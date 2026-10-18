@@ -43,19 +43,12 @@ void validate_execution_memory_binding(
     }
 }
 
-ExecutionBufferAddress resolve_execution_buffer(
-    std::uint64_t execution_identity,
+namespace {
+ExecutionBufferAddress bound_execution_buffer(
     const ExecutionArenaPlan& arena,
     const ExecutionMemoryBinding& memory,
-    ExecutionBufferUse use) {
-    validate_execution_memory_binding(
-        execution_identity,
-        arena,
-        memory);
-
-    const auto* allocation =
-        find_arena_allocation(
-            arena, use);
+    ExecutionBufferUse use,
+    const ExecutionArenaAllocation* allocation) {
     if (allocation == nullptr) {
         throw std::invalid_argument(
             "execution buffer generation is not present in compiled arena");
@@ -90,6 +83,36 @@ ExecutionBufferAddress resolve_execution_buffer(
         allocation->bytes,
         memory.allocation_generation,
     };
+}
+}  // namespace
+
+ExecutionBufferAddress resolve_execution_buffer(
+    std::uint64_t execution_identity,
+    const ExecutionArenaPlan& arena,
+    const ExecutionMemoryBinding& memory,
+    ExecutionBufferUse use) {
+    validate_execution_memory_binding(
+        execution_identity,
+        arena,
+        memory);
+    return bound_execution_buffer(arena, memory, use, find_arena_allocation(arena, use));
+}
+
+ExecutionBufferAddress resolve_execution_buffer_hinted(
+    std::uint64_t execution_identity,
+    const ExecutionArenaPlan& arena,
+    const ExecutionMemoryBinding& memory,
+    ExecutionBufferUse use,
+    std::size_t& hint) {
+    validate_execution_memory_binding(
+        execution_identity,
+        arena,
+        memory);
+    const auto& allocations = arena.allocations;
+    const auto* allocation = hint < allocations.size() && allocations[hint].use == use
+        ? &allocations[hint] : find_arena_allocation(arena, use);
+    if (allocation != nullptr) hint = static_cast<std::size_t>(allocation - allocations.data());
+    return bound_execution_buffer(arena, memory, use, allocation);
 }
 
 }  // namespace strix

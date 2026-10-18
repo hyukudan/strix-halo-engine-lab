@@ -227,11 +227,18 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             *resources.model_weights,*resources.tensor_access,*resources.session_state_layout,*resources.session_state_memory,
             *resources.ple_lookup,*resources.ple_prefetch);
     }
+    std::array<double,32> launch_ms{};std::array<std::uint32_t,32> launch_steps{};
     try {
         for(std::size_t step=0;step<steps;++step) {
             const auto& source=serial.execution.steps[step];
             if(!result.execution.state.contains(source.reads_state)) throw std::logic_error("known prefill persistent state disappeared after admission");
             const auto mode=plan.tile8.mode[step];const auto id=static_cast<std::uint32_t>(plan.tile8.r2_variant[step]);
+            // STRIX_PREFILL_TIMING=1: host enqueue time per step mode (admission inside each launch included).
+            const auto launch_begin=timing?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+            struct LaunchLap {
+                bool on;std::chrono::steady_clock::time_point begin;double& total;std::uint32_t& count;
+                ~LaunchLap(){if(on){total+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();++count;}}
+            } launch_lap{timing,launch_begin,launch_ms[static_cast<std::size_t>(mode)%launch_ms.size()],launch_steps[static_cast<std::size_t>(mode)%launch_steps.size()]};
             const bool rows_entry=known_window_rows_mode(mode);
             if(headless&&step+1U==steps) break;
             if(rows_entry&&full_by_id[id]&&rows%8U==0U) {
@@ -287,6 +294,9 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             }
         }
         if(resources.ple_prefetch&&resources.ple_prefetch->active) throw std::logic_error("known prefill left PLE lookup unconsumed");
+        if(timing)
+            for(std::size_t m=0;m<launch_ms.size();++m) if(launch_ms[m]>0.5)
+                std::fprintf(stderr,"prefill launch mode %2zu %8.2f ms (%u steps)\n",m,launch_ms[m],launch_steps[m]);
         lap("launch");
         hooks.complete();lap("complete");materialize(context(steps-1U,rows-1U),post-1U);
         std::uint64_t final_position=0;std::memcpy(&final_position,reinterpret_cast<const void*>(position.address),sizeof(final_position));

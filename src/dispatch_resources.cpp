@@ -150,6 +150,27 @@ ExecutionBufferAddress resolve_dispatch_temporary(
         context.temporaries[index]);
 }
 
+namespace {
+ExecutionBufferAddress resolve_dispatch_hinted(const ExecutionDispatchContext& context, PreparedBufferKind kind,
+    std::span<const ExecutionBufferUse> uses, std::size_t index, std::size_t& hint) {
+    if (context.arena == nullptr) throw std::invalid_argument("dispatch context has no arena plan");
+    if (index >= uses.size()) throw std::out_of_range("dispatch buffer index is out of range");
+    const auto& memory = scratch_memory(context);
+    if (context.prepared_arena_views) return context.prepared_arena_views->resolve(context, kind, index, memory);
+    return resolve_execution_buffer_hinted(memory.execution_identity, *context.arena, memory, uses[index], hint);
+}
+}  // namespace
+
+ExecutionBufferAddress resolve_dispatch_read_hinted(const ExecutionDispatchContext& context, std::size_t index, std::size_t& hint) {
+    return resolve_dispatch_hinted(context, PreparedBufferKind::read, context.reads, index, hint);
+}
+ExecutionBufferAddress resolve_dispatch_write_hinted(const ExecutionDispatchContext& context, std::size_t index, std::size_t& hint) {
+    return resolve_dispatch_hinted(context, PreparedBufferKind::write, context.writes, index, hint);
+}
+ExecutionBufferAddress resolve_dispatch_temporary_hinted(const ExecutionDispatchContext& context, std::size_t index, std::size_t& hint) {
+    return resolve_dispatch_hinted(context, PreparedBufferKind::temporary, context.temporaries, index, hint);
+}
+
 SessionStateAddress resolve_dispatch_state(
     const ExecutionDispatchContext& context,
     SessionStateComponent component) {

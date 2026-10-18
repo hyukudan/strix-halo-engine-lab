@@ -2667,6 +2667,9 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
         d_down_codes, d_down_deltas, d_down_sums, d_rawdots, derived_count };
     std::array<std::uint64_t, derived_count> derived_offset{};
     const auto& memory0 = *rows.front().resources->scratch;
+    // Row views of the compiled prefill arena list the same unique uses in the same order:
+    // each row's allocation indices are the previous row's (hinted lookup, no arena search).
+    std::array<std::size_t, 5> hint{};
     const auto own_views = [&](std::uint32_t r) {
         const auto& row = rows[r]; const auto& first = rows.front();
         if (!row.resources || row.resources != first.resources ||
@@ -2680,8 +2683,8 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
             row.writes[0] != first.writes[0] || row.temporaries[0] != first.temporaries[0] || !row.arena)
             throw std::invalid_argument("known prefill routed rows source/position/owner differs");
         validate_execution_memory_binding(row.execution_identity, *row.arena, memory0);
-        const std::array base{resolve_dispatch_read(row, 0), resolve_dispatch_read(row, 1), resolve_dispatch_read(row, 2),
-            resolve_dispatch_write(row, 0), resolve_dispatch_temporary(row, 0)};
+        const std::array base{resolve_dispatch_read_hinted(row, 0, hint[0]), resolve_dispatch_read_hinted(row, 1, hint[1]),
+            resolve_dispatch_read_hinted(row, 2, hint[2]), resolve_dispatch_write_hinted(row, 0, hint[3]), resolve_dispatch_temporary_hinted(row, 0, hint[4])};
         const std::array index{input, routes, route_weights, output, temporary};
         for (unsigned v = 0; v < base.size(); ++v) {
             const auto& current = base[v]; known_moe_range({current.address, current.bytes});

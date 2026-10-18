@@ -2849,9 +2849,12 @@ PreparedIndexedLaunch prepare_indexed_attention_launch_like(const PreparedIndexe
         config.qsa_hierarchical_selection || config.qsa_gqa_heads_per_block != 1)
         throw std::invalid_argument("QSA prefill row differs from its head row");
     PreparedIndexedLaunch p = head;
-    p.input = resolve_dispatch_read(context, 0);
-    p.output = resolve_dispatch_write(context, 0);
-    p.temporary = resolve_dispatch_temporary(context, 0);
+    // Rows sharing a head are row views of one known-window/prefill arena (unique uses, same order):
+    // the previous row's allocation indices admit this row without searching its arena.
+    thread_local std::array<std::size_t, 3> hint{};
+    p.input = resolve_dispatch_read_hinted(context, 0, hint[0]);
+    p.output = resolve_dispatch_write_hinted(context, 0, hint[1]);
+    p.temporary = resolve_dispatch_temporary_hinted(context, 0, hint[2]);
     if (p.temporary.bytes < p.workspace_layout.total_bytes)
         throw std::invalid_argument("indexed-attention temporary is undersized");
     p.workspace = workspace_pointers(p.temporary, p.workspace_layout);
