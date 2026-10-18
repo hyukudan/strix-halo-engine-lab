@@ -1,20 +1,19 @@
 // Fast prefill profile, qsa component (included by hip_indexed_attention_launcher.hip; needs round_bf16).
 //
-// Sparse attention of a prefill group (Rows > 8 rows, head_dim 256) fused over the union of the
-// selections of TR consecutive rows. union_kernel turns the rows' selected token lists into the
-// ascending list of 4-token blocks any of them selected, each with a TR-bit row mask (and the
-// multiplicity of tokens 0..3, which the selection may repeat). attend_kernel runs one tile of TR
-// rows, one KV head and W waves of 16 query columns (a column is a (row, head) pair: TR rows times
-// 16 / TR heads of that KV head) over a slice of the union: per 16-token chunk, scores
-// S^T = K x Q^T and O^T += V^T x P^T with v_wmma_f32_16x16x16_f16 (FP32 accumulation), K and V
-// converted exactly from BF16 to FP16 (zero past the tile's visible prefix), Q rounded once to FP16
-// after a power-of-two scale per (row, head) that puts its largest |q| in [2^13, 2^14), undone with
-// 1 / sqrt(256) on the FP32 scores. A (row, token) pair outside the row's selection or causal prefix
-// gets score -inf; the softmax is the online one in FP32 (running maximum and sum per column, P
-// rounded once to FP16 for the product, O rescaled only when a column's maximum grows).
-// combine_kernel merges the slices (splits) of each (row, head), divides by the sum and applies the
-// BF16 roundings and the BF16 sigmoid gate of attention_output_body (attend_kernel does it itself when
-// there is one slice).
+// Sparse attention of a prefill group (Rows > 8 rows, head_dim 256) over the union of the selections of
+// TR consecutive rows. union_kernel turns the rows' selected token lists into the ascending list of
+// 4-token blocks any of them selected, each with a TR-bit row mask, and the multiplicity of tokens 0..3
+// (which the selection may repeat). attend_kernel runs one tile of TR rows and one KV head over a slice of
+// the union in 16-token chunks; a query column is a (row, head) pair, 16 columns per WMMA tile (TR rows
+// times 16 / TR heads of that KV head). Scores S^T = K x Q^T and values O^T += V^T x P^T use
+// v_wmma_f32_16x16x16_f16 with FP32 accumulation. K and V go from BF16 to FP16 (exact in the FP16 normal
+// range, zero past the tile's visible prefix); Q is rounded once to FP16 after a power-of-two scale per
+// (row, head) that puts its largest |q| in [2^13, 2^14), undone with 1 / sqrt(256) on the FP32 scores. A
+// (row, token) pair outside the row's selection or causal prefix gets score -inf; the softmax is the
+// online one in FP32 and base 2 (running maximum and sum per column, P rounded once to FP16 for the
+// product, O rescaled only when a column's maximum grows). combine_kernel merges the slices (splits) of
+// each (row, head), divides by the sum and applies the BF16 roundings and the BF16 sigmoid gate of
+// attention_output_body; attend_kernel does it itself when there is one slice.
 // Scratch (per row: its attention_scores buffer, heads x maximum_selected floats): slice partials
 // [split][head][m, l, O[256]] of the row, then for the first row of each tile, at union_at, the
 // tile's union: u32 [padded block count, 0, 0, 0, TR packed token-0..3 counts], uint2 (block, mask)[].
@@ -43,11 +42,6 @@ __device__ __forceinline__ void lds_barrier() { asm volatile("s_waitcnt lgkmcnt(
 __device__ __forceinline__ u32x4 load16(const void* p) {
     return *reinterpret_cast<const __attribute__((address_space(1))) u32x4*>(reinterpret_cast<std::uintptr_t>(p));
 }
-__device__ __forceinline__ unsigned pack(float a, float b) {
-    const _Float16 x = static_cast<_Float16>(a), y = static_cast<_Float16>(b);
-    return static_cast<unsigned>(__builtin_bit_cast(unsigned short, x)) | static_cast<unsigned>(__builtin_bit_cast(unsigned short, y)) << 16U;
-}
-__device__ __forceinline__ float bf_lo(unsigned w) { return __uint_as_float(w << 16U); }
 // Two BF16 (one word) as two FP16: exact for values in the FP16 normal range (BF16 has fewer significand
 // bits); the conversion truncates, so magnitudes beyond the FP16 range saturate at 65504.
 __device__ __forceinline__ unsigned bf16x2_to_f16x2(unsigned w) {
@@ -56,7 +50,6 @@ __device__ __forceinline__ unsigned bf16x2_to_f16x2(unsigned w) {
 // LDS row of feature d in the transposed V tile: rows 8p + j of one store instruction (p = 0..7) and rows
 // 16n + c of one fragment read fall in different bank groups.
 __device__ __forceinline__ unsigned v_row(unsigned d) { return d ^ ((d >> 3U) & 7U); }
-__device__ __forceinline__ float bf_hi(unsigned w) { return __uint_as_float(w & 0xffff0000U); }
 __device__ __forceinline__ float swap16(float v) { // lane L ^ 16
     return __uint_as_float(__builtin_amdgcn_permlanex16(__float_as_uint(v), __float_as_uint(v), 0x76543210U, 0xfedcba98U, false, false));
 }
