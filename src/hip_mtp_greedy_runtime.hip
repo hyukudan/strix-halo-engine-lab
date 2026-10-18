@@ -146,6 +146,8 @@ std::uint32_t HipMtpGreedyRuntime::begin_cycle_draft(const HipMtpTargetHiddenTic
         const std::function<bool(std::span<const float>)> keep=worth && cost_model && i.window?
             std::function<bool(std::span<const float>)>([&](std::span<const float> p){return i.window->worth_drafting(p);}):
             std::function<bool(std::span<const float>)>{};
+        const auto sampler=i.target->token_sampler();
+        require(!sampler || !depth || i.mtp->draft_head(),"MTP speculative sampling requires the draft chain");
         i.candidates=i.mtp->draft_head()?i.mtp->propose_chain(i.plan,i.activation,*i.session,i.draft,depth,i.min_probability,keep):
             i.backend->propose_candidates(*i.session,i.draft,depth);
         if(i.mtp->draft_head()){const auto p=i.mtp->draft_probabilities();i.probabilities.assign(p.begin(),p.end());}
@@ -207,7 +209,8 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
         HipMtpVerifiedTargetRows verified;
         try {
             verified=i.window->verify(*i.session,*i.dispatcher,initial,i.candidates,budget,eos,
-                i.mtp->draft_head()?std::span<const float>(i.probabilities):std::span<const float>{});
+                i.mtp->draft_head()?std::span<const float>(i.probabilities):std::span<const float>{},
+                i.target->token_sampler()?i.mtp->sampled_drafts():std::span<const TokenDraft>{});
         } catch(...) {fail_cycle();throw;}
         return finish_cycle(initial,std::move(verified),budget,eos);
     }
@@ -222,7 +225,9 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
         const auto& candidates=i.candidates;
         for(std::size_t index=0;;++index) {
             replay.push_back({out.final_target,pending});
-            auto completed=i.target->execute_serial(*i.session,i.resources,*i.dispatcher,pending);
+            const auto drafts=i.target->token_sampler()?i.mtp->sampled_drafts():std::span<const TokenDraft>{};
+            auto completed=i.target->execute_serial(*i.session,i.resources,*i.dispatcher,pending,
+                index<drafts.size()?&drafts[index]:nullptr);
             ++out.consumed_target_rows;
             pending=completed.predicted_token();out.final_target=std::move(completed);
             out.emitted_tokens.push_back(pending);

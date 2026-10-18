@@ -2689,6 +2689,8 @@ int STRIX_DECODE_ENTRY(
                 policy.checkpoint_retained_byte_budget = options.mtp.window_checkpoint_bytes;
                 policy.total_retained_byte_budget = options.mtp.window_total_bytes - retained_total;
                 policy.min_probability = strix::decode_cli::mtp_draft_min_probability(options.mtp);
+                policy.timing_independent_schedule =
+                    strix::decode_cli::mtp_sampling(options.mtp) && !options.mtp.sample_timing_schedule;
                 auto verifier = std::make_shared<strix::HipMtpWindowVerifier>(std::move(target), std::move(owners),
                     request_parents->resources, request_parents, policy, generations);
                 request_parents->window_setup = {union_steps, union_total, union_generation, retained_total};
@@ -2751,17 +2753,29 @@ int STRIX_DECODE_ENTRY(
         }
         auto make_window = window_factory_for(parents, {});
         setup_phase.reset();
-        strix::decode_cli::run_mtp_decode_bridge(options, model, compiled, parents, session, direct_dispatcher,
-            generations, catalog_config.deferred_moe_status, optimization_profile.selected, std::cout, std::move(make_window),
-            [&] { return execution_inventory_receipt + ple_cache_completed_receipt(); }
+        // --mtp-sample-repeats N: N independent requests (seeds seed..seed+N-1), each from a fresh
+        // session over the same loaded model; one receipt per request.
+        const auto fresh_session = session;
+        auto request_options = options;
+        for (std::uint32_t repeat = 0; repeat < options.mtp.sample_repeats; ++repeat) {
+            if (repeat) {
+                strix::initialize_hip_fresh_runtime_memory(memory.scratch(), memory.state());
+                session = fresh_session;
+            }
+            request_options.mtp.sample_seed = options.mtp.sample_seed + repeat;
+            strix::decode_cli::run_mtp_decode_bridge(request_options, model, compiled, parents, session, direct_dispatcher,
+                generations, catalog_config.deferred_moe_status, optimization_profile.selected, std::cout, make_window,
+                [&] { return execution_inventory_receipt + ple_cache_completed_receipt(); }
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
-            , strix::tests::mtp_component_diagnostic_requested()
-                ? strix::decode_cli::MtpDecodeQualification{} : strix::decode_cli::MtpDecodeQualification{strix::tests::run_mtp_model_qualification}
-            , strix::tests::mtp_component_diagnostic_requested()
-                ? strix::decode_cli::MtpDecodeComponentDiagnostic{strix::tests::run_mtp_component_diagnostic}
-                : strix::decode_cli::MtpDecodeComponentDiagnostic{}
+                , strix::tests::mtp_component_diagnostic_requested()
+                    ? strix::decode_cli::MtpDecodeQualification{} : strix::decode_cli::MtpDecodeQualification{strix::tests::run_mtp_model_qualification}
+                , strix::tests::mtp_component_diagnostic_requested()
+                    ? strix::decode_cli::MtpDecodeComponentDiagnostic{strix::tests::run_mtp_component_diagnostic}
+                    : strix::decode_cli::MtpDecodeComponentDiagnostic{}
 #endif
-            );
+                );
+            std::cout.flush();
+        }
         if (prefix_store) prefix_store->flush();
         return 0;
     }

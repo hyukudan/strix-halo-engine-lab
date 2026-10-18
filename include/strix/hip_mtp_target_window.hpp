@@ -2,6 +2,7 @@
 #include "strix/hip_mtp_resources.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/speculative_verify_runtime.hpp"
+#include <functional>
 #include <memory>
 #include <span>
 namespace strix {
@@ -65,6 +66,11 @@ public:
     [[nodiscard]] std::uint64_t window_kernel_plan_identity() const noexcept;
     [[nodiscard]] const ExecutionMemoryBinding& deferred_status_binding() const noexcept;
     [[nodiscard]] void* source_stream() const noexcept;
+    // Sampled decoding: called after the window completes and before any row is
+    // published, with every row's FP32 vocabulary logits and finite first-max
+    // tokens; it may replace tokens. Empty (the default) keeps first-max selection.
+    using RowSelection=std::function<void(std::span<const ExecutionBufferAddress>,std::span<std::uint32_t>)>;
+    void set_row_selection(RowSelection);
 private:
     friend class HipKnownPrefixWindow;
     friend class HipMtpTargetWindowBatch;

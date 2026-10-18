@@ -12,6 +12,7 @@
 #include "strix/model_contract.hpp"
 #include "strix/wave_router_contract.hpp"
 #include <algorithm>
+#include "strix/token_sampling.hpp"
 #include <cerrno>
 #include <fstream>
 #include <iterator>
@@ -141,7 +142,21 @@ struct MtpCliOptions {
     struct CohortRequest {std::vector<std::uint32_t> tokens;std::string golden,golden_sha256;};
     std::vector<CohortRequest> cohort;
     std::string cohort_mode;
+    // Sampled decoding (temperature > 0, identity sampling-v1): seeded and reproducible.
+    // Temperature 0 (the default) keeps greedy selection unchanged.
+    double sample_temperature=0.0,sample_top_p=1.0,sample_min_p=0.0;
+    std::uint32_t sample_top_k=0;
+    std::uint64_t sample_seed=0;
+    bool sample_options=false;
+    bool sample_speculation=true;       // off: no drafts, plain sampling from the target
+    bool sample_timing_schedule=false;  // adaptive: measured-cost owner choice (not reproducible)
+    std::uint32_t sample_repeats=1;     // independent requests with seeds seed..seed+N-1
 };
+inline TokenSamplingPolicy mtp_sampling_policy(const MtpCliOptions& m) noexcept {
+    return {static_cast<float>(m.sample_temperature),m.sample_top_k,static_cast<float>(m.sample_top_p),
+        static_cast<float>(m.sample_min_p),m.sample_seed};
+}
+inline bool mtp_sampling(const MtpCliOptions& m) noexcept {return m.sample_temperature>0.0;}
 // This is execution evidence: a configured owner alone is not an attempted
 // native window (EOS, remaining budget/context and history can choose serial).
 inline float mtp_draft_min_probability(const MtpCliOptions& m) noexcept {
@@ -894,6 +909,19 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
         throw std::invalid_argument("MTP draft vocabulary options require --mtp-draft-chain");
     if(m.draft_q4 && m.draft_vocab.empty() && !m.draft_context_vocab)
         throw std::invalid_argument("MTP draft Q4 head requires a draft vocabulary subset");
+    if(m.sample_options) {
+        validate_token_sampling_policy(mtp_sampling_policy(m));
+        if(!mtp_sampling(m) && (m.sample_top_k || m.sample_top_p!=1.0 || m.sample_min_p!=0.0 || !m.sample_speculation ||
+           m.sample_timing_schedule || m.sample_repeats!=1U))
+            throw std::invalid_argument("MTP sampling options require --mtp-sample-temperature above zero");
+        if(mtp_sampling(m) && m.sample_speculation && !m.draft_chain)
+            throw std::invalid_argument("MTP speculative sampling requires --mtp-draft-chain (or --mtp-sample-speculation off)");
+        if(!m.sample_repeats || (mtp_sampling(m) && (m.metadata_only || !m.golden_dump.empty())))
+            throw std::invalid_argument("MTP sampling needs a generation route and at least one request");
+        // Not combined with the other request forms yet (each was qualified alone).
+        if(mtp_sampling(m) && (tiled || !m.cohort.empty()))
+            throw std::invalid_argument("MTP sampling does not combine with the tiled MTP prompt or cohort requests");
+    }
     if(m.window_rows && m.candidate_depth<m.window_rows-1U)
         throw std::invalid_argument("MTP target window requires candidate depth at least rows minus one");
     if(m.window_rows && (o.gdn_recurrent_layout!=HipGdnRecurrentLayout::baseline || o.gdn_recurrent_storage!=GdnRecurrentStorage::key_value ||
@@ -902,6 +930,7 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
     if(!m.cohort_mode.empty() && m.cohort.empty())
         throw std::invalid_argument("MTP cohort mode requires --mtp-cohort-request");
     if(!m.cohort.empty()) {
+        if(tiled) throw std::invalid_argument("MTP cohort requests do not combine with the tiled MTP prompt");
         if(m.cohort.size()>3U || m.metadata_only || !m.golden_dump.empty() || !m.window_prefix || !m.draft_chain ||
            m.window_rows_set!=std::vector<std::uint32_t>{2U,4U,8U} || o.prefill_numerical_profile.has_value())
             throw std::invalid_argument("MTP cohort requests (at most three besides the positional prompt) require prefix "
@@ -1141,6 +1170,17 @@ inline Options parse_options(
             else if(key=="--mtp-max-hidden-error")m.max_hidden_error=parse_double(value,"MTP hidden policy");
             else if(key=="--mtp-max-logit-error")m.max_logit_error=parse_double(value,"MTP logit policy");
             else if(key=="--mtp-spec-min-p")m.spec_min_p=parse_double(value,"MTP draft minimum probability");
+            else if(key=="--mtp-sample-temperature"){m.sample_options=true;m.sample_temperature=parse_double(value,"MTP sampling temperature");}
+            else if(key=="--mtp-sample-top-p"){m.sample_options=true;m.sample_top_p=parse_double(value,"MTP sampling top-p");}
+            else if(key=="--mtp-sample-min-p"){m.sample_options=true;m.sample_min_p=parse_double(value,"MTP sampling min-p");}
+            else if(key=="--mtp-sample-speculation"){
+                if(value!="on" && value!="off")throw std::invalid_argument("MTP sample speculation is on or off");
+                m.sample_options=true;m.sample_speculation=value=="on";
+            }
+            else if(key=="--mtp-sample-schedule"){
+                if(value!="fixed" && value!="adaptive")throw std::invalid_argument("MTP sample schedule is fixed or adaptive");
+                m.sample_options=true;m.sample_timing_schedule=value=="adaptive";
+            }
             else if(key=="--mtp-target-window-rows-set") {
                 for(std::size_t begin=0;begin<=value.size();) {
                     const auto end=std::min(value.find(',',begin),value.size());
@@ -1170,6 +1210,11 @@ inline Options parse_options(
                     m.calibration_rows=static_cast<std::uint32_t>(n);
                 }
                 else if(key=="--mtp-policy-id")m.policy_identity=n;
+                else if(key=="--mtp-sample-seed"){m.sample_options=true;m.sample_seed=n;}
+                else if(key=="--mtp-sample-top-k" || key=="--mtp-sample-repeats"){
+                    if(n>UINT32_MAX)throw std::invalid_argument("MTP sampling top-k/repeats exceeds uint32");
+                    m.sample_options=true;(key=="--mtp-sample-top-k"?m.sample_top_k:m.sample_repeats)=static_cast<std::uint32_t>(n);
+                }
                 else if(key=="--mtp-window-arena-bytes")m.window_arena_bytes=n;
                 else if(key=="--mtp-window-capture-bytes")m.window_capture_bytes=n;
                 else if(key=="--mtp-window-checkpoint-bytes")m.window_checkpoint_bytes=n;

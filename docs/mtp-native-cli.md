@@ -66,3 +66,9 @@ performance measurement. Checkpoint fixtures additionally expose actual union
 and variant dispatch counts and require a nonzero union witness when requested.
 Independent replay, complete state restoration and full-cycle cache comparisons
 remain mandatory; this integration does not qualify speed or arbitrary models.
+
+### Sampled decoding
+
+`--mtp-sample-temperature`, `--mtp-sample-top-k`, `--mtp-sample-top-p`, `--mtp-sample-min-p`, `--mtp-sample-seed`,
+`--mtp-sample-speculation`, `--mtp-sample-schedule` and `--mtp-sample-repeats` select seeded sampling instead of
+greedy selection. They are described in [sampled-decoding.md](sampled-decoding.md).

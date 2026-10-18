@@ -209,6 +209,7 @@ add_library(strix_core STATIC
     src/speculation_sampling.cpp
     src/speculation_sampling_cycle.cpp
     src/speculation_sampling_executor.cpp
+    src/token_sampling.cpp
     src/speculation_cycle.cpp
     src/speculation_executor.cpp
     src/speculative_verify_plan.cpp
@@ -1065,6 +1066,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-speculation-sampling-executor-tests)
     add_test(NAME strix-speculation-sampling-executor-tests COMMAND strix-speculation-sampling-executor-tests)
 
+    add_executable(strix-token-sampling-tests tests/token_sampling_tests.cpp)
+    target_link_libraries(strix-token-sampling-tests PRIVATE strix_core)
+    strix_target_warnings(strix-token-sampling-tests)
+    add_test(NAME strix-token-sampling-tests COMMAND strix-token-sampling-tests)
+
     add_executable(strix-speculation-rng-tests tests/speculation_rng_tests.cpp)
     target_link_libraries(strix-speculation-rng-tests PRIVATE strix_core)
     strix_target_warnings(strix-speculation-rng-tests)
@@ -1378,6 +1384,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_mtp_target_window.hip
         src/hip_mtp_target_checkpoint.hip
         src/hip_mtp_window_verifier.hip
+        src/hip_token_sampling.hip
         src/hip_mtp_target_hidden.hip
         src/hip_mtp_greedy_runtime.hip
         src/hip_mtp_asset_loader.hip

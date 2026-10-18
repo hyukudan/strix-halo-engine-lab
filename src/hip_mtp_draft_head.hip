@@ -269,6 +269,19 @@ void HipMtpDraftHead::wait_step(std::uint32_t step,void* stream) const {
     }
     check(hipStreamSynchronize(p.stream),"MTP draft early-stop step");
 }
+void HipMtpDraftHead::read_logits(std::vector<float>& out) const {
+    const auto& p=*impl_;out.resize(p.rows);
+    check(hipMemcpyAsync(out.data(),p.logits,p.rows*sizeof(float),hipMemcpyDeviceToHost,p.stream),"MTP draft logits readback");
+    check(hipStreamSynchronize(p.stream),"MTP draft logits readback completion");
+}
+std::span<const std::uint32_t> HipMtpDraftHead::host_ids() const noexcept {
+    const auto& p=*impl_;return p.config.full?std::span<const std::uint32_t>{}:std::span<const std::uint32_t>(p.host_ids,p.rows);
+}
+void HipMtpDraftHead::set_token(std::uint32_t step,std::uint32_t token,void* stream) {
+    auto& p=*impl_;require(step<p.config.max_depth && stream==p.stream && token<p.config.vocab_size,"MTP draft token override is invalid");
+    check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(p.slots+step),static_cast<int>(token),1,p.stream),"MTP draft token override");
+    p.reply->tokens[step]=token;
+}
 bool HipMtpDraftHead::full() const noexcept {return impl_->config.full;}
 HipMtpDraftHeadStats HipMtpDraftHead::stats() const noexcept {
     const auto& p=*impl_;return {p.rows,p.base_rows,p.context_rows,p.context_dropped};

@@ -2,6 +2,7 @@
 #include "strix/hip_mtp_resources.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/serial_session.hpp"
+#include "strix/token_sampling.hpp"
 namespace strix {
 class HipMtpTargetHidden;
 class HipMtpTargetWindowBatch;
@@ -74,9 +75,15 @@ public:
         std::uint32_t output_budget);
     HipMtpTargetHidden(const HipMtpTargetHidden&)=delete;
     HipMtpTargetHidden& operator=(const HipMtpTargetHidden&)=delete;
+    // With a token sampler, the row's selection is the sampled decision for the
+    // token at input position + 1 (using `draft` when it proposes that token);
+    // otherwise it is the finite first-max token and `draft` must be null.
     [[nodiscard]] HipMtpTargetHiddenTicket execute_serial(
         SerialSessionContext&,const ExecutionRuntimeResources&,
-        DirectLaunchDispatcher&,std::uint32_t input_token);
+        DirectLaunchDispatcher&,std::uint32_t input_token,const TokenDraft* draft=nullptr);
+    // Sampled decoding (temperature > 0): set once; later serial rows select by it.
+    void set_token_sampler(std::shared_ptr<TokenSampler>);
+    [[nodiscard]] std::shared_ptr<TokenSampler> token_sampler() const noexcept;
     // Split prefill numerical profile. Prompt rows run a sibling serial execution (same steps,
     // arena, state and model bindings; different arithmetic) on the same scratch arena, selected
     // by the session's executor identity. Set once, before any row. hand_off_prompt then moves

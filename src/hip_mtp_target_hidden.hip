@@ -9,6 +9,7 @@
 #include "strix/dispatch_resources.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/session_executor_handoff.hpp"
+#include "strix/hip_token_sampling.hpp"
 #include <algorithm>
 #include <optional>
 #include <stdexcept>
@@ -78,6 +79,9 @@ struct HipMtpTargetHidden::Impl {
     std::unique_ptr<HipGreedyOutput> selector;
     std::uint64_t epoch=0;
     std::unique_ptr<SerialHostStateShadow> shadow;
+    // Sampled selection (null: finite first-max) and its host copy of the logits row.
+    std::shared_ptr<TokenSampler> sampler;
+    std::vector<float> sampled_logits;
     ExecutionMemoryBinding deferred_status;
     std::uint64_t status_lease=0;
     bool busy=false,failed=false;
@@ -235,8 +239,9 @@ std::shared_ptr<HipMtpTargetHidden> HipMtpTargetHidden::create(
 }
 HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial(
     SerialSessionContext& session,const ExecutionRuntimeResources& resources,
-    DirectLaunchDispatcher& dispatcher,std::uint32_t token) {
+    DirectLaunchDispatcher& dispatcher,std::uint32_t token,const TokenDraft* draft) {
     auto& i=*impl_;
+    if(draft && !i.sampler) throw std::invalid_argument("MTP target draft decision requires a token sampler");
     // The prompt lane runs while the session is owned by the sibling prompt execution.
     const bool prompt_lane=i.prompt && !i.handoff && session.execution_identity==i.prompt->execution_identity;
     const auto& lane=prompt_lane?*i.prompt:*i.compiled;
@@ -306,6 +311,11 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial(
             if(i.deferred_status.arena_base)check_deferred_moe_status(status);
             lease->predicted=i.selector->select(i.logits,static_cast<std::uint32_t>(i.model->vocab_size),
                 lease->position,++i.epoch);
+            // The first-max pass above still validates every logit as finite.
+            if(i.sampler) {
+                read_hip_logits_row(i.logits,static_cast<std::uint32_t>(i.model->vocab_size),i.stream,i.sampled_logits);
+                lease->predicted=i.sampler->decide(i.sampled_logits,lease->position+1U,draft).token;
+            }
             if(i.shadow)i.shadow->publish();
         });
         lease->committed=session;
@@ -319,6 +329,12 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial(
         throw;
     }
 }
+void HipMtpTargetHidden::set_token_sampler(std::shared_ptr<TokenSampler> sampler) {
+    auto& i=*impl_;
+    if(i.busy || i.failed || i.sampler) throw std::invalid_argument("MTP target token sampler is set once on an idle producer");
+    i.sampler=std::move(sampler);
+}
+std::shared_ptr<TokenSampler> HipMtpTargetHidden::token_sampler() const noexcept {return impl_->sampler;}
 void HipMtpTargetHidden::set_prompt_execution(const CompiledSerialExecution& prompt) {
     auto& i=*impl_;i.guard->require_original();i.memory->validate_inventory_ownership();
     if(i.prompt || i.started || i.busy || i.failed)
