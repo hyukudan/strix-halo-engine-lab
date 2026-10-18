@@ -7,6 +7,7 @@
 #include "strix/moe_a8_down_contract.hpp"
 
 #include "strix/dispatch_resources.hpp"
+#include "strix/known_window_cohort.hpp"
 #include "strix/prepared_tensor_views.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #ifdef STRIX_BUILD_MOE_BATCHED_ACTIVATION_DIAGNOSTIC
@@ -1662,8 +1663,11 @@ PreparedMoeExperts prepare_moe_experts(
 
     if (config.deferred_moe_status) {
         const auto& record=current_hip_launch_context()->deferred_moe_status;
-        if (!context.memory || record.execution_identity!=context.memory->execution_identity ||
-            (context.execution_identity && record.execution_identity!=context.execution_identity))
+        // A cohort's shared union reports to the record of the owner that enqueues it for all
+        // sessions (its completion checks it); every other launch to its own execution's record.
+        if (!context.memory || !record.execution_identity || (!known_window_cohort_active() &&
+            (record.execution_identity!=context.memory->execution_identity ||
+             (context.execution_identity && record.execution_identity!=context.execution_identity))))
             throw std::invalid_argument("deferred MoE record belongs to a different execution");
         const auto disjoint=[&](std::uintptr_t address,std::uint64_t bytes) {
             if (bytes>std::numeric_limits<std::uintptr_t>::max()-address ||
@@ -2404,7 +2408,10 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
         throw std::invalid_argument("known-window routed rows require retained execution resources");
     const auto& memory = *first.resources->scratch;
     validate_execution_memory_binding(first.execution_identity, *first.arena, memory);
-    if (!extra.owner || extra.memory.execution_identity != first.execution_identity ||
+    // A cohort window's rows belong to the windows of several sessions; the union workspace
+    // belongs to the owner that enqueues it, so only its extent is bound to these rows.
+    const bool cohort = known_window_cohort_active();
+    if (!extra.owner || (!cohort && extra.memory.execution_identity != first.execution_identity) ||
         !extra.memory.allocation_generation || extra.memory.arena_base % 256U || extra.memory.arena_bytes != layout.bytes)
         throw std::invalid_argument("known-window routed rows CSR owner identity/extent differs");
     known_moe_range({extra.memory.arena_base, extra.memory.arena_bytes});
@@ -2426,26 +2433,31 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
     std::array<KnownMoeRange, 24> reads{};
     for (std::size_t r = 0; r < rows.size(); ++r) {
         const auto& row = rows[r];
-        if (!row.resources || row.resources->scratch != first.resources->scratch ||
+        // Per session segment (the whole window outside a cohort): one scratch arena, state and
+        // lookup owner at consecutive positions.
+        const auto& head = rows[known_window_segment_start(rows, r) ? r : r - 1U];
+        if (!row.resources || !row.resources->scratch || row.resources->scratch != head.resources->scratch ||
             row.resources->model_manifest != first.resources->model_manifest ||
             row.resources->model_weights != first.resources->model_weights ||
             row.resources->tensor_access != first.resources->tensor_access ||
             row.resources->session_state_layout != first.resources->session_state_layout ||
-            row.resources->session_state_memory != first.resources->session_state_memory ||
-            row.resources->ple_lookup != first.resources->ple_lookup ||
-            row.resources->ple_hash_contract != first.resources->ple_hash_contract ||
-            row.resources->ple_prefetch != first.resources->ple_prefetch ||
-            row.session_state_layout != first.session_state_layout || row.session_state_memory != first.session_state_memory ||
+            row.resources->session_state_memory != head.resources->session_state_memory ||
+            row.resources->ple_lookup != head.resources->ple_lookup ||
+            row.resources->ple_hash_contract != head.resources->ple_hash_contract ||
+            row.resources->ple_prefetch != head.resources->ple_prefetch ||
+            row.session_state_layout != first.session_state_layout || row.session_state_memory != head.session_state_memory ||
+            row.session_state_memory != row.resources->session_state_memory ||
             (row.memory && row.memory != row.resources->scratch) || row.prepared_tensor_views || row.prepared_arena_views ||
-            row.execution_identity != first.execution_identity || row.step_id != first.step_id || row.op != SerialOp::moe_experts ||
+            row.execution_identity != head.execution_identity || row.step_id != first.step_id || row.op != SerialOp::moe_experts ||
             row.layer != first.layer || row.kernel_id != first.kernel_id || row.logical_rows != 1U || row.request_concurrency != 1U ||
             row.reads_state != first.reads_state || row.writes_state != first.writes_state ||
-            first.position > UINT64_MAX - r || row.position != first.position + r ||
+            !known_window_row_position_follows(rows, r) ||
             row.reads.size() != 3U || row.writes.size() != 1U || row.temporaries.size() != 1U ||
             !std::equal(row.reads.begin(), row.reads.end(), first.reads.begin()) ||
             row.writes[0] != first.writes[0] || row.temporaries[0] != first.temporaries[0] || !row.arena)
             throw std::invalid_argument("known-window routed rows source/position/owner differs");
-        validate_execution_memory_binding(row.execution_identity, *row.arena, memory);
+        const auto& row_memory = *row.resources->scratch;
+        validate_execution_memory_binding(row.execution_identity, *row.arena, row_memory);
         out.rows[r] = prepare_moe_experts(row, const_cast<HipMoeExpertsLauncherConfig*>(&config));
         const auto& p = out.rows[r];
         const auto gate_type = p.tensors.gate.manifest->ggml_type, down_type = p.tensors.down.manifest->ggml_type;
@@ -2462,13 +2474,15 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
         const std::array base{p0.hidden, p0.route_indices, p0.route_weights, p0.output, p0.temporary};
         for (unsigned v = 0; v < views.size(); ++v) {
             const auto current = views[v]; known_moe_range({current.address, current.bytes});
-            if (current.address < memory.arena_base || current.address - memory.arena_base > memory.arena_bytes ||
-                current.bytes > memory.arena_bytes - (current.address - memory.arena_base) ||
-                current.allocation_generation != memory.allocation_generation || base[v].bytes > UINT64_MAX - 255U)
+            if (current.address < row_memory.arena_base || current.address - row_memory.arena_base > row_memory.arena_bytes ||
+                current.bytes > row_memory.arena_bytes - (current.address - row_memory.arena_base) ||
+                current.allocation_generation != row_memory.allocation_generation || base[v].bytes > UINT64_MAX - 255U)
                 throw std::invalid_argument("known-window routed rows view exceeds retained physical allocation");
             const auto stride = (base[v].bytes + 255U) / 256U * 256U;
-            if (current.bytes != base[v].bytes || stride > (UINTPTR_MAX - base[v].address) / rows.size() ||
-                current.address != base[v].address + r * stride)
+            // Rows of different cohort sessions live in different arenas; every union kernel
+            // addresses rows through per-row pointers, so only one session's window keeps the stripe.
+            if (current.bytes != base[v].bytes || (!cohort && (stride > (UINTPTR_MAX - base[v].address) / rows.size() ||
+                current.address != base[v].address + r * stride)))
                 throw std::invalid_argument("known-window routed rows stripe differs from serial allocation");
         }
         const std::array tensor_pairs{p.tensors.gate, p.tensors.up, p.tensors.down};
@@ -2503,7 +2517,7 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
         if (known_moe_overlap(a,b)) throw std::invalid_argument("known-window routed rows writable owner aliases storage");
     };
     const KnownMoeRange csr_range{extra.memory.arena_base, extra.memory.arena_bytes};
-    disjoint(csr_range, {memory.arena_base, memory.arena_bytes});
+    for (const auto& row : rows) disjoint(csr_range, {row.resources->scratch->arena_base, row.resources->scratch->arena_bytes});
     const auto& d1 = current_hip_launch_context()->deferred_moe_status;
     disjoint(csr_range, {d1.arena_base, d1.arena_bytes});
     if (!striped_weights) for (const auto& weight : first.resources->model_weights->tensors) {
@@ -2512,9 +2526,12 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
         disjoint(csr_range, {weight.address, weight.bytes});
         for (std::size_t w = 0; w < 2U*rows.size(); ++w) disjoint(writes[w], {weight.address, weight.bytes});
     }
-    if (const auto* state = first.resources->session_state_memory) {
-        for (const auto s : {KnownMoeRange{state->host_base,state->host_bytes}, KnownMoeRange{state->device_base,state->device_bytes}})
-            if (s.bytes) { disjoint(csr_range,s); for (std::size_t w=0;w<2U*rows.size();++w) disjoint(writes[w],s); }
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        if (!known_window_segment_start(rows, r)) continue;
+        if (const auto* state = rows[r].resources->session_state_memory) {
+            for (const auto s : {KnownMoeRange{state->host_base,state->host_bytes}, KnownMoeRange{state->device_base,state->device_bytes}})
+                if (s.bytes) { disjoint(csr_range,s); for (std::size_t w=0;w<2U*rows.size();++w) disjoint(writes[w],s); }
+        }
     }
     for (std::size_t w = 0; w < 2U*rows.size(); ++w) {
         disjoint(writes[w], {d1.arena_base,d1.arena_bytes});
@@ -2656,7 +2673,8 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
     const q51_known_rows::Workspace& prefill, bool shared_admission = true) {
     const auto count = static_cast<std::uint32_t>(rows.size());
     if (count < 16U || count % 8U || count > q51_known_rows::prefill_max_rows)
-        throw std::invalid_argument("known prefill routed rows require T in [16, 2048], a multiple of 8");
+        throw std::invalid_argument("known prefill routed rows require T in [16, " + std::to_string(q51_known_rows::prefill_max_rows) +
+            "], a multiple of 8");
     if (!config.a8_down_q51 && !config.a8_down_q80)
         throw std::invalid_argument("known prefill routed rows require the A8 down profile");
     // Every view a kernel touches, per row; checked to be row 0 plus r * stride.
@@ -2840,7 +2858,8 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
 void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherConfig& config, const KnownMoePrefillPrepared& p) {
     const auto stream = hip_execution_stream();
     check_hip(hipPeekAtLastError(), "known prefill routed rows stale error");
-    moe_q4k_a8::known_rows::enqueue_prefill(p.request, p.rows, count, p.clear_words, p.gate, p.up, p.down_type, p.down, stream);
+    moe_q4k_a8::known_rows::enqueue_prefill(p.request, p.rows, count, p.clear_words, p.gate, p.up, p.down_type, p.down, stream,
+        config.prefill_f16wmma ? 3 : -1);
     hipLaunchKernelGGL(known_moe_prefill_merge_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
         p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k);
     check_hip(hipGetLastError(), "known prefill routed rows ordered merge");
@@ -2856,6 +2875,7 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
         stats.quantized_submissions.fetch_add(count, std::memory_order_relaxed);
         (p.down_type == 7U ? stats.a8_down_q51_submissions : stats.a8_down_q80_submissions).fetch_add(count, std::memory_order_relaxed);
         if (p.request.gate_type == 13U) stats.q5k_a8_gate_up_submissions.fetch_add(count, std::memory_order_relaxed);
+        if (config.prefill_f16wmma) stats.prefill_f16wmma_submissions.fetch_add(count, std::memory_order_relaxed);
     }
 }
 #endif

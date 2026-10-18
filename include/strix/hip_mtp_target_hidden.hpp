@@ -2,6 +2,8 @@
 #include "strix/hip_mtp_resources.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/serial_session.hpp"
+#include "strix/token_sampling.hpp"
+#include <span>
 namespace strix {
 class HipMtpTargetHidden;
 class HipMtpTargetWindowBatch;
@@ -15,6 +17,8 @@ public:
     [[nodiscard]] bool same_producer(const HipMtpTargetHiddenTicket&) const noexcept;
     [[nodiscard]] bool same_commit(const HipMtpTargetHiddenTicket&) const noexcept;
     [[nodiscard]] bool is_window() const noexcept;
+    // Last row of a tiled prefill block (adopt_prefill_row): its chunk is the block's lineage interval.
+    [[nodiscard]] bool is_prefill_block() const noexcept;
     [[nodiscard]] std::uint64_t chunk_begin() const;
     [[nodiscard]] std::uint64_t chunk_end() const;
     [[nodiscard]] MtpDeviceView view() const;
@@ -74,15 +78,29 @@ public:
         std::uint32_t output_budget);
     HipMtpTargetHidden(const HipMtpTargetHidden&)=delete;
     HipMtpTargetHidden& operator=(const HipMtpTargetHidden&)=delete;
+    // With a token sampler, the row's selection is the sampled decision for the
+    // token at input position + 1 (using `draft` when it proposes that token);
+    // otherwise it is the finite first-max token and `draft` must be null.
     [[nodiscard]] HipMtpTargetHiddenTicket execute_serial(
         SerialSessionContext&,const ExecutionRuntimeResources&,
-        DirectLaunchDispatcher&,std::uint32_t input_token);
+        DirectLaunchDispatcher&,std::uint32_t input_token,const TokenDraft* draft=nullptr);
+    // Sampled decoding (temperature > 0): set once; later serial rows select by it.
+    void set_token_sampler(std::shared_ptr<TokenSampler>);
+    [[nodiscard]] std::shared_ptr<TokenSampler> token_sampler() const noexcept;
     // Split prefill numerical profile. Prompt rows run a sibling serial execution (same steps,
     // arena, state and model bindings; different arithmetic) on the same scratch arena, selected
     // by the session's executor identity. Set once, before any row. hand_off_prompt then moves
     // the session to the decode execution and re-mints the pending prompt row with the handed-off
     // session; the returned ticket replaces `pending`. Later rows run the decode execution only.
     void set_prompt_execution(const CompiledSerialExecution& prompt);
+    // Tiled MTP prompt handoff: mints the pending row from the last row of the tiled prefill block
+    // that has just committed `session` (its last lineage interval, prefill or known-window chunk,
+    // ending at session.next_position). `hidden` is that row's wide tap (copied into a retained
+    // slot) and `logits` its full FP32 head row; the prediction uses the selector's finite
+    // first-max rule. The caller guarantees both come from that completed block (the tiled
+    // prefill computes every row exactly as a serial row of the same execution).
+    [[nodiscard]] HipMtpTargetHiddenTicket adopt_prefill_row(const SerialSessionContext& session,
+        std::uint32_t input_token,MtpDeviceView hidden,std::span<const float> logits);
     [[nodiscard]] HipMtpTargetHiddenTicket hand_off_prompt(SerialSessionContext&,
         const HipMtpTargetHiddenTicket& pending,const ExecutionRuntimeResources& prompt_resources,
         const ExecutionRuntimeResources& decode_resources);

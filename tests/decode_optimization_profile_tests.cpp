@@ -212,7 +212,8 @@ void prefill_profile_contract() {
     rejects([] { (void)parse({"decoder", "m", "1", "--prefill-numerical-profile=exact-v5", "--prefill-numerical-profile", "exact-v5"}); },
         "duplicate prefill numerical profile option");
     const std::string_view pair_message = "prefill numerical profile may differ from an explicit --numerical-profile only in "
-        "the dense A8 projections (q5k-a8-gateup profiles with and without +dense-a8)";
+        "the dense A8 projections (q5k-a8-gateup profiles with and without +dense-a8), or be "
+        "fast-prefill-f16wmma-v1 paired with hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1";
     rejects([&] { (void)tiled(std::string(fp32), std::string(deferred_a8)); }, pair_message);
     rejects([&] { (void)tiled(std::string(fp32), "hc-splitk-f32+q51-q80-a8-down-v1"); }, pair_message);
     rejects([&] { (void)tiled(std::string(a8), std::string(deferred)); }, pair_message);
@@ -245,6 +246,47 @@ void prefill_profile_contract() {
     }
     auto implicit = plain; implicit.numerical_profile_explicit = false;
     rejects([&] { validate_prefill_numerical_profile_cli(implicit); }, pair_message);
+
+    // Fast prefill profile: prefill-only, paired with the dense-A8 split-K profile, components hc/dense/moe.
+    constexpr std::string_view fast = "fast-prefill-f16wmma-v1";
+    const auto with_components = [&](std::string decode, std::string components) {
+        std::vector<std::string> args{"decoder", "m", "1", "2", "--generate", "2", "--known-prefix-window",
+            "--known-prefix-full-rows", "--known-prefix-prefill-rows", "256", "--known-prefix-workspace-budget-bytes", "1",
+            "--known-prefix-host-metadata-budget-bytes", "2", "--known-prefix-uma-budget-bytes", "1",
+            "--known-prefix-host-headroom-bytes", "0", "--numerical-profile", decode, "--prefill-numerical-profile", std::string(fast)};
+        if (!components.empty()) { args.push_back("--prefill-fast-components"); args.push_back(components); }
+        std::vector<char*> argv;
+        for (auto& arg : args) argv.push_back(arg.data());
+        return parse_options(static_cast<int>(argv.size()), argv.data());
+    };
+    const auto all = with_components(std::string(a8), "");
+    const auto all_pair = numerical_profile_pair(all);
+    expect(all_pair.split() && all_pair.prefill == profile(fast) && all_pair.decode == profile(a8) &&
+        all_pair.fast_components == kFastPrefillAll && numerical_profile_pair_admitted(all_pair) &&
+        numerical_profile_fast_prefill(profile(fast)) && numerical_profile_dense_a8(profile(fast)) &&
+        numerical_profile_hc_splitk(profile(fast)) && !numerical_profile_hc_deferred_norm(profile(fast)),
+        "the fast prefill profile pairs with the dense-A8 split-K profile and mirrors its recipe predicates");
+    const auto hc_only = numerical_profile_pair(with_components(std::string(a8), "hc"));
+    const auto dense_moe = numerical_profile_pair(with_components(std::string(a8), "moe,dense"));
+    const auto spelled_all = numerical_profile_pair(with_components(std::string(a8), "dense,router,hc,qsa,moe"));
+    expect(hc_only.fast_components == kFastPrefillHc && dense_moe.fast_components == (kFastPrefillDense | kFastPrefillMoe) &&
+        spelled_all == all_pair, "--prefill-fast-components parses any order of hc, dense, moe, qsa, router");
+    const auto fast_id = numerical_profile_pair_identity(all_pair);
+    expect(fast_id != numerical_profile_pair_identity(hc_only) && numerical_profile_pair_identity(hc_only) != numerical_profile_pair_identity(dense_moe) &&
+        fast_id != numerical_profile_pair_identity({profile(fp32), profile(a8)}) && fast_id != numerical_profile_identity(profile(a8)) &&
+        numerical_profile_pair_identity(spelled_all) == fast_id,
+        "every fast component subset has its own pair identity");
+    const auto dense8 = numerical_profile_pair(with_components(std::string(a8), "hc,dense8,moe"));
+    expect(dense8.fast_components == (kFastPrefillHc | kFastPrefillDense8 | kFastPrefillMoe) && numerical_profile_pair_admitted(dense8) &&
+        numerical_profile_pair_identity(dense8) != fast_id, "dense8 is an admitted opt-in component with its own identity");
+    rejects([&] { (void)with_components(std::string(a8), "dense,dense8"); }, pair_message);
+    rejects([&] { (void)with_components(std::string(fp32), ""); }, pair_message);
+    rejects([&] { (void)with_components(std::string(deferred_a8), ""); }, pair_message);
+    rejects([&] { (void)with_components(std::string(a8), "hc,hc"); }, "--prefill-fast-components accepts hc, dense, moe, qsa, router, dense8 once each");
+    rejects([&] { (void)with_components(std::string(a8), "attention"); }, "--prefill-fast-components accepts hc, dense, moe, qsa, router, dense8 once each");
+    rejects([&] { (void)tiled(std::string(fast), ""); }, "fast prefill profiles are prefill-only (--prefill-numerical-profile)");
+    auto stray = plain; stray.prefill_fast_components = kFastPrefillHc;
+    rejects([&] { validate_prefill_numerical_profile_cli(stray); }, "--prefill-fast-components requires a fast prefill numerical profile");
 }
 
 int main() {

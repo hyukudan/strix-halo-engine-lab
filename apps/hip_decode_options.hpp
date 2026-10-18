@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/decode_execution_options.hpp"
+#include "strix/known_prefill_limits.hpp"
 #include "strix/decode_numerical_profile.hpp"
 #include "strix/gdn_recurrent_layout.hpp"
 #include "strix/gdn_recurrent_storage.hpp"
@@ -10,7 +11,12 @@
 #include "strix/final_generation_state_export.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/wave_router_contract.hpp"
+#include <algorithm>
+#include "strix/token_sampling.hpp"
 #include <cerrno>
+#include <fstream>
+#include <iterator>
+#include <sstream>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
@@ -129,7 +135,28 @@ struct MtpCliOptions {
     // Tiled MTP prompt (--known-prefix-window with the tiled prefill): the golden covers only the
     // first calibration_rows prompt pairs, replayed serially before the tiled prefill (0: default 8).
     std::uint32_t calibration_rows=0;
+    // Several independent requests in one process (the positional prompt and --mtp-golden are
+    // request 0): each has its own target state, MTP runtime, captures and window owners over the
+    // shared model. lockstep verifies the drafts of all active requests with cohort windows;
+    // sequential runs the requests one after another, each exactly as alone.
+    struct CohortRequest {std::vector<std::uint32_t> tokens;std::string golden,golden_sha256;};
+    std::vector<CohortRequest> cohort;
+    std::string cohort_mode;
+    // Sampled decoding (temperature > 0, identity sampling-v1): seeded and reproducible.
+    // Temperature 0 (the default) keeps greedy selection unchanged.
+    double sample_temperature=0.0,sample_top_p=1.0,sample_min_p=0.0;
+    std::uint32_t sample_top_k=0;
+    std::uint64_t sample_seed=0;
+    bool sample_options=false;
+    bool sample_speculation=true;       // off: no drafts, plain sampling from the target
+    bool sample_timing_schedule=false;  // adaptive: measured-cost owner choice (not reproducible)
+    std::uint32_t sample_repeats=1;     // independent requests with seeds seed..seed+N-1
 };
+inline TokenSamplingPolicy mtp_sampling_policy(const MtpCliOptions& m) noexcept {
+    return {static_cast<float>(m.sample_temperature),m.sample_top_k,static_cast<float>(m.sample_top_p),
+        static_cast<float>(m.sample_min_p),m.sample_seed};
+}
+inline bool mtp_sampling(const MtpCliOptions& m) noexcept {return m.sample_temperature>0.0;}
 // This is execution evidence: a configured owner alone is not an attempted
 // native window (EOS, remaining budget/context and history can choose serial).
 inline float mtp_draft_min_probability(const MtpCliOptions& m) noexcept {
@@ -162,6 +189,8 @@ struct Options {
     // Prompt prefill arithmetic (--prefill-numerical-profile). Absent: the prefill uses
     // numerical_profile. Decode and MTP windows always use numerical_profile.
     std::optional<strix::DecodeNumericalProfile> prefill_numerical_profile;
+    // --prefill-fast-components hc,dense,moe,qsa,router: the components a fast prefill profile runs (all by default).
+    std::optional<std::uint32_t> prefill_fast_components;
     bool profile_explicit = false;
     bool any_low_level_flag = false;
     bool context_explicit = false;
@@ -429,7 +458,9 @@ inline void validate_numerical_profile_cli(const Options& options) {
 // The resolved prefill/decode arithmetic pair. Without --prefill-numerical-profile the prefill
 // runs the decode profile, so every existing route keeps its single-profile behaviour.
 inline strix::NumericalProfilePair numerical_profile_pair(const Options& options) noexcept {
-    return {options.prefill_numerical_profile.value_or(options.numerical_profile), options.numerical_profile};
+    const auto prefill = options.prefill_numerical_profile.value_or(options.numerical_profile);
+    return {prefill, options.numerical_profile,
+        strix::numerical_profile_fast_prefill(prefill) ? options.prefill_fast_components.value_or(strix::kFastPrefillAll) : 0U};
 }
 
 // A split pair is admitted only where the code runs it: the tiled known-prefix prefill
@@ -437,10 +468,15 @@ inline strix::NumericalProfilePair numerical_profile_pair(const Options& options
 // prefill profile. Everything else keeps one profile for both phases.
 inline void validate_prefill_numerical_profile_cli(const Options& options) {
     const auto pair = numerical_profile_pair(options);
+    if (strix::numerical_profile_fast_prefill(options.numerical_profile))
+        throw std::invalid_argument("fast prefill profiles are prefill-only (--prefill-numerical-profile)");
+    if (options.prefill_fast_components && !strix::numerical_profile_fast_prefill(pair.prefill))
+        throw std::invalid_argument("--prefill-fast-components requires a fast prefill numerical profile");
     if (!pair.split()) return;
     if (!options.numerical_profile_explicit || !strix::numerical_profile_pair_admitted(pair))
         throw std::invalid_argument("prefill numerical profile may differ from an explicit --numerical-profile only in "
-            "the dense A8 projections (q5k-a8-gateup profiles with and without +dense-a8)");
+            "the dense A8 projections (q5k-a8-gateup profiles with and without +dense-a8), or be "
+            "fast-prefill-f16wmma-v1 paired with hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1");
     const bool tiled = options.known_prefix_window && options.known_prefix_prefill_rows && options.known_prefix_full_rows;
     if (tiled == options.mtp.enabled)
         throw std::invalid_argument("prefill numerical profile requires exactly one prefill route: the tiled known-prefix "
@@ -614,7 +650,7 @@ inline void validate_known_prefill_options(const Options& options) {
         options.known_prefill_uma_explicit || options.known_prefill_headroom_explicit;
     if (!any) return;
     if (!options.known_prefix_window || !options.known_prefix_prefill_explicit ||
-        options.known_prefix_prefill_rows < 16U || options.known_prefix_prefill_rows > 2048U ||
+        options.known_prefix_prefill_rows < 16U || options.known_prefix_prefill_rows > strix::known_prefill_max_rows ||
         options.known_prefix_rows_explicit || options.prompt_lookup ||
         !options.known_prefill_workspace_explicit || !options.known_prefill_metadata_explicit ||
         !options.known_prefill_uma_explicit || !options.known_prefill_headroom_explicit ||
@@ -873,11 +909,38 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
         throw std::invalid_argument("MTP draft vocabulary options require --mtp-draft-chain");
     if(m.draft_q4 && m.draft_vocab.empty() && !m.draft_context_vocab)
         throw std::invalid_argument("MTP draft Q4 head requires a draft vocabulary subset");
+    if(m.sample_options) {
+        validate_token_sampling_policy(mtp_sampling_policy(m));
+        if(!mtp_sampling(m) && (m.sample_top_k || m.sample_top_p!=1.0 || m.sample_min_p!=0.0 || !m.sample_speculation ||
+           m.sample_timing_schedule || m.sample_repeats!=1U))
+            throw std::invalid_argument("MTP sampling options require --mtp-sample-temperature above zero");
+        if(mtp_sampling(m) && m.sample_speculation && !m.draft_chain)
+            throw std::invalid_argument("MTP speculative sampling requires --mtp-draft-chain (or --mtp-sample-speculation off)");
+        if(!m.sample_repeats || (mtp_sampling(m) && (m.metadata_only || !m.golden_dump.empty())))
+            throw std::invalid_argument("MTP sampling needs a generation route and at least one request");
+        // Not combined with the other request forms yet (each was qualified alone).
+        if(mtp_sampling(m) && (tiled || !m.cohort.empty()))
+            throw std::invalid_argument("MTP sampling does not combine with the tiled MTP prompt or cohort requests");
+    }
     if(m.window_rows && m.candidate_depth<m.window_rows-1U)
         throw std::invalid_argument("MTP target window requires candidate depth at least rows minus one");
     if(m.window_rows && (o.gdn_recurrent_layout!=HipGdnRecurrentLayout::baseline || o.gdn_recurrent_storage!=GdnRecurrentStorage::key_value ||
        o.qsa_hierarchical_selection || o.qsa_gqa_heads_per_block!=1U))
         throw std::invalid_argument("MTP closed target windows require baseline recurrent and QSA organizations");
+    if(!m.cohort_mode.empty() && m.cohort.empty())
+        throw std::invalid_argument("MTP cohort mode requires --mtp-cohort-request");
+    if(!m.cohort.empty()) {
+        if(tiled) throw std::invalid_argument("MTP cohort requests do not combine with the tiled MTP prompt");
+        if(m.cohort.size()>3U || m.metadata_only || !m.golden_dump.empty() || !m.window_prefix || !m.draft_chain ||
+           m.window_rows_set!=std::vector<std::uint32_t>{2U,4U,8U} || o.prefill_numerical_profile.has_value())
+            throw std::invalid_argument("MTP cohort requests (at most three besides the positional prompt) require prefix "
+                "windows over the row set 2,4,8, the draft chain, an input golden and one numerical profile");
+        for(const auto& request:m.cohort)
+            if(request.tokens.size()<3U || request.tokens.size()>4097U || !mtp_sha256_text(request.golden_sha256) || request.golden.empty() ||
+               ((resolved || o.context_explicit) && (request.tokens.size()>o.context_tokens ||
+                o.generate_tokens>o.context_tokens-request.tokens.size()+1U)))
+                throw std::invalid_argument("MTP cohort request requires 3..4097 prompt tokens within the context and a pinned golden");
+    }
 }
 inline void validate_resolved_mtp_cli(const Options& o) {
     validate_mtp_cli(o,true);
@@ -998,6 +1061,25 @@ inline Options parse_options(
             options.prefill_numerical_profile = *parsed;
             continue;
         }
+        if (argument == "--prefill-fast-components") {
+            if (options.prefill_fast_components || index + 1 >= argc)
+                throw std::invalid_argument("--prefill-fast-components requires one list of hc, dense, moe, qsa, router, dense8");
+            std::string_view list = argv[++index];
+            std::uint32_t mask = 0;
+            while (!list.empty()) {
+                const auto comma = list.find(',');
+                const auto item = list.substr(0, comma);
+                const std::uint32_t bit = item == "hc" ? strix::kFastPrefillHc : item == "dense" ? strix::kFastPrefillDense
+                    : item == "moe" ? strix::kFastPrefillMoe : item == "qsa" ? strix::kFastPrefillQsa
+                    : item == "router" ? strix::kFastPrefillRouter : item == "dense8" ? strix::kFastPrefillDense8 : 0U;
+                if (!bit || (mask & bit)) throw std::invalid_argument("--prefill-fast-components accepts hc, dense, moe, qsa, router, dense8 once each");
+                mask |= bit;
+                list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1U);
+            }
+            if (!mask) throw std::invalid_argument("--prefill-fast-components requires at least one component");
+            options.prefill_fast_components = mask;
+            continue;
+        }
         if(argument=="--mtp") {
             if(options.mtp.enabled)throw std::invalid_argument("duplicate MTP route option");
             options.mtp.enabled=true;continue;
@@ -1033,6 +1115,31 @@ inline Options parse_options(
             throw std::invalid_argument("MTP draft chain is a flag without a value");
         if(argument.starts_with("--mtp-window-expert-union="))
             throw std::invalid_argument("MTP window expert union is a flag without a value");
+        if(argument=="--mtp-cohort-request") {
+            // TOKENS_FILE,GOLDEN_FILE,GOLDEN_SHA256 (repeatable): decimal token IDs separated by commas or whitespace.
+            if(index+1>=argc)throw std::invalid_argument("MTP cohort request requires a value");
+            const std::string value=argv[++index];
+            const auto a=value.find(','),b=a==std::string::npos?std::string::npos:value.find(',',a+1U);
+            if(a==std::string::npos || b==std::string::npos || value.find(',',b+1U)!=std::string::npos)
+                throw std::invalid_argument("MTP cohort request is TOKENS_FILE,GOLDEN_FILE,GOLDEN_SHA256");
+            MtpCliOptions::CohortRequest request;
+            request.golden=value.substr(a+1U,b-a-1U);request.golden_sha256=value.substr(b+1U);
+            std::ifstream file(value.substr(0,a));
+            if(!file)throw std::invalid_argument("MTP cohort request token file cannot be read");
+            std::string text((std::istreambuf_iterator<char>(file)),std::istreambuf_iterator<char>());
+            for(auto& ch:text)if(ch==',')ch=' ';
+            std::istringstream words(text);std::string word;
+            while(words>>word)request.tokens.push_back(static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                parse_u64(word,"MTP cohort request token"),UINT32_MAX)));
+            options.mtp.supplied=true;options.mtp.cohort.push_back(std::move(request));continue;
+        }
+        if(argument=="--mtp-cohort-mode") {
+            if(index+1>=argc || !options.mtp.cohort_mode.empty())throw std::invalid_argument("MTP cohort mode requires one value");
+            options.mtp.cohort_mode=argv[++index];
+            if(options.mtp.cohort_mode!="lockstep" && options.mtp.cohort_mode!="sequential")
+                throw std::invalid_argument("MTP cohort mode is lockstep or sequential");
+            options.mtp.supplied=true;continue;
+        }
         if(argument.starts_with("--mtp-")) {
             const auto equal=argument.find('=');const auto key=argument.substr(0,equal);
             if(!mtp_option_names.insert(std::string(key)).second)throw std::invalid_argument("duplicate MTP option");
@@ -1063,6 +1170,17 @@ inline Options parse_options(
             else if(key=="--mtp-max-hidden-error")m.max_hidden_error=parse_double(value,"MTP hidden policy");
             else if(key=="--mtp-max-logit-error")m.max_logit_error=parse_double(value,"MTP logit policy");
             else if(key=="--mtp-spec-min-p")m.spec_min_p=parse_double(value,"MTP draft minimum probability");
+            else if(key=="--mtp-sample-temperature"){m.sample_options=true;m.sample_temperature=parse_double(value,"MTP sampling temperature");}
+            else if(key=="--mtp-sample-top-p"){m.sample_options=true;m.sample_top_p=parse_double(value,"MTP sampling top-p");}
+            else if(key=="--mtp-sample-min-p"){m.sample_options=true;m.sample_min_p=parse_double(value,"MTP sampling min-p");}
+            else if(key=="--mtp-sample-speculation"){
+                if(value!="on" && value!="off")throw std::invalid_argument("MTP sample speculation is on or off");
+                m.sample_options=true;m.sample_speculation=value=="on";
+            }
+            else if(key=="--mtp-sample-schedule"){
+                if(value!="fixed" && value!="adaptive")throw std::invalid_argument("MTP sample schedule is fixed or adaptive");
+                m.sample_options=true;m.sample_timing_schedule=value=="adaptive";
+            }
             else if(key=="--mtp-target-window-rows-set") {
                 for(std::size_t begin=0;begin<=value.size();) {
                     const auto end=std::min(value.find(',',begin),value.size());
@@ -1092,6 +1210,11 @@ inline Options parse_options(
                     m.calibration_rows=static_cast<std::uint32_t>(n);
                 }
                 else if(key=="--mtp-policy-id")m.policy_identity=n;
+                else if(key=="--mtp-sample-seed"){m.sample_options=true;m.sample_seed=n;}
+                else if(key=="--mtp-sample-top-k" || key=="--mtp-sample-repeats"){
+                    if(n>UINT32_MAX)throw std::invalid_argument("MTP sampling top-k/repeats exceeds uint32");
+                    m.sample_options=true;(key=="--mtp-sample-top-k"?m.sample_top_k:m.sample_repeats)=static_cast<std::uint32_t>(n);
+                }
                 else if(key=="--mtp-window-arena-bytes")m.window_arena_bytes=n;
                 else if(key=="--mtp-window-capture-bytes")m.window_capture_bytes=n;
                 else if(key=="--mtp-window-checkpoint-bytes")m.window_checkpoint_bytes=n;
@@ -1314,7 +1437,8 @@ inline Options parse_options(
                 value = argv[++index];
             } else value = argument.substr(std::string_view("--known-prefix-prefill-rows=").size());
             const auto rows = parse_u64(value,"known prefill rows");
-            if (rows < 16U || rows > 2048U) throw std::invalid_argument("known prefill rows must be 16 through 2048");
+            if (rows < 16U || rows > strix::known_prefill_max_rows)
+                throw std::invalid_argument("known prefill rows must be 16 through " + std::to_string(strix::known_prefill_max_rows));
             options.known_prefix_prefill_rows = static_cast<std::uint32_t>(rows);
             options.known_prefix_prefill_explicit = true;
             continue;

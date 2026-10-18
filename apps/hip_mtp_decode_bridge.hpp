@@ -123,6 +123,18 @@ inline std::uint64_t mtp_cli_mul(std::uint64_t a,std::uint64_t b) {
     if(b && a>UINT64_MAX/b)throw std::overflow_error("MTP CLI payload budget overflow");
     return a*b;
 }
+// Sampling receipt: the policy, its identity and the decision counts of this request.
+inline std::string mtp_sampling_receipt(const MtpCliOptions& m,const TokenSampler* sampler) {
+    std::ostringstream out;out<<std::setprecision(9);
+    if(!sampler){out<<"{\"identity\":\"greedy-first-max\"}";return out.str();}
+    const auto& p=sampler->policy();const auto& s=sampler->stats();
+    out<<"{\"identity\":\"sampling-v1\",\"temperature\":"<<p.temperature<<",\"top_k\":"<<p.top_k<<",\"top_p\":"<<p.top_p
+       <<",\"min_p\":"<<p.min_p<<",\"seed\":"<<p.seed<<",\"policy_identity\":"<<token_sampling_policy_identity(p)
+       <<",\"speculation\":"<<(m.sample_speculation?"true":"false")<<",\"schedule\":\""<<(m.sample_timing_schedule?"adaptive-timed":"fixed")
+       <<"\",\"drafts\":"<<s.drafts<<",\"plain_decisions\":"<<s.plain<<",\"accepted_drafts\":"<<s.accepted
+       <<",\"rejected_drafts\":"<<s.rejected<<"}";
+    return out.str();
+}
 using MtpDecodeWindowFactory=std::function<std::shared_ptr<HipMtpWindowVerifier>(std::shared_ptr<HipMtpTargetHidden>)>;
 struct MtpDecodeQualificationContext {
     const Options& options;
@@ -182,11 +194,21 @@ inline HipMtpTargetHiddenTicket run_tiled_mtp_prompt(const Options& options,cons
     if(tiled.cache) restored=tiled.cache->begin_request(session,tokens);
     std::uint64_t pos=restored;
     std::vector<MtpDeviceView> views;std::vector<std::uint32_t> next;
+    // STRIX_MTP_TILED_START=0: the last prompt row always runs serially (the previous handoff).
+    // Otherwise a block that ends exactly at the last prompt row also computes that row's head, and
+    // the first draft cycle starts from the block's last row (its tap and FP32 logits).
+    static const bool tiled_start=[]{const char* v=std::getenv("STRIX_MTP_TILED_START");return !v || v[0]!='0';}();
+    HipMtpTargetHiddenTicket pending;
+    bool adopted=false;
     const auto run=[&](HipKnownPromptBackend& backend,HipKnownPrefixWindow& owner,std::uint32_t rows,bool capture) {
         owner.set_prefill_step_observer(observer);block_rows=rows;
+        const bool heads=tiled_start && backend.output_policy()!=KnownWindowOutputPolicy::state_only;
         try {
-            while(pos+rows<=n-1U) {
-                backend.execute_state_rows(tokens.subspan(static_cast<std::size_t>(pos),rows),pos);
+            while(!adopted && (pos+rows<=n-1U || (heads && pos+rows==n))) {
+                const bool final_block=pos+rows==n;
+                std::vector<float> logits;
+                if(final_block) logits=backend.execute_rows(tokens.subspan(static_cast<std::size_t>(pos),rows),pos);
+                else backend.execute_state_rows(tokens.subspan(static_cast<std::size_t>(pos),rows),pos);
                 views.clear();next.clear();
                 if(pos){views.push_back(view(held));next.push_back(tokens[static_cast<std::size_t>(pos)]);}
                 for(std::uint32_t r=0;r+1U<rows;++r){views.push_back(view(block_hidden+static_cast<std::size_t>(r)*width));
@@ -197,13 +219,16 @@ inline HipMtpTargetHiddenTicket run_tiled_mtp_prompt(const Options& options,cons
                 pos+=rows;
                 if(capture && tiled.cache) tiled.cache->after_block(session,tokens,n-1U);
                 if(capture)++blocks;else ++tail_blocks;
+                if(final_block) {
+                    pending=target.adopt_prefill_row(session,tokens[static_cast<std::size_t>(n-1U)],view(held),logits);
+                    adopted=true;
+                }
             }
         } catch(...) {owner.set_prefill_step_observer({});throw;}
         owner.set_prefill_step_observer({});
     };
     run(*tiled.blocks,*tiled.block_owner,tiled.rows,true);
     for(const auto& tail:tiled.tails) run(*tail.backend,*tail.owner,tail.rows,false);
-    HipMtpTargetHiddenTicket pending;
     while(pos<n) {
         auto ticket=target.execute_serial(session,resources,dispatcher,tokens[static_cast<std::size_t>(pos)]);
         if(pos) {
@@ -221,7 +246,7 @@ inline HipMtpTargetHiddenTicket run_tiled_mtp_prompt(const Options& options,cons
     out<<"\"rows\":"<<tiled.rows<<",\"tail_rows\":[";
     for(std::size_t t=0;t<tiled.tails.size();++t)out<<(t?",":"")<<tiled.tails[t].rows;
     out<<"],\"restored_position\":"<<restored
-       <<",\"blocks\":"<<blocks<<",\"tail_blocks\":"<<tail_blocks<<",\"serial_rows\":"<<serial_rows
+       <<",\"blocks\":"<<blocks<<",\"tail_blocks\":"<<tail_blocks<<",\"serial_rows\":"<<serial_rows<<",\"tiled_start\":"<<(adopted?"true":"false")
        <<",\"prompt_ms\":"<<prompt_ms;
     if(tiled.cache) {
         const auto& q=tiled.cache->request();
@@ -354,6 +379,10 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     auto target=HipMtpTargetHidden::create(model,compiled,actual.memory,actual.model,actual.allocator,
         retained_rows,m.target_capture_bytes,d1);
     if(split)target->set_prompt_execution(*parents->prompt.compiled);
+    // Sampled decoding: the final prompt row and every generated row select by the sampler;
+    // earlier prompt rows keep first-max selection (their predictions are never emitted).
+    const auto sampler=mtp_sampling(m) && !dump && !qualify ? std::make_shared<TokenSampler>(mtp_sampling_policy(m))
+                                                           : std::shared_ptr<TokenSampler>{};
     std::shared_ptr<HipMtpWindowVerifier> window;
     if(m.window_rows && !dump) {
         if(!make_window)throw std::invalid_argument("MTP requested target window has no actual prepared native factory");
@@ -385,6 +414,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         const auto prompt_rows=tiled_prompt ? calibration_rows+1U : options.tokens.size();
         const auto calibration_start=std::chrono::steady_clock::now();
         for(std::size_t i=0;i<prompt_rows;++i) {
+            if(sampler && !tiled_prompt && i+1U==options.tokens.size())target->set_token_sampler(sampler);
             auto current=split ? target->execute_serial(session,parents->prompt.resources,*parents->prompt.dispatcher,options.tokens[i])
                                : target->execute_serial(session,r,dispatcher,options.tokens[i]);
             if(pending.valid())replay_rows.push_back({pending,options.tokens[i]});
@@ -451,6 +481,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             }
             draft.context_capacity=m.draft_context_vocab;draft.q4=m.draft_q4;
             runtime->enable_draft_chain(std::move(draft),m.draft_exact);runtime->observe_draft_context(options.tokens);
+            if(sampler && m.sample_speculation)runtime->set_draft_sampler(sampler);
         };
         if(tiled_prompt) {
             calibration_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-calibration_start).count();
@@ -505,7 +536,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         const auto start=std::chrono::steady_clock::now();
         while(generated.size()<options.generate_tokens && generated.back()!=eos.front()) {
             if(session.next_position>=options.context_tokens){stop="context-capacity";break;}
-            const auto result=greedy.cycle(pending,m.candidate_depth,
+            const auto result=greedy.cycle(pending,sampler && !m.sample_speculation?0U:m.candidate_depth,
                 static_cast<std::uint32_t>(options.generate_tokens-generated.size()),eos);
             if(result.emitted_tokens.empty())throw std::runtime_error("MTP generation made no completed target progress");
             generated.insert(generated.end(),result.emitted_tokens.begin(),result.emitted_tokens.end());
@@ -612,6 +643,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"  \"mtp_draft_q4_head\":"<<(m.draft_q4?"true":"false")<<",\n"
             <<"  \"mtp_draft_head_rows\":"<<draft_stats.rows<<",\n  \"mtp_draft_base_rows\":"<<draft_stats.base_rows<<",\n"
             <<"  \"mtp_draft_context_rows\":"<<draft_stats.context_rows<<",\n  \"mtp_draft_context_dropped\":"<<draft_stats.context_dropped<<",\n"
+            <<"  \"sampling\":"<<mtp_sampling_receipt(m,sampler.get())<<",\n"
             <<"  \"mtp_generation_cycle_elapsed_ms\":"<<elapsed<<",\n"
             <<"  \"mtp_timing_scope\":\"post-prompt-and-independent-replay-cycles-only-host-completed-wall-not-GPU-kernel-time\",\n"
             <<(tiled_prompt ? "  \"mtp_tiled_prompt\":{"+tiled_receipt+",\"calibration_rows\":"+std::to_string(calibration_rows)+

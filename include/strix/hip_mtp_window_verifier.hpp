@@ -11,6 +11,9 @@ struct HipMtpWindowVerificationPolicy {
     bool bounded_window_rollback=false; // explicit candidate, full fallback remains default
     // Adaptive owner choice (prefix owners only): 0 keeps the largest fitting owner.
     float min_probability=0.0F;
+    // Owner choice and draft continuation from draft probabilities only (no measured
+    // cycle times), so a sampled run is reproducible from its seed.
+    bool timing_independent_schedule=false;
 };
 struct HipMtpVerifiedTargetRows {
     std::vector<HipMtpTargetHiddenTicket> committed_rows;
@@ -21,13 +24,27 @@ struct HipMtpVerifiedTargetRows {
     std::uint32_t chosen_rows=1; // window owner rows, 1 = serial target steps
 };
 struct HipMtpWindowOwnerStats {std::uint32_t rows=0;std::uint64_t cycles=0;double cycle_ms_ema=0.0;};
+class HipMtpWindowVerifier;
+// One session of a cohort verification: its verifier, committed frontier and drafts, and the rows
+// of the prefix owner it verifies them with (2, 4 or 8; see HipMtpWindowVerifier::cohort_rows).
+struct HipMtpCohortVerifyRequest {
+    HipMtpWindowVerifier* verifier=nullptr;
+    SerialSessionContext* session=nullptr;
+    const HipMtpTargetHiddenTicket* initial=nullptr;
+    std::span<const std::uint32_t> candidates;
+    std::span<const float> probabilities;
+    std::uint32_t budget=0;
+    std::span<const std::uint32_t> eos;
+    std::uint32_t rows=0;
+};
 // One actual closed known-row window per cycle, with retained capture pools per owner.
 // Several prefix owners (distinct 2/4/8 rows over one session) share one deferred
 // GDN record; per cycle T = 1 + leading drafts with probability >= min_probability,
 // rounded up to an owner, then the owner (or serial at T = 1) with the best
 // expected tokens per ms under an EMA of measured cycle time.
 // Every speculative input except the pending seed must match the preceding
-// finite target prediction. A rejected/EOS-truncated window is restored before
+// finite target prediction (with the target's token sampler: the preceding
+// row's sampled decision, which uses that input's draft distribution). A rejected/EOS-truncated window is restored before
 // serial greedy replay; no provisional hidden row reaches MTP reconciliation.
 class HipMtpWindowVerifier final {
 public:
@@ -51,13 +68,29 @@ public:
     [[nodiscard]] HipMtpVerifiedTargetRows verify(SerialSessionContext&,DirectLaunchDispatcher&,
         const HipMtpTargetHiddenTicket& initial,std::span<const std::uint32_t> candidates,
         std::uint32_t output_budget,std::span<const std::uint32_t> eos_tokens,
-        std::span<const float> candidate_probabilities={});
+        std::span<const float> candidate_probabilities={},std::span<const TokenDraft> sampled_drafts={});
     // Whether one more draft can still pay off: the next larger window, with the remaining drafts assumed
     // as likely as the last one, beats the best window the current drafts already allow.
     [[nodiscard]] bool worth_drafting(std::span<const float> probabilities) const;
     // Setup only: every owner's window admission at the session's current frontier, so the
     // first window of each owner does not pay it inside the generation loop.
     void prepare_admission(const SerialSessionContext& session);
+    // Cohort verification (prefix owners only). cohort_rows: the owner verify() would size for these
+    // drafts without its cost model (1 + leading drafts at or above the minimum probability, at
+    // least 2, rounded up to an owner), 0 when no owner fits the budget, context room or lineage
+    // history (the session then verifies alone). cohort_fits: whether the owner of `rows` fits.
+    [[nodiscard]] std::uint32_t cohort_rows(const SerialSessionContext&,std::span<const std::uint32_t> candidates,
+        std::span<const float> probabilities,std::uint32_t output_budget) const;
+    [[nodiscard]] bool cohort_fits(const SerialSessionContext&,std::uint32_t rows,std::size_t candidates,
+        std::uint32_t output_budget) const;
+    [[nodiscard]] std::shared_ptr<HipKnownPrefixWindow> owner_with_rows(std::uint32_t rows) const;
+    // Verifies the drafts of several sessions with one cohort window
+    // (HipKnownPrefixWindow::execute_mtp_cohort) on primary, an idle owner of the requests' total
+    // rows. Per session the inputs, accepted prefix, commit, frontier rewind and published rows are
+    // those of verify() with the same owner, so every emitted token is the session's own target
+    // greedy token. Owner cost samples are not taken from cohort cycles. Results in request order.
+    [[nodiscard]] static std::vector<HipMtpVerifiedTargetRows> verify_cohort(
+        std::span<const HipMtpCohortVerifyRequest> requests,HipKnownPrefixWindow& primary);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

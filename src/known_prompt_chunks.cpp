@@ -1,4 +1,5 @@
 #include "strix/known_prompt_chunks.hpp"
+#include "strix/known_prefill_limits.hpp"
 
 #include "strix/serial_decode_replay.hpp"
 
@@ -18,9 +19,9 @@ KnownPromptChunkCursor::KnownPromptChunkCursor(KnownPromptChunkRequest request,
         request.context_capacity,request.max_new_tokens,request.eos_token_id});
     (void)validated;
     if(request.tiled_prefill) {
-        if(request.logical_rows<16U || request.logical_rows>2048U ||
+        if(request.logical_rows<16U || request.logical_rows>known_prefill_max_rows ||
             !windows.supports_tiled_prefill())
-            throw std::invalid_argument("tiled prompt prefill requires an explicitly capable T16..2048 backend");
+            throw std::invalid_argument("tiled prompt prefill requires an explicitly capable T"+known_prefill_rows_range()+" backend");
         if(request.output_policy==KnownWindowOutputPolicy::state_only && request.max_new_tokens)
             throw std::invalid_argument("state-only tiled prefill supports zero-emission requests only");
     } else if((request.logical_rows!=2U && request.logical_rows!=4U && request.logical_rows!=8U) ||

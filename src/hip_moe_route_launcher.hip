@@ -1,6 +1,7 @@
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
+#include "strix/known_window_cohort.hpp"
 #include "strix/wave_router_contract.hpp"
 
 #include "strix/dispatch_resources.hpp"
@@ -48,6 +49,7 @@ template <typename Pointer> __device__ __forceinline__ Pointer route_tiled(Point
 template <typename Pointer> __device__ __forceinline__ Pointer route_tiled(Pointer pointer, std::uint64_t stride, const RouterTileRowsArgs&) {
     return reinterpret_cast<Pointer>(reinterpret_cast<std::uintptr_t>(pointer) + static_cast<std::uint64_t>(blockIdx.y) * stride);
 }
+#include "hip_router_fast_prefill.inc"
 constexpr std::uint64_t kLauncherTag =
     0x4d4f45524f555432ULL;
 constexpr std::uint64_t fnv_offset =
@@ -1795,9 +1797,11 @@ PreparedRouterRows prepare_router_rows(std::span<const ExecutionDispatchContext>
     auto* user = const_cast<HipMoeRouteLauncherConfig*>(&config);
     for (std::size_t r = 0; r < rows.size(); ++r) {
         const auto& row = rows[r];
+        // A cohort window starts a new session segment (its own window identity) at row r.
+        const auto& head = rows[known_window_segment_start(rows, r) ? r : r - 1U];
         if (row.logical_rows != 1U || row.request_concurrency != 1U ||
-            row.execution_identity != first.execution_identity || row.step_id != first.step_id ||
-            row.layer != first.layer || row.kernel_id != first.kernel_id || row.position != first.position + r)
+            row.execution_identity != head.execution_identity || row.step_id != first.step_id ||
+            row.layer != first.layer || row.kernel_id != first.kernel_id || !known_window_row_position_follows(rows, r))
             throw std::invalid_argument("known-window router rows identity/position differs");
         const auto prepared = prepare_router_launch(row, user);
         const auto workspace = prepare_parallel_router_workspace(row, config);
@@ -2002,7 +2006,12 @@ void route_prefill(std::span<const ExecutionDispatchContext> rows, const HipMoeR
         else if (tiles_per_lane == 8U) by_chunk.template operator()<8U>();
         else by_chunk.template operator()<4U>();
     };
-    if (tiles_per_lane > 1U && hidden_aligned) {
+    // Fast prefill profile, router component: BF16 WMMA logits with two-term weights (hip_router_fast_prefill.inc).
+    if (config.router_fast_prefill && config.activation == HipActivationStorage::bf16 && config.hidden_size % router_fast::kK == 0U &&
+        config.expert_count % router_fast::kN == 0U)
+        hipLaunchKernelGGL(router_fast::logits_kernel<2U>, dim3((tiles * 8U + router_fast::kM - 1U) / router_fast::kM,
+            config.expert_count / router_fast::kN), dim3(256U), 0, stream, args, f32, config.hidden_size, tiles * 8U);
+    else if (tiles_per_lane > 1U && hidden_aligned) {
         if (config.activation == HipActivationStorage::bf16) by_tiles.template operator()<std::uint16_t>();
         else by_tiles.template operator()<float>();
     } else if (config.activation == HipActivationStorage::bf16)

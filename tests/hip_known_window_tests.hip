@@ -823,7 +823,7 @@ struct QsaFixture {
     ExecutionLauncher selected;
 
     const bool bf16_indexer;
-    QsaFixture(bool prefetch, bool wave8, bool bf16_index, std::uint64_t context_tokens) : bf16_indexer(bf16_index) {
+    QsaFixture(bool prefetch, bool wave8, bool bf16_index, std::uint64_t context_tokens, bool dense = false) : bf16_indexer(bf16_index) {
         const auto found = std::find_if(execution.steps.begin(), execution.steps.end(),
             [](const auto& value) { return value.op == SerialOp::indexed_attention; });
         require(found != execution.steps.end(), "canonical QSA operator missing");
@@ -893,6 +893,7 @@ struct QsaFixture {
         config.model = model;
         config.prefetch_q8_input = prefetch;
         config.wave8_q8_output = wave8;
+        config.dense_a8_projections = dense;
         if (prefetch) {
             config.prefetch_eligible_layers = {*step.layer};
             config.prefetch_stats = std::make_shared<qsa_input_prefetch::RuntimeDispatchStats>();
@@ -900,6 +901,7 @@ struct QsaFixture {
         ExecutionBindingRequest binding;
         binding.prefetch_q8_qsa_input = prefetch; binding.qsa_input_prefetch_layers = config.prefetch_eligible_layers;
         binding.wave8_q8_qsa_output = wave8;
+        binding.dense_a8 = dense;
         kernels::KernelRegistry registry;
         register_hip_indexed_attention_kernel_variant(model, binding, config, registry);
         require(registry.variants().size() == 1U, "QSA serial selection is ambiguous");
@@ -1087,6 +1089,92 @@ void qsa_rows_family(bool prefetch, bool wave8, bool bf16_indexer) {
                       << "ms 1-row=" << one_ms << "ms speedup=" << serial_ms / rows_ms << "x rows/1-row=" << rows_ms / one_ms << "\n";
         }
     check(hipEventDestroy(begin), "bench event"); check(hipEventDestroy(end), "bench event");
+}
+
+// Cohort: the rows of two or three sessions (own KV and raw-index state, own positions) in one
+// cohort launch against each session's own rows launch from the same state and inputs.
+void qsa_cohort_family(bool dense, bool bf16_indexer) {
+    QsaFixture f(!dense, true, bf16_indexer, 2304U, dense);
+    struct Session { Span state; std::vector<unsigned char> host, initial; SessionStateMemoryBinding memory; ExecutionRuntimeResources resources; };
+    std::array<Session, 3> sessions;
+    for (std::size_t k = 0; k < sessions.size(); ++k) {
+        auto& session = sessions[k];
+        session.state = f.owner.allocate(f.state_layout.device_total_bytes);
+        session.host.resize(static_cast<std::size_t>(f.state_layout.host_total_bytes));
+        session.memory = {f.state_layout.layout_identity, session.state.address, session.state.bytes, 61U + k,
+            reinterpret_cast<std::uintptr_t>(session.host.data()), f.state_layout.host_total_bytes, 67U + k};
+        session.resources = f.resources; session.resources.session_state_memory = &session.memory;
+        // Each session's own finite BF16 history in every QSA cell of the tested layer.
+        session.initial.assign(static_cast<std::size_t>(session.state.bytes), 0U);
+        for (const auto component : {SessionStateComponent::attention_kv, SessionStateComponent::sparse_index}) {
+            const auto view = resolve_indexed_attention_layer_state(f.state_layout, session.memory, f.model, *f.step.layer, component);
+            std::vector<std::uint16_t> values(static_cast<std::size_t>(view.bytes / 2U));
+            for (std::size_t i = 0; i < values.size(); ++i) {
+                const auto mixed = (i * 2654435761ULL + 37U * (k + 1U) + (component == SessionStateComponent::attention_kv ? 17U : 91U)) >> 7U;
+                values[i] = bf16(static_cast<float>(static_cast<int>(mixed % 2001U) - 1000) * 0.001F);
+            }
+            std::memcpy(session.initial.data() + (view.address - session.state.address), values.data(), values.size() * 2U);
+        }
+    }
+    const auto run = [&](const std::vector<std::uint32_t>& sizes, const std::vector<std::uint64_t>& positions, bool cohort) {
+        write(f.scratch, f.seed);
+        for (std::size_t k = 0; k < sizes.size(); ++k) write(sessions[k].state, sessions[k].initial);
+        auto rows = f.rows;
+        std::uint32_t first = 0;
+        std::vector<HipQsaCohortSegment> segments;
+        for (std::size_t k = 0; k < sizes.size(); ++k) {
+            for (std::uint32_t r = 0; r < sizes[k]; ++r) {
+                rows[first + r].resources = &sessions[k].resources;
+                rows[first + r].session_state_memory = &sessions[k].memory;
+                rows[first + r].position = positions[k] + r;
+            }
+            segments.push_back({std::span<const ExecutionDispatchContext>(rows.data() + first, sizes[k]), &f.config});
+            first += sizes[k];
+        }
+        {
+            const HipLaunchScope active(f.scope());
+            if (cohort) { indexed_attention_known_window_cohort_preflight(segments); indexed_attention_known_window_cohort_launch(segments); }
+            else for (const auto& segment : segments) indexed_attention_known_window_rows_launch(segment.rows, f.config);
+        }
+        f.owner.finish();
+        std::vector<std::vector<unsigned char>> out{read(f.scratch)};
+        for (std::size_t k = 0; k < sizes.size(); ++k) out.push_back(read(sessions[k].state));
+        return out;
+    };
+    unsigned compared = 0;
+    const std::vector<std::vector<std::uint32_t>> shapes{{2U, 2U}, {4U, 4U}, {2U, 2U, 4U}, {4U, 2U, 2U}};
+    const std::vector<std::vector<std::uint64_t>> placements{{0U, 6U, 2045U}, {2047U, 1U, 2201U}, {2201U, 2042U, 3U}};
+    for (const auto& sizes : shapes)
+        for (const auto& positions : placements) {
+            const auto reference = run(sizes, positions, false);
+            const auto candidate = run(sizes, positions, true);
+            require(candidate[0] == reference[0], "QSA cohort output/workspace bytes differ from each session's own window");
+            for (std::size_t k = 1; k < candidate.size(); ++k)
+                require(candidate[k] == reference[k], "QSA cohort KV/raw-index state differs from the session's own window");
+            ++compared;
+        }
+    // Every segment keeps the single-session admission; totals other than 4 or 8 are rejected.
+    const auto rejected = [&](const std::vector<std::uint32_t>& sizes, bool same_state, const char* message) {
+        auto rows = f.rows;
+        std::vector<HipQsaCohortSegment> segments;
+        std::uint32_t first = 0;
+        for (std::size_t k = 0; k < sizes.size(); ++k) {
+            const auto& session = sessions[same_state ? 0U : k];
+            for (std::uint32_t r = 0; r < sizes[k]; ++r) {
+                rows[first + r].resources = &session.resources; rows[first + r].session_state_memory = &session.memory;
+                rows[first + r].position = 100U * (k + 1U) + r;
+            }
+            segments.push_back({std::span<const ExecutionDispatchContext>(rows.data() + first, sizes[k]), &f.config});
+            first += sizes[k];
+        }
+        bool thrown = false;
+        try { indexed_attention_known_window_cohort_preflight(segments); } catch (const std::invalid_argument&) { thrown = true; }
+        require(thrown, message);
+    };
+    rejected({2U, 4U}, false, "QSA cohort admits only four or eight rows in total");
+    rejected({2U, 2U}, true, "QSA cohort rejects two segments of one session state");
+    std::cout << "QSA cohort dense=" << dense << " bf16_indexer=" << bf16_indexer << ": " << compared
+              << " cohort windows bit-exact against per-session windows\n";
 }
 
 // Whole QSA layer (synthetic weights, model shapes) at long context: the
@@ -1430,6 +1518,126 @@ void family_hyper_rows(SerialOp op, bool splitk, bool lane, std::uint32_t count)
     reject([&] { hyper_mix_known_window_rows_launch(bad, f.config); }, "late HC row without resources was admitted");
     auto fp64 = f.config; fp64.splitk_projection = true; fp64.splitk_projection_fp64 = true;
     reject([&] { hyper_mix_known_window_rows_preflight(f.rows, fp64); }, "FP64 HC oracle was admitted as a window entry");
+}
+
+// An inject rows step and the HC rows step that reads its streams, in the real window arena: the
+// persistent launch with the inject folded in equals the two launches byte for byte over the arena.
+// Returns false when the folded launch declined the pair (nothing enqueued).
+bool family_hyper_inject_rows(SerialOp inject_op, std::uint32_t inject_layer, std::uint32_t count) {
+    Owner owner;
+    const auto model = ModelContract::qwen38_flash_next();
+    const auto execution = build_serial_decode_execution_plan(model);
+    const auto io = build_serial_execution_io_plan(execution, true);
+    const auto inject_step = std::find_if(execution.steps.begin(), execution.steps.end(),
+        [&](const auto& s) { return s.op == inject_op && s.layer == inject_layer; });
+    require(inject_step != execution.steps.end() && inject_step + 1 != execution.steps.end(), "inject step missing");
+    const auto mix_step = *(inject_step + 1);
+    const bool final_mix = mix_step.op == SerialOp::final_hyper_mix;
+    require(mix_step.op == SerialOp::attn_hyper_mix || mix_step.op == SerialOp::mlp_hyper_mix || final_mix,
+        "inject step is not followed by an HC step");
+    ExecutionBufferRequest request; request.parallel_moe_router = true;
+    const auto serial = build_serial_execution_arena_plan(model, request, execution, io, 256U);
+    const auto window = build_known_window_arena(serial, 256U, count);
+    const auto scratch = owner.allocate(window.physical.total_bytes);
+    const ExecutionMemoryBinding memory{0x4b4e4f574e494a01ULL + count, scratch.address, scratch.bytes, 37U};
+    ModelManifest manifest; manifest.architecture = "qwen4_exp";
+    ModelRuntimeBinding runtime;
+    ExecutionTensorAccessPlan access;
+    std::vector<Weight> weights;
+    const auto add = [&](std::string name, std::uint32_t type, std::vector<std::uint64_t> dimensions, std::vector<unsigned char> bytes) {
+        ManifestTensor tensor;
+        tensor.name = final_mix ? std::move(name) : "blk." + std::to_string(*mix_step.layer) + "." + name;
+        tensor.role = TensorRole::dense_projection; tensor.layer = mix_step.layer; tensor.ggml_type = type;
+        tensor.dimensions = std::move(dimensions); tensor.byte_size = bytes.size();
+        tensor.absolute_offset = (manifest.total_tensor_bytes + 15U) / 16U * 16U;
+        manifest.total_tensor_bytes = tensor.absolute_offset + tensor.byte_size;
+        const auto device = owner.allocate(bytes.size());
+        write(device, bytes);
+        const auto index = static_cast<std::uint32_t>(weights.size());
+        weights.push_back({device, std::move(bytes)});
+        manifest.tensors.push_back(std::move(tensor));
+        runtime.tensors.push_back({index, RuntimeTensorStorage::resident, device.address, device.bytes, 7U, 0U});
+    };
+    add("hc_norm.weight", 0U, {10240}, f32(10240U, 1.0F, 0.04F));
+    add("hc_down.weight", 8U, {10240, 320}, q8(10240, 320, 23U));
+    add("hc_up.weight", 8U, {320, 10240}, q8(320, 10240, 19U));
+    if (!final_mix) add("hc_inject.weight", 0U, {10240, 4}, f32(40960U, 0.0004F, 0.0002F));
+    for (std::uint32_t slot = 0; slot < weights.size(); ++slot) access.accesses.push_back({mix_step.id, mix_step.op, slot, {slot}});
+    manifest.layout_identity = model_manifest_layout_identity(manifest);
+    runtime.manifest_layout_identity = manifest.layout_identity;
+    runtime.model_content_identity.bytes[0] = 1U;
+    access.manifest_layout_identity = manifest.layout_identity;
+    access.plan_identity = 0x4b4e4f574e494a02ULL;
+    const ExecutionRuntimeResources resources{&memory, &manifest, &runtime, &access};
+    HipHyperMixLauncherConfig config;
+    config.hidden_size = 2560U; config.hc_count = 4U; config.lowrank = 320U; config.rms_epsilon = model.rms_norm_epsilon;
+    config.parallel = config.staged_projections = config.fused_injection = config.typed_projection = true;
+    config.prefetch_rows = config.prefetch_q8_output = true;
+    config.lane_chain_output = true; config.splitk_projection = true;
+    ExecutionBindingRequest binding; binding.lane_chain_hyper_output = true;
+    kernels::KernelRegistry registry;
+    register_hip_hyper_mix_kernel_variant(model, binding, config, registry);
+    require(registry.variants().size() == 1U, "HC serial selection is ambiguous");
+    const auto mix_id = registry.variants().front().id;
+    HipElementwiseLauncherConfig elementwise{2560U, 4U, HipActivationStorage::bf16};
+    const auto inject_launcher = make_hip_inject_launcher("hip.inject.test", &elementwise);
+    const auto contexts = [&](const ExecutionStep& s, std::string_view id) {
+        std::vector<ExecutionDispatchContext> out(count);
+        for (std::uint32_t r = 0; r < count; ++r) {
+            auto& c = out[r];
+            c.execution_identity = memory.execution_identity; c.step_id = s.id; c.op = s.op; c.layer = s.layer;
+            c.kernel_id = id; c.reads = io.steps[s.id].reads; c.writes = io.steps[s.id].writes;
+            c.temporaries = io.steps[s.id].temporaries; c.arena = &window.row_view[r]; c.memory = &memory;
+            c.resources = &resources; c.reads_state = s.reads_state; c.writes_state = s.writes_state;
+            c.position = 5U + r; c.input_token_id = 40U + r;
+        }
+        return out;
+    };
+    const auto inject_rows = contexts(*inject_step, inject_launcher.key);
+    const auto mix_rows = contexts(mix_step, mix_id);
+    // Finite BF16 everywhere, then FP32 injection gates per row.
+    std::vector<unsigned char> seed(static_cast<std::size_t>(scratch.bytes));
+    std::uint32_t state = 0x2545f491U ^ count ^ (static_cast<std::uint32_t>(inject_op) << 8U);
+    for (std::size_t i = 0; i + 1U < seed.size(); i += 2U) {
+        state = state * 1664525U + 1013904223U;
+        const auto value = bf16(static_cast<float>(static_cast<int>(state >> 20U) - 2048) * 0.0007F);
+        std::memcpy(seed.data() + i, &value, sizeof(value));
+    }
+    for (std::uint32_t r = 0; r < count; ++r) {
+        const auto gates = resolve_dispatch_read(inject_rows[r], 2);
+        const float values[4] = {0.75F + 0.01F * static_cast<float>(r), 1.25F, -0.5F, 1.0F / 3.0F};
+        std::memcpy(seed.data() + (gates.address - scratch.address), values, sizeof(values));
+    }
+    HipLaunchContext scope; scope.stream = owner.stream;
+    const auto run = [&](auto&& work) {
+        write(scratch, seed);
+        { const HipLaunchScope owned(scope); work(); }
+        owner.finish();
+        for (const auto& weight : weights) require(read(weight.device) == weight.original, "fused HC rows changed weights");
+        return read(scratch);
+    };
+    const auto reference = run([&] {
+        inject_known_window_rows_launch(inject_rows, elementwise);
+        hyper_mix_known_window_rows_launch(mix_rows, config);
+    });
+    require(reference != seed, "inject + HC rows wrote nothing");
+    bool fused = false;
+    const auto candidate = run([&] { fused = hyper_mix_known_window_rows_launch_injected(inject_rows, elementwise, mix_rows, config); });
+    if (!fused) { require(candidate == seed, "declined fused HC rows enqueued work"); return false; }
+    // The HC workspace is dead after its step; the folded launch may keep it in an owner-held buffer when
+    // the arena gave it the inject's input memory. Every other byte of the arena must match.
+    const auto masked = [&](std::vector<unsigned char> arena) {
+        for (const auto& row : mix_rows) {
+            const auto view = resolve_dispatch_temporary(row, 0);
+            const auto offset = static_cast<std::ptrdiff_t>(view.address - scratch.address);
+            std::copy_n(seed.begin() + offset, static_cast<std::size_t>(view.bytes), arena.begin() + offset);
+        }
+        return arena;
+    };
+    require(masked(candidate) == masked(reference), "fused inject + HC rows differ from the inject and HC rows launches");
+    require(run([&] { (void)hyper_mix_known_window_rows_launch_injected(inject_rows, elementwise, mix_rows, config); }) == candidate,
+        "fused inject + HC rows are not deterministic");
+    return true;
 }
 
 // Median of warm hipEvent timings; MALL flushed before each sample when cold.
@@ -1814,6 +2022,44 @@ void rows_bench() {
 int main(int argc, char** argv) try {
     if (std::getenv("STRIX_QSA_LONG_BENCH")) { bench_qsa_long_context(); return 0; }
     if (argc > 1 && std::string_view(argv[1]) == "--rows-bench") { rows_bench(); return 0; }
+    // HC rows only (the persistent ctest runs this with STRIX_HC_PERSISTENT=1 and requires its launches).
+    if (argc > 1 && std::string_view(argv[1]) == "--hc-rows") {
+        std::uint32_t cases = 0;
+        for (auto op : {SerialOp::attn_hyper_mix, SerialOp::mlp_hyper_mix, SerialOp::final_hyper_mix})
+            for (bool splitk : {false, true}) for (bool lane : {false, true}) for (std::uint32_t rows : {2U, 4U, 8U}) {
+                family_hyper_rows(op, splitk, lane, rows); ++cases;
+            }
+        const auto persistent = hip_hyper_mix_testing_persistent_launches();
+        std::cout << "known-window HC rows bit-exact cases passed: " << cases << ", persistent launches " << persistent << '\n';
+        const auto on = [](const char* name) { const char* v = std::getenv(name); return v && std::string_view(v) == "1"; };
+        if (on("STRIX_HC_PERSISTENT")) require(persistent > 0U, "STRIX_HC_PERSISTENT=1 ran no persistent HC launch");
+        std::uint32_t fused = 0, pairs = 0;
+        const auto last = ModelContract::qwen38_flash_next().hidden_layers - 1U;
+        for (const auto& [op, layer] : {std::pair{SerialOp::attn_inject, 0U}, std::pair{SerialOp::mlp_inject, 1U},
+                 std::pair{SerialOp::mlp_inject, static_cast<std::uint32_t>(last)}})
+            for (std::uint32_t rows : {2U, 4U, 8U}) { fused += family_hyper_inject_rows(op, layer, rows) ? 1U : 0U; ++pairs; }
+        std::cout << "fused inject + HC rows: " << fused << " of " << pairs << " pairs folded, all equal the two launches\n";
+        if (on("STRIX_HC_PERSISTENT") && on("STRIX_HC_PERSISTENT_INJECT"))
+            require(fused == pairs, "STRIX_HC_PERSISTENT_INJECT=1 declined a fixture pair");
+        if (std::getenv("STRIX_HC_ROWS_BENCH"))
+            for (bool cold : {false, true}) for (std::uint32_t rows : {2U, 4U, 8U}) {
+                bench_hyper_rows(true, true, rows, cold);
+                if (!std::getenv("STRIX_HC_PERSISTENT_TRACE")) continue;
+                // Last launch: per phase, min / median / max over blocks, us after the earliest block start.
+                const auto trace = hip_hyper_mix_testing_persistent_trace();
+                std::uint64_t start = UINT64_MAX;
+                for (std::size_t b = 0; b < trace.size() / 8U; ++b) start = std::min(start, trace[b * 8U]);
+                std::cout << "  trace T=" << rows << (cold ? " cold" : " warm") << " (start, A done, barrier1, B done, barrier2, C chain, end):";
+                for (unsigned k = 0; k < 7U; ++k) {
+                    std::vector<double> v;
+                    for (std::size_t b = 0; b < trace.size() / 8U; ++b) v.push_back(static_cast<double>(trace[b * 8U + k] - start) / 100.0);
+                    std::sort(v.begin(), v.end());
+                    std::cout << ' ' << v.front() << '/' << v[v.size() / 2U] << '/' << v.back();
+                }
+                std::cout << '\n';
+            }
+        return 0;
+    }
     router_rows_family();
     elementwise_rows_family();
     family(false, false);
@@ -1834,6 +2080,7 @@ int main(int argc, char** argv) try {
     qsa_rows_family(true, true, false);
     qsa_rows_family(false, false, true);
     qsa_rows_family(false, false, false);
+    for (bool dense : {false, true}) for (bool bf16_indexer : {true, false}) qsa_cohort_family(dense, bf16_indexer);
     for(auto rows:{2U,4U,8U}) family_lm_head_rows(rows);
     std::cout << "known-window shared/GDN/QSA/LM-head component fixtures passed\n";
     return 0;

@@ -1,4 +1,5 @@
 #include "strix/hip_known_prompt_backend.hpp"
+#include "strix/known_prefill_limits.hpp"
 
 #include "strix/hip_known_prefix_window.hpp"
 #include "strix/hip_launch_context.hpp"
@@ -149,7 +150,7 @@ struct HipKnownPromptBackend::Impl {
                 throw std::invalid_argument("known prompt all-rows delivery cannot run a block without its heads");
             if (current_hip_launch_context() || session.health != SerialSessionHealth::ready ||
                 session.arithmetic_lineage.tainted || position != session.next_position ||
-                tokens.size() != rows || (window->supports_tiled_prefill() ? (rows<16U||rows>2048U) : (rows != 2U && rows != 4U && rows != 8U)) ||
+                tokens.size() != rows || (window->supports_tiled_prefill() ? (rows<16U||rows>known_prefill_max_rows) : (rows != 2U && rows != 4U && rows != 8U)) ||
                 position > std::numeric_limits<std::uint64_t>::max() - rows ||
                 committed_before > std::numeric_limits<std::uint64_t>::max() - rows)
                 throw std::invalid_argument("known prompt window differs from the live eager session");

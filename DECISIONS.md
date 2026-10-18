@@ -328,28 +328,10 @@ of complete blocks carry the prefill profile, suffix rows the decode profile; th
 the row counts per route and both profiles (see
 [docs/teacher-forced-tiled-prefill.md](docs/teacher-forced-tiled-prefill.md)).
 
-Why: the serial route is the only way to score long documents, at about 13 minutes per 16K-token document and
-profile; the tiled prefill reproduces serial rows bit for bit within a profile, so the same files can come from
-it in a fraction of the time. The staging buffer bounds host memory by T rows; no device memory is added (the
-arena already holds every row's logits stripe).
-
-Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL), wall time including model load, serial route
-with the automatic organization, tiled route with the explicit v5 flag set; F = FP32-dense profile, A = dense A8:
-
-| Check | Result |
-| --- | --- |
-| 1536 tokens (wiki), T=256 (6 blocks, final input inside the last block), F and A | Logits file byte-identical to serial (SHA-256), 1535 score rows equal, same generated token; 75 s serial vs 10 s tiled |
-| 2000 tokens (code), T=512 (3 blocks + 464 serial suffix rows), F and A | Byte-identical, score rows equal; 98 s vs 32-34 s |
-| Split pair, decode F / prefill A, 1536 tokens, T=256 | Byte-identical to the serial A file (every row in a block) |
-| Serial route, new binary vs base | Byte-identical file and score rows |
-| 4096 tokens, T=2048, F | Byte-identical, 4095 score rows equal; 205 s vs 25 s |
-| 16384 tokens (wiki), T=2048, F | Byte-identical (16.3 GB file), 16383 score rows equal; 1001 s serial vs 66 s tiled |
-| 16384 tokens, where the tiled time goes (per 2048-row block) | 7-8 s GPU against 5.4 s for the same prefill with only the terminal head (the eight-row heads add about 2.6 s), 31 ms download, 150 ms scoring; the 0.3-2.8 s spool overlaps the next block |
-
 ## D-035: block-boundary prefix state cache
 
 `--prefix-cache-host-bytes N` (optional `--prefix-cache-dir DIR`, `--prefix-cache-disk-bytes N`,
-`--prefix-cache-every N`) keeps the complete session state at block boundaries P = k�T of the tiled
+`--prefix-cache-every N`) keeps the complete session state at block boundaries P = k·T of the tiled
 known-prefix prefill and restores the longest cached boundary below the prompt length into a fresh session;
 only the rest of the prompt is prefilled. Per-position rows (KV and raw indexer keys of every attention layer)
 are stored once per block and shared by the checkpoints of a prompt; the in-place state (GDN matrices, GDN/PLE
@@ -395,6 +377,155 @@ cold) or an uncached process; timings are single smoke runs on shared nodes, not
 MTP cycle counts can differ between identical runs (the window cost model is timing-driven); tokens, replay and
 state digests do not.
 
+## D-036: fast prefill profile, routed MoE component in FP16 WMMA
+
+The `moe` component of `fast-prefill-f16wmma-v1` (`--prefill-fast-components ...,moe`) changes the routed
+MoE of complete tiled prefill blocks only. There, gate/up and down dequantize
+Q4_K/Q5_K/Q5_1/Q8_0 weights to FP16 inside the kernel (one FP32 value rounded once, no FP16 copy in memory),
+activations are FP16 with a power-of-two scale per prompt row (input) and per (row, slot) (SwiGLU output),
+and `v_wmma_f32_16x16x16_f16` accumulates over the whole K in FP32 without a per-group epilogue. The SwiGLU is
+fused into the gate/up epilogue; merge and commit are unchanged. CSR batches hold up to 64 assignments of one
+expert; a CTA covers 128 outputs of both gate and up (down: 256 outputs), every wave owns all rows of the batch,
+B tiles are staged in LDS once per K step of 64 and the next two K steps load while one computes. See
+[docs/prefill-numerical-profile.md](docs/prefill-numerical-profile.md).
+
+Why: the A8 contract's per-group FP32 epilogue (8 VALU operations per element and group, not overlapped with
+the matrix products) bounds the iu8 WMMA kernels at 9–13 TOPS; FP16 products with FP32 accumulation over K have
+no such epilogue and are also more accurate than A8 activations.
+
+Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL):
+
+| Check | Result |
+| --- | --- |
+| Fixture, 512 experts, T = 256/1024 (random Q4_K/Q5_K/Q5_1/Q8_0 blocks), raw slot dots against an FP32 reference with unquantized activations | relative RMS error 1.0–1.2e-4 (Q5_1 down), 4.1e-4 (Q8_0 down); the A8 kernels 1.3–1.9e-2 |
+| Same, a block of the first T/2 rows (other CSR batches) | byte-identical rows |
+| Repeated runs | byte-identical |
+| Engine, 16K prompt, 32 tokens, T = 2048 | prefill rows of the MoE in FP16 = prompt rows × 48 layers; tokens equal to the dense-A8 profile for the first 8 tokens |
+| Fixture, gate/up + down per 2048 rows, T = 2048 (uniform / skewed routes) | 11.2 / 12.4 ms (iu8 A8 WMMA: 16.3 / 17.4 ms) |
+| Engine GPU time at 16K, T = 2048 | routed MoE 6.94 → 5.64 s; total 24.57 → 23.17 s |
+| Engine request time, T = 2048, GEN = 1, quiet node | 4K 5936 → 5588 ms (+6 %), 16K 24927 → 23671 ms (+5 %) |
+
+## D-037: fast prefill profile, QSA attention component over row-tile unions
+
+The `qsa` component of `fast-prefill-f16wmma-v1` (`--prefill-fast-components ...,qsa`) changes the sparse
+attention of the tiled prefill's QSA groups (16, 32 or 64 rows) only. The rows of a tile (4 consecutive rows
+by default) attend over the union of their selected blocks, each (row, token) pair masked by the row's own
+selection and causal prefix, with FP16 WMMA scores and values, an online FP32 softmax and the exact path's
+BF16 output roundings and gate. Indexer, selection, KV store and the output projection are unchanged; serial
+tiles and MTP prompt rows keep the exact attention. See
+[docs/prefill-numerical-profile.md](docs/prefill-numerical-profile.md).
+
+Why: the exact grouped kernels read every selected K and V row once per prompt row (about 2050 tokens of
+1 KiB per KV head) with 2-byte lane loads and FP32 VALU arithmetic. Consecutive rows select largely the same
+blocks (the union of 4 rows is about 1.4–2 times one row's selection at 4K–16K positions), so one 16-token
+chunk staged in LDS serves 4 rows × 12 query heads as WMMA operands.
+
+Kernel organisation (`src/hip_qsa_fast_prefill.inc`): a union kernel per tile; one attention workgroup per
+(tile, KV head) with four loader waves (three chunks in flight in fixed register sets, staged as FP16 into two
+LDS buffers) and pairs of compute waves that split the 256 features (half of Q as WMMA fragments in registers,
+partial scores exchanged through LDS, half of O accumulated). With one slice per tile the workgroup
+normalises and gates in place; smaller groups use 2–4 slices and a combine kernel.
+
+Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL):
+
+| Check | Result |
+| --- | --- |
+| Fixture, one 64-row group, synthetic selections, against an FP64 reference | relative RMS error 1.3–1.4e-3 (exact kernels: 2.8–3.0e-3, which round the softmax weights to BF16) |
+| Fixture, selection noise matched to the engine's measured unions; exact score+softmax+value vs union+attention per group | 4096: 816 → 396 µs; 8192: 801 → 470 µs; 12288: 847 → 513 µs; 16000: 840 → 536 µs |
+| Engine self-check against the serial exact tiles (`STRIX_QSA_PREFILL_SELFCHECK=1`), 4K (T = 4096) and 16K (T = 8192) | every QSA call on the fast path; relative RMS 1.6–2.2e-3, no non-finite value |
+| Teacher-forced quality, 31 segments, `dense,moe` vs `dense,moe,qsa` (same build, paired) | top-1 95.45 % → 95.45 % (paired delta −0.00 ± 0.06 pt), KL 0.01972 → 0.01967 (−0.3 % ± 1.9 %); the 1079 changed top-1 rows have a median reference margin of 0.22 nats (3.10 over all rows). The segments are 1–2K tokens: full-visible selections, not long-context sparsity |
+
+## D-038: fast prefill profile, router logits component in BF16 WMMA
+
+The `router` component (`--prefill-fast-components ...,router`) computes the router logits of the tiled
+prefill blocks with `v_wmma_f32_16x16x16_bf16`: each FP32 weight is split into two BF16 terms
+(`h = bf16(w)`, `m = bf16(w - h)`, relative error at most 2⁻¹⁷), the BF16 activations are exact operands and
+the products accumulate in FP32. Top-k selection and everything after the logits are unchanged; windows,
+serial rows and FP32 activations keep the exact router (`src/hip_router_fast_prefill.inc`).
+
+Why: the exact router runs FP32 FMA chains (about 3 TFLOPS); its 7 ms per 8192-row block is 3 % of the
+16K prefill.
+
+| Check | Result |
+| --- | --- |
+| Fixture, 8192 rows, 2560 × 512, against FP64 | max logit error 2.0e-4 on logits up to 14 (exact kernel: 3.2e-5); 7 of 8192 rows change their ordered top-10 (near-ties); a third weight term (exact weights) gives the same error and is 15 % slower |
+| Fixture time per 8192 rows (busy node) | exact 6.9–7.2 ms, router component 3.1–3.7 ms |
+| Teacher-forced quality, `dense,moe,qsa` vs `dense,moe,qsa,router` | top-1 95.45 % → 95.51 % (paired delta +0.06 ± 0.07 pt), KL 0.01967 → 0.01926 (−2.1 % ± 2.0 %); qsa and router together against dense,moe: +0.05 ± 0.06 pt, KL −2.3 % ± 1.9 % |
+
+## D-039: several requests verified in cohort windows
+
+Up to four independent requests decode in one process (`--mtp-cohort-request`, CLI benchmark mode). Each has
+its own state, serial scratch, PLE backend, MTP runtime, draft state, golden replay and 2/4/8 window owners;
+the model, the MTP sidecar assets and one window stream are shared. Each cycle every request drafts up to
+8 / requests rows, gets the owner its drafts call for, and the requests are packed into windows of 4 or 8
+rows. A cohort window admits every request's own window unchanged and advances their steps in lockstep: the
+routed expert union, HC mixers, router, LM head, shared-expert projections and the GDN/QSA projections run
+once for the rows of all requests on an idle owner of the total rows, while GDN recurrence, QSA KV
+append/selection/attention, PLE, embedding, combine and injections run per request from its own state. Each
+request then accepts, commits and publishes as after its own window (see
+[docs/multi-request-cohort.md](docs/multi-request-cohort.md)).
+
+Why: decode is bandwidth bound, and one window reads its weights once for all rows; rows of other requests
+fill a window without the acceptance risk of longer draft chains. The shared steps already compute every
+row with per-row pointers and row-count-independent arithmetic, so each request keeps exactly its own
+tokens. Alternative: independent sessions on separate streams (the serving scheduler) shares no weight
+reads. Status: opt-in, exact; the throughput gain is pending the measurement campaign.
+
+| Check | Result |
+| --- | --- |
+| GDN fixture: cohorts of 2-4 sessions (1-8 rows each), pending rows and commits, four storage/format variants | 120 cohort scenarios bit-exact against per-session windows (348 total) |
+| QSA fixture: cohorts of 2-3 sessions at mixed positions, FP32 and dense A8, BF16 and Q8 indexer | 48 cohort windows bit-exact (outputs, workspaces, KV and raw index) |
+| Full model, dense A8, code + Spanish prompts, 256 tokens each: lockstep, without shared expert, without shared steps, sequential | Tokens identical to each prompt's own run, replay error 0 |
+| Full model, dense A8, four requests (code, Spanish, 1192-token agent, JS reasoning), lockstep with the default and a 4-row cap, sequential; agent + code pair | Tokens identical to each prompt's own run, replay error 0 |
+| Single-request route after the change | Tokens identical to the base build |
+
+Tiled MTP start: a block (T rows or a tail size) that ends exactly at the last prompt row now computes that row's
+head, and its wide hidden state and FP32 logits mint the first cycle's pending target ticket
+(`HipMtpTargetHidden::adopt_prefill_row`; the ticket's chunk is the block's lineage interval). No prompt row runs
+serially on that path; `STRIX_MTP_TILED_START=0` restores the serial last row. Against that handoff, same binary
+(single smoke runs): 16K prompt, T=1024, tails 64,16, A: 256 tokens identical to an uncached run, replay 0, prompt
+digest identical cold/warm and old/new; prompt phase 29.1 s -> 26.8 s cold and 6.0 s -> 1.74 s warm (15360
+restored, one 1024-row block); F: 43.5 -> 40.2 s cold, 5.75 -> 2.70 s warm, same identities. 4K prompts (T=512) ending in a T block or a 16-row tail block: tokens and digest
+identical, cold prompt phase 8.7 -> 6.9 s and 7.0 -> 6.5 s; a prompt ending in serial rows is unchanged.
+
+## D-040: speculative sampling for temperature > 0
+
+`--mtp-sample-temperature T` (with optional top-k, top-p, min-p and a seed) samples instead of selecting the
+first-max token; temperature 0 is the unchanged greedy path, with no sampler object and no host copies. Each
+emitted position is one standard speculative decision: with a draft `d ~ q`, accept with probability
+`min(1, p(d)/q(d))`, otherwise sample `normalize(max(0, p - q))` over the full target support; without a draft,
+sample `p`. Drafts are drawn from the draft head's distribution under the same transform (`q` is zero outside a
+draft vocabulary subset) and fed to the next draft step. Uniforms are counter-based, keyed by seed, policy,
+absolute position and draw class, so a position draws the same values in a window row, a serial step or a
+replay. Window rows are decided in order before any row is published; prefix acceptance is unchanged (an input
+is kept only when the previous row's decision accepted it). With the default `fixed` schedule, window and draft
+lengths depend on draft probabilities only, so a run is reproducible from its seed; `adaptive` keeps the
+measured-cost choices. See [docs/sampled-decoding.md](docs/sampled-decoding.md).
+
+Why: greedy-only decoding excluded every temperature > 0 use. The rule keeps the output distribution exactly the
+target's for any draft. Alternative: drafter-invariant coupling (one shared noise for target and draft, so tokens
+do not depend on the drafting schedule). Not adopted: its acceptance is lower than `min(1, p/q)`, and the fixed
+schedule already gives reproducibility. Rows are transformed on the host (one FP32 vocabulary row per decided
+row); a device-side transform is open.
+
+Why: the serial route is the only way to score long documents, at about 13 minutes per 16K-token document and
+profile; the tiled prefill reproduces serial rows bit for bit within a profile, so the same files can come from
+it in a fraction of the time. The staging buffer bounds host memory by T rows; no device memory is added (the
+arena already holds every row's logits stripe).
+
+Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL), wall time including model load, serial route
+with the automatic organization, tiled route with the explicit v5 flag set; F = FP32-dense profile, A = dense A8:
+
+| Check | Result |
+| --- | --- |
+| 1536 tokens (wiki), T=256 (6 blocks, final input inside the last block), F and A | Logits file byte-identical to serial (SHA-256), 1535 score rows equal, same generated token; 75 s serial vs 10 s tiled |
+| 2000 tokens (code), T=512 (3 blocks + 464 serial suffix rows), F and A | Byte-identical, score rows equal; 98 s vs 32-34 s |
+| Split pair, decode F / prefill A, 1536 tokens, T=256 | Byte-identical to the serial A file (every row in a block) |
+| Serial route, new binary vs base | Byte-identical file and score rows |
+| 4096 tokens, T=2048, F | Byte-identical, 4095 score rows equal; 205 s vs 25 s |
+| 16384 tokens (wiki), T=2048, F | Byte-identical (16.3 GB file), 16383 score rows equal; 1001 s serial vs 66 s tiled |
+| 16384 tokens, where the tiled time goes (per 2048-row block) | 7-8 s GPU against 5.4 s for the same prefill with only the terminal head (the eight-row heads add about 2.6 s), 31 ms download, 150 ms scoring; the 0.3-2.8 s spool overlaps the next block |
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |
@@ -409,3 +540,4 @@ state digests do not.
 | X-011 | HC low part in LDS; q8_rows prefetch depth 4; GDN 4 or 16 columns per wave | slower or neutral | Not adopted. |
 | X-012 | `--model-copy-tier experts`, `--staged-moe-router-logits` on the serial path | slower | Not used in the measured configuration. |
 | X-013 | `--mtp-spec-min-p` 0.7, 0.75, 0.8, 0.88, 0.9 | lower tok/s | 0.85 is the measured optimum (D-022). |
+| X-014 | Token-tree verify windows (draft runner-up as a sibling row, leaf or with a chain) | offline sizing, not built | Over code, en, es, fr and agent prompts (256 tokens each, the recommended MTP configuration) rejections are ~0.43 per cycle everywhere and the runner-up is right in 15-55 % of them; a free sibling at the actual rejection depth would add at most 5-8 % tokens per cycle. Verify rows are not free (~5.6 ms per extra row, the routed expert union grows with rows) and windows have no spare rows (most prose windows are R2), so simulated rate change is -1.8 to +1.3 % with 2/4/8 owners and -1.5 to +0.9 % against a chain with owners of every size. Prose yields fewer tokens per cycle because its chains are shorter, not because its rejections differ. Diagnostic: `STRIX_MTP_DRAFT_LOG=1 STRIX_MTP_DRAFT_TOP2=1`. |

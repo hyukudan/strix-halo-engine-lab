@@ -1,4 +1,5 @@
 #include "strix/known_prefix_prefill.hpp"
+#include "strix/known_prefill_limits.hpp"
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -52,7 +53,7 @@ std::pair<std::uint64_t,std::uint64_t> identities(const CompiledKnownPrefixPrefi
 }
 CompiledKnownPrefixPrefill compile_known_prefix_prefill(const ModelContract& model,const CompiledSerialExecution& serial,
     const ModelManifest& manifest,const ExecutionTensorAccessPlan& access,const KnownPrefillRequest& request) {
-    require(request.logical_rows>=16U&&request.logical_rows<=2048U,"known prefill rows must be within 16 and 2048");
+    require(request.logical_rows>=16U&&request.logical_rows<=known_prefill_max_rows,("known prefill rows must be within "+known_prefill_rows_range()).c_str());
     require(request.workspace_budget_bytes&&request.host_metadata_payload_budget_bytes,"known prefill requires explicit workspace and host metadata budgets");
     validate_known_window_output_policy(request.output_policy);
     const auto payload=metadata_payload(request.logical_rows,serial.arena.allocations.size());
@@ -86,7 +87,7 @@ CompiledKnownPrefixPrefill compile_known_prefix_prefill(const ModelContract& mod
     return plan;
 }
 void validate_compiled_known_prefix_prefill(const CompiledKnownPrefixPrefill& plan,const CompiledSerialExecution& serial) {
-    require(plan.logical_rows>=16U&&plan.logical_rows<=2048U,"known prefill rows must be within 16 and 2048");
+    require(plan.logical_rows>=16U&&plan.logical_rows<=known_prefill_max_rows,("known prefill rows must be within "+known_prefill_rows_range()).c_str());
     validate_compiled_known_prefix_window(plan.tile8,serial);
     require(plan.tile8.logical_rows==8U&&plan.tile8.output_policy==KnownWindowOutputPolicy::all_rows&&
         known_window_has_promoted_steps(plan.tile8),"known prefill selection must retain its complete closed tile-eight contract");

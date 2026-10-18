@@ -11,6 +11,8 @@
 #include "strix/hip_moe_route_launcher.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/prepared_tensor_views.hpp"
+#include "strix/known_window_cohort.hpp"
+#include "strix/hip_mtp_target_window.hpp"
 
 #include <algorithm>
 #include <array>
@@ -170,6 +172,8 @@ struct HipKnownPrefixWindow::Impl {
     DeferredMoeFirstError completion_status{};
     bool failed = false;
     HipKnownPrefixWindow::PrefillStepObserver prefill_observer;
+    // Set while a cohort executes this owner's window: its routed union ran on the cohort primary.
+    bool cohort_member = false;
 
     Impl(CompiledKnownPrefixWindow source, CompiledSerialExecution serial_source,
         ModelContract model_source, HipLauncherCatalogConfig config_source,
@@ -366,6 +370,36 @@ struct HipKnownPrefixWindow::Impl {
         }
         return false;
     }
+    // STRIX_HC_PERSISTENT=1 STRIX_HC_PERSISTENT_INJECT=1: an inject rows step followed by its HC rows step
+    // (attn inject -> MLP mix, MLP inject -> next attention mix or the final mix) runs as one persistent HC
+    // launch at the inject step; the HC step is then recorded as completed without a launch.
+    static bool hc_inject_fusion_enabled() {
+        static const bool on = [] {
+            const char* p = std::getenv("STRIX_HC_PERSISTENT"); const char* i = std::getenv("STRIX_HC_PERSISTENT_INJECT");
+            return p && p[0] == '1' && i && i[0] == '1';
+        }();
+        return on;
+    }
+    std::size_t fused_hc_step = SIZE_MAX;
+    bool fuse_hc_inject(std::size_t i, const std::vector<std::vector<ExecutionDispatchContext>>& contexts) {
+        if (fused_hc_step == i) { fused_hc_step = SIZE_MAX; return true; }
+        if (fused_hc_step != SIZE_MAX) throw std::logic_error("known-window fused HC step was not reached");
+        const auto& step = serial.execution.steps[i];
+        if ((step.op != SerialOp::attn_inject && step.op != SerialOp::mlp_inject) ||
+            window.r2_variant[i] != KnownWindowR2Variant::inject_rows_v1 || i + 1U >= serial.execution.steps.size())
+            return false;
+        const auto next = serial.execution.steps[i + 1U].op;
+        const auto variant = window.r2_variant[i + 1U];
+        if ((next != SerialOp::attn_hyper_mix && next != SerialOp::mlp_hyper_mix && next != SerialOp::final_hyper_mix) ||
+            (variant != KnownWindowR2Variant::hyper_mix_rows2_v1 && variant != KnownWindowR2Variant::hyper_mix_rows4_v1 &&
+             variant != KnownWindowR2Variant::hyper_mix_rows8_v1) || contexts[i].size() != contexts[i + 1U].size())
+            return false;
+        if (!hyper_mix_known_window_rows_launch_injected(contexts[i], elementwise_config, contexts[i + 1U],
+                hyper_for(contexts[i + 1U])))
+            return false;
+        fused_hc_step = i + 1U;
+        return true;
+    }
     void require_shared_joined() {
         if (!shared_detach) return;
         if (std::any_of(shared_detach->pending.begin(), shared_detach->pending.end(), [](auto p) { return p != 0U; }))
@@ -388,6 +422,9 @@ struct HipKnownPrefixWindow::Impl {
         shared_config.prefetch_eligible_layers = config.shared_expert_prefetch_layers;
         shared_config.prefetch_stats = config.shared_expert_prefetch_stats;
         shared_config.dense_a8_projections = config.dense_a8;
+        // Fast prefill profile (prefill catalog only): FP16 WMMA dense projections in 32..256-row prompt launches.
+        shared_config.dense_f16_prefill = (config.fast_prefill_components & kFastPrefillDense) != 0U;
+        shared_config.dense_g64_prefill = (config.fast_prefill_components & kFastPrefillDense8) != 0U;
         shared_fallback = shared_config;
         shared_fallback.prefetch_q8 = false; shared_fallback.prefetch_eligible_layers.clear();
         gdn_config.model = model; gdn_config.activation = config.activation;
@@ -397,6 +434,8 @@ struct HipKnownPrefixWindow::Impl {
         gdn_config.virtual_q8_output_projection = config.virtual_q8_gdn_output;
         gdn_config.wave8_q8_output_projection = config.wave8_q8_gdn_output;
         gdn_config.dense_a8_projections = config.dense_a8;
+        gdn_config.dense_f16_prefill = (config.fast_prefill_components & kFastPrefillDense) != 0U;
+        gdn_config.dense_g64_prefill = (config.fast_prefill_components & kFastPrefillDense8) != 0U;
         r2_entries[0] = {KnownWindowR2Variant::shared_q8_virtual256_r2_v1, this,
             [](std::span<const ExecutionDispatchContext, 2> rows, void* object) {
                 const auto& self = *static_cast<Impl*>(object);
@@ -561,6 +600,9 @@ struct HipKnownPrefixWindow::Impl {
         qsa_config.prefetch_stats=config.qsa_input_prefetch_stats;
         qsa_config.wave8_q8_output=config.wave8_q8_qsa_output;
         qsa_config.dense_a8_projections=config.dense_a8;
+        qsa_config.dense_f16_prefill=(config.fast_prefill_components & kFastPrefillDense) != 0U;
+        qsa_config.dense_g64_prefill=(config.fast_prefill_components & kFastPrefillDense8) != 0U;
+        qsa_config.qsa_fast_prefill=(config.fast_prefill_components & kFastPrefillQsa) != 0U;
         qsa_fallback=qsa_config;
         qsa_fallback.prefetch_q8_input=false; qsa_fallback.prefetch_eligible_layers.clear();
         // One entry per QSA variant actually selected (layers may differ in indexer format).
@@ -608,6 +650,8 @@ struct HipKnownPrefixWindow::Impl {
         routed_config.a8_down_q51=config.a8_down_q51;
         routed_config.a8_down_q80=config.a8_down_q80;
         routed_config.q5k_a8g32_gate_up=config.q5k_a8g32_gate_up;
+        // fast-prefill-f16wmma-v1 moe component: T-row prefill blocks run the routed MoE in FP16 WMMA.
+        routed_config.prefill_f16wmma=(config.fast_prefill_components & kFastPrefillMoe) != 0U;
         routed_config.q4k_a8_stats=config.q4k_a8_stats;
         routed_config.q4k_a8_quiescence=std::make_shared<HipSetupQuiescenceGuard>();
         for(std::size_t i=0;i<window.mode.size();++i)
@@ -644,6 +688,7 @@ struct HipKnownPrefixWindow::Impl {
         hyper_config.splitk_deferred_norm=config.splitk_deferred_norm;
         hyper_config.prefetch_hc_projection_next_tile=config.prefetch_hc_projection_next_tile;
         hyper_config.arithmetic_stats=config.arithmetic_stats;
+        hyper_config.fast_prefill_wmma=(config.fast_prefill_components & kFastPrefillHc) != 0U;
         hyper_fallback=hyper_config; hyper_fallback.lane_chain_output=false;
         rows_entries.push_back({window.logical_rows==2U?KnownWindowR2Variant::hyper_mix_rows2_v1:
             window.logical_rows==4U?KnownWindowR2Variant::hyper_mix_rows4_v1:KnownWindowR2Variant::hyper_mix_rows8_v1,this,
@@ -779,6 +824,7 @@ struct HipKnownPrefixWindow::Impl {
         route_config.parallel_projection=config.parallel_moe_router; route_config.staged_logits=config.staged_moe_router_logits;
         route_config.ranked_topk=config.ranked_moe_router_topk; route_config.wave_topk=config.wave_moe_router_topk;
         route_config.wave_manifest_admission=config.wave_router_manifest_admission;
+        route_config.router_fast_prefill=(config.fast_prefill_components & kFastPrefillRouter) != 0U;
         elementwise_config.hidden_size=u32(model.hidden_size); elementwise_config.hc_count=u32(model.hc_count);
         elementwise_config.activation=config.activation;
         rows_entries.push_back({KnownWindowR2Variant::moe_route_rows_v1,this,
@@ -805,7 +851,7 @@ struct HipKnownPrefixWindow::Impl {
     }
     void complete() {
         guard.require_original();
-        if(window.routed_expert_union_steps)
+        if(window.routed_expert_union_steps && !cohort_member)
             check(hipMemcpyAsync(&pending_union_summary,
                 reinterpret_cast<const void*>(full_prefill_union()?prefill_routed_workspace.memory.arena_base:routed_workspace.memory.arena_base),
                 sizeof(pending_union_summary),hipMemcpyDeviceToHost,scope.stream),"read latest routed expert union metadata");
@@ -829,7 +875,7 @@ struct HipKnownPrefixWindow::Impl {
                 experts!=s.touched || batches!=s.batches ||
                 std::any_of(s.reserved,s.reserved+8U,[](auto v){return v!=0U;}))
                 throw std::runtime_error("routed expert union metadata disagrees with its completed prefill");
-        } else if(window.routed_expert_union_steps) {
+        } else if(window.routed_expert_union_steps && !cohort_member) {
             const auto& s=pending_union_summary;
             const auto assignments=window.logical_rows*u32(model.num_experts_per_token);
             std::uint64_t experts=0,batches=0,batch_assignments=0,unique_row_assignments=0;
@@ -980,6 +1026,287 @@ struct HipKnownPrefixWindow::Impl {
                 std::span<const KnownWindowRowsEntry>(rows_entries), hooks);
         } catch (...) { failed = true; throw; }
     }
+    // ---- Cohort: the closed windows of several sessions in one stream of steps ----
+    // Every member is the session's own idle closed owner (its rows, arena, captures, deferred GDN,
+    // PLE snapshots and greedy replies); the primary is another idle owner whose row count equals
+    // the members' total and whose routed-union workspace and stream run the steps shared by all
+    // rows. All owners share one stream. Each member window is admitted exactly as on its own and
+    // its row-loop, PLE, shared-expert, combine and inject steps are its own launches. The shared
+    // steps (routed expert union, HC mixers, router, LM head and the projections of GDN and QSA)
+    // run once for all rows; GDN recurrence and QSA attention run per session inside them.
+    struct CohortMember {
+        Impl* impl = nullptr;
+        SerialSessionContext* session = nullptr;
+        std::span<const std::uint32_t> tokens;
+        std::shared_ptr<HipMtpTargetWindowCapture> capture;
+        const PreparedCapture* observed = nullptr;
+        KnownWindowExecutionHooks hooks;
+        std::unique_ptr<KnownWindowRun> run;
+        bool begun = false, launched = false;
+    };
+    static bool cohort_shared_mode(KnownWindowStepMode mode) noexcept {
+        return mode == KnownWindowStepMode::routed_expert_union || mode == KnownWindowStepMode::hyper_mix_rows ||
+            mode == KnownWindowStepMode::moe_route_rows || mode == KnownWindowStepMode::lm_head_rows ||
+            mode == KnownWindowStepMode::gdn_deferred_rows || mode == KnownWindowStepMode::qsa_rows;
+    }
+    // STRIX_COHORT_SHARED=0: every step of a cohort runs per session (the same launches as alone,
+    // on one stream); only the scheduling differs. STRIX_COHORT_SHARED_EXPERT=0 keeps only the
+    // shared expert per session.
+    static bool cohort_shared_enabled() {
+        static const bool on = [] { const char* v = std::getenv("STRIX_COHORT_SHARED"); return !v || v[0] != '0'; }();
+        return on;
+    }
+    static bool cohort_shared_expert_enabled() {
+        static const bool on = [] { const char* v = std::getenv("STRIX_COHORT_SHARED_EXPERT"); return !v || v[0] != '0'; }();
+        return on;
+    }
+    // Step i of a cohort runs once for every member's rows on the primary.
+    bool cohort_step_shared(std::size_t i, std::span<CohortMember> members) const {
+        if (!cohort_shared_enabled()) return false;
+        const auto mode = window.mode[i];
+        if (mode == KnownWindowStepMode::shared_rows) {
+            if (!cohort_shared_expert_enabled()) return false;
+            for (const auto& m : members) {
+                const auto own = m.impl->window.mode[i];
+                if ((own != KnownWindowStepMode::shared_rows && own != KnownWindowStepMode::r2_shared_q8) || !m.run->promoted_step(i) ||
+                    !m.impl->detachable_shared(i)) return false;
+            }
+            return detachable_shared(i);
+        }
+        if (!cohort_shared_mode(mode)) return false;
+        for (const auto& m : members) {
+            if (!m.run->wide_step(i) || m.impl->window.mode[i] != mode) return false;
+            if (mode == KnownWindowStepMode::qsa_rows && m.run->rows() != 2U && m.run->rows() != 4U && m.run->rows() != 8U) return false;
+        }
+        return true;
+    }
+    std::vector<std::pair<std::vector<const void*>, std::unique_ptr<ArenaLookupIndex>>> cohort_indexes;
+    const ArenaLookupIndex& cohort_index(std::span<CohortMember> members) {
+        std::vector<const void*> key;
+        for (const auto& m : members) key.push_back(m.impl);
+        for (const auto& entry : cohort_indexes) if (entry.first == key) return *entry.second;
+        std::vector<const ExecutionArenaPlan*> plans;
+        for (const auto& m : members) {
+            plans.push_back(&m.impl->window.arena.physical);
+            for (const auto& row : m.impl->window.row_plan) plans.push_back(&row.arena);
+            for (const auto& view : m.impl->window.arena.row_view) plans.push_back(&view);
+        }
+        cohort_indexes.emplace_back(std::move(key), std::make_unique<ArenaLookupIndex>(plans));
+        return *cohort_indexes.back().second;
+    }
+    void launch_cohort_shared(std::size_t i, std::span<CohortMember> members) {
+        std::vector<ExecutionDispatchContext> all;
+        all.reserve(window.logical_rows);
+        for (const auto& m : members) { const auto rows = m.run->step_rows(i); all.insert(all.end(), rows.begin(), rows.end()); }
+        const std::span<const ExecutionDispatchContext> rows(all);
+        const KnownWindowCohortScope cohort;
+        switch (window.mode[i]) {
+        case KnownWindowStepMode::shared_rows: {
+            // As in one window: on the side stream after everything queued so far, joined before the
+            // layer's MoE combine (join_cohort_shared), with every segment's workspace rows in the
+            // owner's workspace.
+            std::vector<std::span<const ExecutionDispatchContext>> segments;
+            for (const auto& m : members) segments.push_back(m.run->step_rows(i));
+            const auto& shared = shared_for(segments[0]);
+            const auto layer = *serial.execution.steps[i].layer;
+            if (!shared_detach_enabled()) {
+                shared_expert_known_window_cohort_launch(segments, shared, scope.stream, 0U, 0U);
+                break;
+            }
+            auto& d = detach_state();
+            if (d.pending[layer]) throw std::logic_error("known-window cohort shared expert detached twice before its combine");
+            const auto e = layer + d.parity * d.pending.size();
+            check(hipEventRecord(d.forked[e], scope.stream), "record known-window cohort shared fork");
+            check(hipStreamWaitEvent(d.side, d.forked[e], 0), "order known-window cohort shared stream");
+            shared_expert_known_window_cohort_launch(segments, shared, d.side, reinterpret_cast<std::uintptr_t>(d.workspace),
+                d.workspace_bytes);
+            check(hipEventRecord(d.joined[e], d.side), "record known-window cohort shared join");
+            d.pending[layer] = 1U;
+            break;
+        }
+        case KnownWindowStepMode::routed_expert_union:
+            moe_experts_known_window_rows_launch(rows, routed_config, routed_workspace); break;
+        case KnownWindowStepMode::hyper_mix_rows:
+            hyper_mix_known_window_rows_launch(rows, hyper_for(rows)); break;
+        case KnownWindowStepMode::moe_route_rows:
+            moe_route_known_window_rows_launch(rows, route_config); break;
+        case KnownWindowStepMode::lm_head_rows: {
+            lm_head_known_window_rows_launch(rows, head_config);
+            // Each session's argmax rows land in its own owner's replies, read by its own capture.
+            for (const auto& m : members) {
+                const auto own = m.run->step_rows(i);
+                std::array<ExecutionBufferAddress, hip_greedy_rows_max> logits{};
+                for (std::size_t r = 0; r < own.size(); ++r) logits[r] = resolve_dispatch_write(own[r], 0);
+                enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress>(logits.data(), own.size()),
+                    head_config.vocab_size, m.impl->greedy_partials, m.impl->greedy_replies, hip_execution_stream());
+            }
+            break;
+        }
+        case KnownWindowStepMode::gdn_deferred_rows: {
+            std::vector<HipGdnWindowCohortSegment> segments;
+            for (const auto& m : members) segments.push_back({m.run->step_rows(i), &m.impl->gdn_window_config});
+            gdn_window_cohort_rows_launch(segments);
+            for (const auto& m : members) m.impl->remember_gdn_layer(m.run->step_rows(i)[0]);
+            break;
+        }
+        case KnownWindowStepMode::qsa_rows: {
+            std::vector<HipQsaCohortSegment> segments;
+            for (const auto& m : members) segments.push_back({m.run->step_rows(i), &m.impl->qsa_for(m.run->step_rows(i))});
+            indexed_attention_known_window_cohort_launch(segments);
+            break;
+        }
+        default: throw std::logic_error("known-window cohort step has no shared implementation");
+        }
+    }
+    // Before a step that is each member's own: the layer's MoE combine waits for the cohort shared expert.
+    void join_cohort_shared(std::size_t i) {
+        const auto& step = serial.execution.steps[i];
+        if (step.op != SerialOp::moe_combine || !step.layer || !shared_detach || !shared_detach->pending[*step.layer]) return;
+        auto& d = *shared_detach;
+        check(hipStreamWaitEvent(scope.stream, d.joined[*step.layer + d.parity * d.pending.size()], 0), "join known-window cohort shared stream");
+        d.pending[*step.layer] = 0U;
+    }
+    static std::vector<HipMtpTargetWindowExecution> execute_cohort(Impl& primary, std::span<CohortMember> members) {
+        if (members.size() < 2U) throw std::invalid_argument("known-window cohort requires two or more sessions");
+        std::uint32_t total = 0;
+        for (std::size_t a = 0; a < members.size(); ++a) {
+            const auto& m = members[a];
+            if (!m.impl || !m.session || !m.capture || m.impl == &primary || m.impl->failed || m.impl->prefill ||
+                m.impl->executing || m.tokens.size() != m.impl->logical_rows() || !m.impl->greedy_replies ||
+                m.impl->scope.stream != primary.scope.stream || m.impl->serial.execution_identity != primary.serial.execution_identity ||
+                m.impl->window.mode.size() != primary.window.mode.size() ||
+                m.impl->resources.model_manifest != primary.resources.model_manifest ||
+                m.impl->resources.model_weights != primary.resources.model_weights)
+                throw std::invalid_argument("known-window cohort members must be idle closed owners of one model on the primary's stream");
+            for (std::size_t b = 0; b < a; ++b)
+                if (members[b].impl == m.impl || members[b].session == m.session ||
+                    members[b].impl->resources.session_state_memory == m.impl->resources.session_state_memory)
+                    throw std::invalid_argument("known-window cohort members must be distinct sessions");
+            total += m.impl->logical_rows();
+        }
+        if (primary.failed || primary.prefill || primary.executing || total != primary.window.logical_rows ||
+            current_hip_launch_context())
+            throw std::invalid_argument("known-window cohort primary must be an idle closed owner of the cohort's rows");
+        struct Leases {
+            std::vector<bool*> held;
+            ~Leases() { for (auto* l : held) *l = false; }
+        } leases;
+        primary.executing = true; leases.held.push_back(&primary.executing);
+        for (auto& m : members) { m.impl->executing = true; leases.held.push_back(&m.impl->executing); }
+        struct CohortFlags {
+            std::span<CohortMember> members;
+            ~CohortFlags() { for (auto& m : members) m.impl->cohort_member = false; }
+        } flags{members};
+        bool primary_launched = false, union_ran = false;
+        try {
+            primary.validate_metadata();
+            for (auto& m : members) {
+                auto& self = *m.impl;
+                self.cohort_member = true;
+                self.validate_metadata();
+                m.observed = &self.prepared_capture(m.capture);
+                m.capture->begin(&self, *m.session, m.tokens);
+                m.begun = true;
+                auto& hooks = m.hooks;
+                hooks.preflight_scope = [&self] { self.validate_scope(); };
+                hooks.preflight_plan = [&self] { self.validate_metadata(); };
+                auto* capture = m.capture.get();
+                hooks.complete = [&self, capture] { self.complete(); capture->completed_before_publish(); };
+                hooks.quiesce_or_fail_stop = [&self] {
+                    self.failed = true;
+                    if (self.shared_detach && self.shared_detach->side) (void)hipStreamSynchronize(self.shared_detach->side);
+                    self.guard.recover_or_fail_stop();
+                };
+                hooks.position_reader_implementations = self.position_readers;
+                hooks.record_actual_window_lineage = true;
+                if (shared_detach_enabled())
+                    hooks.before_step = [&self](std::size_t i, const std::vector<std::vector<ExecutionDispatchContext>>& contexts) {
+                        return self.detach_shared(i, contexts);
+                    };
+                hooks.preflight_memo = &self.preflight_memo; hooks.recipe_memo = &self.recipe_memo;
+                hooks.preflight_slots = &self.preflight_slots; hooks.arena_index = &self.arena_index;
+            }
+            std::optional<ValidatedModelBindingScope> binding;
+            if (!primary.resources.distributed_stage) binding.emplace(*primary.resources.model_manifest, *primary.resources.model_weights);
+            const ArenaLookupScope lookups(primary.cohort_index(members));
+            for (auto& m : members) {
+                auto& self = *m.impl;
+                const HipLaunchScope active(self.scope);
+                m.run = std::make_unique<KnownWindowRun>(self.window, self.serial, self.resources, self.scratch, *m.session,
+                    m.tokens, std::span<const CompiledLaunchPlan* const>(m.observed->pointers),
+                    std::span<const KnownWindowR2Entry>(m.observed->recorded_r2),
+                    std::span<const KnownWindowRowsEntry>(m.observed->recorded_rows), m.hooks, true);
+                m.launched = true;
+            }
+            const auto steps = primary.serial.execution.steps.size();
+            for (std::size_t i = 0; i < steps; ++i) {
+                if (primary.cohort_step_shared(i, members)) {
+                    {
+                        const HipLaunchScope active(primary.scope);
+                        primary_launched = true;
+                        union_ran = union_ran || primary.window.mode[i] == KnownWindowStepMode::routed_expert_union;
+                        primary.launch_cohort_shared(i, members);
+                    }
+                    for (auto& m : members) m.run->record_external_step(i);
+                    continue;
+                }
+                if (primary.shared_detach) {
+                    const HipLaunchScope active(primary.scope);
+                    primary.join_cohort_shared(i);
+                }
+                for (auto& m : members) {
+                    const HipLaunchScope active(m.impl->scope);
+                    m.run->launch_step(i);
+                }
+            }
+            primary.require_shared_joined();
+            {
+                // The primary checks its D1 record and, when the union ran on it, the union summary.
+                const HipLaunchScope active(primary.scope);
+                primary.cohort_member = !union_ran;
+                struct Reset { bool& flag; ~Reset() { flag = false; } } reset{primary.cohort_member};
+                primary.complete();
+            }
+            for (auto& m : members) {
+                const HipLaunchScope active(m.impl->scope);
+                m.run->complete();
+                m.impl->require_shared_joined();
+            }
+        } catch (...) {
+            for (auto& m : members) {
+                if (m.begun) m.capture->abort();
+                if (m.run) m.run->fail();
+                else if (m.launched || m.begun) {
+                    m.impl->failed = true;
+                    if (m.begun) m.impl->guard.recover_or_fail_stop();
+                }
+                m.impl->failed = true;
+            }
+            primary.failed = true;
+            if (primary_launched) primary.guard.recover_or_fail_stop();
+            throw;
+        }
+        std::vector<HipMtpTargetWindowExecution> out(members.size());
+        try {
+            for (std::size_t a = 0; a < members.size(); ++a) {
+                auto& m = members[a];
+                out[a].execution = m.run->publish();
+                out[a].batch = m.capture->seal(*m.session);
+            }
+        } catch (...) {
+            for (auto& m : members) {
+                m.capture->abort();
+                m.session->health = SerialSessionHealth::poisoned; m.session->arithmetic_lineage.tainted = true;
+                m.impl->failed = true; m.impl->guard.recover_or_fail_stop();
+            }
+            primary.failed = true;
+            throw;
+        }
+        if (union_ran)
+            primary.last_union_observation = HipKnownPrefixUnionObservation{members[0].session->next_position - members[0].impl->logical_rows(), primary.last_union_layer,
+                primary.pending_union_summary};
+        return out;
+    }
     KnownWindowResult execute(SerialSessionContext& session, std::span<const std::uint32_t> tokens,
         const std::function<void()>& before_publish = {},
         const std::shared_ptr<HipMtpTargetWindowCapture>& capture = {},HipMtpTargetWindowBatch* batch=nullptr,
@@ -1019,9 +1346,12 @@ struct HipKnownPrefixWindow::Impl {
             };
             hooks.position_reader_implementations = position_readers;
             hooks.record_actual_window_lineage=static_cast<bool>(capture);
-            if(!prefill && shared_detach_enabled())
-                hooks.before_step=[&](std::size_t i,const std::vector<std::vector<ExecutionDispatchContext>>& contexts) {
-                    return detach_shared(i,contexts);
+            fused_hc_step=SIZE_MAX;
+            const bool detach=!prefill && shared_detach_enabled(), fuse_hc=!prefill && hc_inject_fusion_enabled();
+            if(detach || fuse_hc)
+                hooks.before_step=[&,detach,fuse_hc](std::size_t i,const std::vector<std::vector<ExecutionDispatchContext>>& contexts) {
+                    if(fuse_hc && fuse_hc_inject(i,contexts)) return true;
+                    return detach && detach_shared(i,contexts);
                 };
             hooks.skip_head=skip_head;
             hooks.preflight_memo=&preflight_memo;hooks.recipe_memo=&recipe_memo;hooks.preflight_slots=&preflight_slots;
@@ -1102,6 +1432,19 @@ void HipKnownPrefixWindow::set_prefill_step_observer(PrefillStepObserver observe
     if(!impl_->prefill || impl_->executing || impl_->failed)
         throw std::invalid_argument("prefill step observer requires an idle tiled prefill owner");
     impl_->prefill_observer=std::move(observer);
+}
+std::vector<HipMtpTargetWindowExecution> HipKnownPrefixWindow::execute_mtp_cohort(HipKnownPrefixWindow& primary,
+    std::span<const HipKnownPrefixCohortMember> members) {
+    std::vector<Impl::CohortMember> owned(members.size());
+    for (std::size_t m = 0; m < members.size(); ++m) {
+        if (!members[m].window || !members[m].session || !members[m].capture)
+            throw std::invalid_argument("known-window cohort member is incomplete");
+        owned[m].impl = members[m].window->impl_.get();
+        owned[m].session = members[m].session;
+        owned[m].tokens = members[m].tokens;
+        owned[m].capture = members[m].capture;
+    }
+    return Impl::execute_cohort(*primary.impl_, owned);
 }
 void HipKnownPrefixWindow::attach_greedy_rows(ExecutionBufferAddress partials,HipGreedyRowsReply* replies) {
     impl_->attach_greedy_rows(partials,replies);

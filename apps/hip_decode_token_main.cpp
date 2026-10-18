@@ -62,6 +62,7 @@
 #include "hip_decode_options.hpp"
 #include "hip_mtp_decode_bridge.hpp"
 #include "hip_prefix_state_cache.hpp"
+#include "hip_mtp_cohort_bridge.hpp"
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
 #include "../tests/hip_mtp_model_qualification.hpp"
 #endif
@@ -503,6 +504,17 @@ private:
     strix::GenerationOutputDispatcher* output_dispatcher_ = nullptr;
 };
 
+// One stream shared by the window owners of every request of an MTP cohort (a cohort window
+// interleaves their steps); destroyed after the last owner that borrows it.
+class SharedWindowStream final {
+public:
+    SharedWindowStream() { check_hip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create cohort window stream"); }
+    ~SharedWindowStream() { if (stream && hipStreamDestroy(stream) != hipSuccess) std::_Exit(3); }
+    SharedWindowStream(const SharedWindowStream&) = delete;
+    SharedWindowStream& operator=(const SharedWindowStream&) = delete;
+    hipStream_t stream = nullptr;
+};
+
 // A separate physical window arena and completion record. Serial D1 keeps its
 // existing shadow transaction; known pairs never call its begin/complete path.
 class KnownPromptMemory final {
@@ -511,10 +523,11 @@ public:
         std::uint64_t status_generation,
         std::shared_ptr<const void> retained, std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard,
         std::uint64_t serial_identity = 0, std::uint64_t serial_status_generation = 0,
-        std::uint64_t union_bytes = 0, std::uint64_t union_generation = 0)
+        std::uint64_t union_bytes = 0, std::uint64_t union_generation = 0,
+        std::shared_ptr<const SharedWindowStream> shared_stream = {})
         : KnownPromptMemory(plan.window_execution_identity, plan.arena.physical.total_bytes, arena_generation,
             status_generation, std::move(retained), std::move(guard), serial_identity, serial_status_generation,
-            union_bytes, union_generation) {}
+            union_bytes, union_generation, std::move(shared_stream)) {}
     KnownPromptMemory(const strix::CompiledKnownPrefixPrefill& plan, std::uint64_t arena_generation,
         std::uint64_t status_generation,
         std::shared_ptr<const void> retained, std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard,
@@ -525,8 +538,9 @@ public:
         std::uint64_t arena_generation, std::uint64_t status_generation,
         std::shared_ptr<const void> retained, std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard,
         std::uint64_t serial_identity, std::uint64_t serial_status_generation,
-        std::uint64_t union_bytes, std::uint64_t union_generation)
-        : retained_(std::move(retained)), guard_(std::move(guard)) {
+        std::uint64_t union_bytes, std::uint64_t union_generation,
+        std::shared_ptr<const SharedWindowStream> shared_stream = {})
+        : retained_(std::move(retained)), guard_(std::move(guard)), shared_stream_(std::move(shared_stream)) {
         if (!retained_ || !guard_) throw std::invalid_argument("known prompt requires retained original resources");
         scratch = {window_identity, 0, window_bytes, arena_generation};
         if ((union_bytes == 0) != (union_generation == 0) || union_bytes > 65536U)
@@ -538,7 +552,8 @@ public:
             throw std::invalid_argument("known prompt memory requires current nonempty bindings");
         try {
             guard_->run([&] {
-                check_hip(hipStreamCreateWithFlags(&scope.stream, hipStreamNonBlocking), "create known-prompt stream");
+                if (shared_stream_) scope.stream = shared_stream_->stream;
+                else check_hip(hipStreamCreateWithFlags(&scope.stream, hipStreamNonBlocking), "create known-prompt stream");
                 check_hip(hipMalloc(&arena_, static_cast<std::size_t>(scratch.arena_bytes)), "allocate known-prompt arena");
                 scratch.arena_base = reinterpret_cast<std::uintptr_t>(arena_);
                 check_hip(hipMalloc(&status_, 8), "allocate known-prompt completion record");
@@ -584,11 +599,12 @@ private:
         serial_status_ = nullptr;
         if (status_ && hipFree(status_) != hipSuccess) std::_Exit(3);
         status_ = nullptr;
-        if (scope.stream && hipStreamDestroy(scope.stream) != hipSuccess) std::_Exit(3);
+        if (scope.stream && !shared_stream_ && hipStreamDestroy(scope.stream) != hipSuccess) std::_Exit(3);
         scope.stream = nullptr;
     }
     std::shared_ptr<const void> retained_;
     std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard_;
+    std::shared_ptr<const SharedWindowStream> shared_stream_;
     void* arena_ = nullptr; void* status_ = nullptr; void* serial_status_ = nullptr; void* union_ = nullptr;
 };
 
@@ -1337,7 +1353,12 @@ int STRIX_DECODE_ENTRY(
                 << "  \"hc_deferred_norm_submissions\":"
                 << (hyper_arithmetic_stats ? hyper_arithmetic_stats->deferred_norm_submissions.load(std::memory_order_relaxed) : 0) << ",\n"
                 << "  \"q5k_a8_gate_up_submissions\":"
-                << (q4k_a8_stats ? q4k_a8_stats->q5k_a8_gate_up_submissions.load(std::memory_order_relaxed) : 0) << ",\n"
+                << (q4k_a8_stats ? q4k_a8_stats->q5k_a8_gate_up_submissions.load(std::memory_order_relaxed) : 0) << ",\n";
+        if (options.prefill_numerical_profile && *options.prefill_numerical_profile == strix::DecodeNumericalProfile::fast_prefill_f16wmma_v1)
+            std::cout << "  \"prefill_moe_f16wmma_rows\":"
+                << (q4k_a8_stats ? q4k_a8_stats->prefill_f16wmma_submissions.load(std::memory_order_relaxed) : 0) << ",\n";
+        if (options.numerical_profile != strix::DecodeNumericalProfile::exact_v5)
+            std::cout
                  << "  \"hc_splitk_f32_submissions\":"
                 << (hyper_arithmetic_stats ? hyper_arithmetic_stats->splitk_f32_submissions.load(std::memory_order_relaxed) : 0) << ",\n"
                 << "  \"q51_a8_down_submissions\":"
@@ -1601,18 +1622,24 @@ int STRIX_DECODE_ENTRY(
     auto prefill_catalog_config = catalog_config;
     if (profile_pair.split()) {
         const bool prefill_dense_a8 = strix::numerical_profile_dense_a8(profile_pair.prefill);
+        // A fast prefill profile keeps its decode sibling's kernel plan (dense A8 equal) and differs in the
+        // arithmetic of its prefill launchers; the dense A8 pairs differ in the dense projections' plan.
+        const bool fast = strix::numerical_profile_fast_prefill(profile_pair.prefill);
         if (strix::numerical_profile_hc_splitk(profile_pair.prefill) != hc_splitk_f32 ||
             strix::numerical_profile_hc_deferred_norm(profile_pair.prefill) != hc_deferred_norm ||
             strix::numerical_profile_q5k_a8_gateup(profile_pair.prefill) != q5k_a8_gateup ||
             strix::numerical_profile_q51_a8_down(profile_pair.prefill) != a8_down_q51 ||
-            strix::numerical_profile_q80_a8_down(profile_pair.prefill) != a8_down_q80 || prefill_dense_a8 == dense_a8 ||
-            integer_config)
-            throw std::invalid_argument("prefill numerical profile may differ from the decode profile only in dense A8");
+            strix::numerical_profile_q80_a8_down(profile_pair.prefill) != a8_down_q80 ||
+            (fast ? prefill_dense_a8 != dense_a8 : prefill_dense_a8 == dense_a8) || integer_config)
+            throw std::invalid_argument("prefill numerical profile may differ from the decode profile only in dense A8 "
+                "or in the prefill-only arithmetic of a fast prefill profile");
         auto prefill_binding_request = binding_request;
         auto prefill_buffer_request = buffer_request;
         prefill_binding_request.dense_a8 = prefill_buffer_request.dense_a8 = prefill_dense_a8;
+        if (fast) prefill_binding_request.prefill_arithmetic_identity = strix::numerical_profile_pair_identity(profile_pair);
         prefill_catalog_config.numerical_profile = profile_pair.prefill;
         prefill_catalog_config.dense_a8 = prefill_dense_a8;
+        prefill_catalog_config.fast_prefill_components = profile_pair.fast_components;
         strix::kernels::KernelRegistry prefill_kernel_registry;
         strix::register_complete_hip_kernel_catalog(model, prefill_binding_request, prefill_catalog_config,
             prefill_kernel_registry, nullptr);
@@ -1621,6 +1648,7 @@ int STRIX_DECODE_ENTRY(
         strix::validate_sibling_serial_executions(*compiled_prefill, compiled);
         optimization_profile_receipt +=
             "  \"prefill_dense_a8_configured\": " + std::string(prefill_dense_a8 ? "true" : "false") + ",\n" +
+            "  \"prefill_fast_components\": " + std::to_string(profile_pair.fast_components) + ",\n" +
             "  \"prefill_serial_execution_identity\": " + std::to_string(compiled_prefill->execution_identity) + ",\n" +
             "  \"prefill_serial_kernel_plan_identity\": " + std::to_string(compiled_prefill->kernel_plan_identity) + ",\n" +
             "  \"prefill_serial_scratch\": \"shared-sibling-view-of-decode-serial-arena\",\n";
@@ -2604,13 +2632,15 @@ int STRIX_DECODE_ENTRY(
             };
             tiled.fresh = session;
         }
-        strix::decode_cli::MtpDecodeWindowFactory make_window;
-        if (options.mtp.window_rows) {
-            // Prepare the real closed native owner BEFORE any prompt mutation.
-            // It retains all serial parents and its separate D1/arena ownership.
-            // A row set builds one owner per size; owners share one deferred
-            // GDN record and the arena/total budgets cover all of them.
-            make_window = [&, parents](std::shared_ptr<strix::HipMtpTargetHidden> target) {
+        // Prepare the real closed native owner BEFORE any prompt mutation.
+        // It retains all serial parents and its separate D1/arena ownership.
+        // A row set builds one owner per size; owners share one deferred
+        // GDN record and the arena/total budgets cover all of them. Cohort
+        // requests build their owners on one shared window stream.
+        const auto window_factory_for = [&](std::shared_ptr<strix::decode_cli::MtpDecodeTargetParents> request_parents,
+            std::shared_ptr<const SharedWindowStream> window_stream) -> strix::decode_cli::MtpDecodeWindowFactory {
+            if (!options.mtp.window_rows) return {};
+            return [&, request_parents, window_stream](std::shared_ptr<strix::HipMtpTargetHidden> target) {
               const auto row_set = options.mtp.window_rows_set.empty()
                   ? std::vector<std::uint32_t>{options.mtp.window_rows} : options.mtp.window_rows_set;
               std::vector<std::shared_ptr<strix::HipKnownPrefixWindow>> owners;
@@ -2643,10 +2673,10 @@ int STRIX_DECODE_ENTRY(
                     options.mtp.window_total_bytes - std::min(retained_total, options.mtp.window_total_bytes),
                     union_bytes, options.mtp.window_expert_union_bytes - std::min(union_total, options.mtp.window_expert_union_bytes));
                 auto window_memory = std::make_shared<KnownPromptMemory>(plan, generations.next(), generations.next(),
-                    std::static_pointer_cast<const void>(parents), original_work_device, 0, 0,
-                    union_bytes, union_bytes ? generations.next() : 0);
+                    std::static_pointer_cast<const void>(request_parents), original_work_device, 0, 0,
+                    union_bytes, union_bytes ? generations.next() : 0, window_stream);
                 owners.push_back(std::make_shared<strix::HipKnownPrefixWindow>(plan, compiled, model, catalog_config,
-                    parents->resources, window_memory->scratch, window_memory->scope, std::static_pointer_cast<const void>(window_memory),
+                    request_parents->resources, window_memory->scratch, window_memory->scope, std::static_pointer_cast<const void>(window_memory),
                     union_bytes ? strix::q51_known_rows::Workspace{window_memory->union_scratch,
                         std::static_pointer_cast<const void>(window_memory)} : strix::q51_known_rows::Workspace{}));
                 retained_total += reservation.retained_window_bytes; union_total += union_bytes;
@@ -2659,24 +2689,93 @@ int STRIX_DECODE_ENTRY(
                 policy.checkpoint_retained_byte_budget = options.mtp.window_checkpoint_bytes;
                 policy.total_retained_byte_budget = options.mtp.window_total_bytes - retained_total;
                 policy.min_probability = strix::decode_cli::mtp_draft_min_probability(options.mtp);
+                policy.timing_independent_schedule =
+                    strix::decode_cli::mtp_sampling(options.mtp) && !options.mtp.sample_timing_schedule;
                 auto verifier = std::make_shared<strix::HipMtpWindowVerifier>(std::move(target), std::move(owners),
-                    parents->resources, parents, policy, generations);
-                parents->window_setup = {union_steps, union_total, union_generation, retained_total};
+                    request_parents->resources, request_parents, policy, generations);
+                request_parents->window_setup = {union_steps, union_total, union_generation, retained_total};
                 return verifier;
             };
+        };
+        if (!options.mtp.cohort.empty()) {
+            // Each further request: its own state memory and serial scratch, PLE backend and
+            // prefetch, launch plan and session over the same mapped model, manifest and layout.
+            struct CohortStack {
+                std::shared_ptr<strix::decode_cli::MtpDecodeTargetParents> parents;
+                strix::ExecutionLauncherRegistry launchers;
+                std::optional<strix::CompiledLaunchPlan> plan;
+                std::optional<strix::DirectLaunchDispatcher> dispatcher;
+                strix::SerialSessionContext session;
+            };
+            const auto window_stream = std::make_shared<const SharedWindowStream>();
+            std::vector<std::unique_ptr<CohortStack>> stacks;
+            std::vector<strix::decode_cli::MtpCohortRequest> requests;
+            requests.push_back({parents, &session, &direct_dispatcher, options.tokens, options.mtp.golden,
+                options.mtp.golden_sha256, window_factory_for(parents, window_stream)});
+            for (const auto& request : options.mtp.cohort) {
+                auto stack = std::make_unique<CohortStack>();
+                auto request_memory = std::make_shared<strix::RuntimeExecutionMemoryOwner>(
+                    strix::RuntimeExecutionMemoryOwner::allocate(compiled, state_layout, allocator_owner, generations));
+                strix::initialize_hip_fresh_runtime_memory(request_memory->scratch(), request_memory->state());
+                auto request_experiment = std::make_shared<HipDecodeExperimentResources>(
+                    mapped_owner, model_owner, allocator_owner, request_memory, manifest, tensor_access, state_layout);
+                // One manifest, access plan and layout object for every request: cohort windows
+                // compare these owners across the rows of all requests.
+                request_experiment->resources.model_manifest = experiment_owner->resources.model_manifest;
+                request_experiment->resources.tensor_access = experiment_owner->resources.tensor_access;
+                request_experiment->resources.session_state_layout = experiment_owner->resources.session_state_layout;
+                std::shared_ptr<strix::PleLookupBackend> request_ple = options.planned_ple_io
+                    ? std::static_pointer_cast<strix::PleLookupBackend>(std::make_shared<strix::PlannedPleLookupBackend>(
+                        *retained_ple_source, planned_ple_policy, retained_ple_source))
+                    : std::static_pointer_cast<strix::PleLookupBackend>(std::make_shared<strix::FileMappedPleLookupBackend>());
+                auto request_catalog = std::make_shared<strix::HipLauncherCatalog>(model, catalog_config);
+                stack->parents = std::make_shared<strix::decode_cli::MtpDecodeTargetParents>(
+                    request_experiment, request_catalog, std::move(request_ple), ple_hash_contract);
+                request_catalog->register_for_compiled_execution(compiled, stack->launchers, &stack->parents->resources);
+                if (request_catalog->audit(compiled, stack->launchers).missing_steps)
+                    throw std::logic_error("HIP launcher catalog is incomplete for a cohort request");
+                stack->plan.emplace(strix::compile_launch_plan(compiled, stack->launchers));
+                stack->dispatcher.emplace(*stack->plan, active_observer);
+                const auto request_identities = strix::build_runtime_execution_identities(
+                    compiled.execution_identity, compiled.arena, stack->parents->resources);
+                stack->session.execution_identity = compiled.execution_identity;
+                stack->session.state_layout_identity = state_layout.layout_identity;
+                stack->session.runtime_compatibility_identity = request_identities.compatibility_identity;
+                stack->session.state.valid = all_persistent_state();
+                requests.push_back({stack->parents, &stack->session, &*stack->dispatcher, request.tokens, request.golden,
+                    request.golden_sha256, window_factory_for(stack->parents, window_stream)});
+                stacks.push_back(std::move(stack));
+            }
+            setup_phase.reset();
+            strix::decode_cli::run_mtp_cohort_bridge(options, model, compiled, requests, generations,
+                catalog_config.deferred_moe_status, optimization_profile.selected, std::cout);
+            return 0;
         }
+        auto make_window = window_factory_for(parents, {});
         setup_phase.reset();
-        strix::decode_cli::run_mtp_decode_bridge(options, model, compiled, parents, session, direct_dispatcher,
-            generations, catalog_config.deferred_moe_status, optimization_profile.selected, std::cout, std::move(make_window),
-            [&] { return execution_inventory_receipt + ple_cache_completed_receipt(); }
+        // --mtp-sample-repeats N: N independent requests (seeds seed..seed+N-1), each from a fresh
+        // session over the same loaded model; one receipt per request.
+        const auto fresh_session = session;
+        auto request_options = options;
+        for (std::uint32_t repeat = 0; repeat < options.mtp.sample_repeats; ++repeat) {
+            if (repeat) {
+                strix::initialize_hip_fresh_runtime_memory(memory.scratch(), memory.state());
+                session = fresh_session;
+            }
+            request_options.mtp.sample_seed = options.mtp.sample_seed + repeat;
+            strix::decode_cli::run_mtp_decode_bridge(request_options, model, compiled, parents, session, direct_dispatcher,
+                generations, catalog_config.deferred_moe_status, optimization_profile.selected, std::cout, make_window,
+                [&] { return execution_inventory_receipt + ple_cache_completed_receipt(); }
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
-            , strix::tests::mtp_component_diagnostic_requested()
-                ? strix::decode_cli::MtpDecodeQualification{} : strix::decode_cli::MtpDecodeQualification{strix::tests::run_mtp_model_qualification}
-            , strix::tests::mtp_component_diagnostic_requested()
-                ? strix::decode_cli::MtpDecodeComponentDiagnostic{strix::tests::run_mtp_component_diagnostic}
-                : strix::decode_cli::MtpDecodeComponentDiagnostic{}
+                , strix::tests::mtp_component_diagnostic_requested()
+                    ? strix::decode_cli::MtpDecodeQualification{} : strix::decode_cli::MtpDecodeQualification{strix::tests::run_mtp_model_qualification}
+                , strix::tests::mtp_component_diagnostic_requested()
+                    ? strix::decode_cli::MtpDecodeComponentDiagnostic{strix::tests::run_mtp_component_diagnostic}
+                    : strix::decode_cli::MtpDecodeComponentDiagnostic{}
 #endif
-            );
+                );
+            std::cout.flush();
+        }
         if (prefix_store) prefix_store->flush();
         return 0;
     }

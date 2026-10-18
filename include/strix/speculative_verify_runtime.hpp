@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <span>
 #include <utility>
 #include <vector>
@@ -132,6 +133,46 @@ struct KnownWindowResult {
     std::span<const KnownWindowR2Entry> r2_entries,
     std::span<const KnownWindowRowsEntry> rows_entries,
     const KnownWindowExecutionHooks& hooks);
+
+// The same known window in phases: the constructor performs the complete admission (and returns
+// with admission_only() under hooks.preflight_only), launch_step enqueues one step exactly as the
+// one-call form, complete drains and checks the window, publish advances the session. A cohort
+// caller interleaves the steps of several admitted windows of different sessions on one stream and
+// may enqueue a promoted step for all of their rows itself (record_external_step then keeps this
+// window's counters and state writes). Any exception after admission requires fail(), which
+// poisons the session and runs quiesce_or_fail_stop. With caller_scopes the caller holds one
+// ValidatedModelBindingScope and ArenaLookupScope around every phase instead of the window.
+class KnownWindowRun final {
+public:
+    KnownWindowRun(const CompiledKnownPrefixWindow& window, const CompiledSerialExecution& serial,
+        const ExecutionRuntimeResources& serial_resources,
+        const ExecutionMemoryBinding& window_scratch, SerialSessionContext& session,
+        std::span<const std::uint32_t> tokens,
+        std::span<const CompiledLaunchPlan* const> row_launch,
+        std::span<const KnownWindowR2Entry> r2_entries,
+        std::span<const KnownWindowRowsEntry> rows_entries,
+        const KnownWindowExecutionHooks& hooks, bool caller_scopes = false);
+    ~KnownWindowRun();
+    KnownWindowRun(const KnownWindowRun&) = delete;
+    KnownWindowRun& operator=(const KnownWindowRun&) = delete;
+    [[nodiscard]] bool admission_only() const noexcept;
+    [[nodiscard]] std::size_t steps() const noexcept;
+    [[nodiscard]] std::uint32_t rows() const noexcept;
+    // Row contexts of step i (stable until destruction).
+    [[nodiscard]] std::span<const ExecutionDispatchContext> step_rows(std::size_t i) const;
+    // Step i is dispatched through one wide entry covering every row of this window.
+    [[nodiscard]] bool wide_step(std::size_t i) const;
+    // Step i is dispatched through a wide entry or through pair entries.
+    [[nodiscard]] bool promoted_step(std::size_t i) const;
+    void launch_step(std::size_t i);
+    void record_external_step(std::size_t i);
+    void complete();
+    void fail();
+    [[nodiscard]] KnownWindowResult publish();
+private:
+    struct State;
+    std::unique_ptr<State> state_;
+};
 
 struct SpeculativeVerifyExecutionResult {
     EagerExecutionResult execution;

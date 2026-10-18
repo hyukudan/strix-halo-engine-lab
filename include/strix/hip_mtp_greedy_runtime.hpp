@@ -2,6 +2,8 @@
 #include "strix/hip_mtp_runtime.hpp"
 namespace strix {
 class HipMtpWindowVerifier;
+class HipKnownPrefixWindow;
+struct HipMtpVerifiedTargetRows;
 struct HipMtpGreedyCycleResult {
     std::vector<std::uint32_t> emitted_tokens;
     std::uint32_t proposed_candidates=0,accepted_candidates=0;
@@ -49,8 +51,42 @@ public:
         std::span<const std::uint32_t> eos_tokens={});
     [[nodiscard]] bool failed() const noexcept;
     [[nodiscard]] const HipMtpRuntime& native_runtime() const noexcept;
+    // cycle() in two phases, for a caller that verifies the drafts of several sessions at once
+    // (hip_mtp_greedy_cohort_cycle). begin_cycle_draft drafts for initial_target exactly as cycle
+    // does (cost_model = false drafts up to the minimum probability only) and returns the draft
+    // depth limit; drafting() is false afterwards only when the pending token is EOS (nothing to
+    // verify). finish_cycle publishes the target-verified rows as cycle does. An exception between
+    // the phases must be followed by fail_cycle().
+    std::uint32_t begin_cycle_draft(const HipMtpTargetHiddenTicket& initial_target,
+        std::uint32_t maximum_candidates,std::uint32_t token_budget,
+        std::span<const std::uint32_t> eos_tokens,bool cost_model);
+    [[nodiscard]] bool drafting() const noexcept;
+    [[nodiscard]] std::span<const std::uint32_t> drafted_candidates() const noexcept;
+    [[nodiscard]] std::span<const float> drafted_probabilities() const noexcept;
+    [[nodiscard]] HipMtpGreedyCycleResult finish_cycle(const HipMtpTargetHiddenTicket& initial_target,
+        HipMtpVerifiedTargetRows verified,std::uint32_t token_budget,std::span<const std::uint32_t> eos_tokens);
+    void fail_cycle() noexcept;
+    [[nodiscard]] HipMtpWindowVerifier* window_verifier() const noexcept;
+    [[nodiscard]] SerialSessionContext& target_session() const noexcept;
+    [[nodiscard]] DirectLaunchDispatcher& target_dispatcher() const noexcept;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+// One generation cycle of several independent sessions, each with its own window-verified greedy
+// runtime. Every session drafts as in cycle() (up to the minimum probability; no cost-model stop)
+// and gets the prefix owner verify() would size for its drafts; sessions are packed into cohorts
+// of 4 or 8 rows (a smaller window may be rounded up with padding rows, which are never accepted)
+// verified by one cohort window each. A session whose owner does not fit, or that is left alone,
+// verifies with its own verify(). Each result is the session's own cycle result: every emitted
+// token is that session's target greedy token. An EOS pending token emits nothing (result eos).
+struct HipMtpGreedyCohortMember {
+    HipMtpGreedyRuntime* runtime=nullptr;
+    const HipMtpTargetHiddenTicket* initial=nullptr;
+    std::uint32_t maximum_candidates=0,budget=0;
+    std::span<const std::uint32_t> eos;
+};
+struct HipMtpGreedyCohortStats {std::uint64_t cohort_windows=0,cohort_sessions=0,cohort_rows=0,solo_windows=0;};
+[[nodiscard]] std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(
+    std::span<const HipMtpGreedyCohortMember> members,HipMtpGreedyCohortStats* stats=nullptr);
 } // namespace strix

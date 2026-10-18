@@ -69,6 +69,7 @@ struct RuntimeDispatchStats {
     std::atomic<std::uint64_t> a8_down_q80_submissions{0};
     std::atomic<std::uint64_t> a8_down_q80_legacy_submissions{0};
     std::atomic<std::uint64_t> q5k_a8_gate_up_submissions{0};
+    std::atomic<std::uint64_t> prefill_f16wmma_submissions{0}; // prompt rows of FP16 WMMA prefill blocks
 };
 struct RuntimeLayerClassification {
     std::vector<std::uint32_t> quantized_layers;

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
@@ -155,6 +156,8 @@ struct HipMtpDraftHead::Impl {
     std::uint32_t* slots=nullptr;
     Reply* reply=nullptr;
     Reply* device_reply=nullptr;
+    float* runner_logits=nullptr; // pinned [max_slots][capacity] when the runner-up diagnostic is on
+    std::uint32_t runner_rows[max_slots]{};
     hipStream_t stream=nullptr;
     ~Impl() {
         if(stream) (void)hipStreamSynchronize(stream);
@@ -162,6 +165,7 @@ struct HipMtpDraftHead::Impl {
                      static_cast<void*>(partials),static_cast<void*>(slots)}) if(p) (void)hipFree(p);
         if(host_ids) (void)hipHostFree(host_ids);
         if(reply) (void)hipHostFree(reply);
+        if(runner_logits) (void)hipHostFree(runner_logits);
     }
     template<class T> T* device(std::uint64_t count) {
         void* p=nullptr;check(hipMalloc(&p,static_cast<std::size_t>(count*sizeof(T))),"MTP draft head allocation");return static_cast<T*>(p);
@@ -215,6 +219,9 @@ HipMtpDraftHead::HipMtpDraftHead(const void* q8_head,HipMtpDraftHeadConfig confi
             p.context_dropped=0;
             require(p.base_rows || p.config.context_capacity,"MTP draft base vocabulary has no valid id");
         }
+        if(const char* v=std::getenv("STRIX_MTP_DRAFT_TOP2");v && v[0]!='0')
+            check(hipHostMalloc(reinterpret_cast<void**>(&p.runner_logits),static_cast<std::size_t>(max_slots)*p.capacity*sizeof(float),
+                hipHostMallocDefault),"MTP draft runner-up logits");
         check(hipStreamSynchronize(p.stream),"MTP draft head setup");
     } catch(...) {impl_.reset();throw;}
 }
@@ -231,6 +238,11 @@ void HipMtpDraftHead::launch(const std::uint16_t* hidden,std::uint32_t step,void
         hipLaunchKernelGGL(draft_q4_head,dim3((p.rows+7U)/8U),dim3(256),0,p.stream,hidden,p.compact,p.config.hidden_size/32U,p.rows,p.logits);
         check(hipGetLastError(),"MTP draft Q4 head");
     } else launch_hip_q8_head_rows(hidden,p.config.full?static_cast<const void*>(p.head):p.compact,p.config.hidden_size,p.rows,p.logits,stream);
+    if(p.runner_logits) {
+        p.runner_rows[step]=p.rows;
+        check(hipMemcpyAsync(p.runner_logits+static_cast<std::uint64_t>(step)*p.capacity,p.logits,p.rows*sizeof(float),
+            hipMemcpyDeviceToHost,p.stream),"MTP draft runner-up logits copy");
+    }
     const auto blocks=(p.rows-1U)/threads+1U;
     hipLaunchKernelGGL(draft_argmax_partials,dim3(blocks),dim3(threads),0,p.stream,p.logits,p.ids,p.rows,p.partials);
     check(hipGetLastError(),"MTP draft argmax partials");
@@ -268,6 +280,36 @@ void HipMtpDraftHead::wait_step(std::uint32_t step,void* stream) const {
         }
     }
     check(hipStreamSynchronize(p.stream),"MTP draft early-stop step");
+}
+void HipMtpDraftHead::read_logits(std::vector<float>& out) const {
+    const auto& p=*impl_;out.resize(p.rows);
+    check(hipMemcpyAsync(out.data(),p.logits,p.rows*sizeof(float),hipMemcpyDeviceToHost,p.stream),"MTP draft logits readback");
+    check(hipStreamSynchronize(p.stream),"MTP draft logits readback completion");
+}
+std::span<const std::uint32_t> HipMtpDraftHead::host_ids() const noexcept {
+    const auto& p=*impl_;return p.config.full?std::span<const std::uint32_t>{}:std::span<const std::uint32_t>(p.host_ids,p.rows);
+}
+void HipMtpDraftHead::set_token(std::uint32_t step,std::uint32_t token,void* stream) {
+    auto& p=*impl_;require(step<p.config.max_depth && stream==p.stream && token<p.config.vocab_size,"MTP draft token override is invalid");
+    check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(p.slots+step),static_cast<int>(token),1,p.stream),"MTP draft token override");
+    p.reply->tokens[step]=token;
+}
+bool HipMtpDraftHead::records_runner_up() const noexcept {return impl_->runner_logits!=nullptr;}
+bool HipMtpDraftHead::runner_up(std::uint32_t step,std::uint32_t& token,float& probability) const {
+    const auto& p=*impl_;
+    if(!p.runner_logits || step>=p.config.max_depth || p.runner_rows[step]<2U) return false;
+    const auto* l=p.runner_logits+static_cast<std::uint64_t>(step)*p.capacity;const auto rows=p.runner_rows[step];
+    auto id=[&](std::uint32_t r){return p.config.full?r:p.host_ids[r];};
+    auto better=[&](std::uint32_t a,std::uint32_t b){return l[a]>l[b] || (l[a]==l[b] && id(a)<id(b));};
+    std::uint32_t first=UINT32_MAX,second=UINT32_MAX;
+    for(std::uint32_t r=0;r<rows;++r) {
+        if(!std::isfinite(l[r])) continue;
+        if(first==UINT32_MAX || better(r,first)) {second=first;first=r;}
+        else if(second==UINT32_MAX || better(r,second)) second=r;
+    }
+    if(second==UINT32_MAX) return false;
+    double sum=0.0;for(std::uint32_t r=0;r<rows;++r) if(std::isfinite(l[r])) sum+=std::exp(static_cast<double>(l[r])-l[first]);
+    token=id(second);probability=static_cast<float>(std::exp(static_cast<double>(l[second])-l[first])/sum);return true;
 }
 bool HipMtpDraftHead::full() const noexcept {return impl_->config.full;}
 HipMtpDraftHeadStats HipMtpDraftHead::stats() const noexcept {

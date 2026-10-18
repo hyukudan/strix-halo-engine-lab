@@ -1803,8 +1803,7 @@ void known_shared_engine_projection(bool down, const KnownSharedR2Views& views, 
             site.gate[r] = reinterpret_cast<const float*>(workspace) + s.intermediate;
             site.output[r] = reinterpret_cast<std::uint16_t*>(row(views.output, s.output_stride_bytes, r));
         }
-        if constexpr (Rows > 64U) q8_rows::launch_dense_a8(site, stream, false);
-        else q8_rows::launch(site, config.dense_a8_projections, stream);
+        q8_rows::launch_prefill(site, config.dense_a8_projections, config.dense_f16_prefill, stream, false, config.dense_g64_prefill);
     } else {
         SharedGateUpRowsSite<Rows> site{};
         site.segments = q8_rows::segments({{reinterpret_cast<const void*>(views.weights.gate_q8.address), s.intermediate},
@@ -1818,8 +1817,7 @@ void known_shared_engine_projection(bool down, const KnownSharedR2Views& views, 
         // workspace, independent of the router's top-k selection queued just before it.
         static const bool any_order_enabled = strix_any_order_enabled();
         const bool any_order = any_order_enabled && allow_any_order;
-        if constexpr (Rows > 64U) q8_rows::launch_dense_a8(site, stream, any_order);
-        else q8_rows::launch(site, config.dense_a8_projections, stream, any_order);
+        q8_rows::launch_prefill(site, config.dense_a8_projections, config.dense_f16_prefill, stream, any_order, config.dense_g64_prefill);
     }
     check_hip(hipGetLastError(), "known-window shared rows projection launch");
     if (config.prefetch_q8 && config.prefetch_stats)
@@ -2105,6 +2103,110 @@ void shared_expert_known_window_rows_launch_detached(std::span<const ExecutionDi
         known_shared_engine_projection<2U>(true, views, stream, config);
     } else if (rows.size() == 4U) known_shared_rows_enqueue<4U>(views, stream, config, false);
     else known_shared_rows_enqueue<8U>(views, stream, config, false);
+}
+namespace {
+// Cohort: the projections of all segments' rows through per-row pointers (each row exactly as in its
+// own window), the activation/scalar kernel per segment over its own strided rows.
+template <unsigned Rows>
+void known_shared_cohort_enqueue(std::span<const KnownSharedR2Views> segments, std::span<const unsigned> counts,
+    hipStream_t stream, const HipSharedExpertLauncherConfig& config) {
+    const auto& s = segments[0].shape;
+    const auto& weights = segments[0].weights;
+    const auto at = [](KnownSharedSpan span, std::uint64_t stride, unsigned r) { return span.address + r * stride; };
+    {
+        SharedGateUpRowsSite<Rows> site{};
+        site.segments = q8_rows::segments({{reinterpret_cast<const void*>(weights.gate_q8.address), s.intermediate},
+            {reinterpret_cast<const void*>(weights.up_q8.address), s.intermediate}});
+        site.width = s.hidden; site.outputs = 2U * s.intermediate;
+        unsigned row = 0;
+        for (std::size_t k = 0; k < segments.size(); ++k)
+            for (unsigned r = 0; r < counts[k]; ++r, ++row) {
+                site.input[row] = reinterpret_cast<const void*>(at(segments[k].input, s.input_stride_bytes, r));
+                site.output[row] = reinterpret_cast<float*>(at(segments[k].workspace, s.workspace_stride_bytes, r));
+            }
+        // The first kernel follows a cross-stream wait, so it keeps its barrier.
+        q8_rows::launch(site, config.dense_a8_projections, stream, false);
+        check_hip(hipGetLastError(), "known-window cohort shared gate/up launch");
+    }
+    for (std::size_t k = 0; k < segments.size(); ++k) {
+        const auto& views = segments[k];
+        hipLaunchKernelGGL(rows_shared_activation_scalar_kernel, dim3((config.intermediate_size + kThreads - 1U) / kThreads, counts[k]),
+            dim3(kThreads), 0, stream, views.workspace.address, views.shape.workspace_stride_bytes, views.input.address,
+            views.shape.input_stride_bytes, reinterpret_cast<const void*>(views.weights.shared_gate_f32.address),
+            config.intermediate_size, config.hidden_size);
+        check_hip(hipGetLastError(), "known-window cohort shared activation/scalar launch");
+    }
+    {
+        SharedDownRowsSite<Rows> site{};
+        site.segments = q8_rows::segments({{reinterpret_cast<const void*>(weights.down_q8.address), s.hidden}});
+        site.width = s.intermediate; site.outputs = s.hidden;
+        unsigned row = 0;
+        for (std::size_t k = 0; k < segments.size(); ++k)
+            for (unsigned r = 0; r < counts[k]; ++r, ++row) {
+                const auto workspace = at(segments[k].workspace, s.workspace_stride_bytes, r);
+                site.input[row] = reinterpret_cast<const void*>(workspace);
+                site.gate[row] = reinterpret_cast<const float*>(workspace) + s.intermediate;
+                site.output[row] = reinterpret_cast<std::uint16_t*>(at(segments[k].output, s.output_stride_bytes, r));
+            }
+        q8_rows::launch(site, config.dense_a8_projections, stream);
+        check_hip(hipGetLastError(), "known-window cohort shared down launch");
+    }
+    if (config.prefetch_q8 && config.prefetch_stats)
+        config.prefetch_stats->dispatched_projections.fetch_add(3U, std::memory_order_relaxed);
+}
+} // namespace
+
+void shared_expert_known_window_cohort_launch(std::span<const std::span<const ExecutionDispatchContext>> segments,
+    const HipSharedExpertLauncherConfig& config, void* raw_stream, std::uintptr_t workspace, std::uint64_t workspace_bytes) {
+    const auto stream = static_cast<hipStream_t>(raw_stream);
+    if (segments.size() < 2U || segments.size() > 4U || !stream)
+        throw std::invalid_argument("known-window cohort shared rows require two to four sessions and a stream");
+    std::array<KnownSharedR2Views, 4> views{};
+    std::array<unsigned, 4> counts{};
+    unsigned total = 0;
+    std::uint64_t workspace_extent = 0;
+    for (std::size_t k = 0; k < segments.size(); ++k) {
+        const auto rows = segments[k];
+        if (rows.size() != 2U && rows.size() != 4U && rows.size() != 8U)
+            throw std::invalid_argument("known-window cohort shared segments require 2, 4 or 8 rows");
+        // Every session segment passes the complete single-session admission.
+        views[k] = rows.size() == 2U ? known_shared_r2_views(std::span<const ExecutionDispatchContext, 2>(rows.data(), 2), config) :
+            known_shared_rows_views(rows, config);
+        counts[k] = static_cast<unsigned>(rows.size());
+        const auto& a = views[0]; const auto& b = views[k];
+        if (b.weights.gate_q8.address != a.weights.gate_q8.address || b.weights.up_q8.address != a.weights.up_q8.address ||
+            b.weights.down_q8.address != a.weights.down_q8.address ||
+            b.weights.shared_gate_f32.address != a.weights.shared_gate_f32.address ||
+            b.shape.hidden != a.shape.hidden || b.shape.intermediate != a.shape.intermediate ||
+            b.shape.workspace_stride_bytes != a.shape.workspace_stride_bytes || *rows[0].layer != *segments[0][0].layer)
+            throw std::invalid_argument("known-window cohort shared segments differ in layer, weights or row layout");
+        total += counts[k];
+        workspace_extent += b.shape.workspace_stride_bytes * counts[k];
+    }
+    if (total != 4U && total != 8U) throw std::invalid_argument("known-window cohort shared rows require four or eight rows");
+    require_known_shared_a8(total, config);
+    if (workspace) {
+        // Detached: every segment's rows keep their arena stride in the caller's own workspace, one after another.
+        const auto stride = views[0].shape.workspace_stride_bytes;
+        if (workspace % 256U || stride % 256U || workspace_bytes < workspace_extent || workspace_bytes > UINTPTR_MAX - workspace)
+            throw std::invalid_argument("known-window cohort shared workspace is invalid");
+        std::uint64_t offset = 0;
+        for (std::size_t k = 0; k < segments.size(); ++k) {
+            for (const auto& r : segments[k]) {
+                const auto input = resolve_dispatch_read(r, 0), output = resolve_dispatch_write(r, 0);
+                for (const auto& owned : {input, output})
+                    if (owned.address < workspace + workspace_bytes && workspace < owned.address + owned.bytes)
+                        throw std::invalid_argument("known-window cohort shared workspace aliases row storage");
+            }
+            views[k].workspace.address = workspace + offset;
+            offset += stride * counts[k];
+        }
+    }
+    check_hip(hipPeekAtLastError(), "known-window cohort shared rows stale launch error");
+    const std::span<const KnownSharedR2Views> all(views.data(), segments.size());
+    const std::span<const unsigned> sizes(counts.data(), segments.size());
+    if (total == 4U) known_shared_cohort_enqueue<4U>(all, sizes, stream, config);
+    else known_shared_cohort_enqueue<8U>(all, sizes, stream, config);
 }
 } // namespace strix
 

@@ -251,6 +251,9 @@ Defaults are the measured configuration.
 | `STRIX_MTP_GREEDY_ROWS=0` | Use per-row selectors instead of on-stream argmax of all window rows. |
 | `STRIX_CYCLE_TIMING=1` | Print host phase timings per MTP cycle. |
 | `STRIX_CYCLE_LOG=1` | Print each MTP cycle's window rows and wall time. |
+| `STRIX_MTP_TILED_START=0` | Tiled MTP prompt: run the last prompt row serially instead of starting decode from the last row of a prefill block that ends there. |
+| `STRIX_MTP_DRAFT_LOG=1` | Print every draft proposal (chain start, step, token, probability) and each cycle's outcome (window rows, drafts, accepted, emitted ids). |
+| `STRIX_MTP_DRAFT_TOP2=1` | With `STRIX_MTP_DRAFT_LOG=1`: also copy each draft step's logits to host and print the runner-up token and its probability. Diagnostic only; selection is unchanged. |
 | `STRIX_WINDOW_TIMING=1` | Print host-side phase totals of every known window at exit. |
 | `STRIX_PREFILL_TIMING=1` | Print download, scoring and spool times per block of teacher-forced tiled prefill. |
 

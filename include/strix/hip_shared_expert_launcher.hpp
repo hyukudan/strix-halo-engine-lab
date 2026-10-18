@@ -24,6 +24,10 @@ struct HipSharedExpertLauncherConfig {
     // step (R1, windows and prompt rows) runs Q8_0 x per-32 int8 activations
     // through q8_rows::launch_dense_a8. Different numerics from the exact path.
     bool dense_a8_projections = false;
+    // fast-prefill-f16wmma-v1: prompt launches of 32..256 rows run q8_rows::launch_dense_f16 (prefill only).
+    bool dense_f16_prefill = false;
+    // fast-prefill component dense8: prompt launches of 64..256 rows run q8_rows::launch_dense_g64 (prefill only).
+    bool dense_g64_prefill = false;
 };
 
 enum class HipSharedQ8ProjectionMode {legacy256,virtual256,prefetch8};
@@ -97,6 +101,12 @@ void shared_expert_known_window_rows_launch(
 // workspace rows at the arena's row stride in [workspace, workspace + workspace_bytes) instead of the
 // arena. The caller orders `stream` after the step's input and before its readers, and owns the
 // workspace and stream through quiescence (also after an exception).
+// Cohort of several sessions' windows of one shared-expert step (2/4/8 rows each, four or eight in
+// total). Every segment passes its own window admission; the gate/up and down projections run once
+// for all rows (each row's arithmetic as in its own window), the activation/scalar kernel per
+// segment. A nonzero workspace holds every segment's workspace rows in turn (detached use).
+void shared_expert_known_window_cohort_launch(std::span<const std::span<const ExecutionDispatchContext>> segments,
+    const HipSharedExpertLauncherConfig& config, void* stream, std::uintptr_t workspace, std::uint64_t workspace_bytes);
 void shared_expert_known_window_rows_launch_detached(std::span<const ExecutionDispatchContext> rows,
     const HipSharedExpertLauncherConfig& config, void* stream, std::uintptr_t workspace, std::uint64_t workspace_bytes);
 // Prefill: all T rows of a shared-expert step (8-row tiles of one strided view).

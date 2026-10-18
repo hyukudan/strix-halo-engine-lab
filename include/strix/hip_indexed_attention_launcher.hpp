@@ -36,6 +36,12 @@ struct HipIndexedAttentionLauncherConfig {
     // step (R1, windows and prompt rows) runs Q8_0 x per-32 int8 activations
     // through q8_rows::launch_dense_a8. Different numerics from the exact path.
     bool dense_a8_projections = false;
+    // fast-prefill-f16wmma-v1: prompt launches of 32..256 rows run q8_rows::launch_dense_f16 (prefill only).
+    bool dense_f16_prefill = false;
+    // fast-prefill component dense8: prompt launches of 64..256 rows run q8_rows::launch_dense_g64 (prefill only).
+    bool dense_g64_prefill = false;
+    // fast-prefill-f16wmma-v1, qsa component: prefill groups run the fused union attention (hip_qsa_fast_prefill.inc).
+    bool qsa_fast_prefill = false;
 };
 
 enum class HipQsaInputProjectionMode {legacy256,virtual256,prefetch8};
@@ -118,6 +124,16 @@ void indexed_attention_known_window_rows_preflight(std::span<const ExecutionDisp
     const HipIndexedAttentionLauncherConfig&, HipQsaIndexJournal journal = {});
 void indexed_attention_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipIndexedAttentionLauncherConfig&, HipQsaIndexJournal journal = {});
+// Cohort form: the rows of several sessions (four or eight in total), each segment 2/4/8 consecutive
+// rows of one session with its own KV and raw-index state. Every segment passes the complete
+// single-session admission; the input and output projections run once for all rows (each row's
+// arithmetic exactly as in its own window), store/selection/attention per segment. No journal.
+struct HipQsaCohortSegment {
+    std::span<const ExecutionDispatchContext> rows;
+    const HipIndexedAttentionLauncherConfig* config = nullptr;
+};
+void indexed_attention_known_window_cohort_preflight(std::span<const HipQsaCohortSegment> segments);
+void indexed_attention_known_window_cohort_launch(std::span<const HipQsaCohortSegment> segments);
 // Prefill: all T rows of a QSA step (8-row tiles; projections 64 rows per launch).
 void indexed_attention_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipIndexedAttentionLauncherConfig&, HipQsaIndexJournal journal = {});

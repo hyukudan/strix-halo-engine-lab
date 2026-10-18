@@ -36,6 +36,10 @@ struct HipGdnLauncherConfig {
     // step (R1, windows and prompt rows) runs Q8_0 x per-32 int8 activations
     // through q8_rows::launch_dense_a8. Different numerics from the exact path.
     bool dense_a8_projections = false;
+    // fast-prefill-f16wmma-v1: prompt launches of 32..256 rows run q8_rows::launch_dense_f16 (prefill only).
+    bool dense_f16_prefill = false;
+    // fast-prefill component dense8: prompt launches of 64..256 rows run q8_rows::launch_dense_g64 (prefill only).
+    bool dense_g64_prefill = false;
 };
 
 // Closed eager R2 window helper. Each context remains an R1 row view. Both
@@ -111,6 +115,28 @@ void gdn_window_rows_preflight(std::span<const ExecutionDispatchContext> rows, c
 void gdn_window_rows_launch(std::span<const ExecutionDispatchContext> rows, const HipGdnWindowConfig& config);
 // Commit for the layer of `row` (any R1 GDN context of that layer) on the current stream.
 void gdn_window_commit_launch(const ExecutionDispatchContext& row, const HipGdnWindowConfig& config);
+// Cohort of several sessions' windows of one layer (at most eight rows in total): each segment
+// is one session's layer state, consecutive rows and control, admitted as by gdn_window_enqueue.
+// The input projections, gates, gated norm and output projection run once for all rows (each
+// row's arithmetic exactly as in its own window); prepare and recurrence run per segment.
+struct GdnWindowCohortSegment {
+    GdnWindowLayer layer;
+    std::span<const GdnWindowRow> rows;
+    const GdnWindowControl* control = nullptr;
+};
+void gdn_window_cohort_enqueue(std::span<const GdnWindowCohortSegment> segments, const HipGdnLauncherConfig& config,
+    void* stream);
+// Cohort form: the rows of several sessions (at most eight in total), each segment one session's
+// consecutive rows with that session's own window configuration (retained rows and control). Every
+// segment passes the complete single-session binding. The input projections, gates, gated norm and
+// output projection run once for all rows (each row's arithmetic exactly as in its own window);
+// prepare and recurrence run per segment from that session's state. Same layer and weights.
+struct HipGdnWindowCohortSegment {
+    std::span<const ExecutionDispatchContext> rows;
+    const HipGdnWindowConfig* config = nullptr;
+};
+void gdn_window_cohort_rows_preflight(std::span<const HipGdnWindowCohortSegment> segments);
+void gdn_window_cohort_rows_launch(std::span<const HipGdnWindowCohortSegment> segments);
 
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
 // Test-only incumbent R1 sequence (same kernels and dispatch as the serial
