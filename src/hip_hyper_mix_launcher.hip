@@ -3906,9 +3906,10 @@ void launch_wide_hyper_rows(const PreparedHyperRows& prepared, const HyperTileRo
     const HipHyperMixLauncherConfig& config, std::uint32_t tiles, bool norm) {
     const auto& p = prepared.first;
     const auto* inject = p.inject_runtime ? reinterpret_cast<const void*>(p.inject_runtime->address) : nullptr;
-    // Fast prefill profile: the norm also writes the FP16 rows the WMMA projection reads (STRIX_HCW_NORM16=0: the
-    // projection converts the FP32 rows itself).
-    static const bool norm16_env = [] { const char* v = std::getenv("STRIX_HCW_NORM16"); return !v || v[0] != '0'; }();
+    // Fast prefill profile, STRIX_HCW_NORM16=1: the norm also writes the FP16 rows the WMMA projection reads. Off by
+    // default: in the engine (16K, T=8192 trace) the projection gained ~2 % while the norm cost ~25 % more (the FP32
+    // rows the norm just wrote are cache-resident, unlike in the fixture, where the FP16 input saves 26 %).
+    static const bool norm16_env = [] { const char* v = std::getenv("STRIX_HCW_NORM16"); return v && v[0] == '1'; }();
     HyperWideRows rows = wide;
     const bool norm16 = norm && config.fast_prefill_wmma && norm16_env && wide.count <= kHcwLowRows;
     if (norm16) { rows.normalized16 = hcw_normalized16_scratch(); rows.normalized16_pitch = kHcwNorm16Pitch; }
