@@ -36,6 +36,18 @@ fields, and every row are validated before allocating decoded row payloads.
 Truncation and trailing bytes are rejected. During decode the input file buffer
 and decoded vectors coexist; the file budget is not a claim about process RSS.
 
+Version 2 is version 1 with `version = 2`, `header bytes = 184` and two uint64
+fields appended to the header at offset 168: the target prefill numerical profile
+identity and the target decode numerical profile identity (FNV-1a 64 of the
+profile names, `numerical_profile_identity`). Both must be nonzero. They record
+the target arithmetic whose prefill produced the prompt rows; the native
+numerical profile ID at offset 144 remains the MTP head's own cast profile. The
+`--mtp-golden-dump` route writes version 2. A run admits a version-2 golden only
+when both identities equal its own `--prefill-numerical-profile` /
+`--numerical-profile` pair, and a version-1 golden (no recorded pair) only when
+both phases use one profile, before any target work. The replay payload identity
+below does not include the pair; the file SHA does.
+
 The file SHA binds these container bytes. It is distinct from the runtime replay
 payload identity, which the native consumer computes separately after loading.
 No qualification or activation is implied by successful decoding.

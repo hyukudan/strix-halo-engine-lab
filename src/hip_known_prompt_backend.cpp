@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <algorithm>
+#include <optional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -38,7 +39,9 @@ struct HipKnownPromptBackend::Impl {
     const std::uint64_t vocab_size;
     const std::uint64_t logits_bytes;
     bool failed = false;
+    bool started = false;
     HipKnownPromptBackendStats observed;
+    std::optional<std::pair<SessionExecutor, SessionExecutor>> handoff; // {decode, prefill}
 
     Impl(std::shared_ptr<HipKnownPrefixWindow> native_window, SerialSessionContext& live_session,
         ExecutionMemoryBinding memory, std::uint64_t vocabulary,
@@ -76,6 +79,7 @@ struct HipKnownPromptBackend::Impl {
         const auto committed_before = session.committed_tokens;
         const auto rows = window->logical_rows();
         bool window_attempted = false;
+        started = true;
         try {
             guard->require_original();
             const auto policy=window->output_policy();
@@ -96,8 +100,10 @@ struct HipKnownPromptBackend::Impl {
                     throw std::invalid_argument("known prompt token exceeds vocabulary");
             // Allocate host return storage before any model-state consumption.
             std::vector<float> logits(state_only?0U:static_cast<std::size_t>(vocab_size));
+            if (handoff) hand_off_serial_session(session, handoff->first, handoff->second);
             window_attempted = true;
             const auto result = headless ? window->execute_without_head(session, tokens) : window->execute(session, tokens);
+            if (handoff) hand_off_serial_session(session, handoff->second, handoff->first);
             // A window with deferred GDN or per-row PLE keeps every row of a known prompt: commit them all
             // and apply the pending GDN rows now (both are no-ops for windows without those operators).
             if (!window->supports_tiled_prefill()) { window->commit_prefix(rows); window->flush_deferred(); }
@@ -150,6 +156,12 @@ struct HipKnownPromptBackend::Impl {
             return logits;
         } catch (...) {
             failed = true;
+            // A rejected window leaves a ready session: return it to the decode executor.
+            if (handoff && session.health == SerialSessionHealth::ready && handoff->second.compiled &&
+                session.execution_identity == handoff->second.compiled->execution_identity) {
+                try { hand_off_serial_session(session, handoff->second, handoff->first); }
+                catch (...) { session.health = SerialSessionHealth::poisoned; session.arithmetic_lineage.tainted = true; }
+            }
             if (session.committed_tokens != committed_before) {
                 session.health = SerialSessionHealth::poisoned;
                 session.arithmetic_lineage.tainted = true;
@@ -185,5 +197,12 @@ void HipKnownPromptBackend::execute_state_rows(std::span<const std::uint32_t> to
 }
 HipKnownPromptBackendStats HipKnownPromptBackend::stats() const noexcept {
     return impl_->observed;
+}
+void HipKnownPromptBackend::set_executor_handoff(SessionExecutor decode, SessionExecutor prefill) {
+    if (impl_->handoff || impl_->started || impl_->failed || !decode.compiled || !prefill.compiled ||
+        !decode.resources || !prefill.resources || !impl_->window->supports_tiled_prefill())
+        throw std::invalid_argument("known prompt executor handoff is set once, before any tiled prefill call");
+    validate_sibling_serial_executions(*prefill.compiled, *decode.compiled);
+    impl_->handoff.emplace(decode, prefill);
 }
 } // namespace strix

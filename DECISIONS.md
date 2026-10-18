@@ -277,6 +277,42 @@ below quantizing activations to Q8_1 (+30 % KL). The two profiles pick different
 almost all near-ties (median reference top-2 margin 0.22 nats, against 3.10 overall). The one per-category signal
 is Spanish prose top-1 (−0.55 ± 0.23 pt) with unchanged KL.
 
+## D-033: separate prefill numerical profile
+
+`--prefill-numerical-profile NAME` selects the arithmetic of the prompt prefill (tiled known-prefix prefill
+blocks, or every MTP prompt row); `--numerical-profile` keeps selecting decode, MTP windows and checkpoints.
+Without the flag the prefill uses `--numerical-profile`, and tokens and every existing receipt field are
+unchanged. Admitted today: the dense-A8 sibling of the decode profile, in both directions (see
+[docs/prefill-numerical-profile.md](docs/prefill-numerical-profile.md)).
+
+The prefill runs a second serial execution compiled from the same requests with only dense A8 changed; the two
+are checked to be siblings (same steps, state access, IO and arena layout). The session is handed to the prefill
+execution for each prefill block and back to decode afterwards; only the executor identities change and the
+arithmetic lineage keeps the producer of every row. The prefill execution uses the decode serial arena under its
+own identity, so the split adds no device memory (host side: a second compiled plan; on the MTP route a second
+launcher catalog). MTP goldens (version 2) record the prefill and decode profile identities and are rejected
+under another pair; version-1 goldens are admitted only for one profile.
+
+Why: a fast prefill profile (FP16-dequant WMMA for MoE, HC and dense projections) will change prefill arithmetic
+but not decode. MTP exactness can be kept from the state the prefill produced (replay against a golden of the same
+pair), not from a single-profile run from the start, so both identities must travel with goldens and receipts.
+
+Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL), FP32-dense (F) and dense-A8 (A) profiles:
+
+| Check | Result |
+| --- | --- |
+| Flag absent, tiled prefill T=256 (1032-token prompt, 32 tokens) and MTP 2/4/8 (43-token prompt, 256 tokens), F and A | Tokens identical to `a1c871f`; receipts differ only by added fields |
+| MTP replay, split pairs F/A and A/F (decode/prefill) against goldens dumped with the same pair | Error 0 (hidden and logits, 42 rows) |
+| Prompt rows of a split-pair golden | Byte-identical to the golden of the pure prefill profile |
+| Golden of another pair (v2) or a v1 golden under a split pair, and the reverse | Rejected before target work |
+| Split MTP generation, decode F after prefill A | All 256 tokens equal to pure A (pure F diverges at 212) |
+| Split MTP generation, decode A after prefill F | Diverges from pure F and pure A at token 57 |
+| Split MTP generation with R2-only windows vs adaptive 2/4/8 windows, both pairs | 256 tokens identical (replay error 0 in both) |
+| Split tiled prefill, 1024-token prompt (4 blocks of 256, terminal head in the last block), 32 tokens | Decode F after prefill A equals pure A; decode A after prefill F equals pure F |
+| Split tiled prefill, 1032-token prompt (8 serial suffix rows run decode) | Decode A after prefill F equals pure F; decode F after prefill A differs from both at token 0 |
+| Deferred-normalization pair (decode FP32-dense, prefill dense A8), tiled 1024 | Runs; 32 tokens equal to both pure deferred profiles (which agree here) |
+| Peak RSS, split vs pure prefill profile | +3.8 MB tiled, +0.1 MB MTP; no added device allocation |
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |

@@ -13,6 +13,10 @@ struct HipMtpForwardGoldenRow {
 struct HipMtpForwardGolden {
     ModelContentIdentity independent_source_content,target_content,sidecar_content;
     std::uint64_t independent_reference_identity=0,structural_plan_identity=0,semantic_identity=0,numerical_profile_identity=0;
+    // Target arithmetic that produced the prompt rows (numerical_profile_identity above is the
+    // MTP head's own cast profile): the prefill and decode profile identities. Both zero in a
+    // version-1 file, which predates the split and records neither.
+    std::uint64_t target_prefill_profile_identity=0,target_decode_profile_identity=0;
     std::vector<HipMtpForwardGoldenRow> rows;
 };
 // Framed SHA256 of supplied metadata and ALL source/next hidden/logit bytes.

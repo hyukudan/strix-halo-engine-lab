@@ -3,6 +3,7 @@
 #include "strix/execution_memory.hpp"
 #include "strix/compiled_speculative_verify.hpp"
 #include "strix/serial_request.hpp"
+#include "strix/session_executor_handoff.hpp"
 
 #include <array>
 #include <cstdint>
@@ -71,6 +72,11 @@ public:
     // A failed output copy/validation does not publish new telemetry, even
     // though its session may already have consumed the configured native rows.
     [[nodiscard]] HipKnownPromptBackendStats stats() const noexcept;
+    // Split prefill numerical profile: the window owner runs the sibling `prefill` serial execution
+    // while the session belongs to `decode`. Each call hands the session to `prefill` before the
+    // native window and back to `decode` after it, so serial rows and generation keep `decode`.
+    // Set once, before any call. Executors and their resources are retained by the caller.
+    void set_executor_handoff(SessionExecutor decode, SessionExecutor prefill);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -82,6 +82,7 @@ add_library(strix_core STATIC
     src/moe_q4k_a8_runtime.cpp
     src/gdn_output_admission.cpp
     src/arithmetic_lineage.cpp
+    src/session_executor_handoff.cpp
     src/graph_eligibility.cpp
     src/graph_inputs.cpp
     src/graph_attention_state.cpp
@@ -967,6 +968,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-serial-session-tests PRIVATE strix_core)
     strix_target_warnings(strix-serial-session-tests)
     add_test(NAME strix-serial-session-tests COMMAND strix-serial-session-tests)
+
+    add_executable(strix-session-executor-handoff-tests tests/session_executor_handoff_tests.cpp)
+    target_link_libraries(strix-session-executor-handoff-tests PRIVATE strix_core)
+    strix_target_warnings(strix-session-executor-handoff-tests)
+    add_test(NAME strix-session-executor-handoff-tests COMMAND strix-session-executor-handoff-tests)
 
     add_executable(strix-serial-request-tests tests/serial_request_tests.cpp)
     target_link_libraries(strix-serial-request-tests PRIVATE strix_core)

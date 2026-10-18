@@ -199,6 +199,11 @@ tensor formats/extents before residency; live owner and dispatch preflight still
 runs. Prepared launcher plans are built from the selected numerical kernel IDs,
 not reused from a baseline plan.
 
+`--prefill-numerical-profile` selects the prompt prefill arithmetic separately
+(default: `--numerical-profile`); only the dense-A8 sibling pair is admitted, on
+the tiled known-prefix prefill or the MTP prompt. See
+[prefill numerical profile](prefill-numerical-profile.md).
+
 The admitted routed census is43 Q4_K/Q5_1 layers, four Q4_K/Q8_0 layers and one
 Q5_K/Q8_0 fallback layer. The Q51-only recipe preserves the four Q8_0 fallback
 layers; the Q51/Q80 recipe changes only those four additional eligible down

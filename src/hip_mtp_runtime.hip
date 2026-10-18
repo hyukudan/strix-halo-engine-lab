@@ -56,8 +56,12 @@ void require_chain(const HipMtpTargetHiddenTicket& a,const HipMtpTargetHiddenTic
             "MTP adjacent rows do not retain the same actual whole-window commit");
         return;
     }
+    // Consecutive rows keep one executor, except across the producer's admitted prompt handoff
+    // (split prefill profile), where the lineage below still proves the exact continuation.
+    const bool same_executor=previous.execution_identity==next.execution_identity &&
+        previous.runtime_compatibility_identity==next.runtime_compatibility_identity;
     require(a.source_position()+1U==a.chunk_end() && b.source_position()==b.chunk_begin() &&
-        previous.execution_identity==next.execution_identity && previous.runtime_compatibility_identity==next.runtime_compatibility_identity &&
+        (same_executor || a.admits_executor_change(b)) &&
         previous.state_layout_identity==next.state_layout_identity && previous.next_position==b.chunk_begin() &&
         b.chunk_end()>b.chunk_begin() && next.next_position==b.chunk_end() &&
         b.chunk_end()-b.chunk_begin()<=UINT64_MAX-previous.committed_tokens &&
@@ -73,7 +77,10 @@ void require_chain(const HipMtpTargetHiddenTicket& a,const HipMtpTargetHiddenTic
     } else {
         require(b.chunk_end()==b.chunk_begin()+1U && actual.producer==ArithmeticProducer::serial_row,
             "MTP target serial ticket is not one actual serial row");
-        history=prepare_serial_row_lineage(previous.arithmetic_lineage,b.source_position(),next.execution_identity,
+        const auto producer=b.producer_execution_identity();
+        require(producer==next.execution_identity || (!same_executor && a.admits_executor_change(b)),
+            "MTP target serial ticket producer differs from its session executor");
+        history=prepare_serial_row_lineage(previous.arithmetic_lineage,b.source_position(),producer,
             actual.reduction_plan_identity);
     }
     require(arithmetic_lineage_matches(history,next.arithmetic_lineage,next.next_position),

@@ -23,6 +23,12 @@ public:
     [[nodiscard]] std::uint32_t predicted_token() const;
     [[nodiscard]] const SerialSessionContext& committed_session() const;
     [[nodiscard]] ModelContentIdentity target_content_identity() const;
+    // Execution identity of the serial execution that produced this row (a window ticket
+    // reports its committed session's executor).
+    [[nodiscard]] std::uint64_t producer_execution_identity() const;
+    // True iff `next` is the row this producer re-minted at its admitted prompt handoff and this
+    // ticket is the preceding prompt row: the one place where consecutive rows change executor.
+    [[nodiscard]] bool admits_executor_change(const HipMtpTargetHiddenTicket& next) const noexcept;
 private:
     friend class HipMtpTargetHidden;
     struct Lease;
@@ -71,6 +77,15 @@ public:
     [[nodiscard]] HipMtpTargetHiddenTicket execute_serial(
         SerialSessionContext&,const ExecutionRuntimeResources&,
         DirectLaunchDispatcher&,std::uint32_t input_token);
+    // Split prefill numerical profile. Prompt rows run a sibling serial execution (same steps,
+    // arena, state and model bindings; different arithmetic) on the same scratch arena, selected
+    // by the session's executor identity. Set once, before any row. hand_off_prompt then moves
+    // the session to the decode execution and re-mints the pending prompt row with the handed-off
+    // session; the returned ticket replaces `pending`. Later rows run the decode execution only.
+    void set_prompt_execution(const CompiledSerialExecution& prompt);
+    [[nodiscard]] HipMtpTargetHiddenTicket hand_off_prompt(SerialSessionContext&,
+        const HipMtpTargetHiddenTicket& pending,const ExecutionRuntimeResources& prompt_resources,
+        const ExecutionRuntimeResources& decode_resources);
 private:
     HipMtpTargetHidden();
     friend class HipMtpTargetHiddenTicket;

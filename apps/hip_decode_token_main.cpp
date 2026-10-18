@@ -18,6 +18,7 @@
 #include "strix/hip_serving_prefix_cache.hpp"
 #include "strix/greedy_serving_scheduler.hpp"
 #include "strix/known_prompt_chunks.hpp"
+#include "strix/session_executor_handoff.hpp"
 #include "strix/known_prefix_prefill.hpp"
 #include "strix/generation_output.hpp"
 #include "strix/q51_known_rows.hpp"
@@ -1120,6 +1121,12 @@ int STRIX_DECODE_ENTRY(
         "  \"numerical_profile\": \"" + std::string(strix::numerical_profile_name(options.numerical_profile)) + "\",\n" +
         "  \"numerical_profile_qualification\": \"" +
         (options.numerical_profile == strix::DecodeNumericalProfile::exact_v5 ? std::string("unchanged-base-status") : std::string("not_assessed")) + "\",\n" +
+        "  \"prefill_numerical_profile\": \"" +
+        std::string(strix::numerical_profile_name(strix::decode_cli::numerical_profile_pair(options).prefill)) + "\",\n" +
+        "  \"prefill_numerical_profile_source\": \"" +
+        (options.prefill_numerical_profile ? "explicit" : "numerical-profile") + "\",\n" +
+        "  \"numerical_profile_pair_identity\": " +
+        std::to_string(strix::numerical_profile_pair_identity(strix::decode_cli::numerical_profile_pair(options))) + ",\n" +
         "  \"optimization_profile_reason\": \"" + optimization_profile.reason + "\",\n" +
         "  \"optimization_profile_automatic_applied\": " +
         (optimization_profile.automatic_applied ? "true" : "false") + ",\n" + ple_cpu_helper_receipt;
@@ -1502,6 +1509,38 @@ int STRIX_DECODE_ENTRY(
         }
         if (hc_splitk_selected_steps != 97)
             throw std::invalid_argument("HC numerical profile requires all 97 compiled splitk FP32 mixer steps");
+    }
+    // Split prefill numerical profile: the prompt prefill runs a sibling serial execution whose
+    // dense Q8_0 projections follow the prefill profile (kernel ids, binding/buffer identities and,
+    // through them, the known-prefix prefill ids and launcher configs); decode keeps `compiled`.
+    const auto profile_pair = strix::decode_cli::numerical_profile_pair(options);
+    std::optional<strix::CompiledSerialExecution> compiled_prefill;
+    auto prefill_catalog_config = catalog_config;
+    if (profile_pair.split()) {
+        const bool prefill_dense_a8 = strix::numerical_profile_dense_a8(profile_pair.prefill);
+        if (strix::numerical_profile_hc_splitk(profile_pair.prefill) != hc_splitk_f32 ||
+            strix::numerical_profile_hc_deferred_norm(profile_pair.prefill) != hc_deferred_norm ||
+            strix::numerical_profile_q5k_a8_gateup(profile_pair.prefill) != q5k_a8_gateup ||
+            strix::numerical_profile_q51_a8_down(profile_pair.prefill) != a8_down_q51 ||
+            strix::numerical_profile_q80_a8_down(profile_pair.prefill) != a8_down_q80 || prefill_dense_a8 == dense_a8 ||
+            integer_config)
+            throw std::invalid_argument("prefill numerical profile may differ from the decode profile only in dense A8");
+        auto prefill_binding_request = binding_request;
+        auto prefill_buffer_request = buffer_request;
+        prefill_binding_request.dense_a8 = prefill_buffer_request.dense_a8 = prefill_dense_a8;
+        prefill_catalog_config.numerical_profile = profile_pair.prefill;
+        prefill_catalog_config.dense_a8 = prefill_dense_a8;
+        strix::kernels::KernelRegistry prefill_kernel_registry;
+        strix::register_complete_hip_kernel_catalog(model, prefill_binding_request, prefill_catalog_config,
+            prefill_kernel_registry, nullptr);
+        compiled_prefill = strix::compile_serial_execution(model, prefill_kernel_registry,
+            prefill_binding_request, prefill_buffer_request, 256);
+        strix::validate_sibling_serial_executions(*compiled_prefill, compiled);
+        optimization_profile_receipt +=
+            "  \"prefill_dense_a8_configured\": " + std::string(prefill_dense_a8 ? "true" : "false") + ",\n" +
+            "  \"prefill_serial_execution_identity\": " + std::to_string(compiled_prefill->execution_identity) + ",\n" +
+            "  \"prefill_serial_kernel_plan_identity\": " + std::to_string(compiled_prefill->kernel_plan_identity) + ",\n" +
+            "  \"prefill_serial_scratch\": \"shared-sibling-view-of-decode-serial-arena\",\n";
     }
     std::optional<strix::PreparedOfflineTuning> offline_tuning_owner;
     std::optional<strix::kernels::OfflineTuningPlan> offline_tuning_plan;
@@ -2074,6 +2113,17 @@ int STRIX_DECODE_ENTRY(
         resources.model_manifest = &wave_router_admission->manifest();
         experiment_owner->resources.model_manifest = &wave_router_admission->manifest();
     }
+    // Split prefill: the sibling prefill execution runs on the decode serial arena (identical
+    // layout, never concurrent) under its own execution identity, with the same model, state
+    // and PLE bindings. No additional device memory.
+    std::optional<strix::ExecutionMemoryBinding> prefill_scratch;
+    strix::ExecutionRuntimeResources prefill_resources;
+    if (compiled_prefill) {
+        if (graph_mode) throw std::logic_error("split prefill profile reached graph execution");
+        prefill_scratch = strix::sibling_scratch_binding(*compiled_prefill, compiled, memory.scratch());
+        prefill_resources = resources;
+        prefill_resources.scratch = &*prefill_scratch;
+    }
     std::shared_ptr<strix::integer_projection::HipIntegerRuntimeAllocationOwner> arena_pin, weight_pin;
     std::shared_ptr<strix::integer_projection::HipIntegerProjectionRuntimeBundle> integer_bundle;
     if (integer_config) {
@@ -2155,6 +2205,19 @@ int STRIX_DECODE_ENTRY(
         device_queue_trace->require_healthy_before_commit();
     };
     strix::DirectLaunchDispatcher direct_dispatcher(launch_plan, active_observer);
+    // MTP prompt rows under a split prefill profile: launchers of the sibling prefill execution.
+    std::shared_ptr<strix::HipLauncherCatalog> prefill_launcher_catalog;
+    strix::ExecutionLauncherRegistry prefill_launchers;
+    std::optional<strix::CompiledLaunchPlan> prefill_launch_plan;
+    std::optional<strix::DirectLaunchDispatcher> prefill_dispatcher;
+    if (compiled_prefill && options.mtp.enabled) {
+        prefill_launcher_catalog = std::make_shared<strix::HipLauncherCatalog>(model, prefill_catalog_config);
+        prefill_launcher_catalog->register_for_compiled_execution(*compiled_prefill, prefill_launchers, &prefill_resources);
+        if (prefill_launcher_catalog->audit(*compiled_prefill, prefill_launchers).missing_steps)
+            throw std::logic_error("HIP launcher catalog is incomplete for the prefill serial execution");
+        prefill_launch_plan.emplace(strix::compile_launch_plan(*compiled_prefill, prefill_launchers));
+        prefill_dispatcher.emplace(*prefill_launch_plan, active_observer);
+    }
     std::unique_ptr<strix::HipMoeOverlapDispatcher> moe_overlap;
     if (overlap_arena) {
         if (!deferred_moe) throw std::logic_error("MoE overlap is missing its main stream owner");
@@ -2223,6 +2286,13 @@ int STRIX_DECODE_ENTRY(
             : std::static_pointer_cast<strix::PleLookupBackend>(mtp_mapped_ple_owner);
         auto parents = std::make_shared<strix::decode_cli::MtpDecodeTargetParents>(
             experiment_owner, launcher_catalog, std::move(owned_ple), ple_hash_contract);
+        if (compiled_prefill) {
+            if (!prefill_dispatcher || !prefill_scratch) throw std::logic_error("MTP split prefill lacks its prompt launchers");
+            parents->prompt.compiled = &*compiled_prefill;
+            parents->prompt.dispatcher = &*prefill_dispatcher;
+            parents->prompt.resources = parents->resources;
+            parents->prompt.resources.scratch = &*prefill_scratch;
+        }
         strix::decode_cli::MtpDecodeWindowFactory make_window;
         if (options.mtp.window_rows) {
             // Prepare the real closed native owner BEFORE any prompt mutation.
@@ -2938,7 +3008,10 @@ int STRIX_DECODE_ENTRY(
         } lookup_stats;
         if (options.known_prefix_window || options.prompt_lookup) {
             if (options.known_prefix_prefill_rows) {
-                known_prefill_plan = std::make_shared<strix::CompiledKnownPrefixPrefill>(strix::compile_known_prefix_prefill(model, compiled, manifest, tensor_access,
+                // The tiled prefill derives from the prefill serial execution (its dense projection
+                // kernel ids select the prefill verify ids and launchers).
+                known_prefill_plan = std::make_shared<strix::CompiledKnownPrefixPrefill>(strix::compile_known_prefix_prefill(model,
+                    compiled_prefill ? *compiled_prefill : compiled, manifest, tensor_access,
                     {options.known_prefix_prefill_rows, true, true, true, options.known_prefix_expert_union,
                      options.known_prefix_output_policy, options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U,
                      options.known_window_router_rows || options.known_prefix_full_rows,
@@ -3021,8 +3094,10 @@ int STRIX_DECODE_ENTRY(
                 known_prefix_memory = std::make_shared<KnownPromptMemory>(*known_prefill_plan, arena_generation,
                     status_generation, retained, original_work_device, union_bytes,
                     union_bytes ? generations.next() : 0);
-                known_prefix_owner = std::make_shared<strix::HipKnownPrefixWindow>(*known_prefill_plan, compiled, model,
-                    catalog_config, resources, known_prefix_memory->scratch, known_prefix_memory->scope,
+                known_prefix_owner = std::make_shared<strix::HipKnownPrefixWindow>(*known_prefill_plan,
+                    compiled_prefill ? *compiled_prefill : compiled, model,
+                    compiled_prefill ? prefill_catalog_config : catalog_config,
+                    compiled_prefill ? prefill_resources : resources, known_prefix_memory->scratch, known_prefix_memory->scope,
                     std::static_pointer_cast<const void>(known_prefix_memory),
                     union_bytes ? strix::q51_known_rows::Workspace{known_prefix_memory->union_scratch,
                         std::static_pointer_cast<const void>(known_prefix_memory)} : strix::q51_known_rows::Workspace{});
@@ -3042,6 +3117,12 @@ int STRIX_DECODE_ENTRY(
             if (options.known_prefix_window)
                 known_prefix_backend = std::make_unique<strix::HipKnownPromptBackend>(known_prefix_owner, session,
                     known_prefix_memory->scratch, model.vocab_size, original_work_device);
+            // Each tiled block runs on the prefill execution and hands the session back to decode.
+            if (compiled_prefill) {
+                if (!known_prefill_plan || !known_prefix_backend || options.prompt_lookup)
+                    throw std::logic_error("split prefill profile reached a non-tiled known-prefix route");
+                known_prefix_backend->set_executor_handoff({&compiled, &resources}, {&*compiled_prefill, &prefill_resources});
+            }
             if (options.prompt_lookup)
                 lookup_runtime = std::make_unique<strix::HipPromptLookupRuntime>(compiled, model, catalog_config,
                     resources, *known_prefix_plan, known_prefix_owner, known_prefix_memory->scratch,

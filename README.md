@@ -108,6 +108,11 @@ The recommended profile adds dense A8: the dense Q8_0 projections (GDN, QSA, sha
 activations per group of 32. It is faster in prefill and decode at a small quality cost (D-032). To keep the dense
 projections in FP32, use `hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1`.
 
+`--prefill-numerical-profile NAME` runs the prompt prefill (tiled known-prefix prefill or the MTP prompt) under a
+different profile from decode; today only the dense-A8 sibling of `--numerical-profile` is admitted. Decode and MTP
+windows always use `--numerical-profile`, MTP goldens record both profiles, and MTP stays exact from the state the
+prefill produced. See [docs/prefill-numerical-profile.md](docs/prefill-numerical-profile.md) (D-033).
+
 **2. Kernel organization required by the windows** (A8 MoE, wave8 Q8 GDN, deferred MoE status, HC chain)
 
 ```
