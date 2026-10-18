@@ -7,6 +7,7 @@
 #include "strix/iq4_nl.hpp"
 #include "strix/ple_workspace.hpp"
 #include "strix/graph_ple.hpp"
+#include "hip_q8_rows_gemv.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -2012,6 +2013,32 @@ register_for_compiled_execution(
         "compiled execution has no PLE step");
 }
 
+// Prefill key / value projections of 64 strided rows through the wide q8_rows kernels, with the
+// arithmetic of project_wave8_q8_bf16_to_fp32_rows_kernel per row: coefficient scale * code, chain
+// acc += x * c over features 8L + l + 256k, shuffle-down lane tree then the leaf tree.
+__device__ __forceinline__ float ple_rows_tree_add(float lower, float upper) {
+    float result;
+    asm("v_add_f32 %0, %1, %2" : "=v"(result) : "v"(upper), "v"(lower));
+    return result;
+}
+template <unsigned Rows> struct PleRowsSite {
+    using Input = std::uint16_t;
+    static constexpr unsigned rows = Rows;
+    static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)
+    q8_rows::Segments segments;
+    std::uint32_t width, outputs, in_stride, out_stride;
+    const std::uint16_t* base;
+    float* out;
+    __device__ const std::uint16_t* row_input(unsigned r) const { return base + static_cast<std::uint64_t>(r) * in_stride; }
+    __device__ static float coefficient(unsigned scale, std::int8_t code) {
+        return __half2float(__ushort_as_half(static_cast<unsigned short>(scale))) * static_cast<float>(code);
+    }
+    __device__ static void fma(float& acc, float c, float x) { acc += x * c; }
+    __device__ static float add(float lower, float upper) { return ple_rows_tree_add(lower, upper); }
+    __device__ void store(std::uint32_t o, unsigned r, float value) const { out[static_cast<std::uint64_t>(r) * out_stride + o] = value; }
+};
+constexpr std::uint32_t kPleWideRows = 64U;
+
 struct HipPleKnownWindow::Impl {
     HipPleLauncherConfig config;
     std::uint32_t max_rows = 0, rows = 0, slot = 0;
@@ -2032,6 +2059,27 @@ struct HipPleKnownWindow::Impl {
     }
     // Key and value projections of all rows, each Q8 weight block read once (the per-row
     // wave8 arithmetic). False when a projection is not wave8 Q8: rows project one by one.
+    // project_rows for kPleWideRows rows at once (prefill); false when the shapes or alignment do not fit.
+    bool project_rows_wide(const PreparedPleLaunch& p, const std::uint16_t* gathered, std::uint32_t first) const {
+        const auto width = static_cast<std::uint32_t>(config.model.ple_embed_dim);
+        if (weight_kind(p.tensors.key.manifest->ggml_type) != WeightKind::q8_0 ||
+            weight_kind(p.tensors.value.manifest->ggml_type) != WeightKind::q8_0 || width % 32U ||
+            (reinterpret_cast<std::uintptr_t>(gathered) | stride) % 16U) return false;
+        const auto expanded = static_cast<std::uint32_t>(p.expanded), hidden = static_cast<std::uint32_t>(config.model.hidden_size);
+        const auto project = [&](const void* weights, std::uint32_t outputs, float* out) {
+            PleRowsSite<kPleWideRows> site{};
+            site.segments = q8_rows::segments({{weights, outputs}});
+            site.width = width; site.outputs = outputs;
+            site.in_stride = static_cast<std::uint32_t>(stride / sizeof(std::uint16_t)); site.out_stride = outputs;
+            site.base = gathered; site.out = out;
+            q8_rows::launch(site, false, hip_execution_stream());
+        };
+        project(reinterpret_cast<const void*>(p.tensors.key.runtime->address), expanded, projections + static_cast<std::uint64_t>(first) * expanded);
+        project(reinterpret_cast<const void*>(p.tensors.value.runtime->address), hidden,
+            projections + static_cast<std::uint64_t>(max_rows) * expanded + static_cast<std::uint64_t>(first) * hidden);
+        check_hip(hipGetLastError(), "prefill PLE wide rows projection launch");
+        return true;
+    }
     bool project_rows(const PreparedPleLaunch& p, const std::uint16_t* gathered, std::uint32_t count, std::uint32_t first = 0U) const {
         const auto width = static_cast<std::uint32_t>(config.model.ple_embed_dim);
         if (weight_kind(p.tensors.key.manifest->ggml_type) != WeightKind::q8_0 ||
@@ -2275,11 +2323,39 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
     const auto stream = hip_execution_stream();
     bool projected = true;
     if (w.prefill) {
-        // Eight-row projection groups over all rows (the window path's arithmetic per row).
-        for (std::uint32_t first = 0; first < rows.size() && projected; first += 8U) {
-            const auto count = std::min<std::uint32_t>(8U, static_cast<std::uint32_t>(rows.size()) - first);
-            projected = w.project_rows(prepared[first], reinterpret_cast<const std::uint16_t*>(static_cast<std::byte*>(device) +
-                first * w.stride), count, first);
+        // 64-row wide projections, then eight-row groups for the rest (the window path's arithmetic
+        // per row). STRIX_PREFILL_PLE_WIDE=0 keeps eight-row groups; STRIX_PREFILL_PLE_WIDE_CHECK=1
+        // also runs them over the wide rows and compares every projected value bitwise.
+        static const bool wide = [] { const char* v = std::getenv("STRIX_PREFILL_PLE_WIDE"); return !v || v[0] != '0'; }();
+        static const bool check = [] { const char* v = std::getenv("STRIX_PREFILL_PLE_WIDE_CHECK"); return v && v[0] == '1'; }();
+        const auto at = [&](std::uint32_t first) {
+            return reinterpret_cast<const std::uint16_t*>(static_cast<std::byte*>(device) + first * w.stride);
+        };
+        const auto total = static_cast<std::uint32_t>(rows.size());
+        std::uint32_t first = 0;
+        if (wide)
+            while (total - first >= kPleWideRows && w.project_rows_wide(prepared[first], at(first), first)) first += kPleWideRows;
+        if (check && first) {
+            const auto expanded = static_cast<std::uint64_t>(prepared[0].expanded), hidden = static_cast<std::uint64_t>(w.config.model.hidden_size);
+            const auto read = [&]() {
+                std::vector<float> keys(first * expanded), values(first * hidden);
+                check_hip(hipMemcpyAsync(keys.data(), w.projections, keys.size() * 4U, hipMemcpyDeviceToHost, stream), "PLE check keys");
+                check_hip(hipMemcpyAsync(values.data(), w.projections + w.max_rows * expanded, values.size() * 4U, hipMemcpyDeviceToHost, stream),
+                    "PLE check values");
+                check_hip(hipStreamSynchronize(stream), "PLE check synchronize");
+                return std::pair{keys, values};
+            };
+            const auto wide_values = read();
+            for (std::uint32_t r = 0; r < first; r += 8U) static_cast<void>(w.project_rows(prepared[r], at(r), 8U, r));
+            const auto rows_values = read();
+            std::size_t differ = 0;
+            for (std::size_t i = 0; i < wide_values.first.size(); ++i) differ += std::memcmp(&wide_values.first[i], &rows_values.first[i], 4U) != 0;
+            for (std::size_t i = 0; i < wide_values.second.size(); ++i) differ += std::memcmp(&wide_values.second[i], &rows_values.second[i], 4U) != 0;
+            std::fprintf(stderr, "PLE wide check: rows %u values %zu differ %zu\n", first, wide_values.first.size() + wide_values.second.size(), differ);
+        }
+        for (; first < total && projected; first += 8U) {
+            const auto count = std::min<std::uint32_t>(8U, total - first);
+            projected = w.project_rows(prepared[first], at(first), count, first);
         }
     } else projected = w.project_rows(prepared[0], static_cast<const std::uint16_t*>(device), static_cast<std::uint32_t>(rows.size()));
     const auto expanded = prepared[0].expanded, hidden = w.config.model.hidden_size;
