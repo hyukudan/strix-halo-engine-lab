@@ -823,7 +823,7 @@ struct QsaFixture {
     ExecutionLauncher selected;
 
     const bool bf16_indexer;
-    QsaFixture(bool prefetch, bool wave8, bool bf16_index, std::uint64_t context_tokens) : bf16_indexer(bf16_index) {
+    QsaFixture(bool prefetch, bool wave8, bool bf16_index, std::uint64_t context_tokens, bool dense = false) : bf16_indexer(bf16_index) {
         const auto found = std::find_if(execution.steps.begin(), execution.steps.end(),
             [](const auto& value) { return value.op == SerialOp::indexed_attention; });
         require(found != execution.steps.end(), "canonical QSA operator missing");
@@ -893,6 +893,7 @@ struct QsaFixture {
         config.model = model;
         config.prefetch_q8_input = prefetch;
         config.wave8_q8_output = wave8;
+        config.dense_a8_projections = dense;
         if (prefetch) {
             config.prefetch_eligible_layers = {*step.layer};
             config.prefetch_stats = std::make_shared<qsa_input_prefetch::RuntimeDispatchStats>();
@@ -900,6 +901,7 @@ struct QsaFixture {
         ExecutionBindingRequest binding;
         binding.prefetch_q8_qsa_input = prefetch; binding.qsa_input_prefetch_layers = config.prefetch_eligible_layers;
         binding.wave8_q8_qsa_output = wave8;
+        binding.dense_a8 = dense;
         kernels::KernelRegistry registry;
         register_hip_indexed_attention_kernel_variant(model, binding, config, registry);
         require(registry.variants().size() == 1U, "QSA serial selection is ambiguous");
@@ -1087,6 +1089,92 @@ void qsa_rows_family(bool prefetch, bool wave8, bool bf16_indexer) {
                       << "ms 1-row=" << one_ms << "ms speedup=" << serial_ms / rows_ms << "x rows/1-row=" << rows_ms / one_ms << "\n";
         }
     check(hipEventDestroy(begin), "bench event"); check(hipEventDestroy(end), "bench event");
+}
+
+// Cohort: the rows of two or three sessions (own KV and raw-index state, own positions) in one
+// cohort launch against each session's own rows launch from the same state and inputs.
+void qsa_cohort_family(bool dense, bool bf16_indexer) {
+    QsaFixture f(!dense, true, bf16_indexer, 2304U, dense);
+    struct Session { Span state; std::vector<unsigned char> host, initial; SessionStateMemoryBinding memory; ExecutionRuntimeResources resources; };
+    std::array<Session, 3> sessions;
+    for (std::size_t k = 0; k < sessions.size(); ++k) {
+        auto& session = sessions[k];
+        session.state = f.owner.allocate(f.state_layout.device_total_bytes);
+        session.host.resize(static_cast<std::size_t>(f.state_layout.host_total_bytes));
+        session.memory = {f.state_layout.layout_identity, session.state.address, session.state.bytes, 61U + k,
+            reinterpret_cast<std::uintptr_t>(session.host.data()), f.state_layout.host_total_bytes, 67U + k};
+        session.resources = f.resources; session.resources.session_state_memory = &session.memory;
+        // Each session's own finite BF16 history in every QSA cell of the tested layer.
+        session.initial.assign(static_cast<std::size_t>(session.state.bytes), 0U);
+        for (const auto component : {SessionStateComponent::attention_kv, SessionStateComponent::sparse_index}) {
+            const auto view = resolve_indexed_attention_layer_state(f.state_layout, session.memory, f.model, *f.step.layer, component);
+            std::vector<std::uint16_t> values(static_cast<std::size_t>(view.bytes / 2U));
+            for (std::size_t i = 0; i < values.size(); ++i) {
+                const auto mixed = (i * 2654435761ULL + 37U * (k + 1U) + (component == SessionStateComponent::attention_kv ? 17U : 91U)) >> 7U;
+                values[i] = bf16(static_cast<float>(static_cast<int>(mixed % 2001U) - 1000) * 0.001F);
+            }
+            std::memcpy(session.initial.data() + (view.address - session.state.address), values.data(), values.size() * 2U);
+        }
+    }
+    const auto run = [&](const std::vector<std::uint32_t>& sizes, const std::vector<std::uint64_t>& positions, bool cohort) {
+        write(f.scratch, f.seed);
+        for (std::size_t k = 0; k < sizes.size(); ++k) write(sessions[k].state, sessions[k].initial);
+        auto rows = f.rows;
+        std::uint32_t first = 0;
+        std::vector<HipQsaCohortSegment> segments;
+        for (std::size_t k = 0; k < sizes.size(); ++k) {
+            for (std::uint32_t r = 0; r < sizes[k]; ++r) {
+                rows[first + r].resources = &sessions[k].resources;
+                rows[first + r].session_state_memory = &sessions[k].memory;
+                rows[first + r].position = positions[k] + r;
+            }
+            segments.push_back({std::span<const ExecutionDispatchContext>(rows.data() + first, sizes[k]), &f.config});
+            first += sizes[k];
+        }
+        {
+            const HipLaunchScope active(f.scope());
+            if (cohort) { indexed_attention_known_window_cohort_preflight(segments); indexed_attention_known_window_cohort_launch(segments); }
+            else for (const auto& segment : segments) indexed_attention_known_window_rows_launch(segment.rows, f.config);
+        }
+        f.owner.finish();
+        std::vector<std::vector<unsigned char>> out{read(f.scratch)};
+        for (std::size_t k = 0; k < sizes.size(); ++k) out.push_back(read(sessions[k].state));
+        return out;
+    };
+    unsigned compared = 0;
+    const std::vector<std::vector<std::uint32_t>> shapes{{2U, 2U}, {4U, 4U}, {2U, 2U, 4U}, {4U, 2U, 2U}};
+    const std::vector<std::vector<std::uint64_t>> placements{{0U, 6U, 2045U}, {2047U, 1U, 2201U}, {2201U, 2042U, 3U}};
+    for (const auto& sizes : shapes)
+        for (const auto& positions : placements) {
+            const auto reference = run(sizes, positions, false);
+            const auto candidate = run(sizes, positions, true);
+            require(candidate[0] == reference[0], "QSA cohort output/workspace bytes differ from each session's own window");
+            for (std::size_t k = 1; k < candidate.size(); ++k)
+                require(candidate[k] == reference[k], "QSA cohort KV/raw-index state differs from the session's own window");
+            ++compared;
+        }
+    // Every segment keeps the single-session admission; totals other than 4 or 8 are rejected.
+    const auto rejected = [&](const std::vector<std::uint32_t>& sizes, bool same_state, const char* message) {
+        auto rows = f.rows;
+        std::vector<HipQsaCohortSegment> segments;
+        std::uint32_t first = 0;
+        for (std::size_t k = 0; k < sizes.size(); ++k) {
+            const auto& session = sessions[same_state ? 0U : k];
+            for (std::uint32_t r = 0; r < sizes[k]; ++r) {
+                rows[first + r].resources = &session.resources; rows[first + r].session_state_memory = &session.memory;
+                rows[first + r].position = 100U * (k + 1U) + r;
+            }
+            segments.push_back({std::span<const ExecutionDispatchContext>(rows.data() + first, sizes[k]), &f.config});
+            first += sizes[k];
+        }
+        bool thrown = false;
+        try { indexed_attention_known_window_cohort_preflight(segments); } catch (const std::invalid_argument&) { thrown = true; }
+        require(thrown, message);
+    };
+    rejected({2U, 4U}, false, "QSA cohort admits only four or eight rows in total");
+    rejected({2U, 2U}, true, "QSA cohort rejects two segments of one session state");
+    std::cout << "QSA cohort dense=" << dense << " bf16_indexer=" << bf16_indexer << ": " << compared
+              << " cohort windows bit-exact against per-session windows\n";
 }
 
 // Whole QSA layer (synthetic weights, model shapes) at long context: the
@@ -1834,6 +1922,7 @@ int main(int argc, char** argv) try {
     qsa_rows_family(true, true, false);
     qsa_rows_family(false, false, true);
     qsa_rows_family(false, false, false);
+    for (bool dense : {false, true}) for (bool bf16_indexer : {true, false}) qsa_cohort_family(dense, bf16_indexer);
     for(auto rows:{2U,4U,8U}) family_lm_head_rows(rows);
     std::cout << "known-window shared/GDN/QSA/LM-head component fixtures passed\n";
     return 0;

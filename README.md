@@ -211,6 +211,16 @@ reservation is declared. The complete, copy-ready command with every flag explai
 To use the exact profile instead, pass
 `--numerical-profile hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1`.
 
+Several requests (up to four) can decode together in one process: `--mtp-cohort-request TOKENS_FILE,GOLDEN,SHA256`
+(repeatable) adds requests next to the positional prompt, each with its own state, MTP runtime and golden. Their
+drafts are verified in cohort windows that read the projection, expert, HC and head weights once for the rows of all
+requests, while every request produces exactly the tokens it produces alone. See [docs/multi-request-cohort.md](docs/multi-request-cohort.md)
+(D-035).
+
+Teacher-forced scoring (`--teacher-forced-score`, `--teacher-logits-file`) also runs over the tiled prefill with the
+all-rows output policy, producing byte-identical logits files to the serial route within a profile, several times
+faster. See [docs/teacher-forced-tiled-prefill.md](docs/teacher-forced-tiled-prefill.md) (D-034).
+
 ## How it works
 
 **One decode cycle.** The predictor drafts until it is no longer confident; a cost model picks the window size;

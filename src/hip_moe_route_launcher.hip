@@ -1,6 +1,7 @@
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
+#include "strix/known_window_cohort.hpp"
 #include "strix/wave_router_contract.hpp"
 
 #include "strix/dispatch_resources.hpp"
@@ -1796,9 +1797,11 @@ PreparedRouterRows prepare_router_rows(std::span<const ExecutionDispatchContext>
     auto* user = const_cast<HipMoeRouteLauncherConfig*>(&config);
     for (std::size_t r = 0; r < rows.size(); ++r) {
         const auto& row = rows[r];
+        // A cohort window starts a new session segment (its own window identity) at row r.
+        const auto& head = rows[known_window_segment_start(rows, r) ? r : r - 1U];
         if (row.logical_rows != 1U || row.request_concurrency != 1U ||
-            row.execution_identity != first.execution_identity || row.step_id != first.step_id ||
-            row.layer != first.layer || row.kernel_id != first.kernel_id || row.position != first.position + r)
+            row.execution_identity != head.execution_identity || row.step_id != first.step_id ||
+            row.layer != first.layer || row.kernel_id != first.kernel_id || !known_window_row_position_follows(rows, r))
             throw std::invalid_argument("known-window router rows identity/position differs");
         const auto prepared = prepare_router_launch(row, user);
         const auto workspace = prepare_parallel_router_workspace(row, config);

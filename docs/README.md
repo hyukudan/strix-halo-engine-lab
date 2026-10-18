@@ -67,6 +67,7 @@ A wider kernel, larger speculative window, second node or second physical link i
 - [MTP command line](mtp-native-cli.md) and [MTP runtime contract](mtp-native-runtime.md).
 - [Known-prefix window](known-prefix-window.md).
 - [Automatic decode optimization profile](decode-optimization-profile.md).
+- [Several requests in one decode loop (cohort windows)](multi-request-cohort.md).
 
 The decisions behind this path (D-021 to D-031, and the measured rejections) are in
 [`DECISIONS.md`](../DECISIONS.md).

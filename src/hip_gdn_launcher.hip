@@ -4899,11 +4899,16 @@ void validate_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowR
         for (const auto width : {static_cast<std::uint64_t>(config.model.hidden_size), static_cast<std::uint64_t>(gdn_window_shape(config.model).value_width)})
             if (!q8_rows::dense_a8_width(width)) throw std::invalid_argument("GDN window dense A8 width is not admitted");
 }
+// parts: 1 input projections and gates, 2 prepare and recurrence (the only parts that read or write
+// the layer's recurrent/conv state, retained rows and control), 4 gated norm and output projection.
+// Parts 1 and 4 are per-row arithmetic over weights only, so a cohort runs them once for the rows of
+// several sessions and part 2 per session.
 template <unsigned Rows>
 void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRow> input,
-    const GdnWindowControl* control, const HipGdnLauncherConfig& config, hipStream_t stream) {
+    const GdnWindowControl* control, const HipGdnLauncherConfig& config, hipStream_t stream, unsigned parts = 7U) {
     const auto shape = gdn_window_shape(config.model);
     const auto rows = gdn_window_rows<Rows>(input, shape);
+    if (parts & 1U) {
     GdnWidePointers<Rows> x{};
     for (unsigned r = 0; r < Rows; ++r) x.input[r] = input[r].input;
     // qkv, z and Q8 beta/alpha share one q8_rows launch.
@@ -4933,6 +4938,8 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
             static_cast<const float*>(layer.alpha), rows, shape.hidden, shape.value_heads);
         check_hip(hipGetLastError(), "GDN window F32 gate projection launch");
     }
+    }
+    if (parts & 2U) {
     const auto saved = gdn_window_saved(config.model, layer.retained);
     hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_prepare_kernel<Rows>),
         dim3(shape.key_heads * 2U + shape.value_heads + 1U), dim3(kRecurrentThreads), 0, stream, rows,
@@ -4948,6 +4955,8 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
         hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::key_value>), tiles,
             dim3(32), 0, stream, rows, layer.matrix, saved, control, shape.key_heads, shape.head_dim);
     check_hip(hipGetLastError(), "GDN window recurrence launch");
+    }
+    if (!(parts & 4U)) return;
     // Dense A8: the gated norm (one wave per 32 features) also quantizes the out projection's
     // rows into a scratch slot, so the projection needs no quantizer launch.
     const bool dense = config.dense_a8_projections;
@@ -5073,6 +5082,89 @@ void gdn_window_rows_launch(std::span<const ExecutionDispatchContext> rows, cons
 void gdn_window_commit_launch(const ExecutionDispatchContext& row, const HipGdnWindowConfig& config) {
     const auto bound = bind_gdn_window({&row, 1U}, config, false);
     gdn_window_commit_enqueue(bound.layer, config.control, config.gdn, hip_execution_stream());
+}
+
+namespace {
+template <class Body> void gdn_window_rows_dispatch(std::size_t rows, Body&& body) {
+    switch (rows) {
+    case 1: body(std::integral_constant<unsigned, 1U>{}); break;
+    case 2: body(std::integral_constant<unsigned, 2U>{}); break;
+    case 3: body(std::integral_constant<unsigned, 3U>{}); break;
+    case 4: body(std::integral_constant<unsigned, 4U>{}); break;
+    case 5: body(std::integral_constant<unsigned, 5U>{}); break;
+    case 6: body(std::integral_constant<unsigned, 6U>{}); break;
+    case 7: body(std::integral_constant<unsigned, 7U>{}); break;
+    case 8: body(std::integral_constant<unsigned, 8U>{}); break;
+    default: throw std::invalid_argument("GDN window requires 1..8 rows");
+    }
+}
+struct GdnCohortBinding {
+    std::array<GdnWindowBinding, gdn_window_max_rows> segments;
+    std::size_t count = 0;
+};
+GdnCohortBinding bind_gdn_window_cohort(std::span<const HipGdnWindowCohortSegment> segments) {
+    if (segments.empty() || segments.size() > gdn_window_max_rows)
+        throw std::invalid_argument("GDN cohort window requires 1..8 session segments");
+    GdnCohortBinding out;
+    for (std::size_t s = 0; s < segments.size(); ++s) {
+        const auto& segment = segments[s];
+        if (!segment.config || segment.rows.empty() || *segment.rows[0].layer != *segments[0].rows[0].layer ||
+            segment.config->gdn.dense_a8_projections != segments[0].config->gdn.dense_a8_projections ||
+            segment.config->gdn.recurrent_storage != segments[0].config->gdn.recurrent_storage)
+            throw std::invalid_argument("GDN cohort window segments differ in layer or arithmetic");
+        // Every session segment passes the complete single-session window binding.
+        out.segments[s] = bind_gdn_window(segment.rows, *segment.config, true);
+    }
+    out.count = segments.size();
+    return out;
+}
+} // namespace
+
+void gdn_window_cohort_enqueue(std::span<const GdnWindowCohortSegment> segments, const HipGdnLauncherConfig& config, void* stream) {
+    if (segments.empty() || segments.size() > gdn_window_max_rows)
+        throw std::invalid_argument("GDN cohort window requires 1..8 session segments");
+    std::array<GdnWindowRow, gdn_window_max_rows> rows{};
+    std::size_t count = 0;
+    const auto& a = segments[0].layer;
+    for (std::size_t s = 0; s < segments.size(); ++s) {
+        const auto& segment = segments[s];
+        validate_gdn_window(segment.layer, segment.rows, true, segment.control, config, stream);
+        const auto& b = segment.layer;
+        if (count + segment.rows.size() > gdn_window_max_rows)
+            throw std::invalid_argument("GDN cohort window segments exceed eight rows");
+        if (a.qkv != b.qkv || a.z != b.z || a.beta != b.beta || a.alpha != b.alpha || a.out != b.out || a.conv != b.conv ||
+            a.dt != b.dt || a.a != b.a || a.norm != b.norm || a.gate_type != b.gate_type || a.conv_type != b.conv_type ||
+            a.dt_type != b.dt_type || a.a_type != b.a_type || a.norm_type != b.norm_type)
+            throw std::invalid_argument("GDN cohort window segments bind different weights");
+        for (std::size_t o = 0; o < s; ++o)
+            if (segments[o].layer.matrix == b.matrix || segments[o].layer.conv_state == b.conv_state ||
+                segments[o].layer.retained == b.retained || segments[o].control == segment.control)
+                throw std::invalid_argument("GDN cohort window segments share session state");
+        for (const auto& row : segment.rows) rows[count++] = row;
+    }
+    const auto native = static_cast<hipStream_t>(stream);
+    const std::span<const GdnWindowRow> all(rows.data(), count);
+    gdn_window_rows_dispatch(count, [&](auto width) {
+        enqueue_gdn_window<decltype(width)::value>(a, all, segments[0].control, config, native, 1U);
+    });
+    for (const auto& segment : segments)
+        gdn_window_rows_dispatch(segment.rows.size(), [&](auto width) {
+            enqueue_gdn_window<decltype(width)::value>(segment.layer, segment.rows, segment.control, config, native, 2U);
+        });
+    gdn_window_rows_dispatch(count, [&](auto width) {
+        enqueue_gdn_window<decltype(width)::value>(a, all, segments[0].control, config, native, 4U);
+    });
+}
+
+void gdn_window_cohort_rows_preflight(std::span<const HipGdnWindowCohortSegment> segments) {
+    static_cast<void>(bind_gdn_window_cohort(segments));
+}
+void gdn_window_cohort_rows_launch(std::span<const HipGdnWindowCohortSegment> segments) {
+    const auto bound = bind_gdn_window_cohort(segments);
+    std::array<GdnWindowCohortSegment, gdn_window_max_rows> layers{};
+    for (std::size_t s = 0; s < bound.count; ++s)
+        layers[s] = {bound.segments[s].layer, {bound.segments[s].rows.data(), bound.segments[s].count}, segments[s].config->control};
+    gdn_window_cohort_enqueue({layers.data(), bound.count}, segments[0].config->gdn, hip_execution_stream());
 }
 
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC

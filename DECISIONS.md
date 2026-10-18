@@ -468,6 +468,32 @@ Why: the exact router runs FP32 FMA chains (about 3 TFLOPS); its 7 ms per 8192-r
 | Fixture, 8192 rows, 2560 × 512, against FP64 | max logit error 2.0e-4 on logits up to 14 (exact kernel: 3.2e-5); 7 of 8192 rows change their ordered top-10 (near-ties); a third weight term (exact weights) gives the same error and is 15 % slower |
 | Fixture time per 8192 rows (busy node) | exact 6.9–7.2 ms, router component 3.1–3.7 ms |
 | Teacher-forced quality, `dense,moe,qsa` vs `dense,moe,qsa,router` | top-1 95.45 % → 95.51 % (paired delta +0.06 ± 0.07 pt), KL 0.01967 → 0.01926 (−2.1 % ± 2.0 %); qsa and router together against dense,moe: +0.05 ± 0.06 pt, KL −2.3 % ± 1.9 % |
+## D-035: several requests verified in cohort windows
+
+Up to four independent requests decode in one process (`--mtp-cohort-request`, CLI benchmark mode). Each has
+its own state, serial scratch, PLE backend, MTP runtime, draft state, golden replay and 2/4/8 window owners;
+the model, the MTP sidecar assets and one window stream are shared. Each cycle every request drafts up to
+8 / requests rows, gets the owner its drafts call for, and the requests are packed into windows of 4 or 8
+rows. A cohort window admits every request's own window unchanged and advances their steps in lockstep: the
+routed expert union, HC mixers, router, LM head, shared-expert projections and the GDN/QSA projections run
+once for the rows of all requests on an idle owner of the total rows, while GDN recurrence, QSA KV
+append/selection/attention, PLE, embedding, combine and injections run per request from its own state. Each
+request then accepts, commits and publishes as after its own window (see
+[docs/multi-request-cohort.md](docs/multi-request-cohort.md)).
+
+Why: decode is bandwidth bound, and one window reads its weights once for all rows; rows of other requests
+fill a window without the acceptance risk of longer draft chains. The shared steps already compute every
+row with per-row pointers and row-count-independent arithmetic, so each request keeps exactly its own
+tokens. Alternative: independent sessions on separate streams (the serving scheduler) shares no weight
+reads. Status: opt-in, exact; the throughput gain is pending the measurement campaign.
+
+| Check | Result |
+| --- | --- |
+| GDN fixture: cohorts of 2-4 sessions (1-8 rows each), pending rows and commits, four storage/format variants | 120 cohort scenarios bit-exact against per-session windows (348 total) |
+| QSA fixture: cohorts of 2-3 sessions at mixed positions, FP32 and dense A8, BF16 and Q8 indexer | 48 cohort windows bit-exact (outputs, workspaces, KV and raw index) |
+| Full model, dense A8, code + Spanish prompts, 256 tokens each: lockstep, without shared expert, without shared steps, sequential | Tokens identical to each prompt's own run, replay error 0 |
+| Full model, dense A8, four requests (code, Spanish, 1192-token agent, JS reasoning), lockstep with the default and a 4-row cap, sequential; agent + code pair | Tokens identical to each prompt's own run, replay error 0 |
+| Single-request route after the change | Tokens identical to the base build |
 
 ## Measured and rejected
 
