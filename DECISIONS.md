@@ -542,3 +542,4 @@ Status: opt-in until the timing campaign. Both rules are data only, and the lang
 | X-011 | HC low part in LDS; q8_rows prefetch depth 4; GDN 4 or 16 columns per wave | slower or neutral | Not adopted. |
 | X-012 | `--model-copy-tier experts`, `--staged-moe-router-logits` on the serial path | slower | Not used in the measured configuration. |
 | X-013 | `--mtp-spec-min-p` 0.7, 0.75, 0.8, 0.88, 0.9 | lower tok/s | 0.85 is the measured optimum (D-022). |
+| X-015 | Q8 instead of the Q4_0 copy of the MTP draft head subset (always, from depth 1, 2 or 3, only with a zh/ja pack, only without a pack) | simulated -1.6 % to -0.1 % | The Q8 head costs about 2x per draft step (+0.22/+0.29/+0.39 ms at 37k/49k/65k rows, `strix-hip-mtp-draft-head-tests --bench-precision`) and, even at no cost, gains nothing beyond trajectory noise on 10 prompts (full-chain logs). Keep `--mtp-draft-q4`; Q5/Q6 are bounded by Q8. |

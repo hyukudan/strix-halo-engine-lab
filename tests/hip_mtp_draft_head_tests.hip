@@ -241,10 +241,45 @@ void bench(std::uint32_t base_rows,std::uint32_t context_rows) {
     std::printf("  wall chain subset head, one sync             %.4f\n",chain_subset);
     check(hipEventDestroy(a));check(hipEventDestroy(b));
 }
+__global__ void flush_read(const uint4* p,std::size_t count,unsigned* sink) {
+    uint4 a{};for(auto i=blockIdx.x*static_cast<std::size_t>(blockDim.x)+threadIdx.x;i<count;i+=static_cast<std::size_t>(gridDim.x)*blockDim.x){const auto v=p[i];a.x^=v.x;a.y^=v.y;a.z^=v.z;a.w^=v.w;}
+    if((a.x^a.y^a.z^a.w)==0x9e3779b9U)*sink=1U;
+}
+// --bench-precision: GPU time of one draft step's head + argmax, Q8 subset against the Q4 subset, at the row counts
+// the deployed vocabularies use, warm (repeated launches) and cold (a 256 MiB read evicts L2/MALL before each launch,
+// as the MTP block does between draft steps in decode).
+void bench_precision() {
+    constexpr std::uint32_t h=2560,v=248320,depth=3;constexpr int runs=40;
+    Fixture f(h,v,1234);
+    Device<std::uint16_t> hidden(h);const auto x=hidden_values(h,3);check(hipMemcpy(hidden.p,x.data(),h*2U,hipMemcpyHostToDevice));
+    Device<uint4> flush((256U<<20U)/16U);check(hipMemset(flush.p,1,256U<<20U));Device<unsigned> sink(1);
+    hipEvent_t a,b;check(hipEventCreate(&a));check(hipEventCreate(&b));
+    auto gpu=[&](bool cold,auto&& body){std::vector<double> t;for(int r=0;r<runs+3;++r){
+        if(cold) hipLaunchKernelGGL(flush_read,dim3(2048),dim3(256),0,f.stream.s,flush.p,flush.n,sink.p);
+        check(hipEventRecord(a,f.stream.s));body();check(hipEventRecord(b,f.stream.s));
+        check(hipEventSynchronize(b));float ms=0;check(hipEventElapsedTime(&ms,a,b));if(r>=3)t.push_back(ms);}return median(t);};
+    std::printf("bench-precision h=%u: rows | warm Q4 Q8 | cold Q4 Q8 (ms per draft step, head + argmax)\n",h);
+    for(const std::uint32_t base_rows:{32768U,45056U,61440U}) {
+        std::vector<std::uint32_t> base(base_rows),context(4096);
+        for(std::uint32_t i=0;i<base_rows;++i)base[i]=i;
+        std::mt19937 g(7);for(auto& c:context)c=base_rows+g()%(v-base_rows);
+        HipMtpDraftHead q8(f.head.p,{h,v,depth,false,base,4096},f.stream.s);q8.observe(context);
+        HipMtpDraftHeadConfig q4c{h,v,depth,false,base,4096,true};HipMtpDraftHead q4(f.head.p,q4c,f.stream.s);q4.observe(context);
+        check(hipStreamSynchronize(f.stream.s));
+        const auto rows=q8.stats().rows;
+        const double w4=gpu(false,[&]{q4.launch(hidden.p,0,f.stream.s);}),w8=gpu(false,[&]{q8.launch(hidden.p,0,f.stream.s);});
+        const double c4=gpu(true,[&]{q4.launch(hidden.p,0,f.stream.s);}),c8=gpu(true,[&]{q8.launch(hidden.p,0,f.stream.s);});
+        std::printf("  %6u | %.4f %.4f | %.4f %.4f\n",rows,w4,w8,c4,c8);
+    }
+    HipMtpDraftHead full(f.head.p,{h,v,depth,true,{},0},f.stream.s);
+    std::printf("  full %u | Q8 warm %.4f cold %.4f\n",v,gpu(false,[&]{full.launch(hidden.p,0,f.stream.s);}),gpu(true,[&]{full.launch(hidden.p,0,f.stream.s);}));
+    check(hipEventDestroy(a));check(hipEventDestroy(b));
+}
 }
 int main(int argc,char** argv) {
     try {
         int devices=0;if(hipGetDeviceCount(&devices)!=hipSuccess || !devices){std::cout<<"skip: no HIP device\n";return 77;}
+        if(argc>1 && std::string(argv[1])=="--bench-precision") {bench_precision();return 0;}
         if(argc>1 && std::string(argv[1])=="--bench") {
             for(const auto [b,c]:{std::pair{32768U,4096U},std::pair{16384U,4096U},std::pair{65536U,4096U}})bench(b,c);return 0;
         }
