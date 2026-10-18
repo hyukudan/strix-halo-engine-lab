@@ -136,8 +136,9 @@ inline constexpr std::optional<DecodeNumericalProfile> numerical_profile_dense_a
 }
 
 // Components of a fast prefill profile (any non-empty subset; all by default).
-inline constexpr std::uint32_t kFastPrefillHc = 1U, kFastPrefillDense = 2U, kFastPrefillMoe = 4U,
-    kFastPrefillAll = kFastPrefillHc | kFastPrefillDense | kFastPrefillMoe;
+inline constexpr std::uint32_t kFastPrefillHc = 1U, kFastPrefillDense = 2U, kFastPrefillMoe = 4U, kFastPrefillQsa = 8U,
+    kFastPrefillRouter = 16U,
+    kFastPrefillAll = kFastPrefillHc | kFastPrefillDense | kFastPrefillMoe | kFastPrefillQsa | kFastPrefillRouter;
 // dense8: the dense projections as A8-G64 (int8 x int8, int32 over 64 features per scale step) instead of the FP16 form
 // of `dense`; opt-in (not part of the default set) and exclusive with `dense`.
 inline constexpr std::uint32_t kFastPrefillDense8 = 32U, kFastPrefillKnown = kFastPrefillAll | kFastPrefillDense8;

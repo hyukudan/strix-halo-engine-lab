@@ -422,6 +422,53 @@ Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL):
 | Engine GPU time at 16K, T = 2048 | routed MoE 6.94 → 5.64 s; total 24.57 → 23.17 s |
 | Engine request time, T = 2048, GEN = 1, quiet node | 4K 5936 → 5588 ms (+6 %), 16K 24927 → 23671 ms (+5 %) |
 
+## D-036: fast prefill profile, QSA attention component over row-tile unions
+
+The `qsa` component of `fast-prefill-f16wmma-v1` (`--prefill-fast-components ...,qsa`) changes the sparse
+attention of the tiled prefill's QSA groups (16, 32 or 64 rows) only. The rows of a tile (4 consecutive rows
+by default) attend over the union of their selected blocks, each (row, token) pair masked by the row's own
+selection and causal prefix, with FP16 WMMA scores and values, an online FP32 softmax and the exact path's
+BF16 output roundings and gate. Indexer, selection, KV store and the output projection are unchanged; serial
+tiles and MTP prompt rows keep the exact attention. See
+[docs/prefill-numerical-profile.md](docs/prefill-numerical-profile.md).
+
+Why: the exact grouped kernels read every selected K and V row once per prompt row (about 2050 tokens of
+1 KiB per KV head) with 2-byte lane loads and FP32 VALU arithmetic. Consecutive rows select largely the same
+blocks (the union of 4 rows is about 1.4–2 times one row's selection at 4K–16K positions), so one 16-token
+chunk staged in LDS serves 4 rows × 12 query heads as WMMA operands.
+
+Kernel organisation (`src/hip_qsa_fast_prefill.inc`): a union kernel per tile; one attention workgroup per
+(tile, KV head) with four loader waves (three chunks in flight in fixed register sets, staged as FP16 into two
+LDS buffers) and pairs of compute waves that split the 256 features (half of Q as WMMA fragments in registers,
+partial scores exchanged through LDS, half of O accumulated). With one slice per tile the workgroup
+normalises and gates in place; smaller groups use 2–4 slices and a combine kernel.
+
+Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL):
+
+| Check | Result |
+| --- | --- |
+| Fixture, one 64-row group, synthetic selections, against an FP64 reference | relative RMS error 1.3–1.4e-3 (exact kernels: 2.8–3.0e-3, which round the softmax weights to BF16) |
+| Fixture, selection noise matched to the engine's measured unions; exact score+softmax+value vs union+attention per group | 4096: 816 → 396 µs; 8192: 801 → 470 µs; 12288: 847 → 513 µs; 16000: 840 → 536 µs |
+| Engine self-check against the serial exact tiles (`STRIX_QSA_PREFILL_SELFCHECK=1`), 4K (T = 4096) and 16K (T = 8192) | every QSA call on the fast path; relative RMS 1.6–2.2e-3, no non-finite value |
+| Teacher-forced quality, 31 segments, `dense,moe` vs `dense,moe,qsa` (same build, paired) | top-1 95.45 % → 95.45 % (paired delta −0.00 ± 0.06 pt), KL 0.01972 → 0.01967 (−0.3 % ± 1.9 %); the 1079 changed top-1 rows have a median reference margin of 0.22 nats (3.10 over all rows). The segments are 1–2K tokens: full-visible selections, not long-context sparsity |
+
+## D-037: fast prefill profile, router logits component in BF16 WMMA
+
+The `router` component (`--prefill-fast-components ...,router`) computes the router logits of the tiled
+prefill blocks with `v_wmma_f32_16x16x16_bf16`: each FP32 weight is split into two BF16 terms
+(`h = bf16(w)`, `m = bf16(w - h)`, relative error at most 2⁻¹⁷), the BF16 activations are exact operands and
+the products accumulate in FP32. Top-k selection and everything after the logits are unchanged; windows,
+serial rows and FP32 activations keep the exact router (`src/hip_router_fast_prefill.inc`).
+
+Why: the exact router runs FP32 FMA chains (about 3 TFLOPS); its 7 ms per 8192-row block is 3 % of the
+16K prefill.
+
+| Check | Result |
+| --- | --- |
+| Fixture, 8192 rows, 2560 × 512, against FP64 | max logit error 2.0e-4 on logits up to 14 (exact kernel: 3.2e-5); 7 of 8192 rows change their ordered top-10 (near-ties); a third weight term (exact weights) gives the same error and is 15 % slower |
+| Fixture time per 8192 rows (busy node) | exact 6.9–7.2 ms, router component 3.1–3.7 ms |
+| Teacher-forced quality, `dense,moe,qsa` vs `dense,moe,qsa,router` | top-1 95.45 % → 95.51 % (paired delta +0.06 ± 0.07 pt), KL 0.01967 → 0.01926 (−2.1 % ± 2.0 %); qsa and router together against dense,moe: +0.05 ± 0.06 pt, KL −2.3 % ± 1.9 % |
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |

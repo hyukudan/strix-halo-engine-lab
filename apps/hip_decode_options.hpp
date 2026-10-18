@@ -163,7 +163,7 @@ struct Options {
     // Prompt prefill arithmetic (--prefill-numerical-profile). Absent: the prefill uses
     // numerical_profile. Decode and MTP windows always use numerical_profile.
     std::optional<strix::DecodeNumericalProfile> prefill_numerical_profile;
-    // --prefill-fast-components hc,dense,moe: the components a fast prefill profile runs (all by default).
+    // --prefill-fast-components hc,dense,moe,qsa,router: the components a fast prefill profile runs (all by default).
     std::optional<std::uint32_t> prefill_fast_components;
     bool profile_explicit = false;
     bool any_low_level_flag = false;
@@ -1010,15 +1010,16 @@ inline Options parse_options(
         }
         if (argument == "--prefill-fast-components") {
             if (options.prefill_fast_components || index + 1 >= argc)
-                throw std::invalid_argument("--prefill-fast-components requires one list of hc, dense, moe, dense8");
+                throw std::invalid_argument("--prefill-fast-components requires one list of hc, dense, moe, qsa, router, dense8");
             std::string_view list = argv[++index];
             std::uint32_t mask = 0;
             while (!list.empty()) {
                 const auto comma = list.find(',');
                 const auto item = list.substr(0, comma);
                 const std::uint32_t bit = item == "hc" ? strix::kFastPrefillHc : item == "dense" ? strix::kFastPrefillDense
-                    : item == "moe" ? strix::kFastPrefillMoe : item == "dense8" ? strix::kFastPrefillDense8 : 0U;
-                if (!bit || (mask & bit)) throw std::invalid_argument("--prefill-fast-components accepts hc, dense, moe, dense8 once each");
+                    : item == "moe" ? strix::kFastPrefillMoe : item == "qsa" ? strix::kFastPrefillQsa
+                    : item == "router" ? strix::kFastPrefillRouter : item == "dense8" ? strix::kFastPrefillDense8 : 0U;
+                if (!bit || (mask & bit)) throw std::invalid_argument("--prefill-fast-components accepts hc, dense, moe, qsa, router, dense8 once each");
                 mask |= bit;
                 list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1U);
             }

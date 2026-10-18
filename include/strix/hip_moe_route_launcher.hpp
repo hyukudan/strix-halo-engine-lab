@@ -24,6 +24,8 @@ struct HipMoeRouteLauncherConfig {
     bool ranked_topk = false;
     bool wave_topk = false;
     std::shared_ptr<const WaveRouterManifestAdmission> wave_manifest_admission;
+    // fast-prefill-f16wmma-v1, router component: prefill tiles' logits in BF16 WMMA (hip_router_fast_prefill.inc).
+    bool router_fast_prefill = false;
 };
 
 void register_hip_moe_route_kernel_variant(

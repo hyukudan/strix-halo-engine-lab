@@ -568,6 +568,7 @@ struct HipKnownPrefixWindow::Impl {
         qsa_config.dense_a8_projections=config.dense_a8;
         qsa_config.dense_f16_prefill=(config.fast_prefill_components & kFastPrefillDense) != 0U;
         qsa_config.dense_g64_prefill=(config.fast_prefill_components & kFastPrefillDense8) != 0U;
+        qsa_config.qsa_fast_prefill=(config.fast_prefill_components & kFastPrefillQsa) != 0U;
         qsa_fallback=qsa_config;
         qsa_fallback.prefetch_q8_input=false; qsa_fallback.prefetch_eligible_layers.clear();
         // One entry per QSA variant actually selected (layers may differ in indexer format).
@@ -789,6 +790,7 @@ struct HipKnownPrefixWindow::Impl {
         route_config.parallel_projection=config.parallel_moe_router; route_config.staged_logits=config.staged_moe_router_logits;
         route_config.ranked_topk=config.ranked_moe_router_topk; route_config.wave_topk=config.wave_moe_router_topk;
         route_config.wave_manifest_admission=config.wave_router_manifest_admission;
+        route_config.router_fast_prefill=(config.fast_prefill_components & kFastPrefillRouter) != 0U;
         elementwise_config.hidden_size=u32(model.hidden_size); elementwise_config.hc_count=u32(model.hc_count);
         elementwise_config.activation=config.activation;
         rows_entries.push_back({KnownWindowR2Variant::moe_route_rows_v1,this,
