@@ -1146,17 +1146,20 @@ inline unsigned wide_kernel() { static const unsigned kernel = env_unsigned("STR
 inline bool wide_stage() { static const bool stage = env_unsigned("STRIX_Q8_ROWS_WIDE_STAGE", 0U) == 1U; return stage; }
 inline unsigned narrow_vopd() { static const unsigned vopd = env_unsigned("STRIX_Q8_ROWS_VOPD", 1U); return vopd; }
 inline unsigned narrow_fp32_min_width() { static const unsigned w = env_unsigned("STRIX_Q8_ROWS_VOPD_FP32_MIN", 1024U); return w; }
-// STRIX_DENSE_A8_STAGE=0 never stages the rows in LDS, =2 stages every rows <= 8 launch
-// that fits (tuning); the default stages rows <= 2 up to kDenseA8StageBytes.
+// Rows <= 8 whose quantized activations and chain slots fit one block's LDS quantize them in
+// the projection kernel (no quantizer launch; measured faster in 8-row MTP windows even at one
+// block per CU). STRIX_DENSE_A8_STAGE=0 never stages, =1 stages only up to kDenseA8StageBytes.
 inline unsigned dense_a8_stage_mode() {
-    static const unsigned mode = [] { const char* v = std::getenv("STRIX_DENSE_A8_STAGE"); return v ? static_cast<unsigned>(std::atoi(v)) : 1U; }();
+    static const unsigned mode = [] { const char* v = std::getenv("STRIX_DENSE_A8_STAGE"); return v ? static_cast<unsigned>(std::atoi(v)) : 2U; }();
     return mode;
 }
 constexpr std::uint64_t kDenseA8StageBytes = 24U * 1024U;
 // Dense A8. Rows <= 8 whose activations fit LDS: one persistent launch that quantizes them
-// per block. Otherwise one quantizer launch into the family's scratch slot (any-order when
-// the caller allows it; it writes only the slot no queued projection reads) and one
-// barrier-ordered projection launch (dot4 rows <= 8, WMMA 16/32/64).
+// per block (the 6144-wide 3..8-row inputs do not fit; windows quantize those in their
+// producers, launch_dense_a8_quantized). Otherwise one quantizer launch into the family's
+// scratch slot (any-order when the caller allows it; it writes only the slot no queued
+// projection reads) and one barrier-ordered projection launch (dot4 rows <= 8, WMMA
+// 16/32/64).
 template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream, bool any_order) {
     static_assert(Site::rows <= 8U || (Site::rows % 16U == 0U && Site::rows <= kDenseA8Rows));
     if (!dense_a8_width(site.width))
@@ -1177,7 +1180,7 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
         const auto stage = dense_a8_stage_bytes<Site::rows>(site.width);
         const auto chain = static_cast<std::uint64_t>(kWaves) * Outs * Site::rows * 33U * 8U;
         const unsigned mode = dense_a8_stage_mode();
-        if (mode && stage + chain <= (mode == 2U ? kLdsBytes : kDenseA8StageBytes) && (mode == 2U || Site::rows <= 2U)) {
+        if (mode && stage + chain <= (mode == 2U ? kLdsBytes : kDenseA8StageBytes)) {
             constexpr auto kernel = project_rows_dense_a8_kernel<Site, Outs, true>;
             const auto bytes = static_cast<std::uint32_t>(stage);
             run(kernel, std::min((groups + kWaves - 1U) / kWaves, resident_blocks<kernel, kThreads>(bytes)), kThreads, bytes, any_order,
