@@ -38,6 +38,12 @@ Speculative MTP decode path. Details: [README.md](README.md) and
     `MADV_RANDOM` + `MADV_POPULATE_READ` (`STRIX_PLE_WARM=0` skips), so decode
     does not read from disk after another process evicted the pages;
   - GDN rows use a fused FMA (neutral).
+- **Several requests** (`--mtp-cohort-request`, CLI benchmark mode, D-035): up to four
+  independent requests, each with its own state, MTP runtime and golden replay, verified in
+  cohort windows that read the projection, expert, HC and head weights once for all
+  requests' rows; each request's
+  tokens equal its single-request run. See
+  [docs/multi-request-cohort.md](docs/multi-request-cohort.md).
 - **Diagnostics:** `STRIX_CYCLE_TIMING=1` (host phase marks),
   `STRIX_CYCLE_LOG=1` (per-cycle window rows and wall time).
 

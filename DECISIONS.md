@@ -346,6 +346,32 @@ with the automatic organization, tiled route with the explicit v5 flag set; F = 
 | 16384 tokens (wiki), T=2048, F | Byte-identical (16.3 GB file), 16383 score rows equal; 1001 s serial vs 66 s tiled |
 | 16384 tokens, where the tiled time goes (per 2048-row block) | 7-8 s GPU against 5.4 s for the same prefill with only the terminal head (the eight-row heads add about 2.6 s), 31 ms download, 150 ms scoring; the 0.3-2.8 s spool overlaps the next block |
 
+## D-035: several requests verified in cohort windows
+
+Up to four independent requests decode in one process (`--mtp-cohort-request`, CLI benchmark mode). Each has
+its own state, serial scratch, PLE backend, MTP runtime, draft state, golden replay and 2/4/8 window owners;
+the model, the MTP sidecar assets and one window stream are shared. Each cycle every request drafts up to
+8 / requests rows, gets the owner its drafts call for, and the requests are packed into windows of 4 or 8
+rows. A cohort window admits every request's own window unchanged and advances their steps in lockstep: the
+routed expert union, HC mixers, router, LM head, shared-expert projections and the GDN/QSA projections run
+once for the rows of all requests on an idle owner of the total rows, while GDN recurrence, QSA KV
+append/selection/attention, PLE, embedding, combine and injections run per request from its own state. Each
+request then accepts, commits and publishes as after its own window (see
+[docs/multi-request-cohort.md](docs/multi-request-cohort.md)).
+
+Why: decode is bandwidth bound, and one window reads its weights once for all rows; rows of other requests
+fill a window without the acceptance risk of longer draft chains. The shared steps already compute every
+row with per-row pointers and row-count-independent arithmetic, so each request keeps exactly its own
+tokens. Alternative: independent sessions on separate streams (the serving scheduler) shares no weight
+reads. Status: opt-in, exact; the throughput gain is pending the measurement campaign.
+
+| Check | Result |
+| --- | --- |
+| GDN fixture: cohorts of 2-4 sessions (1-8 rows each), pending rows and commits, four storage/format variants | 120 cohort scenarios bit-exact against per-session windows (348 total) |
+| QSA fixture: cohorts of 2-3 sessions at mixed positions, FP32 and dense A8, BF16 and Q8 indexer | 48 cohort windows bit-exact (outputs, workspaces, KV and raw index) |
+| Full model, dense A8, code + Spanish prompts, 256 tokens each: lockstep, without shared expert, without shared steps, sequential | Tokens identical to each prompt's own run, replay error 0 |
+| Single-request route after the change | Tokens identical to the base build |
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |

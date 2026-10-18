@@ -113,6 +113,12 @@ different profile from decode; today only the dense-A8 sibling of `--numerical-p
 windows always use `--numerical-profile`, MTP goldens record both profiles, and MTP stays exact from the state the
 prefill produced. See [docs/prefill-numerical-profile.md](docs/prefill-numerical-profile.md) (D-033).
 
+Several requests (up to four) can decode together in one process: `--mtp-cohort-request TOKENS_FILE,GOLDEN,SHA256`
+(repeatable) adds requests next to the positional prompt, each with its own state, MTP runtime and golden. Their
+drafts are verified in cohort windows that read the projection, expert, HC and head weights once for the rows of all
+requests, while every request produces exactly the tokens it produces alone. See [docs/multi-request-cohort.md](docs/multi-request-cohort.md)
+(D-035).
+
 Teacher-forced scoring (`--teacher-forced-score`, `--teacher-logits-file`) also runs over the tiled prefill with the
 all-rows output policy, producing byte-identical logits files to the serial route within a profile, several times
 faster. See [docs/teacher-forced-tiled-prefill.md](docs/teacher-forced-tiled-prefill.md) (D-034).

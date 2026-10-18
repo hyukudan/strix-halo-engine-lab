@@ -10,7 +10,11 @@
 #include "strix/final_generation_state_export.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/wave_router_contract.hpp"
+#include <algorithm>
 #include <cerrno>
+#include <fstream>
+#include <iterator>
+#include <sstream>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
@@ -126,6 +130,13 @@ struct MtpCliOptions {
     bool draft_chain=false,draft_exact=false,draft_q4=false;
     std::string draft_vocab;
     std::uint32_t draft_context_vocab=0;
+    // Several independent requests in one process (the positional prompt and --mtp-golden are
+    // request 0): each has its own target state, MTP runtime, captures and window owners over the
+    // shared model. lockstep verifies the drafts of all active requests with cohort windows;
+    // sequential runs the requests one after another, each exactly as alone.
+    struct CohortRequest {std::vector<std::uint32_t> tokens;std::string golden,golden_sha256;};
+    std::vector<CohortRequest> cohort;
+    std::string cohort_mode;
 };
 // This is execution evidence: a configured owner alone is not an attempted
 // native window (EOS, remaining budget/context and history can choose serial).
@@ -818,6 +829,19 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
     if(m.window_rows && (o.gdn_recurrent_layout!=HipGdnRecurrentLayout::baseline || o.gdn_recurrent_storage!=GdnRecurrentStorage::key_value ||
        o.qsa_hierarchical_selection || o.qsa_gqa_heads_per_block!=1U))
         throw std::invalid_argument("MTP closed target windows require baseline recurrent and QSA organizations");
+    if(!m.cohort_mode.empty() && m.cohort.empty())
+        throw std::invalid_argument("MTP cohort mode requires --mtp-cohort-request");
+    if(!m.cohort.empty()) {
+        if(m.cohort.size()>3U || m.metadata_only || !m.golden_dump.empty() || !m.window_prefix || !m.draft_chain ||
+           m.window_rows_set!=std::vector<std::uint32_t>{2U,4U,8U} || o.prefill_numerical_profile.has_value())
+            throw std::invalid_argument("MTP cohort requests (at most three besides the positional prompt) require prefix "
+                "windows over the row set 2,4,8, the draft chain, an input golden and one numerical profile");
+        for(const auto& request:m.cohort)
+            if(request.tokens.size()<3U || request.tokens.size()>4097U || !mtp_sha256_text(request.golden_sha256) || request.golden.empty() ||
+               ((resolved || o.context_explicit) && (request.tokens.size()>o.context_tokens ||
+                o.generate_tokens>o.context_tokens-request.tokens.size()+1U)))
+                throw std::invalid_argument("MTP cohort request requires 3..4097 prompt tokens within the context and a pinned golden");
+    }
 }
 inline void validate_resolved_mtp_cli(const Options& o) {
     validate_mtp_cli(o,true);
@@ -972,6 +996,31 @@ inline Options parse_options(
             throw std::invalid_argument("MTP draft chain is a flag without a value");
         if(argument.starts_with("--mtp-window-expert-union="))
             throw std::invalid_argument("MTP window expert union is a flag without a value");
+        if(argument=="--mtp-cohort-request") {
+            // TOKENS_FILE,GOLDEN_FILE,GOLDEN_SHA256 (repeatable): decimal token IDs separated by commas or whitespace.
+            if(index+1>=argc)throw std::invalid_argument("MTP cohort request requires a value");
+            const std::string value=argv[++index];
+            const auto a=value.find(','),b=a==std::string::npos?std::string::npos:value.find(',',a+1U);
+            if(a==std::string::npos || b==std::string::npos || value.find(',',b+1U)!=std::string::npos)
+                throw std::invalid_argument("MTP cohort request is TOKENS_FILE,GOLDEN_FILE,GOLDEN_SHA256");
+            MtpCliOptions::CohortRequest request;
+            request.golden=value.substr(a+1U,b-a-1U);request.golden_sha256=value.substr(b+1U);
+            std::ifstream file(value.substr(0,a));
+            if(!file)throw std::invalid_argument("MTP cohort request token file cannot be read");
+            std::string text((std::istreambuf_iterator<char>(file)),std::istreambuf_iterator<char>());
+            for(auto& ch:text)if(ch==',')ch=' ';
+            std::istringstream words(text);std::string word;
+            while(words>>word)request.tokens.push_back(static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                parse_u64(word,"MTP cohort request token"),UINT32_MAX)));
+            options.mtp.supplied=true;options.mtp.cohort.push_back(std::move(request));continue;
+        }
+        if(argument=="--mtp-cohort-mode") {
+            if(index+1>=argc || !options.mtp.cohort_mode.empty())throw std::invalid_argument("MTP cohort mode requires one value");
+            options.mtp.cohort_mode=argv[++index];
+            if(options.mtp.cohort_mode!="lockstep" && options.mtp.cohort_mode!="sequential")
+                throw std::invalid_argument("MTP cohort mode is lockstep or sequential");
+            options.mtp.supplied=true;continue;
+        }
         if(argument.starts_with("--mtp-")) {
             const auto equal=argument.find('=');const auto key=argument.substr(0,equal);
             if(!mtp_option_names.insert(std::string(key)).second)throw std::invalid_argument("duplicate MTP option");

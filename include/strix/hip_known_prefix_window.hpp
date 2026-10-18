@@ -18,6 +18,15 @@ struct HipGreedyRowsReply;
 class HipMtpTargetWindowCapture;
 struct HipMtpTargetWindowCapturePolicy;
 struct HipMtpTargetWindowExecution;
+class HipKnownPrefixWindow;
+// One session's window in a cohort: its own idle closed owner of the session's row count, its
+// session, input tokens and a capture prepared on that owner.
+struct HipKnownPrefixCohortMember {
+    HipKnownPrefixWindow* window = nullptr;
+    SerialSessionContext* session = nullptr;
+    std::span<const std::uint32_t> tokens;
+    std::shared_ptr<HipMtpTargetWindowCapture> capture;
+};
 struct HipKnownPrefixUnionObservation {
     std::uint64_t first_position = 0;
     std::uint32_t layer = 0;
@@ -111,6 +120,14 @@ public:
     // windows of different sizes over one session continue one pending protocol.
     // flush_deferred() must then run on an owner that has executed a window.
     void share_deferred(const HipKnownPrefixWindow& primary);
+    // Cohort of independent sessions: each member's captured window exactly as
+    // execute_mtp_captured would run it alone (same admission, same per-row arithmetic, same
+    // capture and greedy replies), with the steps that read only weights and per-row activations
+    // enqueued once for the rows of all members on primary, an idle owner of another session
+    // whose row count is the members' total. Every owner must use one stream. Results are in
+    // member order; any failure poisons every member session and disables every owner involved.
+    [[nodiscard]] static std::vector<HipMtpTargetWindowExecution> execute_mtp_cohort(HipKnownPrefixWindow& primary,
+        std::span<const HipKnownPrefixCohortMember> members);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

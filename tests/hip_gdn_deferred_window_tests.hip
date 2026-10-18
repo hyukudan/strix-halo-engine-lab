@@ -248,6 +248,110 @@ struct Fixture {
         owner.guards();
     }
 };
+// Cohort: several sessions (own state, history, retained rows, control and inputs) in one
+// gdn_window_cohort_enqueue against each session's own gdn_window_enqueue from the same state.
+struct CohortSession {
+    Side together, alone;
+    Buffer control_together, control_alone;
+    std::vector<float> state; std::vector<std::uint16_t> history;
+};
+void cohort_scenarios(Fixture& f, unsigned& cases) {
+    std::vector<CohortSession> sessions(4);
+    Rng rng{991U};
+    for (auto& session : sessions) {
+        session.state = uniform<float>(state_floats, -0.2F, 0.2F, rng);
+        session.history = uniform<std::uint16_t>(static_cast<std::size_t>(conv_width) * kernel, -1.0F, 1.0F, rng);
+        for (auto* side : {&session.together, &session.alone}) {
+            side->matrix = f.owner.allocate(state_floats * sizeof(float));
+            side->conv = f.owner.allocate(session.history.size() * sizeof(std::uint16_t));
+            side->retained = f.owner.allocate(static_cast<std::size_t>(gdn_window_retained_bytes(f.config.model)));
+            for (unsigned row = 0; row < 16U; ++row) {
+                side->input.push_back(f.owner.allocate(hidden * sizeof(std::uint16_t)));
+                side->output.push_back(f.owner.allocate(hidden * sizeof(std::uint16_t)));
+                side->workspace.push_back(f.owner.allocate(workspace_floats * sizeof(float)));
+            }
+        }
+        session.control_together = f.owner.allocate(sizeof(GdnWindowControl));
+        session.control_alone = f.owner.allocate(sizeof(GdnWindowControl));
+        for (unsigned row = 0; row < 16U; ++row) {
+            const auto values = uniform<std::uint16_t>(hidden, -1.0F, 1.0F, rng);
+            write(session.together.input[row], values); write(session.alone.input[row], values);
+        }
+    }
+    const auto control = [&](Buffer buffer, std::uint32_t pending, std::uint32_t slot) {
+        const GdnWindowControl value{pending, slot};
+        check(hipMemcpyAsync(buffer.address, &value, sizeof(value), hipMemcpyHostToDevice, f.owner.stream), "set cohort GDN control");
+    };
+    const auto device = [](Buffer buffer) { return reinterpret_cast<const GdnWindowControl*>(buffer.address); };
+    struct Case { std::vector<unsigned> sizes; };
+    const std::vector<Case> shapes{{{2U, 2U}}, {{4U, 4U}}, {{2U, 2U, 2U, 2U}}, {{2U, 2U, 4U}}, {{4U, 2U, 2U}}, {{2U, 6U}},
+        {{1U, 7U}}, {{3U, 5U}}, {{1U, 1U}}, {{8U}}};
+    for (const auto& shape : shapes) {
+        const auto count = shape.sizes.size();
+        for (unsigned variant = 0; variant < 3U; ++variant) {
+            std::string label = "cohort";
+            for (const auto size : shape.sizes) label += " " + std::to_string(size);
+            label += " variant " + std::to_string(variant);
+            std::vector<GdnWindowCohortSegment> segments;
+            std::vector<std::vector<GdnWindowRow>> together_rows(count), alone_rows(count);
+            std::vector<unsigned> first_rows(count), pending(count), keep(count);
+            for (std::size_t k = 0; k < count; ++k) {
+                auto& session = sessions[k];
+                for (auto* side : {&session.together, &session.alone}) {
+                    write(side->matrix, session.state); write(side->conv, session.history);
+                    for (unsigned r = 0; r < 16U; ++r) {
+                        check(hipMemset(side->output[r].address, 0x5a, side->output[r].bytes), "poison cohort GDN output");
+                        check(hipMemset(side->workspace[r].address, 0x5a, side->workspace[r].bytes), "poison cohort GDN workspace");
+                    }
+                    check(hipMemset(side->retained.address, 0x5a, side->retained.bytes), "poison cohort GDN retained rows");
+                }
+                // A first window of every session alone leaves pending rows in slot 0.
+                first_rows[k] = 1U + (k + variant) % 8U;
+                pending[k] = (variant + k) % (first_rows[k] + 1U);
+                keep[k] = 1U + (variant * 3U + k) % shape.sizes[k];
+                control(session.control_together, 0U, 1U); control(session.control_alone, 0U, 1U);
+                gdn_window_enqueue(f.layer(session.together), f.rows(session.together, 0U, first_rows[k]),
+                    device(session.control_together), f.config, f.owner.stream);
+                gdn_window_enqueue(f.layer(session.alone), f.rows(session.alone, 0U, first_rows[k]),
+                    device(session.control_alone), f.config, f.owner.stream);
+                control(session.control_together, pending[k], 0U); control(session.control_alone, pending[k], 0U);
+                together_rows[k] = f.rows(session.together, 8U, shape.sizes[k]);
+                alone_rows[k] = f.rows(session.alone, 8U, shape.sizes[k]);
+                segments.push_back({f.layer(session.together), together_rows[k], device(session.control_together)});
+            }
+            f.owner.finish();
+            gdn_window_cohort_enqueue(segments, f.config, f.owner.stream);
+            for (std::size_t k = 0; k < count; ++k)
+                gdn_window_enqueue(f.layer(sessions[k].alone), alone_rows[k], device(sessions[k].control_alone), f.config, f.owner.stream);
+            f.owner.finish();
+            for (std::size_t k = 0; k < count; ++k) {
+                const auto& session = sessions[k];
+                const auto what = label + " session " + std::to_string(k);
+                for (unsigned r = 8U; r < 8U + shape.sizes[k]; ++r) {
+                    require(read(session.together.workspace[r]) == read(session.alone.workspace[r]), what + ": workspace of row " + std::to_string(r) + " differs");
+                    require(read(session.together.output[r]) == read(session.alone.output[r]), what + ": output of row " + std::to_string(r) + " differs");
+                }
+                require(read(session.together.matrix) == read(session.alone.matrix), what + ": recurrent matrix differs after pending rows");
+                require(read(session.together.conv) == read(session.alone.conv), what + ": conv history differs after pending rows");
+                require(read(session.together.retained) == read(session.alone.retained), what + ": retained rows differ");
+            }
+            for (std::size_t k = 0; k < count; ++k) {
+                auto& session = sessions[k];
+                control(session.control_together, keep[k], 1U); control(session.control_alone, keep[k], 1U);
+                gdn_window_commit_enqueue(f.layer(session.together), device(session.control_together), f.config, f.owner.stream);
+                gdn_window_commit_enqueue(f.layer(session.alone), device(session.control_alone), f.config, f.owner.stream);
+            }
+            f.owner.finish();
+            for (std::size_t k = 0; k < count; ++k) {
+                const auto what = label + " session " + std::to_string(k) + " after commit";
+                require(read(sessions[k].together.matrix) == read(sessions[k].alone.matrix), what + ": recurrent matrix differs");
+                require(read(sessions[k].together.conv) == read(sessions[k].alone.conv), what + ": conv history differs");
+            }
+            ++cases;
+        }
+    }
+    f.owner.guards();
+}
 float elapsed(hipEvent_t start, hipEvent_t stop) { float ms = 0; check(hipEventElapsedTime(&ms, start, stop), "event time"); return ms; }
 template <class F> float median_ms(Owner& owner, F&& run) {
     hipEvent_t start, stop;
@@ -306,6 +410,8 @@ int main(int argc, char** argv) {
             // Owners of different sizes sharing one pending record (adaptive verifier).
             for (const auto [t, u] : {std::pair{2U, 4U}, std::pair{4U, 2U}, std::pair{8U, 2U}, std::pair{2U, 8U}, std::pair{4U, 8U}, std::pair{8U, 4U}})
                 for (unsigned n = 0; n <= t; ++n) { fixture.scenario(t, n, (n + 1U) % (u + 1U), n == 2U, u); ++cases; }
+            // Several sessions in one cohort window, each against its own window.
+            cohort_scenarios(fixture, cases);
         }
         std::cout << "deferred GDN window: " << cases << " scenarios bit-exact (outputs, workspaces, matrix, conv history)\n";
         return 0;
