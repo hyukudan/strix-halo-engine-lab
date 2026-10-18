@@ -1258,6 +1258,27 @@ void inject_known_window_rows_preflight(std::span<const ExecutionDispatchContext
     const HipElementwiseLauncherConfig& config) {
     static_cast<void>(prepare_inject_rows(rows, config));
 }
+namespace {
+ElementwiseRowsViews elementwise_views(const ElementwiseRowsArgs& args, std::size_t count) {
+    ElementwiseRowsViews views;
+    views.count = static_cast<std::uint32_t>(count);
+    for (std::uint32_t r = 0; r < views.count; ++r) {
+        views.first[r] = args.first[r]; views.second[r] = args.second[r];
+        views.weights[r] = args.weights[r]; views.output[r] = args.output[r];
+    }
+    return views;
+}
+} // namespace
+ElementwiseRowsViews inject_known_window_rows_views(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config) {
+    return elementwise_views(prepare_inject_rows(rows, config), rows.size());
+}
+ElementwiseRowsViews moe_combine_known_window_rows_views(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config) {
+    auto views = elementwise_views(prepare_combine_rows(rows, config), rows.size());
+    for (auto& weights : views.weights) weights = nullptr;
+    return views;
+}
 void inject_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipElementwiseLauncherConfig& config) {
     const auto args = prepare_inject_rows(rows, config);

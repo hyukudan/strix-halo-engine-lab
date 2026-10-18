@@ -19,6 +19,7 @@
 #include "strix/hip_moe_a8_down.hpp"
 #endif
 #include <array>
+#include <functional>
 #include <algorithm>
 #include <limits>
 #include <optional>
@@ -2356,6 +2357,33 @@ __global__ void known_moe_rows_commit_kernel(KnownMoeRowsDevice view, KnownMoeCs
     if (out < hidden_size) store_activation(view.output[blockIdx.y] + out, view.accumulation[blockIdx.y][out]);
 }
 
+// The MoE combine folded into the commit (STRIX_WINDOW_COMMIT_COMBINE=1): each output element's thread also
+// stores shared + routed (the routed value just committed, or the existing one after a failure, as the
+// separate combine launch would read it) in the combine's output row.
+struct KnownMoeCombineDevice {
+    const std::uint16_t* shared[8]{};
+    std::uint16_t* combined[8]{};
+};
+template <bool Combine>
+__global__ void known_moe_rows_commit_combine_kernel(KnownMoeRowsDevice view, KnownMoeCsrDevice csr,
+    std::uint32_t row_count, std::uint32_t hidden_size, std::uint32_t* record, KnownMoeCombineDevice combine) {
+    std::uint32_t failure = csr.header[0];
+    for (std::uint32_t r = 0; r < row_count; ++r) failure |= *view.status[r];
+    if (blockIdx.x == 0U && blockIdx.y == 0U && threadIdx.x == 0U) {
+        csr.header[0] = failure;
+        if (failure & 7U) for (const auto word : {1U, 2U, 4U, 5U}) csr.header[word] = 0U;
+        if (failure & 7U) for (std::uint32_t word = 8U; word < 24U; ++word) csr.header[word] = 0U;
+        for (std::uint32_t r = 0; r < row_count; ++r)
+            merge_deferred_moe_first_error(*reinterpret_cast<DeferredMoeFirstError*>(record), *view.status[r], DeferredMoeDomain::q4k_a8);
+    }
+    const auto out = blockIdx.x * blockDim.x + threadIdx.x;
+    if (out >= hidden_size) return;
+    if (!failure) store_activation(view.output[blockIdx.y] + out, view.accumulation[blockIdx.y][out]);
+    if constexpr (Combine)
+        store_activation(combine.combined[blockIdx.y] + out,
+            load_activation(combine.shared[blockIdx.y] + out) + load_activation(view.output[blockIdx.y] + out));
+}
+
 struct KnownMoeRowsPrepared {
     std::array<PreparedMoeExperts, 8> rows{};
     std::array<moe_q4k_a8::Bindings, 8> quantized_bindings{};
@@ -2531,7 +2559,8 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
 }
 
 void known_moe_rows_enqueue(std::span<const ExecutionDispatchContext> rows,
-    const HipMoeExpertsLauncherConfig& config, const KnownMoeRowsPrepared& p) {
+    const HipMoeExpertsLauncherConfig& config, const KnownMoeRowsPrepared& p,
+    const KnownMoeCombineDevice* combine = nullptr, const std::function<void()>* before_commit = nullptr) {
     const auto stream = hip_execution_stream();
     const auto count = static_cast<std::uint32_t>(rows.size());
     check_hip(hipPeekAtLastError(), "known-window routed rows stale error");
@@ -2560,9 +2589,16 @@ void known_moe_rows_enqueue(std::span<const ExecutionDispatchContext> rows,
     hipLaunchKernelGGL(known_moe_rows_merge_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
         p.device, p.csr, config.hidden_size, config.expert_count, config.top_k);
     check_hip(hipGetLastError(), "known-window routed rows ordered merge");
-    hipLaunchKernelGGL(known_moe_rows_commit_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
-        p.device, p.csr, count, config.hidden_size, hip_deferred_moe_status());
-    check_hip(hipGetLastError(), "known-window routed rows output commit");
+    if (combine) {
+        if (before_commit && *before_commit) (*before_commit)();
+        hipLaunchKernelGGL(known_moe_rows_commit_combine_kernel<true>, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0,
+            stream, p.device, p.csr, count, config.hidden_size, hip_deferred_moe_status(), *combine);
+        check_hip(hipGetLastError(), "known-window routed rows output commit + MoE combine");
+    } else {
+        hipLaunchKernelGGL(known_moe_rows_commit_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
+            p.device, p.csr, count, config.hidden_size, hip_deferred_moe_status());
+        check_hip(hipGetLastError(), "known-window routed rows output commit");
+    }
     if (config.q4k_a8_stats) {
         auto& stats = *config.q4k_a8_stats;
         if (config.batched_slot_activation) {
@@ -2877,6 +2913,49 @@ void moe_experts_known_window_rows_launch(std::span<const ExecutionDispatchConte
     known_moe_rows_enqueue(rows,config,prepared);
 #else
     (void)rows; (void)config; (void)workspace;
+    throw std::invalid_argument("known-window routed rows require built A8 runtime");
+#endif
+}
+bool moe_experts_known_window_rows_launch_combined(std::span<const ExecutionDispatchContext> rows,
+    const HipMoeExpertsLauncherConfig& config, const q51_known_rows::Workspace& workspace,
+    std::span<const void* const> combine_shared, std::span<const void* const> combine_routed,
+    std::span<void* const> combine_output, const std::function<void()>& before_commit) {
+#ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+    const auto prepared=prepare_known_moe_rows(rows,config,workspace);
+    const auto count=static_cast<std::uint32_t>(rows.size());
+    const auto decline=[](const char* why) {
+        if (std::getenv("STRIX_WINDOW_FOLD_VERBOSE")) std::fprintf(stderr, "window commit + combine fold declined: %s\n", why);
+        return false;
+    };
+    if (combine_shared.size()!=count || combine_routed.size()!=count || combine_output.size()!=count)
+        return decline("row counts differ");
+    const auto at=[](const void* x){return reinterpret_cast<std::uintptr_t>(x);};
+    const std::uint64_t row_bytes=static_cast<std::uint64_t>(config.hidden_size)*2U;
+    const auto overlap=[](std::uintptr_t a,std::uint64_t an,std::uintptr_t b,std::uint64_t bn){return a<b+bn && b<a+an;};
+    KnownMoeCombineDevice combine{};
+    for (std::uint32_t t=0;t<count;++t) {
+        // The combine reads this step's routed output rows; outputs are BF16 rows.
+        if (combine_routed[t]!=prepared.device.output[t]) return decline("the combine does not read the routed output");
+        combine.shared[t]=static_cast<const std::uint16_t*>(combine_shared[t]);
+        combine.combined[t]=static_cast<std::uint16_t*>(combine_output[t]);
+    }
+    // Each element's thread reads its shared and routed values and the accumulation before storing the
+    // combined value: a combined row may replace its own row's shared or routed row exactly, nothing else.
+    for (std::uint32_t t=0;t<count;++t) {
+        const auto c=at(combine.combined[t]);
+        for (std::uint32_t o=0;o<count;++o) {
+            const auto acc=at(prepared.device.accumulation[o]);
+            if (overlap(c,row_bytes,acc,static_cast<std::uint64_t>(config.hidden_size)*4U)) return decline("combined row aliases an accumulation");
+            for (const auto x:{at(combine.shared[o]),at(prepared.device.output[o]),at(combine.combined[o])}) {
+                if (o==t && x==c) continue;
+                if (overlap(c,row_bytes,x,row_bytes)) return decline("combined row aliases another row");
+            }
+        }
+    }
+    known_moe_rows_enqueue(rows,config,prepared,&combine,&before_commit);
+    return true;
+#else
+    (void)rows; (void)config; (void)workspace; (void)combine_shared; (void)combine_routed; (void)combine_output; (void)before_commit;
     throw std::invalid_argument("known-window routed rows require built A8 runtime");
 #endif
 }

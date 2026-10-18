@@ -82,6 +82,17 @@ void hyper_mix_known_window_rows_preflight(std::span<const ExecutionDispatchCont
     const HipHyperMixLauncherConfig& config);
 void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipHyperMixLauncherConfig& config);
+// The inject rows step that writes this HC step's input streams (and, with `combine`, the MoE-combine rows
+// step whose output that inject reads) folded into the HC normalisation: one kernel instead of two or three,
+// then the HC projection and output kernels. The views come from the elementwise steps' own admission; the
+// streams, the combined rows, the HC outputs and the gates are the bytes of the separate launches (an HC
+// workspace the arena aliased with a folded input moves to an owner-held buffer). Returns false, with nothing
+// enqueued, when the views do not chain or alias (the caller then launches the steps itself).
+bool hyper_mix_known_window_rows_launch_folded(const ElementwiseRowsViews* combine, const ElementwiseRowsViews& inject,
+    std::span<const ExecutionDispatchContext> rows, const HipHyperMixLauncherConfig& config,
+    const HipElementwiseLauncherConfig& elementwise);
+// Number of folded window HC launches so far, for fixtures.
+std::uint64_t hip_hyper_mix_testing_folded_launches();
 // Prefill: all T rows of an HC step (T a multiple of 8, tiles one stride apart) in one launch per kernel.
 void hyper_mix_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipHyperMixLauncherConfig& config);

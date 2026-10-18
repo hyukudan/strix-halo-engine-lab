@@ -57,6 +57,20 @@ void inject_known_window_rows_preflight(std::span<const ExecutionDispatchContext
     const HipElementwiseLauncherConfig& config);
 void inject_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipElementwiseLauncherConfig& config);
+// The resolved views of an admitted inject (first = streams, second = hidden, weights = gates) or MoE-combine
+// (first = shared, second = routed) rows call: the same admission as the launch, nothing enqueued, for a
+// consumer that runs the element arithmetic inside its own kernel.
+struct ElementwiseRowsViews {
+    const void* first[8];
+    const void* second[8];
+    const float* weights[8];
+    void* output[8];
+    std::uint32_t count = 0;
+};
+ElementwiseRowsViews inject_known_window_rows_views(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config);
+ElementwiseRowsViews moe_combine_known_window_rows_views(std::span<const ExecutionDispatchContext> rows,
+    const HipElementwiseLauncherConfig& config);
 void moe_combine_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipElementwiseLauncherConfig& config);
 void moe_combine_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
