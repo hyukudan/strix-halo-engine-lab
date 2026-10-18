@@ -94,7 +94,18 @@ its own pair identity):
   FP16 x FP16 -> FP32 WMMA: activations rounded to FP16 into a scratch slot (finite values beyond the
   FP16 range are counted), Q8_0 blocks dequantized to FP16 in LDS by the projection. Launches of other
   row counts keep dense A8. The GDN output projection does not use the fused A8 quantizer.
-- `moe`: routed MoE (separate branch). On this branch the bit is recorded but selects no kernel yet.
+- `moe`: the routed MoE of every complete tiled prefill block (the T-row CSR path) runs FP16 WMMA. Each
+  Q4_K/Q5_K gate/up value `d*sc*q - dm*m`, Q5_1 down value `d*q + m` and Q8_0 down value `d*q` is formed in
+  FP32 and rounded once to FP16 inside the kernel (no FP16 copy of the weights in memory). The BF16 input
+  row is scaled by `2^s` (one `s` per prompt row, putting the row maximum in `[2^13, 2^14)`) and converted
+  to FP16; `h = silu(g) * u` is computed and kept in FP32 and rounded to FP16 by the down kernel with a
+  power-of-two scale per (row, slot) from its largest `|h|`. `v_wmma_f32_16x16x16_f16` accumulates over the
+  whole K in FP32 (K steps of 64 ascending) with no per-group epilogue; the scales are undone exactly on
+  the FP32 sums. Merge (route weights in slot order) and the BF16 commit are unchanged. A non-finite `g`,
+  `u` or `h` fails the row closed (status 8). Each (row, output) sums in the same order whatever CSR batch
+  (up to 64 assignments of one expert) it lands in, so results do not depend on T or on the other rows.
+  Serial rows (the unpadded suffix, every MTP prompt row) and windows keep the A8 MoE. The kernels reuse the
+  A8 routed-MoE scratch views. Receipt: `prefill_moe_f16wmma_rows` (prompt rows times layers that ran it).
 
 Router, QSA indexer, attention, GDN recurrence, PLE and LM head keep the decode profile's arithmetic.
 Tokens differ from a dense-A8 run; exactness is defined from the handoff state as for every split pair.
