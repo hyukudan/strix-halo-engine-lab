@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -3679,7 +3680,9 @@ __global__ void attention_output_rows_dense_a8_kernel(QsaRowsAttentionViews<Rows
 // division; the value chain is the same ascending-slot fma chain the window kernel's
 // contracted sum += score * value compiles to.
 template <unsigned D> __device__ __forceinline__ float qsa_lane_xor(float v) {
-    if constexpr (D == 16U) return __shfl_xor(v, 16, 32);
+    // Distance 16: permlanex16 with the identity selects swaps the two 16-lane rows (lane L ^ 16).
+    if constexpr (D == 16U) return __uint_as_float(__builtin_amdgcn_permlanex16(__float_as_uint(v), __float_as_uint(v),
+        0x76543210U, 0xfedcba98U, false, false));
     else return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x160 | static_cast<int>(D), 0xf, 0xf, false));
 }
 // Reduce-scatter of P per-lane partial sums (P a power of two <= 16): lane step D (16, 8, ...)
@@ -3766,6 +3769,71 @@ __global__ __launch_bounds__(256) void attention_score_rows_group_kernel(QsaRows
         }
     }
 }
+// head_dim 256 form of attention_score_rows_group_kernel<Rows, G, Slots, true>: every feature
+// guard is true, the wave's Slots token indices are loaded once (lane i holds slot first + i),
+// and the next slot's K row is requested before the current slot's products. Per slot the
+// statements are those of the generic kernel.
+template <unsigned Rows, unsigned G, unsigned Slots>
+__global__ __launch_bounds__(256) void attention_score_rows_group256_kernel(QsaRowsAttentionViews<Rows> views,
+    const std::uint16_t* kv_state, std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t slots) {
+#pragma clang fp contract(off)
+    static_assert(Slots <= 32U);
+    constexpr unsigned Dim = 256U; // head_dim == Dim (checked by the caller)
+    const auto lane = threadIdx.x % 32U;
+    const auto wave = blockIdx.x * 8U + threadIdx.x / 32U;
+    const auto groups = (slots + Slots - 1U) / Slots, head_groups = attention_heads / G;
+    const auto r = wave / (head_groups * groups);
+    if (r >= Rows) return;
+    const auto head0 = wave / groups % head_groups * G, first = wave % groups * Slots;
+    if (first >= views.count[r]) return;
+    const auto kv_head = head0 / (attention_heads / kv_heads);
+    float qv[G][8];
+#pragma unroll
+    for (unsigned h = 0; h < G; ++h) {
+        const auto* q = views.q_gate[r] + static_cast<std::uint64_t>(head0 + h) * Dim * 2ULL;
+#pragma unroll
+        for (unsigned j = 0; j < 8U; ++j) qv[h][j] = q[lane + 32U * j];
+    }
+    const float scale = sqrtf(static_cast<float>(head_dim));
+    const auto last = min(first + Slots, views.count[r]);
+    const auto tokens = lane < last - first ? views.selected[r][first + lane] : 0U;
+    float* const scores = views.scores[r]; // loaded once: a store could alias the argument block
+    const auto* kbase = kv_state + static_cast<std::uint64_t>(kv_head) * Dim + lane;
+    const auto row_elements = static_cast<std::uint64_t>(kv_heads) * Dim * 2ULL;
+    // Raw BF16 bits travel to the next slot; they become floats where the products use them.
+    std::uint16_t raw[8];
+    const auto load = [&](std::uint32_t index, std::uint16_t (&k)[8]) {
+        const auto token = static_cast<std::uint32_t>(__builtin_amdgcn_readlane(static_cast<int>(tokens), static_cast<int>(index)));
+        const auto* row = kbase + static_cast<std::uint64_t>(token) * row_elements;
+#pragma unroll
+        for (unsigned j = 0; j < 8U; ++j) k[j] = row[32U * j];
+    };
+    load(0U, raw);
+    constexpr unsigned P = G <= 2U ? 2U : G <= 4U ? 4U : G <= 8U ? 8U : 16U;
+    for (auto slot = first; slot < last; ++slot) {
+        float kf[8];
+#pragma unroll
+        for (unsigned j = 0; j < 8U; ++j) kf[j] = bf16_to_float(raw[j]);
+        if (slot + 1U < last) load(slot + 1U - first, raw);
+        float partial[P];
+#pragma unroll
+        for (unsigned h = 0; h < P; ++h) {
+            if (h >= G) { partial[h] = 0.0F; continue; }
+            float p[8];
+#pragma unroll
+            for (unsigned j = 0; j < 8U; ++j) p[j] = qv[h][j] * kf[j];
+#pragma unroll
+            for (unsigned j = 0; j < 4U; ++j) p[j] += p[j + 4U];
+            p[0] += p[2]; p[1] += p[3];
+            partial[h] = p[0] + p[1];
+        }
+        qsa_scatter<P>(partial, lane);
+        const auto h = qsa_scatter_head<P>(lane);
+        if (h < G && (lane & ((32U / P) - 1U)) == 0U)
+            scores[static_cast<std::uint64_t>(head0 + h) * maximum_selected + slot] = partial[0] / scale;
+    }
+}
 template <unsigned Rows, unsigned G>
 __global__ __launch_bounds__(256) void attention_output_rows_group_kernel(QsaRowsAttentionViews<Rows> views,
     const std::uint16_t* kv_state, std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
@@ -3806,6 +3874,160 @@ __global__ __launch_bounds__(256) void attention_output_rows_group_kernel(QsaRow
         const float gate = round_bf16(1.0F / (1.0F + expf(-views.q_gate[r][static_cast<std::uint64_t>(head) * head_dim * 2ULL + head_dim + feature])));
         views.output[r][static_cast<std::uint64_t>(head) * head_dim + feature] = round_bf16(attn * gate);
     }
+}
+
+// attention_output_rows_group_kernel with the value loads of the next 8 slots requested before
+// the current 8 slots join the chains. Each head's chain is the same ascending-slot fma
+// sequence (its blocking into 4 or 8 slots does not enter the arithmetic), with the same
+// BF16 roundings and gate.
+template <unsigned Rows, unsigned G>
+__global__ __launch_bounds__(256) void attention_output_rows_group_prefetch_kernel(QsaRowsAttentionViews<Rows> views,
+    const std::uint16_t* kv_state, std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim) {
+    const auto head0 = static_cast<std::uint32_t>(blockIdx.x) * G, r = static_cast<std::uint32_t>(blockIdx.y);
+    const auto feature = static_cast<std::uint32_t>(threadIdx.x);
+    if (head0 >= attention_heads || feature >= head_dim) return;
+    const auto count = views.count[r];
+    const auto kv_head = head0 / (attention_heads / kv_heads);
+    const auto kv_width = kv_heads * head_dim;
+    const auto offset = static_cast<std::uint64_t>(kv_width) + static_cast<std::uint64_t>(kv_head) * head_dim + feature;
+    const auto* selected = views.selected[r];
+    const float* scores = views.scores[r] + static_cast<std::uint64_t>(head0) * maximum_selected;
+    const auto* values = kv_state + offset;
+    const auto row_elements = static_cast<std::uint64_t>(kv_width) * 2ULL;
+    float sum[G];
+#pragma unroll
+    for (unsigned h = 0; h < G; ++h) sum[h] = 0.0F;
+    constexpr unsigned B = 8U;
+    const auto full = count / B * B;
+    std::uint16_t raw[B];
+    if (full) {
+#pragma unroll
+        for (unsigned i = 0; i < B; ++i) raw[i] = values[static_cast<std::uint64_t>(selected[i]) * row_elements];
+    }
+    for (std::uint32_t slot = 0; slot < full; slot += B) {
+        float value[B];
+#pragma unroll
+        for (unsigned i = 0; i < B; ++i) value[i] = bf16_to_float(raw[i]);
+        // Unconditional (the last block reloads itself), so the loads stay ahead of this block's chains.
+        const auto next = slot + B < full ? slot + B : slot;
+#pragma unroll
+        for (unsigned i = 0; i < B; ++i) raw[i] = values[static_cast<std::uint64_t>(selected[next + i]) * row_elements];
+        __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+        for (unsigned i = 0; i < B; ++i)
+#pragma unroll
+            for (unsigned h = 0; h < G; ++h)
+                sum[h] = __builtin_fmaf(scores[static_cast<std::uint64_t>(h) * maximum_selected + slot + i], value[i], sum[h]);
+    }
+    for (auto slot = full; slot < count; ++slot) {
+        const float value = bf16_to_float(values[static_cast<std::uint64_t>(selected[slot]) * row_elements]);
+#pragma unroll
+        for (unsigned h = 0; h < G; ++h) sum[h] = __builtin_fmaf(scores[static_cast<std::uint64_t>(h) * maximum_selected + slot], value, sum[h]);
+    }
+#pragma unroll
+    for (unsigned h = 0; h < G; ++h) {
+        const auto head = head0 + h;
+        const float attn = round_bf16(sum[h]);
+        const float gate = round_bf16(1.0F / (1.0F + expf(-views.q_gate[r][static_cast<std::uint64_t>(head) * head_dim * 2ULL + head_dim + feature])));
+        views.output[r][static_cast<std::uint64_t>(head) * head_dim + feature] = round_bf16(attn * gate);
+    }
+}
+
+// Prefill groups (Rows > 8): the pooled/normalised/rotated key of a complete block depends only
+// on its raw keys, so it is formed once per prefill call (block_pool_kernel: the statements of
+// block_score_rows_kernel's pooled part) and every row of every group scores it
+// (block_score_pooled_rows_kernel). Per (row, block, head) the score is the 128-feature LDS tree
+// of block_score_rows_kernel done in registers: lane l holds features l + 32j, so strides 64
+// and 32 are the in-lane pairs (j, j + 2) and then (0, 1), and 16..1 are the xor reduce-scatter
+// of attention_score_rows_group_kernel (each step adds the partials of lanes L and L ^ D). The
+// relu sum over the heads, in head order from 0, and the division are unchanged.
+template <SmallWeightKind Kind>
+__global__ void block_pool_kernel(const std::uint16_t* raw_keys, std::uint32_t first_block, std::uint32_t head_dim,
+    std::uint32_t compress_ratio, const void* key_norm, float epsilon, std::uint32_t rotary_dim, float theta, float* pooled_keys) {
+    const auto block = first_block + static_cast<std::uint32_t>(blockIdx.x);
+    const auto feature = static_cast<std::uint32_t>(threadIdx.x);
+    if (feature >= head_dim) return;
+    extern __shared__ float shared[];
+    auto* pooled = shared;
+    auto* scratch = shared + head_dim;
+    float mean = 0.0F;
+    const auto token_start = static_cast<std::uint64_t>(block) * compress_ratio;
+    for (std::uint32_t offset = 0; offset < compress_ratio; ++offset)
+        mean += bf16_to_float(raw_keys[(token_start + offset) * head_dim + feature]);
+    mean /= static_cast<float>(compress_ratio);
+    mean = round_bf16(mean);
+    pooled[feature] = mean;
+    scratch[feature] = mean * mean;
+    __syncthreads();
+    for (std::uint32_t stride = head_dim / 2U; stride > 0; stride >>= 1U) {
+        if (feature < stride) scratch[feature] += scratch[feature + stride];
+        __syncthreads();
+    }
+    const float inv_rms = rsqrtf(scratch[0] / static_cast<float>(head_dim) + epsilon);
+    pooled[feature] = round_bf16(mean * inv_rms * load_small_weight<Kind>(key_norm, feature));
+    __syncthreads();
+    float rotated = pooled[feature];
+    if (feature < rotary_dim) {
+        const auto half = rotary_dim / 2U;
+        const auto pair = feature % half;
+        const float exponent = 2.0F * static_cast<float>(pair) / static_cast<float>(rotary_dim);
+        const float angle = static_cast<float>(token_start) * powf(theta, -exponent);
+        const float cosine = cosf(angle);
+        const float sine = sinf(angle);
+        if (feature < half) rotated = pooled[feature] * cosine - pooled[feature + half] * sine;
+        else rotated = pooled[feature] * cosine + pooled[feature - half] * sine;
+    }
+    pooled_keys[static_cast<std::uint64_t>(block) * head_dim + feature] = round_bf16(rotated);
+}
+// One wave scores RowsPerWave consecutive rows against 32 consecutive blocks (lane i keeps
+// block base + i); index head_dim 128, 4 index heads.
+template <unsigned Rows, unsigned RowsPerWave>
+__global__ __launch_bounds__(256) void block_score_pooled_rows_kernel(QsaRowsScoreViews<Rows> views, const float* pooled_keys,
+    std::uint32_t scored_blocks, std::uint32_t head_dim) {
+#pragma clang fp contract(off)
+    constexpr unsigned Heads = 4U, Dim = 128U; // head_dim == Dim (checked by the caller)
+    const auto lane = threadIdx.x % 32U;
+    const auto wave = blockIdx.x * 8U + threadIdx.x / 32U;
+    const auto chunks = (scored_blocks + 31U) / 32U;
+    const auto r0 = wave / chunks * RowsPerWave, base = wave % chunks * 32U;
+    if (r0 >= Rows) return;
+    float q[RowsPerWave][Heads][4];
+    std::uint32_t blocks[RowsPerWave];
+#pragma unroll
+    for (unsigned rr = 0; rr < RowsPerWave; ++rr) {
+        blocks[rr] = views.blocks[r0 + rr];
+#pragma unroll
+        for (unsigned h = 0; h < Heads; ++h)
+#pragma unroll
+            for (unsigned j = 0; j < 4U; ++j) q[rr][h][j] = views.index_query[r0 + rr][h * Dim + lane + 32U * j];
+    }
+    float result[RowsPerWave];
+#pragma unroll
+    for (unsigned rr = 0; rr < RowsPerWave; ++rr) result[rr] = 0.0F;
+    const auto last = min(32U, scored_blocks - base);
+    for (unsigned i = 0; i < last; ++i) {
+        const auto* key = pooled_keys + static_cast<std::uint64_t>(base + i) * Dim + lane;
+        const float k0 = key[0], k1 = key[32], k2 = key[64], k3 = key[96];
+#pragma unroll
+        for (unsigned rr = 0; rr < RowsPerWave; ++rr) {
+            float partial[Heads];
+#pragma unroll
+            for (unsigned h = 0; h < Heads; ++h) {
+                const float p0 = q[rr][h][0] * k0, p1 = q[rr][h][1] * k1, p2 = q[rr][h][2] * k2, p3 = q[rr][h][3] * k3;
+                partial[h] = (p0 + p2) + (p1 + p3);
+            }
+            qsa_scatter<Heads, 0U>(partial, lane);
+            // Lane 8h holds head h's sum.
+            float total = 0.0F;
+#pragma unroll
+            for (unsigned h = 0; h < Heads; ++h) total += fmaxf(__shfl(partial[0], static_cast<int>(8U * h), 32), 0.0F);
+            if (lane == i) result[rr] = total / sqrtf(static_cast<float>(head_dim));
+        }
+    }
+#pragma unroll
+    for (unsigned rr = 0; rr < RowsPerWave; ++rr)
+        if (lane < last && base + lane < blocks[rr]) views.block_scores[r0 + rr][base + lane] = result[rr];
 }
 
 // Journal: per absolute layer, (ratio-1) partial-block tail cells then 8 row keys.
@@ -4020,13 +4242,20 @@ void dispatch_small_kind(std::uint32_t type, Launch&& launch) {
     }
 }
 
+// Pooled block keys of one prefill call (block_pool_kernel): blocks [0, valid) are formed from the
+// raw keys this call's groups and the earlier context left; keys has room for capacity blocks.
+struct QsaPrefillPool {
+    float* keys = nullptr;
+    std::uint32_t capacity = 0, valid = 0;
+};
+
 // parts: 1 input projections, 2 norm/store/selection/attention, 4 output projection. Rows > 8
 // (prefill groups of 8-row tiles) store every row's index key and K/V before any row selects
 // or attends; each row reads only positions at or before its own, so this equals the serial
 // tile order (see enqueue_qsa_prefill_rows).
 template <unsigned Rows>
 void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexedAttentionLauncherConfig& config,
-    unsigned parts = 7U) {
+    unsigned parts = 7U, QsaPrefillPool* pool = nullptr) {
     const auto& model = config.model;
     const auto& a = prepared.row[0];
     const auto& tensors = a.tensors;
@@ -4113,7 +4342,71 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         scored_blocks = std::max(scored_blocks, scores.blocks[r]);
         select.block_scores[r] = w.block_scores; select.selected[r] = w.selected_indices; select.visible[r] = s.visible;
     }
-    if (scored_blocks) {
+    const bool pooled = Rows > 8U && pool && pool->keys && scored_blocks <= pool->capacity && a.index_dim == 128U && index_heads == 4U;
+    if (scored_blocks && pooled) {
+        if constexpr (Rows > 8U) {
+            if (scored_blocks > pool->valid) {
+                dispatch_small_kind(tensors.index_k_norm.manifest->ggml_type, [&](auto kind) {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<decltype(kind)::value>), dim3(scored_blocks - pool->valid),
+                        dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream,
+                        reinterpret_cast<const std::uint16_t*>(a.raw_state.address), pool->valid, a.index_dim, s0.ratio,
+                        reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address), model.rms_norm_epsilon, rotary,
+                        model.rope_theta, pool->keys);
+                });
+                check_hip(hipGetLastError(), "QSA prefill block-pool launch");
+                pool->valid = scored_blocks;
+            }
+            // STRIX_QSA_POOLED_ROWS=1|2|4|8: rows per scoring wave (default 4).
+            static const unsigned rows_per_wave = [] {
+                const char* v = std::getenv("STRIX_QSA_POOLED_ROWS");
+                const int n = v ? std::atoi(v) : 4;
+                return n == 1 || n == 2 || n == 8 ? static_cast<unsigned>(n) : 4U;
+            }();
+            const auto score = [&]<unsigned R>() {
+                const auto waves = static_cast<std::uint64_t>(Rows / R) * ((scored_blocks + 31U) / 32U);
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<Rows, R>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)),
+                    dim3(kThreads), 0, stream, scores, static_cast<const float*>(pool->keys), scored_blocks, a.index_dim);
+            };
+            if (rows_per_wave == 1U) score.template operator()<1U>();
+            else if (rows_per_wave == 2U) score.template operator()<2U>();
+            else if (rows_per_wave == 8U) score.template operator()<8U>();
+            else score.template operator()<4U>();
+            check_hip(hipGetLastError(), "QSA prefill pooled block-score launch");
+            // STRIX_QSA_POOLED_CHECK=1: compare every row's block scores with block_score_rows_kernel's.
+            static const bool check = [] { const char* v = std::getenv("STRIX_QSA_POOLED_CHECK"); return v && v[0] == '1'; }();
+            if (check) {
+                const auto copy = [&] {
+                    check_hip(hipStreamSynchronize(stream), "QSA pooled check sync");
+                    std::vector<float> all;
+                    for (unsigned r = 0; r < Rows; ++r) {
+                        const auto at = all.size();
+                        all.resize(at + scores.blocks[r]);
+                        if (scores.blocks[r]) check_hip(hipMemcpy(all.data() + at, scores.block_scores[r], scores.blocks[r] * sizeof(float),
+                            hipMemcpyDeviceToHost), "QSA pooled check copy");
+                    }
+                    return all;
+                };
+                const auto fast = copy();
+                dispatch_small_kind(tensors.index_k_norm.manifest->ggml_type, [&](auto kind) {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_rows_kernel<decltype(kind)::value, Rows>), dim3(scored_blocks, Rows / 8U),
+                        dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream, scores,
+                        reinterpret_cast<const std::uint16_t*>(a.raw_state.address), index_heads, a.index_dim, s0.ratio,
+                        reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address), model.rms_norm_epsilon, rotary, model.rope_theta);
+                });
+                const auto reference = copy();
+                std::size_t differing = 0;
+                for (std::size_t i = 0; i < fast.size(); ++i) differing += std::memcmp(&fast[i], &reference[i], sizeof(float)) != 0;
+                static std::atomic<std::uint64_t> groups{0}, compared{0}, total_differing{0};
+                const auto g = groups.fetch_add(1U) + 1U;
+                const auto c = compared.fetch_add(fast.size()) + fast.size();
+                const auto d = total_differing.fetch_add(differing) + differing;
+                if (differing || g % 64U == 0U)
+                    std::fprintf(stderr, "QSA pooled check: group at position %llu, %zu scores, %zu differ (total %llu groups, %llu scores, %llu differ)\n",
+                        static_cast<unsigned long long>(prepared.position[0]), fast.size(), differing, static_cast<unsigned long long>(g),
+                        static_cast<unsigned long long>(c), static_cast<unsigned long long>(d));
+            }
+        }
+    } else if (scored_blocks) {
         dispatch_small_kind(tensors.index_k_norm.manifest->ggml_type, [&](auto kind) {
             hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_rows_kernel<decltype(kind)::value, Rows>),
                 dim3(scored_blocks, Rows <= 8U ? 1U : Rows / 8U), dim3(a.index_dim),
@@ -4163,10 +4456,14 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         if constexpr (Rows > 8U) {
             static_cast<void>(prepare_indexed_attention_score_grid(a.attention_heads, maximum_count));
             static const bool scatter = [] { const char* v = std::getenv("STRIX_QSA_PREFILL_SCATTER"); return !v || v[0] != '0'; }();
+            // STRIX_QSA_SCORE_PREFETCH=0 keeps the generic kernel for head_dim 256.
+            static const bool prefetch = [] { const char* v = std::getenv("STRIX_QSA_SCORE_PREFETCH"); return !v || v[0] != '0'; }();
             const auto score = [&]<unsigned G, unsigned S>() {
                 const auto waves = static_cast<std::uint64_t>(Rows) * (a.attention_heads / G) * ((maximum_count + S - 1U) / S);
                 const auto blocks = dim3(static_cast<std::uint32_t>((waves + 7U) / 8U));
-                if (scatter) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_group_kernel<Rows, G, S, true>), blocks, dim3(kThreads),
+                if (scatter && prefetch && a.head_dim == 256U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_group256_kernel<Rows, G, S>),
+                    blocks, dim3(kThreads), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim, maximum_count);
+                else if (scatter) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_group_kernel<Rows, G, S, true>), blocks, dim3(kThreads),
                     0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim, maximum_count);
                 else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_group_kernel<Rows, G, S, false>), blocks, dim3(kThreads),
                     0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim, maximum_count);
@@ -4218,8 +4515,13 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     }
     if (grouped) {
         if constexpr (Rows > 8U) {
+            // STRIX_QSA_OUTPUT_PREFETCH=0 keeps the 4-slot kernel without value prefetch.
+            static const bool output_prefetch = [] { const char* v = std::getenv("STRIX_QSA_OUTPUT_PREFETCH"); return !v || v[0] != '0'; }();
             const auto output = [&]<unsigned G>() {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_group_kernel<Rows, G>), dim3(a.attention_heads / G, Rows),
+                if (output_prefetch) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_group_prefetch_kernel<Rows, G>),
+                    dim3(a.attention_heads / G, Rows), dim3(a.head_dim), 0, stream, attention, kv, maximum_selected, a.attention_heads,
+                    a.kv_heads, a.head_dim);
+                else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_group_kernel<Rows, G>), dim3(a.attention_heads / G, Rows),
                     dim3(a.head_dim), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim);
             };
             switch (out_group) {
@@ -4415,7 +4717,7 @@ std::vector<QsaKnownRows<8U>> prepare_qsa_prefill_rows(std::span<const Execution
 }
 template <unsigned W>
 void enqueue_qsa_prefill_projection(const std::vector<QsaKnownRows<8U>>& tiles, std::size_t first,
-    const HipIndexedAttentionLauncherConfig& config, unsigned part) {
+    const HipIndexedAttentionLauncherConfig& config, unsigned part, QsaPrefillPool* pool = nullptr) {
     auto combined = std::make_unique<QsaKnownRows<W>>();
     combined->prefetch = tiles[first].prefetch; combined->journal = tiles[first].journal;
     for (unsigned r = 0; r < W; ++r) {
@@ -4423,7 +4725,7 @@ void enqueue_qsa_prefill_projection(const std::vector<QsaKnownRows<8U>>& tiles, 
         combined->row[r] = tile.row[r % 8U]; combined->selection[r] = tile.selection[r % 8U];
         combined->position[r] = tile.position[r % 8U];
     }
-    enqueue_qsa_known_rows<W>(*combined, config, part);
+    enqueue_qsa_known_rows<W>(*combined, config, part, pool);
 }
 // Attention outputs of every prefill row (self-check).
 std::vector<std::uint8_t> qsa_prefill_attention_outputs(const std::vector<QsaKnownRows<8U>>& tiles) {
@@ -4456,12 +4758,39 @@ void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const 
         if (const char* v = std::getenv("STRIX_QSA_PREFILL_TILES"); v && v[0] == '1') return 1U;
         return 0U;
     }();
+    // Pooled block keys (STRIX_QSA_PREFILL_POOLED=0 keeps block_score_rows_kernel): one device
+    // buffer for the context's blocks, reused by every layer's call on the execution stream.
+    static const bool pooled = [] { const char* v = std::getenv("STRIX_QSA_PREFILL_POOLED"); return !v || v[0] != '0'; }();
+    static std::mutex pool_mutex;
+    static QsaPrefillPool pool_storage;
+    std::unique_lock<std::mutex> pool_lock(pool_mutex, std::defer_lock);
+    QsaPrefillPool* pool = nullptr;
+    if (pooled) {
+        pool_lock.lock();
+        const auto& a = tiles[0].row[0];
+        const auto ratio = tiles[0].selection[0].ratio;
+        const auto tokens = a.index_dim ? a.raw_state.bytes / (static_cast<std::uint64_t>(a.index_dim) * sizeof(std::uint16_t)) : 0U;
+        const auto blocks = static_cast<std::uint32_t>(std::min<std::uint64_t>(ratio ? tokens / ratio : 0U, UINT32_MAX));
+        if (blocks > pool_storage.capacity && a.index_dim == 128U) {
+            if (pool_storage.keys) {
+                check_hip(hipStreamSynchronize(hip_execution_stream()), "QSA prefill block-pool resize sync");
+                check_hip(hipFree(pool_storage.keys), "QSA prefill block-pool free");
+                pool_storage = {};
+            }
+            void* keys = nullptr;
+            check_hip(hipMalloc(&keys, static_cast<std::uint64_t>(blocks) * a.index_dim * sizeof(float)), "QSA prefill block-pool allocation");
+            pool_storage.keys = static_cast<float*>(keys);
+            pool_storage.capacity = blocks;
+        }
+        pool_storage.valid = 0;
+        pool = &pool_storage;
+    }
     const auto projections = [&](unsigned part) {
         for (std::size_t t = 0; t < tiles.size();) {
             const auto left = tiles.size() - t;
-            if (left >= 8U) { enqueue_qsa_prefill_projection<64U>(tiles, t, config, part); t += 8U; }
-            else if (left >= 4U) { enqueue_qsa_prefill_projection<32U>(tiles, t, config, part); t += 4U; }
-            else if (left >= 2U) { enqueue_qsa_prefill_projection<16U>(tiles, t, config, part); t += 2U; }
+            if (left >= 8U) { enqueue_qsa_prefill_projection<64U>(tiles, t, config, part, part == 2U ? pool : nullptr); t += 8U; }
+            else if (left >= 4U) { enqueue_qsa_prefill_projection<32U>(tiles, t, config, part, part == 2U ? pool : nullptr); t += 4U; }
+            else if (left >= 2U) { enqueue_qsa_prefill_projection<16U>(tiles, t, config, part, part == 2U ? pool : nullptr); t += 2U; }
             else { enqueue_qsa_known_rows<8U>(tiles[t], config, part); t += 1U; }
         }
     };
