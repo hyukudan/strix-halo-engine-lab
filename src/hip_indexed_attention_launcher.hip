@@ -2828,6 +2828,67 @@ PreparedIndexedLaunch prepare_indexed_attention_launch(
             q_gate_width, index_q_width, index_dim};
 }
 
+// A prefill row of the same step as `head_context`, admitted by prepare_indexed_attention_launch:
+// the configuration, the step's tensors, the layer's KV/indexer state slices and the session
+// layout are those of the head row (checked by context identity below), so they are copied;
+// only the row's own views (input, output, temporary and its workspace) are resolved, and
+// every check that reads them, or the row's position, is repeated as the full admission does.
+PreparedIndexedLaunch prepare_indexed_attention_launch_like(const PreparedIndexedLaunch& head,
+    const ExecutionDispatchContext& head_context, const ExecutionDispatchContext& context,
+    const HipIndexedAttentionLauncherConfig& config) {
+    const auto& a = head_context;
+    if (context.op != SerialOp::indexed_attention || context.op != a.op || context.step_id != a.step_id ||
+        context.layer != a.layer || !context.layer || context.execution_identity != a.execution_identity ||
+        context.kernel_id != a.kernel_id || context.resources != a.resources || context.arena == nullptr ||
+        context.session_state_layout != a.session_state_layout || context.session_state_memory != a.session_state_memory ||
+        context.memory != a.memory || context.prepared_tensor_views != a.prepared_tensor_views ||
+        context.prepared_arena_views != a.prepared_arena_views || context.logical_rows != 1U || context.request_concurrency != 1U ||
+        context.reads.size() != 1U || context.writes.size() != 1U || context.temporaries.size() != 1U ||
+        context.reads[0] != a.reads[0] || context.writes[0] != a.writes[0] || context.temporaries[0] != a.temporaries[0] ||
+        context.reads_state != a.reads_state || context.writes_state != a.writes_state || head.device_graph ||
+        config.qsa_hierarchical_selection || config.qsa_gqa_heads_per_block != 1)
+        throw std::invalid_argument("QSA prefill row differs from its head row");
+    PreparedIndexedLaunch p = head;
+    p.input = resolve_dispatch_read(context, 0);
+    p.output = resolve_dispatch_write(context, 0);
+    p.temporary = resolve_dispatch_temporary(context, 0);
+    if (p.temporary.bytes < p.workspace_layout.total_bytes)
+        throw std::invalid_argument("indexed-attention temporary is undersized");
+    p.workspace = workspace_pointers(p.temporary, p.workspace_layout);
+    if (context.position >= p.session_layout->context_tokens)
+        throw std::out_of_range("indexed-attention position exceeds session capacity");
+    const auto input_required = static_cast<std::uint64_t>(p.hidden) * config.model.bytes_bf16;
+    if (p.input.bytes < input_required || p.output.bytes < input_required)
+        throw std::invalid_argument("indexed-attention hidden buffers are undersized");
+    const auto& tensors = p.tensors;
+    if (config.wave8_q8_output)
+        q8_projection_organization::validate_fp32_bf16_views(p.attention_width, p.hidden,
+            {reinterpret_cast<std::uintptr_t>(p.workspace.attention_output),
+             static_cast<std::uint64_t>(p.attention_width) * sizeof(float)},
+            {tensors.out.runtime->address, tensors.out.runtime->bytes},
+            {p.output.address, p.output.bytes});
+    if (config.prefetch_q8_input) {
+        if (p.input.address % 2U != 0 || p.output.address % 2U != 0 || p.temporary.address % 4U != 0)
+            throw std::invalid_argument("QSA prefetch owner alignment invalid");
+        struct Range { std::uintptr_t address; std::uint64_t bytes; };
+        std::array<Range, 11> reads{}; reads[0] = {p.input.address, p.input.bytes}; unsigned read_index = 1;
+        for (const auto* tensor : {&tensors.q, &tensors.k, &tensors.v, &tensors.out, &tensors.q_norm, &tensors.k_norm,
+            &tensors.index_q, &tensors.index_k, &tensors.index_q_norm, &tensors.index_k_norm})
+            reads[read_index++] = {tensor->runtime->address, tensor->runtime->bytes};
+        const std::array<Range, 4> writes{{{p.temporary.address, p.temporary.bytes}, {p.output.address, p.output.bytes},
+            {p.kv_state.address, p.kv_state.bytes}, {p.raw_state.address, p.raw_state.bytes}}};
+        const auto valid = [](Range view) { return view.address != 0 && view.bytes != 0 && view.bytes <= UINTPTR_MAX - view.address; };
+        const auto overlap = [](Range x, Range y) { return x.address < y.address + y.bytes && y.address < x.address + x.bytes; };
+        for (const auto view : reads) if (!valid(view)) throw std::invalid_argument("QSA prefetch invalid read owner");
+        for (unsigned i = 0; i < writes.size(); ++i) {
+            if (!valid(writes[i])) throw std::invalid_argument("QSA prefetch invalid writable owner");
+            for (const auto view : reads) if (overlap(writes[i], view)) throw std::invalid_argument("QSA prefetch writable/read owner overlap");
+            for (unsigned j = 0; j < i; ++j) if (overlap(writes[i], writes[j])) throw std::invalid_argument("QSA prefetch writable owner overlap");
+        }
+    }
+    return p;
+}
+
 PreparedIndexedSelection prepare_indexed_attention_selection(const ExecutionDispatchContext& context,
     const PreparedIndexedLaunch& prepared, const ModelContract& model) {
     const auto& session_layout = *prepared.session_layout;
@@ -3759,9 +3820,13 @@ template <unsigned Rows> struct QsaKnownRows {
     std::uint16_t* journal = nullptr;
 };
 
+// head: a prefill row of the same step already admitted in full (its context and launch);
+// the rows here then share its admission (prepare_indexed_attention_launch_like). share alone:
+// rows after the first share the first row's admission (prefill tile 0).
+struct QsaHeadRow { const ExecutionDispatchContext* context = nullptr; const PreparedIndexedLaunch* launch = nullptr; bool share = false; };
 template <unsigned Rows>
 QsaKnownRows<Rows> prepare_qsa_known_rows(std::span<const ExecutionDispatchContext> rows,
-    const HipIndexedAttentionLauncherConfig& config, HipQsaIndexJournal journal) {
+    const HipIndexedAttentionLauncherConfig& config, HipQsaIndexJournal journal, QsaHeadRow head = {}) {
     static_assert(Rows == 2U || Rows == 4U || Rows == 8U);
     if (rows.size() != Rows) throw std::invalid_argument("QSA known-window row count differs");
     if (config.enable_device_graph_inputs || config.qsa_hierarchical_selection || config.qsa_gqa_heads_per_block != 1)
@@ -3784,7 +3849,9 @@ QsaKnownRows<Rows> prepare_qsa_known_rows(std::span<const ExecutionDispatchConte
         const auto& context = rows[r];
         if (context.kernel_id && *context.kernel_id != expected_id)
             throw std::invalid_argument("QSA known-window configuration differs from the row's serial kernel");
-        result.row[r] = prepare_indexed_attention_launch(context, &config);
+        if (head.context) result.row[r] = prepare_indexed_attention_launch_like(*head.launch, *head.context, context, config);
+        else if (r && head.share) result.row[r] = prepare_indexed_attention_launch_like(result.row[0], rows[0], context, config);
+        else result.row[r] = prepare_indexed_attention_launch(context, &config);
         const auto& p = result.row[r];
         const auto& a = result.row[0];
         if (p.device_graph) throw std::invalid_argument("QSA known-window rows are eager only");
@@ -4322,8 +4389,11 @@ std::vector<QsaKnownRows<8U>> prepare_qsa_prefill_rows(std::span<const Execution
     if (rows.size() < 16U || rows.size() % 8U) throw std::invalid_argument("QSA prefill rows require 8-row tiles");
     std::vector<QsaKnownRows<8U>> tiles;
     tiles.reserve(rows.size() / 8U);
+    // STRIX_QSA_PREFILL_SHARED_ADMISSION=0: every row runs the full serial admission.
+    static const bool shared = [] { const char* v = std::getenv("STRIX_QSA_PREFILL_SHARED_ADMISSION"); return !v || v[0] != '0'; }();
     for (std::size_t t = 0; t < rows.size() / 8U; ++t) {
-        tiles.push_back(prepare_qsa_known_rows<8U>(rows.subspan(t * 8U, 8U), config, journal));
+        const QsaHeadRow head = !shared ? QsaHeadRow{} : t ? QsaHeadRow{&rows[0], &tiles.front().row[0], true} : QsaHeadRow{nullptr, nullptr, true};
+        tiles.push_back(prepare_qsa_known_rows<8U>(rows.subspan(t * 8U, 8U), config, journal, head));
         if (tiles.back().prefetch != tiles.front().prefetch || tiles.back().journal != tiles.front().journal)
             throw std::invalid_argument("QSA prefill tiles select different organizations");
     }

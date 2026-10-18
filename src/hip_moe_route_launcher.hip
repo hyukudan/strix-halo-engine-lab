@@ -1133,6 +1133,63 @@ __global__ void __launch_bounds__(256) lanes_rows_moe_route_logits_kernel(Args r
     }
     route_tiled(rows.workspace[row], rows.tile_workspace, rows)[expert] = sum;
 }
+// Prefill tiles: lanes_rows_moe_route_logits_kernel's lane (expert, row) chains for Tiles 8-row tiles
+// at once (blockIdx.y covers Tiles tiles). Each coefficient chunk is loaded once and used by the
+// lane's Tiles chains, each chain the same fused ascending FMA sequence over its own row.
+template <typename Activation, std::uint32_t Tiles, std::uint32_t Chunk>
+__global__ void __launch_bounds__(256) lanes_tiles_moe_route_logits_kernel(RouterTileRowsArgs rows,
+    const float* __restrict__ weights, std::uint32_t hidden_size, std::uint32_t expert_count, std::uint32_t tiles) {
+    constexpr std::uint32_t Rows = 8U, per_vector = 16U / sizeof(Activation), experts_per_wave = 32U / Rows;
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x % 32U);
+    const auto wave = static_cast<std::uint32_t>(blockIdx.x) * 8U + static_cast<std::uint32_t>(threadIdx.x / 32U);
+    const auto expert = wave * experts_per_wave + lane / Rows;
+    const auto row = lane % Rows;
+    if (expert >= expert_count) return;
+    const auto first_tile = static_cast<std::uint32_t>(blockIdx.y) * Tiles;
+    const auto* __restrict__ coefficients = reinterpret_cast<const float4*>(weights + static_cast<std::uint64_t>(expert) * hidden_size);
+    const Activation* hidden[Tiles];
+    float sum[Tiles];
+#pragma unroll
+    for (std::uint32_t t = 0; t < Tiles; ++t) {
+        const auto tile = first_tile + t < tiles ? first_tile + t : first_tile;
+        hidden[t] = reinterpret_cast<const Activation*>(reinterpret_cast<std::uintptr_t>(rows.hidden[row]) +
+            static_cast<std::uint64_t>(tile) * rows.tile_hidden);
+        sum[t] = 0.0F;
+    }
+    for (std::uint32_t feature = 0; feature < hidden_size; feature += Chunk) {
+        float4 coefficient[Chunk / 4U];
+#pragma unroll
+        for (std::uint32_t q = 0; q < Chunk / 4U; ++q) coefficient[q] = coefficients[(feature >> 2U) + q];
+#pragma unroll
+        for (std::uint32_t t = 0; t < Tiles; ++t) {
+            float input[Chunk];
+#pragma unroll
+            for (std::uint32_t v = 0; v < Chunk / per_vector; ++v) {
+                const auto packed = *reinterpret_cast<const uint4*>(hidden[t] + feature + v * per_vector);
+                const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+#pragma unroll
+                for (std::uint32_t k = 0; k < per_vector; ++k) {
+                    if constexpr (sizeof(Activation) == 2U)
+                        input[v * per_vector + k] = bf16_to_float(static_cast<std::uint16_t>(k % 2U ? words[k / 2U] >> 16U : words[k / 2U] & 0xffffU));
+                    else input[v * per_vector + k] = __uint_as_float(words[k]);
+                }
+            }
+#pragma unroll
+            for (std::uint32_t q = 0; q < Chunk / 4U; ++q) {
+                const auto c = coefficient[q];
+                sum[t] = __builtin_fmaf(input[4U * q + 0U], c.x, sum[t]);
+                sum[t] = __builtin_fmaf(input[4U * q + 1U], c.y, sum[t]);
+                sum[t] = __builtin_fmaf(input[4U * q + 2U], c.z, sum[t]);
+                sum[t] = __builtin_fmaf(input[4U * q + 3U], c.w, sum[t]);
+            }
+        }
+    }
+#pragma unroll
+    for (std::uint32_t t = 0; t < Tiles; ++t)
+        if (first_tile + t < tiles)
+            reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(rows.workspace[row]) +
+                static_cast<std::uint64_t>(first_tile + t) * rows.tile_workspace)[expert] = sum[t];
+}
 template <typename Activation, RouterWeightKind WeightKind, std::uint32_t Rows>
 __global__ void __launch_bounds__(256) rows_moe_route_logits_kernel(RouterRowsArgs rows, const void* weights,
     std::uint32_t hidden_size, std::uint32_t expert_count) {
@@ -1813,7 +1870,32 @@ void route_prefill(std::span<const ExecutionDispatchContext> rows, const HipMoeR
     const auto stream = hip_execution_stream();
     const auto* f32 = reinterpret_cast<const float*>(first.tensor->address);
     const dim3 logits((config.expert_count * 8U + 255U) / 256U, tiles);
-    if (config.activation == HipActivationStorage::bf16)
+    // STRIX_ROUTER_PREFILL_TILES=1|2|4|8: 8-row tiles per lane sharing each coefficient load
+    // (1: the window kernel per tile). STRIX_ROUTER_PREFILL_CHUNK=32|64: coefficients in flight.
+    // Measured at T = 256: 359 us per call (one tile per lane, 128 in flight), 323 us (2 tiles, 64);
+    // 4 or 8 tiles and an LDS-staged 32 x 32 block were slower (latency, not bandwidth, bound).
+    static const unsigned tiles_per_lane = [] { const char* v = std::getenv("STRIX_ROUTER_PREFILL_TILES");
+        const unsigned n = v ? static_cast<unsigned>(std::atoi(v)) : 2U; return n == 1U || n == 4U || n == 8U ? n : 2U; }();
+    static const unsigned chunk = [] { const char* v = std::getenv("STRIX_ROUTER_PREFILL_CHUNK");
+        const unsigned n = v ? static_cast<unsigned>(std::atoi(v)) : 64U; return n == 32U ? 32U : 64U; }();
+    const bool hidden_aligned = config.hidden_size % 64U == 0U;
+    const auto tiled = [&]<typename Activation, unsigned T, unsigned C>() {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_tiles_moe_route_logits_kernel<Activation, T, C>),
+            dim3((config.expert_count * 8U + 255U) / 256U, (tiles + T - 1U) / T), dim3(256U), 0, stream, args, f32,
+            config.hidden_size, config.expert_count, tiles);
+    };
+    const auto by_tiles = [&]<typename Activation>() {
+        const auto by_chunk = [&]<unsigned T>() {
+            if (chunk == 64U) tiled.template operator()<Activation, T, 64U>(); else tiled.template operator()<Activation, T, 32U>();
+        };
+        if (tiles_per_lane == 2U) by_chunk.template operator()<2U>();
+        else if (tiles_per_lane == 8U) by_chunk.template operator()<8U>();
+        else by_chunk.template operator()<4U>();
+    };
+    if (tiles_per_lane > 1U && hidden_aligned) {
+        if (config.activation == HipActivationStorage::bf16) by_tiles.template operator()<std::uint16_t>();
+        else by_tiles.template operator()<float>();
+    } else if (config.activation == HipActivationStorage::bf16)
         hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<std::uint16_t, 8U, 128U, RouterTileRowsArgs>),
             logits, dim3(256U), 0, stream, args, f32, config.hidden_size, config.expert_count);
     else

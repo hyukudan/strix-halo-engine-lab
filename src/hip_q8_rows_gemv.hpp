@@ -1145,6 +1145,9 @@ inline unsigned wide_sub() { static const unsigned sub = env_unsigned("STRIX_Q8_
 inline unsigned wide_kernel() { static const unsigned kernel = env_unsigned("STRIX_Q8_ROWS_WIDE_KERNEL", 2U); return kernel; }
 inline bool wide_stage() { static const bool stage = env_unsigned("STRIX_Q8_ROWS_WIDE_STAGE", 0U) == 1U; return stage; }
 inline unsigned narrow_vopd() { static const unsigned vopd = env_unsigned("STRIX_Q8_ROWS_VOPD", 1U); return vopd; }
+// STRIX_Q8_ROWS_WIDE_FP32_MIN: narrowest FP32 input the wide (T >= 16) VOPD coefficient kernel takes.
+// 512 includes the shared down projection (640 wide): 130 -> 100 us per T=64 call after reduce_wide.
+inline unsigned wide_fp32_min_width() { static const unsigned w = env_unsigned("STRIX_Q8_ROWS_WIDE_FP32_MIN", 512U); return w; }
 inline unsigned narrow_fp32_min_width() { static const unsigned w = env_unsigned("STRIX_Q8_ROWS_VOPD_FP32_MIN", 1024U); return w; }
 // Rows <= 8 whose quantized activations and chain slots fit one block's LDS quantize them in
 // the projection kernel (no quantizer launch; measured faster in 8-row MTP windows even at one
@@ -1268,15 +1271,15 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
         }
     }
     if constexpr (Site::rows > 8U) {
-        // Default: the VOPD kernels (4 outputs x 4 rows per wave, 4-wave blocks). FP32 inputs
-        // narrower than 4 chunks (shared down, 640) keep the per-wave kernel, which is faster there.
+        // Default: the VOPD kernels (4 outputs x 4 rows per wave, 4-wave blocks), FP32 inputs from
+        // wide_fp32_min_width() up; narrower ones keep the per-wave kernel.
         if constexpr (fused_fma_of<Site>() && Site::rows % 16U == 0U) {
             if (wide_kernel() == 2U && !wide_stage()) {
                 if constexpr (sizeof(typename Site::Input) == 2U) {
                     constexpr auto kernel = project_wide_rows_vopd_bf16_kernel<Site>;
                     start(kernel, (site.outputs + 3U) / 4U * (Site::rows / 16U), 128U, 0U);
                     return;
-                } else if (site.width >= 1024U) {
+                } else if (site.width >= wide_fp32_min_width()) {
                     constexpr auto kernel = project_wide_rows_coef_kernel<Site, 4U, 4U, 4U, true>;
                     start(kernel, (site.outputs + 3U) / 4U * (Site::rows / 16U), 128U, 0U);
                     return;

@@ -2643,7 +2643,7 @@ struct KnownMoePrefillPrepared {
 };
 KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispatchContext> rows,
     const HipMoeExpertsLauncherConfig& config, const q51_known_rows::Workspace& window,
-    const q51_known_rows::Workspace& prefill) {
+    const q51_known_rows::Workspace& prefill, bool shared_admission = true) {
     const auto count = static_cast<std::uint32_t>(rows.size());
     if (count < 16U || count % 8U || count > q51_known_rows::prefill_max_rows)
         throw std::invalid_argument("known prefill routed rows require T in [16, 2048], a multiple of 8");
@@ -2655,7 +2655,52 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
     std::vector<std::array<std::uintptr_t, view_count>> address(count);
     std::array<std::uint64_t, view_count> extent{};
     KnownMoePrefillPrepared out;
+    // Interior chunks share the window admission of the first chunk (STRIX_PREFILL_MOE_SHARED_ADMISSION=0
+    // admits every chunk): each row is checked to be the same step, source and serial IO as row 0,
+    // its five arena views are resolved and checked like the admission does, and its derived views
+    // (codes, deltas, sums, status, intermediates, accumulation, A8 down image, raw dots) are row 0's
+    // offsets inside its own temporary. The first and last chunks keep the full admission, every view
+    // is then checked row-striped below, and the striped writes are checked against the striped reads.
+    static const bool shared_env = [] { const char* v = std::getenv("STRIX_PREFILL_MOE_SHARED_ADMISSION"); return !v || v[0] != '0'; }();
+    const bool shared = shared_admission && shared_env;
+    enum Derived : unsigned { d_codes, d_deltas, d_sums, d_status, d_intermediates, d_accumulation,
+        d_down_codes, d_down_deltas, d_down_sums, d_rawdots, derived_count };
+    std::array<std::uint64_t, derived_count> derived_offset{};
+    const auto& memory0 = *rows.front().resources->scratch;
+    const auto own_views = [&](std::uint32_t r) {
+        const auto& row = rows[r]; const auto& first = rows.front();
+        if (!row.resources || row.resources != first.resources ||
+            (row.memory && row.memory != row.resources->scratch) || row.prepared_tensor_views || row.prepared_arena_views ||
+            row.session_state_layout != first.session_state_layout || row.session_state_memory != first.session_state_memory ||
+            row.execution_identity != first.execution_identity || row.step_id != first.step_id || row.op != SerialOp::moe_experts ||
+            row.layer != first.layer || row.kernel_id != first.kernel_id || row.logical_rows != 1U || row.request_concurrency != 1U ||
+            row.reads_state != first.reads_state || row.writes_state != first.writes_state ||
+            row.position != first.position + r || row.reads.size() != 3U || row.writes.size() != 1U || row.temporaries.size() != 1U ||
+            !std::equal(row.reads.begin(), row.reads.end(), first.reads.begin()) ||
+            row.writes[0] != first.writes[0] || row.temporaries[0] != first.temporaries[0] || !row.arena)
+            throw std::invalid_argument("known prefill routed rows source/position/owner differs");
+        validate_execution_memory_binding(row.execution_identity, *row.arena, memory0);
+        const std::array base{resolve_dispatch_read(row, 0), resolve_dispatch_read(row, 1), resolve_dispatch_read(row, 2),
+            resolve_dispatch_write(row, 0), resolve_dispatch_temporary(row, 0)};
+        const std::array index{input, routes, route_weights, output, temporary};
+        for (unsigned v = 0; v < base.size(); ++v) {
+            const auto& current = base[v]; known_moe_range({current.address, current.bytes});
+            if (current.address < memory0.arena_base || current.address - memory0.arena_base > memory0.arena_bytes ||
+                current.bytes > memory0.arena_bytes - (current.address - memory0.arena_base) ||
+                current.allocation_generation != memory0.allocation_generation || current.bytes != extent[index[v]])
+                throw std::invalid_argument("known prefill routed row view exceeds retained physical allocation");
+            address[r][index[v]] = current.address;
+        }
+        const std::array derived{codes, deltas, sums, status, intermediates, accumulation, down_codes, down_deltas, down_sums, rawdots};
+        for (unsigned d = 0; d < derived_count; ++d) address[r][derived[d]] = base[4].address + derived_offset[d];
+    };
     for (std::uint32_t chunk = 0; chunk < count; chunk += 8U) {
+        if (shared && chunk && chunk + 8U < count) {
+            if (rows[chunk].position != rows[chunk - 1U].position + 1U)
+                throw std::invalid_argument("known prefill routed rows positions are not consecutive");
+            for (std::uint32_t i = 0; i < 8U; ++i) own_views(chunk + i);
+            continue;
+        }
         // Window admission of each 8-row chunk (positions consecutive inside the chunk).
         const auto p = prepare_known_moe_rows(rows.subspan(chunk, 8U), config, window, true);
         if (chunk && rows[chunk].position != rows[chunk - 1U].position + 1U)
@@ -2680,6 +2725,15 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
             }
         }
         if (!chunk) {
+            // Row 0's derived views as offsets inside its own temporary (the layout is per step).
+            const std::array derived{codes, deltas, sums, status, intermediates, accumulation, down_codes, down_deltas, down_sums, rawdots};
+            const auto temp = address[0][temporary];
+            for (unsigned d = 0; d < derived_count; ++d) {
+                const auto at = address[0][derived[d]];
+                if (at < temp || at - temp > extent[temporary] || extent[derived[d]] > extent[temporary] - (at - temp))
+                    throw std::invalid_argument("known prefill routed row derived view lies outside its temporary");
+                derived_offset[d] = at - temp;
+            }
             const auto& q = *p.rows[0].quantized;
             out.request = q.request;
             out.clear_words = static_cast<std::uint32_t>(q.layout.accumulation_bytes / 4U);
@@ -2702,6 +2756,17 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
         for (std::uint32_t r = 0; r < count; ++r)
             if (address[r][v] != address[0][v] + static_cast<std::uint64_t>(r) * stride[v])
                 throw std::invalid_argument("known prefill routed rows view stride differs");
+    }
+    if (shared && count > 16U) {
+        // Shared rows skipped the per-chunk cross-view checks: the striped writes (output, temporary)
+        // must not meet each other or any striped read (input, routes, route weights); interleaved
+        // stripes fall back to the per-chunk admission.
+        const auto range = [&](View v) { return KnownMoeRange{address[0][v], (count - 1U) * stride[v] + extent[v]}; };
+        const std::array<KnownMoeRange, 2> written{range(output), range(temporary)};
+        bool apart = !known_moe_overlap(written[0], written[1]);
+        for (const auto& w : written)
+            for (const auto read : {range(input), range(routes), range(route_weights)}) apart = apart && !known_moe_overlap(w, read);
+        if (!apart) return prepare_known_moe_prefill(rows, config, window, prefill, false);
     }
     const auto layout = q51_known_rows::scratch_layout(count, config.expert_count, config.top_k, true);
     const auto& first = rows.front();
