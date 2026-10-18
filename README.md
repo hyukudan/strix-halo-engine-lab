@@ -101,8 +101,12 @@ A speculative run has four groups of options.
 strix-hip-decode-token MODEL.gguf TOKEN_ID TOKEN_ID ... \
   --context 8192 --execution-mode eager --residency register --generate 256 \
   --optimization-profile auto \
-  --numerical-profile hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1
+  --numerical-profile hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1
 ```
+
+The recommended profile adds dense A8: the dense Q8_0 projections (GDN, QSA, shared expert) also take int8
+activations per group of 32. It is faster in prefill and decode at a small quality cost (D-032). To keep the dense
+projections in FP32, use `hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1`.
 
 **2. Kernel organization required by the windows** (A8 MoE, wave8 Q8 GDN, deferred MoE status, HC chain)
 

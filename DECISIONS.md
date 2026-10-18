@@ -257,6 +257,26 @@ Each of these kept the per-row arithmetic and was measured on the complete workl
   score × value chain (+0.6 tok/s).
 - GDN rows sites with fused FMA via `__builtin_fmaf` (same single rounding; neutral, kept).
 
+## D-032: dense A8 in the recommended profile
+
+Recommend `hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1`: the profile of D-024 plus int8 activations per
+group of 32 for every dense Q8_0 projection (`dot4` in decode, iu8 WMMA in prefill, bit-identical between the two).
+The FP32-dense profile stays available.
+
+Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL):
+
+| | FP32 dense | dense A8 |
+| --- | --- | --- |
+| Prefill, 1032-token prompt (one block) | 410.5 tok/s | 707.7 tok/s |
+| Decode, MTP windows 2/4/8, 256 tokens (3 interleaved rounds, replay error 0) | 51.9 tok/s | 53.9 tok/s |
+| Top-1 agreement with a Q8_0 reference (49,001 positions) | 95.52 % | 95.55 % |
+| KL to the Q8_0 reference | 0.01940 | 0.01978 (+1.9 ± 2.0 %) |
+
+Why: the quality cost is within the difference between two exact implementations of the same weights, and far
+below quantizing activations to Q8_1 (+30 % KL). The two profiles pick different tokens at 2.8 % of positions,
+almost all near-ties (median reference top-2 margin 0.22 nats, against 3.10 overall). The one per-category signal
+is Spanish prose top-1 (−0.55 ± 0.23 pt) with unchanged KL.
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |
