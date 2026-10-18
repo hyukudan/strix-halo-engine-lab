@@ -73,6 +73,10 @@ a single-profile run from the start.
 
 ## Fast prefill profile (draft)
 
+Quality at long context (D-036): against the exact FP32-dense profile, the default components are closer than
+dense A8 at 16K and 32K. KL is 15-21 % lower than dense A8 on wiki and code documents, in every position bin.
+Long-document retrieval at 8K/16K/32K is unchanged: 116/120 correct, the same as FP32 dense and dense A8.
+
 `fast-prefill-f16wmma-v1` is a prefill-only profile (rejected as `--numerical-profile`). It is admitted
 only with the decode profile `hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1`, on the same two
 routes and with the same rejections as the pairs above. Its prefill execution is compiled from the decode

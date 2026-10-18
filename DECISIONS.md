@@ -268,7 +268,6 @@ Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL):
 | | FP32 dense | dense A8 |
 | --- | --- | --- |
 | Prefill, 1032-token prompt (one block) | 410.5 tok/s | 707.7 tok/s |
-| Decode, MTP windows 2/4/8, 256 tokens (3 interleaved rounds, replay error 0) | 51.9 tok/s | 53.9 tok/s |
 | Top-1 agreement with a Q8_0 reference (49,001 positions) | 95.52 % | 95.55 % |
 | KL to the Q8_0 reference | 0.01940 | 0.01978 (+1.9 ± 2.0 %) |
 
@@ -276,6 +275,21 @@ Why: the quality cost is within the difference between two exact implementations
 below quantizing activations to Q8_1 (+30 % KL). The two profiles pick different tokens at 2.8 % of positions,
 almost all near-ties (median reference top-2 margin 0.22 nats, against 3.10 overall). The one per-category signal
 is Spanish prose top-1 (−0.55 ± 0.23 pt) with unchanged KL.
+
+Validation (segment bootstrap over 31 segments, long context with QSA block selection active, 8 decode prompts)
+keeps dense A8 recommended, under these conditions:
+
+- No decode speed claim. Across 8 prompts, the A8/FP32 decode rate is 0.96-1.06 per prompt, about 1.01 as a
+  geometric mean. Decode is neutral.
+- The reason to choose A8 is prefill: it is 27-31 % faster on long requests.
+- The quality statement holds over all segments. The non-inferiority bound `KL_A8 - 1.05 KL_FP32` has a 95 %
+  upper bound below 0. Five categories (agent, chat-en, chat-es, math, multilingual) still have their bound
+  above 0. They have only 1-8 segments each, so these are open signals, not losses.
+- At 8K/16K/32K the long-context picture is the same for both profiles:
+  - retrieval: 116/120 correct with each profile, and no question graded differently;
+  - KL beyond 4K is no larger than at 0-2K.
+- The functional free-generation suite (tool calls, JSON, code, Spanish) must finish before this decision is
+  final. Only a partial run exists, so no functional claim rests on it.
 
 ## D-033: separate prefill numerical profile
 
@@ -404,6 +418,19 @@ Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL):
 | Fixture, gate/up + down per 2048 rows, T = 2048 (uniform / skewed routes) | 11.2 / 12.4 ms (iu8 A8 WMMA: 16.3 / 17.4 ms) |
 | Engine GPU time at 16K, T = 2048 | routed MoE 6.94 → 5.64 s; total 24.57 → 23.17 s |
 | Engine request time, T = 2048, GEN = 1, quiet node | 4K 5936 → 5588 ms (+6 %), 16K 24927 → 23671 ms (+5 %) |
+
+Long context, all default components (hc, dense, moe, qsa, router; decode dense A8 after the fast prefill),
+against the exact FP32-dense profile:
+
+| Measurement | Fast profile | Dense A8 |
+| --- | --- | --- |
+| KL, teacher-forced 16K/32K documents (wiki, code) | 15-21 % lower than dense A8, every paired 95 % CI excluding 0 | |
+| KL, 20 position bins up to 32K | lower in all 20 bins | |
+| Top-1 agreement | 0.16-0.51 pt higher than dense A8 | |
+| Retrieval, 24 haystacks of 8K/16K/32K | 116/120 correct | 116/120 correct (FP32 dense also 116/120), same questions |
+| 200 generated tokens | identical to FP32 dense in 24/24 haystacks | |
+
+None of the fast components accumulates error with context length.
 
 ## D-037: fast prefill profile, QSA attention component over row-tile unions
 
