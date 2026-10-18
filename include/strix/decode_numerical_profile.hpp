@@ -140,7 +140,7 @@ inline constexpr std::uint32_t kFastPrefillHc = 1U, kFastPrefillDense = 2U, kFas
     kFastPrefillAll = kFastPrefillHc | kFastPrefillDense | kFastPrefillMoe;
 // dense8: the dense projections as A8-G64 (int8 x int8, int32 over 64 features per scale step) instead of the FP16 form
 // of `dense`; opt-in (not part of the default set) and exclusive with `dense`.
-inline constexpr std::uint32_t kFastPrefillDense8 = 16U, kFastPrefillKnown = kFastPrefillAll | kFastPrefillDense8;
+inline constexpr std::uint32_t kFastPrefillDense8 = 32U, kFastPrefillKnown = kFastPrefillAll | kFastPrefillDense8;
 
 // Prefill/decode arithmetic pair. The prompt prefill may run a different (prefill) profile from
 // the decode/MTP windows; decode always runs `decode`. A pair is admitted when both profiles are
