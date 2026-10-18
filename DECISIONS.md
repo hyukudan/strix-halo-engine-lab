@@ -370,6 +370,7 @@ reads. Status: opt-in, exact; the throughput gain is pending the measurement cam
 | GDN fixture: cohorts of 2-4 sessions (1-8 rows each), pending rows and commits, four storage/format variants | 120 cohort scenarios bit-exact against per-session windows (348 total) |
 | QSA fixture: cohorts of 2-3 sessions at mixed positions, FP32 and dense A8, BF16 and Q8 indexer | 48 cohort windows bit-exact (outputs, workspaces, KV and raw index) |
 | Full model, dense A8, code + Spanish prompts, 256 tokens each: lockstep, without shared expert, without shared steps, sequential | Tokens identical to each prompt's own run, replay error 0 |
+| Full model, dense A8, four requests (code, Spanish, 1192-token agent, JS reasoning), lockstep with the default and a 4-row cap, sequential; agent + code pair | Tokens identical to each prompt's own run, replay error 0 |
 | Single-request route after the change | Tokens identical to the base build |
 
 ## Measured and rejected
