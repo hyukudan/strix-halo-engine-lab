@@ -152,7 +152,7 @@ int main() {
         "--known-prefix-uma-budget-bytes", "8192", "--known-prefix-host-headroom-bytes", "0"});
     expect(tiled.known_prefix_prefill_rows == 17 && tiled.known_prefix_rows == 2 && !tiled.known_prefix_rows_explicit,
         "explicit T supports odd tails without relabelling the small-row selector");
-    for (const auto rows : {0U, 15U, 2049U}) {
+    for (const auto rows : {0U, 15U, 8193U}) {
         auto bad = tiled; bad.known_prefix_prefill_rows = rows;
         rejects([&] { validate_known_prefill_options(bad); }, "prefill closes T bounds");
     }
