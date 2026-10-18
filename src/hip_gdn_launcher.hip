@@ -2474,47 +2474,57 @@ void gdn_prefill_norm_kernel(GdnPrefillRows rows, const void* norm_weights, Smal
 // Row-parallel prefill kernels (head_dim 128, conv kernel 4). Same per-row expressions and trees as the
 // kernels above; only work placement differs.
 //
-// F32 beta/alpha projections of every 8-row tile in one launch (blockIdx.y = tile), each row the legacy
-// 256-leaf chain and tree, then the prepare kernel's sigmoid / softplus transform of that row's value.
-// Input row r is input + r * input_stride.
-template <unsigned Rows>
+// F32 beta/alpha projections of every 8-row tile in one launch (blockIdx.y = tile), each (head, row) the legacy
+// 256-leaf chain and tree, then the prepare kernel's sigmoid / softplus transform of that row's value. A block
+// computes Heads outputs of one kind for its Rows rows, so each input row is read once per Heads outputs; the
+// 32-leaf shuffle stage of the (head, row) trees is spread over the block's waves. Input row r is
+// input + r * input_stride.
+template <unsigned Rows, unsigned Heads>
 __global__ __launch_bounds__(kProjectionThreads)
 void gdn_prefill_gates_kernel(const std::uint16_t* input, std::uint64_t input_stride, const float* beta_weights,
     const float* alpha_weights, GdnPrefillRows rows, const void* dt, SmallWeightKind dt_kind, const void* a,
     SmallWeightKind a_kind, std::uint32_t width, std::uint32_t heads) {
-    __shared__ float scratch[Rows][kProjectionThreads];
+    constexpr unsigned Sums = Rows * Heads;
+    __shared__ float scratch[Sums][kProjectionThreads];
     const auto lane = static_cast<std::uint32_t>(threadIdx.x), first = static_cast<std::uint32_t>(blockIdx.y) * Rows;
-    const bool alpha = blockIdx.x >= heads;
-    const auto out = static_cast<std::uint32_t>(blockIdx.x) - (alpha ? heads : 0U);
-    const float* weights = (alpha ? alpha_weights : beta_weights) + static_cast<std::uint64_t>(out) * width;
-    float sum[Rows]{};
+    const auto head0 = static_cast<std::uint32_t>(blockIdx.x) * Heads;
+    const bool alpha = head0 >= heads;
+    const auto out0 = head0 - (alpha ? heads : 0U);
+    const float* weights = (alpha ? alpha_weights : beta_weights) + static_cast<std::uint64_t>(out0) * width;
+    float sum[Heads][Rows]{};
     for (auto feature = lane; feature < width; feature += kProjectionThreads) {
-        const float weight = weights[feature];
+        float x[Rows];
 #pragma unroll
-        for (unsigned row = 0; row < Rows; ++row)
-            sum[row] += bf16_to_float(input[(first + row) * input_stride + feature]) * weight;
+        for (unsigned row = 0; row < Rows; ++row) x[row] = bf16_to_float(input[(first + row) * input_stride + feature]);
+#pragma unroll
+        for (unsigned h = 0; h < Heads; ++h) {
+            const float weight = weights[static_cast<std::uint64_t>(h) * width + feature];
+#pragma unroll
+            for (unsigned row = 0; row < Rows; ++row) sum[h][row] += x[row] * weight;
+        }
     }
 #pragma unroll
-    for (unsigned row = 0; row < Rows; ++row) scratch[row][lane] = sum[row];
+    for (unsigned h = 0; h < Heads; ++h)
+#pragma unroll
+        for (unsigned row = 0; row < Rows; ++row) scratch[h * Rows + row][lane] = sum[h][row];
     __syncthreads();
     for (std::uint32_t stride = kProjectionThreads / 2U; stride > 32U; stride >>= 1U) {
         if (lane < stride) {
 #pragma unroll
-            for (unsigned row = 0; row < Rows; ++row)
-                scratch[row][lane] = gdn_window_add(scratch[row][lane], scratch[row][lane + stride]);
+            for (unsigned i = 0; i < Sums; ++i) scratch[i][lane] = gdn_window_add(scratch[i][lane], scratch[i][lane + stride]);
         }
         __syncthreads();
     }
-    if (lane >= 32U) return;
-#pragma unroll
-    for (unsigned row = 0; row < Rows; ++row) {
-        float total = gdn_window_add(scratch[row][lane], scratch[row][lane + 32U]);
+    const auto wave = lane / 32U, l = lane % 32U;
+    for (auto i = wave; i < Sums; i += kProjectionThreads / 32U) {
+        float total = gdn_window_add(scratch[i][l], scratch[i][l + 32U]);
 #pragma unroll
         for (unsigned distance = 16U; distance; distance /= 2U)
             total = gdn_window_add(total, __shfl_down(total, distance, 32));
-        if (lane == 0U) {
+        if (l == 0U) {
+            const auto out = out0 + i / Rows, row = first + i % Rows;
             const float raw = round_bf16(total);
-            const auto offset = (first + row) * rows.stride + out;
+            const auto offset = row * rows.stride + out;
             if (alpha) {
                 const float biased = raw + load_small(dt, dt_kind, out);
                 rows.gate[offset] = load_small(a, a_kind, out) * softplus(biased);
@@ -2681,26 +2691,32 @@ void gdn_prefill_lanes_kernel(GdnPrefillRows rows, std::uint32_t count, float* s
     for (std::uint32_t first = 0, buffer = 0; first < count; first += Chunk, buffer ^= 1U) {
         const bool more = first + Chunk < count;
         if (more) fetch(first + Chunk);
+        // Row pointers advance by constant strides (a multiplied LDS row offset compiles to a 64-bit mad whose
+        // undefined high half can alias an in-flight load's register and force a wait for the prefetch).
         const Stage& s = stage[buffer];
-#pragma unroll
+        const float* key = s.key[0][sub];
+        const float* query = s.query[0][sub];
+        const float* value = &s.value[0][local];
+        const float* beta = s.beta;
+        const float* decay = s.decay;
+        float* core = rows.core + first * rows.stride + value_head * 128U + column;
+#pragma unroll 1
         for (unsigned r = 0; r < Chunk; ++r) {
-            const float decay = s.decay[r], beta = s.beta[r];
-            const float* key = s.key[r][sub];
-            const float* query = s.query[r][sub];
             float products[K];
 #pragma unroll
             for (unsigned j = 0; j < K; ++j) {
-                retained[j] = retained[j] * decay;
+                retained[j] = retained[j] * *decay;
                 products[j] = retained[j] * key[j];
             }
-            const float delta = (s.value[r][local] - gdn_lane_group_sum<G>(gdn_lane_tree(products))) * beta;
+            const float delta = (*value - gdn_lane_group_sum<G>(gdn_lane_tree(products))) * *beta;
 #pragma unroll
             for (unsigned j = 0; j < K; ++j) {
                 retained[j] = __builtin_fmaf(key[j], delta, retained[j]);
                 products[j] = retained[j] * query[j];
             }
             const float out = gdn_lane_group_sum<G>(gdn_lane_tree(products));
-            if (sub == 0U) rows.core[(first + r) * rows.stride + value_head * 128U + column] = out;
+            if (sub == 0U) *core = out;
+            key += G * Shape::pitch; query += G * Shape::pitch; value += Columns; ++beta; ++decay; core += rows.stride;
         }
         if (more) commit(stage[buffer ^ 1U]);
         gdn_lds_barrier();
@@ -4482,7 +4498,7 @@ void enqueue_gdn_prefill_core_tiles(const std::vector<std::array<GdnKnownWindowR
     check_hip(hipGetLastError(), "GDN prefill gated RMSNorm launch");
 }
 // Shapes: STRIX_GDN_LANES (keys of a column split over 2|4|8 lanes, default 4), STRIX_GDN_LANE_WAVES
-// (2|4|8 waves per recurrence block, default 4), STRIX_GDN_CHUNK (8|16 staged rows, default 8).
+// (2|4|8 waves per recurrence block, default 8), STRIX_GDN_CHUNK (8|16 staged rows, default 8).
 std::uint32_t gdn_prefill_env(const char* name, std::uint32_t fallback, std::initializer_list<std::uint32_t> allowed) {
     const char* v = std::getenv(name);
     const auto n = v ? static_cast<std::uint32_t>(std::atoi(v)) : fallback;
@@ -4493,13 +4509,21 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     const auto stream = hip_execution_stream();
     const auto& first = tiles[0][0];
     const auto count = static_cast<std::uint32_t>(tiles.size() * 8U);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_prefill_gates_kernel<8U>), dim3(first.value_heads * 2U, count / 8U),
-        dim3(kProjectionThreads), 0, stream, reinterpret_cast<const std::uint16_t*>(first.input.address), input_stride,
-        reinterpret_cast<const float*>(first.tensors.beta.runtime->address),
-        reinterpret_cast<const float*>(first.tensors.alpha.runtime->address), strided,
-        reinterpret_cast<const void*>(first.tensors.dt.runtime->address), small_weight_kind(first.tensors.dt.manifest->ggml_type),
-        reinterpret_cast<const void*>(first.tensors.a.runtime->address), small_weight_kind(first.tensors.a.manifest->ggml_type),
-        first.hidden, first.value_heads);
+    // STRIX_GDN_GATE_HEADS: beta/alpha outputs per gates block (1|2|4, default 2; must divide the head count).
+    static const auto gate_heads_env = gdn_prefill_env("STRIX_GDN_GATE_HEADS", 2U, {1U, 2U, 4U});
+    const auto gate_heads = first.value_heads % gate_heads_env ? 1U : gate_heads_env;
+    const auto gates = [&]<unsigned H>() {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_prefill_gates_kernel<8U, H>), dim3(first.value_heads * 2U / H, count / 8U),
+            dim3(kProjectionThreads), 0, stream, reinterpret_cast<const std::uint16_t*>(first.input.address), input_stride,
+            reinterpret_cast<const float*>(first.tensors.beta.runtime->address),
+            reinterpret_cast<const float*>(first.tensors.alpha.runtime->address), strided,
+            reinterpret_cast<const void*>(first.tensors.dt.runtime->address), small_weight_kind(first.tensors.dt.manifest->ggml_type),
+            reinterpret_cast<const void*>(first.tensors.a.runtime->address), small_weight_kind(first.tensors.a.manifest->ggml_type),
+            first.hidden, first.value_heads);
+    };
+    if (gate_heads == 2U) gates.template operator()<2U>();
+    else if (gate_heads == 4U) gates.template operator()<4U>();
+    else gates.template operator()<1U>();
     check_hip(hipGetLastError(), "GDN prefill F32 gate rows launch");
     hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_prefill_conv_kernel<8U, 32U>), dim3(first.key_heads * 2U + first.value_heads),
         dim3(256), 0, stream, strided, count, reinterpret_cast<std::uint16_t*>(first.conv_state.address),
@@ -4507,7 +4531,7 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
         first.key_heads, first.head_dim, config.model.gdn_qk_l2_epsilon);
     check_hip(hipGetLastError(), "GDN prefill conv rows launch");
     static const auto lanes = gdn_prefill_env("STRIX_GDN_LANES", 4U, {2U, 4U, 8U});
-    static const auto waves = gdn_prefill_env("STRIX_GDN_LANE_WAVES", 4U, {2U, 4U, 8U});
+    static const auto waves = gdn_prefill_env("STRIX_GDN_LANE_WAVES", 8U, {2U, 4U, 8U});
     static const auto chunk_env = gdn_prefill_env("STRIX_GDN_CHUNK", 8U, {8U, 16U});
     const auto chunk = count % chunk_env ? 8U : chunk_env;
     auto* matrix = reinterpret_cast<float*>(first.matrix_state.address);
