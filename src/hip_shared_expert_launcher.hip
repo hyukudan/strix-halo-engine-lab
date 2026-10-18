@@ -1803,8 +1803,7 @@ void known_shared_engine_projection(bool down, const KnownSharedR2Views& views, 
             site.gate[r] = reinterpret_cast<const float*>(workspace) + s.intermediate;
             site.output[r] = reinterpret_cast<std::uint16_t*>(row(views.output, s.output_stride_bytes, r));
         }
-        if constexpr (Rows > 64U) q8_rows::launch_dense_a8(site, stream, false);
-        else q8_rows::launch(site, config.dense_a8_projections, stream);
+        q8_rows::launch_prefill(site, config.dense_a8_projections, config.dense_f16_prefill, stream, false, config.dense_g64_prefill);
     } else {
         SharedGateUpRowsSite<Rows> site{};
         site.segments = q8_rows::segments({{reinterpret_cast<const void*>(views.weights.gate_q8.address), s.intermediate},
@@ -1818,8 +1817,7 @@ void known_shared_engine_projection(bool down, const KnownSharedR2Views& views, 
         // workspace, independent of the router's top-k selection queued just before it.
         static const bool any_order_enabled = strix_any_order_enabled();
         const bool any_order = any_order_enabled && allow_any_order;
-        if constexpr (Rows > 64U) q8_rows::launch_dense_a8(site, stream, any_order);
-        else q8_rows::launch(site, config.dense_a8_projections, stream, any_order);
+        q8_rows::launch_prefill(site, config.dense_a8_projections, config.dense_f16_prefill, stream, any_order, config.dense_g64_prefill);
     }
     check_hip(hipGetLastError(), "known-window shared rows projection launch");
     if (config.prefetch_q8 && config.prefetch_stats)

@@ -36,6 +36,10 @@ struct HipIndexedAttentionLauncherConfig {
     // step (R1, windows and prompt rows) runs Q8_0 x per-32 int8 activations
     // through q8_rows::launch_dense_a8. Different numerics from the exact path.
     bool dense_a8_projections = false;
+    // fast-prefill-f16wmma-v1: prompt launches of 32..256 rows run q8_rows::launch_dense_f16 (prefill only).
+    bool dense_f16_prefill = false;
+    // fast-prefill component dense8: prompt launches of 64..256 rows run q8_rows::launch_dense_g64 (prefill only).
+    bool dense_g64_prefill = false;
 };
 
 enum class HipQsaInputProjectionMode {legacy256,virtual256,prefetch8};

@@ -1,4 +1,5 @@
 #include "strix/known_prompt_chunks.hpp"
+#include "strix/known_prefill_limits.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -325,7 +326,7 @@ int main() {
         if(invalid==0U) target.tiled=false;
         if(invalid==1U) request.tiled_prefill=false;
         if(invalid==2U) request.logical_rows=target.width=15U;
-        if(invalid==3U) request.logical_rows=target.width=2049U;
+        if(invalid==3U) request.logical_rows=target.width=strix::known_prefill_max_rows+1U;
         if(invalid==4U) request.logical_rows=target.width=8U;
         if(invalid==5U) request.output_policy=target.policy=Policy::state_only;
         else target.policy=Policy::terminal_row;

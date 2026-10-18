@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/execution_memory.hpp"
+#include "strix/known_prefill_limits.hpp"
 #include <cstdint>
 #include <cstddef>
 #include <memory>
@@ -30,7 +31,7 @@ struct ScratchLayout {
     std::uint64_t batch_experts = 0, batch_begins = 0, bytes = 0;
 };
 // Known-prompt prefill: one CSR over all T rows of a step (T a multiple of 8).
-inline constexpr std::uint32_t prefill_max_rows = 2048;
+inline constexpr std::uint32_t prefill_max_rows = known_prefill_max_rows;
 [[nodiscard]] inline ScratchLayout scratch_layout(std::uint32_t rows,
     std::uint32_t experts, std::uint32_t top_k, bool prefill = false) {
     if ((prefill ? rows < 16U || rows % 8U || rows > prefill_max_rows : rows != 2U && rows != 4U && rows != 8U) ||

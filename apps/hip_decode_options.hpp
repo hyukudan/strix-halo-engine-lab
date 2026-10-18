@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/decode_execution_options.hpp"
+#include "strix/known_prefill_limits.hpp"
 #include "strix/decode_numerical_profile.hpp"
 #include "strix/gdn_recurrent_layout.hpp"
 #include "strix/gdn_recurrent_storage.hpp"
@@ -162,6 +163,8 @@ struct Options {
     // Prompt prefill arithmetic (--prefill-numerical-profile). Absent: the prefill uses
     // numerical_profile. Decode and MTP windows always use numerical_profile.
     std::optional<strix::DecodeNumericalProfile> prefill_numerical_profile;
+    // --prefill-fast-components hc,dense,moe: the components a fast prefill profile runs (all by default).
+    std::optional<std::uint32_t> prefill_fast_components;
     bool profile_explicit = false;
     bool any_low_level_flag = false;
     bool context_explicit = false;
@@ -429,7 +432,9 @@ inline void validate_numerical_profile_cli(const Options& options) {
 // The resolved prefill/decode arithmetic pair. Without --prefill-numerical-profile the prefill
 // runs the decode profile, so every existing route keeps its single-profile behaviour.
 inline strix::NumericalProfilePair numerical_profile_pair(const Options& options) noexcept {
-    return {options.prefill_numerical_profile.value_or(options.numerical_profile), options.numerical_profile};
+    const auto prefill = options.prefill_numerical_profile.value_or(options.numerical_profile);
+    return {prefill, options.numerical_profile,
+        strix::numerical_profile_fast_prefill(prefill) ? options.prefill_fast_components.value_or(strix::kFastPrefillAll) : 0U};
 }
 
 // A split pair is admitted only where the code runs it: the tiled known-prefix prefill
@@ -437,10 +442,15 @@ inline strix::NumericalProfilePair numerical_profile_pair(const Options& options
 // prefill profile. Everything else keeps one profile for both phases.
 inline void validate_prefill_numerical_profile_cli(const Options& options) {
     const auto pair = numerical_profile_pair(options);
+    if (strix::numerical_profile_fast_prefill(options.numerical_profile))
+        throw std::invalid_argument("fast prefill profiles are prefill-only (--prefill-numerical-profile)");
+    if (options.prefill_fast_components && !strix::numerical_profile_fast_prefill(pair.prefill))
+        throw std::invalid_argument("--prefill-fast-components requires a fast prefill numerical profile");
     if (!pair.split()) return;
     if (!options.numerical_profile_explicit || !strix::numerical_profile_pair_admitted(pair))
         throw std::invalid_argument("prefill numerical profile may differ from an explicit --numerical-profile only in "
-            "the dense A8 projections (q5k-a8-gateup profiles with and without +dense-a8)");
+            "the dense A8 projections (q5k-a8-gateup profiles with and without +dense-a8), or be "
+            "fast-prefill-f16wmma-v1 paired with hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1");
     const bool tiled = options.known_prefix_window && options.known_prefix_prefill_rows && options.known_prefix_full_rows;
     if (tiled == options.mtp.enabled)
         throw std::invalid_argument("prefill numerical profile requires exactly one prefill route: the tiled known-prefix "
@@ -614,7 +624,7 @@ inline void validate_known_prefill_options(const Options& options) {
         options.known_prefill_uma_explicit || options.known_prefill_headroom_explicit;
     if (!any) return;
     if (!options.known_prefix_window || !options.known_prefix_prefill_explicit ||
-        options.known_prefix_prefill_rows < 16U || options.known_prefix_prefill_rows > 2048U ||
+        options.known_prefix_prefill_rows < 16U || options.known_prefix_prefill_rows > strix::known_prefill_max_rows ||
         options.known_prefix_rows_explicit || options.prompt_lookup ||
         !options.known_prefill_workspace_explicit || !options.known_prefill_metadata_explicit ||
         !options.known_prefill_uma_explicit || !options.known_prefill_headroom_explicit ||
@@ -998,6 +1008,24 @@ inline Options parse_options(
             options.prefill_numerical_profile = *parsed;
             continue;
         }
+        if (argument == "--prefill-fast-components") {
+            if (options.prefill_fast_components || index + 1 >= argc)
+                throw std::invalid_argument("--prefill-fast-components requires one list of hc, dense, moe, dense8");
+            std::string_view list = argv[++index];
+            std::uint32_t mask = 0;
+            while (!list.empty()) {
+                const auto comma = list.find(',');
+                const auto item = list.substr(0, comma);
+                const std::uint32_t bit = item == "hc" ? strix::kFastPrefillHc : item == "dense" ? strix::kFastPrefillDense
+                    : item == "moe" ? strix::kFastPrefillMoe : item == "dense8" ? strix::kFastPrefillDense8 : 0U;
+                if (!bit || (mask & bit)) throw std::invalid_argument("--prefill-fast-components accepts hc, dense, moe, dense8 once each");
+                mask |= bit;
+                list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1U);
+            }
+            if (!mask) throw std::invalid_argument("--prefill-fast-components requires at least one component");
+            options.prefill_fast_components = mask;
+            continue;
+        }
         if(argument=="--mtp") {
             if(options.mtp.enabled)throw std::invalid_argument("duplicate MTP route option");
             options.mtp.enabled=true;continue;
@@ -1314,7 +1342,8 @@ inline Options parse_options(
                 value = argv[++index];
             } else value = argument.substr(std::string_view("--known-prefix-prefill-rows=").size());
             const auto rows = parse_u64(value,"known prefill rows");
-            if (rows < 16U || rows > 2048U) throw std::invalid_argument("known prefill rows must be 16 through 2048");
+            if (rows < 16U || rows > strix::known_prefill_max_rows)
+                throw std::invalid_argument("known prefill rows must be 16 through " + std::to_string(strix::known_prefill_max_rows));
             options.known_prefix_prefill_rows = static_cast<std::uint32_t>(rows);
             options.known_prefix_prefill_explicit = true;
             continue;

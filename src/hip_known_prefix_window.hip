@@ -388,6 +388,9 @@ struct HipKnownPrefixWindow::Impl {
         shared_config.prefetch_eligible_layers = config.shared_expert_prefetch_layers;
         shared_config.prefetch_stats = config.shared_expert_prefetch_stats;
         shared_config.dense_a8_projections = config.dense_a8;
+        // Fast prefill profile (prefill catalog only): FP16 WMMA dense projections in 32..256-row prompt launches.
+        shared_config.dense_f16_prefill = (config.fast_prefill_components & kFastPrefillDense) != 0U;
+        shared_config.dense_g64_prefill = (config.fast_prefill_components & kFastPrefillDense8) != 0U;
         shared_fallback = shared_config;
         shared_fallback.prefetch_q8 = false; shared_fallback.prefetch_eligible_layers.clear();
         gdn_config.model = model; gdn_config.activation = config.activation;
@@ -397,6 +400,8 @@ struct HipKnownPrefixWindow::Impl {
         gdn_config.virtual_q8_output_projection = config.virtual_q8_gdn_output;
         gdn_config.wave8_q8_output_projection = config.wave8_q8_gdn_output;
         gdn_config.dense_a8_projections = config.dense_a8;
+        gdn_config.dense_f16_prefill = (config.fast_prefill_components & kFastPrefillDense) != 0U;
+        gdn_config.dense_g64_prefill = (config.fast_prefill_components & kFastPrefillDense8) != 0U;
         r2_entries[0] = {KnownWindowR2Variant::shared_q8_virtual256_r2_v1, this,
             [](std::span<const ExecutionDispatchContext, 2> rows, void* object) {
                 const auto& self = *static_cast<Impl*>(object);
@@ -561,6 +566,8 @@ struct HipKnownPrefixWindow::Impl {
         qsa_config.prefetch_stats=config.qsa_input_prefetch_stats;
         qsa_config.wave8_q8_output=config.wave8_q8_qsa_output;
         qsa_config.dense_a8_projections=config.dense_a8;
+        qsa_config.dense_f16_prefill=(config.fast_prefill_components & kFastPrefillDense) != 0U;
+        qsa_config.dense_g64_prefill=(config.fast_prefill_components & kFastPrefillDense8) != 0U;
         qsa_fallback=qsa_config;
         qsa_fallback.prefetch_q8_input=false; qsa_fallback.prefetch_eligible_layers.clear();
         // One entry per QSA variant actually selected (layers may differ in indexer format).
@@ -608,6 +615,8 @@ struct HipKnownPrefixWindow::Impl {
         routed_config.a8_down_q51=config.a8_down_q51;
         routed_config.a8_down_q80=config.a8_down_q80;
         routed_config.q5k_a8g32_gate_up=config.q5k_a8g32_gate_up;
+        // fast-prefill-f16wmma-v1 moe component: T-row prefill blocks run the routed MoE in FP16 WMMA.
+        routed_config.prefill_f16wmma=(config.fast_prefill_components & kFastPrefillMoe) != 0U;
         routed_config.q4k_a8_stats=config.q4k_a8_stats;
         routed_config.q4k_a8_quiescence=std::make_shared<HipSetupQuiescenceGuard>();
         for(std::size_t i=0;i<window.mode.size();++i)
@@ -644,6 +653,7 @@ struct HipKnownPrefixWindow::Impl {
         hyper_config.splitk_deferred_norm=config.splitk_deferred_norm;
         hyper_config.prefetch_hc_projection_next_tile=config.prefetch_hc_projection_next_tile;
         hyper_config.arithmetic_stats=config.arithmetic_stats;
+        hyper_config.fast_prefill_wmma=(config.fast_prefill_components & kFastPrefillHc) != 0U;
         hyper_fallback=hyper_config; hyper_fallback.lane_chain_output=false;
         rows_entries.push_back({window.logical_rows==2U?KnownWindowR2Variant::hyper_mix_rows2_v1:
             window.logical_rows==4U?KnownWindowR2Variant::hyper_mix_rows4_v1:KnownWindowR2Variant::hyper_mix_rows8_v1,this,

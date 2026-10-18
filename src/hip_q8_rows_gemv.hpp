@@ -1854,4 +1854,7 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
     }
 }
 
+#include "hip_dense_a8g64.hpp"
+#include "hip_dense_f16_wmma.hpp"
+
 } // namespace strix::q8_rows

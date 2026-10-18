@@ -394,6 +394,33 @@ cold) or an uncached process; timings are single smoke runs on shared nodes, not
 
 MTP cycle counts can differ between identical runs (the window cost model is timing-driven); tokens, replay and
 state digests do not.
+## D-035: fast prefill profile, routed MoE component in FP16 WMMA
+
+The `moe` component of `fast-prefill-f16wmma-v1` (`--prefill-fast-components ...,moe`) changes the routed
+MoE of complete tiled prefill blocks only. There, gate/up and down dequantize
+Q4_K/Q5_K/Q5_1/Q8_0 weights to FP16 inside the kernel (one FP32 value rounded once, no FP16 copy in memory),
+activations are FP16 with a power-of-two scale per prompt row (input) and per (row, slot) (SwiGLU output),
+and `v_wmma_f32_16x16x16_f16` accumulates over the whole K in FP32 without a per-group epilogue. The SwiGLU is
+fused into the gate/up epilogue; merge and commit are unchanged. CSR batches hold up to 64 assignments of one
+expert; a CTA covers 128 outputs of both gate and up (down: 256 outputs), every wave owns all rows of the batch,
+B tiles are staged in LDS once per K step of 64 and the next two K steps load while one computes. See
+[docs/prefill-numerical-profile.md](docs/prefill-numerical-profile.md).
+
+Why: the A8 contract's per-group FP32 epilogue (8 VALU operations per element and group, not overlapped with
+the matrix products) bounds the iu8 WMMA kernels at 9–13 TOPS; FP16 products with FP32 accumulation over K have
+no such epilogue and are also more accurate than A8 activations.
+
+Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL):
+
+| Check | Result |
+| --- | --- |
+| Fixture, 512 experts, T = 256/1024 (random Q4_K/Q5_K/Q5_1/Q8_0 blocks), raw slot dots against an FP32 reference with unquantized activations | relative RMS error 1.0–1.2e-4 (Q5_1 down), 4.1e-4 (Q8_0 down); the A8 kernels 1.3–1.9e-2 |
+| Same, a block of the first T/2 rows (other CSR batches) | byte-identical rows |
+| Repeated runs | byte-identical |
+| Engine, 16K prompt, 32 tokens, T = 2048 | prefill rows of the MoE in FP16 = prompt rows × 48 layers; tokens equal to the dense-A8 profile for the first 8 tokens |
+| Fixture, gate/up + down per 2048 rows, T = 2048 (uniform / skewed routes) | 11.2 / 12.4 ms (iu8 A8 WMMA: 16.3 / 17.4 ms) |
+| Engine GPU time at 16K, T = 2048 | routed MoE 6.94 → 5.64 s; total 24.57 → 23.17 s |
+| Engine request time, T = 2048, GEN = 1, quiet node | 4K 5936 → 5588 ms (+6 %), 16K 24927 → 23671 ms (+5 %) |
 
 ## Measured and rejected
 

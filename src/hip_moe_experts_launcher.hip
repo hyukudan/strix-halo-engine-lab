@@ -2656,7 +2656,8 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
     const q51_known_rows::Workspace& prefill, bool shared_admission = true) {
     const auto count = static_cast<std::uint32_t>(rows.size());
     if (count < 16U || count % 8U || count > q51_known_rows::prefill_max_rows)
-        throw std::invalid_argument("known prefill routed rows require T in [16, 2048], a multiple of 8");
+        throw std::invalid_argument("known prefill routed rows require T in [16, " + std::to_string(q51_known_rows::prefill_max_rows) +
+            "], a multiple of 8");
     if (!config.a8_down_q51 && !config.a8_down_q80)
         throw std::invalid_argument("known prefill routed rows require the A8 down profile");
     // Every view a kernel touches, per row; checked to be row 0 plus r * stride.
@@ -2840,7 +2841,8 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
 void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherConfig& config, const KnownMoePrefillPrepared& p) {
     const auto stream = hip_execution_stream();
     check_hip(hipPeekAtLastError(), "known prefill routed rows stale error");
-    moe_q4k_a8::known_rows::enqueue_prefill(p.request, p.rows, count, p.clear_words, p.gate, p.up, p.down_type, p.down, stream);
+    moe_q4k_a8::known_rows::enqueue_prefill(p.request, p.rows, count, p.clear_words, p.gate, p.up, p.down_type, p.down, stream,
+        config.prefill_f16wmma ? 3 : -1);
     hipLaunchKernelGGL(known_moe_prefill_merge_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
         p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k);
     check_hip(hipGetLastError(), "known prefill routed rows ordered merge");
@@ -2856,6 +2858,7 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
         stats.quantized_submissions.fetch_add(count, std::memory_order_relaxed);
         (p.down_type == 7U ? stats.a8_down_q51_submissions : stats.a8_down_q80_submissions).fetch_add(count, std::memory_order_relaxed);
         if (p.request.gate_type == 13U) stats.q5k_a8_gate_up_submissions.fetch_add(count, std::memory_order_relaxed);
+        if (config.prefill_f16wmma) stats.prefill_f16wmma_submissions.fetch_add(count, std::memory_order_relaxed);
     }
 }
 #endif

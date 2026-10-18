@@ -48,7 +48,7 @@ public:
         ExecutionMemoryBinding window_scratch, HipLaunchContext scope,
         std::shared_ptr<const void> actual_owner,
         q51_known_rows::Workspace routed_union_workspace = {});
-    // Explicit T16..2048 step-major owner. Closed window construction above
+    // Explicit T16..8192 (known_prefill_max_rows) step-major owner. Closed window construction above
     // retains its original guards and identities. Every projection tile still
     // uses a closed native 8/2 entry; this is not a general GEMM backend.
     HipKnownPrefixWindow(CompiledKnownPrefixPrefill prefill,

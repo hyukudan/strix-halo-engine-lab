@@ -645,6 +645,12 @@ CompiledSerialExecution compile_serial_execution(
             "compiled kernel plan identity must be non-zero");
     }
 
+    if (binding_request.prefill_arithmetic_identity != 0U) {
+        std::uint64_t hash = compiled.kernel_plan_identity;
+        hash_u64(hash, 0x5052454152495448ULL);  // PREARITH
+        hash_u64(hash, binding_request.prefill_arithmetic_identity);
+        compiled.kernel_plan_identity = hash;
+    }
     compiled.whole_plan_graph_safe =
         graph_safe;
     compiled.execution_identity =
@@ -653,6 +659,12 @@ CompiledSerialExecution compile_serial_execution(
             compiled,
             binding_request,
             buffer_request);
+    if (binding_request.prefill_arithmetic_identity != 0U) {
+        std::uint64_t hash = compiled.execution_identity;
+        hash_u64(hash, 0x5052454152495448ULL);
+        hash_u64(hash, binding_request.prefill_arithmetic_identity);
+        compiled.execution_identity = hash;
+    }
 
     if (compiled.execution_identity == 0) {
         throw std::logic_error(

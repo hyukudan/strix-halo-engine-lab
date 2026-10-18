@@ -52,6 +52,9 @@ struct ExecutionBindingRequest {
     bool a8_down_q80 = false;
     bool q5k_a8g32_gate_up = false;
     bool dense_a8 = false;
+    // Non-zero for a prefill execution whose launchers run prefill-only arithmetic over the same
+    // kernel plan (fast prefill profiles): folded into the kernel-plan and execution identities.
+    std::uint64_t prefill_arithmetic_identity = 0;
 };
 
 struct ExecutionKernelBinding {
