@@ -2069,7 +2069,8 @@ void shared_expert_known_window_rows_launch(std::span<const ExecutionDispatchCon
     else known_shared_rows_enqueue<8U>(views, stream, config);
 }
 void shared_expert_known_window_rows_launch_detached(std::span<const ExecutionDispatchContext> rows,
-    const HipSharedExpertLauncherConfig& config, hipStream_t stream, std::uintptr_t workspace, std::uint64_t workspace_bytes) {
+    const HipSharedExpertLauncherConfig& config, void* raw_stream, std::uintptr_t workspace, std::uint64_t workspace_bytes) {
+    const auto stream = static_cast<hipStream_t>(raw_stream);
     if (rows.size() != 2U && rows.size() != 4U && rows.size() != 8U)
         throw std::invalid_argument("detached known-window shared rows require 2, 4 or 8 rows");
     auto views = rows.size() == 2U ?
