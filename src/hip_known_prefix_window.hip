@@ -786,6 +786,7 @@ struct HipKnownPrefixWindow::Impl {
         route_config.parallel_projection=config.parallel_moe_router; route_config.staged_logits=config.staged_moe_router_logits;
         route_config.ranked_topk=config.ranked_moe_router_topk; route_config.wave_topk=config.wave_moe_router_topk;
         route_config.wave_manifest_admission=config.wave_router_manifest_admission;
+        route_config.router_fast_prefill=(config.fast_prefill_components & kFastPrefillRouter) != 0U;
         elementwise_config.hidden_size=u32(model.hidden_size); elementwise_config.hc_count=u32(model.hc_count);
         elementwise_config.activation=config.activation;
         rows_entries.push_back({KnownWindowR2Variant::moe_route_rows_v1,this,
