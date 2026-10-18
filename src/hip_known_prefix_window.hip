@@ -564,6 +564,7 @@ struct HipKnownPrefixWindow::Impl {
         qsa_config.wave8_q8_output=config.wave8_q8_qsa_output;
         qsa_config.dense_a8_projections=config.dense_a8;
         qsa_config.dense_f16_prefill=(config.fast_prefill_components & kFastPrefillDense) != 0U;
+        qsa_config.qsa_fast_prefill=(config.fast_prefill_components & kFastPrefillQsa) != 0U;
         qsa_fallback=qsa_config;
         qsa_fallback.prefetch_q8_input=false; qsa_fallback.prefetch_eligible_layers.clear();
         // One entry per QSA variant actually selected (layers may differ in indexer format).

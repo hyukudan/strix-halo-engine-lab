@@ -38,6 +38,8 @@ struct HipIndexedAttentionLauncherConfig {
     bool dense_a8_projections = false;
     // fast-prefill-f16wmma-v1: prompt launches of 32..256 rows run q8_rows::launch_dense_f16 (prefill only).
     bool dense_f16_prefill = false;
+    // fast-prefill-f16wmma-v1, qsa component: prefill groups run the fused union attention (hip_qsa_fast_prefill.inc).
+    bool qsa_fast_prefill = false;
 };
 
 enum class HipQsaInputProjectionMode {legacy256,virtual256,prefetch8};

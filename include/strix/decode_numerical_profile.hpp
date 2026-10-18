@@ -136,8 +136,8 @@ inline constexpr std::optional<DecodeNumericalProfile> numerical_profile_dense_a
 }
 
 // Components of a fast prefill profile (any non-empty subset; all by default).
-inline constexpr std::uint32_t kFastPrefillHc = 1U, kFastPrefillDense = 2U, kFastPrefillMoe = 4U,
-    kFastPrefillAll = kFastPrefillHc | kFastPrefillDense | kFastPrefillMoe;
+inline constexpr std::uint32_t kFastPrefillHc = 1U, kFastPrefillDense = 2U, kFastPrefillMoe = 4U, kFastPrefillQsa = 8U,
+    kFastPrefillAll = kFastPrefillHc | kFastPrefillDense | kFastPrefillMoe | kFastPrefillQsa;
 
 // Prefill/decode arithmetic pair. The prompt prefill may run a different (prefill) profile from
 // the decode/MTP windows; decode always runs `decode`. A pair is admitted when both profiles are
