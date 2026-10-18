@@ -82,10 +82,11 @@ __global__ void quantize(const void* input, unsigned hidden, signed char* codes,
 }
 // Parallel transcription of the stable CSR: assignment a=r*top_k+s is placed at
 // offsets[e]+#{a'<a with expert e}, i.e. rows then slots ascending per expert.
-// Only defined entries are written. Experts <= 512 <= blockDim.
-__device__ void build_csr(const known_rows::PrologueRows& v, unsigned rows, unsigned experts, unsigned top_k) {
+// Only defined entries are written. Experts <= 512 <= blockDim. The union holds
+// the first `active` rows; batches keep the physical `rows` cap of the kernels.
+__device__ void build_csr(const known_rows::PrologueRows& v, unsigned rows, unsigned active, unsigned experts, unsigned top_k) {
     const auto& csr=v.csr;
-    const unsigned t=threadIdx.x,count=rows*top_k;
+    const unsigned t=threadIdx.x,count=active*top_k;
     __shared__ unsigned expert_of[80],first[80],start[512],scan[3][512],hist[16],failure,duplicates,maximum;
     if(t==0){failure=0U;duplicates=0U;maximum=0U;}
     if(t<16U)hist[t]=0U;
@@ -95,7 +96,7 @@ __device__ void build_csr(const known_rows::PrologueRows& v, unsigned rows, unsi
         if(e>=experts||!isfinite(v.route_weights[t/top_k][t%top_k]))atomicOr(&failure,invalid_route);
     }
     __syncthreads();
-    if(failure){if(t<32U)csr.summary[t]=t==0U?failure:t==3U?count:t==6U?rows:t==7U?1U:0U;return;}
+    if(failure){if(t<32U)csr.summary[t]=t==0U?failure:t==3U?count:t==6U?active:t==7U?1U:0U;return;}
     if(t<count){unsigned f=1U;for(unsigned a=t-t%top_k;a<t;++a)f&=expert_of[a]!=expert_of[t];first[t]=f;}
     __syncthreads();
     unsigned n=0U,unique=0U;
@@ -127,16 +128,16 @@ __device__ void build_csr(const known_rows::PrologueRows& v, unsigned rows, unsi
     }
     if(t==0U)csr.begins[scan[2][511]]=count;
     if(t<32U)csr.summary[t]=t==1U?scan[1][511]:t==2U?scan[2][511]:t==3U?count:t==4U?duplicates:t==5U?maximum:
-        t==6U?rows:t==7U?1U:t>=8U&&t<24U?hist[t-8U]:0U;
+        t==6U?active:t==7U?1U:t>=8U&&t<24U?hist[t-8U]:0U;
 }
 // Window prologue, 1024-thread CTA per row: the incumbent clear, both route
 // validators and the quantizer in their original order; status is written
-// once by thread 0. CTA `rows` builds the CSR concurrently.
+// once by thread 0. CTA `rows` builds the CSR of the first `active` rows concurrently.
 template<bool Bf16>
 __global__ void window_prologue(known_rows::PrologueRows v, unsigned rows, unsigned hidden, unsigned top_k, unsigned experts,
-    unsigned clear_words) {
+    unsigned clear_words, unsigned active) {
     const unsigned row=blockIdx.x;
-    if(row==rows){build_csr(v,rows,experts,top_k);return;}
+    if(row==rows){build_csr(v,rows,active,experts,top_k);return;}
     __shared__ unsigned route_bits;
     if(threadIdx.x==0) route_bits=0;
     for(unsigned i=threadIdx.x;i<clear_words;i+=blockDim.x) v.clear[row][i]=0.0F;
@@ -403,12 +404,14 @@ void enqueue_quantize_only(const Request& request,const Bindings& b,hipStream_t 
     check(hipGetLastError(),"Q4K A8 quantizer enqueue");
 }
 namespace known_rows {
-void enqueue_prologue(const Request& request,const PrologueRows& rows,unsigned count,unsigned clear_words,hipStream_t stream) {
-    if(count==0U||count>8U||count*request.shape.top_k>80U||request.shape.experts>512U)
+void enqueue_prologue(const Request& request,const PrologueRows& rows,unsigned count,unsigned clear_words,hipStream_t stream,
+    unsigned active) {
+    if(!active) active=count;
+    if(count==0U||count>8U||count*request.shape.top_k>80U||request.shape.experts>512U||active>count)
         throw std::invalid_argument("A8 window prologue geometry is invalid");
     check(hipPeekAtLastError(),"A8 window prologue stale error");
-    if(request.input==InputKind::bf16)window_prologue<true><<<count+1U,1024,0,stream>>>(rows,count,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words);
-    else window_prologue<false><<<count+1U,1024,0,stream>>>(rows,count,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words);
+    if(request.input==InputKind::bf16)window_prologue<true><<<count+1U,1024,0,stream>>>(rows,count,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words,active);
+    else window_prologue<false><<<count+1U,1024,0,stream>>>(rows,count,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words,active);
     check(hipGetLastError(),"A8 window prologue enqueue");
 }
 void enqueue_prefill_prologue(const Request& request,const PrefillRows& rows,unsigned count,unsigned clear_words,hipStream_t stream) {

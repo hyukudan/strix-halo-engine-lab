@@ -21,6 +21,12 @@ struct HipMtpVerifiedTargetRows {
     std::uint32_t chosen_rows=1; // window owner rows, 1 = serial target steps
 };
 struct HipMtpWindowOwnerStats {std::uint32_t rows=0;std::uint64_t cycles=0;double cycle_ms_ema=0.0;};
+// Survival controller cost samples: serial rows (1,1), each owner/active-rows option (cycle time minus the
+// draft chain), and the draft step (0,0).
+struct HipMtpWindowOptionStats {std::uint32_t rows=0,active=0;std::uint64_t samples=0;double ms_ema=0.0;};
+// STRIX_MTP_CONTROLLER=survival: the window controller of HipMtpWindowVerifier (prefix owners) chooses
+// owner and active rows by calibrated prefix survival instead of the min-p cut (see the verifier source).
+[[nodiscard]] bool hip_mtp_survival_controller() noexcept;
 // One actual closed known-row window per cycle, with retained capture pools per owner.
 // Several prefix owners (distinct 2/4/8 rows over one session) share one deferred
 // GDN record; per cycle T = 1 + leading drafts with probability >= min_probability,
@@ -29,6 +35,9 @@ struct HipMtpWindowOwnerStats {std::uint32_t rows=0;std::uint64_t cycles=0;doubl
 // Every speculative input except the pending seed must match the preceding
 // finite target prediction. A rejected/EOS-truncated window is restored before
 // serial greedy replay; no provisional hidden row reaches MTP reconciliation.
+// STRIX_MTP_DIAG_FULL_CHAIN=1 (diagnostic, never timed): every cycle drafts the full depth without
+// a cut and verifies one serial target row, so each emitted position starts a complete draft chain.
+[[nodiscard]] bool hip_mtp_full_chain_diagnostic() noexcept;
 class HipMtpWindowVerifier final {
 public:
     HipMtpWindowVerifier(std::shared_ptr<HipMtpTargetHidden>,std::shared_ptr<HipKnownPrefixWindow>,
@@ -51,10 +60,16 @@ public:
     [[nodiscard]] HipMtpVerifiedTargetRows verify(SerialSessionContext&,DirectLaunchDispatcher&,
         const HipMtpTargetHiddenTicket& initial,std::span<const std::uint32_t> candidates,
         std::uint32_t output_budget,std::span<const std::uint32_t> eos_tokens,
-        std::span<const float> candidate_probabilities={});
-    // Whether one more draft can still pay off: the next larger window, with the remaining drafts assumed
-    // as likely as the last one, beats the best window the current drafts already allow.
-    [[nodiscard]] bool worth_drafting(std::span<const float> probabilities) const;
+        std::span<const float> candidate_probabilities={},std::span<const float> candidate_runner_ups={});
+    // Whether one more draft can still pay off. Min-p controller: the next larger window, with the remaining
+    // drafts assumed as likely as the last one, beats the best window the current drafts already allow.
+    // Survival controller: some longer chain, at the calibrated lookahead acceptance, beats the best option
+    // of the drafts so far (plus one exploration draft after a weak first draft).
+    [[nodiscard]] bool worth_drafting(std::span<const float> probabilities,std::span<const float> runner_ups={}) const;
+    [[nodiscard]] bool survival_controller() const noexcept;
+    // The current cycle's draft chain (steps, host wall ms), recorded before verify for the cost split.
+    void note_draft(std::uint32_t steps,double ms) noexcept;
+    [[nodiscard]] std::vector<HipMtpWindowOptionStats> option_stats() const;
     // Setup only: every owner's window admission at the session's current frontier, so the
     // first window of each owner does not pay it inside the generation loop.
     void prepare_admission(const SerialSessionContext& session);

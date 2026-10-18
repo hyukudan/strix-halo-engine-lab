@@ -87,7 +87,10 @@ public:
         const HipMtpTargetWindowCapturePolicy&);
     [[nodiscard]] HipMtpTargetWindowExecution execute_mtp_captured(SerialSessionContext&,
         std::span<const std::uint32_t>,std::shared_ptr<HipMtpTargetWindowCapture>,
-        const std::function<void()>& before_publish = {});
+        const std::function<void()>& before_publish = {},std::uint32_t active_rows = 0);
+    // active_rows (2..logical_rows, 0 = all): rows from active_rows on are padding. They run the dense
+    // projections but stay out of the routed expert union (zero routed output), so the caller must not
+    // accept them; every committed prefix must end before active_rows.
     // Opt-in device greedy selection enqueued right after the multi-row terminal
     // head (KnownWindowRequest::lm_head_rows); logits stay materialised. After each
     // successful execute, replies[r] (host-mapped coherent, logical_rows entries)

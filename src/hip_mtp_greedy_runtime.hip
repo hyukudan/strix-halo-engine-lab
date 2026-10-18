@@ -3,6 +3,8 @@
 #include "strix/mtp_sidecar_binding.hpp"
 #include "strix/hip_mtp_window_verifier.hpp"
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <stdexcept>
@@ -145,18 +147,29 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
         host_phase_mark("1 begin cycle");
         // STRIX_MTP_DRAFT_WORTH=0: draft until min_probability only, without asking the window cost model.
         static const bool worth=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_WORTH");return !v || v[0]!='0';}();
-        const std::function<bool(std::span<const float>)> keep=worth && i.window?
-            std::function<bool(std::span<const float>)>([&](std::span<const float> p){return i.window->worth_drafting(p);}):
+        // The survival controller owns the chain cut (no min-p stop) and sees runner-up probabilities.
+        const bool full_chain=hip_mtp_full_chain_diagnostic();
+        const bool survival=i.window && i.window->survival_controller() && !full_chain;
+        // Without a min-p cut (and without the survival controller) the chain runs sync-free: no keep test.
+        const std::function<bool(std::span<const float>)> keep=((worth && i.min_probability>0.0F) || survival) && i.window && !full_chain?
+            std::function<bool(std::span<const float>)>([&](std::span<const float> p){
+                return i.window->worth_drafting(p,i.mtp->draft_runner_up_probabilities());}):
             std::function<bool(std::span<const float>)>{};
-        const auto candidates=i.mtp->draft_head()?i.mtp->propose_chain(i.plan,i.activation,*i.session,i.draft,depth,i.min_probability,keep):
+        const auto at=i.mtp->next_source_position();
+        const auto chain_start=std::chrono::steady_clock::now();
+        const auto candidates=i.mtp->draft_head()?i.mtp->propose_chain(i.plan,i.activation,*i.session,i.draft,depth,
+                full_chain || survival?0.0F:i.min_probability,keep):
             i.backend->propose_candidates(*i.session,i.draft,depth);
+        if(survival) i.window->note_draft(static_cast<std::uint32_t>(candidates.size()),
+            std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-chain_start).count());
         host_phase_mark("2 draft chain");
         out.proposed_candidates=static_cast<std::uint32_t>(candidates.size());
         finish_draft_proposal(i.draft);
         host_phase_mark("3 finish proposal");
         if(i.window) {
             auto verified=i.window->verify(*i.session,*i.dispatcher,initial,candidates,budget,eos,
-                i.mtp->draft_head()?i.mtp->draft_probabilities():std::span<const float>{});
+                i.mtp->draft_head()?i.mtp->draft_probabilities():std::span<const float>{},
+                i.mtp->draft_head()?i.mtp->draft_runner_up_probabilities():std::span<const float>{});
             host_phase_mark("8 verify tail");
             require(!verified.committed_rows.empty() && verified.committed_rows.size()==verified.emitted_tokens.size(),
                 "MTP target verifier returned no actual aligned committed output rows");
@@ -184,6 +197,14 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
             out.eos=is_eos(pending);out.terminal_budget=out.emitted_tokens.size()>=budget;
             if(out.eos || out.terminal_budget || !accepted)break;
         }
+        }
+        // STRIX_MTP_DRAFT_LOG=1 also prints one line per cycle (its drafts carry the same at=).
+        static const bool log_cycles=std::getenv("STRIX_MTP_DRAFT_LOG")!=nullptr;
+        if(log_cycles) {
+            std::fprintf(stderr,"cycle at=%llu rows=%u proposed=%u accepted=%u emitted=",static_cast<unsigned long long>(at),
+                out.target_window_rows,out.proposed_candidates,out.accepted_candidates);
+            for(std::size_t t=0;t<out.emitted_tokens.size();++t) std::fprintf(stderr,"%s%u",t?",":"",out.emitted_tokens[t]);
+            std::fprintf(stderr,"\n");
         }
         host_phase_mark("9 cycle bookkeeping");
         i.mtp->set_reconciliation_rows(replay,out.final_target);

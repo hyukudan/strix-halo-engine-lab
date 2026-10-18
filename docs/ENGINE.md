@@ -250,7 +250,15 @@ Defaults are the measured configuration.
 | `STRIX_PLE_WARM=0` | Skip prefetching the file-backed PLE table after registration. |
 | `STRIX_MTP_GREEDY_ROWS=0` | Use per-row selectors instead of on-stream argmax of all window rows. |
 | `STRIX_CYCLE_TIMING=1` | Print host phase timings per MTP cycle. |
-| `STRIX_CYCLE_LOG=1` | Print each MTP cycle's window rows and wall time. |
+| `STRIX_CYCLE_LOG=1` | Print each MTP cycle's window rows and wall time (with the survival controller also the draft chain's wall time and steps). |
+| `STRIX_MTP_CONTROLLER=survival` | Survival window controller (opt-in, D-036): the draft cut and the window choice come from a calibrated estimate of prefix survival against separated costs instead of the `--mtp-spec-min-p` cut. Tokens are unchanged. |
+| `STRIX_MTP_ACTIVE_ROWS=1` | With the survival controller: the R4 owner may also verify 3 active rows and the R8 owner 6. The remaining rows are padding outside the routed expert union and acceptance. |
+| `STRIX_MTP_EXPLORE=P` | With the survival controller: one more draft after a first draft whose calibrated acceptance is below P (default 0, off). |
+| `STRIX_MTP_REPROBE=N` | With the survival controller: a window option unused for N cycles (default 64, 0 = never) is chosen once more and a lower cost sample replaces its estimate, so one slow sample cannot price it out for the rest of the run. |
+| `STRIX_MTP_SURVIVAL_ADAPT=0` | With the survival controller: keep the offline calibration fixed (default adapts its bias online). |
+| `STRIX_MTP_DRAFT_LOG=1` | Print every draft (start position, step, token, probability and runner-up probability bits) and one line per cycle. |
+| `STRIX_MTP_DRAFT_TOP2=1` | Diagnostic: the draft head also reduces the runner-up probability (always on with the survival controller). |
+| `STRIX_MTP_DIAG_FULL_CHAIN=1` | Diagnostic, never timed: every cycle drafts the full depth and verifies one serial row, so every emitted position starts a complete draft chain. |
 | `STRIX_WINDOW_TIMING=1` | Print host-side phase totals of every known window at exit. |
 | `STRIX_PREFILL_TIMING=1` | Print download, scoring and spool times per block of teacher-forced tiled prefill. |
 

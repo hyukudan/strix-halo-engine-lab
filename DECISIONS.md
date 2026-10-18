@@ -395,6 +395,51 @@ cold) or an uncached process; timings are single smoke runs on shared nodes, not
 MTP cycle counts can differ between identical runs (the window cost model is timing-driven); tokens, replay and
 state digests do not.
 
+## D-036: survival window controller and active rows (opt-in, pending the timing campaign)
+
+`STRIX_MTP_CONTROLLER=survival` replaces the D-022 cut (the chain stops at the first draft below
+`--mtp-spec-min-p`, and that cut also caps the window) by two separate decisions:
+
+- Acceptance: for draft k, given that drafts 0..k-1 matched, P(draft k equals the target's greedy token) is a
+  logistic in the draft's probability, its log margin over the runner-up (the draft head now also reduces the
+  runner-up) and depth (1, >= 2). Prior weights were fitted offline; online only the bias adapts, pulled back
+  to the prior.
+- Window and chain length: E[N_R] = 1 + sum_j prod_{i<j} P_i over the option's active rows against a cost
+  C = option cost + n draft steps, with separated EMAs (cycle time minus draft chain per option, per draft
+  step, serial rows). The chosen option maximises E[N] - rho*C, rho the long-run tokens per ms. Drafting
+  continues while some longer chain, with further drafts at a lookahead acceptance (from depth and the
+  previous probability), beats the current best option. One extra draft after a weak first draft is
+  available (`STRIX_MTP_EXPLORE`) but off: neutral to slightly negative in simulation.
+
+`STRIX_MTP_ACTIVE_ROWS=1` adds options inside the physical owners: the R4 owner verifies 3 active rows and
+the R8 owner 6. Padding rows run the dense R4/R8 kernels but stay outside the routed expert union (the CSR is
+built over the active rows and the merge skips the rest, so their routed output is zero), and are never
+accepted (acceptance stops before the active count; `commit_prefix` keeps at most that many rows, and
+capture, GDN deferred commit, PLE commit and QSA rows already publish only the accepted prefix). Admission is
+unchanged: the active count is a launch argument of the eager window. The union rows fixture checks, in both
+profiles, that active rows are bit-identical to the full union and padding rows are zero.
+
+Sizing with the full-chain diagnostic (`STRIX_MTP_DIAG_FULL_CHAIN=1`: a 7-deep chain from every generated
+position) on 6 prompts x 512 tokens (EN, ES, FR prose, 2 code, agent; dense A8 profile, Q4 draft, auto
+vocabulary):
+
+- Calibration. Raw draft probability in [0.9, 0.99) predicts 0.957 against 0.801 observed; the calibrated
+  estimate predicts 0.958 against 0.956.
+- Simulation against the min-p 0.8 controller, leave-one-prompt-out (calibrator fitted without the simulated
+  prompt), geometric mean:
+  - controller alone: +2.1 % (+1.0 to +3.5 % per prompt);
+  - with active rows: +4.3 %.
+- Active rows under the min-p controller: about 0 %.
+- Measured costs in single runs (cycle minus drafts): R2 44.2, R3-in-R4 49.3, R4 52.4, R6-in-R8 64.6,
+  R8 72.1 ms.
+
+Tokens are unchanged by construction: every emitted token is the target's greedy token. They were identical,
+with MTP replay error 0, on every run in both profiles. The cost model also re-probes an option whose
+estimate is implausible once it has gone 64 cycles unused (`STRIX_MTP_REPROBE`). In one min-p baseline run, a
+single 111 ms first sample of R4 kept 262 of 267 cycles in R2.
+
+Status: opt-in until an interleaved timing campaign against D-022 qualifies it.
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |

@@ -2530,10 +2530,14 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
     return out;
 }
 
+// active (0 = every row): rows from active on stay out of the expert union and are not merged, so their
+// routed output is zero (shared expert only); the caller never accepts them.
 void known_moe_rows_enqueue(std::span<const ExecutionDispatchContext> rows,
-    const HipMoeExpertsLauncherConfig& config, const KnownMoeRowsPrepared& p) {
+    const HipMoeExpertsLauncherConfig& config, const KnownMoeRowsPrepared& p, std::uint32_t active = 0) {
     const auto stream = hip_execution_stream();
     const auto count = static_cast<std::uint32_t>(rows.size());
+    if (!active) active = count;
+    if (active > count) throw std::invalid_argument("known-window routed rows active count exceeds the window");
     check_hip(hipPeekAtLastError(), "known-window routed rows stale error");
     moe_q4k_a8::known_rows::WindowRows window;
     for (unsigned r = 0; r < count; ++r) {
@@ -2548,7 +2552,7 @@ void known_moe_rows_enqueue(std::span<const ExecutionDispatchContext> rows,
     const auto& first = *p.rows[0].quantized;
     if (first.a8_down_request) { window.down_type = first.a8_down_request->weight_type; window.down_weights = p.a8_down[0].weights; }
     moe_q4k_a8::known_rows::enqueue_window(first.request,
-        std::span<const moe_q4k_a8::Bindings>(p.quantized_bindings.data(), count), p.workspace, window, stream);
+        std::span<const moe_q4k_a8::Bindings>(p.quantized_bindings.data(), count), p.workspace, window, stream, active);
     const auto weights = reinterpret_cast<const void*>(p.rows[0].tensors.down.runtime->address);
     if (!first.a8_down_request) {
     constexpr unsigned down_group = 2U, down_outputs = 4U;
@@ -2557,7 +2561,7 @@ void known_moe_rows_enqueue(std::span<const ExecutionDispatchContext> rows,
         p.device, p.csr, count, weights, config.intermediate_size, config.hidden_size);
     check_hip(hipGetLastError(), "known-window routed rows shared-decode Q5_1 down");
     }
-    hipLaunchKernelGGL(known_moe_rows_merge_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
+    hipLaunchKernelGGL(known_moe_rows_merge_kernel, dim3((config.hidden_size + 255U) / 256U, active), dim3(256), 0, stream,
         p.device, p.csr, config.hidden_size, config.expert_count, config.top_k);
     check_hip(hipGetLastError(), "known-window routed rows ordered merge");
     hipLaunchKernelGGL(known_moe_rows_commit_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
@@ -2871,12 +2875,12 @@ void moe_experts_known_window_rows_preflight(std::span<const ExecutionDispatchCo
 #endif
 }
 void moe_experts_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
-    const HipMoeExpertsLauncherConfig& config, const q51_known_rows::Workspace& workspace) {
+    const HipMoeExpertsLauncherConfig& config, const q51_known_rows::Workspace& workspace, std::uint32_t active_rows) {
 #ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
     const auto prepared=prepare_known_moe_rows(rows,config,workspace);
-    known_moe_rows_enqueue(rows,config,prepared);
+    known_moe_rows_enqueue(rows,config,prepared,active_rows);
 #else
-    (void)rows; (void)config; (void)workspace;
+    (void)rows; (void)config; (void)workspace; (void)active_rows;
     throw std::invalid_argument("known-window routed rows require built A8 runtime");
 #endif
 }

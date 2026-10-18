@@ -100,7 +100,7 @@ struct HipMtpRuntime::Impl {
     std::optional<std::uint32_t> last_teacher_next_input,base_previous_input;
     std::vector<HipMtpReplayRow> replay;
     std::vector<std::uint32_t> candidates;
-    std::vector<float> probabilities;
+    std::vector<float> probabilities,runner_ups; // runner_ups: draft head runner-up probabilities (0 unless enabled)
     MtpDraftCycleInput current;
     HipMtpExecutionStats stats;
     std::uint64_t next_source=0,base_source=0,epoch=0,profile=0;
@@ -338,6 +338,7 @@ struct HipMtpRuntime::Impl {
     }
     // Sync-free proposal chain: identical stage launches to run_current per row,
     // except the head/selector and the device-fed next input token.
+    // Each draft completes before the next when min_probability > 0 or keep_drafting is set.
     std::vector<std::uint32_t> chain(std::uint32_t depth,float min_probability,
         const std::function<bool(std::span<const float>)>& keep_drafting) {
         require(draft && cycle && cycle_base && !active && !validation && candidates.empty() &&
@@ -374,23 +375,26 @@ struct HipMtpRuntime::Impl {
                 copy(owner->view(HipMtpBuffer::wide_current),owner->view(HipMtpBuffer::wide_next));
                 hyper(c,MtpHyperRole::head,stream);
                 draft->launch(hidden,k,stream);
-                if(min_probability>0.0F && k+1U<requested) {
+                if((min_probability>0.0F || keep_drafting) && k+1U<requested) {
                     draft->wait_step(k,stream);
-                    if(draft->probability(k)<min_probability) {depth=k+1U;break;}
+                    if(min_probability>0.0F && draft->probability(k)<min_probability) {depth=k+1U;break;}
                     if(keep_drafting) {
-                        probabilities.resize(k+1U);for(std::uint32_t j=0;j<=k;++j) probabilities[j]=draft->probability(j);
+                        probabilities.resize(k+1U);runner_ups.resize(k+1U);
+                        for(std::uint32_t j=0;j<=k;++j) {probabilities[j]=draft->probability(j);runner_ups[j]=draft->runner_up_probability(j);}
                         if(!keep_drafting(probabilities)) {depth=k+1U;break;}
                     }
                 }
             }
             owner->complete();
             auto tokens=draft->read(depth);
-            probabilities.resize(depth);for(std::uint32_t k=0;k<depth;++k) probabilities[k]=draft->probability(k);
-            // STRIX_MTP_DRAFT_LOG=1: every proposal (chain start position, step, token, probability bits) on stderr.
+            probabilities.resize(depth);runner_ups.resize(depth);
+            for(std::uint32_t k=0;k<depth;++k) {probabilities[k]=draft->probability(k);runner_ups[k]=draft->runner_up_probability(k);}
+            // STRIX_MTP_DRAFT_LOG=1: every proposal (chain start position, step, token, probability bits and
+            // runner-up probability bits, zero unless the head reduces runner-ups) on stderr.
             static const bool log_drafts=std::getenv("STRIX_MTP_DRAFT_LOG")!=nullptr;
             if(log_drafts) for(std::uint32_t k=0;k<depth;++k) {
-                std::uint32_t bits=0;std::memcpy(&bits,&probabilities[k],sizeof(bits));
-                std::fprintf(stderr,"draft at=%llu k=%u token=%u p=%08x\n",static_cast<unsigned long long>(next_source),k,tokens[k],bits);
+                std::uint32_t bits=0,bits2=0;std::memcpy(&bits,&probabilities[k],sizeof(bits));std::memcpy(&bits2,&runner_ups[k],sizeof(bits2));
+                std::fprintf(stderr,"draft at=%llu k=%u token=%u p=%08x p2=%08x\n",static_cast<unsigned long long>(next_source),k,tokens[k],bits,bits2);
             }
             active=false;next_source+=depth;stats.full_forward_rows+=depth;validation.reset();
             // Row zero is the pending cycle input at base_source, as in read_greedy_token.
@@ -522,7 +526,7 @@ void HipMtpRuntime::begin_cycle(std::uint32_t token,const HipMtpTargetHiddenTick
     // bounded by its current source position after that row was overwritten.
     // The first proposal input always copies the authoritative cycle ticket.
     p.base_previous_target=p.last_target;p.base_previous_input=p.last_teacher_next_input;
-    p.cycle_base=ticket;p.base_source=p.next_source;p.pending_token=token;p.candidates.clear();p.probabilities.clear();p.cycle=true;p.first_cache_reusable=false;
+    p.cycle_base=ticket;p.base_source=p.next_source;p.pending_token=token;p.candidates.clear();p.probabilities.clear();p.runner_ups.clear();p.cycle=true;p.first_cache_reusable=false;
     p.replay.clear();p.reconcile_final.reset();p.have_replay=false;
     if(p.draft) p.draft->observe(std::span<const std::uint32_t>(&token,1));
 }
@@ -577,6 +581,7 @@ std::vector<std::uint32_t> HipMtpRuntime::propose_chain(const QualifiedMtpDraftP
     return p.chain(depth,min_probability,keep_drafting);
 }
 std::span<const float> HipMtpRuntime::draft_probabilities() const noexcept {return impl_->probabilities;}
+std::span<const float> HipMtpRuntime::draft_runner_up_probabilities() const noexcept {return impl_->runner_ups;}
 void HipMtpRuntime::dispatch_mtp_step(const MtpForwardStepContext& call) {
     auto& p=*impl_;
     try {

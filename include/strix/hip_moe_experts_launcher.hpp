@@ -61,10 +61,13 @@ void moe_experts_known_window_rows_preflight(
     std::span<const ExecutionDispatchContext> rows,
     const HipMoeExpertsLauncherConfig& config,
     const q51_known_rows::Workspace& workspace);
+// active_rows (0 = every row): rows from active_rows on are left out of the expert union and get a zero
+// routed output (their MoE output is the shared expert only); the caller must never accept them.
 void moe_experts_known_window_rows_launch(
     std::span<const ExecutionDispatchContext> rows,
     const HipMoeExpertsLauncherConfig& config,
-    const q51_known_rows::Workspace& workspace);
+    const q51_known_rows::Workspace& workspace,
+    std::uint32_t active_rows = 0);
 // Known-prompt prefill, A8 profile: all T rows (multiple of 8) of one routed step in one
 // call. Every 8-row chunk passes the window admission above (with the window's own
 // 8-row workspace); each per-row view must then be row 0 plus r times one stride.

@@ -201,10 +201,11 @@ template<unsigned H,unsigned E> struct Fixture {
         upload(scratch,seed.data(),seed.size());check(hipMemset(reinterpret_cast<void*>(csr.address),0xa5,static_cast<std::size_t>(csr.bytes)),"poison CSR payload");
         check(hipMemset(reinterpret_cast<void*>(record.address),0,8U),"clear known routed D1");
     }
+    unsigned active_rows=0; // candidate union over the first active_rows rows (0 = all)
     std::vector<std::byte> run(bool candidate) {
         reset();const auto s=scope();
         {HipLaunchScope active(s);
-         if(candidate) {moe_experts_known_window_rows_preflight(rows,config,workspace);moe_experts_known_window_rows_launch(rows,config,workspace);}
+         if(candidate) {moe_experts_known_window_rows_preflight(rows,config,workspace);moe_experts_known_window_rows_launch(rows,config,workspace,active_rows);}
          else for(const auto& c:rows) incumbent.function(c,incumbent.user_data);}
         owner->drain();const auto error=read(record);require(std::all_of(error.begin(),error.end(),[](auto b){return b==std::byte{0};}),"valid known routed D1 nonzero");
         return read(scratch);
@@ -336,7 +337,7 @@ __global__ void flush_kernel(const uint4* p,std::size_t count,unsigned* sink) {
 // cold weights. A 256 MiB READ evicts L2/MALL without leaving dirty lines (a
 // write flush makes the timed reads pay its writebacks); a spin kernel hides
 // host enqueue cost.
-template<unsigned H,unsigned E> void bench(unsigned count,unsigned mode,Profile profile={}) {
+template<unsigned H,unsigned E> void bench(unsigned count,unsigned mode,Profile profile={},unsigned active_rows=0) {
     Fixture<H,E> f(count,true,profile);f.prepare(mode);
     const auto expected=f.run(false);require(f.run(true)==expected,"real-geometry candidate differs from per-row incumbent");f.check_csr();
     void* flush=nullptr;check(hipMalloc(&flush,(256U<<20U)+256U),"allocate flush");
@@ -352,7 +353,7 @@ template<unsigned H,unsigned E> void bench(unsigned count,unsigned mode,Profile 
              static_cast<std::size_t>(16U<<20U),reinterpret_cast<unsigned*>(static_cast<char*>(flush)+(256U<<20U)));
          hipLaunchKernelGGL(spin_kernel,dim3(1),dim3(1),0,f.owner->stream,200000LL);
          check(hipEventRecord(a,f.owner->stream),"record");
-         if(candidate) moe_experts_known_window_rows_launch(f.rows,f.config,f.workspace);
+         if(candidate) moe_experts_known_window_rows_launch(f.rows,f.config,f.workspace,active_rows);
          else for(const auto& c:f.rows) f.incumbent.function(c,f.incumbent.user_data);
          check(hipEventRecord(b,f.owner->stream),"record");}
         f.owner->drain();float t=0;check(hipEventElapsedTime(&t,a,b),"elapsed");if(i>=6U)ms[candidate].push_back(t*1000.0F);
@@ -360,12 +361,29 @@ template<unsigned H,unsigned E> void bench(unsigned count,unsigned mode,Profile 
     for(auto& v:ms)std::sort(v.begin(),v.end());
     const auto rows=ms[0][ms[0].size()/2U],candidate=ms[1][ms[1].size()/2U];
     std::set<unsigned> distinct(f.selected.begin(),f.selected.end());
-    std::cout<<"bench "<<(profile.a8?"a8":"f32")<<" gate="<<profile.gate<<" down="<<profile.down<<" T="<<count<<" mode="<<mode<<" distinct="<<distinct.size()<<" union_us="<<candidate
+    std::cout<<"bench "<<(profile.a8?"a8":"f32")<<" gate="<<profile.gate<<" down="<<profile.down<<" T="<<count<<" active="<<(active_rows?active_rows:count)
+             <<" mode="<<mode<<" distinct="<<distinct.size()<<" union_us="<<candidate
              <<" rows_x_1row_us="<<rows<<" ratio="<<candidate/rows<<'\n';
     (void)hipFree(flush);(void)hipEventDestroy(a);(void)hipEventDestroy(b);
 }
 } // namespace
 
+// Active rows: the union over the first `active` rows gives those rows the full union's (per-row
+// incumbent's) bytes, and a zero routed output to the later rows.
+template<unsigned H,unsigned E> void check_active(Fixture<H,E>& f,unsigned active) {
+    const auto expected=f.run(false);
+    f.active_rows=active;const auto actual=f.run(true);f.active_rows=0;
+    for(unsigned r=0;r<f.rows.size();++r) {
+        const auto off=f.output[r].address-f.scratch.address;
+        for(std::uint64_t b=0;b<f.output[r].bytes;++b)
+            require(actual[static_cast<std::size_t>(off+b)]==(r<active?expected[static_cast<std::size_t>(off+b)]:std::byte{0}),
+                "active-row union output differs from the full union (or a padding row is not zero)");
+    }
+}
+template<unsigned H,unsigned E> void check_active_rows(Fixture<H,E>& f,unsigned count) {
+    if(count<4U) return;
+    for(unsigned mode=0;mode<6U;++mode) {f.prepare(mode);for(unsigned active=2U;active<count;++active) check_active(f,active);}
+}
 Profile parse_profile(std::string_view name) {
     if(name=="a8q51")return {true,12U,7U};
     // Canonical A8 census: Q8_0 down on layers 2/4/30/46/47, Q5_K gate/up on layer 2.
@@ -381,13 +399,15 @@ void a8_fixture(unsigned count,Profile profile) {
         f.prepare(mode);const auto expected=f.run(false);
         for(unsigned repeat=0;repeat<2U;++repeat){require(f.run(true)==expected,"A8 union whole arena differs from serial A8 rows");f.check_csr();}
     }
+    check_active_rows(f,count);
     for(unsigned mode=0;mode<3U;++mode)f.reject_device(mode);
     f.readonly_and_guards();
 }
 int main(int argc,char** argv) try {
     if(argc>1&&std::string(argv[1])=="bench") {
         const auto profile=parse_profile(argc>4?argv[4]:"f32");
-        if(argc>3) {bench<2560U,512U>(static_cast<unsigned>(std::stoul(argv[2])),static_cast<unsigned>(std::stoul(argv[3])),profile);return 0;}
+        if(argc>3) {bench<2560U,512U>(static_cast<unsigned>(std::stoul(argv[2])),static_cast<unsigned>(std::stoul(argv[3])),profile,
+            argc>5?static_cast<unsigned>(std::stoul(argv[5])):0U);return 0;}
         for(unsigned count:{2U,4U,8U})for(unsigned mode:{5U,1U,2U})bench<2560U,512U>(count,mode,profile);
         return 0;
     }
@@ -405,6 +425,7 @@ int main(int argc,char** argv) try {
         f.prepare(mode);const auto expected=f.run(false);
         for(unsigned repeat=0;repeat<3U;++repeat) {require(f.run(true)==expected,"native CSR whole arena differs from per-row incumbent");f.check_csr();if(repeat==0U)f.check_raw_oracle();}
     }
+    check_active_rows(f,count);
     f.prepare(1U);for(unsigned fault=0;fault<10U;++fault){f.reject_metadata(fault,false);f.reject_metadata(fault,true);}
     for(unsigned mode=0;mode<3U;++mode)f.reject_device(mode);
     f.readonly_and_guards();
