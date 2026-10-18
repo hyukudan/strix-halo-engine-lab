@@ -41,6 +41,9 @@ A wider kernel, larger speculative window, second node or second physical link i
 
 ## Documents
 
+- [Engine reference](ENGINE.md): build options, complete command line, prompt prefill, draft vocabularies,
+  environment switches and repository layout (moved from the top-level README).
+
 - [01 — Target platform](architecture/01-target-platform.md)
 - [02 — Memory and residency](architecture/02-memory-and-residency.md)
 - [03 — Model loading and weight layout](architecture/03-model-loading-and-weight-layout.md)

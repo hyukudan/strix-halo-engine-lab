@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="380" viewBox="0 0 920 380" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-labelledby="title desc">
+<title id="title">Measured speed: writing answers and reading prompts</title>
+<desc id="desc">Decode with MTP: exact profile 53.1 tok/s, dense A8 54.9 tok/s. Prefill tok/s by prompt length, exact / dense A8: 1K 401/703, 4K 388/694, 16K 375/668, 32K 371/656. One Bosgame M5 (Ryzen AI Max+ 395, 128 GB) · UD-Q4_K_XL · commit dff1dbe · 2026-10-18.</desc>
+<rect x="0.5" y="0.5" width="919" height="379" rx="10" fill="#ffffff" stroke="#d0d7de"/>
+<text x="28" y="40" font-size="19" font-weight="700" fill="#1f2328">Tokens per second, one Strix Halo box</text>
+<rect x="28" y="56" width="12" height="12" rx="3" fill="#2a78d6"/>
+<text x="46" y="66.5" font-size="12.5" fill="#1f2328">Exact (FP32 dense)</text>
+<rect x="214" y="56" width="12" height="12" rx="3" fill="#eb6834"/>
+<text x="232" y="66.5" font-size="12.5" fill="#1f2328">Dense A8 (recommended)</text>
+<text x="28" y="96" font-size="15" font-weight="600" fill="#1f2328">Writes answers</text>
+<text x="28" y="114" font-size="12" fill="#59636e">decode, MTP on, 256 tokens</text>
+<line x1="62" x2="268" y1="318.0" y2="318.0" stroke="#e6e8eb" stroke-width="1"/>
+<text x="56" y="322.0" font-size="11" text-anchor="end" fill="#59636e">0</text>
+<line x1="62" x2="268" y1="263.7" y2="263.7" stroke="#e6e8eb" stroke-width="1"/>
+<text x="56" y="267.7" font-size="11" text-anchor="end" fill="#59636e">20</text>
+<line x1="62" x2="268" y1="209.4" y2="209.4" stroke="#e6e8eb" stroke-width="1"/>
+<text x="56" y="213.4" font-size="11" text-anchor="end" fill="#59636e">40</text>
+<line x1="62" x2="268" y1="155.1" y2="155.1" stroke="#e6e8eb" stroke-width="1"/>
+<text x="56" y="159.1" font-size="11" text-anchor="end" fill="#59636e">60</text>
+<path d="M130.0,318.0 V177.9 Q130.0,173.9 134.0,173.9 H160.0 Q164.0,173.9 164.0,177.9 V318.0 Z" fill="#2a78d6"/>
+<text x="147.0" y="167.9" font-size="11" text-anchor="middle" fill="#1f2328">53.1</text>
+<path d="M166.0,318.0 V173.0 Q166.0,169.0 170.0,169.0 H196.0 Q200.0,169.0 200.0,173.0 V318.0 Z" fill="#eb6834"/>
+<text x="183.0" y="163.0" font-size="11" text-anchor="middle" fill="#1f2328">54.9</text>
+<text x="165.0" y="336" font-size="12" text-anchor="middle" fill="#59636e">code prompt</text>
+<line x1="62" x2="268" y1="318" y2="318" stroke="#59636e" stroke-width="1"/>
+<text x="330" y="96" font-size="15" font-weight="600" fill="#1f2328">Reads your prompt</text>
+<text x="330" y="114" font-size="12" fill="#59636e">prefill, by prompt length (tokens)</text>
+<line x1="364" x2="892" y1="318.0" y2="318.0" stroke="#e6e8eb" stroke-width="1"/>
+<text x="358" y="322.0" font-size="11" text-anchor="end" fill="#59636e">0</text>
+<line x1="364" x2="892" y1="270.5" y2="270.5" stroke="#e6e8eb" stroke-width="1"/>
+<text x="358" y="274.5" font-size="11" text-anchor="end" fill="#59636e">200</text>
+<line x1="364" x2="892" y1="223.0" y2="223.0" stroke="#e6e8eb" stroke-width="1"/>
+<text x="358" y="227.0" font-size="11" text-anchor="end" fill="#59636e">400</text>
+<line x1="364" x2="892" y1="175.5" y2="175.5" stroke="#e6e8eb" stroke-width="1"/>
+<text x="358" y="179.5" font-size="11" text-anchor="end" fill="#59636e">600</text>
+<line x1="364" x2="892" y1="128.0" y2="128.0" stroke="#e6e8eb" stroke-width="1"/>
+<text x="358" y="132.0" font-size="11" text-anchor="end" fill="#59636e">800</text>
+<path d="M395.0,318.0 V226.8 Q395.0,222.8 399.0,222.8 H425.0 Q429.0,222.8 429.0,226.8 V318.0 Z" fill="#2a78d6"/>
+<text x="412.0" y="216.8" font-size="11" text-anchor="middle" fill="#1f2328">401</text>
+<path d="M431.0,318.0 V155.0 Q431.0,151.0 435.0,151.0 H461.0 Q465.0,151.0 465.0,155.0 V318.0 Z" fill="#eb6834"/>
+<text x="448.0" y="145.0" font-size="11" text-anchor="middle" fill="#1f2328">703</text>
+<text x="430.0" y="336" font-size="12" text-anchor="middle" fill="#59636e">1K</text>
+<path d="M527.0,318.0 V229.8 Q527.0,225.8 531.0,225.8 H557.0 Q561.0,225.8 561.0,229.8 V318.0 Z" fill="#2a78d6"/>
+<text x="544.0" y="219.8" font-size="11" text-anchor="middle" fill="#1f2328">388</text>
+<path d="M563.0,318.0 V157.2 Q563.0,153.2 567.0,153.2 H593.0 Q597.0,153.2 597.0,157.2 V318.0 Z" fill="#eb6834"/>
+<text x="580.0" y="147.2" font-size="11" text-anchor="middle" fill="#1f2328">694</text>
+<text x="562.0" y="336" font-size="12" text-anchor="middle" fill="#59636e">4K</text>
+<path d="M659.0,318.0 V232.9 Q659.0,228.9 663.0,228.9 H689.0 Q693.0,228.9 693.0,232.9 V318.0 Z" fill="#2a78d6"/>
+<text x="676.0" y="222.9" font-size="11" text-anchor="middle" fill="#1f2328">375</text>
+<path d="M695.0,318.0 V163.3 Q695.0,159.3 699.0,159.3 H725.0 Q729.0,159.3 729.0,163.3 V318.0 Z" fill="#eb6834"/>
+<text x="712.0" y="153.3" font-size="11" text-anchor="middle" fill="#1f2328">668</text>
+<text x="694.0" y="336" font-size="12" text-anchor="middle" fill="#59636e">16K</text>
+<path d="M791.0,318.0 V233.9 Q791.0,229.9 795.0,229.9 H821.0 Q825.0,229.9 825.0,233.9 V318.0 Z" fill="#2a78d6"/>
+<text x="808.0" y="223.9" font-size="11" text-anchor="middle" fill="#1f2328">371</text>
+<path d="M827.0,318.0 V166.2 Q827.0,162.2 831.0,162.2 H857.0 Q861.0,162.2 861.0,166.2 V318.0 Z" fill="#eb6834"/>
+<text x="844.0" y="156.2" font-size="11" text-anchor="middle" fill="#1f2328">656</text>
+<text x="826.0" y="336" font-size="12" text-anchor="middle" fill="#59636e">32K</text>
+<line x1="364" x2="892" y1="318" y2="318" stroke="#59636e" stroke-width="1"/>
+<text x="28" y="364" font-size="11" fill="#59636e">One Bosgame M5 (Ryzen AI Max+ 395, 128 GB) · UD-Q4_K_XL · commit dff1dbe · 2026-10-18. Higher is better.</text>
+</svg>
