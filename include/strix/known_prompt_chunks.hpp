@@ -23,6 +23,10 @@ struct KnownPromptChunkRequest {
     // Explicit separate T16..2048 typed prefill capability. Default2/4/8
     // window contracts and callbacks retain their existing closed widths.
     bool tiled_prefill = false;
+    // Tiled all-rows prefill whose every row's logits are read (teacher-forced scoring): no block
+    // runs headless. The window backend delivers the non-terminal rows itself; the cursor still
+    // keeps only the terminal frontier.
+    bool all_row_heads = false;
 };
 struct KnownPromptChunkProgress {
     std::uint64_t next_position = 0;

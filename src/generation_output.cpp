@@ -34,6 +34,24 @@ void validate(const GenerationOutputRequest& request) {
 }
 } // namespace
 
+void compute_requested_logprobs(std::span<const float> logits, std::span<const std::uint32_t> ids,
+    std::span<RequestedLogprob> out) {
+    if (logits.empty() || out.size()!=ids.size())
+        throw std::invalid_argument("requested logprobs need logits and one output per ID");
+    for (const auto id:ids) if (id>=logits.size()) throw std::invalid_argument("requested logprob token is outside vocabulary");
+    double maximum=static_cast<double>(logits.front());
+    for (const auto value:logits) if (static_cast<double>(value)>maximum) maximum=static_cast<double>(value);
+    double denominator=0;
+    for (const auto value:logits) denominator+=std::exp(static_cast<double>(value)-maximum);
+    const double centered_log_normalizer=std::log(denominator);
+    for (std::size_t i=0;i<ids.size();++i) {
+        const auto id=ids[i];
+        // Subtract in centered coordinates: max+log(sum) would lose the
+        // normalizer for large finite F32 logits with equal maxima.
+        out[i]={id,(static_cast<double>(logits[id])-maximum)-centered_log_normalizer};
+    }
+}
+
 GenerationOutputResult execute_generation_output(const GenerationOutputRequest& request, SerialGreedyStepBackend& backend) {
     validate(request);
     GenerationOutputResult result;
@@ -63,19 +81,7 @@ GenerationOutputResult execute_generation_output(const GenerationOutputRequest& 
         if (token) result.token=selected;
         if (verify) result.verification_selection=selected;
     }
-    if (logprobs) {
-        double maximum=static_cast<double>(logits.front());
-        for (const auto value:logits) if (static_cast<double>(value)>maximum) maximum=static_cast<double>(value);
-        double denominator=0;
-        for (const auto value:logits) denominator+=std::exp(static_cast<double>(value)-maximum);
-        const double centered_log_normalizer=std::log(denominator);
-        for (std::size_t i=0;i<request.logprob_token_ids.size();++i) {
-            const auto id=request.logprob_token_ids[i];
-            // Subtract in centered coordinates: max+log(sum) would lose the
-            // normalizer for large finite F32 logits with equal maxima.
-            result.requested_logprobs[i]={id,(static_cast<double>(logits[id])-maximum)-centered_log_normalizer};
-        }
-    }
+    if (logprobs) compute_requested_logprobs(logits,request.logprob_token_ids,result.requested_logprobs);
     if (full) result.logits=std::move(logits);
     return result;
 }

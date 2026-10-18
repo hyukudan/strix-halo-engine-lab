@@ -1254,6 +1254,48 @@ int main() {
     incompatible_teacher = teacher; incompatible_teacher.mtp.enabled = true;
     rejects([&] { validate_teacher_forced_score(incompatible_teacher); },
         "teacher-forced score requires at least two teacher inputs and generate 1 in serial eager full-output diagnostic mode");
+    // Teacher forcing over the tiled known-prefix prefill: full rows, T rows and every row's head.
+    auto tiled_teacher = teacher;
+    tiled_teacher.known_prefix_window = true; tiled_teacher.known_prefix_full_rows = true;
+    tiled_teacher.known_prefix_prefill_rows = 256; tiled_teacher.known_prefix_expert_union = true;
+    expect(teacher_forced_tiled(tiled_teacher) && !teacher_forced_tiled(teacher), "tiled teacher route is selected by the tiled prefill flags");
+    validate_teacher_forced_score(tiled_teacher);
+    validate_resolved_teacher_forced_score(tiled_teacher, 4);
+    const auto tiled_message = "teacher-forced score over a known prefix requires the tiled prefill "
+        "(--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T) with the all-rows output policy";
+    for (const auto policy : {KnownWindowOutputPolicy::terminal_row, KnownWindowOutputPolicy::state_only}) {
+        auto invalid = tiled_teacher; invalid.known_prefix_output_policy = policy;
+        rejects([&] { validate_teacher_forced_score(invalid); }, tiled_message);
+    }
+    auto untiled = tiled_teacher; untiled.known_prefix_prefill_rows = 0;
+    rejects([&] { validate_teacher_forced_score(untiled); }, tiled_message);
+    untiled = tiled_teacher; untiled.known_prefix_full_rows = false;
+    rejects([&] { validate_teacher_forced_score(untiled); }, tiled_message);
+    untiled = tiled_teacher; untiled.known_prefix_window = false;
+    rejects([&] { validate_teacher_forced_score(untiled); }, tiled_message);
+    untiled = teacher; untiled.known_prefix_expert_union = true;
+    rejects([&] { validate_teacher_forced_score(untiled); }, tiled_message);
+    auto tiled_invalid = tiled_teacher; tiled_invalid.generate_tokens = 2;
+    rejects([&] { validate_teacher_forced_score(tiled_invalid); },
+        "teacher-forced score requires at least two teacher inputs and generate 1 in serial eager full-output diagnostic mode");
+    tiled_invalid = tiled_teacher; tiled_invalid.prompt_lookup = true;
+    rejects([&] { validate_teacher_forced_score(tiled_invalid); },
+        "teacher-forced score requires at least two teacher inputs and generate 1 in serial eager full-output diagnostic mode");
+    tiled_invalid = tiled_teacher; tiled_invalid.mtp.enabled = true;
+    rejects([&] { validate_teacher_forced_score(tiled_invalid); },
+        "teacher-forced score requires at least two teacher inputs and generate 1 in serial eager full-output diagnostic mode");
+    auto tiled_parsed = parse({"decoder", "m", "1", "2", "3", "--generate", "1", "--teacher-forced-score",
+        "--known-prefix-window", "--known-prefix-full-rows", "--known-prefix-prefill-rows", "16",
+        "--known-prefix-workspace-budget-bytes", "8589934592", "--known-prefix-host-metadata-budget-bytes", "67108864",
+        "--known-prefix-uma-budget-bytes", "128849018880", "--known-prefix-host-headroom-bytes", "4294967296"});
+    expect(teacher_forced_tiled(tiled_parsed) && tiled_parsed.known_prefix_output_policy == KnownWindowOutputPolicy::all_rows,
+        "tiled teacher forcing parses with the default all-rows policy");
+    rejects([] { (void)parse({"decoder", "m", "1", "2", "3", "--generate", "1", "--teacher-forced-score",
+        "--known-prefix-window", "--known-prefix-full-rows", "--known-prefix-prefill-rows", "16",
+        "--known-prefix-output-policy", "terminal-row",
+        "--known-prefix-workspace-budget-bytes", "8589934592", "--known-prefix-host-metadata-budget-bytes", "67108864",
+        "--known-prefix-uma-budget-bytes", "128849018880", "--known-prefix-host-headroom-bytes", "4294967296"}); },
+        tiled_message);
     // Stored-byte relocation has a separate closed admission contract and never
     // acts as a low-level organization flag.
     auto copy_options = parse({"decoder", "fixture.gguf", "1", "--generate", "2",

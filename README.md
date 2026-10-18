@@ -113,6 +113,10 @@ different profile from decode; today only the dense-A8 sibling of `--numerical-p
 windows always use `--numerical-profile`, MTP goldens record both profiles, and MTP stays exact from the state the
 prefill produced. See [docs/prefill-numerical-profile.md](docs/prefill-numerical-profile.md) (D-033).
 
+Teacher-forced scoring (`--teacher-forced-score`, `--teacher-logits-file`) also runs over the tiled prefill with the
+all-rows output policy, producing byte-identical logits files to the serial route within a profile, several times
+faster. See [docs/teacher-forced-tiled-prefill.md](docs/teacher-forced-tiled-prefill.md) (D-034).
+
 **2. Kernel organization required by the windows** (A8 MoE, wave8 Q8 GDN, deferred MoE status, HC chain)
 
 ```

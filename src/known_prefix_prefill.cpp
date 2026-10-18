@@ -67,6 +67,9 @@ CompiledKnownPrefixPrefill compile_known_prefix_prefill(const ModelContract& mod
     tile.r2_gdn=request.r2_gdn;tile.r2_gdn_f32_gates=request.r2_gdn_f32_gates;tile.routed_expert_union=request.routed_expert_union;
     tile.router_rows=request.router_rows;tile.combine_inject_rows=request.combine_inject_rows;
     tile.rows_hyper_mix=request.rows_hyper_mix;tile.qsa_rows=request.qsa_rows;tile.rows_ple=request.rows_ple;
+    require(!request.lm_head_rows||request.output_policy==KnownWindowOutputPolicy::all_rows,
+        "known prefill multi-row LM head requires the all-rows output policy");
+    tile.lm_head_rows=request.lm_head_rows;
     // Preserve complete tile admission even when this T request omits heads.
     plan.tile8=compile_known_prefix_window(model,serial,manifest,access,tile);
     require(known_window_has_promoted_steps(plan.tile8),"known prefill requires an actual admitted multi-row projection entry");

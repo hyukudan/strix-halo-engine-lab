@@ -313,6 +313,39 @@ Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL), FP32-dense (F) 
 | Deferred-normalization pair (decode FP32-dense, prefill dense A8), tiled 1024 | Runs; 32 tokens equal to both pure deferred profiles (which agree here) |
 | Peak RSS, split vs pure prefill profile | +3.8 MB tiled, +0.1 MB MTP; no added device allocation |
 
+## D-034: teacher-forced scoring over the tiled prefill
+
+`--teacher-forced-score` (and `--teacher-logits-file`) is admitted on the tiled known-prefix prefill
+(`--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T`, all-rows output policy) as
+well as on the serial eager route. No block runs headless; each block's T heads run as the multi-row prefetch
+Q8_0 head (packs of eight, the R1 head's per-row leaf/reduction tree) when the serial head is that head. After
+a block commits, its T rows are downloaded with one strided copy into a retained pinned staging buffer of T x
+vocabulary floats and scored with the serial consumer's arithmetic (shared `compute_requested_logprobs`),
+rows in parallel host threads, then appended to the ledger in position order; the block's spool append runs on
+a background thread overlapping the next block and is drained before the staging is reused. The unpadded suffix
+runs serially through the same consumer. File format, row order, footer and score rows are unchanged. Rows
+of complete blocks carry the prefill profile, suffix rows the decode profile; the receipt records the route,
+the row counts per route and both profiles (see
+[docs/teacher-forced-tiled-prefill.md](docs/teacher-forced-tiled-prefill.md)).
+
+Why: the serial route is the only way to score long documents, at about 13 minutes per 16K-token document and
+profile; the tiled prefill reproduces serial rows bit for bit within a profile, so the same files can come from
+it in a fraction of the time. The staging buffer bounds host memory by T rows; no device memory is added (the
+arena already holds every row's logits stripe).
+
+Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL), wall time including model load, serial route
+with the automatic organization, tiled route with the explicit v5 flag set; F = FP32-dense profile, A = dense A8:
+
+| Check | Result |
+| --- | --- |
+| 1536 tokens (wiki), T=256 (6 blocks, final input inside the last block), F and A | Logits file byte-identical to serial (SHA-256), 1535 score rows equal, same generated token; 75 s serial vs 10 s tiled |
+| 2000 tokens (code), T=512 (3 blocks + 464 serial suffix rows), F and A | Byte-identical, score rows equal; 98 s vs 32-34 s |
+| Split pair, decode F / prefill A, 1536 tokens, T=256 | Byte-identical to the serial A file (every row in a block) |
+| Serial route, new binary vs base | Byte-identical file and score rows |
+| 4096 tokens, T=2048, F | Byte-identical, 4095 score rows equal; 205 s vs 25 s |
+| 16384 tokens (wiki), T=2048, F | Byte-identical (16.3 GB file), 16383 score rows equal; 1001 s serial vs 66 s tiled |
+| 16384 tokens, where the tiled time goes (per 2048-row block) | 7-8 s GPU against 5.4 s for the same prefill with only the terminal head (the eight-row heads add about 2.6 s), 31 ms download, 150 ms scoring; the 0.3-2.8 s spool overlaps the next block |
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |

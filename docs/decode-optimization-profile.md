@@ -273,6 +273,11 @@ uses the same poison/drain failure path as the score ledger. Full-logit exports
 are for independent KL/top-1 analysis, not a performance run; no metric or
 qualification is inferred merely because a file was created.
 
+Both outputs can also be produced through the tiled known-prefix prefill
+(`--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T`
+with the all-rows output policy), with the same file format, row order and score
+rows; see [teacher-forced-tiled-prefill.md](teacher-forced-tiled-prefill.md).
+
 ## Experimental recurrent island layout
 
 `--gdn-recurrent-layout transposed` can explicitly compose with GDN islands in

@@ -122,6 +122,27 @@ int main() {
         catch(const std::invalid_argument&) {rejected=true;}
         expect(rejected,"out-of-vocabulary scalar cannot become a valid verification selection");
     }
+    {
+        // Held logits (a tiled prefill row) score bit-identically to the backend route.
+        Backend backend;backend.values={3.5F,-2.25F,1e30F,1e30F,0.125F};
+        const std::vector<std::uint32_t> ids{2,0,4,2};
+        const auto routed=strix::execute_generation_output({Need::requested_logprobs,1,5,5,ids},backend);
+        std::vector<strix::RequestedLogprob> held(ids.size());
+        strix::compute_requested_logprobs(backend.values,ids,held);
+        bool same=routed.requested_logprobs.size()==held.size();
+        for(std::size_t i=0;same&&i<held.size();++i)
+            same=held[i].token_id==routed.requested_logprobs[i].token_id&&
+                std::bit_cast<std::uint64_t>(held[i].log_probability)==std::bit_cast<std::uint64_t>(routed.requested_logprobs[i].log_probability);
+        expect(same,"held-logit requested logprobs equal the backend route bit for bit");
+        bool rejected=false;
+        try {std::vector<strix::RequestedLogprob> one(1);const std::uint32_t far[1]{5};strix::compute_requested_logprobs(backend.values,far,one);}
+        catch(const std::invalid_argument&) {rejected=true;}
+        expect(rejected,"held-logit requested logprob rejects an ID outside the row");
+        rejected=false;
+        try {std::vector<strix::RequestedLogprob> none;strix::compute_requested_logprobs(backend.values,ids,none);}
+        catch(const std::invalid_argument&) {rejected=true;}
+        expect(rejected,"held-logit requested logprobs need one output per ID");
+    }
     if(!failures) std::cout<<"generation output tests passed\n";
     return failures?1:0;
 }

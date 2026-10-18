@@ -16,6 +16,9 @@ struct KnownPrefillRequest {
     bool rows_hyper_mix=false,qsa_rows=false;
     // PLE rows from host-staged lookups (all T rows chained, see HipPleKnownWindow prefill).
     bool rows_ple=false;
+    // Multi-row LM head (packs of eight rows, the R1 head's leaf and reduction tree per row) for an
+    // all-rows request whose every row's logits are read (teacher-forced scoring over the prefill).
+    bool lm_head_rows=false;
 };
 struct CompiledKnownPrefixPrefill {
     std::uint32_t logical_rows=0;

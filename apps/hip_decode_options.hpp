@@ -521,14 +521,26 @@ inline void validate_resolved_requested_logprobs(const Options& options, std::ui
         if (id >= vocabulary) throw std::invalid_argument("requested logprob token exceeds model vocabulary");
 }
 
+// Teacher-forced scoring runs on the serial eager route, or on the tiled known-prefix prefill with
+// every row's head (all-rows output policy): complete T-row blocks are scored as they commit and
+// the unpadded suffix rows serially.
+[[nodiscard]] inline bool teacher_forced_tiled(const Options& options) noexcept {
+    return options.teacher_forced_score && options.known_prefix_window && options.known_prefix_full_rows &&
+        options.known_prefix_prefill_rows;
+}
+
 inline void validate_teacher_forced_score(const Options& options) {
     if (!options.teacher_logits_path.empty() && !options.teacher_forced_score)
         throw std::invalid_argument("teacher logits file requires teacher-forced score");
     if (!options.teacher_forced_score) return;
+    if ((options.known_prefix_window || options.known_prefix_prefill_rows || options.known_prefix_expert_union ||
+         options.known_prefix_full_rows) &&
+        (!teacher_forced_tiled(options) || options.known_prefix_output_policy != strix::KnownWindowOutputPolicy::all_rows))
+        throw std::invalid_argument("teacher-forced score over a known prefix requires the tiled prefill "
+            "(--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T) with the all-rows output policy");
     if (options.generate_tokens != 1 || options.tokens.size() < 2 || options.tokens.size() > 262144U ||
         options.execution.mode != DecodeExecutionMode::eager || options.execution.integer_head != DecodeIntegerHead::none ||
         !options.logprob_token_ids.empty() || options.gpu_greedy_token || options.mtp.enabled || options.mtp.supplied ||
-        options.known_prefix_window || options.known_prefix_prefill_rows || options.known_prefix_expert_union ||
         options.prompt_lookup || !options.serving_prefix_files.empty() || options.prefix_cache_roundtrip ||
         !options.raw_recording_path.empty() || !options.validation_final_state_path.empty() ||
         !options.reference_path.empty() || options.moe_token_cost_policy)

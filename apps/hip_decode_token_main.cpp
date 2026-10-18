@@ -93,6 +93,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -101,6 +102,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -719,6 +721,7 @@ public:
         }
     }
     std::vector<float> execute(std::uint32_t token, std::uint64_t position) override {
+        drain_block_spool();
         if (!teacher_inputs_.empty() && (position >= teacher_inputs_.size() ||
             teacher_inputs_[static_cast<std::size_t>(position)] != token || rows_.size() != position))
             throw std::invalid_argument("teacher-forced score input or position differs from its retained sequence");
@@ -754,6 +757,81 @@ public:
         if (!teacher_inputs_.empty()) static_cast<void>(execute(token, position));
         else target_.execute_state(token, position);
     }
+    // Teacher-forced rows of one committed tiled prefill block: `logits` holds tokens.size() full
+    // FP32 rows in row order, computed by the block (no target call here). Each row is scored with
+    // the same validation and requested-logprob arithmetic as execute() and appended to the score
+    // ledger in position order before this returns. Rows are scored in parallel (independent; each
+    // row's arithmetic is sequential and unchanged). The spool append of the block (and the footer
+    // when the final teacher input is in it) runs on a background thread while the next block
+    // computes: `logits` must stay valid until drain_block_spool(), which the window backend calls
+    // before overwriting its staging and every later consumer call makes before touching the spool.
+    void record_block(std::span<const std::uint32_t> tokens, std::uint64_t first_position, std::span<const float> logits) {
+        drain_block_spool();
+        const auto started_at = std::chrono::steady_clock::now();
+        const auto count = tokens.size();
+        if (teacher_inputs_.empty() || !count || logits.size() != count * vocabulary_ || rows_.size() != first_position ||
+            first_position > teacher_inputs_.size() || count > teacher_inputs_.size() - first_position)
+            throw std::invalid_argument("teacher-forced block differs from its retained sequence");
+        for (std::size_t r = 0; r < count; ++r)
+            if (teacher_inputs_[static_cast<std::size_t>(first_position) + r] != tokens[r])
+                throw std::invalid_argument("teacher-forced block input differs from its retained sequence");
+        const bool terminal = first_position + count == teacher_inputs_.size();
+        const auto scored = terminal ? count - 1U : count;
+        if (rows_.size() + scored > maximum_rows_) throw std::length_error("requested logprob ledger capacity exhausted");
+        const auto vocabulary = static_cast<std::size_t>(vocabulary_);
+        const auto row_logits = [logits, vocabulary](std::size_t r) { return logits.subspan(r * vocabulary, vocabulary); };
+        std::vector<std::array<strix::RequestedLogprob, 1>> values(count);
+        std::vector<std::exception_ptr> errors(count);
+        const auto score = [&](std::size_t r) {
+            try {
+                strix::validate_serial_decode_engine_logits(row_logits(r), vocabulary_);
+                if (r < scored) {
+                    const std::array<std::uint32_t, 1> next{teacher_inputs_[static_cast<std::size_t>(first_position) + r + 1U]};
+                    strix::compute_requested_logprobs(row_logits(r), next, values[r]);
+                }
+            } catch (...) { errors[r] = std::current_exception(); }
+        };
+        const auto workers = std::min<std::size_t>(count, std::min(16U, std::max(1U, std::thread::hardware_concurrency())));
+        {
+            std::vector<std::thread> threads;
+            threads.reserve(workers);
+            for (std::size_t w = 0; w < workers; ++w)
+                threads.emplace_back([&, w] { for (std::size_t r = w; r < count; r += workers) score(r); });
+            for (auto& thread : threads) thread.join();
+        }
+        for (const auto& error : errors) if (error) std::rethrow_exception(error);
+        for (std::size_t r = 0; r < scored; ++r)
+            rows_.push_back({tokens[r], first_position + r, {values[r].begin(), values[r].end()}});
+        tiled_rows_ += count;
+        // STRIX_PREFILL_TIMING=1: host milliseconds of scoring and spooling each block on stderr.
+        static const bool timing = [] { const char* v = std::getenv("STRIX_PREFILL_TIMING"); return v && v[0] == '1'; }();
+        if (timing)
+            std::fprintf(stderr, "teacher block %llu rows: score %.1f ms\n", static_cast<unsigned long long>(count),
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started_at).count());
+        if (!spool_) return;
+        std::vector<std::uint32_t> inputs(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(scored));
+        pending_spool_ = std::async(std::launch::async, [this, inputs = std::move(inputs), first_position, row_logits, terminal] {
+            const auto spool_start = std::chrono::steady_clock::now();
+            for (std::size_t r = 0; r < inputs.size(); ++r) spool_->append(inputs[r], first_position + r, row_logits(r));
+            if (terminal) spool_->finish();
+            if (timing)
+                std::fprintf(stderr, "teacher block spool %.1f ms (overlapped)\n",
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - spool_start).count());
+        });
+    }
+    // Completes the background spool of the last block and reports its failure. A failed spool
+    // after committed rows poisons the session like a failed serial-row spool.
+    void drain_block_spool() {
+        if (!pending_spool_.valid()) return;
+        try { pending_spool_.get(); }
+        catch (...) {
+            session_.health = strix::SerialSessionHealth::poisoned;
+            session_.arithmetic_lineage.tainted = true;
+            guard_->recover_or_fail_stop();
+            throw;
+        }
+    }
+    std::uint64_t tiled_rows() const noexcept { return tiled_rows_; }
     const std::vector<Row>& rows() const noexcept { return rows_; }
 private:
     strix::SerialGreedyStepBackend& target_;
@@ -765,6 +843,8 @@ private:
     std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard_;
     std::vector<Row> rows_;
     std::unique_ptr<strix::TeacherLogitSpool> spool_;
+    std::uint64_t tiled_rows_ = 0;
+    std::future<void> pending_spool_; // declared last: destroyed (joined) before the spool it writes
 };
 
 class ObservedServingBackend final : public strix::SerialGreedyStepBackend, public strix::ServingCohortObservation {
@@ -3016,7 +3096,8 @@ int STRIX_DECODE_ENTRY(
                      options.known_prefix_output_policy, options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U,
                      options.known_window_router_rows || options.known_prefix_full_rows,
                      options.known_window_router_rows || options.known_prefix_full_rows,
-                     options.known_prefix_full_rows, options.known_prefix_full_rows, options.known_prefix_full_rows}));
+                     options.known_prefix_full_rows, options.known_prefix_full_rows, options.known_prefix_full_rows,
+                     options.teacher_forced_score}));
                 known_prefix_plan = known_prefill_plan->tile8; // selection ledger, never a relabelled T forward
             } else {
                 const bool full = options.known_prefix_full_rows;
@@ -3080,6 +3161,10 @@ int STRIX_DECODE_ENTRY(
                     multiply(known_prefill_plan->logit_row_indices.size(), sizeof(strix::ExecutionBufferAddress)));
                 if (known_prefill_plan->output_policy != strix::KnownWindowOutputPolicy::state_only)
                     known_prefill_runtime_payload = add(known_prefill_runtime_payload, multiply(model.vocab_size, 2U * sizeof(float)));
+                // Teacher-forced scoring: pinned staging of one block's T full rows (the spool streams them out).
+                if (options.teacher_forced_score)
+                    known_prefill_runtime_payload = add(known_prefill_runtime_payload,
+                        multiply(multiply(known_prefill_plan->logical_rows, model.vocab_size), sizeof(float)));
                 auto growth = add(known_prefill_plan->arena.physical.total_bytes, add(8U, union_bytes));
                 growth = add(growth, add(known_prefill_plan->host_metadata_payload_bytes, map_bytes)); // native owner's second copy
                 growth = add(growth, options.known_prefill_host_headroom); // explicit allocator/driver/fixed-plan allowance
@@ -3122,6 +3207,15 @@ int STRIX_DECODE_ENTRY(
                 if (!known_prefill_plan || !known_prefix_backend || options.prompt_lookup)
                     throw std::logic_error("split prefill profile reached a non-tiled known-prefix route");
                 known_prefix_backend->set_executor_handoff({&compiled, &resources}, {&*compiled_prefill, &prefill_resources});
+            }
+            // Teacher-forced scoring: every row of every block is scored and spooled as it commits.
+            if (options.teacher_forced_score) {
+                if (!known_prefill_plan || !known_prefix_backend || !requested_logprobs ||
+                    known_prefill_plan->output_policy != strix::KnownWindowOutputPolicy::all_rows)
+                    throw std::logic_error("teacher-forced score reached a known-prefix route other than the tiled all-rows prefill");
+                known_prefix_backend->set_all_rows_sink([target = requested_logprobs.get()](std::span<const std::uint32_t> tokens,
+                    std::uint64_t position, std::span<const float> logits) { target->record_block(tokens, position, logits); },
+                    [target = requested_logprobs.get()] { target->drain_block_spool(); });
             }
             if (options.prompt_lookup)
                 lookup_runtime = std::make_unique<strix::HipPromptLookupRuntime>(compiled, model, catalog_config,
@@ -3216,7 +3310,10 @@ int STRIX_DECODE_ENTRY(
             paired.logical_rows = options.known_prefix_prefill_rows ? options.known_prefix_prefill_rows : options.known_prefix_rows;
             paired.tiled_prefill = static_cast<bool>(known_prefill_plan);
             paired.output_policy = options.known_prefix_output_policy;
-            strix::KnownPromptChunkCursor chunks(paired, *known_prefix_backend, backend);
+            // Teacher-forced: no headless block, and the serial suffix rows are scored like serial rows.
+            paired.all_row_heads = options.teacher_forced_score;
+            strix::KnownPromptChunkCursor chunks(paired, *known_prefix_backend,
+                options.teacher_forced_score ? *generation_backend : static_cast<strix::SerialGreedyStepBackend&>(backend));
             while (chunks.advance()) { /* one complete configured window or one unpadded serial suffix row */ }
             const auto& generated = chunks.finish_greedy();
             known_prefix_progress = chunks.progress();
@@ -3232,6 +3329,8 @@ int STRIX_DECODE_ENTRY(
             total.steps_executed += known_prefix_result->consumed_prompt_tokens;
             return total;
         }();
+        // The spool of a final tiled block (with its footer) completes before anything is reported.
+        if (requested_logprobs) requested_logprobs->drain_block_spool();
         if (options.teacher_forced_score && (!requested_logprobs ||
             requested_logprobs->rows().size() != options.tokens.size() - 1U)) {
             session.health = strix::SerialSessionHealth::poisoned;
@@ -3353,6 +3452,23 @@ int STRIX_DECODE_ENTRY(
                 << "  \"prompt_lookup_full_logits_d2h_bytes\":0,\n"
                 << "  \"prompt_lookup_serial_status_execution_identity\":" << known_prefix_memory->serial_scope.deferred_moe_status.execution_identity << ",\n"
                 << "  \"prompt_lookup_window_status_execution_identity\":" << known_prefix_memory->scope.deferred_moe_status.execution_identity << ",\n";
+        }
+        if (requested_logprobs && options.teacher_forced_score) {
+            // Route of the scored rows: rows of complete tiled blocks carry the prefill profile's
+            // arithmetic, serial rows (all of them on the serial route, the unpadded suffix on the
+            // tiled one) the decode profile's; both identities are in this receipt.
+            const auto pair = strix::decode_cli::numerical_profile_pair(options);
+            const auto tiled_rows = requested_logprobs->tiled_rows();
+            std::cout << "  \"teacher_forced_route\":\"" << (known_prefill_plan ? "tiled-known-prefix-prefill" : "serial-eager") << "\",\n"
+                << "  \"teacher_forced_tiled_input_rows\":" << tiled_rows << ",\n"
+                << "  \"teacher_forced_serial_input_rows\":" << options.tokens.size() - tiled_rows << ",\n"
+                << "  \"teacher_forced_tiled_rows_numerical_profile\":\""
+                << (tiled_rows ? strix::numerical_profile_name(pair.prefill) : std::string_view("none")) << "\",\n"
+                << "  \"teacher_forced_serial_rows_numerical_profile\":\""
+                << (options.tokens.size() > tiled_rows ? strix::numerical_profile_name(pair.decode) : std::string_view("none")) << "\",\n";
+            if (known_prefill_plan)
+                std::cout << "  \"teacher_forced_tiled_lm_head\":\""
+                    << (known_prefill_plan->tile8.lm_head_rows_steps ? "rows8-r1-reduction-tree" : "r1-row-loop") << "\",\n";
         }
         if (requested_logprobs) {
             if (!options.teacher_logits_path.empty())

@@ -64,4 +64,10 @@ struct GenerationOutputResult {
 [[nodiscard]] GenerationOutputResult execute_generation_output(
     const GenerationOutputRequest& request, SerialGreedyStepBackend& backend);
 
+// The requested-logprob arithmetic of execute_generation_output, for logits a caller already holds
+// (rows of a tiled prefill block): FP64 maximum, ascending-ID exp sum, centered subtraction. The
+// caller validates the full finite vocabulary and the IDs first. Writes one value per ID into out.
+void compute_requested_logprobs(std::span<const float> logits, std::span<const std::uint32_t> ids,
+    std::span<RequestedLogprob> out);
+
 } // namespace strix
