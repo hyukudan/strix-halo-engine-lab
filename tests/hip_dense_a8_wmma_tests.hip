@@ -711,6 +711,83 @@ void engine_bench(hipStream_t stream) {
     }
 }
 
+// Exact-profile prompt projections: the engine's FP32 q8_rows forms for 64-row launches (sites whose
+// fma is the fused v_fmac_f32 take the VOPD kernels, as GDN/QSA/shared sites do).
+template <class In, unsigned Rows> struct FusedSite : BaselineSite<In, Rows> {
+    static constexpr bool fused_fma = true;
+};
+void exact_bench(hipStream_t stream) {
+    std::cout.setf(std::ios::fixed); std::cout.precision(1);
+    for (const auto& shape : shapes) {
+        std::mt19937 rng(99U);
+        const auto weights_host = make_weights(shape.width, shape.outputs, 0U, rng);
+        Buffer weights(weights_host.size()); weights.upload(weights_host);
+        Activations a(64U, shape.width, shape.bf16);
+        a.upload(make_inputs(64U, shape.width, shape.bf16, 0U, rng));
+        Buffer out(static_cast<std::size_t>(64U) * shape.outputs * 4U);
+        const double flop = 2.0 * 64.0 * shape.width * shape.outputs;
+        const auto run = [&]<class In>() {
+            FusedSite<In, 64U> site{};
+            site.segments = q8_rows::segments({{weights.p, shape.outputs}});
+            for (unsigned r = 0; r < 64U; ++r)
+                site.input[r] = a.input.as<unsigned char>() + static_cast<std::uint64_t>(r) * a.width * sizeof(In);
+            site.width = a.width; site.outputs = shape.outputs; site.output = out.as<float>();
+            const float us = median_us([&] { q8_rows::launch(site, false, stream); }, stream);
+            std::cout << "exact " << shape.name << " " << shape.width << "->" << shape.outputs << " T=64: " << us << " us ("
+                      << flop / (us * 1e6) << " TFLOPS)\n";
+        };
+        if (shape.bf16) run.template operator()<std::uint16_t>(); else run.template operator()<float>();
+    }
+}
+
+// Prompt sites (256 rows per launch, as prefill runs them): quantizer alone, projection alone
+// (from the quantized slot) and both, per engine shape.
+void prompt_bench(hipStream_t stream) {
+    std::cout.setf(std::ios::fixed); std::cout.precision(1);
+    for (const auto& shape : shapes) {
+        std::mt19937 rng(99U);
+        const auto weights_host = make_weights(shape.width, shape.outputs, 0U, rng);
+        Buffer weights(weights_host.size()); weights.upload(weights_host);
+        Activations a(256U, shape.width, shape.bf16);
+        a.upload(make_inputs(256U, shape.width, shape.bf16, 0U, rng));
+        Buffer out(static_cast<std::size_t>(256U) * shape.outputs * 4U);
+        const double ops = 2.0 * 256.0 * shape.width * shape.outputs;
+        const auto run = [&]<class In>() {
+            EngineSite<In, 256U> site{};
+            site.segments = q8_rows::segments({{weights.p, shape.outputs}});
+            for (unsigned r = 0; r < 256U; ++r)
+                site.input[r] = a.input.as<unsigned char>() + static_cast<std::uint64_t>(r) * a.width * sizeof(In);
+            site.width = a.width; site.outputs = shape.outputs; site.output = out.as<float>();
+            const float both = median_us([&] { q8_rows::launch_dense_a8(site, stream, false); }, stream);
+            const auto slot = q8_rows::dense_a8_wide_slot(q8_rows::a8_family_of<decltype(site)>());
+            const std::uint32_t items = 256U * (shape.width / 8U);
+            const float quant = median_us([&] {
+                hipLaunchKernelGGL(q8_rows::dense_a8_quantize_kernel<decltype(site)>, dim3((items + 255U) / 256U), dim3(256), 0, stream,
+                    site, slot.codes, slot.deltas);
+            }, stream);
+            const float project = median_us([&] { q8_rows::launch_dense_a8_projection(site, slot, stream); }, stream);
+            std::cout << "prompt " << shape.name << " " << shape.width << "->" << shape.outputs << " T=256: quantize " << quant
+                      << " us, projection " << project << " us (" << ops / (project * 1e6) << " TOPS), both " << both << " us\n";
+        };
+        if (shape.bf16) run.template operator()<std::uint16_t>(); else run.template operator()<float>();
+        // 64-row launches (the QSA output site runs 64-row prompt launches).
+        const auto run64 = [&]<class In>() {
+            EngineSite<In, 64U> site{};
+            site.segments = q8_rows::segments({{weights.p, shape.outputs}});
+            for (unsigned r = 0; r < 64U; ++r)
+                site.input[r] = a.input.as<unsigned char>() + static_cast<std::uint64_t>(r) * a.width * sizeof(In);
+            site.width = a.width; site.outputs = shape.outputs; site.output = out.as<float>();
+            const auto slot = q8_rows::dense_a8_slot(q8_rows::a8_family_of<decltype(site)>());
+            const std::uint32_t items = 64U * (shape.width / 8U);
+            hipLaunchKernelGGL(q8_rows::dense_a8_quantize_kernel<decltype(site)>, dim3((items + 255U) / 256U), dim3(256), 0, stream,
+                site, slot.codes, slot.deltas);
+            const float project = median_us([&] { q8_rows::launch_dense_a8_projection(site, slot, stream); }, stream);
+            std::cout << "prompt " << shape.name << " T=64: projection " << project << " us (" << ops / 4.0 / (project * 1e6) << " TOPS)\n";
+        };
+        if (shape.bf16) run64.template operator()<std::uint16_t>(); else run64.template operator()<float>();
+    }
+}
+
 void bench(hipStream_t stream) {
     std::cout.setf(std::ios::fixed); std::cout.precision(1);
     for (const auto& shape : shapes) {
@@ -796,6 +873,8 @@ int main() try {
         }
         std::cout << "dense A8: quantizer == reference, WMMA == dot4 == serial reference bitwise: " << cases << " cases\n";
     }
+    if (std::getenv("STRIX_DENSE_A8_PROMPT_BENCH")) prompt_bench(stream);
+    if (std::getenv("STRIX_DENSE_A8_EXACT_BENCH")) exact_bench(stream);
     if (std::getenv("STRIX_DENSE_A8_BENCH")) engine_bench(stream);
     if (std::getenv("STRIX_DENSE_A8_BENCH") && !std::getenv("STRIX_DENSE_A8_ENGINE_ONLY")) bench(stream);
     check(hipStreamDestroy(stream), "destroy stream");

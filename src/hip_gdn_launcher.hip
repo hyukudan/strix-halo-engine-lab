@@ -2744,10 +2744,14 @@ void gdn_prefill_lanes_kernel(GdnPrefillRows rows, std::uint32_t count, float* s
         state[gdn_window_state_index<Storage>(value_head, sub + j * G, column, 128U)] = retained[j];
 }
 // Gated RMSNorm, one wave per (row, head): lane l holds channels l, l+32, l+64, l+96 (gdn_window_key_sum tree).
-template <unsigned Waves>
+// A8: each 32-channel part is also one dense A8 block of the out projection's input; the wave quantizes it
+// (dense_a8_quantize_lane, the quantizer kernel's values) into a8_codes [row][feature] and a8_deltas laid
+// out as the projection's 256-row launches read them ([row / 256][block][row % 256]).
+template <unsigned Waves, bool A8 = false>
 __global__ __launch_bounds__(Waves * 32U)
 void gdn_prefill_norm_rows_kernel(GdnPrefillRows rows, std::uint32_t count, std::uint32_t value_heads,
-    const void* norm_weights, SmallWeightKind norm_kind, std::uint32_t head_dim, float epsilon) {
+    const void* norm_weights, SmallWeightKind norm_kind, std::uint32_t head_dim, float epsilon, std::int8_t* a8_codes = nullptr,
+    float* a8_deltas = nullptr) {
     const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U;
     const auto item = static_cast<std::uint32_t>(blockIdx.x) * Waves + static_cast<std::uint32_t>(threadIdx.x) / 32U;
     if (item >= count * value_heads) return;
@@ -2763,8 +2767,29 @@ void gdn_prefill_norm_rows_kernel(GdnPrefillRows rows, std::uint32_t count, std:
     for (std::uint32_t part = 0; part < 4U; ++part) {
         const auto channel = part * 32U + lane;
         const float gate_value = 1.0F / (1.0F + expf(-rows.z[base + channel]));
-        rows.core[base + channel] = value[part] * inv * load_small(norm_weights, norm_kind, channel) * gate_value;
+        const float result = value[part] * inv * load_small(norm_weights, norm_kind, channel) * gate_value;
+        rows.core[base + channel] = result;
+        if constexpr (A8) {
+            constexpr std::uint64_t pitch = q8_rows::kDenseA8WideRows;
+            const std::uint64_t width = static_cast<std::uint64_t>(value_heads) * head_dim, feature = item % value_heads * head_dim + channel;
+            q8_rows::dense_a8_quantize_lane(result, a8_codes + row * width + feature,
+                a8_deltas + row / pitch * (width / 32U * pitch) + feature / 32U * pitch + row % pitch);
+        }
     }
+}
+// Quantized out-projection input of whole 256-row launches (the norm kernel writes it; prefill steps of up to
+// kGdnFusedA8Rows rows at most kDenseA8MaxWidth wide).
+constexpr std::uint32_t kGdnFusedA8Rows = 2048U;
+q8_rows::DenseA8Slot gdn_fused_a8_scratch() {
+    static unsigned char* const pool = [] {
+        void* p = nullptr;
+        const std::uint64_t bytes = std::uint64_t{kGdnFusedA8Rows} * q8_rows::kDenseA8MaxWidth +
+            std::uint64_t{q8_rows::kDenseA8MaxWidth / 32U} * kGdnFusedA8Rows * 4U;
+        if (hipMalloc(&p, bytes) != hipSuccess) throw std::runtime_error("GDN prefill: fused dense A8 scratch allocation failed");
+        return static_cast<unsigned char*>(p);
+    }();
+    return {reinterpret_cast<std::int8_t*>(pool),
+        reinterpret_cast<float*>(pool + std::uint64_t{kGdnFusedA8Rows} * q8_rows::kDenseA8MaxWidth)};
 }
 
 struct GdnKernelNode {
@@ -4564,7 +4589,7 @@ std::uint32_t gdn_prefill_env(const char* name, std::uint32_t fallback, std::ini
     return std::find(allowed.begin(), allowed.end(), n) != allowed.end() ? n : fallback;
 }
 void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRow, 8U>>& tiles,
-    const GdnPrefillRows& strided, std::uint64_t input_stride, const HipGdnLauncherConfig& config) {
+    const GdnPrefillRows& strided, std::uint64_t input_stride, const HipGdnLauncherConfig& config, const q8_rows::DenseA8Slot* fused_a8) {
     const auto stream = hip_execution_stream();
     const auto& first = tiles[0][0];
     const auto count = static_cast<std::uint32_t>(tiles.size() * 8U);
@@ -4615,7 +4640,12 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     if (config.recurrent_storage == GdnRecurrentStorage::value_key) by_lanes.template operator()<GdnRecurrentStorage::value_key>();
     else by_lanes.template operator()<GdnRecurrentStorage::key_value>();
     check_hip(hipGetLastError(), "GDN prefill lane recurrence launch");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_prefill_norm_rows_kernel<8U>), dim3((count * first.value_heads + 7U) / 8U), dim3(256),
+    if (fused_a8)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_prefill_norm_rows_kernel<8U, true>), dim3((count * first.value_heads + 7U) / 8U), dim3(256),
+            0, stream, strided, count, first.value_heads,
+            reinterpret_cast<const void*>(first.tensors.norm.runtime->address), small_weight_kind(first.tensors.norm.manifest->ggml_type),
+            first.head_dim, config.model.rms_norm_epsilon, fused_a8->codes, fused_a8->deltas);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_prefill_norm_rows_kernel<8U>), dim3((count * first.value_heads + 7U) / 8U), dim3(256),
         0, stream, strided, count, first.value_heads,
         reinterpret_cast<const void*>(first.tensors.norm.runtime->address), small_weight_kind(first.tensors.norm.manifest->ggml_type),
         first.head_dim, config.model.rms_norm_epsilon);
@@ -4686,6 +4716,13 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
         else q8_rows::launch(in, config.dense_a8_projections, stream);
         check_hip(hipGetLastError(), "GDN prefill Q8 input projection launch");
     };
+    // Dense A8 with 256-row output launches over whole 256-row steps: the gated RMSNorm quantizes the out
+    // projection's input (no quantizer launch). STRIX_GDN_FUSED_A8=0 keeps the quantizer launches.
+    static const bool fused_env = [] { const char* v = std::getenv("STRIX_GDN_FUSED_A8"); return !v || v[0] != '0'; }();
+    const q8_rows::DenseA8Slot fused_slot = fused_env && dense_wide >= q8_rows::kDenseA8WideRows && count % q8_rows::kDenseA8WideRows == 0U &&
+            count <= kGdnFusedA8Rows && q8_rows::dense_a8_width(first.value_width) &&
+            reinterpret_cast<std::uintptr_t>(first.tensors.out.runtime->address) % 4U == 0U ? gdn_fused_a8_scratch() : q8_rows::DenseA8Slot{};
+    const q8_rows::DenseA8Slot* fused_a8 = nullptr;
     const auto project_out = [&]<std::uint32_t W>(std::size_t first_tile) {
         GdnOutputRowsSite<W> out{};
         out.segments = q8_rows::segments({{reinterpret_cast<const void*>(first.tensors.out.runtime->address), first.hidden}});
@@ -4694,6 +4731,36 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
             const auto& row = tiles[first_tile + r / 8U][r % 8U];
             out.input[r] = row.workspace.core;
             out.output[r] = reinterpret_cast<std::uint16_t*>(row.output.address);
+        }
+        if constexpr (W == q8_rows::kDenseA8WideRows) {
+            // Rows quantized by the gated RMSNorm (fused_a8): the projection alone.
+            if (fused_a8) {
+                const std::uint64_t row0 = first_tile * 8U, width = first.value_width;
+                const q8_rows::DenseA8Slot slot{fused_a8->codes + row0 * width, fused_a8->deltas + row0 / W * (width / 32U * W)};
+                // STRIX_GDN_FUSED_A8_CHECK=1: the quantizer kernel on the same rows, compared byte for byte.
+                static const bool fused_check = [] { const char* v = std::getenv("STRIX_GDN_FUSED_A8_CHECK"); return v && v[0] == '1'; }();
+                if (fused_check) {
+                    const auto reference = q8_rows::dense_a8_wide_slot(q8_rows::a8_family_of<decltype(out)>());
+                    const auto items = static_cast<std::uint32_t>(W * (width / 8U));
+                    hipLaunchKernelGGL(q8_rows::dense_a8_quantize_kernel<decltype(out)>, dim3((items + 255U) / 256U), dim3(256U), 0, stream,
+                        out, reference.codes, reference.deltas);
+                    check_hip(hipStreamSynchronize(stream), "GDN fused A8 check");
+                    const std::uint64_t code_bytes = W * width, delta_bytes = width / 32U * W * 4U;
+                    std::vector<unsigned char> a(code_bytes + delta_bytes), b(code_bytes + delta_bytes);
+                    check_hip(hipMemcpy(a.data(), reference.codes, code_bytes, hipMemcpyDeviceToHost), "GDN fused A8 check copy");
+                    check_hip(hipMemcpy(a.data() + code_bytes, reference.deltas, delta_bytes, hipMemcpyDeviceToHost), "GDN fused A8 check copy");
+                    check_hip(hipMemcpy(b.data(), slot.codes, code_bytes, hipMemcpyDeviceToHost), "GDN fused A8 check copy");
+                    check_hip(hipMemcpy(b.data() + code_bytes, slot.deltas, delta_bytes, hipMemcpyDeviceToHost), "GDN fused A8 check copy");
+                    std::uint64_t differ = 0;
+                    for (std::uint64_t i = 0; i < a.size(); ++i) differ += a[i] != b[i];
+                    std::fprintf(stderr, "GDN fused A8 check: rows %u bytes %llu differ %llu\n", W, static_cast<unsigned long long>(a.size()),
+                        static_cast<unsigned long long>(differ));
+                    if (differ) throw std::runtime_error("GDN fused A8 codes differ from the quantizer kernel");
+                }
+                q8_rows::launch_dense_a8_projection(out, slot, stream);
+                check_hip(hipGetLastError(), "GDN prefill Q8 output projection launch");
+                return;
+            }
         }
         if constexpr (W > 64U) q8_rows::launch_dense_a8(out, stream, false);
         else q8_rows::launch(out, config.dense_a8_projections, stream);
@@ -4720,8 +4787,10 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
     const auto input_stride = gdn_prefill_input_stride(tiles);
     const bool rows = rows_env && input_stride && gdn_prefill_rows_shape(first, strided, count);
     if (!rows || !check) {
-        if (rows) enqueue_gdn_prefill_core_rows(tiles, strided, input_stride, config);
-        else enqueue_gdn_prefill_core_tiles(tiles, strided, config);
+        if (rows) {
+            if (fused_slot.codes) fused_a8 = &fused_slot;
+            enqueue_gdn_prefill_core_rows(tiles, strided, input_stride, config, fused_a8);
+        } else enqueue_gdn_prefill_core_tiles(tiles, strided, config);
         each_width(project_out);
         return;
     }
@@ -4729,7 +4798,7 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
     enqueue_gdn_prefill_core_tiles(tiles, strided, config);
     const GdnPrefillSnapshot reference(first, strided, count, true);
     inputs.restore();
-    enqueue_gdn_prefill_core_rows(tiles, strided, input_stride, config);
+    enqueue_gdn_prefill_core_rows(tiles, strided, input_stride, config, nullptr);
     const GdnPrefillSnapshot candidate(first, strided, count, true);
     std::uint64_t differ = 0, mismatch = UINT64_MAX;
     for (std::uint64_t i = 0; i < reference.bytes.size(); ++i)

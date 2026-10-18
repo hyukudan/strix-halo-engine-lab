@@ -1182,6 +1182,145 @@ __global__ __launch_bounds__(128) void project_rows_dense_a8_wmma_kernel(Site si
         }
 }
 
+// Staged rows for the 4 x 2 WMMA form below: a block's 64 rows (codes of one block pair, plane-major
+// [K quarter q][A slot][16 bytes], A slot 16 t + i = the row lane i of tile t carries, so a tile's
+// operand is one conflict-free ds_load_b128 per K half) and their deltas, double-buffered.
+struct DenseA8Stage {
+    dense_a8_v4i codes[2][4][64];
+    float deltas[2][2][64];
+};
+// 64 rows x 32 outputs per wave (4 x 2 tiles), rows staged in LDS. The Waves waves of a block share the
+// row tiles: each block pair's codes (64 rows x 64 bytes) and deltas (2 x 64) are loaded from memory
+// once per block, not once per wave (with per-wave loads the operand reads kept the memory and LDS
+// paths as busy as the WMMAs), and each row tile's codes and deltas are read from LDS once for two
+// output tiles. The row tiles run one after another (scheduling barriers keep the compiler from
+// hoisting every tile's operands, which spills): per row tile, 2 x 2 WMMAs, then its 2 x 8 chain steps.
+// Weights stream one block pair ahead per wave. Same WMMAs, epilogue expressions and block order as
+// project_rows_dense_a8_wmma_kernel; one barrier per block pair.
+template <class Site, unsigned Waves>
+__global__ __launch_bounds__(32U * Waves) void project_rows_dense_a8_wmma_lds2_kernel(Site site, const std::int8_t* codes,
+    const float* deltas) {
+#pragma clang fp contract(off)
+    constexpr unsigned Rows = Site::rows, TM = 4U, TN = 2U, Threads = 32U * Waves;
+    static_assert(Rows % 64U == 0U && Rows <= kDenseA8WideRows && Threads >= 128U);
+    constexpr std::uint32_t pitch = dense_a8_pitch<Rows>();
+    __shared__ DenseA8Stage stage;
+    const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x / 32U, i = lane & 15U, h = lane >> 4U;
+    constexpr std::uint32_t row_tiles = Rows / 64U;
+    const std::uint32_t width = site.width, outputs = site.outputs, pairs = width / 64U;
+    const std::uint32_t m0 = blockIdx.x % row_tiles * 64U, n0 = (blockIdx.x / row_tiles * Waves + wave) * 16U * TN;
+    const bool active = n0 < outputs;
+    const unsigned char* w[TN];
+#pragma unroll
+    for (unsigned t = 0; t < TN; ++t) {
+        unsigned m; std::uint32_t row;
+        w[t] = segment_row(site.segments, min(min(n0, outputs - 1U) + 16U * t + i, outputs - 1U), width, m, row);
+    }
+    const unsigned slot = (threadIdx.x / 2U) % 64U, half = threadIdx.x % 2U;
+    const std::uint32_t slot_row = m0 + 16U * (slot / 16U) + 8U * (slot % 2U) + (slot % 16U) / 2U;
+    const auto* code_src = codes + static_cast<std::uint64_t>(slot_row) * width + 32U * half;
+    const unsigned dq = threadIdx.x % 32U;
+    const float* delta_src = deltas + (dq / 16U) * pitch + m0 + 4U * (dq % 16U);
+    const bool stage_codes = threadIdx.x < 128U, stage_deltas = Waves == 4U ? threadIdx.x < 32U : threadIdx.x >= 128U && threadIdx.x < 160U;
+    dense_a8_v4i sc[2];
+    float4 sd;
+    const auto load = [&](std::uint32_t p) {
+        if (stage_codes) {
+            const auto* x = reinterpret_cast<const dense_a8_v4i*>(code_src + 64U * p);
+            sc[0] = x[0]; sc[1] = x[1];
+        }
+        if (stage_deltas) sd = *reinterpret_cast<const float4*>(delta_src + 2U * p * pitch);
+    };
+    const auto store = [&](unsigned buffer) {
+        if (stage_codes) { stage.codes[buffer][2U * half][slot] = sc[0]; stage.codes[buffer][2U * half + 1U][slot] = sc[1]; }
+        if (stage_deltas) *reinterpret_cast<float4*>(&stage.deltas[buffer][dq / 16U][4U * (dq % 16U)]) = sd;
+    };
+    float acc[TM][TN][8];
+#pragma unroll
+    for (unsigned t = 0; t < TM; ++t)
+#pragma unroll
+        for (unsigned u = 0; u < TN; ++u)
+#pragma unroll
+            for (unsigned e = 0; e < 8U; ++e) acc[t][u][e] = 0.0F;
+    constexpr int kMagic = 0x4B400000;
+    constexpr float kMagicF = 12582912.0F;
+    const dense_a8_v8i magic{kMagic, kMagic, kMagic, kMagic, kMagic, kMagic, kMagic, kMagic};
+    unsigned next[TN][17];
+    const auto fetch = [&](std::uint32_t pair) {
+#pragma unroll
+        for (unsigned u = 0; u < TN; ++u) {
+            const auto* q4 = reinterpret_cast<const DenseA8Dword4*>(w[u] + 68U * pair);
+            const DenseA8Dword4 c0 = q4[0], c1 = q4[1], c2 = q4[2], c3 = q4[3];
+            const unsigned last = reinterpret_cast<const unsigned*>(w[u] + 68U * pair)[16];
+            const unsigned q[17]{c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w, c2.x, c2.y, c2.z, c2.w, c3.x, c3.y, c3.z, c3.w, last};
+#pragma unroll
+            for (unsigned k = 0; k < 17U; ++k) next[u][k] = q[k];
+        }
+    };
+    load(0U);
+    store(0U);
+    if (active) fetch(0U);
+    if (pairs > 1U) load(1U);
+    __syncthreads();
+    for (std::uint32_t p = 0; p < pairs; ++p) {
+        const unsigned buffer = p & 1U;
+        if (active) {
+            dense_a8_v4i wb[2][TN][2];
+            float dw[2][TN];
+#pragma unroll
+            for (unsigned u = 0; u < TN; ++u) {
+                const unsigned (&q)[17] = next[u];
+                dw[0][u] = static_cast<float>(__ushort_as_half(static_cast<unsigned short>(q[0] & 0xffffU)));
+                dw[1][u] = static_cast<float>(__ushort_as_half(static_cast<unsigned short>(q[8] >> 16U)));
+                asm volatile("" : "+v"(dw[0][u]), "+v"(dw[1][u]));
+#pragma unroll
+                for (unsigned k = 0; k < 4U; ++k) {
+                    wb[0][u][0][k] = static_cast<int>(__builtin_amdgcn_alignbyte(q[k + 1U], q[k], 2U));
+                    wb[0][u][1][k] = static_cast<int>(__builtin_amdgcn_alignbyte(q[k + 5U], q[k + 4U], 2U));
+                    wb[1][u][0][k] = static_cast<int>(q[9U + k]);
+                    wb[1][u][1][k] = static_cast<int>(q[13U + k]);
+                }
+            }
+            fetch(p + 1U < pairs ? p + 1U : p);
+#pragma unroll
+            for (unsigned s = 0; s < 2U; ++s)
+#pragma unroll
+                for (unsigned t = 0; t < TM; ++t) {
+                    const dense_a8_v4i a0 = stage.codes[buffer][2U * s][16U * t + i], a1 = stage.codes[buffer][2U * s + 1U][16U * t + i];
+                    const float4 lo = *reinterpret_cast<const float4*>(&stage.deltas[buffer][s][16U * t + 8U * h]);
+                    const float4 hi = *reinterpret_cast<const float4*>(&stage.deltas[buffer][s][16U * t + 8U * h + 4U]);
+                    const float da[8]{lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+                    dense_a8_v8i c[TN];
+#pragma unroll
+                    for (unsigned u = 0; u < TN; ++u) c[u] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, wb[s][u][0], magic, false);
+#pragma unroll
+                    for (unsigned u = 0; u < TN; ++u) c[u] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, wb[s][u][1], c[u], false);
+#pragma unroll
+                    for (unsigned u = 0; u < TN; ++u)
+#pragma unroll
+                        for (unsigned e = 0; e < 8U; ++e)
+                            acc[t][u][e] = __builtin_fmaf(dw[s][u] * da[e], __int_as_float(c[u][e]) - kMagicF, acc[t][u][e]);
+                    __builtin_amdgcn_sched_barrier(0);
+                }
+        }
+        if (p + 1U < pairs) {
+            store(buffer ^ 1U);
+            if (p + 2U < pairs) load(p + 2U);
+        }
+        __syncthreads();
+    }
+    if (!active) return;
+#pragma unroll
+    for (unsigned t = 0; t < TM; ++t)
+#pragma unroll
+        for (unsigned u = 0; u < TN; ++u) {
+            const std::uint32_t n = n0 + 16U * u + i;
+            if (n < outputs)
+#pragma unroll
+                for (unsigned e = 0; e < 8U; ++e) site.store(n, m0 + 16U * t + 8U * h + e, dense_a8_canonical(acc[t][u][e]));
+        }
+}
+
 // Persistent grids never exceed the blocks that are resident at once.
 template <auto Kernel, unsigned Threads> unsigned resident_blocks(std::uint32_t lds_bytes) {
     static std::atomic<std::uint64_t> cached{0};
@@ -1220,6 +1359,48 @@ inline unsigned dense_a8_stage_mode() {
     return mode;
 }
 constexpr std::uint64_t kDenseA8StageBytes = 24U * 1024U;
+// The WMMA projection of 16..256 rows from a quantized slot (barrier-ordered).
+template <class Site> void launch_dense_a8_projection(const Site& site, const DenseA8Slot& slot, hipStream_t stream) {
+    static_assert(Site::rows % 16U == 0U && Site::rows <= kDenseA8WideRows);
+    // Tiles measured in prefill on gfx1151 (T = 1032, 64- and 256-row launches): 4 x 1 is the
+    // fastest for every site (GDN/QSA in and out, shared gate/up and down).
+    const auto tiled = [&]<unsigned TM, unsigned TN>() {
+        constexpr unsigned row_tiles = Site::rows / (16U * TM);
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(project_rows_dense_a8_wmma_kernel<Site, TM, TN>), dim3(row_tiles * ((site.outputs + 64U * TN - 1U) / (64U * TN))),
+            dim3(128U), 0, stream, site, slot.codes, slot.deltas);
+    };
+    constexpr unsigned TM = Site::rows >= 64U ? 4U : Site::rows / 16U;
+    // STRIX_DENSE_A8_TILE=11/12/21/22/41/42 (TM TN) forces one tile shape for every site (tuning).
+    static const unsigned forced = env_unsigned("STRIX_DENSE_A8_TILE", 0U);
+    // Launches of 64k rows take the LDS-staged 4 x 2 form when it still has at least 40 blocks of 8
+    // waves (one per CU): GDN/QSA input and the 256-row output launches; narrower launches (shared
+    // expert gate/up, 64-row QSA output) keep the 4 x 1 form.
+    // STRIX_DENSE_A8_LDS=0 never stages, =2 stages every 64k-row launch; STRIX_DENSE_A8_LDS_WAVES=4|8.
+    static const unsigned lds = env_unsigned("STRIX_DENSE_A8_LDS", 1U);
+    if constexpr (Site::rows % 64U == 0U) {
+        const auto lds_blocks = Site::rows / 64U * ((site.outputs + 255U) / 256U);
+        if (!forced && (lds == 2U || (lds == 1U && lds_blocks >= 40U))) {
+            static const unsigned lds_waves = env_unsigned("STRIX_DENSE_A8_LDS_WAVES", 8U);
+            const auto staged = [&]<unsigned Waves>() {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(project_rows_dense_a8_wmma_lds2_kernel<Site, Waves>),
+                    dim3(Site::rows / 64U * ((site.outputs + 32U * Waves - 1U) / (32U * Waves))), dim3(32U * Waves), 0, stream,
+                    site, slot.codes, slot.deltas);
+            };
+            if (lds_waves == 4U) staged.template operator()<4U>(); else staged.template operator()<8U>();
+            return;
+        }
+    }
+    const auto pick = [&]<unsigned M, unsigned N>() {
+        if constexpr (Site::rows % (16U * M) == 0U) { tiled.template operator()<M, N>(); return true; } else return false;
+    };
+    if (forced == 11U && pick.template operator()<1U, 1U>()) return;
+    if (forced == 12U && pick.template operator()<1U, 2U>()) return;
+    if (forced == 21U && pick.template operator()<2U, 1U>()) return;
+    if (forced == 22U && pick.template operator()<2U, 2U>()) return;
+    if (forced == 41U && pick.template operator()<4U, 1U>()) return;
+    if (forced == 42U && pick.template operator()<4U, 2U>()) return;
+    tiled.template operator()<TM, 1U>();
+}
 // Dense A8. Rows <= 8 whose activations fit LDS: one persistent launch that quantizes them
 // per block (the 6144-wide 3..8-row inputs do not fit; windows quantize those in their
 // producers, launch_dense_a8_quantized). Otherwise one quantizer launch into the family's
@@ -1267,28 +1448,7 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
         constexpr auto kernel = project_rows_dense_a8_kernel<Site, Outs, false>;
         run(kernel, std::min((groups + kWaves - 1U) / kWaves, resident_blocks<kernel, kThreads>(0U)), kThreads, 0U, false, slot.codes,
             slot.deltas);
-    } else {
-        // Tiles measured in prefill on gfx1151 (T = 1032, 64- and 256-row launches): 4 x 1 is the
-        // fastest for every site (GDN/QSA in and out, shared gate/up and down).
-        const auto tiled = [&]<unsigned TM, unsigned TN>() {
-            constexpr unsigned row_tiles = Site::rows / (16U * TM);
-            run(project_rows_dense_a8_wmma_kernel<Site, TM, TN>, row_tiles * ((site.outputs + 64U * TN - 1U) / (64U * TN)), 128U, 0U,
-                false, slot.codes, slot.deltas);
-        };
-        constexpr unsigned TM = Site::rows >= 64U ? 4U : Site::rows / 16U;
-        // STRIX_DENSE_A8_TILE=11/12/21/22/41/42 (TM TN) forces one tile shape for every site (tuning).
-        static const unsigned forced = env_unsigned("STRIX_DENSE_A8_TILE", 0U);
-        const auto pick = [&]<unsigned M, unsigned N>() {
-            if constexpr (Site::rows % (16U * M) == 0U) { tiled.template operator()<M, N>(); return true; } else return false;
-        };
-        if (forced == 11U && pick.template operator()<1U, 1U>()) return;
-        if (forced == 12U && pick.template operator()<1U, 2U>()) return;
-        if (forced == 21U && pick.template operator()<2U, 1U>()) return;
-        if (forced == 22U && pick.template operator()<2U, 2U>()) return;
-        if (forced == 41U && pick.template operator()<4U, 1U>()) return;
-        if (forced == 42U && pick.template operator()<4U, 2U>()) return;
-        tiled.template operator()<TM, 1U>();
-    }
+    } else launch_dense_a8_projection(site, slot, stream);
 }
 
 // Projection only, from a slot its producer filled (dense_a8_quantize_lane): codes
