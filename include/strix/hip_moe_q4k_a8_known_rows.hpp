@@ -80,7 +80,10 @@ void enqueue_prefill_prologue(const Request&, const PrefillRows&, unsigned rows,
 // expert, batches of consecutive assignments of one expert; row statuses folded into the
 // summary word), gate/up with the serial down activation quantizer and the integer down.
 // Each (row, slot) runs the window kernels' per-lane arithmetic; the caller merges and
-// commits. Summary histograms count n>=8 in their last bucket.
+// commits. Summary histograms count n>=8 in their last bucket. form 1 runs gate/up and down
+// as iu8 WMMA kernels over batches of <= 16 assignments, form 0 the dot4 kernels, -1 picks by
+// STRIX_PREFILL_MOE_WMMA; every output byte is identical across forms.
 void enqueue_prefill(const Request&, const PrefillRows&, unsigned rows, unsigned clear_words,
-    const unsigned char* gate, const unsigned char* up, unsigned down_type, const unsigned char* down_weights, hipStream_t);
+    const unsigned char* gate, const unsigned char* up, unsigned down_type, const unsigned char* down_weights, hipStream_t,
+    int form = -1);
 } // namespace strix::moe_q4k_a8::known_rows
