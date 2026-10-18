@@ -107,5 +107,7 @@ its own pair identity):
   Serial rows (the unpadded suffix, every MTP prompt row) and windows keep the A8 MoE. The kernels reuse the
   A8 routed-MoE scratch views. Receipt: `prefill_moe_f16wmma_rows` (prompt rows times layers that ran it).
 
+The components act only in complete tiled known-prefix blocks: the serial suffix of the tiled route and every prompt
+row of the MTP prompt route run the serial kernels, where the profile changes the identities but not the arithmetic.
 Router, QSA indexer, attention, GDN recurrence, PLE and LM head keep the decode profile's arithmetic.
 Tokens differ from a dense-A8 run; exactness is defined from the handoff state as for every split pair.

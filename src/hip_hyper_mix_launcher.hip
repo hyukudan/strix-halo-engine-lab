@@ -3779,19 +3779,8 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
         if (projection_kernel == 2U) {
             hipLaunchKernelGGL(hcw_pack_down_kernel, dim3((kHcwRank * kHcwStages + 255U) / 256U), dim3(256U), 0, stream,
                 static_cast<const unsigned char*>(down), scratch.down, scratch.overflow);
-            static const unsigned dbg = [] { const char* v = std::getenv("STRIX_HCW_DBG_PROJ"); return v ? static_cast<unsigned>(std::atoi(v)) : 0U; }();
-            const auto proj = [&]<unsigned D>() {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(hcw_projection_kernel<D>), dim3(kHcwProjColBlocks, (wide.count + kHcwProjRows - 1U) / kHcwProjRows),
-                    dim3(256U), 0, stream, wide, scratch.down, static_cast<const float*>(inject), config.hc_count, scratch.low16);
-            };
-            switch (dbg) {
-            case 1U: proj.template operator()<1U>(); break;
-            case 2U: proj.template operator()<2U>(); break;
-            case 3U: proj.template operator()<3U>(); break;
-            case 4U: proj.template operator()<4U>(); break;
-            case 7U: proj.template operator()<7U>(); break;
-            default: proj.template operator()<0U>(); break;
-            }
+            hipLaunchKernelGGL(hcw_projection_kernel, dim3(kHcwProjColBlocks, (wide.count + kHcwProjRows - 1U) / kHcwProjRows),
+                dim3(256U), 0, stream, wide, scratch.down, static_cast<const float*>(inject), config.hc_count, scratch.low16);
             check_hip(hipGetLastError(), "prefill HC WMMA projection launch");
         } else if (projection_kernel != kSkipKernel) throw std::invalid_argument("HC WMMA output requires the WMMA projection");
         if (output_kernel == kSkipKernel) return;
@@ -3802,23 +3791,11 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
         hipLaunchKernelGGL(hcw_pack_up_kernel, dim3((4U * config.hidden_size * (kHcwRank / 32U) + 255U) / 256U), dim3(256U), 0, stream,
             static_cast<const unsigned char*>(up), scratch.up, config.hidden_size, scratch.overflow);
         const dim3 grid((wide.count + kHcwOutRows - 1U) / kHcwOutRows, config.hidden_size / kHcwOutFeatures);
-        static const unsigned dbg_out = [] { const char* v = std::getenv("STRIX_HCW_DBG_OUT"); return v ? static_cast<unsigned>(std::atoi(v)) : 0U; }();
-        const auto out = [&]<typename Storage, unsigned D>() {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(hcw_output_kernel<Storage, D>), grid, dim3(256U), 0, stream, wide, scratch.up,
+        if (config.activation == HipActivationStorage::bf16)
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(hcw_output_kernel<std::uint16_t>), grid, dim3(256U), 0, stream, wide, scratch.up,
                 scratch.low16, config.hidden_size);
-        };
-        const auto outd = [&]<typename Storage>() {
-            switch (dbg_out) {
-            case 1U: out.template operator()<Storage, 1U>(); break;
-            case 2U: out.template operator()<Storage, 2U>(); break;
-            case 4U: out.template operator()<Storage, 4U>(); break;
-            case 8U: out.template operator()<Storage, 8U>(); break;
-            case 15U: out.template operator()<Storage, 15U>(); break;
-            default: out.template operator()<Storage, 0U>(); break;
-            }
-        };
-        if (config.activation == HipActivationStorage::bf16) outd.template operator()<std::uint16_t>();
-        else outd.template operator()<float>();
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(hcw_output_kernel<float>), grid, dim3(256U), 0, stream, wide, scratch.up, scratch.low16,
+                config.hidden_size);
         check_hip(hipGetLastError(), "prefill HC WMMA output launch");
         return;
         }

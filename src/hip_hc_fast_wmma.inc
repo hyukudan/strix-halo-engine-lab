@@ -101,7 +101,6 @@ __device__ __forceinline__ hcw_v16h hcw_lds_fragment(const _Float16* p) {
 // cb < streams, adds them into injection output cb's FP32 partial of that row (4 FMAs, k ascending).
 // The 8 partials of a row (lanes of one 8-lane group) are summed by a xor tree at the end.
 // The 64 x 32 FP16 weights of a stage are shared by the 8 waves through LDS (double-buffered).
-template <unsigned Dbg>
 __global__ __launch_bounds__(256) void hcw_projection_kernel(HyperWideRows rows, const _Float16* __restrict__ pack,
     const float* __restrict__ inject, unsigned streams, _Float16* __restrict__ low16) {
     __shared__ __align__(16) _Float16 bs[2][kHcwProjCols * kHcwPitch];
@@ -120,13 +119,11 @@ __global__ __launch_bounds__(256) void hcw_projection_kernel(HyperWideRows rows,
     float4 xa[8];
     uint4 bw;
     const auto load = [&](unsigned stage) {
-        if (!(Dbg & 2U)) bw = bsrc[stage * (kHcwProjCols * 32U / 8U)]; else bw = make_uint4(stage, stage, stage, stage);
+        bw = bsrc[stage * (kHcwProjCols * 32U / 8U)];
 #pragma unroll
         for (unsigned q = 0; q < 8U; ++q)
-            if (!(Dbg & 1U))
-                xa[q] = valid >> q & 1U ? *reinterpret_cast<const float4*>(reinterpret_cast<const unsigned char*>(x + stage * 32U) + q * step)
-                                        : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
-            else xa[q] = make_float4(float(stage), 1.0F, 2.0F, float(q));
+            xa[q] = valid >> q & 1U ? *reinterpret_cast<const float4*>(reinterpret_cast<const unsigned char*>(x + stage * 32U) + q * step)
+                                    : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
     };
     hcw_v8f acc[2][4];
 #pragma unroll
@@ -167,8 +164,8 @@ __global__ __launch_bounds__(256) void hcw_projection_kernel(HyperWideRows rows,
 #pragma unroll
             for (unsigned c = 0; c < 4U; ++c) {
                 const hcw_v16h b = hcw_lds_fragment(&bs[buffer][(16U * c + lane % 16U) * kHcwPitch + 16U * h]);
-                if (!(Dbg & 4U)) { acc[0][c] = hcw_wmma(a0, b, acc[0][c]); acc[1][c] = hcw_wmma(a1, b, acc[1][c]); }
-                else { acc[0][c][0] += float(a0[0]) * float(b[0]); acc[1][c][0] += float(a1[0]) * float(b[1]); }
+                acc[0][c] = hcw_wmma(a0, b, acc[0][c]);
+                acc[1][c] = hcw_wmma(a1, b, acc[1][c]);
             }
         }
     }
@@ -204,7 +201,7 @@ __global__ __launch_bounds__(256) void hcw_projection_kernel(HyperWideRows rows,
 // streams' tiles, reading its FP16 low fragments from global, then mixes the streams in the lane
 // (gate -> sigmoid -> normalized * gate in stream order, / streams) as the lane-chain kernels. The
 // epilogue's normalized values are loaded before the GEMM so their DRAM latency overlaps it.
-template <typename Storage, unsigned Dbg>
+template <typename Storage>
 __global__ __launch_bounds__(256) void hcw_output_kernel(HyperWideRows rows, const _Float16* __restrict__ pack,
     const _Float16* __restrict__ low16, std::uint32_t hidden) {
     constexpr unsigned Tile = kHcwK16 * 4U * kHcwOutFeatures * 16U;
@@ -213,7 +210,7 @@ __global__ __launch_bounds__(256) void hcw_output_kernel(HyperWideRows rows, con
     const auto* src = reinterpret_cast<const uint4*>(pack + static_cast<std::uint64_t>(fb) * Tile);
 #pragma unroll
     for (unsigned m = 0; m < Tile / 8U / 256U; ++m)
-        reinterpret_cast<uint4*>(bt)[threadIdx.x + 256U * m] = Dbg & 2U ? make_uint4(m, m, m, m) : src[threadIdx.x + 256U * m];
+        reinterpret_cast<uint4*>(bt)[threadIdx.x + 256U * m] = src[threadIdx.x + 256U * m];
     const unsigned row0 = blockIdx.x * kHcwOutRows + wave * 32U;
     const unsigned ar0 = row0 + lane % 16U, ar1 = ar0 + 16U;
     const bool v0 = ar0 < rows.count, v1 = ar1 < rows.count;
@@ -241,20 +238,20 @@ __global__ __launch_bounds__(256) void hcw_output_kernel(HyperWideRows rows, con
             const unsigned r = row0 + 16U * t + 2U * e + lane / 16U;
             const auto* normalized = wide_row(rows.normalized, rows.normalized_stride, r < rows.count ? r : 0U);
 #pragma unroll
-            for (unsigned s = 0; s < 4U; ++s) nv[t][e][s] = Dbg & 8U ? 1.0F : normalized[static_cast<std::uint64_t>(s) * hidden + feature];
+            for (unsigned s = 0; s < 4U; ++s) nv[t][e][s] = normalized[static_cast<std::uint64_t>(s) * hidden + feature];
         }
     __syncthreads();
     for (unsigned k = 0; k < kHcwK16; ++k) {
         const hcw_v16h a0 = fragment(p0, p1), a1 = fragment(q0, q1);
-        if (k + 1U < kHcwK16 && !(Dbg & 1U)) {
+        if (k + 1U < kHcwK16) {
             p0 = v0 ? l0[2U * k + 2U] : zero; p1 = v0 ? l0[2U * k + 3U] : zero;
             q0 = v1 ? l1[2U * k + 2U] : zero; q1 = v1 ? l1[2U * k + 3U] : zero;
         }
 #pragma unroll
         for (unsigned s = 0; s < 4U; ++s) {
             const hcw_v16h b = hcw_lds_fragment(bt + ((k * 4U + s) * kHcwOutFeatures + lane % 16U) * 16U);
-            if (!(Dbg & 4U)) { acc[0][s] = hcw_wmma(a0, b, acc[0][s]); acc[1][s] = hcw_wmma(a1, b, acc[1][s]); }
-            else { acc[0][s][0] += float(a0[0]) * float(b[0]); acc[1][s][0] += float(a1[0]) * float(b[1]); }
+            acc[0][s] = hcw_wmma(a0, b, acc[0][s]);
+            acc[1][s] = hcw_wmma(a1, b, acc[1][s]);
         }
     }
 #pragma unroll
