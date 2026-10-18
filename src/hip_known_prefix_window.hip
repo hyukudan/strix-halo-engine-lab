@@ -733,6 +733,11 @@ struct HipKnownPrefixWindow::Impl {
         check(hipStreamSynchronize(scope.stream),"complete deferred GDN commit");
         gdn_control()->pending_rows=0; gdn_deferred->pending=false;
     }
+    void discard_deferred() {
+        if(!gdn_deferred || !gdn_deferred->pending) return;
+        check(hipStreamSynchronize(scope.stream),"discard deferred GDN rows fence");
+        gdn_control()->pending_rows=0; gdn_deferred->pending=false;
+    }
     void share_deferred(const Impl& primary) {
         if(!window.gdn_deferred_rows_steps || !primary.gdn_deferred || failed || primary.failed ||
             !gdn_commit_rows.empty() || gdn_deferred->pending ||
@@ -1117,6 +1122,7 @@ bool HipKnownPrefixWindow::defers_state() const noexcept {
 }
 void HipKnownPrefixWindow::commit_prefix(std::uint32_t n_keep) { impl_->commit_prefix(n_keep); }
 void HipKnownPrefixWindow::flush_deferred() { impl_->flush_deferred(); }
+void HipKnownPrefixWindow::discard_deferred() { impl_->discard_deferred(); }
 void HipKnownPrefixWindow::share_deferred(const HipKnownPrefixWindow& primary) { impl_->share_deferred(*primary.impl_); }
 
 } // namespace strix

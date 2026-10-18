@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <set>
 #include <stdexcept>
 #include <sys/socket.h>
 #include <thread>
@@ -136,6 +137,7 @@ struct HttpServer::Impl {
     std::atomic<unsigned> connections{0};
     std::mutex mutex;
     std::condition_variable idle;
+    std::set<int> open_fds; // under mutex; stop() shuts them down so blocked reads return
 
     void handle(int fd, std::string peer) {
         timeval timeout{config.idle_timeout_seconds, 0};
@@ -143,6 +145,16 @@ struct HttpServer::Impl {
         const int one = 1;
         ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         Connection connection(fd, config.cors);
+        // Declared after the connection: unregisters the descriptor before the connection closes it.
+        struct Registration {
+            Impl& impl; int fd;
+            Registration(Impl& i, int f) : impl(i), fd(f) {
+                const std::lock_guard lock(impl.mutex);
+                impl.open_fds.insert(fd);
+                if (impl.stopping.load()) ::shutdown(fd, SHUT_RDWR);
+            }
+            ~Registration() { const std::lock_guard lock(impl.mutex); impl.open_fds.erase(fd); }
+        } registration(*this, fd);
         std::string buffer;
         char chunk[16384];
         while (!stopping.load()) {
@@ -230,8 +242,9 @@ HttpServer::HttpServer(HttpServerConfig config, HttpHandler handler) : impl_(std
 }
 HttpServer::~HttpServer() {
     stop();
+    // Connection threads use the handler (and what it references): wait for every one of them.
     std::unique_lock lock(impl_->mutex);
-    impl_->idle.wait_for(lock, std::chrono::seconds(5), [&] { return impl_->connections.load() == 0U; });
+    impl_->idle.wait(lock, [&] { return impl_->connections.load() == 0U; });
 }
 
 void HttpServer::listen() {
@@ -294,6 +307,8 @@ void HttpServer::serve() {
 void HttpServer::stop() {
     impl_->stopping.store(true);
     if (impl_->listen_fd >= 0) { ::shutdown(impl_->listen_fd, SHUT_RDWR); ::close(impl_->listen_fd); impl_->listen_fd = -1; }
+    const std::lock_guard lock(impl_->mutex);
+    for (const int fd : impl_->open_fds) ::shutdown(fd, SHUT_RDWR);
 }
 std::uint16_t HttpServer::port() const noexcept { return impl_->bound_port; }
 unsigned HttpServer::active_connections() const noexcept { return impl_->connections.load(); }

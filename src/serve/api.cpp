@@ -195,10 +195,14 @@ private:
 };
 
 struct RecentRequest {
-    std::string id, route, status;
+    RecentRequest() = default;
+    RecentRequest(std::string i, std::string r, std::string s, std::int64_t t)
+        : id(std::move(i)), route(std::move(r)), status(std::move(s)), time(t) {}
+    std::string id, route, status; // status: done | cancelled | error
     std::int64_t time = 0;
     std::uint64_t prompt = 0, cached = 0, output = 0, cycles = 0, accepted = 0, proposed = 0;
     double queue_ms = 0, prefill_ms = 0, decode_ms = 0;
+    std::string stop_reason;
 };
 
 std::vector<std::string> stop_strings(const Json* stop) {
@@ -335,7 +339,8 @@ struct ApiService::Impl {
     }
 
     // Drives one ticket: decodes tokens to text, applies stop strings, hands text to `on_text`.
-    struct Outcome { std::string text; GenerationStats stats; std::string finish; std::string matched; std::string error; std::uint64_t output_tokens = 0; };
+    struct Outcome { std::string text; GenerationStats stats; std::string finish; std::string matched; std::string error; std::uint64_t output_tokens = 0;
+        std::vector<std::uint32_t> token_ids; };
     Outcome drive(const std::shared_ptr<GenerationTicket>& ticket, const std::vector<std::string>& stops,
         const std::function<bool(const std::string&)>& on_text, const std::function<bool()>& client_alive) {
         Outcome out;
@@ -347,6 +352,7 @@ struct ApiService::Impl {
             for (const auto id : tokens) {
                 if (stopped) break;
                 ++out.output_tokens;
+                out.token_ids.push_back(id);
                 if (is_stop_token(id)) { stopped = true; break; }
                 const auto text = filter.push(utf8.push(tokenizer->token_bytes(id)));
                 if (!text.empty()) {
@@ -388,8 +394,14 @@ struct ApiService::Impl {
         usage.set("prompt_tokens_details", std::move(details));
         return usage;
     }
-    static Json engine_json(const Outcome& o, const std::string& note) {
+    // "return_token_ids": true adds the generated token IDs (stop token included) for exactness checks.
+    static Json engine_json(const Outcome& o, const std::string& note, const Json& body) {
         Json e = Json::object();
+        if (bool_or(body, "return_token_ids", false)) {
+            Json ids = Json::array();
+            for (const auto id : o.token_ids) ids.push(Json(static_cast<std::int64_t>(id)));
+            e.set("token_ids", std::move(ids));
+        }
         e.set("sampling", Json(o.stats.sampling));
         if (!note.empty()) e.set("note", Json(note));
         e.set("queue_ms", Json(o.stats.queue_ms));
@@ -453,7 +465,7 @@ struct ApiService::Impl {
             out.set("choices", std::move(choices));
             out.set("usage", usage_json(outcome));
             out.set("system_fingerprint", Json("strix-" + outcome.stats.sampling));
-            out.set("strix", engine_json(outcome, note));
+            out.set("strix", engine_json(outcome, note, body));
             response.send(200, "application/json", out.dump());
             finish_entry(entry, outcome);
             return;
@@ -512,7 +524,7 @@ struct ApiService::Impl {
             out.set("id", Json(id)); out.set("object", Json("chat.completion.chunk")); out.set("created", Json(created));
             out.set("model", Json(config.model_id)); out.set("choices", Json::array());
             out.set("usage", usage_json(outcome));
-            out.set("strix", engine_json(outcome, note));
+            out.set("strix", engine_json(outcome, note, body));
             response.write("data: " + out.dump() + "\n\n");
         }
         response.write("data: [DONE]\n\n");
@@ -557,7 +569,7 @@ struct ApiService::Impl {
             out.set("model", Json(config.model_id));
             Json choices = Json::array(); choices.push(std::move(choice));
             out.set("choices", std::move(choices));
-            if (final_usage && outcome) { out.set("usage", usage_json(*outcome)); out.set("strix", engine_json(*outcome, note)); }
+            if (final_usage && outcome) { out.set("usage", usage_json(*outcome)); out.set("strix", engine_json(*outcome, note, body)); }
             return out;
         };
         if (!stream) {
@@ -701,7 +713,7 @@ struct ApiService::Impl {
             out.set("stop_reason", Json(stop_reason(outcome, parsed.tool_calls.size() > 0U)));
             out.set("stop_sequence", outcome.matched.empty() ? Json() : Json(outcome.matched));
             out.set("usage", usage(outcome));
-            out.set("strix", engine_json(outcome, note));
+            out.set("strix", engine_json(outcome, note, body));
             response.send(200, "application/json", out.dump());
             finish_entry(entry, outcome);
             return;
@@ -782,7 +794,8 @@ struct ApiService::Impl {
     }
 
     void finish_entry(RecentRequest& entry, const Outcome& o) {
-        entry.status = !o.error.empty() ? "error" : o.finish;
+        entry.status = !o.error.empty() ? "error" : o.finish == "cancelled" ? "cancelled" : "done";
+        entry.stop_reason = o.finish;
         entry.prompt = o.stats.prompt_tokens; entry.cached = o.stats.cached_tokens; entry.output = o.output_tokens;
         entry.cycles = o.stats.cycles; entry.accepted = o.stats.accepted; entry.proposed = o.stats.proposed;
         entry.queue_ms = o.stats.queue_ms; entry.prefill_ms = o.stats.prefill_ms; entry.decode_ms = o.stats.decode_ms;
@@ -813,10 +826,12 @@ struct ApiService::Impl {
         for (const auto& r : recent) {
             Json e = Json::object();
             e.set("id", Json(r.id)); e.set("route", Json(r.route)); e.set("time", Json(r.time)); e.set("status", Json(r.status));
+            e.set("stop_reason", Json(r.stop_reason));
             e.set("prompt_tokens", Json(r.prompt)); e.set("reused_tokens", Json(r.cached)); e.set("output_tokens", Json(r.output));
             e.set("queue_ms", Json(r.queue_ms)); e.set("prefill_ms", Json(r.prefill_ms)); e.set("decode_ms", Json(r.decode_ms));
-            e.set("prefill_tokens_per_second", Json(r.prefill_ms > 0 ? 1000.0 * static_cast<double>(r.prompt - std::min(r.prompt, r.cached)) / r.prefill_ms : 0.0));
-            e.set("decode_tokens_per_second", Json(r.decode_ms > 0 ? 1000.0 * static_cast<double>(r.output) / r.decode_ms : 0.0));
+            e.set("duration_ms", Json(r.queue_ms + r.prefill_ms + r.decode_ms));
+            e.set("prefill_tok_s", Json(r.prefill_ms > 0 ? 1000.0 * static_cast<double>(r.prompt - std::min(r.prompt, r.cached)) / r.prefill_ms : 0.0));
+            e.set("decode_tok_s", Json(r.decode_ms > 0 ? 1000.0 * static_cast<double>(r.output) / r.decode_ms : 0.0));
             e.set("mtp_cycles", Json(r.cycles)); e.set("mtp_accepted", Json(r.accepted)); e.set("mtp_proposed", Json(r.proposed));
             list.push(std::move(e));
         }
@@ -867,8 +882,11 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& response
     };
     try {
         if (request.method == "GET" && (request.path == "/health" || request.path == "/v1/health")) {
-            Json out = Json::object(); out.set("status", Json("ok")); out.set("model", Json(impl.config.model_id));
-            response.send(200, "application/json", out.dump());
+            std::string state;
+            { const std::lock_guard lock(impl.mutex); state = impl.state; }
+            const bool failed = state == "failed";
+            Json out = Json::object(); out.set("status", Json(failed ? "failed" : "ok")); out.set("model", Json(impl.config.model_id));
+            response.send(failed ? 503 : 200, "application/json", out.dump());
             return;
         }
         if (request.method == "GET" && request.path == "/metrics") { response.send(200, "text/plain; version=0.0.4", impl.metrics()); return; }

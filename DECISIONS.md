@@ -395,6 +395,29 @@ cold) or an uncached process; timings are single smoke runs on shared nodes, not
 MTP cycle counts can differ between identical runs (the window cost model is timing-driven); tokens, replay and
 state digests do not.
 
+## D-036: HTTP serving on the tiled MTP route
+
+`--http-serve` keeps one decoder process: model, MTP assets and the predictor qualification (calibration
+replay of the command-line prompt) are set up once, then OpenAI-compatible (`/v1/chat/completions`,
+`/v1/completions`) and Anthropic-compatible (`/v1/messages`) requests run one at a time, with streaming,
+health, Prometheus metrics and a JSON status (docs/serving.md). Each request starts exactly like the
+command-line request after calibration: fresh target state and session, fresh predictor, and the verify
+windows drop any deferred GDN rows of the previous request (`HipMtpWindowVerifier::begin_session`); the
+prefix state cache spans requests. The tokenizer (byte-level BPE with the model's split rule) and the chat
+template (thinking on/off, reasoning effort, tools and tool calls) are native host code read from the GGUF;
+the template is checked byte for byte against renders of the embedded template, the tokenizer against
+reference encodings of a multilingual corpus.
+
+Why: one load per process instead of per request, and a standard interface for chat clients and agents,
+without changing what is computed: a served request is the command-line request.
+
+Checked on one Strix Halo node (dense-A8 profile, T=16 blocks, prefix cache every 16 tokens, windows
+2/4/8): two chat prompts of 38 tokens served in one process give the command-line token IDs up to the stop
+token (63 and 88 tokens), also when repeated with 16 or 32 prompt tokens restored from the prefix cache and
+when two clients (one streamed) send at the same time. The command line stops only at `--eos-token`
+(default `<|endoftext|>`); the server also stops at `<|im_end|>`. No timing campaign was run; sampling and
+batched decode of concurrent requests are separate routes.
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |

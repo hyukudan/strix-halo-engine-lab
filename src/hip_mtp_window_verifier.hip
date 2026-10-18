@@ -231,6 +231,12 @@ void HipMtpWindowVerifier::prepare_admission(const SerialSessionContext& session
         o.window->preflight_admission(session,tokens);
     }
 }
+void HipMtpWindowVerifier::begin_session() {
+    auto& i=*impl_;
+    require(!i.busy && !failed(),"MTP window verifier session restarts only while idle and healthy");
+    for(auto& o:i.owners) o.window->discard_deferred();
+    i.last=nullptr;i.last_end.reset();
+}
 bool HipMtpWindowVerifier::failed() const noexcept {return impl_->failed || (impl_->checkpoint && impl_->checkpoint->failed());}
 std::uint64_t HipMtpWindowVerifier::retained_payload_bytes() const noexcept {return impl_->retained;}
 bool HipMtpWindowVerifier::worth_drafting(std::span<const float> probabilities) const {

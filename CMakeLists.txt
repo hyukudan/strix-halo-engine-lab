@@ -1542,7 +1542,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_include_directories(strix-hip-decode-token PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_link_libraries(
         strix-hip-decode-token
-        PRIVATE strix_hip_runtime
+        PRIVATE strix_hip_runtime strix_serve
     )
     strix_target_warnings(
         strix-hip-decode-token
@@ -1558,13 +1558,13 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             STRIX_DECODE_ENTRY=strix_hip_decode_token_entry STRIX_MTP_MODEL_QUALIFICATION_RUNNER=1)
         target_include_directories(strix-hip-mtp-model-qualification PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
         target_link_libraries(strix-hip-mtp-model-qualification PRIVATE
-            strix_hip_runtime strix_mtp_projection_component_fixtures)
+            strix_hip_runtime strix_mtp_projection_component_fixtures strix_serve)
         target_compile_options(strix-hip-mtp-model-qualification PRIVATE
             "SHELL:-include \"${CMAKE_CURRENT_SOURCE_DIR}/include/strix/hip_runtime_telemetry.hpp\"")
         strix_target_warnings(strix-hip-mtp-model-qualification)
         add_executable(strix-hip-mtp-qualification-reference-tests tests/hip_mtp_qualification_reference_tests.hip)
         target_link_libraries(strix-hip-mtp-qualification-reference-tests PRIVATE
-            strix_hip_runtime strix_mtp_projection_component_fixtures)
+            strix_hip_runtime strix_mtp_projection_component_fixtures strix_serve)
         set_target_properties(strix-hip-mtp-qualification-reference-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
         strix_target_warnings(strix-hip-mtp-qualification-reference-tests)

@@ -58,6 +58,9 @@ public:
     // Setup only: every owner's window admission at the session's current frontier, so the
     // first window of each owner does not pay it inside the generation loop.
     void prepare_admission(const SerialSessionContext& session);
+    // A new session over the same owners after the target state was reset: pending deferred rows
+    // of the previous session are dropped. The adaptive window costs and acceptance bins persist.
+    void begin_session();
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

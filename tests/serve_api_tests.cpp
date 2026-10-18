@@ -236,8 +236,9 @@ int main() try {
         const auto j = parse_json(http(port, "POST", "/v1/completions", R"({"prompt":"Hello","max_tokens":50})", auth).body);
         check(at(j, "object").as_string() == "text_completion" &&
             at(first_choice(j), "text").as_string().find("Hello there") != std::string::npos, "completions " + j.dump());
-        const auto ids = parse_json(http(port, "POST", "/v1/completions", R"({"prompt":[72,101],"max_tokens":5})", auth).body);
+        const auto ids = parse_json(http(port, "POST", "/v1/completions", R"({"prompt":[72,101],"max_tokens":5,"return_token_ids":true})", auth).body);
         check(at(at(ids, "usage"), "prompt_tokens").as_int() == 2, "completions with token IDs " + ids.dump());
+        check(at(at(ids, "strix"), "token_ids").size() == 5U, "returned token IDs " + ids.dump());
     }
     {
         const std::string body = R"({"model":"x","max_tokens":100,"system":"Be brief.","thinking":{"type":"enabled","budget_tokens":100},

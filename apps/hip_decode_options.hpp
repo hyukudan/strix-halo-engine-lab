@@ -286,6 +286,18 @@ struct Options {
     std::uint64_t prefix_cache_every = 0;  // 0: every max(T, 4096) tokens, rounded to a multiple of T
     std::vector<std::string> prefix_cache_then_prompts;
     bool prefix_cache_disk_bytes_explicit = false, prefix_cache_every_explicit = false;
+    // HTTP serving (docs/serving.md): after the MTP calibration replay the process serves
+    // OpenAI/Anthropic-compatible requests until SIGINT/SIGTERM. The command-line prompt is the
+    // calibration prompt only. Port 0 binds any free port (printed on stderr).
+    bool http_serve = false;
+    std::uint32_t http_port = 8080;
+    std::string http_bind = "127.0.0.1";
+    std::string http_model_id = "qwen3.8-flash-next";
+    std::string http_api_key_file;
+    std::string http_sampling = "greedy";  // temperature > 0: "greedy" (downgrade, noted) or "reject"
+    std::uint32_t http_default_max_tokens = 4096;
+    std::uint32_t http_max_queue = 64;
+    std::uint32_t http_max_connections = 64;
 };
 
 // The wrapper can omit a terminal stateless head without allocating a GPU
@@ -606,6 +618,17 @@ inline void validate_prefix_state_cache(const Options& o) {
         throw std::invalid_argument("--prefix-cache-then-prompt runs on the serial-decode tiled route only");
     if (o.prefix_cache_then_prompts.size() > 64U)
         throw std::invalid_argument("at most 64 --prefix-cache-then-prompt requests");
+}
+
+// HTTP serving runs the tiled MTP route: one calibration replay, then one request at a time.
+inline void validate_http_serve(const Options& o) {
+    if (!o.http_serve) return;
+    if (!mtp_tiled_prompt(o) || !o.mtp.golden_dump.empty() || o.mtp.metadata_only)
+        throw std::invalid_argument("--http-serve requires the tiled MTP route (--mtp with a calibration golden, "
+            "--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T)");
+    if (o.http_port > 65535U || o.http_bind.empty() || o.http_model_id.empty() || !o.http_default_max_tokens ||
+        !o.http_max_queue || !o.http_max_connections || (o.http_sampling != "greedy" && o.http_sampling != "reject"))
+        throw std::invalid_argument("--http-* values: port <= 65535, non-empty bind/model id, positive limits, sampling greedy|reject");
 }
 
 inline void validate_known_prefill_options(const Options& options) {
@@ -1151,6 +1174,32 @@ inline Options parse_options(
                 options.prefix_cache_every_explicit = true;
                 options.prefix_cache_every = parse_u64(value, "prefix cache interval");
             }
+            continue;
+        }
+        if (argument == "--http-serve") {
+            if (options.http_serve) throw std::invalid_argument("duplicate --http-serve");
+            options.http_serve = true;
+            continue;
+        }
+        if (argument == "--http-port" || argument == "--http-bind" || argument == "--http-model-id" ||
+            argument == "--http-api-key-file" || argument == "--http-sampling" || argument == "--http-default-max-tokens" ||
+            argument == "--http-max-queue" || argument == "--http-max-connections") {
+            if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
+                throw std::invalid_argument(std::string(argument) + " requires a value");
+            const std::string_view value = argv[++index];
+            const auto u32 = [&](const char* what) {
+                const auto parsed = parse_u64(value, what);
+                if (parsed > UINT32_MAX) throw std::invalid_argument(std::string(what) + " exceeds uint32");
+                return static_cast<std::uint32_t>(parsed);
+            };
+            if (argument == "--http-port") options.http_port = u32("HTTP port");
+            else if (argument == "--http-bind") options.http_bind = value;
+            else if (argument == "--http-model-id") options.http_model_id = value;
+            else if (argument == "--http-api-key-file") options.http_api_key_file = value;
+            else if (argument == "--http-sampling") options.http_sampling = value;
+            else if (argument == "--http-default-max-tokens") options.http_default_max_tokens = u32("HTTP default max tokens");
+            else if (argument == "--http-max-queue") options.http_max_queue = u32("HTTP queue");
+            else options.http_max_connections = u32("HTTP connections");
             continue;
         }
         if (argument == "--serve-prefix-u32le") {
@@ -1998,6 +2047,7 @@ inline Options parse_options(
     validate_prefill_numerical_profile_cli(options);
     validate_mtp_cli(options);
     validate_prefix_state_cache(options);
+    validate_http_serve(options);
     return options;
 }
 

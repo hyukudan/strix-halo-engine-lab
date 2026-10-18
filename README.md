@@ -33,9 +33,9 @@ Halo without the distributed orchestration work in [TensorMeld](https://github.c
 operation and other GPUs are separate, explicitly qualified stages. First priority: the best correct end-to-end
 performance from AMD hardware.
 
-> **Status: research engine.** It works end to end and the numbers below are measured, but the interface is a
-> command-line tool that takes token IDs and prints a JSON receipt. There is no chat server yet; see the
-> [roadmap](#roadmap).
+> **Status: research engine.** It works end to end and the numbers below are measured. The main interface is a
+> command-line tool that takes token IDs and prints a JSON receipt; `--http-serve` turns the same process into an
+> OpenAI/Anthropic-compatible HTTP server (one request at a time, greedy; see [docs/serving.md](docs/serving.md)).
 
 ## Contents
 
@@ -278,6 +278,10 @@ The full record, with alternatives, evidence and the condition for reopening eac
 In progress, in no particular order and without promised numbers:
 
 - **Prefix cache with GDN state** *(landed, D-035)*: a request whose prompt starts with a cached prefix restores the complete model state at a tiled-prefill block boundary and reads only the rest, with bit-identical output (`--prefix-cache-host-bytes N`, optional `--prefix-cache-dir DIR`; see [docs/prefix-state-cache.md](docs/prefix-state-cache.md)). Timings follow the next benchmark campaign.
+- **HTTP server** *(first version)*: `--http-serve` serves chat/completions, completions and messages with
+  streaming, the model's own tokenizer and chat template (thinking on/off, tool calls), MTP decode and the prefix
+  state cache across requests, with token output identical to the command line
+  ([docs/serving.md](docs/serving.md)). Sampling and batched requests come next.
 - **Monitor panel**: live view of requests, speed and memory.
 - **Several requests at once**.
 - **KV cache in int8**.
