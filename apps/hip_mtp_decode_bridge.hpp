@@ -613,8 +613,10 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         output<<"},\n  \"mtp_chosen_window_rows_scope\":\"verifier-choice-per-cycle-1-is-serial-target-steps\",\n"
             <<"  \"mtp_window_owner_cycle_ms_ema\":{";
         if(window){const auto stats=window->owner_stats();
-            for(std::size_t s=0;s<stats.size();++s)output<<(s?",":"")<<"\""<<stats[s].rows<<"\":{\"cycles\":"<<stats[s].cycles<<",\"ema_ms\":"<<stats[s].cycle_ms_ema<<"}";}
+            for(std::size_t s=0;s<stats.size();++s)output<<(s?",":"")<<"\""<<stats[s].rows<<"\":{\"cycles\":"<<stats[s].cycles<<",\"ema_ms\":"<<stats[s].cycle_ms_ema
+                <<",\"probes\":"<<stats[s].probes<<"}";}
         output<<"},\n"
+            <<"  \"mtp_window_cost_model\":\""<<(window && !window->robust_cost_model()?"legacy-ema":"robust-median-reprobe-v1")<<"\",\n"
             <<"  \"mtp_draft_chain\":"<<(m.draft_chain?"true":"false")<<",\n"
             <<"  \"mtp_draft_exact_kernels\":"<<(m.draft_exact?"true":"false")<<",\n"
             <<"  \"mtp_draft_q4_head\":"<<(m.draft_q4?"true":"false")<<",\n"

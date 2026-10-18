@@ -20,7 +20,9 @@ struct HipMtpVerifiedTargetRows {
     std::uint32_t r2_dispatches=0,projection_launches_saved=0;
     std::uint32_t chosen_rows=1; // window owner rows, 1 = serial target steps
 };
-struct HipMtpWindowOwnerStats {std::uint32_t rows=0;std::uint64_t cycles=0;double cycle_ms_ema=0.0;};
+// Min-p controller cost samples per owner (rows 1 = serial, per emitted token); cycle_ms_ema is the current
+// estimate (EMA with STRIX_MTP_WINDOW_COST=legacy, else robust, D-039); probes = re-probe choices.
+struct HipMtpWindowOwnerStats {std::uint32_t rows=0;std::uint64_t cycles=0;double cycle_ms_ema=0.0;std::uint64_t probes=0;};
 // Survival controller cost samples: serial rows (1,1), each owner/active-rows option (cycle time minus the
 // draft chain), and the draft step (0,0).
 struct HipMtpWindowOptionStats {std::uint32_t rows=0,active=0;std::uint64_t samples=0;double ms_ema=0.0;};
@@ -67,6 +69,8 @@ public:
     // of the drafts so far (plus one exploration draft after a weak first draft).
     [[nodiscard]] bool worth_drafting(std::span<const float> probabilities,std::span<const float> runner_ups={}) const;
     [[nodiscard]] bool survival_controller() const noexcept;
+    // Min-p controller cost model: robust estimates with re-probes (default) or the legacy EMA.
+    [[nodiscard]] bool robust_cost_model() const noexcept;
     // The current cycle's draft chain (steps, host wall ms), recorded before verify for the cost split.
     void note_draft(std::uint32_t steps,double ms) noexcept;
     [[nodiscard]] std::vector<HipMtpWindowOptionStats> option_stats() const;

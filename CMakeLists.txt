@@ -167,6 +167,7 @@ add_library(strix_core STATIC
     src/mtp_forward_contract.cpp
     src/mtp_forward_golden_file.cpp
     src/mtp_target_window_policy.cpp
+    src/mtp_window_controller.cpp
     src/mtp_sidecar_binding.cpp
     src/mtp_forward_semantics.cpp
     src/mtp_forward_runtime.cpp
@@ -1129,6 +1130,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-mtp-target-window-policy-tests PRIVATE strix_core)
     strix_target_warnings(strix-mtp-target-window-policy-tests)
     add_test(NAME strix-mtp-target-window-policy-tests COMMAND strix-mtp-target-window-policy-tests)
+
+    add_executable(strix-mtp-window-controller-tests tests/mtp_window_controller_tests.cpp)
+    target_link_libraries(strix-mtp-window-controller-tests PRIVATE strix_core)
+    strix_target_warnings(strix-mtp-window-controller-tests)
+    add_test(NAME strix-mtp-window-controller-tests COMMAND strix-mtp-window-controller-tests)
 
     add_executable(strix-mtp-sidecar-binding-tests tests/mtp_sidecar_binding_tests.cpp)
     target_link_libraries(strix-mtp-sidecar-binding-tests PRIVATE strix_core)

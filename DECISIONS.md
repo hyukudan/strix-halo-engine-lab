@@ -440,6 +440,44 @@ single 111 ms first sample of R4 kept 262 of 267 cycles in R2.
 
 Status: opt-in until an interleaved timing campaign against D-022 qualifies it.
 
+## D-039: robust window cost estimates with bounded re-probes (D-022 controller, default)
+
+The D-022 controller only samples an owner's cost when it chooses it. Under the EMA, the first sample set
+the estimate and later samples were capped at 2x, so one slow window (page faults, a stalled host) could
+price an owner out for the rest of the run. Once a larger owner looked too slow, `worth_drafting` stopped
+every chain early, the larger owners were never chosen again, and nothing corrected the estimate.
+
+On hardware (code prompt, dense A8 profile, min-p 0.8) this happened as follows. The first R4 sample after
+its warm-up was 111 ms, against about 55 ms in other runs. R8 got only its warm-up window. 262 of 267 cycles
+then ran R2, at 41.8 tok/s; a repeat of the same run gave 61.2 tok/s.
+
+Now (`MtpMinPWindowController`, host code shared by the verifier and a unit test):
+
+- Cost estimate per owner and for serial rows. It keeps the last 8 samples; the first window of an owner is
+  still not a sample.
+  - With fewer than 3 samples the estimate is provisional and equals their minimum, so a single slow sample
+    cannot inflate it.
+  - From 3 samples on, it is their median, so one outlier never moves it.
+- Bounded re-probe. An owner whose estimate is provisional, or implausible (above the settled estimate of a
+  larger owner), is chosen once more, if it fits, after it has gone 64 choices unused. Each probe doubles that
+  owner's interval, so a run of N cycles pays at most about log2(N/64) probes per owner, and none once every
+  estimate has settled.
+- Unchanged: the chain cut, calibration and ranking (expected tokens per estimated ms), the policy flags,
+  and every emitted token. Only the choice of window differs.
+
+`STRIX_MTP_WINDOW_COST=legacy` restores the previous EMA without re-probes. Receipts record
+`mtp_window_cost_model` and per-owner `probes`.
+
+`tests/mtp_window_controller_tests.cpp` replays the stall with a synthetic cost sequence (a 111 ms first R4
+sample, then a confident workload):
+
+| Cost model | Outcome |
+| --- | --- |
+| Legacy | Stays in R2 |
+| Robust | Re-probes R8 and R4 a few times and runs the workload in R8 |
+
+Without the spike, both models settle on the same windows.
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |
