@@ -80,7 +80,7 @@ profile's binding and buffer requests (same kernel ids, steps, arena and state l
 state is an ordinary decode input state; `prefill_arithmetic_identity` folds the pair identity into the
 prefill execution's kernel-plan and execution identities, so the two executions remain distinct siblings.
 The prefill launchers are configured with the profile's components, recorded as `prefill_fast_components`
-and selected by `--prefill-fast-components hc,dense,moe` (any non-empty subset, default all; a subset has
+and selected by `--prefill-fast-components hc,dense,moe,qsa,router` (any non-empty subset, default all; a subset has
 its own pair identity):
 
 - `hc`: the wide prefill HC steps run FP16 WMMA projections: down (10240 -> 320) with the injection
@@ -106,6 +106,33 @@ its own pair identity):
   (up to 64 assignments of one expert) it lands in, so results do not depend on T or on the other rows.
   Serial rows (the unpadded suffix, every MTP prompt row) and windows keep the A8 MoE. The kernels reuse the
   A8 routed-MoE scratch views. Receipt: `prefill_moe_f16wmma_rows` (prompt rows times layers that ran it).
+- `qsa`: the sparse attention of the prefill groups (16, 32 or 64 rows of the tiled prefill; head size 256)
+  runs over the union of the selections of `t` consecutive rows (`STRIX_QSA_FAST_TILE`, 4 by default). A
+  union kernel lists, in ascending order, the 4-token blocks any of the `t` rows selected, each with a row
+  mask, and the multiplicity of tokens 0..3 in each row's selection (the selection repeats them when fewer
+  blocks than the budget are eligible). For each KV head and each 16-token chunk of the union,
+  `v_wmma_f32_16x16x16_f16` forms the scores of the `t` rows times the query heads of that KV head: K is
+  converted from BF16 to FP16 (exact in the FP16 normal range; larger magnitudes saturate at 65504), Q is
+  rounded once to FP16 after a power-of-two scale per (row, head) that puts its largest `|q|` in
+  `[2^13, 2^14)`, undone with `1 / sqrt(256)` on the FP32 scores. A (row, token) pair outside the row's
+  selection or causal prefix gets score `-inf`; a repeated token's weight is multiplied by its multiplicity.
+  The softmax is the online one in FP32 and base 2 (running maximum and sum per (row, head); the weights
+  `2^(s - m)` are rounded once to FP16 and multiply V, converted like K, with FP32 accumulation; the
+  accumulators are rescaled when a maximum grows). Slices of the union run in separate workgroups and are
+  merged in FP32; the merged sum is divided by the merged denominator and the exact path's BF16 roundings
+  and BF16 sigmoid gate follow. Unlike the exact path, the softmax weights are not rounded to BF16 and the
+  score and value sums are in hardware order. The indexer, block selection, KV store and output projection
+  are unchanged; serial tiles and MTP prompt rows keep the exact attention. The kernels use the rows'
+  attention-score workspace as scratch; a shape it does not cover keeps the exact kernels.
+  `STRIX_QSA_PREFILL_SELFCHECK=1` reports, per prefill call, the error of the attention outputs against the
+  serial exact tiles.
+- `router`: the router logits of the tiled prefill blocks (BF16 activations) run `v_wmma_f32_16x16x16_bf16`.
+  Each FP32 router weight `w` is split into two BF16 terms, `h = bf16(w)` and `m = bf16(w - h)` (round to
+  nearest even; `h + m` keeps 16 significant bits, relative error at most `2^-17`); the BF16 activations are
+  exact operands, so each product is exact, and the dot products accumulate in FP32 (K steps of 32, term
+  `h` then `m`). Top-k selection, normalisation and everything after the logits are unchanged; windows,
+  serial rows and FP32 activations keep the exact router.
 
-Router, QSA indexer, attention, GDN recurrence, PLE and LM head keep the decode profile's arithmetic.
+QSA indexer and selection, GDN recurrence, PLE and LM head keep the decode profile's arithmetic (and the
+QSA attention and router logits without `qsa` and `router`).
 Tokens differ from a dense-A8 run; exactness is defined from the handoff state as for every split pair.
