@@ -80,7 +80,7 @@ profile's binding and buffer requests (same kernel ids, steps, arena and state l
 state is an ordinary decode input state; `prefill_arithmetic_identity` folds the pair identity into the
 prefill execution's kernel-plan and execution identities, so the two executions remain distinct siblings.
 The prefill launchers are configured with the profile's components, recorded as `prefill_fast_components`
-and selected by `--prefill-fast-components hc,dense,moe` (any non-empty subset, default all; a subset has
+and selected by `--prefill-fast-components hc,dense,moe,dense8` (any non-empty subset, default hc,dense,moe; a subset has
 its own pair identity):
 
 - `hc`: the wide prefill HC steps run FP16 WMMA projections: down (10240 -> 320) with the injection
@@ -89,11 +89,21 @@ its own pair identity):
   the normalized rows and the low values are rounded to FP16 as operands; accumulation is FP32 over the
   whole width. The FP32 low values, the injection (FP32 inputs and weights, FP32 FMA chains) and the mix
   (stream order) keep FP32 arithmetic. Steps that do not take the wide path keep the decode profile's
-  kernels.
+  kernels. By default the up projection keeps the FP32 lane-chain kernel on the projection's FP32 low values
+  (`STRIX_HCW_OUTPUT=2` selects the FP16 WMMA up projection). Blocks of up to 8192 rows. Diagnostic
+  `STRIX_HCW_NORM16`: 1 = a fast-profile HC norm also writes the normalized rows in FP16 (padded pitch)
+  for the projection; 2 = it writes only the FP16 rows and the lane-chain output's stream mix reads them
+  too (the injection then runs on the FP16 values widened to FP32). Off by default.
 - `dense`: GDN, QSA and shared-expert dense projections of prompt launches of 32..256 rows run
   FP16 x FP16 -> FP32 WMMA: activations rounded to FP16 into a scratch slot (finite values beyond the
   FP16 range are counted), Q8_0 blocks dequantized to FP16 in LDS by the projection. Launches of other
   row counts keep dense A8. The GDN output projection does not use the fused A8 quantizer.
+- `dense8` (opt-in, not in the default set, exclusive with `dense`): the same projections, on 256-row
+  launches where dense A8 takes its 4 x 2 LDS form, run A8-G64: activations in int8 per (row, 64-feature
+  group) with the dense A8 quantizer's rules; each Q8_0 block pair requantized once per weight matrix to
+  one scale `dp = max(|d0|, |d1|)`, `q' = clamp(rint(q * d_b / dp), -128, 127)` (exact where the two
+  scales are equal), stored as 68-byte pairs (FP32 `dp`, 64 codes); int32 accumulation over each pair and
+  one FP32 step `acc += (dp * delta) * dot` per pair, NaN canonical. Other launches keep dense A8.
 - `moe`: the routed MoE of every complete tiled prefill block (the T-row CSR path) runs FP16 WMMA. Each
   Q4_K/Q5_K gate/up value `d*sc*q - dm*m`, Q5_1 down value `d*q + m` and Q8_0 down value `d*q` is formed in
   FP32 and rounded once to FP16 inside the kernel (no FP16 copy of the weights in memory). The BF16 input
