@@ -102,5 +102,15 @@ namespace testing {
 // 256-leaf summation tree); width % 32 == 0 for wave8. Bit-exactness fixture only.
 void enqueue_ple_q8_projection(bool wave8,const std::uint16_t* input,const void* q8,std::uint32_t input_width,
     std::uint32_t output_width,float* output,void* stream);
+// PLE tail (key/query gate, gated value, grouped norm, causal convolution and residual) of `rows`
+// consecutive rows. keys: rows x hidden*hc FP32 (overwritten); values: rows x hidden FP32; input and
+// output: rows of hidden*hc BF16 at their element strides; conv_state: hidden*hc x history BF16,
+// advanced by all rows; norms and convolution F32, or BF16 when bf16_weights. rows_form selects
+// the prefill rows kernels, otherwise the per-row kernels run row by row. scratch: rows*hc +
+// 2*hidden*hc floats. Bit-exactness fixture only.
+void enqueue_ple_tail(bool rows_form,float* keys,const float* values,const std::uint16_t* input,std::uint32_t input_stride,
+    std::uint16_t* output,std::uint32_t output_stride,std::uint16_t* conv_state,const void* norm_key,const void* norm_query,
+    const void* norm_conv,const void* conv,bool bf16_weights,std::uint32_t rows,std::uint32_t hidden_size,std::uint32_t hc_count,
+    std::uint32_t kernel_size,std::uint32_t ngram_size,float epsilon,float* scratch,void* stream);
 }
 }  // namespace strix

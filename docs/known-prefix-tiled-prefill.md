@@ -14,6 +14,16 @@ implementation, and it does not run a complete decoder forward every eight rows.
 
 GDN recurrence and convolution still update rows in increasing position order.
 PLE and QSA retain the original row-local operations and history transitions.
+The PLE tail after the key/value projections (key/query gate, gated value,
+grouped norm, causal convolution and residual) runs as one rows-form sequence of
+three launches per T-row block instead of four launches per row. Each row keeps
+its own reductions, gate, norm and tap order; a row's convolution taps read the
+previous state or the BF16 of an earlier row's normalized value, which is what the
+per-row state shift stores, and the state after the block is written once every
+row has read it. Rows whose inputs or outputs are not at one uniform stride use
+the per-row launches. `STRIX_PREFILL_PLE_ROWS=0` selects the per-row launches;
+`STRIX_PREFILL_PLE_ROWS_CHECK=1` runs both forms from the same inputs and state and
+reports the number of differing output and state values per block.
 Every declared position-history reader receives its own absolute position;
 future-row host position values are not reused. There is no temporal scan or
 parallel recurrent update. The routed expert workspace is retained for an

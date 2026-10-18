@@ -864,6 +864,194 @@ __global__ void conv_residual_kernel(
             silu);
 }
 
+// Rows form of the per-row PLE tail for the T rows of a prefill block (blockIdx.y is the row).
+// Each row keeps the per-row kernels' arithmetic: the same per-lane strided sums, LDS trees,
+// gate, gated product, norm and convolution tap order. The convolution state of every row is
+// the bf16 of the previous rows' normalized values, so a row's taps read either the old state
+// (lag beyond the block's start) or the bf16 of an earlier row's normalized value; the state
+// after the block is written by a separate kernel once every row has read the old state.
+__device__ __forceinline__ float ple_rows_exact_mul(float a, float b) {
+    float result;  // a plain product, never contracted into the sum that consumes it
+    asm("v_mul_f32 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
+    return result;
+}
+// Gate (normalize_key_and_gate_kernel) and grouped norm of the gated value (gated_value_kernel,
+// grouped_norm_kernel) of one row's stream; the normalized values overwrite the row's key, which
+// the per-row path does not read after the gate.
+__global__ void ple_rows_gate_norm_kernel(
+    float* key, std::uint32_t key_stride,
+    const float* value, std::uint32_t value_stride,
+    const std::uint16_t* query, std::uint32_t query_stride,
+    const void* key_norm, SmallWeightKind key_norm_kind,
+    const void* query_norm, SmallWeightKind query_norm_kind,
+    const void* conv_norm, SmallWeightKind conv_norm_kind,
+    float* gates, std::uint32_t hidden_size, std::uint32_t hc_count, float epsilon) {
+    const auto stream = static_cast<std::uint32_t>(blockIdx.x);
+    const auto row = static_cast<std::uint32_t>(blockIdx.y);
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
+    if (stream >= hc_count) return;
+    key += static_cast<std::uint64_t>(row) * key_stride;
+    value += static_cast<std::uint64_t>(row) * value_stride;
+    query += static_cast<std::uint64_t>(row) * query_stride;
+
+    __shared__ float key_reduce[kThreads];
+    __shared__ float query_reduce[kThreads];
+    __shared__ float inverse_key;
+    __shared__ float inverse_query;
+    __shared__ float gate;
+    __shared__ float inverse_rms;
+
+    float key_square = 0.0F;
+    float query_square = 0.0F;
+    const auto base = static_cast<std::uint64_t>(stream) * hidden_size;
+    for (std::uint32_t feature = lane; feature < hidden_size; feature += kThreads) {
+        const float k = key[base + feature];
+        const float q = bf16_to_float(query[base + feature]);
+        key_square += k * k;
+        query_square += q * q;
+    }
+    key_reduce[lane] = key_square;
+    query_reduce[lane] = query_square;
+    __syncthreads();
+    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
+        if (lane < stride) {
+            key_reduce[lane] += key_reduce[lane + stride];
+            query_reduce[lane] += query_reduce[lane + stride];
+        }
+        __syncthreads();
+    }
+    if (lane == 0) {
+        inverse_key = rsqrtf(key_reduce[0] / static_cast<float>(hidden_size) + epsilon);
+        inverse_query = rsqrtf(query_reduce[0] / static_cast<float>(hidden_size) + epsilon);
+    }
+    __syncthreads();
+
+    float dot = 0.0F;
+    for (std::uint32_t feature = lane; feature < hidden_size; feature += kThreads) {
+        const auto index = base + feature;
+        const float normalized_key = key[index] * inverse_key * load_small(key_norm, key_norm_kind, index);
+        const float normalized_query =
+            bf16_to_float(query[index]) * inverse_query * load_small(query_norm, query_norm_kind, index);
+        dot += normalized_key * normalized_query;
+    }
+    key_reduce[lane] = dot;
+    __syncthreads();
+    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
+        if (lane < stride) key_reduce[lane] += key_reduce[lane + stride];
+        __syncthreads();
+    }
+    if (lane == 0) {
+        const float score = key_reduce[0] / sqrtf(static_cast<float>(hidden_size));
+        const float magnitude = sqrtf(fmaxf(fabsf(score), 1e-6F));
+        const float signed_root = score > 0.0F ? magnitude : score < 0.0F ? -magnitude : 0.0F;
+        gate = 1.0F / (1.0F + expf(-signed_root));
+        gates[static_cast<std::uint64_t>(row) * hc_count + stream] = gate;
+    }
+    __syncthreads();
+
+    const float g = gate;
+    float square = 0.0F;
+    for (std::uint32_t feature = lane; feature < hidden_size; feature += kThreads) {
+        const float gated = ple_rows_exact_mul(value[feature], g);
+        square += gated * gated;
+    }
+    key_reduce[lane] = square;
+    __syncthreads();
+    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
+        if (lane < stride) key_reduce[lane] += key_reduce[lane + stride];
+        __syncthreads();
+    }
+    if (lane == 0) inverse_rms = rsqrtf(key_reduce[0] / static_cast<float>(hidden_size) + epsilon);
+    __syncthreads();
+    for (std::uint32_t feature = lane; feature < hidden_size; feature += kThreads) {
+        const auto index = base + feature;
+        const float gated = ple_rows_exact_mul(value[feature], g);
+        key[index] = gated * inverse_rms * load_small(conv_norm, conv_norm_kind, index);
+    }
+}
+
+// conv_residual_kernel for every row of the block; the old state is only read.
+__global__ void ple_rows_conv_residual_kernel(
+    const std::uint16_t* hidden, std::uint32_t hidden_stride,
+    const float* value, std::uint32_t value_stride,
+    const float* gates,
+    const float* normalized, std::uint32_t normalized_stride,
+    const std::uint16_t* conv_state, const void* conv_weight, SmallWeightKind conv_kind,
+    std::uint16_t* output, std::uint32_t output_stride,
+    std::uint32_t hidden_size, std::uint32_t hc_count, std::uint32_t history, std::uint32_t kernel_size,
+    std::uint32_t dilation, std::uint32_t* graph_status) {
+    if (graph_status && atomicAdd(graph_status, 0U) != 0U) return;
+    const auto channel = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto row = static_cast<std::uint32_t>(blockIdx.y);
+    if (channel >= hidden_size * hc_count) return;
+    const auto* state = conv_state + static_cast<std::uint64_t>(channel) * history;
+
+    float conv = 0.0F;
+    for (std::uint32_t tap = 0; tap < kernel_size; ++tap) {
+        const auto lag = (kernel_size - 1U - tap) * dilation;
+        float value_at;
+        if (lag == 0) value_at = normalized[static_cast<std::uint64_t>(row) * normalized_stride + channel];
+        else if (row >= lag)
+            value_at = bf16_to_float(float_to_bf16(
+                normalized[static_cast<std::uint64_t>(row - lag) * normalized_stride + channel]));
+        else value_at = bf16_to_float(state[history + row - lag]);
+        conv += value_at *
+            load_small(conv_weight, conv_kind, static_cast<std::uint64_t>(channel) * kernel_size + tap);
+    }
+    const auto stream = channel / hidden_size, feature = channel % hidden_size;
+    const float gated = ple_rows_exact_mul(value[static_cast<std::uint64_t>(row) * value_stride + feature],
+        gates[static_cast<std::uint64_t>(row) * hc_count + stream]);
+    const float silu = conv / (1.0F + expf(-conv));
+    output[static_cast<std::uint64_t>(row) * output_stride + channel] =
+        float_to_bf16(bf16_to_float(hidden[static_cast<std::uint64_t>(row) * hidden_stride + channel]) + gated + silu);
+}
+
+// The convolution state after `rows` rows: the last `history` entries of old state ++ bf16(rows).
+__global__ void ple_rows_conv_state_kernel(
+    const float* normalized, std::uint32_t normalized_stride, std::uint16_t* conv_state,
+    std::uint32_t channels, std::uint32_t history, std::uint32_t rows, std::uint32_t* graph_status) {
+    if (graph_status && atomicAdd(graph_status, 0U) != 0U) return;
+    const auto channel = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (channel >= channels) return;
+    auto* state = conv_state + static_cast<std::uint64_t>(channel) * history;
+    for (std::uint32_t index = 0; index < history; ++index) {
+        const auto source = rows + index;  // ascending: reads only entries not yet rewritten
+        state[index] = source < history ? state[source]
+            : float_to_bf16(normalized[static_cast<std::uint64_t>(source - history) * normalized_stride + channel]);
+    }
+}
+
+// Arguments of the rows-form PLE tail (prefill rows and the test fixture).
+struct PleTailRows {
+    float* keys; std::uint32_t key_stride;
+    const float* values; std::uint32_t value_stride;
+    const std::uint16_t* input; std::uint32_t input_stride;
+    std::uint16_t* output; std::uint32_t output_stride;
+    std::uint16_t* conv_state;
+    const void *norm_key, *norm_query, *norm_conv, *conv;
+    SmallWeightKind norm_key_kind, norm_query_kind, norm_conv_kind, conv_kind;
+    float* gates;
+    std::uint32_t rows, hidden_size, hc_count, kernel_size, ngram_size;
+    float epsilon;
+};
+void enqueue_ple_tail_rows(const PleTailRows& t, std::uint32_t* graph_status, hipStream_t stream) {
+    const auto channels = t.hidden_size * t.hc_count;
+    const auto history = (t.kernel_size - 1U) * t.ngram_size;
+    hipLaunchKernelGGL(ple_rows_gate_norm_kernel, dim3(t.hc_count, t.rows), dim3(kThreads), 0, stream,
+        t.keys, t.key_stride, t.values, t.value_stride, t.input, t.input_stride, t.norm_key, t.norm_key_kind,
+        t.norm_query, t.norm_query_kind, t.norm_conv, t.norm_conv_kind, t.gates, t.hidden_size, t.hc_count, t.epsilon);
+    check_hip(hipGetLastError(), "HIP PLE rows gate/norm launch");
+    const auto blocks = (channels + kThreads - 1U) / kThreads;
+    hipLaunchKernelGGL(ple_rows_conv_residual_kernel, dim3(blocks, t.rows), dim3(kThreads), 0, stream,
+        t.input, t.input_stride, t.values, t.value_stride, t.gates, t.keys, t.key_stride, t.conv_state, t.conv,
+        t.conv_kind, t.output, t.output_stride, t.hidden_size, t.hc_count, history, t.kernel_size, t.ngram_size,
+        graph_status);
+    check_hip(hipGetLastError(), "HIP PLE rows convolution launch");
+    hipLaunchKernelGGL(ple_rows_conv_state_kernel, dim3(blocks), dim3(kThreads), 0, stream,
+        t.keys, t.key_stride, t.conv_state, channels, history, t.rows, graph_status);
+    check_hip(hipGetLastError(), "HIP PLE rows convolution state launch");
+}
+
 template <WeightKind Kind>
 void launch_projection(
     const std::uint16_t* input,
@@ -1843,6 +2031,33 @@ void testing::enqueue_ple_q8_projection(bool wave8,const std::uint16_t* input,co
         input,q8,input_width,output_width,output);
     check_hip(hipGetLastError(),"PLE Q8 projection test launch");
 }
+void testing::enqueue_ple_tail(bool rows_form,float* keys,const float* values,const std::uint16_t* input,std::uint32_t input_stride,
+    std::uint16_t* output,std::uint32_t output_stride,std::uint16_t* conv_state,const void* norm_key,const void* norm_query,
+    const void* norm_conv,const void* conv,bool bf16_weights,std::uint32_t rows,std::uint32_t hidden_size,std::uint32_t hc_count,
+    std::uint32_t kernel_size,std::uint32_t ngram_size,float epsilon,float* scratch,void* stream) {
+    const auto s=static_cast<hipStream_t>(stream);
+    const auto kind=bf16_weights?SmallWeightKind::bf16:SmallWeightKind::f32;
+    const auto expanded=hidden_size*hc_count,history=(kernel_size-1U)*ngram_size,blocks=(expanded+kThreads-1U)/kThreads;
+    if(rows_form){
+        const PleTailRows t{keys,expanded,values,hidden_size,input,input_stride,output,output_stride,conv_state,norm_key,norm_query,
+            norm_conv,conv,kind,kind,kind,kind,scratch,rows,hidden_size,hc_count,kernel_size,ngram_size,epsilon};
+        enqueue_ple_tail_rows(t,nullptr,s);
+        return;
+    }
+    // The launch sequence of enqueue_ple_device after its projections, one row at a time.
+    float* gates=scratch;float* gated=scratch+hc_count;float* normalized=gated+expanded;
+    for(std::uint32_t r=0;r<rows;++r){
+        float* key=keys+static_cast<std::uint64_t>(r)*expanded;const float* value=values+static_cast<std::uint64_t>(r)*hidden_size;
+        const auto* in=input+static_cast<std::uint64_t>(r)*input_stride;auto* out=output+static_cast<std::uint64_t>(r)*output_stride;
+        hipLaunchKernelGGL(normalize_key_and_gate_kernel,dim3(hc_count),dim3(kThreads),0,s,key,in,norm_key,kind,norm_query,kind,gates,
+            hidden_size,hc_count,epsilon);
+        hipLaunchKernelGGL(gated_value_kernel,dim3(blocks),dim3(kThreads),0,s,value,gates,gated,hidden_size,hc_count);
+        hipLaunchKernelGGL(grouped_norm_kernel,dim3(hc_count),dim3(kThreads),0,s,gated,norm_conv,kind,normalized,hidden_size,hc_count,epsilon);
+        hipLaunchKernelGGL(conv_residual_kernel,dim3(blocks),dim3(kThreads),0,s,in,gated,normalized,conv_state,conv,kind,out,expanded,
+            history,kernel_size,ngram_size,nullptr);
+    }
+    check_hip(hipGetLastError(),"PLE tail test launch");
+}
 
 struct HipPleLauncherBundle::OwnedUploads {
     AllocationGenerationSource generations;
@@ -2049,6 +2264,7 @@ struct HipPleKnownWindow::Impl {
     std::array<bool, 2> recorded{};
     std::byte* snapshots = nullptr;
     float* projections = nullptr;   // every row's key, then every row's value
+    float* gates = nullptr;         // prefill: every row's stream gates (rows-form tail)
     std::uintptr_t conv_address = 0, ngram_address = 0;
     std::vector<PleHashResult> hashes;
     ~Impl() {
@@ -2056,6 +2272,7 @@ struct HipPleKnownWindow::Impl {
         for (auto e : released) if (e) (void)hipEventDestroy(e);
         if (snapshots) (void)hipFree(snapshots);
         if (projections) (void)hipFree(projections);
+        if (gates) (void)hipFree(gates);
     }
     // Key and value projections of all rows, each Q8 weight block read once (the per-row
     // wave8 arithmetic). False when a projection is not wave8 Q8: rows project one by one.
@@ -2120,6 +2337,45 @@ struct HipPleKnownWindow::Impl {
         default: return false;
         }
         check_hip(hipGetLastError(), "known-window PLE rows projection launch");
+        return true;
+    }
+    // The rows-form tail of all prefill rows after project_rows: false (rows run one by one) unless
+    // every row's input and output sit at one uniform stride, rows do not overlap and the outputs
+    // are either the inputs themselves or disjoint from all of them.
+    bool tail_rows(const std::vector<PreparedPleLaunch>& p, PleTailRows& t) const {
+        const auto count = static_cast<std::uint32_t>(p.size());
+        const auto expanded = p[0].expanded, bytes = expanded * config.model.bytes_bf16;
+        const auto in0 = p[0].input.address, out0 = p[0].output.address;
+        const auto in_step = count > 1U && p[1].input.address > in0 ? p[1].input.address - in0 : bytes;
+        const auto out_step = count > 1U && p[1].output.address > out0 ? p[1].output.address - out0 : bytes;
+        if (!gates || (in0 | out0 | in_step | out_step) % 2U || in_step < bytes || out_step < bytes ||
+            in_step / 2U > std::numeric_limits<std::uint32_t>::max() || out_step / 2U > std::numeric_limits<std::uint32_t>::max())
+            return false;
+        for (std::uint32_t r = 0; r < count; ++r)
+            if (p[r].input.address != in0 + r * in_step || p[r].output.address != out0 + r * out_step) return false;
+        const auto in_end = in0 + (count - 1U) * in_step + bytes, out_end = out0 + (count - 1U) * out_step + bytes;
+        if (!(in0 == out0 && in_step == out_step) && out0 < in_end && in0 < out_end) return false;
+        const auto& s = p[0].tensors;
+        t.keys = projections; t.key_stride = static_cast<std::uint32_t>(expanded);
+        t.values = projections + static_cast<std::uint64_t>(max_rows) * expanded;
+        t.value_stride = static_cast<std::uint32_t>(config.model.hidden_size);
+        t.input = reinterpret_cast<const std::uint16_t*>(in0); t.input_stride = static_cast<std::uint32_t>(in_step / 2U);
+        t.output = reinterpret_cast<std::uint16_t*>(out0); t.output_stride = static_cast<std::uint32_t>(out_step / 2U);
+        t.conv_state = reinterpret_cast<std::uint16_t*>(p[0].conv_state.address);
+        t.norm_key = reinterpret_cast<const void*>(s.norm_key.runtime->address);
+        t.norm_query = reinterpret_cast<const void*>(s.norm_query.runtime->address);
+        t.norm_conv = reinterpret_cast<const void*>(s.norm_conv.runtime->address);
+        t.conv = reinterpret_cast<const void*>(s.conv.runtime->address);
+        t.norm_key_kind = small_weight_kind(s.norm_key.manifest->ggml_type);
+        t.norm_query_kind = small_weight_kind(s.norm_query.manifest->ggml_type);
+        t.norm_conv_kind = small_weight_kind(s.norm_conv.manifest->ggml_type);
+        t.conv_kind = small_weight_kind(s.conv.manifest->ggml_type);
+        t.gates = gates; t.rows = count;
+        t.hidden_size = static_cast<std::uint32_t>(config.model.hidden_size);
+        t.hc_count = static_cast<std::uint32_t>(config.model.hc_count);
+        t.kernel_size = static_cast<std::uint32_t>(config.model.ple_conv_kernel_size);
+        t.ngram_size = static_cast<std::uint32_t>(config.model.ngram_size);
+        t.epsilon = config.model.rms_norm_epsilon;
         return true;
     }
     std::vector<PreparedPleLaunch> prepare(std::span<const ExecutionDispatchContext> spans) {
@@ -2199,6 +2455,11 @@ HipPleKnownWindow::HipPleKnownWindow(const ModelContract& model, HipActivationSt
     check_hip(hipMalloc(&projections, sizeof(float) * max_rows * model.hidden_size * (model.hc_count + 1ULL)),
         "known-window PLE row projections");
     w.projections = static_cast<float*>(projections);
+    if (prefill) {
+        void* gates = nullptr;
+        check_hip(hipMalloc(&gates, sizeof(float) * max_rows * model.hc_count), "known-window PLE row gates");
+        w.gates = static_cast<float*>(gates);
+    }
     w.hashes.resize(max_rows);
 }
 HipPleKnownWindow::~HipPleKnownWindow() = default;
@@ -2359,7 +2620,50 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
         }
     } else projected = w.project_rows(prepared[0], static_cast<const std::uint16_t*>(device), static_cast<std::uint32_t>(rows.size()));
     const auto expanded = prepared[0].expanded, hidden = w.config.model.hidden_size;
-    for (std::size_t r = 0; r < rows.size(); ++r) {
+    // Prefill rows run the PLE tail (gate, gated value, norm, convolution) as one rows-form launch
+    // sequence instead of four launches per row, with the per-row arithmetic.
+    // STRIX_PREFILL_PLE_ROWS=0 keeps the per-row launches; STRIX_PREFILL_PLE_ROWS_CHECK=1 runs both
+    // from the same inputs and state and compares every output and the final state bitwise.
+    static const bool tail_rows = [] { const char* v = std::getenv("STRIX_PREFILL_PLE_ROWS"); return !v || v[0] != '0'; }();
+    static const bool tail_check = [] { const char* v = std::getenv("STRIX_PREFILL_PLE_ROWS_CHECK"); return v && v[0] == '1'; }();
+    PleTailRows tail{};
+    if (w.prefill && projected && tail_rows && w.tail_rows(prepared, tail)) {
+        const auto n = static_cast<std::uint32_t>(rows.size());
+        if (!tail_check) enqueue_ple_tail_rows(tail, hip_graph_status(), stream);
+        else {
+            const auto key_bytes = static_cast<std::size_t>(n) * expanded * 4U;
+            const auto in_bytes = static_cast<std::size_t>(n - 1U) * tail.input_stride * 2U + expanded * 2U;
+            std::vector<std::byte> keys(key_bytes), conv(w.conv_bytes), input(in_bytes);
+            const auto copy = [&](void* to, const void* from, std::size_t bytes, hipMemcpyKind kind) {
+                check_hip(hipMemcpyAsync(to, from, bytes, kind, stream), "PLE rows check copy");
+            };
+            copy(keys.data(), tail.keys, key_bytes, hipMemcpyDeviceToHost);
+            copy(conv.data(), tail.conv_state, w.conv_bytes, hipMemcpyDeviceToHost);
+            copy(input.data(), tail.input, in_bytes, hipMemcpyDeviceToHost);
+            check_hip(hipStreamSynchronize(stream), "PLE rows check save");
+            const auto read = [&] {
+                std::vector<std::uint16_t> out(static_cast<std::size_t>(n) * expanded + w.conv_bytes / 2U);
+                for (std::uint32_t r = 0; r < n; ++r)
+                    copy(out.data() + static_cast<std::size_t>(r) * expanded, tail.output + static_cast<std::uint64_t>(r) * tail.output_stride,
+                        expanded * 2U, hipMemcpyDeviceToHost);
+                copy(out.data() + static_cast<std::size_t>(n) * expanded, tail.conv_state, w.conv_bytes, hipMemcpyDeviceToHost);
+                check_hip(hipStreamSynchronize(stream), "PLE rows check read");
+                return out;
+            };
+            enqueue_ple_tail_rows(tail, hip_graph_status(), stream);
+            const auto rows_values = read();
+            copy(tail.keys, keys.data(), key_bytes, hipMemcpyHostToDevice);
+            copy(tail.conv_state, conv.data(), w.conv_bytes, hipMemcpyHostToDevice);
+            copy(const_cast<std::uint16_t*>(tail.input), input.data(), in_bytes, hipMemcpyHostToDevice);
+            for (std::size_t r = 0; r < rows.size(); ++r)
+                enqueue_ple_device(prepared[r], reinterpret_cast<std::uint16_t*>(static_cast<std::byte*>(device) + r * w.stride),
+                    w.projections + r * expanded, w.projections + w.max_rows * expanded + r * hidden);
+            const auto row_values = read();
+            std::size_t differ = 0;
+            for (std::size_t i = 0; i < rows_values.size(); ++i) differ += rows_values[i] != row_values[i];
+            std::fprintf(stderr, "PLE rows check: rows %u values %zu differ %zu\n", n, rows_values.size(), differ);
+        }
+    } else for (std::size_t r = 0; r < rows.size(); ++r) {
         auto* gathered = reinterpret_cast<std::uint16_t*>(static_cast<std::byte*>(device) + r * w.stride);
         if (projected)
             enqueue_ple_device(prepared[r], gathered, w.projections + r * expanded,
