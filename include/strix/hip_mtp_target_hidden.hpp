@@ -3,6 +3,7 @@
 #include "strix/launch_dispatch.hpp"
 #include "strix/serial_session.hpp"
 #include "strix/token_sampling.hpp"
+#include <span>
 namespace strix {
 class HipMtpTargetHidden;
 class HipMtpTargetWindowBatch;
@@ -16,6 +17,8 @@ public:
     [[nodiscard]] bool same_producer(const HipMtpTargetHiddenTicket&) const noexcept;
     [[nodiscard]] bool same_commit(const HipMtpTargetHiddenTicket&) const noexcept;
     [[nodiscard]] bool is_window() const noexcept;
+    // Last row of a tiled prefill block (adopt_prefill_row): its chunk is the block's lineage interval.
+    [[nodiscard]] bool is_prefill_block() const noexcept;
     [[nodiscard]] std::uint64_t chunk_begin() const;
     [[nodiscard]] std::uint64_t chunk_end() const;
     [[nodiscard]] MtpDeviceView view() const;
@@ -90,6 +93,14 @@ public:
     // the session to the decode execution and re-mints the pending prompt row with the handed-off
     // session; the returned ticket replaces `pending`. Later rows run the decode execution only.
     void set_prompt_execution(const CompiledSerialExecution& prompt);
+    // Tiled MTP prompt handoff: mints the pending row from the last row of the tiled prefill block
+    // that has just committed `session` (its last lineage interval, prefill or known-window chunk,
+    // ending at session.next_position). `hidden` is that row's wide tap (copied into a retained
+    // slot) and `logits` its full FP32 head row; the prediction uses the selector's finite
+    // first-max rule. The caller guarantees both come from that completed block (the tiled
+    // prefill computes every row exactly as a serial row of the same execution).
+    [[nodiscard]] HipMtpTargetHiddenTicket adopt_prefill_row(const SerialSessionContext& session,
+        std::uint32_t input_token,MtpDeviceView hidden,std::span<const float> logits);
     [[nodiscard]] HipMtpTargetHiddenTicket hand_off_prompt(SerialSessionContext&,
         const HipMtpTargetHiddenTicket& pending,const ExecutionRuntimeResources& prompt_resources,
         const ExecutionRuntimeResources& decode_resources);

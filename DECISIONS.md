@@ -515,6 +515,15 @@ reads. Status: opt-in, exact; the throughput gain is pending the measurement cam
 | Full model, dense A8, four requests (code, Spanish, 1192-token agent, JS reasoning), lockstep with the default and a 4-row cap, sequential; agent + code pair | Tokens identical to each prompt's own run, replay error 0 |
 | Single-request route after the change | Tokens identical to the base build |
 
+Tiled MTP start: a block (T rows or a tail size) that ends exactly at the last prompt row now computes that row's
+head, and its wide hidden state and FP32 logits mint the first cycle's pending target ticket
+(`HipMtpTargetHidden::adopt_prefill_row`; the ticket's chunk is the block's lineage interval). No prompt row runs
+serially on that path; `STRIX_MTP_TILED_START=0` restores the serial last row. Against that handoff, same binary
+(single smoke runs): 16K prompt, T=1024, tails 64,16, A: 256 tokens identical to an uncached run, replay 0, prompt
+digest identical cold/warm and old/new; prompt phase 29.1 s -> 26.8 s cold and 6.0 s -> 1.74 s warm (15360
+restored, one 1024-row block); F: 43.5 -> 40.2 s cold, 5.75 -> 2.70 s warm, same identities. 4K prompts (T=512) ending in a T block or a 16-row tail block: tokens and digest
+identical, cold prompt phase 8.7 -> 6.9 s and 7.0 -> 6.5 s; a prompt ending in serial rows is unchanged.
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |

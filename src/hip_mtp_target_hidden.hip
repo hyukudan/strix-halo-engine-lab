@@ -10,6 +10,8 @@
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/session_executor_handoff.hpp"
 #include "strix/hip_token_sampling.hpp"
+#include "strix/serial_request.hpp"
+#include "strix/arithmetic_lineage.hpp"
 #include <algorithm>
 #include <optional>
 #include <stdexcept>
@@ -58,6 +60,8 @@ struct HipMtpTargetHiddenTicket::Lease {
     // Set for rows promoted from a partially accepted window: the batch's committed session
     // covers every executed row, this one ends at the accepted prefix.
     std::optional<SerialSessionContext> prefix_committed;
+    // Set for a row adopted from a tiled prefill block: the block's first position.
+    std::optional<std::uint64_t> block_begin;
 };
 struct HipMtpTargetHidden::Impl {
     struct Slot {
@@ -121,9 +125,10 @@ bool HipMtpTargetHiddenTicket::same_commit(const HipMtpTargetHiddenTicket& b) co
     return lease_ && b.lease_ && (lease_->batch ? lease_->batch==b.lease_->batch : lease_==b.lease_);
 }
 bool HipMtpTargetHiddenTicket::is_window() const noexcept {return lease_ && !!lease_->batch;}
+bool HipMtpTargetHiddenTicket::is_prefill_block() const noexcept {return lease_ && !!lease_->block_begin;}
 std::uint64_t HipMtpTargetHiddenTicket::chunk_begin() const {
     if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");
-    return lease_->batch?lease_->batch->chunk_begin():lease_->position;
+    return lease_->batch?lease_->batch->chunk_begin():lease_->block_begin?*lease_->block_begin:lease_->position;
 }
 std::uint64_t HipMtpTargetHiddenTicket::chunk_end() const {
     if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");
@@ -152,7 +157,7 @@ std::uint64_t HipMtpTargetHiddenTicket::producer_execution_identity() const {
 }
 bool HipMtpTargetHiddenTicket::admits_executor_change(const HipMtpTargetHiddenTicket& next) const noexcept {
     if(!lease_ || !next.lease_ || lease_->owner!=next.lease_->owner || !lease_->owner || lease_->batch || next.lease_->batch ||
-       lease_->prefix_committed || next.lease_->prefix_committed) return false;
+       lease_->prefix_committed || next.lease_->prefix_committed || lease_->block_begin || next.lease_->block_begin) return false;
     const auto& h=lease_->owner->impl_->handoff;
     if(!h) return false;
     const auto& a=lease_->committed;const auto& b=next.lease_->committed;
@@ -335,6 +340,41 @@ void HipMtpTargetHidden::set_token_sampler(std::shared_ptr<TokenSampler> sampler
     i.sampler=std::move(sampler);
 }
 std::shared_ptr<TokenSampler> HipMtpTargetHidden::token_sampler() const noexcept {return impl_->sampler;}
+HipMtpTargetHiddenTicket HipMtpTargetHidden::adopt_prefill_row(const SerialSessionContext& session,
+    std::uint32_t token,MtpDeviceView hidden,std::span<const float> logits) {
+    auto& i=*impl_;
+    const auto& lineage=session.arithmetic_lineage;
+    const auto* last=lineage.intervals.empty()?nullptr:&lineage.intervals.back();
+    if(i.busy || i.failed || i.prompt || session.health!=SerialSessionHealth::ready ||
+       session.execution_identity!=i.compiled->execution_identity || !session.next_position ||
+       session.committed_tokens!=session.next_position || lineage.tainted || !last ||
+       (last->producer!=ArithmeticProducer::prefill_chunk && last->producer!=ArithmeticProducer::known_window_chunk) ||
+       last->end!=session.next_position || last->begin>=last->end ||
+       !arithmetic_lineage_valid(lineage,session.next_position) ||
+       token>=i.model->vocab_size || logits.size()!=i.model->vocab_size || !hidden.address ||
+       current_hip_launch_context())
+        throw std::invalid_argument("MTP prefill row adoption requires the idle target and a just-committed prefill block");
+    i.guard->require_original(); i.memory->validate_inventory_ownership();
+    auto slot=std::find_if(i.slots.begin(),i.slots.end(),[](auto& s){return s.reader.expired();});
+    if(slot==i.slots.end()) throw std::runtime_error("MTP target capture slots retained by active readers");
+    if(hidden.bytes!=slot->view.bytes) throw std::invalid_argument("MTP prefill row hidden width differs from the target tap");
+    auto lease=std::make_shared<HipMtpTargetHiddenTicket::Lease>();
+    lease->owner=shared_from_this();lease->snapshot=slot->view;lease->allocation_lease=slot->lease;
+    lease->position=session.next_position-1U;lease->token=token;
+    lease->content=i.weights->binding().model_content_identity;
+    lease->producer=session.execution_identity;lease->block_begin=last->begin;
+    lease->predicted=select_greedy_token(logits,i.model->vocab_size);
+    i.busy=true;
+    try {
+        check(hipMemcpyAsync(reinterpret_cast<void*>(slot->view.address),reinterpret_cast<const void*>(hidden.address),
+            static_cast<std::size_t>(hidden.bytes),hipMemcpyDeviceToDevice,i.stream),"MTP prefill row capture");
+        check(hipStreamSynchronize(i.stream),"MTP prefill row capture completion");
+        i.guard->require_original();
+    } catch(...) {i.failed=true;i.busy=false;i.guard->recover_or_fail_stop();throw;}
+    lease->committed=session;
+    slot->reader=lease;i.busy=false;i.started=true;
+    HipMtpTargetHiddenTicket ticket;ticket.lease_=std::move(lease);return ticket;
+}
 void HipMtpTargetHidden::set_prompt_execution(const CompiledSerialExecution& prompt) {
     auto& i=*impl_;i.guard->require_original();i.memory->validate_inventory_ownership();
     if(i.prompt || i.started || i.busy || i.failed)

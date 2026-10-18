@@ -177,6 +177,10 @@ struct HipMtpRuntime::Impl {
         if(ticket.is_window()) {
             require(actual.producer==ArithmeticProducer::known_window_chunk && actual.begin==ticket.chunk_begin() &&
                 actual.end==ticket.chunk_end(),"MTP target window ticket lacks its actual chunk history");
+        } else if(ticket.is_prefill_block()) {
+            require((actual.producer==ArithmeticProducer::prefill_chunk || actual.producer==ArithmeticProducer::known_window_chunk) &&
+                actual.begin==ticket.chunk_begin() && actual.end==ticket.chunk_end() && ticket.source_position()+1U==ticket.chunk_end(),
+                "MTP target prefill-block ticket lacks its actual block history");
         } else {
             require(ticket.chunk_begin()==ticket.source_position() && ticket.chunk_end()==ticket.source_position()+1U &&
                 actual.producer==ArithmeticProducer::serial_row,"MTP target serial ticket frontier differs from its actual row");

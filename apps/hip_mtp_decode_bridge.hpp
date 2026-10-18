@@ -194,11 +194,21 @@ inline HipMtpTargetHiddenTicket run_tiled_mtp_prompt(const Options& options,cons
     if(tiled.cache) restored=tiled.cache->begin_request(session,tokens);
     std::uint64_t pos=restored;
     std::vector<MtpDeviceView> views;std::vector<std::uint32_t> next;
+    // STRIX_MTP_TILED_START=0: the last prompt row always runs serially (the previous handoff).
+    // Otherwise a block that ends exactly at the last prompt row also computes that row's head, and
+    // the first draft cycle starts from the block's last row (its tap and FP32 logits).
+    static const bool tiled_start=[]{const char* v=std::getenv("STRIX_MTP_TILED_START");return !v || v[0]!='0';}();
+    HipMtpTargetHiddenTicket pending;
+    bool adopted=false;
     const auto run=[&](HipKnownPromptBackend& backend,HipKnownPrefixWindow& owner,std::uint32_t rows,bool capture) {
         owner.set_prefill_step_observer(observer);block_rows=rows;
+        const bool heads=tiled_start && backend.output_policy()!=KnownWindowOutputPolicy::state_only;
         try {
-            while(pos+rows<=n-1U) {
-                backend.execute_state_rows(tokens.subspan(static_cast<std::size_t>(pos),rows),pos);
+            while(!adopted && (pos+rows<=n-1U || (heads && pos+rows==n))) {
+                const bool final_block=pos+rows==n;
+                std::vector<float> logits;
+                if(final_block) logits=backend.execute_rows(tokens.subspan(static_cast<std::size_t>(pos),rows),pos);
+                else backend.execute_state_rows(tokens.subspan(static_cast<std::size_t>(pos),rows),pos);
                 views.clear();next.clear();
                 if(pos){views.push_back(view(held));next.push_back(tokens[static_cast<std::size_t>(pos)]);}
                 for(std::uint32_t r=0;r+1U<rows;++r){views.push_back(view(block_hidden+static_cast<std::size_t>(r)*width));
@@ -209,13 +219,16 @@ inline HipMtpTargetHiddenTicket run_tiled_mtp_prompt(const Options& options,cons
                 pos+=rows;
                 if(capture && tiled.cache) tiled.cache->after_block(session,tokens,n-1U);
                 if(capture)++blocks;else ++tail_blocks;
+                if(final_block) {
+                    pending=target.adopt_prefill_row(session,tokens[static_cast<std::size_t>(n-1U)],view(held),logits);
+                    adopted=true;
+                }
             }
         } catch(...) {owner.set_prefill_step_observer({});throw;}
         owner.set_prefill_step_observer({});
     };
     run(*tiled.blocks,*tiled.block_owner,tiled.rows,true);
     for(const auto& tail:tiled.tails) run(*tail.backend,*tail.owner,tail.rows,false);
-    HipMtpTargetHiddenTicket pending;
     while(pos<n) {
         auto ticket=target.execute_serial(session,resources,dispatcher,tokens[static_cast<std::size_t>(pos)]);
         if(pos) {
@@ -233,7 +246,7 @@ inline HipMtpTargetHiddenTicket run_tiled_mtp_prompt(const Options& options,cons
     out<<"\"rows\":"<<tiled.rows<<",\"tail_rows\":[";
     for(std::size_t t=0;t<tiled.tails.size();++t)out<<(t?",":"")<<tiled.tails[t].rows;
     out<<"],\"restored_position\":"<<restored
-       <<",\"blocks\":"<<blocks<<",\"tail_blocks\":"<<tail_blocks<<",\"serial_rows\":"<<serial_rows
+       <<",\"blocks\":"<<blocks<<",\"tail_blocks\":"<<tail_blocks<<",\"serial_rows\":"<<serial_rows<<",\"tiled_start\":"<<(adopted?"true":"false")
        <<",\"prompt_ms\":"<<prompt_ms;
     if(tiled.cache) {
         const auto& q=tiled.cache->request();

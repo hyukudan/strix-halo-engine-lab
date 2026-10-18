@@ -90,11 +90,17 @@ With `--mtp` and the tiled prefill flags the prompt itself runs through the tile
 3. Complete T-row blocks (then complete tail blocks) run tiled. A step observer copies every
    row's wide hidden state (the MTP target tap) out of the block arena, and the predictor's cache
    rows are built from those copies. Block boundaries are captured.
-4. The remaining rows, at least the last prompt row, run serially through the MTP target producer;
-   its last ticket starts the first draft cycle. Decode is unchanged (adaptive windows).
+4. A block (T rows or a tail size) that ends exactly at the last prompt row also computes that
+   row's head (terminal-row output policy). The first draft cycle starts from that row: its wide
+   hidden state and FP32 logits mint the pending target ticket (`HipMtpTargetHidden::adopt_prefill_row`,
+   same first-max selection as a serial row), so no prompt row runs serially.
+5. Otherwise the remaining rows, at least the last prompt row, run serially through the MTP target
+   producer, whose last ticket starts the first draft cycle. Decode is unchanged (adaptive windows).
 
-The last prompt row always runs serially, so a prompt of exactly k·T tokens runs its last T rows
-through the tail blocks and serial rows. A split numerical-profile pair is rejected on this route.
+`STRIX_MTP_TILED_START=0` restores the previous handoff (the last prompt row always serial; a prompt
+of exactly k·T tokens then runs its last T rows through the tail blocks and serial rows). The receipt's
+`mtp_tiled_prompt.tiled_start` says which handoff ran. A split numerical-profile pair is rejected on
+this route.
 
 ## Measured
 
