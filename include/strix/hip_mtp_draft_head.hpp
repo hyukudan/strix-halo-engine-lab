@@ -47,6 +47,11 @@ public:
     // (1/sum exp(l - max), finite rows only; 0 for a failed step). Same mapped
     // reply and completion rule as read(); never affects the selected token.
     [[nodiscard]] float probability(std::uint32_t step) const;
+    // Waits until step's selection is published in the mapped reply (its last kernel stores a
+    // completion count after the reply fields), polling instead of a stream synchronisation;
+    // falls back to synchronising `stream` (and reports its errors) if the count does not
+    // arrive. Equivalent to synchronising before reading probability(step).
+    void wait_step(std::uint32_t step,void* stream) const;
     [[nodiscard]] bool full() const noexcept;
     [[nodiscard]] HipMtpDraftHeadStats stats() const noexcept;
     // Device views for tests: compact logits [rows] and real ids [rows] (null in full mode).

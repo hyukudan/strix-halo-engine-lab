@@ -4245,6 +4245,23 @@ void enqueue_hip_mtp_hyper_mix_q8(const std::uint16_t* input,const float* norm,c
     auto* normalized=workspace;auto* low=normalized+h*streams;
     hipLaunchKernelGGL(HIP_KERNEL_NAME(prepare_hyper_norm_kernel<std::uint16_t>),dim3(streams),dim3(kThreads),0,stream,
         input,static_cast<const void*>(norm),0U,h,streams,epsilon,normalized);check_hip(hipGetLastError(),"MTP HC normalization");
+    // STRIX_MTP_HC_ROWS=0: the serial split-K kernel instead of its one-row window form (two
+    // outputs per block, twice the blocks). The window kernel reproduces the serial kernel per
+    // row bit for bit (the known-window fixtures check this); outputs per block only regroup
+    // independent chains. The serial lane-chain output stays: its one-row register form is slower.
+    static const bool rows_kernels=[]{const char* v=std::getenv("STRIX_MTP_HC_ROWS");return !v || v[0]!='0';}();
+    if(draft && rows_kernels && reinterpret_cast<std::uintptr_t>(normalized)%16U==0U) {
+        HyperRows rows{};
+        rows.input[0]=input;rows.output[0]=output;rows.normalized[0]=normalized;rows.low[0]=low;rows.injection[0]=injection;
+        constexpr unsigned outputs=2U,blocks=(rank+outputs-1U)/outputs;
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_splitk_hyper_projection_kernel<outputs,HyperRows>),
+            dim3(blocks+(inject?(streams+outputs-1U)/outputs:0U)),dim3(512U),0,stream,rows,1U,down,streams,rank,inject,blocks);
+        check_hip(hipGetLastError(),"MTP draft HC split-K projection rows");
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(lane_chain_hyper_output_kernel<std::uint16_t>),dim3(h/32U),dim3(32U*streams),
+            static_cast<std::size_t>(lane_chain_hyper_output_lds(streams,rank)),stream,normalized,low,up,h,streams,rank,output);
+        check_hip(hipGetLastError(),"MTP draft HC lane-chain output");
+        return;
+    }
     if(draft) {
         // Target decode's FP32 split-K projection and lane-chain output (Q8 down/up, F32 injection).
         constexpr unsigned outputs=4U,blocks=rank/outputs;

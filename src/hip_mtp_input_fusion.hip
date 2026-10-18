@@ -1,5 +1,6 @@
 #include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_mtp_input_fusion.hpp"
+#include <cstdlib>
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <array>
@@ -48,8 +49,12 @@ __device__ std::uint16_t to_bf16(float x) {
 __device__ float rounded(float v,HipMtpInputRounding rounding) {
     return rounding==HipMtpInputRounding::bf16_rne?__uint_as_float(static_cast<unsigned>(to_bf16(v))<<16U):v;
 }
-__global__ __launch_bounds__(256) void mtp_input_norms(HipMtpInputFusionRequest r) {
+// Threads >= 256 (when launched wider) only join the element-wise output pass: the sum and
+// its 256-lane tree are the first 256 threads' exactly as in a 256-thread launch.
+template<unsigned Threads=256U>
+__global__ __launch_bounds__(Threads) void mtp_input_norms(HipMtpInputFusionRequest r) {
     __shared__ float sums[256];
+    __shared__ float shared_inverse;
     const unsigned lane=threadIdx.x;
     const bool hidden=blockIdx.x!=0U;
     const unsigned n=hidden?r.hidden_size*r.hc_count:r.hidden_size;
@@ -58,11 +63,14 @@ __global__ __launch_bounds__(256) void mtp_input_norms(HipMtpInputFusionRequest 
     const auto* weights=reinterpret_cast<const float*>(hidden?r.hidden_norm.address:r.embedding_norm.address);
     auto* out=reinterpret_cast<float*>(r.normalized_scratch.address)+(hidden?r.hidden_size:0U);
     float sum=0.0F;
-    for(unsigned i=lane;i<n;i+=256U) {const float v=load_value(input,i,storage);sum=fmaf(v,v,sum);}
-    sums[lane]=sum;__syncthreads();
+    if(lane<256U) for(unsigned i=lane;i<n;i+=256U) {const float v=load_value(input,i,storage);sum=fmaf(v,v,sum);}
+    if(lane<256U) sums[lane]=sum;
+    __syncthreads();
     for(unsigned stride=128U;stride;stride>>=1U) {if(lane<stride)sums[lane]=sums[lane]+sums[lane+stride];__syncthreads();}
-    const float inverse=1.0F/sqrtf(sums[0]/static_cast<float>(n)+r.epsilon);
-    for(unsigned i=lane;i<n;i+=256U) {
+    if(lane==0U) shared_inverse=1.0F/sqrtf(sums[0]/static_cast<float>(n)+r.epsilon);
+    __syncthreads();
+    const float inverse=shared_inverse;
+    for(unsigned i=lane;i<n;i+=Threads) {
         const float gain=r.norm_weight_encoding==MtpNormWeightEncoding::gemma_offset?1.0F+weights[i]:weights[i];
         const float normalized=load_value(input,i,storage)*inverse;
         out[i]=rounded(normalized*gain,r.normalized_rounding);
@@ -151,6 +159,57 @@ template<bool Q4> __device__ __forceinline__ float block_code(const unsigned cha
     if constexpr(Q4) return static_cast<float>(static_cast<int>((block[2U+(j&15U)]>>(j>=16U?4U:0U))&15U)-8);
     else return static_cast<float>(static_cast<signed char>(block[2U+j]));
 }
+// R rows per wave (wave w of a block owns rows (block*8 + w)*R .. +R-1): each lane loads its
+// eight normalised inputs of every role once per column group and runs each row's unchanged
+// FMA sequence on them (per row: same column groups, same element order, same tree).
+template<bool Q4,unsigned R>
+__global__ __launch_bounds__(256) void mtp_input_projections_wave_rows(HipMtpInputFusionRequest r,const unsigned char* weights) {
+    constexpr unsigned block=Q4?18U:34U,hc=4U;
+    const unsigned lane=threadIdx.x%32U,first=(blockIdx.x*8U+threadIdx.x/32U)*R,h=r.hidden_size;
+    if(first>=h)return;
+    const auto* input=reinterpret_cast<const float*>(r.normalized_scratch.address);
+    float embedding[R],sums[R][hc];
+#pragma unroll
+    for(unsigned k=0;k<R;++k){embedding[k]=0.0F;for(unsigned s=0;s<hc;++s)sums[k][s]=0.0F;}
+    for(unsigned base=8U*lane;base<h;base+=256U) {
+        float xe[8],xs[hc][8];
+#pragma unroll
+        for(unsigned i=0;i<8U;++i){xe[i]=input[base+i];for(unsigned s=0;s<hc;++s)xs[s][i]=input[h+s*h+base+i];}
+#pragma unroll
+        for(unsigned k=0;k<R;++k) {
+            if(first+k>=h)break;
+            const auto* packed=weights+static_cast<std::uint64_t>(first+k)*(2U*h/32U)*block;
+            const auto* e=packed+(base/32U)*block;const auto* w=packed+((h+base)/32U)*block;
+            const float es=__half2float(*reinterpret_cast<const __half*>(e)),ws=__half2float(*reinterpret_cast<const __half*>(w));
+#pragma unroll
+            for(unsigned i=0;i<8U;++i) {
+                embedding[k]=fmaf(es*block_code<Q4>(e,base%32U+i),xe[i],embedding[k]);
+                const float weight=ws*block_code<Q4>(w,base%32U+i);
+#pragma unroll
+                for(unsigned s=0;s<hc;++s) sums[k][s]=fmaf(weight,xs[s][i],sums[k][s]);
+            }
+        }
+    }
+#pragma unroll
+    for(unsigned k=0;k<R;++k) {
+        for(unsigned d=16U;d;d>>=1U) {
+            embedding[k]+=__shfl_xor(embedding[k],static_cast<int>(d),32);
+            for(unsigned s=0;s<hc;++s) sums[k][s]+=__shfl_xor(sums[k][s],static_cast<int>(d),32);
+        }
+    }
+    if(lane)return;
+#pragma unroll
+    for(unsigned k=0;k<R;++k) {
+        const unsigned row=first+k;
+        if(row>=h)break;
+        const float projected=rounded(embedding[k],r.projection_rounding);
+        for(unsigned s=0;s<hc;++s) {
+            const float v=projected+rounded(sums[k][s],r.projection_rounding);
+            if(r.output_storage==HipMtpInputStorage::bf16)reinterpret_cast<std::uint16_t*>(r.output.address)[s*h+row]=to_bf16(v);
+            else reinterpret_cast<float*>(r.output.address)[s*h+row]=v;
+        }
+    }
+}
 template<bool Q4>
 __global__ __launch_bounds__(256) void mtp_input_projections_wave(HipMtpInputFusionRequest r,const unsigned char* weights) {
     constexpr unsigned block=Q4?18U:34U;
@@ -226,7 +285,7 @@ void launch_hip_mtp_input_fusion(const HipMtpInputFusionRequest& r,void* raw_str
     hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;check(hipStreamIsCapturing(stream,&capture),"MTP input fusion capture query");
     if(capture!=hipStreamCaptureStatusNone)throw std::invalid_argument("MTP input fusion is eager only");
     check(hipPeekAtLastError(),"MTP input fusion prior HIP error");
-    hipLaunchKernelGGL(mtp_input_norms,dim3(2U),dim3(256U),0U,stream,r);check(hipGetLastError(),"MTP input norms launch");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_norms<256U>),dim3(2U),dim3(256U),0U,stream,r);check(hipGetLastError(),"MTP input norms launch");
     const unsigned jobs=r.hidden_size;
     if(r.hidden_size%kStagedColumns==0U && r.projection_row_stride_bytes%8U==0U && r.packed_projection.address%8U==0U)
         hipLaunchKernelGGL(mtp_input_projections_staged,dim3(r.hidden_size/kStagedRows),dim3(kStagedRows*(1U+r.hc_count)),0U,stream,r);
@@ -239,10 +298,20 @@ void launch_hip_mtp_input_fusion_draft(const HipMtpInputFusionRequest& r,void* r
     preflight_hip_mtp_input_fusion(r);
     if(!raw_stream)throw std::invalid_argument("MTP input fusion requires an explicit owned stream");
     const auto stream=static_cast<hipStream_t>(raw_stream);
-    hipLaunchKernelGGL(mtp_input_norms,dim3(2U),dim3(256U),0U,stream,r);check(hipGetLastError(),"MTP input norms launch");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_norms<1024U>),dim3(2U),dim3(1024U),0U,stream,r);check(hipGetLastError(),"MTP input norms launch");
     const auto* q8=reinterpret_cast<const unsigned char*>(r.packed_projection.address);
-    if(const auto* q4=static_cast<const unsigned char*>(hip_mtp_draft_q4(q8)))
-        hipLaunchKernelGGL(mtp_input_projections_wave<true>,dim3((r.hidden_size+7U)/8U),dim3(256U),0U,stream,r,q4);
+    const auto* q4=static_cast<const unsigned char*>(hip_mtp_draft_q4(q8));
+    // STRIX_MTP_PROJ_ROWS=1|2|4: output rows per wave (each row's arithmetic is unchanged).
+    static const unsigned rows_per_wave=[]{const char* v=std::getenv("STRIX_MTP_PROJ_ROWS");
+        const unsigned n=v?static_cast<unsigned>(std::atoi(v)):2U;return n==1U||n==4U?n:2U;}();
+    const auto rows=[&]<unsigned R>(){
+        const dim3 grid((r.hidden_size+8U*R-1U)/(8U*R));
+        if(q4) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_projections_wave_rows<true,R>),grid,dim3(256U),0U,stream,r,q4);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_projections_wave_rows<false,R>),grid,dim3(256U),0U,stream,r,q8);
+    };
+    if(r.hc_count==4U && rows_per_wave==4U) rows.template operator()<4U>();
+    else if(r.hc_count==4U && rows_per_wave==2U) rows.template operator()<2U>();
+    else if(q4) hipLaunchKernelGGL(mtp_input_projections_wave<true>,dim3((r.hidden_size+7U)/8U),dim3(256U),0U,stream,r,q4);
     else hipLaunchKernelGGL(mtp_input_projections_wave<false>,dim3((r.hidden_size+7U)/8U),dim3(256U),0U,stream,r,q8);
     check(hipGetLastError(),"MTP draft fused projection launch");
 }
