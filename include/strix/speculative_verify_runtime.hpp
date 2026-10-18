@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace strix {
@@ -24,6 +25,9 @@ struct KnownWindowExecutionHooks {
     // Tiled prefill only: a block whose logits are never read (more prompt follows) skips the
     // terminal head step entirely; the result then carries no logit rows.
     bool skip_head = false;
+    // Admission only: every check and preflight, the memo/slot updates, then return before the
+    // lineage, PLE lookup or any launch. Nothing is enqueued and the session is not changed.
+    bool preflight_only = false;
     // Metadata/config/resource owners cannot change via aliases during a call.
     std::function<void()> preflight_plan;
     std::function<void()> preflight_scope;
@@ -41,6 +45,15 @@ struct KnownWindowExecutionHooks {
     // still validates its own context before enqueueing, so repeat windows skip the
     // ~1,750-context preflight (about 8 ms of host time before the first launch).
     std::vector<const void*>* preflight_memo = nullptr;
+    // Lineage recipe identities of a memoized plan (keyed like preflight_memo): the recipe
+    // hashes only the plan, the compiled window and the selected entries, all fixed per key.
+    std::vector<std::pair<const void*, std::array<std::uint64_t, 2>>>* recipe_memo = nullptr;
+    // Owner-held launcher preflights already proven, one slot per (step, row): the preflight
+    // function and its user data. The contexts of a (step, row) come from the owner's compiled
+    // window, not from its launch plan, so a new plan of the same owner (an MTP capture copy
+    // that wraps one step) re-runs only the slots whose launcher differs, plus its own
+    // structural plan checks; the owner-level admission already passed with the first plan.
+    std::vector<std::array<std::uintptr_t, 2>>* preflight_slots = nullptr;
 };
 
 struct KnownWindowR2Entry {

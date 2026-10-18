@@ -286,9 +286,13 @@ KnownWindowResult execute_known_prefix_window_eager(
     const void* preflight_key = row_launch.empty() ? nullptr : static_cast<const void*>(row_launch.front());
     const bool preflight_known = hooks.preflight_memo && preflight_key &&
         std::find(hooks.preflight_memo->begin(), hooks.preflight_memo->end(), preflight_key) != hooks.preflight_memo->end();
-    // Every allocation, clone, mode and identity is checked before callbacks.
-    if (!preflight_known) validate_compiled_known_prefix_window(window, serial);
     const auto rows = window.logical_rows;
+    const auto slot_count = serial.execution.steps.size() * rows;
+    // Another plan of this owner already passed the full admission (see preflight_slots).
+    const bool owner_known = !preflight_known && hooks.preflight_slots && hooks.preflight_slots->size() == slot_count;
+    const bool static_known = preflight_known || owner_known;
+    // Every allocation, clone, mode and identity is checked before callbacks.
+    if (!static_known) validate_compiled_known_prefix_window(window, serial);
     if(tokens.size()!=rows || row_launch.size()!=rows)
         throw std::invalid_argument("known window token/launch row count differs from its compiled geometry");
     if (!hooks.preflight_scope || !hooks.complete || !hooks.quiesce_or_fail_stop)
@@ -297,12 +301,12 @@ KnownWindowResult execute_known_prefix_window_eager(
         throw std::logic_error("known window requires a ready serial session");
     if (session.execution_identity != serial.execution_identity || !session.execution_identity)
         throw std::invalid_argument("known window serial session execution identity mismatch");
-    if (!preflight_known) validate_execution_runtime_resources(serial.execution_identity, serial.arena,
+    if (!static_known) validate_execution_runtime_resources(serial.execution_identity, serial.arena,
         serial_resources, session.next_position);
-    const auto identities = preflight_known ? RuntimeExecutionIdentities{} : build_runtime_execution_identities(
+    const auto identities = static_known ? RuntimeExecutionIdentities{} : build_runtime_execution_identities(
         serial.execution_identity, serial.arena, serial_resources);
     if (!session.runtime_compatibility_identity ||
-        (!preflight_known && session.runtime_compatibility_identity != identities.compatibility_identity) ||
+        (!static_known && session.runtime_compatibility_identity != identities.compatibility_identity) ||
         session.state_layout_identity != serial_resources.session_state_layout->layout_identity ||
         window.manifest_layout_identity != serial_resources.model_manifest->layout_identity ||
         window.tensor_access_plan_identity != serial_resources.tensor_access->plan_identity)
@@ -320,7 +324,7 @@ KnownWindowResult execute_known_prefix_window_eager(
         next_lineage=prepare_prefill_chunk_lineage(session.arithmetic_lineage,
             session.next_position,post_position,window.window_execution_identity,
             window.window_kernel_plan_identity,window.window_execution_identity);
-    if (!preflight_known) {
+    if (!static_known) {
     validate_execution_memory_binding(window.window_execution_identity, window.arena.physical, window_scratch);
     const auto& old_scratch = *serial_resources.scratch;
     if (window_scratch.arena_bytes > std::numeric_limits<std::uintptr_t>::max() - window_scratch.arena_base ||
@@ -352,7 +356,7 @@ KnownWindowResult execute_known_prefix_window_eager(
         requests[r].position = session.next_position + r;
         requests[r].state = session.state;
         if (preflight_known) continue;
-        validate_execution_runtime_resources(window.window_execution_identity, window.arena.row_view[r],
+        if (!owner_known) validate_execution_runtime_resources(window.window_execution_identity, window.arena.row_view[r],
             resources[r], session.next_position + r);
         validate_window_launch_plan(window.row_plan[r], row_launch[r]);
         for (std::size_t i = 0; i < serial.execution.steps.size(); ++i) {
@@ -370,7 +374,7 @@ KnownWindowResult execute_known_prefix_window_eager(
             if (!position && !qsa)
                 throw std::invalid_argument("known window position-history reader implementation is not admitted");
         }
-        validate_eager_execution_preflight(window.row_plan[r].execution, window.row_plan[r].bindings,
+        if (!owner_known) validate_eager_execution_preflight(window.row_plan[r].execution, window.row_plan[r].bindings,
             window.row_plan[r].io, window.row_plan[r].arena, requests[r],
             resources[r].session_state_layout, resources[r].session_state_memory, &resources[r]);
     }
@@ -471,35 +475,65 @@ KnownWindowResult execute_known_prefix_window_eager(
     };
     { const auto ms = window_ms_since(timing_mark); window_host_timing().admit += ms; if (preflight_known) window_host_timing().known_admit += ms; }
     timing_mark = std::chrono::steady_clock::now();
+    host_phase_mark("6a admit");
     hooks.preflight_scope();
     // A missing callback is not an implicit permit. Every row-loop launcher
     // proves its current metadata before PLE can start or any word is written.
+    std::vector<std::array<std::uintptr_t, 2>> proven;
+    if (!preflight_known && hooks.preflight_slots) proven.assign(slot_count, {0U, 0U});
+    // True when slot (i, r) needs its preflight: unproven for this owner, or a different launcher.
+    const auto needs = [&](std::size_t i, std::size_t r, auto function, const void* data) {
+        const std::array<std::uintptr_t, 2> key{reinterpret_cast<std::uintptr_t>(function), reinterpret_cast<std::uintptr_t>(data)};
+        if (!proven.empty()) proven[i * rows + r] = key;
+        return !owner_known || (*hooks.preflight_slots)[i * rows + r] != key;
+    };
     for (std::size_t i = 0; i < steps && !preflight_known; ++i) {
-        if(selected_rows[i]) selected_rows[i]->preflight(contexts[i],selected_rows[i]->config);
-        else if (selected[i]) {
+        if(selected_rows[i]) {
+            if (needs(i, 0, selected_rows[i]->preflight, selected_rows[i]->config))
+                selected_rows[i]->preflight(contexts[i],selected_rows[i]->config);
+        } else if (selected[i]) {
             for(std::size_t r=0;r<rows;r+=2U)
-                selected[i]->preflight(std::span<const ExecutionDispatchContext,2>(contexts[i].data()+r,2U),selected[i]->config);
+                if (needs(i, r, selected[i]->preflight, selected[i]->config))
+                    selected[i]->preflight(std::span<const ExecutionDispatchContext,2>(contexts[i].data()+r,2U),selected[i]->config);
         } else for (std::size_t r = 0; r < rows; ++r) {
             const auto& launcher = row_launch[r]->steps[i];
             if (!launcher.preflight)
                 throw std::invalid_argument("known window row launcher lacks pure metadata preflight");
-            launcher.preflight(contexts[i][r], launcher.user_data);
+            if (needs(i, r, launcher.preflight, launcher.user_data)) launcher.preflight(contexts[i][r], launcher.user_data);
         }
     }
-    { const auto ms = window_ms_since(timing_mark); window_host_timing().preflight += ms; if (preflight_known) window_host_timing().known_preflight += ms; }
+    { const auto ms = window_ms_since(timing_mark); window_host_timing().preflight += ms; if (preflight_known) window_host_timing().known_preflight += ms;
+      if (window_host_timing().enabled && !preflight_known)
+          std::fprintf(stderr, "window admission rows=%u owner_known=%d setup=%d: admit+preflight %.3f ms (preflight %.3f)\n", rows,
+              owner_known ? 1 : 0, hooks.preflight_only ? 1 : 0, window_ms_since(timing_begin), ms); }
+    host_phase_mark("6b row preflight");
     timing_mark = std::chrono::steady_clock::now();
-    if (hooks.preflight_plan) hooks.preflight_plan();
+    // execute() validated the owner metadata just before this call; with every preflight
+    // skipped nothing ran since, so a memoized window does not repeat it.
+    if (hooks.preflight_plan && !preflight_known) hooks.preflight_plan();
     if (hooks.preflight_memo && !preflight_known) hooks.preflight_memo->push_back(preflight_key);
+    // Slots this admission proved; a later plan of the owner compares against the newest ones.
+    if (!proven.empty()) *hooks.preflight_slots = std::move(proven);
+    if (hooks.preflight_only) return {};
     { const auto ms = window_ms_since(timing_mark); window_host_timing().plan += ms;
       if (preflight_known) { window_host_timing().known_plan += ms; ++window_host_timing().known; } }
     timing_mark = std::chrono::steady_clock::now();
+    host_phase_mark("6c preflight plan");
     if(hooks.record_actual_window_lineage) {
-        const auto recipe=actual_window_recipe(window,serial,row_launch,selected,selected_rows);
+        const std::pair<const void*,std::array<std::uint64_t,2>>* memo=nullptr;
+        if(preflight_known && hooks.recipe_memo) for(const auto& entry:*hooks.recipe_memo) if(entry.first==preflight_key) memo=&entry;
+        ActualWindowRecipe recipe;
+        if(memo) recipe={memo->second[0],memo->second[1]};
+        else {
+            recipe=actual_window_recipe(window,serial,row_launch,selected,selected_rows);
+            if(hooks.recipe_memo && preflight_key) hooks.recipe_memo->push_back({preflight_key,{recipe.reduction,recipe.state_update}});
+        }
         next_lineage=prepare_known_window_chunk_lineage(session.arithmetic_lineage,session.next_position,post_position,
             window.window_execution_identity,recipe.reduction,recipe.state_update);
         if(!arithmetic_lineage_valid(next_lineage,post_position))
             throw std::invalid_argument("recorded known window requires complete actual preceding producer history");
     }
+    host_phase_mark("6d lineage recipe");
     std::vector<DirectLaunchDispatcher> dispatchers;
     dispatchers.reserve(rows);
     for(const auto* plan:row_launch) dispatchers.emplace_back(*plan);

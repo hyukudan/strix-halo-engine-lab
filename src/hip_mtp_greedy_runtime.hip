@@ -68,6 +68,7 @@ void HipMtpGreedyRuntime::use_window_verifier(std::shared_ptr<HipMtpWindowVerifi
     auto& i=*impl_;require(!i.busy && !failed() && !i.cycled && window && window->target_owner()==i.target,
         "MTP window verifier must retain the same actual idle target before the first cycle");
     i.window=std::move(window);
+    i.window->prepare_admission(*i.session);
 }
 void HipMtpGreedyRuntime::set_draft_min_probability(float p) {
     auto& i=*impl_;require(!i.busy && !i.cycled && p>=0.0F && p<=1.0F,"MTP draft minimum probability is set once in [0, 1] before cycles");

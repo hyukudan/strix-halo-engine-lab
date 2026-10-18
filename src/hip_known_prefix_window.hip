@@ -141,6 +141,8 @@ struct HipKnownPrefixWindow::Impl {
     std::deque<ExecutionRuntimeResources> gdn_commit_resources; // owned copies: the window's are call-local
     std::unique_ptr<HipPleKnownWindow> ple_window;
     std::vector<const void*> preflight_memo;
+    std::vector<std::pair<const void*, std::array<std::uint64_t, 2>>> recipe_memo;
+    std::vector<std::array<std::uintptr_t, 2>> preflight_slots;
     DeferredMoeFirstError completion_status{};
     bool failed = false;
 
@@ -645,7 +647,7 @@ struct HipKnownPrefixWindow::Impl {
         if(primary.gdn_deferred==gdn_deferred) return;
         gdn_deferred=primary.gdn_deferred;
         bind_deferred();
-        preflight_memo.clear();
+        preflight_memo.clear(); recipe_memo.clear(); preflight_slots.clear();
     }
     void setup_head_rows() {
         if(!window.lm_head_rows_steps) return;
@@ -857,6 +859,31 @@ struct HipKnownPrefixWindow::Impl {
                !capture.owner_before(entry->key))return *entry;
         throw std::invalid_argument("MTP target capture has no prepared plans on this actual known-window owner");
     }
+    // Setup-time admission of the owner's own launch plans (see preflight_admission()).
+    void preflight_admission(SerialSessionContext session, std::span<const std::uint32_t> tokens) {
+        if (failed || prefill || executing || current_hip_launch_context() || tokens.size() != logical_rows())
+            throw std::invalid_argument("known-window setup admission requires an idle closed window owner");
+        struct ExecutionLease {
+            bool& active;
+            explicit ExecutionLease(bool& value):active(value){active=true;}
+            ~ExecutionLease(){active=false;}
+        } execution_lease(executing);
+        try {
+            validate_metadata();
+            const HipLaunchScope active(scope);
+            KnownWindowExecutionHooks hooks;
+            hooks.preflight_scope = [&] { validate_scope(); };
+            hooks.preflight_plan = [&] { validate_metadata(); };
+            hooks.complete = [] { throw std::logic_error("known-window setup admission never completes a window"); };
+            hooks.quiesce_or_fail_stop = [&] { failed = true; guard.recover_or_fail_stop(); };
+            hooks.position_reader_implementations = position_readers;
+            hooks.preflight_memo=&preflight_memo;hooks.recipe_memo=&recipe_memo;hooks.preflight_slots=&preflight_slots;
+            hooks.preflight_only = true;
+            (void)execute_known_prefix_window_eager(window, serial, resources, scratch, session, tokens,
+                std::span<const CompiledLaunchPlan* const>(launch_pointers), std::span<const KnownWindowR2Entry>(r2_entries),
+                std::span<const KnownWindowRowsEntry>(rows_entries), hooks);
+        } catch (...) { failed = true; throw; }
+    }
     KnownWindowResult execute(SerialSessionContext& session, std::span<const std::uint32_t> tokens,
         const std::function<void()>& before_publish = {},
         const std::shared_ptr<HipMtpTargetWindowCapture>& capture = {},HipMtpTargetWindowBatch* batch=nullptr,
@@ -893,7 +920,7 @@ struct HipKnownPrefixWindow::Impl {
             hooks.position_reader_implementations = position_readers;
             hooks.record_actual_window_lineage=static_cast<bool>(capture);
             hooks.skip_head=skip_head;
-            hooks.preflight_memo=&preflight_memo;
+            hooks.preflight_memo=&preflight_memo;hooks.recipe_memo=&recipe_memo;hooks.preflight_slots=&preflight_slots;
             const auto first_position=session.next_position;
             auto result=prefill ? execute_known_prefix_prefill_eager(*prefill,serial,resources,scratch,session,tokens,
                 launch_plans.front(),r2_entries,rows_entries,hooks,prefill_entries) :
@@ -939,6 +966,9 @@ KnownWindowResult HipKnownPrefixWindow::execute(SerialSessionContext& session, s
 }
 KnownWindowResult HipKnownPrefixWindow::execute(SerialSessionContext& session, std::span<const std::uint32_t> tokens) {
     return impl_->execute(session,tokens);
+}
+void HipKnownPrefixWindow::preflight_admission(const SerialSessionContext& session, std::span<const std::uint32_t> tokens) {
+    impl_->preflight_admission(session, tokens);
 }
 KnownWindowResult HipKnownPrefixWindow::execute_without_head(SerialSessionContext& session, std::span<const std::uint32_t> tokens) {
     return impl_->execute(session,tokens,{},{},nullptr,true);

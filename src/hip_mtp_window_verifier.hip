@@ -219,6 +219,18 @@ std::vector<HipMtpWindowOwnerStats> HipMtpWindowVerifier::owner_stats() const {
     return out;
 }
 std::uint32_t HipMtpWindowVerifier::logical_rows() const noexcept {return impl_->window->logical_rows();}
+void HipMtpWindowVerifier::prepare_admission(const SerialSessionContext& session) {
+    // STRIX_WINDOW_SETUP_PREFLIGHT=0 leaves each owner's admission to its first window.
+    static const bool enabled=[]{const char* v=std::getenv("STRIX_WINDOW_SETUP_PREFLIGHT");return !v || v[0]!='0';}();
+    auto& i=*impl_;
+    if(!enabled || i.busy || failed()) return;
+    const auto capacity=std::min(i.resources.session_state_layout->context_tokens,i.target->model().max_position_embeddings);
+    for(auto& o:i.owners) {
+        if(session.next_position+o.rows>capacity) continue;
+        const std::vector<std::uint32_t> tokens(o.rows,0U);
+        o.window->preflight_admission(session,tokens);
+    }
+}
 bool HipMtpWindowVerifier::failed() const noexcept {return impl_->failed || (impl_->checkpoint && impl_->checkpoint->failed());}
 std::uint64_t HipMtpWindowVerifier::retained_payload_bytes() const noexcept {return impl_->retained;}
 bool HipMtpWindowVerifier::worth_drafting(std::span<const float> probabilities) const {

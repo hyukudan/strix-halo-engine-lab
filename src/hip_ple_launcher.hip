@@ -2081,15 +2081,25 @@ struct HipPleKnownWindow::Impl {
             throw std::invalid_argument("known-window PLE requires a host lookup backend");
         std::vector<PreparedPleLaunch> out;
         out.reserve(spans.size());
+        // Window rows hold per-row copies of one resource set (only the scratch binding differs, and
+        // each row resolves its own arena views below): the same sources resolve the same tensors.
+        const auto same_sources = [](const ExecutionRuntimeResources* a, const ExecutionRuntimeResources* b) {
+            return a == b || (a && b && a->model_manifest == b->model_manifest && a->model_weights == b->model_weights &&
+                a->tensor_access == b->tensor_access && a->session_state_layout == b->session_state_layout &&
+                a->session_state_memory == b->session_state_memory && a->ple_lookup == b->ple_lookup &&
+                a->ple_hash_contract == b->ple_hash_contract && a->distributed_stage == b->distributed_stage);
+        };
         for (std::size_t r = 0; r < spans.size(); ++r) {
-            if (prefill && r > 0U) {
-                // Prefill rows of one step share config, tensors, layout, hash contract and session state with
+            const bool shared = r > 0U && (prefill || (same_sources(spans[r].resources, spans[0].resources) &&
+                spans[r].prepared_tensor_views == spans[0].prepared_tensor_views));
+            if (shared) {
+                // Rows of one step share config, tensors, layout, hash contract and session state with
                 // row 0 (checked below); only the row's own arena views differ, resolved and size-checked here.
                 const auto& row = spans[r];
                 const auto& head = spans[0];
                 if (row.op != head.op || row.step_id != head.step_id || row.layer != head.layer ||
                     row.kernel_id != head.kernel_id || row.execution_identity != head.execution_identity ||
-                    row.resources != head.resources || row.logical_rows != 1U || row.request_concurrency != 1U ||
+                    !same_sources(row.resources, head.resources) || row.logical_rows != 1U || row.request_concurrency != 1U ||
                     row.reads.size() != 1U || row.writes.size() != 1U || row.temporaries.size() != 1U)
                     throw std::invalid_argument("prefill PLE rows differ from their first row");
                 auto copy = out.front();
@@ -2162,6 +2172,7 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
     };
     const auto prepared = w.prepare(rows);
     lap("prepare");
+    const auto prepared_at = std::chrono::steady_clock::now();
     const auto& contract = prepared[0].hash_contract;
     auto& backend = *rows[0].resources->ple_lookup;
     auto* prefetch = rows[0].resources->ple_prefetch;
@@ -2248,6 +2259,17 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
         for (const auto& error : errors) if (error) std::rethrow_exception(error);
     }
     lap("gather");
+    if (!w.prefill) {
+        // STRIX_CYCLE_TIMING=1: host time of a window's PLE prepare + hash + gather, printed at exit.
+        struct Totals { double ms = 0, prep = 0; unsigned long long n = 0; bool on = std::getenv("STRIX_CYCLE_TIMING") != nullptr;
+            ~Totals() { if (on && n) std::fprintf(stderr, "window PLE host prepare+gather: %llu x %.4f ms (prepare %.4f ms)\n", n,
+                ms / static_cast<double>(n), prep / static_cast<double>(n)); } };
+        static Totals totals;
+        if (totals.on) {
+            totals.ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - mark).count();
+            totals.prep += std::chrono::duration<double, std::milli>(prepared_at - mark).count(); ++totals.n;
+        }
+    }
     void* device = nullptr;
     check_hip(hipHostGetDevicePointer(&device, staging, 0), "known-window PLE staging device view");
     const auto stream = hip_execution_stream();

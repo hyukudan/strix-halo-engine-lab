@@ -5,6 +5,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <vector>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -625,7 +626,13 @@ void FileMappedPleLookupBackend::finish(
         }
         // Only selected IQ4_NL rows are decoded. Storage remains quantized;
         // the existing activation contract is BF16, rounded to nearest-even.
+        // The row is decoded into host-cached memory and copied once: the destination is
+        // often a mapped, uncached staging buffer where 2-byte stores are slow.
         const auto blocks = pending_.stored_row_bytes / iq4_nl::block_bytes;
+        thread_local std::vector<std::byte> decoded;
+        if (decoded.size() < pending_.row_bytes) decoded.resize(static_cast<std::size_t>(pending_.row_bytes));
+        auto* const final_output = output;
+        output = decoded.data();
         for (std::uint64_t block = 0; block < blocks; ++block) {
             const std::span<const std::byte, iq4_nl::block_bytes> packed(
                 input + static_cast<std::size_t>(block * iq4_nl::block_bytes),
@@ -642,6 +649,7 @@ void FileMappedPleLookupBackend::finish(
                 std::memcpy(output + static_cast<std::size_t>(column * 2U), &bf16, sizeof(bf16));
             }
         }
+        std::memcpy(final_output, decoded.data(), static_cast<std::size_t>(pending_.row_bytes));
     }
 
     pending_ = {};

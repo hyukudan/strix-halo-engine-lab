@@ -55,6 +55,9 @@ public:
     // Whether one more draft can still pay off: the next larger window, with the remaining drafts assumed
     // as likely as the last one, beats the best window the current drafts already allow.
     [[nodiscard]] bool worth_drafting(std::span<const float> probabilities) const;
+    // Setup only: every owner's window admission at the session's current frontier, so the
+    // first window of each owner does not pay it inside the generation loop.
+    void prepare_admission(const SerialSessionContext& session);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
