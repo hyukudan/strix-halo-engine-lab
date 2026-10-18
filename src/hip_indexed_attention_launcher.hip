@@ -3332,6 +3332,7 @@ template <unsigned Rows> struct QsaInputRowsSite {
     using Input = std::uint16_t;
     static constexpr unsigned rows = Rows;
     static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)
+    static constexpr bool tree_upper_src0 = true;  // add(lower, upper) reads upper as src0 (lane VOPD tree)
     const void* input[Rows];
     q8_rows::Segments segments;
     std::uint32_t width, outputs;
@@ -3349,6 +3350,7 @@ template <unsigned Rows> struct QsaOutputRowsSite {
     using Input = float;
     static constexpr unsigned rows = Rows;
     static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)
+    static constexpr bool tree_upper_src0 = true;  // add(lower, upper) reads upper as src0 (lane VOPD tree)
     const void* input[Rows];
     q8_rows::Segments segments;
     std::uint32_t width, outputs;
@@ -5064,6 +5066,9 @@ void launch_hip_qsa_rows_projection_probe(HipQsaRowsProjection projection, HipQs
     std::span<const HipQsaInputProjectionView> input, HipQsaInputProjectionView weights,
     std::span<const HipQsaInputProjectionView> output, std::uint32_t width, std::uint32_t outputs, void* stream) {
     const auto rows = static_cast<std::uint32_t>(input.size());
+    // The fixture rewrites weights in place between calls (STRIX_Q8_ROWS_LANE_PROBE_CACHE=1 keeps the
+    // lane kernel's repacked weights, for timing one unchanged matrix).
+    if (!q8_rows::env_unsigned("STRIX_Q8_ROWS_LANE_PROBE_CACHE", 0U)) q8_rows::invalidate_lane_weights();
     const bool input_side = projection == HipQsaRowsProjection::input;
     if ((rows != 1U && rows != 2U && rows != 4U && rows != 8U && rows != 16U && rows != 32U && rows != 64U) || output.size() != rows ||
         (!input_side && projection != HipQsaRowsProjection::output) ||

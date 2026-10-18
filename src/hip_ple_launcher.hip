@@ -2240,6 +2240,7 @@ template <unsigned Rows> struct PleRowsSite {
     using Input = std::uint16_t;
     static constexpr unsigned rows = Rows;
     static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)
+    static constexpr bool tree_upper_src0 = true;  // add(lower, upper) reads upper as src0 (lane VOPD tree)
     q8_rows::Segments segments;
     std::uint32_t width, outputs, in_stride, out_stride;
     const std::uint16_t* base;
