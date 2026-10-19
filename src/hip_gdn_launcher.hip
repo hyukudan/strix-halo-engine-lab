@@ -5705,6 +5705,7 @@ bool same_island_config(const HipGdnLauncherConfig& a, const HipGdnLauncherConfi
         a.model.gdn_layers == b.model.gdn_layers &&
         a.model.attention_heads == b.model.attention_heads &&
         a.model.kv_heads == b.model.kv_heads &&
+        a.model.attention_kv_storage == b.model.attention_kv_storage &&
         a.model.head_dim == b.model.head_dim &&
         a.model.mtp_full_attention_layers == b.model.mtp_full_attention_layers &&
         a.model.mtp_use_dedicated_embeddings == b.model.mtp_use_dedicated_embeddings &&

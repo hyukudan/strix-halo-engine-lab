@@ -244,16 +244,25 @@ Defaults are the measured configuration.
 | Variable | Effect |
 |---|---|
 | `STRIX_HASH_CACHE=0` / `=DIR` | Disable, or relocate, the verified SHA-256 cache of model files (default `~/.cache/strix-engine/file-sha256`). A cached digest is reused only while the file keeps its device, inode, size, mtime and ctime, and it is still checked against the expected SHA-256. |
+| `STRIX_MTP_WINDOW_COST=legacy` | Min-p window controller: EMA cost estimates without re-probes (the behaviour before D-042; default is median/minimum estimates with bounded re-probes). |
+| `STRIX_MTP_DRAFT_VOCAB=2` | Draft vocabulary policy 2 with `--mtp-draft-vocab auto:DIR` (opt-in, D-043): the chosen language pack comes from `pack2-<lang>.bin` (no rows repeated from the core; 32k rows for Chinese) and a prompt without a pack gets `core64k.bin`. Tokens are unchanged. |
+| `STRIX_MTP_DRAFT_CORE=<N>k` | With `auto:DIR`: use `core<N>k.bin` (32k, 48k, 64k ship) as the core. |
 | `STRIX_MTP_DRAFT_WORTH=0` | Draft up to `--mtp-spec-min-p` only, without asking the window cost model before each extra step. |
 | `STRIX_MTP_DRAFT_Q4_ALL=0` | Disable Q4_0 copies of the MTP draft projections. |
 | `STRIX_ANYORDER=0` | Disable any-order launches of independent kernels. |
 | `STRIX_PLE_WARM=0` | Skip prefetching the file-backed PLE table after registration. |
 | `STRIX_MTP_GREEDY_ROWS=0` | Use per-row selectors instead of on-stream argmax of all window rows. |
 | `STRIX_CYCLE_TIMING=1` | Print host phase timings per MTP cycle. |
-| `STRIX_CYCLE_LOG=1` | Print each MTP cycle's window rows and wall time. |
+| `STRIX_CYCLE_LOG=1` | Print each MTP cycle's window rows and wall time (with the survival controller also the draft chain's wall time and steps). |
 | `STRIX_MTP_TILED_START=0` | Tiled MTP prompt: run the last prompt row serially instead of starting decode from the last row of a prefill block that ends there. |
-| `STRIX_MTP_DRAFT_LOG=1` | Print every draft proposal (chain start, step, token, probability) and each cycle's outcome (window rows, drafts, accepted, emitted ids). |
-| `STRIX_MTP_DRAFT_TOP2=1` | With `STRIX_MTP_DRAFT_LOG=1`: also copy each draft step's logits to host and print the runner-up token and its probability. Diagnostic only; selection is unchanged. |
+| `STRIX_MTP_CONTROLLER=survival` | Survival window controller (opt-in, D-041): the draft cut and the window choice come from a calibrated estimate of prefix survival against separated costs instead of the `--mtp-spec-min-p` cut. Tokens are unchanged. |
+| `STRIX_MTP_ACTIVE_ROWS=1` | With the survival controller: the R4 owner may also verify 3 active rows and the R8 owner 6. The remaining rows are padding outside the routed expert union and acceptance. |
+| `STRIX_MTP_EXPLORE=P` | With the survival controller: one more draft after a first draft whose calibrated acceptance is below P (default 0, off). |
+| `STRIX_MTP_REPROBE=N` | With the survival controller: a window option unused for N cycles (default 64, 0 = never) is chosen once more and a lower cost sample replaces its estimate, so one slow sample cannot price it out for the rest of the run. |
+| `STRIX_MTP_SURVIVAL_ADAPT=0` | With the survival controller: keep the offline calibration fixed (default adapts its bias online). |
+| `STRIX_MTP_DRAFT_LOG=1` | Print every draft proposal (chain start, step, token, probability and runner-up probability bits) and each cycle's outcome (window rows, drafts, accepted, emitted ids). |
+| `STRIX_MTP_DRAFT_TOP2=1` | Diagnostic: the draft head also reduces the runner-up probability (always on with the survival controller); with `STRIX_MTP_DRAFT_LOG=1` each step's logits are also copied to host and the runner-up token is printed. Selection is unchanged. |
+| `STRIX_MTP_DIAG_FULL_CHAIN=1` | Diagnostic, never timed: every cycle drafts the full depth and verifies one serial row, so every emitted position starts a complete draft chain. |
 | `STRIX_WINDOW_TIMING=1` | Print host-side phase totals of every known window at exit. |
 | `STRIX_PREFILL_TIMING=1` | Print download, scoring and spool times per block of teacher-forced tiled prefill. |
 

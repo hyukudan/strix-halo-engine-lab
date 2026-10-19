@@ -89,7 +89,8 @@ public:
     // min_probability > 0 completes each draft before the next and stops after
     // the first draft whose max softmax probability is below it (that draft is
     // kept). Returns 1..depth drafts; probabilities of the last chain below.
-    // keep_drafting (optional) sees the probabilities so far and may stop the chain earlier.
+    // keep_drafting (optional; it also completes each draft before the next) sees the probabilities
+    // so far (runner-ups in draft_runner_up_probabilities()) and may stop the chain.
     [[nodiscard]] std::vector<std::uint32_t> propose_chain(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,
         const SerialSessionContext&,const DraftProposalStateContext&,std::uint32_t depth,float min_probability=0.0F,
         const std::function<bool(std::span<const float>)>& keep_drafting={});
@@ -99,6 +100,8 @@ public:
     // feeds the next step. sampled_drafts() holds the last chain's drafts in order.
     void set_draft_sampler(std::shared_ptr<TokenSampler>);
     [[nodiscard]] std::span<const TokenDraft> sampled_drafts() const noexcept;
+    // Runner-up probability per draft of the last chain (zeros unless the head reduces runner-ups).
+    [[nodiscard]] std::span<const float> draft_runner_up_probabilities() const noexcept;
     void dispatch_mtp_step(const MtpForwardStepContext&) override;
     [[nodiscard]] MtpDraftCycleInput make_cycle_input(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,
         const MtpDraftRuntimeBinding&,const MtpDraftStateMemoryBinding&,const SerialSessionContext&,

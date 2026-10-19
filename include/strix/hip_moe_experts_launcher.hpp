@@ -9,6 +9,7 @@
 #include <memory>
 #include "strix/moe_q4k_a8_runtime.hpp"
 #include "strix/q51_known_rows.hpp"
+#include <functional>
 #include <span>
 
 namespace strix {
@@ -64,10 +65,21 @@ void moe_experts_known_window_rows_preflight(
     std::span<const ExecutionDispatchContext> rows,
     const HipMoeExpertsLauncherConfig& config,
     const q51_known_rows::Workspace& workspace);
+// active_rows (0 = every row): rows from active_rows on are left out of the expert union and get a zero
+// routed output (their MoE output is the shared expert only); the caller must never accept them.
 void moe_experts_known_window_rows_launch(
     std::span<const ExecutionDispatchContext> rows,
     const HipMoeExpertsLauncherConfig& config,
-    const q51_known_rows::Workspace& workspace);
+    const q51_known_rows::Workspace& workspace,
+    std::uint32_t active_rows = 0);
+// The routed rows step with the MoE-combine rows step that follows it folded into the commit
+// (STRIX_WINDOW_COMMIT_COMBINE=1): `combine_*` are the combine step's admitted views (shared, routed, output),
+// `before_commit` runs on the host just before the commit is enqueued (the window joins the shared-expert
+// stream there). Returns false, with nothing enqueued, when the views do not chain or alias.
+bool moe_experts_known_window_rows_launch_combined(std::span<const ExecutionDispatchContext> rows,
+    const HipMoeExpertsLauncherConfig& config, const q51_known_rows::Workspace& workspace,
+    std::span<const void* const> combine_shared, std::span<const void* const> combine_routed,
+    std::span<void* const> combine_output, const std::function<void()>& before_commit, std::uint32_t active_rows = 0);
 // Known-prompt prefill, A8 profile: all T rows (multiple of 8) of one routed step in one
 // call. Every 8-row chunk passes the window admission above (with the window's own
 // 8-row workspace); each per-row view must then be row 0 plus r times one stride.

@@ -68,6 +68,7 @@ A wider kernel, larger speculative window, second node or second physical link i
 - [Known-prefix window](known-prefix-window.md).
 - [Automatic decode optimization profile](decode-optimization-profile.md).
 - [Several requests in one decode loop (cohort windows)](multi-request-cohort.md).
+- [Serving over HTTP](serving.md).
 
 The decisions behind this path (D-021 to D-031, and the measured rejections) are in
 [`DECISIONS.md`](../DECISIONS.md).

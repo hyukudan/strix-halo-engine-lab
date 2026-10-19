@@ -1,6 +1,7 @@
 #include "strix/host_phase_timing.hpp"
 #include "strix/hip_mtp_window_verifier.hpp"
 #include "strix/mtp_target_window_policy.hpp"
+#include "strix/mtp_window_controller.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/arithmetic_lineage.hpp"
 #include "strix/session_state_memory.hpp"
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -38,12 +40,54 @@ bool session_equal(const SerialSessionContext& a,const SerialSessionContext& b) 
         a.arithmetic_lineage.tainted==b.arithmetic_lineage.tainted && a.arithmetic_lineage.intervals==b.arithmetic_lineage.intervals;
 }
 }
+bool hip_mtp_survival_controller() noexcept {
+    static const bool enabled=[]{const char* v=std::getenv("STRIX_MTP_CONTROLLER");return v && std::string_view(v)=="survival";}();
+    return enabled;
+}
+namespace {
+double env_number(const char* name,double fallback) {const char* v=std::getenv(name);return v && *v?std::atof(v):fallback;}
+double clamped_logit(double p) {p=std::clamp(p,1e-6,1.0-1e-6);return std::log(p/(1.0-p));}
+double sigmoid(double z) {return 1.0/(1.0+std::exp(-std::clamp(z,-30.0,30.0)));}
+// P(draft k equals the target's greedy token | drafts 0..k-1 did): a logistic over the draft's own
+// probability, its margin over the runner-up and its depth. The draft probability is a softmax over the draft
+// vocabulary, not an acceptance rate. Prior weights are fitted offline on full-chain logs (every start
+// position drafted to depth 7 on EN/ES/FR/code/agent prompts, Q4 draft, auto vocabulary); the history of
+// earlier probabilities added nothing there once depth is known. Online, only the bias adapts to the
+// recent workload (SGD on verified drafts, pulled back to the prior).
+struct SurvivalCalibrator {
+    static constexpr std::size_t width=5;
+    // bias, logit p1, log(p1/p2) capped at 12, depth 1, depth >= 2
+    static constexpr std::array<double,width> prior{0.1956,1.0131,-0.4434,-0.3505,-0.7112};
+    // Acceptance of a draft not made yet, from its depth and the previous draft's probability:
+    // bias, logit p(k-1), depth 1, depth >= 2.
+    static constexpr std::array<double,4> lookahead{0.3911,0.1133,0.1019,-0.1015};
+    double bias=prior[0],rate=0.0,pull=0.0;
+    static std::array<double,width> features(std::size_t k,float p1,float p2) {
+        const double margin=std::min(12.0,std::log(std::max(static_cast<double>(p1),1e-6)/std::max(static_cast<double>(p2),1e-6)));
+        return {1.0,clamped_logit(p1),margin,k==1?1.0:0.0,k>=2?1.0:0.0};
+    }
+    double probability(std::size_t k,float p1,float p2) const {
+        const auto x=features(k,p1,p2);double z=bias;
+        for(std::size_t f=1;f<width;++f) z+=prior[f]*x[f];
+        return sigmoid(z);
+    }
+    void update(std::size_t k,float p1,float p2,bool right) {
+        if(rate>0.0) bias-=rate*(probability(k,p1,p2)-(right?1.0:0.0)+pull*(bias-prior[0]));
+    }
+    static double next(std::size_t k,float previous) {
+        return sigmoid(lookahead[0]+lookahead[1]*clamped_logit(previous)+(k==1?lookahead[2]:0.0)+(k>=2?lookahead[3]:0.0));
+    }
+};
+}
+bool hip_mtp_full_chain_diagnostic() noexcept {
+    static const bool enabled=[]{const char* v=std::getenv("STRIX_MTP_DIAG_FULL_CHAIN");return v && v[0]=='1';}();
+    return enabled;
+}
 struct HipMtpWindowVerifier::Impl {
     struct Owner {
         std::shared_ptr<HipKnownPrefixWindow> window;
         std::array<std::shared_ptr<HipMtpTargetWindowCapture>,4> captures;
         std::uint32_t rows=0;
-        HipMtpWindowOwnerStats stats;
         std::shared_ptr<void> greedy_partials,greedy_replies;
         bool warmed=false; // first window of an owner pays one-time admission and first-touch costs
     };
@@ -55,15 +99,31 @@ struct HipMtpWindowVerifier::Impl {
     std::unique_ptr<HipMtpTargetCheckpoint> checkpoint;
     std::uint64_t retained=0,maximum_history_intervals=0;
     bool busy=false,failed=false,bounded=false,prefix=false;
-    // Adaptive choice: owner cost per cycle (draft included), serial cost per emitted token.
+    // Min-p controller (D-022): owner cost per cycle (draft included), serial cost per emitted token,
+    // per-bin acceptance; host logic in MtpMinPWindowController.
     float min_probability=0.0F;
     bool timing_independent=false;
     std::vector<float> sampled_logits;
-    double serial_ms_ema=0.0;std::uint64_t serial_cycles=0;
-    // Draft probabilities are not acceptance rates: per probability bin, verified
-    // drafts (every draft up to the first rejection) and how many were accepted.
-    std::array<double,10> tested{},accepted{};
+    std::unique_ptr<MtpMinPWindowController> minp;
     Owner* last=nullptr; // owner of the last prefix window; its stream carries the PLE commit
+    // Survival controller (STRIX_MTP_CONTROLLER=survival). An option is an owner and its active rows: with
+    // STRIX_MTP_ACTIVE_ROWS=1 the R4 owner also verifies 3 active rows and the R8 owner 6 (the rest are
+    // padding outside the expert union and acceptance). Costs are separated: per option the cycle time
+    // minus the draft chain (verify, commit, reconcile and host work), per draft step, per serial row.
+    struct Option {Owner* owner=nullptr;std::uint32_t active=0;std::uint64_t cycles=0,last_used=0,reprobe_after=0;double cost_ms_ema=0.0;bool probing=false;};
+    bool survival=false;
+    std::vector<Option> options; // ascending active rows
+    SurvivalCalibrator calibrator;
+    double explore=0.0; // one more draft after a first draft whose calibrated acceptance is below this
+    double draft_ms_ema=0.0,serial_row_ms_ema=0.0;std::uint64_t draft_samples=0,serial_rows=0;
+    double rho=0.0; // long-run tokens per ms (EMA over cycles): the price of a millisecond in survival_best
+    // An option's cost is only sampled when it is chosen, so one slow sample (page faults, a stalled host) could
+    // price it out for the rest of the run. An option whose estimate is implausible (above a larger option's, or
+    // for the largest one, more than 1.25x the next smaller one scaled by rows) and unused for reprobe_cycles
+    // cycles is chosen once more; that sample replaces a higher estimate. A probe that confirms the estimate
+    // doubles the option's interval (STRIX_MTP_REPROBE=N cycles, 0 = never).
+    std::uint64_t cycle_index=0,reprobe_cycles=64;
+    double chain_ms=0.0;std::uint32_t chain_steps=0; // the current cycle's draft chain (note_draft)
     std::optional<std::chrono::steady_clock::time_point> last_end;
     Impl(std::shared_ptr<HipMtpTargetHidden> t,std::vector<std::shared_ptr<HipKnownPrefixWindow>> w,
          const ExecutionRuntimeResources& r,std::shared_ptr<const void> owner,
@@ -84,10 +144,29 @@ struct HipMtpWindowVerifier::Impl {
                 "MTP window verifier requires actual closed all-row target owners");
             require(owners.empty() || (owners.back().rows<candidate->logical_rows() && candidate->defers_state() &&
                 owners.front().window->defers_state()),"MTP window owners must have distinct rows and prefix acceptance");
-            owners.push_back({candidate,{},candidate->logical_rows(),{candidate->logical_rows(),0,0.0},{},{},false});
+            owners.push_back({candidate,{},candidate->logical_rows(),{},{},false});
         }
         window=owners.back().window;
         prefix=window->defers_state();
+        {
+            // STRIX_MTP_WINDOW_COST=legacy: EMA cost estimates without re-probes (the D-022 behaviour before D-042).
+            const char* cost=std::getenv("STRIX_MTP_WINDOW_COST");
+            const auto model=cost && std::string_view(cost)=="legacy"?MtpWindowCostEstimate::Model::legacy:MtpWindowCostEstimate::Model::robust;
+            std::vector<std::uint32_t> rows;for(const auto& o:owners) rows.push_back(o.rows);
+            minp=std::make_unique<MtpMinPWindowController>(std::move(rows),min_probability,model,64,timing_independent);
+        }
+        // The survival controller prices options by measured time: never with a timing-independent schedule.
+        survival=prefix && hip_mtp_survival_controller() && !timing_independent;
+        if(survival) {
+            const bool active_rows=env_number("STRIX_MTP_ACTIVE_ROWS",0.0)!=0.0;
+            for(auto& o:owners) {
+                if(active_rows && (o.rows==4U || o.rows==8U)) options.push_back({&o,o.rows==4U?3U:6U});
+                options.push_back({&o,o.rows});
+            }
+            explore=env_number("STRIX_MTP_EXPLORE",0.0);
+            reprobe_cycles=static_cast<std::uint64_t>(std::max(0.0,env_number("STRIX_MTP_REPROBE",64.0)));
+            if(env_number("STRIX_MTP_SURVIVAL_ADAPT",1.0)!=0.0) {calibrator.rate=0.01;calibrator.pull=0.01;}
+        }
         for(std::size_t o=1;o<owners.size();++o) owners[o].window->share_deferred(*owners.front().window);
         const auto reservation=bounded?plan_hip_mtp_target_window_rollback(target->model(),*resources.session_state_layout,0,window->logical_rows(),true).reservation:
             plan_hip_mtp_target_checkpoint(target->model(),*resources.session_state_layout,policy.snapshot_policy);
@@ -131,60 +210,109 @@ struct HipMtpWindowVerifier::Impl {
         retained=mtp_native::sum(retained,checkpoint->reserved_bytes());
         require(retained<=policy.total_retained_byte_budget,"MTP actual verification pools exceed admitted reservation");
     }
-    static std::size_t bin(float p){return std::min<std::size_t>(9U,static_cast<std::size_t>(std::max(p,0.0F)*10.0F));}
-    // Calibrated acceptance: the bin's observed rate with a two-draft prior at p.
-    double acceptance(float p) const {const auto b=bin(p);return (accepted[b]+2.0*p)/(tested[b]+2.0);}
-    void calibrate(std::span<const float> p,std::size_t accepted_drafts,std::size_t verified_rows) {
-        for(std::size_t j=0;j<p.size() && j<verified_rows && j<=accepted_drafts;++j){
-            const auto b=bin(p[j]);tested[b]+=1.0;if(j<accepted_drafts)accepted[b]+=1.0;}
+    // Survival controller. Calibrated acceptance of each draft so far.
+    std::vector<double> survival_acceptance(std::span<const float> p,std::span<const float> p2) const {
+        std::vector<double> out(p.size());
+        for(std::size_t k=0;k<p.size();++k) out[k]=calibrator.probability(k,p[k],k<p2.size()?p2[k]:0.0F);
+        return out;
     }
-    // Expected emitted tokens of an R-row prefix window when draft j is accepted
-    // with its calibrated probability, given that every earlier draft was accepted.
-    double expected_tokens(std::uint32_t rows,std::span<const float> p) const {
-        double expected=1.0,run=1.0;
-        for(std::uint32_t j=1;j<rows && j<=p.size();++j){run*=acceptance(p[j-1U]);expected+=run;}
-        return expected;
+    // Unmeasured options are priced just under the cheapest measured one, so each is tried.
+    double option_cost(const Option& o) const {
+        if(o.cycles) return o.cost_ms_ema;
+        const Option* cheapest=nullptr;
+        for(const auto& m:options) if(m.cycles && (!cheapest || m.cost_ms_ema<cheapest->cost_ms_ema)) cheapest=&m;
+        return cheapest?0.9*cheapest->cost_ms_ema:1.0;
     }
-    bool worth_drafting(std::span<const float> p) const {
-        if(timing_independent || min_probability<=0.0F || p.empty()) return true;
-        const auto usable=p.size()+1U;
-        double best=serial_cycles?1.0/serial_ms_ema:0.0;
-        const Owner* next=nullptr;
-        for(const auto& o:owners) {
-            if(o.rows<=usable) {if(o.stats.cycles) best=std::max(best,expected_tokens(o.rows,p)/o.stats.cycle_ms_ema);}
-            else if(!next) next=&o;
+    // Best option for drafts with acceptance P (n=P.size() drafts paid): E[N] = 1 + sum_j prod_{i<j} P_i over
+    // the option's active rows against C = option cost + n draft steps. The value is E[N] - rho*C, rho the
+    // long-run rate (a cycle is worth its tokens minus the tokens its time would earn at that rate), or
+    // E[N]/C before the first cycle. Serial target steps earn one token per serial row cost.
+    // Returns the option (nullptr = serial) and its value.
+    template<class Fits> std::pair<Option*,double> survival_best(std::span<const double> P,Fits fits) {
+        std::vector<double> expected(P.size()+1U,1.0);double run=1.0;
+        for(std::size_t j=0;j<P.size();++j) {run*=P[j];expected[j+1U]=expected[j]+run;}
+        const double drafts=draft_samples?draft_ms_ema*static_cast<double>(P.size()):0.0;
+        const auto value=[&](double tokens,double ms){return rho>0.0?tokens-rho*ms:tokens/ms;};
+        Option* best=nullptr;double best_value=serial_rows?value(expected.back(),serial_row_ms_ema*expected.back()+drafts):0.0;
+        for(auto& o:options) {
+            if(!fits(o)) continue;
+            const auto v=value(expected[std::min<std::size_t>(o.active-1U,P.size())],option_cost(o)+drafts);
+            if(v>best_value || (!best && !serial_rows)) {best=&o;best_value=v;}
         }
-        if(!next) return false;
-        if(!next->stats.cycles) return true;
-        std::vector<float> assumed(p.begin(),p.end());assumed.resize(next->rows-1U,p.back());
-        return expected_tokens(next->rows,assumed)/next->stats.cycle_ms_ema>best;
+        return {best,best_value};
+    }
+    // Keep drafting while some longer chain (future drafts at the lookahead acceptance) has a better best
+    // option than the drafts so far; after a weak first draft, one exploration step regardless.
+    bool survival_keep(std::span<const float> p,std::span<const float> p2) {
+        if(p.empty()) return true;
+        auto P=survival_acceptance(p,p2);
+        const auto any=[](const Option&){return true;};
+        const auto now=survival_best(P,any).second;
+        const auto next=SurvivalCalibrator::next(p.size(),p.back());
+        for(std::size_t m=p.size();m<owners.back().rows-1U;++m) {
+            P.push_back(next);
+            if(survival_best(P,any).second>now) return true;
+        }
+        return p.size()==1U && P.front()<explore;
+    }
+    bool implausible(const Option& o) const {
+        const Option* smaller=nullptr;
+        for(const auto& m:options) {
+            if(!m.cycles || &m==&o) continue;
+            if(m.active>o.active && m.cost_ms_ema<o.cost_ms_ema) return true;
+            if(m.active<o.active && (!smaller || m.active>smaller->active)) smaller=&m;
+        }
+        const bool largest=std::none_of(options.begin(),options.end(),[&](const Option& m){return m.cycles && m.active>o.active;});
+        return largest && smaller && o.cost_ms_ema>1.25*smaller->cost_ms_ema*o.active/smaller->active;
+    }
+    template<class Fits> Option* survival_choose(std::span<const float> p,std::span<const float> p2,std::size_t candidates,Fits fits) {
+        ++cycle_index;
+        const auto use=[&](Option* o){if(o) o->last_used=cycle_index;return o;};
+        // Options never measured and holding the drafts are tried first, largest first.
+        for(auto o=options.rbegin();o!=options.rend();++o) if(!o->cycles && o->active<=candidates+1U && fits(*o)) return use(&*o);
+        if(reprobe_cycles) for(auto o=options.rbegin();o!=options.rend();++o)
+            if(o->cycles && cycle_index-o->last_used>std::max(o->reprobe_after,reprobe_cycles) && implausible(*o) && fits(*o)) {
+                o->probing=true;return use(&*o);}
+        return use(survival_best(survival_acceptance(p,p2),fits).first);
+    }
+    void survival_calibrate(std::span<const float> p,std::span<const float> p2,std::size_t accepted_drafts,std::size_t verified_rows) {
+        for(std::size_t j=0;j<p.size() && j<verified_rows && j<=accepted_drafts;++j)
+            calibrator.update(j,p[j],j<p2.size()?p2[j]:0.0F,j<accepted_drafts);
+    }
+    void survival_observe(Option* option,std::size_t emitted) {
+        const auto now=std::chrono::steady_clock::now();
+        if(last_end && emitted) {
+            const auto ms=std::chrono::duration<double,std::milli>(now-*last_end).count();
+            static const bool log_cycles=std::getenv("STRIX_CYCLE_LOG")!=nullptr;
+            if(log_cycles) std::fprintf(stderr,"cycle rows=%u emitted=%zu ms=%.2f draft_ms=%.2f drafts=%u\n",
+                option?option->active:1U,emitted,ms,chain_ms,chain_steps);
+            constexpr double alpha=0.25;
+            auto update=[&](double& ema,std::uint64_t& count,double value){
+                ema=count?ema+alpha*(std::min(value,2.0*ema)-ema):value;++count;};
+            if(chain_steps) update(draft_ms_ema,draft_samples,chain_ms/chain_steps);
+            const auto rate=static_cast<double>(emitted)/std::max(ms,1e-3);
+            rho=rho>0.0?rho+0.1*(rate-rho):rate;
+            const auto rest=std::max(ms-chain_ms,0.0);
+            if(option) {
+                // An owner's first window pays one-time admission and first touch: not a cost sample.
+                if(option->owner->warmed) {
+                    if(option->probing) {
+                        option->reprobe_after=rest<0.9*option->cost_ms_ema?reprobe_cycles:2U*std::max(option->reprobe_after,reprobe_cycles);
+                        option->cost_ms_ema=std::min(option->cost_ms_ema,rest);++option->cycles;
+                    }
+                    else update(option->cost_ms_ema,option->cycles,rest);
+                }
+                option->owner->warmed=true;option->probing=false;
+            } else update(serial_row_ms_ema,serial_rows,rest/static_cast<double>(emitted));
+        }
+        last_end=now;chain_ms=0.0;chain_steps=0;
     }
     // nullptr = serial target steps.
     template<class Fits> Owner* choose(std::span<const float> p,std::size_t candidates,Fits fits) {
-        auto largest=[&]()->Owner*{for(auto o=owners.rbegin();o!=owners.rend();++o) if(fits(*o)) return &*o;return nullptr;};
-        if(min_probability<=0.0F || p.size()!=candidates) return largest();
-        std::uint32_t want=1;
-        while(want-1U<p.size() && p[want-1U]>=min_probability) ++want;
-        Owner* cap=&owners.back();
-        for(auto& o:owners) if(o.rows>=want){cap=&o;break;}
-        const bool serial=want==1U;
-        if(timing_independent) {
-            // The smallest owner covering the confident drafts, else the largest that fits.
-            if(serial) return nullptr;
-            for(auto& o:owners) if(o.rows>=want && fits(o)) return &o;
-            return largest();
-        }
-        // Unmeasured options are tried once before the cost model ranks them.
-        if(fits(*cap) && !cap->stats.cycles) return cap;
-        if(serial && !serial_cycles) return nullptr;
-        Owner* best=nullptr;double best_rate=0.0;
-        for(auto& o:owners) {
-            if(o.rows>cap->rows || !fits(o) || !o.stats.cycles) continue;
-            const auto rate=expected_tokens(o.rows,p)/o.stats.cycle_ms_ema;
-            if(!best || rate>best_rate){best=&o;best_rate=rate;}
-        }
-        if(serial && (!best || 1.0/serial_ms_ema>best_rate)) return nullptr;
-        return best?best:largest();
+        std::array<std::uint8_t,8> mask{};
+        for(std::size_t o=0;o<owners.size();++o) mask[o]=fits(owners[o])?1U:0U;
+        const auto chosen=minp->choose(p,candidates,std::span<const std::uint8_t>(mask.data(),owners.size()));
+        return chosen==MtpMinPWindowController::serial?nullptr:&owners[chosen];
     }
     // A cohort cycle is not a sample of any owner's cost; the next cycle measures from here.
     void skip_sample() {last_end=std::chrono::steady_clock::now();}
@@ -204,16 +332,7 @@ struct HipMtpWindowVerifier::Impl {
             const auto ms=std::chrono::duration<double,std::milli>(now-*last_end).count();
             static const bool log_cycles=std::getenv("STRIX_CYCLE_LOG")!=nullptr;
             if(log_cycles) std::fprintf(stderr,"cycle rows=%u emitted=%zu ms=%.2f\n",owner?owner->rows:1U,emitted,ms);
-            constexpr double alpha=0.25;
-            // A sample is capped at twice the running estimate: one slow cycle (page faults,
-            // a stalled host) must not price an owner out of every later choice.
-            auto update=[&](double& ema,std::uint64_t& count,double value){
-                ema=count?ema+alpha*(std::min(value,2.0*ema)-ema):value;++count;};
-            if(owner) {
-                // The owner's first window is not a cost sample; it stays unmeasured and is tried again.
-                if(owner->warmed) update(owner->stats.cycle_ms_ema,owner->stats.cycles,ms);
-                owner->warmed=true;
-            } else update(serial_ms_ema,serial_cycles,ms/static_cast<double>(emitted));
+            minp->observe(owner?static_cast<std::size_t>(owner-owners.data()):MtpMinPWindowController::serial,emitted,ms);
         }
         last_end=now;
     }
@@ -234,10 +353,11 @@ std::vector<std::shared_ptr<HipKnownPrefixWindow>> HipMtpWindowVerifier::window_
     std::vector<std::shared_ptr<HipKnownPrefixWindow>> out;for(const auto& o:impl_->owners)out.push_back(o.window);return out;
 }
 std::vector<HipMtpWindowOwnerStats> HipMtpWindowVerifier::owner_stats() const {
-    std::vector<HipMtpWindowOwnerStats> out{{1U,impl_->serial_cycles,impl_->serial_ms_ema}};
-    for(const auto& o:impl_->owners)out.push_back(o.stats);
+    std::vector<HipMtpWindowOwnerStats> out;
+    for(const auto& o:impl_->minp->owner_stats()) out.push_back({o.rows,o.cycles,o.cycle_ms,o.probes});
     return out;
 }
+bool HipMtpWindowVerifier::robust_cost_model() const noexcept {return impl_->minp->model()==MtpWindowCostEstimate::Model::robust;}
 std::uint32_t HipMtpWindowVerifier::logical_rows() const noexcept {return impl_->window->logical_rows();}
 void HipMtpWindowVerifier::prepare_admission(const SerialSessionContext& session) {
     // STRIX_WINDOW_SETUP_PREFLIGHT=0 leaves each owner's admission to its first window.
@@ -352,7 +472,7 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
             result.committed_rows=i.target->accept_verified_prefix(provisional,*q.initial,session,n_keep);
             result.emitted_tokens.assign(selected.begin(),selected.begin()+n_keep);
             result.accepted_candidates=k;result.accepted_window=n_keep==rows;
-            if(q.probabilities.size()==q.candidates.size())i.calibrate(q.probabilities,k,rows-1U);
+            if(q.probabilities.size()==q.candidates.size())i.minp->calibrate(q.probabilities,k,rows-1U);
             i.skip_sample();
             provisional.reset();
             natives[a]={};
@@ -373,16 +493,33 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
         throw;
     }
 }
+void HipMtpWindowVerifier::begin_session() {
+    auto& i=*impl_;
+    require(!i.busy && !failed(),"MTP window verifier session restarts only while idle and healthy");
+    for(auto& o:i.owners) o.window->discard_deferred();
+    i.last=nullptr;i.last_end.reset();
+}
 bool HipMtpWindowVerifier::failed() const noexcept {return impl_->failed || (impl_->checkpoint && impl_->checkpoint->failed());}
 std::uint64_t HipMtpWindowVerifier::retained_payload_bytes() const noexcept {return impl_->retained;}
-bool HipMtpWindowVerifier::worth_drafting(std::span<const float> probabilities) const {
-    return impl_->worth_drafting(probabilities);
+bool HipMtpWindowVerifier::worth_drafting(std::span<const float> probabilities,std::span<const float> runner_ups) const {
+    return impl_->survival?impl_->survival_keep(probabilities,runner_ups):impl_->minp->worth_drafting(probabilities);
+}
+bool HipMtpWindowVerifier::survival_controller() const noexcept {return impl_->survival;}
+void HipMtpWindowVerifier::note_draft(std::uint32_t steps,double ms) noexcept {impl_->chain_steps=steps;impl_->chain_ms=ms;}
+std::vector<HipMtpWindowOptionStats> HipMtpWindowVerifier::option_stats() const {
+    std::vector<HipMtpWindowOptionStats> out;
+    if(!impl_->survival) return out;
+    out.push_back({1U,1U,impl_->serial_rows,impl_->serial_row_ms_ema});
+    for(const auto& o:impl_->options) out.push_back({o.owner->rows,o.active,o.cycles,o.cost_ms_ema});
+    out.push_back({0U,0U,impl_->draft_samples,impl_->draft_ms_ema});
+    return out;
 }
 HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& session,DirectLaunchDispatcher& dispatcher,
     const HipMtpTargetHiddenTicket& initial,std::span<const std::uint32_t> candidates,
     std::uint32_t budget,std::span<const std::uint32_t> eos,std::span<const float> probabilities,
-    std::span<const TokenDraft> drafts) {
+    std::span<const TokenDraft> drafts,std::span<const float> runner_ups) {
     auto& i=*impl_;
+    if(hip_mtp_full_chain_diagnostic()) budget=std::min(budget,1U); // no owner fits: one serial row
     const auto sampler=i.target->token_sampler();
     require(sampler?drafts.size()==candidates.size():drafts.empty(),"MTP sampled verification needs one draft distribution per candidate");
     for(std::size_t k=0;k<drafts.size();++k)
@@ -403,14 +540,32 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
     // Capture::begin needs room for one actual known-window chunk. Capacity
     // exhaustion is an ordinary serial fallback, before pool/checkpoint work.
     // Adaptive prefix windows may pad unconfident rows: they are never accepted.
-    const bool pad=i.prefix && i.min_probability>0.0F;
+    const bool pad=i.prefix && (i.min_probability>0.0F || i.survival);
     const auto room=capacity-session.next_position;
     const bool history=session.arithmetic_lineage.intervals.size()<i.maximum_history_intervals;
-    auto* owner=i.choose(probabilities,candidates.size(),[&](const Impl::Owner& o){
+    const bool survival=i.survival && probabilities.size()==candidates.size();
+    Impl::Option* option=nullptr;Impl::Owner* owner=nullptr;
+    if(survival) {
+        option=i.survival_choose(probabilities,runner_ups,candidates.size(),[&](const Impl::Option& o){
+            return budget>=o.active && room>=o.owner->rows && history && !candidates.empty();});
+        owner=option?option->owner:nullptr;
+    } else owner=i.choose(probabilities,candidates.size(),[&](const Impl::Owner& o){
         return budget>=o.rows && room>=o.rows && history && (pad?!candidates.empty():candidates.size()+1>=o.rows);});
     const bool use_window=owner!=nullptr;
     const auto rows=use_window?owner->rows:1U;
-    out.chosen_rows=rows;
+    // Rows whose drafts can be accepted; the owner's later rows are padding (outside the expert union
+    // when fewer than its physical rows).
+    const auto active=option?option->active:rows;
+    out.chosen_rows=active;
+    const auto calibrate=[&](std::size_t accepted,std::size_t verified) {
+        if(probabilities.size()!=candidates.size()) return;
+        if(survival) i.survival_calibrate(probabilities,runner_ups,accepted,verified);
+        else i.minp->calibrate(probabilities,accepted,verified);
+    };
+    const auto observe=[&](bool window,std::size_t emitted) {
+        if(survival) i.survival_observe(window?option:nullptr,emitted);
+        else i.observe(window?owner:nullptr,emitted);
+    };
     std::shared_ptr<HipMtpTargetWindowCapture> capture;
     if(use_window) {
         for(const auto& pool:owner->captures)if(pool->ready_for_reuse()){capture=pool;break;}
@@ -420,7 +575,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
         // row without a draft, a rejection, EOS or the budget; later rows are never accepted.
         if(sampler) capture->set_row_selection([&,first=session.next_position+1U,stream=capture->source_stream()](
             std::span<const ExecutionBufferAddress> logits,std::span<std::uint32_t> predictions) {
-            const auto decisions=sampler->decide_rows(std::min(rows,budget),first,drafts,eos,[&](std::uint32_t r) {
+            const auto decisions=sampler->decide_rows(std::min(active,budget),first,drafts,eos,[&](std::uint32_t r) {
                 read_hip_logits_row(logits[r],static_cast<std::uint32_t>(vocabulary),stream,i.sampled_logits);
                 return std::span<const float>(i.sampled_logits);});
             for(std::size_t r=0;r<decisions.size();++r) predictions[r]=decisions[r].token;
@@ -439,7 +594,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             for(std::uint32_t r=1;r<rows;++r) inputs.push_back(candidates[std::min<std::size_t>(r-1U,candidates.size()-1U)]);
             const auto previous=session;
             host_phase_mark("4 verify prologue");
-            auto native=owner->window->execute_mtp_captured(session,inputs,capture);
+            auto native=owner->window->execute_mtp_captured(session,inputs,capture,{},active);
             host_phase_mark("7 window launch+wait");
             attempted_target=true;out.attempted_window=true;
             out.r2_dispatches=native.execution.r2_dispatches;
@@ -449,7 +604,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             for(std::uint32_t row=0;row<rows;++row)selected.push_back(provisional->predicted_token(row));
             // Longest accepted prefix: row a+1's input equals row a's prediction.
             std::uint32_t a=0;
-            while(a+1U<rows && a<candidates.size() && a+1U<budget && inputs[a+1U]==selected[a] && !is_eos(selected[a])) ++a;
+            while(a+1U<active && a<candidates.size() && a+1U<budget && inputs[a+1U]==selected[a] && !is_eos(selected[a])) ++a;
             const auto n_keep=a+1U;
             host_phase_mark("7a select/accept");
             owner->window->commit_prefix(n_keep);i.last=owner;
@@ -466,9 +621,9 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             out.committed_rows=i.target->accept_verified_prefix(provisional,initial,session,n_keep);
             host_phase_mark("7d accept prefix");
             out.emitted_tokens.assign(selected.begin(),selected.begin()+n_keep);
-            out.accepted_candidates=a;out.accepted_window=n_keep==rows;
-            if(probabilities.size()==candidates.size())i.calibrate(probabilities,a,rows-1U);
-            i.observe(owner,n_keep);
+            out.accepted_candidates=a;out.accepted_window=n_keep==active;
+            calibrate(a,active-1U);
+            observe(true,n_keep);
             host_phase_mark("7e calibrate/observe");
             provisional.reset();
             host_phase_mark("7f release provisional");
@@ -514,8 +669,8 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             if(accepted)++out.accepted_candidates;
             if(is_eos(pending) || !accepted)break;
         }
-        if(probabilities.size()==candidates.size())i.calibrate(probabilities,out.accepted_candidates,out.emitted_tokens.size());
-        i.observe(use_window?owner:nullptr,out.emitted_tokens.size());
+        calibrate(out.accepted_candidates,out.emitted_tokens.size());
+        observe(use_window,out.emitted_tokens.size());
         i.busy=false;return out;
     } catch(...) {
         i.failed=true;i.busy=false;

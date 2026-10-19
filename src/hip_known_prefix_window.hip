@@ -171,6 +171,7 @@ struct HipKnownPrefixWindow::Impl {
     std::unique_ptr<SharedDetach> shared_detach;
     DeferredMoeFirstError completion_status{};
     bool failed = false;
+    std::uint32_t active_rows = 0; // execute_mtp_captured: rows in the expert union (0 = every row)
     HipKnownPrefixWindow::PrefillStepObserver prefill_observer;
     // Set while a cohort executes this owner's window: its routed union ran on the cohort primary.
     bool cohort_member = false;
@@ -363,10 +364,82 @@ struct HipKnownPrefixWindow::Impl {
             d.pending[layer] = 1U;
             return true;
         }
-        if (step.op == SerialOp::moe_combine && shared_detach && shared_detach->pending[layer]) {
-            auto& d = *shared_detach;
-            check(hipStreamWaitEvent(scope.stream, d.joined[layer + d.parity * d.pending.size()], 0), "join known-window shared stream");
-            d.pending[layer] = 0U;
+        if (step.op == SerialOp::moe_combine) join_shared(layer);
+        return false;
+    }
+    // The owner's stream waits for the layer's detached shared expert (at its MoE combine, or before the
+    // routed commit when the combine is folded into it).
+    void join_shared(std::uint32_t layer) {
+        if (!shared_detach || !shared_detach->pending[layer]) return;
+        auto& d = *shared_detach;
+        check(hipStreamWaitEvent(scope.stream, d.joined[layer + d.parity * d.pending.size()], 0), "join known-window shared stream");
+        d.pending[layer] = 0U;
+    }
+    // Window HC folds (each opt-in; see hyper_mix_known_window_rows_launch_folded):
+    // STRIX_WINDOW_INJECT_NORM=1: an inject rows step followed by its HC rows step runs as inject+norm, split-K,
+    //   output; STRIX_WINDOW_COMBINE_INJECT=1: a MoE-combine rows step, the MLP inject and the next HC rows step
+    //   run as combine+inject+norm, split-K, output. The folded steps are recorded as completed without a launch.
+    static bool env_on(const char* name) { const char* v = std::getenv(name); return v && v[0] == '1'; }
+    static bool inject_norm_enabled() { static const bool on = env_on("STRIX_WINDOW_INJECT_NORM"); return on; }
+    static bool combine_inject_enabled() { static const bool on = env_on("STRIX_WINDOW_COMBINE_INJECT"); return on; }
+    static bool commit_combine_enabled() { static const bool on = env_on("STRIX_WINDOW_COMMIT_COMBINE"); return on; }
+    std::vector<std::size_t> folded_steps;
+    bool hc_rows_step(std::size_t i) const {
+        const auto op = serial.execution.steps[i].op;
+        const auto v = window.r2_variant[i];
+        return (op == SerialOp::attn_hyper_mix || op == SerialOp::mlp_hyper_mix || op == SerialOp::final_hyper_mix) &&
+            (v == KnownWindowR2Variant::hyper_mix_rows2_v1 || v == KnownWindowR2Variant::hyper_mix_rows4_v1 ||
+             v == KnownWindowR2Variant::hyper_mix_rows8_v1);
+    }
+    bool inject_rows_step(std::size_t i) const {
+        const auto op = serial.execution.steps[i].op;
+        return (op == SerialOp::attn_inject || op == SerialOp::mlp_inject) && window.r2_variant[i] == KnownWindowR2Variant::inject_rows_v1;
+    }
+    bool fold_window_steps(std::size_t i, const std::vector<std::vector<ExecutionDispatchContext>>& contexts) {
+        if (!folded_steps.empty() && folded_steps.front() == i) { folded_steps.erase(folded_steps.begin()); return true; }
+        if (!folded_steps.empty()) throw std::logic_error("known-window folded step was not reached in order");
+        const auto steps = serial.execution.steps.size();
+        const auto same_rows = [&](std::size_t a, std::size_t b) { return contexts[a].size() == contexts[b].size(); };
+        // STRIX_WINDOW_COMMIT_COMBINE=1: the routed rows step and the MoE combine after it; the shared stream is
+        // joined just before the commit.
+        if (commit_combine_enabled() && serial.execution.steps[i].op == SerialOp::moe_experts && i + 1U < steps &&
+            serial.execution.steps[i + 1U].op == SerialOp::moe_combine &&
+            window.r2_variant[i + 1U] == KnownWindowR2Variant::moe_combine_rows_v1 && same_rows(i, i + 1U) &&
+            serial.execution.steps[i].layer && (window.r2_variant[i] == KnownWindowR2Variant::routed_a8_union_rows2_v1 ||
+             window.r2_variant[i] == KnownWindowR2Variant::routed_a8_union_rows4_v1 ||
+             window.r2_variant[i] == KnownWindowR2Variant::routed_a8_union_rows8_v1 ||
+             window.r2_variant[i] == KnownWindowR2Variant::routed_q51_union_rows2_v1 ||
+             window.r2_variant[i] == KnownWindowR2Variant::routed_q51_union_rows4_v1 ||
+             window.r2_variant[i] == KnownWindowR2Variant::routed_q51_union_rows8_v1)) {
+            const auto combine = moe_combine_known_window_rows_views(contexts[i + 1U], elementwise_config);
+            const auto n = contexts[i].size();
+            const auto layer = *serial.execution.steps[i].layer;
+            if (elementwise_config.activation == HipActivationStorage::bf16 &&
+                moe_experts_known_window_rows_launch_combined(contexts[i], routed_config, routed_workspace,
+                    std::span<const void* const>(combine.first, n), std::span<const void* const>(combine.second, n),
+                    std::span<void* const>(combine.output, n), [&, layer] { join_shared(layer); }, active_rows)) {
+                folded_steps = {i + 1U};
+                return true;
+            }
+        }
+        if (combine_inject_enabled() && serial.execution.steps[i].op == SerialOp::moe_combine &&
+            window.r2_variant[i] == KnownWindowR2Variant::moe_combine_rows_v1 && i + 2U < steps &&
+            inject_rows_step(i + 1U) && hc_rows_step(i + 2U) && same_rows(i, i + 1U) && same_rows(i, i + 2U)) {
+            const auto combine = moe_combine_known_window_rows_views(contexts[i], elementwise_config);
+            const auto inject = inject_known_window_rows_views(contexts[i + 1U], elementwise_config);
+            if (hyper_mix_known_window_rows_launch_folded(&combine, inject, contexts[i + 2U], hyper_for(contexts[i + 2U]),
+                    elementwise_config)) {
+                folded_steps = {i + 1U, i + 2U};
+                return true;
+            }
+        }
+        if (inject_norm_enabled() && inject_rows_step(i) && i + 1U < steps && hc_rows_step(i + 1U) && same_rows(i, i + 1U)) {
+            const auto inject = inject_known_window_rows_views(contexts[i], elementwise_config);
+            if (hyper_mix_known_window_rows_launch_folded(nullptr, inject, contexts[i + 1U], hyper_for(contexts[i + 1U]),
+                    elementwise_config)) {
+                folded_steps = {i + 1U};
+                return true;
+            }
         }
         return false;
     }
@@ -669,7 +742,7 @@ struct HipKnownPrefixWindow::Impl {
             },
             [](std::span<const ExecutionDispatchContext> rows,void* object) {
                 const auto& self=*static_cast<Impl*>(object);
-                moe_experts_known_window_rows_launch(rows,self.routed_config,self.routed_workspace);
+                moe_experts_known_window_rows_launch(rows,self.routed_config,self.routed_workspace,self.active_rows);
             }});
     }
     const HipHyperMixLauncherConfig& hyper_for(std::span<const ExecutionDispatchContext> rows) const {
@@ -778,6 +851,11 @@ struct HipKnownPrefixWindow::Impl {
         check(hipStreamSynchronize(scope.stream),"complete deferred GDN commit");
         gdn_control()->pending_rows=0; gdn_deferred->pending=false;
     }
+    void discard_deferred() {
+        if(!gdn_deferred || !gdn_deferred->pending) return;
+        check(hipStreamSynchronize(scope.stream),"discard deferred GDN rows fence");
+        gdn_control()->pending_rows=0; gdn_deferred->pending=false;
+    }
     void share_deferred(const Impl& primary) {
         if(!window.gdn_deferred_rows_steps || !primary.gdn_deferred || failed || primary.failed ||
             !gdn_commit_rows.empty() || gdn_deferred->pending ||
@@ -877,7 +955,8 @@ struct HipKnownPrefixWindow::Impl {
                 throw std::runtime_error("routed expert union metadata disagrees with its completed prefill");
         } else if(window.routed_expert_union_steps && !cohort_member) {
             const auto& s=pending_union_summary;
-            const auto assignments=window.logical_rows*u32(model.num_experts_per_token);
+            const auto union_rows=active_rows?active_rows:window.logical_rows;
+            const auto assignments=union_rows*u32(model.num_experts_per_token);
             std::uint64_t experts=0,batches=0,batch_assignments=0,unique_row_assignments=0;
             for(std::uint32_t i=0;i<8U;++i) {
                 experts+=s.rows_per_expert_histogram[i];
@@ -887,7 +966,7 @@ struct HipKnownPrefixWindow::Impl {
                 if(i>=window.logical_rows && (s.rows_per_expert_histogram[i] || s.batch_size_histogram[i]))
                     throw std::runtime_error("routed expert union histogram exceeds its admitted row count");
             }
-            if(s.status || s.version!=1U || s.logical_rows!=window.logical_rows || s.assignments!=assignments ||
+            if(s.status || s.version!=1U || s.logical_rows!=union_rows || s.assignments!=assignments ||
                 !s.touched || s.touched>assignments || s.touched>model.num_experts ||
                 s.batches<s.touched || s.batches>assignments || !s.maximum_assignments ||
                 s.maximum_assignments>assignments || s.duplicate_assignments>assignments ||
@@ -1346,12 +1425,17 @@ struct HipKnownPrefixWindow::Impl {
             };
             hooks.position_reader_implementations = position_readers;
             hooks.record_actual_window_lineage=static_cast<bool>(capture);
-            fused_hc_step=SIZE_MAX;
-            const bool detach=!prefill && shared_detach_enabled(), fuse_hc=!prefill && hc_inject_fusion_enabled();
-            if(detach || fuse_hc)
-                hooks.before_step=[&,detach,fuse_hc](std::size_t i,const std::vector<std::vector<ExecutionDispatchContext>>& contexts) {
+            fused_hc_step=SIZE_MAX;folded_steps.clear();
+            const bool detach=!prefill && shared_detach_enabled(), fuse_hc=!prefill && hc_inject_fusion_enabled(),
+                fold=!prefill && (inject_norm_enabled() || combine_inject_enabled() || commit_combine_enabled());
+            if(detach || fuse_hc || fold)
+                hooks.before_step=[&,detach,fuse_hc,fold](std::size_t i,const std::vector<std::vector<ExecutionDispatchContext>>& contexts) {
+                    // Folded steps first; the shared-expert join (at the MoE combine) precedes a fold started there.
+                    // A window fold that already took an inject step leaves nothing for the persistent HC fusion.
+                    if(fold && !folded_steps.empty() && folded_steps.front()==i) return fold_window_steps(i,contexts);
                     if(fuse_hc && fuse_hc_inject(i,contexts)) return true;
-                    return detach && detach_shared(i,contexts);
+                    if(detach && detach_shared(i,contexts)) return true;
+                    return fold && fold_window_steps(i,contexts);
                 };
             hooks.skip_head=skip_head;
             hooks.preflight_memo=&preflight_memo;hooks.recipe_memo=&recipe_memo;hooks.preflight_slots=&preflight_slots;
@@ -1424,8 +1508,16 @@ std::shared_ptr<HipMtpTargetWindowCapture> HipKnownPrefixWindow::prepare_mtp_tar
     return capture;
 }
 HipMtpTargetWindowExecution HipKnownPrefixWindow::execute_mtp_captured(SerialSessionContext& session,std::span<const std::uint32_t> tokens,
-    std::shared_ptr<HipMtpTargetWindowCapture> capture,const std::function<void()>& before_publish){
+    std::shared_ptr<HipMtpTargetWindowCapture> capture,const std::function<void()>& before_publish,std::uint32_t active_rows){
     if(!capture)throw std::invalid_argument("MTP target capture owner is absent");
+    if(active_rows && (active_rows<2U || active_rows>logical_rows() || impl_->prefill))
+        throw std::invalid_argument("known-window active rows must be 2..rows of a closed window");
+    // Only the routed expert union reads it; without a union every row runs its experts (padding cost).
+    struct ActiveRows {
+        std::uint32_t& value;
+        ActiveRows(std::uint32_t& v,std::uint32_t a):value(v){value=a;}
+        ~ActiveRows(){value=0;}
+    } scoped(impl_->active_rows,active_rows==logical_rows()?0U:active_rows);
     HipMtpTargetWindowExecution out;out.execution=impl_->execute(session,tokens,before_publish,capture,&out.batch);return out;
 }
 void HipKnownPrefixWindow::set_prefill_step_observer(PrefillStepObserver observer) {
@@ -1460,6 +1552,7 @@ bool HipKnownPrefixWindow::defers_state() const noexcept {
 }
 void HipKnownPrefixWindow::commit_prefix(std::uint32_t n_keep) { impl_->commit_prefix(n_keep); }
 void HipKnownPrefixWindow::flush_deferred() { impl_->flush_deferred(); }
+void HipKnownPrefixWindow::discard_deferred() { impl_->discard_deferred(); }
 void HipKnownPrefixWindow::share_deferred(const HipKnownPrefixWindow& primary) { impl_->share_deferred(*primary.impl_); }
 
 } // namespace strix

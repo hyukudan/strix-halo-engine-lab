@@ -268,7 +268,6 @@ Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL):
 | | FP32 dense | dense A8 |
 | --- | --- | --- |
 | Prefill, 1032-token prompt (one block) | 410.5 tok/s | 707.7 tok/s |
-| Decode, MTP windows 2/4/8, 256 tokens (3 interleaved rounds, replay error 0) | 51.9 tok/s | 53.9 tok/s |
 | Top-1 agreement with a Q8_0 reference (49,001 positions) | 95.52 % | 95.55 % |
 | KL to the Q8_0 reference | 0.01940 | 0.01978 (+1.9 ± 2.0 %) |
 
@@ -276,6 +275,21 @@ Why: the quality cost is within the difference between two exact implementations
 below quantizing activations to Q8_1 (+30 % KL). The two profiles pick different tokens at 2.8 % of positions,
 almost all near-ties (median reference top-2 margin 0.22 nats, against 3.10 overall). The one per-category signal
 is Spanish prose top-1 (−0.55 ± 0.23 pt) with unchanged KL.
+
+Validation (segment bootstrap over 31 segments, long context with QSA block selection active, 8 decode prompts)
+keeps dense A8 recommended, under these conditions:
+
+- No decode speed claim. Across 8 prompts, the A8/FP32 decode rate is 0.96-1.06 per prompt, about 1.01 as a
+  geometric mean. Decode is neutral.
+- The reason to choose A8 is prefill: it is 27-31 % faster on long requests.
+- The quality statement holds over all segments. The non-inferiority bound `KL_A8 - 1.05 KL_FP32` has a 95 %
+  upper bound below 0. Five categories (agent, chat-en, chat-es, math, multilingual) still have their bound
+  above 0. They have only 1-8 segments each, so these are open signals, not losses.
+- At 8K/16K/32K the long-context picture is the same for both profiles:
+  - retrieval: 116/120 correct with each profile, and no question graded differently;
+  - KL beyond 4K is no larger than at 0-2K.
+- The functional free-generation suite (tool calls, JSON, code, Spanish) must finish before this decision is
+  final. Only a partial run exists, so no functional claim rests on it.
 
 ## D-033: separate prefill numerical profile
 
@@ -405,6 +419,19 @@ Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL):
 | Engine GPU time at 16K, T = 2048 | routed MoE 6.94 → 5.64 s; total 24.57 → 23.17 s |
 | Engine request time, T = 2048, GEN = 1, quiet node | 4K 5936 → 5588 ms (+6 %), 16K 24927 → 23671 ms (+5 %) |
 
+Long context, all default components (hc, dense, moe, qsa, router; decode dense A8 after the fast prefill),
+against the exact FP32-dense profile:
+
+| Measurement | Fast profile | Dense A8 |
+| --- | --- | --- |
+| KL, teacher-forced 16K/32K documents (wiki, code) | 15-21 % lower than dense A8, every paired 95 % CI excluding 0 | |
+| KL, 20 position bins up to 32K | lower in all 20 bins | |
+| Top-1 agreement | 0.16-0.51 pt higher than dense A8 | |
+| Retrieval, 24 haystacks of 8K/16K/32K | 116/120 correct | 116/120 correct (FP32 dense also 116/120), same questions |
+| 200 generated tokens | identical to FP32 dense in 24/24 haystacks | |
+
+None of the fast components accumulates error with context length.
+
 ## D-037: fast prefill profile, QSA attention component over row-tile unions
 
 The `qsa` component of `fast-prefill-f16wmma-v1` (`--prefill-fast-components ...,qsa`) changes the sparse
@@ -525,6 +552,211 @@ with the automatic organization, tiled route with the explicit v5 flag set; F = 
 | 4096 tokens, T=2048, F | Byte-identical, 4095 score rows equal; 205 s vs 25 s |
 | 16384 tokens (wiki), T=2048, F | Byte-identical (16.3 GB file), 16383 score rows equal; 1001 s serial vs 66 s tiled |
 | 16384 tokens, where the tiled time goes (per 2048-row block) | 7-8 s GPU against 5.4 s for the same prefill with only the terminal head (the eight-row heads add about 2.6 s), 31 ms download, 150 ms scoring; the 0.3-2.8 s spool overlaps the next block |
+## D-041: survival window controller and active rows (opt-in, pending the timing campaign)
+
+`STRIX_MTP_CONTROLLER=survival` replaces the D-022 cut (the chain stops at the first draft below
+`--mtp-spec-min-p`, and that cut also caps the window) by two separate decisions:
+
+- Acceptance: for draft k, given that drafts 0..k-1 matched, P(draft k equals the target's greedy token) is a
+  logistic in the draft's probability, its log margin over the runner-up (the draft head now also reduces the
+  runner-up) and depth (1, >= 2). Prior weights were fitted offline; online only the bias adapts, pulled back
+  to the prior.
+- Window and chain length: E[N_R] = 1 + sum_j prod_{i<j} P_i over the option's active rows against a cost
+  C = option cost + n draft steps, with separated EMAs (cycle time minus draft chain per option, per draft
+  step, serial rows). The chosen option maximises E[N] - rho*C, rho the long-run tokens per ms. Drafting
+  continues while some longer chain, with further drafts at a lookahead acceptance (from depth and the
+  previous probability), beats the current best option. One extra draft after a weak first draft is
+  available (`STRIX_MTP_EXPLORE`) but off: neutral to slightly negative in simulation.
+
+`STRIX_MTP_ACTIVE_ROWS=1` adds options inside the physical owners: the R4 owner verifies 3 active rows and
+the R8 owner 6. Padding rows run the dense R4/R8 kernels but stay outside the routed expert union (the CSR is
+built over the active rows and the merge skips the rest, so their routed output is zero), and are never
+accepted (acceptance stops before the active count; `commit_prefix` keeps at most that many rows, and
+capture, GDN deferred commit, PLE commit and QSA rows already publish only the accepted prefix). Admission is
+unchanged: the active count is a launch argument of the eager window. The union rows fixture checks, in both
+profiles, that active rows are bit-identical to the full union and padding rows are zero.
+
+Sizing with the full-chain diagnostic (`STRIX_MTP_DIAG_FULL_CHAIN=1`: a 7-deep chain from every generated
+position) on 6 prompts x 512 tokens (EN, ES, FR prose, 2 code, agent; dense A8 profile, Q4 draft, auto
+vocabulary):
+
+- Calibration. Raw draft probability in [0.9, 0.99) predicts 0.957 against 0.801 observed; the calibrated
+  estimate predicts 0.958 against 0.956.
+- Simulation against the min-p 0.8 controller, leave-one-prompt-out (calibrator fitted without the simulated
+  prompt), geometric mean:
+  - controller alone: +2.1 % (+1.0 to +3.5 % per prompt);
+  - with active rows: +4.3 %.
+- Active rows under the min-p controller: about 0 %.
+- Measured costs in single runs (cycle minus drafts): R2 44.2, R3-in-R4 49.3, R4 52.4, R6-in-R8 64.6,
+  R8 72.1 ms.
+
+Tokens are unchanged by construction: every emitted token is the target's greedy token. They were identical,
+with MTP replay error 0, on every run in both profiles. The cost model also re-probes an option whose
+estimate is implausible once it has gone 64 cycles unused (`STRIX_MTP_REPROBE`). In one min-p baseline run, a
+single 111 ms first sample of R4 kept 262 of 267 cycles in R2.
+
+Status: opt-in until an interleaved timing campaign against D-022 qualifies it.
+
+## D-042: robust window cost estimates with bounded re-probes (D-022 controller, default)
+
+The D-022 controller only samples an owner's cost when it chooses it. Under the EMA, the first sample set
+the estimate and later samples were capped at 2x, so one slow window (page faults, a stalled host) could
+price an owner out for the rest of the run. Once a larger owner looked too slow, `worth_drafting` stopped
+every chain early, the larger owners were never chosen again, and nothing corrected the estimate.
+
+On hardware (code prompt, dense A8 profile, min-p 0.8) this happened as follows. The first R4 sample after
+its warm-up was 111 ms, against about 55 ms in other runs. R8 got only its warm-up window. 262 of 267 cycles
+then ran R2, at 41.8 tok/s; a repeat of the same run gave 61.2 tok/s.
+
+Now (`MtpMinPWindowController`, host code shared by the verifier and a unit test):
+
+- Cost estimate per owner and for serial rows. It keeps the last 8 samples; the first window of an owner is
+  still not a sample.
+  - With fewer than 3 samples the estimate is provisional and equals their minimum, so a single slow sample
+    cannot inflate it.
+  - From 3 samples on, it is their median, so one outlier never moves it.
+- Bounded re-probe. An owner whose estimate is provisional, or implausible (above the settled estimate of a
+  larger owner), is chosen once more, if it fits, after it has gone 64 choices unused. Each probe doubles that
+  owner's interval, so a run of N cycles pays at most about log2(N/64) probes per owner, and none once every
+  estimate has settled.
+- Unchanged: the chain cut, calibration and ranking (expected tokens per estimated ms), the policy flags,
+  and every emitted token. Only the choice of window differs.
+
+`STRIX_MTP_WINDOW_COST=legacy` restores the previous EMA without re-probes. Receipts record
+`mtp_window_cost_model` and per-owner `probes`.
+
+`tests/mtp_window_controller_tests.cpp` replays the stall with a synthetic cost sequence (a 111 ms first R4
+sample, then a confident workload):
+
+| Cost model | Outcome |
+| --- | --- |
+| Legacy | Stays in R2 |
+| Robust | Re-probes R8 and R4 a few times and runs the workload in R8 |
+
+Without the spike, both models settle on the same windows.
+
+## D-043: draft vocabulary policy 2 (opt-in, pending the timing campaign)
+
+The draft head proposes only from its rows: the core, the language pack chosen by the prompt, and every
+prompt or emitted token (the context rows). A full-chain diagnostic run per head variant (Q4 subset as
+deployed, Q8 subset, Q8 full head; 10 prompts: en, es, fr, de, ja x2, zh, two code, agent) measured what this
+costs.
+
+Findings:
+
+- Tokens outside the rows cost only their first appearance. Later appearances are already context rows.
+  - Generated positions whose token is outside the rows: 0.2-0.8 % with a Latin pack, 0.6-1.2 % in Japanese,
+    1-4.3 % in English and code (core only), and 6.1 % in Chinese (core32k + pack-zh16k).
+  - Share of draft misses with an out-of-rows target: 15 % (JS reasoning), 12 % (Chinese), 6.5 % (English
+    chat, agent), and at most 2.6 % elsewhere.
+- Normalising the draft probability over the subset barely moves it. On the first draft, where all head
+  variants see the same input, p(subset) / p(full head) has a median of 1.0000-1.0047 and a p90 of
+  1.003-1.085. A renormalisation or per-pack calibration has nothing to correct.
+- Pack selection by prompt picked the best pack on every prompt. Prompts without a pack (English, code, agent)
+  gain nothing from any pack.
+- Ceiling: the Q8 full head at today's draft cost would gain only +1.1 % (min-p) / +1.2 % (survival
+  controller), geometric mean. The largest gains are Chinese (+3.2 / +4.5 %), JS reasoning (+2.9 / +3.6 %) and
+  English chat (+1.3 / +1.6 %).
+- Simulation method. A subset head's argmax equals the full head's whenever the full argmax is one of its rows,
+  so any subset's chains follow from the full-head chains. They matched the real Q8 subset runs on every one
+  of 31,933 drafts.
+
+Policy 2 (`STRIX_MTP_DRAFT_VOCAB=2` with `auto:DIR`):
+
+- A chosen pack comes from `pack2-<lang>.bin`. This is the same ranking with core32k excluded: the shipped
+  packs were ranked against a 16k core, so 0.2-4.5k of their rows repeat the core. The Chinese pack doubles to
+  32k rows, which cuts its out-of-rows positions from 23 to 2 of 376.
+- A prompt without a pack gets `core64k.bin`, a longer prefix of the core32k ranking.
+
+Simulated gain against today's vocabulary, with the extra head rows priced at 0.1 ms per draft step per 16k
+rows:
+
+| | Min-p | Survival controller |
+| --- | --- | --- |
+| Geometric mean | +0.4 % | +0.6 % |
+| Chinese | +2.3 % | +3.0 % |
+| JS reasoning | +1.5 % | +1.6 % |
+| English chat | +0.4 % | +0.9 % |
+| Spanish | +0.7 % | +0.6 % |
+| Others | -0.4 to +0.4 % | |
+
+`STRIX_MTP_DRAFT_CORE=<N>k` forces the core. Tokens are unchanged: the draft only steers verification.
+
+Status: opt-in until the timing campaign. Both rules are data only, and the language is still chosen with the
+`pack-` files.
+## D-044: verify-window step folds (opt-in)
+
+`STRIX_WINDOW_INJECT_NORM=1` folds the inject rows step into the next HC rows step's normalisation,
+`STRIX_WINDOW_COMMIT_COMBINE=1` folds the MoE combine into the routed rows commit, and
+`STRIX_WINDOW_COMBINE_INJECT=1` folds combine + inject + HC norm (almost always declined with the canonical arena,
+falling back to the inject fold). Each fold keeps the expressions of the separate launches and is declined, with
+nothing enqueued, when its views do not chain or alias; component fixtures (`strix-hip-known-window-tests
+--window-folds`, the union rows fixture) equal the separate launches over the whole arena, and complete MTP decode
+gives identical tokens with replay error 0 with each fold and with all. A kernel trace per window shows -138
+dispatches and about -0.5 ms (about 1 %), within the noise of single smoke runs, so all three stay off by default.
+The remaining dependent steps need grid-wide dependencies, so local folds cannot reach the 2-4 ms per window
+that was hoped for. See [docs/window-step-folds.md](docs/window-step-folds.md).
+
+## D-045: HTTP serving on the tiled MTP route
+
+`--http-serve` keeps one decoder process: model, MTP assets and the predictor qualification (calibration
+replay of the command-line prompt) are set up once, then OpenAI-compatible (`/v1/chat/completions`,
+`/v1/completions`) and Anthropic-compatible (`/v1/messages`) requests run one at a time, with streaming,
+health, Prometheus metrics and a JSON status (docs/serving.md). Each request starts exactly like the
+command-line request after calibration: fresh target state and session, fresh predictor, and the verify
+windows drop any deferred GDN rows of the previous request (`HipMtpWindowVerifier::begin_session`); the
+prefix state cache spans requests. The tokenizer (byte-level BPE with the model's split rule) and the chat
+template (thinking on/off, reasoning effort, tools and tool calls) are native host code read from the GGUF;
+the template is checked byte for byte against renders of the embedded template, the tokenizer against
+reference encodings of a multilingual corpus.
+
+Why: one load per process instead of per request, and a standard interface for chat clients and agents,
+without changing what is computed: a served request is the command-line request.
+
+Checked on one Strix Halo node (dense-A8 profile, T=16 blocks, prefix cache every 16 tokens, windows
+2/4/8): two chat prompts of 38 tokens served in one process give the command-line token IDs up to the stop
+token (63 and 88 tokens), also when repeated with 16 or 32 prompt tokens restored from the prefix cache and
+when two clients (one streamed) send at the same time. The command line stops only at `--eos-token`
+(default `<|endoftext|>`); the server also stops at `<|im_end|>`. No timing campaign was run; sampling and
+batched decode of concurrent requests are separate routes.
+
+## D-046: int8 attention KV cache with per-token scales (kv-int8-tok-v1)
+
+`--attention-kv-storage kv-int8-tok-v1` stores the target model's QSA attention KV cache as int8 codes with one
+FP32 scale per token, KV head and K/V half: per (token, head, half), `s = max|x| / 127` over the 256 BF16-rounded
+values and `code = clamp(rint(x / s), -127, 127)`; readers use `float(code) * s` where the BF16 cache uses the BF16
+value. A KV row is 1040 instead of 2048 bytes, 12480 instead of 24576 bytes per token over the 12 layers. The
+storage is a field of the model contract (`attention_kv_storage`), so every KV size (session layout, layer
+slices, snapshots, MTP checkpoints and rollbacks) derives from it; it enters the execution and session-layout
+identities (prefix-cache keys), the indexed-attention implementation identity and the MTP golden's recorded
+target profile pair, and the receipt (`attention_kv_storage`, `attention_kv_bytes_per_token`,
+`attention_kv_storage_qualification: not_assessed`). Without the flag nothing changes. The MTP head keeps its
+BF16 KV cache; the indexer never reads the KV cache. See [docs/attention-kv-int8.md](docs/attention-kv-int8.md).
+
+Why: the KV cache is the per-token state that grows with context; halving it doubles the context that fits in a
+given state budget and halves the KV bytes the score/value kernels read. The quantizer's maximum is
+order-independent and every kernel form keeps its arithmetic order with the dequantized element, so the decode,
+window and prefill-group kernels stay bit-identical to one another and the tiled routes keep reproducing the
+serial rows within the new identity.
+
+Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL), profile `hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1`:
+
+| Check | Result |
+| --- | --- |
+| BF16 default, new binary vs base, teacher-forced 1600 tokens, tiled T=256 | Logits file byte-identical |
+| BF16 default, MTP golden dump (43-token prompt) and MTP windows + plain decode, 128 tokens, base vs new | Same golden SHA-256, same tokens |
+| kv-int8-tok-v1, teacher-forced 1600 tokens, tiled T=256 vs serial route | Logits file byte-identical |
+| kv-int8-tok-v1, MTP windows (rows 2/4/8, golden dumped under the identity), 128 tokens | Replay error 0 (hidden and logit), tokens equal the serial decode with the automatic v5 organization |
+| Device fixture (`strix-hip-attention-kv-int8-tests`) | Writers equal the host quantizer; decode, 8-row window and 16-row prefill-group kernels bitwise equal |
+| Quality vs BF16 KV, teacher-forced 16K wiki (T=2048) | Top-1 agreement 97.08%, mean KL 0.0054, mean NLL 1.6116 → 1.6103 |
+| Quality vs BF16 KV, teacher-forced 16K code (T=2048) | Top-1 agreement 98.24%, mean KL 0.0058, mean NLL 0.5498 → 0.5497 |
+| KL by position (16K) | No growth with depth: wiki 0.0054 / 0.0052 / 0.0056, code 0.0106 / 0.0046 / 0.0056 for 0-2K / 2-8K / 8-16K |
+
+For scale, the dense-A8 profile against the FP32-dense profile on the same 16K documents measures 96.7-98.1%
+top-1 agreement and mean KL 0.0066-0.0069. Speed was not measured (deferred to the combined campaign).
+
+It does not run with the fast prefill QSA component, which reads BF16 keys and values, and is not admitted with
+cohort windows, the prefix state cache or HTTP serving, which were not checked under the identity.
 
 ## Measured and rejected
 
@@ -541,3 +773,4 @@ with the automatic organization, tiled route with the explicit v5 flag set; F = 
 | X-012 | `--model-copy-tier experts`, `--staged-moe-router-logits` on the serial path | slower | Not used in the measured configuration. |
 | X-013 | `--mtp-spec-min-p` 0.7, 0.75, 0.8, 0.88, 0.9 | lower tok/s | 0.85 is the measured optimum (D-022). |
 | X-014 | Token-tree verify windows (draft runner-up as a sibling row, leaf or with a chain) | offline sizing, not built | Over code, en, es, fr and agent prompts (256 tokens each, the recommended MTP configuration) rejections are ~0.43 per cycle everywhere and the runner-up is right in 15-55 % of them; a free sibling at the actual rejection depth would add at most 5-8 % tokens per cycle. Verify rows are not free (~5.6 ms per extra row, the routed expert union grows with rows) and windows have no spare rows (most prose windows are R2), so simulated rate change is -1.8 to +1.3 % with 2/4/8 owners and -1.5 to +0.9 % against a chain with owners of every size. Prose yields fewer tokens per cycle because its chains are shorter, not because its rejections differ. Diagnostic: `STRIX_MTP_DRAFT_LOG=1 STRIX_MTP_DRAFT_TOP2=1`. |
+| X-015 | Q8 instead of the Q4_0 copy of the MTP draft head subset (always, from depth 1, 2 or 3, only with a zh/ja pack, only without a pack) | simulated -1.6 % to -0.1 % | The Q8 head costs about 2x per draft step (+0.22/+0.29/+0.39 ms at 37k/49k/65k rows, `strix-hip-mtp-draft-head-tests --bench-precision`) and, even at no cost, gains nothing beyond trajectory noise on 10 prompts (full-chain logs). Keep `--mtp-draft-q4`; Q5/Q6 are bounded by Q8. |

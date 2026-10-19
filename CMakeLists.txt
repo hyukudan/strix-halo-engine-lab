@@ -167,6 +167,7 @@ add_library(strix_core STATIC
     src/mtp_forward_contract.cpp
     src/mtp_forward_golden_file.cpp
     src/mtp_target_window_policy.cpp
+    src/mtp_window_controller.cpp
     src/mtp_sidecar_binding.cpp
     src/mtp_forward_semantics.cpp
     src/mtp_forward_runtime.cpp
@@ -250,6 +251,24 @@ add_executable(strix-inspect-gguf apps/inspect_gguf_main.cpp)
 target_link_libraries(strix-inspect-gguf PRIVATE strix_core)
 strix_target_warnings(strix-inspect-gguf)
 
+# Host-only serving front end (no GPU): JSON, tokenizer, chat template, HTTP and the API mapping.
+add_library(strix_serve STATIC
+    src/serve/json.cpp
+    src/serve/bpe_tokenizer.cpp
+    src/serve/chat_template.cpp
+    src/serve/http_server.cpp
+    src/serve/engine.cpp
+    src/serve/api.cpp
+)
+target_include_directories(strix_serve PUBLIC include PRIVATE src/serve)
+target_compile_features(strix_serve PUBLIC cxx_std_20)
+target_link_libraries(strix_serve PUBLIC Threads::Threads)
+strix_target_warnings(strix_serve)
+
+add_executable(strix-tokenize apps/tokenize_main.cpp)
+target_link_libraries(strix-tokenize PRIVATE strix_serve)
+strix_target_warnings(strix-tokenize)
+
 add_executable(strix-mtp-manifest-audit apps/mtp_manifest_audit_main.cpp)
 target_link_libraries(strix-mtp-manifest-audit PRIVATE strix_core)
 strix_target_warnings(strix-mtp-manifest-audit)
@@ -290,6 +309,15 @@ if(BUILD_TESTING OR STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE OR STRIX_ENABLE_EXPERI
     endif()
 endif()
 if(BUILD_TESTING)
+    add_executable(strix-serve-frontend-tests tests/serve_frontend_tests.cpp)
+    target_link_libraries(strix-serve-frontend-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-serve-frontend-tests)
+    add_test(NAME strix-serve-frontend-tests COMMAND strix-serve-frontend-tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/serve/chat_template_cases.json)
+    add_executable(strix-serve-api-tests tests/serve_api_tests.cpp)
+    target_link_libraries(strix-serve-api-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-serve-api-tests)
+    add_test(NAME strix-serve-api-tests COMMAND strix-serve-api-tests)
     add_executable(strix-teacher-logit-spool-tests tests/teacher_logit_spool_tests.cpp)
     target_compile_features(strix-teacher-logit-spool-tests PRIVATE cxx_std_20)
     target_include_directories(strix-teacher-logit-spool-tests PRIVATE include)
@@ -1136,6 +1164,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-mtp-target-window-policy-tests)
     add_test(NAME strix-mtp-target-window-policy-tests COMMAND strix-mtp-target-window-policy-tests)
 
+    add_executable(strix-mtp-window-controller-tests tests/mtp_window_controller_tests.cpp)
+    target_link_libraries(strix-mtp-window-controller-tests PRIVATE strix_core)
+    strix_target_warnings(strix-mtp-window-controller-tests)
+    add_test(NAME strix-mtp-window-controller-tests COMMAND strix-mtp-window-controller-tests)
+
     add_executable(strix-mtp-sidecar-binding-tests tests/mtp_sidecar_binding_tests.cpp)
     target_link_libraries(strix-mtp-sidecar-binding-tests PRIVATE strix_core)
     strix_target_warnings(strix-mtp-sidecar-binding-tests)
@@ -1522,7 +1555,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_include_directories(strix-hip-decode-token PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_link_libraries(
         strix-hip-decode-token
-        PRIVATE strix_hip_runtime
+        PRIVATE strix_hip_runtime strix_serve
     )
     strix_target_warnings(
         strix-hip-decode-token
@@ -1538,13 +1571,13 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             STRIX_DECODE_ENTRY=strix_hip_decode_token_entry STRIX_MTP_MODEL_QUALIFICATION_RUNNER=1)
         target_include_directories(strix-hip-mtp-model-qualification PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
         target_link_libraries(strix-hip-mtp-model-qualification PRIVATE
-            strix_hip_runtime strix_mtp_projection_component_fixtures)
+            strix_hip_runtime strix_mtp_projection_component_fixtures strix_serve)
         target_compile_options(strix-hip-mtp-model-qualification PRIVATE
             "SHELL:-include \"${CMAKE_CURRENT_SOURCE_DIR}/include/strix/hip_runtime_telemetry.hpp\"")
         strix_target_warnings(strix-hip-mtp-model-qualification)
         add_executable(strix-hip-mtp-qualification-reference-tests tests/hip_mtp_qualification_reference_tests.hip)
         target_link_libraries(strix-hip-mtp-qualification-reference-tests PRIVATE
-            strix_hip_runtime strix_mtp_projection_component_fixtures)
+            strix_hip_runtime strix_mtp_projection_component_fixtures strix_serve)
         set_target_properties(strix-hip-mtp-qualification-reference-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
         strix_target_warnings(strix-hip-mtp-qualification-reference-tests)
@@ -1956,6 +1989,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_test(NAME strix-hip-known-window-tests COMMAND strix-hip-known-window-tests)
         add_test(NAME strix-hip-known-window-hc-persistent-tests COMMAND strix-hip-known-window-tests --hc-rows)
         set_tests_properties(strix-hip-known-window-hc-persistent-tests PROPERTIES ENVIRONMENT "STRIX_HC_PERSISTENT=1;STRIX_HC_PERSISTENT_INJECT=1")
+        add_test(NAME strix-hip-known-window-fold-tests COMMAND strix-hip-known-window-tests --window-folds)
         add_executable(strix-hip-qsa-block-select-tests tests/hip_qsa_block_select_tests.hip)
         set_target_properties(strix-hip-qsa-block-select-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
@@ -1965,6 +1999,15 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         strix_target_warnings(strix-hip-qsa-block-select-tests)
         add_test(NAME strix-hip-qsa-block-select-tests COMMAND strix-hip-qsa-block-select-tests)
         set_tests_properties(strix-hip-qsa-block-select-tests PROPERTIES SKIP_RETURN_CODE 77)
+        add_executable(strix-hip-attention-kv-int8-tests tests/hip_attention_kv_int8_tests.hip)
+        set_target_properties(strix-hip-attention-kv-int8-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-attention-kv-int8-tests PRIVATE strix_hip_runtime)
+        target_compile_definitions(strix-hip-attention-kv-int8-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
+        target_compile_options(strix-hip-attention-kv-int8-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math)
+        strix_target_warnings(strix-hip-attention-kv-int8-tests)
+        add_test(NAME strix-hip-attention-kv-int8-tests COMMAND strix-hip-attention-kv-int8-tests)
+        set_tests_properties(strix-hip-attention-kv-int8-tests PROPERTIES SKIP_RETURN_CODE 77)
 
         # Full-model qualification is explicit and requires a model and teacher;
         # it is intentionally absent from the automatic device regression.

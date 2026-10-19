@@ -35,6 +35,12 @@ void add_to_total(MemoryBreakdown& plan, std::uint64_t value) {
 }  // namespace
 
 std::uint64_t base_kv_bytes_per_token(const ModelContract& model) {
+    if (model.attention_kv_storage == AttentionKvStorage::int8_token) {
+        // Per layer: int8 K and V codes plus one FP32 scale per KV head and half.
+        const auto codes = product({model.kv_heads, model.head_dim, 2});
+        const auto scales = product({model.kv_heads, 2, model.bytes_fp32});
+        return product({model.full_attention_layers, checked_add(codes, scales)});
+    }
     return product({model.full_attention_layers, model.kv_heads, model.head_dim,
                     2, model.bytes_bf16});
 }

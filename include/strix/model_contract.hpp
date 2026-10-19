@@ -5,6 +5,16 @@
 
 namespace strix {
 
+// Storage of the target model's QSA attention KV cache (the MTP head keeps its
+// own BF16 cache). bf16 is the canonical model dtype. int8_token is the opt-in
+// kv-int8-tok-v1 identity: per token, per KV head and per K/V half, symmetric
+// int8 codes of the BF16-rounded values with one FP32 scale (absmax / 127).
+enum class AttentionKvStorage : std::uint32_t { bf16 = 0, int8_token = 1 };
+
+[[nodiscard]] constexpr const char* attention_kv_storage_name(AttentionKvStorage storage) noexcept {
+    return storage == AttentionKvStorage::int8_token ? "kv-int8-tok-v1" : "bf16";
+}
+
 // Captured from the official Qwen config pinned in artifacts/. These values
 // describe shapes only; they do not define operator semantics.
 struct ModelContract {
@@ -56,6 +66,7 @@ struct ModelContract {
     bool gdn_conv_silu = true;
     std::uint64_t bytes_bf16 = 2;
     std::uint64_t bytes_fp32 = 4;
+    AttentionKvStorage attention_kv_storage = AttentionKvStorage::bf16;
 
     [[nodiscard]] static ModelContract qwen38_flash_next();
 

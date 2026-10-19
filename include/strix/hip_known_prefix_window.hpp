@@ -96,7 +96,10 @@ public:
         const HipMtpTargetWindowCapturePolicy&);
     [[nodiscard]] HipMtpTargetWindowExecution execute_mtp_captured(SerialSessionContext&,
         std::span<const std::uint32_t>,std::shared_ptr<HipMtpTargetWindowCapture>,
-        const std::function<void()>& before_publish = {});
+        const std::function<void()>& before_publish = {},std::uint32_t active_rows = 0);
+    // active_rows (2..logical_rows, 0 = all): rows from active_rows on are padding. They run the dense
+    // projections but stay out of the routed expert union (zero routed output), so the caller must not
+    // accept them; every committed prefix must end before active_rows.
     // Opt-in device greedy selection enqueued right after the multi-row terminal
     // head (KnownWindowRequest::lm_head_rows); logits stay materialised. After each
     // successful execute, replies[r] (host-mapped coherent, logical_rows entries)
@@ -120,6 +123,9 @@ public:
     void commit_prefix(std::uint32_t n_keep);
     // Applies pending GDN rows before any ordinary serial token touches GDN state.
     void flush_deferred();
+    // Drops pending GDN rows without applying them: the session state they belong to was
+    // replaced (a new request starts from a fresh state).
+    void discard_deferred();
     // Before either owner executes: adopt primary's deferred GDN rows/control so
     // windows of different sizes over one session continue one pending protocol.
     // flush_deferred() must then run on an owner that has executed a window.

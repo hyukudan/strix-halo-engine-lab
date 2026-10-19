@@ -31,6 +31,7 @@
 #include "strix/hip_runtime_allocator.hpp"
 #include "strix/hip_session_snapshot_transfer.hpp"
 #include "strix/launch_dispatch.hpp"
+#include "strix/memory_plan.hpp"
 #include "strix/mapped_model_file.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/model_content_hash.hpp"
@@ -61,6 +62,7 @@
 #include "hip_decode_experiment.hpp"
 #include "hip_decode_options.hpp"
 #include "hip_mtp_decode_bridge.hpp"
+#include "hip_http_serve.hpp"
 #include "hip_prefix_state_cache.hpp"
 #include "hip_mtp_cohort_bridge.hpp"
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
@@ -1012,6 +1014,9 @@ int STRIX_DECODE_ENTRY(
             "  --record-state-policy final|each --prefix-cache-roundtrip\n"
             "  --prefix-cache-host-bytes N [--prefix-cache-dir DIR [--prefix-cache-disk-bytes N]] [--prefix-cache-every N]\n"
             "      [--prefix-cache-then-prompt FILE ...] (block-boundary prefix state cache, tiled known-prefix prefill only)\n"
+            "  --http-serve [--http-bind ADDR] [--http-port N] [--http-model-id NAME] [--http-api-key-file FILE]\n"
+            "      [--http-sampling greedy|reject] [--http-default-max-tokens N] [--http-max-queue N] [--http-max-connections N]\n"
+            "      (OpenAI/Anthropic-compatible HTTP server on the tiled MTP route; the prompt is the calibration prompt)\n"
             "  --prefetch-q8-qsa-input (opt-in exact-tree Q8 input projections)\n"
             "  --prefetch-q8-shared-expert (opt-in exact-tree Q8 gate/up/down)\n"
             "  --execution-mode eager|graph (default eager)\n"
@@ -1050,9 +1055,11 @@ int STRIX_DECODE_ENTRY(
     std::optional<strix::ExecutionPhaseScope> setup_phase;
     if (host_telemetry.enabled) setup_phase.emplace(strix::ExecutionPhase::admission);
 
-    const auto model =
+    auto model =
         strix::ModelContract::
             qwen38_flash_next();
+    // Opt-in KV identity: every state size, layout/execution identity and launcher derives from it.
+    model.attention_kv_storage = options.attention_kv_storage;
 
     const auto generation_eos =
         options.eos_token.value_or(
@@ -1171,6 +1178,7 @@ int STRIX_DECODE_ENTRY(
     strix::decode_cli::validate_resolved_gdn_islands(options);
     strix::decode_cli::validate_resolved_gdn_recurrent_layout(options);
     strix::decode_cli::validate_resolved_gdn_recurrent_storage(options);
+    strix::decode_cli::validate_resolved_attention_kv_storage(options);
     strix::decode_cli::validate_resolved_qsa_hierarchical_selection(options);
     strix::decode_cli::validate_resolved_qsa_gqa(options);
     strix::decode_cli::validate_resolved_known_prefix_window(options);
@@ -2752,6 +2760,9 @@ int STRIX_DECODE_ENTRY(
             return 0;
         }
         auto make_window = window_factory_for(parents, {});
+        if (options.http_serve)
+            parents->serve = strix::decode_cli::make_http_serve(options, "native MTP greedy decode, profile " +
+                std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens));
         setup_phase.reset();
         // --mtp-sample-repeats N: N independent requests (seeds seed..seed+N-1), each from a fresh
         // session over the same loaded model; one receipt per request.
@@ -2794,8 +2805,12 @@ int STRIX_DECODE_ENTRY(
     }
     const auto gdn_recurrent_layout_receipt = [&]() -> std::string {
         std::string storage;
+        if (model.attention_kv_storage != strix::AttentionKvStorage::bf16)
+            storage = std::string("  \"attention_kv_storage\":\"") + strix::attention_kv_storage_name(model.attention_kv_storage) +
+                "\",\n  \"attention_kv_bytes_per_token\":" + std::to_string(strix::base_kv_bytes_per_token(model)) +
+                ",\n  \"attention_kv_storage_qualification\":\"not_assessed\",\n";
         if (options.gdn_recurrent_storage != strix::GdnRecurrentStorage::key_value)
-            storage = "  \"gdn_recurrent_storage\":\"value-key\",\n  \"gdn_recurrent_storage_qualification\":\"not_assessed\",\n";
+            storage += "  \"gdn_recurrent_storage\":\"value-key\",\n  \"gdn_recurrent_storage_qualification\":\"not_assessed\",\n";
         if (options.gdn_recurrent_layout == strix::HipGdnRecurrentLayout::baseline) return storage;
         return storage + "  \"gdn_recurrent_layout\": \"" +
             std::string(strix::gdn_recurrent_layout_marker(options.gdn_recurrent_layout)) + "\",\n"

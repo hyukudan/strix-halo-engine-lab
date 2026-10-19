@@ -268,6 +268,8 @@ struct Options {
     bool serving_request_explicit = false, serving_headroom_explicit = false;
     strix::GdnRecurrentStorage gdn_recurrent_storage = strix::GdnRecurrentStorage::key_value;
     bool gdn_recurrent_storage_explicit = false;
+    strix::AttentionKvStorage attention_kv_storage = strix::AttentionKvStorage::bf16;
+    bool attention_kv_storage_explicit = false;
     std::uint32_t known_prefix_rows = 2;
     bool known_prefix_rows_explicit = false;
     std::uint32_t ple_cpu_helper_threads = 0;
@@ -315,6 +317,18 @@ struct Options {
     std::uint64_t prefix_cache_every = 0;  // 0: every max(T, 4096) tokens, rounded to a multiple of T
     std::vector<std::string> prefix_cache_then_prompts;
     bool prefix_cache_disk_bytes_explicit = false, prefix_cache_every_explicit = false;
+    // HTTP serving (docs/serving.md): after the MTP calibration replay the process serves
+    // OpenAI/Anthropic-compatible requests until SIGINT/SIGTERM. The command-line prompt is the
+    // calibration prompt only. Port 0 binds any free port (printed on stderr).
+    bool http_serve = false;
+    std::uint32_t http_port = 8080;
+    std::string http_bind = "127.0.0.1";
+    std::string http_model_id = "qwen3.8-flash-next";
+    std::string http_api_key_file;
+    std::string http_sampling = "greedy";  // temperature > 0: "greedy" (downgrade, noted) or "reject"
+    std::uint32_t http_default_max_tokens = 4096;
+    std::uint32_t http_max_queue = 64;
+    std::uint32_t http_max_connections = 64;
 };
 
 // The wrapper can omit a terminal stateless head without allocating a GPU
@@ -644,6 +658,17 @@ inline void validate_prefix_state_cache(const Options& o) {
         throw std::invalid_argument("at most 64 --prefix-cache-then-prompt requests");
 }
 
+// HTTP serving runs the tiled MTP route: one calibration replay, then one request at a time.
+inline void validate_http_serve(const Options& o) {
+    if (!o.http_serve) return;
+    if (!mtp_tiled_prompt(o) || !o.mtp.golden_dump.empty() || o.mtp.metadata_only)
+        throw std::invalid_argument("--http-serve requires the tiled MTP route (--mtp with a calibration golden, "
+            "--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T)");
+    if (o.http_port > 65535U || o.http_bind.empty() || o.http_model_id.empty() || !o.http_default_max_tokens ||
+        !o.http_max_queue || !o.http_max_connections || (o.http_sampling != "greedy" && o.http_sampling != "reject"))
+        throw std::invalid_argument("--http-* values: port <= 65535, non-empty bind/model id, positive limits, sampling greedy|reject");
+}
+
 inline void validate_known_prefill_options(const Options& options) {
     const bool any = options.known_prefix_prefill_explicit || options.known_prefix_prefill_rows || !options.known_prefix_tail_rows.empty() ||
         options.known_prefill_workspace_explicit || options.known_prefill_metadata_explicit ||
@@ -805,6 +830,31 @@ inline void validate_resolved_qsa_hierarchical_selection(const Options& options)
         throw std::invalid_argument("hierarchical QSA requires eager D1 without integer head or roundtrip and context<=131072");
 }
 
+// kv-int8-tok-v1 is admitted on the routes whose KV writers and readers implement it and
+// were checked with it: eager C1 decode (including the automatic v5 organization), the
+// known-prefix windows and tiled prefill, teacher-forced scoring and prefix-accepting MTP
+// windows. Everything else is rejected.
+inline void validate_resolved_attention_kv_storage(const Options& options) {
+    if (options.attention_kv_storage == strix::AttentionKvStorage::bf16) return;
+    if (options.attention_kv_storage != strix::AttentionKvStorage::int8_token)
+        throw std::invalid_argument("attention KV storage must be bf16 or kv-int8-tok-v1");
+    if (options.execution.mode != strix::DecodeExecutionMode::eager ||
+        options.execution.integer_head != strix::DecodeIntegerHead::none || options.gpu_greedy_token || options.prefix_cache_roundtrip ||
+        options.prompt_lookup || !options.serving_prefix_files.empty() || options.serving_concurrency != 1 ||
+        options.serving_tensor_cohort_rows != 1 || options.serving_prefill_rows ||
+        options.qsa_gqa_heads_per_block != 1 || options.qsa_hierarchical_selection ||
+        !options.reference_path.empty() || !options.raw_recording_path.empty() ||
+        !options.offline_tuning_cache_path.empty() || !options.offline_compile_provenance_path.empty())
+        throw std::invalid_argument("kv-int8-tok-v1 requires eager C1 decode, known-prefix windows/prefill or MTP windows "
+            "without graph/integer head, GPU greedy, prefix cache, prompt lookup, serving, QSA GQA/hierarchical, "
+            "RAW/reference or offline tuning");
+    // The fast prefill QSA component reads BF16 keys and values; its identity would not describe an int8 cache.
+    if ((numerical_profile_pair(options).fast_components & strix::kFastPrefillQsa) != 0U)
+        throw std::invalid_argument("kv-int8-tok-v1 cannot run with the fast prefill QSA component");
+    if (!options.mtp.cohort.empty() || prefix_state_cache_requested(options) || options.http_serve)
+        throw std::invalid_argument("kv-int8-tok-v1 is not admitted with cohort windows, the prefix state cache or HTTP serving");
+}
+
 inline void validate_resolved_gdn_recurrent_storage(const Options& options) {
     strix::validate_gdn_recurrent_storage(options.gdn_recurrent_storage);
     if (options.gdn_recurrent_storage != strix::GdnRecurrentStorage::key_value &&
@@ -962,7 +1012,7 @@ inline Options parse_options(
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1] [--prefill-numerical-profile NAME] "
             "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] "
-            "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-window-router-rows] [--known-prefix-prefill-rows 16..2048 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
+            "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--attention-kv-storage bf16|kv-int8-tok-v1] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-window-router-rows] [--known-prefix-prefill-rows 16..2048 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N [--unqualified-context]] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert|experts --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
@@ -1276,6 +1326,32 @@ inline Options parse_options(
             }
             continue;
         }
+        if (argument == "--http-serve") {
+            if (options.http_serve) throw std::invalid_argument("duplicate --http-serve");
+            options.http_serve = true;
+            continue;
+        }
+        if (argument == "--http-port" || argument == "--http-bind" || argument == "--http-model-id" ||
+            argument == "--http-api-key-file" || argument == "--http-sampling" || argument == "--http-default-max-tokens" ||
+            argument == "--http-max-queue" || argument == "--http-max-connections") {
+            if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
+                throw std::invalid_argument(std::string(argument) + " requires a value");
+            const std::string_view value = argv[++index];
+            const auto u32 = [&](const char* what) {
+                const auto parsed = parse_u64(value, what);
+                if (parsed > UINT32_MAX) throw std::invalid_argument(std::string(what) + " exceeds uint32");
+                return static_cast<std::uint32_t>(parsed);
+            };
+            if (argument == "--http-port") options.http_port = u32("HTTP port");
+            else if (argument == "--http-bind") options.http_bind = value;
+            else if (argument == "--http-model-id") options.http_model_id = value;
+            else if (argument == "--http-api-key-file") options.http_api_key_file = value;
+            else if (argument == "--http-sampling") options.http_sampling = value;
+            else if (argument == "--http-default-max-tokens") options.http_default_max_tokens = u32("HTTP default max tokens");
+            else if (argument == "--http-max-queue") options.http_max_queue = u32("HTTP queue");
+            else options.http_max_connections = u32("HTTP connections");
+            continue;
+        }
         if (argument == "--serve-prefix-u32le") {
             if (index + 1 >= argc || options.serving_prefix_files.size() >= 64)
                 throw std::invalid_argument("serving prefix requires a file and at most64 requests");
@@ -1504,6 +1580,19 @@ inline Options parse_options(
         if (argument == "--known-prefix-window") {
             if (options.known_prefix_window) throw std::invalid_argument("duplicate known-prefix window option");
             options.known_prefix_window = true;
+            continue;
+        }
+        if (argument == "--attention-kv-storage" || argument.starts_with("--attention-kv-storage=")) {
+            if (options.attention_kv_storage_explicit) throw std::invalid_argument("duplicate attention KV storage option");
+            std::string_view value;
+            if (argument == "--attention-kv-storage") {
+                if (index + 1 >= argc) throw std::invalid_argument("attention KV storage requires a value");
+                value = argv[++index];
+            } else value = argument.substr(std::string_view("--attention-kv-storage=").size());
+            if (value == "bf16") options.attention_kv_storage = strix::AttentionKvStorage::bf16;
+            else if (value == "kv-int8-tok-v1") options.attention_kv_storage = strix::AttentionKvStorage::int8_token;
+            else throw std::invalid_argument("attention KV storage must be bf16 or kv-int8-tok-v1");
+            options.attention_kv_storage_explicit = true;
             continue;
         }
         if (argument == "--gdn-recurrent-storage" || argument.starts_with("--gdn-recurrent-storage=")) {
@@ -2122,6 +2211,7 @@ inline Options parse_options(
     validate_prefill_numerical_profile_cli(options);
     validate_mtp_cli(options);
     validate_prefix_state_cache(options);
+    validate_http_serve(options);
     return options;
 }
 

@@ -36,9 +36,10 @@ motor está pensado para funcionar por completo en una sola Strix Halo sin el tr
 [TensorMeld](https://github.com/hyukudan/tensormeld); el funcionamiento multinodo y otras GPUs son etapas aparte,
 cualificadas explícitamente. Primera prioridad: el mejor rendimiento correcto de extremo a extremo en hardware AMD.
 
-> **Estado: motor de investigación.** Funciona de principio a fin y los números de abajo son medidos, pero la
-> interfaz es una herramienta de línea de comandos que recibe IDs de token e imprime un recibo JSON. Todavía no
-> hay servidor de chat; ver la [hoja de ruta](#hoja-de-ruta).
+> **Estado: motor de investigación.** Funciona de principio a fin y los números de abajo son medidos. La interfaz
+> principal es una herramienta de línea de comandos que recibe IDs de token e imprime un recibo JSON; `--http-serve`
+> convierte el mismo proceso en un servidor HTTP compatible con las API de OpenAI y Anthropic (una petición cada vez,
+> greedy; ver [docs/serving.md](docs/serving.md)).
 
 ## Contenido
 
@@ -300,7 +301,10 @@ El registro completo, con alternativas, evidencia y la condición para reabrir c
 En curso, sin un orden concreto y sin números prometidos:
 
 - **Caché de prefijos con estado GDN** *(ya integrada, D-035)*: una petición cuyo prompt empieza por un prefijo en caché restaura el estado completo del modelo en un límite de bloque del prefill por bloques y solo lee el resto, con salida idéntica bit a bit (`--prefix-cache-host-bytes N`, opcional `--prefix-cache-dir DIR`; ver [docs/prefix-state-cache.md](docs/prefix-state-cache.md)). Los tiempos llegarán con la próxima campaña de medidas.
-- **Panel de monitorización**: vista en vivo de peticiones, velocidad y memoria.
+- **Servidor HTTP** *(primera versión)*: `--http-serve` sirve chat/completions, completions y messages con streaming,
+  con el tokenizador y la plantilla de chat del propio modelo (pensamiento sí/no, llamadas a herramientas), decodificación
+  MTP y la caché de estado de prefijos entre peticiones. La salida en tokens es idéntica a la de la línea de comandos
+  ([docs/serving.md](docs/serving.md)). El muestreo y las peticiones en lote vienen después.- **Panel de monitorización**: vista en vivo de peticiones, velocidad y memoria.
 - **Varias peticiones a la vez**.
 - **Caché KV en int8**.
 - **Muestreo con decodificación especulativa** (hoy la decodificación es voraz).
