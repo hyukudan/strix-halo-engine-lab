@@ -230,6 +230,12 @@ KV head and K/V half: 12480 instead of 24576 bytes per token. It is a separate, 
 the execution, state-layout and MTP golden identities. See [docs/attention-kv-int8.md](docs/attention-kv-int8.md)
 (D-046).
 
+`--mtp-ngram-draft` lets a continuation found earlier in the context extend a draft chain that stopped early, inside
+the same verify window; it pays on requests that copy their context (correcting a given document) and stays closed
+elsewhere (D-047, opt-in). `--dense-q6p-pack` reads 6.5-bit copies of the dense weights with the same bits as a
+6-bit emulated checkpoint (D-048, a draft until its timing and quality decision). Sampled decisions run on the GPU
+by default (D-050).
+
 ## How it works
 
 **One decode cycle.** The predictor drafts until it is no longer confident; a cost model picks the window size;
@@ -303,9 +309,9 @@ In progress, in no particular order and without promised numbers:
   ([docs/serving.md](docs/serving.md)). Sampling and batched requests come next.
 - **Monitor panel**: live view of requests, speed and memory.
 - **Several requests at once**.
-- **KV cache in int8**.
-- **Sampling with speculative decoding** (today decoding is greedy).
-- **6-bit trunk** weights.
+- **KV cache in int8** *(opt-in, D-046)*.
+- **Sampling with speculative decoding** *(landed, D-040; decisions on the GPU, D-050)*.
+- **6-bit trunk** weights *(draft, D-048)*.
 
 ## FAQ
 
