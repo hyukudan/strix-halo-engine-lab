@@ -68,6 +68,10 @@ __device__ __forceinline__ float paired(Coefficient q,int4 a0,int4 a1,int s0,int
     return c0+c1;
 }
 
+// Row status (and prefill summary) bit set by the gate/up projection itself for a non-finite
+// (row, slot). The projection kernels' entry checks ignore it: another CTA of the same launch may
+// already have set it, and skipping on it would make the written bytes depend on CTA order.
+constexpr unsigned projection_nonfinite=8U;
 // The public component does not trust caller-provided device CSR contents.
 // Admit the complete <=80 assignment permutation before any projection CTA.
 __global__ void admit_csr(DeviceRows view,DeviceCsr csr,unsigned rows,unsigned experts,unsigned top_k) {
@@ -196,7 +200,7 @@ __global__ __launch_bounds__(256) void project_window(const unsigned char* gate,
     unsigned rows,unsigned hidden,unsigned outputs) {
     unsigned failure=csr.summary[0];
     for(unsigned r=0;r<rows;++r)failure|=*view.status[r];
-    if(failure||blockIdx.y>=csr.summary[2])return;
+    if((failure&~projection_nonfinite)||blockIdx.y>=csr.summary[2])return;
     const auto begin=csr.begins[blockIdx.y],count=csr.begins[blockIdx.y+1U]-begin,expert=csr.experts[blockIdx.y];
     __shared__ __align__(16) signed char local_codes[G][max_hidden];
     __shared__ __align__(16) float local_deltas[G][max_hidden/32U];
@@ -273,7 +277,7 @@ __global__ __launch_bounds__(256) void project_window(const unsigned char* gate,
                 const auto r=csr.rows[begin+group+a],slot=csr.slots[begin+group+a];
                 const float g=acc[0][a],u=acc[1][a],silu=(g/(1.0F+expf(-g)))*u;
                 view.output[r][(slot*2U)*outputs+out]=silu;view.output[r][(slot*2U+1U)*outputs+out]=u;
-                if(nonfinite(g)||nonfinite(u)||nonfinite(silu))atomicOr(view.status[r],8U);
+                if(nonfinite(g)||nonfinite(u)||nonfinite(silu))atomicOr(view.status[r],projection_nonfinite);
             }
         }
         if constexpr(A8Down) {
@@ -289,7 +293,7 @@ __global__ __launch_bounds__(256) void project_window(const unsigned char* gate,
                     const float hv=(g/(1.0F+expf(-g)))*u;
                     view.output[r][at+outputs]=u;
                     const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(hv)));
-                    if(bad!=0){view.output[r][at]=g;if(lane==0)atomicOr(view.status[r],8U);continue;}
+                    if(bad!=0){view.output[r][at]=g;if(lane==0)atomicOr(view.status[r],projection_nonfinite);continue;}
                     float x=fabsf(hv);
                     for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,__shfl_xor(x,stride,32));
                     const bool tiny=x>0.0F && x<0x1p-119F;
@@ -532,7 +536,7 @@ template<unsigned G,bool Q5K,unsigned Chunk=max_hidden/256U>
 __global__ __launch_bounds__(256) void project_prefill(const unsigned char* gate,const unsigned char* up,PrefillRows view,
     unsigned hidden,unsigned outputs) {
     const auto& csr=view.csr;
-    if(csr.summary[0]||blockIdx.x>=csr.summary[2])return;
+    if((csr.summary[0]&~projection_nonfinite)||blockIdx.x>=csr.summary[2])return;
     const unsigned tile_index=blockIdx.y;
     const auto begin=csr.begins[blockIdx.x],count=csr.begins[blockIdx.x+1U]-begin,expert=csr.experts[blockIdx.x];
     __shared__ __align__(16) signed char local_codes[G][max_hidden];
@@ -617,7 +621,7 @@ __global__ __launch_bounds__(256) void project_prefill(const unsigned char* gate
             const float hv=(g/(1.0F+expf(-g)))*u;
             output[at_slot+outputs]=u;
             const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(hv)));
-            if(bad!=0){output[at_slot]=g;if(lane==0){atomicOr(at(view.status,r),8U);atomicOr(csr.summary,8U);}continue;}
+            if(bad!=0){output[at_slot]=g;if(lane==0){atomicOr(at(view.status,r),projection_nonfinite);atomicOr(csr.summary,projection_nonfinite);}continue;}
             float x=fabsf(hv);
             for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,__shfl_xor(x,stride,32));
             const bool tiny=x>0.0F && x<0x1p-119F;
@@ -856,7 +860,7 @@ __global__ __launch_bounds__(32U*Waves) void project_prefill_wmma(const unsigned
     unsigned hidden,unsigned outputs) {
     constexpr unsigned Outs=8U*Waves,Groups=max_hidden/32U;
     const auto& csr=view.csr;
-    if(csr.summary[0]||blockIdx.x>=csr.summary[2])return;
+    if((csr.summary[0]&~projection_nonfinite)||blockIdx.x>=csr.summary[2])return;
     const auto begin=csr.begins[blockIdx.x],count=csr.begins[blockIdx.x+1U]-begin,expert=csr.experts[blockIdx.x];
     __shared__ union { WmmaRowsStage<Groups> s; float tile[2][wmma_batch][Outs]; } lds;
     __shared__ unsigned row_of[wmma_batch],slot_of[wmma_batch];
@@ -889,7 +893,7 @@ __global__ __launch_bounds__(32U*Waves) void project_prefill_wmma(const unsigned
         const float hv=(g/(1.0F+expf(-g)))*u;
         output[at_slot+outputs]=u;
         const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(hv)));
-        if(bad!=0){output[at_slot]=g;if(lane==0){atomicOr(at(view.status,r),8U);atomicOr(csr.summary,8U);}continue;}
+        if(bad!=0){output[at_slot]=g;if(lane==0){atomicOr(at(view.status,r),projection_nonfinite);atomicOr(csr.summary,projection_nonfinite);}continue;}
         float x=fabsf(hv);
         for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,__shfl_xor(x,stride,32));
         const bool tiny=x>0.0F && x<0x1p-119F;
@@ -1139,7 +1143,7 @@ template<bool Q5K>
 __global__ __launch_bounds__(256) void project_prefill_f16(const unsigned char* gate,const unsigned char* up,PrefillRows view,
     unsigned hidden,unsigned outputs) {
     const auto& csr=view.csr;
-    if(csr.summary[0]||blockIdx.y>=csr.summary[2])return;
+    if((csr.summary[0]&~projection_nonfinite)||blockIdx.y>=csr.summary[2])return;
     const unsigned begin=csr.begins[blockIdx.y],count=csr.begins[blockIdx.y+1U]-begin,expert=csr.experts[blockIdx.y];
     __shared__ __align__(16) F16Stage s;
     __shared__ F16Rows rows;
@@ -1225,7 +1229,7 @@ __global__ __launch_bounds__(256) void project_prefill_f16(const unsigned char* 
         float m=fabsf(hv);
         for(int stride=8;stride!=0;stride/=2)m=fmaxf(m,__shfl_xor(m,stride,32));
         if(live&&i==0U)atomicMax(reinterpret_cast<unsigned*>(at(view.down_sums,r))+slot,__float_as_uint(m));
-        if(live&&bad){atomicOr(at(view.status,r),8U);atomicOr(csr.summary,8U);}
+        if(live&&bad){atomicOr(at(view.status,r),projection_nonfinite);atomicOr(csr.summary,projection_nonfinite);}
     }
 }
 // The 32 FP16 weights of a Q8_0 down block (down_operands' byte selection, written without arrays).
