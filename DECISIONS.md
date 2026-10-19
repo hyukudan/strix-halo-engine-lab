@@ -751,6 +751,8 @@ Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL), profile `hc-spl
 | Quality vs BF16 KV, teacher-forced 16K wiki (T=2048) | Top-1 agreement 97.08%, mean KL 0.0054, mean NLL 1.6116 → 1.6103 |
 | Quality vs BF16 KV, teacher-forced 16K code (T=2048) | Top-1 agreement 98.24%, mean KL 0.0058, mean NLL 0.5498 → 0.5497 |
 | KL by position (16K) | No growth with depth: wiki 0.0054 / 0.0052 / 0.0056, code 0.0106 / 0.0046 / 0.0056 for 0-2K / 2-8K / 8-16K |
+| Teacher-forced NLL, 32K haystack (32055 rows, no logits file) | NLL 4.3611 → 4.2609; mean absolute per-row target-logprob difference 0.18 (0-2K) rising to 0.33 (24-32K), against 0.04-0.06 on the 16K wiki/code documents |
+| Long-document retrieval, 24 haystacks of 8K/16K/32K tokens (5 questions each), greedy 200 tokens | Full output identical to the BF16 KV on 24/24 haystacks; 116/120 correct in both |
 
 For scale, the dense-A8 profile against the FP32-dense profile on the same 16K documents measures 96.7-98.1%
 top-1 agreement and mean KL 0.0066-0.0069. Speed was not measured (deferred to the combined campaign).
