@@ -149,6 +149,7 @@ add_library(strix_core STATIC
     src/indexed_attention_workspace.cpp
     src/indexed_attention_state.cpp
     src/iq4_nl.cpp
+    src/q6p_registry.cpp
     src/launch_dispatch.cpp
     src/low_precision.cpp
     src/memory_plan.cpp
@@ -1401,6 +1402,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 
     add_library(strix_hip_runtime STATIC
         src/hip_host_upload_backend.cpp
+        src/hip_q6p_pack.cpp
         src/hip_runtime_allocator.cpp
         src/hip_sampled_target_logits_reader.cpp
         src/hip_session_snapshot_transfer.cpp

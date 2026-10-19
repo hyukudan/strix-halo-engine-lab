@@ -17,6 +17,8 @@
 #include <set>
 
 #include "strix/dispatch_resources.hpp"
+#include "strix/q6p_registry.hpp"
+#include "hip_q6p_weights.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -971,7 +973,7 @@ __global__ void batched_typed_hyper_projection_kernel(
 // Diagnostic parallel projection: independent fixed reduction identity. Each
 // wave owns a disjoint 640-feature tile, and registers reuse its input across R
 // output rows. Existing ordered kernels and their production dispatch stay intact.
-template <unsigned R, typename Acc, bool Injection>
+template <unsigned R, typename Acc, bool Injection, bool Q6 = false>
 __device__ __forceinline__ void splitk_hyper_lane_dots(
     const float* normalized, const void* weights, unsigned first, unsigned valid,
     unsigned tile, unsigned lane, Acc (&sums)[R]) {
@@ -1012,6 +1014,32 @@ __device__ __forceinline__ void splitk_hyper_lane_dots(
     } else {
         unsigned packed[R][5];
         float scales[R][5];
+        if constexpr (Q6) {
+            // Q6P32 copy of the down tensor: the same codes and scales, decoded once all loads are issued.
+            unsigned qs[R][5], qh[R][5];
+            unsigned short bits[R][5];
+            const unsigned m=lane%8U;
+#pragma unroll
+            for(unsigned r=0;r<R;++r) if(r<valid) {
+#pragma unroll
+                for(unsigned s=0;s<5U;++s) {
+                    const unsigned b=tile*20U+4U*s+lane/8U;
+                    const auto o=q6p::chunk_offsets(10240U,b/8U);
+                    const auto* row=static_cast<const unsigned char*>(weights)+static_cast<std::uint64_t>(first+r)*q6p::row_bytes(10240U);
+                    qs[r][s]=*reinterpret_cast<const unsigned*>(row+o.qs+16U*(b%8U)+4U*(m/2U));
+                    qh[r][s]=*reinterpret_cast<const unsigned*>(row+o.qh+8U*(b%8U)+4U*(m/4U));
+                    bits[r][s]=*reinterpret_cast<const unsigned short*>(row+o.d+2U*(b%8U));
+                }
+            }
+#pragma unroll
+            for(unsigned r=0;r<R;++r) if(r<valid) {
+#pragma unroll
+                for(unsigned s=0;s<5U;++s) {
+                    scales[r][s]=__half2float(__ushort_as_half(bits[r][s]));
+                    packed[r][s]=q6p::codes4(qs[r][s],qh[r][s],m);
+                }
+            }
+        } else
 #pragma unroll
         for(unsigned r=0;r<R;++r) if(r<valid) {
 #pragma unroll
@@ -1206,7 +1234,7 @@ __global__ __launch_bounds__(512) void deferred_hyper_projection_kernel(
     }
 }
 
-template <unsigned R, typename Acc>
+template <unsigned R, typename Acc, bool Q6 = false>
 __global__ __launch_bounds__(512) void splitk_hyper_projection_kernel(
     const float* __restrict__ normalized,const void* __restrict__ down,unsigned width,unsigned streams,
     unsigned rank,float* __restrict__ low,const void* __restrict__ inject,float* __restrict__ injection,unsigned low_blocks) {
@@ -1219,7 +1247,7 @@ __global__ __launch_bounds__(512) void splitk_hyper_projection_kernel(
     const auto* input=normalized+static_cast<std::uint64_t>(blockIdx.y)*width;
     Acc sums[R];
     if(is_inject)splitk_hyper_lane_dots<R,Acc,true>(input,inject,first,valid,tile,lane,sums);
-    else splitk_hyper_lane_dots<R,Acc,false>(input,down,first,valid,tile,lane,sums);
+    else splitk_hyper_lane_dots<R,Acc,false,Q6>(input,down,first,valid,tile,lane,sums);
     if(lane==0U) {
 #pragma unroll
         for(unsigned r=0;r<R;++r)if(r<valid)red[tile][r]=sums[r];
@@ -1592,19 +1620,37 @@ __device__ __forceinline__ void stage_tile16(unsigned char* __restrict__ stage,c
 
 // Exact output chains: one wave per stream and one lane per output feature.
 // Row tiles occupy 34*rank bytes; rank%32 makes every wave tile 16-aligned.
-template <typename Storage>
+// Q6: up is the Q6P32 copy (26*rank-byte tiles); same codes, scales and chain.
+template <bool Q6>
+__device__ __forceinline__ float lane_chain_scale(const unsigned char* row, std::uint32_t rank, std::uint32_t block);
+template <bool Q6>
+__device__ __forceinline__ std::uint64_t lane_chain_codes(const unsigned char* row, std::uint32_t rank, std::uint32_t block, std::uint32_t g);
+template <typename Storage, bool Q6 = false>
 __global__ void lane_chain_hyper_output_kernel(const float* normalized,const float* low,const void* up,
     std::uint32_t hidden,std::uint32_t streams,std::uint32_t rank,Storage* output){
     extern __shared__ __align__(16) unsigned char staging[];
     const auto lane=threadIdx.x&31U,stream=threadIdx.x/32U;
     const std::uint64_t row=blockIdx.y,first=static_cast<std::uint64_t>(blockIdx.x)*32U;
-    const std::uint64_t tile_bytes=34ULL*rank,row_bytes=static_cast<std::uint64_t>(rank/32U)*34U;
+    const std::uint64_t block_bytes=Q6?26U:34U;
+    const std::uint64_t tile_bytes=block_bytes*rank,row_bytes=static_cast<std::uint64_t>(rank/32U)*block_bytes;
     auto* stage=staging+stream*tile_bytes;
     const auto* source=static_cast<const unsigned char*>(up)+(static_cast<std::uint64_t>(stream)*hidden+first)*row_bytes;
     stage_tile16(stage,source,tile_bytes,lane);
     __syncthreads();
     float gate=0.0F;
     for(std::uint32_t block=0;block<rank/32U;++block){
+        if constexpr (Q6) {
+            const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes;
+            const float scale=lane_chain_scale<true>(weight,rank,block);
+            for(std::uint32_t g=0;g<4U;++g){
+                const auto codes=lane_chain_codes<true>(weight,rank,block,g);
+                for(std::uint32_t l=0;l<8U;++l){
+                    const float coefficient=scale*static_cast<float>(static_cast<signed char>(codes>>(8U*l)));
+                    gate+=low[row*rank+static_cast<std::uint64_t>(block)*32U+8U*g+l]*coefficient;
+                }
+            }
+            continue;
+        }
         const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes+static_cast<std::uint64_t>(block)*34U;
         const auto scale_bits=static_cast<unsigned short>(static_cast<unsigned>(weight[0])|(static_cast<unsigned>(weight[1])<<8U));
         const float scale=__half2float(__ushort_as_half(scale_bits));
@@ -1857,13 +1903,41 @@ __global__ void rows_batched_typed_hyper_projection_kernel(Rows rows, std::uint3
 
 // Split-K P1: weights stay in registers while every row replays the R1 lane
 // chain, the xor reduction and the ordered 16-tile block sum.
-template <unsigned R, bool Injection, class LoadX, class Rows>
+// Q6: weights is the Q6P32 copy of the Q8_0 down tensor; the same codes and
+// scales are decoded once all loads are in flight.
+template <unsigned R, bool Injection, class LoadX, class Rows, bool Q6 = false>
 __device__ __forceinline__ void rows_splitk_hyper_lane_dots(const Rows& rows, unsigned count,
     const void* weights, unsigned first, unsigned valid, unsigned tile, unsigned lane, float (*red)[16][R], LoadX&& load_x) {
     (void)rows;
     float4 w[Injection ? R : 1U][5];
     unsigned packed[Injection ? 1U : R][5];
     float scales[Injection ? 1U : R][5];
+    if constexpr (Q6 && !Injection) {
+        // Lane: block tile*20+4s+lane/8 of the row, its weights 4(lane%8)..+3.
+        unsigned qs[R][5], qh[R][5];
+        unsigned short bits[R][5];
+        const unsigned m=lane%8U;
+#pragma unroll
+        for (unsigned r=0;r<R;++r) if(r<valid) {
+#pragma unroll
+            for(unsigned s=0;s<5U;++s) {
+                const unsigned b=tile*20U+4U*s+lane/8U;
+                const auto o=q6p::chunk_offsets(10240U,b/8U);
+                const auto* row=static_cast<const unsigned char*>(weights)+static_cast<std::uint64_t>(first+r)*q6p::row_bytes(10240U);
+                qs[r][s]=*reinterpret_cast<const unsigned*>(row+o.qs+16U*(b%8U)+4U*(m/2U));
+                qh[r][s]=*reinterpret_cast<const unsigned*>(row+o.qh+8U*(b%8U)+4U*(m/4U));
+                bits[r][s]=*reinterpret_cast<const unsigned short*>(row+o.d+2U*(b%8U));
+            }
+        }
+#pragma unroll
+        for (unsigned r=0;r<R;++r) if(r<valid) {
+#pragma unroll
+            for(unsigned s=0;s<5U;++s) {
+                scales[r][s]=__half2float(__ushort_as_half(bits[r][s]));
+                packed[r][s]=q6p::codes4(qs[r][s],qh[r][s],m);
+            }
+        }
+    } else
 #pragma unroll
     for (unsigned r=0;r<R;++r) if(r<valid) {
 #pragma unroll
@@ -1923,7 +1997,7 @@ __device__ __forceinline__ void rows_splitk_hyper_lane_dots(const Rows& rows, un
     }
 }
 
-template <unsigned R, class Rows = HyperRows>
+template <unsigned R, class Rows = HyperRows, bool Q6 = false>
 __global__ __launch_bounds__(512) void rows_splitk_hyper_projection_kernel(Rows rows, unsigned count,
     const void* __restrict__ down, unsigned streams, unsigned rank, const void* __restrict__ inject, unsigned low_blocks) {
     __shared__ float red[kWindowRows][16][R];
@@ -1934,7 +2008,7 @@ __global__ __launch_bounds__(512) void rows_splitk_hyper_projection_kernel(Rows 
     const unsigned valid=remaining<R?remaining:R;
     const auto stored=[&](unsigned t,unsigned at){return *reinterpret_cast<const float4*>(tiled(rows.normalized[t], rows.tile_normalized, rows)+at);};
     if(is_inject)rows_splitk_hyper_lane_dots<R,true>(rows,count,inject,first,valid,tile,lane,red,stored);
-    else rows_splitk_hyper_lane_dots<R,false>(rows,count,down,first,valid,tile,lane,red,stored);
+    else rows_splitk_hyper_lane_dots<R,false,decltype(stored)&,Rows,Q6>(rows,count,down,first,valid,tile,lane,red,stored);
     __syncthreads();
     const unsigned t=threadIdx.x/R,r=threadIdx.x%R;
     if(t<count && r<valid) {
@@ -2084,13 +2158,29 @@ __global__ void rows_q8_batched_hyper_output_kernel(Rows rows, std::uint32_t cou
 // One staged up tile per block; each stream wave runs every row's R1 lane chain.
 // Count > 0 fixes the row count at compile time: rows advance together, each
 // coefficient decoded once for all of them, every row keeping its own serial chain.
-template <typename Storage, std::uint32_t Count = 0U, class Rows = HyperRows>
+// Q6: up is the Q6P32 copy (Q6P32 rows in the staged tile); same codes and scales.
+template <bool Q6>
+__device__ __forceinline__ float lane_chain_scale(const unsigned char* row, std::uint32_t rank, std::uint32_t block) {
+    static_assert(Q6);
+    const auto o=q6p::chunk_offsets(rank,block/8U);
+    return __half2float(__ushort_as_half(*reinterpret_cast<const unsigned short*>(row+o.d+2U*(block%8U))));
+}
+// Codes of weights 8g..8g+7 of a block (byte l = weight 8g+l).
+template <bool Q6>
+__device__ __forceinline__ std::uint64_t lane_chain_codes(const unsigned char* row, std::uint32_t rank, std::uint32_t block, std::uint32_t g) {
+    static_assert(Q6);
+    const auto o=q6p::chunk_offsets(rank,block/8U);
+    return q6p::codes8(*reinterpret_cast<const unsigned*>(row+o.qs+16U*(block%8U)+4U*g),
+        *reinterpret_cast<const unsigned*>(row+o.qh+8U*(block%8U)+4U*(g/2U)),4U*(g&1U));
+}
+template <typename Storage, std::uint32_t Count = 0U, class Rows = HyperRows, bool Q6 = false>
 __global__ void rows_lane_chain_hyper_output_kernel(Rows rows, std::uint32_t count, const void* up,
     std::uint32_t hidden, std::uint32_t streams, std::uint32_t rank) {
     extern __shared__ __align__(16) unsigned char staging[];
     const auto lane=threadIdx.x&31U,stream=threadIdx.x/32U;
     const std::uint64_t first=static_cast<std::uint64_t>(blockIdx.x)*32U;
-    const std::uint64_t tile_bytes=34ULL*rank,row_bytes=static_cast<std::uint64_t>(rank/32U)*34U;
+    const std::uint64_t block_bytes=Q6?26U:34U;
+    const std::uint64_t tile_bytes=block_bytes*rank,row_bytes=static_cast<std::uint64_t>(rank/32U)*block_bytes;
     auto* stage=staging+stream*tile_bytes;
     const auto* source=static_cast<const unsigned char*>(up)+(static_cast<std::uint64_t>(stream)*hidden+first)*row_bytes;
     stage_tile16(stage,source,tile_bytes,lane);
@@ -2105,6 +2195,22 @@ __global__ void rows_lane_chain_hyper_output_kernel(Rows rows, std::uint32_t cou
 #pragma unroll
     for(std::uint32_t t=0;t<Count;++t){ low[t]=tiled(rows.low[t], rows.tile_normalized, rows, blockIdx.z * looped_tiles(rows) + z); gate[t]=0.0F; }
     for(std::uint32_t block=0;block<rank/32U;++block){
+        if constexpr (Q6) {
+            const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes;
+            const float scale=lane_chain_scale<true>(weight,rank,block);
+#pragma unroll
+            for(std::uint32_t g=0;g<4U;++g){
+                const auto codes=lane_chain_codes<true>(weight,rank,block,g);
+#pragma unroll
+                for(std::uint32_t l=0;l<8U;++l){
+                    const float coefficient=scale*static_cast<float>(static_cast<signed char>(codes>>(8U*l)));
+#pragma unroll
+                    for(std::uint32_t t=0;t<Count;++t)
+                        gate[t]+=low[t][static_cast<std::uint64_t>(block)*32U+8U*g+l]*coefficient;
+                }
+            }
+            continue;
+        }
         const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes+static_cast<std::uint64_t>(block)*34U;
         const auto scale_bits=static_cast<unsigned short>(static_cast<unsigned>(weight[0])|(static_cast<unsigned>(weight[1])<<8U));
         const float scale=__half2float(__ushort_as_half(scale_bits));
@@ -2123,6 +2229,18 @@ __global__ void rows_lane_chain_hyper_output_kernel(Rows rows, std::uint32_t cou
         const auto* low=tiled(rows.low[t], rows.tile_normalized, rows, blockIdx.z * looped_tiles(rows) + z);
         float gate=0.0F;
         for(std::uint32_t block=0;block<rank/32U;++block){
+            if constexpr (Q6) {
+                const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes;
+                const float scale=lane_chain_scale<true>(weight,rank,block);
+                for(std::uint32_t g=0;g<4U;++g){
+                    const auto codes=lane_chain_codes<true>(weight,rank,block,g);
+                    for(std::uint32_t l=0;l<8U;++l){
+                        const float coefficient=scale*static_cast<float>(static_cast<signed char>(codes>>(8U*l)));
+                        gate+=low[static_cast<std::uint64_t>(block)*32U+8U*g+l]*coefficient;
+                    }
+                }
+                continue;
+            }
             const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes+static_cast<std::uint64_t>(block)*34U;
             const auto scale_bits=static_cast<unsigned short>(static_cast<unsigned>(weight[0])|(static_cast<unsigned>(weight[1])<<8U));
             const float scale=__half2float(__ushort_as_half(scale_bits));
@@ -2143,14 +2261,64 @@ __global__ void rows_lane_chain_hyper_output_kernel(Rows rows, std::uint32_t cou
     }
 }
 
+// Row-split form (Q8_0, Count rows known at compile time): G groups of `streams` waves per block share the
+// staged up tile; group g runs the chains of rows g, g + G, ... (Count / G rows per lane instead of Count),
+// then all groups mix. Every (row, stream, feature) chain is the one of rows_lane_chain_hyper_output_kernel
+// (block, then code order; same coefficient and accumulation expressions), so the bits are the same; only
+// how many lanes share the rows changes (80 blocks of 128 threads ran 8 waves per CU).
+template <typename Storage, std::uint32_t Count, std::uint32_t G, class Rows = HyperRows>
+__global__ void rows_lane_chain_split_hyper_output_kernel(Rows rows, const void* up, std::uint32_t hidden,
+    std::uint32_t streams, std::uint32_t rank) {
+    static_assert(Count % G == 0U);
+    extern __shared__ __align__(16) unsigned char staging[];
+    const auto lane=threadIdx.x&31U,wave=threadIdx.x/32U,stream=wave%streams,group=wave/streams;
+    const std::uint64_t first=static_cast<std::uint64_t>(blockIdx.x)*32U;
+    const std::uint64_t tile_bytes=34U*static_cast<std::uint64_t>(rank),row_bytes=static_cast<std::uint64_t>(rank/32U)*34U;
+    auto* stage=staging+stream*tile_bytes;
+    const auto* source=static_cast<const unsigned char*>(up)+(static_cast<std::uint64_t>(stream)*hidden+first)*row_bytes;
+    if(group==0U) stage_tile16(stage,source,tile_bytes,lane);
+    __syncthreads();
+    auto* sig=reinterpret_cast<float*>(staging+static_cast<std::uint64_t>(streams)*tile_bytes);
+    for(std::uint32_t z=0;z<looped_tiles(rows);++z){
+    if(z)__syncthreads();
+    constexpr std::uint32_t Own=Count/G;
+    const float* low[Own];
+    float gate[Own];
+#pragma unroll
+    for(std::uint32_t i=0;i<Own;++i){ low[i]=tiled(rows.low[group+G*i], rows.tile_normalized, rows, blockIdx.z * looped_tiles(rows) + z); gate[i]=0.0F; }
+    for(std::uint32_t block=0;block<rank/32U;++block){
+        const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes+static_cast<std::uint64_t>(block)*34U;
+        const auto scale_bits=static_cast<unsigned short>(static_cast<unsigned>(weight[0])|(static_cast<unsigned>(weight[1])<<8U));
+        const float scale=__half2float(__ushort_as_half(scale_bits));
+#pragma unroll
+        for(std::uint32_t k=0;k<32U;++k){
+            const float coefficient=scale*static_cast<float>(static_cast<signed char>(weight[2U+k]));
+#pragma unroll
+            for(std::uint32_t i=0;i<Own;++i)
+                gate[i]+=low[i][static_cast<std::uint64_t>(block)*32U+k]*coefficient;
+        }
+    }
+#pragma unroll
+    for(std::uint32_t i=0;i<Own;++i) sig[((group+G*i)*streams+stream)*32U+lane]=sigmoid(gate[i]);
+    __syncthreads();
+    for(std::uint32_t t=wave;t<Count;t+=G*streams){
+        float mixed=0.0F;const auto feature=first+lane;
+        for(std::uint32_t s=0;s<streams;++s)
+            mixed+=tiled(rows.normalized[t], rows.tile_normalized, rows, blockIdx.z * looped_tiles(rows) + z)[static_cast<std::uint64_t>(s)*hidden+feature]*sig[(t*streams+s)*32U+lane];
+        store_activation(&static_cast<Storage*>(tiled(rows.output[t], rows.tile_output, rows, blockIdx.z * looped_tiles(rows) + z))[feature],mixed/static_cast<float>(streams));
+    }
+    }
+}
+
 // Rank-320 form of the rows lane chain: each lane loads its own 340-byte Q8 row straight into registers
 // (21 x 16 B + 4 B, all issued up front) and starts the chain as soon as the first block has arrived, so
 // the chain overlaps the remaining loads instead of following a whole-tile LDS stage. Same per-row chain
 // (block, then code order), same coefficient and accumulation expressions, same stream mix.
-template <typename Storage, std::uint32_t Count, class Rows = HyperRows>
+// Q6: up is the Q6P32 copy (260-byte rows); same codes, scales and chain.
+template <typename Storage, std::uint32_t Count, class Rows = HyperRows, bool Q6 = false>
 __global__ void rows_lane_chain_hyper_output_regs_kernel(Rows rows, const void* up,
     std::uint32_t hidden, std::uint32_t streams) {
-    constexpr std::uint32_t kBlocks = 10U, kRowBytes = kBlocks * 34U, kWords = kRowBytes / 4U;
+    constexpr std::uint32_t kBlocks = 10U, kRowBytes = kBlocks * (Q6 ? 26U : 34U), kWords = kRowBytes / 4U;
     extern __shared__ __align__(16) unsigned char staging[];
     const auto lane = threadIdx.x & 31U, stream = threadIdx.x / 32U;
     const std::uint64_t first = static_cast<std::uint64_t>(blockIdx.x) * 32U;
@@ -2172,11 +2340,26 @@ __global__ void rows_lane_chain_hyper_output_regs_kernel(Rows rows, const void* 
     for (std::uint32_t t = 0; t < Count; ++t) { low[t] = tiled(rows.low[t], rows.tile_normalized, rows); gate[t] = 0.0F; }
 #pragma unroll
     for (std::uint32_t block = 0; block < kBlocks; ++block) {
-        const auto scale_bits = static_cast<unsigned short>(byte_at(block * 34U) | (byte_at(block * 34U + 1U) << 8U));
-        const float scale = __half2float(__ushort_as_half(scale_bits));
+        float scale;
+        if constexpr (Q6) {
+            const auto o = q6p::chunk_offsets(320U, block / 8U);
+            scale = __half2float(__ushort_as_half(static_cast<unsigned short>(byte_at(o.d + 2U * (block % 8U)) |
+                (byte_at(o.d + 2U * (block % 8U) + 1U) << 8U))));
+        } else {
+            const auto scale_bits = static_cast<unsigned short>(byte_at(block * 34U) | (byte_at(block * 34U + 1U) << 8U));
+            scale = __half2float(__ushort_as_half(scale_bits));
+        }
 #pragma unroll
         for (std::uint32_t k = 0; k < 32U; ++k) {
-            const float coefficient = scale * static_cast<float>(static_cast<signed char>(byte_at(block * 34U + 2U + k)));
+            signed char code;
+            if constexpr (Q6) {
+                const auto o = q6p::chunk_offsets(320U, block / 8U);
+                const std::uint32_t g = k / 8U;
+                const auto codes = q6p::codes8(words[(o.qs + 16U * (block % 8U) + 4U * g) / 4U],
+                    words[(o.qh + 8U * (block % 8U) + 4U * (g / 2U)) / 4U], 4U * (g & 1U));
+                code = static_cast<signed char>(codes >> (8U * (k % 8U)));
+            } else code = static_cast<signed char>(byte_at(block * 34U + 2U + k));
+            const float coefficient = scale * static_cast<float>(code);
 #pragma unroll
             for (std::uint32_t t = 0; t < Count; ++t)
                 gate[t] += low[t][static_cast<std::uint64_t>(block) * 32U + k] * coefficient;
@@ -3264,7 +3447,19 @@ void launch_typed(
                         constexpr unsigned outputs = 4U;
                         const auto blocks = (config.lowrank + outputs - 1U) / outputs;
                         const dim3 grid(blocks + (injection_output ? (config.hc_count + outputs - 1U) / outputs : 0U), context.logical_rows);
+                        // The registered Q6P32 copy of the down tensor replaces it (same bits).
+                        const auto* q6_down = q6p::find(reinterpret_cast<const void*>(down_runtime.address));
+                        const bool q6 = q6_down && q6_down->kind == q6p::Kind::q6p32 && q6_down->rows == config.lowrank &&
+                            q6_down->cols == 10240U && width == 10240U;
                         const auto launch = [&]<typename Acc>() {
+                            if (q6 && std::is_same_v<Acc, float>)
+                                hipLaunchKernelGGL(HIP_KERNEL_NAME(splitk_hyper_projection_kernel<outputs,float,true>),
+                                    grid, dim3(512U), 0, hip_execution_stream(), normalized,
+                                    reinterpret_cast<const void*>(q6_down->base), static_cast<std::uint32_t>(width),
+                                    config.hc_count, config.lowrank, low,
+                                    inject_runtime ? reinterpret_cast<const void*>(inject_runtime->address) : nullptr,
+                                    injection_output ? reinterpret_cast<float*>(injection_output->address) : nullptr, blocks);
+                            else
                             hipLaunchKernelGGL(HIP_KERNEL_NAME(splitk_hyper_projection_kernel<outputs,Acc>),
                                 grid, dim3(512U), 0, hip_execution_stream(), normalized,
                                 reinterpret_cast<const void*>(down_runtime.address), static_cast<std::uint32_t>(width),
@@ -3335,6 +3530,15 @@ void launch_typed(
                         reinterpret_cast<const void*>(up_runtime.address),config.hidden_size,config.hc_count,config.lowrank,
                         reinterpret_cast<Storage*>(output.address));
                 }else if(config.lane_chain_output){
+                    // The registered Q6P32 copy of the up tensor replaces it (same bits).
+                    const auto* q6_up=q6p::find(reinterpret_cast<const void*>(up_runtime.address));
+                    if(q6_up && q6_up->kind==q6p::Kind::q6p32 && q6_up->cols==config.lowrank &&
+                       q6_up->rows==config.hidden_size*config.hc_count)
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(lane_chain_hyper_output_kernel<Storage,true>),
+                        dim3(config.hidden_size/32U,context.logical_rows),dim3(32U*config.hc_count),
+                        static_cast<std::size_t>(lane_chain_hyper_output_lds(config.hc_count,config.lowrank)),hip_execution_stream(),
+                        normalized,low,reinterpret_cast<const void*>(q6_up->base),config.hidden_size,config.hc_count,config.lowrank,reinterpret_cast<Storage*>(output.address));
+                    else
                     hipLaunchKernelGGL(HIP_KERNEL_NAME(lane_chain_hyper_output_kernel<Storage>),
                         dim3(config.hidden_size/32U,context.logical_rows),dim3(32U*config.hc_count),
                         static_cast<std::size_t>(lane_chain_hyper_output_lds(config.hc_count,config.lowrank)),hip_execution_stream(),
@@ -4082,12 +4286,22 @@ void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, cons
                 const unsigned n = v ? static_cast<unsigned>(std::atoi(v)) : 2U;
                 return n == 1U || n == 4U || n == 8U ? n : 2U;
             }();
+            // The registered Q6P32 copy of the down tensor replaces it (same bits).
+            const auto* q6_down = q6p::find(reinterpret_cast<const void*>(p.down_runtime->address));
+            const bool q6 = q6_down && q6_down->kind == q6p::Kind::q6p32 && q6_down->rows == config.lowrank &&
+                q6_down->cols == 10240U && width == 10240U;
             const auto launch = [&]<unsigned outputs>() {
                 const auto blocks = (config.lowrank + outputs - 1U) / outputs;
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_splitk_hyper_projection_kernel<outputs, Rows>),
-                    dim3(blocks + (inject ? (config.hc_count + outputs - 1U) / outputs : 0U), 1U, tiles), dim3(512U), 0,
-                    hip_execution_stream(), rows, count, reinterpret_cast<const void*>(p.down_runtime->address),
-                    config.hc_count, config.lowrank, inject, blocks);
+                if (q6)
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_splitk_hyper_projection_kernel<outputs, Rows, true>),
+                        dim3(blocks + (inject ? (config.hc_count + outputs - 1U) / outputs : 0U), 1U, tiles), dim3(512U), 0,
+                        hip_execution_stream(), rows, count, reinterpret_cast<const void*>(q6_down->base),
+                        config.hc_count, config.lowrank, inject, blocks);
+                else
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_splitk_hyper_projection_kernel<outputs, Rows>),
+                        dim3(blocks + (inject ? (config.hc_count + outputs - 1U) / outputs : 0U), 1U, tiles), dim3(512U), 0,
+                        hip_execution_stream(), rows, count, reinterpret_cast<const void*>(p.down_runtime->address),
+                        config.hc_count, config.lowrank, inject, blocks);
             };
             if (per_block == 1U) launch.template operator()<1U>();
             else if (per_block == 2U) launch.template operator()<2U>();
@@ -4106,24 +4320,50 @@ void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, cons
                 static_cast<std::uint64_t>(count - 1U) * config.hc_count * 32U * sizeof(float);
             // STRIX_HC_LANE_CHAIN_REGS=0: keep the LDS-staged form for rank 320 as well.
             static const bool regs = [] { const char* v = std::getenv("STRIX_HC_LANE_CHAIN_REGS"); return !v || v[0] != '0'; }();
-            const auto output = [&]<std::uint32_t Count>() {
-                // Register form only up to 4 rows: at 8 rows it runs out of registers (32.1 -> 37.3 us).
-                if constexpr (Count != 0U && Count <= 4U) if (regs && config.lowrank == 320U) {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_hyper_output_regs_kernel<Storage, Count, Rows>),
-                        dim3(config.hidden_size / 32U, 1U, tiles), dim3(32U * config.hc_count),
-                        static_cast<std::size_t>(Count) * config.hc_count * 32U * sizeof(float), hip_execution_stream(),
-                        rows, reinterpret_cast<const void*>(p.up_runtime->address), config.hidden_size, config.hc_count);
+            // The registered Q6P32 copy of the up tensor replaces it (same bits).
+            const auto* q6_up = q6p::find(reinterpret_cast<const void*>(p.up_runtime->address));
+            const bool q6 = q6_up && q6_up->kind == q6p::Kind::q6p32 && q6_up->cols == config.lowrank &&
+                q6_up->rows == config.hidden_size * config.hc_count;
+            const auto* up = q6 ? reinterpret_cast<const void*>(q6_up->base) : reinterpret_cast<const void*>(p.up_runtime->address);
+            // Q8_0 windows of 8 rows run the row-split output form with 2 row groups per block (in-run R8 window
+            // 3.22 -> 2.98 ms per window; 4 and 8 groups were not faster, and at 4 rows the register form wins).
+            // STRIX_HC_LANE_SPLIT=0 keeps the LDS form; =2|4|8 forces that many groups (also for 4-row windows).
+            static const int split_env = [] { const char* v = std::getenv("STRIX_HC_LANE_SPLIT"); return v ? std::atoi(v) : -1; }();
+            const auto output = [&]<std::uint32_t Count, bool Q6>() {
+                const unsigned split = split_env >= 0 ? static_cast<unsigned>(split_env) : (Count == 8U ? 2U : 0U);
+                if constexpr (!Q6 && (Count == 4U || Count == 8U)) if (split >= 2U && split <= Count && config.hc_count * 32U * split <= 1024U) {
+                    const auto launch_split = [&]<std::uint32_t G>() {
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_split_hyper_output_kernel<Storage, Count, G, Rows>),
+                            dim3(config.hidden_size / 32U, 1U, tiles / looped(rows)), dim3(32U * config.hc_count * G),
+                            static_cast<std::size_t>(lds), hip_execution_stream(), rows, up, config.hidden_size, config.hc_count,
+                            config.lowrank);
+                    };
+                    if (split == 2U) launch_split.template operator()<2U>();
+                    else if (split == 4U) launch_split.template operator()<4U>();
+                    else if constexpr (Count == 8U) launch_split.template operator()<8U>();
+                    else launch_split.template operator()<4U>();
                     return;
                 }
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_hyper_output_kernel<Storage, Count, Rows>),
+                // Register form only up to 4 rows: at 8 rows it runs out of registers (32.1 -> 37.3 us).
+                if constexpr (Count != 0U && Count <= 4U) if (regs && config.lowrank == 320U) {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_hyper_output_regs_kernel<Storage, Count, Rows, Q6>),
+                        dim3(config.hidden_size / 32U, 1U, tiles), dim3(32U * config.hc_count),
+                        static_cast<std::size_t>(Count) * config.hc_count * 32U * sizeof(float), hip_execution_stream(),
+                        rows, up, config.hidden_size, config.hc_count);
+                    return;
+                }
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_hyper_output_kernel<Storage, Count, Rows, Q6>),
                     dim3(config.hidden_size / 32U, 1U, tiles / looped(rows)),
                     dim3(32U * config.hc_count), static_cast<std::size_t>(lds), hip_execution_stream(), rows, count,
-                    reinterpret_cast<const void*>(p.up_runtime->address), config.hidden_size, config.hc_count, config.lowrank);
+                    up, config.hidden_size, config.hc_count, config.lowrank);
             };
-            if (count == 2U) output.template operator()<2U>();
-            else if (count == 4U) output.template operator()<4U>();
-            else if (count == 8U) output.template operator()<8U>();
-            else output.template operator()<0U>();
+            const auto by_count = [&]<bool Q6>() {
+                if (count == 2U) output.template operator()<2U, Q6>();
+                else if (count == 4U) output.template operator()<4U, Q6>();
+                else if (count == 8U) output.template operator()<8U, Q6>();
+                else output.template operator()<0U, Q6>();
+            };
+            if (q6) by_count.template operator()<true>(); else by_count.template operator()<false>();
         } else {
             hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_q8_batched_hyper_output_kernel<Storage, Rows>),
                 dim3((config.hidden_size + kStagedOutputs - 1U) / kStagedOutputs, 1U, tiles), dim3(kStagedThreads), 0,
