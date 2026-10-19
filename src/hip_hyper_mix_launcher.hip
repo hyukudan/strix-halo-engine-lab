@@ -2199,6 +2199,55 @@ __global__ void rows_lane_chain_hyper_output_kernel(Rows rows, std::uint32_t cou
     }
 }
 
+// Row-split form (Q8_0, Count rows known at compile time): G groups of `streams` waves per block share the
+// staged up tile; group g runs the chains of rows g, g + G, ... (Count / G rows per lane instead of Count),
+// then all groups mix. Every (row, stream, feature) chain is the one of rows_lane_chain_hyper_output_kernel
+// (block, then code order; same coefficient and accumulation expressions), so the bits are the same; only
+// how many lanes share the rows changes (80 blocks of 128 threads ran 8 waves per CU).
+template <typename Storage, std::uint32_t Count, std::uint32_t G, class Rows = HyperRows>
+__global__ void rows_lane_chain_split_hyper_output_kernel(Rows rows, const void* up, std::uint32_t hidden,
+    std::uint32_t streams, std::uint32_t rank) {
+    static_assert(Count % G == 0U);
+    extern __shared__ __align__(16) unsigned char staging[];
+    const auto lane=threadIdx.x&31U,wave=threadIdx.x/32U,stream=wave%streams,group=wave/streams;
+    const std::uint64_t first=static_cast<std::uint64_t>(blockIdx.x)*32U;
+    const std::uint64_t tile_bytes=34U*static_cast<std::uint64_t>(rank),row_bytes=static_cast<std::uint64_t>(rank/32U)*34U;
+    auto* stage=staging+stream*tile_bytes;
+    const auto* source=static_cast<const unsigned char*>(up)+(static_cast<std::uint64_t>(stream)*hidden+first)*row_bytes;
+    if(group==0U) stage_tile16(stage,source,tile_bytes,lane);
+    __syncthreads();
+    auto* sig=reinterpret_cast<float*>(staging+static_cast<std::uint64_t>(streams)*tile_bytes);
+    for(std::uint32_t z=0;z<looped_tiles(rows);++z){
+    if(z)__syncthreads();
+    constexpr std::uint32_t Own=Count/G;
+    const float* low[Own];
+    float gate[Own];
+#pragma unroll
+    for(std::uint32_t i=0;i<Own;++i){ low[i]=tiled(rows.low[group+G*i], rows.tile_normalized, rows, blockIdx.z * looped_tiles(rows) + z); gate[i]=0.0F; }
+    for(std::uint32_t block=0;block<rank/32U;++block){
+        const auto* weight=stage+static_cast<std::uint64_t>(lane)*row_bytes+static_cast<std::uint64_t>(block)*34U;
+        const auto scale_bits=static_cast<unsigned short>(static_cast<unsigned>(weight[0])|(static_cast<unsigned>(weight[1])<<8U));
+        const float scale=__half2float(__ushort_as_half(scale_bits));
+#pragma unroll
+        for(std::uint32_t k=0;k<32U;++k){
+            const float coefficient=scale*static_cast<float>(static_cast<signed char>(weight[2U+k]));
+#pragma unroll
+            for(std::uint32_t i=0;i<Own;++i)
+                gate[i]+=low[i][static_cast<std::uint64_t>(block)*32U+k]*coefficient;
+        }
+    }
+#pragma unroll
+    for(std::uint32_t i=0;i<Own;++i) sig[((group+G*i)*streams+stream)*32U+lane]=sigmoid(gate[i]);
+    __syncthreads();
+    for(std::uint32_t t=wave;t<Count;t+=G*streams){
+        float mixed=0.0F;const auto feature=first+lane;
+        for(std::uint32_t s=0;s<streams;++s)
+            mixed+=tiled(rows.normalized[t], rows.tile_normalized, rows, blockIdx.z * looped_tiles(rows) + z)[static_cast<std::uint64_t>(s)*hidden+feature]*sig[(t*streams+s)*32U+lane];
+        store_activation(&static_cast<Storage*>(tiled(rows.output[t], rows.tile_output, rows, blockIdx.z * looped_tiles(rows) + z))[feature],mixed/static_cast<float>(streams));
+    }
+    }
+}
+
 // Rank-320 form of the rows lane chain: each lane loads its own 340-byte Q8 row straight into registers
 // (21 x 16 B + 4 B, all issued up front) and starts the chain as soon as the first block has arrived, so
 // the chain overlaps the remaining loads instead of following a whole-tile LDS stage. Same per-row chain
@@ -4214,7 +4263,25 @@ void launch_hyper_rows(const PreparedHyperRows& prepared, const Rows& rows, cons
             const bool q6 = q6_up && q6_up->kind == q6p::Kind::q6p32 && q6_up->cols == config.lowrank &&
                 q6_up->rows == config.hidden_size * config.hc_count;
             const auto* up = q6 ? reinterpret_cast<const void*>(q6_up->base) : reinterpret_cast<const void*>(p.up_runtime->address);
+            // Q8_0 windows of 8 rows run the row-split output form with 2 row groups per block (in-run R8 window
+            // 3.22 -> 2.98 ms per window; 4 and 8 groups were not faster, and at 4 rows the register form wins).
+            // STRIX_HC_LANE_SPLIT=0 keeps the LDS form; =2|4|8 forces that many groups (also for 4-row windows).
+            static const int split_env = [] { const char* v = std::getenv("STRIX_HC_LANE_SPLIT"); return v ? std::atoi(v) : -1; }();
             const auto output = [&]<std::uint32_t Count, bool Q6>() {
+                const unsigned split = split_env >= 0 ? static_cast<unsigned>(split_env) : (Count == 8U ? 2U : 0U);
+                if constexpr (!Q6 && (Count == 4U || Count == 8U)) if (split >= 2U && split <= Count && config.hc_count * 32U * split <= 1024U) {
+                    const auto launch_split = [&]<std::uint32_t G>() {
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_split_hyper_output_kernel<Storage, Count, G, Rows>),
+                            dim3(config.hidden_size / 32U, 1U, tiles / looped(rows)), dim3(32U * config.hc_count * G),
+                            static_cast<std::size_t>(lds), hip_execution_stream(), rows, up, config.hidden_size, config.hc_count,
+                            config.lowrank);
+                    };
+                    if (split == 2U) launch_split.template operator()<2U>();
+                    else if (split == 4U) launch_split.template operator()<4U>();
+                    else if constexpr (Count == 8U) launch_split.template operator()<8U>();
+                    else launch_split.template operator()<4U>();
+                    return;
+                }
                 // Register form only up to 4 rows: at 8 rows it runs out of registers (32.1 -> 37.3 us).
                 if constexpr (Count != 0U && Count <= 4U) if (regs && config.lowrank == 320U) {
                     hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_lane_chain_hyper_output_regs_kernel<Storage, Count, Rows, Q6>),
