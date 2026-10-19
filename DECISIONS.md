@@ -784,6 +784,54 @@ document correction (en, es), summary, English prose and code, replay error 0. S
 66.9 -> 81.5 tok/s (en) and 74.9 -> 79.2 (es); the others extended no cycle. Off by default until the timing
 campaign.
 
+## D-048: dense Q6P32 weights (draft numerical proposal, opt-in)
+
+`--dense-q6p-pack PATH` registers 6.5-bit Q6P32 copies of the dense Q8_0 tensors (GDN, QSA, HC, shared
+expert, LM head) and BF16 copies of the F32 routers, pinned to an emulated checkpoint whose Q8_0 tensors hold
+the same 6-bit codes and scales. Every Q6P32 block is an exact Q8_0 block, so the Q6P32 kernels compute the
+bits of the Q8_0 kernels on the emulated file; `STRIX_Q6P=0` keeps every launcher on its Q8_0 kernel for A/B
+on one file. Covered: the dense A8 profile's 1-8 row projections, the FP32 rows and R1 projections, LM head
+rows up to 4 and R1, HC split-K and lane chain, and the router logits; prefill and LM head windows of more
+than four rows keep the Q8_0 tensors. See [docs/dense-q6p32-weights.md](docs/dense-q6p32-weights.md).
+
+Checked: fixtures equal Q8_0 bit for bit (1036 exact and 528 dense A8 cases with the Q8_0 tensor poisoned,
+registry hits proving the copies were read); MTP 256 tokens with the Q8_0 kernels' golden: tokens identical
+and replay error 0 in the dense A8 and FP32 profiles. Quality of the emulated checkpoint against Q8_0 (49001
+positions, dense A8, pre-registered bound KL <= 0.066 and top-1 >= 92.5 %): all dense at 6 bits (v1) KL
+0.0279, top-1 94.42 %; with HC kept in Q8_0 (v1hc) KL 0.0253, top-1 94.61 %; the current checkpoint
+measures KL 0.0198, top-1 95.55 %. Both pass the bound, at +41 % (v1) and +28 % (v1hc) relative KL.
+
+Status: draft. The format, the checkpoint choice (v1 or v1hc) and any default wait for the timing campaign
+and the quality decision; nothing changes without the flag.
+
+## D-049: HC rows output of 8-row windows in the row-split lane-chain form (default)
+
+In 8-row verify windows with Q8_0 HC weights, the lane-chain HC output runs as two groups of stream waves per
+block that share the staged up tile, each running half the rows' chains; the stream mix is spread over all
+waves. Every (row, stream, feature) chain and the mix keep their order and expressions, so the bits are those
+of the LDS form. `STRIX_HC_LANE_SPLIT=0` keeps the LDS form, `=2|4|8` forces the group count (also at 4 rows).
+
+Why: the 8-row HC output was the largest latency-bound step left in an R8 window (the window runs at 80-83 %
+of its DRAM floor). Measured in a run: 3.22 -> 2.98 ms per R8 window; 4 and 8 groups were not faster, and at 4
+rows the register form stays. Checked: 36 HC fixture cases and 256 MTP tokens identical, replay error 0.
+
+## D-050: sampled decisions on the GPU (default)
+
+With `--mtp-sample-temperature` above zero, target rows (window and serial) and the draft chain are decided on
+the device with the host sampler's transform, order and random stream (docs/sampled-decoding.md). Kept sets
+of at most 2048 entries are compacted in token id order and decided by one workgroup with the host's own
+sequence; larger sets use a fixed two-level partition, and a top-p prefix needing more than 2048 entries is
+decided on the host. The draft chain samples each step right after the draft head on the same stream and
+writes the token into the head's device slot, so it no longer waits or reads back per step; policies whose
+draft rows could need the host (top-p < 1 without a top-k <= 2048) keep the draft on the host.
+`STRIX_SAMPLE_PATH=host|device|auto` (default auto = device) and `STRIX_SAMPLE_DRAFT_HOST=1` select the path.
+
+Checked: the device fixture decides 400 rows (200 with the draft distribution in device memory) and 146
+draft steps equal to the host in token and support (largest relative probability difference 1e-13); engine
+smoke runs (six policies, 256 tokens) give the host path's tokens with replay error 0, and the sampling-v1
+chi-square smoke gives the host path's numbers. Single runs measured the device faster than the host for every kind of
+decision under all six policy classes; the timing campaign confirms it.
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |
