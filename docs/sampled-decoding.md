@@ -55,6 +55,28 @@ draft distribution.
 - Prompt: only the final prompt row decides by sampling; earlier rows keep first-max selection because their
   predictions are never emitted.
 
+## Device decisions
+
+Target rows (window rows and serial rows) are decided on the GPU by default (`src/hip_token_sampling_device.hip`);
+`STRIX_SAMPLE_HOST=1` restores the host path everywhere. The draft chain still decides on the host.
+
+- Same transform: the finite check, `z = (logit - max) / T` in double, the cutoff, top-k by `(z desc, id asc)`
+  (radix selection on the logit's order key; a tie at the k-th key takes the lowest token ids), weights `exp(z)` in
+  double, top-p over the `(weight desc, id asc)` prefix and the inverse CDF in the same entry order. The top-p
+  prefix, its mass, the sample, the acceptance test and the residual walk run sequentially over at most 2048
+  candidates in exactly the host's arithmetic; a row whose prefix needs more candidates is decided on the host.
+- Same uniforms: the host computes each row's `U(n, plain|accept|residual)` with the counter-based generator and
+  passes them to the device; only the token and its decision flags come back.
+- Rounding: without top-p the weights are summed in token id order over a fixed two-level partition (per thread,
+  then per workgroup), and the device `exp` may differ from the host's in the last bit. A decision can therefore
+  differ from the host path only when its uniform lies within a few double ulps of a cumulative boundary.
+- The draft distribution `q` of a drafted row is staged in pinned host memory (token id ascending) and read by the
+  device for `q(d)` and the residual.
+
+`strix-hip-token-sampling-device-tests` compares device and host decisions (with and without drafts, every filter
+combination) for rows of 4099 to 248320 tokens. `STRIX_SAMPLE_TIMING=1` prints the host time of sampled decisions
+per kind and window size at exit.
+
 ## Reproducibility
 
 Which positions carry a draft, and which draft, depends on the window and draft-length choices. The `fixed`
