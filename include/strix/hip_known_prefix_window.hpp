@@ -101,6 +101,8 @@ public:
     // (see KnownWindowExecutionHooks::after_step). Set while idle; an empty function removes it.
     using PrefillStepObserver = std::function<void(std::size_t, const std::function<ExecutionDispatchContext(std::uint32_t)>&)>;
     void set_prefill_step_observer(PrefillStepObserver observer);
+    // Diagnostics only: the same observer for verify windows (every step after it was enqueued). Set while idle.
+    void set_window_step_observer(PrefillStepObserver observer);
     [[nodiscard]] std::uint32_t logical_rows() const noexcept;
     [[nodiscard]] bool supports_tiled_prefill() const noexcept;
     // Immutable compiler-selected intent; verification consumers require all_rows.

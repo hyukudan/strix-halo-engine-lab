@@ -170,7 +170,7 @@ struct HipKnownPrefixWindow::Impl {
     DeferredMoeFirstError completion_status{};
     bool failed = false;
     std::uint32_t active_rows = 0; // execute_mtp_captured: rows in the expert union (0 = every row)
-    HipKnownPrefixWindow::PrefillStepObserver prefill_observer;
+    HipKnownPrefixWindow::PrefillStepObserver prefill_observer,window_observer;
 
     Impl(CompiledKnownPrefixWindow source, CompiledSerialExecution serial_source,
         ModelContract model_source, HipLauncherCatalogConfig config_source,
@@ -1029,6 +1029,7 @@ struct HipKnownPrefixWindow::Impl {
             hooks.preflight_memo=&preflight_memo;hooks.recipe_memo=&recipe_memo;hooks.preflight_slots=&preflight_slots;
             hooks.arena_index=&arena_index;
             if(prefill) hooks.after_step=prefill_observer;
+            else if(window_observer) hooks.after_step=window_observer;
             const auto first_position=session.next_position;
             auto result=prefill ? execute_known_prefix_prefill_eager(*prefill,serial,resources,scratch,session,tokens,
                 launch_plans.front(),r2_entries,rows_entries,hooks,prefill_entries) :
@@ -1107,6 +1108,9 @@ HipMtpTargetWindowExecution HipKnownPrefixWindow::execute_mtp_captured(SerialSes
         ~ActiveRows(){value=0;}
     } scoped(impl_->active_rows,active_rows==logical_rows()?0U:active_rows);
     HipMtpTargetWindowExecution out;out.execution=impl_->execute(session,tokens,before_publish,capture,&out.batch);return out;
+}
+void HipKnownPrefixWindow::set_window_step_observer(PrefillStepObserver observer) {
+    impl_->window_observer=std::move(observer);
 }
 void HipKnownPrefixWindow::set_prefill_step_observer(PrefillStepObserver observer) {
     if(!impl_->prefill || impl_->executing || impl_->failed)

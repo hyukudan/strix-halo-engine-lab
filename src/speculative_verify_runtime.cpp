@@ -561,8 +561,17 @@ KnownWindowResult execute_known_prefix_window_eager(
                 *serial_resources.session_state_layout, *serial_resources.session_state_memory,
                 *serial_resources.ple_lookup, *serial_resources.ple_prefetch);
     }
+    // Diagnostic observer (KnownWindowExecutionHooks::after_step): called after each step was enqueued with
+    // the step's per-row contexts. Absent in production.
+    const auto observe_step = [&](std::size_t s) {
+        if (!hooks.after_step) return;
+        hooks.after_step(s, [&](std::uint32_t row) {
+            if (row >= rows) throw std::invalid_argument("known window observer row is outside the window");
+            return contexts[s][row]; });
+    };
     try {
         for (std::size_t i = 0; i < steps; ++i) {
+            if (i) observe_step(i - 1U);
             const auto& step = serial.execution.steps[i];
             if (!result.execution.state.contains(step.reads_state))
                 throw std::logic_error("known window persistent state disappeared after admission");
@@ -644,6 +653,7 @@ KnownWindowResult execute_known_prefix_window_eager(
                 }
             }
         }
+        if (steps) observe_step(steps - 1U);
         if (serial_resources.ple_prefetch && serial_resources.ple_prefetch->active)
             throw std::logic_error("known window completed without consuming its PLE lookup");
         window_host_timing().launch += window_ms_since(timing_mark); timing_mark = std::chrono::steady_clock::now();
