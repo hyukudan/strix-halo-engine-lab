@@ -481,19 +481,32 @@ public:
         return static_cast<std::size_t>(free - slots_.begin());
     }
 
-    // Interleaved admission: one unit of the oldest running prompt. Then one decode cycle of every request
-    // past its prompt: a cohort cycle with two or more, the ordinary cycle with one.
+    // Interleaved admission: one unit of the oldest running prompt, when the decode cycles have had at least
+    // `prompt_share` times the time of the previous units (STRIX_BATCH_PROMPT_SHARE, default 0: one unit per
+    // step; always when nothing decodes). Then one decode cycle
+    // of every request past its prompt: a cohort cycle with two or more, the ordinary cycle with one.
     void step() {
+        using clock = std::chrono::steady_clock;
         Slot* prompt = nullptr;
-        for (auto& s : slots_) if (s->prefilling && (!prompt || s->order < prompt->order)) prompt = s.get();
-        if (prompt) {
+        bool decoding = false;
+        for (auto& s : slots_) {
+            if (s->prefilling && (!prompt || s->order < prompt->order)) prompt = s.get();
+            if (s->active && !s->prefilling) decoding = true;
+        }
+        if (!prompt) prompt_debt_ms_ = 0.0;
+        if (prompt && (!decoding || prompt_debt_ms_ <= 0.0)) {
             ++stats_.prompt_steps;
+            const auto t0 = clock::now();
             prompt->prefill->step(serial_rows_per_step_);
             if (prompt->prefill->done()) complete_prompt(*prompt);
+            prompt_debt_ms_ += prompt_share_ * std::chrono::duration<double, std::milli>(clock::now() - t0).count();
         }
         std::vector<Slot*> live;
         for (auto& s : slots_) if (s->active && !s->prefilling) live.push_back(s.get());
         if (live.empty()) return;
+        const auto cycle_start = clock::now();
+        struct Debt {double& debt; clock::time_point t0;
+            ~Debt(){debt -= std::chrono::duration<double, std::milli>(clock::now() - t0).count();}} debt{prompt_debt_ms_, cycle_start};
         const auto& m = options_.mtp;
         const auto budget = [](const Slot& s) {
             return static_cast<std::uint32_t>(std::min<std::uint64_t>(s.request.max_tokens - s.result.generated_tokens, UINT32_MAX));
@@ -579,6 +592,13 @@ private:
     std::vector<std::unique_ptr<Slot>> slots_;
     bool interleave_ = false;
     std::uint32_t serial_rows_per_step_ = 16;
+    // Interleaved admission: decode time owed to the requests past their prompt for the prompt units run.
+    double prompt_debt_ms_ = 0.0;
+    double prompt_share_ = [] {
+        const char* v = std::getenv("STRIX_BATCH_PROMPT_SHARE");
+        const double x = v ? std::atof(v) : 0.0;
+        return x >= 0.0 ? x : 0.0;
+    }();
     Stats stats_;
 };
 

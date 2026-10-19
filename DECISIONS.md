@@ -758,6 +758,41 @@ top-1 agreement and mean KL 0.0066-0.0069. Speed was not measured (deferred to t
 It does not run with the fast prefill QSA component, which reads BF16 keys and values, and is not admitted with
 cohort windows, the prefix state cache or HTTP serving, which were not checked under the identity.
 
+## D-047: batched decoding on the tiled MTP route (cohort requests with tiled prompts, `--http-batch`)
+
+Cohort windows (D-039) now run on the tiled MTP prompt, the serving route. A run holds up to eight request slots;
+each slot owns what a single request owns (target state and session, launch plan, PLE backend, tiled prefill owners
+and backends, prefix state cache view, predictor, target producer, 2/4/8 window owners on one shared window
+stream), while the tiled prefill arenas are shared and used by one prompt at a time. The calibration replay runs
+once and qualifies every slot. A request is admitted into a free slot between decode cycles and starts exactly like
+a request of the one-at-a-time server (fresh state, session and predictor, its prompt through the tiled prefill, its
+first token from the prompt's last row); its prompt advances one unit at a time (a T-row block, a tail block or 16
+serial rows) between the cycles of the others; it leaves when it ends. Cycles with two or more requests past their
+prompt are cohort cycles. The command line exposes it as `--mtp-cohort-request TOKENS_FILE` on the tiled prompt
+(lockstep or sequential, up to eight requests), the server as `--http-batch N` (1..8). Sampled decoding works on
+this route: the target sampler is per request (replaceable on an idle producer), the tiled prompt's last row
+selects through it, cohort windows install each sampled request's row selection on its capture and pass its draft
+distributions; `--http-sampling sample` samples with each request's policy and seed. See
+[docs/serving.md](docs/serving.md#batched-decoding) and [docs/multi-request-cohort.md](docs/multi-request-cohort.md).
+
+Why: the server ran one request at a time, so concurrent clients only queued, and cohort windows (the decode-side
+batching) were limited to the serial prompt route (4097 tokens, about 70 ms per prompt token). Alternative: one
+shared state with row offsets per request; not taken, because every per-request owner already exists and keeps each
+request's arithmetic its own. Status: opt-in (`--http-batch`, cohort requests); greedy requests are exact.
+
+| Check | Result |
+| --- | --- |
+| Command line, tiled prompt, code8k (4 blocks) + es2, lockstep and sequential; code8k + es2 + p43 + prose8k, lockstep and sequential | Every request identical to its sequential run and request 0 to the single-request tiled route; calibration replay error 0 |
+| Eight requests (code8k, prose8k and six short prompts), lockstep vs sequential | Identical, all eight |
+| Interleaved admission (`STRIX_BATCH_INTERLEAVE=1`), four requests | Identical to the sequential run |
+| Server `--http-batch 8`, eight short prompts alone | Token IDs identical to the one-at-a-time server |
+| Server `--http-batch 8`, N = 2/4/8 concurrent clients, short prompts and 8K prompts | Every request returns its N = 1 tokens |
+| `strix-serve-api-tests` (queue pull interface: order, cancelled-while-queued jobs, totals, shutdown) | Pass |
+
+Single smoke runs, not a campaign (dense A8, windows 2/4/8, 256 tokens per request): four requests on the command
+line 63.6 tok/s aggregate (cycles only) against 43.6 sequential, eight 58.7 against 40.6; the server took 49.8 s for
+eight concurrent short requests against 69.7 s one at a time.
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |

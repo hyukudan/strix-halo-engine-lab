@@ -9,11 +9,34 @@ strix-hip-decode-token MODEL.gguf TOKEN_ID ... (request 0: positional prompt, --
   [--mtp-cohort-mode lockstep|sequential]                      (default lockstep)
 ```
 
-`TOKENS_FILE` holds decimal token IDs separated by commas or whitespace; `GOLDEN_FILE` is that prompt's MTP
+On the serial prompt route (the default) `TOKENS_FILE` holds decimal token IDs separated by commas or whitespace;
+`GOLDEN_FILE` is that prompt's MTP
 golden under the run's numerical profile (dumped with `--mtp-golden-dump` like any other golden). The rest of
 the command line is the ordinary speculative configuration of the README; the cohort requires prefix windows
 over the row set `2,4,8`, the draft chain and one numerical profile for prompt and decode (no
-`--prefill-numerical-profile`). At most four requests in total; `--generate` applies to each request.
+`--prefill-numerical-profile`). At most four requests in total on the serial prompt route (eight on the tiled
+prompt, below); `--generate` applies to each request.
+
+## Tiled prompt (batched route)
+
+On the tiled MTP prompt (`--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T`, the serving
+route) cohort requests take `--mtp-cohort-request TOKENS_FILE` without a golden: the predictor is qualified once by
+the calibration replay of the positional prompt's first `--mtp-calibration-rows` pairs, exactly as for the server,
+and every request then runs its whole prompt through the tiled prefill (T-row blocks, tail blocks, serial rows) like
+a served request. Up to eight requests in total (seven besides the positional prompt); prompts are bounded by the
+context only. `--mtp-sample-*` applies to every request (request i uses seed + i).
+
+Each request has a slot (see [serving.md](serving.md#batched-decoding)): its own state, session, launch plan, PLE
+backend, tiled prefill owners and backends (the prefill arenas are shared and used by one prompt at a time), prefix
+cache view, predictor, target producer and window owners on one shared window stream. `lockstep` runs every
+request's prompt (one after another) and then decodes them together; `sequential` admits each request after the
+previous one ended, each exactly as alone. With more than four requests a cycle forms two or more cohort windows (two
+rows per request, groups of four requests per 8-row window).
+
+The receipt (`mode` `native-mtp-cohort-tiled-prompt-target-verified-greedy|sampled`) has the fields of the serial
+cohort receipt plus each request's tiled prompt receipt, its prompt time and restored tokens; the replay errors are
+those of the shared calibration replay. `STRIX_BATCH_INTERLEAVE=1` interleaves the prompts with the decode cycles
+(then the cycle wall includes the prompts).
 
 ## Per-request state
 
@@ -84,7 +107,7 @@ acceptance, window histogram, finish time, rate and generated tokens.
 
 ## Limits
 
-- CLI benchmark mode only; the serving scheduler still runs independent sessions without cross-request
-  batching (see [serving.md](serving.md)).
+- Serial prompt route: CLI benchmark mode, at most four requests of up to 4097 prompt tokens each. The tiled
+  prompt route serves through the same slots (`--http-batch`, [serving.md](serving.md)).
 - PLE and the elementwise steps run per request (PLE weights are small; elementwise steps read no weights).
 - Drafting is sequential per request.
