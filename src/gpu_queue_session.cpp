@@ -18,7 +18,7 @@ template<class Range> bool nonzero(const Range& bytes) { return std::any_of(byte
 void validate(const GpuQueuePeerFrame& f) {
     if (!nonzero(f.campaign) || !nonzero(f.local) || !nonzero(f.peer) || !nonzero(f.device_instance) || f.local == f.peer ||
         !f.epoch || !f.import_generation || !f.pool_identity || !f.first_sequence || !f.payload_bytes ||
-        (f.recovery_flags & ~(gpu_queue_reset_controller | gpu_queue_reset_network)) ||
+        (f.recovery_flags & ~(gpu_queue_reset_controller | gpu_queue_reset_network | gpu_queue_terminal_kernel)) ||
         ((f.recovery_flags & gpu_queue_reset_network) && !(f.recovery_flags & gpu_queue_reset_controller)) ||
         (f.kind >= gpu_queue_reset_done && !(f.recovery_flags & gpu_queue_reset_controller)) ||
         f.depth < 2 || f.depth > SGU_MAX_QUEUE_DEPTH || f.ring_frames < 32 || f.ring_frames > SGU_MAX_FRAMES ||
@@ -52,6 +52,8 @@ GpuQueuePeerFrame decode_gpu_queue_peer_frame(std::span<const std::byte> bytes) 
 void require_gpu_queue_peer(const GpuQueuePeerFrame& local, const GpuQueuePeerFrame& peer, const GpuQueuePeerFrame* established) {
     validate(local); validate(peer);
     const auto opposite = ((local.directions & 1U) << 1) | ((local.directions & 2U) >> 1);
+    if ((peer.recovery_flags ^ local.recovery_flags) & gpu_queue_terminal_kernel)
+        throw std::runtime_error("GPU queue peers disagree on the terminal format (kernel-validated header vs application record)");
     if (peer.campaign != local.campaign || peer.local != local.peer || peer.peer != local.local ||
         peer.epoch != local.epoch || peer.window != local.window || peer.first_sequence != local.first_sequence ||
         peer.payload_bytes != local.payload_bytes || peer.kind != local.kind || peer.depth != local.depth ||
@@ -73,6 +75,7 @@ GpuQueueSessionReport run_gpu_queue_session(LinuxGpuQueue& queue, const GpuQueue
         ((policy.directions & 1U) && !gpu.produce) || ((policy.directions & 2U) && !gpu.consume) ||
         policy.window_timeout.count() <= 0 || policy.window_timeout > std::chrono::minutes{1} ||
         !policy.maximum_progress_calls || policy.maximum_progress_calls > 1000000 ||
+        (queue.required_terminal_bytes() && policy.terminal_bytes != queue.required_terminal_bytes()) ||
         policy.payload_bytes * queue.depth() * policy.windows * (policy.directions == 3 ? 2U : 1U) > 128ULL * 1024 * 1024)
         throw std::invalid_argument("GPU queue session exceeds bounded explicit policy");
     if ((policy.recovery_flags & ~(gpu_queue_reset_controller | gpu_queue_reset_network)) ||
@@ -82,7 +85,8 @@ GpuQueueSessionReport run_gpu_queue_session(LinuxGpuQueue& queue, const GpuQueue
     GpuQueueSessionReport report;
     try {
         GpuQueuePeerFrame local; local.campaign = policy.campaign; local.depth = queue.depth(); local.ring_frames = queue.observation().ring_frames;
-        local.payload_bytes = policy.payload_bytes; local.directions = policy.directions; local.recovery_flags = policy.recovery_flags;
+        local.payload_bytes = policy.payload_bytes; local.directions = policy.directions; local.recovery_flags = policy.recovery_flags |
+            (queue.terminal() == GpuQueueTerminal::kernel_header ? gpu_queue_terminal_kernel : 0U);
         std::copy_n(queue.binding().local_uuid, 16, local.local.begin()); std::copy_n(queue.binding().peer_uuid, 16, local.peer.begin());
         std::copy_n(queue.binding().device_instance, 16, local.device_instance.begin());
         std::optional<GpuQueuePeerFrame> peer;

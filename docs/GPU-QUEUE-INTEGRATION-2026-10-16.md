@@ -37,6 +37,36 @@ fences while another producer still needs the GPU. It is a serialized-owner API.
 It does not automatically replace the model dispatcher's production transport,
 turn a physical link into multiple links, or grant production qualification.
 
+## Terminal format (driver patch 0016)
+
+The last frame of every operation is its terminal. Two formats exist; a queue
+uses one for its whole lifetime (`GpuQueueExpected::terminal`) because the
+driver refuses to re-prepare a slot with different flags.
+
+- `kernel_header` (runner default, `--terminal kernel`): PREPARE sets
+  `SGU_PREPARE_TERMINAL_HEADER` with `terminal_bytes = SGU_TERMINAL_HEADER_BYTES`
+  (64). The TX kernel builds `struct sgu_terminal_header` itself; the RX kernel
+  lands it in kernel memory and checks magic, version, the import's connection
+  epoch, sequence, payload bytes, payload frame count and slot before EVENT
+  reports completion. A mismatch is reported as `SGU_FRAME_ERROR_TERMINAL`
+  (`GpuQueueTerminalMismatch` in the adapter); the queue is failed and only
+  STOP/RELEASE/RECOVER with a strictly newer epoch remain. The DMA-BUF terminal
+  slot is not used and the GPU no longer writes or reads a terminal record.
+  Requires `SGU_CAP_TERMINAL_HEADER` from `SGU_IOC_QUEUE`; without it the queue
+  constructor refuses instead of silently downgrading.
+- `application` (`--terminal application`): the legacy 32-byte record
+  (epoch, sequence, endpoint-salted tag, bytes) written by the GPU producer into
+  the DMA-BUF terminal slot and compared by the GPU consumer. Kept for drivers
+  without 0016 and for comparison runs.
+
+Peers agree on the format before any DMA: kernel-header sessions set
+`gpu_queue_terminal_kernel` (0x40) in the HELLO flags word, which must match
+exactly, and the runner adds `terminal-kernel-header-v1` to the contract hash.
+A peer built before this change rejects the unknown bit, so mixed formats never
+run. Sequence numbers already match by construction: RX slot `s` of window `w`
+uses the same sequence as the peer's TX slot `s`. The kernel validates framing,
+not payload integrity; the GPU byte verification below is unchanged.
+
 ## GPU visibility and end-to-end correctness
 
 On the receive path, the GPU verifies every byte of **raw RX before any acquire,
@@ -151,7 +181,7 @@ args=(
   --epoch "$FRESH_EPOCH" --request-id "$REQUEST_ID"
   --role "$ROLE" --control-mode "$CONTROL_MODE" --control-port "$LOOPBACK_PORT"
   --payload-bytes 4097 --ring-frames 32 --queue-depth 8 --windows 4
-  --full-duplex --timeout-ms 30000
+  --full-duplex --timeout-ms 30000 --terminal kernel
 )
 build/gpu-queue/strix-gpu-queue-visibility "${args[@]}" --check-config
 # The following command performs actual allocation, GPU work and USB4 DMA.
@@ -184,7 +214,7 @@ Materialize the driver from its current `main` and the genuine pinned Linux base
 Then run the engine tests with that source and the driver's canonical headers:
 
 ```sh
-export USB4_SOURCE_TREE=/absolute/path/materialized-nine-patch-driver
+export USB4_SOURCE_TREE=/absolute/path/materialized-driver   # series through 0016 or later
 export USB4_DRIVER_REPO=/absolute/path/strix-halo-usb4-driver
 python3 -m unittest discover -s tests -p 'test_*gpu*.py' -v
 ```

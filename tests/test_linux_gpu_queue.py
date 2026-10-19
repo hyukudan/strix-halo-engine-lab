@@ -1,6 +1,7 @@
 """Compile the engine adapter against the complete driver with kernel-API/DMA doubles.
 
-USB4_SOURCE_TREE must be an independently materialized nine-patch driver tree.
+USB4_SOURCE_TREE must be an independently materialized driver tree that includes
+patch 0016 (kernel-validated terminal header); its UAPI must equal ours byte for byte.
 This does not execute a kernel, GPU instructions or cache-coherence behavior.
 """
 import os
@@ -15,13 +16,15 @@ CASES = ('group_success', 'group_network', 'group_admission', 'group_failure', '
          'paired_duplex', 'paired_oneway', 'paired_recovery', 'ambiguous_release', 'ambiguous_recovery',
          'failed_dependency', 'recovery', 'stop_retention', 'identity', 'wire',
          'session', 'session_rx', 'session_tx', 'session_recovery', 'session_bad_credit', 'session_bad_gpu',
+         'terminal_kernel', 'terminal_mismatch', 'terminal_unsupported', 'terminal_wire', 'session_terminal',
+         'paired_terminal', 'paired_terminal_mismatch',
          *(f'corruption{x}' for x in range(1, 9)))
 
 class LinuxGpuQueueTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if 'USB4_SOURCE_TREE' not in os.environ:
-            raise RuntimeError('Set USB4_SOURCE_TREE to the materialized nine-patch driver tree')
+            raise RuntimeError('Set USB4_SOURCE_TREE to the materialized driver tree (series through 0016 or later)')
         source = Path(os.environ['USB4_SOURCE_TREE']).resolve()
         if (source / 'include/uapi/linux/strix_gpu_stream.h').read_bytes() != (ROOT / 'include/strix/linux_direct_gpu_stream_uapi.h').read_bytes():
             raise RuntimeError('Engine/driver UAPI drift: byte-for-byte header verification failed')

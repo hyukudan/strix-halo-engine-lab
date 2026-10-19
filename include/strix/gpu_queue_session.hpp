@@ -21,6 +21,10 @@ inline constexpr std::uint32_t gpu_queue_hello = 1, gpu_queue_ready = 2,
     gpu_queue_reset_done = 5, gpu_queue_reset_failed = 6;
 inline constexpr std::uint32_t gpu_queue_reset_controller = 0x10,
     gpu_queue_reset_network = 0x20;
+// Feature bit in the same flags word: both peers use the kernel-validated
+// terminal header (GpuQueueTerminal::kernel_header). Peers must agree exactly;
+// a decoder without this bit rejects the frame, so mixed modes never run.
+inline constexpr std::uint32_t gpu_queue_terminal_kernel = 0x40;
 [[nodiscard]] std::vector<std::byte> encode_gpu_queue_peer_frame(const GpuQueuePeerFrame&);
 [[nodiscard]] GpuQueuePeerFrame decode_gpu_queue_peer_frame(std::span<const std::byte>);
 void require_gpu_queue_peer(const GpuQueuePeerFrame& local, const GpuQueuePeerFrame& peer,
@@ -40,10 +44,12 @@ struct GpuQueueSessionGpu {
 struct GpuQueueSessionPolicy {
     std::array<std::uint8_t, 32> campaign{};
     std::uint64_t payload_bytes = 0;
+    // Must equal queue.required_terminal_bytes() when that is nonzero.
     std::uint32_t windows = 1, directions = 3, terminal_bytes = 32;
     std::uint32_t recovery_every_windows = 0, maximum_progress_calls = 100000;
     std::chrono::milliseconds window_timeout{10000};
     // Additive wire feature negotiation: old decoders reject nonzero flags.
+    // Only reset bits here; gpu_queue_terminal_kernel follows queue.terminal().
     std::uint32_t recovery_flags = 0;
     bool independent_control = false;
 };

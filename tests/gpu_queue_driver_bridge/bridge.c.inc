@@ -35,12 +35,21 @@ int queue_fixture_ioctl(void *value,unsigned long command,void *argument) {
 void queue_fixture_pool(void *value,struct sgu_buffer *tx,struct sgu_buffer *rx) {
     const struct sgu_import p=import_request(value,1);*tx=p.tx;*rx=p.rx;
 }
+static int corrupt_terminal;
+void queue_fixture_corrupt_terminal(int enabled){corrupt_terminal=enabled;}
 void queue_fixture_complete(void *value,unsigned direction,unsigned slot) {
     struct fixture *f=value;struct tbstream_gpu_context *ctx=f->sdev.gpu_context;
     assert(direction<=1&&slot<ctx->queue_depth);
     struct sgu_hw_operation *op=&ctx->operations[direction][slot];
     struct tb_ring *ring=direction?f->sdev.rx_ring.ring:f->sdev.tx_ring.ring;
     assert(op->phase==SGU_OP_PENDING);
+    if(direction==SGU_DIRECTION_RX&&(op->request.flags&SGU_PREPARE_TERMINAL_HEADER)){
+        /* The matching peer's kernel-built header, written where the controller would. */
+        assert(ctx->terminal_page[direction][slot]);
+        sgu_terminal_build(page_address(ctx->terminal_page[direction][slot]),ctx->identity.connection_epoch,
+                           op->request.sequence+(corrupt_terminal?1:0),op->request.payload_bytes,op->payload_frames,slot);
+        corrupt_terminal=0;
+    }
     for(unsigned n=0;n<op->total_frames;++n){
         struct sgu_hw_frame *sf=sgu_frame_at(ctx,op,n);struct ring_frame *rf=&sf->frame;
         rf->size=sf->result.expected_bytes==4096?0:sf->result.expected_bytes;

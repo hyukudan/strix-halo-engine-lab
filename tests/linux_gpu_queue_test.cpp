@@ -20,10 +20,12 @@ struct Fixture {
     bool gpu_idle=true,change_identity=false,auto_complete=false;
     int mutate_event=0,submit_again=0;unsigned long mutate_cleanup=0;
     unsigned ioctls=0; bool corrupt_reset=false;
+    unsigned hidden_features=0;
     std::unique_ptr<LinuxGpuQueue> queue;
-    Fixture(unsigned depth=8,unsigned frames=32,bool reverse=false) {
+    Fixture(unsigned depth=8,unsigned frames=32,bool reverse=false,GpuQueueTerminal terminal=GpuQueueTerminal::application,unsigned hide=0) {
+        hidden_features=hide;
         driver={queue_fixture_create(frames),queue_fixture_destroy};
-        GpuQueueExpected expected;expected.local.fill(0x11);expected.peer.fill(0x22);expected.depth=depth;expected.ring_frames=frames;
+        GpuQueueExpected expected;expected.local.fill(0x11);expected.peer.fill(0x22);expected.depth=depth;expected.ring_frames=frames;expected.terminal=terminal;
         if(reverse){queue_fixture_reverse_endpoints(driver.get());std::swap(expected.local,expected.peer);}
         GpuQueueIo io{driver,[this](unsigned long command,void* argument){
             ++ioctls;
@@ -38,6 +40,7 @@ struct Fixture {
                     case 7:e.frames[e.count].capacity=1;break;case 8:++e.handle;break;default:assert(false);}
                 mutate_event=0;
             }
+            if(!result&&command==SGU_IOC_QUEUE)static_cast<sgu_queue_config*>(argument)->features&=~hidden_features;
             if(!result&&command==SGU_IOC_RESET_GROUP&&corrupt_reset)static_cast<sgu_reset_group*>(argument)->members[0].fence.import_generation++;
             if(!result&&command==mutate_cleanup)static_cast<sgu_action*>(argument)->result=99;
             return GpuQueueSyscall{result<0?-1:result,result<0?-result:0};
@@ -150,8 +153,15 @@ void wire() {
     b.completed_mask=127;rejects([&]{require_gpu_queue_peer(a,b);});
 }
 void session(const std::string& kind) {
-    Fixture f;f.start();f.auto_complete=true;
+    const bool kernel_terminal=kind=="session_terminal";
+    Fixture f(8,32,false,kernel_terminal?GpuQueueTerminal::kernel_header:GpuQueueTerminal::application);f.start();f.auto_complete=true;
     GpuQueueSessionPolicy p;p.campaign.fill(1);p.payload_bytes=4097;p.windows=3;p.directions=3;
+    if(kernel_terminal){
+        // The policy must carry the kernel header size; a legacy size is refused up front.
+        GpuQueueSessionGpu none{[](const auto&){},[](const auto&){return true;}};
+        rejects([&]{static_cast<void>(run_gpu_queue_session(*f.queue,f.pool(),p,{true,[](auto){},[]{return std::vector<std::byte>{};}},none));});
+        p.terminal_bytes=SGU_TERMINAL_HEADER_BYTES;
+    }
     if(kind=="session_recovery")p.recovery_every_windows=1;
     if(kind=="session_rx")p.directions=2;
     if(kind=="session_tx")p.directions=1;
@@ -160,6 +170,7 @@ void session(const std::string& kind) {
         auto peer=sent;std::swap(peer.local,peer.peer);peer.device_instance.fill(7);peer.import_generation+=7;peer.pool_identity+=7;
         peer.directions=((p.directions&1U)<<1)|((p.directions&2U)>>1);
         if(peer.kind==gpu_queue_consumed)peer.completed_mask=(p.directions&1)?255:0;
+        assert(((sent.recovery_flags&gpu_queue_terminal_kernel)!=0)==kernel_terminal);
         if(kind=="session_bad_credit"&&peer.kind==gpu_queue_consumed)peer.completed_mask=0;
         return encode_gpu_queue_peer_frame(peer);
     }};
@@ -188,12 +199,17 @@ void ambiguous_cleanup(const std::string& name) {
 }
 
 void paired(const std::string& name) {
+    const bool mismatch=name=="paired_terminal_mismatch";
     int sockets[2];assert(socketpair(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC,0,sockets)==0);
     const auto child=fork();assert(child>=0);const bool reverse=child==0;
     const int socket=sockets[reverse?1:0];close(sockets[reverse?0:1]);
     {
-        Fixture f(8,32,reverse);f.start();f.auto_complete=true;
+        // paired_terminal: both peers use the kernel-validated header. The
+        // mismatch case runs the header on one peer only and must refuse.
+        const bool kernel_terminal=name=="paired_terminal"||(mismatch&&!reverse);
+        Fixture f(8,32,reverse,kernel_terminal?GpuQueueTerminal::kernel_header:GpuQueueTerminal::application);f.start();f.auto_complete=true;
         GpuQueueSessionPolicy policy;policy.campaign.fill(1);policy.payload_bytes=4097;policy.windows=3;policy.directions=3;
+        if(kernel_terminal)policy.terminal_bytes=SGU_TERMINAL_HEADER_BYTES;
         if(name=="paired_oneway")policy.directions=reverse?2:1;
         if(name=="paired_recovery"||name=="paired_controller"||name=="paired_network")policy.recovery_every_windows=1;
         if(name=="paired_controller"||name=="paired_network")policy.recovery_flags=gpu_queue_reset_controller;
@@ -205,6 +221,11 @@ void paired(const std::string& name) {
             bytes.resize(static_cast<std::size_t>(count));return bytes;
         }};
         const auto result=run_gpu_queue_session(*f.queue,f.pool(),policy,io,{[](const auto&){},[](const auto&){return true;}});
+        if(mismatch){
+            assert(result.cleanup_released&&!result.error.empty()&&result.completed_windows==0);
+            close(socket);if(reverse)std::_Exit(0);
+            int status=0;assert(waitpid(child,&status,0)==child&&WIFEXITED(status)&&WEXITSTATUS(status)==0);return;
+        }
         assert(result.cleanup_released&&result.error.empty()&&result.completed_windows==3);
         assert(result.recoveries==((name=="paired_recovery"||name=="paired_controller"||name=="paired_network")?2:0));
         assert(result.controller_resets==((name=="paired_controller"||name=="paired_network")?2:0));
@@ -252,6 +273,47 @@ void reset_wire() {
     a.recovery_flags=0;rejects([&]{encode_gpu_queue_peer_frame(a);});
 }
 
+void terminal(const std::string& name) {
+    if(name=="terminal_unsupported"){
+        // A driver without 0016 cannot be asked for the kernel header.
+        rejects([&]{Fixture f(8,32,false,GpuQueueTerminal::kernel_header,SGU_CAP_TERMINAL_HEADER);});
+        Fixture legacy(8,32,false,GpuQueueTerminal::application,SGU_CAP_TERMINAL_HEADER);legacy.start();
+        auto op=legacy.queue->prepare(1,0,1,4097,32);assert(legacy.queue->submit(op));legacy.finish(op);legacy.consume(op);
+        assert(legacy.queue->release());return;
+    }
+    if(name=="terminal_wire"){
+        GpuQueuePeerFrame a;a.campaign.fill(1);a.local.fill(2);a.peer.fill(3);a.device_instance.fill(4);
+        a.epoch=1;a.import_generation=2;a.pool_identity=3;a.first_sequence=1;a.payload_bytes=4097;
+        a.depth=8;a.ring_frames=32;a.kind=gpu_queue_hello;a.directions=3;a.recovery_flags=gpu_queue_terminal_kernel;
+        assert(decode_gpu_queue_peer_frame(encode_gpu_queue_peer_frame(a))==a);
+        auto b=a;std::swap(b.local,b.peer);require_gpu_queue_peer(a,b);
+        b.recovery_flags=0;rejects([&]{require_gpu_queue_peer(a,b);});rejects([&]{require_gpu_queue_peer(b,a);});
+        a.recovery_flags|=gpu_queue_reset_controller;b=a;std::swap(b.local,b.peer);require_gpu_queue_peer(a,b);
+        a.recovery_flags=0x80;rejects([&]{static_cast<void>(encode_gpu_queue_peer_frame(a));});return;
+    }
+    Fixture f(8,32,false,GpuQueueTerminal::kernel_header);f.start();
+    assert(f.queue->terminal()==GpuQueueTerminal::kernel_header&&f.queue->required_terminal_bytes()==SGU_TERMINAL_HEADER_BYTES);
+    const auto before=f.ioctls;
+    rejects([&]{f.queue->prepare(1,0,1,4097,32);});assert(f.ioctls==before&&!f.queue->failed());
+    if(name=="terminal_mismatch"){
+        auto op=f.queue->prepare(1,0,1,4097,SGU_TERMINAL_HEADER_BYTES);assert(f.queue->submit(op));
+        queue_fixture_corrupt_terminal(1);queue_fixture_complete(f.driver.get(),1,0);
+        bool mismatch=false;
+        try{static_cast<void>(f.queue->poll());}catch(const GpuQueueTerminalMismatch&){mismatch=true;}
+        assert(mismatch&&f.queue->failed());rejects([&]{f.queue->gpu_consumed(op);});
+        assert(f.queue->recover());f.start(2);
+        auto next=f.queue->prepare(1,0,1,4097,SGU_TERMINAL_HEADER_BYTES);assert(f.queue->submit(next));f.finish(next);f.consume(next);
+        assert(f.queue->release());return;
+    }
+    // Every slot both ways; EVENT still reports the terminal at its slot offset.
+    std::vector<GpuQueueOperation> ops;
+    for(unsigned dir=0;dir<2;++dir)for(unsigned slot=0;slot<8;++slot){
+        auto op=f.queue->prepare(dir,slot,slot+1,4097+slot,SGU_TERMINAL_HEADER_BYTES);if(!dir)f.queue->gpu_produced(op);assert(f.queue->submit(op));ops.push_back(op);
+    }
+    for(auto& op:ops){f.finish(op);f.consume(op);}
+    const auto stats=f.queue->stats();assert(stats.completions[0]==8&&stats.completions[1]==8);
+    assert(f.queue->release());
+}
 }
 int main(int argc,char** argv) {
     assert(argc==2);std::string name=argv[1];
@@ -261,6 +323,7 @@ int main(int argc,char** argv) {
     else if(name=="failed_dependency")failed_dependency();else if(name=="recovery")recovery();else if(name=="stop_retention")stop_retention();
     else if(name.starts_with("ambiguous"))ambiguous_cleanup(name);
     else if(name.starts_with("paired"))paired(name);
+    else if(name.starts_with("terminal"))terminal(name);
     else if(name=="identity")identity();else if(name=="wire")wire();else if(name.starts_with("session"))session(name);
     else if(name.starts_with("corruption"))corruption(std::stoi(name.substr(10)));else assert(false);
     std::cout<<"PASS "<<name<<'\n';

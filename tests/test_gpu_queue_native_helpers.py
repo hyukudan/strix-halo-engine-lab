@@ -23,7 +23,8 @@ class NativeHelpers(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout+p.stderr)
         self.assertIn('PASS '+case, p.stdout)
 for kind, cases in [('memory', ['normal','bounds','null_lease','partial_allocation','busy','capture','timeout','device','repeat_allocation']),
-                    ('options', ['controller','network','network_no_control','network_only','controller_no_schedule','controller_duplicate','valid','duplex','ack','duplicate','geometry','depth','legacy','epoch','budget'])]:
+                    ('options', ['controller','network','network_no_control','network_only','controller_no_schedule','controller_duplicate','valid','duplex','ack','duplicate','geometry','depth','legacy','epoch','budget',
+                                'terminal_application','terminal_kernel','terminal_unknown','terminal_duplicate','terminal_missing'])]:
     for case in cases:
         setattr(NativeHelpers, 'test_'+kind+'_'+case, lambda self, kind=kind, case=case: self.case(kind,case))
 if __name__ == '__main__':

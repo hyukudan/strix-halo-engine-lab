@@ -59,7 +59,8 @@ int run(const Options& options){
         throw std::runtime_error("queue GPU UUID/runtime/architecture differs from exact expectation");
     // The operator must maintain exclusive ConfigFS mode/route ownership across
     // preflight/open/close. A build ID alone cannot prove gpu_direct selection.
-    LinuxGpuQueue queue(open_linux_gpu_queue(o.device,preflight),GpuQueueExpected{bytes_uuid(o.local),bytes_uuid(o.peer),o.ring_frames,options.depth});
+    const auto terminal_format=options.kernel_terminal?GpuQueueTerminal::kernel_header:GpuQueueTerminal::application;
+    LinuxGpuQueue queue(open_linux_gpu_queue(o.device,preflight),GpuQueueExpected{bytes_uuid(o.local),bytes_uuid(o.peer),o.ring_frames,options.depth,terminal_format});
     AllocationGenerationSource generations;
     auto allocator=std::make_shared<HipDirectGpuPoolAllocator>(device,HipDirectGpuPoolPolicy{true,128ULL*1024*1024,4096,2ULL*1024*1024});
     const auto geometry=plan_multi_link_transport_pools(std::array{DirectFrameGeometry{4096,o.ring_frames,true}});
@@ -76,12 +77,14 @@ int run(const Options& options){
     auto canonical=o.campaign+"\n"+o.run+"\n"+o.link+"\n"+std::to_string(o.request)+"\n"+std::to_string(o.seed)+"\n"+
         std::to_string(o.bytes)+"\n"+std::to_string(options.depth)+"\n"+std::to_string(options.windows)+"\n"+std::to_string(options.recovery_every)+"\nqueue-gpu-v1";
     if(options.controller_reset) canonical+="\ncontroller-reset-v1\n"+std::to_string(options.include_network);
+    // Part of the agreed contract hash as well as the HELLO feature bit.
+    if(options.kernel_terminal) canonical+="\nterminal-kernel-header-v1";
     const auto hash=sha256_bytes({reinterpret_cast<const std::byte*>(canonical.data()),canonical.size()});
     const auto tag=gpu_visibility_mix(o.seed^o.request^0x715545554531ULL);
     auto control=std::make_shared<BoundedCommissioningTcpControl>(CommissioningTcpPolicy{o.listener,o.port,2048,100000,o.timeout});
     queue.import_pool(pool,o.epoch,binding.pool_binding_identity);queue.arm();
     GpuQueueSessionPolicy policy;std::copy(hash.bytes.begin(),hash.bytes.end(),policy.campaign.begin());policy.payload_bytes=o.bytes;
-    policy.windows=options.windows;policy.directions=options.full_duplex?3:o.receiver?2:1;policy.terminal_bytes=sizeof(Terminal);
+    policy.windows=options.windows;policy.directions=options.full_duplex?3:o.receiver?2:1;policy.terminal_bytes=options.kernel_terminal?SGU_TERMINAL_HEADER_BYTES:static_cast<std::uint32_t>(sizeof(Terminal));
     policy.recovery_every_windows=options.recovery_every;policy.window_timeout=o.timeout;
     policy.recovery_flags=options.controller_reset?gpu_queue_reset_controller:0U;
     if(options.include_network)policy.recovery_flags|=gpu_queue_reset_network;
@@ -99,8 +102,12 @@ int run(const Options& options){
             probes[op.slot]->produce(std::array{GpuVisibilityRange{s.views[0].address,op.payload_bytes}},pattern);
             check(hipMemcpyAsync(reinterpret_cast<void*>(binding.pool.tx.address+op.pool_offset),reinterpret_cast<const void*>(s.views[0].address),
                 static_cast<std::size_t>(op.payload_bytes),hipMemcpyDeviceToDevice,s.stream),"queue TX pack");
-            *s.terminal=terminal_for(op);
-            check(hipMemcpyAsync(reinterpret_cast<void*>(binding.pool.tx.address+queue.terminal_offset(op.slot)),s.terminal,sizeof(Terminal),hipMemcpyHostToDevice,s.stream),"queue TX terminal publish");
+            // Kernel terminal mode: the kernel builds and sends the header; the
+            // DMA-BUF terminal slot is not read by the controller.
+            if(!options.kernel_terminal){
+                *s.terminal=terminal_for(op);
+                check(hipMemcpyAsync(reinterpret_cast<void*>(binding.pool.tx.address+queue.terminal_offset(op.slot)),s.terminal,sizeof(Terminal),hipMemcpyHostToDevice,s.stream),"queue TX terminal publish");
+            }
             memory->wait(op.slot);receipt.producer=true;receipts.push_back(receipt);
         },
         [&](const GpuQueueOperation& op){
@@ -114,8 +121,11 @@ int run(const Options& options){
             }
             check(hipMemcpyAsync(reinterpret_cast<void*>(s.views[1].address),reinterpret_cast<const void*>(raw),static_cast<std::size_t>(op.payload_bytes),hipMemcpyDeviceToDevice,s.stream),"queue RX acquire");
             check(hipMemcpyAsync(reinterpret_cast<void*>(s.views[2].address),reinterpret_cast<const void*>(s.views[1].address),static_cast<std::size_t>(op.payload_bytes),hipMemcpyDeviceToDevice,s.stream),"queue RX unpack");
-            check(hipMemcpyAsync(s.terminal,reinterpret_cast<const void*>(binding.pool.rx.address+queue.terminal_offset(op.slot)),sizeof(Terminal),hipMemcpyDeviceToHost,s.stream),"queue RX terminal acquire");
-            memory->wait(op.slot);receipt.terminal=*s.terminal==terminal_for(op);
+            // Kernel terminal mode: a completed EVENT already proves the peer's
+            // header matched epoch, sequence, size, frame count and slot.
+            if(!options.kernel_terminal)
+                check(hipMemcpyAsync(s.terminal,reinterpret_cast<const void*>(binding.pool.rx.address+queue.terminal_offset(op.slot)),sizeof(Terminal),hipMemcpyDeviceToHost,s.stream),"queue RX terminal acquire");
+            memory->wait(op.slot);receipt.terminal=options.kernel_terminal||*s.terminal==terminal_for(op);
             receipt.copied=probes[op.slot]->verify(std::array{GpuVisibilityRange{s.views[2].address,op.payload_bytes}},pattern);
             receipt.verified=receipt.terminal&&valid_gpu_visibility_result(receipt.raw,pattern,receipt.raw.nonce,op.payload_bytes)&&
                 valid_gpu_visibility_result(receipt.copied,pattern,receipt.copied.nonce,op.payload_bytes);
@@ -141,7 +151,7 @@ int run(const Options& options){
         <<",\"runtime_version\":"<<device.runtime_version<<",\"gpu_driver_version\":"<<device.driver_version<<",\"device_instance\":"<<quote(uuid(instance))
         <<",\"physical_link\":"<<quote(o.link)<<",\"request_id\":"<<o.request<<",\"seed\":"<<o.seed<<",\"ring_frames\":"<<o.ring_frames<<",\"recovery_every\":"<<options.recovery_every
         <<",\"epoch\":"<<o.epoch<<",\"final_epoch\":"<<report.final_epoch<<",\"bytes\":"<<o.bytes<<",\"depth\":"<<options.depth<<",\"windows\":"<<options.windows
-        <<",\"directions\":"<<policy.directions<<",\"completed_windows\":"<<report.completed_windows<<",\"completed_tx\":"<<report.completed_tx<<",\"completed_rx\":"<<report.completed_rx
+        <<",\"directions\":"<<policy.directions<<",\"terminal_format\":"<<quote(options.kernel_terminal?"kernel_header":"application")<<",\"completed_windows\":"<<report.completed_windows<<",\"completed_tx\":"<<report.completed_tx<<",\"completed_rx\":"<<report.completed_rx
         <<",\"controller_reset_requested\":"<<b(options.controller_reset)<<",\"network_recovery_requested\":"<<b(options.include_network)<<",\"controller_resets\":"<<report.controller_resets<<",\"recoveries\":"<<report.recoveries<<",\"peak_outstanding_tx\":"<<report.peak_inflight_tx<<",\"peak_outstanding_rx\":"<<report.peak_inflight_rx<<",\"elapsed_ns\":"<<elapsed
         <<",\"cleanup\":"<<quote(report.cleanup_released?"released":"retained")<<",\"transfers\":[";
     for(std::size_t n=0;n<receipts.size();++n){if(n)std::cout<<',';const auto& r=receipts[n];const auto& op=r.operation;
@@ -157,13 +167,15 @@ int main(int argc,char** argv){
     if(argc==2&&std::string_view(argv[1])=="--help"){
         std::cout<<"Experimental native GPU queue runner: normal gpu_visibility identity arguments, plus\n"
             "--configured-gpu-direct --queue-depth 2..8 --windows 1..128 [--full-duplex] [--recover-every N].\n"
+            "--terminal kernel|application (default kernel: driver-validated 64-byte terminal, needs\n"
+            "SGU_CAP_TERMINAL_HEADER on both hosts; application: legacy 32-byte GPU record). Same on both peers.\n"
             "Optional --controller-reset with --recover-every N: privileged local group reset after peer stop agreement.\n"
             "--include-network --independent-control permits USB4NET outage; control must use another physical path.\n"
             "Use --check-config for no HIP/driver/socket work. --iterations/--duplex-pairs are rejected.\n"
             "Authenticated SSH loopback tunnel and exclusive provisioned ConfigFS ownership are required.\n";return 0;
     }
     try{const auto options=queue_lab::parse(argc,argv);
-        if(options.base.check_only){std::cout<<"{\"schema\":\"strix-gpu-queue-config-v1\",\"executed\":false,\"production_qualified\":false,\"depth\":"<<options.depth<<",\"windows\":"<<options.windows<<"}\n";return 0;}
+        if(options.base.check_only){std::cout<<"{\"schema\":\"strix-gpu-queue-config-v1\",\"executed\":false,\"production_qualified\":false,\"depth\":"<<options.depth<<",\"windows\":"<<options.windows<<",\"terminal_format\":\""<<(options.kernel_terminal?"kernel_header":"application")<<"\"}\n";return 0;}
         return run(options);
     }catch(const std::exception& error){std::cout<<"{\"schema\":\"strix-gpu-queue-error-v1\",\"production_qualified\":false,\"error\":"<<quote(error.what())<<"}\n";return 1;}
 }

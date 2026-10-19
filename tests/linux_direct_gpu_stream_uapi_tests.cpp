@@ -27,6 +27,13 @@ static_assert(sizeof(sgu_prepare) == 152 && alignof(sgu_prepare) == 8);
 static_assert(offsetof(sgu_prepare, handle) == 104);
 static_assert(offsetof(sgu_prepare, pool_offset) == 120);
 static_assert(offsetof(sgu_prepare, terminal_bytes) == 136);
+// 0016: the former reserved word carries flags; layout and size are unchanged.
+static_assert(offsetof(sgu_prepare, flags) == 144 && offsetof(sgu_prepare, reserved) == 144);
+static_assert(SGU_PREPARE_TERMINAL_HEADER == 1ULL && SGU_CAP_TERMINAL_HEADER == 256U && SGU_FRAME_ERROR_TERMINAL == 128U);
+static_assert(sizeof(sgu_terminal_header) == SGU_TERMINAL_HEADER_BYTES && SGU_TERMINAL_HEADER_BYTES == 64U);
+static_assert(offsetof(sgu_terminal_header, connection_epoch) == 8 && offsetof(sgu_terminal_header, sequence) == 16);
+static_assert(offsetof(sgu_terminal_header, payload_bytes) == 24 && offsetof(sgu_terminal_header, payload_frames) == 32);
+static_assert(offsetof(sgu_terminal_header, slot) == 36 && offsetof(sgu_terminal_header, reserved) == 40);
 static_assert(sizeof(sgu_action) == 136 && alignof(sgu_action) == 8);
 static_assert(offsetof(sgu_action, direction) == 120);
 static_assert(sizeof(sgu_frame_result) == 32 && alignof(sgu_frame_result) == 8);

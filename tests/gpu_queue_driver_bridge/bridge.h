@@ -16,6 +16,8 @@ void queue_fixture_inject_stop_failure(int enabled);
 void queue_fixture_identity_change(void*);
 int queue_fixture_fd(void *value);
 void queue_fixture_inject_reset_failure(int code);
+/* Next RX kernel-header terminal delivered with a wrong sequence (peer mismatch). */
+void queue_fixture_corrupt_terminal(int enabled);
 #ifdef __cplusplus
 }
 #endif

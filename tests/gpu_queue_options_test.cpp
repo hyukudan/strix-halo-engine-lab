@@ -11,7 +11,12 @@ std::vector<std::string> arguments(){return {"queue","--experimental-commissioni
  "--payload-bytes","4097","--control-port","41100","--gpu-runtime-version","1","--gpu-driver-version","1"};}
 queue_lab::Options parse(std::vector<std::string> args){std::vector<char*> pointers;for(auto& a:args)pointers.push_back(a.data());return queue_lab::parse(static_cast<int>(pointers.size()),pointers.data());}
 int main(int argc,char** argv){assert(argc==2);const std::string name=argv[1];auto args=arguments();bool negative=true;
- if(name=="valid"){auto o=parse(args);assert(o.depth==8&&o.windows==4&&!o.full_duplex);negative=false;}
+ if(name=="valid"){auto o=parse(args);assert(o.depth==8&&o.windows==4&&!o.full_duplex&&o.kernel_terminal);negative=false;}
+ else if(name=="terminal_application"){args.insert(args.end(),{"--terminal","application"});auto o=parse(args);assert(!o.kernel_terminal);negative=false;}
+ else if(name=="terminal_kernel"){args.insert(args.end(),{"--terminal","kernel"});auto o=parse(args);assert(o.kernel_terminal);negative=false;}
+ else if(name=="terminal_unknown"){args.insert(args.end(),{"--terminal","auto"});}
+ else if(name=="terminal_duplicate"){args.insert(args.end(),{"--terminal","kernel","--terminal","application"});}
+ else if(name=="terminal_missing"){args.insert(args.end(),{"--terminal"});}
  else if(name=="duplex"){args.insert(args.end(),{"--full-duplex","--queue-depth","4","--windows","3","--recover-every","1"});auto o=parse(args);assert(o.depth==4&&o.windows==3&&o.recovery_every==1&&o.full_duplex);negative=false;}
  else if(name=="controller"){args.insert(args.end(),{"--controller-reset","--recover-every","1"});auto o=parse(args);assert(o.controller_reset&&!o.include_network);negative=false;}
  else if(name=="network"){args.insert(args.end(),{"--controller-reset","--recover-every","1","--include-network","--independent-control"});auto o=parse(args);assert(o.include_network&&o.independent_control);negative=false;}

@@ -91,6 +91,10 @@ def validate(report: dict[str, Any]) -> dict[tuple[int,int,int,int], dict[str,An
             require(integer(report['peak_outstanding_'+suffix])==(depth if active else 0),'wrong software outstanding count')
         canonical='\n'.join(str(report[k]) for k in ('campaign','run','physical_link','request_id','seed','bytes','depth','windows','recovery_every'))+'\nqueue-gpu-v1'
         if reset_requested: canonical+='\ncontroller-reset-v1\n'+str(int(network_requested))
+        # Receipts older than the kernel-validated terminal carry no field: legacy profile.
+        terminal_format=report.get('terminal_format','application')
+        require(terminal_format in ('application','kernel_header'),'unknown terminal format')
+        if terminal_format=='kernel_header': canonical+='\nterminal-kernel-header-v1'
         require(hex_id(report['contract_sha256'],64)==hashlib.sha256(canonical.encode('ascii')).hexdigest(),'campaign contract hash differs')
         transfers=report['transfers']
         require(type(transfers) is list and len(transfers)==count*(2 if directions==3 else 1),'wrong receipt coverage')
@@ -144,6 +148,7 @@ def pair_reports(a: dict[str,Any], b: dict[str,Any]) -> dict[str,Any]:
     require(b['directions']==((a['directions']&1)<<1)|((a['directions']&2)>>1),'directions are not complementary')
     for name in ('campaign','run','contract_sha256','epoch','final_epoch','depth','windows','bytes','ring_frames','recoveries','recovery_every'):
         require(a[name]==b[name],'paired schedule differs: '+name)
+    require(a.get('terminal_format','application')==b.get('terminal_format','application'),'paired terminal format differs')
     for flag in ('controller_reset_requested','network_recovery_requested','controller_resets'):
         require(a.get(flag,False if flag.endswith('requested') else 0)==b.get(flag,False if flag.endswith('requested') else 0),'paired reset policy differs')
     for key in aa:
@@ -152,7 +157,7 @@ def pair_reports(a: dict[str,Any], b: dict[str,Any]) -> dict[str,Any]:
     return dict(schema='strix-gpu-queue-evidence-summary-v1',structurally_consistent=True,
                 authenticity_verified=False,production_qualified=False,
                 campaign=a['campaign'],run=a['run'],depth=a['depth'],windows=a['windows'],
-                duplex=a['directions']==3,recoveries=a['recoveries'],
+                duplex=a['directions']==3,recoveries=a['recoveries'],terminal_format=a.get('terminal_format','application'),
                 verified_payload_bytes=a['bytes']*a['depth']*a['windows']*(2 if a['directions']==3 else 1))
 
 def main() -> int:

@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <span>
+#include <stdexcept>
 
 namespace strix::transport {
 
@@ -25,9 +26,27 @@ struct GpuQueueIo {
 [[nodiscard]] GpuQueueIo open_linux_gpu_queue(const std::string& path,
     std::function<void()> require_provisioned_route);
 
+// Who builds and checks the last (terminal) frame of every operation. Fixed for
+// the queue's lifetime: the kernel refuses to re-prepare a slot with other flags.
+//  application: legacy profile. The GPU producer writes its own terminal record
+//    (1..4096 bytes) into the DMA-BUF terminal slot and the consumer checks it.
+//  kernel_header: SGU_PREPARE_TERMINAL_HEADER (driver patch 0016). TX sends a
+//    kernel-built 64-byte sgu_terminal_header; RX lands it in kernel memory and
+//    validates epoch, sequence, payload size, frame count and slot before EVENT
+//    reports completion. Requires SGU_CAP_TERMINAL_HEADER on this kernel, the
+//    same mode on the peer (agreed in the session HELLO) and matching sequences.
+enum class GpuQueueTerminal : std::uint32_t { application = 0, kernel_header = 1 };
 struct GpuQueueExpected {
     std::array<std::uint8_t, 16> local{}, peer{};
     std::uint32_t ring_frames = 0, depth = 0;
+    GpuQueueTerminal terminal = GpuQueueTerminal::application;
+};
+// EVENT reported SGU_FRAME_ERROR_TERMINAL: the peer's kernel-built terminal did
+// not match this operation (epoch, sequence, size, frame count or slot), or a
+// payload frame landed in the terminal slot. The queue is failed; only STOP,
+// RELEASE or RECOVER with a strictly newer epoch are allowed afterwards.
+struct GpuQueueTerminalMismatch final : std::runtime_error {
+    using std::runtime_error::runtime_error;
 };
 struct GpuQueuePool {
     sgu_buffer tx{}, rx{};
@@ -69,6 +88,10 @@ public:
     [[nodiscard]] std::uint32_t depth() const noexcept;
     [[nodiscard]] std::uint64_t slot_capacity() const noexcept;
     [[nodiscard]] std::uint64_t terminal_offset(std::uint32_t slot) const;
+    [[nodiscard]] GpuQueueTerminal terminal() const noexcept;
+    // terminal_bytes every PREPARE must use: SGU_TERMINAL_HEADER_BYTES in
+    // kernel_header mode, 0 (caller-chosen 1..4096) in application mode.
+    [[nodiscard]] std::uint32_t required_terminal_bytes() const noexcept;
     void import_pool(GpuQueuePool, std::uint64_t epoch, std::uint64_t pool_identity);
     void arm();
     [[nodiscard]] GpuQueueOperation prepare(std::uint32_t direction, std::uint32_t slot,

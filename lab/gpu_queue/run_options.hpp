@@ -6,16 +6,27 @@ struct Options {
     visibility_lab::RunOptions base;
     unsigned depth = 8, windows = 4, recovery_every = 0;
     bool full_duplex = false, configured_gpu_direct = false, controller_reset = false, include_network = false, independent_control = false;
+    // kernel: kernel-built and kernel-validated 64-byte terminal (driver 0016,
+    // SGU_CAP_TERMINAL_HEADER). application: legacy 32-byte GPU-written record.
+    // Both peers must pass the same value; the session HELLO refuses a mismatch.
+    bool kernel_terminal = true;
 };
 inline Options parse(int argc, char** argv) {
     Options out; std::vector<char*> remaining{argv[0]};
-    bool seen_depth=false, seen_windows=false, seen_recovery=false;
+    bool seen_depth=false, seen_windows=false, seen_recovery=false, seen_terminal=false;
     for(int n=1;n<argc;++n) {
         const std::string_view key=argv[n];
         if(key=="--controller-reset" || key=="--include-network" || key=="--independent-control") {
             bool& value=key=="--controller-reset"?out.controller_reset:key=="--include-network"?out.include_network:out.independent_control;
             if(value)throw std::invalid_argument("duplicate controller recovery option");
             value=true;continue;
+        }
+        if(key=="--terminal") {
+            if(seen_terminal)throw std::invalid_argument("duplicate terminal format");
+            if(n+1>=argc)throw std::invalid_argument("missing terminal format");
+            const std::string_view value=argv[++n];
+            if(value!="kernel"&&value!="application")throw std::invalid_argument("--terminal must be kernel or application");
+            seen_terminal=true;out.kernel_terminal=value=="kernel";continue;
         }
         if(key=="--configured-gpu-direct") { if(out.configured_gpu_direct)throw std::invalid_argument("duplicate route acknowledgment");out.configured_gpu_direct=true;continue; }
         if(key=="--full-duplex") { if(out.full_duplex)throw std::invalid_argument("duplicate duplex mode");out.full_duplex=true;continue; }

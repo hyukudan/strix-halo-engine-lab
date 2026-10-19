@@ -42,6 +42,21 @@ class QueueEvidence(unittest.TestCase):
         self.assertTrue(m.pair_reports(a,b)['structurally_consistent'])
         b['controller_resets']=1
         with self.assertRaises(m.EvidenceError):m.pair_reports(a,b)
+    def test_kernel_terminal(self):
+        a,b=fixtures()
+        for r in (a,b):
+            r['terminal_format']='kernel_header'
+            canonical='\n'.join(str(r[k]) for k in ('campaign','run','physical_link','request_id','seed','bytes','depth','windows','recovery_every'))+'\nqueue-gpu-v1\nterminal-kernel-header-v1'
+            r['contract_sha256']=hashlib.sha256(canonical.encode()).hexdigest()
+        self.assertEqual(m.pair_reports(a,b)['terminal_format'],'kernel_header')
+        legacy=fixtures()[1]
+        with self.assertRaises(m.EvidenceError):m.pair_reports(a,legacy)
+        b['terminal_format']='application'
+        with self.assertRaises(m.EvidenceError):m.pair_reports(a,b)
+        b['terminal_format']='other'
+        with self.assertRaises(m.EvidenceError):m.pair_reports(a,b)
+    def test_legacy_terminal_default(self):
+        self.assertEqual(m.pair_reports(*fixtures())['terminal_format'],'application')
     def test_network_without_reset(self):
         a,b=fixtures();b['network_recovery_requested']=True
         with self.assertRaises(m.EvidenceError):m.pair_reports(a,b)

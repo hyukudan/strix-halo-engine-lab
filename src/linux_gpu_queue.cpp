@@ -138,6 +138,7 @@ LinuxGpuQueue::LinuxGpuQueue(GpuQueueIo io, GpuQueueExpected expected)
     : impl_(std::make_unique<Impl>(std::move(io), expected)) {
     auto& i = *impl_;
     if (!i.io.lifetime || !i.io.ioctl_call || !i.io.require_current || expected.depth < 2 || expected.depth > SGU_MAX_QUEUE_DEPTH ||
+        (expected.terminal != GpuQueueTerminal::application && expected.terminal != GpuQueueTerminal::kernel_header) ||
         expected.ring_frames < 32 || expected.ring_frames > SGU_MAX_FRAMES || !nonzero(expected.local) || !nonzero(expected.peer) || expected.local == expected.peer)
         throw std::invalid_argument("GPU queue requires complete identity and bounded multi-slot geometry");
     i.observed.fence.abi_major = SGU_ABI_MAJOR; i.observed.fence.abi_minor = SGU_ABI_MINOR;
@@ -158,6 +159,8 @@ LinuxGpuQueue::LinuxGpuQueue(GpuQueueIo io, GpuQueueExpected expected)
         (config.features & required) != required || config.reserved)
         malformed("GPU queue optional queue/recovery interface is unavailable");
     i.capabilities = config.features;
+    if (expected.terminal == GpuQueueTerminal::kernel_header && !(config.features & SGU_CAP_TERMINAL_HEADER))
+        malformed("GPU queue kernel-validated terminal requested but this driver lacks SGU_CAP_TERMINAL_HEADER (patch 0016)");
     i.capacity = static_cast<std::uint64_t>((q.ring_frames - expected.depth) / expected.depth) * SGU_FRAME_BYTES;
     if (!i.capacity) malformed("GPU queue has no disjoint payload capacity");
 }
@@ -169,6 +172,10 @@ const sgu_query& LinuxGpuQueue::observation() const noexcept { return impl_->obs
 const sgu_fence& LinuxGpuQueue::binding() const noexcept { return impl_->fence; }
 std::uint32_t LinuxGpuQueue::depth() const noexcept { return impl_->expected.depth; }
 std::uint64_t LinuxGpuQueue::slot_capacity() const noexcept { return impl_->capacity; }
+GpuQueueTerminal LinuxGpuQueue::terminal() const noexcept { return impl_->expected.terminal; }
+std::uint32_t LinuxGpuQueue::required_terminal_bytes() const noexcept {
+    return impl_->expected.terminal == GpuQueueTerminal::kernel_header ? SGU_TERMINAL_HEADER_BYTES : 0U;
+}
 std::uint64_t LinuxGpuQueue::terminal_offset(std::uint32_t slot) const {
     if (slot >= depth()) throw std::invalid_argument("GPU queue terminal slot is out of range");
     return static_cast<std::uint64_t>(impl_->expected.ring_frames - depth() + slot) * SGU_FRAME_BYTES;
@@ -208,6 +215,7 @@ GpuQueueOperation LinuxGpuQueue::prepare(std::uint32_t direction, std::uint32_t 
     std::uint64_t bytes, std::uint32_t terminal_bytes) {
     auto& i = *impl_; i.current();
     if (!i.armed || i.stopped || direction > 1 || slot >= depth() || !bytes || bytes > i.capacity || !terminal_bytes || terminal_bytes > SGU_FRAME_BYTES ||
+        (required_terminal_bytes() && terminal_bytes != required_terminal_bytes()) ||
         !sequence || sequence <= i.prepared_sequence[direction] || i.operations[direction][slot] || i.last_handle == UINT64_MAX)
         throw std::invalid_argument("GPU queue PREPARE_SLOT violates geometry, ownership or monotonic identity");
     GpuQueueOperation operation{i.fence.connection_epoch, i.fence.import_generation, ++i.last_handle, sequence,
@@ -216,6 +224,7 @@ GpuQueueOperation LinuxGpuQueue::prepare(std::uint32_t direction, std::uint32_t 
     value.operation.fence = i.fence; value.operation.handle = operation.handle; value.operation.sequence = sequence;
     value.operation.pool_offset = operation.pool_offset; value.operation.payload_bytes = bytes;
     value.operation.terminal_bytes = terminal_bytes; value.operation.direction = direction;
+    value.operation.flags = i.expected.terminal == GpuQueueTerminal::kernel_header ? SGU_PREPARE_TERMINAL_HEADER : 0ULL;
     // Reserve userspace state before exposing identity. A failed ioctl is never
     // blindly replayed and no slot becomes reusable on an ambiguous result.
     auto& entry = i.operations[direction][slot]; entry.emplace(); entry->operation = operation;
@@ -261,6 +270,13 @@ std::optional<GpuQueueCompletion> LinuxGpuQueue::poll() {
         const auto result = i.raw(SGU_IOC_EVENT, &event);
         if (result.result < 0 && (result.error == EAGAIN || result.error == EINTR)) return std::nullopt;
         if (result.result != 0 || result.error) throw std::system_error(result.error ? result.error : EIO, std::generic_category(), "GPU queue EVENT");
+        if (equal_fence(event.fence, i.fence) && event.status == SGU_EVENT_FAILED && event.count <= SGU_EVENT_BATCH) {
+            std::uint32_t flags = 0;
+            for (std::uint32_t n = 0; n < event.count; ++n) flags |= event.frames[n].error_flags;
+            if ((flags & SGU_FRAME_ERROR_TERMINAL) && i.expected.terminal == GpuQueueTerminal::kernel_header)
+                throw GpuQueueTerminalMismatch("GPU queue peer terminal header rejected by the kernel (SGU_FRAME_ERROR_TERMINAL): "
+                    "epoch, sequence, payload size or slot differ between peers; RECOVER with a fresh epoch");
+        }
         if (!equal_fence(event.fence, i.fence) || event.direction > 1 || event.reserved || event.status != SGU_EVENT_COMPLETE ||
             !event.count || event.count > SGU_EVENT_BATCH || !event.monotonic_ns)
             malformed("GPU queue EVENT is failed, canceled or foreign");
