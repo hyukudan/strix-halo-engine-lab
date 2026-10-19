@@ -2169,14 +2169,16 @@ void enqueue(Shape shape, const Bindings& bindings, Mode mode, hipStream_t strea
 namespace strix {
 namespace {
 #ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+// Window unions of 2/4/8 rows; cohort unions of several sessions' windows of 16 or 32 rows.
+constexpr std::uint32_t kKnownMoeMaxRows = moe_q4k_a8::known_rows::max_union_rows;
 struct KnownMoeRowsDevice {
-    const float* intermediates[8]{};
-    const std::uint32_t* routes[8]{};
-    const float* route_weights[8]{};
-    std::uint32_t* status[8]{};
-    float* rawdots[8]{};
-    float* accumulation[8]{};
-    std::uint16_t* output[8]{};
+    const float* intermediates[kKnownMoeMaxRows]{};
+    const std::uint32_t* routes[kKnownMoeMaxRows]{};
+    const float* route_weights[kKnownMoeMaxRows]{};
+    std::uint32_t* status[kKnownMoeMaxRows]{};
+    float* rawdots[kKnownMoeMaxRows]{};
+    float* accumulation[kKnownMoeMaxRows]{};
+    std::uint16_t* output[kKnownMoeMaxRows]{};
 };
 struct KnownMoeCsrDevice {
     std::uint32_t* header; // union status, touched count, batch count
@@ -2365,8 +2367,8 @@ __global__ void known_moe_rows_commit_kernel(KnownMoeRowsDevice view, KnownMoeCs
 // stores shared + routed (the routed value just committed, or the existing one after a failure, as the
 // separate combine launch would read it) in the combine's output row.
 struct KnownMoeCombineDevice {
-    const std::uint16_t* shared[8]{};
-    std::uint16_t* combined[8]{};
+    const std::uint16_t* shared[kKnownMoeMaxRows]{};
+    std::uint16_t* combined[kKnownMoeMaxRows]{};
 };
 template <bool Combine>
 __global__ void known_moe_rows_commit_combine_kernel(KnownMoeRowsDevice view, KnownMoeCsrDevice csr,
@@ -2389,9 +2391,9 @@ __global__ void known_moe_rows_commit_combine_kernel(KnownMoeRowsDevice view, Kn
 }
 
 struct KnownMoeRowsPrepared {
-    std::array<PreparedMoeExperts, 8> rows{};
-    std::array<moe_q4k_a8::Bindings, 8> quantized_bindings{};
-    std::array<moe_q4k_a8::DownBindings, 8> a8_down{};
+    std::array<PreparedMoeExperts, kKnownMoeMaxRows> rows{};
+    std::array<moe_q4k_a8::Bindings, kKnownMoeMaxRows> quantized_bindings{};
+    std::array<moe_q4k_a8::DownBindings, kKnownMoeMaxRows> a8_down{};
     q51_known_rows::Workspace workspace;
     KnownMoeRowsDevice device;
     KnownMoeCsrDevice csr{};
@@ -2415,8 +2417,10 @@ hipStream_t known_moe_rows_stream() {
 // striped_weights: the caller checks the row stripes against every weight tensor once.
 KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchContext> rows,
     const HipMoeExpertsLauncherConfig& config, const q51_known_rows::Workspace& extra, bool striped_weights = false) {
-    if (rows.size() != 2U && rows.size() != 4U && rows.size() != 8U)
-        throw std::invalid_argument("known-window routed rows require R2/R4/R8");
+    // 16 / 32 rows: a cohort union of several sessions' windows (A8 profile only).
+    if (rows.size() != 2U && rows.size() != 4U && rows.size() != 8U &&
+        !((rows.size() == 16U || rows.size() == 32U) && known_window_cohort_active() && (config.a8_down_q51 || config.a8_down_q80)))
+        throw std::invalid_argument("known-window routed rows require R2/R4/R8 (16/32: an A8 cohort union)");
     const auto layout = q51_known_rows::scratch_layout(static_cast<std::uint32_t>(rows.size()),
         config.expert_count, config.top_k);
     validate_config(config);
@@ -2457,8 +2461,8 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
         moe_q4k_a8::validate_a8_down_content(first.resources->model_weights->model_content_identity);
     }
     KnownMoeRowsPrepared out;
-    std::array<KnownMoeRange, 16> writes{};
-    std::array<KnownMoeRange, 24> reads{};
+    std::array<KnownMoeRange, 2U * kKnownMoeMaxRows> writes{};
+    std::array<KnownMoeRange, 3U * kKnownMoeMaxRows> reads{};
     for (std::size_t r = 0; r < rows.size(); ++r) {
         const auto& row = rows[r];
         // Per session segment (the whole window outside a cohort): one scratch arena, state and

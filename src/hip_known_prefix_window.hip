@@ -16,6 +16,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
 #include <cstdint>
 #include <deque>
 #include <limits>
@@ -119,6 +123,7 @@ struct HipKnownPrefixWindow::Impl {
     HipElementwiseLauncherConfig elementwise_config;
     q51_known_rows::Workspace routed_workspace;
     q51_known_rows::Workspace prefill_routed_workspace; // all T rows of a prefill step (STRIX_PREFILL_FULL_MOE)
+    q51_known_rows::Workspace cohort_union_workspace[2]; // wide cohort unions of 16 / 32 rows (allocated on first use)
     q51_known_rows::Summary pending_union_summary;
     std::uint32_t last_union_layer = 0;
     std::optional<HipKnownPrefixUnionObservation> last_union_observation;
@@ -267,6 +272,20 @@ struct HipKnownPrefixWindow::Impl {
     }
     ~Impl() { guard.recover_or_fail_stop(); }
     bool full_prefill_union() const noexcept {return prefill&&prefill_routed_workspace.owner;}
+    // The CSR workspace of a wide cohort union of 16 or 32 rows enqueued on this owner's stream.
+    const q51_known_rows::Workspace& cohort_union(std::uint32_t rows) {
+        auto& slot = cohort_union_workspace[rows == 32U ? 1U : 0U];
+        if (slot.owner) return slot;
+        const auto bytes = q51_known_rows::required_scratch_bytes(rows, routed_config.expert_count, routed_config.top_k);
+        void* memory = nullptr;
+        guard.run([&] { check(hipMalloc(&memory, bytes), "allocate known-window cohort routed CSR"); });
+        std::shared_ptr<void> owner(memory, [](void* p) { if (p) (void)hipFree(p); });
+        const auto base = reinterpret_cast<std::uintptr_t>(memory);
+        if (base % 256U) throw std::runtime_error("known-window cohort routed CSR allocation is not 256-byte aligned");
+        status_disjoint(base, bytes);
+        slot = {{execution_identity(), base, bytes, routed_workspace.memory.allocation_generation ^ (rows == 32U ? 3ULL : 2ULL) << 61U}, owner};
+        return slot;
+    }
     std::uint64_t execution_identity() const noexcept {return prefill?prefill->prefill_execution_identity:window.window_execution_identity;}
     const ExecutionArenaPlan& physical_arena() const noexcept {return prefill?prefill->arena.physical:window.arena.physical;}
     std::uint32_t logical_rows() const noexcept {return prefill?prefill->logical_rows:window.logical_rows;}
@@ -1169,6 +1188,95 @@ struct HipKnownPrefixWindow::Impl {
         }
         return true;
     }
+    // STRIX_COHORT_WIDE=gdn (comma list; "all"): with two or more chunks, the listed steps run once for the
+    // rows of every chunk (16 or 32 rows) instead of once per chunk. Per-row arithmetic as in the chunk.
+    static bool cohort_wide_enabled(const char* family) {
+        static const std::string list = [] { const char* v = std::getenv("STRIX_COHORT_WIDE"); return std::string(v ? v : ""); }();
+        if (list == "all") return true;
+        std::size_t at = 0;
+        while (at <= list.size()) {
+            const auto end = std::min(list.find(',', at), list.size());
+            if (list.compare(at, end - at, family) == 0) return true;
+            at = end + 1U;
+        }
+        return false;
+    }
+    static bool cohort_wide_step(std::size_t i, std::span<CohortMember> members) {
+        const auto mode = members[0].impl->window.mode[i];
+        std::uint32_t total = 0;
+        for (const auto& m : members) {
+            if (!m.run->wide_step(i) || m.impl->window.mode[i] != mode) return false;
+            total += m.run->rows();
+        }
+        if (total != 16U && total != 32U) return false;
+        switch (mode) {
+        case KnownWindowStepMode::gdn_deferred_rows:
+            // 16 / 32 rows: dense A8 projections only (gdn_window_cohort_enqueue).
+            for (const auto& m : members) if (!m.impl->gdn_window_config.gdn.dense_a8_projections) return false;
+            return cohort_wide_enabled("gdn");
+        case KnownWindowStepMode::lm_head_rows: return cohort_wide_enabled("head");
+        case KnownWindowStepMode::routed_expert_union: return cohort_wide_union(members);
+        case KnownWindowStepMode::qsa_rows:
+            // 16 / 32 rows: dense A8 only (the launcher also requires a Q8_0 output projection).
+            if (!cohort_wide_enabled("qsa")) return false;
+            for (const auto& m : members)
+                if ((m.run->rows() != 2U && m.run->rows() != 4U && m.run->rows() != 8U) ||
+                    !m.impl->qsa_for(m.run->step_rows(i)).dense_a8_projections) return false;
+            return true;
+        default: return false;
+        }
+    }
+    // The routed union of every member's rows on the lead member (A8 profile, 16 or 32 rows).
+    static bool cohort_wide_union(std::span<CohortMember> members) {
+        if (!cohort_wide_enabled("moe")) return false;
+        std::uint32_t total = 0;
+        for (const auto& m : members) {
+            const auto& c = m.impl->routed_config;
+            if (!m.impl->window.routed_expert_union_steps || !(c.a8_down_q51 || c.a8_down_q80) || m.impl->active_rows) return false;
+            total += m.impl->logical_rows();
+        }
+        return total == 16U || total == 32U;
+    }
+    static void launch_cohort_wide(std::size_t i, std::span<CohortMember> members) {
+        const KnownWindowCohortScope cohort;
+        switch (members[0].impl->window.mode[i]) {
+        case KnownWindowStepMode::routed_expert_union: {
+            std::vector<ExecutionDispatchContext> all;
+            for (const auto& m : members) { const auto rows = m.run->step_rows(i); all.insert(all.end(), rows.begin(), rows.end()); }
+            auto& lead = *members[0].impl;
+            moe_experts_known_window_rows_launch(all, lead.routed_config, lead.cohort_union(static_cast<std::uint32_t>(all.size())), 0U);
+            break;
+        }
+        case KnownWindowStepMode::gdn_deferred_rows: {
+            std::vector<HipGdnWindowCohortSegment> segments;
+            for (const auto& m : members) segments.push_back({m.run->step_rows(i), &m.impl->gdn_window_config});
+            gdn_window_cohort_rows_launch(segments);
+            for (const auto& m : members) m.impl->remember_gdn_layer(m.run->step_rows(i)[0]);
+            break;
+        }
+        case KnownWindowStepMode::qsa_rows: {
+            std::vector<HipQsaCohortSegment> segments;
+            for (const auto& m : members) segments.push_back({m.run->step_rows(i), &m.impl->qsa_for(m.run->step_rows(i))});
+            indexed_attention_known_window_cohort_launch(segments);
+            break;
+        }
+        case KnownWindowStepMode::lm_head_rows: {
+            std::vector<ExecutionDispatchContext> all;
+            for (const auto& m : members) { const auto rows = m.run->step_rows(i); all.insert(all.end(), rows.begin(), rows.end()); }
+            lm_head_known_window_rows_launch(all, members[0].impl->head_config);
+            // Each session's argmax rows land in its own owner's replies, read by its own capture.
+            for (const auto& m : members) {
+                const auto own = m.run->step_rows(i);
+                std::array<ExecutionBufferAddress, hip_greedy_rows_max> logits{};
+                for (std::size_t r = 0; r < own.size(); ++r) logits[r] = resolve_dispatch_write(own[r], 0);
+                enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress>(logits.data(), own.size()),
+                    members[0].impl->head_config.vocab_size, m.impl->greedy_partials, m.impl->greedy_replies, hip_execution_stream());
+            }
+            break;
+        }
+        default: throw std::logic_error("known-window cohort step has no wide implementation");
+        }
+    }
     std::vector<std::pair<std::vector<const void*>, std::unique_ptr<ArenaLookupIndex>>> cohort_indexes;
     const ArenaLookupIndex& cohort_index(std::span<CohortMember> members) {
         std::vector<const void*> key;
@@ -1257,41 +1365,82 @@ struct HipKnownPrefixWindow::Impl {
     }
     static std::vector<HipMtpTargetWindowExecution> execute_cohort(Impl& primary, std::span<CohortMember> members) {
         if (members.size() < 2U) throw std::invalid_argument("known-window cohort requires two or more sessions");
-        std::uint32_t total = 0;
+        Impl* const primaries[] = {&primary};
+        const std::size_t sizes[] = {members.size()};
+        return execute_cohort_chunks(primaries, sizes, members);
+    }
+    // Chunks of consecutive members, each either several members on its own primary (an idle owner of the
+    // chunk's total rows; its shared steps run once for the chunk's rows, as in a one-chunk cohort) or a
+    // lone member (null primary) whose steps are all its own launches. The chunks run step by step on one
+    // stream: step i of every chunk before step i + 1 of any.
+    static std::vector<HipMtpTargetWindowExecution> execute_cohort_chunks(std::span<Impl* const> primaries,
+        std::span<const std::size_t> sizes, std::span<CohortMember> members) {
+        if (primaries.empty() || primaries.size() != sizes.size() || members.size() < 2U)
+            throw std::invalid_argument("known-window cohort requires two or more sessions in one or more chunks");
+        struct Chunk { Impl* primary; std::span<CohortMember> members; };
+        std::vector<Chunk> chunks;
+        std::size_t offset = 0;
+        for (std::size_t c = 0; c < sizes.size(); ++c) {
+            if (!sizes[c] || offset + sizes[c] > members.size() || (sizes[c] == 1U) != (primaries[c] == nullptr))
+                throw std::invalid_argument("known-window cohort chunk needs a primary exactly when it has two or more members");
+            chunks.push_back({primaries[c], members.subspan(offset, sizes[c])});
+            offset += sizes[c];
+        }
+        if (offset != members.size()) throw std::invalid_argument("known-window cohort chunks do not cover the members");
+        const auto stream = members[0].impl ? members[0].impl->scope.stream : nullptr;
         for (std::size_t a = 0; a < members.size(); ++a) {
             const auto& m = members[a];
-            if (!m.impl || !m.session || !m.capture || m.impl == &primary || m.impl->failed || m.impl->prefill ||
+            const auto& model = *members[0].impl;
+            if (!m.impl || !m.session || !m.capture || m.impl->failed || m.impl->prefill ||
                 m.impl->executing || m.tokens.size() != m.impl->logical_rows() || !m.impl->greedy_replies ||
-                m.impl->scope.stream != primary.scope.stream || m.impl->serial.execution_identity != primary.serial.execution_identity ||
-                m.impl->window.mode.size() != primary.window.mode.size() ||
-                m.impl->resources.model_manifest != primary.resources.model_manifest ||
-                m.impl->resources.model_weights != primary.resources.model_weights)
+                m.impl->scope.stream != stream || m.impl->serial.execution_identity != model.serial.execution_identity ||
+                m.impl->window.mode.size() != model.window.mode.size() ||
+                m.impl->resources.model_manifest != model.resources.model_manifest ||
+                m.impl->resources.model_weights != model.resources.model_weights)
                 throw std::invalid_argument("known-window cohort members must be idle closed owners of one model on the primary's stream");
             for (std::size_t b = 0; b < a; ++b)
                 if (members[b].impl == m.impl || members[b].session == m.session ||
                     members[b].impl->resources.session_state_memory == m.impl->resources.session_state_memory)
                     throw std::invalid_argument("known-window cohort members must be distinct sessions");
-            total += m.impl->logical_rows();
         }
-        if (primary.failed || primary.prefill || primary.executing || total != primary.window.logical_rows ||
-            current_hip_launch_context())
-            throw std::invalid_argument("known-window cohort primary must be an idle closed owner of the cohort's rows");
+        for (std::size_t c = 0; c < chunks.size(); ++c) {
+            auto* primary = chunks[c].primary;
+            if (!primary) continue;
+            std::uint32_t total = 0;
+            for (const auto& m : chunks[c].members) {
+                if (m.impl == primary) throw std::invalid_argument("known-window cohort primary is one of its members");
+                total += m.impl->logical_rows();
+            }
+            for (std::size_t o = 0; o < c; ++o) if (chunks[o].primary == primary)
+                throw std::invalid_argument("known-window cohort chunks share a primary");
+            for (const auto& m : members) if (m.impl == primary)
+                throw std::invalid_argument("known-window cohort primary is a member of another chunk");
+            const auto& model = *members[0].impl;
+            if (primary->failed || primary->prefill || primary->executing || total != primary->window.logical_rows ||
+                primary->scope.stream != stream || primary->serial.execution_identity != model.serial.execution_identity ||
+                primary->window.mode.size() != model.window.mode.size() ||
+                primary->resources.model_manifest != model.resources.model_manifest ||
+                primary->resources.model_weights != model.resources.model_weights || current_hip_launch_context())
+                throw std::invalid_argument("known-window cohort primary must be an idle closed owner of the cohort's rows");
+        }
         struct Leases {
             std::vector<bool*> held;
             ~Leases() { for (auto* l : held) *l = false; }
         } leases;
-        primary.executing = true; leases.held.push_back(&primary.executing);
+        for (auto& chunk : chunks) if (chunk.primary) { chunk.primary->executing = true; leases.held.push_back(&chunk.primary->executing); }
         for (auto& m : members) { m.impl->executing = true; leases.held.push_back(&m.impl->executing); }
         struct CohortFlags {
             std::span<CohortMember> members;
             ~CohortFlags() { for (auto& m : members) m.impl->cohort_member = false; }
         } flags{members};
-        bool primary_launched = false, union_ran = false;
+        std::vector<char> primary_launched(chunks.size(), 0), union_ran(chunks.size(), 0);
         try {
-            primary.validate_metadata();
-            for (auto& m : members) {
+            for (auto& chunk : chunks) if (chunk.primary) chunk.primary->validate_metadata();
+            // A lone member runs its routed union itself, unless the cohort's union runs wide for all rows.
+            const bool wide_union = chunks.size() > 1U && cohort_wide_union(members);
+            for (auto& chunk : chunks) for (auto& m : chunk.members) {
                 auto& self = *m.impl;
-                self.cohort_member = true;
+                self.cohort_member = chunk.primary != nullptr || wide_union;
                 self.validate_metadata();
                 m.observed = &self.prepared_capture(m.capture);
                 m.capture->begin(&self, *m.session, m.tokens);
@@ -1315,9 +1464,12 @@ struct HipKnownPrefixWindow::Impl {
                 hooks.preflight_memo = &self.preflight_memo; hooks.recipe_memo = &self.recipe_memo;
                 hooks.preflight_slots = &self.preflight_slots; hooks.arena_index = &self.arena_index;
             }
+            auto& lead = *members[0].impl;
             std::optional<ValidatedModelBindingScope> binding;
-            if (!primary.resources.distributed_stage) binding.emplace(*primary.resources.model_manifest, *primary.resources.model_weights);
-            const ArenaLookupScope lookups(primary.cohort_index(members));
+            if (!lead.resources.distributed_stage) binding.emplace(*lead.resources.model_manifest, *lead.resources.model_weights);
+            // One lookup index over every member's plans (keyed on the first chunk's primary, or the lead member).
+            auto& indexer = chunks[0].primary ? *chunks[0].primary : lead;
+            const ArenaLookupScope lookups(indexer.cohort_index(members));
             for (auto& m : members) {
                 auto& self = *m.impl;
                 const HipLaunchScope active(self.scope);
@@ -1327,39 +1479,96 @@ struct HipKnownPrefixWindow::Impl {
                     std::span<const KnownWindowRowsEntry>(m.observed->recorded_rows), m.hooks, true);
                 m.launched = true;
             }
-            const auto steps = primary.serial.execution.steps.size();
+            const auto steps = lead.serial.execution.steps.size();
+            // STRIX_COHORT_WIDE_LOG=1: per call (first 4, then every 256th) the steps run wide, shared per chunk
+            // and per member, with the mode of every step that ran per member in some chunk.
+            static const bool wide_log = std::getenv("STRIX_COHORT_WIDE_LOG") != nullptr;
+            static std::atomic<std::uint64_t> wide_calls{0};
+            const auto call = wide_log ? wide_calls.fetch_add(1U) : 0U;
+            const bool log_call = wide_log && (call < 4U || call % 256U == 0U);
+            std::uint32_t wide_count = 0, shared_count = 0, own_count = 0;
+            std::uint32_t wide_union_rows = 0; // rows of the last wide union (set per union step, all equal)
+            std::map<int, std::uint32_t> own_modes;
             for (std::size_t i = 0; i < steps; ++i) {
-                if (primary.cohort_step_shared(i, members)) {
+                if (chunks.size() > 1U && cohort_wide_step(i, members)) {
+                    ++wide_count;
+                    // Every chunk primary first joins its detached shared expert of an earlier layer, as before
+                    // a step of its own.
+                    for (auto& chunk : chunks) if (chunk.primary && chunk.primary->shared_detach) {
+                        const HipLaunchScope active(chunk.primary->scope);
+                        chunk.primary->join_cohort_shared(i);
+                    }
                     {
-                        const HipLaunchScope active(primary.scope);
-                        primary_launched = true;
-                        union_ran = union_ran || primary.window.mode[i] == KnownWindowStepMode::routed_expert_union;
-                        primary.launch_cohort_shared(i, members);
+                        const HipLaunchScope active(lead.scope);
+                        launch_cohort_wide(i, members);
+                    }
+                    if (lead.window.mode[i] == KnownWindowStepMode::routed_expert_union) {
+                        wide_union_rows = 0;
+                        for (const auto& m : members) wide_union_rows += m.run->rows();
                     }
                     for (auto& m : members) m.run->record_external_step(i);
                     continue;
                 }
-                if (primary.shared_detach) {
-                    const HipLaunchScope active(primary.scope);
-                    primary.join_cohort_shared(i);
-                }
-                for (auto& m : members) {
-                    const HipLaunchScope active(m.impl->scope);
-                    m.run->launch_step(i);
+                for (std::size_t c = 0; c < chunks.size(); ++c) {
+                    auto& chunk = chunks[c];
+                    auto* primary = chunk.primary;
+                    if (primary && primary->cohort_step_shared(i, chunk.members)) {
+                        {
+                            const HipLaunchScope active(primary->scope);
+                            primary_launched[c] = 1;
+                            if (primary->window.mode[i] == KnownWindowStepMode::routed_expert_union) union_ran[c] = 1;
+                            primary->launch_cohort_shared(i, chunk.members);
+                        }
+                        for (auto& m : chunk.members) m.run->record_external_step(i);
+                        ++shared_count;
+                        continue;
+                    }
+                    ++own_count;
+                    if (log_call) ++own_modes[static_cast<int>(chunk.members[0].impl->window.mode[i])];
+                    if (primary && primary->shared_detach) {
+                        const HipLaunchScope active(primary->scope);
+                        primary->join_cohort_shared(i);
+                    }
+                    for (auto& m : chunk.members) {
+                        const HipLaunchScope active(m.impl->scope);
+                        m.run->launch_step(i);
+                    }
                 }
             }
-            primary.require_shared_joined();
-            {
+            if (log_call) {
+                std::uint32_t total = 0;
+                for (const auto& m : members) total += m.run->rows();
+                std::fprintf(stderr, "cohort call %llu: %zu chunks, %zu sessions, %u rows, %zu steps: wide %u, chunk-shared %u, own %u (modes",
+                    static_cast<unsigned long long>(call), chunks.size(), members.size(), total, steps, wide_count, shared_count, own_count);
+                for (const auto& [mode, n] : own_modes) std::fprintf(stderr, " %d:%u", mode, n);
+                std::fprintf(stderr, ")\n");
+            }
+            for (std::size_t c = 0; c < chunks.size(); ++c) {
+                auto* primary = chunks[c].primary;
+                if (!primary) continue;
+                primary->require_shared_joined();
                 // The primary checks its D1 record and, when the union ran on it, the union summary.
-                const HipLaunchScope active(primary.scope);
-                primary.cohort_member = !union_ran;
-                struct Reset { bool& flag; ~Reset() { flag = false; } } reset{primary.cohort_member};
-                primary.complete();
+                const HipLaunchScope active(primary->scope);
+                primary->cohort_member = !union_ran[c];
+                struct Reset { bool& flag; ~Reset() { flag = false; } } reset{primary->cohort_member};
+                primary->complete();
             }
             for (auto& m : members) {
                 const HipLaunchScope active(m.impl->scope);
                 m.run->complete();
                 m.impl->require_shared_joined();
+            }
+            if (wide_union_rows) {
+                // The last wide union's summary (the stream is complete): its rows, assignments and status.
+                q51_known_rows::Summary s{};
+                const auto& ws = lead.cohort_union(wide_union_rows);
+                check(hipMemcpy(&s, reinterpret_cast<const void*>(ws.memory.arena_base), sizeof(s), hipMemcpyDeviceToHost),
+                    "read wide cohort routed union metadata");
+                const auto assignments = wide_union_rows * lead.routed_config.top_k;
+                if (s.status || s.version != 1U || s.logical_rows != wide_union_rows || s.assignments != assignments ||
+                    !s.touched || s.touched > assignments || s.batches < s.touched || s.batches > assignments ||
+                    s.duplicate_assignments > assignments || std::any_of(s.reserved, s.reserved + 8U, [](auto v) { return v != 0U; }))
+                    throw std::runtime_error("wide cohort routed union metadata disagrees with its completed window");
             }
         } catch (...) {
             for (auto& m : members) {
@@ -1371,8 +1580,11 @@ struct HipKnownPrefixWindow::Impl {
                 }
                 m.impl->failed = true;
             }
-            primary.failed = true;
-            if (primary_launched) primary.guard.recover_or_fail_stop();
+            for (std::size_t c = 0; c < chunks.size(); ++c) {
+                if (!chunks[c].primary) continue;
+                chunks[c].primary->failed = true;
+                if (primary_launched[c]) chunks[c].primary->guard.recover_or_fail_stop();
+            }
             throw;
         }
         std::vector<HipMtpTargetWindowExecution> out(members.size());
@@ -1388,12 +1600,16 @@ struct HipKnownPrefixWindow::Impl {
                 m.session->health = SerialSessionHealth::poisoned; m.session->arithmetic_lineage.tainted = true;
                 m.impl->failed = true; m.impl->guard.recover_or_fail_stop();
             }
-            primary.failed = true;
+            for (auto& chunk : chunks) if (chunk.primary) chunk.primary->failed = true;
             throw;
         }
-        if (union_ran)
-            primary.last_union_observation = HipKnownPrefixUnionObservation{members[0].session->next_position - members[0].impl->logical_rows(), primary.last_union_layer,
-                primary.pending_union_summary};
+        for (std::size_t c = 0; c < chunks.size(); ++c)
+            if (union_ran[c]) {
+                auto& primary = *chunks[c].primary;
+                const auto& first = chunks[c].members[0];
+                primary.last_union_observation = HipKnownPrefixUnionObservation{first.session->next_position - first.impl->logical_rows(),
+                    primary.last_union_layer, primary.pending_union_summary};
+            }
         return out;
     }
     KnownWindowResult execute(SerialSessionContext& session, std::span<const std::uint32_t> tokens,
@@ -1551,6 +1767,22 @@ std::vector<HipMtpTargetWindowExecution> HipKnownPrefixWindow::execute_mtp_cohor
         owned[m].capture = members[m].capture;
     }
     return Impl::execute_cohort(*primary.impl_, owned);
+}
+std::vector<HipMtpTargetWindowExecution> HipKnownPrefixWindow::execute_mtp_cohort_chunks(
+    std::span<HipKnownPrefixWindow* const> primaries, std::span<const std::size_t> chunk_members,
+    std::span<const HipKnownPrefixCohortMember> members) {
+    std::vector<Impl::CohortMember> owned(members.size());
+    for (std::size_t m = 0; m < members.size(); ++m) {
+        if (!members[m].window || !members[m].session || !members[m].capture)
+            throw std::invalid_argument("known-window cohort member is incomplete");
+        owned[m].impl = members[m].window->impl_.get();
+        owned[m].session = members[m].session;
+        owned[m].tokens = members[m].tokens;
+        owned[m].capture = members[m].capture;
+    }
+    std::vector<Impl*> impls;
+    for (auto* p : primaries) impls.push_back(p ? p->impl_.get() : nullptr);
+    return Impl::execute_cohort_chunks(impls, chunk_members, owned);
 }
 void HipKnownPrefixWindow::attach_greedy_rows(ExecutionBufferAddress partials,HipGreedyRowsReply* replies) {
     impl_->attach_greedy_rows(partials,replies);

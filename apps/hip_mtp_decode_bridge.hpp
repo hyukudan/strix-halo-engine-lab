@@ -923,7 +923,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                     <<",\"solo_steps\":"<<st.solo_steps<<",\"max_active\":"<<st.max_active<<",\"prompt_steps\":"<<st.prompt_steps
                     <<",\"interleaved_admission\":"<<(runner.interleaved()?"true":"false")
                     <<",\"cohort_windows\":"<<st.cohort.cohort_windows<<",\"cohort_window_sessions\":"<<st.cohort.cohort_sessions
-                    <<",\"cohort_window_rows\":"<<st.cohort.cohort_rows<<",\"cohort_solo_windows\":"<<st.cohort.solo_windows
+                    <<",\"cohort_window_rows\":"<<st.cohort.cohort_rows<<",\"cohort_solo_windows\":"<<st.cohort.solo_windows<<",\"cohort_chunks\":"<<st.cohort.cohort_chunks
                     <<",\"calibration_rows\":"<<calibration_rows<<",\"calibration_ms\":"<<calibration_ms<<"}\n";
                 return;
             }

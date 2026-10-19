@@ -459,6 +459,12 @@ std::shared_ptr<HipKnownPrefixWindow> HipMtpWindowVerifier::owner_with_rows(std:
 }
 std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::span<const HipMtpCohortVerifyRequest> requests,
     HipKnownPrefixWindow& primary) {
+    HipKnownPrefixWindow* const primaries[]={&primary};
+    const std::size_t chunks[]={requests.size()};
+    return verify_cohort(requests,primaries,chunks);
+}
+std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::span<const HipMtpCohortVerifyRequest> requests,
+    std::span<HipKnownPrefixWindow* const> primaries,std::span<const std::size_t> chunks) {
     require(requests.size()>=2U,"MTP cohort verification requires two or more sessions");
     struct Prepared {
         Impl* impl=nullptr;Impl::Owner* owner=nullptr;
@@ -516,7 +522,7 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
     bool attempted=false;
     try {
         host_phase_mark("4 cohort verify prologue");
-        auto natives=HipKnownPrefixWindow::execute_mtp_cohort(primary,members);
+        auto natives=HipKnownPrefixWindow::execute_mtp_cohort_chunks(primaries,chunks,members);
         host_phase_mark("7 cohort window launch+wait");
         attempted=true;
         std::vector<HipMtpVerifiedTargetRows> out(requests.size());

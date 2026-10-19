@@ -521,8 +521,8 @@ void prefetch8_wave_q8_lm_head_kernel(
 }
 
 struct LmHeadRowsViews {
-    const std::uint16_t* input[lm_head_window_max_rows];
-    float* output[lm_head_window_max_rows];
+    const std::uint16_t* input[lm_head_cohort_max_rows];
+    float* output[lm_head_cohort_max_rows];
 };
 
 // Wave32 value of lane + Distance for the low lanes that consume it.
@@ -1327,14 +1327,14 @@ void launch_lean_rows(std::uint32_t cols, std::size_t rows, const LmHeadRowsView
 
 PreparedLmHeadRows prepare_lm_head_rows(std::span<const ExecutionDispatchContext> rows,
     const HipLmHeadLauncherConfig& config) {
-    if (rows.size() < 2U || rows.size() > lm_head_window_max_rows)
-        throw std::invalid_argument("known-window LM head supports two to eight rows");
+    if (rows.size() < 2U || (rows.size() > lm_head_window_max_rows && rows.size() != 16U && rows.size() != 32U))
+        throw std::invalid_argument("known-window LM head supports two to eight, 16 or 32 rows");
     validate_config(config);
     if (!config.prefetch_q8_wave || config.input != HipActivationStorage::bf16)
         throw std::invalid_argument("known-window LM head rows require the eager prefetch BF16/Q8_0 head");
     const auto expected = kernel_id(ExecutionBindingRequest{}, config);
     PreparedLmHeadRows out;
-    std::array<ExecutionBufferAddress, lm_head_window_max_rows> inputs{}, outputs{};
+    std::array<ExecutionBufferAddress, lm_head_cohort_max_rows> inputs{}, outputs{};
     const RuntimeTensorBinding* tensor = nullptr;
     for (std::size_t r = 0; r < rows.size(); ++r) {
         if (!rows[r].kernel_id || *rows[r].kernel_id != expected)
@@ -1378,6 +1378,16 @@ void lm_head_known_window_rows_launch(std::span<const ExecutionDispatchContext> 
         check_hip(hipGetLastError(), "known-window lean LM head rows launch");
         return;
     }
+    // Cohorts of several sessions: 16 rows in one unstaged launch, 32 rows as two (per row the same DAG).
+    if (rows.size() == 16U || rows.size() == 32U) {
+        for (std::size_t first = 0; first < rows.size(); first += 16U) {
+            LmHeadRowsViews part{};
+            for (unsigned r = 0; r < 16U; ++r) { part.input[r] = p.views.input[first + r]; part.output[r] = p.views.output[first + r]; }
+            launch_lm_head_rows<16>(part, p.weights, h, v, stream);
+        }
+        check_hip(hipGetLastError(), "known-window LM head cohort rows launch");
+        return;
+    }
     switch (rows.size()) {
     case 2: launch_lm_head_rows<2>(p.views, p.weights, h, v, stream); break;
     case 3: launch_lm_head_rows<3>(p.views, p.weights, h, v, stream); break;
@@ -1394,6 +1404,7 @@ void lm_head_known_window_rows_launch_greedy(std::span<const ExecutionDispatchCo
     const HipLmHeadLauncherConfig& config, ExecutionBufferAddress partials, HipGreedyRowsReply* replies) {
     if (!lean_rows_admitted(config, rows.size())) {
         lm_head_known_window_rows_launch(rows, config);
+        if (rows.size() > lm_head_window_max_rows) throw std::invalid_argument("known-window greedy LM head supports two to eight rows");
         std::array<ExecutionBufferAddress, lm_head_window_max_rows> logits{};
         for (std::size_t r = 0; r < rows.size(); ++r) logits[r] = resolve_dispatch_write(rows[r], 0);
         enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress>(logits.data(), rows.size()), config.vocab_size,

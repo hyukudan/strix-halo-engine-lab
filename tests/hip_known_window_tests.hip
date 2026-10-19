@@ -1097,15 +1097,26 @@ void qsa_rows_family(bool prefetch, bool wave8, bool bf16_indexer) {
 // cohort launch against each session's own rows launch from the same state and inputs.
 void qsa_cohort_family(bool dense, bool bf16_indexer) {
     QsaFixture f(!dense, true, bf16_indexer, 2304U, dense);
-    struct Session { Span state; std::vector<unsigned char> host, initial; SessionStateMemoryBinding memory; ExecutionRuntimeResources resources; };
-    std::array<Session, 3> sessions;
+    // Each session: its own window arena (the fixture's layout and inputs), state and resources.
+    struct Session {
+        Span state, scratch; std::vector<unsigned char> host, initial; SessionStateMemoryBinding memory;
+        ExecutionMemoryBinding arena; ExecutionRuntimeResources resources; std::array<ExecutionDispatchContext, 8> rows;
+    };
+    std::array<Session, 8> sessions;
     for (std::size_t k = 0; k < sessions.size(); ++k) {
         auto& session = sessions[k];
+        session.scratch = f.owner.allocate(f.window.physical.total_bytes);
+        session.arena = {f.memory.execution_identity, session.scratch.address, session.scratch.bytes, 43U + k};
         session.state = f.owner.allocate(f.state_layout.device_total_bytes);
         session.host.resize(static_cast<std::size_t>(f.state_layout.host_total_bytes));
         session.memory = {f.state_layout.layout_identity, session.state.address, session.state.bytes, 61U + k,
             reinterpret_cast<std::uintptr_t>(session.host.data()), f.state_layout.host_total_bytes, 67U + k};
         session.resources = f.resources; session.resources.session_state_memory = &session.memory;
+        session.resources.scratch = &session.arena;
+        session.rows = f.rows;
+        for (auto& row : session.rows) {
+            row.memory = &session.arena; row.resources = &session.resources; row.session_state_memory = &session.memory;
+        }
         // Each session's own finite BF16 history in every QSA cell of the tested layer.
         session.initial.assign(static_cast<std::size_t>(session.state.bytes), 0U);
         for (const auto component : {SessionStateComponent::attention_kv, SessionStateComponent::sparse_index}) {
@@ -1119,19 +1130,12 @@ void qsa_cohort_family(bool dense, bool bf16_indexer) {
         }
     }
     const auto run = [&](const std::vector<std::uint32_t>& sizes, const std::vector<std::uint64_t>& positions, bool cohort) {
-        write(f.scratch, f.seed);
-        for (std::size_t k = 0; k < sizes.size(); ++k) write(sessions[k].state, sessions[k].initial);
-        auto rows = f.rows;
-        std::uint32_t first = 0;
         std::vector<HipQsaCohortSegment> segments;
         for (std::size_t k = 0; k < sizes.size(); ++k) {
-            for (std::uint32_t r = 0; r < sizes[k]; ++r) {
-                rows[first + r].resources = &sessions[k].resources;
-                rows[first + r].session_state_memory = &sessions[k].memory;
-                rows[first + r].position = positions[k] + r;
-            }
-            segments.push_back({std::span<const ExecutionDispatchContext>(rows.data() + first, sizes[k]), &f.config});
-            first += sizes[k];
+            auto& session = sessions[k];
+            write(session.scratch, f.seed); write(session.state, session.initial);
+            for (std::uint32_t r = 0; r < sizes[k]; ++r) session.rows[r].position = positions[k] + r;
+            segments.push_back({std::span<const ExecutionDispatchContext>(session.rows.data(), sizes[k]), &f.config});
         }
         {
             const HipLaunchScope active(f.scope());
@@ -1139,41 +1143,44 @@ void qsa_cohort_family(bool dense, bool bf16_indexer) {
             else for (const auto& segment : segments) indexed_attention_known_window_rows_launch(segment.rows, f.config);
         }
         f.owner.finish();
-        std::vector<std::vector<unsigned char>> out{read(f.scratch)};
-        for (std::size_t k = 0; k < sizes.size(); ++k) out.push_back(read(sessions[k].state));
+        std::vector<std::vector<unsigned char>> out;
+        for (std::size_t k = 0; k < sizes.size(); ++k) { out.push_back(read(sessions[k].scratch)); out.push_back(read(sessions[k].state)); }
         return out;
     };
     unsigned compared = 0;
-    const std::vector<std::vector<std::uint32_t>> shapes{{2U, 2U}, {4U, 4U}, {2U, 2U, 4U}, {4U, 2U, 2U}};
-    const std::vector<std::vector<std::uint64_t>> placements{{0U, 6U, 2045U}, {2047U, 1U, 2201U}, {2201U, 2042U, 3U}};
+    // 4 / 8 rows; 16 / 32 rows (cohorts of several 8-row chunks) with dense A8 only.
+    std::vector<std::vector<std::uint32_t>> shapes{{2U, 2U}, {4U, 4U}, {2U, 2U, 4U}, {4U, 2U, 2U}};
+    if (dense)
+        for (const auto& wide : std::vector<std::vector<std::uint32_t>>{{8U, 8U}, {4U, 4U, 4U, 4U}, {8U, 4U, 2U, 2U},
+                 {2U, 2U, 2U, 2U, 2U, 2U, 2U, 2U}, {8U, 8U, 8U, 8U}, {8U, 4U, 4U, 8U, 2U, 2U, 2U, 2U}})
+            shapes.push_back(wide);
+    const std::vector<std::vector<std::uint64_t>> placements{{0U, 6U, 2045U, 2047U, 1U, 2201U, 3U, 1000U},
+        {2047U, 1U, 2201U, 3U, 2042U, 0U, 6U, 1500U}, {2201U, 2042U, 3U, 0U, 1000U, 6U, 2047U, 1U}};
     for (const auto& sizes : shapes)
         for (const auto& positions : placements) {
             const auto reference = run(sizes, positions, false);
             const auto candidate = run(sizes, positions, true);
-            require(candidate[0] == reference[0], "QSA cohort output/workspace bytes differ from each session's own window");
-            for (std::size_t k = 1; k < candidate.size(); ++k)
-                require(candidate[k] == reference[k], "QSA cohort KV/raw-index state differs from the session's own window");
+            for (std::size_t k = 0; k < candidate.size(); ++k)
+                require(candidate[k] == reference[k], k % 2U ? "QSA cohort KV/raw-index state differs from the session's own window" :
+                    "QSA cohort output/workspace bytes differ from each session's own window");
             ++compared;
         }
     // Every segment keeps the single-session admission; totals other than 4 or 8 are rejected.
     const auto rejected = [&](const std::vector<std::uint32_t>& sizes, bool same_state, const char* message) {
-        auto rows = f.rows;
+        std::vector<std::array<ExecutionDispatchContext, 8>> rows;
+        for (std::size_t k = 0; k < sizes.size(); ++k) rows.push_back(sessions[same_state ? 0U : k].rows);
         std::vector<HipQsaCohortSegment> segments;
-        std::uint32_t first = 0;
         for (std::size_t k = 0; k < sizes.size(); ++k) {
-            const auto& session = sessions[same_state ? 0U : k];
-            for (std::uint32_t r = 0; r < sizes[k]; ++r) {
-                rows[first + r].resources = &session.resources; rows[first + r].session_state_memory = &session.memory;
-                rows[first + r].position = 100U * (k + 1U) + r;
-            }
-            segments.push_back({std::span<const ExecutionDispatchContext>(rows.data() + first, sizes[k]), &f.config});
-            first += sizes[k];
+            for (std::uint32_t r = 0; r < sizes[k]; ++r) rows[k][r].position = 100U * (k + 1U) + r;
+            segments.push_back({std::span<const ExecutionDispatchContext>(rows[k].data(), sizes[k]), &f.config});
         }
         bool thrown = false;
         try { indexed_attention_known_window_cohort_preflight(segments); } catch (const std::invalid_argument&) { thrown = true; }
         require(thrown, message);
     };
-    rejected({2U, 4U}, false, "QSA cohort admits only four or eight rows in total");
+    rejected({2U, 4U}, false, "QSA cohort admits only 4, 8, 16 or 32 rows in total");
+    rejected({8U, 4U}, false, "QSA cohort admits only 4, 8, 16 or 32 rows in total");
+    if (!dense) rejected({8U, 8U}, false, "QSA cohort of 16 rows requires dense A8");
     rejected({2U, 2U}, true, "QSA cohort rejects two segments of one session state");
     std::cout << "QSA cohort dense=" << dense << " bf16_indexer=" << bf16_indexer << ": " << compared
               << " cohort windows bit-exact against per-session windows\n";
@@ -1839,6 +1846,79 @@ void bench_hyper_rows(bool splitk, bool lane, std::uint32_t count, bool cold) {
 }
 // Terminal head over real window row views: the configured prefetch R1 head
 // per row is the oracle; device greedy rows land in host-mapped memory.
+// Cohort heads of 16 / 32 rows: the rows of several 8-row windows (own arenas), one launch, against
+// every row's R1 head.
+void family_lm_head_cohort_rows(std::uint32_t rows) {
+    Owner owner;
+    const auto model = ModelContract::qwen38_flash_next();
+    const auto plan = build_serial_decode_execution_plan(model);
+    const auto io = build_serial_execution_io_plan(plan);
+    const auto step = plan.steps.back();
+    constexpr std::uint32_t hidden = 2560U, vocab = 4099U;
+    const auto& step_io = io.steps[step.id];
+    ExecutionArenaPlan serial; serial.alignment = 256U;
+    serial.allocations.push_back({step_io.reads[0], step.id, step.id, 0, hidden * 2U});
+    serial.allocations.push_back({step_io.writes[0], step.id, step.id, 5120U, vocab * 4U + 64U});
+    serial.total_bytes = (5120U + vocab * 4U + 64U + 255U) / 256U * 256U;
+    serial.naive_nonaliased_bytes = serial.total_bytes;
+    const auto window = build_known_window_arena(serial, 256U, 8U);
+    const auto weights = q8(hidden, vocab, 5U);
+    const auto device_weights = owner.allocate(weights.size());
+    write(device_weights, weights);
+    ModelManifest manifest; manifest.architecture = "qwen4_exp";
+    ManifestTensor tensor; tensor.name = "output.weight"; tensor.role = TensorRole::output_head;
+    tensor.dimensions = {hidden, vocab}; tensor.ggml_type = 8U; tensor.byte_size = weights.size();
+    manifest.tensors.push_back(tensor); manifest.total_tensor_bytes = tensor.byte_size;
+    manifest.layout_identity = model_manifest_layout_identity(manifest);
+    ModelRuntimeBinding runtime; runtime.manifest_layout_identity = manifest.layout_identity;
+    runtime.model_content_identity.bytes[0] = 1U;
+    runtime.tensors.push_back({0, RuntimeTensorStorage::resident, device_weights.address, device_weights.bytes, 1, 0});
+    ExecutionTensorAccessPlan access; access.manifest_layout_identity = manifest.layout_identity;
+    access.plan_identity = 0x4b4e4f574e4c4d02ULL; access.accesses.push_back({step.id, SerialOp::lm_head, 0, {0}});
+    const auto arenas = rows / 8U;
+    std::vector<ExecutionMemoryBinding> memory(arenas);
+    std::vector<ExecutionRuntimeResources> resources(arenas);
+    for (std::uint32_t a = 0; a < arenas; ++a) {
+        const auto scratch = owner.allocate(window.physical.total_bytes);
+        memory[a] = {0x4b4e4f574e4c4d01ULL, scratch.address, scratch.bytes, 23U + a};
+    }
+    for (std::uint32_t a = 0; a < arenas; ++a) resources[a] = {&memory[a], &manifest, &runtime, &access};
+    HipLmHeadLauncherConfig config{hidden, vocab, HipActivationStorage::bf16, true, true, true};
+    const std::string id = "hip.lm_head.bf16.h2560.v4099.r1.c1.prefetch8-wave8-v1.virtual256.q8";
+    std::vector<ExecutionDispatchContext> contexts(rows);
+    std::vector<ExecutionBufferAddress> logits(rows);
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        auto& c = contexts[r];
+        const auto a = r / 8U;
+        c.execution_identity = memory[a].execution_identity; c.step_id = step.id; c.op = step.op; c.kernel_id = id;
+        c.reads = step_io.reads; c.writes = step_io.writes; c.arena = &window.row_view[r % 8U]; c.memory = &memory[a];
+        c.resources = &resources[a]; c.position = r % 8U;
+        const auto in = resolve_dispatch_read(c, 0);
+        std::vector<std::uint16_t> bits(hidden);
+        for (std::uint32_t i = 0; i < hidden; ++i)
+            bits[i] = bf16(static_cast<float>(static_cast<int>((i * (2U * r + 5U)) % 23U) - 11) / 17.0F);
+        write({in.address, hidden * 2U}, bytes_of(bits));
+        logits[r] = resolve_dispatch_write(c, 0);
+    }
+    HipLaunchContext scope; scope.stream = owner.stream;
+    const auto launcher = make_hip_lm_head_launcher(id, &config);
+    const auto run = [&](bool candidate) {
+        for (const auto& l : logits) check(hipMemset(reinterpret_cast<void*>(l.address), 0xff, l.bytes), "poison head rows");
+        {
+            const HipLaunchScope owned(scope);
+            if (candidate) { lm_head_known_window_rows_preflight(contexts, config); lm_head_known_window_rows_launch(contexts, config); }
+            else for (const auto& c : contexts) launcher.function(c, launcher.user_data);
+        }
+        owner.finish();
+        std::vector<std::vector<unsigned char>> out;
+        for (const auto& l : logits) out.push_back(read({l.address, l.bytes}));
+        return out;
+    };
+    const auto reference = run(false);
+    require(run(true) == reference && run(true) == reference, "cohort head rows differ from R1 head bytes or tails");
+    std::cout << "LM head cohort rows " << rows << ": bit-exact against R1 heads\n";
+}
+
 void family_lm_head_rows(std::uint32_t rows) {
     Owner owner;
     const auto model = ModelContract::qwen38_flash_next();
@@ -2319,6 +2399,7 @@ int main(int argc, char** argv) try {
     qsa_rows_family(false, false, false);
     for (bool dense : {false, true}) for (bool bf16_indexer : {true, false}) qsa_cohort_family(dense, bf16_indexer);
     for(auto rows:{2U,4U,8U}) family_lm_head_rows(rows);
+    for (auto rows : {16U, 32U}) family_lm_head_cohort_rows(rows);
     std::cout << "known-window shared/GDN/QSA/LM-head component fixtures passed\n";
     return 0;
 } catch (const std::exception& error) {

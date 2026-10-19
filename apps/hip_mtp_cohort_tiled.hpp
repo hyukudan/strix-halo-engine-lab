@@ -99,7 +99,7 @@ inline MtpDecodeBatchServe make_cohort_tiled_run(const Options& options, const M
             << "  \"mtp_cohort_requests\":" << records.size() << ",\n"
             << "  \"mtp_calibration_rows\":" << runner.calibration.rows << ",\n  \"mtp_calibration_ms\":" << runner.calibration.ms << ",\n"
             << "  \"mtp_cohort_windows\":" << stats.cohort.cohort_windows << ",\n  \"mtp_cohort_window_sessions\":" << stats.cohort.cohort_sessions
-            << ",\n  \"mtp_cohort_window_rows\":" << stats.cohort.cohort_rows << ",\n  \"mtp_cohort_solo_windows\":" << stats.cohort.solo_windows
+            << ",\n  \"mtp_cohort_window_rows\":" << stats.cohort.cohort_rows << ",\n  \"mtp_cohort_solo_windows\":" << stats.cohort.solo_windows << ",\n  \"mtp_cohort_chunks\":" << stats.cohort.cohort_chunks
             << ",\n  \"mtp_cohort_steps\":" << stats.steps << ",\n  \"mtp_cohort_cohort_steps\":" << stats.cohort_steps << ",\n"
             << "  \"mtp_cohort_wall_ms\":" << decode_ms << ",\n  \"mtp_cohort_generated_tokens\":" << total_tokens << ",\n"
             << "  \"mtp_cohort_aggregate_tokens_per_second\":" << (decode_ms > 0.0 ? 1000.0 * static_cast<double>(total_tokens) / decode_ms : 0.0) << ",\n"

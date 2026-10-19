@@ -4820,7 +4820,9 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     else attend.template operator()<false>();
     }
     if (!(parts & 4U)) return;
-    if constexpr (Rows <= 8U) if (cohort_slot && !(parts & 2U) && config.dense_a8_projections && tensors.out.manifest->ggml_type == 8U)
+    // Cohorts of 16 / 32 rows (several sessions' segments): the WMMA projection from the same slot.
+    constexpr bool slot_rows = Rows <= 8U || (Rows % 16U == 0U && Rows <= q8_rows::kDenseA8Rows);
+    if constexpr (slot_rows) if (cohort_slot && !(parts & 2U) && config.dense_a8_projections && tensors.out.manifest->ggml_type == 8U)
         output_slot = *cohort_slot;
 
     QsaRowsOutputViews<Rows> out{};
@@ -4828,7 +4830,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         out.input[r] = prepared.row[r].workspace.attention_output;
         out.output[r] = reinterpret_cast<std::uint16_t*>(prepared.row[r].output.address);
     }
-    if constexpr (Rows <= 8U) if (output_slot.codes) {
+    if constexpr (slot_rows) if (output_slot.codes) {
         QsaOutputRowsSite<Rows> site{};
         site.segments = q8_rows::segments({{reinterpret_cast<const void*>(tensors.out.runtime->address), a.hidden}});
         for (unsigned r = 0; r < Rows; ++r) { site.input[r] = out.input[r]; site.output[r] = out.output[r]; }
@@ -5217,8 +5219,8 @@ QsaCohortPrepared prepare_qsa_cohort(std::span<const HipQsaCohortSegment> segmen
     if (segments.size() < 2U) throw std::invalid_argument("QSA cohort window requires two or more session segments");
     QsaCohortPrepared out;
     for (const auto& segment : segments) {
-        if (!segment.config || out.count + segment.rows.size() > 8U)
-            throw std::invalid_argument("QSA cohort window segments exceed eight rows");
+        if (!segment.config || out.count + segment.rows.size() > 32U)
+            throw std::invalid_argument("QSA cohort window segments exceed 32 rows");
         // Every session segment passes the complete single-session admission.
         qsa_rows_dispatch(segment.rows.size(), [&](auto rows) {
             out.segments.emplace_back(prepare_qsa_known_rows<decltype(rows)::value>(segment.rows, *segment.config, {}));
@@ -5226,7 +5228,15 @@ QsaCohortPrepared prepare_qsa_cohort(std::span<const HipQsaCohortSegment> segmen
         out.first.push_back(static_cast<unsigned>(out.count));
         out.count += segment.rows.size();
     }
-    if (out.count != 4U && out.count != 8U) throw std::invalid_argument("QSA cohort window requires four or eight rows in total");
+    if (out.count != 4U && out.count != 8U && out.count != 16U && out.count != 32U)
+        throw std::invalid_argument("QSA cohort window requires 4, 8, 16 or 32 rows in total");
+    // 16 / 32 rows: dense A8 with a Q8_0 output projection only (the pre-quantized slot path; per row the
+    // arithmetic of the 1..8-row forms).
+    if (out.count > 8U) {
+        const auto& p0 = std::visit([](const auto& p) -> const PreparedIndexedLaunch& { return p.row[0]; }, out.segments[0]);
+        if (!segments[0].config->dense_a8_projections || p0.tensors.out.manifest->ggml_type != 8U)
+            throw std::invalid_argument("QSA cohort window of 16 or 32 rows requires dense A8 and a Q8_0 output projection");
+    }
     const auto& c0 = *segments[0].config;
     const auto& a = std::visit([](const auto& p) -> const PreparedIndexedLaunch& { return p.row[0]; }, out.segments[0]);
     const auto prefetch0 = std::visit([](const auto& p) { return p.prefetch; }, out.segments[0]);
@@ -5277,7 +5287,9 @@ void indexed_attention_known_window_cohort_launch(std::span<const HipQsaCohortSe
     const auto slot = q8_rows::dense_a8_slot(0U);
     const auto merged = [&](unsigned part) {
         if (prepared.count == 4U) enqueue_qsa_known_rows<4U>(qsa_cohort_rows<4U>(prepared), config, part, nullptr, 0U, &slot);
-        else enqueue_qsa_known_rows<8U>(qsa_cohort_rows<8U>(prepared), config, part, nullptr, 0U, &slot);
+        else if (prepared.count == 8U) enqueue_qsa_known_rows<8U>(qsa_cohort_rows<8U>(prepared), config, part, nullptr, 0U, &slot);
+        else if (prepared.count == 16U) enqueue_qsa_known_rows<16U>(qsa_cohort_rows<16U>(prepared), config, part, nullptr, 0U, &slot);
+        else enqueue_qsa_known_rows<32U>(qsa_cohort_rows<32U>(prepared), config, part, nullptr, 0U, &slot);
     };
     merged(1U);
     for (std::size_t s = 0; s < prepared.segments.size(); ++s)

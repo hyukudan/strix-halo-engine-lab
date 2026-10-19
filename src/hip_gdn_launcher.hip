@@ -5056,7 +5056,7 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
         check_hip(hipGetLastError(), "GDN window F32 gate projection launch");
     }
     }
-    if (parts & 2U) {
+    if constexpr (Rows <= kGdnWindowRows) if (parts & 2U) {
     const auto saved = gdn_window_saved(config.model, layer.retained);
     // STRIX_GDN_WINDOW_PREPARE_GATES=1: the beta/gate scalars of the prepare spread over (head, row) pairs.
     static const bool parallel_gates = [] {
@@ -5265,18 +5265,29 @@ GdnCohortBinding bind_gdn_window_cohort(std::span<const HipGdnWindowCohortSegmen
 }
 } // namespace
 
+// Parts 1 and 4 of a cohort: 1..8 rows, or 16 / 32 rows (cohorts of several 8-row chunks; the 16-row-tile
+// projection forms, per-row arithmetic of the 1..8-row forms).
+template <class Body> void gdn_cohort_rows_dispatch(std::size_t rows, Body&& body) {
+    switch (rows) {
+    case 16: body(std::integral_constant<unsigned, 16U>{}); break;
+    case 32: body(std::integral_constant<unsigned, 32U>{}); break;
+    default:
+        if (rows > gdn_window_max_rows) throw std::invalid_argument("GDN cohort window requires 1..8, 16 or 32 rows");
+        gdn_window_rows_dispatch(rows, std::forward<Body>(body));
+    }
+}
 void gdn_window_cohort_enqueue(std::span<const GdnWindowCohortSegment> segments, const HipGdnLauncherConfig& config, void* stream) {
     if (segments.empty() || segments.size() > gdn_window_max_rows)
         throw std::invalid_argument("GDN cohort window requires 1..8 session segments");
-    std::array<GdnWindowRow, gdn_window_max_rows> rows{};
+    std::array<GdnWindowRow, gdn_window_cohort_max_rows> rows{};
     std::size_t count = 0;
     const auto& a = segments[0].layer;
     for (std::size_t s = 0; s < segments.size(); ++s) {
         const auto& segment = segments[s];
         validate_gdn_window(segment.layer, segment.rows, true, segment.control, config, stream);
         const auto& b = segment.layer;
-        if (count + segment.rows.size() > gdn_window_max_rows)
-            throw std::invalid_argument("GDN cohort window segments exceed eight rows");
+        if (count + segment.rows.size() > gdn_window_cohort_max_rows)
+            throw std::invalid_argument("GDN cohort window segments exceed 32 rows");
         if (a.qkv != b.qkv || a.z != b.z || a.beta != b.beta || a.alpha != b.alpha || a.out != b.out || a.conv != b.conv ||
             a.dt != b.dt || a.a != b.a || a.norm != b.norm || a.gate_type != b.gate_type || a.conv_type != b.conv_type ||
             a.dt_type != b.dt_type || a.a_type != b.a_type || a.norm_type != b.norm_type)
@@ -5287,16 +5298,20 @@ void gdn_window_cohort_enqueue(std::span<const GdnWindowCohortSegment> segments,
                 throw std::invalid_argument("GDN cohort window segments share session state");
         for (const auto& row : segment.rows) rows[count++] = row;
     }
+    // 16 / 32 rows: dense A8 projections only (the 16-row-tile WMMA forms; the FP32 Q8 wide forms do not
+    // keep the per-row arithmetic of the 1..8-row forms).
+    if (count > gdn_window_max_rows && !config.dense_a8_projections)
+        throw std::invalid_argument("GDN cohort window of 16 or 32 rows requires dense A8 projections");
     const auto native = static_cast<hipStream_t>(stream);
     const std::span<const GdnWindowRow> all(rows.data(), count);
-    gdn_window_rows_dispatch(count, [&](auto width) {
+    gdn_cohort_rows_dispatch(count, [&](auto width) {
         enqueue_gdn_window<decltype(width)::value>(a, all, segments[0].control, config, native, 1U);
     });
     for (const auto& segment : segments)
         gdn_window_rows_dispatch(segment.rows.size(), [&](auto width) {
             enqueue_gdn_window<decltype(width)::value>(segment.layer, segment.rows, segment.control, config, native, 2U);
         });
-    gdn_window_rows_dispatch(count, [&](auto width) {
+    gdn_cohort_rows_dispatch(count, [&](auto width) {
         enqueue_gdn_window<decltype(width)::value>(a, all, segments[0].control, config, native, 4U);
     });
 }

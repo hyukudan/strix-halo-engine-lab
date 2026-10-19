@@ -315,18 +315,111 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
         throw;
     }
 }
+namespace {
+struct CohortItem {std::size_t member;std::uint32_t rows;};
+// Global row budget (STRIX_COHORT_ROWS): items (largest first) fill groups of at most `budget` rows; a group's
+// items fill chunks of at most eight rows; a chunk of two or more items runs on an idle owner of its total rows
+// (4 or 8) that no member of the group verifies with, else its items run alone in the group's stream of steps.
+// A group of one item verifies alone.
+std::vector<HipMtpGreedyCycleResult> budget_cohorts(std::span<const HipMtpGreedyCohortMember> members,
+    std::vector<CohortItem>& items,std::vector<HipMtpGreedyCycleResult>& out,std::vector<bool>& open,
+    HipMtpGreedyCohortStats* stats,std::uint32_t budget) {
+    const auto sum_of=[](const std::vector<CohortItem>& v){std::uint32_t s=0;for(const auto& x:v)s+=x.rows;return s;};
+    std::stable_sort(items.begin(),items.end(),[](const CohortItem& a,const CohortItem& b){return a.rows>b.rows;});
+    std::vector<CohortItem> solo;
+    std::vector<std::vector<CohortItem>> groups;
+    for(const auto& item:items) {
+        if(!item.rows){solo.push_back(item);continue;}
+        bool placed=false;
+        for(auto& g:groups) if(sum_of(g)+item.rows<=budget){g.push_back(item);placed=true;break;}
+        if(!placed)groups.push_back({item});
+    }
+    for(auto& g:groups) {
+        if(g.size()<2U){solo.insert(solo.end(),g.begin(),g.end());continue;}
+        // Chunks: first fit of the (descending) items into bins of eight rows; a bin of six rows gives its
+        // last item a chunk of its own, so every chunk of two or more items has 4 or 8 rows.
+        std::vector<std::vector<CohortItem>> bins;
+        for(const auto& item:g) {
+            bool placed=false;
+            for(auto& b:bins) if(sum_of(b)+item.rows<=8U){b.push_back(item);placed=true;break;}
+            if(!placed)bins.push_back({item});
+        }
+        std::vector<std::vector<CohortItem>> chunks;
+        for(auto& b:bins) {
+            const auto sum=sum_of(b);
+            if(sum!=4U && sum!=8U && b.size()>=2U){const auto last=b.back();b.pop_back();chunks.push_back(b);chunks.push_back({last});}
+            else chunks.push_back(b);
+        }
+        // Primaries: owners no member verifies with in this cycle, one per chunk.
+        std::vector<const HipKnownPrefixWindow*> used;
+        for(const auto& x:g) used.push_back(members[x.member].runtime->window_verifier()->owner_with_rows(x.rows).get());
+        std::vector<std::shared_ptr<HipKnownPrefixWindow>> keep;
+        std::vector<HipKnownPrefixWindow*> primaries;
+        std::vector<std::size_t> sizes;
+        std::vector<CohortItem> order;
+        for(const auto& c:chunks) {
+            if(c.size()>=2U) {
+                const auto total=sum_of(c);
+                std::shared_ptr<HipKnownPrefixWindow> primary;
+                for(const auto& x:g) {
+                    auto o=members[x.member].runtime->window_verifier()->owner_with_rows(total);
+                    if(o && std::find(used.begin(),used.end(),o.get())==used.end()){primary=std::move(o);break;}
+                }
+                if(primary) {
+                    used.push_back(primary.get());primaries.push_back(primary.get());keep.push_back(std::move(primary));
+                    sizes.push_back(c.size());order.insert(order.end(),c.begin(),c.end());
+                    continue;
+                }
+            }
+            for(const auto& x:c){primaries.push_back(nullptr);sizes.push_back(1U);order.push_back(x);}
+        }
+        std::vector<HipMtpCohortVerifyRequest> requests;
+        std::uint32_t total=0;
+        for(const auto& x:order) {
+            const auto& c=members[x.member];auto& r=*c.runtime;total+=x.rows;
+            requests.push_back({r.window_verifier(),&r.target_session(),c.initial,r.drafted_candidates(),
+                r.drafted_probabilities(),c.budget,c.eos,x.rows,r.drafted_distributions()});
+        }
+        auto verified=HipMtpWindowVerifier::verify_cohort(requests,primaries,sizes);
+        for(std::size_t k=0;k<order.size();++k) {
+            const auto& c=members[order[k].member];
+            out[order[k].member]=c.runtime->finish_cycle(*c.initial,std::move(verified[k]),c.budget,c.eos);
+            open[order[k].member]=false;
+        }
+        if(stats){++stats->cohort_windows;stats->cohort_sessions+=order.size();stats->cohort_rows+=total;stats->cohort_chunks+=sizes.size();}
+    }
+    for(const auto& x:solo) {
+        const auto& c=members[x.member];auto& r=*c.runtime;
+        auto verified=r.window_verifier()->verify(r.target_session(),r.target_dispatcher(),*c.initial,r.drafted_candidates(),
+            c.budget,c.eos,r.drafted_probabilities(),r.drafted_distributions());
+        out[x.member]=r.finish_cycle(*c.initial,std::move(verified),c.budget,c.eos);
+        open[x.member]=false;
+        if(stats)++stats->solo_windows;
+    }
+    return out;
+}
+}
 std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(std::span<const HipMtpGreedyCohortMember> members,
     HipMtpGreedyCohortStats* stats) {
     std::vector<HipMtpGreedyCycleResult> out(members.size());
     std::vector<bool> open(members.size(),false);
-    struct Item {std::size_t member;std::uint32_t rows;};
+    using Item=CohortItem;
     std::vector<Item> items;
     // Rows per session: at most 8 / sessions (4 for two, 2 for three or four), so that the sessions of a
     // cycle fill one 8-row cohort; drafts beyond that window are not drafted.
     // STRIX_COHORT_MAX_ROWS=2|4|8 overrides it.
     static const std::uint32_t max_rows_override=[]{const char* v=std::getenv("STRIX_COHORT_MAX_ROWS");
         const auto n=v?std::atoi(v):0;return n==2||n==4||n==8?static_cast<std::uint32_t>(n):0U;}();
-    const std::uint32_t cap=max_rows_override?max_rows_override:members.size()>=3U?2U:members.size()==2U?4U:8U;
+    // STRIX_COHORT_ROWS=16|32: a global row budget per cycle instead of one 8-row cohort. Each session gets
+    // the largest of 8/4/2 rows that keeps sessions x rows within the budget; the sessions of a group (up
+    // to the budget) run in one stream of steps as chunks of at most eight rows (verify_cohort over chunks).
+    static const std::uint32_t budget_rows=[]{const char* v=std::getenv("STRIX_COHORT_ROWS");
+        const auto n=v?std::atoi(v):0;return n==16||n==32?static_cast<std::uint32_t>(n):0U;}();
+    const auto budget_cap=[&]{
+        std::uint32_t r=8U;while(r>2U && members.size()*r>budget_rows) r/=2U;return r;
+    };
+    const std::uint32_t cap=max_rows_override?max_rows_override:budget_rows?budget_cap():
+        members.size()>=3U?2U:members.size()==2U?4U:8U;
     try {
         for(std::size_t m=0;m<members.size();++m) {
             const auto& c=members[m];
@@ -341,6 +434,7 @@ std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(std::span<const
                 c.runtime->drafted_candidates().size(),c.budget)) rows=cap;
             items.push_back({m,rows});
         }
+        if(budget_rows) return budget_cohorts(members,items,out,open,stats,budget_rows);
         // Pack sessions into cohorts of 4 or 8 rows: larger windows first, each into the first cohort
         // with room; a lone session, or one whose owner does not fit, verifies alone.
         std::vector<Item> solo;
