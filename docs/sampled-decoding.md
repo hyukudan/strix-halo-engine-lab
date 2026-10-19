@@ -55,6 +55,48 @@ draft distribution.
 - Prompt: only the final prompt row decides by sampling; earlier rows keep first-max selection because their
   predictions are never emitted.
 
+## Device decisions
+
+Sampled rows are decided on the GPU by default (`src/hip_token_sampling_device.hip`): target rows (window rows and
+serial rows) and the draft chain. `STRIX_SAMPLE_PATH=host` (or `STRIX_SAMPLE_HOST=1`) restores the host path
+everywhere, `STRIX_SAMPLE_PATH=device` forces the device path, and `STRIX_SAMPLE_DRAFT_HOST=1` keeps only the draft
+chain on the host. The default (`auto`) is the device path for every policy: it decided faster than the host for
+each kind of decision (window rows, serial rows, draft steps) with every filter combination measured.
+
+- Same transform: the finite check, `z = (logit - max) / T` in double, the cutoff, top-k by `(z desc, id asc)`
+  (radix selection on the logit's order key; a tie at the k-th key takes the lowest token ids), weights `exp(z)` in
+  double, top-p over the `(weight desc, id asc)` prefix and the inverse CDF in the same entry order.
+- Small kept sets: when the cutoff and top-k keep at most 2048 entries (any min-p or top-k filter in practice), the
+  kept entries are compacted in token id order and one workgroup decides the row with the host's own sequence:
+  the total summed in token id order, the top-p prefix and its mass, the cumulative probabilities, the acceptance
+  test and the residual walk.
+- Top-k up to 64: one pass over the logits. Each of the 32 workgroups of a row keeps its own k largest entries
+  (radix selection in local memory, ties by lowest id), and one workgroup merges the lists, which contain the
+  row's top-k, applies the cutoff and decides as above.
+- Large kept sets: the weights are summed in token id order over a fixed two-level partition (per thread, then per
+  workgroup). With top-p, the prefix boundary, the sample and the residual sample are mass quantiles in
+  `(weight desc, id asc)` order: four radix rounds over the order key with per-digit masses, then a walk over
+  the entries of the final key in token id order. The masses are summed in 80-bit fixed point (two 64-bit integer
+  accumulators, resolution 2^-80), so every sum is exact and independent of the order of the atomic additions,
+  and no candidate limit applies.
+- Same uniforms: the host computes each row's `U(n, plain|accept|residual|draft)` with the counter-based generator
+  and passes them to the device; only tokens and decision flags come back.
+- Rounding: the device `exp` may differ from the host's in the last bit, and large kept sets sum in a different
+  order (or in fixed point), so a decision can differ from the host path only when its uniform lies within a few
+  double ulps of a cumulative boundary.
+- Draft chain: each step's sampling kernels run after the draft head and overwrite the step's device token slot,
+  which the next step's embedding reads, so the chain never waits for the host. The draft head's entries are
+  visited in token id order through an index map uploaded when the entry list grows. Each step's `q` stays in
+  device memory (probabilities over the head's ids, ascending) and the target rows read `q(d)` and the residual
+  from there. Every policy runs the draft chain on the device.
+
+`strix-hip-token-sampling-device-tests` compares device and host decisions (with and without drafts, the draft
+distribution in pinned host or device memory, every filter combination, top-p up to 0.99 without top-k, top-k on
+both sides of the one-pass limit) for rows of 4099 to 248320 tokens, and
+device draft steps (token, support and probabilities) over entry lists shaped like the draft head's.
+`STRIX_SAMPLE_TIMING=1` prints the host time of sampled decisions per kind and window size, and the device
+sampler's kernel time, at exit.
+
 ## Reproducibility
 
 Which positions carry a draft, and which draft, depends on the window and draft-length choices. The `fixed`
@@ -65,9 +107,10 @@ can differ.
 
 ## Cost
 
-Each decided row copies one FP32 vocabulary row (about 1 MB) to the host and builds its distribution there; each
-draft step copies the draft head's rows and completes before the next step. Rows after the first rejection are not
-decided. A device-side transform is a possible follow-up.
+On the device path a window's rows are decided together by the sampler's kernels after the window, and a draft
+step adds its sampling kernels to the chain; only the decisions are read back. The host path copies one FP32
+vocabulary row (about 1 MB) per decided row and builds its distribution there, and each draft step copies the
+draft head's rows and completes before the next step; rows after the first rejection are not decided.
 
 ## Validation
 
