@@ -346,6 +346,43 @@ with the automatic organization, tiled route with the explicit v5 flag set; F = 
 | 16384 tokens (wiki), T=2048, F | Byte-identical (16.3 GB file), 16383 score rows equal; 1001 s serial vs 66 s tiled |
 | 16384 tokens, where the tiled time goes (per 2048-row block) | 7-8 s GPU against 5.4 s for the same prefill with only the terminal head (the eight-row heads add about 2.6 s), 31 ms download, 150 ms scoring; the 0.3-2.8 s spool overlaps the next block |
 
+## D-035: int8 attention KV cache with per-token scales (kv-int8-tok-v1)
+
+`--attention-kv-storage kv-int8-tok-v1` stores the target model's QSA attention KV cache as int8 codes with one
+FP32 scale per token, KV head and K/V half: per (token, head, half), `s = max|x| / 127` over the 256 BF16-rounded
+values and `code = clamp(rint(x / s), -127, 127)`; readers use `float(code) * s` where the BF16 cache uses the BF16
+value. A KV row is 1040 instead of 2048 bytes, 12480 instead of 24576 bytes per token over the 12 layers. The
+storage is a field of the model contract (`attention_kv_storage`), so every KV size (session layout, layer
+slices, snapshots, MTP checkpoints and rollbacks) derives from it; it enters the execution and session-layout
+identities (prefix-cache keys), the indexed-attention implementation identity and the MTP golden's recorded
+target profile pair, and the receipt (`attention_kv_storage`, `attention_kv_bytes_per_token`,
+`attention_kv_storage_qualification: not_assessed`). Without the flag nothing changes. The MTP head keeps its
+BF16 KV cache; the indexer never reads the KV cache. See [docs/attention-kv-int8.md](docs/attention-kv-int8.md).
+
+Why: the KV cache is the per-token state that grows with context; halving it doubles the context that fits in a
+given state budget and halves the KV bytes the score/value kernels read. The quantizer's maximum is
+order-independent and every kernel form keeps its arithmetic order with the dequantized element, so the decode,
+window and prefill-group kernels stay bit-identical to one another and the tiled routes keep reproducing the
+serial rows within the new identity.
+
+Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL), profile `hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1`:
+
+| Check | Result |
+| --- | --- |
+| BF16 default, new binary vs base, teacher-forced 1600 tokens, tiled T=256 | Logits file byte-identical |
+| BF16 default, MTP golden dump (43-token prompt) and MTP windows + plain decode, 128 tokens, base vs new | Same golden SHA-256, same tokens |
+| kv-int8-tok-v1, teacher-forced 1600 tokens, tiled T=256 vs serial route | Logits file byte-identical |
+| kv-int8-tok-v1, MTP windows (rows 2/4/8, golden dumped under the identity), 128 tokens | Replay error 0 (hidden and logit), tokens equal the serial decode with the automatic v5 organization |
+| Device fixture (`strix-hip-attention-kv-int8-tests`) | Writers equal the host quantizer; decode, 8-row window and 16-row prefill-group kernels bitwise equal |
+| Quality vs BF16 KV, teacher-forced 16K wiki (T=2048) | Top-1 agreement 97.08%, mean KL 0.0054, mean NLL 1.6116 → 1.6103 |
+| Quality vs BF16 KV, teacher-forced 16K code (T=2048) | Top-1 agreement 98.24%, mean KL 0.0058, mean NLL 0.5498 → 0.5497 |
+| KL by position (16K) | No growth with depth: wiki 0.0054 / 0.0052 / 0.0056, code 0.0106 / 0.0046 / 0.0056 for 0-2K / 2-8K / 8-16K |
+| Teacher-forced NLL, 32K haystack (32055 rows, no logits file) | NLL 4.3611 → 4.2609; mean absolute per-row target-logprob difference 0.18 (0-2K) rising to 0.33 (24-32K), against 0.04-0.06 on the 16K wiki/code documents |
+| Long-document retrieval, 24 haystacks of 8K/16K/32K tokens (5 questions each), greedy 200 tokens | Full output identical to the BF16 KV on 24/24 haystacks; 116/120 correct in both |
+
+For scale, the dense-A8 profile against the FP32-dense profile on the same 16K documents measures 96.7-98.1%
+top-1 agreement and mean KL 0.0066-0.0069. Speed was not measured (deferred to the combined campaign).
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |
