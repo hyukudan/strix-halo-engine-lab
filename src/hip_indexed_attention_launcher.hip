@@ -1323,6 +1323,7 @@ __global__ void publish_qsa_selection_status(const std::uint32_t* local,
     if (index == 0) merge_deferred_moe_first_error(*first_error, bits, DeferredMoeDomain::qsa_selection);
 }
 
+#ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC // only caller: select_blocks_serial_kernel
 // Single-thread reference selection (diagnostic only; production runs the parallel body below).
 __device__ __forceinline__ void select_blocks_body(
     float* block_scores,
@@ -1424,6 +1425,7 @@ __device__ __forceinline__ void select_blocks_body(
             token;
     }
 }
+#endif
 
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC // reference selection of the block-select probe only
 __global__ void select_blocks_serial_kernel(float* block_scores, std::uint32_t num_blocks,
