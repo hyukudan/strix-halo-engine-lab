@@ -1244,6 +1244,7 @@ struct HipTokenDraftSamplerDevice::Impl {
     double* q = nullptr;                // device: [max_steps][capacity]
     std::uint32_t* staging = nullptr;   // pinned host: order then ids
     std::vector<std::uint64_t> positions;
+    std::vector<hipEvent_t> starts, stops; // STRIX_SAMPLE_TIMING: per step, read after the chain completed
     Impl(std::uint32_t c, std::uint32_t steps)
         : capacity(c), max_steps(steps), engine(c, 1U), results(pinned_results(std::max<std::uint32_t>(steps, 1U))), positions(steps) {
         require(steps > 0U, "device draft sampler needs a step");
@@ -1255,6 +1256,8 @@ struct HipTokenDraftSamplerDevice::Impl {
     ~Impl() {
         if (results) (void)hipHostFree(results);
         if (staging) (void)hipHostFree(staging);
+        for (auto* e : starts) (void)hipEventDestroy(e);
+        for (auto* e : stops) (void)hipEventDestroy(e);
         for (void* p : {static_cast<void*>(order), static_cast<void*>(sorted_ids), static_cast<void*>(q)}) if (p) (void)hipFree(p);
     }
     void set_vocabulary(std::span<const std::uint32_t> ids, std::uint32_t n, hipStream_t stream) {
@@ -1281,7 +1284,16 @@ struct HipTokenDraftSamplerDevice::Impl {
         a.logits = logits; a.order = order; a.ids = sorted_ids;
         a.q_out = q + static_cast<std::uint64_t>(k) * capacity; a.token_out = slot;
         a.u_plain = u;
+        const bool timed = sample_timing_enabled();
+        if (timed && starts.empty()) {
+            starts.resize(max_steps); stops.resize(max_steps);
+            for (std::uint32_t i = 0; i < max_steps; ++i) {
+                check(hipEventCreate(&starts[i]), "draft timing event"); check(hipEventCreate(&stops[i]), "draft timing event");
+            }
+        }
+        if (timed) check(hipEventRecord(starts[k], stream), "draft timing start");
         engine.enqueue(r, 1U, rows, policy, results + k, stream);
+        if (timed) check(hipEventRecord(stops[k], stream), "draft timing stop");
     }
     TokenDraft draft(std::uint32_t k) const {
         const auto result = results[k];
@@ -1310,7 +1322,14 @@ void HipTokenDraftSamplerDevice::step(const TokenSampler& sampler, std::uint32_t
 void HipTokenDraftSamplerDevice::finish(TokenSampler& sampler, std::uint32_t steps, std::vector<TokenDraft>& out) {
     require(steps <= impl_->max_steps, "device draft steps exceed the sampler");
     out.clear();
-    for (std::uint32_t k = 0; k < steps; ++k) { out.push_back(impl_->draft(k)); sampler.count_draft(); }
+    for (std::uint32_t k = 0; k < steps; ++k) {
+        out.push_back(impl_->draft(k)); sampler.count_draft();
+        if (!impl_->starts.empty()) {
+            float ms = 0.0F;
+            check(hipEventElapsedTime(&ms, impl_->starts[k], impl_->stops[k]), "draft timing");
+            record_sample_timing(SampleTimingKind::draft_kernels, 1U, 0.0, static_cast<double>(ms) * 1e-3, 1U);
+        }
+    }
 }
 
 TokenDecision hip_decide_token_for_testing(std::span<const float> logits, const TokenSamplingPolicy& policy,
