@@ -323,7 +323,7 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial(
             if(i.sampler) {
                 const auto t0=std::chrono::steady_clock::now();
                 const auto vocabulary=static_cast<std::uint32_t>(i.model->vocab_size);
-                if(device_token_sampling_enabled()) {
+                if(device_token_sampling_enabled(i.sampler->policy())) {
                     if(!i.device_sampler) i.device_sampler=std::make_unique<HipTokenSamplerDevice>(vocabulary,1U);
                     const DeviceSampleRow row{i.logits,lease->position+1U,draft};
                     const auto decision=i.device_sampler->decide(*i.sampler,std::span<const DeviceSampleRow>(&row,1U),i.stream).front();
@@ -332,7 +332,7 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial(
                 } else
                     read_hip_logits_row(i.logits,vocabulary,i.stream,i.sampled_logits);
                 const auto t1=std::chrono::steady_clock::now();
-                if(!device_token_sampling_enabled())
+                if(!device_token_sampling_enabled(i.sampler->policy()))
                     lease->predicted=i.sampler->decide(i.sampled_logits,lease->position+1U,draft).token;
                 if(sample_timing_enabled()) record_sample_timing(SampleTimingKind::serial,1U,
                     std::chrono::duration<double>(t1-t0).count(),

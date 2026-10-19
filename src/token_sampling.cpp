@@ -124,6 +124,21 @@ TokenDistribution make_token_distribution(std::span<const float> logits,std::spa
     return out;
 }
 
+TokenDistribution make_token_distribution_from_probabilities(std::span<const std::uint32_t> tokens,
+    std::span<const double> probabilities) {
+    require(tokens.size()==probabilities.size(),"token distribution geometry is invalid");
+    TokenDistribution out;
+    for(std::size_t i=0;i<tokens.size();++i) if(probabilities[i]>0.0) {
+        out.tokens_.push_back(tokens[i]);out.probabilities_.push_back(probabilities[i]);
+    }
+    out.by_token_.resize(out.tokens_.size());
+    for(std::size_t i=0;i<out.by_token_.size();++i) out.by_token_[i]=static_cast<std::uint32_t>(i);
+    std::sort(out.by_token_.begin(),out.by_token_.end(),[&](std::uint32_t a,std::uint32_t b){return out.tokens_[a]<out.tokens_[b];});
+    for(std::size_t i=1;i<out.by_token_.size();++i)
+        require(out.tokens_[out.by_token_[i-1]]!=out.tokens_[out.by_token_[i]],"token distribution ids must be distinct");
+    return out;
+}
+
 TokenDecision decide_token(const TokenDistribution& p,const TokenDraft* draft,
     double u_plain,double u_accept,double u_residual) {
     require(!p.empty(),"token decision requires a target distribution");
@@ -182,6 +197,10 @@ TokenSampler::Uniforms TokenSampler::uniforms(std::uint64_t position,bool drafte
         u.residual=speculation_uniform01(rng_,position,SpeculationRandomDrawClass::residual_fallback);
     }
     return u;
+}
+
+double TokenSampler::draft_uniform(std::uint64_t position) const {
+    return speculation_uniform01(rng_,position,SpeculationRandomDrawClass::draft_proposal);
 }
 
 void TokenSampler::count(const TokenDecision& decision) noexcept {

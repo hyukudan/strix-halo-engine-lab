@@ -19,11 +19,11 @@ namespace {
 struct SampleTimingTotals {
     std::mutex mutex;
     // [kind][rows 0..8]: calls, decided rows, readback seconds, decide seconds
-    std::uint64_t calls[3][9]{}, decided[3][9]{};
-    double readback[3][9]{}, decide[3][9]{};
+    std::uint64_t calls[4][9]{}, decided[4][9]{};
+    double readback[4][9]{}, decide[4][9]{};
     ~SampleTimingTotals() {
-        static const char* names[3] = {"window", "serial", "draft"};
-        for (unsigned k = 0; k < 3U; ++k) for (unsigned r = 0; r < 9U; ++r) if (calls[k][r])
+        static const char* names[4] = {"window", "serial", "draft", "kernels"};
+        for (unsigned k = 0; k < 4U; ++k) for (unsigned r = 0; r < 9U; ++r) if (calls[k][r])
             std::fprintf(stderr, "sample-timing %s rows=%u: %llu calls, %llu decided rows, readback %.1f us/call, decide %.1f us/call\n",
                 names[k], r, static_cast<unsigned long long>(calls[k][r]), static_cast<unsigned long long>(decided[k][r]),
                 readback[k][r] * 1e6 / static_cast<double>(calls[k][r]), decide[k][r] * 1e6 / static_cast<double>(calls[k][r]));

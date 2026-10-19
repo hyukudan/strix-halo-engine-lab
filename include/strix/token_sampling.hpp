@@ -50,6 +50,8 @@ public:
 private:
     friend TokenDistribution make_token_distribution(std::span<const float>,std::span<const std::uint32_t>,
         const TokenSamplingPolicy&);
+    friend TokenDistribution make_token_distribution_from_probabilities(std::span<const std::uint32_t>,
+        std::span<const double>);
     std::vector<std::uint32_t> tokens_;
     std::vector<double> probabilities_;
     std::vector<std::uint32_t> by_token_; // indices into tokens_, token id ascending
@@ -59,12 +61,27 @@ private:
 [[nodiscard]] TokenDistribution make_token_distribution(std::span<const float> logits,
     std::span<const std::uint32_t> ids,const TokenSamplingPolicy&);
 
+// A distribution computed elsewhere (the device path): the entries with a positive probability, in the given
+// order, with their probabilities as given.
+[[nodiscard]] TokenDistribution make_token_distribution_from_probabilities(std::span<const std::uint32_t> tokens,
+    std::span<const double> probabilities);
+
+// Device-resident draft distribution (drafts sampled on the device): probabilities over `count` token ids in
+// ascending order, 0 for ids outside the distribution. Valid until the next draft chain.
+struct TokenDraftDevice {
+    const std::uint32_t* tokens = nullptr;
+    const double* probabilities = nullptr;
+    std::uint32_t count = 0;
+};
+
 // A sampled draft and the distribution it was drawn from. The position is the
-// absolute position of the token the draft proposes.
+// absolute position of the token the draft proposes. A draft sampled on the
+// device carries `device` and an empty `distribution`.
 struct TokenDraft {
     std::uint64_t position = 0;
     std::uint32_t token = 0;
     TokenDistribution distribution;
+    TokenDraftDevice device;
 };
 
 struct TokenDecision {
@@ -107,6 +124,9 @@ public:
     struct Uniforms {double plain = 0.0,accept = 0.0,residual = 0.0;};
     [[nodiscard]] Uniforms uniforms(std::uint64_t position,bool drafted) const;
     void count(const TokenDecision& decision) noexcept;
+    // The same for draft(): the proposal uniform of a position and the draft count.
+    [[nodiscard]] double draft_uniform(std::uint64_t position) const;
+    void count_draft() noexcept {++stats_.drafts;}
 private:
     TokenSamplingPolicy policy_;
     SpeculationRngIdentity rng_;

@@ -427,7 +427,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             const auto start=std::chrono::steady_clock::now();
             std::vector<TokenDecision> decisions;
             const auto n=std::min(rows,budget);
-            if(device_token_sampling_enabled()) {
+            if(device_token_sampling_enabled(sampler->policy())) {
                 // Every row on the device at once; the stopping rule of TokenSampler::decide_rows on the results.
                 if(!i.device_sampler) i.device_sampler=std::make_unique<HipTokenSamplerDevice>(static_cast<std::uint32_t>(vocabulary),8U);
                 std::vector<DeviceSampleRow> device_rows(n);

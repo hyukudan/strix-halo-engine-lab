@@ -294,6 +294,14 @@ void HipMtpDraftHead::set_token(std::uint32_t step,std::uint32_t token,void* str
     check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(p.slots+step),static_cast<int>(token),1,p.stream),"MTP draft token override");
     p.reply->tokens[step]=token;
 }
+std::uint32_t* HipMtpDraftHead::device_token_slot(std::uint32_t step) {
+    require(step<impl_->config.max_depth,"MTP draft token slot is invalid");return impl_->slots+step;
+}
+std::uint32_t HipMtpDraftHead::capacity() const noexcept {return impl_->capacity;}
+void HipMtpDraftHead::record_token(std::uint32_t step,std::uint32_t token) {
+    auto& p=*impl_;require(step<p.config.max_depth && token<p.config.vocab_size,"MTP draft token record is invalid");
+    p.reply->tokens[step]=token;
+}
 bool HipMtpDraftHead::records_runner_up() const noexcept {return impl_->runner_logits!=nullptr;}
 bool HipMtpDraftHead::runner_up(std::uint32_t step,std::uint32_t& token,float& probability) const {
     const auto& p=*impl_;

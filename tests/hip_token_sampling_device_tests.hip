@@ -1,12 +1,14 @@
 // Device sampling-v1 against the host transform: for random logit rows, policies, drafts and uniforms the
-// device decision must equal decide_token(make_token_distribution(...)) (the device sums in a fixed parallel
-// order and uses the device exp, so only a uniform within a few double ulps of a cumulative boundary could
-// differ; none is expected over these draws).
+// device decision must equal decide_token(make_token_distribution(...)) (the device exp and, for large kept sets,
+// the parallel summation order could only change a uniform within a few double ulps of a cumulative boundary;
+// none is expected over these draws). Drafts are read from pinned host memory or from device memory. Device
+// draft steps over draft-head-like entry lists must give the host's token and distribution.
 #include "strix/hip_token_sampling_device.hpp"
 #include "strix/token_sampling.hpp"
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -42,7 +44,7 @@ int main(int argc, char** argv) try {
         {1.0F, 5U, 1.0F, 0.0F, 0U}, {1.0F, 0U, 0.8F, 0.0F, 0U}, {0.7F, 40U, 0.9F, 0.05F, 0U}, {2.0F, 0U, 0.95F, 0.0F, 0U},
         {0.3F, 0U, 1.0F, 0.0F, 0U}, {1.0F, 3000U, 1.0F, 0.0F, 0U}, {1.5F, 0U, 0.5F, 0.0F, 0U},
     };
-    unsigned decided = 0, drafted = 0, accepted = 0, residual = 0, fallbacks = 0;
+    unsigned decided = 0, drafted = 0, accepted = 0, residual = 0, fallbacks = 0, device_q = 0;
     for (unsigned c = 0; c < cases; ++c) {
         const auto& policy = policies[c % std::size(policies)];
         const std::uint32_t vocab = c % 3U == 0U ? 248320U : c % 3U == 1U ? 151936U : 4099U;
@@ -64,8 +66,10 @@ int main(int argc, char** argv) try {
         const auto host = decide_token(make_token_distribution(logits, {}, policy), with_draft ? &draft : nullptr,
             u_plain, with_draft ? u_accept : 0.0, with_draft ? u_residual : 0.0);
         bool fallback = false;
+        const bool q_on_device = with_draft && c % 2U == 1U;
+        device_q += q_on_device ? 1U : 0U;
         const auto device = hip_decide_token_for_testing(logits, policy, with_draft ? &draft : nullptr, u_plain,
-            with_draft ? u_accept : 0.0, with_draft ? u_residual : 0.0, &fallback);
+            with_draft ? u_accept : 0.0, with_draft ? u_residual : 0.0, &fallback, q_on_device);
         fallbacks += fallback ? 1U : 0U;
         require(device.token == host.token && device.drafted == host.drafted && device.accepted == host.accepted &&
                 device.residual == host.residual,
@@ -73,6 +77,39 @@ int main(int argc, char** argv) try {
                 std::to_string(device.token) + " vs " + std::to_string(host.token));
         ++decided; drafted += host.drafted; accepted += host.accepted; residual += host.residual;
     }
+    // Device draft steps: entry lists like the draft head's (an ascending base list, then context ids appended
+    // in arrival order) or the identity, for the policies the device draft path takes.
+    unsigned draft_steps = 0;
+    double max_relative = 0.0;
+    for (unsigned c = 0; c < cases / 2U; ++c) {
+        const auto& policy = policies[c % std::size(policies)];
+        if (!(policy.top_p >= 1.0F || (policy.top_k > 0U && policy.top_k <= device_top_p_candidates))) continue;
+        std::vector<std::uint32_t> ids;
+        const std::uint32_t vocab = 248320U;
+        if (c % 5U != 0U) {
+            std::uniform_int_distribution<std::uint32_t> pick(0, vocab - 1U);
+            std::vector<std::uint8_t> seen(vocab, 0U);
+            for (std::uint32_t t = 0; t < vocab && ids.size() < 32768U; t += 1U + pick(rng) % 13U) { ids.push_back(t); seen[t] = 1U; }
+            for (unsigned k = 0; k < 4096U; ++k) { const auto t = pick(rng); if (!seen[t]) { seen[t] = 1U; ids.push_back(t); } }
+        }
+        const auto entries = ids.empty() ? vocab : static_cast<std::uint32_t>(ids.size());
+        const auto logits = make_logits(rng, entries, c % 2U ? 2.0F : 3.5F);
+        const double u = uniform(rng);
+        const auto host = make_token_distribution(logits, ids, policy);
+        const auto host_token = host.sample(u);
+        const auto device = hip_draft_for_testing(logits, ids, policy, u);
+        require(device.token == host_token, "device draft token differs from the host in case " + std::to_string(c) + ": " +
+            std::to_string(device.token) + " vs " + std::to_string(host_token));
+        const auto& d = device.distribution;
+        require(d.tokens().size() == host.tokens().size(), "device draft support size differs in case " + std::to_string(c));
+        for (const auto t : host.tokens()) {
+            const double h = host.probability(t), g = d.probability(t);
+            require(g > 0.0, "device draft support differs in case " + std::to_string(c));
+            max_relative = std::max(max_relative, std::abs(g - h) / h);
+        }
+        ++draft_steps;
+    }
+    require(max_relative < 1e-12, "device draft probabilities differ from the host by " + std::to_string(max_relative));
     // A non-finite logit is rejected as on the host.
     {
         std::vector<float> bad(4099U, 0.0F);
@@ -82,8 +119,11 @@ int main(int argc, char** argv) try {
         catch (const std::invalid_argument&) { rejected = true; }
         require(rejected, "device sampling accepted a non-finite logit");
     }
-    std::cout << "device sampling-v1: " << decided << " decisions equal the host (" << drafted << " drafted, " << accepted
-              << " accepted, " << residual << " residual, " << fallbacks << " host top-p fallbacks)\n";
+    std::cout << "device sampling-v1: " << decided << " decisions equal the host (" << drafted << " drafted, " << device_q
+              << " with the draft distribution in device memory, " << accepted << " accepted, " << residual << " residual, "
+              << fallbacks << " host top-p fallbacks); " << draft_steps
+              << " device draft steps equal the host (token and support; max relative probability difference "
+              << max_relative << ")\n";
     return 0;
 } catch (const std::exception& error) {
     std::cerr << "device sampling test failed: " << error.what() << '\n';

@@ -1,6 +1,7 @@
 #include "strix/host_phase_timing.hpp"
 #include "strix/hip_mtp_runtime.hpp"
 #include "strix/hip_token_sampling.hpp"
+#include "strix/hip_token_sampling_device.hpp"
 #include <chrono>
 #include "strix/hip_mtp_attention.hpp"
 #include "strix/hip_mtp_projection.hpp"
@@ -107,6 +108,8 @@ struct HipMtpRuntime::Impl {
     std::shared_ptr<TokenSampler> sampler;
     std::vector<TokenDraft> sampled;
     std::vector<float> draft_logits;
+    // Drafts sampled on the device (device_draft_sampling_enabled): no per-step wait or readback.
+    std::unique_ptr<HipTokenDraftSamplerDevice> draft_device;
     MtpDraftCycleInput current;
     HipMtpExecutionStats stats;
     std::uint64_t next_source=0,base_source=0,epoch=0,profile=0;
@@ -366,6 +369,12 @@ struct HipMtpRuntime::Impl {
             const auto* hidden=reinterpret_cast<const std::uint16_t*>(owner->view(HipMtpBuffer::hidden0).address);
             copy(owner->view(HipMtpBuffer::wide_current),cycle_base->view());
             draft->begin_chain();
+            const bool device_draft=sampler && device_draft_sampling_enabled(sampler->policy());
+            if(device_draft) {
+                if(!draft_device) draft_device=std::make_unique<HipTokenDraftSamplerDevice>(draft->capacity(),
+                    std::max<std::uint32_t>(owner->budget().maximum_candidate_depth,1U));
+                draft_device->set_vocabulary(draft->host_ids(),draft->stats().rows,stream);
+            }
             const auto requested=depth;
             for(std::uint32_t k=0;k<requested;++k) {
                 const auto c=context(next_source+k);
@@ -385,7 +394,13 @@ struct HipMtpRuntime::Impl {
                 copy(owner->view(HipMtpBuffer::wide_current),owner->view(HipMtpBuffer::wide_next));
                 hyper(c,MtpHyperRole::head,stream);
                 draft->launch(hidden,k,stream);
-                if(sampler) {
+                if(device_draft) {
+                    // The sampled token overwrites the argmax in the step's slot before the next step reads it.
+                    const auto t0=std::chrono::steady_clock::now();
+                    draft_device->step(*sampler,k,draft->logits(),next_source+k+2U,draft->device_token_slot(k),stream);
+                    if(sample_timing_enabled()) record_sample_timing(SampleTimingKind::draft,1U,0.0,
+                        std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count(),1U);
+                } else if(sampler) {
                     // Draft k proposes the token at next_source + k + 2 (row k's seed sits at next_source + k + 1).
                     const auto t0=std::chrono::steady_clock::now();
                     draft->read_logits(draft_logits);
@@ -397,7 +412,7 @@ struct HipMtpRuntime::Impl {
                     draft->set_token(k,sampled.back().token,stream);
                 }
                 if(min_probability>0.0F && k+1U<requested) {
-                    if(!sampler) draft->wait_step(k,stream);
+                    if(!sampler || device_draft) draft->wait_step(k,stream);
                     if(draft->probability(k)<min_probability) {depth=k+1U;break;}
                     if(keep_drafting) {
                         probabilities.resize(k+1U);for(std::uint32_t j=0;j<=k;++j) probabilities[j]=draft->probability(j);
@@ -406,6 +421,10 @@ struct HipMtpRuntime::Impl {
                 }
             }
             owner->complete();
+            if(device_draft) {
+                draft_device->finish(*sampler,depth,sampled);
+                for(std::uint32_t k=0;k<depth;++k) draft->record_token(k,sampled[k].token);
+            }
             auto tokens=draft->read(depth);
             probabilities.resize(depth);for(std::uint32_t k=0;k<depth;++k) probabilities[k]=draft->probability(k);
             // STRIX_MTP_DRAFT_LOG=1: every proposal (chain start position, step, token, probability bits) on stderr.
