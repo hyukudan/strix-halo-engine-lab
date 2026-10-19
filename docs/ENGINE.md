@@ -263,6 +263,8 @@ Defaults are the measured configuration.
 | `STRIX_MTP_DRAFT_TOP2=1` | Diagnostic: the draft head also reduces the runner-up probability (always on with the survival controller). |
 | `STRIX_MTP_DIAG_FULL_CHAIN=1` | Diagnostic, never timed: every cycle drafts the full depth and verifies one serial row, so every emitted position starts a complete draft chain. |
 | `STRIX_WINDOW_ROUTE_LOG=1` | Diagnostic, never timed: after every router step of a verify window, the routed expert ids of each row (`route pos= rows= row= layer= ids=` on stderr); synchronizes the device per layer. With `--mtp-spec-min-p 0` every cycle is an R8 window, which gives the routing of all eight rows. |
+| `STRIX_GDN_WINDOW_TILED=1` | Window GDN recurrence with one block per (value head, 32 value columns): the state slice is read and written with coalesced loads through LDS and each wave runs `STRIX_GDN_WINDOW_COLUMNS` (2, 4 or 8; default 8) columns, so the per-row dependent chain is shorter. Key-value storage, head dim 128. Same arithmetic per column; bit-identical outputs and state. Off by default. |
+| `STRIX_GDN_WINDOW_PREPARE_GATES=1` | Window GDN prepare with the beta/gate scalar transforms spread over (value head, row) pairs instead of a serial row loop per head (that block was the longest one of the prepare at R4/R8). Same per-element arithmetic; bit-identical. Off by default. |
 | `STRIX_WINDOW_TIMING=1` | Print host-side phase totals of every known window at exit. |
 | `STRIX_PREFILL_TIMING=1` | Print download, scoring and spool times per block of teacher-forced tiled prefill. |
 
