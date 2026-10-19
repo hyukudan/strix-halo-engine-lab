@@ -53,6 +53,13 @@ const Tensor* find(const void* original_address) noexcept {
     return &it->second;
 }
 
+bool registered(const void* original_address) noexcept {
+    if (!kernels_enabled()) return false;
+    auto& r = registry();
+    const std::shared_lock lock(r.mutex);
+    return r.tensors.contains(original_address);
+}
+
 std::uint64_t hits() noexcept { return registry().hits.load(std::memory_order_relaxed); }
 
 bool kernels_enabled() noexcept {
