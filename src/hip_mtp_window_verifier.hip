@@ -8,6 +8,7 @@
 #include "strix/hip_token_sampling.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
+#include <cstdint>
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -57,6 +58,10 @@ struct HipMtpWindowVerifier::Impl {
     bool busy=false,failed=false,bounded=false,prefix=false;
     // Adaptive choice: owner cost per cycle (draft included), serial cost per emitted token.
     float min_probability=0.0F;
+    // Candidate rows from `external_first` on were proposed by another source (context n-grams) with
+    // their own learned acceptance: used to size the next window, never fed to the draft calibration.
+    std::size_t external_first=SIZE_MAX;
+    std::vector<double> external;
     bool timing_independent=false;
     std::vector<float> sampled_logits;
     double serial_ms_ema=0.0;std::uint64_t serial_cycles=0;
@@ -135,14 +140,17 @@ struct HipMtpWindowVerifier::Impl {
     // Calibrated acceptance: the bin's observed rate with a two-draft prior at p.
     double acceptance(float p) const {const auto b=bin(p);return (accepted[b]+2.0*p)/(tested[b]+2.0);}
     void calibrate(std::span<const float> p,std::size_t accepted_drafts,std::size_t verified_rows) {
-        for(std::size_t j=0;j<p.size() && j<verified_rows && j<=accepted_drafts;++j){
+        for(std::size_t j=0;j<p.size() && j<external_first && j<verified_rows && j<=accepted_drafts;++j){
             const auto b=bin(p[j]);tested[b]+=1.0;if(j<accepted_drafts)accepted[b]+=1.0;}
     }
     // Expected emitted tokens of an R-row prefix window when draft j is accepted
     // with its calibrated probability, given that every earlier draft was accepted.
     double expected_tokens(std::uint32_t rows,std::span<const float> p) const {
         double expected=1.0,run=1.0;
-        for(std::uint32_t j=1;j<rows && j<=p.size();++j){run*=acceptance(p[j-1U]);expected+=run;}
+        for(std::uint32_t j=1;j<rows && j<=p.size();++j){
+            const std::size_t r=j-1U;
+            run*=r>=external_first && r-external_first<external.size()?external[r-external_first]:acceptance(p[r]);
+            expected+=run;}
         return expected;
     }
     bool worth_drafting(std::span<const float> p) const {
@@ -375,6 +383,11 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
 }
 bool HipMtpWindowVerifier::failed() const noexcept {return impl_->failed || (impl_->checkpoint && impl_->checkpoint->failed());}
 std::uint64_t HipMtpWindowVerifier::retained_payload_bytes() const noexcept {return impl_->retained;}
+void HipMtpWindowVerifier::set_external_rows(std::size_t first,std::span<const double> acceptance) {
+    auto& i=*impl_;
+    require(!i.busy,"MTP window verifier external rows are set between cycles");
+    i.external_first=first;i.external.assign(acceptance.begin(),acceptance.end());
+}
 bool HipMtpWindowVerifier::worth_drafting(std::span<const float> probabilities) const {
     return impl_->worth_drafting(probabilities);
 }
@@ -383,6 +396,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
     std::uint32_t budget,std::span<const std::uint32_t> eos,std::span<const float> probabilities,
     std::span<const TokenDraft> drafts) {
     auto& i=*impl_;
+    struct ClearExternal{Impl& impl;~ClearExternal(){impl.external_first=SIZE_MAX;impl.external.clear();}} clear_external{i};
     const auto sampler=i.target->token_sampler();
     require(sampler?drafts.size()==candidates.size():drafts.empty(),"MTP sampled verification needs one draft distribution per candidate");
     for(std::size_t k=0;k<drafts.size();++k)

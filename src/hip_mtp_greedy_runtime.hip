@@ -38,6 +38,8 @@ struct HipMtpGreedyRuntime::Impl {
     // The drafts of the cycle in progress (between begin_cycle_draft and finish_cycle).
     std::vector<std::uint32_t> candidates;
     std::vector<float> probabilities;
+    std::unique_ptr<MtpNgramDraft> ngram;
+    std::vector<double> ngram_acceptance;
     Impl(std::shared_ptr<HipMtpRuntime> m,QualifiedMtpDraftPlan q,ActivatedMtpDraftPlan a,
          std::shared_ptr<HipMtpTargetHidden> t,SerialSessionContext& s,const ExecutionRuntimeResources& r,
          DirectLaunchDispatcher& d,std::shared_ptr<const void> o)
@@ -73,6 +75,16 @@ void HipMtpGreedyRuntime::use_window_verifier(std::shared_ptr<HipMtpWindowVerifi
         "MTP window verifier must retain the same actual idle target before the first cycle");
     i.window=std::move(window);
     i.window->prepare_admission(*i.session);
+}
+void HipMtpGreedyRuntime::enable_ngram_draft(std::span<const std::uint32_t> prompt,MtpNgramDraftConfig config) {
+    auto& i=*impl_;
+    require(!i.busy && !i.cycled && i.window && !i.target->token_sampler(),
+        "MTP n-gram draft extension needs the window verifier, greedy selection and no cycle yet");
+    i.ngram=std::make_unique<MtpNgramDraft>(config);
+    i.ngram->reset(prompt);
+}
+const MtpNgramDraftStats* HipMtpGreedyRuntime::ngram_stats() const noexcept {
+    return impl_->ngram?&impl_->ngram->stats():nullptr;
 }
 void HipMtpGreedyRuntime::set_draft_min_probability(float p) {
     auto& i=*impl_;require(!i.busy && !i.cycled && p>=0.0F && p<=1.0F,"MTP draft minimum probability is set once in [0, 1] before cycles");
@@ -152,6 +164,22 @@ std::uint32_t HipMtpGreedyRuntime::begin_cycle_draft(const HipMtpTargetHiddenTic
         i.candidates=i.mtp->draft_head()?i.mtp->propose_chain(i.plan,i.activation,*i.session,i.draft,depth,i.min_probability,keep):
             i.backend->propose_candidates(*i.session,i.draft,depth);
         if(i.mtp->draft_head()){const auto p=i.mtp->draft_probabilities();i.probabilities.assign(p.begin(),p.end());}
+        if(i.ngram && cost_model && i.window && i.probabilities.size()==i.candidates.size()) {
+            // Keep the drafts up to the first one below the minimum probability; a context n-gram may
+            // continue them up to the draft depth. The target verifies every row either way.
+            std::size_t confident=0;
+            while(confident<i.candidates.size() && i.probabilities[confident]>=i.min_probability) ++confident;
+            auto extension=i.ngram->begin_cycle(pending,i.candidates,confident,depth,i.ngram_acceptance);
+            if(!extension.empty()) {
+                i.candidates.resize(confident);i.probabilities.resize(confident);
+                for(std::size_t r=0;r<extension.size();++r) {
+                    i.candidates.push_back(extension[r]);
+                    i.probabilities.push_back(static_cast<float>(i.ngram_acceptance[r]));
+                }
+                i.window->set_external_rows(confident,i.ngram_acceptance);
+                i.ngram->used(extension.size());
+            }
+        }
         host_phase_mark("2 draft chain");
         finish_draft_proposal(i.draft);
         host_phase_mark("3 finish proposal");
@@ -204,6 +232,7 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::finish_cycle(const HipMtpTargetHidd
         out.target_window_rows=verified.chosen_rows;
         out.eos=is_eos(out.emitted_tokens.back());out.terminal_budget=out.emitted_tokens.size()>=budget;
         log_cycle(initial,out);
+        if(i.ngram)i.ngram->finish_cycle(out.emitted_tokens);
         host_phase_mark("9 cycle bookkeeping");
         i.mtp->set_reconciliation_rows(replay,out.final_target);
         i.backend->reconcile_after_target(i.draft,*i.session,out.emitted_tokens);
@@ -250,6 +279,7 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
             if(out.eos || out.terminal_budget || !accepted)break;
         }
         log_cycle(initial,out);
+        if(i.ngram)i.ngram->finish_cycle(out.emitted_tokens);
         host_phase_mark("9 cycle bookkeeping");
         i.mtp->set_reconciliation_rows(replay,out.final_target);
         i.backend->reconcile_after_target(i.draft,*i.session,out.emitted_tokens);

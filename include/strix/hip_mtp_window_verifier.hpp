@@ -72,6 +72,10 @@ public:
     // Whether one more draft can still pay off: the next larger window, with the remaining drafts assumed
     // as likely as the last one, beats the best window the current drafts already allow.
     [[nodiscard]] bool worth_drafting(std::span<const float> probabilities) const;
+    // The next verify(): candidates from `first` on come from another proposal source with these
+    // per-row acceptance estimates (conditional on the earlier rows). They size the window like draft
+    // rows but never enter the draft calibration. Cleared by verify().
+    void set_external_rows(std::size_t first,std::span<const double> acceptance);
     // Setup only: every owner's window admission at the session's current frontier, so the
     // first window of each owner does not pay it inside the generation loop.
     void prepare_admission(const SerialSessionContext& session);
