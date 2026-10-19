@@ -4224,7 +4224,10 @@ bool persistent_hyper_rows_eligible(const PreparedHyperRows& prepared, const Hip
     return persistent_hyper_rows_enabled() && !std::getenv("STRIX_HC_ROWS_FUSED_NORM") && config.splitk_projection &&
         config.lane_chain_output && config.hidden_size == kPersistHidden && config.hc_count == kPersistStreams &&
         config.lowrank == kPersistRank && p.down_manifest->ggml_type == 8U && p.up_manifest->ggml_type == 8U &&
-        (!p.inject_runtime || p.inject_manifest->ggml_type == 0U) && (count == 2U || count == 4U || count == 8U);
+        (!p.inject_runtime || p.inject_manifest->ggml_type == 0U) && (count == 2U || count == 4U || count == 8U) &&
+        // The persistent kernel has no Q6P32 form: weights with a registered copy keep the launches that read it.
+        !q6p::registered(reinterpret_cast<const void*>(p.down_runtime->address)) &&
+        !q6p::registered(reinterpret_cast<const void*>(p.up_runtime->address));
 }
 
 template <class Rows>

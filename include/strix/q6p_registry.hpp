@@ -41,6 +41,8 @@ void clear() noexcept;
 // Registered copy of the tensor that starts at this device address, or nullptr
 // (always nullptr when STRIX_Q6P=0).
 const Tensor* find(const void* original_address) noexcept;
+// Whether find() would return a copy, without counting a hit (launch eligibility checks).
+bool registered(const void* original_address) noexcept;
 // STRIX_Q6P=0 keeps every launcher on its original kernel (A/B on one checkpoint).
 bool kernels_enabled() noexcept;
 std::uint64_t registered_count() noexcept;
