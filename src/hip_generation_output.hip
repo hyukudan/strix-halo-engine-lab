@@ -336,6 +336,19 @@ std::uint64_t hip_greedy_rows_scratch_bytes(std::uint32_t rows, std::uint32_t vo
     require(rows && rows <= hip_greedy_rows_max && vocabulary, "GPU greedy rows require 1..8 rows and a nonzero vocabulary");
     return static_cast<std::uint64_t>(rows) * ((static_cast<std::uint64_t>(vocabulary) - 1U) / threads + 1U) * sizeof(Partial);
 }
+static_assert(sizeof(HipGreedyRowsPartial) == sizeof(Partial) && threads == hip_greedy_rows_partial_logits);
+void enqueue_hip_greedy_rows_finish(ExecutionBufferAddress partials, std::uint32_t rows, std::uint32_t vocabulary,
+    HipGreedyRowsReply* replies, void* stream) {
+    const auto bytes = hip_greedy_rows_scratch_bytes(rows, vocabulary);
+    require(replies && partials.address && partials.address % alignof(Partial) == 0 && partials.bytes >= bytes,
+        "GPU greedy rows scratch/reply views are invalid");
+    void* device_replies = nullptr;
+    check(hipHostGetDevicePointer(&device_replies, replies, 0), "GPU greedy rows replies must be host-mapped");
+    const auto count = static_cast<std::uint32_t>((static_cast<std::uint64_t>(vocabulary) - 1U) / threads + 1U);
+    hipLaunchKernelGGL(greedy_rows_finish, dim3(rows), dim3(threads), 0, reinterpret_cast<hipStream_t>(stream),
+        reinterpret_cast<const Partial*>(partials.address), count, static_cast<HipGreedyRowsReply*>(device_replies));
+    check(hipGetLastError(), "submit greedy rows finish");
+}
 void enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress> logits, std::uint32_t vocabulary,
     ExecutionBufferAddress partials, HipGreedyRowsReply* replies, void* stream) {
     const auto rows = static_cast<std::uint32_t>(logits.size());

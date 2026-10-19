@@ -9,6 +9,7 @@
 #include <string>
 
 namespace strix {
+struct HipGreedyRowsReply;
 
 struct HipLmHeadLauncherConfig {
     std::uint32_t hidden_size = 0;
@@ -19,6 +20,9 @@ struct HipLmHeadLauncherConfig {
     // Explicit eager BF16/Q8_0 candidates; wave8 also requires prefetch.
     bool prefetch_q8_wave = false;
     bool wave8_q8_wave = false;
+    // Known-window rows kernel: 0 = staged rows kernel, 1/2 = lean rows kernel with 1/2 logits
+    // per wave (same per-logit arithmetic and trees; STRIX_LM_HEAD_ROWS_LEAN).
+    std::uint32_t rows_lean = 0;
 };
 
 void register_hip_lm_head_kernel_variant(
@@ -66,6 +70,12 @@ void lm_head_known_window_rows_preflight(std::span<const ExecutionDispatchContex
     const HipLmHeadLauncherConfig& config);
 void lm_head_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipLmHeadLauncherConfig& config);
+// The same launch followed by the window greedy selection of every row: replies as from
+// enqueue_hip_greedy_rows over the written logits. When the lean rows kernel applies
+// (config.rows_lean, 5-8 rows) its greedy partials are computed in the head kernel and only the
+// finish launch follows; otherwise this is the rows launch plus enqueue_hip_greedy_rows.
+void lm_head_known_window_rows_launch_greedy(std::span<const ExecutionDispatchContext> rows,
+    const HipLmHeadLauncherConfig& config, ExecutionBufferAddress partials, HipGreedyRowsReply* replies);
 
 // Source-only native MTP entry points; qualification is separate.
 struct MtpNativeContext;
