@@ -44,6 +44,8 @@ struct HipMtpCohortVerifyRequest {
     std::uint32_t budget=0;
     std::span<const std::uint32_t> eos;
     std::uint32_t rows=0;
+    // Sampled decoding: one draft distribution per candidate (empty when the target selects first-max).
+    std::span<const TokenDraft> drafts;
 };
 // One actual closed known-row window per cycle, with retained capture pools per owner.
 // Several prefix owners (distinct 2/4/8 rows over one session) share one deferred

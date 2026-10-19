@@ -65,6 +65,7 @@
 #include "hip_http_serve.hpp"
 #include "hip_prefix_state_cache.hpp"
 #include "hip_mtp_cohort_bridge.hpp"
+#include "hip_mtp_cohort_tiled.hpp"
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
 #include "../tests/hip_mtp_model_qualification.hpp"
 #endif
@@ -2412,6 +2413,7 @@ int STRIX_DECODE_ENTRY(
     std::unique_ptr<strix::decode_cli::HipPrefixStateCacheSession> prefix_state;
     strix::ModelContentIdentity prefix_cache_identity;
     std::uint64_t prefix_cache_every = 0;
+    std::uint64_t known_prefix_union_bytes = 0; // routed-union scratch of the tiled prefill owners (0: none)
     if (options.known_prefix_window || options.prompt_lookup) {
         if (options.known_prefix_prefill_rows) {
             // The tiled prefill derives from the prefill serial execution (its dense projection
@@ -2453,6 +2455,7 @@ int STRIX_DECODE_ENTRY(
             if (!union_bytes || union_bytes > 65536U)
                 throw std::invalid_argument("known-prefix expert union exceeds separate 64KiB setup budget");
         }
+        known_prefix_union_bytes = union_bytes;
         const auto arena_generation = generations.next();
         const auto status_generation = generations.next();
         if (known_prefill_plan) {
@@ -2705,51 +2708,99 @@ int STRIX_DECODE_ENTRY(
                 return verifier;
             };
         };
-        if (!options.mtp.cohort.empty()) {
-            // Each further request: its own state memory and serial scratch, PLE backend and
-            // prefetch, launch plan and session over the same mapped model, manifest and layout.
-            struct CohortStack {
-                std::shared_ptr<strix::decode_cli::MtpDecodeTargetParents> parents;
-                strix::ExecutionLauncherRegistry launchers;
-                std::optional<strix::CompiledLaunchPlan> plan;
-                std::optional<strix::DirectLaunchDispatcher> dispatcher;
-                strix::SerialSessionContext session;
+        // Each further request of the cohort and batched routes: its own state memory and serial scratch, PLE
+        // backend and prefetch, launch plan and session over the same mapped model, manifest and layout; on the
+        // tiled prompt also its own tiled prefill backends (over the shared prefill arenas) and prefix cache view.
+        struct CohortStack {
+            std::shared_ptr<strix::decode_cli::MtpDecodeTargetParents> parents;
+            std::shared_ptr<strix::RuntimeExecutionMemoryOwner> memory;
+            strix::ExecutionLauncherRegistry launchers;
+            std::optional<strix::CompiledLaunchPlan> plan;
+            std::optional<strix::DirectLaunchDispatcher> dispatcher;
+            strix::SerialSessionContext session;
+            std::shared_ptr<strix::HipKnownPrefixWindow> block_owner;
+            std::unique_ptr<strix::HipKnownPromptBackend> blocks;
+            std::vector<std::shared_ptr<strix::HipKnownPrefixWindow>> tail_owners;
+            std::vector<std::unique_ptr<strix::HipKnownPromptBackend>> tails;
+            std::unique_ptr<strix::decode_cli::HipPrefixStateCacheSession> cache;
+        };
+        const auto make_stack = [&] {
+            auto stack = std::make_unique<CohortStack>();
+            stack->memory = std::make_shared<strix::RuntimeExecutionMemoryOwner>(
+                strix::RuntimeExecutionMemoryOwner::allocate(compiled, state_layout, allocator_owner, generations));
+            strix::initialize_hip_fresh_runtime_memory(stack->memory->scratch(), stack->memory->state());
+            auto request_experiment = std::make_shared<HipDecodeExperimentResources>(
+                mapped_owner, model_owner, allocator_owner, stack->memory, manifest, tensor_access, state_layout);
+            // One manifest, access plan and layout object for every request: cohort windows
+            // compare these owners across the rows of all requests.
+            request_experiment->resources.model_manifest = experiment_owner->resources.model_manifest;
+            request_experiment->resources.tensor_access = experiment_owner->resources.tensor_access;
+            request_experiment->resources.session_state_layout = experiment_owner->resources.session_state_layout;
+            std::shared_ptr<strix::PleLookupBackend> request_ple = options.planned_ple_io
+                ? std::static_pointer_cast<strix::PleLookupBackend>(std::make_shared<strix::PlannedPleLookupBackend>(
+                    *retained_ple_source, planned_ple_policy, retained_ple_source))
+                : std::static_pointer_cast<strix::PleLookupBackend>(std::make_shared<strix::FileMappedPleLookupBackend>());
+            auto request_catalog = std::make_shared<strix::HipLauncherCatalog>(model, catalog_config);
+            stack->parents = std::make_shared<strix::decode_cli::MtpDecodeTargetParents>(
+                request_experiment, request_catalog, std::move(request_ple), ple_hash_contract);
+            request_catalog->register_for_compiled_execution(compiled, stack->launchers, &stack->parents->resources);
+            if (request_catalog->audit(compiled, stack->launchers).missing_steps)
+                throw std::logic_error("HIP launcher catalog is incomplete for a cohort request");
+            stack->plan.emplace(strix::compile_launch_plan(compiled, stack->launchers));
+            stack->dispatcher.emplace(*stack->plan, active_observer);
+            const auto request_identities = strix::build_runtime_execution_identities(
+                compiled.execution_identity, compiled.arena, stack->parents->resources);
+            stack->session.execution_identity = compiled.execution_identity;
+            stack->session.state_layout_identity = state_layout.layout_identity;
+            stack->session.runtime_compatibility_identity = request_identities.compatibility_identity;
+            stack->session.state.valid = all_persistent_state();
+            return stack;
+        };
+        // The tiled prompt of a further request: owners over its own state, PLE and launchers and the shared
+        // prefill arenas (one prompt runs at a time), backends bound to its session, its own cache view.
+        const auto add_tiled = [&](CohortStack& stack) {
+            if (!known_prefill_plan || !known_prefix_memory || compiled_prefill)
+                throw std::logic_error("batched MTP requests need the tiled prefill of one numerical profile");
+            const auto workspace = [&](const std::shared_ptr<KnownPromptMemory>& arena) {
+                return known_prefix_union_bytes ? strix::q51_known_rows::Workspace{arena->union_scratch,
+                    std::static_pointer_cast<const void>(arena)} : strix::q51_known_rows::Workspace{};
             };
+            stack.block_owner = std::make_shared<strix::HipKnownPrefixWindow>(*known_prefill_plan, compiled, model, catalog_config,
+                stack.parents->resources, known_prefix_memory->scratch, known_prefix_memory->scope,
+                std::static_pointer_cast<const void>(known_prefix_memory), workspace(known_prefix_memory));
+            stack.blocks = std::make_unique<strix::HipKnownPromptBackend>(stack.block_owner, stack.session,
+                known_prefix_memory->scratch, model.vocab_size, original_work_device);
+            for (std::size_t t = 0; t < known_tail_plans.size(); ++t) {
+                stack.tail_owners.push_back(std::make_shared<strix::HipKnownPrefixWindow>(*known_tail_plans[t], compiled, model,
+                    catalog_config, stack.parents->resources, known_tail_memories[t]->scratch, known_tail_memories[t]->scope,
+                    std::static_pointer_cast<const void>(known_tail_memories[t]), workspace(known_tail_memories[t])));
+                stack.tails.push_back(std::make_unique<strix::HipKnownPromptBackend>(stack.tail_owners.back(), stack.session,
+                    known_tail_memories[t]->scratch, model.vocab_size, original_work_device));
+            }
+            if (prefix_store)
+                stack.cache = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(prefix_store, prefix_cache_identity,
+                    options.known_prefix_prefill_rows, prefix_cache_every, model, state_layout, stack.memory->state());
+            auto& tiled = stack.parents->tiled;
+            tiled.blocks = stack.blocks.get(); tiled.block_owner = stack.block_owner;
+            for (std::size_t t = 0; t < stack.tails.size(); ++t)
+                tiled.tails.push_back({stack.tails[t].get(), stack.tail_owners[t], options.known_prefix_tail_rows[t]});
+            tiled.rows = options.known_prefix_prefill_rows;
+            tiled.cache = stack.cache.get();
+            tiled.reset_state = [slot_memory = stack.memory] {
+                check_hip(hipDeviceSynchronize(), "batched MTP slot reset fence");
+                strix::initialize_hip_fresh_runtime_memory(slot_memory->scratch(), slot_memory->state());
+            };
+            tiled.fresh = stack.session;
+        };
+        const bool tiled_route = strix::decode_cli::mtp_tiled_prompt(options);
+        if (!options.mtp.cohort.empty() && !tiled_route) {
             const auto window_stream = std::make_shared<const SharedWindowStream>();
             std::vector<std::unique_ptr<CohortStack>> stacks;
             std::vector<strix::decode_cli::MtpCohortRequest> requests;
             requests.push_back({parents, &session, &direct_dispatcher, options.tokens, options.mtp.golden,
                 options.mtp.golden_sha256, window_factory_for(parents, window_stream)});
             for (const auto& request : options.mtp.cohort) {
-                auto stack = std::make_unique<CohortStack>();
-                auto request_memory = std::make_shared<strix::RuntimeExecutionMemoryOwner>(
-                    strix::RuntimeExecutionMemoryOwner::allocate(compiled, state_layout, allocator_owner, generations));
-                strix::initialize_hip_fresh_runtime_memory(request_memory->scratch(), request_memory->state());
-                auto request_experiment = std::make_shared<HipDecodeExperimentResources>(
-                    mapped_owner, model_owner, allocator_owner, request_memory, manifest, tensor_access, state_layout);
-                // One manifest, access plan and layout object for every request: cohort windows
-                // compare these owners across the rows of all requests.
-                request_experiment->resources.model_manifest = experiment_owner->resources.model_manifest;
-                request_experiment->resources.tensor_access = experiment_owner->resources.tensor_access;
-                request_experiment->resources.session_state_layout = experiment_owner->resources.session_state_layout;
-                std::shared_ptr<strix::PleLookupBackend> request_ple = options.planned_ple_io
-                    ? std::static_pointer_cast<strix::PleLookupBackend>(std::make_shared<strix::PlannedPleLookupBackend>(
-                        *retained_ple_source, planned_ple_policy, retained_ple_source))
-                    : std::static_pointer_cast<strix::PleLookupBackend>(std::make_shared<strix::FileMappedPleLookupBackend>());
-                auto request_catalog = std::make_shared<strix::HipLauncherCatalog>(model, catalog_config);
-                stack->parents = std::make_shared<strix::decode_cli::MtpDecodeTargetParents>(
-                    request_experiment, request_catalog, std::move(request_ple), ple_hash_contract);
-                request_catalog->register_for_compiled_execution(compiled, stack->launchers, &stack->parents->resources);
-                if (request_catalog->audit(compiled, stack->launchers).missing_steps)
-                    throw std::logic_error("HIP launcher catalog is incomplete for a cohort request");
-                stack->plan.emplace(strix::compile_launch_plan(compiled, stack->launchers));
-                stack->dispatcher.emplace(*stack->plan, active_observer);
-                const auto request_identities = strix::build_runtime_execution_identities(
-                    compiled.execution_identity, compiled.arena, stack->parents->resources);
-                stack->session.execution_identity = compiled.execution_identity;
-                stack->session.state_layout_identity = state_layout.layout_identity;
-                stack->session.runtime_compatibility_identity = request_identities.compatibility_identity;
-                stack->session.state.valid = all_persistent_state();
+                auto stack = make_stack();
                 requests.push_back({stack->parents, &stack->session, &*stack->dispatcher, request.tokens, request.golden,
                     request.golden_sha256, window_factory_for(stack->parents, window_stream)});
                 stacks.push_back(std::move(stack));
@@ -2759,8 +2810,27 @@ int STRIX_DECODE_ENTRY(
                 catalog_config.deferred_moe_status, optimization_profile.selected, std::cout);
             return 0;
         }
-        auto make_window = window_factory_for(parents, {});
-        if (options.http_serve)
+        // Batched decoding: cohort requests on the tiled prompt (one slot per request) or --http-batch N.
+        const std::size_t batch_slots = tiled_route && !options.mtp.cohort.empty() ? 1U + options.mtp.cohort.size()
+            : options.http_serve && options.http_batch ? options.http_batch : 0U;
+        std::shared_ptr<const SharedWindowStream> batch_stream;
+        std::vector<std::unique_ptr<CohortStack>> batch_stacks;
+        if (batch_slots) {
+            batch_stream = std::make_shared<const SharedWindowStream>();
+            for (std::size_t slot = 1; slot < batch_slots; ++slot) {
+                auto stack = make_stack();
+                add_tiled(*stack);
+                parents->batch_slots.push_back({stack->parents, &stack->session, &*stack->dispatcher,
+                    window_factory_for(stack->parents, batch_stream)});
+                batch_stacks.push_back(std::move(stack));
+            }
+            parents->serve_batch = options.http_serve
+                ? strix::decode_cli::make_http_batch_serve(options, "native MTP batched decode (" + std::to_string(batch_slots) +
+                    " slots), profile " + std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens))
+                : strix::decode_cli::make_cohort_tiled_run(options, model, std::cout);
+        }
+        auto make_window = window_factory_for(parents, batch_stream);
+        if (options.http_serve && !batch_slots)
             parents->serve = strix::decode_cli::make_http_serve(options, "native MTP greedy decode, profile " +
                 std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens));
         setup_phase.reset();

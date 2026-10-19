@@ -325,7 +325,10 @@ struct Options {
     std::string http_bind = "127.0.0.1";
     std::string http_model_id = "qwen3.8-flash-next";
     std::string http_api_key_file;
-    std::string http_sampling = "greedy";  // temperature > 0: "greedy" (downgrade, noted) or "reject"
+    std::string http_sampling = "greedy";  // temperature > 0: "greedy" (downgrade, noted), "reject" or "sample" (--http-batch)
+    // 0: one request at a time (each from the single request state). 1..8: batched decoding with that many
+    // request slots: requests are admitted between decode cycles and decoded together (cohort windows).
+    std::uint32_t http_batch = 0;
     std::uint32_t http_default_max_tokens = 4096;
     std::uint32_t http_max_queue = 64;
     std::uint32_t http_max_connections = 64;
@@ -665,8 +668,14 @@ inline void validate_http_serve(const Options& o) {
         throw std::invalid_argument("--http-serve requires the tiled MTP route (--mtp with a calibration golden, "
             "--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T)");
     if (o.http_port > 65535U || o.http_bind.empty() || o.http_model_id.empty() || !o.http_default_max_tokens ||
-        !o.http_max_queue || !o.http_max_connections || (o.http_sampling != "greedy" && o.http_sampling != "reject"))
-        throw std::invalid_argument("--http-* values: port <= 65535, non-empty bind/model id, positive limits, sampling greedy|reject");
+        !o.http_max_queue || !o.http_max_connections || o.http_batch > 8U ||
+        (o.http_sampling != "greedy" && o.http_sampling != "reject" && o.http_sampling != "sample"))
+        throw std::invalid_argument("--http-* values: port <= 65535, non-empty bind/model id, positive limits, batch 0..8, "
+            "sampling greedy|reject|sample");
+    if (o.http_sampling == "sample" && !o.http_batch)
+        throw std::invalid_argument("--http-sampling sample runs on the batched route (--http-batch N)");
+    if (o.http_batch && (!o.mtp.window_prefix || !o.mtp.draft_chain || o.mtp.window_rows_set != std::vector<std::uint32_t>{2U, 4U, 8U}))
+        throw std::invalid_argument("--http-batch requires prefix windows over the row set 2,4,8 and the draft chain");
 }
 
 inline void validate_known_prefill_options(const Options& options) {
@@ -968,9 +977,11 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
             throw std::invalid_argument("MTP speculative sampling requires --mtp-draft-chain (or --mtp-sample-speculation off)");
         if(!m.sample_repeats || (mtp_sampling(m) && (m.metadata_only || !m.golden_dump.empty())))
             throw std::invalid_argument("MTP sampling needs a generation route and at least one request");
-        // Not combined with the other request forms yet (each was qualified alone).
-        if(mtp_sampling(m) && (tiled || !m.cohort.empty()))
-            throw std::invalid_argument("MTP sampling does not combine with the tiled MTP prompt or cohort requests");
+        // Not combined with the other request forms yet (each was qualified alone), except cohort requests on
+        // the tiled prompt (the batched route samples per request).
+        if(mtp_sampling(m) && tiled==m.cohort.empty())
+            throw std::invalid_argument("MTP sampling combines with the tiled MTP prompt only for cohort requests, "
+                "and with cohort requests only on the tiled prompt");
     }
     if(m.window_rows && m.candidate_depth<m.window_rows-1U)
         throw std::invalid_argument("MTP target window requires candidate depth at least rows minus one");
@@ -979,8 +990,17 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
         throw std::invalid_argument("MTP closed target windows require baseline recurrent and QSA organizations");
     if(!m.cohort_mode.empty() && m.cohort.empty())
         throw std::invalid_argument("MTP cohort mode requires --mtp-cohort-request");
-    if(!m.cohort.empty()) {
-        if(tiled) throw std::invalid_argument("MTP cohort requests do not combine with the tiled MTP prompt");
+    if(!m.cohort.empty() && tiled) {
+        // Tiled prompt: every request runs its prompt like a served request (calibration once, no golden).
+        if(m.cohort.size()>7U || o.http_serve || !m.window_prefix || !m.draft_chain ||
+           m.window_rows_set!=std::vector<std::uint32_t>{2U,4U,8U} || o.prefill_numerical_profile.has_value())
+            throw std::invalid_argument("MTP cohort requests on the tiled prompt (at most seven besides the positional prompt) "
+                "require prefix windows over the row set 2,4,8, the draft chain and one numerical profile");
+        for(const auto& request:m.cohort)
+            if(request.tokens.empty() || ((resolved || o.context_explicit) && (request.tokens.size()>=o.context_tokens ||
+                o.generate_tokens>o.context_tokens-request.tokens.size()+1U)))
+                throw std::invalid_argument("MTP cohort request on the tiled prompt requires a prompt within the context");
+    } else if(!m.cohort.empty()) {
         if(m.cohort.size()>3U || m.metadata_only || !m.golden_dump.empty() || !m.window_prefix || !m.draft_chain ||
            m.window_rows_set!=std::vector<std::uint32_t>{2U,4U,8U} || o.prefill_numerical_profile.has_value())
             throw std::invalid_argument("MTP cohort requests (at most three besides the positional prompt) require prefix "
@@ -1167,13 +1187,14 @@ inline Options parse_options(
             throw std::invalid_argument("MTP window expert union is a flag without a value");
         if(argument=="--mtp-cohort-request") {
             // TOKENS_FILE,GOLDEN_FILE,GOLDEN_SHA256 (repeatable): decimal token IDs separated by commas or whitespace.
+            // On the tiled prompt TOKENS_FILE alone (no golden: the calibration replay qualifies every request).
             if(index+1>=argc)throw std::invalid_argument("MTP cohort request requires a value");
             const std::string value=argv[++index];
             const auto a=value.find(','),b=a==std::string::npos?std::string::npos:value.find(',',a+1U);
-            if(a==std::string::npos || b==std::string::npos || value.find(',',b+1U)!=std::string::npos)
-                throw std::invalid_argument("MTP cohort request is TOKENS_FILE,GOLDEN_FILE,GOLDEN_SHA256");
+            if((a==std::string::npos)!=(b==std::string::npos) || (b!=std::string::npos && value.find(',',b+1U)!=std::string::npos))
+                throw std::invalid_argument("MTP cohort request is TOKENS_FILE[,GOLDEN_FILE,GOLDEN_SHA256]");
             MtpCliOptions::CohortRequest request;
-            request.golden=value.substr(a+1U,b-a-1U);request.golden_sha256=value.substr(b+1U);
+            if(a!=std::string::npos){request.golden=value.substr(a+1U,b-a-1U);request.golden_sha256=value.substr(b+1U);}
             std::ifstream file(value.substr(0,a));
             if(!file)throw std::invalid_argument("MTP cohort request token file cannot be read");
             std::string text((std::istreambuf_iterator<char>(file)),std::istreambuf_iterator<char>());
@@ -1333,7 +1354,7 @@ inline Options parse_options(
         }
         if (argument == "--http-port" || argument == "--http-bind" || argument == "--http-model-id" ||
             argument == "--http-api-key-file" || argument == "--http-sampling" || argument == "--http-default-max-tokens" ||
-            argument == "--http-max-queue" || argument == "--http-max-connections") {
+            argument == "--http-max-queue" || argument == "--http-max-connections" || argument == "--http-batch") {
             if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
                 throw std::invalid_argument(std::string(argument) + " requires a value");
             const std::string_view value = argv[++index];
@@ -1349,6 +1370,7 @@ inline Options parse_options(
             else if (argument == "--http-sampling") options.http_sampling = value;
             else if (argument == "--http-default-max-tokens") options.http_default_max_tokens = u32("HTTP default max tokens");
             else if (argument == "--http-max-queue") options.http_max_queue = u32("HTTP queue");
+            else if (argument == "--http-batch") options.http_batch = u32("HTTP batch");
             else options.http_max_connections = u32("HTTP connections");
             continue;
         }
