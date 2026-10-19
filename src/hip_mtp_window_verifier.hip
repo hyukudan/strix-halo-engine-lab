@@ -9,6 +9,7 @@
 #include "strix/hip_token_sampling.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
+#include <cstdint>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -102,6 +103,10 @@ struct HipMtpWindowVerifier::Impl {
     // Min-p controller (D-022): owner cost per cycle (draft included), serial cost per emitted token,
     // per-bin acceptance; host logic in MtpMinPWindowController.
     float min_probability=0.0F;
+    // Candidate rows from `external_first` on were proposed by another source (context n-grams) with
+    // their own learned acceptance: used to size the next window, never fed to the draft calibration.
+    std::size_t external_first=SIZE_MAX;
+    std::vector<double> external;
     bool timing_independent=false;
     std::vector<float> sampled_logits;
     std::unique_ptr<MtpMinPWindowController> minp;
@@ -501,6 +506,11 @@ void HipMtpWindowVerifier::begin_session() {
 }
 bool HipMtpWindowVerifier::failed() const noexcept {return impl_->failed || (impl_->checkpoint && impl_->checkpoint->failed());}
 std::uint64_t HipMtpWindowVerifier::retained_payload_bytes() const noexcept {return impl_->retained;}
+void HipMtpWindowVerifier::set_external_rows(std::size_t first,std::span<const double> acceptance) {
+    auto& i=*impl_;
+    require(!i.busy && !i.survival && i.minp,"MTP window verifier external rows are set between cycles of the min-p controller");
+    i.minp->set_external_rows(first,acceptance);
+}
 bool HipMtpWindowVerifier::worth_drafting(std::span<const float> probabilities,std::span<const float> runner_ups) const {
     return impl_->survival?impl_->survival_keep(probabilities,runner_ups):impl_->minp->worth_drafting(probabilities);
 }
@@ -520,6 +530,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
     std::span<const TokenDraft> drafts,std::span<const float> runner_ups) {
     auto& i=*impl_;
     if(hip_mtp_full_chain_diagnostic()) budget=std::min(budget,1U); // no owner fits: one serial row
+    struct ClearExternal{Impl& impl;~ClearExternal(){if(impl.minp)impl.minp->clear_external_rows();}} clear_external{i};
     const auto sampler=i.target->token_sampler();
     require(sampler?drafts.size()==candidates.size():drafts.empty(),"MTP sampled verification needs one draft distribution per candidate");
     for(std::size_t k=0;k<drafts.size();++k)

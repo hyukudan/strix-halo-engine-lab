@@ -45,6 +45,10 @@ public:
     // Owner index (ascending rows) or `serial`; fits[o] != 0 when owner o is admissible this cycle.
     [[nodiscard]] std::size_t choose(std::span<const float> p,std::size_t candidates,std::span<const std::uint8_t> fits);
     void calibrate(std::span<const float> p,std::size_t accepted_drafts,std::size_t verified_rows);
+    // Candidate rows from `first` on come from another proposal source (context n-grams) with these
+    // acceptance estimates: they size the window like draft rows, never enter the calibration.
+    void set_external_rows(std::size_t first,std::span<const double> acceptance);
+    void clear_external_rows() noexcept {external_first_=serial;external_.clear();}
     // Wall time from the previous verified cycle to the end of this one (owner or `serial`, emitted > 0).
     // An owner's first window pays one-time admission and first touch: it is not a sample.
     void observe(std::size_t owner,std::size_t emitted,double ms);
@@ -65,5 +69,7 @@ private:
     bool timing_independent_=false;
     std::uint64_t reprobe_cycles_,choices_=0;
     std::array<double,10> tested_{},accepted_{};
+    std::size_t external_first_=serial;
+    std::vector<double> external_;
 };
 } // namespace strix

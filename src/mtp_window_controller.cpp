@@ -37,14 +37,20 @@ std::size_t bin(float p) {return std::min<std::size_t>(9U,static_cast<std::size_
 // Calibrated acceptance: the bin's observed rate with a two-draft prior at p.
 double MtpMinPWindowController::acceptance(float p) const {const auto b=bin(p);return (accepted_[b]+2.0*p)/(tested_[b]+2.0);}
 void MtpMinPWindowController::calibrate(std::span<const float> p,std::size_t accepted_drafts,std::size_t verified_rows) {
-    for(std::size_t j=0;j<p.size() && j<verified_rows && j<=accepted_drafts;++j){
+    for(std::size_t j=0;j<p.size() && j<external_first_ && j<verified_rows && j<=accepted_drafts;++j){
         const auto b=bin(p[j]);tested_[b]+=1.0;if(j<accepted_drafts)accepted_[b]+=1.0;}
+}
+void MtpMinPWindowController::set_external_rows(std::size_t first,std::span<const double> acceptance) {
+    external_first_=first;external_.assign(acceptance.begin(),acceptance.end());
 }
 // Expected emitted tokens of an R-row prefix window when draft j is accepted
 // with its calibrated probability, given that every earlier draft was accepted.
 double MtpMinPWindowController::expected_tokens(std::uint32_t rows,std::span<const float> p) const {
     double expected=1.0,run=1.0;
-    for(std::uint32_t j=1;j<rows && j<=p.size();++j){run*=acceptance(p[j-1U]);expected+=run;}
+    for(std::uint32_t j=1;j<rows && j<=p.size();++j){
+        const std::size_t r=j-1U;
+        run*=r>=external_first_ && r-external_first_<external_.size()?external_[r-external_first_]:acceptance(p[r]);
+        expected+=run;}
     return expected;
 }
 bool MtpMinPWindowController::worth_drafting(std::span<const float> p) const {

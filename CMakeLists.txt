@@ -158,6 +158,7 @@ add_library(strix_core STATIC
     src/mtp_draft_binding.cpp
     src/mtp_draft_contract.cpp
     src/mtp_draft_qualification.cpp
+    src/mtp_ngram_draft.cpp
     src/mtp_draft_tensor_audit.cpp
     src/mtp_draft_state_contract.cpp
     src/mtp_draft_state_memory.cpp
@@ -1139,6 +1140,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-mtp-draft-cycle-input-tests PRIVATE strix_core)
     strix_target_warnings(strix-mtp-draft-cycle-input-tests)
     add_test(NAME strix-mtp-draft-cycle-input-tests COMMAND strix-mtp-draft-cycle-input-tests)
+
+    add_executable(strix-mtp-ngram-draft-tests tests/mtp_ngram_draft_tests.cpp)
+    target_link_libraries(strix-mtp-ngram-draft-tests PRIVATE strix_core)
+    strix_target_warnings(strix-mtp-ngram-draft-tests)
+    add_test(NAME strix-mtp-ngram-draft-tests COMMAND strix-mtp-ngram-draft-tests)
 
     add_executable(strix-mtp-draft-activation-tests tests/mtp_draft_activation_tests.cpp)
     target_link_libraries(strix-mtp-draft-activation-tests PRIVATE strix_core)
