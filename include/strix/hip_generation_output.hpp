@@ -82,4 +82,12 @@ struct HipGreedyRowsReply { std::uint32_t token, status; };
 [[nodiscard]] std::uint64_t hip_greedy_rows_scratch_bytes(std::uint32_t rows, std::uint32_t vocabulary);
 void enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress> logits, std::uint32_t vocabulary,
     ExecutionBufferAddress partials, HipGreedyRowsReply* replies, void* stream);
+// Partials of a producer that fuses the first launch: row r's partial b covers logits
+// [256b, 256b + 256) and holds the selected finite value and token, whether a non-finite logit
+// was seen (bad) and whether any finite one was (valid). The selection rule is a total order, so
+// any order of combining gives the same reply. The finish launch then completes the replies.
+struct HipGreedyRowsPartial { float value; std::uint32_t token, bad, valid; };
+inline constexpr std::uint32_t hip_greedy_rows_partial_logits = 256;
+void enqueue_hip_greedy_rows_finish(ExecutionBufferAddress partials, std::uint32_t rows, std::uint32_t vocabulary,
+    HipGreedyRowsReply* replies, void* stream);
 } // namespace strix
