@@ -1,5 +1,7 @@
 #include "strix/host_phase_timing.hpp"
 #include "strix/hip_mtp_runtime.hpp"
+#include "strix/hip_token_sampling.hpp"
+#include <chrono>
 #include "strix/hip_mtp_attention.hpp"
 #include "strix/hip_mtp_projection.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
@@ -385,8 +387,13 @@ struct HipMtpRuntime::Impl {
                 draft->launch(hidden,k,stream);
                 if(sampler) {
                     // Draft k proposes the token at next_source + k + 2 (row k's seed sits at next_source + k + 1).
+                    const auto t0=std::chrono::steady_clock::now();
                     draft->read_logits(draft_logits);
+                    const auto t1=std::chrono::steady_clock::now();
                     sampled.push_back(sampler->draft(draft_logits,draft->host_ids(),next_source+k+2U));
+                    if(sample_timing_enabled()) record_sample_timing(SampleTimingKind::draft,1U,
+                        std::chrono::duration<double>(t1-t0).count(),
+                        std::chrono::duration<double>(std::chrono::steady_clock::now()-t1).count(),1U);
                     draft->set_token(k,sampled.back().token,stream);
                 }
                 if(min_probability>0.0F && k+1U<requested) {

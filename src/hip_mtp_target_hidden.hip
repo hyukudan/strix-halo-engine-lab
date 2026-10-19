@@ -10,6 +10,8 @@
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/session_executor_handoff.hpp"
 #include "strix/hip_token_sampling.hpp"
+#include "strix/hip_token_sampling_device.hpp"
+#include <chrono>
 #include "strix/serial_request.hpp"
 #include "strix/arithmetic_lineage.hpp"
 #include <algorithm>
@@ -86,6 +88,7 @@ struct HipMtpTargetHidden::Impl {
     // Sampled selection (null: finite first-max) and its host copy of the logits row.
     std::shared_ptr<TokenSampler> sampler;
     std::vector<float> sampled_logits;
+    std::unique_ptr<HipTokenSamplerDevice> device_sampler; // sampling-v1 on the GPU (STRIX_SAMPLE_HOST=1: host)
     ExecutionMemoryBinding deferred_status;
     std::uint64_t status_lease=0;
     bool busy=false,failed=false;
@@ -318,8 +321,22 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial(
                 lease->position,++i.epoch);
             // The first-max pass above still validates every logit as finite.
             if(i.sampler) {
-                read_hip_logits_row(i.logits,static_cast<std::uint32_t>(i.model->vocab_size),i.stream,i.sampled_logits);
-                lease->predicted=i.sampler->decide(i.sampled_logits,lease->position+1U,draft).token;
+                const auto t0=std::chrono::steady_clock::now();
+                const auto vocabulary=static_cast<std::uint32_t>(i.model->vocab_size);
+                if(device_token_sampling_enabled()) {
+                    if(!i.device_sampler) i.device_sampler=std::make_unique<HipTokenSamplerDevice>(vocabulary,1U);
+                    const DeviceSampleRow row{i.logits,lease->position+1U,draft};
+                    const auto decision=i.device_sampler->decide(*i.sampler,std::span<const DeviceSampleRow>(&row,1U),i.stream).front();
+                    i.sampler->count(decision);
+                    lease->predicted=decision.token;
+                } else
+                    read_hip_logits_row(i.logits,vocabulary,i.stream,i.sampled_logits);
+                const auto t1=std::chrono::steady_clock::now();
+                if(!device_token_sampling_enabled())
+                    lease->predicted=i.sampler->decide(i.sampled_logits,lease->position+1U,draft).token;
+                if(sample_timing_enabled()) record_sample_timing(SampleTimingKind::serial,1U,
+                    std::chrono::duration<double>(t1-t0).count(),
+                    std::chrono::duration<double>(std::chrono::steady_clock::now()-t1).count(),1U);
             }
             if(i.shadow)i.shadow->publish();
         });

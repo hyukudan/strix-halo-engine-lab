@@ -6,6 +6,7 @@
 #include "strix/session_state_memory.hpp"
 #include "strix/hip_generation_output.hpp"
 #include "strix/hip_token_sampling.hpp"
+#include "strix/hip_token_sampling_device.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <array>
@@ -59,6 +60,7 @@ struct HipMtpWindowVerifier::Impl {
     float min_probability=0.0F;
     bool timing_independent=false;
     std::vector<float> sampled_logits;
+    std::unique_ptr<HipTokenSamplerDevice> device_sampler; // sampling-v1 on the GPU (STRIX_SAMPLE_HOST=1: host)
     double serial_ms_ema=0.0;std::uint64_t serial_cycles=0;
     // Draft probabilities are not acceptance rates: per probability bin, verified
     // drafts (every draft up to the first rejection) and how many were accepted.
@@ -420,9 +422,29 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
         // row without a draft, a rejection, EOS or the budget; later rows are never accepted.
         if(sampler) capture->set_row_selection([&,first=session.next_position+1U,stream=capture->source_stream()](
             std::span<const ExecutionBufferAddress> logits,std::span<std::uint32_t> predictions) {
-            const auto decisions=sampler->decide_rows(std::min(rows,budget),first,drafts,eos,[&](std::uint32_t r) {
+            const bool timed=sample_timing_enabled();
+            double readback=0.0;
+            const auto start=std::chrono::steady_clock::now();
+            std::vector<TokenDecision> decisions;
+            const auto n=std::min(rows,budget);
+            if(device_token_sampling_enabled()) {
+                // Every row on the device at once; the stopping rule of TokenSampler::decide_rows on the results.
+                if(!i.device_sampler) i.device_sampler=std::make_unique<HipTokenSamplerDevice>(static_cast<std::uint32_t>(vocabulary),8U);
+                std::vector<DeviceSampleRow> device_rows(n);
+                for(std::uint32_t r=0;r<n;++r) device_rows[r]={logits[r],first+r,r<drafts.size()?&drafts[r]:nullptr};
+                const auto all=i.device_sampler->decide(*sampler,device_rows,stream);
+                for(std::uint32_t r=0;r<n;++r) {
+                    decisions.push_back(all[r]);sampler->count(all[r]);
+                    if(!device_rows[r].draft || !all[r].accepted || std::find(eos.begin(),eos.end(),all[r].token)!=eos.end()) break;
+                }
+            } else decisions=sampler->decide_rows(n,first,drafts,eos,[&](std::uint32_t r) {
+                const auto t0=std::chrono::steady_clock::now();
                 read_hip_logits_row(logits[r],static_cast<std::uint32_t>(vocabulary),stream,i.sampled_logits);
+                if(timed) readback+=std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
                 return std::span<const float>(i.sampled_logits);});
+            if(timed) record_sample_timing(SampleTimingKind::window,rows,readback,
+                std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()-readback,
+                static_cast<std::uint32_t>(decisions.size()));
             for(std::size_t r=0;r<decisions.size();++r) predictions[r]=decisions[r].token;
         });
         else capture->set_row_selection({});

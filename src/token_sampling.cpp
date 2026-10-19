@@ -174,6 +174,20 @@ TokenDecision TokenSampler::decide(std::span<const float> logits,std::uint64_t p
     return out;
 }
 
+TokenSampler::Uniforms TokenSampler::uniforms(std::uint64_t position,bool drafted) const {
+    Uniforms u;
+    u.plain=speculation_uniform01(rng_,position,SpeculationRandomDrawClass::serial_target);
+    if(drafted) {
+        u.accept=speculation_uniform01(rng_,position,SpeculationRandomDrawClass::draft_acceptance);
+        u.residual=speculation_uniform01(rng_,position,SpeculationRandomDrawClass::residual_fallback);
+    }
+    return u;
+}
+
+void TokenSampler::count(const TokenDecision& decision) noexcept {
+    if(!decision.drafted) ++stats_.plain; else if(decision.accepted) ++stats_.accepted; else ++stats_.rejected;
+}
+
 std::vector<TokenDecision> TokenSampler::decide_rows(std::uint32_t max_rows,std::uint64_t first_position,
     std::span<const TokenDraft> drafts,std::span<const std::uint32_t> eos,
     const std::function<std::span<const float>(std::uint32_t)>& logits) {

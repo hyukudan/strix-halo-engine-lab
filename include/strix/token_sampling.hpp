@@ -102,6 +102,11 @@ public:
         std::span<const TokenDraft> drafts,std::span<const std::uint32_t> eos_tokens,
         const std::function<std::span<const float>(std::uint32_t)>& logits);
     [[nodiscard]] const TokenSamplerStats& stats() const noexcept {return stats_;}
+    // The uniforms decide() draws for a position (accept and residual are 0 without a draft), and the
+    // statistics update of one decision: for a caller that computes the decision elsewhere (the device path).
+    struct Uniforms {double plain = 0.0,accept = 0.0,residual = 0.0;};
+    [[nodiscard]] Uniforms uniforms(std::uint64_t position,bool drafted) const;
+    void count(const TokenDecision& decision) noexcept;
 private:
     TokenSamplingPolicy policy_;
     SpeculationRngIdentity rng_;
