@@ -92,6 +92,10 @@ public:
     // The current cycle's draft chain (steps, host wall ms), recorded before verify for the cost split.
     void note_draft(std::uint32_t steps,double ms) noexcept;
     [[nodiscard]] std::vector<HipMtpWindowOptionStats> option_stats() const;
+    // The next verify(): candidates from `first` on come from another proposal source with these
+    // per-row acceptance estimates (conditional on the earlier rows). They size the window like draft
+    // rows but never enter the draft calibration (min-p controller only). Cleared by verify().
+    void set_external_rows(std::size_t first,std::span<const double> acceptance);
     // Setup only: every owner's window admission at the session's current frontier, so the
     // first window of each owner does not pay it inside the generation loop.
     void prepare_admission(const SerialSessionContext& session);

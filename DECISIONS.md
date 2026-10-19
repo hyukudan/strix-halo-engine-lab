@@ -751,12 +751,86 @@ Measured on one Strix Halo node (Qwen3.8-Flash-Next UD-Q4_K_XL), profile `hc-spl
 | Quality vs BF16 KV, teacher-forced 16K wiki (T=2048) | Top-1 agreement 97.08%, mean KL 0.0054, mean NLL 1.6116 → 1.6103 |
 | Quality vs BF16 KV, teacher-forced 16K code (T=2048) | Top-1 agreement 98.24%, mean KL 0.0058, mean NLL 0.5498 → 0.5497 |
 | KL by position (16K) | No growth with depth: wiki 0.0054 / 0.0052 / 0.0056, code 0.0106 / 0.0046 / 0.0056 for 0-2K / 2-8K / 8-16K |
+| Teacher-forced NLL, 32K haystack (32055 rows, no logits file) | NLL 4.3611 → 4.2609; mean absolute per-row target-logprob difference 0.18 (0-2K) rising to 0.33 (24-32K), against 0.04-0.06 on the 16K wiki/code documents |
+| Long-document retrieval, 24 haystacks of 8K/16K/32K tokens (5 questions each), greedy 200 tokens | Full output identical to the BF16 KV on 24/24 haystacks; 116/120 correct in both |
 
 For scale, the dense-A8 profile against the FP32-dense profile on the same 16K documents measures 96.7-98.1%
 top-1 agreement and mean KL 0.0066-0.0069. Speed was not measured (deferred to the combined campaign).
 
 It does not run with the fast prefill QSA component, which reads BF16 keys and values, and is not admitted with
 cohort windows, the prefix state cache or HTTP serving, which were not checked under the identity.
+
+## D-047: context n-gram extension of the MTP draft chain (opt-in)
+
+`--mtp-ngram-draft` appends, after the MTP drafts kept by the minimum probability, the continuation of the
+longest earlier occurrence (2 to 4 tokens) of context + kept drafts, up to the draft depth, inside the same
+verify window (no new window shape). Every row is verified by the target, so tokens are the greedy tokens;
+the predictor cache is rebuilt from committed target rows as after any rejected draft. A per-request
+acceptance table, fed by scoring every cycle's would-be extension against the emitted tokens (host only,
+prior 0.2), gates it: rows are proposed only while the first row's learned acceptance is at least 0.5, they
+size the window with that acceptance and stay out of the draft calibration (docs/mtp-native-cli.md). It works with
+the D-022 controller only: the survival controller (D-041) rejects it.
+
+Why: requests that copy their context (correcting a given document, edits) have long exact continuations
+in the prompt that the MTP chain stops short of. Full-chain logs (512 tokens, dense A8, 18 prompts:
+prose in five languages, thinking, summaries, rewrites, document QA, code, agent) simulated with the
+verifier cost model: substituting n-gram chains for MTP chains loses on everything but copying, and even an
+oracle choosing MTP or n-gram per cycle adds only 0.1-1.6 % over the best MTP-only choice on prose,
+summaries and answers (3.9 % on code); on document correction it adds 19-22 %. The gated extension adds
++11.0 % (English) and +5.6 % (Spanish) on correction and never opens on the 16 other prompts.
+
+Checked on one node (dense A8, windows 2/4/8, 512 tokens): tokens identical with and without the switch on
+document correction (en, es), summary, English prose and code, replay error 0. Single smoke runs: correction
+66.9 -> 81.5 tok/s (en) and 74.9 -> 79.2 (es); the others extended no cycle. Off by default until the timing
+campaign.
+
+## D-048: dense Q6P32 weights (draft numerical proposal, opt-in)
+
+`--dense-q6p-pack PATH` registers 6.5-bit Q6P32 copies of the dense Q8_0 tensors (GDN, QSA, HC, shared
+expert, LM head) and BF16 copies of the F32 routers, pinned to an emulated checkpoint whose Q8_0 tensors hold
+the same 6-bit codes and scales. Every Q6P32 block is an exact Q8_0 block, so the Q6P32 kernels compute the
+bits of the Q8_0 kernels on the emulated file; `STRIX_Q6P=0` keeps every launcher on its Q8_0 kernel for A/B
+on one file. Covered: the dense A8 profile's 1-8 row projections, the FP32 rows and R1 projections, LM head
+rows up to 4 and R1, HC split-K and lane chain, and the router logits; prefill and LM head windows of more
+than four rows keep the Q8_0 tensors. See [docs/dense-q6p32-weights.md](docs/dense-q6p32-weights.md).
+
+Checked: fixtures equal Q8_0 bit for bit (1036 exact and 528 dense A8 cases with the Q8_0 tensor poisoned,
+registry hits proving the copies were read); MTP 256 tokens with the Q8_0 kernels' golden: tokens identical
+and replay error 0 in the dense A8 and FP32 profiles. Quality of the emulated checkpoint against Q8_0 (49001
+positions, dense A8, pre-registered bound KL <= 0.066 and top-1 >= 92.5 %): all dense at 6 bits (v1) KL
+0.0279, top-1 94.42 %; with HC kept in Q8_0 (v1hc) KL 0.0253, top-1 94.61 %; the current checkpoint
+measures KL 0.0198, top-1 95.55 %. Both pass the bound, at +41 % (v1) and +28 % (v1hc) relative KL.
+
+Status: draft. The format, the checkpoint choice (v1 or v1hc) and any default wait for the timing campaign
+and the quality decision; nothing changes without the flag.
+
+## D-049: HC rows output of 8-row windows in the row-split lane-chain form (default)
+
+In 8-row verify windows with Q8_0 HC weights, the lane-chain HC output runs as two groups of stream waves per
+block that share the staged up tile, each running half the rows' chains; the stream mix is spread over all
+waves. Every (row, stream, feature) chain and the mix keep their order and expressions, so the bits are those
+of the LDS form. `STRIX_HC_LANE_SPLIT=0` keeps the LDS form, `=2|4|8` forces the group count (also at 4 rows).
+
+Why: the 8-row HC output was the largest latency-bound step left in an R8 window (the window runs at 80-83 %
+of its DRAM floor). Measured in a run: 3.22 -> 2.98 ms per R8 window; 4 and 8 groups were not faster, and at 4
+rows the register form stays. Checked: 36 HC fixture cases and 256 MTP tokens identical, replay error 0.
+
+## D-050: sampled decisions on the GPU (default)
+
+With `--mtp-sample-temperature` above zero, target rows (window and serial) and the draft chain are decided on
+the device with the host sampler's transform, order and random stream (docs/sampled-decoding.md). Kept sets
+of at most 2048 entries are compacted in token id order and decided by one workgroup with the host's own
+sequence; larger sets use a fixed two-level partition, and a top-p prefix needing more than 2048 entries is
+decided on the host. The draft chain samples each step right after the draft head on the same stream and
+writes the token into the head's device slot, so it no longer waits or reads back per step; policies whose
+draft rows could need the host (top-p < 1 without a top-k <= 2048) keep the draft on the host.
+`STRIX_SAMPLE_PATH=host|device|auto` (default auto = device) and `STRIX_SAMPLE_DRAFT_HOST=1` select the path.
+
+Checked: the device fixture decides 400 rows (200 with the draft distribution in device memory) and 146
+draft steps equal to the host in token and support (largest relative probability difference 1e-13); engine
+smoke runs (six policies, 256 tokens) give the host path's tokens with replay error 0, and the sampling-v1
+chi-square smoke gives the host path's numbers. Single runs measured the device faster than the host for every kind of
+decision under all six policy classes; the timing campaign confirms it.
 
 ## Measured and rejected
 
@@ -774,3 +848,8 @@ cohort windows, the prefix state cache or HTTP serving, which were not checked u
 | X-013 | `--mtp-spec-min-p` 0.7, 0.75, 0.8, 0.88, 0.9 | lower tok/s | 0.85 is the measured optimum (D-022). |
 | X-014 | Token-tree verify windows (draft runner-up as a sibling row, leaf or with a chain) | offline sizing, not built | Over code, en, es, fr and agent prompts (256 tokens each, the recommended MTP configuration) rejections are ~0.43 per cycle everywhere and the runner-up is right in 15-55 % of them; a free sibling at the actual rejection depth would add at most 5-8 % tokens per cycle. Verify rows are not free (~5.6 ms per extra row, the routed expert union grows with rows) and windows have no spare rows (most prose windows are R2), so simulated rate change is -1.8 to +1.3 % with 2/4/8 owners and -1.5 to +0.9 % against a chain with owners of every size. Prose yields fewer tokens per cycle because its chains are shorter, not because its rejections differ. Diagnostic: `STRIX_MTP_DRAFT_LOG=1 STRIX_MTP_DRAFT_TOP2=1`. |
 | X-015 | Q8 instead of the Q4_0 copy of the MTP draft head subset (always, from depth 1, 2 or 3, only with a zh/ja pack, only without a pack) | simulated -1.6 % to -0.1 % | The Q8 head costs about 2x per draft step (+0.22/+0.29/+0.39 ms at 37k/49k/65k rows, `strix-hip-mtp-draft-head-tests --bench-precision`) and, even at no cost, gains nothing beyond trajectory noise on 10 prompts (full-chain logs). Keep `--mtp-draft-q4`; Q5/Q6 are bounded by Q8. |
+| X-016 | Richer survival-controller inputs and stopping rules for the draft chain and verify window: acceptance in the request, cumulative chain probability, previous draft probability, entropy from top-2, token type of the draft and previous token (logistic, leave one prompt out), gradient-boosted trees, a richer or online depth-wise lookahead, drafting 2-7 steps before choosing, R5/R7 active rows | simulated -2.6 % to +0.1 % against the D-041 controller (R3/R6), base and distilled draft | Full-chain logs (16 prompts base draft, 12 distilled; prose en/es/fr/de/zh/ja, summaries, rewrites, QA, agent, code), measured R2/R4/R8 costs. Log loss improves 1.3 % at most and even trees fitted on the evaluation data reach +0.3 % over D-041. An oracle that knows the accepted length gains +18 to +21 % (base) or +25 to +28 % (distilled) over min-p 0.85, but that is information the draft does not carry when the window is chosen; D-041 (+4 %, +9.6 % with the distilled draft) is within about 1 % of the best draft-time controller found. |
+| X-017 | Algorithmic cuts of verify-window bytes: choosing the window rows from their real expert-union bytes, keeping or prefetching the routed experts of the previous window or of the next layer in L2/MALL, ordering experts for cache reuse | simulated -0.1 % (byte-aware rows); cache reuse not available | Route logs (`STRIX_WINDOW_ROUTE_LOG`, 517 R8 windows, 6 prompts): a window reads 10 / 15.8 / 25.5 / 40.9 distinct experts per layer for 1 / 2 / 4 / 8 rows (1.50 / 2.38 / 3.85 / 6.16 GB, 3.1 MB per expert); a row adds 4-6 new experts per layer whether or not it is accepted, so bytes carry no acceptance information and the survival controller already prices R3/R6 at the fitted cost (23.7 ms + 8.06 ms/GB). The MALL serves a re-read of up to 32 MB at about 850 GB/s against 235 GB/s from DRAM, but keeps nothing past 16 MB of other traffic (LRU), while one layer of one row is 31 MB and an R8 window streams 6 GB; 59 % of a layer's union recurs in the next window but is long evicted. A side-stream prefetch against a saturating read costs its full bytes. |
+| X-018 | Routed-expert window kernels (A8 gate/up `project_window`, Q5_1/Q8_0 `down_window`): aligned 16/8-byte Q5_1 block loads instead of byte loads, one gate/up pass for experts of 5-8 rows (G=8), half the Q4_K blocks in registers (`STRIX_MOE_GATEUP_CHUNK=5`) in windows, other expert orders and 64/128-row tiles | exact; union fixture 0 % (wide down), +4..+17 % slower (G=8); in-situ R8 trace 0 % (chunk 5) | The kernels already run near the bandwidth of their access pattern: a pure read of the same scattered expert slabs (no arithmetic) reaches 205-226 GB/s for 10-80 experts (236 GB/s for one contiguous stream), the window down kernel runs at that floor and gate/up at about 85-90 % of it (about 190 GB/s in situ). The remaining gate/up gap is worth at most about 3-4 % of an R8 window. |
+| X-019 | Shared expert and window GDN core: shared expert of all rows in one weight pass or fused gate/up/down; GDN recurrence with 4 or 2 value columns per wave, a tiled recurrence (one block per value head and 32 columns, coalesced state through LDS, 2/4/8 columns per wave, `STRIX_GDN_WINDOW_TILED`), a row-parallel prepare (one 128-thread group per row) and a prepare with the beta/gate scalars over (head, row) pairs (`STRIX_GDN_WINDOW_PREPARE_GATES`) | all bit-exact (228 fixture scenarios, identical tokens, replay 0); shared expert not changed (0 % by construction); tiled recurrence fixture -17 % (R1) to -12 % (R8), in-situ R8 trace -3 % (54.7 to 52.9 us per layer); parallel gates fixture R8 -25 %, in situ 0 %; row-parallel prepare and plain 4/2 columns slower | The shared expert runs on the second stream and ends before the routed merge in every window layer of an R8 trace (median slack 259 us), so it is off the window critical path. In situ the window recurrence reads a cold 3.1 MB state per layer (about 13 us at DRAM bandwidth) and then runs a dependent chain of about 4-5 us per row; the exact variants only shorten the warm parts. Both GDN switches stay opt-in (about 0.1 % of an R8 window). Shortening the row chain further needs a different summation order (chunked form), which is not bit-exact. |
+| X-020 | Verify-window LM head of 5-8 rows (`STRIX_LM_HEAD_ROWS_LEAN=2`): staged inputs read as 16-byte LDS words with one-instruction BF16 unpacking, two logits per wave sharing them, lane and local reduction trees evaluated two partial sums per register (same operand pairs, operands commuted), greedy partials fused into the head kernel; also the one-logit form (`=1`) and the lean kernel for 2-4 rows | logits bit-identical to the R1 head (all fixture rows cases, 2-8 rows), same greedy replies as the CPU oracle, identical tokens and replay 0 on two 512-token prompts; real-shape fixture R8 4.19-4.62 ms to 3.37-3.41 ms (R6 3.58 to 3.43 ms with greedy); in-situ R8 trace 4.54 ms (head 4.43 + greedy 0.11) to 3.56 ms (-0.98 ms per R8 window); 2-4 rows: 3.07/3.14 to 3.30-3.35 ms (slower); `=1` R8 3.92-4.24 ms | The 8-row head was bound by vector instructions (about 170 per 256-byte chunk and 440 for the trees of each logit at 139 VGPRs), not by its 675 MB of weights; the lean form is at about 80 % of the byte floor (2.86 ms). Windows of up to four rows keep the unstaged rows kernel. Kept opt-in until the timing campaign: with the min-p controller R8 windows are 7-28 % of the cycles, so the expected gain is about +0.1-0.5 % tok/s (more with min-p 0 or more R8 windows). |

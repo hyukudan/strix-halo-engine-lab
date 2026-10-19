@@ -4,9 +4,12 @@
 #endif
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
+#include "strix/hip_generation_output.hpp"
 #include "strix/q8_projection_organization.hpp"
 
 #include "strix/dispatch_resources.hpp"
+#include "strix/q6p_registry.hpp"
+#include "hip_q6p_weights.hpp"
 
 #include <cstdlib>
 #include <string_view>
@@ -539,7 +542,9 @@ __device__ float lane_down(float value) {
 // R1 leaf, lane-tree and local-tree DAG of prefetch8_wave_q8_lm_head_kernel.
 // Groups > 1 stages all rows' BF16 inputs in LDS once per block, which then
 // covers Groups consecutive Waves-row tiles; it changes no arithmetic.
-template <unsigned Waves, unsigned Rows, unsigned Groups>
+// Q6: weights is the Q6P32 copy of the Q8_0 head; it yields the same codes and
+// scales (decoded where the Q8_0 path unpacks its prefetched codes).
+template <unsigned Waves, unsigned Rows, unsigned Groups, bool Q6 = false>
 __global__ __launch_bounds__(32U * Waves)
 void prefetch8_wave_q8_lm_head_rows_kernel(LmHeadRowsViews views, const void* weights,
     std::uint32_t input_width, std::uint32_t output_width) {
@@ -563,16 +568,26 @@ void prefetch8_wave_q8_lm_head_rows_kernel(LmHeadRowsViews views, const void* we
     // stop exactly where the R1 base < width guard stops accumulating.
     std::uint64_t next_codes = 0;
     __half next_scale{};
+    q6p::Group next_group{};
+    const auto q6_row = q6p::uniform(q6p::row_of(static_cast<const unsigned char*>(weights), input_width, row));
     const auto fetch = [&](std::uint32_t feature) {
-        const auto& block = blocks[feature / 32U];
-        __builtin_memcpy(&next_codes, block.values + feature % 32U, 8U);
-        next_scale = block.scale;
+        if constexpr (Q6) {
+            next_group = q6p::load_group(q6_row, feature);
+        } else {
+            const auto& block = blocks[feature / 32U];
+            __builtin_memcpy(&next_codes, block.values + feature % 32U, 8U);
+            next_scale = block.scale;
+        }
     };
     if (8U * lane < input_width) fetch(8U * lane);
     for (std::uint64_t chunk = 0; chunk < input_width; chunk += 256U) {
         const auto base = chunk + 8U * lane;
         if (base >= input_width) break;
         const auto feature = static_cast<std::uint32_t>(base);
+        if constexpr (Q6) {
+            next_codes = q6p::codes8(next_group.qs, next_group.qh, q6p::shift_of(feature));
+            next_scale = __ushort_as_half(static_cast<unsigned short>(next_group.scale));
+        }
         const auto packed = next_codes;
         const float scale = __half2float(next_scale);
         if (base + 256U < input_width) fetch(feature + 256U);
@@ -619,8 +634,179 @@ void prefetch8_wave_q8_lm_head_rows_kernel(LmHeadRowsViews views, const void* we
 // direct per-wave input loads from overflowing the vector cache.
 constexpr unsigned lm_head_rows_groups = 16;
 constexpr std::uint64_t lm_head_rows_lds_limit = 48U * 1024U;
-template <unsigned Rows>
-void launch_lm_head_rows(const LmHeadRowsViews& views, const void* weights,
+// Lean rows head: every logit keeps the leaf, lane-tree and local-tree DAG of
+// prefetch8_wave_q8_lm_head_rows_kernel (and so of the R1 head) with fewer instructions around
+// it. Inputs are staged in LDS and read as 16-byte words (one shift or mask per BF16 value); a
+// wave runs Cols consecutive logits that share those reads; and the trees run two partial sums
+// per register: an add pairs the same two values as the R1 shuffle tree and only the lane that
+// keeps the result changes, so each sum is the same IEEE add with its operands commuted.
+template <unsigned D>
+__device__ __forceinline__ float lane_xor(float value) {
+    if constexpr (D == 16) {
+        const auto bits = __float_as_uint(value);
+        return __uint_as_float(__builtin_amdgcn_permlanex16(bits, bits, 0x76543210U, 0xfedcba98U, false, false));
+    } else {
+        return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(value), 0x160 + static_cast<int>(D), 0xf, 0xf, false));
+    }
+}
+// v[0..M/2) <- pairs (v[2i], v[2i+1]): lanes without bit D add v[2i] at lane ^ D, lanes with it
+// add v[2i+1] at lane ^ D, so each value's partial sums keep their positions in a half-size segment.
+template <unsigned D, unsigned M>
+__device__ __forceinline__ void lean_pack(float* v, bool upper) {
+#pragma unroll
+    for (unsigned i = 0; i < M / 2U; ++i) {
+        const float a = v[2U * i], b = v[2U * i + 1U];
+        v[i] = (upper ? b : a) + lane_xor<D>(upper ? a : b);
+    }
+}
+struct LeanGreedy { float value; std::uint32_t token, bad, valid; };
+__device__ __forceinline__ std::uint32_t lean_key(float value) {
+    auto bits = __float_as_uint(value);
+    if ((bits & 0x7fffffffU) == 0) bits = 0;
+    return (bits & 0x80000000U) ? ~bits : (bits ^ 0x80000000U);
+}
+__device__ __forceinline__ LeanGreedy lean_choose(LeanGreedy a, const LeanGreedy& b) {
+    const auto bad = a.bad | b.bad;
+    if (b.valid && (!a.valid || lean_key(b.value) > lean_key(a.value) ||
+                    (lean_key(b.value) == lean_key(a.value) && b.token < a.token))) a = b;
+    a.bad = bad;
+    return a;
+}
+constexpr unsigned lm_head_lean_waves = 8;
+template <unsigned Rows, unsigned Cols, bool Greedy>
+__global__ __launch_bounds__(32U * lm_head_lean_waves)
+void lean_q8_lm_head_rows_kernel(LmHeadRowsViews views, const void* weights, std::uint32_t input_width,
+    std::uint32_t output_width, LeanGreedy* partials, std::uint32_t partial_count) {
+    constexpr unsigned groups = hip_greedy_rows_partial_logits / (lm_head_lean_waves * Cols);
+    constexpr unsigned slots = (Rows * Cols + 3U) / 4U * 4U, regs = slots / 4U;
+    extern __shared__ uint4 staged[];
+    __shared__ LeanGreedy best_lds[Greedy ? lm_head_lean_waves * slots : 1U];
+    const auto words = input_width / 8U;
+    for (auto i = static_cast<std::uint32_t>(threadIdx.x); i < Rows * words; i += 32U * lm_head_lean_waves)
+        staged[i] = reinterpret_cast<const uint4*>(views.input[i / words])[i % words];
+    __syncthreads();
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U, wave = static_cast<std::uint32_t>(threadIdx.x) / 32U;
+    LeanGreedy best[regs]{};
+    for (unsigned group = 0; group < groups; ++group) {
+        const auto first = ((static_cast<std::uint32_t>(blockIdx.x) * groups + group) * lm_head_lean_waves + wave) * Cols;
+        if (first >= output_width) break;
+        float partial[Cols][Rows][8]{};
+        const Q8Block* blocks[Cols];
+        std::uint64_t next_codes[Cols]{};
+        __half next_scale[Cols]{};
+#pragma unroll
+        for (unsigned c = 0; c < Cols; ++c)
+            blocks[c] = static_cast<const Q8Block*>(weights) +
+                static_cast<std::uint64_t>(min(first + c, output_width - 1U)) * (input_width / 32U);
+        const auto fetch = [&](std::uint32_t feature) {
+#pragma unroll
+            for (unsigned c = 0; c < Cols; ++c) {
+                const auto& block = blocks[c][feature / 32U];
+                __builtin_memcpy(&next_codes[c], block.values + feature % 32U, 8U);
+                next_scale[c] = block.scale;
+            }
+        };
+        if (8U * lane < input_width) fetch(8U * lane);
+        for (std::uint64_t chunk = 0; chunk < input_width; chunk += 256U) {
+            const auto base = chunk + 8U * lane;
+            if (base >= input_width) break;
+            const auto feature = static_cast<std::uint32_t>(base);
+            float weight[Cols][8];
+#pragma unroll
+            for (unsigned c = 0; c < Cols; ++c) {
+                const auto packed = next_codes[c];
+                const float scale = __half2float(next_scale[c]);
+#pragma unroll
+                for (unsigned local = 0; local < 8; ++local)
+                    weight[c][local] = scale * static_cast<float>(static_cast<std::int8_t>(packed >> (8U * local)));
+            }
+            if (base + 256U < input_width) fetch(feature + 256U);
+#pragma unroll
+            for (unsigned r = 0; r < Rows; ++r) {
+                const uint4 word = staged[(r * input_width + feature) / 8U];
+                const std::uint32_t pair[4] = {word.x, word.y, word.z, word.w};
+                float act[8];
+#pragma unroll
+                for (unsigned q = 0; q < 4; ++q) {
+                    act[2U * q] = __uint_as_float(pair[q] << 16U);
+                    act[2U * q + 1U] = __uint_as_float(pair[q] & 0xffff0000U);
+                }
+#pragma unroll
+                for (unsigned c = 0; c < Cols; ++c)
+#pragma unroll
+                    for (unsigned local = 0; local < 8; ++local)
+                        partial[c][r][local] += act[local] * weight[c][local];
+            }
+        }
+        // Value (slot, local) starts at list index n such that after the five lane stages it sits in
+        // register slot / 4 at lane 8 * (slot % 4) + local.
+        float v[slots * 8U];
+#pragma unroll
+        for (unsigned slot = 0; slot < slots; ++slot)
+#pragma unroll
+            for (unsigned local = 0; local < 8; ++local) {
+                const unsigned n = ((slot >> 1U) & 1U) | ((slot & 1U) << 1U) | (((local >> 2U) & 1U) << 2U) |
+                    (((local >> 1U) & 1U) << 3U) | ((local & 1U) << 4U) | ((slot >> 2U) << 5U);
+                v[n] = slot < Rows * Cols ? partial[slot / Rows][slot % Rows][local] : 0.0F;
+            }
+        lean_pack<16, slots * 8U>(v, (lane & 16U) != 0U);
+        lean_pack<8, slots * 4U>(v, (lane & 8U) != 0U);
+        lean_pack<4, slots * 2U>(v, (lane & 4U) != 0U);
+        lean_pack<2, slots>(v, (lane & 2U) != 0U);
+        lean_pack<1, slots / 2U>(v, (lane & 1U) != 0U);
+        // Local tree p0 += p4 ...; p0 += p2, p1 += p3; p0 += p1 over lanes 8q + local.
+#pragma unroll
+        for (unsigned j = 0; j < regs; ++j) {
+            v[j] += lane_xor<4>(v[j]);
+            v[j] += lane_xor<2>(v[j]);
+            v[j] += lane_xor<1>(v[j]);
+        }
+        if ((lane & 7U) == 0U) {
+#pragma unroll
+            for (unsigned j = 0; j < regs; ++j) {
+                const auto slot = 4U * j + lane / 8U;
+                if (slot >= Rows * Cols) continue;
+                const auto row = first + slot / Rows;
+                if (row >= output_width) continue;
+                views.output[slot % Rows][row] = v[j];
+                if constexpr (Greedy) {
+                    LeanGreedy here{v[j], row, 0U, 0U};
+                    here.bad = (__float_as_uint(v[j]) & 0x7f800000U) == 0x7f800000U ? 1U : 0U;
+                    here.valid = here.bad ^ 1U;
+                    best[j] = lean_choose(best[j], here);
+                }
+            }
+        }
+    }
+    if constexpr (Greedy) {
+        if ((lane & 7U) == 0U)
+#pragma unroll
+            for (unsigned j = 0; j < regs; ++j) best_lds[wave * slots + 4U * j + lane / 8U] = best[j];
+        __syncthreads();
+        if (threadIdx.x < Rows) {
+            LeanGreedy total{0.0F, 0U, 0U, 0U};
+            for (unsigned w = 0; w < lm_head_lean_waves; ++w)
+                for (unsigned c = 0; c < Cols; ++c) total = lean_choose(total, best_lds[w * slots + c * Rows + threadIdx.x]);
+            partials[static_cast<std::uint64_t>(threadIdx.x) * partial_count + blockIdx.x] = total;
+        }
+    }
+}
+
+template <unsigned Rows, unsigned Cols>
+void launch_lean_lm_head_rows(const LmHeadRowsViews& views, const void* weights, std::uint32_t hidden,
+    std::uint32_t vocab, LeanGreedy* partials, hipStream_t stream) {
+    const auto lds = static_cast<std::uint32_t>(Rows * hidden * 2U);
+    const auto blocks = (vocab + hip_greedy_rows_partial_logits - 1U) / hip_greedy_rows_partial_logits;
+    if (partials)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(lean_q8_lm_head_rows_kernel<Rows, Cols, true>), dim3(blocks),
+            dim3(32U * lm_head_lean_waves), lds, stream, views, weights, hidden, vocab, partials, blocks);
+    else
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(lean_q8_lm_head_rows_kernel<Rows, Cols, false>), dim3(blocks),
+            dim3(32U * lm_head_lean_waves), lds, stream, views, weights, hidden, vocab, partials, blocks);
+}
+
+template <unsigned Rows, bool Q6>
+void launch_lm_head_rows_format(const LmHeadRowsViews& views, const void* weights,
     std::uint32_t hidden, std::uint32_t vocab, hipStream_t stream) {
     const auto lds = static_cast<std::uint64_t>(Rows) * hidden * 2U;
     // STRIX_LM_HEAD_ROWS_WIDE=w16|direct (wide windows): 16 waves share one staged copy
@@ -631,18 +817,44 @@ void launch_lm_head_rows(const LmHeadRowsViews& views, const void* weights,
     }();
     if (Rows > 4U && lds <= lm_head_rows_lds_limit && wide == 1) {
         constexpr auto rows_per_block = 16U * (lm_head_rows_groups / 2U);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<16, Rows, lm_head_rows_groups / 2U>),
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<16, Rows, lm_head_rows_groups / 2U, Q6>),
             dim3((vocab + rows_per_block - 1U) / rows_per_block), dim3(512), static_cast<std::uint32_t>(lds), stream,
             views, weights, hidden, vocab);
     } else if (Rows > 4U && lds <= lm_head_rows_lds_limit && wide == 0) {
         constexpr auto rows_per_block = 8U * lm_head_rows_groups;
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<8, Rows, lm_head_rows_groups>),
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<8, Rows, lm_head_rows_groups, Q6>),
             dim3((vocab + rows_per_block - 1U) / rows_per_block), dim3(256), static_cast<std::uint32_t>(lds), stream,
             views, weights, hidden, vocab);
     } else {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<8, Rows, 1>),
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_rows_kernel<8, Rows, 1, Q6>),
             dim3((vocab + 7U) / 8U), dim3(256), 0, stream, views, weights, hidden, vocab);
     }
+}
+// The registered Q6P32 copy of the Q8_0 head replaces it when its shape matches.
+const q6p::Tensor* q6_head(const void* weights, std::uint32_t hidden, std::uint32_t vocab) {
+    const auto* q6 = q6p::find(weights);
+    return q6 && q6->kind == q6p::Kind::q6p32 && q6->rows == vocab && q6->cols == hidden ? q6 : nullptr;
+}
+// Wide windows (staged, more than four rows) are VALU bound and the decode makes the Q6P32 head
+// slower (8 rows: 4.36 -> 4.51 ms in the window profile); they keep the Q8_0 head, same bits.
+template <unsigned Rows>
+void launch_lm_head_rows(const LmHeadRowsViews& views, const void* weights,
+    std::uint32_t hidden, std::uint32_t vocab, hipStream_t stream) {
+    if (const auto* q6 = Rows <= 4U ? q6_head(weights, hidden, vocab) : nullptr)
+        launch_lm_head_rows_format<Rows, true>(views, q6->base, hidden, vocab, stream);
+    else launch_lm_head_rows_format<Rows, false>(views, weights, hidden, vocab, stream);
+}
+// R1 prefetch8 wave8 head over a registered Q6P32 copy: the one-row rows kernel repeats the
+// R1 leaf, lane-tree and local-tree DAG. False when the head has no copy.
+bool launch_q6_head_r1(const std::uint16_t* hidden, const void* weights, std::uint32_t hidden_size,
+    std::uint32_t vocab, float* logits, hipStream_t stream) {
+    const auto* q6 = q6_head(weights, hidden_size, vocab);
+    if (!q6) return false;
+    LmHeadRowsViews views{};
+    views.input[0] = hidden;
+    views.output[0] = logits;
+    launch_lm_head_rows_format<1, true>(views, q6->base, hidden_size, vocab, stream);
+    return true;
 }
 
 template <
@@ -655,7 +867,10 @@ void launch_typed(
     const ExecutionBufferAddress& logits) {
     if (config.prefetch_q8_wave) {
         if constexpr (Kind == WeightKind::q8_0 && std::is_same_v<Input, std::uint16_t>) {
-            if (config.wave8_q8_wave) {
+            if (config.wave8_q8_wave && std::is_same_v<Input, std::uint16_t> &&
+                launch_q6_head_r1(reinterpret_cast<const std::uint16_t*>(hidden.address), reinterpret_cast<const void*>(weights.address),
+                    config.hidden_size, config.vocab_size, reinterpret_cast<float*>(logits.address), hip_execution_stream())) {
+            } else if (config.wave8_q8_wave) {
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<Input, 8>),
                     dim3((config.vocab_size + 7U) / 8U), dim3(256), 0, hip_execution_stream(),
                     reinterpret_cast<const Input*>(hidden.address),
@@ -1085,6 +1300,31 @@ make_hip_lm_head_launcher(
 
 namespace {
 struct PreparedLmHeadRows { LmHeadRowsViews views{}; const void* weights = nullptr; };
+// Lean rows (config.rows_lean 1 or 2) stage every row's input in LDS next to its greedy slots.
+// Windows of up to four rows keep the unstaged rows kernel, which is faster there.
+bool lean_rows_admitted(const HipLmHeadLauncherConfig& config, std::size_t rows) {
+    return (config.rows_lean == 1U || config.rows_lean == 2U) && rows > 4U && config.hidden_size % 256U == 0U &&
+        rows * config.hidden_size * 2U <= lm_head_rows_lds_limit;
+}
+template <unsigned Cols>
+void launch_lean_rows_cols(std::size_t rows, const LmHeadRowsViews& views, const void* weights, std::uint32_t h,
+    std::uint32_t v, LeanGreedy* partials, hipStream_t stream) {
+    switch (rows) {
+    case 2: launch_lean_lm_head_rows<2, Cols>(views, weights, h, v, partials, stream); break;
+    case 3: launch_lean_lm_head_rows<3, Cols>(views, weights, h, v, partials, stream); break;
+    case 4: launch_lean_lm_head_rows<4, Cols>(views, weights, h, v, partials, stream); break;
+    case 5: launch_lean_lm_head_rows<5, Cols>(views, weights, h, v, partials, stream); break;
+    case 6: launch_lean_lm_head_rows<6, Cols>(views, weights, h, v, partials, stream); break;
+    case 7: launch_lean_lm_head_rows<7, Cols>(views, weights, h, v, partials, stream); break;
+    default: launch_lean_lm_head_rows<8, Cols>(views, weights, h, v, partials, stream); break;
+    }
+}
+void launch_lean_rows(std::uint32_t cols, std::size_t rows, const LmHeadRowsViews& views, const void* weights,
+    std::uint32_t h, std::uint32_t v, LeanGreedy* partials, hipStream_t stream) {
+    if (cols == 2U) launch_lean_rows_cols<2>(rows, views, weights, h, v, partials, stream);
+    else launch_lean_rows_cols<1>(rows, views, weights, h, v, partials, stream);
+}
+
 PreparedLmHeadRows prepare_lm_head_rows(std::span<const ExecutionDispatchContext> rows,
     const HipLmHeadLauncherConfig& config) {
     if (rows.size() < 2U || rows.size() > lm_head_window_max_rows)
@@ -1133,6 +1373,11 @@ void lm_head_known_window_rows_launch(std::span<const ExecutionDispatchContext> 
     const auto stream = hip_execution_stream();
     const auto h = config.hidden_size, v = config.vocab_size;
     check_hip(hipPeekAtLastError(), "known-window LM head rows stale launch error");
+    if (lean_rows_admitted(config, rows.size())) {
+        launch_lean_rows(config.rows_lean, rows.size(), p.views, p.weights, h, v, nullptr, stream);
+        check_hip(hipGetLastError(), "known-window lean LM head rows launch");
+        return;
+    }
     switch (rows.size()) {
     case 2: launch_lm_head_rows<2>(p.views, p.weights, h, v, stream); break;
     case 3: launch_lm_head_rows<3>(p.views, p.weights, h, v, stream); break;
@@ -1143,6 +1388,29 @@ void lm_head_known_window_rows_launch(std::span<const ExecutionDispatchContext> 
     default: launch_lm_head_rows<8>(p.views, p.weights, h, v, stream); break;
     }
     check_hip(hipGetLastError(), "known-window LM head rows launch");
+}
+
+void lm_head_known_window_rows_launch_greedy(std::span<const ExecutionDispatchContext> rows,
+    const HipLmHeadLauncherConfig& config, ExecutionBufferAddress partials, HipGreedyRowsReply* replies) {
+    if (!lean_rows_admitted(config, rows.size())) {
+        lm_head_known_window_rows_launch(rows, config);
+        std::array<ExecutionBufferAddress, lm_head_window_max_rows> logits{};
+        for (std::size_t r = 0; r < rows.size(); ++r) logits[r] = resolve_dispatch_write(rows[r], 0);
+        enqueue_hip_greedy_rows(std::span<const ExecutionBufferAddress>(logits.data(), rows.size()), config.vocab_size,
+            partials, replies, hip_execution_stream());
+        return;
+    }
+    const auto p = prepare_lm_head_rows(rows, config);
+    const auto rows_count = static_cast<std::uint32_t>(rows.size());
+    const auto bytes = hip_greedy_rows_scratch_bytes(rows_count, config.vocab_size);
+    if (!partials.address || partials.address % alignof(LeanGreedy) != 0 || partials.bytes < bytes || !replies)
+        throw std::invalid_argument("known-window fused greedy LM head scratch/reply views are invalid");
+    const auto stream = hip_execution_stream();
+    check_hip(hipPeekAtLastError(), "known-window LM head rows stale launch error");
+    launch_lean_rows(config.rows_lean, rows.size(), p.views, p.weights, config.hidden_size, config.vocab_size,
+        reinterpret_cast<LeanGreedy*>(partials.address), stream);
+    check_hip(hipGetLastError(), "known-window fused greedy LM head rows launch");
+    enqueue_hip_greedy_rows_finish(partials, rows_count, config.vocab_size, replies, stream);
 }
 
 void HipLmHeadLauncherBundle::
@@ -1275,6 +1543,12 @@ void launch_hip_mtp_lm_head(const MtpNativeContext& c,void* stream) {
     check_hip(hipPeekAtLastError(),"MTP head pending HIP error");
     if(select_hip_mtp_lm_head_recipe(*c.model,c.tensors->lm_head)==HipMtpLmHeadRecipe::prefetch8_wave8_q8) {
         const auto outputs=static_cast<std::uint32_t>(c.model->vocab_size);
+        if(launch_q6_head_r1(reinterpret_cast<const std::uint16_t*>(c.resources->view(HipMtpBuffer::hidden0).address),
+            reinterpret_cast<const void*>(c.tensors->lm_head.runtime->address),static_cast<std::uint32_t>(c.model->hidden_size),outputs,
+            reinterpret_cast<float*>(c.resources->view(HipMtpBuffer::logits).address),reinterpret_cast<hipStream_t>(stream))) {
+            check_hip(hipGetLastError(),"MTP Q6P32 LM head launch");
+            return;
+        }
         hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<std::uint16_t,8>),
             dim3(outputs/8U+static_cast<std::uint32_t>(outputs%8U!=0U)),dim3(256U),0,
             reinterpret_cast<hipStream_t>(stream),
@@ -1310,6 +1584,10 @@ void launch_hip_q8_head_rows(const std::uint16_t* hidden,const void* q8_rows,std
     if(!hidden || !q8_rows || !logits || !stream || !rows || !hidden_size || hidden_size%32U || hidden_size>10240U ||
        reinterpret_cast<std::uintptr_t>(q8_rows)%2U)
         throw std::invalid_argument("Q8 draft head rows geometry/views invalid");
+    if(launch_q6_head_r1(hidden,q8_rows,hidden_size,rows,logits,reinterpret_cast<hipStream_t>(stream))) {
+        check_hip(hipGetLastError(),"Q6P32 draft head rows launch");
+        return;
+    }
     hipLaunchKernelGGL(HIP_KERNEL_NAME(prefetch8_wave_q8_lm_head_kernel<std::uint16_t,8>),
         dim3(rows/8U+static_cast<std::uint32_t>(rows%8U!=0U)),dim3(256U),0,reinterpret_cast<hipStream_t>(stream),
         hidden,q8_rows,hidden_size,rows,logits);

@@ -72,3 +72,22 @@ remain mandatory; this integration does not qualify speed or arbitrary models.
 `--mtp-sample-temperature`, `--mtp-sample-top-k`, `--mtp-sample-top-p`, `--mtp-sample-min-p`, `--mtp-sample-seed`,
 `--mtp-sample-speculation`, `--mtp-sample-schedule` and `--mtp-sample-repeats` select seeded sampling instead of
 greedy selection. They are described in [sampled-decoding.md](sampled-decoding.md).
+
+### Context n-gram extension of the draft chain
+
+`--mtp-ngram-draft` (off by default; needs `--mtp-draft-chain`, prefix target windows, greedy selection, one
+request (no cohort or HTTP serving) and the D-022 controller, not the survival controller)
+lets the context continue a draft chain that stopped early. The chain keeps its drafts up to the first one
+below the minimum probability; when the longest suffix (2 to 4 tokens) of prompt + output + kept drafts
+occurred earlier in the context, the tokens that followed it then are appended, up to the draft depth, in
+the same verify window. The target verifies every row, so the output is the greedy output with or without
+the switch; the predictor's cache is rebuilt from the committed target rows as for any rejected draft.
+
+Whether to propose is learned per request: every cycle's would-be extension is scored against the tokens the
+verifier emitted (host work only), from a prior of 0.2, and an extension is proposed only while its learned
+first-row acceptance is at least 0.5. Extension rows size the window with their learned acceptance and are
+kept out of the draft calibration. `STRIX_MTP_NGRAM_FLOOR` and `STRIX_MTP_NGRAM_PRIOR` change the gate.
+The receipt's `mtp_ngram_draft` counts proposal cycles, extended cycles, extension rows and accepted rows.
+
+It helps requests that copy their context (correcting or editing a given document, code edits); on free
+prose, summaries and answers the gate stays closed and nothing changes. Cohort cycles do not use it.

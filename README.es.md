@@ -230,7 +230,13 @@ las filas de todas las peticiones, y cada petición produce exactamente los toke
 
 La decodificación es greedy salvo que `--mtp-sample-temperature` sea mayor que cero: el muestreo (top-k/top-p/min-p,
 semilla) mantiene los borradores MTP como propuestas especulativas y es reproducible para una semilla. Ver
-[docs/sampled-decoding.md](docs/sampled-decoding.md) (D-040).
+[docs/sampled-decoding.md](docs/sampled-decoding.md) (D-040). Las decisiones del muestreo se toman en la GPU por
+defecto (D-050).
+
+`--mtp-ngram-draft` deja que una continuación ya vista en el contexto prolongue una cadena de borradores que se cortó
+pronto, dentro de la misma ventana de verificación; paga en peticiones que copian su contexto (corregir un documento
+dado) y no se abre en las demás (D-047, opcional). `--dense-q6p-pack` lee copias de 6,5 bits de los pesos densos con
+los mismos bits que un checkpoint emulado de 6 bits (D-048, borrador hasta su decisión de velocidad y calidad).
 
 ## Cómo funciona
 
@@ -304,11 +310,12 @@ En curso, sin un orden concreto y sin números prometidos:
 - **Servidor HTTP** *(primera versión)*: `--http-serve` sirve chat/completions, completions y messages con streaming,
   con el tokenizador y la plantilla de chat del propio modelo (pensamiento sí/no, llamadas a herramientas), decodificación
   MTP y la caché de estado de prefijos entre peticiones. La salida en tokens es idéntica a la de la línea de comandos
-  ([docs/serving.md](docs/serving.md)). El muestreo y las peticiones en lote vienen después.- **Panel de monitorización**: vista en vivo de peticiones, velocidad y memoria.
+  ([docs/serving.md](docs/serving.md)). El muestreo y las peticiones en lote vienen después.
+- **Panel de monitorización**: vista en vivo de peticiones, velocidad y memoria.
 - **Varias peticiones a la vez**.
-- **Caché KV en int8**.
-- **Muestreo con decodificación especulativa** (hoy la decodificación es voraz).
-- **Pesos del tronco en 6 bits**.
+- **Caché KV en int8** *(opcional, D-046)*.
+- **Muestreo con decodificación especulativa** *(integrado, D-040; decisiones en la GPU, D-050)*.
+- **Pesos del tronco en 6 bits** *(borrador, D-048)*.
 
 ## Preguntas frecuentes
 

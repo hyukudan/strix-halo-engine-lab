@@ -1,6 +1,7 @@
 #include "strix/hip_gdn_launcher.hpp"
 #include "strix/hip_indexed_attention_launcher.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
+#include "strix/q6p_registry.hpp"
 
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -18,10 +19,11 @@
 #include <vector>
 
 // q8_rows engine sites against their R1 kernels, T = 1..8 and 16/32/64: bitwise payloads
-// (real and edge shapes, edge values), A8 error against the exact path, and with
-// STRIX_Q8_ROWS_BENCH=1 warm/cold timings at the model shapes, plus weight GB/s of
-// T = 8/16/32/64 at the prefill shapes. STRIX_Q8_ROWS_WIDE_ONLY=1 runs only the
-// T = 16/32/64 checks (and, with STRIX_Q8_ROWS_BENCH_ONLY=1, only the benchmark).
+// (real and edge shapes, edge values), Q6P32 copies against their Q8_0 tensors (exact and
+// dense A8 forms), A8 error against the exact path, and with STRIX_Q8_ROWS_BENCH=1
+// warm/cold timings at the model shapes, plus weight GB/s of T = 8/16/32/64 at the
+// prefill shapes. STRIX_Q8_ROWS_WIDE_ONLY=1 runs only the T = 16/32/64 checks (and, with
+// STRIX_Q8_ROWS_BENCH_ONLY=1, only the benchmark).
 namespace {
 using namespace strix;
 void require(bool value, const std::string& message) { if (!value) throw std::runtime_error(message); }
@@ -78,8 +80,9 @@ std::uint16_t bf16(float value) {
     return static_cast<std::uint16_t>(bits >> 16U);
 }
 // Flavors: 0 smooth finite, 1 edge scales/codes/BF16 bits (subnormal, signed
-// zero, extremes), 2 alternating +-127/-128 codes, 3 sparse NaN/Inf activations.
-std::vector<std::uint8_t> weights_bytes(std::uint32_t width, std::uint32_t outputs, unsigned flavor) {
+// zero, extremes), 2 alternating +-127/-128 codes (31/-32 for six-bit codes),
+// 3 sparse NaN/Inf activations.
+std::vector<std::uint8_t> weights_bytes(std::uint32_t width, std::uint32_t outputs, unsigned flavor, bool six_bit = false) {
     const auto blocks = static_cast<std::size_t>(width / 32U) * outputs;
     std::vector<std::uint8_t> result(blocks * 34U);
     constexpr std::array<std::uint16_t, 8> scales{0x0000, 0x8000, 0x0001, 0x8001, 0x0400, 0x8400, 0x2000, 0xa000};
@@ -88,7 +91,9 @@ std::vector<std::uint8_t> weights_bytes(std::uint32_t width, std::uint32_t outpu
         result[block * 34U] = static_cast<std::uint8_t>(scale & 0xffU);
         result[block * 34U + 1U] = static_cast<std::uint8_t>(scale >> 8U);
         for (std::size_t lane = 0; lane < 32U; ++lane) {
-            const int code = flavor == 2U ? (lane % 2U ? -128 : 127) : static_cast<int>((block * 7U + lane * 3U) % 29U) - 14;
+            const int code = flavor == 2U ? (lane % 2U ? (six_bit ? -32 : -128) : (six_bit ? 31 : 127)) :
+                six_bit && flavor == 1U ? static_cast<int>((block * 13U + lane * 5U) % 64U) - 32 :
+                static_cast<int>((block * 7U + lane * 3U) % 29U) - 14;
             result[block * 34U + 2U + lane] = static_cast<std::uint8_t>(static_cast<std::int8_t>(code));
         }
     }
@@ -123,8 +128,8 @@ struct Fixture {
             if (s == Site::shared_down) gate.push_back(std::make_unique<Buffer>(4U));
         }
     }
-    void prepare(unsigned flavor) const {
-        weights.upload(weights_bytes(width, outputs, flavor));
+    void prepare(unsigned flavor, bool six_bit = false) const {
+        weights.upload(weights_bytes(width, outputs, flavor, six_bit));
         for (unsigned r = 0; r < rows; ++r) {
             input[r]->upload(input_bytes(width, r, bf16_input(site), flavor));
             if (site == Site::shared_down) {
@@ -194,6 +199,44 @@ void exact_case(hipStream_t stream, Site site, unsigned rows, std::uint32_t widt
                     }
         }
         if (!flavor && rows > 1U) require(expected[0] != expected[1], "degenerate row fixture");
+        ++cases;
+    }
+}
+// Six-bit Q8_0 weights through their registered Q6P32 copy: the same bits as the
+// Q8_0 rows kernel. The Q8_0 tensor is poisoned before the Q6P32 run, so an
+// unregistered fallback cannot pass.
+// Q6P32 copy registered and the Q8_0 tensor poisoned: every launch that reads the copy (a registry hit)
+// must give the Q8_0 bits of its mode (exact or dense A8); launches that keep the Q8_0 tensor (exact VOPD
+// forms) count in `kept`.
+void q6_case(hipStream_t stream, Site site, unsigned rows, std::uint32_t width, std::uint32_t outputs, unsigned flavors,
+    std::uint32_t& cases, Mode mode = Mode::rows, std::uint32_t* kept = nullptr) {
+    Fixture f(site, rows, width, outputs);
+    Buffer q6(q6p::q6p32_bytes(outputs, width));
+    for (unsigned flavor = 0; flavor < flavors; ++flavor) {
+        f.prepare(flavor, true);
+        const auto expected = f.run(mode, stream);
+        const auto q8 = weights_bytes(width, outputs, flavor, true);
+        std::vector<std::uint8_t> packed(q6.bytes), back(q8.size());
+        require(q6p::to_q6p32(q8.data(), outputs, width, packed.data()), "six-bit fixture codes outside Q6P32");
+        q6p::to_q8_0(packed.data(), outputs, width, back.data());
+        require(back == q8, "Q6P32 host round trip");
+        q6.upload(packed);
+        f.weights.poison(stream);
+        q6p::register_tensor(reinterpret_cast<const void*>(f.weights.address),
+            {reinterpret_cast<const unsigned char*>(q6.address), outputs, width, q6p::Kind::q6p32});
+        const auto before = q6p::hits();
+        const auto actual = f.run(mode, stream);
+        const bool read = q6p::hits() != before;
+        q6p::clear();
+        if (!read) {
+            require(kept != nullptr, std::string(name(site)) + " rows=" + std::to_string(rows) + ": Q6P32 copy not read");
+            ++*kept;
+            continue;
+        }
+        for (unsigned r = 0; r < rows; ++r)
+            require(expected[r] == actual[r], std::string(name(site)) + (mode == Mode::rows_a8 ? " dense A8" : "") + " Q6P32 rows=" + std::to_string(rows) + " width=" +
+                std::to_string(width) + " outputs=" + std::to_string(outputs) + " flavor=" + std::to_string(flavor) +
+                ": row " + std::to_string(r) + " differs from Q8_0");
         ++cases;
     }
 }
@@ -343,6 +386,24 @@ int main() try {
     std::uint32_t wide = 0;
     wide_cases(stream, wide);
     std::cout << "q8_rows T=16/32/64 payloads equal the R1 kernels bitwise: " << wide << " cases\n";
+    std::uint32_t q6_cases = 0, q6_kept = 0, q6_a8 = 0;
+    for (const auto site : sites)
+        for (const unsigned rows : {1U, 2U, 3U, 4U, 8U}) {
+            if (rows == 3U && site != Site::gdn_input && site != Site::gdn_output) continue;
+            const auto [width, outputs] = model_shape(site);
+            q6_case(stream, site, rows, width, outputs, 4U, q6_cases, Mode::rows, &q6_kept);
+            for (const std::uint32_t w : {32U, 96U, 288U, 640U}) for (const std::uint32_t o : {1U, 7U, 33U})
+                q6_case(stream, site, rows, w, o, 3U, q6_cases, Mode::rows, &q6_kept);
+            if (bf16_input(site) && rows >= 4U) q6_case(stream, site, rows, 2400U, 5003U, 2U, q6_cases, Mode::rows, &q6_kept);
+            if (rows == 3U) continue;
+            // Dense A8 (widths of whole 64-feature block pairs): LDS-staged and slot forms.
+            q6_case(stream, site, rows, width, outputs, 3U, q6_a8, Mode::rows_a8);
+            for (const std::uint32_t w : {64U, 320U, 640U}) for (const std::uint32_t o : {1U, 7U, 33U})
+                q6_case(stream, site, rows, w, o, 2U, q6_a8, Mode::rows_a8);
+            if (bf16_input(site)) q6_case(stream, site, rows, 2432U, 5003U, 2U, q6_a8, Mode::rows_a8);
+        }
+    std::cout << "q8_rows Q6P32 payloads equal their Q8_0 tensors bitwise: " << q6_cases << " exact cases (" << q6_kept
+              << " launches kept the Q8_0 tensor), " << q6_a8 << " dense A8 cases\n";
     for (const auto site : sites)
         for (const unsigned rows : {1U, 2U, 4U, 8U}) {
             const auto [width, outputs] = model_shape(site);
@@ -365,7 +426,16 @@ int main() try {
                     Fixture f(site, rows, width, outputs); f.prepare(0);
                     std::cout << "  T=" << rows << " R1 x T " << median_us(f, Mode::row_loop, cold, flush, stream)
                               << "  rows " << median_us(f, Mode::rows, cold, flush, stream)
-                              << "  rows-A8 " << median_us(f, Mode::rows_a8, cold, flush, stream) << '\n';
+                              << "  rows-A8 " << median_us(f, Mode::rows_a8, cold, flush, stream);
+                    Buffer q6(q6p::q6p32_bytes(outputs, width));
+                    std::vector<std::uint8_t> packed(q6.bytes);
+                    f.prepare(0, true);
+                    require(q6p::to_q6p32(weights_bytes(width, outputs, 0, true).data(), outputs, width, packed.data()), "bench Q6P32");
+                    q6.upload(packed);
+                    q6p::register_tensor(reinterpret_cast<const void*>(f.weights.address),
+                        {reinterpret_cast<const unsigned char*>(q6.address), outputs, width, q6p::Kind::q6p32});
+                    std::cout << "  rows-Q6P32 " << median_us(f, Mode::rows, cold, flush, stream) << '\n';
+                    q6p::clear();
                 }
             }
         wide_bench(stream);

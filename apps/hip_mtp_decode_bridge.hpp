@@ -36,6 +36,7 @@
 #include <iomanip>
 #include <stdexcept>
 #include <utility>
+#include <cstdlib>
 
 namespace strix::decode_cli {
 // Serving (--http-serve): after the calibration replay the bridge hands a request runner to the
@@ -609,6 +610,13 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
         if(window && !qualify)greedy.use_window_verifier(window);
         if(m.draft_chain)greedy.set_draft_min_probability(mtp_draft_min_probability(m));
+        if(m.ngram_draft && !qualify) {
+            // STRIX_MTP_NGRAM_FLOOR / STRIX_MTP_NGRAM_PRIOR tune the gate (defaults 0.5 / 0.2).
+            MtpNgramDraftConfig ngram;
+            if(const char* v=std::getenv("STRIX_MTP_NGRAM_FLOOR"))ngram.floor=std::strtod(v,nullptr);
+            if(const char* v=std::getenv("STRIX_MTP_NGRAM_PRIOR"))ngram.prior=std::strtod(v,nullptr);
+            greedy.enable_ngram_draft(options.tokens,ngram);
+        }
         if(qualify){
             MtpDecodeQualificationContext context{options,parents,native,target,std::move(window),session,dispatcher,generations,greedy,*runtime,std::move(pending)};
             qualify(context);
@@ -734,6 +742,12 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"  \"mtp_draft_chain\":"<<(m.draft_chain?"true":"false")<<",\n"
             <<"  \"mtp_draft_exact_kernels\":"<<(m.draft_exact?"true":"false")<<",\n"
             <<"  \"mtp_draft_q4_head\":"<<(m.draft_q4?"true":"false")<<",\n"
+            <<"  \"mtp_ngram_draft\":"<<[&]{
+                const auto* s=greedy.ngram_stats();
+                if(!s) return std::string("null");
+                return "{\"proposal_cycles\":"+std::to_string(s->cycles)+",\"extended_cycles\":"+std::to_string(s->extended_cycles)+
+                    ",\"extension_rows\":"+std::to_string(s->extension_rows)+",\"accepted_rows\":"+std::to_string(s->accepted_rows)+"}";
+            }()<<",\n"
             <<"  \"mtp_draft_head_rows\":"<<draft_stats.rows<<",\n  \"mtp_draft_base_rows\":"<<draft_stats.base_rows<<",\n"
             <<"  \"mtp_draft_context_rows\":"<<draft_stats.context_rows<<",\n  \"mtp_draft_context_dropped\":"<<draft_stats.context_dropped<<",\n"
             <<"  \"sampling\":"<<mtp_sampling_receipt(m,sampler.get())<<",\n"

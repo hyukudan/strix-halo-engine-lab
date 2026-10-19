@@ -130,6 +130,8 @@ struct MtpCliOptions {
     bool window_prefix=false;
     // Draft-only head/chain controls: they change acceptance, never target output.
     bool draft_chain=false,draft_exact=false,draft_q4=false;
+    // Context n-gram extension of the draft chain inside the verify windows (greedy only).
+    bool ngram_draft=false;
     std::string draft_vocab;
     std::uint32_t draft_context_vocab=0;
     // Tiled MTP prompt (--known-prefix-window with the tiled prefill): the golden covers only the
@@ -277,6 +279,8 @@ struct Options {
     std::vector<std::uint32_t> logprob_token_ids;
     bool teacher_forced_score = false;
     std::string teacher_logits_path;
+    // Dense Q6P32 pack of an emulated checkpoint (strix/hip_q6p_pack.hpp).
+    std::string dense_q6p_pack_path;
     bool known_prefix_expert_union = false;
     // Router + combine/inject rows entries in the known-prefix or MTP window.
     bool known_window_router_rows = false;
@@ -664,6 +668,7 @@ inline void validate_http_serve(const Options& o) {
     if (!mtp_tiled_prompt(o) || !o.mtp.golden_dump.empty() || o.mtp.metadata_only)
         throw std::invalid_argument("--http-serve requires the tiled MTP route (--mtp with a calibration golden, "
             "--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T)");
+    if (o.mtp.ngram_draft) throw std::invalid_argument("--http-serve does not run --mtp-ngram-draft");
     if (o.http_port > 65535U || o.http_bind.empty() || o.http_model_id.empty() || !o.http_default_max_tokens ||
         !o.http_max_queue || !o.http_max_connections || (o.http_sampling != "greedy" && o.http_sampling != "reject"))
         throw std::invalid_argument("--http-* values: port <= 65535, non-empty bind/model id, positive limits, sampling greedy|reject");
@@ -957,6 +962,8 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
         throw std::invalid_argument("MTP window QSA rows and prefix acceptance require an actual target window");
     if((!m.draft_vocab.empty() || m.draft_context_vocab || m.draft_exact || m.draft_q4) && !m.draft_chain)
         throw std::invalid_argument("MTP draft vocabulary options require --mtp-draft-chain");
+    if(m.ngram_draft && (!m.draft_chain || !m.window_rows || !m.window_prefix || m.sample_options || m.metadata_only || !m.cohort.empty()))
+        throw std::invalid_argument("--mtp-ngram-draft requires --mtp-draft-chain, prefix target windows, greedy selection and one request");
     if(m.draft_q4 && m.draft_vocab.empty() && !m.draft_context_vocab)
         throw std::invalid_argument("MTP draft Q4 head requires a draft vocabulary subset");
     if(m.sample_options) {
@@ -1008,10 +1015,10 @@ inline Options parse_options(
     if (argc < 2) {
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
-            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX (--mtp-golden FILE --mtp-golden-sha256 HEX | --mtp-golden-dump FILE) [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE[,FILE...]|auto:DIR] [--mtp-draft-context-vocab N] [--mtp-draft-exact] [--mtp-draft-q4]] (explicit source/conversion/cast/budget options required)] "
+            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX (--mtp-golden FILE --mtp-golden-sha256 HEX | --mtp-golden-dump FILE) [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE[,FILE...]|auto:DIR] [--mtp-draft-context-vocab N] [--mtp-draft-exact] [--mtp-draft-q4] [--mtp-ngram-draft]] (explicit source/conversion/cast/budget options required)] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1] [--prefill-numerical-profile NAME] "
-            "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] "
+            "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] [--dense-q6p-pack PATH] "
             "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--attention-kv-storage bf16|kv-int8-tok-v1] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-window-router-rows] [--known-prefix-prefill-rows 16..2048 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N [--unqualified-context]] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert|experts --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
@@ -1061,6 +1068,17 @@ inline Options parse_options(
                 if (!bytes) throw std::invalid_argument("model copy budgets must be positive");
                 *target = bytes;
             }
+            continue;
+        }
+        if (argument == "--dense-q6p-pack" || argument.starts_with("--dense-q6p-pack=")) {
+            if (!options.dense_q6p_pack_path.empty())
+                throw std::invalid_argument("duplicate dense Q6P32 pack option");
+            const auto value = argument == "--dense-q6p-pack" ?
+                (index + 1 < argc ? std::string_view(argv[++index]) : std::string_view{}) :
+                argument.substr(std::string_view("--dense-q6p-pack=").size());
+            if (value.empty() || value.starts_with("--"))
+                throw std::invalid_argument("dense Q6P32 pack requires a nonempty path");
+            options.dense_q6p_pack_path = value;
             continue;
         }
         if (argument == "--teacher-logits-file" || argument.starts_with("--teacher-logits-file=")) {
@@ -1150,6 +1168,10 @@ inline Options parse_options(
         if(argument=="--mtp-draft-chain") {
             if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
             options.mtp.supplied=true;options.mtp.draft_chain=true;continue;
+        }
+        if(argument=="--mtp-ngram-draft") {
+            if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
+            options.mtp.supplied=true;options.mtp.ngram_draft=true;continue;
         }
         if(argument=="--mtp-draft-q4") {
             if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");

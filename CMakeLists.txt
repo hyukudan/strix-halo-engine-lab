@@ -149,6 +149,7 @@ add_library(strix_core STATIC
     src/indexed_attention_workspace.cpp
     src/indexed_attention_state.cpp
     src/iq4_nl.cpp
+    src/q6p_registry.cpp
     src/launch_dispatch.cpp
     src/low_precision.cpp
     src/memory_plan.cpp
@@ -157,6 +158,7 @@ add_library(strix_core STATIC
     src/mtp_draft_binding.cpp
     src/mtp_draft_contract.cpp
     src/mtp_draft_qualification.cpp
+    src/mtp_ngram_draft.cpp
     src/mtp_draft_tensor_audit.cpp
     src/mtp_draft_state_contract.cpp
     src/mtp_draft_state_memory.cpp
@@ -1139,6 +1141,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-mtp-draft-cycle-input-tests)
     add_test(NAME strix-mtp-draft-cycle-input-tests COMMAND strix-mtp-draft-cycle-input-tests)
 
+    add_executable(strix-mtp-ngram-draft-tests tests/mtp_ngram_draft_tests.cpp)
+    target_link_libraries(strix-mtp-ngram-draft-tests PRIVATE strix_core)
+    strix_target_warnings(strix-mtp-ngram-draft-tests)
+    add_test(NAME strix-mtp-ngram-draft-tests COMMAND strix-mtp-ngram-draft-tests)
+
     add_executable(strix-mtp-draft-activation-tests tests/mtp_draft_activation_tests.cpp)
     target_link_libraries(strix-mtp-draft-activation-tests PRIVATE strix_core)
     strix_target_warnings(strix-mtp-draft-activation-tests)
@@ -1401,6 +1408,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 
     add_library(strix_hip_runtime STATIC
         src/hip_host_upload_backend.cpp
+        src/hip_q6p_pack.cpp
         src/hip_runtime_allocator.cpp
         src/hip_sampled_target_logits_reader.cpp
         src/hip_session_snapshot_transfer.cpp
@@ -1418,6 +1426,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_mtp_target_checkpoint.hip
         src/hip_mtp_window_verifier.hip
         src/hip_token_sampling.hip
+        src/hip_token_sampling_device.hip
         src/hip_mtp_target_hidden.hip
         src/hip_mtp_greedy_runtime.hip
         src/hip_mtp_asset_loader.hip
@@ -1936,6 +1945,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
         target_compile_options(strix-hip-dense-a8-wmma-tests PRIVATE
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        # hip_q8_rows_gemv.hpp reads the Q6P32 registry (strix/q6p_registry.hpp).
+        target_link_libraries(strix-hip-dense-a8-wmma-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-dense-a8-wmma-tests)
         add_test(NAME strix-hip-dense-a8-wmma-tests COMMAND strix-hip-dense-a8-wmma-tests)
 
@@ -1987,6 +1998,13 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-known-window-tests)
         add_test(NAME strix-hip-known-window-tests COMMAND strix-hip-known-window-tests)
+        add_executable(strix-hip-token-sampling-device-tests tests/hip_token_sampling_device_tests.hip)
+        set_target_properties(strix-hip-token-sampling-device-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-token-sampling-device-tests PRIVATE strix_hip_runtime)
+        target_compile_options(strix-hip-token-sampling-device-tests PRIVATE -mno-wavefrontsize64)
+        strix_target_warnings(strix-hip-token-sampling-device-tests)
+        add_test(NAME strix-hip-token-sampling-device-tests COMMAND strix-hip-token-sampling-device-tests)
         add_test(NAME strix-hip-known-window-hc-persistent-tests COMMAND strix-hip-known-window-tests --hc-rows)
         set_tests_properties(strix-hip-known-window-hc-persistent-tests PROPERTIES ENVIRONMENT "STRIX_HC_PERSISTENT=1;STRIX_HC_PERSISTENT_INJECT=1")
         add_test(NAME strix-hip-known-window-fold-tests COMMAND strix-hip-known-window-tests --window-folds)

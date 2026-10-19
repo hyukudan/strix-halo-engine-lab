@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/hip_mtp_runtime.hpp"
+#include "strix/mtp_ngram_draft.hpp"
 namespace strix {
 class HipMtpWindowVerifier;
 class HipKnownPrefixWindow;
@@ -35,6 +36,11 @@ public:
     // Draft chains stop after the first draft below this max softmax probability
     // (0 = full depth); the verifier receives every draft probability.
     void set_draft_min_probability(float);
+    // Context n-gram extension of the draft chain (strix/mtp_ngram_draft.hpp): `prompt` is the request's
+    // prompt. Needs the window verifier and greedy selection; set before the first cycle. Cohort cycles
+    // (begin_cycle_draft without the cost model) do not use it.
+    void enable_ngram_draft(std::span<const std::uint32_t> prompt,MtpNgramDraftConfig config={});
+    [[nodiscard]] const MtpNgramDraftStats* ngram_stats() const noexcept;
     // Prime source positions in order with actual next prompt tokens. The last
     // prompt row is reserved for begin/cycle with its actual target prediction.
     void prime_prompt(std::span<const HipMtpReplayRow>);

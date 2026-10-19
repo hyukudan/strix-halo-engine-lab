@@ -172,7 +172,7 @@ struct HipKnownPrefixWindow::Impl {
     DeferredMoeFirstError completion_status{};
     bool failed = false;
     std::uint32_t active_rows = 0; // execute_mtp_captured: rows in the expert union (0 = every row)
-    HipKnownPrefixWindow::PrefillStepObserver prefill_observer;
+    HipKnownPrefixWindow::PrefillStepObserver prefill_observer,window_observer;
     // Set while a cohort executes this owner's window: its routed union ran on the cohort primary.
     bool cohort_member = false;
 
@@ -872,6 +872,11 @@ struct HipKnownPrefixWindow::Impl {
         head_config.hidden_size=u32(model.hidden_size); head_config.vocab_size=u32(model.vocab_size);
         head_config.input=config.activation; head_config.virtual_q8_wave=config.virtual_q8_lm_head;
         head_config.prefetch_q8_wave=config.prefetch_q8_lm_head; head_config.wave8_q8_wave=config.wave8_q8_lm_head;
+        // STRIX_LM_HEAD_ROWS_LEAN=1|2: lean rows head (1 or 2 logits per wave) with the greedy
+        // partials fused (STRIX_LM_HEAD_ROWS_GREEDY=0 keeps the separate greedy pass).
+        static const std::uint32_t lean=[]{const char* v=std::getenv("STRIX_LM_HEAD_ROWS_LEAN");
+            return v&&(v[0]=='1'||v[0]=='2')?static_cast<std::uint32_t>(v[0]-'0'):0U;}();
+        head_config.rows_lean=lean;
         const auto variant=window.logical_rows==2U?KnownWindowR2Variant::lm_head_q8_prefetch8_rows2_v1:
             window.logical_rows==4U?KnownWindowR2Variant::lm_head_q8_prefetch8_rows4_v1:KnownWindowR2Variant::lm_head_q8_prefetch8_rows8_v1;
         rows_entries.push_back({variant,this,
@@ -880,6 +885,11 @@ struct HipKnownPrefixWindow::Impl {
             },
             [](std::span<const ExecutionDispatchContext> rows,void* object) {
                 const auto& self=*static_cast<Impl*>(object);
+                static const bool fused=[]{const char* v=std::getenv("STRIX_LM_HEAD_ROWS_GREEDY");return !v||v[0]!='0';}();
+                if(self.greedy_replies && self.head_config.rows_lean && fused) {
+                    lm_head_known_window_rows_launch_greedy(rows,self.head_config,self.greedy_partials,self.greedy_replies);
+                    return;
+                }
                 lm_head_known_window_rows_launch(rows,self.head_config);
                 if(!self.greedy_replies) return;
                 std::array<ExecutionBufferAddress,hip_greedy_rows_max> logits{};
@@ -1441,6 +1451,7 @@ struct HipKnownPrefixWindow::Impl {
             hooks.preflight_memo=&preflight_memo;hooks.recipe_memo=&recipe_memo;hooks.preflight_slots=&preflight_slots;
             hooks.arena_index=&arena_index;
             if(prefill) hooks.after_step=prefill_observer;
+            else if(window_observer) hooks.after_step=window_observer;
             const auto first_position=session.next_position;
             auto result=prefill ? execute_known_prefix_prefill_eager(*prefill,serial,resources,scratch,session,tokens,
                 launch_plans.front(),r2_entries,rows_entries,hooks,prefill_entries) :
@@ -1519,6 +1530,9 @@ HipMtpTargetWindowExecution HipKnownPrefixWindow::execute_mtp_captured(SerialSes
         ~ActiveRows(){value=0;}
     } scoped(impl_->active_rows,active_rows==logical_rows()?0U:active_rows);
     HipMtpTargetWindowExecution out;out.execution=impl_->execute(session,tokens,before_publish,capture,&out.batch);return out;
+}
+void HipKnownPrefixWindow::set_window_step_observer(PrefillStepObserver observer) {
+    impl_->window_observer=std::move(observer);
 }
 void HipKnownPrefixWindow::set_prefill_step_observer(PrefillStepObserver observer) {
     if(!impl_->prefill || impl_->executing || impl_->failed)
