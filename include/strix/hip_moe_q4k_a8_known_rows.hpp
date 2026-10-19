@@ -86,7 +86,9 @@ void enqueue_prefill_prologue(const Request&, const PrefillRows&, unsigned rows,
 // commits. Summary histograms count n>=8 in their last bucket. form 1 runs gate/up and down
 // as iu8 WMMA kernels over batches of <= 16 assignments (CSR from a parallel builder), form 0
 // the dot4 kernels, -1 picks by STRIX_PREFILL_MOE_WMMA (default WMMA); form 2 (tests) is form 1
-// with the serial CSR builder. Every output byte is identical across forms.
+// with the serial CSR builder. Every output byte is identical across forms. A non-finite gate/up
+// value of a (row, slot) sets status bit 8 in its row and in the summary: gate/up still runs every
+// batch (the bytes it writes do not depend on CTA order), the down is skipped.
 void enqueue_prefill(const Request&, const PrefillRows&, unsigned rows, unsigned clear_words,
     const unsigned char* gate, const unsigned char* up, unsigned down_type, const unsigned char* down_weights, hipStream_t,
     int form = -1);
