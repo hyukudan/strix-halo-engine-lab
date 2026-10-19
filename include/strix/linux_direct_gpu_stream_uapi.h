@@ -212,9 +212,10 @@ struct sgu_sync_file {
  * mandatory. It does NOT reset the NHI, retrain the cable, or certify the peer.
  * Success returns the unimported identity in fence and SESSION_RECOVERED.
  * Blocking SUBMIT/RX_REPOST waits for foreign fences without holding the
- * device mutex; O_NONBLOCK returns EAGAIN without publishing/enqueuing, both
- * for an unsignalled dependency and for a contended device mutex. It still
- * takes the short internal context and reservation locks. */
+ * device mutex; O_NONBLOCK returns EAGAIN without publishing/enqueuing, for an
+ * unsignalled dependency and for a contended device, reservation or DMA
+ * submission mutex (held by the watchdog while it stops the rings). Only the
+ * context spinlock is still taken. */
 
 /* Experimental numbers local to this opt-in device mode, not allocated stock
  * USB4STREAM ioctls. Exact command/size is checked; unknown commands fail. */
