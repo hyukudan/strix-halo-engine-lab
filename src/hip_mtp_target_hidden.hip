@@ -356,6 +356,11 @@ void HipMtpTargetHidden::set_token_sampler(std::shared_ptr<TokenSampler> sampler
     if(i.busy || i.failed || i.sampler) throw std::invalid_argument("MTP target token sampler is set once on an idle producer");
     i.sampler=std::move(sampler);
 }
+void HipMtpTargetHidden::replace_token_sampler(std::shared_ptr<TokenSampler> sampler) {
+    auto& i=*impl_;
+    if(i.busy || i.failed) throw std::invalid_argument("MTP target token sampler changes only on an idle healthy producer");
+    i.sampler=std::move(sampler);
+}
 std::shared_ptr<TokenSampler> HipMtpTargetHidden::token_sampler() const noexcept {return impl_->sampler;}
 HipMtpTargetHiddenTicket HipMtpTargetHidden::adopt_prefill_row(const SerialSessionContext& session,
     std::uint32_t token,MtpDeviceView hidden,std::span<const float> logits) {
@@ -381,6 +386,8 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::adopt_prefill_row(const SerialSessi
     lease->content=i.weights->binding().model_content_identity;
     lease->producer=session.execution_identity;lease->block_begin=last->begin;
     lease->predicted=select_greedy_token(logits,i.model->vocab_size);
+    // Sampled decoding: the block's last row selects through the sampler, as a final serial row would.
+    if(i.sampler) lease->predicted=i.sampler->decide(logits,session.next_position,nullptr).token;
     i.busy=true;
     try {
         check(hipMemcpyAsync(reinterpret_cast<void*>(slot->view.address),reinterpret_cast<const void*>(hidden.address),

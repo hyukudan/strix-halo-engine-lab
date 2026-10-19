@@ -69,6 +69,8 @@ public:
     [[nodiscard]] bool drafting() const noexcept;
     [[nodiscard]] std::span<const std::uint32_t> drafted_candidates() const noexcept;
     [[nodiscard]] std::span<const float> drafted_probabilities() const noexcept;
+    // Sampled decoding: the distribution of every drafted candidate (empty when the target selects first-max).
+    [[nodiscard]] std::span<const TokenDraft> drafted_distributions() const noexcept;
     [[nodiscard]] HipMtpGreedyCycleResult finish_cycle(const HipMtpTargetHiddenTicket& initial_target,
         HipMtpVerifiedTargetRows verified,std::uint32_t token_budget,std::span<const std::uint32_t> eos_tokens);
     void fail_cycle() noexcept;

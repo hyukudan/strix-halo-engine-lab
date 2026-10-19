@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -18,6 +19,7 @@ struct SamplingParameters {
     double temperature = 0.0; // 0 = greedy (exact)
     double top_p = 1.0;
     std::uint32_t top_k = 0;
+    double min_p = 0.0;
     std::uint64_t seed = 0;
     bool seeded = false;
 };
@@ -76,6 +78,14 @@ private:
     std::atomic<bool> cancelled_{false};
 };
 
+// A job taken by a batching engine (GenerationQueue::take). on_tokens already publishes into the
+// ticket; the engine reports the end with GenerationQueue::finish.
+struct TakenJob {
+    GenerationJob job;
+    std::shared_ptr<GenerationTicket> ticket;
+    std::chrono::steady_clock::time_point submitted, started;
+};
+
 struct QueueSnapshot {
     std::uint64_t queued = 0, running = 0, completed = 0, failed = 0, cancelled = 0;
     std::uint64_t prompt_tokens = 0, cached_tokens = 0, generated_tokens = 0;
@@ -90,6 +100,14 @@ public:
     std::shared_ptr<GenerationTicket> submit(GenerationJob job);
     // Runs jobs until shutdown(); `observe` (optional) sees every finished job's stats.
     void run(GenerationEngine& engine, const std::function<void(const GenerationStats&)>& observe = {});
+    // Batching engines, which decode several jobs at once and take new ones between steps instead of
+    // run(): the oldest job that is not cancelled, waiting for one when `wait` (nullopt when none is
+    // queued, or after shutdown). Jobs cancelled while queued are finished here.
+    std::optional<TakenJob> take(bool wait);
+    // The end of a taken job: fills queue_ms, updates the totals and finishes its ticket.
+    void finish(TakenJob& job, GenerationStats stats, std::string error = {},
+        const std::function<void(const GenerationStats&)>& observe = {});
+    [[nodiscard]] bool stopping() const;
     void shutdown();
     [[nodiscard]] QueueSnapshot snapshot() const;
 private:

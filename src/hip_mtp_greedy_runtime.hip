@@ -204,6 +204,9 @@ std::uint32_t HipMtpGreedyRuntime::begin_cycle_draft(const HipMtpTargetHiddenTic
     return depth;
 }
 std::span<const std::uint32_t> HipMtpGreedyRuntime::drafted_candidates() const noexcept {return impl_->candidates;}
+std::span<const TokenDraft> HipMtpGreedyRuntime::drafted_distributions() const noexcept {
+    const auto& i=*impl_;return i.target->token_sampler()?i.mtp->sampled_drafts():std::span<const TokenDraft>{};
+}
 std::span<const float> HipMtpGreedyRuntime::drafted_probabilities() const noexcept {return impl_->probabilities;}
 bool HipMtpGreedyRuntime::drafting() const noexcept {return impl_->busy;}
 HipMtpWindowVerifier* HipMtpGreedyRuntime::window_verifier() const noexcept {return impl_->window.get();}
@@ -382,7 +385,7 @@ std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(std::span<const
             for(const auto& x:g) {
                 const auto& c=members[x.member];auto& r=*c.runtime;
                 requests.push_back({r.window_verifier(),&r.target_session(),c.initial,r.drafted_candidates(),
-                    r.drafted_probabilities(),c.budget,c.eos,x.rows});
+                    r.drafted_probabilities(),c.budget,c.eos,x.rows,r.drafted_distributions()});
             }
             auto verified=HipMtpWindowVerifier::verify_cohort(requests,*primary);
             for(std::size_t k=0;k<g.size();++k) {
@@ -395,7 +398,7 @@ std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(std::span<const
         for(const auto& x:solo) {
             const auto& c=members[x.member];auto& r=*c.runtime;
             auto verified=r.window_verifier()->verify(r.target_session(),r.target_dispatcher(),*c.initial,r.drafted_candidates(),
-                c.budget,c.eos,r.drafted_probabilities());
+                c.budget,c.eos,r.drafted_probabilities(),r.drafted_distributions());
             out[x.member]=r.finish_cycle(*c.initial,std::move(verified),c.budget,c.eos);
             open[x.member]=false;
             if(stats)++stats->solo_windows;
