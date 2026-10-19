@@ -653,9 +653,18 @@ void KnownWindowRun::launch_step(std::size_t i) {
     const auto& step = serial.execution.steps[i];
     if (!result.execution.state.contains(step.reads_state))
         throw std::logic_error("known window persistent state disappeared after admission");
+    // Diagnostic observer (KnownWindowExecutionHooks::after_step): called after the step was enqueued with
+    // its per-row contexts. Absent in production.
+    const auto observe = [&] {
+        if (!hooks.after_step) return;
+        hooks.after_step(i, [&](std::uint32_t row) {
+            if (row >= rows) throw std::invalid_argument("known window observer row is outside the window");
+            return contexts[i][row]; });
+    };
     if (hooks.before_step && (selected[i] || selected_rows[i]) && hooks.before_step(i, contexts)) {
         const auto width = selected_rows[i] ? rows : 2U;
         for (std::uint32_t first = 0; first < rows; first += width) st.record_promoted(i, width);
+        observe();
         return;
     }
     if (hooks.before_step && !selected[i] && !selected_rows[i]) (void)hooks.before_step(i, contexts);
@@ -679,6 +688,7 @@ void KnownWindowRun::launch_step(std::size_t i) {
             else selected[i]->launch(std::span<const ExecutionDispatchContext,2>(contexts[i].data()+first,2U),selected[i]->config);
             st.record_promoted(i, width);
         }
+        observe();
         return;
     }
     for (std::size_t r = 0; r < rows; ++r) {
@@ -710,6 +720,7 @@ void KnownWindowRun::launch_step(std::size_t i) {
         result.execution.completion_order.push_back(step.id);
         result.execution.state.publish_write(step.writes_state);
     }
+    observe();
 }
 
 void KnownWindowRun::record_external_step(std::size_t i) {

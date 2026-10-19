@@ -753,6 +753,49 @@ std::vector<std::uint16_t> rows_input(std::uint32_t r, std::uint32_t width, unsi
     return bits;
 }
 
+strix::HipGreedyRowsReply greedy_oracle(const std::vector<float>& logits);
+strix::ExecutionBufferAddress buffer_view(std::uintptr_t address, std::uint64_t bytes);
+
+// Lean rows kernels (1 and 2 logits per wave) against the same R1 words, and their fused
+// greedy partials against the CPU first-max oracle over those words.
+void run_lean_rows(RowsHead& f, const std::vector<std::vector<std::uint32_t>>& reference) {
+    const auto rows = f.rows, vocab = f.vocab;
+    const auto partial_bytes = strix::hip_greedy_rows_scratch_bytes(rows, vocab);
+    void* partials = nullptr;
+    check(hipMalloc(&partials, partial_bytes), "allocate lean greedy partials");
+    strix::HipGreedyRowsReply* replies = nullptr;
+    check(hipHostMalloc(reinterpret_cast<void**>(&replies), rows * sizeof(*replies), hipHostMallocMapped | hipHostMallocCoherent),
+        "allocate lean greedy replies");
+    for (const std::uint32_t lean : {1U, 2U}) {
+        auto config = f.config; config.rows_lean = lean;
+        for (const bool greedy : {false, true}) {
+            f.poison();
+            std::fill(replies, replies + rows, strix::HipGreedyRowsReply{0xffffffffU, 0xffffffffU});
+            check(hipMemset(partials, 0xff, partial_bytes), "poison lean greedy partials");
+            f.scoped([&] {
+                if (greedy) strix::lm_head_known_window_rows_launch_greedy(f.contexts, config,
+                    buffer_view(reinterpret_cast<std::uintptr_t>(partials), partial_bytes), replies);
+                else strix::lm_head_known_window_rows_launch(f.contexts, config);
+            });
+            const auto candidate = f.read();
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                expect(std::equal(reference[r].begin(), reference[r].begin() + vocab, candidate[r].begin()),
+                    "lean multi-row LM head equals every R1 logit word of its row");
+                expect(std::all_of(candidate[r].begin() + vocab, candidate[r].end(), [](auto w) { return w == 0xffffffffU; }),
+                    "lean multi-row LM head preserves each row's destination tail");
+                if (!greedy) continue;
+                std::vector<float> logits(vocab);
+                std::memcpy(logits.data(), reference[r].data(), vocab * 4ULL);
+                const auto expected = greedy_oracle(logits);
+                expect(replies[r].token == expected.token && replies[r].status == expected.status,
+                    "fused greedy row matches the first-max finite oracle of the R1 logits");
+            }
+        }
+    }
+    check(hipHostFree(replies), "free lean greedy replies");
+    check(hipFree(partials), "free lean greedy partials");
+}
+
 void run_rows_case(std::uint32_t rows, std::uint32_t width, std::uint32_t vocab, unsigned pattern, bool wave8 = true) {
     RowsHead f(rows, width, vocab, wave8);
     f.upload_weights(rows_weights(vocab, width, pattern));
@@ -770,6 +813,7 @@ void run_rows_case(std::uint32_t rows, std::uint32_t width, std::uint32_t vocab,
                 "multi-row LM head preserves each row's destination tail");
         }
     }
+    if (width % 256U == 0U && rows * width * 2U <= 48U * 1024U) run_lean_rows(f, reference);
 }
 
 void rows_rejections() {
@@ -909,7 +953,7 @@ void bench_rows() {
     check(hipHostMalloc(reinterpret_cast<void**>(&replies), 8U * sizeof(*replies), hipHostMallocMapped | hipHostMallocCoherent),
         "allocate bench replies");
     std::cout << "LM_HEAD_ROWS_BENCH shape=" << vocab << "x" << width << " q8_0 median_of=25\n";
-    for (const std::uint32_t rows : {2U, 4U, 8U}) {
+    for (const std::uint32_t rows : {2U, 4U, 6U, 8U}) {
         const std::span<const strix::ExecutionDispatchContext> c(f.contexts.data(), rows);
         f.poison(); f.window(c);
         const auto candidate = f.read();
@@ -925,6 +969,20 @@ void bench_rows() {
                 buffer_view(reinterpret_cast<std::uintptr_t>(partials), partial_bytes), replies, f.stream); });
         std::cout << "T=" << rows << " r1_one_ms=" << one << " r1_loop_ms=" << loop << " rows_ms=" << multi
                   << " speedup=" << loop / multi << " rows_over_one=" << multi / one << " greedy_rows_ms=" << greedy << '\n';
+        for (const std::uint32_t lean : {1U, 2U}) {
+            if (rows <= 4U) break;
+            auto config = f.config; config.rows_lean = lean;
+            const auto view = buffer_view(reinterpret_cast<std::uintptr_t>(partials), partial_bytes);
+            const auto plain = median_ms(f.stream, [&] { f.scoped([&] { strix::lm_head_known_window_rows_launch(c, config); }); });
+            const auto fused = median_ms(f.stream, [&] {
+                f.scoped([&] { strix::lm_head_known_window_rows_launch_greedy(c, config, view, replies); }); });
+            const auto words = f.read();
+            for (std::uint32_t r = 0; r < rows; ++r)
+                expect(std::equal(reference[r].begin(), reference[r].begin() + vocab, words[r].begin()),
+                    "real-shape lean LM head equals every R1 logit word");
+            std::cout << "T=" << rows << " lean=" << lean << " rows_ms=" << plain << " fused_greedy_ms=" << fused
+                      << " vs_rows_plus_greedy=" << (multi + greedy) / fused << '\n';
+        }
     }
     check(hipHostFree(replies), "free bench replies");
     check(hipFree(partials), "free bench partials");

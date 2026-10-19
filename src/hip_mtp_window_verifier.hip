@@ -7,6 +7,9 @@
 #include "strix/session_state_memory.hpp"
 #include "strix/hip_generation_output.hpp"
 #include "strix/hip_token_sampling.hpp"
+#include "strix/dispatch_resources.hpp"
+#include <functional>
+#include <vector>
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <cstdint>
@@ -173,6 +176,26 @@ struct HipMtpWindowVerifier::Impl {
             if(env_number("STRIX_MTP_SURVIVAL_ADAPT",1.0)!=0.0) {calibrator.rate=0.01;calibrator.pull=0.01;}
         }
         for(std::size_t o=1;o<owners.size();++o) owners[o].window->share_deferred(*owners.front().window);
+        // STRIX_WINDOW_ROUTE_LOG=1 (diagnostics, never timed): after each router step of a verify window, the
+        // routed expert ids of every row ("route pos=P rows=R row=r layer=L ids=..." on stderr). Synchronizes.
+        if(env_number("STRIX_WINDOW_ROUTE_LOG",0.0)!=0.0) for(auto& o:owners) {
+            const auto top_k=static_cast<std::size_t>(target->model().num_experts_per_token);
+            o.window->set_window_step_observer([rows=o.rows,top_k](std::size_t,const std::function<ExecutionDispatchContext(std::uint32_t)>& row) {
+                const auto first=row(0);
+                if(first.op!=SerialOp::moe_route) return;
+                require(hipDeviceSynchronize()==hipSuccess,"route log fence");
+                for(std::uint32_t r=0;r<rows;++r) {
+                    const auto c=row(r);
+                    const auto out=resolve_dispatch_write(c,0);
+                    std::vector<std::uint32_t> ids(std::min<std::size_t>(top_k,static_cast<std::size_t>(out.bytes/4U)));
+                    require(hipMemcpy(ids.data(),reinterpret_cast<const void*>(out.address),ids.size()*4U,hipMemcpyDeviceToHost)==hipSuccess,"route log copy");
+                    std::fprintf(stderr,"route pos=%llu rows=%u row=%u layer=%u ids=",static_cast<unsigned long long>(c.position),
+                        rows,r,c.layer.value_or(UINT32_MAX));
+                    for(std::size_t k=0;k<ids.size();++k) std::fprintf(stderr,k?",%u":"%u",ids[k]);
+                    std::fputs(" end\n",stderr);
+                }
+            });
+        }
         const auto reservation=bounded?plan_hip_mtp_target_window_rollback(target->model(),*resources.session_state_layout,0,window->logical_rows(),true).reservation:
             plan_hip_mtp_target_checkpoint(target->model(),*resources.session_state_layout,policy.snapshot_policy);
         const auto upper=mtp_native::sum(reservation.retained_bytes,
