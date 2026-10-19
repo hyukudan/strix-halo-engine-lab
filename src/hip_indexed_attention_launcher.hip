@@ -2110,12 +2110,22 @@ void launch_linear_to_float_typed(
         "HIP indexed-attention projection launch");
 }
 
+// One-row q8_rows sites over a registered Q6P32 copy (bitwise the R1 prefetch8 kernels);
+// false when the weights have none.
+bool qsa_q6_r1_input(const std::uint16_t* input, const void* weights, std::uint32_t width, std::uint32_t outputs,
+    float* output, hipStream_t stream);
+bool qsa_q6_r1_output(const float* input, const void* weights, std::uint32_t width, std::uint32_t outputs,
+    std::uint16_t* output, hipStream_t stream);
+
 void launch_linear_to_float(
     const TensorPair& tensor,
     const ExecutionBufferAddress& input,
     std::uint32_t input_width,
     std::uint32_t output_width,
     float* output, bool prefetch = false, qsa_input_prefetch::RuntimeDispatchStats* stats = nullptr) {
+    if(prefetch && qsa_input_prefetch::eligible(*tensor.manifest) &&
+       qsa_q6_r1_input(reinterpret_cast<const std::uint16_t*>(input.address),reinterpret_cast<const void*>(tensor.runtime->address),
+           input_width,output_width,output,hip_execution_stream())) return;
     if(prefetch && qsa_input_prefetch::eligible(*tensor.manifest)){
         if(tensor.runtime->address%16U!=0 || tensor.manifest->absolute_offset%16U!=0 || tensor.runtime->bytes<qsa_input_prefetch::required_weight_bytes(input_width,output_width))throw std::invalid_argument("QSA prefetch launch weight alignment/extent invalid");
         hipLaunchKernelGGL(linear_prefetch8_q8_qsa_input_kernel,dim3(output_width),dim3(32),0,hip_execution_stream(),reinterpret_cast<const std::uint16_t*>(input.address),reinterpret_cast<const void*>(tensor.runtime->address),input_width,output_width,output);
@@ -2204,6 +2214,8 @@ void launch_linear_float_to_bf16(
         if (tensor.manifest->ggml_type != 8U || input_width % 32U)
             throw std::invalid_argument("wave8 QSA output requires aligned Q8_0 weights");
         q8_projection_organization::validate_geometry(input_width, output_width);
+        if (qsa_q6_r1_output(input, reinterpret_cast<const void*>(tensor.runtime->address), input_width, output_width,
+                reinterpret_cast<std::uint16_t*>(output.address), hip_execution_stream())) return;
         hipLaunchKernelGGL(linear_prefetch8_wave8_q8_float_to_bf16_kernel,
             dim3((output_width + 7U) / 8U), dim3(256), 0, hip_execution_stream(), input,
             reinterpret_cast<const void*>(tensor.runtime->address), input_width, output_width,
@@ -3390,6 +3402,30 @@ void launch_qsa_dense_a8_output(const TensorPair& weights, const float* input, c
     site.width = width; site.outputs = hidden;
     q8_rows::launch(site, true, stream);
     check_hip(hipGetLastError(), "HIP indexed-attention dense A8 output projection launch");
+}
+bool q6_r1_registered(const void* weights, std::uint32_t width, std::uint32_t outputs) {
+    const auto* q6 = q6p::find(weights);
+    return q6 && q6->kind == q6p::Kind::q6p32 && q6->rows == outputs && q6->cols == width;
+}
+bool qsa_q6_r1_input(const std::uint16_t* input, const void* weights, std::uint32_t width, std::uint32_t outputs,
+    float* output, hipStream_t stream) {
+    if (!q6_r1_registered(weights, width, outputs)) return false;
+    QsaInputRowsSite<1> site{};
+    site.segments = q8_rows::segments({{weights, outputs}});
+    site.width = width; site.outputs = outputs; site.input[0] = input; site.output[0][0] = output;
+    q8_rows::launch(site, false, stream);
+    check_hip(hipGetLastError(), "HIP indexed-attention Q6P32 input projection launch");
+    return true;
+}
+bool qsa_q6_r1_output(const float* input, const void* weights, std::uint32_t width, std::uint32_t outputs,
+    std::uint16_t* output, hipStream_t stream) {
+    if (!q6_r1_registered(weights, width, outputs)) return false;
+    QsaOutputRowsSite<1> site{};
+    site.segments = q8_rows::segments({{weights, outputs}});
+    site.width = width; site.outputs = outputs; site.input[0] = input; site.output[0] = output;
+    q8_rows::launch(site, false, stream);
+    check_hip(hipGetLastError(), "HIP indexed-attention Q6P32 output projection launch");
+    return true;
 }
 
 template <WeightKind Kind, unsigned Rows>

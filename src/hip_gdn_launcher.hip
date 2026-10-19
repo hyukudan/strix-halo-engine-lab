@@ -2810,6 +2810,10 @@ struct GdnEmitTarget {
 void record_gdn_kernel(GdnKernelLedger* ledger, const void* function, dim3 grid, dim3 block) {
     if (ledger) ledger->push_back({function, grid, block, 0});
 }
+bool gdn_q6_r1_registered(const RuntimeTensorBinding& weights, std::uint32_t width, std::uint32_t outputs) {
+    const auto* q6 = q6p::find(reinterpret_cast<const void*>(weights.address));
+    return q6 && q6->kind == q6p::Kind::q6p32 && q6->rows == outputs && q6->cols == width;
+}
 
 template <WeightKind Kind>
 void launch_projection(
@@ -2860,6 +2864,16 @@ void launch_projection_by_kind(
             input, weights, input_width, output_width, output, stream, ledger);
         return;
     case WeightKind::q8_0:
+        if (mode == ProjectionMode::prefetch8_wave8 && !ledger && gdn_q6_r1_registered(weights, input_width, output_width)) {
+            // Registered Q6P32 copy: the one-row q8_rows site is bitwise the prefetch8 wave8 kernel.
+            // Island emitters (ledger) keep the recorded Q8_0 kernel; their numerics are the same.
+            GdnInputRowsSite<1> site{};
+            site.segments = q8_rows::segments({{reinterpret_cast<const void*>(weights.address), output_width}});
+            site.width = input_width; site.outputs = output_width; site.input[0] = input; site.output[0][0] = output;
+            q8_rows::launch(site, false, stream);
+            check_hip(hipGetLastError(), "HIP GDN Q6P32 input projection launch");
+            return;
+        }
         if (mode == ProjectionMode::prefetch8_wave8) {
             record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_prefetch8_wave8_q8_bf16_to_fp32_kernel), dim3((output_width + 7U) / 8U), dim3(256));
             hipLaunchKernelGGL(project_prefetch8_wave8_q8_bf16_to_fp32_kernel,
@@ -2943,6 +2957,15 @@ void launch_output_by_kind(
             {reinterpret_cast<std::uintptr_t>(input), static_cast<std::uint64_t>(input_width) * sizeof(float)},
             {weights.address, weights.bytes},
             {reinterpret_cast<std::uintptr_t>(output), static_cast<std::uint64_t>(output_width) * sizeof(std::uint16_t)});
+        if (!ledger && gdn_q6_r1_registered(weights, input_width, output_width)) {
+            // Registered Q6P32 copy: the one-row q8_rows site is bitwise the prefetch8 wave8 kernel.
+            GdnOutputRowsSite<1> site{};
+            site.segments = q8_rows::segments({{reinterpret_cast<const void*>(weights.address), output_width}});
+            site.width = input_width; site.outputs = output_width; site.input[0] = input; site.output[0] = output;
+            q8_rows::launch(site, false, stream);
+            check_hip(hipGetLastError(), "HIP GDN Q6P32 output projection launch");
+            return;
+        }
         record_gdn_kernel(ledger, reinterpret_cast<const void*>(project_prefetch8_wave8_q8_fp32_to_bf16_kernel), dim3((output_width + 7U) / 8U), dim3(256));
         hipLaunchKernelGGL(project_prefetch8_wave8_q8_fp32_to_bf16_kernel, dim3((output_width + 7U) / 8U), dim3(256), 0,
             stream, input, reinterpret_cast<const void*>(weights.address), input_width, output_width, output);

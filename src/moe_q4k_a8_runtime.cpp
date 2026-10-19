@@ -1,4 +1,5 @@
 #include "strix/moe_q4k_a8_runtime.hpp"
+#include "strix/q6p_registry.hpp"
 #include <array>
 #include <limits>
 #include <stdexcept>
@@ -171,7 +172,7 @@ void validate_a8_down_content(const ModelContentIdentity& content) {
     constexpr std::array<std::uint8_t,32> expected{
         0x37,0x26,0xd6,0xf0,0xd9,0xba,0x30,0xb9,0xd6,0x55,0xba,0x30,0x35,0x95,0x11,0x89,
         0x41,0xba,0xec,0xa5,0xe6,0x94,0x5f,0xc8,0x78,0x5f,0x93,0x8e,0x0f,0x54,0x55,0xe4};
-    if (content.bytes != expected)
+    if (content.bytes != expected && !q6p::derived_content_admitted(content.bytes.data()))
         throw std::invalid_argument("A8 down requires the admitted model content identity");
 }
 }  // namespace strix::moe_q4k_a8
