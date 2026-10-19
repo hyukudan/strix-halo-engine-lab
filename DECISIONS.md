@@ -758,6 +758,30 @@ top-1 agreement and mean KL 0.0066-0.0069. Speed was not measured (deferred to t
 It does not run with the fast prefill QSA component, which reads BF16 keys and values, and is not admitted with
 cohort windows, the prefix state cache or HTTP serving, which were not checked under the identity.
 
+## D-047: context n-gram extension of the MTP draft chain (opt-in)
+
+`--mtp-ngram-draft` appends, after the MTP drafts kept by the minimum probability, the continuation of the
+longest earlier occurrence (2 to 4 tokens) of context + kept drafts, up to the draft depth, inside the same
+verify window (no new window shape). Every row is verified by the target, so tokens are the greedy tokens;
+the predictor cache is rebuilt from committed target rows as after any rejected draft. A per-request
+acceptance table, fed by scoring every cycle's would-be extension against the emitted tokens (host only,
+prior 0.2), gates it: rows are proposed only while the first row's learned acceptance is at least 0.5, they
+size the window with that acceptance and stay out of the draft calibration (docs/mtp-native-cli.md). It works with
+the D-022 controller only: the survival controller (D-041) rejects it.
+
+Why: requests that copy their context (correcting a given document, edits) have long exact continuations
+in the prompt that the MTP chain stops short of. Full-chain logs (512 tokens, dense A8, 18 prompts:
+prose in five languages, thinking, summaries, rewrites, document QA, code, agent) simulated with the
+verifier cost model: substituting n-gram chains for MTP chains loses on everything but copying, and even an
+oracle choosing MTP or n-gram per cycle adds only 0.1-1.6 % over the best MTP-only choice on prose,
+summaries and answers (3.9 % on code); on document correction it adds 19-22 %. The gated extension adds
++11.0 % (English) and +5.6 % (Spanish) on correction and never opens on the 16 other prompts.
+
+Checked on one node (dense A8, windows 2/4/8, 512 tokens): tokens identical with and without the switch on
+document correction (en, es), summary, English prose and code, replay error 0. Single smoke runs: correction
+66.9 -> 81.5 tok/s (en) and 74.9 -> 79.2 (es); the others extended no cycle. Off by default until the timing
+campaign.
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |
