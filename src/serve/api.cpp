@@ -378,12 +378,17 @@ struct ApiService::Impl {
         return out;
     }
 
-    std::shared_ptr<GenerationTicket> submit(std::vector<std::uint32_t> prompt, std::uint32_t max_tokens, const SamplingParameters& sampling) {
+    std::shared_ptr<GenerationTicket> submit(std::vector<std::uint32_t> prompt, std::uint32_t max_tokens, const SamplingParameters& sampling,
+        const Json& body) {
         GenerationJob job;
         job.prompt = std::move(prompt);
         job.max_tokens = max_tokens;
         job.stop_tokens = config.stop_tokens;
         job.sampling = sampling;
+        if (const auto* ngram = body.find("ngram_draft"); ngram && !ngram->is_null()) {
+            if (!ngram->is_bool()) throw ApiError(400, "invalid_request_error", "ngram_draft must be a boolean", "ngram_draft");
+            job.ngram_draft = ngram->as_bool();
+        }
         auto ticket = queue.submit(std::move(job));
         if (!ticket) throw ApiError(429, "rate_limit_error", "the request queue is full");
         return ticket;
@@ -416,6 +421,8 @@ struct ApiService::Impl {
         e.set("mtp_cycles", Json(o.stats.cycles));
         e.set("mtp_accepted", Json(o.stats.accepted));
         e.set("mtp_proposed", Json(o.stats.proposed));
+        e.set("ngram_rows", Json(o.stats.ngram_rows));
+        e.set("ngram_accepted", Json(o.stats.ngram_accepted));
         return e;
     }
     static Json tool_calls_json(const Json& calls) {
@@ -444,7 +451,7 @@ struct ApiService::Impl {
         bool include_usage = false;
         if (const auto* options = body.find("stream_options"); options && options->is_object()) include_usage = bool_or(*options, "include_usage", false);
         const auto limit = max_tokens(body, prompt.tokens.size());
-        auto ticket = submit(prompt.tokens, limit, sampling_params);
+        auto ticket = submit(prompt.tokens, limit, sampling_params, body);
         const auto id = random_id("chatcmpl-");
         const auto created = unix_now();
         RecentRequest entry{id, "chat.completions", "ok", created};
@@ -561,7 +568,7 @@ struct ApiService::Impl {
         const auto stops = stop_strings(body.find("stop"));
         const bool stream = bool_or(body, "stream", false);
         const auto limit = max_tokens(body, prompt.size());
-        auto ticket = submit(prompt, limit, sampling_params);
+        auto ticket = submit(prompt, limit, sampling_params, body);
         const auto id = random_id("cmpl-");
         const auto created = unix_now();
         RecentRequest entry{id, "completions", "ok", created};
@@ -678,7 +685,7 @@ struct ApiService::Impl {
         const auto* max = body.find("max_tokens");
         if (!max || !max->is_number()) throw ApiError(400, "invalid_request_error", "max_tokens is required", "max_tokens");
         const auto limit = max_tokens(body, prompt.tokens.size());
-        auto ticket = submit(prompt.tokens, limit, sampling_params);
+        auto ticket = submit(prompt.tokens, limit, sampling_params, body);
         const auto id = random_id("msg_");
         RecentRequest entry{id, "messages", "ok", unix_now()};
         const auto stop_reason = [&](const Outcome& o, bool tools) {

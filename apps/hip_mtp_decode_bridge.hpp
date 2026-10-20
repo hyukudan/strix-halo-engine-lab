@@ -47,12 +47,15 @@ struct MtpServeRequest {
     std::span<const std::uint32_t> prompt;
     std::uint64_t max_tokens = 0;
     std::span<const std::uint32_t> stop_tokens;
+    // Context n-gram draft extension for this request: forced on/off, or unset = the engine's default.
+    std::optional<bool> ngram_draft;
     // Newly verified tokens after each cycle (the first call carries the prompt's own prediction);
     // false stops the request.
     std::function<bool(std::span<const std::uint32_t>)> on_tokens;
 };
 struct MtpServeResult {
     std::uint64_t restored_tokens = 0, generated_tokens = 0, cycles = 0, proposed = 0, accepted = 0;
+    std::uint64_t ngram_rows = 0, ngram_accepted = 0;
     double prompt_ms = 0.0, decode_ms = 0.0;
     std::string finish = "length"; // stop|length|context|cancelled
 };
@@ -816,6 +819,18 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         if(runtime->next_source_position()+1U!=session.next_position)
             throw std::logic_error("MTP replay did not prime the actual final prompt frontier");
         replay_rows.clear(); // release prompt snapshots before bounded cycles
+        // Context n-gram draft extension (D-047, default auto since D-055): `forced` = explicitly required (the
+        // runtime rejects it where it cannot run); otherwise it runs where admissible, and not under the survival
+        // controller. STRIX_MTP_NGRAM_FLOOR / STRIX_MTP_NGRAM_PRIOR tune its gate (defaults 0.5 / 0.2).
+        const auto ngram_wanted=[&](bool forced){
+            return forced || (mtp_ngram_draft_admissible(m) && window && !window->survival_controller());
+        };
+        const auto ngram_config=[]{
+            MtpNgramDraftConfig ngram;
+            if(const char* v=std::getenv("STRIX_MTP_NGRAM_FLOOR"))ngram.floor=std::strtod(v,nullptr);
+            if(const char* v=std::getenv("STRIX_MTP_NGRAM_PRIOR"))ngram.prior=std::strtod(v,nullptr);
+            return ngram;
+        };
         const auto enable_draft_on=[&](HipMtpRuntime& draft_runtime,std::span<const std::uint32_t> prompt,
             const std::shared_ptr<TokenSampler>& draft_sampler) {
             if(!m.draft_chain) return;
@@ -956,6 +971,10 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                     HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
                     if(window)greedy.use_window_verifier(window);
                     if(m.draft_chain)greedy.set_draft_min_probability(mtp_draft_min_probability(m));
+                    // n-gram extension per request (D-055): the request's "ngram_draft" (true = on where admissible,
+                    // false = off), else the engine's mode.
+                    if(q.ngram_draft ? *q.ngram_draft && ngram_wanted(false) : !m.ngram_off && ngram_wanted(m.ngram_draft))
+                        greedy.enable_ngram_draft(q.prompt,ngram_config());
                     const auto is_stop=[&](std::uint32_t t){return std::find(q.stop_tokens.begin(),q.stop_tokens.end(),t)!=q.stop_tokens.end();};
                     const std::array<std::uint32_t,1> first{pending.predicted_token()};
                     out.generated_tokens=1;
@@ -972,6 +991,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         if(!q.on_tokens(result.emitted_tokens)){out.finish="cancelled";break;}
                         if(is_stop(result.emitted_tokens.back()))out.finish="stop";
                     }
+                    if(const auto* ng=greedy.ngram_stats()){out.ngram_rows=ng->extension_rows;out.ngram_accepted=ng->accepted_rows;}
                     pending={};
                     out.decode_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-decode_start).count();
                     return out;
@@ -995,13 +1015,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
         if(window && !qualify)greedy.use_window_verifier(window);
         if(m.draft_chain)greedy.set_draft_min_probability(mtp_draft_min_probability(m));
-        if(m.ngram_draft && !qualify) {
-            // STRIX_MTP_NGRAM_FLOOR / STRIX_MTP_NGRAM_PRIOR tune the gate (defaults 0.5 / 0.2).
-            MtpNgramDraftConfig ngram;
-            if(const char* v=std::getenv("STRIX_MTP_NGRAM_FLOOR"))ngram.floor=std::strtod(v,nullptr);
-            if(const char* v=std::getenv("STRIX_MTP_NGRAM_PRIOR"))ngram.prior=std::strtod(v,nullptr);
-            greedy.enable_ngram_draft(options.tokens,ngram);
-        }
+        if(!qualify && !m.ngram_off && ngram_wanted(m.ngram_draft))greedy.enable_ngram_draft(options.tokens,ngram_config());
         if(qualify){
             MtpDecodeQualificationContext context{options,parents,native,target,std::move(window),session,dispatcher,generations,greedy,*runtime,std::move(pending)};
             qualify(context);

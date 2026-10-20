@@ -760,7 +760,7 @@ top-1 agreement and mean KL 0.0066-0.0069. Speed was not measured (deferred to t
 It does not run with the fast prefill QSA component, which reads BF16 keys and values, and is not admitted with
 cohort windows, the prefix state cache or HTTP serving, which were not checked under the identity.
 
-## D-047: context n-gram extension of the MTP draft chain (opt-in)
+## D-047: context n-gram extension of the MTP draft chain (opt-in; `auto` by default since D-055)
 
 `--mtp-ngram-draft` appends, after the MTP drafts kept by the minimum probability, the continuation of the
 longest earlier occurrence (2 to 4 tokens) of context + kept drafts, up to the draft depth, inside the same
@@ -904,6 +904,27 @@ Single smoke runs, not a campaign (dense A8, windows 2/4/8, 256 tokens per reque
 62.2 tok/s aggregate as two cohort windows per cycle against 77.7 fused (12 rows); eight 74.3 against 85.2 (16 rows,
 `gdn,qsa,head,moe`); sequential 44.9 and 44.3. The server took 42.9 s for eight concurrent short requests fused
 (with the wide inject) against 46.9 s.
+
+## D-055: decode defaults from the final campaign (draft profiles, min-p by draft, n-gram auto)
+
+`include/strix/mtp_draft_profiles.hpp` registers the qualified MTP draft sidecars (`base`, `distill-d`,
+`distill-g`) by SHA-256 with their identity and provenance pins and their best draft early-stop probability.
+`--mtp-draft-profile NAME` fills those pins (only the local path stays explicit; a disagreeing pin is an
+error). Without `--mtp-spec-min-p`, a run with a window row set takes the profiled draft's min-p: 0.85 for the
+base draft (D-022), 0.7 for the distilled drafts; an unprofiled sidecar keeps 0.5. `--mtp-ngram-draft` becomes
+`on|off|auto`, default `auto`: on wherever it is admissible (greedy, one request, prefix windows, the D-022
+controller), including each `--http-serve` request (`"ngram_draft"` request field); its learned per-request gate
+opens only when the output copies the context. See [docs/decode-defaults.md](docs/decode-defaults.md).
+
+Why: the final campaign (same binary and node, 8 workloads, 256 tokens) measured distillG at min-p 0.7 at +10.0 %
+decode over the base draft at 0.85 (geometric mean; English/Spanish prose +14-15 %), distillD at 0.7 +8.2 %, and
+the n-gram extension +5.8 % / +7.7 % on document correction (English / Spanish) and neutral elsewhere (its gate
+stays closed). Each default only changes the proposed drafts and the window choice; the target verifies every
+token.
+
+Checked: the options contract (min-p by identity, profile pins, n-gram modes and where `auto` stays off); the
+default command against the explicit switches: tokens identical and replay error 0 (DEFAULTS-GATES); the server
+against the command line with the same mode (SERVER-GATE).
 
 ## Measured and rejected
 

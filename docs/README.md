@@ -65,6 +65,7 @@ A wider kernel, larger speculative window, second node or second physical link i
 
 - [Multi-row verify window: design and status](VERIFY_WINDOW_PLAN.md).
 - [MTP command line](mtp-native-cli.md) and [MTP runtime contract](mtp-native-runtime.md).
+- [Decode defaults](decode-defaults.md): draft profiles (`--mtp-draft-profile`), min-p by draft identity and the n-gram extension in `auto` (D-055).
 - [Known-prefix window](known-prefix-window.md).
 - [Automatic decode optimization profile](decode-optimization-profile.md).
 - [Several requests in one decode loop (cohort windows)](multi-request-cohort.md).
