@@ -71,8 +71,16 @@ inline MtpDecodeBatchServe make_cohort_tiled_run(const Options& options, const M
                 if (!runner.slot(s).active) { record.slot = s; break; }
             runner.admit(std::move(request));
         };
+        double prompts_ms = 0.0; // lockstep with interleaved admission: from admission to the end of the last prompt
         if (lockstep) {
             for (std::size_t q = 0; q < prompts.size(); ++q) admit(q);
+            // Interleaved admission (STRIX_BATCH_INTERLEAVE=1): the prompts advance in the steps (in groups with
+            // STRIX_PROMPT_BATCH=1), with the decode cycles of the requests already past theirs.
+            if (runner.interleaved()) {
+                const auto admitted = std::chrono::steady_clock::now();
+                while (runner.prefilling()) runner.step();
+                prompts_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - admitted).count();
+            }
             start = std::chrono::steady_clock::now();
             while (runner.active()) runner.step();
             decode_ms = now_ms();
@@ -101,6 +109,10 @@ inline MtpDecodeBatchServe make_cohort_tiled_run(const Options& options, const M
             << "  \"mtp_cohort_windows\":" << stats.cohort.cohort_windows << ",\n  \"mtp_cohort_window_sessions\":" << stats.cohort.cohort_sessions
             << ",\n  \"mtp_cohort_window_rows\":" << stats.cohort.cohort_rows << ",\n  \"mtp_cohort_solo_windows\":" << stats.cohort.solo_windows << ",\n  \"mtp_cohort_chunks\":" << stats.cohort.cohort_chunks
             << ",\n  \"mtp_cohort_steps\":" << stats.steps << ",\n  \"mtp_cohort_cohort_steps\":" << stats.cohort_steps << ",\n"
+            << "  \"prompt_batch\":{\"enabled\":" << (runner.prompt_batching() ? "true" : "false") << ",\"interleaved\":"
+            << (runner.interleaved() ? "true" : "false") << ",\"prompt_steps\":" << stats.prompt_steps << ",\"groups\":" << stats.prompt_groups
+            << ",\"grouped_blocks\":" << stats.grouped_blocks << ",\"grouped_rows\":" << stats.grouped_rows
+            << ",\"group_ms\":" << stats.prompt_group_ms << ",\"prompts_ms\":" << prompts_ms << "},\n"
             << "  \"mtp_cohort_wall_ms\":" << decode_ms << ",\n  \"mtp_cohort_generated_tokens\":" << total_tokens << ",\n"
             << "  \"mtp_cohort_aggregate_tokens_per_second\":" << (decode_ms > 0.0 ? 1000.0 * static_cast<double>(total_tokens) / decode_ms : 0.0) << ",\n"
             << "  \"mtp_timing_scope\":\"post-prompt-cycles-only-host-completed-wall-not-GPU-kernel-time\",\n"

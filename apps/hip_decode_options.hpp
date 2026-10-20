@@ -523,8 +523,10 @@ inline strix::NumericalProfilePair numerical_profile_pair(const Options& options
 }
 
 // A split pair is admitted only where the code runs it: the tiled known-prefix prefill
-// (full rows) or the MTP prompt route, with a decode profile whose dense-A8 sibling is the
-// prefill profile. Everything else keeps one profile for both phases.
+// (full rows), the serial MTP prompt, or the tiled MTP prompt (the serving route: its tiled
+// blocks run the prefill profile, its calibration rows, serial suffix and decode the decode
+// profile), with a decode profile whose dense-A8 sibling is the prefill profile. Everything
+// else keeps one profile for both phases.
 inline void validate_prefill_numerical_profile_cli(const Options& options) {
     const auto pair = numerical_profile_pair(options);
     if (strix::numerical_profile_fast_prefill(options.numerical_profile))
@@ -537,9 +539,9 @@ inline void validate_prefill_numerical_profile_cli(const Options& options) {
             "the dense A8 projections (q5k-a8-gateup profiles with and without +dense-a8), or be "
             "fast-prefill-f16wmma-v1 paired with hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1");
     const bool tiled = options.known_prefix_window && options.known_prefix_prefill_rows && options.known_prefix_full_rows;
-    if (tiled == options.mtp.enabled)
-        throw std::invalid_argument("prefill numerical profile requires exactly one prefill route: the tiled known-prefix "
-            "prefill (--known-prefix-prefill-rows with --known-prefix-full-rows) or the MTP prompt");
+    if (!tiled && !options.mtp.enabled)
+        throw std::invalid_argument("prefill numerical profile requires a prefill route: the tiled known-prefix "
+            "prefill (--known-prefix-prefill-rows with --known-prefix-full-rows), the MTP prompt, or both (tiled MTP prompt)");
     if (options.model_copy_tier != strix::HipModelCopyTier::none || !options.validation_final_state_path.empty() ||
         options.gdn_islands || options.prepared_eager || options.moe_shared_overlap || options.mtp.metadata_only)
         throw std::invalid_argument("prefill numerical profile excludes model copy tiers, final-state export, GDN islands, "
@@ -1036,10 +1038,11 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
         throw std::invalid_argument("MTP cohort mode requires --mtp-cohort-request");
     if(!m.cohort.empty() && tiled) {
         // Tiled prompt: every request runs its prompt like a served request (calibration once, no golden).
+        // A split prefill profile runs every slot's tiled blocks on the prefill profile (as a single request's).
         if(m.cohort.size()>7U || o.http_serve || !m.window_prefix || !m.draft_chain ||
-           m.window_rows_set!=std::vector<std::uint32_t>{2U,4U,8U} || o.prefill_numerical_profile.has_value())
+           m.window_rows_set!=std::vector<std::uint32_t>{2U,4U,8U})
             throw std::invalid_argument("MTP cohort requests on the tiled prompt (at most seven besides the positional prompt) "
-                "require prefix windows over the row set 2,4,8, the draft chain and one numerical profile");
+                "require prefix windows over the row set 2,4,8 and the draft chain");
         for(const auto& request:m.cohort)
             if(request.tokens.empty() || ((resolved || o.context_explicit) && (request.tokens.size()>=o.context_tokens ||
                 o.generate_tokens>o.context_tokens-request.tokens.size()+1U)))

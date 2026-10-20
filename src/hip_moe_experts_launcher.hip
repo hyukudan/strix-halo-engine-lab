@@ -2740,18 +2740,22 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
         d_down_codes, d_down_deltas, d_down_sums, d_rawdots, derived_count };
     std::array<std::uint64_t, derived_count> derived_offset{};
     const auto& memory0 = *rows.front().resources->scratch;
+    // Segmented prefill (inside a cohort scope): consecutive rows of one session form a segment over that
+    // session's own resources and positions; every segment uses the same block arena (memory0).
+    std::vector<std::uint32_t> segment_head(count);
+    for (std::uint32_t r = 0; r < count; ++r) segment_head[r] = known_window_segment_start(rows, r) ? r : segment_head[r - 1U];
     // Row views of the compiled prefill arena list the same unique uses in the same order:
     // each row's allocation indices are the previous row's (hinted lookup, no arena search).
     std::array<std::size_t, 5> hint{};
     const auto own_views = [&](std::uint32_t r) {
-        const auto& row = rows[r]; const auto& first = rows.front();
-        if (!row.resources || row.resources != first.resources ||
+        const auto& row = rows[r]; const auto& first = rows.front(); const auto& head = rows[segment_head[r]];
+        if (!row.resources || row.resources != head.resources || row.resources->scratch != &memory0 ||
             (row.memory && row.memory != row.resources->scratch) || row.prepared_tensor_views || row.prepared_arena_views ||
-            row.session_state_layout != first.session_state_layout || row.session_state_memory != first.session_state_memory ||
+            row.session_state_layout != first.session_state_layout || row.session_state_memory != head.session_state_memory ||
             row.execution_identity != first.execution_identity || row.step_id != first.step_id || row.op != SerialOp::moe_experts ||
             row.layer != first.layer || row.kernel_id != first.kernel_id || row.logical_rows != 1U || row.request_concurrency != 1U ||
             row.reads_state != first.reads_state || row.writes_state != first.writes_state ||
-            row.position != first.position + r || row.reads.size() != 3U || row.writes.size() != 1U || row.temporaries.size() != 1U ||
+            row.position != head.position + (r - segment_head[r]) || row.reads.size() != 3U || row.writes.size() != 1U || row.temporaries.size() != 1U ||
             !std::equal(row.reads.begin(), row.reads.end(), first.reads.begin()) ||
             row.writes[0] != first.writes[0] || row.temporaries[0] != first.temporaries[0] || !row.arena)
             throw std::invalid_argument("known prefill routed rows source/position/owner differs");
@@ -2772,14 +2776,14 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
     };
     for (std::uint32_t chunk = 0; chunk < count; chunk += 8U) {
         if (shared && chunk && chunk + 8U < count) {
-            if (rows[chunk].position != rows[chunk - 1U].position + 1U)
+            if (!known_window_row_position_follows(rows, chunk))
                 throw std::invalid_argument("known prefill routed rows positions are not consecutive");
             for (std::uint32_t i = 0; i < 8U; ++i) own_views(chunk + i);
             continue;
         }
         // Window admission of each 8-row chunk (positions consecutive inside the chunk).
         const auto p = prepare_known_moe_rows(rows.subspan(chunk, 8U), config, window, true);
-        if (chunk && rows[chunk].position != rows[chunk - 1U].position + 1U)
+        if (chunk && !known_window_row_position_follows(rows, chunk))
             throw std::invalid_argument("known prefill routed rows positions are not consecutive");
         for (std::uint32_t i = 0; i < 8U; ++i) {
             const auto& e = p.rows[i];
