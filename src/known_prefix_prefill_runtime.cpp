@@ -30,6 +30,18 @@ constexpr std::array flags{PersistentState::attention_kv,PersistentState::recurr
     PersistentState::convolution_history,PersistentState::sparse_index,PersistentState::ngram_history,PersistentState::position_history};
 bool reads_position(PersistentState state) {return (static_cast<std::uint32_t>(state)&static_cast<std::uint32_t>(PersistentState::position_history))!=0;}
 }
+// The same model through possibly distinct owner objects: manifest layout, access plan and every resident tensor binding.
+bool same_model(const ExecutionRuntimeResources& a,const ExecutionRuntimeResources& b) {
+    if(a.model_manifest==b.model_manifest&&a.model_weights==b.model_weights&&a.tensor_access==b.tensor_access) return true;
+    const auto& x=*a.model_weights;const auto& y=*b.model_weights;
+    if(a.model_manifest->layout_identity!=b.model_manifest->layout_identity||a.tensor_access->plan_identity!=b.tensor_access->plan_identity||
+        a.tensor_access->manifest_layout_identity!=b.tensor_access->manifest_layout_identity||
+        x.manifest_layout_identity!=y.manifest_layout_identity||x.model_content_identity.bytes!=y.model_content_identity.bytes||
+        x.tensors.size()!=y.tensors.size()) return false;
+    for(std::size_t i=0;i<x.tensors.size();++i)
+        if(x.tensors[i].address!=y.tensors[i].address||x.tensors[i].bytes!=y.tensors[i].bytes||x.tensors[i].storage!=y.tensors[i].storage) return false;
+    return true;
+}
 KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPrefill& plan,
     const CompiledSerialExecution& serial,const ExecutionRuntimeResources& serial_resources,
     const ExecutionMemoryBinding& memory,SerialSessionContext& session,std::span<const std::uint32_t> tokens,
@@ -411,8 +423,8 @@ std::vector<KnownWindowResult> execute_known_prefix_prefill_segments_eager(const
         const auto& g=segments[s];auto& session=*g.session;const auto& own=*g.resources;
         if(session.health!=SerialSessionHealth::ready) throw std::logic_error("segmented prefill requires ready serial sessions");
         require(session.execution_identity==serial.execution_identity&&session.execution_identity,"segmented prefill source session identity differs");
-        require(own.model_manifest==lead.model_manifest&&own.model_weights==lead.model_weights&&own.tensor_access==lead.tensor_access&&
-            own.session_state_layout&&own.session_state_memory&&own.scratch&&!own.distributed_stage&&
+        require(own.model_manifest&&own.model_weights&&own.tensor_access&&own.session_state_layout&&own.session_state_memory&&
+            own.scratch&&!own.distributed_stage&&same_model(own,lead)&&
             own.session_state_layout->layout_identity==lead.session_state_layout->layout_identity,
             "segmented prefill sessions must share one model and one state layout");
         for(std::size_t o=0;o<s;++o)
@@ -436,7 +448,9 @@ std::vector<KnownWindowResult> execute_known_prefix_prefill_segments_eager(const
         const auto& state_memory=*own.session_state_memory;
         disjoint(state_memory.device_base,state_memory.device_bytes);disjoint(state_memory.host_base,state_memory.host_bytes);
         require(!own.ple_prefetch||!own.ple_prefetch->active,"segmented prefill cannot borrow an active PLE lookup");
+        // One set of model objects for every row (the shared steps compare them across rows).
         resources[s]=own;resources[s].scratch=&memory;
+        resources[s].model_manifest=lead.model_manifest;resources[s].model_weights=lead.model_weights;resources[s].tensor_access=lead.tensor_access;
         validate_execution_runtime_resources(plan.prefill_execution_identity,plan.arena.physical,resources[s],session.next_position);
         EagerExecutionRequest request;request.input_token_id=g.tokens[0];request.position=session.next_position;request.state=session.state;
         validate_eager_execution_preflight(serial.execution,serial.bindings,serial.io,plan.arena.row_view[offset[s]],request,

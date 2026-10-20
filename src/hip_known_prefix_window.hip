@@ -1791,8 +1791,7 @@ struct HipKnownPrefixWindow::Impl {
                 const auto& r = requests[s];
                 if (!r.own || !r.session || !r.own->prefill || r.own->failed || (r.own->executing && r.own != this) ||
                     r.tokens.size() != r.own->logical_rows() || r.own->serial.execution_identity != serial.execution_identity ||
-                    r.own->resources.model_manifest != resources.model_manifest || r.own->resources.model_weights != resources.model_weights ||
-                    r.own->resources.tensor_access != resources.tensor_access || r.own->config.fast_prefill_components != config.fast_prefill_components ||
+                    !same_model(r.own->resources, resources) || r.own->config.fast_prefill_components != config.fast_prefill_components ||
                     r.own->config.dense_a8 != config.dense_a8 || (r.head && r.own->prefill->output_policy == KnownWindowOutputPolicy::state_only))
                     throw std::invalid_argument("segmented prefill member needs its own idle tiled owner of its rows, of this owner's execution and profile");
                 if (r.own != this) r.own->validate_metadata();

@@ -75,6 +75,8 @@ struct KnownPrefillSegmentHooks {
     // segment's own row r (0..rows_s-1).
     std::function<void(std::size_t,std::size_t,const std::function<ExecutionDispatchContext(std::uint32_t)>&)> after_step;
 };
+// The same model through possibly distinct owner objects (manifest layout, access plan, tensor bindings).
+[[nodiscard]] bool same_model(const ExecutionRuntimeResources&,const ExecutionRuntimeResources&);
 // One result per segment, in segment order (logits: the segment's last row when head). Any failure after
 // admission poisons every segment's session.
 [[nodiscard]] std::vector<KnownWindowResult> execute_known_prefix_prefill_segments_eager(
