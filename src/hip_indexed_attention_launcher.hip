@@ -4586,9 +4586,11 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         scored_blocks = std::max(scored_blocks, scores.blocks[r]);
         select.block_scores[r] = w.block_scores; select.selected[r] = w.selected_indices; select.visible[r] = s.visible;
     }
-    const bool pooled = Rows > 8U && pool && pool->keys && scored_blocks <= pool->capacity && a.index_dim == 128U && index_heads == 4U;
+    // Prefill groups (Rows > 8) and, with STRIX_QSA_WINDOW_POOLED=1, verify windows of 2/4/8 rows
+    // (indexed_attention_known_window_rows_launch passes a pool then).
+    const bool pooled = pool && pool->keys && scored_blocks <= pool->capacity && a.index_dim == 128U && index_heads == 4U;
     if ((subparts & 4U) && scored_blocks && pooled) {
-        if constexpr (Rows > 8U) {
+        {
             if (scored_blocks > pool->valid) {
                 dispatch_small_kind(tensors.index_k_norm.manifest->ggml_type, [&](auto kind) {
                     hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<decltype(kind)::value>), dim3(scored_blocks - pool->valid),
@@ -4606,7 +4608,8 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                 const int n = v ? std::atoi(v) : 4;
                 return n == 1 || n == 2 || n == 8 ? static_cast<unsigned>(n) : 4U;
             }();
-            const auto score = [&]<unsigned R>() {
+            const auto score = [&]<unsigned Wanted>() {
+                constexpr unsigned R = Wanted < Rows ? Wanted : Rows; // a 2-row window scores both rows per wave
                 const auto waves = static_cast<std::uint64_t>(Rows / R) * ((scored_blocks + 31U) / 32U);
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<Rows, R>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)),
                     dim3(kThreads), 0, stream, scores, static_cast<const float*>(pool->keys), scored_blocks, a.index_dim);
@@ -4632,7 +4635,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                 };
                 const auto fast = copy();
                 dispatch_small_kind(tensors.index_k_norm.manifest->ggml_type, [&](auto kind) {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_rows_kernel<decltype(kind)::value, Rows>), dim3(scored_blocks, Rows / 8U),
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_rows_kernel<decltype(kind)::value, Rows>), dim3(scored_blocks, Rows <= 8U ? 1U : Rows / 8U),
                         dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream, scores,
                         reinterpret_cast<const std::uint16_t*>(a.raw_state.address), index_heads, a.index_dim, s0.ratio,
                         reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address), model.rms_norm_epsilon, rotary, model.rope_theta);
@@ -4728,15 +4731,30 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         // Fast prefill profile, qsa component: the fused union attention replaces score, softmax and value/gate.
         bool fast = false;
         if constexpr (Rows > 8U) if (!Int8 && config.qsa_fast_prefill) fast = launch_qsa_fast_prefill(prepared, a, maximum_selected, stream);
-        bool grouped = false;
+        bool grouped = false, grouped_score = false;
+        const auto per_kv = a.kv_heads && a.attention_heads % a.kv_heads == 0U ? a.attention_heads / a.kv_heads : 0U;
         if constexpr (Rows > 8U) {
-            const auto per_kv = a.kv_heads && a.attention_heads % a.kv_heads == 0U ? a.attention_heads / a.kv_heads : 0U;
             grouped = head_group != 0U && out_group != 0U && a.head_dim <= kThreads && per_kv &&
                 per_kv % head_group == 0U && per_kv % out_group == 0U;
+            grouped_score = grouped;
+        } else {
+            // STRIX_QSA_WINDOW_GROUPED=1: verify windows of 2/4/8 rows score with the prefill groups'
+            // KV-head-grouped kernel (per (row, query head, slot) the same products and reduction as
+            // attention_score_rows_wave_kernel; the key row is read once per head group instead of
+            // once per head). STRIX_QSA_WINDOW_SLOTS=4|8|16 slots per wave (default 8). The value/gate
+            // output keeps the window kernel.
+            static const bool window_grouped = [] { const char* v = std::getenv("STRIX_QSA_WINDOW_GROUPED"); return v && v[0] == '1'; }();
+            grouped_score = window_grouped && head_group != 0U && a.head_dim <= kThreads && per_kv && per_kv % head_group == 0U;
         }
+        static const unsigned window_slots = [] {
+            const char* v = std::getenv("STRIX_QSA_WINDOW_SLOTS");
+            const int n = v ? std::atoi(v) : 8;
+            return n == 4 || n == 16 ? static_cast<unsigned>(n) : 8U;
+        }();
+        const auto score_slots = Rows > 8U ? group_slots : window_slots;
         if (!(subparts & 16U) || fast) {
-        } else if (grouped) {
-            if constexpr (Rows > 8U) {
+        } else if (grouped_score) {
+            {
                 static_cast<void>(prepare_indexed_attention_score_grid(a.attention_heads, maximum_count));
                 static const bool scatter = [] { const char* v = std::getenv("STRIX_QSA_PREFILL_SCATTER"); return !v || v[0] != '0'; }();
                 // STRIX_QSA_SCORE_PREFETCH=0 keeps the generic kernel for head_dim 256.
@@ -4752,8 +4770,8 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                         0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim, maximum_count);
                 };
                 const auto by_group = [&]<unsigned G>() {
-                    if (group_slots == 4U) score.template operator()<G, 4U>();
-                    else if (group_slots == 16U) score.template operator()<G, 16U>();
+                    if (score_slots == 4U) score.template operator()<G, 4U>();
+                    else if (score_slots == 16U) score.template operator()<G, 16U>();
                     else score.template operator()<G, 8U>();
                 };
                 switch (head_group) {
@@ -5203,11 +5221,44 @@ void indexed_attention_known_window_rows_preflight(std::span<const ExecutionDisp
     else if (rows.size() == 8U) static_cast<void>(prepare_qsa_known_rows<8U>(rows, config, journal));
     else throw std::invalid_argument("QSA known-window requires exactly two, four or eight rows");
 }
+// STRIX_QSA_WINDOW_POOLED=1: verify windows score the indexer blocks as prefill groups do: one
+// block_pool_kernel pass forms every complete block's pooled/normalised/rotated key (the statements
+// of block_score_rows_kernel's pooled part), then block_score_pooled_rows_kernel scores them with the
+// same per-(row, block, head) products and reduction order. Bitwise the same block scores
+// (STRIX_QSA_POOLED_CHECK=1 compares them). The pool is formed again by every call.
+namespace {
+QsaPrefillPool* qsa_window_pool(const PreparedIndexedLaunch& a, std::uint32_t ratio) {
+    static const bool enabled = [] { const char* v = std::getenv("STRIX_QSA_WINDOW_POOLED"); return v && v[0] == '1'; }();
+    if (!enabled || a.index_dim != 128U || !ratio) return nullptr;
+    static QsaPrefillPool pool;
+    const auto tokens = a.raw_state.bytes / (static_cast<std::uint64_t>(a.index_dim) * sizeof(std::uint16_t));
+    const auto blocks = static_cast<std::uint32_t>(std::min<std::uint64_t>(tokens / ratio, UINT32_MAX));
+    if (blocks > pool.capacity) {
+        if (pool.keys) {
+            check_hip(hipStreamSynchronize(hip_execution_stream()), "QSA window block-pool resize sync");
+            check_hip(hipFree(pool.keys), "QSA window block-pool free");
+            pool = {};
+        }
+        void* keys = nullptr;
+        check_hip(hipMalloc(&keys, static_cast<std::uint64_t>(blocks) * a.index_dim * sizeof(float)), "QSA window block-pool allocation");
+        pool.keys = static_cast<float*>(keys);
+        pool.capacity = blocks;
+    }
+    pool.valid = 0;
+    return &pool;
+}
+template <unsigned Rows>
+void enqueue_qsa_window_rows(std::span<const ExecutionDispatchContext> rows, const HipIndexedAttentionLauncherConfig& config,
+    HipQsaIndexJournal journal) {
+    const auto prepared = prepare_qsa_known_rows<Rows>(rows, config, journal);
+    enqueue_qsa_known_rows<Rows>(prepared, config, 7U, qsa_window_pool(prepared.row[0], prepared.selection[0].ratio));
+}
+} // namespace
 void indexed_attention_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipIndexedAttentionLauncherConfig& config, HipQsaIndexJournal journal) {
-    if (rows.size() == 2U) enqueue_qsa_known_rows<2U>(prepare_qsa_known_rows<2U>(rows, config, journal), config);
-    else if (rows.size() == 4U) enqueue_qsa_known_rows<4U>(prepare_qsa_known_rows<4U>(rows, config, journal), config);
-    else if (rows.size() == 8U) enqueue_qsa_known_rows<8U>(prepare_qsa_known_rows<8U>(rows, config, journal), config);
+    if (rows.size() == 2U) enqueue_qsa_window_rows<2U>(rows, config, journal);
+    else if (rows.size() == 4U) enqueue_qsa_window_rows<4U>(rows, config, journal);
+    else if (rows.size() == 8U) enqueue_qsa_window_rows<8U>(rows, config, journal);
     else throw std::invalid_argument("QSA known-window requires exactly two, four or eight rows");
 }
 
