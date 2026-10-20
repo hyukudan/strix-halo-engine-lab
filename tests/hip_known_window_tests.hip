@@ -1152,7 +1152,8 @@ void qsa_cohort_family(bool dense, bool bf16_indexer) {
     std::vector<std::vector<std::uint32_t>> shapes{{2U, 2U}, {4U, 4U}, {2U, 2U, 4U}, {4U, 2U, 2U}};
     if (dense)
         for (const auto& wide : std::vector<std::vector<std::uint32_t>>{{8U, 8U}, {4U, 4U, 4U, 4U}, {8U, 4U, 2U, 2U},
-                 {2U, 2U, 2U, 2U, 2U, 2U, 2U, 2U}, {8U, 8U, 8U, 8U}, {8U, 4U, 4U, 8U, 2U, 2U, 2U, 2U}})
+                 {2U, 2U, 2U, 2U, 2U, 2U, 2U, 2U}, {8U, 8U, 8U, 8U}, {8U, 4U, 4U, 8U, 2U, 2U, 2U, 2U},
+                 {4U, 4U, 2U}, {8U, 4U, 2U}, {8U, 8U, 4U, 2U, 2U}})
             shapes.push_back(wide);
     const std::vector<std::vector<std::uint64_t>> placements{{0U, 6U, 2045U, 2047U, 1U, 2201U, 3U, 1000U},
         {2047U, 1U, 2201U, 3U, 2042U, 0U, 6U, 1500U}, {2201U, 2042U, 3U, 0U, 1000U, 6U, 2047U, 1U}};
@@ -1178,9 +1179,8 @@ void qsa_cohort_family(bool dense, bool bf16_indexer) {
         try { indexed_attention_known_window_cohort_preflight(segments); } catch (const std::invalid_argument&) { thrown = true; }
         require(thrown, message);
     };
-    rejected({2U, 4U}, false, "QSA cohort admits only 4, 8, 16 or 32 rows in total");
-    rejected({8U, 4U}, false, "QSA cohort admits only 4, 8, 16 or 32 rows in total");
-    if (!dense) rejected({8U, 8U}, false, "QSA cohort of 16 rows requires dense A8");
+    rejected({2U, 4U}, false, "QSA cohort admits only 4, 8 or 9..32 rows in total");
+    if (!dense) rejected({8U, 4U}, false, "QSA cohort of more than 8 rows requires dense A8");
     rejected({2U, 2U}, true, "QSA cohort rejects two segments of one session state");
     std::cout << "QSA cohort dense=" << dense << " bf16_indexer=" << bf16_indexer << ": " << compared
               << " cohort windows bit-exact against per-session windows\n";
@@ -1846,8 +1846,8 @@ void bench_hyper_rows(bool splitk, bool lane, std::uint32_t count, bool cold) {
 }
 // Terminal head over real window row views: the configured prefetch R1 head
 // per row is the oracle; device greedy rows land in host-mapped memory.
-// Cohort heads of 16 / 32 rows: the rows of several 8-row windows (own arenas), one launch, against
-// every row's R1 head.
+// Cohort heads of 9..32 rows: the rows of several 8-row windows (own arenas; the last one partly used), in
+// launches of at most 16 rows, against every row's R1 head.
 void family_lm_head_cohort_rows(std::uint32_t rows) {
     Owner owner;
     const auto model = ModelContract::qwen38_flash_next();
@@ -1875,7 +1875,7 @@ void family_lm_head_cohort_rows(std::uint32_t rows) {
     runtime.tensors.push_back({0, RuntimeTensorStorage::resident, device_weights.address, device_weights.bytes, 1, 0});
     ExecutionTensorAccessPlan access; access.manifest_layout_identity = manifest.layout_identity;
     access.plan_identity = 0x4b4e4f574e4c4d02ULL; access.accesses.push_back({step.id, SerialOp::lm_head, 0, {0}});
-    const auto arenas = rows / 8U;
+    const auto arenas = (rows + 7U) / 8U;
     std::vector<ExecutionMemoryBinding> memory(arenas);
     std::vector<ExecutionRuntimeResources> resources(arenas);
     for (std::uint32_t a = 0; a < arenas; ++a) {
@@ -2243,9 +2243,20 @@ void elementwise_rows_family() {
                     if (inject) inject_known_window_rows_launch(c, f.elementwise); else moe_combine_known_window_rows_launch(c, f.elementwise);
                 }, inject ? "inject" : "combine");
             if (rows == 4U && layer == 0U) rows_rejections(f, contexts, preflight);
+            // Cohort inject launch: the window's rows as session segments of 2/4 rows, one launch.
+            if (inject && rows == 8U)
+                for (const auto& sizes : std::vector<std::vector<std::size_t>>{{4U, 4U}, {2U, 2U, 4U}, {2U, 2U, 2U, 2U}}) {
+                    rows_equal_serial(f, contexts, [&](const ExecutionDispatchContext& c) { launcher.function(c, launcher.user_data); },
+                        [&](std::span<const ExecutionDispatchContext> c) {
+                            std::vector<std::span<const ExecutionDispatchContext>> segments;
+                            std::size_t first = 0;
+                            for (const auto size : sizes) { segments.push_back(c.subspan(first, size)); first += size; }
+                            inject_known_window_cohort_rows_launch(segments, f.elementwise);
+                        }, "inject cohort");
+                }
         }
     }
-    std::cout << "attn/mlp inject and MoE combine rows 2/4/8 equal serial bytes\n";
+    std::cout << "attn/mlp inject and MoE combine rows 2/4/8 (inject cohorts of 2/4-row segments) equal serial bytes\n";
 }
 
 // hipEvent timing: median over 25 samples (after 5 warmups) of 20 back-to-back
@@ -2399,7 +2410,7 @@ int main(int argc, char** argv) try {
     qsa_rows_family(false, false, false);
     for (bool dense : {false, true}) for (bool bf16_indexer : {true, false}) qsa_cohort_family(dense, bf16_indexer);
     for(auto rows:{2U,4U,8U}) family_lm_head_rows(rows);
-    for (auto rows : {16U, 32U}) family_lm_head_cohort_rows(rows);
+    for (auto rows : {9U, 12U, 16U, 17U, 24U, 32U}) family_lm_head_cohort_rows(rows);
     std::cout << "known-window shared/GDN/QSA/LM-head component fixtures passed\n";
     return 0;
 } catch (const std::exception& error) {

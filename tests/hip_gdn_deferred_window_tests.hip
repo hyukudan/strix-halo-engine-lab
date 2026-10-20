@@ -289,7 +289,8 @@ void cohort_scenarios(Fixture& f, unsigned& cases) {
     // Q8 and the dense A8 projections.
     const std::vector<Case> shapes{{{2U, 2U}}, {{4U, 4U}}, {{2U, 2U, 2U, 2U}}, {{2U, 2U, 4U}}, {{4U, 2U, 2U}}, {{2U, 6U}},
         {{1U, 7U}}, {{3U, 5U}}, {{1U, 1U}}, {{8U}}, {{8U, 8U}}, {{4U, 4U, 4U, 4U}}, {{8U, 4U, 2U, 2U}},
-        {{2U, 2U, 2U, 2U, 2U, 2U, 2U, 2U}}, {{8U, 8U, 8U, 8U}}, {{8U, 4U, 4U, 8U, 2U, 2U, 2U, 2U}}};
+        {{2U, 2U, 2U, 2U, 2U, 2U, 2U, 2U}}, {{8U, 8U, 8U, 8U}}, {{8U, 4U, 4U, 8U, 2U, 2U, 2U, 2U}},
+        {{4U, 4U, 2U}}, {{8U, 4U, 2U}}, {{8U, 8U, 4U, 2U, 2U}}, {{8U, 8U, 8U, 2U}}};
     const bool dense_before = f.config.dense_a8_projections;
     for (const bool dense : {false, true})
     for (const auto& shape : shapes) {

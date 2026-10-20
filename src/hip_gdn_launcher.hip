@@ -17,6 +17,7 @@
 #include "strix/hip_launch_context.hpp"
 #include "strix/graph_operator_control.hpp"
 
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <hip/hip_fp16.h>
@@ -5265,6 +5266,20 @@ GdnCohortBinding bind_gdn_window_cohort(std::span<const HipGdnWindowCohortSegmen
 }
 } // namespace
 
+// Shared sink of the padding rows of cohort projections (allocated on first use, grown on demand; the
+// stream is drained before a larger one replaces it).
+static std::byte* gdn_cohort_pad_sink(std::uint64_t bytes) {
+    static void* memory = nullptr;
+    static std::uint64_t held = 0;
+    static std::mutex mutex;
+    const std::lock_guard lock(mutex);
+    if (held < bytes) {
+        if (memory) { check_hip(hipDeviceSynchronize(), "drain GDN cohort pad sink"); check_hip(hipFree(memory), "free GDN cohort pad sink"); }
+        check_hip(hipMalloc(&memory, bytes), "allocate GDN cohort pad sink");
+        held = bytes;
+    }
+    return static_cast<std::byte*>(memory);
+}
 // Parts 1 and 4 of a cohort: 1..8 rows, or 16 / 32 rows (cohorts of several 8-row chunks; the 16-row-tile
 // projection forms, per-row arithmetic of the 1..8-row forms).
 template <class Body> void gdn_cohort_rows_dispatch(std::size_t rows, Body&& body) {
@@ -5298,20 +5313,30 @@ void gdn_window_cohort_enqueue(std::span<const GdnWindowCohortSegment> segments,
                 throw std::invalid_argument("GDN cohort window segments share session state");
         for (const auto& row : segment.rows) rows[count++] = row;
     }
-    // 16 / 32 rows: dense A8 projections only (the 16-row-tile WMMA forms; the FP32 Q8 wide forms do not
-    // keep the per-row arithmetic of the 1..8-row forms).
+    // More than 8 rows: dense A8 projections only (the 16-row-tile WMMA forms; the FP32 Q8 wide forms do not
+    // keep the per-row arithmetic of the 1..8-row forms). Totals other than 16 / 32 are padded for the
+    // projections with rows that read row 0's input and write only a sink no row reads.
     if (count > gdn_window_max_rows && !config.dense_a8_projections)
-        throw std::invalid_argument("GDN cohort window of 16 or 32 rows requires dense A8 projections");
+        throw std::invalid_argument("GDN cohort window of more than 8 rows requires dense A8 projections");
     const auto native = static_cast<hipStream_t>(stream);
-    const std::span<const GdnWindowRow> all(rows.data(), count);
-    gdn_cohort_rows_dispatch(count, [&](auto width) {
+    const auto padded = count <= gdn_window_max_rows || count == 16U || count == 32U ? count : count < 16U ? 16U : 32U;
+    if (padded > count) {
+        const auto shape = gdn_window_shape(config.model);
+        const auto workspace_bytes = ((static_cast<std::uint64_t>(shape.conv_width) + 2U * shape.value_width + 2U * shape.value_heads) *
+            sizeof(float) + 255U) / 256U * 256U;
+        const auto sink = gdn_cohort_pad_sink(workspace_bytes + static_cast<std::uint64_t>(config.model.hidden_size) * 2U);
+        for (auto r = count; r < padded; ++r)
+            rows[r] = {rows[0].input, reinterpret_cast<std::uint16_t*>(sink + workspace_bytes), reinterpret_cast<float*>(sink)};
+    }
+    const std::span<const GdnWindowRow> all(rows.data(), padded);
+    gdn_cohort_rows_dispatch(padded, [&](auto width) {
         enqueue_gdn_window<decltype(width)::value>(a, all, segments[0].control, config, native, 1U);
     });
     for (const auto& segment : segments)
         gdn_window_rows_dispatch(segment.rows.size(), [&](auto width) {
             enqueue_gdn_window<decltype(width)::value>(segment.layer, segment.rows, segment.control, config, native, 2U);
         });
-    gdn_cohort_rows_dispatch(count, [&](auto width) {
+    gdn_cohort_rows_dispatch(padded, [&](auto width) {
         enqueue_gdn_window<decltype(width)::value>(a, all, segments[0].control, config, native, 4U);
     });
 }

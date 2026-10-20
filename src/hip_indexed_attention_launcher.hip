@@ -5228,10 +5228,10 @@ QsaCohortPrepared prepare_qsa_cohort(std::span<const HipQsaCohortSegment> segmen
         out.first.push_back(static_cast<unsigned>(out.count));
         out.count += segment.rows.size();
     }
-    if (out.count != 4U && out.count != 8U && out.count != 16U && out.count != 32U)
-        throw std::invalid_argument("QSA cohort window requires 4, 8, 16 or 32 rows in total");
-    // 16 / 32 rows: dense A8 with a Q8_0 output projection only (the pre-quantized slot path; per row the
-    // arithmetic of the 1..8-row forms).
+    if (out.count != 4U && out.count != 8U && (out.count < 9U || out.count > 32U))
+        throw std::invalid_argument("QSA cohort window requires 4, 8 or 9..32 rows in total");
+    // More than 8 rows: dense A8 with a Q8_0 output projection only (the pre-quantized slot path; per row the
+    // arithmetic of the 1..8-row forms), padded to 16 / 32 rows for the projections.
     if (out.count > 8U) {
         const auto& p0 = std::visit([](const auto& p) -> const PreparedIndexedLaunch& { return p.row[0]; }, out.segments[0]);
         if (!segments[0].config->dense_a8_projections || p0.tensors.out.manifest->ggml_type != 8U)
@@ -5260,10 +5260,37 @@ QsaCohortPrepared prepare_qsa_cohort(std::span<const HipQsaCohortSegment> segmen
     }
     return out;
 }
+// Shared sink of the padding rows of cohort projections (workspace and output; grown on demand).
+std::uintptr_t qsa_cohort_pad_sink(std::uint64_t bytes) {
+    static void* memory = nullptr;
+    static std::uint64_t held = 0;
+    static std::mutex mutex;
+    const std::lock_guard lock(mutex);
+    if (held < bytes) {
+        if (memory) { check_hip(hipDeviceSynchronize(), "drain QSA cohort pad sink"); check_hip(hipFree(memory), "free QSA cohort pad sink"); }
+        check_hip(hipMalloc(&memory, bytes), "allocate QSA cohort pad sink");
+        held = bytes;
+    }
+    return reinterpret_cast<std::uintptr_t>(memory);
+}
 // The rows of every segment as one T-row view for the state-free parts (input and output projections).
+// Rows past the segments' (padding up to 16 / 32) read row 0's input and write only the pad sink.
 template <unsigned Rows>
 QsaKnownRows<Rows> qsa_cohort_rows(const QsaCohortPrepared& prepared) {
     QsaKnownRows<Rows> all{};
+    if (prepared.count < Rows) {
+        const auto& head = std::visit([](const auto& p) -> const PreparedIndexedLaunch& { return p.row[0]; }, prepared.segments[0]);
+        const auto workspace = (head.workspace_layout.total_bytes + 255U) / 256U * 256U;
+        const auto sink = qsa_cohort_pad_sink(workspace + static_cast<std::uint64_t>(head.hidden) * 2U);
+        auto pad = head;
+        pad.temporary = {pad.temporary.use, sink, head.workspace_layout.total_bytes, pad.temporary.allocation_generation};
+        pad.workspace = workspace_pointers(pad.temporary, head.workspace_layout);
+        pad.output = {pad.output.use, sink + workspace, static_cast<std::uint64_t>(head.hidden) * 2U, pad.output.allocation_generation};
+        const auto& selection = std::visit([](const auto& p) -> const PreparedIndexedSelection& { return p.selection[0]; }, prepared.segments[0]);
+        for (auto r = static_cast<unsigned>(prepared.count); r < Rows; ++r) {
+            all.row[r] = pad; all.selection[r] = selection; all.position[r] = std::visit([](const auto& p) { return p.position[0]; }, prepared.segments[0]);
+        }
+    }
     for (std::size_t s = 0; s < prepared.segments.size(); ++s)
         std::visit([&](const auto& p) {
             constexpr auto count = std::tuple_size_v<decltype(p.row)>;
@@ -5288,7 +5315,7 @@ void indexed_attention_known_window_cohort_launch(std::span<const HipQsaCohortSe
     const auto merged = [&](unsigned part) {
         if (prepared.count == 4U) enqueue_qsa_known_rows<4U>(qsa_cohort_rows<4U>(prepared), config, part, nullptr, 0U, &slot);
         else if (prepared.count == 8U) enqueue_qsa_known_rows<8U>(qsa_cohort_rows<8U>(prepared), config, part, nullptr, 0U, &slot);
-        else if (prepared.count == 16U) enqueue_qsa_known_rows<16U>(qsa_cohort_rows<16U>(prepared), config, part, nullptr, 0U, &slot);
+        else if (prepared.count <= 16U) enqueue_qsa_known_rows<16U>(qsa_cohort_rows<16U>(prepared), config, part, nullptr, 0U, &slot);
         else enqueue_qsa_known_rows<32U>(qsa_cohort_rows<32U>(prepared), config, part, nullptr, 0U, &slot);
     };
     merged(1U);

@@ -136,7 +136,7 @@ template<unsigned H,unsigned E> struct Fixture {
         const auto layout=moe_q4k_a8::build_runtime_workspace(H,I,E,K,true,profile.a8);
         alloc(uses.reads[0],H*2U);alloc(uses.reads[1],K*4U);alloc(uses.reads[2],K*4U);
         alloc(uses.writes[0],H*2U);alloc(uses.temporaries[0],layout.total_bytes);
-        const unsigned per=std::min(count,8U),arenas=count/per;
+        const unsigned per=std::min(count,8U),arenas=(count+per-1U)/per;
         serial.naive_nonaliased_bytes=serial.total_bytes;window=build_known_window_arena(serial,256U,per);
         const auto arena_bytes=(window.physical.total_bytes+255U)/256U*256U;
         scratch=owner->allocate(arena_bytes*arenas);memory={0x4d4f45524f575301ULL,scratch.address,window.physical.total_bytes,31U};
@@ -477,7 +477,7 @@ int main(int argc,char** argv) try {
     }
     if(argc>3&&std::string(argv[3])!="f32") {
         const unsigned rows=static_cast<unsigned>(std::stoul(argv[1]));
-        require(rows==2U||rows==4U||rows==8U||rows==16U||rows==32U,"known routed A8 fixture rows must be 2/4/8/16/32");
+        require(rows==2U||rows==4U||rows==8U||(rows>=9U&&rows<=32U),"known routed A8 fixture rows must be 2/4/8 or 9..32");
         a8_fixture(rows,parse_profile(argv[3]));
         std::cout<<"known routed rows "<<rows<<' '<<argv[3]<<" A8 fixture completed\n";return 0;
     }

@@ -14,7 +14,7 @@ inline constexpr std::string_view organization_identity =
 // Source-declared staging arrays only; compiled LDS/register/private usage
 // remains a compiler qualification result. Geometry is bounded before products.
 [[nodiscard]] inline std::uint64_t staged_activation_bytes(std::uint32_t rows) {
-    if(rows!=2U&&rows!=4U&&rows!=8U&&rows!=16U&&rows!=32U)throw std::invalid_argument("A8 CSR staging requires R2/R4/R8/R16/R32");
+    if(rows<2U||rows>max_union_rows)throw std::invalid_argument("A8 CSR staging requires 2..32 rows");
     return static_cast<std::uint64_t>(rows)*(max_hidden+2ULL*(max_hidden/32U)*sizeof(std::uint32_t));
 }
 // Per-row Bindings retain the exact R1 views and numerical contract. Quantize

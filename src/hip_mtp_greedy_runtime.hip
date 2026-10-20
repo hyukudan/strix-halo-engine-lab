@@ -410,16 +410,14 @@ std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(std::span<const
     // STRIX_COHORT_MAX_ROWS=2|4|8 overrides it.
     static const std::uint32_t max_rows_override=[]{const char* v=std::getenv("STRIX_COHORT_MAX_ROWS");
         const auto n=v?std::atoi(v):0;return n==2||n==4||n==8?static_cast<std::uint32_t>(n):0U;}();
-    // STRIX_COHORT_ROWS=16|32: a global row budget per cycle instead of one 8-row cohort. Each session gets
-    // the largest of 8/4/2 rows that keeps sessions x rows within the budget; the sessions of a group (up
-    // to the budget) run in one stream of steps as chunks of at most eight rows (verify_cohort over chunks).
+    // STRIX_COHORT_ROWS=16|32: a global row budget per cycle instead of one 8-row cohort. Each session keeps
+    // the rows it gets in an 8-row cohort (8 / sessions, at least 2), so up to four sessions run as before and
+    // more fill one group of up to the budget instead of several cohorts; the sessions of a group run in one
+    // stream of steps as chunks of at most eight rows (verify_cohort over chunks). Measured: more rows per
+    // session (4 at four sessions, 8 at two) cost more than the drafts they accept.
     static const std::uint32_t budget_rows=[]{const char* v=std::getenv("STRIX_COHORT_ROWS");
         const auto n=v?std::atoi(v):0;return n==16||n==32?static_cast<std::uint32_t>(n):0U;}();
-    const auto budget_cap=[&]{
-        std::uint32_t r=8U;while(r>2U && members.size()*r>budget_rows) r/=2U;return r;
-    };
-    const std::uint32_t cap=max_rows_override?max_rows_override:budget_rows?budget_cap():
-        members.size()>=3U?2U:members.size()==2U?4U:8U;
+    const std::uint32_t cap=max_rows_override?max_rows_override:members.size()>=3U?2U:members.size()==2U?4U:8U;
     try {
         for(std::size_t m=0;m<members.size();++m) {
             const auto& c=members[m];

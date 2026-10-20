@@ -72,7 +72,10 @@ window stream shared by all slots. The calibration replay runs once.
   progress while prompts wait, later full cohorts); `STRIX_BATCH_INTERLEAVE=0` runs each prompt whole at admission.
 - A cycle decodes every request past its prompt: with two or more it is a cohort cycle (cohort windows, D-039: each
   request drafts up to 8 / requests rows, at least 2, and requests are packed into 4- and 8-row windows whose
-  weight-reading steps run once for all rows), with one the ordinary cycle.
+  weight-reading steps run once for all rows), with one the ordinary cycle. With five to eight requests,
+  `STRIX_COHORT_ROWS=16 STRIX_COHORT_WIDE=all` runs the cycle as one group of up to 16 rows whose GDN/QSA
+  projections, LM head and expert union run once for all rows (D-052,
+  [multi-request cohort](multi-request-cohort.md#global-row-budget-and-wide-steps-opt-in)).
 - A request leaves its slot when it ends (stop token, budget, context, stop string, disconnect), without stopping the
   others; its slot is free for the next queued request.
 - Greedy requests return exactly the tokens they return alone (and on the one-at-a-time route): every request keeps

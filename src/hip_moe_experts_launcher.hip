@@ -2417,10 +2417,10 @@ hipStream_t known_moe_rows_stream() {
 // striped_weights: the caller checks the row stripes against every weight tensor once.
 KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchContext> rows,
     const HipMoeExpertsLauncherConfig& config, const q51_known_rows::Workspace& extra, bool striped_weights = false) {
-    // 16 / 32 rows: a cohort union of several sessions' windows (A8 profile only).
+    // 9..32 rows: a cohort union of several sessions' windows (A8 profile only).
     if (rows.size() != 2U && rows.size() != 4U && rows.size() != 8U &&
-        !((rows.size() == 16U || rows.size() == 32U) && known_window_cohort_active() && (config.a8_down_q51 || config.a8_down_q80)))
-        throw std::invalid_argument("known-window routed rows require R2/R4/R8 (16/32: an A8 cohort union)");
+        !(rows.size() >= 9U && rows.size() <= kKnownMoeMaxRows && known_window_cohort_active() && (config.a8_down_q51 || config.a8_down_q80)))
+        throw std::invalid_argument("known-window routed rows require R2/R4/R8 (9..32: an A8 cohort union)");
     const auto layout = q51_known_rows::scratch_layout(static_cast<std::uint32_t>(rows.size()),
         config.expert_count, config.top_k);
     validate_config(config);

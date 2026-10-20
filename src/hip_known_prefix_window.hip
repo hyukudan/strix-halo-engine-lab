@@ -16,6 +16,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <tuple>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -26,6 +28,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -123,7 +126,7 @@ struct HipKnownPrefixWindow::Impl {
     HipElementwiseLauncherConfig elementwise_config;
     q51_known_rows::Workspace routed_workspace;
     q51_known_rows::Workspace prefill_routed_workspace; // all T rows of a prefill step (STRIX_PREFILL_FULL_MOE)
-    q51_known_rows::Workspace cohort_union_workspace[2]; // wide cohort unions of 16 / 32 rows (allocated on first use)
+    std::map<std::uint32_t, q51_known_rows::Workspace> cohort_union_workspace; // wide cohort unions per row count (on first use)
     q51_known_rows::Summary pending_union_summary;
     std::uint32_t last_union_layer = 0;
     std::optional<HipKnownPrefixUnionObservation> last_union_observation;
@@ -272,9 +275,9 @@ struct HipKnownPrefixWindow::Impl {
     }
     ~Impl() { guard.recover_or_fail_stop(); }
     bool full_prefill_union() const noexcept {return prefill&&prefill_routed_workspace.owner;}
-    // The CSR workspace of a wide cohort union of 16 or 32 rows enqueued on this owner's stream.
+    // The CSR workspace of a wide cohort union of 9..32 rows enqueued on this owner's stream.
     const q51_known_rows::Workspace& cohort_union(std::uint32_t rows) {
-        auto& slot = cohort_union_workspace[rows == 32U ? 1U : 0U];
+        auto& slot = cohort_union_workspace[rows];
         if (slot.owner) return slot;
         const auto bytes = q51_known_rows::required_scratch_bytes(rows, routed_config.expert_count, routed_config.top_k);
         void* memory = nullptr;
@@ -283,7 +286,7 @@ struct HipKnownPrefixWindow::Impl {
         const auto base = reinterpret_cast<std::uintptr_t>(memory);
         if (base % 256U) throw std::runtime_error("known-window cohort routed CSR allocation is not 256-byte aligned");
         status_disjoint(base, bytes);
-        slot = {{execution_identity(), base, bytes, routed_workspace.memory.allocation_generation ^ (rows == 32U ? 3ULL : 2ULL) << 61U}, owner};
+        slot = {{execution_identity(), base, bytes, routed_workspace.memory.allocation_generation ^ (static_cast<std::uint64_t>(rows) << 56U)}, owner};
         return slot;
     }
     std::uint64_t execution_identity() const noexcept {return prefill?prefill->prefill_execution_identity:window.window_execution_identity;}
@@ -1188,11 +1191,12 @@ struct HipKnownPrefixWindow::Impl {
         }
         return true;
     }
-    // STRIX_COHORT_WIDE=gdn (comma list; "all"): with two or more chunks, the listed steps run once for the
-    // rows of every chunk (16 or 32 rows) instead of once per chunk. Per-row arithmetic as in the chunk.
+    // STRIX_COHORT_WIDE=gdn,qsa,head,moe,inject (comma list; "all" = gdn,qsa,head,moe): with two or more chunks,
+    // the listed steps run once for the rows of every chunk (9..32 rows) instead of once per chunk. Per-row
+    // arithmetic as in the chunk. The wide inject measured slower than the per-request launches it replaces.
     static bool cohort_wide_enabled(const char* family) {
         static const std::string list = [] { const char* v = std::getenv("STRIX_COHORT_WIDE"); return std::string(v ? v : ""); }();
-        if (list == "all") return true;
+        if (list == "all") return std::string_view(family) != "inject";
         std::size_t at = 0;
         while (at <= list.size()) {
             const auto end = std::min(list.find(',', at), list.size());
@@ -1208,13 +1212,14 @@ struct HipKnownPrefixWindow::Impl {
             if (!m.run->wide_step(i) || m.impl->window.mode[i] != mode) return false;
             total += m.run->rows();
         }
-        if (total != 16U && total != 32U) return false;
+        if (total < 9U || total > 32U) return false;
         switch (mode) {
         case KnownWindowStepMode::gdn_deferred_rows:
             // 16 / 32 rows: dense A8 projections only (gdn_window_cohort_enqueue).
             for (const auto& m : members) if (!m.impl->gdn_window_config.gdn.dense_a8_projections) return false;
             return cohort_wide_enabled("gdn");
         case KnownWindowStepMode::lm_head_rows: return cohort_wide_enabled("head");
+        case KnownWindowStepMode::inject_rows: return cohort_wide_enabled("inject");
         case KnownWindowStepMode::routed_expert_union: return cohort_wide_union(members);
         case KnownWindowStepMode::qsa_rows:
             // 16 / 32 rows: dense A8 only (the launcher also requires a Q8_0 output projection).
@@ -1235,7 +1240,7 @@ struct HipKnownPrefixWindow::Impl {
             if (!m.impl->window.routed_expert_union_steps || !(c.a8_down_q51 || c.a8_down_q80) || m.impl->active_rows) return false;
             total += m.impl->logical_rows();
         }
-        return total == 16U || total == 32U;
+        return total >= 9U && total <= 32U;
     }
     static void launch_cohort_wide(std::size_t i, std::span<CohortMember> members) {
         const KnownWindowCohortScope cohort;
@@ -1258,6 +1263,12 @@ struct HipKnownPrefixWindow::Impl {
             std::vector<HipQsaCohortSegment> segments;
             for (const auto& m : members) segments.push_back({m.run->step_rows(i), &m.impl->qsa_for(m.run->step_rows(i))});
             indexed_attention_known_window_cohort_launch(segments);
+            break;
+        }
+        case KnownWindowStepMode::inject_rows: {
+            std::vector<std::span<const ExecutionDispatchContext>> segments;
+            for (const auto& m : members) segments.push_back(m.run->step_rows(i));
+            inject_known_window_cohort_rows_launch(segments, members[0].impl->elementwise_config);
             break;
         }
         case KnownWindowStepMode::lm_head_rows: {
@@ -1373,6 +1384,7 @@ struct HipKnownPrefixWindow::Impl {
     // chunk's total rows; its shared steps run once for the chunk's rows, as in a one-chunk cohort) or a
     // lone member (null primary) whose steps are all its own launches. The chunks run step by step on one
     // stream: step i of every chunk before step i + 1 of any.
+    static bool& cohort_last_wide() { thread_local bool wide = false; return wide; }
     static std::vector<HipMtpTargetWindowExecution> execute_cohort_chunks(std::span<Impl* const> primaries,
         std::span<const std::size_t> sizes, std::span<CohortMember> members) {
         if (primaries.empty() || primaries.size() != sizes.size() || members.size() < 2U)
@@ -1535,6 +1547,7 @@ struct HipKnownPrefixWindow::Impl {
                     }
                 }
             }
+            cohort_last_wide() = wide_count != 0U;
             if (log_call) {
                 std::uint32_t total = 0;
                 for (const auto& m : members) total += m.run->rows();
@@ -1782,7 +1795,28 @@ std::vector<HipMtpTargetWindowExecution> HipKnownPrefixWindow::execute_mtp_cohor
     }
     std::vector<Impl*> impls;
     for (auto* p : primaries) impls.push_back(p ? p->impl_.get() : nullptr);
-    return Impl::execute_cohort_chunks(impls, chunk_members, owned);
+    // STRIX_COHORT_WIDE_LOG=1: at exit, calls and mean host wall time (launch to completion) per total rows,
+    // chunk count and whether any step ran wide.
+    struct Timing {
+        std::map<std::tuple<std::uint32_t, std::size_t, bool>, std::pair<std::uint64_t, double>> calls;
+        ~Timing() {
+            for (const auto& [key, value] : calls)
+                std::fprintf(stderr, "cohort timing rows %u chunks %zu wide %d: %llu calls x %.3f ms\n", std::get<0>(key), std::get<1>(key),
+                    std::get<2>(key) ? 1 : 0, static_cast<unsigned long long>(value.first), value.second / static_cast<double>(value.first));
+        }
+    };
+    static const bool timed = std::getenv("STRIX_COHORT_WIDE_LOG") != nullptr;
+    const auto start = std::chrono::steady_clock::now();
+    auto out = Impl::execute_cohort_chunks(impls, chunk_members, owned);
+    if (timed) {
+        static Timing timing;
+        std::uint32_t rows = 0;
+        for (const auto& m : members) rows += m.window->logical_rows();
+        auto& entry = timing.calls[{rows, chunk_members.size(), Impl::cohort_last_wide()}];
+        ++entry.first;
+        entry.second += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    }
+    return out;
 }
 void HipKnownPrefixWindow::attach_greedy_rows(ExecutionBufferAddress partials,HipGreedyRowsReply* replies) {
     impl_->attach_greedy_rows(partials,replies);

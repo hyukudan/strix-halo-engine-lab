@@ -1330,8 +1330,8 @@ bool overlap(DeviceBytes a,DeviceBytes b){return a.address<b.address+b.bytes&&b.
 void range(DeviceBytes v){if(!v.address||!v.bytes||v.bytes>UINTPTR_MAX-v.address)throw std::invalid_argument("A8 CSR gate/up owner range is invalid");}
 struct Prepared {DeviceRows rows;DeviceCsr csr;};
 Prepared prepare(const Request& request,std::span<const Bindings> rows,const q51_known_rows::Workspace& workspace,hipStream_t stream) {
-    if(rows.size()!=2U&&rows.size()!=4U&&rows.size()!=8U&&rows.size()!=16U&&rows.size()!=32U)
-        throw std::invalid_argument("A8 CSR gate/up requires R2/R4/R8 (or a 16/32-row cohort union)");
+    if(rows.size()!=2U&&rows.size()!=4U&&rows.size()!=8U&&(rows.size()<9U||rows.size()>max_union_rows))
+        throw std::invalid_argument("A8 CSR gate/up requires R2/R4/R8 (or a cohort union of 9..32 rows)");
     // The bound of the all-rows staging form (project_csr); cohort unions run the window kernels only.
     if(rows.size()<=8U&&staged_activation_bytes(static_cast<unsigned>(rows.size()))>65536U)
         throw std::invalid_argument("A8 CSR gate/up staging exceeds bounded LDS budget");
@@ -1443,7 +1443,7 @@ void enqueue_window(const Request& request,std::span<const Bindings> rows,const 
 #define STRIX_A8_WINDOW_DOWN(R,Q51) \
     hipLaunchKernelGGL(HIP_KERNEL_NAME(down_window<R,Q51>),down_grid,dim3(256),0,stream,down,p.rows,p.csr, \
         count,request.shape.hidden,request.shape.rows)
-    // 16 / 32 rows: the CSR caps batches at 8 assignments, so the 8-row form stages every batch.
+    // Cohort unions of 9..32 rows: the CSR caps batches at 8 assignments, so the 8-row form stages every batch.
     if(window.down_type==7U){if(count==2U){STRIX_A8_WINDOW_DOWN(2U,true);}else if(count==4U){STRIX_A8_WINDOW_DOWN(4U,true);}else{STRIX_A8_WINDOW_DOWN(8U,true);}}
     else {if(count==2U){STRIX_A8_WINDOW_DOWN(2U,false);}else if(count==4U){STRIX_A8_WINDOW_DOWN(4U,false);}else{STRIX_A8_WINDOW_DOWN(8U,false);}}
 #undef STRIX_A8_WINDOW_DOWN

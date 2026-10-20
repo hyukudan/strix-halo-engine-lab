@@ -82,10 +82,12 @@ for the aggregate rate.
 
 ### Global row budget and wide steps (opt-in)
 
-`STRIX_COHORT_ROWS=16|32` replaces the one 8-row cohort per cycle by a row budget: each request gets the
-largest of 8, 4 or 2 rows that keeps requests x rows within the budget (4 requests at 16 rows: 4 rows
-each; 8 requests: 2 rows at 16, 4 rows at 32; 2 requests: 8 rows each). Requests fill groups of at most
-the budget; a group's requests fill chunks of at most 8 rows (largest windows first). A chunk of two or more
+`STRIX_COHORT_ROWS=16|32` replaces the one 8-row cohort per cycle by a row budget. Each request keeps the
+rows it has in an 8-row cohort (8 / requests, at least 2; `STRIX_COHORT_MAX_ROWS` overrides), so up to four
+requests run as before, and five to eight requests (10 to 16 rows) fill one group instead of two cohorts.
+More rows per request (4 rows each at four requests, 8 at two) were measured to cost more than the drafts
+they accept. Requests fill groups of at most the budget; a group's requests fill chunks of at most 8 rows
+(largest windows first). A chunk of two or more
 requests whose rows add up to 4 or 8 runs on an idle owner of that row count that no request of the group
 verifies with (its primary, as an ordinary cohort); any other request runs as a chunk of its own with its
 own window. The chunks of a group advance step by step on the shared stream
@@ -93,17 +95,19 @@ own window. The chunks of a group advance step by step on the shared stream
 padding rows are added. With chunks only, every chunk still reads the weights of its shared steps.
 
 `STRIX_COHORT_WIDE=gdn,qsa,head,moe` (or `all`) additionally runs the listed steps once for the rows of all
-chunks when they add up to 16 or 32 rows:
+chunks when they add up to 9..32 rows (the dense projections pad to 16 or 32 rows with rows that read the
+first row's input and write only a sink buffer no row reads):
 
 | Step | Wide form | Per-row arithmetic |
 | --- | --- | --- |
-| GDN layer (`gdn`) | Input and output projections as one 16- or 32-row dense A8 launch (16-row WMMA tiles from the same pitch-64 activation slot); prepare and recurrence per session | Dense A8 only: the chain per (row, output) of the 1..8-row form |
+| GDN layer (`gdn`) | Input and output projections as one 16- or 32-row dense A8 launch (16-row WMMA tiles from the same pitch-64 activation slot); prepare and recurrence per session | Dense A8 only (the FP32 Q8 wide forms do not keep the 1..8-row bits): the chain per (row, output) of the 1..8-row form |
 | QSA layer (`qsa`) | Input and output projections as one launch; norm, KV append, selection and attention per session | Dense A8 with a Q8_0 output projection only |
-| LM head (`head`) | One unstaged 16-row launch (two for 32 rows); each request's greedy rows into its own replies | The R1 leaf, lane-tree and local-tree DAG per row |
-| Routed experts (`moe`) | One expert union over all rows on the lead request's stream, with a 16/32-row CSR workspace; down in batches of at most 8 assignments | Per (row, slot) accumulators, merge in slot order (A8 profile only) |
+| LM head (`head`) | Unstaged launches of at most 16 rows; each request's greedy rows into its own replies | The R1 leaf, lane-tree and local-tree DAG per row |
+| Routed experts (`moe`) | One expert union over all rows on the lead request's stream, with a CSR workspace per row count; down in batches of at most 8 assignments | Per (row, slot) accumulators, merge in slot order (A8 profile only) |
+| Injections (`inject`, not in `all`) | One launch over all rows | Elementwise per row; measured slower than the per-request launches (147 to 161 ms per 16-row step) |
 
 HC mixers, router and shared expert stay per chunk: their weights per layer (about 5-7 MB) are re-read
-from the MALL by the second chunk. A wide union's status covers all its rows: a failing row fails the
+from the MALL by the second chunk. MoE combines stay per request (each waits for its chunk's shared expert). A wide union's status covers all its rows: a failing row fails the
 whole cohort window, as in an 8-row cohort.
 
 ## Exactness
@@ -130,8 +134,8 @@ tokens are compared with its own single-request run.
 | `STRIX_COHORT_SHARED_EXPERT=0` | Shared steps as above except the shared expert, which runs per request. |
 | `STRIX_COHORT_MAX_ROWS=2\|4\|8` | Per-request row cap in a cohort cycle (default 8 / requests; with a budget, budget / requests). |
 | `STRIX_COHORT_ROWS=16\|32` | Global row budget per cycle: chunks of up to 8 rows in one stream of steps. |
-| `STRIX_COHORT_WIDE=gdn,qsa,head,moe\|all` | With a budget: the listed steps once for all chunks' rows (16 or 32). |
-| `STRIX_COHORT_WIDE_LOG=1` | Per cohort call (first 4, then every 256th): chunks, rows and steps run wide, per chunk and per request. |
+| `STRIX_COHORT_WIDE=gdn,qsa,head,moe,inject\|all` | With a budget: the listed steps once for all chunks' rows (9..32; `all` = gdn,qsa,head,moe). |
+| `STRIX_COHORT_WIDE_LOG=1` | Per cohort call (first 4, then every 256th): chunks, rows and steps run wide, per chunk and per request; at exit, calls and mean wall ms per row total, chunk count and wide or not. |
 
 The receipt (`mode` `native-mtp-cohort-...`) reports `mtp_cohort_wall_ms`, `mtp_cohort_generated_tokens`,
 `mtp_cohort_aggregate_tokens_per_second`, cohort window counts and, per request, its replay errors, cycles,

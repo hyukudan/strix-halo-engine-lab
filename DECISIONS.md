@@ -867,6 +867,44 @@ Single smoke runs, not a campaign (dense A8, windows 2/4/8, 256 tokens per reque
 line 63.6 tok/s aggregate (cycles only) against 43.6 sequential, eight 58.7 against 40.6; the server took 49.8 s for
 eight concurrent short requests against 69.7 s one at a time.
 
+## D-052: cohort cycles of up to 32 rows with wide shared steps (`STRIX_COHORT_ROWS`, `STRIX_COHORT_WIDE`, opt-in)
+
+A cohort window (D-039) already ran the steps that read only weights once for the rows of all its sessions, but
+one window held at most 8 rows: with five to eight requests every cycle needed two cohort windows, each reading the
+fixed weights (GDN/QSA projections, LM head, HC, router, shared expert) and its own expert union. With
+`STRIX_COHORT_ROWS=16|32` the sessions of a cycle form one group of up to that many rows, run as chunks of at most
+8 rows that advance step by step on one stream (`HipKnownPrefixWindow::execute_mtp_cohort_chunks`; a chunk of two
+or more sessions has a primary owner as before, a lone session runs its own window). Each session keeps its 8-row
+cohort row count (8 / sessions, at least 2), so up to four requests run as before. With `STRIX_COHORT_WIDE` (`all`
+= gdn, qsa, head, moe) these steps run once for the rows of all chunks (9 to 32 rows): the GDN and QSA input and
+output projections (dense A8, 16-row WMMA tiles, padded to 16 or 32 rows with rows that read the first row's input
+and write a sink), the LM head (unstaged launches of up to 16 rows) and the routed expert union (CSR per row count,
+down in batches of at most 8 assignments). Recurrence, attention, PLE, combines and injections stay per session;
+HC, router and shared expert per chunk (their per-layer weights are re-read from the MALL). It applies to the
+command-line cohort and to `--http-batch` alike. See [docs/multi-request-cohort.md](docs/multi-request-cohort.md).
+
+Why: an independent request shares few experts with another (on six prompts' route logs the union of N requests'
+windows is 72-95 % of their separate expert bytes), so the gain of fusing is the fixed weights read once per cycle
+instead of once per cohort window, plus the cross-request expert overlap; it only exists where a cycle needed more
+than one cohort window. Alternatives measured and not taken as defaults: more rows per request at the same
+budget (4 rows each at four requests: 62 tok/s against 71.5; 8 each at two: 52 against 60, the extra drafts are
+rarely accepted), and the wide inject launch (`inject`, opt-in: 16-row steps 161 ms against 147.5 ms without it).
+The FP32 Q8 wide projection forms were found not to keep the per-row bits of the 1..8-row forms (a GDN cohort
+fixture differed at row 8), so the wide GDN and QSA steps require dense A8. Status: opt-in.
+
+| Check | Result |
+| --- | --- |
+| `strix-hip-gdn-deferred-window-tests`: cohorts of up to 8 sessions and 10-32 rows (dense A8) against each session's own window | 588 scenarios bit-exact (outputs, workspaces, matrix, conv history); totals > 8 without dense A8 rejected |
+| `strix-hip-known-window-tests`: QSA cohorts of 2-8 sessions at mixed positions (10-32 rows dense A8), LM head rows 9-32 from several arenas against R1, inject cohorts of 2/4-row segments | Bit-exact |
+| `strix-hip-moe-known-rows-tests 12/16/17/24/32 1 a8q51/a8q80/a8q5k`: unions over several arenas against the serial A8 rows, experts shared by up to all rows | Whole arena identical |
+| Command line (code1k + prose1k, es2, en2, p43, esprose, frprose, enconv), N = 2, 4, 6, 8, budgets 16 and 32, wide sets, every request against its sequential run | Identical, replay error 0 |
+| Server `--http-batch 8`, eight concurrent short requests, fused against unfused | Token IDs identical (8 of 8) |
+
+Single smoke runs, not a campaign (dense A8, windows 2/4/8, 256 tokens per request, same binary): six requests
+62.2 tok/s aggregate as two cohort windows per cycle against 77.7 fused (12 rows); eight 74.3 against 85.2 (16 rows,
+`gdn,qsa,head,moe`); sequential 44.9 and 44.3. The server took 42.9 s for eight concurrent short requests fused
+(with the wide inject) against 46.9 s.
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |
