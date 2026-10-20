@@ -963,6 +963,7 @@ the decode window (a later phase). Status: opt-in.
 | --- | --- |
 | `strix-compiled-speculative-verify-tests`: three sessions (16/32/24 rows, different start positions) as one segmented block against each block alone, shared and per-segment steps, terminal-row and state-only | State words, generations, positions, heads, lineage and observed rows identical; admission faults change nothing, a dispatch fault poisons every segment once |
 | Server `--http-batch 8`, dense A8, T = 2048 + tails 1024/256/64/16, code1k/docedit-en/es2/p43, N = 2/4/8 staggered 0.3 s against each alone (same server) | Every request's 32 token IDs identical; 7 groups of 2-5 blocks, up to 1360 rows |
+| Integration (integrate/qwen): cohort requests on the tiled prompt, lockstep N = 4 | Rejected at first ("known prefill routed rows source/position/owner differs"): the positional request's tiled owners hold the state layout object of the main resources, the further requests' stacks another copy of the same layout. The segmented prefill now gives every segment the lead's layout object, as it already did for the manifest, weights and access plan (the identities are checked equal). Dense, fast prefill profile and a 8192-row group owner then run; fixture: further sessions with their own layout copy |
 
 ## D-055: decode defaults from the final campaign (draft profiles, min-p by draft, n-gram auto)
 
@@ -987,6 +988,20 @@ without `--mtp-spec-min-p` vs the explicit pins and 0.7 (code prompt: tokens and
 47/76 accepted); document correction on the tiled route, `auto` vs explicit `on` vs `off` (tokens and schedule
 identical); English chat on the serial route, `auto` vs `off` (identical); the server on the document-correction
 prompt by default, with `"ngram_draft": false` and `true`: the command line's 64 tokens in all three.
+
+## D-056: tail blocks of the tiled prefill by default (`--known-prefix-tail-rows`)
+
+With full rows and an output head, the tiled prefill now takes the tail sizes 1024, 256, 64 and 16 that are below T
+when `--known-prefix-tail-rows` is not given; `--known-prefix-tail-rows none` keeps the old behaviour. The remainder
+after the last complete T-row block, and the whole prompt when it is shorter than T, then runs as tail blocks, the
+largest that fits first, and only the last fewer than 16 rows run serially.
+
+Why: the server runs a fixed T (2048, or 8192 with the fast prefill profile). Without tails a 1K prompt never fills a
+block and ran all 1024 rows serially: about 45 s on cluster node 1, against about 1.5 s as a tail block (found by the
+integrated measurement of cohort requests, whose 1K members' prompts took 45 s each). Every tail size compiles its
+own tiled owner, which costs setup time and memory per size; four sizes bound the serial remainder to 15 rows.
+
+Checked: TAILS-GATE.
 
 ## Measured and rejected
 

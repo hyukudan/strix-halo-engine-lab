@@ -12,6 +12,7 @@
 #include "strix/model_contract.hpp"
 #include "strix/wave_router_contract.hpp"
 #include <algorithm>
+#include <array>
 #include "strix/token_sampling.hpp"
 #include "strix/mtp_draft_profiles.hpp"
 #include <cerrno>
@@ -335,8 +336,10 @@ struct Options {
     bool prompt_lookup_snapshot_explicit = false, prompt_lookup_snapshot_bytes_explicit = false;
     bool device_queue_trace = false;
     std::uint32_t known_prefix_prefill_rows = 0;
-    // Optional smaller tiled blocks (descending) for the remainder after the last complete T-row block.
+    // Smaller tiled blocks (descending) for the remainder after the last complete T-row block; by default the
+    // sizes of default_known_prefill_tail_rows below T (D-056), none with `--known-prefix-tail-rows none`.
     std::vector<std::uint32_t> known_prefix_tail_rows;
+    bool known_prefix_tail_rows_off = false;
     bool known_prefix_prefill_explicit = false;
     std::uint64_t known_prefill_workspace_budget = 0, known_prefill_metadata_budget = 0;
     std::uint64_t known_prefill_uma_budget = 0, known_prefill_host_headroom = 0;
@@ -720,6 +723,21 @@ inline void validate_http_serve(const Options& o) {
         throw std::invalid_argument("--http-sampling sample runs on the batched route (--http-batch N)");
     if (o.http_batch && (!o.mtp.window_prefix || !o.mtp.draft_chain || o.mtp.window_rows_set != std::vector<std::uint32_t>{2U, 4U, 8U}))
         throw std::invalid_argument("--http-batch requires prefix windows over the row set 2,4,8 and the draft chain");
+}
+
+// Default tail blocks of the tiled prefill (D-056). Without them, a prompt shorter than T, or the remainder after the
+// last complete T-row block, runs as serial rows (a 1K prompt with T = 2048: about 45 s instead of about 1.5 s). The
+// sizes below T are used, largest first; fewer than 16 remaining rows stay serial. A tail block runs the tiled
+// prefill arithmetic of a T-row block over fewer rows. `--known-prefix-tail-rows LIST` replaces the set and
+// `--known-prefix-tail-rows none` keeps the remainder serial.
+inline constexpr std::array<std::uint32_t, 4> default_known_prefill_tail_rows{1024U, 256U, 64U, 16U};
+inline void apply_default_known_prefill_tails(Options& options) {
+    if (!options.known_prefix_tail_rows.empty() || options.known_prefix_tail_rows_off || !options.known_prefix_window ||
+        !options.known_prefix_prefill_explicit || !options.known_prefix_full_rows || options.teacher_forced_score ||
+        options.known_prefix_output_policy == strix::KnownWindowOutputPolicy::state_only)
+        return;
+    for (const auto rows : default_known_prefill_tail_rows)
+        if (rows < options.known_prefix_prefill_rows) options.known_prefix_tail_rows.push_back(rows);
 }
 
 inline void validate_known_prefill_options(const Options& options) {
@@ -1578,9 +1596,10 @@ inline Options parse_options(
             continue;
         }
         if (argument == "--known-prefix-tail-rows") {
-            if (!options.known_prefix_tail_rows.empty() || index + 1 >= argc)
+            if (!options.known_prefix_tail_rows.empty() || options.known_prefix_tail_rows_off || index + 1 >= argc)
                 throw std::invalid_argument("--known-prefix-tail-rows requires one value");
             const std::string_view value = argv[++index];
+            if (value == "none") { options.known_prefix_tail_rows_off = true; continue; }
             for (std::size_t begin = 0; begin <= value.size();) {
                 const auto end = std::min(value.find(',', begin), value.size());
                 const auto rows = parse_u64(value.substr(begin, end - begin), "known prefill tail rows");
@@ -2227,6 +2246,7 @@ inline Options parse_options(
         throw std::invalid_argument("offline compile provenance requires --offline-tuning-cache");
     validate_moe_token_cost_options(options);
     validate_prompt_lookup_snapshot_options(options);
+    apply_default_known_prefill_tails(options);
     validate_known_prefill_options(options);
     validate_serving_prefix_cache_limits(options);
     if (options.serving_prefix_files.empty() && (options.serving_tensor_cohort_explicit || options.serving_concurrency_explicit || options.serving_memory_explicit ||

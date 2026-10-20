@@ -19,7 +19,7 @@ greedy decode or with MTP decode (see [MTP](#mtp)). Every other route rejects th
 | `--prefix-cache-disk-bytes N` | Optional disk budget (oldest checkpoints are deleted first; 0 = unbounded). |
 | `--prefix-cache-every N` | Capture interval in tokens, a multiple of T (default: 4096 rounded up to a multiple of T). The last block boundary of every prompt is always captured. |
 | `--prefix-cache-then-prompt FILE` | Repeatable. After the main request, run these prompts (token IDs separated by commas or whitespace) in the same process, each from a fresh session, through the same cache. Serial-decode route only. |
-| `--known-prefix-tail-rows T2[,T3...]` | Optional (independent of the cache): after the last complete T-row block, run the remainder as complete blocks of the largest tail size that fits (descending sizes, 16..1024, multiples of 8, less than T), and only the rest as serial rows. |
+| `--known-prefix-tail-rows T2[,T3...]\|none` | Independent of the cache: after the last complete T-row block, run the remainder as complete blocks of the largest tail size that fits (descending sizes, 16..1024, multiples of 8, less than T), and only the rest as serial rows. Default (D-056): the sizes of 1024, 256, 64, 16 below T, whenever the tiled prefill has full rows and an output head; `none` keeps the remainder serial. |
 
 Diagnostics: `STRIX_PREFIX_CACHE_LOOKUP=0` captures without ever restoring (every request is cold);
 `STRIX_PREFIX_CACHE_DIGEST=1` adds a SHA-256 of the whole prompt state to the MTP receipt.
