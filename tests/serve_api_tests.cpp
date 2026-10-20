@@ -140,7 +140,43 @@ std::vector<Json> sse_data(const std::string& body) {
 }
 }  // namespace
 
+// The pull interface of batching engines: FIFO order, jobs cancelled while queued finished and skipped,
+// tokens published into the ticket, totals per finished job, nothing after shutdown.
+void test_batched_queue() {
+    GenerationQueue queue(8);
+    const auto job = [](std::uint32_t token) { GenerationJob j; j.prompt = {token, token + 1U}; return j; };
+    const auto t1 = queue.submit(job(1)), t2 = queue.submit(job(3)), t3 = queue.submit(job(5));
+    check(t1 && t2 && t3, "batched queue submit");
+    t2->cancel();
+    auto a = queue.take(false);
+    check(a && a->ticket == t1 && a->job.prompt.front() == 1U, "batched queue takes the oldest job");
+    auto b = queue.take(false);
+    check(b && b->ticket == t3, "batched queue skips a job cancelled while queued");
+    bool done = false;
+    static_cast<void>(t2->wait(std::chrono::milliseconds(0), done));
+    check(done && t2->stats().finish == "cancelled", "batched queue finishes the cancelled job");
+    check(!queue.take(false), "batched queue is empty");
+    const std::uint32_t tokens[] = {7, 8};
+    check(a->job.on_tokens(tokens), "batched job publishes");
+    done = false;
+    const auto got = t1->wait(std::chrono::milliseconds(0), done);
+    check(got.size() == 2U && got[0] == 7U && !done, "batched job tokens reach the ticket");
+    GenerationStats stats;
+    stats.generated_tokens = 2;
+    stats.finish = "stop";
+    queue.finish(*a, stats);
+    queue.finish(*b, {}, "engine failure");
+    const auto snap = queue.snapshot();
+    check(snap.completed == 1U && snap.failed == 1U && snap.cancelled == 1U && snap.running == 0U && snap.queued == 0U &&
+          snap.generated_tokens == 2U, "batched queue totals");
+    static_cast<void>(t1->wait(std::chrono::milliseconds(0), done));
+    check(done && t1->stats().finish == "stop" && t3->error() == "engine failure", "batched tickets finished");
+    queue.shutdown();
+    check(!queue.take(true) && queue.stopping(), "batched queue after shutdown");
+}
+
 int main() try {
+    test_batched_queue();
     const auto tokenizer = tiny_tokenizer();
     ScriptedEngine engine(tokenizer);
     GenerationQueue queue;

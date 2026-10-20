@@ -42,7 +42,9 @@ int main(int argc, char** argv) try {
     const TokenSamplingPolicy policies[] = {
         {1.0F, 0U, 1.0F, 0.0F, 0U}, {0.7F, 0U, 1.0F, 0.0F, 0U}, {0.6F, 0U, 1.0F, 0.1F, 0U}, {0.7F, 40U, 1.0F, 0.0F, 0U},
         {1.0F, 5U, 1.0F, 0.0F, 0U}, {1.0F, 0U, 0.8F, 0.0F, 0U}, {0.7F, 40U, 0.9F, 0.05F, 0U}, {2.0F, 0U, 0.95F, 0.0F, 0U},
-        {0.3F, 0U, 1.0F, 0.0F, 0U}, {1.0F, 3000U, 1.0F, 0.0F, 0U}, {1.5F, 0U, 0.5F, 0.0F, 0U},
+        {0.3F, 0U, 1.0F, 0.0F, 0U}, {1.0F, 3000U, 1.0F, 0.0F, 0U}, {1.5F, 0U, 0.5F, 0.0F, 0U}, {0.7F, 0U, 0.9F, 0.0F, 0U},
+        {1.0F, 0U, 0.95F, 0.0F, 0U}, {0.8F, 64U, 0.95F, 0.0F, 0U}, {0.9F, 65U, 1.0F, 0.0F, 0U}, {1.0F, 0U, 0.9F, 0.02F, 0U},
+        {1.2F, 20U, 0.9F, 0.0F, 0U}, {0.5F, 0U, 0.99F, 0.0F, 0U}, {1.0F, 50U, 1.0F, 0.0F, 0U},
     };
     unsigned decided = 0, drafted = 0, accepted = 0, residual = 0, fallbacks = 0, device_q = 0;
     for (unsigned c = 0; c < cases; ++c) {
@@ -77,13 +79,13 @@ int main(int argc, char** argv) try {
                 std::to_string(device.token) + " vs " + std::to_string(host.token));
         ++decided; drafted += host.drafted; accepted += host.accepted; residual += host.residual;
     }
+    require(fallbacks == 0U, std::to_string(fallbacks) + " rows had no device decision");
     // Device draft steps: entry lists like the draft head's (an ascending base list, then context ids appended
-    // in arrival order) or the identity, for the policies the device draft path takes.
+    // in arrival order) or the identity, for every policy.
     unsigned draft_steps = 0;
     double max_relative = 0.0;
     for (unsigned c = 0; c < cases / 2U; ++c) {
         const auto& policy = policies[c % std::size(policies)];
-        if (!(policy.top_p >= 1.0F || (policy.top_k > 0U && policy.top_k <= device_top_p_candidates))) continue;
         std::vector<std::uint32_t> ids;
         const std::uint32_t vocab = 248320U;
         if (c % 5U != 0U) {
@@ -121,7 +123,7 @@ int main(int argc, char** argv) try {
     }
     std::cout << "device sampling-v1: " << decided << " decisions equal the host (" << drafted << " drafted, " << device_q
               << " with the draft distribution in device memory, " << accepted << " accepted, " << residual << " residual, "
-              << fallbacks << " host top-p fallbacks); " << draft_steps
+              << fallbacks << " without a device decision); " << draft_steps
               << " device draft steps equal the host (token and support; max relative probability difference "
               << max_relative << ")\n";
     return 0;

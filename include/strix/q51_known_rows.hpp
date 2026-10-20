@@ -34,7 +34,8 @@ struct ScratchLayout {
 inline constexpr std::uint32_t prefill_max_rows = known_prefill_max_rows;
 [[nodiscard]] inline ScratchLayout scratch_layout(std::uint32_t rows,
     std::uint32_t experts, std::uint32_t top_k, bool prefill = false) {
-    if ((prefill ? rows < 16U || rows % 8U || rows > prefill_max_rows : rows != 2U && rows != 4U && rows != 8U) ||
+    // Windows: 2, 4 or 8 rows; cohort unions of several sessions' windows: up to 32 rows.
+    if ((prefill ? rows < 16U || rows % 8U || rows > prefill_max_rows : rows < 2U || rows > 32U) ||
         !experts || experts > 512U || !top_k || top_k > 10U || top_k > experts)
         throw std::invalid_argument("Q5_1 known rows CSR geometry is invalid");
     const auto align = [](std::uint64_t n) { return (n + 255U) / 256U * 256U; };

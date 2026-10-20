@@ -2,9 +2,13 @@
 
 #include "strix/execution_runtime.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <span>
+#include <string>
+#include <string_view>
 
 namespace strix {
 
@@ -41,6 +45,29 @@ private:
 [[nodiscard]] inline bool known_window_row_position_follows(std::span<const ExecutionDispatchContext> rows, std::size_t r) noexcept {
     if (known_window_segment_start(rows, r)) return true;
     return rows[r - 1U].position != UINT64_MAX && rows[r].position == rows[r - 1U].position + 1U;
+}
+
+// In-process A/B of cohort features (measurement only): with STRIX_COHORT_AB=1 every odd cohort cycle
+// (known_window_cohort_cycle(), advanced once per cycle by the cohort scheduler) runs without the features
+// listed in STRIX_COHORT_AB_OFF (comma list, e.g. "gdnseg,combine,draft"); timings are kept per parity.
+inline std::uint64_t& known_window_cohort_cycle() noexcept {
+    thread_local std::uint64_t cycle = 0;
+    return cycle;
+}
+[[nodiscard]] inline bool known_window_cohort_ab() noexcept {
+    static const bool on = [] { const char* v = std::getenv("STRIX_COHORT_AB"); return v && v[0] == '1'; }();
+    return on;
+}
+[[nodiscard]] inline bool known_window_cohort_feature_off(std::string_view feature) {
+    if (!known_window_cohort_ab() || !(known_window_cohort_cycle() & 1U)) return false;
+    static const std::string list = [] { const char* v = std::getenv("STRIX_COHORT_AB_OFF"); return std::string(v ? v : ""); }();
+    std::size_t at = 0;
+    while (at <= list.size()) {
+        const auto end = std::min(list.find(',', at), list.size());
+        if (std::string_view(list).substr(at, end - at) == feature) return true;
+        at = end + 1U;
+    }
+    return false;
 }
 
 }  // namespace strix

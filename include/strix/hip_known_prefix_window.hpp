@@ -140,6 +140,13 @@ public:
     // member order; any failure poisons every member session and disables every owner involved.
     [[nodiscard]] static std::vector<HipMtpTargetWindowExecution> execute_mtp_cohort(HipKnownPrefixWindow& primary,
         std::span<const HipKnownPrefixCohortMember> members);
+    // Several cohorts in one stream of steps: chunk c is chunk_members[c] consecutive members, run as a
+    // cohort on primaries[c] (an idle owner of the chunk's total rows) when it has two or more members, or
+    // as the member's own window (primaries[c] null) when it has one. Step i of every chunk is enqueued
+    // before step i + 1 of any; each member's arithmetic is exactly its window alone.
+    [[nodiscard]] static std::vector<HipMtpTargetWindowExecution> execute_mtp_cohort_chunks(
+        std::span<HipKnownPrefixWindow* const> primaries, std::span<const std::size_t> chunk_members,
+        std::span<const HipKnownPrefixCohortMember> members);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
