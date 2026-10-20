@@ -218,8 +218,8 @@ void prefill_profile_contract() {
     rejects([&] { (void)tiled(std::string(fp32), "hc-splitk-f32+q51-q80-a8-down-v1"); }, pair_message);
     rejects([&] { (void)tiled(std::string(a8), std::string(deferred)); }, pair_message);
     rejects([] { (void)parse({"decoder", "m", "1", "--prefill-numerical-profile", "hc-splitk-f32-v1"}); }, pair_message);
-    const std::string_view route_message = "prefill numerical profile requires exactly one prefill route: the tiled known-prefix "
-        "prefill (--known-prefix-prefill-rows with --known-prefix-full-rows) or the MTP prompt";
+    const std::string_view route_message = "prefill numerical profile requires a prefill route: the tiled known-prefix "
+        "prefill (--known-prefix-prefill-rows with --known-prefix-full-rows), the MTP prompt, or both (tiled MTP prompt)";
     auto plain = absent; plain.prefill_numerical_profile = profile(fp32);
     validate_prefill_numerical_profile_cli(plain); // tiled route admitted
     auto serial = plain; serial.known_prefix_window = false; serial.known_prefix_prefill_rows = 0; serial.known_prefix_full_rows = false;
@@ -231,17 +231,25 @@ void prefill_profile_contract() {
     auto mtp = serial; mtp.mtp.enabled = true;
     validate_prefill_numerical_profile_cli(mtp); // MTP prompt route admitted
     auto both = plain; both.mtp.enabled = true;
-    rejects([&] { validate_prefill_numerical_profile_cli(both); }, route_message);
+    validate_prefill_numerical_profile_cli(both); // tiled MTP prompt (serving route) admitted
+    auto mtp_window_only = window_only; mtp_window_only.mtp.enabled = true;
+    validate_prefill_numerical_profile_cli(mtp_window_only); // serial MTP prompt (no tiled blocks) admitted
     const std::string_view exclusion_message = "prefill numerical profile excludes model copy tiers, final-state export, GDN islands, "
         "prepared/overlapped serial execution and MTP metadata diagnostics";
-    for (int which = 0; which < 6; ++which) {
-        auto excluded = which < 5 ? plain : mtp;
+    for (int which = 0; which < 12; ++which) {
+        // The same exclusions on the tiled route (and the MTP prompt), then on the tiled MTP prompt.
+        auto excluded = which < 5 ? plain : which == 5 ? mtp : both;
         if (which == 0) excluded.model_copy_tier = HipModelCopyTier::experts;
         if (which == 1) excluded.validation_final_state_path = "state";
         if (which == 2) excluded.gdn_islands = true;
         if (which == 3) excluded.prepared_eager = true;
         if (which == 4) excluded.moe_shared_overlap = true;
-        if (which == 5) excluded.mtp.metadata_only = true;
+        if (which == 5 || which == 11) excluded.mtp.metadata_only = true;
+        if (which == 6) excluded.model_copy_tier = HipModelCopyTier::experts;
+        if (which == 7) excluded.validation_final_state_path = "state";
+        if (which == 8) excluded.gdn_islands = true;
+        if (which == 9) excluded.prepared_eager = true;
+        if (which == 10) excluded.moe_shared_overlap = true;
         rejects([&] { validate_prefill_numerical_profile_cli(excluded); }, exclusion_message);
     }
     auto implicit = plain; implicit.numerical_profile_explicit = false;
