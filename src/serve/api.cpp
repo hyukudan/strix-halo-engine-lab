@@ -265,8 +265,13 @@ struct ApiService::Impl {
         s.top_p = number_or(body, "top_p", 1.0);
         const auto top_k = number_or(body, "top_k", 0.0);
         s.top_k = top_k > 0.0 ? static_cast<std::uint32_t>(top_k) : 0U;
+        s.min_p = number_or(body, "min_p", 0.0);
         if (const auto* seed = body.find("seed"); seed && seed->is_number()) { s.seed = static_cast<std::uint64_t>(seed->as_int()); s.seeded = true; }
         if (s.temperature < 0.0 || s.temperature > 2.0) throw ApiError(400, "invalid_request_error", "temperature must be in [0, 2]", "temperature");
+        if (engine_samples && s.temperature > 0.0 && (!(s.top_p > 0.0) || s.top_p > 1.0))
+            throw ApiError(400, "invalid_request_error", "top_p must be in (0, 1]", "top_p");
+        if (engine_samples && s.temperature > 0.0 && (s.min_p < 0.0 || s.min_p >= 1.0))
+            throw ApiError(400, "invalid_request_error", "min_p must be in [0, 1)", "min_p");
         if (s.temperature > 0.0 && !engine_samples) {
             if (config.sampling_policy == "reject")
                 throw ApiError(400, "invalid_request_error", "this server decodes greedy only; send temperature 0", "temperature");

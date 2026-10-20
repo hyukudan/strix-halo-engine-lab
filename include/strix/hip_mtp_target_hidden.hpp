@@ -86,6 +86,9 @@ public:
         DirectLaunchDispatcher&,std::uint32_t input_token,const TokenDraft* draft=nullptr);
     // Sampled decoding (temperature > 0): set once; later serial rows select by it.
     void set_token_sampler(std::shared_ptr<TokenSampler>);
+    // Serving several requests on one producer: the sampler of the next request (null: first-max), on an idle
+    // healthy producer. The final prompt row and every later row select by it.
+    void replace_token_sampler(std::shared_ptr<TokenSampler>);
     [[nodiscard]] std::shared_ptr<TokenSampler> token_sampler() const noexcept;
     // Split prefill numerical profile. Prompt rows run a sibling serial execution (same steps,
     // arena, state and model bindings; different arithmetic) on the same scratch arena, selected

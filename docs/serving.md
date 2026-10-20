@@ -22,7 +22,8 @@ Serving runs on the tiled MTP route, so it takes the flags of a tiled MTP reques
 | `--http-port N` | `8080` | listen port (`0`: any free port, printed on stderr) |
 | `--http-model-id NAME` | `qwen3.8-flash-next` | model name reported by `/v1/models` and responses |
 | `--http-api-key-file FILE` | none | require `Authorization: Bearer KEY` or `x-api-key: KEY` on the API routes |
-| `--http-sampling greedy\|reject` | `greedy` | requests with `temperature > 0`: run greedy and say so in the response, or answer 400 |
+| `--http-batch N` | `0` | `1`..`8`: batched decoding with N request slots ([below](#batched-decoding)); `0`: one request at a time |
+| `--http-sampling greedy\|reject\|sample` | `greedy` | requests with `temperature > 0`: run greedy and say so in the response, answer 400, or sample (sampling-v1, batched route only) |
 | `--http-default-max-tokens N` | `4096` | generation budget when a request gives none |
 | `--http-max-queue N` | `64` | waiting requests before new ones get 503 |
 | `--http-max-connections N` | `64` | open connections before new ones get 503 |
@@ -52,8 +53,40 @@ when it stops.
   engine stops after the current cycle).
 - A failure inside the engine leaves the target state unknown: the failing request gets an error,
   `/health` answers 503 and the process stops with a non-zero exit status.
-- Decoding is greedy. A request with `temperature > 0` is decoded greedy and the response carries
-  `strix.note`; with `--http-sampling reject` it gets a 400 instead.
+- Decoding is greedy unless the batched route samples (below). A request with `temperature > 0` is decoded greedy
+  and the response carries `strix.note`; with `--http-sampling reject` it gets a 400 instead.
+
+## Batched decoding
+
+`--http-batch N` keeps N request slots. Each slot owns what a single request owns: target state and session, launch
+plan, PLE backend and prefetch state, tiled prefill backends (the prefill arenas are shared; one prompt runs at a
+time), prefix state cache view (over the shared store), predictor, target producer and its 2/4/8 window owners on one
+window stream shared by all slots. The calibration replay runs once.
+
+- Between decode cycles the engine thread takes queued requests into free slots. A joining request starts exactly
+  like a request of the one-at-a-time route: fresh state and session, fresh predictor, its prompt through the tiled
+  prefill, its first token from the prompt's last row.
+- Its prompt advances one unit at a time (a T-row block, a tail block or 16 serial rows) between the decode cycles of
+  the other requests, so that a long prompt does not stop them: one prompt unit, then one decode cycle.
+  `STRIX_BATCH_PROMPT_SHARE=X` gives the decode cycles at least X times the time of the prompt units (more decode
+  progress while prompts wait, later full cohorts); `STRIX_BATCH_INTERLEAVE=0` runs each prompt whole at admission.
+- A cycle decodes every request past its prompt: with two or more it is a cohort cycle (cohort windows, D-039: each
+  request drafts up to 8 / requests rows, at least 2, and requests are packed into 4- and 8-row windows whose
+  weight-reading steps run once for all rows), with one the ordinary cycle. With five to eight requests,
+  `STRIX_COHORT_ROWS=16 STRIX_COHORT_WIDE=all` runs the cycle as one group of up to 16 rows whose GDN/QSA
+  projections, LM head and expert union run once for all rows (D-052,
+  [multi-request cohort](multi-request-cohort.md#global-row-budget-and-wide-steps-opt-in)).
+- A request leaves its slot when it ends (stop token, budget, context, stop string, disconnect), without stopping the
+  others; its slot is free for the next queued request.
+- Greedy requests return exactly the tokens they return alone (and on the one-at-a-time route): every request keeps
+  its own state and arithmetic, and the shared steps compute each row as the request's own window would.
+- `--http-sampling sample`: a request with `temperature > 0` samples with its own policy (`temperature`, `top_k`,
+  `top_p`, `min_p`) and `seed` (random when absent), with speculative decisions on its drafts (D-040; on the GPU as
+  in [sampled-decoding.md](sampled-decoding.md)). Its tokens follow the target distribution exactly; they are not
+  the same tokens as alone, because the drafts per cycle depend on how many requests share the cycle.
+- Statistics per request are those of the one-at-a-time route; `prefill_ms` runs from admission to the first
+  token (it includes the decode cycles interleaved with the prompt), `queue_ms` from submission to admission.
+  The receipt at shutdown is `"mode":"native-mtp-batch"` with slot, step and cohort window counts.
 
 ## Endpoints
 
@@ -140,18 +173,11 @@ encode|plain|decode FILE` exposes the tokenizer on the command line.
 
 ## Limits
 
-- One request at a time; concurrent requests wait in the queue. Batched decode of several requests
-  is a separate route.
-- Greedy decoding only on this route.
-- TODO, sampling (`temperature > 0`): sampled decoding (sampling-v1, D-040) exists on the command line, but only
-  with the serial MTP prompt. The command line rejects it with the tiled MTP prompt, and every served request
-  runs the tiled prompt. Wiring it here needs the tiled prompt's last row to select through the token sampler,
-  plus the per-request sampler state (seed, policy) in the request. Until then `--http-sampling` decides between
-  greedy-with-a-note and 400.
-- TODO, concurrent requests in one decode loop: cohort windows (D-039) are command-line only and rejected with
-  the tiled MTP prompt. Wiring them here needs per-request sessions, predictor runtimes and verifiers kept alive
-  across the queue (today the server resets one session per request), a tiled prompt per joining request, and
-  admission of requests into a running cohort.
+- Without `--http-batch`: one request at a time, greedy only; concurrent requests wait in the queue.
+- `--http-batch`: at most eight slots; requests beyond them wait in the queue. Prompts run one at a time (block-
+  interleaved with the decode cycles, not batched with each other). With more than four decoding requests a cycle
+  forms two or more 8-row cohort windows (two rows per request), so the aggregate rate stays near that of four.
+- Every slot holds a full context of state memory and its own window owners; memory grows with N.
 - The window controller switches (`STRIX_MTP_CONTROLLER=survival`, `STRIX_MTP_ACTIVE_ROWS=1`,
   `STRIX_MTP_DRAFT_VOCAB=2`, the window folds) apply to served requests as on the command line. The draft
   vocabulary is chosen per request from that request's prompt.

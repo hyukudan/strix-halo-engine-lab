@@ -1756,13 +1756,15 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
 
 // Projection only, from a slot its producer filled (dense_a8_quantize_lane): codes
 // [row][width], deltas [block * kDenseA8Rows + row] for rows 0..Site::rows-1.
+// 16/32 rows (cohort windows of several sessions): the WMMA projection from the same pitch-64 slot.
 template <class Site> void launch_dense_a8_quantized(const Site& site, const DenseA8Slot& slot, hipStream_t stream) {
-    static_assert(Site::rows <= 8U);
+    static_assert(Site::rows <= 8U || (Site::rows % 16U == 0U && Site::rows <= kDenseA8Rows));
     if (!dense_a8_width(site.width))
         throw std::invalid_argument("q8_rows: dense A8 requires a width that is a positive multiple of 64, at most 8192");
     for (unsigned m = 0; m < site.segments.count; ++m)
         if (reinterpret_cast<std::uintptr_t>(site.segments.weights[m]) % 4U)
             throw std::invalid_argument("q8_rows: dense A8 requires dword-aligned Q8 weights");
+    if constexpr (Site::rows > 8U) { launch_dense_a8_projection(site, slot, stream); return; } else {
     constexpr unsigned Outs = dense_a8_outs_of<Site>();
     const unsigned groups = (site.outputs + Outs - 1U) / Outs;
     const auto project = [&]<bool Q6>(const Site& args) {
@@ -1772,6 +1774,7 @@ template <class Site> void launch_dense_a8_quantized(const Site& site, const Den
     };
     Site q6;
     if (q6_site(site, q6)) project.template operator()<true>(q6); else project.template operator()<false>(site);
+    }
 }
 
 // Lane-output prompt kernel (project_wide_rows_lane_kernel): STRIX_Q8_ROWS_LANE=0 keeps the VOPD

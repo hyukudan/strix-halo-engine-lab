@@ -73,6 +73,13 @@ ElementwiseRowsViews moe_combine_known_window_rows_views(std::span<const Executi
     const HipElementwiseLauncherConfig& config);
 void moe_combine_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipElementwiseLauncherConfig& config);
+// The inject rows of several sessions' windows (segments of 2/4/8 rows, each admitted as its window; up to
+// 32 rows) in one launch: every row's elements exactly as its own window's launch.
+void inject_known_window_cohort_rows_launch(std::span<const std::span<const ExecutionDispatchContext>> segments,
+    const HipElementwiseLauncherConfig& config);
+// The same for the MoE-combine rows (shared + routed per row).
+void moe_combine_known_window_cohort_rows_launch(std::span<const std::span<const ExecutionDispatchContext>> segments,
+    const HipElementwiseLauncherConfig& config);
 void moe_combine_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipElementwiseLauncherConfig& config);
 // Prefill: all T rows of an inject / MoE-combine step (8-row tiles one stride apart) in one launch.

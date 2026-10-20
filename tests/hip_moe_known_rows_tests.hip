@@ -1,3 +1,4 @@
+#include "strix/known_window_cohort.hpp"
 #include "strix/dispatch_resources.hpp"
 #include "strix/execution_arena.hpp"
 #include "strix/execution_io.hpp"
@@ -23,6 +24,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <optional>
 #include <vector>
 
 namespace {
@@ -100,6 +102,9 @@ template<unsigned H,unsigned E> struct Fixture {
     View scratch{},csr{},record{};
     View combine_buffer{};
     ExecutionMemoryBinding memory;
+    // 16 / 32 rows: a cohort union of 8-row windows, each its own arena (a sub-range of scratch) and session.
+    std::vector<ExecutionMemoryBinding> memories;
+    std::vector<SessionStateMemoryBinding> sessions;
     q51_known_rows::Workspace workspace;
     ModelManifest manifest;
     ModelRuntimeBinding weights;
@@ -131,8 +136,15 @@ template<unsigned H,unsigned E> struct Fixture {
         const auto layout=moe_q4k_a8::build_runtime_workspace(H,I,E,K,true,profile.a8);
         alloc(uses.reads[0],H*2U);alloc(uses.reads[1],K*4U);alloc(uses.reads[2],K*4U);
         alloc(uses.writes[0],H*2U);alloc(uses.temporaries[0],layout.total_bytes);
-        serial.naive_nonaliased_bytes=serial.total_bytes;window=build_known_window_arena(serial,256U,count);
-        scratch=owner->allocate(window.physical.total_bytes);memory={0x4d4f45524f575301ULL,scratch.address,scratch.bytes,31U};
+        const unsigned per=std::min(count,8U),arenas=(count+per-1U)/per;
+        serial.naive_nonaliased_bytes=serial.total_bytes;window=build_known_window_arena(serial,256U,per);
+        const auto arena_bytes=(window.physical.total_bytes+255U)/256U*256U;
+        scratch=owner->allocate(arena_bytes*arenas);memory={0x4d4f45524f575301ULL,scratch.address,window.physical.total_bytes,31U};
+        memories.resize(arenas);sessions.resize(arenas);
+        for(unsigned a=0;a<arenas;++a){
+            memories[a]={memory.execution_identity,scratch.address+a*arena_bytes,window.physical.total_bytes,31U+a};
+            sessions[a].layout_identity=0x53455353U+a;
+        }
         csr=owner->allocate(q51_known_rows::required_scratch_bytes(count,E,K));
         workspace={{memory.execution_identity,csr.address,csr.bytes,43U},owner};record=owner->allocate(8U);
         manifest.architecture="qwen4_exp";
@@ -159,9 +171,12 @@ template<unsigned H,unsigned E> struct Fixture {
         id=registry.variants().front().id;incumbent=make_hip_moe_experts_launcher(id,&config);
         rows.resize(count);resources.resize(count);hidden.resize(count);routes.resize(count);mix.resize(count);output.resize(count);temp.resize(count);
         for(unsigned r=0;r<count;++r) {
-            resources[r]={&memory,&manifest,&weights,&access};auto& c=rows[r];
+            const unsigned a=r/per;
+            resources[r]={&memories[a],&manifest,&weights,&access};auto& c=rows[r];
+            if(arenas>1U){resources[r].session_state_memory=&sessions[a];c.session_state_memory=&sessions[a];}
             c.execution_identity=memory.execution_identity;c.step_id=step.id;c.op=step.op;c.layer=step.layer;c.kernel_id=id;
-            c.reads=uses.reads;c.writes=uses.writes;c.temporaries=uses.temporaries;c.arena=&window.row_view[r];c.memory=&memory;c.resources=&resources[r];c.position=29U+r;
+            c.reads=uses.reads;c.writes=uses.writes;c.temporaries=uses.temporaries;c.arena=&window.row_view[r%per];c.memory=&memories[a];
+            c.resources=&resources[r];c.position=29U+r;
             hidden[r]=resolve_dispatch_read(c,0);routes[r]=resolve_dispatch_read(c,1);mix[r]=resolve_dispatch_read(c,2);
             output[r]=resolve_dispatch_write(c,0);temp[r]=resolve_dispatch_temporary(c,0);
         }
@@ -206,6 +221,7 @@ template<unsigned H,unsigned E> struct Fixture {
     std::vector<std::byte> run(bool candidate) {
         reset();const auto s=scope();
         {HipLaunchScope active(s);
+         std::optional<KnownWindowCohortScope> cohort;if(rows.size()>8U)cohort.emplace();
          if(candidate) {moe_experts_known_window_rows_preflight(rows,config,workspace);moe_experts_known_window_rows_launch(rows,config,workspace,active_rows);}
          else for(const auto& c:rows) incumbent.function(c,incumbent.user_data);}
         owner->drain();const auto error=read(record);require(std::all_of(error.begin(),error.end(),[](auto b){return b==std::byte{0};}),"valid known routed D1 nonzero");
@@ -433,6 +449,15 @@ Profile parse_profile(std::string_view name) {
 // A8 launcher per routing pattern, CSR, and the device failure paths.
 void a8_fixture(unsigned count,Profile profile) {
     Fixture<2560U,512U> f(count,true,profile);
+    if(count>8U) {
+        // Cohort union of 16 / 32 rows (several sessions' 8-row windows): every routing pattern, including
+        // experts shared by up to all rows (down batches of 8), against the serial A8 rows.
+        for(unsigned mode=0;mode<6U;++mode) {
+            f.prepare(mode);const auto expected=f.run(false);
+            for(unsigned repeat=0;repeat<2U;++repeat)require(f.run(true)==expected,"A8 cohort union whole arena differs from serial A8 rows");
+        }
+        return;
+    }
     for(unsigned mode=0;mode<6U;++mode) {
         f.prepare(mode);const auto expected=f.run(false);
         for(unsigned repeat=0;repeat<2U;++repeat){require(f.run(true)==expected,"A8 union whole arena differs from serial A8 rows");f.check_csr();}
@@ -452,7 +477,7 @@ int main(int argc,char** argv) try {
     }
     if(argc>3&&std::string(argv[3])!="f32") {
         const unsigned rows=static_cast<unsigned>(std::stoul(argv[1]));
-        require(rows==2U||rows==4U||rows==8U,"known routed fixture rows must be 2/4/8");
+        require(rows==2U||rows==4U||rows==8U||(rows>=9U&&rows<=32U),"known routed A8 fixture rows must be 2/4/8 or 9..32");
         a8_fixture(rows,parse_profile(argv[3]));
         std::cout<<"known routed rows "<<rows<<' '<<argv[3]<<" A8 fixture completed\n";return 0;
     }
