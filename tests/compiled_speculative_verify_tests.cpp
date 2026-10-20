@@ -683,14 +683,16 @@ void known_prefix_prefill_segment_tests(const strix::ModelContract& model) {
         }
         // Segmented: one fixture's model and serial plan; sessions 1 and 2 bring their own state memory.
         KnownRuntimeFixture f(model,true,true);
+        // Each further session also holds its own copy of the state layout (as a cohort's further requests do).
         struct Extra {std::vector<std::uint64_t> words;strix::SessionStateMemoryBinding memory;strix::ExecutionRuntimeResources resources;
-            strix::SerialSessionContext session;};
+            strix::SerialSessionContext session;strix::SerialSessionStateLayout layout;};
         std::vector<Extra> extra(sizes.size()-1U);
         for(std::size_t e=0;e<extra.size();++e) {
             auto& x=extra[e];
             x.words.assign(f.state_words.size(),0U);
             x.memory=f.state_memory;x.memory.host_base=reinterpret_cast<std::uintptr_t>(x.words.data());x.memory.host_allocation_generation=40U+e;
             x.resources=f.resources;x.resources.session_state_memory=&x.memory;
+            x.layout=*f.resources.session_state_layout;x.resources.session_state_layout=&x.layout;
             x.session=f.session;
             x.session.runtime_compatibility_identity=strix::build_runtime_execution_identities(f.source.serial.execution_identity,
                 f.source.serial.arena,x.resources).compatibility_identity;
@@ -726,13 +728,16 @@ void known_prefix_prefill_segment_tests(const strix::ModelContract& model) {
         std::uint32_t shared_launches=0;
         if(shared) segment_hooks.shared=[&](std::size_t step) {
             const bool on=plan.tile8.mode[step]==strix::KnownWindowStepMode::shared_rows;shared_launches+=on;return on;};
+        bool one_layout=true;
         segment_hooks.after_step=[&](std::size_t step,std::size_t s,const std::function<strix::ExecutionDispatchContext(std::uint32_t)>& row) {
+            one_layout=one_layout&&row(0).session_state_layout==f.resources.session_state_layout;
             if(step!=tap) return;
             for(std::uint32_t r=0;r<sizes[s];++r) observed[s].push_back(read_word(strix::resolve_dispatch_write(row(r),0).address));
         };
         const auto results=strix::execute_known_prefix_prefill_segments_eager(plan,f.source.serial,f.window_memory,segments,launch,{},wide,
             f.hooks(),full,segment_hooks);
         expect(results.size()==sizes.size()&&(!shared||shared_launches>0U),"segmented prefill returns one result per segment");
+        expect(one_layout,"every segment's rows carry the lead's state layout object");
         for(std::size_t s=0;s<sizes.size();++s) {
             const auto& session=session_of(s);
             const auto& words=s?extra[s-1U].words:f.state_words;

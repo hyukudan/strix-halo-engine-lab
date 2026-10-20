@@ -448,9 +448,12 @@ std::vector<KnownWindowResult> execute_known_prefix_prefill_segments_eager(const
         const auto& state_memory=*own.session_state_memory;
         disjoint(state_memory.device_base,state_memory.device_bytes);disjoint(state_memory.host_base,state_memory.host_bytes);
         require(!own.ple_prefetch||!own.ple_prefetch->active,"segmented prefill cannot borrow an active PLE lookup");
-        // One set of model objects for every row (the shared steps compare them across rows).
+        // One set of model objects for every row (the shared steps compare them across rows), including the state
+        // layout object: the segments' layouts have one identity (checked above), but the requests of a cohort can
+        // hold distinct copies of it (the positional request's owners and the further requests' stacks).
         resources[s]=own;resources[s].scratch=&memory;
         resources[s].model_manifest=lead.model_manifest;resources[s].model_weights=lead.model_weights;resources[s].tensor_access=lead.tensor_access;
+        resources[s].session_state_layout=lead.session_state_layout;
         validate_execution_runtime_resources(plan.prefill_execution_identity,plan.arena.physical,resources[s],session.next_position);
         EagerExecutionRequest request;request.input_token_id=g.tokens[0];request.position=session.next_position;request.state=session.state;
         validate_eager_execution_preflight(serial.execution,serial.bindings,serial.io,plan.arena.row_view[offset[s]],request,
