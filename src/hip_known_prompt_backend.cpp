@@ -385,4 +385,7 @@ void HipKnownPromptBackend::set_executor_handoff(SessionExecutor decode, Session
     validate_sibling_serial_executions(*prefill.compiled, *decode.compiled);
     impl_->handoff.emplace(decode, prefill);
 }
+std::uint64_t HipKnownPromptBackend::handoff_prefill_execution_identity() const noexcept {
+    return impl_->handoff ? impl_->handoff->second.compiled->execution_identity : 0U;
+}
 } // namespace strix

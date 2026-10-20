@@ -2349,12 +2349,13 @@ int STRIX_DECODE_ENTRY(
         device_queue_trace->require_healthy_before_commit();
     };
     strix::DirectLaunchDispatcher direct_dispatcher(launch_plan, active_observer);
-    // MTP prompt rows under a split prefill profile: launchers of the sibling prefill execution.
+    // Serial MTP prompt rows under a split prefill profile: launchers of the sibling prefill execution
+    // (the tiled MTP prompt runs only its tiled blocks on the prefill profile, through their owners).
     std::shared_ptr<strix::HipLauncherCatalog> prefill_launcher_catalog;
     strix::ExecutionLauncherRegistry prefill_launchers;
     std::optional<strix::CompiledLaunchPlan> prefill_launch_plan;
     std::optional<strix::DirectLaunchDispatcher> prefill_dispatcher;
-    if (compiled_prefill && options.mtp.enabled) {
+    if (compiled_prefill && options.mtp.enabled && !strix::decode_cli::mtp_tiled_prompt(options)) {
         prefill_launcher_catalog = std::make_shared<strix::HipLauncherCatalog>(model, prefill_catalog_config);
         prefill_launcher_catalog->register_for_compiled_execution(*compiled_prefill, prefill_launchers, &prefill_resources);
         if (prefill_launcher_catalog->audit(*compiled_prefill, prefill_launchers).missing_steps)
@@ -2539,6 +2540,16 @@ int STRIX_DECODE_ENTRY(
                 growth = add(growth, add(tail->arena.physical.total_bytes, add(8U, union_bytes)));
                 growth = add(growth, tail->host_metadata_payload_bytes);
             }
+            // Batched MTP slots (cohort requests on the tiled prompt, --http-batch N): each further slot's block
+            // and tail owners share the arenas above but hold their own metadata copy and completion records
+            // (about 286 MB per slot at T = 8192).
+            const std::uint64_t extra_slots = !strix::decode_cli::mtp_tiled_prompt(options) ? 0U
+                : !options.mtp.cohort.empty() ? options.mtp.cohort.size()
+                : options.http_serve && options.http_batch ? options.http_batch - 1U : 0U;
+            for (std::uint64_t slot = 0; slot < extra_slots; ++slot) {
+                growth = add(growth, add(add(known_prefill_plan->host_metadata_payload_bytes, map_bytes), 8U));
+                for (const auto& tail : known_tail_plans) growth = add(growth, add(tail->host_metadata_payload_bytes, 8U));
+            }
             known_prefill_reservation = strix::plan_uma_reservation_growth(
                 strix::build_uma_owner_inventory(views), growth, known_prefill_runtime_payload,
                 {options.known_prefill_uma_budget, options.known_prefill_uma_budget});
@@ -2676,7 +2687,7 @@ int STRIX_DECODE_ENTRY(
             : std::static_pointer_cast<strix::PleLookupBackend>(mtp_mapped_ple_owner);
         auto parents = std::make_shared<strix::decode_cli::MtpDecodeTargetParents>(
             experiment_owner, launcher_catalog, std::move(owned_ple), ple_hash_contract);
-        if (compiled_prefill) {
+        if (compiled_prefill && !strix::decode_cli::mtp_tiled_prompt(options)) {
             if (!prefill_dispatcher || !prefill_scratch) throw std::logic_error("MTP split prefill lacks its prompt launchers");
             parents->prompt.compiled = &*compiled_prefill;
             parents->prompt.dispatcher = &*prefill_dispatcher;
@@ -2692,6 +2703,8 @@ int STRIX_DECODE_ENTRY(
             for (std::size_t t = 0; t < known_tail_backends.size(); ++t)
                 tiled.tails.push_back({known_tail_backends[t].get(), known_tail_owners[t], options.known_prefix_tail_rows[t]});
             tiled.rows = options.known_prefix_prefill_rows;
+            // Split prefill profile: the block backends above hand the session to the prefill execution.
+            tiled.prefill_execution_identity = compiled_prefill ? compiled_prefill->execution_identity : 0U;
             tiled.cache = prefix_state.get();
             tiled.reset_state = [&] {
                 check_hip(hipDeviceSynchronize(), "tiled MTP prompt reset fence");
@@ -2781,6 +2794,10 @@ int STRIX_DECODE_ENTRY(
             std::vector<std::shared_ptr<strix::HipKnownPrefixWindow>> tail_owners;
             std::vector<std::unique_ptr<strix::HipKnownPromptBackend>> tails;
             std::unique_ptr<strix::decode_cli::HipPrefixStateCacheSession> cache;
+            // Split prefill profile: the sibling prefill execution's view of this slot's serial scratch and
+            // its resources (this slot's state, PLE and model bindings), the tiled owners' executor.
+            std::optional<strix::ExecutionMemoryBinding> prefill_scratch;
+            strix::ExecutionRuntimeResources prefill_resources;
         };
         const auto make_stack = [&] {
             auto stack = std::make_unique<CohortStack>();
@@ -2815,25 +2832,41 @@ int STRIX_DECODE_ENTRY(
             return stack;
         };
         // The tiled prompt of a further request: owners over its own state, PLE and launchers and the shared
-        // prefill arenas (one prompt runs at a time), backends bound to its session, its own cache view.
+        // prefill arenas (one prompt runs at a time), backends bound to its session, its own cache view. Under
+        // a split prefill profile the owners run the sibling prefill execution with the prefill launcher
+        // configuration over this slot's resources, and each backend hands this slot's session to it and back.
         const auto add_tiled = [&](CohortStack& stack) {
-            if (!known_prefill_plan || !known_prefix_memory || compiled_prefill)
-                throw std::logic_error("batched MTP requests need the tiled prefill of one numerical profile");
+            if (!known_prefill_plan || !known_prefix_memory)
+                throw std::logic_error("batched MTP requests need the tiled prefill");
             const auto workspace = [&](const std::shared_ptr<KnownPromptMemory>& arena) {
                 return known_prefix_union_bytes ? strix::q51_known_rows::Workspace{arena->union_scratch,
                     std::static_pointer_cast<const void>(arena)} : strix::q51_known_rows::Workspace{};
             };
-            stack.block_owner = std::make_shared<strix::HipKnownPrefixWindow>(*known_prefill_plan, compiled, model, catalog_config,
-                stack.parents->resources, known_prefix_memory->scratch, known_prefix_memory->scope,
+            if (compiled_prefill) {
+                stack.prefill_scratch = strix::sibling_scratch_binding(*compiled_prefill, compiled, stack.memory->scratch());
+                stack.prefill_resources = stack.parents->resources;
+                stack.prefill_resources.scratch = &*stack.prefill_scratch;
+            }
+            const auto& owner_compiled = compiled_prefill ? *compiled_prefill : compiled;
+            const auto& owner_catalog = compiled_prefill ? prefill_catalog_config : catalog_config;
+            const auto& owner_resources = compiled_prefill ? stack.prefill_resources : stack.parents->resources;
+            const auto hand_off = [&](strix::HipKnownPromptBackend& backend) {
+                if (compiled_prefill)
+                    backend.set_executor_handoff({&compiled, &stack.parents->resources}, {&*compiled_prefill, &stack.prefill_resources});
+            };
+            stack.block_owner = std::make_shared<strix::HipKnownPrefixWindow>(*known_prefill_plan, owner_compiled, model, owner_catalog,
+                owner_resources, known_prefix_memory->scratch, known_prefix_memory->scope,
                 std::static_pointer_cast<const void>(known_prefix_memory), workspace(known_prefix_memory));
             stack.blocks = std::make_unique<strix::HipKnownPromptBackend>(stack.block_owner, stack.session,
                 known_prefix_memory->scratch, model.vocab_size, original_work_device);
+            hand_off(*stack.blocks);
             for (std::size_t t = 0; t < known_tail_plans.size(); ++t) {
-                stack.tail_owners.push_back(std::make_shared<strix::HipKnownPrefixWindow>(*known_tail_plans[t], compiled, model,
-                    catalog_config, stack.parents->resources, known_tail_memories[t]->scratch, known_tail_memories[t]->scope,
+                stack.tail_owners.push_back(std::make_shared<strix::HipKnownPrefixWindow>(*known_tail_plans[t], owner_compiled, model,
+                    owner_catalog, owner_resources, known_tail_memories[t]->scratch, known_tail_memories[t]->scope,
                     std::static_pointer_cast<const void>(known_tail_memories[t]), workspace(known_tail_memories[t])));
                 stack.tails.push_back(std::make_unique<strix::HipKnownPromptBackend>(stack.tail_owners.back(), stack.session,
                     known_tail_memories[t]->scratch, model.vocab_size, original_work_device));
+                hand_off(*stack.tails.back());
             }
             if (prefix_store)
                 stack.cache = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(prefix_store, prefix_cache_identity,
@@ -2843,6 +2876,7 @@ int STRIX_DECODE_ENTRY(
             for (std::size_t t = 0; t < stack.tails.size(); ++t)
                 tiled.tails.push_back({stack.tails[t].get(), stack.tail_owners[t], options.known_prefix_tail_rows[t]});
             tiled.rows = options.known_prefix_prefill_rows;
+            tiled.prefill_execution_identity = compiled_prefill ? compiled_prefill->execution_identity : 0U;
             tiled.cache = stack.cache.get();
             tiled.reset_state = [slot_memory = stack.memory] {
                 check_hip(hipDeviceSynchronize(), "batched MTP slot reset fence");

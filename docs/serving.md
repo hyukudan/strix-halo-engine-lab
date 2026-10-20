@@ -34,6 +34,15 @@ predictor, exactly as for a command-line request. Requests do not need to share 
 `--generate` is ignored while serving. The prefix state cache flags (`--prefix-cache-host-bytes`,
 `--prefix-cache-every`, `--prefix-cache-dir`) apply across requests.
 
+The prompt may run a separate prefill profile (`--prefill-numerical-profile`, see
+[prefill-numerical-profile.md](prefill-numerical-profile.md)), for example the fast prefill profile
+`fast-prefill-f16wmma-v1` with the dense-A8 decode profile and `--known-prefix-prefill-rows 8192` (T
+above 4096 needs `--known-prefix-host-metadata-budget-bytes` above the plan's metadata, about 286 MB
+at T = 8192). Its complete tiled blocks run the prefill profile; the calibration rows, the serial
+suffix and decoding run the decode profile, and decoding is exact from the state the blocks produced.
+The calibration golden is that of the decode profile. The prefix state cache keys its checkpoints by
+the pair, both executions and T.
+
 The process prints `strix serve: listening on ADDR:PORT` on stderr once it accepts requests, and a
 one-line JSON receipt (`"mode":"native-mtp-http-serve"`, the number of served requests) on stdout
 when it stops.

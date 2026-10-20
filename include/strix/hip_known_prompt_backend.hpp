@@ -79,6 +79,8 @@ public:
     // native window and back to `decode` after it, so serial rows and generation keep `decode`.
     // Set once, before any call. Executors and their resources are retained by the caller.
     void set_executor_handoff(SessionExecutor decode, SessionExecutor prefill);
+    // The prefill execution identity of the handoff (0: none, the window owner runs the session's executor).
+    [[nodiscard]] std::uint64_t handoff_prefill_execution_identity() const noexcept;
     // Every row's logits of a tiled all-rows block (teacher-forced scoring). After a block commits,
     // its T full FP32 rows are downloaded from the arena into one retained pinned host staging
     // buffer (T x vocab floats, allocated here; no prompt-sized buffer) and handed to the sink in

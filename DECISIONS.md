@@ -905,7 +905,42 @@ Single smoke runs, not a campaign (dense A8, windows 2/4/8, 256 tokens per reque
 `gdn,qsa,head,moe`); sequential 44.9 and 44.3. The server took 42.9 s for eight concurrent short requests fused
 (with the wide inject) against 46.9 s.
 
-## D-053: prompt groups, several requests' prompt blocks in one segmented prefill (`STRIX_PROMPT_BATCH`, opt-in)
+## D-053: split prefill profile on the tiled MTP prompt (server, batched slots)
+
+The tiled MTP prompt, the route of `--http-serve`, `--http-batch` and cohort requests on the tiled prompt, now
+admits a split pair (D-033), in particular the fast prefill profile with the dense-A8 decode profile. Its complete
+blocks and tail blocks run the prefill profile: each block backend hands the session to the sibling prefill
+execution and back, as on the tiled route. The calibration rows, the serial suffix, MTP replay, drafts, windows and
+generated rows run the decode profile. The target producer never holds a prompt execution (`adopt_prefill_row`
+requires that). When a block ends at the last prompt row, the target adopts that row on the decode execution. The
+calibration rows are serial decode rows, so their golden records the decode profile for both phases: the
+single-profile golden of the decode profile is the same file. Every batched slot builds its own sibling scratch
+view, prefill owners (prefill launcher configuration over its own state, PLE and launchers; the prefill arenas stay
+shared) and handoffs. The setup's UMA growth estimate counts each slot's copy of the plan metadata (285.8 MB at
+T = 8192). See [docs/prefill-numerical-profile.md](docs/prefill-numerical-profile.md) and
+[docs/serving.md](docs/serving.md).
+
+Why: the server read prompts with the dense profile (about 650-830 tok/s), while the fast profile reads them at
+about 850-1000 tok/s on the same tiled route. Alternative: the serial MTP prompt's split (every prompt row on the
+prefill execution); not taken, because its serial rows keep the decode kernels and the server's prompt is tiled.
+Status: opt-in (`--prefill-numerical-profile`); decoding is exact from the state the blocks produce, not equal to
+the dense prefill's tokens.
+
+| Check (fast prefill, distillG min-p 0.7 unless noted, 64 tokens) | Result |
+| --- | --- |
+| Tiled MTP route against serial greedy decode from the same blocks: 9000 tokens (block + 5 tails + 8 serial rows), 8700 tokens (7 tails, 12 serial), 8192 tokens (terminal block adopted) | Identical; replay error 0 |
+| Windows R2 only, R4 only, R8 only, 2/4/8 adaptive; base draft at min-p 0.85; draft depth 1 | Identical |
+| Calibration golden dumped under the split pair against the decode profile's | Byte-identical |
+| Dense profile on this branch against main 61ec1da | Identical |
+| Server, one request at a time: against the command line; repeated prompts; prefix state cache cold/warm (host, and disk across two processes, 8192 tokens restored) | Identical |
+| Server `--http-batch 4`: four concurrent requests (and two pairs of equal prompts), with and without the shared prefix cache | Every request returns its solo tokens |
+
+Single smoke pass, not a campaign (cluster1, server, one request each, 256 tokens): prompt time 8K prose 12.3 s
+dense (T = 2048) against 9.2 s fast (T = 8192), 32K code 50.7 s against 38.5 s, 32K prose 51.2 s against 38.6 s;
+end to end 18.1 against 15.0 s and about 56-57 against 44-45 s. Tail blocks (1024,256,64,16) did not help these
+prompts.
+
+## D-054: prompt groups, several requests' prompt blocks in one segmented prefill (`STRIX_PROMPT_BATCH`, opt-in)
 
 On the batched tiled MTP route (`--http-batch`, cohort requests with interleaved admission) a prompt step may run the
 next tiled blocks (T-row or tail blocks) of several running prompts together: the oldest prompt's block and then

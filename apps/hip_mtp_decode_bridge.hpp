@@ -95,6 +95,9 @@ struct MtpDecodeTargetParents final {
         };
         std::vector<Tail> tails; // descending rows
         std::uint32_t rows = 0;
+        // Split prefill numerical profile: the sibling prefill execution every block and tail backend hands
+        // the session to around its block (0: one profile). Calibration, serial and decode rows keep `compiled`.
+        std::uint64_t prefill_execution_identity = 0;
         HipPrefixStateCacheSession* cache = nullptr;
         // Fresh target state and session, exactly as after setup (after the calibration replay).
         std::function<void()> reset_state;
@@ -744,21 +747,40 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     const auto decode_profile_identity=kv_bound(numerical_profile_identity(pair.decode));
     const bool split=pair.split();
     const bool tiled_prompt=parents && parents->tiled.blocks;
+    // Under a split pair the serial MTP prompt runs every prompt row on the sibling prompt execution and
+    // hands the session to decode after the replay. The tiled MTP prompt runs only its tiled blocks on the
+    // prefill profile (each block backend hands the session to the prefill execution and back); its
+    // calibration rows, serial suffix and decode run the decode profile, and the target adopts the last
+    // block's row on the decode execution (it never holds a prompt execution).
+    const bool serial_split=split && !tiled_prompt;
     const std::size_t calibration_rows=tiled_prompt ? mtp_calibration_rows(options) : options.tokens.size()-1U;
-    if(tiled_prompt && (split || qualify || component_diagnostic || !parents->tiled.block_owner || !parents->tiled.reset_state ||
+    // A tiled prompt's blocks hand off to the prefill execution exactly under a split pair.
+    const auto tiled_profile_bound=[&](const MtpDecodeTargetParents::TiledPrompt& t) {
+        const auto expected=split ? t.prefill_execution_identity : 0U;
+        if(split && (!expected || expected==compiled.execution_identity)) return false;
+        if(t.blocks->handoff_prefill_execution_identity()!=expected) return false;
+        return std::all_of(t.tails.begin(),t.tails.end(),[&](const auto& tail){
+            return tail.backend && tail.backend->handoff_prefill_execution_identity()==expected;});
+    };
+    if(tiled_prompt && (qualify || component_diagnostic || !parents->tiled.block_owner || !parents->tiled.reset_state ||
        !parents->tiled.rows || std::any_of(parents->tiled.tails.begin(),parents->tiled.tails.end(),
-           [&](const auto& t){return !t.backend || !t.owner || t.rows>=parents->tiled.rows;})))
-        throw std::invalid_argument("tiled MTP prompt requires one numerical profile, its block owners and a state reset");
-    if(split!=(parents && parents->prompt.compiled) ||
-       (split && (!parents->prompt.dispatcher || parents->prompt.resources.session_state_memory!=parents->resources.session_state_memory)))
-        throw std::invalid_argument("MTP split prefill profile requires its actual prompt execution and only then");
+           [&](const auto& t){return !t.backend || !t.owner || t.rows>=parents->tiled.rows;}) || !tiled_profile_bound(parents->tiled)))
+        throw std::invalid_argument("tiled MTP prompt requires its block owners, a state reset and, exactly under a split prefill "
+            "profile, block handoffs to the prefill execution");
+    if(serial_split!=(parents && parents->prompt.compiled) ||
+       (serial_split && (!parents->prompt.dispatcher || parents->prompt.resources.session_state_memory!=parents->resources.session_state_memory)))
+        throw std::invalid_argument("MTP split prefill profile requires its actual prompt execution on the serial MTP prompt and only there");
+    // The calibration rows of a tiled prompt are serial decode rows: its golden records the decode profile
+    // as the prefill of those rows.
+    const auto golden_prefill_identity=tiled_prompt ? decode_profile_identity : prefill_profile_identity;
+    const auto golden_prefill_profile=tiled_prompt ? pair.decode : pair.prefill;
     if(!m.metadata_only && !dump){
     golden=read_mtp_forward_golden_file(m.golden,mtp_cli_digest(m.golden_sha256),m.golden_max_bytes);
     // A golden records the target prefill/decode pair whose prefill produced its prompt rows. A
     // version-1 golden records none and is admitted only for a single-profile run, as before.
     if(golden.target_decode_profile_identity ?
-           golden.target_prefill_profile_identity!=prefill_profile_identity || golden.target_decode_profile_identity!=decode_profile_identity :
-           split || model.attention_kv_storage!=AttentionKvStorage::bf16)
+           golden.target_prefill_profile_identity!=golden_prefill_identity || golden.target_decode_profile_identity!=decode_profile_identity :
+           serial_split || model.attention_kv_storage!=AttentionKvStorage::bf16)
         throw std::invalid_argument("MTP golden was dumped under another target prefill/decode numerical profile pair "
             "or KV identity (a version-1 golden records none and requires one profile for both and the BF16 KV); dump a golden with this pair");
     if(tiled_prompt ? golden.rows.size()!=calibration_rows :
@@ -837,7 +859,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     if(deferred_status)d1={r.session_state_layout,&generations};
     auto target=HipMtpTargetHidden::create(model,compiled,actual.memory,actual.model,actual.allocator,
         retained_rows,m.target_capture_bytes,d1);
-    if(split)target->set_prompt_execution(*parents->prompt.compiled);
+    if(serial_split)target->set_prompt_execution(*parents->prompt.compiled);
     // Sampled decoding: the final prompt row and every generated row select by the sampler;
     // earlier prompt rows keep first-max selection (their predictions are never emitted).
     const auto sampler=mtp_sampling(m) && !dump && !qualify ? std::make_shared<TokenSampler>(mtp_sampling_policy(m))
@@ -869,12 +891,12 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     try {
         // The prompt rows are the prefill: under a split pair they run the sibling prompt
         // execution, and the session moves to the decode execution only after the replay.
-        if(split)hand_off_serial_session(session,{&compiled,&r},{parents->prompt.compiled,&parents->prompt.resources});
+        if(serial_split)hand_off_serial_session(session,{&compiled,&r},{parents->prompt.compiled,&parents->prompt.resources});
         const auto prompt_rows=tiled_prompt ? calibration_rows+1U : options.tokens.size();
         const auto calibration_start=std::chrono::steady_clock::now();
         for(std::size_t i=0;i<prompt_rows;++i) {
             if(sampler && !tiled_prompt && i+1U==options.tokens.size())target->set_token_sampler(sampler);
-            auto current=split ? target->execute_serial(session,parents->prompt.resources,*parents->prompt.dispatcher,options.tokens[i])
+            auto current=serial_split ? target->execute_serial(session,parents->prompt.resources,*parents->prompt.dispatcher,options.tokens[i])
                                : target->execute_serial(session,r,dispatcher,options.tokens[i]);
             if(pending.valid())replay_rows.push_back({pending,options.tokens[i]});
             pending=std::move(current);
@@ -884,7 +906,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             // explicit self-generated pins keep it distinguishable from an
             // independent reference; nothing is qualified or generated here.
             golden=capture_hip_mtp_forward_golden(*runtime,replay_rows,mtp_self_generated_golden_source(),mtp_self_generated_golden_reference);
-            golden.target_prefill_profile_identity=prefill_profile_identity;
+            golden.target_prefill_profile_identity=golden_prefill_identity;
             golden.target_decode_profile_identity=decode_profile_identity;
             const auto sha=write_mtp_forward_golden_file(m.golden_dump,golden,m.golden_max_bytes);
             assets->validate_assets_unchanged();
@@ -895,7 +917,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 <<"\",\"mtp_independent_reference_identity\":"<<golden.independent_reference_identity
                 <<",\"mtp_structural_plan_identity\":"<<golden.structural_plan_identity<<",\"mtp_semantic_identity\":"<<golden.semantic_identity
                 <<",\"mtp_native_arithmetic_profile_identity\":"<<golden.numerical_profile_identity
-                <<",\"mtp_golden_target_prefill_numerical_profile\":\""<<numerical_profile_name(pair.prefill)
+                <<",\"mtp_golden_target_prefill_numerical_profile\":\""<<numerical_profile_name(golden_prefill_profile)
                 <<"\",\"mtp_golden_target_decode_numerical_profile\":\""<<numerical_profile_name(pair.decode)
                 <<"\",\"mtp_golden_target_prefill_profile_identity\":"<<golden.target_prefill_profile_identity
                 <<",\"mtp_golden_target_decode_profile_identity\":"<<golden.target_decode_profile_identity<<"}\n";
@@ -986,8 +1008,11 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 first->native=native;first->target=target;first->window=window;first->held=tiled_held;
                 slots.push_back(std::move(first));
                 for(const auto& setup:parents->batch_slots) {
-                    if(!setup.parents || !setup.session || !setup.dispatcher || !setup.parents->tiled.blocks || !setup.parents->tiled.reset_state)
-                        throw std::invalid_argument("batched MTP slot lacks its parents, session, dispatcher or tiled prompt");
+                    if(!setup.parents || !setup.session || !setup.dispatcher || !setup.parents->tiled.blocks || !setup.parents->tiled.reset_state ||
+                       !tiled_profile_bound(setup.parents->tiled) || setup.parents->prompt.compiled ||
+                       setup.parents->tiled.prefill_execution_identity!=parents->tiled.prefill_execution_identity)
+                        throw std::invalid_argument("batched MTP slot lacks its parents, session, dispatcher or tiled prompt, "
+                            "or its tiled blocks do not run the request's prefill profile");
                     auto slot=std::make_unique<MtpBatchRunner::Slot>();
                     slot->parents=setup.parents;slot->session=setup.session;slot->dispatcher=setup.dispatcher;
                     const auto& own=*setup.parents->experiment;
@@ -1100,7 +1125,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         // from the state this prefill produced. The pending prompt row is re-minted with the
         // handed-off session; the lineage keeps the prefill identity of every prompt row.
         {
-            if(split)pending=target->hand_off_prompt(session,pending,parents->prompt.resources,r);
+            if(serial_split)pending=target->hand_off_prompt(session,pending,parents->prompt.resources,r);
             enable_draft(options.tokens);
         }
         HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
@@ -1185,7 +1210,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"  \"mtp_norm_converter_reference_sha256\":\""<<model_content_identity_hex(evidence.norm_converter_reference_sha256)<<"\",\n"
             <<"  \"target_prefill_numerical_profile\":\""<<numerical_profile_name(pair.prefill)<<"\",\n"
             <<"  \"target_decode_numerical_profile\":\""<<numerical_profile_name(pair.decode)<<"\",\n"
-            <<"  \"target_prefill_execution_identity\":"<<(split?parents->prompt.compiled->execution_identity:compiled.execution_identity)<<",\n"
+            <<"  \"target_prefill_execution_identity\":"<<(serial_split?parents->prompt.compiled->execution_identity:
+                tiled_prompt && split?parents->tiled.prefill_execution_identity:compiled.execution_identity)<<",\n"
             <<"  \"mtp_golden_target_profile_pair_recorded\":"<<(golden.target_decode_profile_identity?"true":"false")<<",\n"
             <<"  \"target_execution_identity\":"<<compiled.execution_identity<<",\n"
             <<"  \"target_kernel_plan_identity\":"<<compiled.kernel_plan_identity<<",\n"
@@ -1249,7 +1275,9 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"  \"sampling\":"<<mtp_sampling_receipt(m,sampler.get())<<",\n"
             <<"  \"mtp_generation_cycle_elapsed_ms\":"<<elapsed<<",\n"
             <<"  \"mtp_timing_scope\":\"post-prompt-and-independent-replay-cycles-only-host-completed-wall-not-GPU-kernel-time\",\n"
-            <<(tiled_prompt ? "  \"mtp_tiled_prompt\":{"+tiled_receipt+",\"calibration_rows\":"+std::to_string(calibration_rows)+
+            <<(tiled_prompt ? "  \"mtp_tiled_prompt\":{"+tiled_receipt+",\"block_numerical_profile\":\""+
+                std::string(numerical_profile_name(pair.prefill))+"\",\"serial_numerical_profile\":\""+
+                std::string(numerical_profile_name(pair.decode))+"\",\"calibration_rows\":"+std::to_string(calibration_rows)+
                 ",\"calibration_ms\":"+std::to_string(calibration_ms)+"},\n" : std::string{})
             <<"  \"prefix_tokens_consumed\":"<<options.tokens.size()<<",\n  \"final_position\":"<<session.next_position<<",\n"
             <<"  \"stop_reason\":\""<<stop<<"\",\n  \"generated_tokens\":[";

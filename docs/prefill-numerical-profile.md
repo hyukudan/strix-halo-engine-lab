@@ -20,13 +20,17 @@ A split pair is admitted only where it runs with existing kernels:
 The two profiles of a pair differ only in the dense Q8_0 projections (GDN, QSA, shared expert): FP32
 activations or int8 activations per group of 32. Their HC, MoE and LM-head kernels, arena layout and
 state layout are the same, so a state produced by one is an input state of the other. The decode
-profile must be explicit. Exactly one prefill route is required:
+profile must be explicit. One of three prefill routes is required:
 
 - the tiled known-prefix prefill: `--known-prefix-window --known-prefix-full-rows
   --known-prefix-prefill-rows T`. Every complete T-row block runs the prefill profile. The unpadded
   suffix of fewer than T rows and generation run the decode profile, as serial rows;
 - the MTP prompt (`--mtp`): every prompt row runs the prefill profile. MTP replay, draft cycles,
-  target windows, checkpoints and generated rows run the decode profile.
+  target windows, checkpoints and generated rows run the decode profile;
+- the tiled MTP prompt (`--mtp` with the tiled prefill flags above), the route of `--http-serve`, its
+  batched slots (`--http-batch`) and cohort requests on the tiled prompt. Every complete block (and tail
+  block) runs the prefill profile. The calibration rows, the serial suffix, MTP replay, draft cycles,
+  windows and generated rows run the decode profile.
 
 Model copy tiers, final-state export, GDN islands, prepared or overlapped serial execution and the MTP
 metadata diagnostic are rejected with a split pair. Every other admission rule of `--numerical-profile`
@@ -57,6 +61,19 @@ state: replay against a golden dumped with the same pair has error 0, and every 
 verified by the decode target from the state the prefill produced. It does not reproduce the tokens of
 a single-profile run from the start.
 
+On the tiled MTP prompt the target producer never holds the prefill execution. The calibration replay
+runs its rows on the decode execution, so its golden records the decode profile for both phases (the
+golden of a single-profile run with the decode profile is the same file). After the calibration the
+prompt starts from a fresh state: each block and tail backend hands the session to the prefill execution
+around its block, exactly as on the tiled route; the serial suffix runs through the target producer on
+the decode execution, and when a block ends at the last prompt row the target adopts that row (hidden
+state and logits) on the decode execution. Every generated token is verified by the decode target from
+the state the fast blocks produced, with the same tokens as serial decode from that state. Every batched
+slot builds its own sibling view of its serial scratch, its own prefill owners (prefill launcher
+configuration over its own state, PLE and launchers; the prefill arenas are shared, one prompt runs at a
+time) and its own handoffs. Each slot's block owner holds a copy of the plan metadata (about 286 MB at
+T = 8192); the setup's UMA growth estimate counts one per slot.
+
 ## Identity
 
 - Receipt: `prefill_numerical_profile`, `prefill_numerical_profile_source` (`explicit` or
@@ -64,7 +81,8 @@ a single-profile run from the start.
   `prefill_dense_a8_configured`, `prefill_serial_execution_identity` and
   `prefill_serial_kernel_plan_identity`, and `optimization_profile_selected` gains `+prefill:NAME`.
   MTP receipts add `target_prefill_numerical_profile`, `target_decode_numerical_profile`,
-  `target_prefill_execution_identity` and `mtp_golden_target_profile_pair_recorded`.
+  `target_prefill_execution_identity` and `mtp_golden_target_profile_pair_recorded`; the tiled MTP
+  prompt's `mtp_tiled_prompt` object adds `block_numerical_profile` and `serial_numerical_profile`.
 - `numerical_profile_pair_identity` of a single-profile pair is that profile's identity; a split pair
   has a distinct identity that also differs from the reversed pair.
 - MTP goldens (version 2) record the prefill and decode profile identities; see
@@ -149,6 +167,8 @@ its own pair identity):
 
 The components act only in complete tiled known-prefix blocks: the serial suffix of the tiled route and every prompt
 row of the MTP prompt route run the serial kernels, where the profile changes the identities but not the arithmetic.
+On the tiled MTP prompt (the server) the blocks run the fast arithmetic and the suffix the decode profile, as on the
+tiled route.
 QSA indexer and selection, GDN recurrence, PLE and LM head keep the decode profile's arithmetic (and the
 QSA attention and router logits without `qsa` and `router`).
 Tokens differ from a dense-A8 run; exactness is defined from the handoff state as for every split pair.
