@@ -923,8 +923,11 @@ stays closed). Each default only changes the proposed drafts and the window choi
 token.
 
 Checked: the options contract (min-p by identity, profile pins, n-gram modes and where `auto` stays off); the
-default command against the explicit switches: tokens identical and replay error 0 (DEFAULTS-GATES); the server
-against the command line with the same mode (SERVER-GATE).
+default command against the explicit switches, 64 tokens each, replay error 0 everywhere: distillG by profile
+without `--mtp-spec-min-p` vs the explicit pins and 0.7 (code prompt: tokens and schedule identical, 16 cycles,
+47/76 accepted); document correction on the tiled route, `auto` vs explicit `on` vs `off` (tokens and schedule
+identical); English chat on the serial route, `auto` vs `off` (identical); the server on the document-correction
+prompt by default, with `"ngram_draft": false` and `true`: the command line's 64 tokens in all three.
 
 ## Measured and rejected
 
