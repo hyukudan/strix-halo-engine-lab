@@ -94,6 +94,16 @@ public:
     [[nodiscard]] std::vector<std::uint32_t> propose_chain(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,
         const SerialSessionContext&,const DraftProposalStateContext&,std::uint32_t depth,float min_probability=0.0F,
         const std::function<bool(std::span<const float>)>& keep_drafting={});
+    // The same chain in phases, so that a cohort can enqueue step k of every session (each on its own
+    // stream) before waiting for any: begin (false: depth 0, nothing to draft), then while launch_step()
+    // and after_step() (false: the chain stops), then finish() for the drafts. Each session's launches and
+    // waits are exactly those of propose_chain.
+    [[nodiscard]] bool propose_chain_begin(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,
+        const SerialSessionContext&,const DraftProposalStateContext&,std::uint32_t depth,float min_probability=0.0F,
+        const std::function<bool(std::span<const float>)>& keep_drafting={});
+    [[nodiscard]] bool propose_chain_launch_step();
+    [[nodiscard]] bool propose_chain_after_step();
+    [[nodiscard]] std::vector<std::uint32_t> propose_chain_finish();
     [[nodiscard]] std::span<const float> draft_probabilities() const noexcept;
     // Sampled drafts (temperature > 0), set once on an enabled draft chain before cycles:
     // every draft step completes, its token is drawn from the draft distribution and

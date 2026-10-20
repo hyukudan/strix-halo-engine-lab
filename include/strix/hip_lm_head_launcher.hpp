@@ -66,6 +66,8 @@ private:
 // block once and keeps each row's R1 leaf/tree arithmetic, so every row's logits
 // equal its R1 launch bitwise. All rows share one head tensor; outputs are disjoint.
 inline constexpr std::uint32_t lm_head_window_max_rows = 8;
+// Cohort windows of several sessions: 16 or 32 rows (lm_head_known_window_rows_launch only).
+inline constexpr std::uint32_t lm_head_cohort_max_rows = 32;
 void lm_head_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipLmHeadLauncherConfig& config);
 void lm_head_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,

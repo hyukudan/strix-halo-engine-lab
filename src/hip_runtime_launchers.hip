@@ -140,7 +140,8 @@ template <typename Storage>
 __device__ __forceinline__ void combine_element(const Storage* shared, const Storage* routed, Storage* output) {
     store_activation(output, load_activation(shared) + load_activation(routed));
 }
-constexpr std::uint32_t kElementwiseMaxRows = 8;
+// Windows of 2/4/8 rows; cohorts of several sessions' windows up to 32 rows (inject cohort launches).
+constexpr std::uint32_t kElementwiseMaxRows = 32;
 struct ElementwiseRowsArgs {
     const void* first[kElementwiseMaxRows];
     const void* second[kElementwiseMaxRows];
@@ -1335,6 +1336,61 @@ void moe_combine_known_prefill_rows_launch(std::span<const ExecutionDispatchCont
 void moe_combine_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipElementwiseLauncherConfig& config) {
     static_cast<void>(prepare_combine_rows(rows, config));
+}
+namespace {
+// The inject (or MoE-combine) rows of several sessions' windows (each segment admitted as its own window) as
+// one argument block; no row may write what a row of another segment reads or writes.
+ElementwiseRowsArgs prepare_elementwise_cohort_rows(std::span<const std::span<const ExecutionDispatchContext>> segments,
+    const HipElementwiseLauncherConfig& config, std::uint32_t& count, bool inject) {
+    ElementwiseRowsArgs all{};
+    count = 0;
+    struct Range { std::uintptr_t low, high; };
+    const auto hidden = checked_mul(config.hidden_size, activation_bytes(config));
+    const auto expanded = inject ? checked_mul(hidden, config.hc_count) : hidden;
+    for (const auto& segment : segments) {
+        if (count + segment.size() > kElementwiseMaxRows) throw std::invalid_argument("known-window elementwise cohort exceeds 32 rows");
+        const auto args = inject ? prepare_inject_rows(segment, config) : prepare_combine_rows(segment, config);
+        for (std::size_t r = 0; r < segment.size(); ++r, ++count) {
+            all.first[count] = args.first[r]; all.second[count] = args.second[r];
+            all.weights[count] = args.weights[r]; all.output[count] = args.output[r];
+        }
+    }
+    const auto at = [](const void* p) { return reinterpret_cast<std::uintptr_t>(p); };
+    for (std::uint32_t r = 0; r < count; ++r)
+        for (std::uint32_t o = 0; o < count; ++o) {
+            if (o == r) continue;
+            const Range out{at(all.output[r]), at(all.output[r]) + expanded};
+            for (const Range other : {Range{at(all.output[o]), at(all.output[o]) + expanded}, Range{at(all.first[o]), at(all.first[o]) + expanded},
+                     Range{at(all.second[o]), at(all.second[o]) + hidden}})
+                if (out.low < other.high && other.low < out.high)
+                    throw std::invalid_argument("known-window elementwise cohort rows alias across rows");
+        }
+    return all;
+}
+} // namespace
+void inject_known_window_cohort_rows_launch(std::span<const std::span<const ExecutionDispatchContext>> segments,
+    const HipElementwiseLauncherConfig& config) {
+    std::uint32_t count = 0;
+    const auto args = prepare_elementwise_cohort_rows(segments, config, count, true);
+    const dim3 grid(prepare_1d_blocks(checked_mul(config.hidden_size, config.hc_count)), count);
+    if (config.activation == HipActivationStorage::bf16)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(inject_rows_kernel<std::uint16_t>), grid, dim3(256U), 0,
+            elementwise_rows_stream(), args, config.hidden_size, config.hc_count);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(inject_rows_kernel<float>), grid, dim3(256U), 0,
+            elementwise_rows_stream(), args, config.hidden_size, config.hc_count);
+    check_hip(hipGetLastError(), "known-window inject cohort rows launch");
+}
+void moe_combine_known_window_cohort_rows_launch(std::span<const std::span<const ExecutionDispatchContext>> segments,
+    const HipElementwiseLauncherConfig& config) {
+    std::uint32_t count = 0;
+    const auto args = prepare_elementwise_cohort_rows(segments, config, count, false);
+    const dim3 grid(prepare_1d_blocks(config.hidden_size), count);
+    if (config.activation == HipActivationStorage::bf16)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(combine_rows_kernel<std::uint16_t>), grid, dim3(256U), 0,
+            elementwise_rows_stream(), args, config.hidden_size);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(combine_rows_kernel<float>), grid, dim3(256U), 0,
+            elementwise_rows_stream(), args, config.hidden_size);
+    check_hip(hipGetLastError(), "known-window MoE-combine cohort rows launch");
 }
 void moe_combine_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipElementwiseLauncherConfig& config) {

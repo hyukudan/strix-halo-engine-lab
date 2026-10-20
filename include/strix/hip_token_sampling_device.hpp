@@ -12,11 +12,12 @@ namespace strix {
 // Device form of sampling-v1 (src/token_sampling.cpp): the transform, the inverse-CDF sample and the speculative
 // decision of every row run on the GPU over the row's FP32 logits; only the decisions come back. The uniforms
 // are the host sampler's (same counter-based draws), so the random numbers are identical.
-// Rows whose cutoff and top-k keep at most `device_top_p_candidates` entries are decided by one workgroup in the
-// host's order and arithmetic (sequential sums in token id or top-p order). Larger rows use a fixed parallel
-// summation order. In both cases the device `exp` may differ from the host's by an ulp, so a decision can differ
-// from the host path only when its uniform falls within a few double ulps of a cumulative boundary.
-// Rows whose top-p prefix needs more than `device_top_p_candidates` entries are decided on the host.
+// Rows whose cutoff and top-k keep at most `device_top_p_candidates` entries (and every row with a top-k of at most
+// device_top_p_candidates / 32, selected in one pass) are decided by one workgroup in the host's order and
+// arithmetic (sequential sums in token id or top-p order). Larger rows sum in a fixed parallel order; their top-p
+// prefix and inverse CDF are mass quantiles in (weight desc, id asc) order with exact fixed-point sums. In all
+// cases the device `exp` may differ from the host's by an ulp, so a decision can differ from the host path only
+// when its uniform falls within a few double ulps of a cumulative boundary.
 inline constexpr std::uint32_t device_top_p_candidates = 2048;
 
 // Which path decides sampled rows. STRIX_SAMPLE_PATH=device|host|auto (default auto); STRIX_SAMPLE_HOST=1 is
@@ -27,8 +28,7 @@ enum class TokenSamplingPath : unsigned {device = 0, host = 1};
 [[nodiscard]] inline bool device_token_sampling_enabled(const TokenSamplingPolicy& policy) noexcept {
     return token_sampling_path(policy) == TokenSamplingPath::device;
 }
-// Draft chain on the device: the device path, a policy whose draft rows never need the host (top-p 1, or top-k
-// at most device_top_p_candidates) and STRIX_SAMPLE_DRAFT_HOST unset.
+// Draft chain on the device: the device path and STRIX_SAMPLE_DRAFT_HOST unset.
 [[nodiscard]] bool device_draft_sampling_enabled(const TokenSamplingPolicy&) noexcept;
 
 struct DeviceSampleRow {
@@ -43,8 +43,8 @@ public:
     ~HipTokenSamplerDevice();
     HipTokenSamplerDevice(const HipTokenSamplerDevice&) = delete;
     HipTokenSamplerDevice& operator=(const HipTokenSamplerDevice&) = delete;
-    // Decisions of every row (the caller applies the stopping rule). Waits for `stream`. A row whose decision
-    // needs the host (oversized top-p prefix) is decided with the host transform after reading its logits.
+    // Decisions of every row (the caller applies the stopping rule). Waits for `stream`. A row without a device
+    // decision (not expected) is decided with the host transform after reading its logits.
     [[nodiscard]] std::vector<TokenDecision> decide(TokenSampler& sampler,std::span<const DeviceSampleRow> rows,void* stream);
     [[nodiscard]] std::uint64_t host_fallbacks() const noexcept;
     struct Impl; // also used by the testing functions

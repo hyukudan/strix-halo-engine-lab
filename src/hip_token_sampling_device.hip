@@ -19,11 +19,15 @@ namespace {
 // Rows are split into kBlocks workgroups of kThreads threads; thread t of block b owns the contiguous index
 // range [(b * kThreads + t) * per, +per), so every scan below runs in token id order.
 constexpr unsigned kThreads = 256, kBlocks = 32, kMaxRows = 8, kCand = device_top_p_candidates, kSmallThreads = 1024;
+// Top-k up to kTopkOnePass: each workgroup keeps its own top-k, one workgroup merges the kBlocks lists.
+constexpr unsigned kTopkOnePass = kCand / kBlocks;
 constexpr std::uint32_t kNone = 0xffffffffU;
 enum : std::uint32_t {
     flag_nonfinite = 1U, flag_host = 2U, flag_drafted = 4U, flag_accepted = 8U, flag_residual = 16U,
     flag_top_p = 32U, flag_need_residual = 64U, flag_done = 128U, flag_small = 256U, flag_bad_draft = 512U,
 };
+using u64 = unsigned long long;
+using u128 = unsigned __int128;
 
 // Index i of a row is its i-th entry in token id order: entry order[i] of the logits, token ids[i]. Target rows
 // (the full vocabulary) have neither map; draft rows (the draft head's entries) have both.
@@ -46,17 +50,27 @@ struct Policy {
 // Radix selection of the m-th largest order key: after four 8-bit rounds `key` is the m-th key and `need` the
 // number of elements equal to it that belong to the m largest (lowest token ids first).
 struct Select { std::uint32_t active, prefix, mask, remaining; };
+// Mass quantile in (key desc, token id asc) order over large rows: the first entry whose cumulative value reaches
+// (kind 0, top-p boundary) or exceeds (kinds 1 and 2, inverse CDF) a target. Values are summed in 80-bit fixed
+// point (units of 2^-80, two 64-bit accumulators), so every sum is exact and independent of the summation order.
+struct Quant {
+    u128 target, above, total, cum;
+    double scale;           // kind 0: top_p; kinds 1 and 2: the uniform
+    std::uint32_t active, kind, prefix, mask, index, zero, pad0, pad1;
+};
 struct RowState {
     float max;
-    std::uint32_t flags, cut_count, kept_count, last_kept, last_residual, token, pad;
-    double total, residual_mass;
-    Select topk, cand;
+    std::uint32_t flags, cut_count, kept_count, last_kept, last_residual, prefix_key, prefix_index;
+    double total, mass;     // large rows: kept weight total; top-p prefix mass
+    Select topk;
+    Quant quant;
 };
 struct Candidate { std::uint32_t key, id; double w; };
 struct Scratch {
     float* block_max;
     std::uint32_t *block_count, *block_eq, *hist;
-    double *weights, *block_sum, *block_residual;
+    double *weights, *block_sum, *block_residual, *rvals;
+    u64 *qhist, *qtie;
     Candidate* candidates;
     RowState* state;
 };
@@ -81,6 +95,18 @@ __device__ __forceinline__ void thread_range(std::uint32_t vocab, unsigned block
 // sampling-v1 step 1a/2: z = (logit - max logit) / temperature in double.
 __device__ __forceinline__ double z_of(float logit, float max, double temperature) {
     return (static_cast<double>(logit) - static_cast<double>(max)) / temperature;
+}
+// Fixed point: x >= 0 (below 2^23) as hi * 2^-40 + lo * 2^-80, truncated below 2^-80.
+__device__ __forceinline__ void fp_split(double x, u64& hi, u64& lo) {
+    const double s = x * 0x1p40;
+    const double h = floor(s);
+    hi = static_cast<u64>(h);
+    lo = static_cast<u64>(floor((s - h) * 0x1p40));
+}
+__device__ __forceinline__ u128 fp_join(u64 hi, u64 lo) { return (static_cast<u128>(hi) << 40U) + lo; }
+__device__ __forceinline__ u128 fp_of(double x) { u64 hi, lo; fp_split(x, hi, lo); return fp_join(hi, lo); }
+__device__ __forceinline__ double fp_double(u128 v) {
+    return static_cast<double>(static_cast<u64>(v >> 64U)) * 0x1p-16 + static_cast<double>(static_cast<u64>(v)) * 0x1p-80;
 }
 // Deterministic block reductions: a fixed LDS tree.
 template <typename T, typename Op> __device__ T block_reduce(T value, T* lds, Op op) {
@@ -161,12 +187,10 @@ __global__ void sample_after_count_kernel(Policy policy, Scratch s) {
     st.topk = {topk ? 1U : 0U, 0U, 0U, policy.top_k};
     if ((topk ? policy.top_k : cut) <= kCand) st.flags |= flag_small;
 }
-// One radix round of selection `which` (0 top-k, 1 top-p candidates) over every finite element.
-template <unsigned Which> __device__ Select& selection(RowState& st) { if constexpr (Which == 0U) return st.topk; else return st.cand; }
-template <unsigned Which>
+// One radix round of the top-k selection over every finite element.
 __global__ __launch_bounds__(kThreads) void sample_hist_kernel(Rows rows, Policy policy, Scratch s, unsigned shift) {
     const auto row = blockIdx.y;
-    const auto sel = selection<Which>(s.state[row]);
+    const auto sel = s.state[row].topk;
     if (!sel.active) return;
     __shared__ std::uint32_t hist[256];
     hist[threadIdx.x] = 0U;
@@ -181,9 +205,9 @@ __global__ __launch_bounds__(kThreads) void sample_hist_kernel(Rows rows, Policy
     __syncthreads();
     s.hist[(static_cast<std::uint64_t>(row) * kBlocks + blockIdx.x) * 256U + threadIdx.x] = hist[threadIdx.x];
 }
-template <unsigned Which> __global__ __launch_bounds__(kThreads) void sample_pick_kernel(Scratch s, unsigned shift) {
+__global__ __launch_bounds__(kThreads) void sample_pick_kernel(Scratch s, unsigned shift) {
     const auto row = blockIdx.x;
-    auto& sel = selection<Which>(s.state[row]);
+    auto& sel = s.state[row].topk;
     if (!sel.active) return;
     __shared__ std::uint32_t counts[256];
     std::uint32_t c = 0;
@@ -204,9 +228,9 @@ template <unsigned Which> __global__ __launch_bounds__(kThreads) void sample_pic
     }
 }
 // Elements equal to the selected key, per block.
-template <unsigned Which> __global__ __launch_bounds__(kThreads) void sample_equal_kernel(Rows rows, Policy policy, Scratch s) {
+__global__ __launch_bounds__(kThreads) void sample_equal_kernel(Rows rows, Policy policy, Scratch s) {
     const auto row = blockIdx.y;
-    const auto sel = selection<Which>(s.state[row]);
+    const auto sel = s.state[row].topk;
     if (!sel.active) return;
     const RowArgs& a = rows.row[row];
     std::uint32_t begin, end;
@@ -215,16 +239,15 @@ template <unsigned Which> __global__ __launch_bounds__(kThreads) void sample_equ
     for (auto i = begin; i < end; ++i) n += order_key(logit_at(a, i)) == sel.prefix ? 1U : 0U;
     __shared__ std::uint32_t lds[kThreads];
     const auto total = block_reduce(n, lds, [](std::uint32_t x, std::uint32_t y) { return x + y; });
-    if (threadIdx.x == 0U) s.block_eq[(Which * kMaxRows + row) * kBlocks + blockIdx.x] = total;
+    if (threadIdx.x == 0U) s.block_eq[row * kBlocks + blockIdx.x] = total;
 }
 // Rank (among elements equal to the selected key, token id order) of the first element of this thread's range.
-template <unsigned Which>
 __device__ std::uint32_t equal_rank_base(const Scratch& s, const Select& sel, const RowArgs& a, std::uint32_t begin,
     std::uint32_t end, unsigned row, std::uint32_t* lds) {
     std::uint32_t mine = 0;
     if (sel.active) for (auto i = begin; i < end; ++i) mine += order_key(logit_at(a, i)) == sel.prefix ? 1U : 0U;
     std::uint32_t base = block_exclusive(mine, lds);
-    if (sel.active) for (unsigned b = 0; b < blockIdx.x; ++b) base += s.block_eq[(Which * kMaxRows + row) * kBlocks + b];
+    if (sel.active) for (unsigned b = 0; b < blockIdx.x; ++b) base += s.block_eq[row * kBlocks + b];
     return base;
 }
 __device__ __forceinline__ bool selected(const Select& sel, std::uint32_t key, std::uint32_t& equal_rank) {
@@ -256,84 +279,37 @@ __device__ void sort_candidates(Candidate* c, unsigned size) {
             __syncthreads();
         }
 }
+// Bitonic sort of v[0, size) descending.
+__device__ void sort_desc(u64* v, unsigned size) {
+    for (unsigned span = 2U; span <= size; span <<= 1U)
+        for (unsigned stride = span >> 1U; stride > 0U; stride >>= 1U) {
+            for (unsigned j = threadIdx.x; j < size; j += blockDim.x) {
+                const auto partner = j ^ stride;
+                if (partner > j) {
+                    const bool descending = (j & span) == 0U;
+                    const bool swap = descending ? v[j] < v[partner] : v[partner] < v[j];
+                    if (swap) { const auto t = v[j]; v[j] = v[partner]; v[partner] = t; }
+                }
+            }
+            __syncthreads();
+        }
+}
 
-// Small rows: at most kCand entries pass the cutoff and top-k. They are compacted in token order and decided by
-// one workgroup exactly as the host does (sequential sums in token id order, or in top-p order).
-__global__ __launch_bounds__(kThreads) void sample_small_count_kernel(Rows rows, Policy policy, Scratch s) {
-    const auto row = blockIdx.y;
-    const auto& st = s.state[row];
-    if ((st.flags & (flag_small | flag_nonfinite)) != flag_small) return;
-    const RowArgs& a = rows.row[row];
-    std::uint32_t begin, end;
-    thread_range(policy.vocab, blockIdx.x, threadIdx.x, begin, end);
-    __shared__ std::uint32_t ranks[kThreads];
-    const auto topk = st.topk;
-    const float max = st.max;
-    auto rank = equal_rank_base<0U>(s, topk, a, begin, end, row, ranks);
-    std::uint32_t n = 0;
-    for (auto i = begin; i < end; ++i) {
-        const float l = logit_at(a, i);
-        n += z_of(l, max, policy.temperature) >= policy.cutoff && selected(topk, order_key(l), rank) ? 1U : 0U;
-    }
-    __shared__ std::uint32_t counts[kThreads];
-    const auto total = block_reduce(n, counts, [](std::uint32_t x, std::uint32_t y) { return x + y; });
-    if (threadIdx.x == 0U) s.block_count[row * kBlocks + blockIdx.x] = total;
-}
-__global__ __launch_bounds__(kThreads) void sample_small_collect_kernel(Rows rows, Policy policy, Scratch s) {
-    const auto row = blockIdx.y;
-    const auto& st = s.state[row];
-    if ((st.flags & (flag_small | flag_nonfinite)) != flag_small) return;
-    const RowArgs& a = rows.row[row];
-    std::uint32_t begin, end;
-    thread_range(policy.vocab, blockIdx.x, threadIdx.x, begin, end);
-    __shared__ std::uint32_t ranks[kThreads];
-    const auto topk = st.topk;
-    const float max = st.max;
-    auto rank = equal_rank_base<0U>(s, topk, a, begin, end, row, ranks);
-    auto rank_count = rank;
-    std::uint32_t n = 0;
-    for (auto i = begin; i < end; ++i) {
-        const float l = logit_at(a, i);
-        n += z_of(l, max, policy.temperature) >= policy.cutoff && selected(topk, order_key(l), rank_count) ? 1U : 0U;
-    }
-    __shared__ std::uint32_t lds[kThreads];
-    auto position = block_exclusive(n, lds);
-    for (unsigned b = 0; b < blockIdx.x; ++b) position += s.block_count[row * kBlocks + b];
-    Candidate* out = s.candidates + static_cast<std::uint64_t>(row) * kCand;
-    for (auto i = begin; i < end; ++i) {
-        const float l = logit_at(a, i);
-        const double z = z_of(l, max, policy.temperature);
-        if (z >= policy.cutoff && selected(topk, order_key(l), rank) && position < kCand) out[position++] = {order_key(l), i, exp(z)};
-    }
-}
-__global__ __launch_bounds__(kSmallThreads) void sample_small_decide_kernel(Rows rows, Policy policy, Scratch s, Result* results) {
-    const auto row = blockIdx.x;
-    const auto& st = s.state[row];
-    if ((st.flags & (flag_small | flag_nonfinite)) != flag_small) return;
-    const RowArgs& a = rows.row[row];
-    __shared__ Candidate c[kCand];
-    __shared__ std::uint32_t kept_shared;
+// The kept entries c[0, n) of a row (token id order, w = exp z, room for the next power of two) decided by the
+// whole workgroup exactly as the host does: the total summed in token id order, the top-p prefix of the
+// (w desc, id asc) order and its mass, the cumulative probabilities, the acceptance test and the residual walk.
+__device__ void decide_kept(const RowArgs& a, const Policy& policy, Candidate* c, std::uint32_t n, Result* result) {
     __shared__ double total_shared;
-    if (threadIdx.x == 0U) {
-        std::uint32_t kept = 0;
-        for (unsigned b = 0; b < kBlocks; ++b) kept += s.block_count[row * kBlocks + b];
-        kept_shared = kept < kCand ? kept : kCand;
-    }
-    __syncthreads();
-    const auto n = kept_shared;
     unsigned size = 2U;
     while (size < n) size <<= 1U;
-    const Candidate* in = s.candidates + static_cast<std::uint64_t>(row) * kCand;
-    for (unsigned j = threadIdx.x; j < size; j += blockDim.x) c[j] = j < n ? in[j] : Candidate{0U, kNone, 0.0};
+    for (unsigned j = n + threadIdx.x; j < size; j += blockDim.x) c[j] = Candidate{0U, kNone, 0.0};
     if (a.q_out) for (std::uint32_t j = threadIdx.x; j < policy.vocab; j += blockDim.x) a.q_out[j] = 0.0;
     __syncthreads();
-    // The host's total: the kept weights summed in token id order.
     if (threadIdx.x == 0U) { double total = 0.0; for (std::uint32_t j = 0; j < n; ++j) total += c[j].w; total_shared = total; }
     __syncthreads();
     const double total = total_shared;
     if (policy.top_p_active) sort_candidates(c, size);
     if (threadIdx.x != 0U) return;
-    // With top-p, the shortest (w desc, id asc) prefix reaching top_p * total, normalized by its own mass.
     std::uint32_t count = n;
     double norm = total;
     if (policy.top_p_active) {
@@ -380,7 +356,196 @@ __global__ __launch_bounds__(kSmallThreads) void sample_small_decide_kernel(Rows
     }
     if (a.q_out) for (std::uint32_t j = 0; j < count; ++j) a.q_out[c[j].id] = p_of(j);
     if (a.token_out) *a.token_out = token;
-    results[row] = {token, flags};
+    *result = {token, flags};
+}
+
+// Small rows: at most kCand entries pass the cutoff and top-k. They are compacted in token order and decided by
+// decide_kept.
+__global__ __launch_bounds__(kThreads) void sample_small_count_kernel(Rows rows, Policy policy, Scratch s) {
+    const auto row = blockIdx.y;
+    const auto& st = s.state[row];
+    if ((st.flags & (flag_small | flag_nonfinite)) != flag_small) return;
+    const RowArgs& a = rows.row[row];
+    std::uint32_t begin, end;
+    thread_range(policy.vocab, blockIdx.x, threadIdx.x, begin, end);
+    __shared__ std::uint32_t ranks[kThreads];
+    const auto topk = st.topk;
+    const float max = st.max;
+    auto rank = equal_rank_base(s, topk, a, begin, end, row, ranks);
+    std::uint32_t n = 0;
+    for (auto i = begin; i < end; ++i) {
+        const float l = logit_at(a, i);
+        n += z_of(l, max, policy.temperature) >= policy.cutoff && selected(topk, order_key(l), rank) ? 1U : 0U;
+    }
+    __shared__ std::uint32_t counts[kThreads];
+    const auto total = block_reduce(n, counts, [](std::uint32_t x, std::uint32_t y) { return x + y; });
+    if (threadIdx.x == 0U) s.block_count[row * kBlocks + blockIdx.x] = total;
+}
+__global__ __launch_bounds__(kThreads) void sample_small_collect_kernel(Rows rows, Policy policy, Scratch s) {
+    const auto row = blockIdx.y;
+    const auto& st = s.state[row];
+    if ((st.flags & (flag_small | flag_nonfinite)) != flag_small) return;
+    const RowArgs& a = rows.row[row];
+    std::uint32_t begin, end;
+    thread_range(policy.vocab, blockIdx.x, threadIdx.x, begin, end);
+    __shared__ std::uint32_t ranks[kThreads];
+    const auto topk = st.topk;
+    const float max = st.max;
+    auto rank = equal_rank_base(s, topk, a, begin, end, row, ranks);
+    auto rank_count = rank;
+    std::uint32_t n = 0;
+    for (auto i = begin; i < end; ++i) {
+        const float l = logit_at(a, i);
+        n += z_of(l, max, policy.temperature) >= policy.cutoff && selected(topk, order_key(l), rank_count) ? 1U : 0U;
+    }
+    __shared__ std::uint32_t lds[kThreads];
+    auto position = block_exclusive(n, lds);
+    for (unsigned b = 0; b < blockIdx.x; ++b) position += s.block_count[row * kBlocks + b];
+    Candidate* out = s.candidates + static_cast<std::uint64_t>(row) * kCand;
+    for (auto i = begin; i < end; ++i) {
+        const float l = logit_at(a, i);
+        const double z = z_of(l, max, policy.temperature);
+        if (z >= policy.cutoff && selected(topk, order_key(l), rank) && position < kCand) out[position++] = {order_key(l), i, exp(z)};
+    }
+}
+__global__ __launch_bounds__(kSmallThreads) void sample_small_decide_kernel(Rows rows, Policy policy, Scratch s, Result* results) {
+    const auto row = blockIdx.x;
+    const auto& st = s.state[row];
+    if ((st.flags & (flag_small | flag_nonfinite)) != flag_small) return;
+    __shared__ Candidate c[kCand];
+    __shared__ std::uint32_t kept_shared;
+    if (threadIdx.x == 0U) {
+        std::uint32_t kept = 0;
+        for (unsigned b = 0; b < kBlocks; ++b) kept += s.block_count[row * kBlocks + b];
+        kept_shared = kept < kCand ? kept : kCand;
+    }
+    __syncthreads();
+    const auto n = kept_shared;
+    const Candidate* in = s.candidates + static_cast<std::uint64_t>(row) * kCand;
+    for (unsigned j = threadIdx.x; j < n; j += blockDim.x) c[j] = in[j];
+    decide_kept(rows.row[row], policy, c, n, results + row);
+}
+
+// Top-k up to kTopkOnePass in one pass over the logits. Each workgroup selects its own k largest entries
+// (radix selection in LDS; ties at the k-th key take the lowest ids) and writes them in token order: the global
+// top-k under (key desc, id asc) is contained in the union of these lists.
+__global__ __launch_bounds__(kThreads) void topk_block_kernel(Rows rows, Policy policy, Scratch s) {
+    const auto row = blockIdx.y;
+    const RowArgs& a = rows.row[row];
+    std::uint32_t begin, end;
+    thread_range(policy.vocab, blockIdx.x, threadIdx.x, begin, end);
+    __shared__ std::uint32_t hist[256];
+    __shared__ std::uint32_t prefix, mask, remaining, all;
+    __shared__ std::uint32_t lds[kThreads];
+    if (threadIdx.x == 0U) { prefix = 0U; mask = 0U; remaining = policy.top_k; all = 0U; }
+    bool bad = false;
+    for (unsigned shift = 24U, round = 0U; round < 4U; ++round, shift -= 8U) {
+        hist[threadIdx.x] = 0U;
+        __syncthreads();
+        const auto p = prefix, m = mask;
+        if (all) break;
+        for (auto i = begin; i < end; ++i) {
+            const float l = logit_at(a, i);
+            if (round == 0U) bad = bad || !isfinite(l);
+            const auto key = order_key(l);
+            if ((key & m) == p) atomicAdd(&hist[(key >> shift) & 255U], 1U);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0U) {
+            if (round == 0U) {
+                std::uint32_t n = 0;
+                for (unsigned b = 0; b < 256U; ++b) n += hist[b];
+                if (n <= remaining) all = 1U;
+            }
+            if (!all) {
+                std::uint32_t above = 0;
+                for (int bin = 255; bin >= 0; --bin) {
+                    if (above + hist[bin] >= remaining) {
+                        remaining -= above;
+                        prefix |= static_cast<std::uint32_t>(bin) << shift;
+                        mask |= 255U << shift;
+                        break;
+                    }
+                    above += hist[bin];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (bad) atomicOr(&s.state[row].flags, flag_nonfinite);
+    const bool take_all = all != 0U;
+    const auto key_k = prefix, need = remaining;
+    // Ties at the k-th key: the first `need` in token order.
+    std::uint32_t ties = 0;
+    if (!take_all) for (auto i = begin; i < end; ++i) ties += order_key(logit_at(a, i)) == key_k ? 1U : 0U;
+    auto tie_rank = block_exclusive(ties, lds);
+    const auto keep = [&](std::uint32_t key, std::uint32_t& rank) {
+        if (take_all || key > key_k) return true;
+        if (key < key_k) return false;
+        return rank++ < need;
+    };
+    auto rank_count = tie_rank;
+    std::uint32_t mine = 0;
+    for (auto i = begin; i < end; ++i) mine += keep(order_key(logit_at(a, i)), rank_count) ? 1U : 0U;
+    auto position = block_exclusive(mine, lds);
+    Candidate* out = s.candidates + (static_cast<std::uint64_t>(row) * kBlocks + blockIdx.x) * kTopkOnePass;
+    for (auto i = begin; i < end; ++i) {
+        const auto key = order_key(logit_at(a, i));
+        if (keep(key, tie_rank) && position < kTopkOnePass) out[position++] = {key, i, 0.0};
+    }
+    __shared__ std::uint32_t counts[kThreads];
+    const auto total = block_reduce(mine, counts, [](std::uint32_t x, std::uint32_t y) { return x + y; });
+    if (threadIdx.x == 0U) s.block_count[row * kBlocks + blockIdx.x] = total < kTopkOnePass ? total : kTopkOnePass;
+}
+// Merge: the block lists in block order are in token order; the k largest of them (key desc, id asc) that pass
+// the cutoff are the kept set, decided by decide_kept.
+__global__ __launch_bounds__(kSmallThreads) void topk_merge_kernel(Rows rows, Policy policy, Scratch s, Result* results) {
+    const auto row = blockIdx.x;
+    if (s.state[row].flags & flag_nonfinite) return;
+    const RowArgs& a = rows.row[row];
+    __shared__ std::uint32_t offsets[kBlocks + 1U];
+    __shared__ std::uint32_t index[kCand];
+    __shared__ u64 order[kCand];
+    __shared__ std::uint8_t chosen[kCand];
+    __shared__ Candidate c[kTopkOnePass];
+    __shared__ std::uint32_t kept_shared;
+    if (threadIdx.x == 0U) {
+        offsets[0] = 0U;
+        for (unsigned b = 0; b < kBlocks; ++b) offsets[b + 1U] = offsets[b] + s.block_count[row * kBlocks + b];
+    }
+    __syncthreads();
+    const auto n = offsets[kBlocks];
+    unsigned size = 2U;
+    while (size < n) size <<= 1U;
+    for (unsigned j = threadIdx.x; j < size; j += blockDim.x) {
+        if (j < n) {
+            unsigned b = 0;
+            while (offsets[b + 1U] <= j) ++b;
+            const auto& e = s.candidates[(static_cast<std::uint64_t>(row) * kBlocks + b) * kTopkOnePass + (j - offsets[b])];
+            index[j] = e.id;
+            // (key desc, position asc): the position is in token order.
+            order[j] = (static_cast<u64>(e.key) << 32U) | (0xffffffffU - j);
+            chosen[j] = 0U;
+        } else order[j] = 0ULL;
+    }
+    __syncthreads();
+    sort_desc(order, size);
+    const auto k = policy.top_k < n ? policy.top_k : n;
+    for (unsigned j = threadIdx.x; j < k; j += blockDim.x) chosen[0xffffffffU - static_cast<std::uint32_t>(order[j])] = 1U;
+    __syncthreads();
+    if (threadIdx.x == 0U) {
+        const float max = logit_at(a, index[0xffffffffU - static_cast<std::uint32_t>(order[0])]);
+        std::uint32_t kept = 0;
+        for (std::uint32_t j = 0; j < n; ++j) {
+            if (!chosen[j]) continue;
+            const float l = logit_at(a, index[j]);
+            const double z = z_of(l, max, policy.temperature);
+            if (z >= policy.cutoff) c[kept++] = {order_key(l), index[j], exp(z)};
+        }
+        kept_shared = kept;
+    }
+    __syncthreads();
+    decide_kept(a, policy, c, kept_shared, results + row);
 }
 
 // Large rows: weights w = exp(z) of the kept elements (cutoff, then top-k), written per index (0 elsewhere);
@@ -395,7 +560,7 @@ __global__ __launch_bounds__(kThreads) void sample_weights_kernel(Rows rows, Pol
     thread_range(policy.vocab, blockIdx.x, threadIdx.x, begin, end);
     __shared__ std::uint32_t ranks[kThreads];
     const auto topk = st.topk;
-    auto rank = equal_rank_base<0U>(s, topk, a, begin, end, row, ranks);
+    auto rank = equal_rank_base(s, topk, a, begin, end, row, ranks);
     double* weights = s.weights + static_cast<std::uint64_t>(row) * policy.vocab;
     double sum = 0.0;
     std::uint32_t kept = 0, last = 0;
@@ -422,13 +587,12 @@ __global__ void sample_after_weights_kernel(Policy policy, Scratch s) {
     std::uint32_t kept = 0;
     for (unsigned b = 0; b < kBlocks; ++b) { total += s.block_sum[row * kBlocks + b]; kept += s.block_count[row * kBlocks + b]; }
     st.total = total; st.kept_count = kept;
-    if (policy.top_p_active) {
+    if (policy.top_p_active && !(st.flags & flag_nonfinite)) {
         st.flags |= flag_top_p;
-        // The kept set is the largest-key set, so its top kCand entries are the overall top kCand.
-        st.cand = {kept > kCand ? 1U : 0U, 0U, 0U, kCand};
+        st.quant.active = 1U; st.quant.kind = 0U; st.quant.scale = policy.top_p;
     }
 }
-// Large draft rows: the distribution per index.
+// Large draft rows without top-p: the distribution per index.
 __global__ __launch_bounds__(kThreads) void sample_q_out_kernel(Rows rows, Policy policy, Scratch s) {
     const auto row = blockIdx.y;
     const auto& st = s.state[row];
@@ -439,103 +603,248 @@ __global__ __launch_bounds__(kThreads) void sample_q_out_kernel(Rows rows, Polic
     thread_range(policy.vocab, blockIdx.x, threadIdx.x, begin, end);
     for (auto i = begin; i < end; ++i) a.q_out[i] = weights[i] / st.total;
 }
-// Top-p candidates: kept elements (and, with more than kCand kept, the kCand largest), compacted in token order.
-__global__ __launch_bounds__(kThreads) void sample_candidate_count_kernel(Rows rows, Policy policy, Scratch s) {
-    const auto row = blockIdx.y;
-    auto& st = s.state[row];
-    if (st.flags & flag_small) return;
-    const RowArgs& a = rows.row[row];
-    const double* weights = s.weights + static_cast<std::uint64_t>(row) * policy.vocab;
-    std::uint32_t begin, end;
-    thread_range(policy.vocab, blockIdx.x, threadIdx.x, begin, end);
-    __shared__ std::uint32_t ranks[kThreads];
-    const auto cand = st.cand;
-    auto rank = equal_rank_base<1U>(s, cand, a, begin, end, row, ranks);
-    std::uint32_t n = 0;
-    for (auto i = begin; i < end; ++i) n += weights[i] > 0.0 && selected(cand, order_key(logit_at(a, i)), rank) ? 1U : 0U;
-    __shared__ std::uint32_t counts[kThreads];
-    const auto total = block_reduce(n, counts, [](std::uint32_t x, std::uint32_t y) { return x + y; });
-    if (threadIdx.x == 0U) s.block_count[row * kBlocks + blockIdx.x] = total;
+
+// Large top-p rows. The prefix is every kept entry with a key above prefix_key plus the entries at prefix_key up
+// to index prefix_index (token order), found as a kind-0 quantile; its fixed-point mass normalizes p.
+__device__ __forceinline__ bool in_prefix(const RowState& st, std::uint32_t key, std::uint32_t i) {
+    return key > st.prefix_key || (key == st.prefix_key && i <= st.prefix_index);
 }
-__global__ __launch_bounds__(kThreads) void sample_collect_kernel(Rows rows, Policy policy, Scratch s) {
+__device__ __forceinline__ double quant_value(const Scratch& s, const RowState& st, unsigned row, std::uint32_t vocab,
+    std::uint32_t i, std::uint32_t key) {
+    const std::uint64_t at = static_cast<std::uint64_t>(row) * vocab + i;
+    if (st.quant.kind == 0U) return s.weights[at];
+    if (st.quant.kind == 1U) return in_prefix(st, key, i) ? s.weights[at] : 0.0;
+    return s.rvals[at];
+}
+__device__ __forceinline__ bool quant_hit(const Quant& q, u128 cumulative) {
+    return q.kind == 0U ? cumulative >= q.target : cumulative > q.target;
+}
+// One radix round: per-block fixed-point value per 8-bit digit of the entries matching the current key prefix.
+__global__ __launch_bounds__(kThreads) void quant_hist_kernel(Rows rows, Policy policy, Scratch s, unsigned shift) {
     const auto row = blockIdx.y;
-    auto& st = s.state[row];
-    if (st.flags & flag_small) return;
+    const auto& st = s.state[row];
+    const auto& q = st.quant;
+    if (!q.active) return;
+    __shared__ u64 hist[256][2];
+    hist[threadIdx.x][0] = 0ULL; hist[threadIdx.x][1] = 0ULL;
+    __syncthreads();
     const RowArgs& a = rows.row[row];
-    const double* weights = s.weights + static_cast<std::uint64_t>(row) * policy.vocab;
     std::uint32_t begin, end;
     thread_range(policy.vocab, blockIdx.x, threadIdx.x, begin, end);
-    __shared__ std::uint32_t ranks[kThreads];
-    const auto cand = st.cand;
-    auto rank = equal_rank_base<1U>(s, cand, a, begin, end, row, ranks);
-    auto rank_count = rank;
-    std::uint32_t n = 0;
-    for (auto i = begin; i < end; ++i) n += weights[i] > 0.0 && selected(cand, order_key(logit_at(a, i)), rank_count) ? 1U : 0U;
-    __shared__ std::uint32_t lds[kThreads];
-    auto position = block_exclusive(n, lds);
-    for (unsigned b = 0; b < blockIdx.x; ++b) position += s.block_count[row * kBlocks + b];
-    Candidate* out = s.candidates + static_cast<std::uint64_t>(row) * kCand;
     for (auto i = begin; i < end; ++i) {
         const auto key = order_key(logit_at(a, i));
-        if (weights[i] > 0.0 && selected(cand, key, rank) && position < kCand) out[position++] = {key, i, weights[i]};
+        if ((key & q.mask) != q.prefix) continue;
+        const double v = quant_value(s, st, row, policy.vocab, i, key);
+        if (!(v > 0.0)) continue;
+        u64 hi, lo;
+        fp_split(v, hi, lo);
+        const auto bin = (key >> shift) & 255U;
+        atomicAdd(&hist[bin][0], hi);
+        atomicAdd(&hist[bin][1], lo);
+    }
+    __syncthreads();
+    u64* out = s.qhist + ((static_cast<std::uint64_t>(row) * kBlocks + blockIdx.x) * 256U + threadIdx.x) * 2U;
+    out[0] = hist[threadIdx.x][0];
+    out[1] = hist[threadIdx.x][1];
+}
+// The digit holding the target; round 0 also sets the target from the set's total.
+__global__ __launch_bounds__(kThreads) void quant_pick_kernel(Scratch s, unsigned shift) {
+    const auto row = blockIdx.x;
+    auto& q = s.state[row].quant;
+    if (!q.active) return;
+    __shared__ u128 bins[256];
+    u64 hi = 0, lo = 0;
+    for (unsigned b = 0; b < kBlocks; ++b) {
+        const u64* in = s.qhist + ((static_cast<std::uint64_t>(row) * kBlocks + b) * 256U + threadIdx.x) * 2U;
+        hi += in[0]; lo += in[1];
+    }
+    bins[threadIdx.x] = fp_join(hi, lo);
+    __syncthreads();
+    if (threadIdx.x != 0U) return;
+    if (shift == 24U) {
+        u128 total = 0;
+        for (unsigned bin = 0; bin < 256U; ++bin) total += bins[bin];
+        q.total = total;
+        // A zero residual mass (p == q up to rounding) samples p with the residual uniform instead.
+        if (total == 0) { q.zero = 1U; q.active = 0U; return; }
+        // sampling-v1: top_p * total (inclusive), or uniform * mass (exclusive); within the set.
+        q.target = fp_of(q.scale * fp_double(total));
+        if (q.kind != 0U && q.target >= total) q.target = total - 1U;
+    }
+    u128 above = 0;
+    int chosen = -1, last = -1;
+    for (int bin = 255; bin >= 0; --bin) {
+        const u128 m = bins[bin];
+        if (m == 0) continue;
+        last = bin;
+        if (quant_hit(q, above + m)) { chosen = bin; break; }
+        above += m;
+    }
+    if (chosen < 0) {
+        // Rounding: the target lies beyond the set; take its last entry.
+        if (last < 0) { q.active = 0U; return; }
+        chosen = last;
+        above -= bins[last];
+        q.target = q.kind == 0U ? bins[last] : bins[last] - 1U;
+    } else q.target -= above;
+    q.above += above;
+    q.prefix |= static_cast<std::uint32_t>(chosen) << shift;
+    q.mask |= 255U << shift;
+}
+// Entries at the final key: per-block fixed-point sums, then a walk in token order.
+__global__ __launch_bounds__(kThreads) void quant_tie_sum_kernel(Rows rows, Policy policy, Scratch s) {
+    const auto row = blockIdx.y;
+    const auto& st = s.state[row];
+    const auto& q = st.quant;
+    if (!q.active) return;
+    const RowArgs& a = rows.row[row];
+    std::uint32_t begin, end;
+    thread_range(policy.vocab, blockIdx.x, threadIdx.x, begin, end);
+    u128 mine = 0;
+    for (auto i = begin; i < end; ++i) {
+        const auto key = order_key(logit_at(a, i));
+        if (key != q.prefix) continue;
+        const double v = quant_value(s, st, row, policy.vocab, i, key);
+        if (v > 0.0) mine += fp_of(v);
+    }
+    __shared__ u128 lds[kThreads];
+    lds[threadIdx.x] = mine;
+    __syncthreads();
+    if (threadIdx.x == 0U) {
+        u128 sum = 0;
+        for (unsigned t = 0; t < kThreads; ++t) sum += lds[t];
+        u64* out = s.qtie + (static_cast<std::uint64_t>(row) * kBlocks + blockIdx.x) * 2U;
+        out[0] = static_cast<u64>(sum >> 64U);
+        out[1] = static_cast<u64>(sum);
     }
 }
-// Large top-p rows: sampling-v1's (w desc, id asc) prefix, its mass and the decision, in the host's arithmetic.
-__global__ __launch_bounds__(kSmallThreads) void sample_top_p_decide_kernel(Rows rows, Policy policy, Scratch s, Result* results) {
+__global__ __launch_bounds__(kThreads) void quant_walk_kernel(Rows rows, Policy policy, Scratch s) {
     const auto row = blockIdx.x;
     auto& st = s.state[row];
-    if (st.flags & (flag_nonfinite | flag_small)) return;
-    __shared__ Candidate c[kCand];
-    const auto n = st.kept_count < kCand ? st.kept_count : kCand;
-    const Candidate* in = s.candidates + static_cast<std::uint64_t>(row) * kCand;
-    for (unsigned j = threadIdx.x; j < kCand; j += blockDim.x) c[j] = j < n ? in[j] : Candidate{0U, kNone, 0.0};
-    __syncthreads();
-    sort_candidates(c, kCand);
-    if (threadIdx.x != 0U) return;
+    auto& q = st.quant;
+    if (!q.active) return;
     const RowArgs& a = rows.row[row];
-    const double target = policy.top_p * st.total;
-    double mass = 0.0;
-    std::uint32_t count = 0;
-    while (count < n) { mass += c[count].w; ++count; if (mass >= target) break; }
-    if (mass < target && st.kept_count > n) { results[row] = {0U, flag_host}; return; }
-    const auto p_of = [&](std::uint32_t j) { return c[j].w / mass; };
-    std::uint32_t token = kNone, flags = 0U;
-    const auto sample = [&](double u) {
-        double cumulative = 0.0;
-        for (std::uint32_t j = 0; j < count; ++j) { cumulative += p_of(j); if (u < cumulative) return token_at(a, c[j].id); }
-        return token_at(a, c[count - 1U].id);
-    };
-    if (a.draft == kNone) token = sample(a.u_plain);
-    else {
-        flags |= flag_drafted;
-        const double qd = q_probability(a, a.draft);
-        double pd = 0.0;
-        for (std::uint32_t j = 0; j < count; ++j) if (token_at(a, c[j].id) == a.draft) { pd = p_of(j); break; }
-        if (!(qd > 0.0)) { token = a.draft; flags |= flag_bad_draft; }
-        else if (a.u_accept * qd < pd) { token = a.draft; flags |= flag_accepted; }
-        else {
-            flags |= flag_residual;
-            double rmass = 0.0;
-            for (std::uint32_t j = 0; j < count; ++j) rmass += fmax(0.0, p_of(j) - q_probability(a, token_at(a, c[j].id)));
-            if (!(rmass > 0.0)) token = sample(a.u_residual);
-            else {
-                const double rtarget = a.u_residual * rmass;
-                double cumulative = 0.0;
-                std::uint32_t last = a.draft;
-                for (std::uint32_t j = 0; j < count; ++j) {
-                    const auto t = token_at(a, c[j].id);
-                    const double r = fmax(0.0, p_of(j) - q_probability(a, t));
-                    if (!(r > 0.0)) continue;
-                    cumulative += r; last = t;
-                    if (rtarget < cumulative) { token = t; break; }
-                }
-                if (token == kNone) token = last;
-            }
+    __shared__ unsigned chosen_block, chosen_thread;
+    __shared__ u128 start;
+    __shared__ u128 sums[kThreads];
+    if (threadIdx.x == 0U) {
+        q.index = kNone; // stays kNone only if the walk fails; the row then reports no decision
+        u128 cumulative = 0;
+        chosen_block = kNone;
+        for (unsigned b = 0; b < kBlocks; ++b) {
+            const u64* in = s.qtie + (static_cast<std::uint64_t>(row) * kBlocks + b) * 2U;
+            const u128 v = (static_cast<u128>(in[0]) << 64U) | in[1];
+            if (v == 0) continue;
+            if (quant_hit(q, cumulative + v)) { chosen_block = b; break; }
+            cumulative += v;
         }
+        start = cumulative;
     }
-    if (a.token_out) *a.token_out = token;
-    results[row] = {token, flags | flag_done};
+    __syncthreads();
+    const auto block = chosen_block;
+    if (block == kNone) { if (threadIdx.x == 0U) q.active = 0U; return; }
+    std::uint32_t begin, end;
+    thread_range(policy.vocab, block, threadIdx.x, begin, end);
+    u128 mine = 0;
+    for (auto i = begin; i < end; ++i) {
+        const auto key = order_key(logit_at(a, i));
+        if (key != q.prefix) continue;
+        const double v = quant_value(s, st, row, policy.vocab, i, key);
+        if (v > 0.0) mine += fp_of(v);
+    }
+    sums[threadIdx.x] = mine;
+    __syncthreads();
+    if (threadIdx.x == 0U) {
+        u128 cumulative = start;
+        chosen_thread = kNone;
+        for (unsigned t = 0; t < kThreads; ++t) {
+            if (sums[t] == 0) continue;
+            if (quant_hit(q, cumulative + sums[t])) { chosen_thread = t; break; }
+            cumulative += sums[t];
+        }
+        start = cumulative;
+    }
+    __syncthreads();
+    if (threadIdx.x != chosen_thread) return;
+    u128 cumulative = start;
+    for (auto i = begin; i < end; ++i) {
+        const auto key = order_key(logit_at(a, i));
+        if (key != q.prefix) continue;
+        const double v = quant_value(s, st, row, policy.vocab, i, key);
+        if (!(v > 0.0)) continue;
+        cumulative += fp_of(v);
+        if (quant_hit(q, cumulative)) { q.index = i; q.cum = q.above + cumulative; return; }
+    }
 }
+__device__ void quant_reset(Quant& q, std::uint32_t kind, double scale) {
+    q.target = 0; q.above = 0; q.total = 0; q.cum = 0;
+    q.scale = scale; q.active = 1U; q.kind = kind; q.prefix = 0U; q.mask = 0U; q.index = 0U; q.zero = 0U;
+}
+// After the prefix: its mass, the draft's acceptance, and the next quantile (sample or residual).
+__global__ void topp_after_prefix_kernel(Rows rows, Policy policy, Scratch s, Result* results) {
+    const auto row = blockIdx.x;
+    auto& st = s.state[row];
+    if (!(st.flags & flag_top_p)) return;
+    auto& q = st.quant;
+    if (!q.active || q.index == kNone) { q.active = 0U; return; }
+    st.prefix_key = q.prefix; st.prefix_index = q.index; st.mass = fp_double(q.cum);
+    const RowArgs& a = rows.row[row];
+    if (a.draft == kNone) { quant_reset(q, 1U, a.u_plain); return; }
+    const double* weights = s.weights + static_cast<std::uint64_t>(row) * policy.vocab;
+    const double w = weights[a.draft];
+    const double pd = w > 0.0 && in_prefix(st, order_key(a.logits[a.draft]), a.draft) ? w / st.mass : 0.0;
+    const double qd = q_probability(a, a.draft);
+    q.active = 0U;
+    if (!(qd > 0.0)) { results[row] = {a.draft, flag_done | flag_drafted | flag_bad_draft}; return; }
+    if (a.u_accept * qd < pd) { results[row] = {a.draft, flag_done | flag_drafted | flag_accepted}; return; }
+    quant_reset(q, 2U, a.u_residual);
+}
+// Residual values r = max(0, p - q) over the prefix (drafted rows are target rows: index = token id).
+__global__ __launch_bounds__(kThreads) void topp_residual_kernel(Rows rows, Policy policy, Scratch s) {
+    const auto row = blockIdx.y;
+    const auto& st = s.state[row];
+    if (!(st.flags & flag_top_p) || !st.quant.active || st.quant.kind != 2U) return;
+    const RowArgs& a = rows.row[row];
+    const std::uint64_t base = static_cast<std::uint64_t>(row) * policy.vocab;
+    std::uint32_t begin, end;
+    thread_range(policy.vocab, blockIdx.x, threadIdx.x, begin, end);
+    for (auto i = begin; i < end; ++i) {
+        const double w = s.weights[base + i];
+        s.rvals[base + i] = w > 0.0 && in_prefix(st, order_key(a.logits[i]), i) ? fmax(0.0, w / st.mass - q_probability(a, i)) : 0.0;
+    }
+}
+// Large top-p draft rows: the distribution per index.
+__global__ __launch_bounds__(kThreads) void topp_q_out_kernel(Rows rows, Policy policy, Scratch s) {
+    const auto row = blockIdx.y;
+    const auto& st = s.state[row];
+    const RowArgs& a = rows.row[row];
+    if (!a.q_out || !(st.flags & flag_top_p)) return;
+    const double* weights = s.weights + static_cast<std::uint64_t>(row) * policy.vocab;
+    std::uint32_t begin, end;
+    thread_range(policy.vocab, blockIdx.x, threadIdx.x, begin, end);
+    for (auto i = begin; i < end; ++i) {
+        const double w = weights[i];
+        a.q_out[i] = w > 0.0 && in_prefix(st, order_key(logit_at(a, i)), i) ? w / st.mass : 0.0;
+    }
+}
+// After a sample or residual quantile: the token, or (zero residual mass) a sample of p with the residual uniform.
+__global__ void topp_finish_kernel(Rows rows, Scratch s, Result* results) {
+    const auto row = blockIdx.x;
+    auto& st = s.state[row];
+    if (!(st.flags & flag_top_p)) return;
+    auto& q = st.quant;
+    const RowArgs& a = rows.row[row];
+    if (!q.active) {
+        if (q.kind == 2U && q.zero) quant_reset(q, 1U, a.u_residual);
+        return;
+    }
+    if (q.index == kNone) { q.active = 0U; return; }
+    const auto token = token_at(a, q.index);
+    if (a.token_out) *a.token_out = token;
+    results[row] = {token, flag_done | (a.draft == kNone ? 0U : flag_drafted | flag_residual)};
+    q.active = 0U;
+}
+
 // Large rows without top-p: find the element where the running sum of `value(i)` first exceeds `target`;
 // thread 0 walks the block sums, the block's threads sum their ranges, thread 0 their prefix, one thread its range.
 template <typename Value>
@@ -693,7 +1002,9 @@ struct Engine {
         const auto o_max = take(sizeof(float) * kMaxRows * kBlocks), o_count = take(4ULL * kMaxRows * kBlocks),
             o_eq = take(4ULL * 2U * kMaxRows * kBlocks), o_hist = take(4ULL * kMaxRows * kBlocks * 256U),
             o_w = take(8ULL * rows * c), o_sum = take(8ULL * kMaxRows * kBlocks), o_res = take(8ULL * kMaxRows * kBlocks),
-            o_cand = take(sizeof(Candidate) * kMaxRows * kCand), o_state = take(sizeof(RowState) * kMaxRows);
+            o_cand = take(sizeof(Candidate) * kMaxRows * kCand), o_state = take(sizeof(RowState) * kMaxRows),
+            o_rvals = take(8ULL * rows * c), o_qhist = take(16ULL * kMaxRows * kBlocks * 256U),
+            o_qtie = take(16ULL * kMaxRows * kBlocks);
         check(hipMalloc(&device_memory, at), "device token sampler scratch");
         auto* base = static_cast<unsigned char*>(device_memory);
         scratch.block_max = reinterpret_cast<float*>(base + o_max);
@@ -705,6 +1016,9 @@ struct Engine {
         scratch.block_residual = reinterpret_cast<double*>(base + o_res);
         scratch.candidates = reinterpret_cast<Candidate*>(base + o_cand);
         scratch.state = reinterpret_cast<RowState*>(base + o_state);
+        scratch.rvals = reinterpret_cast<double*>(base + o_rvals);
+        scratch.qhist = reinterpret_cast<u64*>(base + o_qhist);
+        scratch.qtie = reinterpret_cast<u64*>(base + o_qtie);
     }
     ~Engine() { if (device_memory) (void)hipFree(device_memory); }
     Engine(const Engine&) = delete;
@@ -723,35 +1037,50 @@ struct Engine {
         check(hipMemsetAsync(scratch.state, 0, sizeof(RowState) * kMaxRows, stream), "device sampler state reset");
         for (unsigned i = 0; i < count; ++i) results[i] = {0U, 0U};
         const dim3 grid(kBlocks, count);
-        hipLaunchKernelGGL(sample_max_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
-        hipLaunchKernelGGL(sample_count_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
-        hipLaunchKernelGGL(sample_after_count_kernel, dim3(count), dim3(1), 0, stream, p, scratch);
-        if (p.top_k) {
-            for (unsigned shift = 24U, round = 0U; round < 4U; ++round, shift -= 8U) {
-                hipLaunchKernelGGL(sample_hist_kernel<0U>, grid, dim3(kThreads), 0, stream, r, p, scratch, shift);
-                hipLaunchKernelGGL(sample_pick_kernel<0U>, dim3(count), dim3(kThreads), 0, stream, scratch, shift);
-            }
-            hipLaunchKernelGGL(sample_equal_kernel<0U>, grid, dim3(kThreads), 0, stream, r, p, scratch);
-        }
-        hipLaunchKernelGGL(sample_small_count_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
-        hipLaunchKernelGGL(sample_small_collect_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
-        hipLaunchKernelGGL(sample_small_decide_kernel, dim3(count), dim3(kSmallThreads), 0, stream, r, p, scratch, results);
-        hipLaunchKernelGGL(sample_weights_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
-        hipLaunchKernelGGL(sample_after_weights_kernel, dim3(count), dim3(1), 0, stream, p, scratch);
-        if (p.top_p_active) {
-            for (unsigned shift = 24U, round = 0U; round < 4U; ++round, shift -= 8U) {
-                hipLaunchKernelGGL(sample_hist_kernel<1U>, grid, dim3(kThreads), 0, stream, r, p, scratch, shift);
-                hipLaunchKernelGGL(sample_pick_kernel<1U>, dim3(count), dim3(kThreads), 0, stream, scratch, shift);
-            }
-            hipLaunchKernelGGL(sample_equal_kernel<1U>, grid, dim3(kThreads), 0, stream, r, p, scratch);
-            hipLaunchKernelGGL(sample_candidate_count_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
-            hipLaunchKernelGGL(sample_collect_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
-            hipLaunchKernelGGL(sample_top_p_decide_kernel, dim3(count), dim3(kSmallThreads), 0, stream, r, p, scratch, results);
+        if (p.top_k > 0U && p.top_k <= kTopkOnePass) {
+            // Small top-k: one pass over the logits and one merging workgroup per row.
+            hipLaunchKernelGGL(topk_block_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
+            hipLaunchKernelGGL(topk_merge_kernel, dim3(count), dim3(kSmallThreads), 0, stream, r, p, scratch, results);
         } else {
-            hipLaunchKernelGGL(sample_q_out_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
-            hipLaunchKernelGGL(sample_decide_kernel, dim3(count), dim3(kThreads), 0, stream, r, p, scratch, results);
-            hipLaunchKernelGGL(sample_residual_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
-            hipLaunchKernelGGL(sample_residual_decide_kernel, dim3(count), dim3(kThreads), 0, stream, r, p, scratch, results);
+            hipLaunchKernelGGL(sample_max_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
+            hipLaunchKernelGGL(sample_count_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
+            hipLaunchKernelGGL(sample_after_count_kernel, dim3(count), dim3(1), 0, stream, p, scratch);
+            if (p.top_k) {
+                for (unsigned shift = 24U, round = 0U; round < 4U; ++round, shift -= 8U) {
+                    hipLaunchKernelGGL(sample_hist_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch, shift);
+                    hipLaunchKernelGGL(sample_pick_kernel, dim3(count), dim3(kThreads), 0, stream, scratch, shift);
+                }
+                hipLaunchKernelGGL(sample_equal_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
+            }
+            hipLaunchKernelGGL(sample_small_count_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
+            hipLaunchKernelGGL(sample_small_collect_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
+            hipLaunchKernelGGL(sample_small_decide_kernel, dim3(count), dim3(kSmallThreads), 0, stream, r, p, scratch, results);
+            hipLaunchKernelGGL(sample_weights_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
+            hipLaunchKernelGGL(sample_after_weights_kernel, dim3(count), dim3(1), 0, stream, p, scratch);
+            if (p.top_p_active) {
+                // Prefix boundary, then the sample or the residual quantile, then (zero residual mass) a sample of p.
+                const auto quantile = [&] {
+                    for (unsigned shift = 24U, round = 0U; round < 4U; ++round, shift -= 8U) {
+                        hipLaunchKernelGGL(quant_hist_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch, shift);
+                        hipLaunchKernelGGL(quant_pick_kernel, dim3(count), dim3(kThreads), 0, stream, scratch, shift);
+                    }
+                    hipLaunchKernelGGL(quant_tie_sum_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
+                    hipLaunchKernelGGL(quant_walk_kernel, dim3(count), dim3(kThreads), 0, stream, r, p, scratch);
+                };
+                quantile();
+                hipLaunchKernelGGL(topp_after_prefix_kernel, dim3(count), dim3(1), 0, stream, r, p, scratch, results);
+                hipLaunchKernelGGL(topp_residual_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
+                hipLaunchKernelGGL(topp_q_out_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
+                quantile();
+                hipLaunchKernelGGL(topp_finish_kernel, dim3(count), dim3(1), 0, stream, r, scratch, results);
+                quantile();
+                hipLaunchKernelGGL(topp_finish_kernel, dim3(count), dim3(1), 0, stream, r, scratch, results);
+            } else {
+                hipLaunchKernelGGL(sample_q_out_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
+                hipLaunchKernelGGL(sample_decide_kernel, dim3(count), dim3(kThreads), 0, stream, r, p, scratch, results);
+                hipLaunchKernelGGL(sample_residual_kernel, grid, dim3(kThreads), 0, stream, r, p, scratch);
+                hipLaunchKernelGGL(sample_residual_decide_kernel, dim3(count), dim3(kThreads), 0, stream, r, p, scratch, results);
+            }
         }
         hipLaunchKernelGGL(sample_nonfinite_kernel, dim3(1), dim3(kMaxRows), 0, stream, scratch, results, count);
         check(hipGetLastError(), "device token sampling launch");
@@ -786,8 +1115,7 @@ TokenSamplingPath token_sampling_path(const TokenSamplingPolicy& policy) noexcep
 }
 bool device_draft_sampling_enabled(const TokenSamplingPolicy& policy) noexcept {
     static const bool draft_host = env_is("STRIX_SAMPLE_DRAFT_HOST", "1");
-    return !draft_host && device_token_sampling_enabled(policy) &&
-           (policy.top_p >= 1.0F || (policy.top_k > 0U && policy.top_k <= device_top_p_candidates));
+    return !draft_host && device_token_sampling_enabled(policy);
 }
 
 struct HipTokenSamplerDevice::Impl {
@@ -891,7 +1219,7 @@ std::vector<TokenDecision> HipTokenSamplerDevice::decide(TokenSampler& sampler, 
         require(!(result.flags & flag_nonfinite), "token distribution requires finite logits");
         require(!(result.flags & flag_bad_draft), "draft token must have positive draft probability");
         if (result.flags & flag_host || !(result.flags & flag_done)) {
-            // Oversized top-p prefix: the host transform over this row's logits.
+            // No device decision (not expected): the host transform over this row's logits.
             ++i.fallbacks;
             read_hip_logits_row(rows[k].logits, i.vocab, stream, i.host_logits);
             const auto draft = rows[k].draft ? std::optional<TokenDraft>(host_token_draft(*rows[k].draft, stream)) : std::nullopt;
@@ -916,6 +1244,7 @@ struct HipTokenDraftSamplerDevice::Impl {
     double* q = nullptr;                // device: [max_steps][capacity]
     std::uint32_t* staging = nullptr;   // pinned host: order then ids
     std::vector<std::uint64_t> positions;
+    std::vector<hipEvent_t> starts, stops; // STRIX_SAMPLE_TIMING: per step, read after the chain completed
     Impl(std::uint32_t c, std::uint32_t steps)
         : capacity(c), max_steps(steps), engine(c, 1U), results(pinned_results(std::max<std::uint32_t>(steps, 1U))), positions(steps) {
         require(steps > 0U, "device draft sampler needs a step");
@@ -927,6 +1256,8 @@ struct HipTokenDraftSamplerDevice::Impl {
     ~Impl() {
         if (results) (void)hipHostFree(results);
         if (staging) (void)hipHostFree(staging);
+        for (auto* e : starts) (void)hipEventDestroy(e);
+        for (auto* e : stops) (void)hipEventDestroy(e);
         for (void* p : {static_cast<void*>(order), static_cast<void*>(sorted_ids), static_cast<void*>(q)}) if (p) (void)hipFree(p);
     }
     void set_vocabulary(std::span<const std::uint32_t> ids, std::uint32_t n, hipStream_t stream) {
@@ -953,13 +1284,22 @@ struct HipTokenDraftSamplerDevice::Impl {
         a.logits = logits; a.order = order; a.ids = sorted_ids;
         a.q_out = q + static_cast<std::uint64_t>(k) * capacity; a.token_out = slot;
         a.u_plain = u;
+        const bool timed = sample_timing_enabled();
+        if (timed && starts.empty()) {
+            starts.resize(max_steps); stops.resize(max_steps);
+            for (std::uint32_t i = 0; i < max_steps; ++i) {
+                check(hipEventCreate(&starts[i]), "draft timing event"); check(hipEventCreate(&stops[i]), "draft timing event");
+            }
+        }
+        if (timed) check(hipEventRecord(starts[k], stream), "draft timing start");
         engine.enqueue(r, 1U, rows, policy, results + k, stream);
+        if (timed) check(hipEventRecord(stops[k], stream), "draft timing stop");
     }
     TokenDraft draft(std::uint32_t k) const {
         const auto result = results[k];
         require(!(result.flags & flag_nonfinite), "token distribution requires finite logits");
         if (result.flags & flag_host || !(result.flags & flag_done))
-            throw std::logic_error("device draft step needed the host (policy outside the device draft path)");
+            throw std::logic_error("device draft step produced no decision");
         TokenDraft d;
         d.position = positions[k]; d.token = result.token;
         d.device = {sorted_ids, q + static_cast<std::uint64_t>(k) * capacity, rows};
@@ -982,7 +1322,14 @@ void HipTokenDraftSamplerDevice::step(const TokenSampler& sampler, std::uint32_t
 void HipTokenDraftSamplerDevice::finish(TokenSampler& sampler, std::uint32_t steps, std::vector<TokenDraft>& out) {
     require(steps <= impl_->max_steps, "device draft steps exceed the sampler");
     out.clear();
-    for (std::uint32_t k = 0; k < steps; ++k) { out.push_back(impl_->draft(k)); sampler.count_draft(); }
+    for (std::uint32_t k = 0; k < steps; ++k) {
+        out.push_back(impl_->draft(k)); sampler.count_draft();
+        if (!impl_->starts.empty()) {
+            float ms = 0.0F;
+            check(hipEventElapsedTime(&ms, impl_->starts[k], impl_->stops[k]), "draft timing");
+            record_sample_timing(SampleTimingKind::draft_kernels, 1U, 0.0, static_cast<double>(ms) * 1e-3, 1U);
+        }
+    }
 }
 
 TokenDecision hip_decide_token_for_testing(std::span<const float> logits, const TokenSamplingPolicy& policy,
@@ -1029,8 +1376,9 @@ TokenDecision hip_decide_token_for_testing(std::span<const float> logits, const 
     const auto result = impl.results[0];
     require(!(result.flags & flag_nonfinite), "token distribution requires finite logits");
     require(!(result.flags & flag_bad_draft), "draft token must have positive draft probability");
-    if (host_fallback) *host_fallback = (result.flags & flag_host) != 0U;
-    if (result.flags & flag_host) return decide_token(make_token_distribution(logits, {}, policy), draft, u_plain, u_accept, u_residual);
+    const bool none = (result.flags & flag_host) || !(result.flags & flag_done);
+    if (host_fallback) *host_fallback = none;
+    if (none) return decide_token(make_token_distribution(logits, {}, policy), draft, u_plain, u_accept, u_residual);
     TokenDecision out;
     out.token = result.token;
     out.drafted = (result.flags & flag_drafted) != 0U;

@@ -832,6 +832,79 @@ smoke runs (six policies, 256 tokens) give the host path's tokens with replay er
 chi-square smoke gives the host path's numbers. Single runs measured the device faster than the host for every kind of
 decision under all six policy classes; the timing campaign confirms it.
 
+## D-051: batched decoding on the tiled MTP route (cohort requests with tiled prompts, `--http-batch`)
+
+Cohort windows (D-039) now run on the tiled MTP prompt, the serving route. A run holds up to eight request slots;
+each slot owns what a single request owns (target state and session, launch plan, PLE backend, tiled prefill owners
+and backends, prefix state cache view, predictor, target producer, 2/4/8 window owners on one shared window
+stream), while the tiled prefill arenas are shared and used by one prompt at a time. The calibration replay runs
+once and qualifies every slot. A request is admitted into a free slot between decode cycles and starts exactly like
+a request of the one-at-a-time server (fresh state, session and predictor, its prompt through the tiled prefill, its
+first token from the prompt's last row); its prompt advances one unit at a time (a T-row block, a tail block or 16
+serial rows) between the cycles of the others; it leaves when it ends. Cycles with two or more requests past their
+prompt are cohort cycles. The command line exposes it as `--mtp-cohort-request TOKENS_FILE` on the tiled prompt
+(lockstep or sequential, up to eight requests), the server as `--http-batch N` (1..8). Sampled decoding works on
+this route: the target sampler is per request (replaceable on an idle producer), the tiled prompt's last row
+selects through it, cohort windows install each sampled request's row selection on its capture and pass its draft
+distributions; `--http-sampling sample` samples with each request's policy and seed. See
+[docs/serving.md](docs/serving.md#batched-decoding) and [docs/multi-request-cohort.md](docs/multi-request-cohort.md).
+
+Why: the server ran one request at a time, so concurrent clients only queued, and cohort windows (the decode-side
+batching) were limited to the serial prompt route (4097 tokens, about 70 ms per prompt token). Alternative: one
+shared state with row offsets per request; not taken, because every per-request owner already exists and keeps each
+request's arithmetic its own. Status: opt-in (`--http-batch`, cohort requests); greedy requests are exact.
+
+| Check | Result |
+| --- | --- |
+| Command line, tiled prompt, code8k (4 blocks) + es2, lockstep and sequential; code8k + es2 + p43 + prose8k, lockstep and sequential | Every request identical to its sequential run and request 0 to the single-request tiled route; calibration replay error 0 |
+| Eight requests (code8k, prose8k and six short prompts), lockstep vs sequential | Identical, all eight |
+| Interleaved admission (`STRIX_BATCH_INTERLEAVE=1`), four requests | Identical to the sequential run |
+| Server `--http-batch 8`, eight short prompts alone | Token IDs identical to the one-at-a-time server |
+| Server `--http-batch 8`, N = 2/4/8 concurrent clients, short prompts and 8K prompts | Every request returns its N = 1 tokens |
+| `strix-serve-api-tests` (queue pull interface: order, cancelled-while-queued jobs, totals, shutdown) | Pass |
+
+Single smoke runs, not a campaign (dense A8, windows 2/4/8, 256 tokens per request): four requests on the command
+line 63.6 tok/s aggregate (cycles only) against 43.6 sequential, eight 58.7 against 40.6; the server took 49.8 s for
+eight concurrent short requests against 69.7 s one at a time.
+
+## D-052: cohort cycles of up to 32 rows with wide shared steps (`STRIX_COHORT_ROWS`, `STRIX_COHORT_WIDE`, opt-in)
+
+A cohort window (D-039) already ran the steps that read only weights once for the rows of all its sessions, but
+one window held at most 8 rows: with five to eight requests every cycle needed two cohort windows, each reading the
+fixed weights (GDN/QSA projections, LM head, HC, router, shared expert) and its own expert union. With
+`STRIX_COHORT_ROWS=16|32` the sessions of a cycle form one group of up to that many rows, run as chunks of at most
+8 rows that advance step by step on one stream (`HipKnownPrefixWindow::execute_mtp_cohort_chunks`; a chunk of two
+or more sessions has a primary owner as before, a lone session runs its own window). Each session keeps its 8-row
+cohort row count (8 / sessions, at least 2), so up to four requests run as before. With `STRIX_COHORT_WIDE` (`all`
+= gdn, qsa, head, moe) these steps run once for the rows of all chunks (9 to 32 rows): the GDN and QSA input and
+output projections (dense A8, 16-row WMMA tiles, padded to 16 or 32 rows with rows that read the first row's input
+and write a sink), the LM head (unstaged launches of up to 16 rows) and the routed expert union (CSR per row count,
+down in batches of at most 8 assignments). Recurrence, attention, PLE, combines and injections stay per session;
+HC, router and shared expert per chunk (their per-layer weights are re-read from the MALL). It applies to the
+command-line cohort and to `--http-batch` alike. See [docs/multi-request-cohort.md](docs/multi-request-cohort.md).
+
+Why: an independent request shares few experts with another (on six prompts' route logs the union of N requests'
+windows is 72-95 % of their separate expert bytes), so the gain of fusing is the fixed weights read once per cycle
+instead of once per cohort window, plus the cross-request expert overlap; it only exists where a cycle needed more
+than one cohort window. Alternatives measured and not taken as defaults: more rows per request at the same
+budget (4 rows each at four requests: 62 tok/s against 71.5; 8 each at two: 52 against 60, the extra drafts are
+rarely accepted), and the wide inject launch (`inject`, opt-in: 16-row steps 161 ms against 147.5 ms without it).
+The FP32 Q8 wide projection forms were found not to keep the per-row bits of the 1..8-row forms (a GDN cohort
+fixture differed at row 8), so the wide GDN and QSA steps require dense A8. Status: opt-in.
+
+| Check | Result |
+| --- | --- |
+| `strix-hip-gdn-deferred-window-tests`: cohorts of up to 8 sessions and 10-32 rows (dense A8) against each session's own window | 588 scenarios bit-exact (outputs, workspaces, matrix, conv history); totals > 8 without dense A8 rejected |
+| `strix-hip-known-window-tests`: QSA cohorts of 2-8 sessions at mixed positions (10-32 rows dense A8), LM head rows 9-32 from several arenas against R1, inject cohorts of 2/4-row segments | Bit-exact |
+| `strix-hip-moe-known-rows-tests 12/16/17/24/32 1 a8q51/a8q80/a8q5k`: unions over several arenas against the serial A8 rows, experts shared by up to all rows | Whole arena identical |
+| Command line (code1k + prose1k, es2, en2, p43, esprose, frprose, enconv), N = 2, 4, 6, 8, budgets 16 and 32, wide sets, every request against its sequential run | Identical, replay error 0 |
+| Server `--http-batch 8`, eight concurrent short requests, fused against unfused | Token IDs identical (8 of 8) |
+
+Single smoke runs, not a campaign (dense A8, windows 2/4/8, 256 tokens per request, same binary): six requests
+62.2 tok/s aggregate as two cohort windows per cycle against 77.7 fused (12 rows); eight 74.3 against 85.2 (16 rows,
+`gdn,qsa,head,moe`); sequential 44.9 and 44.3. The server took 42.9 s for eight concurrent short requests fused
+(with the wide inject) against 46.9 s.
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |
