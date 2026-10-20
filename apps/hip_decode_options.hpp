@@ -13,6 +13,7 @@
 #include "strix/wave_router_contract.hpp"
 #include <algorithm>
 #include "strix/token_sampling.hpp"
+#include "strix/mtp_draft_profiles.hpp"
 #include <cerrno>
 #include <fstream>
 #include <iterator>
@@ -130,8 +131,14 @@ struct MtpCliOptions {
     bool window_prefix=false;
     // Draft-only head/chain controls: they change acceptance, never target output.
     bool draft_chain=false,draft_exact=false,draft_q4=false;
-    // Context n-gram extension of the draft chain inside the verify windows (greedy only).
-    bool ngram_draft=false;
+    // Context n-gram extension of the draft chain inside the verify windows (greedy only, D-047/D-055):
+    // --mtp-ngram-draft[=on] requires it (errors where it is not admissible), =off disables it, and the
+    // default (=auto) runs it wherever it is admissible: its learned per-request gate stays closed unless
+    // the output copies the context.
+    bool ngram_draft=false,ngram_off=false;
+    // --mtp-draft-profile NAME: a qualified draft (strix/mtp_draft_profiles.hpp) whose identity and
+    // provenance pins fill the sidecar options that are not given (a given pin must agree).
+    std::string draft_profile;
     std::string draft_vocab;
     std::uint32_t draft_context_vocab=0;
     // Tiled MTP prompt (--known-prefix-window with the tiled prefill): the golden covers only the
@@ -161,8 +168,39 @@ inline TokenSamplingPolicy mtp_sampling_policy(const MtpCliOptions& m) noexcept 
 inline bool mtp_sampling(const MtpCliOptions& m) noexcept {return m.sample_temperature>0.0;}
 // This is execution evidence: a configured owner alone is not an attempted
 // native window (EOS, remaining budget/context and history can choose serial).
+// Without --mtp-spec-min-p a profiled draft (by sidecar SHA-256, D-055) uses its own value, any other
+// sidecar 0.5; a single target window (no row set) does not stop the chain early.
 inline float mtp_draft_min_probability(const MtpCliOptions& m) noexcept {
-    return static_cast<float>(m.spec_min_p>=0.0?m.spec_min_p:(m.window_rows_set.empty()?0.0:0.5));
+    if(m.spec_min_p>=0.0) return static_cast<float>(m.spec_min_p);
+    if(m.window_rows_set.empty()) return 0.0F;
+    const auto* profile=find_mtp_draft_profile_by_sha256(m.sidecar_sha256);
+    return profile?profile->min_probability:0.5F;
+}
+// The n-gram extension runs: explicitly required, or by default (auto) where it is admissible:
+// greedy, one request, the draft chain with prefix windows, a generation route. The bridge also leaves
+// it off in auto under the survival controller (the extension works with the D-022 controller only).
+inline bool mtp_ngram_draft_admissible(const MtpCliOptions& m) noexcept {
+    return m.draft_chain && m.window_rows && m.window_prefix && !m.sample_options && !m.metadata_only &&
+        m.cohort.empty() && m.golden_dump.empty();
+}
+inline bool mtp_ngram_draft_requested(const MtpCliOptions& m) noexcept {
+    return m.ngram_draft || (!m.ngram_off && mtp_ngram_draft_admissible(m));
+}
+// Fill the sidecar pins of --mtp-draft-profile that were not given; a given pin must agree.
+inline void apply_mtp_draft_profile(MtpCliOptions& m) {
+    if(m.draft_profile.empty()) return;
+    const auto* p=find_mtp_draft_profile(m.draft_profile);
+    if(!p) throw std::invalid_argument("unknown MTP draft profile (base, distill-d, distill-g)");
+    const auto fill=[](std::string& field,std::string_view value){
+        if(field.empty()) field=std::string(value);
+        else if(field!=value) throw std::invalid_argument("MTP draft profile disagrees with an explicit sidecar pin");
+    };
+    fill(m.sidecar_logical_name,p->logical_name);fill(m.sidecar_sha256,p->sidecar_sha256);
+    fill(m.repository,p->repository);fill(m.revision,p->revision);fill(m.source_path,p->source_path);
+    fill(m.converter_revision,p->converter_revision);fill(m.converter_sha256,p->converter_sha256);
+    fill(m.norm_converter_sha256,p->norm_converter_sha256);
+    if(!m.sidecar_bytes) m.sidecar_bytes=p->sidecar_bytes;
+    else if(m.sidecar_bytes!=p->sidecar_bytes) throw std::invalid_argument("MTP draft profile disagrees with an explicit sidecar pin");
 }
 inline std::string_view mtp_target_verification_name(std::uint64_t attempted_windows) noexcept {
     return attempted_windows ? "closed-known-window-attempted-with-serial-fallback" : "serial-target-fallback";
@@ -668,7 +706,6 @@ inline void validate_http_serve(const Options& o) {
     if (!mtp_tiled_prompt(o) || !o.mtp.golden_dump.empty() || o.mtp.metadata_only)
         throw std::invalid_argument("--http-serve requires the tiled MTP route (--mtp with a calibration golden, "
             "--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T)");
-    if (o.mtp.ngram_draft) throw std::invalid_argument("--http-serve does not run --mtp-ngram-draft");
     if (o.http_port > 65535U || o.http_bind.empty() || o.http_model_id.empty() || !o.http_default_max_tokens ||
         !o.http_max_queue || !o.http_max_connections || (o.http_sampling != "greedy" && o.http_sampling != "reject"))
         throw std::invalid_argument("--http-* values: port <= 65535, non-empty bind/model id, positive limits, sampling greedy|reject");
@@ -1015,7 +1052,7 @@ inline Options parse_options(
     if (argc < 2) {
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
-            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX (--mtp-golden FILE --mtp-golden-sha256 HEX | --mtp-golden-dump FILE) [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE[,FILE...]|auto:DIR] [--mtp-draft-context-vocab N] [--mtp-draft-exact] [--mtp-draft-q4] [--mtp-ngram-draft]] (explicit source/conversion/cast/budget options required)] "
+            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX (--mtp-golden FILE --mtp-golden-sha256 HEX | --mtp-golden-dump FILE) [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE[,FILE...]|auto:DIR] [--mtp-draft-context-vocab N] [--mtp-draft-exact] [--mtp-draft-q4] [--mtp-ngram-draft[=on|off|auto]]] [--mtp-draft-profile base|distill-d|distill-g] (explicit source/conversion/cast/budget options required)] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1] [--prefill-numerical-profile NAME] "
             "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] [--dense-q6p-pack PATH] "
@@ -1169,9 +1206,11 @@ inline Options parse_options(
             if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
             options.mtp.supplied=true;options.mtp.draft_chain=true;continue;
         }
-        if(argument=="--mtp-ngram-draft") {
-            if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
-            options.mtp.supplied=true;options.mtp.ngram_draft=true;continue;
+        if(argument=="--mtp-ngram-draft" || argument.starts_with("--mtp-ngram-draft=")) {
+            if(!mtp_option_names.insert("--mtp-ngram-draft").second)throw std::invalid_argument("duplicate MTP option");
+            const auto mode=argument=="--mtp-ngram-draft"?std::string_view("on"):argument.substr(18);
+            if(mode!="on" && mode!="off" && mode!="auto")throw std::invalid_argument("--mtp-ngram-draft is on, off or auto");
+            options.mtp.supplied=true;options.mtp.ngram_draft=mode=="on";options.mtp.ngram_off=mode=="off";continue;
         }
         if(argument=="--mtp-draft-q4") {
             if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
@@ -1239,6 +1278,7 @@ inline Options parse_options(
             else if(key=="--mtp-projection-rounding")m.projection_rounding=value;
             else if(key=="--mtp-sidecar-residency")m.sidecar_residency=value;
             else if(key=="--mtp-draft-vocab")m.draft_vocab=value;
+            else if(key=="--mtp-draft-profile")m.draft_profile=value;
             else if(key=="--mtp-max-hidden-error")m.max_hidden_error=parse_double(value,"MTP hidden policy");
             else if(key=="--mtp-max-logit-error")m.max_logit_error=parse_double(value,"MTP logit policy");
             else if(key=="--mtp-spec-min-p")m.spec_min_p=parse_double(value,"MTP draft minimum probability");
@@ -2231,6 +2271,7 @@ inline Options parse_options(
     validate_teacher_forced_score(options);
     validate_numerical_profile_cli(options);
     validate_prefill_numerical_profile_cli(options);
+    apply_mtp_draft_profile(options.mtp);
     validate_mtp_cli(options);
     validate_prefix_state_cache(options);
     validate_http_serve(options);

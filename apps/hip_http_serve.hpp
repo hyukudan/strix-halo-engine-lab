@@ -35,6 +35,7 @@ public:
         request.prompt = job.prompt;
         request.max_tokens = job.max_tokens;
         request.stop_tokens = job.stop_tokens;
+        request.ngram_draft = job.ngram_draft;
         request.on_tokens = job.on_tokens;
         MtpServeResult result;
         try {
@@ -50,6 +51,8 @@ public:
         stats.cycles = result.cycles;
         stats.proposed = result.proposed;
         stats.accepted = result.accepted;
+        stats.ngram_rows = result.ngram_rows;
+        stats.ngram_accepted = result.ngram_accepted;
         stats.prefill_ms = result.prompt_ms;
         stats.decode_ms = result.decode_ms;
         stats.finish = result.finish;
