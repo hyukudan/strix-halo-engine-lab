@@ -509,7 +509,14 @@ std::vector<KnownWindowResult> execute_known_prefix_prefill_segments_eager(const
             }
             if(rows_entry&&full_by_id[id]) {
                 std::vector<ExecutionDispatchContext> all(rows[s]);for(std::uint32_t r=0;r<rows[s];++r) all[r]=context(step,s,r);
-                full_by_id[id]->preflight(all,full_by_id[id]->config);
+                // As a block alone: position-independent full-T entries admit their first and last two tiles here.
+                const bool edges=mode!=KnownWindowStepMode::qsa_rows&&mode!=KnownWindowStepMode::ple_rows&&
+                    mode!=KnownWindowStepMode::routed_expert_union&&rows[s]>32U;
+                const std::span<const ExecutionDispatchContext> view(all);
+                if(edges) {
+                    full_by_id[id]->preflight(view.first(16U),full_by_id[id]->config);
+                    full_by_id[id]->preflight(view.last(16U),full_by_id[id]->config);
+                } else full_by_id[id]->preflight(view,full_by_id[id]->config);
                 continue;
             }
             const auto width=multi?(rows_entry?8U:2U):1U;
@@ -532,6 +539,7 @@ std::vector<KnownWindowResult> execute_known_prefix_prefill_segments_eager(const
         }
     hooks.preflight_scope();
     if(hooks.preflight_plan) hooks.preflight_plan();
+    if(hooks.preflight_memo&&!preflight_known) hooks.preflight_memo->push_back(preflight_key);
     DirectLaunchDispatcher dispatcher(launch);
     const auto observe=[&](std::size_t step,std::size_t s) {
         if(!segment_hooks.after_step) return;
