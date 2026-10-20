@@ -1191,12 +1191,13 @@ struct HipKnownPrefixWindow::Impl {
         }
         return true;
     }
-    // STRIX_COHORT_WIDE=gdn,qsa,head,moe,inject (comma list; "all" = gdn,qsa,head,moe): with two or more chunks,
-    // the listed steps run once for the rows of every chunk (9..32 rows) instead of once per chunk. Per-row
-    // arithmetic as in the chunk. The wide inject measured slower than the per-request launches it replaces.
+    // STRIX_COHORT_WIDE=gdn,qsa,head,moe,combine,inject (comma list, or "all"): with two or more chunks, the
+    // listed steps run once for the rows of every chunk (9..32 rows) instead of once per chunk. Per-row
+    // arithmetic as in the chunk.
     static bool cohort_wide_enabled(const char* family) {
         static const std::string list = [] { const char* v = std::getenv("STRIX_COHORT_WIDE"); return std::string(v ? v : ""); }();
-        if (list == "all") return std::string_view(family) != "inject";
+        if (known_window_cohort_feature_off(family)) return false;
+        if (list == "all") return true;
         std::size_t at = 0;
         while (at <= list.size()) {
             const auto end = std::min(list.find(',', at), list.size());
@@ -1205,7 +1206,7 @@ struct HipKnownPrefixWindow::Impl {
         }
         return false;
     }
-    static bool cohort_wide_step(std::size_t i, std::span<CohortMember> members) {
+    static bool cohort_wide_step(std::size_t i, std::span<CohortMember> members, bool all_chunked) {
         const auto mode = members[0].impl->window.mode[i];
         std::uint32_t total = 0;
         for (const auto& m : members) {
@@ -1220,6 +1221,8 @@ struct HipKnownPrefixWindow::Impl {
             return cohort_wide_enabled("gdn");
         case KnownWindowStepMode::lm_head_rows: return cohort_wide_enabled("head");
         case KnownWindowStepMode::inject_rows: return cohort_wide_enabled("inject");
+        // Every chunk must have a primary: a lone session joins its own detached shared expert inside its step.
+        case KnownWindowStepMode::moe_combine_rows: return all_chunked && cohort_wide_enabled("combine");
         case KnownWindowStepMode::routed_expert_union: return cohort_wide_union(members);
         case KnownWindowStepMode::qsa_rows:
             // 16 / 32 rows: dense A8 only (the launcher also requires a Q8_0 output projection).
@@ -1265,10 +1268,13 @@ struct HipKnownPrefixWindow::Impl {
             indexed_attention_known_window_cohort_launch(segments);
             break;
         }
-        case KnownWindowStepMode::inject_rows: {
+        case KnownWindowStepMode::inject_rows:
+        case KnownWindowStepMode::moe_combine_rows: {
             std::vector<std::span<const ExecutionDispatchContext>> segments;
             for (const auto& m : members) segments.push_back(m.run->step_rows(i));
-            inject_known_window_cohort_rows_launch(segments, members[0].impl->elementwise_config);
+            if (members[0].impl->window.mode[i] == KnownWindowStepMode::inject_rows)
+                inject_known_window_cohort_rows_launch(segments, members[0].impl->elementwise_config);
+            else moe_combine_known_window_cohort_rows_launch(segments, members[0].impl->elementwise_config);
             break;
         }
         case KnownWindowStepMode::lm_head_rows: {
@@ -1500,9 +1506,11 @@ struct HipKnownPrefixWindow::Impl {
             const bool log_call = wide_log && (call < 4U || call % 256U == 0U);
             std::uint32_t wide_count = 0, shared_count = 0, own_count = 0;
             std::uint32_t wide_union_rows = 0; // rows of the last wide union (set per union step, all equal)
+            bool all_chunked = true;
+            for (const auto& chunk : chunks) all_chunked = all_chunked && chunk.primary != nullptr;
             std::map<int, std::uint32_t> own_modes;
             for (std::size_t i = 0; i < steps; ++i) {
-                if (chunks.size() > 1U && cohort_wide_step(i, members)) {
+                if (chunks.size() > 1U && cohort_wide_step(i, members, all_chunked)) {
                     ++wide_count;
                     // Every chunk primary first joins its detached shared expert of an earlier layer, as before
                     // a step of its own.

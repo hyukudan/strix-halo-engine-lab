@@ -3,6 +3,7 @@
 #include "strix/hip_gdn_lm_wave8_diagnostic.hpp"
 #endif
 #include "strix/hip_gdn_launcher.hpp"
+#include "strix/known_window_cohort.hpp"
 #include "hip_q8_rows_gemv.hpp"
 #include "strix/hip_gdn_islands.hpp"
 #include "strix/hip_model_residency.hpp"
@@ -2112,12 +2113,10 @@ __device__ __forceinline__ void gdn_window_shift(std::uint16_t (&window)[kGdnWin
 // beta/gate transforms of every window row. Blocks own one 128-channel head;
 // the trailing block owns the per-head beta/gate scalars.
 template <unsigned Rows, bool ParallelGates = false>
-__global__ __launch_bounds__(kRecurrentThreads)
-void gdn_window_prepare_kernel(GdnWindowRows<Rows> rows, std::uint16_t* conv_state, const void* conv_weights,
+__device__ __forceinline__ void gdn_window_prepare_rows(const GdnWindowRows<Rows>& rows, std::uint16_t* conv_state, const void* conv_weights,
     SmallWeightKind conv_kind, const void* dt, SmallWeightKind dt_kind, const void* a, SmallWeightKind a_kind,
-    GdnWindowSaved saved, const GdnWindowControl* control, std::uint32_t key_heads, std::uint32_t value_heads,
-    std::uint32_t head_dim, float epsilon) {
-    __shared__ float scratch[kRecurrentThreads];
+    const GdnWindowSaved& saved, const GdnWindowControl* control, std::uint32_t key_heads, std::uint32_t value_heads,
+    std::uint32_t head_dim, float epsilon, float* scratch) {
     const auto lane = static_cast<std::uint32_t>(threadIdx.x), block = static_cast<std::uint32_t>(blockIdx.x);
     const auto pending = gdn_window_pending(control), slot = control->pending_slot & 1U, next = slot ^ 1U;
     const auto key_width = key_heads * head_dim;
@@ -2176,6 +2175,51 @@ void gdn_window_prepare_kernel(GdnWindowRows<Rows> rows, std::uint16_t* conv_sta
             if (is_key) gdn_saved<float>(saved, next, row, saved.k)[channel - key_width] = value;
         } else gdn_saved<float>(saved, next, row, saved.v)[channel - key_width * 2U] = value;
         qkv[channel] = value;
+    }
+}
+template <unsigned Rows, bool ParallelGates = false>
+__global__ __launch_bounds__(kRecurrentThreads)
+void gdn_window_prepare_kernel(GdnWindowRows<Rows> rows, std::uint16_t* conv_state, const void* conv_weights,
+    SmallWeightKind conv_kind, const void* dt, SmallWeightKind dt_kind, const void* a, SmallWeightKind a_kind,
+    GdnWindowSaved saved, const GdnWindowControl* control, std::uint32_t key_heads, std::uint32_t value_heads,
+    std::uint32_t head_dim, float epsilon) {
+    __shared__ float scratch[kRecurrentThreads];
+    gdn_window_prepare_rows<Rows, ParallelGates>(rows, conv_state, conv_weights, conv_kind, dt, dt_kind, a, a_kind, saved,
+        control, key_heads, value_heads, head_dim, epsilon, scratch);
+}
+// Cohorts: the prepare / recurrence of every session's segment (2, 4 or 8 rows; its own state, history,
+// retained rows and control) in one launch, blockIdx.y = segment; each segment runs the per-session kernel's body.
+struct GdnSegment {
+    GdnWindowRows<8> rows;
+    std::uint32_t count;
+    std::uint16_t* conv_state;
+    float* matrix;
+    GdnWindowSaved saved;
+    const GdnWindowControl* control;
+};
+struct GdnSegments { GdnSegment segment[8]; };
+template <unsigned Rows> __device__ __forceinline__ GdnWindowRows<Rows> gdn_rows_prefix(const GdnWindowRows<8>& all) {
+    GdnWindowRows<Rows> out;
+#pragma unroll
+    for (unsigned r = 0; r < Rows; ++r) {
+        out.qkv[r] = all.qkv[r]; out.z[r] = all.z[r]; out.beta[r] = all.beta[r]; out.gate[r] = all.gate[r]; out.core[r] = all.core[r];
+    }
+    return out;
+}
+template <bool ParallelGates>
+__global__ __launch_bounds__(kRecurrentThreads)
+void gdn_window_prepare_segments_kernel(GdnSegments segments, const void* conv_weights, SmallWeightKind conv_kind,
+    const void* dt, SmallWeightKind dt_kind, const void* a, SmallWeightKind a_kind, std::uint32_t key_heads,
+    std::uint32_t value_heads, std::uint32_t head_dim, float epsilon) {
+    __shared__ float scratch[kRecurrentThreads];
+    const auto& s = segments.segment[blockIdx.y];
+    switch (s.count) {
+    case 2: gdn_window_prepare_rows<2, ParallelGates>(gdn_rows_prefix<2>(s.rows), s.conv_state, conv_weights, conv_kind, dt, dt_kind,
+        a, a_kind, s.saved, s.control, key_heads, value_heads, head_dim, epsilon, scratch); break;
+    case 4: gdn_window_prepare_rows<4, ParallelGates>(gdn_rows_prefix<4>(s.rows), s.conv_state, conv_weights, conv_kind, dt, dt_kind,
+        a, a_kind, s.saved, s.control, key_heads, value_heads, head_dim, epsilon, scratch); break;
+    default: gdn_window_prepare_rows<8, ParallelGates>(gdn_rows_prefix<8>(s.rows), s.conv_state, conv_weights, conv_kind, dt, dt_kind,
+        a, a_kind, s.saved, s.control, key_heads, value_heads, head_dim, epsilon, scratch); break;
     }
 }
 template <GdnRecurrentStorage Storage>
@@ -2389,6 +2433,16 @@ __global__ __launch_bounds__(32)
 void gdn_window_recurrent_kernel(GdnWindowRows<Rows> rows, float* state, GdnWindowSaved saved,
     const GdnWindowControl* control, std::uint32_t key_heads, std::uint32_t head_dim) {
     gdn_window_recurrence<Rows, Storage, Columns>(rows, state, saved, control, key_heads, head_dim);
+}
+template <GdnRecurrentStorage Storage, std::uint32_t Columns>
+__global__ __launch_bounds__(32)
+void gdn_window_recurrent_segments_kernel(GdnSegments segments, std::uint32_t key_heads, std::uint32_t head_dim) {
+    const auto& s = segments.segment[blockIdx.y];
+    switch (s.count) {
+    case 2: gdn_window_recurrence<2, Storage, Columns>(gdn_rows_prefix<2>(s.rows), s.matrix, s.saved, s.control, key_heads, head_dim); break;
+    case 4: gdn_window_recurrence<4, Storage, Columns>(gdn_rows_prefix<4>(s.rows), s.matrix, s.saved, s.control, key_heads, head_dim); break;
+    default: gdn_window_recurrence<8, Storage, Columns>(gdn_rows_prefix<8>(s.rows), s.matrix, s.saved, s.control, key_heads, head_dim); break;
+    }
 }
 // Standalone commit of the pending rows: recurrence tiles, then 32-channel conv groups.
 template <GdnRecurrentStorage Storage>
@@ -5291,6 +5345,51 @@ template <class Body> void gdn_cohort_rows_dispatch(std::size_t rows, Body&& bod
         gdn_window_rows_dispatch(rows, std::forward<Body>(body));
     }
 }
+// Part 2 (prepare and recurrence) of every cohort segment in one launch each (segments of 2, 4 or 8 rows).
+static void enqueue_gdn_window_segments(std::span<const GdnWindowCohortSegment> segments, const HipGdnLauncherConfig& config,
+    hipStream_t stream) {
+    if (segments.size() > gdn_window_max_rows) throw std::invalid_argument("GDN cohort segments exceed eight sessions");
+    const auto shape = gdn_window_shape(config.model);
+    GdnSegments all{};
+    for (std::size_t s = 0; s < segments.size(); ++s) {
+        const auto& segment = segments[s];
+        auto& g = all.segment[s];
+        g.count = static_cast<std::uint32_t>(segment.rows.size());
+        for (std::uint32_t r = 0; r < g.count; ++r) {
+            g.rows.qkv[r] = segment.rows[r].workspace; g.rows.z[r] = g.rows.qkv[r] + shape.conv_width;
+            g.rows.beta[r] = g.rows.z[r] + shape.value_width; g.rows.gate[r] = g.rows.beta[r] + shape.value_heads;
+            g.rows.core[r] = g.rows.gate[r] + shape.value_heads;
+        }
+        g.conv_state = segment.layer.conv_state; g.matrix = segment.layer.matrix;
+        g.saved = gdn_window_saved(config.model, segment.layer.retained); g.control = segment.control;
+    }
+    const auto& layer = segments[0].layer;
+    const auto count = static_cast<std::uint32_t>(segments.size());
+    static const bool parallel_gates = [] { const char* v = std::getenv("STRIX_GDN_WINDOW_PREPARE_GATES"); return v && v[0] == '1'; }();
+    const auto prepare = parallel_gates ? gdn_window_prepare_segments_kernel<true> : gdn_window_prepare_segments_kernel<false>;
+    hipLaunchKernelGGL(prepare, dim3(shape.key_heads * 2U + shape.value_heads + 1U, count), dim3(kRecurrentThreads), 0, stream, all,
+        layer.conv, small_weight_kind(layer.conv_type), layer.dt, small_weight_kind(layer.dt_type), layer.a,
+        small_weight_kind(layer.a_type), shape.key_heads, shape.value_heads, shape.head_dim, config.model.gdn_qk_l2_epsilon);
+    check_hip(hipGetLastError(), "GDN cohort segments prepare launch");
+    static const std::uint32_t window_columns = [] {
+        const char* v = std::getenv("STRIX_GDN_WINDOW_COLUMNS");
+        const int n = v ? std::atoi(v) : 8;
+        return static_cast<std::uint32_t>(n == 4 || n == 2 ? n : 8);
+    }();
+    const auto recurrence = [&]<std::uint32_t Columns>() {
+        const auto tiles = dim3(shape.value_heads * (shape.head_dim / Columns), count);
+        if (config.recurrent_storage == GdnRecurrentStorage::value_key)
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_segments_kernel<GdnRecurrentStorage::value_key, Columns>), tiles,
+                dim3(32), 0, stream, all, shape.key_heads, shape.head_dim);
+        else
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_segments_kernel<GdnRecurrentStorage::key_value, Columns>), tiles,
+                dim3(32), 0, stream, all, shape.key_heads, shape.head_dim);
+    };
+    if (window_columns == 4U) recurrence.template operator()<4U>();
+    else if (window_columns == 2U) recurrence.template operator()<2U>();
+    else recurrence.template operator()<8U>();
+    check_hip(hipGetLastError(), "GDN cohort segments recurrence launch");
+}
 void gdn_window_cohort_enqueue(std::span<const GdnWindowCohortSegment> segments, const HipGdnLauncherConfig& config, void* stream) {
     if (segments.empty() || segments.size() > gdn_window_max_rows)
         throw std::invalid_argument("GDN cohort window requires 1..8 session segments");
@@ -5332,7 +5431,15 @@ void gdn_window_cohort_enqueue(std::span<const GdnWindowCohortSegment> segments,
     gdn_cohort_rows_dispatch(padded, [&](auto width) {
         enqueue_gdn_window<decltype(width)::value>(a, all, segments[0].control, config, native, 1U);
     });
+    // Part 2 of every segment in one prepare and one recurrence launch (STRIX_COHORT_GDN_SEGMENTS=0: one pair per
+    // segment). The tiled recurrence (STRIX_GDN_WINDOW_TILED=1) keeps one pair per segment.
+    static const bool segmented = [] { const char* v = std::getenv("STRIX_COHORT_GDN_SEGMENTS"); return !v || v[0] != '0'; }();
+    static const bool tiled = [] { const char* v = std::getenv("STRIX_GDN_WINDOW_TILED"); return v && v[0] == '1'; }();
+    bool fused = segmented && !tiled && segments.size() >= 2U && !known_window_cohort_feature_off("gdnseg");
     for (const auto& segment : segments)
+        fused = fused && (segment.rows.size() == 2U || segment.rows.size() == 4U || segment.rows.size() == 8U);
+    if (fused) enqueue_gdn_window_segments(segments, config, native);
+    else for (const auto& segment : segments)
         gdn_window_rows_dispatch(segment.rows.size(), [&](auto width) {
             enqueue_gdn_window<decltype(width)::value>(segment.layer, segment.rows, segment.control, config, native, 2U);
         });

@@ -1,3 +1,4 @@
+#include "strix/known_window_cohort.hpp"
 #include "strix/host_phase_timing.hpp"
 #include "strix/hip_mtp_greedy_runtime.hpp"
 #include "strix/mtp_sidecar_binding.hpp"
@@ -39,6 +40,11 @@ struct HipMtpGreedyRuntime::Impl {
     // The drafts of the cycle in progress (between begin_cycle_draft and finish_cycle).
     std::vector<std::uint32_t> candidates;
     std::vector<float> probabilities,runner_ups;
+    // A draft chain between draft_begin and draft_end (begin_cycle_draft runs all phases in order).
+    struct DraftState {
+        std::uint32_t depth=0,pending=0;bool cost_model=false,survival=false,full_chain=false,open=false;
+        std::chrono::steady_clock::time_point start{};
+    } ds;
     std::unique_ptr<MtpNgramDraft> ngram;
     std::vector<double> ngram_acceptance;
     Impl(std::shared_ptr<HipMtpRuntime> m,QualifiedMtpDraftPlan q,ActivatedMtpDraftPlan a,
@@ -126,6 +132,14 @@ HipMtpTargetHiddenTicket HipMtpGreedyRuntime::prefill_prompt(std::span<const std
 }
 std::uint32_t HipMtpGreedyRuntime::begin_cycle_draft(const HipMtpTargetHiddenTicket& initial,
     std::uint32_t max_candidates,std::uint32_t budget,std::span<const std::uint32_t> eos,bool cost_model) {
+    const auto depth=draft_begin(initial,max_candidates,budget,eos,cost_model);
+    if(!drafting()) return depth;
+    while(draft_launch_step() && draft_after_step()) {}
+    draft_end();
+    return depth;
+}
+std::uint32_t HipMtpGreedyRuntime::draft_begin(const HipMtpTargetHiddenTicket& initial,
+    std::uint32_t max_candidates,std::uint32_t budget,std::span<const std::uint32_t> eos,bool cost_model) {
     auto& i=*impl_;require(!i.busy && !failed() && budget,"MTP greedy cycle requires idle healthy owner and nonzero budget");
     require(initial.valid() && session_matches(initial.committed_session(),*i.session),
         "MTP greedy cycle requires exact current committed target ticket");
@@ -168,12 +182,35 @@ std::uint32_t HipMtpGreedyRuntime::begin_cycle_draft(const HipMtpTargetHiddenTic
             std::function<bool(std::span<const float>)>{};
         const auto sampler=i.target->token_sampler();
         require(!sampler || !depth || i.mtp->draft_head(),"MTP speculative sampling requires the draft chain");
-        const auto chain_start=std::chrono::steady_clock::now();
-        i.candidates=i.mtp->draft_head()?i.mtp->propose_chain(i.plan,i.activation,*i.session,i.draft,depth,
-                full_chain || survival?0.0F:i.min_probability,keep):
-            i.backend->propose_candidates(*i.session,i.draft,depth);
+        i.ds=Impl::DraftState{};
+        i.ds.depth=depth;i.ds.pending=pending;i.ds.cost_model=cost_model;i.ds.survival=survival;i.ds.full_chain=full_chain;
+        i.ds.start=std::chrono::steady_clock::now();
+        if(i.mtp->draft_head())
+            i.ds.open=i.mtp->propose_chain_begin(i.plan,i.activation,*i.session,i.draft,depth,
+                full_chain || survival?0.0F:i.min_probability,keep);
+        else i.candidates=i.backend->propose_candidates(*i.session,i.draft,depth);
+    } catch(...) {fail_cycle();throw;}
+    return depth;
+}
+bool HipMtpGreedyRuntime::draft_launch_step() {
+    auto& i=*impl_;
+    if(!i.busy || !i.ds.open) return false;
+    try {return i.mtp->propose_chain_launch_step();} catch(...) {fail_cycle();throw;}
+}
+bool HipMtpGreedyRuntime::draft_after_step() {
+    auto& i=*impl_;
+    if(!i.busy || !i.ds.open) return false;
+    try {return i.mtp->propose_chain_after_step();} catch(...) {fail_cycle();throw;}
+}
+void HipMtpGreedyRuntime::draft_end() {
+    auto& i=*impl_;require(i.busy && !i.failed,"MTP draft end requires a begun draft");
+    const auto depth=i.ds.depth;const auto pending=i.ds.pending;const bool cost_model=i.ds.cost_model;
+    const bool survival=i.ds.survival,full_chain=i.ds.full_chain;
+    try {
+        if(i.ds.open) {i.candidates=i.mtp->propose_chain_finish();i.ds.open=false;}
+        else if(i.mtp->draft_head()) i.candidates.clear();
         if(survival) i.window->note_draft(static_cast<std::uint32_t>(i.candidates.size()),
-            std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-chain_start).count());
+            std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-i.ds.start).count());
         i.runner_ups.clear();
         if(i.mtp->draft_head()){
             const auto p=i.mtp->draft_probabilities();i.probabilities.assign(p.begin(),p.end());
@@ -201,7 +238,6 @@ std::uint32_t HipMtpGreedyRuntime::begin_cycle_draft(const HipMtpTargetHiddenTic
         finish_draft_proposal(i.draft);
         host_phase_mark("3 finish proposal");
     } catch(...) {fail_cycle();throw;}
-    return depth;
 }
 std::span<const std::uint32_t> HipMtpGreedyRuntime::drafted_candidates() const noexcept {return impl_->candidates;}
 std::span<const TokenDraft> HipMtpGreedyRuntime::drafted_distributions() const noexcept {
@@ -399,7 +435,37 @@ std::vector<HipMtpGreedyCycleResult> budget_cohorts(std::span<const HipMtpGreedy
     return out;
 }
 }
+namespace {
+std::vector<HipMtpGreedyCycleResult> cohort_cycle(std::span<const HipMtpGreedyCohortMember> members,
+    HipMtpGreedyCohortStats* stats);
+// STRIX_COHORT_AB=1 (measurement): per cycle parity, the mean wall time of a cohort cycle (drafts, windows,
+// acceptance and reconciliation) and the tokens it emitted, printed at exit; odd cycles run without the
+// features of STRIX_COHORT_AB_OFF.
+struct CohortAbTiming {
+    double ms[2]{}; std::uint64_t cycles[2]{}, tokens[2]{};
+    ~CohortAbTiming() {
+        for (unsigned p = 0; p < 2U; ++p) if (cycles[p])
+            std::fprintf(stderr, "cohort ab %s: %llu cycles x %.3f ms, %.3f tokens/cycle, %.2f tok/s\n", p ? "odd (features off)" : "even",
+                static_cast<unsigned long long>(cycles[p]), ms[p] / static_cast<double>(cycles[p]),
+                static_cast<double>(tokens[p]) / static_cast<double>(cycles[p]), 1000.0 * static_cast<double>(tokens[p]) / ms[p]);
+    }
+};
+}
 std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(std::span<const HipMtpGreedyCohortMember> members,
+    HipMtpGreedyCohortStats* stats) {
+    ++known_window_cohort_cycle();
+    if (!known_window_cohort_ab()) return cohort_cycle(members, stats);
+    static CohortAbTiming timing;
+    const auto parity = known_window_cohort_cycle() & 1U;
+    const auto start = std::chrono::steady_clock::now();
+    auto out = cohort_cycle(members, stats);
+    timing.ms[parity] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    ++timing.cycles[parity];
+    for (const auto& r : out) timing.tokens[parity] += r.emitted_tokens.size();
+    return out;
+}
+namespace {
+std::vector<HipMtpGreedyCycleResult> cohort_cycle(std::span<const HipMtpGreedyCohortMember> members,
     HipMtpGreedyCohortStats* stats) {
     std::vector<HipMtpGreedyCycleResult> out(members.size());
     std::vector<bool> open(members.size(),false);
@@ -419,13 +485,40 @@ std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(std::span<const
         const auto n=v?std::atoi(v):0;return n==16||n==32?static_cast<std::uint32_t>(n):0U;}();
     const std::uint32_t cap=max_rows_override?max_rows_override:members.size()>=3U?2U:members.size()==2U?4U:8U;
     try {
+        // Drafts: every session's chain in phases, step k of all sessions (each on its own stream) enqueued
+        // before any wait (STRIX_COHORT_DRAFT_INTERLEAVE=0: one session's chain after another). Each session's
+        // launches and waits are those of its own chain.
+        static const bool interleave=[]{const char* v=std::getenv("STRIX_COHORT_DRAFT_INTERLEAVE");return !v || v[0]!='0';}();
+        const bool interleaved=interleave && !known_window_cohort_feature_off("draft");
         for(std::size_t m=0;m<members.size();++m) {
             const auto& c=members[m];
             require(c.runtime && c.initial && c.runtime->window_verifier(),"MTP cohort cycle requires window-verified greedy runtimes");
             for(std::size_t o=0;o<m;++o)require(members[o].runtime!=c.runtime,"MTP cohort cycle requires distinct sessions");
-            static_cast<void>(c.runtime->begin_cycle_draft(*c.initial,std::min(c.maximum_candidates,cap-1U),c.budget,c.eos,false));
-            if(!c.runtime->drafting()){out[m].final_target=*c.initial;out[m].eos=true;continue;}
-            open[m]=true;
+            if(interleaved) {
+                static_cast<void>(c.runtime->draft_begin(*c.initial,std::min(c.maximum_candidates,cap-1U),c.budget,c.eos,false));
+                if(c.runtime->drafting()) open[m]=true;
+            } else {
+                static_cast<void>(c.runtime->begin_cycle_draft(*c.initial,std::min(c.maximum_candidates,cap-1U),c.budget,c.eos,false));
+                if(c.runtime->drafting()) open[m]=true;
+            }
+        }
+        if(interleaved) {
+            std::vector<bool> stepping(open);
+            for(bool any=true;any;) {
+                any=false;
+                std::vector<bool> launched(members.size(),false);
+                for(std::size_t m=0;m<members.size();++m) if(stepping[m]) launched[m]=members[m].runtime->draft_launch_step();
+                for(std::size_t m=0;m<members.size();++m) {
+                    if(!stepping[m]) continue;
+                    stepping[m]=launched[m] && members[m].runtime->draft_after_step();
+                    any=any || stepping[m];
+                }
+            }
+            for(std::size_t m=0;m<members.size();++m) if(open[m]) members[m].runtime->draft_end();
+        }
+        for(std::size_t m=0;m<members.size();++m) {
+            const auto& c=members[m];
+            if(!open[m]){out[m].final_target=*c.initial;out[m].eos=true;continue;}
             auto rows=c.runtime->window_verifier()->cohort_rows(c.runtime->target_session(),
                 c.runtime->drafted_candidates(),c.runtime->drafted_probabilities(),c.budget);
             if(rows>cap && c.runtime->window_verifier()->cohort_fits(c.runtime->target_session(),cap,
@@ -500,5 +593,6 @@ std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(std::span<const
         for(std::size_t m=0;m<members.size();++m) if(open[m]) members[m].runtime->fail_cycle();
         throw;
     }
+}
 }
 } // namespace strix

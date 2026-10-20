@@ -2243,20 +2243,21 @@ void elementwise_rows_family() {
                     if (inject) inject_known_window_rows_launch(c, f.elementwise); else moe_combine_known_window_rows_launch(c, f.elementwise);
                 }, inject ? "inject" : "combine");
             if (rows == 4U && layer == 0U) rows_rejections(f, contexts, preflight);
-            // Cohort inject launch: the window's rows as session segments of 2/4 rows, one launch.
-            if (inject && rows == 8U)
+            // Cohort inject / combine launch: the window's rows as session segments of 2/4 rows, one launch.
+            if (rows == 8U)
                 for (const auto& sizes : std::vector<std::vector<std::size_t>>{{4U, 4U}, {2U, 2U, 4U}, {2U, 2U, 2U, 2U}}) {
                     rows_equal_serial(f, contexts, [&](const ExecutionDispatchContext& c) { launcher.function(c, launcher.user_data); },
                         [&](std::span<const ExecutionDispatchContext> c) {
                             std::vector<std::span<const ExecutionDispatchContext>> segments;
                             std::size_t first = 0;
                             for (const auto size : sizes) { segments.push_back(c.subspan(first, size)); first += size; }
-                            inject_known_window_cohort_rows_launch(segments, f.elementwise);
-                        }, "inject cohort");
+                            if (inject) inject_known_window_cohort_rows_launch(segments, f.elementwise);
+                            else moe_combine_known_window_cohort_rows_launch(segments, f.elementwise);
+                        }, inject ? "inject cohort" : "combine cohort");
                 }
         }
     }
-    std::cout << "attn/mlp inject and MoE combine rows 2/4/8 (inject cohorts of 2/4-row segments) equal serial bytes\n";
+    std::cout << "attn/mlp inject and MoE combine rows 2/4/8 (and cohorts of 2/4-row segments) equal serial bytes\n";
 }
 
 // hipEvent timing: median over 25 samples (after 5 warmups) of 20 back-to-back

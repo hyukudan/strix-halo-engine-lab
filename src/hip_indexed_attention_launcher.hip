@@ -1,3 +1,4 @@
+#include "strix/known_window_cohort.hpp"
 #include "strix/hip_indexed_attention_launcher.hpp"
 #include "hip_q8_rows_gemv.hpp"
 #include "strix/hip_mtp_attention.hpp"
@@ -4479,10 +4480,13 @@ struct QsaPrefillPool {
 // cohort_slot: a cohort window's dense A8 output slot. Part 2 of one session's rows writes the fused
 // output codes at rows [cohort_row, cohort_row + Rows) of it and part 4 of all rows reads them, as
 // one window's part 2 + 4 do within one call (the slot layout does not depend on the row count).
+// subparts (part 2): 1 norms/rope, 2 KV/raw-index append, 4 block scores, 8 selection, 16 attention scores,
+// 32 softmax, 64 value/gate output. A cohort runs the state-free ones (1, 8, 32) once for the rows of every
+// session and the others per session, in this order.
 template <unsigned Rows>
 void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexedAttentionLauncherConfig& config,
     unsigned parts = 7U, QsaPrefillPool* pool = nullptr, unsigned skip_inputs = 0U,
-    const q8_rows::DenseA8Slot* cohort_slot = nullptr, unsigned cohort_row = 0U) {
+    const q8_rows::DenseA8Slot* cohort_slot = nullptr, unsigned cohort_row = 0U, unsigned subparts = 127U) {
     const auto& model = config.model;
     const auto& a = prepared.row[0];
     const auto& tensors = a.tensors;
@@ -4543,9 +4547,11 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         });
         check_hip(hipGetLastError(), "QSA known-window norm/rope launch");
     };
+    if (subparts & 1U) {
     norm(tensors.index_q_norm, &WorkspacePointers::index_query, index_heads, a.index_dim, a.index_dim, false);
     norm(tensors.q_norm, &WorkspacePointers::q_gate, a.attention_heads, a.head_dim, a.head_dim * 2U, any_order);
     norm(tensors.k_norm, &WorkspacePointers::current_k, a.kv_heads, a.head_dim, a.head_dim, any_order);
+    }
 
     QsaRowsStoreViews<Rows> store{};
     for (unsigned r = 0; r < Rows; ++r) {
@@ -4556,6 +4562,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     store.journal = prepared.journal;
     const bool kv_int8 = model.attention_kv_storage == AttentionKvStorage::int8_token;
     const auto bf16_kv_width = kv_int8 ? 0U : a.kv_width; // 0: store_rows_kernel writes only the raw index keys
+    if (subparts & 2U) {
     hipLaunchKernelGGL(HIP_KERNEL_NAME(store_rows_kernel<Rows>), dim3((std::max(bf16_kv_width, a.index_dim) + kThreads - 1U) / kThreads, Rows),
         dim3(kThreads), 0, stream, store, reinterpret_cast<std::uint16_t*>(a.raw_state.address),
         reinterpret_cast<std::uint16_t*>(a.kv_state.address), a.index_dim, bf16_kv_width);
@@ -4564,6 +4571,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         hipLaunchKernelGGL(HIP_KERNEL_NAME(store_rows_kv_int8_kernel<Rows>), dim3(a.kv_heads, 2U, Rows), dim3(kThreads), 0, stream,
             store, reinterpret_cast<void*>(a.kv_state.address), a.kv_width, a.kv_heads, a.head_dim);
         check_hip(hipGetLastError(), "QSA known-window int8 KV append");
+    }
     }
 
     QsaRowsScoreViews<Rows> scores{};
@@ -4579,7 +4587,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         select.block_scores[r] = w.block_scores; select.selected[r] = w.selected_indices; select.visible[r] = s.visible;
     }
     const bool pooled = Rows > 8U && pool && pool->keys && scored_blocks <= pool->capacity && a.index_dim == 128U && index_heads == 4U;
-    if (scored_blocks && pooled) {
+    if ((subparts & 4U) && scored_blocks && pooled) {
         if constexpr (Rows > 8U) {
             if (scored_blocks > pool->valid) {
                 dispatch_small_kind(tensors.index_k_norm.manifest->ggml_type, [&](auto kind) {
@@ -4642,7 +4650,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                         static_cast<unsigned long long>(c), static_cast<unsigned long long>(d));
             }
         }
-    } else if (scored_blocks) {
+    } else if ((subparts & 4U) && scored_blocks) {
         dispatch_small_kind(tensors.index_k_norm.manifest->ggml_type, [&](auto kind) {
             hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_rows_kernel<decltype(kind)::value, Rows>),
                 dim3(scored_blocks, Rows <= 8U ? 1U : Rows / 8U), dim3(a.index_dim),
@@ -4652,7 +4660,8 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         });
         check_hip(hipGetLastError(), "QSA known-window block-score launch");
     }
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(select_rows_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, stream, select, s0.ratio, s0.block_topk);
+    if (subparts & 8U)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(select_rows_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, stream, select, s0.ratio, s0.block_topk);
     check_hip(hipGetLastError(), "QSA known-window selection launch");
     // STRIX_QSA_UNION_DUMP=1 (diagnostic, synchronizes; prefill groups only): how many distinct tokens the
     // selections of 8/16/32/64 consecutive rows cover, against the per-row count (stderr, every 16th group).
@@ -4725,7 +4734,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             grouped = head_group != 0U && out_group != 0U && a.head_dim <= kThreads && per_kv &&
                 per_kv % head_group == 0U && per_kv % out_group == 0U;
         }
-        if (fast) {
+        if (!(subparts & 16U) || fast) {
         } else if (grouped) {
             if constexpr (Rows > 8U) {
                 static_cast<void>(prepare_indexed_attention_score_grid(a.attention_heads, maximum_count));
@@ -4778,7 +4787,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             dim3(static_cast<std::uint32_t>(prepare_indexed_attention_score_grid(a.attention_heads, maximum_count)), Rows),
             dim3(kThreads), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim);
         check_hip(hipGetLastError(), "QSA known-window score launch");
-        if (!fast) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_softmax_rows_kernel<Rows>), dim3(a.attention_heads, Rows), dim3(kThreads), 0,
+        if (!fast && (subparts & 32U)) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_softmax_rows_kernel<Rows>), dim3(a.attention_heads, Rows), dim3(kThreads), 0,
             stream, attention, maximum_selected);
         check_hip(hipGetLastError(), "QSA known-window softmax launch");
         // Dense A8 window with the output projection in this call: the value/gate kernel writes its codes.
@@ -4788,7 +4797,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             output_slot = cohort_slot ? q8_rows::DenseA8Slot{cohort_slot->codes + static_cast<std::uint64_t>(cohort_row) * a.attention_width,
                 cohort_slot->deltas + cohort_row} : q8_rows::dense_a8_slot(0U);
         }
-        if (fast) {
+        if (!(subparts & 64U) || fast) {
         } else if (grouped) {
             if constexpr (Rows > 8U) {
                 // STRIX_QSA_OUTPUT_PREFETCH=0 keeps the 4-slot kernel without value prefetch.
@@ -5319,11 +5328,26 @@ void indexed_attention_known_window_cohort_launch(std::span<const HipQsaCohortSe
         else enqueue_qsa_known_rows<32U>(qsa_cohort_rows<32U>(prepared), config, part, nullptr, 0U, &slot);
     };
     merged(1U);
-    for (std::size_t s = 0; s < prepared.segments.size(); ++s)
-        std::visit([&](const auto& p) {
-            constexpr auto count = static_cast<unsigned>(std::tuple_size_v<decltype(p.row)>);
-            enqueue_qsa_known_rows<count>(p, *segments[s].config, 2U, nullptr, 0U, &slot, prepared.first[s]);
-        }, prepared.segments[s]);
+    // Part 2: STRIX_COHORT_QSA_SEGMENTS=1 runs the state-free sub-parts (norms, selection, softmax) once for every
+    // row (measured neutral at eight sessions: 148.0 against 147.0 ms per cycle); default: the part per session.
+    static const bool merge_free = [] { const char* v = std::getenv("STRIX_COHORT_QSA_SEGMENTS"); return v && v[0] == '1'; }();
+    const bool merge = merge_free && !known_window_cohort_feature_off("qsaseg");
+    const auto per_session = [&](unsigned subparts) {
+        for (std::size_t s = 0; s < prepared.segments.size(); ++s)
+            std::visit([&](const auto& p) {
+                constexpr auto count = static_cast<unsigned>(std::tuple_size_v<decltype(p.row)>);
+                enqueue_qsa_known_rows<count>(p, *segments[s].config, 2U, nullptr, 0U, &slot, prepared.first[s], subparts);
+            }, prepared.segments[s]);
+    };
+    const auto all_rows = [&](unsigned subparts) {
+        if (prepared.count == 4U) enqueue_qsa_known_rows<4U>(qsa_cohort_rows<4U>(prepared), config, 2U, nullptr, 0U, &slot, 0U, subparts);
+        else if (prepared.count == 8U) enqueue_qsa_known_rows<8U>(qsa_cohort_rows<8U>(prepared), config, 2U, nullptr, 0U, &slot, 0U, subparts);
+        else if (prepared.count <= 16U) enqueue_qsa_known_rows<16U>(qsa_cohort_rows<16U>(prepared), config, 2U, nullptr, 0U, &slot, 0U, subparts);
+        else enqueue_qsa_known_rows<32U>(qsa_cohort_rows<32U>(prepared), config, 2U, nullptr, 0U, &slot, 0U, subparts);
+    };
+    if (merge) {
+        all_rows(1U); per_session(2U | 4U); all_rows(8U); per_session(16U); all_rows(32U); per_session(64U);
+    } else per_session(127U);
     merged(4U);
 }
 

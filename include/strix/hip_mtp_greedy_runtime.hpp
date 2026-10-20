@@ -66,6 +66,16 @@ public:
     std::uint32_t begin_cycle_draft(const HipMtpTargetHiddenTicket& initial_target,
         std::uint32_t maximum_candidates,std::uint32_t token_budget,
         std::span<const std::uint32_t> eos_tokens,bool cost_model);
+    // begin_cycle_draft in phases (HipMtpRuntime::propose_chain_begin and the rest), so that a cohort
+    // enqueues draft step k of every session before waiting for any: draft_begin (same arguments and
+    // result; drafting() false: nothing to draft), then while draft_launch_step() and draft_after_step(),
+    // then draft_end(). Each session's launches, waits and drafts are those of begin_cycle_draft.
+    std::uint32_t draft_begin(const HipMtpTargetHiddenTicket& initial_target,
+        std::uint32_t maximum_candidates,std::uint32_t token_budget,
+        std::span<const std::uint32_t> eos_tokens,bool cost_model);
+    [[nodiscard]] bool draft_launch_step();
+    [[nodiscard]] bool draft_after_step();
+    void draft_end();
     [[nodiscard]] bool drafting() const noexcept;
     [[nodiscard]] std::span<const std::uint32_t> drafted_candidates() const noexcept;
     [[nodiscard]] std::span<const float> drafted_probabilities() const noexcept;

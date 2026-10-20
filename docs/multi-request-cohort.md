@@ -104,10 +104,20 @@ first row's input and write only a sink buffer no row reads):
 | QSA layer (`qsa`) | Input and output projections as one launch; norm, KV append, selection and attention per session | Dense A8 with a Q8_0 output projection only |
 | LM head (`head`) | Unstaged launches of at most 16 rows; each request's greedy rows into its own replies | The R1 leaf, lane-tree and local-tree DAG per row |
 | Routed experts (`moe`) | One expert union over all rows on the lead request's stream, with a CSR workspace per row count; down in batches of at most 8 assignments | Per (row, slot) accumulators, merge in slot order (A8 profile only) |
-| Injections (`inject`, not in `all`) | One launch over all rows | Elementwise per row; measured slower than the per-request launches (147 to 161 ms per 16-row step) |
+| MoE combine (`combine`) | One launch over all rows, after every chunk joins its shared expert (every chunk has a primary) | Elementwise per row |
+| Injections (`inject`) | One launch over all rows | Elementwise per row |
 
 HC mixers, router and shared expert stay per chunk: their weights per layer (about 5-7 MB) are re-read
-from the MALL by the second chunk. MoE combines stay per request (each waits for its chunk's shared expert). A wide union's status covers all its rows: a failing row fails the
+from the MALL by the second chunk.
+
+Inside the cohort GDN and QSA launches the per-session parts are fused across sessions too: the GDN
+prepare and recurrence of every session run as one launch each (`blockIdx.y` = session, each running the
+per-session body for its 2, 4 or 8 rows; `STRIX_COHORT_GDN_SEGMENTS=0` keeps one pair per session). With
+`STRIX_COHORT_QSA_SEGMENTS=1` the state-free QSA sub-parts (norms and rope, block selection, softmax) also run
+once for every row while the KV append, block scores, attention scores and value/gate output stay per session
+(measured neutral, so off by default). The draft chains of a cohort cycle advance
+depth by depth: step k of every session (each on its own stream) is enqueued before any session waits for
+its step (`STRIX_COHORT_DRAFT_INTERLEAVE=0`: one chain after another). A wide union's status covers all its rows: a failing row fails the
 whole cohort window, as in an 8-row cohort.
 
 ## Exactness
@@ -134,7 +144,10 @@ tokens are compared with its own single-request run.
 | `STRIX_COHORT_SHARED_EXPERT=0` | Shared steps as above except the shared expert, which runs per request. |
 | `STRIX_COHORT_MAX_ROWS=2\|4\|8` | Per-request row cap in a cohort cycle (default 8 / requests; with a budget, budget / requests). |
 | `STRIX_COHORT_ROWS=16\|32` | Global row budget per cycle: chunks of up to 8 rows in one stream of steps. |
-| `STRIX_COHORT_WIDE=gdn,qsa,head,moe,inject\|all` | With a budget: the listed steps once for all chunks' rows (9..32; `all` = gdn,qsa,head,moe). |
+| `STRIX_COHORT_WIDE=gdn,qsa,head,moe,combine,inject\|all` | With a budget: the listed steps once for all chunks' rows (9..32). |
+| `STRIX_COHORT_GDN_SEGMENTS=0`, `STRIX_COHORT_DRAFT_INTERLEAVE=0` | Per-session GDN prepare/recurrence; one draft chain after another. |
+| `STRIX_COHORT_QSA_SEGMENTS=1` | State-free QSA sub-parts once for all rows (neutral). |
+| `STRIX_COHORT_AB=1`, `STRIX_COHORT_AB_OFF=gdnseg,qsaseg,combine,draft,gdn,...` | Measurement: odd cohort cycles run without the listed features (wide families by name); mean cycle ms, tokens and tok/s per parity at exit. |
 | `STRIX_COHORT_WIDE_LOG=1` | Per cohort call (first 4, then every 256th): chunks, rows and steps run wide, per chunk and per request; at exit, calls and mean wall ms per row total, chunk count and wide or not. |
 
 The receipt (`mode` `native-mtp-cohort-...`) reports `mtp_cohort_wall_ms`, `mtp_cohort_generated_tokens`,
