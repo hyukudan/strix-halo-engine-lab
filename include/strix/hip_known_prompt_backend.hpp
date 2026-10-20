@@ -88,6 +88,21 @@ public:
     // like any other post-commit error. Set once, before any call.
     using AllRowsSink = std::function<void(std::span<const std::uint32_t>, std::uint64_t, std::span<const float>)>;
     void set_all_rows_sink(AllRowsSink sink, std::function<void()> drain);
+    // Prompt blocks of several sessions in one segmented run (HipKnownPrefixWindow::execute_prefill_segments)
+    // on `group`'s owner and arena. Member m is the block `tokens` at `position` of the session of
+    // `backend` (its own tiled backend of tokens.size() rows): admission, executor handoff, commit checks
+    // and telemetry are that backend's, exactly as its execute_rows / execute_state_rows. Returns each
+    // member's terminal logits (empty unless `logits`). Any failure disables every member backend and
+    // poisons the sessions that consumed rows.
+    struct GroupMember {
+        HipKnownPromptBackend* backend = nullptr;
+        std::span<const std::uint32_t> tokens;
+        std::uint64_t position = 0;
+        bool logits = false;
+        std::function<void(std::size_t, const std::function<ExecutionDispatchContext(std::uint32_t)>&)> observer;
+    };
+    [[nodiscard]] static std::vector<std::vector<float>> execute_group(HipKnownPromptBackend& group,
+        std::span<const GroupMember> members);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

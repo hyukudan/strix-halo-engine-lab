@@ -99,6 +99,10 @@ struct MtpDecodeTargetParents final {
         // Fresh target state and session, exactly as after setup (after the calibration replay).
         std::function<void()> reset_state;
         SerialSessionContext fresh;
+        // Prompt groups (STRIX_PROMPT_BATCH): the owner the blocks of several requests run on, when it is not the
+        // T-row block owner (STRIX_PROMPT_BATCH_ROWS above T). Null: the blocks backend and its owner.
+        HipKnownPromptBackend* group = nullptr;
+        std::shared_ptr<HipKnownPrefixWindow> group_owner;
     } tiled;
     // Set: serve requests after the calibration replay instead of the command-line request.
     MtpDecodeServe serve;
@@ -223,22 +227,83 @@ public:
     [[nodiscard]] bool done() const noexcept {return phase_==Phase::done;}
     [[nodiscard]] std::uint64_t position() const noexcept {return pos_;}
     [[nodiscard]] std::uint64_t restored() const noexcept {return restored_;}
+    // The prompt's next unit when it is a tiled block (a T-row block or a tail block): its backend, owner, rows,
+    // whether it is a T block (prefix cache capture) and whether it ends the prompt. Null when the next unit is
+    // serial rows or the prompt is done. Only advances past exhausted block phases, as step() would.
+    struct Block {
+        HipKnownPromptBackend* backend=nullptr;
+        HipKnownPrefixWindow* owner=nullptr;
+        std::uint32_t rows=0;
+        bool capture=false,final=false;
+    };
+    [[nodiscard]] std::optional<Block> next_block() {
+        while(phase_==Phase::blocks || phase_==Phase::tails) {
+            const bool blocks=phase_==Phase::blocks;
+            if(!blocks && tail_>=tiled_.tails.size()){phase_=Phase::serial;break;}
+            auto& backend=blocks?*tiled_.blocks:*tiled_.tails[tail_].backend;
+            auto& owner=blocks?*tiled_.block_owner:*tiled_.tails[tail_].owner;
+            const auto rows=blocks?tiled_.rows:tiled_.tails[tail_].rows;
+            // STRIX_MTP_TILED_START=0: the last prompt row always runs serially (the previous handoff).
+            // Otherwise a block that ends exactly at the last prompt row also computes that row's head, and
+            // the first draft cycle starts from the block's last row (its tap and FP32 logits).
+            static const bool tiled_start=[]{const char* v=std::getenv("STRIX_MTP_TILED_START");return !v || v[0]!='0';}();
+            const bool heads=tiled_start && backend.output_policy()!=KnownWindowOutputPolicy::state_only;
+            if(!adopted_ && (pos_+rows<=n_-1U || (heads && pos_+rows==n_))) return Block{&backend,&owner,rows,blocks,pos_+rows==n_};
+            if(blocks)phase_=Phase::tails;else ++tail_;
+        }
+        return std::nullopt;
+    }
+    // The block's tokens (valid until the prompt is destroyed).
+    [[nodiscard]] std::span<const std::uint32_t> block_tokens(const Block& block) const {
+        return std::span<const std::uint32_t>(tokens_).subspan(static_cast<std::size_t>(pos_),block.rows);
+    }
+    // The step observer of a block: copies every row's wide hidden state (the MTP target tap) out of the arena.
+    [[nodiscard]] HipKnownPrefixWindow::PrefillStepObserver block_observer(std::uint32_t rows) {
+        return [this,rows](std::size_t step,const std::function<ExecutionDispatchContext(std::uint32_t)>& row) {
+            if(step!=tap_) return;
+            const auto stream=hip_execution_stream();
+            for(std::uint32_t r=0;r<rows;++r) {
+                const auto c=row(r);
+                const auto source=resolve_dispatch_write(c,0);
+                if(source.bytes<width_)throw std::logic_error("tiled MTP tap row is undersized");
+                check(hipMemcpyAsync(block_hidden_+static_cast<std::size_t>(r)*width_,reinterpret_cast<const void*>(source.address),
+                    static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice,stream),"tiled MTP tap copy");
+            }
+        };
+    }
+    // After the block ran (alone or in a group): the predictor rows, the held row, the prefix cache capture and,
+    // for the final block, the adoption of its last row (logits: its terminal logits).
+    void finish_block(const Block& block,const std::vector<float>& logits,bool grouped=false) {
+        const auto rows=block.rows;
+        std::vector<MtpDeviceView> views;std::vector<std::uint32_t> next;
+        if(pos_){views.push_back(view(held_));next.push_back(tokens_[static_cast<std::size_t>(pos_)]);}
+        for(std::uint32_t r=0;r+1U<rows;++r){views.push_back(view(block_hidden_+static_cast<std::size_t>(r)*width_));
+            next.push_back(tokens_[static_cast<std::size_t>(pos_+r+1U)]);}
+        runtime_.prime_hidden_rows(qualified_,activated_,views,next);
+        check(hipMemcpy(held_,block_hidden_+static_cast<std::size_t>(rows-1U)*width_,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
+            "tiled MTP held copy");
+        pos_+=rows;
+        if(block.capture && tiled_.cache) tiled_.cache->after_block(session_,tokens_,n_-1U);
+        if(block.capture)++blocks_;else ++tail_blocks_;
+        if(grouped)++grouped_blocks_;
+        if(block.final) {
+            // STRIX_PREFIX_CACHE_DIGEST=1: also the SHA-256 of the final row's FP32 logits in the receipt.
+            static const bool digest=[]{const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");return v && v[0]=='1';}();
+            if(digest) {
+                const auto bytes=std::as_bytes(std::span<const float>(logits));
+                final_logits_digest_=sha256_bytes(std::vector<std::byte>(bytes.begin(),bytes.end()));
+            }
+            if(final_sampler_) target_.replace_token_sampler(final_sampler_);
+            pending_=target_.adopt_prefill_row(session_,tokens_[static_cast<std::size_t>(n_-1U)],view(held_),logits);
+            adopted_=true;
+            phase_=Phase::done;
+        }
+    }
     // Runs the next unit of the prompt.
     void step(std::uint32_t serial_rows_per_step=UINT32_MAX) {
         for(;;) {
             if(phase_==Phase::blocks || phase_==Phase::tails) {
-                const bool blocks=phase_==Phase::blocks;
-                if(!blocks && tail_>=tiled_.tails.size()){phase_=Phase::serial;continue;}
-                auto& backend=blocks?*tiled_.blocks:*tiled_.tails[tail_].backend;
-                auto& owner=blocks?*tiled_.block_owner:*tiled_.tails[tail_].owner;
-                const auto rows=blocks?tiled_.rows:tiled_.tails[tail_].rows;
-                // STRIX_MTP_TILED_START=0: the last prompt row always runs serially (the previous handoff).
-                // Otherwise a block that ends exactly at the last prompt row also computes that row's head, and
-                // the first draft cycle starts from the block's last row (its tap and FP32 logits).
-                static const bool tiled_start=[]{const char* v=std::getenv("STRIX_MTP_TILED_START");return !v || v[0]!='0';}();
-                const bool heads=tiled_start && backend.output_policy()!=KnownWindowOutputPolicy::state_only;
-                if(!adopted_ && (pos_+rows<=n_-1U || (heads && pos_+rows==n_))) {run_block(backend,owner,rows,blocks);return;}
-                if(blocks)phase_=Phase::tails;else ++tail_;
+                if(const auto block=next_block()) {run_block(*block);return;}
                 continue;
             }
             if(phase_==Phase::serial) {
@@ -260,7 +325,8 @@ public:
         for(std::size_t t=0;t<tiled_.tails.size();++t)out<<(t?",":"")<<tiled_.tails[t].rows;
         out<<"],\"restored_position\":"<<restored_
            <<",\"blocks\":"<<blocks_<<",\"tail_blocks\":"<<tail_blocks_<<",\"serial_rows\":"<<serial_rows_<<",\"tiled_start\":"<<(adopted_?"true":"false")
-           <<",\"prompt_ms\":"<<prompt_ms;
+           <<",\"prompt_ms\":"<<prompt_ms<<",\"grouped_blocks\":"<<grouped_blocks_;
+        if(final_logits_digest_) out<<",\"final_logits_digest\":\""<<model_content_identity_hex(*final_logits_digest_)<<'"';
         if(tiled_.cache) {
             const auto& q=tiled_.cache->request();
             out<<",\"prefix_cache\":{\"lookup_ms\":"<<q.lookup_ms<<",\"restore_ms\":"<<q.restore_ms<<",\"restored_bytes\":"<<q.restored_bytes
@@ -277,42 +343,15 @@ private:
     enum class Phase {blocks,tails,serial,done};
     static void check(hipError_t e,const char* what){if(e!=hipSuccess)throw std::runtime_error(std::string(what)+": "+hipGetErrorString(e));}
     [[nodiscard]] MtpDeviceView view(const std::byte* p) const {return MtpDeviceView{reinterpret_cast<std::uintptr_t>(p),width_,1U};}
-    void run_block(HipKnownPromptBackend& backend,HipKnownPrefixWindow& owner,std::uint32_t rows,bool capture) {
-        const HipKnownPrefixWindow::PrefillStepObserver observer=[this,rows](std::size_t step,const std::function<ExecutionDispatchContext(std::uint32_t)>& row) {
-            if(step!=tap_) return;
-            const auto stream=hip_execution_stream();
-            for(std::uint32_t r=0;r<rows;++r) {
-                const auto c=row(r);
-                const auto source=resolve_dispatch_write(c,0);
-                if(source.bytes<width_)throw std::logic_error("tiled MTP tap row is undersized");
-                check(hipMemcpyAsync(block_hidden_+static_cast<std::size_t>(r)*width_,reinterpret_cast<const void*>(source.address),
-                    static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice,stream),"tiled MTP tap copy");
-            }
-        };
-        owner.set_prefill_step_observer(observer);
+    void run_block(const Block& block) {
+        auto& owner=*block.owner;
+        owner.set_prefill_step_observer(block_observer(block.rows));
         try {
-            const bool final_block=pos_+rows==n_;
             std::vector<float> logits;
-            const std::span<const std::uint32_t> all(tokens_);
-            if(final_block) logits=backend.execute_rows(all.subspan(static_cast<std::size_t>(pos_),rows),pos_);
-            else backend.execute_state_rows(all.subspan(static_cast<std::size_t>(pos_),rows),pos_);
+            if(block.final) logits=block.backend->execute_rows(block_tokens(block),pos_);
+            else block.backend->execute_state_rows(block_tokens(block),pos_);
             owner.set_prefill_step_observer({});
-            std::vector<MtpDeviceView> views;std::vector<std::uint32_t> next;
-            if(pos_){views.push_back(view(held_));next.push_back(tokens_[static_cast<std::size_t>(pos_)]);}
-            for(std::uint32_t r=0;r+1U<rows;++r){views.push_back(view(block_hidden_+static_cast<std::size_t>(r)*width_));
-                next.push_back(tokens_[static_cast<std::size_t>(pos_+r+1U)]);}
-            runtime_.prime_hidden_rows(qualified_,activated_,views,next);
-            check(hipMemcpy(held_,block_hidden_+static_cast<std::size_t>(rows-1U)*width_,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
-                "tiled MTP held copy");
-            pos_+=rows;
-            if(capture && tiled_.cache) tiled_.cache->after_block(session_,tokens_,n_-1U);
-            if(capture)++blocks_;else ++tail_blocks_;
-            if(final_block) {
-                if(final_sampler_) target_.replace_token_sampler(final_sampler_);
-                pending_=target_.adopt_prefill_row(session_,tokens_[static_cast<std::size_t>(n_-1U)],view(held_),logits);
-                adopted_=true;
-                phase_=Phase::done;
-            }
+            finish_block(block,logits);
         } catch(...) {owner.set_prefill_step_observer({});throw;}
     }
     void run_serial_row() {
@@ -337,7 +376,8 @@ private:
     DirectLaunchDispatcher& dispatcher_;
     std::byte* held_=nullptr;
     std::shared_ptr<TokenSampler> final_sampler_;
-    std::uint64_t n_=0,width_=0,restored_=0,pos_=0,blocks_=0,tail_blocks_=0,serial_rows_=0;
+    std::uint64_t n_=0,width_=0,restored_=0,pos_=0,blocks_=0,tail_blocks_=0,serial_rows_=0,grouped_blocks_=0;
+    std::optional<ModelContentIdentity> final_logits_digest_;
     std::size_t tap_=SIZE_MAX,tail_=0;
     std::byte* block_hidden_=nullptr;
     Phase phase_=Phase::blocks;
@@ -407,6 +447,9 @@ public:
     };
     struct Stats {
         std::uint64_t admitted = 0, finished = 0, steps = 0, cohort_steps = 0, solo_steps = 0, max_active = 0, prompt_steps = 0;
+        // Prompt groups (STRIX_PROMPT_BATCH=1): segmented runs of several prompts' blocks, their blocks and rows.
+        std::uint64_t prompt_groups = 0, grouped_blocks = 0, grouped_rows = 0;
+        double prompt_group_ms = 0.0;
         HipMtpGreedyCohortStats cohort;
     };
     // The calibration replay that qualified the predictor for every slot (set by the bridge).
@@ -434,6 +477,7 @@ public:
     }
     [[nodiscard]] bool has_free_slot() const noexcept { return active() < slots_.size(); }
     [[nodiscard]] bool interleaved() const noexcept { return interleave_; }
+    [[nodiscard]] static bool prompt_batching() noexcept { return prompt_batch_enabled(); }
     [[nodiscard]] std::size_t prefilling() const noexcept {
         return static_cast<std::size_t>(std::count_if(slots_.begin(), slots_.end(), [](const auto& s) { return s->prefilling; }));
     }
@@ -498,8 +542,10 @@ public:
         if (prompt && (!decoding || prompt_debt_ms_ <= 0.0)) {
             ++stats_.prompt_steps;
             const auto t0 = clock::now();
-            prompt->prefill->step(serial_rows_per_step_);
-            if (prompt->prefill->done()) complete_prompt(*prompt);
+            if (!run_prompt_group(*prompt)) {
+                prompt->prefill->step(serial_rows_per_step_);
+                if (prompt->prefill->done()) complete_prompt(*prompt);
+            }
             prompt_debt_ms_ += prompt_share_ * std::chrono::duration<double, std::milli>(clock::now() - t0).count();
         }
         std::vector<Slot*> live;
@@ -541,6 +587,63 @@ public:
     }
 
 private:
+    // STRIX_PROMPT_BATCH=1: the prompt unit of a step is a group. When the oldest running prompt's next unit is a
+    // tiled block (a T-row or tail block), the next blocks of the other running prompts join it, oldest first,
+    // while the rows fit the budget (the T-row block owner's arena, or STRIX_PROMPT_BATCH_ROWS if smaller). The
+    // group runs as one segmented prefill on slot 0's block owner (HipKnownPromptBackend::execute_group): each
+    // prompt's block is the one it would run alone, with the same per-row arithmetic. A prompt whose next unit
+    // is serial rows, or a lone block, runs alone as before. Returns false when no group of two or more formed.
+    static bool prompt_batch_enabled() {
+        static const bool on = [] { const char* v = std::getenv("STRIX_PROMPT_BATCH"); return v && v[0] == '1'; }();
+        return on;
+    }
+    static std::uint32_t prompt_batch_rows() {
+        static const std::uint32_t rows = [] {
+            const char* v = std::getenv("STRIX_PROMPT_BATCH_ROWS");
+            const long n = v ? std::atol(v) : 0L;
+            return n > 0L ? static_cast<std::uint32_t>(n) : UINT32_MAX;
+        }();
+        return rows;
+    }
+    bool run_prompt_group(Slot& oldest) {
+        if (!prompt_batch_enabled() || prefilling() < 2U) return false;
+        const auto& lead = slots_.front()->parents->tiled;
+        auto& group = lead.group ? *lead.group : *lead.blocks;
+        const auto budget = std::min(lead.group ? lead.group_owner->logical_rows() : lead.rows, prompt_batch_rows());
+        struct Member { Slot* slot; TiledMtpPrompt::Block block; };
+        std::vector<Member> members;
+        std::uint32_t rows = 0;
+        const auto join = [&](Slot& s) {
+            const auto block = s.prefill->next_block();
+            if (!block || block->rows > budget - rows) return;
+            members.push_back({&s, *block});
+            rows += block->rows;
+        };
+        join(oldest);
+        if (members.empty()) return false;
+        std::vector<Slot*> others;
+        for (auto& s : slots_) if (s.get() != &oldest && s->prefilling) others.push_back(s.get());
+        std::sort(others.begin(), others.end(), [](const Slot* a, const Slot* b) { return a->order < b->order; });
+        for (auto* s : others) join(*s);
+        if (members.size() < 2U) return false;
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<HipKnownPromptBackend::GroupMember> group_members;
+        group_members.reserve(members.size());
+        for (const auto& m : members)
+            group_members.push_back({m.block.backend, m.slot->prefill->block_tokens(m.block), m.slot->prefill->position(), m.block.final,
+                m.slot->prefill->block_observer(m.block.rows)});
+        const auto logits = HipKnownPromptBackend::execute_group(group, group_members);
+        for (std::size_t k = 0; k < members.size(); ++k) {
+            auto& s = *members[k].slot;
+            s.prefill->finish_block(members[k].block, logits[k], true);
+            if (s.prefill->done()) complete_prompt(s);
+        }
+        ++stats_.prompt_groups;
+        stats_.grouped_blocks += members.size();
+        stats_.grouped_rows += rows;
+        stats_.prompt_group_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        return true;
+    }
     // The end of a request's prompt: its pending row, its greedy runtime and its first token.
     void complete_prompt(Slot& s) {
         const auto& m = options_.mtp;

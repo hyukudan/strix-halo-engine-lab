@@ -147,6 +147,23 @@ public:
     [[nodiscard]] static std::vector<HipMtpTargetWindowExecution> execute_mtp_cohort_chunks(
         std::span<HipKnownPrefixWindow* const> primaries, std::span<const std::size_t> chunk_members,
         std::span<const HipKnownPrefixCohortMember> members);
+    // Segmented tiled prefill (several requests' prompt blocks in one run): segment s is a block of
+    // members[s].tokens rows of members[s].session, which must equal the rows of members[s].own (that
+    // session's own idle tiled owner of the block, whose resources, profile and lineage identity the segment
+    // uses). The segments occupy consecutive rows of this owner's arena (an idle tiled prefill owner of the
+    // same execution whose T covers them all). Row-independent steps (STRIX_PROMPT_BATCH_SHARED) run once
+    // for every segment's rows; every other step runs per segment exactly as the segment's block alone.
+    // head: the segment's last row computes its logits (results[s].logits). observer: like
+    // set_prefill_step_observer, with the segment's own rows. Any failure poisons every member session
+    // and disables this owner.
+    struct PrefillSegmentRequest {
+        HipKnownPrefixWindow* own = nullptr;
+        SerialSessionContext* session = nullptr;
+        std::span<const std::uint32_t> tokens;
+        bool head = false;
+        PrefillStepObserver observer;
+    };
+    [[nodiscard]] std::vector<KnownWindowResult> execute_prefill_segments(std::span<const PrefillSegmentRequest> members);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

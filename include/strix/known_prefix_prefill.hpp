@@ -50,4 +50,36 @@ void validate_compiled_known_prefix_prefill(const CompiledKnownPrefixPrefill&,
     const KnownWindowExecutionHooks&,
     // Optional entries that take all T rows of a step in one call (selected by the step's variant).
     std::span<const KnownWindowRowsEntry> full={});
+
+// Segmented tiled prefill: the blocks of several independent sessions in one step-major run over one
+// T-row arena. Segment s owns arena rows [offset_s, offset_s + rows_s) (offsets in segment order) with its
+// own session, state, position, tokens, PLE history and lineage. A step the caller marks shared (its
+// arithmetic per row depends only on that row and the weights) runs once for the rows of every segment
+// through its full-T entry; every other step runs per segment exactly as that segment's block alone
+// (execute_known_prefix_prefill_eager on a rows_s-row plan): the same entries, row counts and order.
+struct KnownPrefillSegment {
+    SerialSessionContext* session=nullptr;
+    // The session's own resources (state memory and layout, PLE lookup, model objects); the block arena
+    // replaces their scratch for the rows of this block.
+    const ExecutionRuntimeResources* resources=nullptr;
+    std::span<const std::uint32_t> tokens; // 8..T rows, a multiple of 8
+    bool head=false;                       // the terminal head of the segment's last row (terminal-row plans)
+    // Producer recorded in the session's lineage: the tiled plan of the session's own block of rows_s rows,
+    // whose per-row arithmetic the segment repeats (0: this plan's identities).
+    std::uint64_t lineage_execution_identity=0,lineage_kernel_plan_identity=0;
+};
+struct KnownPrefillSegmentHooks {
+    // True: step i runs once for the rows of every segment (requires a full-T entry).
+    std::function<bool(std::size_t)> shared;
+    // After step i of segment s is enqueued (also for shared steps, once per segment): resolver of the
+    // segment's own row r (0..rows_s-1).
+    std::function<void(std::size_t,std::size_t,const std::function<ExecutionDispatchContext(std::uint32_t)>&)> after_step;
+};
+// One result per segment, in segment order (logits: the segment's last row when head). Any failure after
+// admission poisons every segment's session.
+[[nodiscard]] std::vector<KnownWindowResult> execute_known_prefix_prefill_segments_eager(
+    const CompiledKnownPrefixPrefill&,const CompiledSerialExecution&,const ExecutionMemoryBinding&,
+    std::span<const KnownPrefillSegment>,const CompiledLaunchPlan&,
+    std::span<const KnownWindowR2Entry>,std::span<const KnownWindowRowsEntry>,
+    const KnownWindowExecutionHooks&,std::span<const KnownWindowRowsEntry> full,const KnownPrefillSegmentHooks&);
 } // namespace strix

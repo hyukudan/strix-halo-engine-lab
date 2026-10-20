@@ -2438,6 +2438,12 @@ int STRIX_DECODE_ENTRY(
     strix::ModelContentIdentity prefix_cache_identity;
     std::uint64_t prefix_cache_every = 0;
     std::uint64_t known_prefix_union_bytes = 0; // routed-union scratch of the tiled prefill owners (0: none)
+    // Prompt groups of the batched tiled MTP prompt (STRIX_PROMPT_BATCH_ROWS above T): a tiled owner of that many rows
+    // with its own arena, on which the blocks of several requests run as one segmented prefill.
+    std::shared_ptr<strix::CompiledKnownPrefixPrefill> known_group_plan;
+    std::shared_ptr<KnownPromptMemory> known_group_memory;
+    std::shared_ptr<strix::HipKnownPrefixWindow> known_group_owner;
+    std::unique_ptr<strix::HipKnownPromptBackend> known_group_backend;
     if (options.known_prefix_window || options.prompt_lookup) {
         if (options.known_prefix_prefill_rows) {
             // The tiled prefill derives from the prefill serial execution (its dense projection
@@ -2596,6 +2602,32 @@ int STRIX_DECODE_ENTRY(
             if (compiled_prefill)
                 known_tail_backends.back()->set_executor_handoff({&compiled, &resources}, {&*compiled_prefill, &prefill_resources});
         }
+        if (const char* group_env = std::getenv("STRIX_PROMPT_BATCH_ROWS");
+            group_env && known_prefill_plan && strix::decode_cli::mtp_tiled_prompt(options) &&
+            std::strtoull(group_env, nullptr, 10) > options.known_prefix_prefill_rows) {
+            const auto group_rows = std::strtoull(group_env, nullptr, 10);
+            if (group_rows % 8U || group_rows > strix::known_prefill_max_rows || known_prefill_plan->output_policy == strix::KnownWindowOutputPolicy::all_rows)
+                throw std::invalid_argument("STRIX_PROMPT_BATCH_ROWS must be a multiple of 8 up to " + strix::known_prefill_rows_range() +
+                    " on a terminal-row or state-only tiled prefill");
+            known_group_plan = std::make_shared<strix::CompiledKnownPrefixPrefill>(strix::compile_known_prefix_prefill(model,
+                compiled_prefill ? *compiled_prefill : compiled, manifest, tensor_access,
+                {static_cast<std::uint32_t>(group_rows), true, true, true, options.known_prefix_expert_union,
+                 options.known_prefix_output_policy, options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U,
+                 true, true, true, true, true, false}));
+            struct GroupRetained { std::shared_ptr<const void> original, ple, source, plan; };
+            const auto retained = std::make_shared<GroupRetained>(GroupRetained{experiment_owner, prefill_ple_owner, retained_ple_source,
+                known_group_plan});
+            known_group_memory = std::make_shared<KnownPromptMemory>(*known_group_plan, generations.next(), generations.next(),
+                retained, original_work_device, known_prefix_union_bytes, known_prefix_union_bytes ? generations.next() : 0);
+            known_group_owner = std::make_shared<strix::HipKnownPrefixWindow>(*known_group_plan,
+                compiled_prefill ? *compiled_prefill : compiled, model, compiled_prefill ? prefill_catalog_config : catalog_config,
+                compiled_prefill ? prefill_resources : resources, known_group_memory->scratch, known_group_memory->scope,
+                std::static_pointer_cast<const void>(known_group_memory),
+                known_prefix_union_bytes ? strix::q51_known_rows::Workspace{known_group_memory->union_scratch,
+                    std::static_pointer_cast<const void>(known_group_memory)} : strix::q51_known_rows::Workspace{});
+            known_group_backend = std::make_unique<strix::HipKnownPromptBackend>(known_group_owner, session,
+                known_group_memory->scratch, model.vocab_size, original_work_device);
+        }
         if (strix::decode_cli::prefix_state_cache_requested(options)) {
             if (!known_prefill_plan || !known_prefix_backend)
                 throw std::logic_error("prefix state cache reached a route other than the tiled known-prefix prefill");
@@ -2666,6 +2698,8 @@ int STRIX_DECODE_ENTRY(
                 strix::initialize_hip_fresh_runtime_memory(memory.scratch(), memory.state());
             };
             tiled.fresh = session;
+            tiled.group = known_group_backend.get();
+            tiled.group_owner = known_group_owner;
         }
         // Prepare the real closed native owner BEFORE any prompt mutation.
         // It retains all serial parents and its separate D1/arena ownership.

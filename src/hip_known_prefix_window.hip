@@ -126,6 +126,9 @@ struct HipKnownPrefixWindow::Impl {
     HipElementwiseLauncherConfig elementwise_config;
     q51_known_rows::Workspace routed_workspace;
     q51_known_rows::Workspace prefill_routed_workspace; // all T rows of a prefill step (STRIX_PREFILL_FULL_MOE)
+    // Segmented prefill blocks of fewer than T rows: the CSR of their full union per row count (allocated at admission).
+    std::map<std::uint32_t, q51_known_rows::Workspace> prefill_union_workspace;
+    std::uint32_t prefill_union_rows = 0; // rows of the last full prefill union (0: T)
     std::map<std::uint32_t, q51_known_rows::Workspace> cohort_union_workspace; // wide cohort unions per row count (on first use)
     q51_known_rows::Summary pending_union_summary;
     std::uint32_t last_union_layer = 0;
@@ -287,6 +290,24 @@ struct HipKnownPrefixWindow::Impl {
         if (base % 256U) throw std::runtime_error("known-window cohort routed CSR allocation is not 256-byte aligned");
         status_disjoint(base, bytes);
         slot = {{execution_identity(), base, bytes, routed_workspace.memory.allocation_generation ^ (static_cast<std::uint64_t>(rows) << 56U)}, owner};
+        return slot;
+    }
+    // The CSR workspace of a full prefill union of `rows` rows: the owner's own for T, else one per row count.
+    const q51_known_rows::Workspace& prefill_union(std::uint32_t rows) {
+        if (!prefill || rows == prefill->logical_rows) return prefill_routed_workspace;
+        if (!rows || rows % 8U || rows > prefill->logical_rows)
+            throw std::invalid_argument("known prefill union rows must be a multiple of 8 within T");
+        auto& slot = prefill_union_workspace[rows];
+        if (slot.owner) return slot;
+        const auto bytes = q51_known_rows::prefill_scratch_bytes(rows, u32(model.num_experts), u32(model.num_experts_per_token));
+        void* memory = nullptr;
+        guard.run([&] { check(hipMalloc(&memory, bytes), "allocate known prefill segmented routed CSR"); });
+        std::shared_ptr<void> owner(memory, [](void* p) { if (p) (void)hipFree(p); });
+        const auto base = reinterpret_cast<std::uintptr_t>(memory);
+        if (base % 256U) throw std::runtime_error("known prefill segmented routed CSR allocation is not 256-byte aligned");
+        status_disjoint(base, bytes);
+        slot = {{execution_identity(), base, bytes,
+            routed_workspace.memory.allocation_generation ^ (1ULL << 63U) ^ (static_cast<std::uint64_t>(rows) << 40U)}, owner};
         return slot;
     }
     std::uint64_t execution_identity() const noexcept {return prefill?prefill->prefill_execution_identity:window.window_execution_identity;}
@@ -649,12 +670,15 @@ struct HipKnownPrefixWindow::Impl {
             prefill_routed_workspace={{execution_identity(),base,bytes,routed_workspace.memory.allocation_generation^(1ULL<<63U)},owner};
             prefill_entries.push_back({KnownWindowR2Variant::routed_a8_union_rows8_v1,this,
                 [](std::span<const ExecutionDispatchContext> rows,void* object) {
-                    const auto& self=*static_cast<Impl*>(object);
-                    moe_experts_known_prefill_rows_preflight(rows,self.routed_config,self.routed_workspace,self.prefill_routed_workspace);
+                    auto& self=*static_cast<Impl*>(object);
+                    moe_experts_known_prefill_rows_preflight(rows,self.routed_config,self.routed_workspace,
+                        self.prefill_union(static_cast<std::uint32_t>(rows.size())));
                 },
                 [](std::span<const ExecutionDispatchContext> rows,void* object) {
-                    const auto& self=*static_cast<Impl*>(object);
-                    moe_experts_known_prefill_rows_launch(rows,self.routed_config,self.routed_workspace,self.prefill_routed_workspace);
+                    auto& self=*static_cast<Impl*>(object);
+                    const auto count=static_cast<std::uint32_t>(rows.size());
+                    moe_experts_known_prefill_rows_launch(rows,self.routed_config,self.routed_workspace,self.prefill_union(count));
+                    self.prefill_union_rows=count==self.prefill->logical_rows?0U:count;
                 }});
         }
         if(!gdn) return;
@@ -961,9 +985,10 @@ struct HipKnownPrefixWindow::Impl {
     }
     void complete() {
         guard.require_original();
+        const auto prefill_rows_done=full_prefill_union()?(prefill_union_rows?prefill_union_rows:prefill->logical_rows):0U;
         if(window.routed_expert_union_steps && !cohort_member)
             check(hipMemcpyAsync(&pending_union_summary,
-                reinterpret_cast<const void*>(full_prefill_union()?prefill_routed_workspace.memory.arena_base:routed_workspace.memory.arena_base),
+                reinterpret_cast<const void*>(full_prefill_union()?prefill_union(prefill_rows_done).memory.arena_base:routed_workspace.memory.arena_base),
                 sizeof(pending_union_summary),hipMemcpyDeviceToHost,scope.stream),"read latest routed expert union metadata");
         if (config.deferred_moe_status)
             check(hipMemcpyAsync(&completion_status,
@@ -975,10 +1000,10 @@ struct HipKnownPrefixWindow::Impl {
         if(full_prefill_union()) {
             // One CSR over all T rows: histogram buckets saturate at 8, batches hold <= 64 assignments.
             const auto& s=pending_union_summary;
-            const auto assignments=prefill->logical_rows*u32(model.num_experts_per_token);
+            const auto assignments=prefill_rows_done*u32(model.num_experts_per_token);
             std::uint64_t experts=0,batches=0;
             for(std::uint32_t i=0;i<8U;++i){experts+=s.rows_per_expert_histogram[i];batches+=s.batch_size_histogram[i];}
-            if(s.status || s.version!=1U || s.logical_rows!=prefill->logical_rows || s.assignments!=assignments ||
+            if(s.status || s.version!=1U || s.logical_rows!=prefill_rows_done || s.assignments!=assignments ||
                 !s.touched || s.touched>assignments || s.touched>model.num_experts ||
                 s.batches<s.touched || s.batches>assignments || !s.maximum_assignments ||
                 s.maximum_assignments>assignments || s.duplicate_assignments>assignments ||
@@ -1711,6 +1736,111 @@ struct HipKnownPrefixWindow::Impl {
             throw;
         }
     }
+    // ---- Segmented prefill: the blocks of several sessions in one run over this owner's arena ----
+    // STRIX_PROMPT_BATCH_SHARED (comma list of hc, router, moe, elementwise, shared, or "all"; default
+    // "hc,router,moe,elementwise"; "none" runs every step per segment): the families whose prefill step runs once
+    // for the rows of every segment. Each of them computes a row from that row's input and the weights only.
+    static bool segment_family_shared(std::string_view family) {
+        static const std::string list = [] {
+            const char* v = std::getenv("STRIX_PROMPT_BATCH_SHARED");
+            return std::string(v ? v : "hc,router,moe,elementwise");
+        }();
+        if (list == "all") return true;
+        std::size_t at = 0;
+        while (at <= list.size()) {
+            const auto end = std::min(list.find(',', at), list.size());
+            if (std::string_view(list).substr(at, end - at) == family) return true;
+            at = end + 1U;
+        }
+        return false;
+    }
+    bool segment_shared_step(std::size_t i) const {
+        switch (window.mode[i]) {
+        case KnownWindowStepMode::hyper_mix_rows: return segment_family_shared("hc");
+        case KnownWindowStepMode::moe_route_rows: return segment_family_shared("router");
+        case KnownWindowStepMode::routed_expert_union: return full_prefill_union() && segment_family_shared("moe");
+        case KnownWindowStepMode::inject_rows:
+        case KnownWindowStepMode::moe_combine_rows: return segment_family_shared("elementwise");
+        case KnownWindowStepMode::shared_rows: return segment_family_shared("shared");
+        default: return false;
+        }
+    }
+    struct PrefillSegment {
+        Impl* own = nullptr;
+        SerialSessionContext* session = nullptr;
+        std::span<const std::uint32_t> tokens;
+        bool head = false;
+        HipKnownPrefixWindow::PrefillStepObserver observer;
+    };
+    std::vector<KnownWindowResult> execute_segments(std::span<const PrefillSegment> requests) {
+        if (failed) throw std::logic_error("known-window native owner cannot be reused after an exception");
+        if (executing) throw std::logic_error("known-window native owner cannot execute recursively");
+        if (!prefill || requests.empty() || prefill->output_policy == KnownWindowOutputPolicy::all_rows)
+            throw std::invalid_argument("segmented prefill runs on a terminal-row or state-only tiled prefill owner");
+        struct ExecutionLease {
+            bool& active;
+            explicit ExecutionLease(bool& value):active(value){active=true;}
+            ~ExecutionLease(){active=false;}
+        } execution_lease(executing);
+        bool owned_eager_scope_admitted = false, committed = false;
+        std::vector<KnownPrefillSegment> segments(requests.size());
+        try {
+            if (current_hip_launch_context()) throw std::invalid_argument("known-window native owner cannot nest a HIP launch scope");
+            std::uint32_t total = 0;
+            for (std::size_t s = 0; s < requests.size(); ++s) {
+                const auto& r = requests[s];
+                if (!r.own || !r.session || !r.own->prefill || r.own->failed || (r.own->executing && r.own != this) ||
+                    r.tokens.size() != r.own->logical_rows() || r.own->serial.execution_identity != serial.execution_identity ||
+                    r.own->resources.model_manifest != resources.model_manifest || r.own->resources.model_weights != resources.model_weights ||
+                    r.own->resources.tensor_access != resources.tensor_access || r.own->config.fast_prefill_components != config.fast_prefill_components ||
+                    r.own->config.dense_a8 != config.dense_a8 || (r.head && r.own->prefill->output_policy == KnownWindowOutputPolicy::state_only))
+                    throw std::invalid_argument("segmented prefill member needs its own idle tiled owner of its rows, of this owner's execution and profile");
+                if (r.own != this) r.own->validate_metadata();
+                total += static_cast<std::uint32_t>(r.tokens.size());
+                segments[s].session = r.session;
+                segments[s].resources = &r.own->resources;
+                segments[s].tokens = r.tokens;
+                segments[s].head = r.head;
+                segments[s].lineage_execution_identity = r.own->prefill->prefill_execution_identity;
+                segments[s].lineage_kernel_plan_identity = r.own->prefill->prefill_kernel_plan_identity;
+            }
+            if (total > prefill->logical_rows) throw std::invalid_argument("segmented prefill rows exceed this owner's T");
+            validate_metadata();
+            // The full union's CSR for these rows is allocated before anything is enqueued.
+            if (full_prefill_union()) (void)prefill_union(total);
+            owned_eager_scope_admitted = true;
+            const HipLaunchScope active(scope);
+            KnownWindowExecutionHooks hooks;
+            hooks.preflight_scope = [&] { validate_scope(); };
+            hooks.preflight_plan = [&] { validate_metadata(); };
+            hooks.complete = [&] { complete(); };
+            hooks.quiesce_or_fail_stop = [&] {
+                failed = true;
+                if (shared_detach && shared_detach->side) (void)hipStreamSynchronize(shared_detach->side);
+                guard.recover_or_fail_stop();
+            };
+            hooks.position_reader_implementations = position_readers;
+            hooks.preflight_memo = &preflight_memo; hooks.recipe_memo = &recipe_memo; hooks.preflight_slots = &preflight_slots;
+            hooks.arena_index = &arena_index;
+            KnownPrefillSegmentHooks segment_hooks;
+            segment_hooks.shared = [this](std::size_t i) { return segment_shared_step(i); };
+            if (std::any_of(requests.begin(), requests.end(), [](const auto& r) { return static_cast<bool>(r.observer); }))
+                segment_hooks.after_step = [&](std::size_t step, std::size_t s, const std::function<ExecutionDispatchContext(std::uint32_t)>& row) {
+                    if (requests[s].observer) requests[s].observer(step, row);
+                };
+            auto results = execute_known_prefix_prefill_segments_eager(*prefill, serial, scratch, segments, launch_plans.front(),
+                r2_entries, rows_entries, hooks, prefill_entries, segment_hooks);
+            committed = true;
+            require_shared_joined();
+            return results;
+        } catch (...) {
+            if (committed)
+                for (auto& g : segments) if (g.session) { g.session->health = SerialSessionHealth::poisoned; g.session->arithmetic_lineage.tainted = true; }
+            failed = true;
+            if (owned_eager_scope_admitted) guard.recover_or_fail_stop();
+            throw;
+        }
+    }
 };
 
 HipKnownPrefixWindow::HipKnownPrefixWindow(CompiledKnownPrefixWindow window,
@@ -1825,6 +1955,18 @@ std::vector<HipMtpTargetWindowExecution> HipKnownPrefixWindow::execute_mtp_cohor
         entry.second += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     }
     return out;
+}
+std::vector<KnownWindowResult> HipKnownPrefixWindow::execute_prefill_segments(std::span<const PrefillSegmentRequest> members) {
+    std::vector<Impl::PrefillSegment> owned(members.size());
+    for (std::size_t s = 0; s < members.size(); ++s) {
+        if (!members[s].own) throw std::invalid_argument("segmented prefill member has no own tiled owner");
+        owned[s].own = members[s].own->impl_.get();
+        owned[s].session = members[s].session;
+        owned[s].tokens = members[s].tokens;
+        owned[s].head = members[s].head;
+        owned[s].observer = members[s].observer;
+    }
+    return impl_->execute_segments(owned);
 }
 void HipKnownPrefixWindow::attach_greedy_rows(ExecutionBufferAddress partials,HipGreedyRowsReply* replies) {
     impl_->attach_greedy_rows(partials,replies);
