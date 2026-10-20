@@ -641,7 +641,15 @@ private:
         ++stats_.prompt_groups;
         stats_.grouped_blocks += members.size();
         stats_.grouped_rows += rows;
-        stats_.prompt_group_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        stats_.prompt_group_ms += ms;
+        // STRIX_PROMPT_BATCH_LOG=1: one stderr line per group (blocks, rows, wall).
+        static const bool log = [] { const char* v = std::getenv("STRIX_PROMPT_BATCH_LOG"); return v && v[0] == '1'; }();
+        if (log) {
+            std::cerr << "prompt group " << stats_.prompt_groups << ": " << members.size() << " blocks, " << rows << " rows (";
+            for (std::size_t k = 0; k < members.size(); ++k) std::cerr << (k ? "+" : "") << members[k].block.rows;
+            std::cerr << "), " << ms << " ms" << std::endl;
+        }
         return true;
     }
     // The end of a request's prompt: its pending row, its greedy runtime and its first token.

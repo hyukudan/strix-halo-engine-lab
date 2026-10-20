@@ -905,6 +905,25 @@ Single smoke runs, not a campaign (dense A8, windows 2/4/8, 256 tokens per reque
 `gdn,qsa,head,moe`); sequential 44.9 and 44.3. The server took 42.9 s for eight concurrent short requests fused
 (with the wide inject) against 46.9 s.
 
+## D-053: prompt groups, several requests' prompt blocks in one segmented prefill (`STRIX_PROMPT_BATCH`, opt-in)
+
+On the batched tiled MTP route (`--http-batch`, cohort requests with interleaved admission) a prompt step may run the
+next tiled blocks (T-row or tail blocks) of several running prompts together: the oldest prompt's block and then
+the others', oldest first, within a row budget (the T-row owner's rows, or `STRIX_PROMPT_BATCH_ROWS`; above T a
+dedicated group owner of that many rows). The group is one segmented prefill over consecutive rows of one arena
+(`execute_known_prefix_prefill_segments_eager`): the steps whose per-row arithmetic depends only on the row's input
+and the weights (HC, router, routed expert union, inject and combine; `STRIX_PROMPT_BATCH_SHARED`) run once for every
+segment's rows, and every other step (GDN, QSA, PLE, shared expert, row loops, the terminal head) runs per segment
+exactly as the segment's block alone. Each request keeps its own unit sequence, state, PLE history, predictor rows,
+terminal logits and lineage (the producer of its own block of that size). Serial units and lone blocks run alone;
+decode cycles stay separate. See [docs/prompt-batch.md](docs/prompt-batch.md).
+
+Why: with concurrent requests the server ran their prompts one block at a time, re-reading every routed expert per
+block; the union of several blocks reads each expert once. Alternatives not taken: concatenating the prompts as one
+sequence (wrong causal state), sharing the GDN/QSA dense projections across segments (exact only for the dense A8
+forms, and at most one 256-row launch's weights per segment, small next to the expert union), fusing prefill with
+the decode window (a later phase). Status: opt-in.
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |
