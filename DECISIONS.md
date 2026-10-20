@@ -959,6 +959,11 @@ sequence (wrong causal state), sharing the GDN/QSA dense projections across segm
 forms, and at most one 256-row launch's weights per segment, small next to the expert union), fusing prefill with
 the decode window (a later phase). Status: opt-in.
 
+| Check | Result |
+| --- | --- |
+| `strix-compiled-speculative-verify-tests`: three sessions (16/32/24 rows, different start positions) as one segmented block against each block alone, shared and per-segment steps, terminal-row and state-only | State words, generations, positions, heads, lineage and observed rows identical; admission faults change nothing, a dispatch fault poisons every segment once |
+| Server `--http-batch 8`, dense A8, T = 2048 + tails 1024/256/64/16, code1k/docedit-en/es2/p43, N = 2/4/8 staggered 0.3 s against each alone (same server) | Every request's 32 token IDs identical; 7 groups of 2-5 blocks, up to 1360 rows |
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |
