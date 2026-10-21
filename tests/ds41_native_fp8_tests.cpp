@@ -111,7 +111,7 @@ int main() try {
 
     std::mt19937 rng(41017);
     // The declared product against double precision, plain and K-split rows, the widths of the model's sites.
-    for (const auto [rows, width] : {std::pair<std::size_t, std::size_t>{64, 5120}, {32, 1280}, {64, 8192}, {32, 4096}, {32, 2304}}) {
+    for (const auto& [rows, width] : {std::pair<std::size_t, std::size_t>{64, 5120}, {32, 1280}, {64, 8192}, {32, 4096}, {32, 2304}}) {
         const auto t = random_fp8(rng, rows, width);
         expect(fp8_tensor_check({t.data(), rows * width}, {t.data() + rows * width, t.size() - rows * width}, rows, width).empty(),
                "random tensor passes the check");
