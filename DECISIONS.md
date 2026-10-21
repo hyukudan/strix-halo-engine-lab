@@ -1001,7 +1001,10 @@ block and ran all 1024 rows serially: about 45 s on cluster node 1, against abou
 integrated measurement of cohort requests, whose 1K members' prompts took 45 s each). Every tail size compiles its
 own tiled owner, which costs setup time and memory per size; four sizes bound the serial remainder to 15 rows.
 
-Checked: TAILS-GATE.
+Checked: options tests (the default set below T, `none`, an explicit list replaces it, no tails without full rows);
+cohort requests on the tiled prompt (T = 2048; code1k, prose1k and six short prompts, 128 tokens): with the default
+every request's tokens equal those with the explicit `--known-prefix-tail-rows 1024,256,64,16`, along the same route
+(the 1K prompts as one 1024-row tail block, 1.3-1.4 s, against about 45 s as serial rows without tails), replay 0.
 
 ## Measured and rejected
 
