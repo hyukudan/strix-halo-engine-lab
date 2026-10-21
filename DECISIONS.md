@@ -760,7 +760,7 @@ top-1 agreement and mean KL 0.0066-0.0069. Speed was not measured (deferred to t
 It does not run with the fast prefill QSA component, which reads BF16 keys and values, and is not admitted with
 cohort windows, the prefix state cache or HTTP serving, which were not checked under the identity.
 
-## D-047: context n-gram extension of the MTP draft chain (opt-in)
+## D-047: context n-gram extension of the MTP draft chain (opt-in; `auto` by default since D-055)
 
 `--mtp-ngram-draft` appends, after the MTP drafts kept by the minimum probability, the continuation of the
 longest earlier occurrence (2 to 4 tokens) of context + kept drafts, up to the draft depth, inside the same
@@ -831,6 +831,180 @@ draft steps equal to the host in token and support (largest relative probability
 smoke runs (six policies, 256 tokens) give the host path's tokens with replay error 0, and the sampling-v1
 chi-square smoke gives the host path's numbers. Single runs measured the device faster than the host for every kind of
 decision under all six policy classes; the timing campaign confirms it.
+
+## D-051: batched decoding on the tiled MTP route (cohort requests with tiled prompts, `--http-batch`)
+
+Cohort windows (D-039) now run on the tiled MTP prompt, the serving route. A run holds up to eight request slots;
+each slot owns what a single request owns (target state and session, launch plan, PLE backend, tiled prefill owners
+and backends, prefix state cache view, predictor, target producer, 2/4/8 window owners on one shared window
+stream), while the tiled prefill arenas are shared and used by one prompt at a time. The calibration replay runs
+once and qualifies every slot. A request is admitted into a free slot between decode cycles and starts exactly like
+a request of the one-at-a-time server (fresh state, session and predictor, its prompt through the tiled prefill, its
+first token from the prompt's last row); its prompt advances one unit at a time (a T-row block, a tail block or 16
+serial rows) between the cycles of the others; it leaves when it ends. Cycles with two or more requests past their
+prompt are cohort cycles. The command line exposes it as `--mtp-cohort-request TOKENS_FILE` on the tiled prompt
+(lockstep or sequential, up to eight requests), the server as `--http-batch N` (1..8). Sampled decoding works on
+this route: the target sampler is per request (replaceable on an idle producer), the tiled prompt's last row
+selects through it, cohort windows install each sampled request's row selection on its capture and pass its draft
+distributions; `--http-sampling sample` samples with each request's policy and seed. See
+[docs/serving.md](docs/serving.md#batched-decoding) and [docs/multi-request-cohort.md](docs/multi-request-cohort.md).
+
+Why: the server ran one request at a time, so concurrent clients only queued, and cohort windows (the decode-side
+batching) were limited to the serial prompt route (4097 tokens, about 70 ms per prompt token). Alternative: one
+shared state with row offsets per request; not taken, because every per-request owner already exists and keeps each
+request's arithmetic its own. Status: opt-in (`--http-batch`, cohort requests); greedy requests are exact.
+
+| Check | Result |
+| --- | --- |
+| Command line, tiled prompt, code8k (4 blocks) + es2, lockstep and sequential; code8k + es2 + p43 + prose8k, lockstep and sequential | Every request identical to its sequential run and request 0 to the single-request tiled route; calibration replay error 0 |
+| Eight requests (code8k, prose8k and six short prompts), lockstep vs sequential | Identical, all eight |
+| Interleaved admission (`STRIX_BATCH_INTERLEAVE=1`), four requests | Identical to the sequential run |
+| Server `--http-batch 8`, eight short prompts alone | Token IDs identical to the one-at-a-time server |
+| Server `--http-batch 8`, N = 2/4/8 concurrent clients, short prompts and 8K prompts | Every request returns its N = 1 tokens |
+| `strix-serve-api-tests` (queue pull interface: order, cancelled-while-queued jobs, totals, shutdown) | Pass |
+
+Single smoke runs, not a campaign (dense A8, windows 2/4/8, 256 tokens per request): four requests on the command
+line 63.6 tok/s aggregate (cycles only) against 43.6 sequential, eight 58.7 against 40.6; the server took 49.8 s for
+eight concurrent short requests against 69.7 s one at a time.
+
+## D-052: cohort cycles of up to 32 rows with wide shared steps (`STRIX_COHORT_ROWS`, `STRIX_COHORT_WIDE`, opt-in)
+
+A cohort window (D-039) already ran the steps that read only weights once for the rows of all its sessions, but
+one window held at most 8 rows: with five to eight requests every cycle needed two cohort windows, each reading the
+fixed weights (GDN/QSA projections, LM head, HC, router, shared expert) and its own expert union. With
+`STRIX_COHORT_ROWS=16|32` the sessions of a cycle form one group of up to that many rows, run as chunks of at most
+8 rows that advance step by step on one stream (`HipKnownPrefixWindow::execute_mtp_cohort_chunks`; a chunk of two
+or more sessions has a primary owner as before, a lone session runs its own window). Each session keeps its 8-row
+cohort row count (8 / sessions, at least 2), so up to four requests run as before. With `STRIX_COHORT_WIDE` (`all`
+= gdn, qsa, head, moe) these steps run once for the rows of all chunks (9 to 32 rows): the GDN and QSA input and
+output projections (dense A8, 16-row WMMA tiles, padded to 16 or 32 rows with rows that read the first row's input
+and write a sink), the LM head (unstaged launches of up to 16 rows) and the routed expert union (CSR per row count,
+down in batches of at most 8 assignments). Recurrence, attention, PLE, combines and injections stay per session;
+HC, router and shared expert per chunk (their per-layer weights are re-read from the MALL). It applies to the
+command-line cohort and to `--http-batch` alike. See [docs/multi-request-cohort.md](docs/multi-request-cohort.md).
+
+Why: an independent request shares few experts with another (on six prompts' route logs the union of N requests'
+windows is 72-95 % of their separate expert bytes), so the gain of fusing is the fixed weights read once per cycle
+instead of once per cohort window, plus the cross-request expert overlap; it only exists where a cycle needed more
+than one cohort window. Alternatives measured and not taken as defaults: more rows per request at the same
+budget (4 rows each at four requests: 62 tok/s against 71.5; 8 each at two: 52 against 60, the extra drafts are
+rarely accepted), and the wide inject launch (`inject`, opt-in: 16-row steps 161 ms against 147.5 ms without it).
+The FP32 Q8 wide projection forms were found not to keep the per-row bits of the 1..8-row forms (a GDN cohort
+fixture differed at row 8), so the wide GDN and QSA steps require dense A8. Status: opt-in.
+
+| Check | Result |
+| --- | --- |
+| `strix-hip-gdn-deferred-window-tests`: cohorts of up to 8 sessions and 10-32 rows (dense A8) against each session's own window | 588 scenarios bit-exact (outputs, workspaces, matrix, conv history); totals > 8 without dense A8 rejected |
+| `strix-hip-known-window-tests`: QSA cohorts of 2-8 sessions at mixed positions (10-32 rows dense A8), LM head rows 9-32 from several arenas against R1, inject cohorts of 2/4-row segments | Bit-exact |
+| `strix-hip-moe-known-rows-tests 12/16/17/24/32 1 a8q51/a8q80/a8q5k`: unions over several arenas against the serial A8 rows, experts shared by up to all rows | Whole arena identical |
+| Command line (code1k + prose1k, es2, en2, p43, esprose, frprose, enconv), N = 2, 4, 6, 8, budgets 16 and 32, wide sets, every request against its sequential run | Identical, replay error 0 |
+| Server `--http-batch 8`, eight concurrent short requests, fused against unfused | Token IDs identical (8 of 8) |
+
+Single smoke runs, not a campaign (dense A8, windows 2/4/8, 256 tokens per request, same binary): six requests
+62.2 tok/s aggregate as two cohort windows per cycle against 77.7 fused (12 rows); eight 74.3 against 85.2 (16 rows,
+`gdn,qsa,head,moe`); sequential 44.9 and 44.3. The server took 42.9 s for eight concurrent short requests fused
+(with the wide inject) against 46.9 s.
+
+## D-053: split prefill profile on the tiled MTP prompt (server, batched slots)
+
+The tiled MTP prompt, the route of `--http-serve`, `--http-batch` and cohort requests on the tiled prompt, now
+admits a split pair (D-033), in particular the fast prefill profile with the dense-A8 decode profile. Its complete
+blocks and tail blocks run the prefill profile: each block backend hands the session to the sibling prefill
+execution and back, as on the tiled route. The calibration rows, the serial suffix, MTP replay, drafts, windows and
+generated rows run the decode profile. The target producer never holds a prompt execution (`adopt_prefill_row`
+requires that). When a block ends at the last prompt row, the target adopts that row on the decode execution. The
+calibration rows are serial decode rows, so their golden records the decode profile for both phases: the
+single-profile golden of the decode profile is the same file. Every batched slot builds its own sibling scratch
+view, prefill owners (prefill launcher configuration over its own state, PLE and launchers; the prefill arenas stay
+shared) and handoffs. The setup's UMA growth estimate counts each slot's copy of the plan metadata (285.8 MB at
+T = 8192). See [docs/prefill-numerical-profile.md](docs/prefill-numerical-profile.md) and
+[docs/serving.md](docs/serving.md).
+
+Why: the server read prompts with the dense profile (about 650-830 tok/s), while the fast profile reads them at
+about 850-1000 tok/s on the same tiled route. Alternative: the serial MTP prompt's split (every prompt row on the
+prefill execution); not taken, because its serial rows keep the decode kernels and the server's prompt is tiled.
+Status: opt-in (`--prefill-numerical-profile`); decoding is exact from the state the blocks produce, not equal to
+the dense prefill's tokens.
+
+| Check (fast prefill, distillG min-p 0.7 unless noted, 64 tokens) | Result |
+| --- | --- |
+| Tiled MTP route against serial greedy decode from the same blocks: 9000 tokens (block + 5 tails + 8 serial rows), 8700 tokens (7 tails, 12 serial), 8192 tokens (terminal block adopted) | Identical; replay error 0 |
+| Windows R2 only, R4 only, R8 only, 2/4/8 adaptive; base draft at min-p 0.85; draft depth 1 | Identical |
+| Calibration golden dumped under the split pair against the decode profile's | Byte-identical |
+| Dense profile on this branch against main 61ec1da | Identical |
+| Server, one request at a time: against the command line; repeated prompts; prefix state cache cold/warm (host, and disk across two processes, 8192 tokens restored) | Identical |
+| Server `--http-batch 4`: four concurrent requests (and two pairs of equal prompts), with and without the shared prefix cache | Every request returns its solo tokens |
+
+Single smoke pass, not a campaign (cluster1, server, one request each, 256 tokens): prompt time 8K prose 12.3 s
+dense (T = 2048) against 9.2 s fast (T = 8192), 32K code 50.7 s against 38.5 s, 32K prose 51.2 s against 38.6 s;
+end to end 18.1 against 15.0 s and about 56-57 against 44-45 s. Tail blocks (1024,256,64,16) did not help these
+prompts.
+
+## D-054: prompt groups, several requests' prompt blocks in one segmented prefill (`STRIX_PROMPT_BATCH`, opt-in)
+
+On the batched tiled MTP route (`--http-batch`, cohort requests with interleaved admission) a prompt step may run the
+next tiled blocks (T-row or tail blocks) of several running prompts together: the oldest prompt's block and then
+the others', oldest first, within a row budget (the T-row owner's rows, or `STRIX_PROMPT_BATCH_ROWS`; above T a
+dedicated group owner of that many rows). The group is one segmented prefill over consecutive rows of one arena
+(`execute_known_prefix_prefill_segments_eager`): the steps whose per-row arithmetic depends only on the row's input
+and the weights (HC, router, routed expert union, inject and combine; `STRIX_PROMPT_BATCH_SHARED`) run once for every
+segment's rows, and every other step (GDN, QSA, PLE, shared expert, row loops, the terminal head) runs per segment
+exactly as the segment's block alone. Each request keeps its own unit sequence, state, PLE history, predictor rows,
+terminal logits and lineage (the producer of its own block of that size). Serial units and lone blocks run alone;
+decode cycles stay separate. See [docs/prompt-batch.md](docs/prompt-batch.md).
+
+Why: with concurrent requests the server ran their prompts one block at a time, re-reading every routed expert per
+block; the union of several blocks reads each expert once. Alternatives not taken: concatenating the prompts as one
+sequence (wrong causal state), sharing the GDN/QSA dense projections across segments (exact only for the dense A8
+forms, and at most one 256-row launch's weights per segment, small next to the expert union), fusing prefill with
+the decode window (a later phase). Status: opt-in.
+
+| Check | Result |
+| --- | --- |
+| `strix-compiled-speculative-verify-tests`: three sessions (16/32/24 rows, different start positions) as one segmented block against each block alone, shared and per-segment steps, terminal-row and state-only | State words, generations, positions, heads, lineage and observed rows identical; admission faults change nothing, a dispatch fault poisons every segment once |
+| Server `--http-batch 8`, dense A8, T = 2048 + tails 1024/256/64/16, code1k/docedit-en/es2/p43, N = 2/4/8 staggered 0.3 s against each alone (same server) | Every request's 32 token IDs identical; 7 groups of 2-5 blocks, up to 1360 rows |
+| Integration (integrate/qwen): cohort requests on the tiled prompt, lockstep N = 4 | Rejected at first ("known prefill routed rows source/position/owner differs"): the positional request's tiled owners hold the state layout object of the main resources, the further requests' stacks another copy of the same layout. The segmented prefill now gives every segment the lead's layout object, as it already did for the manifest, weights and access plan (the identities are checked equal). Dense, fast prefill profile and a 8192-row group owner then run; fixture: further sessions with their own layout copy |
+
+## D-055: decode defaults from the final campaign (draft profiles, min-p by draft, n-gram auto)
+
+`include/strix/mtp_draft_profiles.hpp` registers the qualified MTP draft sidecars (`base`, `distill-d`,
+`distill-g`) by SHA-256 with their identity and provenance pins and their best draft early-stop probability.
+`--mtp-draft-profile NAME` fills those pins (only the local path stays explicit; a disagreeing pin is an
+error). Without `--mtp-spec-min-p`, a run with a window row set takes the profiled draft's min-p: 0.85 for the
+base draft (D-022), 0.7 for the distilled drafts; an unprofiled sidecar keeps 0.5. `--mtp-ngram-draft` becomes
+`on|off|auto`, default `auto`: on wherever it is admissible (greedy, one request, prefix windows, the D-022
+controller), including each `--http-serve` request (`"ngram_draft"` request field); its learned per-request gate
+opens only when the output copies the context. See [docs/decode-defaults.md](docs/decode-defaults.md).
+
+Why: the final campaign (same binary and node, 8 workloads, 256 tokens) measured distillG at min-p 0.7 at +10.0 %
+decode over the base draft at 0.85 (geometric mean; English/Spanish prose +14-15 %), distillD at 0.7 +8.2 %, and
+the n-gram extension +5.8 % / +7.7 % on document correction (English / Spanish) and neutral elsewhere (its gate
+stays closed). Each default only changes the proposed drafts and the window choice; the target verifies every
+token.
+
+Checked: the options contract (min-p by identity, profile pins, n-gram modes and where `auto` stays off); the
+default command against the explicit switches, 64 tokens each, replay error 0 everywhere: distillG by profile
+without `--mtp-spec-min-p` vs the explicit pins and 0.7 (code prompt: tokens and schedule identical, 16 cycles,
+47/76 accepted); document correction on the tiled route, `auto` vs explicit `on` vs `off` (tokens and schedule
+identical); English chat on the serial route, `auto` vs `off` (identical); the server on the document-correction
+prompt by default, with `"ngram_draft": false` and `true`: the command line's 64 tokens in all three.
+
+## D-056: tail blocks of the tiled prefill by default (`--known-prefix-tail-rows`)
+
+With full rows and an output head, the tiled prefill now takes the tail sizes 1024, 256, 64 and 16 that are below T
+when `--known-prefix-tail-rows` is not given; `--known-prefix-tail-rows none` keeps the old behaviour. The remainder
+after the last complete T-row block, and the whole prompt when it is shorter than T, then runs as tail blocks, the
+largest that fits first, and only the last fewer than 16 rows run serially.
+
+Why: the server runs a fixed T (2048, or 8192 with the fast prefill profile). Without tails a 1K prompt never fills a
+block and ran all 1024 rows serially: about 45 s on cluster node 1, against about 1.5 s as a tail block (found by the
+integrated measurement of cohort requests, whose 1K members' prompts took 45 s each). Every tail size compiles its
+own tiled owner, which costs setup time and memory per size; four sizes bound the serial remainder to 15 rows.
+
+Checked: options tests (the default set below T, `none`, an explicit list replaces it, no tails without full rows);
+cohort requests on the tiled prompt (T = 2048; code1k, prose1k and six short prompts, 128 tokens): with the default
+every request's tokens equal those with the explicit `--known-prefix-tail-rows 1024,256,64,16`, along the same route
+(the 1K prompts as one 1024-row tail block, 1.3-1.4 s, against about 45 s as serial rows without tails), replay 0.
 
 ## Measured and rejected
 

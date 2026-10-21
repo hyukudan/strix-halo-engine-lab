@@ -265,8 +265,13 @@ struct ApiService::Impl {
         s.top_p = number_or(body, "top_p", 1.0);
         const auto top_k = number_or(body, "top_k", 0.0);
         s.top_k = top_k > 0.0 ? static_cast<std::uint32_t>(top_k) : 0U;
+        s.min_p = number_or(body, "min_p", 0.0);
         if (const auto* seed = body.find("seed"); seed && seed->is_number()) { s.seed = static_cast<std::uint64_t>(seed->as_int()); s.seeded = true; }
         if (s.temperature < 0.0 || s.temperature > 2.0) throw ApiError(400, "invalid_request_error", "temperature must be in [0, 2]", "temperature");
+        if (engine_samples && s.temperature > 0.0 && (!(s.top_p > 0.0) || s.top_p > 1.0))
+            throw ApiError(400, "invalid_request_error", "top_p must be in (0, 1]", "top_p");
+        if (engine_samples && s.temperature > 0.0 && (s.min_p < 0.0 || s.min_p >= 1.0))
+            throw ApiError(400, "invalid_request_error", "min_p must be in [0, 1)", "min_p");
         if (s.temperature > 0.0 && !engine_samples) {
             if (config.sampling_policy == "reject")
                 throw ApiError(400, "invalid_request_error", "this server decodes greedy only; send temperature 0", "temperature");
@@ -373,12 +378,17 @@ struct ApiService::Impl {
         return out;
     }
 
-    std::shared_ptr<GenerationTicket> submit(std::vector<std::uint32_t> prompt, std::uint32_t max_tokens, const SamplingParameters& sampling) {
+    std::shared_ptr<GenerationTicket> submit(std::vector<std::uint32_t> prompt, std::uint32_t max_tokens, const SamplingParameters& sampling,
+        const Json& body) {
         GenerationJob job;
         job.prompt = std::move(prompt);
         job.max_tokens = max_tokens;
         job.stop_tokens = config.stop_tokens;
         job.sampling = sampling;
+        if (const auto* ngram = body.find("ngram_draft"); ngram && !ngram->is_null()) {
+            if (!ngram->is_bool()) throw ApiError(400, "invalid_request_error", "ngram_draft must be a boolean", "ngram_draft");
+            job.ngram_draft = ngram->as_bool();
+        }
         auto ticket = queue.submit(std::move(job));
         if (!ticket) throw ApiError(429, "rate_limit_error", "the request queue is full");
         return ticket;
@@ -411,6 +421,8 @@ struct ApiService::Impl {
         e.set("mtp_cycles", Json(o.stats.cycles));
         e.set("mtp_accepted", Json(o.stats.accepted));
         e.set("mtp_proposed", Json(o.stats.proposed));
+        e.set("ngram_rows", Json(o.stats.ngram_rows));
+        e.set("ngram_accepted", Json(o.stats.ngram_accepted));
         return e;
     }
     static Json tool_calls_json(const Json& calls) {
@@ -439,7 +451,7 @@ struct ApiService::Impl {
         bool include_usage = false;
         if (const auto* options = body.find("stream_options"); options && options->is_object()) include_usage = bool_or(*options, "include_usage", false);
         const auto limit = max_tokens(body, prompt.tokens.size());
-        auto ticket = submit(prompt.tokens, limit, sampling_params);
+        auto ticket = submit(prompt.tokens, limit, sampling_params, body);
         const auto id = random_id("chatcmpl-");
         const auto created = unix_now();
         RecentRequest entry{id, "chat.completions", "ok", created};
@@ -556,7 +568,7 @@ struct ApiService::Impl {
         const auto stops = stop_strings(body.find("stop"));
         const bool stream = bool_or(body, "stream", false);
         const auto limit = max_tokens(body, prompt.size());
-        auto ticket = submit(prompt, limit, sampling_params);
+        auto ticket = submit(prompt, limit, sampling_params, body);
         const auto id = random_id("cmpl-");
         const auto created = unix_now();
         RecentRequest entry{id, "completions", "ok", created};
@@ -673,7 +685,7 @@ struct ApiService::Impl {
         const auto* max = body.find("max_tokens");
         if (!max || !max->is_number()) throw ApiError(400, "invalid_request_error", "max_tokens is required", "max_tokens");
         const auto limit = max_tokens(body, prompt.tokens.size());
-        auto ticket = submit(prompt.tokens, limit, sampling_params);
+        auto ticket = submit(prompt.tokens, limit, sampling_params, body);
         const auto id = random_id("msg_");
         RecentRequest entry{id, "messages", "ok", unix_now()};
         const auto stop_reason = [&](const Outcome& o, bool tools) {

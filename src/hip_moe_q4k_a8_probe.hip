@@ -83,11 +83,14 @@ __global__ void quantize(const void* input, unsigned hidden, signed char* codes,
 // Parallel transcription of the stable CSR: assignment a=r*top_k+s is placed at
 // offsets[e]+#{a'<a with expert e}, i.e. rows then slots ascending per expert.
 // Only defined entries are written. Experts <= 512 <= blockDim. The union holds
-// the first `active` rows; batches keep the physical `rows` cap of the kernels.
+// the first `active` rows; batches keep the physical `rows` cap of the kernels (at most 8:
+// cohort unions of 16 / 32 rows run their down in 8-assignment batches). Histogram
+// buckets saturate at 8.
 __device__ void build_csr(const known_rows::PrologueRows& v, unsigned rows, unsigned active, unsigned experts, unsigned top_k) {
     const auto& csr=v.csr;
     const unsigned t=threadIdx.x,count=active*top_k;
-    __shared__ unsigned expert_of[80],first[80],start[512],scan[3][512],hist[16],failure,duplicates,maximum;
+    __shared__ unsigned expert_of[known_rows::max_assignments],first[known_rows::max_assignments],start[512],scan[3][512],hist[16],failure,duplicates,maximum;
+    const unsigned cap=min(rows,8U);
     if(t==0){failure=0U;duplicates=0U;maximum=0U;}
     if(t<16U)hist[t]=0U;
     __syncthreads();
@@ -101,7 +104,7 @@ __device__ void build_csr(const known_rows::PrologueRows& v, unsigned rows, unsi
     __syncthreads();
     unsigned n=0U,unique=0U;
     if(t<experts)for(unsigned a=0;a<count;++a)if(expert_of[a]==t){++n;unique+=first[a];}
-    const unsigned nb=(n+rows-1U)/rows;
+    const unsigned nb=(n+cap-1U)/cap;
     if(t<512U){scan[0][t]=n;scan[1][t]=n!=0U;scan[2][t]=nb;}
     __syncthreads();
     for(unsigned d=1U;d<512U;d<<=1U) {
@@ -116,8 +119,8 @@ __device__ void build_csr(const known_rows::PrologueRows& v, unsigned rows, unsi
         start[t]=off;csr.offsets[t]=off;
         if(t==experts-1U)csr.offsets[experts]=off+n;
         if(n) {
-            csr.touched[touched]=t;atomicAdd(&hist[unique-1U],1U);atomicAdd(&duplicates,n-unique);atomicMax(&maximum,n);
-            for(unsigned b=0;b<nb;++b){csr.experts[batch+b]=t;csr.begins[batch+b]=off+b*rows;atomicAdd(&hist[8U+min(rows,n-b*rows)-1U],1U);}
+            csr.touched[touched]=t;atomicAdd(&hist[min(unique,8U)-1U],1U);atomicAdd(&duplicates,n-unique);atomicMax(&maximum,n);
+            for(unsigned b=0;b<nb;++b){csr.experts[batch+b]=t;csr.begins[batch+b]=off+b*cap;atomicAdd(&hist[8U+min(cap,n-b*cap)-1U],1U);}
         }
     }
     __syncthreads();
@@ -407,7 +410,7 @@ namespace known_rows {
 void enqueue_prologue(const Request& request,const PrologueRows& rows,unsigned count,unsigned clear_words,hipStream_t stream,
     unsigned active) {
     if(!active) active=count;
-    if(count==0U||count>8U||count*request.shape.top_k>80U||request.shape.experts>512U||active>count)
+    if(count==0U||count>known_rows::max_union_rows||count*request.shape.top_k>known_rows::max_assignments||request.shape.experts>512U||active>count)
         throw std::invalid_argument("A8 window prologue geometry is invalid");
     check(hipPeekAtLastError(),"A8 window prologue stale error");
     if(request.input==InputKind::bf16)window_prologue<true><<<count+1U,1024,0,stream>>>(rows,count,request.shape.hidden,request.shape.top_k,request.shape.experts,clear_words,active);

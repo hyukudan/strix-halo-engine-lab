@@ -222,7 +222,7 @@ inline void run_mtp_cohort_bridge(const Options& options, const ModelContract& m
             << "  \"mtp_cohort_shared_steps\":" << ([] { const char* v = std::getenv("STRIX_COHORT_SHARED"); return !v || v[0] != '0'; }() ? "true" : "false") << ",\n"
             << "  \"mtp_cohort_requests\":" << live.size() << ",\n"
             << "  \"mtp_cohort_windows\":" << stats.cohort_windows << ",\n  \"mtp_cohort_window_sessions\":" << stats.cohort_sessions
-            << ",\n  \"mtp_cohort_window_rows\":" << stats.cohort_rows << ",\n  \"mtp_cohort_solo_windows\":" << stats.solo_windows << ",\n"
+            << ",\n  \"mtp_cohort_window_rows\":" << stats.cohort_rows << ",\n  \"mtp_cohort_solo_windows\":" << stats.solo_windows << ",\n  \"mtp_cohort_chunks\":" << stats.cohort_chunks << ",\n"
             << "  \"mtp_cohort_wall_ms\":" << wall << ",\n  \"mtp_cohort_generated_tokens\":" << total_tokens << ",\n"
             << "  \"mtp_cohort_aggregate_tokens_per_second\":" << (wall > 0.0 ? 1000.0 * static_cast<double>(total_tokens) / wall : 0.0) << ",\n"
             << "  \"mtp_timing_scope\":\"post-prompt-and-independent-replay-cycles-only-host-completed-wall-not-GPU-kernel-time\",\n"

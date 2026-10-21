@@ -99,6 +99,59 @@ void GenerationQueue::run(GenerationEngine& engine, const std::function<void(con
     }
 }
 
+std::optional<TakenJob> GenerationQueue::take(bool wait) {
+    for (;;) {
+        Entry entry;
+        {
+            std::unique_lock lock(mutex_);
+            if (wait) ready_.wait(lock, [&] { return stopping_ || !entries_.empty(); });
+            if (entries_.empty()) return std::nullopt;
+            entry = std::move(entries_.front());
+            entries_.pop_front();
+            --totals_.queued;
+            ++totals_.running;
+            std::uint64_t position = 0;
+            for (auto& waiting : entries_) waiting.ticket->queue_position_.store(++position);
+        }
+        TakenJob taken{std::move(entry.job), entry.ticket, entry.submitted, std::chrono::steady_clock::now()};
+        if (taken.ticket->cancelled()) {
+            GenerationStats stats;
+            stats.finish = "cancelled";
+            finish(taken, std::move(stats));
+            continue;
+        }
+        auto ticket = taken.ticket;
+        taken.job.on_tokens = [ticket](std::span<const std::uint32_t> tokens) { return ticket->publish(tokens); };
+        return taken;
+    }
+}
+
+void GenerationQueue::finish(TakenJob& job, GenerationStats stats, std::string error,
+    const std::function<void(const GenerationStats&)>& observe) {
+    if (job.ticket->cancelled() && error.empty()) stats.finish = "cancelled";
+    stats.queue_ms = std::chrono::duration<double, std::milli>(job.started - job.submitted).count();
+    // Batched jobs overlap: busy time adds each job's own service time.
+    const auto busy = std::chrono::duration<double>(std::chrono::steady_clock::now() - job.started).count();
+    {
+        const std::lock_guard lock(mutex_);
+        --totals_.running;
+        if (!error.empty()) ++totals_.failed;
+        else if (stats.finish == "cancelled") ++totals_.cancelled;
+        else ++totals_.completed;
+        totals_.prompt_tokens += stats.prompt_tokens;
+        totals_.cached_tokens += stats.cached_tokens;
+        totals_.generated_tokens += stats.generated_tokens;
+        totals_.busy_seconds += busy;
+    }
+    if (observe) observe(stats);
+    job.ticket->finish(std::move(stats), std::move(error));
+}
+
+bool GenerationQueue::stopping() const {
+    const std::lock_guard lock(mutex_);
+    return stopping_;
+}
+
 void GenerationQueue::shutdown() {
     std::deque<Entry> dropped;
     {

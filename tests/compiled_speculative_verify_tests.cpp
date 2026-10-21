@@ -618,6 +618,176 @@ void known_prefix_prefill_tests(const strix::ModelContract& model) {
     }
 }
 
+// Full-T mock entry: every row as its R1 row; rows of several sessions (segments) each keep consecutive positions.
+void recording_full_preflight(std::span<const strix::ExecutionDispatchContext> rows,void* opaque) {
+    if(rows.size()<8U || rows.size()%8U) throw std::invalid_argument("mock full rows require 8-row tiles");
+    for(std::size_t r=0;r<rows.size();++r) {
+        recording_window_preflight(rows[r],opaque);
+        const bool start=r==0U || rows[r].session_state_memory!=rows[r-1U].session_state_memory;
+        if(!start && rows[r].position!=rows[r-1U].position+1U) throw std::invalid_argument("mock full rows break a segment's positions");
+        if(!start && rows[r].resources!=rows[r-1U].resources) throw std::invalid_argument("mock full rows mix resources inside a segment");
+    }
+}
+
+// Segmented prefill (several sessions' blocks in one run) against each block alone: per-session state words,
+// generations, positions, terminal head, lineage and observed rows, with shared full-T steps and per-segment steps.
+void known_prefix_prefill_segment_tests(const strix::ModelContract& model) {
+    using P=strix::KnownWindowOutputPolicy;using V=strix::KnownWindowR2Variant;
+    const std::vector<std::uint32_t> sizes{16U,32U,24U};
+    const std::vector<std::uint32_t> lead_in{0U,3U,5U};
+    const auto request_for=[&](std::uint32_t rows,P policy) {
+        strix::KnownPrefillRequest request;request.logical_rows=rows;request.r2_shared_expert=true;request.r2_gdn=true;
+        request.r2_gdn_f32_gates=true;request.output_policy=policy;
+        request.workspace_budget_bytes=UINT64_MAX;request.host_metadata_payload_budget_bytes=UINT64_MAX;
+        return request;
+    };
+    // An observed step with an output, past the middle of the forward.
+    const auto tap_step=[](const strix::CompiledSerialExecution& serial) {
+        auto i=serial.execution.steps.size()/2U;
+        while(i+1U<serial.execution.steps.size() && serial.io.steps[i].writes.empty()) ++i;
+        return i;
+    };
+    const auto block_tokens=[](std::size_t s,std::uint32_t rows) {
+        std::vector<std::uint32_t> tokens(rows);for(std::uint32_t r=0;r<rows;++r) tokens[r]=5U+static_cast<std::uint32_t>(s)*29U+r*7U;
+        return tokens;
+    };
+    for(auto policy:{P::terminal_row,P::state_only}) for(bool shared:{false,true}) {
+        // Reference: each block alone after its own serial lead-in.
+        struct Reference {std::vector<std::uint64_t> state;std::array<std::uint64_t,6> generations{};std::uint64_t position=0,head=0,lineage=0;
+            std::vector<std::uint64_t> observed;};
+        std::vector<Reference> reference(sizes.size());
+        for(std::size_t s=0;s<sizes.size();++s) {
+            KnownRuntimeFixture f(model,true,true);
+            for(std::uint32_t k=0;k<lead_in[s];++k) (void)f.serial_token(3U+k*5U+static_cast<std::uint32_t>(s));
+            const auto plan=strix::compile_known_prefix_prefill(model,f.source.serial,f.source.manifest,f.source.access,request_for(sizes[s],policy));
+            f.window_pool.assign(static_cast<std::size_t>((plan.arena.physical.total_bytes+7U)/8U),0U);
+            f.window_memory={plan.prefill_execution_identity,reinterpret_cast<std::uintptr_t>(f.window_pool.data()),plan.arena.physical.total_bytes,11U};
+            auto source=f.source.serial;source.execution_identity=plan.prefill_execution_identity;source.arena=plan.arena.row_view[0];
+            const auto launch=strix::compile_launch_plan(source,f.registry);
+            const std::array<strix::KnownWindowRowsEntry,2> wide{{{V::shared_q8_virtual256_r8_v1,&f.trace,&recording_rows_preflight,&recording_rows_launch},
+                {V::gdn_q8_rows8_f32_gates_r1_v1,&f.trace,&recording_rows_preflight,&recording_rows_launch}}};
+            const std::array<strix::KnownWindowRowsEntry,1> full{{{V::shared_q8_virtual256_r8_v1,&f.trace,&recording_full_preflight,&recording_rows_launch}}};
+            auto hooks=f.hooks();
+            const auto tap=tap_step(f.source.serial);
+            hooks.after_step=[&](std::size_t step,const std::function<strix::ExecutionDispatchContext(std::uint32_t)>& row) {
+                if(step!=tap) return;
+                for(std::uint32_t r=0;r<sizes[s];++r) reference[s].observed.push_back(read_word(strix::resolve_dispatch_write(row(r),0).address));
+            };
+            const auto tokens=block_tokens(s,sizes[s]);
+            const auto result=strix::execute_known_prefix_prefill_eager(plan,f.source.serial,f.resources,f.window_memory,f.session,tokens,
+                launch,{},wide,hooks,full);
+            reference[s].state=f.state_words;reference[s].generations=f.session.state.generations;reference[s].position=f.session.next_position;
+            reference[s].lineage=f.session.arithmetic_lineage.history_identity;
+            if(policy==P::terminal_row) reference[s].head=read_word(result.logits.at(0).address);
+            expect(result.logits.size()==(policy==P::terminal_row?1U:0U),"solo block maps its terminal head by policy");
+        }
+        // Segmented: one fixture's model and serial plan; sessions 1 and 2 bring their own state memory.
+        KnownRuntimeFixture f(model,true,true);
+        // Each further session also holds its own copy of the state layout (as a cohort's further requests do).
+        struct Extra {std::vector<std::uint64_t> words;strix::SessionStateMemoryBinding memory;strix::ExecutionRuntimeResources resources;
+            strix::SerialSessionContext session;strix::SerialSessionStateLayout layout;};
+        std::vector<Extra> extra(sizes.size()-1U);
+        for(std::size_t e=0;e<extra.size();++e) {
+            auto& x=extra[e];
+            x.words.assign(f.state_words.size(),0U);
+            x.memory=f.state_memory;x.memory.host_base=reinterpret_cast<std::uintptr_t>(x.words.data());x.memory.host_allocation_generation=40U+e;
+            x.resources=f.resources;x.resources.session_state_memory=&x.memory;
+            x.layout=*f.resources.session_state_layout;x.resources.session_state_layout=&x.layout;
+            x.session=f.session;
+            x.session.runtime_compatibility_identity=strix::build_runtime_execution_identities(f.source.serial.execution_identity,
+                f.source.serial.arena,x.resources).compatibility_identity;
+        }
+        const auto session_of=[&](std::size_t s)->strix::SerialSessionContext& {return s?extra[s-1U].session:f.session;};
+        const auto resources_of=[&](std::size_t s)->const strix::ExecutionRuntimeResources& {return s?extra[s-1U].resources:f.resources;};
+        for(std::size_t s=0;s<sizes.size();++s) {
+            strix::DirectLaunchDispatcher dispatcher(f.serial_launch);
+            for(std::uint32_t k=0;k<lead_in[s];++k)
+                (void)strix::execute_serial_token(f.source.serial,session_of(s),resources_of(s),3U+k*5U+static_cast<std::uint32_t>(s),dispatcher);
+        }
+        std::uint32_t total=0;for(auto rows:sizes) total+=rows;
+        const auto plan=strix::compile_known_prefix_prefill(model,f.source.serial,f.source.manifest,f.source.access,request_for(total+8U,policy));
+        f.window_pool.assign(static_cast<std::size_t>((plan.arena.physical.total_bytes+7U)/8U),0U);
+        f.window_memory={plan.prefill_execution_identity,reinterpret_cast<std::uintptr_t>(f.window_pool.data()),plan.arena.physical.total_bytes,12U};
+        auto source=f.source.serial;source.execution_identity=plan.prefill_execution_identity;source.arena=plan.arena.row_view[0];
+        const auto launch=strix::compile_launch_plan(source,f.registry);
+        const std::array<strix::KnownWindowRowsEntry,2> wide{{{V::shared_q8_virtual256_r8_v1,&f.trace,&recording_rows_preflight,&recording_rows_launch},
+                {V::gdn_q8_rows8_f32_gates_r1_v1,&f.trace,&recording_rows_preflight,&recording_rows_launch}}};
+        const std::array<strix::KnownWindowRowsEntry,1> full{{{V::shared_q8_virtual256_r8_v1,&f.trace,&recording_full_preflight,&recording_rows_launch}}};
+        std::vector<std::vector<std::uint32_t>> tokens(sizes.size());
+        std::vector<strix::KnownPrefillSegment> segments(sizes.size());
+        std::vector<strix::CompiledKnownPrefixPrefill> own;
+        for(std::size_t s=0;s<sizes.size();++s)
+            own.push_back(strix::compile_known_prefix_prefill(model,f.source.serial,f.source.manifest,f.source.access,request_for(sizes[s],policy)));
+        for(std::size_t s=0;s<sizes.size();++s) {
+            tokens[s]=block_tokens(s,sizes[s]);
+            segments[s]={&session_of(s),&resources_of(s),tokens[s],policy==P::terminal_row,own[s].prefill_execution_identity,own[s].prefill_kernel_plan_identity};
+        }
+        std::vector<std::vector<std::uint64_t>> observed(sizes.size());
+        const auto tap=tap_step(f.source.serial);
+        strix::KnownPrefillSegmentHooks segment_hooks;
+        std::uint32_t shared_launches=0;
+        if(shared) segment_hooks.shared=[&](std::size_t step) {
+            const bool on=plan.tile8.mode[step]==strix::KnownWindowStepMode::shared_rows;shared_launches+=on;return on;};
+        bool one_layout=true;
+        segment_hooks.after_step=[&](std::size_t step,std::size_t s,const std::function<strix::ExecutionDispatchContext(std::uint32_t)>& row) {
+            one_layout=one_layout&&row(0).session_state_layout==f.resources.session_state_layout;
+            if(step!=tap) return;
+            for(std::uint32_t r=0;r<sizes[s];++r) observed[s].push_back(read_word(strix::resolve_dispatch_write(row(r),0).address));
+        };
+        const auto results=strix::execute_known_prefix_prefill_segments_eager(plan,f.source.serial,f.window_memory,segments,launch,{},wide,
+            f.hooks(),full,segment_hooks);
+        expect(results.size()==sizes.size()&&(!shared||shared_launches>0U),"segmented prefill returns one result per segment");
+        expect(one_layout,"every segment's rows carry the lead's state layout object");
+        for(std::size_t s=0;s<sizes.size();++s) {
+            const auto& session=session_of(s);
+            const auto& words=s?extra[s-1U].words:f.state_words;
+            expect(words==reference[s].state,"segment state words equal its block alone");
+            expect(session.state.generations==reference[s].generations&&session.next_position==reference[s].position&&
+                session.committed_tokens==reference[s].position&&session.health==strix::SerialSessionHealth::ready,
+                "segment publishes exactly its block's positions and state generations");
+            expect(session.arithmetic_lineage.history_identity==reference[s].lineage&&!session.arithmetic_lineage.tainted,
+                "segment lineage records its own block's producer");
+            expect(observed[s]==reference[s].observed,"segment observer sees its own rows as alone");
+            if(policy==P::terminal_row)
+                expect(results[s].logits.size()==1U&&results[s].logit_row_indices[0]==sizes[s]-1U&&read_word(results[s].logits[0].address)==reference[s].head,
+                    "segment terminal head equals its block alone");
+            else expect(results[s].logits.empty(),"state-only segments compute no head");
+        }
+    }
+    {
+        // Admission failures leave every session untouched; a dispatch failure poisons every segment once.
+        for(unsigned fault=0;fault<4;++fault) {
+            KnownRuntimeFixture f(model,true,true);
+            std::vector<std::uint64_t> words(f.state_words.size(),0U);
+            auto memory=f.state_memory;memory.host_base=reinterpret_cast<std::uintptr_t>(words.data());memory.host_allocation_generation=50U;
+            auto resources=f.resources;resources.session_state_memory=&memory;
+            auto other=f.session;
+            other.runtime_compatibility_identity=strix::build_runtime_execution_identities(f.source.serial.execution_identity,
+                f.source.serial.arena,resources).compatibility_identity;
+            const auto plan=strix::compile_known_prefix_prefill(model,f.source.serial,f.source.manifest,f.source.access,request_for(32U,P::terminal_row));
+            f.window_pool.assign(static_cast<std::size_t>((plan.arena.physical.total_bytes+7U)/8U),0U);
+            f.window_memory={plan.prefill_execution_identity,reinterpret_cast<std::uintptr_t>(f.window_pool.data()),plan.arena.physical.total_bytes,13U};
+            auto source=f.source.serial;source.execution_identity=plan.prefill_execution_identity;source.arena=plan.arena.row_view[0];
+            const auto launch=strix::compile_launch_plan(source,f.registry);
+            const std::array<strix::KnownWindowRowsEntry,2> wide{{{V::shared_q8_virtual256_r8_v1,&f.trace,&recording_rows_preflight,&recording_rows_launch},
+                {V::gdn_q8_rows8_f32_gates_r1_v1,&f.trace,&recording_rows_preflight,&recording_rows_launch}}};
+            std::vector<std::uint32_t> a(16U,7U),b(fault==0?24U:16U,9U);
+            if(fault==1) b.back()=static_cast<std::uint32_t>(model.vocab_size);
+            if(fault==3) f.trace.fail_position=3U;
+            std::vector<strix::KnownPrefillSegment> segments{{&f.session,&f.resources,a,true},{fault==2?&f.session:&other,&resources,b,true}};
+            const auto before=f.state_words;
+            bool rejected=false;
+            try {(void)strix::execute_known_prefix_prefill_segments_eager(plan,f.source.serial,f.window_memory,segments,launch,{},wide,f.hooks(),{},{});}
+            catch(const std::exception&) {rejected=true;}
+            expect(rejected,"segmented prefill rejects oversized, out-of-vocabulary, duplicate-session or failing blocks");
+            if(fault==3) expect(f.session.health==strix::SerialSessionHealth::poisoned&&other.health==strix::SerialSessionHealth::poisoned&&
+                f.quiesces==1U&&!f.session.committed_tokens&&!other.committed_tokens,"a dispatch failure poisons every segment and drains once");
+            else expect(f.trace.calls==0U&&f.state_words==before&&f.session.health==strix::SerialSessionHealth::ready&&
+                other.health==strix::SerialSessionHealth::ready,"segmented admission completes before any mutation");
+        }
+    }
+}
+
 void known_window_output_policy_tests(const strix::ModelContract& model) {
     using P=strix::KnownWindowOutputPolicy;
     for(const std::uint32_t rows:{2U,4U,8U}) {
@@ -2068,6 +2238,7 @@ int main() {
     known_window_mixed_format_tests(model);
     known_window_wide_compiler_tests(model);
     known_prefix_prefill_tests(model);
+    known_prefix_prefill_segment_tests(model);
 
     if (failures == 0) {
         std::cout << "compiled speculative verify tests passed\n";

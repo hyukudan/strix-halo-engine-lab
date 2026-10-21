@@ -352,12 +352,26 @@ struct HipMtpRuntime::Impl {
     // Sync-free proposal chain: identical stage launches to run_current per row,
     // except the head/selector and the device-fed next input token.
     // Each draft completes before the next when min_probability > 0 or keep_drafting is set.
+    // The draft chain in phases (chain() runs them in order; a cohort interleaves the phases of several
+    // sessions, each on its own stream): begin, then per step launch and decide, then finish.
+    struct ChainState {
+        std::uint32_t requested=0,depth=0,k=0;float min_probability=0.0F;
+        std::function<bool(std::span<const float>)> keep;
+        bool device_draft=false,stop=false;
+        const std::uint16_t* hidden=nullptr;
+    } cs;
     std::vector<std::uint32_t> chain(std::uint32_t depth,float min_probability,
         const std::function<bool(std::span<const float>)>& keep_drafting) {
+        if(!chain_begin(depth,min_probability,keep_drafting)) return {};
+        while(chain_launch_step() && chain_after_step()) {}
+        return chain_finish();
+    }
+    // False: nothing to draft (depth 0).
+    bool chain_begin(std::uint32_t depth,float min_probability,const std::function<bool(std::span<const float>)>& keep_drafting) {
         require(draft && cycle && cycle_base && !active && !validation && candidates.empty() &&
             depth<=owner->budget().maximum_candidate_depth,"MTP draft chain requires a fresh bounded proposal");
         sampled.clear();
-        if(!depth) return {};
+        if(!depth) return false;
         require(stats.full_forward_rows<=UINT64_MAX-depth && epoch!=UINT64_MAX,"MTP draft chain counters exhausted");
         validation.emplace(owner->admit_native_entry());
         try {
@@ -367,17 +381,28 @@ struct HipMtpRuntime::Impl {
         ++epoch;active=true;
         try {
             void* stream=owner->stream();
-            const auto* hidden=reinterpret_cast<const std::uint16_t*>(owner->view(HipMtpBuffer::hidden0).address);
+            cs=ChainState{};cs.requested=cs.depth=depth;cs.min_probability=min_probability;cs.keep=keep_drafting;
+            cs.hidden=reinterpret_cast<const std::uint16_t*>(owner->view(HipMtpBuffer::hidden0).address);
             copy(owner->view(HipMtpBuffer::wide_current),cycle_base->view());
             draft->begin_chain();
-            const bool device_draft=sampler && device_draft_sampling_enabled(sampler->policy());
-            if(device_draft) {
+            cs.device_draft=sampler && device_draft_sampling_enabled(sampler->policy());
+            if(cs.device_draft) {
                 if(!draft_device) draft_device=std::make_unique<HipTokenDraftSamplerDevice>(draft->capacity(),
                     std::max<std::uint32_t>(owner->budget().maximum_candidate_depth,1U));
                 draft_device->set_vocabulary(draft->host_ids(),draft->stats().rows,stream);
             }
-            const auto requested=depth;
-            for(std::uint32_t k=0;k<requested;++k) {
+            return true;
+        } catch(...) {failure();throw;}
+    }
+    // Enqueues step k; false when the chain has no step left.
+    bool chain_launch_step() {
+        if(cs.stop || cs.k>=cs.requested) return false;
+        try {
+            void* stream=owner->stream();
+            const auto* hidden=cs.hidden;
+            const bool device_draft=cs.device_draft;
+            const auto k=cs.k;
+            {
                 const auto c=context(next_source+k);
                 if(k) launch_hip_mtp_embedding_device(c,draft->device_token(k-1U),stream);
                 else launch_hip_mtp_embedding(c,pending_token,stream);
@@ -412,16 +437,30 @@ struct HipMtpRuntime::Impl {
                         std::chrono::duration<double>(std::chrono::steady_clock::now()-t1).count(),1U);
                     draft->set_token(k,sampled.back().token,stream);
                 }
-                if((min_probability>0.0F || keep_drafting) && k+1U<requested) {
-                    if(!sampler || device_draft) draft->wait_step(k,stream);
-                    if(min_probability>0.0F && draft->probability(k)<min_probability) {depth=k+1U;break;}
-                    if(keep_drafting) {
-                        probabilities.resize(k+1U);runner_ups.resize(k+1U);
-                        for(std::uint32_t j=0;j<=k;++j) {probabilities[j]=draft->probability(j);runner_ups[j]=draft->runner_up_probability(j);}
-                        if(!keep_drafting(probabilities)) {depth=k+1U;break;}
-                    }
+            }
+            return true;
+        } catch(...) {failure();throw;}
+    }
+    // After step k: the minimum-probability / keep test (waits for the step when one applies); false stops.
+    bool chain_after_step() {
+        try {
+            const auto k=cs.k++;
+            if((cs.min_probability>0.0F || cs.keep) && k+1U<cs.requested) {
+                if(!sampler || cs.device_draft) draft->wait_step(k,owner->stream());
+                if(cs.min_probability>0.0F && draft->probability(k)<cs.min_probability) {cs.depth=k+1U;cs.stop=true;return false;}
+                if(cs.keep) {
+                    probabilities.resize(k+1U);runner_ups.resize(k+1U);
+                    for(std::uint32_t j=0;j<=k;++j) {probabilities[j]=draft->probability(j);runner_ups[j]=draft->runner_up_probability(j);}
+                    if(!cs.keep(probabilities)) {cs.depth=k+1U;cs.stop=true;return false;}
                 }
             }
+            return cs.k<cs.requested;
+        } catch(...) {failure();throw;}
+    }
+    std::vector<std::uint32_t> chain_finish() {
+        try {
+            auto depth=cs.depth;
+            const bool device_draft=cs.device_draft;
             owner->complete();
             if(device_draft) {
                 draft_device->finish(*sampler,depth,sampled);
@@ -625,6 +664,17 @@ std::vector<std::uint32_t> HipMtpRuntime::propose_chain(const QualifiedMtpDraftP
     require(p.cycle && p.cycle_base && same_session(target,p.cycle_base->committed_session()),"MTP draft chain does not match its native cycle");
     return p.chain(depth,min_probability,keep_drafting);
 }
+bool HipMtpRuntime::propose_chain_begin(const QualifiedMtpDraftPlan& plan,const ActivatedMtpDraftPlan& activated,
+    const SerialSessionContext& target,const DraftProposalStateContext& proposal,std::uint32_t depth,float min_probability,
+    const std::function<bool(std::span<const float>)>& keep_drafting) {
+    auto& p=*impl_;p.qualification(plan,activated);
+    validate_mtp_draft_proposal_phase(p.owner->binding(),proposal,target,DraftProposalStatePhase::proposal_active);
+    require(p.cycle && p.cycle_base && same_session(target,p.cycle_base->committed_session()),"MTP draft chain does not match its native cycle");
+    return p.chain_begin(depth,min_probability,keep_drafting);
+}
+bool HipMtpRuntime::propose_chain_launch_step() {return impl_->chain_launch_step();}
+bool HipMtpRuntime::propose_chain_after_step() {return impl_->chain_after_step();}
+std::vector<std::uint32_t> HipMtpRuntime::propose_chain_finish() {return impl_->chain_finish();}
 std::span<const float> HipMtpRuntime::draft_probabilities() const noexcept {return impl_->probabilities;}
 void HipMtpRuntime::set_draft_sampler(std::shared_ptr<TokenSampler> sampler) {
     auto& p=*impl_;require(p.draft && sampler && !p.sampler && !p.cycle && !p.active && !p.broken,

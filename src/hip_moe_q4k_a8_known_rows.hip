@@ -21,9 +21,10 @@
 namespace strix::moe_q4k_a8::known_rows {
 namespace {
 struct DeviceRows {
-    const signed char* codes[8]{}; const float* deltas[8]{}; const int* sums[8]{};
-    const unsigned* routes[8]{}; unsigned* status[8]{}; float* output[8]{};
-    signed char* down_codes[8]{}; float* down_deltas[8]{}; int* down_sums[8]{}; float* rawdots[8]{};
+    const signed char* codes[max_union_rows]{}; const float* deltas[max_union_rows]{}; const int* sums[max_union_rows]{};
+    const unsigned* routes[max_union_rows]{}; unsigned* status[max_union_rows]{}; float* output[max_union_rows]{};
+    signed char* down_codes[max_union_rows]{}; float* down_deltas[max_union_rows]{}; int* down_sums[max_union_rows]{};
+    float* rawdots[max_union_rows]{};
 };
 struct DeviceCsr {
     unsigned* summary; unsigned* offsets; unsigned* touched;
@@ -1329,8 +1330,10 @@ bool overlap(DeviceBytes a,DeviceBytes b){return a.address<b.address+b.bytes&&b.
 void range(DeviceBytes v){if(!v.address||!v.bytes||v.bytes>UINTPTR_MAX-v.address)throw std::invalid_argument("A8 CSR gate/up owner range is invalid");}
 struct Prepared {DeviceRows rows;DeviceCsr csr;};
 Prepared prepare(const Request& request,std::span<const Bindings> rows,const q51_known_rows::Workspace& workspace,hipStream_t stream) {
-    if(rows.size()!=2U&&rows.size()!=4U&&rows.size()!=8U)throw std::invalid_argument("A8 CSR gate/up requires R2/R4/R8");
-    if(staged_activation_bytes(static_cast<unsigned>(rows.size()))>65536U)
+    if(rows.size()!=2U&&rows.size()!=4U&&rows.size()!=8U&&(rows.size()<9U||rows.size()>max_union_rows))
+        throw std::invalid_argument("A8 CSR gate/up requires R2/R4/R8 (or a cohort union of 9..32 rows)");
+    // The bound of the all-rows staging form (project_csr); cohort unions run the window kernels only.
+    if(rows.size()<=8U&&staged_activation_bytes(static_cast<unsigned>(rows.size()))>65536U)
         throw std::invalid_argument("A8 CSR gate/up staging exceeds bounded LDS budget");
     const auto layout=q51_known_rows::scratch_layout(static_cast<unsigned>(rows.size()),request.shape.experts,request.shape.top_k);
     const DeviceBytes csr{workspace.memory.arena_base,workspace.memory.arena_bytes};range(csr);
@@ -1339,7 +1342,7 @@ Prepared prepare(const Request& request,std::span<const Bindings> rows,const q51
     if(!stream||stream==hipStreamLegacy||stream==hipStreamPerThread)throw std::invalid_argument("A8 CSR gate/up admits explicit eager streams only");
     hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;check(hipStreamIsCapturing(stream,&capture),"A8 CSR gate/up capture query");
     if(capture!=hipStreamCaptureStatusNone)throw std::invalid_argument("A8 CSR gate/up admits explicit eager streams only");
-    Prepared out;std::array<DeviceBytes,40> writes{};std::array<DeviceBytes,32> reads{};
+    Prepared out;std::array<DeviceBytes,5U*max_union_rows> writes{};std::array<DeviceBytes,4U*max_union_rows> reads{};
     for(unsigned r=0;r<rows.size();++r) {
         const auto& b=rows[r];validate(request,b);
         if(b.gate.address!=rows.front().gate.address||b.gate.bytes!=rows.front().gate.bytes||
@@ -1440,6 +1443,7 @@ void enqueue_window(const Request& request,std::span<const Bindings> rows,const 
 #define STRIX_A8_WINDOW_DOWN(R,Q51) \
     hipLaunchKernelGGL(HIP_KERNEL_NAME(down_window<R,Q51>),down_grid,dim3(256),0,stream,down,p.rows,p.csr, \
         count,request.shape.hidden,request.shape.rows)
+    // Cohort unions of 9..32 rows: the CSR caps batches at 8 assignments, so the 8-row form stages every batch.
     if(window.down_type==7U){if(count==2U){STRIX_A8_WINDOW_DOWN(2U,true);}else if(count==4U){STRIX_A8_WINDOW_DOWN(4U,true);}else{STRIX_A8_WINDOW_DOWN(8U,true);}}
     else {if(count==2U){STRIX_A8_WINDOW_DOWN(2U,false);}else if(count==4U){STRIX_A8_WINDOW_DOWN(4U,false);}else{STRIX_A8_WINDOW_DOWN(8U,false);}}
 #undef STRIX_A8_WINDOW_DOWN

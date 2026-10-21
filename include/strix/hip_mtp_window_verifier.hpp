@@ -44,6 +44,8 @@ struct HipMtpCohortVerifyRequest {
     std::uint32_t budget=0;
     std::span<const std::uint32_t> eos;
     std::uint32_t rows=0;
+    // Sampled decoding: one draft distribution per candidate (empty when the target selects first-max).
+    std::span<const TokenDraft> drafts;
 };
 // One actual closed known-row window per cycle, with retained capture pools per owner.
 // Several prefix owners (distinct 2/4/8 rows over one session) share one deferred
@@ -115,6 +117,11 @@ public:
     // greedy token. Owner cost samples are not taken from cohort cycles. Results in request order.
     [[nodiscard]] static std::vector<HipMtpVerifiedTargetRows> verify_cohort(
         std::span<const HipMtpCohortVerifyRequest> requests,HipKnownPrefixWindow& primary);
+    // The same over chunks of consecutive requests (HipKnownPrefixWindow::execute_mtp_cohort_chunks): chunk c
+    // has chunks[c] requests and runs on primaries[c] (null for a lone request, which runs its own window).
+    [[nodiscard]] static std::vector<HipMtpVerifiedTargetRows> verify_cohort(
+        std::span<const HipMtpCohortVerifyRequest> requests,std::span<HipKnownPrefixWindow* const> primaries,
+        std::span<const std::size_t> chunks);
     // A new session over the same owners after the target state was reset: pending deferred rows
     // of the previous session are dropped. The adaptive window costs and acceptance bins persist.
     void begin_session();

@@ -66,9 +66,21 @@ public:
     std::uint32_t begin_cycle_draft(const HipMtpTargetHiddenTicket& initial_target,
         std::uint32_t maximum_candidates,std::uint32_t token_budget,
         std::span<const std::uint32_t> eos_tokens,bool cost_model);
+    // begin_cycle_draft in phases (HipMtpRuntime::propose_chain_begin and the rest), so that a cohort
+    // enqueues draft step k of every session before waiting for any: draft_begin (same arguments and
+    // result; drafting() false: nothing to draft), then while draft_launch_step() and draft_after_step(),
+    // then draft_end(). Each session's launches, waits and drafts are those of begin_cycle_draft.
+    std::uint32_t draft_begin(const HipMtpTargetHiddenTicket& initial_target,
+        std::uint32_t maximum_candidates,std::uint32_t token_budget,
+        std::span<const std::uint32_t> eos_tokens,bool cost_model);
+    [[nodiscard]] bool draft_launch_step();
+    [[nodiscard]] bool draft_after_step();
+    void draft_end();
     [[nodiscard]] bool drafting() const noexcept;
     [[nodiscard]] std::span<const std::uint32_t> drafted_candidates() const noexcept;
     [[nodiscard]] std::span<const float> drafted_probabilities() const noexcept;
+    // Sampled decoding: the distribution of every drafted candidate (empty when the target selects first-max).
+    [[nodiscard]] std::span<const TokenDraft> drafted_distributions() const noexcept;
     [[nodiscard]] HipMtpGreedyCycleResult finish_cycle(const HipMtpTargetHiddenTicket& initial_target,
         HipMtpVerifiedTargetRows verified,std::uint32_t token_budget,std::span<const std::uint32_t> eos_tokens);
     void fail_cycle() noexcept;
@@ -92,7 +104,7 @@ struct HipMtpGreedyCohortMember {
     std::uint32_t maximum_candidates=0,budget=0;
     std::span<const std::uint32_t> eos;
 };
-struct HipMtpGreedyCohortStats {std::uint64_t cohort_windows=0,cohort_sessions=0,cohort_rows=0,solo_windows=0;};
+struct HipMtpGreedyCohortStats {std::uint64_t cohort_windows=0,cohort_sessions=0,cohort_rows=0,solo_windows=0,cohort_chunks=0;};
 [[nodiscard]] std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(
     std::span<const HipMtpGreedyCohortMember> members,HipMtpGreedyCohortStats* stats=nullptr);
 } // namespace strix
