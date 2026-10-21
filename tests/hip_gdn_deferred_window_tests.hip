@@ -256,7 +256,7 @@ struct CohortSession {
     std::vector<float> state; std::vector<std::uint16_t> history;
 };
 void cohort_scenarios(Fixture& f, unsigned& cases) {
-    std::vector<CohortSession> sessions(4);
+    std::vector<CohortSession> sessions(8);
     Rng rng{991U};
     for (auto& session : sessions) {
         session.state = uniform<float>(state_floats, -0.2F, 0.2F, rng);
@@ -284,12 +284,34 @@ void cohort_scenarios(Fixture& f, unsigned& cases) {
     };
     const auto device = [](Buffer buffer) { return reinterpret_cast<const GdnWindowControl*>(buffer.address); };
     struct Case { std::vector<unsigned> sizes; };
+    // Up to 8 rows (one launch of the 1..8-row forms) and 16 / 32 rows (cohorts of several 8-row chunks:
+    // input and output projections as one 16- or 32-row launch, the recurrence per session); both with the
+    // Q8 and the dense A8 projections.
     const std::vector<Case> shapes{{{2U, 2U}}, {{4U, 4U}}, {{2U, 2U, 2U, 2U}}, {{2U, 2U, 4U}}, {{4U, 2U, 2U}}, {{2U, 6U}},
-        {{1U, 7U}}, {{3U, 5U}}, {{1U, 1U}}, {{8U}}};
+        {{1U, 7U}}, {{3U, 5U}}, {{1U, 1U}}, {{8U}}, {{8U, 8U}}, {{4U, 4U, 4U, 4U}}, {{8U, 4U, 2U, 2U}},
+        {{2U, 2U, 2U, 2U, 2U, 2U, 2U, 2U}}, {{8U, 8U, 8U, 8U}}, {{8U, 4U, 4U, 8U, 2U, 2U, 2U, 2U}},
+        {{4U, 4U, 2U}}, {{8U, 4U, 2U}}, {{8U, 8U, 4U, 2U, 2U}}, {{8U, 8U, 8U, 2U}}};
+    const bool dense_before = f.config.dense_a8_projections;
+    for (const bool dense : {false, true})
     for (const auto& shape : shapes) {
+        unsigned total = 0;
+        for (const auto size : shape.sizes) total += size;
+        if (total > gdn_window_max_rows && !dense) {
+            // Wider cohorts require dense A8: the Q8 FP32 forms are rejected before any launch.
+            f.config.dense_a8_projections = false;
+            std::vector<GdnWindowCohortSegment> segments;
+            for (std::size_t k = 0; k < shape.sizes.size(); ++k)
+                segments.push_back({f.layer(sessions[k].together), f.rows(sessions[k].together, 8U, shape.sizes[k]),
+                    device(sessions[k].control_together)});
+            bool thrown = false;
+            try { gdn_window_cohort_enqueue(segments, f.config, f.owner.stream); } catch (const std::invalid_argument&) { thrown = true; }
+            require(thrown, "GDN cohort of 16 or 32 rows without dense A8 was not rejected");
+            continue;
+        }
+        f.config.dense_a8_projections = dense;
         const auto count = shape.sizes.size();
         for (unsigned variant = 0; variant < 3U; ++variant) {
-            std::string label = "cohort";
+            std::string label = dense ? "cohort dense A8" : "cohort";
             for (const auto size : shape.sizes) label += " " + std::to_string(size);
             label += " variant " + std::to_string(variant);
             std::vector<GdnWindowCohortSegment> segments;
@@ -350,6 +372,7 @@ void cohort_scenarios(Fixture& f, unsigned& cases) {
             ++cases;
         }
     }
+    f.config.dense_a8_projections = dense_before;
     f.owner.guards();
 }
 float elapsed(hipEvent_t start, hipEvent_t stop) { float ms = 0; check(hipEventElapsedTime(&ms, start, stop), "event time"); return ms; }

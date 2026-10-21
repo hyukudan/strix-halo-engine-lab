@@ -174,6 +174,31 @@ int main() {
       only_state.generate_tokens = 0; validate_known_prefill_options(only_state);
       only_state.generate_tokens = 1;
       rejects([&] { validate_known_prefill_options(only_state); }, "T state-only never fabricates terminal logits"); }
+    {   // Default tail blocks (D-056): the sizes below T, unless given or turned off.
+        const auto full = [](std::initializer_list<std::string> extra) {
+            std::vector<std::string> a{"decoder", "m", "1", "--known-prefix-window", "--known-prefix-full-rows",
+                "--known-prefix-workspace-budget-bytes", "4096", "--known-prefix-host-metadata-budget-bytes", "2048",
+                "--known-prefix-uma-budget-bytes", "8192", "--known-prefix-host-headroom-bytes", "0"};
+            a.insert(a.end(), extra.begin(), extra.end());
+            std::vector<char*> argv;
+            for (auto& arg : a) argv.push_back(arg.data());
+            return parse_options(static_cast<int>(argv.size()), argv.data());
+        };
+        using Rows = std::vector<std::uint32_t>;
+        expect(full({"--known-prefix-prefill-rows=2048"}).known_prefix_tail_rows == Rows{1024U, 256U, 64U, 16U},
+            "T = 2048 takes the default tails 1024, 256, 64, 16");
+        expect(full({"--known-prefix-prefill-rows=8192"}).known_prefix_tail_rows == Rows{1024U, 256U, 64U, 16U},
+            "T = 8192 takes the default tails");
+        expect(full({"--known-prefix-prefill-rows=256"}).known_prefix_tail_rows == Rows{64U, 16U}, "only the tails below T");
+        expect(full({"--known-prefix-prefill-rows=16"}).known_prefix_tail_rows.empty(), "T = 16 has no smaller tail");
+        const auto off = full({"--known-prefix-prefill-rows=2048", "--known-prefix-tail-rows", "none"});
+        expect(off.known_prefix_tail_rows.empty() && off.known_prefix_tail_rows_off, "none keeps the remainder serial");
+        expect(full({"--known-prefix-prefill-rows=2048", "--known-prefix-tail-rows", "512,32"}).known_prefix_tail_rows ==
+            Rows{512U, 32U}, "an explicit list replaces the default");
+        rejects([&] { (void)full({"--known-prefix-prefill-rows=2048", "--known-prefix-tail-rows", "none",
+            "--known-prefix-tail-rows", "64"}); }, "tails are given once");
+        expect(tiled.known_prefix_tail_rows.empty(), "no default tails without full rows");
+    }
     auto cohort = parse({"decoder", "m", "--serve-prefix-u32le", "p", "--serve-concurrency", "4",
         "--serve-tensor-cohort-rows=2", "--serve-memory-budget-bytes", "1000000",
         "--serve-request-budget-bytes", "1000", "--serve-headroom-bytes", "0", "--generate", "1"});

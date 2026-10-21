@@ -275,11 +275,117 @@ void HipKnownPromptBackend::set_all_rows_sink(AllRowsSink sink, std::function<vo
     self.all_rows_sink = std::move(sink);
     self.all_rows_drain = std::move(drain);
 }
+std::vector<std::vector<float>> HipKnownPromptBackend::execute_group(HipKnownPromptBackend& group,
+    std::span<const GroupMember> members) {
+    auto& lead = *group.impl_;
+    if (members.empty() || !lead.window->supports_tiled_prefill() || current_hip_launch_context())
+        throw std::invalid_argument("known prompt group requires members and a tiled prefill group owner");
+    std::vector<Impl*> impls(members.size());
+    std::vector<std::uint64_t> committed_before(members.size());
+    std::vector<char> handed(members.size(), 0);
+    std::vector<HipKnownPrefixWindow::PrefillSegmentRequest> requests(members.size());
+    std::vector<std::vector<float>> logits(members.size());
+    bool attempted = false;
+    for (std::size_t m = 0; m < members.size(); ++m) {
+        const auto& member = members[m];
+        if (!member.backend) throw std::invalid_argument("known prompt group member has no backend");
+        auto& self = *member.backend->impl_;
+        impls[m] = &self;
+        for (std::size_t o = 0; o < m; ++o)
+            if (impls[o] == &self || &impls[o]->session == &self.session)
+                throw std::invalid_argument("known prompt group members must be distinct sessions");
+    }
+    try {
+        for (std::size_t m = 0; m < members.size(); ++m) {
+            const auto& member = members[m];
+            auto& self = *impls[m];
+            if (self.failed) throw std::logic_error("known prompt adapter cannot be reused after an exception");
+            self.started = true;
+            self.guard->require_original();
+            const auto rows = self.window->logical_rows();
+            const auto policy = self.window->output_policy();
+            validate_known_window_output_policy(policy);
+            if (!self.window->supports_tiled_prefill() || self.all_rows_sink || policy == KnownWindowOutputPolicy::all_rows ||
+                (member.logits && policy == KnownWindowOutputPolicy::state_only))
+                throw std::invalid_argument("known prompt group members are terminal-row or state-only tiled blocks");
+            auto& session = self.session;
+            committed_before[m] = session.committed_tokens;
+            if (session.health != SerialSessionHealth::ready || session.arithmetic_lineage.tainted ||
+                member.position != session.next_position || member.tokens.size() != rows || rows < 16U || rows > known_prefill_max_rows ||
+                member.position > std::numeric_limits<std::uint64_t>::max() - rows ||
+                committed_before[m] > std::numeric_limits<std::uint64_t>::max() - rows)
+                throw std::invalid_argument("known prompt group block differs from the live eager session");
+            for (const auto token : member.tokens)
+                if (static_cast<std::uint64_t>(token) >= self.vocab_size)
+                    throw std::invalid_argument("known prompt token exceeds vocabulary");
+            if (member.logits) logits[m].resize(static_cast<std::size_t>(self.vocab_size));
+            requests[m] = {self.window.get(), &session, member.tokens, member.logits, member.observer};
+        }
+        for (std::size_t m = 0; m < members.size(); ++m)
+            if (impls[m]->handoff) { hand_off_serial_session(impls[m]->session, impls[m]->handoff->first, impls[m]->handoff->second); handed[m] = 1; }
+        attempted = true;
+        const auto results = lead.window->execute_prefill_segments(requests);
+        for (std::size_t m = 0; m < members.size(); ++m)
+            if (handed[m]) { hand_off_serial_session(impls[m]->session, impls[m]->handoff->second, impls[m]->handoff->first); handed[m] = 0; }
+        for (std::size_t m = 0; m < members.size(); ++m) {
+            auto& self = *impls[m];
+            const auto& result = results[m];
+            const auto rows = static_cast<std::uint32_t>(members[m].tokens.size());
+            if (self.session.health != SerialSessionHealth::ready || self.session.next_position != members[m].position + rows ||
+                self.session.committed_tokens != committed_before[m] + rows || result.logits.size() != result.logit_row_indices.size() ||
+                result.logits.size() != (members[m].logits ? 1U : 0U) || result.omitted_lm_heads != rows - result.logits.size() ||
+                (members[m].logits && result.logit_row_indices[0] != rows - 1U))
+                throw std::logic_error("known prompt group block did not commit its configured causal rows");
+            if (members[m].logits) {
+                // The segment's terminal row lies in the group owner's arena.
+                lead.validate_terminal(result.logits[0]);
+                lead.guard->require_original();
+                check_prompt_copy(hipMemcpy(logits[m].data(), reinterpret_cast<const void*>(result.logits[0].address),
+                    static_cast<std::size_t>(lead.logits_bytes), hipMemcpyDeviceToHost));
+                lead.guard->require_original();
+                validate_serial_decode_engine_logits(logits[m], self.vocab_size);
+            }
+            auto next = self.observed;
+            add_prompt_stat(next.windows, 1U, next.saturated);
+            add_prompt_stat(next.omitted_lm_heads, result.omitted_lm_heads, next.saturated);
+            if (!members[m].logits) add_prompt_stat(next.state_only_windows, 1U, next.saturated);
+            add_prompt_stat(next.completed_input_rows, rows, next.saturated);
+            add_prompt_stat(next.shared_rows_dispatches, result.shared_rows_dispatches, next.saturated);
+            add_prompt_stat(next.gdn_rows_dispatches, result.gdn_rows_dispatches, next.saturated);
+            add_prompt_stat(next.routed_expert_union_dispatches, result.routed_expert_union_dispatches, next.saturated);
+            add_prompt_stat(next.r2_dispatches, result.r2_dispatches, next.saturated);
+            add_prompt_stat(next.row_loop_dispatches, result.row_loop_dispatches, next.saturated);
+            for (std::size_t i = 0; i < next.r2_variant_dispatches.size(); ++i)
+                add_prompt_stat(next.r2_variant_dispatches[i], result.r2_variant_dispatches[i], next.saturated);
+            self.observed = next;
+        }
+        return logits;
+    } catch (...) {
+        for (std::size_t m = 0; m < members.size(); ++m) {
+            auto& self = *impls[m];
+            self.failed = true;
+            auto& session = self.session;
+            if (handed[m] && session.health == SerialSessionHealth::ready && session.execution_identity == self.handoff->second.compiled->execution_identity) {
+                try { hand_off_serial_session(session, self.handoff->second, self.handoff->first); }
+                catch (...) { session.health = SerialSessionHealth::poisoned; session.arithmetic_lineage.tainted = true; }
+            }
+            if (attempted && session.committed_tokens != committed_before[m]) {
+                session.health = SerialSessionHealth::poisoned;
+                session.arithmetic_lineage.tainted = true;
+            }
+        }
+        if (attempted) lead.guard->recover_or_fail_stop();
+        throw;
+    }
+}
 void HipKnownPromptBackend::set_executor_handoff(SessionExecutor decode, SessionExecutor prefill) {
     if (impl_->handoff || impl_->started || impl_->failed || !decode.compiled || !prefill.compiled ||
         !decode.resources || !prefill.resources || !impl_->window->supports_tiled_prefill())
         throw std::invalid_argument("known prompt executor handoff is set once, before any tiled prefill call");
     validate_sibling_serial_executions(*prefill.compiled, *decode.compiled);
     impl_->handoff.emplace(decode, prefill);
+}
+std::uint64_t HipKnownPromptBackend::handoff_prefill_execution_identity() const noexcept {
+    return impl_->handoff ? impl_->handoff->second.compiled->execution_identity : 0U;
 }
 } // namespace strix

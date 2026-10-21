@@ -114,7 +114,39 @@ struct HipMtpWindowVerifier::Impl {
     bool timing_independent=false;
     std::vector<float> sampled_logits;
     std::unique_ptr<MtpMinPWindowController> minp;
-    std::unique_ptr<HipTokenSamplerDevice> device_sampler; // sampling-v1 on the GPU (STRIX_SAMPLE_HOST=1: host)
+    std::unique_ptr<HipTokenSamplerDevice> device_sampler; // sampling-v1 on the GPU (STRIX_SAMPLE_PATH=host: host)
+    // Sampled rows: decided in order from row 0 (the token at `first`) until the first row without a
+    // draft, a rejection, EOS or `n` rows; later rows are never accepted. Spans must outlive the window.
+    HipMtpTargetWindowCapture::RowSelection sampled_selection(std::shared_ptr<TokenSampler> sampler,std::uint64_t first,void* stream,
+        std::uint32_t rows,std::uint32_t n,std::span<const TokenDraft> drafts,std::span<const std::uint32_t> eos) {
+        return [this,sampler=std::move(sampler),first,stream,rows,n,drafts,eos](
+            std::span<const ExecutionBufferAddress> logits,std::span<std::uint32_t> predictions) {
+            const auto vocabulary=target->model().vocab_size;
+            const bool timed=sample_timing_enabled();
+            double readback=0.0;
+            const auto start=std::chrono::steady_clock::now();
+            std::vector<TokenDecision> decisions;
+            if(device_token_sampling_enabled(sampler->policy())) {
+                // Every row on the device at once; the stopping rule of TokenSampler::decide_rows on the results.
+                if(!device_sampler) device_sampler=std::make_unique<HipTokenSamplerDevice>(static_cast<std::uint32_t>(vocabulary),8U);
+                std::vector<DeviceSampleRow> device_rows(n);
+                for(std::uint32_t r=0;r<n;++r) device_rows[r]={logits[r],first+r,r<drafts.size()?&drafts[r]:nullptr};
+                const auto all=device_sampler->decide(*sampler,device_rows,stream);
+                for(std::uint32_t r=0;r<n;++r) {
+                    decisions.push_back(all[r]);sampler->count(all[r]);
+                    if(!device_rows[r].draft || !all[r].accepted || std::find(eos.begin(),eos.end(),all[r].token)!=eos.end()) break;
+                }
+            } else decisions=sampler->decide_rows(n,first,drafts,eos,[&](std::uint32_t r) {
+                const auto t0=std::chrono::steady_clock::now();
+                read_hip_logits_row(logits[r],static_cast<std::uint32_t>(vocabulary),stream,sampled_logits);
+                if(timed) readback+=std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
+                return std::span<const float>(sampled_logits);});
+            if(timed) record_sample_timing(SampleTimingKind::window,rows,readback,
+                std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()-readback,
+                static_cast<std::uint32_t>(decisions.size()));
+            for(std::size_t r=0;r<decisions.size();++r) predictions[r]=decisions[r].token;
+        };
+    }
     Owner* last=nullptr; // owner of the last prefix window; its stream carries the PLE commit
     // Survival controller (STRIX_MTP_CONTROLLER=survival). An option is an owner and its active rows: with
     // STRIX_MTP_ACTIVE_ROWS=1 the R4 owner also verifies 3 active rows and the R8 owner 6 (the rest are
@@ -427,6 +459,12 @@ std::shared_ptr<HipKnownPrefixWindow> HipMtpWindowVerifier::owner_with_rows(std:
 }
 std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::span<const HipMtpCohortVerifyRequest> requests,
     HipKnownPrefixWindow& primary) {
+    HipKnownPrefixWindow* const primaries[]={&primary};
+    const std::size_t chunks[]={requests.size()};
+    return verify_cohort(requests,primaries,chunks);
+}
+std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::span<const HipMtpCohortVerifyRequest> requests,
+    std::span<HipKnownPrefixWindow* const> primaries,std::span<const std::size_t> chunks) {
     require(requests.size()>=2U,"MTP cohort verification requires two or more sessions");
     struct Prepared {
         Impl* impl=nullptr;Impl::Owner* owner=nullptr;
@@ -450,6 +488,11 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
         for(auto token:q.candidates)require(token<vocabulary,"MTP target candidate outside vocabulary");
         for(auto token:q.eos)require(token<vocabulary,"MTP target EOS outside vocabulary");
         require(q.candidates.size()<i.window->logical_rows(),"MTP verifier admits only one closed window per cycle");
+        const auto sampler=i.target->token_sampler();
+        require(sampler?q.drafts.size()==q.candidates.size():q.drafts.empty(),"MTP sampled verification needs one draft distribution per candidate");
+        for(std::size_t k=0;k<q.drafts.size();++k)
+            require(q.drafts[k].token==q.candidates[k] && q.drafts[k].position==session.next_position+1U+k,
+                "MTP sampled draft does not match its candidate");
         const auto pending=initial.predicted_token();
         require(std::find(q.eos.begin(),q.eos.end(),pending)==q.eos.end(),"MTP cohort session has an EOS pending token");
         auto* owner=i.owner_of(q.rows);
@@ -461,7 +504,14 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
         p.inputs.reserve(q.rows);p.inputs.push_back(pending);
         for(std::uint32_t r=1;r<q.rows;++r) p.inputs.push_back(q.candidates[std::min<std::size_t>(r-1U,q.candidates.size()-1U)]);
         members[a]={owner->window.get(),q.session,p.inputs,p.capture};
+        if(sampler) p.capture->set_row_selection(i.sampled_selection(sampler,session.next_position+1U,p.capture->source_stream(),
+            q.rows,std::min(q.rows,q.budget),q.drafts,q.eos));
     }
+    // The selections borrow the requests' spans: never leave them attached past the call.
+    struct ClearSelections {
+        std::vector<Prepared>& p;
+        ~ClearSelections(){for(auto& x:p) if(x.capture) x.capture->set_row_selection({});}
+    } clear_selections{prepared};
     for(auto& p:prepared) {
         // The previous owner's PLE commit runs on its own stream.
         if(p.impl->last && p.impl->last!=p.owner &&
@@ -472,7 +522,7 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
     bool attempted=false;
     try {
         host_phase_mark("4 cohort verify prologue");
-        auto natives=HipKnownPrefixWindow::execute_mtp_cohort(primary,members);
+        auto natives=HipKnownPrefixWindow::execute_mtp_cohort_chunks(primaries,chunks,members);
         host_phase_mark("7 cohort window launch+wait");
         attempted=true;
         std::vector<HipMtpVerifiedTargetRows> out(requests.size());
@@ -506,6 +556,7 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
             i.skip_sample();
             provisional.reset();
             natives[a]={};
+            p.capture->set_row_selection({});
             p.capture.reset();
             i.busy=false;
         }
@@ -609,33 +660,8 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
         i.target->validate_window_capture(*capture);
         // Sampled rows: decided in order from row 0 (the token at next_position + 1) until the first
         // row without a draft, a rejection, EOS or the budget; later rows are never accepted.
-        if(sampler) capture->set_row_selection([&,first=session.next_position+1U,stream=capture->source_stream()](
-            std::span<const ExecutionBufferAddress> logits,std::span<std::uint32_t> predictions) {
-            const bool timed=sample_timing_enabled();
-            double readback=0.0;
-            const auto start=std::chrono::steady_clock::now();
-            std::vector<TokenDecision> decisions;
-            const auto n=std::min(active,budget); // padding rows are never decided
-            if(device_token_sampling_enabled(sampler->policy())) {
-                // Every row on the device at once; the stopping rule of TokenSampler::decide_rows on the results.
-                if(!i.device_sampler) i.device_sampler=std::make_unique<HipTokenSamplerDevice>(static_cast<std::uint32_t>(vocabulary),8U);
-                std::vector<DeviceSampleRow> device_rows(n);
-                for(std::uint32_t r=0;r<n;++r) device_rows[r]={logits[r],first+r,r<drafts.size()?&drafts[r]:nullptr};
-                const auto all=i.device_sampler->decide(*sampler,device_rows,stream);
-                for(std::uint32_t r=0;r<n;++r) {
-                    decisions.push_back(all[r]);sampler->count(all[r]);
-                    if(!device_rows[r].draft || !all[r].accepted || std::find(eos.begin(),eos.end(),all[r].token)!=eos.end()) break;
-                }
-            } else decisions=sampler->decide_rows(n,first,drafts,eos,[&](std::uint32_t r) {
-                const auto t0=std::chrono::steady_clock::now();
-                read_hip_logits_row(logits[r],static_cast<std::uint32_t>(vocabulary),stream,i.sampled_logits);
-                if(timed) readback+=std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count();
-                return std::span<const float>(i.sampled_logits);});
-            if(timed) record_sample_timing(SampleTimingKind::window,active,readback,
-                std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count()-readback,
-                static_cast<std::uint32_t>(decisions.size()));
-            for(std::size_t r=0;r<decisions.size();++r) predictions[r]=decisions[r].token;
-        });
+        if(sampler) capture->set_row_selection(i.sampled_selection(sampler,session.next_position+1U,capture->source_stream(),
+            active,std::min(active,budget),drafts,eos)); // padding rows are never decided
         else capture->set_row_selection({});
     }
     // The selection borrows this call's locals: never leave it attached past the call.

@@ -6,12 +6,15 @@
 #include <stdexcept>
 
 namespace strix::moe_q4k_a8::known_rows {
+// Rows of one window union: verify windows of 2/4/8 rows, cohort unions of several sessions' windows
+// (16 or 32 rows; down batches of at most 8 assignments).
+inline constexpr unsigned max_union_rows = 32U, max_assignments = max_union_rows * 10U;
 inline constexpr std::string_view organization_identity =
     "a8-csr-gate-up-v1:shared-packed-weights:independent-row-pair4";
 // Source-declared staging arrays only; compiled LDS/register/private usage
 // remains a compiler qualification result. Geometry is bounded before products.
 [[nodiscard]] inline std::uint64_t staged_activation_bytes(std::uint32_t rows) {
-    if(rows!=2U&&rows!=4U&&rows!=8U)throw std::invalid_argument("A8 CSR staging requires R2/R4/R8");
+    if(rows<2U||rows>max_union_rows)throw std::invalid_argument("A8 CSR staging requires 2..32 rows");
     return static_cast<std::uint64_t>(rows)*(max_hidden+2ULL*(max_hidden/32U)*sizeof(std::uint32_t));
 }
 // Per-row Bindings retain the exact R1 views and numerical contract. Quantize
@@ -30,8 +33,8 @@ void enqueue(const Request&, std::span<const Bindings>,
 // Device tables of the window prologue (probe TU, shares the quantizer body).
 struct CsrRows { unsigned *summary{}, *offsets{}, *touched{}, *rows{}, *slots{}, *experts{}, *begins{}; };
 struct PrologueRows {
-    const void* input[8]{}; const unsigned* routes[8]{}; const float* route_weights[8]{};
-    signed char* codes[8]{}; float* deltas[8]{}; int* sums[8]{}; unsigned* status[8]{}; float* clear[8]{};
+    const void* input[max_union_rows]{}; const unsigned* routes[max_union_rows]{}; const float* route_weights[max_union_rows]{};
+    signed char* codes[max_union_rows]{}; float* deltas[max_union_rows]{}; int* sums[max_union_rows]{}; unsigned* status[max_union_rows]{}; float* clear[max_union_rows]{};
     CsrRows csr;
 };
 // One CTA per row zeroes clear[r][0..clear_words) and status, validates routes
@@ -46,10 +49,10 @@ void enqueue_prologue(const Request&, const PrologueRows&, unsigned rows, unsign
 // prologue. down_type 7/8 selects the A8 profile (Q5_1/Q8_0 A8G32 down) and
 // then needs each row's serial down image (codes/deltas/sums) and raw slot dots.
 struct WindowRows {
-    std::array<DeviceBytes, 8> route_weights{}, clear{};
+    std::array<DeviceBytes, max_union_rows> route_weights{}, clear{};
     std::uint32_t down_type = 0;
     DeviceBytes down_weights{};
-    std::array<DeviceBytes, 8> down_codes{}, down_deltas{}, down_sums{}, rawdots{};
+    std::array<DeviceBytes, max_union_rows> down_codes{}, down_deltas{}, down_sums{}, rawdots{};
 };
 // Complete window producer: one prologue launch (rows plus the device CSR
 // build into the workspace: complete stable (row,slot) grouping, so no

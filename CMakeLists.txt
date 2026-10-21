@@ -1992,6 +1992,13 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                         COMMAND strix-hip-moe-known-rows-tests ${rows} 1 ${profile})
                 endforeach()
             endforeach()
+            # Cohort unions of several sessions' 8-row windows (A8 profile).
+            foreach(rows 12 16 24 32)
+                foreach(profile a8q51 a8q80 a8q5k)
+                    add_test(NAME strix-hip-moe-known-rows-${rows}-${profile}
+                        COMMAND strix-hip-moe-known-rows-tests ${rows} 1 ${profile})
+                endforeach()
+            endforeach()
         endif()
 
         add_executable(strix-hip-event-queue-trace-tests tests/hip_event_queue_trace_tests.hip)

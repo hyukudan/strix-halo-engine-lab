@@ -75,9 +75,11 @@ greedy selection. They are described in [sampled-decoding.md](sampled-decoding.m
 
 ### Context n-gram extension of the draft chain
 
-`--mtp-ngram-draft` (off by default; needs `--mtp-draft-chain`, prefix target windows, greedy selection, one
-request (no cohort or HTTP serving) and the D-022 controller, not the survival controller)
-lets the context continue a draft chain that stopped early. The chain keeps its drafts up to the first one
+`--mtp-ngram-draft[=on|off|auto]` lets the context continue a draft chain that stopped early. The default is
+`auto` (D-055): it runs wherever it is admissible (`--mtp-draft-chain`, prefix target windows, greedy
+selection, one request, the D-022 controller; in the HTTP server per request) and stays off elsewhere (sampling,
+cohort requests, golden dumps, the survival controller). `on` (or the bare flag) requires it and rejects the
+command where it cannot run; `off` disables it. A server request can set `"ngram_draft": true|false`. The chain keeps its drafts up to the first one
 below the minimum probability; when the longest suffix (2 to 4 tokens) of prompt + output + kept drafts
 occurred earlier in the context, the tokens that followed it then are appended, up to the draft depth, in
 the same verify window. The target verifies every row, so the output is the greedy output with or without

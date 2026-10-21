@@ -175,7 +175,71 @@ void expert_copy_cli_contract(){
         "the existing explicit-gap low-level fallback is unchanged without an explicit organization selector");
 }
 }
+// D-055: decode defaults from the final campaign. The draft early-stop probability follows the draft's
+// identity, --mtp-draft-profile fills a qualified draft's pins, and the n-gram extension is auto by default.
+void campaign_defaults_contract(){
+    using namespace strix;
+    using namespace strix::decode_cli;
+    MtpCliOptions m;
+    m.window_rows_set={2U,4U,8U};
+    m.sidecar_sha256=std::string(find_mtp_draft_profile("distill-g")->sidecar_sha256);
+    require(mtp_draft_min_probability(m)==0.7F,"distillG defaults to min-p 0.7");
+    m.sidecar_sha256=std::string(find_mtp_draft_profile("distill-d")->sidecar_sha256);
+    require(mtp_draft_min_probability(m)==0.7F,"distillD defaults to min-p 0.7");
+    m.sidecar_sha256=std::string(find_mtp_draft_profile("base")->sidecar_sha256);
+    require(mtp_draft_min_probability(m)==0.85F,"the base draft defaults to min-p 0.85 (D-022)");
+    m.sidecar_sha256=std::string(64,'1');
+    require(mtp_draft_min_probability(m)==0.5F,"an unprofiled draft keeps 0.5");
+    m.spec_min_p=0.6;
+    require(mtp_draft_min_probability(m)==0.6F,"an explicit min-p wins");
+    m.spec_min_p=-1.0;m.window_rows_set.clear();
+    require(mtp_draft_min_probability(m)==0.0F,"a single window does not stop the chain early");
+    require(find_mtp_draft_profile(mtp_recommended_draft_profile)!=nullptr,"the recommended profile exists");
+
+    // --mtp-draft-profile fills the pins that are not given; a given pin must agree.
+    auto args=request();
+    for(const auto* key:{"--mtp-sidecar-logical-name","--mtp-sidecar-sha256","--mtp-source-repository","--mtp-source-revision",
+        "--mtp-source-path","--mtp-converter-revision","--mtp-converter-sha256","--mtp-norm-converter-sha256","--mtp-sidecar-bytes"})
+        erase_option(args,key);
+    reject(args,"a request without the sidecar pins is rejected");
+    args.insert(args.end(),{"--mtp-draft-profile","distill-g"});
+    const auto profiled=parse(args);
+    const auto* g=find_mtp_draft_profile("distill-g");
+    require(profiled.mtp.sidecar_sha256==g->sidecar_sha256 && profiled.mtp.sidecar_logical_name==g->logical_name &&
+        profiled.mtp.repository==g->repository && profiled.mtp.revision==g->revision && profiled.mtp.source_path==g->source_path &&
+        profiled.mtp.converter_revision==g->converter_revision && profiled.mtp.converter_sha256==g->converter_sha256 &&
+        profiled.mtp.norm_converter_sha256==g->norm_converter_sha256 && profiled.mtp.sidecar_bytes==g->sidecar_bytes,
+        "the distill-g profile fills every sidecar pin");
+    auto agree=args;agree.insert(agree.end(),{"--mtp-sidecar-sha256",std::string(g->sidecar_sha256)});
+    (void)parse(agree);
+    auto disagree=args;disagree.insert(disagree.end(),{"--mtp-sidecar-sha256",std::string(64,'1')});
+    reject_as(disagree,"MTP draft profile disagrees with an explicit sidecar pin","a disagreeing pin is rejected");
+    auto unknown=request();unknown.insert(unknown.end(),{"--mtp-draft-profile","other"});
+    reject_as(unknown,"unknown MTP draft profile (base, distill-d, distill-g)","an unknown profile is rejected");
+
+    // --mtp-ngram-draft[=on|off|auto]: auto (the default) runs where admissible.
+    MtpCliOptions n;
+    require(!mtp_ngram_draft_requested(n),"auto without the draft chain and prefix windows does not run");
+    n.draft_chain=true;n.window_rows=8U;n.window_prefix=true;
+    require(mtp_ngram_draft_admissible(n) && mtp_ngram_draft_requested(n),"auto runs with the chain and prefix windows");
+    n.ngram_off=true;require(!mtp_ngram_draft_requested(n),"off disables it");
+    n.ngram_off=false;n.sample_options=true;require(!mtp_ngram_draft_requested(n),"auto stays off when sampling");
+    n.sample_options=false;n.cohort.push_back({});require(!mtp_ngram_draft_requested(n),"auto stays off with cohort requests");
+    n.cohort.clear();n.golden_dump="g";require(!mtp_ngram_draft_requested(n),"auto stays off when dumping a golden");
+    auto mode=request();mode.push_back("--mtp-ngram-draft=off");
+    require(parse(mode).mtp.ngram_off && !parse(mode).mtp.ngram_draft,"=off parses");
+    mode=request();mode.push_back("--mtp-ngram-draft=auto");
+    require(!parse(mode).mtp.ngram_off && !parse(mode).mtp.ngram_draft,"=auto parses");
+    mode=request();mode.push_back("--mtp-ngram-draft=maybe");
+    reject_as(mode,"--mtp-ngram-draft is on, off or auto","an unknown n-gram mode is rejected");
+    mode=request();mode.insert(mode.end(),{"--mtp-ngram-draft=off","--mtp-ngram-draft"});
+    reject(mode,"duplicate n-gram option rejected");
+    mode=request();mode.push_back("--mtp-ngram-draft");
+    reject(mode,"an explicit n-gram draft still requires the chain and prefix windows");
+}
+
 int main(){try{
+    campaign_defaults_contract();
     const auto legacy=parse({"decoder","target.gguf","1"});
     require(!legacy.mtp.enabled&&!legacy.mtp.supplied,"legacy CLI does not select MTP");
     auto good=parse(request());
