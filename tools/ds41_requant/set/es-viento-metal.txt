@@ -1,0 +1,51 @@
+# Instrumento de viento metal
+Los instrumentos de viento metal son instrumentos musicales de viento compuestos por un tubo de metal (generalmente latón), que puede estar doblado o recto, una boquilla y una campana en el extremo opuesto a la boquilla. Aunque estos instrumentos están fabricados en metal, la mayoría de ellos tienen antecesores tomados de la naturaleza, como las caracolas, ramas huecas o cuernos de algunos animales.
+
+Tipos 
+Dentro de la familia de los instrumentos de viento metal existen dos grupos: los instrumentos de taladro cónico y los de taladro cilíndrico. En los primeros, el conducto del aire se ensancha gradualmente desde la embocadura hasta la campana. Estos instrumentos tienen sus antecesores en las caracolas marinas y los cuernos de los animales. Ejemplo de ellos es el shofár, un instrumento judío fabricado con el cuerno de un carnero y que aún es usado en las sinagogas. De los instrumentos modernos utilizados, la trompa, la tuba, el clarín y el fliscorno son sus principales representantes.
+
+En los instrumentos de taladro cilíndrico, el conducto no se ensancha más que en el tudel del principio hasta unos centímetros antes de llegar a la campana y todos los tubos centrales que componen las bombas y los pasos entre los pistones son cilíndricos.
+
+Tienen sus orígenes en conductos sonoros fabricados en madera, bambú o caña que estaban provistos de una embocadura gruesa y abultada con un cuerpo de animal a modo de pabellón. Como representantes modernos de estos instrumentos destacan la trompeta y el trombón. En cualquier caso, los instrumentos actuales de los dos grupos no son cónicos o cilíndricos por completo.
+
+Funcionamiento 
+
+El sonido se produce gracias a la vibración de los labios del intérprete en la parte denominada boquilla a partir de la columna del aire (flujo del aire). La posición de los labios es fundamental a la hora de ejecutar una nota. Cuando la columna de aire atraviesa el tubo, produce una serie de notas llamada serie de armónicos naturales. Se pueden obtener otras notas utilizando válvulas, pistones o varas deslizantes, dependiendo del tipo de instrumento. El sonido de los instrumentos de metal puede alterarse introduciendo en la campana un mecanismo conocido como sordina, consiguiendo un timbre diferente.
+
+Generación del sonido 
+Basados ​​en su fuente primaria de sonido, los instrumentos con boquillas de embudo pertenecen a la familia de las flautas de lengüeta, pero aquí los labios vibrantes del ejecutante unidos a la boquilla forman la flauta de lengüeta, basada en un principio similar al de las lengûetas que golpean. Sin embargo, el método de producción de sonido es muy diferente al de los tubos de lengüeta simples o dobles, aquí la boquilla del embudo también participa en la producción de sonido actuando como un resonador de pequeña cavidad y reaccionando a la vibración de los labios. Otra diferencia importante es la masa de los labios que es más grande que la masa de las cañas vibrantes mencionadas como ejemplo, por lo que el ejecutante puede influir más fácilmente en la resonancia de los tubos, e incluso, si es necesario, puede modificar ligeramente su frecuencia. El músico puede lograr esto cambiando la tensión de sus labios, la cantidad y la velocidad del aire que pasa a través de ellos. La onda estacionaria creada en el tubo afecta la vibración de los labios, la perpetúa y la estabiliza.
+
+Debido a que el músico en un instrumento de viento-metal tiene el control directo sobre el vibrador principal (los labios), estos instrumentos pueden explotar la habilidad del músico para seleccionar el armónico al que la corriente de aire del instrumento vibra. Haciendo que el instrumento sea por lo menos el doble de largo que el equivalente en instrumentos de viento madera y empezando con el segundo armónico, los músicos pueden conseguir un rango de notas muy amplio simplemente variando la tensión de sus labios.
+
+Una diferencia interesante entre los instrumentos viento de metal y de madera es que los instrumentos de viento de madera son no-direccionales. Esto significa que el sonido producido se propaga en todas las direcciones con el mismo volumen aproximado. Los instrumentos de metal, por otra parte, son muy direccionales, con la mayor cantidad del sonido producido viajando directamente desde la campana. Esta diferencia hace que sea significativamente más difícil de grabar de forma precisa a uno de estos instrumentos.
+
+Resonador
+El resonador de los instrumentos con boquillas de embudo es, como la mayoría de los instrumentos de viento, un tubo en cuya columna de aire se crean ondas estacionarias como resultado de la excitación de la boquilla. En el caso más simple, el tubo tiene una sección transversal constante, cilíndrica, o puede expandirse uniformemente, cónica, pero en la mayoría de los casos tiene una forma compleja. Los instrumentos con un orificio predominantemente cilíndrico (trompeta, trombón) también se denominan trompetas, y los instrumentos con un orificio cónico que se ensancha (sofar, cuerno, fliscorno) se denominan cuernos. Debido a la naturaleza del tubo de lengüeta, el tubo puede considerarse acústicamente cerrado por un extremo, por lo que en el caso de un tubo cilíndrico, las partes impares del tono fundamental resuenan únicamente en él, en el caso de un agujero cónico, toda la secuencia armónica.
+
+El resonador de tubería de instrumentos con boquillas de embudo avanzadas se puede dividir en las siguientes cuatro partes:
+
+ la boquilla con su cavidad
+ la sección de tubería en expansión que sigue a la boquilla
+ sección de tubería cilíndrica con una sección transversal constante
+ la parte que se expande como un embudo.
+La proporción de estas partes varía significativamente en diferentes tipos de instrumentos musicales. El característico sonido brillante y metálico de la trompeta se debe a su tubo tradicionalmente estrecho y en gran parte cilíndrico. El funcionamiento telescópico del tubo de empuje del trombón requiere mecánicamente que la mayor parte del resonador del tubo también sea cilíndrico, con una sección transversal constante. Pero en cualquier instrumento equipado con válvulas, incluso si tiene un orificio cónico en forma de cono, las secciones de tubería insertadas por las válvulas deben ser necesariamente de sección transversal constante. De aquí se seguiría el desagradable hecho de que las resonancias de estos instrumentos no corresponden a la secuencia armónica natural, como sería deseable desde el punto de vista musical, ya que un tubo cilíndrico cerrado por un extremo sólo resuena por cada segundo armónico de su fundamental. tono. Afortunadamente, este no es el caso.
+
+Sordina 
+La sordina es una herramienta instrumental; este artefacto se introduce dentro de la campana, sirviendo para cambiar el sonido del instrumento aunque también puede  apagar considerablemente volumen. Dependiendo del instrumento el tamaño de la sordina varía según el tamaño de la campana.
+
+Formas 
+Los instrumentos de campana fundidos en metal o tallados en madera variaron de forma desde el principio, pero los instrumentos martillados a partir de láminas de metal sólo podían tener inicialmente una forma recta. Los romanos conocían la tecnología de doblar silbatos de latón ya en el , pero este conocimiento se olvidó a principios de la Edad Media. La construcción de instrumentos cada vez más largos (especialmente el largo añafil) en forma doblada se originó en el norte de Italia y se hizo común en los siglos XV y XVI. Esta solución permitía que el centro de gravedad del instrumento estuviera más cerca del músico durante su uso y que hiciera falta una fuerza menor para sostenerlo. Por otro lado, un instrumento más "compacto" es menos vulnerable y más fácil de transportar o tocar a lomo de caballo, por ejemplo. Además, la flexión del tubo permitía el uso del doble tubo de corredera y las válvulas. La curvatura no afecta significativamente al sonido del instrumento, pero hay que procurar que sea lo más curvo posible en relación con el diámetro de la tubería.
+
+Las formas más típicas pueden agruparse en las siguientes categorías:
+
+Horizontal 
+
+Tanto la boquilla como la campana son horizontales. La primera variante es la trompeta natural de doble curvatura, que sobrevivió casi sin cambios hasta el . Esta forma se conserva en la trompeta actual, pero también en la corneta y el fliscorno. En raras ocasiones, también se encuentran esta forma en instrumentos más graves como la trompa tenor e incluso la trompa barítono.
+
+Vertical 
+
+La campana mira hacia arriba, con la boquilla perpendicular a ella en posición horizontal. El ophicleid fue el primero en fabricarse con esta forma, y más tarde casi todos los instrumentos de metal de tono grave con una escala rica, la tuba , el eufonio, la trompa barítono, la trompa tenor. También se fabricó una versión de la corneta, para su uso a caballo.
+
+Como una calabaza 
+
+El corno tiene un sistema de tubos especialmente largos doblados, enrollados de forma que la boquilla y la campana están relativamente cerca. De este modo, el ejecutante puede alcanzar

@@ -32,6 +32,8 @@ struct Limits {
     std::uint64_t max_total_array_elements = 100'000'000;
     std::uint32_t max_array_depth = 8;
     std::uint32_t max_tensor_dimensions = 4;
+    // Top-level numeric arrays up to this length keep their values (0: summaries only, the default).
+    std::uint64_t max_retained_array_elements = 0;
 };
 
 struct MetadataEntry {
@@ -44,6 +46,11 @@ struct MetadataEntry {
     std::optional<std::string> string_value;
     std::optional<ValueType> array_element_type;
     std::optional<std::uint64_t> array_length;
+    // Retained top-level numeric array values (see Limits::max_retained_array_elements); exactly one of
+    // these is filled, by element signedness: unsigned/boolean, signed, or float32/float64.
+    std::vector<std::uint64_t> unsigned_array;
+    std::vector<std::int64_t> signed_array;
+    std::vector<double> floating_array;
 };
 
 struct TensorTypeGeometry {

@@ -15,7 +15,7 @@ namespace {
 struct UnicodeRange { std::uint32_t first, last; std::uint8_t flags; };
 #include "unicode_tables.inc"
 
-constexpr std::uint8_t kLetter = 1U, kMark = 2U, kNumber = 4U;
+constexpr std::uint8_t kLetter = 1U, kMark = 2U, kNumber = 4U, kPunctuation = 8U, kSymbol = 16U;
 
 std::uint8_t category(std::uint32_t cp) {
     std::size_t lo = 0, hi = std::size(kUnicodeRanges);
@@ -135,6 +135,107 @@ std::vector<std::pair<std::size_t, std::size_t>> pre_split(const CodePoints& tex
     return pieces;
 }
 
+// The DeepSeek V3/V4 pre-tokenizer (GGUF `joyai-llm` / `deepseek-v3`): a sequence of three isolating splits, each
+// applied to every piece the previous one produced (matches and the text between them are both pieces):
+//   1. \p{N}{1,3}
+//   2. [\x{4E00}-\x{9FA5}\x{3040}-\x{309F}\x{30A0}-\x{30FF}]+
+//   3. [!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*
+//      |\s*[\r\n]+|\s+(?!\S)|\s+
+// In pattern 3 the alternatives are tried in order at each position; a piece's end is its text's end.
+std::vector<std::pair<std::size_t, std::size_t>> pre_split_deepseek(const CodePoints& text) {
+    const auto& c = text.cp;
+    const auto n = c.size();
+    using Range = std::pair<std::size_t, std::size_t>;
+    // isolates the maximal runs (at most `limit` long) of code points with `in`, inside every range of `pieces`
+    const auto isolate = [&](const std::vector<Range>& pieces, const auto& in, std::size_t limit) {
+        std::vector<Range> out;
+        for (const auto& [a, b] : pieces) {
+            std::size_t gap = a, i = a;
+            while (i < b) {
+                if (!in(c[i])) { ++i; continue; }
+                if (gap < i) out.emplace_back(gap, i);
+                std::size_t e = i;
+                while (e < b && e - i < limit && in(c[e])) ++e;
+                out.emplace_back(i, e);
+                i = gap = e;
+            }
+            if (gap < b) out.emplace_back(gap, b);
+        }
+        return out;
+    };
+    std::vector<Range> pieces;
+    if (n != 0U) pieces.emplace_back(0U, n);
+    pieces = isolate(pieces, [](std::uint32_t cp) { return (category(cp) & kNumber) != 0U; }, 3U);
+    pieces = isolate(pieces, [](std::uint32_t cp) {
+        return (cp >= 0x4E00U && cp <= 0x9FA5U) || (cp >= 0x3040U && cp <= 0x309FU) || (cp >= 0x30A0U && cp <= 0x30FFU);
+    }, SIZE_MAX);
+    std::vector<std::pair<std::size_t, std::size_t>> out;
+    for (const auto& [a, b] : pieces) {
+        const auto letter_or_mark = [&](std::size_t k) { return k < b && (category(c[k]) & (kLetter | kMark)) != 0U; };
+        const auto punct_or_symbol = [&](std::size_t k) { return k < b && (category(c[k]) & (kPunctuation | kSymbol)) != 0U; };
+        const auto ws = [&](std::size_t k) { return k < b && white_space(c[k]); };
+        const auto crlf = [&](std::size_t k) { return k < b && (c[k] == '\r' || c[k] == '\n'); };
+        const auto ascii_letter = [&](std::size_t k) { return k < b && ((c[k] >= 'a' && c[k] <= 'z') || (c[k] >= 'A' && c[k] <= 'Z')); };
+        const auto ascii_punct = [&](std::size_t k) {
+            constexpr std::string_view set = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+            return k < b && c[k] < 0x80U && set.find(static_cast<char>(c[k])) != std::string_view::npos;
+        };
+        const auto match = [&](std::size_t i) -> std::size_t {  // end of the match at i, 0 when none
+            // 1. one ASCII punctuation character and ASCII letters
+            if (ascii_punct(i) && ascii_letter(i + 1U)) {
+                std::size_t e = i + 1U;
+                while (ascii_letter(e)) ++e;
+                return e;
+            }
+            // 2. [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
+            if (!crlf(i) && !(category(c[i]) & (kLetter | kPunctuation | kSymbol)) && letter_or_mark(i + 1U)) {
+                std::size_t e = i + 1U;
+                while (letter_or_mark(e)) ++e;
+                return e;
+            }
+            if (letter_or_mark(i)) {
+                std::size_t e = i;
+                while (letter_or_mark(e)) ++e;
+                return e;
+            }
+            // 3.  ?[\p{P}\p{S}]+[\r\n]*
+            std::size_t start = SIZE_MAX;
+            if (c[i] == ' ' && punct_or_symbol(i + 1U)) start = i + 1U;
+            else if (punct_or_symbol(i)) start = i;
+            if (start != SIZE_MAX) {
+                std::size_t e = start;
+                while (punct_or_symbol(e)) ++e;
+                while (crlf(e)) ++e;
+                return e;
+            }
+            // 4-6. whitespace runs
+            if (ws(i)) {
+                std::size_t run = i;
+                while (ws(run)) ++run;
+                std::size_t last_newline = SIZE_MAX;
+                for (std::size_t k = i; k < run; ++k) if (crlf(k)) last_newline = k;
+                if (last_newline != SIZE_MAX) return last_newline + 1U;  // \s*[\r\n]+
+                if (run == b) return run;                               // \s+(?!\S) at the piece end
+                if (run - i >= 2U) return run - 1U;                     // \s+(?!\S) leaves one
+                return run;                                             // \s+
+            }
+            return 0U;
+        };
+        std::size_t gap = a, i = a;
+        while (i < b) {
+            const std::size_t e = match(i);
+            if (e == 0U) { ++i; continue; }
+            if (gap < i) out.emplace_back(text.offset[gap], text.offset[i]);
+            out.emplace_back(text.offset[i], text.offset[e]);
+            i = gap = e;
+        }
+        if (gap < b) out.emplace_back(text.offset[gap], text.offset[b]);
+    }
+    return out;
+}
+
+enum class PreTokenizer { qwen35, deepseek };
+
 std::array<std::string, 256> byte_to_unicode() {
     std::array<std::string, 256> out{};
     std::array<bool, 256> direct{};
@@ -229,9 +330,13 @@ struct BpeTokenizer::Impl {
     std::unordered_map<std::string, std::uint32_t> ids;
     std::unordered_map<std::string, std::uint32_t> ranks;
     std::vector<std::uint32_t> specials; // control and user-defined, longest text first
+    // first bytes at which a special token may start: '<' and '[' (qwen35), every special's first byte (DeepSeek,
+    // whose added tokens such as the DSML markers also start inside text)
+    std::array<bool, 256> special_start{};
     std::array<std::string, 256> byte_unicode = byte_to_unicode();
     std::unordered_map<std::uint32_t, unsigned char> unicode_byte;
     std::string pre;
+    PreTokenizer pre_kind = PreTokenizer::qwen35;
     std::uint32_t eos = UINT32_MAX;
     mutable std::mutex cache_mutex;
     mutable std::unordered_map<std::string, std::vector<std::uint32_t>> cache;
@@ -287,7 +392,8 @@ struct BpeTokenizer::Impl {
     }
     void encode_plain(std::string_view text, std::vector<std::uint32_t>& out) const {
         const auto points = decode_utf8(text);
-        for (const auto& [begin, end] : pre_split(points)) bpe(text.substr(begin, end - begin), out);
+        for (const auto& [begin, end] : pre_kind == PreTokenizer::deepseek ? pre_split_deepseek(points) : pre_split(points))
+            bpe(text.substr(begin, end - begin), out);
     }
 };
 
@@ -296,13 +402,27 @@ BpeTokenizer::~BpeTokenizer() = default;
 
 std::shared_ptr<const BpeTokenizer> BpeTokenizer::from_parts(std::vector<std::string> tokens, std::vector<std::int32_t> types,
     std::span<const std::string> merges, std::string pre) {
-    if (pre != "qwen35") throw std::invalid_argument("tokenizer: only the qwen35 byte-level BPE pre-tokenizer is implemented, not " + pre);
+    const bool deepseek = pre == "joyai-llm" || pre == "deepseek-v3";
+    if (pre != "qwen35" && !deepseek)
+        throw std::invalid_argument("tokenizer: only the qwen35 and DeepSeek V3/V4 (joyai-llm, deepseek-v3) byte-level BPE pre-tokenizers are implemented, not " + pre);
     if (tokens.empty() || types.size() != tokens.size()) throw std::invalid_argument("tokenizer: token and type tables differ");
     std::shared_ptr<BpeTokenizer> out(new BpeTokenizer());
     auto& impl = *out->impl_;
     impl.pre = std::move(pre);
+    impl.pre_kind = deepseek ? PreTokenizer::deepseek : PreTokenizer::qwen35;
     impl.tokens = std::move(tokens);
     impl.types = std::move(types);
+    if (deepseek) {
+        // DeepSeek GGUFs type only the special added tokens as control; the others (<｜User｜>, <think>, the DSML
+        // markers, ...) are typed normal although the reference tokenizer matches every added token as a whole. The
+        // added tokens are the block from the first control token past the byte-level base to the vocabulary's end:
+        // they become user-defined (matched before pre-tokenization, decoded as their text).
+        std::size_t first_added = impl.tokens.size();
+        for (std::size_t i = 256; i < impl.types.size(); ++i)
+            if (static_cast<TokenType>(impl.types[i]) == TokenType::control) { first_added = i; break; }
+        for (std::size_t i = first_added; i < impl.types.size(); ++i)
+            if (static_cast<TokenType>(impl.types[i]) == TokenType::normal) impl.types[i] = static_cast<std::int32_t>(TokenType::user_defined);
+    }
     impl.ids.reserve(impl.tokens.size());
     for (std::size_t i = 0; i < impl.tokens.size(); ++i) {
         impl.ids.emplace(impl.tokens[i], static_cast<std::uint32_t>(i));
@@ -313,6 +433,10 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::from_parts(std::vector<std::st
         [&](auto a, auto b) { return impl.tokens[a].size() > impl.tokens[b].size(); });
     impl.ranks.reserve(merges.size());
     for (std::size_t r = 0; r < merges.size(); ++r) impl.ranks.emplace(merges[r], static_cast<std::uint32_t>(r));
+    impl.special_start['<'] = impl.special_start['['] = true;
+    if (deepseek)
+        for (const auto id : impl.specials)
+            if (!impl.tokens[id].empty()) impl.special_start[static_cast<unsigned char>(impl.tokens[id][0])] = true;
     for (std::size_t b = 0; b < 256U; ++b) {
         const auto points = decode_utf8(impl.byte_unicode[b]);
         impl.unicode_byte.emplace(points.cp.at(0), static_cast<unsigned char>(b));
@@ -334,7 +458,7 @@ std::vector<std::uint32_t> BpeTokenizer::encode(std::string_view text, bool pars
     std::size_t start = 0, i = 0;
     while (i < text.size()) {
         bool matched = false;
-        if (text[i] == '<' || text[i] == '[') {
+        if (impl_->special_start[static_cast<unsigned char>(text[i])]) {
             for (const auto id : impl_->specials) {
                 const auto& s = impl_->tokens[id];
                 if (!s.empty() && text.compare(i, s.size(), s) == 0) {
@@ -393,6 +517,15 @@ std::vector<std::string> BpeTokenizer::pre_tokenize(std::string_view text) {
     std::vector<std::string> out;
     const auto points = decode_utf8(text);
     for (const auto& [begin, end] : pre_split(points)) out.emplace_back(text.substr(begin, end - begin));
+    return out;
+}
+
+std::vector<std::string> BpeTokenizer::pre_tokenize(std::string_view text, std::string_view pre) {
+    if (pre == "qwen35") return pre_tokenize(text);
+    if (pre != "joyai-llm" && pre != "deepseek-v3") throw std::invalid_argument("tokenizer: unknown pre-tokenizer");
+    std::vector<std::string> out;
+    const auto points = decode_utf8(text);
+    for (const auto& [begin, end] : pre_split_deepseek(points)) out.emplace_back(text.substr(begin, end - begin));
     return out;
 }
 

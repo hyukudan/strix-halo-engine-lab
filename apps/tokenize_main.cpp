@@ -2,24 +2,48 @@
 //   strix-tokenize MODEL.gguf encode FILE   token IDs of FILE's bytes (special tokens parsed), comma-separated
 //   strix-tokenize MODEL.gguf plain FILE    same without special-token parsing
 //   strix-tokenize MODEL.gguf decode FILE   text of the comma/space-separated token IDs in FILE
+//   strix-tokenize MODEL.gguf time FILE [K] the tokenizer's load time and the encode time of FILE (special tokens parsed),
+//                                           K runs (default 5): first, min and median, and the token count
 #include "strix/serve/bpe_tokenizer.hpp"
 
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <iterator>
 #include <sstream>
 #include <string>
+#include <vector>
 
 int main(int argc, char** argv) try {
-    if (argc != 4) {
-        std::cerr << "usage: strix-tokenize MODEL.gguf encode|plain|decode FILE\n";
+    const std::string mode = argc > 2 ? argv[2] : "";
+    if (argc != 4 && !(argc == 5 && mode == "time")) {
+        std::cerr << "usage: strix-tokenize MODEL.gguf encode|plain|decode|time FILE [K]\n";
         return 2;
     }
-    const std::string mode = argv[2];
     std::ifstream file(argv[3], std::ios::binary);
     if (!file) throw std::runtime_error(std::string("cannot read ") + argv[3]);
     const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    const auto t_load = std::chrono::steady_clock::now();
     const auto tokenizer = strix::serve::BpeTokenizer::load_gguf(argv[1]);
+    if (mode == "time") {
+        const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+        const double load_ms = ms(std::chrono::steady_clock::now() - t_load);
+        const int runs = argc == 5 ? std::max(1, std::stoi(argv[4])) : 5;
+        std::vector<double> t;
+        std::size_t count = 0;
+        for (int k = 0; k < runs; ++k) {
+            const auto t0 = std::chrono::steady_clock::now();
+            count = tokenizer->encode(text, true).size();
+            t.push_back(ms(std::chrono::steady_clock::now() - t0));
+        }
+        const double first = t.front();
+        std::sort(t.begin(), t.end());
+        std::printf("tokenize: %zu bytes -> %zu tokens; load %.3f ms; encode first %.3f ms, min %.3f ms, median %.3f ms (%d runs)\n", text.size(),
+                    count, load_ms, first, t.front(), t[t.size() / 2U], runs);
+        return 0;
+    }
     if (mode == "encode" || mode == "plain") {
         const auto ids = tokenizer->encode(text, mode == "encode");
         for (std::size_t i = 0; i < ids.size(); ++i) std::cout << (i ? "," : "") << ids[i];

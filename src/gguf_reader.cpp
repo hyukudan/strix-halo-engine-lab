@@ -210,8 +210,30 @@ private:
             output->array_element_type = element_type;
             output->array_length = length;
         }
+        const bool retain = output != nullptr && depth == 0 && length <= limits_.max_retained_array_elements &&
+                            element_type != ValueType::string && element_type != ValueType::array;
+        if (retain) {
+            retain_array(element_type, length, *output);
+            return;
+        }
         for (std::uint64_t index = 0; index < length; ++index) {
             read_value(element_type, nullptr, depth + 1);
+        }
+    }
+
+    void retain_array(ValueType element_type, std::uint64_t length, MetadataEntry& output) {
+        for (std::uint64_t index = 0; index < length; ++index) {
+            MetadataEntry value;
+            read_value(element_type, &value, 1);
+            if (value.unsigned_value.has_value()) {
+                output.unsigned_array.push_back(*value.unsigned_value);
+            } else if (value.signed_value.has_value()) {
+                output.signed_array.push_back(*value.signed_value);
+            } else if (value.floating_value.has_value()) {
+                output.floating_array.push_back(*value.floating_value);
+            } else {
+                output.unsigned_array.push_back(value.boolean_value.value_or(false) ? 1U : 0U);
+            }
         }
     }
 

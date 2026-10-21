@@ -1,0 +1,188 @@
+"""
+Module difflib -- helpers for computing deltas between objects.
+
+Function get_close_matches(word, possibilities, n=3, cutoff=0.6):
+    Use SequenceMatcher to return list of the best "good enough" matches.
+
+Function context_diff(a, b):
+    For two lists of strings, return a delta in context diff format.
+
+Function ndiff(a, b):
+    Return a delta: the difference between `a` and `b` (lists of strings).
+
+Function restore(delta, which):
+    Return one of the two sequences that generated an ndiff delta.
+
+Function unified_diff(a, b):
+    For two lists of strings, return a delta in unified diff format.
+
+Class SequenceMatcher:
+    A flexible class for comparing pairs of sequences of any type.
+
+Class Differ:
+    For producing human-readable deltas from sequences of lines of text.
+
+Class HtmlDiff:
+    For producing HTML side by side comparison with change highlights.
+"""
+
+__all__ = ['get_close_matches', 'ndiff', 'restore', 'SequenceMatcher',
+           'Differ','IS_CHARACTER_JUNK', 'IS_LINE_JUNK', 'context_diff',
+           'unified_diff', 'diff_bytes', 'HtmlDiff', 'Match']
+
+from heapq import nlargest as _nlargest
+from collections import namedtuple as _namedtuple
+from types import GenericAlias
+
+Match = _namedtuple('Match', 'a b size')
+
+def _calculate_ratio(matches, length):
+    if length:
+        return 2.0 * matches / length
+    return 1.0
+
+class SequenceMatcher:
+
+    """
+    SequenceMatcher is a flexible class for comparing pairs of sequences of
+    any type, so long as the sequence elements are hashable.  The basic
+    algorithm predates, and is a little fancier than, an algorithm
+    published in the late 1980's by Ratcliff and Obershelp under the
+    hyperbolic name "gestalt pattern matching".  The basic idea is to find
+    the longest contiguous matching subsequence that contains no "junk"
+    elements (R-O doesn't address junk).  The same idea is then applied
+    recursively to the pieces of the sequences to the left and to the right
+    of the matching subsequence.  This does not yield minimal edit
+    sequences, but does tend to yield matches that "look right" to people.
+
+    SequenceMatcher tries to compute a "human-friendly diff" between two
+    sequences.  Unlike e.g. UNIX(tm) diff, the fundamental notion is the
+    longest *contiguous* & junk-free matching subsequence.  That's what
+    catches peoples' eyes.  The Windows(tm) windiff has another interesting
+    notion, pairing up elements that appear uniquely in each sequence.
+    That, and the method here, appear to yield more intuitive difference
+    reports than does diff.  This method appears to be the least vulnerable
+    to syncing up on blocks of "junk lines", though (like blank lines in
+    ordinary text files, or maybe "<P>" lines in HTML files).  That may be
+    because this is the only method of the 3 that has a *concept* of
+    "junk" <wink>.
+
+    Example, comparing two strings, and considering blanks to be "junk":
+
+    >>> s = SequenceMatcher(lambda x: x == " ",
+    ...                     "private Thread currentThread;",
+    ...                     "private volatile Thread currentThread;")
+    >>>
+
+    .ratio() returns a float in [0, 1], measuring the "similarity" of the
+    sequences.  As a rule of thumb, a .ratio() value over 0.6 means the
+    sequences are close matches:
+
+    >>> print(round(s.ratio(), 2))
+    0.87
+    >>>
+
+    If you're only interested in where the sequences match,
+    .get_matching_blocks() is handy:
+
+    >>> for block in s.get_matching_blocks():
+    ...     print("a[%d] and b[%d] match for %d elements" % block)
+    a[0] and b[0] match for 8 elements
+    a[8] and b[17] match for 21 elements
+    a[29] and b[38] match for 0 elements
+
+    Note that the last tuple returned by .get_matching_blocks() is always a
+    dummy, (len(a), len(b), 0), and this is the only case in which the last
+    tuple element (number of elements matched) is 0.
+
+    If you want to know how to change the first sequence into the second,
+    use .get_opcodes():
+
+    >>> for opcode in s.get_opcodes():
+    ...     print("%6s a[%d:%d] b[%d:%d]" % opcode)
+     equal a[0:8] b[0:8]
+    insert a[8:8] b[8:17]
+     equal a[8:29] b[17:38]
+
+    See the Differ class for a fancy human-friendly file differencer, which
+    uses SequenceMatcher both to compare sequences of lines, and to compare
+    sequences of characters within similar (near-matching) lines.
+
+    See also function get_close_matches() in this module, which shows how
+    simple code building on SequenceMatcher can be used to do useful work.
+
+    Timing:  Basic R-O is cubic time worst case and quadratic time expected
+    case.  SequenceMatcher is quadratic time for the worst case and has
+    expected-case behavior dependent in a complicated way on how many
+    elements the sequences have in common; best case time is linear.
+    """
+
+    def __init__(self, isjunk=None, a='', b='', autojunk=True):
+        """Construct a SequenceMatcher.
+
+        Optional arg isjunk is None (the default), or a one-argument
+        function that takes a sequence element and returns true iff the
+        element is junk.  None is equivalent to passing "lambda x: 0", i.e.
+        no elements are considered to be junk.  For example, pass
+            lambda x: x in " \\t"
+        if you're comparing lines as sequences of characters, and don't
+        want to synch up on blanks or hard tabs.
+
+        Optional arg a is the first of two sequences to be compared.  By
+        default, an empty string.  The elements of a must be hashable.  See
+        also .set_seqs() and .set_seq1().
+
+        Optional arg b is the second of two sequences to be compared.  By
+        default, an empty string.  The elements of b must be hashable. See
+        also .set_seqs() and .set_seq2().
+
+        Optional arg autojunk should be set to False to disable the
+        "automatic junk heuristic" that treats popular elements as junk
+        (see module documentation for more information).
+        """
+
+        # Members:
+        # a
+        #      first sequence
+        # b
+        #      second sequence; differences are computed as "what do
+        #      we need to do to 'a' to change it into 'b'?"
+        # b2j
+        #      for x in b, b2j[x] is a list of the indices (into b)
+        #      at which x appears; junk and popular elements do not appear
+        # fullbcount
+        #      for x in b, fullbcount[x] == the number of times x
+        #      appears in b; only materialized if really needed (used
+        #      only for computing quick_ratio())
+        # matching_blocks
+        #      a list of (i, j, k) triples, where a[i:i+k] == b[j:j+k];
+        #      ascending & non-overlapping in i and in j; terminated by
+        #      a dummy (len(a), len(b), 0) sentinel
+        # opcodes
+        #      a list of (tag, i1, i2, j1, j2) tuples, where tag is
+        #      one of
+        #          'replace'   a[i1:i2] should be replaced by b[j1:j2]
+        #          'delete'    a[i1:i2] should be deleted
+        #          'insert'    b[j1:j2] should be inserted
+        #          'equal'     a[i1:i2] == b[j1:j2]
+        # isjunk
+        #      a user-supplied function taking a sequence element and
+        #      returning true iff the element is "junk" -- this has
+        #      subtle but helpful effects on the algorithm, which I'll
+        #      get around to writing up someday <0.9 wink>.
+        #      DON'T USE!  Only __chain_b uses this.  Use "in self.bjunk".
+        # bjunk
+        #      the items in b for which isjunk is True.
+        # bpopular
+        #      nonjunk items in b treated as junk by the heuristic (if used).
+
+        self.isjunk = isjunk
+        self.a = self.b = None
+        self.autojunk = autojunk
+        self.set_seqs(a, b)
+
+    def set_seqs(self, a, b):
+        """Set the two sequences to be compared.
+
+        >>> s = SequenceMatcher()
+        >>> s

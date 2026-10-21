@@ -1,0 +1,156 @@
+<|im_start|>user
+Resuelve paso a paso los siguientes ejercicios, usando LaTeX para las fórmulas y explicando cada paso en español.
+1. Calcula el límite $\lim_{x \to 0} \frac{e^{x} - 1 - x}{x^2}$.
+2. Resuelve el sistema $2x + 3y - z = 5$, $x - y + 2z = 3$, $3x + y + z = 10$ por el método de Gauss.
+3. Halla la ecuación de la recta tangente a $f(x) = x^3 - 3x + 2$ en $x = 2$ y estudia sus extremos relativos.
+4. En una urna hay 5 bolas rojas y 3 azules. Se extraen dos sin reemplazamiento. Calcula la probabilidad de que sean del mismo color y la de que la segunda sea azul sabiendo que la primera fue roja.
+5. Calcula $\int x^2 e^{x}\,dx$ por partes.
+6. Un capital de 12.000 euros se invierte al 3,5 % de interés compuesto anual. ¿Cuántos años tarda en superar los 15.000 euros?
+7. Demuestra que la suma de los ángulos interiores de un polígono convexo de $n$ lados es $(n-2)\pi$.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+Aquí tienes la resolución detallada y paso a paso de los ejercicios solicitados.
+
+---
+
+### 1. Cálculo del límite $\lim_{x \to 0} \frac{e^{x} - 1 - x}{x^2}$
+
+**Análisis inicial:**
+Sustituimos $x = 0$ en la expresión:
+$$ \frac{e^{0} - 1 - 0}{0^2} = \frac{1 - 1}{0} = \frac{0}{0} $$
+Estamos ante una indeterminación del tipo $\frac{0}{0}$. Podemos resolverlo aplicando la regla de L'Hôpital o mediante desarrollo en serie de Taylor. Usaremos la **regla de L'Hôpital**, que establece que si $\lim_{x \to c} \frac{f(x)}{g(x)}$ es indeterminada, entonces $\lim_{x \to c} \frac{f(x)}{g(x)} = \lim_{x \to c} \frac{f'(x)}{g'(x)}$.
+
+**Paso 1: Primera aplicación de la regla de L'Hôpital**
+Derivamos numerador y denominador respecto a $x$:
+- Numerador: $\frac{d}{dx}(e^x - 1 - x) = e^x - 1$
+- Denominador: $\frac{d}{dx}(x^2) = 2x$
+
+El nuevo límite es:
+$$ \lim_{x \to 0} \frac{e^x - 1}{2x} $$
+Sustituimos $x=0$ nuevamente: $\frac{e^0 - 1}{2(0)} = \frac{1-1}{0} = \frac{0}{0}$. La indeterminación persiste.
+
+**Paso 2: Segunda aplicación de la regla de L'Hôpital**
+Derivamos nuevamente numerador y denominador:
+- Numerador: $\frac{d}{dx}(e^x - 1) = e^x$
+- Denominador: $\frac{d}{dx}(2x) = 2$
+
+El nuevo límite es:
+$$ \lim_{x \to 0} \frac{e^x}{2} $$
+
+**Paso 3: Evaluación final**
+Sustituimos $x = 0$:
+$$ \frac{e^0}{2} = \frac{1}{2} $$
+
+**Resultado:**
+$$ \lim_{x \to 0} \frac{e^{x} - 1 - x}{x^2} = \frac{1}{2} $$
+
+---
+
+### 2. Resolución del sistema por el método de Gauss
+
+El sistema de ecuaciones es:
+$$
+\begin{cases}
+2x + 3y - z = 5 \\
+x - y + 2z = 3 \\
+3x + y + z = 10
+\end{cases}
+$$
+
+Escribimos la matriz ampliada:
+$$
+\left[
+\begin{array}{ccc|c}
+2 & 3 & -1 & 5 \\
+1 & -1 & 2 & 3 \\
+3 & 1 & 1 & 10
+\end{array}
+\right]
+$$
+
+**Paso 1: Obtener un pivote 1 en la posición (1,1)**
+Interchangeamos la fila 1 ($F_1$) y la fila 2 ($F_2$) para tener un 1 en la esquina superior izquierda, lo que facilita los cálculos:
+$$
+\left[
+\begin{array}{ccc|c}
+1 & -1 & 2 & 3 \\
+2 & 3 & -1 & 5 \\
+3 & 1 & 1 & 10
+\end{array}
+\right]
+$$
+
+**Paso 2: Ceros debajo del primer pivote**
+Hacemos ceros en la columna 1 bajo la posición (1,1).
+- $F_2 \to F_2 - 2F_1$
+- $F_3 \to F_3 - 3F_1$
+
+Cálculos para $F_2$:
+$(2, 3, -1, 5) - (2, -2, 4, 6) = (0, 5, -5, -1)$
+
+Cálculos para $F_3$:
+$(3, 1, 1, 10) - (3, -3, 6, 9) = (0, 4, -5, 1)$
+
+La matriz resultante es:
+$$
+\left[
+\begin{array}{ccc|c}
+1 & -1 & 2 & 3 \\
+0 & 5 & -5 & -1 \\
+0 & 4 & -5 & 1
+\end{array}
+\right]
+$$
+
+**Paso 3: Cero debajo del segundo pivote**
+Queremos un cero en la posición (3,2). Podemos hacer $F_3 \to 5F_3 - 4F_2$ para evitar fracciones intermedias, o simplemente dividir $F_2$ por 5. Usaremos la operación directa para mantener precisión entera hasta el final:
+- $F_3 \to 5F_3 - 4F_2$
+
+Cálculos para la nueva $F_3$:
+$5(0, 4, -5, 1) - 4(0, 5, -5, -1)$
+$= (0, 20, -25, 5) - (0, 20, -20, -4)$
+$= (0, 0, -5, 9)$
+
+La matriz escalonada es:
+$$
+\left[
+\begin{array}{ccc|c}
+1 & -1 & 2 & 3 \\
+0 & 5 & -5 & -1 \\
+0 & 0 & -5 & 9
+\end{array}
+\right]
+$$
+
+**Paso 4: Resolución por sustitución hacia atrás**
+De la tercera fila:
+$$ -5z = 9 \implies z = -\frac{9}{5} = -1.8 $$
+
+De la segunda fila:
+$$ 5y - 5z = -1 $$
+Sustituimos $z$:
+$$ 5y - 5(-1.8) = -1 \implies 5y + 9 = -1 \implies 5y = -10 \implies y = -2 $$
+
+De la primera fila:
+$$ x - y + 2z = 3 $$
+Sustituimos $y$ y $z$:
+$$ x - (-2) + 2(-1.8) = 3 $$
+$$ x + 2 - 3.6 = 3 $$
+$$ x - 1.6 = 3 \implies x = 4.6 $$
+(En fracción: $x = 3 + 1.6 = 4.6 = \frac{23}{5}$)
+
+**Solución del sistema:**
+$$ x = \frac{23}{5}, \quad y = -2, \quad z = -\frac{9}{5} $$
+
+---
+
+### 3. Recta tangente y extremos relativos de $f(x) = x^3 - 3x + 2$
+
+**Parte A: Ecuación de la recta tangente en $x = 2$**
+
+La ecuación de la recta tangente en $x=a$ es:
+$$ y - f(a) = f'(a)(x - a) $$
+Aqu
