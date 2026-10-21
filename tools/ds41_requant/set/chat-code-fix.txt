@@ -1,0 +1,264 @@
+<|im_start|>user
+Write a complete Python module implementing a bounded LRU cache with per-entry TTL expiration, a monotonic clock that can be injected for tests, thread safety, statistics (hits, misses, evictions, expirations) and a decorator to memoize functions. Then write a thorough unittest test suite with at least twelve tests, including concurrency tests. After the code, explain the design decisions and the complexity of each operation.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+```python
+"""
+A thread-safe bounded LRU cache with per-entry TTL expiration,
+statistics tracking, and a memoization decorator.
+
+Features:
+- Bounded LRU cache (Least Recently Used eviction)
+- Per-entry TTL (Time-To-Live) with expiration
+- Injectible monotonic clock for testing
+- Thread-safe operations using RLock
+- Statistics: hits, misses, evictions, expirations
+- Memoization decorator for functions
+"""
+
+import threading
+import time
+from collections import OrderedDict
+from functools import wraps
+from typing import Any, Callable, Optional, Tuple
+
+
+class MonotonicClock:
+    """Wrapper around time.monotonic for injectibility in tests."""
+
+    def __call__(self) -> float:
+        return time.monotonic()
+
+
+class LRUCache:
+    """
+    A thread-safe bounded LRU cache with per-entry TTL expiration.
+
+    Parameters:
+    ----------
+    maxsize : int
+        Maximum number of entries in the cache. Must be >= 1.
+    ttl : Optional[float]
+        Default TTL in seconds for entries. If None, entries do not expire.
+    clock : Optional[Callable[[], float]]
+        A callable that returns the current time (e.g., time.monotonic).
+        Injected for testing purposes.
+
+    Attributes:
+    ----------
+    hits : int
+        Number of cache hits (successful lookups).
+    misses : int
+        Number of cache misses (failed lookups).
+    evictions : int
+        Number of entries evicted due to cache size limit.
+    expirations : int
+        Number of entries that were expired and removed upon access or insertion.
+    """
+
+    def __init__(
+        self,
+        maxsize: int,
+        ttl: Optional[float] = None,
+        clock: Optional[Callable[[], float]] = None,
+    ):
+        if maxsize < 1:
+            raise ValueError("maxsize must be >= 1")
+        self.maxsize = maxsize
+        self.ttl = ttl
+        self._clock = clock if clock is not None else MonotonicClock()
+        # OrderedDict preserves insertion order; we use it for LRU behavior
+        # Keys map to (value, expiry_time) where expiry_time is None if no TTL
+        self._cache: OrderedDict[Any, Tuple[Any, Optional[float]]] = OrderedDict()
+        self._lock = threading.RLock()
+        # Statistics counters
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
+        self._expirations = 0
+
+    @property
+    def hits(self) -> int:
+        with self._lock:
+            return self._hits
+
+    @property
+    def misses(self) -> int:
+        with self._lock:
+            return self._misses
+
+    @property
+    def evictions(self) -> int:
+        with self._lock:
+            return self._evictions
+
+    @property
+    def expirations(self) -> int:
+        with self._lock:
+            return self._expirations
+
+    def _is_expired(self, expiry_time: Optional[float], now: float) -> bool:
+        """Check if an entry with the given expiry time has expired."""
+        if expiry_time is None:
+            return False
+        return now >= expiry_time
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        """
+        Retrieve a value from the cache.
+
+        If the key exists and hasn't expired, returns the value and updates
+        LRU order. If the key doesn't exist or has expired, returns default
+        and increments misses counter. Expired entries are removed lazily.
+
+        Parameters:
+        ----------
+        key : Any
+            The cache key to look up.
+        default : Any
+            Value to return if key is not found or expired.
+
+        Returns:
+        -------
+        Any
+            The cached value or default.
+        """
+        with self._lock:
+            now = self._clock()
+            if key not in self._cache:
+                self._misses += 1
+                return default
+
+            value, expiry_time = self._cache[key]
+
+            # Check if expired
+            if self._is_expired(expiry_time, now):
+                # Remove expired entry
+                del self._cache[key]
+                self._expirations += 1
+                self._misses += 1
+                return default
+
+            # Move to end to mark as recently used
+            self._cache.move_to_end(key)
+            self._hits += 1
+            return value
+
+    def put(self, key: Any, value: Any, ttl: Optional[float] = None) -> None:
+        """
+        Insert or update a value in the cache.
+
+        If the cache is at capacity, the least recently used entry is evicted.
+        Expired entries are cleaned up during insertion to maintain accurate stats.
+
+        Parameters:
+        ----------
+        key : Any
+            The cache key.
+        value : Any
+            The value to cache.
+        ttl : Optional[float]
+            Per-entry TTL in seconds. If None, uses the cache's default TTL.
+        """
+        with self._lock:
+            now = self._clock()
+
+            # Determine effective TTL
+            if ttl is not None:
+                expiry_time = now + ttl
+            elif self.ttl is not None:
+                expiry_time = now + self.ttl
+            else:
+                expiry_time = None
+
+            # Check if key already exists
+            if key in self._cache:
+                # Update existing entry
+                self._cache[key] = (value, expiry_time)
+                self._cache.move_to_end(key)
+                return
+
+            # Check if cache is full before adding
+            if len(self._cache) >= self.maxsize:
+                # Evict the least recently used item (first item)
+                evicted_key, _ = self._cache.popitem(last=False)
+                self._evictions += 1
+
+            # Insert new entry at the end (most recently used)
+            self._cache[key] = (value, expiry_time)
+
+    def __contains__(self, key: Any) -> bool:
+        """
+        Check if a key exists in the cache and is not expired.
+
+        Parameters:
+        ----------
+        key : Any
+            The cache key to check.
+
+        Returns:
+        -------
+        bool
+            True if key exists and is valid, False otherwise.
+        """
+        with self._lock:
+            if key not in self._cache:
+                return False
+            now = self._clock()
+            _, expiry_time = self._cache[key]
+            if self._is_expired(expiry_time, now):
+                # Remove expired entry
+                del self._cache[key]
+                self._expirations += 1
+                return False
+            return True
+
+    def __len__(self) -> int:
+        """Return the number of valid (non-expired) entries in the cache."""
+        with self._lock:
+            # We need to clean up expired entries to give accurate count
+            now = self._clock()
+            keys_to_remove = []
+            for key, (_, expiry_time) in self._cache.items():
+                if self._is_expired(expiry_time, now):
+                    keys_to_remove.append(key)
+            for key in keys_to_remove:
+                del self._cache[key]
+                self._expirations += 1
+            return len(self._cache)
+
+    def __repr__(self) -> str:
+        with self._lock:
+            return (
+                f"LRUCache(maxsize={self.maxsize}, ttl={self.ttl}, "
+                f"entries={len(self._cache)}, hits={self._hits}, "
+                f"misses={self._misses}, evictions={self._evictions}, "
+                f"expirations={self._expirations})"
+            )
+
+    def clear(self) -> None:
+        """Remove all entries from the cache and reset statistics."""
+        with self._lock:
+            self._cache.clear()
+            self._hits = 0
+            self._misses = 0
+            self._evictions = 0
+            self._expirations = 0
+
+    def keys(self) -> list:
+        """Return a list of keys currently in the cache (may include expired)."""
+        with self._lock:
+            return list(self._cache.keys())
+
+    def values(self) -> list:
+        """Return a list of values currently in the cache (may include expired)."""
+        with self._lock:
+            return [v for v, _ in self._cache.values()]
+
+    def items(self) -> list:
+        """Return a list of (key, value) pairs currently in the cache."""
+        with self._lock:
+            return [(k,

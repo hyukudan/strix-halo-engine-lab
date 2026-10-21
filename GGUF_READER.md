@@ -20,7 +20,9 @@ Pinned structural source: `ggml-org/ggml@353b63b439f27ab2cc19dac97ab1681ba6d2d08
 - overflow-safe byte/range computation for the current types 0–39, including
   divisibility of the first dimension by the quantization block;
 - rejection of ranges that extend past the file or overlap;
-- array summaries without keeping huge vocabularies/lists in memory;
+- array summaries without keeping huge vocabularies/lists in memory; top-level numeric
+  arrays up to `Limits::max_retained_array_elements` keep their values when a model
+  contract asks for them (default 0: summaries only);
 - `strix-inspect-gguf` JSON CLI.
 
 ## Deliberate limits

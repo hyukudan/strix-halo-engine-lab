@@ -1,0 +1,44 @@
+# North American B-25 Mitchell
+The North American B-25 Mitchell is an American medium bomber that was introduced in 1941 and named in honor of Brigadier General William "Billy" Mitchell, a pioneer of U.S. military aviation. Used by many Allied air forces, the B-25 served in every theater of World War II, and after the war ended, many remained in service, operating across four decades. Produced in numerous variants, nearly 10,000 B-25s were built, It was the most-produced American medium bomber and the third most-produced American bomber overall. These included several limited models such as the F-10 reconnaissance aircraft, the AT-24 crew trainers, and the United States Marine Corps' PBJ-1 patrol bomber.
+
+Design and development
+
+The US Army Air Corps issued a specification for a medium bomber in March 1939 that was capable of carrying a payload of  over  at  North American Aviation (NAA) used its NA-40B design to develop the NA-62, which competed for the medium bomber contract. No YB-25 was available for prototype service tests. In September 1939, the Air Corps ordered the NA-62 into production as the B-25, along with the other new Air Corps medium bomber, the Martin B-26 Marauder "off the drawing board".
+
+Early into B-25 production, NAA incorporated a significant redesign to the wing dihedral. The first nine aircraft had a constant-dihedral, meaning the wing had a consistent, upward angle from the fuselage to the wingtip. This design caused stability problems. "Flattening" the outer wing panels by giving them a slight anhedral angle just outboard of the engine nacelles nullified the problem and gave the B-25 its gull wing configuration. Less noticeable changes during this period included an increase in the size of the tail fins and a decrease in their inward tilt at their tops.
+
+NAA continued design and development in 1940 and 1941. Both the B-25A and B-25B series entered USAAF service. The B-25B was operational in 1942. Combat requirements led to further developments. Before the year was over, NAA was producing the B-25C and B-25D series at different plants. Also in 1942, the manufacturer began design work on the cannon-armed B-25G series. The NA-100 of 1943 and 1944 was an interim armament development at the Kansas City complex known as the B-25D2. Similar armament upgrades by U.S-based commercial modification centers involved about half of the B-25G series. Further development led to the B-25H, B-25J, and B-25J2. The gunship design concept dates to late 1942 and NAA sent a field technical representative to the SWPA. The factory-produced B-25G entered production during the NA-96 order followed by the redesigned B-25H gunship. The B-25J reverted to the bomber role, but it, too, could be outfitted as a strafer.
+
+NAA manufactured the greatest number of aircraft in World War II, the first time a company had produced trainers, bombers, and fighters simultaneously (the AT-6/SNJ Texan/Harvard, B-25 Mitchell, and the P-51 Mustang). It produced B-25s at both its Inglewood main plant and an additional 6,608 aircraft at its Kansas City, Kansas, plant at Fairfax Airport.
+
+After the war, the USAF placed a contract for the TB-25L trainer in 1952. This was a modification program by Hayes of Birmingham, Alabama. Its primary role was reciprocating engine pilot training.
+
+A development of the B-25 was the North American XB-28 Dragon, designed as a high-altitude bomber. Two prototypes were built with the second prototype, the XB-28A, evaluated as a photo-reconnaissance platform, but the aircraft did not enter production.
+
+Flight characteristics 
+The B-25 was a safe and forgiving aircraft to fly. With one engine out, 60° banking turns into the dead engine were possible, and control could be easily maintained down to 145 mph (230 km/h). The pilot had to remember to maintain engine-out directional control at low speeds after takeoff with rudder; if this maneuver were attempted with ailerons, the aircraft could snap out of control. The tricycle landing gear made for excellent visibility while taxiing. The only significant complaint about the B-25 was its extremely noisy engines; as a result, many pilots eventually suffered from some degree of hearing loss.
+
+The high noise level was due to design and space restrictions in the engine cowlings, which resulted in the exhaust "stacks" protruding directly from the cowling ring and partly covered by a small triangular fairing. This arrangement directed exhaust and noise directly at the pilot and crew compartments.
+
+Durability 
+
+The Mitchell was exceptionally sturdy and could withstand tremendous punishment. One B-25C of the 321st Bomb Group was nicknamed "Patches" because its crew chief painted all the aircraft's flak hole patches with bright yellow zinc chromate primer. By the end of the war, this aircraft had completed over 300 missions, had been belly-landed six times, and had over 400 patched holes. The airframe of "Patches" was so distorted from battle damage that straight-and-level flight required 8° of left aileron trim and 6° of right rudder, causing the aircraft to "crab" sideways across the sky.
+
+Operational history
+
+Asia-Pacific 
+Most B-25s in American service were used in the war against Japan in Asia and the Pacific. The Mitchell fought from the Northern Pacific to the South Pacific and the Far East. These areas included the campaigns in the Aleutian Islands, Papua New Guinea, the Solomon Islands, New Britain, China, Burma and the island hopping campaign in the Central Pacific. The aircraft's potential as a ground-attack aircraft emerged during the Pacific war. The jungle environment reduced the usefulness of medium-level bombing, and made low-level attack the best tactic. Using similar mast height level tactics and skip bombing, the B-25 proved itself to be a capable anti-shipping weapon and sank many enemy sea vessels. An ever-increasing number of forward firing guns made the B-25 a formidable strafing aircraft for island warfare. The strafer models were the B-25C1/D1, the B-25J1 and with the NAA strafer nose, the J2 subseries.
+
+In Burma, the B-25 was used to attack Japanese communication links, especially bridges in central Burma. It also helped supply the besieged troops at Imphal in 1944. The China Air Task Force, the Chinese American Composite Wing, the First Air Commando Group, the 341st Bomb Group, and eventually, the relocated 12th Bomb Group, all operated the B-25 in the China Burma India Theater. Many of these missions involved battle-field isolation, interdiction, and close air support.
+
+Later in the war, as the USAAF acquired bases in other parts of the Pacific, the Mitchell could strike targets in Indochina, Formosa, and Kyushu, increasing the usefulness of the B-25. It was also used in some of the shortest raids of the Pacific War, striking from Saipan against Guam and Tinian. The 41st Bomb Group used it against Japanese-occupied islands that had been bypassed by the main campaign, such as the Marshall Islands.
+
+Middle East and Italy 
+The first B-25s arrived in Egypt and were carrying out independent operations by October 1942. Operations there against Axis airfields and motorized vehicle columns supported the ground actions of the Second Battle of El Alamein. Thereafter, the aircraft took part in the rest of the campaign in North Africa, the invasion of Sicily, and the advance up Italy. In the Strait of Messina to the Aegean Sea, the B-25 conducted sea sweeps as part of the coastal air forces. In Italy, the B-25 was used in the ground attack role, concentrating on attacks against road and rail links in Italy, Austria, and the Balkans. The B-25 had a longer range than the Douglas A-20 Havoc and Douglas A-26 Invader, allowing it to reach further into occupied Europe. The five bombardment groups – 20 squadrons – of the Ninth and Twelfth Air Forces that used the B-25 in the Mediterranean Theater of Operations were the only U.S. units to employ the B-25 in Europe.
+
+Europe 
+The RAF received nearly 900 Mitchells, using them to replace Douglas Bostons, Lockheed Venturas, and Vickers Wellington bombers. The Mitchell entered active RAF service on 22 January 1943. At first, it was used to bomb targets in occupied Europe. After the Normandy invasion, the RAF and France used Mitchells in support of the Allies in Europe. Several squadrons moved to forward airbases on the continent. The USAAF used the B-25 in combat in the European theater of operations.
+
+USAAF 
+
+The B-25B found fame as the bomber used in the 18 April 19

@@ -1,0 +1,18 @@
+# Line endings: text files are stored with LF and checked out with LF on every platform, so a commit made
+# from Windows cannot turn a file into CRLF (which makes every later merge a whole-file conflict).
+# Files already committed with CRLF keep their bytes until they are renormalised on purpose
+# (`git add --renormalize <paths>` in a commit of its own).
+* text=auto eol=lf
+
+# Scripts that must keep LF even if a tool rewrites them.
+*.sh text eol=lf
+*.py text eol=lf
+
+# Binary data.
+*.bin binary
+*.gguf binary
+*.o binary
+*.hsaco binary
+*.png binary
+*.jpg binary
+*.pdf binary

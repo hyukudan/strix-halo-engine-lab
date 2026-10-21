@@ -107,6 +107,22 @@ void tokenizer_tests(const char* model) {
     std::string got;
     for (const auto& piece : pieces) got += "[" + piece + "]";
     check(pieces == expected, "pre-tokenizer pieces " + got);
+    // DeepSeek V3/V4 pre-tokenizer: pieces of the reference implementation (tokenizer.json of DeepSeek V4.1)
+    const std::vector<std::pair<std::string, std::vector<std::string>>> deepseek{
+        {"Hello world's 123456  \n\n x\tdon'T 😀!!\n", {"Hello", " world", "'s", " ", "123", "456", "  \n\n", " x", "\tdon", "'T", " 😀!!\n"}},
+        {"x=a.b(c,d); // ünïcödé ÄÖÜ\r\n\r\n  end", {"x", "=a", ".b", "(c", ",d", ");", " //", " ünïcödé", " ÄÖÜ", "\r\n\r\n", " ", " end"}},
+        {"日本語のテキストabc中文12漢字 カタカナ", {"日本語のテキスト", "abc", "中文", "12", "漢字", " ", "カタカナ"}},
+        {"€100 and $5.99, (test) [x] {y} @user #tag",
+         {"€", "100", " and", " $", "5", ".", "99", ",", " (", "test", ")", " [", "x", "]", " {", "y", "}", " @", "user", " #", "tag"}},
+        {"naïve café \xCC\x81" "e \xC2\xA0nbsp", {"naïve", " café", " \xCC\x81" "e", " ", "\xC2\xA0nbsp"}},
+        {"\x01\x02" "abc\xE2\x80\x8B" "def  ", {"\x01", "\x02" "abc", "\xE2\x80\x8B" "def", "  "}},
+    };
+    for (const auto& [text, want] : deepseek) {
+        const auto ds = BpeTokenizer::pre_tokenize(text, "joyai-llm");
+        std::string seen;
+        for (const auto& piece : ds) seen += "[" + piece + "]";
+        check(ds == want, "DeepSeek pre-tokenizer pieces " + seen);
+    }
     Utf8StreamDecoder decoder;
     std::string text;
     for (const char* part : {"a\xF0\x9F", "\x98", "\x80" "b", "\xC3"}) text += decoder.push(part);

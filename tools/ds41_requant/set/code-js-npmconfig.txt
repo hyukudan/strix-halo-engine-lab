@@ -1,0 +1,123 @@
+const { mkdir, readFile, writeFile } = require('node:fs/promises')
+const { dirname, resolve } = require('node:path')
+const { spawn } = require('node:child_process')
+const { EOL } = require('node:os')
+const localeCompare = require('@isaacs/string-locale-compare')('en')
+const pkgJson = require('@npmcli/package-json')
+const { defaults, definitions, nerfDarts } = require('@npmcli/config/lib/definitions')
+const { log, output } = require('proc-log')
+const BaseCommand = require('../base-cmd.js')
+const { redact } = require('@npmcli/redact')
+
+// These are the config values to swap with "protected".  It does not catch
+// every single sensitive thing a user may put in the npmrc file but it gets
+// the common ones.  This is distinct from nerfDarts because that is used to
+// validate valid configs during "npm config set", and folks may have old
+// invalid entries lying around in a config file that we still want to protect
+// when running "npm config list"
+// This is a more general list of values to consider protected.  You can not
+// "npm config get" them, and they will not display during "npm config list"
+const protected = [
+  'auth',
+  'authToken',
+  'certfile',
+  'email',
+  'keyfile',
+  'password',
+  'username',
+]
+
+// take an array of `[key, value, k2=v2, k3, v3, ...]` and turn into
+// { key: value, k2: v2, k3: v3 }
+const keyValues = args => {
+  const kv = {}
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i].split('=')
+    const key = arg.shift()
+    const val = arg.length ? arg.join('=')
+      : i < args.length - 1 ? args[++i]
+      : ''
+    kv[key.trim()] = val.trim()
+  }
+  return kv
+}
+
+const isProtected = (k) => {
+  // _password
+  if (k.startsWith('_')) {
+    return true
+  }
+  if (protected.includes(k)) {
+    return true
+  }
+  // //localhost:8080/:_password
+  if (k.startsWith('//')) {
+    if (k.includes(':_')) {
+      return true
+    }
+    // //registry:_authToken or //registry:authToken
+    for (const p of protected) {
+      if (k.endsWith(`:${p}`) || k.endsWith(`:_${p}`)) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+// Private fields are either protected or they can redacted info
+const isPrivate = (k, v) => isProtected(k) || redact(v) !== v
+
+const displayVar = (k, v) =>
+  `${k} = ${isProtected(k, v) ? '(protected)' : JSON.stringify(redact(v))}`
+
+class Config extends BaseCommand {
+  static description = 'Manage the npm configuration files'
+  static name = 'config'
+  static usage = [
+    'set <key>=<value> [<key>=<value> ...]',
+    'get [<key> [<key> ...]]',
+    'delete <key> [<key> ...]',
+    'list [--json]',
+    'edit',
+    'fix',
+  ]
+
+  static params = [
+    'json',
+    'global',
+    'editor',
+    'location',
+    'long',
+  ]
+
+  static ignoreImplicitWorkspace = false
+
+  static skipConfigValidation = true
+
+  static async completion (opts) {
+    const argv = opts.conf.argv.remain
+    if (argv[1] !== 'config') {
+      argv.unshift('config')
+    }
+
+    if (argv.length === 2) {
+      const cmds = ['get', 'set', 'delete', 'ls', 'rm', 'edit', 'fix']
+      if (opts.partialWord !== 'l') {
+        cmds.push('list')
+      }
+
+      return cmds
+    }
+
+    const action = argv[2]
+    switch (action) {
+      case 'set':
+        // TODO: complete with valid values, if possible.
+        if (argv.length > 3) {
+          return []
+        }
+
+        // fallthrough
+        /* eslint no-fallthrough:0 */
+      case 'get

@@ -1,0 +1,14 @@
+[
+ ["en-capitals", "The capital of France is Paris. The capital of Spain is"],
+ ["en-story", "Once upon a time, in a small village at the edge of a great forest, there lived an old clockmaker who"],
+ ["en-explain", "Photosynthesis is the process by which plants"],
+ ["en-history", "The Industrial Revolution began in Britain in the late eighteenth century because"],
+ ["es-receta", "Para preparar una tortilla de patatas tradicional, primero hay que"],
+ ["es-historia", "La Reconquista fue un largo periodo de la historia de la península ibérica en el que"],
+ ["es-ciencia", "El agua hierve a cien grados centígrados al nivel del mar porque"],
+ ["code-py", "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number iteratively.\"\"\"\n"],
+ ["code-cpp", "#include <vector>\n#include <algorithm>\n\n// Returns the indices that would sort v in ascending order.\nstd::vector<size_t> argsort(const std::vector<double>& v) {\n"],
+ ["code-sql", "-- List the ten customers with the highest total order value in 2023\nSELECT"],
+ ["math-sum", "The sum of the first n positive integers is n(n+1)/2. Proof: we proceed by induction on n."],
+ ["math-word", "A train travels 120 km in 1.5 hours. Its average speed is therefore"]
+]

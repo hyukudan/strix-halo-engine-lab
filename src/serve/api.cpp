@@ -105,7 +105,8 @@ private:
 // <tool_call> on is kept for the final tool-call parse.
 class ChatSplitter {
 public:
-    explicit ChatSplitter(bool thinking) : phase_(thinking ? Phase::reasoning : Phase::content) {}
+    explicit ChatSplitter(bool thinking, std::string tool_marker = "<tool_call>")
+        : phase_(thinking ? Phase::reasoning : Phase::content), tool_marker_(std::move(tool_marker)) {}
     struct Delta { bool reasoning; std::string text; };
     std::vector<Delta> push(std::string_view text) {
         std::vector<Delta> out;
@@ -137,7 +138,7 @@ public:
                     buffer_.erase(0, first);
                     leading_ = false;
                 }
-                const auto call = buffer_.find("<tool_call>");
+                const auto call = buffer_.find(tool_marker_);
                 if (call != std::string::npos) {
                     auto before = buffer_.substr(0, call);
                     const auto last = before.find_last_not_of(" \t\r\n");
@@ -146,7 +147,7 @@ public:
                     tools_ = buffer_.substr(call);
                     buffer_.clear();
                     phase_ = Phase::tools;
-                } else hold_tail(out, false, 10U);
+                } else hold_tail(out, false, tool_marker_.size() - 1U);
             } else {
                 tools_.append(buffer_);
                 buffer_.clear();
@@ -190,6 +191,7 @@ private:
         emit_cut(out, reasoning, buffer_.size() - keep);
     }
     Phase phase_;
+    std::string tool_marker_;
     std::string buffer_, tools_;
     bool leading_ = false, reasoning_leading_ = true;
 };
@@ -334,7 +336,7 @@ struct ApiService::Impl {
             else input.reasoning_effort = effort;
         }
         std::string text;
-        try { text = render_chat_template(input); }
+        try { text = config.chat_renderer ? config.chat_renderer(input) : render_chat_template(input); }
         catch (const ChatTemplateError& error) { throw ApiError(400, "invalid_request_error", error.what(), "messages"); }
         ChatPrompt out;
         out.tokens = tokenizer->encode(text, true);
@@ -458,7 +460,7 @@ struct ApiService::Impl {
         if (!stream) {
             auto outcome = drive(ticket, stops, {}, [&] { return !response.client_gone(); });
             if (!outcome.error.empty()) throw ApiError(500, "server_error", outcome.error);
-            const auto parsed = parse_assistant_output(outcome.text, prompt.thinking, prompt.tools);
+            const auto parsed = (config.output_parser ? config.output_parser(outcome.text, prompt.thinking, prompt.tools) : parse_assistant_output(outcome.text, prompt.thinking, prompt.tools));
             Json message = Json::object();
             message.set("role", Json("assistant"));
             message.set("content", parsed.content.empty() && parsed.tool_calls.size() ? Json() : Json(sanitize_utf8(parsed.content)));
@@ -500,7 +502,7 @@ struct ApiService::Impl {
         first.set("role", Json("assistant"));
         first.set("content", Json(""));
         chunk(std::move(first), Json());
-        ChatSplitter splitter(prompt.thinking);
+        ChatSplitter splitter(prompt.thinking, config.tool_call_marker);
         const auto send_deltas = [&](const std::vector<ChatSplitter::Delta>& deltas) {
             for (const auto& d : deltas) {
                 Json delta = Json::object();
@@ -519,7 +521,7 @@ struct ApiService::Impl {
             error.set("error", std::move(detail));
             response.write("data: " + error.dump() + "\n\n");
         } else if (splitter.saw_tools()) {
-            const auto parsed = parse_assistant_output(outcome.text, prompt.thinking, prompt.tools);
+            const auto parsed = (config.output_parser ? config.output_parser(outcome.text, prompt.thinking, prompt.tools) : parse_assistant_output(outcome.text, prompt.thinking, prompt.tools));
             if (parsed.tool_calls.size()) {
                 auto calls = tool_calls_json(parsed.tool_calls);
                 std::int64_t index = 0;
@@ -704,7 +706,7 @@ struct ApiService::Impl {
         if (!stream) {
             auto outcome = drive(ticket, stops, {}, [&] { return !response.client_gone(); });
             if (!outcome.error.empty()) throw ApiError(500, "api_error", outcome.error);
-            const auto parsed = parse_assistant_output(outcome.text, prompt.thinking, prompt.tools);
+            const auto parsed = (config.output_parser ? config.output_parser(outcome.text, prompt.thinking, prompt.tools) : parse_assistant_output(outcome.text, prompt.thinking, prompt.tools));
             Json content = Json::array();
             if (prompt.thinking && !parsed.reasoning.empty()) {
                 Json b = Json::object(); b.set("type", Json("thinking")); b.set("thinking", Json(sanitize_utf8(parsed.reasoning))); b.set("signature", Json(""));
@@ -760,7 +762,7 @@ struct ApiService::Impl {
             start.set("content_block", std::move(block));
             event("content_block_start", start);
         };
-        ChatSplitter splitter(prompt.thinking);
+        ChatSplitter splitter(prompt.thinking, config.tool_call_marker);
         const auto send_deltas = [&](const std::vector<ChatSplitter::Delta>& deltas) {
             for (const auto& d : deltas) {
                 const std::string kind = d.reasoning ? "thinking" : "text";
@@ -782,7 +784,7 @@ struct ApiService::Impl {
         send_deltas(splitter.finish());
         bool tools = false;
         if (splitter.saw_tools()) {
-            const auto parsed = parse_assistant_output(outcome.text, prompt.thinking, prompt.tools);
+            const auto parsed = (config.output_parser ? config.output_parser(outcome.text, prompt.thinking, prompt.tools) : parse_assistant_output(outcome.text, prompt.thinking, prompt.tools));
             for (const auto& call : parsed.tool_calls.as_array()) {
                 tools = true;
                 Json block = Json::object(); block.set("type", Json("tool_use")); block.set("id", Json(random_id("toolu_")));
@@ -848,6 +850,7 @@ struct ApiService::Impl {
             list.push(std::move(e));
         }
         out.set("requests", std::move(list));
+        if (config.status_extra) config.status_extra(out);
         return out;
     }
     std::string metrics() {
@@ -865,6 +868,7 @@ struct ApiService::Impl {
         counter("strix_engine_busy_seconds_total", "Seconds the engine spent on generations.", q.busy_seconds);
         counter("strix_queue_waiting", "Generations waiting in the queue.", static_cast<double>(q.queued), "gauge");
         counter("strix_queue_running", "Generations running.", static_cast<double>(q.running), "gauge");
+        if (config.metrics_extra) m << config.metrics_extra();
         return m.str();
     }
 };
@@ -896,14 +900,21 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& response
         if (request.method == "GET" && (request.path == "/health" || request.path == "/v1/health")) {
             std::string state;
             { const std::lock_guard lock(impl.mutex); state = impl.state; }
-            const bool failed = state == "failed";
-            Json out = Json::object(); out.set("status", Json(failed ? "failed" : "ok")); out.set("model", Json(impl.config.model_id));
-            response.send(failed ? 503 : 200, "application/json", out.dump());
+            const bool failed = state == "failed", draining = state == "draining";
+            Json out = Json::object(); out.set("status", Json(failed ? "failed" : draining ? "draining" : "ok")); out.set("model", Json(impl.config.model_id));
+            response.send(failed || draining ? 503 : 200, "application/json", out.dump());
             return;
         }
         if (request.method == "GET" && request.path == "/metrics") { response.send(200, "text/plain; version=0.0.4", impl.metrics()); return; }
         if (request.method == "GET" && request.path == "/api/status") { response.send(200, "application/json", impl.status().dump()); return; }
         impl.authorize(request);
+        if (request.method == "POST" && request.path == "/admin/drain" && impl.config.on_drain) {
+            impl.config.on_drain();
+            { const std::lock_guard lock(impl.mutex); if (impl.state != "failed") impl.state = "draining"; }
+            Json out = Json::object(); out.set("status", Json("draining"));
+            response.send(200, "application/json", out.dump());
+            return;
+        }
         if (request.method == "GET" && request.path == "/v1/models") {
             Json model = Json::object();
             model.set("id", Json(impl.config.model_id)); model.set("object", Json("model")); model.set("created", Json(unix_now()));

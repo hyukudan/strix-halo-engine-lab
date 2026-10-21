@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/serve/bpe_tokenizer.hpp"
+#include "strix/serve/chat_template.hpp"
 #include "strix/serve/engine.hpp"
 #include "strix/serve/http_server.hpp"
 #include "strix/serve/json.hpp"
@@ -23,6 +24,16 @@ struct ApiConfig {
     std::vector<std::uint32_t> stop_tokens;  // generation ends at any of these (not emitted)
     std::size_t recent_requests = 50;
     std::string engine_description;          // free text for /api/status
+    // Model family hooks; unset: the Qwen3.8 chat template, its output parser and its <tool_call> marker.
+    std::function<std::string(const ChatTemplateInput&)> chat_renderer;
+    std::function<AssistantOutput(const std::string& text, bool thinking, const Json& tools)> output_parser;
+    std::string tool_call_marker = "<tool_call>";  // streaming: content from this marker on is kept for the tool parse
+    // Engine members added to /api/status (memory, slots, group) and lines added to /metrics.
+    std::function<void(Json& status)> status_extra;
+    std::function<std::string()> metrics_extra;
+    // POST /admin/drain (authenticated): stop admitting and finish what runs; /health answers 503 "draining" after it.
+    // Unset: the route answers 404.
+    std::function<void()> on_drain;
 };
 
 // OpenAI-compatible (/v1/chat/completions, /v1/completions, /v1/models) and Anthropic-compatible

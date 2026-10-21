@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Bounded host-only preparation and numerical evidence evaluation. Never runs HIP."""
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+SCHEMA = "strix-native-numerical-campaign-v1"
+ROOT = Path(__file__).resolve().parents[3]
+MAX_JSON = 16 * 1024 * 1024
+MAX_PLAN_JSON = 256 * 1024 * 1024
+MAX_LINE = 8 * 1024 * 1024
+MAX_LOGITS_FILE = 8 * 1024**3
+MAX_MODEL = 512 * 1024**3
+MAX_POSITIONS = 4096
+MAX_VOCAB = 262144
+STATE_CLASSES = ("kv", "recurrent", "convolution", "host_ngram", "sparse_index", "position")
+FRESH_RAW_HISTORY = "single_row_eager_from_fresh_initialized_state"
+FRESH_GRAPH_HISTORY = "single_row_graph_from_fresh_initialized_state"
+KINDS = {"logits", "greedy", "json", "tool", "state", "context"}
+THRESHOLDS = {"max_abs_logit_error": 0.05, "max_mean_kl": 0.001,
+              "max_nll_increase": 0.02, "max_teacher_forced_argmax_mismatch_rate": 0.01,
+              "max_generated_token_edit_rate": 0.01,
+              "semantic_failures": 0, "state_byte_mismatches": 0}
+ROW_CONTRACT = ("strix-row-quant-v1:f64:nearest-even:divide:no-ftz:finite-only:"
+                "symmetric-127-or-7:zero-scale-one:exact-groups:ordered-groups")
+
+
+def floating_profile(input_storage):
+    require(input_storage in {"bf16", "fp32"}, "unknown floating activation storage")
+    return (f"strix-experimental-float-lm-head-v1:decode:C1:M1:{input_storage}-source-widen-f32:"
+            "original-ggml-weight-decode-f32:256-thread-feature-stride:fp32-sum-binary-tree:"
+            "fp32-logits:compiler-bound-arithmetic:no-whole-model-precision-claim")
+
+
+def integer_profile(candidate, input_storage):
+    require(candidate["activation_class"] in {"W4A8", "W4A4"} and input_storage in {"bf16", "fp32"}
+            and candidate["encoding"] in {"q4_0", "iq4_xs"} and candidate["operand"] in {"iu4", "iu8"}
+            and (candidate["operand"] != "iu4" or candidate["encoding"] == "q4_0" and candidate["activation_class"] == "W4A4"),
+            "integer profile needs explicit source storage and activation encoding")
+    activation = "symmetric_a8" if candidate["activation_class"] == "W4A8" else "symmetric_a4"
+    fnv = 14695981039346656037
+    for byte in ROW_CONTRACT.encode() + b"\0" + activation.encode() + b"\0" + struct.pack("<Q", 32):
+        fnv = ((fnv ^ byte) * 1099511628211) & ((1 << 64) - 1)
+    code = "q4_0-u4-z8" if candidate["encoding"] == "q4_0" else "iq4_xs-codebook-i8"
+    core = (f"strix-integer-projection-v1:{code}:{activation}:{candidate['operand']}:"
+            f"gfx1151-w32-g32-i32-no-clamp-i64-correction-f64-scale-left-to-right-no-contract:{fnv}")
+    return (f"strix-experimental-lm-head-v1:decode:C1:M1:{input_storage}-exact-widen-f64:{core}"
+            ":f64-group-order:binary32-integer-RNE-gradual-signed-zero:reject-nonfinite:whole-logits-status-gated-commit")
+
+
+class Invalid(ValueError):
+    pass
+
+
+def require(ok, message):
+    if not ok:
+        raise Invalid(message)
+
+
+def keys(value, required, optional=()):
+    require(isinstance(value, dict) and set(required) <= value.keys()
+            and value.keys() <= set(required) | set(optional), "unknown or missing object fields")
+
+
+def integer(value, low=0, high=(1 << 64) - 1):
+    require(type(value) is int and low <= value <= high, "integer is outside declared bounds")
+    return value
+
+
+def finite(value, low=None):
+    try:
+        valid = type(value) in (int, float) and math.isfinite(value) and (low is None or value >= low)
+    except (OverflowError, ValueError):
+        valid = False
+    require(valid, "nonfinite or invalid numerical value")
+    return float(value)
+
+
+def digest(value):
+    require(isinstance(value, str) and len(value) == 64
+            and all(c in "0123456789abcdef" for c in value), "expected lowercase SHA256")
+    return value
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                      allow_nan=False).encode("utf-8")
+
+
+def identity(value):
+    return hashlib.sha256(canonical(value)).hexdigest()
+
+
+def text(value, maximum=65536):
+    require(isinstance(value, str) and 0 < len(value.encode("utf-8")) <= maximum,
+            "empty or excessive text")
+    return value
+
+
+def private_path(value):
+    require(isinstance(value, (str, Path)), "artifact path must be text")
+    path = Path(value)
+    require(path.is_absolute(), "artifact paths must be absolute")
+    path = path.resolve()
+    require(path != ROOT and ROOT not in path.parents
+            and not any((p / ".git").exists() for p in (path, *path.parents)),
+            "model, prompts, references and results must remain outside Git/source checkouts")
+    return path
+
+
+def file_hash(path, maximum):
+    path = Path(path)
+    before = path.stat()
+    require(path.is_file() and 0 < before.st_size <= maximum, "missing, empty or excessive artifact")
+    result = hashlib.sha256()
+    with path.open("rb") as stream:
+        while block := stream.read(4 * 1024 * 1024):
+            result.update(block)
+    after = path.stat()
+    require((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) ==
+            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns), "artifact changed while hashing")
+    return result.hexdigest(), after.st_size
+
+
+def pin(value, maximum=MAX_JSON, private=True):
+    path = private_path(value) if private else Path(value).resolve(strict=True)
+    sha, size = file_hash(path, maximum)
+    return {"path": str(path), "sha256": sha, "bytes": size}
+
+
+def verify_pin(value, maximum=MAX_JSON, private=True):
+    keys(value, ("path", "sha256", "bytes"))
+    digest(value["sha256"]); integer(value["bytes"], 1, maximum)
+    actual = pin(value["path"], maximum, private)
+    require(actual == value, "artifact identity/extent mismatch")
+    return Path(actual["path"])
+
+
+def parse_json(raw):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            require(key not in result, "duplicate JSON field")
+            result[key] = value
+        return result
+    def reject(_):
+        raise Invalid("nonfinite JSON constant")
+    try:
+        return json.loads(raw, object_pairs_hook=pairs, parse_constant=reject)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise Invalid("invalid bounded UTF8 JSON") from error
+
+
+def load(path, maximum=MAX_JSON):
+    path = Path(path)
+    require(path.stat().st_size <= maximum, "JSON exceeds read bound")
+    with path.open("rb") as stream:
+        raw = stream.read(maximum + 1)
+    require(0 < len(raw) <= maximum, "empty or excessive JSON")
+    return parse_json(raw)
+
+
+def load_plan(path):
+    return load(path, MAX_PLAN_JSON)
+
+
+def write_new(value, path, maximum=MAX_JSON):
+    path = private_path(path)
+    encoded = canonical(value) + b"\n"
+    require(len(encoded) <= maximum, "JSON artifact exceeds explicit byte admission")
+    path.parent.mkdir(parents=True, exist_ok=True)
+   

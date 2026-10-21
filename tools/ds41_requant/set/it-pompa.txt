@@ -1,0 +1,42 @@
+# Pompa fluidodinamica
+Una pompa fluidodinamica (detta comunemente pompa dinamica) è un tipo di pompa nel quale il movimento del fluido è prodotto da un momento indotto nel fluido stesso.
+
+Queste pompe non hanno bisogno di valvole, ma hanno lo svantaggio che la portata e l'efficienza diminuiscono con l'aumentare della pressione all'uscita. In genere queste pompe hanno la necessità dell'adescamento, ovvero di essere inizialmente riempite di liquido per poter funzionare.
+
+Tipologie 
+elenco di alcune categorie di pompe:
+centrifuga;
+assiale;
+ariete idraulico;
+magnetofluidodinamica;
+lineare;
+
+Pompa centrifuga 
+La pompa centrifuga utilizza l'effetto centrifugo della sua girante per movimentare il liquido, trasformando l'energia meccanica proveniente dal suo motore prima in energia cinetica e successivamente in energia di pressione che conferisce al liquido sollevato.
+
+La pompa centrifuga è di gran lunga la pompa di uso più comune, sia in ambito industriale che civile.
+
+La definizione si limita generalmente alle pompe con girante radiale e semiassiale ossia alle pompe nelle quali il flusso di fluido attraversa la girante radialmente o semiassialmente, diversamente al caso delle giranti ad elica nelle quali il fluido attraversa la girante assialmente.
+
+Costruzione 
+Una pompa centrifuga è composta essenzialmente da una parte mobile detta girante (ruota palettata), che aspira il fluido da una tubazione di aspirazione, comunicante con il centro della pompa, e trasferisce al liquido l'energia meccanica trasmessa dal motore sotto forma di energia cinetica.
+
+La ruota palettata gira in una camera fissa a forma di chiocciola, voluta o corpo di pompa, entro cui si muove il liquido spinto dalla forza centrifuga impressale dalla girante, che trasforma l'energia cinetica del liquido in energia di pressione e lo incanala nella tubazione di mandata comunicante con la periferia della pompa.
+
+La girante è una ruota dotata di palette che può essere realizzata secondo molte varianti costruttive a seconda delle prestazioni richieste: girante chiusa, girante aperta, girante monocanale, girante arretrata, girante vortex, giranti assiali, giranti semiassiali.
+
+Quasi tutte le pompe centrifughe hanno aspirazione assiale e mandata radiale (stile europeo ISO) o tangenziale (stile statunitense API) verso l'alto. La supportazione può essere su piedini o centreline, la prima più semplice, la seconda più robusta. In ogni caso, la quasi totalità delle pompe centrifughe ha una supportazione back pull-out, che consente di estrarre il supporto 5 completo di cassa stoppa 4 e albero 6 senza dover smontare il corpo 1, appunto agendo nella parte posteriore, con il vantaggio di non dover disconnettere la pompa dalle tubazioni durante gli interventi di manutenzione.
+
+Funzionamento 
+
+Se ne comprende il funzionamento osservando che un cilindro riempito d'acqua, posto in rotazione attorno al proprio asse, modifica la forma del pelo libero, facendogli assumere un profilo parabolico: infatti l'accelerazione centrifuga è proporzionale al quadrato della velocità angolare, ed al raggio di rotazione. La differenza H di livello che si osserva (e che, intuitivamente, è funzione della velocità angolare) si dice prevalenza della pompa. È anche intuitivo osservare che, a parità di velocità angolare (e quindi di profilo del liquido), se si pratica un foro esattamente all'altezza H non si avrà alcuna uscita di liquido. Se invece il foro viene praticato a una quota inferiore si osserverà una fuoriuscita di liquido; inoltre è intuitivo osservare che tanto più basso viene praticato il foro, tanto maggiore sarà la quantità nell'unità di tempo, detta portata, di liquido uscente.
+
+Nella pratica, il fluido è contenuto all'interno di un corpo ed è messo in rotazione da una girante.
+
+Il movimento della girante determina una depressione nel tubo di aspirazione e l'acqua, spinta dalla pressione atmosferica, risale lungo il tubo ed entra nella pompa.
+
+la girante messa in rotazione dal motore dopo aver risucchiato il liquido lo proietta alla periferia del corpo-pompa in virtù della forza centrifuga prodotta dalla velocità della girante.
+
+La girante è dotata di una serie di pallette curve che formano dei canali a sezione crescente dal centro verso la periferia.
+
+Pertanto il liquido che entra dalla parte centrale della girante nel percorrere i vari canali per il principio di Bernoulli, convertono parte dell'energia cinetica

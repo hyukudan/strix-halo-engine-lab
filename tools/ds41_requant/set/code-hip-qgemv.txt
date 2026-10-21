@@ -1,0 +1,80 @@
+// Microbench: GEMV de expertos MoE (gate+up 1280x2560) y denso, por formato de cuantizaciÃ³n, en gfx1151.
+// Layout SoA (planos de bits contiguos + escalas aparte), 8 pesos por lane por iteraciÃ³n, activaciones int8 (A8)
+// con v_dot4. No calcula nada Ãºtil: mide bytes/s efectivos y el coste de descuantizar de cada formato.
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <vector>
+#include <random>
+#include <cstring>
+#include <string>
+
+#define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { printf("HIP %s @%d\n", hipGetErrorString(e_), __LINE__); exit(1);} } while (0)
+
+enum Fmt { Q8, Q6, Q5, Q4, Q4M, Q4K, Q4G128, IQ4NL, Q3, Q3G128, Q2M, Q2G64, IQ3GRID, TRELLIS3, NFMT };
+static const char* NAMES[] = {"q8_g32", "q6_g32", "q5_g32", "q4_g32(Q4_0)", "q4_g32+min(Q4_1)", "q4_K-like",
+                              "q4_g128", "iq4nl_lut", "q3_g32", "q3_g128", "q2_g32+min", "q2_g64", "iq3_grid", "trellis3"};
+// bits de pesos (planos) y bytes de metadatos por grupo
+struct Desc { int bits; int group; int meta_bytes_per_group; int extra_bytes_per_256; };
+static const Desc D[] = {
+    {8, 32, 2, 0}, {6, 32, 2, 0}, {5, 32, 2, 0}, {4, 32, 2, 0}, {4, 32, 4, 0}, {4, 32, 2, 4},
+    {4, 128, 2, 0}, {4, 32, 2, 0}, {3, 32, 2, 0}, {3, 128, 2, 0}, {2, 32, 4, 0}, {2, 64, 2, 0}, {3, 32, 2, 0}, {3, 32, 2, 0}};
+
+constexpr int K = 2560;          // columnas (d_model)
+constexpr int ITERS = K / 256;   // 8 pesos/lane x 32 lanes = 256 por iteraciÃ³n
+
+__device__ __forceinline__ int dot8(uint32_t w0, uint32_t w1, uint2 a, int acc) {
+    acc = __builtin_amdgcn_sudot4(true, (int)w0, true, (int)a.x, acc, false);
+    acc = __builtin_amdgcn_sudot4(true, (int)w1, true, (int)a.y, acc, false);
+    return acc;
+}
+__device__ __forceinline__ float h2f(uint16_t h) { return __half2float(*reinterpret_cast<__half*>(&h)); }
+
+// Planos por fila: plane[p] es un array de filas, cada una con K*bitsP/8 bytes. Lane l, iteraciÃ³n it -> pesos
+// [it*256 + l*8, +8): en un plano de b bits ocupan b bytes contiguos.
+template <int F, int R>
+__global__ __launch_bounds__(256) void gemv(const uint8_t* __restrict__ p0, const uint8_t* __restrict__ p1,
+                                            const uint8_t* __restrict__ meta, const int* __restrict__ experts,
+                                            int rows_per_expert, size_t expert_stride_p0, size_t expert_stride_p1,
+                                            size_t expert_stride_meta, const int8_t* __restrict__ act,
+                                            float* __restrict__ out, const int* __restrict__ asum = nullptr) {
+    __shared__ uint32_t grid_lds[256];
+    if constexpr (F == IQ3GRID) {
+        grid_lds[threadIdx.x] = 0x04030201u * (threadIdx.x | 1) ^ 0x1f1f1f1fu * (threadIdx.x >> 3);
+        __syncthreads();
+    }
+    const int lane = threadIdx.x & 31;
+    const int row_global = blockIdx.x * 8 + (threadIdx.x >> 5);
+    const int e_slot = row_global / rows_per_expert;
+    const int row = row_global % rows_per_expert;
+    const int e = experts[e_slot];
+    constexpr int bits = (F == Q8) ? 8 : (F == Q6) ? 6 : (F == Q5) ? 5 : (F == Q3 || F == Q3G128 || F == IQ3GRID || F == TRELLIS3) ? 3 : (F == Q2M || F == Q2G64) ? 2 : 4;
+    constexpr int group = (F == Q4G128 || F == Q3G128) ? 128 : (F == Q2G64) ? 64 : 32;
+    constexpr int metab = (F == Q4M || F == Q2M) ? 4 : 2;
+    // plano 0: 4 bits (o 8, o 2 para q2/q3, o 8-bit Ã­ndices para grid); plano 1: bits altos
+    constexpr int b0 = (F == Q8) ? 8 : (F == Q3 || F == Q3G128 || F == Q2M || F == Q2G64) ? 2 : (F == IQ3GRID) ? 2 /*2 idx de 8b por 8 pesos*/ : (F == TRELLIS3) ? 2 : 4;
+    constexpr int b1 = bits - b0 + ((F == IQ3GRID) ? 0 : 0);
+    const uint8_t* r0 = p0 + (size_t)e * expert_stride_p0 + (size_t)row * (K * b0 / 8);
+    const uint8_t* r1 = p1 + (size_t)e * expert_stride_p1 + (size_t)row * (K * (b1 > 0 ? b1 : 1) / 8);
+    const uint8_t* rm = meta + (size_t)e * expert_stride_meta + (size_t)row * (K / group * metab + ((F == Q4K) ? K / 256 * 4 : 0));
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.f;
+    // carga adelantada de todos los planos (10 iteraciones) para tener bytes en vuelo
+    uint32_t q0[ITERS][2];
+    uint32_t q1[ITERS];
+#pragma unroll
+    for (int it = 0; it < ITERS; ++it) {
+        const int off = it * 256 + lane * 8;   // Ã­ndice del primer peso
+        if constexpr (b0 == 8) { uint2 v = *reinterpret_cast<const uint2*>(r0 + off); q0[it][0] = v.x; q0[it][1] = v.y; }
+        else if constexpr (b0 == 4) { q0[it][0] = *reinterpret_cast<const uint32_t*>(r0 + off / 2); q0[it][1] = 0; }
+        else if constexpr (b0 == 2) { q0[it][0] = *reinterpret_cast<const uint16_t*>(r0 + off / 4); q0[it][1] = 0; }
+        if constexpr (b1 == 2) q1[it] = *reinterpret_cast<const uint16_t*>(r1 + off / 4);
+        else if constexpr (b1 == 1) q1[it] = r1[off / 8];
+        else q1[it] = 0;
+    }
+#pragma unroll
+    for (int it = 0; it < ITERS; ++it) {
+        const int off = it * 256 + lane * 8

@@ -1,0 +1,79 @@
+<|im_start|>user
+Estoy preparando unas oposiciones al Cuerpo General Administrativo de la Administración del Estado. Explícame con detalle, en unas 1.800 palabras, el procedimiento administrativo común de la Ley 39/2015: interesados, fases (iniciación, ordenación, instrucción y finalización), cómputo de plazos, silencio administrativo, y los recursos de alzada, potestativo de reposición y extraordinario de revisión. Pon ejemplos prácticos y termina con diez preguntas tipo test con su solución.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+**El Procedimiento Administrativo Común según la Ley 39/2015: Una Guía Integral para Oposicionistas**
+
+La Ley 39/2015, de 1 de octubre, del Procedimiento Administrativo Común de las Administraciones Públicas (LPACAP), constituye el pilar fundamental sobre el que se asienta la actuación administrativa en España. Para cualquier opositor al Cuerpo General Administrativo de la Administración del Estado, dominar esta norma no es opcional; es imprescindible. A continuación, desglosaremos los elementos esenciales de este procedimiento, desde la definición de los sujetos implicados hasta el régimen de recursos, utilizando un lenguaje técnico pero accesible y ejemplificando con situaciones prácticas para facilitar la comprensión.
+
+### 1. Los Interesados en el Procedimiento
+
+El procedimiento administrativo no es una actuación unilateral aislada, sino un intercambio de información y garantías entre la Administración y los ciudadanos. La LPACAP amplía el concepto de "interesado" más allá de quién promueve el procedimiento. Según el artículo 4 de la ley, son interesados:
+
+1.  **Quienes lo inicien** en ejercicio de sus derechos e intereses legítimos.
+2.  **Quienes tengan derechos legítimos** que pudieran verse afectados por el procedimiento.
+3.  **Quienes tengan intereses legítimos** que puedan verse afectados, aunque no tengan un derecho subjetivo previo (por ejemplo, una asociación ecologista en un procedimiento de urbanismo).
+4.  **Las organizaciones sindicales y empresariales** más representativas, cuando sus intereses colectivos puedan verse afectados.
+
+*Ejemplo práctico:* Si el Ministerio de Transportes incoa un procedimiento para declarar una carretera como autovía de peaje, los titulares de terrenos expropiados son interesados por derecho afectado. Sin embargo, los vecinos de una urbanización colindante que se quejan del ruido también pueden ser reconocidos como interesados por tener un interés legítimo, aunque no sean propietarios de la vía.
+
+### 2. Las Fases del Procedimiento Administrativo
+
+El artículo 54 de la LPACAP establece que el procedimiento administrativo se ordena en cuatro fases básicas. Es crucial entender que no todos los procedimientos pasan por todas las fases con la misma intensidad, pero la estructura es siempre esta:
+
+#### A. Iniciación
+La iniciación es el acto que pone en marcha el procedimiento. Puede ser:
+*   **De oficio:** Por acuerdo del órgano competente, bien por iniciativa propia, bien como consecuencia de una denuncia, orden superior o petición de informes. Debe ser ordenada por el titular del órgano competente o por quien tenga delegación expresa.
+*   **A solicitud del interesado:** Mediante una solicitud que debe contener mínimos exigidos (identificación, datos de contacto, manifestación de consentimiento o denegación de consentimiento al acceso a datos, etc.). Si la solicitud no reúne los requisitos, la Administración requerirá al interesado para que la subsane en un plazo máximo de 10 días (ampliable).
+
+*Ejemplo práctico:* Un ciudadano solicita una licencia de actividad para abrir una peluquería. Esto es una iniciación a solicitud. Si la inspección de trabajo detecta que la peluquería ya está abierta sin licencia y inicia un expediente sancionador, eso es una iniciación de oficio.
+
+#### B. Ordenación
+Esta fase es transversal y continua durante todo el procedimiento. El órgano competente tiene el deber de impulsar la tramitación en todo momento, adoptando las decisiones y medidas necesarias. La ordenación busca evitar la paralización injustificada.
+Puntos clave:
+*   Los informes preceptivos pero no vinculantes deben emitirse en 2 meses. Si no se emiten, se entiende que son favorables.
+*   Los informes vinculantes deben emitirse en el plazo previsto en la norma específica; si no, el órgano competente podrá dictar resolución prescindiendo del informe, pero siempre que este no sea exigible por norma de superior rango o no haya sido solicitado en tiempo.
+*   La acumulación de procedimientos permite unir varios expedientes que tienen puntos en común para dictar una única resolución.
+
+#### C. Instrucción
+Es la fase de aportación de pruebas y documentos para formar el convencimiento de la Administración sobre los hechos. Incluye:
+*   **Aportación de pruebas:** Los interesados pueden solicitar pruebas y aportar documentos. La Administración puede recabar informes de otros organismos.
+*   **Prueba electrónica:** La LPACAP potencia el uso de medios electrónicos para la obtención de pruebas y su valoración.
+*   **Trámite de audiencia:** Antes de dictar resolución, se debe dar vista del expediente al interesado (si no se le dio anteriormente) para que formule alegaciones y aporte documentos. Este trámite es obligatorio en procedimientos sancionadores o restrictivos de derechos, y en cualquier otro donde la resolución sea desfavorable.
+
+*Ejemplo práctico:* En un procedimiento de responsabilidad patrimonial (ej. un daño en la calzada), la fase de instrucción implica recabar informes de técnicos de obras públicas, periciales del afectado y pruebas fotográficas. Antes de denegar la indemnización, se debe dar trámite de audiencia al reclamante.
+
+#### D. Finalización
+El procedimiento termina por:
+1.  **Resolución:** Es la forma normal. Debe ser expresa, motivada y congruente con las pretensiones de los interesados.
+2.  **Desistimiento:** El interesado renuncia a la continuación del procedimiento pero no a su derecho (puede volver a pedirlo).
+3.  **Renuncia:** El interesado renuncia a su derecho subjetivo o interés legítimo.
+4.  **Satisfacción extrajudicial:** Cuando el conflicto se resuelve fuera del procedimiento.
+5.  **Imposibilidad material:** Por causas sobrevenidas.
+6.  **Caducidad:** Si el procedimiento es de oficio, caduca si no se ha dictado resolución en el plazo máximo (generalmente 3 meses, salvo norma especial). Si es a solicitud, la falta de resolución no produce caducidad, pero sí puede dar lugar al silencio.
+
+### 3. El Cómputo de Plazos
+
+Uno de los errores más comunes en los exámenes es el cómputo de plazos. La LPACAP distingue claramente:
+
+*   **Plazos en días hábiles:** Se excluyen sábados, domingos y festivos. El plazo empieza a correr al día siguiente de la notificación o publicación. Ejemplo: Plazo de 10 días hábiles para formular alegaciones.
+*   **Plazos en meses o años:** Si el plazo se señala en meses o años, se computa de fecha a fecha. Si no hay día correspondiente en el mes de vencimiento, vence el último día del mes. Ejemplo: Plazo de 1 mes para interponer recurso. Si se notifica el 15 de enero, vence el 15 de febrero.
+
+Es vital recordar que la notificación se practica por los medios previstos (electrónica prioritaria, postal, etc.). Se entiende recibida al día siguiente hábil a su remisión (si es postal) o desde su puesta a disposición en la sede electrónica (si es electrónica).
+
+### 4. El Silencio Administrativo
+
+Cuando la Administración no dicta resolución expresa dentro del plazo establecido, se produce el silencio administrativo. Su efecto depende de quién inició el procedimiento y de la naturaleza del mismo (artículos 24 y 25 LPACAP):
+
+1.  **Silencio Negativo:**
+    *   En procedimientos iniciados **a solicitud del interesado** para el ejercicio de derechos: Si no se resuelve en plazo, se entiende **desestimada** la solicitud. *Nota: Si es un procedimiento para el ejercicio de derechos reconocidos en normas constitucionales o leyes orgánicas, el silencio es estimatorio.*
+    *   En procedimientos iniciados **de oficio** que persigan el reconocimiento de facultades o derechos a los interesados: Si no se resuelve, se entiende **desestimada**.
+
+2.  **Silencio Estimatorio:**
+    *   En procedimientos iniciados **de oficio** que persigan **gravar** bienes, derechos o intereses de los particulares, o **sancionar**: Si la Administración no dicta resolución en plazo, se entiende **estimada** la pretensión (es decir, no se impone la sanción o el gravamen).
+    *   En procedimientos para el **ejercicio de derechos reconocidos en normas constitucionales o leyes orgánicas** iniciados a solicitud: El silencio es **estimatorio**.
+
+*Ejemplo práctico:* Si pido una licencia de obra (procedimiento a solicitud, derecho general) y pasa el plazo sin respuesta, el silencio es negativo (no tengo licencia). Si el Ayuntamiento incoa un procedimiento para declararme en ruina inminente mi casa (de oficio, gravoso para mí) y no resuelve en plazo, el silencio es estimatorio (significa que no se declara la ruina, por

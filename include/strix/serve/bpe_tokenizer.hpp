@@ -13,7 +13,8 @@ namespace strix::serve {
 // `token_type`, `merges`, `pre`). Encoding splits the text on control and user-defined tokens
 // (when special parsing is on), pre-tokenizes every other piece with the model's pattern, maps its
 // bytes to the byte-level alphabet and applies the merges by rank. Decoding inverts the byte map.
-// Only the `qwen35` pre-tokenizer is implemented; other GGUF tokenizers are rejected at load.
+// The `qwen35` and the DeepSeek V3/V4 (`joyai-llm`, `deepseek-v3`) pre-tokenizers are implemented; other GGUF
+// tokenizers are rejected at load.
 class BpeTokenizer {
 public:
     enum class TokenType : std::int32_t { normal = 1, unknown = 2, control = 3, user_defined = 4, unused = 5, byte = 6 };
@@ -37,6 +38,7 @@ public:
 
     // Pre-tokenizer pieces of plain text (no special-token splitting), for tests.
     [[nodiscard]] static std::vector<std::string> pre_tokenize(std::string_view text);
+    [[nodiscard]] static std::vector<std::string> pre_tokenize(std::string_view text, std::string_view pre);
 
 private:
     BpeTokenizer();

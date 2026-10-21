@@ -1,0 +1,2107 @@
+#include "strix/deepseek41_device_forward.hpp"
+
+#include "strix/deepseek41_attention_host.hpp"
+#include "strix/dist/communicator.hpp"
+#include "strix/hip_ds41_attention.hpp"
+#include "strix/ds41_engram.hpp"
+#include "strix/ds41_expert_tp.hpp"
+#include "strix/ds41_moe.hpp"
+#include "strix/ds41_native_fp8.hpp"
+#include "strix/ds41_packed.hpp"
+#include "strix/ds41_weight_overlay.hpp"
+#include "strix/hip_ds41_expert_tp.hpp"
+#include "strix/hip_ds41_formats.hpp"
+#include "strix/hip_ds41_layer.hpp"
+#include "hip_ds41_step_trace.hpp"
+
+#include <hip/hip_runtime.h>
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <optional>
+#include <set>
+#include <span>
+#include <stdexcept>
+#include <future>
+#include <thread>
+#include <utility>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace strix::deepseek41 {
+namespace {
+
+void check(hipError_t e, const char* what) {
+    if (e != hipSuccess) throw std::runtime_error(std::string("deepseek41 device forward: ") + what + ": " + hipGetErrorString(e));
+}
+
+std::uint64_t fnv(const std::vector<float>& v) {
+    std::uint64_t h = 14695981039346656037ULL;
+    for (const float f : v) {
+        auto b = std::bit_cast<std::uint32_t>(f);
+        for (int k = 0; k < 4; ++k, b >>= 8U) {
+            h ^= b & 0xffU;
+            h *= 1099511628211ULL;
+        }
+    }
+    return h;
+}
+
+template <typename T>
+struct Dev {
+    T* p = nullptr;
+    std::size_t n = 0;
+    Dev() = default;
+    explicit Dev(std::size_t count) : n(count) {
+        check(hipMalloc(reinterpret_cast<void**>(&p), std::max<std::size_t>(count, 1) * sizeof(T)), "hipMalloc");
+    }
+    ~Dev() {
+        if (p != nullptr) (void)hipFree(p);
+    }
+    Dev(const Dev&) = delete;
+    Dev& operator=(const Dev&) = delete;
+    Dev(Dev&& o) noexcept : p(std::exchange(o.p, nullptr)), n(o.n) {}
+    Dev& operator=(Dev&& o) noexcept {
+        std::swap(p, o.p);
+        std::swap(n, o.n);
+        return *this;
+    }
+    template <typename C>
+    void upload(const C& host, hipStream_t s) {
+        check(hipMemcpyAsync(p, host.data(), host.size() * sizeof(T), hipMemcpyHostToDevice, s), "upload");
+    }
+};
+
+template <typename T>
+std::vector<T> download(const T* p, std::size_t n, hipStream_t s) {
+    std::vector<T> out(n);
+    check(hipMemcpyAsync(out.data(), p, n * sizeof(T), hipMemcpyDeviceToHost, s), "download");
+    check(hipStreamSynchronize(s), "download");
+    return out;
+}
+
+class Mapped {
+public:
+    explicit Mapped(const std::filesystem::path& path) {
+        fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd_ < 0) throw std::runtime_error("deepseek41 device forward: cannot open " + path.string());
+        struct stat st {};
+        if (::fstat(fd_, &st) != 0) throw std::runtime_error("deepseek41 device forward: cannot stat the model");
+        size_ = static_cast<std::uint64_t>(st.st_size);
+        void* p = ::mmap(nullptr, size_, PROT_READ, MAP_SHARED, fd_, 0);
+        if (p == MAP_FAILED) throw std::runtime_error("deepseek41 device forward: mmap failed");
+        base_ = static_cast<const std::uint8_t*>(p);
+    }
+    ~Mapped() {
+        if (base_ != nullptr) ::munmap(const_cast<std::uint8_t*>(base_), size_);
+        if (fd_ >= 0) ::close(fd_);
+    }
+    Mapped(const Mapped&) = delete;
+    Mapped& operator=(const Mapped&) = delete;
+    [[nodiscard]] std::span<const std::uint8_t> bytes(std::uint64_t offset, std::uint64_t size) const {
+        if (offset > size_ || size > size_ - offset) throw std::out_of_range("deepseek41 device forward: tensor outside the file");
+        return {base_ + offset, static_cast<std::size_t>(size)};
+    }
+
+private:
+    int fd_ = -1;
+    std::uint64_t size_ = 0;
+    const std::uint8_t* base_ = nullptr;
+};
+
+// Routes of one window resident on the device (gate/up reads rows, down reads and writes slots).
+struct DeviceRoutes {
+    Dev<std::uint32_t> experts, begins, rows, slots, order, low_counts;
+    std::uint32_t expert_count = 0, max_rows = 0;
+    DeviceRoutes(const ds41::WindowRoutes& r, hipStream_t s)
+        : experts(r.experts.size()), begins(r.begins.size()), rows(r.rows.size()), slots(r.slots.size()), order(r.order.size()),
+          low_counts(r.low_counts.size()), expert_count(static_cast<std::uint32_t>(r.experts.size())), max_rows(r.max_rows) {
+        experts.upload(r.experts, s);
+        begins.upload(r.begins, s);
+        rows.upload(r.rows, s);
+        slots.upload(r.slots, s);
+        order.upload(r.order, s);
+        low_counts.upload(r.low_counts, s);
+    }
+    [[nodiscard]] ds41::RoutesView gate_up() const { return {experts.p, begins.p, rows.p, slots.p, expert_count, max_rows}; }
+    [[nodiscard]] ds41::RoutesView down() const { return {experts.p, begins.p, slots.p, slots.p, expert_count, max_rows}; }
+};
+
+// out = a + b elementwise (one rounding): the canonical y = y0 + y1 of the two K-halves of wo_b.
+__global__ void add_halves(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, std::uint32_t n) {
+    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = a[i] + b[i];
+}
+
+// STRIX_DS41_COMPRESS_RING: the ratio-2 carries of a rolled-back window, every layer in one launch (block b: layer b),
+// exactly the copies and memsets of commit_window: open, the kept last row's (kv, score) and valid 1; else zeros.
+struct CarryRestore {
+    std::uint32_t* state;  // 2 x kHeadDim words: kv, score
+    std::uint32_t* valid;
+    const std::uint32_t* kv;
+    const std::uint32_t* score;
+};
+constexpr std::uint32_t max_carry_restores = 64;  // per launch: 2 KiB of kernel arguments
+struct CarryRestores {
+    CarryRestore layer[max_carry_restores];
+};
+__global__ void restore_carries(CarryRestores a, std::uint32_t open) {
+    const CarryRestore& c = a.layer[blockIdx.x];
+    constexpr std::uint32_t D = ds41::attn::kHeadDim;
+    for (std::uint32_t i = threadIdx.x; i < 2U * D; i += blockDim.x) c.state[i] = open != 0U ? (i < D ? c.kv[i] : c.score[i - D]) : 0U;
+    if (threadIdx.x == 0U) *c.valid = open;
+}
+
+std::uint64_t row_bytes(ds41::WeightFormat f, std::uint32_t width) {
+    return std::uint64_t{width} / ds41::block_elements(f) * ds41::block_bytes(f);
+}
+
+double seconds_since(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
+}
+
+// Byte ranges of the model file into device memory through a pinned staging buffer, read with O_DIRECT so the
+// weights never enter the page cache (resident weights + a cached copy would not fit next to each other).
+class DirectLoader {
+public:
+    static constexpr std::uint64_t align = 4096, chunk = 256ULL << 20U;
+    explicit DirectLoader(const std::filesystem::path& path) {
+        fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+        if (fd_ < 0) fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd_ < 0) throw std::runtime_error("deepseek41 device forward: cannot open " + path.string());
+        check(hipHostMalloc(reinterpret_cast<void**>(&buffer_), chunk + 2U * align, hipHostMallocDefault), "staging buffer");
+    }
+    ~DirectLoader() {
+        if (buffer_ != nullptr) (void)hipHostFree(buffer_);
+        if (fd_ >= 0) ::close(fd_);
+    }
+    DirectLoader(const DirectLoader&) = delete;
+    DirectLoader& operator=(const DirectLoader&) = delete;
+    void load(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* device) {
+        std::uint64_t done = 0;
+        while (done < bytes) {
+            const std::uint64_t at = offset + done, base = at & ~(align - 1U), lead = at - base;
+            const std::uint64_t take = std::min(bytes - done, chunk - lead);
+            const std::uint64_t want = (lead + take + align - 1U) & ~(align - 1U);
+            std::uint64_t got = 0;
+            while (got < lead + take) {
+                const auto n = ::pread(fd_, buffer_ + got, want - got, static_cast<off_t>(base + got));
+                if (n <= 0) throw std::runtime_error("deepseek41 device forward: short read of the weights");
+                got += static_cast<std::uint64_t>(n);
+            }
+            check(hipMemcpy(device + done, buffer_ + lead, take, hipMemcpyHostToDevice), "weight upload");
+            done += take;
+        }
+    }
+
+private:
+    int fd_ = -1;
+    std::uint8_t* buffer_ = nullptr;
+};
+
+// FNV of the live window of a ring (slot = position % capacity): positions max(0, T - window) .. T - 1 in order (older
+// slots are never read again, and a prefill on the exact cone does not write them).
+std::uint64_t ring_window_hash(const std::uint8_t* ring, std::uint32_t positions) {
+    namespace attn = ds41::attn;
+    std::uint64_t h = 14695981039346656037ULL;
+    const std::uint32_t first = positions > attn::kWindow ? positions - attn::kWindow : 0U;
+    for (std::uint32_t p = first; p < positions; ++p) {
+        const std::uint8_t* e = ring + std::size_t{p % AttentionHost::ring_capacity} * attn::kWindowEntryBytes;
+        for (std::uint32_t i = 0; i < attn::kWindowEntryBytes; ++i) h = (h ^ e[i]) * 1099511628211ULL;
+    }
+    return h;
+}
+
+}  // namespace
+
+struct DeviceForward::Impl {
+    DeviceForwardOptions options;
+    TargetModel model;
+    Plan plan;
+    std::unique_ptr<Mapped> file;
+    std::unique_ptr<ds41::WeightOverlay> overlay;
+    std::map<std::string, std::array<std::uint32_t, 4>> cb4;  // weights packed to CB4 and their tables
+    std::map<std::string, std::uint32_t> uniform;              // weights packed to U5 / U6 (bits)
+    std::set<std::string> router_bf16;                         // routers held as their exact BF16 copy
+    std::set<std::string> f8;                                  // F16 tensors held as their exact F8 rows
+    std::set<std::string> planar;                              // packed site weights in the planar layout
+    std::map<std::string, std::array<std::uint32_t, 2>> native_fp8;  // native FP8 site weights: rows, width (codes, then exponents)
+    Dev<float> fp8_gate, fp8_up;                                      // native FP8 shared expert: gate and up products [R][I]
+    std::map<std::string, const ManifestTensor*> tensors;
+    std::map<std::string, Dev<std::uint8_t>> weights;  // every tensor a device operation reads
+    std::unique_ptr<ds41::EngramHasher> hasher;
+    std::vector<std::uint64_t> engram_rows;
+    std::vector<std::uint32_t> history;  // tokens of positions [0, position) (export_state)
+    hipStream_t stream = nullptr;
+    std::uint32_t position = 0;
+    // attention piece state (device): per-layer rings, the KV sources' caches and ratio-2 carries (ping-pong),
+    // the candidate pool and each index source's selection
+    std::array<ds41::attn::LayerAttention, 40> roles{};
+    struct LayerState {
+        Dev<std::uint8_t> ring, kv_cache, idx_cache;
+        Dev<float> carry[2];
+        Dev<std::uint32_t> carry_valid[2];
+        int carry_cur = 0;
+        Dev<std::uint32_t> idx, idx_count;
+        Dev<float> ckv, cscore;  // compressor inputs of the last step's rows (the ratio-2 carry of a rolled-back window)
+    };
+    std::vector<LayerState> attn;
+    Dev<std::uint8_t> candidates;
+    std::vector<hipEvent_t> op_events;  // op_timing: one per plan step + 1
+    std::unique_ptr<ds41::StepTrace> trace;  // STRIX_DS41_STEP_TRACE (hip_ds41_step_trace.hpp), null when unset
+    Dev<std::uint32_t> op_ids;           // op_timing: every layer's route ids of the step (copied on the stream)
+    Dev<float> index_scores, iq, iw, attn_partial;
+    Dev<std::uint32_t> select_keys;
+    // stream_experts: device slots for the selected experts of one layer and their pinned staging
+    Dev<std::uint8_t> slot_gate, slot_up, slot_down;
+    std::uint8_t* slot_pinned = nullptr;
+    double stream_seconds = 0.0;  // last step: host time copying expert bytes (file -> pinned)
+    Dev<std::uint8_t> index_qprep;       // index scores scratch: R x kIdxPrepBytes
+    Dev<std::uint32_t> attn_tickets;     // R x kAttnGroupCount, zero between calls (the last chunk block combines)
+    Dev<std::uint32_t> router_tickets;   // 1, zero between calls (STRIX_DS41_ROUTER_FAST: the last scores block selects)
+    Dev<std::uint64_t> pos64;
+    Dev<ds41::attn::RopeRow> rope_rows;  // [window @ pos][compressed @ pos][compressed @ even group start], W rows each
+    std::uint32_t rows = 1;              // rows of the last step (a verify window: R > 1)
+    Dev<float> capture[3];               // capture_main_hidden: input streams of the last three layers, [R][hc][hidden]
+    Dev<float> streams[2];
+    int cur = 0;
+    bool identity_pre = true;  // pre_carry is the identity (before the first FFN site)
+    std::array<float, ds41::hc_copies> pre_carry{};
+    Dev<float> x, qr, q, kv, o, o_low, y, shared, raw, low, high, h, logits, emb, ekv, scores, route_w;
+    Dev<std::uint8_t> erows, image_row;  // erows: [engram layer of the range][row][column] x 264 B, uploaded once per step
+    std::uint8_t* erows_pinned = nullptr;  // pinned staging of erows (the upload is asynchronous)
+    Dev<std::uint32_t> token, pos, ids;
+    Dev<ds41::HcMix> mix_attn, mix_ffn;
+    Dev<float> mix_partial;
+    Dev<std::uint32_t> hc_counters;  // enqueue_hc_site's per-row counters, back at zero after every launch
+    Dev<std::int8_t> site_codes;
+    Dev<std::int8_t> o_codes;  // the attention output's A8 from its combine (STRIX_DS41_ATTN_A8=1)
+    Dev<float> o_deltas;
+    Dev<std::int32_t> o_sums;
+    Dev<float> site_deltas;
+    Dev<std::int32_t> site_sums;
+    Dev<std::int8_t> codes, act_codes, sh_act_codes;
+    Dev<float> deltas, act_deltas, sh_act_deltas;
+    Dev<std::int32_t> sums, act_sums, sh_act_sums;
+    Dev<ds41::ArgmaxCandidate> partial, cand0, cand1, best;
+    std::vector<std::uint32_t> route_ids;
+    // routed window of the current layer, built on the device from the router's ids (no host round trip)
+    struct BuiltRoutes {
+        Dev<std::uint32_t> experts, begins, rows, slots, order, low_counts, counts;
+    } built;
+    std::vector<float> logits_host;
+    std::uint32_t expert_first = 0, expert_end = 0;  // routed experts resident on this rank
+    // STRIX_DS41_EXPERT_TP=1 (two ranks): every routed expert split by its intermediate rows over the ranks
+    // (ds41-expert-tp2-i1152-v1, ds41_expert_tp.hpp); expert_first/end then cover all experts.
+    bool expert_tp = false;
+    ds41::VocabSlice head_slice{};                   // head rows resident on this rank
+    std::unique_ptr<ds41::EngramRowReader> engram_reader;
+    std::vector<std::uint8_t> engram_bytes;  // Engram rows of the current token, [engram layer][column] x 264 B
+    // STRIX_DS41_ENGRAM_ASYNC=1: the NVMe reads run on a host thread, one batch per Engram layer straight into its
+    // pinned staging, while the plan is enqueued; each layer's upload waits only for its own rows (same bytes).
+    bool engram_async = false;
+    // STRIX_DS41_COMPRESS_RING=1: commit_window restores every ratio-2 carry in one kernel and does not synchronise (the
+    // carries are only read by the stream's later work; host reads of them download, which synchronises).
+    bool compress_ring = false;
+    std::map<std::uint32_t, std::unique_ptr<DeviceRoutes>> shared_routes;  // per window rows (one shared expert)
+    Dev<float> half_own, half_other;  // half sums [R][H], then (split shared expert) this rank's shared rows [R][H / 2]
+    Dev<ds41::ArgmaxCandidate> cand_own, cand_other;
+    // world 2, shared expert split by rows over the ranks (DeviceForwardOptions::split_shared): this rank's A8
+    // activation half [R][I / 2] codes then [R][I / 64] deltas, and the peer's; the slot of the shared_expert hash.
+    bool split_shared = false;
+    Dev<std::uint8_t> shx_own, shx_other;
+    std::size_t shared_hash_at = 0;
+    [[nodiscard]] bool distributed() const noexcept { return options.world == 2U; }
+    [[nodiscard]] double comm_seconds() const { return distributed() ? options.communicator->stats().seconds : 0.0; }
+
+    std::span<const std::uint8_t> host_tensor(const std::string& name) const {
+        const auto it = tensors.find(name);
+        if (it == tensors.end()) throw std::invalid_argument("deepseek41 device forward: no tensor " + name);
+        if (overlay)
+            if (const auto* e = overlay->find(name)) return overlay->bytes(*e);
+        return file->bytes(it->second->absolute_offset, it->second->byte_size);
+    }
+    [[nodiscard]] const std::uint8_t* dev(const std::string& name) const { return weights.at(name).p; }
+    void site_weight(ds41::Q8A8View& v, const std::string& name) const {  // Q8_0 rows, or CB4 rows of a packed overlay tensor
+        v.weight = dev(name);
+        if (const auto f = native_fp8.find(name); f != native_fp8.end()) {  // native FP8: codes, then the block exponents
+            v.packed = ds41::packed_native_fp8;
+            v.scales = v.weight + std::size_t{f->second[0]} * f->second[1];
+            v.planar = false;
+            return;
+        }
+        const auto it = cb4.find(name);
+        v.packed = it != cb4.end() ? 4U : uniform.contains(name) ? uniform.at(name) : 0U;
+        if (it != cb4.end()) std::copy(it->second.begin(), it->second.end(), v.table);
+        v.planar = planar.contains(name);
+    }
+    [[nodiscard]] const float* devf(const std::string& name) const { return reinterpret_cast<const float*>(weights.at(name).p); }
+    [[nodiscard]] const std::uint16_t* devh(const std::string& name) const {
+        return reinterpret_cast<const std::uint16_t*>(weights.at(name).p);
+    }
+    [[nodiscard]] std::vector<float> buffer(Buffer b) const;
+};
+
+std::vector<float> DeviceForward::Impl::buffer(Buffer b) const {
+    const auto& c = model.config;
+    const auto mix = [&](const ds41::HcMix* p) {
+        const auto m = download(p, 1, stream)[0];
+        std::vector<float> v;
+        v.insert(v.end(), m.pre.begin(), m.pre.end());
+        v.insert(v.end(), m.post.begin(), m.post.end());
+        v.insert(v.end(), m.comb.begin(), m.comb.end());
+        return v;
+    };
+    switch (b) {
+    case Buffer::stream: return download(streams[cur].p, plan.buffer_elements(b), stream);
+    case Buffer::mix_attn: return mix(mix_attn.p);
+    case Buffer::mix_ffn: return mix(mix_ffn.p);
+    case Buffer::pre_carry: return {pre_carry.begin(), pre_carry.end()};
+    case Buffer::x: return download(x.p, c.hidden_size, stream);
+    case Buffer::qr: return download(qr.p, c.q_lora_rank, stream);
+    case Buffer::q: return download(q.p, std::size_t{c.num_attention_heads} * c.head_dim, stream);
+    case Buffer::kvrow: return download(kv.p, c.head_dim, stream);
+    case Buffer::o: return download(o.p, std::size_t{c.num_attention_heads} * c.head_dim, stream);
+    case Buffer::o_low: return download(o_low.p, std::size_t{c.o_groups} * c.o_lora_rank, stream);
+    case Buffer::y: return download(y.p, c.hidden_size, stream);
+    case Buffer::shared: return download(shared.p, c.hidden_size, stream);
+    case Buffer::route_w: return download(route_w.p, c.num_experts_per_tok, stream);
+    case Buffer::raw: return download(raw.p, std::size_t{c.num_experts_per_tok} * c.hidden_size, stream);
+    default: throw std::logic_error("deepseek41 device forward: buffer without a device copy");
+    }
+}
+
+std::vector<Op> DeviceForward::host_ops() { return {}; }  // every operation runs on the device
+
+namespace {
+// Load-time choices from the environment, so every app built on DeviceForward can switch them without its own flags: a
+// requantization overlay when the caller sets none (STRIX_DS41_OVERLAY=FILE.gguf, STRIX_DS41_CB4=1 packs its sites), and
+// the exact storage forms STRIX_DS41_ROUTER_BF16 / STRIX_DS41_F16_AS_F8 (0 off, 1 on; unset: the caller's option).
+DeviceForwardOptions with_env_overlay(DeviceForwardOptions o) {
+    if (o.weights_overlay.empty())
+        if (const char* e = std::getenv("STRIX_DS41_OVERLAY"); e != nullptr && *e != 0) {
+            o.weights_overlay = e;
+            if (const char* c = std::getenv("STRIX_DS41_CB4"); c != nullptr && *c == '1') o.cb4_overlay = true;
+        }
+    const auto flag = [](const char* name, bool& value) {
+        if (const char* v = std::getenv(name); v != nullptr && (*v == '0' || *v == '1')) value = *v == '1';
+    };
+    flag("STRIX_DS41_ROUTER_BF16", o.router_bf16);
+    flag("STRIX_DS41_OP_TIMING", o.op_timing);
+    flag("STRIX_DS41_F16_AS_F8", o.f16_as_f8);
+    // native FP8 dense weights (default off): STRIX_DS41_NATIVE_FP8=DIR of the original checkpoint, STRIX_DS41_NATIVE_FP8_SITES=classes
+    if (o.native_fp8.empty())
+        if (const char* e = std::getenv("STRIX_DS41_NATIVE_FP8"); e != nullptr && *e != 0) o.native_fp8 = e;
+    if (const char* e = std::getenv("STRIX_DS41_NATIVE_FP8_SITES"); e != nullptr && *e != 0) o.native_fp8_sites = e;
+    return o;
+}
+}  // namespace
+
+DeviceForward::DeviceForward(const std::filesystem::path& gguf, const HostForwardOptions& options)
+    : DeviceForward(gguf, [&] {
+          DeviceForwardOptions o;
+          o.layers = options.layers;
+          o.max_positions = options.max_positions;
+          o.weights_overlay = options.weights_overlay;
+          return o;
+      }()) {}
+
+DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForwardOptions& options_in) : impl_(std::make_unique<Impl>()) {
+    const DeviceForwardOptions options = with_env_overlay(options_in);
+    const auto t_load = std::chrono::steady_clock::now();
+    auto& m = *impl_;
+    m.options = options;
+    if (options.world != 1U && options.world != 2U) throw std::invalid_argument("deepseek41 device forward: world must be 1 or 2");
+    if (options.world == 2U && (options.communicator == nullptr || options.rank > 1U))
+        throw std::invalid_argument("deepseek41 device forward: world 2 needs a communicator and rank 0 or 1");
+    m.model = validate_target(read_file(gguf));
+    m.plan = build_decode_plan(m.model, 0, options.layers);
+    m.file = std::make_unique<Mapped>(gguf);
+    if (!options.weights_overlay.empty()) m.overlay = std::make_unique<ds41::WeightOverlay>(options.weights_overlay, m.model.manifest);
+    for (const auto& t : m.model.manifest.tensors) m.tensors.emplace(t.name, &t);
+    check(hipStreamCreateWithFlags(&m.stream, hipStreamNonBlocking), "stream");
+    {
+        const auto& cfg = m.model.config;
+        const std::uint32_t per_rank = cfg.n_routed_experts / options.world;
+        m.expert_first = options.rank * per_rank;
+        m.expert_end = m.expert_first + per_rank;
+        m.expert_tp = ds41::expert_tp::enabled_from_env();
+        if (m.expert_tp) {
+            if (!m.distributed() || options.stream_experts || cfg.moe_intermediate_size != ds41::expert_tp::inter)
+                throw std::invalid_argument("deepseek41 device forward: STRIX_DS41_EXPERT_TP=1 needs two ranks, resident experts and I = 2304");
+            m.expert_first = 0;
+            m.expert_end = cfg.n_routed_experts;
+        }
+        m.head_slice = m.distributed() ? ds41::vocab_slice(cfg.vocab_size, 2U, options.rank) : ds41::VocabSlice{0U, cfg.vocab_size};
+    }
+    std::set<std::string> names;
+    for (const auto& s : m.plan.steps)
+        for (const auto& w : s.weights)
+            if (w.find("engram_embd") == std::string::npos) names.insert(w);  // Engram rows are read per token
+    DirectLoader loader(gguf);
+    std::unique_ptr<DirectLoader> overlay_loader;
+    if (m.overlay) overlay_loader = std::make_unique<DirectLoader>(m.overlay->path());
+    std::unique_ptr<ds41::SafetensorsCheckpoint> checkpoint;
+    std::vector<std::string> fp8_classes;
+    if (!options.native_fp8.empty()) {
+        checkpoint = std::make_unique<ds41::SafetensorsCheckpoint>(options.native_fp8);
+        fp8_classes = ds41::parse_fp8_site_classes(options.native_fp8_sites);
+    }
+    for (const auto& n : names) {
+        const auto* t = m.tensors.at(n);
+        if (checkpoint) {  // native FP8 site weight: the checkpoint's codes and block exponents instead of the Q8_0 tensor
+            const auto cls = ds41::fp8_site_class(n);
+            if (cls && std::find(fp8_classes.begin(), fp8_classes.end(), *cls) != fp8_classes.end()) {
+                const auto rows = static_cast<std::uint32_t>(t->dimensions[1]), width = static_cast<std::uint32_t>(t->dimensions[0]);
+                const auto host = ds41::read_fp8_tensor(*checkpoint, *ds41::fp8_original_name(n), rows, width);
+                Dev<std::uint8_t> d(host.bytes.size());
+                check(hipMemcpy(d.p, host.bytes.data(), host.bytes.size(), hipMemcpyHostToDevice), "native FP8 weight upload");
+                m.native_fp8.emplace(n, std::array<std::uint32_t, 2>{rows, width});
+                m.weights.emplace(n, std::move(d));
+                continue;
+            }
+        }
+        const auto* over = m.overlay ? m.overlay->find(n) : nullptr;
+        std::uint64_t offset = over != nullptr ? over->absolute_offset : t->absolute_offset, bytes = t->byte_size;
+        if (options.stream_experts && n.ends_with("_exps.weight")) continue;  // read per layer from the file
+        if (m.expert_tp && n.ends_with("_exps.weight")) {  // this rank's part of every expert (ds41_expert_tp.hpp)
+            const auto& cfg = m.model.config;
+            const bool down = n.ends_with("ffn_down_exps.weight");
+            Dev<std::uint8_t> d(ds41::expert_tp::part_bytes(bytes, cfg.n_routed_experts, down, cfg.hidden_size));
+            auto& from = over != nullptr ? *overlay_loader : loader;
+            ds41::expert_tp::load_part([&](std::uint64_t o, std::uint64_t b, std::uint8_t* dst) { from.load(o, b, dst); }, offset, bytes,
+                                       cfg.n_routed_experts, down, cfg.hidden_size, options.rank, d.p, m.stream);
+            m.weights.emplace(n, std::move(d));
+            continue;
+        }
+        if (n.ends_with("_exps.weight")) {  // [experts][rows][row bytes]: this rank's expert range only
+            const std::uint64_t per = bytes / m.model.config.n_routed_experts;
+            offset += per * m.expert_first;
+            bytes = per * (m.expert_end - m.expert_first);
+        } else if (n == "output.weight") {  // [vocab][row bytes]: this rank's vocabulary slice only
+            const std::uint64_t per = bytes / m.model.config.vocab_size;
+            offset += per * m.head_slice.first;
+            bytes = per * m.head_slice.count;
+        }
+        const bool site = n.ends_with("attn_q_a.weight") || n.ends_with("attn_q_b.weight") || n.ends_with("attn_kv.weight") ||
+                          n.ends_with("attn_output_a.weight") || n.ends_with("attn_output_b.weight") || n == "output.weight" ||
+                          n.ends_with("_shexp.weight");
+        // F8 only where it pays: engram_kv (25600 x 6144); indexer.attn_q_b is also exact but its narrow rows run no faster
+        if (options.f16_as_f8 && n.ends_with("engram_kv.weight")) {
+            const auto f16 = m.host_tensor(n);
+            const auto packed = ds41::pack_f16_as_f8(
+                std::span<const std::uint16_t>(reinterpret_cast<const std::uint16_t*>(f16.data()), f16.size() / 2U), t->dimensions[0]);
+            if (packed) {
+                Dev<std::uint8_t> d(packed->size());
+                check(hipMemcpy(d.p, packed->data(), packed->size(), hipMemcpyHostToDevice), "F8 weight upload");
+                m.f8.insert(n);
+                m.weights.emplace(n, std::move(d));
+                continue;
+            }
+        }
+        if (options.router_bf16 && n.ends_with("ffn_gate_inp.weight")) {  // exact BF16 copy of an F32 router
+            const auto f32 = m.host_tensor(n);
+            std::vector<std::uint16_t> half(f32.size() / 4U);
+            bool exact = true;
+            for (std::size_t i = 0; i < half.size(); ++i) {
+                std::uint32_t u;
+                std::memcpy(&u, f32.data() + 4U * i, 4);
+                exact = exact && (u & 0xffffU) == 0U;
+                half[i] = static_cast<std::uint16_t>(u >> 16U);
+            }
+            if (exact) {
+                Dev<std::uint8_t> d(half.size() * 2U);
+                check(hipMemcpy(d.p, half.data(), half.size() * 2U, hipMemcpyHostToDevice), "BF16 router upload");
+                m.router_bf16.insert(n);
+                m.weights.emplace(n, std::move(d));
+                continue;
+            }
+        }
+        if (over != nullptr && options.cb4_overlay && site) {  // packed rows of this rank's range (ds41_packed)
+            const auto whole = m.overlay->bytes(*over);
+            if (const auto choice = ds41::choose_packing(whole)) {
+                const bool planar = options.packed_planar && !n.ends_with("_shexp.weight");
+                const auto packed = ds41::pack_rows(whole.subspan(offset - over->absolute_offset, bytes), t->dimensions[0], *choice,
+                                                    planar ? ds41::PackedLayout::planar : ds41::PackedLayout::interleaved);
+                if (planar) m.planar.insert(n);
+                Dev<std::uint8_t> d(packed.size());
+                check(hipMemcpy(d.p, packed.data(), packed.size(), hipMemcpyHostToDevice), "packed weight upload");
+                if (choice->kind == ds41::PackedKind::cb4) {
+                    std::array<std::uint32_t, 4> words{};
+                    std::memcpy(words.data(), choice->table.data(), 16);
+                    m.cb4.emplace(n, words);
+                } else {
+                    m.uniform.emplace(n, static_cast<std::uint32_t>(choice->kind));
+                }
+                m.weights.emplace(n, std::move(d));
+                continue;
+            }
+        }
+        Dev<std::uint8_t> d(bytes);
+        (over != nullptr ? *overlay_loader : loader).load(offset, bytes, d.p);
+        m.weights.emplace(n, std::move(d));
+    }
+    // The declared identities of the steps on native FP8 weights (the shared expert only with all three tensors).
+    for (auto& s : m.plan.steps) {
+        if (s.weights.empty() || !m.native_fp8.contains(s.weights[0])) continue;
+        if (s.op == Op::shared_expert) {
+            if (!m.native_fp8.contains(s.weights[1]) || !m.native_fp8.contains(s.weights[2]))
+                throw std::logic_error("deepseek41 device forward: native FP8 shared expert needs gate, up and down");
+            s.identity = ds41::fp8_swiglu_identity;
+        } else {
+            s.identity = s.op == Op::o_a ? ds41::fp8_grouped_identity : s.op == Op::o_b ? ds41::fp8_ksplit_identity : ds41::fp8_product_identity;
+        }
+    }
+    m.hasher = std::make_unique<ds41::EngramHasher>(m.model.engram);
+    m.engram_rows.assign(std::size_t{m.hasher->layers()} * m.hasher->columns(), 0U);
+    if (options.engram_direct_io) {
+        std::vector<ds41::EngramTable> tables;
+        for (const auto l : m.model.engram.layer_ids) {
+            const auto* t = m.tensors.at("blk." + std::to_string(l) + ".engram_embd.weight");
+            tables.push_back({t->absolute_offset, t->byte_size / 264U});
+        }
+        m.engram_reader = std::make_unique<ds41::EngramRowReader>(gguf, std::move(tables), ds41::engram_reader_threads(64U), true);  // 64 on the pair since P15
+    }
+
+    const auto& c = m.model.config;
+    namespace attn = ds41::attn;
+    m.roles = attn::released_plan();  // the host forward's AttentionHost checks these roles against the model
+    std::uint32_t max_count = 1, source_ratio = 0;
+    constexpr std::size_t W = max_window_rows;  // every activation buffer holds a verify window
+    for (std::uint32_t l = 0; l < options.layers; ++l) {
+        const auto& r = m.roles[l];
+        Impl::LayerState L;
+        L.ring = Dev<std::uint8_t>(std::size_t{AttentionHost::ring_capacity} * attn::kWindowEntryBytes);
+        check(hipMemsetAsync(L.ring.p, 0, L.ring.n, m.stream), "ring");
+        if (r.owns_kv) {
+            const std::size_t entries = options.max_positions / r.ratio + 1U;
+            max_count = std::max<std::uint32_t>(max_count, static_cast<std::uint32_t>(entries));
+            L.kv_cache = Dev<std::uint8_t>(entries * attn::kKvEntryBytes);
+            L.idx_cache = Dev<std::uint8_t>(entries * attn::kIdxEntryBytes);
+            check(hipMemsetAsync(L.kv_cache.p, 0, L.kv_cache.n, m.stream), "kv cache");
+            check(hipMemsetAsync(L.idx_cache.p, 0, L.idx_cache.n, m.stream), "index cache");
+            L.ckv = Dev<float>(W * attn::kHeadDim);
+            L.cscore = Dev<float>(W * attn::kHeadDim);
+            for (int k = 0; k < 2; ++k) {
+                L.carry[k] = Dev<float>(2U * attn::kHeadDim);
+                L.carry_valid[k] = Dev<std::uint32_t>(1);
+                check(hipMemsetAsync(L.carry[k].p, 0, L.carry[k].n * 4U, m.stream), "carry");
+                check(hipMemsetAsync(L.carry_valid[k].p, 0, 4U, m.stream), "carry");
+            }
+        }
+        if (r.owns_index) {
+            L.idx = Dev<std::uint32_t>(W * attn::kTopK);
+            L.idx_count = Dev<std::uint32_t>(W);
+            check(hipMemsetAsync(L.idx.p, 0, W * attn::kTopK * 4U, m.stream), "top-k");
+            check(hipMemsetAsync(L.idx_count.p, 0, W * 4U, m.stream), "top-k");
+        }
+        if (r.candidate_source) source_ratio = r.ratio;
+        m.attn.push_back(std::move(L));
+    }
+    const std::size_t cand_bytes = source_ratio != 0U ? (options.max_positions / source_ratio + attn::kCandBlockSize) / attn::kCandBlockSize
+                                                      : (max_count + attn::kCandBlockSize) / attn::kCandBlockSize;
+    m.candidates = Dev<std::uint8_t>(W * cand_bytes);
+    check(hipMemsetAsync(m.candidates.p, 0, W * cand_bytes, m.stream), "candidates");
+    m.index_scores = Dev<float>(W * max_count);
+    m.select_keys = Dev<std::uint32_t>(W * max_count);
+    m.iq = Dev<float>(W * attn::kIdxHeads * attn::kIdxDim);
+    m.iw = Dev<float>(W * attn::kIdxHeads);
+    if (options.stream_experts) {
+        if (options.world != 1U) throw std::invalid_argument("deepseek41 device forward: stream_experts is a one-node mode");
+        const std::uint64_t gs = row_bytes(ds41::WeightFormat::iq2_xxs, c.hidden_size) * c.moe_intermediate_size;
+        const std::uint64_t ds = row_bytes(ds41::WeightFormat::q2_k, c.moe_intermediate_size) * c.hidden_size;
+        const std::uint64_t k = c.num_experts_per_tok;
+        m.slot_gate = Dev<std::uint8_t>(k * gs);
+        m.slot_up = Dev<std::uint8_t>(k * gs);
+        m.slot_down = Dev<std::uint8_t>(k * ds);
+        check(hipHostMalloc(reinterpret_cast<void**>(&m.slot_pinned), k * (2U * gs + ds), hipHostMallocDefault), "expert staging");
+    }
+    m.index_qprep = Dev<std::uint8_t>(std::size_t{W} * attn::hip::kIdxPrepBytes);
+    m.attn_tickets = Dev<std::uint32_t>(std::size_t{W} * attn::hip::kAttnGroupCount);
+    check(hipMemsetAsync(m.attn_tickets.p, 0, m.attn_tickets.n * 4U, m.stream), "attention tickets");
+    m.router_tickets = Dev<std::uint32_t>(1);
+    check(hipMemsetAsync(m.router_tickets.p, 0, 4U, m.stream), "router tickets");
+    m.attn_partial = Dev<float>(W * attn::kHeads * attn::kMaxChunks * (2U + attn::kHeadDim));
+    m.pos64 = Dev<std::uint64_t>(W);
+    m.rope_rows = Dev<attn::RopeRow>(3U * W);
+    const std::size_t H = c.hidden_size, hc = c.hc_mult, I = c.moe_intermediate_size, K = c.num_experts_per_tok;
+    m.streams[0] = Dev<float>(W * hc * H);
+    m.streams[1] = Dev<float>(W * hc * H);
+    if (options.capture_main_hidden) {
+        if (options.layers < 4U) throw std::invalid_argument("deepseek41 device forward: capture_main_hidden needs at least 4 layers");
+        for (auto& cap : m.capture) cap = Dev<float>(W * hc * H);
+    }
+    m.x = Dev<float>(W * H);
+    m.qr = Dev<float>(W * c.q_lora_rank);
+    m.q = Dev<float>(W * c.num_attention_heads * c.head_dim);
+    m.kv = Dev<float>(W * c.head_dim);
+    m.o = Dev<float>(W * c.num_attention_heads * c.head_dim);
+    m.o_low = Dev<float>(W * c.o_groups * c.o_lora_rank);
+    m.y = Dev<float>(W * H);
+    m.shared = Dev<float>(W * H);
+    m.raw = Dev<float>(W * K * H);
+    m.low = Dev<float>(W * H);
+    m.high = Dev<float>(W * H);
+    m.h = Dev<float>(W * H);
+    m.logits = Dev<float>(W * c.vocab_size);  // [row][vocab]
+    const std::size_t cols = m.model.engram.rows_per_token();
+    m.erows = Dev<std::uint8_t>(std::size_t{m.model.engram.layer_ids.size()} * W * cols * 264U);
+    check(hipHostMalloc(reinterpret_cast<void**>(&m.erows_pinned), m.erows.n, hipHostMallocDefault), "engram staging");
+    m.emb = Dev<float>(W * cols * 256U);
+    m.ekv = Dev<float>(W * H * (hc + 1U));
+    m.scores = Dev<float>(W * c.n_routed_experts);
+    m.route_w = Dev<float>(W * K);
+    m.ids = Dev<std::uint32_t>(W * K);
+    if (options.op_timing) {
+        m.op_ids = Dev<std::uint32_t>(std::size_t{options.layers} * max_window_rows * K);
+        check(hipMemset(m.op_ids.p, 0xff, m.op_ids.n * 4U), "op timing ids");
+    }
+    if (const int level = ds41::StepTrace::env_level(); level != 0) m.trace = std::make_unique<ds41::StepTrace>(level, options.rank);
+    if (options.op_timing || (m.trace && m.trace->level() == 1)) {
+        m.op_events.resize(m.plan.steps.size() + 1U);
+        for (auto& e : m.op_events) check(hipEventCreate(&e), "op timing event");
+    }
+    m.image_row = Dev<std::uint8_t>(W);
+    m.image_row.upload(std::vector<std::uint8_t>(W, 0), m.stream);
+    m.token = Dev<std::uint32_t>(W);
+    m.pos = Dev<std::uint32_t>(W);
+    m.mix_attn = Dev<ds41::HcMix>(W);
+    m.mix_ffn = Dev<ds41::HcMix>(W);
+    m.mix_partial = Dev<float>(ds41::hc_mix_partial_floats(static_cast<std::uint32_t>(W), static_cast<std::uint32_t>(H)));
+    m.hc_counters = Dev<std::uint32_t>(ds41::hc_site_counter_count(static_cast<std::uint32_t>(W)));
+    m.hc_counters.upload(std::vector<std::uint32_t>(m.hc_counters.n, 0U), m.stream);
+    const std::size_t site_width = std::max<std::size_t>({H, c.q_lora_rank, std::size_t{c.num_attention_heads} * c.head_dim,
+                                                          std::size_t{c.o_groups} * c.o_lora_rank});
+    m.site_codes = Dev<std::int8_t>(W * site_width);
+    m.o_codes = Dev<std::int8_t>(W * c.num_attention_heads * c.head_dim);
+    m.o_deltas = Dev<float>(W * c.num_attention_heads * c.head_dim / 32U);
+    m.o_sums = Dev<std::int32_t>(W * c.num_attention_heads * c.head_dim / 32U);
+    m.site_deltas = Dev<float>(W * site_width / 32U);
+    m.site_sums = Dev<std::int32_t>(W * site_width / 32U);
+    m.codes = Dev<std::int8_t>(W * H);
+    m.deltas = Dev<float>(W * H / 32U);
+    m.sums = Dev<std::int32_t>(W * H / 32U);
+    m.act_codes = Dev<std::int8_t>(W * K * I);
+    m.act_deltas = Dev<float>(W * K * I / 32U);
+    m.act_sums = Dev<std::int32_t>(W * K * I / 32U);
+    m.sh_act_codes = Dev<std::int8_t>(W * I);
+    m.sh_act_deltas = Dev<float>(W * I / 32U);
+    m.sh_act_sums = Dev<std::int32_t>(W * I / 32U);
+    if (!m.native_fp8.empty()) {
+        m.fp8_gate = Dev<float>(W * I);
+        m.fp8_up = Dev<float>(W * I);
+    }
+    std::uint32_t partial_blocks = 0;
+    for (std::uint32_t r = 0; r < 2U; ++r)
+        partial_blocks = std::max(partial_blocks, ds41::argmax_partial_blocks(ds41::vocab_slice(c.vocab_size, 2U, r).count));
+    m.partial = Dev<ds41::ArgmaxCandidate>(W * partial_blocks);
+    m.cand0 = Dev<ds41::ArgmaxCandidate>(W);
+    m.cand1 = Dev<ds41::ArgmaxCandidate>(W);
+    m.best = Dev<ds41::ArgmaxCandidate>(W);
+    m.cand_own = Dev<ds41::ArgmaxCandidate>(W);
+    m.cand_other = Dev<ds41::ArgmaxCandidate>(W);
+    // two ranks: the split shared expert is opt-in (options.split_shared or STRIX_DS41_SPLIT_SHARED=1). P10 measured it
+    // equal to the overlapped form at R1 and 6-7 ms slower per verify window at R >= 2 (its extra exchanges).
+    m.split_shared = m.distributed() && (options.split_shared || [] {
+        const char* v = std::getenv("STRIX_DS41_SPLIT_SHARED");
+        return v && *v == '1';
+    }());
+    // P13 defaults (main 00:15, after P12): HC_SITE, QA_KV, ENGRAM_ASYNC and COMPRESS_RING on, =0 turns each off.
+    m.engram_async = [] {
+        const char* v = std::getenv("STRIX_DS41_ENGRAM_ASYNC");
+        return !(v && *v == '0');
+    }();
+    m.compress_ring = [] {
+        const char* v = std::getenv("STRIX_DS41_COMPRESS_RING");
+        return !(v && *v == '0');
+    }();
+    if (m.split_shared && (I % 64U != 0U || H % 2U != 0U)) throw std::invalid_argument("deepseek41 device forward: shared split geometry");
+    m.half_own = Dev<float>(W * H + (m.split_shared ? W * H / 2U : 0U));
+    m.half_other = Dev<float>(W * H + (m.split_shared ? W * H / 2U : 0U));
+    if (m.split_shared) {
+        m.shx_own = Dev<std::uint8_t>(W * I / 2U + W * I / 64U * 4U);
+        m.shx_other = Dev<std::uint8_t>(W * I / 2U + W * I / 64U * 4U);
+    }
+    {
+        const std::size_t n = W * K + 1U;
+        m.built.experts = Dev<std::uint32_t>(n);
+        m.built.begins = Dev<std::uint32_t>(n);
+        m.built.rows = Dev<std::uint32_t>(n);
+        m.built.slots = Dev<std::uint32_t>(n);
+        m.built.order = Dev<std::uint32_t>(n);
+        m.built.low_counts = Dev<std::uint32_t>(n);
+        m.built.counts = Dev<std::uint32_t>(2);
+    }
+    for (std::uint32_t r = 1; r <= W; ++r)  // the shared expert as expert 0 of a one-expert window of r rows
+        m.shared_routes.emplace(r, std::make_unique<DeviceRoutes>(ds41::build_window_routes(std::vector<std::uint32_t>(r, 0U), r, 1U, 1U), m.stream));
+    check(hipStreamSynchronize(m.stream), "setup");
+    load_seconds_ = seconds_since(t_load);
+}
+
+DeviceForward::~DeviceForward() {
+    if (impl_ && impl_->slot_pinned != nullptr) (void)hipHostFree(impl_->slot_pinned);
+    if (impl_ && impl_->erows_pinned != nullptr) (void)hipHostFree(impl_->erows_pinned);
+    if (impl_)
+        for (auto e : impl_->op_events) (void)hipEventDestroy(e);
+    if (impl_ && impl_->stream != nullptr) (void)hipStreamDestroy(impl_->stream);
+}
+
+const float* DeviceForward::device_logits() const noexcept { return impl_->logits.p; }
+
+std::size_t DeviceForward::cb4_tensors() const noexcept {
+    return impl_->cb4.size() + impl_->uniform.size() + impl_->router_bf16.size() + impl_->f8.size();
+}
+
+std::string DeviceForward::overlay_description() const { return impl_->overlay ? impl_->overlay->describe() : std::string{}; }
+
+std::string DeviceForward::storage_description() const {
+    const auto& m = *impl_;
+    std::string out = "packed sites " + std::to_string(m.cb4.size() + m.uniform.size()) + ", BF16 routers " +
+                      std::to_string(m.router_bf16.size()) + ", F8 rows " + std::to_string(m.f8.size());
+    if (!m.native_fp8.empty())
+        out += ", native FP8 sites " + std::to_string(m.native_fp8.size()) + " (" + m.options.native_fp8.string() + ")";
+    return out;
+}
+
+double DeviceForward::last_stream_seconds() const noexcept { return impl_->stream_seconds; }
+
+std::vector<std::pair<std::string, std::uint64_t>> DeviceForward::state_hashes() const {
+    const auto& m = *impl_;
+    namespace attn = ds41::attn;
+    const auto fnv_bytes = [](const void* data, std::size_t n, std::uint64_t h = 14695981039346656037ULL) {
+        const auto* b = static_cast<const std::uint8_t*>(data);
+        for (std::size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ULL;
+        return h;
+    };
+    std::vector<std::pair<std::string, std::uint64_t>> out;
+    for (std::uint32_t l = 0; l < m.options.layers; ++l) {
+        const auto& r = m.roles[l];
+        const auto& L = m.attn[l];
+        const std::string at = "@" + std::to_string(l);
+        const auto ring = download(L.ring.p, L.ring.n, m.stream);
+        out.emplace_back("ring" + at, ring_window_hash(ring.data(), m.position));
+        if (r.owns_kv) {
+            const std::size_t entries = m.position / r.ratio;
+            const auto kv = download(L.kv_cache.p, entries * attn::kKvEntryBytes, m.stream);
+            const auto ix = download(L.idx_cache.p, entries * attn::kIdxEntryBytes, m.stream);
+            out.emplace_back("kv" + at, fnv_bytes(kv.data(), kv.size()));
+            out.emplace_back("idx_keys" + at, fnv_bytes(ix.data(), ix.size()));
+            if (r.ratio == 2U) {
+                const auto carry = download(L.carry[L.carry_cur].p, L.carry[L.carry_cur].n, m.stream);
+                const auto valid = download(L.carry_valid[L.carry_cur].p, 1, m.stream);
+                out.emplace_back("carry" + at, valid[0] != 0U ? fnv_bytes(carry.data(), carry.size() * 4U) : 0U);
+            }
+        }
+        if (r.owns_index) {  // after step(token) the last row is row 0 of the window
+            const auto count = download(L.idx_count.p, 1, m.stream)[0];
+            const auto idx = download(L.idx.p, count, m.stream);
+            out.emplace_back("topk" + at, fnv_bytes(idx.data(), idx.size() * 4U, count));
+        }
+    }
+    return out;
+}
+
+AttentionState DeviceForward::export_state() const {
+    const auto& m = *impl_;
+    namespace attn = ds41::attn;
+    AttentionState s;
+    s.position = m.position;
+    s.next_token = next_token_;
+    s.tokens = m.history;
+    s.layers.resize(m.options.layers);
+    for (std::uint32_t l = 0; l < m.options.layers; ++l) {
+        const auto& r = m.roles[l];
+        const auto& L = m.attn[l];
+        auto& S = s.layers[l];
+        S.owns_kv = r.owns_kv;
+        S.owns_index = r.owns_index;
+        S.ratio = r.ratio;
+        S.ring = download(L.ring.p, L.ring.n, m.stream);
+        if (r.owns_kv) {
+            const std::size_t entries = m.position / r.ratio;
+            S.kv = download(L.kv_cache.p, entries * attn::kKvEntryBytes, m.stream);
+            S.idx_keys = download(L.idx_cache.p, entries * attn::kIdxEntryBytes, m.stream);
+            if (r.ratio == 2U) {
+                S.carry = download(L.carry[L.carry_cur].p, L.carry[L.carry_cur].n, m.stream);
+                S.carry_valid = download(L.carry_valid[L.carry_cur].p, 1, m.stream)[0] != 0U;
+            }
+        }
+        if (r.owns_index) {  // the last row is row m.rows - 1 of the last window
+            const std::uint32_t last = m.rows - 1U;
+            const auto count = download(L.idx_count.p + last, 1, m.stream)[0];
+            S.topk = download(L.idx.p + std::size_t{last} * attn::kTopK, count, m.stream);
+        }
+    }
+    return s;
+}
+
+void DeviceForward::import_state(const AttentionState& s) {
+    auto& m = *impl_;
+    namespace attn = ds41::attn;
+    const auto fail = [](const std::string& what) { throw std::invalid_argument("deepseek41 device forward: import_state: " + what); };
+    if (s.layers.size() != m.options.layers) fail("the state has " + std::to_string(s.layers.size()) + " layers, the forward " + std::to_string(m.options.layers));
+    if (s.position >= m.options.max_positions) fail("position " + std::to_string(s.position) + " leaves no room in max_positions");
+    if (s.tokens.size() != s.position) fail("token history length != position");
+    if (s.position == 0U) fail("an empty state (start a fresh forward instead)");
+    hipStream_t st = m.stream;
+    std::vector<std::uint32_t> counts(m.options.layers, 0U);  // host sources of the top-k counts, alive until the sync
+    for (std::uint32_t l = 0; l < m.options.layers; ++l) {
+        const auto& r = m.roles[l];
+        auto& L = m.attn[l];
+        const auto& S = s.layers[l];
+        if (S.owns_kv != r.owns_kv || S.owns_index != r.owns_index || (r.owns_kv && S.ratio != r.ratio)) fail("layer " + std::to_string(l) + " roles differ");
+        if (S.ring.size() != L.ring.n) fail("ring size of layer " + std::to_string(l));
+        check(hipMemcpyAsync(L.ring.p, S.ring.data(), L.ring.n, hipMemcpyHostToDevice, st), "import ring");
+        if (r.owns_kv) {
+            const std::size_t entries = s.position / r.ratio;
+            if (S.kv.size() != entries * attn::kKvEntryBytes || S.idx_keys.size() != entries * attn::kIdxEntryBytes) fail("cache size of layer " + std::to_string(l));
+            check(hipMemsetAsync(L.kv_cache.p, 0, L.kv_cache.n, st), "import kv");
+            check(hipMemsetAsync(L.idx_cache.p, 0, L.idx_cache.n, st), "import idx");
+            check(hipMemcpyAsync(L.kv_cache.p, S.kv.data(), S.kv.size(), hipMemcpyHostToDevice, st), "import kv");
+            check(hipMemcpyAsync(L.idx_cache.p, S.idx_keys.data(), S.idx_keys.size(), hipMemcpyHostToDevice, st), "import idx");
+            for (int k = 0; k < 2; ++k) {
+                check(hipMemsetAsync(L.carry[k].p, 0, L.carry[k].n * 4U, st), "import carry");
+                check(hipMemsetAsync(L.carry_valid[k].p, 0, 4U, st), "import carry");
+            }
+            L.carry_cur = 0;
+            if (r.ratio == 2U && S.carry_valid) {
+                if (S.carry.size() != L.carry[0].n) fail("carry size of layer " + std::to_string(l));
+                check(hipMemcpyAsync(L.carry[0].p, S.carry.data(), S.carry.size() * 4U, hipMemcpyHostToDevice, st), "import carry");
+                check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(L.carry_valid[0].p), 1, 1, st), "import carry");
+            }
+        }
+        if (r.owns_index) {  // the last row's selection as row 0 (state_hashes reads it; the next step overwrites it)
+            if (S.topk.size() > attn::kTopK) fail("top-k size of layer " + std::to_string(l));
+            const std::uint32_t count = counts[l] = S.topk_known ? static_cast<std::uint32_t>(S.topk.size()) : 0U;
+            check(hipMemsetAsync(L.idx_count.p, 0, L.idx_count.n * 4U, st), "import top-k");
+            check(hipMemcpyAsync(L.idx_count.p, &counts[l], 4U, hipMemcpyHostToDevice, st), "import top-k");
+            if (count != 0U) check(hipMemcpyAsync(L.idx.p, S.topk.data(), std::size_t{count} * 4U, hipMemcpyHostToDevice, st), "import top-k");
+        }
+    }
+    m.hasher->reset();
+    for (const auto t : s.tokens) m.hasher->push(t, m.engram_rows);
+    m.history = s.tokens;
+    m.position = s.position;
+    m.rows = 1;
+    next_token_ = s.next_token;
+    tokens_.assign(1, s.next_token);
+    check(hipStreamSynchronize(st), "import state");
+}
+
+std::uint64_t DeviceForward::weight_bytes() const noexcept {
+    std::uint64_t n = 0;
+    for (const auto& [name, d] : impl_->weights) n += d.n;
+    return n;
+}
+
+const std::vector<float>& DeviceForward::step(std::uint32_t token) {
+    const std::uint32_t one[1] = {token};
+    (void)step_window(one);
+    return impl_->logits_host;
+}
+
+std::uint32_t DeviceForward::next_position() const noexcept { return impl_->position; }
+void* DeviceForward::stream() const noexcept { return impl_->stream; }
+std::array<const float*, 3> DeviceForward::captured_streams() const {
+    if (!impl_->options.capture_main_hidden) throw std::logic_error("deepseek41 device forward: capture_main_hidden is off");
+    return {impl_->capture[0].p, impl_->capture[1].p, impl_->capture[2].p};
+}
+
+void DeviceForward::reset() {
+    auto& m = *impl_;
+    for (auto& L : m.attn) {
+        const auto zero = [&](void* p, std::size_t bytes) {
+            if (p != nullptr && bytes != 0U) check(hipMemsetAsync(p, 0, bytes, m.stream), "reset");
+        };
+        zero(L.ring.p, L.ring.n);
+        zero(L.kv_cache.p, L.kv_cache.n);
+        zero(L.idx_cache.p, L.idx_cache.n);
+        for (int k = 0; k < 2; ++k) {
+            zero(L.carry[k].p, L.carry[k].n * 4U);
+            zero(L.carry_valid[k].p, L.carry_valid[k].n * 4U);
+        }
+        L.carry_cur = 0;
+        zero(L.idx.p, L.idx.n * 4U);
+        zero(L.idx_count.p, L.idx_count.n * 4U);
+    }
+    check(hipMemsetAsync(m.candidates.p, 0, m.candidates.n, m.stream), "reset");
+    check(hipStreamSynchronize(m.stream), "reset");
+    m.hasher->reset();
+    m.history.clear();
+    m.position = 0;
+    m.rows = 1;
+    tokens_.clear();
+}
+
+void DeviceForward::commit_window(std::uint32_t kept) {
+    auto& m = *impl_;
+    const std::uint32_t R = m.rows;
+    if (kept == 0U || kept > R) throw std::invalid_argument("deepseek41 device forward: commit_window keeps 1..R rows");
+    if (kept == R) return;
+    const std::uint32_t first = m.position - R, last = first + kept - 1U;
+    // The ratio-2 compressor's pending group after row kept - 1: that row's (kv, score) when its position opens a
+    // group, else none (exactly what the compress kernel leaves after a last row at that position).
+    if (m.compress_ring) {
+        const std::size_t D = ds41::attn::kHeadDim;
+        CarryRestores a{};
+        std::uint32_t n = 0;
+        const auto launch = [&] {
+            if (n == 0U) return;
+            restore_carries<<<n, 256, 0, m.stream>>>(a, last % 2U == 0U ? 1U : 0U);
+            check(hipGetLastError(), "rollback carry");
+            n = 0;
+        };
+        for (std::uint32_t l = 0; l < m.options.layers; ++l) {
+            const auto& r = m.roles[l];
+            if (!r.owns_kv || r.ratio != 2U) continue;
+            auto& L = m.attn[l];
+            a.layer[n++] = {reinterpret_cast<std::uint32_t*>(L.carry[L.carry_cur].p), L.carry_valid[L.carry_cur].p,
+                            reinterpret_cast<const std::uint32_t*>(L.ckv.p + (kept - 1U) * D),
+                            reinterpret_cast<const std::uint32_t*>(L.cscore.p + (kept - 1U) * D)};
+            if (n == max_carry_restores) launch();
+        }
+        launch();
+    }
+    for (std::uint32_t l = 0; l < m.options.layers && !m.compress_ring; ++l) {
+        const auto& r = m.roles[l];
+        if (!r.owns_kv || r.ratio != 2U) continue;
+        auto& L = m.attn[l];
+        float* state = L.carry[L.carry_cur].p;
+        const std::size_t D = ds41::attn::kHeadDim;
+        if (last % 2U == 0U) {
+            check(hipMemcpyAsync(state, L.ckv.p + (kept - 1U) * D, D * 4U, hipMemcpyDeviceToDevice, m.stream), "rollback carry");
+            check(hipMemcpyAsync(state + D, L.cscore.p + (kept - 1U) * D, D * 4U, hipMemcpyDeviceToDevice, m.stream), "rollback carry");
+            check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(L.carry_valid[L.carry_cur].p), 1, 1, m.stream), "rollback carry");
+        } else {
+            check(hipMemsetAsync(state, 0, 2U * D * 4U, m.stream), "rollback carry");
+            check(hipMemsetAsync(L.carry_valid[L.carry_cur].p, 0, 4U, m.stream), "rollback carry");
+        }
+    }
+    m.hasher->truncate(first + kept);
+    m.history.resize(first + kept);
+    m.position = first + kept;
+    m.rows = kept;
+    tokens_.resize(kept);
+    if (!m.compress_ring) check(hipStreamSynchronize(m.stream), "rollback");
+}
+
+void DeviceForward::collect_op_timing(const std::vector<double>& exchange) {
+    auto& m = *impl_;
+    const auto& c = m.model.config;
+    const std::uint32_t R = m.rows, K = c.num_experts_per_tok;
+    const auto ids = download(m.op_ids.p, std::size_t{m.options.layers} * max_window_rows * K, m.stream);
+    const bool tp = m.distributed() && m.options.tp_attention;
+    const std::uint32_t per_rank = m.expert_end - m.expert_first;
+    op_timing_.assign(exchange.size(), OpTiming{});
+    for (std::size_t i = 0; i < exchange.size(); ++i) {
+        const auto& s = m.plan.steps[i];
+        auto& o = op_timing_[i];
+        o.op = s.op;
+        o.layer = s.layer;
+        o.site = s.site;
+        float ms = 0.0F;
+        check(hipEventElapsedTime(&ms, m.op_events[i], m.op_events[i + 1]), "op timing");
+        o.ms = ms;
+        o.exchange_ms = exchange[i] * 1e3;
+        std::uint32_t used = 0;  // this rank's experts the step's rows selected
+        if (s.op == Op::routed_experts && s.layer >= 0) {
+            std::vector<bool> seen(per_rank, false);
+            for (std::uint32_t k = 0; k < R * K; ++k) {
+                const auto e = ids[(std::size_t{static_cast<std::uint32_t>(s.layer)} * max_window_rows * K) + k];
+                if (e >= m.expert_first && e < m.expert_end && !seen[e - m.expert_first]) {
+                    seen[e - m.expert_first] = true;
+                    ++used;
+                }
+            }
+        }
+        for (const auto& w : s.weights) {
+            const auto it = m.weights.find(w);
+            if (it == m.weights.end()) continue;  // Engram rows (read per token from the file) and streamed experts
+            std::uint64_t b = it->second.n;
+            if (w.ends_with("_exps.weight")) b = per_rank != 0U ? b / per_rank * used : 0U;
+            else if (w == "token_embd.weight") b = b / c.vocab_size * R;
+            else if (tp && (w.ends_with("attn_q_b.weight") || w.ends_with("attn_output_a.weight") || w.ends_with("attn_output_b.weight")))
+                b /= 2U;
+            else if (m.split_shared && w.ends_with("_shexp.weight")) b /= 2U;
+            o.weight_bytes += b;
+        }
+    }
+}
+
+const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std::uint32_t> window) {
+    auto& m = *impl_;
+    const auto& c = m.model.config;
+    const auto R = static_cast<std::uint32_t>(window.size());
+    if (R == 0U || R > max_window_rows) throw std::invalid_argument("deepseek41 device forward: a step has 1..8 rows");
+    for (const auto t : window)
+        if (t >= c.vocab_size) throw std::invalid_argument("deepseek41 device forward: token outside the vocabulary");
+    if (m.position + R > m.options.max_positions) throw std::out_of_range("deepseek41 device forward: context full");
+    const std::uint32_t H = c.hidden_size, hc = c.hc_mult, K = c.num_experts_per_tok, I = c.moe_intermediate_size;
+    const std::uint32_t V = c.vocab_size, W = max_window_rows;
+    const std::uint32_t position = m.position;  // of row 0
+    const bool hashing = m.options.op_hashes && R == 1U;
+    m.rows = R;
+    hipStream_t st = m.stream;
+    ds41::StepTrace* const tr = m.trace.get();
+    if (tr) tr->begin(R);
+    std::vector<std::uint32_t> pos32(R);
+    std::vector<std::uint64_t> pos64(R);
+    for (std::uint32_t r = 0; r < R; ++r) pos32[r] = position + r, pos64[r] = position + r;
+    m.token.upload(std::vector<std::uint32_t>(window.begin(), window.end()), st);
+    m.pos.upload(pos32, st);
+    m.pos64.upload(pos64, st);
+    namespace attn = ds41::attn;
+    std::vector<attn::RopeRow> rope_rows(3U * W);
+    for (std::uint32_t r = 0; r < R; ++r) {
+        rope_rows[r] = attn::rope_row(attn::RopeKind::window, position + r);
+        rope_rows[W + r] = attn::rope_row(attn::RopeKind::compressed, position + r);
+        rope_rows[2U * W + r] = attn::rope_row(attn::RopeKind::compressed, (position + r) / 2U * 2U);
+    }
+    m.rope_rows.upload(rope_rows, st);
+    const attn::RopeRow* rope_window = m.rope_rows.p;
+    const attn::RopeRow* rope_compressed = m.rope_rows.p + W;
+    const attn::RopeRow* rope_group = m.rope_rows.p + 2U * W;
+    const auto t_step = std::chrono::steady_clock::now();
+    if (tr) tr->mark("upload_inputs");
+    const auto& e = m.model.engram;
+    const std::uint32_t cols = e.rows_per_token(), engram_layers = m.hasher->layers();
+    std::vector<std::uint64_t> engram_rows(std::size_t{R} * engram_layers * cols);  // [row][engram layer][column]
+    for (std::uint32_t r = 0; r < R; ++r) {
+        m.hasher->push(window[r], m.engram_rows);
+        m.history.push_back(window[r]);
+        std::copy(m.engram_rows.begin(), m.engram_rows.end(), engram_rows.begin() + static_cast<std::ptrdiff_t>(std::size_t{r} * m.engram_rows.size()));
+    }
+    if (tr) tr->mark("engram_hash");
+    engram_seconds_ = 0.0;
+    m.stream_seconds = 0.0;
+    std::uint32_t engram_in_range = 0;  // Engram layers of the range (a prefix of layer_ids)
+    while (engram_in_range < engram_layers && e.layer_ids[engram_in_range] < m.options.layers) ++engram_in_range;
+    // STRIX_DS41_ENGRAM_ASYNC: layer li's batch is its rows in [row][column] order, read straight into its pinned
+    // staging (the layout of the synchronous path); Op::engram of the layer waits for it, then uploads it. The previous
+    // step ended synchronised, so no upload still reads the staging. engram_io is declared last: on unwinding it joins
+    // the reads before the requests and promises they use go away.
+    const bool engram_async = m.engram_async && m.engram_reader && engram_in_range != 0U;
+    std::vector<std::vector<ds41::EngramRowRequest>> layer_requests(engram_async ? engram_in_range : 0U);
+    std::vector<std::promise<void>> engram_ready(layer_requests.size());
+    std::vector<std::future<void>> engram_wait;
+    double engram_read_seconds = 0.0;
+    std::future<void> engram_io;
+    if (engram_async) {
+        for (std::uint32_t li = 0; li < engram_in_range; ++li) {
+            for (std::uint32_t r = 0; r < R; ++r)
+                for (std::uint32_t k = 0; k < cols; ++k)
+                    layer_requests[li].push_back({li, engram_rows[(std::size_t{r} * engram_layers + li) * cols + k]});
+            engram_wait.push_back(engram_ready[li].get_future());
+        }
+        engram_io = std::async(std::launch::async, [&] {
+            const auto t0 = std::chrono::steady_clock::now();
+            std::uint32_t li = 0;
+            try {
+                for (; li < engram_in_range; ++li) {
+                    std::uint8_t* out = m.erows_pinned + std::size_t{li} * R * cols * 264U;
+                    m.engram_reader->read(layer_requests[li], {out, layer_requests[li].size() * 264U});
+                    engram_ready[li].set_value();
+                }
+            } catch (...) {
+                for (; li < engram_in_range; ++li) engram_ready[li].set_exception(std::current_exception());
+            }
+            engram_read_seconds = seconds_since(t0);
+        });
+    } else if (m.engram_reader) {  // every Engram layer of the range, every row, in one batch from the NVMe (O_DIRECT)
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<ds41::EngramRowRequest> requests;
+        for (std::uint32_t r = 0; r < R; ++r)
+            for (std::uint32_t li = 0; li < engram_layers; ++li)
+                if (e.layer_ids[li] < m.options.layers)
+                    for (std::uint32_t k = 0; k < cols; ++k)
+                        requests.push_back({li, engram_rows[(std::size_t{r} * engram_layers + li) * cols + k]});
+        m.engram_bytes.resize(requests.size() * 264U);
+        m.engram_reader->read(requests, m.engram_bytes);
+        engram_seconds_ = seconds_since(t0);
+        if (tr) tr->mark("engram_read");
+    }
+    if (engram_in_range != 0U && !engram_async) {  // rows of every Engram layer of the range: [layer][row][column], one asynchronous upload
+        for (std::uint32_t li = 0; li < engram_in_range; ++li)
+            for (std::uint32_t r = 0; r < R; ++r) {
+                std::uint8_t* out = m.erows_pinned + ((std::size_t{li} * R + r) * cols) * 264U;
+                if (m.engram_reader) {  // the reader's order: [row][engram layer of the range][column]
+                    std::copy_n(m.engram_bytes.data() + (std::size_t{r} * engram_in_range + li) * cols * 264U, std::size_t{cols} * 264U, out);
+                } else {
+                    const auto table = m.host_tensor("blk." + std::to_string(e.layer_ids[li]) + ".engram_embd.weight");
+                    for (std::uint32_t k = 0; k < cols; ++k)
+                        std::copy_n(table.data() + engram_rows[(std::size_t{r} * engram_layers + li) * cols + k] * 264U, 264, out + std::size_t{k} * 264U);
+                }
+            }
+        if (tr) tr->mark("engram_pack");
+        check(hipMemcpyAsync(m.erows.p, m.erows_pinned, std::size_t{engram_in_range} * R * cols * 264U, hipMemcpyHostToDevice, st),
+              "engram rows");
+        if (tr) tr->mark("engram_h2d_enqueue");
+    }
+    check(hipStreamSynchronize(st), "step inputs");  // the uploads above read host temporaries (and the pinned staging)
+    if (tr) tr->mark("sync_inputs");
+    hashes_.clear();
+    stream_hashes_.clear();
+    if (m.options.record_routes) routes_.assign(m.options.layers, {});
+    timing_.assign(m.options.layers, LayerTiming{});
+    std::int32_t timed_layer = -1;
+    auto t_layer = std::chrono::steady_clock::now();
+    double comm_at_layer = m.comm_seconds();
+    const auto stream_now = [&] { return m.streams[m.cur].p; };
+    auto t_head = t_step;
+    const std::uint32_t capture_first = m.options.layers >= 3U ? m.options.layers - 3U : 0U;
+
+    // The shared expert of an FFN site (its A8 input already in codes/deltas).
+    // Storage format of a weight: Q8_0, or the requant overlays' packed forms (CB4 table, U5/U6), same products.
+    const auto fmt_of = [&](const std::string& n) {
+        return m.cb4.contains(n) ? ds41::WeightFormat::cb4
+            : m.uniform.contains(n) ? (m.uniform.at(n) == 5U ? ds41::WeightFormat::u5 : ds41::WeightFormat::u6)
+                                    : ds41::WeightFormat::q8_0;
+    };
+    // Native FP8 site product of `name` rows [first, first + count) with the A8 rows codes/deltas (width values, stride width).
+    const auto fp8_site = [&](const std::string& name, std::uint32_t width, std::uint32_t first, std::uint32_t count, const std::int8_t* codes,
+                              const float* deltas, float* out, std::uint32_t out_stride) {
+        ds41::Q8A8View v;
+        m.site_weight(v, name);
+        v.width = width;
+        v.first = first;
+        v.count = count;
+        v.per_group = count;
+        v.codes = codes;
+        v.deltas = deltas;
+        v.rows = R;
+        v.x_stride = width;
+        v.out_stride = out_stride;
+        v.out = out;
+        ds41::enqueue_q8_0_a8(v, st);
+    };
+    // Native FP8 shared expert (fp8_swiglu_identity): gate and up rows [first, first + count) as products, then the clamped
+    // SwiGLU and its A8 rows (count values each) into act_codes / act_deltas / act_sums.
+    const auto fp8_shared_gate_up = [&](const Step& s, std::uint32_t first, std::uint32_t count, std::int8_t* act_codes, float* act_deltas,
+                                        std::int32_t* act_sums) {
+        fp8_site(s.weights[0], H, first, count, m.codes.p, m.deltas.p, m.fp8_gate.p, count);
+        fp8_site(s.weights[1], H, first, count, m.codes.p, m.deltas.p, m.fp8_up.p, count);
+        ds41::enqueue_swiglu_a8(m.fp8_gate.p, m.fp8_up.p, R, count, static_cast<float>(c.swiglu_limit), act_codes, act_deltas, act_sums, st);
+    };
+    // The shared expert of an FFN site (its A8 input already in codes/deltas), in the stored format of its tensors.
+    const auto enqueue_shared = [&](const Step& s) {
+        if (m.native_fp8.contains(s.weights[0])) {
+            fp8_shared_gate_up(s, 0U, I, m.sh_act_codes.p, m.sh_act_deltas.p, m.sh_act_sums.p);
+            fp8_site(s.weights[2], I, 0U, H, m.sh_act_codes.p, m.sh_act_deltas.p, m.shared.p, H);
+            return;
+        }
+        const DeviceRoutes& r = *m.shared_routes.at(R);
+        const auto gu_fmt = fmt_of(s.weights[0]), down_fmt = fmt_of(s.weights[2]);
+        if (fmt_of(s.weights[1]) != gu_fmt || (gu_fmt == ds41::WeightFormat::cb4 && m.cb4.at(s.weights[0]) != m.cb4.at(s.weights[1])))
+            throw std::logic_error("deepseek41 device forward: shared gate and up must share their CB4 table");
+        const auto gate_row = row_bytes(gu_fmt, H), down_row = row_bytes(down_fmt, I);
+        ds41::GateUpView gu;
+        if (gu_fmt == ds41::WeightFormat::cb4) std::copy(m.cb4.at(s.weights[0]).begin(), m.cb4.at(s.weights[0]).end(), gu.table);
+        gu.gate = m.dev(s.weights[0]);
+        gu.up = m.dev(s.weights[1]);
+        gu.expert_stride_bytes = gate_row * I;
+        gu.row_bytes = gate_row;
+        gu.hidden = H;
+        gu.inter = I;
+        gu.routes = r.gate_up();
+        gu.codes = m.codes.p;
+        gu.deltas = m.deltas.p;
+        gu.limit = static_cast<float>(c.swiglu_limit);
+        gu.act_codes = m.sh_act_codes.p;
+        gu.act_deltas = m.sh_act_deltas.p;
+        gu.act_sums = m.sh_act_sums.p;
+        ds41::enqueue_gate_up(gu_fmt, gu, st);
+        ds41::RoutesProductView dv;
+        if (down_fmt == ds41::WeightFormat::cb4) std::copy(m.cb4.at(s.weights[2]).begin(), m.cb4.at(s.weights[2]).end(), dv.table);
+        dv.weights = m.dev(s.weights[2]);
+        dv.expert_stride_bytes = down_row * H;
+        dv.row_bytes = down_row;
+        dv.width = I;
+        dv.outputs = H;
+        dv.routes = r.down();
+        dv.codes = m.sh_act_codes.p;
+        dv.deltas = m.sh_act_deltas.p;
+        dv.out = m.shared.p;
+        ds41::enqueue_routes_product(down_fmt, dv, st);
+    };
+    const bool overlap_shared = [] { const char* v = std::getenv("STRIX_DS41_EP_OVERLAP"); return !(v && v[0] == '0'); }();
+    const Step* deferred_shared = nullptr;
+    std::vector<double> op_exchange;  // op_timing: host seconds in the communicator per plan step
+    const bool step_events = m.options.op_timing || (tr && tr->level() == 1);  // one device event after every plan step
+    if (step_events) {
+        op_exchange.reserve(m.plan.steps.size());
+        check(hipEventRecord(m.op_events[0], st), "op timing");
+    }
+    if (tr) tr->first_event(st);
+    // STRIX_DS41_HC_SITE=1: each hyper-connection boundary (the previous sublayer's expansion, this site's mixes, the
+    // collapse, the RMSNorm and the A8 of x) as one enqueue_hc_site, same bits. The expansion waits for the next
+    // site (or the Engram injection, or the head). Off with op hashes or layer timing, which need every step's output.
+    static const bool hc_site_flag = [] { const char* v = std::getenv("STRIX_DS41_HC_SITE"); return !(v && v[0] == '0'); }();
+    // STRIX_DS41_QA_KV=1: q_a and kv in one launch over one A8 of the attention input, same bits.
+    // QA_KV off by default since P15 (P13/P14: -0.15 to -0.2 ms at R1 without it, 0 at R6); =1 turns it on
+    static const bool qa_kv_flag = [] { const char* v = std::getenv("STRIX_DS41_QA_KV"); return v && v[0] == '1'; }();
+    // STRIX_DS41_ATTN_A8=1: the attention combine writes the A8 of its output for o_a, and o_a the A8 of its output
+    // for o_b (in the product kernel when one block owns whole groups), same bits.
+    static const bool attn_a8 = [] { const char* v = std::getenv("STRIX_DS41_ATTN_A8"); return v && v[0] == '1'; }();
+    const bool fuse_hc = hc_site_flag && !hashing && !m.options.layer_timing;
+    const bool fuse_qa_kv = qa_kv_flag && !hashing;
+    struct PendingPost { bool on = false; const float* sub = nullptr; const float* residual = nullptr; const ds41::HcMix* mixes = nullptr; };
+    PendingPost post;              // an expansion not yet enqueued; stream_now() is already its output
+    std::int64_t capture_at = -1;  // the layer whose input is captured once the pending expansion is stored
+    const Step* site_mix = nullptr;
+    bool x_a8 = false;  // codes/deltas/sums hold the A8 of the current x
+    bool kv_done = false;
+    const auto stored_post = [&] {  // the pending expansion is in stream_now() (or enqueued before anything after it)
+        post.on = false;
+        if (capture_at >= 0) {
+            check(hipMemcpyAsync(m.capture[static_cast<std::size_t>(capture_at) - capture_first].p, stream_now(), std::size_t{R} * hc * H * 4U,
+                                 hipMemcpyDeviceToDevice, st),
+                  "capture");
+            capture_at = -1;
+        }
+    };
+    const auto flush_post = [&] {
+        if (!post.on) return;
+        ds41::enqueue_hc_expand(post.sub, post.residual, post.mixes, R, H, stream_now(), st);
+        stored_post();
+    };
+    // One hc site: the pending expansion (if any), the mixes of `mix` (if any) into mixes_out, then the collapse by
+    // collapse_mixes, the RMSNorm by norm_weight into out and its A8 into codes / deltas / sums.
+    const auto enqueue_site = [&](const Step* mix, ds41::HcMix* mixes_out, const ds41::HcMix* collapse_mixes, const float* norm_weight,
+                                  float* out, std::int8_t* codes, float* deltas, std::int32_t* sums) {
+        ds41::HcSiteView v;
+        v.rows = R;
+        v.hidden = H;
+        if (post.on) {
+            v.sub = post.sub;
+            v.residual = post.residual;
+            v.expand_mixes = post.mixes;
+        }
+        v.stream = stream_now();
+        if (mix) {
+            v.fn = m.devh(mix->weights[0]);
+            v.base = m.devf(mix->weights[1]);
+            v.scale = m.devf(mix->weights[2]);
+            v.iters = c.hc_sinkhorn_iters;
+            v.hc_eps = static_cast<float>(c.hc_eps);
+            v.mix_norm_eps = 1e-20F;
+            v.mixes_out = mixes_out;
+            v.partial = m.mix_partial.p;
+            v.counters = m.hc_counters.p;
+        }
+        v.collapse_mixes = collapse_mixes;
+        v.norm_weight = norm_weight;
+        v.norm_eps = 1e-20F;
+        v.out = out;
+        v.out_stride = H;
+        v.codes = codes;
+        v.deltas = deltas;
+        v.sums = sums;
+        v.a8_stride = H;
+        ds41::enqueue_hc_site(v, st);
+        if (post.on) stored_post();
+    };
+    for (const auto& s : m.plan.steps) {
+        const double comm_before = step_events || tr ? m.comm_seconds() : 0.0;
+        const auto layer = static_cast<std::uint32_t>(std::max(s.layer, 0));
+        const std::string p = "blk." + std::to_string(layer) + ".";
+        if (m.options.layer_timing && s.layer >= 0 && s.layer != timed_layer) {  // the previous layer ended synchronised
+            timed_layer = s.layer;
+            t_layer = std::chrono::steady_clock::now();
+            comm_at_layer = m.comm_seconds();
+        }
+        if (s.op == Op::head) t_head = std::chrono::steady_clock::now();
+        switch (s.op) {
+        case Op::embed:
+            ds41::enqueue_embedding(m.devh("token_embd.weight"), m.token.p, R, H, stream_now(), st);
+            m.pre_carry = ds41::hc_identity_pre();
+            m.identity_pre = true;
+            break;
+        case Op::engram: {
+            flush_post();  // the injection updates the expanded stream
+            const std::size_t li = static_cast<std::size_t>(std::find(e.layer_ids.begin(), e.layer_ids.end(), layer) - e.layer_ids.begin());
+            if (engram_async) {  // this layer's rows only: the later Engram layers' reads overlap the layers before them
+                const auto t_wait = tr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                engram_wait.at(li).get();
+                if (tr) tr->sync("engram_wait", t_wait, static_cast<int>(layer));
+                const std::size_t at = li * R * cols * 264U;
+                check(hipMemcpyAsync(m.erows.p + at, m.erows_pinned + at, std::size_t{R} * cols * 264U, hipMemcpyHostToDevice, st),
+                      "engram rows");
+            }
+            ds41::enqueue_engram_rows_bf16(m.erows.p + li * R * cols * 264U, R * cols, m.emb.p, st);  // uploaded at step start (async: just above)
+            ds41::F16RowsView v;
+            if (m.f8.contains(p + "engram_kv.weight")) v.weight_f8 = m.dev(p + "engram_kv.weight");
+            else v.weight = m.devh(p + "engram_kv.weight");
+            v.width = cols * 256U;
+            v.first = 0;
+            v.count = H * (hc + 1U);
+            v.x = m.emb.p;
+            v.rows = R;
+            v.x_stride = v.width;
+            v.out_stride = v.count;
+            v.out = m.ekv.p;
+            ds41::enqueue_f16_rows(v, st);
+            ds41::enqueue_engram_inject(stream_now(), m.ekv.p, m.devf(p + "engram_q_norm.weight"), m.devf(p + "engram_k_norm.weight"), R, H,
+                                        1e-20F, st);
+            break;
+        }
+        case Op::hc_mix: {
+            if (fuse_hc) {  // part of the site's enqueue_hc_site at its RMSNorm
+                site_mix = &s;
+                break;
+            }
+            ds41::HcMixView v;
+            v.stream = stream_now();
+            v.fn = m.devh(s.weights[0]);
+            v.base = m.devf(s.weights[1]);
+            v.scale = m.devf(s.weights[2]);
+            v.rows = R;
+            v.hidden = H;
+            v.iters = c.hc_sinkhorn_iters;
+            v.hc_eps = static_cast<float>(c.hc_eps);
+            v.norm_eps = 1e-20F;
+            v.out = s.site == "attn" ? m.mix_attn.p : m.mix_ffn.p;
+            v.partial = m.mix_partial.p;
+            ds41::enqueue_hc_mixes(v, st);
+            break;
+        }
+        case Op::hc_pre: {
+            if (fuse_hc) break;  // part of the site's enqueue_hc_site at its RMSNorm
+            const ds41::HcMix* mixes = s.site == "attn" ? (m.identity_pre ? nullptr : m.mix_ffn.p) : m.mix_attn.p;
+            ds41::enqueue_hc_collapse(stream_now(), mixes, R, H, m.x.p, st);
+            break;
+        }
+        case Op::rms_norm: {
+            if (fuse_hc && (s.site == "attn" || s.site == "ffn")) {
+                const bool at = s.site == "attn";
+                const ds41::HcMix* collapse = at ? (m.identity_pre ? nullptr : m.mix_ffn.p) : m.mix_attn.p;
+                enqueue_site(site_mix, at ? m.mix_attn.p : m.mix_ffn.p, collapse, m.devf(s.weights[0]), m.x.p, m.codes.p, m.deltas.p, m.sums.p);
+                site_mix = nullptr;
+                x_a8 = true;
+                break;
+            }
+            float* v = s.site == "q" ? m.qr.p : s.site == "kv" ? m.kv.p : m.x.p;
+            const std::uint32_t n = s.site == "q" ? c.q_lora_rank : s.site == "kv" ? c.head_dim : H;
+            ds41::enqueue_rms_norm(v, m.devf(s.weights[0]), R, n, n, 1e-20F, v, st);
+            break;
+        }
+        case Op::q_a: case Op::q_b: case Op::kv: case Op::o_a: case Op::o_b: {
+            if (s.op == Op::kv && kv_done) {  // enqueued with q_a
+                kv_done = false;
+                break;
+            }
+            const float* in = nullptr;
+            ds41::Q8A8View v;
+            m.site_weight(v, s.weights[0]);
+            v.first = 0;
+            v.rows = R;
+            std::uint32_t in_width = 0;
+            if (s.op == Op::q_a) { in = m.x.p; in_width = H; v.width = H; v.count = c.q_lora_rank; v.out = m.qr.p; }
+            const bool tp = m.distributed() && m.options.tp_attention;
+            const std::uint32_t tp_heads = c.num_attention_heads / 2U, tp_groups = c.o_groups / 2U;
+            if (s.op == Op::q_b) {
+                in = m.qr.p;
+                in_width = c.q_lora_rank;
+                v.width = c.q_lora_rank;
+                v.count = (tp ? tp_heads : c.num_attention_heads) * c.head_dim;  // TP: rows of heads [32r, 32r + 32)
+                v.first = tp ? m.options.rank * tp_heads * c.head_dim : 0U;
+                v.out = m.q.p;
+            }
+            if (s.op == Op::kv) { in = m.x.p; in_width = H; v.width = H; v.count = c.head_dim; v.out = m.kv.p; }
+            if (s.op == Op::o_a) {
+                in = m.o.p;
+                in_width = (tp ? tp_heads : c.num_attention_heads) * c.head_dim;  // TP: this rank's heads only
+                v.width = c.num_attention_heads * c.head_dim / c.o_groups;
+                v.count = (tp ? tp_groups : c.o_groups) * c.o_lora_rank;
+                v.first = tp ? m.options.rank * tp_groups * c.o_lora_rank : 0U;  // TP: rows of o-groups [4r, 4r + 4)
+                v.per_group = c.o_lora_rank;  // output o reads group o / o_lora_rank of the attention output
+                v.out = m.o_low.p;
+            }
+            if (s.op == Op::o_b) {
+                // wo_b as two K-halves h0 (columns 0..4095) + h1 (4096..8191), the declared order of every run. One process:
+                // h0 into y, then h1 accumulated. TP: this rank's half into half_own, the peer's by exchange, y = h0 + h1.
+                const std::uint32_t full = c.o_groups * c.o_lora_rank, half = full / 2U;
+                in = m.o_low.p;
+                in_width = tp ? half : full;
+                if (!attn_a8) ds41::enqueue_quantize_a8(in, in_width, R, m.site_codes.p, m.site_deltas.p, m.site_sums.p, st);
+                v.width = half;
+                v.row_width = full;
+                v.count = H;
+                v.per_group = H;
+                v.x_stride = in_width;
+                v.out_stride = H;
+                if (tp) {
+                    v.k_offset = m.options.rank * half;
+                    v.codes = m.site_codes.p;
+                    v.deltas = m.site_deltas.p;
+                    v.out = m.half_own.p;
+                    ds41::enqueue_q8_0_a8(v, st);
+                    m.options.communicator->exchange(st, m.half_own.p, m.half_other.p, std::size_t{R} * H * 4U,
+                                                     dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, position});
+                    const float* h0 = m.options.rank == 0U ? m.half_own.p : m.half_other.p;
+                    const float* h1 = m.options.rank == 0U ? m.half_other.p : m.half_own.p;
+                    const std::uint32_t n = R * H;
+                    add_halves<<<(n + 255U) / 256U, 256, 0, st>>>(h0, h1, m.y.p, n);
+                    check(hipGetLastError(), "add_halves");
+                } else {
+                    for (std::uint32_t part = 0; part < 2U; ++part) {
+                        v.k_offset = part * half;
+                        v.codes = m.site_codes.p + part * half;
+                        v.deltas = m.site_deltas.p + part * half / 32U;
+                        v.accumulate = part == 1U;
+                        v.out = m.y.p;
+                        ds41::enqueue_q8_0_a8(v, st);
+                    }
+                }
+                break;
+            }
+            if (v.per_group == 0U) v.per_group = v.count;
+            v.x_stride = in_width;
+            v.out_stride = v.count;
+            if (s.op == Op::q_a || s.op == Op::kv) {
+                // the attention input's A8 in codes / deltas: from the hc site, or quantized once here for q_a and kv
+                if (!x_a8 && fuse_qa_kv) {
+                    ds41::enqueue_quantize_a8(in, in_width, R, m.codes.p, m.deltas.p, m.sums.p, st);
+                    x_a8 = true;
+                }
+                if (x_a8) {
+                    v.codes = m.codes.p;
+                    v.deltas = m.deltas.p;
+                    if (fuse_qa_kv && s.op == Op::q_a) {
+                        ds41::Q8A8View kv;
+                        m.site_weight(kv, p + "attn_kv.weight");
+                        kv.first = 0;
+                        kv.rows = R;
+                        kv.width = H;
+                        kv.count = c.head_dim;
+                        kv.per_group = kv.count;
+                        kv.codes = m.codes.p;
+                        kv.deltas = m.deltas.p;
+                        kv.x_stride = H;
+                        kv.out_stride = kv.count;
+                        kv.out = m.kv.p;
+                        ds41::enqueue_q8_0_a8_pair(v, kv, st);
+                        kv_done = true;
+                    } else {
+                        ds41::enqueue_q8_0_a8(v, st);
+                    }
+                    break;
+                }
+            }
+            if (attn_a8 && s.op == Op::o_a) {  // its input's A8 from the attention combine; its output's A8 for o_b
+                v.codes = m.o_codes.p;
+                v.deltas = m.o_deltas.p;
+                v.a8_codes = m.site_codes.p;
+                v.a8_deltas = m.site_deltas.p;
+                v.a8_sums = m.site_sums.p;
+                ds41::enqueue_q8_0_a8(v, st);
+                break;
+            }
+            ds41::enqueue_quantize_a8(in, in_width, R, m.site_codes.p, m.site_deltas.p, m.site_sums.p, st);
+            v.codes = m.site_codes.p;
+            v.deltas = m.site_deltas.p;
+            ds41::enqueue_q8_0_a8(v, st);
+            break;
+        }
+        // ---- attention piece (ds41_attention kernels); F16 projections feeding it on the layer piece's F16 rows ----
+        case Op::window_write: {
+            const auto& r = m.roles[layer];
+            attn::hip::WindowView v{};
+            v.kv = m.kv.p;
+            v.norm = m.devf(s.weights[0]);
+            v.rope = r.rope == attn::RopeKind::window ? rope_window : rope_compressed;
+            v.pos = m.pos64.p;
+            v.rows = R;
+            v.capacity = AttentionHost::ring_capacity;
+            v.ring = m.attn[layer].ring.p;
+            attn::hip::enqueue_window_write(v, st);
+            break;
+        }
+        case Op::compress: {
+            const auto& r = m.roles[layer];
+            auto& L = m.attn[layer];
+            const auto f16_proj = [&](const std::string& w, float* out) {  // compressor projection on x
+                ds41::F16RowsView v;
+                v.weight = m.devh(w);
+                v.width = H;
+                v.first = 0;
+                v.count = attn::kHeadDim;
+                v.x = m.x.p;
+                v.rows = R;
+                v.x_stride = H;
+                v.out_stride = attn::kHeadDim;
+                v.out = out;
+                return v;
+            };
+            if (r.ratio == 2U)  // one launch with STRIX_DS41_F16_PAIR=1
+                ds41::enqueue_f16_rows_pair(f16_proj(p + "attn_compressor_kv.weight", L.ckv.p),
+                                            f16_proj(p + "attn_compressor_gate.weight", L.cscore.p), st);
+            else ds41::enqueue_f16_rows(f16_proj(p + "attn_compressor_kv.weight", L.ckv.p), st);
+            attn::hip::CompressView v{};
+            v.ratio = r.ratio;
+            v.rows = R;
+            v.kv = L.ckv.p;
+            v.score = L.cscore.p;
+            v.norm = m.devf(p + "attn_compressor_norm.weight");
+            v.wk = m.devh(p + "indexer.attn_k.weight");
+            v.knorm = m.devf(p + "indexer.k_norm.weight");
+            v.rope = r.ratio == 2U ? rope_group : rope_compressed;  // the group's first position
+            v.pos = m.pos64.p;
+            v.state_in = L.carry[L.carry_cur].p;
+            v.state_valid_in = L.carry_valid[L.carry_cur].p;
+            v.state_out = L.carry[1 - L.carry_cur].p;
+            v.state_valid_out = L.carry_valid[1 - L.carry_cur].p;
+            v.kv_cache = L.kv_cache.p;
+            v.idx_cache = L.idx_cache.p;
+            attn::hip::enqueue_compress(v, st);
+            L.carry_cur = 1 - L.carry_cur;
+            break;
+        }
+        case Op::index: {
+            const auto& r = m.roles[layer];
+            auto& L = m.attn[layer];
+            const std::uint32_t ratio = m.roles[static_cast<std::size_t>(r.kv_source)].ratio;
+            const std::uint32_t count = (position + R) / ratio;  // of the last row; every row's count <= this
+            if (count == 0U) {  // nothing compressed yet: an empty selection, as on the host
+                check(hipMemsetAsync(L.idx_count.p, 0, R * 4U, st), "empty top-k");
+                break;
+            }
+            if ((position + 1U) / ratio == 0U)
+                throw std::logic_error("deepseek41 device forward: a window must not start before the first compressed entry");
+            ds41::F16RowsView qv;
+            if (m.f8.contains(p + "indexer.attn_q_b.weight")) qv.weight_f8 = m.dev(p + "indexer.attn_q_b.weight");
+            else qv.weight = m.devh(p + "indexer.attn_q_b.weight");
+            qv.width = c.q_lora_rank;
+            qv.first = 0;
+            qv.count = attn::kIdxHeads * attn::kIdxDim;
+            qv.x = m.qr.p;
+            qv.rows = R;
+            qv.x_stride = c.q_lora_rank;
+            qv.out_stride = qv.count;
+            qv.out = m.iq.p;
+            ds41::F16RowsView wv;
+            wv.weight = m.devh(p + "indexer.proj.weight");
+            wv.width = H;
+            wv.first = 0;
+            wv.count = attn::kIdxHeads;
+            wv.x = m.x.p;
+            wv.rows = R;
+            wv.x_stride = H;
+            wv.out_stride = attn::kIdxHeads;
+            wv.out = m.iw.p;
+            ds41::enqueue_f16_rows_pair(qv, wv, st);  // one launch with STRIX_DS41_F16_PAIR=1 (F16 q_b)
+            attn::hip::IndexView iv{};
+            iv.rows = R;
+            iv.ratio = ratio;
+            iv.max_count = count;
+            iv.q = m.iq.p;
+            iv.w = m.iw.p;
+            iv.rope = r.rope == attn::RopeKind::window ? rope_window : rope_compressed;
+            iv.pos = m.pos64.p;
+            iv.idx_cache = m.attn[static_cast<std::size_t>(r.kv_source)].idx_cache.p;
+            iv.scores = m.index_scores.p;
+            iv.qprep = m.index_qprep.p;
+            attn::hip::enqueue_index_scores(iv, st);
+            attn::hip::SelectView sv{};
+            sv.rows = R;
+            sv.ratio = ratio;
+            sv.max_count = count;  // also the candidate pool's row stride: source and users share the ratio
+            sv.topk = attn::kTopK;
+            sv.cand_blocks = attn::kCandBlocks;
+            sv.block_size = attn::kCandBlockSize;
+            sv.pool = r.candidate_source ? attn::Pool::candidate_source : r.candidate_user ? attn::Pool::candidate_user : attn::Pool::plain;
+            sv.pos = m.pos64.p;
+            sv.scores = m.index_scores.p;
+            sv.candidates = m.candidates.p;
+            sv.keys = m.select_keys.p;
+            sv.idx = L.idx.p;
+            sv.idx_count = L.idx_count.p;
+            attn::hip::enqueue_select(sv, st);
+            break;
+        }
+        case Op::attention: {
+            const auto& r = m.roles[layer];
+            attn::hip::AttentionView v{};
+            v.rows = R;
+            v.capacity = AttentionHost::ring_capacity;
+            v.topk = attn::kTopK;
+            v.q = m.q.p;
+            v.sink = m.devf(s.weights[0]);
+            v.rope = r.rope == attn::RopeKind::window ? rope_window : rope_compressed;
+            v.pos = m.pos64.p;
+            v.ring = m.attn[layer].ring.p;
+            if (r.ratio != 0U) {
+                v.kv_cache = m.attn[static_cast<std::size_t>(r.kv_source)].kv_cache.p;
+                v.idx = m.attn[static_cast<std::size_t>(r.index_source)].idx.p;
+                v.idx_count = m.attn[static_cast<std::size_t>(r.index_source)].idx_count.p;
+            }
+            v.partial = m.attn_partial.p;
+            v.o = m.o.p;
+            v.tickets = m.attn_tickets.p;
+            if (attn_a8) {
+                v.codes = m.o_codes.p;
+                v.deltas = m.o_deltas.p;
+                v.sums = m.o_sums.p;
+            }
+            if (m.distributed() && m.options.tp_attention) {  // heads [32r, 32r + 32): q, sink and o local to the rank
+                v.heads = c.num_attention_heads / 2U;
+                v.sink = m.devf(s.weights[0]) + m.options.rank * v.heads;
+            }
+            attn::hip::enqueue_attention(v, st);
+            break;
+        }
+        case Op::hc_post: {
+            const int next = 1 - m.cur;
+            x_a8 = false;
+            if (fuse_hc) {  // stored by the next site (or before the Engram injection, or by the head)
+                post.on = true;
+                post.sub = m.y.p;
+                post.residual = stream_now();
+                post.mixes = s.site == "attn" ? m.mix_attn.p : m.mix_ffn.p;
+                m.cur = next;
+                if (s.site == "ffn") {
+                    m.identity_pre = false;
+                    if (m.options.capture_main_hidden && layer + 1U >= capture_first && layer + 1U < m.options.layers) capture_at = layer + 1U;
+                }
+                break;
+            }
+            ds41::enqueue_hc_expand(m.y.p, stream_now(), s.site == "attn" ? m.mix_attn.p : m.mix_ffn.p, R, H, m.streams[next].p, st);
+            m.cur = next;
+            if (s.site == "ffn") {
+                if (hashing) m.pre_carry = download(m.mix_ffn.p, 1, st)[0].pre;  // host copy only for the hash
+                m.identity_pre = false;
+                if (m.options.capture_main_hidden && layer + 1U >= capture_first && layer + 1U < m.options.layers)
+                    check(hipMemcpyAsync(m.capture[layer + 1U - capture_first].p, m.streams[next].p, std::size_t{R} * hc * H * 4U,
+                                         hipMemcpyDeviceToDevice, st),
+                          "capture");  // the input of layer + 1
+                if (m.options.layer_timing) {
+                    check(hipStreamSynchronize(st), "layer end");
+                    timing_[layer] = {seconds_since(t_layer), m.comm_seconds() - comm_at_layer};
+                }
+            }
+            break;
+        }
+        case Op::router: {
+            ds41::RouterView v;
+            v.x = m.x.p;
+            if (m.router_bf16.contains(s.weights[0])) v.weight_bf16 = m.devh(s.weights[0]);
+            else v.weight = m.devf(s.weights[0]);
+            v.bias = m.devf(s.weights[1]);
+            v.bias_image = m.devf(s.weights[2]);
+            v.image_rows = m.image_row.p;
+            v.rows = R;
+            v.hidden = H;
+            v.experts = c.n_routed_experts;
+            v.top_k = K;
+            v.route_scale = static_cast<float>(c.routed_scaling_factor);
+            v.scores = m.scores.p;
+            v.ids = m.ids.p;
+            v.weights = m.route_w.p;
+            v.tickets = m.router_tickets.p;  // STRIX_DS41_ROUTER_FAST=1: the selection in the scores launch
+            ds41::enqueue_router(v, st);
+            if (hashing) m.route_ids = download(m.ids.p, K, st);  // host copy only for the hash
+            if (m.options.record_routes) routes_[layer] = download(m.ids.p, std::size_t{R} * K, st);
+            if (m.options.op_timing)
+                check(hipMemcpyAsync(m.op_ids.p + std::size_t{layer} * max_window_rows * K, m.ids.p, std::size_t{R} * K * 4U,
+                                     hipMemcpyDeviceToDevice, st),
+                      "op timing ids");
+            break;
+        }
+        case Op::shared_expert: {
+            // A8 of the FFN input, shared by the shared expert and the routed experts (from the hc site when fused)
+            if (!x_a8) ds41::enqueue_quantize_a8(m.x.p, H, R, m.codes.p, m.deltas.p, m.sums.p, st);
+            // Shared expert, three forms with the same bits: split by intermediate rows over the two ranks (opt-in,
+            // STRIX_DS41_SPLIT_SHARED=1), overlapped with the half-sum exchange (two ranks, default; STRIX_DS41_EP_OVERLAP=0 off), or here.
+            const DeviceRoutes& r = *m.shared_routes.at(R);
+            if (m.split_shared) {
+                // rank r: gate/up of intermediate rows [I/2 r, I/2 r + I/2) (whole A8 groups, the same products), then the
+                // activation halves are exchanged while the routed experts run; the down rows follow in the combine.
+                const std::uint32_t hI = I / 2U;
+                if (m.native_fp8.contains(s.weights[0])) {
+                    fp8_shared_gate_up(s, hI * m.options.rank, hI, reinterpret_cast<std::int8_t*>(m.shx_own.p),
+                                       reinterpret_cast<float*>(m.shx_own.p + std::size_t{R} * hI), m.sh_act_sums.p);
+                    m.options.communicator->start(st, m.shx_own.p, std::size_t{R} * hI + std::size_t{R} * hI / 32U * 4U,
+                                                  dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, position});
+                    if (hashing) m.shared_hash_at = hashes_.size();
+                    break;
+                }
+                const auto gu_fmt = fmt_of(s.weights[0]);
+                const auto gate_row = row_bytes(gu_fmt, H);
+                ds41::GateUpView gu;
+                if (gu_fmt == ds41::WeightFormat::cb4) std::copy(m.cb4.at(s.weights[0]).begin(), m.cb4.at(s.weights[0]).end(), gu.table);
+                gu.gate = m.dev(s.weights[0]) + gate_row * hI * m.options.rank;
+                gu.up = m.dev(s.weights[1]) + gate_row * hI * m.options.rank;
+                gu.expert_stride_bytes = gate_row * I;
+                gu.row_bytes = gate_row;
+                gu.hidden = H;
+                gu.inter = hI;
+                gu.routes = r.gate_up();
+                gu.codes = m.codes.p;
+                gu.deltas = m.deltas.p;
+                gu.limit = static_cast<float>(c.swiglu_limit);
+                gu.act_codes = reinterpret_cast<std::int8_t*>(m.shx_own.p);
+                gu.act_deltas = reinterpret_cast<float*>(m.shx_own.p + std::size_t{R} * hI);
+                gu.act_sums = m.sh_act_sums.p;
+                ds41::enqueue_gate_up(gu_fmt, gu, st);
+                m.options.communicator->start(st, m.shx_own.p, std::size_t{R} * hI + std::size_t{R} * hI / 32U * 4U,
+                                              dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, position});
+                if (hashing) m.shared_hash_at = hashes_.size();  // the shared output exists after the combine
+                break;
+            }
+            // Two ranks, no op hashes: the shared expert (replicated, independent of the exchange) is enqueued between
+            // the start and the finish of the half-sum exchange, so it runs while the halves travel. Same kernels and
+            // buffers, same bits. STRIX_DS41_EP_OVERLAP=0 keeps it here.
+            if (m.distributed() && !hashing && overlap_shared) {
+                deferred_shared = &s;
+                break;
+            }
+            enqueue_shared(s);
+            break;
+        }
+        case Op::routed_experts: {
+            if (m.options.stream_experts) {
+                if (R != 1U) throw std::invalid_argument("deepseek41 device forward: stream_experts decodes one row per step");
+                const auto ids = download(m.ids.p, K, st);  // also waits for the producers of the previous slot contents
+                auto routes = ds41::build_window_routes(ids, 1U, K, m.plan.expert_split);
+                const std::vector<std::uint32_t> experts = routes.experts;  // the union, ascending
+                for (std::uint32_t j = 0; j < routes.experts.size(); ++j) routes.experts[j] = j;  // slot j holds experts[j]
+                const auto gate_row = row_bytes(ds41::WeightFormat::iq2_xxs, H), down_row = row_bytes(ds41::WeightFormat::q2_k, I);
+                const std::uint64_t gs = gate_row * I, ds = down_row * H;
+                const auto* tg = m.tensors.at(s.weights[0]);
+                const auto* tu = m.tensors.at(s.weights[1]);
+                const auto* td = m.tensors.at(s.weights[2]);
+                const auto t0 = std::chrono::steady_clock::now();
+                std::vector<std::future<void>> copies;
+                for (std::size_t j = 0; j < experts.size(); ++j)
+                    copies.push_back(std::async(std::launch::async, [&, j] {
+                        const std::uint64_t e = experts[j];
+                        std::uint8_t* out = m.slot_pinned + j * (2U * gs + ds);
+                        const auto g = m.file->bytes(tg->absolute_offset + e * gs, gs);
+                        const auto u = m.file->bytes(tu->absolute_offset + e * gs, gs);
+                        const auto d = m.file->bytes(td->absolute_offset + e * ds, ds);
+                        std::copy(g.begin(), g.end(), out);
+                        std::copy(u.begin(), u.end(), out + gs);
+                        std::copy(d.begin(), d.end(), out + 2U * gs);
+                    }));
+                for (auto& f : copies) f.get();
+                m.stream_seconds += seconds_since(t0);
+                for (std::size_t j = 0; j < experts.size(); ++j) {
+                    const std::uint8_t* in = m.slot_pinned + j * (2U * gs + ds);
+                    check(hipMemcpyAsync(m.slot_gate.p + j * gs, in, gs, hipMemcpyHostToDevice, st), "expert gate");
+                    check(hipMemcpyAsync(m.slot_up.p + j * gs, in + gs, gs, hipMemcpyHostToDevice, st), "expert up");
+                    check(hipMemcpyAsync(m.slot_down.p + j * ds, in + 2U * gs, ds, hipMemcpyHostToDevice, st), "expert down");
+                }
+                const std::vector<std::uint32_t> counts{static_cast<std::uint32_t>(routes.experts.size()), routes.max_rows};
+                m.built.experts.upload(routes.experts, st);
+                m.built.begins.upload(routes.begins, st);
+                m.built.rows.upload(routes.rows, st);
+                m.built.slots.upload(routes.slots, st);
+                m.built.order.upload(routes.order, st);
+                m.built.low_counts.upload(routes.low_counts, st);
+                m.built.counts.upload(counts, st);
+                const ds41::RoutesView gate_routes{m.built.experts.p, m.built.begins.p, m.built.rows.p, m.built.slots.p, K, 1U, m.built.counts.p};
+                const ds41::RoutesView down_routes{m.built.experts.p, m.built.begins.p, m.built.slots.p, m.built.slots.p, K, 1U, m.built.counts.p};
+                ds41::GateUpView gu;
+                gu.gate = m.slot_gate.p;
+                gu.up = m.slot_up.p;
+                gu.expert_stride_bytes = gs;
+                gu.row_bytes = gate_row;
+                gu.hidden = H;
+                gu.inter = I;
+                gu.routes = gate_routes;
+                gu.codes = m.codes.p;
+                gu.deltas = m.deltas.p;
+                gu.limit = static_cast<float>(c.swiglu_limit);
+                gu.act_codes = m.act_codes.p;
+                gu.act_deltas = m.act_deltas.p;
+                gu.act_sums = m.act_sums.p;
+                ds41::enqueue_gate_up(ds41::WeightFormat::iq2_xxs, gu, st);
+                ds41::RoutesProductView dv;
+                dv.weights = m.slot_down.p;
+                dv.expert_stride_bytes = ds;
+                dv.row_bytes = down_row;
+                dv.width = I;
+                dv.outputs = H;
+                dv.routes = down_routes;
+                dv.codes = m.act_codes.p;
+                dv.deltas = m.act_deltas.p;
+                dv.out = m.raw.p;
+                ds41::enqueue_routes_product(ds41::WeightFormat::q2_k, dv, st);
+                check(hipStreamSynchronize(st), "streamed experts");  // the uploads read the shared staging
+                break;
+            }
+            // routes of this rank's experts [expert_first, expert_end) from the router's device ids
+            ds41::BuildRoutesView bv;
+            bv.ids = m.ids.p;
+            bv.rows = R;
+            bv.top_k = K;
+            bv.split = m.expert_tp ? c.n_routed_experts : m.plan.expert_split;  // expert TP: every slot in the rank's fold
+            bv.first = m.expert_first;
+            bv.end = m.expert_end;
+            bv.experts = m.built.experts.p;
+            bv.begins = m.built.begins.p;
+            bv.rows_out = m.built.rows.p;
+            bv.slots = m.built.slots.p;
+            bv.order = m.built.order.p;
+            bv.low_counts = m.built.low_counts.p;
+            bv.counts = m.built.counts.p;
+            ds41::enqueue_build_routes(bv, st);
+            const ds41::RoutesView gate_routes{m.built.experts.p, m.built.begins.p, m.built.rows.p, m.built.slots.p, R * K, R, m.built.counts.p};
+            const ds41::RoutesView down_routes{m.built.experts.p, m.built.begins.p, m.built.slots.p, m.built.slots.p, R * K, R, m.built.counts.p};
+            // expert TP: this rank's 1152 intermediate rows of every expert and its 5-block down rows (ds41_expert_tp.hpp)
+            const std::uint32_t EI = m.expert_tp ? ds41::expert_tp::half : I;
+            const auto gate_row = row_bytes(ds41::WeightFormat::iq2_xxs, H);
+            const std::uint64_t down_row = m.expert_tp ? ds41::expert_tp::device_down_row_bytes() : row_bytes(ds41::WeightFormat::q2_k, I);
+            // The built expert ids are absolute; the resident tensors start at expert_first, so the kernels get the
+            // address expert 0 would have (only ids in [expert_first, expert_end) are ever dereferenced).
+            const std::uint64_t gate_stride = gate_row * EI, down_stride = down_row * H;
+            ds41::GateUpView gu;
+            gu.gate = m.dev(s.weights[0]) - gate_stride * m.expert_first;
+            gu.up = m.dev(s.weights[1]) - gate_stride * m.expert_first;
+            gu.expert_stride_bytes = gate_stride;
+            gu.row_bytes = gate_row;
+            gu.hidden = H;
+            gu.inter = EI;
+            gu.routes = gate_routes;
+            gu.codes = m.codes.p;
+            gu.deltas = m.deltas.p;
+            gu.limit = static_cast<float>(c.swiglu_limit);
+            gu.act_codes = m.act_codes.p;
+            gu.act_deltas = m.act_deltas.p;
+            gu.act_sums = m.act_sums.p;
+            ds41::enqueue_gate_up(ds41::WeightFormat::iq2_xxs, gu, st);
+            ds41::RoutesProductView dv;
+            dv.weights = m.dev(s.weights[2]) - down_stride * m.expert_first;
+            dv.expert_stride_bytes = down_stride;
+            dv.row_bytes = down_row;
+            dv.width = EI;
+            dv.outputs = H;
+            dv.routes = down_routes;
+            dv.codes = m.act_codes.p;
+            dv.deltas = m.act_deltas.p;
+            dv.out = m.raw.p;
+            if (m.expert_tp)  // this rank's K-half parts (packed half-block rows unless STRIX_DS41_EXPERT_TP_LAYOUT=dup)
+                ds41::enqueue_routes_product_groups(ds41::WeightFormat::q2_k, dv, st, ds41::expert_tp::packed_from_env());
+            else ds41::enqueue_routes_product(ds41::WeightFormat::q2_k, dv, st);
+            break;
+        }
+        case Op::combine: {
+            if (m.split_shared) {
+                // the peer's activation half, the full activation, this rank's down rows [H/2 r, H/2 r + H/2) after its
+                // half sum in the same exchange, then (shared + low) + high on both ranks
+                const std::uint32_t hI = I / 2U, hH = H / 2U;
+                m.options.communicator->finish(st, m.shx_other.p);
+                const auto* own = m.shx_own.p;
+                const auto* other = m.shx_other.p;
+                const auto* first = m.options.rank == 0U ? own : other;
+                const auto* second = m.options.rank == 0U ? other : own;
+                const auto codes = [&](const std::uint8_t* b) { return reinterpret_cast<const std::int8_t*>(b); };
+                const auto deltas = [&](const std::uint8_t* b) { return reinterpret_cast<const float*>(b + std::size_t{R} * hI); };
+                ds41::enqueue_assemble_a8_halves(codes(first), deltas(first), codes(second), deltas(second), R, hI, m.sh_act_codes.p,
+                                                 m.sh_act_deltas.p, st);
+                const DeviceRoutes& r = *m.shared_routes.at(R);
+                const std::string down_name = "blk." + std::to_string(layer) + ".ffn_down_shexp.weight";
+                if (m.native_fp8.contains(down_name)) {
+                    fp8_site(down_name, I, hH * m.options.rank, hH, m.sh_act_codes.p, m.sh_act_deltas.p, m.half_own.p + std::size_t{R} * H, hH);
+                } else {
+                    const auto down_fmt = fmt_of(down_name);
+                    const auto down_row = row_bytes(down_fmt, I);
+                    ds41::RoutesProductView dv;
+                    if (down_fmt == ds41::WeightFormat::cb4) std::copy(m.cb4.at(down_name).begin(), m.cb4.at(down_name).end(), dv.table);
+                    dv.weights = m.dev(down_name) + down_row * hH * m.options.rank;
+                    dv.expert_stride_bytes = down_row * H;
+                    dv.row_bytes = down_row;
+                    dv.width = I;
+                    dv.outputs = hH;
+                    dv.routes = r.down();
+                    dv.codes = m.sh_act_codes.p;
+                    dv.deltas = m.sh_act_deltas.p;
+                    dv.out = m.half_own.p + std::size_t{R} * H;
+                    ds41::enqueue_routes_product(down_fmt, dv, st);
+                }
+                ds41::HalfSumView v;
+                v.raw = m.raw.p;
+                v.weights = m.route_w.p;
+                v.order = m.built.order.p;
+                v.low_counts = m.built.low_counts.p;
+                v.rows = R;
+                v.top_k = K;
+                v.hidden = H;
+                v.half = m.expert_tp ? 0U : m.options.rank;  // expert TP: the fold of all the row's slots (low_counts = top_k)
+                v.out = m.half_own.p;
+                ds41::enqueue_half_sum(v, st);
+                m.options.communicator->exchange(st, m.half_own.p, m.half_other.p, (std::size_t{R} * H + std::size_t{R} * hH) * 4U,
+                                                 dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, position});
+                const float* low = m.options.rank == 0U ? m.half_own.p : m.half_other.p;
+                const float* high = m.options.rank == 0U ? m.half_other.p : m.half_own.p;
+                ds41::enqueue_canonical_sum_split(low + std::size_t{R} * H, high + std::size_t{R} * H, low, high, R, H, m.y.p,
+                                                  m.shared.p, st);
+                if (hashing) {
+                    const std::string label = "shared_expert@" + std::to_string(layer) + ":" + std::string(to_string(Buffer::shared));
+                    hashes_.insert(hashes_.begin() + static_cast<std::ptrdiff_t>(m.shared_hash_at), {label, fnv(m.buffer(Buffer::shared))});
+                }
+                break;
+            }
+            if (m.distributed()) {  // this rank's half sum, the peer's by exchange, then (shared + low) + high on both
+                ds41::HalfSumView v;
+                v.raw = m.raw.p;
+                v.weights = m.route_w.p;
+                v.order = m.built.order.p;
+                v.low_counts = m.built.low_counts.p;
+                v.rows = R;
+                v.top_k = K;
+                v.hidden = H;
+                v.half = m.expert_tp ? 0U : m.options.rank;  // expert TP: the fold of all the row's slots (low_counts = top_k)
+                v.out = m.half_own.p;
+                ds41::enqueue_half_sum(v, st);
+                if (deferred_shared) {
+                    m.options.communicator->start(st, m.half_own.p, std::size_t{R} * H * 4U,
+                                                  dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, position});
+                    enqueue_shared(*deferred_shared);
+                    deferred_shared = nullptr;
+                    m.options.communicator->finish(st, m.half_other.p);
+                } else {
+                    m.options.communicator->exchange(st, m.half_own.p, m.half_other.p, std::size_t{R} * H * 4U,
+                                                     dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, position});
+                }
+                const float* low = m.options.rank == 0U ? m.half_own.p : m.half_other.p;
+                const float* high = m.options.rank == 0U ? m.half_other.p : m.half_own.p;
+                ds41::enqueue_canonical_sum(m.shared.p, low, high, std::size_t{R} * H, m.y.p, st);
+                break;
+            }
+            // two ranks emulated on one node: each rank's weighted half sum, then (shared + low) + high
+            for (std::uint32_t half = 0; half < 2U; ++half) {
+                ds41::HalfSumView v;
+                v.raw = m.raw.p;
+                v.weights = m.route_w.p;
+                v.order = m.built.order.p;
+                v.low_counts = m.built.low_counts.p;
+                v.rows = R;
+                v.top_k = K;
+                v.hidden = H;
+                v.half = half;
+                v.out = half == 0U ? m.low.p : m.high.p;
+                ds41::enqueue_half_sum(v, st);
+            }
+            ds41::enqueue_canonical_sum(m.shared.p, m.low.p, m.high.p, std::size_t{R} * H, m.y.p, st);
+            break;
+        }
+        case Op::head: {
+            if (fuse_hc) {
+                enqueue_site(nullptr, nullptr, m.identity_pre ? nullptr : m.mix_ffn.p, m.devf("output_norm.weight"), m.h.p, m.site_codes.p,
+                             m.site_deltas.p, m.site_sums.p);
+            } else {
+                ds41::enqueue_hc_collapse(stream_now(), m.identity_pre ? nullptr : m.mix_ffn.p, R, H, m.h.p, st);
+                ds41::enqueue_rms_norm(m.h.p, m.devf("output_norm.weight"), R, H, H, 1e-20F, m.h.p, st);
+                ds41::enqueue_quantize_a8(m.h.p, H, R, m.site_codes.p, m.site_deltas.p, m.site_sums.p, st);
+            }
+            ds41::Q8A8View v;
+            m.site_weight(v, "output.weight");  // this rank's rows [head_slice.first, + count)
+            v.width = H;
+            v.first = 0;
+            v.count = m.head_slice.count;
+            v.per_group = m.head_slice.count;
+            v.codes = m.site_codes.p;
+            v.deltas = m.site_deltas.p;
+            v.rows = R;
+            v.x_stride = H;
+            v.out_stride = V;  // logits [row][vocab]
+            v.out = m.logits.p + m.head_slice.first;
+            ds41::enqueue_q8_0_a8(v, st);
+            if (R == 1U && m.distributed() && m.options.gather_logits) {
+                const auto other = ds41::vocab_slice(c.vocab_size, 2U, 1U - m.options.rank);
+                if (other.count != m.head_slice.count) throw std::logic_error("deepseek41 device forward: unequal vocabulary slices");
+                m.options.communicator->exchange(st, m.logits.p + m.head_slice.first, m.logits.p + other.first, std::size_t{other.count} * 4U,
+                                                 dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 0U, position});
+            }
+            if (R == 1U && (hashing || !m.distributed() || m.options.gather_logits)) {
+                const auto t0 = tr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                m.logits_host = download(m.logits.p, c.vocab_size, st);
+                if (tr) tr->sync("logits_d2h", t0, -1);
+            } else m.logits_host.clear();
+            break;
+        }
+        case Op::argmax: {
+            // two ranks: each the argmax of its vocabulary slice, then the candidates combine
+            if (m.distributed()) {  // this rank's candidates, the peer's by exchange, combined in rank order on both
+                const auto& sl = m.head_slice;
+                ds41::enqueue_argmax(m.logits.p + sl.first, R, sl.count, V, sl.first, m.partial.p, m.cand_own.p, st);
+                m.options.communicator->exchange(st, m.cand_own.p, m.cand_other.p, std::size_t{R} * sizeof(ds41::ArgmaxCandidate),
+                                                 dist::Tag{static_cast<std::uint32_t>(dist::TagKind::argmax), 0U, position});
+                const auto* first = m.options.rank == 0U ? m.cand_own.p : m.cand_other.p;
+                const auto* second = m.options.rank == 0U ? m.cand_other.p : m.cand_own.p;
+                ds41::enqueue_combine_argmax(first, second, R, m.best.p, st);
+            } else {
+                const auto r0 = ds41::vocab_slice(c.vocab_size, 2U, 0U), r1 = ds41::vocab_slice(c.vocab_size, 2U, 1U);
+                ds41::enqueue_argmax(m.logits.p + r0.first, R, r0.count, V, r0.first, m.partial.p, m.cand0.p, st);
+                ds41::enqueue_argmax(m.logits.p + r1.first, R, r1.count, V, r1.first, m.partial.p, m.cand1.p, st);
+                ds41::enqueue_combine_argmax(m.cand0.p, m.cand1.p, R, m.best.p, st);
+            }
+            const auto t_best = tr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const auto best = download(m.best.p, R, st);
+            if (tr) tr->sync("best_d2h", t_best, -1);
+            tokens_.resize(R);
+            for (std::uint32_t r = 0; r < R; ++r) {
+                if (best[r].finite == 0U) throw std::runtime_error("deepseek41 device forward: non-finite logits");
+                tokens_[r] = best[r].index;
+            }
+            next_token_ = tokens_.back();
+            head_seconds_ = seconds_since(t_head);
+            break;
+        }
+        }
+        if (step_events) {
+            op_exchange.push_back(m.comm_seconds() - comm_before);
+            check(hipEventRecord(m.op_events[op_exchange.size()], st), "op timing");
+        }
+        if (tr) tr->op(to_string(s.op), s.layer, s.site, m.comm_seconds() - comm_before, static_cast<int>(op_exchange.size()));
+        // hashes of the step's outputs, labelled and computed as HostForward's
+        if (!hashing) continue;
+        if (m.split_shared && s.op == Op::shared_expert) continue;  // recorded by the combine (see there)
+        for (const auto b : s.outputs) {
+            std::uint64_t h = 0;
+            if (b == Buffer::logits) h = fnv(m.logits_host);
+            else if (b == Buffer::token) h = next_token_;
+            else if (b == Buffer::route_ids) {
+                for (const auto v : m.route_ids) h = h * 1099511628211ULL + v;
+            } else {
+                const auto v = m.buffer(b);
+                h = fnv(v);
+                if (m.options.buffer_tap)
+                    m.options.buffer_tap(std::string(to_string(s.op)) + (s.layer >= 0 ? "@" + std::to_string(s.layer) : "") +
+                                             (s.site.empty() ? "" : "/" + s.site) + ":" + std::string(to_string(b)),
+                                         v);
+            }
+            if (s.op == Op::hc_post && s.site == "ffn" && b == Buffer::stream) stream_hashes_.push_back(h);
+            hashes_.emplace_back(std::string(to_string(s.op)) + (s.layer >= 0 ? "@" + std::to_string(s.layer) : "") +
+                                     (s.site.empty() ? "" : "/" + s.site) + ":" + std::string(to_string(b)),
+                                 h);
+        }
+    }
+    if (engram_async) {
+        engram_io.get();
+        engram_seconds_ = engram_read_seconds;
+        if (tr)  // the reader thread's whole read (only its duration is meaningful in the row)
+            tr->sync("engram_async_read", std::chrono::steady_clock::now() -
+                                              std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(engram_read_seconds)), -1);
+    }
+    if (tr) tr->last_event(st);
+    check(hipStreamSynchronize(st), "step");
+    if (tr) tr->mark("final_sync");
+    if (m.options.op_timing) collect_op_timing(op_exchange);
+    if (tr) tr->mark("collect_op_timing");
+    m.position += R;
+    step_seconds_ = seconds_since(t_step);
+    if (tr) tr->finish(m.op_events, step_seconds_);
+    return tokens_;
+}
+
+}  // namespace strix::deepseek41

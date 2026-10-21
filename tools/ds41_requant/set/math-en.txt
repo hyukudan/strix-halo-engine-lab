@@ -1,0 +1,128 @@
+<|im_start|>user
+Solve the following problems carefully, showing every step and using LaTeX for formulas.
+1. Find all real solutions of $x^4 - 5x^2 + 4 = 0$ and factor the polynomial completely.
+2. Compute $\int_0^{\pi/2} \frac{\sin x}{\sin x + \cos x}\,dx$.
+3. Prove by induction that $\sum_{k=1}^{n} k^3 = \left(\frac{n(n+1)}{2}\right)^2$.
+4. A fair die is rolled until a six appears. What is the expected number of rolls, and what is the probability that more than four rolls are needed?
+5. Find the eigenvalues and eigenvectors of the matrix $\begin{pmatrix} 2 & 1 \\ 1 & 2 \end{pmatrix}$ and diagonalize it.
+6. Show that $\sqrt{2}$ is irrational.<|im_end|>
+<|im_start|>assistant
+<think>
+The user wants me to solve 6 math problems carefully with every step shown and using LaTeX. Let me work through each one systematically.
+
+1. Solve x⁴ - 5x² + 4 = 0 - This is a quadratic in x². Let u = x², then u² - 5u + 4 = 0, factor as (u-1)(u-4) = 0, so u = 1 or u = 4, giving x = ±1, ±2.
+
+2. Compute ∫₀^{π/2} sin(x)/(sin(x)+cos(x)) dx - Classic symmetry trick. Let I = ∫₀^{π/2} sin(x)/(sin(x)+cos(x)) dx. Substituting x → π/2 - x gives I = ∫₀^{π/2} cos(x)/(cos(x)+sin(x)) dx. Adding: 2I = ∫₀^{π/2} 1 dx = π/2, so I = π/4.
+
+3. Prove by induction that Σk³ = [n(n+1)/2]².
+
+4. Geometric distribution: expected value = 1/p = 6. P(more than 4 rolls) = (5/6)⁴.
+
+5. Eigenvalues of [[2,1],[1,2]]: det([[2-λ,1],[1,2-λ]]) = (2-λ)² - 1 = 0, so λ = 1 or λ = 3. Eigenvectors follow.
+
+6. Proof that √2 is irrational - classic proof by contradiction.
+
+Let me write all of these out carefully.
+</think>
+
+# Complete Solutions to Six Problems
+
+---
+
+## 1. Solving $x^4 - 5x^2 + 4 = 0$ and Factoring
+
+This is a **quadratic in disguise** (biquadratic equation). Let $u = x^2$:
+
+$$u^2 - 5u + 4 = 0$$
+
+Factoring the quadratic:
+
+$$(u - 1)(u - 4) = 0$$
+
+So $u = 1$ or $u = 4$. Substituting back $u = x^2$:
+
+$$x^2 = 1 \implies x = \pm 1, \qquad x^2 = 4 \implies x = \pm 2$$
+
+**The four real solutions are:** $\;x = -2,\;-1,\;1,\;2.$
+
+Since these are exactly the roots, the polynomial factors completely over $\mathbb{R}$ (and $\mathbb{C}$) as:
+
+$$\boxed{x^4 - 5x^2 + 4 = (x+2)(x+1)(x-1)(x-2)}$$
+
+---
+
+## 2. Computing $\displaystyle\int_0^{\pi/2} \frac{\sin x}{\sin x + \cos x}\,dx$
+
+Let $\displaystyle I = \int_0^{\pi/2} \frac{\sin x}{\sin x + \cos x}\,dx.$
+
+**Step 1 — Substitution.** Apply the symmetry substitution $x \mapsto \frac{\pi}{2} - x$. Since $\sin\!\bigl(\tfrac{\pi}{2}-x\bigr)=\cos x$ and $\cos\!\bigl(\tfrac{\pi}{2}-x\bigr)=\sin x$, and the limits $\bigl[\tfrac{\pi}{2},\,0\bigr]$ reverse back to $\bigl[0,\,\tfrac{\pi}{2}\bigr]$:
+
+$$I = \int_0^{\pi/2} \frac{\cos x}{\cos x + \sin x}\,dx$$
+
+**Step 2 — Add the two forms.**
+
+$$2I = \int_0^{\pi/2} \frac{\sin x}{\sin x+\cos x}\,dx \;+\; \int_0^{\pi/2} \frac{\cos x}{\sin x+\cos x}\,dx = \int_0^{\pi/2} \frac{\sin x + \cos x}{\sin x + \cos x}\,dx = \int_0^{\pi/2} 1\,dx = \frac{\pi}{2}$$
+
+**Step 3 — Solve for $I$.**
+
+$$\boxed{I = \dfrac{\pi}{4}}$$
+
+---
+
+## 3. Induction Proof: $\displaystyle\sum_{k=1}^{n} k^3 = \left(\frac{n(n+1)}{2}\right)^2$
+
+### Base Case ($n = 1$)
+
+$$\sum_{k=1}^{1} k^3 = 1^3 = 1, \qquad \left(\frac{1\cdot 2}{2}\right)^2 = 1^2 = 1. \;\checkmark$$
+
+### Inductive Hypothesis
+
+Assume the formula holds for some $n = m \geq 1$:
+
+$$\sum_{k=1}^{m} k^3 = \left(\frac{m(m+1)}{2}\right)^2 \tag{IH}$$
+
+### Inductive Step ($n = m+1$)
+
+$$\sum_{k=1}^{m+1} k^3 = \underbrace{\sum_{k=1}^{m} k^3}_{\text{apply IH}} + (m+1)^3 = \left(\frac{m(m+1)}{2}\right)^2 + (m+1)^3$$
+
+Factor out $(m+1)^2$:
+
+$$= (m+1)^2\!\left[\frac{m^2}{4} + (m+1)\right] = (m+1)^2\!\left[\frac{m^2 + 4(m+1)}{4}\right] = (m+1)^2\cdot\frac{m^2 + 4m + 4}{4}$$
+
+Recognize the numerator as a perfect square: $m^2 + 4m + 4 = (m+2)^2$.
+
+$$= (m+1)^2\cdot\frac{(m+2)^2}{4} = \left[\frac{(m+1)(m+2)}{2}\right]^2$$
+
+This is exactly $\left(\frac{n(n+1)}{2}\right)^2$ with $n = m+1$. $\;\checkmark$
+
+By mathematical induction, the identity holds for **all** $n \in \mathbb{N}$. $\blacksquare$
+
+---
+
+## 4. Rolling a Die Until a Six Appears
+
+The number of rolls $X$ until the first six follows a **geometric distribution** with parameter $p = \frac{1}{6}$.
+
+### Expected Number of Rolls
+
+$$E[X] = \frac{1}{p} = \frac{1}{1/6} = \boxed{6}$$
+
+### Probability That More Than Four Rolls Are Needed
+
+"More than four rolls are needed" means the first four rolls are **all non-sixes** (each with probability $\frac{5}{6}$):
+
+$$P(X > 4) = \left(\frac{5}{6}\right)^4 = \frac{625}{1296} \approx 0.4823$$
+
+$$\boxed{P(X > 4) = \left(\frac{5}{6}\right)^4 = \frac{625}{1296}}$$
+
+---
+
+## 5. Eigenvalues, Eigenvectors, and Diagonalization of $A = \begin{pmatrix} 2 & 1 \\ 1 & 2 \end{pmatrix}$
+
+### Eigenvalues
+
+Solve $\det(A - \lambda I) = 0$:
+
+$$\det\begin{pmatrix} 2-\lambda & 1 \\ 1 & 2-\lambda \end{pmatrix} = (2-\lambda)^2 - 1 = \lambda^2 - 4\lambda + 3 = (\lambda - 1)(\lambda - 3) = 0$$
+
+$$\boxed{\lambda_1 = 1, \qquad \lambda_2 =
