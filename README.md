@@ -4,13 +4,6 @@
 
 [English](README.md) · [Español](README.es.md)
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/media/speed-dark.svg">
-    <img alt="Measured speed on one Strix Halo box. Writing answers with MTP: 53.1 tok/s exact profile, 54.9 tok/s dense A8. Reading the prompt: about 400 tok/s exact and about 700 tok/s dense A8 from 1K to 32K tokens. Commit dff1dbe, 2026-10-18." src="docs/media/speed-light.svg" width="860">
-  </picture>
-</p>
-
 <!-- SCREENSHOT: monitor panel of the engine goes here once the panel ships, e.g.
 <p align="center"><img alt="Engine monitor panel" src="docs/media/monitor.png" width="860"></p>
 -->
@@ -20,7 +13,7 @@ machine (Ryzen AI Max+ 395, 128 GB of unified memory) under Linux with ROCm. It 
 chip and that model, so every kernel, memory layout and scheduling choice can assume exactly what the hardware
 and the model are.
 
-It answers about **53-55 tokens per second** on a code prompt and reads prompts at **about 700 tokens per
+It answers about **60 tokens per second** on a code prompt and reads prompts at **about 1,000 tokens per
 second**, and the text it writes is **exactly** the text plain one-token-at-a-time greedy decoding would write.
 The speed comes from guessing several tokens ahead and checking all the guesses at once, never from changing
 the answer.
@@ -35,12 +28,14 @@ performance from AMD hardware.
 
 > **Status: research engine.** It works end to end and the numbers below are measured. The main interface is a
 > command-line tool that takes token IDs and prints a JSON receipt; `--http-serve` turns the same process into an
-> OpenAI/Anthropic-compatible HTTP server (one request at a time, greedy; see [docs/serving.md](docs/serving.md)).
+> OpenAI/Anthropic-compatible HTTP server (one request at a time by default, up to eight batched request slots with
+> `--http-batch`; see [docs/serving.md](docs/serving.md)).
 
 ## Contents
 
 [Why it is different](#why-it-is-different) ·
 [How fast](#how-fast) ·
+[Two nodes and DeepSeek](#two-nodes-a-discrete-gpu-and-deepseek-v41-flash) ·
 [How good](#how-good-quality) ·
 [Languages](#beyond-english) ·
 [What you need](#what-you-need) ·
@@ -73,45 +68,82 @@ performance from AMD hardware.
 
 ## How fast
 
-Measured on **one Bosgame M5** (Ryzen AI Max+ 395, 128 GB), model UD-Q4_K_XL, one request at a time, at commit
-`dff1dbe` on **2026-10-18**. These numbers will be refreshed after the current benchmark campaign.
+Measured on **one Strix Halo mini PC** (Ryzen AI Max+ 395, 128 GB), model UD-Q4_K_XL, one request at a time, in
+the production configuration (dense A8 numerical profile, distilled draft head, MTP windows 2/4/8, greedy, 256
+generated tokens, golden replay error 0), **2026-10-22**, median of 3 runs:
 
-<!-- BENCH: refresh every value in this section (and tools/gen_readme_chart.py, then rerun it) at the final campaign commit; update commit and date. -->
+**Writes answers** (decode with speculative MTP windows):
 
-**Writes answers** (decode, speculative with MTP windows 2/4/8, code prompt, 256 generated tokens, replay error 0):
-
-| Profile | Tokens per second |
+| Prompt | Tokens per second |
 |---|---|
-| Exact (FP32 dense) | **53.1** |
-| Dense A8 (recommended) | **54.9** |
+| Code, 1K-token prompt | **59.9** |
+| Prose, 1K-token prompt | **55.5** |
+| Prose, 8K-token prompt | **48.9** |
+| Code, 32K-token prompt | **51.8** |
 
-<!-- BENCH: decode per workload (English prose, Spanish prose, other languages, chat) for both profiles. -->
+Code is the easiest case for the predictor; prose accepts fewer drafted tokens per check. Through the HTTP server
+the same requests decode at 59.2 (code) and 54.9 (prose) tok/s. The exact (FP32 dense) profile was last measured
+on 2026-10-18 (commit `dff1dbe`): 53.1 tok/s on a code prompt, against 54.9 for dense A8 on the same build.
 
-Code is the easiest case for the predictor. Prose accepts fewer drafted tokens per check, so it decodes
-slower: at an earlier commit (`b0d1cd1`) English prose ran at 37.2 tok/s where code ran at 48.5 tok/s. A
-per-workload table for the current build is pending; see [docs/ENGINE.md](docs/ENGINE.md#decode-by-workload-earlier-measurement).
+**Reads your prompt** (fast prompt profile, 8192-row tiles; time to first token includes the whole prompt):
 
-**Reads your prompt** (prefill, tiled, tokens per second of the whole request):
-
-| Prompt length | Exact (FP32 dense) | Dense A8 (recommended) |
+| Prompt length | Prefill, tokens per second | Time to first token |
 |---|---|---|
-| 1K tokens | ~401 | **703** |
-| 4K tokens | ~388 | **694** |
-| 16K tokens | ~375 | **668** |
-| 32K tokens | ~371 | **656** |
+| 1K tokens | 916 | **1.13 s** |
+| 4K tokens | 1,085 | **3.78 s** |
+| 16K tokens | 1,089 | **15.05 s** |
+| 32K tokens | 1,065 | **30.76 s** |
 
-**Time to first token:**
+The exact prompt profile reads about 400 tokens per second at every length (2026-10-18). Loading the model takes
+about 11 s once its checksum is cached; the very first start hashes the 111 GB file, about 50 s.
 
-| Prompt length | Exact | Dense A8 |
+## Two nodes, a discrete GPU and DeepSeek V4.1 Flash
+
+The same engine also runs **DeepSeek V4.1 Flash** (the 1017 checkpoint: 2-bit routed experts, dense weights in a
+6-bit packed overlay plus trellis-coded shared-expert and head weights) across **two Strix Halo machines** linked by
+USB4. Each node holds half of the routed experts; the decode runs expert tensor parallel, the prefill expert
+parallel, and the attention is split across the two GPUs. The production settings are listed in
+[docs/ds41-production-defaults.md](docs/ds41-production-defaults.md) and [DECISIONS.md](DECISIONS.md) (D-061 to D-064).
+
+Measured on the two-node pair, 40 layers, production defaults and identity; every gate run's tokens are bitwise
+equal to a stored reference:
+
+| What | Measured |
+|---|---|
+| Greedy decode, one stream | **28.5** tok/s |
+| DSpark speculative decode, one stream (8 English / 8 Spanish / 8 code prompts, 256 tokens) | **37.5 / 39.3 / 62.3** tok/s (46.4 over all 24) |
+| Batched decode, 8 streams (aggregate) | **95.9** tok/s |
+| Prompt reading (device prefill), 8K tokens | **734** tok/s |
+| Server (OpenAI API, 8 slots, DSpark), 8-category short set, 1 / 4 / 8 clients | **38.4 / 59.3 / 66.8** tok/s aggregate |
+| Time to first token through the server, 8K-token prompt, idle server | **15.8** s |
+
+**With a discrete GPU.** An NVIDIA RTX PRO 6000 Blackwell (96 GB) in a PC can take the first 22 layers of the
+decode: it runs layers [0, 22) with CUDA, the pair runs [22, 40) and the head, and one hidden state crosses the network per step
+(`strix-cuda-ds41-pipeline-front` with `strix-deepseek41-rank --role pipeline-stage`, opt-in; see
+[docs/ds41-pipeline-stage.md](docs/ds41-pipeline-stage.md)). Without the trellis sites the split is bitwise the
+pair-only run (24/24 prompts, 6144/6144 tokens, 61.7 tok/s with DSpark). With them the RTX layers sum the trellis
+shared expert in IEEE order, a declared composed identity checked against the pair (KL mean 1.7e-3, top-1 127/128;
+[docs/ds41-cuda-trellis-shexp.md](docs/ds41-cuda-trellis-shexp.md)). Measured with 8 English, 8 Spanish and 8 code
+prompts of 256 tokens, production identity, both columns on the same pair build (P17.1):
+
+| What | Pair only | Pair + RTX PRO |
 |---|---|---|
-| 1K tokens | <!-- BENCH: TTFT 1K exact --> pending | <!-- BENCH: TTFT 1K dense A8 --> pending |
-| 4K tokens | <!-- BENCH: TTFT 4K exact --> pending | <!-- BENCH: TTFT 4K dense A8 --> pending |
-| 16K tokens | <!-- BENCH: TTFT 16K exact --> pending | <!-- BENCH: TTFT 16K dense A8 --> pending |
-| 32K tokens | <!-- BENCH: TTFT 32K exact --> pending | <!-- BENCH: TTFT 32K dense A8 --> pending |
+| Greedy decode, one stream | 27.7 tok/s | **38.3** tok/s |
+| DSpark decode, one stream (English / Spanish / code) | 37.5 / 39.3 / 62.3 tok/s | **50.3 / 54.2 / 81.1** tok/s |
+| DSpark decode, all 24 prompts | 46.4 tok/s | **61.8** tok/s (x1.33) |
 
-Until TTFT is measured directly: at the prefill rates above, reading a 32K-token prompt takes roughly 50 s with
-dense A8 and 88 s with the exact profile (arithmetic from the throughput, not a separate measurement). Loading
-the model takes about 11 s once its checksum is cached; the very first start hashes the 111 GB file, about 50 s.
+The RTX PRO can also read the prompt for the pair: a resident CUDA prefill service (`strix-cuda-ds41-prefill-service`,
+experts streamed from pinned host memory) hands the attention state to the server's import route. With the exact
+profile (state bytes equal to the reference prefill) the time to first token including the state export is 3.6 s at
+2K, 4.4 s at 8K and 12.2 s at 32K tokens on a warm service (handoff measured to a local import endpoint).
+A third, opt-in mode keeps all dense weights and the hottest experts on the RTX PRO and asks the pair for the rest (`strix-cuda-ds41-hot-decode` with `strix-deepseek41-expert-server`): exact, 40.1
+tok/s greedy on 6 chats, measured on an earlier pair build (27.2 tok/s pair only).
+
+**Qwen3.8-Flash-Next on two replicas.** Two full copies of Qwen3.8-Flash-Next, one per node, behind the TensorMeld
+router (D-057 to D-060), servers restarted before each of 3 rounds, median: 42.8 / 85.8 / 102.9 / 110.6 / 120.4 tok/s
+aggregate at 1 / 2 / 4 / 6 / 8 clients on the 8-category short set (wall time including the first token); on a
+coding chat the per-request decode rates sum to 90.7 / 181.5 / 201.6 / 255.0 tok/s at 1 / 2 / 4 / 8 users. Every
+response equals the single-node one (570/570).
 
 ## How good (quality)
 
@@ -160,7 +192,7 @@ We work to avoid losing quality or speed outside English.
 
 | | |
 |---|---|
-| **Machine** | AMD Strix Halo with the Radeon 8060S iGPU (`gfx1151`), e.g. Ryzen AI Max+ 395, with **128 GB** of unified memory. Measured on a Bosgame M5. |
+| **Machine** | AMD Strix Halo with the Radeon 8060S iGPU (`gfx1151`), e.g. Ryzen AI Max+ 395, with **128 GB** of unified memory. Measured on a Strix Halo mini PC. |
 | **OS** | Linux. |
 | **GPU stack** | ROCm/HIP. Tested with ROCm **core 10.1** installed under `/opt/rocm/core-10.1`. |
 | **Build tools** | CMake >= 3.24, Ninja, a C++20 compiler, optionally OpenSSL for fast file hashing. |
@@ -235,6 +267,20 @@ the same verify window; it pays on requests that copy their context (correcting 
 elsewhere (D-047, opt-in). `--dense-q6p-pack` reads 6.5-bit copies of the dense weights with the same bits as a
 6-bit emulated checkpoint (D-048, a draft until its timing and quality decision). Sampled decisions run on the GPU
 by default (D-050).
+
+### Exposing the servers
+
+The HTTP servers (`strix-hip-decode-token --http-serve` and `strix-deepseek41-serve`) listen on `127.0.0.1` unless
+`--http-bind` says otherwise. They have no TLS of their own. Authentication is one optional shared key:
+with `--http-api-key-file FILE` every API and admin route (completions, `/admin/drain`, `/admin/import-state`)
+needs `Authorization: Bearer <key>` or `x-api-key: <key>`; without it the server accepts any client. `/health`,
+`/metrics` and `/api/status` answer without the key. Bodies, queued requests and open connections are bounded
+(`--http-max-queue`, `--http-max-connections`). Keep the servers on loopback or a private network and put
+remote clients behind an authenticating front end such as the [TensorMeld](https://github.com/hyukudan/tensormeld)
+router or its control channel; the two-node DeepSeek ranks exchange tensors over the USB4 link, and the RTX split
+(pipeline stage TCP port) and the expert servers talk plain TCP: none of these carry authentication, so they must
+stay on a direct cable or a private network. Per-user keys, TLS and a secure configuration interface are
+work items, not features.
 
 ## How it works
 

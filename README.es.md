@@ -79,7 +79,7 @@ cualificadas explícitamente. Primera prioridad: el mejor rendimiento correcto d
 
 ## Velocidad
 
-Medido en **un Bosgame M5** (Ryzen AI Max+ 395, 128 GB), modelo UD-Q4_K_XL, una petición cada vez, en el commit
+Medido en **un mini PC Strix Halo** (Ryzen AI Max+ 395, 128 GB), modelo UD-Q4_K_XL, una petición cada vez, en el commit
 `dff1dbe` el **2026-10-18**. Estos números se actualizarán tras la campaña de benchmarks en curso.
 
 <!-- BENCH: actualizar todos los valores de esta sección (y tools/gen_readme_chart.py, y volver a ejecutarlo) con el commit final de la campaña; actualizar commit y fecha. -->
@@ -170,7 +170,7 @@ Trabajamos para no perder calidad ni velocidad fuera del inglés.
 
 | | |
 |---|---|
-| **Máquina** | AMD Strix Halo con la iGPU Radeon 8060S (`gfx1151`), p. ej. Ryzen AI Max+ 395, con **128 GB** de memoria unificada. Medido en un Bosgame M5. |
+| **Máquina** | AMD Strix Halo con la iGPU Radeon 8060S (`gfx1151`), p. ej. Ryzen AI Max+ 395, con **128 GB** de memoria unificada. Medido en un mini PC Strix Halo. |
 | **Sistema** | Linux. |
 | **Pila de GPU** | ROCm/HIP. Probado con ROCm **core 10.1** instalado en `/opt/rocm/core-10.1`. |
 | **Herramientas** | CMake >= 3.24, Ninja, un compilador C++20 y, opcionalmente, OpenSSL para calcular hashes rápido. |

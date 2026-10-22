@@ -1,4 +1,7 @@
 #include "strix/dist/communicator.hpp"
+#include "strix/dist/gpu_direct.hpp"
+#include "strix/dist/host_copy.hpp"
+#include "dist_latency_trace.hpp"
 
 #include "strix/serve/json.hpp"
 
@@ -27,8 +30,11 @@
 #include <random>
 #include <sstream>
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <functional>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <thread>
 
@@ -110,9 +116,35 @@ private:
 // Runs one job at a time on a persistent thread (the progress thread of a transport or stream). After a
 // job it spins briefly for the next one (the exchanges of consecutive layers come close together), then
 // sleeps; the caller spins for completion.
+// How long an idle worker spins before it sleeps (STRIX_DIST_SPIN_US, default 300): a job posted within the window
+// starts without a wake-up.
+std::chrono::microseconds worker_spin() {
+    static const auto us = [] {
+        const char* v = std::getenv("STRIX_DIST_SPIN_US");
+        return std::chrono::microseconds(v && *v ? std::stoll(v) : 300LL);
+    }();
+    return us;
+}
+
 class Worker {
 public:
     Worker() : thread_([this] { run(); }) {}
+    // Runs this worker on one CPU only (the communicator's progress thread: STRIX_DIST_PROGRESS_CPU).
+    void pin(int cpu) {
+        if (cpu < 0 || cpu >= CPU_SETSIZE) fail("dist: CPU outside cpu_set_t range");
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(cpu, &set);
+        if (const int e = pthread_setaffinity_np(thread_.native_handle(), sizeof(set), &set); e != 0)
+            fail("dist: cannot pin worker to CPU " + std::to_string(cpu) + ": " + std::strerror(e));
+    }
+    void name(const std::string& value) {
+        if (const int e = pthread_setname_np(thread_.native_handle(), value.c_str()); e != 0)
+            fail("dist: cannot name worker: " + std::string(std::strerror(e)));
+    }
+    void idle_spin(std::chrono::microseconds duration) {
+        idle_spin_us_.store(duration.count(), std::memory_order_relaxed);
+    }
     ~Worker() {
         {
             std::lock_guard lock(mutex_);
@@ -124,7 +156,18 @@ public:
     Worker(const Worker&) = delete;
     Worker& operator=(const Worker&) = delete;
     void post(std::function<void()> job) {
-        job_ = std::move(job);
+        if (latency::enabled()) {
+            const auto context = latency::context();
+            job_ = [context, job = std::move(job)] {
+                latency::context() = context;
+                latency::mark("worker_run");
+                job();
+                latency::mark("worker_done");
+            };
+            latency::mark("worker_post");
+        } else {
+            job_ = std::move(job);
+        }
         error_ = nullptr;
         {
             std::lock_guard lock(mutex_);
@@ -137,12 +180,23 @@ public:
         while (finished_.load(std::memory_order_acquire) != target) cpu_relax();
         if (error_) std::rethrow_exception(error_);
     }
+    // The same with a deadline: false if the job has not finished by then (it keeps running).
+    bool wait_until(std::chrono::steady_clock::time_point deadline) {
+        const auto target = posted_.load(std::memory_order_relaxed);
+        for (unsigned i = 0; finished_.load(std::memory_order_acquire) != target; ++i) {
+            if ((i & 1023U) == 0U && std::chrono::steady_clock::now() >= deadline) return false;
+            cpu_relax();
+        }
+        if (error_) std::rethrow_exception(error_);
+        return true;
+    }
 
 private:
     void run() {
         std::uint64_t seen = 0;
         while (true) {
-            const auto spin_end = std::chrono::steady_clock::now() + std::chrono::microseconds(300);
+            const auto spin_end = std::chrono::steady_clock::now() +
+                std::chrono::microseconds(idle_spin_us_.load(std::memory_order_relaxed));
             while (posted_.load(std::memory_order_acquire) == seen && !stop_.load(std::memory_order_acquire) &&
                    std::chrono::steady_clock::now() < spin_end)
                 cpu_relax();
@@ -162,6 +216,7 @@ private:
     std::exception_ptr error_;
     std::atomic<std::uint64_t> posted_{0}, finished_{0};
     std::atomic<bool> stop_{false};
+    std::atomic<std::int64_t> idle_spin_us_{worker_spin().count()};
     std::thread thread_;
 };
 
@@ -220,9 +275,49 @@ public:
                 fail("usb4 host transport weights must be positive");
             }
         if (const char* t = std::getenv("STRIX_DIST_USB4_TIMEOUT_MS"); t && *t) timeout_ = std::chrono::milliseconds(std::stoll(t));
-        for (std::size_t i = 0; i < fds_.size(); ++i) {
-            writers_.push_back(std::make_unique<Worker>());
-            readers_.push_back(std::make_unique<Worker>());
+        // Every read and write is non-blocking (poll() bounds the waits: deadline, abort), whoever opened the streams.
+        for (const int fd : fds_)
+            if (const int flags = ::fcntl(fd, F_GETFL); flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+                const int error = errno;
+                for (const int open_fd : fds_) ::close(open_fd);
+                fail(std::string("usb4 host transport: cannot make a stream non-blocking: ") + std::strerror(error));
+            }
+        // STRIX_DIST_USB4_EAGER=N: messages of at most N bytes are moved on the calling thread, with no hand-off to the
+        // per-stream threads. Every direction of every stream progresses in one poll loop, so a part larger than what
+        // a stream buffers cannot deadlock two ranks that both write before they read.
+        // Default 65536 since P17.3 (deepseek41 pair, layout 1: R1 decode +2.8 %, R6 / batch equal, same bits); =0 off.
+        eager_ = std::size_t{65536};
+        if (const char* e = std::getenv("STRIX_DIST_USB4_EAGER"); e && *e) eager_ = std::min<std::size_t>(std::stoull(e), std::size_t{1} << 20U);
+        // Optional singleton masks per stream, in topology/receipt order. Unspecified: inherited affinity.
+        // Validate the complete list before starting any jobs; a partial map is an error, not an unpinned fallback.
+        const auto cpus = [this](const char* key) {
+            std::vector<int> result;
+            if (const char* text = std::getenv(key); text && *text) {
+                std::stringstream input(text);
+                for (std::string item; std::getline(input, item, ',');) {
+                    std::size_t end = 0;
+                    const int cpu = std::stoi(item, &end);
+                    if (end != item.size() || cpu < 0 || cpu >= CPU_SETSIZE) fail(std::string(key) + ": invalid CPU");
+                    result.push_back(cpu);
+                }
+                if (result.size() != fds_.size()) fail(std::string(key) + ": needs exactly one CPU per stream");
+            }
+            return result;
+        };
+        try {
+            const auto write_cpus = cpus("STRIX_DIST_USB4_WRITE_CPUS");
+            const auto read_cpus = cpus("STRIX_DIST_USB4_READ_CPUS");
+            for (std::size_t i = 0; i < fds_.size(); ++i) {
+                writers_.push_back(std::make_unique<Worker>());
+                readers_.push_back(std::make_unique<Worker>());
+                if (!write_cpus.empty()) writers_.back()->pin(write_cpus[i]);
+                if (!read_cpus.empty()) readers_.back()->pin(read_cpus[i]);
+                if (latency::enabled() || !write_cpus.empty()) writers_.back()->name("u4-w" + std::to_string(i));
+                if (latency::enabled() || !read_cpus.empty()) readers_.back()->name("u4-r" + std::to_string(i));
+            }
+        } catch (...) {
+            close_all();
+            throw;
         }
     }
     ~Usb4HostTransport() override {
@@ -242,6 +337,7 @@ public:
         for (std::size_t k = 0; k < names_.size(); ++k)
             out += (k ? "," : "") + names_[k] + (fds_.size() > 1U ? "*" + std::to_string(weights_[k]) : "");
         if (min_part_) out += " (min part " + std::to_string(min_part_) + " B)";
+        if (eager_) out += " (eager up to " + std::to_string(eager_) + " B)";
         return out;
     }
 
@@ -264,11 +360,12 @@ private:
         return message.subspan(begin, end - begin);
     }
     void close_all() {
+        std::lock_guard lock(fds_mutex_); // abort() may be switching them to /dev/null on another thread
         for (auto& fd : fds_)
             if (fd >= 0) { ::close(fd); fd = -1; }
     }
-    // Waits until `fd` is ready for `events` (blocking descriptors) in short slices, so an abort or the
-    // deadline stops the wait.
+    // Waits until `fd` is ready for `events` in short slices, so an abort or the deadline stops the wait. The
+    // descriptors stay non-blocking: no read or write can sleep in the kernel past the deadline or an abort.
     void wait_ready(std::size_t k, short events, std::chrono::steady_clock::time_point deadline, const char* what) {
         if (spin_) return;
         while (true) {
@@ -283,17 +380,28 @@ private:
                 fail_stream(k, std::string(what) + ": poll: " + errno_text(errno));
             }
             if (ready == 0) continue;
+            stats_[k].revents.store(p.revents, std::memory_order_relaxed);
             if (p.revents & POLLNVAL) fail_stream(k, std::string(what) + ": descriptor closed");
             return; // ready, or an error/hang-up that the read or write reports precisely
         }
     }
     void write_part(std::size_t k, std::span<const std::byte> bytes) {
+        latency::mark("stream_write_begin", k);
         std::size_t done = 0;
         auto deadline = std::chrono::steady_clock::now() + timeout_;
+        auto& st = stats_[k];
+        st.want_w.store(bytes.size(), std::memory_order_relaxed);
+        st.done_w.store(0, std::memory_order_relaxed);
         while (done < bytes.size()) {
             wait_ready(k, POLLOUT, deadline, "write");
             const auto n = ::write(fds_[k], bytes.data() + done, bytes.size() - done);
-            if (n > 0) { done += static_cast<std::size_t>(n); deadline = std::chrono::steady_clock::now() + timeout_; continue; }
+            if (n > 0) {
+                done += static_cast<std::size_t>(n);
+                st.done_w.store(done, std::memory_order_relaxed);
+                st.last_w.store(now_ns(), std::memory_order_relaxed);
+                deadline = std::chrono::steady_clock::now() + timeout_;
+                continue;
+            }
             if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
                 if (aborted_.load(std::memory_order_acquire)) throw Aborted{};
                 if (spin_) cpu_relax();
@@ -304,12 +412,22 @@ private:
         }
     }
     void read_part(std::size_t k, std::span<std::byte> bytes) {
+        latency::mark("stream_read_begin", k);
         std::size_t done = 0;
         auto deadline = std::chrono::steady_clock::now() + timeout_;
+        auto& st = stats_[k];
+        st.want_r.store(bytes.size(), std::memory_order_relaxed);
+        st.done_r.store(0, std::memory_order_relaxed);
         while (done < bytes.size()) {
             wait_ready(k, POLLIN, deadline, "read");
             const auto n = ::read(fds_[k], bytes.data() + done, bytes.size() - done);
-            if (n > 0) { done += static_cast<std::size_t>(n); deadline = std::chrono::steady_clock::now() + timeout_; continue; }
+            if (n > 0) {
+                done += static_cast<std::size_t>(n);
+                st.done_r.store(done, std::memory_order_relaxed);
+                st.last_r.store(now_ns(), std::memory_order_relaxed);
+                deadline = std::chrono::steady_clock::now() + timeout_;
+                continue;
+            }
             if (n == 0) fail_stream(k, "the peer closed the stream (its rank failed or exited)");
             if (errno == EINTR || errno == EAGAIN) {
                 if (aborted_.load(std::memory_order_acquire)) throw Aborted{};
@@ -318,6 +436,88 @@ private:
                 continue;
             }
             fail_stream(k, "read: " + errno_text(errno));
+        }
+    }
+    // The eager path: every unfinished direction of every used stream in one loop on the calling thread. Each pass
+    // tries the reads and writes (non-blocking); a pass without progress polls them all, in slices so an abort or the
+    // deadline (no progress on any of them for the timeout) ends the wait. Partial reads and writes are the norm.
+    void eager(const std::span<const std::byte>* out, const std::span<std::byte>* in, std::size_t used) {
+        std::array<std::span<const std::byte>, 8> wpart{};
+        std::array<std::span<std::byte>, 8> rpart{};
+        std::array<std::size_t, 8> wdone{}, rdone{};
+        std::size_t open = 0;
+        for (std::size_t k = 0; k < used; ++k) {
+            auto& st = stats_[k];
+            if (out) {
+                wpart[k] = part(*out, k, used);
+                st.want_w.store(wpart[k].size(), std::memory_order_relaxed);
+                st.done_w.store(0, std::memory_order_relaxed);
+                open += !wpart[k].empty();
+            }
+            if (in) {
+                rpart[k] = part(*in, k, used);
+                st.want_r.store(rpart[k].size(), std::memory_order_relaxed);
+                st.done_r.store(0, std::memory_order_relaxed);
+                open += !rpart[k].empty();
+            }
+        }
+        auto deadline = std::chrono::steady_clock::now() + timeout_;
+        std::array<pollfd, 16> fds{};
+        std::array<std::size_t, 16> stream{};
+        while (open) {
+            bool moved = false;
+            for (std::size_t k = 0; k < used; ++k) {
+                auto& st = stats_[k];
+                if (wdone[k] < wpart[k].size()) {
+                    const auto n = ::write(fds_[k], wpart[k].data() + wdone[k], wpart[k].size() - wdone[k]);
+                    if (n > 0) {
+                        wdone[k] += static_cast<std::size_t>(n);
+                        st.done_w.store(wdone[k], std::memory_order_relaxed);
+                        st.last_w.store(now_ns(), std::memory_order_relaxed);
+                        moved = true;
+                        open -= wdone[k] == wpart[k].size();
+                    } else if (n == 0 || (errno != EAGAIN && errno != EINTR)) {
+                        fail_stream(k, n == 0 ? std::string("write returned 0") : "write: " + errno_text(errno));
+                    }
+                }
+                if (rdone[k] < rpart[k].size()) {
+                    const auto n = ::read(fds_[k], rpart[k].data() + rdone[k], rpart[k].size() - rdone[k]);
+                    if (n > 0) {
+                        rdone[k] += static_cast<std::size_t>(n);
+                        st.done_r.store(rdone[k], std::memory_order_relaxed);
+                        st.last_r.store(now_ns(), std::memory_order_relaxed);
+                        moved = true;
+                        open -= rdone[k] == rpart[k].size();
+                    } else if (n == 0) {
+                        fail_stream(k, "the peer closed the stream (its rank failed or exited)");
+                    } else if (errno != EAGAIN && errno != EINTR) {
+                        fail_stream(k, "read: " + errno_text(errno));
+                    }
+                }
+            }
+            if (!open) break;
+            if (aborted_.load(std::memory_order_acquire)) throw Aborted{};
+            const auto now = std::chrono::steady_clock::now();
+            if (moved) { deadline = now + timeout_; continue; }
+            if (now >= deadline) {
+                std::size_t k = 0;
+                while (wdone[k] == wpart[k].size() && rdone[k] == rpart[k].size()) ++k;
+                fail_stream(k, std::string(wdone[k] < wpart[k].size() ? "write" : "read") + ": no progress within " + std::to_string(timeout_.count()) + " ms");
+            }
+            if (spin_) { cpu_relax(); continue; }
+            std::size_t n = 0;
+            for (std::size_t k = 0; k < used; ++k) {
+                const short events = static_cast<short>((wdone[k] < wpart[k].size() ? POLLOUT : 0) | (rdone[k] < rpart[k].size() ? POLLIN : 0));
+                if (events) { fds[n] = pollfd{fds_[k], events, 0}; stream[n++] = k; }
+            }
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+            const int ready = ::poll(fds.data(), static_cast<nfds_t>(n), static_cast<int>(std::clamp<long long>(left, 0, 50)));
+            if (ready < 0 && errno != EINTR) fail_stream(stream[0], "poll: " + errno_text(errno));
+            for (std::size_t i = 0; ready > 0 && i < n; ++i) {
+                if (!fds[i].revents) continue;
+                stats_[stream[i]].revents.store(fds[i].revents, std::memory_order_relaxed);
+                if (fds[i].revents & POLLNVAL) fail_stream(stream[i], "descriptor closed");
+            }
         }
     }
     struct Aborted {};
@@ -331,9 +531,27 @@ private:
         fail(text);
     }
     void run(const std::span<const std::byte>* out, const std::span<std::byte>* in) {
-        if (poisoned_) fail("usb4 host transport: unusable after an earlier stream failure (" + poison_ + ")");
+        if (poisoned_.load(std::memory_order_acquire)) {
+            std::lock_guard lock(root_mutex_);
+            fail("usb4 host transport: unusable after an earlier stream failure (" + (poison_.empty() ? root_ : poison_) + ")");
+        }
         const std::size_t size = out ? out->size() : in->size();
         const std::size_t used = streams_for(size);
+        if (size <= eager_) {
+            try {
+                eager(out, in, used);
+                return;
+            } catch (...) {
+                if (!aborted_.load(std::memory_order_acquire)) throw;
+                close_all();
+                poisoned_ = true;
+                {
+                    std::lock_guard lock(root_mutex_);
+                    poison_ = root_.empty() ? std::string("aborted") : root_;
+                }
+                fail(poison_ + " (all streams closed; the peer rank sees them close)");
+            }
+        }
         for (std::size_t k = 0; k < used; ++k) {
             if (out) {
                 const auto piece = part(*out, k, used);
@@ -370,21 +588,61 @@ private:
     std::vector<std::string> names_;
     std::vector<int> fds_;
     std::vector<std::uint32_t> weights_;
-    std::size_t min_part_ = 0;
+    std::size_t min_part_ = 0, eager_ = 0;
     std::chrono::milliseconds timeout_;
     const bool spin_ = [] { const char* v = std::getenv("STRIX_DIST_USB4_SPIN"); return v && v[0] == '1'; }();
     std::atomic<bool> aborted_{false};
-    bool poisoned_ = false;
-    std::mutex root_mutex_;
+    std::atomic<bool> poisoned_{false};
+    // Per stream, for failure reports: bytes done / expected of the part in flight, last successful read and write
+    // (steady ns), last poll events.
+    struct StreamStats {
+        std::atomic<std::uint64_t> done_w{0}, want_w{0}, done_r{0}, want_r{0}, last_w{0}, last_r{0};
+        std::atomic<int> revents{0};
+    };
+    std::array<StreamStats, 8> stats_{};
+    static std::uint64_t now_ns() {
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+
+public:
+    void abort(const std::string& why) override {
+        {
+            std::lock_guard lock(root_mutex_);
+            if (root_.empty()) root_ = why;
+        }
+        aborted_.store(true, std::memory_order_release); // stream threads leave within one poll slice (50 ms)
+        // The streams close now (the peer sees CLOSE), but the descriptor numbers stay ours: dup2 puts /dev/null in
+        // their place, so a thread still inside a read, write or poll cannot reach an unrelated file that reused the
+        // number (an HTTP socket in the server). close_all() releases the numbers later.
+        std::lock_guard lock(fds_mutex_);
+        const int null_fd = ::open("/dev/null", O_RDWR | O_CLOEXEC);
+        for (const int fd : fds_)
+            if (fd >= 0) {
+                if (null_fd >= 0) (void)::dup2(null_fd, fd);
+                else (void)::shutdown(fd, SHUT_RDWR);
+            }
+        if (null_fd >= 0) ::close(null_fd);
+        poisoned_.store(true, std::memory_order_release);
+    }
+    [[nodiscard]] std::string state() const override {
+        std::ostringstream out;
+        const auto now = now_ns();
+        for (std::size_t k = 0; k < names_.size(); ++k) {
+            const auto& st = stats_[k];
+            const auto ago = [&](std::uint64_t t) { return t ? std::to_string((now - t) / 1000000U) + " ms ago" : std::string("never"); };
+            out << (k ? "; " : "") << names_[k] << ": wrote " << st.done_w.load() << "/" << st.want_w.load() << " (last " << ago(st.last_w.load())
+                << "), read " << st.done_r.load() << "/" << st.want_r.load() << " (last " << ago(st.last_r.load()) << "), revents 0x" << std::hex
+                << st.revents.load() << std::dec;
+        }
+        return out.str();
+    }
+
+private:
+    std::mutex root_mutex_, fds_mutex_;
     std::string poison_, root_;
     std::vector<std::unique_ptr<Worker>> writers_, readers_;
 };
 
-bool spin_streams() {
-    // STRIX_DIST_USB4_SPIN=1: non-blocking descriptors polled by the stream threads.
-    static const bool spin = [] { const char* v = std::getenv("STRIX_DIST_USB4_SPIN"); return v && v[0] == '1'; }();
-    return spin;
-}
 void set_blocking(int fd, bool blocking) {
     const int flags = ::fcntl(fd, F_GETFL);
     if (flags < 0 || ::fcntl(fd, F_SETFL, blocking ? flags & ~O_NONBLOCK : flags | O_NONBLOCK) < 0)
@@ -470,7 +728,7 @@ struct Candidate {
     bool reply_queued = false; // rank 0: hello + acknowledgement queued; rank 1: acknowledgement queued
     bool reply_written = false;
     Hello peer;
-    std::size_t garbage = 0, reopens = 0;
+    std::size_t garbage = 0, reopens = 0, open_retries = 0;
     std::string last_error;
     std::vector<std::string> trace; // STRIX_DIST_USB4_DEBUG=1
 };
@@ -511,6 +769,11 @@ std::vector<Candidate> layout_candidates(const Usb4AutoOptions& options, std::ve
             const auto* r = entry.find(field);
             return r && r->is_string() ? " (" + r->as_string() + ")" : std::string();
         };
+        // A stream in gpu_direct mode serves the GPU-direct path only (host read/write are refused there).
+        if (const auto* cfg = entry.find("configfs"); cfg && cfg->is_string() && read_text(cfg->as_string() + "/gpu_direct") == "1") {
+            rejected.push_back(key + " " + c.info.device + ": in gpu_direct mode (GPU-direct path)");
+            continue;
+        }
         // sysfs decides: the layout is written at one moment (boot, a probe) and its attached/openable
         // flags can be stale in either direction. Never open a stream whose service has no peer now
         // (its controller or link may be down).
@@ -590,10 +853,19 @@ void queue(Candidate& c, const Hello& first, const Hello* second = nullptr) {
 void open_stream(Candidate& c) {
     c.fd = ::open(c.info.device.c_str(), O_RDWR | O_CLOEXEC | O_NONBLOCK);
     if (c.fd < 0) {
+        const int e = errno;
+        c.last_error = std::string("open failed: ") + errno_text(e);
+        // Transient right after the previous session's teardown (the driver's reset after DMA teardown can still be
+        // pending, and the rings cannot be allocated yet): try again every 250 ms within the pairing deadline.
+        if (e == ENOMEM || e == EBUSY || e == EAGAIN) {
+            ++c.open_retries;
+            c.reopen_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+            return;
+        }
         c.dead = true;
-        c.last_error = std::string("open failed: ") + errno_text(errno);
         return;
     }
+    if (c.open_retries) note(c, "opened after " + std::to_string(c.open_retries) + " transient open failure(s)");
     ++c.generation;
     c.opened_at = std::chrono::steady_clock::now();
     c.last_hello = {};
@@ -614,7 +886,7 @@ bool handshake_done(const Candidate& c, std::uint32_t rank) {
 bool handshake_step(Candidate& c, std::uint32_t index, const Handshake& hs) {
     const auto now = std::chrono::steady_clock::now();
     if (c.fd < 0) {
-        if (hs.rank == 0U || now >= c.reopen_at) open_stream(c);
+        if (now >= c.reopen_at) open_stream(c); // rank 0's reopen_at is in the past unless an open failed transiently
         return c.fd >= 0;
     }
     const auto lost = [&](const std::string& why) {
@@ -703,18 +975,29 @@ Plan read_plan(int fd) {
     auto* bytes = reinterpret_cast<std::byte*>(&plan);
     std::size_t done = 0;
     const auto deadline = std::chrono::steady_clock::now() + plan_wait;
+    const char* spin_env = std::getenv("STRIX_DIST_USB4_SPIN");
+    const bool spin = spin_env && std::string(spin_env) == "1";
+    if (spin) {
+        // busy_poll streams intentionally reject poll(). Keep pairing bounded
+        // using the same explicit nonblocking mode as the data path.
+        const int flags = ::fcntl(fd, F_GETFL);
+        if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+            fail(std::string("usb4 pairing: cannot make plan read nonblocking: ") + std::strerror(errno));
+    }
     while (done < sizeof(plan)) {
         const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
         if (left <= 0) fail("usb4 pairing: no plan from the peer within " + std::to_string(plan_wait.count()) + " ms");
-        pollfd p{fd, POLLIN, 0};
-        const int ready = ::poll(&p, 1, static_cast<int>(left));
-        if (ready < 0 && errno == EINTR) continue;
-        if (ready < 0 || (p.revents & (POLLERR | POLLHUP))) fail("usb4 pairing: the stream failed while waiting for the plan");
-        if (ready == 0) continue;
+        if (!spin) {
+            pollfd p{fd, POLLIN, 0};
+            const int ready = ::poll(&p, 1, static_cast<int>(left));
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready < 0 || (p.revents & (POLLERR | POLLHUP))) fail("usb4 pairing: the stream failed while waiting for the plan");
+            if (ready == 0) continue;
+        }
         const auto n = ::read(fd, bytes + done, sizeof(plan) - done);
         if (n == 0) fail("usb4 pairing: the peer closed the stream before the plan");
         if (n < 0) {
-            if (errno == EINTR || errno == EAGAIN) continue;
+            if (errno == EINTR || errno == EAGAIN) { if (spin) cpu_relax(); continue; }
             fail(std::string("usb4 pairing: plan read failed: ") + std::strerror(errno));
         }
         done += static_cast<std::size_t>(n);
@@ -856,8 +1139,7 @@ std::unique_ptr<Transport> usb4_host(const std::vector<std::string>& devices, co
             for (const int open_fd : fds) ::close(open_fd);
             fail("cannot open " + path + ": " + std::strerror(errno));
         }
-        fds.push_back(fd);
-        if (!spin_streams()) set_blocking(fd, true);
+        fds.push_back(fd); // stays non-blocking: poll() bounds every wait (deadline, abort)
     }
     return std::make_unique<Usb4HostTransport>(std::move(fds), devices,
                                                weights.empty() ? std::vector<std::uint32_t>(devices.size(), 1U) : weights);
@@ -866,6 +1148,38 @@ std::unique_ptr<Transport> usb4_host(const std::vector<std::string>& devices, co
 std::unique_ptr<Transport> usb4_host_descriptors(std::vector<int> fds, std::vector<std::string> names, std::vector<std::uint32_t> weights,
                                                  std::size_t min_part, std::chrono::milliseconds timeout) {
     return std::make_unique<Usb4HostTransport>(std::move(fds), std::move(names), std::move(weights), min_part, timeout);
+}
+
+std::vector<Usb4LayoutStream> usb4_layout_streams(const Usb4AutoOptions& options) {
+    std::string path = options.layout;
+    if (path.empty()) {
+        const char* env = std::getenv("STRIX_DIST_USB4_LAYOUT");
+        path = env && *env ? env : "/run/usb4stream-layout.json";
+    }
+    std::ifstream file(path);
+    if (!file) fail("cannot read the USB4 stream layout " + path);
+    std::stringstream text;
+    text << file.rdbuf();
+    const auto layout = strix::serve::parse_json(text.str());
+    std::vector<Usb4LayoutStream> out;
+    if (!layout.is_object()) return out;
+    for (const auto& [key, entry] : layout.as_object()) {
+        const auto slash = key.find('/');
+        if (slash == std::string::npos || !entry.is_object()) continue;
+        Usb4LayoutStream st;
+        st.key = key;
+        st.service = key.substr(0, slash);
+        st.stream = key.substr(slash + 1U);
+        if (const auto* d = entry.find("device"); d && d->is_string()) st.device = d->as_string();
+        if (const auto* cfg = entry.find("configfs"); cfg && cfg->is_string()) st.configfs = cfg->as_string();
+        const auto dot = st.service.rfind('.');
+        st.xdomain = dot == std::string::npos ? st.service : st.service.substr(0, dot);
+        st.attached = exists(options.sysfs + "/" + st.service);
+        st.gpu_direct = !st.configfs.empty() && read_text(st.configfs + "/gpu_direct") == "1";
+        out.push_back(std::move(st));
+    }
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.key < b.key; });
+    return out;
 }
 
 std::string Usb4Topology::receipt() const {
@@ -935,7 +1249,7 @@ std::unique_ptr<Transport> usb4_host_auto(const Usb4AutoOptions& options, Usb4To
     };
     for (std::size_t i = 0; i < candidates.size(); ++i) {
         auto& c = candidates[i];
-        if (c.dead && c.fd < 0) { reject(c, "could not be opened"); continue; }
+        if (c.fd < 0 && (c.dead || c.open_retries)) { reject(c, "could not be opened"); continue; }
         if (handshake_done(c, hs.rank)) { accepted.push_back(i); continue; }
         reject(c, !c.hello_ok ? "no answer from the peer"
                   : "the peer's hello arrived but the handshake did not complete (one direction only?)");
@@ -1031,9 +1345,9 @@ std::unique_ptr<Transport> usb4_host_auto(const Usb4AutoOptions& options, Usb4To
             }
             std::stable_sort(accepted.begin(), accepted.end(), [&](std::size_t a, std::size_t b) { return key[a] < key[b]; });
         }
-        for (const auto i : accepted)
-            if (!spin_streams()) set_blocking(candidates[i].fd, true);
-            else set_blocking(candidates[i].fd, false);
+        // The data path keeps the descriptors non-blocking (poll() bounds every wait, so a deadline or an abort always
+        // ends it; a blocking read could outlive both).
+        for (const auto i : accepted) set_blocking(candidates[i].fd, false);
         std::vector<int> fds;
         for (const auto i : accepted) fds.push_back(candidates[i].fd);
         // Cables (XDomains) in striping order; each one measured with all its streams at once.
@@ -1146,6 +1460,12 @@ std::unique_ptr<Transport> tcp_connect(const std::string& host, std::uint16_t po
     }
 }
 
+namespace {
+std::uint64_t wall_ns() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+}
+} // namespace
+
 class Communicator::Progress {
 public:
     Worker worker;
@@ -1155,14 +1475,274 @@ Communicator::Communicator(Group group, std::unique_ptr<Transport> transport, st
     : group_(group), transport_(std::move(transport)), max_bytes_(max_bytes), progress_(std::make_unique<Progress>()) {
     if (group_.world != 2U || group_.rank > 1U || !transport_ || max_bytes_ == 0U)
         throw std::invalid_argument("dist communicator needs two ranks, a transport and a size bound");
-    check(hipHostMalloc(reinterpret_cast<void**>(&send_host_), max_bytes_ + sizeof(Trailer), hipHostMallocDefault), "pinned send buffer");
-    check(hipHostMalloc(reinterpret_cast<void**>(&receive_host_), max_bytes_ + sizeof(Trailer), hipHostMallocDefault), "pinned receive buffer");
+    if (const char* c = std::getenv("STRIX_DIST_PROGRESS_CPU"); c && *c) {
+        progress_->worker.pin(std::stoi(c));
+        progress_->worker.name("u4-progress");
+    }
+    if (latency::enabled()) progress_->worker.name("u4-progress");
+    if (const char* c = std::getenv("STRIX_DIST_PROGRESS_SPIN_US"); c && *c) {
+        const auto duration = std::stoll(c);
+        if (duration < 0 || duration > 10000)
+            throw std::invalid_argument("STRIX_DIST_PROGRESS_SPIN_US must be 0..10000");
+        progress_->worker.idle_spin(std::chrono::microseconds(duration));
+    }
+    if (const char* t = std::getenv("STRIX_DIST_WAIT_TIMEOUT_MS"); t && *t) wait_timeout_ = std::chrono::milliseconds(std::stoll(t));
+    if (const char* t = std::getenv("STRIX_DIST_HOST_D2H_KERNEL_BYTES"); t && *t) {
+        d2h_kernel_bytes_ = std::stoull(t);
+        if (d2h_kernel_bytes_ > (std::size_t{1} << 20U))
+            throw std::invalid_argument("STRIX_DIST_HOST_D2H_KERNEL_BYTES must be 0..1048576");
+    }
+    if (const char* t = std::getenv("STRIX_DIST_STAGED_READY_BYTES"); t && *t) {
+        staged_ready_bytes_ = std::stoull(t);
+        if (staged_ready_bytes_ > (std::size_t{1} << 20U))
+            throw std::invalid_argument("STRIX_DIST_STAGED_READY_BYTES must be 0..1048576");
+    }
+    // Fused staging (default; STRIX_DIST_STAGING=copy: off): kernels write and read these buffers directly (send_staging /
+    // finish_staged), so they are coherent (no stale GPU-cached lines of a reused receive buffer); copy: the default
+    // pinned memory and copies only. The event-based fused path keeps its coherent pools, independently of the separate
+    // small readiness pools; "ready" falls back to fused above its limit.
+    if (const char* v = std::getenv("STRIX_DIST_STAGING"); v && std::string(v) == "copy") fused_ = false;
+    const unsigned staging_flags = fused_ ? hipHostMallocCoherent : hipHostMallocDefault;
+    check(hipHostMalloc(reinterpret_cast<void**>(&send_host_), max_bytes_ + sizeof(Trailer), staging_flags), "pinned send buffer");
+    check(hipHostMalloc(reinterpret_cast<void**>(&receive_host_), max_bytes_ + sizeof(Trailer), staging_flags), "pinned receive buffer");
+    if (d2h_kernel_bytes_) {
+        const auto status = hipHostGetDevicePointer(&send_device_alias_, send_host_, 0);
+        if (status != hipSuccess) {
+            (void)hipHostFree(receive_host_);
+            (void)hipHostFree(send_host_);
+            receive_host_ = send_host_ = nullptr;
+            check(status, "mapped pinned send buffer for copy kernel");
+        }
+    }
+    if (staged_ready_bytes_) {
+        try {
+            int device = 0, native_atomics = 0;
+            check(hipGetDevice(&device), "staged ready device");
+            check(hipDeviceGetAttribute(&native_atomics, hipDeviceAttributeHostNativeAtomicSupported, device), "host atomics");
+            if (!native_atomics) throw std::runtime_error("staged readiness requires native host atomics");
+            const auto count = std::min(max_bytes_, staged_ready_bytes_) + sizeof(Trailer);
+            check(hipHostMalloc(reinterpret_cast<void**>(&staged_send_host_), count, hipHostMallocCoherent), "coherent staged send");
+            check(hipHostMalloc(reinterpret_cast<void**>(&staged_receive_host_), count, hipHostMallocCoherent), "coherent staged receive");
+            check(hipHostMalloc(reinterpret_cast<void**>(&producer_flag_), sizeof(StagedReady), hipHostMallocCoherent), "producer readiness");
+            check(hipHostMalloc(reinterpret_cast<void**>(&consumer_flag_), sizeof(StagedReady), hipHostMallocCoherent), "consumer readiness");
+            new (producer_flag_) StagedReady{};
+            new (consumer_flag_) StagedReady{};
+            check(hipMalloc(reinterpret_cast<void**>(&staged_counters_), 2 * sizeof(unsigned)), "staged block counters");
+            check(hipMemset(staged_counters_, 0, 2 * sizeof(unsigned)), "staged block counters initialization");
+            // Device-memory hipMemset may return before completion. Producers
+            // use a nonblocking caller stream, which need not wait on the null
+            // stream. Finish this one-time initialization before exposing views.
+            check(hipStreamSynchronize(nullptr), "staged block counters initialized");
+            producer_flag_->block_counter = staged_counters_;
+            consumer_flag_->block_counter = staged_counters_ + 1;
+            check(hipHostGetDevicePointer(&staged_send_device_, staged_send_host_, 0), "staged send alias");
+            check(hipHostGetDevicePointer(&staged_receive_device_, staged_receive_host_, 0), "staged receive alias");
+            check(hipHostGetDevicePointer(reinterpret_cast<void**>(&producer_flag_device_), producer_flag_, 0), "producer readiness alias");
+            check(hipHostGetDevicePointer(reinterpret_cast<void**>(&consumer_flag_device_), consumer_flag_, 0), "consumer readiness alias");
+        } catch (...) {
+            if (staged_counters_) (void)hipFree(staged_counters_);
+            if (consumer_flag_) (void)hipHostFree(consumer_flag_);
+            if (producer_flag_) (void)hipHostFree(producer_flag_);
+            if (staged_receive_host_) (void)hipHostFree(staged_receive_host_);
+            if (staged_send_host_) (void)hipHostFree(staged_send_host_);
+            (void)hipHostFree(receive_host_);
+            (void)hipHostFree(send_host_);
+            throw;
+        }
+    }
+    if (const char* t = std::getenv("STRIX_DIST_TRACE"); t && *t) {
+        const auto path = std::string(t) + ".r" + std::to_string(group_.rank);
+        trace_ = std::fopen(path.c_str(), "w");
+        if (!trace_) throw std::runtime_error("dist trace: cannot open " + path);
+        std::fprintf(trace_, "# H seq bytes tag layer entry produced staged peer_staged received validated consumer (host path)\n"
+                             "# G seq bytes tag layer rings entry produced tx_submitted rx_done tx_done consumer (GPU-direct; 0: not seen)\n"
+                             "# wall-clock ns; produced: the CPU saw the producer done; consumer: the received bytes are in device\n"
+                             "# memory for the next kernel (host: H2D copy end, GPU-direct: gather end, both from GPU events)\n");
+    }
 }
+Communicator::Communicator(Group group, std::unique_ptr<Transport> transport, std::unique_ptr<DeviceExchange> direct, std::size_t max_bytes)
+    : Communicator(group, std::move(transport), max_bytes) {
+    direct_ = std::move(direct);
+    if (direct_) configure_routes();
+    if (direct_ && trace_) direct_->set_trace(trace_);
+}
+
+const Route& Communicator::route(std::size_t bytes) const {
+    for (const auto& r : routes_)
+        if (bytes <= r.up_to) return r;
+    return routes_.back();
+}
+std::string Communicator::route_text() const {
+    std::ostringstream out;
+    for (std::size_t i = 0; i < routes_.size(); ++i) {
+        const auto& r = routes_[i];
+        out << (i ? "," : "") << (r.up_to == SIZE_MAX ? std::string("inf") : std::to_string(r.up_to)) << ':'
+            << (!r.direct ? "host" : r.host_percent ? "mix" : "gpu");
+        if (r.host_percent) out << ':' << r.rings << ':' << r.host_percent;
+        else if (r.direct && r.rings) out << ':' << r.rings;
+    }
+    return out.str();
+}
+
+namespace {
+std::vector<Route> parse_routes(const std::string& text) {
+    std::vector<Route> out;
+    std::stringstream in(text);
+    for (std::string item; std::getline(in, item, ',');) {
+        std::stringstream f(item);
+        std::string up, path, rings, percent;
+        std::getline(f, up, ':');
+        std::getline(f, path, ':');
+        std::getline(f, rings, ':');
+        std::getline(f, percent, ':');
+        Route r;
+        r.up_to = up == "inf" ? SIZE_MAX : static_cast<std::size_t>(std::stoull(up));
+        if (path != "host" && path != "gpu" && path != "mix") throw std::invalid_argument("STRIX_DIST_ROUTE: path must be host, gpu or mix: " + item);
+        r.direct = path != "host";
+        r.rings = rings.empty() ? 0U : static_cast<unsigned>(std::stoul(rings));
+        if (path == "mix") {
+            r.host_percent = percent.empty() ? 0U : static_cast<unsigned>(std::stoul(percent));
+            if (r.host_percent == 0U || r.host_percent > 99U) throw std::invalid_argument("STRIX_DIST_ROUTE: mix needs RINGS:HOST_PERCENT (1..99): " + item);
+        } else if (!percent.empty()) throw std::invalid_argument("STRIX_DIST_ROUTE: only mix takes a host share: " + item);
+        if (!out.empty() && r.up_to <= out.back().up_to) throw std::invalid_argument("STRIX_DIST_ROUTE: sizes must increase: " + text);
+        out.push_back(r);
+    }
+    if (out.empty()) throw std::invalid_argument("STRIX_DIST_ROUTE: empty table");
+    out.back().up_to = SIZE_MAX;
+    return out;
+}
+} // namespace
+
+// Measures every candidate (host path, direct on 1..rings rings) at a grid of sizes, both ranks in the same order;
+// rank 0 picks the fastest p50 per size and both apply its table.
+void Communicator::configure_routes() {
+    const char* env = std::getenv("STRIX_DIST_ROUTE");
+    const std::string mode = env && *env ? env : "table";
+    const bool host_allowed = transport_->name().rfind("tcp", 0) != 0;
+    if (mode == "table") {
+        // The measured defaults (2026-10-21, poll kernel). With host streams (mixed layout, e.g. data0 host + data1
+        // gpu_direct): small messages on the host path, two rings up to 1 MB, above that 35 % over the host path and
+        // the rest over the rings at once. Without (every stream gpu_direct): one ring up to 32 KB, two up to 256 KB,
+        // every ring above.
+        const auto all = std::to_string(direct_->rings());
+        if (host_allowed && max_bytes_ >= 65536U)
+            routes_ = parse_routes("65536:host,1048576:gpu:2,inf:mix:" + all + ":35");
+        else
+            routes_ = parse_routes("32768:gpu:1,262144:gpu:2,inf:gpu:" + all);
+        return;
+    }
+    if (mode == "gpu") { routes_ = {Route{SIZE_MAX, true, 0}}; return; }
+    if (mode == "host") {
+        if (!host_allowed) throw std::invalid_argument("STRIX_DIST_ROUTE=host: the transport is only a control channel here");
+        routes_ = {Route{max_bytes_, false, 0}, Route{SIZE_MAX, true, 0}};
+        return;
+    }
+    if (mode != "auto") {
+        set_routes(mode);
+        return;
+    }
+    routes_ = {Route{SIZE_MAX, true, 0}};
+    std::vector<std::size_t> grid;
+    for (std::size_t g : {std::size_t{64}, std::size_t{1024}, std::size_t{4096}, std::size_t{20480}, std::size_t{65536}, std::size_t{163840},
+                          std::size_t{524288}, std::size_t{2} << 20U, std::size_t{8} << 20U})
+        grid.push_back(g);
+    const std::size_t largest = grid.back();
+    hipStream_t s{};
+    void *local = nullptr, *remote = nullptr;
+    check(hipStreamCreateWithFlags(&s, hipStreamNonBlocking), "route calibration stream");
+    check(hipMalloc(&local, largest), "route calibration buffer");
+    check(hipMalloc(&remote, largest), "route calibration buffer");
+    check(hipMemsetAsync(local, 0x5A, largest, s), "route calibration buffer");
+    struct Candidate { bool direct; unsigned rings; };
+    std::vector<Candidate> candidates;
+    for (unsigned r = 1; r <= direct_->rings(); ++r) candidates.push_back({true, r});
+    std::ostringstream table;
+    std::uint32_t round = 0;
+    for (std::size_t i = 0; i < grid.size(); ++i) {
+        const auto g = grid[i];
+        const unsigned iterations = g <= 65536U ? 40U : g <= (1U << 20U) ? 12U : 4U;
+        double best = 1e30;
+        Candidate pick{true, 0};
+        auto all = candidates;
+        if (host_allowed && g <= max_bytes_) all.push_back({false, 0});
+        for (const auto& c : all) {
+            std::vector<double> t;
+            for (unsigned k = 0; k < iterations + 2U; ++k) {
+                check(hipStreamSynchronize(s), "route calibration");
+                const auto t0 = std::chrono::steady_clock::now();
+                const Tag tag{static_cast<std::uint32_t>(TagKind::control), 0xCA11U, round++};
+                if (c.direct) {
+                    direct_->use_rings(c.rings);
+                    // through the router-free path: one direct exchange (chunked above the capacity)
+                    routes_ = {Route{SIZE_MAX, true, c.rings}};
+                } else {
+                    routes_ = {Route{SIZE_MAX, false, 0}};
+                }
+                exchange(s, local, remote, g, tag);
+                check(hipStreamSynchronize(s), "route calibration");
+                if (k >= 2U) t.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+            }
+            std::sort(t.begin(), t.end());
+            const double p50 = t[t.size() / 2U];
+            if (p50 < best) { best = p50; pick = c; }
+        }
+        table << (i + 1U == grid.size() ? std::string("inf") : std::to_string(g)) << ':' << (pick.direct ? "gpu" : "host");
+        if (pick.direct) table << ':' << pick.rings;
+        if (i + 1U < grid.size()) table << ',';
+    }
+    check(hipStreamSynchronize(s), "route calibration");
+    (void)hipFree(local);
+    (void)hipFree(remote);
+    (void)hipStreamDestroy(s);
+    // Rank 0's table, as a fixed-size message (both ranks send the same size).
+    std::vector<std::byte> out(1024), in(1024);
+    const auto mine = table.str();
+    if (mine.size() >= out.size()) throw std::logic_error("route table too long");
+    std::memcpy(out.data(), mine.data(), mine.size());
+    transport_->exchange(out, in);
+    const auto* peer = reinterpret_cast<const char*>(in.data());
+    routes_ = parse_routes(group_.rank == 0U ? mine : std::string(peer, strnlen(peer, in.size())));
+    for (const auto& r : routes_)
+        if (!r.direct && r.up_to > max_bytes_) throw std::runtime_error("route table sends " + std::to_string(r.up_to) + " B over the host path (max " +
+                                                                         std::to_string(max_bytes_) + ")");
+    stats_ = CommunicatorStats{};
+}
+void Communicator::set_routes(const std::string& table) {
+    if (!direct_) throw std::logic_error("dist routes: no device exchange");
+    if (started_ || direct_started_ || staged_ || staged_prepared_ || staged_receive_held_)
+        throw std::logic_error("dist routes: a staged view or exchange is in flight");
+    auto routes = parse_routes(table);
+    const bool host_allowed = transport_->name().rfind("tcp", 0) != 0;
+    for (const auto& r : routes)
+        if ((!r.direct || r.host_percent) && (!host_allowed || (!r.direct && r.up_to > max_bytes_)))
+            throw std::invalid_argument("STRIX_DIST_ROUTE: host path not available for " + table);
+    routes_ = std::move(routes);
+}
+
+void Communicator::check_exchanges() const {
+    if (direct_)
+        if (const auto f = direct_->failure(); !f.empty()) throw std::runtime_error("dist exchange: gpu-direct: " + f);
+}
+std::string Communicator::transport_name() const {
+    return direct_ ? direct_->name() + " + control " + transport_->name() + "; routes " + route_text() : transport_->name();
+}
+
 Communicator::~Communicator() {
+    if (trace_pending_) try { flush_trace(); } catch (...) {}
+    direct_.reset(); // waits for its in-flight exchange and releases its streams
     if (started_) {
-        try { progress_->worker.wait(); } catch (...) {}
+        cancel_.store(true, std::memory_order_release); // the job's own waits stop
+        try {
+            if (!progress_->worker.wait_until(std::chrono::steady_clock::now() + wait_timeout_)) {
+                transport_->abort("dist exchange: destroyed with an exchange in flight");
+                (void)progress_->worker.wait_until(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+            }
+        } catch (...) {}
     }
     progress_.reset();
+    // Teardown only: a forgotten release, a prepared-but-not-started producer or
+    // a host timeout cannot free storage still referenced by this stream.
+    if (staged_exposed_) (void)hipStreamSynchronize(staged_stream_);
     if (send_ready_) {
         (void)hipEventSynchronize(send_ready_);
         (void)hipEventDestroy(send_ready_);
@@ -1171,8 +1751,130 @@ Communicator::~Communicator() {
         (void)hipEventSynchronize(receive_done_);
         (void)hipEventDestroy(receive_done_);
     }
+    if (consumer_flag_) (void)hipHostFree(consumer_flag_);
+    if (staged_counters_) (void)hipFree(staged_counters_);
+    if (producer_flag_) (void)hipHostFree(producer_flag_);
+    if (staged_receive_host_) (void)hipHostFree(staged_receive_host_);
+    if (staged_send_host_) (void)hipHostFree(staged_send_host_);
     (void)hipHostFree(send_host_);
     (void)hipHostFree(receive_host_);
+    if (pre_copy_) (void)hipEventDestroy(pre_copy_);
+    if (h2d_done_) (void)hipEventDestroy(h2d_done_);
+    if (trace_) std::fclose(trace_);
+}
+
+void Communicator::quiesce(hipStream_t stream) {
+    if (started_ || direct_started_ || staged_ || staged_prepared_ || staged_receive_held_)
+        throw std::logic_error("dist exchange: quiesce() while a staged view or exchange is in flight");
+    if (direct_) direct_->quiesce(stream);
+    if (consumer_pending_token_) {
+        try { wait_staged_flag(consumer_flag_, consumer_pending_token_, std::chrono::steady_clock::now() + wait_timeout_); }
+        catch (const std::exception& e) { stop(e.what()); }
+        consumer_pending_token_ = 0;
+    }
+}
+
+namespace {
+void reset_staged_flag(StagedReady* flag, std::uint64_t token) {
+    static_assert(std::atomic_ref<std::uint64_t>::is_always_lock_free);
+    std::atomic_ref<std::uint64_t>(flag->done).store(0, std::memory_order_relaxed);
+    std::atomic_ref<std::uint64_t>(flag->ready).store(token, std::memory_order_release);
+}
+}
+
+void Communicator::wait_staged_flag(StagedReady* flag, std::uint64_t token, std::chrono::steady_clock::time_point deadline) {
+    for (unsigned i = 0;; ++i) {
+        const auto done = std::atomic_ref<std::uint64_t>(flag->done).load(std::memory_order_acquire);
+        if (done == token) return;
+        if (done != 0) throw std::runtime_error("staged readiness: wrong generation, expected " + std::to_string(token) + " got " + std::to_string(done));
+        if ((i & 1023U) == 0U && (cancel_.load(std::memory_order_acquire) || std::chrono::steady_clock::now() >= deadline))
+            throw std::runtime_error("staged readiness: producer/consumer did not release generation " + std::to_string(token) + " before its deadline");
+        cpu_relax();
+    }
+}
+
+ProducerStage Communicator::prepare_staged_ready(hipStream_t stream, std::size_t bytes) {
+    if (!staged_ready_bytes_ || !bytes || bytes > max_bytes_ || bytes > staged_ready_bytes_ || trace_ ||
+        (direct_ && route(bytes).direct)) return {};
+    if (!terminal_.empty()) throw std::runtime_error("staged readiness: communicator stopped: " + terminal_);
+    if (started_ || direct_started_ || staged_ || staged_prepared_ || staged_receive_held_)
+        throw std::logic_error("staged readiness: previous view or exchange not released");
+    if (staged_exposed_ && stream != staged_stream_) throw std::logic_error("staged readiness: one stream per communicator");
+    if (sequence_ == UINT64_MAX) throw std::overflow_error("staged readiness: generation exhausted");
+    staged_stream_ = stream;
+    staged_exposed_ = staged_prepared_ = true;
+    staged_prepared_bytes_ = bytes;
+    staged_token_ = sequence_ + 1U;
+    reset_staged_flag(producer_flag_, staged_token_);
+    return ProducerStage{staged_send_device_, producer_flag_device_, staged_token_};
+}
+
+void Communicator::start_staged_ready(hipStream_t stream, std::size_t bytes, const Tag& tag) {
+    if (!terminal_.empty()) throw std::runtime_error("staged readiness: communicator stopped: " + terminal_);
+    if (!staged_prepared_ || started_ || direct_started_ || bytes != staged_prepared_bytes_ || stream != staged_stream_)
+        throw std::logic_error("staged readiness: start without the matching prepared producer");
+    tag_ = tag;
+    if (consumer_pending_token_) {
+        try { wait_staged_flag(consumer_flag_, consumer_pending_token_, std::chrono::steady_clock::now() + wait_timeout_); }
+        catch (const std::exception& e) { stop(e.what()); }
+        consumer_pending_token_ = 0;
+    }
+    std::swap(send_host_, staged_send_host_);
+    std::swap(receive_host_, staged_receive_host_);
+    staged_prepared_ = false;
+    staged_started_ = true;
+    // start_host records only CPU state on this path; progress waits on producer_flag_.
+    start_host(stream, nullptr, bytes);
+}
+
+ConsumerStage Communicator::finish_staged_ready() {
+    if (!staged_started_ || !started_) throw std::logic_error("staged readiness: finish without start");
+    finish_host(staged_stream_, nullptr); // validates the exact same in-band trailer and CRC
+    std::swap(send_host_, staged_send_host_);
+    std::swap(receive_host_, staged_receive_host_);
+    staged_started_ = false;
+    staged_receive_held_ = true;
+    reset_staged_flag(consumer_flag_, staged_token_); // CPU payload writes happen before GPU's acquire
+    latency::mark("consumer_view_ready");
+    return ConsumerStage{staged_receive_device_, consumer_flag_device_, staged_token_};
+}
+
+void Communicator::release_staged_ready(hipStream_t stream) {
+    if (!staged_receive_held_ || started_ || stream != staged_stream_)
+        throw std::logic_error("staged readiness: release without the matching consumer");
+    consumer_pending_token_ = staged_token_;
+    staged_receive_held_ = false;
+}
+
+void* Communicator::send_staging(std::size_t bytes) const {
+    if (!fused_ || !terminal_.empty() || started_ || direct_started_ || staged_ || staged_prepared_ || staged_receive_held_ || bytes == 0U || bytes > max_bytes_) return nullptr;
+    if (direct_ && route(bytes).direct) return nullptr;
+    void* device = nullptr;
+    if (hipHostGetDevicePointer(&device, send_host_, 0) != hipSuccess) return nullptr;
+    return device;
+}
+void Communicator::start_staged(hipStream_t stream, std::size_t bytes, const Tag& tag) {
+    if (!terminal_.empty()) throw std::runtime_error("dist exchange: the communicator stopped earlier: " + terminal_);
+    if (send_staging(bytes) == nullptr) throw std::logic_error("dist exchange: start_staged() without a host-path staging buffer");
+    if (trace_pending_) flush_trace();
+    tag_ = tag;
+    start_host(stream, nullptr, bytes);
+    staged_ = true;
+}
+const void* Communicator::finish_staged(hipStream_t stream) {
+    if (!staged_ || !started_) throw std::logic_error("dist exchange: finish_staged() without start_staged()");
+    finish_host(stream, nullptr);
+    void* device = nullptr;
+    check(hipHostGetDevicePointer(&device, receive_host_, 0), "receive staging");
+    return device;
+}
+void Communicator::release_staged(hipStream_t stream) {
+    if (!staged_) throw std::logic_error("dist exchange: release_staged() without start_staged()");
+    staged_ = false;
+    // the consumers enqueued so far read the receive buffer: it is reused only after them
+    if (!receive_done_) check(hipEventCreateWithFlags(&receive_done_, hipEventDisableTiming), "receive event");
+    check(hipEventRecord(receive_done_, stream), "receive event");
+    receive_pending_ = true;
 }
 
 void Communicator::exchange(hipStream_t stream, const void* local, void* remote, std::size_t bytes, const Tag& tag) {
@@ -1181,65 +1883,272 @@ void Communicator::exchange(hipStream_t stream, const void* local, void* remote,
 }
 
 void Communicator::start(hipStream_t stream, const void* local, std::size_t bytes, const Tag& tag) {
-    if (started_) throw std::logic_error("dist exchange: start() while an exchange is in flight");
+    if (!terminal_.empty()) throw std::runtime_error("dist exchange: the communicator stopped earlier: " + terminal_);
+    if (started_ || direct_started_ || staged_ || staged_prepared_ || staged_receive_held_)
+        throw std::logic_error("dist exchange: start() while a staged view or exchange is in flight");
+    if (trace_pending_) flush_trace();
+    if (direct_ && bytes > 0U && route(bytes).direct) {
+        // Device to device. The kernel checks each operation's framing (epoch, sequence, size, slot); the identity
+        // of the collective (plan, request, tag, layer) and a checksum of the payload travel in-band and are checked
+        // by the receiver's GPU. Messages above the capacity are exchanged in chunks in finish().
+        if (!local) throw std::invalid_argument("dist exchange size or buffers");
+        const Route& r = route(bytes);
+        stats_.last_entry = std::chrono::steady_clock::now();
+        tag_ = tag;
+        // A mixed route: the head goes over the host path (its own trailer, sequence and CRC), at the same time.
+        const std::size_t host = r.host_percent ? std::min(max_bytes_, bytes / 100U * r.host_percent + bytes % 100U * r.host_percent / 100U) & ~std::size_t{63} : 0U;
+        direct_offset_ = host;
+        direct_bytes_ = bytes - host;
+        direct_local_ = static_cast<const std::byte*>(local) + host;
+        mix_rings_ = r.rings;
+        if (host) start_host(stream, local, host);
+        if (direct_bytes_ <= direct_->capacity()) {
+            direct_->use_rings(r.rings);
+            direct_->expect_next(direct_bytes_, r.rings); // the next message on the rings is likely this size again
+            direct_->start(stream, direct_local_, direct_bytes_, ExchangeIdentity{group_.plan, tag.request, tag.kind, tag.layer});
+        }
+        direct_started_ = true;
+        return;
+    }
     if (bytes == 0U || bytes > max_bytes_ || !local) throw std::invalid_argument("dist exchange size or buffers");
+    tag_ = tag;
+    start_host(stream, local, bytes);
+}
+
+void Communicator::start_host(hipStream_t stream, const void* local, std::size_t bytes) {
+    latency::context().sequence = sequence_;
+    latency::mark("host_entry", bytes);
     const auto entry = std::chrono::steady_clock::now();
     stats_.last_entry = entry;
+    // The collective is recorded before any wait (dumped if a wait expires).
+    current_ = History{sequence_, bytes, tag_.kind, tag_.layer, tag_.request, 0, 0, 'H'};
+    set_phase(Phase::reuse_wait);
     // The receive buffer is reused only after the CPU has seen the previous copy out of it complete.
-    if (receive_pending_)
+    if (!staged_started_ && receive_pending_) {
+        const auto deadline = entry + wait_timeout_;
         for (hipError_t ready; (ready = hipEventQuery(receive_done_)) != hipSuccess;) {
             if (ready != hipErrorNotReady) check(ready, "previous receive copy");
+            if (std::chrono::steady_clock::now() >= deadline)
+                stop("the previous exchange's copy out of the receive buffer did not complete within " + std::to_string(wait_timeout_.count()) + " ms");
             cpu_relax();
         }
-    receive_pending_ = false;
+    }
+    if (!staged_started_) receive_pending_ = false;
     // The copy is ordered after the producer of `local` on the stream; the progress thread waits for it on
     // the CPU before computing the CRC and sending.
-    check(hipMemcpyAsync(send_host_, local, bytes, hipMemcpyDeviceToHost, stream), "device to host");
-    if (!send_ready_) check(hipEventCreateWithFlags(&send_ready_, hipEventDisableTiming), "send event");
-    check(hipEventRecord(send_ready_, stream), "send event");
+    if (trace_) {
+        t_entry_ = wall_ns();
+        if (!pre_copy_) check(hipEventCreate(&pre_copy_), "trace event");
+        check(hipEventRecord(pre_copy_, stream), "trace event");
+    }
+    if (!staged_started_) {
+        latency::mark("d2h_enqueue_begin");
+        if (local) {
+            if (d2h_kernel_bytes_ && bytes <= d2h_kernel_bytes_)
+                enqueue_host_d2h_copy(send_device_alias_, local, bytes, stream);
+            else
+                check(hipMemcpyAsync(send_host_, local, bytes, hipMemcpyDeviceToHost, stream), "device to host");
+        }
+        latency::mark("d2h_copy_submitted");
+        if (!send_ready_) check(hipEventCreateWithFlags(&send_ready_, hipEventDisableTiming), "send event");
+        check(hipEventRecord(send_ready_, stream), "send event");
+        latency::mark("d2h_enqueued");
+    }
     bytes_ = bytes;
-    tag_ = tag;
     started_ = true;
     started_at_ = entry;
+    set_phase(Phase::producer);
     progress_->worker.post([this] {
-        // Spin on the copy's event: a blocking synchronize may sleep and add its wake-up to every exchange.
-        for (hipError_t ready; (ready = hipEventQuery(send_ready_)) != hipSuccess;) {
-            if (ready != hipErrorNotReady) check(ready, "device to host");
-            cpu_relax();
+        // Spin on the copy's event: a blocking synchronize may sleep and add its wake-up to every exchange. Bounded:
+        // a producer that never completes stops the communicator (and wakes the peer) instead of hanging both ranks.
+        const auto deadline = started_at_ + wait_timeout_;
+        const auto bounded = [&](hipEvent_t event, const char* what) {
+            for (unsigned i = 0;; ++i) {
+                const hipError_t ready = hipEventQuery(event);
+                if (ready == hipSuccess) return;
+                if (ready != hipErrorNotReady) check(ready, what);
+                if ((i & 1023U) == 0U && (cancel_.load(std::memory_order_acquire) || std::chrono::steady_clock::now() >= deadline))
+                    throw std::runtime_error(std::string("dist exchange: ") + what + " did not complete within " + std::to_string(wait_timeout_.count()) + " ms");
+                cpu_relax();
+            }
+        };
+        if (trace_) {
+            bounded(pre_copy_, "the producer");
+            t_produced_ = wall_ns();
         }
+        if (staged_started_) {
+            latency::mark("producer_flag_wait_begin");
+            wait_staged_flag(producer_flag_, staged_token_, deadline);
+            latency::mark("producer_flag_ready");
+        } else {
+            bounded(send_ready_, "the producer's device-to-host copy");
+        }
+        latency::mark("d2h_observed");
+        std::uint64_t cmd = 0;
+        std::memcpy(&cmd, send_host_, std::min<std::size_t>(sizeof(cmd), bytes_));
+        cmd_out_.store(cmd, std::memory_order_relaxed);
+        set_phase(Phase::transfer);
         Trailer trailer;
         trailer.epoch = group_.epoch; trailer.plan = group_.plan; trailer.sequence = sequence_; trailer.request = tag_.request;
         trailer.bytes = bytes_; trailer.rank = group_.rank; trailer.tag = tag_.kind; trailer.layer = tag_.layer;
+        latency::mark("crc_tx_begin");
         trailer.crc32c = crc32c(std::span<const std::byte>(send_host_, bytes_));
+        latency::mark("crc_tx_end");
+        if (trace_) trailer.staged_ns = t_staged_ = wall_ns();
         std::memcpy(send_host_ + bytes_, &trailer, sizeof(trailer));
         stats_.last_staged = std::chrono::steady_clock::now();
+        latency::mark("transport_begin");
         transport_->exchange(std::span<const std::byte>(send_host_, bytes_ + sizeof(Trailer)),
                              std::span<std::byte>(receive_host_, bytes_ + sizeof(Trailer)));
+        latency::mark("transport_end");
         stats_.last_received = std::chrono::steady_clock::now();
+        if (trace_) t_received_ = wall_ns();
+        std::uint64_t got = 0;
+        std::memcpy(&got, receive_host_, std::min<std::size_t>(sizeof(got), bytes_));
+        cmd_in_.store(got, std::memory_order_relaxed);
+        set_phase(Phase::check);
+        // The peer's message is checked here, as soon as it is complete: on a mixed route this overlaps the device
+        // exchange's part instead of following it in finish(). A mismatch is rethrown by finish().
+        // STRIX_DIST_CHECK_ON_CALLER=1: checked by finish() on the caller's thread instead (the earlier placement).
+        if (!check_on_caller()) {
+            latency::mark("crc_rx_begin");
+            validate_peer();
+            latency::mark("crc_rx_end");
+        }
     });
     returned_at_ = std::chrono::steady_clock::now();
 }
 
 void Communicator::finish(hipStream_t stream, void* remote) {
+    if (direct_started_) {
+        if (!remote) throw std::invalid_argument("dist exchange receive buffer");
+        direct_started_ = false;
+        const auto t0 = std::chrono::steady_clock::now();
+        auto* const direct_remote = static_cast<std::byte*>(remote) + direct_offset_;
+        if (direct_bytes_ <= direct_->capacity()) {
+            direct_->finish(stream, direct_remote);
+        } else {
+            // Chunks of the capacity, one exchange each, in order (no overlap with the caller's work).
+            const std::size_t chunk = direct_->capacity() & ~std::size_t{63};
+            for (std::size_t offset = 0; offset < direct_bytes_; offset += chunk) {
+                const std::size_t n = std::min(chunk, direct_bytes_ - offset);
+                // The next chunk exactly, after the last one the first chunk of a message of this size.
+                const std::size_t after = offset + n < direct_bytes_ ? std::min(chunk, direct_bytes_ - offset - n) : std::min(chunk, direct_bytes_);
+                direct_->use_rings(direct_offset_ ? mix_rings_ : route(n).rings);
+                direct_->expect_next(after, direct_offset_ ? mix_rings_ : route(after).rings);
+                direct_->start(stream, static_cast<const std::byte*>(direct_local_) + offset, n,
+                               ExchangeIdentity{group_.plan, tag_.request, tag_.kind, tag_.layer + static_cast<std::uint32_t>(offset / chunk)});
+                direct_->finish(stream, direct_remote + offset);
+            }
+        }
+        stats_.bytes_sent += direct_bytes_;
+        if (direct_offset_) { // mixed: the host part counts the exchange and its time
+            stats_.check += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            finish_host(stream, remote);
+            return;
+        }
+        ++stats_.exchanges;
+        stats_.seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - stats_.last_entry).count();
+        stats_.check += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        return;
+    }
     if (!started_) throw std::logic_error("dist exchange: finish() without start()");
     if (!remote) throw std::invalid_argument("dist exchange receive buffer");
-    const auto entry = std::chrono::steady_clock::now();
-    started_ = false;
-    progress_->worker.wait();
-    const auto received = std::chrono::steady_clock::now();
-    const auto bytes = bytes_;
+    finish_host(stream, remote);
+}
+
+void Communicator::set_phase(Phase p) {
+    phase_.store(static_cast<int>(p), std::memory_order_release);
+    phase_since_.store(static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()), std::memory_order_release);
+}
+
+std::string Communicator::diagnose() const {
+    static const char* const names[] = {"idle", "receive-buffer reuse wait", "producer wait", "transfer", "check"};
+    std::ostringstream out;
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    const int ph = phase_.load(std::memory_order_acquire);
+    out << "dist state: rank " << group_.rank << ", phase " << names[std::clamp(ph, 0, 4)] << " for "
+        << (now - static_cast<long long>(phase_since_.load(std::memory_order_acquire))) / 1000000 << " ms; in flight: "
+        << current_.path << " seq " << current_.sequence << " " << current_.bytes << " B tag " << current_.tag << " layer " << current_.layer
+        << " request " << current_.request << " command out 0x" << std::hex << cmd_out_.load() << " in 0x" << cmd_in_.load() << std::dec;
+    out << "; last collectives (oldest first):";
+    const std::size_t n = std::min<std::size_t>(history_next_, history_.size());
+    for (std::size_t i = history_next_ - n; i < history_next_; ++i) {
+        const auto& h = history_[i % history_.size()];
+        out << " [" << h.path << " " << h.sequence << " " << h.bytes << "B t" << h.tag << " l" << h.layer << " r" << h.request << " c0x" << std::hex
+            << h.cmd_out << "/0x" << h.cmd_in << std::dec << "]";
+    }
+    if (const auto s = transport_->state(); !s.empty()) out << "; streams: " << s;
+    return out.str();
+}
+
+void Communicator::stop(const std::string& why) {
+    const std::string tuple = " [exchange " + std::to_string(current_.sequence) + ": " + std::to_string(current_.bytes) + " B, tag " +
+                              std::to_string(current_.tag) + ", layer " + std::to_string(current_.layer) + ", request " +
+                              std::to_string(current_.request) + "]";
+    const std::string state = diagnose();
+    if (terminal_.empty()) {
+        terminal_ = why + tuple;
+        cancel_.store(true, std::memory_order_release);
+        std::fprintf(stderr, "%s\n%s\n", terminal_.c_str(), state.c_str());
+        std::fflush(stderr);
+        transport_->abort(terminal_); // closes the channel: the peer's pending reads end now
+    }
+    throw std::runtime_error(why + tuple);
+}
+
+bool Communicator::check_on_caller() {
+    static const bool on = [] { const char* v = std::getenv("STRIX_DIST_CHECK_ON_CALLER"); return v && v[0] == '1'; }();
+    return on;
+}
+
+void Communicator::validate_peer() {
     Trailer peer;
-    std::memcpy(&peer, receive_host_ + bytes, sizeof(peer));
+    std::memcpy(&peer, receive_host_ + bytes_, sizeof(peer));
     if (peer.magic != trailer_magic || peer.epoch != group_.epoch || peer.plan != group_.plan || peer.sequence != sequence_ ||
-        peer.request != tag_.request || peer.bytes != bytes || peer.rank != 1U - group_.rank || peer.tag != tag_.kind ||
+        peer.request != tag_.request || peer.bytes != bytes_ || peer.rank != 1U - group_.rank || peer.tag != tag_.kind ||
         peer.layer != tag_.layer)
         throw std::runtime_error("dist exchange: the peer's trailer does not match this collective");
-    if (peer.crc32c != crc32c(std::span<const std::byte>(receive_host_, bytes)))
+    if (peer.crc32c != crc32c(std::span<const std::byte>(receive_host_, bytes_)))
         throw std::runtime_error("dist exchange: payload CRC mismatch");
-    check(hipMemcpyAsync(remote, receive_host_, bytes, hipMemcpyHostToDevice, stream), "host to device");
-    if (!receive_done_) check(hipEventCreateWithFlags(&receive_done_, hipEventDisableTiming), "receive event");
-    check(hipEventRecord(receive_done_, stream), "receive event");
-    receive_pending_ = true;
+    peer_staged_ns_ = peer.staged_ns;
+    if (trace_) t_validated_ = wall_ns();
+}
+
+void Communicator::finish_host(hipStream_t stream, void* remote) {
+    latency::mark("finish_wait_begin");
+    const auto entry = std::chrono::steady_clock::now();
+    started_ = false;
+    try {
+        // The job bounds its own waits (producer: wait_timeout_, each stream: the transport's no-progress timeout);
+        // this bound is the last resort if it does not return.
+        if (!progress_->worker.wait_until(entry + 2 * wait_timeout_ + std::chrono::seconds(5)))
+            stop("the exchange's progress job did not return within " + std::to_string((2 * wait_timeout_ + std::chrono::seconds(5)).count()) + " ms");
+    } catch (const std::exception& e) {
+        // Which collective was in flight: a stall shows the same one on both ranks, ranks that disagree on the
+        // sequence of exchanges show different ones. The communicator stops and closes the channel (the peer wakes).
+        stop(e.what());
+    }
+    set_phase(Phase::idle);
+    latency::mark("finish_wait_end");
+    const auto received = std::chrono::steady_clock::now();
+    if (check_on_caller()) validate_peer();
+    const auto bytes = bytes_; // the peer's message was checked (trailer and CRC)
+    if (!staged_started_ && remote) {
+        latency::mark("h2d_enqueue_begin");
+        check(hipMemcpyAsync(remote, receive_host_, bytes, hipMemcpyHostToDevice, stream), "host to device");
+        if (!receive_done_) check(hipEventCreateWithFlags(&receive_done_, hipEventDisableTiming), "receive event");
+        check(hipEventRecord(receive_done_, stream), "receive event");
+        latency::mark("h2d_enqueued");
+    }
+    if (trace_) {
+        if (!h2d_done_) check(hipEventCreate(&h2d_done_), "trace event");
+        check(hipEventRecord(h2d_done_, stream), "trace event");
+    }
+    if (!staged_started_ && remote) receive_pending_ = true;
+    current_.cmd_out = cmd_out_.load(std::memory_order_relaxed);
+    current_.cmd_in = cmd_in_.load(std::memory_order_relaxed);
+    history_[history_next_++ % history_.size()] = current_;
     ++sequence_;
     ++stats_.exchanges;
     stats_.bytes_sent += bytes;
@@ -1250,6 +2159,67 @@ void Communicator::finish(hipStream_t stream, void* remote) {
     stats_.overlap += std::chrono::duration<double>(entry - returned_at_).count();
     stats_.finish_wait += std::chrono::duration<double>(received - entry).count();
     stats_.seconds += std::chrono::duration<double>(end - started_at_).count();
+    if (trace_) {
+        // Written when the next exchange starts: the H2D copy's end is read from the GPU timeline then.
+        pending_ = PendingTrace{sequence_ - 1U, bytes, tag_.kind, tag_.layer, t_entry_, t_produced_, t_staged_, peer_staged_ns_, t_received_, t_validated_};
+        trace_pending_ = true;
+    }
+}
+
+void Communicator::flush_trace() {
+    trace_pending_ = false;
+    float ms = 0.0F;
+    std::uint64_t consumer = 0;
+    if (hipEventSynchronize(h2d_done_) == hipSuccess && hipEventElapsedTime(&ms, pre_copy_, h2d_done_) == hipSuccess && pending_.produced)
+        consumer = pending_.produced + static_cast<std::uint64_t>(static_cast<double>(ms) * 1e6);
+    const auto& t = pending_;
+    std::fprintf(trace_, "H %llu %zu %u %u %llu %llu %llu %llu %llu %llu %llu\n", static_cast<unsigned long long>(t.sequence), t.bytes, t.tag,
+                 t.layer, static_cast<unsigned long long>(t.entry), static_cast<unsigned long long>(t.produced),
+                 static_cast<unsigned long long>(t.staged), static_cast<unsigned long long>(t.peer_staged),
+                 static_cast<unsigned long long>(t.received), static_cast<unsigned long long>(t.validated),
+                 static_cast<unsigned long long>(consumer));
+}
+
+void Communicator::exchange_host(std::span<const std::byte> local, std::span<std::byte> remote, const Tag& tag) {
+    if (started_ || direct_started_) throw std::logic_error("dist exchange: exchange_host() while an exchange is in flight");
+    const std::size_t bytes = local.size();
+    if (bytes == 0U || bytes > max_bytes_ || (!remote.empty() && remote.size() != bytes))
+        throw std::invalid_argument("dist exchange_host size or buffers");
+    const auto entry = std::chrono::steady_clock::now();
+    stats_.last_entry = entry;
+    // The receive buffer is reused only after the CPU has seen the previous copy out of it (exchange()'s) complete.
+    if (receive_pending_)
+        for (hipError_t ready; (ready = hipEventQuery(receive_done_)) != hipSuccess;) {
+            if (ready != hipErrorNotReady) check(ready, "previous receive copy");
+            cpu_relax();
+        }
+    receive_pending_ = false;
+    std::memcpy(send_host_, local.data(), bytes);
+    Trailer trailer;
+    trailer.epoch = group_.epoch; trailer.plan = group_.plan; trailer.sequence = sequence_; trailer.request = tag.request;
+    trailer.bytes = bytes; trailer.rank = group_.rank; trailer.tag = tag.kind; trailer.layer = tag.layer;
+    trailer.crc32c = crc32c(std::span<const std::byte>(send_host_, bytes));
+    std::memcpy(send_host_ + bytes, &trailer, sizeof(trailer));
+    stats_.last_staged = std::chrono::steady_clock::now();
+    transport_->exchange(std::span<const std::byte>(send_host_, bytes + sizeof(Trailer)), std::span<std::byte>(receive_host_, bytes + sizeof(Trailer)));
+    const auto received = std::chrono::steady_clock::now();
+    stats_.last_received = received;
+    Trailer peer;
+    std::memcpy(&peer, receive_host_ + bytes, sizeof(peer));
+    if (peer.magic != trailer_magic || peer.epoch != group_.epoch || peer.plan != group_.plan || peer.sequence != sequence_ ||
+        peer.request != tag.request || peer.bytes != bytes || peer.rank != 1U - group_.rank || peer.tag != tag.kind || peer.layer != tag.layer)
+        throw std::runtime_error("dist exchange: the peer's trailer does not match this collective");
+    if (peer.crc32c != crc32c(std::span<const std::byte>(receive_host_, bytes)))
+        throw std::runtime_error("dist exchange: payload CRC mismatch");
+    if (!remote.empty()) std::memcpy(remote.data(), receive_host_, bytes);
+    ++sequence_;
+    ++stats_.exchanges;
+    stats_.bytes_sent += bytes;
+    const auto end = std::chrono::steady_clock::now();
+    stats_.stage += std::chrono::duration<double>(stats_.last_staged - entry).count();
+    stats_.wire += std::chrono::duration<double>(received - stats_.last_staged).count();
+    stats_.check += std::chrono::duration<double>(end - received).count();
+    stats_.seconds += std::chrono::duration<double>(end - entry).count();
 }
 
 } // namespace strix::dist

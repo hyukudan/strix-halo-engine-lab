@@ -44,6 +44,14 @@ struct RouterRowsArgs {
 // Prefill tiles: blockIdx.y selects the 8-row tile, each view shifted by its own stride.
 // Window kernels take RouterRowsArgs and compile without tile arithmetic.
 struct RouterTileRowsArgs : RouterRowsArgs {};
+struct RouterCohortRowsArgs {
+    const void* hidden[32];float* workspace[32];
+    std::uint32_t* indices[32];float* weights[32];std::uint32_t count=0;
+    std::uint64_t tile_hidden=0,tile_workspace=0,tile_indices=0,tile_weights=0;
+};
+template<typename Pointer> __device__ __forceinline__ Pointer route_tiled(Pointer pointer,std::uint64_t,const RouterCohortRowsArgs&) {
+    return pointer;
+}
 template <typename Pointer> __device__ __forceinline__ Pointer route_tiled(Pointer pointer, std::uint64_t, const RouterRowsArgs&) {
     return pointer;
 }
@@ -1059,8 +1067,8 @@ __device__ __forceinline__ float router_dot_tile(const float* input, const float
 // never waits on LDS. Per (row, expert) it is the serial chain: fused,
 // ascending from feature zero.
 constexpr std::uint32_t kWaveRowsChunk = 64;
-template <typename Activation, std::uint32_t Rows>
-__global__ void __launch_bounds__(256) wave_rows_moe_route_logits_kernel(RouterRowsArgs rows,
+template <typename Activation, std::uint32_t Rows,class Args=RouterRowsArgs>
+__global__ void __launch_bounds__(256) wave_rows_moe_route_logits_kernel(Args rows,
     const float* __restrict__ weights, std::uint32_t hidden_size, std::uint32_t expert_count) {
     constexpr std::uint32_t per_vector = 16U / sizeof(Activation);
     const auto wave = static_cast<std::uint32_t>(__builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x / 32U)));
@@ -1068,7 +1076,8 @@ __global__ void __launch_bounds__(256) wave_rows_moe_route_logits_kernel(RouterR
     const auto expert = static_cast<std::uint32_t>(blockIdx.x) * 8U + wave;
     if (expert >= expert_count) return;
     const float* __restrict__ coefficients = weights + static_cast<std::uint64_t>(expert) * hidden_size;
-    const auto* hidden = static_cast<const Activation*>(rows.hidden[lane < Rows ? lane : 0U]);
+    const auto active=[&] {if constexpr(Rows==32U) return rows.count;else return Rows;}();
+    const auto* hidden = static_cast<const Activation*>(rows.hidden[lane < active ? lane : 0U]);
     float sum = 0.0F;
     for (std::uint32_t feature = 0; feature < hidden_size; feature += kWaveRowsChunk) {
         float input[kWaveRowsChunk];
@@ -1087,7 +1096,7 @@ __global__ void __launch_bounds__(256) wave_rows_moe_route_logits_kernel(RouterR
         for (std::uint32_t k = 0; k < kWaveRowsChunk; ++k)
             sum = __builtin_fmaf(input[k], coefficients[feature + k], sum);
     }
-    if (lane < Rows) rows.workspace[lane][expert] = sum;
+    if (lane < active) rows.workspace[lane][expert] = sum;
 }
 // F32 weights, every lane busy: a wave covers 32 / Rows experts x Rows rows and
 // lane (expert, row) runs that pair's serial chain (fused, ascending from
@@ -1155,8 +1164,8 @@ __global__ void __launch_bounds__(256) lanes_rows_moe_route_logits_kernel(Args r
     }
     route_tiled(rows.workspace[row], rows.tile_workspace, rows)[expert] = sum;
 }
-// Staged form of lanes_rows_moe_route_logits_kernel (Chunk 128) for Steps x 128 features: the first Rows / 2
-// waves of a block (one for a single row) run the same lane (expert, row) chains for its 16 experts (fused,
+// Staged form of lanes_rows_moe_route_logits_kernel (Chunk 128) for Steps x 128 features: the first chain
+// waves of a block run the same lane (expert, row) chains for its Experts experts (fused,
 // ascending from feature zero, the same float4 order; for one row also the order of router_dot_ascending in
 // parallel_moe_route_logits_kernel), but read the coefficients from LDS; the Loaders waves after them stream the
 // block's coefficients chunk by chunk, depth chunks ahead in registers, into a two-slot LDS ring. The lanes form
@@ -1170,13 +1179,15 @@ __device__ __forceinline__ void router_lds_barrier() {
     __builtin_amdgcn_s_barrier();
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
-template <std::uint32_t Rows> constexpr std::uint32_t staged_router_chain_waves() { return Rows >= 2U ? Rows / 2U : 1U; }
-template <typename Activation, std::uint32_t Rows, std::uint32_t Steps, std::uint32_t Loaders, bool Bf16 = false>
-__global__ void __launch_bounds__(32U * (staged_router_chain_waves<Rows>() + Loaders)) staged_rows_moe_route_logits_kernel(
+template <std::uint32_t Rows, std::uint32_t Experts = 16U> constexpr std::uint32_t staged_router_chain_waves() {
+    return (Rows * Experts + 31U) / 32U;
+}
+template <typename Activation, std::uint32_t Rows, std::uint32_t Steps, std::uint32_t Loaders, bool Bf16 = false, std::uint32_t Experts = 16U>
+__global__ void __launch_bounds__(32U * (staged_router_chain_waves<Rows, Experts>() + Loaders)) staged_rows_moe_route_logits_kernel(
     RouterRowsArgs rows, const void* __restrict__ weights, std::uint32_t expert_count) {
     static_assert(Rows == 1U || Rows == 2U || Rows == 4U || Rows == 8U);
-    constexpr std::uint32_t chunk = 128U, hidden_size = Steps * chunk, experts = 16U, vectors = chunk / 4U;
-    constexpr std::uint32_t chains = staged_router_chain_waves<Rows>();
+    constexpr std::uint32_t chunk = 128U, hidden_size = Steps * chunk, experts = Experts, vectors = chunk / 4U;
+    constexpr std::uint32_t chains = staged_router_chain_waves<Rows, Experts>();
     // 16 float4 of ring per loader thread (a deeper ring, 32, measured slower).
     constexpr std::uint32_t per_loader = experts * vectors / (32U * Loaders), depth = 16U / per_loader, pitch = vectors + 1U;
     static_assert(per_loader * 32U * Loaders == experts * vectors && depth * per_loader == 16U);
@@ -1896,6 +1907,21 @@ void launch_router_rows_typed(const PreparedRouterRows& p, const HipMoeRouteLaun
         const bool half = bf16 && bf16->kind == q6p::Kind::bf16 && bf16->rows == config.expert_count &&
             bf16->cols == config.hidden_size;
         const auto lanes = [&]<std::uint32_t R>() {
+            // Twice as many independent blocks for the 512-expert single-session router.
+            // Each (row, expert) retains the ascending fused chain and the same loader ring depth.
+            static const bool small = [] { const char* v = std::getenv("STRIX_QKERN_ROUTER8"); return v && v[0] == '1'; }();
+            if (small && staged && config.hidden_size == 20U * 128U) {
+                constexpr unsigned experts = 8U, loaders = 4U;
+                const auto grid8 = dim3((config.expert_count + experts - 1U) / experts);
+                const auto threads8 = dim3(32U * (staged_router_chain_waves<R, experts>() + loaders));
+                if (half)
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 20U, loaders, true, experts>),
+                        grid8, threads8, 0, stream, p.args, bf16->base, config.expert_count);
+                else
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 20U, loaders, false, experts>),
+                        grid8, threads8, 0, stream, p.args, f32, config.expert_count);
+                return;
+            }
             if (staged && config.hidden_size == 20U * 128U) {
                 // 16 experts per block: R / 2 chain waves and 8 loader waves keeping 8 chunks in flight.
                 constexpr std::uint32_t experts = 16U, loaders = 8U;
@@ -1969,6 +1995,33 @@ void moe_route_known_window_rows_launch(std::span<const ExecutionDispatchContext
     const auto prepared = prepare_router_rows(rows, config);
     if (config.activation == HipActivationStorage::bf16) launch_router_rows_by_weight<std::uint16_t>(prepared, config);
     else launch_router_rows_by_weight<float>(prepared, config);
+}
+void moe_route_known_window_cohort_launch(std::span<const std::span<const ExecutionDispatchContext>> segments,
+    const HipMoeRouteLauncherConfig& config) {
+    if(segments.size()<2U || segments.size()>8U || config.hidden_size%kWaveRowsChunk || !config.wave_topk)
+        throw std::invalid_argument("wide router cohort geometry or topology differs");
+    RouterCohortRowsArgs args{};
+    const auto lead=prepare_router_rows(segments[0],config);
+    if(lead.kind!=RouterWeightKind::f32) throw std::invalid_argument("wide router cohort requires F32 weights");
+    for(const auto segment:segments) {
+        const auto p=prepare_router_rows(segment,config);
+        if(args.count+p.rows>32U || p.kind!=lead.kind || p.tensor->address!=lead.tensor->address)
+            throw std::invalid_argument("wide router cohort rows or weights differ");
+        for(std::uint32_t r=0;r<p.rows;++r,++args.count) {
+            args.hidden[args.count]=p.args.hidden[r];args.workspace[args.count]=p.args.workspace[r];
+            args.indices[args.count]=p.args.indices[r];args.weights[args.count]=p.args.weights[r];
+        }
+    }
+    const auto run=[&]<typename Activation>() {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_moe_route_logits_kernel<Activation,32U,RouterCohortRowsArgs>),
+            dim3((config.expert_count+7U)/8U),dim3(256U),0,hip_execution_stream(),args,
+            reinterpret_cast<const float*>(lead.tensor->address),config.hidden_size,config.expert_count);
+    };
+    if(config.activation==HipActivationStorage::bf16) run.template operator()<std::uint16_t>();else run.template operator()<float>();
+    check_hip(hipGetLastError(),"wide router cohort logits launch");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave,RouterCohortRowsArgs>),
+        dim3(args.count),dim3(kThreads),0,hip_execution_stream(),args,config.expert_count,config.top_k,config.normalize_selected);
+    check_hip(hipGetLastError(),"wide router cohort select launch");
 }
 
 namespace {

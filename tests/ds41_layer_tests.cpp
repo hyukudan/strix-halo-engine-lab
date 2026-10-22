@@ -18,6 +18,9 @@
 #include <random>
 #include <string>
 #include <vector>
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <immintrin.h>  // _mm_cvtps_ph (F16C)
+#endif
 
 #include "ds41_engram_golden.inc"
 
@@ -33,7 +36,12 @@ void expect(bool condition, const std::string& message) {
     }
 }
 
+#if defined(_MSC_VER) && !defined(__clang__)
+// no _Float16 in MSVC: the F16C conversion, round to nearest even like the cast
+std::uint16_t to_f16(float x) { return static_cast<std::uint16_t>(_mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(x), _MM_FROUND_TO_NEAREST_INT), 0)); }
+#else
 std::uint16_t to_f16(float x) { return __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(x)); }
+#endif
 
 std::vector<float> random_vector(std::mt19937& rng, std::size_t n, float scale) {
     std::normal_distribution<float> d(0.0F, scale);

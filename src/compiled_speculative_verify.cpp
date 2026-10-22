@@ -446,6 +446,7 @@ bool window_same_arena(const ExecutionArenaPlan& left, const ExecutionArenaPlan&
 constexpr std::string_view known_shared_base = "hip.shared_expert.bf16.h2560.m640.r1.c1";
 constexpr std::string_view known_gdn_wave8_head = "hip.gdn.bf16.h2560.kh16.vh48.d128.r1.c1.scalar.wave8-input-v1.wave8-q8-output-v1";
 constexpr std::string_view known_gdn_wave8_tail = ".prefetch8.virtual256.q8-input.virtual256.q8-output";
+constexpr std::string_view known_trellis_marker = ".trellis-g1-fp32-s4-v1";
 // The serial plan's dense A8 marker (one identity for the whole plan, checked by the
 // serial compiler) carries over to every window/prefill row of the step.
 bool known_shared_id(std::string_view id) {
@@ -458,9 +459,13 @@ bool known_shared_id(std::string_view id) {
 }
 bool known_gdn_id(std::string_view id) {
     for (const bool dense : {false, true})
+      for (const bool trellis : {false, true}) {
+        if (trellis && !dense) continue;
         if (id == std::string(known_gdn_wave8_head) + std::string(dense ? q8_projection_organization::dense_a8_marker : "") +
+                std::string(trellis ? known_trellis_marker : "") +
                 std::string(known_gdn_wave8_tail))
             return true;
+      }
     return false;
 }
 // Serial routed-expert arithmetic the union reproduces: the float profile
@@ -485,10 +490,31 @@ std::optional<RoutedUnionProfile> routed_union_profile(std::string_view id) {
 bool known_qsa_id(std::string_view id) {
     constexpr std::string_view base="hip.indexed_attention.bf16.h2560.q24x256.kv2.idx4x128.b2048.r1.c1.scalar";
     for(const bool wave8:{false,true}) for(const bool dense:{false,true}) for(const bool prefetch:{false,true})
+      for(const bool trellis:{false,true}) {
+        if (trellis && !dense) continue;
         if(id==std::string(base)+std::string(wave8?q8_projection_organization::qsa_output_wave8_marker:"")+
             std::string(dense?q8_projection_organization::dense_a8_marker:"")+
+            std::string(trellis?known_trellis_marker:"")+
             std::string(prefetch?qsa_input_prefetch::kernel_suffix:"")) return true;
+      }
     return false;
+}
+// Source manifests retain Q8 tensors for the wide prompt. Window accounting
+// describes the actual selected decode operands, including signed scale vectors.
+std::pair<std::uint64_t, std::uint32_t> trellis_window_adjustment(
+    std::string_view id, KnownWindowStepMode mode, std::uint32_t rows) {
+    if (id.find(known_trellis_marker) == std::string_view::npos) return {};
+    std::uint64_t outputs = 0;
+    std::uint32_t saved = rows - 1U;
+    if (mode == KnownWindowStepMode::qsa_rows) outputs = 12288U;
+    else if (mode == KnownWindowStepMode::gdn_rows || mode == KnownWindowStepMode::gdn_deferred_rows) outputs = 6144U;
+    else if (mode == KnownWindowStepMode::r2_gdn_staged) { outputs = 6144U; saved = rows / 2U; }
+    else return {};
+    const auto q8 = 2560ULL / 32U * 34U * outputs;
+    const auto packed = 2560ULL * outputs * 5U / 8U + (2560U + outputs) * 2U;
+    // Compact input/partial/output launches replace one input projection;
+    // the remaining source projections retain their existing merged launch.
+    return {(q8 - packed) * saved, 3U * saved};
 }
 const ManifestTensor& window_tensor(const ModelManifest& manifest,
     const ExecutionTensorAccessPlan& access, std::uint32_t step, SerialOp op,
@@ -806,6 +832,10 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
                 avoided += known_gdn_q8_large_projection_bytes*(window.logical_rows/2U); launches += 3U*(window.logical_rows/2U);
             }
         } else throw std::invalid_argument("known window mode is not in the closed table");
+        if (binding.kernel_id) {
+            const auto adjustment = trellis_window_adjustment(*binding.kernel_id, mode, window.logical_rows);
+            avoided -= adjustment.first; launches += adjustment.second;
+        }
         hash_u64(kernel, step.id); hash_u64(kernel, static_cast<std::uint64_t>(mode));
         hash_u64(kernel, static_cast<std::uint64_t>(variant));
         hash_u64(kernel, binding.host_or_runtime_step);
@@ -993,6 +1023,11 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
                 output.r2_variant[i]=mode==KnownWindowStepMode::inject_rows ? KnownWindowR2Variant::inject_rows_v1 :
                     KnownWindowR2Variant::moe_combine_rows_v1;
             }
+        }
+        if (binding.kernel_id) {
+            const auto adjustment = trellis_window_adjustment(*binding.kernel_id, output.mode[i], output.logical_rows);
+            output.logical_projection_weight_bytes_avoided -= adjustment.first;
+            output.projection_launches_saved += adjustment.second;
         }
         if (output.mode[i] == KnownWindowStepMode::r1_row_loop) {
             ++output.row_loop_steps; if (binding.host_or_runtime_step) ++output.runtime_row_steps;

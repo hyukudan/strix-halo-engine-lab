@@ -103,7 +103,9 @@ struct sgu_import {
 /* PREPARE reserves one C1 operation per direction. Its start offset is frame-aligned;
  * the final payload frame may be partial and has an exact expected wire size.
  * contiguous and cannot overlap the dedicated last-frame terminal region.
- * terminal_bytes is wire metadata size, 1..4096; the kernel never parses it. */
+ * terminal_bytes is wire metadata size, 1..4096. Without flags the kernel never
+ * parses it. flags (formerly reserved, zero = legacy behaviour) may hold
+ * SGU_PREPARE_TERMINAL_HEADER, see struct sgu_terminal_header below. */
 struct sgu_prepare {
     struct sgu_fence fence;
     __aligned_u64 handle;
@@ -112,7 +114,10 @@ struct sgu_prepare {
     __aligned_u64 payload_bytes;
     __u32 terminal_bytes;
     __u32 direction;
-    __aligned_u64 reserved;
+    union {
+        __aligned_u64 reserved;
+        __aligned_u64 flags;
+    };
 };
 
 /* ARM/STOP/RELEASE use zero handle/sequence/direction. Other actions identify
@@ -207,7 +212,10 @@ struct sgu_sync_file {
  * mandatory. It does NOT reset the NHI, retrain the cable, or certify the peer.
  * Success returns the unimported identity in fence and SESSION_RECOVERED.
  * Blocking SUBMIT/RX_REPOST waits for foreign fences without holding the
- * device mutex; O_NONBLOCK returns EAGAIN without publishing/enqueuing. */
+ * device mutex; O_NONBLOCK returns EAGAIN without publishing/enqueuing, for an
+ * unsignalled dependency and for a contended device, reservation or DMA
+ * submission mutex (held by the watchdog while it stops the rings). Only the
+ * context spinlock is still taken. */
 
 /* Experimental numbers local to this opt-in device mode, not allocated stock
  * USB4STREAM ioctls. Exact command/size is checked; unknown commands fail. */
@@ -290,5 +298,49 @@ struct sgu_reset_group {
     struct sgu_reset_member members[SGU_MAX_RESET_MEMBERS];
 };
 #define SGU_IOC_RESET_GROUP _IOWR(0xb7, 0x51, struct sgu_reset_group)
+
+/* Kernel-validated terminal frame (optional, additive extension).
+ *
+ * Without it, RX frames land in descriptor posting order and the kernel only
+ * checks each frame's length: if the peers disagree on payload_bytes or on
+ * SUBMIT order and the sizes happen to match, data shifts silently.
+ *
+ * With SGU_PREPARE_TERMINAL_HEADER in sgu_prepare.flags (terminal_bytes must
+ * then be SGU_TERMINAL_HEADER_BYTES), the terminal frame no longer uses the
+ * DMA-BUF terminal slot. On TX the kernel itself sends this header, built from
+ * the operation. On RX the terminal lands in kernel memory and is checked
+ * against the local operation: length, magic, version, the import's
+ * connection_epoch, sequence, payload_bytes, payload frame count and slot. A
+ * mismatch sets SGU_FRAME_ERROR_TERMINAL on that frame, EVENT reports
+ * SGU_EVENT_FAILED and the session fails (RECOVER with a fresh epoch).
+ *
+ * Contract: both peers set the flag on matching operations, and an RX
+ * operation uses the same sequence number as the peer's TX operation it
+ * receives. The kernel validates framing, not payload integrity (link CRC
+ * only); an end-to-end payload checksum remains the application's job.
+ *
+ * Discovery: SGU_IOC_QUEUE reports SGU_CAP_TERMINAL_HEADER. Kernels without
+ * it reject a non-zero flags field with EINVAL. ABI versioning: abi_minor is
+ * part of every identity and QUERY requires an exact match, so additive
+ * extensions are advertised as capability bits and abi_minor stays 0; it will
+ * only change together with an exact-match-free QUERY. */
+#define SGU_CAP_TERMINAL_HEADER 256U
+#define SGU_PREPARE_TERMINAL_HEADER 1ULL
+#define SGU_FRAME_ERROR_TERMINAL 128U
+#define SGU_TERMINAL_MAGIC 0x54554753U /* "SGUT" as little-endian bytes */
+#define SGU_TERMINAL_VERSION 1U
+#define SGU_TERMINAL_HEADER_BYTES 64U
+/* Little-endian on the wire. */
+struct sgu_terminal_header {
+    __le32 magic;
+    __le16 version;
+    __le16 header_bytes;
+    __le64 connection_epoch;
+    __le64 sequence;
+    __le64 payload_bytes;
+    __le32 payload_frames;
+    __le32 slot;
+    __le64 reserved[3];
+};
 
 #endif

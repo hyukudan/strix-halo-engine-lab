@@ -690,6 +690,418 @@ __global__ __launch_bounds__(32U * Waves) void gate_up_slots_kernel(GateUpView v
     }
 }
 
+// STRIX_DS41_EXPERT_ROWS: the routed gate/up (IQ2_XXS) and down (Q2_K) with the loads restructured. Every
+// (entry, output) keeps the lane classes, group order, terms and butterfly of accumulate_rows, so the bits are
+// those of the kernels above.
+// - Per union slot a wave issues the activation loads of the first staged part, then the first weight step of its
+//   rows (Depth steps; Steps = groups / 32 rounded up per lane), then stores the activations to LDS behind an
+//   LDS-only barrier (__syncthreads is a workgroup release fence, which would wait for the weight loads).
+// - Depth 1: a rolled loop that issues the next step's loads unconditionally (the last one clamped to a valid group
+//   and unused) before decoding the current step; the declared kernels' `if (more)` loads made the compiler wait for
+//   the next group before decoding the current one. Depth = Steps (down only): every step held in registers and
+//   reused by the later parts of an expert; otherwise later parts reload (from the caches).
+// - Weight rows are buffer loads with the row in the scalar offset and one vector offset per step shared by the
+//   rows (no 64-bit address registers); the IQ2_XXS scale and the Q2_K scale pair are dword loads (no d16 loads).
+// - Signs 1: IQ2_XXS sign masks from a 128-entry LDS table of byte_masks(sign_byte(i)); 2: the same bytes by
+//   v_perm (selector 12 + bit gives 0x00 / 0xff), without 32-bit multiplies.
+// - The butterflies move the lanes of __shfl_xor(x, d, 32) by DPP (d < 16) and permlanex16 (d = 16).
+struct IqHeld { unsigned d; unsigned long long aux; };      // d: the block's first dword (the FP16 scale below)
+struct Q2Held { unsigned q[8]; unsigned scales; unsigned dm; };  // scales: the dword at the group's scale pair
+template <WeightFormat Format> struct HeldOf;
+template <> struct HeldOf<WeightFormat::iq2_xxs> { using type = IqHeld; };
+template <> struct HeldOf<WeightFormat::q2_k> { using type = Q2Held; };
+template <WeightFormat Format> using HeldGroup = typename HeldOf<Format>::type;
+
+// The W weight rows of a wave: buffer resources over one expert's matrix (gate/up: rows [0, split) in the gate,
+// the others in the up) and each row's byte offset. The offsets are wave-uniform: buffer loads with the row in the
+// scalar offset and one vector offset per step shared by the W rows.
+template <unsigned W> struct WaveRows { __amdgpu_buffer_rsrc_t rsrc[2]; int offset[W]; unsigned split; };
+__device__ __forceinline__ __amdgpu_buffer_rsrc_t weight_rsrc(const void* base) {
+    return __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(base), 0, 0x7fffffff, 0x31004000);  // raw, offset-checked
+}
+template <WeightFormat Format>
+__device__ __forceinline__ HeldGroup<Format> load_held_group(__amdgpu_buffer_rsrc_t rsrc, int row, unsigned g) {
+    HeldGroup<Format> raw;
+    if constexpr (Format == WeightFormat::iq2_xxs) {
+        const unsigned block = g / 8U * static_cast<unsigned>(iq2_xxs_block_bytes);
+        raw.d = __builtin_amdgcn_raw_buffer_load_b32(rsrc, static_cast<int>(block), row, 0);
+        const auto aux = __builtin_amdgcn_raw_buffer_load_b64(rsrc, static_cast<int>(block + 2U + 8U * (g % 8U)), row, 0);
+        raw.aux = aux[0] | (static_cast<unsigned long long>(aux[1]) << 32U);
+    } else {
+        const unsigned block = g / 8U * static_cast<unsigned>(q2_k_block_bytes), group = g % 8U, half = group / 4U;
+        const auto q0 = __builtin_amdgcn_raw_buffer_load_b128(rsrc, static_cast<int>(block + 16U + 32U * half), row, 0);
+        const auto q1 = __builtin_amdgcn_raw_buffer_load_b128(rsrc, static_cast<int>(block + 32U + 32U * half), row, 0);
+#pragma unroll
+        for (unsigned k = 0; k < 4U; ++k) { raw.q[k] = q0[k]; raw.q[k + 4U] = q1[k]; }
+        raw.scales = __builtin_amdgcn_raw_buffer_load_b32(rsrc, static_cast<int>(block + 8U * half + 2U * (group % 4U)), row, 0);
+        raw.dm = __builtin_amdgcn_raw_buffer_load_b32(rsrc, static_cast<int>(block + 80U), row, 0);
+    }
+    return raw;
+}
+template <WeightFormat Format, unsigned W>
+__device__ __forceinline__ void load_step(const WaveRows<W>& rows, unsigned g, HeldGroup<Format> (&held)[W]) {
+#pragma unroll
+    for (unsigned w = 0; w < W; ++w) held[w] = load_held_group<Format>(rows.rsrc[w < rows.split ? 0U : 1U], rows.offset[w], g);
+}
+__device__ __forceinline__ unsigned byte_masks_perm(unsigned bits4) {
+    return __builtin_amdgcn_perm(0U, 0U, ((bits4 * 0x00204081U) & 0x01010101U) | 0x0c0c0c0cU);
+}
+__device__ __forceinline__ void load_sign_masks(unsigned long long* masks) {
+    if (threadIdx.x < 128U) {
+        const unsigned s = sign_byte(threadIdx.x);
+        masks[threadIdx.x] = byte_masks(s & 15U) | (static_cast<unsigned long long>(byte_masks(s >> 4U)) << 32U);
+    }
+}
+template <unsigned Signs>
+__device__ __forceinline__ IqGroup decode_held(const IqHeld& raw, const unsigned long long* grid, const unsigned long long* masks) {
+    IqGroup out;
+    const float d = half_bits_to_float(static_cast<unsigned short>(raw.d & 0xffffU));
+    const unsigned aux0 = static_cast<unsigned>(raw.aux), aux1 = static_cast<unsigned>(raw.aux >> 32U);
+    out.scale = d * (0.5F + static_cast<float>(aux1 >> 28U)) * 0.25F;
+#pragma unroll
+    for (unsigned l = 0; l < 4U; ++l) {
+        const unsigned long long g = grid[(aux0 >> (8U * l)) & 0xffU];
+        unsigned m0, m1;
+        if constexpr (Signs == 1U) {
+            const unsigned long long m = masks[(aux1 >> (7U * l)) & 127U];
+            m0 = static_cast<unsigned>(m); m1 = static_cast<unsigned>(m >> 32U);
+        } else {
+            const unsigned signs = sign_byte(aux1 >> (7U * l));
+            m0 = Signs == 2U ? byte_masks_perm(signs & 15U) : byte_masks(signs & 15U);
+            m1 = Signs == 2U ? byte_masks_perm(signs >> 4U) : byte_masks(signs >> 4U);
+        }
+        out.w[2U * l] = apply_signs(static_cast<unsigned>(g), m0);
+        out.w[2U * l + 1U] = apply_signs(static_cast<unsigned>(g >> 32U), m1);
+    }
+    return out;
+}
+__device__ __forceinline__ Q2Group decode_held(const Q2Held& raw, unsigned shift) {
+    Q2Group out;
+#pragma unroll
+    for (unsigned k = 0; k < 8U; ++k) out.w[k] = static_cast<int>((raw.q[k] >> shift) & 0x03030303U);
+    out.scale0 = raw.scales & 0xffU;
+    out.scale1 = (raw.scales >> 8U) & 0xffU;
+    out.d = half_bits_to_float(static_cast<unsigned short>(raw.dm & 0xffffU));
+    out.dmin = half_bits_to_float(static_cast<unsigned short>(raw.dm >> 16U));
+    return out;
+}
+// The value of lane ^ D (as __shfl_xor(v, D, 32)).
+template <unsigned D> __device__ __forceinline__ int lane_xor_bits(int v) {
+    if constexpr (D == 16U) {
+        const auto u = static_cast<unsigned>(v);
+        return static_cast<int>(__builtin_amdgcn_permlanex16(u, u, 0x76543210U, 0xfedcba98U, false, false));
+    }
+    else return __builtin_amdgcn_update_dpp(v, v, 0x160 + static_cast<int>(D), 0xf, 0xf, false);  // DPP row_xmask
+}
+template <unsigned D> __device__ __forceinline__ float lane_xor(float v) { return __int_as_float(lane_xor_bits<D>(__float_as_int(v))); }
+__device__ __forceinline__ float butterfly_sum(float v) {
+    v = v + lane_xor<16U>(v); v = v + lane_xor<8U>(v); v = v + lane_xor<4U>(v); v = v + lane_xor<2U>(v);
+    return v + lane_xor<1U>(v);
+}
+__device__ __forceinline__ float butterfly_max(float v) {
+    v = fmaxf(v, lane_xor<16U>(v)); v = fmaxf(v, lane_xor<8U>(v)); v = fmaxf(v, lane_xor<4U>(v)); v = fmaxf(v, lane_xor<2U>(v));
+    return fmaxf(v, lane_xor<1U>(v));
+}
+__device__ __forceinline__ int butterfly_isum(int v) {
+    v += lane_xor_bits<16U>(v); v += lane_xor_bits<8U>(v); v += lane_xor_bits<4U>(v); v += lane_xor_bits<2U>(v);
+    return v + lane_xor_bits<1U>(v);
+}
+
+// Steps [0, Depth) of the lane's weight rows, step-major (step i is group lane + 32 i, clamped to the last group).
+template <WeightFormat Format, unsigned W, unsigned Steps, unsigned Depth>
+__device__ __forceinline__ void load_held(const WaveRows<W>& rows, unsigned width, HeldGroup<Format> (&held)[Steps][W]) {
+    const unsigned lane = threadIdx.x % 32U, last = width / 32U - 1U;
+#pragma unroll
+    for (unsigned i = 0; i < (Depth < Steps ? Depth : Steps); ++i) load_step<Format, W>(rows, min(lane + 32U * i, last), held[i]);
+    asm volatile("" ::: "memory");  // issued here, ahead of the staging stores and barrier
+}
+// One step (group g of the lane) of accumulate_rows over the W held groups: the same terms in the same order.
+template <WeightFormat Format, unsigned MaxRows, unsigned W, unsigned Signs>
+__device__ __forceinline__ void accumulate_group(const HeldGroup<Format> (&held)[W], unsigned g, const signed char* lds_codes,
+                                                 const float* lds_deltas, unsigned count, unsigned width, const unsigned long long* grid,
+                                                 const unsigned long long* masks, float (&acc)[W][MaxRows]) {
+    const unsigned groups = width / 32U;
+    int4 x0[MaxRows], x1[MaxRows];
+    float delta[MaxRows];
+    int sx0[MaxRows], sx1[MaxRows];
+#pragma unroll
+    for (unsigned r = 0; r < MaxRows; ++r)
+        if (r < count) {
+            const auto* x = reinterpret_cast<const int4*>(lds_codes + static_cast<unsigned long long>(r) * width + 32U * g);
+            x0[r] = x[0]; x1[r] = x[1];
+            delta[r] = lds_deltas[r * groups + g];
+            if constexpr (Format == WeightFormat::q2_k) {
+                const int ones = 0x01010101;
+                sx0[r] = unsigned_dot(ones, ones, ones, ones, x0[r].x, x0[r].y, x0[r].z, x0[r].w);
+                sx1[r] = unsigned_dot(ones, ones, ones, ones, x1[r].x, x1[r].y, x1[r].z, x1[r].w);
+            }
+        }
+#pragma unroll
+    for (unsigned w = 0; w < W; ++w) {
+        if constexpr (Format == WeightFormat::q2_k) {
+            const auto q = decode_held(held[w], 2U * (g % 4U));
+#pragma unroll
+            for (unsigned r = 0; r < MaxRows; ++r)
+                if (r < count) {
+                    const int qx0 = unsigned_dot(q.w[0], q.w[1], q.w[2], q.w[3], x0[r].x, x0[r].y, x0[r].z, x0[r].w);
+                    const int qx1 = unsigned_dot(q.w[4], q.w[5], q.w[6], q.w[7], x1[r].x, x1[r].y, x1[r].z, x1[r].w);
+                    const int a = __mul24(static_cast<int>(q.scale0 & 15U), qx0) + __mul24(static_cast<int>(q.scale1 & 15U), qx1);
+                    const int b = __mul24(static_cast<int>(q.scale0 >> 4U), sx0[r]) + __mul24(static_cast<int>(q.scale1 >> 4U), sx1[r]);
+                    const float scaled = q.d * static_cast<float>(a);
+                    const float offset = q.dmin * static_cast<float>(b);
+                    acc[w][r] = acc[w][r] + (scaled - offset) * delta[r];
+                }
+        } else {
+            const auto q = decode_held<Signs>(held[w], grid, masks);
+#pragma unroll
+            for (unsigned r = 0; r < MaxRows; ++r)
+                if (r < count) acc[w][r] = acc[w][r] + static_cast<float>(signed_dot(q.w, x0[r], x1[r])) * (q.scale * delta[r]);
+        }
+    }
+}
+// accumulate_rows over held groups: steps [0, Depth) are loaded by the caller; step i issues the loads of step
+// i + Depth before it decodes step i (no copies, no conditional loads). Then the butterfly of accumulate_rows.
+template <WeightFormat Format, unsigned MaxRows, unsigned W, unsigned Steps, unsigned Depth, unsigned Signs>
+__device__ __forceinline__ void accumulate_stream(const WaveRows<W>& rows, HeldGroup<Format> (&held)[Steps][W],
+                                                  const signed char* lds_codes, const float* lds_deltas, unsigned count, unsigned width,
+                                                  const unsigned long long* grid, const unsigned long long* masks, float (&acc)[W][MaxRows]) {
+    const unsigned lane = threadIdx.x % 32U, groups = width / 32U;
+    __builtin_assume(groups > 32U * (Steps - 1U));  // Steps = groups / 32 rounded up: only the last step can be partial
+#pragma unroll
+    for (unsigned w = 0; w < W; ++w)
+#pragma unroll
+        for (unsigned r = 0; r < MaxRows; ++r) acc[w][r] = 0.0F;
+    if constexpr (Depth == 1U) {
+        // Rolled: the next step's loads (the last one clamped, unused) are issued unconditionally before the
+        // current step is decoded; the register footprint of accumulate_rows.
+        HeldGroup<Format> current[W];
+#pragma unroll
+        for (unsigned w = 0; w < W; ++w) current[w] = held[0][w];
+#pragma unroll 1
+        for (unsigned i = 0; i < Steps; ++i) {
+            HeldGroup<Format> next[W];
+            load_step<Format, W>(rows, min(lane + 32U * (i + 1U), groups - 1U), next);
+            asm volatile("" ::: "memory");
+            const unsigned g = lane + 32U * i;
+            if (g < groups) accumulate_group<Format, MaxRows, W, Signs>(current, g, lds_codes, lds_deltas, count, width, grid, masks, acc);
+#pragma unroll
+            for (unsigned w = 0; w < W; ++w) current[w] = next[w];
+        }
+    } else {
+#pragma unroll
+    for (unsigned i = 0; i < Steps; ++i) {
+        if (i + Depth < Steps) {
+            load_step<Format, W>(rows, min(lane + 32U * (i + Depth), groups - 1U), held[i + Depth]);
+            asm volatile("" ::: "memory");  // keeps the loads here (not sunk into the partial last step's branch)
+        }
+        const unsigned g = lane + 32U * i;
+        if (g < groups) accumulate_group<Format, MaxRows, W, Signs>(held[i], g, lds_codes, lds_deltas, count, width, grid, masks, acc);
+        __builtin_amdgcn_sched_barrier(0);  // one step's decode at a time
+    }
+    }
+#pragma unroll
+    for (unsigned w = 0; w < W; ++w)
+#pragma unroll
+        for (unsigned r = 0; r < MaxRows; ++r)
+            if (r < count) acc[w][r] = butterfly_sum(acc[w][r]);
+}
+// A block barrier for LDS data only: unlike __syncthreads (a workgroup release fence, which waits for every
+// outstanding global load), the held weight loads stay in flight across it.
+__device__ __forceinline__ void lds_barrier() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+// stage_rows with lds_barrier (the later parts of an expert).
+__device__ __forceinline__ void stage_rows_lds(const RoutesView& routes, const EntryRange& range, const signed char* __restrict__ codes,
+                                               const float* __restrict__ deltas, unsigned width, signed char* __restrict__ lds_codes,
+                                               float* __restrict__ lds_deltas) {
+    const unsigned words = width / 16U, groups = width / 32U;
+    for (unsigned e = 0; e < range.count; ++e) {
+        const unsigned long long input = entry_input(routes, range.begin + e);
+        const auto* source = reinterpret_cast<const int4*>(codes + input * width);
+        auto* target = reinterpret_cast<int4*>(lds_codes + static_cast<unsigned long long>(e) * width);
+        for (unsigned i = threadIdx.x; i < words; i += blockDim.x) target[i] = source[i];
+        for (unsigned i = threadIdx.x; i < groups; i += blockDim.x)
+            lds_deltas[e * groups + i] = deltas[input * groups + i];
+    }
+    lds_barrier();
+}
+// stage_rows split around the weight loads: the loads of the first part into registers (K int4 per thread and
+// entry), then their LDS stores and the barrier. Threads: the block size; K * Threads covers width / 16.
+using Words4 = int __attribute__((ext_vector_type(4)));
+template <unsigned MaxRows, unsigned K> struct StageRegs { Words4 codes[MaxRows][K]; float deltas[MaxRows]; };
+template <unsigned MaxRows, unsigned K, unsigned Threads>
+__device__ __forceinline__ void stage_issue(const RoutesView& routes, const EntryRange& part, const signed char* __restrict__ codes,
+                                            const float* __restrict__ deltas, unsigned width, StageRegs<MaxRows, K>& s) {
+    const unsigned words = width / 16U, groups = width / 32U;
+#pragma unroll
+    for (unsigned e = 0; e < MaxRows; ++e)
+        if (e < part.count) {
+            const unsigned long long input = entry_input(routes, part.begin + e);
+            const auto* source = reinterpret_cast<const Words4*>(codes + input * width);
+#pragma unroll
+            for (unsigned k = 0; k < K; ++k)
+                if (threadIdx.x + k * Threads < words) s.codes[e][k] = source[threadIdx.x + k * Threads];
+            if (threadIdx.x < groups) s.deltas[e] = deltas[input * groups + threadIdx.x];
+        }
+}
+template <unsigned MaxRows, unsigned K, unsigned Threads>
+__device__ __forceinline__ void stage_store(const EntryRange& part, unsigned width, const StageRegs<MaxRows, K>& s,
+                                            signed char* __restrict__ lds_codes, float* __restrict__ lds_deltas) {
+    const unsigned words = width / 16U, groups = width / 32U;
+#pragma unroll
+    for (unsigned e = 0; e < MaxRows; ++e)
+        if (e < part.count) {
+            auto* target = reinterpret_cast<Words4*>(lds_codes + static_cast<unsigned long long>(e) * width);
+#pragma unroll
+            for (unsigned k = 0; k < K; ++k)
+                if (threadIdx.x + k * Threads < words) target[threadIdx.x + k * Threads] = s.codes[e][k];
+            if (threadIdx.x < groups) lds_deltas[e * groups + threadIdx.x] = s.deltas[e];
+        }
+    lds_barrier();
+}
+__device__ __forceinline__ unsigned union_count(const RoutesView& routes) { return routes.counts ? routes.counts[0] : routes.expert_count; }
+
+// routes_product_slots_kernel with held weight groups (W outputs per wave, Waves waves; gridDim.y union slots).
+// Depth: steps loaded ahead (Steps: every step, kept for the later parts of an expert; else later parts reload).
+template <WeightFormat Format, unsigned MaxRows, unsigned W, unsigned Waves, unsigned Steps, unsigned Depth, unsigned Signs>
+__global__ __launch_bounds__(32U * Waves) void routes_product_rows_kernel(RoutesProductView view) {
+    constexpr unsigned threads = 32U * Waves, k_words = (64U * Steps + threads - 1U) / threads;
+    extern __shared__ int4 staged[];
+    __shared__ unsigned long long grid[grid_words<Format>];
+    __shared__ unsigned long long masks[Format == WeightFormat::iq2_xxs && Signs == 1U ? 128U : 1U];
+    if constexpr (Format == WeightFormat::iq2_xxs) {
+        load_grid(grid);
+        if constexpr (Signs == 1U) load_sign_masks(masks);
+    }
+    const unsigned slots = union_count(view.routes);
+    auto* lds_codes = reinterpret_cast<signed char*>(staged);
+    auto* lds_deltas = reinterpret_cast<float*>(lds_codes + static_cast<unsigned long long>(MaxRows) * view.width);
+    const unsigned wave = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x / 32U)));
+    const unsigned first = (blockIdx.x * Waves + wave) * W;
+    const bool active = first < view.outputs;
+    for (unsigned j = blockIdx.y; j < slots; j += gridDim.y) {
+        const EntryRange range{view.routes.begins[j], view.routes.begins[j + 1U] - view.routes.begins[j], view.routes.experts[j]};
+        const EntryRange part0{range.begin, min(MaxRows, range.count), range.expert};
+        StageRegs<MaxRows, k_words> s;
+        stage_issue<MaxRows, k_words, threads>(view.routes, part0, view.codes, view.deltas, view.width, s);
+        WaveRows<W> rows;
+        rows.rsrc[0] = rows.rsrc[1] = weight_rsrc(static_cast<const unsigned char*>(view.weights) + range.expert * view.expert_stride_bytes);
+        rows.split = W;
+#pragma unroll
+        for (unsigned w = 0; w < W; ++w) rows.offset[w] = static_cast<int>(min(first + w, view.outputs - 1U) * view.row_bytes);
+        HeldGroup<Format> held[Steps][W];
+        load_held<Format, W, Steps, Depth>(rows, view.width, held);
+        if (j != blockIdx.y) lds_barrier();
+        stage_store<MaxRows, k_words, threads>(part0, view.width, s, lds_codes, lds_deltas);
+        const auto part_product = [&](const EntryRange& part, HeldGroup<Format> (&h)[Steps][W]) {
+            if (!active) return;
+            float acc[W][MaxRows];
+            accumulate_stream<Format, MaxRows, W, Steps, Depth, Signs>(rows, h, lds_codes, lds_deltas, part.count, view.width, grid, masks, acc);
+            if (threadIdx.x % 32U != 0U) return;
+#pragma unroll
+            for (unsigned r = 0; r < MaxRows; ++r)
+                if (r < part.count) {
+                    const unsigned long long output = view.routes.outputs[part.begin + r];
+#pragma unroll
+                    for (unsigned w = 0; w < W; ++w)
+                        if (first + w < view.outputs) view.out[output * view.outputs + first + w] = acc[w][r];
+                }
+        };
+        part_product(part0, held);
+        for (unsigned chunk = MaxRows; chunk < range.count; chunk += MaxRows) {
+            const EntryRange part{range.begin + chunk, min(MaxRows, range.count - chunk), range.expert};
+            lds_barrier();
+            stage_rows_lds(view.routes, part, view.codes, view.deltas, view.width, lds_codes, lds_deltas);
+            if constexpr (Depth >= Steps) {
+                part_product(part, held);
+            } else {
+                HeldGroup<Format> again[Steps][W];
+                load_held<Format, W, Steps, Depth>(rows, view.width, again);
+                part_product(part, again);
+            }
+        }
+    }
+}
+// gate_up_slots_kernel with held weight groups (32 / Waves outputs of gate and of up per wave; Depth as above).
+template <WeightFormat Format, unsigned MaxRows, unsigned Waves, unsigned Steps, unsigned Depth, unsigned Signs>
+__global__ __launch_bounds__(32U * Waves) void gate_up_rows_kernel(GateUpView view) {
+    constexpr unsigned outs = 32U / Waves, W = 2U * outs, threads = 32U * Waves, k_words = (64U * Steps + threads - 1U) / threads;
+    extern __shared__ int4 staged[];
+    __shared__ unsigned long long grid[grid_words<Format>];
+    __shared__ unsigned long long masks[Format == WeightFormat::iq2_xxs && Signs == 1U ? 128U : 1U];
+    __shared__ float tile[2][MaxRows][32];
+    if constexpr (Format == WeightFormat::iq2_xxs) {
+        load_grid(grid);
+        if constexpr (Signs == 1U) load_sign_masks(masks);
+    }
+    const unsigned slots = union_count(view.routes);
+    auto* lds_codes = reinterpret_cast<signed char*>(staged);
+    auto* lds_deltas = reinterpret_cast<float*>(lds_codes + static_cast<unsigned long long>(MaxRows) * view.hidden);
+    const unsigned wave = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x / 32U)));
+    const unsigned lane = threadIdx.x % 32U, first = blockIdx.x * 32U + wave * outs;
+    for (unsigned j = blockIdx.y; j < slots; j += gridDim.y) {
+        const EntryRange range{view.routes.begins[j], view.routes.begins[j + 1U] - view.routes.begins[j], view.routes.experts[j]};
+        const EntryRange part0{range.begin, min(MaxRows, range.count), range.expert};
+        StageRegs<MaxRows, k_words> s;
+        stage_issue<MaxRows, k_words, threads>(view.routes, part0, view.codes, view.deltas, view.hidden, s);
+        const unsigned long long expert_base = range.expert * view.expert_stride_bytes;
+        WaveRows<W> rows;
+        rows.rsrc[0] = weight_rsrc(static_cast<const unsigned char*>(view.gate) + expert_base);
+        rows.rsrc[1] = weight_rsrc(static_cast<const unsigned char*>(view.up) + expert_base);
+        rows.split = outs;
+#pragma unroll
+        for (unsigned w = 0; w < outs; ++w) rows.offset[w] = rows.offset[w + outs] = static_cast<int>((first + w) * view.row_bytes);
+        HeldGroup<Format> held[Steps][W];
+        load_held<Format, W, Steps, Depth>(rows, view.hidden, held);
+        if (j != blockIdx.y) lds_barrier();
+        stage_store<MaxRows, k_words, threads>(part0, view.hidden, s, lds_codes, lds_deltas);
+        const auto part_gate_up = [&](const EntryRange& part, HeldGroup<Format> (&h)[Steps][W]) {
+            float acc[W][MaxRows];
+            accumulate_stream<Format, MaxRows, W, Steps, Depth, Signs>(rows, h, lds_codes, lds_deltas, part.count, view.hidden, grid, masks, acc);
+            if (lane == 0U)
+#pragma unroll
+                for (unsigned r = 0; r < MaxRows; ++r)
+                    if (r < part.count)
+#pragma unroll
+                        for (unsigned w = 0; w < outs; ++w) {
+                            tile[0][r][wave * outs + w] = acc[w][r];
+                            tile[1][r][wave * outs + w] = acc[w + outs][r];
+                        }
+            lds_barrier();
+            for (unsigned e = wave; e < part.count; e += Waves) {
+                const unsigned long long slot = view.routes.outputs[part.begin + e];
+                const unsigned at = blockIdx.x * 32U + lane, groups = view.inter / 32U;
+                const float g = tile[0][e][lane], u = tile[1][e][lane];
+                if (view.gate_out) { view.gate_out[slot * view.inter + at] = g; view.up_out[slot * view.inter + at] = u; }
+                const float act = swiglu_clamped(g, u, view.limit);
+                const float amax = butterfly_max(fabsf(act));
+                const bool tiny = amax > 0.0F && amax < 0x1p-119F;
+                const float delta = amax == 0.0F || tiny ? 1.0F : amax / 127.0F;
+                const float rounded = tiny ? 0.0F : rintf(act / delta);
+                const int code = static_cast<int>(fminf(127.0F, fmaxf(-127.0F, rounded)));
+                const int sum = butterfly_isum(code);
+                view.act_codes[slot * view.inter + at] = static_cast<signed char>(code);
+                if (lane == 0U) { view.act_deltas[slot * groups + blockIdx.x] = delta; view.act_sums[slot * groups + blockIdx.x] = sum; }
+            }
+        };
+        part_gate_up(part0, held);
+        for (unsigned chunk = MaxRows; chunk < range.count; chunk += MaxRows) {
+            const EntryRange part{range.begin + chunk, min(MaxRows, range.count - chunk), range.expert};
+            lds_barrier();
+            stage_rows_lds(view.routes, part, view.codes, view.deltas, view.hidden, lds_codes, lds_deltas);
+            if constexpr (Depth >= Steps) {
+                part_gate_up(part, held);
+            } else {
+                HeldGroup<Format> again[Steps][W];
+                load_held<Format, W, Steps, Depth>(rows, view.hidden, again);
+                part_gate_up(part, again);
+            }
+        }
+    }
+}
+
 // Window routes from the router's ids, in one block (rows * top_k <= 64): the CSR over the union of the
 // experts in [first, end) in ascending id with entries in ascending row, every row's slots in ascending id
 // with its low-half count, counts[0] = union experts and counts[1] = the most entries of one expert.
@@ -747,6 +1159,7 @@ __global__ __launch_bounds__(64) void build_routes_kernel(BuildRoutesView view) 
         view.counts[1] = most;
     }
 }
+
 
 __device__ __forceinline__ void combine_body(const float* __restrict__ raw, const float* __restrict__ shared,
                                              const float* __restrict__ weights, const std::uint32_t* __restrict__ order,
@@ -1291,6 +1704,267 @@ void dispatch_gate_up(const GateUpView& view, int form, hipStream_t stream) {
     else launch_gate_up_form<Format, 8>(view, form, stream);
 }
 
+// STRIX_DS41_EXPERT_ROWS shapes: staged rows per part and waves per block of the gate/up and of the down, the down's
+// steps loaded ahead and the IQ2_XXS sign form. STRIX_DS41_EXPERT_ROWS_FORM=QGDABS overrides them: Q down steps
+// ahead (1 or 3 = all, kept for the later parts), caps G, D (1, 2, 4 or 8), waves A, B (1: 8, 2: 16), signs S (1: LDS
+// table, 2: v_perm). Only the model's widths (gate/up 5120 = 5 steps, down 2304 = 3 steps) have every shape; other
+// widths take 8 waves, signs 2 and (down) every step ahead.
+struct RowsShape { unsigned gate_cap = 4U, down_cap = 4U, gate_waves = 16U, down_waves = 8U, signs = 2U, down_depth = 1U; };
+RowsShape rows_shape() {
+    RowsShape s;
+    const int f = moe_kernel_tuning().rows_form;
+    if (f < 0) return s;
+    const auto digit = [f](int place) { return static_cast<unsigned>(f / place % 10); };
+    const auto cap = [](unsigned d, unsigned fallback) { return d == 1U || d == 2U || d == 4U || d == 8U ? d : fallback; };
+    s.gate_cap = cap(digit(10000), s.gate_cap);
+    s.down_cap = cap(digit(1000), s.down_cap);
+    if (digit(100) != 0U) s.gate_waves = digit(100) == 2U ? 16U : 8U;
+    if (digit(10) != 0U) s.down_waves = digit(10) == 2U ? 16U : 8U;
+    if (digit(1) != 0U) s.signs = std::min(digit(1), 2U);
+    if (digit(100000) != 0U) s.down_depth = digit(100000) >= 3U ? 3U : 1U;
+    return s;
+}
+// Union slots of the grid: the STRIX_DS41_EXPERT_SLOTS bound for device-built routes, else every slot.
+unsigned rows_grid_y(const RoutesView& routes) {
+    if (routes.counts)
+        if (const unsigned y = expert_slots_y(routes.max_rows, routes.expert_count); y != 0U) return y;
+    return routes.expert_count;
+}
+template <unsigned MaxRows, unsigned Waves, unsigned Steps, unsigned Depth, unsigned Signs>
+void launch_gate_up_rows(const GateUpView& view, hipStream_t stream) {
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(gate_up_rows_kernel<WeightFormat::iq2_xxs, MaxRows, Waves, Steps, Depth, Signs>),
+                       dim3(view.inter / 32U, rows_grid_y(view.routes)), dim3(32U * Waves), staged_bytes<MaxRows>(view.hidden), stream, view);
+}
+template <unsigned MaxRows, unsigned Waves, unsigned Steps>
+void gate_up_rows_signs(const GateUpView& view, const RowsShape& s, hipStream_t stream) {
+    if (s.signs == 1U) launch_gate_up_rows<MaxRows, Waves, Steps, 1U, 1U>(view, stream);
+    else launch_gate_up_rows<MaxRows, Waves, Steps, 1U, 2U>(view, stream);
+}
+template <unsigned MaxRows, unsigned Steps>
+void gate_up_rows_shape(const GateUpView& view, const RowsShape& s, hipStream_t stream) {
+    if constexpr (Steps == 5U) {
+        if (s.gate_waves == 16U) gate_up_rows_signs<MaxRows, 16U, Steps>(view, s, stream);
+        else gate_up_rows_signs<MaxRows, 8U, Steps>(view, s, stream);
+        return;
+    }
+    launch_gate_up_rows<MaxRows, 8U, Steps, 1U, 2U>(view, stream);
+}
+template <unsigned Steps>
+void gate_up_rows_steps(const GateUpView& view, const RowsShape& s, hipStream_t stream) {
+    const auto m = std::min(view.routes.max_rows, s.gate_cap);
+    if (m <= 1U) gate_up_rows_shape<1, Steps>(view, s, stream);
+    else if (m <= 2U) gate_up_rows_shape<2, Steps>(view, s, stream);
+    else if (m <= 4U) gate_up_rows_shape<4, Steps>(view, s, stream);
+    else gate_up_rows_shape<8, Steps>(view, s, stream);
+}
+// The routed IQ2_XXS gate/up in the held-groups form; false (nothing launched) when the flag is off or the shape
+// is not covered.
+bool gate_up_rows(WeightFormat format, const GateUpView& view, hipStream_t stream) {
+    if (moe_kernel_tuning().rows <= 0 || format != WeightFormat::iq2_xxs) return false;
+    const auto s = rows_shape();
+    switch ((view.hidden / 32U + 31U) / 32U) {
+    case 1U: gate_up_rows_steps<1>(view, s, stream); return true;
+    case 4U: gate_up_rows_steps<4>(view, s, stream); return true;
+    case 5U: gate_up_rows_steps<5>(view, s, stream); return true;
+    default: return false;
+    }
+}
+template <unsigned MaxRows, unsigned Waves, unsigned Steps, unsigned Depth>
+void launch_down_rows(const RoutesProductView& view, hipStream_t stream) {
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(routes_product_rows_kernel<WeightFormat::q2_k, MaxRows, 32U / Waves, Waves, Steps, Depth, 0U>),
+                       dim3((view.outputs + 31U) / 32U, rows_grid_y(view.routes)), dim3(32U * Waves), staged_bytes<MaxRows>(view.width),
+                       stream, view);
+}
+template <unsigned MaxRows, unsigned Steps>
+void down_rows_shape(const RoutesProductView& view, const RowsShape& s, hipStream_t stream) {
+    if constexpr (Steps == 3U) {
+        if (s.down_waves == 16U) {
+            if (s.down_depth >= Steps) launch_down_rows<MaxRows, 16U, Steps, Steps>(view, stream);
+            else launch_down_rows<MaxRows, 16U, Steps, 1U>(view, stream);
+        } else {
+            if (s.down_depth >= Steps) launch_down_rows<MaxRows, 8U, Steps, Steps>(view, stream);
+            else launch_down_rows<MaxRows, 8U, Steps, 1U>(view, stream);
+        }
+        return;
+    }
+    launch_down_rows<MaxRows, 8U, Steps, Steps>(view, stream);
+}
+template <unsigned Steps>
+void down_rows_steps(const RoutesProductView& view, const RowsShape& s, hipStream_t stream) {
+    const auto m = std::min(view.routes.max_rows, s.down_cap);
+    if (m <= 1U) down_rows_shape<1, Steps>(view, s, stream);
+    else if (m <= 2U) down_rows_shape<2, Steps>(view, s, stream);
+    else if (m <= 4U) down_rows_shape<4, Steps>(view, s, stream);
+    else down_rows_shape<8, Steps>(view, s, stream);
+}
+// The routed Q2_K down in the held-groups form (as gate_up_rows).
+bool down_rows(WeightFormat format, const RoutesProductView& view, hipStream_t stream) {
+    if (moe_kernel_tuning().rows <= 0 || format != WeightFormat::q2_k) return false;
+    const auto s = rows_shape();
+    switch ((view.width / 32U + 31U) / 32U) {
+    case 1U: down_rows_steps<1>(view, s, stream); return true;
+    case 2U: down_rows_steps<2>(view, s, stream); return true;
+    case 3U: down_rows_steps<3>(view, s, stream); return true;
+    default: return false;
+    }
+}
+
+// STRIX_DS41_TP_DOWN=1: the expert-TP down (ds41-expert-tp2-i1152-v1: Q2_K rows of width 1152 = 36 groups, 4 whole
+// blocks then the rank's half block, packed (44 bytes) or, Packed false, the first half of block 4 of a 420-byte row)
+// with held groups. Lane l holds group l of each of its wave's W rows (the whole blocks) and ONE tail group: row l / 4,
+// group 32 + l % 4 (W <= 8 rows: 4 W lanes). The tail step thus decodes one group per lane, where accumulate_rows
+// decodes W groups on lanes 0..3 while the other lanes idle. A tail term is computed exactly as accumulate_rows
+// computes it, moved to lane l % 4 by a lane permute and added there after the lane's whole-block term, so every
+// (entry, output) keeps its lane classes (lane l: 0 + term(l), then + term(l + 32) for l < 4), its terms and its
+// butterfly: the bits of routes_product_kernel<q2_k, ..., Tail>. Every group is loaded once per union slot and held
+// across the staged-row parts (no re-reads); the slot loop, staging and barriers are those of routes_product_rows_kernel.
+template <bool Packed>
+__device__ __forceinline__ Q2Held load_tp_tail(__amdgpu_buffer_rsrc_t rsrc, int row, unsigned group) {
+    Q2Held raw;
+    const int half = static_cast<int>(4U * q2_k_block_bytes);
+    // Packed: scales [0, 8), codes [8, 40), d and dmin [40, 44); else block 4 (scales [0, 16), codes [16, 80), dm at 80).
+    const int codes = Packed ? 8 : 16, dm = Packed ? 40 : 80;
+    const auto q0 = __builtin_amdgcn_raw_buffer_load_b128(rsrc, row + half + codes, 0, 0);
+    const auto q1 = __builtin_amdgcn_raw_buffer_load_b128(rsrc, row + half + codes + 16, 0, 0);
+#pragma unroll
+    for (unsigned k = 0; k < 4U; ++k) { raw.q[k] = q0[k]; raw.q[k + 4U] = q1[k]; }
+    raw.scales = __builtin_amdgcn_raw_buffer_load_b32(rsrc, row + half + static_cast<int>(2U * group), 0, 0);
+    raw.dm = __builtin_amdgcn_raw_buffer_load_b32(rsrc, row + half + dm, 0, 0);
+    return raw;
+}
+inline constexpr unsigned tp_down_width = 1152U, tp_down_groups = tp_down_width / 32U;
+template <unsigned MaxRows, unsigned W, unsigned Waves, bool Packed>
+__global__ __launch_bounds__(32U * Waves) void tp_down_kernel(RoutesProductView view) {
+    static_assert(W >= 1U && W <= 8U && tp_down_groups == 36U);
+    constexpr unsigned width = tp_down_width, groups = tp_down_groups, threads = 32U * Waves;
+    constexpr unsigned k_words = (width / 16U + threads - 1U) / threads;
+    extern __shared__ int4 staged[];
+    const unsigned slots = union_count(view.routes);
+    auto* lds_codes = reinterpret_cast<signed char*>(staged);
+    auto* lds_deltas = reinterpret_cast<float*>(lds_codes + static_cast<unsigned long long>(MaxRows) * width);
+    const unsigned wave = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x / 32U)));
+    const unsigned lane = threadIdx.x % 32U, first = (blockIdx.x * Waves + wave) * W;
+    const bool active = first < view.outputs;
+    const unsigned tail_group = lane % 4U, tail_row = min(first + min(lane / 4U, W - 1U), view.outputs - 1U);
+    for (unsigned j = blockIdx.y; j < slots; j += gridDim.y) {
+        const EntryRange range{view.routes.begins[j], view.routes.begins[j + 1U] - view.routes.begins[j], view.routes.experts[j]};
+        const EntryRange part0{range.begin, min(MaxRows, range.count), range.expert};
+        StageRegs<MaxRows, k_words> s;
+        stage_issue<MaxRows, k_words, threads>(view.routes, part0, view.codes, view.deltas, width, s);
+        const auto rsrc = weight_rsrc(static_cast<const unsigned char*>(view.weights) + range.expert * view.expert_stride_bytes);
+        Q2Held held[W];
+#pragma unroll
+        for (unsigned w = 0; w < W; ++w)
+            held[w] = load_held_group<WeightFormat::q2_k>(rsrc, static_cast<int>(min(first + w, view.outputs - 1U) * view.row_bytes), lane);
+        const Q2Held tail = load_tp_tail<Packed>(rsrc, static_cast<int>(tail_row * view.row_bytes), tail_group);
+        asm volatile("" ::: "memory");  // issued here, ahead of the staging stores and barrier
+        if (j != blockIdx.y) lds_barrier();
+        stage_store<MaxRows, k_words, threads>(part0, width, s, lds_codes, lds_deltas);
+        const auto part_product = [&](const EntryRange& part) {
+            if (!active) return;
+            float acc[W][MaxRows];
+#pragma unroll
+            for (unsigned w = 0; w < W; ++w)
+#pragma unroll
+                for (unsigned r = 0; r < MaxRows; ++r) acc[w][r] = 0.0F;
+            accumulate_group<WeightFormat::q2_k, MaxRows, W, 0U>(held, lane, lds_codes, lds_deltas, part.count, width, nullptr, nullptr, acc);
+            // The tail terms of accumulate_rows' second step (group 32 + l % 4 of row l / 4), one per lane.
+            float term[MaxRows];
+            {
+                const unsigned g = 32U + tail_group;
+                const auto q = decode_held(tail, 2U * tail_group);
+#pragma unroll
+                for (unsigned r = 0; r < MaxRows; ++r)
+                    if (r < part.count) {
+                        const auto* x = reinterpret_cast<const int4*>(lds_codes + static_cast<unsigned long long>(r) * width + 32U * g);
+                        const int4 x0 = x[0], x1 = x[1];
+                        const float delta = lds_deltas[r * groups + g];
+                        const int ones = 0x01010101;
+                        const int sx0 = unsigned_dot(ones, ones, ones, ones, x0.x, x0.y, x0.z, x0.w);
+                        const int sx1 = unsigned_dot(ones, ones, ones, ones, x1.x, x1.y, x1.z, x1.w);
+                        const int qx0 = unsigned_dot(q.w[0], q.w[1], q.w[2], q.w[3], x0.x, x0.y, x0.z, x0.w);
+                        const int qx1 = unsigned_dot(q.w[4], q.w[5], q.w[6], q.w[7], x1.x, x1.y, x1.z, x1.w);
+                        const int a = __mul24(static_cast<int>(q.scale0 & 15U), qx0) + __mul24(static_cast<int>(q.scale1 & 15U), qx1);
+                        const int b = __mul24(static_cast<int>(q.scale0 >> 4U), sx0) + __mul24(static_cast<int>(q.scale1 >> 4U), sx1);
+                        const float scaled = q.d * static_cast<float>(a);
+                        const float offset = q.dmin * static_cast<float>(b);
+                        term[r] = (scaled - offset) * delta;
+                    }
+            }
+#pragma unroll
+            for (unsigned w = 0; w < W; ++w)
+#pragma unroll
+                for (unsigned r = 0; r < MaxRows; ++r)
+                    if (r < part.count) {
+                        const float t = __shfl(term[r], static_cast<int>(4U * w + tail_group), 32);
+                        if (lane < 4U) acc[w][r] = acc[w][r] + t;
+                    }
+#pragma unroll
+            for (unsigned w = 0; w < W; ++w)
+#pragma unroll
+                for (unsigned r = 0; r < MaxRows; ++r)
+                    if (r < part.count) acc[w][r] = butterfly_sum(acc[w][r]);
+            if (lane != 0U) return;
+#pragma unroll
+            for (unsigned r = 0; r < MaxRows; ++r)
+                if (r < part.count) {
+                    const unsigned long long output = view.routes.outputs[part.begin + r];
+#pragma unroll
+                    for (unsigned w = 0; w < W; ++w)
+                        if (first + w < view.outputs) view.out[output * view.outputs + first + w] = acc[w][r];
+                }
+        };
+        part_product(part0);
+        for (unsigned chunk = MaxRows; chunk < range.count; chunk += MaxRows) {
+            const EntryRange part{range.begin + chunk, min(MaxRows, range.count - chunk), range.expert};
+            lds_barrier();
+            stage_rows_lds(view.routes, part, view.codes, view.deltas, width, lds_codes, lds_deltas);
+            part_product(part);
+        }
+    }
+}
+// STRIX_DS41_TP_DOWN_FORM=CW: at most C staged rows per part (1, 2, 4 or 8) and W rows per wave (2, 4 or 8; 32 / W waves
+// per block). Default 2 rows, W 8 (4 waves): the fastest at R1-R8 (expert-once bench --tp, layers 5/20/35, both ranks:
+// R6 down 251 -> 200 us per layer, R1 62 -> 58, R8 322 -> 248; cap 8 with W 8 is much slower).
+struct TpDownShape { unsigned cap = 2U, w = 8U; };
+TpDownShape tp_down_shape() {
+    TpDownShape s;
+    const int f = moe_kernel_tuning().tp_down_form;
+    if (f < 0) return s;
+    const auto c = static_cast<unsigned>(f / 10 % 10), w = static_cast<unsigned>(f % 10);
+    if (c == 1U || c == 2U || c == 4U || c == 8U) s.cap = c;
+    if (w == 2U || w == 4U || w == 8U) s.w = w;
+    return s;
+}
+template <unsigned MaxRows, unsigned W, bool Packed>
+void launch_tp_down(const RoutesProductView& view, hipStream_t stream) {
+    constexpr unsigned waves = 32U / W;
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(tp_down_kernel<MaxRows, W, waves, Packed>), dim3((view.outputs + 31U) / 32U, rows_grid_y(view.routes)),
+                       dim3(32U * waves), staged_bytes<MaxRows>(tp_down_width), stream, view);
+}
+template <unsigned MaxRows, bool Packed>
+void tp_down_w(const RoutesProductView& view, const TpDownShape& s, hipStream_t stream) {
+    if (s.w == 2U) launch_tp_down<MaxRows, 2U, Packed>(view, stream);
+    else if (s.w == 8U) launch_tp_down<MaxRows, 8U, Packed>(view, stream);
+    else launch_tp_down<MaxRows, 4U, Packed>(view, stream);
+}
+template <bool Packed>
+void tp_down_rows(const RoutesProductView& view, const TpDownShape& s, hipStream_t stream) {
+    const auto m = std::min(view.routes.max_rows, s.cap);
+    if (m <= 1U) tp_down_w<1, Packed>(view, s, stream);
+    else if (m <= 2U) tp_down_w<2, Packed>(view, s, stream);
+    else if (m <= 4U) tp_down_w<4, Packed>(view, s, stream);
+    else tp_down_w<8, Packed>(view, s, stream);
+}
+// The expert-TP down in the form above; false (nothing launched) when the flag is off or the shape is not 1152 wide.
+bool tp_down(const RoutesProductView& view, bool packed, hipStream_t stream) {
+    if (moe_kernel_tuning().tp_down <= 0 || view.width != tp_down_width) return false;
+    const auto s = tp_down_shape();
+    if (packed) tp_down_rows<true>(view, s, stream);
+    else tp_down_rows<false>(view, s, stream);
+    return true;
+}
+
 } // namespace
 
 MoeKernelTuning& moe_kernel_tuning() {
@@ -1305,6 +1979,10 @@ MoeKernelTuning& moe_kernel_tuning() {
         read("STRIX_DS41_MOE_PREFILL", t.prefill);
         read("STRIX_DS41_EXPERT_SLOTS", t.slots);
         read("STRIX_DS41_EXPERT_SLOTS_Y", t.slots_y);
+        read("STRIX_DS41_EXPERT_ROWS", t.rows);
+        read("STRIX_DS41_EXPERT_ROWS_FORM", t.rows_form);
+        read("STRIX_DS41_TP_DOWN", t.tp_down);
+        read("STRIX_DS41_TP_DOWN_FORM", t.tp_down_form);
         return t;
     }();
     return tuning;
@@ -1356,9 +2034,13 @@ void enqueue_routes_product(WeightFormat format, const RoutesProductView& view, 
     const auto elements = block_elements(format);
     if (!view.weights || !view.routes.experts || !view.routes.begins || !view.routes.inputs || !view.routes.outputs ||
         !view.codes || !view.deltas || !view.out || view.routes.expert_count == 0U || view.routes.max_rows == 0U ||
-        view.routes.max_rows > product_max_rows || view.width == 0U || view.width % elements != 0U || view.outputs == 0U ||
+        view.routes.max_rows > 16U || view.width == 0U || view.width % elements != 0U || view.outputs == 0U ||
         view.row_bytes != view.width / elements * block_bytes(format) || reinterpret_cast<std::uintptr_t>(view.codes) % 16U != 0U)
         throw std::invalid_argument("ds41 routes product view is inconsistent");
+    if (down_rows(format, view, static_cast<hipStream_t>(stream))) {
+        check(hipGetLastError(), "routes product launch");
+        return;
+    }
     // The Q8_0 product (or its requant packed forms) is the shared expert's down; the other formats are routed experts.
     const auto& tuning = moe_kernel_tuning();
     const bool shared = format == WeightFormat::q8_0 || format == WeightFormat::cb4 || format == WeightFormat::u5 || format == WeightFormat::u6;
@@ -1371,12 +2053,16 @@ void enqueue_routes_product_groups(WeightFormat format, const RoutesProductView&
     const std::uint64_t need = half_tail ? view.width / 256U * q2_k_block_bytes + 44U : (view.width + 255U) / 256U * q2_k_block_bytes;
     if (format != WeightFormat::q2_k || (half_tail && view.width % 256U != 128U) || view.row_bytes < need || !view.weights ||
         !view.routes.experts || !view.routes.begins || !view.routes.inputs || !view.routes.outputs || !view.codes || !view.deltas || !view.out || view.routes.expert_count == 0U || view.routes.max_rows == 0U ||
-        view.routes.max_rows > product_max_rows || view.width == 0U || view.width % 32U != 0U || view.outputs == 0U ||
+        view.routes.max_rows > 16U || view.width == 0U || view.width % 32U != 0U || view.outputs == 0U ||
         reinterpret_cast<std::uintptr_t>(view.codes) % 16U != 0U)
         throw std::invalid_argument("ds41 routes product (groups) view is inconsistent");
     int form = moe_kernel_tuning().routed;
     if (form < 0) form = default_product_form(format, view.routes.max_rows);
     const auto queue = static_cast<hipStream_t>(stream);
+    if (tp_down(view, half_tail, queue)) {
+        check(hipGetLastError(), "routes product (groups) launch");
+        return;
+    }
     if (half_tail) dispatch_routes_product<WeightFormat::q2_k, true>(view, form, view.routes.max_rows, view.routes.expert_count, 0U, 0U, queue);
     else routes_product(format, view, form, view.routes.max_rows, view.routes.expert_count, 0U, 0U, queue);
     check(hipGetLastError(), "routes product (groups) launch");
@@ -1386,10 +2072,14 @@ void enqueue_gate_up(WeightFormat format, const GateUpView& view, void* stream) 
     if (format == WeightFormat::q2_k || !view.gate || !view.up || !view.routes.experts || !view.routes.begins ||
         !view.routes.inputs || !view.routes.outputs || !view.codes || !view.deltas || !view.act_codes || !view.act_deltas ||
         !view.act_sums || (!view.gate_out) != (!view.up_out) || view.routes.expert_count == 0U || view.routes.max_rows == 0U ||
-        view.routes.max_rows > product_max_rows || view.hidden % elements != 0U || view.inter == 0U || view.inter % 32U != 0U ||
+        view.routes.max_rows > 16U || view.hidden % elements != 0U || view.inter == 0U || view.inter % 32U != 0U ||
         view.row_bytes != view.hidden / elements * block_bytes(format) || reinterpret_cast<std::uintptr_t>(view.codes) % 16U != 0U)
         throw std::invalid_argument("ds41 gate/up view is inconsistent");
     const auto queue = static_cast<hipStream_t>(stream);
+    if (gate_up_rows(format, view, queue)) {
+        check(hipGetLastError(), "gate/up launch");
+        return;
+    }
     // The Q8_0 gate/up is the shared expert's; the other formats are routed experts.
     const auto& tuning = moe_kernel_tuning();
     const bool shared = format == WeightFormat::q8_0 || format == WeightFormat::cb4 || format == WeightFormat::u5 ||
@@ -1413,6 +2103,19 @@ void enqueue_combine(const CombineView& view, void* stream) {
 }
 
 void enqueue_router(const RouterView& view, void* stream) {
+    if (view.rows > product_max_rows && view.rows <= 16U && view.x && view.scores && view.ids && view.weights) {
+        for (unsigned first = 0; first < view.rows; first += product_max_rows) {
+            RouterView part = view;
+            part.rows = std::min(product_max_rows, view.rows - first);
+            part.x += static_cast<std::size_t>(first) * view.hidden;
+            part.scores += static_cast<std::size_t>(first) * view.experts;
+            part.ids += static_cast<std::size_t>(first) * view.top_k;
+            part.weights += static_cast<std::size_t>(first) * view.top_k;
+            if (part.image_rows) part.image_rows += first;
+            enqueue_router(part, stream);
+        }
+        return;
+    }
     if (!view.x || !(view.weight || view.weight_bf16) || !view.bias || !view.scores || !view.ids || !view.weights || view.rows == 0U ||
         view.rows > product_max_rows || view.hidden == 0U || view.experts == 0U || view.experts > 1024U || view.top_k == 0U ||
         view.top_k > 16U || view.top_k > view.experts || (view.image_rows && !view.bias_image))
@@ -1486,11 +2189,13 @@ void enqueue_assemble_a8_halves(const std::int8_t* first_codes, const float* fir
 
 void enqueue_build_routes(const BuildRoutesView& view, void* stream) {
     if (!view.ids || !view.experts || !view.begins || !view.rows_out || !view.slots || !view.order || !view.low_counts ||
-        !view.counts || view.rows == 0U || view.top_k == 0U || view.rows * view.top_k > 64U || view.first >= view.end ||
+        !view.counts || view.rows == 0U || view.top_k == 0U || view.rows > 16U || view.top_k > 128U / view.rows || view.first >= view.end ||
         view.base > view.first)
         throw std::invalid_argument("ds41 build routes view is inconsistent");
     if (routes_fast_enabled()) { enqueue_build_routes_fast(view, stream); return; }  // STRIX_DS41_ROUTES_FAST=1, same outputs
-    hipLaunchKernelGGL(build_routes_kernel, dim3(1), dim3(64), 0, static_cast<hipStream_t>(stream), view);
+    if (view.rows * view.top_k > 64U)
+        enqueue_build_routes_wide_serial(view, stream);
+    else hipLaunchKernelGGL(build_routes_kernel, dim3(1), dim3(64), 0, static_cast<hipStream_t>(stream), view);
     check(hipGetLastError(), "build routes launch");
 }
 } // namespace strix::ds41

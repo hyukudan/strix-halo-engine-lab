@@ -1,4 +1,5 @@
 #include "strix/hip_known_prefix_window.hpp"
+#include "strix/dispatch_fuse.hpp"
 #include "strix/hip_mtp_target_window.hpp"
 #include "strix/hip_ple_launcher.hpp"
 
@@ -423,9 +424,9 @@ struct HipKnownPrefixWindow::Impl {
     //   output; STRIX_WINDOW_COMBINE_INJECT=1: a MoE-combine rows step, the MLP inject and the next HC rows step
     //   run as combine+inject+norm, split-K, output. The folded steps are recorded as completed without a launch.
     static bool env_on(const char* name) { const char* v = std::getenv(name); return v && v[0] == '1'; }
-    static bool inject_norm_enabled() { static const bool on = env_on("STRIX_WINDOW_INJECT_NORM"); return on; }
+    static bool inject_norm_enabled() { static const bool on = strix_fuse_switch("STRIX_WINDOW_INJECT_NORM"); return on; }
     static bool combine_inject_enabled() { static const bool on = env_on("STRIX_WINDOW_COMBINE_INJECT"); return on; }
-    static bool commit_combine_enabled() { static const bool on = env_on("STRIX_WINDOW_COMMIT_COMBINE"); return on; }
+    static bool commit_combine_enabled() { static const bool on = strix_fuse_switch("STRIX_WINDOW_COMMIT_COMBINE"); return on; }
     std::vector<std::size_t> folded_steps;
     bool hc_rows_step(std::size_t i) const {
         const auto op = serial.execution.steps[i].op;
@@ -491,8 +492,7 @@ struct HipKnownPrefixWindow::Impl {
     // launch at the inject step; the HC step is then recorded as completed without a launch.
     static bool hc_inject_fusion_enabled() {
         static const bool on = [] {
-            const char* p = std::getenv("STRIX_HC_PERSISTENT"); const char* i = std::getenv("STRIX_HC_PERSISTENT_INJECT");
-            return p && p[0] == '1' && i && i[0] == '1';
+            return strix_fuse_switch("STRIX_HC_PERSISTENT") && strix_fuse_switch("STRIX_HC_PERSISTENT_INJECT");
         }();
         return on;
     }
@@ -550,6 +550,7 @@ struct HipKnownPrefixWindow::Impl {
         gdn_config.virtual_q8_output_projection = config.virtual_q8_gdn_output;
         gdn_config.wave8_q8_output_projection = config.wave8_q8_gdn_output;
         gdn_config.dense_a8_projections = config.dense_a8;
+        gdn_config.dense_trellis_projections = numerical_profile_dense_trellis(config.numerical_profile);
         gdn_config.dense_f16_prefill = (config.fast_prefill_components & kFastPrefillDense) != 0U;
         gdn_config.dense_g64_prefill = (config.fast_prefill_components & kFastPrefillDense8) != 0U;
         r2_entries[0] = {KnownWindowR2Variant::shared_q8_virtual256_r2_v1, this,
@@ -719,9 +720,14 @@ struct HipKnownPrefixWindow::Impl {
         qsa_config.prefetch_stats=config.qsa_input_prefetch_stats;
         qsa_config.wave8_q8_output=config.wave8_q8_qsa_output;
         qsa_config.dense_a8_projections=config.dense_a8;
+        qsa_config.dense_trellis_projections=numerical_profile_dense_trellis(config.numerical_profile);
         qsa_config.dense_f16_prefill=(config.fast_prefill_components & kFastPrefillDense) != 0U;
         qsa_config.dense_g64_prefill=(config.fast_prefill_components & kFastPrefillDense8) != 0U;
         qsa_config.qsa_fast_prefill=(config.fast_prefill_components & kFastPrefillQsa) != 0U;
+        if(!prefill) {
+            const char* pool=std::getenv("STRIX_QKERN_QSA_PERSISTENT");
+            if(pool && pool[0]=='1') qsa_config.window_pool=make_hip_qsa_window_pool();
+        }
         qsa_fallback=qsa_config;
         qsa_fallback.prefetch_q8_input=false; qsa_fallback.prefetch_eligible_layers.clear();
         // One entry per QSA variant actually selected (layers may differ in indexer format).
@@ -898,6 +904,7 @@ struct HipKnownPrefixWindow::Impl {
         gdn_control()->pending_rows=0; gdn_deferred->pending=false;
     }
     void discard_deferred() {
+        invalidate_hip_qsa_window_pool(qsa_config.window_pool);
         if(!gdn_deferred || !gdn_deferred->pending) return;
         check(hipStreamSynchronize(scope.stream),"discard deferred GDN rows fence");
         gdn_control()->pending_rows=0; gdn_deferred->pending=false;
@@ -1233,13 +1240,35 @@ struct HipKnownPrefixWindow::Impl {
     }
     static bool cohort_wide_step(std::size_t i, std::span<CohortMember> members, bool all_chunked) {
         const auto mode = members[0].impl->window.mode[i];
+        const bool shared=mode==KnownWindowStepMode::shared_rows || mode==KnownWindowStepMode::r2_shared_q8;
         std::uint32_t total = 0;
         for (const auto& m : members) {
-            if (!m.run->wide_step(i) || m.impl->window.mode[i] != mode) return false;
+            const auto own=m.impl->window.mode[i];
+            if(shared) {
+                if(!m.run->promoted_step(i) || (own!=KnownWindowStepMode::shared_rows && own!=KnownWindowStepMode::r2_shared_q8)) return false;
+            } else if (!m.run->wide_step(i) || own != mode) return false;
             total += m.run->rows();
         }
         if (total < 9U || total > 32U) return false;
+        static const bool joint=[] {const char* v=std::getenv("STRIX_MTP_BATCH_JOINT");return v && v[0]=='1';}();
         switch (mode) {
+        case KnownWindowStepMode::moe_route_rows:
+            if(!joint) return false;
+            for(const auto& m:members) if(!m.impl->route_config.wave_topk || m.impl->route_config.hidden_size%64U) return false;
+            return cohort_wide_enabled("router");
+        case KnownWindowStepMode::hyper_mix_rows:
+            if(!joint) return false;
+            for(const auto& m:members) {
+                const auto& config=m.impl->hyper_for(m.run->step_rows(i));
+                if(!config.splitk_projection || !config.lane_chain_output) return false;
+            }
+            return cohort_wide_enabled("hyper");
+        case KnownWindowStepMode::r2_shared_q8:
+        case KnownWindowStepMode::shared_rows:
+            if(!joint) return false;
+            if(!cohort_shared_expert_enabled() || !cohort_wide_enabled("shared")) return false;
+            for(const auto& m:members) if(!m.impl->shared_for(m.run->step_rows(i)).dense_a8_projections) return false;
+            return true;
         case KnownWindowStepMode::gdn_deferred_rows:
             // 16 / 32 rows: dense A8 projections only (gdn_window_cohort_enqueue).
             for (const auto& m : members) if (!m.impl->gdn_window_config.gdn.dense_a8_projections) return false;
@@ -1273,6 +1302,26 @@ struct HipKnownPrefixWindow::Impl {
     static void launch_cohort_wide(std::size_t i, std::span<CohortMember> members) {
         const KnownWindowCohortScope cohort;
         switch (members[0].impl->window.mode[i]) {
+        case KnownWindowStepMode::moe_route_rows: {
+            std::vector<std::span<const ExecutionDispatchContext>> segments;
+            for(const auto& m:members) segments.push_back(m.run->step_rows(i));
+            moe_route_known_window_cohort_launch(segments,members[0].impl->route_config);
+            break;
+        }
+        case KnownWindowStepMode::hyper_mix_rows: {
+            std::vector<std::span<const ExecutionDispatchContext>> segments;
+            for(const auto& m:members) segments.push_back(m.run->step_rows(i));
+            hyper_mix_known_window_cohort_launch(segments,members[0].impl->hyper_for(segments[0]));
+            break;
+        }
+        case KnownWindowStepMode::r2_shared_q8:
+        case KnownWindowStepMode::shared_rows: {
+            std::vector<std::span<const ExecutionDispatchContext>> segments;
+            for(const auto& m:members) segments.push_back(m.run->step_rows(i));
+            shared_expert_known_window_cohort_launch(segments,members[0].impl->shared_for(segments[0]),
+                members[0].impl->scope.stream,0U,0U);
+            break;
+        }
         case KnownWindowStepMode::routed_expert_union: {
             std::vector<ExecutionDispatchContext> all;
             for (const auto& m : members) { const auto rows = m.run->step_rows(i); all.insert(all.end(), rows.begin(), rows.end()); }
@@ -1506,6 +1555,7 @@ struct HipKnownPrefixWindow::Impl {
                     };
                 hooks.preflight_memo = &self.preflight_memo; hooks.recipe_memo = &self.recipe_memo;
                 hooks.preflight_slots = &self.preflight_slots; hooks.arena_index = &self.arena_index;
+                hooks.after_step=self.window_observer;
             }
             auto& lead = *members[0].impl;
             std::optional<ValidatedModelBindingScope> binding;
@@ -1528,7 +1578,14 @@ struct HipKnownPrefixWindow::Impl {
             static const bool wide_log = std::getenv("STRIX_COHORT_WIDE_LOG") != nullptr;
             static std::atomic<std::uint64_t> wide_calls{0};
             const auto call = wide_log ? wide_calls.fetch_add(1U) : 0U;
-            const bool log_call = wide_log && (call < 4U || call % 256U == 0U);
+            const bool log_call = wide_log && (std::getenv("STRIX_COHORT_WIDE_LOG")[0]=='2' || call < 4U || call % 256U == 0U);
+            const auto observe=[](CohortMember& m,std::size_t step) {
+                if(m.impl->window_observer) m.impl->window_observer(step,[&](std::uint32_t row) {
+                    const auto rows=m.run->step_rows(step);
+                    if(row>=rows.size()) throw std::invalid_argument("cohort observer row is outside its session");
+                    return rows[row];
+                });
+            };
             std::uint32_t wide_count = 0, shared_count = 0, own_count = 0;
             std::uint32_t wide_union_rows = 0; // rows of the last wide union (set per union step, all equal)
             bool all_chunked = true;
@@ -1551,7 +1608,7 @@ struct HipKnownPrefixWindow::Impl {
                         wide_union_rows = 0;
                         for (const auto& m : members) wide_union_rows += m.run->rows();
                     }
-                    for (auto& m : members) m.run->record_external_step(i);
+                    for (auto& m : members) {m.run->record_external_step(i);observe(m,i);}
                     continue;
                 }
                 for (std::size_t c = 0; c < chunks.size(); ++c) {
@@ -1564,7 +1621,7 @@ struct HipKnownPrefixWindow::Impl {
                             if (primary->window.mode[i] == KnownWindowStepMode::routed_expert_union) union_ran[c] = 1;
                             primary->launch_cohort_shared(i, chunk.members);
                         }
-                        for (auto& m : chunk.members) m.run->record_external_step(i);
+                        for (auto& m : chunk.members) {m.run->record_external_step(i);observe(m,i);}
                         ++shared_count;
                         continue;
                     }

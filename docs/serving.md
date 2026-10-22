@@ -85,6 +85,9 @@ window stream shared by all slots. The calibration replay runs once.
   `STRIX_COHORT_ROWS=16 STRIX_COHORT_WIDE=all` runs the cycle as one group of up to 16 rows whose GDN/QSA
   projections, LM head and expert union run once for all rows (D-052,
   [multi-request cohort](multi-request-cohort.md#global-row-budget-and-wide-steps-opt-in)).
+  The experimental `STRIX_MTP_BATCH_JOINT=1` replaces that fixed per-request cap
+  with a joint cost-based choice and supports shared dense steps through 32
+  rows; see [joint serving windows](joint-serving-windows.md). It is off by default.
 - A request leaves its slot when it ends (stop token, budget, context, stop string, disconnect), without stopping the
   others; its slot is free for the next queued request.
 - Greedy requests return exactly the tokens they return alone (and on the one-at-a-time route): every request keeps
@@ -187,6 +190,10 @@ encode|plain|decode FILE` exposes the tokenizer on the command line.
   interleaved with the decode cycles, not batched with each other). With more than four decoding requests a cycle
   forms two or more 8-row cohort windows (two rows per request), so the aggregate rate stays near that of four.
 - Every slot holds a full context of state memory and its own window owners; memory grows with N.
+- Each request resets the adaptive min-p, depth or survival controller to its configured prior, retaining
+  the slot's device owners. Previous requests' acceptance estimates and scheduler-dependent cycle costs
+  do not set the new request's draft depth. `STRIX_MTP_REQUEST_RESET=0` retains the earlier policy history
+  for controlled comparisons. Target verification continues to decide every token and committed state.
 - The window controller switches (`STRIX_MTP_CONTROLLER=survival`, `STRIX_MTP_ACTIVE_ROWS=1`,
   `STRIX_MTP_DRAFT_VOCAB=2`, the window folds) apply to served requests as on the command line. The draft
   vocabulary is chosen per request from that request's prompt.

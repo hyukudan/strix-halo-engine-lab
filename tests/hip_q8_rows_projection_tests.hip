@@ -72,7 +72,7 @@ std::pair<std::uint32_t, std::uint32_t> model_shape(Site s) {
     default: return {640U, 2560U};
     }
 }
-enum class Mode { rows, rows_a8, row_loop };
+enum class Mode { rows, rows_a8, row_loop, shared_a8_reference, shared_a8_narrow };
 
 std::uint16_t bf16(float value) {
     auto bits = std::bit_cast<std::uint32_t>(value);
@@ -159,7 +159,9 @@ struct Fixture {
                 if (site == Site::shared_down) g.push_back({gate[r]->address, gate[r]->bytes});
             }
             launch_hip_shared_rows_projection_probe(site == Site::shared_down ? HipSharedQ8ProjectionRole::down : HipSharedQ8ProjectionRole::gate_up,
-                mode == Mode::rows ? HipSharedRowsProbeMode::rows : mode == Mode::rows_a8 ? HipSharedRowsProbeMode::rows_a8 : HipSharedRowsProbeMode::row_loop,
+                mode == Mode::rows ? HipSharedRowsProbeMode::rows : mode == Mode::rows_a8 ? HipSharedRowsProbeMode::rows_a8 :
+                mode == Mode::shared_a8_reference ? HipSharedRowsProbeMode::rows_a8_reference :
+                mode == Mode::shared_a8_narrow ? HipSharedRowsProbeMode::rows_a8_narrow : HipSharedRowsProbeMode::row_loop,
                 x, {weights.address, weights.bytes}, g, y, width, outputs, stream);
         }
     }
@@ -281,6 +283,36 @@ float median_us(const Fixture& f, Mode mode, bool cold, const Buffer& flush, hip
     std::sort(samples.begin(), samples.end());
     return samples[samples.size() / 2U];
 }
+void shared_down_r8_cases(hipStream_t stream) {
+    unsigned cases = 0;
+    // Includes partial output waves, unusual Q8 scales/codes, nonfinite inputs,
+    // and the production shape. Compare full BF16 payloads, never a tolerance.
+    for (const unsigned outputs : {1U, 7U, 9U, 33U, 2560U, 2563U}) {
+        Fixture f(Site::shared_down, 8U, 640U, outputs);
+        for (unsigned flavor = 0; flavor < 4U; ++flavor) {
+            f.prepare(flavor);
+            const auto reference = f.run(Mode::shared_a8_reference, stream);
+            for (unsigned repeat = 0; repeat < 3U; ++repeat)
+                require(f.run(Mode::shared_a8_narrow, stream) == reference, "shared down R8 A8 organization changed output bits");
+            ++cases;
+        }
+    }
+    std::cout << "shared down R8 A8 narrow bitwise PASS " << cases << " cases x3 repeats\n";
+    if (std::getenv("STRIX_Q8_ROWS_BENCH")) {
+        Buffer flush(256ULL << 20U);
+        check(hipMemset(reinterpret_cast<void*>(flush.address), 1, flush.bytes), "init flush");
+        Fixture f(Site::shared_down, 8U, 640U, 2560U); f.prepare(0);
+        for (const bool cold : {false, true})
+            for (unsigned pair = 0; pair < 3U; ++pair) {
+                const auto a = pair & 1U ? Mode::shared_a8_narrow : Mode::shared_a8_reference;
+                const auto b = pair & 1U ? Mode::shared_a8_reference : Mode::shared_a8_narrow;
+                const auto first = median_us(f, a, cold, flush, stream), second = median_us(f, b, cold, flush, stream);
+                std::cout << "shared-down-r8 " << (cold ? "cold" : "warm") << " pair=" << pair
+                          << " reference_us=" << (pair & 1U ? second : first)
+                          << " narrow_us=" << (pair & 1U ? first : second) << '\n';
+            }
+    }
+}
 } // namespace
 
 // Prefill shapes of the wide (T > 8) windows: GDN qkv+z 12288 + 6144, QSA q 12288 + 512 + 512.
@@ -333,6 +365,11 @@ int main() try {
     hipStream_t stream = nullptr;
     check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create stream");
     std::uint32_t cases = 0;
+    shared_down_r8_cases(stream);
+    if (std::getenv("STRIX_SHARED_DOWN_R8_ONLY")) {
+        check(hipStreamDestroy(stream), "destroy stream");
+        return 0;
+    }
     // STRIX_Q8_ROWS_WIDE_ONLY=1: only the T = 16/32/64 checks (and their benchmark).
     if (std::getenv("STRIX_Q8_ROWS_WIDE_ONLY")) {
         if (!std::getenv("STRIX_Q8_ROWS_BENCH_ONLY")) {

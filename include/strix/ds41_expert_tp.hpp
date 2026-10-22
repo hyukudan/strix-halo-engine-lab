@@ -36,11 +36,20 @@ inline constexpr std::uint64_t down_row_bytes = down_blocks * q2_k_block_bytes; 
 inline constexpr std::uint64_t half_block_bytes = 44;  // packed half block: scales 8, codes 32, d, dmin
 inline constexpr std::uint64_t down_row_bytes_packed = 4U * q2_k_block_bytes + half_block_bytes;  // 380
 
-// STRIX_DS41_EXPERT_TP=1 (read once).
+// STRIX_DS41_EXPERT_TP=1 (read once): the flag set explicitly (the CPU host forward and the tests follow only this).
 [[nodiscard]] bool enabled_from_env();
+// The decode forwards' choice (DeviceForward, BatchForward), default on since P16: STRIX_DS41_EXPERT_TP=1 on (the
+// caller rejects an unsuitable model or layout), =0 off, unset = the default when the layout allows it (two ranks,
+// resident experts, I = 2304). The prefill keeps the expert-parallel identity (ds41-prefill-ep+decode-tp).
+[[nodiscard]] bool decode_enabled(std::uint32_t world, std::uint32_t moe_inter, bool stream_experts);
+// The default for an unset STRIX_DS41_EXPERT_TP (true; serve sets false: its device prefill reads the decode weights in place).
+void set_decode_default(bool on);
 // Down-row storage on the device (read once): the packed half-block rows (380 B, default) or, with
 // STRIX_DS41_EXPERT_TP_LAYOUT=dup, the duplicated boundary block (420 B). Same group values, same bits.
 [[nodiscard]] bool packed_from_env();
+// Overrides the layout before any load (1 packed, 0 dup, -1 the environment): the expert-TP device prefill reads the
+// dup rows (whole Q2_K blocks), so a server with expert TP and the device prefill loads them in that layout.
+void set_packed(int mode);
 [[nodiscard]] inline std::uint64_t device_down_row_bytes() { return packed_from_env() ? down_row_bytes_packed : down_row_bytes; }
 
 // Global intermediate index of local index j of a rank (the table above).

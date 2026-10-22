@@ -52,6 +52,9 @@ public:
     // Wall time from the previous verified cycle to the end of this one (owner or `serial`, emitted > 0).
     // An owner's first window pays one-time admission and first touch: it is not a sample.
     void observe(std::size_t owner,std::size_t emitted,double ms);
+    // A new request starts with the configured prior, not a previous workload's
+    // acceptance bins, cycle costs or exploration history.
+    void begin_session();
     [[nodiscard]] std::vector<OwnerStats> owner_stats() const; // serial first (rows 1), then the owners
     [[nodiscard]] MtpWindowCostEstimate::Model model() const noexcept {return model_;}
 private:

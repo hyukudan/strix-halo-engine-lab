@@ -589,7 +589,7 @@ void test_synthetic_windows() {
     std::vector<std::uint8_t> storage[3];
     {
         const DeviceExperts e(synthetic_experts(WeightFormat::iq2_xxs, WeightFormat::q2_k, 16, 512, 256, storage, 31));
-        for (const std::uint32_t rows : {1U, 2U, 3U, 5U, 8U}) check_window(e, window_case(rows, 6, 16, 512, rows % 2U ? 0U : 3U, 40U + rows), 8U, "synthetic IQ2_XXS/Q2_K window");
+        for (const std::uint32_t rows : {1U, 2U, 3U, 5U, 8U, 9U, 12U, 16U}) check_window(e, window_case(rows, 6, 16, 512, rows % 2U ? 0U : 3U, 40U + rows), 8U, "synthetic IQ2_XXS/Q2_K window");
     }
     {
         const DeviceExperts e(synthetic_experts(WeightFormat::mxfp4, WeightFormat::mxfp4, 12, 512, 256, storage, 51));
@@ -626,6 +626,34 @@ void test_real_windows(const std::string& q2, const std::string& dspark) {
         check_window(e, window_case(1, 3, 128, e.host.hidden, 0, 81), 64U, "real mtp.0 window");
         check_window(e, window_case(6, 3, 128, e.host.hidden, 1, 82), 64U, "real mtp.0 window");
     }
+}
+
+// STRIX_DS41_EXPERT_ROWS: the held-groups routed gate/up (IQ2_XXS) and down (Q2_K) against the host reference,
+// over shapes (STRIX_DS41_EXPERT_ROWS_FORM, QGDABS digits: down steps ahead, caps, waves, signs), including caps
+// below the window's rows (experts done in parts) and partial last steps (synthetic widths, the model's down).
+void test_held_windows(const std::string& q2) {
+    using strix::ds41::WeightFormat;
+    auto& tuning = strix::ds41::moe_kernel_tuning();
+    const auto saved = tuning;
+    std::vector<std::uint8_t> storage[3];
+    {
+        const DeviceExperts e(synthetic_experts(WeightFormat::iq2_xxs, WeightFormat::q2_k, 16, 512, 256, storage, 31));
+        for (const int form : {-1, 311111, 122111, 388111})
+            for (const std::uint32_t rows : {1U, 2U, 3U, 5U, 8U}) {
+                tuning = saved; tuning.rows = 1; tuning.rows_form = form;
+                check_window(e, window_case(rows, 6, 16, 512, rows % 2U ? 0U : 3U, 40U + rows), 8U,
+                             "held form " + std::to_string(form) + " synthetic window");
+            }
+    }
+    if (!q2.empty()) {
+        const DeviceExperts e(file_experts(q2, "blk.20.", storage));
+        for (const int form : {-1, 111111, 322222, 388221, 144112, 312212})
+            for (const auto& [rows, common, seed] : {std::tuple{1U, 0U, 71U}, std::tuple{3U, 2U, 72U}, std::tuple{8U, 4U, 73U}}) {
+                tuning = saved; tuning.rows = 1; tuning.rows_form = form;
+                check_window(e, window_case(rows, 6, 384, e.host.hidden, common, seed), 192U, "held form " + std::to_string(form) + " real blk.20 window");
+            }
+    }
+    tuning = saved;
 }
 
 // ---- Cold timings ----
@@ -769,7 +797,7 @@ struct DeviceBuiltRoutes {
 void test_device_routes() {
     using namespace strix::ds41;
     std::size_t bad = 0, cases = 0;
-    for (const std::uint32_t rows : {1U, 2U, 3U, 6U, 8U})
+    for (const std::uint32_t rows : {1U, 2U, 3U, 6U, 8U, 9U, 10U, 11U, 12U, 13U, 14U, 15U, 16U})
         for (const std::uint32_t common : {0U, 3U, 6U})
             for (const std::uint32_t half : {0U, 1U, 2U}) {
                 const auto c = window_case(rows, 6U, 384U, 512U, common, 500U + rows * 7U + common);
@@ -1360,6 +1388,7 @@ int main() try {
     test_synthetic_windows();
     test_device_routes();
     test_real_windows(q2 ? q2 : "", dspark ? dspark : "");
+    test_held_windows(q2 ? q2 : "");
     test_real_layers(q2 ? q2 : "", dspark ? dspark : "");
     if (const char* bench = std::getenv("STRIX_DS41_BENCH"); bench && *bench == '1') {
         std::vector<std::uint8_t> storage[3];

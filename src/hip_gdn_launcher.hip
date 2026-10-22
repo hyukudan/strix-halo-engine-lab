@@ -3,6 +3,7 @@
 #include "strix/hip_gdn_lm_wave8_diagnostic.hpp"
 #endif
 #include "strix/hip_gdn_launcher.hpp"
+#include "strix/qpersist.hpp"
 #include "strix/known_window_cohort.hpp"
 #include "hip_q8_rows_gemv.hpp"
 #include "strix/hip_gdn_islands.hpp"
@@ -200,6 +201,11 @@ std::uint32_t checked_u32(
 
 void validate_config(
     const HipGdnLauncherConfig& config) {
+    if (config.dense_trellis_projections && (!config.dense_a8_projections || config.enable_device_graph_inputs))
+        throw std::invalid_argument("dense trellis GDN requires its eager dense-A8 parent recipe");
+#if !defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    if (config.dense_trellis_projections) throw std::invalid_argument("dense trellis runtime is disabled in this build");
+#endif
     if (const auto error =
             config.model.validate();
         !error.empty()) {
@@ -1041,6 +1047,7 @@ __device__ __forceinline__ float gdn_rows_tree_add(float lower, float upper) {
 }
 // qkv, z (and Q8 beta/alpha) segments from BF16 rows to BF16-rounded FP32 workspaces.
 template <unsigned Rows> struct GdnInputRowsSite {
+    static constexpr bool dense_trellis_inputs = true;
     using Input = std::uint16_t;
     static constexpr unsigned rows = Rows;
     static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)
@@ -2258,7 +2265,36 @@ template <std::uint32_t Columns> struct GdnWindowInputsT { float key[4], query[4
 using GdnWindowInputs = GdnWindowInputsT<kGdnWindowColumns>;
 // Columns: value columns per wave (8, or 4/2 with STRIX_GDN_WINDOW_COLUMNS: more waves, shorter per-wave chains;
 // every column's arithmetic is the same).
-template <bool Output, std::uint32_t Columns = kGdnWindowColumns>
+template <unsigned Distance, unsigned Count>
+__device__ __forceinline__ void gdn_window_scatter(float* sums, unsigned lane) {
+#pragma unroll
+    for (unsigned c = 0; c < Count / 2U; ++c) {
+        const bool upper = (lane & Distance) != 0U;
+        const float local = sums[2U * c + (upper ? 1U : 0U)];
+        const float peer = __shfl_xor(sums[2U * c + (upper ? 0U : 1U)], Distance);
+        // Always add the lower-key subtree first, including in upper lanes.
+        sums[c] = upper ? gdn_window_add(peer, local) : gdn_window_add(local, peer);
+    }
+}
+template <unsigned Columns>
+__device__ __forceinline__ void gdn_window_sums(float (&sums)[Columns]) {
+    const auto lane = static_cast<unsigned>(threadIdx.x) & 31U;
+    static_assert(Columns == 4U || Columns == 8U);
+    gdn_window_scatter<16U, Columns>(sums, lane);
+    gdn_window_scatter<8U, Columns / 2U>(sums, lane);
+    if constexpr (Columns == 8U) gdn_window_scatter<4U, 2U>(sums, lane);
+    float sum = sums[0];
+    if constexpr (Columns == 4U) sum = gdn_window_add(sum, gdn_window_down<4U>(sum));
+    sum = gdn_window_add(sum, gdn_window_down<2U>(sum));
+    sum = gdn_window_add(sum, gdn_window_down<1U>(sum));
+#pragma unroll
+    for (unsigned c = 0; c < Columns; ++c) {
+        const auto root = (c & 1U) * 16U + (c & 2U) * 4U + (c & 4U);
+        sums[c] = __shfl(sum, static_cast<int>(root));
+    }
+}
+
+template <bool Output, std::uint32_t Columns = kGdnWindowColumns, bool Scatter = false>
 __device__ __forceinline__ void gdn_window_step(float (&retained)[4][Columns], const GdnWindowInputsT<Columns>& in,
     float* core) {
     float deltas[Columns];
@@ -2271,8 +2307,16 @@ __device__ __forceinline__ void gdn_window_step(float (&retained)[4][Columns], c
             retained[part][column] = retained[part][column] * decay;
             products[part] = retained[part][column] * in.key[part];
         }
-        deltas[column] = (in.value[column] - gdn_window_key_sum(products)) * in.beta;
+        if constexpr (Scatter)
+            deltas[column] = gdn_window_add(gdn_window_add(products[0], products[2]), gdn_window_add(products[1], products[3]));
+        else deltas[column] = (in.value[column] - gdn_window_key_sum(products)) * in.beta;
     }
+    if constexpr (Scatter) {
+        gdn_window_sums(deltas);
+#pragma unroll
+        for (unsigned c = 0; c < Columns; ++c) deltas[c] = (in.value[c] - deltas[c]) * in.beta;
+    }
+    float output[Columns];
 #pragma unroll
     for (std::uint32_t column = 0; column < Columns; ++column) {
         float products[4];
@@ -2282,19 +2326,36 @@ __device__ __forceinline__ void gdn_window_step(float (&retained)[4][Columns], c
             products[part] = retained[part][column] * in.query[part];
         }
         if constexpr (Output) {
-            const float sum = gdn_window_key_sum(products);
-            if ((threadIdx.x & 31U) == 0U) core[column] = sum;
+            if constexpr (Scatter)
+                output[column] = gdn_window_add(gdn_window_add(products[0], products[2]), gdn_window_add(products[1], products[3]));
+            else {
+                const float sum = gdn_window_key_sum(products);
+                if ((threadIdx.x & 31U) == 0U) core[column] = sum;
+            }
         }
+    }
+    if constexpr (Output && Scatter) {
+        gdn_window_sums(output);
+        if ((threadIdx.x & 31U) == 0U)
+#pragma unroll
+            for (unsigned c = 0; c < Columns; ++c) core[c] = output[c];
     }
 }
 // Read the tile once, apply the pending rows and write it once (if any), then
 // run the window rows in registers. Row inputs are loaded ahead of their step.
-template <unsigned Rows, GdnRecurrentStorage Storage, std::uint32_t Columns = kGdnWindowColumns>
+template <unsigned Rows, GdnRecurrentStorage Storage, std::uint32_t Columns = kGdnWindowColumns, bool Scatter = false,
+    bool WholeHead = false>
 __device__ __forceinline__ void gdn_window_recurrence(const GdnWindowRows<Rows ? Rows : 1U>& rows, float* state,
     const GdnWindowSaved& saved, const GdnWindowControl* control, std::uint32_t key_heads, std::uint32_t head_dim) {
-    const auto lane = static_cast<std::uint32_t>(threadIdx.x), tiles = head_dim / Columns;
-    const auto value_head = static_cast<std::uint32_t>(blockIdx.x) / tiles;
-    const auto value_base = static_cast<std::uint32_t>(blockIdx.x) % tiles * Columns;
+    const auto lane = WholeHead ? static_cast<std::uint32_t>(threadIdx.x) & 31U : static_cast<std::uint32_t>(threadIdx.x);
+    const auto tiles = head_dim / Columns;
+    const auto raw_tile = WholeHead ? static_cast<std::uint32_t>(blockIdx.x) * tiles + static_cast<std::uint32_t>(threadIdx.x) / 32U :
+        static_cast<std::uint32_t>(blockIdx.x);
+    // Each complete wave owns one tile. Make that wave-uniform address explicit
+    // so its row values, beta and gate retain the incumbent scalar placement.
+    const auto tile = WholeHead ? static_cast<std::uint32_t>(__builtin_amdgcn_readfirstlane(static_cast<int>(raw_tile))) : raw_tile;
+    const auto value_head = tile / tiles;
+    const auto value_base = tile % tiles * Columns;
     const auto key_offset = value_head % key_heads * head_dim, key_width = key_heads * head_dim;
     const auto value_offset = static_cast<std::uint64_t>(value_head) * head_dim + value_base;
     const auto load = [&](const float* key, const float* query, const float* value, float beta, float gate) {
@@ -2315,14 +2376,15 @@ __device__ __forceinline__ void gdn_window_recurrence(const GdnWindowRows<Rows ?
             gdn_saved<const float>(saved, slot, row, saved.beta)[value_head],
             gdn_saved<const float>(saved, slot, row, saved.gate)[value_head]);
     };
+    const auto window_inputs = [&](unsigned row) {
+        const float* qkv = rows.qkv[row];
+        return load(qkv + key_width + key_offset, qkv + key_offset, qkv + key_width * 2U + value_offset,
+            rows.beta[row][value_head], rows.gate[row][value_head]);
+    };
     GdnWindowInputsT<Columns> window[Rows ? Rows : 1U];
-    if constexpr (Rows != 0U) {
+    if constexpr (Rows != 0U && !Scatter) {
 #pragma unroll
-        for (unsigned row = 0; row < Rows; ++row) {
-            const float* qkv = rows.qkv[row];
-            window[row] = load(qkv + key_width + key_offset, qkv + key_offset, qkv + key_width * 2U + value_offset,
-                rows.beta[row][value_head], rows.gate[row][value_head]);
-        }
+        for (unsigned row = 0; row < Rows; ++row) window[row] = window_inputs(row);
     }
     float retained[4][Columns];
 #pragma unroll
@@ -2336,7 +2398,7 @@ __device__ __forceinline__ void gdn_window_recurrence(const GdnWindowRows<Rows ?
         for (std::uint32_t row = 0; row < pending; ++row) {
             const auto in = next;
             if (row + 1U < pending) next = pending_inputs(slot, row + 1U);
-            gdn_window_step<false, Columns>(retained, in, nullptr);
+            gdn_window_step<false, Columns, Scatter>(retained, in, nullptr);
         }
 #pragma unroll
         for (std::uint32_t part = 0; part < 4U; ++part)
@@ -2346,8 +2408,16 @@ __device__ __forceinline__ void gdn_window_recurrence(const GdnWindowRows<Rows ?
                     retained[part][column];
     }
     if constexpr (Rows != 0U) {
+        if constexpr (Scatter) {
+            // Keep only the current row's inputs live next to the scatter
+            // accumulators. Preloading all eight rows raises VGPR pressure.
+#pragma unroll 1
+            for (unsigned row = 0; row < Rows; ++row)
+                gdn_window_step<true, Columns, true>(retained, window_inputs(row), rows.core[row] + value_offset);
+        } else {
 #pragma unroll
-        for (unsigned row = 0; row < Rows; ++row) gdn_window_step<true, Columns>(retained, window[row], rows.core[row] + value_offset);
+        for (unsigned row = 0; row < Rows; ++row) gdn_window_step<true, Columns, Scatter>(retained, window[row], rows.core[row] + value_offset);
+        }
     }
 }
 // STRIX_GDN_WINDOW_TILED=1 (key-value storage): one block of 32/Columns waves per (value head, 32 columns). The block
@@ -2428,11 +2498,11 @@ void gdn_window_recurrent_tiled_kernel(GdnWindowRows<Rows> rows, float* state, G
 #pragma unroll
     for (unsigned row = 0; row < Rows; ++row) gdn_window_step<true, Columns>(retained, window[row], rows.core[row] + value_offset);
 }
-template <unsigned Rows, GdnRecurrentStorage Storage, std::uint32_t Columns = kGdnWindowColumns>
+template <unsigned Rows, GdnRecurrentStorage Storage, std::uint32_t Columns = kGdnWindowColumns, bool Scatter = false>
 __global__ __launch_bounds__(32)
 void gdn_window_recurrent_kernel(GdnWindowRows<Rows> rows, float* state, GdnWindowSaved saved,
     const GdnWindowControl* control, std::uint32_t key_heads, std::uint32_t head_dim) {
-    gdn_window_recurrence<Rows, Storage, Columns>(rows, state, saved, control, key_heads, head_dim);
+    gdn_window_recurrence<Rows, Storage, Columns, Scatter>(rows, state, saved, control, key_heads, head_dim);
 }
 template <GdnRecurrentStorage Storage, std::uint32_t Columns>
 __global__ __launch_bounds__(32)
@@ -2496,6 +2566,34 @@ void gdn_window_norm_dense_a8_kernel(GdnWindowRows<Rows> rows, const void* norm_
     core[index] = result;
     q8_rows::dense_a8_quantize_lane(result, a8_codes + static_cast<std::uint64_t>(row) * a8_width + index,
         a8_deltas + (index / 32U) * q8_rows::kDenseA8Rows + row);
+}
+// Sixteen independent recurrence waves own all 128 value columns of one head.
+// They keep the incumbent tile/leaf arithmetic and physical stores. A local
+// barrier then replaces the launch boundary before the same 128-leaf norm.
+// The norm's surplus lanes write only unused LDS entries and join every barrier.
+template <unsigned Rows, GdnRecurrentStorage Storage, bool Dense>
+__global__ __launch_bounds__(512)
+void gdn_window_recurrent_norm_kernel(GdnWindowRows<Rows> rows, float* state, GdnWindowSaved saved,
+    const GdnWindowControl* control, std::uint32_t key_heads, const void* norm_weights, SmallWeightKind norm_kind,
+    float epsilon, std::int8_t* a8_codes, float* a8_deltas, std::uint32_t a8_width) {
+    constexpr std::uint32_t head_dim = 128U;
+    gdn_window_recurrence<Rows, Storage, 8U, false, true>(rows, state, saved, control, key_heads, head_dim);
+    __syncthreads();
+    __shared__ float scratch[512];
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
+    const auto index = static_cast<std::uint64_t>(blockIdx.x) * head_dim + lane;
+    for (unsigned row = 0; row < Rows; ++row) {
+        const float value = lane < head_dim ? rows.core[row][index] : 0.0F;
+        const float inv = rsqrtf(gdn_window_sum128(scratch, lane, value * value) / static_cast<float>(head_dim) + epsilon);
+        if (lane < head_dim) {
+            const float gate_value = 1.0F / (1.0F + expf(-rows.z[row][index]));
+            const float result = value * inv * load_small(norm_weights, norm_kind, lane) * gate_value;
+            rows.core[row][index] = result;
+            if constexpr (Dense)
+                q8_rows::dense_a8_quantize_lane(result, a8_codes + static_cast<std::uint64_t>(row) * a8_width + index,
+                    a8_deltas + (index / 32U) * q8_rows::kDenseA8Rows + row);
+        }
+    }
 }
 // Batched F32 beta/alpha projections: per row the legacy 256-leaf chain and tree.
 template <unsigned Rows>
@@ -4128,6 +4226,9 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
 
 void launch_gdn(const ExecutionDispatchContext& context, void* user_data) {
     const auto prepared = prepare_gdn_launch(context, static_cast<const HipGdnLauncherConfig*>(user_data));
+#if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    HipDenseTrellisScope arithmetic(static_cast<const HipGdnLauncherConfig*>(user_data)->dense_trellis_projections);
+#endif
     const auto* graph = current_hip_launch_context();
     emit_gdn_sequence(prepared, *static_cast<const HipGdnLauncherConfig*>(user_data),
         {hip_execution_stream(), hip_graph_status(), hip_graph_position(),
@@ -4167,6 +4268,7 @@ std::string kernel_id(
         (config.wave8_q8_input_projections ? std::string(q8_projection_organization::gdn_wave8_marker) : "") +
         (config.wave8_q8_output_projection ? std::string(q8_projection_organization::gdn_output_wave8_marker) : "") +
         (config.dense_a8_projections ? std::string(q8_projection_organization::dense_a8_marker) : "") +
+        (config.dense_trellis_projections ? ".trellis-g1-fp32-s4-v1" : "") +
         (config.prefetch_q8_input_projections ? ".prefetch8" : "") +
         (config.virtual_q8_input_projections ? ".virtual256.q8-input" : "") +
         (config.virtual_q8_output_projection ? ".virtual256.q8-output" : "");
@@ -4224,6 +4326,7 @@ std::uint64_t implementation_identity(
     if (config.wave8_q8_input_projections) hash_u64(hash, 0x47444e5138574156ULL);
     if (config.wave8_q8_output_projection) hash_u64(hash, 0x47444e514f573831ULL);
     if (config.dense_a8_projections) hash_u64(hash, 0x47444e4441385631ULL); // GDNDA8V1
+    if (config.dense_trellis_projections) hash_u64(hash, 0x544c473146503453ULL); // TLG1FP4S
     if (config.recurrent_layout != HipGdnRecurrentLayout::baseline) {
         hash_u64(hash, 0x47444e4c44533031ULL); // GDN LDS organization version 1.
         hash_u64(hash, static_cast<std::uint32_t>(config.recurrent_layout));
@@ -4667,6 +4770,9 @@ void gdn_known_window_rows_preflight(std::span<const ExecutionDispatchContext> r
 }
 void gdn_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipGdnLauncherConfig& config) {
+#if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    HipDenseTrellisScope arithmetic(config.dense_trellis_projections);
+#endif
     if (rows.size() == 4U) enqueue_gdn_wide_rows<4U>(prepare_gdn_wide_rows<4U>(rows, config), config);
     else if (rows.size() == 8U) enqueue_gdn_wide_rows<8U>(prepare_gdn_wide_rows<8U>(rows, config), config);
     else throw std::invalid_argument("GDN wide-window requires exactly four or eight rows");
@@ -4988,6 +5094,9 @@ void gdn_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> 
     static_cast<void>(prepare_gdn_prefill_rows(rows, config, strided));
 }
 void gdn_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows, const HipGdnLauncherConfig& config) {
+#if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    HipDenseTrellisScope arithmetic(config.dense_trellis_projections);
+#endif
     GdnPrefillRows strided{};
     const auto tiles = prepare_gdn_prefill_rows(rows, config, strided);
     enqueue_gdn_prefill_rows(tiles, strided, config);
@@ -4999,6 +5108,9 @@ void gdn_known_window_r2_preflight(std::span<const ExecutionDispatchContext, 2> 
 }
 void gdn_known_window_r2_launch(std::span<const ExecutionDispatchContext, 2> rows,
     const HipGdnLauncherConfig& config) {
+#if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    HipDenseTrellisScope arithmetic(config.dense_trellis_projections);
+#endif
     // Repeat current-view validation at this public entry; preflight isn't a permit.
     const auto prepared = prepare_gdn_known_window_rows(rows, config, Format::all_q8);
     enqueue_gdn_known_window_inputs(prepared, Format::all_q8, config);
@@ -5010,6 +5122,9 @@ void gdn_known_window_r2_f32_gates_preflight(std::span<const ExecutionDispatchCo
 }
 void gdn_known_window_r2_f32_gates_launch(std::span<const ExecutionDispatchContext, 2> rows,
     const HipGdnLauncherConfig& config) {
+#if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    HipDenseTrellisScope arithmetic(config.dense_trellis_projections);
+#endif
     const auto prepared = prepare_gdn_known_window_rows(rows, config, Format::q8_large_f32_gates);
     enqueue_gdn_known_window_inputs(prepared, Format::q8_large_f32_gates, config);
     enqueue_gdn_known_window_completion(prepared, config);
@@ -5080,6 +5195,8 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
     const GdnWindowControl* control, const HipGdnLauncherConfig& config, hipStream_t stream, unsigned parts = 7U) {
     const auto shape = gdn_window_shape(config.model);
     const auto rows = gdn_window_rows<Rows>(input, shape);
+    bool fused_norm = false;
+    q8_rows::DenseA8Slot fused_slot{};
     if (parts & 1U) {
     GdnWidePointers<Rows> x{};
     for (unsigned r = 0; r < Rows; ++r) x.input[r] = input[r].input;
@@ -5130,8 +5247,46 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
         const int n = v ? std::atoi(v) : 8;
         return static_cast<std::uint32_t>(n == 4 || n == 2 ? n : 8);
     }();
+    if constexpr (Rows == 2U || Rows == 4U || Rows == 8U) {
+        if (qpersist_gdn_tail_enabled() && (parts & 4U) && shape.head_dim == 128U && window_columns == 8U) {
+            // Alternate recurrence organizations retain their own mapping.
+            static const bool alternate = [] {
+                const char* tiled = std::getenv("STRIX_GDN_WINDOW_TILED");
+                const char* scatter = std::getenv("STRIX_QKERN_GDN_SCATTER");
+                return (tiled && tiled[0] == '1') || (scatter && scatter[0] == '1');
+            }();
+            if (!alternate) {
+                const bool dense = config.dense_a8_projections;
+                if (dense) fused_slot = q8_rows::dense_a8_slot(0U);
+                const auto launch = [&]<GdnRecurrentStorage Storage, bool Dense>() {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_norm_kernel<Rows, Storage, Dense>),
+                        dim3(shape.value_heads), dim3(512), 0, stream, rows, layer.matrix, saved, control,
+                        shape.key_heads, layer.norm, small_weight_kind(layer.norm_type), config.model.rms_norm_epsilon,
+                        fused_slot.codes, fused_slot.deltas, shape.value_width);
+                };
+                if (config.recurrent_storage == GdnRecurrentStorage::value_key) {
+                    if (dense) launch.template operator()<GdnRecurrentStorage::value_key, true>();
+                    else launch.template operator()<GdnRecurrentStorage::value_key, false>();
+                } else {
+                    if (dense) launch.template operator()<GdnRecurrentStorage::key_value, true>();
+                    else launch.template operator()<GdnRecurrentStorage::key_value, false>();
+                }
+                fused_norm = true;
+            }
+        }
+    }
     const auto recurrence = [&]<std::uint32_t Columns>() {
         const auto tiles = dim3(shape.value_heads * (shape.head_dim / Columns));
+        static const bool scatter = [] { const char* v = std::getenv("STRIX_QKERN_GDN_SCATTER"); return v && v[0] == '1'; }();
+        if constexpr (Columns == 4U || Columns == 8U) if (scatter) {
+            if (config.recurrent_storage == GdnRecurrentStorage::value_key)
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::value_key, Columns, true>), tiles,
+                    dim3(32), 0, stream, rows, layer.matrix, saved, control, shape.key_heads, shape.head_dim);
+            else
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::key_value, Columns, true>), tiles,
+                    dim3(32), 0, stream, rows, layer.matrix, saved, control, shape.key_heads, shape.head_dim);
+            return;
+        }
         if (config.recurrent_storage == GdnRecurrentStorage::value_key)
             hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_recurrent_kernel<Rows, GdnRecurrentStorage::value_key, Columns>), tiles,
                 dim3(32), 0, stream, rows, layer.matrix, saved, control, shape.key_heads, shape.head_dim);
@@ -5146,7 +5301,8 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
             dim3(shape.value_heads * (shape.head_dim / kGdnTiledColumns)), dim3(32U * (kGdnTiledColumns / Columns)), 0, stream,
             rows, layer.matrix, saved, control, shape.key_heads, shape.head_dim);
     };
-    if (tiled && config.recurrent_storage == GdnRecurrentStorage::key_value && shape.head_dim == 128U) {
+    if (fused_norm) {
+    } else if (tiled && config.recurrent_storage == GdnRecurrentStorage::key_value && shape.head_dim == 128U) {
         if (window_columns == 8U) tiled_recurrence.template operator()<8U>();
         else if (window_columns == 4U) tiled_recurrence.template operator()<4U>();
         else tiled_recurrence.template operator()<2U>();
@@ -5162,12 +5318,12 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
     const bool dense = config.dense_a8_projections;
     if (dense && (shape.head_dim != kRecurrentThreads || shape.head_dim % 32U))
         throw std::invalid_argument("GDN window dense A8 norm quantizer requires one 128-feature head per block");
-    const auto slot = dense ? q8_rows::dense_a8_slot(0U) : q8_rows::DenseA8Slot{};
-    if (dense)
+    const auto slot = fused_norm ? fused_slot : dense ? q8_rows::dense_a8_slot(0U) : q8_rows::DenseA8Slot{};
+    if (!fused_norm && dense)
         hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_norm_dense_a8_kernel<Rows>), dim3(shape.value_heads, Rows),
             dim3(kRecurrentThreads), 0, stream, rows, layer.norm, small_weight_kind(layer.norm_type), shape.head_dim,
             config.model.rms_norm_epsilon, slot.codes, slot.deltas, shape.value_width);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_norm_kernel<Rows>), dim3(shape.value_heads, Rows),
+    else if (!fused_norm) hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_norm_kernel<Rows>), dim3(shape.value_heads, Rows),
         dim3(kRecurrentThreads), 0, stream, rows, layer.norm, small_weight_kind(layer.norm_type), shape.head_dim,
         config.model.rms_norm_epsilon);
     check_hip(hipGetLastError(), "GDN window gated RMSNorm launch");
@@ -5189,6 +5345,9 @@ std::uint64_t gdn_window_retained_bytes(const ModelContract& model) {
 }
 void gdn_window_enqueue(const GdnWindowLayer& layer, std::span<const GdnWindowRow> rows,
     const GdnWindowControl* control, const HipGdnLauncherConfig& config, void* stream) {
+#if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    HipDenseTrellisScope arithmetic(config.dense_trellis_projections);
+#endif
     validate_gdn_window(layer, rows, true, control, config, stream);
     const auto native = static_cast<hipStream_t>(stream);
     switch (rows.size()) {
@@ -5310,6 +5469,7 @@ GdnCohortBinding bind_gdn_window_cohort(std::span<const HipGdnWindowCohortSegmen
         const auto& segment = segments[s];
         if (!segment.config || segment.rows.empty() || *segment.rows[0].layer != *segments[0].rows[0].layer ||
             segment.config->gdn.dense_a8_projections != segments[0].config->gdn.dense_a8_projections ||
+            segment.config->gdn.dense_trellis_projections != segments[0].config->gdn.dense_trellis_projections ||
             segment.config->gdn.recurrent_storage != segments[0].config->gdn.recurrent_storage)
             throw std::invalid_argument("GDN cohort window segments differ in layer or arithmetic");
         // Every session segment passes the complete single-session window binding.
@@ -5391,6 +5551,9 @@ static void enqueue_gdn_window_segments(std::span<const GdnWindowCohortSegment> 
     check_hip(hipGetLastError(), "GDN cohort segments recurrence launch");
 }
 void gdn_window_cohort_enqueue(std::span<const GdnWindowCohortSegment> segments, const HipGdnLauncherConfig& config, void* stream) {
+#if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    HipDenseTrellisScope arithmetic(config.dense_trellis_projections);
+#endif
     if (segments.empty() || segments.size() > gdn_window_max_rows)
         throw std::invalid_argument("GDN cohort window requires 1..8 session segments");
     std::array<GdnWindowRow, gdn_window_cohort_max_rows> rows{};

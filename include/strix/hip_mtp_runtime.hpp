@@ -57,6 +57,8 @@ public:
     // this actual owner and are valid until the next runtime operation.
     [[nodiscard]] HipMtpCacheStateView cache_state() const;
     [[nodiscard]] HipMtpExecutionStats execution_stats() const noexcept;
+    // Actual generation-cache producer, separate from full-forward qualification.
+    [[nodiscard]] const char* draft_cache_profile() const noexcept;
     [[nodiscard]] HipMtpNativeRowResult execute_diagnostic(
         const HipMtpTargetHiddenTicket&,std::uint32_t next_input_token);
     void begin_cycle(std::uint32_t actual_pending_token,const HipMtpTargetHiddenTicket&);

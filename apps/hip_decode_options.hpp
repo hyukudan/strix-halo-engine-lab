@@ -15,6 +15,7 @@
 #include <array>
 #include "strix/token_sampling.hpp"
 #include "strix/mtp_draft_profiles.hpp"
+#include "strix/mtp_depth_window_controller.hpp"
 #include <cerrno>
 #include <fstream>
 #include <iterator>
@@ -171,11 +172,13 @@ inline bool mtp_sampling(const MtpCliOptions& m) noexcept {return m.sample_tempe
 // native window (EOS, remaining budget/context and history can choose serial).
 // Without --mtp-spec-min-p a profiled draft (by sidecar SHA-256, D-055) uses its own value, any other
 // sidecar 0.5; a single target window (no row set) does not stop the chain early.
-inline float mtp_draft_min_probability(const MtpCliOptions& m) noexcept {
+inline float mtp_draft_min_probability(const MtpCliOptions& m) {
+    if(mtp_depth_controller_enabled() && mtp_sampling(m))
+        throw std::invalid_argument("depth MTP controller requires greedy selection");
     if(m.spec_min_p>=0.0) return static_cast<float>(m.spec_min_p);
     if(m.window_rows_set.empty()) return 0.0F;
     const auto* profile=find_mtp_draft_profile_by_sha256(m.sidecar_sha256);
-    return profile?profile->min_probability:0.5F;
+    return mtp_depth_domain_min_probability(profile?profile->min_probability:0.5F);
 }
 // The n-gram extension runs: explicitly required, or by default (auto) where it is admissible:
 // greedy, one request, the draft chain with prefix windows, a generation route. The bridge also leaves
@@ -320,6 +323,7 @@ struct Options {
     std::string teacher_logits_path;
     // Dense Q6P32 pack of an emulated checkpoint (strix/hip_q6p_pack.hpp).
     std::string dense_q6p_pack_path;
+    std::string dense_trellis_pack_path;
     bool known_prefix_expert_union = false;
     // Router + combine/inject rows entries in the known-prefix or MTP window.
     bool known_window_router_rows = false;
@@ -1096,7 +1100,7 @@ inline Options parse_options(
             "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX (--mtp-golden FILE --mtp-golden-sha256 HEX | --mtp-golden-dump FILE) [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE[,FILE...]|auto:DIR] [--mtp-draft-context-vocab N] [--mtp-draft-exact] [--mtp-draft-q4] [--mtp-ngram-draft[=on|off|auto]]] [--mtp-draft-profile base|distill-d|distill-g] (explicit source/conversion/cast/budget options required)] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1] [--prefill-numerical-profile NAME] "
-            "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] [--dense-q6p-pack PATH] "
+            "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] [--dense-q6p-pack PATH] [--dense-trellis-pack PATH] "
             "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--attention-kv-storage bf16|kv-int8-tok-v1] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-window-router-rows] [--known-prefix-prefill-rows 16..2048 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N [--unqualified-context]] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert|experts --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
@@ -1157,6 +1161,14 @@ inline Options parse_options(
             if (value.empty() || value.starts_with("--"))
                 throw std::invalid_argument("dense Q6P32 pack requires a nonempty path");
             options.dense_q6p_pack_path = value;
+            continue;
+        }
+        if (argument == "--dense-trellis-pack" || argument.starts_with("--dense-trellis-pack=")) {
+            if (!options.dense_trellis_pack_path.empty()) throw std::invalid_argument("duplicate dense trellis pack option");
+            const auto value = argument == "--dense-trellis-pack" ?
+                (index + 1 < argc ? std::string_view(argv[++index]) : std::string_view{}) : argument.substr(std::string_view("--dense-trellis-pack=").size());
+            if (value.empty() || value.starts_with("--")) throw std::invalid_argument("dense trellis pack requires a nonempty path");
+            options.dense_trellis_pack_path = value;
             continue;
         }
         if (argument == "--teacher-logits-file" || argument.starts_with("--teacher-logits-file=")) {
@@ -2314,6 +2326,16 @@ inline Options parse_options(
     if (options.virtual_q8_lm_head && options.execution.integer_head != strix::DecodeIntegerHead::none)
         throw std::invalid_argument("integer and virtual Q8 LM heads are mutually exclusive");
     validate_teacher_forced_score(options);
+    if (numerical_profile_dense_trellis(options.numerical_profile) != !options.dense_trellis_pack_path.empty())
+        throw std::invalid_argument("the explicit dense trellis numerical profile and its pinned pack are required together");
+    if (!options.dense_trellis_pack_path.empty() && (!options.numerical_profile_explicit || !options.dense_q6p_pack_path.empty()))
+        throw std::invalid_argument("dense trellis requires an explicit profile and excludes a Q6P32 overlay");
+    if (!options.dense_trellis_pack_path.empty() && (options.http_serve || options.http_batch || !options.mtp.cohort.empty()))
+        throw std::invalid_argument("the experimental dense trellis route is one-shot C1 only");
+#if !defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    if (!options.dense_trellis_pack_path.empty())
+        throw std::invalid_argument("dense trellis runtime is disabled in this build");
+#endif
     validate_numerical_profile_cli(options);
     validate_prefill_numerical_profile_cli(options);
     apply_mtp_draft_profile(options.mtp);

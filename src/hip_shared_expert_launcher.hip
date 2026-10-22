@@ -23,6 +23,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -1519,6 +1521,28 @@ template <unsigned Rows> struct SharedDownRowsSite {
         store_activation(output[r] + out, gated);
     }
 };
+// R8/M640: retain two outputs per wave, but only allocate the twenty real Q8
+// blocks of each chain. Every output keeps its dot4 products, ascending block
+// FMA chain, canonicalization and gated BF16 store. Other widths use the base site.
+struct SharedDownR8NarrowSite : SharedDownRowsSite<8U> {
+    static constexpr unsigned dense_a8_width = 640U;
+};
+template <unsigned Rows>
+void launch_shared_down_rows(const SharedDownRowsSite<Rows>& site, bool a8, hipStream_t stream, int forced = -1) {
+    if constexpr (Rows == 8U) {
+        static const bool enabled = [] {
+            const char* v = std::getenv("STRIX_QWEN_SHARED_DOWN_NARROW");
+            return v && v[0] == '1';
+        }();
+        if (a8 && site.width == 640U && (forced < 0 ? enabled : forced != 0)) {
+            SharedDownR8NarrowSite narrow{};
+            static_cast<SharedDownRowsSite<8U>&>(narrow) = site;
+            q8_rows::launch(narrow, true, stream);
+            return;
+        }
+    } else static_cast<void>(forced);
+    q8_rows::launch(site, a8, stream);
+}
 void launch_shared_dense_a8_gate_up(const SharedTensors& tensors, const std::uint16_t* hidden, float* workspace,
     std::uint32_t hidden_size, std::uint32_t intermediate_size, hipStream_t stream) {
     SharedGateUpRowsSite<1U> site{};
@@ -1847,7 +1871,8 @@ void known_shared_engine_projection(bool down, const KnownSharedR2Views& views, 
             site.gate[r] = reinterpret_cast<const float*>(workspace) + s.intermediate;
             site.output[r] = reinterpret_cast<std::uint16_t*>(row(views.output, s.output_stride_bytes, r));
         }
-        q8_rows::launch_prefill(site, config.dense_a8_projections, config.dense_f16_prefill, stream, false, config.dense_g64_prefill);
+        if constexpr (Rows <= 8U) launch_shared_down_rows(site, config.dense_a8_projections, stream);
+        else q8_rows::launch_prefill(site, config.dense_a8_projections, config.dense_f16_prefill, stream, false, config.dense_g64_prefill);
     } else {
         SharedGateUpRowsSite<Rows> site{};
         site.segments = q8_rows::segments({{reinterpret_cast<const void*>(views.weights.gate_q8.address), s.intermediate},
@@ -2151,6 +2176,18 @@ void shared_expert_known_window_rows_launch_detached(std::span<const ExecutionDi
 namespace {
 // Cohort: the projections of all segments' rows through per-row pointers (each row exactly as in its
 // own window), the activation/scalar kernel per segment over its own strided rows.
+void* shared_cohort_padding(hipStream_t stream,std::uint64_t bytes) {
+    struct Buffer {void* memory=nullptr;std::uint64_t bytes=0;};
+    static std::mutex mutex;
+    static std::map<hipStream_t,Buffer> buffers;
+    const std::lock_guard lock(mutex);
+    auto& b=buffers[stream];
+    if(b.bytes<bytes) {
+        if(b.memory) {check_hip(hipStreamSynchronize(stream),"drain shared cohort padding");check_hip(hipFree(b.memory),"free shared cohort padding");}
+        check_hip(hipMalloc(&b.memory,bytes),"allocate shared cohort padding");b.bytes=bytes;
+    }
+    return b.memory;
+}
 template <unsigned Rows>
 void known_shared_cohort_enqueue(std::span<const KnownSharedR2Views> segments, std::span<const unsigned> counts,
     hipStream_t stream, const HipSharedExpertLauncherConfig& config) {
@@ -2168,6 +2205,10 @@ void known_shared_cohort_enqueue(std::span<const KnownSharedR2Views> segments, s
                 site.input[row] = reinterpret_cast<const void*>(at(segments[k].input, s.input_stride_bytes, r));
                 site.output[row] = reinterpret_cast<float*>(at(segments[k].workspace, s.workspace_stride_bytes, r));
             }
+        if constexpr(Rows>8U) if(row<Rows) {
+            auto* sink=static_cast<float*>(shared_cohort_padding(stream,static_cast<std::uint64_t>(Rows-row)*2U*s.intermediate*sizeof(float)));
+            for(auto r=row;r<Rows;++r) {site.input[r]=site.input[0];site.output[r]=sink+static_cast<std::uint64_t>(r-row)*2U*s.intermediate;}
+        }
         // The first kernel follows a cross-stream wait, so it keeps its barrier.
         q8_rows::launch(site, config.dense_a8_projections, stream, false);
         check_hip(hipGetLastError(), "known-window cohort shared gate/up launch");
@@ -2192,6 +2233,10 @@ void known_shared_cohort_enqueue(std::span<const KnownSharedR2Views> segments, s
                 site.gate[row] = reinterpret_cast<const float*>(workspace) + s.intermediate;
                 site.output[row] = reinterpret_cast<std::uint16_t*>(at(segments[k].output, s.output_stride_bytes, r));
             }
+        if constexpr(Rows>8U) if(row<Rows) {
+            auto* sink=static_cast<std::uint16_t*>(shared_cohort_padding(stream,static_cast<std::uint64_t>(Rows-row)*s.hidden*sizeof(std::uint16_t)));
+            for(auto r=row;r<Rows;++r) {site.input[r]=site.input[0];site.gate[r]=site.gate[0];site.output[r]=sink+static_cast<std::uint64_t>(r-row)*s.hidden;}
+        }
         q8_rows::launch(site, config.dense_a8_projections, stream);
         check_hip(hipGetLastError(), "known-window cohort shared down launch");
     }
@@ -2203,10 +2248,10 @@ void known_shared_cohort_enqueue(std::span<const KnownSharedR2Views> segments, s
 void shared_expert_known_window_cohort_launch(std::span<const std::span<const ExecutionDispatchContext>> segments,
     const HipSharedExpertLauncherConfig& config, void* raw_stream, std::uintptr_t workspace, std::uint64_t workspace_bytes) {
     const auto stream = static_cast<hipStream_t>(raw_stream);
-    if (segments.size() < 2U || segments.size() > 4U || !stream)
-        throw std::invalid_argument("known-window cohort shared rows require two to four sessions and a stream");
-    std::array<KnownSharedR2Views, 4> views{};
-    std::array<unsigned, 4> counts{};
+    if (segments.size() < 2U || segments.size() > 8U || !stream)
+        throw std::invalid_argument("known-window cohort shared rows require two to eight sessions and a stream");
+    std::array<KnownSharedR2Views, 8> views{};
+    std::array<unsigned, 8> counts{};
     unsigned total = 0;
     std::uint64_t workspace_extent = 0;
     for (std::size_t k = 0; k < segments.size(); ++k) {
@@ -2227,7 +2272,10 @@ void shared_expert_known_window_cohort_launch(std::span<const std::span<const Ex
         total += counts[k];
         workspace_extent += b.shape.workspace_stride_bytes * counts[k];
     }
-    if (total != 4U && total != 8U) throw std::invalid_argument("known-window cohort shared rows require four or eight rows");
+    if (total != 4U && total != 8U && (total<9U || total>32U))
+        throw std::invalid_argument("known-window cohort shared rows require 4, 8 or 9..32 rows");
+    if(total>8U && !config.dense_a8_projections)
+        throw std::invalid_argument("wide shared cohort requires dense A8 arithmetic");
     require_known_shared_a8(total, config);
     if (workspace) {
         // Detached: every segment's rows keep their arena stride in the caller's own workspace, one after another.
@@ -2250,7 +2298,9 @@ void shared_expert_known_window_cohort_launch(std::span<const std::span<const Ex
     const std::span<const KnownSharedR2Views> all(views.data(), segments.size());
     const std::span<const unsigned> sizes(counts.data(), segments.size());
     if (total == 4U) known_shared_cohort_enqueue<4U>(all, sizes, stream, config);
-    else known_shared_cohort_enqueue<8U>(all, sizes, stream, config);
+    else if(total==8U) known_shared_cohort_enqueue<8U>(all, sizes, stream, config);
+    else if(total<=16U) known_shared_cohort_enqueue<16U>(all, sizes, stream, config);
+    else known_shared_cohort_enqueue<32U>(all, sizes, stream, config);
 }
 } // namespace strix
 
@@ -2444,7 +2494,7 @@ namespace {
 template <unsigned Rows>
 void enqueue_shared_rows_probe(bool down, bool a8, std::span<const HipSharedQ8ProjectionView> input,
     HipSharedQ8ProjectionView weights, std::span<const HipSharedQ8ProjectionView> gate,
-    std::span<const HipSharedQ8ProjectionView> output, std::uint32_t width, std::uint32_t outputs, hipStream_t stream) {
+    std::span<const HipSharedQ8ProjectionView> output, std::uint32_t width, std::uint32_t outputs, hipStream_t stream, int forced = -1) {
     const auto segments = q8_rows::segments({{reinterpret_cast<const void*>(weights.address), outputs}});
     if (down) {
         SharedDownRowsSite<Rows> site{};
@@ -2454,7 +2504,7 @@ void enqueue_shared_rows_probe(bool down, bool a8, std::span<const HipSharedQ8Pr
             site.gate[r] = reinterpret_cast<const float*>(gate[r].address);
             site.output[r] = reinterpret_cast<std::uint16_t*>(output[r].address);
         }
-        q8_rows::launch(site, a8, stream);
+        launch_shared_down_rows(site, a8, stream, forced);
     } else {
         SharedGateUpRowsSite<Rows> site{};
         site.segments = segments; site.width = width; site.outputs = outputs;
@@ -2477,10 +2527,15 @@ void launch_hip_shared_rows_projection_probe(HipSharedQ8ProjectionRole role, Hip
     const bool down = role == HipSharedQ8ProjectionRole::down;
     if ((rows != 1U && rows != 2U && rows != 4U && rows != 8U && rows != 16U && rows != 32U && rows != 64U) || output.size() != rows || gate.size() != (down ? rows : 0U) ||
         (!down && role != HipSharedQ8ProjectionRole::gate_up) ||
-        (mode != HipSharedRowsProbeMode::rows && mode != HipSharedRowsProbeMode::rows_a8 && mode != HipSharedRowsProbeMode::row_loop) ||
+        (mode != HipSharedRowsProbeMode::rows && mode != HipSharedRowsProbeMode::rows_a8 && mode != HipSharedRowsProbeMode::row_loop &&
+         mode != HipSharedRowsProbeMode::rows_a8_reference && mode != HipSharedRowsProbeMode::rows_a8_narrow) ||
         !stream || static_cast<hipStream_t>(stream) == hipStreamLegacy || static_cast<hipStream_t>(stream) == hipStreamPerThread ||
         !width || width % 32U || !outputs)
         throw std::invalid_argument("shared rows projection diagnostic requires 1/2/4/8/16/32/64 rows, a role, a mode and an owned stream");
+    if (mode == HipSharedRowsProbeMode::rows_a8_reference || mode == HipSharedRowsProbeMode::rows_a8_narrow) {
+        if (!down || rows != 8U || width != 640U)
+            throw std::invalid_argument("explicit shared down organization requires A8 R8/M640");
+    }
     const auto overlap = [](HipSharedQ8ProjectionView x, HipSharedQ8ProjectionView y) {
         return x.address < y.address + y.bytes && y.address < x.address + x.bytes;
     };
@@ -2516,11 +2571,14 @@ void launch_hip_shared_rows_projection_probe(HipSharedQ8ProjectionRole role, Hip
         }
         return;
     }
-    const bool a8 = mode == HipSharedRowsProbeMode::rows_a8;
+    const bool a8 = mode == HipSharedRowsProbeMode::rows_a8 || mode == HipSharedRowsProbeMode::rows_a8_reference ||
+        mode == HipSharedRowsProbeMode::rows_a8_narrow;
+    const int forced = mode == HipSharedRowsProbeMode::rows_a8_reference ? 0 :
+        mode == HipSharedRowsProbeMode::rows_a8_narrow ? 1 : -1;
     if (rows == 1U) enqueue_shared_rows_probe<1U>(down, a8, input, weights, gate, output, width, outputs, native);
     else if (rows == 2U) enqueue_shared_rows_probe<2U>(down, a8, input, weights, gate, output, width, outputs, native);
     else if (rows == 4U) enqueue_shared_rows_probe<4U>(down, a8, input, weights, gate, output, width, outputs, native);
-    else if (rows == 8U) enqueue_shared_rows_probe<8U>(down, a8, input, weights, gate, output, width, outputs, native);
+    else if (rows == 8U) enqueue_shared_rows_probe<8U>(down, a8, input, weights, gate, output, width, outputs, native, forced);
     else if (rows == 16U) enqueue_shared_rows_probe<16U>(down, a8, input, weights, gate, output, width, outputs, native);
     else if (rows == 32U) enqueue_shared_rows_probe<32U>(down, a8, input, weights, gate, output, width, outputs, native);
     else enqueue_shared_rows_probe<64U>(down, a8, input, weights, gate, output, width, outputs, native);

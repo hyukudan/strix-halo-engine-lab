@@ -50,7 +50,7 @@ hashes the 111 GB file, about 50 s).
 
 ## Decode by workload (earlier measurement)
 
-Measured on one Bosgame M5 (Ryzen AI Max+ 395, 128 GB), UD-Q4_K_XL, A8 profile without dense A8, single stream,
+Measured on one Strix Halo mini PC (Ryzen AI Max+ 395, 128 GB), UD-Q4_K_XL, A8 profile without dense A8, single stream,
 256 generated tokens, at `b0d1cd1` (before D-032 and later decode work; the code figure has since risen to the
 values in the README):
 
@@ -245,6 +245,7 @@ Defaults are the measured configuration.
 |---|---|
 | `STRIX_HASH_CACHE=0` / `=DIR` | Disable, or relocate, the verified SHA-256 cache of model files (default `~/.cache/strix-engine/file-sha256`). A cached digest is reused only while the file keeps its device, inode, size, mtime and ctime, and it is still checked against the expected SHA-256. |
 | `STRIX_MTP_WINDOW_COST=legacy` | Min-p window controller: EMA cost estimates without re-probes (the behaviour before D-042; default is median/minimum estimates with bounded re-probes). |
+| `STRIX_MTP_REQUEST_RESET=0` | Retain learned controller costs, acceptance bins and exploration history across served requests for controlled comparisons. By default each request starts from its configured prior while reusing the slot's device owners. |
 | `STRIX_MTP_DRAFT_VOCAB=2` | Draft vocabulary policy 2 with `--mtp-draft-vocab auto:DIR` (opt-in, D-043): the chosen language pack comes from `pack2-<lang>.bin` (no rows repeated from the core; 32k rows for Chinese) and a prompt without a pack gets `core64k.bin`. Tokens are unchanged. |
 | `STRIX_MTP_DRAFT_CORE=<N>k` | With `auto:DIR`: use `core<N>k.bin` (32k, 48k, 64k ship) as the core. |
 | `STRIX_MTP_DRAFT_WORTH=0` | Draft up to `--mtp-spec-min-p` only, without asking the window cost model before each extra step. |

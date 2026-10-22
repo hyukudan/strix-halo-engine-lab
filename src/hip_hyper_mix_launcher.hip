@@ -1,4 +1,5 @@
 #include "strix/hip_mtp_fast_draft.hpp"
+#include "strix/dispatch_fuse.hpp"
 #include "strix/hip_lane_chain_hyper_output_tests.hpp"
 #include "strix/hip_hc_wide_rows_tests.hpp"
 #include "strix/hip_lane_chain_hyper_projection_tests.hpp"
@@ -1717,6 +1718,14 @@ struct HyperRows {
     // Prefill: blockIdx.z selects an 8-row tile, each view blockIdx.z * its stride bytes on (0 in windows).
     std::uint64_t tile_input, tile_output, tile_normalized, tile_injection;
 };
+struct HyperCohortRows {
+    const void* input[32];void* output[32];
+    float* normalized[32];float* low[32];float* injection[32];
+    std::uint64_t tile_input=0,tile_output=0,tile_normalized=0,tile_injection=0;
+};
+template<class Rows> constexpr unsigned hyper_row_capacity=std::is_same_v<Rows,HyperCohortRows>?32U:kWindowRows;
+template<typename Pointer> __device__ __forceinline__ Pointer tiled(Pointer pointer,std::uint64_t,const HyperCohortRows&,
+    std::uint32_t=0U) {return pointer;}
 // Prefill tiles: the same views, blockIdx.z selects the 8-row tile. Window kernels take
 // HyperRows and compile without any tile arithmetic; HyperTileRows kernels shift each view
 // by blockIdx.z times its stride (the kernel argument itself is never written: a written
@@ -2000,7 +2009,7 @@ __device__ __forceinline__ void rows_splitk_hyper_lane_dots(const Rows& rows, un
 template <unsigned R, class Rows = HyperRows, bool Q6 = false>
 __global__ __launch_bounds__(512) void rows_splitk_hyper_projection_kernel(Rows rows, unsigned count,
     const void* __restrict__ down, unsigned streams, unsigned rank, const void* __restrict__ inject, unsigned low_blocks) {
-    __shared__ float red[kWindowRows][16][R];
+    __shared__ float red[hyper_row_capacity<Rows>][16][R];
     const unsigned lane=threadIdx.x%32U,tile=threadIdx.x/32U;
     const bool is_inject=blockIdx.x>=low_blocks;
     const unsigned first=(is_inject?blockIdx.x-low_blocks:blockIdx.x)*R;
@@ -2030,8 +2039,8 @@ template <unsigned R, typename Storage, class Rows = HyperRows>
 __global__ __launch_bounds__(512) void rows_splitk_norm_hyper_projection_kernel(Rows rows, unsigned count,
     const void* __restrict__ down, unsigned streams, unsigned rank, const void* __restrict__ inject, unsigned low_blocks,
     const void* __restrict__ norm, std::uint32_t norm_type, unsigned hidden, float epsilon) {
-    __shared__ float red[kWindowRows][16][R];
-    __shared__ float inverse[kWindowRows][8];
+    __shared__ float red[hyper_row_capacity<Rows>][16][R];
+    __shared__ float inverse[hyper_row_capacity<Rows>][8];
     const unsigned lane=threadIdx.x%32U,tile=threadIdx.x/32U;
     for(unsigned pair=tile;pair<count*streams;pair+=16U) {
         const unsigned t=pair/streams,stream=pair%streams;
@@ -4153,9 +4162,9 @@ bool persistent_up_late() {
     static const bool late = [] { const char* v = std::getenv("STRIX_HC_PERSISTENT_UP_LATE"); return v && v[0] == '1'; }();
     return late;
 }
-template <typename Storage, std::uint32_t Count, bool Inject = false>
-bool launch_persistent_hyper_rows(const PreparedHyperMix& p, const HyperRows& rows, const HipHyperMixLauncherConfig& config,
-    const PersistInjectRows& injected = {}) {
+// All kPersistBlocks blocks of one instantiation fit on the device at once (checked once per instantiation).
+template <typename Storage, std::uint32_t Count, bool Inject>
+bool persistent_hyper_resident() {
     const auto kernel = rows_persistent_hyper_mix_kernel<Storage, Count, Inject>;
     static const bool resident = [&] {
         int device = 0, per_cu = 0;
@@ -4177,7 +4186,12 @@ bool launch_persistent_hyper_rows(const PreparedHyperMix& p, const HyperRows& ro
                 attributes.localSizeBytes, fits ? "persistent" : "three-kernel form");
         return fits;
     }();
-    if (!resident) return false;
+    return resident;
+}
+template <typename Storage, std::uint32_t Count, bool Inject = false>
+bool launch_persistent_hyper_rows(const PreparedHyperMix& p, const HyperRows& rows, const HipHyperMixLauncherConfig& config,
+    const PersistInjectRows& injected = {}) {
+    if (!persistent_hyper_resident<Storage, Count, Inject>()) return false;
     const auto stream = hip_execution_stream();
     auto& barrier = persistent_hyper_barrier(stream);
     const auto* inject = p.inject_runtime ? reinterpret_cast<const float*>(p.inject_runtime->address) : nullptr;
@@ -4211,8 +4225,51 @@ bool launch_persistent_hyper_rows(const PreparedHyperMix& p, const HyperRows& ro
     return true;
 }
 bool persistent_hyper_rows_enabled() {
-    static const bool enabled = [] { const char* v = std::getenv("STRIX_HC_PERSISTENT"); return v && v[0] == '1'; }();
+    static const bool enabled = strix_fuse_switch("STRIX_HC_PERSISTENT");
     return enabled;
+}
+// STRIX_MTP_HC_PERSISTENT=1 (STRIX_DISPATCH_FUSE=1): one HC mix of the draft chain (one row, BF16 streams,
+// F32 norm, Q8_0 down/up, F32 [4][10240] injection or none) as the persistent launch: one dispatch instead of
+// the normalisation, the one-row split-K projection and the lane-chain output. The persistent kernel keeps
+// their expressions and order (the HC rows fixtures check it against the serial R1 launches bit for bit).
+bool launch_persistent_hyper_draft(const std::uint16_t* input, const float* norm, const void* down, const float* inject,
+    const void* up, float* normalized, float* low, float* injection, std::uint16_t* output, float epsilon, hipStream_t stream) {
+    static const bool enabled = [] { const char* v = std::getenv("STRIX_MTP_HC_PERSISTENT"); return v && v[0] == '1'; }();
+    if (!enabled || !persistent_hyper_resident<std::uint16_t, 1U, false>()) return false;
+    HyperRows rows{};
+    rows.input[0] = input; rows.output[0] = output; rows.normalized[0] = normalized; rows.low[0] = low; rows.injection[0] = injection;
+    auto& barrier = persistent_hyper_barrier(stream);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_persistent_hyper_mix_kernel<std::uint16_t, 1U, false>), dim3(kPersistBlocks), dim3(512U), 0,
+        stream, rows, static_cast<const void*>(norm), 0U, epsilon, static_cast<const unsigned char*>(down), inject,
+        static_cast<const unsigned char*>(up), barrier.counter, barrier.issued, barrier.counter + 16, barrier.queued, PersistInjectRows{},
+        static_cast<unsigned long long*>(nullptr), persistent_up_late());
+    check_hip(hipGetLastError(), "MTP draft persistent HC launch");
+    barrier.issued += 2U * kPersistBlocks;
+    barrier.queued += kPersistRank / kPersistUnitOutputs + (inject ? kPersistStreams : 0U) + kPersistBlocks;
+    persistent_hyper_launches.fetch_add(1U, std::memory_order_relaxed);
+    return true;
+}
+// Window sizes that take the persistent HC form. STRIX_HC_PERSISTENT_ROWS=2,4,8 (comma list) selects them; unset,
+// an explicit STRIX_HC_PERSISTENT=1 keeps every size and STRIX_DISPATCH_FUSE alone takes 2 and 4: at 8 rows the
+// persistent split-K phase costs more than the two dispatches it removes (kernel trace, 2026-10-21).
+bool persistent_hyper_rows_size(std::uint32_t count) {
+    static const unsigned mask = [] {
+        const char* v = std::getenv("STRIX_HC_PERSISTENT_ROWS");
+        if (!v || !*v) {
+            const char* p = std::getenv("STRIX_HC_PERSISTENT");
+            return p && *p ? ~0U : (1U << 2U) | (1U << 4U);
+        }
+        unsigned m = 0;
+        for (const char* c = v; *c;) {
+            char* end = nullptr;
+            const auto n = std::strtoul(c, &end, 10);
+            if (end == c) { ++c; continue; }
+            if (n < 32U) m |= 1U << n;
+            c = end;
+        }
+        return m;
+    }();
+    return count < 32U && ((mask >> count) & 1U) != 0U;
 }
 bool persistent_decline(const char* why) {
     if (std::getenv("STRIX_HC_PERSISTENT_VERBOSE")) std::fprintf(stderr, "persistent HC inject fold declined: %s\n", why);
@@ -4225,6 +4282,7 @@ bool persistent_hyper_rows_eligible(const PreparedHyperRows& prepared, const Hip
         config.lane_chain_output && config.hidden_size == kPersistHidden && config.hc_count == kPersistStreams &&
         config.lowrank == kPersistRank && p.down_manifest->ggml_type == 8U && p.up_manifest->ggml_type == 8U &&
         (!p.inject_runtime || p.inject_manifest->ggml_type == 0U) && (count == 2U || count == 4U || count == 8U) &&
+        persistent_hyper_rows_size(count) &&
         // The persistent kernel has no Q6P32 form: weights with a registered copy keep the launches that read it.
         !q6p::registered(reinterpret_cast<const void*>(p.down_runtime->address)) &&
         !q6p::registered(reinterpret_cast<const void*>(p.up_runtime->address));
@@ -4397,7 +4455,7 @@ std::vector<std::uint64_t> hip_hyper_mix_testing_persistent_trace() {
 bool hyper_mix_known_window_rows_launch_injected(std::span<const ExecutionDispatchContext> inject_rows,
     const HipElementwiseLauncherConfig& inject_config, std::span<const ExecutionDispatchContext> rows,
     const HipHyperMixLauncherConfig& config) {
-    static const bool enabled = [] { const char* v = std::getenv("STRIX_HC_PERSISTENT_INJECT"); return v && v[0] == '1'; }();
+    static const bool enabled = strix_fuse_switch("STRIX_HC_PERSISTENT_INJECT");
     if (!enabled || inject_rows.size() != rows.size()) return false;
     const auto prepared = prepare_hyper_rows(rows, config);
     if (!persistent_hyper_rows_eligible(prepared, config) || inject_config.activation != config.activation ||
@@ -4464,6 +4522,29 @@ void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext
     const HipHyperMixLauncherConfig& config) {
     const auto prepared = prepare_hyper_rows(rows, config);
     launch_hyper_rows(prepared, prepared.rows, config, 1U);
+}
+void hyper_mix_known_window_cohort_launch(std::span<const std::span<const ExecutionDispatchContext>> segments,
+    const HipHyperMixLauncherConfig& config) {
+    if(segments.size()<2U || segments.size()>8U || !config.splitk_projection || !config.lane_chain_output)
+        throw std::invalid_argument("wide HC cohort requires split-K and lane-chain output");
+    auto lead=prepare_hyper_rows(segments[0],config);
+    HyperCohortRows rows{};
+    std::uint32_t count=0;
+    for(const auto segment:segments) {
+        const auto p=prepare_hyper_rows(segment,config);
+        if(count+p.count>32U || p.first.down_runtime->address!=lead.first.down_runtime->address ||
+            p.first.up_runtime->address!=lead.first.up_runtime->address ||
+            p.first.norm_runtime->address!=lead.first.norm_runtime->address ||
+            (p.first.inject_runtime?p.first.inject_runtime->address:0U)!=
+                (lead.first.inject_runtime?lead.first.inject_runtime->address:0U))
+            throw std::invalid_argument("wide HC cohort rows or weights differ");
+        for(std::uint32_t r=0;r<p.count;++r,++count) {
+            rows.input[count]=p.rows.input[r];rows.output[count]=p.rows.output[r];
+            rows.normalized[count]=p.rows.normalized[r];rows.low[count]=p.rows.low[r];rows.injection[count]=p.rows.injection[r];
+        }
+    }
+    lead.count=count;
+    launch_hyper_rows(lead,rows,config,1U);
 }
 
 namespace {
@@ -5671,6 +5752,8 @@ void enqueue_hip_mtp_hyper_mix_q8(const std::uint16_t* input,const float* norm,c
     // independent chains. The serial lane-chain output stays: its one-row register form is slower.
     static const bool rows_kernels=[]{const char* v=std::getenv("STRIX_MTP_HC_ROWS");return !v || v[0]!='0';}();
     if(draft && rows_kernels && reinterpret_cast<std::uintptr_t>(normalized)%16U==0U) {
+        if(launch_persistent_hyper_draft(input,norm,down,static_cast<const float*>(inject),up,normalized,low,injection,output,epsilon,stream))
+            return;
         HyperRows rows{};
         rows.input[0]=input;rows.output[0]=output;rows.normalized[0]=normalized;rows.low[0]=low;rows.injection[0]=injection;
         constexpr unsigned outputs=2U,blocks=(rank+outputs-1U)/outputs;

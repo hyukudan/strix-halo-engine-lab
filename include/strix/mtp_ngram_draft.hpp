@@ -28,7 +28,9 @@ struct MtpNgramDraftConfig {
 };
 
 struct MtpNgramDraftStats {
-    std::uint64_t cycles = 0;          // cycles with a shadow proposal
+    std::uint64_t cycles = 0;          // cycles with a shadow proposal (host only: no verifier row unless extended)
+    std::uint64_t scored_cycles = 0;   // shadow proposals in play (their confident drafts were all emitted)
+    std::uint64_t shadow_right_rows = 0; // leading shadow rows equal to the emitted tokens (would-be accepted rows)
     std::uint64_t extended_cycles = 0; // cycles whose candidates were extended
     std::uint64_t extension_rows = 0;  // extension rows proposed to the verifier
     std::uint64_t accepted_rows = 0;   // extension rows accepted by the target

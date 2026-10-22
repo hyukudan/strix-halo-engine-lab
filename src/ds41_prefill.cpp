@@ -5,6 +5,24 @@
 
 namespace strix::ds41 {
 
+std::vector<PrefillPass> plan_prefill_passes(std::uint32_t total, std::uint32_t pass_rows,
+                                          std::uint32_t alignment, std::uint32_t min_final_rows) {
+    if (total == 0U || alignment == 0U || pass_rows == 0U || pass_rows % alignment != 0U || min_final_rows > pass_rows)
+        throw std::invalid_argument("ds41 prefill passes: nonempty rows, aligned capacity and final suffix within capacity");
+    std::vector<PrefillPass> passes;
+    std::uint32_t begin = 0;
+    while (total - begin > pass_rows) {
+        const auto left = total - begin;
+        auto rows = pass_rows;
+        if (left - rows < min_final_rows) rows = (left - min_final_rows) / alignment * alignment;
+        if (rows == 0U) throw std::invalid_argument("ds41 prefill passes: no aligned split preserves the final suffix");
+        passes.push_back({begin, rows});
+        begin += rows;
+    }
+    passes.push_back({begin, total - begin});
+    return passes;
+}
+
 PrefillRoutes build_prefill_routes(std::span<const std::uint32_t> ids, std::uint32_t rows, std::uint32_t top_k,
                                    std::uint32_t experts, std::uint32_t split, std::uint32_t batch_rows, std::uint32_t first,
                                    std::uint32_t end) {

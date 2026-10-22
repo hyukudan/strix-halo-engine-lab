@@ -27,11 +27,11 @@ struct SiteRow {
     Pick q8[7], u6[7];
 };
 
-// q_b slot: rows 2..8. The segment form 4,8,0,3 (ds41/sr2-qbflat) for U6 R3-R8 and Q8_0 R6-R8; the sweep picks elsewhere.
+// q_b slot: rows 2..8. The segment form 4,8,0,3 for U6 R3-R8 and Q8_0 R6-R8; the sweep picks elsewhere.
 constexpr Pick qb_q8[7] = {rn(1, 8, true), rn(2, 8, true), rn(2, 8, false), rn(1, 16, false), seg(4, 8), seg(4, 8), seg(4, 8)};
 constexpr Pick qb_u6[7] = {rn(2, 8, false), seg(4, 8), seg(4, 8), seg(4, 8), seg(4, 8), seg(4, 8), seg(4, 8)};
 
-// Picks of rows 2..8 from the cold sweep (strix-hip-ds41-rn-sel-bench, cluster2 turns sr2-rnsel-bench1/2: median of 4
+// Picks of rows 2..8 from the cold sweep (strix-hip-ds41-rn-sel-bench on one node, two sweeps: median of 4
 // runs of the stream time; all variants bitwise equal). Rule: the engine kernel when it is within 1% of the best shape,
 // else the =1 default shape when within 1% of the best, else the best. One tensor-parallel rank (--tp-attention); the
 // single-process q_b (32,768 outputs) and head (129,280) rows reuse the TP picks (not measured).

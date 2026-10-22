@@ -9,9 +9,17 @@
 #include <stdexcept>
 #include <string>
 
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#include <malloc.h>
+#include <sys/stat.h>
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace strix::ds41 {
 namespace {
@@ -21,6 +29,43 @@ void require(bool ok, const char* message) {
 }
 
 constexpr std::uint64_t page_size = 4096;
+
+// Positional read (pread; thread-safe on a shared descriptor) and page-aligned buffers.
+#if defined(_WIN32)
+// Native Windows: the descriptor wraps a file handle opened with CreateFileW; FILE_FLAG_NO_BUFFERING is the
+// O_DIRECT analogue (offsets, lengths and buffers page aligned, as the direct path reads whole pages), and
+// ReadFile with an OVERLAPPED offset on a synchronous handle is a positional read like pread.
+int open_rows_file(const std::filesystem::path& file, bool direct) {
+    const DWORD flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS | (direct ? FILE_FLAG_NO_BUFFERING : 0U);
+    const HANDLE h = ::CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    const int fd = ::_open_osfhandle(reinterpret_cast<intptr_t>(h), _O_RDONLY | _O_BINARY);
+    if (fd < 0) ::CloseHandle(h);
+    return fd;
+}
+long long read_at(int fd, std::uint8_t* out, std::size_t bytes, std::uint64_t offset) {
+    OVERLAPPED at{};
+    at.Offset = static_cast<DWORD>(offset & 0xffffffffU);
+    at.OffsetHigh = static_cast<DWORD>(offset >> 32U);
+    DWORD got = 0;
+    const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(fd));
+    if (!::ReadFile(handle, out, static_cast<DWORD>(bytes), &got, &at)) return -1;
+    return static_cast<long long>(got);
+}
+std::uint8_t* alloc_pages(std::size_t bytes) { return static_cast<std::uint8_t*>(::_aligned_malloc(bytes, page_size)); }
+void free_pages(std::uint8_t* p) { ::_aligned_free(p); }
+void close_fd(int fd) { ::_close(fd); }
+#else
+long long read_at(int fd, std::uint8_t* out, std::size_t bytes, std::uint64_t offset) {
+    return static_cast<long long>(::pread(fd, out, bytes, static_cast<off_t>(offset)));
+}
+std::uint8_t* alloc_pages(std::size_t bytes) {
+    void* raw = nullptr;
+    return ::posix_memalign(&raw, page_size, bytes) == 0 ? static_cast<std::uint8_t*>(raw) : nullptr;
+}
+void free_pages(std::uint8_t* p) { std::free(p); }
+void close_fd(int fd) { ::close(fd); }
+#endif
 
 } // namespace
 
@@ -83,6 +128,17 @@ EngramRowReader::EngramRowReader(const std::filesystem::path& file, std::vector<
                                  bool direct_io)
     : tables_(std::move(tables)) {
     require(threads >= 1 && threads <= 256 && !tables_.empty(), "Engram reader configuration");
+#if defined(_WIN32)
+    if (direct_io) {
+        fd_ = open_rows_file(file, true);
+        direct_ = fd_ >= 0;
+    }
+    if (fd_ < 0) fd_ = open_rows_file(file, false);
+    if (fd_ < 0)
+        throw std::runtime_error("Engram reader cannot open the model file: Win32 error " + std::to_string(::GetLastError()));
+    struct _stat64 st{};
+    if (::_fstat64(fd_, &st) != 0) { close_fd(fd_); throw std::runtime_error("Engram reader cannot stat the model file"); }
+#else
     if (direct_io) {
         fd_ = ::open(file.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
         direct_ = fd_ >= 0;
@@ -90,11 +146,12 @@ EngramRowReader::EngramRowReader(const std::filesystem::path& file, std::vector<
     if (fd_ < 0) fd_ = ::open(file.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd_ < 0) throw std::runtime_error("Engram reader cannot open the model file: " + std::string(std::strerror(errno)));
     struct stat st{};
-    if (::fstat(fd_, &st) != 0) { ::close(fd_); throw std::runtime_error("Engram reader cannot stat the model file"); }
+    if (::fstat(fd_, &st) != 0) { close_fd(fd_); throw std::runtime_error("Engram reader cannot stat the model file"); }
+#endif
     file_bytes_ = static_cast<std::uint64_t>(st.st_size);
     for (const auto& t : tables_)
         if (t.rows == 0 || t.file_offset + t.rows * engram_row_bytes > file_bytes_) {
-            ::close(fd_);
+            close_fd(fd_);
             throw std::invalid_argument("Engram table lies outside the model file");
         }
     for (unsigned i = 0; i < threads; ++i) threads_.emplace_back([this] { worker(); });
@@ -107,7 +164,7 @@ EngramRowReader::~EngramRowReader() {
     }
     wake_.notify_all();
     for (auto& t : threads_) t.join();
-    if (fd_ >= 0) ::close(fd_);
+    if (fd_ >= 0) close_fd(fd_);
 }
 
 void EngramRowReader::read_one(const EngramRowRequest& r, std::uint8_t* out, std::uint8_t* page) {
@@ -116,7 +173,7 @@ void EngramRowReader::read_one(const EngramRowRequest& r, std::uint8_t* out, std
     if (!direct_) {
         std::size_t got = 0;
         while (got < engram_row_bytes) {
-            const auto n = ::pread(fd_, out + got, engram_row_bytes - got, static_cast<off_t>(offset + got));
+            const auto n = read_at(fd_, out + got, engram_row_bytes - got, offset + got);
             if (n <= 0) throw std::runtime_error("Engram row read failed");
             got += static_cast<std::size_t>(n);
         }
@@ -129,7 +186,7 @@ void EngramRowReader::read_one(const EngramRowRequest& r, std::uint8_t* out, std
     const std::size_t length = static_cast<std::size_t>(last - first);  // one or two pages
     std::size_t got = 0;
     while (got < length) {
-        const auto n = ::pread(fd_, page + got, length - got, static_cast<off_t>(first + got));
+        const auto n = read_at(fd_, page + got, length - got, first + got);
         if (n <= 0) throw std::runtime_error("Engram row direct read failed");
         got += static_cast<std::size_t>(n);
         if (got % page_size) throw std::runtime_error("Engram direct read returned a partial page");
@@ -140,9 +197,8 @@ void EngramRowReader::read_one(const EngramRowRequest& r, std::uint8_t* out, std
 }
 
 void EngramRowReader::worker() {
-    void* raw = nullptr;
-    if (::posix_memalign(&raw, page_size, 2 * page_size) != 0) std::abort();
-    auto* page = static_cast<std::uint8_t*>(raw);
+    auto* page = alloc_pages(2 * page_size);
+    if (page == nullptr) std::abort();
     std::uint64_t seen = 0;
     for (;;) {
         std::span<const EngramRowRequest> batch;
@@ -176,7 +232,7 @@ void EngramRowReader::worker() {
         }
         done_.notify_all();
     }
-    std::free(page);
+    free_pages(page);
 }
 
 void EngramRowReader::read(std::span<const EngramRowRequest> requests, std::span<std::uint8_t> out) {

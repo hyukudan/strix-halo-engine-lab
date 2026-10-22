@@ -12,7 +12,7 @@
 
 #include "strix/ds41_scalar_codecs.hpp"
 
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) || defined(__CUDACC__)
 #define DS41A_HD __host__ __device__ inline
 #else
 #define DS41A_HD inline

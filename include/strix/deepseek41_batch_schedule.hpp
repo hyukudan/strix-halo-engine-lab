@@ -42,7 +42,7 @@ inline PlannedStep plan_step(std::span<BatchSequence* const> sequences, std::uin
     for (std::uint32_t i = 0; i < sequences.size() && out.rows.size() < max_rows; ++i) {
         const auto& s = *sequences[i];
         if (!s.reading_prompt()) continue;
-        std::size_t take = std::min<std::size_t>({prompt_rows, max_rows - out.rows.size(), s.prompt.size() - s.fed});
+        std::size_t take = std::min<std::size_t>({prompt_rows, BatchForward::max_rows, max_rows - out.rows.size(), s.prompt.size() - s.fed});
         if (s.position == 0U) take = std::min<std::size_t>(take, 1U);
         for (std::size_t k = 0; k < take; ++k) {
             out.rows.push_back({s.slot, s.prompt[s.fed + k]});

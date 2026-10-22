@@ -6,7 +6,7 @@
 | --- | --- | --- | --- | --- |
 | D-001 | Build a dedicated inference engine for Strix Halo and Qwen3.8-Flash-Next. | Specializing for one platform and one model allows kernels, memory layout and scheduling that a general-purpose runtime cannot assume. | Scope confirmed by the owner. | Reopen only by explicit decision. |
 | D-002 | Retired. | Superseded by the publication policy in `AGENTS.md`. | — | — |
-| D-003 | Start with native Linux, ROCm and `gfx1151`. | It is the real target environment and allows hardware-specific optimization. | Target hardware (Bosgame M5, Ryzen AI Max+ 395). | Revisit after a first stable version. |
+| D-003 | Start with native Linux, ROCm and `gfx1151`. | It is the real target environment and allows hardware-specific optimization. | Target hardware (a Ryzen AI Max+ 395 mini PC). | Revisit after a first stable version. |
 | D-004 | Use GGUF as the initial input format. | Public format, weights available, no dependency on private formats. | `GGUF_READER.md`. | Measure a lossless internal cache later. |
 | D-005 | Quality and reproducibility are gates, not later tasks. | MTP, recurrence and quantization can produce misleading gains. | `docs/qualification-ledger.md`. | Permanent. |
 | D-006 | The priority UI is a remote administration plane. | Operation, observability and benchmarks add more value than another chat client. | Scope confirmed by the owner. | Chat remains an optional integrated playground. |
@@ -131,7 +131,7 @@ binary deployment.
 
 # Speculative decode decisions (2026-10-16 to 2026-10-17)
 
-All measurements below are from one Bosgame M5 node (Ryzen AI Max+ 395, 128 GB), UD-Q4_K_XL, a 43-token
+All measurements below are from one Strix Halo node (Ryzen AI Max+ 395, 128 GB), UD-Q4_K_XL, a 43-token
 prompt and 256 generated tokens, compared against the same binary's serial output. They are local workload
 numbers, not qualification evidence. Every adopted change kept the output bit-identical.
 
@@ -935,7 +935,7 @@ the dense prefill's tokens.
 | Server, one request at a time: against the command line; repeated prompts; prefix state cache cold/warm (host, and disk across two processes, 8192 tokens restored) | Identical |
 | Server `--http-batch 4`: four concurrent requests (and two pairs of equal prompts), with and without the shared prefix cache | Every request returns its solo tokens |
 
-Single smoke pass, not a campaign (cluster1, server, one request each, 256 tokens): prompt time 8K prose 12.3 s
+Single smoke pass, not a campaign (one node, server, one request each, 256 tokens): prompt time 8K prose 12.3 s
 dense (T = 2048) against 9.2 s fast (T = 8192), 32K code 50.7 s against 38.5 s, 32K prose 51.2 s against 38.6 s;
 end to end 18.1 against 15.0 s and about 56-57 against 44-45 s. Tail blocks (1024,256,64,16) did not help these
 prompts.
@@ -1006,6 +1006,150 @@ cohort requests on the tiled prompt (T = 2048; code1k, prose1k and six short pro
 every request's tokens equal those with the explicit `--known-prefix-tail-rows 1024,256,64,16`, along the same route
 (the 1K prompts as one 1024-row tail block, 1.3-1.4 s, against about 45 s as serial rows without tails), replay 0.
 
+## D-057: served requests start from the controller's prior (`STRIX_MTP_REQUEST_RESET`, default)
+
+Each served request resets the adaptive min-p, depth or survival controller of its slot to the configured prior:
+learned window costs, the median of cost samples, acceptance bins, warm-up, choices and re-probe backoff. The
+slot's device owners are reused. `STRIX_MTP_REQUEST_RESET=0` keeps the earlier behaviour for comparisons. The
+target verifies every token, so tokens and committed state do not change.
+
+Why: the controller kept the costs it had learned inside the previous requests. Under concurrent scheduling those
+wall-clock costs include other slots' work and prefills (R4 measured 195 ms instead of 57 ms), so after chat traffic
+a single request stopped extending past R2 and decoded about 30 % slower, persistently.
+
+Measured on one Strix Halo node, 256 tokens at T = 0, three consecutive requests per cell (server decode rate):
+
+| Phase | code1k, before → reset (tok/s) | prose1k, before → reset (tok/s) |
+| --- | --- | --- |
+| Before chat traffic | 58.65 → 59.15 | 55.99 → 54.89 |
+| After 40 chat requests | 41.47 → 59.11 | 41.47 → 54.84 |
+| After 80 chat requests | 41.72 → 58.89 | 41.30 → 54.69 |
+
+With the reset the schedule stays at 73 cycles (182/274 accepted/proposed) on code1k and 85 cycles on prose1k in all
+nine requests; without it, 137-138 cycles. The difference before traffic is not claimed as a gain or a loss
+(separate windows, no thermal control).
+
+## D-058: joint windows for concurrent served requests (`STRIX_MTP_BATCH_JOINT=1`, with `STRIX_COHORT_ROWS=32 STRIX_COHORT_WIDE=all`)
+
+With two or more decoding requests, the server chooses all requests' verify windows together under a row budget,
+from the measured costs of the whole topology and each slot's acceptance history (reset when a request is
+admitted); a request may also skip drafting for a cycle and commit one row. HC, router and shared expert run as
+wide steps of up to 32 rows next to the existing GDN/QSA/head projections and expert union. One request keeps its
+own route. The switch is off in the code; the production replicas set it. See
+[joint serving windows](docs/joint-serving-windows.md).
+
+Why: the earlier server capped each request at R4 with two requests and R2 with three or more, and a 6-row cycle
+(R4 + R2) ran as two separate chunks that each read all dense weights (7 of 19 cycles at C2 in a trace).
+
+Measured on one node, three AB/BA/AB plans, fresh servers per arm, sum of the requests' decode rates (median):
+
+| Load | C | Before (tok/s) | Joint (tok/s) | Change |
+| --- | ---: | ---: | ---: | ---: |
+| code1k, 256 tokens | 1 | 59.86 | 59.89 | +0.05 % |
+| code1k | 2 | 64.13 | 71.03 | +10.8 % |
+| code1k | 4 | 78.13 | 83.07 | +6.3 % |
+| coding chat, 187 tokens | 2 | 91.23 | 102.65 | +12.5 % |
+| coding chat | 4 | 89.54 | 121.94 | +36.2 % |
+
+At C2 and C4 every joint run is above every earlier run. 84/84 requests return the tokens they return alone;
+the gates compare 3,328 full FP32 logit rows and 217 committed state components with C1. Coding chat at C1 is too
+noisy (68.8-91.0 tok/s in the control arm) to attribute its median change to the switch.
+
+## D-059: persistent draft score, attention tail and draft cache (`STRIX_QPERSIST_*`)
+
+`STRIX_QPERSIST_DRAFT_SCORE=1`, `STRIX_QPERSIST_QSA_TAIL=1` and `STRIX_QPERSIST_MTP_CACHE=1` run the MTP QK score,
+the QSA softmax/value/gate tail and the draft cache publication as single workgroup kernels with the same reduction
+trees and roundings ([details](docs/qwen-persistence-kernels.md)). The switches are off in the code; the production
+replicas set the three. `STRIX_QPERSIST_GDN_TAIL` stays off: a traced R8 regression.
+
+Measured on one node, 3 interleaved plans, 256 tokens, on top of the production decode set: code1k 59.34 → 59.88
+tok/s (+0.9 %), prose1k 55.06 → 55.52 (+0.8 %), all three runs above all three base runs; prose8k and code32k
+within noise (no repeated regression). Tokens are identical in all 24 runs (golden replay error 0).
+
+## D-060: two full replicas, one per node, behind the router
+
+The model runs as one complete copy per Strix Halo node, and the router sends each request to one replica
+(T 1024 with a prefix-cache entry every 1024 tokens, balanced by active decodes). Nothing crosses the USB4 link.
+Tensor parallelism of one request across the two nodes is rejected for now (X-021).
+
+Measured through the router before D-057/D-058 (8-category short-prompt set, wall aggregate including time to
+first token): 42.4 / 84.6 / 94.8 / 86.3 tok/s at 1 / 2 / 4 / 6 requests. 78/78 token-prompt outputs equal the
+single-node tokens. Coding chat on fresh servers: 66.1 / 123.8 / 134.6 tok/s wall at 1 / 2 / 4 requests (decode
+summed over requests 89.1 / 179.0 / 180.7). C6 is below C4 because each node prefills its queued prompts one after
+another while its decodes pause.
+
+Re-measured with D-057 and D-058 (supersedes the numbers above; servers restarted before each of 3 rounds, median):
+8-category set 42.8 / 85.8 / 102.9 / 110.6 / 120.4 tok/s wall aggregate at 1 / 2 / 4 / 6 / 8 requests; coding chat
+68.1 / 136.2 / 146.9 / 166.7 tok/s wall at 1 / 2 / 4 / 8 (decode summed over requests 90.7 / 181.5 / 201.6 / 255.0).
+C6 and C8 now scale past C4. Token ids equal one node's in all 570 responses.
+
+## D-061: DeepSeek-V4.1 two-node production defaults
+
+The two-node DeepSeek-V4.1 apps default to the configuration measured as a gain and exact in the P17.1 timing
+campaign (132 timed runs, 3 interleaved rounds per arm, every run's tokens checked against its identity's
+reference) and the P17.2-P17.4 gates. The full table, the environment of the production identity and the opt-outs
+are in [docs/ds41-production-defaults.md](docs/ds41-production-defaults.md).
+
+| Default | Effect (measured against all on) |
+| --- | --- |
+| Segmented batch steps (`STRIX_DS41_BATCH_SEGMENTS`) | batch N=8 87.0 → 95.8 tok/s (+9.1 %) |
+| Expert-TP down (`STRIX_DS41_TP_DOWN`) | R6 window 66.0 → 64.0 ms (−3.0 %), batch N=8 +1.6 % |
+| Speculative batch (`--draft-ranks 2`, controller) | N=1 +82 %, N=2 +53 %, N=4/8 neutral (the controller stops drafting) |
+| Speculative serve (`--dspark-ranks 2`, `--dspark-max-inflight 4`) | C1 +62 %, C2 +52 %, C4 +19 %; at C8 the cap cuts the TTFT cost over plain from +45 % to +24 % and keeps +7 % throughput |
+| Interleaved serve prefill (`STRIX_DS41_SERVE_SCHED=interleave`) | an 8K prompt under 4 decoding streams stalls decode ≤ 0.95 s instead of 12.9 s; its own TTFT 12.8 → 28.8 s |
+
+Off: the tpserve prefill (X-023), the prepared load, `STRIX_DS41_BATCH_ROWS16` and the serve cache profile (no gain
+on short chats). Serve with the defaults (P17.4, layout 1): 64/64 requests token-identical to the campaign
+reference, 38.4 / 52.7 / 59.3 / 66.8 tok/s at C1 / C2 / C4 / C8 on the 8-category short-prompt set.
+
+## D-062: DeepSeek-V4.1 dist transport: bounded waits, eager small messages, fused staging
+
+- Waits on the USB4 streams are bounded and abortable with a shared stop, host streams are non-blocking, and a
+  failed exchange reports the transport state and names the collective in flight. Serve sets
+  `STRIX_DIST_USB4_TIMEOUT_MS` and `STRIX_DIST_WAIT_TIMEOUT_MS` to 60000 unless given, below its 120 s watchdog.
+- `STRIX_DIST_USB4_EAGER` defaults to 65536 (`=0` off): messages up to 64 KiB go out in one duplex poll loop.
+  R1 27.8 → 28.5 tok/s (+2.5 %), R6 and batch equal, bits identical.
+- `STRIX_DIST_STAGING` defaults to fused (`=copy` off): the TP o_b product writes the coherent pinned send buffer
+  and the add reads the pinned receive buffer, on host-path routes. R1 −0.2 to −0.4 ms per token, batch N=1..2
+  −0.25 ms per step, R6 / N=8 / prefill equal; bitwise in layouts 1 and 2bq.
+
+Why: a rare host-path stall used to end only at the 120 s watchdog with no report; the soak after the change (4 serve
+passes, 288 requests, and 3 long-prompt runs) had every token id equal to the reference and no stall.
+
+## D-063: GPU-direct exchange in the DeepSeek-V4.1 production apps (`usb4gpu`, serve `usb4_gpu_auto`)
+
+Rank, batch, prefill, serve and dspark-rank build the device exchange next to the host control transport. Without
+gpu_direct streams they print "gpu-direct unavailable … host path only" and run the host path. Serve quiesces both
+ranks when it goes idle after work, so no posted GPU receive outlives the driver's 30 s DMA deadline. The bits are
+the same in both layouts (R1, R6, batch, prefill 8K logits, serve 64/64 + warm 8/8).
+
+Measured, the same binary and kernel, layout 2bq against layout 1: R6 window 63.53 → 61.71 ms (+2.9 %), prefill 8K
+721.7 → 733.3 tok/s (+1.6 %), serve C2 / C4 / C8 +5 / +7 / +4 %, 8K TTFT after 40 s idle 17.35 → 15.69 s, R1
+−1 % (2 host streams instead of 4), batch equal. 2b with `latency_qos_us 0` is slower everywhere. The production
+layout is the deployment's choice.
+
+## D-064: a discrete GPU in the DeepSeek-V4.1 decode (RTX split, opt-in)
+
+An NVIDIA RTX PRO 6000 Blackwell (96 GB) in a PC can take part in the two-node DeepSeek-V4.1 decode in two
+modes, both opt-in and neither changing a pair-only default:
+
+- **Pipeline split** (`strix-cuda-ds41-pipeline-front` + `strix-deepseek41-rank --role pipeline-stage --first-layer
+  22`, protocol `strix/ds41-pipeline-v1` with the speculative BEGIN / VERIFY / ACCEPT / COMMIT extension): the RTX
+  runs layers [0, 22), the pair [22, 40) and the head. Without trellis sites it is bitwise the pair-only decode
+  (24/24 prompts, 6144/6144 tokens); with the trellis shared expert the RTX layers use the composed identity
+  `ds41-hetero-mixb-k22-v1` (IEEE pair sums on CUDA), gated against the pair-only mix-B run (KL mean 1.70e-3,
+  top-1 127/128). Measured (8 EN / 8 ES / 8 code prompts × 256 tokens): DSpark 61.8 tok/s against 46.4 pair-only
+  (x1.33), greedy 38.3 tok/s. A resident CUDA prefill service can run the prompt on the RTX (experts streamed
+  from pinned host memory) and hand the state to the pair's import route: exact profile, TTFT including the export
+  3.64 s at 2K, 4.39 s at 8K, 12.20 s at 32K (warm service, handoff to a local import endpoint). The fast prefill profile is not qualified.
+- **Dense + hot experts** (`strix-cuda-ds41-hot-decode` + `strix-deepseek41-expert-server`): the RTX holds the
+  dense weights and a placement of hot experts, the pair serves the others. Exact; 40.1 tok/s greedy on 6 chats
+  against 27.2 pair-only on that build. It degrades for DSpark windows R >= 4 (most layers go remote over 1 GbE),
+  so the pipeline split is the mode for speculative decoding.
+
+Why opt-in: both need a second machine, a 1-2.5 GbE link and a CUDA build (`STRIX_ENABLE_CUDA_DS41`); the pair-only
+path stays the reference and the default.
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |
@@ -1027,3 +1171,7 @@ every request's tokens equal those with the explicit `--known-prefix-tail-rows 1
 | X-018 | Routed-expert window kernels (A8 gate/up `project_window`, Q5_1/Q8_0 `down_window`): aligned 16/8-byte Q5_1 block loads instead of byte loads, one gate/up pass for experts of 5-8 rows (G=8), half the Q4_K blocks in registers (`STRIX_MOE_GATEUP_CHUNK=5`) in windows, other expert orders and 64/128-row tiles | exact; union fixture 0 % (wide down), +4..+17 % slower (G=8); in-situ R8 trace 0 % (chunk 5) | The kernels already run near the bandwidth of their access pattern: a pure read of the same scattered expert slabs (no arithmetic) reaches 205-226 GB/s for 10-80 experts (236 GB/s for one contiguous stream), the window down kernel runs at that floor and gate/up at about 85-90 % of it (about 190 GB/s in situ). The remaining gate/up gap is worth at most about 3-4 % of an R8 window. |
 | X-019 | Shared expert and window GDN core: shared expert of all rows in one weight pass or fused gate/up/down; GDN recurrence with 4 or 2 value columns per wave, a tiled recurrence (one block per value head and 32 columns, coalesced state through LDS, 2/4/8 columns per wave, `STRIX_GDN_WINDOW_TILED`), a row-parallel prepare (one 128-thread group per row) and a prepare with the beta/gate scalars over (head, row) pairs (`STRIX_GDN_WINDOW_PREPARE_GATES`) | all bit-exact (228 fixture scenarios, identical tokens, replay 0); shared expert not changed (0 % by construction); tiled recurrence fixture -17 % (R1) to -12 % (R8), in-situ R8 trace -3 % (54.7 to 52.9 us per layer); parallel gates fixture R8 -25 %, in situ 0 %; row-parallel prepare and plain 4/2 columns slower | The shared expert runs on the second stream and ends before the routed merge in every window layer of an R8 trace (median slack 259 us), so it is off the window critical path. In situ the window recurrence reads a cold 3.1 MB state per layer (about 13 us at DRAM bandwidth) and then runs a dependent chain of about 4-5 us per row; the exact variants only shorten the warm parts. Both GDN switches stay opt-in (about 0.1 % of an R8 window). Shortening the row chain further needs a different summation order (chunked form), which is not bit-exact. |
 | X-020 | Verify-window LM head of 5-8 rows (`STRIX_LM_HEAD_ROWS_LEAN=2`): staged inputs read as 16-byte LDS words with one-instruction BF16 unpacking, two logits per wave sharing them, lane and local reduction trees evaluated two partial sums per register (same operand pairs, operands commuted), greedy partials fused into the head kernel; also the one-logit form (`=1`) and the lean kernel for 2-4 rows | logits bit-identical to the R1 head (all fixture rows cases, 2-8 rows), same greedy replies as the CPU oracle, identical tokens and replay 0 on two 512-token prompts; real-shape fixture R8 4.19-4.62 ms to 3.37-3.41 ms (R6 3.58 to 3.43 ms with greedy); in-situ R8 trace 4.54 ms (head 4.43 + greedy 0.11) to 3.56 ms (-0.98 ms per R8 window); 2-4 rows: 3.07/3.14 to 3.30-3.35 ms (slower); `=1` R8 3.92-4.24 ms | The 8-row head was bound by vector instructions (about 170 per 256-byte chunk and 440 for the trees of each logit at 139 VGPRs), not by its 675 MB of weights; the lean form is at about 80 % of the byte floor (2.86 ms). Windows of up to four rows keep the unstaged rows kernel. Kept opt-in until the timing campaign: with the min-p controller R8 windows are 7-28 % of the cycles, so the expected gain is about +0.1-0.5 % tok/s (more with min-p 0 or more R8 windows). |
+| X-021 | Tensor parallelism of one request across the two nodes over USB4 | ~200 µs per complete exchange, host path and GPU-direct | A window has 96 exchanges and leaves ~5 ms for them, so each must stay under ~50 µs at the real cadence (calculated). A raw 20 KB exchange takes 18-22 µs back to back but 70-90 µs on average after ≥ 100 µs idle. Reopen only if exchanges at the model's cadence come close to their back-to-back time. Two replicas instead (D-060). |
+| X-022 | `STRIX_DS41_OB_SPLIT=K`: the TP o_b exchange in K column chunks overlapping the products and adds | exact; R6 66.14 → 67.37 / 69.14 / 71.17 ms at K = 2 / 4 / 8 | Each extra host-path exchange costs ~21 µs net, more than the overlap hides, and nothing independent runs after attention (the compressor index and the engram read this step). Kept opt-in. |
+| X-023 | tpserve prefill (`STRIX_DS41_PREFILL_EXPERT_TP=1`) instead of the expert-parallel prefill | 1.4 % (1K) to 6.1 % (16K) slower | Not adopted. |
+| X-024 | USB4 driver completion work on a per-CPU high-priority queue (`dma_wq_percpu`) | p99 of a 20 KB exchange 230 µs → 2.9 ms; R6 63.90 → 66.24 ms (+3.7 %); R1 28.39 → 27.31 tok/s | A per-CPU worker on the IRQ's CPU cannot move away from what runs there. Receive polling and IRQ pinning were neutral; the after-idle cost is not in the driver's wake-up chain. Kept off. |

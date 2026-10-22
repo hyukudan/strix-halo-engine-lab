@@ -5,6 +5,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include <span>
+
 namespace strix::ds41::attn::hip {
 
 // RoPE tables are per row: the rows' own positions (and, for compress, the group's first position).
@@ -38,6 +40,10 @@ void enqueue_compress(const CompressView& v, hipStream_t stream);
 // STRIX_DS41_COMPRESS_AHEAD=1 (default off): the index key weights of each thread are read three 64-weight steps ahead,
 // the first ones before the latent barrier; the same chains, the same bytes. Tests: 0 off, 1 on, -1 the environment.
 void set_compress_ahead(int mode);
+// STRIX_DS41_COMPRESS_FAST=1 (default off): the same kernel in fewer instructions (hardware F16 conversion of finite
+// weights, 16-byte latent reads, the next weight step requested ahead, branch-free exp range tests); the same chains,
+// the same bytes. Tests: 0 off, 1 on, -1 the environment.
+void set_compress_fast(int mode);
 
 struct IndexView {
     std::uint32_t rows, ratio, max_count;   // max_count >= every row's (pos + 1) / ratio
@@ -89,6 +95,17 @@ struct AttentionView {
 };
 inline constexpr unsigned kAttnGroupCount = 8;   // at most 8 head groups per row (8 heads per block)
 void enqueue_attention(const AttentionView& v, hipStream_t stream);
+
+// Segment launches (several requests of a batch step per launch, STRIX_DS41_BATCH_SEGMENTS): one view per request
+// segment, each exactly the call above (its checks, its grid, every block's work), at most kMaxSegments per launch.
+// The segments must not share state (ring, caches, carry, scratch rows). Index: every qprep, then every scores grid;
+// select: the one-block rows, then the slices, then the merges; attention: grouped by the call's heads per wave.
+inline constexpr unsigned kMaxSegments = 8;
+void enqueue_window_write_segments(std::span<const WindowView> views, hipStream_t stream);
+void enqueue_compress_segments(std::span<const CompressView> views, hipStream_t stream);
+void enqueue_index_scores_segments(std::span<const IndexView> views, hipStream_t stream);
+void enqueue_select_segments(std::span<const SelectView> views, hipStream_t stream);
+void enqueue_attention_segments(std::span<const AttentionView> views, hipStream_t stream);
 #if defined(STRIX_DS41_ATTN_TIMING)
 // timing build: slot k (0 window .. 6 combine) x 65536 blocks x {wall0, wall1, cycles0, cycles1}
 void set_timing_buffer(void* p);

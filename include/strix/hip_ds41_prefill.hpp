@@ -127,6 +127,11 @@ struct PrefillMoeWeights {
     const void* down = nullptr;
     std::uint64_t gate_row_bytes = 0, down_row_bytes = 0; // one output row
     std::uint32_t hidden = 0, inter = 0;
+    // Down width (0: inter). Larger than inter (expert TP, ds41-expert-tp2-i1152-v1 in its 420-byte "dup" rows: inter
+    // 1152, down rows of 5 whole Q2_K blocks = 1280): the A8 activation of every slot is copied to a down_width stride
+    // with the groups past inter zero (codes 0, delta 0), so each of those groups adds +0 to its lane class and the
+    // down product is the declared 36-group product bit for bit.
+    std::uint32_t down_width = 0;
     float limit = 10.0F;
 };
 // Per-call inputs over all T rows; chunk c covers rows [c * chunk_rows, min(T, (c + 1) * chunk_rows)).
@@ -177,6 +182,9 @@ private:
     void enqueue_experts_split(const PrefillMoeInputs& in, std::uint32_t row0, std::uint32_t rows, void* stream);
     void experts_rows(const PrefillMoeInputs& in, std::uint32_t row0, std::uint32_t rows, void* stream);
     void half_rows(const float* weights, std::uint32_t first_row, std::uint32_t rows, std::uint32_t half, float* out, void* stream);
+    void pad_activations(std::uint32_t rows, void* stream);  // down_width > inter only
+    [[nodiscard]] const std::int8_t* down_codes() const noexcept { return pad_codes_ ? pad_codes_ : act_codes_; }
+    [[nodiscard]] const float* down_deltas() const noexcept { return pad_deltas_ ? pad_deltas_ : act_deltas_; }
     PrefillMoeWeights w_;
     std::uint32_t top_k_, experts_, split_, chunk_rows_, first_, end_;
     std::uint64_t scratch_bytes_ = 0;
@@ -187,6 +195,8 @@ private:
     std::int8_t* act_codes_ = nullptr;
     float* act_deltas_ = nullptr;
     std::int32_t* act_sums_ = nullptr;
+    std::int8_t* pad_codes_ = nullptr;  // down_width > inter: the activations at the down's stride
+    float* pad_deltas_ = nullptr;
     float* raw_ = nullptr;
     void* joint_ = nullptr;  // enqueue_half_joint's input copies (allocated on first use)
 };

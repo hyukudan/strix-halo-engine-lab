@@ -34,6 +34,7 @@ struct HostForwardOptions {
     std::uint32_t layers = 4;          // target layers [0, layers)
     std::uint32_t max_positions = 4096;
     std::filesystem::path weights_overlay;  // optional requantization candidate (ds41::WeightOverlay)
+    bool head = true;  // false: no head and no argmax (the FRONT [0, layers) of a pipeline; step() returns no logits)
     // Called with every op output buffer ("op@layer/site:buffer", values) of every step (activation calibration).
     std::function<void(const std::string&, const std::vector<float>&)> buffer_tap;
 };
@@ -62,6 +63,9 @@ public:
     // The weight overlay's description line (empty without one).
     [[nodiscard]] std::string overlay_description() const;
     [[nodiscard]] const std::vector<float>& dumped() const noexcept { return dumped_; }
+    // The last step's activation buffer (stream, mix_ffn, ...) and the attention state (a pipeline FRONT's boundary).
+    [[nodiscard]] const std::vector<float>& buffer(Buffer b) const { return buf_.at(b); }
+    [[nodiscard]] const AttentionHost& attention() const noexcept { return *attention_; }
 
 private:
     std::span<const std::uint8_t> tensor(const std::string& name) const;

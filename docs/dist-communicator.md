@@ -108,6 +108,118 @@ What the stream service could expose to make this simpler (none of it is require
 - an rx polling mode (`rx_napi`/`spin_us`) as a per-open option, so a job can choose it without module
   parameters.
 
+## GPU-direct exchanges (`gpu_direct.hpp`)
+
+With streams in the driver's gpu_direct mode, an exchange goes from a device buffer to the peer's device buffer
+without host copies: `Communicator(group, control, usb4_gpu_direct(...), max_bytes)`, with the same `exchange` /
+`start` / `finish` calls. `control` is a host-path transport (the pairing, the setup messages, and messages larger
+than the GPU-direct capacity).
+
+- **Streams.** The layout's streams whose configfs `gpu_direct` reads 1; this code never writes that attribute.
+  Host-path pairing skips them. A gpu_direct stream pairs with the stream of the same name at the other end of
+  the same cable; the cable map comes from the host-path streams of that cable, so every cable keeps one
+  host-mode stream. The endpoint identity reported by the driver (QUERY) must name the peer host of that cable.
+- **Arenas.** Per stream, a TX and an RX window of `ring_frames` x 4 KB in device memory, exported as DMA-BUF and
+  imported once; `depth` slots (4) per direction, `floor((ring_frames - depth) / depth)` frames each (1 MB with
+  1024 frames). The terminal frame of every operation is built and checked by the kernel (patch 0016): epoch,
+  sequence, payload size, frame count, slot.
+- **One exchange** (sequence k + 1, slot k % depth, on `floor((bytes + 64) / min_part)` streams, at least one):
+  1. `start`: a scatter kernel copies the caller's buffer into the TX slots and writes a 64-byte header after
+     the last part: magic, sequence, plan, request, size, collective tag, layer and a checksum of every 4-byte
+     word, sum of `(w ^ (i * 0x9E3779B1)) * (2i + 1)`. Then an event is recorded. The RX slot's previous
+     operation is retired once the CPU has seen its consumer copy complete.
+  2. Progress thread: PREPARE + SUBMIT of RX k, a CPU wait for the producer event (DMA-BUF reservations do not
+     see HIP work), PREPARE + SUBMIT of TX k, then EVENT polls until RX and TX are complete. It then writes
+     k + 1 into the completion flag (device signal memory).
+  3. `finish`: the stream waits for the flag (`hipStreamWaitValue32`). A gather kernel checks the flag's failure
+     value, copies the RX slots into the caller's buffer and checks the received header against this rank's
+     identity and the checksum of the received words. Then the consumer event is recorded. Neither call waits on
+     the CPU for the GPU.
+- **Order and identity.** Both ranks post and submit in sequence order. A TX that reaches the peer before its RX
+  is posted waits on end-to-end flow control. If the ranks disagree on the order or the size, the kernel's
+  terminal check fails (`GpuQueueTerminalMismatch`). If they disagree on the plan, the request, the collective
+  or the layer, the receiving GPU refuses the exchange. A checksum mismatch is refused too. No mismatch can
+  deliver shifted or foreign data.
+- **Failures.** Every exchange has a deadline (30 s). On a host-side error (deadline, refused terminal, driver
+  error), the progress thread stops every queue of the pair. The peer's operations on those streams then
+  fail, or reach their deadline, so both ranks stop. It then writes the failure value into the flag. A gather that sees the
+  failure value, or refuses a header, records the reason in host-mapped memory and traps. The stream's queue
+  faults, so nothing enqueued after it consumes the buffer, and later HIP calls on the stream fail.
+  `failure()` (and every later `start` / `finish`, which throw it) gives the GPU's reason, the peer's tag and
+  layer, and the host-side cause. The destructor always drains the progress thread.
+- **Opening.** The stream device is opened non-blocking. EAGAIN / EINTR are retried for at most the setup
+  timeout, and the configfs state is checked between attempts.
+- **Any size.** Bytes that are not a whole 4-byte word travel zero-padded in the last word; only the real bytes
+  are written. Parts are `ceil(wire / used)` rounded up to 64 B and checked against the slot before any launch.
+  Messages above the capacity are exchanged in capacity-sized chunks.
+- **Completions.** The scatter's last block stores the sequence into host-mapped memory after a system-scope fence.
+  The progress thread polls that word (no HIP call while the caller launches work), then confirms with the
+  producer event once before SUBMIT. A job ends when every RX has landed; TX completions are consumed later
+  (`STRIX_DIST_GPU_LAZY_TX=0` waits for them), at the latest before that TX slot is reused or at drain. The
+  gather loads the completion flag once per block.
+- **Epochs.** The wall clock in ns, above both ranks' clocks, never random: the driver refuses an epoch lower than
+  a device's last one.
+- **Size router.** `STRIX_DIST_ROUTE` unset (or `table`) is the measured default:
+  - with host streams (a mixed layout such as data0 host + data1 gpu_direct): up to 64 KB on the host path, two
+    rings up to 1 MB, and above that the mixed route with 35 % of the bytes on the host path
+    (`65536:host,1048576:gpu:2,inf:mix:RINGS:35`);
+  - without host streams (every stream gpu_direct): one ring up to 32 KB, two rings up to 256 KB, every ring above.
+
+  Other values:
+  - `auto` measures the host path and the device exchange on 1..rings rings at a grid of sizes when the Communicator
+    is built, at idle, and rank 0's table is applied by both ranks. On the hardware it chose worse than the table.
+  - `gpu`, `host`, or an explicit table `UP_TO:host|gpu[:RINGS],...`.
+
+  The host path is never chosen when the transport is only a TCP control channel. A requested ring count is raised
+  to the fewest rings whose slots hold the message.
+- **Mixed route.** A table entry `UP_TO:mix:RINGS:HOST_PERCENT` sends the head of a message (HOST_PERCENT % of
+  the bytes, a multiple of 64 B, at most the host bound) over the host path and the rest over RINGS rings, both
+  at once. The host part carries its own trailer and CRC; each part lands at its own offset of the receive buffer,
+  so the delivered bytes, and every reduction that reads them, are those of either path alone. This uses the
+  host streams and the GPU-direct rings of a mixed layout together for large messages. `set_routes()` replaces the
+  table between exchanges (both ranks, same table); the probe sweeps host shares with `STRIX_PROBE_MIX`.
+- **Receive posted ahead.** Each exchange on the rings posts the next exchange's receive before its own TX
+  (`STRIX_DIST_GPU_PREPOST`, default on; 0 off). The peer can only send exchange k+1 after receiving exchange k, so it
+  always finds its receive descriptors posted.
+  - Why: on these controllers a TX that starts while the peer's GPU receive ring is empty can wait about 100-200 ms
+    for E2E credits. Back to back, that happened in 9-15 of 3000 exchanges at every size from 20 KB to 1 MB and on a
+    single ring; with the receive posted ahead, in none of 18 000 (p50 +2 µs). Host-mode rings keep their receive ring
+    full and never showed it. The credit mechanism is inferred from these measurements, not proven.
+  - The next exchange's geometry comes from `DeviceExchange::expect_next()`: the communicator gives the next chunk of a
+    chunked message exactly, and otherwise a message of the same size again.
+  - A wrong guess is seen the same way by both ranks, which make the same calls; both then complete one internal
+    exchange of the guessed geometry (scratch buffers, a control identity) that posts the real one's receive.
+  - `Communicator::quiesce()` consumes a receive posted ahead the same way. Call it on both ranks at the same point
+    before staying idle for long (e.g. at the end of a request in a server): a posted receive counts against the
+    driver's DMA deadline (30 s).
+- **Blocking wait.** After an exchange of at most 64 KB (`STRIX_DIST_GPU_BLOCK_WAIT=N`, 0 off, 1 every size), the
+  next exchange's caller waits for that exchange's gather instead of spinning. With polled completion this took
+  decode from 17.8 to 20.2 tok/s. Applied to prefill's large chunks it halved throughput, hence the size limit.
+- **Fallback.** `usb4_gpu_direct_streams()` exchanges both ranks' attached gpu_direct stream counts before any
+  setup. When either rank has none, the apps continue on the host path (`usb4gpu` keeps its host streams;
+  `usb4gpu4` opens `usb4_host_auto`), and both ranks make the same choice. A failure later in the setup throws
+  with its cause (fail closed).
+- **Every stream in gpu_direct mode** (`usb4_gpu_direct_all`). A TCP connection over Ethernet carries only the
+  rendezvous: inventory, epoch, pool identity, session parameters, barriers, the ring order. Then:
+  - **HELLO.** An in-band HELLO on every ring gives the cable map, since a ring is point to point. Crossed cables and
+    stream numbering that differs between the hosts are accepted; a ring whose HELLO endpoints do not match its
+    QUERY identity both ways is refused.
+  - **Ring order.** The rings are ranked by measured 64 B round trip, and ring 0 carries the one-ring messages.
+  - **Ring limit.** `max_streams` keeps the first rings of that agreed order.
+  - App transports: `usb4gpu4:HOST:PORT` (rank, batch) and `usb4-gpu4:HOST:PORT` (prefill), where rank 0 listens on
+    PORT.
+- **Recovery.** Not automatic. A failed exchange poisons the session, and both ranks must restart it. The
+  driver's RECOVER with a fresh epoch, coordinated over the control transport, is the intended path and is not
+  implemented.
+- **Test without hardware.** `strix-hip-dist-gpu-direct-tests` runs two ranks on one GPU against a fake of the
+  queue ioctls. It checks exchanges of 12 B to the full capacity and chunked larger messages through the
+  Communicator, byte-exact. Failure cases run in child processes: a size mismatch (terminal check), a collective
+  mismatch (GPU refusal naming the peer's tag), and a silent peer (deadline). In each case both ranks stop with
+  the cause.
+  The fake pairs operations in physical (FIFO) order. Further cases: sizes at every slot edge and odd sizes with
+  guard bytes; the bootstrap with crossed, renumbered and foreign rings followed by byte-exact exchanges; dropping
+  rings after the bootstrap; the router's calibration on two threads.
+
 ## Expert parallelism of the deepseek41 MoE layer
 
 Each rank runs the router and the shared expert on the same inputs (replicated, identical bits), computes the
@@ -121,6 +233,35 @@ expert (replicated, independent of the exchange) and then finishes the exchange 
 shared expert's GPU time hides the transfer. The order of operations inside every sum is unchanged, so the bits are
 the same with and without overlap.
 
+## Measurements, GPU-direct on 2 rings (data1 of both cables) vs the host path on 2 streams (data0)
+
+Probe `strix-dist-gpu-probe`: GPU producer, exchange, stream synchronize; every received word is checked, and all
+exchanges were byte-exact.
+
+| p50 µs | 64 B | 20 KB | 160 KB | 21 MB |
+|---|---|---|---|---|
+| host path, 2 streams | 26 | 36 | 146 | 15 074 |
+| GPU-direct, 2 rings | 33 | 53 | 95 | 7 491 |
+| GPU-direct, 2 ms idle before each | 110 | 565 | 753 | 7 901 |
+| host path, 2 ms idle before each | 599 | 350 | 263 | 15 590 |
+
+- With the gather loading the completion flag in every thread, it ran at ~1.2-4 GB/s (131 µs at 160 KB). With one
+  load per block it takes 10.9 µs.
+- Reads of the RX arena itself run at full speed, before and after DMA (5-8 µs for copy or checksum kernels up to
+  1 MB).
+
+deepseek41 runner, 40 layers, two nodes. Tokens, batch requests and logits were identical to the host path in
+every run.
+
+| workload | host path | GPU-direct, every size | size router (auto) |
+|---|---|---|---|
+| decode, tok/s | 20.15 | 13.7-15.8 | 20.18 |
+| batch N=8, ms/step | 126.0 | 122.7-123.5 | — |
+| prefill 8K row split, tok/s | 566.5 | 568-583 | 556 |
+
+With every size on GPU-direct, decode loses because small exchanges follow idle gaps and the GPU rings complete
+through interrupts (no polling).
+
 ## Measurements, four streams on two cables (kernel with receive polling)
 
 - Round trip of a 20 KB message: 32 us p50 / 58 us p99 striped over 4 streams, 57 / 68 us on one stream; 120 KB:
@@ -133,7 +274,7 @@ the same with and without overlap.
   shared expert overlapped with the half-sum exchange, 17.70 tok/s (56.5 ms/token), against 16.94 tok/s
   (59.0 ms/token) in the serial order. Same tokens on both ranks and in every variant.
 
-## Measurements (cluster1 <-> cluster2, one USB4 cable, two streams, host path, interrupt-driven module)
+## Measurements (node1 <-> node2, one USB4 cable, two streams, host path, interrupt-driven module)
 
 - Expert parallelism by halves over USB4 between the two nodes: the output of layer 20 equals the single-node
   output bitwise on both ranks (1 and 6 rows, 20-30 inputs each), and the two ranks' outputs agree.

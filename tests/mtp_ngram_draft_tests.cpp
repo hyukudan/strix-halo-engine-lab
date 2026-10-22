@@ -64,6 +64,7 @@ int main() {
         }
         check(opened, "copying opens the gate");
         check(d.stats().accepted_rows > 0 && d.stats().extended_cycles > 0, "accepted extension rows are counted");
+        check(d.stats().shadow_right_rows >= d.stats().accepted_rows && d.stats().scored_cycles > 0, "shadow scoring is counted");
     }
     {
         MtpNgramDraft d;
@@ -81,6 +82,8 @@ int main() {
         }
         check(extended == 0, "a request that does not copy never gets extension rows");
         check(d.stats().cycles > 0, "shadow proposals are still scored");
+        check(d.stats().scored_cycles == d.stats().cycles && d.stats().shadow_right_rows == 0 && d.stats().extension_rows == 0,
+            "wrong shadow proposals are scored, counted as not right and never verified");
         check(d.acceptance(2, false, 0) < 0.2, "shadow scoring lowers the learned acceptance");
     }
     {

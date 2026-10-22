@@ -1436,12 +1436,34 @@ void enqueue_prefill_down(WeightFormat format, const PrefillDownView& view, void
     check(hipGetLastError(), "prefill down launch");
 }
 
+namespace {
+// Slot s's A8 activation (inter codes, inter / 32 deltas) at the down's stride: codes and deltas copied, the groups
+// past inter zero (code 0, delta 0: each adds +0 to its lane class, so the product is the inter-wide one).
+__global__ __launch_bounds__(256) void pad_a8_kernel(const std::int8_t* codes, const float* deltas, std::uint32_t inter,
+                                                     std::uint32_t width, std::int8_t* out_codes, float* out_deltas) {
+    const std::uint64_t s = blockIdx.x;
+    const auto* src = codes + s * inter;
+    auto* dst = out_codes + s * width;
+    for (unsigned i = threadIdx.x; i < width; i += blockDim.x) dst[i] = i < inter ? src[i] : static_cast<std::int8_t>(0);
+    for (unsigned g = threadIdx.x; g < width / 32U; g += blockDim.x)
+        out_deltas[s * (width / 32U) + g] = g < inter / 32U ? deltas[s * (inter / 32U) + g] : 0.0F;
+}
+}  // namespace
+
+void PrefillMoe::pad_activations(std::uint32_t rows, void* stream) {
+    if (pad_codes_ == nullptr || rows == 0U) return;
+    hipLaunchKernelGGL(pad_a8_kernel, dim3(rows * top_k_), dim3(256), 0, static_cast<hipStream_t>(stream), act_codes_, act_deltas_,
+                       w_.inter, w_.down_width, pad_codes_, pad_deltas_);
+    check(hipGetLastError(), "prefill MoE pad");
+}
+
 PrefillMoe::PrefillMoe(const PrefillMoeWeights& weights, std::uint32_t top_k, std::uint32_t experts, std::uint32_t split,
                        std::uint32_t chunk_rows, std::uint32_t first, std::uint32_t end)
     : w_(weights), top_k_(top_k), experts_(experts), split_(split), chunk_rows_(chunk_rows), first_(first), end_(end ? end : experts) {
     if (top_k == 0U || top_k > 16U || experts == 0U || chunk_rows == 0U || first_ >= end_ || end_ > experts || !w_.gate || !w_.up ||
-        !w_.down || w_.hidden == 0U || w_.inter == 0U)
+        !w_.down || w_.hidden == 0U || w_.inter == 0U || (w_.down_width != 0U && (w_.down_width < w_.inter || w_.down_width % 32U != 0U)))
         throw std::invalid_argument("ds41 prefill MoE configuration is inconsistent");
+    if (w_.down_width == 0U) w_.down_width = w_.inter;
     const std::uint64_t slots = static_cast<std::uint64_t>(chunk_rows) * top_k, owned = end_ - first_;
     // Batches of 8 (window path) bound the batch count of either path.
     const std::uint64_t batches = prefill_max_batches(chunk_rows, top_k, static_cast<std::uint32_t>(owned), 8U);
@@ -1456,6 +1478,8 @@ PrefillMoe::PrefillMoe(const PrefillMoeWeights& weights, std::uint32_t top_k, st
     const auto o_sexp = take(batches * 4U), o_sbeg = take((batches + 1U) * 4U), o_stot = take(4U);
     const auto o_codes = take(slots * w_.inter), o_deltas = take(slots * w_.inter / 32U * 4U), o_sums = take(slots * w_.inter / 32U * 4U);
     const auto o_raw = take(slots * w_.hidden * 4U);
+    const bool pad = w_.down_width != w_.inter;
+    const auto o_pcodes = pad ? take(slots * w_.down_width) : 0U, o_pdeltas = pad ? take(slots * w_.down_width / 32U * 4U) : 0U;
     scratch_bytes_ = offset;
     check(hipMalloc(&memory_, offset), "prefill MoE scratch");
     auto* base = static_cast<unsigned char*>(memory_);
@@ -1469,6 +1493,10 @@ PrefillMoe::PrefillMoe(const PrefillMoeWeights& weights, std::uint32_t top_k, st
     act_deltas_ = reinterpret_cast<float*>(base + o_deltas);
     act_sums_ = reinterpret_cast<std::int32_t*>(base + o_sums);
     raw_ = reinterpret_cast<float*>(base + o_raw);
+    if (pad) {
+        pad_codes_ = reinterpret_cast<std::int8_t*>(base + o_pcodes);
+        pad_deltas_ = reinterpret_cast<float*>(base + o_pdeltas);
+    }
 }
 PrefillMoe::~PrefillMoe() {
     (void)hipFree(memory_);
@@ -1476,9 +1504,12 @@ PrefillMoe::~PrefillMoe() {
 }
 void PrefillMoe::set_weights(const PrefillMoeWeights& weights) {
     if (!weights.gate || !weights.up || !weights.down || weights.hidden != w_.hidden || weights.inter != w_.inter ||
+        (weights.down_width != 0U ? weights.down_width : weights.inter) != w_.down_width ||
         weights.gate_up_format != w_.gate_up_format || weights.down_format != w_.down_format)
         throw std::invalid_argument("ds41 prefill MoE: set_weights needs the same geometry and formats");
+    const std::uint32_t down_width = w_.down_width;
     w_ = weights;
+    w_.down_width = down_width;
 }
 
 void PrefillMoe::enqueue_experts(const PrefillMoeInputs& in, std::uint32_t chunk, std::uint32_t& row0, std::uint32_t& rows, void* stream) {
@@ -1516,7 +1547,8 @@ void PrefillMoe::experts_rows(const PrefillMoeInputs& in, std::uint32_t row0, st
         RoutesView dr = gr;
         dr.inputs = routes_.entry_slots;
         dn.weights = w_.down; dn.expert_stride_bytes = w_.down_row_bytes * w_.hidden; dn.row_bytes = w_.down_row_bytes;
-        dn.width = w_.inter; dn.outputs = w_.hidden; dn.routes = dr; dn.codes = act_codes_; dn.deltas = act_deltas_; dn.out = raw_;
+        pad_activations(rows, stream);
+        dn.width = w_.down_width; dn.outputs = w_.hidden; dn.routes = dr; dn.codes = down_codes(); dn.deltas = down_deltas(); dn.out = raw_;
         enqueue_routes_product(w_.down_format, dn, stream);
         return;
     }
@@ -1530,7 +1562,8 @@ void PrefillMoe::experts_rows(const PrefillMoeInputs& in, std::uint32_t row0, st
     enqueue_prefill_gate_up(w_.gate_up_format, gu, stream);
     PrefillDownView dn;
     dn.weights = w_.down; dn.expert_stride_bytes = w_.down_row_bytes * w_.hidden; dn.row_bytes = w_.down_row_bytes;
-    dn.width = w_.inter; dn.outputs = w_.hidden; dn.routes = view; dn.codes = act_codes_; dn.deltas = act_deltas_; dn.out = raw_;
+    pad_activations(rows, stream);
+    dn.width = w_.down_width; dn.outputs = w_.hidden; dn.routes = view; dn.codes = down_codes(); dn.deltas = down_deltas(); dn.out = raw_;
     enqueue_prefill_down(w_.down_format, dn, stream);
 }
 // Histogram selector: one route build with the sparse experts (<= window_mean entries) first; their batches of 8 run
@@ -1556,7 +1589,8 @@ void PrefillMoe::enqueue_experts_split(const PrefillMoeInputs& in, std::uint32_t
         RoutesView dr = gr;
         dr.inputs = routes_.entry_slots;
         dn.weights = w_.down; dn.expert_stride_bytes = w_.down_row_bytes * w_.hidden; dn.row_bytes = w_.down_row_bytes;
-        dn.width = w_.inter; dn.outputs = w_.hidden; dn.routes = dr; dn.codes = act_codes_; dn.deltas = act_deltas_; dn.out = raw_;
+        pad_activations(rows, stream);
+        dn.width = w_.down_width; dn.outputs = w_.hidden; dn.routes = dr; dn.codes = down_codes(); dn.deltas = down_deltas(); dn.out = raw_;
         enqueue_routes_product(w_.down_format, dn, stream);
     }
     const auto view = prefill_routes_view(routes_, rows, top_k_, owned, 16U);
@@ -1567,7 +1601,8 @@ void PrefillMoe::enqueue_experts_split(const PrefillMoeInputs& in, std::uint32_t
     enqueue_prefill_gate_up(w_.gate_up_format, gu, stream);
     PrefillDownView dn;
     dn.weights = w_.down; dn.expert_stride_bytes = w_.down_row_bytes * w_.hidden; dn.row_bytes = w_.down_row_bytes;
-    dn.width = w_.inter; dn.outputs = w_.hidden; dn.routes = view; dn.codes = act_codes_; dn.deltas = act_deltas_; dn.out = raw_;
+    pad_activations(rows, stream);
+    dn.width = w_.down_width; dn.outputs = w_.hidden; dn.routes = view; dn.codes = down_codes(); dn.deltas = down_deltas(); dn.out = raw_;
     enqueue_prefill_down(w_.down_format, dn, stream);
 }
 void PrefillMoe::enqueue_combine(const PrefillMoeInputs& in, std::uint32_t chunk, float* y, void* stream) {

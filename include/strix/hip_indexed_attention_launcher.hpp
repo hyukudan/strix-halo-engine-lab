@@ -18,6 +18,13 @@
 
 namespace strix {
 
+class HipQsaWindowPool;
+// One eager window owner's cache. The owner must invalidate it before replacing
+// its session's committed prefix (discard_deferred does this), and retain it
+// through stream drain. Rejected/window rows are invalidated from the next frontier.
+[[nodiscard]] std::shared_ptr<HipQsaWindowPool> make_hip_qsa_window_pool();
+void invalidate_hip_qsa_window_pool(const std::shared_ptr<HipQsaWindowPool>&);
+
 struct HipIndexedAttentionLauncherConfig {
     ModelContract model =
         ModelContract::qwen38_flash_next();
@@ -40,8 +47,10 @@ struct HipIndexedAttentionLauncherConfig {
     bool dense_f16_prefill = false;
     // fast-prefill component dense8: prompt launches of 64..256 rows run q8_rows::launch_dense_g64 (prefill only).
     bool dense_g64_prefill = false;
+    bool dense_trellis_projections = false;
     // fast-prefill-f16wmma-v1, qsa component: prefill groups run the fused union attention (hip_qsa_fast_prefill.inc).
     bool qsa_fast_prefill = false;
+    std::shared_ptr<HipQsaWindowPool> window_pool;
 };
 
 enum class HipQsaInputProjectionMode {legacy256,virtual256,prefetch8};

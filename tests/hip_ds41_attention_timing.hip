@@ -1,7 +1,9 @@
 // Timing build of the deepseek41 attention kernels (compiled with STRIX_DS41_ATTN_TIMING): every block records wall
 // clock and shader cycles, so each launch gives its span on the GPU, the per-block durations and the shader clock
 // actually used. Every case runs cold (after 200 ms idle, one launch) and warm (after 300 back-to-back launches);
-// a sampler thread reads the DPM level (pp_dpm_sclk) every 5 ms. Not a correctness test.
+// a sampler thread reads the DPM level (pp_dpm_sclk) every 5 ms. The compress kernel also records shader cycles at its
+// phase marks (DS41_CMARK; printed as median cycles since the previous mark), default and fast form. Usage:
+// [pp_dpm_sclk path] [compress: the compress cases alone]. Not a correctness test.
 #include "strix/hip_ds41_attention.hpp"
 
 #include <algorithm>
@@ -57,7 +59,7 @@ double wall_mhz;
 const char* slot_name[] = {"window", "compress", "qprep", "scores", "select", "chunk", "combine"};
 // span per kernel slot (max end - min start), median block duration, shader clock from cycles / wall time
 void report(const char* label, float event_us) {
-    std::vector<unsigned long long> t(11ULL * 65536 * 4);
+    std::vector<unsigned long long> t(15ULL * 65536 * 4);
     check(hipMemcpy(t.data(), timing, t.size() * 8, hipMemcpyDeviceToHost));
     std::printf("  %-6s event %8.1f us |", label, event_us);
     for (unsigned s = 0; s < 7; ++s) {
@@ -91,6 +93,24 @@ void report(const char* label, float event_us) {
         std::printf(" marks (median us since previous):");
         for (unsigned k = 0; k < 12; ++k) if (!gaps[k].empty()) { std::sort(gaps[k].begin(), gaps[k].end()); std::printf(" m%u %.1f", k, gaps[k][gaps[k].size() / 2]); }
     }
+    // shader-cycle marks (slots 11..14): median cycles since the previous mark (the first since the block's entry)
+    std::vector<double> cgaps[16];
+    for (unsigned b = 0; b < 65536; ++b) {
+        unsigned long long prev = 0;
+        for (unsigned s = 0; s < 7 && prev == 0; ++s) if (t[(s * 65536ULL + b) * 4 + 1] != 0) prev = t[(s * 65536ULL + b) * 4 + 2];
+        if (prev == 0) continue;
+        for (unsigned k = 0; k < 16; ++k) {
+            const unsigned long long mk = t[((11ULL + k / 4) * 65536 + b) * 4 + k % 4];
+            if (mk != 0) { cgaps[k].push_back(double((mk - prev) & 0xFFFFFULL)); prev = mk; }
+        }
+    }
+    bool any = false;
+    for (unsigned k = 0; k < 16; ++k) if (!cgaps[k].empty()) {
+        if (!any) std::printf("\n    cycle marks (median cycles since previous, blocks):");
+        any = true;
+        std::sort(cgaps[k].begin(), cgaps[k].end());
+        std::printf(" c%u %.0f (%zu)", k, cgaps[k][cgaps[k].size() / 2], cgaps[k].size());
+    }
     std::printf(" dpm: %s\n", take_levels().c_str());
     check(hipMemset(timing, 0, t.size() * 8));
 }
@@ -99,14 +119,14 @@ template <class F> void measure(const char* name, F launch) {
     check(hipEventCreate(&e0)); check(hipEventCreate(&e1));
     std::printf("%s\n", name);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    check(hipDeviceSynchronize()); check(hipMemset(timing, 0, 11ULL * 65536 * 32)); check(hipDeviceSynchronize());
+    check(hipDeviceSynchronize()); check(hipMemset(timing, 0, 15ULL * 65536 * 32)); check(hipDeviceSynchronize());
     take_levels();
     sampling = true;
     check(hipEventRecord(e0)); launch(); check(hipEventRecord(e1)); check(hipEventSynchronize(e1));
     float ms; check(hipEventElapsedTime(&ms, e0, e1));
     report("cold", ms * 1e3F);
     for (int i = 0; i < 300; ++i) launch();
-    check(hipDeviceSynchronize()); check(hipMemset(timing, 0, 11ULL * 65536 * 32)); check(hipDeviceSynchronize()); take_levels();
+    check(hipDeviceSynchronize()); check(hipMemset(timing, 0, 15ULL * 65536 * 32)); check(hipDeviceSynchronize()); take_levels();
     for (int i = 0; i < 20; ++i) launch();   // keep the clock up right before the measured launch
     check(hipEventRecord(e0)); launch(); check(hipEventRecord(e1)); check(hipEventSynchronize(e1));
     check(hipEventElapsedTime(&ms, e0, e1));
@@ -124,7 +144,7 @@ int main(int argc, char** argv) {
         wall_mhz = rate_khz / 1000.0;
         std::printf("wall clock %.1f MHz, sclk now %d MHz\n", wall_mhz, read_sclk());
         std::thread th(sampler);
-        timing = dev_zero<unsigned long long>(11ULL * 65536 * 4);
+        timing = dev_zero<unsigned long long>(15ULL * 65536 * 4);
         g::set_timing_buffer(timing);
         // attention: random ring and compressed caches, 640 visible keys per row
         const unsigned cap = a::kWindow + a::kMaxRows, ncache = 4096;
@@ -134,7 +154,9 @@ int main(int argc, char** argv) {
         for (auto& b : kv) b = static_cast<std::uint8_t>(rng());
         for (std::size_t t = 0; t < ncache; ++t) for (unsigned b = 0; b < 32; ++b) kv[t * 288 + 256 + b] = 0x38;
         auto* dring = dev(ring); auto* dkv = dev(kv);
+        const std::string only = argc > 2 ? argv[2] : "";  // "compress": the compress cases alone
         for (const unsigned rows : {1U, 8U}) {
+            if (only == "compress") break;
             std::vector<std::uint64_t> pos(rows);
             for (unsigned r = 0; r < rows; ++r) pos[r] = 100000 + r;
             std::vector<a::RopeRow> rope; for (const auto p : pos) rope.push_back(a::rope_row(a::RopeKind::compressed, p));
@@ -150,8 +172,34 @@ int main(int argc, char** argv) {
             tp.heads = 32;   // one tensor-parallel rank
             measure(("attention, 640 keys, 32 heads, rows " + std::to_string(rows)).c_str(), [&] { g::enqueue_attention(tp, nullptr); });
         }
+        // compress at ratio 1 and 2: the first row at an odd position (a group's last token at ratio 2)
+        {
+            const auto norm = rnd(512, 0.5F, 1.5F), knorm = rnd(128, 0.5F, 1.5F);
+            std::vector<std::uint16_t> wk(128 * 512);
+            for (auto& h : wk) h = static_cast<std::uint16_t>(0x1800U + (rng() & 0xFFFU) + ((rng() & 1U) << 15U));
+            auto* dnorm = dev(norm); auto* dknorm = dev(knorm); auto* dwk = dev(wk);
+            auto* dstate_in = dev(rnd(1024, -3, 3)); auto* dvalid_in = dev(std::vector<std::uint32_t>{1U});
+            auto* dstate_out = dev_zero<float>(1024); auto* dvalid_out = dev_zero<std::uint32_t>(1);
+            auto* dkvc = dev_zero<std::uint8_t>(std::size_t{60000} * a::kKvEntryBytes);
+            auto* didxc = dev_zero<std::uint8_t>(std::size_t{60000} * a::kIdxEntryBytes);
+            for (const unsigned ratio : {1U, 2U}) for (const unsigned rows : {1U, 2U, 6U, 8U}) {
+                std::vector<std::uint64_t> pos(rows);
+                std::vector<a::RopeRow> rope(rows);
+                for (unsigned r = 0; r < rows; ++r) { pos[r] = 50001 + r; rope[r] = a::rope_row(a::RopeKind::compressed, pos[r] / ratio * ratio); }
+                auto* dkvr = dev(rnd(rows * 512, -3, 3)); auto* dsc = dev(rnd(rows * 512, -4, 4));
+                auto* dpos = dev(pos); auto* drope = dev(rope);
+                const g::CompressView cv{ratio, rows, dkvr, dsc, dnorm, dwk, dknorm, drope, dpos, dstate_in, dvalid_in, dstate_out, dvalid_out, dkvc, didxc};
+                for (const int fast : {0, 1}) {
+                    g::set_compress_fast(fast);
+                    measure(("compress" + std::string(fast != 0 ? " (fast)" : "") + ", ratio " + std::to_string(ratio) + ", rows " + std::to_string(rows)).c_str(),
+                            [&] { g::enqueue_compress(cv, nullptr); });
+                }
+                g::set_compress_fast(-1);
+            }
+        }
         // index scores + select at 32K and 131K positions (ratio 1)
         for (const std::uint32_t count : {32768U, 131072U}) for (const unsigned rows : {1U, 8U}) {
+            if (only == "compress") break;
             std::vector<std::uint8_t> cache(std::size_t{count} * 68);
             for (auto& b : cache) b = static_cast<std::uint8_t>(rng());
             for (std::size_t t = 0; t < count; ++t) for (unsigned b = 0; b < 4; ++b) cache[t * 68 + 64 + b] = 124;

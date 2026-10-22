@@ -8,11 +8,16 @@
 //   a streaming-read ceiling over exactly the same unique byte ranges (one launch for gate+up, one
 //   for down, the same cold start), i.e. the bandwidth floor of the window's bytes;
 //   with --check, every form's outputs bitwise against the default form.
-// usage: strix-hip-ds41-expert-once-bench MODEL.gguf --routes FILE [--layers 5,20,35] [--rank R]
+// --tp: the expert-TP layout (ds41_expert_tp.hpp) of rank R, loaded as the device forward loads it: 1152 gate/up rows
+// of all 384 experts and the rank's packed down rows (380 B, or 420 B with STRIX_DS41_EXPERT_TP_LAYOUT=dup); routes
+// over every expert (each rank computes the whole union), the down through enqueue_routes_product_groups.
+// usage: strix-hip-ds41-expert-once-bench MODEL.gguf --routes FILE [--layers 5,20,35] [--rank R] [--tp]
 //        [--rows 1,2,4,6,8] [--cases N] [--reps N] [--forms -1,0,3,4] [--check]
 
 #include "strix/gguf_reader.hpp"
 #include "strix/hip_ds41_formats.hpp"
+#include "strix/ds41_expert_tp.hpp"
+#include "strix/hip_ds41_expert_tp.hpp"
 #include "strix/hip_ds41_routes_fast.hpp"
 #include "strix/ds41_layer.hpp"
 
@@ -210,10 +215,12 @@ std::vector<Window> windows(const std::vector<std::vector<Token>>& seqs, unsigne
 struct RankExperts {
     Tensor gate_t, up_t, down_t;
     std::uint32_t first = 0, end = 0, hidden = 0, inter = 0, top_k = 6, split = 192;
+    bool tp = false;
+    std::uint64_t gate_stride = 0, down_stride = 0, down_row = 0;  // per expert (the rank's part with --tp)
     Device<std::uint8_t> gate, up, down;
     RankExperts(const Tensor& g, const Tensor& u, const Tensor& d, std::uint32_t f, std::uint32_t e, const std::string& path)
-        : gate_t(g), up_t(u), down_t(d), first(f), end(e), hidden(g.width), inter(g.outputs), gate(g.stride * (e - f)),
-          up(u.stride * (e - f)), down(d.stride * (e - f)) {
+        : gate_t(g), up_t(u), down_t(d), first(f), end(e), hidden(g.width), inter(g.outputs), gate_stride(g.stride),
+          down_stride(d.stride), down_row(d.row_bytes), gate(g.stride * (e - f)), up(u.stride * (e - f)), down(d.stride * (e - f)) {
         const auto load = [&](const Tensor& t, Device<std::uint8_t>& dev) {
             std::vector<std::uint8_t> host(t.stride * (e - f));
             read_into(path, t.info->absolute_offset + t.stride * f, host.size(), host.data());
@@ -221,8 +228,28 @@ struct RankExperts {
         };
         load(g, gate); load(u, up); load(d, down);
     }
-    [[nodiscard]] double gate_up_bytes() const { return 2.0 * static_cast<double>(gate_t.stride); }
-    [[nodiscard]] double down_bytes() const { return static_cast<double>(down_t.stride); }
+    // --tp: rank r's part of every expert, through the device forward's loader.
+    RankExperts(const Tensor& g, const Tensor& u, const Tensor& d, unsigned rank, const std::string& path, hipStream_t s)
+        : gate_t(g), up_t(u), down_t(d), first(0), end(g.experts), hidden(g.width), inter(strix::ds41::expert_tp::half), split(g.experts),
+          tp(true), gate_stride(g.row_bytes * strix::ds41::expert_tp::half),
+          down_stride(strix::ds41::expert_tp::device_down_row_bytes() * d.outputs), down_row(strix::ds41::expert_tp::device_down_row_bytes()),
+          gate(strix::ds41::expert_tp::part_bytes(g.info->byte_size, g.experts, false, d.outputs)),
+          up(strix::ds41::expert_tp::part_bytes(u.info->byte_size, u.experts, false, d.outputs)),
+          down(strix::ds41::expert_tp::part_bytes(d.info->byte_size, d.experts, true, d.outputs)) {
+        std::vector<std::uint8_t> host;
+        const strix::ds41::expert_tp::LoadFn load = [&](std::uint64_t offset, std::uint64_t bytes, std::uint8_t* dst) {
+            host.resize(bytes);
+            read_into(path, offset, bytes, host.data());
+            check(hipMemcpy(dst, host.data(), bytes, hipMemcpyHostToDevice), "tp upload");
+        };
+        const auto part = [&](const Tensor& t, Device<std::uint8_t>& dev, bool is_down) {
+            strix::ds41::expert_tp::load_part(load, t.info->absolute_offset, t.info->byte_size, t.experts, is_down, d.outputs, rank, dev.data, s);
+        };
+        part(g, gate, false); part(u, up, false); part(d, down, true);
+        check(hipDeviceSynchronize(), "tp load");
+    }
+    [[nodiscard]] double gate_up_bytes() const { return 2.0 * static_cast<double>(gate_stride); }
+    [[nodiscard]] double down_bytes() const { return static_cast<double>(down_stride); }
 };
 
 struct RoutedBuffers {
@@ -255,15 +282,16 @@ void enqueue_routed(const RankExperts& e, RoutedBuffers& b, std::uint32_t rows, 
     const RoutesView gate_routes{b.experts.data, b.begins.data, b.rows_out.data, b.slots.data, slots, rows, b.counts.data};
     const RoutesView down_routes{b.experts.data, b.begins.data, b.slots.data, b.slots.data, slots, rows, b.counts.data};
     GateUpView gu;
-    gu.gate = e.gate.data; gu.up = e.up.data; gu.expert_stride_bytes = e.gate_t.stride; gu.row_bytes = e.gate_t.row_bytes;
+    gu.gate = e.gate.data; gu.up = e.up.data; gu.expert_stride_bytes = e.gate_stride; gu.row_bytes = e.gate_t.row_bytes;
     gu.hidden = e.hidden; gu.inter = e.inter; gu.routes = gate_routes; gu.codes = b.codes.data; gu.deltas = b.deltas.data;
     gu.limit = 10.0F; gu.act_codes = b.act_codes.data; gu.act_deltas = b.act_deltas.data; gu.act_sums = b.act_sums.data;
     enqueue_gate_up(e.gate_t.format, gu, s);
     if (timer) timer->mark(2, s);
     RoutesProductView dv;
-    dv.weights = e.down.data; dv.expert_stride_bytes = e.down_t.stride; dv.row_bytes = e.down_t.row_bytes; dv.width = e.inter;
+    dv.weights = e.down.data; dv.expert_stride_bytes = e.down_stride; dv.row_bytes = e.down_row; dv.width = e.inter;
     dv.outputs = e.hidden; dv.routes = down_routes; dv.codes = b.act_codes.data; dv.deltas = b.act_deltas.data; dv.out = b.raw.data;
-    enqueue_routes_product(e.down_t.format, dv, s);
+    if (e.tp) enqueue_routes_product_groups(e.down_t.format, dv, s, expert_tp::packed_from_env());
+    else enqueue_routes_product(e.down_t.format, dv, s);
     if (timer) timer->mark(3, s);
 }
 
@@ -287,7 +315,7 @@ struct Options {
     std::vector<int> layers{20}, forms{-1};
     unsigned rank = 0, cases = 64, reps = 2;
     std::vector<int> rows{1, 2, 4, 6, 8};
-    bool check = false, tight = false, routes_check = false;
+    bool check = false, tight = false, routes_check = false, tp = false;
 };
 
 // --routes-check: build_routes_fast_kernel against build_routes_kernel on every window start of every
@@ -368,12 +396,29 @@ void bench_layer(const Options& o, unsigned layer, const RankExperts& e, const s
         quantize_rows(ref, rows, e.hidden, 11U + rows, s);
         Timer timer;
         for (const int form : o.forms) {
-            // form >= 1000: the default forms with STRIX_DS41_EXPERT_SLOTS on, slots_y = form - 1000 (0 = the table)
-            const bool slotted = form >= 1000;
-            tuning = saved; tuning.routed = slotted ? -1 : form;
-            if (slotted) { tuning.slots = 1; tuning.slots_y = form - 1000; }
-            const int fg = form < 0 || slotted ? default_gate_up(rows) : form, fd = form < 0 || slotted ? default_down(rows) : form;
-            const unsigned cg = std::min(form_cap(fg), rows), cd = std::min(form_cap(fd), rows);
+            // form >= 1000: the default forms with STRIX_DS41_EXPERT_SLOTS on, slots_y = form - 1000 (0 = the table);
+            // form >= 1000000: STRIX_DS41_EXPERT_ROWS on with STRIX_DS41_EXPERT_ROWS_FORM = form % 1000000 (0 = the
+            // default shapes), and with STRIX_DS41_EXPERT_SLOTS on (table) from 2000000.
+            // form >= 3000000: STRIX_DS41_EXPERT_SLOTS on (table) and STRIX_DS41_TP_DOWN on with STRIX_DS41_TP_DOWN_FORM =
+            // form % 1000 (0 = the default shape); from 4000000 also STRIX_DS41_EXPERT_ROWS on (default shapes).
+            const bool tpd = form >= 3000000, held = form >= 1000000 && (!tpd || form >= 4000000),
+                       slotted = held ? form >= 2000000 : form >= 1000;
+            tuning = saved; tuning.routed = slotted || held ? -1 : form;
+            if (slotted) { tuning.slots = 1; tuning.slots_y = held || tpd ? 0 : form - 1000; }
+            if (held) { tuning.rows = 1; tuning.rows_form = tpd || form % 1000000 == 0 ? -1 : form % 1000000; }
+            if (tpd) { tuning.tp_down = 1; tuning.tp_down_form = form % 1000 == 0 ? -1 : form % 1000; }
+            const int fg = form < 0 || slotted || held ? default_gate_up(rows) : form, fd = form < 0 || slotted || held ? default_down(rows) : form;
+            unsigned cg = std::min(form_cap(fg), rows), cd = std::min(form_cap(fd), rows);
+            if (held) {  // caps of the held form (QGDABS digits; down steps ahead 3: one read per expert)
+                const int f = form % 1000000;
+                const unsigned g = f ? static_cast<unsigned>(f / 10000 % 10) : 4U, d = f ? static_cast<unsigned>(f / 1000 % 10) : 4U;
+                cg = std::min(g ? g : 4U, rows); cd = f / 100000 % 10 >= 3 ? rows : std::min(d ? d : 4U, rows);
+            }
+            if (tpd) {  // the TP down holds its groups across the parts (one read per expert)
+                cd = rows;
+                if (!held) cg = std::min(form_cap(default_gate_up(rows)), rows);
+                else cg = std::min(4U, rows);
+            }
             Sum& sum = total[{rows_i, form}];
             std::size_t bad = 0;
             for (const auto& w : cases) {
@@ -396,7 +441,7 @@ void bench_layer(const Options& o, unsigned layer, const RankExperts& e, const s
                     b.clear_outputs(); ref.clear_outputs();
                     ref.ids.upload(w.ids);
                     const auto mine = tuning;
-                    tuning = saved; tuning.routed = -1; tuning.slots = 0;
+                    tuning = saved; tuning.routed = -1; tuning.slots = 0; tuning.rows = 0; tuning.tp_down = 0;
                     enqueue_routed(e, ref, rows, s, nullptr);
                     tuning = mine;
                     enqueue_routed(e, b, rows, s, nullptr);
@@ -426,13 +471,13 @@ void bench_layer(const Options& o, unsigned layer, const RankExperts& e, const s
             for (unsigned rep = 0; rep < o.reps; ++rep) {
                 flush(s);
                 timer.mark(1, s);
-                const auto chunks_gu = static_cast<unsigned>((e.gate_t.stride + 65535U) / 65536U);
+                const auto chunks_gu = static_cast<unsigned>((e.gate_stride + 65535U) / 65536U);
                 hipLaunchKernelGGL(stream_kernel, dim3(chunks_gu, static_cast<unsigned>(ids.size())), dim3(256), 0, s, e.gate.data, e.up.data,
-                                   b.unique.data, e.gate_t.stride, chunks_gu, sink.data);
+                                   b.unique.data, e.gate_stride, chunks_gu, sink.data);
                 timer.mark(2, s);
-                const auto chunks_dn = static_cast<unsigned>((e.down_t.stride + 65535U) / 65536U);
+                const auto chunks_dn = static_cast<unsigned>((e.down_stride + 65535U) / 65536U);
                 hipLaunchKernelGGL(stream_kernel, dim3(chunks_dn, static_cast<unsigned>(ids.size())), dim3(256), 0, s, e.down.data,
-                                   static_cast<const unsigned char*>(nullptr), b.unique.data, e.down_t.stride, chunks_dn, sink.data);
+                                   static_cast<const unsigned char*>(nullptr), b.unique.data, e.down_stride, chunks_dn, sink.data);
                 timer.mark(3, s);
                 check(hipGetLastError(), "stream");
                 const double gu = timer.ms(1, 2), dn = timer.ms(2, 3);
@@ -463,6 +508,7 @@ int main(int argc, char** argv) try {
         else if (a == "--check") o.check = true;
         else if (a == "--tight") o.tight = true;
         else if (a == "--routes-check") o.routes_check = true;
+        else if (a == "--tp") o.tp = true;
         else throw std::invalid_argument("unknown option " + a);
     }
     if (o.routes.empty()) throw std::invalid_argument("--routes is required");
@@ -501,7 +547,7 @@ int main(int argc, char** argv) try {
         const auto g = tensor(tensors, prefix + "ffn_gate_exps.weight"), u = tensor(tensors, prefix + "ffn_up_exps.weight"),
                    d = tensor(tensors, prefix + "ffn_down_exps.weight");
         const std::uint32_t half = g.experts / 2U;
-        const RankExperts e(g, u, d, o.rank * half, o.rank * half + half, o.model);
+        const RankExperts e = o.tp ? RankExperts(g, u, d, o.rank, o.model, s) : RankExperts(g, u, d, o.rank * half, o.rank * half + half, o.model);
         gu_bytes = e.gate_up_bytes(); dn_bytes = e.down_bytes();
         std::cout << "layer " << layer << " rank " << o.rank << ": experts [" << e.first << ", " << e.end << "), gate+up "
                   << e.gate_up_bytes() / 1e6 << " MB, down " << e.down_bytes() / 1e6 << " MB per expert" << std::endl;

@@ -1,8 +1,8 @@
 #!/bin/bash
 # CPU activation calibration: every calibration document (BOS + 127 tokens) through the 40-layer host forward,
 # per-channel sums of squares of the projection inputs, then merged into calib/cpu.imat.
-cd ~/ai-cluster-lab/scratch-admin/requant
-M=~/ai-cluster-lab/models/DeepSeek-V4.1-Flash-1017/DeepSeek-V4.1-Flash-1017-Q2.gguf
+cd "${RQ_DIR:-.}"
+M=${DS41_MODEL:?path of the DeepSeek-V4.1-Flash-1017 Q2 GGUF}
 mkdir -p calib/cpu
 while read -r cat doc start len; do
   ids=$(python3 -c "import numpy as np; s=np.fromfile('data/calib.u32','<u4'); print(','.join(map(str,s[$start:$start+$len])))")

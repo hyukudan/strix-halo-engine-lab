@@ -944,7 +944,7 @@ struct QsaFixture {
     HipLaunchContext scope() const { HipLaunchContext result; result.stream = owner.stream; return result; }
     std::span<const ExecutionDispatchContext> group(std::uint32_t count) const { return {rows.data(), count}; }
     void place(std::uint64_t position) { for (unsigned r = 0; r < 8U; ++r) rows[r].position = position + r; }
-    void reset() { write(scratch, seed); write(state, initial_state); }
+    void reset() { invalidate_hip_qsa_window_pool(config.window_pool); write(scratch, seed); write(state, initial_state); }
     void serial_rows(std::uint32_t count) { for (std::uint32_t r = 0; r < count; ++r) selected.function(rows[r], selected.user_data); }
     struct Payload { std::vector<unsigned char> arena, state; };
     Payload run(std::uint32_t count, std::uint64_t position, bool candidate) {
@@ -967,6 +967,7 @@ struct QsaFixture {
 
 void qsa_rows_family(bool prefetch, bool wave8, bool bf16_indexer) {
     QsaFixture f(prefetch, wave8, bf16_indexer, 2304U);
+    f.config.window_pool = make_hip_qsa_window_pool();
     const std::uint64_t prefetched = bf16_indexer ? 3U : 5U; // BF16 indexer stays on the legacy256 tree
     unsigned compared = 0;
     // Positions cover p=0, partial-block tails, the full-visible/top-k boundary
@@ -1036,6 +1037,21 @@ void qsa_rows_family(bool prefetch, bool wave8, bool bf16_indexer) {
                 require(f.cells(actual, f.kv, state_contract.kv_row_bytes, expected_cells) ==
                         f.cells(golden, f.kv, state_contract.kv_row_bytes, expected_cells),
                     "QSA accepted KV prefix differs from serial");
+                // Reuse the same pool after a rejection at every depth, including
+                // complete speculative blocks and a partial block at the frontier.
+                // Compare the next window's entire workspace, logits input and state.
+                f.place(position + keep); write(f.scratch, f.seed);
+                {
+                    const HipLaunchScope active(f.scope());
+                    indexed_attention_known_window_rows_launch(f.group(8U), f.config);
+                }
+                f.owner.finish();
+                const auto next_arena = read(f.scratch), next_state = read(f.state);
+                write(f.scratch, f.seed); write(f.state, actual);
+                { const HipLaunchScope active(f.scope()); f.serial_rows(8U); }
+                f.owner.finish();
+                require(read(f.scratch) == next_arena && read(f.state) == next_state,
+                    "QSA persistent pool reused a rejected/tail block");
                 ++commits;
             }
         }
@@ -1091,6 +1107,70 @@ void qsa_rows_family(bool prefetch, bool wave8, bool bf16_indexer) {
                       << "ms 1-row=" << one_ms << "ms speedup=" << serial_ms / rows_ms << "x rows/1-row=" << rows_ms / one_ms << "\n";
         }
     check(hipEventDestroy(begin), "bench event"); check(hipEventDestroy(end), "bench event");
+}
+
+// A cached owner can skip several cycles while its rejected raw keys are
+// overwritten by serial steps or another owner. Its next frontier is then past
+// the old speculative blocks: clamping only at that frontier misses stale keys.
+void qsa_pool_idle_owner() {
+    QsaFixture f(true, true, true, 2304U);
+    const auto journal = f.owner.allocate(qsa_index_journal_bytes(f.model));
+    const auto plan = prepare_qsa_index_tail(f.model, f.state_layout, f.state_memory, {journal.address, journal.bytes});
+    const auto words = f.owner.allocate(16U);
+    auto* position_word = reinterpret_cast<std::uint64_t*>(words.address);
+    auto* keep_word = reinterpret_cast<std::uint32_t*>(words.address + 8U);
+    constexpr std::uint64_t position = 2203U, keep = 1U;
+    const std::vector<std::uint64_t> control{position, keep};
+    for (const bool other_owner : {false, true}) for (const bool negate_query : {false, true}) {
+        f.config.window_pool = make_hip_qsa_window_pool();
+        f.reset(); f.place(position); write(words, bytes_of(control));
+        {
+            const HipLaunchScope active(f.scope());
+            enqueue_qsa_index_tail_snapshot(plan, position_word, f.owner.stream);
+            indexed_attention_known_window_rows_launch(f.group(8U), f.config, {journal.address, journal.bytes});
+            enqueue_qsa_index_tail_commit(plan, position_word, keep_word, f.owner.stream);
+        }
+        f.owner.finish();
+        const auto speculative = read(f.state);
+        // Skip beyond every block the first owner formed speculatively.
+        f.place(position + keep); write(f.scratch, f.seed);
+        {
+            const HipLaunchScope active(f.scope());
+            if (other_owner) {
+                auto other = f.config; other.window_pool = make_hip_qsa_window_pool();
+                indexed_attention_known_window_rows_launch(f.group(8U), other);
+            } else f.serial_rows(8U);
+        }
+        f.owner.finish();
+        const auto advanced = read(f.state);
+        const auto raw_begin = static_cast<std::ptrdiff_t>(f.raw.address - f.state.address +
+            (position + keep) * f.model.indexer_head_dim * sizeof(std::uint16_t));
+        const auto raw_bytes = static_cast<std::ptrdiff_t>(4U * f.model.indexer_head_dim * sizeof(std::uint16_t));
+        require(!std::equal(speculative.begin() + raw_begin, speculative.begin() + raw_begin + raw_bytes,
+            advanced.begin() + raw_begin), "QSA catch-up fixture did not overwrite the speculative block");
+        // Scores apply ReLU per head. Exercise both query signs so an all-negative
+        // dot product cannot hide a stale pooled key behind a zero score.
+        auto next_seed = f.seed;
+        if (negate_query) for (const auto& row : f.rows) {
+            const auto input = resolve_dispatch_read(row, 0);
+            for (std::uint32_t i = 0; i < 2560U; ++i) {
+                const auto offset = static_cast<std::size_t>(input.address - f.scratch.address) + i * sizeof(std::uint16_t);
+                std::uint16_t bits = 0; std::memcpy(&bits, next_seed.data() + offset, sizeof(bits));
+                bits ^= 0x8000U; std::memcpy(next_seed.data() + offset, &bits, sizeof(bits));
+            }
+        }
+        f.place(position + keep + 8U); write(f.scratch, next_seed);
+        { const HipLaunchScope active(f.scope()); indexed_attention_known_window_rows_launch(f.group(8U), f.config); }
+        f.owner.finish();
+        const auto candidate_arena = read(f.scratch), candidate_state = read(f.state);
+        write(f.state, advanced); write(f.scratch, next_seed);
+        { const HipLaunchScope active(f.scope()); f.serial_rows(8U); }
+        f.owner.finish();
+        require(read(f.scratch) == candidate_arena && read(f.state) == candidate_state,
+            "QSA idle owner reused speculative blocks overwritten during catch-up");
+    }
+    guards(f.scratch); guards(f.state);
+    std::cout << "QSA persistent pool: serial and other-owner catch-up bit-exact\n";
 }
 
 // Cohort: the rows of two or three sessions (own KV and raw-index state, own positions) in one
@@ -2330,6 +2410,13 @@ void rows_bench() {
 } // namespace
 
 int main(int argc, char** argv) try {
+    if (argc > 1 && std::string_view(argv[1]) == "--qsa-pool-lifecycle") { qsa_pool_idle_owner(); return 0; }
+    if (argc > 1 && std::string_view(argv[1]) == "--qsa-pool-tests") {
+        for (bool prefetch : {false, true}) for (bool bf16_indexer : {false, true})
+            qsa_rows_family(prefetch, prefetch, bf16_indexer);
+        qsa_pool_idle_owner();
+        return 0;
+    }
     if (std::getenv("STRIX_QSA_LONG_BENCH")) { bench_qsa_long_context(); return 0; }
     if (argc > 1 && std::string_view(argv[1]) == "--rows-bench") { rows_bench(); return 0; }
     if (argc > 1 && std::string_view(argv[1]) == "--window-folds") {
@@ -2409,6 +2496,7 @@ int main(int argc, char** argv) try {
     qsa_rows_family(true, true, false);
     qsa_rows_family(false, false, true);
     qsa_rows_family(false, false, false);
+    qsa_pool_idle_owner();
     for (bool dense : {false, true}) for (bool bf16_indexer : {true, false}) qsa_cohort_family(dense, bf16_indexer);
     for(auto rows:{2U,4U,8U}) family_lm_head_rows(rows);
     for (auto rows : {9U, 12U, 16U, 17U, 24U, 32U}) family_lm_head_cohort_rows(rows);

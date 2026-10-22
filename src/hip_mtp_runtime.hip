@@ -1,4 +1,5 @@
 #include "strix/host_phase_timing.hpp"
+#include "strix/model_content_hash.hpp"
 #include "strix/hip_mtp_runtime.hpp"
 #include "strix/hip_token_sampling.hpp"
 #include "strix/hip_token_sampling_device.hpp"
@@ -90,6 +91,16 @@ void require_chain(const HipMtpTargetHiddenTicket& a,const HipMtpTargetHiddenTic
         "MTP target ticket arithmetic history is not the actual producer continuation");
 }
 }
+namespace {
+enum class DraftCacheProfile {mixed,fast,teacher};
+DraftCacheProfile configured_draft_cache_profile() {
+    const char* v=std::getenv("STRIX_MTP_DRAFT_CACHE");
+    if(!v || !*v || std::strcmp(v,"mixed")==0)return DraftCacheProfile::mixed;
+    if(std::strcmp(v,"fast")==0)return DraftCacheProfile::fast;
+    if(std::strcmp(v,"teacher")==0)return DraftCacheProfile::teacher;
+    throw std::invalid_argument("MTP draft cache must be mixed, fast or teacher");
+}
+}
 struct HipMtpRuntime::Impl {
     std::shared_ptr<HipMtpResources> owner;
     std::unique_ptr<HipGreedyOutput> selector;
@@ -98,6 +109,7 @@ struct HipMtpRuntime::Impl {
     // F32 copies of the attention/MLP HC injection matrices for the split-K draft mix.
     std::unique_ptr<float,void(*)(float*)> hc_inject{nullptr,[](float* p){(void)hipFree(p);}};
     bool draft_exact=false;
+    DraftCacheProfile cache_profile=configured_draft_cache_profile();
     std::optional<HipMtpResources::NativeValidationScope> validation;
     std::optional<HipMtpTargetHiddenTicket> last_target,cycle_base,base_previous_target,reconcile_final;
     std::optional<std::uint32_t> last_teacher_next_input,base_previous_input;
@@ -315,7 +327,7 @@ struct HipMtpRuntime::Impl {
     }
     // Batched teacher cache rows: same per-row launches as teacher_cache, one
     // admission and one completion for the whole contiguous run.
-    void teacher_cache_rows(std::span<const HipMtpReplayRow> rows) {
+    void teacher_cache_rows(std::span<const HipMtpReplayRow> rows,bool fast_cache=false) {
         if(rows.empty()) return;
         require(!active && !validation && stats.cache_only_rows<=UINT64_MAX-rows.size(),"MTP batched cache rows require an idle owner");
         validation.emplace(owner->admit_native_entry());
@@ -342,7 +354,7 @@ struct HipMtpRuntime::Impl {
                 const auto c=context(row.hidden.source_position());
                 copy(owner->view(HipMtpBuffer::wide_current),row.hidden.view());
                 launch_hip_mtp_embedding(c,row.next_input_token,stream);cache_row_front(c,stream);
-                launch_hip_mtp_cache_rows(c,stream);
+                launch_hip_mtp_cache_rows(c,stream,fast_cache);
             }
             owner->complete();
             active=false;cache_only_active=false;next_source+=rows.size();stats.cache_only_rows+=rows.size();validation.reset();
@@ -438,6 +450,7 @@ struct HipMtpRuntime::Impl {
                     draft->set_token(k,sampled.back().token,stream);
                 }
             }
+            host_phase_mark("2l draft step launch");
             return true;
         } catch(...) {failure();throw;}
     }
@@ -447,6 +460,7 @@ struct HipMtpRuntime::Impl {
             const auto k=cs.k++;
             if((cs.min_probability>0.0F || cs.keep) && k+1U<cs.requested) {
                 if(!sampler || cs.device_draft) draft->wait_step(k,owner->stream());
+                host_phase_mark("2w draft step wait");
                 if(cs.min_probability>0.0F && draft->probability(k)<cs.min_probability) {cs.depth=k+1U;cs.stop=true;return false;}
                 if(cs.keep) {
                     probabilities.resize(k+1U);runner_ups.resize(k+1U);
@@ -527,6 +541,15 @@ bool HipMtpRuntime::failed() const noexcept {return impl_->broken || impl_->owne
 void HipMtpRuntime::cancel() noexcept {impl_->failure();}
 std::uint64_t HipMtpRuntime::numerical_profile_identity() const noexcept {return impl_->profile;}
 HipMtpExecutionStats HipMtpRuntime::execution_stats() const noexcept {return impl_->stats;}
+const char* HipMtpRuntime::draft_cache_profile() const noexcept {
+    const auto& p=*impl_;
+    if(!p.draft || p.draft_exact)return "native-teacher-q8-v1";
+    if(p.cache_profile==DraftCacheProfile::teacher)return "generation-teacher-q8-v1";
+    const bool q4=hip_mtp_draft_q4(reinterpret_cast<const void*>(p.owner->tensors().key.runtime->address))!=nullptr;
+    if(p.cache_profile==DraftCacheProfile::fast)
+        return q4?"generation-fast-q4-v1":"generation-fast-q8-v1";
+    return q4?"mixed-fast-q4-teacher-q8-v1":"mixed-fast-q8-teacher-q8-v1";
+}
 HipMtpCacheStateView HipMtpRuntime::cache_state() const {
     const auto& p=*impl_;
     require(!p.broken && !p.active && !p.cycle && !p.validation,
@@ -679,6 +702,8 @@ std::span<const float> HipMtpRuntime::draft_probabilities() const noexcept {retu
 void HipMtpRuntime::set_draft_sampler(std::shared_ptr<TokenSampler> sampler) {
     auto& p=*impl_;require(p.draft && sampler && !p.sampler && !p.cycle && !p.active && !p.broken,
         "MTP sampled drafts need an enabled idle draft chain, once before cycles");
+    require(p.draft_exact || p.cache_profile==DraftCacheProfile::mixed,
+        "uniform generation cache profiles currently require greedy drafts");
     p.sampler=std::move(sampler);
 }
 std::span<const TokenDraft> HipMtpRuntime::sampled_drafts() const noexcept {return impl_->sampled;}
@@ -775,11 +800,13 @@ void HipMtpRuntime::reconcile_after_target(const QualifiedMtpDraftPlan& plan,con
         p.last_target=p.base_previous_target;p.last_teacher_next_input=p.base_previous_input;
         std::size_t first=0;
         if(p.draft) {
-            if(!p.replay.empty() && p.first_cache_reusable && p.replay[0].hidden.same_commit(*p.cycle_base) &&
+            if((p.draft_exact || p.cache_profile!=DraftCacheProfile::teacher) &&
+               !p.replay.empty() && p.first_cache_reusable && p.replay[0].hidden.same_commit(*p.cycle_base) &&
                p.replay[0].hidden.source_position()==p.base_source && p.replay[0].hidden.view()==p.cycle_base->view() &&
                p.replay[0].next_input_token==p.pending_token) {p.reuse_first_teacher_cache(p.replay[0]);first=1;}
             host_phase_mark("9c reuse first cache");
-            p.teacher_cache_rows(std::span<const HipMtpReplayRow>(p.replay).subspan(first));
+            p.teacher_cache_rows(std::span<const HipMtpReplayRow>(p.replay).subspan(first),
+                !p.draft_exact && p.cache_profile==DraftCacheProfile::fast);
             host_phase_mark("9d teacher cache rows (gpu+sync)");
             p.draft->observe(emitted);first=p.replay.size();
             host_phase_mark("9e draft observe");
@@ -795,6 +822,26 @@ void HipMtpRuntime::reconcile_after_target(const QualifiedMtpDraftPlan& plan,con
         require(p.next_source==p.reconcile_final->source_position(),"MTP replay did not reach the actual committed target frontier");
         p.cycle=false;p.cycle_base.reset();p.base_previous_target.reset();p.base_previous_input.reset();
         p.replay.clear();p.reconcile_final.reset();p.have_replay=false;p.candidates.clear();p.first_cache_reusable=false;
+        // Diagnostic only: compare the occupied proposer prefix across schedules.
+        static const bool audit=[] {const char* v=std::getenv("STRIX_MTP_CACHE_AUDIT");return v && v[0]=='1';}();
+        if(audit) {
+            const auto cache=cache_state();
+            const auto kv_bytes=cache.logical_rows*cache.kv_row_bytes;
+            const auto raw_bytes=cache.logical_rows*cache.raw_index_row_bytes;
+            require(kv_bytes<=cache.kv.bytes && raw_bytes<=cache.raw_index.bytes &&
+                kv_bytes+raw_bytes<=(1ULL<<30U),"MTP cache audit exceeds occupied views or 1 GiB");
+            std::vector<std::byte> kv(static_cast<std::size_t>(kv_bytes)),raw(static_cast<std::size_t>(raw_bytes));
+            const auto proof=p.owner->admit_native_entry();p.owner->mark_submitted();
+            if(kv_bytes)check(hipMemcpyAsync(kv.data(),reinterpret_cast<const void*>(cache.kv.address),kv.size(),
+                hipMemcpyDeviceToHost,static_cast<hipStream_t>(p.owner->stream())),"MTP cache audit KV read");
+            if(raw_bytes)check(hipMemcpyAsync(raw.data(),reinterpret_cast<const void*>(cache.raw_index.address),raw.size(),
+                hipMemcpyDeviceToHost,static_cast<hipStream_t>(p.owner->stream())),"MTP cache audit raw-index read");
+            p.owner->complete();
+            const auto kh=model_content_identity_hex(sha256_bytes(std::span<const std::byte>(kv)));
+            const auto rh=model_content_identity_hex(sha256_bytes(std::span<const std::byte>(raw)));
+            std::fprintf(stderr,"mtp_cache at=%llu profile=%s kv=%s raw=%s\n",
+                static_cast<unsigned long long>(p.next_source),draft_cache_profile(),kh.c_str(),rh.c_str());
+        }
     } catch(...) {p.failure();throw;}
 }
 } // namespace strix

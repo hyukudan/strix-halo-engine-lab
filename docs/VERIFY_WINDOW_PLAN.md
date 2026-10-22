@@ -4,7 +4,7 @@ Started 2026-10-17; status updated at `f429bd6`.
 
 ## Why
 
-Baseline on one Bosgame M5 node (Ryzen AI Max+ 395, `gfx1151`), 43-token prompt, 256 generated tokens:
+Baseline on one Strix Halo node (Ryzen AI Max+ 395, `gfx1151`), 43-token prompt, 256 generated tokens:
 
 | Path | tok/s | cost per forward |
 |---|---|---|

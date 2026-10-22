@@ -1,7 +1,9 @@
 #include "strix/mtp_window_controller.hpp"
+#include "strix/mtp_batch_window_controller.hpp"
 
 #include <algorithm>
 #include <stdexcept>
+#include <utility>
 
 namespace strix {
 void MtpWindowCostEstimate::add(double ms) {
@@ -33,6 +35,11 @@ MtpMinPWindowController::MtpMinPWindowController(std::vector<std::uint32_t> owne
 }
 namespace {
 std::size_t bin(float p) {return std::min<std::size_t>(9U,static_cast<std::size_t>(std::max(p,0.0F)*10.0F));}
+}
+void MtpMinPWindowController::begin_session() {
+    std::vector<std::uint32_t> rows;
+    for(const auto& o:owners_) rows.push_back(o.rows);
+    *this=MtpMinPWindowController(std::move(rows),min_probability_,model_,reprobe_cycles_,timing_independent_);
 }
 // Calibrated acceptance: the bin's observed rate with a two-draft prior at p.
 double MtpMinPWindowController::acceptance(float p) const {const auto b=bin(p);return (accepted_[b]+2.0*p)/(tested_[b]+2.0);}
@@ -124,5 +131,117 @@ std::vector<MtpMinPWindowController::OwnerStats> MtpMinPWindowController::owner_
     std::vector<OwnerStats> out{{1U,serial_.samples(),serial_.value(),0U}};
     for(const auto& o:owners_) out.push_back({o.rows,o.cost.samples(),o.cost.value(),o.probes});
     return out;
+}
+} // namespace strix
+
+namespace strix {
+namespace {
+std::array<std::uint32_t,3> batch_key(std::span<const std::uint32_t> rows) {
+    std::array<std::uint32_t,3> key{};
+    for(auto r:rows) ++key[r==8U?2U:r==4U?1U:0U];
+    return key;
+}
+}
+double MtpBatchWindowController::expected(const Request& q,std::uint32_t rows,bool prior) const {
+    const auto& h=history_.at(q.slot);
+    double e=1.0,s=1.0;
+    for(std::uint32_t d=0;d+1U<rows;++d) {
+        if(!prior && d>=q.probabilities.size()) break;
+        const double p=prior?0.8:std::clamp(static_cast<double>(q.probabilities[d]),0.0,1.0);
+        s*=(h.hits[d]+4.0*p)/(h.seen[d]+4.0);e+=s;
+    }
+    return e;
+}
+double MtpBatchWindowController::cost(std::span<const std::uint32_t> rows) const {
+    const auto key=batch_key(rows);
+    const auto found=costs_.find(key);
+    if(found!=costs_.end() && found->second.samples()) return found->second.value();
+    std::uint32_t total=0;for(auto r:rows) total+=r?r:2U;
+    // Byte-shaped prior: shared weights plus incremental union/KV rows. Once a
+    // topology is measured, extrapolate from the closest same-concurrency one.
+    double estimate=28.0+2.0*total+3.0*static_cast<double>(rows.size());
+    std::uint32_t distance=UINT32_MAX;
+    for(const auto& [k,v]:costs_) {
+        if(!v.samples() || k[0]+k[1]+k[2]!=rows.size()) continue;
+        const auto t=2U*k[0]+4U*k[1]+8U*k[2];
+        const auto delta=total>t?total-t:t-total;
+        if(delta<distance) {distance=delta;estimate=v.value()*(28.0+2.0*total)/(28.0+2.0*t);}
+    }
+    return estimate;
+}
+std::vector<std::uint32_t> MtpBatchWindowController::search(std::span<const Request> requests,std::uint32_t budget,bool prior) const {
+    if(requests.empty() || requests.size()>8U || budget<2U*requests.size())
+        throw std::invalid_argument("joint MTP windows require 1..8 requests and two physical rows each");
+    for(const auto& q:requests) if(q.limit!=2U && q.limit!=4U && q.limit!=8U)
+        throw std::invalid_argument("joint MTP window limit must be an admitted owner");
+    std::vector<std::uint32_t> current(requests.size(),0U),best;
+    double best_rate=-1.0;
+    const auto visit=[&](auto&& self,std::size_t at,std::uint32_t used,double e,std::uint32_t drafts)->void {
+        if(at==requests.size()) {
+            // Small primaries have exactly four or eight rows. A six-row plan
+            // would split into two serial chunks and reread every weight.
+            if(used<9U && used!=4U && used!=8U) return;
+            const auto ms=cost(current)+(prior?(draft_.samples()?draft_.value():1.2)*drafts:0.0);
+            const auto rate=e/ms;
+            if(rate>best_rate) {best_rate=rate;best=current;}
+            return;
+        }
+        const auto& q=requests[at];
+        for(const auto r:{0U,2U,4U,8U}) {
+            if(!prior && r==0U) continue;
+            const auto physical=r?r:2U;
+            if(physical>q.limit || used+physical+2U*(requests.size()-at-1U)>budget) continue;
+            current[at]=r;
+            self(self,at+1U,used+physical,e+(r?expected(q,r,prior):1.0),drafts+(r?r-1U:0U));
+        }
+    };
+    visit(visit,0U,0U,0.0,0U);
+    // Three context/budget tails can each fit only R2. They cannot be padded to
+    // eight rows: retain their admissible small chunks rather than fail a request.
+    if(best.empty()) return std::vector<std::uint32_t>(requests.size(),prior?0U:2U);
+    return best;
+}
+std::vector<std::uint32_t> MtpBatchWindowController::plan(std::span<const Request> q,std::uint32_t budget) {
+    auto out=search(q,budget,true);
+    probe_.clear();
+    auto& plans=plans_.at(q.size());
+    // Bounded exploration samples deeper windows even after a low-acceptance
+    // region. It does not borrow another request's acceptance history.
+    if(++plans<=9U || plans%32U==1U) {
+        const auto depth=plans<=9U?(2U<<((plans-1U)%3U)):plans%96U<33U?8U:plans%96U<65U?4U:2U;
+        std::uint32_t used=2U*static_cast<std::uint32_t>(q.size());
+        std::fill(out.begin(),out.end(),2U);
+        for(std::size_t k=0;k<q.size();++k) {
+            auto r=depth;while(r>q[k].limit || used+r-2U>budget) r/=2U;
+            if(r>=2U) {out[k]=r;used+=r-2U;}
+        }
+        // Avoid a six-row chunk even during exploration (e.g. a context tail).
+        if(used==6U) {
+            bool padded=false;
+            for(std::size_t k=0;k<q.size();++k) if(out[k]==2U && q[k].limit>=4U && budget>=8U) {
+                out[k]=4U;padded=true;break;
+            }
+            if(!padded) std::fill(out.begin(),out.end(),2U);
+        }
+        probe_=out;
+    }
+    return out;
+}
+std::vector<std::uint32_t> MtpBatchWindowController::choose(std::span<const Request> q,std::uint32_t budget) const {
+    if(!probe_.empty()) return probe_;
+    return search(q,budget,false);
+}
+void MtpBatchWindowController::observe(std::span<const Request> q,std::span<const std::uint32_t> rows,
+    std::span<const std::uint32_t> accepted,double draft_ms,double target_ms,std::uint32_t steps) {
+    if(q.size()!=rows.size() || rows.size()!=accepted.size() || !(target_ms>0.0) || draft_ms<0.0)
+        throw std::invalid_argument("joint MTP observation geometry or timing differs");
+    costs_[batch_key(rows)].add(target_ms);
+    if(steps && draft_ms>0.0) draft_.add(draft_ms/steps);
+    for(std::size_t k=0;k<q.size();++k) {
+        auto& h=history_.at(q[k].slot);
+        for(std::size_t d=0;d<q[k].probabilities.size() && d+1U<rows[k] && d<=accepted[k];++d) {
+            h.seen[d]+=1.0;if(d<accepted[k]) h.hits[d]+=1.0;
+        }
+    }
 }
 } // namespace strix

@@ -21,11 +21,21 @@ struct MoeKernelTuning {
     int shared = -1;  // shared expert (Q8_0, one expert of R rows)
     int head = -1;    // output head (Q8_0 x A8 over the vocabulary slice)
     int prefill = -1; // prefill experts (WMMA kernels of hip_ds41_prefill.hip)
-    // Routed experts with routes built on the device (STRIX_DS41_EXPERT_SLOTS=1, default 0 = off): the grids
+    // Routed experts with routes built on the device (STRIX_DS41_EXPERT_SLOTS, default 1 since P16, =0 off): the grids
     // cover slots_y(R) union slots instead of rows * top_k and each block loops over slots y, y + slots_y, ...
     // below counts[0] (fewer padded blocks; every slot's products unchanged). STRIX_DS41_EXPERT_SLOTS_Y=N fixes it.
-    int slots = 0;
+    int slots = 1;
     int slots_y = 0;
+    // Routed IQ2_XXS gate/up and Q2_K down with every weight group of a wave loaded at once and held in registers
+    // across the staged-row parts (STRIX_DS41_EXPERT_ROWS=1, default 0 = off; same bits). STRIX_DS41_EXPERT_ROWS_FORM
+    // overrides the shape for A/B (hip_ds41_formats.hip, rows_shape).
+    int rows = 0;
+    int rows_form = -1;
+    // The expert-TP down (enqueue_routes_product_groups at width 1152) with held groups and its four tail groups spread
+    // over the lanes (STRIX_DS41_TP_DOWN, default 1 since P17.2, =0 off; same bits). STRIX_DS41_TP_DOWN_FORM overrides the
+    // shape.
+    int tp_down = 1;
+    int tp_down_form = -1;
 };
 MoeKernelTuning& moe_kernel_tuning();
 
@@ -60,7 +70,7 @@ void enqueue_product(WeightFormat format, const ProductView& view, void* stream)
 
 // Window routes in device memory (WindowRoutes): expert slot j = blockIdx.y owns entries
 // begins[j] .. begins[j + 1]; entry i reads activation row inputs[i] and writes output row outputs[i].
-// max_rows bounds the entries of any expert (1..8), or with device routes the entries staged at a time.
+// max_rows bounds the entries of any expert (1..16), or with device routes the entries staged at a time.
 struct RoutesView {
     const std::uint32_t* experts = nullptr;
     const std::uint32_t* begins = nullptr;

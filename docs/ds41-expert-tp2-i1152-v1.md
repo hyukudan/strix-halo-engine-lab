@@ -1,8 +1,10 @@
 # ds41-expert-tp2-i1152-v1: routed experts split by the intermediate dimension over two ranks
 
-Status: declared identity, opt-in. `STRIX_DS41_EXPERT_TP=1` (read once at startup) selects it in the host reference
-(`HostForward`, `strix-deepseek41-trimmed`), the two-rank `DeviceForward` (decode steps and verify windows) and the
-two-rank `BatchForward`. With the variable unset every path keeps the current identity
+Status: declared identity, the default of the two-rank decode since P16. `STRIX_DS41_EXPERT_TP` (read once at
+startup): `1` on, `0` off; unset, the two-rank `DeviceForward` (decode steps and verify windows) and `BatchForward` take it
+when the layout allows it (two ranks, resident experts, I = 2304; `expert_tp::decode_enabled`), and the server keeps it
+off (its device prefill reads the decode weights in place). The host reference (`HostForward`,
+`strix-deepseek41-trimmed`) follows only an explicit `1`. With `0` every path keeps the expert-parallel identity
 (`combine-shared+low-half+high-half-ascending-id-v1`, `ds41-moe.md`) and its bits. Files: `include/strix/ds41_expert_tp.hpp`,
 `src/ds41_expert_tp.cpp` (layout + host reference), `include/strix/hip_ds41_expert_tp.hpp`, `src/hip_ds41_expert_tp.hip`
 (loader + down-row packing), `enqueue_routes_product_groups` in `src/hip_ds41_formats.hip`, tests
@@ -84,3 +86,16 @@ the FP32 bits differ (`combine@L:y` hashes differ from the first layer on).
   exact product up to rounding.
 - Device: op hashes of every step equal the host reference's on both ranks (R1), fill windows of 2..8 rows and
   rejected windows (`--fill-keep`) equal the R1 fill, batch tokens/logits equal DeviceForward alone in the identity.
+
+## Mixed identity ds41-prefill-ep+decode-tp
+
+`DevicePrefill` implements only the expert-parallel identity and ignores `STRIX_DS41_EXPERT_TP`. A prompt filled by the
+device prefill and continued by a decode forward with expert TP (`strix-deepseek41-longctx`, where the prefill object is
+freed before the decode forward loads; a state imported from another prefill) runs the declared mixed identity
+**ds41-prefill-ep+decode-tp**: prompt state of the expert-parallel prefill, every decode step and verify window in
+ds41-expert-tp2-i1152-v1.
+
+- The decode stays exact against its own CPU reference (this document's gates).
+- The prefill is not bit-identical to an expert-TP prefill; it is validated by quality, as the RTX prefill is: on 3
+  prompts, the first 64 generated tokens equal those of the expert-parallel prefill + expert-parallel decode, and the KL of
+  the continuation's full logits (`strix-deepseek41-longctx --logits-out`) against that run, mean and max per step.

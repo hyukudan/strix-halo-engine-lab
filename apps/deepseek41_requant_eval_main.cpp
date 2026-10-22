@@ -178,8 +178,9 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
     const auto stream = static_cast<hipStream_t>(fwd.stream());
     std::vector<float> host(std::size_t{strix::deepseek41::DeviceForward::max_window_rows} * slice.count);
     const auto fetch = [&](std::uint32_t R) {  // this rank's slice of the last window's logits
-        check(hipMemcpy2DAsync(host.data(), std::size_t{slice.count} * 4U, fwd.device_logits() + slice.first, std::size_t{V} * 4U,
-                               std::size_t{slice.count} * 4U, R, hipMemcpyDeviceToHost, stream),
+        const auto lr = fwd.device_logits_rows(slice.first);
+        check(hipMemcpy2DAsync(host.data(), std::size_t{slice.count} * 4U, lr.p, lr.stride * 4U, std::size_t{slice.count} * 4U, R,
+                               hipMemcpyDeviceToHost, stream),
               "logits download");
         check(hipStreamSynchronize(stream), "logits download");
     };

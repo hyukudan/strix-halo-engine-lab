@@ -139,6 +139,190 @@ void WindowController::observe(const Draft& d, std::uint32_t verified, std::uint
     }
 }
 
+BatchWindowController::BatchWindowController(std::uint32_t slots) : slot_seen_(slots), slot_hits_(slots) {
+    if (slots == 0U) throw std::invalid_argument("BatchWindowController needs at least one slot");
+}
+
+void BatchWindowController::reset(std::uint32_t slot) {
+    slot_seen_.at(slot).fill(0U);
+    slot_hits_.at(slot).fill(0U);
+}
+
+double BatchWindowController::plain_cost(std::uint32_t n) const {
+    if (n == 0U) return 0.0;
+    std::array<double, max_requests + 1U> v{};
+    for (std::uint32_t r = 0; r <= max_requests; ++r) v[r] = static_cast<double>(costs_.plain[r]);
+    if (n <= max_requests && v[n] > 0.0) return v[n];
+    std::uint32_t lo = 0, hi = 0;
+    for (std::uint32_t r = 1; r < n && r <= max_requests; ++r)
+        if (v[r] > 0.0) lo = r;
+    for (std::uint32_t r = n + 1U; r <= max_requests; ++r)
+        if (v[r] > 0.0) { hi = r; break; }
+    const double x = n;
+    if (lo != 0U && hi != 0U) return v[lo] + (v[hi] - v[lo]) * (x - lo) / (static_cast<double>(hi) - lo);
+    // unmeasured: a request more costs about 1.5 window rows (its row plus its own segment's launches)
+    const double row = costs_.row > 0.0F ? costs_.row : (lo != 0U ? 0.13 * v[lo] : hi != 0U ? 0.13 * v[hi] : 0.005);
+    if (lo != 0U) return v[lo] + 1.5 * row * (x - lo);
+    if (hi != 0U) return std::max(0.5 * v[hi], v[hi] - 1.5 * row * (static_cast<double>(hi) - x));
+    return 0.075 + 1.5 * row * (x - 1.0);  // nothing measured yet
+}
+
+double BatchWindowController::step_cost(std::span<const std::uint32_t> rows, std::uint32_t drafting) const {
+    const auto n = static_cast<std::uint32_t>(rows.size());
+    std::uint32_t total = 0;
+    for (const auto r : rows) total += r;
+    const double plain = plain_cost(n);
+    // defaults until measured: a window row ~13 % of a one-request step, a draft ~20 %, append + commit 1.5 ms
+    const double row = costs_.row > 0.0F ? costs_.row : 0.13 * plain_cost(1U);
+    if (drafting == 0U) return plain + row * (total - n);
+    const double draft = costs_.draft > 0.0F ? costs_.draft : 0.2 * plain_cost(1U);
+    const double extra = costs_.draft > 0.0F ? costs_.extra : 0.0015;  // measured drafts: `extra` as given (0 = inside the walls)
+    const std::uint32_t drafters = std::max(costs_.drafters, 1U);
+    return plain + row * (total - n) + draft * ((drafting + drafters - 1U) / drafters) + (drafters > 1U ? costs_.round : 0.0F) + extra * n;
+}
+
+double BatchWindowController::probability(std::uint32_t depth, float confidence) const {
+    const auto b = SurvivalController::bin(confidence);
+    std::uint64_t bs = 0, bh = 0;  // the bin over every depth
+    for (std::uint32_t j = 0; j < block_size; ++j) bs += seen_[j][b], bh += hits_[j][b];
+    const double q = (static_cast<double>(bh) + 1.0) / (static_cast<double>(bs) + 2.0);
+    return (static_cast<double>(hits_[depth][b]) + 4.0 * q) / (static_cast<double>(seen_[depth][b]) + 4.0);
+}
+
+double BatchWindowController::slot_survival(std::uint32_t slot, std::uint32_t depth) const {
+    std::uint64_t s = 0, h = 0;  // pooled over every request and confidence
+    for (std::uint32_t b = 0; b < WindowController::bins; ++b) s += seen_[depth][b], h += hits_[depth][b];
+    const double prior = (static_cast<double>(h) + 1.0) / (static_cast<double>(s) + 2.0);
+    return (static_cast<double>(slot_hits_.at(slot)[depth]) + 8.0 * prior) / (static_cast<double>(slot_seen_.at(slot)[depth]) + 8.0);
+}
+
+std::vector<std::uint32_t> BatchWindowController::search(const std::vector<std::vector<double>>& expected, std::span<const std::uint32_t> limit,
+                                                         std::uint32_t budget, int drafting) const {
+    const auto n = static_cast<std::uint32_t>(expected.size());
+    const auto total = [](const std::vector<std::uint32_t>& rows) {
+        std::uint32_t t = 0;
+        for (const auto r : rows) t += r;
+        return t;
+    };
+    const auto rate = [&](const std::vector<std::uint32_t>& rows) {
+        double e = 0.0;
+        std::uint32_t d = 0;
+        for (std::uint32_t i = 0; i < n; ++i) e += expected[i][rows[i] - 1U], d += rows[i] > 1U ? 1U : 0U;
+        return e / step_cost(rows, drafting < 0 ? d : static_cast<std::uint32_t>(drafting));
+    };
+    std::vector<std::uint32_t> best(n, 1U);
+    double best_rate = rate(best);
+    if (n <= 4U) {  // exhaustive, in a fixed order (ties keep the earlier, fewer-row plan)
+        std::vector<std::uint32_t> rows(n, 1U);
+        for (;;) {
+            std::uint32_t i = 0;
+            while (i < n && rows[i] == limit[i]) rows[i++] = 1U;
+            if (i == n) break;
+            ++rows[i];
+            if (total(rows) <= budget) {
+                const double r = rate(rows);
+                if (r > best_rate) best_rate = r, best = rows;
+            }
+        }
+        return best;
+    }
+    for (std::uint32_t u = 1; u <= max_window; ++u) {  // local search from every uniform start
+        std::vector<std::uint32_t> rows(n);
+        for (std::uint32_t i = 0; i < n; ++i) rows[i] = std::min(u, limit[i]);
+        while (total(rows) > budget) *std::max_element(rows.begin(), rows.end()) -= 1U;
+        double cur = rate(rows);
+        for (;;) {
+            std::vector<std::uint32_t> cand;
+            double cand_rate = cur;
+            const auto consider = [&](const std::vector<std::uint32_t>& t) {
+                if (total(t) > budget) return;
+                const double r = rate(t);
+                if (r > cand_rate) cand_rate = r, cand = t;
+            };
+            for (std::uint32_t i = 0; i < n; ++i) {
+                auto t = rows;
+                if (t[i] < limit[i]) ++t[i], consider(t);
+                t = rows;
+                if (t[i] > 1U) --t[i], consider(t);
+                for (std::uint32_t j = 0; j < n; ++j) {
+                    t = rows;
+                    if (j != i && t[i] < limit[i] && t[j] > 1U) ++t[i], --t[j], consider(t);
+                }
+            }
+            if (cand.empty()) break;
+            rows = cand;
+            cur = cand_rate;
+        }
+        if (cur > best_rate) best_rate = cur, best = rows;
+    }
+    return best;
+}
+
+std::vector<bool> BatchWindowController::plan_drafts(std::span<const std::uint32_t> slots, std::span<const std::uint32_t> limit,
+                                                     std::uint32_t budget) {
+    const auto n = static_cast<std::uint32_t>(slots.size());
+    if (limit.size() != n || budget < n) throw std::invalid_argument("BatchWindowController: one row per request at least");
+    std::vector<bool> out(n, false);
+    if (n == 0U) return out;
+    if (++plans_ % explore_every == 0U) {  // exploration: one request with room drafts (round-robin over the plans)
+        const auto first = static_cast<std::uint32_t>((plans_ / explore_every) % n);
+        for (std::uint32_t j = 0; j < n && budget > n; ++j)
+            if (const auto i = (first + j) % n; limit[i] > 1U) {
+                out[i] = true;
+                break;
+            }
+        return out;
+    }
+    std::vector<std::vector<double>> expected(n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        double survival = 1.0, e = 1.0;
+        expected[i].push_back(1.0);
+        for (std::uint32_t R = 2; R <= limit[i]; ++R) {
+            survival *= slot_survival(slots[i], R - 2U);
+            e += survival;
+            expected[i].push_back(e);
+        }
+    }
+    const auto rows = search(expected, limit, budget, -1);
+    for (std::uint32_t i = 0; i < n; ++i) out[i] = rows[i] > 1U;
+    return out;
+}
+
+std::vector<std::uint32_t> BatchWindowController::choose_rows(std::span<const std::uint32_t> slots, std::span<const std::uint32_t> limit,
+                                                              std::uint32_t budget, const std::vector<bool>& drafted,
+                                                              std::span<const Draft> drafts) const {
+    const auto n = static_cast<std::uint32_t>(slots.size());
+    if (limit.size() != n || drafted.size() != n || drafts.size() != n || budget < n)
+        throw std::invalid_argument("BatchWindowController: plan geometry");
+    std::uint32_t drafting = 0;
+    std::vector<std::uint32_t> lim(limit.begin(), limit.end());
+    std::vector<std::vector<double>> expected(n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        expected[i].push_back(1.0);
+        if (!drafted[i]) {
+            lim[i] = 1U;
+            continue;
+        }
+        ++drafting;
+        double survival = 1.0, e = 1.0;
+        for (std::uint32_t R = 2; R <= lim[i]; ++R) {
+            survival *= probability(R - 2U, drafts[i].confidence[R - 2U]);
+            e += survival;
+            expected[i].push_back(e);
+        }
+    }
+    return search(expected, lim, budget, static_cast<int>(drafting));
+}
+
+void BatchWindowController::observe(std::uint32_t slot, const Draft& d, std::uint32_t verified, std::uint32_t accepted) {
+    for (std::uint32_t j = 0; j < verified && j <= accepted && j < block_size; ++j) {
+        const auto b = SurvivalController::bin(d.confidence[j]);
+        ++seen_[j][b];
+        ++slot_seen_.at(slot)[j];
+        if (j < accepted) ++hits_[j][b], ++slot_hits_.at(slot)[j];
+    }
+}
+
 std::uint32_t WindowPolicy::choose(const Draft& d) const {
     if (controller) return controller->choose(d);
     if (survival) return survival->choose(d);

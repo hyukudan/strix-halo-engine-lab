@@ -2,17 +2,23 @@
 
 #include "strix/deepseek41_attention_host.hpp"
 #include "strix/dist/communicator.hpp"
+#include "strix/dist/staged_ready.hpp"
 #include "strix/hip_ds41_attention.hpp"
 #include "strix/ds41_engram.hpp"
 #include "strix/ds41_expert_tp.hpp"
 #include "strix/ds41_moe.hpp"
 #include "strix/ds41_native_fp8.hpp"
 #include "strix/ds41_packed.hpp"
+#include "strix/ds41_shexp_tp.hpp"
+#include "strix/ds41_trellis.hpp"
+#include "strix/ds41_trellis_group.hpp"
 #include "strix/ds41_weight_overlay.hpp"
 #include "strix/hip_ds41_expert_tp.hpp"
 #include "strix/hip_ds41_formats.hpp"
 #include "strix/hip_ds41_layer.hpp"
 #include "hip_ds41_step_trace.hpp"
+
+#include "hip_ds41_prepared_load.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -20,6 +26,7 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -27,6 +34,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <string_view>
 #include <stdexcept>
 #include <future>
 #include <thread>
@@ -141,6 +149,57 @@ __global__ void add_halves(const float* __restrict__ a, const float* __restrict_
     const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = a[i] + b[i];
 }
+// Staged readiness (STRIX_DIST_STAGED_READY_BYTES): the producer's release after the o_b product (one block), and the
+// add of the two halves behind the consumer acquire, publishing the consumer token at its end (every thread of every
+// block, no early return).
+__global__ void publish_ready_kernel(dist::StagedReady* flag, std::uint64_t token) { dist::publish_staged_block(flag, token, 1U); }
+__global__ void add_halves_ready(const float* a, const float* b, float* __restrict__ out, std::uint32_t n, dist::StagedReady* flag,
+                                 std::uint64_t token) {
+    dist::staged_acquire(flag, token);
+    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = a[i] + b[i];
+    dist::publish_staged_block(flag, token, gridDim.x);
+}
+// The same add for one column chunk of STRIX_DS41_OB_SPLIT: a and b hold [rows][cols], out the rows of `width` values
+// from column col0.
+__global__ void add_halves_cols(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, std::uint32_t rows,
+                                std::uint32_t cols, std::uint32_t col0, std::uint32_t width) {
+    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * cols) out[std::size_t{i / cols} * width + col0 + i % cols] = a[i] + b[i];
+}
+// STRIX_DS41_OB_SPLIT=K: the tensor-parallel o_b half in K column chunks, each one's exchange overlapping the next one's
+// product (every output's product and add unchanged, so the same bits). 1 / unset: one product, one exchange.
+std::uint32_t ob_split(std::uint32_t hidden) {
+    static const std::uint32_t k = [] {
+        const char* v = std::getenv("STRIX_DS41_OB_SPLIT");
+        return v && *v ? static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10)) : 1U;
+    }();
+    if (k <= 1U) return 1U;
+    if (k > 8U || hidden % k != 0U || (hidden / k) % 32U != 0U) throw std::invalid_argument("STRIX_DS41_OB_SPLIT: 2, 4, 5 or 8");
+    return k;
+}
+// STRIX_DS41_LATE_HC_LAYERS=all (default since P17.5) | none | <comma-separated layers>: see late_mix in the forward.
+bool late_hc_layer(std::uint32_t layer) {
+    static const std::vector<bool> on = [] {
+        std::vector<bool> r(1024, false);
+        const char* v = std::getenv("STRIX_DS41_LATE_HC_LAYERS");
+        if (!v || !*v) return std::vector<bool>(1024, true);
+        const std::string s(v);
+        if (s == "all") return std::vector<bool>(1024, true);
+        if (s == "none" || s == "off") return r;
+        std::size_t i = 0;
+        while (i < s.size()) {
+            const std::size_t j = s.find(',', i);
+            const auto l = std::stoul(s.substr(i, j == std::string::npos ? std::string::npos : j - i));
+            if (l >= r.size()) throw std::invalid_argument("STRIX_DS41_LATE_HC_LAYERS: layer out of range");
+            r[l] = true;
+            if (j == std::string::npos) break;
+            i = j + 1U;
+        }
+        return r;
+    }();
+    return layer < on.size() && on[layer];
+}
 
 // STRIX_DS41_COMPRESS_RING: the ratio-2 carries of a rolled-back window, every layer in one launch (block b: layer b),
 // exactly the copies and memsets of commit_window: open, the kept last row's (kv, score) and valid 1; else zeros.
@@ -236,6 +295,36 @@ struct DeviceForward::Impl {
     std::set<std::string> planar;                              // packed site weights in the planar layout
     std::map<std::string, std::array<std::uint32_t, 2>> native_fp8;  // native FP8 site weights: rows, width (codes, then exponents)
     Dev<float> fp8_gate, fp8_up;                                      // native FP8 shared expert: gate and up products [R][I]
+    // trellis sites (options.trellis, ds41_trellis.hpp): the pack, the library context, the prepared site of each
+    // GGUF weight name this rank runs from the pack, and the bytes it reads per step (op timing)
+    std::unique_ptr<ds41::TrellisPack> trellis_pack;
+    std::unique_ptr<ds41::TrellisContext> trellis;
+    std::vector<std::string> trellis_classes;
+    std::map<std::string, const ds41::TrellisSite*> trellis_sites;
+    std::map<std::string, std::uint64_t> trellis_bytes;
+    Dev<float> tr_gate, tr_up, tr_act;  // trellis shared expert: gate, up and the SwiGLU activation [R][I] (F32)
+    // trellis shared expert split over the ranks (options.trellis_shexp_tp, ds41-trellis-k5-v1:shexp-tp): per layer the
+    // rank slices this process runs (world 2: its own; one process: both, rank order); tr_p1 = rank 1's partial (one process)
+    bool shexp_tp = false;
+    std::vector<std::vector<ds41::ShexpTpSlices>> trellis_shexp_tp;
+    Dev<float> tr_p1;
+    // trellis attention projections (ds41-trellis-k5-v1, q_b / o_a / o_b): per layer, the linears this process runs in
+    // rank-slice order (TP: this rank's; one process: both ranks'), empty = today's kernel
+    struct TrellisAttn { std::vector<const ds41::TrellisSite*> q_b, o_a, o_b; };
+    std::vector<TrellisAttn> trellis_attn;
+    std::unique_ptr<ds41::TrellisGroupRunner> trellis_oa;  // STRIX_DS41_TRELLIS_OA_GROUP=1|2: o_a groups in one staged call
+    // trellis LM head (ds41-trellis-k5-v1:head): the vocabulary slices this process computes (world 2: its own; world 1:
+    // both, so one process gives the two ranks' bits) and their prepared row slices of the pack's head
+    std::vector<std::pair<ds41::VocabSlice, const ds41::TrellisSite*>> trellis_head;
+    // STRIX_DS41_TRELLIS_HEADOUT: a step of R > 1 rows writes the head to head_rows ([slice k][max_window_rows][count],
+    // contiguous rows, so the library writes in place and R5..7 go as 8 rows) instead of logits; R1 writes logits in place.
+    // head_rows_valid: the last head step went to head_rows (argmax and device_logits_rows read it from there).
+    bool headout = false, head_rows_valid = false;
+    [[nodiscard]] std::pair<const float*, std::size_t> logits_rows(std::uint32_t slice_first, std::uint32_t vocab) const;
+    [[nodiscard]] const ds41::TrellisSite* trellis_site(const std::string& name) const {
+        const auto it = trellis_sites.find(name);
+        return it == trellis_sites.end() ? nullptr : it->second;
+    }
     std::map<std::string, const ManifestTensor*> tensors;
     std::map<std::string, Dev<std::uint8_t>> weights;  // every tensor a device operation reads
     std::unique_ptr<ds41::EngramHasher> hasher;
@@ -264,6 +353,8 @@ struct DeviceForward::Impl {
     // stream_experts: device slots for the selected experts of one layer and their pinned staging
     Dev<std::uint8_t> slot_gate, slot_up, slot_down;
     std::uint8_t* slot_pinned = nullptr;
+    std::uint8_t* receive_pinned = nullptr;  // receive_buffer(): a pipeline TAIL's message payloads
+    std::size_t receive_bytes = 0;
     double stream_seconds = 0.0;  // last step: host time copying expert bytes (file -> pinned)
     Dev<std::uint8_t> index_qprep;       // index scores scratch: R x kIdxPrepBytes
     Dev<std::uint32_t> attn_tickets;     // R x kAttnGroupCount, zero between calls (the last chunk block combines)
@@ -277,6 +368,7 @@ struct DeviceForward::Impl {
     bool identity_pre = true;  // pre_carry is the identity (before the first FFN site)
     std::array<float, ds41::hc_copies> pre_carry{};
     Dev<float> x, qr, q, kv, o, o_low, y, shared, raw, low, high, h, logits, emb, ekv, scores, route_w;
+    Dev<float> head_rows;  // STRIX_DS41_TRELLIS_HEADOUT (see headout)
     Dev<std::uint8_t> erows, image_row;  // erows: [engram layer of the range][row][column] x 264 B, uploaded once per step
     std::uint8_t* erows_pinned = nullptr;  // pinned staging of erows (the upload is asynchronous)
     Dev<std::uint32_t> token, pos, ids;
@@ -320,6 +412,14 @@ struct DeviceForward::Impl {
     bool split_shared = false;
     Dev<std::uint8_t> shx_own, shx_other;
     std::size_t shared_hash_at = 0;
+    // pipeline stages: the cut this TAIL receives (first > 0) or this FRONT produces (layers < the model's)
+    std::uint32_t first = 0;
+    ds41::pipe::BoundaryPlan cut;
+    ds41::pipe::BoundaryGeometry geo;
+    std::uint32_t last_position = 0;  // position of row 0 of the last step (export_boundary)
+    std::vector<std::vector<std::uint32_t>> boundary_topk;  // host staging of the boundary's top-k sections
+    Dev<std::uint8_t> control;        // exchange_host staging: [send | receive] x control_chunk
+    static constexpr std::size_t control_chunk = 1U << 20U;  // a whole verify window's STEP frame in one exchange
     [[nodiscard]] bool distributed() const noexcept { return options.world == 2U; }
     [[nodiscard]] double comm_seconds() const { return distributed() ? options.communicator->stats().seconds : 0.0; }
 
@@ -349,6 +449,11 @@ struct DeviceForward::Impl {
         return reinterpret_cast<const std::uint16_t*>(weights.at(name).p);
     }
     [[nodiscard]] std::vector<float> buffer(Buffer b) const;
+    ~Impl() {
+        // Plans borrow the activation allocations, group workspaces and streams.
+        trellis_oa.reset();
+        trellis.reset();
+    }
 };
 
 std::vector<float> DeviceForward::Impl::buffer(Buffer b) const {
@@ -402,6 +507,12 @@ DeviceForwardOptions with_env_overlay(DeviceForwardOptions o) {
     if (o.native_fp8.empty())
         if (const char* e = std::getenv("STRIX_DS41_NATIVE_FP8"); e != nullptr && *e != 0) o.native_fp8 = e;
     if (const char* e = std::getenv("STRIX_DS41_NATIVE_FP8_SITES"); e != nullptr && *e != 0) o.native_fp8_sites = e;
+    // trellis dense sites (default off): STRIX_DS41_TRELLIS=pack dir or STRIX_DS41_TRELLIS_MIX=class=dir,... (mixed K
+    // per class, ds41_trellis.hpp), STRIX_DS41_TRELLIS_SITES=classes
+    if (o.trellis.empty())
+        if (const auto spec = ds41::trellis_env_spec(); !spec.empty()) o.trellis = spec;
+    if (const char* e = std::getenv("STRIX_DS41_TRELLIS_SITES"); e != nullptr && *e != 0) o.trellis_sites = e;
+    flag("STRIX_DS41_SHEXP_TP", o.trellis_shexp_tp);
     return o;
 }
 }  // namespace
@@ -424,7 +535,13 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
     if (options.world == 2U && (options.communicator == nullptr || options.rank > 1U))
         throw std::invalid_argument("deepseek41 device forward: world 2 needs a communicator and rank 0 or 1");
     m.model = validate_target(read_file(gguf));
-    m.plan = build_decode_plan(m.model, 0, options.layers);
+    if (options.first_layer != 0U && (options.first_layer >= options.layers || !options.head))
+        throw std::invalid_argument("deepseek41 device forward: a pipeline TAIL runs layers [first_layer, layers) and the head");
+    m.first = options.first_layer;
+    m.plan = build_decode_plan(m.model, options.first_layer, options.layers, options.first_layer == 0U, options.head);
+    m.geo = ds41::pipe::boundary_geometry(m.model.config);
+    if (options.first_layer != 0U) m.cut = ds41::pipe::plan_boundary(m.model.layers, options.first_layer);
+    else if (options.layers < m.model.config.num_hidden_layers) m.cut = ds41::pipe::plan_boundary(m.model.layers, options.layers);
     m.file = std::make_unique<Mapped>(gguf);
     if (!options.weights_overlay.empty()) m.overlay = std::make_unique<ds41::WeightOverlay>(options.weights_overlay, m.model.manifest);
     for (const auto& t : m.model.manifest.tensors) m.tensors.emplace(t.name, &t);
@@ -434,7 +551,7 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
         const std::uint32_t per_rank = cfg.n_routed_experts / options.world;
         m.expert_first = options.rank * per_rank;
         m.expert_end = m.expert_first + per_rank;
-        m.expert_tp = ds41::expert_tp::enabled_from_env();
+        m.expert_tp = ds41::expert_tp::decode_enabled(options.world, cfg.moe_intermediate_size, options.stream_experts);  // default on since P16
         if (m.expert_tp) {
             if (!m.distributed() || options.stream_experts || cfg.moe_intermediate_size != ds41::expert_tp::inter)
                 throw std::invalid_argument("deepseek41 device forward: STRIX_DS41_EXPERT_TP=1 needs two ranks, resident experts and I = 2304");
@@ -450,6 +567,7 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
     DirectLoader loader(gguf);
     std::unique_ptr<DirectLoader> overlay_loader;
     if (m.overlay) overlay_loader = std::make_unique<DirectLoader>(m.overlay->path());
+    ds41::prepared::HipLoader prepared(gguf, m.overlay ? m.overlay->path() : std::filesystem::path{}, m.model, options.rank, options.world, m.expert_tp, &options.trellis, &options.trellis_sites);
     std::unique_ptr<ds41::SafetensorsCheckpoint> checkpoint;
     std::vector<std::string> fp8_classes;
     if (!options.native_fp8.empty()) {
@@ -473,6 +591,21 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
         const auto* over = m.overlay ? m.overlay->find(n) : nullptr;
         std::uint64_t offset = over != nullptr ? over->absolute_offset : t->absolute_offset, bytes = t->byte_size;
         if (options.stream_experts && n.ends_with("_exps.weight")) continue;  // read per layer from the file
+        if (n.ends_with("_exps.weight") && !options.stream_experts) {
+            const auto& cfg = m.model.config;
+            const bool down = n.ends_with("ffn_down_exps.weight");
+            const auto count = m.expert_tp ? ds41::expert_tp::part_bytes(bytes, cfg.n_routed_experts, down, cfg.hidden_size)
+                                         : bytes / cfg.n_routed_experts * (m.expert_end - m.expert_first);
+            // Allocation is also needed by the fallback; avoid allocating this speculative destination
+            // unless an artifact was requested (the adapter stays inert otherwise).
+            if (prepared.active()) {
+                Dev<std::uint8_t> d(count);
+                if (prepared.load(n, count, d.p, m.stream)) {
+                    m.weights.emplace(n, std::move(d));
+                    continue;
+                }
+            }
+        }
         if (m.expert_tp && n.ends_with("_exps.weight")) {  // this rank's part of every expert (ds41_expert_tp.hpp)
             const auto& cfg = m.model.config;
             const bool down = n.ends_with("ffn_down_exps.weight");
@@ -550,6 +683,8 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
         (over != nullptr ? *overlay_loader : loader).load(offset, bytes, d.p);
         m.weights.emplace(n, std::move(d));
     }
+    prepared.report();
+    ds41::prepared::device_hashes(m.weights, options.rank, m.stream);
     // The declared identities of the steps on native FP8 weights (the shared expert only with all three tensors).
     for (auto& s : m.plan.steps) {
         if (s.weights.empty() || !m.native_fp8.contains(s.weights[0])) continue;
@@ -561,6 +696,116 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
             s.identity = s.op == Op::o_a ? ds41::fp8_grouped_identity : s.op == Op::o_b ? ds41::fp8_ksplit_identity : ds41::fp8_product_identity;
         }
     }
+    // trellis sites (identity ds41-trellis-k5-v1): each enabled class prepares its weights (whole or this rank's
+    // slice) from the pack; the Q8_0 / packed copies above stay loaded. Site groups add their prepares here.
+    if (!options.trellis.empty()) {
+        m.trellis_pack = std::make_unique<ds41::TrellisPack>(options.trellis);
+        m.trellis = std::make_unique<ds41::TrellisContext>();
+        m.trellis_classes = ds41::parse_trellis_site_classes(options.trellis_sites);
+        if (m.trellis_classes.empty())
+            std::fprintf(stderr, "ds41 trellis: STRIX_DS41_TRELLIS is set but no site class is selected (STRIX_DS41_TRELLIS_SITES empty): "
+                                 "no site reads the pack\n");
+        const auto prepare = [&](const std::string& name, const ds41::TrellisSlice& slice = {}) {
+            const auto pack_name = ds41::trellis_pack_name(name);
+            if (!pack_name) throw std::logic_error("deepseek41 device forward: no trellis name for " + name);
+            const auto& site = m.trellis->prepare(*m.trellis_pack, *pack_name, slice);
+            m.trellis_sites[name] = &site;
+            m.trellis_bytes[name] += site.device_bytes;
+            return &site;
+        };
+        for (auto& s : m.plan.steps) {
+            // shared expert (replicated on both ranks, its whole gate / up / down): F32 x -> gate, up -> clamped SwiGLU (F32)
+            // -> down, three trellis linears (docs/ds41-trellis-k5-v1.md, shexp)
+            if (s.op == Op::shared_expert && ds41::trellis_class_enabled(m.trellis_classes, s.weights[0])) {
+                if (m.native_fp8.contains(s.weights[0]))
+                    throw std::invalid_argument("deepseek41 device forward: shared expert both native FP8 and trellis");
+                if (options.trellis_shexp_tp) {
+                    // ds41-trellis-k5-v1:shexp-tp: rank r's gate / up row slices and down column slice (world 2: its own;
+                    // one process: both ranks', rank order). trellis_sites names the first, so the shexp checks see a
+                    // trellis shared expert; trellis_bytes counts every slice this process reads.
+                    const std::uint32_t inter = m.model.config.moe_intermediate_size;
+                    if (m.trellis_shexp_tp.empty()) m.trellis_shexp_tp.assign(m.model.config.num_hidden_layers, {});
+                    auto& slices = m.trellis_shexp_tp.at(static_cast<std::size_t>(s.layer));
+                    for (std::uint32_t r = 0; r < ds41::shexp_tp_ranks; ++r) {
+                        if (m.distributed() && r != options.rank) continue;
+                        const auto gu = ds41::shexp_tp_gate_up_slice(inter, r), dn = ds41::shexp_tp_down_slice(inter, r);
+                        ds41::ShexpTpSlices t;
+                        t.gate = prepare(s.weights[0], gu);
+                        t.up = prepare(s.weights[1], gu);
+                        t.down = prepare(s.weights[2], dn);
+                        slices.push_back(t);
+                    }
+                    for (std::size_t k = 0; k < 3U; ++k) {
+                        const auto& f = slices.front();
+                        m.trellis_sites[s.weights[k]] = k == 0U ? f.gate : k == 1U ? f.up : f.down;
+                    }
+                    s.identity = ds41::trellis_shexp_step_identity(slices.front().gate->bits, slices.front().down->bits, true);
+                } else {
+                    const auto* gate = prepare(s.weights[0]);
+                    (void)prepare(s.weights[1]);
+                    const auto* down = prepare(s.weights[2]);
+                    s.identity = ds41::trellis_shexp_step_identity(gate->bits, down->bits, false);
+                }
+            }
+            // LM head: rows [slice.first, + count) of the vocabulary, F32 x (the final norm's output), no A8
+            if (s.op == Op::head && ds41::trellis_class_enabled(m.trellis_classes, "output.weight")) {
+                for (std::uint32_t r = 0; r < 2U; ++r) {
+                    if (m.distributed() && r != m.options.rank) continue;
+                    const auto sl = ds41::vocab_slice(m.model.config.vocab_size, 2U, r);
+                    m.trellis_head.emplace_back(sl, prepare("output.weight", {ds41::TrellisSlice::Kind::rows, sl.first, sl.count}));
+                }
+                s.identity = ds41::trellis_step_identity(m.trellis_head.back().second->bits, "head");
+                m.headout = ds41::trellis_headout_enabled();
+            }
+        }
+        // attention projections (docs/ds41-trellis-k5-v1.md, q_b / o_a / o_b): rank r's q_b rows [16384 r, +16384), o_a groups
+        // [4 r, 4 r + 4) (one linear each), o_b K-half columns [4096 r, +4096); one process runs both ranks' linears
+        m.trellis_attn.assign(m.model.config.num_hidden_layers, {});
+        {
+            const auto& c = m.model.config;
+            const bool tp = m.distributed() && options.tp_attention;
+            const std::uint32_t first_rank = tp ? options.rank : 0U, ranks = tp ? 1U : 2U;
+            const std::uint32_t q_rows = c.num_attention_heads / 2U * c.head_dim, o_half = c.o_groups * c.o_lora_rank / 2U;
+            for (auto& s : m.plan.steps) {
+                if (s.layer < 0 || (s.op != Op::q_b && s.op != Op::o_a && s.op != Op::o_b)) continue;
+                const auto& name = s.weights[0];
+                if (!ds41::trellis_class_enabled(m.trellis_classes, name)) continue;
+                if (m.native_fp8.contains(name)) throw std::invalid_argument("deepseek41 device forward: " + name + " both native FP8 and trellis");
+                auto& ta = m.trellis_attn[static_cast<std::size_t>(s.layer)];
+                for (std::uint32_t r = first_rank; r < first_rank + ranks; ++r) {
+                    const char* cls = s.op == Op::q_b ? "q_b" : s.op == Op::o_a ? "o_a" : "o_b";
+                    const ds41::TrellisSite* last = nullptr;
+                    if (s.op == Op::q_b) {
+                        ta.q_b.push_back(last = prepare(name, {ds41::TrellisSlice::Kind::rows, r * q_rows, q_rows}));
+                    } else if (s.op == Op::o_b) {
+                        ta.o_b.push_back(last = prepare(name, {ds41::TrellisSlice::Kind::columns, r * o_half, o_half}));
+                    } else {
+                        for (std::uint32_t g = r * (c.o_groups / 2U); g < (r + 1U) * (c.o_groups / 2U); ++g) {
+                            const auto pack_name = ds41::trellis_pack_name(name, static_cast<int>(g));
+                            const auto& site = m.trellis->prepare(*m.trellis_pack, *pack_name);
+                            m.trellis_bytes[name] += site.device_bytes;
+                            ta.o_a.push_back(last = &site);
+                        }
+                    }
+                    s.identity = ds41::trellis_step_identity(last->bits, cls);
+                }
+            }
+        }
+        m.trellis->reserve(m.stream, max_window_rows);
+        if (const int mode = ds41::trellis_oa_group_mode(); mode != 0)  // default off: the per-group calls below
+            for (const auto& ta : m.trellis_attn)
+                if (!ta.o_a.empty()) {
+                    m.trellis_oa = std::make_unique<ds41::TrellisGroupRunner>(ta.o_a, mode, m.stream);
+                    std::fprintf(stderr, "ds41 trellis: %s\n", m.trellis_oa->describe().c_str());
+                    break;
+                }
+    }
+    m.shexp_tp = !m.trellis_shexp_tp.empty();
+    if (options.trellis_shexp_tp && !m.shexp_tp)
+        throw std::invalid_argument("deepseek41 device forward: STRIX_DS41_SHEXP_TP=1 needs STRIX_DS41_TRELLIS with the shexp class");
+    if (m.shexp_tp && m.expert_tp)  // two per-rank partial folds into the half sums: no declared identity for the pair yet
+        throw std::invalid_argument("deepseek41 device forward: STRIX_DS41_SHEXP_TP=1 with expert TP (STRIX_DS41_EXPERT_TP, default on "
+                                    "since P16) is not a declared identity; set STRIX_DS41_EXPERT_TP=0 or leave SHEXP_TP unset");
     m.hasher = std::make_unique<ds41::EngramHasher>(m.model.engram);
     m.engram_rows.assign(std::size_t{m.hasher->layers()} * m.hasher->columns(), 0U);
     if (options.engram_direct_io) {
@@ -653,6 +898,7 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
     m.high = Dev<float>(W * H);
     m.h = Dev<float>(W * H);
     m.logits = Dev<float>(W * c.vocab_size);  // [row][vocab]
+    if (m.headout) m.head_rows = Dev<float>(m.trellis_head.size() * W * m.trellis_head.front().first.count);
     const std::size_t cols = m.model.engram.rows_per_token();
     m.erows = Dev<std::uint8_t>(std::size_t{m.model.engram.layer_ids.size()} * W * cols * 264U);
     check(hipHostMalloc(reinterpret_cast<void**>(&m.erows_pinned), m.erows.n, hipHostMallocDefault), "engram staging");
@@ -700,6 +946,12 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
         m.fp8_gate = Dev<float>(W * I);
         m.fp8_up = Dev<float>(W * I);
     }
+    if (m.trellis) {
+        m.tr_gate = Dev<float>(W * I);
+        m.tr_up = Dev<float>(W * I);
+        m.tr_act = Dev<float>(W * I);
+        if (m.shexp_tp && !m.distributed()) m.tr_p1 = Dev<float>(W * H);
+    }
     std::uint32_t partial_blocks = 0;
     for (std::uint32_t r = 0; r < 2U; ++r)
         partial_blocks = std::max(partial_blocks, ds41::argmax_partial_blocks(ds41::vocab_slice(c.vocab_size, 2U, r).count));
@@ -715,7 +967,7 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
         const char* v = std::getenv("STRIX_DS41_SPLIT_SHARED");
         return v && *v == '1';
     }());
-    // P13 defaults (main 00:15, after P12): HC_SITE, QA_KV, ENGRAM_ASYNC and COMPRESS_RING on, =0 turns each off.
+    // P13 defaults (after P12): HC_SITE, QA_KV, ENGRAM_ASYNC and COMPRESS_RING on, =0 turns each off.
     m.engram_async = [] {
         const char* v = std::getenv("STRIX_DS41_ENGRAM_ASYNC");
         return !(v && *v == '0');
@@ -725,6 +977,10 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
         return !(v && *v == '0');
     }();
     if (m.split_shared && (I % 64U != 0U || H % 2U != 0U)) throw std::invalid_argument("deepseek41 device forward: shared split geometry");
+    if (m.split_shared)
+        for (const auto& s : m.plan.steps)
+            if (s.op == Op::shared_expert && m.trellis_site(s.weights[0]) != nullptr)
+                throw std::invalid_argument("deepseek41 device forward: the trellis shared expert is replicated (no STRIX_DS41_SPLIT_SHARED)");
     m.half_own = Dev<float>(W * H + (m.split_shared ? W * H / 2U : 0U));
     m.half_other = Dev<float>(W * H + (m.split_shared ? W * H / 2U : 0U));
     if (m.split_shared) {
@@ -748,7 +1004,12 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
 }
 
 DeviceForward::~DeviceForward() {
+    if (impl_) {
+        impl_->trellis_oa.reset();
+        impl_->trellis.reset();
+    }
     if (impl_ && impl_->slot_pinned != nullptr) (void)hipHostFree(impl_->slot_pinned);
+    if (impl_ && impl_->receive_pinned != nullptr) (void)hipHostFree(impl_->receive_pinned);
     if (impl_ && impl_->erows_pinned != nullptr) (void)hipHostFree(impl_->erows_pinned);
     if (impl_)
         for (auto e : impl_->op_events) (void)hipEventDestroy(e);
@@ -756,6 +1017,30 @@ DeviceForward::~DeviceForward() {
 }
 
 const float* DeviceForward::device_logits() const noexcept { return impl_->logits.p; }
+std::pair<const float*, std::size_t> DeviceForward::Impl::logits_rows(std::uint32_t slice_first, std::uint32_t vocab) const {
+    if (head_rows_valid)
+        for (std::size_t k = 0; k < trellis_head.size(); ++k)
+            if (const auto& sl = trellis_head[k].first; sl.first == slice_first) return {head_rows.p + k * max_window_rows * sl.count, sl.count};
+    return {logits.p + slice_first, vocab};
+}
+DeviceForward::LogitsRows DeviceForward::device_logits_rows(std::uint32_t first) const {
+    const auto [p, stride] = impl_->logits_rows(first, impl_->model.config.vocab_size);
+    return {p, stride};
+}
+
+std::span<std::uint8_t> DeviceForward::receive_buffer(std::size_t bytes) {
+    auto& m = *impl_;
+    if (bytes > m.receive_bytes) {
+        check(hipStreamSynchronize(m.stream), "receive buffer");  // no upload still reads the old one
+        if (m.receive_pinned != nullptr) (void)hipHostFree(m.receive_pinned);
+        m.receive_pinned = nullptr;
+        m.receive_bytes = 0;
+        const std::size_t n = std::max<std::size_t>(bytes, std::size_t{1} << 20U);
+        check(hipHostMalloc(reinterpret_cast<void**>(&m.receive_pinned), n, hipHostMallocDefault), "receive buffer");
+        m.receive_bytes = n;
+    }
+    return {m.receive_pinned, bytes};
+}
 
 std::size_t DeviceForward::cb4_tensors() const noexcept {
     return impl_->cb4.size() + impl_->uniform.size() + impl_->router_bf16.size() + impl_->f8.size();
@@ -769,6 +1054,9 @@ std::string DeviceForward::storage_description() const {
                       std::to_string(m.router_bf16.size()) + ", F8 rows " + std::to_string(m.f8.size());
     if (!m.native_fp8.empty())
         out += ", native FP8 sites " + std::to_string(m.native_fp8.size()) + " (" + m.options.native_fp8.string() + ")";
+    if (m.trellis)
+        out += ", trellis sites " + std::to_string(m.trellis_sites.size()) + " (" + std::to_string(m.trellis->device_bytes() >> 20U) +
+               " MiB, " + m.trellis_pack->describe() + ", " + m.trellis->announced_identity(m.trellis_classes, m.options.trellis_shexp_tp) + ")";
     return out;
 }
 
@@ -783,7 +1071,7 @@ std::vector<std::pair<std::string, std::uint64_t>> DeviceForward::state_hashes()
         return h;
     };
     std::vector<std::pair<std::string, std::uint64_t>> out;
-    for (std::uint32_t l = 0; l < m.options.layers; ++l) {
+    for (std::uint32_t l = m.first; l < m.options.layers; ++l) {
         const auto& r = m.roles[l];
         const auto& L = m.attn[l];
         const std::string at = "@" + std::to_string(l);
@@ -817,8 +1105,18 @@ AttentionState DeviceForward::export_state() const {
     s.position = m.position;
     s.next_token = next_token_;
     s.tokens = m.history;
-    s.layers.resize(m.options.layers);
-    for (std::uint32_t l = 0; l < m.options.layers; ++l) {
+    s.layers.resize(m.options.layers);  // a TAIL leaves layers [0, first) absent (empty ring)
+    for (const auto& src : m.cut.kv_sources) {  // TAIL: its mirrors of the KV sources before first (no ring: still absent)
+        if (m.first == 0U) break;
+        const auto& L = m.attn[src.layer];
+        auto& S = s.layers[src.layer];
+        const std::size_t entries = m.position / src.ratio;
+        S.owns_kv = true;
+        S.ratio = src.ratio;
+        S.kv = download(L.kv_cache.p, entries * attn::kKvEntryBytes, m.stream);
+        S.idx_keys = download(L.idx_cache.p, entries * attn::kIdxEntryBytes, m.stream);
+    }
+    for (std::uint32_t l = m.first; l < m.options.layers; ++l) {
         const auto& r = m.roles[l];
         const auto& L = m.attn[l];
         auto& S = s.layers[l];
@@ -848,13 +1146,30 @@ void DeviceForward::import_state(const AttentionState& s) {
     auto& m = *impl_;
     namespace attn = ds41::attn;
     const auto fail = [](const std::string& what) { throw std::invalid_argument("deepseek41 device forward: import_state: " + what); };
-    if (s.layers.size() != m.options.layers) fail("the state has " + std::to_string(s.layers.size()) + " layers, the forward " + std::to_string(m.options.layers));
+    // A whole forward or a FRONT [0, layers) takes the first `layers` layers of a state with at least as many; a TAIL its
+    // layers [first, layers) and the caches of the KV sources before first that its layers read (the mirrors).
+    if (s.layers.size() < m.options.layers) fail("the state has " + std::to_string(s.layers.size()) + " layers, the forward " + std::to_string(m.options.layers));
+    for (std::uint32_t l = m.first; l < m.options.layers; ++l)
+        if (s.layers[l].ring.empty()) fail("layer " + std::to_string(l) + " is absent from the state");
     if (s.position >= m.options.max_positions) fail("position " + std::to_string(s.position) + " leaves no room in max_positions");
     if (s.tokens.size() != s.position) fail("token history length != position");
     if (s.position == 0U) fail("an empty state (start a fresh forward instead)");
     hipStream_t st = m.stream;
     std::vector<std::uint32_t> counts(m.options.layers, 0U);  // host sources of the top-k counts, alive until the sync
-    for (std::uint32_t l = 0; l < m.options.layers; ++l) {
+    for (const auto& src : m.cut.kv_sources) {  // TAIL: the mirrored caches of the KV sources before first
+        if (m.first == 0U) break;
+        const auto& r = m.roles[src.layer];
+        auto& L = m.attn[src.layer];
+        const auto& S = s.layers[src.layer];
+        const std::size_t entries = s.position / r.ratio;
+        if (!S.owns_kv || S.kv.size() != entries * attn::kKvEntryBytes || S.idx_keys.size() != entries * attn::kIdxEntryBytes)
+            fail("the state lacks the caches of KV source " + std::to_string(src.layer) + " (the TAIL's layers read them)");
+        check(hipMemsetAsync(L.kv_cache.p, 0, L.kv_cache.n, st), "import kv");
+        check(hipMemsetAsync(L.idx_cache.p, 0, L.idx_cache.n, st), "import idx");
+        check(hipMemcpyAsync(L.kv_cache.p, S.kv.data(), S.kv.size(), hipMemcpyHostToDevice, st), "import kv");
+        check(hipMemcpyAsync(L.idx_cache.p, S.idx_keys.data(), S.idx_keys.size(), hipMemcpyHostToDevice, st), "import idx");
+    }
+    for (std::uint32_t l = m.first; l < m.options.layers; ++l) {
         const auto& r = m.roles[l];
         auto& L = m.attn[l];
         const auto& S = s.layers[l];
@@ -895,6 +1210,123 @@ void DeviceForward::import_state(const AttentionState& s) {
     next_token_ = s.next_token;
     tokens_.assign(1, s.next_token);
     check(hipStreamSynchronize(st), "import state");
+}
+
+const std::vector<float>& DeviceForward::last_logits() const noexcept { return impl_->logits_host; }
+
+const ds41::pipe::BoundaryPlan& DeviceForward::boundary_plan() const {
+    if (impl_->cut.cut == 0U) throw std::logic_error("deepseek41 device forward: not a pipeline stage");
+    return impl_->cut;
+}
+
+ds41::pipe::Boundary DeviceForward::export_boundary() const {
+    const auto& m = *impl_;
+    namespace pipe = ds41::pipe;
+    namespace attn = ds41::attn;
+    if (m.first != 0U || m.options.head || m.cut.cut != m.options.layers) throw std::logic_error("deepseek41 device forward: export_boundary needs a FRONT (layers < the model's, head off)");
+    const std::uint32_t R = m.rows, p = m.last_position;
+    if (m.position != p + R || m.history.size() < m.position) throw std::logic_error("deepseek41 device forward: export_boundary before a step");
+    const std::uint32_t H = m.model.config.hidden_size, hc = m.model.config.hc_mult;
+    pipe::Boundary b;
+    b.position = p;
+    b.rows = R;
+    b.tokens.assign(m.history.end() - static_cast<std::ptrdiff_t>(R), m.history.end());
+    b.stream = download(m.streams[m.cur].p, std::size_t{R} * hc * H, m.stream);
+    const auto mixes = download(m.mix_ffn.p, R, m.stream);
+    pipe::Section mix{pipe::SectionKind::mix_ffn, m.cut.cut - 1U, 0U, R, {}};
+    mix.bytes.resize(std::size_t{R} * sizeof(ds41::HcMix));
+    std::memcpy(mix.bytes.data(), mixes.data(), mix.bytes.size());
+    b.sections.push_back(std::move(mix));
+    for (const auto& src : m.cut.kv_sources) {
+        const auto& L = m.attn[src.layer];
+        const std::uint32_t first = p / src.ratio, end = (p + R) / src.ratio, n = end - first;
+        pipe::Section k{pipe::SectionKind::kv_entries, src.layer, first, n, {}};
+        if (n != 0U) {
+            const auto kv = download(L.kv_cache.p + std::size_t{first} * attn::kKvEntryBytes, std::size_t{n} * attn::kKvEntryBytes, m.stream);
+            const auto ix = download(L.idx_cache.p + std::size_t{first} * attn::kIdxEntryBytes, std::size_t{n} * attn::kIdxEntryBytes, m.stream);
+            k.bytes = kv;
+            k.bytes.insert(k.bytes.end(), ix.begin(), ix.end());
+        }
+        b.sections.push_back(std::move(k));
+    }
+    for (const auto& src : m.cut.topk_sources) {
+        const auto& L = m.attn[src.layer];
+        const auto counts = download(L.idx_count.p, R, m.stream);
+        const auto ids = download(L.idx.p, std::size_t{R} * attn::kTopK, m.stream);
+        pipe::Section k{pipe::SectionKind::topk, src.layer, 0U, R, {}};
+        const auto put = [&](std::uint32_t v) {
+            for (int i = 0; i < 4; ++i) k.bytes.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
+        };
+        for (std::uint32_t r = 0; r < R; ++r) {
+            put(counts[r]);
+            for (std::uint32_t j = 0; j < counts[r]; ++j) put(ids[std::size_t{r} * attn::kTopK + j]);
+        }
+        b.sections.push_back(std::move(k));
+    }
+    if (m.cut.candidate_source >= 0) {
+        const std::uint32_t count = (p + R) / m.cut.candidate_ratio;
+        const std::uint32_t stride = (count + m.geo.candidate_block - 1U) / m.geo.candidate_block;
+        pipe::Section k{pipe::SectionKind::candidates, static_cast<std::uint32_t>(m.cut.candidate_source), stride, R, {}};
+        if (stride != 0U) k.bytes = download(m.candidates.p, std::size_t{R} * stride, m.stream);
+        b.sections.push_back(std::move(k));
+    }
+    return b;
+}
+
+void DeviceForward::exchange_host(std::span<const std::byte> out, std::span<std::byte> in) {
+    auto& m = *impl_;
+    if (!m.distributed()) throw std::logic_error("deepseek41 device forward: exchange_host needs world 2");
+    if (!in.empty() && out.size() != in.size()) throw std::invalid_argument("deepseek41 device forward: exchange_host sizes differ");
+    // STRIX_DS41_HOST_EXCHANGE=1: host to host through the communicator's pinned buffers (no device round trip; the same
+    // messages on the wire, so the peer may use either path). Default: through the device control buffer.
+    static const bool host_only = [] {
+        const char* v = std::getenv("STRIX_DS41_HOST_EXCHANGE");
+        return v != nullptr && std::string_view(v) == "1";
+    }();
+    if (host_only) {
+        for (std::size_t at = 0; at < out.size(); at += Impl::control_chunk) {
+            const std::size_t n = std::min(Impl::control_chunk, out.size() - at);
+            m.options.communicator->exchange_host(out.subspan(at, n), in.empty() ? std::span<std::byte>{} : in.subspan(at, n),
+                                                  dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 0xC1U, at});
+        }
+        return;
+    }
+    if (m.control.p == nullptr) m.control = Dev<std::uint8_t>(2U * Impl::control_chunk);
+    for (std::size_t at = 0; at < out.size(); at += Impl::control_chunk) {
+        const std::size_t n = std::min(Impl::control_chunk, out.size() - at);
+        check(hipMemcpyAsync(m.control.p, out.data() + at, n, hipMemcpyHostToDevice, m.stream), "control upload");
+        m.options.communicator->exchange(m.stream, m.control.p, m.control.p + Impl::control_chunk, n,
+                                         dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 0xC1U, at});
+        if (!in.empty())  // an empty `in`: the peer's bytes are not wanted
+            check(hipMemcpyAsync(in.data() + at, m.control.p + Impl::control_chunk, n, hipMemcpyDeviceToHost, m.stream), "control download");
+        check(hipStreamSynchronize(m.stream), "control");
+    }
+}
+
+std::vector<float> DeviceForward::window_logits() {
+    auto& m = *impl_;
+    const auto& c = m.model.config;
+    const std::uint32_t R = static_cast<std::uint32_t>(tokens_.size()), V = c.vocab_size;
+    if (R == 0U || !m.options.head) throw std::logic_error("deepseek41 device forward: window_logits needs a step with the head");
+    auto all = download(m.logits.p, std::size_t{R} * V, m.stream);
+    if (m.head_rows_valid)  // trellis head with HEADOUT at R > 1: this process's slices are in head_rows ([slice][row][count])
+        for (std::size_t k = 0; k < m.trellis_head.size(); ++k) {
+            const auto& sl = m.trellis_head[k].first;
+            const auto rows = download(m.head_rows.p + k * max_window_rows * sl.count, std::size_t{R} * sl.count, m.stream);
+            for (std::uint32_t r = 0; r < R; ++r)
+                std::copy_n(rows.data() + std::size_t{r} * sl.count, sl.count, all.data() + std::size_t{r} * V + sl.first);
+        }
+    if (!m.distributed()) return all;
+    const auto& own = m.head_slice;
+    const auto other = ds41::vocab_slice(V, 2U, 1U - m.options.rank);
+    if (other.count != own.count) throw std::logic_error("deepseek41 device forward: unequal vocabulary slices");
+    std::vector<float> mine(std::size_t{R} * own.count), theirs(std::size_t{R} * own.count);
+    for (std::uint32_t r = 0; r < R; ++r)
+        std::copy_n(all.data() + std::size_t{r} * V + own.first, own.count, mine.data() + std::size_t{r} * own.count);
+    exchange_host(std::as_bytes(std::span<const float>(mine)), std::as_writable_bytes(std::span<float>(theirs)));
+    for (std::uint32_t r = 0; r < R; ++r)
+        std::copy_n(theirs.data() + std::size_t{r} * own.count, own.count, all.data() + std::size_t{r} * V + other.first);
+    return all;
 }
 
 std::uint64_t DeviceForward::weight_bytes() const noexcept {
@@ -960,7 +1392,7 @@ void DeviceForward::commit_window(std::uint32_t kept) {
             check(hipGetLastError(), "rollback carry");
             n = 0;
         };
-        for (std::uint32_t l = 0; l < m.options.layers; ++l) {
+        for (std::uint32_t l = m.first; l < m.options.layers; ++l) {
             const auto& r = m.roles[l];
             if (!r.owns_kv || r.ratio != 2U) continue;
             auto& L = m.attn[l];
@@ -971,7 +1403,7 @@ void DeviceForward::commit_window(std::uint32_t kept) {
         }
         launch();
     }
-    for (std::uint32_t l = 0; l < m.options.layers && !m.compress_ring; ++l) {
+    for (std::uint32_t l = m.first; l < m.options.layers && !m.compress_ring; ++l) {
         const auto& r = m.roles[l];
         if (!r.owns_kv || r.ratio != 2U) continue;
         auto& L = m.attn[l];
@@ -1024,6 +1456,10 @@ void DeviceForward::collect_op_timing(const std::vector<double>& exchange) {
             }
         }
         for (const auto& w : s.weights) {
+            if (const auto t = m.trellis_bytes.find(w); t != m.trellis_bytes.end()) {  // trellis site: this rank's prepared bytes
+                o.weight_bytes += t->second;
+                continue;
+            }
             const auto it = m.weights.find(w);
             if (it == m.weights.end()) continue;  // Engram rows (read per token from the file) and streamed experts
             std::uint64_t b = it->second.n;
@@ -1038,6 +1474,22 @@ void DeviceForward::collect_op_timing(const std::vector<double>& exchange) {
 }
 
 const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std::uint32_t> window) {
+    if (impl_->first != 0U) throw std::logic_error("deepseek41 device forward: a pipeline TAIL steps on boundaries (step_boundary)");
+    return run_step(window, nullptr);
+}
+
+const std::vector<std::uint32_t>& DeviceForward::step_boundary(const ds41::pipe::Boundary& b) {
+    auto& m = *impl_;
+    if (m.first == 0U) throw std::logic_error("deepseek41 device forward: step_boundary needs first_layer > 0");
+    if (b.position != m.position)
+        throw std::invalid_argument("deepseek41 device forward: boundary at position " + std::to_string(b.position) + ", the TAIL is at " +
+                                    std::to_string(m.position));
+    if (b.rows == 0U || b.rows > max_window_rows) throw std::invalid_argument("deepseek41 device forward: a step has 1..8 rows");
+    ds41::pipe::validate_boundary(b, m.cut, m.geo);
+    return run_step(b.tokens, &b);
+}
+
+const std::vector<std::uint32_t>& DeviceForward::run_step(std::span<const std::uint32_t> window, const ds41::pipe::Boundary* boundary) {
     auto& m = *impl_;
     const auto& c = m.model.config;
     const auto R = static_cast<std::uint32_t>(window.size());
@@ -1075,6 +1527,11 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
     const auto& e = m.model.engram;
     const std::uint32_t cols = e.rows_per_token(), engram_layers = m.hasher->layers();
     std::vector<std::uint64_t> engram_rows(std::size_t{R} * engram_layers * cols);  // [row][engram layer][column]
+    // Engram layers of the range [first, layers): layer_ids [engram_first, engram_in_range)
+    std::uint32_t engram_first = 0, engram_in_range = 0;
+    while (engram_in_range < m.hasher->layers() && e.layer_ids[engram_in_range] < m.options.layers) ++engram_in_range;
+    while (engram_first < engram_in_range && e.layer_ids[engram_first] < m.first) ++engram_first;
+    const std::uint32_t engram_count = engram_in_range - engram_first;
     for (std::uint32_t r = 0; r < R; ++r) {
         m.hasher->push(window[r], m.engram_rows);
         m.history.push_back(window[r]);
@@ -1083,13 +1540,11 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
     if (tr) tr->mark("engram_hash");
     engram_seconds_ = 0.0;
     m.stream_seconds = 0.0;
-    std::uint32_t engram_in_range = 0;  // Engram layers of the range (a prefix of layer_ids)
-    while (engram_in_range < engram_layers && e.layer_ids[engram_in_range] < m.options.layers) ++engram_in_range;
     // STRIX_DS41_ENGRAM_ASYNC: layer li's batch is its rows in [row][column] order, read straight into its pinned
     // staging (the layout of the synchronous path); Op::engram of the layer waits for it, then uploads it. The previous
     // step ended synchronised, so no upload still reads the staging. engram_io is declared last: on unwinding it joins
     // the reads before the requests and promises they use go away.
-    const bool engram_async = m.engram_async && m.engram_reader && engram_in_range != 0U;
+    const bool engram_async = m.engram_async && m.engram_reader && engram_count != 0U;
     std::vector<std::vector<ds41::EngramRowRequest>> layer_requests(engram_async ? engram_in_range : 0U);
     std::vector<std::promise<void>> engram_ready(layer_requests.size());
     std::vector<std::future<void>> engram_wait;
@@ -1097,14 +1552,18 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
     std::future<void> engram_io;
     if (engram_async) {
         for (std::uint32_t li = 0; li < engram_in_range; ++li) {
+            engram_wait.push_back(engram_ready[li].get_future());
+            if (li < engram_first) {  // a TAIL never runs the layers before its range
+                engram_ready[li].set_value();
+                continue;
+            }
             for (std::uint32_t r = 0; r < R; ++r)
                 for (std::uint32_t k = 0; k < cols; ++k)
                     layer_requests[li].push_back({li, engram_rows[(std::size_t{r} * engram_layers + li) * cols + k]});
-            engram_wait.push_back(engram_ready[li].get_future());
         }
         engram_io = std::async(std::launch::async, [&] {
             const auto t0 = std::chrono::steady_clock::now();
-            std::uint32_t li = 0;
+            std::uint32_t li = engram_first;
             try {
                 for (; li < engram_in_range; ++li) {
                     std::uint8_t* out = m.erows_pinned + std::size_t{li} * R * cols * 264U;
@@ -1121,7 +1580,7 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
         std::vector<ds41::EngramRowRequest> requests;
         for (std::uint32_t r = 0; r < R; ++r)
             for (std::uint32_t li = 0; li < engram_layers; ++li)
-                if (e.layer_ids[li] < m.options.layers)
+                if (e.layer_ids[li] < m.options.layers && e.layer_ids[li] >= m.first)
                     for (std::uint32_t k = 0; k < cols; ++k)
                         requests.push_back({li, engram_rows[(std::size_t{r} * engram_layers + li) * cols + k]});
         m.engram_bytes.resize(requests.size() * 264U);
@@ -1129,12 +1588,13 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
         engram_seconds_ = seconds_since(t0);
         if (tr) tr->mark("engram_read");
     }
-    if (engram_in_range != 0U && !engram_async) {  // rows of every Engram layer of the range: [layer][row][column], one asynchronous upload
-        for (std::uint32_t li = 0; li < engram_in_range; ++li)
+    if (engram_count != 0U && !engram_async) {  // rows of every Engram layer of the range: [layer][row][column], one asynchronous upload
+        for (std::uint32_t li = engram_first; li < engram_in_range; ++li)
             for (std::uint32_t r = 0; r < R; ++r) {
                 std::uint8_t* out = m.erows_pinned + ((std::size_t{li} * R + r) * cols) * 264U;
                 if (m.engram_reader) {  // the reader's order: [row][engram layer of the range][column]
-                    std::copy_n(m.engram_bytes.data() + (std::size_t{r} * engram_in_range + li) * cols * 264U, std::size_t{cols} * 264U, out);
+                    std::copy_n(m.engram_bytes.data() + (std::size_t{r} * engram_count + (li - engram_first)) * cols * 264U, std::size_t{cols} * 264U,
+                                out);
                 } else {
                     const auto table = m.host_tensor("blk." + std::to_string(e.layer_ids[li]) + ".engram_embd.weight");
                     for (std::uint32_t k = 0; k < cols; ++k)
@@ -1142,9 +1602,61 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
                 }
             }
         if (tr) tr->mark("engram_pack");
-        check(hipMemcpyAsync(m.erows.p, m.erows_pinned, std::size_t{engram_in_range} * R * cols * 264U, hipMemcpyHostToDevice, st),
+        const std::size_t skip = std::size_t{engram_first} * R * cols * 264U;  // layers before the range: never read
+        check(hipMemcpyAsync(m.erows.p + skip, m.erows_pinned + skip, std::size_t{engram_count} * R * cols * 264U, hipMemcpyHostToDevice, st),
               "engram rows");
         if (tr) tr->mark("engram_h2d_enqueue");
+    }
+    if (boundary != nullptr) {  // the TAIL's input: the stream after layer first - 1, its FFN mix and the cut's sections
+        namespace pipe = ds41::pipe;
+        const auto& b = *boundary;
+        check(hipMemcpyAsync(m.streams[m.cur].p, b.stream_data(), b.stream_floats() * 4U, hipMemcpyHostToDevice, st), "boundary stream");
+        const auto* mix = b.find(pipe::SectionKind::mix_ffn, m.first - 1U);
+        static_assert(sizeof(ds41::HcMix) == (2U * ds41::hc_copies + ds41::hc_copies * ds41::hc_copies) * 4U, "HcMix is pre, post, comb");
+        check(hipMemcpyAsync(m.mix_ffn.p, mix->bytes.data(), mix->bytes.size(), hipMemcpyHostToDevice, st), "boundary mix");
+        m.identity_pre = false;  // layer first - 1's FFN ran: its pre collapses layer first's attention input
+        for (const auto& src : m.cut.kv_sources) {
+            const auto* k = b.find(pipe::SectionKind::kv_entries, src.layer);
+            auto& L = m.attn[src.layer];
+            const std::size_t n = k->count;
+            if ((std::size_t{k->first} + n) * attn::kKvEntryBytes > L.kv_cache.n)
+                throw std::out_of_range("deepseek41 device forward: boundary KV entries past the cache");
+            if (n != 0U) {
+                check(hipMemcpyAsync(L.kv_cache.p + std::size_t{k->first} * attn::kKvEntryBytes, k->bytes.data(), n * attn::kKvEntryBytes,
+                                     hipMemcpyHostToDevice, st),
+                      "boundary kv");
+                check(hipMemcpyAsync(L.idx_cache.p + std::size_t{k->first} * attn::kIdxEntryBytes, k->bytes.data() + n * attn::kKvEntryBytes,
+                                     n * attn::kIdxEntryBytes, hipMemcpyHostToDevice, st),
+                      "boundary index keys");
+            }
+        }
+        m.boundary_topk.assign(m.cut.topk_sources.size(), {});
+        for (std::size_t i = 0; i < m.cut.topk_sources.size(); ++i) {
+            const auto layer = m.cut.topk_sources[i].layer;
+            const auto* k = b.find(pipe::SectionKind::topk, layer);
+            auto& host = m.boundary_topk[i];  // [counts W][ids R x topk], alive until the sync below
+            host.assign(W + std::size_t{R} * attn::kTopK, 0U);
+            std::size_t at = 0;
+            const auto word = [&] {
+                std::uint32_t v;
+                std::memcpy(&v, k->bytes.data() + at, 4);
+                at += 4U;
+                return v;
+            };
+            for (std::uint32_t r = 0; r < R; ++r) {
+                const auto n = host[r] = word();
+                for (std::uint32_t j = 0; j < n; ++j) host[W + std::size_t{r} * attn::kTopK + j] = word();
+            }
+            auto& L = m.attn[layer];
+            check(hipMemcpyAsync(L.idx_count.p, host.data(), std::size_t{W} * 4U, hipMemcpyHostToDevice, st), "boundary top-k");
+            check(hipMemcpyAsync(L.idx.p, host.data() + W, std::size_t{R} * attn::kTopK * 4U, hipMemcpyHostToDevice, st), "boundary top-k");
+        }
+        if (m.cut.candidate_source >= 0) {
+            const auto* k = b.find(pipe::SectionKind::candidates, static_cast<std::uint32_t>(m.cut.candidate_source));
+            if (k->bytes.size() > m.candidates.n) throw std::out_of_range("deepseek41 device forward: boundary candidates past the pool");
+            if (!k->bytes.empty())
+                check(hipMemcpyAsync(m.candidates.p, k->bytes.data(), k->bytes.size(), hipMemcpyHostToDevice, st), "boundary candidates");
+        }
     }
     check(hipStreamSynchronize(st), "step inputs");  // the uploads above read host temporaries (and the pinned staging)
     if (tr) tr->mark("sync_inputs");
@@ -1193,6 +1705,13 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
     };
     // The shared expert of an FFN site (its A8 input already in codes/deltas), in the stored format of its tensors.
     const auto enqueue_shared = [&](const Step& s) {
+        if (const auto* gate = m.trellis_site(s.weights[0])) {  // trellis (ds41-trellis-k5-v1:shexp): F32 x, no A8
+            ds41::enqueue_trellis_linear(*gate, m.x.p, m.tr_gate.p, R, H, I, false, st);
+            ds41::enqueue_trellis_linear(*m.trellis_site(s.weights[1]), m.x.p, m.tr_up.p, R, H, I, false, st);
+            ds41::enqueue_swiglu_f32(m.tr_gate.p, m.tr_up.p, R, I, static_cast<float>(c.swiglu_limit), m.tr_act.p, st);
+            ds41::enqueue_trellis_linear(*m.trellis_site(s.weights[2]), m.tr_act.p, m.shared.p, R, I, H, false, st);
+            return;
+        }
         if (m.native_fp8.contains(s.weights[0])) {
             fp8_shared_gate_up(s, 0U, I, m.sh_act_codes.p, m.sh_act_deltas.p, m.sh_act_sums.p);
             fp8_site(s.weights[2], I, 0U, H, m.sh_act_codes.p, m.sh_act_deltas.p, m.shared.p, H);
@@ -1257,8 +1776,32 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
     PendingPost post;              // an expansion not yet enqueued; stream_now() is already its output
     std::int64_t capture_at = -1;  // the layer whose input is captured once the pending expansion is stored
     const Step* site_mix = nullptr;
+    // STRIX_DS41_LATE_HC_LAYERS (P17.5, default all; none = off; measured R1 -0.2, R6 -0.35, batch N=2..8 -0.6..-1.5 ms): on those layers, with HC_SITE and tensor-parallel attention, the attention site
+    // skips its mixes (the collapse that feeds q_a uses the previous FFN site's mixes; these are first read by
+    // hc_post(attn)), and they are enqueued as a mix-only site over the same stored stream right after the o_b exchange
+    // starts, so they run during it. hc_post(attn) is the latest point. Same kernels and partitions, so the same bits.
+    const Step* late_mix = nullptr;
+    const auto enqueue_late_mix = [&] {
+        if (!late_mix) return;
+        ds41::HcSiteView v;
+        v.rows = R;
+        v.hidden = H;
+        v.stream = stream_now();
+        v.fn = m.devh(late_mix->weights[0]);
+        v.base = m.devf(late_mix->weights[1]);
+        v.scale = m.devf(late_mix->weights[2]);
+        v.iters = c.hc_sinkhorn_iters;
+        v.hc_eps = static_cast<float>(c.hc_eps);
+        v.mix_norm_eps = 1e-20F;
+        v.mixes_out = m.mix_attn.p;
+        v.partial = m.mix_partial.p;
+        v.counters = m.hc_counters.p;
+        ds41::enqueue_hc_site(v, st);
+        late_mix = nullptr;
+    };
     bool x_a8 = false;  // codes/deltas/sums hold the A8 of the current x
     bool kv_done = false;
+    bool o_a_trellis = false;  // this layer's o_a ran from the trellis pack (no A8 of o_low for a Q8 o_b)
     const auto stored_post = [&] {  // the pending expansion is in stream_now() (or enqueued before anything after it)
         post.on = false;
         if (capture_at >= 0) {
@@ -1383,7 +1926,10 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
             if (fuse_hc && (s.site == "attn" || s.site == "ffn")) {
                 const bool at = s.site == "attn";
                 const ds41::HcMix* collapse = at ? (m.identity_pre ? nullptr : m.mix_ffn.p) : m.mix_attn.p;
-                enqueue_site(site_mix, at ? m.mix_attn.p : m.mix_ffn.p, collapse, m.devf(s.weights[0]), m.x.p, m.codes.p, m.deltas.p, m.sums.p);
+                const bool late = at && site_mix && m.distributed() && m.options.tp_attention && late_hc_layer(layer);
+                enqueue_site(late ? nullptr : site_mix, at ? m.mix_attn.p : m.mix_ffn.p, collapse, m.devf(s.weights[0]), m.x.p, m.codes.p,
+                             m.deltas.p, m.sums.p);
+                if (late) late_mix = site_mix;
                 site_mix = nullptr;
                 x_a8 = true;
                 break;
@@ -1397,6 +1943,48 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
             if (s.op == Op::kv && kv_done) {  // enqueued with q_a
                 kv_done = false;
                 break;
+            }
+            if (!m.trellis_attn.empty() && (s.op == Op::q_b || s.op == Op::o_a || s.op == Op::o_b)) {
+                // ds41-trellis-k5-v1 q_b / o_a / o_b: F32 inputs, no A8; the linears of this process in rank-slice order
+                const auto& ta = m.trellis_attn[layer];
+                const bool tp = m.distributed() && m.options.tp_attention;
+                const std::uint32_t q_rows = c.num_attention_heads / 2U * c.head_dim;
+                const std::uint32_t o_width = c.num_attention_heads * c.head_dim / c.o_groups, o_half = c.o_groups * c.o_lora_rank / 2U;
+                if (s.op == Op::q_b && !ta.q_b.empty()) {
+                    const std::size_t n = ta.q_b.size() * q_rows;  // q [R][n]: rank slices side by side
+                    for (std::size_t k = 0; k < ta.q_b.size(); ++k)
+                        ds41::enqueue_trellis_linear(*ta.q_b[k], m.qr.p, m.q.p + k * q_rows, R, c.q_lora_rank, n, false, st);
+                    break;
+                }
+                if (s.op == Op::o_a && !ta.o_a.empty()) {
+                    const std::size_t in_width = ta.o_a.size() * o_width, out_width = ta.o_a.size() * c.o_lora_rank;
+                    if (m.trellis_oa)  // the same library calls per row, one stage + one scatter (ds41_trellis_group.hpp)
+                        m.trellis_oa->enqueue(ta.o_a, m.o.p, in_width, m.o_low.p, out_width, R, st);
+                    else
+                        for (std::size_t g = 0; g < ta.o_a.size(); ++g)
+                            ds41::enqueue_trellis_linear(*ta.o_a[g], m.o.p + g * o_width, m.o_low.p + g * c.o_lora_rank, R, in_width, out_width, false,
+                                                         st);
+                    o_a_trellis = true;
+                    break;
+                }
+                if (s.op == Op::o_b && !ta.o_b.empty()) {
+                    // y = h0 + h1 (one FP32 add per value): TP the rank's half, the peer's by exchange, add_halves; one process
+                    // h0 into y, then y = y + h1 (accumulate), the same bits
+                    if (tp) {
+                        ds41::enqueue_trellis_linear(*ta.o_b[0], m.o_low.p, m.half_own.p, R, o_half, H, false, st);
+                        m.options.communicator->exchange(st, m.half_own.p, m.half_other.p, std::size_t{R} * H * 4U,
+                                                         dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, position});
+                        const float* h0 = m.options.rank == 0U ? m.half_own.p : m.half_other.p;
+                        const float* h1 = m.options.rank == 0U ? m.half_other.p : m.half_own.p;
+                        const std::uint32_t n = R * H;
+                        add_halves<<<(n + 255U) / 256U, 256, 0, st>>>(h0, h1, m.y.p, n);
+                        check(hipGetLastError(), "add_halves");
+                    } else {
+                        for (std::size_t k = 0; k < 2U; ++k)
+                            ds41::enqueue_trellis_linear(*ta.o_b[k], m.o_low.p + k * o_half, m.y.p, R, 2U * o_half, H, k == 1U, st);
+                    }
+                    break;
+                }
             }
             const float* in = nullptr;
             ds41::Q8A8View v;
@@ -1431,7 +2019,7 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
                 const std::uint32_t full = c.o_groups * c.o_lora_rank, half = full / 2U;
                 in = m.o_low.p;
                 in_width = tp ? half : full;
-                if (!attn_a8) ds41::enqueue_quantize_a8(in, in_width, R, m.site_codes.p, m.site_deltas.p, m.site_sums.p, st);
+                if (!attn_a8 || o_a_trellis) ds41::enqueue_quantize_a8(in, in_width, R, m.site_codes.p, m.site_deltas.p, m.site_sums.p, st);
                 v.width = half;
                 v.row_width = full;
                 v.count = H;
@@ -1442,10 +2030,72 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
                     v.k_offset = m.options.rank * half;
                     v.codes = m.site_codes.p;
                     v.deltas = m.site_deltas.p;
+                    if (const std::uint32_t ob_k = ob_split(H); ob_k > 1U) {
+                        const std::uint32_t ob_c = H / ob_k;
+                        const std::size_t ob_chunk = std::size_t{R} * ob_c;
+                        const auto product = [&](std::uint32_t k) {
+                            auto w = v;
+                            w.first = k * ob_c;
+                            w.count = ob_c;
+                            w.per_group = ob_c;  // one input group (the check needs per_group == count with row_width)
+                            w.out_stride = ob_c;
+                            w.out = m.half_own.p + k * ob_chunk;
+                            ds41::enqueue_q8_0_a8(w, st);
+                        };
+                        const auto add = [&](std::uint32_t k) {
+                            const float* own = m.half_own.p + k * ob_chunk;
+                            const float* other = m.half_other.p + k * ob_chunk;
+                            const auto n = static_cast<std::uint32_t>(ob_chunk);
+                            add_halves_cols<<<(n + 255U) / 256U, 256, 0, st>>>(m.options.rank == 0U ? own : other, m.options.rank == 0U ? other : own, m.y.p, R, ob_c,
+                                                                              k * ob_c, H);
+                            check(hipGetLastError(), "add_halves_cols");
+                        };
+                        product(0U);
+                        for (std::uint32_t k = 0; k < ob_k; ++k) {
+                            m.options.communicator->start(st, m.half_own.p + k * ob_chunk, ob_chunk * 4U,
+                                                          dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, position});
+                            if (k == 0U) enqueue_late_mix();
+                            if (k + 1U < ob_k) product(k + 1U);
+                            if (k > 0U) add(k - 1U);
+                            m.options.communicator->finish(st, m.half_other.p + k * ob_chunk);
+                        }
+                        add(ob_k - 1U);
+                        break;
+                    }
+                    if (const auto stage = m.options.communicator->prepare_staged_ready(st, std::size_t{R} * H * 4U); stage.data) {
+                        auto* own = static_cast<float*>(stage.data);
+                        v.out = own;
+                        ds41::enqueue_q8_0_a8(v, st);
+                        publish_ready_kernel<<<1, 64, 0, st>>>(stage.flag, stage.token);
+                        check(hipGetLastError(), "publish ready");
+                        m.options.communicator->start_staged_ready(st, std::size_t{R} * H * 4U, dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, position});
+                        enqueue_late_mix();
+                        const auto peer = m.options.communicator->finish_staged_ready();
+                        const auto* other = static_cast<const float*>(peer.data);
+                        const std::uint32_t n = R * H;
+                        add_halves_ready<<<(n + 255U) / 256U, 256, 0, st>>>(m.options.rank == 0U ? own : other, m.options.rank == 0U ? other : own, m.y.p, n,
+                                                                         peer.flag, peer.token);
+                        check(hipGetLastError(), "add_halves_ready");
+                        m.options.communicator->release_staged_ready(st);
+                        break;
+                    }
+                    if (auto* staged = static_cast<float*>(m.options.communicator->send_staging(std::size_t{R} * H * 4U))) {
+                        v.out = staged;
+                        ds41::enqueue_q8_0_a8(v, st);
+                        m.options.communicator->start_staged(st, std::size_t{R} * H * 4U, dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, position});
+                        enqueue_late_mix();
+                        const auto* peer = static_cast<const float*>(m.options.communicator->finish_staged(st));
+                        const std::uint32_t n = R * H;
+                        add_halves<<<(n + 255U) / 256U, 256, 0, st>>>(m.options.rank == 0U ? staged : peer, m.options.rank == 0U ? peer : staged, m.y.p, n);
+                        check(hipGetLastError(), "add_halves");
+                        m.options.communicator->release_staged(st);
+                        break;
+                    }
                     v.out = m.half_own.p;
                     ds41::enqueue_q8_0_a8(v, st);
-                    m.options.communicator->exchange(st, m.half_own.p, m.half_other.p, std::size_t{R} * H * 4U,
-                                                     dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, position});
+                    m.options.communicator->start(st, m.half_own.p, std::size_t{R} * H * 4U, dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, position});
+                    enqueue_late_mix();
+                    m.options.communicator->finish(st, m.half_other.p);
                     const float* h0 = m.options.rank == 0U ? m.half_own.p : m.half_other.p;
                     const float* h1 = m.options.rank == 0U ? m.half_other.p : m.half_own.p;
                     const std::uint32_t n = R * H;
@@ -1659,6 +2309,7 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
             break;
         }
         case Op::hc_post: {
+            if (s.site == "attn") enqueue_late_mix();  // if the o_b path did not
             const int next = 1 - m.cur;
             x_a8 = false;
             if (fuse_hc) {  // stored by the next site (or before the Engram injection, or by the head)
@@ -1720,6 +2371,15 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
             if (!x_a8) ds41::enqueue_quantize_a8(m.x.p, H, R, m.codes.p, m.deltas.p, m.sums.p, st);
             // Shared expert, three forms with the same bits: split by intermediate rows over the two ranks (opt-in,
             // STRIX_DS41_SPLIT_SHARED=1), overlapped with the half-sum exchange (two ranks, default; STRIX_DS41_EP_OVERLAP=0 off), or here.
+            if (m.shexp_tp) {
+                // ds41-trellis-k5-v1:shexp-tp: this rank's partial into shared (one process: rank 0's there, rank 1's into
+                // tr_p1); the combine adds it onto the rank's half sum before the exchange (no overlapped form)
+                const auto& slices = m.trellis_shexp_tp.at(layer);
+                for (std::size_t k = 0; k < slices.size(); ++k)
+                    ds41::enqueue_shexp_tp_partial(slices[k], m.x.p, R, static_cast<float>(c.swiglu_limit), m.tr_gate.p, m.tr_up.p,
+                                                   m.tr_act.p, k == 0U ? m.shared.p : m.tr_p1.p, st);
+                break;
+            }
             const DeviceRoutes& r = *m.shared_routes.at(R);
             if (m.split_shared) {
                 // rank r: gate/up of intermediate rows [I/2 r, I/2 r + I/2) (whole A8 groups, the same products), then the
@@ -1962,6 +2622,15 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
                 v.half = m.expert_tp ? 0U : m.options.rank;  // expert TP: the fold of all the row's slots (low_counts = top_k)
                 v.out = m.half_own.p;
                 ds41::enqueue_half_sum(v, st);
+                if (m.shexp_tp) {  // shexp-tp: S_r + P_r travels, y = (S0 + P0) + (S1 + P1)
+                    ds41::enqueue_add_inplace_f32(m.half_own.p, m.shared.p, std::size_t{R} * H, st);
+                    m.options.communicator->exchange(st, m.half_own.p, m.half_other.p, std::size_t{R} * H * 4U,
+                                                     dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, position});
+                    const float* low = m.options.rank == 0U ? m.half_own.p : m.half_other.p;
+                    const float* high = m.options.rank == 0U ? m.half_other.p : m.half_own.p;
+                    ds41::enqueue_add_f32(low, high, std::size_t{R} * H, m.y.p, st);
+                    break;
+                }
                 if (deferred_shared) {
                     m.options.communicator->start(st, m.half_own.p, std::size_t{R} * H * 4U,
                                                   dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, position});
@@ -1991,6 +2660,12 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
                 v.out = half == 0U ? m.low.p : m.high.p;
                 ds41::enqueue_half_sum(v, st);
             }
+            if (m.shexp_tp) {  // shexp-tp, both ranks here: y = (S0 + P0) + (S1 + P1)
+                ds41::enqueue_add_inplace_f32(m.low.p, m.shared.p, std::size_t{R} * H, st);
+                ds41::enqueue_add_inplace_f32(m.high.p, m.tr_p1.p, std::size_t{R} * H, st);
+                ds41::enqueue_add_f32(m.low.p, m.high.p, std::size_t{R} * H, m.y.p, st);
+                break;
+            }
             ds41::enqueue_canonical_sum(m.shared.p, m.low.p, m.high.p, std::size_t{R} * H, m.y.p, st);
             break;
         }
@@ -2003,19 +2678,30 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
                 ds41::enqueue_rms_norm(m.h.p, m.devf("output_norm.weight"), R, H, H, 1e-20F, m.h.p, st);
                 ds41::enqueue_quantize_a8(m.h.p, H, R, m.site_codes.p, m.site_deltas.p, m.site_sums.p, st);
             }
-            ds41::Q8A8View v;
-            m.site_weight(v, "output.weight");  // this rank's rows [head_slice.first, + count)
-            v.width = H;
-            v.first = 0;
-            v.count = m.head_slice.count;
-            v.per_group = m.head_slice.count;
-            v.codes = m.site_codes.p;
-            v.deltas = m.site_deltas.p;
-            v.rows = R;
-            v.x_stride = H;
-            v.out_stride = V;  // logits [row][vocab]
-            v.out = m.logits.p + m.head_slice.first;
-            ds41::enqueue_q8_0_a8(v, st);
+            if (!m.trellis_head.empty() && m.headout) {  // same rows and bits, no staging (R1 in place, R > 1 to head_rows)
+                m.head_rows_valid = R > 1U;
+                for (std::size_t k = 0; k < m.trellis_head.size(); ++k) {
+                    const auto& [sl, site] = m.trellis_head[k];
+                    float* y = m.head_rows_valid ? m.head_rows.p + k * max_window_rows * sl.count : m.logits.p + sl.first;
+                    ds41::enqueue_trellis_linear_rows(*site, m.h.p, y, R, H, m.head_rows_valid ? sl.count : V, max_window_rows, 5U, st);
+                }
+            } else if (!m.trellis_head.empty()) {  // trellis head (ds41-trellis-k5-v1:head): logits[row][slice] from F32 h
+                for (const auto& [sl, site] : m.trellis_head) ds41::enqueue_trellis_linear(*site, m.h.p, m.logits.p + sl.first, R, H, V, false, st);
+            } else {
+                ds41::Q8A8View v;
+                m.site_weight(v, "output.weight");  // this rank's rows [head_slice.first, + count)
+                v.width = H;
+                v.first = 0;
+                v.count = m.head_slice.count;
+                v.per_group = m.head_slice.count;
+                v.codes = m.site_codes.p;
+                v.deltas = m.site_deltas.p;
+                v.rows = R;
+                v.x_stride = H;
+                v.out_stride = V;  // logits [row][vocab]
+                v.out = m.logits.p + m.head_slice.first;
+                ds41::enqueue_q8_0_a8(v, st);
+            }
             if (R == 1U && m.distributed() && m.options.gather_logits) {
                 const auto other = ds41::vocab_slice(c.vocab_size, 2U, 1U - m.options.rank);
                 if (other.count != m.head_slice.count) throw std::logic_error("deepseek41 device forward: unequal vocabulary slices");
@@ -2033,7 +2719,8 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
             // two ranks: each the argmax of its vocabulary slice, then the candidates combine
             if (m.distributed()) {  // this rank's candidates, the peer's by exchange, combined in rank order on both
                 const auto& sl = m.head_slice;
-                ds41::enqueue_argmax(m.logits.p + sl.first, R, sl.count, V, sl.first, m.partial.p, m.cand_own.p, st);
+                const auto [lp, ls] = m.logits_rows(sl.first, V);
+                ds41::enqueue_argmax(lp, R, sl.count, static_cast<std::uint32_t>(ls), sl.first, m.partial.p, m.cand_own.p, st);
                 m.options.communicator->exchange(st, m.cand_own.p, m.cand_other.p, std::size_t{R} * sizeof(ds41::ArgmaxCandidate),
                                                  dist::Tag{static_cast<std::uint32_t>(dist::TagKind::argmax), 0U, position});
                 const auto* first = m.options.rank == 0U ? m.cand_own.p : m.cand_other.p;
@@ -2041,8 +2728,10 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
                 ds41::enqueue_combine_argmax(first, second, R, m.best.p, st);
             } else {
                 const auto r0 = ds41::vocab_slice(c.vocab_size, 2U, 0U), r1 = ds41::vocab_slice(c.vocab_size, 2U, 1U);
-                ds41::enqueue_argmax(m.logits.p + r0.first, R, r0.count, V, r0.first, m.partial.p, m.cand0.p, st);
-                ds41::enqueue_argmax(m.logits.p + r1.first, R, r1.count, V, r1.first, m.partial.p, m.cand1.p, st);
+                const auto [l0, s0] = m.logits_rows(r0.first, V);
+                const auto [l1, s1] = m.logits_rows(r1.first, V);
+                ds41::enqueue_argmax(l0, R, r0.count, static_cast<std::uint32_t>(s0), r0.first, m.partial.p, m.cand0.p, st);
+                ds41::enqueue_argmax(l1, R, r1.count, static_cast<std::uint32_t>(s1), r1.first, m.partial.p, m.cand1.p, st);
                 ds41::enqueue_combine_argmax(m.cand0.p, m.cand1.p, R, m.best.p, st);
             }
             const auto t_best = tr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -2086,6 +2775,7 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
                                  h);
         }
     }
+    flush_post();  // a FRONT stage (no head): the last layer's expansion is still pending with the fused hc sites
     if (engram_async) {
         engram_io.get();
         engram_seconds_ = engram_read_seconds;
@@ -2098,6 +2788,7 @@ const std::vector<std::uint32_t>& DeviceForward::step_window(std::span<const std
     if (tr) tr->mark("final_sync");
     if (m.options.op_timing) collect_op_timing(op_exchange);
     if (tr) tr->mark("collect_op_timing");
+    m.last_position = position;
     m.position += R;
     step_seconds_ = seconds_since(t_step);
     if (tr) tr->finish(m.op_events, step_seconds_);

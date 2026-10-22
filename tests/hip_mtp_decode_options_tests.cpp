@@ -5,6 +5,33 @@
 #include <vector>
 namespace {
 void require(bool ok,const char* message){if(!ok)throw std::runtime_error(message);}
+struct Env {
+    std::string key,old;bool had;
+    static void set(const char* k,const char* v){
+#ifdef _WIN32
+        _putenv_s(k,v?v:"");
+#else
+        if(v)setenv(k,v,1);else unsetenv(k);
+#endif
+    }
+    Env(const char* k,const char* v):key(k),had(std::getenv(k)!=nullptr){
+        if(had)old=std::getenv(k);
+        set(k,v);
+    }
+    ~Env(){set(key.c_str(),had?old.c_str():nullptr);}
+};
+void depth_policy_options_contract(){
+    using namespace strix::decode_cli;
+    Env mode("STRIX_MTP_CONTROLLER","depth"),domain("STRIX_MTP_DOMAIN","prose"),
+        threshold("STRIX_MTP_MINP_PROSE",".83");
+    MtpCliOptions options;options.window_rows_set={2,4,8};
+    require(std::abs(mtp_draft_min_probability(options)-.83F)<1e-6F,"domain threshold applies to an implicit min-p");
+    options.spec_min_p=.61;
+    require(std::abs(mtp_draft_min_probability(options)-.61F)<1e-6F,"explicit CLI min-p overrides the domain");
+    options.sample_temperature=1;
+    bool rejected=false;try{(void)mtp_draft_min_probability(options);}catch(const std::invalid_argument&){rejected=true;}
+    require(rejected,"unqualified sampled depth policy is rejected");
+}
 strix::decode_cli::Options parse(std::vector<std::string> args){
     std::vector<char*> argv;for(auto& value:args)argv.push_back(value.data());
     return strix::decode_cli::parse_options(static_cast<int>(argv.size()),argv.data());
@@ -472,5 +499,6 @@ int main(){try{
         reject_as(baseline,"duplicate staged MoE router logits option","duplicate staged logits rejected");
     }
     expert_copy_cli_contract();
+    depth_policy_options_contract();
     return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

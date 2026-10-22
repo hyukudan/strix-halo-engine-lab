@@ -128,11 +128,12 @@ void MtpNgramDraft::finish_cycle(std::span<const std::uint32_t> emitted) {
         const auto p = shadow_.prefix.size();
         if (emitted.size() > p && std::equal(shadow_.prefix.begin(), shadow_.prefix.end(), emitted.begin())) {
             const auto truth = emitted.subspan(p);
+            ++stats_.scored_cycles;
             for (std::size_t k = 0; k < shadow_.tokens.size() && k < truth.size(); ++k) {
                 const auto c = cell(shadow_.suffix, shadow_.supported, k);
                 const bool right = shadow_.tokens[k] == truth[k];
                 tried_[c] += 1.0;
-                if (right) right_[c] += 1.0;
+                if (right) { right_[c] += 1.0; ++stats_.shadow_right_rows; }
                 if (right && k < shadow_.used) ++stats_.accepted_rows;
                 if (!right) break;
             }

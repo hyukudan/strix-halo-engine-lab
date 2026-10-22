@@ -106,6 +106,8 @@ std::uint64_t hip_hyper_mix_testing_folded_launches();
 // Prefill: all T rows of an HC step (T a multiple of 8, tiles one stride apart) in one launch per kernel.
 void hyper_mix_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipHyperMixLauncherConfig& config);
+void hyper_mix_known_window_cohort_launch(std::span<const std::span<const ExecutionDispatchContext>> segments,
+    const HipHyperMixLauncherConfig& config);
 void hyper_mix_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipHyperMixLauncherConfig& config);
 
