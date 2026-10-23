@@ -640,6 +640,8 @@ constexpr std::uint64_t lm_head_rows_lds_limit = 48U * 1024U;
 // wave runs Cols consecutive logits that share those reads; and the trees run two partial sums
 // per register: an add pairs the same two values as the R1 shuffle tree and only the lane that
 // keeps the result changes, so each sum is the same IEEE add with its operands commuted.
+// The optional direct-input specialization keeps the same vector reads and trees
+// but reads the BF16 words from the input rows instead of an LDS copy.
 template <unsigned D>
 __device__ __forceinline__ float lane_xor(float value) {
     if constexpr (D == 16) {
@@ -673,7 +675,7 @@ __device__ __forceinline__ LeanGreedy lean_choose(LeanGreedy a, const LeanGreedy
     return a;
 }
 constexpr unsigned lm_head_lean_waves = 8;
-template <unsigned Rows, unsigned Cols, bool Greedy>
+template <unsigned Rows, unsigned Cols, bool Greedy, bool Staged = true>
 __global__ __launch_bounds__(32U * lm_head_lean_waves)
 void lean_q8_lm_head_rows_kernel(LmHeadRowsViews views, const void* weights, std::uint32_t input_width,
     std::uint32_t output_width, LeanGreedy* partials, std::uint32_t partial_count) {
@@ -682,9 +684,11 @@ void lean_q8_lm_head_rows_kernel(LmHeadRowsViews views, const void* weights, std
     extern __shared__ uint4 staged[];
     __shared__ LeanGreedy best_lds[Greedy ? lm_head_lean_waves * slots : 1U];
     const auto words = input_width / 8U;
-    for (auto i = static_cast<std::uint32_t>(threadIdx.x); i < Rows * words; i += 32U * lm_head_lean_waves)
-        staged[i] = reinterpret_cast<const uint4*>(views.input[i / words])[i % words];
-    __syncthreads();
+    if constexpr (Staged) {
+        for (auto i = static_cast<std::uint32_t>(threadIdx.x); i < Rows * words; i += 32U * lm_head_lean_waves)
+            staged[i] = reinterpret_cast<const uint4*>(views.input[i / words])[i % words];
+        __syncthreads();
+    }
     const auto lane = static_cast<std::uint32_t>(threadIdx.x) % 32U, wave = static_cast<std::uint32_t>(threadIdx.x) / 32U;
     LeanGreedy best[regs]{};
     for (unsigned group = 0; group < groups; ++group) {
@@ -723,7 +727,8 @@ void lean_q8_lm_head_rows_kernel(LmHeadRowsViews views, const void* weights, std
             if (base + 256U < input_width) fetch(feature + 256U);
 #pragma unroll
             for (unsigned r = 0; r < Rows; ++r) {
-                const uint4 word = staged[(r * input_width + feature) / 8U];
+                const uint4 word = Staged ? staged[(r * input_width + feature) / 8U] :
+                    reinterpret_cast<const uint4*>(views.input[r])[feature / 8U];
                 const std::uint32_t pair[4] = {word.x, word.y, word.z, word.w};
                 float act[8];
 #pragma unroll
@@ -795,8 +800,18 @@ void lean_q8_lm_head_rows_kernel(LmHeadRowsViews views, const void* weights, std
 template <unsigned Rows, unsigned Cols>
 void launch_lean_lm_head_rows(const LmHeadRowsViews& views, const void* weights, std::uint32_t hidden,
     std::uint32_t vocab, LeanGreedy* partials, hipStream_t stream) {
+    static const bool direct = [] { const char* v = std::getenv("STRIX_QKERN_HEAD_DIRECT"); return v && v[0] == '1'; }();
     const auto lds = static_cast<std::uint32_t>(Rows * hidden * 2U);
     const auto blocks = (vocab + hip_greedy_rows_partial_logits - 1U) / hip_greedy_rows_partial_logits;
+    if (direct) {
+        if (partials)
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(lean_q8_lm_head_rows_kernel<Rows, Cols, true, false>), dim3(blocks),
+                dim3(32U * lm_head_lean_waves), 0, stream, views, weights, hidden, vocab, partials, blocks);
+        else
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(lean_q8_lm_head_rows_kernel<Rows, Cols, false, false>), dim3(blocks),
+                dim3(32U * lm_head_lean_waves), 0, stream, views, weights, hidden, vocab, partials, blocks);
+        return;
+    }
     if (partials)
         hipLaunchKernelGGL(HIP_KERNEL_NAME(lean_q8_lm_head_rows_kernel<Rows, Cols, true>), dim3(blocks),
             dim3(32U * lm_head_lean_waves), lds, stream, views, weights, hidden, vocab, partials, blocks);
@@ -1318,7 +1333,8 @@ struct PreparedLmHeadRows { LmHeadRowsViews views{}; const void* weights = nullp
 // Lean rows (config.rows_lean 1 or 2) stage every row's input in LDS next to its greedy slots.
 // Windows of up to four rows keep the unstaged rows kernel, which is faster there.
 bool lean_rows_admitted(const HipLmHeadLauncherConfig& config, std::size_t rows) {
-    return (config.rows_lean == 1U || config.rows_lean == 2U) && rows > 4U && config.hidden_size % 256U == 0U &&
+    static const bool direct = [] { const char* v = std::getenv("STRIX_QKERN_HEAD_DIRECT"); return v && v[0] == '1'; }();
+    return (direct || config.rows_lean == 1U || config.rows_lean == 2U) && rows > 4U && rows <= 8U && config.hidden_size % 256U == 0U &&
         rows * config.hidden_size * 2U <= lm_head_rows_lds_limit;
 }
 template <unsigned Cols>

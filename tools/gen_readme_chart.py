@@ -12,7 +12,7 @@ Every value must come from a recorded measurement; put its commit and date in SO
 
 from pathlib import Path
 
-SOURCE = "One Bosgame M5 (Ryzen AI Max+ 395, 128 GB) · UD-Q4_K_XL · commit dff1dbe · 2026-10-18"
+SOURCE = "One Strix Halo mini PC (Ryzen AI Max+ 395, 128 GB) · UD-Q4_K_XL · commit dff1dbe · 2026-10-18"
 
 PROFILES = ("Exact (FP32 dense)", "Dense A8 (recommended)")
 

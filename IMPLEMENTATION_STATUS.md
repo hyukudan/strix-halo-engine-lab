@@ -3,6 +3,20 @@
 Current cross-cutting summary: [qualification ledger](docs/qualification-ledger.md).
 The slices below are retained implementation history, not native qualification.
 
+## DeepSeek V4.1 Flash on two nodes and with a discrete GPU (2026-10-23)
+
+- **Two Strix Halo nodes over USB4:** DeepSeek V4.1 Flash 1017 (2-bit routed experts, c-u6 dense overlay, trellis
+  mix-B shared-expert and head sites) runs expert tensor parallel decode, expert parallel device prefill, DSpark
+  speculative decode, batched decode and an OpenAI-compatible server (`strix-deepseek41-serve`). Production
+  defaults: [docs/ds41-production-defaults.md](docs/ds41-production-defaults.md); decisions D-061 to D-064.
+- **Measured** (production defaults, bitwise-gated runs): greedy 28.5 tok/s, DSpark 37.5 / 39.3 / 62.3 tok/s
+  (EN / ES / code, 24 prompts), batch N=8 95.9 tok/s, device prefill 734 tok/s at 8K, server C1 / C4 / C8
+  38.4 / 59.3 / 66.8 tok/s, 8K time to first token 15.8 s on an idle server.
+- **RTX split (opt-in, D-064):** CUDA FRONT layers [0, 22) on an RTX PRO 6000 + pair TAIL: DSpark 61.8 tok/s
+  (x1.33 over pair-only), greedy 38.3 tok/s, bitwise without trellis sites, composed identity with them.
+- **Gates of this state:** R1 and R6 windows bitwise against the stored references on both ranks, batch tokens
+  equal to the campaign, prefill 8K logits FNV, server 64/64 requests equal; Qwen replicas 570/570 equal to one node.
+
 ## Current state (2026-10-17, f429bd6)
 
 Speculative MTP decode path. Details: [README.md](README.md) and
@@ -23,7 +37,7 @@ Speculative MTP decode path. Details: [README.md](README.md) and
   capped at 2x the estimate). Longest-accepted-prefix acceptance with deferred
   GDN state commit (no state checkpoint); routed experts are executed as a union
   per window. Output is bit-identical to serial greedy decode.
-- **Measured** on one Bosgame M5 node (Ryzen AI Max+ 395, 128 GB), UD-Q4_K_XL,
+- **Measured** on one Strix Halo node (Ryzen AI Max+ 395, 128 GB), UD-Q4_K_XL,
   256 generated tokens: Python code prompt 48.4 tok/s stable (49.5 tok/s with a
   smaller draft vocabulary); prose ~34–37 tok/s; output identical across runs.
   These are local workload measurements, not qualification evidence.

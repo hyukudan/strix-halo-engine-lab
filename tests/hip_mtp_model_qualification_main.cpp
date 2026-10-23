@@ -1,6 +1,7 @@
 #include "hip_mtp_model_qualification.hpp"
 #include "hip_mtp_qualification_reference.hpp"
 #include "hip_mtp_target_checkpoint_components.hpp"
+#include "hip_mtp_prefix_gate.hpp"
 #include <charconv>
 #include <algorithm>
 #include <iostream>
@@ -15,7 +16,7 @@
 int strix_hip_decode_token_entry(int,char**);
 namespace strix::tests {
 namespace {
-struct Request {std::string path,sha,export_path;std::uint64_t file_bytes=0,host_bytes=0,coverage=31,export_bytes=0,export_capture_bytes=0,export_greedy_rows=0;bool component_diagnostic=false;};
+struct Request {std::string path,sha,export_path,prefix_gate_path;std::uint64_t file_bytes=0,host_bytes=0,coverage=31,export_bytes=0,export_capture_bytes=0,export_greedy_rows=0;bool component_diagnostic=false;};
 Request request;
 std::optional<MtpQualificationReference> reference;
 void require(bool v,const char* message){if(!v)throw std::invalid_argument(message);}
@@ -36,10 +37,18 @@ std::vector<char*> configure(int argc,char** argv){
         else if(key=="--qualification-export-bytes")request.export_bytes=number(value);
         else if(key=="--qualification-export-capture-bytes")request.export_capture_bytes=number(value);
         else if(key=="--qualification-export-greedy-rows")request.export_greedy_rows=number(value);
+        else if(key=="--qualification-prefix-gate")request.prefix_gate_path=value;
         else if(key=="--qualification-component-diagnostic"){
             require(value=="1","component diagnostic must be explicitly enabled with 1");request.component_diagnostic=true;
         }
         else throw std::invalid_argument("unknown qualification option");
+    }
+    if(!request.prefix_gate_path.empty()) {
+        require(seen.size()==1U && !std::filesystem::exists(request.prefix_gate_path),
+            "prefix gate requires only its fresh output path, without reference/export options");
+        require(std::find_if(forward.begin()+1,forward.end(),[](const char* p){return std::string_view(p)=="--mtp";})!=forward.end(),
+            "prefix gate requires the explicit MTP route and ordinary asset/replay pins");
+        forward.push_back(nullptr);return forward;
     }
     if(!request.export_path.empty()){
         require(request.path.empty() && request.sha.empty() && !request.file_bytes && !request.host_bytes &&
@@ -69,6 +78,7 @@ std::vector<char*> configure(int argc,char** argv){
 }
 }
 bool mtp_target_input_export_requested() noexcept{return !request.export_path.empty();}
+bool mtp_prefix_gate_requested() noexcept{return !request.prefix_gate_path.empty();}
 bool mtp_component_diagnostic_requested() noexcept{return request.component_diagnostic;}
 void run_mtp_component_diagnostic(const std::shared_ptr<HipMtpResources>& owner,std::uint64_t actual_profile){
     require(request.component_diagnostic && reference && owner && actual_profile,
@@ -153,6 +163,7 @@ void export_mtp_target_inputs(const decode_cli::Options& o,const ModelContract& 
     std::cout<<"]}\n";
 }
 void run_mtp_model_qualification(decode_cli::MtpDecodeQualificationContext& c){
+    if(!request.prefix_gate_path.empty()){prefix_gate::run(c,request.prefix_gate_path);return;}
     require(reference.has_value(),"qualification reference was not admitted before setup");
     const auto& g=*reference;
     const auto& owner=*c.predictor;

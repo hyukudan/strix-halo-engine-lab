@@ -1,4 +1,5 @@
 #include "strix/mtp_window_controller.hpp"
+#include "strix/mtp_batch_window_controller.hpp"
 
 #include <array>
 #include <cmath>
@@ -103,6 +104,84 @@ int main() {
             expect(o==0U || o==MtpMinPWindowController::serial,"probe respects the fits mask");
             c.observe(o,1U,45.0);
         }
+    }
+    // A slot first observes cheap R2 cycles and slow deeper windows (for example
+    // while other requests are scheduled), then serves a confident request.
+    // Those individually plausible costs can suppress all deeper drafting: a
+    // larger owner's fit-mask re-probe cannot help if the chain never reaches it.
+    for(const auto model:{Model::legacy,Model::robust}) {
+        MtpMinPWindowController reused({2U,4U,8U},0.7F,model,4);
+        for(int k=0;k<10;++k) {
+            reused.observe(0,2,20.0);reused.observe(1,4,200.0);reused.observe(2,8,300.0);
+        }
+        const std::vector<float> p{0.99F};
+        expect(!reused.worth_drafting(p),"retained workload costs stop the next request at one draft");
+        for(int k=0;k<200;++k)reused.calibrate(p,0,1);
+        reused.set_external_rows(0,std::array<double,1>{0.01});
+        reused.begin_session();
+        MtpMinPWindowController fresh({2U,4U,8U},0.7F,model,4);
+        expect(reused.worth_drafting(p),"request reset reopens deeper drafting from the prior");
+        for(const auto& s:reused.owner_stats())
+            expect(!s.cycles && !s.probes && s.cycle_ms==0.0,"reset clears costs and exploration history");
+        const std::array<std::uint8_t,3> all{1U,1U,1U};
+        const std::vector<float> chain{0.99F,0.85F,0.72F,0.4F};
+        for(int k=0;k<80;++k) {
+            const auto a=reused.choose(chain,chain.size(),all),b=fresh.choose(chain,chain.size(),all);
+            expect(a==b,"reused request choices equal a fresh controller after reset");
+            expect(reused.worth_drafting(p)==fresh.worth_drafting(p),"reset restores acceptance and external-row priors");
+            reused.calibrate(chain,2,3);fresh.calibrate(chain,2,3);
+            reused.observe(a,3,55.0);fresh.observe(b,3,55.0);
+        }
+    }
+    // An implausible middle owner can also stay trapped: one fast re-probe
+    // cannot displace a full median window of slow samples, and the larger
+    // owner is never drafted even though its retained cost is competitive.
+    {
+        MtpMinPWindowController reused({2U,4U,8U},0.7F,Model::robust,64);
+        for(int k=0;k<10;++k) {
+            reused.observe(0,2,20.0);reused.observe(1,4,90.0);reused.observe(2,8,35.0);
+        }
+        const std::vector<float> p{0.99F};
+        const std::array<std::uint8_t,3> all{1U,1U,1U};
+        std::size_t probes=0,large=0;
+        for(int k=0;k<128;++k) {
+            const auto o=reused.choose(p,1,all);
+            if(o==1U)++probes;
+            if(o==2U)++large;
+            reused.observe(o,2,o==0U?20.0:o==1U?25.0:35.0);
+        }
+        expect(probes==1U && large==0U,"a short reused session only gets one middle-owner re-probe");
+        expect(reused.owner_stats()[2].cycle_ms==90.0 && !reused.worth_drafting(p),
+            "one fast probe leaves the slow median and the deeper draft barrier intact");
+        reused.begin_session();
+        expect(reused.worth_drafting(p),"a new request clears the contaminated median without waiting for more probes");
+    }
+    {
+        strix::MtpBatchWindowController joint(4);
+        const std::vector<float> high(7,0.99F),low(7,0.01F);
+        std::vector<strix::MtpBatchWindowController::Request> q{{0,8,high},{1,8,high}};
+        const auto good=joint.choose(q,16);
+        expect(good==std::vector<std::uint32_t>({8,8}),"joint selection retains deep, high acceptance windows");
+        q[0].probabilities=low;q[1].probabilities=low;
+        expect(joint.choose(q,16)==std::vector<std::uint32_t>({2,2}),"joint selection avoids low acceptance padding");
+        q[0].limit=4;q[1].limit=2;q[0].probabilities=high;
+        expect(joint.choose(q,16)==std::vector<std::uint32_t>({2,2}),"six physical rows cannot fall through to serial chunks");
+        const std::vector<strix::MtpBatchWindowController::Request> tails{{0,2,{}},{1,2,{}},{2,2,{}}};
+        expect(joint.choose(tails,16)==std::vector<std::uint32_t>({2,2,2}),"three R2-only tails retain admissible chunks");
+        const std::vector<strix::MtpBatchWindowController::Request> triple{{0,8,{}},{1,8,{}},{2,8,{}}};
+        const auto probe=joint.plan(triple,16);
+        expect(probe==std::vector<std::uint32_t>({4,2,2}),"three-request exploration pads a valid eight-row cohort");
+        q={{0,8,high},{1,8,high},{2,8,high},{3,8,high}};
+        const auto bounded=joint.choose(q,16);
+        std::uint32_t total=0;for(auto r:bounded) total+=r;
+        expect(total<=16U,"joint exhaustive search respects the global row budget");
+        q.resize(2);q[0].probabilities=low;q[1].probabilities=low;
+        const std::array<std::uint32_t,2> rows{8,8},miss{0,0};
+        for(int n=0;n<100;++n) joint.observe(q,rows,miss,200.0,30.0,14U);
+        for(int k=0;k<9;++k) static_cast<void>(joint.plan(q,16)); // bounded exploration
+        const auto no_draft=joint.plan(q,16);
+        expect(no_draft==std::vector<std::uint32_t>({0,0}),"joint planning skips expensive unproductive drafts");
+        joint.reset(0);joint.reset(1);
     }
     if(failures) {std::cerr<<failures<<" failure(s)\n";return 1;}
     std::cout<<"mtp window controller: legacy R2 share "<<share(stuck,2)<<", robust R8 share "<<share(fixed,8)

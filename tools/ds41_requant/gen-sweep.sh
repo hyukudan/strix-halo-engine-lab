@@ -1,7 +1,7 @@
 #!/bin/bash
 # generate one overlay per class at FMT (sensitivity sweep); usage: gen-sweep.sh FMT [IMATRIX] [TAGSUFFIX]
-cd ~/ai-cluster-lab/scratch-admin/requant
-M=~/ai-cluster-lab/models/DeepSeek-V4.1-Flash-1017/DeepSeek-V4.1-Flash-1017-Q2.gguf
+cd "${RQ_DIR:-.}"
+M=${DS41_MODEL:?path of the DeepSeek-V4.1-Flash-1017 Q2 GGUF}
 PY=${PY:-python3}
 fmt=$1; im=${2:-}; suf=${3:-}
 for c in ${CLASSES:-q_a q_b kv wo_a wo_b sh_gu sh_down head}; do

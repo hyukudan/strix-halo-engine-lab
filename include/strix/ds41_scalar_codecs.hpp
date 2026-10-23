@@ -4,6 +4,7 @@
 // codes follow the formats: E8M0 255 and E4M3 S.1111.111 are NaN, E8M0 0 is 2^-127, E2M1 code 8 is -0.
 // Branch-free so device kernels can decode in the inner loops.
 #include <cstdint>
+#include "strix/ds41_msvc_builtins.hpp"
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #define DS41C_HD __host__ __device__ inline

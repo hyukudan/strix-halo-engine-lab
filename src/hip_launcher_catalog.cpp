@@ -32,7 +32,7 @@ std::uint32_t checked_u32(
 HipGdnLauncherConfig make_gdn_config(const ModelContract& model,
     HipActivationStorage activation, bool graph, bool virtual_q8, bool prefetch_q8, bool virtual_output,
     bool wave8, bool wave8_output, HipGdnRecurrentLayout recurrent_layout = HipGdnRecurrentLayout::baseline,
-    GdnRecurrentStorage recurrent_storage = GdnRecurrentStorage::key_value, bool dense_a8 = false, bool dense_f16 = false) {
+    GdnRecurrentStorage recurrent_storage = GdnRecurrentStorage::key_value, bool dense_a8 = false, bool dense_f16 = false, bool dense_trellis = false) {
     HipGdnLauncherConfig config;
     config.model = model;
     config.activation = activation;
@@ -46,6 +46,7 @@ HipGdnLauncherConfig make_gdn_config(const ModelContract& model,
     config.recurrent_storage = recurrent_storage;
     config.dense_a8_projections = dense_a8;
     config.dense_f16_prefill = dense_f16;
+    config.dense_trellis_projections = dense_trellis;
     return config;
 }
 
@@ -57,7 +58,7 @@ indexed_attention_config(
     bool wave8_output = false, bool hierarchical_selection = false,
     std::shared_ptr<QsaHierarchicalSelectionStats> selection_stats = {},
     std::uint32_t gqa_heads = 1, std::shared_ptr<QsaHierarchicalSelectionStats> gqa_stats = {}, bool dense_a8 = false,
-    bool dense_f16 = false) {
+    bool dense_f16 = false, bool dense_trellis = false) {
     HipIndexedAttentionLauncherConfig config;
     config.model = model;
     config.activation = activation;
@@ -72,6 +73,7 @@ indexed_attention_config(
     config.gqa_stats = std::move(gqa_stats);
     config.dense_a8_projections = dense_a8;
     config.dense_f16_prefill = dense_f16;
+    config.dense_trellis_projections = dense_trellis;
     return config;
 }
 
@@ -496,7 +498,7 @@ void register_complete_hip_kernel_catalog(
         qualification);
 
     const auto gdn = make_gdn_config(model, config.activation,
-        config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input, config.wave8_q8_gdn_output, config.gdn_recurrent_layout, config.gdn_recurrent_storage, config.dense_a8);
+        config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input, config.wave8_q8_gdn_output, config.gdn_recurrent_layout, config.gdn_recurrent_storage, config.dense_a8, false, numerical_profile_dense_trellis(config.numerical_profile));
     register_hip_gdn_kernel_variant(
         model,
         request,
@@ -507,7 +509,7 @@ void register_complete_hip_kernel_catalog(
     const auto indexed =
         indexed_attention_config(
             model,
-            config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats, config.wave8_q8_qsa_output, config.qsa_hierarchical_selection, config.qsa_selection_stats, config.qsa_gqa_heads_per_block, config.qsa_gqa_stats, config.dense_a8);
+            config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats, config.wave8_q8_qsa_output, config.qsa_hierarchical_selection, config.qsa_selection_stats, config.qsa_gqa_heads_per_block, config.qsa_gqa_stats, config.dense_a8, false, numerical_profile_dense_trellis(config.numerical_profile));
     if(config.prefetch_q8_qsa_input){auto base=indexed;base.prefetch_q8_input=false;base.prefetch_eligible_layers.clear();auto base_request=request;base_request.prefetch_q8_qsa_input=false;base_request.qsa_input_prefetch_layers.clear();register_hip_indexed_attention_kernel_variant(model,base_request,base,registry,qualification);}
     register_hip_indexed_attention_kernel_variant(
         model,
@@ -604,13 +606,13 @@ HipLauncherCatalog::HipLauncherCatalog(
       gdn_config_(
           make_gdn_config(model, config.activation,
               config.enable_device_graph_inputs, config.virtual_q8_gdn_input, config.prefetch_q8_gdn_input, config.virtual_q8_gdn_output, config.wave8_q8_gdn_input, config.wave8_q8_gdn_output, config.gdn_recurrent_layout, config.gdn_recurrent_storage, config.dense_a8,
-              (config.fast_prefill_components & kFastPrefillDense) != 0U)),
+              (config.fast_prefill_components & kFastPrefillDense) != 0U, numerical_profile_dense_trellis(config.numerical_profile))),
       gdn_(gdn_config_),
       indexed_attention_(
           indexed_attention_config(
               model,
               config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats, config.wave8_q8_qsa_output, config.qsa_hierarchical_selection, config.qsa_selection_stats, config.qsa_gqa_heads_per_block, config.qsa_gqa_stats, config.dense_a8,
-              (config.fast_prefill_components & kFastPrefillDense) != 0U)),
+              (config.fast_prefill_components & kFastPrefillDense) != 0U, numerical_profile_dense_trellis(config.numerical_profile))),
       embedding_(
           embedding_config(
               model,

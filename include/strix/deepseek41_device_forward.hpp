@@ -2,6 +2,7 @@
 
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/deepseek41_host_forward.hpp"
+#include "strix/ds41_pipeline_wire.hpp"
 
 #include <array>
 #include <cstdint>
@@ -81,6 +82,27 @@ struct DeviceForwardOptions {
     // Site classes read natively: q_a, q_b, kv, o_a, o_b, shexp (gate, up and down together), or all. Also
     // STRIX_DS41_NATIVE_FP8_SITES=list.
     std::string native_fp8_sites = "all";
+    // Pipeline stages (strix/ds41-pipeline-v1, ds41_pipeline_wire.hpp). first_layer > 0: this forward is the TAIL of a cut
+    // at first_layer: it runs target layers [first_layer, layers) and the head on a boundary (step_boundary) instead of
+    // the embedding and the layers before (their KV / top-k / candidate outputs that later layers read arrive in the
+    // boundary's sections and are kept in mirrors of the source layers' caches). 0 (default): the whole forward.
+    std::uint32_t first_layer = 0;
+    // false: no head and no argmax: a FRONT stage [0, layers) of a pipeline (export_boundary() after each step).
+    bool head = true;
+    // trellis weights for the dense decode sites (ds41_trellis.hpp, identity ds41-trellis-k5-v1,
+    // docs/ds41-trellis-k5-v1.md), off when empty: a pack directory (dense.L<l>.safetensors + dense.head.safetensors). The
+    // selected sites run the trellis library on F32 activations (no A8 at those sites) instead of their Q8_0 / packed
+    // copy, which stays loaded. Also STRIX_DS41_TRELLIS=DIR; the build must link the library (CMake STRIX_DS41_TRELLIS).
+    std::filesystem::path trellis;
+    // Site classes read from the pack: q_a, q_b, kv, o_a, o_b, shexp, head, or all (each class only where its hook
+    // exists). Default EMPTY: on v12 no class wins in-app yet, so STRIX_DS41_TRELLIS alone selects nothing (a startup line
+    // says so); name the classes explicitly ("shexp", "all", ...). Also STRIX_DS41_TRELLIS_SITES=list.
+    std::string trellis_sites;
+    // With a trellis shared expert (class shexp): split it over the two ranks (identity ds41-trellis-k5-v1:shexp-tp,
+    // ds41_shexp_tp.hpp): rank r runs gate / up rows [1152 r, +1152) and the down K-half [1152 r, +1152), adds its partial
+    // onto its half sum before the half-sum exchange; y = (S0 + P0) + (S1 + P1). One process runs both ranks' partials.
+    // Default off (the replicated ds41-trellis-k5-v1:shexp). Also STRIX_DS41_SHEXP_TP=1.
+    bool trellis_shexp_tp = false;
     // With op_hashes: called with every hashed op output ("op@layer/site:buffer", values) of single steps (calibration).
     std::function<void(const std::string&, const std::vector<float>&)> buffer_tap;
 };
@@ -155,6 +177,24 @@ public:
     // index sources' last top-k, the position, the Engram history and next_token(). Then step(next_token()) is the step
     // of position state.position, bitwise. Needs state.position + the rows to come <= max_positions.
     void import_state(const AttentionState& state);
+    // Pipeline FRONT (layers < the model's, head off): what the cut after layer layers - 1 carries for the last step (the
+    // stream, the FFN mix of the last layer, the KV entries, top-k and candidate blocks later layers read).
+    [[nodiscard]] ds41::pipe::Boundary export_boundary() const;
+    // Pipeline TAIL (first_layer > 0): one step of the boundary's rows (position must be next_position()); returns each
+    // row's greedy token, like step_window (R = 1: the logits are kept as step() keeps them).
+    const std::vector<std::uint32_t>& step_boundary(const ds41::pipe::Boundary& boundary);
+    [[nodiscard]] const ds41::pipe::BoundaryPlan& boundary_plan() const;
+    // Every logit of every row of the last step with the head, [row][vocab] on the host. World 2: a collective (both ranks
+    // call it after the same step; each sends its vocabulary slice of every row to the peer). For checks, not a hot path.
+    [[nodiscard]] std::vector<float> window_logits();
+    // Host logits of the last single-row step (as step() returns them; empty when the step kept none).
+    [[nodiscard]] const std::vector<float>& last_logits() const noexcept;
+    // World 2: host bytes to the peer and the peer's back (same size on both ranks), through the communicator; an empty
+    // `in` drops the peer's bytes (no download).
+    void exchange_host(std::span<const std::byte> out, std::span<std::byte> in);
+    // Pinned host memory of at least `bytes` owned by the forward (grown on demand; the previous contents are lost when
+    // it grows): a pipeline TAIL receives each STEP payload here, so the boundary uploads read pinned memory directly.
+    [[nodiscard]] std::span<std::uint8_t> receive_buffer(std::size_t bytes);
     [[nodiscard]] std::uint64_t weight_bytes() const noexcept;
     // Tensors packed to CB4 at load (cb4_overlay) and their device bytes.
     [[nodiscard]] std::size_t cb4_tensors() const noexcept;
@@ -164,6 +204,14 @@ public:
     [[nodiscard]] std::string storage_description() const;
     // Device logits of the last step, [row][vocab] on stream(); with world 2 only this rank's vocabulary slice is valid.
     [[nodiscard]] const float* device_logits() const noexcept;
+    // The last step's logits rows of the vocabulary slice starting at `first` (a vocab_slice first): device_logits() + first
+    // with row stride vocab, except under STRIX_DS41_TRELLIS_HEADOUT at R > 1 (the trellis head's per-slice rows, stride =
+    // the slice's count; device_logits() then holds no rows of that step). Readers of R > 1 logits use this.
+    struct LogitsRows {
+        const float* p = nullptr;
+        std::size_t stride = 0;  // floats between rows
+    };
+    [[nodiscard]] LogitsRows device_logits_rows(std::uint32_t first) const;
     [[nodiscard]] double load_seconds() const noexcept { return load_seconds_; }
     // Operations of the plan still bound to a host stand-in (none since the attention piece landed).
     [[nodiscard]] static std::vector<Op> host_ops();
@@ -171,6 +219,7 @@ public:
     struct Impl;
 
 private:
+    const std::vector<std::uint32_t>& run_step(std::span<const std::uint32_t> tokens, const ds41::pipe::Boundary* boundary);
     std::unique_ptr<Impl> impl_;
     std::uint32_t next_token_ = 0;
     std::vector<std::uint32_t> tokens_;

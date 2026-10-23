@@ -41,6 +41,14 @@ Optional closed R2/R4/R8 target verification requires `--mtp-target-window-rows 
 
 Reservations cover declared requested payloads, including target D1 capture/shadow requirements. Window total includes the window arena/completion record plus checkpoint/capture payloads. They exclude opaque driver bookkeeping and container capacity overhead, and do not assert physical RAM fit. Snapshot tails follow their declared logical policy. Receipt fields describe actual operations from a completed invocation, separate declared-policy replay activation from hardware/performance qualification, and label cycle-only host wall timing. Source implementation alone establishes no native or model validation result.
 
+`--mtp-spec-min-p 1.0` does not force serial target execution. The cost
+controller may probe an unmeasured configured owner and select it when its
+expected emitted tokens per unit cost beats serial verification, including
+padded prefix windows. Use actual attempted-window counts and row histograms
+to identify execution. For an independent serial decode reference, use ordinary
+eager generation without MTP, retaining the same actual prefill, numerical
+profile and assets; do not infer seriality from a probability threshold.
+
 The verification receipt follows actual window attempts. A configured owner with zero attempts reports `serial-target-fallback` and separately records its requested rows/configuration. Pair-entry dispatch counts explicitly exclude wide R4/R8 dispatches; the wide count is `null` because the current verifier result does not expose it. No total is inferred from requested geometry. The base backing inventory keeps its original pre-optional-request boundary. A distinct `mtp_target_d1_inventory` describes the later actual target D1 presence as unaccounted storage, without inventing backing keys or adding it to the base allocation census.
 
 
@@ -90,6 +98,10 @@ verifier emitted (host work only), from a prior of 0.2, and an extension is prop
 first-row acceptance is at least 0.5. Extension rows size the window with their learned acceptance and are
 kept out of the draft calibration. `STRIX_MTP_NGRAM_FLOOR` and `STRIX_MTP_NGRAM_PRIOR` change the gate.
 The receipt's `mtp_ngram_draft` counts proposal cycles, extended cycles, extension rows and accepted rows.
+`proposal_cycles` are the shadow proposals (host only): rows reach the verifier only in `extended_cycles`
+(`extension_rows`). `shadow_scored_cycles` counts the shadow proposals whose confident drafts were all emitted,
+and `shadow_right_rows` their leading rows equal to the emitted tokens, i.e. the rows an always-open
+extension would have had accepted.
 
 It helps requests that copy their context (correcting or editing a given document, code edits); on free
 prose, summaries and answers the gate stays closed and nothing changes. Cohort cycles do not use it.

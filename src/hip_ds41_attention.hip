@@ -28,9 +28,12 @@ struct BlockTimer {
 #define DS41_TIMED(s) const BlockTimer ds41_timer_(s)
 // phase mark k of the block (thread 0, after its outstanding memory operations): slots 7.. of the timing buffer
 #define DS41_MARK(k) do { __builtin_amdgcn_s_waitcnt(0); if (threadIdx.x == 0U && g_ds41_timing != nullptr) {     const unsigned long long b_ = blockIdx.x + gridDim.x * (blockIdx.y + static_cast<unsigned long long>(gridDim.y) * blockIdx.z);     g_ds41_timing[((7ULL + (k) / 4U) * 65536ULL + b_) * 4ULL + (k) % 4U] = static_cast<unsigned long long>(wall_clock64()); } } while (0)
+// shader-cycle mark k of the block (thread 0, after its outstanding memory operations): slots 11.. (20-bit counter)
+#define DS41_CMARK(k) do { __builtin_amdgcn_s_waitcnt(0); if (threadIdx.x == 0U && g_ds41_timing != nullptr) {     const unsigned long long b_ = blockIdx.x + gridDim.x * (blockIdx.y + static_cast<unsigned long long>(gridDim.y) * blockIdx.z);     g_ds41_timing[((11ULL + (k) / 4U) * 65536ULL + b_) * 4ULL + (k) % 4U] = __builtin_readcyclecounter(); } } while (0)
 #else
 #define DS41_TIMED(s) (void)0
 #define DS41_MARK(k) (void)0
+#define DS41_CMARK(k) (void)0
 #endif
 
 // xor lane exchange without LDS: DPP row_xmask inside the 16-lane rows, permlanex16 across them
@@ -70,9 +73,9 @@ __device__ __forceinline__ void rope512(float (&x)[16], const RopeRow& rope, uns
     }
 }
 
-__global__ __launch_bounds__(32) void window_write_kernel(WindowView v) {
+__device__ __forceinline__ void window_write_body(const WindowView& v, const uint3 bid) {
     DS41_TIMED(0U);
-    const unsigned r = blockIdx.x, lane = threadIdx.x;
+    const unsigned r = bid.x, lane = threadIdx.x;
     float x[16];
 #pragma unroll
     for (unsigned i = 0; i < 16; ++i) x[i] = v.kv[r * kHeadDim + 16 * lane + i];
@@ -97,12 +100,53 @@ __global__ __launch_bounds__(32) void window_write_kernel(WindowView v) {
 // weights ahead (the first ones before the latent barrier) instead of one step at a time;
 // the chain of each output (512 fmaf over d ascending) and everything else are unchanged.
 constexpr unsigned kAheadSteps = 3;
-template <bool Ahead>
-__global__ __launch_bounds__(128) void compress_kernel(CompressView v) {
+// Fast (STRIX_DS41_COMPRESS_FAST=1, default off): the same values in fewer instructions. f16_to_float compiles to
+// per-element exec-mask branches in the 512-term chains; here a finite F16 converts in the fmaf itself (v_fma_mix:
+// exact, the same float for normals, subnormals with F16 denormals on and signed zeros) and a step of 64 weights with
+// an exponent of 31 in any of its lanes takes f16_to_float itself; the latent is read from LDS 4 floats at a time and
+// the next step's weights are requested before the current step's chain. exp_f's range tests become selects over the
+// same polynomial, e2m1_encode's chain a sum of its tests, and the carry rows are read before they are stored. Every
+// chain (512 fmaf over d ascending, the merge, the norms) is unchanged.
+__device__ __forceinline__ float exp_f_sel(float x) {
+    const float n = __builtin_rintf(x * 1.44269504088896341F);
+    float r = __builtin_fmaf(n, -0.693145751953125F, x);
+    r = __builtin_fmaf(n, -1.42860676533018e-06F, r);
+    float q = 2.48015873e-05F;
+    q = __builtin_fmaf(q, r, 1.98412698e-04F);
+    q = __builtin_fmaf(q, r, 1.38888889e-03F);
+    q = __builtin_fmaf(q, r, 8.33333333e-03F);
+    q = __builtin_fmaf(q, r, 4.16666667e-02F);
+    q = __builtin_fmaf(q, r, 1.66666667e-01F);
+    q = __builtin_fmaf(q, r, 0.5F);
+    q = __builtin_fmaf(q, r, 1.0F);
+    q = __builtin_fmaf(q, r, 1.0F);
+    const float e = q * pow2f(static_cast<int>(n));
+    return x < -87.0F ? 0.0F : (x > 88.0F ? __builtin_inff() : e);
+}
+// some F16 of the pair has exponent 31 (inf / NaN)
+__device__ __forceinline__ unsigned f16x2_special(std::uint32_t w) {
+    return static_cast<unsigned>((~w & 0x7C00U) == 0U) | static_cast<unsigned>((~w & 0x7C000000U) == 0U);
+}
+__device__ __forceinline__ float f16_finite(std::uint32_t w, unsigned hi) {
+    return static_cast<float>(__builtin_bit_cast(_Float16, static_cast<std::uint16_t>(w >> (16U * hi))));
+}
+// e2m1_encode as a count of the thresholds not below the magnitude: the first true test of its chain is the number
+// of false tests before it (the thresholds ascend), and a NaN fails every test (code 7) in both forms.
+__device__ __forceinline__ std::uint8_t e2m1_encode_sel(float x) {
+    const std::uint8_t sign = (f2u(x) >> 31U) != 0U ? 8U : 0U;
+    const float a = x < 0.0F ? -x : x;
+    const unsigned m = static_cast<unsigned>(!(a <= 0.25F)) + static_cast<unsigned>(!(a < 0.75F)) + static_cast<unsigned>(!(a <= 1.25F)) +
+                       static_cast<unsigned>(!(a < 1.75F)) + static_cast<unsigned>(!(a <= 2.5F)) + static_cast<unsigned>(!(a < 3.5F)) +
+                       static_cast<unsigned>(!(a <= 5.0F));
+    return static_cast<std::uint8_t>(m | sign);
+}
+// Fast takes precedence over Ahead (it requests the next step itself).
+template <bool Ahead, bool Fast>
+__device__ __forceinline__ void compress_body(const CompressView& v, const uint3 bid) {
     DS41_TIMED(1U);
     __shared__ float latent_s[kHeadDim];
     __shared__ float k_s[kIdxDim];
-    const unsigned r = blockIdx.x, tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U;
+    const unsigned r = bid.x, tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U;
     const std::uint64_t p = v.pos[r];
     [[maybe_unused]] const uint4* wrow = reinterpret_cast<const uint4*>(v.wk + tid * kHeadDim);  // 8 F16 weights per uint4
     [[maybe_unused]] uint4 ahead[kAheadSteps][8];
@@ -112,9 +156,20 @@ __global__ __launch_bounds__(128) void compress_kernel(CompressView v) {
         const float* sc = v.score + r * kHeadDim + 16 * lane;
         if (wave == 0U && r + 1U == v.rows) {  // the pending group after the last row
             const bool pending = (p % 2U) == 0U;
-            for (unsigned i = 0; i < 16; ++i) {
-                v.state_out[16 * lane + i] = pending ? kv[i] : 0.0F;
-                v.state_out[kHeadDim + 16 * lane + i] = pending ? sc[i] : 0.0F;
+            if constexpr (Fast) {   // both rows read unconditionally, then stored: no load-to-store round trip per element
+                float a[16], b[16];
+#pragma unroll
+                for (unsigned i = 0; i < 16; ++i) { a[i] = kv[i]; b[i] = sc[i]; }
+#pragma unroll
+                for (unsigned i = 0; i < 16; ++i) {
+                    v.state_out[16 * lane + i] = pending ? a[i] : 0.0F;
+                    v.state_out[kHeadDim + 16 * lane + i] = pending ? b[i] : 0.0F;
+                }
+            } else {
+                for (unsigned i = 0; i < 16; ++i) {
+                    v.state_out[16 * lane + i] = pending ? kv[i] : 0.0F;
+                    v.state_out[kHeadDim + 16 * lane + i] = pending ? sc[i] : 0.0F;
+                }
             }
             if (lane == 0U) *v.state_valid_out = pending ? 1U : 0U;
         }
@@ -122,31 +177,78 @@ __global__ __launch_bounds__(128) void compress_kernel(CompressView v) {
         if (wave == 0U) {
             const float* kv0 = r > 0U ? v.kv + (r - 1U) * kHeadDim + 16 * lane : v.state_in + 16 * lane;
             const float* sc0 = r > 0U ? v.score + (r - 1U) * kHeadDim + 16 * lane : v.state_in + kHeadDim + 16 * lane;
+            float a0[16], b0[16], a1[16], b1[16];
+#pragma unroll
+            for (unsigned i = 0; i < 16; ++i) { a0[i] = kv0[i]; b0[i] = sc0[i]; a1[i] = kv[i]; b1[i] = sc[i]; }
+            DS41_CMARK(0U);
 #pragma unroll
             for (unsigned i = 0; i < 16; ++i) {
-                const float m = fmaxf(sc0[i], sc[i]);
-                const float e0 = exp_f(sc0[i] - m), e1 = exp_f(sc[i] - m);
+                const float m = fmaxf(b0[i], b1[i]);
+                const float e0 = Fast ? exp_f_sel(b0[i] - m) : exp_f(b0[i] - m), e1 = Fast ? exp_f_sel(b1[i] - m) : exp_f(b1[i] - m);
                 const float sum = e0 + e1;
-                x[i] = kv0[i] * (e0 / sum) + kv[i] * (e1 / sum);
+                x[i] = a0[i] * (e0 / sum) + a1[i] * (e1 / sum);
             }
+            DS41_CMARK(1U);
         }
     } else if (wave == 0U) {
 #pragma unroll
         for (unsigned i = 0; i < 16; ++i) x[i] = v.kv[r * kHeadDim + 16 * lane + i];
+        DS41_CMARK(0U);
     }
     if (wave == 0U) {
         norm512(x, v.norm, lane);
 #pragma unroll
         for (unsigned i = 0; i < 16; ++i) latent_s[16 * lane + i] = x[i];
+        DS41_CMARK(2U);
     }
-    if constexpr (Ahead) {  // in flight across the barrier
+    if constexpr (Ahead && !Fast) {  // in flight across the barrier
 #pragma unroll
         for (unsigned a = 0; a < kAheadSteps; ++a)
 #pragma unroll
             for (unsigned u = 0; u < 8; ++u) ahead[a][u] = wrow[8 * a + u];
     }
     __syncthreads();
-    if constexpr (!Ahead) {   // index key output tid: one 512-term fmaf chain over d ascending; 64 weights loaded ahead per step
+    DS41_CMARK(3U);
+    if constexpr (Fast) {   // the same chain: hardware conversion of finite weights, next step requested ahead
+        const uint4* row = reinterpret_cast<const uint4*>(v.wk + tid * kHeadDim);
+        const float4* lat = reinterpret_cast<const float4*>(latent_s);
+        float acc = 0.0F;
+        uint4 h[8], nh[8];
+#pragma unroll
+        for (unsigned u = 0; u < 8; ++u) nh[u] = row[u];
+#pragma unroll 1
+        for (unsigned n = 0; n < kHeadDim / 64U; ++n) {
+            unsigned special = 0U;
+#pragma unroll
+            for (unsigned u = 0; u < 8; ++u) {
+                h[u] = nh[u];
+                special |= f16x2_special(h[u].x) | f16x2_special(h[u].y) | f16x2_special(h[u].z) | f16x2_special(h[u].w);
+            }
+            if (n + 1U < kHeadDim / 64U) {
+#pragma unroll
+                for (unsigned u = 0; u < 8; ++u) nh[u] = row[8 * (n + 1U) + u];
+            }
+            if (special != 0U) {
+#pragma unroll
+                for (unsigned u = 0; u < 8; ++u) {
+                    const std::uint32_t hw[4] = {h[u].x, h[u].y, h[u].z, h[u].w};
+#pragma unroll
+                    for (unsigned j = 0; j < 8; ++j)
+                        acc = fmaf(f16_to_float(static_cast<std::uint16_t>(hw[j / 2] >> (16U * (j % 2)))), latent_s[64 * n + 8 * u + j], acc);
+                }
+            } else {
+#pragma unroll
+                for (unsigned u = 0; u < 8; ++u) {
+                    const std::uint32_t hw[4] = {h[u].x, h[u].y, h[u].z, h[u].w};
+                    const float4 l0 = lat[16 * n + 2 * u], l1 = lat[16 * n + 2 * u + 1];
+                    const float l[8] = {l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w};
+#pragma unroll
+                    for (unsigned j = 0; j < 8; ++j) acc = fmaf(f16_finite(hw[j / 2], j % 2), l[j], acc);
+                }
+            }
+        }
+        k_s[tid] = acc;
+    } else if constexpr (!Ahead) {   // index key output tid: one 512-term fmaf chain over d ascending; 64 weights loaded ahead per step
         const std::uint16_t* row = v.wk + tid * kHeadDim;
         float acc = 0.0F;
         for (unsigned d0 = 0; d0 < kHeadDim; d0 += 64) {
@@ -187,7 +289,9 @@ __global__ __launch_bounds__(128) void compress_kernel(CompressView v) {
         }
         k_s[tid] = acc;
     }
+    DS41_CMARK(4U);
     __syncthreads();
+    DS41_CMARK(5U);
     if (wave != 0U) return;
     const RopeRow& rope = v.rope[r];
     const std::uint64_t slot = p / v.ratio;
@@ -200,6 +304,7 @@ __global__ __launch_bounds__(128) void compress_kernel(CompressView v) {
     const float rk = 1.0F / sqrtf(wave_sum(ss) / 128.0F + kNormEps);
 #pragma unroll
     for (unsigned o = 0; o < 4; ++o) k[o] = (k[o] * rk) * v.knorm[4 * lane + o];
+    DS41_CMARK(6U);
     if (lane >= 16U) {
         rope_pair(k[0], k[1], rope.c[2 * (lane - 16U)], rope.s[2 * (lane - 16U)], false);
         rope_pair(k[2], k[3], rope.c[2 * (lane - 16U) + 1], rope.s[2 * (lane - 16U) + 1], false);
@@ -211,12 +316,14 @@ __global__ __launch_bounds__(128) void compress_kernel(CompressView v) {
     std::uint8_t* ie = v.idx_cache + slot * kIdxEntryBytes;
     std::uint8_t c[4];
 #pragma unroll
-    for (unsigned o = 0; o < 4; ++o) c[o] = e2m1_encode(clampf(k[o] / s, -6.0F, 6.0F));
+    for (unsigned o = 0; o < 4; ++o) c[o] = Fast ? e2m1_encode_sel(clampf(k[o] / s, -6.0F, 6.0F)) : e2m1_encode(clampf(k[o] / s, -6.0F, 6.0F));
     ie[2 * lane] = static_cast<std::uint8_t>(c[0] | (c[1] << 4U));
     ie[2 * lane + 1] = static_cast<std::uint8_t>(c[2] | (c[3] << 4U));
     if ((lane & 7U) == 0U) ie[64 + lane / 8] = static_cast<std::uint8_t>(e + 127);
+    DS41_CMARK(7U);
     // compressed KV: RoPE the latent, FP4 with an E4M3 scale per lane (16 dims)
     rope512(x, rope, lane, false);
+    DS41_CMARK(8U);
     float am = 0.0F;
 #pragma unroll
     for (unsigned i = 0; i < 16; ++i) am = fmaxf(am, fabsf(x[i]));
@@ -226,10 +333,12 @@ __global__ __launch_bounds__(128) void compress_kernel(CompressView v) {
     std::uint32_t w[2] = {0, 0};
 #pragma unroll
     for (unsigned i = 0; i < 16; ++i)
-        w[i / 8] |= static_cast<std::uint32_t>(e2m1_encode(clampf(x[i] / sv, -6.0F, 6.0F))) << (4U * (i % 8));
+        w[i / 8] |= static_cast<std::uint32_t>(Fast ? e2m1_encode_sel(clampf(x[i] / sv, -6.0F, 6.0F)) : e2m1_encode(clampf(x[i] / sv, -6.0F, 6.0F)))
+                    << (4U * (i % 8));
     std::uint8_t* ke = v.kv_cache + slot * kKvEntryBytes;
     *reinterpret_cast<uint2*>(ke + 8 * lane) = make_uint2(w[0], w[1]);
     ke[256 + lane] = sc;
+    DS41_CMARK(9U);
 }
 
 // 4 E2M1 codes (16 bits: dims 4i..4i+3, low nibble first) -> 4 int8 values (2 x value).
@@ -247,9 +356,9 @@ __device__ __forceinline__ std::uint32_t e2m1x4_to_i8(std::uint32_t x) {
 // (threads tid, tid^1) as packed int8 (2 x value), the block scale 2^e as float, and the head weight / 64.
 struct QPrep { int qv[kIdxHeads][32]; float qs[kIdxHeads][4]; float w[kIdxHeads]; };
 static_assert(sizeof(QPrep) == kIdxPrepBytes);
-__global__ __launch_bounds__(256) void index_qprep_kernel(IndexView v) {
+__device__ __forceinline__ void index_qprep_body(const IndexView& v, const uint3 bid) {
     DS41_TIMED(2U);
-    const unsigned r = blockIdx.x, tid = threadIdx.x, h = tid / 8U, part = tid % 8U;
+    const unsigned r = bid.x, tid = threadIdx.x, h = tid / 8U, part = tid % 8U;
     QPrep& out = reinterpret_cast<QPrep*>(v.qprep)[r];
     float q[16];
 #pragma unroll
@@ -280,11 +389,11 @@ __global__ __launch_bounds__(256) void index_qprep_kernel(IndexView v) {
 // rows' quantised queries are wave-uniform and no global store precedes their reads, so they come in with scalar
 // loads (the dot products take them as scalar operands); scores wait in LDS and are stored after every kMaxRows rows
 // (calls of up to kMaxCallRows rows: the key is still decoded once).
-__global__ __launch_bounds__(256) void index_scores_kernel(IndexView v) {
+__device__ __forceinline__ void index_scores_body(const IndexView& v, const uint3 bid) {
     DS41_TIMED(3U);
     __shared__ float out_s[kMaxRows][256];
     const unsigned tid = threadIdx.x;
-    const std::uint64_t t = static_cast<std::uint64_t>(blockIdx.x) * 256U + tid;
+    const std::uint64_t t = static_cast<std::uint64_t>(bid.x) * 256U + tid;
     if (t >= v.max_count) return;
     const QPrep* prep = static_cast<const QPrep*>(v.qprep);
     const std::uint32_t* e = reinterpret_cast<const std::uint32_t*>(v.idx_cache + t * kIdxEntryBytes);
@@ -422,11 +531,11 @@ __device__ void ordered_select(const std::uint32_t* keys, std::uint32_t n, std::
     }
 }
 
-__global__ __launch_bounds__(kSelThreads) void select_kernel(SelectView v) {
+__device__ __forceinline__ void select_body(const SelectView& v, const uint3 bid) {
     DS41_TIMED(4U);
     __shared__ unsigned hist[kSelWaves][256];
     __shared__ unsigned warp_tot[33];
-    const unsigned r = blockIdx.x;
+    const unsigned r = bid.x;
     const std::uint32_t n = static_cast<std::uint32_t>((v.pos[r] + 1U) / v.ratio);
     const float* scores = v.scores + static_cast<std::size_t>(r) * v.max_count;
     std::uint32_t* keys = v.keys + static_cast<std::size_t>(r) * v.max_count;
@@ -480,12 +589,12 @@ __device__ __forceinline__ SelScratch sel_scratch(const SelectView& v, unsigned 
     std::uint32_t* base = v.keys + static_cast<std::size_t>(r) * v.max_count;
     return {base, base + static_cast<std::size_t>(slices) * v.topk, base + 2 * static_cast<std::size_t>(slices) * v.topk, slices};
 }
-__global__ __launch_bounds__(kSelThreads) void select_slice_kernel(SelectView v) {
+__device__ __forceinline__ void select_slice_body(const SelectView& v, const uint3 bid) {
     DS41_TIMED(4U);
     __shared__ unsigned hist[kSelWaves][256];
     __shared__ unsigned warp_tot[33];
     __shared__ std::uint32_t skeys[kSelSlice];
-    const unsigned s = blockIdx.x, r = blockIdx.y;
+    const unsigned s = bid.x, r = bid.y;
     const std::uint32_t n = static_cast<std::uint32_t>((v.pos[r] + 1U) / v.ratio), t0 = s * kSelSlice;
     if (t0 >= n) return;
     const std::uint32_t m = n - t0 < kSelSlice ? n - t0 : kSelSlice;
@@ -521,14 +630,14 @@ __global__ __launch_bounds__(kSelThreads) void select_slice_kernel(SelectView v)
 }
 // Level two: block 0 of a row selects the top-k among the survivors; block 1 (candidate source only) the candidate
 // blocks among the block maxima.
-__global__ __launch_bounds__(kSelThreads) void select_merge_kernel(SelectView v) {
+__device__ __forceinline__ void select_merge_body(const SelectView& v, const uint3 bid) {
     DS41_TIMED(4U);
     __shared__ unsigned hist[kSelWaves][256];
     __shared__ unsigned warp_tot[33];
-    const unsigned r = blockIdx.y;
+    const unsigned r = bid.y;
     const std::uint32_t n = static_cast<std::uint32_t>((v.pos[r] + 1U) / v.ratio);
     const SelScratch sc = sel_scratch(v, r);
-    if (blockIdx.x == 1U) {
+    if (bid.x == 1U) {
         if (n == 0U) return;
         std::uint8_t* cand = v.candidates + static_cast<std::size_t>(r) * ((v.max_count + v.block_size - 1) / v.block_size);
         const std::uint32_t nb = (n + v.block_size - 1) / v.block_size, ninf_key = order_key(-__builtin_inff());
@@ -749,13 +858,13 @@ __device__ __forceinline__ unsigned visible_keys(const AttentionView& v, unsigne
     return nw + (v.idx_count != nullptr ? v.idx_count[r] : 0U);
 }
 template <unsigned kAttnHpw>
-__global__ __launch_bounds__(kAttnThreads) void attention_chunk_kernel(AttentionView v) {
+__device__ __forceinline__ void attention_chunk_body(const AttentionView& v, const uint3 bid) {
     DS41_TIMED(5U);
     __shared__ float4 ks[kTile][kHeadDim / 4];
     __shared__ std::uint32_t cidx[kChunk];
     __shared__ unsigned last_s;
-    const unsigned c = blockIdx.x, r = blockIdx.z, tid = threadIdx.x, lane = tid & 31U;
-    const unsigned hb = (blockIdx.y * (kAttnThreads / 32U) + (tid >> 5U)) * kAttnHpw;
+    const unsigned c = bid.x, r = bid.z, tid = threadIdx.x, lane = tid & 31U;
+    const unsigned hb = (bid.y * (kAttnThreads / 32U) + (tid >> 5U)) * kAttnHpw;
     unsigned nw;
     const unsigned n = visible_keys(v, r, nw), chunks = (n + kChunk - 1) / kChunk;
     if (c >= chunks) return;
@@ -817,7 +926,7 @@ __global__ __launch_bounds__(kAttnThreads) void attention_chunk_kernel(Attention
     // the last chunk block of this (row, head group) to finish combines its heads
     __threadfence();
     __syncthreads();
-    std::uint32_t* ticket = v.tickets + r * kAttnGroups + blockIdx.y;
+    std::uint32_t* ticket = v.tickets + r * kAttnGroups + bid.y;
     if (tid == 0U) last_s = atomicAdd(ticket, 1U) == chunks - 1U ? 1U : 0U;
     __syncthreads();
     if (last_s == 0U) return;
@@ -827,12 +936,109 @@ __global__ __launch_bounds__(kAttnThreads) void attention_chunk_kernel(Attention
     if (tid == 0U) *ticket = 0U;
     DS41_MARK(11U);
 }
-__global__ __launch_bounds__(32) void attention_combine_kernel(AttentionView v) {
+__device__ __forceinline__ void attention_combine_body(const AttentionView& v, const uint3 bid) {
     DS41_TIMED(6U);
     unsigned nw;
-    const unsigned n = visible_keys(v, blockIdx.y, nw);
-    attention_combine_head(v, blockIdx.y, blockIdx.x, threadIdx.x, (n + kChunk - 1) / kChunk);
+    const unsigned n = visible_keys(v, bid.y, nw);
+    attention_combine_head(v, bid.y, bid.x, threadIdx.x, (n + kChunk - 1) / kChunk);
 }
+
+// ---- kernels: one call (the block's own coordinates), or several segments of one kind in one launch ----
+// A segment launch carries up to kMaxSegments views by value; segment k owns the linear blocks [first[k], first[k+1])
+// and each of them runs exactly the block (x, y, z) of that segment's own grid (gx x gy x gz), so every row's work,
+// arithmetic and order are those of the per-segment call. Segments never share state (each its own request).
+template <class View>
+struct SegmentLaunch {
+    View v[kMaxSegments];
+    unsigned first[kMaxSegments + 1];
+    unsigned gx[kMaxSegments], gy[kMaxSegments];
+    unsigned n;
+};
+template <class View>
+__device__ __forceinline__ uint3 segment_block(const SegmentLaunch<View>& s, unsigned& k) {
+    const unsigned b = blockIdx.x;
+    k = 0;
+    while (k + 1U < s.n && b >= s.first[k + 1U]) ++k;
+    const unsigned l = b - s.first[k], gx = s.gx[k], gy = s.gy[k];
+    return make_uint3(l % gx, (l / gx) % gy, l / (gx * gy));
+}
+__device__ __forceinline__ uint3 own_block() { return make_uint3(blockIdx.x, blockIdx.y, blockIdx.z); }
+
+__global__ __launch_bounds__(32) void window_write_kernel(WindowView v) { window_write_body(v, own_block()); }
+__global__ __launch_bounds__(32) void window_write_seg_kernel(SegmentLaunch<WindowView> s) {
+    unsigned k;
+    const uint3 b = segment_block(s, k);
+    window_write_body(s.v[k], b);
+}
+template <bool Ahead, bool Fast>
+__global__ __launch_bounds__(128) void compress_kernel(CompressView v) { compress_body<Ahead, Fast>(v, own_block()); }
+template <bool Ahead, bool Fast>
+__global__ __launch_bounds__(128) void compress_seg_kernel(SegmentLaunch<CompressView> s) {
+    unsigned k;
+    const uint3 b = segment_block(s, k);
+    compress_body<Ahead, Fast>(s.v[k], b);
+}
+__global__ __launch_bounds__(256) void index_qprep_kernel(IndexView v) { index_qprep_body(v, own_block()); }
+__global__ __launch_bounds__(256) void index_qprep_seg_kernel(SegmentLaunch<IndexView> s) {
+    unsigned k;
+    const uint3 b = segment_block(s, k);
+    index_qprep_body(s.v[k], b);
+}
+__global__ __launch_bounds__(256) void index_scores_kernel(IndexView v) { index_scores_body(v, own_block()); }
+__global__ __launch_bounds__(256) void index_scores_seg_kernel(SegmentLaunch<IndexView> s) {
+    unsigned k;
+    const uint3 b = segment_block(s, k);
+    index_scores_body(s.v[k], b);
+}
+__global__ __launch_bounds__(kSelThreads) void select_kernel(SelectView v) { select_body(v, own_block()); }
+__global__ __launch_bounds__(kSelThreads) void select_seg_kernel(SegmentLaunch<SelectView> s) {
+    unsigned k;
+    const uint3 b = segment_block(s, k);
+    select_body(s.v[k], b);
+}
+__global__ __launch_bounds__(kSelThreads) void select_slice_kernel(SelectView v) { select_slice_body(v, own_block()); }
+__global__ __launch_bounds__(kSelThreads) void select_slice_seg_kernel(SegmentLaunch<SelectView> s) {
+    unsigned k;
+    const uint3 b = segment_block(s, k);
+    select_slice_body(s.v[k], b);
+}
+__global__ __launch_bounds__(kSelThreads) void select_merge_kernel(SelectView v) { select_merge_body(v, own_block()); }
+__global__ __launch_bounds__(kSelThreads) void select_merge_seg_kernel(SegmentLaunch<SelectView> s) {
+    unsigned k;
+    const uint3 b = segment_block(s, k);
+    select_merge_body(s.v[k], b);
+}
+template <unsigned kAttnHpw>
+__global__ __launch_bounds__(kAttnThreads) void attention_chunk_kernel(AttentionView v) { attention_chunk_body<kAttnHpw>(v, own_block()); }
+template <unsigned kAttnHpw>
+__global__ __launch_bounds__(kAttnThreads) void attention_chunk_seg_kernel(SegmentLaunch<AttentionView> s) {
+    unsigned k;
+    const uint3 b = segment_block(s, k);
+    attention_chunk_body<kAttnHpw>(s.v[k], b);
+}
+__global__ __launch_bounds__(32) void attention_combine_kernel(AttentionView v) { attention_combine_body(v, own_block()); }
+__global__ __launch_bounds__(32) void attention_combine_seg_kernel(SegmentLaunch<AttentionView> s) {
+    unsigned k;
+    const uint3 b = segment_block(s, k);
+    attention_combine_body(s.v[k], b);
+}
+
+// Host side: segments of one kind, each with its own grid, flushed as launches of at most kMaxSegments.
+template <class View>
+struct SegmentBatch {
+    SegmentLaunch<View> s{};
+    void add(const View& v, dim3 g) {
+        s.v[s.n] = v;
+        s.gx[s.n] = g.x;
+        s.gy[s.n] = g.y;
+        s.first[s.n + 1U] = s.first[s.n] + g.x * g.y * g.z;
+        ++s.n;
+    }
+    [[nodiscard]] bool full() const noexcept { return s.n == kMaxSegments; }
+    [[nodiscard]] bool empty() const noexcept { return s.n == 0U; }
+    [[nodiscard]] unsigned blocks() const noexcept { return s.first[s.n]; }
+    void clear() { s = SegmentLaunch<View>{}; }
+};
 
 void check(hipError_t e, const char* what) {
     if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
@@ -843,58 +1049,161 @@ void check_rows(std::uint32_t rows) {
 
 }  // namespace
 
-void enqueue_window_write(const WindowView& v, hipStream_t stream) {
+static void check_window(const WindowView& v) {
     check_rows(v.rows);
     if (v.capacity < kWindow + v.rows) throw std::invalid_argument("ds41 window ring capacity");
+}
+void enqueue_window_write(const WindowView& v, hipStream_t stream) {
+    check_window(v);
     hipLaunchKernelGGL(window_write_kernel, dim3(v.rows), dim3(32), 0, stream, v);
     check(hipGetLastError(), "ds41 window write");
 }
 int compress_ahead_mode = -1;  // set_compress_ahead: 0 / 1; -1 = STRIX_DS41_COMPRESS_AHEAD
 void set_compress_ahead(int mode) { compress_ahead_mode = mode; }
-void enqueue_compress(const CompressView& v, hipStream_t stream) {
+int compress_fast_mode = -1;  // set_compress_fast: 0 / 1; -1 = STRIX_DS41_COMPRESS_FAST
+void set_compress_fast(int mode) { compress_fast_mode = mode; }
+static void check_compress(const CompressView& v) {
     check_rows(v.rows);
     if (v.ratio != 1U && v.ratio != 2U) throw std::invalid_argument("ds41 compress ratio");
+}
+// 2 fast, 1 ahead, 0 the default kernel
+static int compress_form() {
     static const bool ahead_env = [] { const char* e = std::getenv("STRIX_DS41_COMPRESS_AHEAD"); return e && e[0] == '1'; }();
-    if (compress_ahead_mode < 0 ? ahead_env : compress_ahead_mode != 0) hipLaunchKernelGGL(compress_kernel<true>, dim3(v.rows), dim3(128), 0, stream, v);
-    else hipLaunchKernelGGL(compress_kernel<false>, dim3(v.rows), dim3(128), 0, stream, v);
+    static const bool fast_env = [] { const char* e = std::getenv("STRIX_DS41_COMPRESS_FAST"); return e && e[0] == '1'; }();
+    if (compress_fast_mode < 0 ? fast_env : compress_fast_mode != 0) return 2;
+    if (compress_ahead_mode < 0 ? ahead_env : compress_ahead_mode != 0) return 1;
+    return 0;
+}
+void enqueue_compress(const CompressView& v, hipStream_t stream) {
+    check_compress(v);
+    const int form = compress_form();
+    if (form == 2) hipLaunchKernelGGL(HIP_KERNEL_NAME(compress_kernel<false, true>), dim3(v.rows), dim3(128), 0, stream, v);
+    else if (form == 1) hipLaunchKernelGGL(HIP_KERNEL_NAME(compress_kernel<true, false>), dim3(v.rows), dim3(128), 0, stream, v);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(compress_kernel<false, false>), dim3(v.rows), dim3(128), 0, stream, v);
     check(hipGetLastError(), "ds41 compress");
+}
+static void check_index(const IndexView& v) {
+    check_rows(v.rows);
+    if (v.qprep == nullptr) throw std::invalid_argument("ds41 index scores: IndexView::qprep scratch (rows x kIdxPrepBytes) is required");
 }
 void enqueue_index_scores(const IndexView& v, hipStream_t stream) {
     check_rows(v.rows);
     if (v.max_count == 0U) return;
-    if (v.qprep == nullptr) throw std::invalid_argument("ds41 index scores: IndexView::qprep scratch (rows x kIdxPrepBytes) is required");
+    check_index(v);
     hipLaunchKernelGGL(index_qprep_kernel, dim3(v.rows), dim3(256), 0, stream, v);
     hipLaunchKernelGGL(index_scores_kernel, dim3((v.max_count + 255U) / 256U), dim3(256), 0, stream, v);
     check(hipGetLastError(), "ds41 index scores");
 }
-void enqueue_select(const SelectView& v, hipStream_t stream) {
+// slices of the two-level selection (0: one block per row)
+static unsigned select_slices(const SelectView& v) {
     check_rows(v.rows);
-    if (v.max_count <= kSelSlice) {
+    if (v.max_count <= kSelSlice) return 0U;
+    const std::size_t slices = (v.max_count + kSelSlice - 1) / kSelSlice;
+    if (2 * slices * v.topk + (v.max_count + v.block_size - 1) / v.block_size > v.max_count)
+        throw std::invalid_argument("ds41 select: top-k or candidate block size too large for the key scratch");
+    return static_cast<unsigned>(slices);
+}
+static dim3 select_merge_grid(const SelectView& v) { return dim3(v.pool == Pool::candidate_source ? 2U : 1U, v.rows); }
+void enqueue_select(const SelectView& v, hipStream_t stream) {
+    const unsigned slices = select_slices(v);
+    if (slices == 0U) {
         hipLaunchKernelGGL(select_kernel, dim3(v.rows), dim3(kSelThreads), 0, stream, v);
     } else {
-        const std::size_t slices = (v.max_count + kSelSlice - 1) / kSelSlice;
-        if (2 * slices * v.topk + (v.max_count + v.block_size - 1) / v.block_size > v.max_count)
-            throw std::invalid_argument("ds41 select: top-k or candidate block size too large for the key scratch");
-        hipLaunchKernelGGL(select_slice_kernel, dim3(static_cast<unsigned>(slices), v.rows), dim3(kSelThreads), 0, stream, v);
-        hipLaunchKernelGGL(select_merge_kernel, dim3(v.pool == Pool::candidate_source ? 2U : 1U, v.rows), dim3(kSelThreads), 0, stream, v);
+        hipLaunchKernelGGL(select_slice_kernel, dim3(slices, v.rows), dim3(kSelThreads), 0, stream, v);
+        hipLaunchKernelGGL(select_merge_kernel, select_merge_grid(v), dim3(kSelThreads), 0, stream, v);
     }
     check(hipGetLastError(), "ds41 select");
 }
-void enqueue_attention(const AttentionView& v, hipStream_t stream) {
+// heads per wave of a call: the most that still gives >= 40 blocks (one per two CUs), else 1
+static unsigned attention_hpw(const AttentionView& v) {
     check_rows(v.rows);
     if (v.capacity < kWindow + v.rows || (v.idx_count != nullptr && v.topk > kTopK))
         throw std::invalid_argument("ds41 attention capacity / topk");
     if (v.heads == 0U || v.heads > kHeads || v.heads % kAttnMinBlockHeads != 0U) throw std::invalid_argument("ds41 attention heads: multiple of 8, at most 64");
-    // the most heads per wave that still gives >= 40 blocks (one per two CUs), else 1
     const auto blocks = [&](unsigned hpw) { return kMaxChunks * (v.heads / (kAttnMinBlockHeads * hpw)) * v.rows; };
     const auto fits = [&](unsigned hpw) { return v.heads % (kAttnMinBlockHeads * hpw) == 0U && blocks(hpw) >= 40U; };
-    const unsigned hpw = fits(4U) ? 4U : fits(2U) ? 2U : 1U;
+    return fits(4U) ? 4U : fits(2U) ? 2U : 1U;
+}
+void enqueue_attention(const AttentionView& v, hipStream_t stream) {
+    const unsigned hpw = attention_hpw(v);
     const dim3 grid(kMaxChunks, v.heads / (kAttnMinBlockHeads * hpw), v.rows);
     if (hpw == 4U) hipLaunchKernelGGL(attention_chunk_kernel<4>, grid, dim3(kAttnThreads), 0, stream, v);
     else if (hpw == 2U) hipLaunchKernelGGL(attention_chunk_kernel<2>, grid, dim3(kAttnThreads), 0, stream, v);
     else hipLaunchKernelGGL(attention_chunk_kernel<1>, grid, dim3(kAttnThreads), 0, stream, v);
     if (v.tickets == nullptr) hipLaunchKernelGGL(attention_combine_kernel, dim3(v.heads, v.rows), dim3(32), 0, stream, v);
     check(hipGetLastError(), "ds41 attention");
+}
+
+// ---- several requests' segments per launch (BatchForward): the per-call checks and grids, flushed at kMaxSegments ----
+namespace {
+template <class View, class Launch>
+void for_segments(std::span<const View> views, Launch&& launch, const auto& grid_of) {
+    SegmentBatch<View> b;
+    for (const auto& v : views) {
+        const dim3 g = grid_of(v);
+        if (g.x * g.y * g.z == 0U) continue;
+        b.add(v, g);
+        if (b.full()) { launch(b); b.clear(); }
+    }
+    if (!b.empty()) launch(b);
+}
+}  // namespace
+
+void enqueue_window_write_segments(std::span<const WindowView> views, hipStream_t stream) {
+    for (const auto& v : views) check_window(v);
+    for_segments(views, [&](const SegmentBatch<WindowView>& b) {
+        hipLaunchKernelGGL(window_write_seg_kernel, dim3(b.blocks()), dim3(32), 0, stream, b.s);
+    }, [](const WindowView& v) { return dim3(v.rows); });
+    check(hipGetLastError(), "ds41 window write (segments)");
+}
+void enqueue_compress_segments(std::span<const CompressView> views, hipStream_t stream) {
+    for (const auto& v : views) check_compress(v);
+    const int form = compress_form();
+    for_segments(views, [&](const SegmentBatch<CompressView>& b) {
+        if (form == 2) hipLaunchKernelGGL(HIP_KERNEL_NAME(compress_seg_kernel<false, true>), dim3(b.blocks()), dim3(128), 0, stream, b.s);
+        else if (form == 1) hipLaunchKernelGGL(HIP_KERNEL_NAME(compress_seg_kernel<true, false>), dim3(b.blocks()), dim3(128), 0, stream, b.s);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(compress_seg_kernel<false, false>), dim3(b.blocks()), dim3(128), 0, stream, b.s);
+    }, [](const CompressView& v) { return dim3(v.rows); });
+    check(hipGetLastError(), "ds41 compress (segments)");
+}
+void enqueue_index_scores_segments(std::span<const IndexView> views, hipStream_t stream) {
+    for (const auto& v : views) if (v.max_count != 0U) check_index(v); else check_rows(v.rows);
+    for_segments(views, [&](const SegmentBatch<IndexView>& b) {
+        hipLaunchKernelGGL(index_qprep_seg_kernel, dim3(b.blocks()), dim3(256), 0, stream, b.s);
+    }, [](const IndexView& v) { return v.max_count == 0U ? dim3(0) : dim3(v.rows); });
+    for_segments(views, [&](const SegmentBatch<IndexView>& b) {
+        hipLaunchKernelGGL(index_scores_seg_kernel, dim3(b.blocks()), dim3(256), 0, stream, b.s);
+    }, [](const IndexView& v) { return dim3((v.max_count + 255U) / 256U); });
+    check(hipGetLastError(), "ds41 index scores (segments)");
+}
+void enqueue_select_segments(std::span<const SelectView> views, hipStream_t stream) {
+    for (const auto& v : views) (void)select_slices(v);
+    for_segments(views, [&](const SegmentBatch<SelectView>& b) {
+        hipLaunchKernelGGL(select_seg_kernel, dim3(b.blocks()), dim3(kSelThreads), 0, stream, b.s);
+    }, [](const SelectView& v) { return select_slices(v) == 0U ? dim3(v.rows) : dim3(0); });
+    for_segments(views, [&](const SegmentBatch<SelectView>& b) {
+        hipLaunchKernelGGL(select_slice_seg_kernel, dim3(b.blocks()), dim3(kSelThreads), 0, stream, b.s);
+    }, [](const SelectView& v) { const unsigned s = select_slices(v); return s == 0U ? dim3(0) : dim3(s, v.rows); });
+    for_segments(views, [&](const SegmentBatch<SelectView>& b) {
+        hipLaunchKernelGGL(select_merge_seg_kernel, dim3(b.blocks()), dim3(kSelThreads), 0, stream, b.s);
+    }, [](const SelectView& v) { return select_slices(v) == 0U ? dim3(0) : select_merge_grid(v); });
+    check(hipGetLastError(), "ds41 select (segments)");
+}
+void enqueue_attention_segments(std::span<const AttentionView> views, hipStream_t stream) {
+    for (const unsigned hpw : {4U, 2U, 1U}) {  // each segment keeps its own heads per wave (its kernel form)
+        const auto grid = [hpw](const AttentionView& v) {
+            return attention_hpw(v) == hpw ? dim3(kMaxChunks, v.heads / (kAttnMinBlockHeads * hpw), v.rows) : dim3(0);
+        };
+        for_segments(views, [&](const SegmentBatch<AttentionView>& b) {
+            if (hpw == 4U) hipLaunchKernelGGL(attention_chunk_seg_kernel<4>, dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
+            else if (hpw == 2U) hipLaunchKernelGGL(attention_chunk_seg_kernel<2>, dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
+            else hipLaunchKernelGGL(attention_chunk_seg_kernel<1>, dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
+        }, grid);
+    }
+    for_segments(views, [&](const SegmentBatch<AttentionView>& b) {
+        hipLaunchKernelGGL(attention_combine_seg_kernel, dim3(b.blocks()), dim3(32), 0, stream, b.s);
+    }, [](const AttentionView& v) { return v.tickets == nullptr ? dim3(v.heads, v.rows) : dim3(0); });
+    check(hipGetLastError(), "ds41 attention (segments)");
 }
 
 }  // namespace strix::ds41::attn::hip

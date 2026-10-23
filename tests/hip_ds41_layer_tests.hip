@@ -8,6 +8,7 @@
 
 #include "strix/deepseek41_model.hpp"
 #include "strix/ds41_engram.hpp"
+#include "strix/ds41_packed.hpp"
 #include "strix/hip_ds41_formats.hpp"
 #include "strix/hip_ds41_layer.hpp"
 
@@ -227,6 +228,33 @@ __global__ void f16_select_kernel(std::uint32_t* out) {
 }
 
 // ---- synthetic --------------------------------------------------------------------------------------
+// Explicit F8 views: do not rely on a model tensor happening to pass the loader's
+// lossless-packing check. Exercise both wave counts, partial output blocks and F16
+// subnormals against the original F16 weights and the serial host operator.
+void f8_rows16(std::mt19937& rng) {
+    for (const std::uint32_t rows : {9U, 16U})
+        for (const auto [width, count] : {std::pair{6144U, 37U}, std::pair{256U, 8193U}}) {
+            std::vector<std::uint16_t> weight(std::size_t{width} * count);
+            for (std::size_t i = 0; i < weight.size(); ++i)
+                weight[i] = to_f16(std::ldexp(static_cast<float>(static_cast<int>(i % 16U) - 8),
+                                             static_cast<int>((i / 32U) % 10U) - 20));
+            const auto packed = pack_f16_as_f8(weight, width);
+            expect(packed.has_value(), "F8 rows16 fixture is losslessly representable");
+            if (!packed) continue;
+            const auto input = random_vector(rng, std::size_t{rows} * width, 1.0F);
+            Device<std::uint8_t> dw(*packed);
+            Device<float> dx(input), out(std::size_t{rows} * count);
+            F16RowsView v;
+            v.weight_f8 = dw.p; v.width = width; v.count = count; v.rows = rows;
+            v.x = dx.p; v.x_stride = width; v.out = out.p; v.out_stride = count;
+            enqueue_f16_rows(v, nullptr);
+            expect(same_bits(out.down(), host_f16(weight, width, count, input, rows)),
+                   "F8 projection equals original F16 operator, rows=" + std::to_string(rows) +
+                       " width=" + std::to_string(width) + " count=" + std::to_string(count));
+        }
+    std::cout << "explicit F8 rows9/16 checked against original F16 operator\n";
+}
+
 void synthetic(std::mt19937& rng) {
     {
         // The select form of the half conversion (the fast site kernel) is f16_to_float bitwise on the device too.
@@ -404,7 +432,7 @@ void synthetic(std::mt19937& rng) {
     }
 
     // Q8_0 x A8 sites: plain, slice, grouped; rows 1..8.
-    for (const std::uint32_t r : {1U, 3U, 8U}) {
+    for (const std::uint32_t r : {1U, 3U, 8U, 9U, 10U, 11U, 12U, 13U, 14U, 15U, 16U}) {
         const std::uint32_t width = 4096, count = 2048, groups = 2;
         const auto w = random_q8(rng, count, width);
         const auto xf = random_vector(rng, std::size_t{r} * groups * width, 1.0F);
@@ -464,7 +492,7 @@ void synthetic(std::mt19937& rng) {
             v.packed = 4;
             std::memcpy(v.table, cb_table.data(), 16);
         };
-        for (const std::uint32_t r : {1U, 2U, 3U, 5U, 8U}) {
+        for (const std::uint32_t r : {1U, 2U, 3U, 5U, 8U, 9U, 12U, 16U}) {
             const std::uint32_t width = 4096, count = 2048, groups = 2;
             const auto [emu, packed] = cb4_pair(count, width);
             const auto xa = host_a8(random_vector(rng, std::size_t{r} * groups * width, 1.0F), r, groups * width);
@@ -510,7 +538,7 @@ void synthetic(std::mt19937& rng) {
                 std::memcpy(p + 18, &high, bits == 5U ? 4U : 8U);
             }
             Device<std::uint8_t> dw(packed);
-            for (const std::uint32_t r : {1U, 3U, 8U}) {
+            for (const std::uint32_t r : {1U, 3U, 8U, 9U, 12U, 16U}) {
                 const auto xa = host_a8(random_vector(rng, std::size_t{r} * groups * width, 1.0F), r, groups * width);
                 DevA8 dx(xa);
                 Device<float> out(std::size_t{r} * count);
@@ -526,7 +554,7 @@ void synthetic(std::mt19937& rng) {
             const std::uint32_t width = 8192, count = 256, half = width / 2;
             const auto [emu, packed] = cb4_pair(count, width);
             Device<std::uint8_t> dw(packed);
-            for (const std::uint32_t many : {1U, 4U, 8U}) {
+            for (const std::uint32_t many : {1U, 4U, 8U, 9U, 12U, 16U}) {
                 const auto xa = host_a8(random_vector(rng, std::size_t{many} * width, 1.0F), many, width);
                 DevA8 dx(xa);
                 std::vector<float> ref(std::size_t{many} * count);
@@ -982,8 +1010,12 @@ int main() {
         return 0;
     }
     std::mt19937 rng(20261019);
-    synthetic(rng);
-    if (const char* path = std::getenv("STRIX_DEEPSEEK41_GGUF")) real_chain(path);
+    if (std::getenv("STRIX_DS41_F8_ROWS16_ONLY")) f8_rows16(rng);
+    else {
+        synthetic(rng);
+        f8_rows16(rng);
+        if (const char* path = std::getenv("STRIX_DEEPSEEK41_GGUF")) real_chain(path);
+    }
     if (failures) {
         std::cerr << failures << " failure(s)\n";
         return 1;

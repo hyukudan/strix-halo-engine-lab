@@ -45,6 +45,33 @@ int main() {
                std::as_bytes(std::span(memory_vector.data(), memory_vector.size())))) ==
                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
            "SHA-256 memory buffer matches known vector");
+    {  // the fast provider (SHA-NI when the CPU has it) gives sha256_bytes' digest at every length around the block edges
+        std::vector<std::byte> data(70000);
+        std::uint32_t x = 12345U;
+        for (auto& b : data) {
+            x = x * 1664525U + 1013904223U;
+            b = static_cast<std::byte>(x >> 24U);
+        }
+        bool same = true;
+        for (std::size_t n = 0; n < 300U; ++n)
+            same = same && strix::sha256_bytes_fast(std::span(data.data(), n)) == strix::sha256_bytes(std::span(data.data(), n));
+        for (const std::size_t n : {1000U, 4095U, 4096U, 65536U, 70000U})
+            same = same && strix::sha256_bytes_fast(std::span(data.data(), n)) == strix::sha256_bytes(std::span(data.data(), n));
+        same = same && strix::sha256_bytes_fast(std::span(data.data() + 1, 777U)) == strix::sha256_bytes(std::span(data.data() + 1, 777U));
+        for (const std::size_t cut : {0U, 1U, 63U, 64U, 65U, 1000U, 69997U}) {  // incremental, split anywhere (cut + 3 <= size)
+            strix::Sha256Fast h;
+            h.update(std::span(data.data(), cut));
+            h.update(std::span(data.data() + cut, 3U));
+            h.update(std::span(data.data() + cut + 3U, data.size() - cut - 3U));
+            same = same && h.finalize() == strix::sha256_bytes(data);
+        }
+        expect(same, "fast SHA-256 provider matches the portable digest");
+        expect(strix::model_content_identity_hex(strix::sha256_bytes_fast(
+                   std::as_bytes(std::span(memory_vector.data(), memory_vector.size())))) ==
+                   "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+               "fast SHA-256 matches the known vector");
+        std::cout << "sha256 fast provider: " << strix::sha256_fast_provider() << '\n';
+    }
     const auto root =
         std::filesystem::temp_directory_path() /
         "strix-model-content-hash-test";

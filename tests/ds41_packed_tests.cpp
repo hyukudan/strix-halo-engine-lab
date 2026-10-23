@@ -11,6 +11,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <immintrin.h>  // _mm_cvtps_ph (F16C)
+#endif
 
 // Packed forms of Q8_0-embeddable weights: choice, both layouts round-trip to the exact Q8_0 blocks, planar plane
 // alignment, products through the decoded blocks equal the Q8_0 products, and rejection of unrepresentable codes.
@@ -121,7 +124,11 @@ int main() try {
                 if ((c & 0x7fU) == 0x7fU) c = 0x80U;  // no NaN; -0 instead
                 const float v = std::ldexp(e4m3_to_float(c), k);
                 // the F16 of an E4M3 value times 2^k (|k| small) is exact: 4 significant bits, in range
+#if defined(_MSC_VER) && !defined(__clang__)
+                const auto h = static_cast<std::uint16_t>(_mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(v), _MM_FROUND_TO_NEAREST_INT), 0));  // F16C, RNE
+#else
                 const auto h = std::bit_cast<std::uint16_t>(static_cast<_Float16>(v));
+#endif
                 f16[b * 32U + j] = h;
             }
         }

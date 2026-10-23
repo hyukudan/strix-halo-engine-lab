@@ -298,6 +298,19 @@ void prefill_profile_contract() {
 }
 
 int main() {
+    const auto compact = DecodeNumericalProfile::dense_trellis_g1_fp32_v1;
+    const auto compact_name = numerical_profile_name(compact);
+    expect(parse_decode_numerical_profile(compact_name) == compact && numerical_profile_dense_a8(compact) &&
+        numerical_profile_hc_splitk(compact) && !numerical_profile_hc_deferred_norm(compact), "compact profile retains its specified parent recipe");
+    const auto parent = DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1;
+    const NumericalProfilePair original_pair{DecodeNumericalProfile::fast_prefill_f16wmma_v1, parent, kFastPrefillAll};
+    const NumericalProfilePair compact_pair{original_pair.prefill, compact, kFastPrefillAll};
+    expect(numerical_profile_pair_admitted(compact_pair) && numerical_profile_pair_identity(compact_pair) != numerical_profile_pair_identity(original_pair) &&
+        numerical_profile_identity(compact) != numerical_profile_identity(parent), "compact recipe cannot alias original profile or cache identities");
+    rejects([] { (void)parse({"decoder", "m", "1", "--dense-trellis-pack=pack.gguf"}); },
+        "the explicit dense trellis numerical profile and its pinned pack are required together");
+    rejects([&] { (void)parse({"decoder", "m", "1", "--numerical-profile", compact_name.data()}); },
+        "the explicit dense trellis numerical profile and its pinned pack are required together");
     prefill_profile_contract();
 #ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
     transposed_island_cli_contract();

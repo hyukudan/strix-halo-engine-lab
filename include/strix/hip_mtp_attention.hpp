@@ -9,7 +9,8 @@ void preflight_hip_mtp_attention(const MtpNativeContext&);
 // key norm/RoPE and BF16 stores for c.position. No query, index selection,
 // attention output, host synchronization or publication. Only that row changes.
 void preflight_hip_mtp_cache_rows(const MtpNativeContext&);
-void launch_hip_mtp_cache_rows(const MtpNativeContext&,void* stream);
+// fast_cache is proposal-only; prompt priming keeps the incumbent Q8 producer.
+void launch_hip_mtp_cache_rows(const MtpNativeContext&,void* stream,bool fast_cache=false);
 void launch_hip_mtp_indexer(const MtpNativeContext&,void* stream);
 void launch_hip_mtp_sparse_attention(const MtpNativeContext&,void* stream);
 // Draft-only: same stages with the Q/K/V and output Q8 projections on the

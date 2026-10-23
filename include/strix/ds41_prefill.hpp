@@ -22,6 +22,14 @@
 
 namespace strix::ds41 {
 
+struct PrefillPass {
+    std::uint32_t begin = 0, rows = 0;
+};
+// Consecutive global positions, bounded row buffers and aligned starts. Rebalance a short final pass so that a
+// decoder suffix can fit entirely in it. The final row count need not be aligned; all preceding counts are.
+[[nodiscard]] std::vector<PrefillPass> plan_prefill_passes(std::uint32_t total, std::uint32_t pass_rows,
+                                                        std::uint32_t alignment, std::uint32_t min_final_rows = 0);
+
 struct PrefillRoutes {
     std::uint32_t rows = 0, top_k = 0, experts = 0, batch_rows = 0;
     std::vector<std::uint32_t> begins;                                 // [experts + 1]

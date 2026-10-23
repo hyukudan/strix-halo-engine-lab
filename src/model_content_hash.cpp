@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <optional>
@@ -14,6 +15,17 @@
 #include <vector>
 #if defined(__linux__)
 #include <sys/stat.h>
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+#define STRIX_SHA_NI 1
+#include <immintrin.h>
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#define STRIX_SHA_NI_TARGET
+#else
+#include <cpuid.h>
+#define STRIX_SHA_NI_TARGET __attribute__((target("sha,sse4.1,ssse3")))
+#endif
 #endif
 #if defined(STRIX_USE_OPENSSL_SHA256)
 #include <openssl/evp.h>
@@ -490,6 +502,146 @@ ModelContentIdentity sha256_bytes(std::span<const std::byte> bytes) {
     Sha256 digest;
     digest.update(reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size());
     return digest.finalize();
+}
+
+// ---- SHA-256 of in-memory bytes on the CPU's SHA extensions (same digest as sha256_bytes) ----
+namespace {
+
+#if defined(STRIX_SHA_NI)
+bool cpu_has_sha_ni() noexcept {
+#if defined(_MSC_VER) && !defined(__clang__)
+    int r[4] = {};
+    __cpuid(r, 0);
+    if (r[0] < 7) return false;
+    __cpuid(r, 1);
+    const bool sse41 = (r[2] & (1 << 19)) != 0, ssse3 = (r[2] & (1 << 9)) != 0;
+    __cpuidex(r, 7, 0);
+    return sse41 && ssse3 && (r[1] & (1 << 29)) != 0;
+#else
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    if (__get_cpuid_max(0, nullptr) < 7U) return false;
+    __get_cpuid(1, &a, &b, &c, &d);
+    const bool sse41 = (c & (1U << 19U)) != 0U, ssse3 = (c & (1U << 9U)) != 0U;
+    __get_cpuid_count(7, 0, &a, &b, &c, &d);
+    return sse41 && ssse3 && (b & (1U << 29U)) != 0U;
+#endif
+}
+
+// `blocks` 64-byte blocks into state (the FIPS 180-4 compression, the rounds on SHA256RNDS2 / MSG1 / MSG2).
+STRIX_SHA_NI_TARGET void sha_ni_blocks(std::uint32_t state[8], const std::uint8_t* data, std::size_t blocks) noexcept {
+    const __m128i bswap = _mm_set_epi64x(0x0c0d0e0f08090a0bLL, 0x0405060700010203LL);
+    __m128i tmp = _mm_loadu_si128(reinterpret_cast<const __m128i*>(state));         // DCBA
+    __m128i s1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(state + 4));      // HGFE
+    tmp = _mm_shuffle_epi32(tmp, 0xB1);                                             // CDAB
+    s1 = _mm_shuffle_epi32(s1, 0x1B);                                               // EFGH
+    __m128i s0 = _mm_alignr_epi8(tmp, s1, 8);                                       // ABEF
+    s1 = _mm_blend_epi16(s1, tmp, 0xF0);                                            // CDGH
+    for (; blocks != 0U; --blocks, data += 64) {
+        const __m128i abef = s0, cdgh = s1;
+        __m128i w[4];
+        for (int g = 0; g < 16; ++g) {
+            __m128i& m = w[g & 3];
+            if (g < 4) {
+                m = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(data + 16 * g)), bswap);
+            } else {
+                // W[t] = sigma1(W[t-2]) + W[t-7] + sigma0(W[t-15]) + W[t-16], four words at a time
+                const __m128i x = _mm_add_epi32(_mm_sha256msg1_epu32(w[g & 3], w[(g + 1) & 3]), _mm_alignr_epi8(w[(g + 3) & 3], w[(g + 2) & 3], 4));
+                m = _mm_sha256msg2_epu32(x, w[(g + 3) & 3]);
+            }
+            __m128i msg = _mm_add_epi32(m, _mm_loadu_si128(reinterpret_cast<const __m128i*>(k.data() + 4 * g)));
+            s1 = _mm_sha256rnds2_epu32(s1, s0, msg);
+            msg = _mm_shuffle_epi32(msg, 0x0E);
+            s0 = _mm_sha256rnds2_epu32(s0, s1, msg);
+        }
+        s0 = _mm_add_epi32(s0, abef);
+        s1 = _mm_add_epi32(s1, cdgh);
+    }
+    tmp = _mm_shuffle_epi32(s0, 0x1B);   // FEBA
+    s1 = _mm_shuffle_epi32(s1, 0xB1);    // DCHG
+    s0 = _mm_blend_epi16(tmp, s1, 0xF0); // DCBA
+    s1 = _mm_alignr_epi8(s1, tmp, 8);    // HGFE
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(state), s0);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(state + 4), s1);
+}
+
+const bool kShaNi = cpu_has_sha_ni();
+#endif
+
+}  // namespace
+
+const char* sha256_fast_provider() noexcept {
+#if defined(STRIX_SHA_NI)
+    if (kShaNi) return "sha-ni";
+#endif
+    return "portable";
+}
+
+struct Sha256Fast::Impl {
+    Sha256 portable;  // without the SHA extensions
+    std::uint32_t state[8] = {0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU, 0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U};
+    std::uint8_t buf[64] = {};
+    std::size_t buf_n = 0;
+    std::uint64_t total = 0;
+    bool done = false;
+};
+Sha256Fast::Sha256Fast() : impl_(new Impl) {}
+Sha256Fast::~Sha256Fast() { delete impl_; }
+void Sha256Fast::update(std::span<const std::byte> bytes) {
+    auto& m = *impl_;
+    if (m.done) throw std::logic_error("SHA-256 update after finalize");
+    const auto* p = reinterpret_cast<const std::uint8_t*>(bytes.data());
+    std::size_t n = bytes.size();
+#if defined(STRIX_SHA_NI)
+    if (kShaNi) {
+        m.total += n;
+        if (m.buf_n != 0U) {
+            const std::size_t take = std::min(n, 64U - m.buf_n);
+            std::memcpy(m.buf + m.buf_n, p, take);
+            m.buf_n += take;
+            p += take;
+            n -= take;
+            if (m.buf_n < 64U) return;
+            sha_ni_blocks(m.state, m.buf, 1);
+            m.buf_n = 0;
+        }
+        if (n >= 64U) {
+            sha_ni_blocks(m.state, p, n / 64U);
+            p += n / 64U * 64U;
+            n %= 64U;
+        }
+        std::memcpy(m.buf, p, n);
+        m.buf_n = n;
+        return;
+    }
+#endif
+    m.portable.update(p, n);
+}
+ModelContentIdentity Sha256Fast::finalize() {
+    auto& m = *impl_;
+    if (m.done) throw std::logic_error("SHA-256 finalize twice");
+    m.done = true;
+#if defined(STRIX_SHA_NI)
+    if (kShaNi) {
+        std::uint8_t tail[128] = {};
+        std::memcpy(tail, m.buf, m.buf_n);
+        tail[m.buf_n] = 0x80U;
+        const std::size_t tail_blocks = m.buf_n + 9U <= 64U ? 1U : 2U;
+        const std::uint64_t bits = m.total * 8U;
+        for (unsigned i = 0; i < 8U; ++i) tail[tail_blocks * 64U - 1U - i] = static_cast<std::uint8_t>(bits >> (8U * i));
+        sha_ni_blocks(m.state, tail, tail_blocks);
+        ModelContentIdentity id;
+        for (std::size_t w = 0; w < 8U; ++w)
+            for (std::size_t b = 0; b < 4U; ++b) id.bytes[w * 4U + b] = static_cast<std::uint8_t>(m.state[w] >> (24U - 8U * b));
+        return id;
+    }
+#endif
+    return m.portable.finalize();
+}
+
+ModelContentIdentity sha256_bytes_fast(std::span<const std::byte> bytes) {
+    Sha256Fast h;
+    h.update(bytes);
+    return h.finalize();
 }
 
 ModelContentIdentity build_model_content_identity(

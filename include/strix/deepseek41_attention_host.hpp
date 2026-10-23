@@ -38,6 +38,11 @@ public:
     [[nodiscard]] const ds41::attn::LayerAttention& role(std::uint32_t layer) const { return roles_.at(layer); }
     // Last top-k of an index source (ascending compressed positions).
     [[nodiscard]] const std::vector<std::uint32_t>& topk(std::uint32_t layer) const;
+    // KV sources: the compressed KV and index-key caches (entries at position / ratio); the candidate source's blocks of
+    // the last row (one byte per block).
+    [[nodiscard]] std::span<const std::uint8_t> kv_cache(std::uint32_t layer) const;
+    [[nodiscard]] std::span<const std::uint8_t> idx_cache(std::uint32_t layer) const;
+    [[nodiscard]] std::span<const std::uint8_t> candidates() const noexcept { return candidates_; }
 
     struct Layer;
 

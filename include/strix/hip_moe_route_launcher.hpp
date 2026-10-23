@@ -74,6 +74,8 @@ void moe_route_known_window_rows_preflight(std::span<const ExecutionDispatchCont
     const HipMoeRouteLauncherConfig& config);
 void moe_route_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipMoeRouteLauncherConfig& config);
+void moe_route_known_window_cohort_launch(std::span<const std::span<const ExecutionDispatchContext>> segments,
+    const HipMoeRouteLauncherConfig& config);
 // Prefill: all T rows of a router step (8-row tiles one stride apart).
 void moe_route_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipMoeRouteLauncherConfig& config);

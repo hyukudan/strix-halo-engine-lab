@@ -2,6 +2,8 @@
 #include "strix/hip_indexed_attention_launcher.hpp"
 #include "hip_q8_rows_gemv.hpp"
 #include "strix/hip_mtp_attention.hpp"
+#include "strix/qpersist.hpp"
+#include "strix/hip_qpersist_diagnostic.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 
@@ -238,6 +240,11 @@ std::uint32_t checked_u32(
 
 void validate_config(
     const HipIndexedAttentionLauncherConfig& config) {
+    if (config.dense_trellis_projections && (!config.dense_a8_projections || config.enable_device_graph_inputs))
+        throw std::invalid_argument("dense trellis QSA requires its eager dense-A8 parent recipe");
+#if !defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    if (config.dense_trellis_projections) throw std::invalid_argument("dense trellis runtime is disabled in this build");
+#endif
     if (const auto error =
             config.model.validate();
         !error.empty()) {
@@ -1877,6 +1884,34 @@ __global__ void attention_output_kernel(const float* q_gate, const std::uint16_t
         attention_heads, kv_heads, head_dim, output, dynamic);
 }
 
+// One workgroup owns a head through softmax and the chronological value chain.
+// The barrier replaces the launch boundary; both incumbent arithmetic bodies,
+// the BF16 probability stores and the slot order remain unchanged.
+template <bool Int8 = false, bool Dense = false>
+__device__ __forceinline__ void attention_tail_body(const float* q_gate, const std::uint16_t* kv_state,
+    const std::uint32_t* selected, float* scores, std::uint32_t selected_count,
+    std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, float* output, GraphSelectionArguments dynamic,
+    std::int8_t* codes = nullptr, float* deltas = nullptr, std::uint32_t row = 0U) {
+    attention_softmax_body(scores, selected_count, maximum_selected, dynamic);
+    __syncthreads();
+    attention_output_body<Int8>(q_gate, kv_state, selected, scores, selected_count, maximum_selected,
+        attention_heads, kv_heads, head_dim, output, dynamic);
+    if constexpr (Dense) if (threadIdx.x < head_dim) {
+        const auto index = static_cast<std::uint64_t>(blockIdx.x) * head_dim + threadIdx.x;
+        q8_rows::dense_a8_quantize_lane(output[index],
+            codes + static_cast<std::uint64_t>(row) * attention_heads * head_dim + index,
+            deltas + (index / 32U) * q8_rows::kDenseA8Rows + row);
+    }
+}
+__global__ void attention_tail_kernel(const float* q_gate, const std::uint16_t* kv_state,
+    const std::uint32_t* selected, float* scores, std::uint32_t selected_count,
+    std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, float* output, GraphSelectionArguments dynamic) {
+    attention_tail_body(q_gate, kv_state, selected, scores, selected_count, maximum_selected,
+        attention_heads, kv_heads, head_dim, output, dynamic);
+}
+
 __global__ void attention_output_int8_kernel(const float* q_gate, const std::uint16_t* kv_state,
     const std::uint32_t* selected, const float* scores, std::uint32_t selected_count,
     std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
@@ -3086,6 +3121,9 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
     const auto prepared = prepare_indexed_attention_launch(context,
         static_cast<const HipIndexedAttentionLauncherConfig*>(user_data));
     const auto& config = *static_cast<const HipIndexedAttentionLauncherConfig*>(user_data);
+#if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    HipDenseTrellisScope arithmetic(config.dense_trellis_projections);
+#endif
     const auto& model = config.model;
     const auto& input = prepared.input; const auto& output = prepared.output;
     const auto& workspace_layout = prepared.workspace_layout; const auto& workspace = prepared.workspace;
@@ -3441,6 +3479,7 @@ __device__ __forceinline__ float qsa_rows_coefficient(unsigned scale, std::int8_
 }
 // index_q, index_k, q, k, v (five segments) from BF16 rows to BF16-rounded FP32.
 template <unsigned Rows> struct QsaInputRowsSite {
+    static constexpr bool dense_trellis_inputs = true;
     using Input = std::uint16_t;
     static constexpr unsigned rows = Rows;
     static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)
@@ -3805,6 +3844,15 @@ __global__ void attention_output_rows_kernel(QsaRowsAttentionViews<Rows> views, 
     const auto r = blockIdx.y;
     attention_output_body<Int8>(views.q_gate[r], kv_state, views.selected[r], views.scores[r], views.count[r],
         maximum_selected, attention_heads, kv_heads, head_dim, views.output[r], GraphSelectionArguments{});
+}
+template <unsigned Rows, bool Int8 = false, bool Dense = false>
+__global__ __launch_bounds__(kThreads) void attention_tail_rows_kernel(QsaRowsAttentionViews<Rows> views,
+    const std::uint16_t* kv_state, std::uint32_t maximum_selected, std::uint32_t attention_heads,
+    std::uint32_t kv_heads, std::uint32_t head_dim, std::int8_t* codes, float* deltas) {
+    const auto r = static_cast<std::uint32_t>(blockIdx.y);
+    attention_tail_body<Int8, Dense>(views.q_gate[r], kv_state, views.selected[r], views.scores[r],
+        views.count[r], maximum_selected, attention_heads, kv_heads, head_dim, views.output[r],
+        GraphSelectionArguments{}, codes, deltas, r);
 }
 // Dense A8 (block = one head, thread = feature, every lane present): attention_output_rows_kernel
 // whose waves also quantize the 32 features they just wrote for the o projection (separate
@@ -4805,8 +4853,12 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             dim3(static_cast<std::uint32_t>(prepare_indexed_attention_score_grid(a.attention_heads, maximum_count)), Rows),
             dim3(kThreads), 0, stream, attention, kv, maximum_selected, a.attention_heads, a.kv_heads, a.head_dim);
         check_hip(hipGetLastError(), "QSA known-window score launch");
-        if (!fast && (subparts & 32U)) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_softmax_rows_kernel<Rows>), dim3(a.attention_heads, Rows), dim3(kThreads), 0,
-            stream, attention, maximum_selected);
+        // Complete BF16 window tails only; cohort and prefill schedules stay separate.
+        const bool fused_tail = Rows <= 8U && qpersist_qsa_tail_enabled() && !Int8 && !fast && !grouped &&
+            !cohort_slot && a.head_dim <= kThreads && (subparts & 96U) == 96U;
+        if (!fused_tail && !fast && (subparts & 32U))
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_softmax_rows_kernel<Rows>), dim3(a.attention_heads, Rows), dim3(kThreads), 0,
+                stream, attention, maximum_selected);
         check_hip(hipGetLastError(), "QSA known-window softmax launch");
         // Dense A8 window with the output projection in this call: the value/gate kernel writes its codes.
         if constexpr (Rows <= 8U) if (config.dense_a8_projections && ((parts & 4U) || cohort_slot) && tensors.out.manifest->ggml_type == 8U) {
@@ -4815,7 +4867,17 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             output_slot = cohort_slot ? q8_rows::DenseA8Slot{cohort_slot->codes + static_cast<std::uint64_t>(cohort_row) * a.attention_width,
                 cohort_slot->deltas + cohort_row} : q8_rows::dense_a8_slot(0U);
         }
-        if (!(subparts & 64U) || fast) {
+        if (fused_tail) {
+            if (output_slot.codes)
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_tail_rows_kernel<Rows, Int8, true>),
+                    dim3(a.attention_heads, Rows), dim3(kThreads), 0, stream, attention, kv, maximum_selected,
+                    a.attention_heads, a.kv_heads, a.head_dim, output_slot.codes, output_slot.deltas);
+            else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_tail_rows_kernel<Rows, Int8>),
+                dim3(a.attention_heads, Rows), dim3(kThreads), 0, stream, attention, kv, maximum_selected,
+                a.attention_heads, a.kv_heads, a.head_dim, nullptr, nullptr);
+            check_hip(hipGetLastError(), "QSA known-window fused softmax/value launch");
+        }
+        if (!(subparts & 64U) || fast || fused_tail) {
         } else if (grouped) {
             if constexpr (Rows > 8U) {
                 // STRIX_QSA_OUTPUT_PREFETCH=0 keeps the 4-slot kernel without value prefetch.
@@ -4937,6 +4999,7 @@ std::string kernel_id(
         (config.qsa_hierarchical_selection ? std::string(qsa_hierarchical_selection_marker) : "") +
         (config.wave8_q8_output ? std::string(q8_projection_organization::qsa_output_wave8_marker) : "") +
         (config.dense_a8_projections ? std::string(q8_projection_organization::dense_a8_marker) : "") +
+        (config.dense_trellis_projections ? ".trellis-g1-fp32-s4-v1" : "") +
         (config.prefetch_q8_input ? std::string(qsa_input_prefetch::kernel_suffix) : "");
 }
 
@@ -4986,6 +5049,7 @@ std::uint64_t implementation_identity(
     if(config.prefetch_q8_input){hash_u64(hash,0x5153415052465631ULL);for(auto layer:config.prefetch_eligible_layers)hash_u64(hash,layer);}
     if(config.wave8_q8_output) hash_u64(hash, 0x5153414f57385631ULL);
     if(config.dense_a8_projections) hash_u64(hash, 0x5153414441385631ULL); // QSADA8V1
+    if(config.dense_trellis_projections) hash_u64(hash, 0x544c473146503453ULL); // TLG1FP4S
     if(config.qsa_hierarchical_selection) hash_u64(hash, 0x515341544f503531ULL);
     if(config.qsa_gqa_heads_per_block != 1) {
         hash_u64(hash, 0x5153414751417631ULL); hash_u64(hash, config.qsa_gqa_heads_per_block);
@@ -5211,6 +5275,9 @@ void indexed_attention_known_prefill_rows_preflight(std::span<const ExecutionDis
 }
 void indexed_attention_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipIndexedAttentionLauncherConfig& config, HipQsaIndexJournal journal) {
+#if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    HipDenseTrellisScope arithmetic(config.dense_trellis_projections);
+#endif
     enqueue_qsa_prefill_rows(prepare_qsa_prefill_rows(rows, config, journal), config);
 }
 
@@ -5221,15 +5288,70 @@ void indexed_attention_known_window_rows_preflight(std::span<const ExecutionDisp
     else if (rows.size() == 8U) static_cast<void>(prepare_qsa_known_rows<8U>(rows, config, journal));
     else throw std::invalid_argument("QSA known-window requires exactly two, four or eight rows");
 }
+// This cache belongs to one eager owner, never to an address-keyed process singleton.
+// The committed prefix is immutable until the owner's explicit discard/reset.
+class HipQsaWindowPool {
+    struct Entry {
+        std::uintptr_t raw = 0, norm = 0;
+        std::uint64_t raw_generation = 0, norm_generation = 0;
+        QsaPrefillPool pool;
+    };
+    std::vector<Entry> entries_;
+    hipStream_t stream_ = nullptr;
+    int device_ = -1;
+public:
+    ~HipQsaWindowPool() {
+        if (entries_.empty()) return;
+        // Every entry's last consumer is ordered on this one owner stream.
+        if (hipStreamSynchronize(stream_) != hipSuccess) std::terminate();
+        for (auto& entry : entries_) if (entry.pool.keys && hipFree(entry.pool.keys) != hipSuccess) std::terminate();
+    }
+    void invalidate() noexcept { for (auto& entry : entries_) entry.pool.valid = 0U; }
+    QsaPrefillPool* get(const PreparedIndexedLaunch& a, std::uint32_t ratio, std::uint64_t position) {
+        int device = -1;
+        check_hip(hipGetDevice(&device), "QSA persistent pool device");
+        const auto stream = hip_execution_stream();
+        if (device_ < 0) { device_ = device; stream_ = stream; }
+        if (device != device_ || stream != stream_) throw std::invalid_argument("QSA persistent pool requires its owner's device/stream");
+        const auto& norm = *a.tensors.index_k_norm.runtime;
+        for (auto& entry : entries_) if (entry.raw == a.raw_state.address) {
+            if (entry.raw_generation != a.raw_state.allocation_generation || entry.norm != norm.address ||
+                entry.norm_generation != norm.allocation_generation)
+                throw std::invalid_argument("QSA persistent pool owner bindings changed");
+            // The previous window may have pooled rejected/padded rows. Never reuse
+            // a block containing a position this window rewrites, including partial tails.
+            entry.pool.valid = std::min(entry.pool.valid, static_cast<std::uint32_t>(position / ratio));
+            return &entry.pool;
+        }
+        const auto tokens = a.raw_state.bytes / (static_cast<std::uint64_t>(a.index_dim) * sizeof(std::uint16_t));
+        const auto blocks = static_cast<std::uint32_t>(std::min<std::uint64_t>(tokens / ratio, UINT32_MAX));
+        if (!blocks || entries_.size() >= 64U) return nullptr;
+        Entry entry;
+        entry.raw = a.raw_state.address; entry.raw_generation = a.raw_state.allocation_generation;
+        entry.norm = norm.address; entry.norm_generation = norm.allocation_generation;
+        entry.pool.capacity = blocks;
+        // Allocate the host slot before taking ownership of a device allocation.
+        entries_.push_back(entry);
+        void* keys = nullptr;
+        check_hip(hipMalloc(&keys, static_cast<std::uint64_t>(blocks) * a.index_dim * sizeof(float)), "QSA persistent pool allocation");
+        entries_.back().pool.keys = static_cast<float*>(keys);
+        return &entries_.back().pool;
+    }
+};
+std::shared_ptr<HipQsaWindowPool> make_hip_qsa_window_pool() { return std::make_shared<HipQsaWindowPool>(); }
+void invalidate_hip_qsa_window_pool(const std::shared_ptr<HipQsaWindowPool>& pool) { if (pool) pool->invalidate(); }
+
 // STRIX_QSA_WINDOW_POOLED=1: verify windows score the indexer blocks as prefill groups do: one
 // block_pool_kernel pass forms every complete block's pooled/normalised/rotated key (the statements
 // of block_score_rows_kernel's pooled part), then block_score_pooled_rows_kernel scores them with the
 // same per-(row, block, head) products and reduction order. Bitwise the same block scores
 // (STRIX_QSA_POOLED_CHECK=1 compares them). The pool is formed again by every call.
 namespace {
-QsaPrefillPool* qsa_window_pool(const PreparedIndexedLaunch& a, std::uint32_t ratio) {
+QsaPrefillPool* qsa_window_pool(const PreparedIndexedLaunch& a, std::uint32_t ratio,
+    const HipIndexedAttentionLauncherConfig& config, std::uint64_t position) {
     static const bool enabled = [] { const char* v = std::getenv("STRIX_QSA_WINDOW_POOLED"); return v && v[0] == '1'; }();
     if (!enabled || a.index_dim != 128U || !ratio) return nullptr;
+    if (config.window_pool) return config.window_pool->get(a, ratio, position);
     static QsaPrefillPool pool;
     const auto tokens = a.raw_state.bytes / (static_cast<std::uint64_t>(a.index_dim) * sizeof(std::uint16_t));
     const auto blocks = static_cast<std::uint32_t>(std::min<std::uint64_t>(tokens / ratio, UINT32_MAX));
@@ -5251,11 +5373,22 @@ template <unsigned Rows>
 void enqueue_qsa_window_rows(std::span<const ExecutionDispatchContext> rows, const HipIndexedAttentionLauncherConfig& config,
     HipQsaIndexJournal journal) {
     const auto prepared = prepare_qsa_known_rows<Rows>(rows, config, journal);
-    enqueue_qsa_known_rows<Rows>(prepared, config, 7U, qsa_window_pool(prepared.row[0], prepared.selection[0].ratio));
+    auto* pool = qsa_window_pool(prepared.row[0], prepared.selection[0].ratio, config, prepared.position[0]);
+    enqueue_qsa_known_rows<Rows>(prepared, config, 7U, pool);
+    // This owner may be idle while serial steps or other owners overwrite its
+    // rejected rows. A later frontier could already be past the stale blocks,
+    // so clamping only on the next call cannot detect them. Retain only blocks
+    // known committed BEFORE this window; rebuild its newly formed blocks
+    // (at most three for the canonical R8 / compress-ratio-four path).
+    if (pool && config.window_pool)
+        pool->valid = std::min(pool->valid, static_cast<std::uint32_t>(prepared.position[0] / prepared.selection[0].ratio));
 }
 } // namespace
 void indexed_attention_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipIndexedAttentionLauncherConfig& config, HipQsaIndexJournal journal) {
+#if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    HipDenseTrellisScope arithmetic(config.dense_trellis_projections);
+#endif
     if (rows.size() == 2U) enqueue_qsa_window_rows<2U>(rows, config, journal);
     else if (rows.size() == 4U) enqueue_qsa_window_rows<4U>(rows, config, journal);
     else if (rows.size() == 8U) enqueue_qsa_window_rows<8U>(rows, config, journal);
@@ -5303,7 +5436,7 @@ QsaCohortPrepared prepare_qsa_cohort(std::span<const HipQsaCohortSegment> segmen
     for (std::size_t s = 0; s < segments.size(); ++s) {
         const auto& c = *segments[s].config;
         const auto& b = std::visit([](const auto& p) -> const PreparedIndexedLaunch& { return p.row[0]; }, out.segments[s]);
-        if (c.dense_a8_projections != c0.dense_a8_projections || c.wave8_q8_output != c0.wave8_q8_output ||
+        if (c.dense_a8_projections != c0.dense_a8_projections || c.dense_trellis_projections != c0.dense_trellis_projections || c.wave8_q8_output != c0.wave8_q8_output ||
             c.prefetch_q8_input != c0.prefetch_q8_input || std::visit([](const auto& p) { return p.prefetch; }, out.segments[s]) != prefetch0 ||
             *segments[s].rows[0].layer != *segments[0].rows[0].layer || b.hidden != a.hidden || b.attention_width != a.attention_width)
             throw std::invalid_argument("QSA cohort window segments differ in layer or arithmetic");
@@ -5371,6 +5504,9 @@ void indexed_attention_known_window_cohort_preflight(std::span<const HipQsaCohor
 void indexed_attention_known_window_cohort_launch(std::span<const HipQsaCohortSegment> segments) {
     const auto prepared = prepare_qsa_cohort(segments);
     const auto& config = *segments[0].config;
+#if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    HipDenseTrellisScope arithmetic(config.dense_trellis_projections);
+#endif
     const auto slot = q8_rows::dense_a8_slot(0U);
     const auto merged = [&](unsigned part) {
         if (prepared.count == 4U) enqueue_qsa_known_rows<4U>(qsa_cohort_rows<4U>(prepared), config, part, nullptr, 0U, &slot);
@@ -6206,6 +6342,37 @@ __global__ void validate_mtp_cache_casts(const float* index,std::uint32_t index_
         if(invalid)atomicOr(status,8U);
     }
 }
+// One block validates the complete small cache row before publishing any byte.
+// Shared admission keeps early exits uniform around the barriers. This
+// folds only validators and casts/stores, with no arithmetic reduction.
+__global__ __launch_bounds__(kThreads) void mtp_cache_publish_kernel(
+    const float* index, std::uint32_t index_dim, const float* key, const float* value,
+    std::uint32_t kv_width, std::uint16_t* raw_state, std::uint16_t* kv_state,
+    std::uint64_t position, std::uint64_t capacity, std::uint32_t* status) {
+    __shared__ bool admitted;
+    if (threadIdx.x == 0U) admitted = atomicAdd(status, 0U) == 0U;
+    __syncthreads();
+    if (!admitted) return;
+    const auto count = index_dim > kv_width ? index_dim : kv_width;
+    for (std::uint32_t i = threadIdx.x; i < count; i += kThreads) {
+        bool invalid = false;
+        if (i < index_dim) invalid = !isfinite(index[i]) || (float_to_bf16(index[i]) & 0x7f80U) == 0x7f80U;
+        if (i < kv_width) invalid = invalid || !isfinite(key[i]) || !isfinite(value[i]) ||
+            (float_to_bf16(key[i]) & 0x7f80U) == 0x7f80U || (float_to_bf16(value[i]) & 0x7f80U) == 0x7f80U;
+        if (invalid) atomicOr(status, 8U);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0U) admitted = atomicAdd(status, 0U) == 0U && position < capacity;
+    __syncthreads();
+    if (!admitted) return;
+    for (std::uint32_t i = threadIdx.x; i < index_dim; i += kThreads)
+        raw_state[position * index_dim + i] = float_to_bf16(index[i]);
+    const auto row = position * static_cast<std::uint64_t>(kv_width) * 2ULL;
+    for (std::uint32_t i = threadIdx.x; i < kv_width; i += kThreads) {
+        kv_state[row + i] = float_to_bf16(key[i]);
+        kv_state[row + kv_width + i] = float_to_bf16(value[i]);
+    }
+}
 struct MtpAttentionPrepared {
     MtpDeviceView input,output,work,kv,index,status;
     WorkspacePointers workspace;
@@ -6295,16 +6462,31 @@ void mtp_attention_finite(const MtpAttentionPrepared& p,const float* values,std:
 }
 void preflight_hip_mtp_attention(const MtpNativeContext& c) {(void)prepare_mtp_attention(c);}
 void preflight_hip_mtp_cache_rows(const MtpNativeContext& c) {(void)prepare_mtp_attention(c);}
-void launch_hip_mtp_cache_rows(const MtpNativeContext& c,void* raw_stream) {
+void launch_hip_mtp_cache_rows(const MtpNativeContext& c,void* raw_stream,bool fast_cache) {
     const auto p=prepare_mtp_attention(c);require_mtp_attention_stream(c,raw_stream);
     const auto stream=static_cast<hipStream_t>(raw_stream);const auto& m=*c.model;const auto& w=p.workspace;
     // The original indexer stores the unnormalised BF16-rounded key. Pooled
     // index-key norm/RoPE is applied later by block_score_kernel, never here.
     mtp_project<WeightKind::bf16>(p.input,p.tensors.index_k,p.hidden,p.index_dim,w.current_index_key,stream);
-    mtp_project<WeightKind::q8_0>(p.input,p.tensors.k,p.hidden,p.kv_width,w.current_k,stream);
-    mtp_project<WeightKind::q8_0>(p.input,p.tensors.v,p.hidden,p.kv_width,w.current_v,stream);
+    if(fast_cache) {
+        launch_hip_mtp_draft_q8_gemv(reinterpret_cast<const void*>(p.input.address),true,
+            reinterpret_cast<const void*>(p.tensors.k.runtime->address),p.hidden,p.kv_width,w.current_k,false,stream);
+        launch_hip_mtp_draft_q8_gemv(reinterpret_cast<const void*>(p.input.address),true,
+            reinterpret_cast<const void*>(p.tensors.v.runtime->address),p.hidden,p.kv_width,w.current_v,false,stream);
+    } else {
+        mtp_project<WeightKind::q8_0>(p.input,p.tensors.k,p.hidden,p.kv_width,w.current_k,stream);
+        mtp_project<WeightKind::q8_0>(p.input,p.tensors.v,p.hidden,p.kv_width,w.current_v,stream);
+    }
     launch_norm_rope_typed<SmallWeightKind::f32>(w.current_k,p.kv_heads,p.dim,p.dim,*p.tensors.k_norm.runtime,m,c.position,{},stream);
     auto* status=reinterpret_cast<std::uint32_t*>(p.status.address);
+    if (qpersist_mtp_cache_enabled()) {
+        hipLaunchKernelGGL(mtp_cache_publish_kernel, dim3(1), dim3(kThreads), 0, stream,
+            w.current_index_key, p.index_dim, w.current_k, w.current_v, p.kv_width,
+            reinterpret_cast<std::uint16_t*>(p.index.address), reinterpret_cast<std::uint16_t*>(p.kv.address),
+            c.position, c.resources->context_capacity(), status);
+        check_hip(hipGetLastError(), "MTP fused teacher cache publish enqueue");
+        return;
+    }
     hipLaunchKernelGGL(validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,
         w.current_index_key,p.index_dim,w.current_k,w.current_v,p.kv_width,status);
     check_hip(hipGetLastError(),"MTP teacher cache-cast validation enqueue");
@@ -6323,15 +6505,24 @@ void launch_hip_mtp_indexer(const MtpNativeContext& c,void* raw_stream) {
     mtp_project<WeightKind::bf16>(p.input,p.tensors.index_k,p.hidden,p.index_dim,w.current_index_key,stream);
     launch_norm_rope_typed<SmallWeightKind::f32>(w.index_query,checked_u32(m.indexer_n_heads,"MTP index heads"),p.index_dim,p.index_dim,
         *p.tensors.index_q_norm.runtime,m,c.position,{},stream);
-    mtp_attention_finite(p,w.index_query,p.index_width,stream);mtp_attention_finite(p,w.current_index_key,p.index_dim,stream);
+    mtp_attention_finite(p,w.index_query,p.index_width,stream);
     auto* cache_status=reinterpret_cast<std::uint32_t*>(p.status.address);
-    hipLaunchKernelGGL(validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,
-        w.current_index_key,p.index_dim,static_cast<const float*>(nullptr),static_cast<const float*>(nullptr),0U,cache_status);
-    check_hip(hipGetLastError(),"MTP full raw-index cache-cast validation enqueue");
-    const GraphPositionKernelArguments guarded_cache{nullptr,c.resources->context_capacity(),cache_status};
-    hipLaunchKernelGGL(store_raw_index_key_kernel,dim3((p.index_dim+kThreads-1U)/kThreads),dim3(kThreads),0,stream,
-        w.current_index_key,reinterpret_cast<std::uint16_t*>(p.index.address),p.index_dim,c.position,guarded_cache);
-    check_hip(hipGetLastError(),"MTP raw index store enqueue");
+    if (qpersist_mtp_cache_enabled()) {
+        hipLaunchKernelGGL(mtp_cache_publish_kernel, dim3(1), dim3(kThreads), 0, stream,
+            w.current_index_key, p.index_dim, nullptr, nullptr, 0U,
+            reinterpret_cast<std::uint16_t*>(p.index.address), nullptr,
+            c.position, c.resources->context_capacity(), cache_status);
+        check_hip(hipGetLastError(), "MTP fused raw index publish enqueue");
+    } else {
+        mtp_attention_finite(p,w.current_index_key,p.index_dim,stream);
+        hipLaunchKernelGGL(validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,
+            w.current_index_key,p.index_dim,static_cast<const float*>(nullptr),static_cast<const float*>(nullptr),0U,cache_status);
+        check_hip(hipGetLastError(),"MTP full raw-index cache-cast validation enqueue");
+        const GraphPositionKernelArguments guarded_cache{nullptr,c.resources->context_capacity(),cache_status};
+        hipLaunchKernelGGL(store_raw_index_key_kernel,dim3((p.index_dim+kThreads-1U)/kThreads),dim3(kThreads),0,stream,
+            w.current_index_key,reinterpret_cast<std::uint16_t*>(p.index.address),p.index_dim,c.position,guarded_cache);
+        check_hip(hipGetLastError(),"MTP raw index store enqueue");
+    }
     const GraphSelectionArguments selection{{},p.ratio,p.topk};
     if(p.blocks<=p.topk) {
         hipLaunchKernelGGL(fill_visible_indices_kernel,dim3((p.visible+kThreads-1U)/kThreads),dim3(kThreads),0,stream,w.selected_indices,p.visible);
@@ -6375,28 +6566,57 @@ void mtp_sparse_attention(const MtpNativeContext& c,void* raw_stream,bool draft)
     project(p.tensors.v,p.kv_width,w.current_v,true);
     launch_norm_rope_typed<SmallWeightKind::f32>(w.q_gate,p.heads,p.dim,p.dim*2U,*p.tensors.q_norm.runtime,m,c.position,{},stream);
     launch_norm_rope_typed<SmallWeightKind::f32>(w.current_k,p.kv_heads,p.dim,p.dim,*p.tensors.k_norm.runtime,m,c.position,{},stream);
-    mtp_attention_finite(p,w.q_gate,p.q_width,stream);mtp_attention_finite(p,w.current_k,p.kv_width,stream,unordered);
-    mtp_attention_finite(p,w.current_v,p.kv_width,stream,unordered);
+    mtp_attention_finite(p,w.q_gate,p.q_width,stream);
     auto* cache_status=reinterpret_cast<std::uint32_t*>(p.status.address);
-    if(unordered) hipExtLaunchKernelGGL(validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,nullptr,nullptr,hipExtAnyOrderLaunch,
-        static_cast<const float*>(nullptr),0U,w.current_k,w.current_v,p.kv_width,cache_status);
-    else hipLaunchKernelGGL(validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,
-        static_cast<const float*>(nullptr),0U,w.current_k,w.current_v,p.kv_width,cache_status);
-    check_hip(hipGetLastError(),"MTP full KV cache-cast validation enqueue");
-    const GraphPositionKernelArguments guarded_cache{nullptr,c.resources->context_capacity(),cache_status};
-    hipLaunchKernelGGL(store_kv_kernel,dim3((p.kv_width+kThreads-1U)/kThreads),dim3(kThreads),0,stream,w.current_k,w.current_v,
-        reinterpret_cast<std::uint16_t*>(p.kv.address),p.kv_width,c.position,guarded_cache);
-    check_hip(hipGetLastError(),"MTP KV store enqueue");
+    if (qpersist_mtp_cache_enabled()) {
+        hipLaunchKernelGGL(mtp_cache_publish_kernel, dim3(1), dim3(kThreads), 0, stream,
+            nullptr, 0U, w.current_k, w.current_v, p.kv_width, nullptr,
+            reinterpret_cast<std::uint16_t*>(p.kv.address), c.position, c.resources->context_capacity(), cache_status);
+        check_hip(hipGetLastError(), "MTP fused KV publish enqueue");
+    } else {
+        mtp_attention_finite(p,w.current_k,p.kv_width,stream,unordered);
+        mtp_attention_finite(p,w.current_v,p.kv_width,stream,unordered);
+        if(unordered) hipExtLaunchKernelGGL(validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,nullptr,nullptr,hipExtAnyOrderLaunch,
+            static_cast<const float*>(nullptr),0U,w.current_k,w.current_v,p.kv_width,cache_status);
+        else hipLaunchKernelGGL(validate_mtp_cache_casts,dim3(1),dim3(kThreads),0,stream,
+            static_cast<const float*>(nullptr),0U,w.current_k,w.current_v,p.kv_width,cache_status);
+        check_hip(hipGetLastError(),"MTP full KV cache-cast validation enqueue");
+        const GraphPositionKernelArguments guarded_cache{nullptr,c.resources->context_capacity(),cache_status};
+        hipLaunchKernelGGL(store_kv_kernel,dim3((p.kv_width+kThreads-1U)/kThreads),dim3(kThreads),0,stream,w.current_k,w.current_v,
+            reinterpret_cast<std::uint16_t*>(p.kv.address),p.kv_width,c.position,guarded_cache);
+        check_hip(hipGetLastError(),"MTP KV store enqueue");
+    }
     const GraphSelectionArguments selection{{},p.ratio,p.topk};
-    hipLaunchKernelGGL(attention_score_kernel,dim3(checked_u32(static_cast<std::uint64_t>(p.heads)*p.selected,"MTP attention score grid")),
+    if (qpersist_draft_score_enabled() && p.dim <= kThreads) {
+        // The draft formerly used one 256-thread block for every head/slot.
+        // Use the incumbent window tree: eight waves/block, four slots/wave,
+        // with query features held across slots. No split or reassociated dot.
+        QsaRowsAttentionViews<1U> attention{};
+        attention.q_gate[0] = w.q_gate; attention.selected[0] = w.selected_indices;
+        attention.scores[0] = w.attention_scores; attention.count[0] = p.selected;
+        const auto groups = (p.selected + 3U) / 4U;
+        const auto waves = static_cast<std::uint64_t>(p.heads) * groups;
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_wave_kernel<1U, 4U>),
+            dim3(checked_u32((waves + 7U) / 8U, "MTP tiled score grid")), dim3(kThreads), 0, stream,
+            attention, reinterpret_cast<const std::uint16_t*>(p.kv.address), p.maximum_selected,
+            p.heads, p.kv_heads, p.dim, p.selected);
+    } else hipLaunchKernelGGL(attention_score_kernel,dim3(checked_u32(static_cast<std::uint64_t>(p.heads)*p.selected,"MTP attention score grid")),
         dim3(kThreads),0,stream,w.q_gate,reinterpret_cast<const std::uint16_t*>(p.kv.address),w.selected_indices,p.selected,p.maximum_selected,
         p.heads,p.kv_heads,p.dim,w.attention_scores,selection);
     check_hip(hipGetLastError(),"MTP attention scores enqueue");
-    hipLaunchKernelGGL(attention_softmax_kernel,dim3(p.heads),dim3(kThreads),0,stream,w.attention_scores,p.selected,p.maximum_selected,selection);
-    check_hip(hipGetLastError(),"MTP attention softmax enqueue");
-    hipLaunchKernelGGL(attention_output_kernel,dim3(p.heads),dim3(p.dim),0,stream,w.q_gate,reinterpret_cast<const std::uint16_t*>(p.kv.address),
-        w.selected_indices,w.attention_scores,p.selected,p.maximum_selected,p.heads,p.kv_heads,p.dim,w.attention_output,selection);
-    check_hip(hipGetLastError(),"MTP attention value enqueue");
+    if (qpersist_qsa_tail_enabled() && p.dim <= kThreads) {
+        hipLaunchKernelGGL(attention_tail_kernel, dim3(p.heads), dim3(kThreads), 0, stream,
+            w.q_gate, reinterpret_cast<const std::uint16_t*>(p.kv.address), w.selected_indices,
+            w.attention_scores, p.selected, p.maximum_selected, p.heads, p.kv_heads, p.dim,
+            w.attention_output, selection);
+        check_hip(hipGetLastError(), "MTP fused attention tail enqueue");
+    } else {
+        hipLaunchKernelGGL(attention_softmax_kernel,dim3(p.heads),dim3(kThreads),0,stream,w.attention_scores,p.selected,p.maximum_selected,selection);
+        check_hip(hipGetLastError(),"MTP attention softmax enqueue");
+        hipLaunchKernelGGL(attention_output_kernel,dim3(p.heads),dim3(p.dim),0,stream,w.q_gate,reinterpret_cast<const std::uint16_t*>(p.kv.address),
+            w.selected_indices,w.attention_scores,p.selected,p.maximum_selected,p.heads,p.kv_heads,p.dim,w.attention_output,selection);
+        check_hip(hipGetLastError(),"MTP attention value enqueue");
+    }
     mtp_attention_finite(p,w.attention_output,p.attention_width,stream);
     if(draft) {
         launch_hip_mtp_draft_q8_gemv(w.attention_output,false,reinterpret_cast<const void*>(p.tensors.out.runtime->address),
@@ -6412,3 +6632,100 @@ void mtp_sparse_attention(const MtpNativeContext& c,void* raw_stream,bool draft)
 void launch_hip_mtp_sparse_attention(const MtpNativeContext& c,void* stream) {mtp_sparse_attention(c,stream,false);}
 void launch_hip_mtp_sparse_attention_draft(const MtpNativeContext& c,void* stream) {mtp_sparse_attention(c,stream,true);}
 } // namespace strix
+
+#if defined(STRIX_BUILD_QPERSIST_DIAGNOSTIC)
+namespace strix::qpersist_diagnostic {
+namespace {
+void require_stream(hipStream_t stream) {
+    if (!stream || stream == hipStreamPerThread || stream == hipStreamLegacy)
+        throw std::invalid_argument("qpersist diagnostic requires an owned stream");
+}
+void validate(const Attention& a, hipStream_t stream) {
+    require_stream(stream);
+    if ((a.rows.size() != 1U && a.rows.size() != 2U && a.rows.size() != 4U && a.rows.size() != 8U) ||
+        !a.kv || !a.heads || a.heads > 64U || !a.kv_heads || a.heads % a.kv_heads ||
+        (a.dim != 128U && a.dim != 256U) || !a.maximum || a.maximum > 2051U ||
+        (a.codes == nullptr) != (a.deltas == nullptr))
+        throw std::invalid_argument("qpersist diagnostic attention shape is not admitted");
+    for (const auto& row : a.rows)
+        if (!row.query || !row.selected || !row.scores || !row.output || !row.count || row.count > a.maximum)
+            throw std::invalid_argument("qpersist diagnostic attention row is not admitted");
+}
+template <unsigned Rows> QsaRowsAttentionViews<Rows> views(const Attention& a) {
+    QsaRowsAttentionViews<Rows> v{};
+    for (unsigned r = 0; r < Rows; ++r) {
+        v.q_gate[r] = a.rows[r].query; v.selected[r] = a.rows[r].selected;
+        v.scores[r] = a.rows[r].scores; v.output[r] = a.rows[r].output; v.count[r] = a.rows[r].count;
+    }
+    return v;
+}
+template <unsigned Rows> void scores(const Attention& a, bool tiled, hipStream_t stream) {
+    const auto v = views<Rows>(a);
+    std::uint32_t count = 0;
+    for (const auto& row : a.rows) count = std::max(count, row.count);
+    if (tiled) {
+        const auto waves = static_cast<std::uint64_t>(Rows) * a.heads * ((count + 3U) / 4U);
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_wave_kernel<Rows, 4U>),
+            dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)), dim3(kThreads), 0, stream,
+            v, a.kv, a.maximum, a.heads, a.kv_heads, a.dim, count);
+    } else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_score_rows_kernel<Rows>),
+        dim3(a.heads * count, Rows), dim3(kThreads), 0, stream,
+        v, a.kv, a.maximum, a.heads, a.kv_heads, a.dim);
+}
+template <unsigned Rows> void tail(const Attention& a, bool fused, hipStream_t stream) {
+    const auto v = views<Rows>(a);
+    if (fused) {
+        if (a.codes) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_tail_rows_kernel<Rows, false, true>),
+            dim3(a.heads, Rows), dim3(kThreads), 0, stream, v, a.kv, a.maximum, a.heads, a.kv_heads, a.dim, a.codes, a.deltas);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_tail_rows_kernel<Rows>),
+            dim3(a.heads, Rows), dim3(kThreads), 0, stream, v, a.kv, a.maximum, a.heads, a.kv_heads, a.dim, nullptr, nullptr);
+    } else {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_softmax_rows_kernel<Rows>), dim3(a.heads, Rows), dim3(kThreads), 0,
+            stream, v, a.maximum);
+        if (a.codes) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_dense_a8_kernel<Rows>),
+            dim3(a.heads, Rows), dim3(a.dim), 0, stream, v, a.kv, a.maximum, a.heads, a.kv_heads, a.dim, a.codes, a.deltas);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_kernel<Rows>),
+            dim3(a.heads, Rows), dim3(a.dim), 0, stream, v, a.kv, a.maximum, a.heads, a.kv_heads, a.dim);
+    }
+}
+}
+void enqueue_scores(const Attention& a, bool tiled, hipStream_t stream) {
+    validate(a, stream);
+    switch (a.rows.size()) {
+    case 1U: scores<1U>(a, tiled, stream); break;
+    case 2U: scores<2U>(a, tiled, stream); break;
+    case 4U: scores<4U>(a, tiled, stream); break;
+    default: scores<8U>(a, tiled, stream); break;
+    }
+    check_hip(hipGetLastError(), "qpersist diagnostic scores");
+}
+void enqueue_tail(const Attention& a, bool fused, hipStream_t stream) {
+    validate(a, stream);
+    switch (a.rows.size()) {
+    case 1U: tail<1U>(a, fused, stream); break;
+    case 2U: tail<2U>(a, fused, stream); break;
+    case 4U: tail<4U>(a, fused, stream); break;
+    default: tail<8U>(a, fused, stream); break;
+    }
+    check_hip(hipGetLastError(), "qpersist diagnostic tail");
+}
+void enqueue_cache(const Cache& c, bool fused, hipStream_t stream) {
+    require_stream(stream);
+    if (!c.status || !c.capacity || (!c.index_dim && !c.kv_width) || c.index_dim > 256U || c.kv_width > 8192U ||
+        (c.index_dim && (!c.index || !c.raw_state)) || (c.kv_width && (!c.key || !c.value || !c.kv_state)))
+        throw std::invalid_argument("qpersist diagnostic cache shape is not admitted");
+    if (fused) hipLaunchKernelGGL(mtp_cache_publish_kernel, dim3(1), dim3(kThreads), 0, stream,
+        c.index, c.index_dim, c.key, c.value, c.kv_width, c.raw_state, c.kv_state, c.position, c.capacity, c.status);
+    else {
+        hipLaunchKernelGGL(validate_mtp_cache_casts, dim3(1), dim3(kThreads), 0, stream,
+            c.index, c.index_dim, c.key, c.value, c.kv_width, c.status);
+        const GraphPositionKernelArguments guarded{nullptr, c.capacity, c.status};
+        if (c.index_dim) hipLaunchKernelGGL(store_raw_index_key_kernel, dim3((c.index_dim + kThreads - 1U) / kThreads),
+            dim3(kThreads), 0, stream, c.index, c.raw_state, c.index_dim, c.position, guarded);
+        if (c.kv_width) hipLaunchKernelGGL(store_kv_kernel, dim3((c.kv_width + kThreads - 1U) / kThreads),
+            dim3(kThreads), 0, stream, c.key, c.value, c.kv_state, c.kv_width, c.position, guarded);
+    }
+    check_hip(hipGetLastError(), "qpersist diagnostic cache");
+}
+} // namespace strix::qpersist_diagnostic
+#endif // STRIX_BUILD_QPERSIST_DIAGNOSTIC

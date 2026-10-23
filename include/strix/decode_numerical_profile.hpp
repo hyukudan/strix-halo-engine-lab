@@ -26,7 +26,10 @@ enum class DecodeNumericalProfile {
     // hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1 whose prompt launches run FP16 WMMA
     // arithmetic in the components of NumericalProfilePair::fast_components (prefill HC projections,
     // dense projections of 32..256 rows, routed MoE). Launches outside those keep the sibling's arithmetic.
-    fast_prefill_f16wmma_v1
+    fast_prefill_f16wmma_v1,
+    // Pinned selected dense K5 assets in R1/R2/R4/R8 projections only. Wide
+    // prompt blocks retain their named prefill recipe. Experimental, not qualified.
+    dense_trellis_g1_fp32_v1
 };
 
 inline constexpr std::string_view numerical_profile_name(DecodeNumericalProfile value) {
@@ -45,6 +48,8 @@ inline constexpr std::string_view numerical_profile_name(DecodeNumericalProfile 
     case DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1:
         return "hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1";
     case DecodeNumericalProfile::fast_prefill_f16wmma_v1: return "fast-prefill-f16wmma-v1";
+    case DecodeNumericalProfile::dense_trellis_g1_fp32_v1:
+        return "hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-trellis-g1-fp32-s4-v1";
     }
     return {};
 }
@@ -58,13 +63,16 @@ inline constexpr std::optional<DecodeNumericalProfile> parse_decode_numerical_pr
              DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_v1,
              DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1,
              DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1,
-             DecodeNumericalProfile::fast_prefill_f16wmma_v1})
+             DecodeNumericalProfile::fast_prefill_f16wmma_v1, DecodeNumericalProfile::dense_trellis_g1_fp32_v1})
         if (numerical_profile_name(value) == name) return value;
     return std::nullopt;
 }
 
 inline constexpr bool numerical_profile_fast_prefill(DecodeNumericalProfile value) {
     return value == DecodeNumericalProfile::fast_prefill_f16wmma_v1;
+}
+inline constexpr bool numerical_profile_dense_trellis(DecodeNumericalProfile value) {
+    return value == DecodeNumericalProfile::dense_trellis_g1_fp32_v1;
 }
 // The decode profile a fast prefill profile is paired with (its kernel plan and fallback arithmetic).
 inline constexpr std::optional<DecodeNumericalProfile> numerical_profile_fast_prefill_decode(DecodeNumericalProfile value) {
@@ -76,7 +84,7 @@ inline constexpr std::optional<DecodeNumericalProfile> numerical_profile_fast_pr
 inline constexpr bool numerical_profile_dense_a8(DecodeNumericalProfile value) {
     return value == DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1 ||
         value == DecodeNumericalProfile::hc_deferred_norm_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1 ||
-        numerical_profile_fast_prefill(value);
+        numerical_profile_fast_prefill(value) || numerical_profile_dense_trellis(value);
 }
 inline constexpr bool numerical_profile_q5k_a8_gateup(DecodeNumericalProfile value) {
     return value == DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_v1 ||
@@ -159,7 +167,8 @@ struct NumericalProfilePair {
 inline constexpr bool numerical_profile_pair_admitted(NumericalProfilePair pair) {
     if (numerical_profile_fast_prefill(pair.decode)) return false;
     if (numerical_profile_fast_prefill(pair.prefill))
-        return numerical_profile_fast_prefill_decode(pair.prefill) == pair.decode && pair.fast_components != 0U &&
+        return numerical_profile_fast_prefill_decode(pair.prefill) == (numerical_profile_dense_trellis(pair.decode)
+                ? DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1 : pair.decode) && pair.fast_components != 0U &&
             (pair.fast_components & ~kFastPrefillKnown) == 0U &&
             (pair.fast_components & (kFastPrefillDense | kFastPrefillDense8)) != (kFastPrefillDense | kFastPrefillDense8);
     return pair.fast_components == 0U && (!pair.split() || numerical_profile_dense_a8_sibling(pair.decode) == pair.prefill);

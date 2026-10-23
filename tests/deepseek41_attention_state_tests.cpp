@@ -3,8 +3,11 @@
 #include "strix/ds41_attention.hpp"
 
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <vector>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -57,6 +60,48 @@ strix::deepseek41::AttentionState random_state(std::uint32_t position, std::mt19
     return s;
 }
 
+// The bytes of serialize_attention_state(s) built in place: plan the frame from the pieces' sizes, copy each piece to
+// its offset, write the frame, seal (as a device capture does into its pinned buffer).
+std::vector<std::uint8_t> in_place(const strix::deepseek41::AttentionState& s, unsigned threads, std::uint64_t& digest) {
+    namespace ds = strix::deepseek41;
+    ds::AttentionFrame f;
+    f.position = s.position;
+    f.next_token = s.next_token;
+    f.token_count = s.tokens.size();
+    for (const auto& L : s.layers) {
+        ds::AttentionFrameLayer F;
+        F.owns_kv = L.owns_kv;
+        F.owns_index = L.owns_index;
+        F.carry_valid = L.carry_valid;
+        F.topk_known = L.topk_known;
+        F.ratio = L.ratio;
+        F.ring_bytes = L.ring.size();
+        F.kv_bytes = L.kv.size();
+        F.idx_bytes = L.idx_keys.size();
+        F.carry_floats = L.carry.size();
+        F.topk_count = L.topk.size();
+        f.layers.push_back(F);
+    }
+    ds::plan_attention_frame(f);
+    std::vector<std::uint8_t> out(f.total + 5U, 0xA5U);  // a larger buffer (a reused pinned one): only [0, total) is the state
+    for (std::size_t l = 0; l < s.layers.size(); ++l) {
+        const auto& L = s.layers[l];
+        const auto& F = f.layers[l];
+        const auto put = [&](std::uint64_t at, const void* p, std::size_t n) {
+            if (n != 0U) std::memcpy(out.data() + at, p, n);
+        };
+        put(F.ring_at, L.ring.data(), L.ring.size());
+        put(F.kv_at, L.kv.data(), L.kv.size());
+        put(F.idx_at, L.idx_keys.data(), L.idx_keys.size());
+        put(F.carry_at, L.carry.data(), L.carry.size() * 4U);
+        put(F.topk_at, L.topk.data(), L.topk.size() * 4U);
+    }
+    ds::write_attention_frame(f, s.tokens, out);
+    digest = ds::seal_attention_frame(f, out, threads).digest;
+    out.resize(f.total);
+    return out;
+}
+
 }  // namespace
 
 int main() {
@@ -70,6 +115,45 @@ int main() {
             const auto file = dir / ("s" + std::to_string(position) + ".state");
             strix::deepseek41::save_attention_state(file, s);
             const auto back = strix::deepseek41::load_attention_state(file);
+            {  // in memory: the file's bytes; split by layer range and merged back: the same state
+                namespace ds = strix::deepseek41;
+                const auto bytes = ds::serialize_attention_state(s);
+                std::ifstream in(file, std::ios::binary);
+                const std::vector<std::uint8_t> disk{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+                expect(bytes == disk, "serialized bytes == the file's bytes");
+                expect(ds::deserialize_attention_state(bytes).digest() == s.digest(), "deserialize");
+                for (const unsigned threads : {1U, 3U, 0U}) {  // in place (a capture's frame) == serialize, whole and as a TAIL range
+                    std::uint64_t d = 0;
+                    expect(in_place(s, threads, d) == bytes && d == s.digest(), "in-place frame == serialize (threads " + std::to_string(threads) + ")");
+                    const auto tail = ds::slice_attention_state(s, 21, 40);
+                    expect(in_place(tail, threads, d) == ds::serialize_attention_state(tail) && d == tail.digest(), "in-place frame of a layer range");
+                }
+                auto bad = bytes;
+                bad[bad.size() / 3U] ^= 0x01U;
+                bool refused = false;
+                try {
+                    (void)ds::deserialize_attention_state(bad);
+                } catch (const std::runtime_error&) {
+                    refused = true;
+                }
+                expect(refused, "corrupt state bytes refused");
+                for (const std::uint32_t k : {1U, 20U, 21U, 23U}) {
+                    auto front = ds::slice_attention_state(s, 0, k);
+                    front.layers.resize(k);  // a FRONT's export has K layers
+                    front.next_token = 0;    // the FRONT has no head
+                    const auto tail = ds::slice_attention_state(s, k, 40);
+                    const auto merged = ds::merge_attention_states(front, tail);
+                    expect(merged.digest() == s.digest() && merged.hashes() == s.hashes(), "split at " + std::to_string(k) + " and merged");
+                    expect(ds::deserialize_attention_state(ds::serialize_attention_state(tail)).hashes() == tail.hashes(), "a TAIL state round trip");
+                    bool overlap = false;
+                    try {
+                        (void)ds::merge_attention_states(s, tail);
+                    } catch (const std::invalid_argument&) {
+                        overlap = true;
+                    }
+                    expect(overlap, "overlapping layers refused");
+                }
+            }
             expect(back.hashes() == s.hashes() && back.digest() == s.digest() && back.tokens == s.tokens && back.next_token == s.next_token,
                    "round trip at position " + std::to_string(position));
             expect(back.digest(true) == s.digest(true) && back.digest() != 0U, "digest without top-k");

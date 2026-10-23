@@ -103,8 +103,11 @@ struct HipMtpGreedyCohortMember {
     const HipMtpTargetHiddenTicket* initial=nullptr;
     std::uint32_t maximum_candidates=0,budget=0;
     std::span<const std::uint32_t> eos;
+    std::uint32_t slot=0;
 };
 struct HipMtpGreedyCohortStats {std::uint64_t cohort_windows=0,cohort_sessions=0,cohort_rows=0,solo_windows=0,cohort_chunks=0;};
+class MtpBatchWindowController;
 [[nodiscard]] std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(
-    std::span<const HipMtpGreedyCohortMember> members,HipMtpGreedyCohortStats* stats=nullptr);
+    std::span<const HipMtpGreedyCohortMember> members,HipMtpGreedyCohortStats* stats=nullptr,
+    MtpBatchWindowController* joint=nullptr);
 } // namespace strix

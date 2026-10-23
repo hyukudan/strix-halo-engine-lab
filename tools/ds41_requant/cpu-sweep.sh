@@ -1,8 +1,8 @@
 #!/bin/bash
 # CPU (host forward) gate while the two-node path is unavailable: cpu-sweep.sh N VARIANT... (base = no overlay)
 # Every eval document's first N tokens (from its BOS) through the 40-layer host forward, full logits per step.
-cd ~/ai-cluster-lab/scratch-admin/requant
-M=~/ai-cluster-lab/models/DeepSeek-V4.1-Flash-1017/DeepSeek-V4.1-Flash-1017-Q2.gguf
+cd "${RQ_DIR:-.}"
+M=${DS41_MODEL:?path of the DeepSeek-V4.1-Flash-1017 Q2 GGUF}
 N=$1; shift
 jobs=()
 while read -r cat doc start len; do

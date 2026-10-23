@@ -26,6 +26,16 @@ license and a verifiable contract.
 
 ## Approval rule
 
+The experimental selected dense projection adapts wave-transform and ordered
+split-reduction organization from the related project-owned `strix_trellis`
+tree at `9c28680b46e379abe0ad92a14c4a7611fd7bfd74`, specifically
+`src/transforms.hpp` and `src/backend.hpp`. That pinned tree contains no
+license or notice file; do not infer an upstream license or independent
+authorship for the adapted organization. Distribution terms remain unresolved.
+The new FP32 transform/FMA recipe, asset pins and qualification boundary are
+documented in [the dense projection contract](docs/dense-trellis-g1.md).
+The source model's existing provenance and asset terms continue to apply.
+
 Each row needs a URL/repo, a SHA or immutable revision, the applicable license,
 artifact hashes and a verifiable contract. Secondary references, such as
 open, non-canonical pull requests, may guide tests and structural checks, but

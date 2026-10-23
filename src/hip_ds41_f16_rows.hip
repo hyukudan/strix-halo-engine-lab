@@ -184,7 +184,9 @@ __device__ __forceinline__ void f16_rows_lanes_body(const F16RowsView& v, unsign
     }
 #pragma unroll
     for (unsigned r = 0; r < R; ++r) {
-        if (r >= rows) break;
+        if constexpr (R > kRows) {
+            if (r >= rows) continue;
+        } else if (r >= rows) break;
         float s[8];
 #pragma unroll
         for (unsigned j = 0; j < 8; ++j) {
@@ -287,7 +289,7 @@ void launch_pair(const F16RowsView& a, const F16RowsView& b, hipStream_t s) {
 bool f16_rows_lanes_supported(const F16RowsView& v) noexcept {
     const bool weights = v.weight_f8 ? reinterpret_cast<std::uintptr_t>(v.weight_f8) % 8U == 0 && (v.width + v.width / 32U) % 8U == 0
                                      : v.weight && reinterpret_cast<std::uintptr_t>(v.weight) % 16U == 0;
-    return weights && v.x && v.out && v.count && v.width && v.width % 32U == 0 && v.rows >= 1 && v.rows <= kRows &&
+    return weights && v.x && v.out && v.count && v.width && v.width % 32U == 0 && v.rows >= 1 && v.rows <= 16U &&
            (v.rows == 1 || v.x_stride % 4U == 0) && reinterpret_cast<std::uintptr_t>(v.x) % 16U == 0;
 }
 
@@ -300,7 +302,8 @@ void enqueue_f16_rows_lanes(const F16RowsView& v, void* stream) {
     } else if (v.rows == 1) launch_lanes<1>(v, s);
     else if (v.rows == 2) launch_lanes<2>(v, s);
     else if (v.rows <= 4) launch_lanes<4>(v, s);
-    else launch_lanes<8>(v, s);
+    else if (v.rows <= kRows) launch_lanes<8>(v, s);
+    else launch_lanes<16>(v, s);
     if (hipGetLastError() != hipSuccess) throw std::runtime_error("F16 rows (lanes) launch");
 }
 
@@ -314,7 +317,8 @@ void enqueue_f16_rows_lanes_pair(const F16RowsView& a, const F16RowsView& b, voi
     if (a.rows == 1) launch_pair<1>(a, b, s);
     else if (a.rows == 2) launch_pair<2>(a, b, s);
     else if (a.rows <= 4) launch_pair<4>(a, b, s);
-    else launch_pair<8>(a, b, s);
+    else if (a.rows <= kRows) launch_pair<8>(a, b, s);
+    else launch_pair<16>(a, b, s);
     if (hipGetLastError() != hipSuccess) throw std::runtime_error("F16 rows (pair) launch");
 }
 

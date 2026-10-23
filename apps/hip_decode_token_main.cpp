@@ -6,6 +6,7 @@
 #include "strix/compiled_execution.hpp"
 #include "strix/teacher_logit_spool.hpp"
 #include "strix/hip_q6p_pack.hpp"
+#include "strix/hip_dense_trellis_pack.hpp"
 #include "strix/q6p_registry.hpp"
 #include "strix/execution_resources.hpp"
 #include "strix/execution_tensor_access.hpp"
@@ -1869,6 +1870,28 @@ int STRIX_DECODE_ENTRY(
                   << " BF16 tensors, " << dense_q6p_pack->q6p_bytes << " bytes replace " << dense_q6p_pack->replaced_bytes
                   << (strix::q6p::kernels_enabled() ? "" : " (STRIX_Q6P=0: not read)") << '\n';
     }
+    std::shared_ptr<const strix::HipDenseTrellisPack> dense_trellis_pack;
+    std::string dense_trellis_configuration_receipt;
+#if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    if (!options.dense_trellis_pack_path.empty()) {
+        dense_trellis_pack = strix::load_hip_dense_trellis_pack(options.dense_trellis_pack_path, mapped, manifest,
+            model_residency.binding(), generations);
+        dense_trellis_configuration_receipt = "  \"dense_trellis_pack_sha256\":\"" + dense_trellis_pack->sha256 + "\",\n" +
+            "  \"dense_trellis_recipe\":\"fp32-transform-fma-split4-v1\",\n" +
+            "  \"dense_trellis_scope\":\"decode-r1-r2-r4-r8\",\n" +
+            "  \"dense_trellis_tensors\":" + std::to_string(dense_trellis_pack->tensors) + ",\n" +
+            "  \"dense_trellis_packed_bytes\":" + std::to_string(dense_trellis_pack->packed_bytes) + ",\n" +
+            "  \"dense_trellis_replaced_q8_bytes\":" + std::to_string(dense_trellis_pack->replaced_bytes) + ",\n" +
+            "  \"dense_trellis_workspace_bytes\":" + std::to_string(dense_trellis_pack->workspace_bytes) + ",\n" +
+            "  \"dense_trellis_qualification\":\"experimental-not-assessed\",\n";
+        optimization_profile_receipt += dense_trellis_configuration_receipt;
+    }
+#endif
+    const auto dense_trellis_completed_receipt = [&] {
+        if (!dense_trellis_pack) return std::string{};
+        return "  \"dense_trellis_used_layer_mask\":" + std::to_string(strix::hip_dense_trellis_used_layers()) + ",\n" +
+            "  \"dense_trellis_usage_scope\":\"host-entry-coverage-including-capture-not-cycle-counts\",\n";
+    };
     // After registration: pinning the model may evict anything populated before it.
     warm_file_backed_tensors(mapped, manifest);
     // Keep the actual registration/copy owner and its exact map control block
@@ -2938,13 +2961,14 @@ int STRIX_DECODE_ENTRY(
             request_options.mtp.sample_seed = options.mtp.sample_seed + repeat;
             strix::decode_cli::run_mtp_decode_bridge(request_options, model, compiled, parents, session, direct_dispatcher,
                 generations, catalog_config.deferred_moe_status, optimization_profile.selected, std::cout, make_window,
-                [&] { return execution_inventory_receipt + ple_cache_completed_receipt(); }
+                [&] { return execution_inventory_receipt + ple_cache_completed_receipt() + dense_trellis_configuration_receipt + dense_trellis_completed_receipt(); }
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
                 , strix::tests::mtp_component_diagnostic_requested()
                     ? strix::decode_cli::MtpDecodeQualification{} : strix::decode_cli::MtpDecodeQualification{strix::tests::run_mtp_model_qualification}
                 , strix::tests::mtp_component_diagnostic_requested()
                     ? strix::decode_cli::MtpDecodeComponentDiagnostic{strix::tests::run_mtp_component_diagnostic}
                     : strix::decode_cli::MtpDecodeComponentDiagnostic{}
+                , strix::tests::mtp_prefix_gate_requested()
 #endif
                 );
             std::cout.flush();
@@ -3413,7 +3437,7 @@ int STRIX_DECODE_ENTRY(
             emit_q51_slot_receipt();
             emit_q51_slot_counts();
             std::cout
-                << optimization_profile_receipt << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt
+                << optimization_profile_receipt << dense_trellis_completed_receipt() << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt
                 << strix::decode_detail::qsa_input_dispatch_receipt(qsa_prefetch_stats.get())
                 << shared_dispatch_receipt.completed_counts()
                 << ple_cache_completed_receipt() << qsa_gqa_receipt() << gdn_recurrent_layout_receipt() << qsa_selection_receipt() << gdn_islands_receipt() << strix::decode_detail::deferred_moe_completed_tokens_receipt(deferred_moe.get())
@@ -3836,7 +3860,7 @@ int STRIX_DECODE_ENTRY(
                     raw_require_identity();
                 });
         }
-        std::cout << "{\n" << optimization_profile_receipt << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt << model_copy_receipt;
+        std::cout << "{\n" << optimization_profile_receipt << dense_trellis_completed_receipt() << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt << model_copy_receipt;
         if (token_cost_backend) {
             const auto observed = token_cost_backend->stats();
             const strix::ObservedMoeTokenCostPolicy policy{};
@@ -4217,7 +4241,7 @@ int STRIX_DECODE_ENTRY(
             reference->steps.size());
     }
 
-    std::cout << '{' << '\n' << optimization_profile_receipt << eager_submission_receipt << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
+    std::cout << '{' << '\n' << optimization_profile_receipt << dense_trellis_completed_receipt() << eager_submission_receipt << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt;
     emit_q4k_a8_receipt();
     std::cout << "  \"model_content_identity\": \""
               << strix::model_content_identity_hex(

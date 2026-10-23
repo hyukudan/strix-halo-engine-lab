@@ -431,6 +431,119 @@ void test_controller() {
     std::cout << "controller: costs, sweep, gate, exploration and rank symmetry ok\n";
 }
 
+// Batch window controller: cost model, stage 1 (who drafts) and stage 2 (rows) under the row budget, exploration,
+// per-request survival, and a toy batch whose every request must end with its greedy tokens.
+void test_batch_controller() {
+    BatchWindowController w(4);
+    BatchWindowController::Costs c;
+    c.plain[1] = 0.0383F, c.plain[2] = 0.0465F, c.plain[4] = 0.0604F;
+    c.row = 0.0048F, c.draft = 0.0075F, c.extra = 0.0F;
+    w.set_costs(c);
+    expect(std::abs(w.plain_cost(3) - (0.0465 + 0.0604) / 2.0) < 1e-6, "batch controller: plain[3] interpolated");
+    const std::uint32_t rows22[2] = {2, 2};
+    expect(std::abs(w.step_cost(rows22, 2) - (0.0465 + 2 * 0.0048 + 2 * 0.0075)) < 1e-6, "batch controller: step cost of two drafted windows");
+    const std::uint32_t slots[4] = {0, 1, 2, 3}, limit[4] = {6, 6, 6, 6};
+    // nothing observed yet: the pooled prior (1 + 0) / (2 + 0) = 0.5 per depth
+    // every request accepts everything: requests 0 and 1 draft long windows
+    Draft good{};
+    good.confidence.fill(4.0F);
+    for (int i = 0; i < 64; ++i) w.observe(0, good, 5, 5), w.observe(1, good, 5, 5);
+    // request 2 rejects its first draft every time, request 3 is new (pooled prior)
+    for (int i = 0; i < 64; ++i) w.observe(2, good, 1, 0);
+    const auto who = w.plan_drafts(std::span(slots, 3), std::span(limit, 3), 8);
+    // (8 rows for 3 requests: one long window, one draft call, beats two medium ones)
+    expect(who.size() == 3U && (who[0] || who[1]) && !who[2], "batch controller: stage 1 drafts a request that accepts, not the one that rejects");
+    std::vector<Draft> drafts(3, good);
+    const auto rows = w.choose_rows(std::span(slots, 3), std::span(limit, 3), 8, who, drafts);
+    std::uint32_t total = 0;
+    for (const auto r : rows) total += r;
+    expect(total <= 8U && rows[2] == 1U && rows[0] + rows[1] >= 6U, "batch controller: stage 2 gives the budget to the good window");
+    // expensive drafts: plain steps win (no exploration on these plans)
+    BatchWindowController e(2);
+    c.draft = 0.5F;
+    e.set_costs(c);
+    bool any = false;
+    for (int i = 0; i < 15; ++i) {
+        const auto d = e.plan_drafts(std::span(slots, 2), std::span(limit, 2), 8);
+        any = any || d[0] || d[1];
+    }
+    expect(!any, "batch controller: drafts dearer than their tokens -> plain rows");
+    const auto ex = e.plan_drafts(std::span(slots, 2), std::span(limit, 2), 8);
+    expect((ex[0] ? 1 : 0) + (ex[1] ? 1 : 0) == 1, "batch controller: every 16th plan explores (one request drafts)");
+    const std::uint32_t one[2] = {1, 1};
+    const auto noroom = e.plan_drafts(std::span(slots, 2), std::span(one, 2), 8);
+    expect(!noroom[0] && !noroom[1], "batch controller: no room, no draft");
+    // the local search (more than 4 requests) respects the budget and finds the obvious plan
+    BatchWindowController big(8);
+    c.draft = 0.0075F;
+    c.plain[8] = 0.0897F;
+    big.set_costs(c);
+    Draft poor{};
+    poor.confidence.fill(-1.5F);  // the confidence head tells the poor drafts apart (stage 2 is calibrated on it)
+    for (std::uint32_t s = 0; s < 8; ++s)
+        for (int i = 0; i < 64; ++i) big.observe(s, s < 2U ? good : poor, 5, s < 2U ? 5U : 0U);
+    const std::uint32_t slots8[8] = {0, 1, 2, 3, 4, 5, 6, 7}, limit8[8] = {6, 6, 6, 6, 6, 6, 6, 6};
+    std::vector<bool> all(8, true);
+    std::vector<Draft> d8(8, poor);
+    d8[0] = good, d8[1] = good;
+    const auto r8 = big.choose_rows(slots8, limit8, 12, all, d8);
+    total = 0;
+    for (const auto r : r8) total += r;
+    expect(total <= 12U && r8[0] + r8[1] > 2U, "batch controller: local search under a 12-row budget");
+    // toy batch: requests with their own greedy text and drafts right with probability q_i; any plan the controller
+    // makes, every request must end with exactly its greedy text
+    std::mt19937 rng(7);
+    const std::uint32_t n = 3, length = 200;
+    std::vector<std::vector<std::uint32_t>> text(n);
+    for (auto& t : text)
+        for (std::uint32_t k = 0; k < length + 8U; ++k) t.push_back(static_cast<std::uint32_t>(rng() % 1000U));
+    const double q[n] = {0.95, 0.6, 0.1};
+    std::vector<std::vector<std::uint32_t>> out(n, std::vector<std::uint32_t>{});
+    BatchWindowController toy(n);
+    c.plain[3] = 0.053F;
+    toy.set_costs(c);
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    bool done = false;
+    std::uint64_t windows = 0;
+    while (!done) {
+        std::vector<std::uint32_t> sl, lim;
+        for (std::uint32_t i = 0; i < n; ++i) sl.push_back(i), lim.push_back(std::max<std::uint32_t>(1U, std::min<std::uint32_t>(6U, length - std::min<std::uint32_t>(length, static_cast<std::uint32_t>(out[i].size())))));
+        const auto dr = toy.plan_drafts(sl, lim, 8);
+        std::vector<Draft> ds(n);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            const auto at = out[i].size();
+            ds[i].tokens[0] = at ? out[i].back() : 0U;
+            for (std::uint32_t j = 1; j <= block_size; ++j) {
+                const bool right = u(rng) < q[i];
+                ds[i].tokens[j] = right ? text[i][at + j - 1U] : 5000U + j;  // draft j: the greedy token after row j - 1
+                ds[i].confidence[j - 1U] = right ? 3.0F : -1.0F;
+            }
+        }
+        const auto R = toy.choose_rows(sl, lim, 8, dr, ds);
+        std::uint32_t tot = 0;
+        for (std::uint32_t i = 0; i < n; ++i) {
+            tot += R[i];
+            expect(R[i] >= 1U && R[i] <= lim[i] && (R[i] == 1U || dr[i]), "batch controller: rows within the request's limit, windows only if drafted");
+            // the target's greedy token after row j is text[at + j]; draft j + 1 is kept while it equals it
+            const auto at = out[i].size();
+            std::uint32_t accepted = 0;
+            while (accepted + 1U < R[i] && ds[i].tokens[accepted + 1U] == text[i][at + accepted]) ++accepted;
+            (void)at;
+            for (std::uint32_t j = 0; j <= accepted; ++j) out[i].push_back(text[i][out[i].size()]);
+            if (dr[i]) toy.observe(i, ds[i], std::max(R[i] - 1U, 1U), R[i] > 1U ? accepted : 0U);
+            windows += R[i] > 1U;
+        }
+        expect(tot <= 8U, "batch controller: the step's rows fit the budget");
+        done = true;
+        for (std::uint32_t i = 0; i < n; ++i) done = done && out[i].size() >= length;
+    }
+    bool equal = true;
+    for (std::uint32_t i = 0; i < n; ++i) equal = equal && std::equal(out[i].begin(), out[i].begin() + length, text[i].begin());
+    expect(equal && windows > 0U, "batch controller: toy batch ends with every request's greedy text");
+    expect(toy.slot_survival(0, 0) > toy.slot_survival(2, 0) + 0.3, "batch controller: per-request survival separates the requests");
+    std::cout << "batch controller: costs, two stages, budget, exploration, local search and toy batch ok\n";
+}
+
 // The host drafter on the real weights (STRIX_DS41_Q2_GGUF, STRIX_DS41_DSPARK_GGUF): the same inputs as
 // the device fixture; with STRIX_DS41_DSPARK_DUMP the inputs and outputs are written for the
 // independent float64 oracle.
@@ -485,6 +598,7 @@ int main() {
     test_speculative_simulation();
     test_driver();
     test_controller();
+    test_batch_controller();
     const char* q2 = std::getenv("STRIX_DS41_Q2_GGUF");
     const char* dspark = std::getenv("STRIX_DS41_DSPARK_GGUF");
     const char* dir = std::getenv("STRIX_DS41_DSPARK_DUMP");

@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/hip_mtp_target_hidden.hpp"
+#include "strix/mtp_depth_window_controller.hpp"
 #include "strix/hip_mtp_target_window.hpp"
 #include "strix/hip_mtp_target_checkpoint.hpp"
 #include "strix/hip_known_prefix_window.hpp"
@@ -89,6 +90,9 @@ public:
     // of the drafts so far (plus one exploration draft after a weak first draft).
     [[nodiscard]] bool worth_drafting(std::span<const float> probabilities,std::span<const float> runner_ups={}) const;
     [[nodiscard]] bool survival_controller() const noexcept;
+    [[nodiscard]] bool depth_controller() const noexcept;
+    [[nodiscard]] std::vector<MtpDepthWindowController::CostStats> depth_cost_stats() const;
+    [[nodiscard]] std::vector<MtpDepthWindowController::CostStats> draft_depth_stats() const;
     // Min-p controller cost model: robust estimates with re-probes (default) or the legacy EMA.
     [[nodiscard]] bool robust_cost_model() const noexcept;
     // The current cycle's draft chain (steps, host wall ms), recorded before verify for the cost split.
@@ -123,7 +127,9 @@ public:
         std::span<const HipMtpCohortVerifyRequest> requests,std::span<HipKnownPrefixWindow* const> primaries,
         std::span<const std::size_t> chunks);
     // A new session over the same owners after the target state was reset: pending deferred rows
-    // of the previous session are dropped. The adaptive window costs and acceptance bins persist.
+    // of the previous session are dropped. Adaptive policy state starts from its
+    // configured prior, retaining the device owners. STRIX_MTP_REQUEST_RESET=0
+    // retains the previous session's learned policy for controlled comparisons.
     void begin_session();
 private:
     struct Impl;

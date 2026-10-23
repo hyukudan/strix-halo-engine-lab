@@ -7,6 +7,9 @@
 #include "strix/hip_ds41_formats.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -545,6 +548,30 @@ struct DeviceStage {
     Buffer<std::uint8_t> ring;
 };
 
+// STRIX_DS41_DSPARK_MEMLOG=1: the amdgpu GTT in use (sysfs mem_info_gtt_used of the first GPU) at each stage of the
+// drafter's setup, against the bytes it allocates there (DeviceDrafter::footprint's parts). Diagnostics only.
+bool memlog_on() {
+    static const bool on = [] { const char* v = std::getenv("STRIX_DS41_DSPARK_MEMLOG"); return v && v[0] == '1'; }();
+    return on;
+}
+std::uint64_t gtt_used() {
+    std::error_code ec;
+    for (const auto& de : std::filesystem::directory_iterator("/sys/class/drm", ec)) {
+        std::ifstream f(de.path() / "device" / "mem_info_gtt_used");
+        std::uint64_t v = 0;
+        if (f >> v) return v;
+    }
+    return 0;
+}
+void memlog(const char* stage, std::uint64_t& last, std::uint64_t expected) {
+    if (!memlog_on()) return;
+    (void)hipDeviceSynchronize();
+    const auto now = gtt_used();
+    std::fprintf(stderr, "dspark memlog: %-34s GTT +%9.1f MiB (allocated here %9.1f MiB)\n", stage, static_cast<double>(static_cast<std::int64_t>(now - last)) / 1048576.0,
+                 static_cast<double>(expected) / 1048576.0);
+    last = now;
+}
+
 // Activation rows that one product launch stages in LDS fit in 64 KB.
 std::uint32_t row_chunk(std::uint32_t width) {
     for (std::uint32_t c = 8U; c > 1U; c /= 2U)
@@ -624,12 +651,14 @@ void enqueue_confidence(const float* weight, const float* x, const float* markov
 
 struct DeviceDrafter::Impl {
     static constexpr std::uint32_t max_rows = 128; // rows of one main_rows/append call
+    std::uint64_t gtt_mark = memlog_on() ? gtt_used() : 0U;  // STRIX_DS41_DSPARK_MEMLOG: the GTT before any member
     hipStream_t stream{};
     DeviceQ8 main_proj, output;
     Buffer<float> main_norm, final_norm, confidence;
     Buffer<std::uint16_t> markov_embed, markov_head, token_embd;
     DeviceStage stage[stages];
     std::uint64_t next = 0;
+    std::uint64_t start = 0;  // the first position with an appended row (skip_to); attention never reads before it
     // Scratch.
     Buffer<float> x_main{static_cast<std::size_t>(max_rows) * main_width};
     Buffer<float> proj{static_cast<std::size_t>(max_rows) * hidden}, main_x{static_cast<std::size_t>(max_rows) * hidden};
@@ -684,11 +713,64 @@ struct DeviceDrafter::Impl {
     Buffer<float> best_values{markov_blocks};
     Buffer<std::uint32_t> best_ids{markov_blocks};
     Buffer<float> confidence_out{block_size};
+    // Sequence contexts (set_sequences): what one request's drafting owns -- the stage rings, the position and the
+    // draft vocabulary. The active context lives in the fields above; the others are parked here (parked[active]
+    // holds nothing while it is active). Selecting swaps buffers, nothing is copied.
+    struct Context {
+        Buffer<std::uint8_t> ring[stages];
+        std::uint64_t next = 0, start = 0;
+        std::uint32_t core = vocab, extra_capacity = 0;
+        std::vector<std::uint32_t> extra_host;
+        std::vector<std::uint8_t> member;
+        Buffer<std::uint32_t> extra_ids;
+        Buffer<std::uint8_t> extra_rows;
+        Buffer<float> logits_extra;
+    };
+    std::vector<Context> parked;
+    std::uint32_t active = 0;
+    void swap_context(Context& other) {
+        for (std::uint32_t si = 0; si < stages; ++si) std::swap(stage[si].ring, other.ring[si]);
+        std::swap(next, other.next);
+        std::swap(start, other.start);
+        std::swap(core, other.core);
+        std::swap(extra_capacity, other.extra_capacity);
+        std::swap(extra_host, other.extra_host);
+        std::swap(member, other.member);
+        std::swap(extra_ids, other.extra_ids);
+        std::swap(extra_rows, other.extra_rows);
+        std::swap(logits_extra, other.logits_extra);
+    }
+    // A fresh context: empty rings, position 0, the full vocabulary (as a new DeviceDrafter).
+    Context fresh_context() {
+        Context ctx;
+        for (auto& r : ctx.ring) {
+            r = Buffer<std::uint8_t>(static_cast<std::size_t>(window) * entry_bytes);
+            check(hipMemsetAsync(r.data, 0, r.count, stream), "clear ring");
+        }
+        ctx.extra_capacity = 8192;
+        ctx.member.assign(vocab, 0U);
+        ctx.extra_ids = Buffer<std::uint32_t>(8192);
+        ctx.extra_rows = Buffer<std::uint8_t>(static_cast<std::size_t>(8192) * output.row_bytes);
+        ctx.logits_extra = Buffer<float>(static_cast<std::size_t>(block_size) * 8192);
+        return ctx;
+    }
 
     explicit Impl(const Weights& w)
         : main_proj(w.main_proj), output(w.output), main_norm(upload_span(w.main_norm)), final_norm(upload_span(w.final_norm)),
           confidence(upload_span(w.confidence)), markov_embed(upload_span(w.markov_embed.bits)), markov_head(upload_span(w.markov_head.bits)),
           token_embd(upload_span(w.token_embd.bits)) {
+        if (memlog_on()) {
+            const auto f = footprint(w, 1U);
+            std::uint64_t stage_bytes = 0;
+            for (const auto& h : w.stage)
+                stage_bytes += (h.hc_attn_fn.bits.size() + h.hc_ffn_fn.bits.size()) * 2U + h.q_a.bytes.size() + h.q_b.bytes.size() + h.kv.bytes.size() +
+                               h.out_a.bytes.size() + h.out_b.bytes.size() + h.routed.gate.size() + h.routed.up.size() + h.routed.down.size() +
+                               h.shared.gate.size() + h.shared.up.size() + h.shared.down.size() +
+                               (h.hc_attn_scale.size() + h.hc_attn_base.size() + h.hc_ffn_scale.size() + h.hc_ffn_base.size() + h.attn_norm.size() +
+                                h.ffn_norm.size() + h.sinks.size() + h.q_norm.size() + h.kv_norm.size() + h.router.size() + h.bias.size() + h.bias_image.size()) * 4U;
+            memlog_stages_expected = stage_bytes;
+            memlog("members (head weights + scratch)", gtt_mark, f.weights - stage_bytes + f.scratch);
+        }
         check(hipStreamCreate(&stream), "stream");
         for (std::uint32_t s = 0; s < stages; ++s) {
             const auto& h = w.stage[s];
@@ -704,6 +786,7 @@ struct DeviceDrafter::Impl {
             d.ring = Buffer<std::uint8_t>(static_cast<std::size_t>(window) * entry_bytes);
             check(hipMemsetAsync(d.ring.data, 0, d.ring.count, stream), "clear ring");
         }
+        memlog("stages (weights + rings)", gtt_mark, memlog_stages_expected + std::uint64_t{stages} * window * entry_bytes);
         const std::uint32_t z = 0;
         zero.upload(&z, 1, stream);
         std::vector<float> ident(block_size * mix_count, 0.0F);
@@ -734,7 +817,9 @@ struct DeviceDrafter::Impl {
         if (const char* v = std::getenv("STRIX_DS41_DSPARK_WIDE_ROWS")) wide_rows = static_cast<unsigned>(v[0] - '0');
         gpu_routes = flag("STRIX_DS41_DSPARK_GPU_ROUTES");
         check(hipDeviceSynchronize(), "upload");
+        memlog("route tables + extra rows", gtt_mark, std::uint64_t{extra_capacity} * output.row_bytes);
     }
+    std::uint64_t memlog_stages_expected = 0;
     ~Impl() { (void)hipStreamDestroy(stream); }
 
     // y[rows][outputs] = Q8_0 linear of x (A8 per row), launched in row chunks whose staged rows fit in LDS.
@@ -982,8 +1067,69 @@ void DeviceDrafter::reset() {
     for (auto& s : impl_->stage) check(hipMemsetAsync(s.ring.data, 0, s.ring.count, impl_->stream), "clear ring");
     check(hipStreamSynchronize(impl_->stream), "reset");
     impl_->next = 0;
+    impl_->start = 0;
+}
+void DeviceDrafter::skip_to(std::uint64_t position) {
+    if (impl_->next != 0U) throw std::logic_error("ds41 dspark: skip_to needs an empty context");
+    impl_->next = position;
+    impl_->start = position;
 }
 std::vector<std::uint8_t> DeviceDrafter::ring(std::uint32_t s) const { return impl_->stage[s].ring.download(impl_->stream); }
+void DeviceDrafter::set_sequences(std::uint32_t count) {
+    auto& m = *impl_;
+    if (count == 0U) throw std::invalid_argument("ds41 dspark: at least one sequence context");
+    check(hipStreamSynchronize(m.stream), "sequences");
+    if (m.active != 0U) select(0U);
+    m.parked.resize(1U);  // context 0 is the active one; contexts beyond `count` are dropped
+    while (m.parked.size() < count) m.parked.push_back(m.fresh_context());
+    check(hipStreamSynchronize(m.stream), "sequences");
+    if (memlog_on()) {
+        const auto one = std::uint64_t{stages} * window * entry_bytes + 8192U * 4U + 8192U * m.output.row_bytes + std::uint64_t{block_size} * 8192U * 4U;
+        memlog("sequence contexts", m.gtt_mark, one * (count - 1U));
+    }
+}
+DeviceDrafter::Footprint DeviceDrafter::footprint(const Weights& w, std::uint32_t sequences) {
+    // keep in step with Impl (its members and constructor) and Impl::fresh_context
+    Footprint f;
+    const auto q8 = [](const Q8Matrix& m) { return static_cast<std::uint64_t>(m.bytes.size()); };
+    const auto f32 = [](std::span<const float> v) { return static_cast<std::uint64_t>(v.size()) * 4U; };
+    const auto f16 = [](const F16Matrix& m) { return static_cast<std::uint64_t>(m.bits.size()) * 2U; };
+    f.weights = q8(w.main_proj) + q8(w.output) + f32(w.main_norm) + f32(w.final_norm) + f32(w.confidence) + f16(w.markov_embed) +
+                f16(w.markov_head) + f16(w.token_embd);
+    for (const auto& h : w.stage)
+        f.weights += f16(h.hc_attn_fn) + f16(h.hc_ffn_fn) + f32(h.hc_attn_scale) + f32(h.hc_attn_base) + f32(h.hc_ffn_scale) + f32(h.hc_ffn_base) +
+                     f32(h.attn_norm) + f32(h.ffn_norm) + f32(h.sinks) + f32(h.q_norm) + f32(h.kv_norm) + q8(h.q_a) + q8(h.q_b) + q8(h.kv) +
+                     q8(h.out_a) + q8(h.out_b) + f32(h.router) + f32(h.bias) + f32(h.bias_image) + h.routed.gate.size() + h.routed.up.size() +
+                     h.routed.down.size() + h.shared.gate.size() + h.shared.up.size() + h.shared.down.size();
+    using u64 = std::uint64_t;
+    const u64 R = Impl::max_rows, B = block_size, K = top_k, slots = Impl::route_slots;
+    u64 e4 = 0, e1 = 0;  // 4-byte and 1-byte elements of the scratch buffers
+    e4 += R * main_width + 2U * R * hidden + 2U * (R * main_width / 32U) + 2U * R * head_dim + R * rope_dim + 1U;  // x_main .. zero
+    e1 += R * main_width;                                                                                          // codes
+    e4 += (B + 1U) + 2U * B * stream_width + 4U * B * mix_count + B * (mix_count + 1U) + 2U * B * hidden + 2U * B * q_rank + 2U * B * q_width +
+          B * o_width + B * hidden + u64{max_keys} * head_dim + o_groups + (o_groups + 1U) + u64{o_groups} * B;      // tokens .. wo_entries
+    e1 += B * entry_bytes;                                                                                         // block_entries
+    e4 += B * experts + 2U * B * K + 2U * (B * K * inter / 32U) + 2U * (B * inter / 32U) + B * K * hidden + B * hidden + 1U + 2U + B;
+    e1 += B * K * inter + B * inter;                                                                               // act / shared codes
+    e4 += slots + (slots + 1U) + 3U * B * K + B;                                                                   // device routes
+    e4 += B * vocab + 2U + 2U + B * markov_rank + 2U * u64{markov_blocks} + B;                                     // logits .. confidence_out
+    f.scratch = 4U * e4 + e1;
+    // a context: the stage rings, the extra vocabulary ids / head rows and their logits (the active one lives in Impl)
+    const u64 context = u64{stages} * window * entry_bytes + 8192U * 4U + 8192U * w.output.row_bytes() + B * 8192U * 4U;
+    f.contexts = context * std::max<std::uint32_t>(sequences, 1U);
+    return f;
+}
+std::uint32_t DeviceDrafter::sequences() const noexcept { return impl_->parked.empty() ? 1U : static_cast<std::uint32_t>(impl_->parked.size()); }
+void DeviceDrafter::select(std::uint32_t sequence) {
+    auto& m = *impl_;
+    if (sequence >= sequences()) throw std::invalid_argument("ds41 dspark: no such sequence context");
+    if (sequence == m.active) return;
+    // the kernels already enqueued keep the device pointers they were given; later work on the stream is ordered
+    m.swap_context(m.parked[m.active]);
+    m.swap_context(m.parked[sequence]);
+    m.active = sequence;
+}
+std::uint32_t DeviceDrafter::selected() const noexcept { return impl_->active; }
 
 std::vector<float> DeviceDrafter::main_rows(std::span<const float> main_hidden, std::uint32_t rows) {
     auto& m = *impl_;
@@ -1030,7 +1176,7 @@ Draft DeviceDrafter::draft(std::uint32_t token, bool keep_logits, DraftTimes* ti
     constexpr std::uint32_t rows = block_size;
     if (token >= vocab) throw std::invalid_argument("ds41 dspark draft token");
     const auto start = clock::now();
-    const std::uint64_t first = m.next, oldest = first > window ? first - window : 0U;
+    const std::uint64_t first = m.next, oldest = std::max(first > window ? first - window : std::uint64_t{0}, m.start);
     const auto ring_keys = static_cast<std::uint32_t>(first - oldest);
     std::uint32_t block_tokens[block_size + 1U] = {token, noise_token, noise_token, noise_token, noise_token, 0U};
     m.tokens.upload(block_tokens, block_size + 1U, m.stream);

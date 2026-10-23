@@ -1,6 +1,10 @@
+#include "strix/deepseek41_batch_dspark.hpp"
 #include "strix/deepseek41_batch_forward.hpp"
 #include "strix/deepseek41_batch_schedule.hpp"
 #include "strix/dist/communicator.hpp"
+#include "strix/dist/gpu_direct.hpp"
+#include "strix/ds41_dspark_files.hpp"
+#include "strix/hip_ds41_dspark.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -20,10 +24,11 @@
 
 // Several requests decoded together on the two-node deepseek41 runner (BatchForward), or both ranks in one process
 // (--transport emulate). Gate and measurement tool:
-//   strix-deepseek41-batch MODEL.gguf --rank R --transport usb4auto|tcp-listen:P|tcp-connect:H:P|emulate
+//   strix-deepseek41-batch MODEL.gguf --rank R --transport usb4auto|usb4gpu|tcp-listen:P|tcp-connect:H:P|emulate
 //       --prompts a.ids,b.ids,... --n 1,2,4,8 --generate G [--mode batch|alone|both] [--prompt-rows 8]
 //       [--fill K --fill-ids FILE] [--layers L] [--max-positions P] [--tp-attention] [--engram-direct]
 //       [--check] [--gather] [--print-rows] [--sync-start] [--pool N] [--context-state FILE]
+//       [--mode spec --draft DSPARK.gguf [--vocab SPEC] [--window controller|fixed:R] [--spec-only]]
 // Request i of a run reads prompt i (mod the list). --mode both runs every request alone first (one row per step in
 // decode, its prompt in chunks of --prompt-rows), then all N together, and compares, per request and position, the
 // fed token, the greedy token and (with --check) the FNV of this rank's logits slice (--gather: of the full logits):
@@ -32,7 +37,12 @@
 // KV caches come from a shared pool of N positions (BatchForwardOptions::pool_positions); every request reserves its
 // fill + prompt + generated positions (the tokens must not change). --context-state FILE: every request starts from the
 // attention state of FILE (a long prefilled context, strix-deepseek41-longctx --state-out) imported into its slot; the
-// prompts must be the tokens that follow it.
+// prompts must be the tokens that follow it. --mode spec: DSpark windows of every request inside the batch steps
+// (BatchSpeculator: the drafter on rank 0, one drafting context per request, per-request windows from
+// BatchWindowController or fixed:R); every request's tokens (and, with --check, every kept row's logits) must equal
+// its run alone ("GATE spec"); prints the decode-only aggregate tok/s, tokens per window and the window histogram.
+// --spec-only skips the alone runs (timing). Rank 0 plans; a 256-byte control packet per step (rows, the commits of
+// the previous step) keeps rank 1 on the same rows.
 namespace {
 
 using strix::deepseek41::BatchForward;
@@ -47,7 +57,11 @@ struct Args {
     bool sync_start = false;  // timing: every prompt is read before any request decodes (N rows in every decode step)
     std::uint32_t pool = 0;   // BatchForwardOptions::pool_positions
     std::string context_state;
+    std::string state_out;
     const strix::deepseek41::AttentionState* context = nullptr;  // loaded --context-state
+    std::string draft, vocab = "full", window = "controller";      // --mode spec
+    bool spec_only = false;
+    std::uint32_t draft_ranks = 2;  // 2 (default since P17.2): drafts on both ranks (a request's context on rank slot % 2); 1: rank 0
 };
 
 std::uint64_t fnv(std::span<const float> v) {
@@ -80,6 +94,9 @@ std::vector<std::string> split(const std::string& s, char sep) {
     return out;
 }
 
+// usb4gpu: the device exchange (GPU-direct streams) built next to the host-path control transport.
+std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
+
 std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, unsigned timeout) {
     const std::chrono::seconds limit(timeout);
     const auto colon = spec.find(':');
@@ -98,6 +115,23 @@ std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, 
         std::printf("usb4 topology: %s\n", topology.receipt().c_str());
         return t;
     }
+    if (kind == "usb4gpu") {  // GPU-direct exchanges over the gpu_direct streams, control over the host-path ones
+        strix::dist::Usb4AutoOptions o;
+        o.rank = rank;
+        o.timeout = limit;
+        strix::dist::Usb4Topology topology;
+        auto t = strix::dist::usb4_host_auto(o, &topology);
+        std::printf("usb4 topology: %s\n", topology.receipt().c_str());
+        std::string receipt;
+        std::string why_direct;
+        if (strix::dist::usb4_gpu_direct_streams(o, *t, &why_direct) == 0U) {  // both ranks agree: host path only
+            std::printf("gpu-direct unavailable (%s): host path only\n", why_direct.c_str());
+            return t;
+        }
+        gpu_direct = strix::dist::usb4_gpu_direct(o, topology, *t, {}, &receipt);
+        std::printf("usb4 %s\n", receipt.c_str());
+        return t;
+    }
     throw std::invalid_argument("unknown or unavailable transport " + spec);
 }
 
@@ -110,8 +144,10 @@ using Trace = std::map<std::uint32_t, RowRecord>;  // by position, per request
 
 struct RunResult {
     std::vector<Trace> traces;
+    std::vector<std::uint64_t> state_hashes;
     std::uint64_t steady_steps = 0, steady_rows = 0;
     double steady_seconds = 0.0, steady_exchange = 0.0, steady_engram = 0.0;
+    double steady_wall = 0.0;  // the same steps end to end on the host (planning and bookkeeping included)
     double steady_union = 0.0;        // mean over steps of the mean union per layer (this rank)
     double steady_max_rows = 0.0;     // mean over steps of the mean max rows of one expert
     double steady_expert_bytes = 0.0; // per step
@@ -158,7 +194,8 @@ RunResult run(BatchForward& fwd, const Args& a, const std::vector<std::vector<st
             active = std::move(reading);
             index = std::move(reading_index);
         }
-        const auto plan = strix::deepseek41::plan_step(active, a.prompt_rows);
+        const auto t_step = std::chrono::steady_clock::now();
+        const auto plan = strix::deepseek41::plan_step(active, a.prompt_rows, fwd.row_limit());
         std::vector<std::uint32_t> positions(plan.rows.size());
         for (std::size_t r = 0; r < plan.rows.size(); ++r) positions[r] = active[plan.owner[r]]->position;  // fixed up below
         {  // the position of every row: its sequence's position plus its rank inside the segment
@@ -185,6 +222,7 @@ RunResult run(BatchForward& fwd, const Args& a, const std::vector<std::vector<st
         strix::deepseek41::apply_step(active, plan, tokens);
         ++res.steps;
         if (decode_only && res.steps > 1U) {
+            res.steady_wall += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_step).count();
             ++res.steady_steps;
             res.steady_rows += plan.rows.size();
             res.steady_seconds += st.seconds;
@@ -201,6 +239,12 @@ RunResult run(BatchForward& fwd, const Args& a, const std::vector<std::vector<st
         }
     }
     res.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (a.check)
+        for (std::uint32_t i = 0; i < n; ++i) {
+            const auto hash = fwd.export_state(i).digest(true);
+            res.state_hashes.push_back(hash);
+            if (print && a.print_rows) std::printf("state req %u fnv %016llx\n", i, static_cast<unsigned long long>(hash));
+        }
     return res;
 }
 
@@ -211,7 +255,7 @@ RunResult run(BatchForward& fwd, const Args& a, const std::vector<std::vector<st
 // every kept position).
 bool windows_gate(BatchForward& fwd, const Args& a, const std::vector<std::vector<std::uint32_t>>& prompts, std::uint32_t n,
                   const std::vector<Trace>& alone, bool print) {
-    const std::uint32_t w = BatchForward::max_rows / n;
+    const std::uint32_t w = std::min(BatchForward::max_rows, fwd.row_limit() / n);
     std::vector<BatchSequence> seqs(n);
     std::vector<std::vector<std::uint32_t>> truth(n);  // the tokens each request generates alone
     for (std::uint32_t i = 0; i < n; ++i) {
@@ -240,7 +284,7 @@ bool windows_gate(BatchForward& fwd, const Args& a, const std::vector<std::vecto
             if (q.generated.size() >= a.generate) continue;
             any = true;
             if (q.reading_prompt()) {  // prompt chunks as in the batch runs
-                std::size_t take = std::min<std::size_t>({a.prompt_rows, BatchForward::max_rows - rows.size(), q.prompt.size() - q.fed});
+                std::size_t take = std::min<std::size_t>({a.prompt_rows, fwd.row_limit() - rows.size(), q.prompt.size() - q.fed});
                 if (q.position == 0U) take = std::min<std::size_t>(take, 1U);
                 if (take == 0U) continue;
                 for (std::size_t k = 0; k < take; ++k) {
@@ -252,7 +296,7 @@ bool windows_gate(BatchForward& fwd, const Args& a, const std::vector<std::vecto
             }
             // window: the last token, then drafts = the request's own next tokens, one of them wrong
             const std::size_t g = q.generated.size();
-            const std::uint32_t room = static_cast<std::uint32_t>(std::min<std::size_t>({w, BatchForward::max_rows - rows.size(), a.generate - g}));
+            const std::uint32_t room = static_cast<std::uint32_t>(std::min<std::size_t>({w, fwd.row_limit() - rows.size(), a.generate - g}));
             if (room == 0U) continue;
             const std::uint32_t wrong = static_cast<std::uint32_t>(rnd() % (room + 1U));  // == room: no wrong draft
             rows.push_back({q.slot, q.generated.back()});
@@ -329,13 +373,268 @@ bool windows_gate(BatchForward& fwd, const Args& a, const std::vector<std::vecto
     return differ == 0U;
 }
 
+// One step's control packet from the planner (rank 0) to rank 1: the commits of the previous step, then the rows.
+struct SpecPacket {
+    std::uint32_t magic = 0x53504b31U, done = 0, rows = 0, commits = 0;
+    std::uint32_t row[BatchForward::max_rows][2]{};     // slot, token
+    std::uint32_t commit[BatchForward::max_rows][2]{};  // slot, kept
+};
+static_assert(sizeof(SpecPacket) <= strix::deepseek41::BatchSpeculator::round_bytes);
+
+// The follower's side of the spec gate (rank 1): the rows of every step (fed token, argmax, this rank's logits slice) by
+// position, the positions moved back by the commits (a commit (slot, kept) of the previous step keeps its first `kept`
+// rows of that slot), then the kept rows against this rank's runs alone and each request's final attention state.
+struct FollowerCheck {
+    std::vector<std::uint32_t> pos, base;  // per slot: next position; the first position of its rows in the last step
+    std::vector<Trace> rows;
+    explicit FollowerCheck(std::uint32_t n) : pos(n, 0U), base(n, 0U), rows(n) {}
+    void commit(std::uint32_t slot, std::uint32_t kept) { pos.at(slot) = base.at(slot) + kept; }
+    void step(BatchForward& fwd, std::span<const BatchRow> step_rows, std::span<const std::uint32_t> tokens, bool hash) {
+        std::vector<bool> seen(pos.size(), false);
+        for (std::size_t r = 0; r < step_rows.size(); ++r) {
+            const auto s = step_rows[r].slot;
+            if (!seen.at(s)) seen[s] = true, base[s] = pos[s];
+            rows[s][pos[s]++] = RowRecord{step_rows[r].token, tokens[r], hash ? fnv(fwd.row_logits(static_cast<std::uint32_t>(r))) : 0U};
+        }
+    }
+    bool report(BatchForward& fwd, const Args& a, std::uint32_t n, const std::vector<Trace>& alone, const std::vector<std::uint64_t>& alone_state) {
+        std::uint64_t compared = 0, differ = 0, states = 0;
+        for (std::uint32_t i = 0; i < n; ++i) {
+            for (const auto& [p, rec] : rows[i]) {
+                if (p >= pos[i]) continue;  // dropped by a commit and not fed again
+                const auto it = alone[i].find(p);
+                if (it == alone[i].end()) continue;
+                ++compared;
+                if (it->second.fed != rec.fed || it->second.argmax != rec.argmax || it->second.hash != rec.hash) {
+                    if (differ < 10U)
+                        std::printf("  DIFF spec follower req %u pos %u: alone fed %u argmax %u, spec fed %u argmax %u\n", i, p, it->second.fed,
+                                    it->second.argmax, rec.fed, rec.argmax);
+                    ++differ;
+                }
+            }
+            if (a.check && fwd.export_state(i).digest(true) != alone_state[i]) ++states;
+        }
+        std::printf("GATE spec follower N %u %s: %llu kept rows compared (%s), %llu differ; final attention states %s\n", n,
+                    differ == 0U && states == 0U ? "PASS" : "FAIL", static_cast<unsigned long long>(compared),
+                    a.check ? (a.gather ? "tokens + full logits" : "tokens + this rank's logits slice") : "tokens",
+                    static_cast<unsigned long long>(differ), !a.check ? "not compared (no --check)" : states == 0U ? "== alone" : "DIFFER");
+        std::fflush(stdout);
+        return differ == 0U && states == 0U;
+    }
+};
+
+// DSpark windows inside the batch: N requests decoded with BatchSpeculator, compared with their runs alone (rank 0 its
+// kept rows and final states below, rank 1 through FollowerCheck).
+bool spec_gate(BatchForward& fwd, strix::ds41::dspark::DeviceDrafter* drafter, const Args& a, std::uint32_t rank, bool two_ranks,
+               const std::vector<std::vector<std::uint32_t>>& prompts, std::uint32_t n, const std::vector<Trace>& alone,
+               const std::vector<std::uint64_t>& alone_state, bool print) {
+    std::vector<BatchSequence> seqs(n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        claim(fwd, a, i, prompts[i].size() + a.generate + 16U);
+        seqs[i].slot = i;
+        seqs[i].prompt = prompts[i];
+    }
+    std::vector<Trace> traces(n);
+    const auto send = [&](SpecPacket& pk) {  // one 512-byte message (the size of a draft round, which may come instead)
+        if (!two_ranks) return;
+        std::array<std::byte, strix::deepseek41::BatchSpeculator::round_bytes> o{}, i{};
+        std::memcpy(o.data(), &pk, sizeof pk);
+        fwd.exchange_host(o, i);
+        if (rank == 1U) std::memcpy(&pk, i.data(), sizeof pk);
+    };
+    if (rank == 1U && a.draft_ranks == 2U) {  // the follower with its own drafter: the draft round, then the rows
+        strix::deepseek41::BatchSpecOptions so;
+        so.vocabulary = a.vocab;
+        so.prompt_rows = a.prompt_rows;
+        so.rank = 1U;
+        so.world = 2U;
+        so.exchange = [&](std::span<const std::byte> out, std::span<std::byte> in) { fwd.exchange_host(out, in); };
+        strix::deepseek41::BatchSpeculator spec(fwd, *drafter, n, so);
+        for (std::uint32_t i = 0; i < n; ++i) spec.start(i, prompts[i]);
+        FollowerCheck check(n);
+        std::vector<BatchRow> last;
+        std::vector<std::uint32_t> last_tokens;
+        std::uint64_t step = 0;
+        for (;;) {  // a draft round (rank 1 drafts this step) or the step's packet
+            std::array<std::byte, strix::deepseek41::BatchSpeculator::round_bytes> o{}, i{};
+            fwd.exchange_host(o, i);
+            std::uint32_t magic = 0;
+            std::memcpy(&magic, i.data(), 4U);
+            if (magic == strix::deepseek41::BatchSpeculator::round_magic) {
+                std::vector<std::pair<std::uint32_t, std::uint32_t>> applied;
+                const bool more = spec.follow_packet(i, last, last_tokens, step, &applied);
+                for (const auto& [slot, kept] : applied) check.commit(slot, kept);
+                if (!more) break;
+                continue;
+            }
+            SpecPacket pk;
+            std::memcpy(&pk, i.data(), sizeof pk);
+            if (pk.magic != SpecPacket{}.magic) throw std::runtime_error("spec gate: bad control packet");
+            for (std::uint32_t c = 0; c < pk.commits; ++c) {
+                spec.follow_commit(pk.commit[c][0], pk.commit[c][1]);
+                check.commit(pk.commit[c][0], pk.commit[c][1]);
+            }
+            spec.follow_stage(last, last_tokens, step);
+            if (pk.done) break;
+            last.assign(pk.rows, BatchRow{});
+            for (std::uint32_t r = 0; r < pk.rows; ++r) last[r] = {pk.row[r][0], pk.row[r][1]};
+            last_tokens = fwd.step(last);
+            check.step(fwd, last, last_tokens, a.check);
+            ++step;
+        }
+        return a.spec_only || check.report(fwd, a, n, alone, alone_state);
+    }
+    if (rank == 1U) {  // the follower: commits, then the planner's rows
+        FollowerCheck check(n);
+        for (;;) {
+            SpecPacket pk;
+            send(pk);
+            for (std::uint32_t c = 0; c < pk.commits; ++c) {
+                fwd.commit(pk.commit[c][0], pk.commit[c][1]);
+                check.commit(pk.commit[c][0], pk.commit[c][1]);
+            }
+            if (pk.done) break;
+            std::vector<BatchRow> rows(pk.rows);
+            for (std::uint32_t r = 0; r < pk.rows; ++r) rows[r] = {pk.row[r][0], pk.row[r][1]};
+            const auto& tokens = fwd.step(rows);
+            check.step(fwd, rows, tokens, a.check);
+        }
+        return a.spec_only || check.report(fwd, a, n, alone, alone_state);
+    }
+    strix::deepseek41::BatchSpecOptions so;
+    so.vocabulary = a.vocab;
+    so.prompt_rows = a.prompt_rows;
+    if (a.window.rfind("fixed:", 0) == 0) so.fixed_rows = static_cast<std::uint32_t>(std::stoul(a.window.substr(6)));
+    else if (a.window != "controller") throw std::invalid_argument("--window is controller or fixed:R");
+    const bool split = two_ranks && a.draft_ranks == 2U;
+    if (split) {
+        so.world = 2U;
+        so.exchange = [&](std::span<const std::byte> out, std::span<std::byte> in) { fwd.exchange_host(out, in); };
+    }
+    strix::deepseek41::BatchSpeculator spec(fwd, *drafter, n, so);
+    for (std::uint32_t i = 0; i < n; ++i) spec.start(i, prompts[i]);
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> commits;
+    double wall_decode = 0.0;  // decode-only steps end to end on rank 0 (the control packet included)
+    const auto t0 = std::chrono::steady_clock::now();
+    for (;;) {
+        std::vector<BatchSequence*> active;
+        std::vector<std::uint32_t> remaining;
+        for (auto& q : seqs)
+            if (q.generated.size() < a.generate) active.push_back(&q);
+        if (a.sync_start && std::any_of(active.begin(), active.end(), [](const BatchSequence* q) { return q->reading_prompt(); }))
+            active.erase(std::remove_if(active.begin(), active.end(), [](const BatchSequence* q) { return !q->reading_prompt(); }), active.end());
+        for (const auto* q : active) remaining.push_back(a.generate - static_cast<std::uint32_t>(q->generated.size()));
+        SpecPacket pk;
+        pk.commits = static_cast<std::uint32_t>(commits.size());
+        for (std::size_t c = 0; c < commits.size(); ++c) pk.commit[c][0] = commits[c].first, pk.commit[c][1] = commits[c].second;
+        const auto put_commits = [&] {  // split: the commits a round did not carry
+            if (!split) return;
+            const auto c = spec.take_commits();
+            pk.commits = static_cast<std::uint32_t>(c.size());
+            for (std::size_t k = 0; k < c.size(); ++k) pk.commit[k][0] = c[k] >> 16U, pk.commit[k][1] = c[k] & 0xFFFFU;
+        };
+        if (active.empty()) {
+            put_commits();
+            pk.done = 1U;
+            send(pk);
+            break;
+        }
+        const auto t_step = std::chrono::steady_clock::now();
+        const auto decode_before = spec.stats().decode_steps;
+        const auto& plan = spec.plan(active, remaining);
+        put_commits();
+        pk.rows = static_cast<std::uint32_t>(plan.rows.size());
+        for (std::size_t r = 0; r < plan.rows.size(); ++r) pk.row[r][0] = plan.rows[r].slot, pk.row[r][1] = plan.rows[r].token;
+        send(pk);
+        const auto& tokens = fwd.step(plan.rows);
+        // the rows' records before finish() moves the positions; a window keeps its first rows (filtered below)
+        std::vector<std::uint32_t> base(n);
+        for (std::uint32_t i = 0; i < n; ++i) base[i] = seqs[i].position;
+        std::vector<std::pair<std::uint32_t, RowRecord>> recs(plan.rows.size());
+        std::map<std::uint32_t, std::uint32_t> at;
+        for (std::size_t r = 0; r < plan.rows.size(); ++r) {
+            const auto slot = plan.rows[r].slot;
+            const auto [it, fresh] = at.emplace(slot, base[slot]);
+            (void)fresh;
+            recs[r] = {it->second++, RowRecord{plan.rows[r].token, tokens[r], a.check ? fnv(fwd.row_logits(static_cast<std::uint32_t>(r))) : 0U}};
+        }
+        commits = spec.finish(active, tokens);
+        if (spec.stats().decode_steps != decode_before)  // the whole decode step: plan, drafts, control packet, step, finish
+            wall_decode += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_step).count();
+        for (std::size_t r = 0; r < plan.rows.size(); ++r) {
+            const auto slot = plan.rows[r].slot;
+            if (recs[r].first < seqs[slot].position) traces[slot][recs[r].first] = recs[r].second;  // kept rows only
+        }
+    }
+    const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::uint64_t compared = 0, differ = 0;
+    if (!a.spec_only)
+        for (std::uint32_t i = 0; i < n; ++i) {
+            for (const auto& [pos, rec] : traces[i]) {
+                const auto it = alone[i].find(pos);
+                if (it == alone[i].end()) continue;  // past the alone run's last fed row
+                ++compared;
+                if (it->second.fed != rec.fed || it->second.argmax != rec.argmax || it->second.hash != rec.hash) {
+                    if (print && differ < 10U)
+                        std::printf("  DIFF spec req %u pos %u: alone fed %u argmax %u, spec fed %u argmax %u\n", i, pos, it->second.fed,
+                                    it->second.argmax, rec.fed, rec.argmax);
+                    ++differ;
+                }
+            }
+            std::vector<std::uint32_t> truth;
+            for (const auto& [pos, rec] : alone[i])
+                if (pos + 1U >= prompts[i].size()) truth.push_back(rec.argmax);
+            truth.resize(std::min<std::size_t>(truth.size(), a.generate));
+            std::vector<std::uint32_t> got(seqs[i].generated.begin(), seqs[i].generated.begin() + static_cast<std::ptrdiff_t>(std::min<std::size_t>(seqs[i].generated.size(), a.generate)));
+            if (got != truth) {
+                ++differ;
+                if (print) std::printf("  DIFF spec req %u: %zu tokens differ from its run alone\n", i, got.size());
+            }
+        }
+    std::uint64_t states = 0;  // each request's final attention state (this rank's) against its run alone
+    if (!a.spec_only && a.check)
+        for (std::uint32_t i = 0; i < n; ++i)
+            if (fwd.export_state(i).digest(true) != alone_state[i]) ++states;
+    if (print) {
+        const auto& st = spec.stats();
+        const double agg = st.decode_seconds > 0.0 ? static_cast<double>(st.decode_tokens) / st.decode_seconds : 0.0;
+        const double steps = static_cast<double>(std::max<std::uint64_t>(st.decode_steps, 1U));
+        std::string hist;
+        for (std::uint32_t r = 1; r < st.window_rows.size(); ++r)
+            if (st.window_rows[r]) hist += " R" + std::to_string(r) + ":" + std::to_string(st.window_rows[r]);
+        std::string surv;
+        for (std::uint32_t j = 0; j < st.reached.size(); ++j)
+            surv += (j ? " " : "") + (st.reached[j] ? std::to_string(static_cast<double>(st.hit[j]) / static_cast<double>(st.reached[j])).substr(0, 5) : std::string("-"));
+        const auto& c = spec.controller().costs();
+        std::printf("SPEC N %u (%s, vocab %s): decode %.2f tok/s aggregate (%.2f per request), %.2f tok/step, %.2f rows/step, %.2f ms/step "
+                    "(draft %.2f ms per drafted step); %llu steps (%llu decode-only, %llu drafted), %.1f s; windows%s; survival %s; "
+                    "costs ms plain[1..%u]",
+                    n, a.window.c_str(), a.vocab.c_str(), agg, agg / n, static_cast<double>(st.decode_tokens) / steps,
+                    static_cast<double>(st.rows) / static_cast<double>(std::max<std::uint64_t>(st.steps, 1U)), st.decode_seconds * 1e3 / steps,
+                    st.drafted_steps ? st.draft_seconds * 1e3 / static_cast<double>(st.drafted_steps) : 0.0, static_cast<unsigned long long>(st.steps),
+                    static_cast<unsigned long long>(st.decode_steps), static_cast<unsigned long long>(st.drafted_steps), wall, hist.c_str(), surv.c_str(), n);
+        for (std::uint32_t k = 1; k <= n; ++k) std::printf(" %.2f", c.plain[k] * 1e3);
+        std::printf(", row %.2f, draft %.2f; wall decode %.2f tok/s (%.2f ms/step incl. control)\n", c.row * 1e3, c.draft * 1e3,
+                    wall_decode > 0.0 ? static_cast<double>(st.decode_tokens) / wall_decode : 0.0, wall_decode * 1e3 / steps);
+        if (!a.spec_only)
+            std::printf("GATE spec N %u %s: %llu kept rows compared (%s), %llu differ; final attention states %s\n", n,
+                        differ == 0U && states == 0U ? "PASS" : "FAIL", static_cast<unsigned long long>(compared),
+                        a.check ? (a.gather ? "tokens + full logits" : "tokens + this rank's logits slice") : "tokens",
+                        static_cast<unsigned long long>(differ), !a.check ? "not compared (no --check)" : states == 0U ? "== alone" : "DIFFER");
+        std::fflush(stdout);
+    }
+    return differ == 0U && states == 0U;
+}
+
 void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport, bool print) {
     std::unique_ptr<strix::dist::Communicator> comm;
-    if (transport) comm = std::make_unique<strix::dist::Communicator>(strix::dist::Group{rank, 2U, 1U, 0x64733462ULL}, std::move(transport), 4U << 20U);
+    if (transport && gpu_direct)
+        comm = std::make_unique<strix::dist::Communicator>(strix::dist::Group{rank, 2U, 1U, 0x64733462ULL}, std::move(transport), std::move(gpu_direct), 4U << 20U);
+    else if (transport) comm = std::make_unique<strix::dist::Communicator>(strix::dist::Group{rank, 2U, 1U, 0x64733462ULL}, std::move(transport), 4U << 20U);
     std::vector<std::uint32_t> ns;
     for (const auto& s : split(a.n_list, ',')) ns.push_back(static_cast<std::uint32_t>(std::stoul(s)));
     const std::uint32_t n_max = *std::max_element(ns.begin(), ns.end());
-    if (n_max == 0U || n_max > BatchForward::max_rows) throw std::invalid_argument("--n values must be in 1..8");
+    if (n_max == 0U || n_max > BatchForward::configured_row_limit()) throw std::invalid_argument("--n exceeds STRIX_DS41_BATCH_ROWS16 step limit (8, or 16 when enabled)");
     std::vector<std::vector<std::uint32_t>> prompt_list;
     for (const auto& f : split(a.prompts, ',')) prompt_list.push_back(read_ids(f));
     if (prompt_list.empty()) throw std::invalid_argument("--prompts needs at least one ids file");
@@ -353,7 +652,25 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
     o.engram_direct_io = a.engram_direct;
     o.slice_logits = a.check && !a.gather;
     o.gather_logits = a.check && a.gather;
+    const bool spec = a.mode == "spec";
+    // DSpark windows (controller, spec packet, staging) are qualified at 8 rows: not combined with ROWS16
+    if (spec && BatchForward::configured_row_limit() > BatchForward::max_rows)
+        throw std::invalid_argument("--mode spec is not qualified with STRIX_DS41_BATCH_ROWS16=1 (DSpark windows stay at 8 rows)");
+    o.capture_main_hidden = spec && (rank == 0U || a.draft_ranks == 2U);  // the drafters' input rows
     BatchForward fwd(a.model, o);
+    std::unique_ptr<strix::ds41::dspark::DeviceDrafter> drafter;
+    if (spec && (rank == 0U || (a.draft_ranks == 2U && comm))) {
+        const auto w = strix::ds41::dspark::load_weights(a.model, a.draft);
+        drafter = std::make_unique<strix::ds41::dspark::DeviceDrafter>(w->weights);
+        if (print) std::printf("drafter %s on %s (one drafting context per request), window policy %s, vocabulary %s\n", a.draft.c_str(),
+                               a.draft_ranks == 2U ? "both ranks (request i on rank i %% 2)" : "rank 0", a.window.c_str(), a.vocab.c_str());
+    }
+    const auto save_state = [&](const std::string& phase, std::uint32_t n, std::uint32_t request, std::uint32_t slot) {
+        if (a.state_out.empty()) return;
+        const auto path = a.state_out + "-" + phase + "-n" + std::to_string(n) + "-q" + std::to_string(request) +
+                          "-r" + std::to_string(rank) + ".state";
+        strix::deepseek41::save_attention_state(path, fwd.export_state(slot));
+    };
     if (print) {
         std::printf("rank %u of %u (%s): layers [0, %u), weights %.2f GiB in %.1f s; per step: fixed %.3f GB + %.1f MB per routed expert per layer;"
                     " state %.1f MiB per request (%u positions), workspace %.1f MiB, %u slots\n",
@@ -362,6 +679,20 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
                     static_cast<double>(fwd.state_bytes_per_slot()) / 1048576.0, a.max_positions, static_cast<double>(fwd.workspace_bytes()) / 1048576.0,
                     o.slots);
         if (const auto ov = fwd.overlay_description(); !ov.empty()) std::printf("weights overlay: %s\n", ov.c_str());
+        if (const auto id = fwd.trellis_identity(); !id.empty())
+            std::printf("trellis: %s, %.1f MiB (+ %.1f MiB library workspaces)\n", id.c_str(), static_cast<double>(fwd.trellis_bytes()) / 1048576.0,
+                        static_cast<double>(fwd.trellis_library_bytes()) / 1048576.0);
+        {  // the footprint the server sizes with, against the device memory in use after the load
+            const auto f = BatchForward::footprint(a.model, o);
+            const auto [free, total] = fwd.device_memory();
+            const double mib = 1048576.0;
+            std::printf("footprint: weights %.1f + state %.1f x %u + workspace %.1f + pool %.1f + trellis %.1f = %.1f MiB; "
+                        "device in use %.1f MiB of %.1f (free %.1f)\n",
+                        static_cast<double>(f.weights) / mib, static_cast<double>(f.state_per_slot) / mib, o.slots,
+                        static_cast<double>(f.workspace) / mib, static_cast<double>(f.pool) / mib, static_cast<double>(f.trellis) / mib,
+                        static_cast<double>(f.weights + f.state_per_slot * o.slots + f.workspace + f.pool + f.trellis) / mib,
+                        static_cast<double>(total - free) / mib, static_cast<double>(total) / mib, static_cast<double>(free) / mib);
+        }
         if (a.pool != 0U)
             std::printf("KV pool: %u positions over the slots, %.1f MiB of arenas (largest free reservation %llu)\n", a.pool,
                         static_cast<double>(fwd.pool_bytes()) / 1048576.0, static_cast<unsigned long long>(fwd.pool_free_positions()));
@@ -387,10 +718,13 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
     bool all_pass = true;
     for (const auto n : ns) {
         std::vector<Trace> alone(n);
-        if (a.mode == "alone" || a.mode == "both" || a.mode == "windows") {
+        std::vector<std::uint64_t> alone_state(n);
+        if (a.mode == "alone" || a.mode == "both" || a.mode == "windows" || (spec && !a.spec_only)) {
             for (std::uint32_t i = 0; i < n; ++i) {
                 const std::vector<std::vector<std::uint32_t>> one{prompts[i]};
                 auto r = run(fwd, a, one, 1U, template_slot, a.fill != 0U, false);
+                if (a.check) alone_state[i] = r.state_hashes.front();
+                save_state("alone", n, i, 0U);
                 alone[i] = std::move(r.traces[0]);
                 if (print && a.mode == "alone")
                     for (const auto& [pos, rec] : alone[i])
@@ -399,12 +733,18 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
             }
         }
         if (a.mode == "alone") continue;
+        if (spec) {
+            if (a.fill != 0U || a.context) throw std::invalid_argument("--mode spec starts every request at position 0 (no --fill / --context-state)");
+            all_pass = spec_gate(fwd, drafter.get(), a, rank, comm != nullptr, prompts, n, alone, alone_state, print) && all_pass;
+            continue;
+        }
         if (a.mode == "windows") {
             if (a.fill != 0U) throw std::invalid_argument("--mode windows starts every request at position 0 (no --fill)");
             all_pass = windows_gate(fwd, a, prompts, n, alone, print) && all_pass;
             continue;
         }
         const auto r = run(fwd, a, prompts, n, template_slot, a.fill != 0U, print);
+        for (std::uint32_t i = 0; i < n; ++i) save_state("batch", n, i, i);
         if (print) {
             const double step_ms = r.steady_steps ? r.steady_seconds * 1e3 / static_cast<double>(r.steady_steps) : 0.0;
             const double agg = r.steady_seconds > 0.0 ? static_cast<double>(r.steady_rows) / r.steady_seconds : 0.0;
@@ -416,6 +756,8 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
                         n, static_cast<unsigned long long>(r.steps), static_cast<unsigned long long>(r.steady_steps), r.seconds, step_ms, agg,
                         agg / n, r.steady_exchange * 1e3 / steps, r.steady_engram * 1e3 / steps, r.steady_union / steps, r.steady_max_rows / steps,
                         (fixed + experts) / 1e9, fixed / 1e9, experts / 1e9, step_ms > 0.0 ? (fixed + experts) / (step_ms * 1e-3) / 1e9 : 0.0);
+            std::printf("N %u wall decode %.2f tok/s (%.2f ms/step end to end)\n", n,
+                        r.steady_wall > 0.0 ? static_cast<double>(r.steady_rows) / r.steady_wall : 0.0, r.steady_wall * 1e3 / steps);
             for (std::uint32_t i = 0; i < n; ++i) {
                 std::string toks;
                 std::uint32_t shown = 0;
@@ -426,6 +768,10 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
         }
         if (a.mode == "both") {
             std::uint64_t compared = 0, differ = 0;
+            if (a.check && alone_state != r.state_hashes) {
+                ++differ;
+                if (print) std::printf("  DIFF final attention state digests\n");
+            }
             for (std::uint32_t i = 0; i < n; ++i) {
                 if (alone[i].size() != r.traces[i].size()) {
                     ++differ;
@@ -452,7 +798,7 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
         }
         std::fflush(stdout);
     }
-    if (print && (a.mode == "both" || a.mode == "windows")) std::printf("GATE %s\n", all_pass ? "PASS" : "FAIL");
+    if (print && (a.mode == "both" || a.mode == "windows" || (spec && !a.spec_only))) std::printf("GATE %s\n", all_pass ? "PASS" : "FAIL");
     if (comm && print) {
         const auto& s = comm->stats();
         std::printf("exchanges %llu, %.1f MB sent, %.2f s in exchange (stage %.2f, wire %.2f, check %.2f)\n", static_cast<unsigned long long>(s.exchanges),
@@ -491,13 +837,20 @@ int main(int argc, char** argv) try {
         else if (s == "--sync-start") a.sync_start = true;
         else if (s == "--pool") a.pool = u32();
         else if (s == "--context-state") a.context_state = next();
+        else if (s == "--state-out") a.state_out = next();
         else if (s == "--connect-timeout") a.connect_timeout = static_cast<unsigned>(std::stoul(next()));
+        else if (s == "--draft") a.draft = next();
+        else if (s == "--vocab") a.vocab = next();
+        else if (s == "--window") a.window = next();
+        else if (s == "--spec-only") a.spec_only = true;
+        else if (s == "--draft-ranks") a.draft_ranks = u32();
         else if (a.model.empty()) a.model = s;
         else throw std::invalid_argument("unknown argument " + s);
     }
     if (a.model.empty() || a.prompts.empty()) throw std::invalid_argument("usage: strix-deepseek41-batch MODEL.gguf --prompts a.ids,b.ids --n 1,2,4,8 ...");
-    if (a.mode != "batch" && a.mode != "alone" && a.mode != "both" && a.mode != "windows")
-        throw std::invalid_argument("--mode is batch, alone, both or windows");
+    if (a.mode != "batch" && a.mode != "alone" && a.mode != "both" && a.mode != "windows" && a.mode != "spec")
+        throw std::invalid_argument("--mode is batch, alone, both, windows or spec");
+    if (a.mode == "spec" && a.draft.empty()) throw std::invalid_argument("--mode spec needs --draft DSPARK.gguf");
     if (a.prompt_rows == 0U || a.prompt_rows > BatchForward::max_rows) throw std::invalid_argument("--prompt-rows must be in 1..8");
     if (a.fill != 0U && a.fill_ids.empty()) throw std::invalid_argument("--fill needs --fill-ids");
     strix::deepseek41::AttentionState context;

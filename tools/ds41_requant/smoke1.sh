@@ -1,8 +1,8 @@
 #!/bin/bash
 # single-node smoke (4 layers, both ranks emulated in one process)
-cd ~/ai-cluster-lab/scratch-admin/requant
+cd "${RQ_DIR:-.}"
 export LD_LIBRARY_PATH=/opt/rocm/core-10.1/lib
-M=~/ai-cluster-lab/models/DeepSeek-V4.1-Flash-1017/DeepSeek-V4.1-Flash-1017-Q2.gguf
+M=${DS41_MODEL:?path of the DeepSeek-V4.1-Flash-1017 Q2 GGUF}
 B=build/strix-deepseek41-requant-eval
 mkdir -p smoke/ref
 E="--transport emulate --layers 4"

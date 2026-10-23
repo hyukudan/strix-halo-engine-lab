@@ -65,6 +65,8 @@ AttentionHost::AttentionHost(const TargetModel& model, std::uint32_t layers, std
 AttentionHost::~AttentionHost() = default;
 
 const std::vector<std::uint32_t>& AttentionHost::topk(std::uint32_t layer) const { return layers_.at(layer)->topk; }
+std::span<const std::uint8_t> AttentionHost::kv_cache(std::uint32_t layer) const { return layers_.at(layer)->kv_cache; }
+std::span<const std::uint8_t> AttentionHost::idx_cache(std::uint32_t layer) const { return layers_.at(layer)->idx_cache; }
 
 void AttentionHost::window_write(std::uint32_t layer, std::span<const float> kv, std::uint32_t position) {
     const std::string p = "blk." + std::to_string(layer) + ".";

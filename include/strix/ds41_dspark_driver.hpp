@@ -119,6 +119,63 @@ private:
     bool explore_ = false;
 };
 
+// Batch window controller (DSpark inside BatchForward, N > 1): one plan per step for every decoding request of the
+// step, in two stages, from MEASURED costs. Deterministic in its inputs; it never changes tokens.
+//  - Step cost model (seconds): plain[n] = a step of n requests with one row each (measured: the BatchForward step
+//    of n segments), every extra window row adds `row`, every request that drafts adds `draft` (one drafter call per
+//    request), and a step with drafts adds `extra` per request (append of its rows to its drafting context, commit).
+//    Rows of prompts read in the same step are outside the plan (they do not depend on it).
+//  - Stage 1, before drafting (no confidences yet): which requests draft, from each request's own survival per depth
+//    (its verified windows, shrunk towards the rates pooled over every request with 8 pseudo-observations). The
+//    choice maximises the step's expected tokens per second under the row budget; the all-plain plan is included.
+//  - Stage 2, after drafting (the drafter calls are paid): each drafted request's rows (1..6) from its drafts'
+//    confidences (P(d_j ok | d_<j ok) per depth x confidence bin pooled over requests, shrunk as in
+//    WindowController), under the same row budget.
+//  - Exploration: every 16th plan drafts one request that has room (round-robin; stage 2 still decides its rows), so
+//    drafting costs and survival keep being measured while plain steps lead.
+//  The search over row vectors is exhaustive up to 4 requests, else a local search (+1 / -1 / move one row) from
+//  every uniform start; both include the all-plain plan.
+class BatchWindowController {
+public:
+    static constexpr std::uint32_t max_requests = 8, max_window = block_size + 1U, explore_every = 16;
+    struct Costs {
+        std::array<float, max_requests + 1U> plain{};  // [n], 0 = not measured
+        float row = 0.0F, draft = 0.0F, extra = 0.0F;  // row / draft 0 = not measured (defaults: see step_cost)
+        // drafters running in parallel (the two ranks): n drafting requests cost ceil(n / drafters) drafts plus
+        // `round` (the exchanges of a split draft round)
+        std::uint32_t drafters = 1;
+        float round = 0.0F;
+    };
+    explicit BatchWindowController(std::uint32_t slots);
+    void set_costs(const Costs& costs) { costs_ = costs; }
+    [[nodiscard]] const Costs& costs() const noexcept { return costs_; }
+    // A new request in `slot`: its own survival history is forgotten.
+    void reset(std::uint32_t slot);
+    // Stage 1: for the decoding requests `slots` (at most limit[i] rows each, >= 1) and `budget` rows in total
+    // (>= slots.size()), which ones draft.
+    [[nodiscard]] std::vector<bool> plan_drafts(std::span<const std::uint32_t> slots, std::span<const std::uint32_t> limit, std::uint32_t budget);
+    // Stage 2: rows per request (1 = its token only) given which ones drafted and their drafts (others ignored).
+    [[nodiscard]] std::vector<std::uint32_t> choose_rows(std::span<const std::uint32_t> slots, std::span<const std::uint32_t> limit,
+                                                         std::uint32_t budget, const std::vector<bool>& drafted, std::span<const Draft> drafts) const;
+    // After the step: a drafted request verified `verified` drafts and accepted `accepted` of them.
+    void observe(std::uint32_t slot, const Draft& d, std::uint32_t verified, std::uint32_t accepted);
+    // Modelled step time of a plan (rows per request; `drafting` requests called the drafter).
+    [[nodiscard]] double step_cost(std::span<const std::uint32_t> rows, std::uint32_t drafting) const;
+    [[nodiscard]] double plain_cost(std::uint32_t n) const;
+    [[nodiscard]] double probability(std::uint32_t depth, float confidence) const;
+    [[nodiscard]] double slot_survival(std::uint32_t slot, std::uint32_t depth) const;
+
+private:
+    // the best rows per request for expected tokens expected[i][R - 1] under the budget; the step pays `drafting`
+    // drafter calls (drafting < 0: one per request with more than one row)
+    [[nodiscard]] std::vector<std::uint32_t> search(const std::vector<std::vector<double>>& expected, std::span<const std::uint32_t> limit,
+                                                    std::uint32_t budget, int drafting) const;
+    Costs costs_;
+    std::array<std::array<std::uint32_t, WindowController::bins>, block_size> seen_{}, hits_{};  // pooled, by confidence
+    std::vector<std::array<std::uint32_t, block_size>> slot_seen_, slot_hits_;
+    std::uint64_t plans_ = 0;
+};
+
 struct WindowPolicy {
     bool automatic = false;
     std::uint32_t drafts = block_size;                  // fixed window

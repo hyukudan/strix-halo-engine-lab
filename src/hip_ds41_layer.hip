@@ -1792,7 +1792,12 @@ namespace {
 std::uint32_t fp8_outputs_per_wave = 0;  // 0: STRIX_DS41_FP8_W or 1
 
 void enqueue_fp8_a8(const Q8A8View& view, hipStream_t q) {
-    require(view.scales && !view.planar && view.rows <= max_rows, "native FP8 x A8 site: scales, interleaved rows, 1..8 rows");
+    require(view.scales && !view.planar && view.rows <= 16U, "native FP8 x A8 site: scales, interleaved rows, 1..16 rows");
+    if (view.rows > max_rows) {
+        launch_fp8_a8<16, 1>(view, q);
+        check(hipGetLastError(), "native FP8 x A8 sixteen-row launch");
+        return;
+    }
     // Outputs per wave (1, 2 or 4; same bits): STRIX_DS41_FP8_W, default 1 at 1-2 rows (one contiguous row stream per
     // wave) and 2 from 3 rows (each row's unpacked A8 codes serve two outputs). 5-8 rows take at most 2 (4 spills).
     static const unsigned env_w = [] { const char* e = std::getenv("STRIX_DS41_FP8_W"); return e && (e[0] == '1' || e[0] == '2' || e[0] == '4') ? unsigned(e[0] - '0') : 0U; }();
@@ -1823,7 +1828,7 @@ static Q8A8View checked_q8_0_a8(const Q8A8View& v) {
     require(v.packed == 0U || (v.packed >= 4U && v.packed <= 6U), "Q8_0 x A8 site: packed must be 0, 4, 5 or 6");
     require(!v.planar || v.packed != 0U, "Q8_0 x A8 site: planar needs packed rows");
     require(!v.planar, "Q8_0 x A8 site: no planar packed kernel is registered yet");
-    require(v.weight && v.codes && v.deltas && v.out && v.count && v.width && v.width % 32U == 0 && v.rows >= 1 && v.rows <= max_rows &&
+    require(v.weight && v.codes && v.deltas && v.out && v.count && v.width && v.width % 32U == 0 && v.rows >= 1 && v.rows <= 16U &&
                 v.x_stride % 32U == 0 && view.count % view.per_group == 0 && reinterpret_cast<std::uintptr_t>(v.codes) % 16U == 0 &&
                 (v.rows == 1 || v.x_stride >= (view.count / view.per_group) * v.width) &&
                 (!v.row_width || (v.row_width % 32U == 0 && v.k_offset % 32U == 0 && v.k_offset + v.width <= v.row_width &&
@@ -1852,6 +1857,17 @@ void enqueue_q8_0_a8(const Q8A8View& v, void* stream) {
         return;
     }
     const Q8A8View view = checked_q8_0_a8(v);
+    // A real sixteen-row product: each weight load serves every row. Keep all <=8
+    // specializations and their LDS sizes unchanged. The separate output quantizer
+    // has the same per-row bytes as the fused epilogue.
+    if (v.rows > max_rows) {
+        Q8A8View plain = view;
+        plain.a8_codes = nullptr;
+        launch_q8_0_a8<16, 1>(plain, as_stream(stream));
+        check(hipGetLastError(), "Q8_0 x A8 sixteen-row launch");
+        if (v.a8_codes) enqueue_quantize_a8(v.out, v.count, v.rows, v.a8_codes, v.a8_deltas, v.a8_sums, stream);
+        return;
+    }
     // STRIX_DS41_RN_WIDE=1|2: 2-8 rows in the multi-row form (hip_ds41_rn_wide.hpp), same bits; =1 the default shape
     // for every site, =2 the per site x format x rows table (hip_ds41_rn_table.hpp; may keep this kernel). The rn form
     // does not write the output A8 (ATTN_A8): then the separate quantize of out, the declared same-bits fallback.
@@ -1928,6 +1944,10 @@ void enqueue_q8_0_a8_pair(const Q8A8View& a, const Q8A8View& b, void* stream) {
 
 void enqueue_f16_rows(const F16RowsView& v, void* stream) {
     require((v.weight || v.weight_f8) && v.x && v.out && v.count && v.width && v.rows >= 1, "F16 rows view");
+    if (v.rows > max_rows && v.rows <= 16U && f16_rows_lanes_supported(v)) {
+        enqueue_f16_rows_lanes(v, stream);
+        return;
+    }
     if (v.weight_f8) {  // F8 rows: only the lanes kernel reads them
         require(v.rows <= max_rows && f16_rows_lanes_supported(v), "F16 rows view: F8 rows need the lanes kernel (decode rows)");
         // STRIX_DS41_ENGRAM_FAST=1, 1 row: 16-byte F8 loads, activations staged once per 32 rows (hip_ds41_f8_rows_fast.hip; same bits)
@@ -1978,8 +1998,8 @@ void enqueue_f16_rows(const F16RowsView& v, void* stream) {
 }
 
 void enqueue_f16_rows_pair(const F16RowsView& a, const F16RowsView& b, void* stream) {
-    // STRIX_DS41_F16_PAIR=1 (default off): one launch when both views take the lanes kernels (hip_ds41_f16_rows.hip)
-    static const bool pair = [] { const char* e = std::getenv("STRIX_DS41_F16_PAIR"); return e && e[0] == '1'; }();
+    // STRIX_DS41_F16_PAIR (on by default since P16, =0 off): one launch when both views take the lanes kernels (hip_ds41_f16_rows.hip)
+    static const bool pair = [] { const char* e = std::getenv("STRIX_DS41_F16_PAIR"); return !(e && e[0] == '0'); }();
     static const bool lanes = [] { const char* e = std::getenv("STRIX_DS41_F16_LANES"); return !(e && e[0] == '0'); }();
     if (pair && lanes && a.rows <= max_rows && f16_rows_pair_supported(a, b)) {
         enqueue_f16_rows_lanes_pair(a, b, stream);

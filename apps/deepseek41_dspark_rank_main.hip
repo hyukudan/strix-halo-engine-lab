@@ -1,6 +1,6 @@
 // One rank of the two-node deepseek41 decode with DSpark speculative drafting and verify windows, or both ranks in
 // one process over the in-memory transport (--transport emulate, trimmed models).
-//   strix-deepseek41-dspark-rank MODEL.gguf DRAFT.gguf --rank R --transport usb4:DEV,DEV,... | tcp-listen:PORT |
+//   strix-deepseek41-dspark-rank MODEL.gguf DRAFT.gguf --rank R --transport usb4:DEV,DEV,... | usb4auto | usb4gpu | tcp-listen:PORT |
 //       tcp-connect:HOST:PORT | emulate  --layers N --prompt-ids a,b,c --generate G
 //       [--mode greedy | spec | bench] [--draft split | rank0] [--vocab SPEC] [--bench-rows 1,2,4,6,8] [--bench-reps N]
 //       [--engram-direct] [--connect-timeout S] [--max-positions P] [--reference a,b,c --oracle-rows 2,4,8] [--gate]
@@ -10,10 +10,13 @@
 // last three layers to the drafter; the tokens equal greedy's. bench: window costs per row count. oracle: windows of
 // the cycled sizes whose drafts are the greedy reference continuation made wrong from a varying row on (every
 // acceptance depth, every rollback); the tokens must equal the reference.
+// --prompt-file F with greedy or spec: every prompt of F (one comma list per line) in turn on the loaded weights, one
+// result block each (a prompt set for stable acceptance numbers).
 // Draft placement: split = both ranks draft, the drafter's head split by vocabulary (8-byte candidate exchange per
 // Markov step, the rest replicated); rank0 = rank 0 drafts alone and sends the window (k and the drafts) to rank 1.
 #include "strix/deepseek41_device_forward.hpp"
 #include "strix/dist/communicator.hpp"
+#include "strix/dist/gpu_direct.hpp"
 #include "strix/ds41_dspark_driver.hpp"
 #include "strix/ds41_dspark_files.hpp"
 #include "strix/ds41_dspark_vocab.hpp"
@@ -64,7 +67,10 @@ std::vector<std::uint32_t> parse_list(const std::string& s) {
     return out;
 }
 
-std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, unsigned timeout) {
+// usb4gpu: the device exchange (GPU-direct streams) built next to the host-path control transport (null: host path).
+std::unique_ptr<strix::dist::DeviceExchange> gpu_direct;
+
+std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, unsigned timeout) {
     const std::chrono::seconds limit(timeout);
     const auto colon = spec.find(':');
     const std::string kind = spec.substr(0, colon), rest = colon == std::string::npos ? "" : spec.substr(colon + 1);
@@ -78,6 +84,24 @@ std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, 
         std::stringstream ss(rest);
         for (std::string d; std::getline(ss, d, ',');) devices.push_back(d);
         return strix::dist::usb4_host(devices);
+    }
+    if (kind == "usb4auto" || kind == "usb4gpu") {  // usb4gpu: GPU-direct exchanges over the gpu_direct streams
+        strix::dist::Usb4AutoOptions o;
+        o.rank = rank;
+        o.timeout = limit;
+        strix::dist::Usb4Topology topology;
+        auto t = strix::dist::usb4_host_auto(o, &topology);
+        std::printf("usb4 topology: %s\n", topology.receipt().c_str());
+        if (kind == "usb4auto") return t;
+        std::string why;
+        if (strix::dist::usb4_gpu_direct_streams(o, *t, &why) == 0U) {  // both ranks agree from the same exchanged counts
+            std::printf("gpu-direct unavailable (%s): host path only\n", why.c_str());
+            return t;
+        }
+        std::string receipt;
+        gpu_direct = strix::dist::usb4_gpu_direct(o, topology, *t, {}, &receipt);
+        std::printf("usb4 %s\n", receipt.c_str());
+        return t;
     }
     throw std::invalid_argument("unknown or unavailable transport " + spec);
 }
@@ -105,6 +129,36 @@ struct Stats {
     double draft = 0, packet = 0, verify = 0, verify_exchange = 0, append = 0, total = 0;
 };
 
+// STRIX_DS41_DSPARK_FORCE=cycle:R1,R2,.. (spec): window i verifies R_(i mod n) rows (1..6; R1 = the drafter still
+// runs on every step, its proposals are only recorded). Same on both ranks (window count). Unset = the policy decides.
+std::vector<std::uint32_t> forced_windows_from_env() {
+    const char* v = std::getenv("STRIX_DS41_DSPARK_FORCE");
+    if (v == nullptr || *v == 0) return {};
+    const std::string s(v);
+    if (s.rfind("cycle:", 0) != 0) throw std::invalid_argument("STRIX_DS41_DSPARK_FORCE=cycle:R,R,..");
+    auto rows = parse_list(s.substr(6));
+    for (const auto R : rows)
+        if (R < 1U || R > ds::block_size + 1U) throw std::invalid_argument("STRIX_DS41_DSPARK_FORCE rows 1..6");
+    if (rows.empty()) throw std::invalid_argument("STRIX_DS41_DSPARK_FORCE: no rows");
+    return rows;
+}
+
+// One comma list of ids per line (empty lines skipped).
+std::vector<std::vector<std::uint32_t>> read_prompts(const std::string& path) {
+    std::vector<std::vector<std::uint32_t>> prompts;
+    std::FILE* f = std::fopen(path.c_str(), "r");
+    if (f == nullptr) throw std::invalid_argument("cannot read " + path);
+    std::string line;
+    for (int c; (c = std::fgetc(f)) != EOF;) {
+        if (c == '\n') { if (!line.empty()) prompts.push_back(parse_list(line)); line.clear(); }
+        else if (c != '\r') line.push_back(static_cast<char>(c));
+    }
+    if (!line.empty()) prompts.push_back(parse_list(line));
+    std::fclose(f);
+    if (prompts.empty()) throw std::invalid_argument(path + ": no prompts");
+    return prompts;
+}
+
 // Data for the drafter's offline replay and distillation: for every prompt of --prompt-file (one comma list per line),
 // greedy decoding of --generate tokens, writing <dump>-<i>.tokens (prompt length, then every token: prompt and
 // generated), <dump>-<i>.hidden (f32 [steps][15360]: the drafter's input row of each fed token, bitwise the
@@ -112,18 +166,7 @@ struct Stats {
 // is reset between prompts.
 void run_dump(const Args& a, strix::deepseek41::DeviceForward& fwd, bool write) {
     auto* st = static_cast<hipStream_t>(fwd.stream());
-    std::vector<std::vector<std::uint32_t>> prompts;
-    {
-        std::FILE* f = std::fopen(a.prompt_file.c_str(), "r");
-        if (f == nullptr) throw std::invalid_argument("cannot read " + a.prompt_file);
-        std::string line;
-        for (int c; (c = std::fgetc(f)) != EOF;) {
-            if (c == '\n') { if (!line.empty()) prompts.push_back(parse_list(line)); line.clear(); }
-            else if (c != '\r') line.push_back(static_cast<char>(c));
-        }
-        if (!line.empty()) prompts.push_back(parse_list(line));
-        std::fclose(f);
-    }
+    const auto prompts = read_prompts(a.prompt_file);
     float *row = nullptr, *rows_dev = nullptr;
     check(hipMalloc(reinterpret_cast<void**>(&row), std::size_t{ds::main_width} * 4U), "dump row");
     check(hipMalloc(reinterpret_cast<void**>(&rows_dev), std::size_t{ds::main_width} * 8U * 4U), "dump rows");
@@ -212,7 +255,7 @@ void run_dump(const Args& a, strix::deepseek41::DeviceForward& fwd, bool write) 
 
 void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport, bool print) {
     const auto t_start = clock_type::now();
-    strix::dist::Communicator comm(strix::dist::Group{rank, 2U, 1U, 0x64733432ULL}, std::move(transport), 512U << 10U);
+    strix::dist::Communicator comm(strix::dist::Group{rank, 2U, 1U, 0x64733432ULL}, std::move(transport), std::move(gpu_direct), 512U << 10U);
     const bool spec = a.mode == "spec", oracle = a.mode == "oracle";
     const auto reference = a.reference.empty() ? std::vector<std::uint32_t>{} : parse_list(a.reference);
     const auto oracle_rows = parse_list(a.oracle_rows);
@@ -237,8 +280,11 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
     std::unique_ptr<ds::LoadedWeights> draft_weights;
     std::unique_ptr<ds::DeviceDrafter> drafter;
     std::uint64_t draft_request = 0;
-    const auto prompt = parse_list(a.prompt);
-    const auto choice = ds::choose_vocabulary(a.vocab, prompt);
+    // --prompt-file with greedy / spec: every line in turn on the same weights (decode state, drafter and window
+    // policy fresh per prompt), one result block per prompt
+    const auto set = !a.prompt_file.empty() && (a.mode == "greedy" || spec) ? read_prompts(a.prompt_file)
+                                                                          : std::vector<std::vector<std::uint32_t>>{parse_list(a.prompt)};
+    const auto choice = ds::choose_vocabulary(a.vocab, set[0]);
     if (drafting) {
         draft_weights = ds::load_weights(a.model, a.draft);
         drafter = std::make_unique<ds::DeviceDrafter>(draft_weights->weights);
@@ -259,313 +305,350 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
         return;
     }
     Scratch scratch;
-    const auto policy = ds::window_policy_from_env();
+    // STRIX_DS41_DSPARK_TRACE=FILE (spec, rank 0): one JSON line per window (input position, the 5 proposals and
+    // confidences, verified rows, the target's tokens for them, accepted, draft / verify / append ms), and one line per
+    // prompt with the prompt and the generated tokens. Output tokens are unchanged.
+    const auto forced = spec ? forced_windows_from_env() : std::vector<std::uint32_t>{};
+    std::FILE* trace = nullptr;
+    if (const char* tv = std::getenv("STRIX_DS41_DSPARK_TRACE"); spec && rank == 0U && tv != nullptr && *tv != 0) {
+        trace = std::fopen(tv, "a");
+        if (trace == nullptr) throw std::runtime_error(std::string("cannot write ") + tv);
+    }
+    for (std::size_t si = 0; si < set.size(); ++si) {
+        const auto& prompt = set[si];
+        if (si > 0U) {
+            fwd.reset();
+            if (drafter) {
+                drafter->reset();
+                drafter->set_vocabulary(ds::choose_vocabulary(a.vocab, prompt).vocabulary);
+            }
+        }
+        if (print && set.size() > 1U) std::printf("==== prompt %zu of %zu (%zu tokens)\n", si, set.size(), prompt.size());
+        const auto policy = ds::window_policy_from_env();
 
-    // ---- prompt: one row per step; the drafter gets every row's input ----
-    const auto t_prompt = clock_type::now();
-    std::uint32_t t = 0, staged = 0;
-    const auto flush = [&] {
-        if (staged == 0U) return;
-        drafter->append_hidden_device(scratch.main_hidden, staged, st);
-        staged = 0;
-    };
-    double prompt_step_sum = 0.0;
-    std::uint32_t prompt_step_n = 0;
-    for (std::size_t pi = 0; pi < prompt.size(); ++pi) {
-        const auto ts = clock_type::now();
-        (void)fwd.step(prompt[pi]);
-        if (pi >= 4U) prompt_step_sum += since(ts), ++prompt_step_n;  // the first steps pay one-time costs
-        t = fwd.next_token();
+        // ---- prompt: one row per step; the drafter gets every row's input ----
+        const auto t_prompt = clock_type::now();
+        std::uint32_t t = 0, staged = 0;
+        const auto flush = [&] {
+            if (staged == 0U) return;
+            drafter->append_hidden_device(scratch.main_hidden, staged, st);
+            staged = 0;
+        };
+        double prompt_step_sum = 0.0;
+        std::uint32_t prompt_step_n = 0;
+        for (std::size_t pi = 0; pi < prompt.size(); ++pi) {
+            const auto ts = clock_type::now();
+            (void)fwd.step(prompt[pi]);
+            if (pi >= 4U) prompt_step_sum += since(ts), ++prompt_step_n;  // the first steps pay one-time costs
+            t = fwd.next_token();
+            if (drafting) {
+                const auto caps = fwd.captured_streams();
+                ds::enqueue_main_hidden(caps[0], caps[1], caps[2], 1U, scratch.main_hidden + std::size_t{staged} * ds::main_width, st);
+                if (++staged == 128U) flush();
+            }
+        }
         if (drafting) {
-            const auto caps = fwd.captured_streams();
-            ds::enqueue_main_hidden(caps[0], caps[1], caps[2], 1U, scratch.main_hidden + std::size_t{staged} * ds::main_width, st);
-            if (++staged == 128U) flush();
+            flush();
+            drafter->add_vocabulary(prompt);
+            const std::uint32_t first[1] = {t};
+            drafter->add_vocabulary(first);
         }
-    }
-    if (drafting) {
-        flush();
-        drafter->add_vocabulary(prompt);
-        const std::uint32_t first[1] = {t};
-        drafter->add_vocabulary(first);
-    }
-    const double prompt_seconds = since(t_prompt);
-    std::vector<std::uint32_t> out{t};
-    Stats S;
-    const auto t_gen = clock_type::now();
+        const double prompt_seconds = since(t_prompt);
+        std::vector<std::uint32_t> out{t};
+        Stats S;
+        const auto t_gen = clock_type::now();
 
-    if (a.mode == "greedy") {
-        while (out.size() < a.generate) {
-            const auto t0 = clock_type::now();
-            const std::uint32_t one[1] = {t};
-            t = fwd.step_window(one)[0];
-            S.verify += since(t0);
-            ++S.verify_by_rows[1].first;
-            S.verify_by_rows[1].second += fwd.last_step_seconds();
-            out.push_back(t);
-        }
-    } else if (a.mode == "bench") {
-        // Window cost per row count: rows [t, t, ...] then keep one row (the state stays a valid prefix of t's).
-        for (const auto R : parse_list(a.bench_rows)) {
-            std::vector<std::uint32_t> w(R, t);
-            double sum = 0, exch = 0;
-            for (std::uint32_t i = 0; i < a.bench_reps + 1U; ++i) {
-                const double c0 = comm.stats().seconds;
-                const auto t0 = clock_type::now();
-                (void)fwd.step_window(w);
-                const double s = since(t0);
-                fwd.commit_window(1);
-                if (i > 0U) { sum += s; exch += comm.stats().seconds - c0; }  // the first pays one-time costs
-                t = fwd.last_tokens()[0];
-                std::fill(w.begin(), w.end(), t);
-            }
-            if (print)
-                std::printf("bench R%u: %.2f ms per window (exchange %.2f ms), %.2f ms per row\n", R, sum * 1e3 / a.bench_reps,
-                            exch * 1e3 / a.bench_reps, sum * 1e3 / a.bench_reps / R);
-        }
-    } else {
-        // Online window costs and the drafting gate, decided on rank 0 and sent to rank 1 after every window (32 bytes),
-        // so both ranks choose the same windows: cost[k] = draft + verify of k + 1 rows (EMAs of rank 0's times, a
-        // linear guess until a size is seen); the gate drafts while the measured rate of drafted windows (tokens per
-        // second, draft and append included) beats single steps, and tries the other side every 16th decision.
-        const auto ctl = spec ? policy.controller : nullptr;  // STRIX_DS41_DSPARK_WINDOW=controller
-        const bool gated = spec && (a.gate || ctl);
-        // controller costs, accumulated on rank 0 (sums and counts) and shared as means through the control packet
-        std::array<double, ds::block_size + 2U> cost_sum{};
-        std::array<std::uint32_t, ds::block_size + 2U> cost_n{};
-        double draft_sum = 0.0, extra_sum = 0.0;
-        std::uint32_t draft_n = 0;
-        if (prompt_step_n != 0U) cost_sum[1] = prompt_step_sum, cost_n[1] = prompt_step_n;
-        std::array<double, ds::block_size + 2U> verify_ema{};
-        double draft_ema = 0.0, rate_spec = 0.0, rate_plain = 0.0;
-        std::uint32_t since_switch = 0;
-        bool use_spec = true;
-        const auto ema = [](double& e, double v) { e = e == 0.0 ? v : 0.875 * e + 0.125 * v; };
-        const auto push_costs = [&] {
-            if (!policy.survival) return;
-            const double v1 = verify_ema[1] != 0.0 ? verify_ema[1] : 0.075;
-            for (std::uint32_t k = 0; k <= ds::block_size; ++k) {
-                const double v = verify_ema[k + 1U] != 0.0 ? verify_ema[k + 1U] : v1 * (1.0 + 0.3 * k);
-                policy.survival->set_cost(k, static_cast<float>((draft_ema + v) * 1e3));
-            }
-        };
-        const auto control = [&](std::uint32_t seq) {  // rank 0's gate and costs to both ranks
-            if (ctl) {
-                // [0..5] verify of 1..6 rows, [6] draft, [7] append + control, [8] rank 0's next decision (draft or not)
-                const auto t0 = clock_type::now();
-                float packet[16] = {};
-                for (std::uint32_t r = 1; r <= ds::block_size + 1U; ++r)
-                    packet[r - 1U] = cost_n[r] != 0U ? static_cast<float>(cost_sum[r] / cost_n[r]) : 0.0F;
-                packet[6] = draft_n != 0U ? static_cast<float>(draft_sum / draft_n) : 0.0F;
-                packet[7] = draft_n != 0U ? static_cast<float>(extra_sum / draft_n) : 0.0F;
-                const auto apply = [&](const float* q) {
-                    auto c = ctl->costs();  // sample counts are kept locally (both ranks run the same windows)
-                    for (std::uint32_t r = 1; r <= ds::block_size + 1U; ++r) c.verify[r] = q[r - 1U];
-                    c.draft = q[6];
-                    c.extra = q[7];
-                    ctl->set_costs(c);
-                };
-                if (rank == 0U) {
-                    apply(packet);
-                    packet[8] = ctl->draft_next() ? 1.0F : 0.0F;
-                }
-                check(hipMemcpyAsync(scratch.packet, packet, 64U, hipMemcpyHostToDevice, st), "control");
-                comm.exchange(st, scratch.packet, scratch.packet + 16, 64U,
-                              strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 1003U, seq});
-                if (rank == 1U) {
-                    check(hipMemcpyAsync(packet, scratch.packet + 16, 64U, hipMemcpyDeviceToHost, st), "control");
-                    check(hipStreamSynchronize(st), "control");
-                    apply(packet);
-                    // with the drafter on both ranks the controllers advance together: same decision or a bug
-                    if (drafting && ctl->draft_next() != (packet[8] != 0.0F))
-                        throw std::logic_error("DSpark controller: the ranks disagree on drafting");
-                }
-                use_spec = packet[8] != 0.0F;
-                S.packet += since(t0);
-                return;
-            }
-            if (!gated && !policy.survival) return;
-            const auto t0 = clock_type::now();
-            float packet[8] = {use_spec ? 1.0F : 0.0F};
-            for (std::uint32_t k = 0; k <= ds::block_size; ++k) {
-                const double v = verify_ema[k + 1U] != 0.0 ? verify_ema[k + 1U] : 0.0;
-                packet[1U + k] = static_cast<float>(v);
-            }
-            packet[7] = static_cast<float>(draft_ema);
-            check(hipMemcpyAsync(scratch.packet, packet, 32U, hipMemcpyHostToDevice, st), "control");
-            comm.exchange(st, scratch.packet, scratch.packet + 8, 32U,
-                          strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 1002U, seq});
-            if (rank == 1U) {
-                check(hipMemcpyAsync(packet, scratch.packet + 8, 32U, hipMemcpyDeviceToHost, st), "control");
-                check(hipStreamSynchronize(st), "control");
-            }
-            use_spec = packet[0] != 0.0F;  // both ranks continue from the packet's (float) values
-            for (std::uint32_t k = 0; k <= ds::block_size; ++k) verify_ema[k + 1U] = packet[1U + k];
-            draft_ema = packet[7];
-            push_costs();
-            S.packet += since(t0);
-        };
-        std::uint32_t decisions = 0;
-        if (ctl) control(decisions++);  // V1 from the prompt before the first decision
-        while (out.size() < a.generate) {
-            if (gated && !use_spec) {  // a single step; its row is staged for the drafter
+        if (a.mode == "greedy") {
+            while (out.size() < a.generate) {
                 const auto t0 = clock_type::now();
                 const std::uint32_t one[1] = {t};
                 t = fwd.step_window(one)[0];
+                S.verify += since(t0);
+                ++S.verify_by_rows[1].first;
+                S.verify_by_rows[1].second += fwd.last_step_seconds();
+                out.push_back(t);
+            }
+        } else if (a.mode == "bench") {
+            // Window cost per row count: rows [t, t, ...] then keep one row (the state stays a valid prefix of t's).
+            for (const auto R : parse_list(a.bench_rows)) {
+                std::vector<std::uint32_t> w(R, t);
+                double sum = 0, exch = 0;
+                for (std::uint32_t i = 0; i < a.bench_reps + 1U; ++i) {
+                    const double c0 = comm.stats().seconds;
+                    const auto t0 = clock_type::now();
+                    (void)fwd.step_window(w);
+                    const double s = since(t0);
+                    fwd.commit_window(1);
+                    if (i > 0U) { sum += s; exch += comm.stats().seconds - c0; }  // the first pays one-time costs
+                    t = fwd.last_tokens()[0];
+                    std::fill(w.begin(), w.end(), t);
+                }
+                if (print)
+                    std::printf("bench R%u: %.2f ms per window (exchange %.2f ms), %.2f ms per row\n", R, sum * 1e3 / a.bench_reps,
+                                exch * 1e3 / a.bench_reps, sum * 1e3 / a.bench_reps / R);
+            }
+        } else {
+            // Online window costs and the drafting gate, decided on rank 0 and sent to rank 1 after every window (32 bytes),
+            // so both ranks choose the same windows: cost[k] = draft + verify of k + 1 rows (EMAs of rank 0's times, a
+            // linear guess until a size is seen); the gate drafts while the measured rate of drafted windows (tokens per
+            // second, draft and append included) beats single steps, and tries the other side every 16th decision.
+            const auto ctl = spec ? policy.controller : nullptr;  // STRIX_DS41_DSPARK_WINDOW=controller
+            const bool gated = spec && (a.gate || ctl);
+            // controller costs, accumulated on rank 0 (sums and counts) and shared as means through the control packet
+            std::array<double, ds::block_size + 2U> cost_sum{};
+            std::array<std::uint32_t, ds::block_size + 2U> cost_n{};
+            double draft_sum = 0.0, extra_sum = 0.0;
+            std::uint32_t draft_n = 0;
+            if (prompt_step_n != 0U) cost_sum[1] = prompt_step_sum, cost_n[1] = prompt_step_n;
+            std::array<double, ds::block_size + 2U> verify_ema{};
+            double draft_ema = 0.0, rate_spec = 0.0, rate_plain = 0.0;
+            std::uint32_t since_switch = 0;
+            bool use_spec = true;
+            const auto ema = [](double& e, double v) { e = e == 0.0 ? v : 0.875 * e + 0.125 * v; };
+            const auto push_costs = [&] {
+                if (!policy.survival) return;
+                const double v1 = verify_ema[1] != 0.0 ? verify_ema[1] : 0.075;
+                for (std::uint32_t k = 0; k <= ds::block_size; ++k) {
+                    const double v = verify_ema[k + 1U] != 0.0 ? verify_ema[k + 1U] : v1 * (1.0 + 0.3 * k);
+                    policy.survival->set_cost(k, static_cast<float>((draft_ema + v) * 1e3));
+                }
+            };
+            const auto control = [&](std::uint32_t seq) {  // rank 0's gate and costs to both ranks
+                if (ctl) {
+                    // [0..5] verify of 1..6 rows, [6] draft, [7] append + control, [8] rank 0's next decision (draft or not)
+                    const auto t0 = clock_type::now();
+                    float packet[16] = {};
+                    for (std::uint32_t r = 1; r <= ds::block_size + 1U; ++r)
+                        packet[r - 1U] = cost_n[r] != 0U ? static_cast<float>(cost_sum[r] / cost_n[r]) : 0.0F;
+                    packet[6] = draft_n != 0U ? static_cast<float>(draft_sum / draft_n) : 0.0F;
+                    packet[7] = draft_n != 0U ? static_cast<float>(extra_sum / draft_n) : 0.0F;
+                    const auto apply = [&](const float* q) {
+                        auto c = ctl->costs();  // sample counts are kept locally (both ranks run the same windows)
+                        for (std::uint32_t r = 1; r <= ds::block_size + 1U; ++r) c.verify[r] = q[r - 1U];
+                        c.draft = q[6];
+                        c.extra = q[7];
+                        ctl->set_costs(c);
+                    };
+                    if (rank == 0U) {
+                        apply(packet);
+                        packet[8] = ctl->draft_next() ? 1.0F : 0.0F;
+                    }
+                    check(hipMemcpyAsync(scratch.packet, packet, 64U, hipMemcpyHostToDevice, st), "control");
+                    comm.exchange(st, scratch.packet, scratch.packet + 16, 64U,
+                                  strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 1003U, seq});
+                    if (rank == 1U) {
+                        check(hipMemcpyAsync(packet, scratch.packet + 16, 64U, hipMemcpyDeviceToHost, st), "control");
+                        check(hipStreamSynchronize(st), "control");
+                        apply(packet);
+                        // with the drafter on both ranks the controllers advance together: same decision or a bug
+                        if (drafting && ctl->draft_next() != (packet[8] != 0.0F))
+                            throw std::logic_error("DSpark controller: the ranks disagree on drafting");
+                    }
+                    use_spec = packet[8] != 0.0F;
+                    S.packet += since(t0);
+                    return;
+                }
+                if (!gated && !policy.survival) return;
+                const auto t0 = clock_type::now();
+                float packet[8] = {use_spec ? 1.0F : 0.0F};
+                for (std::uint32_t k = 0; k <= ds::block_size; ++k) {
+                    const double v = verify_ema[k + 1U] != 0.0 ? verify_ema[k + 1U] : 0.0;
+                    packet[1U + k] = static_cast<float>(v);
+                }
+                packet[7] = static_cast<float>(draft_ema);
+                check(hipMemcpyAsync(scratch.packet, packet, 32U, hipMemcpyHostToDevice, st), "control");
+                comm.exchange(st, scratch.packet, scratch.packet + 8, 32U,
+                              strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 1002U, seq});
+                if (rank == 1U) {
+                    check(hipMemcpyAsync(packet, scratch.packet + 8, 32U, hipMemcpyDeviceToHost, st), "control");
+                    check(hipStreamSynchronize(st), "control");
+                }
+                use_spec = packet[0] != 0.0F;  // both ranks continue from the packet's (float) values
+                for (std::uint32_t k = 0; k <= ds::block_size; ++k) verify_ema[k + 1U] = packet[1U + k];
+                draft_ema = packet[7];
+                push_costs();
+                S.packet += since(t0);
+            };
+            std::uint32_t decisions = 0;
+            if (ctl) control(decisions++);  // V1 from the prompt before the first decision
+            while (out.size() < a.generate) {
+                if (gated && !use_spec) {  // a single step; its row is staged for the drafter
+                    const auto t0 = clock_type::now();
+                    const std::uint32_t one[1] = {t};
+                    t = fwd.step_window(one)[0];
+                    const double vs = since(t0);
+                    S.verify += vs;
+                    ++S.verify_by_rows[1].first;
+                    S.verify_by_rows[1].second += vs;
+                    ++S.plain_steps;
+                    out.push_back(t);
+                    const auto t1 = clock_type::now();
+                    if (drafting) {
+                        const auto caps = fwd.captured_streams();
+                        ds::enqueue_main_hidden(caps[0], caps[1], caps[2], 1U, scratch.main_hidden + std::size_t{staged} * ds::main_width, st);
+                        if (++staged == 128U) flush();
+                        const std::uint32_t one_out[1] = {t};
+                        drafter->add_vocabulary(one_out);
+                    }
+                    S.append += since(t1);
+                    if (ctl) {
+                        auto c = ctl->costs();
+                        ++c.samples[1];
+                        ctl->set_costs(c);
+                        if (rank == 0U) cost_sum[1] += vs, ++cost_n[1];
+                    } else if (rank == 0U) {
+                        ema(verify_ema[1], vs);
+                        ema(rate_plain, 1.0 / since(t0));
+                        if (++since_switch >= 16U || (rate_spec != 0.0 && rate_spec > rate_plain)) { use_spec = true; since_switch = 0; }
+                    }
+                    control(decisions++);
+                    continue;
+                }
+                const auto t_window = clock_type::now();
+                if (drafting) flush();  // rows of single steps since the last draft
+                // draft (both ranks: split head; or rank 0 alone, then the window packet)
+                auto t0 = clock_type::now();
+                ds::Draft d{};
+                std::uint32_t k = 0;
+                std::vector<std::uint32_t> drafts;
+                if (oracle) {  // the reference continuation, wrong from row `bad` on (none when bad == 0)
+                    const std::uint32_t R = oracle_rows[S.windows % oracle_rows.size()];
+                    k = R - 1U;
+                    const std::uint32_t bad = (S.windows * 7U + S.windows / 3U) % R;
+                    for (std::uint32_t j = 1; j <= k; ++j) {
+                        const std::size_t at = out.size() - 1U + j;
+                        std::uint32_t v = at < reference.size() ? reference[at] : 0U;
+                        if (bad != 0U && j >= bad) v = (v + 1U) % 129280U;
+                        drafts.push_back(v);
+                    }
+                } else if (drafter) {
+                    d = drafter->draft(t, false);
+                    k = policy.choose(d);
+                }
+                if (!forced.empty() && !oracle) k = forced[S.windows % forced.size()] - 1U;
+                const double draft_s = since(t0);
+                S.draft += draft_s;
+                if (!split && !oracle) {
+                    t0 = clock_type::now();
+                    std::uint32_t packet[8] = {k, d.tokens[1], d.tokens[2], d.tokens[3], d.tokens[4], d.tokens[5], 0U, 0U};
+                    check(hipMemcpyAsync(scratch.packet, packet, 32U, hipMemcpyHostToDevice, st), "packet");
+                    comm.exchange(st, scratch.packet, scratch.packet + 8, 32U,
+                                  strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 1001U, S.windows});
+                    if (rank == 1U) {
+                        check(hipMemcpyAsync(packet, scratch.packet + 8, 32U, hipMemcpyDeviceToHost, st), "packet");
+                        check(hipStreamSynchronize(st), "packet");
+                        k = packet[0];
+                        for (std::uint32_t j = 0; j < ds::block_size; ++j) d.tokens[j + 1U] = packet[j + 1U];
+                    }
+                    S.packet += since(t0);
+                }
+                if (!oracle) drafts.assign(d.tokens.begin() + 1, d.tokens.begin() + 1 + k);
+                k = std::min<std::uint32_t>(k, a.generate - static_cast<std::uint32_t>(out.size()) - 1U);  // no rows past the end
+                drafts.resize(k);
+                // verify window [t, d_1..d_k]
+                std::vector<std::uint32_t> w{t};
+                w.insert(w.end(), drafts.begin(), drafts.end());
+                t0 = clock_type::now();
+                const double c0 = comm.stats().seconds;
+                const auto g = fwd.step_window(w);
                 const double vs = since(t0);
                 S.verify += vs;
-                ++S.verify_by_rows[1].first;
-                S.verify_by_rows[1].second += vs;
-                ++S.plain_steps;
-                out.push_back(t);
-                const auto t1 = clock_type::now();
+                S.verify_exchange += comm.stats().seconds - c0;
+                auto& vr = S.verify_by_rows[k + 1U];
+                ++vr.first;
+                vr.second += vs;
+                std::uint32_t accepted = 0;
+                while (accepted < k && drafts[accepted] == g[accepted]) ++accepted;
+                const std::size_t trace_pos = out.size() - 1U;
+                ++S.windows;
+                S.verified += k;
+                S.accepted += accepted;
+                for (std::uint32_t j = 0; j < k && j <= accepted && j < ds::block_size; ++j) {
+                    ++S.reached[j];
+                    if (j < accepted) ++S.hit[j];
+                }
+                if (!oracle) policy.observe(d, k, accepted);
+                for (std::uint32_t j = 0; j <= accepted; ++j) out.push_back(g[j]);
+                t = g[accepted];
+                // commit the accepted prefix and append its rows to the drafter
+                t0 = clock_type::now();
+                fwd.commit_window(accepted + 1U);
                 if (drafting) {
                     const auto caps = fwd.captured_streams();
-                    ds::enqueue_main_hidden(caps[0], caps[1], caps[2], 1U, scratch.main_hidden + std::size_t{staged} * ds::main_width, st);
-                    if (++staged == 128U) flush();
-                    const std::uint32_t one_out[1] = {t};
-                    drafter->add_vocabulary(one_out);
+                    ds::enqueue_main_hidden(caps[0], caps[1], caps[2], accepted + 1U, scratch.main_hidden, st);
+                    drafter->append_hidden_device(scratch.main_hidden, accepted + 1U, st);
+                    drafter->add_vocabulary(std::span<const std::uint32_t>(out).last(accepted + 1U));
                 }
-                S.append += since(t1);
+                S.append += since(t0);
+                if (trace != nullptr) {
+                    std::fprintf(trace, "{\"p\":%zu,\"pos\":%zu,\"ctx\":%zu,\"t\":%u,\"R\":%u,\"d\":[%u,%u,%u,%u,%u],\"c\":[%.4f,%.4f,%.4f,%.4f,%.4f],\"g\":[",
+                                 si, trace_pos, prompt.size() + trace_pos, w[0], k + 1U, d.tokens[1], d.tokens[2], d.tokens[3], d.tokens[4],
+                                 d.tokens[5], d.confidence[0], d.confidence[1], d.confidence[2], d.confidence[3], d.confidence[4]);
+                    for (std::uint32_t j = 0; j <= k; ++j) std::fprintf(trace, j ? ",%u" : "%u", g[j]);
+                    std::fprintf(trace, "],\"a\":%u,\"D\":%.3f,\"V\":%.3f,\"A\":%.3f}\n", accepted, draft_s * 1e3, vs * 1e3, since(t0) * 1e3);
+                }
                 if (ctl) {
                     auto c = ctl->costs();
-                    ++c.samples[1];
+                    ++c.samples[k + 1U];
                     ctl->set_costs(c);
-                    if (rank == 0U) cost_sum[1] += vs, ++cost_n[1];
-                } else if (rank == 0U) {
-                    ema(verify_ema[1], vs);
-                    ema(rate_plain, 1.0 / since(t0));
-                    if (++since_switch >= 16U || (rate_spec != 0.0 && rate_spec > rate_plain)) { use_spec = true; since_switch = 0; }
+                    if (rank == 0U) {
+                        cost_sum[k + 1U] += vs, ++cost_n[k + 1U];
+                        draft_sum += draft_s, extra_sum += since(t0), ++draft_n;  // append (+ the control below, next time)
+                    }
+                } else if (gated && rank == 0U) {
+                    ema(draft_ema, draft_s);
+                    ema(verify_ema[k + 1U], vs);
+                    ema(rate_spec, static_cast<double>(accepted + 1U) / since(t_window));
+                    if (++since_switch >= 16U || (rate_plain != 0.0 && rate_plain > rate_spec)) { use_spec = false; since_switch = 0; }
+                } else if (policy.survival && rank == 0U) {
+                    ema(draft_ema, draft_s);
+                    ema(verify_ema[k + 1U], vs);
                 }
-                control(decisions++);
-                continue;
+                if (!oracle) control(decisions++);
             }
-            const auto t_window = clock_type::now();
-            if (drafting) flush();  // rows of single steps since the last draft
-            // draft (both ranks: split head; or rank 0 alone, then the window packet)
-            auto t0 = clock_type::now();
-            ds::Draft d{};
-            std::uint32_t k = 0;
-            std::vector<std::uint32_t> drafts;
-            if (oracle) {  // the reference continuation, wrong from row `bad` on (none when bad == 0)
-                const std::uint32_t R = oracle_rows[S.windows % oracle_rows.size()];
-                k = R - 1U;
-                const std::uint32_t bad = (S.windows * 7U + S.windows / 3U) % R;
-                for (std::uint32_t j = 1; j <= k; ++j) {
-                    const std::size_t at = out.size() - 1U + j;
-                    std::uint32_t v = at < reference.size() ? reference[at] : 0U;
-                    if (bad != 0U && j >= bad) v = (v + 1U) % 129280U;
-                    drafts.push_back(v);
-                }
-            } else if (drafter) {
-                d = drafter->draft(t, false);
-                k = policy.choose(d);
-            }
-            const double draft_s = since(t0);
-            S.draft += draft_s;
-            if (!split && !oracle) {
-                t0 = clock_type::now();
-                std::uint32_t packet[8] = {k, d.tokens[1], d.tokens[2], d.tokens[3], d.tokens[4], d.tokens[5], 0U, 0U};
-                check(hipMemcpyAsync(scratch.packet, packet, 32U, hipMemcpyHostToDevice, st), "packet");
-                comm.exchange(st, scratch.packet, scratch.packet + 8, 32U,
-                              strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 1001U, S.windows});
-                if (rank == 1U) {
-                    check(hipMemcpyAsync(packet, scratch.packet + 8, 32U, hipMemcpyDeviceToHost, st), "packet");
-                    check(hipStreamSynchronize(st), "packet");
-                    k = packet[0];
-                    for (std::uint32_t j = 0; j < ds::block_size; ++j) d.tokens[j + 1U] = packet[j + 1U];
-                }
-                S.packet += since(t0);
-            }
-            if (!oracle) drafts.assign(d.tokens.begin() + 1, d.tokens.begin() + 1 + k);
-            k = std::min<std::uint32_t>(k, a.generate - static_cast<std::uint32_t>(out.size()) - 1U);  // no rows past the end
-            drafts.resize(k);
-            // verify window [t, d_1..d_k]
-            std::vector<std::uint32_t> w{t};
-            w.insert(w.end(), drafts.begin(), drafts.end());
-            t0 = clock_type::now();
-            const double c0 = comm.stats().seconds;
-            const auto g = fwd.step_window(w);
-            const double vs = since(t0);
-            S.verify += vs;
-            S.verify_exchange += comm.stats().seconds - c0;
-            auto& vr = S.verify_by_rows[k + 1U];
-            ++vr.first;
-            vr.second += vs;
-            std::uint32_t accepted = 0;
-            while (accepted < k && drafts[accepted] == g[accepted]) ++accepted;
-            ++S.windows;
-            S.verified += k;
-            S.accepted += accepted;
-            for (std::uint32_t j = 0; j < k && j <= accepted && j < ds::block_size; ++j) {
-                ++S.reached[j];
-                if (j < accepted) ++S.hit[j];
-            }
-            if (!oracle) policy.observe(d, k, accepted);
-            for (std::uint32_t j = 0; j <= accepted; ++j) out.push_back(g[j]);
-            t = g[accepted];
-            // commit the accepted prefix and append its rows to the drafter
-            t0 = clock_type::now();
-            fwd.commit_window(accepted + 1U);
-            if (drafting) {
-                const auto caps = fwd.captured_streams();
-                ds::enqueue_main_hidden(caps[0], caps[1], caps[2], accepted + 1U, scratch.main_hidden, st);
-                drafter->append_hidden_device(scratch.main_hidden, accepted + 1U, st);
-                drafter->add_vocabulary(std::span<const std::uint32_t>(out).last(accepted + 1U));
-            }
-            S.append += since(t0);
-            if (ctl) {
-                auto c = ctl->costs();
-                ++c.samples[k + 1U];
-                ctl->set_costs(c);
-                if (rank == 0U) {
-                    cost_sum[k + 1U] += vs, ++cost_n[k + 1U];
-                    draft_sum += draft_s, extra_sum += since(t0), ++draft_n;  // append (+ the control below, next time)
-                }
-            } else if (gated && rank == 0U) {
-                ema(draft_ema, draft_s);
-                ema(verify_ema[k + 1U], vs);
-                ema(rate_spec, static_cast<double>(accepted + 1U) / since(t_window));
-                if (++since_switch >= 16U || (rate_plain != 0.0 && rate_plain > rate_spec)) { use_spec = false; since_switch = 0; }
-            } else if (policy.survival && rank == 0U) {
-                ema(draft_ema, draft_s);
-                ema(verify_ema[k + 1U], vs);
-            }
-            if (!oracle) control(decisions++);
+            if (drafting) flush();
         }
-        if (drafting) flush();
-    }
-    S.total = since(t_gen);
-    out.resize(std::min<std::size_t>(out.size(), a.generate));
-    if (!print) return;
-    std::uint64_t h = 14695981039346656037ULL;
-    for (const auto v : out) h = (h ^ v) * 1099511628211ULL;
-    std::printf("tokens (%zu, fnv %016llx):", out.size(), static_cast<unsigned long long>(h));
-    for (const auto v : out) std::printf(" %u", v);
-    std::printf("\n");
-    const auto& cs = comm.stats();
-    if (a.mode != "bench") {
-        const double n = static_cast<double>(out.size() - 1U);  // tokens produced by the generation loop
-        std::printf("prompt %zu tokens in %.2f s; generation %.0f tokens in %.3f s = %.2f tok/s\n", prompt.size(), prompt_seconds, n, S.total,
-                    n / S.total);
-        std::printf("time (ms): draft %.1f, packet %.1f, verify %.1f (exchange %.1f), commit+append %.1f, other %.1f\n", S.draft * 1e3,
-                    S.packet * 1e3, S.verify * 1e3, S.verify_exchange * 1e3, S.append * 1e3,
-                    (S.total - S.draft - S.packet - S.verify - S.append) * 1e3);
-        for (const auto& [R, v] : S.verify_by_rows)
-            std::printf("  verify R%u: %u windows, %.2f ms each\n", R, v.first, v.second * 1e3 / std::max(1U, v.first));
-    }
-    if (spec || oracle) {
-        std::printf("windows %u, drafts verified %u, accepted %u (%.3f per window, %.2f tokens per window)\n", S.windows, S.verified, S.accepted,
-                    static_cast<double>(S.accepted) / std::max(1U, S.windows), 1.0 + static_cast<double>(S.accepted) / std::max(1U, S.windows));
-        std::printf("survival P(d_j ok | d_<j ok):");
-        for (std::uint32_t j = 0; j < ds::block_size; ++j)
-            std::printf(" %u/%u=%.3f", S.hit[j], S.reached[j], S.reached[j] ? static_cast<double>(S.hit[j]) / S.reached[j] : 0.0);
+        S.total = since(t_gen);
+        out.resize(std::min<std::size_t>(out.size(), a.generate));
+        if (trace != nullptr) {
+            std::fprintf(trace, "{\"p\":%zu,\"done\":1,\"prompt\":[", si);
+            for (std::size_t j = 0; j < prompt.size(); ++j) std::fprintf(trace, j ? ",%u" : "%u", prompt[j]);
+            std::fprintf(trace, "],\"out\":[");
+            for (std::size_t j = 0; j < out.size(); ++j) std::fprintf(trace, j ? ",%u" : "%u", out[j]);
+            std::fprintf(trace, "],\"gen_s\":%.4f,\"prompt_s\":%.4f}\n", S.total, prompt_seconds);
+            std::fflush(trace);
+        }
+        if (!print) continue;
+        std::uint64_t h = 14695981039346656037ULL;
+        for (const auto v : out) h = (h ^ v) * 1099511628211ULL;
+        std::printf("tokens (%zu, fnv %016llx):", out.size(), static_cast<unsigned long long>(h));
+        for (const auto v : out) std::printf(" %u", v);
         std::printf("\n");
-        std::printf("draft per window %.2f ms; single steps (gate) %u\n", S.draft * 1e3 / std::max(1U, S.windows), S.plain_steps);
+        const auto& cs = comm.stats();
+        if (a.mode != "bench") {
+            const double n = static_cast<double>(out.size() - 1U);  // tokens produced by the generation loop
+            std::printf("prompt %zu tokens in %.2f s; generation %.0f tokens in %.3f s = %.2f tok/s\n", prompt.size(), prompt_seconds, n, S.total,
+                        n / S.total);
+            std::printf("time (ms): draft %.1f, packet %.1f, verify %.1f (exchange %.1f), commit+append %.1f, other %.1f\n", S.draft * 1e3,
+                        S.packet * 1e3, S.verify * 1e3, S.verify_exchange * 1e3, S.append * 1e3,
+                        (S.total - S.draft - S.packet - S.verify - S.append) * 1e3);
+            for (const auto& [R, v] : S.verify_by_rows)
+                std::printf("  verify R%u: %u windows, %.2f ms each\n", R, v.first, v.second * 1e3 / std::max(1U, v.first));
+        }
+        if (spec || oracle) {
+            std::printf("windows %u, drafts verified %u, accepted %u (%.3f per window, %.2f tokens per window)\n", S.windows, S.verified, S.accepted,
+                        static_cast<double>(S.accepted) / std::max(1U, S.windows), 1.0 + static_cast<double>(S.accepted) / std::max(1U, S.windows));
+            std::printf("survival P(d_j ok | d_<j ok):");
+            for (std::uint32_t j = 0; j < ds::block_size; ++j)
+                std::printf(" %u/%u=%.3f", S.hit[j], S.reached[j], S.reached[j] ? static_cast<double>(S.hit[j]) / S.reached[j] : 0.0);
+            std::printf("\n");
+            std::printf("draft per window %.2f ms; single steps (gate) %u\n", S.draft * 1e3 / std::max(1U, S.windows), S.plain_steps);
+        }
+        std::printf("exchanges %llu, %.1f MB sent, %.3f s in exchange (stage %.3f, wire %.3f, check %.3f); wall %.1f s\n",
+                    static_cast<unsigned long long>(cs.exchanges), static_cast<double>(cs.bytes_sent) / 1e6, cs.seconds, cs.stage, cs.wire, cs.check,
+                    since(t_start));
+        std::fflush(stdout);
     }
-    std::printf("exchanges %llu, %.1f MB sent, %.3f s in exchange (stage %.3f, wire %.3f, check %.3f); wall %.1f s\n",
-                static_cast<unsigned long long>(cs.exchanges), static_cast<double>(cs.bytes_sent) / 1e6, cs.seconds, cs.stage, cs.wire, cs.check,
-                since(t_start));
-    std::fflush(stdout);
 }
 
 // One node alone (world 1; --stream-experts: the routed experts read from the file per layer, decode R = 1 only):
@@ -727,7 +810,7 @@ int main(int argc, char** argv) try {
         else if (a.draft.empty()) a.draft = s;
         else throw std::invalid_argument("unknown argument " + s);
     }
-    if (a.model.empty() || a.draft.empty() || (a.prompt.empty() && a.mode != "dump") || a.generate < 2U ||
+    if (a.model.empty() || a.draft.empty() || (a.prompt.empty() && a.prompt_file.empty()) || a.generate < 2U ||
         (a.mode == "dump" && (a.prompt_file.empty() || a.dump.empty())))
         throw std::invalid_argument("usage: strix-deepseek41-dspark-rank MODEL DRAFT --rank R --transport T --prompt-ids a,b,c ...");
     if (a.mode != "greedy" && a.mode != "spec" && a.mode != "bench" && a.mode != "oracle" && a.mode != "dump")
@@ -761,7 +844,7 @@ int main(int argc, char** argv) try {
     }
     // A blocked open() of a stream on a dead link would hold this node (and the peer) indefinitely.
     ::alarm(a.connect_timeout);
-    auto transport = open_transport(a.transport, a.connect_timeout);
+    auto transport = open_transport(a.transport, a.rank, a.connect_timeout);
     ::alarm(0);
     std::printf("connected (%s)\n", transport->name().c_str());
     std::fflush(stdout);

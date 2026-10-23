@@ -49,10 +49,15 @@ struct PrefillOptions {
     // on its own rows only; the window ring and the compressor run on both ranks over every row from the owners' K/V
     // rows (all-gathered), the routed experts stay split by expert (the MoE input all-gathered, each half sum sent to
     // the row's owner). Same bits as one process; replaces tp_attention.
-    bool row_split = true;  // the world-2 default (main 07:20); false: tensor-parallel attention, every row on both ranks
+    bool row_split = true;  // the world-2 default; false: tensor-parallel attention, every row on both ranks
     // The routed experts are not resident: two layer slots, the next layer's experts read from the file (O_DIRECT) on a
     // thread while the current layer runs (one node: the whole model does not fit). Same bits.
     bool stream_experts = false;
+    // Routed experts in the expert-TP identity ds41-expert-tp2-i1152-v1 (world 2, resident experts, I = 2304, the
+    // dup layout: expert_tp::packed_from_env() false): every rank all experts' K-half parts, its partial sums in the
+    // existing half-sum exchange; the same bits as the expert-TP decode forward. Default off (the expert-parallel
+    // identity); STRIX_DS41_PREFILL_EXPERT_TP=1 turns it on. Reads BatchForward's TP tensors in place via shared_weights.
+    bool expert_tp = false;
     bool engram_direct_io = true;        // Engram rows from the NVMe with O_DIRECT (else the file mapping)
     bool stream_hashes = false;          // FNV of the last row's residual stream after each layer (gate against decode)
     bool gather_logits = true;           // world 2: exchange the vocabulary slices so both ranks hold every logit
@@ -61,7 +66,9 @@ struct PrefillOptions {
     // the last row's logits depend on (ds41_prefill.hpp plan_suffix_replay); every result and the live attention state
     // equal those of a full prefill.
     bool cone = true;
-    std::uint32_t draft_rows = 0;        // rows of the drafter's seed the cone must also cover (0: none)
+    // rows of the drafter's seed (0: none): the last draft_rows rows of a run; the cone also covers them, and the run
+    // keeps their inputs of the last three layers (both ranks hold every seed row; draft_seed())
+    std::uint32_t draft_rows = 0;
     bool routing_loads = false;          // record the routed experts' entry counts per layer (load-balance study)
     // world 2 with row_split: a run of fewer rows takes the tensor-parallel attention form instead (same bits; short
     // prompts: fewer exchanges per layer). Default 9: runs of one window (<= 8 rows) take the TP form (pair: 8 rows 115
@@ -113,6 +120,79 @@ struct PrefillResult {
     std::array<double, 5> attention_parts{};
 };
 
+// ---- resumable prefill (gap #2: a prefill that other requests' decode steps can interleave with) ----
+//
+// A PrefillTask is one run()/extend() of DevicePrefill cut into units. Work happens only inside step(k), which runs the
+// next k units in order and returns when their device work is complete (the prefill's own streams synchronized, no
+// exchange of the prefill pending), so the caller can run other work on the GPU and the communicator (e.g. a
+// BatchForward step of other slots) before the next step(). The units are the same enqueues, in the same order, as
+// the uninterrupted run (cut points only; the cut adds a stream synchronisation at the end of a step() and nothing
+// else), so every row, the logits, the next token and the attention state equal those of run()/extend() for any unit
+// size. The prefill's device scratch, streams and events are its own (it reads the shared weights only); the work runs
+// on a worker thread of the task (its thread-local kernel choices do not leak into the caller's thread) while the
+// caller waits in step(): the caller must not use the DevicePrefill (or call its forwards concurrently) during step().
+//
+// World 2: the list of units, and the place of every exchange in it, is the same on both ranks (loops whose count
+// differs between the ranks are padded with empty units), so both ranks must call step() with the same k sequence
+// (rank 0 decides, e.g. from units_within(), and sends k to rank 1 with its schedule).
+//
+// Unit levels (cut points used): layer = one unit per layer (and the head); phase = + the attention part and the MoE part
+// of a layer; finest = + every attention chunk of chunk_rows rows (q_b, windows, o_a, wo_b), the window K/V + compressor
+// part, every Engram piece of the task's engram_rows rows and every MoE chunk pass of the task's moe_chunk_rows rows.
+enum class PrefillUnitLevel : std::uint32_t { layer = 0, phase = 1, finest = 2 };
+
+struct PrefillTaskOptions {
+    PrefillUnitLevel level = PrefillUnitLevel::finest;
+    // rows per routed-MoE chunk inside the task (0: PrefillOptions::moe_chunk_rows; capped at that). The rows are
+    // independent in the MoE (PrefillMoe: same bits for any chunk), so smaller chunks only bound the unit (each chunk
+    // reads the expert half once). The prefill's own PrefillMoe runs them on row views: no extra scratch. Must be the
+    // same on both ranks. Default 2048 (pair, 8K: largest unit 75 ms vs 123 ms with 4096, +1 % device time).
+    std::uint32_t moe_chunk_rows = 2048;
+    // rows per Engram piece inside the task (0: PrefillOptions::chunk_rows; at most that): the Engram layer's
+    // gather + engram_kv projection + inject is per row, so pieces only bound the unit (finest level: one unit each)
+    std::uint32_t engram_rows = 256;
+    bool unit_timing = true;  // device time of every unit (hip events on the prefill's main stream)
+};
+
+struct PrefillUnitTiming {
+    std::uint32_t index = 0;     // unit number in the task
+    std::int32_t layer = -1;     // layer the unit starts in (-1: setup / head)
+    const char* kind = "";       // what the unit runs (static string)
+    double device_ms = 0.0;      // device time on the main stream from the unit's first to its last enqueue (incl. waits)
+};
+
+class DevicePrefill;
+class PrefillTask {
+public:
+    ~PrefillTask();  // a task not done is cancelled (see cancel())
+    PrefillTask(const PrefillTask&) = delete;
+    PrefillTask& operator=(const PrefillTask&) = delete;
+
+    // Runs the next min(max_units, units left) units (max_units >= 1) and returns how many ran. On return their device
+    // work is complete and no exchange is in flight. The last unit ends with the result (next token, logits).
+    std::uint32_t step(std::uint32_t max_units = 1U);
+    [[nodiscard]] bool done() const noexcept;
+    [[nodiscard]] std::uint32_t units_done() const noexcept;
+    // Rank 0's scheduler: how many of the next units are predicted to fit in budget_ms (>= 1), from the device times of
+    // the same units of the previous layer (the layers' units repeat), else the largest unit seen so far.
+    [[nodiscard]] std::uint32_t units_within(double budget_ms) const;
+    // The run's result (valid once done()); throws if the task failed or was cancelled.
+    [[nodiscard]] const PrefillResult& result() const;
+    [[nodiscard]] const std::vector<PrefillUnitTiming>& unit_timings() const noexcept;
+    // wall time of every step() call so far (ms), and their maximum
+    [[nodiscard]] const std::vector<double>& step_walls() const noexcept;
+    // Abandons the run at the current unit boundary (no further units run). World 2: both ranks must cancel at the
+    // same unit. The DevicePrefill's sequence is then invalid: its next call must be run() (a fresh sequence).
+    void cancel();
+
+    struct State;
+
+private:
+    friend class DevicePrefill;
+    explicit PrefillTask(std::unique_ptr<State> s);
+    std::unique_ptr<State> s_;
+};
+
 class DevicePrefill {
 public:
     DevicePrefill(const std::filesystem::path& gguf, const PrefillOptions& options);
@@ -128,7 +208,19 @@ public:
     // state (rings, compressed KV and index keys, ratio-2 carries) and the Engram history the earlier runs left. The rows
     // so far must be a multiple of window_rows. Every row and the final state equal those of one run of the whole prompt.
     PrefillResult extend(std::span<const std::uint32_t> tokens);
+    // The same runs as resumable tasks (see PrefillTask; the tokens are copied). Nothing runs until the task's first
+    // step(). While a task is not done, this prefill must not be used otherwise (run / extend / begin / export_state /
+    // import_state / state_hashes throw or are undefined); destroy or finish the task first.
+    std::unique_ptr<PrefillTask> begin_run(std::span<const std::uint32_t> tokens, const PrefillTaskOptions& task = {});
+    std::unique_ptr<PrefillTask> begin_extend(std::span<const std::uint32_t> tokens, const PrefillTaskOptions& task = {});
     [[nodiscard]] std::uint32_t positions() const noexcept;  // rows of the sequence so far
+    // draft_rows: the last run's seed -- the input streams of layers layers-3, layers-2, layers-1 of its last `rows`
+    // rows ([rows][hc][hidden] each, device memory, in position order from `first`), valid until the next run.
+    struct DraftSeed {
+        std::array<const float*, 3> streams{};
+        std::uint32_t rows = 0, first = 0;
+    };
+    [[nodiscard]] DraftSeed draft_seed() const noexcept;
     // FNV of every layer's attention state after the last run (the ring's live window, the used compressed KV and
     // index-key entries, carry, the last row's top-k), labelled; the same labels and order as DeviceForward::state_hashes.
     [[nodiscard]] std::vector<std::pair<std::string, std::uint64_t>> state_hashes() const;
@@ -147,7 +239,10 @@ public:
     struct Impl;
 
 private:
+    friend class PrefillTask;
+    friend struct PrefillTask::State;
     PrefillResult run_from(std::span<const std::uint32_t> tokens, std::uint32_t start);
+    std::unique_ptr<PrefillTask> begin_from(std::span<const std::uint32_t> tokens, bool extend, const PrefillTaskOptions& task);
     std::unique_ptr<Impl> impl_;
 };
 

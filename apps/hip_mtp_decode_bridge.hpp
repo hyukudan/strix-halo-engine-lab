@@ -13,6 +13,7 @@
 #include "strix/hip_mtp_forward_replay.hpp"
 #include "strix/mtp_forward_golden_file.hpp"
 #include "strix/hip_mtp_greedy_runtime.hpp"
+#include "strix/mtp_batch_window_controller.hpp"
 #include "strix/hip_mtp_window_verifier.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
 #include "strix/mtp_draft_activation.hpp"
@@ -472,7 +473,7 @@ public:
         std::vector<std::unique_ptr<Slot>> slots, bool interleave = false, std::uint32_t serial_rows_per_step = 16)
         : options_(options), model_(model), compiled_(compiled), qualified_(qualified), activated_(activated),
           enable_draft_(std::move(enable_draft)), slots_(std::move(slots)), interleave_(interleave),
-          serial_rows_per_step_(serial_rows_per_step ? serial_rows_per_step : 1U) {
+          serial_rows_per_step_(serial_rows_per_step ? serial_rows_per_step : 1U),joint_(slots_.size()) {
         if (slots_.empty()) throw std::invalid_argument("batched MTP decoding needs a slot");
     }
     MtpBatchRunner(const MtpBatchRunner&) = delete;
@@ -506,6 +507,7 @@ public:
         s.request = std::move(request);
         s.result = {};
         s.chosen_rows = {};
+        joint_.reset(static_cast<std::uint32_t>(free-slots_.begin()));
         // Exactly the single request's start: fresh target state and session, fresh predictor, no
         // deferred window rows, the request's sampler on the final prompt row and every later row.
         s.greedy.reset();
@@ -574,8 +576,13 @@ public:
         ++stats_.cohort_steps;
         std::vector<HipMtpGreedyCohortMember> members;
         members.reserve(live.size());
-        for (auto* s : live) members.push_back({s->greedy.get(), &s->pending, m.candidate_depth, budget(*s), s->request.stop_tokens});
-        const auto results = hip_mtp_greedy_cohort_cycle(members, &stats_.cohort);
+        for (auto* s : live) {
+            const auto slot=std::find_if(slots_.begin(),slots_.end(),[&](const auto& p){return p.get()==s;})-slots_.begin();
+            members.push_back({s->greedy.get(), &s->pending, m.candidate_depth, budget(*s), s->request.stop_tokens,
+                static_cast<std::uint32_t>(slot)});
+        }
+        static const bool joint=[] {const char* v=std::getenv("STRIX_MTP_BATCH_JOINT");return v && v[0]=='1';}();
+        const auto results = hip_mtp_greedy_cohort_cycle(members, &stats_.cohort,joint?&joint_:nullptr);
         for (std::size_t k = 0; k < live.size(); ++k) apply(*live[k], results[k]);
     }
 
@@ -718,6 +725,7 @@ private:
         return x >= 0.0 ? x : 0.0;
     }();
     Stats stats_;
+    MtpBatchWindowController joint_;
 };
 
 // One synchronous CLI request with externally pinned evidence. Setup/loading,
@@ -728,7 +736,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     SerialSessionContext& session,DirectLaunchDispatcher& dispatcher,AllocationGenerationSource& generations,
     bool deferred_status,std::string_view resolved_profile,std::ostream& output,
     MtpDecodeWindowFactory make_window={},std::function<std::string()> completion_receipt={},
-    MtpDecodeQualification qualify={},MtpDecodeComponentDiagnostic component_diagnostic={}) {
+    MtpDecodeQualification qualify={},MtpDecodeComponentDiagnostic component_diagnostic={},
+    bool qualification_after_tiled_prompt=false) {
     validate_resolved_mtp_cli(options);
     if(!options.mtp.enabled || !parents || session.next_position || session.committed_tokens ||
        session.health!=SerialSessionHealth::ready || session.execution_identity!=compiled.execution_identity)
@@ -765,7 +774,9 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         return std::all_of(t.tails.begin(),t.tails.end(),[&](const auto& tail){
             return tail.backend && tail.backend->handoff_prefill_execution_identity()==expected;});
     };
-    if(tiled_prompt && (qualify || component_diagnostic || !parents->tiled.block_owner || !parents->tiled.reset_state ||
+    if(qualification_after_tiled_prompt && (!qualify || component_diagnostic))
+        throw std::invalid_argument("tiled prompt qualification admission requires only its full qualification callback");
+    if(tiled_prompt && ((qualify && !qualification_after_tiled_prompt) || component_diagnostic || !parents->tiled.block_owner || !parents->tiled.reset_state ||
        !parents->tiled.rows || std::any_of(parents->tiled.tails.begin(),parents->tiled.tails.end(),
            [&](const auto& t){return !t.backend || !t.owner || t.rows>=parents->tiled.rows;}) || !tiled_profile_bound(parents->tiled)))
         throw std::invalid_argument("tiled MTP prompt requires its block owners, a state reset and, exactly under a split prefill "
@@ -1260,11 +1271,20 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"  \"mtp_target_window_rows_set\":[";
         if(window){const auto stats=window->owner_stats();for(std::size_t s=1;s<stats.size();++s)output<<(s>1?",":"")<<stats[s].rows;}
         output<<"],\n  \"mtp_spec_min_p\":"<<mtp_draft_min_probability(m)<<",\n"
-            <<"  \"mtp_window_controller\":\""<<(window && window->survival_controller()?"survival-v1":"min-p")<<"\",\n"
+            <<"  \"mtp_window_controller\":\""<<(window && window->depth_controller()?"depth-v1":window && window->survival_controller()?"survival-v1":"min-p")<<"\",\n"
             <<"  \"mtp_window_option_ms_ema\":[";
         if(window){const auto stats=window->option_stats();
             for(std::size_t s=0;s<stats.size();++s)output<<(s?",":"")<<"{\"rows\":"<<stats[s].rows<<",\"active\":"<<stats[s].active
                 <<",\"samples\":"<<stats[s].samples<<",\"ema_ms\":"<<stats[s].ms_ema<<"}";}
+        output<<"],\n  \"mtp_depth_domain\":\""<<(window && window->depth_controller()?mtp_depth_domain():"inactive")<<"\",\n"
+            <<"  \"mtp_depth_non_draft_ms\":[";
+        if(window){const auto stats=window->depth_cost_stats();
+            for(std::size_t s=0;s<stats.size();++s)output<<(s?",":"")<<"{\"rows\":"<<stats[s].rows<<",\"filled_drafts\":"<<stats[s].filled
+                <<",\"samples\":"<<stats[s].samples<<",\"ms\":"<<stats[s].ms<<",\"probes\":"<<stats[s].probes<<"}";}
+        output<<"],\n  \"mtp_depth_draft_ms\":[";
+        if(window){const auto stats=window->draft_depth_stats();
+            for(std::size_t s=0;s<stats.size();++s)output<<(s?",":"")<<"{\"depth\":"<<stats[s].filled
+                <<",\"samples\":"<<stats[s].samples<<",\"ms\":"<<stats[s].ms<<"}";}
         output<<"],\n"
             <<"  \"mtp_chosen_window_rows_histogram\":{";
         for(std::size_t t=0,first=1;t<chosen_rows.size();++t)if(chosen_rows[t]){output<<(first?"":",")<<"\""<<t<<"\":"<<chosen_rows[t];first=0;}
@@ -1274,15 +1294,17 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             for(std::size_t s=0;s<stats.size();++s)output<<(s?",":"")<<"\""<<stats[s].rows<<"\":{\"cycles\":"<<stats[s].cycles<<",\"ema_ms\":"<<stats[s].cycle_ms_ema
                 <<",\"probes\":"<<stats[s].probes<<"}";}
         output<<"},\n"
-            <<"  \"mtp_window_cost_model\":\""<<(window && !window->robust_cost_model()?"legacy-ema":"robust-median-reprobe-v1")<<"\",\n"
+            <<"  \"mtp_window_cost_model\":\""<<(window && window->depth_controller()?"depth-robust-v1":window && !window->robust_cost_model()?"legacy-ema":"robust-median-reprobe-v1")<<"\",\n"
             <<"  \"mtp_draft_chain\":"<<(m.draft_chain?"true":"false")<<",\n"
+            <<"  \"mtp_draft_cache_profile\":\""<<runtime->draft_cache_profile()<<"\",\n"
             <<"  \"mtp_draft_exact_kernels\":"<<(m.draft_exact?"true":"false")<<",\n"
             <<"  \"mtp_draft_q4_head\":"<<(m.draft_q4?"true":"false")<<",\n"
             <<"  \"mtp_ngram_draft\":"<<[&]{
                 const auto* s=greedy.ngram_stats();
                 if(!s) return std::string("null");
                 return "{\"proposal_cycles\":"+std::to_string(s->cycles)+",\"extended_cycles\":"+std::to_string(s->extended_cycles)+
-                    ",\"extension_rows\":"+std::to_string(s->extension_rows)+",\"accepted_rows\":"+std::to_string(s->accepted_rows)+"}";
+                    ",\"extension_rows\":"+std::to_string(s->extension_rows)+",\"accepted_rows\":"+std::to_string(s->accepted_rows)+
+                    ",\"shadow_scored_cycles\":"+std::to_string(s->scored_cycles)+",\"shadow_right_rows\":"+std::to_string(s->shadow_right_rows)+"}";
             }()<<",\n"
             <<"  \"mtp_draft_head_rows\":"<<draft_stats.rows<<",\n  \"mtp_draft_base_rows\":"<<draft_stats.base_rows<<",\n"
             <<"  \"mtp_draft_context_rows\":"<<draft_stats.context_rows<<",\n  \"mtp_draft_context_dropped\":"<<draft_stats.context_dropped<<",\n"

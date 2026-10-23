@@ -16,7 +16,9 @@
 #include <numeric>
 #include <stdexcept>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -30,8 +32,20 @@ class MappedFile {
 public:
     explicit MappedFile(const std::filesystem::path& path) {
 #if defined(_WIN32)
-        (void)path;
-        throw std::runtime_error("deepseek41 host forward: file mapping is implemented for Linux only");
+        // read-only view of the whole file; the view keeps the mapping alive once both handles are closed
+        const HANDLE file = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                          FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) throw std::runtime_error("deepseek41 host forward: cannot open " + path.string());
+        LARGE_INTEGER bytes{};
+        const HANDLE mapping = ::GetFileSizeEx(file, &bytes) && bytes.QuadPart > 0
+                                   ? ::CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr)
+                                   : nullptr;
+        void* p = mapping != nullptr ? ::MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0) : nullptr;
+        if (mapping != nullptr) ::CloseHandle(mapping);
+        ::CloseHandle(file);
+        if (p == nullptr) throw std::runtime_error("deepseek41 host forward: cannot map " + path.string());
+        size_ = static_cast<std::uint64_t>(bytes.QuadPart);
+        base_ = static_cast<const std::uint8_t*>(p);
 #else
         fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd_ < 0) throw std::runtime_error("deepseek41 host forward: cannot open " + path.string());
@@ -44,7 +58,9 @@ public:
 #endif
     }
     ~MappedFile() {
-#if !defined(_WIN32)
+#if defined(_WIN32)
+        if (base_ != nullptr) ::UnmapViewOfFile(base_);
+#else
         if (base_ != nullptr) ::munmap(const_cast<std::uint8_t*>(base_), size_);
         if (fd_ >= 0) ::close(fd_);
 #endif
@@ -86,7 +102,7 @@ std::vector<Op> HostForward::stand_in_ops() {
 
 HostForward::HostForward(const std::filesystem::path& gguf, const HostForwardOptions& options) : options_(options) {
     model_ = validate_target(read_file(gguf));
-    plan_ = build_decode_plan(model_, 0, options.layers);
+    plan_ = build_decode_plan(model_, 0, options.layers, true, options.head);
     file_ = std::make_unique<MappedFile>(gguf);
     if (!options.weights_overlay.empty()) overlay_ = std::make_unique<ds41::WeightOverlay>(options.weights_overlay, model_.manifest);
     for (const auto& t : model_.manifest.tensors) tensors_.emplace(t.name, &t);

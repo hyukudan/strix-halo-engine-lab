@@ -6,7 +6,9 @@
 #include <stdexcept>
 #include <unordered_map>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -16,9 +18,6 @@
 namespace strix::ds41 {
 
 WeightOverlay::WeightOverlay(const std::filesystem::path& path, const ModelManifest& base) : path_(path) {
-#if defined(_WIN32)
-    throw std::runtime_error("ds41 weight overlay: file mapping is implemented for Linux only");
-#else
     const auto info = gguf::read_file(path);
     std::unordered_map<std::string, const ManifestTensor*> model;
     for (const auto& t : base.tensors) model.emplace(t.name, &t);
@@ -37,6 +36,21 @@ WeightOverlay::WeightOverlay(const std::filesystem::path& path, const ModelManif
         identity_ = *id->string_value;
     else
         throw std::invalid_argument("ds41 weight overlay: missing ds41.requant.identity");
+#if defined(_WIN32)
+    // read-only view of the whole file; the view keeps the mapping alive once both handles are closed
+    const HANDLE file = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                      FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) throw std::runtime_error("ds41 weight overlay: cannot open " + path.string());
+    LARGE_INTEGER file_bytes{};
+    const HANDLE mapping = ::GetFileSizeEx(file, &file_bytes) && file_bytes.QuadPart > 0
+                               ? ::CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr)
+                               : nullptr;
+    void* p = mapping != nullptr ? ::MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0) : nullptr;
+    if (mapping != nullptr) ::CloseHandle(mapping);
+    ::CloseHandle(file);
+    if (p == nullptr) throw std::runtime_error("ds41 weight overlay: cannot map " + path.string());
+    size_ = static_cast<std::uint64_t>(file_bytes.QuadPart);
+#else
     fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd_ < 0) throw std::runtime_error("ds41 weight overlay: cannot open " + path.string());
     struct stat st {};
@@ -44,17 +58,19 @@ WeightOverlay::WeightOverlay(const std::filesystem::path& path, const ModelManif
     size_ = static_cast<std::uint64_t>(st.st_size);
     void* p = ::mmap(nullptr, size_, PROT_READ, MAP_SHARED, fd_, 0);
     if (p == MAP_FAILED) throw std::runtime_error("ds41 weight overlay: mmap failed");
+#endif
     base_ = static_cast<const std::uint8_t*>(p);
     fnv_ = 14695981039346656037ULL;
     for (const auto& [name, e] : entries_) {  // name order: the identity does not depend on the file layout
         for (const char ch : name) fnv_ = (fnv_ ^ static_cast<std::uint8_t>(ch)) * 1099511628211ULL;
         for (const auto b : bytes(e)) fnv_ = (fnv_ ^ b) * 1099511628211ULL;
     }
-#endif
 }
 
 WeightOverlay::~WeightOverlay() {
-#if !defined(_WIN32)
+#if defined(_WIN32)
+    if (base_ != nullptr) ::UnmapViewOfFile(base_);
+#else
     if (base_ != nullptr) ::munmap(const_cast<std::uint8_t*>(base_), size_);
     if (fd_ >= 0) ::close(fd_);
 #endif

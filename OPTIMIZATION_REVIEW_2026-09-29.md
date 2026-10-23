@@ -152,7 +152,7 @@ A graph must own an allocation generation. Growing or replacing a referenced buf
 
 ## 4. UMA: specialization without magical zero-copy assumptions
 
-The Ryzen AI Max+ 395 product specification lists a 256-bit LPDDR5x interface up to 8000 MT/s and two native 40 Gbit/s USB4 ports. The ideal memory-interface rate derived from those numbers is 256 GB/s; this is not a measured sustainable bandwidth. The BOSGAME M5 product page also lists two USB4 Type-C ports. None of these specifications establishes dual-link payload independence. [A4][A5]
+The Ryzen AI Max+ 395 product specification lists a 256-bit LPDDR5x interface up to 8000 MT/s and two native 40 Gbit/s USB4 ports. The ideal memory-interface rate derived from those numbers is 256 GB/s; this is not a measured sustainable bandwidth. The mini PC vendor's product page also lists two USB4 Type-C ports. None of these specifications establishes dual-link payload independence. [A4][A5]
 
 One physical memory pool does not imply identical performance for all mappings. HIP distinguishes coherence modes and notes that fine-grained coherence can constrain caching. Its documentation also distinguishes synchronization visibility and system-scope release behavior. Those descriptions are not proof that an arbitrary external USB4 DMA writer is synchronized with a GPU consumer. [A6]
 
@@ -374,7 +374,7 @@ All lab references below use commit `94d4333b7607343eabf64124ad0a1fbfd15b1861`.
 - [A2] [LLVM AMDGPU backend guide](https://llvm.org/docs/AMDGPUUsage.html). Current target documentation; deployed compiler capabilities still require validation.
 - [A3] [AMD HIP graph tutorial](https://rocm.docs.amd.com/projects/HIP/en/latest/tutorial/graph_api.html).
 - [A4] [AMD Ryzen AI Max+ 395 specifications](https://www.amd.com/es/products/processors/laptop/ryzen/ai-300-series/amd-ryzen-ai-max-plus-395.html).
-- [A5] [BOSGAME M5 specifications](https://www.bosgame.com/products/bosgame-m5-ai-mini-desktop-ryzen-ai-max-395-96gb-128gb-2tb).
+- [A5] The mini PC vendor's specification of the Ryzen AI Max+ 395 system (128 GB LPDDR5x-8000, two USB4 ports).
 - [A6] [AMD HIP coherence control](https://rocm.docs.amd.com/projects/HIP/en/latest/how-to/hip_runtime_api/memory_management/coherence_control.html).
 - [K1] [Linux USB4/Thunderbolt administration guide](https://docs.kernel.org/admin-guide/thunderbolt.html).
 - [K2] [Linux USB4STREAM implementation](https://github.com/torvalds/linux/blob/72d3fcf802c45d00b300f25b848a93c3a2bd7c7e/drivers/thunderbolt/stream.c). In particular: protocol description and ring/progress controls near the start; read/write/poll handling around lines 680–950; file operations and busy-poll configuration around lines 1005–1060.

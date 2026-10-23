@@ -144,7 +144,7 @@ struct RopeView {
 void enqueue_rope(const RopeView& view, void* stream);
 // Q8_0 x A8 site (product_q8_0, bitwise): out[r * out_stride + o] = row (first + o) . x_g, where x_g is
 // the A8 activation codes + r * x_stride + g * width (deltas likewise / 32) and g = o / per_group
-// (per_group = count for a plain projection, 1024 for the grouped attn_output_a). rows 1..8; x_stride
+// (per_group = count for a plain projection, 1024 for the grouped attn_output_a). rows 1..16; x_stride
 // and width multiples of 32; codes 16-byte aligned.
 // K-split sites (q8_0_a8_split_rows): one call per part with row_width = the full weight row (values),
 // k_offset = the part's first column, width = the part's width, codes/deltas pointing at the part's

@@ -84,7 +84,7 @@ void run_case(std::mt19937& rng, const Case& k) {
     const auto t = random_fp8(rng, k.tensor_rows, k.row_width);
     const std::uint32_t groups = k.count / k.per_group, x_stride = groups * k.width;
     Device<std::uint8_t> dw(t);
-    for (const std::uint32_t rows : {1U, 2U, 3U, 4U, 5U, 8U}) {
+    for (const std::uint32_t rows : {1U, 2U, 3U, 4U, 5U, 8U, 9U, 12U, 16U}) {
         std::vector<std::int8_t> codes(std::size_t{rows} * x_stride);
         std::vector<float> deltas(codes.size() / 32U);
         for (std::uint32_t r = 0; r < rows; ++r) {

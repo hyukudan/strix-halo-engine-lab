@@ -1349,6 +1349,45 @@ void known_window_qsa_bf16_indexer_tests(const strix::ModelContract& model) {
     }
 }
 
+void known_window_trellis_profile_tests(const strix::ModelContract& model) {
+    auto parent = make_known_fixture(model, 0U, false, false, true);
+    const auto add_marker = [](auto& fixture, std::string_view marker) {
+        for (auto& binding : fixture.serial.bindings.bindings) {
+            if ((binding.op != strix::SerialOp::gated_delta_net && binding.op != strix::SerialOp::indexed_attention) || !binding.kernel_id) continue;
+            const auto at = binding.kernel_id->find(".prefetch8");
+            expect(at != std::string::npos, "dense fixture has the exact prefetch suffix");
+            binding.kernel_id->insert(at, marker);
+        }
+    };
+    add_marker(parent, ".dense-a8-v1");
+    auto compact = parent;
+    add_marker(compact, ".trellis-g1-fp32-s4-v1");
+    for (const auto rows : {2U, 4U, 8U}) for (const bool deferred : {false, true}) {
+        strix::KnownWindowRequest request{false, true, true, rows};
+        request.qsa_rows = true; request.deferred_gdn = deferred;
+        const auto a = strix::compile_known_prefix_window(model, parent.serial, parent.manifest, parent.access, request);
+        const auto b = strix::compile_known_prefix_window(model, compact.serial, compact.manifest, compact.access, request);
+        strix::validate_compiled_known_prefix_window(b, compact.serial);
+        expect(b.qsa_rows_steps == 12U && (deferred ? b.gdn_deferred_rows_steps == 36U : b.r2_steps + b.gdn_rows_steps == 36U),
+            "compact G1 promotes every selected GDN and QSA with its separate identity");
+        expect(a.window_kernel_plan_identity != b.window_kernel_plan_identity && a.window_execution_identity != b.window_execution_identity,
+            "compact G1 window cannot alias the parent arithmetic identity");
+        expect(a.logical_projection_weight_bytes_avoided - b.logical_projection_weight_bytes_avoided == 411893760ULL * (rows - 1U),
+            "compact window counts K5 payload and signed scales rather than source Q8 bytes");
+        expect(b.projection_launches_saved - a.projection_launches_saved == 144ULL * (rows - 1U),
+            "compact window accounts for three additional projection launches per selected serial row");
+    }
+    for (const auto marker : {".trellis-g1-fp32-s4-v1", ".dense-a8-v1.trellis-g1-fp32-s4-v2"}) {
+        auto invalid = make_known_fixture(model, 0U, false, false, true);
+        add_marker(invalid, marker);
+        strix::KnownWindowRequest request{false, true, true, 8U};
+        request.qsa_rows = true; request.deferred_gdn = true;
+        const auto plan = strix::compile_known_prefix_window(model, invalid.serial, invalid.manifest, invalid.access, request);
+        expect(plan.qsa_rows_steps == 0U && plan.gdn_deferred_rows_steps == 0U,
+            "compact promotion excludes a missing parent marker and unknown arithmetic versions");
+    }
+}
+
 void known_window_qsa_tests(const strix::ModelContract& model) {
     using V=strix::KnownWindowR2Variant;
     using M=strix::KnownWindowStepMode;
@@ -2229,6 +2268,7 @@ int main() {
     known_window_routed_union_runtime_tests(model);
     known_window_hyper_rows_tests(model);
     known_window_qsa_tests(model);
+    known_window_trellis_profile_tests(model);
     known_window_qsa_bf16_indexer_tests(model);
     known_window_tests(model);
     known_window_runtime_tests(model);

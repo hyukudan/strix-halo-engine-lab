@@ -3,6 +3,7 @@
 #include "strix/hip_mtp_greedy_runtime.hpp"
 #include "strix/mtp_sidecar_binding.hpp"
 #include "strix/hip_mtp_window_verifier.hpp"
+#include "strix/mtp_batch_window_controller.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -209,7 +210,7 @@ void HipMtpGreedyRuntime::draft_end() {
     try {
         if(i.ds.open) {i.candidates=i.mtp->propose_chain_finish();i.ds.open=false;}
         else if(i.mtp->draft_head()) i.candidates.clear();
-        if(survival) i.window->note_draft(static_cast<std::uint32_t>(i.candidates.size()),
+        if(survival || (i.window && i.window->depth_controller())) i.window->note_draft(static_cast<std::uint32_t>(i.candidates.size()),
             std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-i.ds.start).count());
         i.runner_ups.clear();
         if(i.mtp->draft_head()){
@@ -235,6 +236,10 @@ void HipMtpGreedyRuntime::draft_end() {
             }
         }
         host_phase_mark("2 draft chain");
+        if(full_chain && std::getenv("STRIX_CYCLE_LOG"))
+            std::fprintf(stderr,"draft_cost at=%llu depth=%zu ms=%.6f\n",
+                static_cast<unsigned long long>(i.session->next_position-1U),i.candidates.size(),
+                std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-i.ds.start).count());
         finish_draft_proposal(i.draft);
         host_phase_mark("3 finish proposal");
     } catch(...) {fail_cycle();throw;}
@@ -438,6 +443,73 @@ std::vector<HipMtpGreedyCycleResult> budget_cohorts(std::span<const HipMtpGreedy
 namespace {
 std::vector<HipMtpGreedyCycleResult> cohort_cycle(std::span<const HipMtpGreedyCohortMember> members,
     HipMtpGreedyCohortStats* stats);
+std::vector<HipMtpGreedyCycleResult> joint_cycle(std::span<const HipMtpGreedyCohortMember> members,
+    HipMtpGreedyCohortStats* stats,MtpBatchWindowController& controller) {
+    using clock=std::chrono::steady_clock;
+    const auto start=clock::now();
+    std::vector<MtpBatchWindowController::Request> requests;
+    for(const auto& c:members) {
+        require(c.runtime && c.initial && c.runtime->window_verifier(),"joint MTP cycle requires a window verifier");
+        std::uint32_t limit=0;
+        for(auto r:{2U,4U,8U}) if(c.runtime->window_verifier()->cohort_fits(c.runtime->target_session(),r,1U,c.budget)) limit=r;
+        // Context/budget tails use the established serial fallback. In particular
+        // never admit physical padding outside the request's remaining capacity.
+        if(!limit) return cohort_cycle(members,stats);
+        while(limit>2U && limit>c.maximum_candidates+1U) limit/=2U;
+        requests.push_back({c.slot,limit,{}});
+    }
+    static const std::uint32_t configured=[] {const char* v=std::getenv("STRIX_COHORT_ROWS");
+        const auto n=v?std::atoi(v):32;return n==16?16U:32U;}();
+    const auto budget=std::max(configured,2U*static_cast<std::uint32_t>(members.size()));
+    const auto plan=controller.plan(requests,budget);
+    std::vector<bool> open(members.size(),false);
+    std::vector<HipMtpGreedyCycleResult> out(members.size());
+    try {
+        for(std::size_t k=0;k<members.size();++k) {
+            const auto& c=members[k];
+            static_cast<void>(c.runtime->draft_begin(*c.initial,plan[k]?plan[k]-1U:0U,c.budget,c.eos,false));
+            open[k]=c.runtime->drafting();
+            if(!open[k]) {out[k].final_target=*c.initial;out[k].eos=true;}
+        }
+        auto stepping=open;
+        for(bool any=true;any;) {
+            any=false;
+            std::vector<bool> launched(members.size(),false);
+            for(std::size_t k=0;k<members.size();++k) if(stepping[k]) launched[k]=members[k].runtime->draft_launch_step();
+            for(std::size_t k=0;k<members.size();++k) if(stepping[k]) {
+                stepping[k]=launched[k] && members[k].runtime->draft_after_step();any=any || stepping[k];
+            }
+        }
+        std::uint32_t draft_steps=0;
+        for(std::size_t k=0;k<members.size();++k) if(open[k]) {
+            members[k].runtime->draft_end();
+            requests[k].probabilities=members[k].runtime->drafted_probabilities();
+            draft_steps+=static_cast<std::uint32_t>(requests[k].probabilities.size());
+        }
+        const auto drafted=clock::now();
+        const auto rows=controller.choose(requests,budget);
+        std::vector<CohortItem> items;
+        for(std::size_t k=0;k<members.size();++k) if(open[k]) items.push_back({k,rows[k]});
+        budget_cohorts(members,items,out,open,stats,budget);
+        const auto end=clock::now();
+        const auto draft_ms=std::chrono::duration<double,std::milli>(drafted-start).count();
+        const auto target_ms=std::chrono::duration<double,std::milli>(end-drafted).count();
+        std::vector<std::uint32_t> accepted;
+        std::uint32_t emitted=0;
+        for(const auto& r:out) {accepted.push_back(r.accepted_candidates);emitted+=static_cast<std::uint32_t>(r.emitted_tokens.size());}
+        controller.observe(requests,rows,accepted,draft_ms,target_ms,draft_steps);
+        static const bool log=[] {const char* v=std::getenv("STRIX_MTP_BATCH_LOG");return v && v[0]=='1';}();
+        if(log) {
+            std::fprintf(stderr,"joint cycle sessions=%zu rows=",members.size());
+            for(std::size_t k=0;k<rows.size();++k) std::fprintf(stderr,k?",%u":"%u",rows[k]);
+            std::fprintf(stderr," drafts=%u emitted=%u draft_ms=%.6f target_ms=%.6f\n",draft_steps,emitted,draft_ms,target_ms);
+        }
+        return out;
+    } catch(...) {
+        for(std::size_t k=0;k<members.size();++k) if(open[k]) members[k].runtime->fail_cycle();
+        throw;
+    }
+}
 // STRIX_COHORT_AB=1 (measurement): per cycle parity, the mean wall time of a cohort cycle (drafts, windows,
 // acceptance and reconciliation) and the tokens it emitted, printed at exit; odd cycles run without the
 // features of STRIX_COHORT_AB_OFF.
@@ -452,8 +524,26 @@ struct CohortAbTiming {
 };
 }
 std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(std::span<const HipMtpGreedyCohortMember> members,
-    HipMtpGreedyCohortStats* stats) {
+    HipMtpGreedyCohortStats* stats,MtpBatchWindowController* joint) {
     ++known_window_cohort_cycle();
+    static const bool log=[] {const char* v=std::getenv("STRIX_MTP_BATCH_LOG");return v && v[0]=='1';}();
+    if(joint || (!known_window_cohort_ab() && log)) {
+        const auto start=std::chrono::steady_clock::now();
+        const auto before=stats?*stats:HipMtpGreedyCohortStats{};
+        auto out=joint?joint_cycle(members,stats,*joint):cohort_cycle(members,stats);
+        if(log) {
+            const auto end=std::chrono::steady_clock::now();
+            std::uint32_t emitted=0;for(const auto& r:out) emitted+=static_cast<std::uint32_t>(r.emitted_tokens.size());
+            std::fprintf(stderr,"batch cycle sessions=%zu groups=%llu rows=%llu solo=%llu emitted=%u ms=%.6f begin_ns=%lld end_ns=%lld\n",
+                members.size(),static_cast<unsigned long long>(stats?stats->cohort_windows-before.cohort_windows:0U),
+                static_cast<unsigned long long>(stats?stats->cohort_rows-before.cohort_rows:0U),
+                static_cast<unsigned long long>(stats?stats->solo_windows-before.solo_windows:0U),emitted,
+                std::chrono::duration<double,std::milli>(end-start).count(),
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count()),
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count()));
+        }
+        return out;
+    }
     if (!known_window_cohort_ab()) return cohort_cycle(members, stats);
     static CohortAbTiming timing;
     const auto parity = known_window_cohort_cycle() & 1U;

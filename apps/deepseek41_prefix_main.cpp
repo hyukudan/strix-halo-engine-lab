@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -30,7 +31,9 @@
 //
 //   strix-deepseek41-prefix MODEL.gguf --prompt FILE (comma-separated ids) [--rows N] [--layers L]
 //       [--world 1 [--stream-experts] | --transport emulate | --rank R --transport usb4-auto]
-//       [--block 256] [--max-rows 4096] [--cache-mb 0] [--warm W1,W2,...] [--decode G] [--repeat-hit K]
+//       [--block 256] [--max-rows 4096] [--cache-mb 0] [--warm W1,W2,...] [--decode G] [--repeat-hit K] [--before-tail]
+//       [--cache-dir DIR [--disk-mb 0] [--phase all|write|read|fresh] [--no-fresh] [--fork F] [--rewind R]
+//        [--corrupt block|snapshot] [--session G]]
 //
 // Scenarios, each on an emptied cache: "miss" (the prompt through the cache: pieces at the last full block, then the
 // tail), and for every W of --warm (W < 0: N + W) a first prompt of W tokens through the cache, then the full prompt
@@ -38,6 +41,17 @@
 // repeats the hit K times (timing; each hit resumes from the same snapshot). Times: "ttft" = lookup + state assembly +
 // import + every prefill piece + the final export, i.e. what a server waits before its first token (without the
 // tokenizer and the slot import, printed apart).
+//
+// --cache-dir DIR: the disk tier of the cache in DIR/rank<R> (write-through; DIR/ref-rank<R>.txt keeps the reference
+// outcome). Phases: "write" (= "all": fresh, then through the cache: miss, RAM hit, disk hit after the RAM tier is
+// dropped; fork --fork F: the prompt's first F tokens + its reversed tail after the prompt was cached, then the prompt
+// again; rewind --rewind R: the first R tokens from the deepest snapshot <= R; every warm W read from disk; session
+// --session G: G tokens decoded from the prompt's state in a BatchForward slot, the block boundaries it reaches
+// inserted from the slot (session snapshots), then the conversation's last boundary and 40 more tokens through the
+// cache against fresh prefills), "read" (a new process on the files: the index rebuilt, optionally after
+// --corrupt block|snapshot damaged one file; disk hit, a warm hit from disk and a RAM hit against the reference file,
+// decode against its tokens), "fresh" (only the fresh prefill, against the reference file). --no-fresh: the miss is the
+// reference (long prompts: one prefill per turn).
 namespace {
 
 namespace ds = strix::deepseek41;
@@ -45,6 +59,10 @@ using Clock = std::chrono::steady_clock;
 
 struct Args {
     std::string model, prompt_path, transport, warm = "-64,-256";
+    std::string cache_dir, phase = "all", corrupt;
+    std::uint64_t disk_mb = 0;
+    std::uint32_t fork = 0, rewind = 0, session = 0;
+    bool before_tail = false, no_fresh = false;
     std::uint32_t rank = 0, world = 1, layers = 40, rows = 0, block = 256, max_rows = 4096, decode = 0, repeat_hit = 1;
     std::uint64_t cache_mb = 0;
     unsigned connect_timeout = 60;
@@ -96,6 +114,9 @@ struct Outcome {
     ds::AttentionState state;
     double seconds = 0.0, lookup_seconds = 0.0, import_seconds = 0.0, export_seconds = 0.0;
     std::vector<std::uint32_t> pieces;
+    std::uint64_t disk_bytes = 0;
+    double disk_seconds = 0.0;
+    bool read_failed = false;
 };
 
 class Gate {
@@ -133,7 +154,20 @@ public:
         ds::PrefixCacheOptions co;
         co.block = a.block;
         co.budget_bytes = a.cache_mb << 20U;
+        if (!a.cache_dir.empty()) {
+            co.dir = rank_dir(a, rank);
+            co.disk_budget_bytes = a.disk_mb << 20U;
+            co.model_id = ds::prefix_model_id(a.model, a.layers, ds::prefix_namespace_from_env(batch_ && batch_->expert_tp()));
+        }
         cache_ = std::make_unique<ds::PrefixCache>(co);
+        if (print_ && cache_->has_disk()) {
+            const auto st = cache_->stats();
+            std::printf("rank %u: disk tier %s: %llu files scanned in %.3f s, %llu ignored; %llu blocks + %llu snapshots = %.1f MB\n", rank,
+                        co.dir.string().c_str(), static_cast<unsigned long long>(st.scanned_files), st.scan_seconds,
+                        static_cast<unsigned long long>(st.ignored_files), static_cast<unsigned long long>(st.disk_blocks),
+                        static_cast<unsigned long long>(st.disk_snapshots), static_cast<double>(st.disk_bytes) / 1e6);
+            std::fflush(stdout);
+        }
     }
 
     // The prompt prefilled fresh: one run of max_rows pieces (extend), no cache.
@@ -165,10 +199,24 @@ public:
         Outcome o;
         const auto t0 = Clock::now();
         const auto N = static_cast<std::uint32_t>(prompt.size());
-        const auto hit = cache_->lookup(prompt, min_rows_);
+        auto hit = cache_->lookup(prompt, min_rows_);
+        ds::AttentionState loaded;
+        if (hit.resume > 0U) {
+            try {
+                loaded = cache_->load(prompt, hit.resume, hit.key);
+                o.disk_bytes = cache_->last_load().disk_bytes;
+                o.disk_seconds = cache_->last_load().disk_seconds;
+                cache_->use(loaded, hit.key);
+            } catch (const ds::PrefixCacheReadError& e) {  // the path goes, the prompt runs as a miss
+                std::printf("  disk read failed (%s): forget, miss\n", e.what());
+                o.read_failed = true;
+                cache_->forget(prompt, hit.resume);
+                hit = ds::PrefixLookup{};
+            }
+        }
         o.resume = hit.resume;
         if (hit.resume == N) {  // the whole prompt is a cached boundary: no prefill
-            o.state = cache_->state(prompt, hit.resume, hit.key);
+            o.state = std::move(loaded);
             o.next_token = hit.next_token;
             o.logits = hit.logits_fnv;
             o.lookup_seconds = since(t0);
@@ -177,7 +225,7 @@ public:
             return o;
         }
         if (hit.resume > 0U) {
-            const auto s = cache_->state(prompt, hit.resume, hit.key);
+            const auto& s = loaded;
             o.lookup_seconds = since(t0);
             const auto t1 = Clock::now();
             prefill_->import_state(s);
@@ -185,7 +233,7 @@ public:
         } else {
             o.lookup_seconds = since(t0);
         }
-        o.pieces = ds::plan_prefill_pieces(hit.resume, hit.shared, N, a_.block, a_.max_rows, min_rows_);
+        o.pieces = ds::plan_prefill_pieces(hit.resume, hit.shared, N, a_.block, a_.max_rows, min_rows_, a_.before_tail);
         ds::PrefillResult r;
         std::uint32_t at = hit.resume;
         for (const auto end : o.pieces) {
@@ -235,6 +283,34 @@ public:
         return {tx, ty};
     }
 
+    // Session snapshots: `x`'s state into slot 0, `g` tokens decoded greedily; every block boundary the slot reaches is
+    // inserted from the slot (only the KV entries the cache lacks). Returns the conversation (prompt + decoded tokens)
+    // and sets `last` to the last boundary inserted.
+    std::vector<std::uint32_t> session(const Outcome& x, std::uint32_t g, std::uint32_t& last) {
+        auto& f = *batch_;
+        if (!f.reserve(0U, f.capacity(0U))) throw std::runtime_error("reserve failed");
+        f.import_state(0U, x.state);
+        std::vector<std::uint32_t> hist = x.state.tokens;
+        std::uint32_t next = x.next_token;
+        last = 0;
+        for (std::uint32_t i = 0; i < g; ++i) {
+            const std::vector<ds::BatchRow> rows{{0U, next}};
+            hist.push_back(next);
+            next = f.step(rows)[0];
+            const std::uint32_t p = f.position(0U);
+            if (p % a_.block != 0U) continue;
+            const auto t0 = Clock::now();
+            const std::uint32_t from = cache_->covered(hist, p);
+            auto s = f.export_state(0U, from);
+            s.tokens.assign(hist.begin(), hist.begin() + p);
+            s.next_token = next;
+            const bool ok = cache_->insert(s, 0U, from);
+            if (ok) last = p;
+            if (print_) std::printf("  session: boundary %u from the slot (KV from %u): %s in %.3f s\n", p, from, ok ? "inserted" : "REFUSED", since(t0));
+        }
+        return hist;
+    }
+
     ds::PrefixCache& cache() { return *cache_; }
     [[nodiscard]] bool has_batch() const { return batch_ != nullptr; }
 
@@ -243,6 +319,10 @@ private:
         o.digest = o.state.digest(true);
         o.hashes = o.state.hashes();
     }
+public:
+    static std::string rank_dir(const Args& a, std::uint32_t rank) { return a.cache_dir + "/rank" + std::to_string(rank); }
+
+private:
     const Args& a_;
     bool print_;
     std::uint32_t min_rows_ = 1;  // world 2 (row split): every run gives each rank a row
@@ -270,15 +350,22 @@ int compare(std::uint32_t rank, const std::string& name, const Outcome& ref, con
             ++diff;
         }
     std::printf("GATE rank %u %-14s resume %6u pieces %-24s token %6u logits %016llx digest %016llx  %s  ttft %.3f s (lookup+state %.3f, import %.3f, "
-                "export+insert %.3f)\n",
+                "export+insert %.3f)",
                 rank, name.c_str(), o.resume, list(o.pieces).c_str(), o.next_token, static_cast<unsigned long long>(o.logits),
                 static_cast<unsigned long long>(o.digest), bad == 0 ? "EQUAL" : "DIFFERENT", o.seconds, o.lookup_seconds, o.import_seconds,
                 o.export_seconds);
+    if (o.disk_bytes != 0U)
+        std::printf(" disk %.1f MB in %.3f s = %.2f GB/s", static_cast<double>(o.disk_bytes) / 1e6, o.disk_seconds,
+                    o.disk_seconds > 0.0 ? static_cast<double>(o.disk_bytes) / o.disk_seconds / 1e9 : 0.0);
+    std::printf("\n");
     std::fflush(stdout);
     return bad;
 }
 
+int run_disk(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint32_t rank, strix::dist::Communicator* comm, bool print);
+
 int run(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint32_t rank, strix::dist::Communicator* comm, bool print) {
+    if (!a.cache_dir.empty()) return run_disk(a, prompt, rank, comm, print);
     Gate g(a, rank, comm, print, prompt.size());
     const auto N = static_cast<std::uint32_t>(prompt.size());
     int bad = 0;
@@ -330,6 +417,239 @@ int run(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint32_t r
     return bad;
 }
 
+// ---- disk tier gate ----
+struct Reference {
+    std::uint32_t tokens = 0, next_token = 0;
+    std::uint64_t logits = 0, digest = 0;
+    std::vector<std::uint32_t> decoded;
+};
+
+std::string ref_path(const Args& a, std::uint32_t rank) { return a.cache_dir + "/ref-rank" + std::to_string(rank) + ".txt"; }
+
+void save_reference(const std::string& path, const Reference& r) {
+    std::ofstream f(path);
+    f << r.tokens << ' ' << r.next_token << ' ' << r.logits << ' ' << r.digest << ' ' << list(r.decoded) << '\n';
+}
+
+Reference load_reference(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) throw std::invalid_argument("no reference file " + path + " (run --phase write first)");
+    Reference r;
+    std::string dec;
+    f >> r.tokens >> r.next_token >> r.logits >> r.digest >> dec;
+    if (dec != "-")
+        for (const long v : parse_list(dec)) r.decoded.push_back(static_cast<std::uint32_t>(v));
+    return r;
+}
+
+Outcome as_outcome(const Reference& r) {
+    Outcome o;
+    o.next_token = r.next_token;
+    o.logits = r.logits;
+    o.digest = r.digest;
+    return o;
+}
+
+// Damages one file of the rank's disk tier before it is opened (a payload byte flipped): the deepest snapshot on the
+// prompt's chain, or the block in the middle of that chain.
+void corrupt_one(const std::string& dir, const std::vector<std::uint32_t>& prompt, std::uint32_t block, const std::string& what) {
+    namespace fs = std::filesystem;
+    const auto name = [&](const char* prefix, std::uint32_t blocks, const char* ext) {
+        char n[64];
+        std::snprintf(n, sizeof n, "%s-%016llx.%s", prefix, static_cast<unsigned long long>(ds::prefix_key(prompt, block, blocks)), ext);
+        return fs::path(dir) / n;
+    };
+    const auto D = static_cast<std::uint32_t>(prompt.size() / block);
+    std::uint32_t deepest = 0;
+    for (std::uint32_t k = D; k >= 1U && deepest == 0U; --k)
+        if (fs::exists(name("s", k, "snp"))) deepest = k;
+    if (deepest == 0U) throw std::runtime_error("--corrupt: no snapshot of the prompt in " + dir);
+    const fs::path victim = what == "snapshot" ? name("s", deepest, "snp") : name("b", std::max<std::uint32_t>(1U, deepest / 2U), "blk");
+    std::fstream io(victim, std::ios::in | std::ios::out | std::ios::binary);
+    io.seekg(4096);
+    char c = 0;
+    io.read(&c, 1);
+    c = static_cast<char>(c ^ 0x5a);
+    io.seekp(4096);
+    io.write(&c, 1);
+    std::printf("corrupted %s (byte 4096; the prompt's deepest snapshot is at %u)\n", victim.string().c_str(), deepest * block);
+}
+
+int run_disk(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint32_t rank, strix::dist::Communicator* comm, bool print) {
+    const auto N = static_cast<std::uint32_t>(prompt.size());
+    const std::string rpath = ref_path(a, rank);
+    if (a.phase == "read" && !a.corrupt.empty()) corrupt_one(Gate::rank_dir(a, rank), prompt, a.block, a.corrupt);
+    Gate g(a, rank, comm, print, std::max<std::size_t>(prompt.size() + a.session + 64U, prompt.size()));
+    int bad = 0;
+    const auto report_cache = [&](const char* when) {
+        const auto st = g.cache().stats();
+        std::printf("  cache %s: RAM %.1f MB (%llu blocks, %llu snapshots); disk %.1f MB (%llu blocks, %llu snapshots), written %llu files %.1f MB in %.3f s "
+                    "(%.2f GB/s), read %llu files %.1f MB in %.3f s, disk hits %llu, read errors %llu\n",
+                    when, static_cast<double>(st.bytes) / 1e6, static_cast<unsigned long long>(st.blocks), static_cast<unsigned long long>(st.snapshots),
+                    static_cast<double>(st.disk_bytes) / 1e6, static_cast<unsigned long long>(st.disk_blocks), static_cast<unsigned long long>(st.disk_snapshots),
+                    static_cast<unsigned long long>(st.written_files), static_cast<double>(st.written_bytes) / 1e6, st.write_seconds,
+                    st.write_seconds > 0.0 ? static_cast<double>(st.written_bytes) / st.write_seconds / 1e9 : 0.0,
+                    static_cast<unsigned long long>(st.read_files), static_cast<double>(st.read_bytes) / 1e6, st.read_seconds,
+                    static_cast<unsigned long long>(st.disk_hits), static_cast<unsigned long long>(st.read_errors));
+        std::fflush(stdout);
+    };
+    const auto decode_one = [&](const Outcome& o) {
+        double import_seconds = 0.0;
+        auto [tx, ty] = g.decode(o, o, import_seconds);
+        std::printf("  decode %u tokens from %s state (slot import %.3f s)\n", a.decode, "this", import_seconds);
+        return tx;
+    };
+    if (a.phase == "fresh") {
+        const auto ref = load_reference(rpath);
+        if (ref.tokens != N) throw std::invalid_argument("the reference is of another prompt length");
+        const auto fr = g.fresh(prompt);
+        bad += compare(rank, "fresh-vs-ref", as_outcome(ref), fr);
+        std::printf("  fresh prefill %.3f s\n", fr.seconds);
+        if (a.decode != 0U && g.has_batch()) {
+            const auto tx = decode_one(fr);
+            const bool eq = tx == ref.decoded;
+            bad += eq ? 0 : 1;
+            std::printf("GATE rank %u decode %u tokens from the fresh state vs the reference: %s\n", rank, a.decode, eq ? "EQUAL" : "DIFFERENT");
+        }
+    } else if (a.phase == "read") {  // a new process on the files of a write phase
+        const auto ref = load_reference(rpath);
+        if (ref.tokens != N) throw std::invalid_argument("the reference is of another prompt length");
+        const auto R = as_outcome(ref);
+        report_cache("after the restart");
+        const auto disk = g.cached(prompt);
+        bad += compare(rank, "restart-disk", R, disk);
+        const auto ram = g.cached(prompt);
+        bad += compare(rank, "restart-ram", R, ram);
+        if (a.decode != 0U && g.has_batch()) {
+            const auto tx = decode_one(disk);
+            const bool eq = tx == ref.decoded;
+            bad += eq ? 0 : 1;
+            std::printf("GATE rank %u decode %u tokens from the restart disk-hit state vs the reference: %s; tokens %s\n", rank, a.decode,
+                        eq ? "EQUAL" : "DIFFERENT", list(tx).c_str());
+        }
+        // a warm hit (multi-turn shape) from disk: drop the RAM tier, the full prompt resumes below its end
+        for (const long w : parse_list(a.warm)) {
+            const long W = w < 0 ? static_cast<long>(N) + w : w;
+            if (W <= 0 || W >= static_cast<long>(N)) continue;
+            g.cache().clear_ram();
+            const std::vector<std::uint32_t> first(prompt.begin(), prompt.begin() + W);
+            const auto turn1 = g.cached(first);  // from disk: the snapshot at or below W, then W's tail (inserted)
+            g.cache().clear_ram();
+            const auto hit = g.cached(prompt);
+            bad += compare(rank, "restart-warm" + std::to_string(W), R, hit);
+            std::printf("  (turn 1 of %ld tokens: resume %u from disk, %.3f s)\n", W, turn1.resume, turn1.seconds);
+        }
+        report_cache("at the end");
+    } else {  // write
+        Outcome ref;
+        if (!a.no_fresh) {
+            ref = g.fresh(prompt);
+            std::printf("GATE rank %u %-14s resume %6u pieces %-24s token %6u logits %016llx digest %016llx  ref    time %.3f s (export %.3f)\n", rank, "fresh",
+                        0U, list(ref.pieces).c_str(), ref.next_token, static_cast<unsigned long long>(ref.logits),
+                        static_cast<unsigned long long>(ref.digest), ref.seconds, ref.export_seconds);
+        }
+        g.cache().clear();
+        const auto miss = g.cached(prompt);
+        g.cache().flush();
+        if (a.no_fresh) {
+            ref = miss;
+            std::printf("GATE rank %u %-14s resume %6u pieces %-24s token %6u logits %016llx digest %016llx  ref    time %.3f s (export+insert %.3f)\n", rank,
+                        "miss(ref)", 0U, list(miss.pieces).c_str(), miss.next_token, static_cast<unsigned long long>(miss.logits),
+                        static_cast<unsigned long long>(miss.digest), miss.seconds, miss.export_seconds);
+        } else {
+            bad += compare(rank, "miss", ref, miss);
+        }
+        report_cache("after the miss");
+        const auto ram = g.cached(prompt);
+        bad += compare(rank, "ram-hit", ref, ram);
+        g.cache().clear_ram();
+        const auto disk = g.cached(prompt);
+        bad += compare(rank, "disk-hit", ref, disk);
+        Reference saved{N, ref.next_token, ref.logits, ref.digest, {}};
+        if (a.decode != 0U && g.has_batch()) {
+            double import_seconds = 0.0;
+            const auto [tx, ty] = g.decode(ref, disk, import_seconds);
+            const bool eq = tx == ty;
+            bad += eq ? 0 : 1;
+            std::printf("GATE rank %u decode %u tokens from the reference and the disk-hit state: %s (slot import %.3f s each); tokens %s\n", rank, a.decode,
+                        eq ? "EQUAL" : "DIFFERENT", import_seconds, list(tx).c_str());
+            saved.decoded = tx;
+        }
+        for (const long w : parse_list(a.warm)) {  // multi-turn shape, turn 2 resumed from disk
+            const long W = w < 0 ? static_cast<long>(N) + w : w;
+            if (W <= 0 || W >= static_cast<long>(N)) continue;
+            g.cache().clear();
+            const std::vector<std::uint32_t> first(prompt.begin(), prompt.begin() + W);
+            (void)g.cached(first);
+            const auto ram_hit = g.cached(prompt);
+            bad += compare(rank, "warm" + std::to_string(W) + "-ram", ref, ram_hit);
+            g.cache().clear();
+            (void)g.cached(first);
+            g.cache().clear_ram();
+            const auto disk_hit = g.cached(prompt);
+            bad += compare(rank, "warm" + std::to_string(W) + "-disk", ref, disk_hit);
+        }
+        if (a.fork != 0U && a.fork < N) {  // two continuations sharing the first F tokens
+            std::vector<std::uint32_t> other(prompt.begin(), prompt.begin() + a.fork);
+            other.insert(other.end(), prompt.rbegin(), prompt.rbegin() + (N - a.fork));
+            const auto ref_b = g.fresh(other);
+            g.cache().clear();
+            (void)g.cached(prompt);
+            g.cache().clear_ram();
+            const auto b = g.cached(other);
+            bad += compare(rank, "fork-B", ref_b, b);
+            const auto a2 = g.cached(prompt);
+            bad += compare(rank, "fork-A-again", ref, a2);
+            g.cache().clear_ram();
+            const auto b2 = g.cached(other);
+            bad += compare(rank, "fork-B-disk", ref_b, b2);
+        }
+        if (a.rewind != 0U && a.rewind < N) {  // the first R tokens: the deepest snapshot <= R, then the rest re-prefilled
+            const std::vector<std::uint32_t> head(prompt.begin(), prompt.begin() + a.rewind);
+            const auto ref_r = g.fresh(head);
+            g.cache().clear();
+            (void)g.cached(prompt);
+            g.cache().clear_ram();
+            const auto r = g.cached(head);
+            bad += compare(rank, "rewind" + std::to_string(a.rewind), ref_r, r);
+            std::printf("  rewind to %u: resumed at %u, re-prefilled %u rows in %.3f s (fresh %.3f s)\n", a.rewind, r.resume, a.rewind - r.resume, r.seconds,
+                        ref_r.seconds);
+        }
+        if (a.session != 0U && g.has_batch()) {  // session snapshots taken by the decode
+            g.cache().clear();
+            const auto base = g.cached(prompt);
+            std::uint32_t last = 0;
+            const auto conv = g.session(base, a.session, last);
+            if (last == 0U) {
+                std::printf("GATE rank %u session: no block boundary reached (decode more)\n", rank);
+                ++bad;
+            } else {
+                const std::vector<std::uint32_t> upto(conv.begin(), conv.begin() + last);
+                const auto ref_s = g.fresh(upto);
+                g.cache().clear_ram();
+                auto full = g.cached(upto);
+                full.logits = ref_s.logits;  // a session snapshot does not know its logits (the batch forward does not keep them)
+                bad += compare(rank, "session-full", ref_s, full);
+                std::vector<std::uint32_t> next_turn = upto;
+                next_turn.insert(next_turn.end(), prompt.begin(), prompt.begin() + 40);
+                const auto ref_t = g.fresh(next_turn);
+                g.cache().clear_ram();
+                const auto t = g.cached(next_turn);
+                bad += compare(rank, "session-turn", ref_t, t);
+            }
+        }
+        report_cache("at the end");
+        g.cache().flush();
+        if (a.phase == "write") save_reference(rpath, saved);
+    }
+    const auto st = g.cache().stats();
+    std::printf("GATE rank %u %s (%d differences); cache %llu lookups %llu hits %llu inserts %llu refused, disk hits %llu\n", rank, bad == 0 ? "PASS" : "FAIL", bad,
+                static_cast<unsigned long long>(st.lookups), static_cast<unsigned long long>(st.hits), static_cast<unsigned long long>(st.inserts),
+                static_cast<unsigned long long>(st.refused), static_cast<unsigned long long>(st.disk_hits));
+    std::fflush(stdout);
+    return bad;
+}
+
 std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, std::uint32_t rank, unsigned timeout) {
     if (spec != "usb4-auto") throw std::invalid_argument("unknown transport " + spec);
     strix::dist::Usb4AutoOptions o;
@@ -366,11 +686,22 @@ int main(int argc, char** argv) try {
         else if (s == "--decode") a.decode = u32();
         else if (s == "--repeat-hit") a.repeat_hit = std::max<std::uint32_t>(1U, u32());
         else if (s == "--no-shared-weights") a.shared = false;
+        else if (s == "--before-tail") a.before_tail = true;
+        else if (s == "--cache-dir") a.cache_dir = next();
+        else if (s == "--disk-mb") a.disk_mb = std::stoull(next());
+        else if (s == "--phase") a.phase = next();
+        else if (s == "--no-fresh") a.no_fresh = true;
+        else if (s == "--fork") a.fork = u32();
+        else if (s == "--rewind") a.rewind = u32();
+        else if (s == "--corrupt") a.corrupt = next();
+        else if (s == "--session") a.session = u32();
         else if (s == "--connect-timeout") a.connect_timeout = static_cast<unsigned>(std::stoul(next()));
         else if (a.model.empty()) a.model = s;
         else throw std::invalid_argument("unknown argument " + s);
     }
     if (a.model.empty() || a.prompt_path.empty()) throw std::invalid_argument("usage: strix-deepseek41-prefix MODEL.gguf --prompt FILE ...");
+    if (a.phase != "all" && a.phase != "write" && a.phase != "read" && a.phase != "fresh") throw std::invalid_argument("--phase all|write|read|fresh");
+    if (a.session != 0U && a.decode == 0U) throw std::invalid_argument("--session needs --decode (the batch forward)");
     if (a.stream_experts && a.decode != 0U) throw std::invalid_argument("--decode needs the experts resident (not --stream-experts)");
     const auto prompt = read_prompt(a.prompt_path, a.rows);
     std::printf("prompt %zu tokens, block %u, max rows %u, layers %u\n", prompt.size(), a.block, a.max_rows, a.layers);

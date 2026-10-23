@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/hip_dense_trellis.hpp"
 
 // T-row Q8_0 projections for known-prefix windows (T = 1..8) and prompt
 // windows (T = 16, 32, 64; see project_wide_rows_kernel).
@@ -29,7 +30,8 @@
 // A Site supplies Input (uint16_t BF16 or float), rows, input[] (or
 // row_input(r)), segments, width, outputs, the coefficient/fma/add arithmetic of
 // its R1 kernel and store(out, row, value); it may override outs, sub, prefetch,
-// dense_a8_outs and a8_family (the dense A8 scratch family). The including
+// dense_a8_outs, dense_a8_width (an exact fixed-width contract), and a8_family
+// (the dense A8 scratch family). The including
 // translation unit owns the arithmetic flags (the dense A8 kernels disable contraction
 // themselves and use explicit FMAs and round-to-nearest divisions).
 
@@ -1225,14 +1227,25 @@ template <class Site> constexpr unsigned dense_a8_outs_of() {
     else return Site::rows <= 2U ? 1U : 2U;
 }
 template <unsigned Rows> constexpr std::uint64_t dense_a8_stage_bytes(std::uint64_t width) { return Rows * width + Rows * (width / 32U) * 4U; }
+template <class Site> constexpr unsigned dense_a8_width_of() {
+    if constexpr (requires { Site::dense_a8_width; }) return Site::dense_a8_width;
+    else return 0U;
+}
+template <class Site> constexpr unsigned dense_a8_chain_blocks_of() {
+    constexpr auto width = dense_a8_width_of<Site>();
+    static_assert(!width || (width % 64U == 0U && width <= 8192U));
+    return width && width < 1024U ? width / 32U : 32U;
+}
 template <class Site, unsigned Outs, bool Staged, bool Q6 = false>
 __global__ __launch_bounds__(kThreads) void project_rows_dense_a8_kernel(Site site, const std::int8_t* codes, const float* deltas) {
 #pragma clang fp contract(off)
     constexpr unsigned Rows = Site::rows, Pairs = Outs * Rows, Depth = 2U;
     static_assert(Rows <= 8U && Pairs <= 16U);
-    __shared__ float2 chain[kWaves][Pairs][33];
+    constexpr unsigned ChainBlocks = dense_a8_chain_blocks_of<Site>();
+    __shared__ float2 chain[kWaves][Pairs][ChainBlocks + 1U];
     const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x / 32U;
-    const std::uint32_t width = site.width, blocks = width / 32U, supers = (blocks + 31U) / 32U;
+    const std::uint32_t width = dense_a8_width_of<Site>() ? dense_a8_width_of<Site>() : site.width;
+    const std::uint32_t blocks = width / 32U, supers = (blocks + 31U) / 32U;
     const std::uint32_t groups = (site.outputs + Outs - 1U) / Outs, first = blockIdx.x * kWaves + wave;
     const std::uint32_t step = gridDim.x * kWaves;
     const std::uint32_t steps = first < groups ? (groups - first + step - 1U) / step * supers : 0U;
@@ -1304,14 +1317,15 @@ __global__ __launch_bounds__(kThreads) void project_rows_dense_a8_kernel(Site si
                 int dot = 0;
 #pragma unroll
                 for (unsigned k = 0; k < 8U; ++k) dot = __builtin_amdgcn_sudot4(true, a[k], true, q[k], dot, false);
-                chain[wave][o * Rows + r][lane] = make_float2(dw * delta[r], static_cast<float>(dot));
+                if (lane < ChainBlocks)
+                    chain[wave][o * Rows + r][lane] = make_float2(dw * delta[r], static_cast<float>(dot));
             }
         }
         wave_lds_order();
         if (lane < Pairs) {
-            const std::uint32_t count = min(32U, blocks - 32U * s);
+            const std::uint32_t count = min(ChainBlocks, blocks - 32U * s);
 #pragma unroll
-            for (unsigned j = 0; j < 32U; ++j)
+            for (unsigned j = 0; j < ChainBlocks; ++j)
                 if (j < count) { const float2 c = chain[wave][lane][j]; acc = __builtin_fmaf(c.x, c.y, acc); }
         }
         if (++s == supers) {
@@ -1703,6 +1717,9 @@ template <class Site> void launch_dense_a8_projection(const Site& site, const De
 // 16/32/64).
 template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream, bool any_order) {
     static_assert(Site::rows <= 8U || (Site::rows % 16U == 0U && Site::rows <= kDenseA8WideRows));
+    if constexpr (dense_a8_width_of<Site>())
+        if (site.width != dense_a8_width_of<Site>())
+            throw std::invalid_argument("q8_rows: dense A8 fixed-width contract differs");
     if (!dense_a8_width(site.width))
         throw std::invalid_argument("q8_rows: dense A8 requires a width that is a positive multiple of 64, at most 8192");
     for (unsigned m = 0; m < site.segments.count; ++m)
@@ -1722,7 +1739,7 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
         constexpr unsigned Outs = dense_a8_outs_of<Site>();
         const unsigned groups = (site.outputs + Outs - 1U) / Outs;
         const auto stage = dense_a8_stage_bytes<Site::rows>(site.width);
-        const auto chain = static_cast<std::uint64_t>(kWaves) * Outs * Site::rows * 33U * 8U;
+        const auto chain = static_cast<std::uint64_t>(kWaves) * Outs * Site::rows * (dense_a8_chain_blocks_of<Site>() + 1U) * 8U;
         const unsigned mode = dense_a8_stage_mode();
         if (mode && stage + chain <= (mode == 2U ? kLdsBytes : kDenseA8StageBytes)) {
             const auto bytes = static_cast<std::uint32_t>(stage);
@@ -1759,6 +1776,9 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
 // 16/32 rows (cohort windows of several sessions): the WMMA projection from the same pitch-64 slot.
 template <class Site> void launch_dense_a8_quantized(const Site& site, const DenseA8Slot& slot, hipStream_t stream) {
     static_assert(Site::rows <= 8U || (Site::rows % 16U == 0U && Site::rows <= kDenseA8Rows));
+    if constexpr (dense_a8_width_of<Site>())
+        if (site.width != dense_a8_width_of<Site>())
+            throw std::invalid_argument("q8_rows: dense A8 fixed-width contract differs");
     if (!dense_a8_width(site.width))
         throw std::invalid_argument("q8_rows: dense A8 requires a width that is a positive multiple of 64, at most 8192");
     for (unsigned m = 0; m < site.segments.count; ++m)
@@ -1892,6 +1912,36 @@ template <class Site> void launch_lane(const Site& site, hipStream_t stream) {
 // the previously queued kernel touches, so it may start while that kernel still runs.
 // a8 selects the dense A8 profile arithmetic (launch_dense_a8).
 template <class Site> void launch(const Site& site, bool a8, hipStream_t stream, bool any_order = false) {
+#if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
+    if constexpr (Site::rows <= 8U && requires { Site::dense_trellis_inputs; }) {
+        if (hip_dense_trellis_active() && hip_dense_trellis_permitted()) {
+            Site remaining = site;
+            remaining.segments = {}; remaining.outputs = 0U;
+            bool replaced = false;
+            for (unsigned m = 0; m < site.segments.count; ++m) {
+                HipDenseTrellisRows views{};
+                for (unsigned r = 0; r < Site::rows; ++r) {
+                    views.input[r] = static_cast<const std::uint16_t*>(site.input[r]);
+                    views.output[r] = site.output[m][r];
+                }
+                const auto outputs = site.segments.first[m + 1U] - site.segments.first[m];
+                if (project_hip_dense_trellis_registered(site.segments.weights[m], views, Site::rows, site.width, outputs, stream)) {
+                    replaced = true;
+                } else {
+                    const auto n = remaining.segments.count++;
+                    remaining.segments.weights[n] = site.segments.weights[m];
+                    remaining.segments.first[n + 1U] = remaining.segments.first[n] + outputs;
+                    remaining.outputs += outputs;
+                    for (unsigned r = 0; r < Site::rows; ++r) remaining.output[n][r] = site.output[m][r];
+                }
+            }
+            if (replaced) {
+                if (remaining.outputs) launch(remaining, a8, stream, any_order);
+                return;
+            }
+        }
+    }
+#endif
     if (a8) { launch_dense_a8(site, stream, any_order); return; }
     const auto start = [&](auto kernel, unsigned blocks, unsigned threads, std::uint32_t bytes, const Site& args) {
         if (any_order)

@@ -11,12 +11,13 @@
 //   w * raw, high likewise for ids >= split; each step is one FP32 product then one FP32 add.
 
 #include "strix/ds41_formats.hpp"
+#include "strix/ds41_msvc_builtins.hpp"
 
 #include <cstdint>
 #include <span>
 #include <vector>
 
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) || defined(__CUDACC__)
 #define STRIX_DS41_HD __host__ __device__
 #else
 #define STRIX_DS41_HD
@@ -87,6 +88,8 @@ STRIX_DS41_HD inline float declared_log1p(float e) {
 STRIX_DS41_HD inline float declared_sqrt(float x) {
 #if defined(__HIP_DEVICE_COMPILE__)
     return static_cast<float>(__dsqrt_rn(static_cast<double>(x)));
+#elif defined(__CUDA_ARCH__)
+    return __fsqrt_rn(x);  // IEEE round-to-nearest single-precision root on NVIDIA devices
 #else
     return __builtin_sqrtf(x);
 #endif

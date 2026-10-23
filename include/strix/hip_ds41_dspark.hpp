@@ -90,7 +90,27 @@ public:
     void set_rank(std::uint32_t rank, std::uint32_t world, RankExchange exchange);
     // Forgets every appended row (new sequence).
     void reset();
+    // An empty context continues a sequence at `position` whose earlier rows it never saw (e.g. a prompt read by the
+    // device prefill): appends and drafts start there and the attention reads only the rows appended since.
+    void skip_to(std::uint64_t position);
+    // Sequence contexts: several requests drafted by one drafter over one copy of its weights (BatchForward). A context
+    // is what one request's drafting owns: the stage rings, the position (next()) and the draft vocabulary.
+    // set_sequences(n) keeps context 0 (the current one) and adds n - 1 fresh ones (empty, full vocabulary);
+    // select(i) makes context i the one append / draft / next / vocabulary / reset act on. Each context drafts
+    // exactly as its own DeviceDrafter would (same weights, same kernels, its own state).
+    void set_sequences(std::uint32_t count);
+    [[nodiscard]] std::uint32_t sequences() const noexcept;
+    void select(std::uint32_t sequence);
+    [[nodiscard]] std::uint32_t selected() const noexcept;
     [[nodiscard]] std::vector<std::uint8_t> ring(std::uint32_t stage) const;
+
+    // Device bytes a drafter over `weights` with `sequences` contexts allocates (no device needed: the sizes of the
+    // constructor's uploads, its scratch and set_sequences' contexts; hipMalloc rounding not included).
+    struct Footprint {
+        std::uint64_t weights = 0, scratch = 0, contexts = 0;
+        [[nodiscard]] std::uint64_t total() const noexcept { return weights + scratch + contexts; }
+    };
+    [[nodiscard]] static Footprint footprint(const Weights& weights, std::uint32_t sequences);
 
 private:
     struct Impl;

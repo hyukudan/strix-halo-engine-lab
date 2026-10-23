@@ -114,6 +114,7 @@ struct HipMtpWindowVerifier::Impl {
     bool timing_independent=false;
     std::vector<float> sampled_logits;
     std::unique_ptr<MtpMinPWindowController> minp;
+    std::unique_ptr<MtpDepthWindowController> depth;
     std::unique_ptr<HipTokenSamplerDevice> device_sampler; // sampling-v1 on the GPU (STRIX_SAMPLE_PATH=host: host)
     // Sampled rows: decided in order from row 0 (the token at `first`) until the first row without a
     // draft, a rejection, EOS or `n` rows; later rows are never accepted. Spans must outlive the window.
@@ -196,6 +197,11 @@ struct HipMtpWindowVerifier::Impl {
             const auto model=cost && std::string_view(cost)=="legacy"?MtpWindowCostEstimate::Model::legacy:MtpWindowCostEstimate::Model::robust;
             std::vector<std::uint32_t> rows;for(const auto& o:owners) rows.push_back(o.rows);
             minp=std::make_unique<MtpMinPWindowController>(std::move(rows),min_probability,model,64,timing_independent);
+        }
+        if(prefix && mtp_depth_controller_enabled() && !timing_independent) {
+            require(!target->token_sampler(),"depth MTP controller requires greedy selection");
+            std::vector<std::uint32_t> rows;for(const auto& o:owners)rows.push_back(o.rows);
+            depth=std::make_unique<MtpDepthWindowController>(std::move(rows),min_probability,mtp_depth_domain_prior());
         }
         // The survival controller prices options by measured time: never with a timing-independent schedule.
         survival=prefix && hip_mtp_survival_controller() && !timing_independent;
@@ -373,7 +379,8 @@ struct HipMtpWindowVerifier::Impl {
     template<class Fits> Owner* choose(std::span<const float> p,std::size_t candidates,Fits fits) {
         std::array<std::uint8_t,8> mask{};
         for(std::size_t o=0;o<owners.size();++o) mask[o]=fits(owners[o])?1U:0U;
-        const auto chosen=minp->choose(p,candidates,std::span<const std::uint8_t>(mask.data(),owners.size()));
+        const auto admitted=std::span<const std::uint8_t>(mask.data(),owners.size());
+        const auto chosen=depth?depth->choose(p,candidates,admitted):minp->choose(p,candidates,admitted);
         return chosen==MtpMinPWindowController::serial?nullptr:&owners[chosen];
     }
     // A cohort cycle is not a sample of any owner's cost; the next cycle measures from here.
@@ -395,6 +402,7 @@ struct HipMtpWindowVerifier::Impl {
             static const bool log_cycles=std::getenv("STRIX_CYCLE_LOG")!=nullptr;
             if(log_cycles) std::fprintf(stderr,"cycle rows=%u emitted=%zu ms=%.2f\n",owner?owner->rows:1U,emitted,ms);
             minp->observe(owner?static_cast<std::size_t>(owner-owners.data()):MtpMinPWindowController::serial,emitted,ms);
+            if(depth)depth->observe(owner?static_cast<std::size_t>(owner-owners.data()):MtpDepthWindowController::serial,emitted,ms);
         }
         last_end=now;
     }
@@ -419,7 +427,7 @@ std::vector<HipMtpWindowOwnerStats> HipMtpWindowVerifier::owner_stats() const {
     for(const auto& o:impl_->minp->owner_stats()) out.push_back({o.rows,o.cycles,o.cycle_ms,o.probes});
     return out;
 }
-bool HipMtpWindowVerifier::robust_cost_model() const noexcept {return impl_->minp->model()==MtpWindowCostEstimate::Model::robust;}
+bool HipMtpWindowVerifier::robust_cost_model() const noexcept {return impl_->depth || impl_->minp->model()==MtpWindowCostEstimate::Model::robust;}
 std::uint32_t HipMtpWindowVerifier::logical_rows() const noexcept {return impl_->window->logical_rows();}
 void HipMtpWindowVerifier::prepare_admission(const SerialSessionContext& session) {
     // STRIX_WINDOW_SETUP_PREFLIGHT=0 leaves each owner's admission to its first window.
@@ -496,13 +504,18 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
         const auto pending=initial.predicted_token();
         require(std::find(q.eos.begin(),q.eos.end(),pending)==q.eos.end(),"MTP cohort session has an EOS pending token");
         auto* owner=i.owner_of(q.rows);
-        require(owner && i.fits(session,*owner,q.candidates.size(),q.budget),"MTP cohort session owner does not fit");
+        // An empty joint draft uses R2 as one real target row plus padding.
+        // Nothing after row zero is accepted; the normal prefix commit restores
+        // the complete request state exactly as for any rejected draft.
+        require(owner && (q.candidates.empty()?i.fits(session,*owner,1U,q.budget):
+            i.fits(session,*owner,q.candidates.size(),q.budget)),"MTP cohort session owner does not fit");
         auto& p=prepared[a];p.impl=&i;p.owner=owner;
         for(const auto& pool:owner->captures)if(pool->ready_for_reuse()){p.capture=pool;break;}
         require(!!p.capture,"MTP window capture pools are retained by previous batch readers");
         i.target->validate_window_capture(*p.capture);
         p.inputs.reserve(q.rows);p.inputs.push_back(pending);
-        for(std::uint32_t r=1;r<q.rows;++r) p.inputs.push_back(q.candidates[std::min<std::size_t>(r-1U,q.candidates.size()-1U)]);
+        for(std::uint32_t r=1;r<q.rows;++r) p.inputs.push_back(q.candidates.empty()?pending:
+            q.candidates[std::min<std::size_t>(r-1U,q.candidates.size()-1U)]);
         members[a]={owner->window.get(),q.session,p.inputs,p.capture};
         if(sampler) p.capture->set_row_selection(i.sampled_selection(sampler,session.next_position+1U,p.capture->source_stream(),
             q.rows,std::min(q.rows,q.budget),q.drafts,q.eos));
@@ -579,6 +592,23 @@ void HipMtpWindowVerifier::begin_session() {
     require(!i.busy && !failed(),"MTP window verifier session restarts only while idle and healthy");
     for(auto& o:i.owners) o.window->discard_deferred();
     i.last=nullptr;i.last_end.reset();
+    // The owners and their device pools are reusable; their workload estimates
+    // are not. In particular, multi-stream cycle wall times include scheduler
+    // work that must not price deeper windows out of a later single-stream run.
+    static const bool reset=[]{const char* v=std::getenv("STRIX_MTP_REQUEST_RESET");return !v || v[0]!='0';}();
+    if(reset) {
+        i.minp->begin_session();
+        if(i.depth) {
+            std::vector<std::uint32_t> rows;for(const auto& o:i.owners)rows.push_back(o.rows);
+            i.depth=std::make_unique<MtpDepthWindowController>(std::move(rows),i.min_probability,mtp_depth_domain_prior());
+        }
+        for(auto& o:i.owners)o.warmed=false;
+        for(auto& option:i.options)option=Impl::Option{option.owner,option.active};
+        i.calibrator.bias=SurvivalCalibrator::prior[0];
+        i.draft_ms_ema=i.serial_row_ms_ema=i.rho=i.chain_ms=0.0;
+        i.draft_samples=i.serial_rows=i.cycle_index=0;
+        i.chain_steps=0;i.external_first=SIZE_MAX;i.external.clear();
+    }
 }
 bool HipMtpWindowVerifier::failed() const noexcept {return impl_->failed || (impl_->checkpoint && impl_->checkpoint->failed());}
 std::uint64_t HipMtpWindowVerifier::retained_payload_bytes() const noexcept {return impl_->retained;}
@@ -586,12 +616,27 @@ void HipMtpWindowVerifier::set_external_rows(std::size_t first,std::span<const d
     auto& i=*impl_;
     require(!i.busy && !i.survival && i.minp,"MTP window verifier external rows are set between cycles of the min-p controller");
     i.minp->set_external_rows(first,acceptance);
+    if(i.depth)i.depth->set_external_rows(first,acceptance);
 }
 bool HipMtpWindowVerifier::worth_drafting(std::span<const float> probabilities,std::span<const float> runner_ups) const {
+    if(impl_->depth)return impl_->depth->worth_drafting(probabilities);
     return impl_->survival?impl_->survival_keep(probabilities,runner_ups):impl_->minp->worth_drafting(probabilities);
 }
 bool HipMtpWindowVerifier::survival_controller() const noexcept {return impl_->survival;}
-void HipMtpWindowVerifier::note_draft(std::uint32_t steps,double ms) noexcept {impl_->chain_steps=steps;impl_->chain_ms=ms;}
+bool HipMtpWindowVerifier::depth_controller() const noexcept {return static_cast<bool>(impl_->depth);}
+std::vector<MtpDepthWindowController::CostStats> HipMtpWindowVerifier::depth_cost_stats() const {
+    return impl_->depth?impl_->depth->cost_stats():std::vector<MtpDepthWindowController::CostStats>{};
+}
+std::vector<MtpDepthWindowController::CostStats> HipMtpWindowVerifier::draft_depth_stats() const {
+    return impl_->depth?impl_->depth->draft_stats():std::vector<MtpDepthWindowController::CostStats>{};
+}
+void HipMtpWindowVerifier::note_draft(std::uint32_t steps,double ms) noexcept {
+    impl_->chain_steps=steps;impl_->chain_ms=ms;
+    if(impl_->depth) {
+        if(steps<=7U && std::isfinite(ms) && ms>=0)impl_->depth->note_draft(steps,ms);
+        else impl_->depth->note_draft(0,0);
+    }
+}
 std::vector<HipMtpWindowOptionStats> HipMtpWindowVerifier::option_stats() const {
     std::vector<HipMtpWindowOptionStats> out;
     if(!impl_->survival) return out;
@@ -605,8 +650,17 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
     std::uint32_t budget,std::span<const std::uint32_t> eos,std::span<const float> probabilities,
     std::span<const TokenDraft> drafts,std::span<const float> runner_ups) {
     auto& i=*impl_;
-    if(hip_mtp_full_chain_diagnostic()) budget=std::min(budget,1U); // no owner fits: one serial row
-    struct ClearExternal{Impl& impl;~ClearExternal(){if(impl.minp)impl.minp->clear_external_rows();}} clear_external{i};
+    // Matched-position diagnostics: execute a physical owner, but commit only one
+    // exact target row. Every arm therefore visits the same target frontiers.
+    const bool diagnostic=hip_mtp_full_chain_diagnostic();
+    const auto diagnostic_rows=diagnostic?static_cast<std::uint32_t>(env_number("STRIX_MTP_DIAG_ROWS",1.0)):0U;
+    require(!diagnostic || diagnostic_rows==1U || diagnostic_rows==2U || diagnostic_rows==4U || diagnostic_rows==8U,
+        "MTP diagnostic rows must be 1, 2, 4 or 8");
+    if(diagnostic && diagnostic_rows==1U) budget=std::min(budget,1U);
+    struct ClearExternal{Impl& impl;~ClearExternal(){
+        if(impl.minp)impl.minp->clear_external_rows();
+        if(impl.depth)impl.depth->clear_external_rows();
+    }} clear_external{i};
     const auto sampler=i.target->token_sampler();
     require(sampler?drafts.size()==candidates.size():drafts.empty(),"MTP sampled verification needs one draft distribution per candidate");
     for(std::size_t k=0;k<drafts.size();++k)
@@ -638,6 +692,12 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
         owner=option?option->owner:nullptr;
     } else owner=i.choose(probabilities,candidates.size(),[&](const Impl::Owner& o){
         return budget>=o.rows && room>=o.rows && history && (pad?!candidates.empty():candidates.size()+1>=o.rows);});
+    if(diagnostic) {
+        owner=diagnostic_rows>1U?i.owner_of(diagnostic_rows):nullptr;
+        require(diagnostic_rows==1U || owner,"MTP diagnostic owner is not admitted");
+        if(owner && (budget<owner->rows || room<owner->rows || !history || candidates.empty())) owner=nullptr;
+        option=nullptr;
+    }
     const bool use_window=owner!=nullptr;
     const auto rows=use_window?owner->rows:1U;
     // Rows whose drafts can be accepted; the owner's later rows are padding (outside the expert union
@@ -647,7 +707,10 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
     const auto calibrate=[&](std::size_t accepted,std::size_t verified) {
         if(probabilities.size()!=candidates.size()) return;
         if(survival) i.survival_calibrate(probabilities,runner_ups,accepted,verified);
-        else i.minp->calibrate(probabilities,accepted,verified);
+        else {
+            i.minp->calibrate(probabilities,accepted,verified);
+            if(i.depth)i.depth->calibrate(probabilities,accepted,verified);
+        }
     };
     const auto observe=[&](bool window,std::size_t emitted) {
         if(survival) i.survival_observe(window?option:nullptr,emitted);
@@ -686,7 +749,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             for(std::uint32_t row=0;row<rows;++row)selected.push_back(provisional->predicted_token(row));
             // Longest accepted prefix: row a+1's input equals row a's prediction.
             std::uint32_t a=0;
-            while(a+1U<active && a<candidates.size() && a+1U<budget && inputs[a+1U]==selected[a] && !is_eos(selected[a])) ++a;
+            while(!diagnostic && a+1U<active && a<candidates.size() && a+1U<budget && inputs[a+1U]==selected[a] && !is_eos(selected[a])) ++a;
             const auto n_keep=a+1U;
             host_phase_mark("7a select/accept");
             owner->window->commit_prefix(n_keep);i.last=owner;
@@ -749,7 +812,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             pending=ticket.predicted_token();out.committed_rows.push_back(std::move(ticket));out.emitted_tokens.push_back(pending);
             const bool accepted=index<candidates.size() && candidates[index]==pending;
             if(accepted)++out.accepted_candidates;
-            if(is_eos(pending) || !accepted)break;
+            if(diagnostic || is_eos(pending) || !accepted)break;
         }
         calibrate(out.accepted_candidates,out.emitted_tokens.size());
         observe(use_window,out.emitted_tokens.size());

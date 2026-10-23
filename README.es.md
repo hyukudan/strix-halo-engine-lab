@@ -1,182 +1,229 @@
-# Strix Halo engine
+# Strix Halo engine lab
 
-**Un motor de inferencia de LLM rápido y exacto para un mini PC de AMD y un modelo grande.**
+**Inferencia de LLM rápida y exacta, escrita desde cero para AMD Strix Halo: un mini PC, dos unidos por USB4, y una
+GPU dedicada cuando la hay.**
 
 [English](README.md) · [Español](README.es.md)
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/media/speed-dark.svg">
-    <img alt="Velocidad medida en un equipo Strix Halo. Escribiendo respuestas con MTP: 53,1 tok/s con el perfil exacto y 54,9 tok/s con dense A8. Leyendo el prompt: unos 400 tok/s con el perfil exacto y unos 700 tok/s con dense A8, de 1K a 32K tokens. Commit dff1dbe, 2026-10-18." src="docs/media/speed-light.svg" width="860">
-  </picture>
-</p>
 
 <!-- SCREENSHOT: captura del panel de monitorización del motor cuando exista, p. ej.
 <p align="center"><img alt="Panel de monitorización del motor" src="docs/media/monitor.png" width="860"></p>
 -->
 
 > Esta es una traducción del [README en inglés](README.md), que es la referencia. La documentación técnica
-> detallada ([docs/ENGINE.md](docs/ENGINE.md), [DECISIONS.md](DECISIONS.md) y `docs/`) está en inglés.
+> ([docs/performance.md](docs/performance.md), [docs/ENGINE.md](docs/ENGINE.md), [DECISIONS.md](DECISIONS.md) y
+> `docs/`) está en inglés.
 
-Este motor ejecuta **Qwen3.8-Flash-Next**, un modelo grande de mezcla de expertos (MoE), en un único equipo
-**AMD Strix Halo** (Ryzen AI Max+ 395, 128 GB de memoria unificada) con Linux y ROCm. Está escrito desde cero
-para ese chip y ese modelo, así que cada kernel, cada disposición de memoria y cada decisión de planificación
-puede dar por sentado exactamente cómo son el hardware y el modelo.
+Es nuestro propio motor de inferencia en C++/HIP para **AMD Strix Halo** (Ryzen AI Max+ 395, Radeon 8060S
+`gfx1151`, 128 GB de memoria unificada) con Linux y ROCm. Ejecuta modelos grandes de mezcla de expertos (MoE):
 
-Responde a unos **53-55 tokens por segundo** con un prompt de código y lee prompts a **unos 700 tokens por
-segundo**, y el texto que escribe es **exactamente** el que escribiría la decodificación voraz (greedy) normal,
-token a token. La velocidad sale de adivinar varios tokens por adelantado y comprobarlos todos a la vez, nunca de
-cambiar la respuesta.
+- **Qwen3.8-Flash-Next** en un nodo, o como dos réplicas en dos nodos. Una petición de chat de código decodifica a
+  **90,7 tok/s**; ocho chats de código a la vez suman **255 tok/s** de decode.
+- **DeepSeek V4.1 Flash** repartido entre **dos nodos por USB4** (paralelismo tensorial de expertos), con una
+  **RTX PRO 6000** opcional que se encarga de las 22 primeras capas. Los prompts de código decodifican a
+  **62,3 tok/s** en el par y a **81,1 tok/s** con la RTX PRO.
 
-**AMD primero e independiente.** Los kernels de ejecución del modelo, la planificación y el decode especulativo son
-código propio en C++/HIP para Strix Halo (`gfx1151`); el motor no envuelve otro runtime de inferencia y todos los
-números de este README salen de nuestro ejecutable `strix-hip-decode-token`. ROCm/HIP, Linux, el formato GGUF y las
-herramientas de compilación habituales siguen siendo dependencias: *independiente* no significa sin dependencias. El
-motor está pensado para funcionar por completo en una sola Strix Halo sin el trabajo de orquestación distribuida de
-[TensorMeld](https://github.com/hyukudan/tensormeld); el funcionamiento multinodo y otras GPUs son etapas aparte,
-cualificadas explícitamente. Primera prioridad: el mejor rendimiento correcto de extremo a extremo en hardware AMD.
+Cada kernel, disposición de memoria y decisión de planificación está escrita para este chip y estos modelos. La
+velocidad sale del decode especulativo exacto (el modelo completo comprueba cada token propuesto), del batching y de
+las réplicas, nunca de cambiar la respuesta: la salida especulativa es igual a la decodificación voraz (greedy)
+normal allí donde lo afirmamos, y cada una de esas afirmaciones la comprueba una puerta (gate).
 
-> **Estado: motor de investigación.** Funciona de principio a fin y los números de abajo son medidos. La interfaz
-> principal es una herramienta de línea de comandos que recibe IDs de token e imprime un recibo JSON; `--http-serve`
-> convierte el mismo proceso en un servidor HTTP compatible con las API de OpenAI y Anthropic (una petición cada vez,
-> greedy; ver [docs/serving.md](docs/serving.md)).
+> **Estado: motor de investigación.** Funciona de principio a fin y todos los números de abajo son medidos. Cada
+> modelo tiene una herramienta de línea de comandos que imprime un recibo JSON y un servidor HTTP compatible con
+> OpenAI/Anthropic (`strix-hip-decode-token --http-serve` para Qwen, `strix-deepseek41-serve` para DeepSeek). El
+> laboratorio acoge también la puesta en marcha de más modelos; ver [Modelos](#modelos).
 
 ## Contenido
 
-[Qué lo hace distinto](#qué-lo-hace-distinto) ·
+[Modelos](#modelos) ·
+[Hardware](#hardware) ·
 [Velocidad](#velocidad) ·
-[Calidad](#calidad) ·
-[Más allá del inglés](#más-allá-del-inglés) ·
+[Exactitud y calidad](#exactitud-y-calidad) ·
+[Qué lo hace distinto](#qué-lo-hace-distinto) ·
+[Idiomas](#más-allá-del-inglés) ·
 [Qué necesitas](#qué-necesitas) ·
 [Compilar](#compilar) ·
 [Ejecutar](#ejecutar) ·
 [Cómo funciona](#cómo-funciona) ·
 [Decisiones de diseño](#decisiones-de-diseño) ·
 [Hoja de ruta](#hoja-de-ruta) ·
+[Repositorios relacionados](#repositorios-relacionados) ·
 [Preguntas frecuentes](#preguntas-frecuentes) ·
 [Licencia](#licencia)
 
-## Qué lo hace distinto
+## Modelos
 
-- **Decodificación especulativa exacta.** Un pequeño predictor integrado (la cabeza MTP del modelo) propone los
-  siguientes tokens. El modelo completo comprueba 2, 4 u 8 de ellos en una sola pasada y se queda con la racha
-  correcta más larga. Cada kernel multifila hace la aritmética de cada fila exactamente igual que el kernel de
-  una fila, así que cada token emitido es idéntico, bit a bit, a la decodificación voraz en serie. Sin
-  tolerancias, sin "casi igual".
-- **Perfiles numéricos con nombre y calidad medida.** Cómo redondea el motor es una elección con nombre y
-  versión, no un detalle oculto. Hoy se recomiendan dos: el **perfil exacto** (proyecciones densas en FP32) y
-  **dense A8** (activaciones int8 en las proyecciones densas; más rápido, con un coste de calidad pequeño y
-  medido). El prompt puede leerse con un perfil y la respuesta escribirse con otro (D-033).
-- **La calidad se mide, no se supone.** Un arnés teacher-forced compara la distribución de salida completa del
-  motor con una referencia Q8_0 en decenas de miles de posiciones (divergencia KL y acuerdo top-1), desglosada
-  por categoría e idioma.
-- **Opcional hasta demostrarlo.** Toda optimización empieza desactivada. Solo pasa a ser la opción por defecto
-  cuando se demuestra que es exacta bit a bit (o, para un perfil numérico nuevo, que tiene una calidad medida)
-  y más rápida en el hardware real, con la carga de trabajo completa. Las ideas que fallaron quedan registradas
-  con sus números.
-- **Primero AMD, e independiente.** Escrito para `gfx1151` con HIP, con su propio lector GGUF, sus propios
-  kernels y su propio planificador de memoria unificada.
+| Modelo | Dónde corre | Estado | Puntos clave |
+|---|---|---|---|
+| **Qwen3.8-Flash-Next** (UD-Q4_K_XL, 111 GB) | 1 nodo; 2 réplicas tras un router | **Producción** | Decode especulativo MTP con cabeza de borrador destilada, idéntico bit a bit al greedy serie; servidor con batching y ventanas de verificación conjuntas; caché de estado de prefijos |
+| **DeepSeek V4.1 Flash** (1017; expertos de 2 bits, denso de 6,5 bits + trellis) | 2 nodos por USB4 | **Producción** (defaults de dos nodos D-061) | Decode con paralelismo tensorial de expertos, prefill en dispositivo con paralelismo de expertos, decode especulativo DSpark, decode por lotes, servidor; puertas bit a bit |
+| DeepSeek V4.1 Flash + RTX PRO 6000 | RTX PRO (capas 0-21) + 2 nodos (22-39) | **Experimental** (opt-in, D-064) | Reparto en tubería por 1 GbE, servicio de prefill CUDA, colocación de expertos calientes |
+| MiniMax M3.1 Flash (EXL3, 3,06 bpw) | 2 nodos | **Puesta en marcha**, no está en esta versión | Lector del formato y referencia en CPU; aún sin cifras de velocidad |
+| GLM-5.3 Flash (GGUF) | 2 nodos | **Pruebas previstas** | Sin empezar en el motor |
+
+El núcleo no conoce ningún modelo: cada familia es un módulo con su contrato, su plan, sus kernels y sus puertas
+([docs/model-families.md](docs/model-families.md)). Los perfiles automáticos solo admiten los ficheros de modelo
+fijados en [SOURCES_LEDGER.md](SOURCES_LEDGER.md).
+
+## Hardware
+
+- **Nodo:** un mini PC AMD Strix Halo, Ryzen AI Max+ 395 con la iGPU Radeon 8060S (`gfx1151`), 128 GB de memoria
+  unificada, Linux, ROCm.
+- **Par:** dos nodos unidos por dos cables USB4 directos (un enlace de 40 Gb/s y otro de 20 Gb/s), con nuestra
+  [serie de parches del driver USB4](https://github.com/hyukudan/strix-halo-usb4-driver): unos 37 Gb/s por sentido
+  con los dos sentidos ocupados, 18,4 µs por un intercambio de 20 KB.
+- **GPU dedicada opcional:** una NVIDIA RTX PRO 6000 Blackwell (96 GB) en un PC, conectada al par por 1 GbE (solo
+  DeepSeek, opt-in).
 
 ## Velocidad
 
-Medido en **un Bosgame M5** (Ryzen AI Max+ 395, 128 GB), modelo UD-Q4_K_XL, una petición cada vez, en el commit
-`dff1dbe` el **2026-10-18**. Estos números se actualizarán tras la campaña de benchmarks en curso.
+Todos los números están medidos en el hardware de arriba, greedy (temperatura 0), medianas de 3 o más ejecuciones,
+el 2026-10-22/23. La tabla completa, con las condiciones y la comprobación de exactitud de cada fila, está en
+**[docs/performance.md](docs/performance.md)**.
 
-<!-- BENCH: actualizar todos los valores de esta sección (y tools/gen_readme_chart.py, y volver a ejecutarlo) con el commit final de la campaña; actualizar commit y fecha. -->
+> Una campaña de defaults está volviendo a cronometrar el 2026-10-23 los flags opt-in más nuevos de los dos
+> modelos. Cuando cierre se actualizarán las filas de DeepSeek de greedy, lotes, prefill y servidor, y las de Qwen
+> de prefill y servidor por réplica. Los valores de abajo son las últimas mediciones limpias.
 
-**Escribe respuestas** (decodificación especulativa con ventanas MTP 2/4/8, prompt de código, 256 tokens
-generados, error de replay 0):
+### Código
 
-| Perfil | Tokens por segundo |
+| Carga | Configuración | Decode |
+|---|---|---|
+| Qwen, chat de código, una petición | un nodo (a través del router) | **90,7 tok/s** |
+| Qwen, chat de código, 2 / 4 / 8 peticiones a la vez | dos réplicas | **181,5 / 201,6 / 255,0 tok/s** sumados por petición |
+| Qwen, código con un prompt de 1K tokens | un nodo | **59,9 tok/s** |
+| Qwen, código con un prompt de 32K tokens | un nodo | 51,8 tok/s |
+| DeepSeek, prompts de código (8 × 256 tokens), DSpark | par | **62,3 tok/s** |
+| DeepSeek, chat de código por el servidor, un cliente | par | 66,9 tok/s tras el primer token |
+| DeepSeek, prompts de código, DSpark | par + RTX PRO | **81,1 tok/s** |
+
+El código es donde más rinde el decode especulativo: repite nombres y estructura, así que las cabezas de borrador
+aciertan tramos largos. El decode sumado cuenta la velocidad de decode de cada petición; un cliente además espera a
+su primer token (chat de código, agregado de pared 68,1 / 136,2 / 146,9 / 166,7 tok/s con 1 / 2 / 4 / 8 peticiones).
+
+### Qwen3.8-Flash-Next
+
+Un nodo, perfil dense A8, ventanas MTP 2/4/8, 256 tokens generados:
+
+| Decode | Código, prompt 1K | Prosa, 1K | Prosa, 8K | Código, 32K |
+|---|---:|---:|---:|---:|
+| tok/s | **59,9** | **55,5** | 48,9 | 51,8 |
+
+| Lectura del prompt (perfil rápido de prompt) | 1K | 4K | 16K | 32K |
+|---|---:|---:|---:|---:|
+| Prefill, tok/s | 916 | 1.085 | 1.089 | 1.065 |
+| Tiempo hasta el primer token | **1,13 s** | 3,78 s | 15,05 s | 30,76 s |
+
+Dos réplicas, un modelo completo por nodo, tras el router de [TensorMeld](https://github.com/hyukudan/tensormeld)
+(D-060), conjunto corto de 8 categorías (prompts de 36-303 tokens), agregado de pared incluido el primer token:
+
+| Clientes | 1 | 2 | 4 | 6 | 8 |
+|---|---:|---:|---:|---:|---:|
+| tok/s | **42,8** | **85,8** | **102,9** | **110,6** | **120,4** |
+| TTFT p50 | 0,89 s | 0,85 s | 1,32 s | 1,91 s | 2,55 s |
+
+Cada respuesta es igual a la de un solo nodo, 570/570.
+
+### DeepSeek V4.1 Flash
+
+Dos nodos por USB4, defaults de producción:
+
+| Qué | Medido |
 |---|---|
-| Exacto (FP32 denso) | **53,1** |
-| Dense A8 (recomendado) | **54,9** |
+| Decode greedy, un flujo | **28,5** tok/s |
+| Decode especulativo DSpark, un flujo (inglés / español / código) | **37,5 / 39,3 / 62,3** tok/s (46,4 en 24 prompts) |
+| Decode por lotes, 8 flujos, agregado | **95,9** tok/s |
+| Prefill en dispositivo, 8K tokens | **734** tok/s (1K / 4K / 16K: 458 / 640 / 758 en una build anterior) |
+| Servidor, conjunto corto de 8 categorías, 1 / 2 / 4 / 8 clientes | **38,4 / 52,7 / 59,3 / 66,8** tok/s agregados |
+| Tiempo hasta el primer token por el servidor, prompt de 8K, en reposo | **15,8 s** |
 
-<!-- BENCH: decodificación por carga (prosa en inglés, prosa en español, otros idiomas, chat) con ambos perfiles. -->
+Con la RTX PRO 6000 (opt-in), la misma build del par en las dos columnas:
 
-El código es el caso más fácil para el predictor. La prosa acepta menos tokens propuestos por comprobación, así
-que se decodifica más despacio: en un commit anterior (`b0d1cd1`) la prosa en inglés iba a 37,2 tok/s donde el
-código iba a 48,5 tok/s. La tabla por carga de trabajo del build actual está pendiente; ver
-[docs/ENGINE.md](docs/ENGINE.md#decode-by-workload-earlier-measurement).
+| Qué | Solo el par | Par + RTX PRO |
+|---|---:|---:|
+| Decode DSpark, los 24 prompts | 46,4 tok/s | **61,8** tok/s (×1,33) |
+| Decode DSpark, inglés / español / código | 37,5 / 39,3 / 62,3 | **50,3 / 54,2 / 81,1** tok/s |
+| Decode greedy | 27,7 tok/s | 38,3 tok/s |
+| Tiempo hasta el primer token, 2K / 8K / 32K (servicio de prefill CUDA exacto) | 15,8 s a 8K | **3,6 / 4,4 / 12,2 s** |
 
-**Lee tu prompt** (prefill en bloques, tokens por segundo de la petición completa):
+Los tiempos del prefill en la RTX se miden en un servicio residente y caliente hasta el estado de atención exportado
+(entregado a un endpoint de importación local). Existe un perfil de prefill CUDA más rápido, pero no pasa la puerta
+de calidad con prompts largos; sigue siendo experimental y no se cita.
 
-| Longitud del prompt | Exacto (FP32 denso) | Dense A8 (recomendado) |
+## Exactitud y calidad
+
+**Exacto donde lo decimos.** Estas salidas se comprueban token a token (o byte a byte) contra una referencia:
+
+- El decode especulativo MTP de Qwen es igual al greedy serie con el mismo perfil numérico, bit a bit (error de
+  replay del golden 0 en cada ejecución cronometrada; réplicas 570/570 iguales a un nodo).
+- El prefill en teselas y la puntuación teacher-forced de Qwen producen los mismos bytes que la ruta serie dentro de
+  un perfil.
+- DeepSeek en el par: las ventanas greedy y DSpark son iguales a las referencias guardadas en los dos rangos; los
+  tokens por lotes y 64/64 respuestas del servidor son iguales a las referencias de la campaña.
+- DeepSeek repartido con la RTX PRO: igual bit a bit al par sin los sitios trellis (24/24 prompts). Con ellos es una
+  identidad compuesta declarada (KL 1,7e-3 frente al par), no bit a bit.
+
+**La calidad se mide, no se supone.** Un arnés teacher-forced compara la distribución de salida completa del motor
+con una referencia en cada posición (divergencia KL y acuerdo top-1), por categoría e idioma.
+
+| Perfil de Qwen | KL frente a la referencia Q8_0 | Acuerdo top-1 |
 |---|---|---|
-| 1K tokens | ~401 | **703** |
-| 4K tokens | ~388 | **694** |
-| 16K tokens | ~375 | **668** |
-| 32K tokens | ~371 | **656** |
-
-**Tiempo hasta el primer token:**
-
-| Longitud del prompt | Exacto | Dense A8 |
-|---|---|---|
-| 1K tokens | <!-- BENCH: TTFT 1K exacto --> pendiente | <!-- BENCH: TTFT 1K dense A8 --> pendiente |
-| 4K tokens | <!-- BENCH: TTFT 4K exacto --> pendiente | <!-- BENCH: TTFT 4K dense A8 --> pendiente |
-| 16K tokens | <!-- BENCH: TTFT 16K exacto --> pendiente | <!-- BENCH: TTFT 16K dense A8 --> pendiente |
-| 32K tokens | <!-- BENCH: TTFT 32K exacto --> pendiente | <!-- BENCH: TTFT 32K dense A8 --> pendiente |
-
-Mientras no se mida el TTFT directamente: a los ritmos de prefill de arriba, leer un prompt de 32K tokens lleva
-unos 50 s con dense A8 y 88 s con el perfil exacto (cuenta hecha a partir del rendimiento, no una medida
-aparte). Cargar el modelo lleva unos 11 s cuando su checksum está en caché; el primer arranque calcula el hash
-del archivo de 111 GB, unos 50 s.
-
-## Calidad
-
-El arnés pasa los mismos documentos al motor y a una referencia Q8_0 del mismo modelo, token a token
-("teacher-forced"), y compara la distribución de probabilidad completa en cada posición:
-
-- **Divergencia KL**: cuánto se alejan las probabilidades del motor de las de la referencia. Menos es mejor; 0
-  significa idénticas.
-- **Acuerdo top-1**: con qué frecuencia el siguiente token más probable del motor coincide con el de la
-  referencia.
-
-| Perfil | KL respecto a Q8_0 | Acuerdo top-1 |
-|---|---|---|
-| Exacto (FP32 denso) | 0,01940 | 95,52 % |
+| Exacto (denso FP32) | 0,01940 | 95,52 % |
 | Dense A8 (recomendado) | 0,01978 (+1,9 ± 2,0 %) | 95,55 % |
 
-49.001 posiciones, medido para [D-032](DECISIONS.md#d-032-dense-a8-in-the-recommended-profile). Dicho
-llanamente: dense A8 está tan cerca de la referencia como el perfil exacto, dentro del margen que separa dos
-implementaciones exactas cualesquiera de los mismos pesos. Donde los dos perfiles discrepan (2,8 % de las
-posiciones) casi siempre es entre dos candidatos prácticamente empatados. Como comparación, cuantizar las
-activaciones a Q8_1 costaba +30 % de KL y no se adoptó.
+49.001 posiciones ([D-032](DECISIONS.md#d-032-dense-a8-in-the-recommended-profile)): dense A8 está tan cerca de la
+referencia como el perfil exacto, dentro del margen que separa dos implementaciones exactas de los mismos pesos.
+Donde los dos perfiles discrepan (2,8 % de las posiciones) casi siempre es entre candidatos casi empatados.
 
-<!-- BENCH: actualizar esta tabla con la campaña de calidad final (por categoría: multilingüe, prosa en español, prosa en inglés, código, agente, matemáticas, chat). -->
+En DeepSeek, los pesos densos codificados con trellis (mix-B) están tan cerca del modelo en precisión original como
+el formato de 6,5 bits (KL 0,0446 frente a 0,0447 en 103.908 tokens) leyendo 2,27 en lugar de 3,63 GB por token y
+nodo; se calculó con una emulación de los formatos, no con los kernels del motor.
 
-Metodología: [docs/teacher-forced-tiled-prefill.md](docs/teacher-forced-tiled-prefill.md) (cómo se producen los
-logits, idénticos byte a byte a la ruta serie),
-[docs/decode-optimization-profile.md](docs/decode-optimization-profile.md) (puntuación y formato del archivo de
-logits) y [docs/qualification-ledger.md](docs/qualification-ledger.md).
+Metodología: [docs/teacher-forced-tiled-prefill.md](docs/teacher-forced-tiled-prefill.md),
+[docs/decode-optimization-profile.md](docs/decode-optimization-profile.md),
+[docs/qualification-ledger.md](docs/qualification-ledger.md).
+
+## Qué lo hace distinto
+
+- **Decode especulativo exacto.** La cabeza MTP de Qwen y el borrador DSpark de DeepSeek proponen varios tokens; el
+  modelo completo los comprueba en una pasada y se queda con el tramo correcto más largo. Los kernels de varias filas
+  repiten la aritmética de una fila, así que un fallo cuesta tiempo, nunca exactitud.
+- **Varias formas de usar más hardware, cada una medida.** Ventanas de verificación por lotes en un nodo, una réplica
+  por nodo, un modelo repartido entre dos nodos por USB4 (paralelismo tensorial de expertos) y una GPU dedicada para
+  las primeras capas o para el prompt.
+- **Perfiles numéricos con nombre y calidad medida.** El redondeo es una elección con nombre y versión. El prompt
+  puede leerse con un perfil y la respuesta escribirse con otro (D-033).
+- **Opt-in hasta que se demuestre.** Toda optimización empieza desactivada y solo pasa a ser default cuando se
+  demuestra exacta (o de calidad medida) y más rápida en la carga completa, en una campaña de tiempos intercalada.
+  Las ideas que fallaron quedan registradas con sus números.
+- **AMD primero e independiente.** Los kernels, la planificación, el decode especulativo, el lector GGUF, el
+  planificador de memoria y el comunicador de dos nodos son código propio; el motor no envuelve otro runtime de
+  inferencia. ROCm/HIP, Linux, el formato GGUF y las herramientas de compilación habituales siguen siendo
+  dependencias. El motor sigue siendo plenamente usable en una sola Strix Halo; el multinodo y otras GPUs son etapas
+  aparte, cualificadas explícitamente.
 
 ## Más allá del inglés
 
-Trabajamos para no perder calidad ni velocidad fuera del inglés.
-
-- **Velocidad: paquetes de vocabulario de borrador por idioma.** El predictor solo propone tokens de un
-  subconjunto del vocabulario, lo que abarata la propuesta. El repositorio incluye un núcleo de 32k independiente
-  del idioma y paquetes de 16k para alemán, español, francés, italiano, portugués, ruso, japonés y chino en
-  [`data/draft-vocab/`](data/draft-vocab/). Con `--mtp-draft-vocab auto:data/draft-vocab` el motor elige el
-  paquete que corresponde al prompt. Con un prompt de chat en español la decodificación pasó de 32,9 a 38,9 tok/s
-  (+18 %). El paquete solo cambia cuántas propuestas se aceptan, nunca el texto.
-- **Calidad: medida por idioma y categoría.** El arnés de calidad da KL y top-1 por separado para texto
-  multilingüe, prosa en español, prosa en inglés, código, tareas de agente, matemáticas y chat, cada uno con un
-  margen explícito. Una elección numérica que perjudica a una de estas categorías se rechaza aunque la media
-  salga bien; por ejemplo, la decisión de dense A8 registra la única señal por categoría que encontró (top-1 en
-  prosa española, −0,55 ± 0,23 puntos, con la KL sin cambios).
+- **Paquetes de vocabulario de borrador por idioma (Qwen).** La cabeza de borrador solo propone desde un subconjunto
+  del vocabulario. El repositorio incluye un núcleo de 32k y paquetes de 16k para alemán, español, francés, italiano,
+  portugués, ruso, japonés y chino en [`data/draft-vocab/`](data/draft-vocab/); `--mtp-draft-vocab
+  auto:data/draft-vocab` elige el paquete que corresponde al prompt. En un prompt de chat en español subió el decode
+  de 32,9 a 38,9 tok/s (+18 %). DSpark de DeepSeek usa la misma idea (`--dspark-vocab auto:`). El paquete solo cambia
+  cuántas propuestas se aceptan, nunca el texto.
+- **Calidad por idioma y categoría.** El arnés da KL y top-1 para texto multilingüe, prosa en español, prosa en
+  inglés, código, tareas de agente, matemáticas y chat, cada uno con su margen. Una elección que perjudica a una
+  categoría se rechaza aunque la media parezca buena.
 
 ## Qué necesitas
 
-| | |
-|---|---|
-| **Máquina** | AMD Strix Halo con la iGPU Radeon 8060S (`gfx1151`), p. ej. Ryzen AI Max+ 395, con **128 GB** de memoria unificada. Medido en un Bosgame M5. |
-| **Sistema** | Linux. |
-| **Pila de GPU** | ROCm/HIP. Probado con ROCm **core 10.1** instalado en `/opt/rocm/core-10.1`. |
-| **Herramientas** | CMake >= 3.24, Ninja, un compilador C++20 y, opcionalmente, OpenSSL para calcular hashes rápido. |
-| **Modelo** | GGUF **UD-Q4_K_XL** de Qwen3.8-Flash-Next (unos 111 GB) y el GGUF **sidecar MTP Q8_0**, del snapshot fijado en [SOURCES_LEDGER.md](SOURCES_LEDGER.md). El perfil automático solo admite exactamente ese contenido. |
-| **Disco** | Espacio para los archivos del modelo (111 GB más el sidecar), la compilación y, para MTP, un pequeño archivo de referencia por prompt (alrededor de 1 MB por token del prompt). Un NVMe rápido acorta el arranque. |
-| **Tokenizador** | El motor recibe IDs de token. Usa el tokenizador del propio modelo para pasar de texto a IDs y al revés. |
+| | Qwen3.8-Flash-Next | DeepSeek V4.1 Flash |
+|---|---|---|
+| **Máquinas** | una Strix Halo (`gfx1151`) con **128 GB** | dos Strix Halo de 128 GB, dos cables USB4 directos, la [serie del driver USB4](https://github.com/hyukudan/strix-halo-usb4-driver); opcionalmente un PC CUDA con una RTX PRO 6000 |
+| **SO / pila GPU** | Linux, ROCm/HIP (probado con ROCm core 10.1 en `/opt/rocm/core-10.1`) | igual; CUDA para las partes RTX opcionales |
+| **Ficheros del modelo** | GGUF UD-Q4_K_XL (~111 GB) + sidecar MTP Q8_0 | el GGUF de expertos de 2 bits, el overlay denso de 6,5 bits, los paquetes trellis y el borrador DSpark ([docs/ds41-production-defaults.md](docs/ds41-production-defaults.md#production-identity-environment-of-both-ranks)) |
+| **Herramientas** | CMake >= 3.24, Ninja, un compilador C++20, opcionalmente OpenSSL para hashes rápidos | igual |
+
+Las herramientas de línea de comandos reciben IDs de token; los servidores HTTP llevan el tokenizador y la plantilla
+de chat de cada modelo.
 
 ## Compilar
 
@@ -191,15 +238,17 @@ cmake -S . -B build -G Ninja \
   -DSTRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE=ON \
   -DSTRIX_USE_OPENSSL_SHA256=ON \
   -DBUILD_TESTING=ON
-ninja -C build strix-hip-decode-token
+ninja -C build strix-hip-decode-token                         # Qwen
+ninja -C build strix-deepseek41-rank strix-deepseek41-serve   # DeepSeek (módulo de familia, STRIX_FAMILY_DEEPSEEK41=ON por defecto)
 ```
 
-`ctest --test-dir build` ejecuta los tests de host y de dispositivo (muchos tests de dispositivo necesitan la GPU
-y los archivos del modelo). Todas las opciones de CMake están en [docs/ENGINE.md](docs/ENGINE.md#build-options).
+Las partes CUDA para la RTX PRO se compilan aparte con `-DSTRIX_ENABLE_CUDA_DS41=ON`. `ctest --test-dir build`
+ejecuta los tests de host y de dispositivo (muchos necesitan la GPU y los ficheros del modelo). Todas las opciones
+de CMake están en [docs/ENGINE.md](docs/ENGINE.md#build-options).
 
 ## Ejecutar
 
-La ejecución más sencilla: decodificación voraz normal con el perfil recomendado, 256 tokens.
+**Qwen, la ejecución más simple:** decode greedy normal con el perfil recomendado, 256 tokens.
 
 ```sh
 ./build/strix-hip-decode-token Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf $(cat prompt.ids) \
@@ -208,155 +257,153 @@ La ejecución más sencilla: decodificación voraz normal con el perfil recomend
   --numerical-profile hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1
 ```
 
-`prompt.ids` contiene el prompt como IDs de token separados por espacios, obtenidos con el tokenizador del
-modelo. El motor imprime un recibo JSON con `generated_tokens` y tiempos; decodifica los tokens con el
-tokenizador del modelo.
+`prompt.ids` contiene el prompt como IDs de token del tokenizador del modelo; el motor imprime un recibo JSON con
+`generated_tokens` y los tiempos. Para las velocidades de arriba añade las opciones especulativas (sidecar MTP,
+ventanas de verificación 2/4/8, vocabulario de borrador): el comando completo está en
+**[docs/ENGINE.md → Command line](docs/ENGINE.md#command-line)** y en [docs/mtp-native-cli.md](docs/mtp-native-cli.md).
+El servidor HTTP, los slots por lotes (`--http-batch`) y la caché de prefijos están en
+[docs/serving.md](docs/serving.md); varias peticiones en un proceso, en
+[docs/multi-request-cohort.md](docs/multi-request-cohort.md); el muestreo, en
+[docs/sampled-decoding.md](docs/sampled-decoding.md).
 
-Para la velocidad completa de arriba, añade las opciones de decodificación especulativa (sidecar MTP, ventanas
-de verificación 2/4/8, vocabulario de borrador). Son explícitas y extensas a propósito: los archivos se fijan por
-SHA-256 y cada reserva de memoria se declara. El comando completo, listo para copiar y con cada opción
-explicada, está en **[docs/ENGINE.md → Command line](docs/ENGINE.md#command-line)**, y las opciones MTP en
-[docs/mtp-native-cli.md](docs/mtp-native-cli.md). Los prompts largos usan el prefill en bloques
-([docs/ENGINE.md → Prompt prefill](docs/ENGINE.md#prompt-prefill)).
+**DeepSeek en el par:** un rango por nodo, el mismo entorno en los dos (la identidad de producción),
+`--transport usb4gpu`; el servidor recibe `--prefill-path device --dspark <DSpark.gguf> --dspark-vocab auto:<vocab>`.
+El entorno, los defaults y cómo desactivarlos están en
+[docs/ds41-production-defaults.md](docs/ds41-production-defaults.md); las líneas de comando del reparto con la RTX,
+en [docs/ds41-pipeline-stage.md](docs/ds41-pipeline-stage.md); la colocación de expertos calientes, en
+[docs/ds41-hot-placement.md](docs/ds41-hot-placement.md); los contextos largos, en
+[docs/deepseek41-long-context.md](docs/deepseek41-long-context.md).
 
-Para usar el perfil exacto, pasa
-`--numerical-profile hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1`.
+### Cómo exponer los servidores
 
-Varias peticiones (hasta cuatro) pueden decodificar juntas en un proceso: `--mtp-cohort-request TOKENS_FILE,GOLDEN,SHA256`
-(repetible) añade peticiones junto al prompt posicional, cada una con su estado, su runtime MTP y su golden. Sus
-borradores se verifican en ventanas de cohorte que leen una sola vez los pesos de proyección, expertos, HC y cabeza para
-las filas de todas las peticiones, y cada petición produce exactamente los tokens que produce sola. Ver
-[docs/multi-request-cohort.md](docs/multi-request-cohort.md) (D-039).
-
-La decodificación es greedy salvo que `--mtp-sample-temperature` sea mayor que cero: el muestreo (top-k/top-p/min-p,
-semilla) mantiene los borradores MTP como propuestas especulativas y es reproducible para una semilla. Ver
-[docs/sampled-decoding.md](docs/sampled-decoding.md) (D-040). Las decisiones del muestreo se toman en la GPU por
-defecto (D-050).
-
-`--mtp-ngram-draft` deja que una continuación ya vista en el contexto prolongue una cadena de borradores que se cortó
-pronto, dentro de la misma ventana de verificación; paga en peticiones que copian su contexto (corregir un documento
-dado) y no se abre en las demás (D-047, opcional). `--dense-q6p-pack` lee copias de 6,5 bits de los pesos densos con
-los mismos bits que un checkpoint emulado de 6 bits (D-048, borrador hasta su decisión de velocidad y calidad).
+Los servidores HTTP (`strix-hip-decode-token --http-serve` y `strix-deepseek41-serve`) escuchan en `127.0.0.1`
+salvo que `--http-bind` diga otra cosa. No tienen TLS propio. La autenticación es una única clave compartida
+opcional: con `--http-api-key-file FICHERO` todas las rutas de API y de administración (completions,
+`/admin/drain`, `/admin/import-state`) exigen `Authorization: Bearer <clave>` o `x-api-key: <clave>`; sin ella el
+servidor acepta a cualquier cliente. `/health`, `/metrics` y `/api/status` responden sin clave. Los cuerpos, las
+peticiones en cola y las conexiones abiertas están acotados (`--http-max-queue`, `--http-max-connections`). Mantén
+los servidores en loopback o en una red privada y pon a los clientes remotos detrás de un frontal con autenticación,
+como el router de [TensorMeld](https://github.com/hyukudan/tensormeld) o su canal de control; los rangos de DeepSeek
+en dos nodos intercambian tensores por el enlace USB4, y el reparto con la RTX (puerto TCP de la etapa de tubería) y
+los servidores de expertos hablan TCP sin cifrar: ninguno lleva autenticación, así que deben quedarse en un cable
+directo o en una red privada. Las claves por usuario, el TLS y una interfaz de configuración segura son tareas
+pendientes, no funcionalidades.
 
 ## Cómo funciona
 
-**Un ciclo de decodificación.** El predictor propone tokens hasta que deja de estar seguro; un modelo de coste
-elige el tamaño de la ventana; el modelo completo comprueba toda la ventana en una pasada; se conserva la racha
-más larga de tokens coincidentes, más el siguiente token del propio modelo completo.
+**Un ciclo de decode especulativo** (el MTP de Qwen y el DSpark de DeepSeek siguen la misma forma):
 
 ```mermaid
 flowchart LR
-    A["Último token aceptado"] --> B["La cabeza MTP propone tokens<br/>hasta que la confianza baja de 0,85"]
-    B --> C{"El modelo de coste elige<br/>ventana 2, 4 u 8<br/>o un paso serie"}
-    C --> D["El modelo completo verifica<br/>todas las filas en una pasada<br/>cada experto se lee una vez"]
-    D --> E["Se conserva el prefijo más largo<br/>igual a la decodificación voraz<br/>+ un token corregido"]
-    E --> F["Se confirma el estado recurrente<br/>solo de las filas aceptadas"]
+    A["Último token aceptado"] --> B["La cabeza de borrador propone tokens<br/>hasta que baja la confianza"]
+    B --> C{"El modelo de coste elige<br/>el tamaño de ventana<br/>o un paso serie"}
+    C --> D["El modelo completo verifica todas las filas<br/>en una pasada<br/>cada experto se lee una vez"]
+    D --> E["Se queda el prefijo más largo<br/>igual al greedy<br/>+ un token corregido"]
+    E --> F["Confirma el estado<br/>solo de las filas aceptadas"]
     F --> A
 ```
 
-Un paso de un token está limitado por el ancho de banda de memoria (se leen todos los pesos activos para un solo
-token), así que comprobar 4 u 8 tokens cuesta mucho menos que 4 u 8 pasos. Como el modelo completo tiene la
-última palabra sobre cada token, una propuesta errónea solo cuesta tiempo, nunca corrección.
+Un paso de un token está limitado por el ancho de banda de memoria (se leen todos los pesos activos para un token),
+así que comprobar 4 u 8 tokens cuesta mucho menos que 4 u 8 pasos. El servidor por lotes va un paso más allá: las
+ventanas conjuntas verifican juntas las filas de varias peticiones y leen cada peso una vez para todas.
 
-**Leer un prompt largo (prefill en bloques).** El prompt se divide en bloques de T filas (hasta 2048). Dentro de
-un bloque el motor ejecuta cada paso de la capa para las T filas antes de avanzar, así que cada peso se lee una
-vez por bloque en lugar de una vez por token. Las capas recurrentes (GDN) siguen actualizando las filas
-estrictamente en orden, así que el resultado es idéntico bit a bit a leer el prompt token a token con el mismo
-perfil.
+**DeepSeek en dos nodos.** Cada nodo guarda la mitad de los expertos enrutados y la mitad de cada proyección densa con
+paralelismo tensorial. En cada capa las dos GPUs intercambian resultados parciales pequeños por USB4 (cuatro flujos de
+host sobre los dos cables); el prompt se lee con paralelismo de expertos y el estado de atención se reparte entre los
+nodos.
 
 ```mermaid
-flowchart TB
-    P["Tokens del prompt"] --> S["División en bloques de T filas"]
-    S --> L["Para cada capa y paso:<br/>las T filas a la vez<br/>pesos leídos una vez por bloque"]
-    L --> R["Recurrencia GDN: filas en orden de posición"]
-    R --> N{"¿Más bloques?"}
-    N -- sí --> L
-    N -- no --> Q["Filas sobrantes, menos de T: en serie"]
-    Q --> G["Primer token y después decodificación especulativa"]
+flowchart LR
+    subgraph N0["Nodo 0 (rango 0)"]
+      A0["Atención + mitad densa"] --> E0["Expertos, mitad"]
+    end
+    subgraph N1["Nodo 1 (rango 1)"]
+      A1["Atención + mitad densa"] --> E1["Expertos, mitad"]
+    end
+    N0 <-- "USB4: resultados parciales, cada capa" --> N1
+    R["RTX PRO opcional:<br/>capas 0-21 o el prompt"] -. "1 GbE: un estado oculto por paso" .-> N0
 ```
 
-La guía de arquitectura está en [docs/README.md](docs/README.md); la referencia detallada del motor, en
-[docs/ENGINE.md](docs/ENGINE.md).
+**Leer un prompt largo (prefill en teselas de Qwen).** El prompt se corta en bloques de hasta 2048 filas; dentro de
+un bloque cada peso se lee una vez para todas las filas, y las capas recurrentes (GDN) siguen actualizando las filas
+en orden, así que el resultado es idéntico bit a bit a leer el prompt token a token con el mismo perfil.
+
+La guía de arquitectura es [docs/README.md](docs/README.md) (multinodo y USB4:
+[docs/architecture/12-multi-node-and-usb4.md](docs/architecture/12-multi-node-and-usb4.md)); la referencia del motor
+es [docs/ENGINE.md](docs/ENGINE.md); el estado actual por área, [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md).
 
 ## Decisiones de diseño
 
 El registro completo, con alternativas, evidencia y la condición para reabrir cada una, está en
 [DECISIONS.md](DECISIONS.md). Las principales:
 
-- **Verificación exacta en lugar de tolerancia (D-021).** Los kernels multifila repiten exactamente la
-  aritmética de una fila, así que la decodificación especulativa nunca cambia la salida. La verificación con
-  tolerancia se rechazó porque la identidad de la salida es la puerta de corrección.
-- **Ventanas adaptativas 2/4/8 con un modelo de coste en línea (D-022).** La ventana crece cuando el predictor
-  está seguro y se reduce cuando no; pasar de {2,4} a {2,4,8} fue la mayor mejora individual.
-- **Aceptación del prefijo más largo sin checkpoints (D-023).** Las filas aceptadas se confirman en el estado
-  recurrente en la ventana siguiente, en lugar de guardar y restaurar el estado en cada ciclo (un 46 % más
-  rápido en la ejecución donde se midió).
-- **Perfiles numéricos con nombre (D-024, D-032).** Activaciones int8 en el MoE y después en las proyecciones
-  densas, cada una adoptada solo con una tabla de calidad medida.
-- **Un perfil de prefill separado (D-033).** El prompt puede leerse con un perfil más rápido mientras la
-  decodificación mantiene el suyo; ambas identidades viajan en cada recibo y archivo de referencia.
-- **Prefill en bloques y puntuación teacher-forced sobre él (D-034).** Los mismos bytes que la ruta serie; una
-  puntuación de 16K tokens pasó de 1001 s a 66 s.
-- **Medido y rechazado.** La captura con hipGraph del bucle de decodificación, el registro de pesos
-  coarse-grained, la normalización HC fusionada, varias variantes de kernels y otros umbrales de propuesta se
-  midieron y no se adoptaron; los números están en la
-  [tabla de rechazos](DECISIONS.md#measured-and-rejected).
+- **Verificación exacta en lugar de tolerancia (D-021)** y **ventanas adaptativas 2/4/8 con un modelo de coste en
+  línea (D-022)**.
+- **Perfiles numéricos con nombre (D-024, D-032)** y **un perfil de prefill aparte (D-033)**.
+- **Prefill en teselas con bytes idénticos (D-034)**: una puntuación de 16K tokens pasó de 1001 s a 66 s.
+- **Servidor: reinicio del controlador por petición (D-057), ventanas conjuntas para peticiones concurrentes (D-058),
+  dos réplicas completas tras el router (D-060)**: C4 +8-9 %, y C6/C8 ya escalan por encima de C4.
+- **Defaults de DeepSeek en dos nodos (D-061), transporte acotado con envíos pequeños anticipados y staging fusionado
+  (D-062), intercambio directo entre GPUs (D-063), una GPU dedicada en el decode (D-064, opt-in).**
+- **Medido y rechazado:** captura con hipGraph del bucle de decode, paralelismo tensorial de una petición de Qwen
+  entre los nodos (X-021) y más; los números están en la [tabla de rechazados](DECISIONS.md#measured-and-rejected).
 
 ## Hoja de ruta
 
-En curso, sin un orden concreto y sin números prometidos:
+En curso, sin cifras prometidas:
 
-- **Caché de prefijos con estado GDN** *(ya integrada, D-035)*: una petición cuyo prompt empieza por un prefijo en caché restaura el estado completo del modelo en un límite de bloque del prefill por bloques y solo lee el resto, con salida idéntica bit a bit (`--prefix-cache-host-bytes N`, opcional `--prefix-cache-dir DIR`; ver [docs/prefix-state-cache.md](docs/prefix-state-cache.md)). Los tiempos llegarán con la próxima campaña de medidas.
-- **Servidor HTTP** *(primera versión)*: `--http-serve` sirve chat/completions, completions y messages con streaming,
-  con el tokenizador y la plantilla de chat del propio modelo (pensamiento sí/no, llamadas a herramientas), decodificación
-  MTP y la caché de estado de prefijos entre peticiones. La salida en tokens es idéntica a la de la línea de comandos
-  ([docs/serving.md](docs/serving.md)). El muestreo y las peticiones en lote vienen después.
-- **Panel de monitorización**: vista en vivo de peticiones, velocidad y memoria.
-- **Varias peticiones a la vez**.
-- **Caché KV en int8** *(opcional, D-046)*.
-- **Muestreo con decodificación especulativa** *(integrado, D-040; decisiones en la GPU, D-050)*.
-- **Pesos del tronco en 6 bits** *(borrador, D-048)*.
+- **MiniMax M3.1 Flash (EXL3) en el par:** el lector del formato y la referencia en CPU de la atención están en
+  puesta en marcha; después vienen los kernels de dispositivo y una puerta por capas.
+- **GLM-5.3 Flash:** primeras pruebas en el par.
+- **DeepSeek:** una ruta de "listo" de menor latencia para el intercambio USB4 y cerrar la campaña de defaults de los
+  flags opt-in más nuevos; tiempo hasta el primer token de extremo a extremo del prefill CUDA exacto a través del
+  servidor del par.
+- **Qwen:** planificaciones de prefill exactas (MoE y densa) que superen al default.
+- **Panel de monitorización**, claves por usuario y TLS a través de la capa de producto.
+
+## Repositorios relacionados
+
+- [strix-halo-usb4-driver](https://github.com/hyukudan/strix-halo-usb4-driver): la serie de parches de Linux que
+  convierte los controladores USB4 de Strix Halo en el enlace directo entre los dos nodos.
+- [strix-trellis](https://github.com/hyukudan/strix-trellis): la biblioteca de cuantización trellis (estilo
+  EXL3/QTIP) que usan los pesos densos de DeepSeek y la puesta en marcha de MiniMax.
+- [TensorMeld](https://github.com/hyukudan/tensormeld): colocación y enrutado entre nodos y GPUs; su router sirve
+  las réplicas de Qwen.
 
 ## Preguntas frecuentes
 
-**¿La decodificación especulativa cambia la respuesta?**
-No. El modelo completo verifica cada token emitido, y los kernels de verificación repiten exactamente la
-aritmética de un token. La salida es igual a la decodificación voraz normal con el mismo perfil numérico, bit a
-bit.
+**¿El decode especulativo cambia la respuesta?**
+No, allí donde afirmamos exactitud (ver [Exactitud y calidad](#exactitud-y-calidad)). Cada token emitido lo
+comprueba el modelo completo con la misma aritmética que un paso de un token. La única excepción documentada es el
+reparto con la RTX con sitios trellis, que es una identidad compuesta declarada.
 
-**¿Qué perfil debo usar?**
-Dense A8 es el recomendado por defecto: más rápido y con una calidad dentro del margen de medida del perfil
-exacto. Usa el perfil exacto cuando necesites la aritmética densa en FP32.
+**¿Qué perfil de Qwen uso?**
+Dense A8 es el recomendado por defecto; usa el perfil exacto si necesitas la aritmética densa en FP32. Los dos
+pueden elegir tokens distintos donde dos candidatos están casi empatados (2,8 % de las posiciones); cada uno es
+determinista y exacto respecto a sí mismo.
 
-**¿Los dos perfiles dan el mismo texto?**
-No siempre. Redondean distinto, así que pueden elegir tokens diferentes donde dos candidatos están casi
-empatados (2,8 % de las posiciones en la medida de calidad). Cada uno es determinista y exacto respecto a sí
-mismo.
+**¿Funciona en otras GPUs u otros modelos?**
+La ruta de Strix Halo es para `gfx1151`. DeepSeek tiene además un backend CUDA para las partes RTX opcionales. Los
+modelos se admiten por contenido fijado; las familias nuevas se añaden como módulos con sus propias puertas
+([Modelos](#modelos)).
 
-**¿Funciona en otras GPU o con otros modelos?**
-No. Está hecho para `gfx1151` y solo admite el contenido fijado de Qwen3.8-Flash-Next. Ese foco es la razón de
-ser del proyecto.
-
-**¿Por qué necesita 128 GB?**
-Solo el archivo del modelo a 4 bits ocupa unos 111 GB. La memoria unificada permite que la GPU lea los pesos
-donde están.
+**¿Por qué hacen falta 128 GB por nodo?**
+Solo el fichero de 4 bits de Qwen ocupa unos 111 GB; los expertos de DeepSeek se reparten entre los dos nodos. La
+memoria unificada permite a la GPU leer los pesos donde están.
 
 **¿Qué longitud de contexto admite?**
-El perfil automático está cualificado a 8192 tokens. Los contextos más largos funcionan con
-`--unqualified-context`; así se midieron los números de prefill hasta 32K.
-
-**¿Por qué IDs de token y no texto?**
-El motor es el núcleo de cómputo. La tokenización, la plantilla de chat y el servicio quedan fuera de él por
-ahora.
+El perfil automático de Qwen está cualificado a 8192 tokens; los contextos más largos funcionan con
+`--unqualified-context` (así llegan las cifras de prefill hasta 32K). Los límites de contexto largo de DeepSeek
+están en [docs/deepseek41-long-context.md](docs/deepseek41-long-context.md).
 
 **¿De dónde salen los números?**
-De nuestras propias ejecuciones en nuestras propias máquinas, con el commit y la fecha junto a cada tabla. Nada
-de lo que aparece aquí es una estimación teórica presentada como resultado.
+De nuestras propias ejecuciones en nuestras máquinas, con fecha, configuración y comprobación de exactitud por fila
+en [docs/performance.md](docs/performance.md). Nada de esto es una estimación presentada como resultado.
 
 ## Licencia
 
-El código del motor se distribuye con la **[licencia Apache 2.0](LICENSE)**, salvo el módulo experimental del kernel
-de Linux en `lab/direct_gpu_stream/kernel/`, que es **GPL-2.0-only** como exige el código del kernel (sus textos de
-licencia están en ese directorio). El código adoptado de otros proyectos conserva su licencia y avisos originales.
-Los pesos del modelo se distribuyen con su propia licencia (Qwen Community License). Las referencias de terceros
-usadas para formatos y semántica del modelo figuran con sus licencias en [SOURCES_LEDGER.md](SOURCES_LEDGER.md).
+El código del motor tiene licencia **[Apache License 2.0](LICENSE)**, salvo el módulo experimental del kernel de
+Linux en `lab/direct_gpu_stream/kernel/`, que es **GPL-2.0-only** como debe serlo el código del kernel de Linux (sus
+textos de licencia están en ese directorio). El código adoptado de otros proyectos conserva su licencia y sus avisos
+originales. Los pesos de los modelos se distribuyen con sus propias licencias. Las referencias de terceros usadas para
+formatos y semántica de modelos están listadas con sus licencias en [SOURCES_LEDGER.md](SOURCES_LEDGER.md).

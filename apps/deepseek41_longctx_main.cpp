@@ -32,6 +32,10 @@
 //       [--state-in FILE] [--state-out FILE] [--teacher N] [--generate G] [--max-positions P]
 //       [--prefill-only] [--stream-experts] [--no-tp] [--row-split] [--no-gather] [--timing]
 //       [--chunk C] [--window W] [--lanes N] [--moe-chunk R] [--connect-timeout S] [--tokens-out FILE] [--segment S]
+//       [--logits-out FILE]
+// --logits-out F: rank 0 writes the full (gathered) logits of every generated step to F, f32 [G][vocab] (quality
+// checks of declared mixed identities, e.g. ds41-prefill-ep+decode-tp: the prefill and the decode forward are
+// separate objects here, so STRIX_DS41_EXPERT_TP applies to the decode only).
 // --segment S: the prefill runs in pieces of S rows (DevicePrefill::extend), its row buffers sized for S rows only.
 // Arms:
 //   default        prefill the first T - N prompt tokens (N = --teacher, 0), then the decode forward feeds the last N
@@ -49,7 +53,7 @@ void check(hipError_t e, const char* what) {
 }
 
 struct Args {
-    std::string model, prompt_path, transport, state_in, state_out, tokens_out;
+    std::string model, prompt_path, transport, state_in, state_out, tokens_out, logits_out;
     std::uint32_t rank = 0, world = 1, layers = 40, rows = 0, teacher = 0, generate = 16, max_positions = 0;
     std::uint32_t chunk = 1024, window = 8, lanes = 4, moe_chunk = 4096, segment = 0;
     unsigned connect_timeout = 60;
@@ -283,6 +287,7 @@ RankResult run(const Args& a, const std::vector<std::uint32_t>& prompt, std::uin
                     static_cast<unsigned long long>(st.digest(true)), token);
     }
     std::FILE* tf = print && !a.tokens_out.empty() ? std::fopen(a.tokens_out.c_str(), "w") : nullptr;
+    std::FILE* lf = print && a.gather && !a.logits_out.empty() ? std::fopen(a.logits_out.c_str(), "wb") : nullptr;
     double decode_s = 0.0;
     std::uint32_t timed = 0;
     for (std::uint32_t g = 0; g < a.generate; ++g) {
@@ -294,6 +299,7 @@ RankResult run(const Args& a, const std::vector<std::uint32_t>& prompt, std::uin
             ++timed;
         }
         const std::uint64_t h = a.gather ? fnv(logits) : 0U;
+        if (lf != nullptr) std::fwrite(logits.data(), sizeof(float), logits.size(), lf);
         out.logits_fnv.push_back(h);
         if (print) {
             std::printf("%s gen %u pos %u fed %u argmax %u logits_fnv %016llx step %.1f ms\n", who, g, T + g, token, next,
@@ -303,6 +309,7 @@ RankResult run(const Args& a, const std::vector<std::uint32_t>& prompt, std::uin
         token = next;
     }
     if (tf != nullptr) std::fclose(tf);
+    if (lf != nullptr) std::fclose(lf);
     if (print) {
         std::printf("%s decode at context %u: %u steps after the first two, %.2f tok/s (%.1f ms/token)\n", who, T, timed,
                     timed ? timed / decode_s : 0.0, timed ? decode_s * 1e3 / timed : 0.0);
@@ -339,6 +346,7 @@ int main(int argc, char** argv) try {
         else if (s == "--state-in") a.state_in = next();
         else if (s == "--state-out") a.state_out = next();
         else if (s == "--tokens-out") a.tokens_out = next();
+        else if (s == "--logits-out") a.logits_out = next();
         else if (s == "--teacher") a.teacher = num();
         else if (s == "--generate") a.generate = num();
         else if (s == "--max-positions") a.max_positions = num();

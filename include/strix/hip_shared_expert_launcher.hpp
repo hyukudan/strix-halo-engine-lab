@@ -45,7 +45,11 @@ void launch_hip_shared_q8_projection_probe(HipSharedQ8ProjectionRole,HipSharedQ8
 // Test-only T = 1/2/4/8/16/32/64 rows of the prefetch8 BF16 gate/up (FP32 out) or FP32 down
 // (per-row FP32 gate, BF16 out) projection: the q8_rows engine (exact or A8) or
 // the R1 kernel once per row. Exact 16-byte aligned views; gate empty for gate/up.
-enum class HipSharedRowsProbeMode { rows, rows_a8, row_loop };
+enum class HipSharedRowsProbeMode {
+    rows, rows_a8, row_loop,
+    // Explicit A8 organizations for bitwise qualification independent of the environment.
+    rows_a8_reference, rows_a8_narrow
+};
 void launch_hip_shared_rows_projection_probe(HipSharedQ8ProjectionRole, HipSharedRowsProbeMode,
     std::span<const HipSharedQ8ProjectionView> input, HipSharedQ8ProjectionView weights,
     std::span<const HipSharedQ8ProjectionView> gate, std::span<const HipSharedQ8ProjectionView> output,

@@ -3,7 +3,9 @@
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/deepseek41_model.hpp"
 
+#include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -53,6 +55,7 @@ struct BatchForwardOptions {
     bool slice_logits = false;        // keep each row's logits of this rank's vocabulary slice on the host
     bool gather_logits = false;       // world 2: exchange the slices so every row's full logits are on the host
     bool layer_timing = false;        // per-layer wall times (synchronises at every layer end)
+    bool capture_main_hidden = false; // keep the inputs of layers [layers - 3, layers) of every row (DSpark drafter input)
     // Requantization overlay (ds41::WeightOverlay: tensors of the same type and size replacing the model's by name),
     // loaded in its stored Q8_0 form: the overlay's bits, the base kernels. Empty: STRIX_DS41_OVERLAY, else none.
     std::filesystem::path weights_overlay;
@@ -79,12 +82,26 @@ struct BatchStepStats {
 
 class BatchForward {
 public:
-    static constexpr std::uint32_t max_rows = 8;  // rows of one step (the products' row limit)
+    static constexpr std::uint32_t max_rows = 8;  // legacy step limit and maximum segment of one request
+    static constexpr std::uint32_t extended_max_rows = 16;
+    // Total independent rows, not the length of one request's verify window. The latter stays <=8
+    // so existing rings, snapshots and rollback semantics keep their layout.
+    [[nodiscard]] static std::uint32_t configured_row_limit() noexcept {
+        const char* v = std::getenv("STRIX_DS41_BATCH_ROWS16");
+        return v && v[0] == '1' && v[1] == '\0' ? extended_max_rows : max_rows;
+    }
+    [[nodiscard]] std::uint32_t row_limit() const noexcept;
 
     BatchForward(const std::filesystem::path& gguf, const BatchForwardOptions& options);
     ~BatchForward();
     // The overlay's path, identity, tensor count, bytes and content FNV (empty without an overlay).
     [[nodiscard]] std::string overlay_description() const;
+    // trellis sites (STRIX_DS41_TRELLIS / _MIX): the identity of the prepared sites ("" without trellis; see
+    // ds41_trellis.hpp trellis_config_identity), their device bytes (weights + staging + HEADOUT rows + o_a group staging,
+    // == footprint().trellis) and the library workspaces queried at load (not in footprint()).
+    [[nodiscard]] std::string trellis_identity() const;
+    [[nodiscard]] std::uint64_t trellis_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t trellis_library_bytes() const noexcept;
     BatchForward(const BatchForward&) = delete;
     BatchForward& operator=(const BatchForward&) = delete;
 
@@ -103,8 +120,13 @@ public:
     // rings, caches, carries, Engram history and position. The slot must have room (capacity > state.position).
     void import_state(std::uint32_t slot, const AttentionState& state);
     [[nodiscard]] std::uint32_t position(std::uint32_t slot) const;
+    // The attention state of `slot` (as DeviceForward::export_state; tokens empty, next_token 0: the caller knows them;
+    // the last row's top-k left out). kv_from (a multiple of every ratio): the KV and index-key entries of positions
+    // [kv_from, position) only (a prefix cache that holds the earlier ones takes a session snapshot this way).
+    [[nodiscard]] AttentionState export_state(std::uint32_t slot, std::uint32_t kv_from = 0) const;
 
-    // One forward step over `rows` (1..max_rows); returns each row's greedy token, in the order of `rows`.
+    // One forward step over `rows` (1..row_limit(), at most max_rows per request's segment);
+    // returns each row's greedy token, in the order of `rows`.
     const std::vector<std::uint32_t>& step(std::span<const BatchRow> rows);
     [[nodiscard]] const std::vector<std::uint32_t>& last_tokens() const noexcept { return tokens_; }
     // Verify windows: after a step, keep rows [0, kept) of `slot`'s segment and roll the others back (its position,
@@ -114,6 +136,11 @@ public:
     // slice_logits: row r's logits of this rank's vocabulary slice; gather_logits: row r's full logits.
     [[nodiscard]] std::span<const float> row_logits(std::uint32_t row) const;
     [[nodiscard]] const BatchStepStats& last_stats() const noexcept { return stats_; }
+    // capture_main_hidden: the input streams of layers layers-3, layers-2, layers-1 of the last step's rows, device
+    // memory [rows][hc][hidden] each in the order of the step's rows (as DeviceForward::captured_streams); valid until
+    // the next step, ordered on stream().
+    [[nodiscard]] std::array<const float*, 3> captured_streams() const;
+    [[nodiscard]] void* stream() const noexcept;  // the hipStream_t of the steps
 
     // Weight bytes read by every step whatever its rows (all but the routed experts; with TP only this rank's
     // parts of q_b, wo_a and wo_b) and the bytes of one routed expert (gate + up + down) per layer.
@@ -129,17 +156,23 @@ public:
     // Tensors held in another form (the F8 Engram KV, the BF16 routers, packed overlay sites) are left out.
     [[nodiscard]] std::map<std::string, std::pair<const void*, std::uint64_t>> file_form_weights() const;
     [[nodiscard]] const TargetModel& model() const noexcept;
+    // The decode identity: true when the routed experts run expert TP (ds41-expert-tp2-i1152-v1), false expert parallel.
+    [[nodiscard]] bool expert_tp() const noexcept;
     // Device memory now: free and total bytes (hipMemGetInfo).
     [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> device_memory() const;
     // World 2: `out` to the peer and the peer's message into `in` (same size on both ranks, <= 64 KiB) through the
     // communicator, on this forward's stream (the serving control channel between steps).
     void exchange_host(std::span<const std::byte> out, std::span<std::byte> in);
+    // GPU-direct: no receive left posted early for a guessed next exchange (Communicator::quiesce on this forward's
+    // stream, waited). Both ranks at the same point between exchanges, e.g. a server going idle; nothing on the host path.
+    void quiesce();
 
     // What a BatchForward with `options` would hold on this rank, from the model header alone (no device work):
     // resident weights, device state per request (slot) and activations/scratch.
     // state_per_slot: rings and carries, plus the caches for max_positions without a pool; pool: the shared arenas.
     struct Footprint {
         std::uint64_t weights = 0, state_per_slot = 0, workspace = 0, pool = 0;
+        std::uint64_t trellis = 0;  // trellis sites on top of the dense weights (they stay loaded), as trellis_bytes()
     };
     [[nodiscard]] static Footprint footprint(const std::filesystem::path& gguf, const BatchForwardOptions& options);
 
