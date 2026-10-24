@@ -13,10 +13,12 @@ This is our own C++/HIP inference engine for **AMD Strix Halo** (Ryzen AI Max+ 3
 128 GB of unified memory) under Linux with ROCm. It runs large mixture-of-experts models:
 
 - **Qwen3.8-Flash-Next** on one node, or as two replicas on two nodes. One coding-chat request decodes at
-  **90.7 tok/s**; eight concurrent coding chats sum to **255 tok/s** of decode.
+  **90.7 tok/s** (prose about 55 tok/s); eight concurrent coding chats sum to **255 tok/s** of decode. With an
+  RTX PRO 6000 reading the prompt, a 32K-token prompt gets its first token in **9.0 s**.
 - **DeepSeek V4.1 Flash** split across **two nodes over USB4** (expert tensor parallel), optionally with an
-  **RTX PRO 6000** taking the first 22 layers. Code prompts decode at **62.3 tok/s** on the pair and **81.1 tok/s**
-  with the RTX PRO.
+  **RTX PRO 6000** taking the first 22 layers. Code prompts decode at **62.3 tok/s** on the pair (prose about
+  38 tok/s) and **81.1 tok/s** with the RTX PRO; eight batched streams reach **101 tok/s**.
+- **MiniMax M3.1 Flash** on the pair is in bring-up, with first, preliminary numbers.
 
 Every kernel, memory layout and scheduling choice is written for this chip and these models. The speed comes from
 exact speculative decoding (the full model checks every drafted token), batching and replicas, never from changing
@@ -53,7 +55,7 @@ by a gate.
 | **Qwen3.8-Flash-Next** (UD-Q4_K_XL, 111 GB) | 1 node; 2 replicas behind a router | **Production** | MTP speculative decoding with a distilled draft head, bit-identical to serial greedy; batched serving with joint verify windows; prefix state cache |
 | **DeepSeek V4.1 Flash** (1017; 2-bit experts, 6.5-bit + trellis dense) | 2 nodes over USB4 | **Production** (two-node defaults D-061) | Expert tensor parallel decode, expert parallel device prefill, DSpark speculative decode, batched decode, server; bitwise gates |
 | DeepSeek V4.1 Flash + RTX PRO 6000 | RTX PRO (layers 0-21) + 2 nodes (22-39) | **Experimental** (opt-in, D-064) | Pipeline split over 1 GbE, CUDA prefill service, hot-expert placement |
-| MiniMax M3.1 Flash (EXL3, 3.06 bpw) | 2 nodes | **Bring-up**, not in this release | Format reader and CPU reference work; no speed claims yet |
+| MiniMax M3.1 Flash (EXL3, 3.06 bpw) | 2 nodes | **Bring-up**, not in this release | Coherent output on the pair, DSpark speculative decode exact against greedy; preliminary numbers only |
 | GLM-5.3 Flash (GGUF) | 2 nodes | **Planned tests** | Not started in the engine |
 
 The core knows no model: each family is a module with its own contract, plan, kernels and gates
@@ -72,78 +74,135 @@ The core knows no model: each family is a module with its own contract, plan, ke
 
 ## How fast
 
-All numbers are measured on the hardware above, greedy (temperature 0), medians of 3 or more runs, on
-2026-10-22/23. The full table, with the conditions and the exactness check of every row, is
+Every number below is measured on our own machines, greedy (temperature 0), and exact: the output tokens equal
+the reference for that mode (speculative decoding, batching, replicas and the RTX offload never change the
+answer). Nothing here is an estimate. Evidence, methods and older values are in
 **[docs/performance.md](docs/performance.md)**.
 
-> A defaults campaign is re-timing the newest opt-in flags of both models on 2026-10-23. When it closes, the
-> DeepSeek greedy, batch, prefill and server rows and the Qwen prefill and per-replica server rows are refreshed.
-> The values below are the last clean measurements.
+How to read the tables:
 
-### Code
+- **Best** is the best measured result for that mode, on the workload that suits it most (usually code or
+  copy-heavy text). **Typical** is the same mode on ordinary text, so you know what to expect from a general chat.
+- **tok/s** is decode speed after the prompt has been read, for one request unless the concurrency says
+  otherwise. **TTFT** is time to first token.
+- **Build:** *release* is the code in this repository. *Pre-release* rows come from integration builds measured
+  after this release (the hash is our build id); their code lands in the next release, and the release value is
+  given next to them where it differs.
+- Medians of 3 or more runs unless the row says otherwise. *Updating* marks rows whose confirmation run is still in
+  progress; they show the latest final measurement and its date.
 
-| Workload | Setup | Decode |
-|---|---|---|
-| Qwen, coding chat, one request | one node (through the router) | **90.7 tok/s** |
-| Qwen, coding chat, 2 / 4 / 8 concurrent requests | two replicas | **181.5 / 201.6 / 255.0 tok/s** summed over requests |
-| Qwen, code with a 1K-token prompt | one node | **59.9 tok/s** |
-| Qwen, code with a 32K-token prompt | one node | 51.8 tok/s |
-| DeepSeek, code prompts (8 × 256 tokens), DSpark | pair | **62.3 tok/s** |
-| DeepSeek, code chat through the server, one client | pair | 66.9 tok/s after the first token |
-| DeepSeek, code prompts, DSpark | pair + RTX PRO | **81.1 tok/s** |
-
-Code is where speculative decoding pays most: code repeats names and structure, so the draft heads guess long
-runs right. Summed decode counts each request's own decode rate; a client also waits for its first token (coding
-chat wall aggregate 68.1 / 136.2 / 146.9 / 166.7 tok/s at 1 / 2 / 4 / 8 requests).
-
-### Qwen3.8-Flash-Next
-
-One node, dense A8 profile, MTP windows 2/4/8, 256 generated tokens:
-
-| Decode | Code, 1K prompt | Prose, 1K | Prose, 8K | Code, 32K |
-|---|---:|---:|---:|---:|
-| tok/s | **59.9** | **55.5** | 48.9 | 51.8 |
-
-| Prompt reading (fast prompt profile) | 1K | 4K | 16K | 32K |
-|---|---:|---:|---:|---:|
-| Prefill, tok/s | 916 | 1,085 | 1,089 | 1,065 |
-| Time to first token | **1.13 s** | 3.78 s | 15.05 s | 30.76 s |
-
-Two replicas, one complete model per node, behind the [TensorMeld](https://github.com/hyukudan/tensormeld) router
-(D-060), 8-category short set (36-303-token prompts), wall aggregate including the first token:
-
-| Clients | 1 | 2 | 4 | 6 | 8 |
-|---|---:|---:|---:|---:|---:|
-| tok/s | **42.8** | **85.8** | **102.9** | **110.6** | **120.4** |
-| TTFT p50 | 0.89 s | 0.85 s | 1.32 s | 1.91 s | 2.55 s |
-
-Every response equals the single-node response, 570/570.
+Hardware: **1 node** = one Strix Halo (128 GB). **2 nodes** = two Strix Halo joined by two USB4 cables.
+**RTX PRO** = an RTX PRO 6000 Blackwell (96 GB) in a PC on 1 GbE.
 
 ### DeepSeek V4.1 Flash
 
-Two nodes over USB4, production defaults:
+All rows: DeepSeek V4.1 Flash (1017 checkpoint), routed experts in the published 2-bit (Q2) GGUF, dense weights in
+a 6.5-bit overlay with trellis-coded attention, shared-expert and head weights. 2 nodes, expert tensor parallel
+(TP2) over USB4.
 
-| What | Measured |
-|---|---|
-| Greedy decode, one stream | **28.5** tok/s |
-| DSpark speculative decode, one stream (English / Spanish / code) | **37.5 / 39.3 / 62.3** tok/s (46.4 over 24 prompts) |
-| Batched decode, 8 streams, aggregate | **95.9** tok/s |
-| Device prefill, 8K tokens | **734** tok/s (1K / 4K / 16K: 458 / 640 / 758 on an earlier build) |
-| Server, 8-category short set, 1 / 2 / 4 / 8 clients | **38.4 / 52.7 / 59.3 / 66.8** tok/s aggregate |
-| Server time to first token, 8K-token prompt, idle | **15.8 s** |
+| Mode | Hardware | Prompt / context | Concurrency | Best | Typical | Date | Build |
+|---|---|---|---:|---:|---:|---|---|
+| Greedy decode | 2 nodes | short prompt | 1 | **32.7 tok/s** (30.6 ms/token) | same (text-independent) | 2026-10-24 *(updating)* | pre-release `f9332f3e`; release: 28.5 tok/s |
+| DSpark speculative decode | 2 nodes | 8 prompts per type, 256 tokens each | 1 | **62.3 tok/s** (code) | 37.5 (English) / 39.3 (Spanish); 46.4 over all 24 | 2026-10-22 | release |
+| Batched decode, no drafting | 2 nodes | 8 prompts, 48 tokens each | 8 | **101.3 tok/s** aggregate | same (text-independent) | 2026-10-24 *(updating)* | pre-release `7ab7fc12`; release: 95.9 tok/s |
+| Device prefill (expert parallel) | 2 nodes | 1K | 1 | TTFT **2.20 s** (465 tok/s) | | 2026-10-24 | pre-release `43086d05` |
+| Device prefill | 2 nodes | 8K | 1 | TTFT **10.78 s** (760 tok/s) | | 2026-10-24 *(updating)* | pre-release `f9332f3e`; release: 734 tok/s |
+| Device prefill | 2 nodes | 16K | 1 | 758 tok/s | | 2026-10-22 *(updating)* | release |
+| Device prefill | 2 nodes | 32K | 1 | TTFT **39.6 s** (828 tok/s), 2 runs | | 2026-10-23 | pre-release `43086d05` + prefill defaults |
+| Server, one client, chat | 2 nodes | chat prompt | 1 | **66.9 tok/s** (code) | 34.9 tok/s (prose) | 2026-10-22 | release |
+| Server, 8 chats × 128 tokens | 2 nodes | chat prompts | 1 / 2 / 4 / 8 | **41.4 / 54.0 / 59.7 / 67.9 tok/s** aggregate | | 2026-10-22 | release |
+| Server, 8-category short set | 2 nodes | 36-303-token prompts | 1 / 2 / 4 / 8 | | 38.4 / 52.7 / 59.3 / 66.8 tok/s aggregate | 2026-10-22 | release |
+| Server TTFT | 2 nodes | 8K, server idle | 1 | **15.8 s** | 27.9 s while 4 other streams decode | 2026-10-22 | release |
 
-With the RTX PRO 6000 (opt-in), same pair build in both columns:
+**DeepSeek with the RTX PRO** (opt-in; same model files; the RTX runs layers 0-21 with CUDA, the two nodes run
+layers 22-39 and the head):
 
-| What | Pair only | Pair + RTX PRO |
-|---|---:|---:|
-| DSpark decode, all 24 prompts | 46.4 tok/s | **61.8** tok/s (×1.33) |
-| DSpark decode, English / Spanish / code | 37.5 / 39.3 / 62.3 | **50.3 / 54.2 / 81.1** tok/s |
-| Greedy decode | 27.7 tok/s | 38.3 tok/s |
-| Time to first token, 2K / 8K / 32K (exact CUDA prefill service) | 15.8 s at 8K | **3.6 / 4.4 / 12.2 s** |
+| Mode | Hardware | Prompt / context | Concurrency | Best | Typical | Date | Build |
+|---|---|---|---:|---:|---:|---|---|
+| DSpark speculative decode | RTX PRO + 2 nodes | 8 prompts per type, 256 tokens each | 1 | **81.1 tok/s** (code) | 50.3 (English) / 54.2 (Spanish); 61.8 over all 24 | 2026-10-22 | release |
+| Greedy decode | RTX PRO + 2 nodes | short prompt | 1 | **38.3 tok/s** | same | 2026-10-22 | release |
+| Prompt reading on the RTX PRO (exact profile) | RTX PRO | 2K / 8K / 32K | 1 | TTFT **3.64 / 4.39 / 12.20 s** | | 2026-10-22 | release |
 
-The RTX prefill times are measured on a warm resident service up to the exported attention state (handed to a local
-import endpoint). A faster CUDA prefill profile exists but fails the quality gate on long prompts; it stays
-experimental and is not quoted.
+The pair-only DSpark run on the same build gives 46.4 tok/s over the 24 prompts (×1.33 with the RTX PRO). The RTX
+split is bitwise equal to the pair without the trellis sites; with them (these rows) it is a declared composed
+identity, checked against the pair (KL 1.7e-3), not bitwise. RTX TTFT: warm resident service, model load
+excluded, up to the exported attention state handed to the import endpoint. A faster CUDA prefill profile fails
+the quality gate on long prompts and is not quoted.
+
+### Qwen3.8-Flash-Next
+
+All rows: Qwen3.8-Flash-Next, UD-Q4_K_XL GGUF (111 GB) plus a distilled Q8_0 MTP draft head (2.8 GB), MTP
+speculative decoding with windows 2/4/8, dense A8 profile, thinking off, 256 generated tokens unless stated.
+
+| Mode | Hardware | Prompt / context | Concurrency | Best | Typical | Date | Build |
+|---|---|---|---:|---:|---:|---|---|
+| MTP decode | 1 node | 1K | 1 | **60.0 tok/s** (code) | 55.7 tok/s (prose) | 2026-10-24 | pre-release `0117a140` (release: 59.8 / 55.5 in the same session) |
+| MTP decode | 1 node | 8K | 1 | | 48.9 tok/s (prose) | 2026-10-22 | release |
+| MTP decode | 1 node | 32K | 1 | **51.8 tok/s** (code) | | 2026-10-22 | release |
+| MTP + copy windows (opt-in), long copy-edit | 1 node | Markdown document (~10 KB) to fix, 2,047-token answer | 1 | **183.5 tok/s** | | 2026-10-24 | pre-release `e1b115a2` |
+| MTP + copy windows (opt-in), long copy-edit | 1 node | Python file + diff to apply, 1,417-token answer | 1 | **163.9 tok/s** | | 2026-10-24 | pre-release `e1b115a2` |
+| MTP + copy windows (opt-in), long copy-edit | 1 node | C++ file to rewrite with renames, 1,711-token answer | 1 | **155.1 tok/s** | | 2026-10-24 | pre-release `e1b115a2` |
+| MTP + copy windows (opt-in), 7 copy-edit tasks | 1 node | 5-10 KB inputs, 1,114-2,047-token answers | 1 | | **125.2 tok/s** (90.2 without copy windows) | 2026-10-24 | pre-release `dd65dbd5` |
+| MTP + copy windows (opt-in), agent sessions | 1 node | 6 coding-agent sessions | 1 | | 59.9 tok/s (unchanged by copy windows) | 2026-10-24 | pre-release `dd65dbd5` |
+
+Copy windows (`--mtp-ngram-draft=wide --mtp-copy-wide-rows 32`) verify up to 32 rows when the answer copies text
+from the prompt; tokens are identical to the default in every run. They help when the answer re-emits long spans
+of the input (rewrites, patches, document fixes), do nothing on new text, and currently work for one request per
+process (not yet with the batched server).
+
+**Two replicas** (one complete model per node behind the router, `--http-batch 8`, servers restarted before each
+of 3 rounds, no warm-up; token ids equal the single-node run in 570/570 responses):
+
+| Mode | Hardware | Prompt / context | Concurrency | Best: coding chat | Typical: 8-category short set | Date | Build |
+|---|---|---|---:|---:|---:|---|---|
+| Server, two replicas | 2 nodes | ~70-token chat / 36-303-token prompts | 1 | **90.7 tok/s** decode (68.1 wall) | 42.8 tok/s wall, TTFT p50 0.89 s | 2026-10-22 | release |
+| Server, two replicas | 2 nodes | same | 2 | **181.5** summed decode (136.2 wall) | 85.8 wall, TTFT p50 0.85 s | 2026-10-22 | release |
+| Server, two replicas | 2 nodes | same | 4 | **201.6** summed decode (146.9 wall) | 102.9 wall, TTFT p50 1.32 s | 2026-10-22 | release |
+| Server, two replicas | 2 nodes | same | 8 | **255.0** summed decode (166.7 wall) | 120.4 wall, TTFT p50 2.55 s | 2026-10-22 | release |
+
+*Summed decode* adds each request's own decode rate; *wall* is all completion tokens over the wall time including
+the first token and queueing (what a client sees).
+
+**Prompt reading, one node** (fast prompt profile, fresh process per run) and **with the RTX PRO** (exact CUDA
+prefill on the RTX, attention and recurrent state streamed to the node over 1 GbE as each layer finishes, then the
+node decodes; 64 generated tokens identical to the node-only run at every length; one run per length):
+
+| Mode | Hardware | 1K | 4K | 8K | 16K | 32K | Date | Build |
+|---|---|---:|---:|---:|---:|---:|---|---|
+| Prefill, TTFT | 1 node | **1.13 s** | **3.72 s** | | **14.46 s** | **29.60 s** | 1K 2026-10-22, rest 2026-10-24 | 1K release; rest pre-release `0a646b90` (release: 3.78 / 15.05 / 30.76 s) |
+| Prefill offload, TTFT | RTX PRO + 1 node | **1.36 s** | **1.92 s** | **2.94 s** | **4.95 s** | **8.99 s** | 2026-10-24 | pre-release `70b93af3` |
+| Same server without the RTX, TTFT | 1 node | 1.80 s | 5.20 s | 10.46 s | 21.43 s | 44.02 s | 2026-10-24 | same server build |
+
+The offload compares against the same production server it forwards to (2,048-row prompt tiles), which reads
+prompts more slowly than the one-node prefill row above (8,192-row tiles). At 32K the RTX path is 4.9× faster than
+that server. With the offload enabled, the router sends prompts of 1K tokens or more to the RTX PRO; shorter ones
+are read on the node.
+
+**Next release candidate** (`0117a140`, measured against the release build in the same session, interleaved runs,
+every run exact): TTFT 2.3 % (1K), 3.4 % (4K) and 5.1 % (16K, 32K) lower; decode equal or up to 0.4 % faster;
+two replicas at concurrency 4 and 8: 3.9 % and 3.6 % more wall throughput, and a 6.9 % lower TTFT at
+concurrency 4. Details in [docs/performance.md](docs/performance.md#qwen38-flash-next-1).
+
+### MiniMax M3.1 Flash (bring-up, preliminary)
+
+All rows: MiniMax M3.1 Flash, EXL3 trellis weights at 3.06 bits per weight, 2 nodes TP2 over USB4. **Preliminary:**
+the bring-up is not in this release and the numbers will move as kernels land.
+
+| Mode | Hardware | Prompt / context | Concurrency | Best | Typical | Date | Build |
+|---|---|---|---:|---:|---:|---|---|
+| Output check | 2 nodes | chat-templated prompts (prose, code, JSON, C++ edit) | 1 | coherent answers; speculative ids equal plain greedy in 4/4 | | 2026-10-24 | pre-release `44ec61f4` |
+| Greedy decode | 2 nodes | 1K | 1 | **6.54 tok/s** (152.9 ms/token) | same (text-independent) | 2026-10-24 *(updating)* | pre-release `d33da74d` |
+| Greedy decode | 2 nodes | 8K | 1 | 5.32 tok/s, 1 run | | 2026-10-24 *(updating)* | pre-release `17ddf83f` (before the MoE kernels) |
+| Prefill, TTFT | 2 nodes | 1K / 8K | 1 | **6.67 s** / 57.1 s (8K: 1 run) | | 2026-10-24 *(updating)* | 1K `d33da74d`, 8K `17ddf83f` |
+| DSpark speculative decode | 2 nodes | JSON table conversion, 256 tokens | 1 | **19.31 tok/s** (×3.6) | | 2026-10-24 | pre-release `44ec61f4` |
+| DSpark speculative decode | 2 nodes | C++ edit, 1K-token prompt, 256 tokens | 1 | **17.33 tok/s** (×3.2) | | 2026-10-24 | pre-release `44ec61f4` |
+| DSpark speculative decode | 2 nodes | Python code / English prose, 256 tokens | 1 | 10.82 tok/s (code, ×2.0) | **6.23 tok/s** (prose, ×1.16) | 2026-10-24 | pre-release `44ec61f4` |
+
+The DSpark speed-ups are against plain greedy on the same build (5.37 tok/s). **Quality gate** (teacher-forced
+distribution against an exact reference, 7 pre-registered rules, two prompts): the second prompt passes all 7
+rules; the first passes 6 and misses top-1 agreement with the exact reference by 2.1 points (71.7 % against a
+73.8 % threshold), while its top-1 against the real text is within 1 point of our CPU reference. It is **not
+declared passed**; a gate over more prompts is planned.
 
 ## How exact, how good
 
@@ -341,8 +400,8 @@ The full record, with alternatives, evidence and the condition for reopening eac
 
 In progress, without promised numbers:
 
-- **MiniMax M3.1 Flash (EXL3) on the pair:** format reader and CPU reference of the attention are in bring-up;
-  device kernels and a layer gate come next.
+- **MiniMax M3.1 Flash (EXL3) on the pair:** the full model runs on both nodes with DSpark; next are faster
+  decode kernels, a wider quality gate and the server.
 - **GLM-5.3 Flash:** first tests on the pair.
 - **DeepSeek:** a lower-latency ready path for the USB4 exchange and a closed defaults campaign for the newest
   opt-in flags; end-to-end time to first token of the exact CUDA prefill through the pair's server.

@@ -4,9 +4,10 @@ Every speed number quoted in the [README](../README.md) is listed here with its 
 exactness check. All numbers are measured on our own machines; values are medians of 3 or more runs unless a row
 says otherwise. Estimates and calculations are not listed as results.
 
-**Re-measurement in progress (2026-10-23).** A defaults campaign is timing every new opt-in flag of the current
-DeepSeek and Qwen builds against their production configuration. When it closes, the rows marked *(campaign)*
-below are refreshed with the build it measured. Until then they show the last clean measurement.
+The README shows, per mode, the **best** measured result and a **typical** one. Rows measured after this release
+on integration builds are collected in [After this release](#after-this-release-pre-release-builds) with their
+build id; their code lands in the next release. Rows marked *(campaign)* below are superseded there where a newer
+measurement exists.
 
 Hardware names used below:
 
@@ -133,6 +134,52 @@ pair-only, 256/256 tokens equal; measured on an earlier pair build (2026-10-21).
 Trellis mix-B dense weights (all K4, head K5) against the 6.5-bit overlay, KL to the original-precision model over
 103,908 tokens, computed in an emulation of the formats (not with the engine's kernels): mix-B 0.0446 at 2.27 GB per
 token per node, 6.5-bit 0.0447 at 3.63 GB; paired ΔKL −0.0001.
+
+## After this release (pre-release builds)
+
+Measured 2026-10-23/24 on integration builds that are not in this repository yet (the hash is our build id).
+Same hardware, greedy, every run exact against its reference before its time is counted.
+
+### DeepSeek V4.1 Flash, pair
+
+| What | Value | Date | Build | Conditions and exactness |
+|---|---|---|---|---|
+| Greedy decode, 1 stream | **30.6 ms/token = 32.7 tok/s** (release build of the same day: 34.7 ms/token) | 2026-10-24 | `f9332f3e` + trellis library release candidate | interleaved A/B ×3 against the production build; both ranks identical to the stored reference in every run. Trellis-coded attention sites, staged-ready exchange views, parallel CRC host path |
+| Verify window of 6 rows | 58.92 ms/window (production 63.25) | 2026-10-24 | same | same |
+| Batched decode, 8 streams | **78.97 ms/step = 101.3 tok/s** aggregate (N = 1 / 2 / 4: 34.21 / 41.40 / 54.38 ms/step) | 2026-10-24 | `7ab7fc12` | shared expert computed during the expert exchange; 8 prompts × 48 tokens; tokens identical to the reference; interleaved A/B ×3, ranges disjoint |
+| Device prefill, 1K | TTFT **2.20 s** (465 tok/s) | 2026-10-24 | `43086d05` | the newer candidate is 1.1 % slower at 1K (2.23 s); root cause in progress. Logits identical on both ranks |
+| Device prefill, 8K | TTFT **10.78 s** (760 tok/s) | 2026-10-24 | `f9332f3e` | production 11.21 s in the same session; logits identical on both ranks and between builds |
+| Device prefill, 32K | TTFT **39.55 s** (828 tok/s), 2 runs | 2026-10-23 | `43086d05` with the three prefill defaults of the next release | defaults campaign; base 41.37 s; logits identical |
+
+A confirmation of the combined candidate (batched decode, server, DSpark, 16K prefill, 8K server TTFT) is running;
+those rows are refreshed when it closes.
+
+### Qwen3.8-Flash-Next
+
+| What | Value | Date | Build | Conditions and exactness |
+|---|---|---|---|---|
+| TTFT one node, 1K / 4K / 16K / 32K | 1.14 / **3.72 / 14.46 / 29.60 s** (production build, same session: 1.15 / 3.83 / 15.24 / 31.24 s) | 2026-10-24 | `0a646b90` with the pipelined dense and reworked MoE prefill schedules (defaults of the next release) | fast prompt profile, fresh process per run, A/B ×4 in ABBA/BAAB order, median of 4; prefix state and logits identical to the release build |
+| Copy windows, long copy-edit: document fix / patch / C++ rewrite | **5.451 / 6.102 / 6.449 ms/token = 183.5 / 163.9 / 155.1 tok/s** (default MTP: 10.76 / 10.87 / 10.87 ms/token) | 2026-10-24 | `e1b115a2` | production fast preset, `--mtp-ngram-draft=wide --mtp-copy-wide-rows 32`, A/B ×3, tokens identical; wide-window gate (tokens, full-vocabulary logits of every row and state equal to serial) PASS |
+| Copy windows, 7 long copy-edit tasks (token-weighted) | **7.987 ms/token = 125.2 tok/s** (default MTP 11.086 = 90.2 tok/s) | 2026-10-24 | `dd65dbd5` | 1,114-2,047-token answers; A/B ×3; 78/78 samples identical to the default. JSON with an edit in every record: neutral (+0.2 %) |
+| Copy windows, 6 coding-agent sessions | 16.708 ms/token = 59.9 tok/s (default 16.714) | 2026-10-24 | `dd65dbd5` | neutral (−0.04 %), tokens identical |
+| Next release candidate, one node: TTFT 1K / 4K / 16K / 32K | **1.12 / 3.73 / 14.64 / 30.17 s** (release build, same session: 1.15 / 3.86 / 15.42 / 31.79 s; −2.3 / −3.4 / −5.1 / −5.1 %, ranges disjoint) | 2026-10-24 | `0117a140` | integration of the prefill, decode-stall and attention work with its new defaults, no extra settings; fast prompt profile, fresh process per run, interleaved A/B, median of 4; prefix state and logits identical to the release reference with the new defaults and with each of them turned off |
+| Next release candidate, one node: decode 1K code / 1K prose / 8K prose / 32K code | **60.0 / 55.7** / 48.1 / 47.9 tok/s (release, same session: 59.8 / 55.5 / 48.1 / 48.2); prompt reading 3.7-4.5 % faster | 2026-10-24 | `0117a140` | 256 tokens, median of 4; 1K ranges disjoint; 8K and 32K vary run to run in both builds (32K ranges 44.5-52.6 and 44.3-52.6 tok/s, same tokens per cycle); tokens, state and final logits identical to the release |
+| Next release candidate, two replicas: coding chat wall throughput at concurrency 1 / 2 / 4 / 8 | 68.2 / 136.4 / **146.8 / 158.1 tok/s** (release, same session: 67.7 / 136.2 / 141.3 / 152.7); TTFT p50 at concurrency 4: 1.28 s (1.37 s) | 2026-10-24 | `0117a140` | `--http-batch 8`, router, fresh servers per run with one excluded warm-up request, 3 runs per build in ABBAAB order, median; 90/90 responses token-identical to the single-node reference. At concurrency 8 the per-request TTFT median is 2.51 s against 2.46 s: it falls on the step between the second and third prompt each node reads in turn, and one run per build was slowed by queueing; the best runs of the two builds are the same |
+| RTX PRO prefill offload, TTFT 1K / 4K / 8K / 16K / 32K | **1.36 / 1.92 / 2.94 / 4.95 / 8.99 s** (same server alone: 1.80 / 5.20 / 10.46 / 21.43 / 44.02 s) | 2026-10-24 | `70b93af3` | exact CUDA prefill (A8 profile) reproduces the node's prefill bit for bit (61 state components); KV and recurrent state streamed to the node per layer over 1 GbE with a lossless codec on 2 connections; 64 generated tokens identical to the node-only run at every length; one run per length |
+
+### MiniMax M3.1 Flash (bring-up, preliminary)
+
+EXL3 trellis weights at 3.06 bits per weight, two nodes, tensor parallel over USB4. Not in this release.
+
+| What | Value | Date | Build | Conditions and exactness |
+|---|---|---|---|---|
+| Greedy decode, 1K prompt | **152.9 ms/token = 6.54 tok/s** | 2026-10-24 | `d33da74d` | optimized MoE and decode linear kernels, A/B ×3 in process, tokens identical across arms; 1K TTFT 6.67 s (median of 3) |
+| Greedy decode, 8K prompt | 187.9 ms/token = 5.32 tok/s; TTFT 57.1 s | 2026-10-24 | `17ddf83f` | before the MoE kernels; 1 run |
+| DSpark decode by text, 256 tokens | JSON table **19.31** (×3.6), C++ edit with a 1K prompt **17.33** (×3.2), Python 10.82 (×2.0), English prose 6.23 (×1.16) tok/s | 2026-10-24 | `44ec61f4` | chat-templated prompts, output coherent; ids equal plain greedy (5.37 tok/s on this build) in 4/4 |
+| Quality gate (teacher-forced, 7 pre-registered rules) | prompt B: 7/7 pass; prompt A: 6/7, top-1 agreement with the exact reference 71.7 % against 73.8 % required | 2026-10-24 | pair build | top-1 against the real text within 1 point of the CPU reference; **not declared passed**; a gate with more prompts is planned |
+
+An all-defaults MiniMax measurement (decode 1K/8K with and without the exchange module, DSpark variants) is
+running; these rows are refreshed when it lands.
 
 ## The USB4 link
 
