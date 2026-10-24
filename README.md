@@ -47,6 +47,36 @@ by a gate.
 
 For detailed implementation internals, use [How it works](#how-it-works) and the documents linked throughout the model sections. The model weights and their licences are separate from the engine code.
 
+## Quick start: build and run one model
+
+This minimal example is for **one Linux Strix Halo node** with the required ROCm toolchain, model GGUF and a tokenizer-produced `prompt.ids` file. It runs **plain greedy Qwen decoding**, not the speculative benchmark configuration.
+
+```bash
+git clone https://github.com/hyukudan/strix-halo-engine-lab.git
+cd strix-halo-engine-lab
+export PATH=/opt/rocm/core-10.1/bin:$PATH
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_HIP_ARCHITECTURES=gfx1151 \
+  -DCMAKE_HIP_COMPILER=/opt/rocm/core-10.1/bin/amdclang++ \
+  -DSTRIX_ENABLE_HIP_RUNTIME=ON \
+  -DSTRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME=ON \
+  -DSTRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE=ON \
+  -DSTRIX_USE_OPENSSL_SHA256=ON -DBUILD_TESTING=ON
+ninja -C build strix-hip-decode-token
+ctest --test-dir build --output-on-failure
+```
+
+With the matching Qwen model and token IDs available in your working directory:
+
+```bash
+./build/strix-hip-decode-token Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf $(cat prompt.ids) \
+  --context 8192 --execution-mode eager --residency register --generate 256 \
+  --optimization-profile auto \
+  --numerical-profile hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1
+```
+
+The command produces a JSON receipt with token IDs and timing. Actual model files and prompt tokens are **not included**. For model assets, optional MTP/DSpark acceleration, serving and two-node transport, continue with [requirements](#what-you-need), [build](#build), [run](#run), and the [full engine reference](docs/getting-started/engine-reference.md). Some CTest cases require the GPU and model assets.
+
 ## Contents
 
 [Models](#models) ·
