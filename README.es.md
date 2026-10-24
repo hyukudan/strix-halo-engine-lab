@@ -143,7 +143,7 @@ se indique.
 
 | Modo | Hardware | Prompt / contexto | Concurrencia | Mejor | Típico | Fecha | Build |
 |---|---|---|---:|---:|---:|---|---|
-| Decode MTP | 1 nodo | 1K | 1 | **59,9 tok/s** (código) | 55,5 tok/s (prosa) | 2026-10-22 | versión |
+| Decode MTP | 1 nodo | 1K | 1 | **60,0 tok/s** (código) | 55,7 tok/s (prosa) | 2026-10-24 | pre-versión `0117a140` (versión: 59,8 / 55,5 en la misma sesión) |
 | Decode MTP | 1 nodo | 8K | 1 | | 48,9 tok/s (prosa) | 2026-10-22 | versión |
 | Decode MTP | 1 nodo | 32K | 1 | **51,8 tok/s** (código) | | 2026-10-22 | versión |
 | MTP + ventanas de copia (opt-in), edición con copia larga | 1 nodo | documento Markdown (~10 KB) que corregir, respuesta de 2.047 tokens | 1 | **183,5 tok/s** | | 2026-10-24 | pre-versión `e1b115a2` |
@@ -185,6 +185,12 @@ La descarga se compara con el mismo servidor de producción al que reenvía (til
 lee los prompts más despacio que la fila de prefill en un nodo de arriba (tiles de 8.192 filas). A 32K la ruta con
 la RTX es 4,9× más rápida que ese servidor. Con la descarga activada, el router manda a la RTX PRO los prompts de
 1K tokens o más; los más cortos se leen en el nodo.
+
+**Candidato de la próxima versión** (`0117a140`, medido frente al build de la versión en la misma sesión,
+ejecuciones intercaladas, todas exactas): TTFT un 2,3 % (1K), un 3,4 % (4K) y un 5,1 % (16K, 32K) menor; decode
+igual o hasta un 0,4 % más rápido; dos réplicas con concurrencia 4 y 8: un 3,9 % y un 3,6 % más de rendimiento
+de pared, y un TTFT un 6,9 % menor con concurrencia 4. Detalles en
+[docs/performance.md](docs/performance.md#qwen38-flash-next-1).
 
 ### MiniMax M3.1 Flash (puesta en marcha, preliminar)
 

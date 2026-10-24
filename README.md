@@ -136,7 +136,7 @@ speculative decoding with windows 2/4/8, dense A8 profile, thinking off, 256 gen
 
 | Mode | Hardware | Prompt / context | Concurrency | Best | Typical | Date | Build |
 |---|---|---|---:|---:|---:|---|---|
-| MTP decode | 1 node | 1K | 1 | **59.9 tok/s** (code) | 55.5 tok/s (prose) | 2026-10-22 | release |
+| MTP decode | 1 node | 1K | 1 | **60.0 tok/s** (code) | 55.7 tok/s (prose) | 2026-10-24 | pre-release `0117a140` (release: 59.8 / 55.5 in the same session) |
 | MTP decode | 1 node | 8K | 1 | | 48.9 tok/s (prose) | 2026-10-22 | release |
 | MTP decode | 1 node | 32K | 1 | **51.8 tok/s** (code) | | 2026-10-22 | release |
 | MTP + copy windows (opt-in), long copy-edit | 1 node | Markdown document (~10 KB) to fix, 2,047-token answer | 1 | **183.5 tok/s** | | 2026-10-24 | pre-release `e1b115a2` |
@@ -177,6 +177,11 @@ The offload compares against the same production server it forwards to (2,048-ro
 prompts more slowly than the one-node prefill row above (8,192-row tiles). At 32K the RTX path is 4.9× faster than
 that server. With the offload enabled, the router sends prompts of 1K tokens or more to the RTX PRO; shorter ones
 are read on the node.
+
+**Next release candidate** (`0117a140`, measured against the release build in the same session, interleaved runs,
+every run exact): TTFT 2.3 % (1K), 3.4 % (4K) and 5.1 % (16K, 32K) lower; decode equal or up to 0.4 % faster;
+two replicas at concurrency 4 and 8: 3.9 % and 3.6 % more wall throughput, and a 6.9 % lower TTFT at
+concurrency 4. Details in [docs/performance.md](docs/performance.md#qwen38-flash-next-1).
 
 ### MiniMax M3.1 Flash (bring-up, preliminary)
 
