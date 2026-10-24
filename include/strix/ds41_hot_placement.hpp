@@ -1,7 +1,7 @@
 #pragma once
 
 // deepseek41 hot-expert placement: the reader of a versioned placement file
-// (format "tensormeld/hot-expert-placement-v1", docs/ds41-hot-placement.md) and the split of a layer's
+// (format "tensormeld/hot-expert-placement-v1", docs/models/deepseek-v4.1/hot-placement.md) and the split of a layer's
 // routed rows into local and remote work under the canonical combine of ds41_moe.hpp:
 //   y = (shared + low) + high, low = fold of the row's experts with id < split in ascending id from 0,
 //   high likewise for ids >= split; each step one FP32 product then one FP32 add.

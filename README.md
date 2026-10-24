@@ -59,8 +59,8 @@ by a gate.
 | GLM-5.3 Flash (GGUF) | 2 nodes | **Planned tests** | Not started in the engine |
 
 The core knows no model: each family is a module with its own contract, plan, kernels and gates
-([docs/model-families.md](docs/model-families.md)). The automatic profiles only admit the pinned model files listed in
-[SOURCES_LEDGER.md](SOURCES_LEDGER.md).
+([docs/models/model-families.md](docs/models/model-families.md)). The automatic profiles only admit the pinned model files listed in
+[docs/reference/sources-ledger.md](docs/reference/sources-ledger.md).
 
 ## Hardware
 
@@ -224,7 +224,7 @@ a reference at every position (KL divergence and top-1 agreement), per category 
 | Exact (FP32 dense) | 0.01940 | 95.52 % |
 | Dense A8 (recommended) | 0.01978 (+1.9 ± 2.0 %) | 95.55 % |
 
-49,001 positions ([D-032](DECISIONS.md#d-032-dense-a8-in-the-recommended-profile)): dense A8 is as close to the
+49,001 positions ([D-032](docs/decisions/decision-register.md#d-032-dense-a8-in-the-recommended-profile)): dense A8 is as close to the
 reference as the exact profile, within the margin between two exact implementations of the same weights. Where the
 two profiles disagree (2.8 % of positions) it is almost always between near-equal candidates.
 
@@ -232,9 +232,9 @@ For DeepSeek, the trellis-coded dense weights (mix-B) are as close to the origin
 format (KL 0.0446 against 0.0447 over 103,908 tokens) at 2.27 instead of 3.63 GB read per token per node; this was
 computed in an emulation of the formats, not with the engine's kernels.
 
-Methodology: [docs/teacher-forced-tiled-prefill.md](docs/teacher-forced-tiled-prefill.md),
-[docs/decode-optimization-profile.md](docs/decode-optimization-profile.md),
-[docs/qualification-ledger.md](docs/qualification-ledger.md).
+Methodology: [docs/engine/prefill/teacher-forced-tiled-prefill.md](docs/engine/prefill/teacher-forced-tiled-prefill.md),
+[docs/engine/decode/optimization-profile.md](docs/engine/decode/optimization-profile.md),
+[docs/reference/qualification-ledger.md](docs/reference/qualification-ledger.md).
 
 ## Why it is different
 
@@ -272,7 +272,7 @@ Methodology: [docs/teacher-forced-tiled-prefill.md](docs/teacher-forced-tiled-pr
 |---|---|---|
 | **Machines** | one Strix Halo (`gfx1151`) with **128 GB** | two Strix Halo with 128 GB each, two direct USB4 cables, the [USB4 driver series](https://github.com/hyukudan/strix-halo-usb4-driver); optionally a CUDA PC with an RTX PRO 6000 |
 | **OS / GPU stack** | Linux, ROCm/HIP (tested with ROCm core 10.1 under `/opt/rocm/core-10.1`) | same; CUDA for the optional RTX parts |
-| **Model files** | UD-Q4_K_XL GGUF (~111 GB) + Q8_0 MTP sidecar | the 2-bit expert GGUF, the 6.5-bit dense overlay, the trellis packs and the DSpark drafter ([docs/ds41-production-defaults.md](docs/ds41-production-defaults.md#production-identity-environment-of-both-ranks)) |
+| **Model files** | UD-Q4_K_XL GGUF (~111 GB) + Q8_0 MTP sidecar | the 2-bit expert GGUF, the 6.5-bit dense overlay, the trellis packs and the DSpark drafter ([docs/models/deepseek-v4.1/production-defaults.md](docs/models/deepseek-v4.1/production-defaults.md#production-identity-environment-of-both-ranks)) |
 | **Build tools** | CMake >= 3.24, Ninja, a C++20 compiler, optionally OpenSSL for fast hashing | same |
 
 The command-line tools take token IDs; the HTTP servers carry the models' own tokenizers and chat templates.
@@ -296,7 +296,7 @@ ninja -C build strix-deepseek41-rank strix-deepseek41-serve   # DeepSeek (family
 
 The CUDA parts for the RTX PRO build separately with `-DSTRIX_ENABLE_CUDA_DS41=ON`. `ctest --test-dir build` runs
 the host and device tests (many device tests need the GPU and the model files). All CMake options are listed in
-[docs/ENGINE.md](docs/ENGINE.md#build-options).
+[docs/getting-started/engine-reference.md](docs/getting-started/engine-reference.md#build-options).
 
 ## Run
 
@@ -311,18 +311,18 @@ the host and device tests (many device tests need the GPU and the model files). 
 
 `prompt.ids` holds the prompt as token IDs from the model's tokenizer; the engine prints a JSON receipt with
 `generated_tokens` and timings. For the speeds above add the speculative options (MTP sidecar, verify windows
-2/4/8, draft vocabulary): the complete command is in **[docs/ENGINE.md → Command line](docs/ENGINE.md#command-line)**
-and [docs/mtp-native-cli.md](docs/mtp-native-cli.md). The HTTP server, batched slots (`--http-batch`) and the
-prefix cache are in [docs/serving.md](docs/serving.md); several requests in one process in
-[docs/multi-request-cohort.md](docs/multi-request-cohort.md); sampling in
-[docs/sampled-decoding.md](docs/sampled-decoding.md).
+2/4/8, draft vocabulary): the complete command is in **[docs/getting-started/engine-reference.md → Command line](docs/getting-started/engine-reference.md#command-line)**
+and [docs/engine/speculative/mtp-native-cli.md](docs/engine/speculative/mtp-native-cli.md). The HTTP server, batched slots (`--http-batch`) and the
+prefix cache are in [docs/engine/serving/serving.md](docs/engine/serving/serving.md); several requests in one process in
+[docs/engine/scheduling/multi-request-cohort.md](docs/engine/scheduling/multi-request-cohort.md); sampling in
+[docs/engine/decode/sampled-decoding.md](docs/engine/decode/sampled-decoding.md).
 
 **DeepSeek on the pair:** one rank per node, the same environment on both ranks (the production identity),
 `--transport usb4gpu`; the server takes `--prefill-path device --dspark <DSpark.gguf> --dspark-vocab auto:<vocab>`.
-The environment, defaults and opt-outs are in [docs/ds41-production-defaults.md](docs/ds41-production-defaults.md);
-the RTX split command lines in [docs/ds41-pipeline-stage.md](docs/ds41-pipeline-stage.md); hot-expert placement in
-[docs/ds41-hot-placement.md](docs/ds41-hot-placement.md); long contexts in
-[docs/deepseek41-long-context.md](docs/deepseek41-long-context.md).
+The environment, defaults and opt-outs are in [docs/models/deepseek-v4.1/production-defaults.md](docs/models/deepseek-v4.1/production-defaults.md);
+the RTX split command lines in [docs/models/deepseek-v4.1/pipeline-stages.md](docs/models/deepseek-v4.1/pipeline-stages.md); hot-expert placement in
+[docs/models/deepseek-v4.1/hot-placement.md](docs/models/deepseek-v4.1/hot-placement.md); long contexts in
+[docs/models/deepseek-v4.1/long-context.md](docs/models/deepseek-v4.1/long-context.md).
 
 ### Exposing the servers
 
@@ -376,14 +376,14 @@ flowchart LR
 weight is read once for all rows, and the recurrent (GDN) layers still update rows in order, so the result is
 bit-identical to reading the prompt one token at a time with the same profile.
 
-The architecture guide is [docs/README.md](docs/README.md) (multi-node and USB4:
+Every document is listed in the [documentation index](docs/README.md). The architecture guide is [docs/architecture/README.md](docs/architecture/README.md) (multi-node and USB4:
 [docs/architecture/12-multi-node-and-usb4.md](docs/architecture/12-multi-node-and-usb4.md)); the engine reference
-is [docs/ENGINE.md](docs/ENGINE.md); current status per area is [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md).
+is [docs/getting-started/engine-reference.md](docs/getting-started/engine-reference.md); current status per area is [docs/reference/implementation-status.md](docs/reference/implementation-status.md).
 
 ## Design decisions
 
 The full record, with alternatives, evidence and the condition for reopening each one, is
-[DECISIONS.md](DECISIONS.md). The main ones:
+[docs/decisions/decision-register.md](docs/decisions/decision-register.md). The main ones:
 
 - **Exact verification over tolerance (D-021)** and **adaptive windows 2/4/8 with an online cost model (D-022)**.
 - **Named numerical profiles (D-024, D-032)** and **a separate prefill profile (D-033)**.
@@ -394,7 +394,7 @@ The full record, with alternatives, evidence and the condition for reopening eac
   GPU-direct exchange (D-063), a discrete GPU in the decode (D-064, opt-in).**
 - **Measured and rejected:** hipGraph capture of the decode loop, tensor parallelism of one Qwen request across the
   nodes (X-021), and more; numbers in the
-  [rejected table](DECISIONS.md#measured-and-rejected).
+  [rejected table](docs/decisions/decision-register.md#measured-and-rejected).
 
 ## Roadmap
 
@@ -440,7 +440,7 @@ the GPU read the weights where they sit.
 **What context length is supported?**
 Qwen's automatic profile is qualified at 8192 tokens; longer contexts run with `--unqualified-context` (the prefill
 numbers go up to 32K that way). DeepSeek's long-context limits are in
-[docs/deepseek41-long-context.md](docs/deepseek41-long-context.md).
+[docs/models/deepseek-v4.1/long-context.md](docs/models/deepseek-v4.1/long-context.md).
 
 **Where are the numbers from?**
 From our own runs on our own machines, with date, configuration and exactness check per row in
@@ -452,4 +452,4 @@ The engine source is licensed under the **[Apache License 2.0](LICENSE)**, excep
 module under `lab/direct_gpu_stream/kernel/`, which is **GPL-2.0-only** as Linux kernel code must be (its license
 texts are kept in that directory). Code adopted from other projects keeps its original license and notices. Model
 weights are distributed under their own licenses. Third-party references used for formats and model semantics are
-listed with their licenses in [SOURCES_LEDGER.md](SOURCES_LEDGER.md).
+listed with their licenses in [docs/reference/sources-ledger.md](docs/reference/sources-ledger.md).

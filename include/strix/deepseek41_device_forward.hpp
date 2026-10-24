@@ -90,7 +90,7 @@ struct DeviceForwardOptions {
     // false: no head and no argmax: a FRONT stage [0, layers) of a pipeline (export_boundary() after each step).
     bool head = true;
     // trellis weights for the dense decode sites (ds41_trellis.hpp, identity ds41-trellis-k5-v1,
-    // docs/ds41-trellis-k5-v1.md), off when empty: a pack directory (dense.L<l>.safetensors + dense.head.safetensors). The
+    // docs/models/deepseek-v4.1/trellis-k5-v1.md), off when empty: a pack directory (dense.L<l>.safetensors + dense.head.safetensors). The
     // selected sites run the trellis library on F32 activations (no A8 at those sites) instead of their Q8_0 / packed
     // copy, which stays loaded. Also STRIX_DS41_TRELLIS=DIR; the build must link the library (CMake STRIX_DS41_TRELLIS).
     std::filesystem::path trellis;

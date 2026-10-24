@@ -166,7 +166,7 @@ struct CudaPrefillOptions {
     // Engram rows of the next token read as soon as a head step knows its greedy token (R1): the next step whose
     // token is that one finds its rows in (or in flight), any other token drops them and reads its own. Same bytes.
     bool engram_prefetch = true;
-    // The pair's P15 target identity on this device (docs/ds41-expert-tp2-i1152-v1.md): decode steps compute the routed
+    // The pair's P15 target identity on this device (docs/models/deepseek-v4.1/expert-tp2-i1152-v1.md): decode steps compute the routed
     // experts' down products and combine in the order of ds41-expert-tp2-i1152-v1 (two K-half parts per output, each
     // folded over the row's experts, then (shared + S0) + S1). run() (prefill) keeps the EP order, as the pair's prefill.
     bool expert_tp = false;
@@ -175,7 +175,7 @@ struct CudaPrefillOptions {
     // Trellis shared expert in decode steps (the pair's trellis site class shexp, e.g. ds41-trellis-mixB-v1): a pack
     // directory (dense.L<l>.safetensors, layers.<l>.ffn.shared_experts.w1 / w3 / w2) whose gate / up / down replace the
     // Q8_0 shared expert of step(): F32 normed x in (no A8), the clamped SwiGLU in F32, F32 out. Each linear runs the
-    // pair library's GEMV order (docs/ds41-cuda-trellis-shexp.md): splits of the K16 tiles as the library's vector policy,
+    // pair library's GEMV order (docs/models/deepseek-v4.1/cuda-trellis-shexp.md): splits of the K16 tiles as the library's vector policy,
     // per lane class two pair products per tile into one accumulator, lanes folded (0 + 2) + (1 + 3), splits folded in
     // order. run() (prefill) keeps the Q8_0 shared expert, as the pair's prefill. Empty: off. Needs the build option
     // STRIX_ENABLE_CUDA_TRELLIS.

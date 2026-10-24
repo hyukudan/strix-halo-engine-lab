@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-// The FRONT of a deepseek41 pipeline (strix/ds41-pipeline-v1, docs/ds41-pipeline-stage.md): the embedding and target
+// The FRONT of a deepseek41 pipeline (strix/ds41-pipeline-v1, docs/models/deepseek-v4.1/pipeline-stages.md): the embedding and target
 // layers [0, K) on this node's backend, the rest on a TAIL (strix-deepseek41-rank --role pipeline-stage --first-layer K),
 // one boundary per step over TCP; the TAIL answers with the greedy tokens.
 //   strix-deepseek41-pipeline-front MODEL.gguf --backend hip --layers K --stage-connect HOST:PORT --stage-token-file PATH

@@ -44,7 +44,7 @@
 //       [--timing] [--engram-direct] [--no-gather]
 //   strix-deepseek41-rank MODEL.gguf --describe-json [--max-positions N]: tensormeld/engine-describe-v1 from the file header
 //       (no weight is read; one JSON line on stdout)
-//   Pipeline TAIL (strix/ds41-pipeline-v1, docs/ds41-pipeline-stage.md): layers [K, layers) and the head on the stream a
+//   Pipeline TAIL (strix/ds41-pipeline-v1, docs/models/deepseek-v4.1/pipeline-stages.md): layers [K, layers) and the head on the stream a
 //   FRONT sends; rank 0 listens, rank 1 (world 2) follows rank 0 over the communicator:
 //   strix-deepseek41-rank MODEL.gguf --role pipeline-stage --first-layer K [--layers 40] --rank R --transport T|single
 //       --stage-listen HOST:PORT --stage-token-file PATH [--stage-once | --stage-sessions N] [--max-positions N] [--op-hashes] [--stream-experts]

@@ -380,7 +380,7 @@ std::string trellis_config_identity(const std::map<std::string, std::uint32_t>& 
         std::string per;
         for (const auto& [m, k] : used) per += (per.empty() ? "" : ",") + m + "=K" + std::to_string(k);
         out = "ds41-trellis-mix-v1{" + per + "}:" + site_list;
-        // the declared mixes (docs/ds41-trellis-k5-v1.md): every used class must carry the K they assign
+        // the declared mixes (docs/models/deepseek-v4.1/trellis-k5-v1.md): every used class must carry the K they assign
         const std::map<std::string, std::uint32_t> mix_a{{"q_b", 3}, {"o_a", 3}, {"o_b", 3}, {"shexp_w2", 3}, {"shexp_w13", 4},
                                                          {"q_a", 4}, {"kv", 4}, {"head", 5}};
         const auto matches = [&](const std::map<std::string, std::uint32_t>& decl, std::uint32_t dense) {

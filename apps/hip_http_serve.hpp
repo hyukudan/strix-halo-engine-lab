@@ -1,7 +1,7 @@
 #pragma once
 // --http-serve: the OpenAI/Anthropic-compatible HTTP front end (strix_serve) over the MTP bridge's
 // request runner. The bridge thread executes the generation queue; HTTP connections run on their
-// own threads and only exchange tokens with it through tickets (docs/serving.md).
+// own threads and only exchange tokens with it through tickets (docs/engine/serving/serving.md).
 #include "hip_decode_options.hpp"
 #include "hip_mtp_decode_bridge.hpp"
 #include "strix/serve/api.hpp"

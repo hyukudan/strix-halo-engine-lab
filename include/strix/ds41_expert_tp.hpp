@@ -1,7 +1,7 @@
 #pragma once
 
 // deepseek41 expert tensor parallelism over two ranks, declared identity ds41-expert-tp2-i1152-v1
-// (docs/ds41-expert-tp2-i1152-v1.md). Default off; STRIX_DS41_EXPERT_TP=1 turns it on in the host forward, the device
+// (docs/models/deepseek-v4.1/expert-tp2-i1152-v1.md). Default off; STRIX_DS41_EXPERT_TP=1 turns it on in the host forward, the device
 // forward and the batch forward (read once at startup).
 //
 // Every routed expert is split by its intermediate dimension (I = 2304) over the two ranks: rank r holds 1152 gate and up

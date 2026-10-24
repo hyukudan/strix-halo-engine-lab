@@ -1,6 +1,6 @@
 #pragma once
 // Block-boundary prefix state cache on the tiled known-prefix prefill: session-state capture and
-// restore over strix::PrefixStateCache (docs/prefix-state-cache.md).
+// restore over strix::PrefixStateCache (docs/engine/serving/prefix-state-cache.md).
 #include "strix/arithmetic_lineage.hpp"
 #include "strix/memory_plan.hpp"
 #include "strix/model_contract.hpp"

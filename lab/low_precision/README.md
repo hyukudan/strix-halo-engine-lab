@@ -1,7 +1,7 @@
 # Portable low-precision experiment
 
 This host-only lab implements the scalar arithmetic gate of the
-[draft proposal](../../docs/proposals/2026-10-11-phase-specific-low-precision.md).
+[draft proposal](../../docs/research/proposals/2026-10-11-phase-specific-low-precision.md).
 It also contains a bounded offline instruction-emission probe. Neither changes
 runtime dispatch, numerical plans, checkpoint storage, authoritative verification,
 KV/recurrent state or wire encoding. Native correctness/performance and model

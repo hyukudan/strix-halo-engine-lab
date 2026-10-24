@@ -43,7 +43,7 @@ schedules; so far no schedule is faster than the default, so the default rows ar
 Setup: the [TensorMeld](https://github.com/hyukudan/tensormeld) router balancing active decodes; servers with
 `--http-batch 8`, T 1024, a prefix-cache entry every 1024 tokens, per-request controller reset (D-057) and joint
 windows (D-058); both servers restarted before each of 3 rounds, no warm-up; median of 3 rounds; 2026-10-22.
-Token ids equal the single-node run in **570/570** responses. Evidence: [DECISIONS.md D-060](../DECISIONS.md#d-060-two-full-replicas-one-per-node-behind-the-router).
+Token ids equal the single-node run in **570/570** responses. Evidence: [docs/decisions/decision-register.md D-060](decisions/decision-register.md#d-060-two-full-replicas-one-per-node-behind-the-router).
 
 Two ways to count, both reported:
 
@@ -73,8 +73,8 @@ Two ways to count, both reported:
 
 Model: DeepSeek V4.1 Flash (1017 checkpoint). Routed experts: the published 2-bit (Q2) GGUF. Dense weights: a
 6.5-bit packed overlay with trellis-coded (EXL3/QTIP-style, [strix-trellis](https://github.com/hyukudan/strix-trellis))
-shared-expert and head weights ("mix-B"). Production defaults: [ds41-production-defaults.md](ds41-production-defaults.md),
-[DECISIONS.md D-061 to D-064](../DECISIONS.md#d-061-deepseek-v41-two-node-production-defaults).
+shared-expert and head weights ("mix-B"). Production defaults: [production-defaults.md](models/deepseek-v4.1/production-defaults.md),
+[docs/decisions/decision-register.md D-061 to D-064](decisions/decision-register.md#d-061-deepseek-v41-two-node-production-defaults).
 
 Exactness on the pair: every gate run is bitwise. Greedy and DSpark windows equal the stored references on both
 ranks, batch tokens equal the campaign reference, and the server's token ids equal the reference in 64/64 requests.
@@ -108,8 +108,8 @@ N=8 +9.1 %; DSpark in the batch app +82 % at N=1, +53 % at N=2; DSpark in the se
 Exactness: without the trellis sites the split is bitwise equal to the pair-only run (61.7 tok/s, 24/24 prompts,
 6,144/6,144 tokens). With them (the 61.8 row) the RTX layers sum the trellis shared expert in IEEE order: a
 declared composed identity, checked against the pair (KL mean 1.7e-3, top-1 127/128), not bitwise. Evidence:
-[ds41-pipeline-stage.md](ds41-pipeline-stage.md), [ds41-cuda-trellis-shexp.md](ds41-cuda-trellis-shexp.md),
-[DECISIONS.md D-064](../DECISIONS.md#d-064-a-discrete-gpu-in-the-deepseek-v41-decode-rtx-split-opt-in).
+[pipeline-stages.md](models/deepseek-v4.1/pipeline-stages.md), [cuda-trellis-shexp.md](models/deepseek-v4.1/cuda-trellis-shexp.md),
+[docs/decisions/decision-register.md D-064](decisions/decision-register.md#d-064-a-discrete-gpu-in-the-deepseek-v41-decode-rtx-split-opt-in).
 
 **RTX PRO prompt reading, exact profile** (resident `strix-cuda-ds41-prefill-service`, 73.3 GB of experts pinned
 in host RAM and the rest read from NVMe, warm, model load excluded, median of 3; the exported attention state's
@@ -127,7 +127,7 @@ numbers are quoted as results.
 **Hot-expert placement** (all dense weights and ~80 GB of the hottest experts on the RTX PRO, a 10 GiB expert
 cache, the rest from `strix-deepseek41-expert-server` on the pair over 1 GbE): 40.1 tok/s greedy against 27.2
 pair-only, 256/256 tokens equal; measured on an earlier pair build (2026-10-21). Evidence:
-[ds41-hot-placement.md](ds41-hot-placement.md).
+[hot-placement.md](models/deepseek-v4.1/hot-placement.md).
 
 ### Dense format quality
 

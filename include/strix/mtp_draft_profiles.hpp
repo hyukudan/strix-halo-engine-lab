@@ -4,7 +4,7 @@
 #include <string_view>
 
 namespace strix {
-// Qualified MTP draft sidecars and their decode profile (docs/decode-defaults.md, D-055).
+// Qualified MTP draft sidecars and their decode profile (docs/engine/speculative/decode-defaults.md, D-055).
 //
 // The engine still takes every asset explicitly: a profile never chooses a file. It does two things:
 //   - names a qualified draft, so `--mtp-draft-profile NAME` fills that draft's identity and provenance pins

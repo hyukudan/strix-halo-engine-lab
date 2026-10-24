@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <string>
 
-// deepseek41 expert server (strix/ds41-expert-rpc-v1, docs/ds41-expert-server.md): keeps routed experts and computes
+// deepseek41 expert server (strix/ds41-expert-rpc-v1, docs/models/deepseek-v4.1/expert-server.md): keeps routed experts and computes
 // them for a parts-host (the device running the dense parts of every layer and its resident experts).
 //   One endpoint per rank ("direct"): strix-deepseek41-expert-server MODEL.gguf --listen HOST:PORT --token-file F
 //       [--experts FIRST:END] [--layers LIST] [--backend hip|host] [--busy-poll] [--keep-warm-us N] [--once] [--max-rows N]

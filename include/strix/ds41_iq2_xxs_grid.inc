@@ -1,5 +1,5 @@
 // IQ2_XXS grid entries: format data copied from ggml/src/ggml-common.h of
-// ggml-org/llama.cpp@552f18f912a32ea86edf82e2b76431cb7131538d (see SOURCES_LEDGER.md).
+// ggml-org/llama.cpp@552f18f912a32ea86edf82e2b76431cb7131538d (see docs/reference/sources-ledger.md).
 //
 // MIT License
 //

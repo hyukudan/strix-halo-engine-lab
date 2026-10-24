@@ -1,7 +1,7 @@
 #pragma once
 
 // Shared expert split over the two ranks on the trellis library (identity ds41-trellis-k5-v1:shexp-tp, declared in
-// docs/ds41-trellis-k5-v1.md; opt-in STRIX_DS41_SHEXP_TP=1 together with the trellis shexp class).
+// docs/models/deepseek-v4.1/trellis-k5-v1.md; opt-in STRIX_DS41_SHEXP_TP=1 together with the trellis shexp class).
 //
 // Rank r holds output rows [1152 r, +1152) of w1 (gate) and w3 (up) (TrellisSlice rows, 5120 -> 1152) and input columns
 // [1152 r, +1152) of w2 (down; TrellisSlice columns, 1152 -> 5120). Its partial P_r = L(w2_r, swiglu(L(w1_r, x), L(w3_r, x)))

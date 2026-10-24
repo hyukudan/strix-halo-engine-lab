@@ -20,7 +20,7 @@
 
 namespace strix {
 
-// Block-boundary prefix state cache (see docs/prefix-state-cache.md).
+// Block-boundary prefix state cache (see docs/engine/serving/prefix-state-cache.md).
 //
 // A checkpoint is the complete session state after the first P = k*T prompt tokens of a tiled
 // prefill (T = --known-prefix-prefill-rows), split into

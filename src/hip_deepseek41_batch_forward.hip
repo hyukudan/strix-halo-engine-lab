@@ -894,7 +894,7 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
                 m.headout = ds41::trellis_headout_enabled();
             }
         }
-        // attention projections (docs/ds41-trellis-k5-v1.md, q_b / o_a / o_b), the same linears as DeviceForward
+        // attention projections (docs/models/deepseek-v4.1/trellis-k5-v1.md, q_b / o_a / o_b), the same linears as DeviceForward
         m.trellis_attn.assign(c.num_hidden_layers, {});
         {
             const std::uint32_t first_rank = tp ? options.rank : 0U, ranks = tp ? 1U : 2U;

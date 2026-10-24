@@ -1,7 +1,7 @@
 #pragma once
 
 // deepseek41 CUDA backend, layer core: the sites outside attention and the routed experts (ds41_layer.hpp,
-// ds41_moe.hpp, ds41_formats.hpp), each reproducing its host reference bit for bit (docs/ds41-cuda-numeric-identity.md).
+// ds41_moe.hpp, ds41_formats.hpp), each reproducing its host reference bit for bit (docs/models/deepseek-v4.1/cuda-numeric-identity.md).
 // Conventions: cuda_ds41_common.hpp. All pointers are device pointers; outputs must not overlap inputs unless a call
 // says otherwise.
 
