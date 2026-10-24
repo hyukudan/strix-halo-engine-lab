@@ -3,7 +3,7 @@
 // ratio 1), indexer (query prep, FP4 scores, exact top-k with the candidate pool), D512 multi-query attention with
 // sinks, and the attention's own F16 projections (compressor kv / gate, indexer q_b / weights). The arithmetic of each
 // kernel is its host reference: ds41_attention.hpp (ds41::attn::*) and f16_rows of ds41_layer.hpp, so results are the
-// host's bits (docs/ds41-cuda-attention.md). Rows of one call are consecutive positions.
+// host's bits (docs/models/deepseek-v4.1/cuda-attention.md). Rows of one call are consecutive positions.
 //
 // Two levels:
 //  - kernel views (enqueue_*): device pointers only; nothing allocates or synchronizes;

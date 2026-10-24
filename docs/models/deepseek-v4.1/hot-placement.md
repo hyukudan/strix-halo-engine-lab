@@ -54,7 +54,7 @@ server of an AMD expert.
 
 `y = (shared + low) + high`; `low` folds the row's experts with id < `canonical_split` in ascending id starting
 from 0, `high` the rest likewise; each step is one FP32 product (weight times unweighted raw vector) then one
-FP32 add (`ds41-moe.md`). Adding a remote partial and a local partial of the same half changes the bits in
+FP32 add (`moe.md`). Adding a remote partial and a local partial of the same half changes the bits in
 general, so a remote target returns:
 
 - the raw (unweighted) FP32 vector of each (row, expert) it computes, which the parts-host places in its

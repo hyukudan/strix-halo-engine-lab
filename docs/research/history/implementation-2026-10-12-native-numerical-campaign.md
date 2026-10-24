@@ -49,7 +49,7 @@ independent fidelity and target execution.
 No model, GPU or network campaign was executed. Native operator fixtures and the
 independent transport commissioning runbook remain their own first-hardware gates.
 
-The [laboratory runbook](../lab/native_campaign/numerical/README.md) specifies
+The [laboratory runbook](../../../lab/native_campaign/numerical/README.md) specifies
 artifact schemas, exact exploratory thresholds, exit codes, private paths,
 resource bounds, API entry points and the trusted quiescent file/provenance
 limitations. A passed evaluator reports numerical evidence only, never native

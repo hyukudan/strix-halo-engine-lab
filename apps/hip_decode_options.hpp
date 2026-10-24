@@ -358,7 +358,7 @@ struct Options {
     std::uint32_t serving_prefill_rows = 0;
     std::uint64_t serving_prefill_workspace_budget = 0, serving_prefill_metadata_budget = 0;
     bool serving_prefill_explicit = false, serving_prefill_workspace_explicit = false, serving_prefill_metadata_explicit = false;
-    // Block-boundary prefix state cache on the tiled known-prefix prefill (docs/prefix-state-cache.md).
+    // Block-boundary prefix state cache on the tiled known-prefix prefill (docs/engine/serving/prefix-state-cache.md).
     // A positive host budget enables it; everything else is optional.
     std::uint64_t prefix_cache_host_bytes = 0;
     std::string prefix_cache_dir;
@@ -366,7 +366,7 @@ struct Options {
     std::uint64_t prefix_cache_every = 0;  // 0: every max(T, 4096) tokens, rounded to a multiple of T
     std::vector<std::string> prefix_cache_then_prompts;
     bool prefix_cache_disk_bytes_explicit = false, prefix_cache_every_explicit = false;
-    // HTTP serving (docs/serving.md): after the MTP calibration replay the process serves
+    // HTTP serving (docs/engine/serving/serving.md): after the MTP calibration replay the process serves
     // OpenAI/Anthropic-compatible requests until SIGINT/SIGTERM. The command-line prompt is the
     // calibration prompt only. Port 0 binds any free port (printed on stderr).
     bool http_serve = false;

@@ -1,6 +1,6 @@
 // Host references of the deepseek41 decode attention kernels. Every reduction is written lane by lane in the
 // device's order (32 lanes, lane l owns dims 16l..16l+15 of a 512 vector, xor butterflies 16..1), so the results
-// are the device's bits; see docs/ds41-attention.md for the declared order.
+// are the device's bits; see docs/models/deepseek-v4.1/attention.md for the declared order.
 #include "strix/ds41_attention.hpp"
 
 #include "strix/deepseek41_model.hpp"

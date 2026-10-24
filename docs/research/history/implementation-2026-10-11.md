@@ -48,5 +48,5 @@ without an explicitly supported tail representation.
 
 Compiler inspection, native correctness, full preparation costs, model fidelity,
 speculative state equivalence and cost per committed token remain separate gates.
-See the [precision proposal](proposals/2026-10-11-phase-specific-low-precision.md)
+See the [precision proposal](../proposals/2026-10-11-phase-specific-low-precision.md)
 and the portable experiment instructions under `lab/low_precision`.

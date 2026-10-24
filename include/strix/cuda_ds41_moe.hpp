@@ -4,7 +4,7 @@
 // (IQ2_XXS), the down projection (Q2_K) and the combine, as decode GEMVs (1 to 8 entries of an expert per pass) and
 // as a grouped GEMM over many rows (prefill, integer MMA). Conventions: cuda_ds41_common.hpp.
 //
-// Every result is the host reference's bit for bit (ds41_moe.hpp / ds41_formats.hpp, docs/ds41-cuda-numeric-identity.md):
+// Every result is the host reference's bit for bit (ds41_moe.hpp / ds41_formats.hpp, docs/models/deepseek-v4.1/cuda-numeric-identity.md):
 //  - each 32-weight group's integer dot of every (entry, output) is exact in int32 (DP4A or IMMA);
 //  - its FP32 term is the declared one: IQ2_XXS float(dot) * (scale * delta), scale = (d * (0.5 + s)) * 0.25;
 //    Q2_K (d * float(A) - dmin * float(B)) * delta;

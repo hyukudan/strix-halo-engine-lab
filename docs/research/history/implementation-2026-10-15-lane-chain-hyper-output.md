@@ -3,13 +3,13 @@
 Current status: this mode is included in the adopted canonical automatic v3
 profile at source `265fd78762884d18eb32aa60294408f080088d52`. Its combined
 native, complete554-array, generated512 and descriptive workload gates passed;
-see the [qualified adoption](decode-optimization-profile.md#qualified-adoption-2026-10-15)
+see the [qualified adoption](../../engine/decode/optimization-profile.md#qualified-adoption-2026-10-15)
 for scope and limits. The source-increment and fixture observations below retain
 their historical scope; their earlier pending gates are closed only for this
 qualified content/context/execution slice. Low-level manual selection stays explicit.
 
 The low-level `--lane-chain-hyper-output` flag remains OFF in
-`--optimization-profile manual` unless explicitly requested, and requires `--prefetch-q8-hyper-output` and its typed fused staged parallel prerequisites. It replaces only eligible HC output steps. Original normalization, low projection and injection remain unchanged. The content-bound [automatic decoder policy](decode-optimization-profile.md) now
+`--optimization-profile manual` unless explicitly requested, and requires `--prefetch-q8-hyper-output` and its typed fused staged parallel prerequisites. It replaces only eligible HC output steps. Original normalization, low projection and injection remain unchanged. The content-bound [automatic decoder policy](../../engine/decode/optimization-profile.md) now
 selects it with no low-level flags for the admitted eager/register checkpoint
 and context as part of the complete v3 bundle described in that policy.
 Automatic workload qualification is recorded in the adoption note above. Other checkpoints and

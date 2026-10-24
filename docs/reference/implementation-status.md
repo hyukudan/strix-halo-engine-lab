@@ -1,6 +1,6 @@
 # Implementation status
 
-Current cross-cutting summary: [qualification ledger](docs/qualification-ledger.md).
+Current cross-cutting summary: [qualification ledger](qualification-ledger.md).
 The slices below are retained implementation history, not native qualification.
 
 ## DeepSeek V4.1 Flash on two nodes and with a discrete GPU (2026-10-23)
@@ -8,7 +8,7 @@ The slices below are retained implementation history, not native qualification.
 - **Two Strix Halo nodes over USB4:** DeepSeek V4.1 Flash 1017 (2-bit routed experts, c-u6 dense overlay, trellis
   mix-B shared-expert and head sites) runs expert tensor parallel decode, expert parallel device prefill, DSpark
   speculative decode, batched decode and an OpenAI-compatible server (`strix-deepseek41-serve`). Production
-  defaults: [docs/ds41-production-defaults.md](docs/ds41-production-defaults.md); decisions D-061 to D-064.
+  defaults: [docs/models/deepseek-v4.1/production-defaults.md](../models/deepseek-v4.1/production-defaults.md); decisions D-061 to D-064.
 - **Measured** (production defaults, bitwise-gated runs): greedy 28.5 tok/s, DSpark 37.5 / 39.3 / 62.3 tok/s
   (EN / ES / code, 24 prompts), batch N=8 95.9 tok/s, device prefill 734 tok/s at 8K, server C1 / C4 / C8
   38.4 / 59.3 / 66.8 tok/s, 8K time to first token 15.8 s on an idle server.
@@ -19,8 +19,8 @@ The slices below are retained implementation history, not native qualification.
 
 ## Current state (2026-10-17, f429bd6)
 
-Speculative MTP decode path. Details: [README.md](README.md) and
-[DECISIONS.md](DECISIONS.md).
+Speculative MTP decode path. Details: [README.md](../../README.md) and
+[docs/decisions/decision-register.md](../decisions/decision-register.md).
 
 - **Target:** AMD Strix Halo `gfx1151` (Ryzen AI Max+ 395, 128 GB UMA), ROCm
   core-10.1. Model: Qwen3.8-Flash-Next (MoE, GDN recurrent layers, QSA indexed
@@ -57,7 +57,7 @@ Speculative MTP decode path. Details: [README.md](README.md) and
   cohort windows that read the projection, expert, HC and head weights once for all
   requests' rows; each request's
   tokens equal its single-request run. See
-  [docs/multi-request-cohort.md](docs/multi-request-cohort.md).
+  [docs/engine/scheduling/multi-request-cohort.md](../engine/scheduling/multi-request-cohort.md).
 - **Diagnostics:** `STRIX_CYCLE_TIMING=1` (host phase marks),
   `STRIX_CYCLE_LOG=1` (per-cycle window rows and wall time).
 
@@ -113,7 +113,7 @@ Implemented in `include/strix/gguf_reader.hpp` and `src/gguf_reader.cpp`: a
 defensive little-endian GGUF v3 reader and the `strix-inspect-gguf` CLI. It
 validates metadata, arrays, the tensor directory, block geometry, sizes,
 alignment, ranges and overlaps without loading weight data.
-Limitations and the canonical review are documented in `GGUF_READER.md`.
+Limitations and the canonical review are documented in `docs/reference/gguf-reader.md`.
 
 Current validation:
 
@@ -701,6 +701,6 @@ passed. Separate descriptive three-pair campaigns measured +25.99% over the
 preserved baseline and +15.55% over the preceding automatic profile on the same
 execution host. These are limited workload observations, not additive gains or
 statistical significance. See E-056 and
-[the adoption record](docs/decode-optimization-profile.md#qualified-adoption-2026-10-15).
+[the adoption record](../engine/decode/optimization-profile.md#qualified-adoption-2026-10-15).
 Earlier status entries retain their historical revision and scope. Source
 adoption does not imply remote binary deployment.

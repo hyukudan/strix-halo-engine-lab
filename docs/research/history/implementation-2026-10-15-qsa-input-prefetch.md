@@ -3,14 +3,14 @@
 Current status: this mode is included in the adopted canonical automatic v3
 profile at source `265fd78762884d18eb32aa60294408f080088d52`. Its combined
 native, complete554-array, generated512 and descriptive workload gates passed;
-see the [qualified adoption](decode-optimization-profile.md#qualified-adoption-2026-10-15)
+see the [qualified adoption](../../engine/decode/optimization-profile.md#qualified-adoption-2026-10-15)
 for scope and limits. The source-increment and fixture observations below retain
 their historical scope; their earlier pending gates are closed only for this
 qualified content/context/execution slice. Low-level manual selection stays explicit.
 
 The `--prefetch-q8-qsa-input` experiment changes only the loading schedule of Q8_0
 query, key, value, index-query and index-key projections. The low-level and manual
-defaults are off. The [automatic profile](decode-optimization-profile.md)
+defaults are off. The [automatic profile](../../engine/decode/optimization-profile.md)
 selects this mode only after its content and execution admission, within the
 automatic-workload qualification recorded above.
 All new kernels live in the original indexed-attention translation unit, with its

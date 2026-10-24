@@ -1,6 +1,6 @@
 #pragma once
 
-// QTIP-style trellis weights for the deepseek41 dense decode sites (identity ds41-trellis-k5-v1, docs/ds41-trellis-k5-v1.md).
+// QTIP-style trellis weights for the deepseek41 dense decode sites (identity ds41-trellis-k5-v1, docs/models/deepseek-v4.1/trellis-k5-v1.md).
 //
 // A pack directory holds dense.L<l>.safetensors (layers.<l>.attn.{wq_a,wq_b,wkv,wo_b}, layers.<l>.attn.wo_a.slice.<g>,
 // layers.<l>.ffn.shared_experts.{w1,w2,w3}) and dense.head.safetensors (head); each linear is four tensors:
@@ -28,7 +28,7 @@ namespace strix::ds41 {
 
 class SafetensorsCheckpoint;
 
-// The name of the single-pack K5 identity (docs/ds41-trellis-k5-v1.md). Engines announce the identity of the packs they
+// The name of the single-pack K5 identity (docs/models/deepseek-v4.1/trellis-k5-v1.md). Engines announce the identity of the packs they
 // prepared (trellis_step_identity / trellis_config_identity below), never this constant alone.
 inline constexpr const char* trellis_identity = "ds41-trellis-k5-v1";
 
@@ -107,7 +107,7 @@ private:
 // columns x K / 8 + 2 (columns + rows), with the slice's rows or columns.
 [[nodiscard]] std::uint64_t trellis_site_bytes(const TrellisTensorInfo& info, const TrellisSlice& slice = {});
 
-// ---- identities announced under single packs and mixes (docs/ds41-trellis-k5-v1.md, "Announced identity") ----
+// ---- identities announced under single packs and mixes (docs/models/deepseek-v4.1/trellis-k5-v1.md, "Announced identity") ----
 // A step's identity: ds41-trellis-k<K>-v1:<site> with the K of the pack that step reads (k5 = ds41-trellis-k5-v1).
 [[nodiscard]] std::string trellis_step_identity(std::uint32_t bits, const std::string& site);
 // The shared expert's step: gate / up (shexp_w13) and down (shexp_w2) may come from packs of different K in a mix:

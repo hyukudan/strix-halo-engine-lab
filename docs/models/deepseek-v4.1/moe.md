@@ -20,7 +20,7 @@ expert indices are `id - base`, for a rank that keeps only its own expert slice 
 
 ## Pipeline and declared arithmetic
 
-1. **Activations:** the A8 contract of `ds41-formats.md` on each row's MoE input.
+1. **Activations:** the A8 contract of `formats.md` on each row's MoE input.
 2. **Fused gate/up** (`enqueue_gate_up`, IQ2_XXS for the target model, MXFP4 for the draft stages): for every
    (row, slot) and intermediate output, the gate and up declared products, then
    `swiglu_clamped(g, u, limit) = (min(g, limit) / (1 + exp(-min(g, limit)))) * clamp(u, -limit, limit)`, with
@@ -39,7 +39,7 @@ as a single node; exchanging them and running the same combine gives the single-
 one half of the experts by id can equally send its finished half sum. (The model's reference applies the
 routing weight before the down projection; in exact arithmetic the two are equal.)
 
-All per-entry results are those of the declared products of `ds41-formats.md`: the lane, group order and
+All per-entry results are those of the declared products of `formats.md`: the lane, group order and
 butterfly of an (entry, output) do not depend on how many entries an expert has or on the kernel's tiling.
 
 ## Router and shared expert
@@ -62,7 +62,7 @@ butterfly of an (entry, output) do not depend on how many entries an expert has 
   `shared` term of the combine.
 - **Expert parallelism**: `restrict_routes` gives a rank the experts below or above the split; `enqueue_half_sum`
   forms its half of every row and `enqueue_canonical_sum` the combine from the two halves (see
-  `dist-communicator.md`); both ranks reproduce the single-node output bitwise.
+  `../../engine/transport/communicator.md`); both ranks reproduce the single-node output bitwise.
 
 ## Kernels
 

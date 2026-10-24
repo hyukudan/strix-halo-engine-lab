@@ -104,4 +104,4 @@ this route.
 
 ## Measured
 
-See DECISIONS.md (D-035).
+See docs/decisions/decision-register.md (D-035).

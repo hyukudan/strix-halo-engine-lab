@@ -11,7 +11,7 @@
 namespace strix::ds41 {
 
 // Format data of the IQ2_XXS layout, as published with the GGUF quantization types
-// (ggml-org/llama.cpp, ggml/src/ggml-common.h, MIT; see SOURCES_LEDGER.md).
+// (ggml-org/llama.cpp, ggml/src/ggml-common.h, MIT; see docs/reference/sources-ledger.md).
 const std::array<std::uint64_t, 256> iq2_xxs_grid{
 #include "strix/ds41_iq2_xxs_grid.inc"
 };

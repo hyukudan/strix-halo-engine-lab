@@ -5,7 +5,7 @@ weights; greedy verify protocol and window choice; not yet wired to the target m
 hidden states and verify windows come with the target runtime). Files: `include/strix/ds41_dspark.hpp`,
 `src/ds41_dspark.cpp` (host), `include/strix/hip_ds41_dspark.hpp`, `src/hip_ds41_dspark.hip` (device),
 fixtures `tests/ds41_dspark_tests.cpp` (CPU) and `tests/hip_ds41_dspark_tests.hip` (GPU). The routed and
-shared experts are the MoE window of `ds41-moe.md`.
+shared experts are the MoE window of `moe.md`.
 
 ## Model interface
 
@@ -35,7 +35,7 @@ uses the target's `token_embd` and `output`.
 ## Numerical identity `ds41-dspark-v1`
 
 Declared arithmetic, host = device bitwise:
-- Q8_0 linears: the A8 activation contract and the declared Q8_0 product of `ds41-formats.md`. The grouped
+- Q8_0 linears: the A8 activation contract and the declared Q8_0 product of `formats.md`. The grouped
   output projection is eight 4,096 -> 1,024 products, one per head group, run as a routes product.
 - Short F16/F32 dots (confidence, attention scores): FP32 products in the wave order (lane l sums terms
   l, l+32, ... from 0 in ascending order, then the butterfly `v[l] += v[l ^ d]`, d = 16..1).

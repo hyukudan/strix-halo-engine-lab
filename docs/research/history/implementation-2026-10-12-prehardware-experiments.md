@@ -2,7 +2,7 @@
 
 ## Integer projection
 
-The opt-in [integer projection lab](../lab/integer_projection/README.md) now
+The opt-in [integer projection lab](../../../lab/integer_projection/README.md) now
 implements Wave32 IU8/IU4 kernels, group-local activation preparation and ordered
 scale application. Q4_0 can use A8/IU8 and A4/IU4; IQ4_XS uses its nonlinear
 codebook decoded to signed I8, never raw nibble indices as IU4 values. Lossless

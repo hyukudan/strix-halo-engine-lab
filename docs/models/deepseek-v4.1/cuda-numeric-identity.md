@@ -94,7 +94,7 @@ Nothing in the layer core. Two remarks:
 ## Rules for the other CUDA pieces
 
 Attention (window ring, compressor, indexer, D512 attention with sink) and the routed experts (IQ2_XXS / Q2_K windows,
-combine) keep the identities of `ds41-attention.md` and `ds41-moe.md`: the same compiler flags, the shared
+combine) keep the identities of `attention.md` and `moe.md`: the same compiler flags, the shared
 host/device helpers of the headers, integer dots wherever the reference has them, and the reference's FP32 order for
 every reduction (lane classes and butterfly for the expert products, the attention's declared chunk orders, the
 two-half combine `(shared + low) + high`).

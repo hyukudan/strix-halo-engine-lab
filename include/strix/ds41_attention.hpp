@@ -2,7 +2,7 @@
 // deepseek41 decode attention (CSA2): sliding-window FP8 ring, ratio-2 / ratio-1 KV compression into an FP4 cache,
 // the FP4 indexer with ReLU-weighted head scores, top-k and the two-level candidate pool, and D512 multi-query
 // attention with a per-head sink. Host references whose arithmetic is the device kernels' declared order (see
-// docs/ds41-attention.md); the scalar helpers below are shared by host and device code.
+// docs/models/deepseek-v4.1/attention.md); the scalar helpers below are shared by host and device code.
 #include <array>
 #include <cstddef>
 #include <cstdint>

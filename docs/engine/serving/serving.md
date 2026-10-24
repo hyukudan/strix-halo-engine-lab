@@ -13,7 +13,7 @@ API routes) is host-only code with no GPU dependency; its contracts are tested w
 ## Starting the server
 
 Serving runs on the tiled MTP route, so it takes the flags of a tiled MTP request (see
-[prefix-state-cache.md](prefix-state-cache.md#mtp) and [mtp-native-cli.md](mtp-native-cli.md)) plus:
+[prefix-state-cache.md](prefix-state-cache.md#mtp) and [mtp-native-cli.md](../speculative/mtp-native-cli.md)) plus:
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -35,7 +35,7 @@ predictor, exactly as for a command-line request. Requests do not need to share 
 `--prefix-cache-every`, `--prefix-cache-dir`) apply across requests.
 
 The prompt may run a separate prefill profile (`--prefill-numerical-profile`, see
-[prefill-numerical-profile.md](prefill-numerical-profile.md)), for example the fast prefill profile
+[prefill-numerical-profile.md](../prefill/prefill-numerical-profile.md)), for example the fast prefill profile
 `fast-prefill-f16wmma-v1` with the dense-A8 decode profile and `--known-prefix-prefill-rows 8192` (T
 above 4096 needs `--known-prefix-host-metadata-budget-bytes` above the plan's metadata, about 286 MB
 at T = 8192). Its complete tiled blocks run the prefill profile; the calibration rows, the serial
@@ -84,17 +84,17 @@ window stream shared by all slots. The calibration replay runs once.
   weight-reading steps run once for all rows), with one the ordinary cycle. With five to eight requests,
   `STRIX_COHORT_ROWS=16 STRIX_COHORT_WIDE=all` runs the cycle as one group of up to 16 rows whose GDN/QSA
   projections, LM head and expert union run once for all rows (D-052,
-  [multi-request cohort](multi-request-cohort.md#global-row-budget-and-wide-steps-opt-in)).
+  [multi-request cohort](../scheduling/multi-request-cohort.md#global-row-budget-and-wide-steps-opt-in)).
   The experimental `STRIX_MTP_BATCH_JOINT=1` replaces that fixed per-request cap
   with a joint cost-based choice and supports shared dense steps through 32
-  rows; see [joint serving windows](joint-serving-windows.md). It is off by default.
+  rows; see [joint serving windows](../scheduling/joint-serving-windows.md). It is off by default.
 - A request leaves its slot when it ends (stop token, budget, context, stop string, disconnect), without stopping the
   others; its slot is free for the next queued request.
 - Greedy requests return exactly the tokens they return alone (and on the one-at-a-time route): every request keeps
   its own state and arithmetic, and the shared steps compute each row as the request's own window would.
 - `--http-sampling sample`: a request with `temperature > 0` samples with its own policy (`temperature`, `top_k`,
   `top_p`, `min_p`) and `seed` (random when absent), with speculative decisions on its drafts (D-040; on the GPU as
-  in [sampled-decoding.md](sampled-decoding.md)). Its tokens follow the target distribution exactly; they are not
+  in [sampled-decoding.md](../decode/sampled-decoding.md)). Its tokens follow the target distribution exactly; they are not
   the same tokens as alone, because the drafts per cycle depend on how many requests share the cycle.
 - Statistics per request are those of the one-at-a-time route; `prefill_ms` runs from admission to the first
   token (it includes the decode cycles interleaved with the prompt), `queue_ms` from submission to admission.

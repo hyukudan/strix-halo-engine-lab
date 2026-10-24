@@ -3,7 +3,7 @@
 This branch combines the wave router, Q8 indexed-attention input prefetch,
 lane-chain HC output, deferred MoE status and Q8 shared-expert prefetch increments.
 This initial integration preserved all low-level modes OFF by default. The later
-[automatic profile policy](decode-optimization-profile.md) selects a content-bound
+[automatic profile policy](../../engine/decode/optimization-profile.md) selects a content-bound
 v3 profile with wave, QSA, HC output, shared-expert prefetch and deferred status
 after exact content/mode admission; its later qualification is linked below. Manual mode preserves the
 original explicit configuration. The independent HC whole-projection
@@ -42,5 +42,5 @@ performance claim. The later source `265fd78762884d18eb32aa60294408f080088d52`
 passed its own native225, 14-module/245-kernel preservation, seven CLI cases,
 full554-array and clean generated512 gates and was adopted as primary. Its paired
 workload observations and limits are in the
-[automatic profile adoption record](decode-optimization-profile.md#qualified-adoption-2026-10-15).
+[automatic profile adoption record](../../engine/decode/optimization-profile.md#qualified-adoption-2026-10-15).
 Detailed private evidence remains outside Git.

@@ -715,7 +715,7 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
         };
         for (auto& s : m.plan.steps) {
             // shared expert (replicated on both ranks, its whole gate / up / down): F32 x -> gate, up -> clamped SwiGLU (F32)
-            // -> down, three trellis linears (docs/ds41-trellis-k5-v1.md, shexp)
+            // -> down, three trellis linears (docs/models/deepseek-v4.1/trellis-k5-v1.md, shexp)
             if (s.op == Op::shared_expert && ds41::trellis_class_enabled(m.trellis_classes, s.weights[0])) {
                 if (m.native_fp8.contains(s.weights[0]))
                     throw std::invalid_argument("deepseek41 device forward: shared expert both native FP8 and trellis");
@@ -758,7 +758,7 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
                 m.headout = ds41::trellis_headout_enabled();
             }
         }
-        // attention projections (docs/ds41-trellis-k5-v1.md, q_b / o_a / o_b): rank r's q_b rows [16384 r, +16384), o_a groups
+        // attention projections (docs/models/deepseek-v4.1/trellis-k5-v1.md, q_b / o_a / o_b): rank r's q_b rows [16384 r, +16384), o_a groups
         // [4 r, 4 r + 4) (one linear each), o_b K-half columns [4096 r, +4096); one process runs both ranks' linears
         m.trellis_attn.assign(m.model.config.num_hidden_layers, {});
         {

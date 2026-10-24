@@ -7,7 +7,7 @@ deployment inputs/results remain outside Git.
 
 ## Reproducible kernel and modules
 
-The [private kernel builder](../lab/direct_gpu_stream/kernel/README.md) verifies
+The [private kernel builder](../../../lab/direct_gpu_stream/kernel/README.md) verifies
 the pinned upstream archive and exact project patches, a hash-bound reviewed
 configuration, compiler/dependency identities and a fresh private workspace.
 It builds the complete kernel image, vmlinux and modules, runs actual modpost,
@@ -23,7 +23,7 @@ signing/enrollment, network configuration or physical reset is automatic.
 
 ## Independent experimental transport entry point
 
-[The commissioning executable](../lab/direct_gpu_stream/COMMISSIONING.md)
+[The commissioning executable](../../../lab/direct_gpu_stream/COMMISSIONING.md)
 connects the actual uncached HIP allocation/export, Linux UAPI, GPU
 packing/acquire/unpacking, peer control and cleanup paths. The receiver compares
 every acquired/unpacked byte before publishing consumer credit or reposting RX.

@@ -79,7 +79,7 @@ remain mandatory; this integration does not qualify speed or arbitrary models.
 
 `--mtp-sample-temperature`, `--mtp-sample-top-k`, `--mtp-sample-top-p`, `--mtp-sample-min-p`, `--mtp-sample-seed`,
 `--mtp-sample-speculation`, `--mtp-sample-schedule` and `--mtp-sample-repeats` select seeded sampling instead of
-greedy selection. They are described in [sampled-decoding.md](sampled-decoding.md).
+greedy selection. They are described in [sampled-decoding.md](../decode/sampled-decoding.md).
 
 ### Context n-gram extension of the draft chain
 

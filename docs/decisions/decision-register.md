@@ -7,19 +7,19 @@
 | D-001 | Build a dedicated inference engine for Strix Halo and Qwen3.8-Flash-Next. | Specializing for one platform and one model allows kernels, memory layout and scheduling that a general-purpose runtime cannot assume. | Scope confirmed by the owner. | Reopen only by explicit decision. |
 | D-002 | Retired. | Superseded by the publication policy in `AGENTS.md`. | — | — |
 | D-003 | Start with native Linux, ROCm and `gfx1151`. | It is the real target environment and allows hardware-specific optimization. | Target hardware (a Ryzen AI Max+ 395 mini PC). | Revisit after a first stable version. |
-| D-004 | Use GGUF as the initial input format. | Public format, weights available, no dependency on private formats. | `GGUF_READER.md`. | Measure a lossless internal cache later. |
-| D-005 | Quality and reproducibility are gates, not later tasks. | MTP, recurrence and quantization can produce misleading gains. | `docs/qualification-ledger.md`. | Permanent. |
+| D-004 | Use GGUF as the initial input format. | Public format, weights available, no dependency on private formats. | `docs/reference/gguf-reader.md`. | Measure a lossless internal cache later. |
+| D-005 | Quality and reproducibility are gates, not later tasks. | MTP, recurrence and quantization can produce misleading gains. | `docs/reference/qualification-ledger.md`. | Permanent. |
 | D-006 | The priority UI is a remote administration plane. | Operation, observability and benchmarks add more value than another chat client. | Scope confirmed by the owner. | Chat remains an optional integrated playground. |
 | D-007 | Build and compile offline before the hardware is available. | Validates toolchain, objects and contracts without pretending to have dynamic results. | E-015. | Revalidate everything on the real machine. |
 | D-008 | The first slice is AR + MTP, C1/C2/C4 and a qualified context below 262K. | Reduces numerical, memory and scheduling risk at the same time. | E-019, O-11. | Extend only after passing correctness, memory and stability. |
 | D-009 | Separate engine, gateway/chat and administration as privilege domains. | A convenient UI must not gain direct control of the GPU process or a shell. | O-14, O-15. | Permanent unless the threat model is revised. |
 | D-010 | Treat the official Qwen repository, paper and checkpoint as the primary architecture source. | Contracts are specified from the model's own definition. | E-020, E-021. | Reopen if Qwen publishes an incompatible revision; always pin the SHA. |
-| D-011 | Expose nearly the maximum GTT, but admit workloads with an independent effective reserve of 16–20 GiB. | GTT widens the mapping; it does not create RAM or protect the host from OOM. | E-022, `MEMORY_BUDGET.md`. | Adjust the reserve only with telemetry from the real hardware. |
+| D-011 | Expose nearly the maximum GTT, but admit workloads with an independent effective reserve of 16–20 GiB. | GTT widens the mapping; it does not create RAM or protect the host from OOM. | E-022, `docs/operations/memory-budget.md`. | Adjust the reserve only with telemetry from the real hardware. |
 | D-012 | Initially keep the 128 GiB single-node profile within an envelope of about 100 GiB of resident weights, until A0.6 justifies another limit. | Preserves the effective reserve and leaves room for KV, recurrence, scratch, runtime and recovery; avoids turning the maximum GTT into a load budget. | E-028, E-032, E-033. | Reopen after real UMA measurements and quality of the candidate quantizations. |
 | D-013 | Break QSA ties by the lowest block index when scores are identical. | The canonical forward uses `torch.topk`, whose tied indices are not guaranteed stable; the engine needs reproducible replay and the same rule in serial and MTP. | E-041, E-043 and fixture `qsa_tie`. | Reopen only if Qwen publishes an explicit, incompatible canonical tie-break. |
 | D-014 | Model each physical USB4 link as an autonomous transport with its own epoch, lease, TX/RX pools and accounting; dual-link mode is a policy above two qualified links. | Avoids assuming summed bandwidth, isolates failures and allows flow distribution, directional split or striping only with evidence of independence. | E-044 to E-047; docs 12 and 16. | Reopen only if the hardware shows an aggregate resource with common ownership/synchronization and an end-to-end benefit. |
-| D-015 | Keep low-level wave router selection OFF in manual mode; the content-bound automatic profile may select wave as part of the adopted v3 bundle after admission, with unchanged softmax/slot-order FP expressions, immutable preflight manifest admission and launcher-only K32; retain default/ranked alternatives. | Pointer identity to a validated owned deep copy avoids hot-path tensor scans and unsafe caches on mutable declared IDs. Raw GGUF rejects groups/bias before shape reduction; registration cannot inspect metadata absent from its API. | E-050; `docs/implementation-2026-10-15-wave-router-topk.md`; host oracle/admission checks. | Reopen for expressible grouped routing/bias, ISA changes, full-array mismatch or failure to improve measured latency. Canonical v3 target/model gates passed as recorded in E-056; other workloads remain separate. |
-| D-016 | Keep an opt-in C1 eager mode with a persistent first MoE error and completion before the token is published. | The domain and the complete bits keep the first error; a temporary copy of the host history avoids publishing position or n-grams on failure. KV/GDN stay in place, and a failure after dispatch poisons the session. | E-051; `docs/deferred-moe-status.md`. | Review, HIP, fixtures and fidelity of the canonical v3 slice closed in E-056; other cases need qualification. Reopen on numerical differences or no measured benefit. |
+| D-015 | Keep low-level wave router selection OFF in manual mode; the content-bound automatic profile may select wave as part of the adopted v3 bundle after admission, with unchanged softmax/slot-order FP expressions, immutable preflight manifest admission and launcher-only K32; retain default/ranked alternatives. | Pointer identity to a validated owned deep copy avoids hot-path tensor scans and unsafe caches on mutable declared IDs. Raw GGUF rejects groups/bias before shape reduction; registration cannot inspect metadata absent from its API. | E-050; `docs/research/history/implementation-2026-10-15-wave-router-topk.md`; host oracle/admission checks. | Reopen for expressible grouped routing/bias, ISA changes, full-array mismatch or failure to improve measured latency. Canonical v3 target/model gates passed as recorded in E-056; other workloads remain separate. |
+| D-016 | Keep an opt-in C1 eager mode with a persistent first MoE error and completion before the token is published. | The domain and the complete bits keep the first error; a temporary copy of the host history avoids publishing position or n-grams on failure. KV/GDN stay in place, and a failure after dispatch poisons the session. | E-051; `docs/engine/decode/deferred-moe-status.md`. | Review, HIP, fixtures and fidelity of the canonical v3 slice closed in E-056; other cases need qualification. Reopen on numerical differences or no measured benefit. |
 | D-020 | Prototype exact whole HC projection chains with explicit 32-thread launch bounds and P1/P2 prefetch; do not integrate before measurement. | Alternative: retain rows8; reduction splitting is excluded. Bound registers using actual compiler evidence, then compare hot and rotating real-weight copies. | E-055; implementation document and diagnostic fixtures. | Risk: dependency latency, cache bias or register pressure can dominate. Reopen after fresh ISA, device exactness and real event measurements; reject if no benefit. |
 
 D-017, D-018, D-019 and the follow-ups to D-015/D-016 are recorded as sections below. D-021 onward cover the
@@ -60,7 +60,7 @@ Rejections from the speculative decode work are in the "Measured and rejected" s
 ## Review format
 
 Every new decision states: alternatives, evidence, risk, consequence for the spec and the condition for
-reopening. Acceptance actions are linked here and in `DESIGN_ACCEPTANCE.md`.
+reopening. Acceptance actions are linked here and in `docs/research/history/2026-09-28-design-acceptance.md`.
 
 
 ## D-017 (2026-10-15): explicit indexed-attention Q8 input prefetch experiment
@@ -93,7 +93,7 @@ per-token reset may queue before serial preflight and is retained conservatively
 A zero-on-construction/dirty-state optimization needs owner recovery injection
 coverage before changing lifecycle semantics. Evidence: E-051. Reopen after
 native compiler/ISA, bounded async fixtures, model fidelity and paired workload
-measurements; see `DESIGN_ACCEPTANCE.md` and `docs/deferred-moe-status.md`.
+measurements; see `docs/research/history/2026-09-28-design-acceptance.md` and `docs/engine/decode/deferred-moe-status.md`.
 
 ## D-019 (2026-10-15): explicit Q8 shared-expert loading experiment
 
@@ -116,7 +116,7 @@ prefetch, shared-expert prefetch and deferred MoE status after metadata/content
 admission. Its own native, full-model fidelity and automatic workload gates passed
 at source `265fd78762884d18eb32aa60294408f080088d52` (E-056); manual flags and
 all existing fallback contracts are retained. This does not adopt unrelated
-projection prototypes or other checkpoints/contexts. See `docs/decode-optimization-profile.md`.
+projection prototypes or other checkpoints/contexts. See `docs/engine/decode/optimization-profile.md`.
 
 D-015 qualified adoption: fast-forward primary source to the exact qualified v3
 revision above, without another code change. Alternatives were retaining the
@@ -145,7 +145,7 @@ Why: a single-token forward is bandwidth bound at ~41 ms; a window reads each we
 verifying T tokens costs far less than T forwards. Before this work a fixed R2 window ran at 15 tok/s, slower
 than plain decode (19.4), because HC, the MoE union and the LM head ran per row. Alternative: tolerance-based
 verification. Rejected because it gives up output identity, which is this engine's correctness gate (D-005).
-Each kernel package has a bitwise test against the 1-row kernel (see `docs/VERIFY_WINDOW_PLAN.md`). Reopen
+Each kernel package has a bitwise test against the 1-row kernel (see `docs/engine/speculative/verify-window-plan.md`). Reopen
 only for sampled (non-greedy) decoding.
 
 ## D-022: adaptive window size {2,4,8} with an online cost model
@@ -297,7 +297,7 @@ keeps dense A8 recommended, under these conditions:
 blocks, or every MTP prompt row); `--numerical-profile` keeps selecting decode, MTP windows and checkpoints.
 Without the flag the prefill uses `--numerical-profile`, and tokens and every existing receipt field are
 unchanged. Admitted today: the dense-A8 sibling of the decode profile, in both directions (see
-[docs/prefill-numerical-profile.md](docs/prefill-numerical-profile.md)).
+[docs/engine/prefill/prefill-numerical-profile.md](../engine/prefill/prefill-numerical-profile.md)).
 
 The prefill runs a second serial execution compiled from the same requests with only dense A8 changed; the two
 are checked to be siblings (same steps, state access, IO and arena layout). The session is handed to the prefill
@@ -340,7 +340,7 @@ a background thread overlapping the next block and is drained before the staging
 runs serially through the same consumer. File format, row order, footer and score rows are unchanged. Rows
 of complete blocks carry the prefill profile, suffix rows the decode profile; the receipt records the route,
 the row counts per route and both profiles (see
-[docs/teacher-forced-tiled-prefill.md](docs/teacher-forced-tiled-prefill.md)).
+[docs/engine/prefill/teacher-forced-tiled-prefill.md](../engine/prefill/teacher-forced-tiled-prefill.md)).
 
 ## D-035: block-boundary prefix state cache
 
@@ -354,7 +354,7 @@ stored per checkpoint. Keys chain SHA-256 over T-token blocks from an identity t
 layout and context, runtime compatibility, decode, prefill-sibling and tiled-plan execution and kernel-plan
 identities, both numerical profiles and their pair, T, the tail sizes and (disk tier) the executable. Host
 tier: pinned memory with LRU in a byte budget; disk tier: checksummed segment/checkpoint files written behind
-the request. See [docs/prefix-state-cache.md](docs/prefix-state-cache.md).
+the request. See [docs/engine/serving/prefix-state-cache.md](../engine/serving/prefix-state-cache.md).
 
 Two pieces were needed around it. `--known-prefix-tail-rows T2[,T3...]` runs the remainder after the last
 T-row block as complete blocks of the largest tail size that fits, before the serial rows: serial prompt rows
@@ -401,7 +401,7 @@ and `v_wmma_f32_16x16x16_f16` accumulates over the whole K in FP32 without a per
 fused into the gate/up epilogue; merge and commit are unchanged. CSR batches hold up to 64 assignments of one
 expert; a CTA covers 128 outputs of both gate and up (down: 256 outputs), every wave owns all rows of the batch,
 B tiles are staged in LDS once per K step of 64 and the next two K steps load while one computes. See
-[docs/prefill-numerical-profile.md](docs/prefill-numerical-profile.md).
+[docs/engine/prefill/prefill-numerical-profile.md](../engine/prefill/prefill-numerical-profile.md).
 
 Why: the A8 contract's per-group FP32 epilogue (8 VALU operations per element and group, not overlapped with
 the matrix products) bounds the iu8 WMMA kernels at 9–13 TOPS; FP16 products with FP32 accumulation over K have
@@ -440,7 +440,7 @@ by default) attend over the union of their selected blocks, each (row, token) pa
 selection and causal prefix, with FP16 WMMA scores and values, an online FP32 softmax and the exact path's
 BF16 output roundings and gate. Indexer, selection, KV store and the output projection are unchanged; serial
 tiles and MTP prompt rows keep the exact attention. See
-[docs/prefill-numerical-profile.md](docs/prefill-numerical-profile.md).
+[docs/engine/prefill/prefill-numerical-profile.md](../engine/prefill/prefill-numerical-profile.md).
 
 Why: the exact grouped kernels read every selected K and V row once per prompt row (about 2050 tokens of
 1 KiB per KV head) with 2-byte lane loads and FP32 VALU arithmetic. Consecutive rows select largely the same
@@ -490,7 +490,7 @@ routed expert union, HC mixers, router, LM head, shared-expert projections and t
 once for the rows of all requests on an idle owner of the total rows, while GDN recurrence, QSA KV
 append/selection/attention, PLE, embedding, combine and injections run per request from its own state. Each
 request then accepts, commits and publishes as after its own window (see
-[docs/multi-request-cohort.md](docs/multi-request-cohort.md)).
+[docs/engine/scheduling/multi-request-cohort.md](../engine/scheduling/multi-request-cohort.md)).
 
 Why: decode is bandwidth bound, and one window reads its weights once for all rows; rows of other requests
 fill a window without the acceptance risk of longer draft chains. The shared steps already compute every
@@ -527,7 +527,7 @@ absolute position and draw class, so a position draws the same values in a windo
 replay. Window rows are decided in order before any row is published; prefix acceptance is unchanged (an input
 is kept only when the previous row's decision accepted it). With the default `fixed` schedule, window and draft
 lengths depend on draft probabilities only, so a run is reproducible from its seed; `adaptive` keeps the
-measured-cost choices. See [docs/sampled-decoding.md](docs/sampled-decoding.md).
+measured-cost choices. See [docs/engine/decode/sampled-decoding.md](../engine/decode/sampled-decoding.md).
 
 Why: greedy-only decoding excluded every temperature > 0 use. The rule keeps the output distribution exactly the
 target's for any draft. Alternative: drafter-invariant coupling (one shared noise for target and draft, so tokens
@@ -695,14 +695,14 @@ nothing enqueued, when its views do not chain or alias; component fixtures (`str
 gives identical tokens with replay error 0 with each fold and with all. A kernel trace per window shows -138
 dispatches and about -0.5 ms (about 1 %), within the noise of single smoke runs, so all three stay off by default.
 The remaining dependent steps need grid-wide dependencies, so local folds cannot reach the 2-4 ms per window
-that was hoped for. See [docs/window-step-folds.md](docs/window-step-folds.md).
+that was hoped for. See [docs/engine/kernels/window-step-folds.md](../engine/kernels/window-step-folds.md).
 
 ## D-045: HTTP serving on the tiled MTP route
 
 `--http-serve` keeps one decoder process: model, MTP assets and the predictor qualification (calibration
 replay of the command-line prompt) are set up once, then OpenAI-compatible (`/v1/chat/completions`,
 `/v1/completions`) and Anthropic-compatible (`/v1/messages`) requests run one at a time, with streaming,
-health, Prometheus metrics and a JSON status (docs/serving.md). Each request starts exactly like the
+health, Prometheus metrics and a JSON status (docs/engine/serving/serving.md). Each request starts exactly like the
 command-line request after calibration: fresh target state and session, fresh predictor, and the verify
 windows drop any deferred GDN rows of the previous request (`HipMtpWindowVerifier::begin_session`); the
 prefix state cache spans requests. The tokenizer (byte-level BPE with the model's split rule) and the chat
@@ -731,7 +731,7 @@ slices, snapshots, MTP checkpoints and rollbacks) derives from it; it enters the
 identities (prefix-cache keys), the indexed-attention implementation identity and the MTP golden's recorded
 target profile pair, and the receipt (`attention_kv_storage`, `attention_kv_bytes_per_token`,
 `attention_kv_storage_qualification: not_assessed`). Without the flag nothing changes. The MTP head keeps its
-BF16 KV cache; the indexer never reads the KV cache. See [docs/attention-kv-int8.md](docs/attention-kv-int8.md).
+BF16 KV cache; the indexer never reads the KV cache. See [docs/engine/decode/attention-kv-int8.md](../engine/decode/attention-kv-int8.md).
 
 Why: the KV cache is the per-token state that grows with context; halving it doubles the context that fits in a
 given state budget and halves the KV bytes the score/value kernels read. The quantizer's maximum is
@@ -768,7 +768,7 @@ verify window (no new window shape). Every row is verified by the target, so tok
 the predictor cache is rebuilt from committed target rows as after any rejected draft. A per-request
 acceptance table, fed by scoring every cycle's would-be extension against the emitted tokens (host only,
 prior 0.2), gates it: rows are proposed only while the first row's learned acceptance is at least 0.5, they
-size the window with that acceptance and stay out of the draft calibration (docs/mtp-native-cli.md). It works with
+size the window with that acceptance and stay out of the draft calibration (docs/engine/speculative/mtp-native-cli.md). It works with
 the D-022 controller only: the survival controller (D-041) rejects it.
 
 Why: requests that copy their context (correcting a given document, edits) have long exact continuations
@@ -792,7 +792,7 @@ the same 6-bit codes and scales. Every Q6P32 block is an exact Q8_0 block, so th
 bits of the Q8_0 kernels on the emulated file; `STRIX_Q6P=0` keeps every launcher on its Q8_0 kernel for A/B
 on one file. Covered: the dense A8 profile's 1-8 row projections, the FP32 rows and R1 projections, LM head
 rows up to 4 and R1, HC split-K and lane chain, and the router logits; prefill and LM head windows of more
-than four rows keep the Q8_0 tensors. See [docs/dense-q6p32-weights.md](docs/dense-q6p32-weights.md).
+than four rows keep the Q8_0 tensors. See [docs/engine/kernels/dense-q6p32-weights.md](../engine/kernels/dense-q6p32-weights.md).
 
 Checked: fixtures equal Q8_0 bit for bit (1036 exact and 528 dense A8 cases with the Q8_0 tensor poisoned,
 registry hits proving the copies were read); MTP 256 tokens with the Q8_0 kernels' golden: tokens identical
@@ -818,7 +818,7 @@ rows the register form stays. Checked: 36 HC fixture cases and 256 MTP tokens id
 ## D-050: sampled decisions on the GPU (default)
 
 With `--mtp-sample-temperature` above zero, target rows (window and serial) and the draft chain are decided on
-the device with the host sampler's transform, order and random stream (docs/sampled-decoding.md). Kept sets
+the device with the host sampler's transform, order and random stream (docs/engine/decode/sampled-decoding.md). Kept sets
 of at most 2048 entries are compacted in token id order and decided by one workgroup with the host's own
 sequence; larger sets use a fixed two-level partition, and a top-p prefix needing more than 2048 entries is
 decided on the host. The draft chain samples each step right after the draft head on the same stream and
@@ -847,7 +847,7 @@ prompt are cohort cycles. The command line exposes it as `--mtp-cohort-request T
 this route: the target sampler is per request (replaceable on an idle producer), the tiled prompt's last row
 selects through it, cohort windows install each sampled request's row selection on its capture and pass its draft
 distributions; `--http-sampling sample` samples with each request's policy and seed. See
-[docs/serving.md](docs/serving.md#batched-decoding) and [docs/multi-request-cohort.md](docs/multi-request-cohort.md).
+[docs/engine/serving/serving.md](../engine/serving/serving.md#batched-decoding) and [docs/engine/scheduling/multi-request-cohort.md](../engine/scheduling/multi-request-cohort.md).
 
 Why: the server ran one request at a time, so concurrent clients only queued, and cohort windows (the decode-side
 batching) were limited to the serial prompt route (4097 tokens, about 70 ms per prompt token). Alternative: one
@@ -881,7 +881,7 @@ output projections (dense A8, 16-row WMMA tiles, padded to 16 or 32 rows with ro
 and write a sink), the LM head (unstaged launches of up to 16 rows) and the routed expert union (CSR per row count,
 down in batches of at most 8 assignments). Recurrence, attention, PLE, combines and injections stay per session;
 HC, router and shared expert per chunk (their per-layer weights are re-read from the MALL). It applies to the
-command-line cohort and to `--http-batch` alike. See [docs/multi-request-cohort.md](docs/multi-request-cohort.md).
+command-line cohort and to `--http-batch` alike. See [docs/engine/scheduling/multi-request-cohort.md](../engine/scheduling/multi-request-cohort.md).
 
 Why: an independent request shares few experts with another (on six prompts' route logs the union of N requests'
 windows is 72-95 % of their separate expert bytes), so the gain of fusing is the fixed weights read once per cycle
@@ -917,8 +917,8 @@ calibration rows are serial decode rows, so their golden records the decode prof
 single-profile golden of the decode profile is the same file. Every batched slot builds its own sibling scratch
 view, prefill owners (prefill launcher configuration over its own state, PLE and launchers; the prefill arenas stay
 shared) and handoffs. The setup's UMA growth estimate counts each slot's copy of the plan metadata (285.8 MB at
-T = 8192). See [docs/prefill-numerical-profile.md](docs/prefill-numerical-profile.md) and
-[docs/serving.md](docs/serving.md).
+T = 8192). See [docs/engine/prefill/prefill-numerical-profile.md](../engine/prefill/prefill-numerical-profile.md) and
+[docs/engine/serving/serving.md](../engine/serving/serving.md).
 
 Why: the server read prompts with the dense profile (about 650-830 tok/s), while the fast profile reads them at
 about 850-1000 tok/s on the same tiled route. Alternative: the serial MTP prompt's split (every prompt row on the
@@ -951,7 +951,7 @@ and the weights (HC, router, routed expert union, inject and combine; `STRIX_PRO
 segment's rows, and every other step (GDN, QSA, PLE, shared expert, row loops, the terminal head) runs per segment
 exactly as the segment's block alone. Each request keeps its own unit sequence, state, PLE history, predictor rows,
 terminal logits and lineage (the producer of its own block of that size). Serial units and lone blocks run alone;
-decode cycles stay separate. See [docs/prompt-batch.md](docs/prompt-batch.md).
+decode cycles stay separate. See [docs/engine/prefill/prompt-batch.md](../engine/prefill/prompt-batch.md).
 
 Why: with concurrent requests the server ran their prompts one block at a time, re-reading every routed expert per
 block; the union of several blocks reads each expert once. Alternatives not taken: concatenating the prompts as one
@@ -974,7 +974,7 @@ error). Without `--mtp-spec-min-p`, a run with a window row set takes the profil
 base draft (D-022), 0.7 for the distilled drafts; an unprofiled sidecar keeps 0.5. `--mtp-ngram-draft` becomes
 `on|off|auto`, default `auto`: on wherever it is admissible (greedy, one request, prefix windows, the D-022
 controller), including each `--http-serve` request (`"ngram_draft"` request field); its learned per-request gate
-opens only when the output copies the context. See [docs/decode-defaults.md](docs/decode-defaults.md).
+opens only when the output copies the context. See [docs/engine/speculative/decode-defaults.md](../engine/speculative/decode-defaults.md).
 
 Why: the final campaign (same binary and node, 8 workloads, 256 tokens) measured distillG at min-p 0.7 at +10.0 %
 decode over the base draft at 0.85 (geometric mean; English/Spanish prose +14-15 %), distillD at 0.7 +8.2 %, and
@@ -1036,7 +1036,7 @@ from the measured costs of the whole topology and each slot's acceptance history
 admitted); a request may also skip drafting for a cycle and commit one row. HC, router and shared expert run as
 wide steps of up to 32 rows next to the existing GDN/QSA/head projections and expert union. One request keeps its
 own route. The switch is off in the code; the production replicas set it. See
-[joint serving windows](docs/joint-serving-windows.md).
+[joint serving windows](../engine/scheduling/joint-serving-windows.md).
 
 Why: the earlier server capped each request at R4 with two requests and R2 with three or more, and a 6-row cycle
 (R4 + R2) ran as two separate chunks that each read all dense weights (7 of 19 cycles at C2 in a trace).
@@ -1059,7 +1059,7 @@ noisy (68.8-91.0 tok/s in the control arm) to attribute its median change to the
 
 `STRIX_QPERSIST_DRAFT_SCORE=1`, `STRIX_QPERSIST_QSA_TAIL=1` and `STRIX_QPERSIST_MTP_CACHE=1` run the MTP QK score,
 the QSA softmax/value/gate tail and the draft cache publication as single workgroup kernels with the same reduction
-trees and roundings ([details](docs/qwen-persistence-kernels.md)). The switches are off in the code; the production
+trees and roundings ([details](../models/qwen3.8/persistence-kernels.md)). The switches are off in the code; the production
 replicas set the three. `STRIX_QPERSIST_GDN_TAIL` stays off: a traced R8 regression.
 
 Measured on one node, 3 interleaved plans, 256 tokens, on top of the production decode set: code1k 59.34 → 59.88
@@ -1088,7 +1088,7 @@ C6 and C8 now scale past C4. Token ids equal one node's in all 570 responses.
 The two-node DeepSeek-V4.1 apps default to the configuration measured as a gain and exact in the P17.1 timing
 campaign (132 timed runs, 3 interleaved rounds per arm, every run's tokens checked against its identity's
 reference) and the P17.2-P17.4 gates. The full table, the environment of the production identity and the opt-outs
-are in [docs/ds41-production-defaults.md](docs/ds41-production-defaults.md).
+are in [docs/models/deepseek-v4.1/production-defaults.md](../models/deepseek-v4.1/production-defaults.md).
 
 | Default | Effect (measured against all on) |
 | --- | --- |

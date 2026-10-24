@@ -66,6 +66,6 @@ the partial request and are reported separately from device failures. The observ
 must complete every future it returns. Its device execution still requires native qualification.
 
 The service's experimental `--handoff-v2 --state-identity ID` enables the framed transport with bounded passes.
-See [the v2 contract](ds41-state-transfer-v2.md). Its Windows SHA provider is checked against known answers before
+See [the v2 contract](state-transfer-v2.md). Its Windows SHA provider is checked against known answers before
 load. CPU transport tests preserve original state hashes through complete reconstruction and lost acknowledgements.
 These transport checks do not qualify model execution, a decode import, or final handoff latency.

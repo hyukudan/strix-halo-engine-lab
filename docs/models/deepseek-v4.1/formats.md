@@ -42,7 +42,7 @@ zero, with the group term
 and the lanes combine as `v[l] = v[l] + v[l ^ d]` for d = 16, 8, 4, 2, 1 (the result is lane 0). The integer
 sums are exact (`v_dot4_i32_iu8`), so the only roundings are the listed FP32 operations. `product_iq2_xxs`,
 `product_q2_k` and `product_mxfp4` evaluate exactly this on the host. Products take 1 to 8 activation rows and a
-list of experts in one launch, or the window routes of ds41-moe.md.
+list of experts in one launch, or the window routes of moe.md.
 
 ## Qualification
 
@@ -54,7 +54,7 @@ list of experts in one launch, or the window routes of ds41-moe.md.
   and 8 rows over three experts in reversed order; and real blocks of the pinned files when `STRIX_DS41_Q2_GGUF`
   and `STRIX_DS41_DSPARK_GGUF` are set (whole experts 0/191/383 of the gate, up and down tensors of layers 0, 1, 20
   and 39; experts 0/64/127 of the three draft stages; 4096 random rows of each Engram table).
-- `STRIX_DS41_BENCH=1` times whole routed-expert windows with cold caches; see `ds41-moe.md`, which also covers
+- `STRIX_DS41_BENCH=1` times whole routed-expert windows with cold caches; see `moe.md`, which also covers
   the window kernels that now implement these products (activation rows staged in LDS, several weight rows per
   wave, each weight group decoded once for every row). One-row products read at the scattered-read rate of the
   device (about 220 GB/s).

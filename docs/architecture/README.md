@@ -41,55 +41,55 @@ A wider kernel, larger speculative window, second node or second physical link i
 
 ## Documents
 
-- [Engine reference](ENGINE.md): build options, complete command line, prompt prefill, draft vocabularies,
+- [Engine reference](../getting-started/engine-reference.md): build options, complete command line, prompt prefill, draft vocabularies,
   environment switches and repository layout (moved from the top-level README).
 
-- [01 — Target platform](architecture/01-target-platform.md)
-- [02 — Memory and residency](architecture/02-memory-and-residency.md)
-- [03 — Model loading and weight layout](architecture/03-model-loading-and-weight-layout.md)
-- [04 — Execution model and graphs](architecture/04-execution-and-graphs.md)
-- [05 — Kernel design](architecture/05-kernel-design.md)
-- [06 — Quantization and numerical rules](architecture/06-quantization-and-numerics.md)
-- [07 — KV, recurrent state and snapshots](architecture/07-state-kv-and-recurrence.md)
-- [08 — Scheduling and concurrency](architecture/08-scheduling-and-concurrency.md)
-- [09 — Speculative decoding](architecture/09-speculative-decoding.md)
-- [10 — Benchmarking and qualification](architecture/10-benchmarking-and-qualification.md)
-- [11 — Runtime observability and recovery](architecture/11-runtime-observability-and-recovery.md)
-- [12 — Multi-node and USB4 interconnect](architecture/12-multi-node-and-usb4.md)
-- [13 — Platform discovery and capability negotiation](architecture/13-platform-discovery.md)
-- [14 — Implementation roadmap](architecture/14-implementation-roadmap.md)
-- [15 — Optimization strategy](architecture/15-optimization-strategy.md)
-- [16 — Direct GPU transport over USB4](architecture/16-direct-gpu-transport.md)
+- [01 — Target platform](01-target-platform.md)
+- [02 — Memory and residency](02-memory-and-residency.md)
+- [03 — Model loading and weight layout](03-model-loading-and-weight-layout.md)
+- [04 — Execution model and graphs](04-execution-and-graphs.md)
+- [05 — Kernel design](05-kernel-design.md)
+- [06 — Quantization and numerical rules](06-quantization-and-numerics.md)
+- [07 — KV, recurrent state and snapshots](07-state-kv-and-recurrence.md)
+- [08 — Scheduling and concurrency](08-scheduling-and-concurrency.md)
+- [09 — Speculative decoding](09-speculative-decoding.md)
+- [10 — Benchmarking and qualification](10-benchmarking-and-qualification.md)
+- [11 — Runtime observability and recovery](11-runtime-observability-and-recovery.md)
+- [12 — Multi-node and USB4 interconnect](12-multi-node-and-usb4.md)
+- [13 — Platform discovery and capability negotiation](13-platform-discovery.md)
+- [14 — Implementation roadmap](14-implementation-roadmap.md)
+- [15 — Optimization strategy](15-optimization-strategy.md)
+- [16 — Direct GPU transport over USB4](16-direct-gpu-transport.md)
 
 ## Speculative decode path
 
-- [Multi-row verify window: design and status](VERIFY_WINDOW_PLAN.md).
-- [MTP command line](mtp-native-cli.md) and [MTP runtime contract](mtp-native-runtime.md).
-- [Decode defaults](decode-defaults.md): draft profiles (`--mtp-draft-profile`), min-p by draft identity and the n-gram extension in `auto` (D-055).
-- [Known-prefix window](known-prefix-window.md).
-- [Automatic decode optimization profile](decode-optimization-profile.md).
-- [Several requests in one decode loop (cohort windows)](multi-request-cohort.md).
-- [Serving over HTTP](serving.md).
+- [Multi-row verify window: design and status](../engine/speculative/verify-window-plan.md).
+- [MTP command line](../engine/speculative/mtp-native-cli.md) and [MTP runtime contract](../engine/speculative/mtp-native-runtime.md).
+- [Decode defaults](../engine/speculative/decode-defaults.md): draft profiles (`--mtp-draft-profile`), min-p by draft identity and the n-gram extension in `auto` (D-055).
+- [Known-prefix window](../engine/prefill/known-input-windows.md).
+- [Automatic decode optimization profile](../engine/decode/optimization-profile.md).
+- [Several requests in one decode loop (cohort windows)](../engine/scheduling/multi-request-cohort.md).
+- [Serving over HTTP](../engine/serving/serving.md).
 
 The decisions behind this path (D-021 to D-031, and the measured rejections) are in
-[`DECISIONS.md`](../DECISIONS.md).
+[`docs/decisions/decision-register.md`](../decisions/decision-register.md).
 
 ## Draft investigations
 
-- [Current qualification ledger](qualification-ledger.md).
-- [Portable correctness and precision foundations](implementation-2026-10-11.md).
-- [Optimization lifetime implementation](implementation-2026-10-12-optimization-lifetimes.md).
-- [Pre-hardware experiments](implementation-2026-10-12-prehardware-experiments.md).
-- [Reusable execution components](implementation-2026-10-12-execution-components.md).
-- [Complete C1 graph and GPU export prerequisites](implementation-2026-10-12-complete-graph-and-export.md).
-- [Device-dynamic GDN and indexed attention](implementation-2026-10-12-dynamic-state-operators.md).
-- [Experimental tiled integer LM-head consumer](implementation-2026-10-12-integer-runtime.md).
-- [Hardware campaign preparation](implementation-2026-10-12-hardware-campaign-preparation.md).
-- [Native numerical campaign preparation](implementation-2026-10-12-native-numerical-campaign.md).
-- [Eager RAW baseline recording](implementation-2026-10-12-raw-baseline-recording.md).
-- [Complete-model experimental decode recording](implementation-2026-10-12-decode-execution-modes.md).
-- [Phase specific packed weights and integer execution](proposals/2026-10-11-phase-specific-low-precision.md).
-- [Execution optimization gates](proposals/2026-10-12-execution-optimization-gates.md).
+- [Current qualification ledger](../reference/qualification-ledger.md).
+- [Portable correctness and precision foundations](../research/history/implementation-2026-10-11.md).
+- [Optimization lifetime implementation](../research/history/implementation-2026-10-12-optimization-lifetimes.md).
+- [Pre-hardware experiments](../research/history/implementation-2026-10-12-prehardware-experiments.md).
+- [Reusable execution components](../research/history/implementation-2026-10-12-execution-components.md).
+- [Complete C1 graph and GPU export prerequisites](../research/history/implementation-2026-10-12-complete-graph-and-export.md).
+- [Device-dynamic GDN and indexed attention](../research/history/implementation-2026-10-12-dynamic-state-operators.md).
+- [Experimental tiled integer LM-head consumer](../research/history/implementation-2026-10-12-integer-runtime.md).
+- [Hardware campaign preparation](../research/history/implementation-2026-10-12-hardware-campaign-preparation.md).
+- [Native numerical campaign preparation](../research/history/implementation-2026-10-12-native-numerical-campaign.md).
+- [Eager RAW baseline recording](../research/history/implementation-2026-10-12-raw-baseline-recording.md).
+- [Complete-model experimental decode recording](../research/history/implementation-2026-10-12-decode-execution-modes.md).
+- [Phase specific packed weights and integer execution](../research/proposals/2026-10-11-phase-specific-low-precision.md).
+- [Execution optimization gates](../research/proposals/2026-10-12-execution-optimization-gates.md).
 
 The proposal is not native qualification or an adopted numerical mode.
 

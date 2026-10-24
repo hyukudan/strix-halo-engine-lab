@@ -55,7 +55,7 @@ exact and the emitted tokens are bit-identical to serial decode.
    older per-row selectors).
 7. One hipGraph per T plus a commit graph. **Dropped:** a measured per-kernel cost of 1.98 vs 1.82 µs did not
    pay for capture and the input plumbing. Independent kernels use any-order launches instead (see
-   [DECISIONS.md](../DECISIONS.md)).
+   [docs/decisions/decision-register.md](../../decisions/decision-register.md)).
 8. MTP teacher forcing from the window's final residual rows, catching up only the accepted rows; Q4_0 copies
    of the MTP draft projections; window length chosen from draft probability (`--mtp-spec-min-p`) and an online
    tokens-per-ms cost model. **Done.** Q4_0 draft copies are on by default (`STRIX_MTP_DRAFT_Q4_ALL=0`

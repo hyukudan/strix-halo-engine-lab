@@ -5,7 +5,7 @@ startup): `1` on, `0` off; unset, the two-rank `DeviceForward` (decode steps and
 when the layout allows it (two ranks, resident experts, I = 2304; `expert_tp::decode_enabled`), and the server keeps it
 off (its device prefill reads the decode weights in place). The host reference (`HostForward`,
 `strix-deepseek41-trimmed`) follows only an explicit `1`. With `0` every path keeps the expert-parallel identity
-(`combine-shared+low-half+high-half-ascending-id-v1`, `ds41-moe.md`) and its bits. Files: `include/strix/ds41_expert_tp.hpp`,
+(`combine-shared+low-half+high-half-ascending-id-v1`, `moe.md`) and its bits. Files: `include/strix/ds41_expert_tp.hpp`,
 `src/ds41_expert_tp.cpp` (layout + host reference), `include/strix/hip_ds41_expert_tp.hpp`, `src/hip_ds41_expert_tp.hip`
 (loader + down-row packing), `enqueue_routes_product_groups` in `src/hip_ds41_formats.hip`, tests
 `tests/ds41_expert_tp_tests.cpp`.
@@ -44,7 +44,7 @@ exact half; resident routed experts per rank 74.27 GiB (40 layers x 384 experts)
 
 ## Declared arithmetic
 
-For a row x (FFN input, A8 as in `ds41-formats.md`), its six slots k (expert e_k, routing weight w_k from the router) and
+For a row x (FFN input, A8 as in `formats.md`), its six slots k (expert e_k, routing weight w_k from the router) and
 rank r:
 
 1. **Gate/up** (unchanged per output): for every local intermediate row j, `g = product_iq2_xxs(gate[e_k][inter_index(r, j)], x)`,

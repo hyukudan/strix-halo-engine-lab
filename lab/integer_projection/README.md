@@ -135,7 +135,7 @@ and row histograms; integration with producer/buffer identities; model/state/
 speculative fidelity; complete-workload timing against the packed floating
 control. No latency/throughput measurement or qualification is claimed here.
 
-The separate [experimental runtime consumer](../../docs/implementation-2026-10-12-integer-runtime.md)
+The separate [experimental runtime consumer](../../docs/research/history/implementation-2026-10-12-integer-runtime.md)
 now binds actual compiled LM-head resources and original model blocks, and uses
 bounded column tiles before a whole-logits commit. It keeps its own exact approval
 identity; the default floating launcher rejects that alternate binding.

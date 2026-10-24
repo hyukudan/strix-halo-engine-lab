@@ -73,4 +73,4 @@ the prefix state cache and HTTP serving. The QSA GQA launcher also rejects a non
 model's bytes (including an all-zero head, an outlier head and exact half-step ties), that every element is
 within half a step (plus FP32 rounding), and that the decode, 8-row window and 16-row prefill-group score/softmax/value kernels give
 bitwise identical probabilities and outputs, close to an FP64 attention over the dequantized cache. Full-model
-exactness and quality results are recorded in DECISIONS.md (D-046).
+exactness and quality results are recorded in docs/decisions/decision-register.md (D-046).

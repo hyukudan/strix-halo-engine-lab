@@ -26,7 +26,7 @@ and every request then runs its whole prompt through the tiled prefill (T-row bl
 a served request. Up to eight requests in total (seven besides the positional prompt); prompts are bounded by the
 context only. `--mtp-sample-*` applies to every request (request i uses seed + i).
 
-Each request has a slot (see [serving.md](serving.md#batched-decoding)): its own state, session, launch plan, PLE
+Each request has a slot (see [serving.md](../serving/serving.md#batched-decoding)): its own state, session, launch plan, PLE
 backend, tiled prefill owners and backends (the prefill arenas are shared and used by one prompt at a time), prefix
 cache view, predictor, target producer and window owners on one shared window stream. `lockstep` runs every
 request's prompt (one after another) and then decodes them together; `sequential` admits each request after the
@@ -157,6 +157,6 @@ acceptance, window histogram, finish time, rate and generated tokens.
 ## Limits
 
 - Serial prompt route: CLI benchmark mode, at most four requests of up to 4097 prompt tokens each. The tiled
-  prompt route serves through the same slots (`--http-batch`, [serving.md](serving.md)).
+  prompt route serves through the same slots (`--http-batch`, [serving.md](../serving/serving.md)).
 - PLE and the elementwise steps run per request (PLE weights are small; elementwise steps read no weights).
 - Drafting is sequential per request.

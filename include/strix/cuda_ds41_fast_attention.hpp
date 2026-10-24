@@ -4,7 +4,7 @@
 // (FP16 inputs, FP32 accumulation; the dequantised cache entries are exact in FP16), base-2 online softmax over tiles
 // of 32 keys in a free order, approximate exp2. Same inputs, selection and output layout as enqueue_attention (the
 // caches through their FP16 rows, enqueue_fast_kv), so it replaces the attention calls of a prefill chunk
-// (docs/ds41-cuda-fast-attention.md). Only mma.sync / ldmatrix / cp.async (sm_80 and later: built for sm_89 and
+// (docs/models/deepseek-v4.1/cuda-fast-attention.md). Only mma.sync / ldmatrix / cp.async (sm_80 and later: built for sm_89 and
 // sm_120).
 #include "strix/cuda_ds41_attention.hpp"
 #include "strix/cuda_ds41_common.hpp"

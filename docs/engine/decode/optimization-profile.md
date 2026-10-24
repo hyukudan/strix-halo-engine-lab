@@ -1,7 +1,7 @@
 # Automatic decoder optimization profile
 
 Selective stored-byte model backing is documented in
-[model-weight-residency.md](model-weight-residency.md). It is an explicit
+[model-weight-residency.md](../../operations/model-weight-residency.md). It is an explicit
 experiment and does not change the automatic default.
 
 The decoder defaults to `--optimization-profile auto`. The low-level launcher
@@ -202,7 +202,7 @@ not reused from a baseline plan.
 `--prefill-numerical-profile` selects the prompt prefill arithmetic separately
 (default: `--numerical-profile`); only the dense-A8 sibling pair is admitted, on
 the tiled known-prefix prefill or the MTP prompt. See
-[prefill numerical profile](prefill-numerical-profile.md).
+[prefill numerical profile](../prefill/prefill-numerical-profile.md).
 
 The admitted routed census is43 Q4_K/Q5_1 layers, four Q4_K/Q8_0 layers and one
 Q5_K/Q8_0 fallback layer. The Q51-only recipe preserves the four Q8_0 fallback
@@ -276,7 +276,7 @@ qualification is inferred merely because a file was created.
 Both outputs can also be produced through the tiled known-prefix prefill
 (`--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T`
 with the all-rows output policy), with the same file format, row order and score
-rows; see [teacher-forced-tiled-prefill.md](teacher-forced-tiled-prefill.md).
+rows; see [teacher-forced-tiled-prefill.md](../prefill/teacher-forced-tiled-prefill.md).
 
 ## Experimental recurrent island layout
 

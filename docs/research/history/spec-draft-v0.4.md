@@ -1,12 +1,14 @@
 # Technical specification v0.4 — inference engine for Strix Halo
 
+> **Superseded.** This v0.4 research draft is kept as a historical record. The normative design is the [architecture guide](../../architecture/README.md); decisions are in the [decision register](../../decisions/decision-register.md).
+
 Status: research draft, revised for technical acceptance and expanded with official
 Qwen sources and the GTT policy. P0 gates and on-hardware measurement are still
 open. Project name not yet decided.
 
 Traceability: the data supporting this specification is indexed in
-[`EVIDENCE.md`](EVIDENCE.md); changes of direction are recorded in
-[`DECISIONS.md`](DECISIONS.md). A statement marked as a hypothesis must not be
+[`docs/decisions/evidence-register.md`](../../decisions/evidence-register.md); changes of direction are recorded in
+[`docs/decisions/decision-register.md`](../../decisions/decision-register.md). A statement marked as a hypothesis must not be
 read as a closed requirement.
 
 ## 1. Objective
@@ -260,7 +262,7 @@ power/TDP, clocks and temperature together with the software environment.
 3. Confirm Linux/ROCm/kernel of the target machine.
 4. Decide whether the internal weights cache is worth its startup time and disk space.
 5. Set the license and the MIT reuse policy.
-6. Resolve the P0 items in `DESIGN_ACCEPTANCE.md` and submit the consolidated spec to a
+6. Resolve the P0 items in `docs/research/history/2026-09-28-design-acceptance.md` and submit the consolidated spec to a
    second review.
 7. Pin the canonical repo, commit and license for QSA, DeltaNet, MoE routing,
    MTP, tokenizer and chat template.

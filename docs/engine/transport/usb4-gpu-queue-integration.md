@@ -84,7 +84,7 @@ A timeout, process exit or missing device is not a memory-release proof.
 Unproved DMA/GPU quiescence and ambiguous release/reset outcomes retain the exact
 owners. The driver now retires proven-safe original contexts even with old FDs
 open; it never reassigns old HopIDs to a replacement connection. See
-[cooperative recovery and retirement](GPU-CONTROLLER-RECOVERY-2026-10-16.md).
+[cooperative recovery and retirement](usb4-controller-recovery.md).
 
 ## 1. Build from the integrated source
 

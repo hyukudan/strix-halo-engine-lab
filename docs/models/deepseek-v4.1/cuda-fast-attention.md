@@ -1,7 +1,7 @@
 # deepseek41 CUDA fast prefill attention
 
 A faster, non-bitwise form of the CSA2 attention and indexer for the CUDA prefill, behind `--fast-attention`
-(`CudaPrefillOptions::fast_attention`, default off). The exact kernels (`docs/ds41-cuda-attention.md`) stay the reference
+(`CudaPrefillOptions::fast_attention`, default off). The exact kernels (`docs/models/deepseek-v4.1/cuda-attention.md`) stay the reference
 arm and the fallback. Header `include/strix/cuda_ds41_fast_attention.hpp`; kernels `src/cuda/ds41_fast_attention.cu`
 (attention, FP16 entry rows) and `src/cuda/ds41_fast_index.cu` (FP8 index scores); test and timing
 `tests/cuda/ds41_fast_attention_tests.cu` (`strix-cuda-ds41-fast-attention-tests [T] [reps] [--device N]`).

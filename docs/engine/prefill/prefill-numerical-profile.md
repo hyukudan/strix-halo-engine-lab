@@ -86,7 +86,7 @@ T = 8192); the setup's UMA growth estimate counts one per slot.
 - `numerical_profile_pair_identity` of a single-profile pair is that profile's identity; a split pair
   has a distinct identity that also differs from the reversed pair.
 - MTP goldens (version 2) record the prefill and decode profile identities; see
-  [the golden format](mtp-forward-golden-file.md). A golden dumped under one pair is rejected under
+  [the golden format](../speculative/mtp-forward-golden-file.md). A golden dumped under one pair is rejected under
   another before any target work; a version-1 golden is admitted only for a single-profile run.
 
 ## Fast prefill profile (draft)

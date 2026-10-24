@@ -10,7 +10,7 @@ GPU dedicada cuando la hay.**
 -->
 
 > Esta es una traducción del [README en inglés](README.md), que es la referencia. La documentación técnica
-> ([docs/performance.md](docs/performance.md), [docs/ENGINE.md](docs/ENGINE.md), [DECISIONS.md](DECISIONS.md) y
+> ([docs/performance.md](docs/performance.md), [docs/getting-started/engine-reference.md](docs/getting-started/engine-reference.md), [docs/decisions/decision-register.md](docs/decisions/decision-register.md) y
 > `docs/`) está en inglés.
 
 Es nuestro propio motor de inferencia en C++/HIP para **AMD Strix Halo** (Ryzen AI Max+ 395, Radeon 8060S
@@ -64,8 +64,8 @@ normal allí donde lo afirmamos, y cada una de esas afirmaciones la comprueba un
 | GLM-5.3 Flash (GGUF) | 2 nodos | **Pruebas previstas** | Sin empezar en el motor |
 
 El núcleo no conoce ningún modelo: cada familia es un módulo con su contrato, su plan, sus kernels y sus puertas
-([docs/model-families.md](docs/model-families.md)). Los perfiles automáticos solo admiten los ficheros de modelo
-fijados en [SOURCES_LEDGER.md](SOURCES_LEDGER.md).
+([docs/models/model-families.md](docs/models/model-families.md)). Los perfiles automáticos solo admiten los ficheros de modelo
+fijados en [docs/reference/sources-ledger.md](docs/reference/sources-ledger.md).
 
 ## Hardware
 
@@ -234,7 +234,7 @@ con una referencia en cada posición (divergencia KL y acuerdo top-1), por categ
 | Exacto (denso FP32) | 0,01940 | 95,52 % |
 | Dense A8 (recomendado) | 0,01978 (+1,9 ± 2,0 %) | 95,55 % |
 
-49.001 posiciones ([D-032](DECISIONS.md#d-032-dense-a8-in-the-recommended-profile)): dense A8 está tan cerca de la
+49.001 posiciones ([D-032](docs/decisions/decision-register.md#d-032-dense-a8-in-the-recommended-profile)): dense A8 está tan cerca de la
 referencia como el perfil exacto, dentro del margen que separa dos implementaciones exactas de los mismos pesos.
 Donde los dos perfiles discrepan (2,8 % de las posiciones) casi siempre es entre candidatos casi empatados.
 
@@ -242,9 +242,9 @@ En DeepSeek, los pesos densos codificados con trellis (mix-B) están tan cerca d
 el formato de 6,5 bits (KL 0,0446 frente a 0,0447 en 103.908 tokens) leyendo 2,27 en lugar de 3,63 GB por token y
 nodo; se calculó con una emulación de los formatos, no con los kernels del motor.
 
-Metodología: [docs/teacher-forced-tiled-prefill.md](docs/teacher-forced-tiled-prefill.md),
-[docs/decode-optimization-profile.md](docs/decode-optimization-profile.md),
-[docs/qualification-ledger.md](docs/qualification-ledger.md).
+Metodología: [docs/engine/prefill/teacher-forced-tiled-prefill.md](docs/engine/prefill/teacher-forced-tiled-prefill.md),
+[docs/engine/decode/optimization-profile.md](docs/engine/decode/optimization-profile.md),
+[docs/reference/qualification-ledger.md](docs/reference/qualification-ledger.md).
 
 ## Qué lo hace distinto
 
@@ -283,7 +283,7 @@ Metodología: [docs/teacher-forced-tiled-prefill.md](docs/teacher-forced-tiled-p
 |---|---|---|
 | **Máquinas** | una Strix Halo (`gfx1151`) con **128 GB** | dos Strix Halo de 128 GB, dos cables USB4 directos, la [serie del driver USB4](https://github.com/hyukudan/strix-halo-usb4-driver); opcionalmente un PC CUDA con una RTX PRO 6000 |
 | **SO / pila GPU** | Linux, ROCm/HIP (probado con ROCm core 10.1 en `/opt/rocm/core-10.1`) | igual; CUDA para las partes RTX opcionales |
-| **Ficheros del modelo** | GGUF UD-Q4_K_XL (~111 GB) + sidecar MTP Q8_0 | el GGUF de expertos de 2 bits, el overlay denso de 6,5 bits, los paquetes trellis y el borrador DSpark ([docs/ds41-production-defaults.md](docs/ds41-production-defaults.md#production-identity-environment-of-both-ranks)) |
+| **Ficheros del modelo** | GGUF UD-Q4_K_XL (~111 GB) + sidecar MTP Q8_0 | el GGUF de expertos de 2 bits, el overlay denso de 6,5 bits, los paquetes trellis y el borrador DSpark ([docs/models/deepseek-v4.1/production-defaults.md](docs/models/deepseek-v4.1/production-defaults.md#production-identity-environment-of-both-ranks)) |
 | **Herramientas** | CMake >= 3.24, Ninja, un compilador C++20, opcionalmente OpenSSL para hashes rápidos | igual |
 
 Las herramientas de línea de comandos reciben IDs de token; los servidores HTTP llevan el tokenizador y la plantilla
@@ -308,7 +308,7 @@ ninja -C build strix-deepseek41-rank strix-deepseek41-serve   # DeepSeek (módul
 
 Las partes CUDA para la RTX PRO se compilan aparte con `-DSTRIX_ENABLE_CUDA_DS41=ON`. `ctest --test-dir build`
 ejecuta los tests de host y de dispositivo (muchos necesitan la GPU y los ficheros del modelo). Todas las opciones
-de CMake están en [docs/ENGINE.md](docs/ENGINE.md#build-options).
+de CMake están en [docs/getting-started/engine-reference.md](docs/getting-started/engine-reference.md#build-options).
 
 ## Ejecutar
 
@@ -324,19 +324,19 @@ de CMake están en [docs/ENGINE.md](docs/ENGINE.md#build-options).
 `prompt.ids` contiene el prompt como IDs de token del tokenizador del modelo; el motor imprime un recibo JSON con
 `generated_tokens` y los tiempos. Para las velocidades de arriba añade las opciones especulativas (sidecar MTP,
 ventanas de verificación 2/4/8, vocabulario de borrador): el comando completo está en
-**[docs/ENGINE.md → Command line](docs/ENGINE.md#command-line)** y en [docs/mtp-native-cli.md](docs/mtp-native-cli.md).
+**[docs/getting-started/engine-reference.md → Command line](docs/getting-started/engine-reference.md#command-line)** y en [docs/engine/speculative/mtp-native-cli.md](docs/engine/speculative/mtp-native-cli.md).
 El servidor HTTP, los slots por lotes (`--http-batch`) y la caché de prefijos están en
-[docs/serving.md](docs/serving.md); varias peticiones en un proceso, en
-[docs/multi-request-cohort.md](docs/multi-request-cohort.md); el muestreo, en
-[docs/sampled-decoding.md](docs/sampled-decoding.md).
+[docs/engine/serving/serving.md](docs/engine/serving/serving.md); varias peticiones en un proceso, en
+[docs/engine/scheduling/multi-request-cohort.md](docs/engine/scheduling/multi-request-cohort.md); el muestreo, en
+[docs/engine/decode/sampled-decoding.md](docs/engine/decode/sampled-decoding.md).
 
 **DeepSeek en el par:** un rango por nodo, el mismo entorno en los dos (la identidad de producción),
 `--transport usb4gpu`; el servidor recibe `--prefill-path device --dspark <DSpark.gguf> --dspark-vocab auto:<vocab>`.
 El entorno, los defaults y cómo desactivarlos están en
-[docs/ds41-production-defaults.md](docs/ds41-production-defaults.md); las líneas de comando del reparto con la RTX,
-en [docs/ds41-pipeline-stage.md](docs/ds41-pipeline-stage.md); la colocación de expertos calientes, en
-[docs/ds41-hot-placement.md](docs/ds41-hot-placement.md); los contextos largos, en
-[docs/deepseek41-long-context.md](docs/deepseek41-long-context.md).
+[docs/models/deepseek-v4.1/production-defaults.md](docs/models/deepseek-v4.1/production-defaults.md); las líneas de comando del reparto con la RTX,
+en [docs/models/deepseek-v4.1/pipeline-stages.md](docs/models/deepseek-v4.1/pipeline-stages.md); la colocación de expertos calientes, en
+[docs/models/deepseek-v4.1/hot-placement.md](docs/models/deepseek-v4.1/hot-placement.md); los contextos largos, en
+[docs/models/deepseek-v4.1/long-context.md](docs/models/deepseek-v4.1/long-context.md).
 
 ### Cómo exponer los servidores
 
@@ -392,14 +392,14 @@ flowchart LR
 un bloque cada peso se lee una vez para todas las filas, y las capas recurrentes (GDN) siguen actualizando las filas
 en orden, así que el resultado es idéntico bit a bit a leer el prompt token a token con el mismo perfil.
 
-La guía de arquitectura es [docs/README.md](docs/README.md) (multinodo y USB4:
+La guía de arquitectura es [docs/architecture/README.md](docs/architecture/README.md) (multinodo y USB4:
 [docs/architecture/12-multi-node-and-usb4.md](docs/architecture/12-multi-node-and-usb4.md)); la referencia del motor
-es [docs/ENGINE.md](docs/ENGINE.md); el estado actual por área, [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md).
+es [docs/getting-started/engine-reference.md](docs/getting-started/engine-reference.md); el estado actual por área, [docs/reference/implementation-status.md](docs/reference/implementation-status.md).
 
 ## Decisiones de diseño
 
 El registro completo, con alternativas, evidencia y la condición para reabrir cada una, está en
-[DECISIONS.md](DECISIONS.md). Las principales:
+[docs/decisions/decision-register.md](docs/decisions/decision-register.md). Las principales:
 
 - **Verificación exacta en lugar de tolerancia (D-021)** y **ventanas adaptativas 2/4/8 con un modelo de coste en
   línea (D-022)**.
@@ -410,7 +410,7 @@ El registro completo, con alternativas, evidencia y la condición para reabrir c
 - **Defaults de DeepSeek en dos nodos (D-061), transporte acotado con envíos pequeños anticipados y staging fusionado
   (D-062), intercambio directo entre GPUs (D-063), una GPU dedicada en el decode (D-064, opt-in).**
 - **Medido y rechazado:** captura con hipGraph del bucle de decode, paralelismo tensorial de una petición de Qwen
-  entre los nodos (X-021) y más; los números están en la [tabla de rechazados](DECISIONS.md#measured-and-rejected).
+  entre los nodos (X-021) y más; los números están en la [tabla de rechazados](docs/decisions/decision-register.md#measured-and-rejected).
 
 ## Hoja de ruta
 
@@ -458,7 +458,7 @@ memoria unificada permite a la GPU leer los pesos donde están.
 **¿Qué longitud de contexto admite?**
 El perfil automático de Qwen está cualificado a 8192 tokens; los contextos más largos funcionan con
 `--unqualified-context` (así llegan las cifras de prefill hasta 32K). Los límites de contexto largo de DeepSeek
-están en [docs/deepseek41-long-context.md](docs/deepseek41-long-context.md).
+están en [docs/models/deepseek-v4.1/long-context.md](docs/models/deepseek-v4.1/long-context.md).
 
 **¿De dónde salen los números?**
 De nuestras propias ejecuciones en nuestras máquinas, con fecha, configuración y comprobación de exactitud por fila
@@ -470,4 +470,4 @@ El código del motor tiene licencia **[Apache License 2.0](LICENSE)**, salvo el 
 Linux en `lab/direct_gpu_stream/kernel/`, que es **GPL-2.0-only** como debe serlo el código del kernel de Linux (sus
 textos de licencia están en ese directorio). El código adoptado de otros proyectos conserva su licencia y sus avisos
 originales. Los pesos de los modelos se distribuyen con sus propias licencias. Las referencias de terceros usadas para
-formatos y semántica de modelos están listadas con sus licencias en [SOURCES_LEDGER.md](SOURCES_LEDGER.md).
+formatos y semántica de modelos están listadas con sus licencias en [docs/reference/sources-ledger.md](docs/reference/sources-ledger.md).

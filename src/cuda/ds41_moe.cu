@@ -1,5 +1,5 @@
 // deepseek41 routed experts on CUDA: A8, device routes, decode GEMVs (gate/up IQ2_XXS + SwiGLU + A8, down Q2_K),
-// the combine and the layer driver. Declared arithmetic: cuda_ds41_moe.hpp and docs/ds41-cuda-numeric-identity.md.
+// the combine and the layer driver. Declared arithmetic: cuda_ds41_moe.hpp and docs/models/deepseek-v4.1/cuda-numeric-identity.md.
 
 #include "ds41_moe_device.cuh"
 

@@ -1,11 +1,13 @@
 # GPU visibility probes — compatibility route and current multi-slot route
 
+> **Superseded** for current installs by [USB4 multi-slot GPU queue integration](usb4-gpu-queue-integration.md). This page documents the older compatibility probes, which remain in the tree.
+
 The original PR #27 probe is retained in `include/strix/hip_gpu_visibility_probe.hpp`,
 `src/hip_gpu_visibility_probe.hip` and `lab/gpu_visibility`. The integrated C1
 pre-copy variant from PR #28 remains in `lab/direct_gpu_stream`.
 
 **For current USB4 multi-slot installation and testing, start with
-[GPU-QUEUE-INTEGRATION-2026-10-16.md](GPU-QUEUE-INTEGRATION-2026-10-16.md).**
+[usb4-gpu-queue-integration.md](usb4-gpu-queue-integration.md).**
 Its `strix-gpu-queue-visibility` executable defaults to eight operations per
 direction and reuses the original GPU verifier in a real QUEUE/PREPARE_SLOT
 transport. The older C1 executables' one-operation limit is not the limit of

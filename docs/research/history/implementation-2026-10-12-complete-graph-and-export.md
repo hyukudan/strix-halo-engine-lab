@@ -95,7 +95,7 @@ visibility on a particular pair remains a target qualification gate.
 
 The project now supplies an actual opt-in extension to a pinned Linux driver,
 a documented UAPI and `LinuxDirectTransportDriverIo`. See the
-[kernel preparation and lifecycle guide](../lab/direct_gpu_stream/kernel/README.md).
+[kernel preparation and lifecycle guide](../../../lab/direct_gpu_stream/kernel/README.md).
 Its enabled driver object compiles against the real source with strict warnings.
 The complete kernel tree, build outputs and receipts remain private. The public
 patch preserves upstream notices and includes the applicable GPL/exception text.

@@ -8,9 +8,9 @@ checks, flags) are those of `cuda_ds41_common.hpp`; the attention lives in `stri
 
 ## Numeric identity
 
-Every kernel computes the declared arithmetic of `docs/ds41-attention.md` (host references in
+Every kernel computes the declared arithmetic of `docs/models/deepseek-v4.1/attention.md` (host references in
 `src/ds41_attention.cpp`) and, for the attention's own F16 projections, the lane-class order of `f16_rows`
-(`docs/ds41-layer.md`, "lane dot"). Nothing here introduces a new identity: **all outputs are the host references'
+(`docs/models/deepseek-v4.1/layer.md`, "lane dot"). Nothing here introduces a new identity: **all outputs are the host references'
 bits** (caches byte for byte, scores, selections and the attention output float for float), so the op hashes of the
 host forward (`fnv1a` of `o`) are reproduced.
 
@@ -30,7 +30,7 @@ How the order is kept on this device:
 - Integer parts are exact whatever the order: the indexer's E2M1 x E2M1 block dots (`__dp4a` on doubled codes,
   |sum| <= 4608), and the selection (radix histograms and scans of integer counts).
 
-| site | declared order (see docs/ds41-attention.md) | CUDA form |
+| site | declared order (see docs/models/deepseek-v4.1/attention.md) | CUDA form |
 | --- | --- | --- |
 | compressor kv / gate, indexer q_b / weights (F16) | lane class `c = i mod 32`: `acc = acc + w * x` ascending, butterfly | a warp per 1 (few rows) or 4 (more rows) consecutive output rows; 256-element segments loaded as 16 B per lane (the next segment in flight) and transposed through the warp's shared buffer so lane `l` takes `l + 32k`; up to 8 rows per pass; all four projections in one launch |
 | window write | kv_norm (lane fma chain, butterfly), RoPE, E4M3 / E8M0 per 32 | warp per row |

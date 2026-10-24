@@ -41,7 +41,7 @@ automatically, and both produce the same logits.
 
 The logits file and the `requested_logprobs_rows` have exactly the serial route's format, order and footer
 (`TMLLOG01`/`TMLEOF01`, see the teacher-forced section of
-[decode-optimization-profile.md](decode-optimization-profile.md)).
+[optimization-profile.md](../decode/optimization-profile.md)).
 
 ## Numerical profiles
 
@@ -57,4 +57,4 @@ the existing prefill/decode profile identities.
 
 Within one numerical profile the tiled prefill reproduces the serial rows bit for bit, and the multi-row
 head reproduces the R1 head per row, so the logits file is byte-identical to the serial route's file for
-the same inputs. This is checked on full-model runs, not inferred; see DECISIONS.md (D-034).
+the same inputs. This is checked on full-model runs, not inferred; see docs/decisions/decision-register.md (D-034).

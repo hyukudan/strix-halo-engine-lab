@@ -2,7 +2,7 @@
 
 This page holds the precise technical material for the engine: the measured decode configuration, every
 build option, the complete command line, the draft vocabularies, the environment switches and the repository
-layout. The [README](../README.md) is the short, user-facing introduction; nothing here contradicts it, this
+layout. The [README](../../README.md) is the short, user-facing introduction; nothing here contradicts it, this
 page only goes deeper.
 
 - [Speculative decode configuration](#speculative-decode-configuration)
@@ -102,7 +102,7 @@ ninja -C build strix-hip-decode-token
 
 `strix-hip-decode-token` takes a GGUF model and the prompt as token IDs; it has no tokenizer. It writes a JSON
 receipt to stdout that includes `generated_tokens`, cycle counts and timings. `--help` lists the general options;
-the MTP options are documented in [mtp-native-cli.md](mtp-native-cli.md).
+the MTP options are documented in [mtp-native-cli.md](../engine/speculative/mtp-native-cli.md).
 
 A speculative run has four groups of options.
 
@@ -121,16 +121,16 @@ projections in FP32 (the exact profile), use `hc-splitk-f32+q51-q80-a8-down+q5k-
 
 The automatic optimization profile is admitted at context 8192 for the pinned model content. Other context sizes
 need `--context N --unqualified-context`; they run the same profiles but are not covered by the automatic
-profile's numerical and timing gates (see [decode-optimization-profile.md](decode-optimization-profile.md)).
+profile's numerical and timing gates (see [optimization-profile.md](../engine/decode/optimization-profile.md)).
 
 `--prefill-numerical-profile NAME` runs the prompt prefill (tiled known-prefix prefill or the MTP prompt) under a
 different profile from decode; today only the dense-A8 sibling of `--numerical-profile` is admitted. Decode and MTP
 windows always use `--numerical-profile`, MTP goldens record both profiles, and MTP stays exact from the state the
-prefill produced. See [prefill-numerical-profile.md](prefill-numerical-profile.md) (D-033).
+prefill produced. See [prefill-numerical-profile.md](../engine/prefill/prefill-numerical-profile.md) (D-033).
 
 Teacher-forced scoring (`--teacher-forced-score`, `--teacher-logits-file`) also runs over the tiled prefill with the
 all-rows output policy, producing byte-identical logits files to the serial route within a profile, several times
-faster. See [teacher-forced-tiled-prefill.md](teacher-forced-tiled-prefill.md) (D-034).
+faster. See [teacher-forced-tiled-prefill.md](../engine/prefill/teacher-forced-tiled-prefill.md) (D-034).
 
 **2. Kernel organization required by the windows** (A8 MoE, wave8 Q8 GDN, deferred MoE status, HC chain)
 
@@ -147,7 +147,7 @@ faster. See [teacher-forced-tiled-prefill.md](teacher-forced-tiled-prefill.md) (
 ```
 
 **3. MTP sidecar, provenance and budgets.** The sidecar file and the target are pinned by SHA-256, and every
-memory reservation is explicit. See [mtp-native-cli.md](mtp-native-cli.md) for the meaning of each value.
+memory reservation is explicit. See [mtp-native-cli.md](../engine/speculative/mtp-native-cli.md) for the meaning of each value.
 
 ```
   --mtp --mtp-sidecar MTP.gguf --mtp-sidecar-logical-name NAME --mtp-sidecar-sha256 HEX --mtp-sidecar-bytes N \
@@ -166,7 +166,7 @@ MTP replay needs a reference forward for the prompt. For benchmarking, generate 
 once with `--mtp-golden-dump prompt.golden` instead of `--mtp-golden`/`--mtp-golden-sha256`, then pass the file
 and the printed SHA-256. A self-generated reference is reported as not independent; it does not change the
 output, because every emitted token is verified by the target. Size `--mtp-golden-max-bytes` at about 1.03 MB
-per prompt row (64 MiB covers a 43-token prompt); see [mtp-native-cli.md](mtp-native-cli.md).
+per prompt row (64 MiB covers a 43-token prompt); see [mtp-native-cli.md](../engine/speculative/mtp-native-cli.md).
 
 **4. Speculative decode**
 
@@ -207,9 +207,9 @@ Long prompts are read by the step-major tiled prefill:
 T is 16 to 2048 rows per block. Every complete block runs each source step for all T rows before moving on;
 the unpadded suffix runs as serial rows. GDN recurrence still updates rows in position order, so the result is
 bit-identical to serial prefill within one numerical profile. On this route the full organization flags of
-group 2 are stated explicitly. See [known-prefix-tiled-prefill.md](known-prefix-tiled-prefill.md),
-[known-prefix-prefill.md](known-prefix-prefill.md) for the budgets, and
-[prefill-numerical-profile.md](prefill-numerical-profile.md) for a prefill profile that differs from decode.
+group 2 are stated explicitly. See [tiled-prefill.md](../engine/prefill/tiled-prefill.md),
+[known-prefix-prefill.md](../engine/prefill/known-prefix-prefill.md) for the budgets, and
+[prefill-numerical-profile.md](../engine/prefill/prefill-numerical-profile.md) for a prefill profile that differs from decode.
 
 The prefill numbers in the README are interleaved request throughput (prompt tokens per second of wall time
 for the request) at `dff1dbe`, 2026-10-18, same binary for both profiles; the commit message records the
@@ -234,7 +234,7 @@ tokens and 5% of the prompt; otherwise the core alone) and prints the choice; ex
 Measured against a 106k general subset: on a code prompt the core needs 86 verify cycles instead of 89 at the same
 speed within noise; on a Spanish chat prompt `auto` selects core + `es16k` and decodes at 38.9 tok/s instead of
 32.9 (+18%). Below 16k rows acceptance drops. `tools/build_draft_vocab.py` documents the file format and builds
-lists from the GGUF tokenizer and text corpora; [data/draft-vocab/README.md](../data/draft-vocab/README.md)
+lists from the GGUF tokenizer and text corpora; [data/draft-vocab/README.md](../../data/draft-vocab/README.md)
 describes how the shipped lists were built.
 
 ## Environment switches
@@ -303,29 +303,29 @@ storage), `strix-model-manifest` (tensor roles, bytes, residency and node placem
 
 ## Documentation map
 
-- [docs/README.md](README.md): architecture guide (platform, memory, kernels, numerics, speculative decoding,
+- [docs/architecture/README.md](../architecture/README.md): architecture guide (platform, memory, kernels, numerics, speculative decoding,
   multi-node USB4) and index of implementation notes.
-- [docs/VERIFY_WINDOW_PLAN.md](VERIFY_WINDOW_PLAN.md): multi-row verify window design and status.
-- [docs/mtp-native-cli.md](mtp-native-cli.md), [docs/mtp-native-runtime.md](mtp-native-runtime.md): MTP
+- [docs/engine/speculative/verify-window-plan.md](../engine/speculative/verify-window-plan.md): multi-row verify window design and status.
+- [docs/engine/speculative/mtp-native-cli.md](../engine/speculative/mtp-native-cli.md), [docs/engine/speculative/mtp-native-runtime.md](../engine/speculative/mtp-native-runtime.md): MTP
   command line and runtime contract.
-- [docs/decode-optimization-profile.md](decode-optimization-profile.md): automatic optimization profile and
+- [docs/engine/decode/optimization-profile.md](../engine/decode/optimization-profile.md): automatic optimization profile and
   teacher-forced scoring.
-- [docs/prefill-numerical-profile.md](prefill-numerical-profile.md),
-  [docs/known-prefix-tiled-prefill.md](known-prefix-tiled-prefill.md),
-  [docs/teacher-forced-tiled-prefill.md](teacher-forced-tiled-prefill.md): prompt prefill.
-- [docs/qualification-ledger.md](qualification-ledger.md): what has been qualified, and how.
-- [DECISIONS.md](../DECISIONS.md): accepted, pending and rejected decisions with their reasons.
-- [IMPLEMENTATION_STATUS.md](../IMPLEMENTATION_STATUS.md): implemented components and how to reproduce them.
-- [SPEC_DRAFT.md](../SPEC_DRAFT.md), [EVIDENCE.md](../EVIDENCE.md), [DESIGN_ACCEPTANCE.md](../DESIGN_ACCEPTANCE.md):
+- [docs/engine/prefill/prefill-numerical-profile.md](../engine/prefill/prefill-numerical-profile.md),
+  [docs/engine/prefill/tiled-prefill.md](../engine/prefill/tiled-prefill.md),
+  [docs/engine/prefill/teacher-forced-tiled-prefill.md](../engine/prefill/teacher-forced-tiled-prefill.md): prompt prefill.
+- [docs/reference/qualification-ledger.md](../reference/qualification-ledger.md): what has been qualified, and how.
+- [docs/decisions/decision-register.md](../decisions/decision-register.md): accepted, pending and rejected decisions with their reasons.
+- [docs/reference/implementation-status.md](../reference/implementation-status.md): implemented components and how to reproduce them.
+- [docs/research/history/spec-draft-v0.4.md](../research/history/spec-draft-v0.4.md), [docs/decisions/evidence-register.md](../decisions/evidence-register.md), [docs/research/history/2026-09-28-design-acceptance.md](../research/history/2026-09-28-design-acceptance.md):
   specification, evidence register and acceptance criteria.
-- [MEMORY_BUDGET.md](../MEMORY_BUDGET.md): UMA/GTT policy and admission guards.
-- [GGUF_READER.md](../GGUF_READER.md): GGUF reader contract and defenses.
-- [SOURCES_LEDGER.md](../SOURCES_LEDGER.md): canonical sources, licenses and provenance.
+- [docs/operations/memory-budget.md](../operations/memory-budget.md): UMA/GTT policy and admission guards.
+- [docs/reference/gguf-reader.md](../reference/gguf-reader.md): GGUF reader contract and defenses.
+- [docs/reference/sources-ledger.md](../reference/sources-ledger.md): canonical sources, licenses and provenance.
 
 ## Working rules
 
-New observations go to `EVIDENCE.md` first. Design changes are reflected in `SPEC_DRAFT.md`, and the reason is
-recorded in `DECISIONS.md`. A hypothesis does not become a requirement until a measurement or an explicit
+New observations go to `docs/decisions/evidence-register.md` first. Design changes are reflected in `docs/research/history/spec-draft-v0.4.md`, and the reason is
+recorded in `docs/decisions/decision-register.md`. A hypothesis does not become a requirement until a measurement or an explicit
 decision supports it. Native `gfx1151` qualification is required before a HIP or direct-transport path becomes a
 default.
 
@@ -334,5 +334,5 @@ default.
 The distributed design treats every physical USB4 link as an independent resource with its own epoch, lease,
 TX/RX pools, completion accounting and health state. Striping or splitting traffic across two links is allowed
 only after simultaneous measurements show the links are independent. See
-[architecture/16-direct-gpu-transport.md](architecture/16-direct-gpu-transport.md) and
-[architecture/12-multi-node-and-usb4.md](architecture/12-multi-node-and-usb4.md).
+[architecture/16-direct-gpu-transport.md](../architecture/16-direct-gpu-transport.md) and
+[architecture/12-multi-node-and-usb4.md](../architecture/12-multi-node-and-usb4.md).
