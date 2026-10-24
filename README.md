@@ -30,6 +30,23 @@ by a gate.
 > (`strix-hip-decode-token --http-serve` for Qwen, `strix-deepseek41-serve` for DeepSeek). The lab also hosts
 > the bring-up of further models; see [Models](#models).
 
+## At a glance
+
+**Who is this for?** Developers experimenting with **native, AMD-first LLM inference** on Ryzen AI Max / Strix Halo—not a general-purpose drop-in inference framework.
+
+| Question | Short answer |
+|---|---|
+| What is it? | An independent C++/HIP inference engine, with model-specific execution paths, kernels, verification gates and HTTP serving. |
+| Which hardware? | One Strix Halo Linux node, two nodes linked by USB4, and optional RTX PRO assistance for selected profiles. |
+| Which models? | Qwen and DeepSeek have production-designated engine profiles; MiniMax is still in bring-up. See [Models](#models). |
+| Does it change model outputs? | Qualified speculative paths check generated tokens against normal greedy decode; other configurations must pass their own exactness gates. |
+| Where do I begin? | Read [requirements](#what-you-need), [build](#build), then [run](#run). |
+| Where are reproducible results? | [Performance methodology and results](docs/performance.md), with test conditions and verification; headline throughput is not a universal guarantee. |
+
+**Project boundaries:** [TensorMeld](https://github.com/hyukudan/tensormeld) handles planning and routing; [Hyperloom](https://github.com/hyukudan/hyperloom) integrates deployment and control; the [USB4 driver](https://github.com/hyukudan/strix-halo-usb4-driver) handles the Linux interconnect. This repository owns **inference execution**, not cluster management.
+
+For detailed implementation internals, use [How it works](#how-it-works) and the documents linked throughout the model sections. The model weights and their licences are separate from the engine code.
+
 ## Contents
 
 [Models](#models) ·
