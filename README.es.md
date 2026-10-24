@@ -392,7 +392,7 @@ flowchart LR
 un bloque cada peso se lee una vez para todas las filas, y las capas recurrentes (GDN) siguen actualizando las filas
 en orden, así que el resultado es idéntico bit a bit a leer el prompt token a token con el mismo perfil.
 
-La guía de arquitectura es [docs/architecture/README.md](docs/architecture/README.md) (multinodo y USB4:
+Todos los documentos están en el [índice de documentación](docs/README.md). La guía de arquitectura es [docs/architecture/README.md](docs/architecture/README.md) (multinodo y USB4:
 [docs/architecture/12-multi-node-and-usb4.md](docs/architecture/12-multi-node-and-usb4.md)); la referencia del motor
 es [docs/getting-started/engine-reference.md](docs/getting-started/engine-reference.md); el estado actual por área, [docs/reference/implementation-status.md](docs/reference/implementation-status.md).
 

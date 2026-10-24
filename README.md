@@ -376,7 +376,7 @@ flowchart LR
 weight is read once for all rows, and the recurrent (GDN) layers still update rows in order, so the result is
 bit-identical to reading the prompt one token at a time with the same profile.
 
-The architecture guide is [docs/architecture/README.md](docs/architecture/README.md) (multi-node and USB4:
+Every document is listed in the [documentation index](docs/README.md). The architecture guide is [docs/architecture/README.md](docs/architecture/README.md) (multi-node and USB4:
 [docs/architecture/12-multi-node-and-usb4.md](docs/architecture/12-multi-node-and-usb4.md)); the engine reference
 is [docs/getting-started/engine-reference.md](docs/getting-started/engine-reference.md); current status per area is [docs/reference/implementation-status.md](docs/reference/implementation-status.md).
 
