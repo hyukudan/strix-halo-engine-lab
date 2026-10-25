@@ -281,21 +281,23 @@ Measured 2026-10-25, one Strix Halo node, Qwen3.8-Flash-Next, single request, 25
 `702bc074`; decode time excludes the prompt. Each run matches its own recipe's golden tokens.
 The two recipes have different weights and can produce different answers.
 
-| Code prompt | MTP window | GSQ HYB-Q2, tok/s | Quality recipe, tok/s |
-|---|---|---:|---:|
-| 1K | auto | **73.43** | pending rerun |
-| 1K | {2} route | **49.16** | **41.85** |
-| 1K | forced R2 | **49.17** | **41.82** |
-| 1K | forced R4 | **64.42** | **51.56** |
-| 1K | forced R8 | **66.56** | **52.07** |
-| 8K | auto | pending | pending |
-| 8K | {2} route | pending | **40.05** |
-| 8K | forced R2 | pending | **40.27** |
-| 8K | forced R4 | pending | **51.44** |
-| 8K | forced R8 | pending | **50.05** |
+| Code prompt | MTP window | GSQ HYB-Q2, tok/s | Quality recipe, tok/s | GSQ / quality |
+|---|---|---:|---:|---:|
+| 1K | auto | **73.18** | **59.59** | 1.23x |
+| 1K | {2} route | **49.16** | **41.85** | 1.17x |
+| 1K | forced R2 | **49.17** | **41.82** | 1.18x |
+| 1K | forced R4 | **64.42** | **51.56** | 1.25x |
+| 1K | forced R8 | **66.56** | **52.07** | 1.28x |
+| 8K | auto | **65.96** | **54.00** | 1.22x |
+| 8K | {2} route | **45.51** | **40.05** | 1.14x |
+| 8K | forced R2 | **45.42** | **40.27** | 1.13x |
+| 8K | forced R4 | **59.61** | **51.44** | 1.16x |
+| 8K | forced R8 | **56.60** | **50.05** | 1.13x |
 
-Repeat counts are unspecified in the partial table. Auto uses the production MTP policy. The {2} route is the harness's “R1” MTP setting, not serial greedy
-decode. This is the partial measured table; missing cells remain in progress.
+Auto uses the production MTP policy. The {2} route is the harness's "R1" MTP setting, not serial greedy decode.
+MTP acceptance at auto: 1K 0.72 (GSQ) vs 0.66 (quality); 8K 0.66 vs 0.73. Prompt processing in the same runs
+(warm): 1K 1.03 s vs 1.17 s; 8K 7.7-7.8 s vs 7.9 s. Against each recipe's byte ceiling for code 1K with MTP,
+GSQ auto reaches about 64 % (113.8 tok/s ceiling) and the quality recipe about 69 % (86.8 tok/s ceiling).
 
 ### MiniMax M3.1 Flash (integration candidate)
 
