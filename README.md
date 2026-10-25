@@ -21,8 +21,8 @@ This is our own C++/HIP inference engine for **AMD Strix Halo** (Ryzen AI Max+ 3
 - **MiniMax M3.1 Flash** on the pair has passed its eight-text quality gate; the decode candidate takes
   **44.40 ms/token at 1K**. **GLM-5.3 Flash** now decodes on the pair at **21.07 tok/s**.
 - **DeepSeek on an RTX PRO 6000 (96 GB, Windows WDDM)** runs the target and DSpark draft on that GPU,
-  with an exclusive VRAM + pinned-host cache: exact decode **77.8 / 83.7 / 91.8 tok/s** for code / English /
-  Spanish chat (2026-10-25; conditions below).
+  with an exclusive VRAM + pinned-host cache: exact decode **82–95 tok/s** for code; same-load code / English /
+  Spanish rates are **82.3 / 87.7 / 94.4 tok/s** (2026-10-25; conditions below).
 
 Every kernel, memory layout and scheduling choice is written for this chip and these models. The speed comes from
 exact speculative decoding (the full model checks every drafted token), batching and replicas, never from changing
@@ -140,8 +140,9 @@ How to read the tables:
 - **Build:** *release* is the code in this repository. *Pre-release* rows come from integration builds measured
   after this release (the hash is our build id); they are candidates for integration, and the release value is
   given next to them where it differs.
-- Medians of 3 or more runs unless the row says otherwise. *Updating* marks rows whose confirmation run is still in
-  progress; they show the latest final measurement and its date.
+- Medians of 3 or more runs unless stated otherwise; repetition counts are unspecified for the latest
+  2026-10-25 candidate measurements. *Updating* marks rows whose confirmation run is still in progress;
+  they show the latest final measurement and its date.
 
 Hardware: **1 node** = one Strix Halo (128 GB). **2 nodes** = two Strix Halo joined by two USB4 cables.
 **RTX PRO** = an RTX PRO 6000 Blackwell (96 GB) in a PC on 1 GbE.
@@ -185,24 +186,26 @@ identity, checked against the pair (KL 1.7e-3), not bitwise. RTX TTFT: warm resi
 excluded, up to the exported attention state handed to the import endpoint. A faster CUDA prefill profile fails
 the quality gate on long prompts and is not quoted.
 
-**Standalone RTX DeepSeek candidate (2026-10-25 evening).** Full DeepSeek V4.1 Flash target on an
+**Standalone RTX DeepSeek candidate (2026-10-25).** Full DeepSeek V4.1 Flash target on an
 RTX PRO 6000 (96 GB, Windows WDDM): Q2 GGUF routed gate/up **IQ2_XXS**, routed down **Q2_K**, dense **Q8_0**.
-Experts use an exclusive VRAM + pinned-host cache; the target and keep-64-pruned DSpark draft share the GPU
-(74.8 GiB expert arena). The selected speculative default uses a capped survival prior, seeded window costs,
-no exploration and frozen costs; costs need refreshing when the binary changes.
+Experts use an exclusive VRAM + pinned-host cache; the target and DSpark draft share the GPU. The draft keeps
+the 64 most-used experts per stage. Deferred/bounded write-backs, the CUDA-graph instantiation fix and the
+warm controller default are adopted; keep-64 pruning measured **+16 %** on code with a four-row window.
 
-| Mode | Prompt / context | Code | English | Spanish | Exactness / build |
-|---|---|---:|---:|---:|---|
-| Warm-controller DSpark, one request | 7 chat prompts (3 code, 2 EN, 2 ES), 128 generated tokens; prompt lengths vary | **77.8 tok/s** | **83.7 tok/s** | **91.8 tok/s** | 70/70 arm/chat comparisons; `5a88c0d1` |
-| Fraction of calculated 161.8 tok/s plain bandwidth ceiling | same workload | **48.1 %** | **51.7 %** | **56.7 %** | reference ceiling, not a speculative maximum |
+| Exact speculative decode | Code | English | Spanish | Calculated ceiling share |
+|---|---:|---:|---:|---|
+| Warm controller + deferred write-backs, same load | **82.3 tok/s** | **87.7 tok/s** | **94.4 tok/s** | **51–58 %** of the 6.18 ms/token all-hit floor |
+| Best runs across loads | **94–95 tok/s** | **97 tok/s** | **100–101 tok/s** | **58–63 %** of the same ceiling |
 
-Rates pool committed tokens over timed decode windows after warm-up, with two warm-controller repeats per
-chat; whole-chat decode rates are **77.1 / 82.1 / 91.2 tok/s**, respectively. They exclude model loading and
-prefill. Canonical-state and token gates pass against this RTX profile; equality against the pair's trellis
-profile is not claimed. Kernel options adopted in the integration line include HC/norm and shared-expert
-fusions, the half-conversion correction, clustered HC, wider expert and attention work, and expanded dense
-outputs. Record processing overlap, router form 2 and single-split QA/KV are separately measured kernel
-follow-ups awaiting full-model confirmation; their gains are not added to these rates.
+Quote code throughput as **82–95 tok/s**: loads vary by up to **~10 %**, so comparisons apply within one load.
+Exact gates pass for this RTX profile; equality against the pair's trellis profile is not claimed.
+Prompt lengths and generated-token counts are unspecified for these latest decode measurements.
+
+| Loading / serving work | Measured result | Status |
+|---|---|---|
+| Pipelined expert loading | Full load **108.7 → 61.8 s**; expert fill **83.1 → 38.0 s**, **2.25 → 6.73 GB/s**, disk-bound | **In development**; bitwise-identical placement and outputs |
+| Persistent loaded worker | **8–18 s per request** on test workloads without reload; fresh-load cache reset **3.4 s** | **In development**; each request bitwise identical to a fresh process |
+| Window prefetch | Gain not established | Implemented, exact; default off, under investigation |
 
 ### Qwen3.8-Flash-Next
 
@@ -244,7 +247,7 @@ node decodes; 64 generated tokens identical to the node-only run at every length
 
 | Mode | Hardware | 1K | 4K | 8K | 16K | 32K | Date | Build |
 |---|---|---:|---:|---:|---:|---:|---|---|
-| Prefill, TTFT | 1 node | **1.13 s** | **3.72 s** | | **14.46 s** | **29.60 s** | 1K 2026-10-22, rest 2026-10-24 | 1K release; rest pre-release `0a646b90` (release: 3.78 / 15.05 / 30.76 s) |
+| Prefill, TTFT | 1 node | **1.13 s** | | | | | 2026-10-22 | release; current opt-in results below |
 | Prefill offload, TTFT | RTX PRO + 1 node | **1.36 s** | **1.92 s** | **2.94 s** | **4.95 s** | **8.99 s** | 2026-10-24 | pre-release `70b93af3` |
 | Same server without the RTX, TTFT | 1 node | 1.80 s | 5.20 s | 10.46 s | 21.43 s | 44.02 s | 2026-10-24 | same server build |
 
@@ -258,12 +261,21 @@ every run exact): TTFT 2.3 % (1K), 3.4 % (4K) and 5.1 % (16K, 32K) lower; decode
 two replicas at concurrency 4 and 8: 3.9 % and 3.6 % more wall throughput, and a 6.9 % lower TTFT at
 concurrency 4. Details in [docs/performance.md](docs/performance.md#qwen38-flash-next-1).
 
-**Evening prefill candidate (2026-10-25, `a85c60ca`).** Combined schedules, dense, GDN, attention, HC and MoE
-changes reduce mean 32,768-token TTFT to **22.95 s** (1,428 tok/s), from 25.78 s in the interleaved baseline.
-That is **45.9 %** of the calculated pooled/overlapped ceiling (3,112 tok/s), or **48.7 %** of the serial-phase
-ceiling (2,933 tok/s). Single node, UD-Q4_K_XL, fast prefill profile, 8,192-row tiles, 32 generated tokens; all
-timed runs have equal final logits digests and tokens, and code-1K/prose-8K gates pass. Integration and maximum-
-context confirmation remain pending, so this stays opt-in.
+**Exact combined prefill candidate (2026-10-25).** One Strix Halo node, Qwen3.8-Flash-Next
+UD-Q4_K_XL, opt-in flags; TTFT includes prompt processing. Prompt kind, repetition counts and generated-token
+counts are unspecified for these latest measurements.
+
+| Prompt length | Baseline TTFT | Candidate TTFT | Change | Candidate tok/s |
+|---|---:|---:|---:|---:|
+| 4K | 3.31 s | **3.02 s** | −8.6 % | 1,356 |
+| 17.7K | 14.63 s | **12.52 s** | −14.4 % | 1,414 |
+| 32K | 25.78 s | **22.95 s** | −11.0 % | 1,428 |
+| 64K | 52.98 s | **46.86 s** | −11.5 % | 1,398 |
+| 128K | 122.2 s | **114.2 s** | −6.5 % | 1,147 |
+| 262,143 tokens | 294.5 s | **248.0 s** | −15.8 % | 1,057 |
+
+About **39–49 %** of the calculated single-node bandwidth ceiling. The 128K result used an earlier variant.
+The candidate remains opt-in; outputs are exact.
 
 Exact MTP draft attention is enabled in the integration candidate. Decode-router work remains under evaluation:
 one-row activation staging improves the draft router, but the combined end-to-end gain is not yet established.
@@ -309,14 +321,16 @@ The integration candidate is not in this release; older batch and speculative ro
 | Output check | 2 nodes | chat-templated prompts (prose, code, JSON, C++ edit) | 1 | coherent answers; speculative ids equal plain greedy in 4/4 | | 2026-10-24 | pre-release `44ec61f4` |
 | Greedy decode, exchange-boundary candidate | 2 nodes | 1K matched replay | 1 | **44.40 ms/token** (22.52 tok/s; 65.7 % of bandwidth ceiling) | exact replay against same-build baseline | 2026-10-25 | integrated in `8cc30ac0`; combined confirmation pending |
 | Greedy decode, exchange-boundary candidate | 2 nodes | 8K matched replay | 1 | **48.32 ms/token** (20.70 tok/s; 60.4 % of bandwidth ceiling) | exact replay against same-build baseline | 2026-10-25 | same candidate |
-| Prefill, TTFT | 2 nodes | 1K / 8K benchmark prompts | 1 | **3.230 / 22.338 s** | state and continuation tokens identical to previous core | 2026-10-25 | pre-release `3e1897a1`, chunk interleave enabled |
+| Prefill, fresh baseline | 2 nodes | 8K benchmark prompt | 1 | **21.87 s** (374.5 tok/s) | exact; combined fresh result not yet measured | 2026-10-25 | integration candidate |
 | Batched decode | 2 nodes | all-defaults bench | 1 / 2 / 4 / 8 | **20.75 / 30.52 / 42.09 / 57.59 tok/s** aggregate | each row identical to running alone | 2026-10-24 | pre-release `3ba49a3d` |
 | DSpark speculative decode | 2 nodes | JSON table conversion, 256 tokens | 1 | **52.03 tok/s** (×2.52) | | 2026-10-24 | pre-release `3ba49a3d` |
 | DSpark speculative decode | 2 nodes | Python code / prose, 256 tokens | 1 | **32.73 tok/s** (code, ×1.59) | DSpark roughly at or below plain speed on prose: 0.88-0.95× on a 6-language set (2026-10-25) | 2026-10-24 | pre-release `3ba49a3d` |
 
 The older DSpark and batch rows retain their measured build; they have not been re-timed on the new decode
-candidate. The exact prefill core is enabled; further combined prefill changes (tiled dense kernels, exact-fit
-MoE tiles, batched router and MSA) await end-to-end gates and timings.
+candidate. New exact prefill items measure **0.78–0.83×** baseline time at 8K and **0.82–0.85×** at 1K
+in the same process;
+a fresh run with all changes enabled is not yet measured. The bitwise expert gate/up kernel fix reduces MoE
+layer time by **3–8 %**; engine A/B confirmation is pending.
 
 **Quality gate (2026-10-25): passed** the pre-registered eight-text evaluation, including two independent,
 byte-identical TP2 runs and all prompt/regime checks. Mean KL to the exact reference is **0.1449** versus
@@ -326,18 +340,20 @@ qualification is conditional on those eight texts; it supersedes the earlier two
 
 ### GLM-5.3 Flash
 
-EXL3 4.05 bpw, two Strix Halo nodes TP2 over USB4; one request, default R1 identity, 64 greedy tokens.
+EXL3 4.05 bpw, two Strix Halo nodes TP2 over USB4; default R1 identity.
+Prompt lengths and generated-token counts are unspecified for the latest decode measurement.
 
 | Mode | Prompt / context | Measured | Date | Status / exactness |
 |---|---|---:|---|---|
-| Greedy decode | 31-token chat prompt | **47.46 ms/token = 21.07 tok/s** | 2026-10-25 evening | `ad6ea409`; tokens equal the prior default anchor |
-| Fraction of bandwidth ceiling | same | **49 %** (calculated 23.2 ms/token floor at ~1K context) | 2026-10-25 | bound uses 246.7 GB/s per node |
-| R1b summation-order experiment | same chat + code/prose/JSON prefixes, 64 tokens each | **45.41–45.59 ms/token** | 2026-10-25 | one run per prompt; separate versioned identity, opt-in |
+| Greedy decode | Decode workload; default R1 | **47.47–47.51 ms/token = 21.07 tok/s**, previously 54.82 ms/token | 2026-10-25 | exact |
+| Fraction of bandwidth ceiling | same | **49 %** (calculated 23.2 ms/token floor) | 2026-10-25 | calculated bound |
+| Exact prefill rework | Synthetic gate model | **12.98 → 3.80 ms/token** (**3.4×** faster) | 2026-10-25 | real-model TTFT not yet measured |
+| R1b summation-order experiment | Alternative numerical identity | **99.14 %** top-1 agreement; closer to a float64 reference | 2026-10-25 | opt-in; not the default |
 
 Fused attention projections and the revised HC path preserve the default identity. The R≥3 memory fault was
 fixed by removing a shadowed dimension constant; synthetic multi-row checks pass, while real-pair batch timing
-still needs confirmation. Chunked prefill integration passes kernel and engine gates, with a real-pair timing
-rerun pending; no new prefill speed is claimed here.
+still needs confirmation. The exact prefill speedup above is measured only on the synthetic gate model;
+real-model TTFT remains unmeasured.
 
 R1b changes FP32 summation order: it diverges from default greedy output on chat and code, while the tested
 prose and JSON continuations agree. Wider quality and timing qualification remains open; it is never silently
