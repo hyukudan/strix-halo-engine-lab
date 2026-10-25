@@ -21,8 +21,8 @@ Es nuestro propio motor de inferencia en C++/HIP para **AMD Strix Halo** (Ryzen 
   RTX PRO 6000 leyendo el prompt, un prompt de 32K tokens recibe su primer token en **9,0 s**.
 - **DeepSeek V4.1 Flash** repartido entre **dos nodos por USB4** (paralelismo tensorial de expertos), con una
   **RTX PRO 6000** opcional que se encarga de las 22 primeras capas. Los prompts de código decodifican a
-  **62,3 tok/s** en el par (prosa, unos 38 tok/s) y a **81,1 tok/s** con la RTX PRO; ocho flujos en lote llegan a
-  **101 tok/s**.
+  **70,6 tok/s** en el par (prosa, unos 42-45 tok/s) y a **81,1 tok/s** con la RTX PRO; ocho flujos en lote llegan a
+  **108 tok/s**.
 - **MiniMax M3.1 Flash** en el par está en puesta en marcha, con unos primeros números preliminares.
 
 Cada kernel, disposición de memoria y decisión de planificación está escrita para este chip y estos modelos. La
@@ -61,7 +61,7 @@ normal allí donde lo afirmamos, y cada una de esas afirmaciones la comprueba un
 | **DeepSeek V4.1 Flash** (1017; expertos de 2 bits, denso de 6,5 bits + trellis) | 2 nodos por USB4 | **Producción** (defaults de dos nodos D-061) | Decode con paralelismo tensorial de expertos, prefill en dispositivo con paralelismo de expertos, decode especulativo DSpark, decode por lotes, servidor; puertas bit a bit |
 | DeepSeek V4.1 Flash + RTX PRO 6000 | RTX PRO (capas 0-21) + 2 nodos (22-39) | **Experimental** (opt-in, D-064) | Reparto en tubería por 1 GbE, servicio de prefill CUDA, colocación de expertos calientes |
 | MiniMax M3.1 Flash (EXL3, 3,06 bpw) | 2 nodos | **Puesta en marcha**, no está en esta versión | Salida coherente en el par, decode especulativo DSpark exacto frente a greedy; solo números preliminares |
-| GLM-5.3 Flash (GGUF) | 2 nodos | **Pruebas previstas** | Sin empezar en el motor |
+| GLM-5.3 Flash (EXL3, 4,05 bpw) | 2 nodos | **Puesta en marcha** | Los pesos reales se ejecutan con exactitud en un nodo (6 capas comprobadas frente a una reproducción independiente, bit a bit); lo siguiente es la ejecución en dos nodos; aún sin cifras de velocidad |
 
 El núcleo no conoce ningún modelo: cada familia es un módulo con su contrato, su plan, sus kernels y sus puertas
 ([docs/models/model-families.md](docs/models/model-families.md)). Los perfiles automáticos solo admiten los ficheros de modelo
@@ -108,17 +108,17 @@ codificación trellis. 2 nodos, paralelismo tensorial de expertos (TP2) por USB4
 
 | Modo | Hardware | Prompt / contexto | Concurrencia | Mejor | Típico | Fecha | Build |
 |---|---|---|---:|---:|---:|---|---|
-| Decode greedy | 2 nodos | prompt corto | 1 | **32,7 tok/s** (30,6 ms/token) | igual (no depende del texto) | 2026-10-24 *(actualizándose)* | pre-versión `f9332f3e`; versión: 28,5 tok/s |
-| Decode especulativo DSpark | 2 nodos | 8 prompts por tipo, 256 tokens cada uno | 1 | **62,3 tok/s** (código) | 37,5 (inglés) / 39,3 (español); 46,4 en los 24 | 2026-10-22 | versión |
-| Decode en lote, sin borrador | 2 nodos | 8 prompts, 48 tokens cada uno | 8 | **101,3 tok/s** agregados | igual (no depende del texto) | 2026-10-24 *(actualizándose)* | pre-versión `7ab7fc12`; versión: 95,9 tok/s |
-| Prefill en dispositivo (paralelo por expertos) | 2 nodos | 1K | 1 | TTFT **2,20 s** (465 tok/s) | | 2026-10-24 | pre-versión `43086d05` |
-| Prefill en dispositivo | 2 nodos | 8K | 1 | TTFT **10,78 s** (760 tok/s) | | 2026-10-24 *(actualizándose)* | pre-versión `f9332f3e`; versión: 734 tok/s |
-| Prefill en dispositivo | 2 nodos | 16K | 1 | 758 tok/s | | 2026-10-22 *(actualizándose)* | versión |
+| Decode greedy | 2 nodos | prompt corto | 1 | **34,7 tok/s** (28,8 ms/token) | igual (no depende del texto) | 2026-10-25 | pre-versión `940a4b85`; versión: 28,5 tok/s |
+| Decode especulativo DSpark | 2 nodos | 8 prompts por tipo, 256 tokens cada uno | 1 | **70,6 tok/s** (código) | 41,9 (inglés) / 45,3 (español); 50,0 en los 24 | 2026-10-24 | pre-versión `cab238d6` |
+| Decode en lote, sin borrador | 2 nodos | 8 prompts, 48 tokens cada uno | 8 | **108,2 tok/s** agregados | igual (no depende del texto) | 2026-10-24 | pre-versión `cab238d6` |
+| Prefill en dispositivo (paralelo por expertos) | 2 nodos | 1K | 1 | TTFT **2,18 s** (469 tok/s) | | 2026-10-24 | pre-versión `cab238d6` |
+| Prefill en dispositivo | 2 nodos | 8K | 1 | TTFT **10,78 s** (760 tok/s) | | 2026-10-24 | pre-versión `f9332f3e`; versión: 734 tok/s |
+| Prefill en dispositivo | 2 nodos | 16K | 1 | TTFT **20,40 s** (803 tok/s) | | 2026-10-24 | pre-versión `f9332f3e` |
 | Prefill en dispositivo | 2 nodos | 32K | 1 | TTFT **39,6 s** (828 tok/s), 2 ejecuciones | | 2026-10-23 | pre-versión `43086d05` + defaults de prefill |
 | Servidor, un cliente, chat | 2 nodos | prompt de chat | 1 | **66,9 tok/s** (código) | 34,9 tok/s (prosa) | 2026-10-22 | versión |
 | Servidor, 8 chats × 128 tokens | 2 nodos | prompts de chat | 1 / 2 / 4 / 8 | **41,4 / 54,0 / 59,7 / 67,9 tok/s** agregados | | 2026-10-22 | versión |
 | Servidor, conjunto corto de 8 categorías | 2 nodos | prompts de 36-303 tokens | 1 / 2 / 4 / 8 | | 38,4 / 52,7 / 59,3 / 66,8 tok/s agregados | 2026-10-22 | versión |
-| TTFT del servidor | 2 nodos | 8K, servidor en reposo | 1 | **15,8 s** | 27,9 s con otros 4 flujos decodificando | 2026-10-22 | versión |
+| TTFT del servidor | 2 nodos | 8K, servidor en reposo | 1 | **15,8 s** | 26,4 s con otros 4 flujos decodificando (pre-versión `cab238d6`, 2026-10-24) | 2026-10-22 | versión |
 
 **DeepSeek con la RTX PRO** (opt-in; mismos ficheros del modelo; la RTX ejecuta las capas 0-21 con CUDA y los dos
 nodos las capas 22-39 y la cabeza):
@@ -200,14 +200,14 @@ Todas las filas: MiniMax M3.1 Flash, pesos trellis EXL3 a 3,06 bits por peso, 2 
 | Modo | Hardware | Prompt / contexto | Concurrencia | Mejor | Típico | Fecha | Build |
 |---|---|---|---:|---:|---:|---|---|
 | Comprobación de la salida | 2 nodos | prompts con plantilla de chat (prosa, código, JSON, edición C++) | 1 | respuestas coherentes; ids especulativos iguales al greedy normal en 4/4 | | 2026-10-24 | pre-versión `44ec61f4` |
-| Decode greedy | 2 nodos | 1K | 1 | **6,54 tok/s** (152,9 ms/token) | igual (no depende del texto) | 2026-10-24 *(actualizándose)* | pre-versión `d33da74d` |
-| Decode greedy | 2 nodos | 8K | 1 | 5,32 tok/s, 1 ejecución | | 2026-10-24 *(actualizándose)* | pre-versión `17ddf83f` (antes de los kernels MoE) |
-| Prefill, TTFT | 2 nodos | 1K / 8K | 1 | **6,67 s** / 57,1 s (8K: 1 ejecución) | | 2026-10-24 *(actualizándose)* | 1K `d33da74d`, 8K `17ddf83f` |
-| Decode especulativo DSpark | 2 nodos | conversión de una tabla a JSON, 256 tokens | 1 | **19,31 tok/s** (×3,6) | | 2026-10-24 | pre-versión `44ec61f4` |
-| Decode especulativo DSpark | 2 nodos | edición C++, prompt de 1K tokens, 256 tokens | 1 | **17,33 tok/s** (×3,2) | | 2026-10-24 | pre-versión `44ec61f4` |
-| Decode especulativo DSpark | 2 nodos | código Python / prosa en inglés, 256 tokens | 1 | 10,82 tok/s (código, ×2,0) | **6,23 tok/s** (prosa, ×1,16) | 2026-10-24 | pre-versión `44ec61f4` |
+| Decode greedy | 2 nodos | 1K | 1 | **20,64 tok/s** (48,44 ms/token) | prompts de chat: 20,66 tok/s, 256 tokens ×3 | 2026-10-24 | pre-versión `3ba49a3d` |
+| Decode greedy | 2 nodos | 8K | 1 | **19,68 tok/s** (50,80 ms/token) | igual (no depende del texto) | 2026-10-24 | pre-versión `3ba49a3d` |
+| Prefill, TTFT | 2 nodos | 1K / 8K | 1 | **5,20 s** / 37,73 s (217 tok/s) | | 2026-10-24 | pre-versión `3ba49a3d` |
+| Decode en lote | 2 nodos | prueba con valores por defecto | 1 / 2 / 4 / 8 | **20,75 / 30,52 / 42,09 / 57,59 tok/s** agregados | cada fila idéntica a su ejecución por separado | 2026-10-24 | pre-versión `3ba49a3d` |
+| Decode especulativo DSpark | 2 nodos | conversión de una tabla a JSON, 256 tokens | 1 | **52,03 tok/s** (×2,52) | | 2026-10-24 | pre-versión `3ba49a3d` |
+| Decode especulativo DSpark | 2 nodos | código Python / prosa, 256 tokens | 1 | **32,73 tok/s** (código, ×1,59) | DSpark aproximadamente a la velocidad del greedy normal o por debajo en prosa: 0,88-0,95× en un conjunto de 6 idiomas (2026-10-25) | 2026-10-24 | pre-versión `3ba49a3d` |
 
-Las mejoras de DSpark son frente al greedy normal con el mismo build (5,37 tok/s). **Puerta de calidad**
+Las mejoras de DSpark son frente al greedy normal con el mismo build (20,6 tok/s). **Puerta de calidad**
 (distribución con teacher forcing frente a una referencia exacta, 7 reglas pre-registradas, dos prompts): el segundo
 prompt pasa las 7 reglas; el primero pasa 6 y se queda a 2,1 puntos en el acuerdo top-1 con la referencia exacta
 (71,7 % frente al 73,8 % exigido), mientras que su top-1 frente al texto real está a menos de 1 punto de nuestra
@@ -418,7 +418,7 @@ En curso, sin cifras prometidas:
 
 - **MiniMax M3.1 Flash (EXL3) en el par:** el modelo completo funciona en los dos nodos con DSpark; lo siguiente
   son kernels de decode más rápidos, una puerta de calidad más amplia y el servidor.
-- **GLM-5.3 Flash:** primeras pruebas en el par.
+- **GLM-5.3 Flash:** puesta en marcha iniciada; lo siguiente es la primera ejecución en dos nodos.
 - **DeepSeek:** una ruta de "listo" de menor latencia para el intercambio USB4 y cerrar la campaña de defaults de los
   flags opt-in más nuevos; tiempo hasta el primer token de extremo a extremo del prefill CUDA exacto a través del
   servidor del par.

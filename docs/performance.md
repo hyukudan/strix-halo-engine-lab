@@ -137,22 +137,24 @@ token per node, 6.5-bit 0.0447 at 3.63 GB; paired ΔKL −0.0001.
 
 ## After this release (pre-release builds)
 
-Measured 2026-10-23/24 on integration builds that are not in this repository yet (the hash is our build id).
+Measured through 2026-10-25 on integration builds that are not in this repository yet (the hash is our build id).
 Same hardware, greedy, every run exact against its reference before its time is counted.
 
 ### DeepSeek V4.1 Flash, pair
 
 | What | Value | Date | Build | Conditions and exactness |
 |---|---|---|---|---|
-| Greedy decode, 1 stream | **30.6 ms/token = 32.7 tok/s** (release build of the same day: 34.7 ms/token) | 2026-10-24 | `f9332f3e` + trellis library release candidate | interleaved A/B ×3 against the production build; both ranks identical to the stored reference in every run. Trellis-coded attention sites, staged-ready exchange views, parallel CRC host path |
-| Verify window of 6 rows | 58.92 ms/window (production 63.25) | 2026-10-24 | same | same |
-| Batched decode, 8 streams | **78.97 ms/step = 101.3 tok/s** aggregate (N = 1 / 2 / 4: 34.21 / 41.40 / 54.38 ms/step) | 2026-10-24 | `7ab7fc12` | shared expert computed during the expert exchange; 8 prompts × 48 tokens; tokens identical to the reference; interleaved A/B ×3, ranges disjoint |
-| Device prefill, 1K | TTFT **2.20 s** (465 tok/s) | 2026-10-24 | `43086d05` | the newer candidate is 1.1 % slower at 1K (2.23 s); root cause in progress. Logits identical on both ranks |
+| Greedy decode, 1 stream | **28.8 ms/token = 34.7 tok/s** (production: 34.8 ms/token) | 2026-10-25 | pre-release `940a4b85` + trellis library release candidate | interleaved with the previous candidate, 3 clean runs; every run exact against its reference on both ranks |
+| Verify window of 6 rows | 54.77 ms/window (production 63.30) | 2026-10-25 | pre-release `940a4b85` | same confirmation; verify windows including rejected rows are bit-equal to one-row decode on both ranks |
+| Batched decode, 8 streams | **73.93 ms/step = 108.2 tok/s** aggregate (production 85.64 ms/step) | 2026-10-24 | pre-release `cab238d6` | no drafting, 8 prompts × 48 tokens; 3 interleaved runs per arm; tokens identical |
+| Device prefill, 1K | TTFT **2.18 s** (469 tok/s; production 2.21 s) | 2026-10-24 | pre-release `cab238d6` | interleaved A/B ×3; logits identical on both ranks and between builds |
 | Device prefill, 8K | TTFT **10.78 s** (760 tok/s) | 2026-10-24 | `f9332f3e` | production 11.21 s in the same session; logits identical on both ranks and between builds |
+| Device prefill, 16K | TTFT **20.40 s** (803 tok/s; production 21.36 s) | 2026-10-24 | pre-release `f9332f3e` | A/B ×3 in the same session; logits identical |
 | Device prefill, 32K | TTFT **39.55 s** (828 tok/s), 2 runs | 2026-10-23 | `43086d05` with the three prefill defaults of the next release | defaults campaign; base 41.37 s; logits identical |
+| DSpark speculative decode, 1 stream | **49.97 tok/s** over all 24; code 70.57 / English 41.94 / Spanish 45.33 (production 45.11 over all 24; code 62.62 / English 38.68 / Spanish 40.34) | 2026-10-24 | pre-release `cab238d6` | 8 English / 8 Spanish / 8 code prompts × 256 tokens; 3 interleaved runs per arm; every speculative run equals plain greedy on 24/24 prompts |
+| Server time to first token, 8K prompt while 4 other streams decode | **26.40 s** (production 28.18 s) | 2026-10-24 | pre-release `cab238d6` | 3 interleaved runs per arm; ids identical idle vs loaded |
 
-A confirmation of the combined candidate (batched decode, server, DSpark, 16K prefill, 8K server TTFT) is running;
-those rows are refreshed when it closes.
+The server aggregate rows at 1-8 clients will be refreshed with the same candidate.
 
 ### Qwen3.8-Flash-Next
 
@@ -173,13 +175,13 @@ EXL3 trellis weights at 3.06 bits per weight, two nodes, tensor parallel over US
 
 | What | Value | Date | Build | Conditions and exactness |
 |---|---|---|---|---|
-| Greedy decode, 1K prompt | **152.9 ms/token = 6.54 tok/s** | 2026-10-24 | `d33da74d` | optimized MoE and decode linear kernels, A/B ×3 in process, tokens identical across arms; 1K TTFT 6.67 s (median of 3) |
-| Greedy decode, 8K prompt | 187.9 ms/token = 5.32 tok/s; TTFT 57.1 s | 2026-10-24 | `17ddf83f` | before the MoE kernels; 1 run |
-| DSpark decode by text, 256 tokens | JSON table **19.31** (×3.6), C++ edit with a 1K prompt **17.33** (×3.2), Python 10.82 (×2.0), English prose 6.23 (×1.16) tok/s | 2026-10-24 | `44ec61f4` | chat-templated prompts, output coherent; ids equal plain greedy (5.37 tok/s on this build) in 4/4 |
+| Greedy decode, 1K prompt | **48.44 ms/token = 20.64 tok/s**; chat prompts 20.66 tok/s | 2026-10-24 | pre-release `3ba49a3d` | all-defaults bench, 256 tokens ×3; ranks agree, token ids checked |
+| Greedy decode, 8K prompt | **50.80 ms/token = 19.68 tok/s** | 2026-10-24 | pre-release `3ba49a3d` | all-defaults bench; ranks agree, token ids checked |
+| Prefill / time to first token, 1K / 8K | **5.20 / 37.73 s** (217 tok/s) | 2026-10-24 | pre-release `3ba49a3d` | all-defaults bench; ranks agree, token ids checked |
+| Batched decode, N = 1 / 2 / 4 / 8 | **20.75 / 30.52 / 42.09 / 57.59 tok/s** aggregate | 2026-10-24 | pre-release `3ba49a3d` | all-defaults bench; each row identical to running alone |
+| DSpark decode, JSON table, 256 tokens | **52.03 tok/s** (×2.52) | 2026-10-24 | pre-release `3ba49a3d` | bundled K4 drafter; ids equal plain greedy on the same build (20.6 tok/s) |
+| DSpark decode, Python code / prose, 256 tokens | Python **32.73 tok/s** (×1.59); English prose 22.68 tok/s (×1.10); on the wider set, DSpark is roughly at or below plain speed on prose (0.88-0.95×), and 1.8-2.2× on code and JSON | 2026-10-24; wider set 2026-10-25 | pre-release `3ba49a3d` | bundled K4 drafter; ids equal plain greedy in all three initial prompts and on the wider set of 16 prompts: 2 each in 6 languages plus code and JSON |
 | Quality gate (teacher-forced, 7 pre-registered rules) | prompt B: 7/7 pass; prompt A: 6/7, top-1 agreement with the exact reference 71.7 % against 73.8 % required | 2026-10-24 | pair build | top-1 against the real text within 1 point of the CPU reference; **not declared passed**; a gate with more prompts is planned |
-
-An all-defaults MiniMax measurement (decode 1K/8K with and without the exchange module, DSpark variants) is
-running; these rows are refreshed when it lands.
 
 ## The USB4 link
 
