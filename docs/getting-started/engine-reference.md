@@ -143,6 +143,14 @@ organization flags, and target-input export/diagnostic routes. **MTP decode and 
 fast prefill automatically yet.** GSQ manifests decline the new auto route; default-injected settings are
 filtered per GSQ owner, so GSQ runs without the former requirement to disable the whole default set.
 
+Diagnostic and execution-control variables also decline the auto route (reason
+`explicit-diagnostic-or-execution-control`, with the decline line): `STRIX_PREFILL_LOGITS_DIGEST`,
+`STRIX_RTX_EXPORT_STATE`, `STRIX_QRTX_STEP_DUMP` and `STRIX_PROMPT_BATCH_ROWS` (any value other than empty or `0`).
+A declined run uses the historical resolution, including its 8192-token default context: a prompt longer than
+that fails with "input token sequence exceeds allocated context" unless `--context` is given, and a long prompt
+runs serial prefill (much slower than the auto route). Leave these variables unset for normal runs; use
+`--print-effective-config` to check which route a command resolves to.
+
 Off switches:
 
 - `--baseline` / `STRIX_BASELINE=1`: disable the new policy and all controlled QPF2K, PLE and wrapper defaults;
