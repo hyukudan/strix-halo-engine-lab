@@ -1102,7 +1102,7 @@ RopeTables::RopeTables(std::uint32_t positions) : positions_(positions) {
         const RopeKind kind = k == 0 ? RopeKind::window : RopeKind::compressed;
         for (std::uint32_t p = 0; p < positions; ++p) h[p] = rope_row(kind, p);
         RopeRow*& d = k == 0 ? window_ : compressed_;
-        STRIX_CUDA_CHECK(cudaMalloc(&d, sizeof(RopeRow) * std::max<std::size_t>(positions, 1)));
+        STRIX_CUDA_CHECK(cudaMalloc(&d, rope_table_bytes(positions)));
         STRIX_CUDA_CHECK(cudaMemcpy(d, h.data(), sizeof(RopeRow) * positions, cudaMemcpyHostToDevice));
     }
 }

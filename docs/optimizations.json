@@ -1166,6 +1166,17 @@
     "doc_anchor": "docs/optimizations.md#rtx-kernels"
   },
   {
+    "engine": "deepseek-rtx",
+    "name": "Lean decode state",
+    "flag_or_env": "--lean-state",
+    "default": "ON",
+    "exact": "Bitwise against the full state at 2K-128K: prefill states, greedy logits and tokens, DSpark windows, replica gates, chat tokens, worker requests.",
+    "gain": "32K state 2,486 to 59 MiB (+264 expert slots, plain decode +3.0 %); 128K loads (195 MiB state).",
+    "preconditions": "Standalone RTX replica or CUDA decode tool.",
+    "off_switch": "--no-lean-state",
+    "doc_anchor": "docs/optimizations.md#lean-decode-state"
+  },
+  {
     "engine": "minimax",
     "name": "Master baseline",
     "flag_or_env": "STRIX_MM_BASELINE",

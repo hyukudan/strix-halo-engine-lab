@@ -11,7 +11,7 @@
 //    enqueue_layer(), which runs one layer's attention from the outputs of the Q8_0 sites (x after attn_norm, qr after
 //    q_a_norm, q = attn_q_b, kv = attn_kv) to o (after the inverse RoPE, the input of attn_output_a).
 #include "strix/cuda_ds41_common.hpp"
-#include "strix/ds41_attention.hpp"
+#include "strix/cuda_ds41_attention_alloc.hpp"
 
 #include <cuda_runtime.h>
 
@@ -112,12 +112,6 @@ struct SelectView {
     std::uint32_t* survivors = nullptr;  // scratch select_survivor_words(R, max_count, topk) (rows above kSelDirect)
     bool long_context = false;          // opt in to > 512K entries (up to kSelMaxSlices slices)
 };
-// Rows of up to kSelDirect positions are selected in one block; longer rows in two levels over slices of kSelSlice.
-inline constexpr unsigned kSelDirect = 8192, kSelSlice = 4096, kSelMaxSlices = 512;
-[[nodiscard]] constexpr std::size_t select_survivor_words(std::uint32_t rows, std::uint32_t max_count, std::uint32_t topk) {
-    const std::size_t slices = (std::size_t{max_count} + kSelSlice - 1U) / kSelSlice;
-    return max_count > kSelDirect ? std::size_t{rows} * slices * (2U * std::size_t{topk} + 1U) : 0U;
-}
 void enqueue_select(const SelectView& v, cudaStream_t stream);
 
 struct AttentionView {
@@ -188,18 +182,6 @@ struct LayerIo {
     float* o = nullptr;                  // R x 64 x 512, attention output after the inverse RoPE
 };
 
-struct LayerAttentionOptions {
-    std::uint32_t first_layer = 0, end_layer = 40;  // layers [first, end) run here
-    std::uint32_t max_positions = 0;                // context length (positions 0 .. max_positions - 1)
-    std::uint32_t max_rows = kMaxRows;              // rows of one call (decode window 8; a prefill chunk more)
-    std::uint32_t window_rows = 64;                 // prefill: indexer / selection / attention launches of this many rows
-    std::uint32_t hidden = 0, q_lora_rank = 0;     // the model's hidden_size and q_lora_rank (required)
-    // External drivers can supply their own workspace and compact the decoder's per-row selection/candidate data.
-    // Defaults retain the original enqueue_layer allocation and layout.
-    bool allocate_workspace = true;
-    std::uint32_t decoder_rows = 0;                // 0: max_rows; layers >= 20 only
-    std::uint32_t candidate_rows = 0;              // 0: max_rows
-};
 
 // Per-layer state of layers [first, end): ring (every layer), compressed KV / index keys and the ratio-2 carry (KV
 // sources), the last selection (index sources), the candidate pool (candidate source). Sources outside the range

@@ -74,15 +74,16 @@ enum class ExpertTier : std::uint8_t { device = 0, host = 1, file = 2 };
 struct CudaPrefillOptions {
     std::uint32_t first_layer = 0, end_layer = 40;  // layers [first, end); embedding when first == 0, head when end == 40
     std::uint32_t max_positions = 8192;             // context capacity (global positions)
-    // Opt-in long context: row buffers hold at most pass_rows; KV/index keys and RoPE hold max_positions.
+    // Bounded prefill: row buffers hold min(pass_rows, max_positions); keys and RoPE hold max_positions.
     // Zero preserves the original single-pass allocation and execution path.
-    std::uint32_t pass_rows = 0;
+    std::uint32_t pass_rows = 0;  // F = 8192 bounds row memory; exact but slower (more expert streaming per pass)
     std::uint32_t chunk_rows = 1024;                // row-local chunk (q_b, attention windows, o_a / o_b, Engram)
     std::uint32_t moe_chunk_rows = 4096;            // routed-expert chunk
     std::uint32_t window_rows = 64;                 // attention call rows (<= attn::kMaxCallRows)
     // An object that only imports a state and decodes (step): none of run()'s prefill buffers (sized by max_positions,
     // chunk_rows, moe_chunk_rows) are allocated, the routed scratch is sized for decode_rows, and run() is refused.
     bool decode_only = false;
+    bool lean_state = true;                        // decode_only: Dmax rows and a 136 + Dmax ring; false restores original state
     bool cone = true;                               // exact suffix replay (only with the full 40 layers)
     std::uint32_t draft_rows = 0;                   // drafter seed rows the cone also covers
     // Approximate bounded decoder replay: 0 (default) keeps the exact cone; 256 caps
@@ -152,7 +153,7 @@ struct CudaPrefillOptions {
     int device = 0;
 
     // ---- incremental decode (step(): R <= decode_rows rows after a run(), an import_state() or a previous step) ----
-    std::uint32_t decode_rows = 8;                  // most rows of one step (the decode windows: 1..8)
+    std::uint32_t decode_rows = 8;                  // decode_max_rows Dmax (the decode windows: 1..8)
     // CUDA graphs of the step: after decode_graph_warmup eager steps of a shape, the step runs as captured graph
     // segments (one launch per segment: [first, first Engram layer) and the rest + head), the positions, token ids
     // and Engram rows read by the graph's own copies from pinned host buffers. Captured per (rows, position bucket,
@@ -455,6 +456,8 @@ public:
     // With pass_rows (a long-context object) the state is the one extend() continues (its producers' selections must
     // be known); step() / decode_residency() refuse such objects.
     void import_state(const deepseek41::AttentionState& state);
+    void clear_decode_graphs() noexcept;  // drain before freeing external capture destinations
+    void reserve_decode_buffers();  // fixed ABI and boundary staging, before external arena planning
     // A fresh sequence at position 0 without a prefill: every cache, carry and selection zeroed, no tokens; the next
     // step's rows start at position 0 (a pipeline FRONT that feeds the prompt as decode rows, as the pair's decode does).
     void reset_sequence();

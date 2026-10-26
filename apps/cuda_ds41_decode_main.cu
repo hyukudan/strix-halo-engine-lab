@@ -3,7 +3,7 @@
 //   strix-cuda-ds41-decode MODEL.gguf (--prompt-ids FILE [--tokens T] | --import-state FILE) [--positions N]
 //       [--layers END] [--steps N] [--rows R] [--ref PAIR_LOG] [--check-run] [--hashes] [--split K]
 //       [--tiers DHF.. | --device-gib G] [--slots S] [--eager | --graphs-ab] [--graph-warmup N] [--bucket B]
-//       [--timing | --timing-layers] [--stops K1,K2,..] [--stop-steps N] [--no-spin] [--engram file|zero] [--json OUT]
+//       [--timing | --timing-layers] [--stops K1,K2,..] [--stop-steps N] [--no-spin] [--no-lean-state] [--engram file|zero] [--json OUT]
 //       [--expert-tp] [--overlay OVERLAY.gguf]
 // --fuse-hc / --fuse-shared: opt-in exact decode launch fusions (default off).
 // --expert-tp + --overlay c-u6.gguf: the pair's P15 target identity (ds41-expert-tp2-i1152-v1 on the c-u6 dense weights).
@@ -330,6 +330,7 @@ int main(int argc, char** argv) {
         else if (a == "--timing-layers") { o.timing = true; o.timing_ops = false; }
         else if (a == "--stops") stops_arg = next();
         else if (a == "--stop-steps") stop_steps = static_cast<std::uint32_t>(std::stoul(next()));
+        else if (a == "--no-lean-state") o.lean_state = false;
         else if (a == "--no-spin") o.decode_spin = false;
         else if (a == "--engram") o.engram = next();
         else if (a == "--buffered") o.engram_direct = false;
@@ -381,6 +382,8 @@ int main(int argc, char** argv) {
     if (ids_file.empty() == state_file.empty()) usage("one of --prompt-ids or --import-state");
     if (rows < 1U || rows > 8U) usage("--rows 1..8");
     o.decode_rows = std::max<std::uint32_t>(rows, 1U);
+    // Import and from-zero use only step(); prompt/run comparisons retain the prefill object.
+    o.decode_only = !state_file.empty() || from_zero;
     std::vector<std::uint32_t> prompt;
     strix::deepseek41::AttentionState imported;
     if (!ids_file.empty()) {

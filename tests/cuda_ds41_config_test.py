@@ -73,7 +73,7 @@ with tempfile.TemporaryDirectory(prefix='ds41-config-', dir=Path.cwd()) as tmp:
                     q8_r1=False, q8_r1_pad=False, draft_keep=0, draft_keep_ids=[], controller_prior='none',
                     controller_costs='none', wb_defer=False, controller_scope='run', host_spares=96,
                     arena_gib=71.5, draft_vocab='full', warmup_graphs='none', residency_seed='none',
-                    residency_save='none', engram_cache_mb=0, load_serial=True, attn_warps=0, max_rows=1, pressure_spares=4)
+                    residency_save='none', engram_cache_mb=0, load_serial=True, attn_warps=0, max_rows=1, pressure_spares=4, lean_state=False, arena_auto=False)
     for key, value in expected.items():
         assert old[key] == value, (key, old[key], value)
     for key in ('decode_fuse_hc', 'decode_fuse_shared', 'decode_router_v2', 'decode_ob_one',
@@ -92,13 +92,16 @@ with tempfile.TemporaryDirectory(prefix='ds41-config-', dir=Path.cwd()) as tmp:
                         (['--draft-vocab', 'full'], {'draft_vocab'}),
                         (['--residency-seed', 'none'], {'residency_seed'}),
                         (['--controller-scope', 'run'], {'controller_scope'}),
-                        (['--host-spares', '96'], {'host_spares'})]:
+                        (['--host-spares', '96'], {'host_spares'}),
+                        (['--no-lean-state'], {'lean_state'}), (['--arena-gib', 'auto'], {'arena_auto'})]:
         assert diff(default, call(flags)) == keys, flags
     assert diff(default, call(extra={'DG_LOAD_SERIAL': '1'})) == {'load_serial'}
     assert call(['--baseline'], extra={'DG_LOAD_SERIAL': '0'})['load_serial'] is False
     # Ordering: baseline resets earlier options; later flags override their own items.
     assert call(['--host-spares', '7', '--baseline']) == old
     assert call(['--baseline', '--host-spares', '7'])['host_spares'] == 7
+    assert call(['--arena-gib', 'auto', '--baseline'])['arena_auto'] is False
+    assert call(['--baseline', '--lean-state'])['lean_state'] is True
     assert call(['--host-spares', '7'], extra={'STRIX_DS41_RTX_BASELINE': '1'})['host_spares'] == 7
     for flags, key, value in [(['--dsrtxk'], 'dsrtxk', True), (['--fuse'], 'fuse', True),
                               (['--q8-r1'], 'q8_r1', True), (['--router-pf'], 'router_form', 2),

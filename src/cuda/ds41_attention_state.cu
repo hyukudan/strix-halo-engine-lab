@@ -43,7 +43,8 @@ AttentionState::AttentionState(std::vector<ds41::attn::LayerAttention> plan, con
         o.hidden == 0U || o.hidden % 256U != 0U || o.q_lora_rank == 0U || o.q_lora_rank % 256U != 0U ||
         o.decoder_rows > o.max_rows || o.candidate_rows > o.max_rows)
         throw std::invalid_argument("ds41 cuda attention state: options (layers, positions, rows, hidden, q_lora_rank)");
-    ring_capacity_ = kWindow + o.max_rows;
+    const auto ledger = attention_allocations(I.plan, o);
+    ring_capacity_ = ledger.ring_rows;
     rope_ = std::make_unique<RopeTables>(o.max_positions);
     // layers needing caches: the range and every source it reads
     std::vector<bool> need(I.plan.size(), false);
@@ -61,39 +62,39 @@ AttentionState::AttentionState(std::vector<ds41::attn::LayerAttention> plan, con
         if (!need[l]) continue;
         const auto& r = I.plan[l];
         auto& c = I.caches[l];
-        if (l >= o.first_layer && l < o.end_layer) c.ring = I.alloc<std::uint8_t>(std::size_t{ring_capacity_} * kWindowEntryBytes);
+        if (l >= o.first_layer && l < o.end_layer) c.ring = I.alloc<std::uint8_t>(ledger.bytes("ring", static_cast<int>(l)) / sizeof(std::uint8_t));
         if (r.owns_kv) {
-            const std::size_t entries = o.max_positions / r.ratio + 1U;
-            c.kv_cache = I.alloc<std::uint8_t>(entries * kKvEntryBytes);
-            c.idx_cache = I.alloc<std::uint8_t>(entries * kIdxEntryBytes);
+            c.kv_cache = I.alloc<std::uint8_t>(ledger.bytes("kv_cache", static_cast<int>(l)) / sizeof(std::uint8_t));
+            c.idx_cache = I.alloc<std::uint8_t>(ledger.bytes("idx_cache", static_cast<int>(l)) / sizeof(std::uint8_t));
             if (r.ratio == 2U) {
-                c.carry = I.alloc<float>(2 * kHeadDim);
-                c.carry_valid = I.alloc<std::uint32_t>(1);
-                if (l >= o.first_layer && l < o.end_layer) c.carry_rows = I.alloc<float>(std::size_t{o.max_rows} * 2U * kHeadDim);
+                c.carry = I.alloc<float>(ledger.bytes("carry", static_cast<int>(l)) / sizeof(float));
+                c.carry_valid = I.alloc<std::uint32_t>(ledger.bytes("carry_valid", static_cast<int>(l)) / sizeof(std::uint32_t));
+                if (l >= o.first_layer && l < o.end_layer && o.allocate_workspace) c.carry_rows = I.alloc<float>(ledger.bytes("carry_rows", static_cast<int>(l)) / sizeof(float));
             }
         }
         if (r.owns_index) {
             c.rows = l >= 20U && o.decoder_rows != 0U ? o.decoder_rows : o.max_rows;
-            c.idx = I.alloc<std::uint32_t>(std::size_t{c.rows} * kTopK);
-            c.idx_count = I.alloc<std::uint32_t>(c.rows);
+            c.idx = I.alloc<std::uint32_t>(ledger.bytes("idx", static_cast<int>(l)) / sizeof(std::uint32_t));
+            c.idx_count = I.alloc<std::uint32_t>(ledger.bytes("idx_count", static_cast<int>(l)) / sizeof(std::uint32_t));
         }
         if (r.candidate_source || r.candidate_user) cand_ratio = std::max(cand_ratio, 1U);
     }
-    cand_stride_ = (o.max_positions + kCandBlockSize - 1U) / kCandBlockSize + 1U;
-    if (cand_ratio != 0U) candidates_ = I.alloc<std::uint8_t>(std::size_t{o.candidate_rows ? o.candidate_rows : o.max_rows} * cand_stride_);
+    cand_stride_ = ledger.cand_stride;
+    if (cand_ratio != 0U) candidates_ = I.alloc<std::uint8_t>(ledger.bytes("candidates"));
     if (o.allocate_workspace) {
-    const std::size_t W = std::min(o.window_rows, o.max_rows);
-    I.ckv = I.alloc<float>(std::size_t{o.max_rows} * kHeadDim);
-    I.cscore = I.alloc<float>(std::size_t{o.max_rows} * kHeadDim);
-    I.iq = I.alloc<float>(std::size_t{o.max_rows} * kIdxHeads * kIdxDim);
-    I.iw = I.alloc<float>(std::size_t{o.max_rows} * kIdxHeads);
-    I.qprep = I.alloc<std::uint8_t>(W * kIdxPrepBytes);
-    I.scores = I.alloc<float>(W * o.max_positions);
-    I.block_keys = I.alloc<std::uint32_t>(W * cand_stride_);
-    I.survivors = I.alloc<std::uint32_t>(select_survivor_words(static_cast<std::uint32_t>(W), o.max_positions, kTopK));
-    I.partial = I.alloc<float>(W * kHeads * kPartialFloats);
+    I.ckv = I.alloc<float>(ledger.bytes("ckv") / sizeof(float));
+    I.cscore = I.alloc<float>(ledger.bytes("cscore") / sizeof(float));
+    I.iq = I.alloc<float>(ledger.bytes("iq") / sizeof(float));
+    I.iw = I.alloc<float>(ledger.bytes("iw") / sizeof(float));
+    I.qprep = I.alloc<std::uint8_t>(ledger.bytes("qprep") / sizeof(std::uint8_t));
+    I.scores = I.alloc<float>(ledger.bytes("scores") / sizeof(float));
+    I.block_keys = I.alloc<std::uint32_t>(ledger.bytes("block_keys") / sizeof(std::uint32_t));
+    I.survivors = I.alloc<std::uint32_t>(ledger.bytes("survivors") / sizeof(std::uint32_t));
+    I.partial = I.alloc<float>(ledger.bytes("partial") / sizeof(float));
     }
-    bytes_ = I.bytes + 2 * sizeof(RopeRow) * std::size_t{o.max_positions};
+    bytes_ = ledger.total();
+    if (bytes_ != I.bytes + ledger.bytes("rope_window") + ledger.bytes("rope_compressed"))
+        throw std::logic_error("ds41 cuda attention: allocation ledger mismatch");
 }
 
 AttentionState::~AttentionState() {

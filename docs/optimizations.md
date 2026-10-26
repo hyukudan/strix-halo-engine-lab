@@ -1017,6 +1017,20 @@ Select vocabulary directory for the drafter.
 - **Measured gain:** No isolated measurement
 - **Implementation / evidence:** [Standalone defaults and gates](models/deepseek-v4.1/rtx-standalone.md#optimizations-default-on-and-off-switches)
 
+### Lean decode state
+
+**Engine:** `deepseek-rtx`. **Control:** `--lean-state`. **Default:** ON.
+
+Keep only the decode-time attention state: an allocation ledger and a split at the maximum decode position replace the full prefill-sized buffers, so the freed VRAM holds more experts.
+
+- **Preconditions:** Standalone RTX replica or CUDA decode tool.
+- **Automatic selection:** Always on unless switched off; `--baseline` turns it off.
+- **Fallback notice:** None; the state layout is fixed at load.
+- **Exactness evidence:** Bitwise against the full state at 2K, 8K, 32K and 128K: prefill states and stream hashes, 64-step greedy logits and tokens, DSpark commit windows, replica gates, chat tokens and persistent-worker requests.
+- **Off switch:** --no-lean-state
+- **Measured gain:** 8K state 673 to 25 MiB; 32K 2,486 to 59 MiB (+264 expert slots, plain decode +3.0 %); 128K loads with a 195 MiB state (without it the replica does not fit in host memory).
+- **Implementation / evidence:** [Standalone defaults and gates](models/deepseek-v4.1/rtx-standalone.md#optimizations-default-on-and-off-switches)
+
 ## MiniMax
 
 ```sh
