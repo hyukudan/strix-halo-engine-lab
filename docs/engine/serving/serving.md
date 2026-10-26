@@ -160,6 +160,60 @@ the stop token, for exactness checks against the command line.
 the monitor page can show served requests without another format. The serving loop publishes the
 same facts it already holds on the host; it adds no device synchronization.
 
+## MiniMax serve (`strix-minimax-serve`)
+
+The MiniMax TP2 server (rank 0 serves HTTP; rank 1 replays the control blocks) has its own API module,
+`src/minimax/serve/minimax_api.*`, with the same routes plus:
+
+- `GET /api/status[?detail=1]`: `"schema": "strix-serve-status-v1"`, `"engine": "strix-minimax-serve"`, state,
+  queue, lifetime totals (from the engine queue: requests, prompt, cached, imported, computed and generated
+  tokens, busy seconds), slots, the process `instance` (`id`: random 16 hex chosen once at start; `start_time` and
+  `started_at`: the same unix start time; always present; the key for counter
+  baselines), `capabilities` (prefix cache and state import are `false` in this build: their counters are
+  real zeros, and a consumer shows them as not supported; `draft` is true when a DSpark drafter is loaded), load facts and the recent-request ring (50 records,
+  newest first). `detail=1` adds the latency histograms as JSON (`le` = finite bounds, `counts` = cumulative
+  counts with the last one for +Inf).
+- Per record: `id` (the accepted `X-Request-Id`, else the completion id), `request_id`, `completion_id`,
+  route, arrival time, `status` (`done|cancelled|error|refused`), `stop_reason`, `stream`, prompt accounting
+  (`prompt_tokens`, `cached_tokens`, `imported_tokens`, `computed_tokens` = prompt - cached - imported;
+  `reused_tokens` is the legacy name of `cached_tokens`), `output_tokens` (stop token included), `queue_ms`,
+  `prefill_ms`, `decode_ms`, `duration_ms`, `first_token_ms` (submit to the first published token, measured by
+  the scheduler; null when no token was published), `max_gap_ms` (the scheduler's longest gap between two
+  emitted tokens; null with fewer than two), draft counts when the engine drafted, rates. The decode rate is
+  (output - 1) / decode seconds, because this engine's decode time starts at the first token.
+- Reply `timings` (non-stream reply and the stream's final chunk): the scheduler's per-request measurements,
+  `queue_ms`, `prefill_ms`, `decode_ms`, `decode_tok_s`, `completion_tokens`, `ttft_ms`, `max_gap_ms`,
+  `stall_ms` (decode time stalled by prefill units), `prefill_units`, `cycles`, `drafted`, `accepted`, `ids_fnv`,
+  `prompt_fnv` (FNV-1a, 16 hex) and `sampling`, for every request, armed or not.
+- `GET /metrics`: metrics text with `# HELP`/`# TYPE` for every family. The `mm_*` value lines are
+  unchanged (the queue's seven and the scheduler's step, prefill, draft, idle and decode-stall seconds, steps,
+  step rows, prefill units, draft cycles, drafted and accepted tokens; `POST /admin/sched` with
+  `reset_counters` zeroes the scheduler's, a counter reset); the `strix_*` counters and gauges use the shared names (`strix_requests_completed_total`,
+  `strix_prompt_tokens_total`, `strix_generated_tokens_total`, `strix_queue_waiting`, ...), plus
+  `strix_prompt_tokens_imported_total`, `strix_prompt_tokens_computed_total`, `strix_engine_info{engine,model,
+  instance}`, `strix_engine_start_time_seconds`, `strix_instrumentation_armed` and, once armed, the
+  histograms `strix_ttft_seconds` and `strix_decode_tokens_per_second`.
+- Armed instrumentation: the first `GET /metrics` or `GET /api/status?detail=1` arms the process (one-way).
+  Requests submitted before that cost one relaxed atomic load each and are not recorded in the ring or the
+  histograms; lifetime totals are always available. Armed, a request adds one ring record and constant-time
+  histogram updates at its end on its HTTP thread, and the scheduler copies one already-measured time into its
+  statistics at completion; nothing on the device path changes.
+- Request ids: an inbound `X-Request-Id` of 8-64 characters `[A-Za-z0-9._-]` (for example `<16 hex>.<attempt>`)
+  is kept whole and echoed in the `X-Request-Id` of every response to that request; a generation request that
+  reaches the queue without one echoes its completion id (requests rejected before that echo only an accepted
+  inbound id); any other value is ignored.
+- `"return_token_ids": true` adds `strix.token_ids` (every generated id, the stop token included, so its length
+  is `usage.completion_tokens`) to the reply, and in a stream to the final chunk (the one with `finish_reason`)
+  and to the usage chunk. `stream_options.include_usage` adds a chunk with empty `choices` and the `usage`
+  after the final chunk, before `data: [DONE]`. These boolean options must be booleans (400 otherwise).
+- `--admin`: `GET` / `POST /admin/sched` (scheduler policy and counters at runtime), served by the same API module
+  through the app's hook.
+- Tests: `strix-minimax-observe-tests` (ids, ring, status JSON, a metrics text validator, histograms) and
+  `strix-minimax-api-tests` (the HTTP contracts against a scripted engine thread: echo rules, token ids,
+  stream event order, engine errors, failed stream start, client disconnect, queue refusal, arming during a
+  request, the scheduler's timings, extras, `mm_*` lines and `/admin/sched` hooks). `tools/minimax/serve_observe_check.py` checks a live server and writes the token-identity and
+  overhead receipt across unarmed and armed sets.
+
 ## Tokenizer and chat template
 
 The tokenizer is read from the model GGUF (byte-level BPE, 248320 tokens, its merges and its

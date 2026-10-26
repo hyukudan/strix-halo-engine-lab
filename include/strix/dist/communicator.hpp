@@ -140,6 +140,8 @@ struct Usb4AutoOptions {
     std::size_t min_part_bytes = 0;
     // A transfer that makes no progress for this long fails the transport ($STRIX_DIST_USB4_TIMEOUT_MS overrides).
     std::chrono::milliseconds io_timeout{120000};
+    // Keep the MiniMax host pairing protocol and its measured transport choices.
+    bool minimax_compat = false;
 };
 struct Usb4StreamPair {
     std::string key;           // layout key of the local stream
@@ -190,6 +192,8 @@ struct Group {
     std::uint32_t world = 2;
     std::uint64_t epoch = 0;
     std::uint64_t plan = 0;
+    // Preserve MiniMax readiness and inline-CRC defaults independently of other engines.
+    bool minimax_compat = false;
 };
 struct Tag {
     std::uint32_t kind = 0;
