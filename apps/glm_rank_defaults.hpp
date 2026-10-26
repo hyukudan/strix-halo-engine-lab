@@ -177,9 +177,10 @@ inline Effective resolve(const Request& r, const EnvGet& env) {
     else if (r.decode_xch) e.decode_xch = {*r.decode_xch, "explicit"};
     else e.decode_xch = {e.baseline ? "comm" : "xfer", src_b};
     e.xch = r.xch;
-    // prefill chunk rows: 2048 (measured with pipeline 2 + async: 8K 31.2 s vs 35.1 s at 1024); baseline 1024
+    // prefill chunk rows: 4096 (measured with pipeline 2 + async: 8K 30.5-30.8 s vs 32.1-32.2 at 2048 and 35.1 at 1024,
+    // 32K 128.6 vs 136.7 s; logits bitwise in every arm); baseline 1024
     if (r.max_rows) e.max_rows = {std::to_string(*r.max_rows), "explicit"};
-    else e.max_rows = {e.baseline ? "1024" : "2048", src_b};
+    else e.max_rows = {e.baseline ? "1024" : "4096", src_b};
     const bool g3_only = r.g3 && !r.decode_or_batch && r.idcheck == 0;
     const bool smoke_head = env_is(env, "STRIX_GLM_SMOKE_HEAD", "1");
     e.prefill = e.prefill_requested.value != "auto"

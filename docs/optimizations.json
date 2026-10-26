@@ -1134,14 +1134,14 @@
   },
   {
     "engine": "glm",
-    "name": "Prefill chunk rows 2048",
+    "name": "Prefill chunk rows 4096",
     "flag_or_env": "--max-rows",
-    "default": "2048",
+    "default": "4096",
     "exact": "Logits equal to the reference prefill on both ranks at 1K/8K/32K.",
-    "gain": "8K 35.65 to 31.39 s (-12 %)",
+    "gain": "8K 32.1 s at 2048 to 30.1-30.8 s at 4096; 32K 136.7 to 128.4 s",
     "preconditions": "Exact chunked prefill.",
-    "off_switch": "--max-rows 1024 or --baseline",
-    "doc_anchor": "docs/optimizations.md#prefill-chunk-rows-2048"
+    "off_switch": "--max-rows 2048 / 1024, or --baseline",
+    "doc_anchor": "docs/optimizations.md#prefill-chunk-rows-4096"
   },
   {
     "engine": "glm",
