@@ -5250,7 +5250,8 @@ float* wide2_low_scratch() {
 // (STRIX_HC_WIDE_OUTPUT_ROWS 16|32, default 32 from 128 rows on), 1: the scalar-low kernel (it needs the
 // transposed low values of projection kernel 1; with another projection kernel 0 runs).
 void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, const void* inject, const void* up,
-    const HipHyperMixLauncherConfig& config, unsigned projection_kernel, unsigned output_kernel, hipStream_t stream) {
+    const HipHyperMixLauncherConfig& config, unsigned projection_kernel, unsigned output_kernel, hipStream_t stream,
+    unsigned output3_band = UINT32_MAX, bool output3_zero_low_rank_stride = false) {
     // The wide2 output kernel reads the transposed low values the wide2 projection writes (rows padded
     // to whole 32-row groups).
     HyperWideRows wide = wide_in;
@@ -5436,7 +5437,33 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
                         // Engine path: the up weights via the cached per-call copy (seam forms keep the fixture's buffer).
                         const void* up3 = !qpf2k_output3 && qpf2k_hc_upcopy() ?
                             qpf2k_hc_up_copy(up, std::uint64_t{kWideStreams} * config.hidden_size * 340U, wide.count, stream) : up;
+                        const unsigned band = qpf2k_output3_form == 0U || qpf2k_output3_form == 7U ?
+                            (output3_band == UINT32_MAX ? qpf2k_hc_output3_band() : output3_band) : 0U;
                         const auto qpf2k3 = [&] {
+                            if (output3_zero_low_rank_stride) wide.low_t_pitch = 0U;  // test seam diagnostic only; outputs discarded
+                            if (band) {
+                                const auto launch = [&]<unsigned Band>() {
+                                    hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_output3_band_kernel<Storage, Band>), grid, dim3(128U), 0, stream, wide, up3, config.hidden_size);
+                                };
+                                // Low-table reuse by CTA permutation only; rank chains, operand forms and epilogue unchanged; unmeasured.
+                                switch (band) {
+                                case 1U: launch.template operator()<1U>(); break;
+                                case 2U: launch.template operator()<2U>(); break;
+                                case 3U: launch.template operator()<3U>(); break;
+                                case 4U: launch.template operator()<4U>(); break;
+                                case 5U: launch.template operator()<5U>(); break;
+                                case 6U: launch.template operator()<6U>(); break;
+                                case 7U: launch.template operator()<7U>(); break;
+                                case 8U: launch.template operator()<8U>(); break;
+                                case 12U: launch.template operator()<12U>(); break;
+                                case 16U: launch.template operator()<16U>(); break;
+                                case 24U: launch.template operator()<24U>(); break;
+                                case 32U: launch.template operator()<32U>(); break;
+                                case 48U: launch.template operator()<48U>(); break;
+                                case 64U: launch.template operator()<64U>(); break;
+                                }
+                                return;
+                            }
                             switch (qpf2k_output3_form) {
                             case 8U: hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_output3_kernel<Storage, 16U, 0U, 8U>), grid, dim3(128U), 0, stream, wide, up3, config.hidden_size); break;
                             case 9U: hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_output3_kernel<Storage, 16U, 1U, 0U>), grid, dim3(128U), 0, stream, wide, up3, config.hidden_size); break;
@@ -5887,7 +5914,9 @@ void testing::enqueue_wide_hyper_rows_test(const HipHyperMixLauncherConfig& conf
         config.hidden_size % (32U * kWideOutputWaves) || !views.rows || !views.normalized || !views.output || !views.down ||
         !views.up || (views.inject && !views.injection) || views.normalized_stride % 16U || !aligned(views.normalized, 16U) ||
         !aligned(views.up, 4U) || (projection_kernel > 4U && projection_kernel != kSkipKernel) ||
-        (output_kernel > 13U && output_kernel != kSkipKernel))
+        (output_kernel > 13U && output_kernel != kSkipKernel) ||
+        (views.output3_band != UINT32_MAX && (!qpf2k_hc_output3_band_valid(views.output3_band) || output_kernel != 7U)) ||
+        (views.output3_zero_low_rank_stride && (output_kernel != 7U || projection_kernel != kSkipKernel || views.output3_band != 0U)))
         throw std::invalid_argument("wide HC rows test views invalid");
     HyperWideRows wide{};
     wide.normalized = views.normalized; wide.normalized_stride = views.normalized_stride;
@@ -5897,7 +5926,8 @@ void testing::enqueue_wide_hyper_rows_test(const HipHyperMixLauncherConfig& conf
     wide.normalized16 = static_cast<const _Float16*>(views.normalized16);
     wide.normalized16_pitch = views.normalized16_pitch ? views.normalized16_pitch : 10240U;
     wide.normalized16_only = views.normalized16 && views.normalized16_only;
-    launch_wide_hyper_kernels(wide, views.down, views.inject, views.up, config, projection_kernel, output_kernel, stream);
+    launch_wide_hyper_kernels(wide, views.down, views.inject, views.up, config, projection_kernel, output_kernel, stream,
+        views.output3_band, views.output3_zero_low_rank_stride);
 }
 
 void testing::enqueue_qpf2k_inject_norm_test(const HipHyperMixLauncherConfig& config, const Qpf2kInjectNormTestViews& v, bool reference,

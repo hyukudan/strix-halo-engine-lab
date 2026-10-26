@@ -359,6 +359,35 @@ void compare_inject_norm(std::uint32_t rows, bool combine, bool in_place, unsign
     if (differ) throw std::runtime_error("qpf2k inject norm differs from the window kernel at byte " + std::to_string(first));
 }
 
+constexpr unsigned kOutput3Bands[] = {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 12U, 16U, 24U, 32U, 48U, 64U};
+
+void compare_v3_bands(std::uint32_t rows, bool bf16, unsigned flavor, hipStream_t stream) {
+    Fixture f(rows, bf16, flavor, 1234U + rows + flavor * 17U + (bf16 ? 1U : 0U));
+    const auto c = config(bf16);
+    auto v = f.views();
+    v.output3_band = 0U;
+    f.reset(0xa5);
+    strix::testing::enqueue_wide_hyper_rows_test(c, v, 1U, 7U, stream);
+    check(hipStreamSynchronize(stream), "band reference");
+    const auto expected = f.written();
+    for (const unsigned band : kOutput3Bands) {
+        f.reset(0xa5);
+        // Different poison on valid output bytes prevents a missing store from inheriting the reference; guards stay equal.
+        check(hipMemset2DAsync(f.output.p, f.output_stride, 0x5a, kHidden * (bf16 ? 2U : 4U), rows, stream), "band poison output");
+        v.output3_band = band;
+        strix::testing::enqueue_wide_hyper_rows_test(c, v, 1U, 7U, stream);
+        check(hipStreamSynchronize(stream), "band candidate");
+        const auto actual = f.written();
+        if (expected.size() != actual.size()) throw std::runtime_error("v3 band written extent differs from band 0");
+        std::size_t differ = 0, first = 0;
+        for (std::size_t i = 0; i < expected.size(); ++i)
+            if (expected[i] != actual[i]) { if (!differ) first = i; ++differ; }
+        std::cout << "v3 band " << band << " vs 0 rows " << rows << (bf16 ? " bf16" : " fp32") << " flavor " << flavor << ": "
+                  << expected.size() << " bytes, differ " << differ << '\n';
+        if (differ) throw std::runtime_error("v3 band differs from band 0 at byte " + std::to_string(first));
+    }
+}
+
 void bench(hipStream_t stream) {
     // STRIX_HC_WIDE_BENCH_ROWS: bench row count (default 2048; the engine's tiled prefill blocks are 8192 rows).
     const std::uint32_t n = [] { const char* v = std::getenv("STRIX_HC_WIDE_BENCH_ROWS"); return v ? static_cast<std::uint32_t>(std::atoi(v)) : 2048U; }();
@@ -371,11 +400,13 @@ void bench(hipStream_t stream) {
     check(hipMemset(half.p, 0, half.n), "half rows");
     check(hipDeviceSynchronize(), "init drain");
     const void* rows16 = nullptr;
-    const auto time = [&](unsigned projection, unsigned output) {
+    const auto time = [&](unsigned projection, unsigned output, unsigned band = UINT32_MAX, bool zero_low_rank_stride = false) {
         std::vector<float> samples;
         auto v = f.views();
         v.normalized16 = rows16;
         v.normalized16_pitch = kWidth + 64U;
+        v.output3_band = band;
+        v.output3_zero_low_rank_stride = zero_low_rank_stride;
         for (unsigned it = 0; it < 25U; ++it) {
             check(hipEventRecord(a, stream), "record");
             strix::testing::enqueue_wide_hyper_rows_test(c, v, projection, output, stream);
@@ -393,6 +424,16 @@ void bench(hipStream_t stream) {
         // (A = output 1, B = form 7, the engine's form), then the attribution forms 8 (no low prefetch),
         // 9 (base epilogue), 10 (prefetch two blocks ahead), 11 (32-step loop), each followed by output 1. Medians of 20 launches.
         strix::testing::enqueue_wide_hyper_rows_test(c, f.views(), 2U, 255U, stream);
+        // Band 0 / B / 0 / B, each median after its own warmup; all arms use the same lows and up weights.
+        for (const unsigned band : kOutput3Bands)
+            for (unsigned i = 0; i < 4U; ++i) {
+                const unsigned bnd = i % 2U ? band : 0U;
+                const float us = time(255U, 7U, bnd);
+                std::cout << "bench v3 band " << bnd << " rows " << n << ": " << us << " us\n";
+            }
+        const float diagnostic = time(255U, 7U, 0U, true);
+        std::cout << "bench v3 band 0 rows " << n << " low-rank stride 0 diagnostic (outputs discarded): " << diagnostic << " us\n";
+        if (std::getenv("STRIX_HC_WIDE_BENCH_V3_BAND_ONLY")) return;
         for (unsigned i = 0; i < 7U; ++i) {
             const unsigned form = i % 2U ? 7U : 1U;
             const float us = time(255U, form);
@@ -496,6 +537,9 @@ void bench(hipStream_t stream) {
     }
 }
 void fixtures_v3(hipStream_t stream) {
+    for (const bool bf16 : {true, false})
+        for (const std::uint32_t rows : {8U, 32U, 1032U, 8192U})
+            for (unsigned flavor = 0; flavor < 4U; ++flavor) compare_v3_bands(rows, bf16, flavor, stream);
     // STRIX_QPF2K_HC output v3 (seam kernel 7 = the engine's form; 8..11 = the bench's attribution forms) == the
     // lane-chain output 1 it replaces (same inputs, every written byte), every flavor incl. non-finite scales / values,
     // partial 32-row groups; form 7 also == the reference forms.

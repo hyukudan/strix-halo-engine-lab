@@ -50,6 +50,8 @@ const bool qpf2k_default_env = [] {
     put("STRIX_QPF2K_GDN_CORE16", "1");                // qpfx 4c44767a (exact; GDN out from FP16 core rows)
     if (put("STRIX_QPF2K_QSA", "1")) put("STRIX_QPF2K_QSA_MASK", "0x57");
     if (put("STRIX_QPF2K_HC", "1")) put("STRIX_QPF2K_HC_MASK", "14");
+    put("STRIX_QPF2K_HC_OUTPUT3", "1");                // lane-chain output v3 (exact; fixtures + in-engine FNV)
+    put("STRIX_QPF2K_HC_OUTPUT3_BAND", "16");          // band 16 (CTA permutation only; v3 kernel -6.4 %, 32K -0.52 s)
     unsigned moe = 0U;
     if (put("STRIX_QPF2K_MOE_DA16", "1")) moe |= 1U;
     if (put("STRIX_QPF2K_MOE_ROUTE", "14")) moe |= 2U;
