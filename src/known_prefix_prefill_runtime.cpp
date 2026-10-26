@@ -1,3 +1,4 @@
+#include "strix/qpf2k_defaults.hpp"
 #include "strix/known_prefix_prefill.hpp"
 #include "strix/dispatch_resources.hpp"
 #include "strix/execution_arena.hpp"
@@ -49,6 +50,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     const CompiledLaunchPlan& launch,std::span<const KnownWindowR2Entry> pairs,
     std::span<const KnownWindowRowsEntry> wide,const KnownWindowExecutionHooks& hooks,
     std::span<const KnownWindowRowsEntry> full) {
+    const qpf2k::ModelScope defaults_scope(serial_resources.model_manifest ? qpf2k::has_gsq_gate(*serial_resources.model_manifest) : qpf2k::gsq_model);
     // STRIX_PREFILL_TIMING=1: host milliseconds of each phase of every block on stderr.
     static const bool timing=[]{const char* v=std::getenv("STRIX_PREFILL_TIMING");return v&&v[0]=='1';}();
     auto mark=std::chrono::steady_clock::now();
@@ -79,7 +81,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     // STRIX_PREFILL_PIPE bit 8: the scope opens (validating the pair) before the resource check, which then skips it.
     static const bool early_scope=[]{const char* v=std::getenv("STRIX_PREFILL_PIPE");return v&&(std::strtoul(v,nullptr,0)&8UL)!=0UL;}();
     std::optional<ValidatedModelBindingScope> binding_scope;
-    if(early_scope&&!serial_resources.distributed_stage&&serial_resources.model_manifest&&serial_resources.model_weights)
+    if(early_scope&&!strix::qpf2k::suppressed(strix::qpf2k::Item::pipe)&&!serial_resources.distributed_stage&&serial_resources.model_manifest&&serial_resources.model_weights)
         binding_scope.emplace(*serial_resources.model_manifest,*serial_resources.model_weights);
     lap("binding");
     validate_execution_runtime_resources(serial.execution_identity,serial.arena,serial_resources,session.next_position);
@@ -90,7 +92,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     // (no per-block indexing of every row view and no teardown of those indices at the end of the block).
     static const bool persistent_views=[]{const char* v=std::getenv("STRIX_PREFILL_PIPE");return v&&(std::strtoul(v,nullptr,0)&128UL)!=0UL;}();
     std::optional<ArenaLookupScope> arena_lookup;
-    if(persistent_views&&hooks.arena_index&&!hooks.arena_index->empty()) arena_lookup.emplace(*hooks.arena_index);
+    if(persistent_views&&!strix::qpf2k::suppressed(strix::qpf2k::Item::pipe)&&hooks.arena_index&&!hooks.arena_index->empty()) arena_lookup.emplace(*hooks.arena_index);
     else arena_lookup.emplace();
     const auto identities=build_runtime_execution_identities(serial.execution_identity,serial.arena,serial_resources);
     lap("identities");
@@ -183,13 +185,13 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     // A headless block skips its head. STRIX_PREFILL_PIPE bit 4: it also skips the final hyper mix before it, whose
     // rows only the head reads (the MTP tap is the last MLP injection; no state is written after it).
     static const bool skip_final_mix=[]{const char* v=std::getenv("STRIX_PREFILL_PIPE");return v&&(std::strtoul(v,nullptr,0)&4UL)!=0UL;}();
-    std::size_t headless_from=steps-1U-(skip_final_mix&&steps>=2U&&serial.execution.steps[steps-2U].op==SerialOp::final_hyper_mix&&
+    std::size_t headless_from=steps-1U-(skip_final_mix&&!strix::qpf2k::suppressed(strix::qpf2k::Item::pipe)&&steps>=2U&&serial.execution.steps[steps-2U].op==SerialOp::final_hyper_mix&&
         serial.execution.steps[steps-2U].writes_state==PersistentState::none?1U:0U);
     // STRIX_PREFILL_PIPE bit 64: with no step observer, a headless block stops after its last persistent-state write
     // (the last layer's KV/recurrent update): the rest of that layer, the final mix and the head feed nothing the
     // session keeps, and the next block starts from its own embeddings.
     static const bool skip_tail=[]{const char* v=std::getenv("STRIX_PREFILL_PIPE");return v&&(std::strtoul(v,nullptr,0)&64UL)!=0UL;}();
-    if(skip_tail&&headless&&!hooks.after_step) {
+    if(skip_tail&&!strix::qpf2k::suppressed(strix::qpf2k::Item::pipe)&&headless&&!hooks.after_step) {
         std::size_t last_write=0;
         for(std::size_t i=0;i<steps;++i) if(serial.execution.steps[i].writes_state!=PersistentState::none) last_write=i;
         if(last_write+1U<headless_from) headless_from=last_write+1U;
@@ -348,7 +350,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             // Any other step: the schedule hook only orders it after work it detached (never enqueues it).
             if(hooks.prefill_step&&hooks.prefill_step(step,{})) throw std::logic_error("known prefill schedule hook took a row step");
             static const bool rows_loops=[]{const char* v=std::getenv("STRIX_PREFILL_PIPE");return v&&(std::strtoul(v,nullptr,0)&16UL)!=0UL;}();
-            if(rows_loops&&mode==KnownWindowStepMode::r1_row_loop&&rows>1U&&step+1U!=steps&&!launch.steps[step].runtime_step&&
+            if(rows_loops&&!strix::qpf2k::suppressed(strix::qpf2k::Item::pipe)&&mode==KnownWindowStepMode::r1_row_loop&&rows>1U&&step+1U!=steps&&!launch.steps[step].runtime_step&&
                 !reads_position(source.reads_state)&&source.op!=SerialOp::ple&&!current_execution_telemetry())
                 if(const auto batched=rows_launch_for(launch.steps[step].function)) {
                     std::vector<ExecutionDispatchContext> all(rows);for(std::uint32_t r=0;r<rows;++r) all[r]=context(step,r);

@@ -11,6 +11,9 @@ void expect(bool condition,const char* why) {if(!condition) {++failures;std::cer
 template<class F> bool rejects(F&& f) {try {f();} catch(const std::exception&) {return true;}return false;}
 }
 int main() {
+    const auto no_capacity = parse_linux_uma_observation("MemTotal: 125829120 kB\n", "VmRSS: 1024 kB\n", 50U);
+    expect(!no_capacity.memory.mem_available_bytes && !no_capacity.memory.gtt_reported_bytes,
+        "automatic prefill cannot derive available UMA or GTT capacity from total memory and RSS");
     const auto observed=parse_linux_uma_observation("MemTotal: 1000 kB\nMemAvailable: 400 kB\nOther: 7 MB\n",
         "Name:\tfixture\nVmRSS:\t8 kB\nVmHWM:\t12 kB\n",41);
     expect(observed.supported && observed.memory.observation_identity==41 && observed.memory.mem_total_bytes==1024000U &&

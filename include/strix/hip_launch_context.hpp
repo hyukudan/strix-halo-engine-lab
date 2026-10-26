@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/graph_inputs.hpp"
+#include "strix/qpf2k_defaults.hpp"
 #include <hip/hip_runtime_api.h>
 #include <limits>
 #include <stdexcept>
@@ -10,6 +11,7 @@ namespace strix {
 // scheduler owns the stream and every allocation through actual completion.
 struct HipLaunchContext {
     hipStream_t stream = nullptr;
+    bool gsq_model = false;
     bool graph_capture = false;
     GraphDynamicArguments arguments;
     ExecutionMemoryBinding status;
@@ -43,7 +45,7 @@ inline thread_local const HipLaunchContext* active_hip_launch_context = nullptr;
 }
 class HipLaunchScope {
 public:
-    explicit HipLaunchScope(const HipLaunchContext& context) : context_(context) {
+    explicit HipLaunchScope(const HipLaunchContext& context) : context_(context), qpf2k_scope_(context.gsq_model) {
         if (active_hip_launch_context || !context_.stream || context_.stream == hipStreamPerThread ||
             (context_.graph_capture && context_.stream == hipStreamLegacy)) {
             throw std::invalid_argument("HIP launch scope requires one explicitly owned stream");
@@ -79,5 +81,6 @@ public:
     HipLaunchScope& operator=(const HipLaunchScope&) = delete;
 private:
     HipLaunchContext context_;
+    qpf2k::ModelScope qpf2k_scope_;
 };
 } // namespace strix

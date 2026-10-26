@@ -172,6 +172,12 @@ void address_evidence_and_reservation_budget() {
 int main() try {
     aliases_and_copy(); sparse_and_nested(); unknown_and_observed(); identities_and_lifetime(); negative();
     address_evidence_and_reservation_budget();
+    UmaOwnerInventory prompt_base;
+    prompt_base.reservation_upper_bound_bytes = 70U;
+    const auto prompt = plan_uma_reservation_growth(prompt_base, 8U + 2U + 4U, 1U, {85U,85U});
+    require(prompt.retained_reserved_bytes == 84U && prompt.setup_peak_reserved_bytes == 85U,
+        "prompt planner counts model once, workspace, both metadata copies, headroom and runtime payload");
+    invalid([&] { (void)plan_uma_reservation_growth(prompt_base,14U,1U,{85U,84U}); });
     std::cout << "UMA owner inventory source fixtures completed\n";
     return 0;
 } catch (const std::exception& error) {

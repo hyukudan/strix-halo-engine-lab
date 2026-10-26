@@ -345,6 +345,9 @@ void campaign_defaults_contract(){
 }
 
 int main(){try{
+    const auto no_speculation = parse({"decoder","m","1","--generate","1","--known-prefix-window=0"});
+    require(!no_speculation.mtp.enabled && !no_speculation.known_prefix_window,
+        "automatic prefill off never infers MTP from environment-only tuning");
     campaign_defaults_contract();
     const auto legacy=parse({"decoder","target.gguf","1"});
     require(!legacy.mtp.enabled&&!legacy.mtp.supplied,"legacy CLI does not select MTP");

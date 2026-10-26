@@ -1,3 +1,4 @@
+#include "qwen_prefill_plan.hpp"
 #include "deferred_moe_receipt.hpp"
 #include "strix/lane_chain_hyper_output.hpp"
 #include "qsa_input_receipt.hpp"
@@ -85,6 +86,7 @@
 #include "strix/serial_request.hpp"
 #include "strix/serial_session.hpp"
 #include "strix/session_state_layout.hpp"
+#include "strix/ple_reclaim.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -1003,6 +1005,11 @@ int STRIX_DECODE_ENTRY(
         std::cout << "Usage: strix-hip-decode-token MODEL.gguf TOKEN_ID ... [options]\n"
             "  --context N --generate N --eos-token ID --residency register|copy\n"
             "  --optimization-profile auto|manual (default auto, qualified checkpoint only)\n"
+            "  --baseline / STRIX_BASELINE=1 (historical resolution, controlled defaults off)\n"
+            "  --print-effective-config (deterministic host JSON; exits before HIP setup)\n"
+            "  --prefill-numerical-profile dense-a8|fast-prefill-f16wmma-v1 (automatic tiled default: FP16)\n"
+            "  STRIX_PREFILL_F16=0 restores historical resolution of the same argv\n"
+            "  --known-prefix-prefill-rows 16..8192; route/full-rows/union/router/prefill-rows accept =0\n"
             "  --host-dispatch-telemetry (host API/commit counters on stderr; profiling only)\n"
             "  --execution-telemetry-trace (bounded 256-event correlated trace; profiling only)\n"
             "  --execution-inventory (include selected host launcher and declared variant metadata)\n"
@@ -1052,7 +1059,7 @@ int STRIX_DECODE_ENTRY(
     auto options =
         parse_options(
             argc,
-            argv);
+            argv, true);
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     const bool target_input_export = strix::tests::mtp_target_input_export_requested();
     if(target_input_export)strix::tests::validate_mtp_target_input_export(options,false);
@@ -1161,6 +1168,7 @@ int STRIX_DECODE_ENTRY(
     const auto manifest =
         strix::build_model_manifest(
             info);
+    const strix::qpf2k::ModelScope defaults_scope(strix::qpf2k::has_gsq_gate(manifest));
     strix::AllocationGenerationSource
         generations;
     std::shared_ptr<const strix::MappedModelFile> mapped_owner = std::make_shared<strix::MappedModelFile>(
@@ -1187,8 +1195,36 @@ int STRIX_DECODE_ENTRY(
             strix::q6p::admit_derived_content(identity);
         }
     }
-    auto optimization_profile = strix::decode_cli::resolve_optimization_profile(
-        options, model, info, manifest, admitted_content, has_auto_a8_runtime, !target_input_export);
+    strix::decode_cli::PrefillCapabilities prompt_capabilities;
+    prompt_capabilities.a8_runtime = has_auto_a8_runtime;
+    auto prompt_memory = strix::decode_cli::observe_prefill_memory(prompt_capabilities);
+    prompt_memory.estimate = [&](const strix::decode_cli::Options& candidate) {
+        return strix::decode_cli::compile_prompt_requirements(candidate, model, manifest, mapped.bytes());
+    };
+    if (target_input_export) options.route_owned = true;
+    auto effective = strix::decode_cli::resolve_effective_config(
+        {options, strix::decode_cli::requested_prefill_environment(), !target_input_export}, model, info, manifest,
+        admitted_content, prompt_capabilities, prompt_memory);
+    options = effective.options;
+    model.attention_kv_storage = options.attention_kv_storage;
+    std::cerr << strix::decode_cli::effective_config_notice(effective);
+    if (options.print_effective_config) {
+        std::cout << strix::decode_cli::effective_config_json(effective);
+        return 0;
+    }
+    strix::qpf2k::undo_pre_injected([](const char* name) { ::unsetenv(name); });
+    strix::qpf2k::baseline = options.baseline;
+    for (const auto& [name, value] : effective.environment) {
+        const bool controlled = options.baseline;
+        if (!std::getenv(name.c_str()) || controlled) ::setenv(name.c_str(), value.c_str(), 1);
+    }
+    strix::qpf2k::defaulted_items = 0U;
+    for (const auto& entry : strix::qpf2k::defaults) {
+        const auto source = effective.sources.find(entry.name);
+        if (source != effective.sources.end() && source->second == strix::decode_cli::OptionSource::automatic)
+            strix::qpf2k::defaulted_items |= strix::qpf2k::bit(entry.item);
+    }
+    auto optimization_profile = effective.organization;
     const auto base_optimization_profile = optimization_profile.selected;
     strix::decode_cli::apply_numerical_profile(options, model, manifest,
         admitted_content, has_auto_a8_runtime, optimization_profile);
@@ -1263,7 +1299,7 @@ int STRIX_DECODE_ENTRY(
         "  \"prefill_numerical_profile\": \"" +
         std::string(strix::numerical_profile_name(strix::decode_cli::numerical_profile_pair(options).prefill)) + "\",\n" +
         "  \"prefill_numerical_profile_source\": \"" +
-        (options.prefill_numerical_profile ? "explicit" : "numerical-profile") + "\",\n" +
+        (options.prefill_profile_automatic ? "automatic" : options.prefill_numerical_profile ? "explicit" : "numerical-profile") + "\",\n" +
         "  \"numerical_profile_pair_identity\": " +
         std::to_string(strix::numerical_profile_pair_identity(strix::decode_cli::numerical_profile_pair(options))) + ",\n" +
         "  \"optimization_profile_reason\": \"" + optimization_profile.reason + "\",\n" +
@@ -1959,14 +1995,75 @@ int STRIX_DECODE_ENTRY(
         return "  \"dense_trellis_used_layer_mask\":" + std::to_string(strix::hip_dense_trellis_used_layers()) + ",\n" +
             "  \"dense_trellis_usage_scope\":\"host-entry-coverage-including-capture-not-cycle-counts\",\n";
     };
+    // Auto tries the same admission as =1, falling back silently to the warm path if setup cannot establish it.
+    // Admitted runs retain =1's data path, credit, diagnostics and receipt (src/ple_reclaim.cpp).
+    const auto ple_reclaim_mode = strix::decode_cli::ple_reclaim_mode(options, residency_policy, graph_mode);
+    const bool ple_reclaim_requested = ple_reclaim_mode != strix::ple_reclaim::Mode::off;
     // After registration: pinning the model may evict anything populated before it.
-    warm_file_backed_tensors(mapped, manifest);
+    if (!ple_reclaim_requested) warm_file_backed_tensors(mapped, manifest);
     if (load_balloon) { (void)hipFree(load_balloon); load_balloon = nullptr; std::cerr << "load balloon: released\n"; }
     // Keep the actual registration/copy owner and its exact map control block
     // pinned in the optional inventory; this is virtual backing, not RSS/PFN evidence.
     std::optional<strix::UmaOwnerInventory> model_owner_inventory;
     if (options.execution_inventory || options.known_prefix_prefill_rows)
         model_owner_inventory.emplace(model_residency.owner_inventory(model_owner, mapped_owner));
+    std::unique_ptr<strix::ple_reclaim::Prefetcher> ple_reclaimer;
+    if (ple_reclaim_requested) {
+        try {
+            const strix::ManifestTensor* table = nullptr;
+            for (const auto& tensor : manifest.tensors) {
+                if (tensor.residency != strix::ResidencyPolicy::file_backed_candidate) continue;
+                if (table || tensor.role != strix::TensorRole::ngram_table || tensor.dimensions.size() != 2 ||
+                    (tensor.ggml_type != 20 && tensor.ggml_type != 30) || (tensor.ggml_type == 20 && tensor.dimensions[0] % 32U))
+                    throw std::invalid_argument("STRIX_PLE_RECLAIMABLE=1 supports exactly one file-backed IQ4_NL/BF16 n-gram table");
+                table = &tensor;
+            }
+            if (!table || !model_owner_inventory) throw std::invalid_argument("STRIX_PLE_RECLAIMABLE=1: no file-backed PLE table");
+#if defined(__linux__)
+            const auto page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+#else
+            const std::uint64_t page = 4096; // Explicit =1 still fails in Prefetcher with its Linux requirement.
+#endif
+            std::vector<strix::ple_reclaim::Interval> registered;
+            for (const auto& view : model_owner_inventory->pinned_views)
+                if (view.category == "weights.registered-host")
+                    registered.push_back({view.view_offset, view.view_offset + view.view_bytes});
+            strix::ple_reclaim::Config config;
+            config.mapping_base = mapped.base_address();
+            config.mapping_bytes = mapped.bytes();
+            config.page = page;
+            config.table_offset = table->absolute_offset;
+            config.table_rows = table->dimensions[1];
+            config.stored_row_bytes = table->ggml_type == 20 ? table->dimensions[0] / 32U * 18U : table->dimensions[0] * 2U;
+            if (config.stored_row_bytes * config.table_rows != table->byte_size)
+                throw std::invalid_argument("STRIX_PLE_RECLAIMABLE=1: n-gram table extent does not match its rows");
+            config.reclaim = strix::ple_reclaim::reclaim_intervals(table->absolute_offset, table->byte_size, page, std::move(registered));
+            const auto contract = strix::build_ple_hash_contract(model);
+            // Decode lookups after the prompt: (G + 1) tokens x heads rows x 2 pages, times (candidate depth + 1) on the
+            // MTP route (every draft and rejected draft looks up its rows; depth 8 if unset), at least 256 MiB;
+            // STRIX_PLE_RECLAIM_DECODE_BYTES can only raise it.
+            const std::uint64_t lookups_per_token = options.mtp.enabled
+                ? (options.mtp.candidate_depth ? options.mtp.candidate_depth + 1ULL : 9ULL) : 1ULL;
+            config.decode_allowance_bytes = std::max<std::uint64_t>(256ULL << 20U,
+                (options.generate_tokens + 1U) * lookups_per_token * contract.head_count * 2U * page);
+            if (const char* v = std::getenv("STRIX_PLE_RECLAIM_DECODE_BYTES"))
+                config.decode_allowance_bytes = std::max<std::uint64_t>(config.decode_allowance_bytes, std::strtoull(v, nullptr, 10));
+            config.ahead_rows = 2U * options.known_prefix_prefill_rows;
+            if (const char* v = std::getenv("STRIX_PLE_RECLAIM_AHEAD_ROWS"); v && std::strtoull(v, nullptr, 10))
+                config.ahead_rows = std::strtoull(v, nullptr, 10);
+            if (const char* v = std::getenv("STRIX_PLE_RECLAIM_STRICT")) config.strict = v[0] != '0';   // default strict
+            if (const char* v = std::getenv("STRIX_PLE_STAGE_PREFETCH")) config.stage_prefetch = v[0] != '0';
+            config.drop_page_cache = [&mapped](std::uint64_t offset, std::uint64_t bytes) { return mapped.drop_page_cache(offset, bytes); };
+            ple_reclaimer = std::make_unique<strix::ple_reclaim::Prefetcher>(std::move(config), contract,
+                std::span<const std::uint32_t>(options.tokens.data(), options.tokens.size()),
+                ple_reclaim_mode == strix::ple_reclaim::Mode::automatic);
+        } catch (const std::exception&) {
+            if (ple_reclaim_mode == strix::ple_reclaim::Mode::required) throw;
+            // A partial drop earns no credit. Restore the original warm path before any consumer allocations.
+            warm_file_backed_tensors(mapped, manifest);
+        }
+        if (ple_reclaimer) strix::ple_reclaim::set_active(ple_reclaimer.get());
+    }
     const auto model_owner_inventory_receipt = [&]() -> std::string {
         if (!model_owner_inventory) return {};
         const auto& inventory = *model_owner_inventory;
@@ -2673,7 +2770,8 @@ int STRIX_DECODE_ENTRY(
             }
             known_prefill_reservation = strix::plan_uma_reservation_growth(
                 strix::build_uma_owner_inventory(views), growth, known_prefill_runtime_payload,
-                {options.known_prefill_uma_budget, options.known_prefill_uma_budget});
+                {options.known_prefill_uma_budget, options.known_prefill_uma_budget},
+                ple_reclaimer ? ple_reclaimer->credit_bytes() : 0U);
             struct PrefillRetained {
                 std::shared_ptr<const void> original, d1, ple, source, plan;
             };
@@ -3887,6 +3985,8 @@ int STRIX_DECODE_ENTRY(
         const auto generation_request_elapsed_ms =
             std::chrono::duration<double, std::milli>(
                 generation_request_stop - generation_request_start).count();
+        // STRIX_PLE_RECLAIMABLE: last residency sample after the timed request (decode lookups included); strict throws.
+        if (ple_reclaimer) ple_reclaimer->finish();
         finalize_raw(result.generated_tokens, std::string(stop_reason_name(result.stop_reason)));
 
         std::string tail_rows_text;
@@ -4135,6 +4235,9 @@ int STRIX_DECODE_ENTRY(
                     << "  \"known_prefix_prefill_uma_budget_bytes\":" << options.known_prefill_uma_budget << ",\n"
                     << "  \"known_prefix_prefill_retained_reservation_upper_bound_bytes\":" << known_prefill_reservation->retained_reserved_bytes << ",\n"
                     << "  \"known_prefix_prefill_setup_reservation_upper_bound_bytes\":" << known_prefill_reservation->setup_peak_reserved_bytes << ",\n"
+                    << (ple_reclaimer ? "  \"known_prefix_prefill_ple_reclaim_credit_bytes\":" +
+                        std::to_string(known_prefill_reservation->reclaimable_file_mapping_credit_bytes) + ",\n" +
+                        "  \"ple_reclaim\":" + ple_reclaimer->receipt_json() + ",\n" : std::string{})
                     << "  \"known_prefix_prefill_reservation_scope\":\"declared-storage-upper-bound-not-physical-fit-or-RSS\",\n";
             }
             if (const auto latest = known_prefix_owner->latest_routed_union_observation()) {

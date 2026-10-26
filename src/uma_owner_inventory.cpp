@@ -141,8 +141,17 @@ UmaReservationPlan build_uma_reservation_plan(std::span<const UmaOwnerView> reta
 }
 UmaReservationEstimate plan_uma_reservation_growth(const UmaOwnerInventory& live,
     std::uint64_t additional_new_retained_bytes, std::uint64_t setup_temporary_bytes, UmaReservationLimits limits) {
+    return plan_uma_reservation_growth(live, additional_new_retained_bytes, setup_temporary_bytes, limits, 0);
+}
+UmaReservationEstimate plan_uma_reservation_growth(const UmaOwnerInventory& live,
+    std::uint64_t additional_new_retained_bytes, std::uint64_t setup_temporary_bytes, UmaReservationLimits limits,
+    std::uint64_t reclaimable_file_mapping_credit_bytes) {
+    require(reclaimable_file_mapping_credit_bytes <= live.known_file_mapping_bytes,
+            "UMA reclaimable credit exceeds the live file-mapping reservation");
     UmaReservationEstimate result;
-    result.retained_reserved_bytes = add(live.reservation_upper_bound_bytes, additional_new_retained_bytes);
+    result.retained_reserved_bytes = add(live.reservation_upper_bound_bytes, additional_new_retained_bytes) -
+        reclaimable_file_mapping_credit_bytes;
+    result.reclaimable_file_mapping_credit_bytes = reclaimable_file_mapping_credit_bytes;
     result.setup_peak_reserved_bytes = add(result.retained_reserved_bytes, setup_temporary_bytes);
     if (limits.retained_bytes && result.retained_reserved_bytes > *limits.retained_bytes)
         throw std::invalid_argument("UMA retained reservation exceeds explicit budget");

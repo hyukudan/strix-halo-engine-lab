@@ -1,5 +1,6 @@
 #include "strix/hip_known_prefix_window.hpp"
 #include "strix/dispatch_fuse.hpp"
+#include "strix/qpf2k_defaults.hpp"
 #include "strix/hip_mtp_target_window.hpp"
 #include "strix/hip_ple_launcher.hpp"
 
@@ -29,37 +30,6 @@
 #include <exception>
 #include <deque>
 
-// qpf2k adopted exact prefill set ON BY DEFAULT (USER rule 2026-10-26 00:44): every STRIX_QPF2K_* switch of the combined
-// arm C that is unset gets C's value before any parser reads it (all parsers are lazy function-local statics, evaluated
-// after static initialisation). Setting a switch explicitly (e.g. =0) keeps it: =0 restores the old path. The two MoE items
-// are recorded in STRIX_QPF2K_MOE_DEFAULTED (bit 1 DA16, bit 2 ROUTE) so the GSQ prefill profile turns them off instead of
-// refusing (an explicit setting with a GSQ gate type is still refused, see enqueue_prefill).
-namespace {
-const bool qpf2k_default_env = [] {
-    // STRIX_QPF2K_DEFAULTS=0: no defaults at all (every unset switch keeps its old OFF meaning).
-    if (const char* d = std::getenv("STRIX_QPF2K_DEFAULTS"); d && d[0] == '0') return false;
-    const auto put = [](const char* name, const char* value) {
-        if (std::getenv(name)) return false;
-        ::setenv(name, value, 0);
-        return true;
-    };
-    put("STRIX_QPF2K_SCHED", "12");
-    put("STRIX_QPF2K_DENSE", "1");
-    put("STRIX_QPF2K_GDN", "1");                       // default parts 55 (decay-NaN dispatch)
-    put("STRIX_QPF2K_GDN_GATES_BATCH", "1");           // qpfx 8f22961a (exact; gates -17.5 % per call)
-    put("STRIX_QPF2K_GDN_CORE16", "1");                // qpfx 4c44767a (exact; GDN out from FP16 core rows)
-    if (put("STRIX_QPF2K_QSA", "1")) put("STRIX_QPF2K_QSA_MASK", "0x257");   // 0x200: stage batching (exact; 32K -0.39 s, 5 of 6 pairs)
-    if (put("STRIX_QPF2K_HC", "1")) put("STRIX_QPF2K_HC_MASK", "14");
-    put("STRIX_QPF2K_HC_OUTPUT3", "1");                // lane-chain output v3 (exact; fixtures + in-engine FNV)
-    put("STRIX_QPF2K_HC_OUTPUT3_BAND", "16");          // band 16 (CTA permutation only; v3 kernel -6.4 %, 32K -0.52 s)
-    unsigned moe = 0U;
-    if (put("STRIX_QPF2K_MOE_DA16", "1")) moe |= 1U;
-    if (put("STRIX_QPF2K_MOE_ROUTE", "14")) moe |= 2U;
-    if (moe != 0U && !std::getenv("STRIX_QPF2K_MOE_DEFAULTED"))
-        ::setenv("STRIX_QPF2K_MOE_DEFAULTED", moe == 3U ? "3" : moe == 1U ? "1" : "2", 0);
-    return true;
-}();
-}  // namespace
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -67,6 +37,21 @@ const bool qpf2k_default_env = [] {
 #include <string_view>
 #include <utility>
 #include <vector>
+
+// CMake route clients: strix-hip-decode-token (also HTTP serving and MTP
+// cohorts through strix_serve), strix-hip-mtp-model-qualification,
+// strix-hip-known-window-model-qualification,
+// strix-hip-known-prompt-model-qualification, and
+// strix-hip-serving-greedy-model-qualification. Keep startup defaults shared
+// with any future runtime client that pulls this translation unit into its link.
+namespace {
+const bool qpf2k_default_env = [] {
+    strix::qpf2k::initialize_before_main(
+        [](const char* name) { return std::getenv(name); },
+        [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; });
+    return true;
+}();
+} // namespace
 
 namespace {
 // STRIX_QRTX_STEP_DUMP=<file> (diagnostic, off by default): after every step of a tiled prefill block, append every row's
@@ -275,6 +260,8 @@ struct HipKnownPrefixWindow::Impl {
         : actual_owner(std::move(owner)), window(std::move(source)), serial(std::move(serial_source)),
           model(std::move(model_source)), config(std::move(config_source)), resources(serial_resources),
           scratch(memory), scope(native_scope), routed_workspace(std::move(union_workspace)) {
+        scope.gsq_model = resources.model_manifest && qpf2k::has_gsq_gate(*resources.model_manifest);
+        const qpf2k::ModelScope defaults_scope(scope.gsq_model);
         prefill=std::move(tiled);
         if (!actual_owner) throw std::invalid_argument("known-window native owner requires retained actual owners");
         if (const auto error = model.validate(); !error.empty()) throw std::invalid_argument(error);
@@ -341,7 +328,7 @@ struct HipKnownPrefixWindow::Impl {
         } else {
             // STRIX_PREFILL_PIPE bit 128: one persistent index for every row view of the T arena.
             const char* v=std::getenv("STRIX_PREFILL_PIPE");
-            if(v&&(std::strtoul(v,nullptr,0)&128UL)!=0UL) arena_index=ArenaLookupIndex::uniform_views(prefill->arena.row_view);
+            if(!qpf2k::suppressed(qpf2k::Item::pipe)&&v&&(std::strtoul(v,nullptr,0)&128UL)!=0UL) arena_index=ArenaLookupIndex::uniform_views(prefill->arena.row_view);
         }
         setup_r2();
         setup_rows();
@@ -515,9 +502,9 @@ struct HipKnownPrefixWindow::Impl {
     // the side stream next to the routed experts (forked after the router, like detach_shared for verify windows),
     // with its workspace rows in an owner-held compact buffer; the MoE combine waits for it. Same kernels, launches
     // and per-row arithmetic; only the stream and the workspace address differ.
-    static unsigned prefill_schedule() {
+    unsigned prefill_schedule() const {
         static const unsigned v = [] { const char* e = std::getenv("STRIX_QPF2K_SCHED"); return e ? static_cast<unsigned>(std::strtoul(e, nullptr, 0)) : 0U; }();
-        return v;
+        return qpf2k::suppressed(qpf2k::Item::sched, scope.gsq_model) ? 0U : v;
     }
     bool prefill_schedule_step(std::size_t i, std::span<const ExecutionDispatchContext> rows) {
         const auto& step = serial.execution.steps[i];
@@ -594,9 +581,9 @@ struct HipKnownPrefixWindow::Impl {
     //   output; STRIX_WINDOW_COMBINE_INJECT=1: a MoE-combine rows step, the MLP inject and the next HC rows step
     //   run as combine+inject+norm, split-K, output. The folded steps are recorded as completed without a launch.
     static bool env_on(const char* name) { const char* v = std::getenv(name); return v && v[0] == '1'; }
-    static bool inject_norm_enabled() { static const bool on = strix_fuse_switch("STRIX_WINDOW_INJECT_NORM"); return on; }
+    static bool inject_norm_enabled() { return strix_window_inject_norm_enabled(); }
     static bool combine_inject_enabled() { static const bool on = env_on("STRIX_WINDOW_COMBINE_INJECT"); return on; }
-    static bool commit_combine_enabled() { static const bool on = strix_fuse_switch("STRIX_WINDOW_COMMIT_COMBINE"); return on; }
+    static bool commit_combine_enabled() { return strix_window_commit_combine_enabled(); }
     std::vector<std::size_t> folded_steps;
     bool hc_rows_step(std::size_t i) const {
         const auto op = serial.execution.steps[i].op;
@@ -693,10 +680,7 @@ struct HipKnownPrefixWindow::Impl {
     // (attn inject -> MLP mix, MLP inject -> next attention mix or the final mix) runs as one persistent HC
     // launch at the inject step; the HC step is then recorded as completed without a launch.
     static bool hc_inject_fusion_enabled() {
-        static const bool on = [] {
-            return strix_fuse_switch("STRIX_HC_PERSISTENT") && strix_fuse_switch("STRIX_HC_PERSISTENT_INJECT");
-        }();
-        return on;
+        return strix_hc_inject_fusion_enabled();
     }
     std::size_t fused_hc_step = SIZE_MAX;
     bool fuse_hc_inject(std::size_t i, const std::vector<std::vector<ExecutionDispatchContext>>& contexts) {
@@ -1131,7 +1115,7 @@ struct HipKnownPrefixWindow::Impl {
         // partials fused (STRIX_LM_HEAD_ROWS_GREEDY=0 keeps the separate greedy pass).
         static const std::uint32_t lean=[]{const char* v=std::getenv("STRIX_LM_HEAD_ROWS_LEAN");
             return v&&(v[0]=='1'||v[0]=='2')?static_cast<std::uint32_t>(v[0]-'0'):0U;}();
-        head_config.rows_lean=lean;
+        head_config.rows_lean=qpf2k::suppressed(qpf2k::Item::rows_lean)?0U:lean;
         const auto variant=window.logical_rows==2U?KnownWindowR2Variant::lm_head_q8_prefetch8_rows2_v1:
             window.logical_rows==4U?KnownWindowR2Variant::lm_head_q8_prefetch8_rows4_v1:KnownWindowR2Variant::lm_head_q8_prefetch8_rows8_v1;
         rows_entries.push_back({variant,this,
@@ -2376,6 +2360,7 @@ void HipKnownPrefixWindow::attach_greedy_rows(ExecutionBufferAddress partials,Hi
 }
 std::uint32_t HipKnownPrefixWindow::logical_rows() const noexcept { return impl_->logical_rows(); }
 bool HipKnownPrefixWindow::supports_tiled_prefill() const noexcept {return impl_->prefill.has_value();}
+bool HipKnownPrefixWindow::gsq_model() const noexcept {return impl_->scope.gsq_model;}
 KnownWindowOutputPolicy HipKnownPrefixWindow::output_policy() const noexcept { return impl_->prefill?impl_->prefill->output_policy:impl_->window.output_policy; }
 std::optional<HipKnownPrefixUnionObservation> HipKnownPrefixWindow::latest_routed_union_observation() const noexcept {
     return impl_->failed?std::nullopt:impl_->last_union_observation;

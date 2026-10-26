@@ -298,6 +298,22 @@ void prefill_profile_contract() {
 }
 
 int main() {
+    const auto dry = parse({"decoder","m","1","--generate","1","--print-effective-config"});
+    expect(dry.print_effective_config && !dry.any_low_level_flag && !dry.route_owned,
+        "effective-config inspection does not take route ownership");
+    const auto baseline_cli = parse({"decoder","m","1","--generate","1","--baseline"});
+    expect(baseline_cli.baseline && baseline_cli.numerical_profile == DecodeNumericalProfile::exact_v5,
+        "syntax parsing records baseline without confusing historical exact-v5 defaults with resolution");
+    const auto baseline_prepared = parse({"decoder","m","1","--generate","1","--baseline","--prepared-eager"});
+    expect(baseline_prepared.baseline && baseline_prepared.prepared_eager,
+        "baseline retains explicit historical organization");
+    rejects([] { (void)parse({"decoder","m","1","--baseline","--known-prefix-window",
+        "--prefill-numerical-profile","fast-prefill-f16wmma-v1"}); },
+        "prefill numerical profile may differ from an explicit --numerical-profile only in the dense A8 projections (q5k-a8-gateup profiles with and without +dense-a8), or be fast-prefill-f16wmma-v1 paired with hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1");
+    const auto dense_prefill = parse({"decoder","m","1","--generate","1","--prefill-numerical-profile","dense-a8"});
+    expect(dense_prefill.prefill_profile_deferred && dense_prefill.prefill_numerical_profile ==
+        DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1,
+        "dense-a8 prefill alias records complete identity for host resolution");
     const auto compact = DecodeNumericalProfile::dense_trellis_g1_fp32_v1;
     const auto compact_name = numerical_profile_name(compact);
     expect(parse_decode_numerical_profile(compact_name) == compact && numerical_profile_dense_a8(compact) &&

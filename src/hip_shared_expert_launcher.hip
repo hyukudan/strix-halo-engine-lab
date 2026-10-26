@@ -2728,5 +2728,64 @@ void launch_hip_shared_rows_projection_probe(HipSharedQ8ProjectionRole role, Hip
     else enqueue_shared_rows_probe<64U>(down, a8, input, weights, gate, output, width, outputs, native);
     check_hip(hipGetLastError(), "shared rows projection diagnostic launch");
 }
+namespace {
+template <unsigned Rows>
+void enqueue_shared_gsq_rows_probe(bool down, bool narrow, std::span<const std::uint32_t> types,
+    std::span<const HipSharedQ8ProjectionView> weights, std::span<const std::uint32_t> counts,
+    std::span<const HipSharedQ8ProjectionView> input, std::span<const HipSharedQ8ProjectionView> gate,
+    std::span<const HipSharedQ8ProjectionView> output, std::uint32_t width, hipStream_t stream) {
+    q8_rows::Segments segments{};
+    for (unsigned m = 0; m < types.size(); ++m) {
+        segments.weights[m] = reinterpret_cast<const unsigned char*>(weights[m].address);
+        segments.types[m] = q8_rows::segment_type(types[m]);
+        segments.first[m + 1U] = segments.first[m] + counts[m];
+    }
+    segments.count = static_cast<unsigned>(types.size());
+    if (down) {
+        SharedDownRowsSite<Rows> site{};
+        site.segments = segments; site.width = width; site.outputs = segments.first[1];
+        for (unsigned r = 0; r < Rows; ++r) {
+            site.input[r] = reinterpret_cast<const void*>(input[r].address);
+            site.gate[r] = reinterpret_cast<const float*>(gate[r].address);
+            site.output[r] = reinterpret_cast<std::uint16_t*>(output[r].address);
+        }
+        launch_shared_down_rows(site, true, stream, narrow ? 1 : 0);
+    } else {
+        SharedGateUpRowsSite<Rows> site{};
+        site.segments = segments; site.width = width; site.outputs = segments.first[segments.count];
+        for (unsigned r = 0; r < Rows; ++r) {
+            site.input[r] = reinterpret_cast<const void*>(input[r].address);
+            site.output[r] = reinterpret_cast<float*>(output[r].address);
+        }
+        q8_rows::launch(site, true, stream);
+    }
+}
+} // namespace
+void launch_hip_shared_gsq_rows_probe(HipSharedQ8ProjectionRole role, bool narrow, std::span<const std::uint32_t> types,
+    std::span<const HipSharedQ8ProjectionView> weights, std::span<const std::uint32_t> counts,
+    std::span<const HipSharedQ8ProjectionView> input, std::span<const HipSharedQ8ProjectionView> gate,
+    std::span<const HipSharedQ8ProjectionView> output, std::uint32_t width, void* stream) {
+    const auto rows = static_cast<std::uint32_t>(input.size());
+    const bool down = role == HipSharedQ8ProjectionRole::down;
+    if ((rows != 1U && rows != 2U && rows != 4U && rows != 8U) || types.empty() || types.size() > (down ? 1U : 2U) ||
+        weights.size() != types.size() || counts.size() != types.size() || output.size() != rows || gate.size() != (down ? rows : 0U) ||
+        (!down && role != HipSharedQ8ProjectionRole::gate_up) || (narrow && (!down || rows != 8U || width != 640U)) ||
+        !q8_rows::dense_a8_width(width) ||
+        !stream || static_cast<hipStream_t>(stream) == hipStreamLegacy || static_cast<hipStream_t>(stream) == hipStreamPerThread)
+        throw std::invalid_argument("shared GSQ typed rows diagnostic requires 1/2/4/8 rows, 1..2 gate/up (1 down) segments and an owned stream");
+    for (unsigned m = 0; m < types.size(); ++m)
+        if (!gsq_a8::dense_type(types[m]) || weights[m].bytes < gsq_a8::dense_row_bytes(types[m], width) * counts[m])
+            throw std::invalid_argument("shared GSQ typed rows diagnostic segment type or weight extent");
+    for (unsigned m = 0; m < types.size(); ++m)
+        if (width % gsq_a8::dense_block_elements(types[m]))
+            throw std::invalid_argument("shared GSQ typed rows diagnostic: width is not whole blocks of a segment type");
+    const auto native = static_cast<hipStream_t>(stream);
+    check_hip(hipPeekAtLastError(), "shared GSQ typed rows diagnostic pre-enqueue stale error");
+    if (rows == 1U) enqueue_shared_gsq_rows_probe<1U>(down, narrow, types, weights, counts, input, gate, output, width, native);
+    else if (rows == 2U) enqueue_shared_gsq_rows_probe<2U>(down, narrow, types, weights, counts, input, gate, output, width, native);
+    else if (rows == 4U) enqueue_shared_gsq_rows_probe<4U>(down, narrow, types, weights, counts, input, gate, output, width, native);
+    else enqueue_shared_gsq_rows_probe<8U>(down, narrow, types, weights, counts, input, gate, output, width, native);
+    check_hip(hipGetLastError(), "shared GSQ typed rows diagnostic launch");
+}
 } // namespace strix
 #endif

@@ -81,6 +81,8 @@ struct UmaReservationPlan {
 };
 struct UmaReservationEstimate {
     std::uint64_t retained_reserved_bytes = 0, setup_peak_reserved_bytes = 0;
+    // File-mapping bytes of the live inventory admitted as reclaimable (already subtracted above); 0 by default.
+    std::uint64_t reclaimable_file_mapping_credit_bytes = 0;
 };
 // Pre-allocation growth estimate: new copies/repack storage are additional
 // backings; aliases contribute zero here. setup_temporary_bytes coexist with
@@ -88,6 +90,12 @@ struct UmaReservationEstimate {
 [[nodiscard]] UmaReservationEstimate plan_uma_reservation_growth(
     const UmaOwnerInventory& live, std::uint64_t additional_new_retained_bytes,
     std::uint64_t setup_temporary_bytes, UmaReservationLimits limits = {});
+// Same, with an explicit credit for file-mapping pages of the live inventory that the caller drops and re-reads
+// (STRIX_PLE_RECLAIMABLE): retained = live + growth - credit. The credit cannot exceed the live inventory's known
+// file-mapping bytes; the caller owns the physical bound it encodes.
+[[nodiscard]] UmaReservationEstimate plan_uma_reservation_growth(
+    const UmaOwnerInventory& live, std::uint64_t additional_new_retained_bytes,
+    std::uint64_t setup_temporary_bytes, UmaReservationLimits limits, std::uint64_t reclaimable_file_mapping_credit_bytes);
 // Setup-only views are live concurrently with retained views, e.g. repack
 // staging. A retained repack copy has its own backing, while registered aliases
 // keep the source key. Limits use the conservative declared reservation bound,
