@@ -121,6 +121,12 @@ struct MoeCombineView {
     // Expert TP: raw / raw1 are the two K-half parts; out = (shared + S0) + S1, S_p the fold of w * part p over the
     // row's slots in ascending expert id from 0 (low_counts unused).
     const float* raw1 = nullptr;
+    // the whole combine (half -1, no raw1): hc_expand with sub = out in the same launch (hc_out[r][k][i] from
+    // hc_residual[r][j][i] and hc_mixes[r][24], in place allowed; hc_pre_carry optional): enqueue_hc_expand's bits
+    const float* hc_residual = nullptr;
+    const float* hc_mixes = nullptr;
+    float* hc_out = nullptr;
+    float* hc_pre_carry = nullptr;
 };
 void enqueue_moe_combine(const MoeCombineView& view, cudaStream_t stream);
 // out = (shared + low) + high elementwise (the combine from two half sums).

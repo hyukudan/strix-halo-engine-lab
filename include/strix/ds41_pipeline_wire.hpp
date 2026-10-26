@@ -65,6 +65,12 @@ enum class MsgType : std::uint16_t {
     spec_begin = 15,   // FRONT -> TAIL: start drafting at the committed position, answered by spec_accept (window 0)
     spec_accept = 16,  // TAIL -> FRONT: the decision of a verify window and the plan of the next one
     spec_commit = 17,  // FRONT -> TAIL: the last decision applied (end of a sequence), answered by ack
+    // several requests (ds41_pipeline_multi.hpp, strix/ds41-pipeline-multi-v1): the TAIL drives a FRONT of sequence slots
+    multi_hello = 18,   // FRONT -> TAIL: HELLO + the FRONT's slots and rows per step, answered by hello_ack
+    seq_step = 19,      // TAIL -> FRONT: one slot's rows, answered by seq_boundary
+    seq_boundary = 20,  // FRONT -> TAIL: the cut of that step (a STEP payload; header flags = the slot)
+    seq_reset = 21,     // TAIL -> FRONT: a slot starts a fresh sequence at position 0, answered by ack
+    seq_import = 22,    // TAIL -> FRONT: a slot continues a state (layers [0, cut) used), answered by ack
 };
 [[nodiscard]] const char* to_string(MsgType type) noexcept;
 

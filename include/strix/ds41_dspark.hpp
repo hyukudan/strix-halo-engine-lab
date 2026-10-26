@@ -30,7 +30,7 @@
 #include <span>
 #include <vector>
 
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) || defined(__CUDACC__)
 #define STRIX_DSPARK_HD __host__ __device__
 #else
 #define STRIX_DSPARK_HD
@@ -275,6 +275,9 @@ void fp8_entry(std::span<const float> x, std::span<std::uint8_t> entry);
 struct Ring {
     std::vector<std::uint8_t> entries = std::vector<std::uint8_t>(static_cast<std::size_t>(window) * entry_bytes);
     std::uint64_t next = 0;
+    // First position ever appended (a ring started at a later position, e.g. a sequence continued from an imported
+    // target state): only positions [max(start, next - 128), next) are keys. 0 = the usual ring.
+    std::uint64_t start = 0;
 };
 struct State { std::array<Ring, stages> rings; };
 

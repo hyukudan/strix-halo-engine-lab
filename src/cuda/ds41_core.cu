@@ -24,6 +24,8 @@ void require(bool ok, const char* what) {
 __global__ void quantize_a8_kernel(const float* __restrict__ x, std::uint32_t rows, std::uint32_t groups, std::uint32_t x_stride,
                                    std::int8_t* __restrict__ codes, float* __restrict__ deltas, std::int32_t* __restrict__ sums,
                                    std::uint32_t out_stride) {
+    // no early PDL trigger: a dependent GEMV launched at this kernel's entry sat resident beside it and slowed this
+    // latency-bound kernel ~2x on the PRO; every CTA triggers implicitly when it exits
     const std::uint32_t warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32U, lane = threadIdx.x & 31U;
     if (warp >= rows * groups) return;
     const std::uint32_t r = warp / groups, g = warp % groups;

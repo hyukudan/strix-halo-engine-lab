@@ -2,6 +2,8 @@
 
 #include "strix/cuda_ds41_parts_host.hpp"
 
+#include "ds41_resident_routes.cuh"
+
 #include <cuda_runtime.h>
 
 #include <stdexcept>
@@ -50,7 +52,7 @@ __global__ __launch_bounds__(1024) void resident_routes_kernel(ResidentRoutesVie
     __syncthreads();
     for (std::uint32_t s = t; s < slots; s += blockDim.x) {
         const std::uint32_t e = v.ids[s];
-        if (e < v.experts && v.slot_of[e] >= 0) atomicAdd(&count[e], 1U);
+        if (e < v.experts && (v.abort || v.slot_of[e] >= 0)) atomicAdd(&count[e], 1U);
     }
     __syncthreads();
     // one thread per expert id (experts <= 1024): union index and entry offset in ascending id
@@ -60,7 +62,7 @@ __global__ __launch_bounds__(1024) void resident_routes_kernel(ResidentRoutesVie
     const std::uint32_t unions = block_exclusive_scan(present, warp_sums);
     const std::uint32_t total = block_exclusive_scan(offset, warp_sums);
     if (c) {
-        v.out.experts[present] = static_cast<std::uint32_t>(v.slot_of[t]);
+        v.out.experts[present] = static_cast<std::uint32_t>(routes_detail::route_slot(v, t));
         v.out.begins[present] = offset;
     }
     offset_of[t] = offset;
@@ -109,6 +111,8 @@ __device__ __forceinline__ const float* vector_of(const SeededCombineView& c, st
     return c.remote[static_cast<std::uint32_t>(src) >> 24U] + std::uint64_t(static_cast<std::uint32_t>(src) & 0xffffffU) * c.hidden;
 }
 
+// windows of at most 32 slots (decode R1..5): one warp, the same arrays
+__global__ __launch_bounds__(32) void resident_routes_small_kernel(ResidentRoutesView v) { routes_detail::resident_routes_warp(v); }
 __global__ __launch_bounds__(kThreads) void seeded_combine_kernel(SeededCombineView c) {
     const std::uint64_t i = std::uint64_t{blockIdx.x} * kThreads + threadIdx.x;
     if (i >= std::uint64_t{c.rows} * c.hidden) return;
@@ -175,6 +179,13 @@ void enqueue_export_window(const ExportWindowView& v, cudaStream_t stream) {
 }
 
 void enqueue_resident_routes(const ResidentRoutesView& v, cudaStream_t stream) {
+    if (v.rows == 0U || v.top_k == 0U || v.top_k > 16U || v.experts == 0U || v.experts > 1024U || !v.ids || !v.slot_of)
+        throw std::invalid_argument("ds41 cuda resident routes: inconsistent arguments");
+    if (v.rows * v.top_k <= 32U) resident_routes_small_kernel<<<1, 32, 0, stream>>>(v);
+    else resident_routes_kernel<<<1, 1024, 0, stream>>>(v);
+    STRIX_CUDA_CHECK(cudaGetLastError());
+}
+void enqueue_resident_routes_block(const ResidentRoutesView& v, cudaStream_t stream) {
     if (v.rows == 0U || v.top_k == 0U || v.top_k > 16U || v.experts == 0U || v.experts > 1024U || !v.ids || !v.slot_of)
         throw std::invalid_argument("ds41 cuda resident routes: inconsistent arguments");
     resident_routes_kernel<<<1, 1024, 0, stream>>>(v);

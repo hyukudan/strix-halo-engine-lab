@@ -133,6 +133,11 @@ void GgufExpertReader::read(std::uint32_t layer, std::uint32_t expert, int part,
     if (!impl_->pread(dst, bytes, at)) throw std::runtime_error("ds41 expert reader: short read");
 }
 
+std::uint64_t GgufExpertReader::tensor_offset(std::uint32_t layer, int part) const {
+    if (!has_layer(layer) || part < 0 || part > 2) throw std::invalid_argument("ds41 expert reader: no such tensor");
+    return impl_->offsets[layer][static_cast<std::size_t>(part)];
+}
+
 void GgufExpertReader::read_tensor(std::uint32_t layer, int part, std::uint8_t* dst) const {
     if (!has_layer(layer) || part < 0 || part > 2) throw std::invalid_argument("ds41 expert reader: no such tensor");
     const std::uint64_t bytes = (part == 2 ? shape_.down_expert_bytes() : shape_.gate_expert_bytes()) * shape_.experts;

@@ -148,7 +148,7 @@ void AttentionState::commit_rows(std::uint32_t first, std::uint32_t end, std::ui
     }
 }
 
-void AttentionState::enqueue_layer(std::uint32_t layer, const LayerWeights& w, const LayerIo& io, cudaStream_t stream) {
+void AttentionState::enqueue_layer(std::uint32_t layer, const LayerWeights& w, const LayerIo& io, cudaStream_t stream, Phase phase) {
     auto& I = *impl_;
     const auto& o = I.options;
     if (!o.allocate_workspace || o.decoder_rows != 0U || o.candidate_rows != 0U)
@@ -159,8 +159,9 @@ void AttentionState::enqueue_layer(std::uint32_t layer, const LayerWeights& w, c
     const auto& r = I.plan[layer];
     const auto& c = I.caches[layer];
     const RopeRow* rope = rope_->table(r.rope);
+    const bool prep = phase != Phase::attend, attend = phase != Phase::prep;
     // the attention's own F16 projections, one launch
-    {
+    if (prep) {
         F16RowsView v{};
         v.rows = io.rows;
         const auto job = [&](const std::uint16_t* wt, std::uint32_t width, std::uint32_t count, const float* x, float* out) {
@@ -177,8 +178,8 @@ void AttentionState::enqueue_layer(std::uint32_t layer, const LayerWeights& w, c
         }
         if (v.job_count != 0U) enqueue_f16_rows(v, stream);
     }
-    enqueue_window_write(WindowView{io.kv, w.kv_norm, rope, io.pos, io.rows, ring_capacity_, c.ring}, stream);
-    if (r.owns_kv) {
+    if (prep) enqueue_window_write(WindowView{io.kv, w.kv_norm, rope, io.pos, io.rows, ring_capacity_, c.ring}, stream);
+    if (prep && r.owns_kv) {
         CompressView v{};
         v.ratio = r.ratio;
         v.rows = io.rows;
@@ -200,7 +201,7 @@ void AttentionState::enqueue_layer(std::uint32_t layer, const LayerWeights& w, c
     for (std::uint32_t w0 = 0; w0 < io.rows; w0 += W) {
         const std::uint32_t n = std::min(W, io.rows - w0);
         const std::uint64_t bound = io.pos_bound - (io.rows - w0 - n);  // >= the window's last position (rows are consecutive)
-        if (r.owns_index) {
+        if (prep && r.owns_index) {
             const auto& src = I.plan[static_cast<std::size_t>(r.kv_source)];
             const auto& sc = I.caches[static_cast<std::size_t>(r.kv_source)];
             const std::uint32_t max_count = static_cast<std::uint32_t>((bound + 1U) / src.ratio);
@@ -235,6 +236,7 @@ void AttentionState::enqueue_layer(std::uint32_t layer, const LayerWeights& w, c
             if (sv.pool != Pool::plain && candidates_ == nullptr) throw std::logic_error("ds41 cuda attention: no candidate pool");
             enqueue_select(sv, stream);
         }
+        if (!attend) continue;
         AttentionView av{};
         av.rows = n;
         av.capacity = ring_capacity_;

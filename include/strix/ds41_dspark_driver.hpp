@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace strix::ds41::dspark {
@@ -110,12 +111,26 @@ public:
     [[nodiscard]] double probability(std::uint32_t depth, float confidence) const;
     [[nodiscard]] double pooled(std::uint32_t depth) const;
     [[nodiscard]] double window_rate(std::uint32_t drafts, const std::array<double, block_size>& p) const;
+    // Survival table: hit / seen counts per depth and confidence bin. A stored table (read_survival_table) warm-starts
+    // a run or a chat (no cold Beta(1, 1) cells at the start of every chat); the counts a run adds take over
+    // as they grow. The sweep and the cost samples are untouched. Only window sizes depend on it, never tokens.
+    struct Table {
+        std::array<std::array<std::uint32_t, bins>, block_size> seen{}, hits{};
+    };
+    [[nodiscard]] Table table() const;
+    void set_table(const Table& table);
+    // Seeded start (measured: the sweep and the exploration windows of a cold controller cost more than they
+    // learn when the costs are known): skip_sweep() drops the initial R6..R2 sweep, set_explore_every(n) explores every
+    // n-th decision (0 = never; default explore_every). Window sizes only, never tokens.
+    void skip_sweep() noexcept { sweep_ = block_size; }
+    void set_explore_every(std::uint32_t n) noexcept { explore_every_ = n; }
 
 private:
     Costs costs_;
     std::array<std::array<std::uint32_t, bins>, block_size> seen_{}, hits_{};
     std::uint64_t decisions_ = 0;
     std::uint32_t sweep_ = 0;
+    std::uint32_t explore_every_ = explore_every;
     bool explore_ = false;
 };
 
@@ -175,6 +190,15 @@ private:
     std::vector<std::array<std::uint32_t, block_size>> slot_seen_, slot_hits_;
     std::uint64_t plans_ = 0;
 };
+
+// Survival tables as text: the line "ds41-dspark-survival-v1 bins 8", then one line per depth j = 1..5:
+// "d<j>" followed by the 8 seen counts and the 8 hit counts (decimal). read: with cap > 0 each depth's counts are scaled
+// down (rounded to nearest) so that its seen counts sum to at most cap, hits <= seen kept. Throws on a malformed file.
+[[nodiscard]] WindowController::Table read_survival_table(const std::string& path, std::uint32_t cap = 0);
+// The default warm-start table built into the binary: the node DSpark probe prior,
+// scaled to `cap` observations per depth like read_survival_table.
+[[nodiscard]] WindowController::Table builtin_survival_table(std::uint32_t cap = 64);
+void write_survival_table(const std::string& path, const WindowController::Table& table);
 
 struct WindowPolicy {
     bool automatic = false;

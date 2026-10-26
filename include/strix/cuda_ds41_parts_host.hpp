@@ -30,8 +30,15 @@ struct ResidentRoutesView {
     const std::int32_t* slot_of = nullptr;
     std::uint32_t rows = 0, top_k = 0, experts = 0, split = 0;
     MoeRoutes out;
+    // Guarded mode (an external slot table, e.g. tierstream's device-gated view; abort != nullptr): every routed id gets a
+    // slot, the guard slot when *abort is set or its entry is < 0 (then *absent_err |= 1). Off: entries < 0 are skipped.
+    const std::uint32_t* abort = nullptr;
+    std::int32_t guard_slot = -1;
+    std::uint32_t* absent_err = nullptr;
 };
 void enqueue_resident_routes(const ResidentRoutesView& view, cudaStream_t stream);
+// The 1024-thread block form only (windows of more than 32 slots always take it; the reference of the one-warp form).
+void enqueue_resident_routes_block(const ResidentRoutesView& view, cudaStream_t stream);
 
 // Combine tables of one window, packed as int32 (one upload per layer, or read in place from mapped host memory):
 // seed[rows * 2] (-1 or the seed vector: answer << 24 | item), start[rows * 2] (leading slots of the half covered by the

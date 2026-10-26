@@ -16,15 +16,14 @@ namespace strix::ds41::cuda::moe_detail {
 
 constexpr unsigned kFull = 0xffffffffU;
 
-// FP16 bits to FP32, exactly as the host's half_to_float (subnormals, infinities and NaN payloads).
+// FP16 bits to FP32, exactly as the host's half_to_float (subnormals, infinities and NaN payloads). No branches: the
+// hardware conversion is exact for every non-NaN encoding, one select restores a NaN's payload (the hardware returns
+// a canonical NaN). The branchy form put a divergence region around every block scale of the decode loops.
 __device__ __forceinline__ float half_bits(std::uint32_t bits) {
-    const std::uint32_t sign = (bits & 0x8000U) << 16U, exponent = (bits >> 10U) & 0x1fU, mantissa = bits & 0x3ffU;
-    if (exponent == 0U) {
-        const float magnitude = static_cast<float>(mantissa) * 5.9604644775390625e-8F;  // exact: m * 2^-24
-        return __uint_as_float(__float_as_uint(magnitude) | sign);
-    }
-    if (exponent == 31U) return __uint_as_float(sign | 0x7f800000U | (mantissa << 13U));
-    return __uint_as_float(sign | ((exponent + 112U) << 23U) | (mantissa << 13U));
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(static_cast<unsigned short>(bits)));
+    const bool nan = (bits & 0x7c00U) == 0x7c00U && (bits & 0x3ffU) != 0U;
+    return nan ? __uint_as_float(((bits & 0x8000U) << 16U) | 0x7f800000U | ((bits & 0x3ffU) << 13U)) : f;
 }
 
 // IQ2_XXS: byte masks (0xff = negative) of four sign bits, and the signed codes of four grid magnitudes.

@@ -133,6 +133,11 @@ const char* to_string(MsgType type) noexcept {
     case MsgType::spec_begin: return "SPEC_BEGIN";
     case MsgType::spec_accept: return "SPEC_ACCEPT";
     case MsgType::spec_commit: return "SPEC_COMMIT";
+    case MsgType::multi_hello: return "MULTI_HELLO";
+    case MsgType::seq_step: return "SEQ_STEP";
+    case MsgType::seq_boundary: return "SEQ_BOUNDARY";
+    case MsgType::seq_reset: return "SEQ_RESET";
+    case MsgType::seq_import: return "SEQ_IMPORT";
     }
     return "UNKNOWN";
 }
@@ -172,7 +177,7 @@ Header decode_header(std::span<const std::uint8_t> bytes, std::uint64_t max_byte
     h.version = r.get<std::uint16_t>();
     if (h.version != kVersion) throw WireError("header: protocol version " + std::to_string(h.version) + ", this engine speaks " + std::to_string(kVersion));
     const auto type = r.get<std::uint16_t>();
-    if (type < 1U || type > 17U) throw WireError("header: unknown message type " + std::to_string(type));
+    if (type < 1U || type > 22U) throw WireError("header: unknown message type " + std::to_string(type));
     h.type = static_cast<MsgType>(type);
     h.request = r.get<std::uint64_t>();
     h.bytes = r.get<std::uint64_t>();

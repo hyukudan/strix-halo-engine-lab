@@ -46,6 +46,8 @@ public:
     // Closes the file (reads throw afterwards). The loader's reads are buffered: an open cached handle on the model
     // file is not kept for the decode's unbuffered reads of the same file.
     void close() noexcept;
+    // absolute file offset of a layer's stacked expert tensor (part 0 gate, 1 up, 2 down)
+    [[nodiscard]] std::uint64_t tensor_offset(std::uint32_t layer, int part) const;
 
 private:
     struct Impl;
