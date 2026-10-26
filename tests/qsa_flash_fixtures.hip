@@ -120,7 +120,7 @@ static void run_score_case(const ScoreCase& c, std::uint32_t blocks, hipStream_t
     auto* d_q = dalloc<float>(c.q.size()); check(hipMemcpy(d_q, c.q.data(), c.q.size() * 4, hipMemcpyHostToDevice), "h2d q");
     auto* d_k = dalloc<float>(c.keys.size()); check(hipMemcpy(d_k, c.keys.data(), c.keys.size() * 4, hipMemcpyHostToDevice), "h2d k");
     auto* d_r = dalloc<uint2>(blocks);
-    hipLaunchKernelGGL(qsa_flash::key_range_kernel, dim3((blocks + 255U) / 256U), dim3(256), 0, s, d_k, 0U, blocks, d_r);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((blocks + 255U) / 256U), dim3(256), 0, s, d_k, 0U, blocks, d_r);
     const std::size_t n = static_cast<std::size_t>(Rows) * 65536U;
     auto* d_ref = dalloc<float>(n); auto* d_new = dalloc<float>(n); auto* d_lds = dalloc<float>(n);
     check(hipMemsetAsync(d_ref, 0xA5, n * 4, s), "memset"); check(hipMemsetAsync(d_new, 0xA5, n * 4, s), "memset"); check(hipMemsetAsync(d_lds, 0xA5, n * 4, s), "memset");
@@ -196,7 +196,7 @@ static void run_select_case(const SelectCase& c, hipStream_t s, std::map<std::st
     const std::size_t n = static_cast<std::size_t>(Rows) * 65536U;
     auto* d_a = dalloc<float>(n); auto* d_b = dalloc<float>(n);
     std::vector<float> host(n, bits(0x7f7fbeefU));
-    for (unsigned r = 0; r < Rows; ++r) std::copy(c.rows[r].begin(), c.rows[r].end(), host.begin() + static_cast<std::size_t>(r) * 65536U);
+    for (unsigned r = 0; r < Rows; ++r) std::copy(c.rows[r].begin(), c.rows[r].end(), host.begin() + static_cast<std::ptrdiff_t>(r) * 65536);
     check(hipMemcpy(d_a, host.data(), n * 4, hipMemcpyHostToDevice), "h2d"); check(hipMemcpy(d_b, host.data(), n * 4, hipMemcpyHostToDevice), "h2d");
     auto* d_sa = dalloc<std::uint32_t>(Rows * kMaxsel); auto* d_sb = dalloc<std::uint32_t>(Rows * kMaxsel);
     check(hipMemset(d_sa, 0xAA, Rows * kMaxsel * 4), "memset"); check(hipMemset(d_sb, 0xAA, Rows * kMaxsel * 4), "memset");
@@ -476,8 +476,257 @@ static void run_attend_case(const char* name, unsigned mode, hipStream_t s, std:
                     static_cast<void*>(ob), static_cast<void*>(d_va), static_cast<void*>(d_vb)}) check(hipFree(p), "free");
 }
 
-int main() {
+// Stage batching: use the actual shared production kernels, with independent,
+// canary-filled arenas for the serial and stage-major schedules. NaN payloads,
+// signed zeros and all unwritten bytes are compared literally (no NaN exemption).
+template <SmallWeightKind Kind>
+static void run_stage_batch_case(unsigned groups, bool wave, bool edges, hipStream_t s) {
+    constexpr unsigned Rows = 64U, Dim = 128U, RowFloats = 1408U, Rotary = 128U;
+    constexpr float Epsilon = 1.0e-6F, Theta = 10000.0F;
+    const unsigned ratio = groups == 128U ? 32U : 4U, topk = edges ? 18U : 2U;
+    const unsigned first = edges ? 1U : 2U * ratio + 1U, rows = groups * Rows;
+    const unsigned tokens = first + rows + 2U, capacity = tokens / ratio + 8U, score_stride = capacity + 8U;
+    Rng rng{0xcafef00d12345678ULL};
+    std::vector<float> input(static_cast<std::size_t>(rows) * RowFloats);
+    for (auto& x : input) x = bf(rng.normal());
+    if (edges) {
+        const std::uint32_t special[] = {0U, 0x80000000U, 0x00010000U, 0x00800000U, 0x7f7f0000U,
+            0x7f800000U, 0xff800000U, 0x7fc10000U, 0xffc20000U, 0x7fa10000U};
+        for (unsigned r = 0; r < rows; ++r) {
+            const auto base = static_cast<std::size_t>(r) * RowFloats;
+            for (unsigned set : {0U, 512U, 1024U, 1152U, 1280U})
+                input[base + set + r % Dim] = bits(special[r % 10U]);
+            if (r % 13U == 0U) std::fill_n(input.begin() + static_cast<std::ptrdiff_t>(base), 512U, -0.0F);
+        }
+    }
+    std::vector<std::uint16_t> initial_raw(static_cast<std::size_t>(tokens) * Dim, 0xa5a5U);
+    for (unsigned p = 0; p < first; ++p)
+        for (unsigned d = 0; d < Dim; ++d) initial_raw[static_cast<std::size_t>(p) * Dim + d] =
+            static_cast<std::uint16_t>(ubits(bf(rng.normal())) >> 16U);
+    auto* weights = dalloc<float>(Dim);
+    if constexpr (Kind == SmallWeightKind::f32) {
+        const std::vector<float> w(Dim, 1.0F);
+        check(hipMemcpy(weights, w.data(), w.size() * sizeof(float), hipMemcpyHostToDevice), "batch weights");
+    } else {
+        const std::vector<std::uint16_t> w(Dim, Kind == SmallWeightKind::f16 ? 0x3c00U : 0x3f80U);
+        check(hipMemcpy(weights, w.data(), w.size() * sizeof(std::uint16_t), hipMemcpyHostToDevice), "batch weights");
+    }
+    struct Arena {
+        float *values, *pool, *scores, *maxima;
+        float2* tables;
+        uint2* ranges;
+        std::uint16_t *raw, *kv, *journal;
+        std::uint32_t* stats;
+        qsa_index::NormGroupViews<Rows>* dn;
+        QsaRowsStoreViews<Rows>* ds;
+        qsa_flash::ScoreGroup<Rows>* dc;
+        uint2* db;
+        std::vector<qsa_index::NormGroupViews<Rows>> norm;
+        std::vector<QsaRowsStoreViews<Rows>> store;
+        std::vector<qsa_flash::ScoreGroup<Rows>> score;
+        std::vector<uint2> bounds;
+        unsigned max_new = 0, max_blocks = 0, max_heads = 0;
+    };
+    const std::size_t table_count = static_cast<std::size_t>(groups) * Rows * (Rotary / 2U) + 8U;
+    const std::size_t score_count = static_cast<std::size_t>(rows) * score_stride;
+    const std::size_t maxima_count = static_cast<std::size_t>(rows) * ((capacity + 3U) / 4U + 3U);
+    const std::size_t kv_count = static_cast<std::size_t>(tokens) * Dim * 2U;
+    const auto setup = [&](Arena& a) {
+        a.values = dalloc<float>(input.size()); a.pool = dalloc<float>(static_cast<std::size_t>(capacity) * Dim);
+        a.scores = dalloc<float>(score_count); a.maxima = dalloc<float>(maxima_count);
+        a.tables = dalloc<float2>(table_count); a.ranges = dalloc<uint2>(capacity);
+        a.raw = dalloc<std::uint16_t>(initial_raw.size()); a.kv = dalloc<std::uint16_t>(kv_count);
+        a.journal = dalloc<std::uint16_t>(8U * Dim + 8U); a.stats = dalloc<std::uint32_t>(qsa_flash::kStats);
+        a.dn = dalloc<qsa_index::NormGroupViews<Rows>>(groups); a.ds = dalloc<QsaRowsStoreViews<Rows>>(groups);
+        a.dc = dalloc<qsa_flash::ScoreGroup<Rows>>(groups); a.db = dalloc<uint2>(groups);
+        check(hipMemcpy(a.values, input.data(), input.size() * sizeof(float), hipMemcpyHostToDevice), "batch inputs");
+        check(hipMemcpy(a.raw, initial_raw.data(), initial_raw.size() * sizeof(std::uint16_t), hipMemcpyHostToDevice), "batch raw prefix");
+        for (const auto& [p, bytes] : std::vector<std::pair<void*, std::size_t>>{
+            {a.pool, static_cast<std::size_t>(capacity) * Dim * sizeof(float)}, {a.scores, score_count * sizeof(float)},
+            {a.maxima, maxima_count * sizeof(float)}, {a.tables, table_count * sizeof(float2)},
+            {a.ranges, capacity * sizeof(uint2)}, {a.kv, kv_count * sizeof(std::uint16_t)},
+            {a.journal, (8U * Dim + 8U) * sizeof(std::uint16_t)}})
+            check(hipMemsetAsync(p, 0xa5, bytes, s), "batch canary");
+        check(hipMemsetAsync(a.stats, 0, qsa_flash::kStats * sizeof(std::uint32_t), s), "batch stats");
+        a.norm.resize(groups); a.store.resize(groups); a.score.resize(groups); a.bounds.resize(groups);
+        unsigned valid = 0;
+        std::size_t offset = 0;
+        for (unsigned g = 0; g < groups; ++g) {
+            auto& n = a.norm[g]; auto& st = a.store[g]; auto& sc = a.score[g];
+            for (unsigned r = 0; r < Rows; ++r) {
+                const unsigned row = g * Rows + r, position = first + row, complete = (position + 1U) / ratio;
+                auto* v = a.values + static_cast<std::size_t>(row) * RowFloats;
+                n.values[0][r] = v; sc.views.index_query[r] = v;
+                n.values[1][r] = v + 512U; n.values[2][r] = v + 1024U;
+                st.index_key[r] = v + 1152U; st.k[r] = v + 1024U; st.v[r] = v + 1280U;
+                n.position[r] = st.position[r] = position;
+                sc.views.block_scores[r] = a.scores + static_cast<std::size_t>(row) * score_stride;
+                sc.views.blocks[r] = complete > topk ? complete : 0U;
+                sc.blocks = std::max(sc.blocks, sc.views.blocks[r]);
+            }
+            n.heads[0] = sc.blocks ? 4U : 0U; n.heads[1] = 2U; n.heads[2] = 1U;
+            for (unsigned set = 0; set < 3U; ++set) {
+                n.weights[set] = weights; n.dim[set] = Dim; n.stride[set] = set == 1U ? 2U * Dim : Dim;
+            }
+            n.table = a.tables + static_cast<std::size_t>(g) * Rows * (Rotary / 2U);
+            st.journal = a.journal;
+            const unsigned count = sc.blocks > valid ? sc.blocks - valid : 0U;
+            a.bounds[g] = make_uint2(valid, count); valid = std::max(valid, sc.blocks);
+            a.max_new = std::max(a.max_new, count); a.max_blocks = std::max(a.max_blocks, sc.blocks);
+            a.max_heads = std::max(a.max_heads, n.heads[0] + 3U);
+            sc.maxima_stride = (sc.blocks + 3U) / 4U + 3U;
+            sc.maxima = sc.blocks ? a.maxima + offset : nullptr;
+            offset += static_cast<std::size_t>(Rows) * sc.maxima_stride;
+        }
+        check(hipMemcpy(a.dn, a.norm.data(), groups * sizeof(a.norm[0]), hipMemcpyHostToDevice), "batch norm descriptors");
+        check(hipMemcpy(a.dc, a.score.data(), groups * sizeof(a.score[0]), hipMemcpyHostToDevice), "batch score descriptors");
+        check(hipMemcpy(a.db, a.bounds.data(), groups * sizeof(uint2), hipMemcpyHostToDevice), "batch bounds");
+    };
+    Arena serial{}, batch{}; setup(serial); setup(batch);
+    constexpr unsigned R = qsa_flash::kScoreRows, W = qsa_flash::kScoreWaves;
+    for (unsigned g = 0; g < groups; ++g) {
+        const auto& n = serial.norm[g]; const auto& st = serial.store[g]; const auto& sc = serial.score[g];
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rope_table_kernel<Rows>), dim3(Rows), dim3(64), 0, s, n, Rotary, Theta);
+        const auto heads = n.heads[0] + 3U;
+        if (wave)
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::norm_rope_wave_kernel<Kind, Rows>), dim3((Rows * heads + 7U) / 8U),
+                dim3(256), 0, s, n, Epsilon, Rotary);
+        else
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::norm_rope_group_kernel<Kind, Rows>), dim3(heads, Rows),
+                dim3(256), 0, s, n, Epsilon, Rotary);
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(store_rows_kernel<Rows>), dim3(1, Rows), dim3(256), 0, s,
+            st, serial.raw, serial.kv, Dim, Dim);
+        if (serial.bounds[g].y) {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<Kind>), dim3(serial.bounds[g].y), dim3(Dim),
+                2U * Dim * sizeof(float), s, serial.raw, serial.bounds[g].x, Dim, ratio, weights, Epsilon, Rotary, Theta, serial.pool);
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((serial.bounds[g].y + 255U) / 256U),
+                dim3(256), 0, s, serial.pool, serial.bounds[g].x, serial.bounds[g].y, serial.ranges);
+        }
+        if (sc.blocks)
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, R, W, true>),
+                dim3(((sc.blocks + 31U) / 32U + W - 1U) / W, Rows / R), dim3(W * 32U), 0, s,
+                sc.views, serial.pool, sc.blocks, Dim, sc.maxima, sc.maxima_stride, serial.ranges, serial.stats);
+    }
+    for (unsigned g = 0; g + 1U < groups; ++g) batch.store[g].journal = nullptr;
+    check(hipMemcpy(batch.ds, batch.store.data(), groups * sizeof(batch.store[0]), hipMemcpyHostToDevice), "batch store descriptors");
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rope_table_kernel<Rows, true>), dim3(Rows, groups), dim3(64), 0, s,
+        qsa_index::NormGroupViews<Rows>{}, Rotary, Theta, batch.dn);
+    if (wave)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::norm_rope_wave_kernel<Kind, Rows, true>),
+            dim3((Rows * batch.max_heads + 7U) / 8U, groups), dim3(256), 0, s,
+            qsa_index::NormGroupViews<Rows>{}, Epsilon, Rotary, batch.dn);
+    else
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::norm_rope_group_kernel<Kind, Rows, true>),
+            dim3(batch.max_heads, Rows, groups), dim3(256), 0, s, qsa_index::NormGroupViews<Rows>{}, Epsilon, Rotary, batch.dn);
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(store_rows_kernel<Rows, true>), dim3(1, Rows, groups), dim3(256), 0, s,
+        QsaRowsStoreViews<Rows>{}, batch.raw, batch.kv, Dim, Dim, batch.ds);
+    if (batch.max_new) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<Kind, true>), dim3(batch.max_blocks), dim3(Dim),
+            2U * Dim * sizeof(float), s, batch.raw, 0U, Dim, ratio, weights, Epsilon, Rotary, Theta, batch.pool, batch.db, groups);
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<true>), dim3((batch.max_blocks + 255U) / 256U),
+            dim3(256), 0, s, batch.pool, 0U, batch.max_blocks, batch.ranges, batch.db, groups);
+    }
+    if (batch.max_blocks)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, R, W, true, false, true, 1U, true>),
+            dim3(((batch.max_blocks + 31U) / 32U + W - 1U) / W, Rows / R, groups), dim3(W * 32U), 0, s,
+            QsaRowsScoreViews<Rows>{}, batch.pool, 0U, Dim, nullptr, 0U, batch.ranges, batch.stats, batch.dc);
+    check(hipGetLastError(), "stage batch launches"); check(hipStreamSynchronize(s), "stage batch sync");
+    const std::string name = "stage batch groups=" + std::to_string(groups) + " wave=" + std::to_string(wave) +
+        " edges=" + std::to_string(edges) + " kind=" + std::to_string(static_cast<unsigned>(Kind));
+    const auto compare = [&](const void* a, const void* b, std::size_t bytes, const char* stage) {
+        std::vector<unsigned char> x(bytes), y(bytes);
+        check(hipMemcpy(x.data(), a, bytes, hipMemcpyDeviceToHost), "batch compare serial");
+        check(hipMemcpy(y.data(), b, bytes, hipMemcpyDeviceToHost), "batch compare batched");
+        expect(x == y, name + " " + stage);
+    };
+    compare(serial.values, batch.values, input.size() * sizeof(float), "norm and untouched projections");
+    compare(serial.tables, batch.tables, table_count * sizeof(float2), "private RoPE tables");
+    compare(serial.raw, batch.raw, initial_raw.size() * sizeof(std::uint16_t), "raw index keys");
+    compare(serial.kv, batch.kv, kv_count * sizeof(std::uint16_t), "BF16 KV");
+    compare(serial.journal, batch.journal, (8U * Dim + 8U) * sizeof(std::uint16_t), "final journal");
+    compare(serial.pool, batch.pool, static_cast<std::size_t>(capacity) * Dim * sizeof(float), "pool");
+    compare(serial.ranges, batch.ranges, capacity * sizeof(uint2), "ranges");
+    compare(serial.scores, batch.scores, score_count * sizeof(float), "scores and masked blocks");
+    compare(serial.maxima, batch.maxima, maxima_count * sizeof(float), "private maxima");
+    compare(serial.stats, batch.stats, qsa_flash::kStats * sizeof(std::uint32_t), "guard decisions");
+    std::vector<std::uint32_t> stats(qsa_flash::kStats);
+    check(hipMemcpy(stats.data(), batch.stats, stats.size() * sizeof(std::uint32_t), hipMemcpyDeviceToHost), "batch guard witness");
+    expect(!batch.max_blocks || stats[qsa_flash::kFused] + stats[qsa_flash::kSeparate] > 0U, name + " scorer executed");
+    std::vector<std::uint16_t> journal(8U * Dim);
+    check(hipMemcpy(journal.data(), batch.journal, journal.size() * sizeof(std::uint16_t), hipMemcpyDeviceToHost), "batch journal witness");
+    bool final_journal = true;
+    for (unsigned r = 0; r < 8U; ++r)
+        for (unsigned d = 0; d < Dim; ++d) {
+            const auto x = input[static_cast<std::size_t>(rows - 8U + r) * RowFloats + 1152U + d];
+            const auto u = ubits(x);
+            const auto expected = static_cast<std::uint16_t>((u + 0x7fffU + ((u >> 16U) & 1U)) >> 16U);
+            final_journal = final_journal && journal[r * Dim + d] == expected;
+        }
+    expect(final_journal, name + " journal contains final eight rows");
+    // Exercise the private maxima through both immediate and deferred selection,
+    // as the engine does with bit 4 clear/set; compare complete selected capacities.
+    const unsigned selected_stride = (topk + 1U) * ratio;
+    const auto selected_count = static_cast<std::size_t>(rows) * selected_stride;
+    auto* selected_serial = dalloc<std::uint32_t>(selected_count);
+    auto* selected_batch = dalloc<std::uint32_t>(selected_count);
+    check(hipMemsetAsync(selected_serial, 0xa5, selected_count * sizeof(std::uint32_t), s), "serial selected canary");
+    check(hipMemsetAsync(selected_batch, 0xa5, selected_count * sizeof(std::uint32_t), s), "batch selected canary");
+    std::vector<qsa_flash::SelectRow> selection(rows);
+    for (unsigned g = 0; g < groups; ++g) {
+        QsaRowsSelectViews<Rows> v{};
+        for (unsigned r = 0; r < Rows; ++r) {
+            const unsigned row = g * Rows + r;
+            v.block_scores[r] = serial.score[g].views.block_scores[r];
+            v.selected[r] = selected_serial + static_cast<std::size_t>(row) * selected_stride;
+            v.visible[r] = first + row + 1U;
+            const auto& sc = batch.score[g];
+            selection[row] = qsa_flash::SelectRow{sc.views.block_scores[r],
+                selected_batch + static_cast<std::size_t>(row) * selected_stride,
+                sc.maxima ? sc.maxima + static_cast<std::size_t>(r) * sc.maxima_stride : nullptr, v.visible[r], 0U};
+        }
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::select_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, s,
+            v, serial.score[g].maxima, serial.score[g].maxima_stride, ratio, topk);
+    }
+    auto* ds = dalloc<qsa_flash::SelectRow>(rows);
+    check(hipMemcpy(ds, selection.data(), rows * sizeof(selection[0]), hipMemcpyHostToDevice), "batch selected descriptors");
+    hipLaunchKernelGGL(qsa_flash::select_batch_kernel, dim3(rows), dim3(kSelectThreads), 0, s, ds, ratio, topk);
+    check(hipGetLastError(), "stage batch selection launch"); check(hipStreamSynchronize(s), "stage batch selection sync");
+    compare(selected_serial, selected_batch, selected_count * sizeof(std::uint32_t), "immediate/deferred selected indices");
+    compare(serial.scores, batch.scores, score_count * sizeof(float), "post-selection scores");
+    check(hipFree(ds), "batch selection free");
+    check(hipFree(selected_serial), "serial selected free"); check(hipFree(selected_batch), "batch selected free");
+    std::printf("  B %s: byte comparisons complete\n", name.c_str());
+    const auto release = [&](Arena& a) {
+        for (void* p : {static_cast<void*>(a.values), static_cast<void*>(a.pool), static_cast<void*>(a.scores),
+            static_cast<void*>(a.maxima), static_cast<void*>(a.tables), static_cast<void*>(a.ranges),
+            static_cast<void*>(a.raw), static_cast<void*>(a.kv), static_cast<void*>(a.journal), static_cast<void*>(a.stats),
+            static_cast<void*>(a.dn), static_cast<void*>(a.ds), static_cast<void*>(a.dc), static_cast<void*>(a.db)}) check(hipFree(p), "batch free");
+    };
+    release(serial); release(batch); check(hipFree(weights), "batch weights free");
+}
+static void run_stage_batch_cases(hipStream_t s) {
+    for (unsigned groups : {1U, 2U, 7U, 128U})
+        for (bool wave : {false, true})
+            for (bool edges : {false, true}) {
+                run_stage_batch_case<SmallWeightKind::f32>(groups, wave, edges, s);
+                run_stage_batch_case<SmallWeightKind::f16>(groups, wave, edges, s);
+                run_stage_batch_case<SmallWeightKind::bf16>(groups, wave, edges, s);
+            }
+}
+
+int main(int argc, char** argv) {
+    const bool stage_only = argc == 2 && std::strcmp(argv[1], "--stage-batch-only") == 0;
+    if (argc != 1 && !stage_only) { std::fprintf(stderr, "usage: %s [--stage-batch-only]\n", argv[0]); return 2; }
     hipStream_t s; check(hipStreamCreate(&s), "stream");
+    // qsa_flash_prod.inc also exposes this bench-only kernel; retain its symbol
+    // when this fixture is built with the engine's unused-function diagnostics.
+    static_cast<void>(&qsa_fast::kv_to_f16_kernel);
+    run_stage_batch_cases(s);
+    if (stage_only) {
+        check(hipStreamDestroy(s), "stream destroy");
+        std::printf("stage batch fixtures: %s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
+        return failures ? 1 : 0;
+    }
     std::map<std::string, std::uint64_t> paths;
     Rng rng{0x2545F4914F6CDD1DULL};
     const auto normal_q = [&](unsigned rows) { std::vector<float> q(static_cast<std::size_t>(rows) * kHeads * kDim); for (auto& x : q) x = bf(rng.normal()); return q; };

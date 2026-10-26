@@ -97,7 +97,7 @@ int main(int argc, char** argv) {
         for (std::uint64_t g = 0; g < groups; ++g) if (scored[g] > valid) {
             hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<SmallWeightKind::bf16>), dim3(scored[g] - valid), dim3(dim), 2 * dim * 4, s,
                 d_raw, valid, dim, ratio, d_knorm, 1e-6F, 64U, 1e7F, d_pool);
-            hipLaunchKernelGGL(qsa_flash::key_range_kernel, dim3((scored[g] - valid + 255U) / 256U), dim3(256), 0, s, d_pool, valid, scored[g] - valid, d_ranges);
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((scored[g] - valid + 255U) / 256U), dim3(256), 0, s, d_pool, valid, scored[g] - valid, d_ranges);
             valid = scored[g];
         }
     };
@@ -120,7 +120,7 @@ int main(int argc, char** argv) {
     const auto key_ranges_all = [&] {
         std::uint32_t valid = 0;
         for (std::uint64_t g = 0; g < groups; ++g) if (scored[g] > valid) {
-            hipLaunchKernelGGL(qsa_flash::key_range_kernel, dim3((scored[g] - valid + 255U) / 256U), dim3(256), 0, s, d_pool, valid, scored[g] - valid, d_ranges);
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((scored[g] - valid + 255U) / 256U), dim3(256), 0, s, d_pool, valid, scored[g] - valid, d_ranges);
             valid = scored[g];
         }
     };

@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <new>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -1567,7 +1568,7 @@ __global__ void publish_qsa_selection_status(const std::uint32_t* local,
 }
 
 // Single-thread reference selection (diagnostic only; production runs the parallel body below).
-__device__ __forceinline__ void select_blocks_body(
+[[maybe_unused]] __device__ __forceinline__ void select_blocks_body(
     float* block_scores,
     std::uint32_t num_blocks,
     std::uint32_t select_blocks,
@@ -3940,37 +3941,7 @@ __global__ void norm_rope_rows_kernel(QsaRowsNormViews<Rows> views, std::uint32_
         epsilon, rotary_dim, theta, views.position[blockIdx.y], GraphPositionKernelArguments{});
 }
 
-// Appends every row's raw index key and K/V before any row attends.
-template <unsigned Rows> struct QsaRowsStoreViews {
-    const float* index_key[Rows];
-    const float* k[Rows];
-    const float* v[Rows];
-    std::uint64_t position[Rows];
-    std::uint16_t* journal; // optional [Rows][index_dim] raw keys for the tail commit
-};
-template <unsigned Rows>
-__global__ void store_rows_kernel(QsaRowsStoreViews<Rows> views, std::uint16_t* raw_state,
-    std::uint16_t* kv_state, std::uint32_t index_dim, std::uint32_t kv_width) {
-    const auto r = blockIdx.y;
-    const auto feature = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const auto position = views.position[r];
-    if (feature < index_dim) {
-        const auto bits = float_to_bf16(views.index_key[r][feature]);
-        raw_state[position * static_cast<std::uint64_t>(index_dim) + feature] = bits;
-        if constexpr (Rows <= 8U) {
-            if (views.journal) views.journal[static_cast<std::uint64_t>(r) * index_dim + feature] = bits;
-        } else {
-            // Prefill groups: the journal holds 8 row keys; the group's last 8-row tile writes
-            // them, as the last serial tile would (earlier tiles' keys are overwritten there).
-            if (views.journal && r >= Rows - 8U) views.journal[static_cast<std::uint64_t>(r - (Rows - 8U)) * index_dim + feature] = bits;
-        }
-    }
-    if (feature < kv_width) {
-        const auto row = position * static_cast<std::uint64_t>(kv_width) * 2ULL;
-        kv_state[row + feature] = float_to_bf16(views.k[r][feature]);
-        kv_state[row + kv_width + feature] = float_to_bf16(views.v[r][feature]);
-    }
-}
+#include "hip_qsa_prefill_stages.inc"
 
 // kv-int8-tok-v1 rows append: grid (kv_heads, 2, Rows), block (h, half, r) quantizes KV head
 // h of row r's K (half 0) or V (half 1) with the decode writer's statements.
@@ -4828,44 +4799,6 @@ void launch_draft_attention_tail(DraftTailVariant variant, const float* q_gate, 
 // and 32 are the in-lane pairs (j, j + 2) and then (0, 1), and 16..1 are the xor reduce-scatter
 // of attention_score_rows_group_kernel (each step adds the partials of lanes L and L ^ D). The
 // relu sum over the heads, in head order from 0, and the division are unchanged.
-template <SmallWeightKind Kind>
-__global__ void block_pool_kernel(const std::uint16_t* raw_keys, std::uint32_t first_block, std::uint32_t head_dim,
-    std::uint32_t compress_ratio, const void* key_norm, float epsilon, std::uint32_t rotary_dim, float theta, float* pooled_keys) {
-    const auto block = first_block + static_cast<std::uint32_t>(blockIdx.x);
-    const auto feature = static_cast<std::uint32_t>(threadIdx.x);
-    if (feature >= head_dim) return;
-    extern __shared__ float shared[];
-    auto* pooled = shared;
-    auto* scratch = shared + head_dim;
-    float mean = 0.0F;
-    const auto token_start = static_cast<std::uint64_t>(block) * compress_ratio;
-    for (std::uint32_t offset = 0; offset < compress_ratio; ++offset)
-        mean += bf16_to_float(raw_keys[(token_start + offset) * head_dim + feature]);
-    mean /= static_cast<float>(compress_ratio);
-    mean = round_bf16(mean);
-    pooled[feature] = mean;
-    scratch[feature] = mean * mean;
-    __syncthreads();
-    for (std::uint32_t stride = head_dim / 2U; stride > 0; stride >>= 1U) {
-        if (feature < stride) scratch[feature] += scratch[feature + stride];
-        __syncthreads();
-    }
-    const float inv_rms = rsqrtf(scratch[0] / static_cast<float>(head_dim) + epsilon);
-    pooled[feature] = round_bf16(mean * inv_rms * load_small_weight<Kind>(key_norm, feature));
-    __syncthreads();
-    float rotated = pooled[feature];
-    if (feature < rotary_dim) {
-        const auto half = rotary_dim / 2U;
-        const auto pair = feature % half;
-        const float exponent = 2.0F * static_cast<float>(pair) / static_cast<float>(rotary_dim);
-        const float angle = static_cast<float>(token_start) * powf(theta, -exponent);
-        const float cosine = cosf(angle);
-        const float sine = sinf(angle);
-        if (feature < half) rotated = pooled[feature] * cosine - pooled[feature + half] * sine;
-        else rotated = pooled[feature] * cosine + pooled[feature - half] * sine;
-    }
-    pooled_keys[static_cast<std::uint64_t>(block) * head_dim + feature] = round_bf16(rotated);
-}
 // One wave scores RowsPerWave consecutive rows against 32 consecutive blocks (lane i keeps
 // block base + i); index head_dim 128, 4 index heads.
 template <unsigned Rows, unsigned RowsPerWave>
@@ -5043,6 +4976,8 @@ QsaKnownRows<Rows> prepare_qsa_known_rows(std::span<const ExecutionDispatchConte
 // STRIX_QSA_INDEX_ROWS=1), bit 4 (with bits 0 and 1 and STRIX_QSA_ATTEND_BATCH=1) one selection launch per prefill call, bit 5 the FP16 KV
 // shadow attend (bench NO-GAIN, kept off), bit 6 (with STRIX_QSA_ATTEND_BATCH=1, the default 4-row tile, prefill mode 0: the
 // batched attend) the group-major order of the batched attend.
+// Bit 9 (0x200, default OFF, requires bits 0 and 1): exact per-64-row-group stage batching; see
+// hip_qsa_prefill_batch.inc for the all-or-nothing admission and descriptor lifetime rules.
 constexpr std::uint32_t qpf2k_maxima_stride = 65536U / qsa_flash::kGroup; // groups of max_position / 4 blocks
 // Per pooled block magnitude ranges (qsa_flash::key_range_kernel), one buffer like the pool's (grown with a sync).
 // STRIX_QPF2K_QSA bit 4 (with bit 1, prefill calls whose union / attend is batched): the groups' selections are deferred
@@ -5067,16 +5002,19 @@ struct Qpf2kSelectBatch {
 };
 Qpf2kSelectBatch& qpf2k_select_batch() { static Qpf2kSelectBatch b; return b; }
 void qpf2k_select_flush(hipStream_t stream);
-uint2* qpf2k_key_ranges(std::uint32_t capacity) {
+uint2* qpf2k_key_ranges(std::uint32_t capacity, bool allow_allocation_failure = false) {
     static uint2* ranges = nullptr;
     static std::uint32_t size = 0;
     if (capacity > size) {
         if (ranges) {
             check_hip(hipStreamSynchronize(hip_execution_stream()), "QSA prefill key-range resize sync");
             check_hip(hipFree(ranges), "QSA prefill key-range free");
+            ranges = nullptr; size = 0;
         }
         void* p = nullptr;
-        check_hip(hipMalloc(&p, std::size_t{capacity} * sizeof(uint2)), "QSA prefill key-range allocation");
+        const auto status = hipMalloc(&p, std::size_t{capacity} * sizeof(uint2));
+        if (allow_allocation_failure && status == hipErrorOutOfMemory) return nullptr;
+        check_hip(status, "QSA prefill key-range allocation");
         ranges = static_cast<uint2*>(p);
         size = capacity;
     }
@@ -5585,7 +5523,9 @@ struct QsaPrefillPool {
 template <unsigned Rows>
 void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexedAttentionLauncherConfig& config,
     unsigned parts = 7U, QsaPrefillPool* pool = nullptr, unsigned skip_inputs = 0U,
-    const q8_rows::DenseA8Slot* cohort_slot = nullptr, unsigned cohort_row = 0U, unsigned subparts = 127U) {
+    const q8_rows::DenseA8Slot* cohort_slot = nullptr, unsigned cohort_row = 0U, unsigned subparts = 127U,
+    const qsa_flash::ScoreGroup<Rows>* staged = nullptr) {
+    if (staged) subparts &= ~7U; // norms, append and scores already completed in stream order
     const auto& model = config.model;
     const auto& a = prepared.row[0];
     const auto& tensors = a.tensors;
@@ -5747,8 +5687,8 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         select.block_scores[r] = w.block_scores; select.selected[r] = w.selected_indices; select.visible[r] = s.visible;
     }
     // STRIX_QPF2K_QSA bit 1: the scorer below left the group maxima here; the selection then runs qsa_flash::select_kernel.
-    float* qpf2k_maxima = nullptr;
-    std::uint32_t qpf2k_maxima_row_stride = qpf2k_maxima_stride;
+    float* qpf2k_maxima = staged ? staged->maxima : nullptr;
+    std::uint32_t qpf2k_maxima_row_stride = staged ? staged->maxima_stride : qpf2k_maxima_stride;
     // Deferred (batched) selection only where nothing reads this group's selections before the call's flush: 64-row
     // groups of the fast prefill profile with BF16 KV, whose union / attend go to the call's attend batch.
     const bool qpf2k_defer = Rows == 64U && !cohort_slot && qpf2k_select_batch().active && config.qsa_fast_prefill &&
@@ -5769,7 +5709,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                 check_hip(hipGetLastError(), "QSA prefill block-pool launch");
                 // STRIX_QPF2K_QSA bit 0: the new blocks' magnitude ranges for the scorer's guard.
                 if constexpr (Rows >= 16U) if (!cohort_slot && (qpf2k_qsa_mask() & 1U)) {
-                    hipLaunchKernelGGL(qsa_flash::key_range_kernel, dim3((scored_blocks - pool->valid + 255U) / 256U), dim3(256), 0, stream,
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((scored_blocks - pool->valid + 255U) / 256U), dim3(256), 0, stream,
                         static_cast<const float*>(pool->keys), pool->valid, scored_blocks - pool->valid, qpf2k_key_ranges(pool->capacity));
                     check_hip(hipGetLastError(), "QSA prefill key-range launch");
                 }
@@ -6350,7 +6290,8 @@ unsigned enqueue_qsa_prefill_dense_inputs(const std::vector<QsaKnownRows<8U>>& t
 }
 template <unsigned W>
 void enqueue_qsa_prefill_projection(const std::vector<QsaKnownRows<8U>>& tiles, std::size_t first,
-    const HipIndexedAttentionLauncherConfig& config, unsigned part, QsaPrefillPool* pool = nullptr, unsigned skip_inputs = 0U) {
+    const HipIndexedAttentionLauncherConfig& config, unsigned part, QsaPrefillPool* pool = nullptr, unsigned skip_inputs = 0U,
+    const qsa_flash::ScoreGroup<W>* staged = nullptr) {
     auto combined = std::make_unique<QsaKnownRows<W>>();
     combined->prefetch = tiles[first].prefetch; combined->journal = tiles[first].journal;
     for (unsigned r = 0; r < W; ++r) {
@@ -6358,7 +6299,7 @@ void enqueue_qsa_prefill_projection(const std::vector<QsaKnownRows<8U>>& tiles, 
         combined->row[r] = tile.row[r % 8U]; combined->selection[r] = tile.selection[r % 8U];
         combined->position[r] = tile.position[r % 8U];
     }
-    enqueue_qsa_known_rows<W>(*combined, config, part, pool, skip_inputs);
+    enqueue_qsa_known_rows<W>(*combined, config, part, pool, skip_inputs, nullptr, 0U, 127U, staged);
 }
 // Rows r of [0, rows) at view(row 0) + r * stride, or false.
 template <class View> bool qsa_prefill_uniform(const std::vector<QsaKnownRows<8U>>& tiles, std::uint32_t rows, View&& view, std::uint64_t& stride) {
@@ -6508,6 +6449,8 @@ void qpf2k_select_flush(hipStream_t stream) {
     sb.traced.clear();
     sb.used = 0;
 }
+#include "hip_qsa_prefill_batch.inc"
+
 // Prefill attention: groups of up to 8 tiles (64 rows) in increasing order. A group stores the
 // raw index keys and K/V of all its rows before any of them selects or attends. A row's
 // selection is fixed by its own position (prepare_qsa_known_rows: visible prefix and
@@ -6553,7 +6496,7 @@ void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const 
         pool_storage.valid = 0;
         pool = &pool_storage;
     }
-    const auto projections = [&](unsigned part) {
+    const auto projections = [&](unsigned part, const Qpf2kStageBatch* stages = nullptr) {
         for (std::size_t t = 0; t < tiles.size();) {
             const auto left = tiles.size() - t;
             // STRIX_PREFILL_DENSE_A8_ROWS=64 keeps the dense A8 input projections at 64 rows per launch.
@@ -6575,7 +6518,11 @@ void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const 
                 if (const auto done = enqueue_qsa_prefill_tiled_output(tiles, config)) { t = done / 8U; continue; }
             if (part == 1U && dense_wide && left >= 32U && wide_inputs.template operator()<256U>()) continue;
             if (part == 1U && dense_wide && left >= 16U && wide_inputs.template operator()<128U>()) continue;
-            if (left >= 8U) { enqueue_qsa_prefill_projection<64U>(tiles, t, config, part, part == 2U ? pool : nullptr); t += 8U; }
+            if (left >= 8U) {
+                enqueue_qsa_prefill_projection<64U>(tiles, t, config, part, part == 2U ? pool : nullptr, 0U,
+                    stages ? stages->slot->scores + t / 8U : nullptr);
+                t += 8U;
+            }
             else if (left >= 4U) { enqueue_qsa_prefill_projection<32U>(tiles, t, config, part, part == 2U ? pool : nullptr); t += 4U; }
             else if (left >= 2U) { enqueue_qsa_prefill_projection<16U>(tiles, t, config, part, part == 2U ? pool : nullptr); t += 2U; }
             else { enqueue_qsa_known_rows<8U>(tiles[t], config, part); t += 1U; }
@@ -6607,7 +6554,11 @@ void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const 
         b.active = mode == 0U && qsa_attend_batch_enabled();
         auto& sb = qpf2k_select_batch();
         sb.active = b.active && (qpf2k_qsa_mask() & 16U) && (qpf2k_qsa_mask() & 3U) == 3U;
-        projections(2U);
+        Qpf2kStageBatch stages;
+        const bool stage_batch = mode == 0U && qpf2k_stage_batch_launch(tiles, config, pool, stages);
+        if (!stage_batch && (qpf2k_qsa_mask() & 0x200U) && qpf2k_trace_enabled())
+            std::fprintf(stderr, "qpf2k qsa stage_batch groups 0 pool 0 range 0 score 0 rope 0 norm 0 store 0 fallback 1\n");
+        projections(2U, stage_batch ? &stages : nullptr);
         qpf2k_select_flush(hip_execution_stream());
         sb.active = false;
         qsa_fast_batch_flush(hip_execution_stream());

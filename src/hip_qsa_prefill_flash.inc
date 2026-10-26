@@ -51,8 +51,20 @@ __device__ __forceinline__ unsigned wave_max_u(unsigned v) {
 }
 // Per pooled block (first .. first + count - 1): its magnitude range (lo, hi) for score_kernel's guard. Launched
 // after every block_pool_kernel launch over the same blocks.
-__global__ __launch_bounds__(256) void key_range_kernel(const float* pooled_keys, std::uint32_t first, std::uint32_t count, uint2* ranges) {
-    const auto i = static_cast<std::uint32_t>(blockIdx.x) * 256U + threadIdx.x;
+template <bool Batch = false>
+__global__ __launch_bounds__(256) void key_range_kernel(const float* pooled_keys, std::uint32_t first, std::uint32_t count, uint2* ranges,
+    const uint2* bounds = nullptr, std::uint32_t groups = 0U) {
+    auto i = static_cast<std::uint32_t>(blockIdx.x) * 256U + threadIdx.x;
+    if (i >= count) return;
+    if constexpr (Batch) {
+        const auto absolute = first + i;
+        const auto group = qsa_prefill_block_group(bounds, groups, absolute);
+        if (group == groups) return;
+        const auto range = bounds[group];
+        if (absolute < range.x) return;
+        i = absolute - range.x;
+        first = range.x; count = range.y;
+    }
     if (i >= count) return;
     const auto* key = reinterpret_cast<const float4*>(pooled_keys + static_cast<std::uint64_t>(first + i) * kDim);
     unsigned lo = 0xffffffffU, hi = 0U;
@@ -125,10 +137,26 @@ __device__ __forceinline__ bool fused_exact(int row_lo, int row_hi, int key_lo, 
 enum Stat : unsigned { kFused, kSeparate, kSelectCandidates, kSelectFewMaxima, kSelectCapacity, kSelectDense, kCandidateGroups, kCandidateMax, kStats };
 // QueryLds: the CTA stages its rows' queries in LDS (32 KB for 16 rows) and the waves read them as wave-uniform
 // LDS broadcasts instead of scalar loads (the same values, so the same arithmetic).
-template <unsigned Rows, unsigned RowsPerCta, unsigned W, bool Stats = false, bool QueryLds = false, bool Fence = true, unsigned RowUnroll = 1U>
-__global__ __launch_bounds__(W * 32U) void score_kernel(QsaRowsScoreViews<Rows> views, const float* pooled_keys,
+template <unsigned Rows> struct ScoreGroup {
+    QsaRowsScoreViews<Rows> views;
+    std::uint32_t blocks, maxima_stride;
+    float* maxima;
+};
+template <unsigned Rows, unsigned RowsPerCta, unsigned W, bool Stats = false, bool QueryLds = false, bool Fence = true, unsigned RowUnroll = 1U, bool Batch = false>
+__global__ __launch_bounds__(W * 32U) void score_kernel(QsaRowsScoreViews<Rows> single, const float* pooled_keys,
     std::uint32_t scored_blocks, std::uint32_t head_dim, float* maxima, std::uint32_t maxima_stride, const uint2* key_ranges,
-    std::uint32_t* stats = nullptr) {
+    std::uint32_t* stats = nullptr, const ScoreGroup<Rows>* groups = nullptr) {
+    const auto& views = [&]() -> const QsaRowsScoreViews<Rows>& {
+        if constexpr (Batch) return groups[blockIdx.z].views;
+        else return single;
+    }();
+    if constexpr (Batch) {
+        const auto& group = groups[blockIdx.z];
+        scored_blocks = group.blocks;
+        maxima = group.maxima; maxima_stride = group.maxima_stride;
+        // Uniform CTA exit, before the row-range barriers; later groups may have a larger grid.
+        if (blockIdx.x >= ((scored_blocks + 31U) / 32U + W - 1U) / W) return;
+    }
     static_assert(Rows % RowsPerCta == 0U);
     __shared__ int row_lo[RowsPerCta], row_hi[RowsPerCta];
     __shared__ __align__(16) float q_lds[QueryLds ? RowsPerCta : 1U][QueryLds ? kHeads * kDim : 1U];
@@ -376,8 +404,13 @@ __device__ __forceinline__ float wave_square_sum(const float (&input)[8], unsign
     for (unsigned d = 16U; d > 0U; d >>= 1U) x += __shfl_down(x, d, 32);
     return __shfl(x, 0, 32);
 }
-template <SmallWeightKind Kind, unsigned Rows>
-__global__ __launch_bounds__(256) void norm_rope_wave_kernel(qsa_index::NormGroupViews<Rows> views, float epsilon, std::uint32_t rotary_dim) {
+template <SmallWeightKind Kind, unsigned Rows, bool Batch = false>
+__global__ __launch_bounds__(256) void norm_rope_wave_kernel(qsa_index::NormGroupViews<Rows> single, float epsilon, std::uint32_t rotary_dim,
+    const qsa_index::NormGroupViews<Rows>* groups = nullptr) {
+    const auto& views = [&]() -> const qsa_index::NormGroupViews<Rows>& {
+        if constexpr (Batch) return groups[blockIdx.y];
+        else return single;
+    }();
     const unsigned lane = threadIdx.x % 32U;
     const unsigned heads_total = views.heads[0] + views.heads[1] + views.heads[2];
     const unsigned wave = blockIdx.x * 8U + threadIdx.x / 32U;
