@@ -1,4 +1,5 @@
 #pragma once
+#include <span>
 
 #include "strix/execution_binding.hpp"
 #include "strix/hip_runtime_launchers.hpp"
@@ -66,5 +67,9 @@ void launch_hip_mtp_embedding(const MtpNativeContext&,std::uint32_t token,void* 
 // Same row load/store as above with the token read on device (sync-free draft
 // chain); an out-of-vocabulary word reads row 0 and is rejected by its producer.
 void launch_hip_mtp_embedding_device(const MtpNativeContext&,const std::uint32_t* token,void* stream);
+// Multi-session draft batch: row t loads tokens[t] (a device token word, as launch_hip_mtp_embedding_device) or,
+// when tokens[t] is null, the host token values[t] (as launch_hip_mtp_embedding); at most 8 contexts.
+void launch_hip_mtp_embedding_rows(std::span<const MtpNativeContext> contexts,std::span<const std::uint32_t* const> tokens,
+    std::span<const std::uint32_t> values,void* stream);
 
 }  // namespace strix

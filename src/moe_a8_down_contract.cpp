@@ -15,8 +15,15 @@ float mul(float x,float y) {volatile float z=x*y;return z;}
 float add(float x,float y) {volatile float z=x+y;return z;}
 }
 std::string_view down_numerical_identity(std::uint32_t type) {
-    need(type==7 || type==8,"A8 down weights must be original Q5_1 or Q8_0");
-    return type==7?q51_a8_down_numerical_identity:q80_a8_down_numerical_identity;
+    need(type==7 || type==8 || ((type==42 || type==20) && q20_a8_enabled()),
+        "A8 down weights must be original Q5_1 or Q8_0 (or Q2_0 / IQ4_NL with STRIX_GSQ_Q20_A8=1)");
+    return type==7?q51_a8_down_numerical_identity:type==42?q20_a8_down_numerical_identity:
+        type==20?iq4nl_a8_down_numerical_identity:q80_a8_down_numerical_identity;
+}
+std::uint64_t down_row_bytes(std::uint32_t type,std::uint32_t intermediate) {
+    if(type==20) return static_cast<std::uint64_t>(intermediate/32U)*18U;
+    return type==42?static_cast<std::uint64_t>(intermediate/64U)*18U:
+        static_cast<std::uint64_t>(intermediate/32U)*(type==7?24U:34U);
 }
 void validate_down(const DownRequest& r,const DownBindings& b) {
     need(r.enabled && r.approved_numerical_identity==down_numerical_identity(r.weight_type),
@@ -29,7 +36,7 @@ void validate_down(const DownRequest& r,const DownBindings& b) {
     const std::uint64_t groups=static_cast<std::uint64_t>(s.top_k)*(s.intermediate/32U);
     const std::array<DeviceBytes,9> views{b.intermediates,b.weights,b.routes,b.codes,b.deltas,b.sums,b.rawdots,b.status,b.aggregate_status};
     const std::array<std::uint64_t,9> bytes{static_cast<std::uint64_t>(s.top_k)*2U*s.intermediate*4U,
-        static_cast<std::uint64_t>(s.experts)*s.hidden*(s.intermediate/32U)*(r.weight_type==7?24U:34U),
+        static_cast<std::uint64_t>(s.experts)*s.hidden*down_row_bytes(r.weight_type,s.intermediate),
         static_cast<std::uint64_t>(s.top_k)*4U,static_cast<std::uint64_t>(s.top_k)*s.intermediate,
         groups*4U,groups*4U,static_cast<std::uint64_t>(s.top_k)*s.hidden*4U,4,4};
     const std::array<unsigned,9> align{16,2,4,16,16,16,16,4,4};
@@ -74,8 +81,39 @@ float evaluate_down_row(std::span<const std::byte> w,const QuantizedRow& q,std::
     require_f32_environment();static_cast<void>(down_numerical_identity(type));
     need(!q.codes.empty() && q.codes.size()<=max_rows && q.codes.size()%128U==0 &&
         q.deltas.size()==q.codes.size()/32U && q.sums.size()==q.deltas.size(),"A8 down oracle image shape invalid");
+    need(w.size()==down_row_bytes(type,static_cast<std::uint32_t>(q.codes.size())),"A8 down packed row size invalid");
+    if(type==20) {
+        std::array<float,4> lanes{};
+        for(std::size_t g=0;g<q.deltas.size();++g) {
+            const auto group=gsq_iq_group(20,w,static_cast<std::uint32_t>(g));
+            std::int64_t sum=0,integer=0;
+            for(unsigned j=0;j<32;++j){const auto c=q.codes[g*32U+j];need(c!=-128,"A8 down code -128 invalid");sum+=c;
+                integer+=static_cast<std::int64_t>(c)*group.v[j];}
+            need(sum==q.sums[g],"A8 down integer sum mismatch");
+            const float contribution=mul(q.deltas[g],mul(group.s0,static_cast<float>(integer)));
+            lanes[g%4U]=add(lanes[g%4U],contribution);
+        }
+        return add(add(lanes[0],lanes[1]),add(lanes[2],lanes[3]));
+    }
+    if(type==42) {
+        std::array<float,4> lanes{};
+        for(std::size_t g=0;g<q.deltas.size();++g) {
+            need(q.deltas[g]>0 && std::isfinite(q.deltas[g]),"A8 down oracle delta invalid");
+            const auto b=w.subspan((g/2U)*18U,18U);
+            std::int64_t sum=0,integer=0;
+            for(unsigned j=0;j<32;++j) {
+                const auto c=q.codes[g*32U+j];need(c!=-128,"A8 down code -128 invalid");sum+=c;
+                const auto e=(g%2U)*32U+j;
+                integer+=static_cast<std::int64_t>(c)*static_cast<int>((byte(b[2U+e/4U])>>(2U*(e%4U)))&3U);
+            }
+            need(sum==q.sums[g] && std::abs(integer-sum)<=16256,"A8 down integer sum/bound mismatch");
+            const float d=half_bits_to_float(static_cast<std::uint16_t>(u16(b,0)));
+            const float contribution=mul(q.deltas[g],mul(d,static_cast<float>(integer-sum)));
+            lanes[g%4U]=add(lanes[g%4U],contribution);
+        }
+        return add(add(lanes[0],lanes[1]),add(lanes[2],lanes[3]));
+    }
     const auto block_bytes=type==7?24U:34U;
-    need(w.size()==q.deltas.size()*block_bytes,"A8 down packed row size invalid");
     std::array<float,4> lanes{};
     for(std::size_t g=0;g<q.deltas.size();++g) {
         need(q.deltas[g]>0 && std::isfinite(q.deltas[g]),"A8 down oracle delta invalid");

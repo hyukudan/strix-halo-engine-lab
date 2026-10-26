@@ -86,5 +86,9 @@ void moe_route_known_prefill_rows_launch(std::span<const ExecutionDispatchContex
 struct MtpNativeContext;
 void preflight_hip_mtp_route(const MtpNativeContext&);
 void launch_hip_mtp_route(const MtpNativeContext&,void* stream);
+// Multi-session draft batch of launch_hip_mtp_route (staged production branch): each context's routes and
+// weights equal its own launch, bit for bit; at most 8 contexts, on `stream` (ordered by the caller).
+[[nodiscard]] bool hip_mtp_route_rows_supported();
+void launch_hip_mtp_route_rows(std::span<const MtpNativeContext> contexts,void* stream);
 
 }  // namespace strix

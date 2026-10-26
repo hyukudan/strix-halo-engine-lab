@@ -1,19 +1,23 @@
+#include "strix/hip_hc_wide_rows_tests.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_runtime_launchers.hpp"
 
 #include "strix/dispatch_resources.hpp"
+#include "strix/rows_launch_registry.hpp"
 
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <array>
+#include <span>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <span>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -222,6 +226,18 @@ __global__ void hyper_expand_kernel(
             &input[source]));
 }
 
+// Rows of a tiled prefill block in one launch (STRIX_PREFILL_PIPE bit 16): blockIdx.y selects the row, whose input
+// and output start one pitch after the previous row's; each element is hyper_expand_kernel's for one row.
+template <typename Storage>
+__global__ void hyper_expand_pitched_rows_kernel(const Storage* input, std::uint64_t input_pitch, Storage* output,
+    std::uint64_t output_pitch, std::uint32_t hidden_size, std::uint32_t hc_count) {
+    const auto within = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (within >= static_cast<std::uint64_t>(hidden_size) * hc_count) return;
+    const auto row = static_cast<std::uint64_t>(blockIdx.y);
+    store_activation(&output[row * output_pitch + within],
+        load_activation(&input[row * input_pitch + within % static_cast<std::uint64_t>(hidden_size)]));
+}
+
 template <typename Storage>
 __global__ void inject_kernel(
     const Storage* hyper_input,
@@ -270,6 +286,43 @@ __global__ void inject_kernel(
         stream;
 
     inject_element(&hyper_input[index], &hidden[hidden_index], injection_weights[weight_index], &output[index]);
+}
+
+// Pitched rows form of inject_kernel (STRIX_PREFILL_PIPE bit 16): blockIdx.y selects the row; each buffer of a row
+// starts one pitch (in elements of that buffer) after the previous row's.
+template <typename Storage>
+__global__ void inject_pitched_rows_kernel(const Storage* hyper_input, std::uint64_t hyper_pitch, const Storage* hidden,
+    std::uint64_t hidden_pitch, const float* injection_weights, std::uint64_t weight_pitch, Storage* output,
+    std::uint64_t output_pitch, std::uint32_t hidden_size, std::uint32_t hc_count) {
+    const auto within = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (within >= static_cast<std::uint64_t>(hidden_size) * hc_count) return;
+    const auto row = static_cast<std::uint64_t>(blockIdx.y);
+    const auto stream = within / static_cast<std::uint64_t>(hidden_size);
+    const auto feature = within % static_cast<std::uint64_t>(hidden_size);
+    inject_element(&hyper_input[row * hyper_pitch + within], &hidden[row * hidden_pitch + feature],
+        injection_weights[row * weight_pitch + stream], &output[row * output_pitch + within]);
+}
+
+// Multi-session draft batch: row blockIdx.y is one session's one-row inject (same element function).
+struct MtpInjectRows {
+    const std::uint16_t* hyper[8]; const std::uint16_t* hidden[8]; const float* weights[8]; std::uint16_t* output[8];
+};
+__global__ void mtp_inject_rows_kernel(MtpInjectRows rows, std::uint32_t hidden_size, std::uint32_t hc_count) {
+    const auto r = blockIdx.y;
+    const auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto expanded_width = static_cast<std::uint64_t>(hidden_size) * hc_count;
+    if (index >= expanded_width) return;
+    const auto stream = index / static_cast<std::uint64_t>(hidden_size);
+    const auto feature = index % static_cast<std::uint64_t>(hidden_size);
+    inject_element(&rows.hyper[r][index], &rows.hidden[r][feature], rows.weights[r][stream], &rows.output[r][index]);
+}
+// Multi-session draft batch: the publish_next_state copy (wide_next -> wide_current) of every row, 16 bytes per lane.
+struct MtpCopyRows { const uint4* source[8]; uint4* destination[8]; };
+__global__ void mtp_copy_rows_kernel(MtpCopyRows rows, std::uint64_t vectors) {
+    const auto r = blockIdx.y;
+    for (std::uint64_t i = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < vectors;
+         i += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
+        rows.destination[r][i] = rows.source[r][i];
 }
 
 template <typename Storage>
@@ -452,6 +505,49 @@ void launch_hyper_expand(
         "unreachable activation storage");
 }
 
+// Every row is admitted as launch_hyper_expand admits it; false (nothing enqueued) unless every row is one row
+// and the inputs and outputs each sit at one pitch.
+bool launch_hyper_expand_rows(std::span<const ExecutionDispatchContext> rows, void* user_data) {
+    if (rows.size() < 2U || rows.size() > 65535U) return false;
+    if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture) return false;
+    const auto first = prepare_hyper_expand(rows[0], user_data);
+    const auto second = prepare_hyper_expand(rows[1], user_data);
+    const auto element = activation_bytes(first.config);
+    const auto expanded = static_cast<std::uint64_t>(first.config.hidden_size) * first.config.hc_count;
+    if (rows[0].logical_rows != 1U || second.input.address <= first.input.address || second.output.address <= first.output.address)
+        return false;
+    const auto input_pitch = static_cast<std::uint64_t>(second.input.address - first.input.address);
+    const auto output_pitch = static_cast<std::uint64_t>(second.output.address - first.output.address);
+    if (input_pitch % element || output_pitch % element || input_pitch < first.config.hidden_size * element ||
+        output_pitch < expanded * element)
+        return false;
+    for (std::size_t r = 1; r < rows.size(); ++r) {
+        const auto row = r == 1U ? second : prepare_hyper_expand(rows[r], user_data);
+        if (rows[r].logical_rows != 1U || &row.config != &first.config ||
+            row.input.address != first.input.address + r * input_pitch || row.output.address != first.output.address + r * output_pitch)
+            return false;
+    }
+    const auto blocks = prepare_1d_blocks(expanded);
+    const auto count = static_cast<std::uint32_t>(rows.size());
+    switch (first.config.activation) {
+    case HipActivationStorage::bf16:
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(hyper_expand_pitched_rows_kernel<std::uint16_t>), dim3(blocks, count), dim3(256U), 0,
+            hip_execution_stream(), reinterpret_cast<const std::uint16_t*>(first.input.address), input_pitch / element,
+            reinterpret_cast<std::uint16_t*>(first.output.address), output_pitch / element, first.config.hidden_size, first.config.hc_count);
+        break;
+    case HipActivationStorage::fp32:
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(hyper_expand_pitched_rows_kernel<float>), dim3(blocks, count), dim3(256U), 0,
+            hip_execution_stream(), reinterpret_cast<const float*>(first.input.address), input_pitch / element,
+            reinterpret_cast<float*>(first.output.address), output_pitch / element, first.config.hidden_size, first.config.hc_count);
+        break;
+    default:
+        throw std::logic_error("unreachable activation storage");
+    }
+    check_hip(hipGetLastError(), "HIP hyper-expand rows kernel launch");
+    return true;
+}
+[[maybe_unused]] const bool hyper_expand_rows_registered = register_rows_launch(&launch_hyper_expand, &launch_hyper_expand_rows);
+
 template <typename Storage>
 void launch_inject_typed(
     const ExecutionDispatchContext& context,
@@ -610,6 +706,58 @@ void launch_inject(
     throw std::logic_error(
         "unreachable activation storage");
 }
+// Every row is admitted as launch_inject admits it; false (nothing enqueued) unless every row is one row and each
+// of its four buffers sits at one pitch.
+bool launch_inject_rows(std::span<const ExecutionDispatchContext> rows, void* user_data) {
+    if (rows.size() < 2U || rows.size() > 65535U) return false;
+    if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture) return false;
+    const auto first = prepare_inject(rows[0], user_data);
+    const auto second = prepare_inject(rows[1], user_data);
+    const auto element = activation_bytes(first.config);
+    const auto expanded = static_cast<std::uint64_t>(first.config.hidden_size) * first.config.hc_count;
+    const auto pitch = [](const ExecutionBufferAddress& a, const ExecutionBufferAddress& b, std::uint64_t unit,
+                           std::uint64_t minimum) -> std::uint64_t {
+        if (b.address <= a.address) return 0U;
+        const auto bytes = static_cast<std::uint64_t>(b.address - a.address);
+        return bytes % unit || bytes < minimum * unit ? 0U : bytes / unit;
+    };
+    const auto hyper = pitch(first.hyper, second.hyper, element, expanded);
+    const auto hidden = pitch(first.hidden, second.hidden, element, first.config.hidden_size);
+    const auto weights = pitch(first.weights, second.weights, sizeof(float), first.config.hc_count);
+    const auto output = pitch(first.output, second.output, element, expanded);
+    if (rows[0].logical_rows != 1U || !hyper || !hidden || !weights || !output) return false;
+    for (std::size_t r = 1; r < rows.size(); ++r) {
+        const auto row = r == 1U ? second : prepare_inject(rows[r], user_data);
+        if (rows[r].logical_rows != 1U || &row.config != &first.config ||
+            row.hyper.address != first.hyper.address + r * hyper * element ||
+            row.hidden.address != first.hidden.address + r * hidden * element ||
+            row.weights.address != first.weights.address + r * weights * sizeof(float) ||
+            row.output.address != first.output.address + r * output * element)
+            return false;
+    }
+    const auto blocks = prepare_1d_blocks(expanded);
+    const auto count = static_cast<std::uint32_t>(rows.size());
+    const auto* weight_base = reinterpret_cast<const float*>(first.weights.address);
+    switch (first.config.activation) {
+    case HipActivationStorage::bf16:
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(inject_pitched_rows_kernel<std::uint16_t>), dim3(blocks, count), dim3(256U), 0,
+            hip_execution_stream(), reinterpret_cast<const std::uint16_t*>(first.hyper.address), hyper,
+            reinterpret_cast<const std::uint16_t*>(first.hidden.address), hidden, weight_base, weights,
+            reinterpret_cast<std::uint16_t*>(first.output.address), output, first.config.hidden_size, first.config.hc_count);
+        break;
+    case HipActivationStorage::fp32:
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(inject_pitched_rows_kernel<float>), dim3(blocks, count), dim3(256U), 0,
+            hip_execution_stream(), reinterpret_cast<const float*>(first.hyper.address), hyper,
+            reinterpret_cast<const float*>(first.hidden.address), hidden, weight_base, weights,
+            reinterpret_cast<float*>(first.output.address), output, first.config.hidden_size, first.config.hc_count);
+        break;
+    default:
+        throw std::logic_error("unreachable activation storage");
+    }
+    check_hip(hipGetLastError(), "HIP inject rows kernel launch");
+    return true;
+}
+[[maybe_unused]] const bool inject_rows_registered = register_rows_launch(&launch_inject, &launch_inject_rows);
 
 template <typename Storage>
 void launch_moe_combine_typed(
@@ -1131,6 +1279,44 @@ void launch_hip_mtp_inject(const MtpNativeContext& c,MtpInjectRole role,void* st
         static_cast<std::uint32_t>(c.model->hidden_size),static_cast<std::uint32_t>(c.model->hc_count),1U);
     check_hip(hipGetLastError(),"MTP native injection launch");
 }
+void launch_hip_mtp_inject_rows(std::span<const MtpNativeContext> contexts,MtpInjectRole role,void* stream) {
+    if(contexts.empty() || contexts.size()>8U || !stream) throw std::invalid_argument("MTP injection batch size or stream is invalid");
+    const auto attn=role==MtpInjectRole::attention;
+    MtpInjectRows rows{};
+    const auto h=static_cast<std::uint32_t>(contexts.front().model->hidden_size);
+    const auto hc=static_cast<std::uint32_t>(contexts.front().model->hc_count);
+    for(std::size_t t=0;t<contexts.size();++t) {
+        const auto& c=contexts[t];
+        preflight_hip_mtp_inject(c,role);
+        if(c.model->hidden_size!=h || c.model->hc_count!=hc) throw std::invalid_argument("MTP injection batch geometry differs");
+        rows.hyper[t]=reinterpret_cast<const std::uint16_t*>(c.resources->view(attn?HipMtpBuffer::fused_wide:HipMtpBuffer::wide_work).address);
+        rows.hidden[t]=reinterpret_cast<const std::uint16_t*>(c.resources->view(attn?HipMtpBuffer::hidden1:HipMtpBuffer::hidden0).address);
+        rows.weights[t]=reinterpret_cast<const float*>(c.resources->view(HipMtpBuffer::injection).address);
+        rows.output[t]=reinterpret_cast<std::uint16_t*>(c.resources->view(attn?HipMtpBuffer::wide_work:HipMtpBuffer::wide_next).address);
+    }
+    check_hip(hipGetLastError(),"MTP injection batch pending HIP error");
+    const auto wide=mtp_native::product(h,hc);
+    hipLaunchKernelGGL(mtp_inject_rows_kernel,dim3(prepare_1d_blocks(wide),static_cast<unsigned>(contexts.size())),dim3(256),0,
+        reinterpret_cast<hipStream_t>(stream),rows,h,hc);
+    check_hip(hipGetLastError(),"MTP injection batch launch");
+}
+void launch_hip_mtp_publish_next_rows(std::span<const MtpNativeContext> contexts,void* stream) {
+    if(contexts.empty() || contexts.size()>8U || !stream) throw std::invalid_argument("MTP state publish batch size or stream is invalid");
+    MtpCopyRows rows{};std::uint64_t bytes=0;
+    for(std::size_t t=0;t<contexts.size();++t) {
+        const auto source=contexts[t].resources->view(HipMtpBuffer::wide_next);
+        const auto destination=contexts[t].resources->view(HipMtpBuffer::wide_current);
+        if(source.bytes!=destination.bytes || !source.bytes || source.bytes%16U || source.address%16U || destination.address%16U ||
+           (t && source.bytes!=bytes))
+            throw std::invalid_argument("MTP state publish batch views are invalid");
+        bytes=source.bytes;
+        rows.source[t]=reinterpret_cast<const uint4*>(source.address);rows.destination[t]=reinterpret_cast<uint4*>(destination.address);
+    }
+    const auto vectors=bytes/16U;
+    hipLaunchKernelGGL(mtp_copy_rows_kernel,dim3(static_cast<unsigned>(std::min<std::uint64_t>((vectors+255U)/256U,64U)),
+        static_cast<unsigned>(contexts.size())),dim3(256),0,reinterpret_cast<hipStream_t>(stream),rows,vectors);
+    check_hip(hipGetLastError(),"MTP state publish batch launch");
+}
 
 }  // namespace strix
 
@@ -1311,6 +1497,69 @@ void inject_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> 
     else hipLaunchKernelGGL(HIP_KERNEL_NAME(inject_rows_kernel<float, ElementwiseTileRowsArgs>), grid, dim3(256U), 0,
             elementwise_rows_stream(), args, config.hidden_size, config.hc_count);
     check_hip(hipGetLastError(), "known prefill inject rows launch");
+}
+namespace {
+bool uniform_prefill_views(const ElementwiseTileRowsArgs& args, std::uint32_t tiles, bool weights, ElementwisePrefillViews& views) {
+    const auto at = [](const auto* p) { return reinterpret_cast<std::uintptr_t>(p); };
+    const auto uniform = [&](const auto* const* v, std::uint64_t tile, std::uint64_t& stride) {
+        if (tile % 8U) return false;
+        stride = tile / 8U;
+        for (std::uint32_t r = 0; r < 8U; ++r)
+            if (!v[r] || at(v[r]) != at(v[0]) + r * stride) return false;
+        return true;
+    };
+    ElementwisePrefillViews out;
+    if (!uniform(args.first, args.tile_first, out.first_stride) || !uniform(args.second, args.tile_second, out.second_stride) ||
+        !uniform(args.output, args.tile_output, out.output_stride) ||
+        (weights && !uniform(args.weights, args.tile_weights, out.weights_stride)))
+        return false;
+    out.first = args.first[0]; out.second = args.second[0]; out.output = args.output[0];
+    out.weights = weights ? args.weights[0] : nullptr;
+    out.count = tiles * 8U;
+    views = out;
+    return true;
+}
+} // namespace
+void testing::enqueue_elementwise_prefill_rows_test(bool combine, const void* first, std::uint64_t first_stride, const void* second,
+    std::uint64_t second_stride, const float* weights, std::uint64_t weights_stride, void* output, std::uint64_t output_stride,
+    std::uint32_t rows, std::uint32_t hidden_size, std::uint32_t hc_count, hipStream_t stream) {
+    if (!rows || rows % 8U || rows / 8U > 65535U) throw std::invalid_argument("elementwise prefill test rows");
+    ElementwiseTileRowsArgs args{};
+    const auto at = [](const void* p, std::uint64_t stride, std::uint32_t r) {
+        return reinterpret_cast<std::uintptr_t>(p) + static_cast<std::uint64_t>(r) * stride;
+    };
+    for (std::uint32_t r = 0; r < 8U; ++r) {
+        args.first[r] = reinterpret_cast<const void*>(at(first, first_stride, r));
+        args.second[r] = reinterpret_cast<const void*>(at(second, second_stride, r));
+        args.weights[r] = combine ? nullptr : reinterpret_cast<const float*>(at(weights, weights_stride, r));
+        args.output[r] = reinterpret_cast<void*>(at(output, output_stride, r));
+    }
+    args.tile_first = 8U * first_stride; args.tile_second = 8U * second_stride;
+    args.tile_weights = combine ? 0U : 8U * weights_stride; args.tile_output = 8U * output_stride;
+    const auto tiles = rows / 8U;
+    if (combine)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(combine_rows_kernel<std::uint16_t, ElementwiseTileRowsArgs>), dim3(prepare_1d_blocks(hidden_size), 8U, tiles),
+            dim3(256U), 0, stream, args, hidden_size);
+    else
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(inject_rows_kernel<std::uint16_t, ElementwiseTileRowsArgs>),
+            dim3(prepare_1d_blocks(checked_mul(hidden_size, hc_count)), 8U, tiles), dim3(256U), 0, stream, args, hidden_size, hc_count);
+    check_hip(hipGetLastError(), "elementwise prefill rows test launch");
+}
+bool inject_known_prefill_rows_views(std::span<const ExecutionDispatchContext> rows, const HipElementwiseLauncherConfig& config,
+    ElementwisePrefillViews& views) {
+    std::uint32_t tiles = 0;
+    const auto hidden = checked_mul(config.hidden_size, activation_bytes(config));
+    const auto args = prepare_elementwise_prefill(rows, [&](auto tile) { return prepare_inject_rows(tile, config); },
+        checked_mul(hidden, config.hc_count), hidden, config.hc_count * 4ULL, checked_mul(hidden, config.hc_count), tiles);
+    return uniform_prefill_views(args, tiles, true, views);
+}
+bool moe_combine_known_prefill_rows_views(std::span<const ExecutionDispatchContext> rows, const HipElementwiseLauncherConfig& config,
+    ElementwisePrefillViews& views) {
+    std::uint32_t tiles = 0;
+    const auto hidden = checked_mul(config.hidden_size, activation_bytes(config));
+    const auto args = prepare_elementwise_prefill(rows, [&](auto tile) { return prepare_combine_rows(tile, config); },
+        hidden, hidden, 0U, hidden, tiles);
+    return uniform_prefill_views(args, tiles, false, views);
 }
 void moe_combine_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipElementwiseLauncherConfig& config) {

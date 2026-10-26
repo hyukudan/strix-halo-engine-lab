@@ -2,12 +2,15 @@
 #include "strix/hip_dense_trellis.hpp"
 
 #include "hip_mtp_model_qualification.hpp"
+#include "hip_mtp_wide_cost.hpp"
+#include "hip_mtp_wide_gate.hpp"
 #include "strix/dispatch_resources.hpp"
 #include "strix/model_content_hash.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -115,6 +118,8 @@ inline void run(decode_cli::MtpDecodeQualificationContext& c, const std::filesys
     const std::array<std::byte, 3> hash_check{std::byte{'a'}, std::byte{'b'}, std::byte{'c'}};
     require(digest(hash_check) == sha256_bytes(hash_check), "prefix gate SHA-256 providers differ");
     State state(c);
+    Hashes initial_physical;
+    const auto initial_state = state.hashes(base.next_position, &initial_physical);
     const auto reset = [&] {
         // Every prior case is materialized before reset. Discard the owners'
         // non-authoritative caches before replacing session storage, including
@@ -150,11 +155,14 @@ inline void run(decode_cli::MtpDecodeQualificationContext& c, const std::filesys
         << ",\"target_content\":\"" << model_content_identity_hex(c.initial.target_content_identity()) << '"'
         << ",\"serial_execution_identity\":" << compiled.execution_identity << ",\"serial_kernel_plan_identity\":" << compiled.kernel_plan_identity
         << ",\"state_scope\":\"all-seven-components-kv-and-index-only-through-committed-frontier\""
-        << ",\"physical_state_scope\":\"full-seven-components-including-discarded-cache-tails-cross-arm-only\",\"cases\":[";
+        << ",\"physical_state_scope\":\"full-seven-components-including-discarded-cache-tails-cross-arm-only\",";
 #if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
     if (hip_dense_trellis_active())
         require(hip_dense_trellis_used_layers() == ((1ULL << 48U) - 1U), "prefix gate did not consume every selected dense tensor");
 #endif
+    out << "\"initial_committed_state\":"; write_hashes(out, initial_state);
+    out << ",\"initial_physical_state\":"; write_hashes(out, initial_physical);
+    out << ",\"cases\":[";
     unsigned cases = 0;
     const auto exercise = [&](unsigned rows, unsigned keep, unsigned offset, const HipMtpTargetHiddenTicket& initial) {
         require(rows == 1U || rows == 2U || rows == 4U || rows == 8U, "prefix gate unsupported rows");
@@ -255,6 +263,110 @@ inline void run(decode_cli::MtpDecodeQualificationContext& c, const std::filesys
     out << "],\"case_count\":" << cases << ",\"passed\":true,\"full_logits_bits_equal\":true,\"all_seven_committed_state_components_equal\":true}\n";
     out.close();
     std::filesystem::rename(destination / "result.pending.json", destination / "result.json");
+    // Optional wide copy verify gate (see hip_mtp_wide_gate.hpp): the decoder's wide cycle against its own serial
+    // oracle from the restored frontier. It attaches the verifier to the greedy runtime, so it runs without the
+    // copy cycle gate below (a separate process). The ordinary decoder never reads this switch.
+    if (const char* wide_gate_mode = std::getenv("STRIX_MTP_WIDE_GATE"); wide_gate_mode && std::string_view(wide_gate_mode) == "1") {
+        require(!std::getenv("STRIX_MTP_COPY_GATE"), "the wide gate and the copy cycle gate run in separate processes");
+        wide_gate::run(c, destination, [&](std::uint64_t frontier) { return state.hashes(frontier); }, reset);
+    }
+    // Optional real-drafter qualification, separate from the fixed-schedule receipt above.
+    // The ordinary decoder never reads this diagnostic switch. The serial oracle is
+    // already captured at every frontier, so changing proposal/cycle lengths cannot
+    // hide a token, committed-state or full-vocabulary logit difference.
+    if (const char* mode = std::getenv("STRIX_MTP_COPY_GATE")) {
+        const std::string_view selected(mode);
+        require(selected == "ctx" || selected == "copy", "copy cycle gate is ctx or copy");
+        reset();
+        c.window->begin_session();
+        // The qualification route leaves the greedy runtime without the verifier; real cycles need it.
+        c.greedy.use_window_verifier(c.window);
+        MtpContextDraftConfig config;
+        config.copy_edit = selected == "copy";
+        c.greedy.enable_context_draft(c.options.tokens, config);
+        std::vector<Bytes> observed(8U, Bytes(logit_bytes.size()));
+        unsigned observed_rows = 0;
+        for (const auto& owner : owners) {
+            const auto rows = owner->logical_rows();
+            owner->set_window_step_observer([&, rows](std::size_t,
+                const std::function<ExecutionDispatchContext(std::uint32_t)>& row) {
+                if (row(0).op != SerialOp::lm_head) return;
+                const auto* scope = current_hip_launch_context();
+                require(scope && scope->stream, "copy cycle gate needs actual window stream");
+                for (std::uint32_t r = 0; r < rows; ++r) {
+                    const auto view = resolve_dispatch_write(row(r), 0);
+                    require(view.bytes == logit_bytes.size(), "copy cycle logit extent differs");
+                    check(hipMemcpyAsync(observed[r].data(), reinterpret_cast<const void*>(view.address),
+                        observed[r].size(), hipMemcpyDeviceToHost, scope->stream), "copy cycle logits");
+                }
+                observed_rows = rows;
+            });
+        }
+        struct ClearCopyObservers {
+            const std::vector<std::shared_ptr<HipKnownPrefixWindow>>& owners;
+            ~ClearCopyObservers() { for (const auto& owner : owners) owner->set_window_step_observer({}); }
+        } clear_copy_observers{owners};
+        std::ofstream copy_out(destination / "copy-cycle.pending.json", std::ios::binary);
+        copy_out.exceptions(std::ios::failbit | std::ios::badbit);
+        copy_out << "{\"schema\":\"mtp-copy-cycle-gate-v1\",\"mode\":\"" << selected
+            << "\",\"performance_qualified\":false,\"cycles\":[";
+        auto frontier = c.initial;
+        unsigned copied = 0, cycle_count = 0, compared_logits = 0;
+        std::uint64_t forward_rows = 0;
+        while (copied < reference_rows) {
+            observed_rows = 0;
+            const auto before_native = c.runtime.execution_stats();
+            const auto before_copy = c.greedy.context_stats()->copy_first_cycles;
+            const auto actual = c.greedy.cycle(frontier, 7U, reference_rows - copied, {});
+            const auto after_native = c.runtime.execution_stats();
+            require(after_native.full_forward_rows >= before_native.full_forward_rows, "copy cycle forward counter regressed");
+            forward_rows += after_native.full_forward_rows - before_native.full_forward_rows;
+            if (c.greedy.context_stats()->copy_first_cycles > before_copy)
+                require(after_native.full_forward_rows == before_native.full_forward_rows, "copy-first executed predictor forwards");
+            const auto count = static_cast<unsigned>(actual.emitted_tokens.size());
+            require(count && count <= reference_rows - copied, "copy cycle exceeds serial oracle");
+            for (unsigned r = 0; r < count; ++r)
+                require(actual.emitted_tokens[r] == tokens[copied + r + 1U], "copy cycle token differs from serial");
+            for (const auto& owner : owners) owner->flush_deferred();
+            check(hipDeviceSynchronize(), "copy cycle materialized completion");
+            if (actual.attempted_target_window && !actual.target_checkpoint_restored) {
+                require(observed_rows >= count, "copy cycle omitted physical window logits");
+                for (unsigned r = 0; r < count; ++r) {
+                    require(digest(observed[r]) == logits[copied + r], "copy cycle full logits differ from serial");
+                    ++compared_logits;
+                }
+            } else {
+                // Serial fallback may compare several candidates. Its scratch retains
+                // the final row; the fixed schedule gate checks every serial frontier.
+                check(hipMemcpy(logit_bytes.data(), reinterpret_cast<const void*>(serial_logits.address),
+                    logit_bytes.size(), hipMemcpyDeviceToHost), "copy serial final logits");
+                require(digest(logit_bytes) == logits[copied + count - 1U], "copy serial final logits differ");
+                ++compared_logits;
+            }
+            const auto hashes = state.hashes(c.session.next_position);
+            require(hashes == states[copied + count - 1U], "copy cycle committed state differs from serial");
+            copy_out << (cycle_count++ ? "," : "") << "{\"offset\":" << copied << ",\"emitted\":" << count
+                << ",\"rows\":" << actual.target_window_rows << ",\"accepted\":" << actual.accepted_candidates
+                << ",\"committed_state\":";
+            write_hashes(copy_out, hashes);
+            copy_out << '}';
+            copied += count;
+            frontier = actual.final_target;
+        }
+        const auto* ng = c.greedy.context_stats();
+        require(ng && ng->accepted_rows <= ng->extension_rows && ng->extension_rows <= ng->selected_rows,
+            "copy cycle delivery counters differ");
+        copy_out << "],\"tokens_checked\":" << copied << ",\"full_logit_rows_checked\":" << compared_logits
+            << ",\"rows_selected\":" << ng->selected_rows << ",\"rows_delivered\":" << ng->extension_rows
+            << ",\"rows_accepted\":" << ng->accepted_rows << ",\"copy_first_cycles\":" << ng->copy_first_cycles
+            << ",\"predictor_forward_rows\":" << forward_rows << ",\"passed\":true}\n";
+        copy_out.close();
+        std::filesystem::rename(destination / "copy-cycle.pending.json", destination / "copy-cycle-result.json");
+    }
+    // Optional S0 cost diagnostic of wide verify windows (see hip_mtp_wide_cost.hpp). The ordinary decoder never
+    // reads this switch; it times from the restored frontier on the oracle above and restores the session.
+    if (const char* wide = std::getenv("STRIX_MTP_WIDE_COST"); wide && std::string_view(wide) == "1")
+        wide_cost::run(c, destination, owners, tokens, logits, reset);
     std::cout << "{\"mode\":\"native-mtp-prefix-gate\",\"cases\":" << cases << ",\"passed\":true,\"performance_qualified\":false}\n";
 }
 } // namespace strix::tests::prefix_gate

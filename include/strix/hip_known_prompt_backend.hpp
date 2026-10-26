@@ -71,6 +71,11 @@ public:
     [[nodiscard]] std::vector<float> execute_rows(
         std::span<const std::uint32_t> tokens, std::uint64_t position) override;
     void execute_state_rows(std::span<const std::uint32_t> tokens,std::uint64_t position) override;
+    void execute_state_rows_deferred(std::span<const std::uint32_t> tokens,std::uint64_t position) override;
+    void finish_deferred() override;
+    // STRIX_QPF2K_SCHED bit 4: a block of the first tokens.size() rows (16..T, a multiple of 8) of this tiled backend.
+    [[nodiscard]] std::vector<float> execute_rows_partial(std::span<const std::uint32_t> tokens, std::uint64_t position) override;
+    void execute_state_rows_partial(std::span<const std::uint32_t> tokens, std::uint64_t position, bool defer) override;
     // A failed output copy/validation does not publish new telemetry, even
     // though its session may already have consumed the configured native rows.
     [[nodiscard]] HipKnownPromptBackendStats stats() const noexcept;

@@ -12,6 +12,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strix::serve {
@@ -35,6 +36,15 @@ struct GenerationJob {
     // Request field "ngram_draft": true/false forces the context n-gram draft extension on/off for this
     // request; unset = the engine's default (auto: on where admissible, its learned gate decides).
     std::optional<bool> ngram_draft;
+    // Request field "draft_depth_max" (batched decoding, measurement): at most this many predictor drafts per
+    // cycle for this request (0/absent = the engine's setting). Drafts only: never the request's output.
+    std::uint32_t draft_depth_max = 0;
+    // Request field "tool_draft" (batched decoding): strict tool-call frame proposals on/off for this request;
+    // unset = the engine's setting (STRIX_BATCH_TOOL_DRAFT, off by default). Drafts only.
+    std::optional<bool> tool_draft;
+    // Request field "ngram_peers" (batched decoding): cross-request lookup on/off for this request's n-gram
+    // extension; unset = the engine's setting (STRIX_BATCH_NGRAM_PEERS, off by default). Drafts only.
+    std::optional<bool> ngram_peers;
     std::function<bool(std::span<const std::uint32_t>)> on_tokens;
 };
 
@@ -43,10 +53,14 @@ struct GenerationStats {
     std::uint64_t cycles = 0, proposed = 0, accepted = 0;
     // Context n-gram extension rows proposed / accepted (0 when it did not run or never opened).
     std::uint64_t ngram_rows = 0, ngram_accepted = 0;
+    std::uint64_t tool_rows = 0, tool_accepted = 0; // strict tool-call frame rows (batched decoding, opt-in)
+    std::uint64_t source_shadow = 0, source_scored = 0, source_right = 0, frame_cycles = 0, frame_shadow = 0; // diagnostics
     double queue_ms = 0.0, prefill_ms = 0.0, decode_ms = 0.0;
     // "stop" (a stop token), "length" (max_tokens), "context" (context full), "cancelled".
     std::string finish = "length";
     std::string sampling = "greedy";
+    // Engine receipts added to the response's "strix" object: (member name, JSON value text). Empty: none.
+    std::vector<std::pair<std::string, std::string>> engine_extra;
 };
 
 class GenerationEngine {

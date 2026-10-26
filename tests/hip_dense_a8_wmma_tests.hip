@@ -793,6 +793,94 @@ void prompt_bench(hipStream_t stream) {
 // exact, and the times of the whole launches (convert + projection for FP16, quantize + projection
 // for A8). Rows 256 and 64 (the prompt launch sizes).
 template <class In, unsigned Rows>
+void schedule_shape(const Shape& shape, hipStream_t stream, unsigned flavor) {
+    std::mt19937 rng(99U + Rows);
+    const auto weights_host = make_weights(shape.width, shape.outputs, flavor, rng);
+    Buffer weights(weights_host.size()); weights.upload(weights_host);
+    Activations a(Rows, shape.width, shape.bf16);
+    a.upload(make_inputs(Rows, shape.width, shape.bf16, flavor, rng));
+    const std::size_t n = static_cast<std::size_t>(Rows) * shape.outputs;
+    Buffer f16_out(n * 4U);
+    const auto site_for = [&](Buffer& out) {
+        FusedSite<In, Rows> site{};
+        site.segments = q8_rows::segments({{weights.p, shape.outputs}});
+        for (unsigned r = 0; r < Rows; ++r)
+            site.input[r] = a.input.as<unsigned char>() + static_cast<std::uint64_t>(r) * a.width * sizeof(In);
+        site.width = a.width; site.outputs = shape.outputs; site.output = out.as<float>();
+        return site;
+    };
+    const auto s16 = site_for(f16_out);
+    Buffer halves(static_cast<std::size_t>(Rows) * shape.width * 2U);
+    using Site = decltype(site_for(f16_out));
+    const auto items = Rows * (shape.width / 8U);
+    hipLaunchKernelGGL(q8_rows::dense_f16_convert_kernel<Site>, dim3((items + 255U) / 256U), dim3(256), 0,
+        stream, s16, halves.as<_Float16>(), q8_rows::dense_f16_overflow_counter());
+    std::vector<unsigned char> baseline(n * 4U), tuned(n * 4U);
+    const auto fp16 = [&]<unsigned BM,unsigned BN,unsigned WM,unsigned WN,unsigned Tune>() {
+        hipFuncAttributes attr{};int blocks=0;
+        const auto kernel=[]{
+            if constexpr((Tune&4U)!=0U)return q8_rows::project_rows_dense_f16_wmma2_kernel<Site, BM, BN, WM, WN, Tune>;
+            else return q8_rows::project_rows_dense_f16_wmma_kernel<Site, BM, BN, WM, WN, Tune>;
+        }();
+        check(hipFuncGetAttributes(&attr,reinterpret_cast<const void*>(kernel)),"FP16 attributes");
+        check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,kernel,256,0),"FP16 occupancy");
+        std::cout << "FP16 resource tune=" << Tune << " vgpr=" << attr.numRegs << " lds=" << attr.sharedSizeBytes
+                  << " local=" << attr.localSizeBytes << " resident_blocks_per_mp=" << blocks << '\n';
+        hipLaunchKernelGGL(kernel, dim3(Rows / BM * ((shape.outputs + BN-1U) / BN)), dim3(256), 0, stream, s16, halves.as<_Float16>());
+        check(hipStreamSynchronize(stream), "FP16 schedule gate");
+        check(hipMemcpy(tuned.data(), f16_out.p, n * 4U, hipMemcpyDeviceToHost), "FP16 schedule bytes");
+        if constexpr (Tune == 0U) baseline = tuned;
+        else require(tuned == baseline, "dense FP16 schedule changed bytes");
+        // STRIX_INTPREFILL_SCHED_BENCH=1: kernel time of this tile and tune (median of 30, warm L2/MALL).
+        if (std::getenv("STRIX_INTPREFILL_SCHED_BENCH") && flavor == 0U) {
+            const float us = median_us([&] {
+                hipLaunchKernelGGL(kernel, dim3(Rows / BM * ((shape.outputs + BN-1U) / BN)), dim3(256), 0, stream, s16, halves.as<_Float16>());
+            }, stream);
+            std::cout << "FP16 bench " << shape.name << " T=" << Rows << " tile " << BM << "x" << BN << " tune=" << Tune << ": "
+                      << us << " us " << 2.0 * Rows * shape.width * shape.outputs / (us * 1e6) << " TFLOPS\n";
+        }
+    };
+    const auto schedule_tiles = [&]<unsigned BM,unsigned BN,unsigned WM,unsigned WN>() {
+        if constexpr(Rows%BM==0U) {
+            fp16.template operator()<BM,BN,WM,WN,0U>(); fp16.template operator()<BM,BN,WM,WN,1U>();
+            fp16.template operator()<BM,BN,WM,WN,2U>(); fp16.template operator()<BM,BN,WM,WN,3U>();
+            if constexpr(BM<=128U) {
+                fp16.template operator()<BM,BN,WM,WN,4U>(); fp16.template operator()<BM,BN,WM,WN,5U>();
+                fp16.template operator()<BM,BN,WM,WN,6U>(); fp16.template operator()<BM,BN,WM,WN,7U>();
+            }
+        }
+    };
+    schedule_tiles.template operator()<32U,128U,16U,32U>();
+    schedule_tiles.template operator()<256U,128U,64U,64U>();
+    schedule_tiles.template operator()<128U,128U,64U,32U>();
+    schedule_tiles.template operator()<128U,64U,32U,32U>();
+    schedule_tiles.template operator()<64U,64U,32U,16U>();
+    schedule_tiles.template operator()<64U,128U,32U,32U>();
+    if constexpr (Rows >= 64U) {
+    hipLaunchKernelGGL(q8_rows::dense_a8_quantize_kernel<Site>, dim3((items + 255U) / 256U), dim3(256), 0,
+        stream, s16, a.codes.as<std::int8_t>(), a.deltas.as<float>());
+    const auto iu8 = [&]<unsigned Waves,bool Single>() {
+        hipFuncAttributes attr{};int blocks=0;
+        const auto kernel=q8_rows::project_rows_dense_a8_wmma_lds2_kernel<Site, Waves, Single>;
+        check(hipFuncGetAttributes(&attr,reinterpret_cast<const void*>(kernel)),"IU8 attributes");
+        check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,kernel,32U*Waves,0),"IU8 occupancy");
+        std::cout << "IU8 resource single=" << Single << " vgpr=" << attr.numRegs << " lds=" << attr.sharedSizeBytes
+                  << " local=" << attr.localSizeBytes << " resident_blocks_per_mp=" << blocks << '\n';
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_rows::project_rows_dense_a8_wmma_lds2_kernel<Site, Waves, Single>),
+            dim3(Rows / 64U * ((shape.outputs + 32U*Waves-1U) / (32U*Waves))), dim3(32U*Waves), 0, stream,
+            s16, a.codes.as<std::int8_t>(), a.deltas.as<float>());
+        check(hipStreamSynchronize(stream), "IU8 LDS gate");
+        check(hipMemcpy(tuned.data(), f16_out.p, n * 4U, hipMemcpyDeviceToHost), "IU8 LDS bytes");
+        if constexpr (!Single) baseline = tuned;
+        else require(tuned == baseline, "dense IU8 single LDS changed bytes");
+    };
+    iu8.template operator()<4U,false>(); iu8.template operator()<4U,true>();
+    iu8.template operator()<8U,false>(); iu8.template operator()<8U,true>();
+    }
+    std::cout << "schedule bytes all eligible FP16 tiles and IU8 waves=4,8 " << shape.name << " T=" << Rows << " PASS\n";
+}
+
+template <class In, unsigned Rows>
 void f16_shape(const Shape& shape, hipStream_t stream, bool timing) {
     std::mt19937 rng(99U + Rows);
     const auto weights_host = make_weights(shape.width, shape.outputs, 0U, rng);
@@ -929,9 +1017,102 @@ void bench(hipStream_t stream) {
 }
 } // namespace
 
+// STRIX_DENSE_F16_ROWS_BENCH=1: the production dense FP16 kernel (128 x 128, tune 4) over T = 256..2048 rows per launch
+// on a strided site (rows at base + r * stride), weights cold (a 96 MB scratch write evicts L2/MALL before each launch):
+// kernel time per 256 rows and TFLOP/s, so the cost of re-streaming the weights every 256 rows is measured, not assumed.
+template <class In, unsigned Rows> struct StridedRowsSite {
+    using Input = In;
+    static constexpr unsigned rows = Rows;
+    const unsigned char* input0;
+    std::uint64_t input_stride;
+    q8_rows::Segments segments;
+    std::uint32_t width, outputs;
+    float* output;
+    __device__ const In* row_input(unsigned r) const { return reinterpret_cast<const In*>(input0 + r * input_stride); }
+    __device__ static float coefficient(unsigned scale, std::int8_t code) { return baseline_coefficient(scale, code); }
+    __device__ static void fma(float& acc, float c, float x) { acc = __builtin_fmaf(c, x, acc); }
+    __device__ static float add(float lower, float upper) { return lower + upper; }
+    __device__ void store(std::uint32_t out, unsigned r, float value) const { output[static_cast<std::uint64_t>(r) * outputs + out] = value; }
+};
+template <class In, unsigned Rows>
+void rows_bench_shape(const Shape& shape, hipStream_t stream, Buffer& flush) {
+    std::mt19937 rng(7U);
+    const auto weights_host = make_weights(shape.width, shape.outputs, 0U, rng);
+    Buffer weights(weights_host.size()); weights.upload(weights_host);
+    Activations a(Rows, shape.width, shape.bf16);
+    a.upload(make_inputs(Rows, shape.width, shape.bf16, 0U, rng));
+    Buffer out(static_cast<std::size_t>(Rows) * shape.outputs * 4U), halves(static_cast<std::size_t>(Rows) * shape.width * 2U);
+    using Site = StridedRowsSite<In, Rows>;
+    Site site{};
+    site.input0 = a.input.as<unsigned char>(); site.input_stride = static_cast<std::uint64_t>(shape.width) * sizeof(In);
+    site.segments = q8_rows::segments({{weights.p, shape.outputs}});
+    site.width = shape.width; site.outputs = shape.outputs; site.output = out.as<float>();
+    const auto items = Rows * (shape.width / 8U);
+    hipLaunchKernelGGL(q8_rows::dense_f16_convert_kernel<Site>, dim3((items + 255U) / 256U), dim3(256), 0, stream, site,
+        halves.as<_Float16>(), q8_rows::dense_f16_overflow_counter());
+    const auto tile = [&]<unsigned BM, unsigned BN, unsigned WM, unsigned WN, unsigned Tune>() {
+    const auto kernel = [] {
+        if constexpr ((Tune & 4U) != 0U) return q8_rows::project_rows_dense_f16_wmma2_kernel<Site, BM, BN, WM, WN, Tune>;
+        else return q8_rows::project_rows_dense_f16_wmma_kernel<Site, BM, BN, WM, WN, Tune>;
+    }();
+    const dim3 grid(Rows / BM * ((shape.outputs + BN - 1U) / BN));
+    hipEvent_t start, stop;
+    check(hipEventCreate(&start), "event"); check(hipEventCreate(&stop), "event");
+    std::vector<float> cold, warm;
+    for (unsigned it = 0; it < 13U; ++it) {
+        check(hipMemsetAsync(flush.p, static_cast<int>(it), flush.bytes, stream), "flush");
+        check(hipEventRecord(start, stream), "record");
+        hipLaunchKernelGGL(kernel, grid, dim3(256), 0, stream, site, halves.as<_Float16>());
+        check(hipEventRecord(stop, stream), "record");
+        check(hipEventSynchronize(stop), "sync");
+        float ms = 0; check(hipEventElapsedTime(&ms, start, stop), "elapsed");
+        if (it >= 3U) cold.push_back(ms * 1000.0F);
+    }
+    const float hot = median_us([&] { hipLaunchKernelGGL(kernel, grid, dim3(256), 0, stream, site, halves.as<_Float16>()); }, stream, 10U);
+    check(hipEventDestroy(start), "event"); check(hipEventDestroy(stop), "event");
+    std::sort(cold.begin(), cold.end());
+    const float us = cold[cold.size() / 2U];
+    std::cout << "rows bench " << shape.name << " " << shape.width << "->" << shape.outputs << " T=" << Rows << " tile " << BM << "x"
+              << BN << " tune " << Tune << " cold " << us << " us (" << us * 256.0F / Rows << " us/256 rows, "
+              << 2.0 * Rows * shape.width * shape.outputs / (us * 1e6) << " TFLOPS) warm " << hot << " us (" << hot * 256.0F / Rows
+              << " us/256 rows)\n";
+    };
+    tile.template operator()<128U, 128U, 64U, 32U, 4U>();
+    tile.template operator()<128U, 64U, 32U, 32U, 4U>();
+    tile.template operator()<64U, 128U, 32U, 32U, 4U>();
+    tile.template operator()<256U, 128U, 64U, 64U, 1U>();
+}
+void rows_bench(hipStream_t stream) {
+    std::cout.setf(std::ios::fixed); std::cout.precision(1);
+    Buffer flush(96U << 20U);
+    for (const auto& shape : shapes) {
+        const auto run = [&]<class In>() {
+            rows_bench_shape<In, 256U>(shape, stream, flush); rows_bench_shape<In, 512U>(shape, stream, flush);
+            rows_bench_shape<In, 1024U>(shape, stream, flush); rows_bench_shape<In, 2048U>(shape, stream, flush);
+        };
+        if (shape.bf16) run.template operator()<std::uint16_t>(); else run.template operator()<float>();
+    }
+}
+
 int main() try {
     hipStream_t stream = nullptr;
     check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create stream");
+    if (std::getenv("STRIX_DENSE_F16_ROWS_BENCH")) { rows_bench(stream); return 0; }
+    if (std::getenv("STRIX_INTPREFILL_GATES")) {
+        for (const auto& shape : shapes) {
+            const auto run = [&]<class In>() {
+                schedule_shape<In,32U>(shape,stream,0U);
+                schedule_shape<In,64U>(shape,stream,0U);
+                schedule_shape<In,128U>(shape,stream,0U);
+                schedule_shape<In,256U>(shape,stream,0U);
+                const Shape tail{shape.name,shape.width,1000U,shape.bf16};
+                schedule_shape<In,64U>(tail,stream,1U);
+            };
+            if(shape.bf16)run.template operator()<std::uint16_t>();else run.template operator()<float>();
+        }
+        check(hipStreamDestroy(stream), "destroy schedule stream");
+        return 0;
+    }
     if (!std::getenv("STRIX_DENSE_A8_BENCH_ONLY")) {
         std::uint32_t engine_cases = 0;
         for (const auto& shape : shapes) {

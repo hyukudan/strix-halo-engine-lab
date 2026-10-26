@@ -1,4 +1,5 @@
 #include "strix/gdn_recurrent_layout_diagnostic.hpp"
+#include "strix/hip_ggml_weight_formats.hpp"
 #ifdef STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC
 #include "strix/hip_gdn_lm_wave8_diagnostic.hpp"
 #endif
@@ -6,6 +7,7 @@
 #include "strix/qpersist.hpp"
 #include "strix/known_window_cohort.hpp"
 #include "hip_q8_rows_gemv.hpp"
+#include "hip_dense_f16_tiled.hpp"
 #include "strix/hip_gdn_islands.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_setup_quiescence.hpp"
@@ -92,6 +94,9 @@ enum class WeightKind {
     q8_0,
     iq4_nl,
     iq4_xs,
+#define STRIX_GGML_KIND_ENUM(kind, type) kind,
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_ENUM) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_ENUM)
+#undef STRIX_GGML_KIND_ENUM
 };
 
 enum class ProjectionMode { legacy256, virtual_stream, prefetch8, prefetch8_wave8 };
@@ -278,6 +283,9 @@ WeightKind weight_kind(
     case 8: return WeightKind::q8_0;
     case 20: return WeightKind::iq4_nl;
     case 23: return WeightKind::iq4_xs;
+#define STRIX_GGML_KIND_MAP(kind, type) case type: return WeightKind::kind;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_MAP) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_MAP)
+#undef STRIX_GGML_KIND_MAP
     case 30: return WeightKind::bf16;
     default:
         throw std::invalid_argument(
@@ -516,6 +524,24 @@ __device__ float load_small(
     return 0.0F;
 }
 
+#define STRIX_GGML_KIND_LOAD(kind, type)                                                          \
+    template <>                                                                                   \
+    __device__ float load_weight<WeightKind::kind>(                                               \
+        const void* weights, std::uint32_t row_width, std::uint64_t row, std::uint32_t feature) { \
+        return hip_ggml::element<type>(weights, row_width, row, feature);                        \
+    }
+STRIX_GGML_KINDS_K(STRIX_GGML_KIND_LOAD) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_LOAD)
+#undef STRIX_GGML_KIND_LOAD
+
+std::uint32_t ggml_type_of(WeightKind kind) {
+    switch (kind) {
+#define STRIX_GGML_KIND_TYPE(k, type) case WeightKind::k: return type;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_TYPE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_TYPE)
+#undef STRIX_GGML_KIND_TYPE
+    default: return 0;
+    }
+}
+
 std::uint64_t required_weight_bytes(
     WeightKind kind,
     std::uint32_t input_width,
@@ -555,6 +581,13 @@ std::uint64_t required_weight_bytes(
                 input_width / 256U) *
             output_rows *
             sizeof(IQ4XSBlock);
+    default: {
+        const auto g = hip_ggml::geometry(ggml_type_of(kind));
+        if (g.elements == 0 || input_width % g.elements != 0) {
+            throw std::invalid_argument("weight width is not a multiple of its GGUF block");
+        }
+        return static_cast<std::uint64_t>(input_width / g.elements) * output_rows * g.bytes;
+    }
     }
     throw std::logic_error(
         "unreachable GDN weight kind");
@@ -1079,6 +1112,54 @@ template <unsigned Rows> struct GdnOutputRowsSite {
     __device__ static void fma(float& acc, float c, float x) { acc = __builtin_fmaf(x, c, acc); }
     __device__ static float add(float lower, float upper) { return gdn_rows_tree_add(lower, upper); }
     __device__ void store(std::uint32_t out, unsigned r, float value) const { output[r][out] = float_to_bf16(value); }
+};
+// STRIX_INTPREFILL_DENSE_ROWS (512 | 1024, fast prefill FP16 only): the input projection (qkv + z) of that many uniformly
+// strided rows in one launch (row r at row 0's views + r * stride), so each weight byte streams once per that many rows
+// instead of once per 256. Same kernels, operands and per-output arithmetic as the 256-row sites.
+template <unsigned Rows> struct GdnInputStridedRowsSite {
+    using Input = std::uint16_t;
+    static constexpr unsigned rows = Rows;
+    const unsigned char* input0;
+    std::uint64_t input_stride;
+    q8_rows::Segments segments;
+    std::uint32_t width, outputs;
+    unsigned char* output0[2];
+    std::uint64_t output_stride;
+    __device__ const Input* row_input(unsigned r) const { return reinterpret_cast<const Input*>(input0 + r * input_stride); }
+    __device__ void store(std::uint32_t out, unsigned r, float value) const {
+        unsigned m; std::uint32_t row;
+        static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
+        reinterpret_cast<float*>(output0[m] + r * output_stride)[row] = round_bf16(value);
+    }
+};
+// STRIX_QPF2K_DENSE=1 (q8_rows::tiled): the input / output projections of all uniformly strided rows of a call in one
+// launch; the same store arithmetic as GdnInputStridedRowsSite / GdnOutputRowsSite.
+struct GdnInputTiledSite {
+    using Input = std::uint16_t;
+    static constexpr unsigned qpf2k_pre_form = 4U;  // FP16-scratch A (STRIX_QPF2K_DENSE_INLINE=0 only): form 4 (t8: -2.2 .. -4.1 %)
+    const unsigned char* input0;
+    std::uint64_t input_stride;
+    q8_rows::Segments segments;
+    std::uint32_t width, outputs;
+    unsigned char* output0[2];
+    std::uint64_t output_stride;
+    __device__ void store(std::uint32_t out, std::uint32_t r, float value) const {
+        unsigned m; std::uint32_t row;
+        static_cast<void>(q8_rows::segment_row(segments, out, width, m, row));
+        reinterpret_cast<float*>(output0[m] + r * output_stride)[row] = round_bf16(value);
+    }
+};
+struct GdnOutputTiledSite {
+    using Input = float;
+    const unsigned char* input0;
+    std::uint64_t input_stride;
+    q8_rows::Segments segments;
+    std::uint32_t width, outputs;
+    unsigned char* output0;
+    std::uint64_t output_stride;
+    __device__ void store(std::uint32_t out, std::uint32_t r, float value) const {
+        reinterpret_cast<std::uint16_t*>(output0 + r * output_stride)[out] = float_to_bf16(value);
+    }
 };
 
 __global__ void conv_update_kernel(
@@ -2596,18 +2677,20 @@ void gdn_window_recurrent_norm_kernel(GdnWindowRows<Rows> rows, float* state, Gd
     }
 }
 // Batched F32 beta/alpha projections: per row the legacy 256-leaf chain and tree.
-template <unsigned Rows>
+__device__ __forceinline__ float gdn_gate_weight(const float* w, std::uint64_t i) { return w[i]; }
+__device__ __forceinline__ float gdn_gate_weight(const std::uint16_t* w, std::uint64_t i) { return bf16_to_float(w[i]); }
+template <unsigned Rows, class Weight = float>
 __global__ __launch_bounds__(kProjectionThreads)
-void gdn_window_f32_gates_kernel(GdnWidePointers<Rows> input, const float* beta_weights, const float* alpha_weights,
+void gdn_window_f32_gates_kernel(GdnWidePointers<Rows> input, const Weight* beta_weights, const Weight* alpha_weights,
     GdnWindowRows<Rows> rows, std::uint32_t width, std::uint32_t heads) {
     __shared__ float scratch[Rows][kProjectionThreads];
     const auto lane = static_cast<std::uint32_t>(threadIdx.x);
     const bool alpha = blockIdx.x >= heads;
     const auto out = static_cast<std::uint32_t>(blockIdx.x) - (alpha ? heads : 0U);
-    const float* weights = (alpha ? alpha_weights : beta_weights) + static_cast<std::uint64_t>(out) * width;
+    const Weight* weights = (alpha ? alpha_weights : beta_weights) + static_cast<std::uint64_t>(out) * width;
     float sum[Rows]{};
     for (auto feature = lane; feature < width; feature += kProjectionThreads) {
-        const float weight = weights[feature];
+        const float weight = gdn_gate_weight(weights, feature);
 #pragma unroll
         for (unsigned row = 0; row < Rows; ++row)
             sum[row] += bf16_to_float(static_cast<const std::uint16_t*>(input.input[row])[feature]) * weight;
@@ -3026,6 +3109,8 @@ void gdn_prefill_norm_rows_kernel(GdnPrefillRows rows, std::uint32_t count, std:
         }
     }
 }
+#include "hip_gdn_prefill_scan.inc"
+#include "hip_gdn_qpf2k_prefill.inc"
 // Quantized out-projection input of whole 256-row launches (the norm kernel writes it; prefill steps of up to
 // kGdnFusedA8Rows rows at most kDenseA8MaxWidth wide).
 constexpr std::uint32_t kGdnFusedA8Rows = 2048U;
@@ -3159,6 +3244,13 @@ void launch_projection_by_kind(
         launch_projection<WeightKind::iq4_xs>(
             input, weights, input_width, output_width, output, stream, ledger);
         return;
+#define STRIX_GGML_KIND_CASE(KIND, type) \
+    case WeightKind::KIND: \
+        launch_projection<WeightKind::KIND>( \
+            input, weights, input_width, output_width, output, stream, ledger); \
+        return;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE)
+#undef STRIX_GGML_KIND_CASE
     }
 }
 
@@ -3252,6 +3344,13 @@ void launch_output_by_kind(
         launch_output_projection<WeightKind::iq4_xs>(
             input, weights, input_width, output_width, output, stream, ledger);
         return;
+#define STRIX_GGML_KIND_CASE(KIND, type) \
+    case WeightKind::KIND: \
+        launch_output_projection<WeightKind::KIND>( \
+            input, weights, input_width, output_width, output, stream, ledger); \
+        return;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE)
+#undef STRIX_GGML_KIND_CASE
     }
 }
 
@@ -3797,7 +3896,9 @@ PreparedGdnLaunch prepare_gdn_launch(
          tensors.beta.manifest->ggml_type == 8U || tensors.alpha.manifest->ggml_type == 8U))
         throw std::invalid_argument("HIP GDN prefetch8 Q8 input width must align to32");
     if (config.wave8_q8_input_projections) {
-        if (tensors.qkv.manifest->ggml_type != 8U || tensors.z.manifest->ggml_type != 8U)
+        const bool dense_covers = config.dense_a8_projections && q8_rows::dense_a8_type(tensors.qkv.manifest->ggml_type) &&
+            q8_rows::dense_a8_type(tensors.z.manifest->ggml_type);
+        if (!dense_covers && (tensors.qkv.manifest->ggml_type != 8U || tensors.z.manifest->ggml_type != 8U))
             throw std::invalid_argument("wave8 GDN input requires Q8_0 qkv and z weights");
         const auto validate = [&](const TensorPair& tensor, std::uint32_t rows, float* target) {
             if (tensor.manifest->ggml_type != 8U) return;
@@ -3819,10 +3920,13 @@ PreparedGdnLaunch prepare_gdn_launch(
         value_width,
         hidden,
         "out");
-    if(config.virtual_q8_output_projection &&
+    // GSQ-RCO (STRIX_GSQ_Q20_A8=1): a typed ssm_out runs the dense A8 segments, not the virtual/wave8 Q8 forms.
+    const bool gsq_out = config.dense_a8_projections && tensors.out.manifest->ggml_type != 8U &&
+        q8_rows::dense_a8_type(tensors.out.manifest->ggml_type);
+    if(config.virtual_q8_output_projection && !gsq_out &&
         (tensors.out.manifest->ggml_type!=8U || value_width%32U!=0U))
         throw std::invalid_argument("virtual Q8 GDN output requires aligned Q8_0 weights");
-    if (config.wave8_q8_output_projection) {
+    if (config.wave8_q8_output_projection && !gsq_out) {
         const auto core_offset = q8_projection_organization::gdn_output_core_offset_bytes(config.model);
         const auto core_address = reinterpret_cast<std::uintptr_t>(workspace.core);
         const auto core_bytes = static_cast<std::uint64_t>(value_width) * sizeof(float);
@@ -3966,8 +4070,9 @@ void emit_gdn_recurrent_layout(const PreparedGdnLaunch& row, HipGdnRecurrentLayo
 void launch_gdn_dense_a8_inputs(const PreparedGdnLaunch& prepared, hipStream_t stream) {
     GdnInputRowsSite<1U> in{};
     const auto add = [&](const TensorPair& tensor, std::uint32_t outputs, float* target) {
-        if (tensor.manifest->ggml_type != 8U) return;
+        if (!q8_rows::dense_a8_type(tensor.manifest->ggml_type)) return;
         const auto m = in.segments.count++;
+        in.segments.types[m] = q8_rows::segment_type(tensor.manifest->ggml_type);
         in.segments.weights[m] = reinterpret_cast<const unsigned char*>(tensor.runtime->address);
         in.segments.first[m + 1U] = in.segments.first[m] + outputs;
         in.output[m][0] = target;
@@ -4009,8 +4114,8 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
             throw std::invalid_argument("HIP GDN dense A8 projections run eager outside islands and graphs");
         launch_gdn_dense_a8_inputs(prepared, target.stream);
     }
-    // Under dense A8 the Q8_0 matrices ran above; other formats keep their R1 kernels.
-    const auto keep = [&](const TensorPair& tensor) { return !dense || tensor.manifest->ggml_type != 8U; };
+    // Under dense A8 the Q8_0 (and GSQ dense) matrices ran above; other formats keep their R1 kernels.
+    const auto keep = [&](const TensorPair& tensor) { return !dense || !q8_rows::dense_a8_type(tensor.manifest->ggml_type); };
     if (keep(tensors.qkv)) launch_projection_by_kind(
         weight_kind(
             tensors.qkv.manifest->
@@ -4200,6 +4305,7 @@ void emit_gdn_sequence(const PreparedGdnLaunch& prepared, const HipGdnLauncherCo
     if (!keep(tensors.out)) {
         GdnOutputRowsSite<1U> out{};
         out.segments = q8_rows::segments({{reinterpret_cast<const void*>(tensors.out.runtime->address), hidden}});
+        out.segments.types[0] = q8_rows::segment_type(tensors.out.manifest->ggml_type);
         out.width = value_width; out.outputs = hidden;
         out.input[0] = workspace.core;
         out.output[0] = reinterpret_cast<std::uint16_t*>(output.address);
@@ -4590,8 +4696,13 @@ std::array<GdnKnownWindowRow, 2> prepare_gdn_known_window_rows(
                 manifest.dimensions[0] == 2560U && manifest.dimensions[1] == 48U &&
                 manifest.byte_size == 491520ULL;
         };
-        if (tensors.qkv.manifest->ggml_type != 8U || tensors.z.manifest->ggml_type != 8U ||
-            tensors.out.manifest->ggml_type != 8U || !is_f32_gate(tensors.beta) || !is_f32_gate(tensors.alpha))
+        // GSQ-RCO (STRIX_GSQ_Q20_A8=1): typed qkv/z/out run as typed dense A8 segments of the same rows sites.
+        const auto matrix_ok = [&](const TensorPair& tensor) {
+            const auto type = tensor.manifest->ggml_type;
+            return type == 8U || (config.dense_a8_projections && q8_rows::dense_a8_type(type));
+        };
+        if (!matrix_ok(tensors.qkv) || !matrix_ok(tensors.z) ||
+            !matrix_ok(tensors.out) || !is_f32_gate(tensors.beta) || !is_f32_gate(tensors.alpha))
             throw std::invalid_argument("GDN known-window R2 F32-gate variant requires Q8_0 qkv/z/out and F32 beta/alpha");
     }
     const std::array<GdnKnownWindowRange, 6> writable{{
@@ -4617,6 +4728,10 @@ void enqueue_gdn_known_window_inputs(const std::array<GdnKnownWindowRow, 2>& pre
     in.segments = q8_gates ? q8_rows::segments({{weights(a.tensors.qkv), a.conv_width}, {weights(a.tensors.z), a.value_width},
         {weights(a.tensors.beta), a.value_heads}, {weights(a.tensors.alpha), a.value_heads}}) :
         q8_rows::segments({{weights(a.tensors.qkv), a.conv_width}, {weights(a.tensors.z), a.value_width}});
+    if (!q8_gates) {
+        in.segments.types[0] = q8_rows::segment_type(a.tensors.qkv.manifest->ggml_type);
+        in.segments.types[1] = q8_rows::segment_type(a.tensors.z.manifest->ggml_type);
+    }
     in.width = a.hidden; in.outputs = in.segments.first[in.segments.count];
     for (unsigned r = 0; r < 2U; ++r) {
         const auto& w = prepared[r].workspace;
@@ -4647,6 +4762,7 @@ void enqueue_gdn_known_window_completion(const std::array<GdnKnownWindowRow, 2>&
     launch_gdn_known_window_core(b, config);
     GdnOutputRowsSite<2U> out{};
     out.segments = q8_rows::segments({{reinterpret_cast<const void*>(a.tensors.out.runtime->address), a.hidden}});
+    out.segments.types[0] = q8_rows::segment_type(a.tensors.out.manifest->ggml_type);
     out.width = a.value_width; out.outputs = a.hidden;
     for (unsigned r = 0; r < 2U; ++r) {
         out.input[r] = prepared[r].workspace.core;
@@ -4731,6 +4847,8 @@ void enqueue_gdn_wide_rows(const std::array<GdnKnownWindowRow, Rows>& prepared,
     GdnInputRowsSite<Rows> in{};
     in.segments = q8_rows::segments({{reinterpret_cast<const void*>(first.tensors.qkv.runtime->address), first.conv_width},
         {reinterpret_cast<const void*>(first.tensors.z.runtime->address), first.value_width}});
+    in.segments.types[0] = q8_rows::segment_type(first.tensors.qkv.manifest->ggml_type);  // GSQ-RCO typed (0 = Q8_0)
+    in.segments.types[1] = q8_rows::segment_type(first.tensors.z.manifest->ggml_type);
     in.width = first.hidden; in.outputs = first.conv_width + first.value_width;
     for (unsigned r = 0; r < Rows; ++r) {
         in.input[r] = reinterpret_cast<const void*>(prepared[r].input.address);
@@ -4751,6 +4869,7 @@ void enqueue_gdn_wide_rows(const std::array<GdnKnownWindowRow, Rows>& prepared,
     for (const auto& row : prepared) launch_gdn_known_window_core(row, config);
     GdnOutputRowsSite<Rows> out{};
     out.segments = q8_rows::segments({{reinterpret_cast<const void*>(first.tensors.out.runtime->address), first.hidden}});
+    out.segments.types[0] = q8_rows::segment_type(first.tensors.out.manifest->ggml_type);
     out.width = first.value_width; out.outputs = first.hidden;
     for (unsigned r = 0; r < Rows; ++r) {
         out.input[r] = prepared[r].workspace.core;
@@ -4868,8 +4987,83 @@ std::uint32_t gdn_prefill_env(const char* name, std::uint32_t fallback, std::ini
     const auto n = v ? static_cast<std::uint32_t>(std::atoi(v)) : fallback;
     return std::find(allowed.begin(), allowed.end(), n) != allowed.end() ? n : fallback;
 }
+// STRIX_QPF2K_GDN=1 (default OFF): the qpf2k core kernels (gdn_qpf2k_prefill.inc) replace the production gates and lane
+// recurrence where their shape conditions hold; STRIX_QPF2K_GDN_PARTS (bit 1 recurrence, bit 2 gates, bit 4 fused core =
+// q/k conv per row segment + recurrence with v conv and gated norm, bit 8 = that core with the norm exchange pipelined one
+// chunk behind, bit 16 = that core with the lean epilogue (own norm sums in registers, z/norm weights loaded before
+// the pair exchange, next chunk's v conv overlapped with the pair wait); default 55 = 1|2|4|16|32 since 4560c3b8, was 23) limits them; bit 32 =
+// lean fused core with the decay-NaN dispatch (gdn_decay_nan_kernel flag; Nan 2 pinned launch + Nan 1 VOPD launch, exactly
+// one does the work: exact like the pinned kernel, fast on calls without a NaN decay; in the default 55); bit 64 = lean fused core with 4
+// columns per lane group (2 waves per block, 4-row chunks, post-order tree; with bit 32 also dispatched); STRIX_QPF2K_GDN_CHECK=1 runs
+// the production kernels and the qpf2k kernels on the same inputs and compares bytes (with the fused core the raw v
+// part of the qkv rows is left unconverted, so the check covers q/k of qkv and every other written byte).
+// One stderr line per process the first time each qpf2k kernel is launched (launch witness for gates/receipts).
+void qpf2k_gdn_witness(const char* what, std::uint32_t rows) {
+    static std::once_flag gates_once, cols_once;
+    std::call_once(what[0] == 'g' ? gates_once : cols_once,
+        [&] { std::fprintf(stderr, "QPF2K GDN launch: %s (first call: %u rows)\n", what, rows); });
+}
+unsigned qpf2k_gdn_parts() {
+    static const unsigned parts = [] {
+        const char* v = std::getenv("STRIX_QPF2K_GDN");
+        if (!v || v[0] != '1') return 0U;
+        const char* p = std::getenv("STRIX_QPF2K_GDN_PARTS");
+        // default 55 = 23 | 32 (decay-NaN dispatch ON: exact, t5 in-engine 32K core 1434.8 -> 1287.2 + 3.7 ms flag; 32K ABA never slower)
+        return p ? static_cast<unsigned>(std::atoi(p)) & 127U : 55U;
+    }();
+    return parts;
+}
+// Fused core resources: the norm exchange (per stream) and the q/k segment-boundary side buffer.
+constexpr unsigned kQpf2kSegments = 8U, kQpf2kCoreWaves = 4U;
+struct Qpf2kCoreScratch { qpf2k_gdn::NormExchange exchange{}; std::uint16_t* side = nullptr; std::uint64_t side_bytes = 0; };
+// Returned by value: the pool may grow under a concurrent caller.
+Qpf2kCoreScratch qpf2k_core_scratch(hipStream_t stream, std::uint32_t value_heads, std::uint64_t side_bytes) {
+    static std::mutex mutex;
+    static std::vector<std::pair<hipStream_t, Qpf2kCoreScratch>> pool;
+    std::lock_guard<std::mutex> lock(mutex);
+    for (auto& [s, scratch] : pool)
+        if (s == stream && scratch.side_bytes >= side_bytes) return scratch;
+    Qpf2kCoreScratch x;
+    const std::uint64_t partial = std::uint64_t{value_heads} * 2U * qpf2k_gdn::kNormRing * 8U * 32U * 4U;
+    void* p = nullptr;
+    if (hipMalloc(&p, partial + std::uint64_t{value_heads} * 2U * 8U + 16U + side_bytes) != hipSuccess)
+        throw std::runtime_error("qpf2k GDN core scratch allocation failed");
+    x.exchange.partial = static_cast<float*>(p);
+    x.exchange.published = reinterpret_cast<unsigned*>(static_cast<unsigned char*>(p) + partial);
+    x.exchange.consumed = x.exchange.published + value_heads * 2U;
+    x.exchange.base = 0;
+    x.exchange.decay_nan = x.exchange.consumed + value_heads * 2U;   // one word (16 bytes reserved), zeroed with the counters
+    x.side = reinterpret_cast<std::uint16_t*>(x.exchange.consumed + value_heads * 2U + 4U);
+    x.side_bytes = side_bytes;
+    for (auto& [s, scratch] : pool)
+        if (s == stream) { scratch = x; return scratch; }  // grown (the old block stays allocated: in-flight launches)
+    pool.emplace_back(stream, x);
+    return pool.back().second;
+}
+// All 2 * value_heads blocks of gdn_core_kernel must be co-resident (cooperative launch); decided once, before any
+// q/k row is rewritten.
+template <GdnRecurrentStorage S, unsigned Lean = 0U, unsigned Cc = 2U, unsigned Nan = 3U>
+bool qpf2k_core_fits(std::uint32_t blocks) {
+    // Opt 6 (post-order tree) for the 4-column core and for the dispatched kernels (Nan 1 / 2); Opt 2 for the default Nan 3
+    constexpr unsigned Waves = Cc == 4U ? 2U : kQpf2kCoreWaves, Chunk = Cc == 4U ? 4U : 8U, Opt = Cc == 4U || Nan == 1U || Nan == 2U ? 6U : 2U;
+    static const bool fits = [&] {
+        int device = 0, cooperative = 0, units = 0, per_unit = 0;
+        if (hipGetDevice(&device) != hipSuccess) return false;
+        if (hipDeviceGetAttribute(&cooperative, hipDeviceAttributeCooperativeLaunch, device) != hipSuccess || !cooperative) return false;
+        if (hipDeviceGetAttribute(&units, hipDeviceAttributeMultiprocessorCount, device) != hipSuccess) return false;
+        if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_unit,
+                reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, Cc, Waves, Chunk, Opt, false, Lean, Nan>),
+                static_cast<int>(Waves * 32U), 0) != hipSuccess) return false;
+        const bool ok = static_cast<std::uint64_t>(units) * static_cast<std::uint64_t>(per_unit) >= blocks;
+        std::fprintf(stderr, "QPF2K GDN core residency (%u columns per lane group, nan %u): units %d blocks/unit %d need %u -> %s\n", Cc,
+            Nan, units, per_unit, blocks, ok ? "fused core" : "unfused kernels");
+        return ok;
+    }();
+    return fits;
+}
 void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRow, 8U>>& tiles,
-    const GdnPrefillRows& strided, std::uint64_t input_stride, const HipGdnLauncherConfig& config, const q8_rows::DenseA8Slot* fused_a8) {
+    const GdnPrefillRows& strided, std::uint64_t input_stride, const HipGdnLauncherConfig& config, const q8_rows::DenseA8Slot* fused_a8,
+    unsigned qpf2k = qpf2k_gdn_parts()) {
     const auto stream = hip_execution_stream();
     const auto& first = tiles[0][0];
     const auto count = static_cast<std::uint32_t>(tiles.size() * 8U);
@@ -4885,10 +5079,124 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
             reinterpret_cast<const void*>(first.tensors.a.runtime->address), small_weight_kind(first.tensors.a.manifest->ggml_type),
             first.hidden, first.value_heads);
     };
-    if (gate_heads == 2U) gates.template operator()<2U>();
+    // STRIX_GDN_GATES_ROWS=1: gdn_gates::gdn_gates_rows_kernel (the same chains, tree and transform; all rows of 16-row
+    // tiles share their staged inputs and the weights of 16 outputs).
+    static const bool gates_rows = [] { const char* v = std::getenv("STRIX_GDN_GATES_ROWS"); return v && v[0] == '1'; }();
+    constexpr unsigned GatesRB = 16U, GatesO = 4U, GatesS = 4U, GatesC = 8U;
+    const bool rows_fit = gates_rows && count >= 256U && count % GatesRB == 0U && first.hidden % gdn_gates::kChains == 0U &&
+        (first.value_heads * 2U) % (GatesO * GatesS) == 0U && input_stride % 8U == 0U &&
+        reinterpret_cast<std::uintptr_t>(first.input.address) % 16U == 0U;
+    constexpr unsigned QGatesO = 1U, QGatesW = 8U, QGatesRC = 4U, QGatesRB = 64U;
+    const bool qpf2k_gates = (qpf2k & 2U) && first.hidden == 2560U && count % QGatesRB == 0U &&
+        (first.value_heads * 2U) % (QGatesO * QGatesW) == 0U && input_stride % 8U == 0U &&
+        reinterpret_cast<std::uintptr_t>(first.input.address) % 16U == 0U;
+    if (qpf2k_gates)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_gates_kernel<QGatesO, QGatesW, QGatesRC, QGatesRB>),
+            dim3(first.value_heads * 2U / (QGatesO * QGatesW), count / QGatesRB), dim3(QGatesW * 32U), 0, stream,
+            reinterpret_cast<const std::uint16_t*>(first.input.address), input_stride,
+            reinterpret_cast<const float*>(first.tensors.beta.runtime->address),
+            reinterpret_cast<const float*>(first.tensors.alpha.runtime->address), strided,
+            reinterpret_cast<const void*>(first.tensors.dt.runtime->address), small_weight_kind(first.tensors.dt.manifest->ggml_type),
+            reinterpret_cast<const void*>(first.tensors.a.runtime->address), small_weight_kind(first.tensors.a.manifest->ggml_type),
+            first.value_heads);
+    if (qpf2k_gates) qpf2k_gdn_witness("gates gdn_qpf2k_gates_kernel<1,8,4,64>", count);
+    else if (rows_fit)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_gates::gdn_gates_rows_kernel<GatesRB, GatesO, GatesS, GatesC>),
+            dim3(first.value_heads * 2U / (GatesO * GatesS), count / GatesRB), dim3(GatesS * 256U), 0, stream,
+            reinterpret_cast<const std::uint16_t*>(first.input.address), input_stride,
+            reinterpret_cast<const float*>(first.tensors.beta.runtime->address),
+            reinterpret_cast<const float*>(first.tensors.alpha.runtime->address), strided,
+            reinterpret_cast<const void*>(first.tensors.dt.runtime->address), small_weight_kind(first.tensors.dt.manifest->ggml_type),
+            reinterpret_cast<const void*>(first.tensors.a.runtime->address), small_weight_kind(first.tensors.a.manifest->ggml_type),
+            first.hidden, first.value_heads);
+    else if (gate_heads == 2U) gates.template operator()<2U>();
     else if (gate_heads == 4U) gates.template operator()<4U>();
     else gates.template operator()<1U>();
     check_hip(hipGetLastError(), "GDN prefill F32 gate rows launch");
+    // qpf2k fused core (bit 4): replaces the conv, recurrence and gated-norm launches below.
+    {
+        auto* matrix_state = reinterpret_cast<float*>(first.matrix_state.address);
+        const bool vk = config.recurrent_storage == GdnRecurrentStorage::value_key;
+        const auto blocks = first.value_heads * 2U;
+        const bool pipe = qpf2k & 8U, lean = (qpf2k & 16U) && !pipe;
+        // bits 32 / 64 (gdn-dense): decay-NaN dispatch / 4 columns per lane group, lean epilogue only. Residency is
+        // checked for every kernel that would be launched (Nan 1 and 2 with the dispatch, else Nan 3); a 4-column core that
+        // does not fit falls back to the 2-column core.
+        const auto fits_of = [&]<unsigned Cc, unsigned Nan>() {
+            return vk ? qpf2k_core_fits<GdnRecurrentStorage::value_key, 1U, Cc, Nan>(blocks) : qpf2k_core_fits<GdnRecurrentStorage::key_value, 1U, Cc, Nan>(blocks);
+        };
+        const bool dispatch_bit = lean && (qpf2k & 32U);
+        const bool four = lean && (qpf2k & 64U) &&
+            (dispatch_bit ? fits_of.template operator()<4U, 1U>() && fits_of.template operator()<4U, 2U>() : fits_of.template operator()<4U, 3U>());
+        const bool dispatch = dispatch_bit &&
+            (four || (fits_of.template operator()<2U, 1U>() && fits_of.template operator()<2U, 2U>()));
+        const bool fits = four || dispatch
+                        || (lean ? (vk ? qpf2k_core_fits<GdnRecurrentStorage::value_key, 1U>(blocks) : qpf2k_core_fits<GdnRecurrentStorage::key_value, 1U>(blocks))
+                                 : (vk ? qpf2k_core_fits<GdnRecurrentStorage::value_key>(blocks) : qpf2k_core_fits<GdnRecurrentStorage::key_value>(blocks)));
+        if ((qpf2k & 4U) && !fused_a8 && count % 8U == 0U && count >= 8U && first.head_dim == 128U && fits) {
+            const auto qk_channels = first.key_heads * 2U * 128U;
+            const unsigned segs = count >= 64U * kQpf2kSegments ? kQpf2kSegments : 1U;
+            const unsigned seg_rows = (count / segs + 31U) / 32U * 32U, nseg = (count + seg_rows - 1U) / seg_rows;
+            const auto scratch = qpf2k_core_scratch(stream, first.value_heads, std::uint64_t{kQpf2kSegments} * 3U * qk_channels * 2U);
+            auto* conv_state = reinterpret_cast<std::uint16_t*>(first.conv_state.address);
+            const void* conv_w = reinterpret_cast<const void*>(first.tensors.conv.runtime->address);
+            const auto conv_kind = small_weight_kind(first.tensors.conv.manifest->ggml_type);
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qk_boundary_kernel<>), dim3(16, nseg), dim3(256), 0, stream, strided, seg_rows,
+                qk_channels, static_cast<const std::uint16_t*>(conv_state), scratch.side);
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qk_conv_kernel<8U, 32U>), dim3(first.key_heads * 2U, nseg), dim3(256), 0, stream,
+                strided, count, seg_rows, conv_state, static_cast<const std::uint16_t*>(scratch.side), conv_w, conv_kind, first.key_heads,
+                first.head_dim, config.model.gdn_qk_l2_epsilon);
+            check_hip(hipGetLastError(), "qpf2k GDN q/k conv launch");
+            check_hip(hipMemsetAsync(scratch.exchange.published, 0, std::uint64_t{first.value_heads} * 2U * 2U * 4U + 4U, stream),
+                "qpf2k GDN exchange reset");   // counters + the decay-NaN flag
+            if (dispatch) {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_decay_nan_kernel<>), dim3(64), dim3(256), 0, stream, strided, count,
+                    first.value_heads, const_cast<unsigned*>(scratch.exchange.decay_nan));
+                check_hip(hipGetLastError(), "qpf2k GDN decay-NaN flag launch");
+            }
+            auto rows_arg = strided; auto count_arg = count; auto* state_arg = matrix_state; auto key_heads_arg = first.key_heads;
+            auto* conv_arg = conv_state; auto conv_w_arg = conv_w; auto conv_kind_arg = conv_kind;
+            const void* norm_w = reinterpret_cast<const void*>(first.tensors.norm.runtime->address);
+            auto norm_kind = small_weight_kind(first.tensors.norm.manifest->ggml_type);
+            float eps = config.model.rms_norm_epsilon; auto xch = scratch.exchange;
+            void* args[] = {&rows_arg, &count_arg, &state_arg, &key_heads_arg, &conv_arg, &conv_w_arg, &conv_kind_arg, &norm_w, &norm_kind,
+                &eps, &xch};
+            using KV = std::integral_constant<GdnRecurrentStorage, GdnRecurrentStorage::key_value>;
+            const void* kernel = lean ? (vk ? reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<GdnRecurrentStorage::value_key, 4U, 2U, kQpf2kCoreWaves, 8U, 2U, false, 1U>)
+                                            : reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<KV::value, 4U, 2U, kQpf2kCoreWaves, 8U, 2U, false, 1U>))
+                               : vk ? (pipe ? reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<GdnRecurrentStorage::value_key, 4U, 2U, kQpf2kCoreWaves, 8U, 2U, true>)
+                                            : reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<GdnRecurrentStorage::value_key, 4U, 2U, kQpf2kCoreWaves, 8U, 2U>))
+                                    : (pipe ? reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<KV::value, 4U, 2U, kQpf2kCoreWaves, 8U, 2U, true>)
+                                            : reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<KV::value, 4U, 2U, kQpf2kCoreWaves, 8U, 2U>));
+            // gdn-dense variants (lean only): Nan 2 (pinned, runs iff the flag is set) then Nan 1 (VOPD, runs iff clear).
+            const auto variant = [&]<GdnRecurrentStorage S, unsigned Nan>() -> const void* {
+                if (four) return reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, 4U, 2U, 4U, 6U, false, 1U, Nan>);
+                // t1 (bench): the post-order tree (Opt 6, 201 VGPRs) is faster than Opt 2 at 2 columns too (9.92 vs 10.10 ms per 8K call)
+                return reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, 2U, kQpf2kCoreWaves, 8U, 6U, false, 1U, Nan>);
+            };
+            const unsigned threads = four ? 64U : kQpf2kCoreWaves * 32U;
+            if (dispatch) {
+                const void* pinned = vk ? variant.template operator()<GdnRecurrentStorage::value_key, 2U>() : variant.template operator()<KV::value, 2U>();
+                const void* paired = vk ? variant.template operator()<GdnRecurrentStorage::value_key, 1U>() : variant.template operator()<KV::value, 1U>();
+                check_hip(hipLaunchCooperativeKernel(pinned, dim3(blocks), dim3(threads), args, 0, stream), "qpf2k GDN fused core cooperative launch (pinned)");
+                check_hip(hipLaunchCooperativeKernel(paired, dim3(blocks), dim3(threads), args, 0, stream), "qpf2k GDN fused core cooperative launch (paired)");
+            } else if (four) {
+                const void* k4 = vk ? variant.template operator()<GdnRecurrentStorage::value_key, 3U>() : variant.template operator()<KV::value, 3U>();
+                check_hip(hipLaunchCooperativeKernel(k4, dim3(blocks), dim3(threads), args, 0, stream), "qpf2k GDN fused core cooperative launch (4 columns)");
+            } else
+            check_hip(hipLaunchCooperativeKernel(kernel, dim3(blocks), dim3(kQpf2kCoreWaves * 32U), args, 0, stream),
+                "qpf2k GDN fused core cooperative launch");
+            if (four || dispatch)
+                qpf2k_gdn_witness(four && dispatch ? "recurrence gdn_core_kernel<4,4,2,4,6,lean> x decay-NaN dispatch (fused conv + norm)"
+                                  : four ? "recurrence gdn_core_kernel<4,4,2,4,6,lean> (fused conv + norm, 4 columns per lane group)"
+                                         : "recurrence gdn_core_kernel<4,2,4,8,6,lean> x decay-NaN dispatch (fused conv + norm)", count);
+            else
+            qpf2k_gdn_witness(lean ? "recurrence gdn_core_kernel<4,2,4,8,2,lean> (fused conv + norm, lean epilogue)"
+                              : pipe ? "recurrence gdn_core_kernel<4,2,4,8,2,pipe> (fused conv + pipelined norm)"
+                                     : "recurrence gdn_core_kernel<4,2,4,8,2> (fused conv + norm)", count);
+            return;
+        }
+    }
     hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_prefill_conv_kernel<8U, 32U>), dim3(first.key_heads * 2U + first.value_heads),
         dim3(256), 0, stream, strided, count, reinterpret_cast<std::uint16_t*>(first.conv_state.address),
         reinterpret_cast<const void*>(first.tensors.conv.runtime->address), small_weight_kind(first.tensors.conv.manifest->ggml_type),
@@ -4917,7 +5225,38 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
         else if (lanes == 8U) by_waves.template operator()<S, 8U>();
         else by_waves.template operator()<S, 4U>();
     };
-    if (config.recurrent_storage == GdnRecurrentStorage::value_key) by_lanes.template operator()<GdnRecurrentStorage::value_key>();
+    // STRIX_GDN_FUSED_NORM=1 (prefill steps of >= 256 rows): gdn_gates::gdn_prefill_lanes_norm_kernel (recurrence + gated
+    // RMSNorm, one block per value head; the same values as the lane recurrence followed by the norm rows kernel).
+    static const bool fused_norm = [] { const char* v = std::getenv("STRIX_GDN_FUSED_NORM"); return v && v[0] == '1'; }();
+    if (fused_norm && first.head_dim == 128U && count >= 256U && count % 8U == 0U) {
+        const auto fused = [&]<GdnRecurrentStorage S, bool A8>() {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_gates::gdn_prefill_lanes_norm_kernel<S, 4U, 16U, 8U, A8>), dim3(first.value_heads), dim3(512),
+                0, stream, strided, count, matrix, first.key_heads, first.value_heads,
+                reinterpret_cast<const void*>(first.tensors.norm.runtime->address), small_weight_kind(first.tensors.norm.manifest->ggml_type),
+                config.model.rms_norm_epsilon, fused_a8 ? fused_a8->codes : nullptr, fused_a8 ? fused_a8->deltas : nullptr);
+        };
+        const bool vk = config.recurrent_storage == GdnRecurrentStorage::value_key;
+        if (vk && fused_a8) fused.template operator()<GdnRecurrentStorage::value_key, true>();
+        else if (vk) fused.template operator()<GdnRecurrentStorage::value_key, false>();
+        else if (fused_a8) fused.template operator()<GdnRecurrentStorage::key_value, true>();
+        else fused.template operator()<GdnRecurrentStorage::key_value, false>();
+        check_hip(hipGetLastError(), "GDN prefill fused recurrence/norm launch");
+        return;
+    }
+    // qpf2k recurrence: QColsG lanes per column group, QColsC columns per group, QColsW waves per block (4 lanes x 32
+    // keys, 2 columns per lane, 4 waves = 64 columns per block, 96 blocks; SGPR decay/beta).
+    constexpr unsigned QColsG = 4U, QColsC = 2U, QColsW = 4U, QColsChunk = 8U, QColsOpt = 2U;
+    using QCols = qpf2k_gdn::ColsShape<QColsG, QColsC, QColsW>;
+    if ((qpf2k & 1U) && count % QColsChunk == 0U) {
+        const auto cols = [&]<GdnRecurrentStorage S>() {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_cols_kernel<S, QColsG, QColsC, QColsW, QColsChunk, QColsOpt>),
+                dim3(first.value_heads * (128U / QCols::columns)), dim3(QColsW * 32U), 0, stream, strided, count, matrix, first.key_heads,
+                static_cast<const unsigned*>(nullptr));   // Nan 3 (pinned): the flag is not read
+        };
+        if (config.recurrent_storage == GdnRecurrentStorage::value_key) cols.template operator()<GdnRecurrentStorage::value_key>();
+        else cols.template operator()<GdnRecurrentStorage::key_value>();
+        qpf2k_gdn_witness("recurrence gdn_qpf2k_cols_kernel<4,2,4,8,2>", count);
+    } else if (config.recurrent_storage == GdnRecurrentStorage::value_key) by_lanes.template operator()<GdnRecurrentStorage::value_key>();
     else by_lanes.template operator()<GdnRecurrentStorage::key_value>();
     check_hip(hipGetLastError(), "GDN prefill lane recurrence launch");
     if (fused_a8)
@@ -4937,13 +5276,14 @@ struct GdnPrefillSnapshot {
     struct Region { std::uintptr_t device; std::uint64_t pitch, width, rows, offset; };
     std::vector<Region> regions;
     std::vector<std::uint8_t> bytes;
-    GdnPrefillSnapshot(const GdnKnownWindowRow& first, const GdnPrefillRows& s, std::uint32_t count, bool outputs) {
+    GdnPrefillSnapshot(const GdnKnownWindowRow& first, const GdnPrefillRows& s, std::uint32_t count, bool outputs,
+        std::uint64_t qkv_width = 0) {
         const auto pitch = s.stride * 4U;
         const auto add = [&](const void* device, std::uint64_t width, std::uint64_t rows, std::uint64_t row_pitch) {
             regions.push_back({reinterpret_cast<std::uintptr_t>(device), row_pitch, width, rows, bytes.size()});
             bytes.resize(bytes.size() + width * rows);
         };
-        add(s.qkv, first.conv_width * 4ULL, count, pitch);
+        add(s.qkv, (qkv_width ? qkv_width : first.conv_width) * 4ULL, count, pitch);
         if (outputs) {
             add(s.beta, first.value_heads * 4ULL, count, pitch);
             add(s.gate, first.value_heads * 4ULL, count, pitch);
@@ -4986,6 +5326,8 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
         GdnInputRowsSite<W> in{};
         in.segments = q8_rows::segments({{reinterpret_cast<const void*>(first.tensors.qkv.runtime->address), first.conv_width},
             {reinterpret_cast<const void*>(first.tensors.z.runtime->address), first.value_width}});
+        in.segments.types[0] = q8_rows::segment_type(first.tensors.qkv.manifest->ggml_type);  // GSQ-RCO typed (0 = Q8_0)
+        in.segments.types[1] = q8_rows::segment_type(first.tensors.z.manifest->ggml_type);
         in.width = first.hidden; in.outputs = first.conv_width + first.value_width;
         for (unsigned r = 0; r < W; ++r) {
             const auto& row = tiles[first_tile + r / 8U][r % 8U];
@@ -4999,12 +5341,13 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
     // projection's input (no quantizer launch). STRIX_GDN_FUSED_A8=0 keeps the quantizer launches.
     static const bool fused_env = [] { const char* v = std::getenv("STRIX_GDN_FUSED_A8"); return !v || v[0] != '0'; }();
     const q8_rows::DenseA8Slot fused_slot = fused_env && !config.dense_f16_prefill && !config.dense_g64_prefill && dense_wide >= q8_rows::kDenseA8WideRows && count % q8_rows::kDenseA8WideRows == 0U &&
-            count <= kGdnFusedA8Rows && q8_rows::dense_a8_width(first.value_width) &&
+            count <= kGdnFusedA8Rows && q8_rows::dense_a8_width(first.value_width) && first.tensors.out.manifest->ggml_type == 8U &&
             reinterpret_cast<std::uintptr_t>(first.tensors.out.runtime->address) % 4U == 0U ? gdn_fused_a8_scratch() : q8_rows::DenseA8Slot{};
     const q8_rows::DenseA8Slot* fused_a8 = nullptr;
     const auto project_out = [&]<std::uint32_t W>(std::size_t first_tile) {
         GdnOutputRowsSite<W> out{};
         out.segments = q8_rows::segments({{reinterpret_cast<const void*>(first.tensors.out.runtime->address), first.hidden}});
+        out.segments.types[0] = q8_rows::segment_type(first.tensors.out.manifest->ggml_type);
         out.width = first.value_width; out.outputs = first.hidden;
         for (unsigned r = 0; r < W; ++r) {
             const auto& row = tiles[first_tile + r / 8U][r % 8U];
@@ -5044,10 +5387,87 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
         q8_rows::launch_prefill(out, config.dense_a8_projections, config.dense_f16_prefill, stream, false, config.dense_g64_prefill);
         check_hip(hipGetLastError(), "GDN prefill Q8 output projection launch");
     };
-    // Largest width that divides what is left, so every row runs exactly once.
-    const auto each_width = [&](auto&& project) {
+    static const std::uint32_t dense_rows_env = [] {
+        const char* v = std::getenv("STRIX_INTPREFILL_DENSE_ROWS");
+        const int n = v ? std::atoi(v) : 0;
+        return n == 512 || n == 1024 ? static_cast<std::uint32_t>(n) : 0U;
+    }();
+    // Row r of tiles [t, t + rows / 8) at view(0) + r * stride for every view of the step, or false.
+    const auto uniform = [&](std::size_t t, std::uint32_t rows, const auto& view, std::uint64_t& stride) {
+        const auto at = [&](std::uint32_t r) { return reinterpret_cast<std::uintptr_t>(view(tiles[t + r / 8U][r % 8U])); };
+        const auto a0 = at(0U), a1 = at(1U);
+        if (a1 <= a0) return false;
+        stride = a1 - a0;
+        for (std::uint32_t r = 2U; r < rows; ++r) if (at(r) != a0 + r * stride) return false;
+        return true;
+    };
+    const auto strided_in = [&]<std::uint32_t W>(std::size_t t) {
+        GdnInputStridedRowsSite<W> in{};
+        std::uint64_t si = 0, sq = 0, sz = 0;
+        if (!uniform(t, W, [](const auto& row) { return reinterpret_cast<const void*>(row.input.address); }, si) ||
+            !uniform(t, W, [](const auto& row) { return static_cast<const void*>(row.workspace.qkv); }, sq) ||
+            !uniform(t, W, [](const auto& row) { return static_cast<const void*>(row.workspace.z); }, sz) || sq != sz)
+            return false;
+        in.segments = q8_rows::segments({{reinterpret_cast<const void*>(first.tensors.qkv.runtime->address), first.conv_width},
+            {reinterpret_cast<const void*>(first.tensors.z.runtime->address), first.value_width}});
+        in.width = first.hidden; in.outputs = first.conv_width + first.value_width;
+        in.input0 = reinterpret_cast<const unsigned char*>(tiles[t][0].input.address); in.input_stride = si;
+        in.output0[0] = reinterpret_cast<unsigned char*>(tiles[t][0].workspace.qkv);
+        in.output0[1] = reinterpret_cast<unsigned char*>(tiles[t][0].workspace.z); in.output_stride = sq;
+        q8_rows::launch_dense_f16(in, stream, false);
+        check_hip(hipGetLastError(), "GDN prefill strided input projection launch");
+        return true;
+    };
+    // Largest width that divides what is left, so every row runs exactly once. The output projection keeps 256-row
+    // launches (fixture p4: 6144->2560 at 512/1024 rows was slower with cold weights, equal warm).
+    const auto none = [&]<std::uint32_t W>(std::size_t) { return false; };
+    // STRIX_QPF2K_DENSE=1: every row the launches below would give to launch_dense_f16 (launches of >= 32 rows: all rows
+    // when the count is a multiple of 32 and the widths reach 32) runs in one q8_rows::tiled launch per projection, same
+    // bits; anything else keeps the launches below.
+    const bool tiled_rows = config.dense_f16_prefill && !config.dense_g64_prefill && wide >= 32U && count % 32U == 0U &&
+        count >= q8_rows::tiled::min_rows();
+    const auto tiled_in = [&]() {
+        if (!tiled_rows || !q8_rows::tiled::site_enabled(1U) || count < q8_rows::tiled::min_rows(1U)) return false;
+        std::uint64_t si = 0, sq = 0, sz = 0;
+        if (!uniform(0U, count, [](const auto& row) { return reinterpret_cast<const void*>(row.input.address); }, si) ||
+            !uniform(0U, count, [](const auto& row) { return static_cast<const void*>(row.workspace.qkv); }, sq) ||
+            !uniform(0U, count, [](const auto& row) { return static_cast<const void*>(row.workspace.z); }, sz) || sq != sz)
+            return false;
+        GdnInputTiledSite in{};
+        in.segments = q8_rows::segments({{reinterpret_cast<const void*>(first.tensors.qkv.runtime->address), first.conv_width},
+            {reinterpret_cast<const void*>(first.tensors.z.runtime->address), first.value_width}});
+        in.width = first.hidden; in.outputs = first.conv_width + first.value_width;
+        in.input0 = reinterpret_cast<const unsigned char*>(tiles[0][0].input.address); in.input_stride = si;
+        in.output0[0] = reinterpret_cast<unsigned char*>(tiles[0][0].workspace.qkv);
+        in.output0[1] = reinterpret_cast<unsigned char*>(tiles[0][0].workspace.z); in.output_stride = sq;
+        if (!q8_rows::tiled::supported(in, count)) return false;
+        q8_rows::tiled::launch(in, count, stream);
+        check_hip(hipGetLastError(), "GDN prefill tiled input projection launch");
+        return true;
+    };
+    const auto tiled_out = [&]() {
+        if (!tiled_rows || !q8_rows::tiled::site_enabled(2U)) return false;
+        std::uint64_t si = 0, so = 0;
+        if (!uniform(0U, count, [](const auto& row) { return static_cast<const void*>(row.workspace.core); }, si) ||
+            !uniform(0U, count, [](const auto& row) { return reinterpret_cast<const void*>(row.output.address); }, so))
+            return false;
+        GdnOutputTiledSite out{};
+        out.segments = q8_rows::segments({{reinterpret_cast<const void*>(first.tensors.out.runtime->address), first.hidden}});
+        out.width = first.value_width; out.outputs = first.hidden;
+        out.input0 = reinterpret_cast<const unsigned char*>(tiles[0][0].workspace.core); out.input_stride = si;
+        out.output0 = reinterpret_cast<unsigned char*>(tiles[0][0].output.address); out.output_stride = so;
+        if (!q8_rows::tiled::supported(out, count)) return false;
+        q8_rows::tiled::launch(out, count, stream);
+        check_hip(hipGetLastError(), "GDN prefill tiled output projection launch");
+        return true;
+    };
+    const auto each_width = [&](auto&& project, auto&& strided) {
         for (std::size_t t = 0; t < tiles.size();) {
             const auto left = (tiles.size() - t) * 8U;
+            if (dense_rows_env && config.dense_f16_prefill && dense_wide >= 256U && left >= dense_rows_env) {
+                const bool done = dense_rows_env == 1024U ? strided.template operator()<1024U>(t) : strided.template operator()<512U>(t);
+                if (done) { t += dense_rows_env / 8U; continue; }
+            }
             // Dense A8: one WMMA launch per 256 (128) rows, so each weight byte streams once per 256 rows.
             if (dense_wide >= 256U && left >= 256U) { project.template operator()<256U>(t); t += 32U; }
             else if (dense_wide >= 128U && left >= 128U) { project.template operator()<128U>(t); t += 16U; }
@@ -5057,19 +5477,40 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
             else { project.template operator()<8U>(t); t += 1U; }
         }
     };
-    each_width(project_in);
+    if (!tiled_in()) each_width(project_in, strided_in);
     // Causal core. STRIX_GDN_PREFILL_ROWS=0 keeps the per-tile gates and the serial prepare/recurrence/norm
     // kernels; STRIX_GDN_PREFILL_CHECK=1 runs both on the same inputs and compares every written byte.
     static const bool rows_env = [] { const char* v = std::getenv("STRIX_GDN_PREFILL_ROWS"); return !v || v[0] != '0'; }();
     static const bool check = [] { const char* v = std::getenv("STRIX_GDN_PREFILL_CHECK"); return v && v[0] == '1'; }();
     const auto input_stride = gdn_prefill_input_stride(tiles);
     const bool rows = rows_env && input_stride && gdn_prefill_rows_shape(first, strided, count);
+    static const bool qpf2k_check = [] { const char* v = std::getenv("STRIX_QPF2K_GDN_CHECK"); return v && v[0] == '1'; }();
+    if (rows && qpf2k_check && qpf2k_gdn_parts() && !check) {
+        // The production row kernels on a snapshot of the inputs, then the qpf2k kernels on the same inputs.
+        const GdnPrefillSnapshot inputs(first, strided, count, false);
+        enqueue_gdn_prefill_core_rows(tiles, strided, input_stride, config, nullptr, 0U);
+        // With the fused core the v part of qkv keeps the raw projection values: compare q/k and every other output.
+        const std::uint64_t qkv_width = (qpf2k_gdn_parts() & 4U) ? std::uint64_t{first.key_heads} * 2U * first.head_dim : 0U;
+        const GdnPrefillSnapshot reference(first, strided, count, true, qkv_width);
+        inputs.restore();
+        enqueue_gdn_prefill_core_rows(tiles, strided, input_stride, config, nullptr);
+        const GdnPrefillSnapshot candidate(first, strided, count, true, qkv_width);
+        std::uint64_t differ = 0, mismatch = UINT64_MAX;
+        for (std::uint64_t i = 0; i < reference.bytes.size(); ++i)
+            if (reference.bytes[i] != candidate.bytes[i]) { ++differ; if (mismatch == UINT64_MAX) mismatch = i; }
+        std::fprintf(stderr, "QPF2K GDN check: layer-rows %u parts %u bytes %llu differ %llu first %lld\n", count, qpf2k_gdn_parts(),
+            static_cast<unsigned long long>(reference.bytes.size()), static_cast<unsigned long long>(differ),
+            mismatch == UINT64_MAX ? -1LL : static_cast<long long>(mismatch));
+        if (differ) throw std::runtime_error("qpf2k GDN prefill kernels differ from the production row kernels");
+        each_width(project_out, none);
+        return;
+    }
     if (!rows || !check) {
         if (rows) {
             if (fused_slot.codes) fused_a8 = &fused_slot;
             enqueue_gdn_prefill_core_rows(tiles, strided, input_stride, config, fused_a8);
         } else enqueue_gdn_prefill_core_tiles(tiles, strided, config);
-        each_width(project_out);
+        if (!tiled_out()) each_width(project_out, none);
         return;
     }
     const GdnPrefillSnapshot inputs(first, strided, count, false);
@@ -5085,7 +5526,7 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
         static_cast<unsigned long long>(reference.bytes.size()), static_cast<unsigned long long>(differ),
         mismatch == UINT64_MAX ? -1LL : static_cast<long long>(mismatch));
     if (differ) throw std::runtime_error("GDN prefill row kernels differ from the tile/serial kernels");
-    each_width(project_out);
+    if (!tiled_out()) each_width(project_out, none);
 }
 }  // namespace
 
@@ -5174,8 +5615,11 @@ void validate_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowR
         throw std::invalid_argument("GDN window requires 1..8 rows");
     if (!layer.qkv || !layer.z || !layer.beta || !layer.alpha || !layer.out || !layer.conv || !layer.dt || !layer.a || !layer.norm)
         throw std::invalid_argument("GDN window weights are missing");
-    if (layer.gate_type != 0U && layer.gate_type != 8U)
-        throw std::invalid_argument("GDN window beta/alpha must be F32 or Q8_0");
+    if (layer.gate_type != 0U && layer.gate_type != 8U && !(layer.gate_type == 30U && q8_rows::gsq_dense_enabled()))
+        throw std::invalid_argument("GDN window beta/alpha must be F32 or Q8_0 (BF16 for GSQ-RCO files)");
+    for (const auto type : {layer.qkv_type, layer.z_type, layer.out_type})
+        if (type != 8U && !(config.dense_a8_projections && q8_rows::dense_a8_type(type)))
+            throw std::invalid_argument("GDN window qkv/z/out must be Q8_0 (or GSQ dense types under dense A8)");
     (void)small_weight_kind(layer.conv_type); (void)small_weight_kind(layer.dt_type);
     (void)small_weight_kind(layer.a_type); (void)small_weight_kind(layer.norm_type);
     for (const auto& row : rows)
@@ -5202,10 +5646,11 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
     for (unsigned r = 0; r < Rows; ++r) x.input[r] = input[r].input;
     // qkv, z and Q8 beta/alpha share one q8_rows launch.
     GdnInputRowsSite<Rows> in{};
-    const bool q8_gates = layer.gate_type != 0U;
+    const bool q8_gates = layer.gate_type == 8U;
     in.segments = q8_gates ? q8_rows::segments({{layer.qkv, shape.conv_width}, {layer.z, shape.value_width},
         {layer.beta, shape.value_heads}, {layer.alpha, shape.value_heads}}) :
         q8_rows::segments({{layer.qkv, shape.conv_width}, {layer.z, shape.value_width}});
+    in.segments.types[0] = q8_rows::segment_type(layer.qkv_type); in.segments.types[1] = q8_rows::segment_type(layer.z_type);
     in.width = shape.hidden; in.outputs = in.segments.first[in.segments.count];
     for (unsigned r = 0; r < Rows; ++r) {
         in.input[r] = input[r].input;
@@ -5215,16 +5660,23 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
     check_hip(hipGetLastError(), "GDN window Q8 input projection launch");
     if (!q8_gates) {
         // Any-order (STRIX_ANYORDER=0 disables): the F32 gates read the same inputs as the Q8 projection queued
-        // just before and write only beta/gate, so they may run alongside it.
-        static const bool any_order = strix_any_order_enabled();
-        if (any_order)
-            hipExtLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_f32_gates_kernel<Rows>), dim3(shape.value_heads * 2U),
-                dim3(kProjectionThreads), 0, stream, nullptr, nullptr, hipExtAnyOrderLaunch, x,
-                static_cast<const float*>(layer.beta), static_cast<const float*>(layer.alpha), rows, shape.hidden,
-                shape.value_heads);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_f32_gates_kernel<Rows>), dim3(shape.value_heads * 2U),
-            dim3(kProjectionThreads), 0, stream, x, static_cast<const float*>(layer.beta),
-            static_cast<const float*>(layer.alpha), rows, shape.hidden, shape.value_heads);
+        // just before and write only beta/gate, so they may run alongside it. STRIX_GDN_GATES_ANYORDER=0|1
+        // (measurement) sets this launch alone.
+        static const bool any_order = [] {
+            const char* v = std::getenv("STRIX_GDN_GATES_ANYORDER");
+            return v && (v[0] == '0' || v[0] == '1') ? v[0] == '1' : strix_any_order_enabled();
+        }();
+        const auto gates = [&]<class Weight>() {
+            if (any_order)
+                hipExtLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_f32_gates_kernel<Rows, Weight>), dim3(shape.value_heads * 2U),
+                    dim3(kProjectionThreads), 0, stream, nullptr, nullptr, hipExtAnyOrderLaunch, x,
+                    static_cast<const Weight*>(layer.beta), static_cast<const Weight*>(layer.alpha), rows, shape.hidden,
+                    shape.value_heads);
+            else hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_window_f32_gates_kernel<Rows, Weight>), dim3(shape.value_heads * 2U),
+                dim3(kProjectionThreads), 0, stream, x, static_cast<const Weight*>(layer.beta),
+                static_cast<const Weight*>(layer.alpha), rows, shape.hidden, shape.value_heads);
+        };
+        if (layer.gate_type == 30U) gates.template operator()<std::uint16_t>(); else gates.template operator()<float>();
         check_hip(hipGetLastError(), "GDN window F32 gate projection launch");
     }
     }
@@ -5329,6 +5781,7 @@ void enqueue_gdn_window(const GdnWindowLayer& layer, std::span<const GdnWindowRo
     check_hip(hipGetLastError(), "GDN window gated RMSNorm launch");
     GdnOutputRowsSite<Rows> out{};
     out.segments = q8_rows::segments({{layer.out, shape.hidden}});
+    out.segments.types[0] = q8_rows::segment_type(layer.out_type);
     out.width = shape.value_width; out.outputs = shape.hidden;
     for (unsigned r = 0; r < Rows; ++r) { out.input[r] = rows.core[r]; out.output[r] = static_cast<std::uint16_t*>(input[r].output); }
     if (dense) q8_rows::launch_dense_a8_quantized(out, slot, stream);
@@ -5404,8 +5857,10 @@ GdnWindowBinding bind_gdn_window(std::span<const ExecutionDispatchContext> rows,
             reinterpret_cast<std::uint16_t*>(prepared[r].output.address), prepared[r].workspace.qkv};
     }
     const auto& row = prepared[0]; const auto& tensors = row.tensors;
-    if (tensors.qkv.manifest->ggml_type != 8U || tensors.z.manifest->ggml_type != 8U || tensors.out.manifest->ggml_type != 8U ||
-        tensors.beta.manifest->ggml_type != tensors.alpha.manifest->ggml_type)
+    const bool gsq_dense = config.gdn.dense_a8_projections && q8_rows::dense_a8_type(tensors.qkv.manifest->ggml_type) &&
+        q8_rows::dense_a8_type(tensors.z.manifest->ggml_type) && q8_rows::dense_a8_type(tensors.out.manifest->ggml_type);
+    if ((!gsq_dense && (tensors.qkv.manifest->ggml_type != 8U || tensors.z.manifest->ggml_type != 8U ||
+         tensors.out.manifest->ggml_type != 8U)) || tensors.beta.manifest->ggml_type != tensors.alpha.manifest->ggml_type)
         throw std::invalid_argument("GDN window requires Q8_0 qkv/z/out and one beta/alpha type");
     const auto& model = config.gdn.model;
     const auto layer = static_cast<std::uint64_t>(*rows[0].layer);
@@ -5419,6 +5874,8 @@ GdnWindowBinding bind_gdn_window(std::span<const ExecutionDispatchContext> rows,
     out.alpha = address(tensors.alpha); out.out = address(tensors.out); out.conv = address(tensors.conv);
     out.dt = address(tensors.dt); out.a = address(tensors.a); out.norm = address(tensors.norm);
     out.gate_type = tensors.beta.manifest->ggml_type; out.conv_type = tensors.conv.manifest->ggml_type;
+    out.qkv_type = tensors.qkv.manifest->ggml_type; out.z_type = tensors.z.manifest->ggml_type;
+    out.out_type = tensors.out.manifest->ggml_type;
     out.dt_type = tensors.dt.manifest->ggml_type; out.a_type = tensors.a.manifest->ggml_type;
     out.norm_type = tensors.norm.manifest->ggml_type;
     out.matrix = reinterpret_cast<float*>(row.matrix_state.address);
@@ -6224,6 +6681,9 @@ const void* wave8_island_input_symbol(std::uint32_t ggml_type) {
     case WeightKind::q8_0: return reinterpret_cast<const void*>(project_prefetch8_wave8_q8_bf16_to_fp32_kernel);
     case WeightKind::iq4_nl: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::iq4_nl>);
     case WeightKind::iq4_xs: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::iq4_xs>);
+#define STRIX_GGML_KIND_CASE(KIND, type) case WeightKind::KIND: return reinterpret_cast<const void*>(project_bf16_to_fp32_kernel<WeightKind::KIND>);
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE)
+#undef STRIX_GGML_KIND_CASE
     }
     throw std::invalid_argument("GDN island input projection type is unsupported");
 }

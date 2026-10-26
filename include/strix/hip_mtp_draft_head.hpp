@@ -43,6 +43,14 @@ public:
     // Head over the active rows for hidden BF16[hidden], then argmax into the
     // device token slot(step) and mapped token[step].
     void launch(const std::uint16_t* hidden,std::uint32_t step,void* stream);
+    // Multi-session draft batch. shared_rows: the number of leading compact rows holding the same ids in every
+    // head (same Q8 head, Q4 subset heads with the same hidden size and runner-up setting, no runner-up
+    // diagnostic), UINT32_MAX when the heads cannot be batched. launch_rows: launch() of every head at `step`
+    // as one batch on `stream` (rows [0, shared) read once for all heads); each head's logits, slot and reply
+    // equal its own launch() bit for bit. Each head's previous work must be ordered before `stream`.
+    [[nodiscard]] static std::uint32_t shared_rows(std::span<HipMtpDraftHead* const> heads);
+    static void launch_rows(std::span<HipMtpDraftHead* const> heads,std::span<const std::uint16_t* const> hidden,
+        std::uint32_t step,std::uint32_t shared,void* stream);
     [[nodiscard]] const std::uint32_t* device_token(std::uint32_t step) const;
     // Throws on a non-finite selected row; the caller already synchronized.
     [[nodiscard]] std::vector<std::uint32_t> read(std::uint32_t count) const;
@@ -56,7 +64,8 @@ public:
     // Waits until step's selection is published in the mapped reply (its last kernel stores a
     // completion count after the reply fields), polling instead of a stream synchronisation;
     // falls back to synchronising `stream` (and reports its errors) if the count does not
-    // arrive. Equivalent to synchronising before reading probability(step).
+    // arrive. Equivalent to synchronising before reading probability(step). `stream` is the stream carrying
+    // the step: the head's own, or the multi-session draft batch stream (launch_rows).
     void wait_step(std::uint32_t step,void* stream) const;
     // Sampled drafts: after wait_step(step), copy the active rows' logits to the host,
     // and replace the step's selection (device slot and mapped reply) before the

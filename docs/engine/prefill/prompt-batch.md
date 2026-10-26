@@ -1,6 +1,6 @@
 # Prompt groups: several requests' prompt blocks in one prefill run
 
-Opt-in (`STRIX_PROMPT_BATCH=1`) for the batched tiled MTP route (`--http-batch N`, cohort requests on the tiled
+On by default (`STRIX_PROMPT_BATCH=0` turns it off) for the batched tiled MTP route (`--http-batch N`, cohort requests on the tiled
 prompt with `STRIX_BATCH_INTERLEAVE=1`). Without it every prompt unit runs alone, as before.
 
 ## What runs together
@@ -41,9 +41,24 @@ to the prompt receipt next to the state digest).
 
 | Switch | Effect |
 | --- | --- |
-| `STRIX_PROMPT_BATCH=1` | Group the running prompts' blocks (default off) |
+| `STRIX_PROMPT_BATCH=0` | Run every prompt unit alone (default: group the running prompts' blocks) |
 | `STRIX_PROMPT_BATCH_ROWS=N` | Row budget of a group; above T, a dedicated group owner of N rows (multiple of 8, up to 8192) |
 | `STRIX_PROMPT_BATCH_SHARED=list` | Families run once for all segments (default `hc,router,moe,elementwise`) |
 
 Receipts: each request's tiled prompt receipt counts `grouped_blocks`; the cohort receipt adds `prompt_batch`
 (groups, grouped blocks and rows, group and prompt time).
+
+## Serial suffix as known-row windows
+
+After its tiled blocks a prompt has (n-1) mod 16 rows left (fewer than the smallest tail block). They used to run
+one serial row per step (~47 ms each on Qwen). With `STRIX_PROMPT_WINDOW` (default on, `=0` restores the serial
+rows) they run as known-row windows of 8, 4 and 2 rows on the request's verify-window owners (an odd row first runs
+serially): each window row's arithmetic is the serial row's (VERIFY_WINDOW_PLAN), every row is committed, and the
+predictor rows, held row and pending ticket are those the serial rows leave. Greedy requests only; a sampled request,
+or a window no owner admits, keeps the serial rows. With `STRIX_PROMPT_WINDOW_COHORT` (default on, `=0` runs each
+prompt's windows alone) the running prompts' next windows run in one stream of steps
+(`HipMtpWindowVerifier::prompt_rows_cohort`, chunks of up to eight rows sharing the weight-only steps as decode
+cohorts do); each prompt's window is the one it runs alone.
+
+Measured (Qwen one node, one replica `--http-batch 8`, tokens == each request alone):
+wall tok/s chat C1 67 -> 71, C4 77 -> 118, C8 76 -> 125; 8-category set C4 61 -> 101.

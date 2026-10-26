@@ -4,6 +4,7 @@
 #include <hip/hip_ext.h>
 #include <hip/hip_runtime.h>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -52,7 +53,7 @@ __device__ __forceinline__ float dot8(const unsigned char* row,unsigned feature,
     if constexpr(Q4) return q4_dot8(row,feature,x,sum); else return q8_dot8(row,feature,x,sum);
 }
 template<bool Q4>
-__global__ __launch_bounds__(256) void mtp_fast_gate_up(HipMtpFastMoeViews v) {
+__device__ __forceinline__ void mtp_fast_gate_up_body(const HipMtpFastMoeViews& v) {
     const unsigned slot=blockIdx.y,wave=threadIdx.x/32U,lane=threadIdx.x%32U,row=blockIdx.x*waves+wave;
     if(!slot && !blockIdx.x && threadIdx.x<routed &&
        (v.routes[threadIdx.x]>=experts || !isfinite(v.route_weights[threadIdx.x]))) atomicOr(v.status,1U);
@@ -91,9 +92,14 @@ __global__ __launch_bounds__(256) void mtp_fast_gate_up(HipMtpFastMoeViews v) {
     gs=wave_sum(gs);us=wave_sum(us);
     if(!lane) v.workspace[slot*inter+row]=(gs/(1.0F+expf(-gs)))*us;
 }
+template<bool Q4>
+__global__ __launch_bounds__(256) void mtp_fast_gate_up(HipMtpFastMoeViews v) {mtp_fast_gate_up_body<Q4>(v);}
+// Draft batch: token z runs the one-token kernel's blocks on its own views (same body, same bits).
+template<bool Q4>
+__global__ __launch_bounds__(256) void mtp_fast_gate_up_rows(HipMtpFastMoeRows v) {mtp_fast_gate_up_body<Q4>(v.views[blockIdx.z]);}
 // W waves per block (one output row each, as before) share one LDS copy of the activations.
 template<bool Q4,unsigned W=waves>
-__global__ __launch_bounds__(32U*W) void mtp_fast_down(HipMtpFastMoeViews v) {
+__device__ __forceinline__ void mtp_fast_down_body(const HipMtpFastMoeViews& v) {
     __shared__ float act[slots*inter];
     __shared__ float weight[slots];
     __shared__ const unsigned char* rows[slots];
@@ -117,6 +123,10 @@ __global__ __launch_bounds__(32U*W) void mtp_fast_down(HipMtpFastMoeViews v) {
     sum=wave_sum(sum);
     if(!lane) v.output[row]=to_bf16(sum);
 }
+template<bool Q4,unsigned W=waves>
+__global__ __launch_bounds__(32U*W) void mtp_fast_down(HipMtpFastMoeViews v) {mtp_fast_down_body<Q4,W>(v);}
+template<bool Q4,unsigned W=waves>
+__global__ __launch_bounds__(32U*W) void mtp_fast_down_rows(HipMtpFastMoeRows v) {mtp_fast_down_body<Q4,W>(v.views[blockIdx.z]);}
 template<bool InBf16,bool OutBf16,bool Q4=false>
 __global__ __launch_bounds__(256) void mtp_draft_q8_gemv(const void* input,const unsigned char* q8,std::uint32_t width,
     std::uint32_t rows,void* output) {
@@ -142,6 +152,74 @@ __global__ __launch_bounds__(256) void mtp_draft_q8_gemv(const void* input,const
     if constexpr(OutBf16) static_cast<std::uint16_t*>(output)[row]=to_bf16(sum);
     else static_cast<float*>(output)[row]=sum;
 }
+// Draft batch: mtp_draft_q8_gemv over Count tokens and up to three weight segments (rows of segment s
+// are outputs first[s]..first[s+1]-1, written to output[s][t]). The wave reads its weight row once and
+// runs every token's unchanged chain on it: per token the same column groups, the same codes and scale,
+// the same local/sum FMA order and the same wave tree as the one-token kernel.
+template<bool Q4> __device__ __forceinline__ void decode8(const unsigned char* row,unsigned feature,float& scale,float* codes) {
+    if constexpr(Q4) {
+        const auto* block=row+(feature/32U)*18U;
+        scale=__half2float(*reinterpret_cast<const __half*>(block));
+        const unsigned within=feature%32U,shift=within>=16U?4U:0U;
+        const auto* c=block+2U+(within&15U);
+#pragma unroll
+        for(unsigned i=0;i<8;++i) codes[i]=static_cast<float>(static_cast<int>((c[i]>>shift)&15U)-8);
+    } else {
+        const auto* block=row+(feature/32U)*34U;
+        scale=__half2float(*reinterpret_cast<const __half*>(block));
+        const auto* c=reinterpret_cast<const signed char*>(block+2U+feature%32U);
+#pragma unroll
+        for(unsigned i=0;i<8;++i) codes[i]=static_cast<float>(c[i]);
+    }
+}
+template<bool InBf16> __device__ __forceinline__ void load8(const void* input,unsigned base,float* x) {
+    if constexpr(InBf16) {
+        const uint4 bits=*reinterpret_cast<const uint4*>(static_cast<const std::uint16_t*>(input)+base);
+        const unsigned w[4]={bits.x,bits.y,bits.z,bits.w};
+#pragma unroll
+        for(unsigned i=0;i<4;++i) {x[2*i]=__uint_as_float(w[i]<<16U);x[2*i+1]=__uint_as_float(w[i]&0xffff0000U);}
+    } else {
+        const auto* f=static_cast<const float*>(input)+base;
+#pragma unroll
+        for(unsigned i=0;i<8;++i) x[i]=f[i];
+    }
+}
+// Tokens come in groups of Count per block (blockIdx.y = group of `total` tokens), bounding the accumulators.
+template<bool InBf16,bool OutBf16,bool Q4,unsigned Count>
+__global__ __launch_bounds__(256) void mtp_draft_q8_gemv_rows(HipMtpDraftGemvRows g,std::uint32_t width,unsigned total) {
+    const unsigned lane=threadIdx.x%32U,output=blockIdx.x*waves+threadIdx.x/32U;
+    if(output>=g.first[g.segments]) return;
+    const unsigned first=blockIdx.y*Count,valid=total-first<Count?total-first:Count;
+    unsigned segment=0;
+    while(output>=g.first[segment+1U]) ++segment;
+    const unsigned row=output-g.first[segment];
+    const auto* r=static_cast<const unsigned char*>(g.weights[segment])+static_cast<std::uint64_t>(row)*(width/32U)*block_bytes<Q4>;
+    float sum[Count];
+#pragma unroll
+    for(unsigned t=0;t<Count;++t) sum[t]=0.0F;
+    for(unsigned base=8U*lane;base<width;base+=256U) {
+        float scale,codes[8];
+        decode8<Q4>(r,base,scale,codes);
+#pragma unroll
+        for(unsigned t=0;t<Count;++t) {
+            float x[8];
+            load8<InBf16>(g.input[first+(t<valid?t:0U)],base,x);
+            float local=0.0F;
+#pragma unroll
+            for(unsigned i=0;i<8;++i) local=fmaf(codes[i],x[i],local);
+            sum[t]=fmaf(scale,local,sum[t]);
+        }
+    }
+#pragma unroll
+    for(unsigned t=0;t<Count;++t) sum[t]=wave_sum(sum[t]);
+    if(lane) return;
+#pragma unroll
+    for(unsigned t=0;t<Count;++t) {
+        if(t>=valid) break;
+        if constexpr(OutBf16) static_cast<std::uint16_t*>(g.output[segment][first+t])[row]=to_bf16(sum[t]);
+        else static_cast<float*>(g.output[segment][first+t])[row]=sum[t];
+    }
+}
 // Q8_0 -> Q4_0 per 32-block, the draft head's rule: d=signed max/-8, q=min(15, v/d+8.5).
 __global__ void mtp_q8_to_q4(const unsigned char* q8,std::uint64_t blocks,unsigned char* q4) {
     const auto b=static_cast<std::uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x;if(b>=blocks) return;
@@ -166,6 +244,12 @@ __global__ void mtp_dequantize_q8(const unsigned char* q8,std::uint64_t elements
     const auto i=static_cast<std::uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x;if(i>=elements) return;
     const auto* block=q8+(i/32U)*34U;
     output[i]=__half2float(*reinterpret_cast<const __half*>(block))*static_cast<float>(static_cast<signed char>(block[2U+i%32U]));
+}
+// STRIX_MTP_DOWN_WAVES=8|16|32: output rows (waves) per block sharing the activation copy.
+unsigned fast_down_waves() {
+    static const unsigned n=[]{const char* e=std::getenv("STRIX_MTP_DOWN_WAVES");
+        const unsigned v=e?static_cast<unsigned>(std::atoi(e)):16U;return v==8U||v==32U?v:16U;}();
+    return n;
 }
 } // namespace
 void launch_hip_mtp_dequantize_q8(const void* q8,std::uint64_t elements,float* output,void* stream) {
@@ -215,6 +299,73 @@ void launch_hip_mtp_draft_q8_gemv(const void* input,bool input_bf16,const void* 
     else start(mtp_draft_q8_gemv<false,false>,w);
     check(hipGetLastError(),"MTP draft Q8 GEMV launch");
 }
+void launch_hip_mtp_draft_q8_gemv_rows(const HipMtpDraftGemvRows& rows,std::uint32_t count,bool input_bf16,std::uint32_t width,
+    bool output_bf16,void* stream) {
+    if(!count || count>hip_mtp_draft_batch_rows || !rows.segments || rows.segments>3U || !stream || !width || width%32U ||
+       rows.first[0]!=0U)
+        throw std::invalid_argument("MTP draft batch GEMV geometry is invalid");
+    HipMtpDraftGemvRows q4=rows;
+    bool all_q4=true,any_q4=false;
+    for(unsigned s=0;s<rows.segments;++s) {
+        if(!rows.weights[s] || rows.first[s+1U]<=rows.first[s] || reinterpret_cast<std::uintptr_t>(rows.weights[s])%2U)
+            throw std::invalid_argument("MTP draft batch GEMV segment is invalid");
+        q4.weights[s]=hip_mtp_draft_q4(rows.weights[s]);all_q4=all_q4 && q4.weights[s];any_q4=any_q4 || q4.weights[s];
+        for(unsigned t=0;t<count;++t) if(!rows.output[s][t]) throw std::invalid_argument("MTP draft batch GEMV output is missing");
+    }
+    for(unsigned t=0;t<count;++t)
+        if(!rows.input[t] || reinterpret_cast<std::uintptr_t>(rows.input[t])%(input_bf16?16U:4U))
+            throw std::invalid_argument("MTP draft batch GEMV input is invalid");
+    // Same weights as the one-token launcher (which decides per tensor): a segment set mixing Q4 copies
+    // and Q8 weights is refused rather than guessed.
+    if(any_q4 && !all_q4) throw std::invalid_argument("MTP draft batch GEMV segments mix Q4 copies and Q8 weights");
+    const auto& g=all_q4?q4:rows;
+    // STRIX_MTP_DRAFT_BATCH_GEMV_GROUP=1..8: tokens per block (default 4); larger groups are split across grid.y.
+    static const unsigned group=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_BATCH_GEMV_GROUP");
+        const unsigned n=v?static_cast<unsigned>(std::atoi(v)):4U;return n>=1U&&n<=8U?n:4U;}();
+    const auto per=std::min(group,count);
+    const auto s=static_cast<hipStream_t>(stream);const dim3 grid((rows.first[rows.segments]+waves-1U)/waves,(count+per-1U)/per);
+    const auto run=[&]<bool Q4,unsigned C>() {
+        if(input_bf16 && output_bf16) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_draft_q8_gemv_rows<true,true,Q4,C>),grid,dim3(256),0,s,g,width,count);
+        else if(input_bf16) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_draft_q8_gemv_rows<true,false,Q4,C>),grid,dim3(256),0,s,g,width,count);
+        else if(output_bf16) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_draft_q8_gemv_rows<false,true,Q4,C>),grid,dim3(256),0,s,g,width,count);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_draft_q8_gemv_rows<false,false,Q4,C>),grid,dim3(256),0,s,g,width,count);
+    };
+    const auto by_count=[&]<bool Q4>() {
+        switch(per) {
+        case 1:run.template operator()<Q4,1U>();break;case 2:run.template operator()<Q4,2U>();break;
+        case 3:run.template operator()<Q4,3U>();break;case 4:run.template operator()<Q4,4U>();break;
+        case 5:run.template operator()<Q4,5U>();break;case 6:run.template operator()<Q4,6U>();break;
+        case 7:run.template operator()<Q4,7U>();break;default:run.template operator()<Q4,8U>();break;
+        }
+    };
+    if(all_q4) by_count.template operator()<true>(); else by_count.template operator()<false>();
+    check(hipGetLastError(),"MTP draft batch GEMV launch");
+}
+void launch_hip_mtp_fast_moe_rows(std::span<const HipMtpFastMoeViews> views,void* stream) {
+    if(views.empty() || views.size()>hip_mtp_draft_batch_rows || !stream) throw std::invalid_argument("MTP fast MoE batch size is invalid");
+    HipMtpFastMoeRows q4{};bool all_q4=true;
+    for(std::size_t t=0;t<views.size();++t) {
+        const auto& v=views[t];
+        if(!v.input || !v.routes || !v.route_weights || !v.gate || !v.up || !v.down || !v.shared_gate || !v.shared_up ||
+           !v.shared_down || !v.shared_scalar || !v.workspace || !v.output || !v.status || reinterpret_cast<std::uintptr_t>(v.input)%16U)
+            throw std::invalid_argument("MTP fast MoE batch views are incomplete or misaligned");
+        auto c=v;
+        c.gate=hip_mtp_draft_q4(v.gate);c.up=hip_mtp_draft_q4(v.up);c.down=hip_mtp_draft_q4(v.down);
+        c.shared_gate=hip_mtp_draft_q4(v.shared_gate);c.shared_up=hip_mtp_draft_q4(v.shared_up);c.shared_down=hip_mtp_draft_q4(v.shared_down);
+        all_q4=all_q4 && c.gate && c.up && c.down && c.shared_gate && c.shared_up && c.shared_down;
+        q4.views[t]=c;
+    }
+    // The batch runs only the production Q4 form (the one-token launcher's first branch).
+    if(!all_q4) throw std::invalid_argument("MTP fast MoE batch needs the registered Q4 copies");
+    const auto s=static_cast<hipStream_t>(stream);const auto n=static_cast<unsigned>(views.size());
+    hipLaunchKernelGGL(mtp_fast_gate_up_rows<true>,dim3((inter+waves)/waves,slots,n),dim3(256),0,s,q4);
+    check(hipGetLastError(),"MTP fast Q4 gate/up batch launch");
+    const unsigned down_waves=fast_down_waves();
+    if(down_waves==32U) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_fast_down_rows<true,32U>),dim3(hidden/32U,1,n),dim3(1024),0,s,q4);
+    else if(down_waves==16U) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_fast_down_rows<true,16U>),dim3(hidden/16U,1,n),dim3(512),0,s,q4);
+    else hipLaunchKernelGGL(mtp_fast_down_rows<true>,dim3(hidden/waves,1,n),dim3(256),0,s,q4);
+    check(hipGetLastError(),"MTP fast Q4 down batch launch");
+}
 void launch_hip_mtp_fast_moe(const HipMtpFastMoeViews& v,void* stream) {
     if(!v.input || !v.routes || !v.route_weights || !v.gate || !v.up || !v.down || !v.shared_gate || !v.shared_up ||
        !v.shared_down || !v.shared_scalar || !v.workspace || !v.output || !v.status || !stream ||
@@ -227,9 +378,7 @@ void launch_hip_mtp_fast_moe(const HipMtpFastMoeViews& v,void* stream) {
     if(q4.gate && q4.up && q4.down && q4.shared_gate && q4.shared_up && q4.shared_down) {
         hipLaunchKernelGGL(mtp_fast_gate_up<true>,dim3((inter+waves)/waves,slots),dim3(256),0,s,q4);
         check(hipGetLastError(),"MTP fast Q4 gate/up launch");
-        // STRIX_MTP_DOWN_WAVES=8|16|32: output rows (waves) per block sharing the activation copy.
-        static const unsigned down_waves=[]{const char* e=std::getenv("STRIX_MTP_DOWN_WAVES");
-            const unsigned n=e?static_cast<unsigned>(std::atoi(e)):16U;return n==8U||n==32U?n:16U;}();
+        const unsigned down_waves=fast_down_waves();
         if(down_waves==32U) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_fast_down<true,32U>),dim3(hidden/32U),dim3(1024),0,s,q4);
         else if(down_waves==16U) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_fast_down<true,16U>),dim3(hidden/16U),dim3(512),0,s,q4);
         else hipLaunchKernelGGL(mtp_fast_down<true>,dim3(hidden/waves),dim3(256),0,s,q4);

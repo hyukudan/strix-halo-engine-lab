@@ -43,7 +43,23 @@ endif()
 if(STRIX_ENABLE_CUDA_TRELLIS AND (NOT STRIX_ENABLE_CUDA_DS41 OR NOT STRIX_FAMILY_DEEPSEEK41))
     message(FATAL_ERROR "STRIX_ENABLE_CUDA_TRELLIS requires STRIX_ENABLE_CUDA_DS41 and STRIX_FAMILY_DEEPSEEK41")
 endif()
+option(STRIX_EXPERIMENTAL_MALL_SHARED_DOWN_NT "Use non-temporal Q8_0 weight loads in shared-expert dense-A8 decode down projections" OFF)
+if(STRIX_EXPERIMENTAL_MALL_SHARED_DOWN_NT)
+    if(NOT STRIX_ENABLE_HIP_RUNTIME)
+        message(FATAL_ERROR "MALL shared down pilot requires HIP runtime support")
+    endif()
+    set_property(SOURCE src/hip_shared_expert_launcher.hip APPEND PROPERTY COMPILE_DEFINITIONS STRIX_EXPERIMENTAL_MALL_SHARED_DOWN_NT=1)
+endif()
 option(STRIX_USE_OPENSSL_SHA256 "Use OpenSSL for full-file SHA-256 verification" OFF)
+option(STRIX_CHECK_KERNEL_SCRATCH "Fail the build when a kernel's private scratch/spills exceed tools/kernel_scratch_allowance.txt" OFF)
+# Post-build check of every amdgcn code object linked into target (tools/check_kernel_scratch.py).
+function(strix_check_kernel_scratch target)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tools/check_kernel_scratch.py --quiet
+            --allowance ${CMAKE_SOURCE_DIR}/tools/kernel_scratch_allowance.txt $<TARGET_FILE:${target}>
+        COMMENT "Kernel scratch/spill check: ${target}" VERBATIM)
+endfunction()
 option(STRIX_ENABLE_EXPERIMENTAL_DENSE_TRELLIS "Build the explicit experimental dense trellis pack route" OFF)
 option(STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE "Build standalone experimental Q4K A8G32 HIP probe" OFF)
 option(STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME "Build opt-in native Q4K A8G32 gate/up integration" OFF)
@@ -188,6 +204,7 @@ add_library(strix_core STATIC
     src/indexed_attention_workspace.cpp
     src/indexed_attention_state.cpp
     src/iq4_nl.cpp
+    src/ggml_dequant.cpp
     src/q6p_registry.cpp
     src/launch_dispatch.cpp
     src/low_precision.cpp
@@ -198,6 +215,8 @@ add_library(strix_core STATIC
     src/mtp_draft_contract.cpp
     src/mtp_draft_qualification.cpp
     src/mtp_ngram_draft.cpp
+    src/mtp_frame_draft.cpp
+    src/mtp_context_draft.cpp
     src/mtp_draft_tensor_audit.cpp
     src/mtp_draft_state_contract.cpp
     src/mtp_draft_state_memory.cpp
@@ -264,6 +283,8 @@ add_library(strix_core STATIC
     src/ple_lookup.cpp
     src/ple_workspace.cpp
     src/prefix_state_cache.cpp
+    src/rtx_state_import.cpp
+    src/bp_codec.cpp
     src/transport.cpp
 )
 endif()
@@ -280,7 +301,7 @@ if(STRIX_CUDA_DS41_ONLY)
     include(CTest)
 else()
 if(NOT MSVC)
-    set_source_files_properties(src/low_precision.cpp src/projection_reduction.cpp src/integer_projection.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    set_source_files_properties(src/low_precision.cpp src/projection_reduction.cpp src/integer_projection.cpp src/ggml_dequant.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 else()
     set_source_files_properties(src/low_precision.cpp src/projection_reduction.cpp src/integer_projection.cpp PROPERTIES COMPILE_OPTIONS "/fp:strict")
 endif()
@@ -321,6 +342,8 @@ target_link_libraries(strix-mtp-manifest-audit PRIVATE strix_core)
 strix_target_warnings(strix-mtp-manifest-audit)
 
 add_executable(strix-model-manifest apps/model_manifest_main.cpp)
+add_executable(strix-gsq-content-identity lab/gsq/content_identity.cpp)
+target_link_libraries(strix-gsq-content-identity PRIVATE strix_core)
 target_link_libraries(strix-model-manifest PRIVATE strix_core)
 strix_target_warnings(strix-model-manifest)
 
@@ -438,6 +461,16 @@ if(BUILD_TESTING)
     target_link_libraries(strix-prefix-state-cache-tests PRIVATE strix_core)
     strix_target_warnings(strix-prefix-state-cache-tests)
     add_test(NAME strix-prefix-state-cache-tests COMMAND strix-prefix-state-cache-tests)
+
+    add_executable(strix-rtx-state-import-tests tests/rtx_state_import_tests.cpp)
+    target_include_directories(strix-rtx-state-import-tests PRIVATE apps)
+    target_link_libraries(strix-rtx-state-import-tests PRIVATE strix_core strix_serve)
+    strix_target_warnings(strix-rtx-state-import-tests)
+    add_test(NAME strix-rtx-state-import-tests COMMAND strix-rtx-state-import-tests)
+    add_executable(strix-bp-codec-tests tests/bp_codec_tests.cpp)
+    target_link_libraries(strix-bp-codec-tests PRIVATE strix_core strix_serve)
+    strix_target_warnings(strix-bp-codec-tests)
+    add_test(NAME strix-bp-codec-tests COMMAND strix-bp-codec-tests)
 
     add_executable(strix-known-prompt-chunks-tests tests/known_prompt_chunks_tests.cpp)
     target_link_libraries(strix-known-prompt-chunks-tests PRIVATE strix_core)
@@ -1200,6 +1233,16 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-mtp-ngram-draft-tests)
     add_test(NAME strix-mtp-ngram-draft-tests COMMAND strix-mtp-ngram-draft-tests)
 
+    add_executable(strix-mtp-frame-draft-tests tests/mtp_frame_draft_tests.cpp)
+    target_link_libraries(strix-mtp-frame-draft-tests PRIVATE strix_core)
+    strix_target_warnings(strix-mtp-frame-draft-tests)
+    add_test(NAME strix-mtp-frame-draft-tests COMMAND strix-mtp-frame-draft-tests)
+
+    add_executable(strix-mtp-context-draft-tests tests/mtp_context_draft_tests.cpp)
+    target_link_libraries(strix-mtp-context-draft-tests PRIVATE strix_core)
+    strix_target_warnings(strix-mtp-context-draft-tests)
+    add_test(NAME strix-mtp-context-draft-tests COMMAND strix-mtp-context-draft-tests)
+
     add_executable(strix-mtp-draft-activation-tests tests/mtp_draft_activation_tests.cpp)
     target_link_libraries(strix-mtp-draft-activation-tests PRIVATE strix_core)
     strix_target_warnings(strix-mtp-draft-activation-tests)
@@ -1449,6 +1492,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             target_compile_options(strix-hip-moe-wmma-prefill-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-moe-wmma-prefill-tests)
             add_test(NAME strix-hip-moe-wmma-prefill-tests COMMAND strix-hip-moe-wmma-prefill-tests)
+            add_test(NAME strix-hip-moe-prefill-schedule-tests COMMAND strix-hip-moe-wmma-prefill-tests schedule)
+            add_test(NAME strix-hip-moe-prefill-gsq-tests COMMAND strix-hip-moe-wmma-prefill-tests gsq)
             add_executable(strix-hip-q4k-a8-probe-tests tests/hip_moe_q4k_a8_probe_tests.hip $<TARGET_OBJECTS:strix_q4k_a8_dot4_compile_probe>)
             target_link_libraries(strix-hip-q4k-a8-probe-tests PRIVATE strix_q4k_a8_hip_probe strix_core)
             set_target_properties(strix-hip-q4k-a8-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
@@ -1461,6 +1506,12 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             target_compile_options(strix-hip-q5k-a8-probe-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
             strix_target_warnings(strix-hip-q5k-a8-probe-tests)
             add_test(NAME strix-hip-q5k-a8-probe-tests COMMAND strix-hip-q5k-a8-probe-tests)
+            add_executable(strix-hip-q20-a8-probe-tests tests/hip_moe_q20_a8_probe_tests.hip)
+            target_link_libraries(strix-hip-q20-a8-probe-tests PRIVATE strix_q4k_a8_hip_probe strix_q4k_a8_contract strix_core strix_hip_runtime)
+            set_target_properties(strix-hip-q20-a8-probe-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+            target_compile_options(strix-hip-q20-a8-probe-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+            strix_target_warnings(strix-hip-q20-a8-probe-tests)
+            add_test(NAME strix-hip-q20-a8-probe-tests COMMAND strix-hip-q20-a8-probe-tests)
         endif()
     endif()
 
@@ -1572,7 +1623,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_QSA_GQA_REUSE_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_QPERSIST_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_MOE_BATCHED_ACTIVATION_DIAGNOSTIC=1)
-        foreach(mtp_fixture input-fusion forward-replay target-checkpoint draft-head fast-draft)
+        foreach(mtp_fixture input-fusion forward-replay target-checkpoint draft-head fast-draft draft-batch)
             string(REPLACE "-" "_" mtp_fixture_file "${mtp_fixture}")
             add_executable(strix-hip-mtp-${mtp_fixture}-tests tests/hip_mtp_${mtp_fixture_file}_tests.hip)
             target_link_libraries(strix-hip-mtp-${mtp_fixture}-tests PRIVATE strix_hip_runtime)
@@ -1637,6 +1688,9 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     )
     target_compile_options(strix-hip-decode-token PRIVATE
         "SHELL:-include \"${CMAKE_CURRENT_SOURCE_DIR}/include/strix/hip_runtime_telemetry.hpp\"")
+    if(STRIX_CHECK_KERNEL_SCRATCH)
+        strix_check_kernel_scratch(strix-hip-decode-token)
+    endif()
     if(BUILD_TESTING)
         # Same actual model/PLE/asset/replay setup as the decoder. External
         # references and the serial-oracle prefix diagnostic have separate
@@ -2034,6 +2088,25 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-dense-a8-wmma-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-dense-a8-wmma-tests)
         add_test(NAME strix-hip-dense-a8-wmma-tests COMMAND strix-hip-dense-a8-wmma-tests)
+        add_executable(strix-hip-gsq-dense-a8-tests tests/hip_gsq_dense_a8_tests.hip)
+        set_target_properties(strix-hip-gsq-dense-a8-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_compile_options(strix-hip-gsq-dense-a8-tests PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-gsq-dense-a8-tests PRIVATE strix_hip_runtime strix_core)
+        strix_target_warnings(strix-hip-gsq-dense-a8-tests)
+        add_test(NAME strix-hip-gsq-dense-a8-tests COMMAND strix-hip-gsq-dense-a8-tests)
+        add_test(NAME strix-hip-prefill-dense-schedule-tests COMMAND ${CMAKE_COMMAND} -E env
+            STRIX_INTPREFILL_GATES=1 $<TARGET_FILE:strix-hip-dense-a8-wmma-tests>)
+        # Whole-T register-blocked dense FP16 projections (STRIX_QPF2K_DENSE=1) == launch_dense_f16, bitwise.
+        add_executable(strix-hip-dense-f16-tiled-tests tests/hip_dense_f16_tiled_tests.hip)
+        set_target_properties(strix-hip-dense-f16-tiled-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_compile_options(strix-hip-dense-f16-tiled-tests PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-dense-f16-tiled-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-dense-f16-tiled-tests)
+        add_test(NAME strix-hip-dense-f16-tiled-tests COMMAND strix-hip-dense-f16-tiled-tests)
 
         if(STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
             add_executable(strix-hip-moe-q4k-a8-known-rows-tests tests/hip_moe_q4k_a8_known_rows_tests.hip)
@@ -2257,6 +2330,13 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                      COMMAND strix-hip-moe-kquant-tests ${mode})
         endforeach()
 
+        add_executable(strix-hip-ggml-weight-formats-tests tests/hip_ggml_weight_formats_tests.hip)
+        set_target_properties(strix-hip-ggml-weight-formats-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-ggml-weight-formats-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-ggml-weight-formats-tests)
+        add_test(NAME strix-hip-ggml-weight-formats-tests COMMAND strix-hip-ggml-weight-formats-tests)
+
         add_executable(strix-hip-gdn-output-projection-tests tests/hip_gdn_output_projection_tests.hip)
         target_link_libraries(strix-hip-gdn-output-projection-tests PRIVATE strix_hip_runtime)
         set_target_properties(strix-hip-gdn-output-projection-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
@@ -2372,6 +2452,11 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-qpersist-attention-tests PRIVATE strix_hip_runtime)
         strix_target_warnings(strix-hip-qpersist-attention-tests)
         add_test(NAME strix-hip-qpersist-attention-tests COMMAND strix-hip-qpersist-attention-tests)
+        add_executable(strix-hip-draft-attention-exact-tests tests/hip_draft_attention_exact_tests.hip)
+        set_target_properties(strix-hip-draft-attention-exact-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-draft-attention-exact-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-draft-attention-exact-tests)
+        add_test(NAME strix-hip-draft-attention-exact-tests COMMAND strix-hip-draft-attention-exact-tests)
         add_executable(strix-hip-qsa-gqa-reuse-diagnostic-tests tests/hip_qsa_gqa_reuse_diagnostic_tests.hip)
         set_target_properties(strix-hip-qsa-gqa-reuse-diagnostic-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
         target_link_libraries(strix-hip-qsa-gqa-reuse-diagnostic-tests PRIVATE strix_hip_runtime)

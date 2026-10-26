@@ -77,6 +77,21 @@ void expert_selection_contract() {
         expect(relative % page == t.absolute_offset % page && relative <= selected.arena_bytes &&
             t.byte_size <= selected.arena_bytes - relative);
     }
+    // all (STRIX_MODEL_COPY_ALL): every local tensor except unpromoted file-backed candidates, page congruent.
+    const auto all_payload = selective_copy_payload_bytes(manifest, HipModelCopyTier::all);
+    expect(all_payload == 17 + 12320 + 31 + 12336 + 128 + 128);
+    const auto every = build_selective_copy_plan(manifest, policy(HipModelCopyTier::all, all_payload), file_bytes, page);
+    expect(every.tensors == std::vector<std::uint32_t>({0, 1, 2, 3, 6, 7}) && every.payload_bytes == all_payload);
+    for (const auto index : every.tensors) {
+        const auto& t = manifest.tensors[index];
+        const auto range = std::find_if(every.ranges.begin(), every.ranges.end(), [&](const auto& r) {
+            return r.file_begin <= t.absolute_offset && t.byte_size <= r.file_end - t.absolute_offset;
+        });
+        expect(range != every.ranges.end() &&
+            (range->arena_offset + t.absolute_offset - range->file_begin) % page == t.absolute_offset % page);
+    }
+    auto gapped = policy(HipModelCopyTier::all, all_payload); gapped.coalesce_gap_bytes = 4096;
+    rejects([&] { (void)build_selective_copy_plan(manifest, gapped, file_bytes, page); });
     for (const auto role : {TensorRole::unknown, TensorRole::embedding, TensorRole::output_head,
         TensorRole::normalization, TensorRole::attention_projection, TensorRole::dense_projection,
         TensorRole::moe_router, TensorRole::recurrent_state, TensorRole::sparse_index,

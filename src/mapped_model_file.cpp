@@ -2,6 +2,7 @@
 
 #include "strix/model_content_hash.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <limits>
 #include <stdexcept>
@@ -218,6 +219,16 @@ void MappedModelFile::validate_unchanged() const {
     throw std::runtime_error("mapped model file validation requires native Linux");
 #endif
 }
+void MappedModelFile::advise_dontneed(std::uint64_t byte_offset, std::uint64_t bytes) const noexcept {
+#if defined(__linux__)
+    if (fd_ >= 0 && bytes && byte_offset < bytes_)
+        (void)::posix_fadvise(fd_, static_cast<off_t>(byte_offset), static_cast<off_t>(std::min(bytes, bytes_ - byte_offset)),
+            POSIX_FADV_DONTNEED);
+#else
+    (void)byte_offset; (void)bytes;
+#endif
+}
+
 void MappedModelFile::read_at(
     std::uint64_t byte_offset,
     std::span<std::byte> destination) const {

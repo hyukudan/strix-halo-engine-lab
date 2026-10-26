@@ -3,6 +3,7 @@
 #include "strix/launch_dispatch.hpp"
 #include "strix/serial_session.hpp"
 #include "strix/token_sampling.hpp"
+#include <optional>
 #include <span>
 namespace strix {
 class HipMtpTargetHidden;
@@ -27,6 +28,8 @@ public:
     [[nodiscard]] std::uint32_t predicted_token() const;
     [[nodiscard]] const SerialSessionContext& committed_session() const;
     [[nodiscard]] ModelContentIdentity target_content_identity() const;
+    // STRIX_SERIAL_LOGITS_DIGEST=1: the serial row's FP32 logits digest (else empty; window and block rows: empty).
+    [[nodiscard]] std::optional<ModelContentIdentity> serial_logits_digest() const;
     // Execution identity of the serial execution that produced this row (a window ticket
     // reports its committed session's executor).
     [[nodiscard]] std::uint64_t producer_execution_identity() const;
@@ -76,6 +79,11 @@ public:
         std::shared_ptr<const HipMtpTargetWindowBatch>,const HipMtpTargetHiddenTicket& base,
         const SerialSessionContext& actual_target,std::span<const std::uint32_t> eos_tokens,
         std::uint32_t output_budget);
+    // Known prompt rows (HipMtpWindowVerifier::prompt_rows): every row of a deferred-state window whose inputs were
+    // the prompt's own tokens, committed whole (target.next_position is the window's end). Each row's arithmetic is
+    // the serial row's; unlike accept_verified_prefix no input needs to equal its predecessor's prediction.
+    [[nodiscard]] std::vector<HipMtpTargetHiddenTicket> accept_known_rows(
+        std::shared_ptr<const HipMtpTargetWindowBatch> batch,const SerialSessionContext& target);
     HipMtpTargetHidden(const HipMtpTargetHidden&)=delete;
     HipMtpTargetHidden& operator=(const HipMtpTargetHidden&)=delete;
     // With a token sampler, the row's selection is the sampled decision for the

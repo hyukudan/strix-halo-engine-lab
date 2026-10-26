@@ -178,6 +178,19 @@ public:
     virtual void execute_state_rows(std::span<const std::uint32_t>, std::uint64_t) {
         throw std::invalid_argument("known prompt backend does not support state-only windows");
     }
+    // STRIX_QPF2K_SCHED bit 2: a state-only block that the caller follows with another block of this backend (which
+    // completes it) or with finish_deferred(); default: the plain state-only block.
+    virtual void execute_state_rows_deferred(std::span<const std::uint32_t> tokens, std::uint64_t position) {
+        execute_state_rows(tokens, position);
+    }
+    virtual void finish_deferred() {}
+    // STRIX_QPF2K_SCHED bit 4: a block of the first tokens.size() rows of a tiled backend (16..T rows, a multiple of 8).
+    [[nodiscard]] virtual std::vector<float> execute_rows_partial(std::span<const std::uint32_t>, std::uint64_t) {
+        throw std::invalid_argument("known prompt backend does not support partial blocks");
+    }
+    virtual void execute_state_rows_partial(std::span<const std::uint32_t>, std::uint64_t, bool) {
+        throw std::invalid_argument("known prompt backend does not support partial blocks");
+    }
 };
 
 struct KnownPromptGreedyRequest {

@@ -103,5 +103,41 @@ The receipt's `mtp_ngram_draft` counts proposal cycles, extended cycles, extensi
 and `shadow_right_rows` their leading rows equal to the emitted tokens, i.e. the rows an always-open
 extension would have had accepted.
 
+### Context copy/n-gram drafter (`ctx`, `copy`)
+
+`--mtp-ngram-draft=ctx` or `=copy` (experimental, never a default) replaces the extension above with the context
+drafter of D-065; both are required like `on` (same admission) and the target still verifies every row. `ctx`:
+the longest exact suffix of 2 to 16 tokens of prompt + output + kept drafts, majority continuation, a
+per-request learned gate from a 0.75 prior that each row must pass together with the window's min-p threshold,
+proposals also after an empty confident prefix. `copy` adds: a context span anchored on four tokens or more
+replaces the confident MTP chain when its expected accepted rows exceed the chain's, and a span that already
+passes the gate before drafting, and is expected to deliver more accepted rows than the request's MTP cycles
+(moving average), supplies the whole chain without predictor forwards (the predictor cache is
+rebuilt from the committed target rows, as for any rejected draft). The receipt's `mtp_ngram_draft` then has
+`mode`, `selected_cycles`/`selected_rows` (passed the gate), `copy_first_cycles`, `copy_first_declined`, `replaced_cycles`, and
+`extended_cycles`/`extension_rows`/`accepted_rows` counted from completed verification. The model qualification
+binary checks real cycles against the serial oracle with `STRIX_MTP_COPY_GATE=ctx|copy` together with
+`--qualification-prefix-gate` (tokens, full-vocabulary logits and committed state at every emitted row).
+
 It helps requests that copy their context (correcting or editing a given document, code edits); on free
 prose, summaries and answers the gate stays closed and nothing changes. Cohort cycles do not use it.
+
+Wide copy verify (opt-in, `--mtp-copy-wide-rows 32`, `16` or `32,16`; absent or 0 = off): with `copy` on the tiled
+MTP prompt and one numerical profile (no split `--prefill-numerical-profile`), single requests only. A cycle whose
+anchor is unanimous, at least eight tokens long, continues for N-1 context tokens without an edited context token and
+whose learned 8+-token unanimous acceptance cells (rows 0, 1-2, 3+) are all at least 0.9 verifies those tokens in one
+N-row forward of the N-row tiled tail owner instead of the 8-row window; listed sizes are tried largest first (a
+span too short or cut by an edit for 32 may still fill 16). Every listed size needs a tail owner (all-rows heads and
+the multi-row head; `--known-prefix-tail-rows` must include each, the default tail set adds them); the sizes share
+one state snapshot. Rows are selected by the target's finite first-max rule; a full acceptance keeps the N committed
+rows and adopts the last as the pending row. A rejection (or an EOS before the last row) abandons the wide cycle: the
+snapshotted recurrent/convolution state and the session are restored, nothing is committed, the predictor is
+untouched, the drafter scores the proposal as a shadow (its rejected row lowers the long-unanimous cells), and the
+ordinary cycle runs instead (copy-first windows re-cover the accepted prefix); no wide cycle of any size is proposed
+again until the committed frontier passes the rejected row. The receipt adds `wide_rows` (the largest size),
+`wide_cycles`, `wide_rows_accepted` (committed wide cycles), `wide_abandoned`, `wide_abandoned_rows_wasted`,
+`wide_ms_committed`, `wide_ms_abandoned` (totals) and `wide_sizes` (the same per size). `STRIX_MTP_WIDE_GATE=1` with
+`--qualification-prefix-gate` (without `STRIX_MTP_COPY_GATE`) checks full and abandoned wide cycles of the largest
+size and, with a second size, one full and one abandoned cycle of it (the pre-cycle state exactly, the cooldown of
+every size) and the ordinary cycles after them against a 176-row serial oracle (tokens, full logits of every wide
+row, committed state).

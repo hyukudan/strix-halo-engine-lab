@@ -104,4 +104,101 @@ __global__ __launch_bounds__(256) void logits_kernel(RouterTileRowsArgs rows, co
             for (unsigned j = 0; j < 2U; ++j) out[n0 + wn + 16U * j + col] = acc[i][j][e];
         }
 }
+
+// STRIX_PREFILL_ROUTER_TUNE (default 2, see the launcher): the same two-term logits from pre-split weights. split_weights writes h = bf16(w) and
+// m = bf16(w - h) of every router weight once per call (logits_kernel<2> splits each weight again in all of its
+// total_rows / kM workgroups), and logits_presplit_kernel stages K steps of 64 (half the barriers), for N = 64 experts
+// per workgroup (waves of 32 x 32, as logits_kernel) or N = 128 (STRIX_PREFILL_ROUTER_TUNE=2: waves of 32 x 64, each A
+// fragment feeds twice the WMMAs). Per logit the WMMA sequence is unchanged: K16 planes ascending, term h then m in
+// each, so the FP32 results are bit-identical.
+__global__ __launch_bounds__(256) void split_weights(const float* weights, std::uint16_t* h, std::uint16_t* m, std::uint32_t count) {
+    for (std::uint32_t i = blockIdx.x * 256U + threadIdx.x; i < count; i += gridDim.x * 256U) {
+        const float x = weights[i];
+        const unsigned hb = bf16_bits(x);
+        h[i] = static_cast<std::uint16_t>(hb);
+        m[i] = static_cast<std::uint16_t>(bf16_bits(x - __uint_as_float(hb << 16U)));
+    }
+}
+constexpr unsigned kK2 = 64U, kPitch2 = kK2 + 8U;
+template <unsigned N>
+__global__ __launch_bounds__(256) void logits_presplit_kernel(RouterTileRowsArgs rows, const std::uint16_t* wh, const std::uint16_t* wm_,
+    std::uint32_t hidden, std::uint32_t total_rows) {
+    static_assert(N == 64U || N == 128U);
+    constexpr unsigned NT = N / 32U, BJ = N / 16U; // B tiles of 16 per wave; B staging tasks per thread
+    __shared__ __align__(16) std::uint16_t a_lds[kM][kPitch2];
+    __shared__ __align__(16) std::uint16_t b_lds[2][N][kPitch2];
+    const unsigned t = threadIdx.x, lane = t % 32U, w = t / 32U, col = lane % 16U;
+    const unsigned m0 = blockIdx.x * kM, n0 = blockIdx.y * N, wm = (w % 4U) * 32U, wn = (w / 4U) * (N / 2U);
+    // Staging: A task j = (row t / 8 + 32 j, 8 activations 8 (t % 8)), j < 4; B task j = (term j / (BJ / 2), expert t / 8 +
+    // 32 (j % (BJ / 2)), 8 weights 8 (t % 8)).
+    const std::uint8_t* a_src[4];
+    const std::uint16_t* b_src[BJ];
+#pragma unroll
+    for (unsigned j = 0; j < 4U; ++j) {
+        const unsigned g = min(m0 + t / 8U + 32U * j, total_rows - 1U);
+        a_src[j] = reinterpret_cast<const std::uint8_t*>(rows.hidden[g % 8U]) + static_cast<std::uint64_t>(g / 8U) * rows.tile_hidden +
+            16U * (t % 8U);
+    }
+#pragma unroll
+    for (unsigned j = 0; j < BJ; ++j)
+        b_src[j] = (j < BJ / 2U ? wh : wm_) + static_cast<std::uint64_t>(n0 + t / 8U + 32U * (j % (BJ / 2U))) * hidden + 8U * (t % 8U);
+    u32x4 a_reg[4], b_reg[BJ];
+    const auto fetch = [&](unsigned k) {
+#pragma unroll
+        for (unsigned j = 0; j < 4U; ++j) a_reg[j] = load16(a_src[j] + 2U * k);
+#pragma unroll
+        for (unsigned j = 0; j < BJ; ++j) b_reg[j] = load16(b_src[j] + k);
+    };
+    f32x8 acc[2][NT] = {};
+    fetch(0U);
+    for (unsigned k = 0; k < hidden; k += kK2) {
+#pragma unroll
+        for (unsigned j = 0; j < 4U; ++j) *reinterpret_cast<u32x4*>(&a_lds[t / 8U + 32U * j][8U * (t % 8U)]) = a_reg[j];
+#pragma unroll
+        for (unsigned j = 0; j < BJ; ++j)
+            *reinterpret_cast<u32x4*>(&b_lds[j / (BJ / 2U)][t / 8U + 32U * (j % (BJ / 2U))][8U * (t % 8U)]) = b_reg[j];
+        lds_barrier();
+        if (k + kK2 < hidden) fetch(k + kK2);
+#pragma unroll
+        for (unsigned kk = 0; kk < kK2 / 16U; ++kk) {
+            bf16x16 a[2];
+#pragma unroll
+            for (unsigned i = 0; i < 2U; ++i) a[i] = *reinterpret_cast<const bf16x16*>(&a_lds[wm + 16U * i + col][16U * kk]);
+#pragma unroll
+            for (unsigned j = 0; j < NT; ++j)
+#pragma unroll
+                for (unsigned s = 0; s < 2U; ++s) {
+                    const bf16x16 b = *reinterpret_cast<const bf16x16*>(&b_lds[s][wn + 16U * j + col][16U * kk]);
+#pragma unroll
+                    for (unsigned i = 0; i < 2U; ++i) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a[i], b, acc[i][j]);
+                }
+        }
+        lds_barrier();
+    }
+#pragma unroll
+    for (unsigned i = 0; i < 2U; ++i)
+#pragma unroll
+        for (unsigned e = 0; e < 8U; ++e) {
+            const unsigned g = m0 + wm + 16U * i + 2U * e + lane / 16U;
+            if (g >= total_rows) continue;
+            float* out = reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(rows.workspace[g % 8U]) +
+                static_cast<std::uint64_t>(g / 8U) * rows.tile_workspace);
+#pragma unroll
+            for (unsigned j = 0; j < NT; ++j) out[n0 + wn + 16U * j + col] = acc[i][j][e];
+        }
+}
+// STRIX_PREFILL_ROUTER_CHECK=1 (diagnostic): copy[r * experts + e] = logit (r, e) (pass 0), or count the differing bit
+// patterns against copy (pass 1).
+__global__ __launch_bounds__(256) void check_logits(RouterTileRowsArgs rows, float* copy, unsigned* mismatches, std::uint32_t experts,
+    std::uint32_t total_rows, unsigned pass) {
+    const std::uint32_t g = blockIdx.x;
+    if (g >= total_rows) return;
+    const float* out = reinterpret_cast<const float*>(reinterpret_cast<std::uintptr_t>(rows.workspace[g % 8U]) +
+        static_cast<std::uint64_t>(g / 8U) * rows.tile_workspace);
+    for (std::uint32_t e = threadIdx.x; e < experts; e += 256U) {
+        float* c = copy + static_cast<std::uint64_t>(g) * experts + e;
+        if (pass == 0U) *c = out[e];
+        else if (__float_as_uint(*c) != __float_as_uint(out[e])) atomicAdd(mismatches, 1U);
+    }
+}
 } // namespace router_fast

@@ -70,14 +70,28 @@ struct RuntimeDispatchStats {
     std::atomic<std::uint64_t> a8_down_q80_legacy_submissions{0};
     std::atomic<std::uint64_t> q5k_a8_gate_up_submissions{0};
     std::atomic<std::uint64_t> prefill_f16wmma_submissions{0}; // prompt rows of FP16 WMMA prefill blocks
+    // GSQ-RCO routed experts: prompt rows (times layers) of each prefill kernel form.
+    std::atomic<std::uint64_t> prefill_gsq_f16wmma_submissions{0};
+    std::atomic<std::uint64_t> prefill_gsq_iu8_submissions{0};
+    std::atomic<std::uint64_t> prefill_gsq_dot4_submissions{0};
+    std::atomic<std::uint64_t> prefill_gsq_f16wmma_batch128_submissions{0}; // FP16 rows whose effective tune has bit 1
 };
+// The same GSQ prefill row counters for the whole process (the MTP decode receipt has no RuntimeDispatchStats).
+struct GsqPrefillRows {
+    std::atomic<std::uint64_t> f16wmma{0}, f16wmma_batch128{0}, iu8wmma{0}, dot4{0};
+};
+[[nodiscard]] GsqPrefillRows& gsq_prefill_rows();
 struct RuntimeLayerClassification {
     std::vector<std::uint32_t> quantized_layers;
     std::vector<std::uint32_t> legacy_q5k_layers;
     std::vector<std::uint32_t> q4k_with_q51_down_layers;
     std::vector<std::uint32_t> q4k_with_q80_down_layers;
     std::vector<std::uint32_t> q5k_with_q80_down_layers;
+    // GSQ-RCO Q2_0 gate/up layers (STRIX_GSQ_Q20_A8=1 only); their down is Q2_0, Q5_1 or Q8_0.
+    std::vector<std::uint32_t> q20_layers;
 };
+// True when every routed layer is a Q2_0 gate/up layer (GSQ-RCO file or hybrid, opt-in).
+[[nodiscard]] bool q20_manifest(const RuntimeLayerClassification&);
 // Requires unambiguous separate gate/up/down tensors for every routed layer.
 // This runs before GPU ownership or full weight loading.
 [[nodiscard]] RuntimeLayerClassification classify_runtime_manifest(

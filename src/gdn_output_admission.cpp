@@ -1,4 +1,6 @@
 #include "strix/gdn_output_admission.hpp"
+#include "strix/gsq_a8_groups.hpp"
+#include "strix/moe_q4k_a8_contract.hpp"
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -23,8 +25,11 @@ void validate_virtual_q8_gdn_output_manifest(const ModelContract& model,const Mo
             if(found) throw std::invalid_argument("virtual Q8 GDN output tensor is duplicated");
             found=&tensor;
         }
-        if(!found || found->role!=TensorRole::recurrent_state || found->layer!=layer || found->ggml_type!=8U ||
-            found->dimensions!=std::vector<std::uint64_t>{width,model.hidden_size} || found->byte_size!=bytes ||
+        // STRIX_GSQ_Q20_A8=1: a GSQ-RCO typed ssm_out (served by the typed dense A8 segments) is admitted with its own extent.
+        const bool gsq=found && found->ggml_type!=8U && gsq_a8::dense_type(found->ggml_type) && moe_q4k_a8::q20_a8_enabled();
+        if(!found || found->role!=TensorRole::recurrent_state || found->layer!=layer || (found->ggml_type!=8U && !gsq) ||
+            found->dimensions!=std::vector<std::uint64_t>{width,model.hidden_size} ||
+            found->byte_size!=(gsq ? std::uint64_t{gsq_a8::dense_row_bytes(found->ggml_type,static_cast<std::uint32_t>(width))}*model.hidden_size : bytes) ||
             found->placement.kind!=PlacementKind::local || found->placement.node!=0)
             throw std::invalid_argument("virtual Q8 GDN output requires every original aligned Q8_0 output tensor");
         ++count;

@@ -6,14 +6,17 @@
 #include "strix/model_contract.hpp"
 #include "strix/model_runtime_binding.hpp"
 #include "strix/q8_projection_organization.hpp"
+#include "strix/gsq_a8_groups.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strix::q8_projection_organization {
@@ -35,6 +38,8 @@ struct ManifestPlan {
     std::vector<OutputWeight> outputs;
     bool gdn_output_wave8 = false;
     bool qsa_output_wave8 = false;
+    // GSQ-RCO (STRIX_GSQ_Q20_A8=1): output projections left to the typed dense A8 segments, as (consumer, layer).
+    std::vector<std::pair<SerialOp, std::uint32_t>> gsq_outputs;
 };
 
 inline std::uint64_t output_checked_product(std::uint64_t a, std::uint64_t b) {
@@ -71,6 +76,12 @@ inline ManifestPlan build_manifest_plan(const ModelContract& model, const ModelM
         validate_geometry(width, rows);
         const auto& tensor = manifest.tensors[index];
         const auto bytes = (width / 32U) * 34U * rows;
+        // STRIX_GSQ_Q20_A8=1: GSQ-RCO typed weights are not part of the Q8 organization (the typed dense A8
+        // segments run them); only their Q8_0 tensors are organized.
+        if (tensor.ggml_type != 8U && gsq_a8::dense_type(tensor.ggml_type)) {
+            const char* gsq = std::getenv("STRIX_GSQ_Q20_A8");
+            if (gsq && gsq[0] == '1' && gsq[1] == 0) return std::uint64_t{0};
+        }
         if (tensor.ggml_type != 8U || tensor.dimensions.size() != 2U ||
             tensor.dimensions[0] != width || tensor.dimensions[1] != rows ||
             tensor.absolute_offset % 16U || tensor.byte_size < bytes ||
@@ -159,6 +170,10 @@ inline ManifestPlan build_manifest_plan(const ModelContract& model, const ModelM
                                (!contains("attn_output") && !contains("o_proj"))) continue;
                     ++count;
                     const auto bytes = add_weight(i, width, model.hidden_size);
+                    if (bytes == 0U) {  // GSQ typed output: served by the dense A8 segments, not organized
+                        plan.gsq_outputs.push_back({consumer, layer});
+                        continue;
+                    }
                     plan.outputs.push_back({static_cast<std::uint32_t>(i), layer,
                         static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(model.hidden_size),
                         bytes, consumer});
@@ -210,7 +225,7 @@ inline void validate_output_steps(const ManifestPlan& plan, const ModelContract&
     validate_execution_memory_binding(compiled.execution_identity, compiled.arena, memory);
     const auto expected = (plan.gdn_output_wave8 ? model.gdn_layers : 0U) +
                           (plan.qsa_output_wave8 ? model.full_attention_layers : 0U);
-    if (plan.outputs.size() != expected)
+    if (plan.outputs.size() + plan.gsq_outputs.size() != expected)
         throw std::invalid_argument("wave8 output projection plan coverage is incomplete");
     std::vector<unsigned> matches(plan.outputs.size(), 0U);
     const auto resolved = [&](ExecutionBufferUse use) {
@@ -229,6 +244,8 @@ inline void validate_output_steps(const ManifestPlan& plan, const ModelContract&
         if (!step.layer || *step.layer >= model.hidden_layers ||
             (((static_cast<std::uint64_t>(*step.layer) + 1U) % model.full_attention_interval != 0U) != gdn))
             throw std::invalid_argument("wave8 output projection step has an invalid model layer");
+        if (std::find(plan.gsq_outputs.begin(), plan.gsq_outputs.end(),
+                std::pair<SerialOp, std::uint32_t>{step.op, *step.layer}) != plan.gsq_outputs.end()) continue;
         std::size_t which = plan.outputs.size();
         for (std::size_t j = 0; j < plan.outputs.size(); ++j)
             if (plan.outputs[j].consumer == step.op && plan.outputs[j].layer == *step.layer) {

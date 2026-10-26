@@ -544,6 +544,7 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
             const auto rows=q.rows;
             auto is_eos=[&](std::uint32_t token){return std::find(q.eos.begin(),q.eos.end(),token)!=q.eos.end();};
             auto& result=out[a];result.chosen_rows=rows;result.attempted_window=true;
+            result.verified_candidates=static_cast<std::uint32_t>(std::min<std::size_t>(q.candidates.size(),rows-1U));
             result.r2_dispatches=natives[a].execution.r2_dispatches;
             result.projection_launches_saved=natives[a].execution.projection_launches_saved;
             auto provisional=std::make_shared<const HipMtpTargetWindowBatch>(std::move(natives[a].batch));
@@ -587,6 +588,144 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
         throw;
     }
 }
+std::vector<HipMtpTargetHiddenTicket> HipMtpWindowVerifier::prompt_rows(SerialSessionContext& session,
+    std::span<const std::uint32_t> tokens) {
+    auto& i=*impl_;
+    require(!i.busy && !failed(),"MTP prompt rows require an idle healthy window verifier");
+    const auto rows=static_cast<std::uint32_t>(tokens.size());
+    auto* owner=i.prefix && !i.target->token_sampler()?i.owner_of(rows):nullptr;
+    if(!owner || !i.fits(session,*owner,rows-1U,rows)) return {};
+    const auto vocabulary=i.target->model().vocab_size;
+    for(auto token:tokens)require(token<vocabulary,"MTP prompt row token outside vocabulary");
+    std::shared_ptr<HipMtpTargetWindowCapture> capture;
+    for(const auto& pool:owner->captures)if(pool->ready_for_reuse()){capture=pool;break;}
+    if(!capture) return {};
+    i.target->validate_window_capture(*capture);
+    capture->set_row_selection({});
+    i.busy=true;bool attempted=false;
+    try {
+        // The previous owner's PLE commit runs on its own stream.
+        if(i.last && i.last!=owner && hipStreamSynchronize(static_cast<hipStream_t>(i.last->captures.front()->source_stream()))!=hipSuccess)
+            throw std::runtime_error("MTP window owner switch could not complete the previous commit");
+        const std::vector<std::uint32_t> inputs(tokens.begin(),tokens.end());
+        auto native=owner->window->execute_mtp_captured(session,inputs,capture,{},rows);
+        attempted=true;
+        auto provisional=std::make_shared<const HipMtpTargetWindowBatch>(std::move(native.batch));
+        owner->window->commit_prefix(rows);i.last=owner;
+        auto tickets=i.target->accept_known_rows(provisional,session);
+        // Prompt rows are no decode cycle: keep them out of the next cycle's measured time.
+        i.skip_sample();
+        provisional.reset();
+        {auto done=std::move(native);}
+        capture.reset();
+        i.busy=false;return tickets;
+    } catch(...) {
+        i.failed=true;i.busy=false;
+        if(attempted || session.health==SerialSessionHealth::poisoned){
+            session.health=SerialSessionHealth::poisoned;session.arithmetic_lineage.tainted=true;
+            i.target->guard()->recover_or_fail_stop();
+        }
+        throw;
+    }
+}
+std::vector<std::vector<HipMtpTargetHiddenTicket>> HipMtpWindowVerifier::prompt_rows_cohort(std::span<const PromptRowsRequest> requests) {
+    std::vector<std::vector<HipMtpTargetHiddenTicket>> out(requests.size());
+    struct Item {std::size_t request;Impl* impl;Impl::Owner* owner;std::uint32_t rows;std::shared_ptr<HipMtpTargetWindowCapture> capture;};
+    std::vector<Item> items;
+    for(std::size_t a=0;a<requests.size();++a) {
+        const auto& q=requests[a];
+        require(q.verifier && q.session,"MTP prompt rows cohort request is incomplete");
+        auto& i=*q.verifier->impl_;
+        for(std::size_t b=0;b<a;++b)require(requests[b].verifier!=q.verifier && requests[b].session!=q.session,
+            "MTP prompt rows cohort requires distinct sessions");
+        require(!i.busy && !q.verifier->failed(),"MTP prompt rows require an idle healthy window verifier");
+        const auto rows=static_cast<std::uint32_t>(q.tokens.size());
+        auto* owner=i.prefix && !i.target->token_sampler()?i.owner_of(rows):nullptr;
+        if(!owner || !i.fits(*q.session,*owner,rows-1U,rows)) continue;
+        const auto vocabulary=i.target->model().vocab_size;
+        for(auto token:q.tokens)require(token<vocabulary,"MTP prompt row token outside vocabulary");
+        std::shared_ptr<HipMtpTargetWindowCapture> capture;
+        for(const auto& pool:owner->captures)if(pool->ready_for_reuse()){capture=pool;break;}
+        if(!capture) continue;
+        i.target->validate_window_capture(*capture);
+        capture->set_row_selection({});
+        items.push_back({a,&i,owner,rows,std::move(capture)});
+    }
+    if(items.empty()) return out;
+    if(items.size()==1U) {
+        const auto a=items.front().request;items.clear();
+        out[a]=requests[a].verifier->prompt_rows(*requests[a].session,requests[a].tokens);
+        return out;
+    }
+    // Chunks: first fit of the (descending) windows into bins of eight rows; a bin of two or more windows whose
+    // rows are 4 or 8 runs on an idle owner of that many rows no window of this call uses, else each of its
+    // windows runs alone in the stream of steps.
+    std::stable_sort(items.begin(),items.end(),[](const Item& x,const Item& y){return x.rows>y.rows;});
+    std::vector<std::vector<std::size_t>> bins;std::vector<std::uint32_t> sums;
+    for(std::size_t k=0;k<items.size();++k) {
+        bool placed=false;
+        for(std::size_t b=0;b<bins.size() && !placed;++b) if(sums[b]+items[k].rows<=8U){bins[b].push_back(k);sums[b]+=items[k].rows;placed=true;}
+        if(!placed){bins.push_back({k});sums.push_back(items[k].rows);}
+    }
+    std::vector<const HipKnownPrefixWindow*> used;
+    for(const auto& x:items) used.push_back(x.owner->window.get());
+    std::vector<HipKnownPrefixWindow*> primaries;std::vector<std::size_t> chunks;std::vector<std::size_t> order;
+    std::vector<std::shared_ptr<HipKnownPrefixWindow>> keep;
+    for(std::size_t b=0;b<bins.size();++b) {
+        if(bins[b].size()>=2U && (sums[b]==4U || sums[b]==8U)) {
+            std::shared_ptr<HipKnownPrefixWindow> primary;
+            for(const auto& x:items) {
+                auto* o=x.impl->owner_of(sums[b]);
+                if(o && std::find(used.begin(),used.end(),o->window.get())==used.end()){primary=o->window;break;}
+            }
+            if(primary) {
+                used.push_back(primary.get());primaries.push_back(primary.get());keep.push_back(std::move(primary));
+                chunks.push_back(bins[b].size());order.insert(order.end(),bins[b].begin(),bins[b].end());
+                continue;
+            }
+        }
+        for(const auto k:bins[b]){primaries.push_back(nullptr);chunks.push_back(1U);order.push_back(k);}
+    }
+    std::vector<HipKnownPrefixCohortMember> members;std::vector<std::vector<std::uint32_t>> inputs(order.size());
+    for(std::size_t m=0;m<order.size();++m) {
+        auto& x=items[order[m]];const auto& q=requests[x.request];
+        inputs[m].assign(q.tokens.begin(),q.tokens.end());
+        members.push_back({x.owner->window.get(),q.session,inputs[m],x.capture});
+    }
+    for(const auto& x:items) {
+        // The previous owner's PLE commit runs on its own stream.
+        if(x.impl->last && x.impl->last!=x.owner &&
+           hipStreamSynchronize(static_cast<hipStream_t>(x.impl->last->captures.front()->source_stream()))!=hipSuccess)
+            throw std::runtime_error("MTP window owner switch could not complete the previous commit");
+    }
+    for(auto& x:items) x.impl->busy=true;
+    bool attempted=false;
+    try {
+        auto natives=HipKnownPrefixWindow::execute_mtp_cohort_chunks(primaries,chunks,members);
+        attempted=true;
+        for(std::size_t m=0;m<order.size();++m) {
+            auto& x=items[order[m]];auto& i=*x.impl;const auto& q=requests[x.request];
+            auto provisional=std::make_shared<const HipMtpTargetWindowBatch>(std::move(natives[m].batch));
+            x.owner->window->commit_prefix(x.rows);i.last=x.owner;
+            out[x.request]=i.target->accept_known_rows(provisional,*q.session);
+            i.skip_sample();
+            provisional.reset();natives[m]={};
+            x.capture->set_row_selection({});x.capture.reset();
+            i.busy=false;
+        }
+        return out;
+    } catch(...) {
+        for(auto& x:items) {
+            auto& i=*x.impl;i.failed=true;i.busy=false;
+            auto& session=*requests[x.request].session;
+            if(attempted || session.health==SerialSessionHealth::poisoned) {
+                session.health=SerialSessionHealth::poisoned;session.arithmetic_lineage.tainted=true;
+                i.target->guard()->recover_or_fail_stop();
+            }
+        }
+        throw;
+    }
+}
 void HipMtpWindowVerifier::begin_session() {
     auto& i=*impl_;
     require(!i.busy && !failed(),"MTP window verifier session restarts only while idle and healthy");
@@ -610,6 +749,21 @@ void HipMtpWindowVerifier::begin_session() {
         i.chain_steps=0;i.external_first=SIZE_MAX;i.external.clear();
     }
 }
+void HipMtpWindowVerifier::flush_pending_window() {
+    auto& i=*impl_;
+    require(!i.busy && !failed(),"MTP window verifier flushes only while idle and healthy");
+    if(i.last) {
+        if(i.prefix) i.last->window->flush_deferred();
+        if(hipStreamSynchronize(static_cast<hipStream_t>(i.last->captures.front()->source_stream()))!=hipSuccess)
+            throw std::runtime_error("MTP window owner could not complete its pending commit");
+    }
+    // Nothing is pending now: this only invalidates the persistent QSA pools of every owner.
+    for(auto& o:i.owners) o.window->discard_deferred();
+}
+void HipMtpWindowVerifier::skip_cycle_sample() {
+    auto& i=*impl_;require(!i.busy,"MTP window verifier sample skip requires an idle verifier");
+    i.last_end=std::chrono::steady_clock::now();
+}
 bool HipMtpWindowVerifier::failed() const noexcept {return impl_->failed || (impl_->checkpoint && impl_->checkpoint->failed());}
 std::uint64_t HipMtpWindowVerifier::retained_payload_bytes() const noexcept {return impl_->retained;}
 void HipMtpWindowVerifier::set_external_rows(std::size_t first,std::span<const double> acceptance) {
@@ -617,6 +771,11 @@ void HipMtpWindowVerifier::set_external_rows(std::size_t first,std::span<const d
     require(!i.busy && !i.survival && i.minp,"MTP window verifier external rows are set between cycles of the min-p controller");
     i.minp->set_external_rows(first,acceptance);
     if(i.depth)i.depth->set_external_rows(first,acceptance);
+}
+void HipMtpWindowVerifier::clear_external_rows() noexcept {
+    auto& i=*impl_;
+    if(i.minp)i.minp->clear_external_rows();
+    if(i.depth)i.depth->clear_external_rows();
 }
 bool HipMtpWindowVerifier::worth_drafting(std::span<const float> probabilities,std::span<const float> runner_ups) const {
     if(impl_->depth)return impl_->depth->worth_drafting(probabilities);
@@ -742,6 +901,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             auto native=owner->window->execute_mtp_captured(session,inputs,capture,{},active);
             host_phase_mark("7 window launch+wait");
             attempted_target=true;out.attempted_window=true;
+            out.verified_candidates=static_cast<std::uint32_t>(std::min<std::size_t>(candidates.size(),active-1U));
             out.r2_dispatches=native.execution.r2_dispatches;
             out.projection_launches_saved=native.execution.projection_launches_saved;
             auto provisional=std::make_shared<const HipMtpTargetWindowBatch>(std::move(native.batch));
@@ -788,6 +948,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             // admission leaves the original ready session untouched; dispatch
             // failures are already poisoned/drained by the native producer.
             attempted_target=true;out.attempted_window=true;
+            out.verified_candidates=rows-1U;
             out.r2_dispatches=native.execution.r2_dispatches;
             out.projection_launches_saved=native.execution.projection_launches_saved;
             auto provisional=std::make_shared<const HipMtpTargetWindowBatch>(std::move(native.batch));
@@ -810,6 +971,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
                 index<drafts.size()?&drafts[index]:nullptr);
             attempted_target=true;
             pending=ticket.predicted_token();out.committed_rows.push_back(std::move(ticket));out.emitted_tokens.push_back(pending);
+            if(index<candidates.size()) out.verified_candidates=std::max(out.verified_candidates,static_cast<std::uint32_t>(index+1U));
             const bool accepted=index<candidates.size() && candidates[index]==pending;
             if(accepted)++out.accepted_candidates;
             if(diagnostic || is_eos(pending) || !accepted)break;

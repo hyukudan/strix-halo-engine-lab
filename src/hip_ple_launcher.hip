@@ -1,4 +1,5 @@
 #include "strix/hip_launch_context.hpp"
+#include "strix/hip_ggml_weight_formats.hpp"
 #include "strix/known_prefill_limits.hpp"
 #include "strix/hip_ple_launcher.hpp"
 
@@ -73,6 +74,9 @@ enum class WeightKind {
     bf16,
     q8_0,
     iq4_xs,
+#define STRIX_GGML_KIND_ENUM(kind, type) kind,
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_ENUM) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_ENUM) STRIX_GGML_KIND_ENUM(iq4_nl, 20)
+#undef STRIX_GGML_KIND_ENUM
 };
 
 enum class SmallWeightKind {
@@ -148,6 +152,9 @@ WeightKind weight_kind(
     case 1: return WeightKind::f16;
     case 8: return WeightKind::q8_0;
     case 23: return WeightKind::iq4_xs;
+#define STRIX_GGML_KIND_MAP(kind, type) case type: return WeightKind::kind;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_MAP) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_MAP) STRIX_GGML_KIND_MAP(iq4_nl, 20)
+#undef STRIX_GGML_KIND_MAP
     case 30: return WeightKind::bf16;
     default:
         throw std::invalid_argument(
@@ -345,6 +352,24 @@ __device__ float load_small(
     return 0.0F;
 }
 
+#define STRIX_GGML_KIND_LOAD(kind, type)                                                          \
+    template <>                                                                                   \
+    __device__ float load_weight<WeightKind::kind>(                                               \
+        const void* weights, std::uint32_t row_width, std::uint64_t row, std::uint32_t feature) { \
+        return hip_ggml::element<type>(weights, row_width, row, feature);                        \
+    }
+STRIX_GGML_KINDS_K(STRIX_GGML_KIND_LOAD) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_LOAD) STRIX_GGML_KIND_LOAD(iq4_nl, 20)
+#undef STRIX_GGML_KIND_LOAD
+
+std::uint32_t ggml_type_of(WeightKind kind) {
+    switch (kind) {
+#define STRIX_GGML_KIND_TYPE(k, type) case WeightKind::k: return type;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_TYPE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_TYPE) STRIX_GGML_KIND_TYPE(iq4_nl, 20)
+#undef STRIX_GGML_KIND_TYPE
+    default: return 0;
+    }
+}
+
 std::uint64_t required_weight_bytes(
     WeightKind kind,
     std::uint32_t input_width,
@@ -381,6 +406,13 @@ std::uint64_t required_weight_bytes(
                 input_width / 256U) *
             output_rows *
             sizeof(IQ4XSBlock);
+    default: {
+        const auto g = hip_ggml::geometry(ggml_type_of(kind));
+        if (g.elements == 0 || input_width % g.elements != 0) {
+            throw std::invalid_argument("weight width is not a multiple of its GGUF block");
+        }
+        return static_cast<std::uint64_t>(input_width / g.elements) * output_rows * g.bytes;
+    }
     }
     throw std::logic_error(
         "unreachable PLE weight kind");
@@ -1138,6 +1170,18 @@ void launch_projection_by_kind(
                 output_width,
                 output);
         return;
+#define STRIX_GGML_KIND_CASE(KIND, type) \
+    case WeightKind::KIND: \
+        launch_projection< \
+            WeightKind::KIND>( \
+                input, \
+                weights, \
+                input_width, \
+                output_width, \
+                output); \
+        return;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE) STRIX_GGML_KIND_CASE(iq4_nl, 20)
+#undef STRIX_GGML_KIND_CASE
     }
 }
 

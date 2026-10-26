@@ -1150,6 +1150,25 @@ modes, both opt-in and neither changing a pair-only default:
 Why opt-in: both need a second machine, a 1-2.5 GbE link and a CUDA build (`STRIX_ENABLE_CUDA_DS41`); the pair-only
 path stays the reference and the default.
 
+## D-065: context copy/n-gram drafter (`--mtp-ngram-draft=ctx|copy`, opt-in; the D-055 default is unchanged)
+
+The D-047 extension stays the default (`auto`, same code and gate). `ctx` and `copy` select a separate drafter
+(strix/mtp_context_draft.hpp) with different criteria: the 2-16 token exact suffix votes for the continuation
+(recency only breaks ties); a 0.75/weight-1 prior lets it propose on a cold request; each selected row must meet
+both the 0.7 floor and the active window threshold; it proposes after any confident prefix, also none; shadows
+from the pending token alone learn even when the MTP prefix is rejected. `copy` also lets a context span of four
+tokens or more replace the confident MTP chain when its expected accepted rows exceed the chain's (from the draft
+probabilities), and, when such a span already passes the gate and is expected to deliver more accepted rows than
+the request's MTP cycles (moving average), supply the chain before any predictor forward.
+Every proposal stays inside the native depth/retention bounds and passes the unchanged exact target
+acceptance/commit path. Delivered and accepted rows come from completed verification (`verified_candidates`),
+separately from host-only shadow and gated-selection counts.
+
+Status: exact (68 native decodes of 22 agent/code/prose prompts identical to the default, six real-cycle gates
+equal to serial decoding in tokens, full logits and committed state). Short single runs show no gain over the
+distilled draft (agent +1.9 % tokens per cycle with `ctx`, ms/token flat or worse): not adopted, default unchanged.
+See [the contract](docs/mtp-native-cli.md#context-copyn-gram-drafter-ctx-copy).
+
 ## Measured and rejected
 
 | ID | Alternative | Result | Reason |

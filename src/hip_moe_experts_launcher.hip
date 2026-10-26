@@ -19,6 +19,9 @@
 #include "strix/hip_q51_grouped_down_probe.hpp"
 #include "strix/hip_moe_a8_down.hpp"
 #endif
+// Self-contained format headers (STRIX_GGML_KINDS_GSQ, hip_ggml, gsq_a8) are needed with the A8 runtime OFF too.
+#include "strix/hip_ggml_weight_formats.hpp"
+#include "strix/gsq_a8_groups.hpp"
 #include <array>
 #include <functional>
 #include <algorithm>
@@ -110,6 +113,9 @@ enum class WeightKind {
     q5_1,
     q4_k,
     q5_k,
+#define STRIX_GGML_KIND_ENUM(kind, type) kind,
+    STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_ENUM)
+#undef STRIX_GGML_KIND_ENUM
 };
 
 struct TensorPair {
@@ -217,9 +223,12 @@ WeightKind weight_kind(
     case 20: return WeightKind::iq4_nl;
     case 23: return WeightKind::iq4_xs;
     case 30: return WeightKind::bf16;
+#define STRIX_GGML_KIND_MAP(kind, type) case type: return WeightKind::kind;
+    STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_MAP)
+#undef STRIX_GGML_KIND_MAP
     default:
         throw std::invalid_argument(
-            "HIP routed experts support F32, F16, BF16, Q8_0, IQ4_NL, IQ4_XS, Q5_1, Q4_K and Q5_K");
+            "HIP routed experts support F32, F16, BF16, Q8_0, IQ4_NL, IQ4_XS, Q5_1, Q4_K, Q5_K and the GSQ-RCO formats");
     }
 }
 
@@ -460,6 +469,19 @@ __device__ float load_weight<WeightKind::q5_k>(
     return load_k_weight(static_cast<const Q5KBlock*>(weights), row_width, row, feature);
 }
 
+#define STRIX_GGML_KIND_LOAD(kind, type)                                                              template <>                                                                                       __device__ float load_weight<WeightKind::kind>(                                                       const void* weights, std::uint32_t row_width, std::uint64_t row, std::uint32_t feature) {         return hip_ggml::element<type>(weights, row_width, row, feature);                            }
+STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_LOAD)
+#undef STRIX_GGML_KIND_LOAD
+
+std::uint32_t ggml_type_of(WeightKind kind) {
+    switch (kind) {
+#define STRIX_GGML_KIND_TYPE(k, type) case WeightKind::k: return type;
+    STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_TYPE)
+#undef STRIX_GGML_KIND_TYPE
+    default: return 0;
+    }
+}
+
 std::uint64_t required_weight_bytes(
     WeightKind kind,
     std::uint32_t input,
@@ -517,6 +539,14 @@ std::uint64_t required_weight_bytes(
         row_bytes = static_cast<std::uint64_t>(input / 256U) *
             (kind == WeightKind::q4_k ? sizeof(Q4KBlock) : sizeof(Q5KBlock));
         break;
+    default: {
+        const auto g = hip_ggml::geometry(ggml_type_of(kind));
+        if (g.elements == 0 || input % g.elements != 0) {
+            throw std::invalid_argument("routed-expert input width is not a multiple of its GGUF block");
+        }
+        row_bytes = static_cast<std::uint64_t>(input / g.elements) * g.bytes;
+        break;
+    }
     }
     return row_bytes *
            output_rows *
@@ -933,6 +963,9 @@ void launch_projection_by_kind(
     case WeightKind::q5_1: STRIX_PROJECT_CASE(q5_1); break;
     case WeightKind::q4_k: STRIX_PROJECT_CASE(q4_k); break;
     case WeightKind::q5_k: STRIX_PROJECT_CASE(q5_k); break;
+#define STRIX_GGML_KIND_CASE(k, type) case WeightKind::k: STRIX_PROJECT_CASE(k); break;
+    STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE)
+#undef STRIX_GGML_KIND_CASE
     }
 #undef STRIX_PROJECT_CASE
     check_hip(
@@ -963,6 +996,9 @@ void launch_down_by_kind(
     case WeightKind::q5_1: STRIX_DOWN_CASE(q5_1); break;
     case WeightKind::q4_k: STRIX_DOWN_CASE(q4_k); break;
     case WeightKind::q5_k: STRIX_DOWN_CASE(q5_k); break;
+#define STRIX_GGML_KIND_CASE(k, type) case WeightKind::k: STRIX_DOWN_CASE(k); break;
+    STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE)
+#undef STRIX_GGML_KIND_CASE
     }
 #undef STRIX_DOWN_CASE
     check_hip(
@@ -1327,7 +1363,10 @@ PreparedQ4kA8 prepare_q4k_a8(const HipMoeExpertsLauncherConfig& config,
     moe_q4k_a8::validate(request,bindings);
     const auto down_type = tensors.down.manifest->ggml_type;
     const bool integer_down = (config.a8_down_q51 && down_type == 7U) ||
-        (config.a8_down_q80 && down_type == 8U);
+        (config.a8_down_q80 && down_type == 8U) ||
+        (config.a8_down_q80 && gsq_a8::down_type(down_type) && moe_q4k_a8::q20_a8_enabled());
+    if (gsq_a8::gate_type(gate_type) && !integer_down)
+        throw std::invalid_argument("Q2_0 A8 gate/up requires the A8 down profile");
     const bool grouped_q51=config.grouped_exact_q51_down && down_type==7U && !integer_down;
     const bool slot_parallel_q51=grouped_q51 && config.q51_slot_parallel_down;
     if(grouped_q51) {
@@ -1656,9 +1695,14 @@ PreparedMoeExperts prepare_moe_experts(
         const auto layer = *context.layer;
         const bool q80_layer = layer == 2U || layer == 4U || layer == 30U || layer == 46U || layer == 47U;
         const auto gate_type = layer == 2U ? 13U : 12U;
-        if (tensors.fused_gate_up || tensors.gate.manifest->ggml_type != gate_type ||
+        const bool q20_layer = moe_q4k_a8::q20_a8_enabled() && !tensors.fused_gate_up &&
+            gsq_a8::gate_type(tensors.gate.manifest->ggml_type) &&
+            tensors.up.manifest->ggml_type == tensors.gate.manifest->ggml_type &&
+            (gsq_a8::down_type(tensors.down.manifest->ggml_type) || tensors.down.manifest->ggml_type == 7U ||
+             tensors.down.manifest->ggml_type == 8U);
+        if (!q20_layer && (tensors.fused_gate_up || tensors.gate.manifest->ggml_type != gate_type ||
             tensors.up.manifest->ggml_type != gate_type ||
-            tensors.down.manifest->ggml_type != (q80_layer ? 8U : 7U))
+            tensors.down.manifest->ggml_type != (q80_layer ? 8U : 7U)))
             throw std::invalid_argument("A8 down layer types differ from canonical fallback census");
     }
 
@@ -1689,10 +1733,11 @@ PreparedMoeExperts prepare_moe_experts(
 #endif
     if (config.q4k_a8g32_gate_up) {
 #ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
+        const bool q20 = gsq_a8::gate_type(tensors.gate.manifest->ggml_type) && moe_q4k_a8::q20_a8_enabled();
         if (tensors.fused_gate_up || tensors.gate.manifest->ggml_type != tensors.up.manifest->ggml_type ||
-            (tensors.gate.manifest->ggml_type != 12 && tensors.gate.manifest->ggml_type != 13))
+            (tensors.gate.manifest->ggml_type != 12 && tensors.gate.manifest->ggml_type != 13 && !q20))
             throw std::invalid_argument("Q4K A8 runtime requires separate paired Q4K or Q5K gate/up");
-        if (tensors.gate.manifest->ggml_type == 12 || config.q5k_a8g32_gate_up)
+        if (tensors.gate.manifest->ggml_type == 12 || config.q5k_a8g32_gate_up || q20)
             quantized = prepare_q4k_a8(config, hidden, route_indices, route_weights, output, temporary, tensors);
 #endif
     }
@@ -2497,7 +2542,7 @@ KnownMoeRowsPrepared prepare_known_moe_rows(std::span<const ExecutionDispatchCon
         // Q4K (or Q5K) gate/up + the serial Q5_1/Q8_0 A8G32 down request.
         if (!p.quantized || p.tensors.fused_gate_up || p.tensors.up.manifest->ggml_type != gate_type ||
             (a8 ? !p.quantized->a8_down_request || p.quantized->a8_down_request->weight_type != down_type ||
-                  (gate_type != 12U && !(gate_type == 13U && config.q5k_a8g32_gate_up)) :
+                  (gate_type != 12U && !(gate_type == 13U && config.q5k_a8g32_gate_up) && !(gsq_a8::gate_type(gate_type) && moe_q4k_a8::q20_a8_enabled())) :
                   !p.quantized->slot_parallel_q51 || gate_type != 12U || down_type != 7U) ||
             gate_type != out.rows[0].tensors.gate.manifest->ggml_type || down_type != out.rows[0].tensors.down.manifest->ggml_type)
             throw std::invalid_argument("known-window routed rows require the serial Q4K/Q5K A8 gate/up and down formats");
@@ -2666,6 +2711,32 @@ __global__ void known_moe_prefill_merge_kernel(KnownMoePrefillDevice view, std::
     if (out >= hidden_size) return;
     const auto* routes = known_moe_prefill_row(view.routes, row);
     for (std::uint32_t slot = 0; slot < top_k; ++slot) if (routes[slot] >= experts) return;
+    const auto* rawdots = known_moe_prefill_row(view.rawdots, row);
+    const auto* route_weights = known_moe_prefill_row(view.route_weights, row);
+    float dots[10];
+#pragma unroll
+    for (std::uint32_t slot = 0; slot < 10U; ++slot) if (slot < top_k) dots[slot] = rawdots[static_cast<std::uint64_t>(slot) * hidden_size + out];
+    float current = 0.0F;
+#pragma unroll
+    for (std::uint32_t slot = 0; slot < 10U; ++slot) if (slot < top_k) {
+        const float weight = route_weights[slot];
+        asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(current) : "s"(weight), "v"(dots[slot]));
+    }
+    known_moe_prefill_row(view.accumulation, row)[out] = current;
+    if ((__float_as_uint(current) & 0x7fffffffU) >= 0x7f7f8000U) { atomicOr(status, 8U); atomicOr(header, 8U); }
+}
+// qpf2k/moe-mi (STRIX_QPF2K_MOE_ROUTE bit 8): known_moe_prefill_merge_kernel when the routed prologue did not zero the
+// accumulation view: the same kernel, plus a zero store on each path where the base returns without a store (the zero the
+// prologue would have left there; the prologue clears exactly hidden words per row). Successful rows: identical.
+__global__ void known_moe_prefill_merge_kernel_z(KnownMoePrefillDevice view, std::uint32_t* header,
+    std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k) {
+    const auto row = blockIdx.y;
+    auto* status = known_moe_prefill_row(view.status, row);
+    const auto out = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (header[0] || *status) { if (out < hidden_size) known_moe_prefill_row(view.accumulation, row)[out] = 0.0F; return; }
+    if (out >= hidden_size) return;
+    const auto* routes = known_moe_prefill_row(view.routes, row);
+    for (std::uint32_t slot = 0; slot < top_k; ++slot) if (routes[slot] >= experts) { known_moe_prefill_row(view.accumulation, row)[out] = 0.0F; return; }
     const auto* rawdots = known_moe_prefill_row(view.rawdots, row);
     const auto* route_weights = known_moe_prefill_row(view.route_weights, row);
     float dots[10];
@@ -2909,9 +2980,24 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
     check_hip(hipPeekAtLastError(), "known prefill routed rows stale error");
     moe_q4k_a8::known_rows::enqueue_prefill(p.request, p.rows, count, p.clear_words, p.gate, p.up, p.down_type, p.down, stream,
         config.prefill_f16wmma ? 3 : -1);
+    // qpf2k core2 bit 9 (STRIX_QPF2K_MOE): the down already ran the ordered merge (last arrival); its guards and non-finite
+    // flag run here instead (same accumulation, status and header bits).
+    if (moe_q4k_a8::known_rows::prefill_fused_merge()) {
+        // The fused tail writes PrefillRows::clear; the commit reads the accumulation view: they must be the same rows.
+        if (reinterpret_cast<std::uintptr_t>(p.rows.clear.base) != reinterpret_cast<std::uintptr_t>(p.device.accumulation.base) ||
+            p.rows.clear.stride != p.device.accumulation.stride)
+            throw std::logic_error("known prefill fused merge: accumulation view differs from the prologue clear view");
+        moe_q4k_a8::known_rows::enqueue_prefill_merge_check(p.rows, count, config.hidden_size, config.expert_count, config.top_k, stream);
+    }
+    else {
+    if (moe_q4k_a8::known_rows::prefill_clear_skipped()) // qpf2k/moe-mi ROUTE bit 8: the zeros move into the merge
+        hipLaunchKernelGGL(known_moe_prefill_merge_kernel_z, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
+            p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k);
+    else
     hipLaunchKernelGGL(known_moe_prefill_merge_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
         p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k);
     check_hip(hipGetLastError(), "known prefill routed rows ordered merge");
+    }
     hipLaunchKernelGGL(known_moe_prefill_commit_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
         p.device, p.rows.csr.summary, count, config.hidden_size, hip_deferred_moe_status());
     check_hip(hipGetLastError(), "known prefill routed rows output commit");
@@ -2924,7 +3010,19 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
         stats.quantized_submissions.fetch_add(count, std::memory_order_relaxed);
         (p.down_type == 7U ? stats.a8_down_q51_submissions : stats.a8_down_q80_submissions).fetch_add(count, std::memory_order_relaxed);
         if (p.request.gate_type == 13U) stats.q5k_a8_gate_up_submissions.fetch_add(count, std::memory_order_relaxed);
-        if (config.prefill_f16wmma) stats.prefill_f16wmma_submissions.fetch_add(count, std::memory_order_relaxed);
+        using Form = moe_q4k_a8::known_rows::PrefillKernelForm;
+        const auto form = moe_q4k_a8::known_rows::prefill_kernel_form(p.request, p.down_type, config.prefill_f16wmma ? 3 : -1);
+        if (form == Form::f16_wmma) stats.prefill_f16wmma_submissions.fetch_add(count, std::memory_order_relaxed);
+        if (gsq_a8::gate_type(p.request.gate_type)) {
+            (form == Form::f16_wmma ? stats.prefill_gsq_f16wmma_submissions : form == Form::iu8_wmma ? stats.prefill_gsq_iu8_submissions
+                : stats.prefill_gsq_dot4_submissions).fetch_add(count, std::memory_order_relaxed);
+            const bool batch128 = form == Form::f16_wmma && (moe_q4k_a8::known_rows::prefill_effective_tune(p.request, count, p.down_type, 3) &
+                moe_q4k_a8::known_rows::gsq_f16_tune_mask & 2U) != 0U;
+            if (batch128) stats.prefill_gsq_f16wmma_batch128_submissions.fetch_add(count, std::memory_order_relaxed);
+            auto& global = moe_q4k_a8::gsq_prefill_rows();
+            (form == Form::f16_wmma ? global.f16wmma : form == Form::iu8_wmma ? global.iu8wmma : global.dot4).fetch_add(count, std::memory_order_relaxed);
+            if (batch128) global.f16wmma_batch128.fetch_add(count, std::memory_order_relaxed);
+        }
     }
 }
 #endif

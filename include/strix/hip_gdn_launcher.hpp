@@ -90,6 +90,8 @@ struct GdnWindowLayer {
     const void *qkv = nullptr, *z = nullptr, *beta = nullptr, *alpha = nullptr, *out = nullptr;
     const void *conv = nullptr, *dt = nullptr, *a = nullptr, *norm = nullptr;
     std::uint32_t gate_type = 0, conv_type = 0, dt_type = 0, a_type = 0, norm_type = 0;
+    // qkv/z/out ggml types: Q8_0, or GSQ dense types under dense A8 (STRIX_GSQ_Q20_A8=1); gates may then be BF16.
+    std::uint32_t qkv_type = 8, z_type = 8, out_type = 8;
     float* matrix = nullptr;             // config.recurrent_storage order
     std::uint16_t* conv_state = nullptr; // [conv channels][kernel] BF16 history
     void* retained = nullptr;            // gdn_window_retained_bytes(): [2 slots][8 rows]

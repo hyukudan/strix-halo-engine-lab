@@ -8,6 +8,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <atomic>
 #include <cstddef>
 #include <cstdio>
@@ -22,6 +23,7 @@
 #include <vector>
 
 #if defined(__linux__)
+#include <sys/mman.h>
 #include <unistd.h>
 #endif
 
@@ -95,7 +97,10 @@ hipError_t selective_allocate(void** address, std::size_t bytes) {
     const auto count = ++model_residency_diagnostic::counters.allocations;
     if (inject(model_residency_diagnostic::Fault::allocation, count)) return hipErrorOutOfMemory;
 #endif
-    const auto error = hipMalloc(address, bytes);
+    // STRIX_MODEL_COPY_ALL=fine|uc: the arena's memory type (default hipMalloc).
+    const auto mode = hip_model_copy_all_mode();
+    const auto error = mode == 2U ? hipExtMallocWithFlags(address, bytes, hipDeviceMallocFinegrained) :
+        mode == 3U ? hipExtMallocWithFlags(address, bytes, hipDeviceMallocUncached) : hipMalloc(address, bytes);
 #if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
     if (error == hipSuccess) ++model_residency_diagnostic::counters.acquired_allocations;
 #endif
@@ -190,7 +195,7 @@ private:
 };
 
 std::uint64_t expert_staging_capacity(const SelectiveCopyPlan& plan, HipModelCopyTier tier) {
-    if (tier != HipModelCopyTier::experts) return 0;
+    if (tier != HipModelCopyTier::experts && tier != HipModelCopyTier::all) return 0;
     std::uint64_t cap = 32ULL * 1024ULL * 1024ULL;
 #if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
     const auto requested = model_residency_diagnostic::fault_plan.staging_capacity_bytes;
@@ -289,8 +294,8 @@ bool should_promote(
 bool should_register(const ManifestTensor& tensor,
     const HipModelResidencyPolicy& policy) noexcept {
     return should_promote(tensor, policy) &&
-        !(policy.copy_tier == HipModelCopyTier::experts &&
-          selective_copy_eligible(tensor, HipModelCopyTier::experts));
+        !((policy.copy_tier == HipModelCopyTier::experts || policy.copy_tier == HipModelCopyTier::all) &&
+          selective_copy_eligible(tensor, policy.copy_tier));
 }
 
 struct HostRange {
@@ -386,7 +391,21 @@ std::vector<HostRange> build_registration_ranges(
             merged.push_back(range);
         }
     }
-    return merged;
+    // STRIX_MODEL_REGISTER_CHUNK_BYTES=N (default 268435456 = 256 MiB; 0 = one registration per merged range): register each merged range as page-aligned
+    // pieces of at most N bytes. An invalidated page of a userptr registration makes the driver revalidate the
+    // whole registration while every queue of the process is evicted; smaller pieces bound that stall. A tensor
+    // may then span pieces: binding requires their device aliases to be contiguous (checked after registering).
+    static const std::uint64_t chunk = [] {
+        const char* v = std::getenv("STRIX_MODEL_REGISTER_CHUNK_BYTES");
+        return v ? std::strtoull(v, nullptr, 10) : 268435456ULL;
+    }();
+    if (chunk == 0U) return merged;
+    const auto piece = std::max<std::uint64_t>(align_down(chunk, page), page);
+    std::vector<HostRange> pieces;
+    for (const auto range : merged)
+        for (auto begin = range.begin; begin < range.end; begin += piece)
+            pieces.push_back(HostRange{begin, std::min(range.end, checked_add(begin, piece))});
+    return pieces;
 }
 
 // Selected source interiors must remain unregistered. Retaining the mapping
@@ -446,6 +465,15 @@ HipModelResidencyReservation plan_hip_model_residency_reservation(const MappedMo
     result.copy_range_count = selective.ranges.size();
     result.copied_reserved_bytes = selective.arena_bytes;
     result.mapped_reserved_bytes = align_up(mapped.bytes(), page_size());
+    // Tier all (STRIX_MODEL_COPY_ALL): the source pages of every copied range are paged out right after their copy
+    // (MADV_PAGEOUT), so the mapping retains only the uncopied file-backed tensors (the CPU-read PLE table).
+    if (policy.copy_tier == HipModelCopyTier::all) {
+        std::uint64_t released = 0;
+        for (const auto& range : selective.ranges)
+            released = checked_add(released, align_up(range.file_end, page_size()) - range.file_begin);
+        if (released >= result.mapped_reserved_bytes) throw std::invalid_argument("copy-all leaves no file-backed mapping");
+        result.mapped_reserved_bytes -= released;
+    }
     const auto ranges = policy.mode == HipModelResidencyMode::registered_file_mapping
         ? build_registration_ranges(mapped, manifest, policy) : build_copy_ranges(mapped, manifest, policy);
     if (policy.copy_tier == HipModelCopyTier::experts)
@@ -579,8 +607,10 @@ UmaOwnerInventory HipModelResidency::owner_inventory(std::shared_ptr<const HipMo
     const UmaBackingIdentity mapping_key{0x4849504d41503031ULL,
         static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(mapped_owner.get())), source_generation_};
     std::vector<UmaOwnerView> views;
+    // Tier all declares only the uncopied (file-backed) part of the mapping as retained (see the reservation plan).
     views.push_back({next_uma_owner_view_identity(), mapping_key, UmaBackingKind::file_mapping, "weights.mapping",
-        reservation_.mapped_reserved_bytes, 0, source_bytes_, pin, UmaAddressSpace::host, source_base_});
+        reservation_.mapped_reserved_bytes, 0, copy_tier_ == HipModelCopyTier::all ?
+            std::min(source_bytes_, reservation_.mapped_reserved_bytes) : source_bytes_, pin, UmaAddressSpace::host, source_base_});
     for (const auto& range : registered_ranges_) {
         if (range.host_base < source_base_ || range.host_base - source_base_ > reservation_.mapped_reserved_bytes ||
             range.bytes > reservation_.mapped_reserved_bytes - (range.host_base - source_base_) ||
@@ -629,6 +659,18 @@ bool HipModelResidency::covers_device_range(
     };
     for (const auto& range : registered_ranges_)
         if (contains(range.device_base, range.bytes)) return true;
+    // Chunked registration: a range may continue through consecutive registrations with contiguous device aliases.
+    for (std::size_t i = 0; i < registered_ranges_.size(); ++i) {
+        const auto& first = registered_ranges_[i];
+        if (!first.device_base || address < first.device_base || address - first.device_base >= first.bytes) continue;
+        auto covered = first.bytes - static_cast<std::uint64_t>(address - first.device_base);
+        for (auto j = i + 1; covered < bytes && j < registered_ranges_.size(); ++j) {
+            const auto& prev = registered_ranges_[j - 1];
+            if (registered_ranges_[j].device_base != prev.device_base + prev.bytes) break;
+            covered += registered_ranges_[j].bytes;
+        }
+        return covered >= bytes;
+    }
     for (const auto& range : copied_ranges_)
         if (contains(range.device_base, range.bytes)) return true;
     if (contains(copy_arena_base_, copy_arena_bytes_)) return true;
@@ -746,6 +788,16 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                     checked_add(
                         result.registered_bytes_,
                         bytes);
+#if defined(__linux__) && defined(MLOCK_ONFAULT)
+                // STRIX_MODEL_REGISTER_MLOCK=1 (opt-in): keep registered pages off the reclaim LRU. A reclaimed or
+                // migrated page invalidates its userptr registration and the driver evicts every queue of the process
+                // until the whole registration is revalidated. Needs RLIMIT_MEMLOCK >= the registered bytes; with
+                // vm.compact_unevictable_allowed=0 compaction does not migrate them either. Failure only warns.
+                static const bool lock = [] { const char* v = std::getenv("STRIX_MODEL_REGISTER_MLOCK"); return v && v[0] == '1'; }();
+                if (lock && mlock2(reinterpret_cast<const void*>(host), static_cast<std::size_t>(bytes), MLOCK_ONFAULT) != 0)
+                    std::fprintf(stderr, "model residency: mlock of %llu registered bytes failed (%s); continuing unlocked\n",
+                        static_cast<unsigned long long>(bytes), std::strerror(errno));
+#endif
             }
 
             for (std::size_t index = 0;
@@ -780,14 +832,25 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                             const auto offset =
                                 static_cast<std::uint64_t>(
                                     host - range.host_base);
-                            return offset <= range.bytes &&
-                                   tensor.byte_size <=
-                                       range.bytes - offset;
+                            return offset < range.bytes || (offset == range.bytes && tensor.byte_size == 0U);
                         });
                 if (found ==
                     result.registered_ranges_.end()) {
                     throw std::logic_error(
                         "promoted tensor is not covered by a registered range");
+                }
+                // A tensor that continues past its first range (chunked registration only) must lie in
+                // consecutive ranges whose host and device aliases are both contiguous.
+                {
+                    auto covered = found->bytes - static_cast<std::uint64_t>(host - found->host_base);
+                    for (auto next = found + 1; covered < tensor.byte_size; ++next) {
+                        const auto prev = next - 1;
+                        if (next == result.registered_ranges_.end() || next->host_base != prev->host_base + prev->bytes ||
+                            next->device_base != prev->device_base + prev->bytes)
+                            throw std::logic_error(
+                                "promoted tensor spans registered ranges without contiguous device aliases");
+                        covered += next->bytes;
+                    }
                 }
 
                 const auto offset =
@@ -809,6 +872,11 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                     if (!range.device_base || range.device_base % page || range.host_base % page ||
                         range.bytes > UINTPTR_MAX - range.device_base)
                         throw std::invalid_argument("selective residency requires page-congruent registered aliases");
+                // Tier all: release the page cache of every range about to be copied BEFORE the arena allocation,
+                // so the allocation finds free memory instead of reclaiming/compacting ~82 GB of cache under the
+                // process's pinned host buffers (measured: 23 M pages scanned and 1.4 M migrated otherwise).
+                if (policy.copy_tier == HipModelCopyTier::all)
+                    for (const auto& range : selective.ranges) mapped.advise_dontneed(range.file_begin, range.file_end - range.file_begin);
                 result.arena_ranges_ = std::move(selective.ranges);
                 result.copy_arena_identity_ = residency_identity();
                 void* arena = nullptr;
@@ -860,6 +928,19 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                                         range.arena_offset + (source_begin - range.file_begin)), source,
                                     static_cast<std::size_t>(bytes)), "selective residency weight copy");
                             }); // Proves the source lease can be reused for the next chunk.
+#if defined(__linux__)
+                            if (policy.copy_tier == HipModelCopyTier::all) {
+#if defined(MADV_PAGEOUT)
+                                constexpr int pageout = MADV_PAGEOUT;
+#else
+                                constexpr int pageout = 21;
+#endif
+                                // Copied: drop these source pages (clean file pages; a later host read refaults them).
+                                const auto first = align_down(source_begin, page_size());
+                                const auto last = std::min(align_up(source_begin + bytes, page_size()), align_up(mapped.bytes(), page_size()));
+                                (void)::madvise(reinterpret_cast<void*>(mapped.base_address() + first), static_cast<std::size_t>(last - first), pageout);
+                            }
+#endif
                             source_begin += bytes;
                         }
                     }
@@ -879,7 +960,7 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                         throw std::logic_error("selective tensor address congruence differs from source");
                 }
                 result.copied_bytes_ = selective.arena_bytes;
-                if (policy.copy_tier == HipModelCopyTier::experts) {
+                if (policy.copy_tier == HipModelCopyTier::experts || policy.copy_tier == HipModelCopyTier::all) {
                     std::size_t selected_count = 0;
                     for (std::size_t index = 0; index < manifest.tensors.size(); ++index) {
                         const auto& tensor = manifest.tensors[index];

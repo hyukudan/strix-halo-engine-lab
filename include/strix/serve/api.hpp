@@ -34,6 +34,9 @@ struct ApiConfig {
     // POST /admin/drain (authenticated): stop admitting and finish what runs; /health answers 503 "draining" after it.
     // Unset: the route answers 404.
     std::function<void()> on_drain;
+    // Further engine routes (authenticated), tried before the built-in POST routes: true when the hook answered.
+    // Unset: nothing changes.
+    std::function<bool(const HttpRequest&, HttpResponseWriter&)> engine_routes;
 };
 
 // OpenAI-compatible (/v1/chat/completions, /v1/completions, /v1/models) and Anthropic-compatible

@@ -6,6 +6,8 @@
 #include <limits>
 #include <stdexcept>
 
+#include "strix/gsq_a8_groups.hpp"
+
 namespace strix::shared_expert_rows_diagnostic {
 enum class Arm { reference_rows, shared_q8_rows };
 struct Shape {
@@ -13,7 +15,11 @@ struct Shape {
     std::uint64_t input_stride_bytes = 0, output_stride_bytes = 0, workspace_stride_bytes = 0;
 };
 struct Span { std::uintptr_t address = 0; std::uint64_t bytes = 0; };
-struct Weights { Span gate_q8, up_q8, down_q8, shared_gate_f32; };
+struct Weights {
+    Span gate_q8, up_q8, down_q8, shared_gate_f32;
+    // ggml types of gate/up/down: Q8_0, or GSQ-RCO dense types (dense A8 typed segments).
+    std::uint32_t gate_type = 8, up_type = 8, down_type = 8;
+};
 struct Layout {
     std::uint64_t input_bytes = 0, output_bytes = 0, workspace_bytes = 0;
     std::uint64_t gate_up_weight_bytes = 0, down_weight_bytes = 0, scalar_weight_bytes = 0;
@@ -55,8 +61,13 @@ inline Layout validate(Shape s, Span input, Weights weights, Span workspace, Spa
     };
     check(input, result.input_bytes); check(output, result.output_bytes);
     check(workspace, result.workspace_bytes);
-    check(weights.gate_q8, result.gate_up_weight_bytes); check(weights.up_q8, result.gate_up_weight_bytes);
-    check(weights.down_q8, result.down_weight_bytes); check(weights.shared_gate_f32, result.scalar_weight_bytes);
+    const auto bytes = [&](std::uint32_t type, std::uint32_t width, std::uint32_t outputs, std::uint64_t q8) {
+        return type == 8U ? q8 : gsq_a8::dense_row_bytes(type, width) * outputs;
+    };
+    check(weights.gate_q8, bytes(weights.gate_type, s.hidden, s.intermediate, result.gate_up_weight_bytes));
+    check(weights.up_q8, bytes(weights.up_type, s.hidden, s.intermediate, result.gate_up_weight_bytes));
+    check(weights.down_q8, bytes(weights.down_type, s.intermediate, s.hidden, result.down_weight_bytes));
+    check(weights.shared_gate_f32, result.scalar_weight_bytes);
     const auto overlap = [](Span a, Span b) {
         return a.address < b.address + b.bytes && b.address < a.address + a.bytes;
     };

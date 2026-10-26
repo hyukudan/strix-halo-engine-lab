@@ -1,10 +1,12 @@
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
+#include "strix/moe_a8_down_contract.hpp"
 #if defined(__FAST_MATH__) || (defined(__FINITE_MATH_ONLY__) && __FINITE_MATH_ONLY__)
 #error "A8 CSR gate/up requires strict floating-point semantics"
 #endif
 #include <hip/hip_fp16.h>
 #include <algorithm>
 #include <array>
+#include <utility>
 #include <cstdio>
 #include <vector>
 #include <cstdlib>
@@ -12,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #pragma clang fp contract(off)
+#include "strix/hip_gsq_a8_groups.hpp"
 #if defined(__HIP_DEVICE_COMPILE__)
 #if !defined(__gfx1151__) || !__has_builtin(__builtin_amdgcn_sudot4)
 #error "A8 CSR gate/up requires gfx1151 signed-A unsigned-B dot4"
@@ -391,6 +394,138 @@ __global__ __launch_bounds__(256) void down_window(const unsigned char* weights,
         if(owner==0U)view.rawdots[csr.rows[begin+a]][csr.slots[begin+a]*hidden+row]=acc[a];
     }
 }
+// GSQ-RCO Q2_0 window forms: project_q20 / down_rawdots_q20 lane arithmetic per (row, slot), shared
+// weight loads per CSR batch, then project_window's A8 down quantizer epilogue (identical bytes).
+__device__ __forceinline__ unsigned q20_word(unsigned byte) {
+    return (byte|(byte<<6U)|(byte<<12U)|(byte<<18U))&0x03030303U;
+}
+__device__ __forceinline__ unsigned q20_u16(const unsigned char* p) {
+    return static_cast<unsigned>(p[0])|(static_cast<unsigned>(p[1])<<8U);
+}
+struct Q20Group { unsigned w[8]; float d; };
+__device__ __forceinline__ Q20Group q20_load(const unsigned char* block,unsigned half) {
+    Q20Group x;
+    const auto* codes=block+2U+half*8U;
+#pragma unroll
+    for(unsigned i=0;i<4U;++i){const unsigned v=q20_u16(codes+2U*i);x.w[2U*i]=q20_word(v&255U);x.w[2U*i+1U]=q20_word(v>>8U);}
+    x.d=__half2float(__ushort_as_half(static_cast<unsigned short>(q20_u16(block))));
+    return x;
+}
+__device__ __forceinline__ float q20_apply(const Q20Group& x,const int* a,int sum,float delta) {
+    int integer=dot(a[0],x.w[0],0);
+#pragma unroll
+    for(unsigned i=1;i<8U;++i)integer=dot(a[i],x.w[i],integer);
+    const float scaled=x.d*static_cast<float>(integer-sum);
+    return delta*scaled;
+}
+template<unsigned G>
+__global__ __launch_bounds__(256) void project_window_q20(const unsigned char* gate,const unsigned char* up,DeviceRows view,DeviceCsr csr,
+    unsigned rows,unsigned hidden,unsigned outputs) {
+    unsigned failure=csr.summary[0];
+    for(unsigned r=0;r<rows;++r)failure|=*view.status[r];
+    if((failure&~projection_nonfinite)||blockIdx.y>=csr.summary[2])return;
+    const auto begin=csr.begins[blockIdx.y],count=csr.begins[blockIdx.y+1U]-begin,expert=csr.experts[blockIdx.y];
+    __shared__ __align__(16) signed char local_codes[G][max_hidden];
+    __shared__ __align__(16) float local_deltas[G][max_hidden/32U];
+    __shared__ __align__(16) int local_sums[G][max_hidden/32U];
+    __shared__ float tile[2][G][32];
+    const unsigned lane=threadIdx.x&31U,c=lane&7U,wave=threadIdx.x/32U;
+    const unsigned out=blockIdx.x*32U+wave*4U+lane/8U,groups=hidden/32U;
+    const auto offset=(static_cast<unsigned long long>(expert)*outputs+out)*(hidden/64U)*18U;
+    for(unsigned group=0;group<count;group+=G) {
+        if(group)__syncthreads();
+#pragma unroll
+        for(unsigned a=0;a<G;++a)if(group+a<count) {
+            const auto r=csr.rows[begin+group+a];
+            for(unsigned i=16U*threadIdx.x;i<hidden;i+=4096U)
+                *reinterpret_cast<int4*>(local_codes[a]+i)=*reinterpret_cast<const int4*>(view.codes[r]+i);
+            for(unsigned i=threadIdx.x;i<hidden/32U;i+=256U){local_deltas[a][i]=view.deltas[r][i];local_sums[a][i]=view.sums[r][i];}
+        }
+        __syncthreads();
+        float acc[2][G]={};
+#pragma unroll
+        for(unsigned m=0;m<2U;++m) {
+            const unsigned char* w=(m==0U?gate:up)+offset;
+#pragma unroll 1
+            for(unsigned g=c;g<groups;g+=8U) {
+                const auto x=q20_load(w+(g/2U)*18U,g&1U);
+#pragma unroll
+                for(unsigned a=0;a<G;++a)if(group+a<count) {
+                    const float value=q20_apply(x,reinterpret_cast<const int*>(local_codes[a]+g*32U),local_sums[a][g],local_deltas[a][g]);
+                    acc[m][a]=acc[m][a]+value;
+                }
+            }
+        }
+#pragma unroll
+        for(unsigned a=0;a<G;++a)if(group+a<count) {
+#pragma unroll
+            for(unsigned m=0;m<2U;++m){acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],1,32);acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],2,32);
+                acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],4,32);}
+            if(c==0U){tile[0][a][out%32U]=acc[0][a];tile[1][a][out%32U]=acc[1][a];}
+        }
+        __syncthreads();
+        for(unsigned a=wave;a<G;a+=8U)if(group+a<count) {
+            const auto r=csr.rows[begin+group+a],slot=csr.slots[begin+group+a];
+            const unsigned feature=blockIdx.x*32U+lane,at=slot*2U*outputs+feature;
+            const float g=tile[0][a][lane],u=tile[1][a][lane];
+            const float hv=(g/(1.0F+expf(-g)))*u;
+            view.output[r][at+outputs]=u;
+            const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(hv)));
+            if(bad!=0){view.output[r][at]=g;if(lane==0)atomicOr(view.status[r],projection_nonfinite);continue;}
+            float x=fabsf(hv);
+            for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,__shfl_xor(x,stride,32));
+            const bool tiny=x>0.0F && x<0x1p-119F;
+            const float delta=x==0.0F || tiny?1.0F:divide_rne(x,127.0F);
+            const float rounded=tiny?0.0F:rintf(divide_rne(hv,delta));
+            const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
+            int sum=code;
+            for(int stride=16;stride!=0;stride/=2) sum+=__shfl_xor(sum,stride,32);
+            view.output[r][at]=hv;
+            view.down_codes[r][slot*outputs+feature]=static_cast<signed char>(code);
+            if(lane==0){view.down_deltas[r][slot*(outputs/32U)+blockIdx.x]=delta;view.down_sums[r][slot*(outputs/32U)+blockIdx.x]=sum;}
+        }
+    }
+}
+template<unsigned Rows>
+__global__ __launch_bounds__(256) void down_window_q20(const unsigned char* weights,DeviceRows view,DeviceCsr csr,
+    unsigned rows,unsigned hidden,unsigned width) {
+    unsigned failure=csr.summary[0];
+    for(unsigned r=0;r<rows;++r)failure|=*view.status[r];
+    if(failure){if(blockIdx.x==0U&&blockIdx.y==0U&&threadIdx.x==0U)csr.summary[0]=failure;return;}
+    if(blockIdx.y>=csr.summary[2])return;
+    const auto begin=csr.begins[blockIdx.y],count=csr.begins[blockIdx.y+1U]-begin,expert=csr.experts[blockIdx.y];
+    __shared__ __align__(16) signed char codes[Rows][max_rows];
+    __shared__ float deltas[Rows][max_rows/32U];
+    __shared__ int sums[Rows][max_rows/32U];
+    const unsigned groups=width/32U;
+#pragma unroll
+    for(unsigned a=0;a<Rows;++a)if(a<count) {
+        const auto r=csr.rows[begin+a],slot=csr.slots[begin+a];
+        for(unsigned i=16U*threadIdx.x;i<width;i+=4096U)
+            *reinterpret_cast<int4*>(codes[a]+i)=*reinterpret_cast<const int4*>(view.down_codes[r]+slot*width+i);
+        for(unsigned i=threadIdx.x;i<groups;i+=256U){deltas[a][i]=view.down_deltas[r][slot*groups+i];sums[a][i]=view.down_sums[r][slot*groups+i];}
+    }
+    __syncthreads();
+    const unsigned lane=threadIdx.x&31U,owner=lane&3U;
+    const unsigned row=blockIdx.x*64U+(threadIdx.x/32U)*8U+lane/4U;
+    const auto* row_weights=weights+(static_cast<unsigned long long>(expert)*hidden+row)*(width/64U)*18U;
+    float acc[Rows]={};
+#pragma unroll 1
+    for(unsigned group=owner;group<groups;group+=4U) {
+        const auto x=q20_load(row_weights+(group/2U)*18U,group&1U);
+#pragma unroll
+        for(unsigned a=0;a<Rows;++a)if(a<count) {
+            const float contribution=q20_apply(x,reinterpret_cast<const int*>(codes[a]+group*32U),sums[a][group],deltas[a][group]);
+            acc[a]=acc[a]+contribution;
+        }
+    }
+#pragma unroll
+    for(unsigned a=0;a<Rows;++a)if(a<count) {
+        acc[a]=acc[a]+__shfl_xor(acc[a],1,32);
+        acc[a]=acc[a]+__shfl_xor(acc[a],2,32);
+        if(owner==0U)view.rawdots[csr.rows[begin+a]][csr.slots[begin+a]*hidden+row]=acc[a];
+    }
+}
 template<class T> __device__ __forceinline__ T* at(StridedRows<T> v,unsigned r) {
     return reinterpret_cast<T*>(reinterpret_cast<std::uintptr_t>(v.base)+static_cast<unsigned long long>(r)*v.stride);
 }
@@ -636,6 +771,269 @@ __global__ __launch_bounds__(256) void project_prefill(const unsigned char* gate
             if(lane==0){at(view.down_deltas,r)[slot*(outputs/32U)+tile_index]=delta;at(view.down_sums,r)[slot*(outputs/32U)+tile_index]=sum;}
         }
     }
+}
+// Q2_0 prefill (dot4 form): project_window_q20 / down_window_q20 arithmetic per (row, slot) over the
+// strided prefill rows; grid x = CSR batch, y = 32-output (gate/up) or 64-row (down) tile.
+template<unsigned G>
+__global__ __launch_bounds__(256) void project_prefill_q20(const unsigned char* gate,const unsigned char* up,PrefillRows view,
+    unsigned hidden,unsigned outputs) {
+    const auto& csr=view.csr;
+    if((csr.summary[0]&~projection_nonfinite)||blockIdx.x>=csr.summary[2])return;
+    const unsigned tile_index=blockIdx.y;
+    const auto begin=csr.begins[blockIdx.x],count=csr.begins[blockIdx.x+1U]-begin,expert=csr.experts[blockIdx.x];
+    __shared__ __align__(16) signed char local_codes[G][max_hidden];
+    __shared__ __align__(16) float local_deltas[G][max_hidden/32U];
+    __shared__ __align__(16) int local_sums[G][max_hidden/32U];
+    __shared__ float tile[2][G][32];
+    const unsigned lane=threadIdx.x&31U,c=lane&7U,wave=threadIdx.x/32U;
+    const unsigned out=tile_index*32U+wave*4U+lane/8U,groups=hidden/32U;
+    const auto offset=(static_cast<unsigned long long>(expert)*outputs+out)*(hidden/64U)*18U;
+    for(unsigned group=0;group<count;group+=G) {
+        if(group)__syncthreads();
+#pragma unroll
+        for(unsigned a=0;a<G;++a)if(group+a<count) {
+            const auto r=csr.rows[begin+group+a];
+            const auto* codes=at(view.codes,r);const auto* deltas=at(view.deltas,r);const auto* sums=at(view.sums,r);
+            for(unsigned i=16U*threadIdx.x;i<hidden;i+=4096U)
+                *reinterpret_cast<int4*>(local_codes[a]+i)=*reinterpret_cast<const int4*>(codes+i);
+            for(unsigned i=threadIdx.x;i<hidden/32U;i+=256U){local_deltas[a][i]=deltas[i];local_sums[a][i]=sums[i];}
+        }
+        __syncthreads();
+        float acc[2][G]={};
+#pragma unroll
+        for(unsigned m=0;m<2U;++m) {
+            const unsigned char* w=(m==0U?gate:up)+offset;
+#pragma unroll 1
+            for(unsigned g=c;g<groups;g+=8U) {
+                const auto x=q20_load(w+(g/2U)*18U,g&1U);
+#pragma unroll
+                for(unsigned a=0;a<G;++a)if(group+a<count) {
+                    const float value=q20_apply(x,reinterpret_cast<const int*>(local_codes[a]+g*32U),local_sums[a][g],local_deltas[a][g]);
+                    acc[m][a]=acc[m][a]+value;
+                }
+            }
+        }
+#pragma unroll
+        for(unsigned a=0;a<G;++a)if(group+a<count) {
+#pragma unroll
+            for(unsigned m=0;m<2U;++m){acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],1,32);acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],2,32);
+                acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],4,32);}
+            if(c==0U){tile[0][a][out%32U]=acc[0][a];tile[1][a][out%32U]=acc[1][a];}
+        }
+        __syncthreads();
+        for(unsigned a=wave;a<G;a+=8U)if(group+a<count) {
+            const auto r=csr.rows[begin+group+a],slot=csr.slots[begin+group+a];
+            float* output=at(view.output,r);
+            const unsigned feature=tile_index*32U+lane,at_slot=slot*2U*outputs+feature;
+            const float g=tile[0][a][lane],u=tile[1][a][lane];
+            const float hv=(g/(1.0F+expf(-g)))*u;
+            output[at_slot+outputs]=u;
+            const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(hv)));
+            if(bad!=0){output[at_slot]=g;if(lane==0){atomicOr(at(view.status,r),projection_nonfinite);atomicOr(csr.summary,projection_nonfinite);}continue;}
+            float x=fabsf(hv);
+            for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,__shfl_xor(x,stride,32));
+            const bool tiny=x>0.0F && x<0x1p-119F;
+            const float delta=x==0.0F || tiny?1.0F:divide_rne(x,127.0F);
+            const float rounded=tiny?0.0F:rintf(divide_rne(hv,delta));
+            const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
+            int sum=code;
+            for(int stride=16;stride!=0;stride/=2) sum+=__shfl_xor(sum,stride,32);
+            output[at_slot]=hv;
+            at(view.down_codes,r)[slot*outputs+feature]=static_cast<signed char>(code);
+            if(lane==0){at(view.down_deltas,r)[slot*(outputs/32U)+tile_index]=delta;at(view.down_sums,r)[slot*(outputs/32U)+tile_index]=sum;}
+        }
+    }
+}
+template<unsigned Rows>
+__global__ __launch_bounds__(256) void down_prefill_q20(const unsigned char* weights,PrefillRows view,unsigned hidden,unsigned width) {
+    const auto& csr=view.csr;
+    if(csr.summary[0]||blockIdx.x>=csr.summary[2])return;
+    const auto begin=csr.begins[blockIdx.x],count=csr.begins[blockIdx.x+1U]-begin,expert=csr.experts[blockIdx.x];
+    __shared__ __align__(16) signed char codes[Rows][max_rows];
+    __shared__ float deltas[Rows][max_rows/32U];
+    __shared__ int sums[Rows][max_rows/32U];
+    const unsigned groups=width/32U;
+    const unsigned lane=threadIdx.x&31U,owner=lane&3U;
+    const unsigned row=blockIdx.y*64U+(threadIdx.x/32U)*8U+lane/4U;
+    const auto* row_weights=weights+(static_cast<unsigned long long>(expert)*hidden+row)*(width/64U)*18U;
+    for(unsigned first=0;first<count;first+=Rows) {
+        if(first)__syncthreads();
+#pragma unroll
+        for(unsigned a=0;a<Rows;++a)if(first+a<count) {
+            const auto r=csr.rows[begin+first+a],slot=csr.slots[begin+first+a];
+            const auto* down_codes=at(view.down_codes,r)+slot*width;
+            const auto* down_deltas=at(view.down_deltas,r)+slot*groups;const auto* down_sums=at(view.down_sums,r)+slot*groups;
+            for(unsigned i=16U*threadIdx.x;i<width;i+=4096U)
+                *reinterpret_cast<int4*>(codes[a]+i)=*reinterpret_cast<const int4*>(down_codes+i);
+            for(unsigned i=threadIdx.x;i<groups;i+=256U){deltas[a][i]=down_deltas[i];sums[a][i]=down_sums[i];}
+        }
+        __syncthreads();
+        float acc[Rows]={};
+#pragma unroll 1
+        for(unsigned group=owner;group<groups;group+=4U) {
+            const auto x=q20_load(row_weights+(group/2U)*18U,group&1U);
+#pragma unroll
+            for(unsigned a=0;a<Rows;++a)if(first+a<count) {
+                const float contribution=q20_apply(x,reinterpret_cast<const int*>(codes[a]+group*32U),sums[a][group],deltas[a][group]);
+                acc[a]=acc[a]+contribution;
+            }
+        }
+#pragma unroll
+        for(unsigned a=0;a<Rows;++a)if(first+a<count) {
+            acc[a]=acc[a]+__shfl_xor(acc[a],1,32);
+            acc[a]=acc[a]+__shfl_xor(acc[a],2,32);
+            if(owner==0U)at(view.rawdots,csr.rows[begin+first+a])[csr.slots[begin+first+a]*hidden+row]=acc[a];
+        }
+    }
+}
+// GSQ IQ window / prefill forms: project_iq / down_rawdots_iq lane arithmetic per (row, slot).
+template<std::uint32_t T,unsigned G,bool Prefill,class View>
+__device__ __forceinline__ void project_iq_body(const unsigned char* gate,const unsigned char* up,const View& view,
+    const DeviceCsr& csr,unsigned batch,unsigned tile_index,unsigned hidden,unsigned outputs) {
+    const auto begin=csr.begins[batch],count=csr.begins[batch+1U]-begin,expert=csr.experts[batch];
+    __shared__ __align__(16) signed char local_codes[G][max_hidden];
+    __shared__ __align__(16) float local_deltas[G][max_hidden/32U];
+    __shared__ float tile[2][G][32];
+    const unsigned lane=threadIdx.x&31U,c=lane&7U,wave=threadIdx.x/32U;
+    const unsigned out=tile_index*32U+wave*4U+lane/8U,groups=hidden/32U;
+    const auto offset=(static_cast<unsigned long long>(expert)*outputs+out)*gsq_a8::row_bytes(T,hidden);
+    for(unsigned group=0;group<count;group+=G) {
+        if(group)__syncthreads();
+#pragma unroll
+        for(unsigned a=0;a<G;++a)if(group+a<count) {
+            const auto r=csr.rows[begin+group+a];
+            const signed char* codes;const float* deltas;
+            if constexpr(Prefill){codes=at(view.codes,r);deltas=at(view.deltas,r);}else{codes=view.codes[r];deltas=view.deltas[r];}
+            for(unsigned i=16U*threadIdx.x;i<hidden;i+=4096U)
+                *reinterpret_cast<int4*>(local_codes[a]+i)=*reinterpret_cast<const int4*>(codes+i);
+            for(unsigned i=threadIdx.x;i<hidden/32U;i+=256U)local_deltas[a][i]=deltas[i];
+        }
+        __syncthreads();
+        float acc[2][G]={};
+#pragma unroll
+        for(unsigned m=0;m<2U;++m) {
+            const unsigned char* w=(m==0U?gate:up)+offset;
+#pragma unroll 1
+            for(unsigned g=c;g<groups;g+=8U) {
+                const auto x=gsq_a8::iq_group<T>(w,g);
+#pragma unroll
+                for(unsigned a=0;a<G;++a)if(group+a<count) {
+                    const float value=gsq_a8::iq_apply<T>(x,reinterpret_cast<const int*>(local_codes[a]+g*32U),local_deltas[a][g]);
+                    acc[m][a]=acc[m][a]+value;
+                }
+            }
+        }
+#pragma unroll
+        for(unsigned a=0;a<G;++a)if(group+a<count) {
+#pragma unroll
+            for(unsigned m=0;m<2U;++m){acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],1,32);acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],2,32);
+                acc[m][a]=acc[m][a]+__shfl_xor(acc[m][a],4,32);}
+            if(c==0U){tile[0][a][out%32U]=acc[0][a];tile[1][a][out%32U]=acc[1][a];}
+        }
+        __syncthreads();
+        for(unsigned a=wave;a<G;a+=8U)if(group+a<count) {
+            const auto r=csr.rows[begin+group+a],slot=csr.slots[begin+group+a];
+            float* output;unsigned* status;signed char* down_codes;float* down_deltas;int* down_sums;
+            if constexpr(Prefill){output=at(view.output,r);status=at(view.status,r);down_codes=at(view.down_codes,r);
+                down_deltas=at(view.down_deltas,r);down_sums=at(view.down_sums,r);}
+            else{output=view.output[r];status=view.status[r];down_codes=view.down_codes[r];down_deltas=view.down_deltas[r];down_sums=view.down_sums[r];}
+            const unsigned feature=tile_index*32U+lane,at_slot=slot*2U*outputs+feature;
+            const float g=tile[0][a][lane],u=tile[1][a][lane];
+            const float hv=(g/(1.0F+expf(-g)))*u;
+            output[at_slot+outputs]=u;
+            const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(hv)));
+            if(bad!=0){output[at_slot]=g;if(lane==0){atomicOr(status,projection_nonfinite);if constexpr(Prefill)atomicOr(csr.summary,projection_nonfinite);}continue;}
+            float x=fabsf(hv);
+            for(int stride=16;stride!=0;stride/=2) x=fmaxf(x,__shfl_xor(x,stride,32));
+            const bool tiny=x>0.0F && x<0x1p-119F;
+            const float delta=x==0.0F || tiny?1.0F:divide_rne(x,127.0F);
+            const float rounded=tiny?0.0F:rintf(divide_rne(hv,delta));
+            const int code=static_cast<int>(fminf(127.0F,fmaxf(-127.0F,rounded)));
+            int sum=code;
+            for(int stride=16;stride!=0;stride/=2) sum+=__shfl_xor(sum,stride,32);
+            output[at_slot]=hv;
+            down_codes[slot*outputs+feature]=static_cast<signed char>(code);
+            if(lane==0){down_deltas[slot*(outputs/32U)+tile_index]=delta;down_sums[slot*(outputs/32U)+tile_index]=sum;}
+        }
+    }
+}
+template<std::uint32_t T,unsigned G>
+__global__ __launch_bounds__(256) void project_window_iq(const unsigned char* gate,const unsigned char* up,DeviceRows view,DeviceCsr csr,
+    unsigned rows,unsigned hidden,unsigned outputs) {
+    unsigned failure=csr.summary[0];
+    for(unsigned r=0;r<rows;++r)failure|=*view.status[r];
+    if((failure&~projection_nonfinite)||blockIdx.y>=csr.summary[2])return;
+    project_iq_body<T,G,false>(gate,up,view,csr,blockIdx.y,blockIdx.x,hidden,outputs);
+}
+template<std::uint32_t T,unsigned G>
+__global__ __launch_bounds__(256) void project_prefill_iq(const unsigned char* gate,const unsigned char* up,PrefillRows view,
+    unsigned hidden,unsigned outputs) {
+    const auto& csr=view.csr;
+    if((csr.summary[0]&~projection_nonfinite)||blockIdx.x>=csr.summary[2])return;
+    const DeviceCsr d{csr.summary,csr.offsets,csr.touched,csr.rows,csr.slots,csr.experts,csr.begins};
+    project_iq_body<T,G,true>(gate,up,view,d,blockIdx.x,blockIdx.y,hidden,outputs);
+}
+template<std::uint32_t T,unsigned Rows,bool Prefill,class View>
+__device__ __forceinline__ void down_iq_body(const unsigned char* weights,const View& view,const DeviceCsr& csr,
+    unsigned batch,unsigned tile_index,unsigned hidden,unsigned width) {
+    const auto begin=csr.begins[batch],count=csr.begins[batch+1U]-begin,expert=csr.experts[batch];
+    __shared__ __align__(16) signed char codes[Rows][max_rows];
+    __shared__ float deltas[Rows][max_rows/32U];
+    const unsigned groups=width/32U;
+    const unsigned lane=threadIdx.x&31U,owner=lane&3U;
+    const unsigned row=tile_index*64U+(threadIdx.x/32U)*8U+lane/4U;
+    const auto* row_weights=weights+(static_cast<unsigned long long>(expert)*hidden+row)*gsq_a8::row_bytes(T,width);
+    for(unsigned first=0;first<count;first+=Rows) {
+        if(first)__syncthreads();
+#pragma unroll
+        for(unsigned a=0;a<Rows;++a)if(first+a<count) {
+            const auto r=csr.rows[begin+first+a],slot=csr.slots[begin+first+a];
+            const signed char* dc;const float* dd;
+            if constexpr(Prefill){dc=at(view.down_codes,r)+slot*width;dd=at(view.down_deltas,r)+slot*groups;}
+            else{dc=view.down_codes[r]+slot*width;dd=view.down_deltas[r]+slot*groups;}
+            for(unsigned i=16U*threadIdx.x;i<width;i+=4096U)
+                *reinterpret_cast<int4*>(codes[a]+i)=*reinterpret_cast<const int4*>(dc+i);
+            for(unsigned i=threadIdx.x;i<groups;i+=256U)deltas[a][i]=dd[i];
+        }
+        __syncthreads();
+        float acc[Rows]={};
+#pragma unroll 1
+        for(unsigned group=owner;group<groups;group+=4U) {
+            const auto x=gsq_a8::iq_group<T>(row_weights,group);
+#pragma unroll
+            for(unsigned a=0;a<Rows;++a)if(first+a<count) {
+                const float contribution=gsq_a8::iq_apply<T>(x,reinterpret_cast<const int*>(codes[a]+group*32U),deltas[a][group]);
+                acc[a]=acc[a]+contribution;
+            }
+        }
+#pragma unroll
+        for(unsigned a=0;a<Rows;++a)if(first+a<count) {
+            acc[a]=acc[a]+__shfl_xor(acc[a],1,32);
+            acc[a]=acc[a]+__shfl_xor(acc[a],2,32);
+            if(owner==0U) {
+                float* raw;
+                if constexpr(Prefill)raw=at(view.rawdots,csr.rows[begin+first+a]);else raw=view.rawdots[csr.rows[begin+first+a]];
+                raw[csr.slots[begin+first+a]*hidden+row]=acc[a];
+            }
+        }
+        if constexpr(!Prefill)break;  // window batches hold at most Rows assignments
+    }
+}
+template<std::uint32_t T,unsigned Rows>
+__global__ __launch_bounds__(256) void down_window_iq(const unsigned char* weights,DeviceRows view,DeviceCsr csr,
+    unsigned rows,unsigned hidden,unsigned width) {
+    unsigned failure=csr.summary[0];
+    for(unsigned r=0;r<rows;++r)failure|=*view.status[r];
+    if(failure){if(blockIdx.x==0U&&blockIdx.y==0U&&threadIdx.x==0U)csr.summary[0]=failure;return;}
+    if(blockIdx.y>=csr.summary[2])return;
+    down_iq_body<T,Rows,false>(weights,view,csr,blockIdx.y,blockIdx.x,hidden,width);
+}
+template<std::uint32_t T,unsigned Rows>
+__global__ __launch_bounds__(256) void down_prefill_iq(const unsigned char* weights,PrefillRows view,unsigned hidden,unsigned width) {
+    const auto& csr=view.csr;
+    if(csr.summary[0]||blockIdx.x>=csr.summary[2])return;
+    const DeviceCsr d{csr.summary,csr.offsets,csr.touched,csr.rows,csr.slots,csr.experts,csr.begins};
+    down_iq_body<T,Rows,true>(weights,view,d,blockIdx.x,blockIdx.y,hidden,width);
 }
 // down_window over strided prefill rows, Rows staged rows at a time: same lane
 // chains, block decode and reduction per (row, slot). Grid x = batch, y = 64-row tile.
@@ -1085,10 +1483,14 @@ __device__ __forceinline__ uint2 f16_scaled_s8(unsigned w,float a) {
 // Prologue of the FP16 forms, one CTA per prompt row: the A8 prologue's clear, route checks and
 // row status, the row's input scale exponent and zeroed max |h| words. No A8 quantizer: a
 // non-finite input reaches g and u and fails the row in the gate/up epilogue (status 8).
+// a16 (MoE tune bit 4, else null): also the row's scaled FP16 image (f16_from_bf16 with the row's
+// scale, the values gate/up would stage), so gate/up converts each prompt row once instead of once
+// per (slot, output tile).
 __global__ __launch_bounds__(256) void f16_prefill_prologue(PrefillRows v,unsigned hidden,unsigned top_k,unsigned experts,
-    unsigned clear_words) {
+    unsigned clear_words,uint4* a16) {
     const unsigned r=blockIdx.x,t=threadIdx.x;
     __shared__ unsigned route_bits;
+    __shared__ int row_exponent;
     __shared__ float wave_max[8];
     if(t==0U)route_bits=0U;
     float* clear=at(v.clear,r);
@@ -1104,9 +1506,16 @@ __global__ __launch_bounds__(256) void f16_prefill_prologue(PrefillRows v,unsign
     __syncthreads();
     if(t==0U) {
         for(unsigned w=1;w<8U;++w)m=fmaxf(m,wave_max[w]);
-        at(v.sums,r)[0]=f16_exponent(m);
+        row_exponent=f16_exponent(m);
+        at(v.sums,r)[0]=row_exponent;
         *at(v.status,r)=route_bits;
     }
+    if(!a16)return;
+    __syncthreads();
+    const float scale=ldexpf(1.0F,row_exponent);
+    const auto* x16=reinterpret_cast<const uint4*>(x);
+    uint4* out=a16+static_cast<std::size_t>(r)*(hidden/8U);
+    for(unsigned k=t;k<hidden/8U;k+=256U)out[k]=f16_from_bf16(x16[k],scale);
 }
 // LDS-only barrier: the staged tiles are complete (lgkmcnt) but the next step's global loads stay
 // in flight (__syncthreads would also wait for them, as its workgroup fence does).
@@ -1120,36 +1529,61 @@ __device__ __forceinline__ uint4 f16_load(const void* p) {
 // One K64 step of a CTA: s.a holds the batch rows (64 x K64), s.b 256 B columns (x K64). A wave
 // owns two B columns tiles (cols[0], cols[1]) and every 16-row tile below mb: the B fragments are
 // read once per K16 plane and reused by up to four row tiles. K16 planes ascend.
-struct F16Stage { _Float16 a[f16_batch][f16_pitch]; _Float16 b[256][f16_pitch]; };
-__device__ __forceinline__ void f16_step(const F16Stage& s,unsigned mb,const unsigned (&cols)[2],unsigned i,f32x8 (&acc)[4][2]) {
+// Tune bit 3: 64-half rows whose 16-byte chunks are XOR-permuted by row % 8, so the 8 rows a 128-bit LDS
+// load serves per pass hit distinct banks without the 8-half padding (staging 40960 instead of 46080 bytes: three
+// 8-wave CTAs per WGP instead of two). Layout only; every operand and accumulation is unchanged.
+template<unsigned Tune> __device__ __forceinline__ unsigned f16_lds(unsigned row,unsigned half) {
+    if constexpr((Tune&8U)!=0U) return row*64U+((half/8U)^(row%8U))*8U+half%8U;
+    else return row*f16_pitch+half;
+}
+template<unsigned Batch,unsigned Columns,unsigned Tune> struct F16Stage {
+    static constexpr unsigned pitch=(Tune&8U)?64U:f16_pitch;
+    _Float16 a[Batch*pitch]; _Float16 b[Columns*pitch];
+    __device__ uint4* a16(unsigned row,unsigned half){return reinterpret_cast<uint4*>(a+f16_lds<Tune>(row,half));}
+    __device__ uint4* b16(unsigned row,unsigned half){return reinterpret_cast<uint4*>(b+f16_lds<Tune>(row,half));}
+};
+// Fragment row base + 16-aligned tile offset: the halves at lo and hi of that row.
+__device__ __forceinline__ f16x16 f16_pair(const _Float16* row,unsigned lo_half,unsigned hi_half) {
+    const uint4 lo=*reinterpret_cast<const uint4*>(row+lo_half),hi=*reinterpret_cast<const uint4*>(row+hi_half);
+    f16x16 v;
+    __builtin_memcpy(&v,&lo,16U);__builtin_memcpy(reinterpret_cast<char*>(&v)+16,&hi,16U);
+    return v;
+}
+template<unsigned Batch,unsigned Columns,unsigned Tune>
+__device__ __forceinline__ void f16_step(const F16Stage<Batch,Columns,Tune>& s,unsigned mb,const unsigned (&cols)[2],unsigned i,f32x8 (&acc)[4][2]) {
 #pragma unroll
     for(unsigned kk=0;kk<4U;++kk) {
-        const f16x16 b0=*reinterpret_cast<const f16x16*>(&s.b[cols[0]+i][16U*kk]);
-        const f16x16 b1=*reinterpret_cast<const f16x16*>(&s.b[cols[1]+i][16U*kk]);
+        // Rows are 16-aligned bases + i, so the XOR key of f16_lds is i % 8 for every fragment of this lane.
+        constexpr unsigned P=F16Stage<Batch,Columns,Tune>::pitch;
+        const unsigned key=(Tune&8U)?i%8U*8U:0U,lo=(16U*kk)^key,hi=(16U*kk+8U)^key;
+        const f16x16 b0=f16_pair(s.b+(cols[0]+i)*P,lo,hi);
+        const f16x16 b1=f16_pair(s.b+(cols[1]+i)*P,lo,hi);
 #pragma unroll
         for(unsigned mi=0;mi<4U;++mi)if(mi<mb) {
-            const f16x16 a=*reinterpret_cast<const f16x16*>(&s.a[16U*mi+i][16U*kk]);
+            const f16x16 a=f16_pair(s.a+(16U*mi+i)*P,lo,hi);
             acc[mi][0]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a,b0,acc[mi][0]);
             acc[mi][1]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a,b1,acc[mi][1]);
         }
     }
 }
 // Batch rows of a CTA into LDS (row, slot, scale exponent).
-struct F16Rows { unsigned row[f16_batch],slot[f16_batch]; int exponent[f16_batch]; };
+template<unsigned Batch> struct F16Rows { unsigned row[Batch],slot[Batch]; int exponent[Batch]; };
 // Gate/up of one CSR batch (<= 64 assignments) for 128 outputs of both matrices. Grid x = output
 // tile (the tiles of a batch run together and share its rows in L2), y = batch. B columns 0..127
 // are gate outputs, 128..255 the same up outputs; wave w owns gate and up columns 16w.. of every
 // row, so one lane holds g and u of the same (row, output) for the fused SwiGLU.
-template<bool Q5K>
+template<bool Q5K,unsigned Tune=0U>
 __global__ __launch_bounds__(256) void project_prefill_f16(const unsigned char* gate,const unsigned char* up,PrefillRows view,
     unsigned hidden,unsigned outputs) {
+    constexpr unsigned Batch=64U,Columns=256U,Outputs=Columns/2U;
+    const unsigned batch=blockIdx.y,tile=blockIdx.x;
     const auto& csr=view.csr;
-    if((csr.summary[0]&~projection_nonfinite)||blockIdx.y>=csr.summary[2])return;
-    const unsigned begin=csr.begins[blockIdx.y],count=csr.begins[blockIdx.y+1U]-begin,expert=csr.experts[blockIdx.y];
-    __shared__ __align__(16) F16Stage s;
-    __shared__ F16Rows rows;
+    if((csr.summary[0]&~projection_nonfinite)||batch>=csr.summary[2])return;
+    const unsigned begin=csr.begins[batch],count=csr.begins[batch+1U]-begin,expert=csr.experts[batch];
+    __shared__ __align__(16) F16Stage<Batch,Columns,Tune> s;
+    __shared__ F16Rows<Batch> rows;
     const unsigned t=threadIdx.x;
-    if(t<f16_batch) {
+    if(t<Batch) {
         const bool live=t<count;const unsigned r=live?csr.rows[begin+t]:0U;
         rows.row[t]=r;rows.slot[t]=live?csr.slots[begin+t]:0U;rows.exponent[t]=live?at(view.sums,r)[0]:0;
     }
@@ -1161,8 +1595,8 @@ __global__ __launch_bounds__(256) void project_prefill_f16(const unsigned char* 
     const float a_scale=ldexpf(1.0F,rows.exponent[a_row]);
     const auto* a_src=reinterpret_cast<const unsigned char*>(at(view.input,rows.row[a_row]))+32U*a_part;
     const unsigned blocks=hidden/256U,steps=hidden/64U;
-    const unsigned char* b_src=(t<128U?gate:up)+
-        (static_cast<unsigned long long>(expert)*outputs+blockIdx.x*128U+(t&127U))*blocks*block_bytes;
+    const unsigned char* b_src=(t<Outputs?gate:up)+
+        (static_cast<unsigned long long>(expert)*outputs+tile*Outputs+(t%Outputs))*blocks*block_bytes;
     struct Regs { uint4 a0{},a1{},h{},q0{},q1{},qh0{},qh1{}; };
     const auto fetch=[&](unsigned step,Regs& r) {
         if(a_live){r.a0=f16_load(a_src+128U*step);r.a1=f16_load(a_src+128U*step+16U);}
@@ -1173,16 +1607,13 @@ __global__ __launch_bounds__(256) void project_prefill_f16(const unsigned char* 
     };
     const auto stage=[&](unsigned step,const Regs& r) {
         const uint4 rh=r.h,rq0=r.q0,rq1=r.q1,rqh0=r.qh0,rqh1=r.qh1;
-        uint4* a_dst=reinterpret_cast<uint4*>(&s.a[a_row][16U*a_part]);
-        a_dst[0]=f16_from_bf16(r.a0,a_scale);a_dst[1]=f16_from_bf16(r.a1,a_scale);
+        *s.a16(a_row,16U*a_part)=f16_from_bf16(r.a0,a_scale);*s.a16(a_row,16U*a_part+8U)=f16_from_bf16(r.a1,a_scale);
         const unsigned p=step%4U,g0=2U*p,g1=g0+1U;
         const float d=__half2float(__ushort_as_half(static_cast<unsigned short>(rh.x&65535U)));
         const float dm=__half2float(__ushort_as_half(static_cast<unsigned short>(rh.x>>16U)));
         const float a0=d*static_cast<float>(factor(rh,g0,false)),b0=-(dm*static_cast<float>(factor(rh,g0,true)));
         const float a1=d*static_cast<float>(factor(rh,g1,false)),b1=-(dm*static_cast<float>(factor(rh,g1,true)));
         const unsigned q[8]{rq0.x,rq0.y,rq0.z,rq0.w,rq1.x,rq1.y,rq1.z,rq1.w};
-        uint4* b_lo=reinterpret_cast<uint4*>(&s.b[t][0]);
-        uint4* b_hi=reinterpret_cast<uint4*>(&s.b[t][32]);
         const unsigned qh[8]{rqh0.x,rqh0.y,rqh0.z,rqh0.w,rqh1.x,rqh1.y,rqh1.z,rqh1.w};
 #pragma unroll
         for(unsigned k=0;k<8U;k+=2U) {
@@ -1192,28 +1623,40 @@ __global__ __launch_bounds__(256) void project_prefill_f16(const unsigned char* 
                 l1|=((qh[k+1U]>>g0)&0x01010101U)<<4U;u1|=((qh[k+1U]>>g1)&0x01010101U)<<4U;
             }
             const uint2 x0=f16_affine_u8(l0,a0,b0),x1=f16_affine_u8(l1,a0,b0),y0=f16_affine_u8(u0,a1,b1),y1=f16_affine_u8(u1,a1,b1);
-            b_lo[k/2U]={x0.x,x0.y,x1.x,x1.y};b_hi[k/2U]={y0.x,y0.y,y1.x,y1.y};
+            *s.b16(t,4U*k)={x0.x,x0.y,x1.x,x1.y};*s.b16(t,32U+4U*k)={y0.x,y0.y,y1.x,y1.y};
         }
     };
     const unsigned lane=t&31U,wave=t/32U,i=lane&15U,h=lane>>4U,mb=(count+15U)/16U;
-    const unsigned cols[2]{16U*wave,128U+16U*wave};
+    const unsigned cols[2]{16U*wave,Outputs+16U*wave};
     f32x8 acc[4][2]={};
-    Regs r0,r1;
-    fetch(0U,r0);fetch(1U,r1); // steps = hidden/64 is even (hidden % 256 == 0)
+    if constexpr(Tune&1U) {
+        Regs r;
+        fetch(0U,r);
+        for(unsigned step=0;step<steps;++step) {
+            if(step)f16_barrier();
+            stage(step,r);
+            f16_barrier();
+            if(step+1U<steps)fetch(step+1U,r);
+            f16_step(s,mb,cols,i,acc);
+        }
+    } else {
+        Regs r0,r1;
+        fetch(0U,r0);fetch(1U,r1); // steps = hidden/64 is even (hidden % 256 == 0)
 #pragma unroll 1
-    for(unsigned step=0;step<steps;step+=2U) {
-        if(step)f16_barrier();
-        stage(step,r0);
-        f16_barrier();
-        if(step+2U<steps)fetch(step+2U,r0);
-        f16_step(s,mb,cols,i,acc);
-        f16_barrier();
-        stage(step+1U,r1);
-        f16_barrier();
-        if(step+3U<steps)fetch(step+3U,r1);
-        f16_step(s,mb,cols,i,acc);
+        for(unsigned step=0;step<steps;step+=2U) {
+            if(step)f16_barrier();
+            stage(step,r0);
+            f16_barrier();
+            if(step+2U<steps)fetch(step+2U,r0);
+            f16_step(s,mb,cols,i,acc);
+            f16_barrier();
+            stage(step+1U,r1);
+            f16_barrier();
+            if(step+3U<steps)fetch(step+3U,r1);
+            f16_step(s,mb,cols,i,acc);
+        }
     }
-    const unsigned out=blockIdx.x*128U+16U*wave+i;
+    const unsigned out=tile*Outputs+16U*wave+i;
 #pragma unroll
     for(unsigned mi=0;mi<4U;++mi)if(mi<mb)
 #pragma unroll
@@ -1247,15 +1690,17 @@ __device__ __forceinline__ void f16_q80_block(const DownBlock<false>& x,unsigned
 // Down of one CSR batch (<= 64 assignments) for 256 hidden outputs, K = width (FP32 h of each
 // (row, slot), scaled and rounded to FP16 while staging). Grid x = output tile, y = batch. B
 // column t decodes K blocks 2*step, 2*step + 1 of its output row; wave w owns columns 32w..+32.
-template<bool Q51>
+template<bool Q51,unsigned Tune=0U>
 __global__ __launch_bounds__(256) void down_prefill_f16(const unsigned char* weights,PrefillRows view,unsigned hidden,unsigned width) {
+    constexpr unsigned Batch=64U,Columns=256U;
+    const unsigned batch=blockIdx.y,tile=blockIdx.x;
     const auto& csr=view.csr;
-    if(csr.summary[0]||blockIdx.y>=csr.summary[2])return;
-    const unsigned begin=csr.begins[blockIdx.y],count=csr.begins[blockIdx.y+1U]-begin,expert=csr.experts[blockIdx.y];
-    __shared__ __align__(16) F16Stage s;
-    __shared__ F16Rows rows;
+    if(csr.summary[0]||batch>=csr.summary[2])return;
+    const unsigned begin=csr.begins[batch],count=csr.begins[batch+1U]-begin,expert=csr.experts[batch];
+    __shared__ __align__(16) F16Stage<Batch,Columns,Tune> s;
+    __shared__ F16Rows<Batch> rows;
     const unsigned t=threadIdx.x;
-    if(t<f16_batch) {
+    if(t<Batch) {
         const bool live=t<count;const unsigned r=live?csr.rows[begin+t]:0U,slot=live?csr.slots[begin+t]:0U;
         rows.row[t]=r;rows.slot[t]=slot;
         rows.exponent[t]=live?f16_exponent(__uint_as_float(static_cast<unsigned>(at(view.down_sums,r)[slot]))):0;
@@ -1266,7 +1711,7 @@ __global__ __launch_bounds__(256) void down_prefill_f16(const unsigned char* wei
     const bool a_live=a_row<count;
     const float a_scale=ldexpf(1.0F,rows.exponent[a_row]);
     const auto* a_src=at(view.output,rows.row[a_row])+2ULL*rows.slot[a_row]*width+16U*a_part;
-    const auto* b_src=weights+(static_cast<unsigned long long>(expert)*hidden+blockIdx.x*256U+t)*groups*block_bytes;
+    const auto* b_src=weights+(static_cast<unsigned long long>(expert)*hidden+tile*Columns+t)*groups*block_bytes;
     struct Regs { uint4 a0{},a1{},a2{},a3{}; DownBlock<Q51> b0,b1; };
     const auto fetch=[&](unsigned step,Regs& r) {
         if(a_live){r.a0=f16_load(a_src+64U*step);r.a1=f16_load(a_src+64U*step+4U);r.a2=f16_load(a_src+64U*step+8U);r.a3=f16_load(a_src+64U*step+12U);}
@@ -1274,9 +1719,7 @@ __global__ __launch_bounds__(256) void down_prefill_f16(const unsigned char* wei
     };
     const auto stage=[&](unsigned step,const Regs& r) {
         const uint4 ra[4]{r.a0,r.a1,r.a2,r.a3};const DownBlock<Q51>& rb0=r.b0;const DownBlock<Q51>& rb1=r.b1;
-        uint4* a_dst=reinterpret_cast<uint4*>(&s.a[a_row][16U*a_part]);
-        a_dst[0]=f16_from_f32(ra[0],ra[1],a_scale);a_dst[1]=f16_from_f32(ra[2],ra[3],a_scale);
-        uint4* b_dst=reinterpret_cast<uint4*>(&s.b[t][0]);
+        *s.a16(a_row,16U*a_part)=f16_from_f32(ra[0],ra[1],a_scale);*s.a16(a_row,16U*a_part+8U)=f16_from_f32(ra[2],ra[3],a_scale);
 #pragma unroll
         for(unsigned half=0;half<2U;++half) {
             if constexpr(Q51) {
@@ -1287,33 +1730,45 @@ __global__ __launch_bounds__(256) void down_prefill_f16(const unsigned char* wei
 #pragma unroll
                 for(unsigned k=0;k<8U;k+=2U) {
                     const uint2 x=f16_affine_u8(c[k],d,m),y=f16_affine_u8(c[k+1U],d,m);
-                    b_dst[4U*half+k/2U]={x.x,x.y,y.x,y.y};
+                    *s.b16(t,8U*(4U*half+k/2U))={x.x,x.y,y.x,y.y};
                 }
             } else {
                 uint4 w[4];
                 f16_q80_block(half?rb1:rb0,2U*step+half,w);
 #pragma unroll
-                for(unsigned k=0;k<4U;++k)b_dst[4U*half+k]=w[k];
+                for(unsigned k=0;k<4U;++k)*s.b16(t,8U*(4U*half+k))=w[k];
             }
         }
     };
     const unsigned lane=t&31U,wave=t/32U,i=lane&15U,h=lane>>4U,mb=(count+15U)/16U;
     const unsigned cols[2]{32U*wave,32U*wave+16U};
     f32x8 acc[4][2]={};
-    Regs r0,r1;
-    fetch(0U,r0);fetch(1U,r1); // steps = width/64 is even (width % 128 == 0)
+    if constexpr(Tune&1U) {
+        Regs r;
+        fetch(0U,r);
+        for(unsigned step=0;step<steps;++step) {
+            if(step)f16_barrier();
+            stage(step,r);
+            f16_barrier();
+            if(step+1U<steps)fetch(step+1U,r);
+            f16_step(s,mb,cols,i,acc);
+        }
+    } else {
+        Regs r0,r1;
+        fetch(0U,r0);fetch(1U,r1); // steps = width/64 is even (width % 128 == 0)
 #pragma unroll 1
-    for(unsigned step=0;step<steps;step+=2U) {
-        if(step)f16_barrier();
-        stage(step,r0);
-        f16_barrier();
-        if(step+2U<steps)fetch(step+2U,r0);
-        f16_step(s,mb,cols,i,acc);
-        f16_barrier();
-        stage(step+1U,r1);
-        f16_barrier();
-        if(step+3U<steps)fetch(step+3U,r1);
-        f16_step(s,mb,cols,i,acc);
+        for(unsigned step=0;step<steps;step+=2U) {
+            if(step)f16_barrier();
+            stage(step,r0);
+            f16_barrier();
+            if(step+2U<steps)fetch(step+2U,r0);
+            f16_step(s,mb,cols,i,acc);
+            f16_barrier();
+            stage(step+1U,r1);
+            f16_barrier();
+            if(step+3U<steps)fetch(step+3U,r1);
+            f16_step(s,mb,cols,i,acc);
+        }
     }
 #pragma unroll
     for(unsigned mi=0;mi<4U;++mi)if(mi<mb)
@@ -1322,11 +1777,258 @@ __global__ __launch_bounds__(256) void down_prefill_f16(const unsigned char* wei
         const unsigned a=16U*mi+2U*e+h;
         if(a>=count)continue;
         const float unscale=ldexpf(1.0F,-rows.exponent[a]);
-        float* out=at(view.rawdots,rows.row[a])+rows.slot[a]*hidden+blockIdx.x*256U+32U*wave+i;
+        float* out=at(view.rawdots,rows.row[a])+rows.slot[a]*hidden+tile*Columns+32U*wave+i;
         out[0]=acc[mi][0][e]*unscale;out[16]=acc[mi][1][e]*unscale;
     }
 }
+// Bit 6 helpers. An FP16 value (bits h) is M * 2^E with M < 2^11 an integer; lsb = E + ctz(M).
+struct F16Int { unsigned man; int exp; bool finite; };
+__device__ __forceinline__ F16Int f16_int(unsigned h) {
+    const unsigned e=(h>>10U)&31U,f=h&1023U;
+    return {e?(f|1024U):f,static_cast<int>(e?e:1U)-25,e!=31U};
+}
+// Every a*q + b with |a| <= |x|*wx, |b| <= |y|*wy (a, b integer multiples of x, y; q <= qmax folded into wx) is an
+// exact FP32 value: |x|*wx + |y|*wy < 2^(min lsb + 24), in integers relative to the lower lsb.
+__device__ __forceinline__ bool f16_affine_exact(unsigned hx,unsigned wx,unsigned hy,unsigned wy) {
+    const F16Int x=f16_int(hx),y=f16_int(hy);
+    if(!x.finite||!y.finite)return false;
+    // Odd mantissa times 2^lsb; relative to the lower lsb both shifts are >= 0.
+    const int cx=x.man?__builtin_ctz(x.man):0,cy=y.man?__builtin_ctz(y.man):0;
+    const int lx=x.man?x.exp+cx:1000,ly=y.man?y.exp+cy:1000;
+    const int lo=min(lx,ly);
+    if(lo==1000)return true;
+    const int sx=lx-lo,sy=ly-lo;
+    if((x.man&&sx>24)||(y.man&&sy>24))return false;
+    const unsigned long long t=(x.man?(static_cast<unsigned long long>(x.man>>cx)*wx)<<sx:0ULL)+
+        (y.man?(static_cast<unsigned long long>(y.man>>cy)*wy)<<sy:0ULL);
+    return t<(1ULL<<24U);
+}
+// Q5_1 block (head word: d low, m high, both FP16): every d*q + m, q <= 31, is an exact FP32 value when both are normal
+// and max(ed + 5, em) - min(ed, em) <= 12 (biased exponent fields): |d*q + m| < 2^(max(ed + 5, em) - 13) and every term
+// is a multiple of 2^(min(ed, em) - 25). Exponent fields only (a few instructions per block); every Q5_1 block of the
+// production Qwen down passes.
+__device__ __forceinline__ bool f16_q51_exact(unsigned head) {
+    const int ed=static_cast<int>((head>>10U)&31U),em=static_cast<int>((head>>26U)&31U);
+    return ed>=1&&ed<=30&&em>=1&&em<=30&&max(ed+5,em)-min(ed,em)<=12;
+}
+// round_f16(a*q + b) for the four unsigned bytes q of w as two FP16 pairs (bytes 0,1 and 2,3), a2 = a * 2^24.
+__device__ __forceinline__ unsigned f16_mix_pair(float a2,unsigned q2,float b) {
+    unsigned r;
+    __asm__("v_fma_mixlo_f16 %0, %1, %2, %3 op_sel_hi:[0,1,0]\n\t"
+            "v_fma_mixhi_f16 %0, %1, %2, %3 op_sel:[0,1,0] op_sel_hi:[0,1,0]" : "=&v"(r) : "v"(a2),"v"(q2),"v"(b));
+    return r;
+}
+__device__ __forceinline__ uint2 f16_affine_u8_fast(unsigned w,float a2,float b) {
+    return {f16_mix_pair(a2,__builtin_amdgcn_perm(0U,w,0x0c010c00U),b),f16_mix_pair(a2,__builtin_amdgcn_perm(0U,w,0x0c030c02U),b)};
+}
+// Tune bits 1, 2 and 4 (values 2, 4, 16) select the redone tiles of the FP16 forms. A CTA owns Batch
+// assignments of one expert (a CSR batch) x Columns B columns; each wave owns 64 rows x 32 columns
+// (four 16-row tiles x two column tiles, as the base tile), so per wave the operands, WMMAs and K order
+// are the base ones.
+//   bit 1 (batch-major): 128-assignment CSR batches, 16 waves (two row halves). Each dequantized weight
+//     tile serves every assignment of an expert up to 128 (the base dequantizes it again per 64), and the
+//     grid still runs the output tiles of one batch together (its rows stay in L2).
+//   bit 2 (compact): 128 columns per CTA (gate/up 64 outputs, down 128) with all the batch rows, so the
+//     weights are not dequantized more often per row; LDS halves (4 CTAs per WGP).
+//   bit 4 (gate/up): stage A from the prologue's FP16 image (a copy) instead of converting BF16 per tile.
+// Threads per B column (TPC) split a column's K step (gate/up: 16 qs bytes of the pair; down: one block).
+//   bit 6 (value 64): exact short dequantization. On gfx1151 VALU and WMMA instructions do not overlap (a VALU
+//     instruction costs WMMA issue time), and the dequantization is the kernel's VALU: byte extract, cvt_f32_ubyte,
+//     fma, cvt to FP16 (~4 per weight). Here each code q enters v_fma_mix{lo,hi}_f16 as the FP16 subnormal q * 2^-24
+//     (one v_perm per two codes) with a * 2^24, giving round_f16(a*q + b) in one instruction per weight. When every
+//     a*q + b of the block is an exact FP32 value (checked from the block's FP16 scales, below), rounding it once to
+//     FP16 equals the base's FP32-then-FP16 rounding, so the bytes are identical; a wave with any block outside the
+//     check takes the base conversion. Q8_0 keeps the base conversion: its offset form d*(q + 128) - 128*d is exact
+//     but turns the base's d * 0 = -0 (negative d) into +0 (self-test: 1 in 128 words).
+//     (Measured and dropped: staging the next step while multiplying, with two LDS images or with a register-only
+//     convert-ahead, is 1.0-1.7x slower: VALU and WMMA serialize anyway and the WMMA operand reads wait on lgkmcnt.)
+// Diagnostic bits (STRIX_INTPREFILL_MOE_TUNE >= 256, never exact, attribution of the kernel time only): 256 skips the
+// WMMAs, 512 stages the raw loaded words without dequantization/conversion, 1024 skips the global loads, 2048 only the
+// A (activation) loads, 4096 only the B (weight) loads.
+template<unsigned Tune> struct F16Tile {
+    static constexpr unsigned Batch=(Tune&2U)?128U:64U,Columns=(Tune&4U)?128U:256U;
+    static constexpr bool Table=true;
+    static constexpr unsigned LTune=Tune;
+    static constexpr unsigned Waves=Batch*Columns/2048U,Threads=32U*Waves,Groups=Columns/32U;
+    static constexpr unsigned TPC=Threads/Columns,AChunks=Batch*8U/Threads;
+};
+template<unsigned Batch,unsigned Columns,unsigned Tune>
+__device__ __forceinline__ void f16_step_rows(const F16Stage<Batch,Columns,Tune>& s,unsigned rbase,unsigned mb,const unsigned (&cols)[2],unsigned i,f32x8 (&acc)[4][2]) {
+#pragma unroll
+    for(unsigned kk=0;kk<4U;++kk) {
+        constexpr unsigned P=F16Stage<Batch,Columns,Tune>::pitch;
+        const unsigned key=(Tune&8U)?i%8U*8U:0U,lo=(16U*kk)^key,hi=(16U*kk+8U)^key;
+        const f16x16 b0=f16_pair(s.b+(cols[0]+i)*P,lo,hi);
+        const f16x16 b1=f16_pair(s.b+(cols[1]+i)*P,lo,hi);
+#pragma unroll
+        for(unsigned mi=0;mi<4U;++mi)if(mi<mb) {
+            const f16x16 a=f16_pair(s.a+(rbase+16U*mi+i)*P,lo,hi);
+            acc[mi][0]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a,b0,acc[mi][0]);
+            acc[mi][1]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a,b1,acc[mi][1]);
+        }
+    }
+}
+#include "hip_moe_prefill_core2.inc"
+// qpf2k core2 bit 6 (gate/up only): one CTA owns two consecutive 128-assignment CSR batches of one expert (256 rows) x
+// 64 outputs of gate and up (128 B columns), so each dequantized weight tile serves up to 256 rows; same per-wave tile
+// (64 rows x 16 gate + 16 up columns), operands and K order as the base. Otherwise the F16Tile shape.
+template<unsigned Tune,unsigned Core> struct F16TileX {
+    static constexpr bool Wide=(Core&64U)!=0U;
+    static constexpr unsigned Batch=Wide?256U:F16Tile<Tune>::Batch,Columns=Wide?128U:F16Tile<Tune>::Columns;
+    static constexpr bool Table=true;
+    static constexpr unsigned LTune=Tune;
+    static constexpr unsigned Waves=Batch*Columns/2048U,Threads=32U*Waves,Groups=Columns/32U;
+    static constexpr unsigned TPC=Threads/Columns,AChunks=Batch*8U/Threads;
+};
+template<bool Wide> struct f16_qv { using type=uint4; };
+template<> struct f16_qv<false> { using type=uint2; };
+__device__ __forceinline__ uint2 f16_load8(const void* p) {
+    typedef unsigned f16_u32x2 __attribute__((ext_vector_type(2)));
+    const f16_u32x2 v=*reinterpret_cast<const __attribute__((address_space(1))) f16_u32x2*>(reinterpret_cast<std::uintptr_t>(p));
+    return uint2{v.x,v.y};
+}
+// The K loop shared by both projections: two register stages (or one with bit 0), LDS-only barriers.
+template<unsigned Tune,class Regs,class Fetch,class Stage,class Step>
+__device__ __forceinline__ void f16_pipeline(unsigned steps,const Fetch& fetch,const Stage& stage,const Step& step_fn) {
+    if constexpr(Tune&1U) {
+        Regs r;
+        fetch(0U,r);
+        for(unsigned step=0;step<steps;++step) {
+            if(step)f16_barrier();
+            stage(step,r,0U);
+            f16_barrier();
+            if(step+1U<steps)fetch(step+1U,r);
+            step_fn(0U);
+        }
+    } else {
+        Regs r0,r1;
+        fetch(0U,r0);fetch(1U,r1); // steps is even
+#pragma unroll 1
+        for(unsigned step=0;step<steps;step+=2U) {
+            if(step)f16_barrier();
+            stage(step,r0,0U);
+            f16_barrier();
+            if(step+2U<steps)fetch(step+2U,r0);
+            step_fn(0U);
+            f16_barrier();
+            stage(step+1U,r1,0U);
+            f16_barrier();
+            if(step+3U<steps)fetch(step+3U,r1);
+            step_fn(0U);
+        }
+    }
+}
+template<bool Q5K,unsigned Tune,unsigned Core=0U>
+__global__ __launch_bounds__((F16TileX<Tune,Core>::Threads),prefill_core2_min_waves(Tune,Core)) void project_prefill_f16x(const unsigned char* gate,const unsigned char* up,PrefillRows view,
+    unsigned hidden,unsigned outputs,const uint4* a16) {
+#define STRIX_F16X_BATCH_TILE const unsigned batch=blockIdx.y,tile=blockIdx.x;
+#define STRIX_F16X_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;
+#include "hip_moe_f16x_project_body.inc"
+#undef STRIX_F16X_BATCH_TILE
+#undef STRIX_F16X_LDS
+}
+template<bool Q51,unsigned Tune,unsigned Core=0U>
+__global__ __launch_bounds__(F16Tile<Tune>::Threads,prefill_core2_min_waves(Tune,Core)) void down_prefill_f16x(const unsigned char* weights,PrefillRows view,unsigned hidden,unsigned width,FuseArgT<Core> fuse) {
+#define STRIX_F16X_BATCH_TILE const unsigned batch=blockIdx.y,tile=blockIdx.x;
+#define STRIX_F16X_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;
+#define STRIX_F16X_DOWN_GUARD if(csr.summary[0]||batch>=csr.summary[2])return;
+#include "hip_moe_f16x_down_body.inc"
+#undef STRIX_F16X_BATCH_TILE
+#undef STRIX_F16X_LDS
+#undef STRIX_F16X_DOWN_GUARD
+}
+#include "hip_moe_gsq_weights.inc"
+#include "hip_moe_gsq_f16_prefill.inc"
+#include "hip_moe_gsq_wmma_prefill.inc"
+#include "hip_moe_prefill_route.inc"
+#include "hip_moe_prefill_g3.inc"
+#include "hip_moe_prefill_p1.inc"
+#include "hip_moe_prefill_da16.inc"
+#include "hip_moe_prefill_p1da16.inc"
+#include "hip_moe_prefill_small.inc"
+// MoE tune bit 4: the FP16 images of the prompt rows (prefill_max_rows x max_hidden halves, allocated on first use).
+uint4* f16_prefill_a16() {
+    static uint4* const pool=[]{
+        void* p=nullptr;
+        check(hipMalloc(&p,static_cast<std::size_t>(q51_known_rows::prefill_max_rows)*max_hidden*2U),"FP16 prefill A image allocation");
+        return static_cast<uint4*>(p);
+    }();
+    return pool;
+}
+// Bit 6 self-test: random FP16 scale pairs (every binade, signs, zeros, subnormals, non-finite) and codes; where the
+// check admits the short path, its FP16 words must equal the base conversion's for every code. counts: tested, admitted,
+// mismatches for K-quant (a = d*sc, b = -dmin*m) and Q5_1 (d*q + m); the last three count the rejected Q8_0 offset form
+// (d*(q + 128) - 128*d), which differs from the base in the sign of zero, and are informational.
+__device__ __forceinline__ unsigned long long selftest_mix(unsigned long long x) {
+    x^=x>>33U;x*=0xff51afd7ed558ccdULL;x^=x>>33U;x*=0xc4ceb9fe1a85ec53ULL;x^=x>>33U;return x;
+}
+__device__ __forceinline__ unsigned selftest_f16(unsigned long long r) {
+    const unsigned pick=static_cast<unsigned>(r&15U);
+    if(pick==0U)return static_cast<unsigned>(r>>8U)&0x83ffU;          // zero / subnormal
+    if(pick==1U)return 0x7c00U|(static_cast<unsigned>(r>>8U)&0x83ffU); // inf / nan
+    if(pick<8U)return (static_cast<unsigned>(r>>8U)&0x8000U)|((3U+static_cast<unsigned>(r>>16U)%7U)<<10U)|(static_cast<unsigned>(r>>24U)&1023U);
+    return static_cast<unsigned>(r>>8U)&0xffffU;                      // any bits
+}
+__global__ void fast_dequant_selftest_kernel(unsigned long long seed,unsigned long long* counts) {
+    const unsigned long long id=blockIdx.x*static_cast<unsigned long long>(blockDim.x)+threadIdx.x;
+    unsigned long long r=selftest_mix(seed^(id*0x9e3779b97f4a7c15ULL));
+    unsigned long long local[9]={};
+    for(unsigned it=0;it<16U;++it) {
+        r=selftest_mix(r+it);
+        const unsigned hx=selftest_f16(r),hy=selftest_f16(selftest_mix(r^1U));
+        const unsigned sc=static_cast<unsigned>(r>>40U)&63U,mn=static_cast<unsigned>(r>>46U)&63U;
+        const bool q5=(r>>52U)&1U;
+        const float d=__half2float(__ushort_as_half(static_cast<unsigned short>(hx))),dm=__half2float(__ushort_as_half(static_cast<unsigned short>(hy)));
+        // K-quant sub-block.
+        {
+            const float a=d*static_cast<float>(sc),b=-(dm*static_cast<float>(mn));
+            ++local[0];
+            if(f16_affine_exact(hx,63U*(q5?31U:15U),hy,63U)) {
+                ++local[1];
+                for(unsigned q=0;q<(q5?32U:16U);q+=4U) {
+                    const unsigned w=q|(q+1U)<<8U|(q+2U)<<16U|(q+3U)<<24U;
+                    const uint2 x=f16_affine_u8(w,a,b),y=f16_affine_u8_fast(w,a*16777216.0F,b);
+                    local[2]+=(x.x!=y.x)+(x.y!=y.y);
+                }
+            }
+        }
+        // Q5_1 block.
+        {
+            ++local[3];
+            if(f16_affine_exact(hx,31U,hy,1U)) {
+                ++local[4];
+                for(unsigned q=0;q<32U;q+=4U) {
+                    const unsigned w=q|(q+1U)<<8U|(q+2U)<<16U|(q+3U)<<24U;
+                    const uint2 x=f16_affine_u8(w,d,dm),y=f16_affine_u8_fast(w,d*16777216.0F,dm);
+                    local[5]+=(x.x!=y.x)+(x.y!=y.y);
+                }
+            }
+        }
+        // Q8_0: every signed byte.
+        {
+            ++local[6];
+            if(((hx>>10U)&31U)!=31U) {
+                ++local[7];
+                for(unsigned q=0;q<256U;q+=4U) {
+                    const unsigned w=q|(q+1U)<<8U|(q+2U)<<16U|(q+3U)<<24U;
+                    const uint2 x=f16_scaled_s8(w,d),y=f16_affine_u8_fast(w^0x80808080U,d*16777216.0F,-128.0F*d);
+                    local[8]+=(x.x!=y.x)+(x.y!=y.y);
+                }
+            }
+        }
+    }
+    for(unsigned k=0;k<9U;++k)atomicAdd(counts+k,local[k]);
+}
 bool overlap(DeviceBytes a,DeviceBytes b){return a.address<b.address+b.bytes&&b.address<a.address+a.bytes;}
+template<auto Kernel,unsigned Threads> void prefill_resources(const char* name,unsigned tune) {
+    static const bool enabled=[]{const char* v=std::getenv("STRIX_INTPREFILL_RESOURCES");return v&&v[0]=='1';}();
+    if(!enabled)return;
+    hipFuncAttributes attributes{};int blocks=0;
+    check(hipFuncGetAttributes(&attributes,reinterpret_cast<const void*>(Kernel)),"prefill resource attributes");
+    check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks,Kernel,Threads,0),"prefill resident block query");
+    std::fprintf(stderr,"intprefill-resource %s tune=%u threads=%u vgpr=%d lds=%zu local=%zu resident_blocks_per_mp=%d\n",
+        name,tune,Threads,attributes.numRegs,attributes.sharedSizeBytes,attributes.localSizeBytes,blocks);
+}
 void range(DeviceBytes v){if(!v.address||!v.bytes||v.bytes>UINTPTR_MAX-v.address)throw std::invalid_argument("A8 CSR gate/up owner range is invalid");}
 struct Prepared {DeviceRows rows;DeviceCsr csr;};
 Prepared prepare(const Request& request,std::span<const Bindings> rows,const q51_known_rows::Workspace& workspace,hipStream_t stream) {
@@ -1371,8 +2073,9 @@ void enqueue_window(const Request& request,std::span<const Bindings> rows,const 
     const WindowRows& window,hipStream_t stream,unsigned active) {
     auto p=prepare(request,rows,workspace,stream);
     const DeviceBytes csr{workspace.memory.arena_base,workspace.memory.arena_bytes};
-    const bool a8=window.down_type!=0U,q5k=request.gate_type==13U;
-    if((a8&&window.down_type!=7U&&window.down_type!=8U)||(q5k&&!a8))
+    const bool a8=window.down_type!=0U,q5k=request.gate_type==13U,q20=request.gate_type==42U,
+        iq=gsq_a8::gate_type(request.gate_type)&&!q20;
+    if((a8&&window.down_type!=7U&&window.down_type!=8U&&!gsq_a8::down_type(window.down_type))||((q5k||q20||iq)&&!a8))
         throw std::invalid_argument("A8 window down/gate format combination is invalid");
     const auto count=static_cast<unsigned>(rows.size()),groups=request.shape.rows/32U;
     PrologueRows v;
@@ -1412,8 +2115,8 @@ void enqueue_window(const Request& request,std::span<const Bindings> rows,const 
     }
     if(a8) {
         range(window.down_weights);
-        const std::uint64_t block_bytes=window.down_type==7U?24U:34U;
-        if(window.down_weights.bytes!=static_cast<std::uint64_t>(request.shape.experts)*request.shape.hidden*groups*block_bytes||
+        if(window.down_weights.bytes!=static_cast<std::uint64_t>(request.shape.experts)*request.shape.hidden*
+               down_row_bytes(window.down_type,request.shape.rows)||
            request.shape.rows>max_rows||request.shape.rows%128U||request.shape.hidden%64U||overlap(window.down_weights,csr))
             throw std::invalid_argument("A8 window down weights/geometry are invalid");
     }
@@ -1431,7 +2134,23 @@ void enqueue_window(const Request& request,std::span<const Bindings> rows,const 
         hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window<G,false,true,5U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
             count,request.shape.hidden,request.shape.rows);
     };
-    if(!a8){if(count==2U){STRIX_A8_WINDOW_PROJECT(2U,false,false);}else{STRIX_A8_WINDOW_PROJECT(4U,false,false);}}
+    const auto iq_project=[&]<std::uint32_t T>(){
+        if(count==2U)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_iq<T,2U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
+            count,request.shape.hidden,request.shape.rows);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_iq<T,4U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
+            count,request.shape.hidden,request.shape.rows);
+    };
+    if(request.gate_type==gsq_a8::type_iq2_s)iq_project.template operator()<gsq_a8::type_iq2_s>();
+    else if(request.gate_type==gsq_a8::type_iq3_xxs)iq_project.template operator()<gsq_a8::type_iq3_xxs>();
+    else if(request.gate_type==gsq_a8::type_iq3_s)iq_project.template operator()<gsq_a8::type_iq3_s>();
+    else if(request.gate_type==gsq_a8::type_iq4_xs)iq_project.template operator()<gsq_a8::type_iq4_xs>();
+    else if(q20){
+        if(count==2U)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_q20<2U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
+            count,request.shape.hidden,request.shape.rows);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_window_q20<4U>),project_grid,dim3(256),0,stream,gate,up,p.rows,p.csr,
+            count,request.shape.hidden,request.shape.rows);
+    }
+    else if(!a8){if(count==2U){STRIX_A8_WINDOW_PROJECT(2U,false,false);}else{STRIX_A8_WINDOW_PROJECT(4U,false,false);}}
     else if(!q5k && half_chunk){if(count==2U)chunked.template operator()<2U>();else chunked.template operator()<4U>();}
     else if(!q5k){if(count==2U){STRIX_A8_WINDOW_PROJECT(2U,false,true);}else{STRIX_A8_WINDOW_PROJECT(4U,false,true);}}
     else {if(count==2U){STRIX_A8_WINDOW_PROJECT(2U,true,true);}else{STRIX_A8_WINDOW_PROJECT(4U,true,true);}}
@@ -1444,42 +2163,128 @@ void enqueue_window(const Request& request,std::span<const Bindings> rows,const 
     hipLaunchKernelGGL(HIP_KERNEL_NAME(down_window<R,Q51>),down_grid,dim3(256),0,stream,down,p.rows,p.csr, \
         count,request.shape.hidden,request.shape.rows)
     // Cohort unions of 9..32 rows: the CSR caps batches at 8 assignments, so the 8-row form stages every batch.
-    if(window.down_type==7U){if(count==2U){STRIX_A8_WINDOW_DOWN(2U,true);}else if(count==4U){STRIX_A8_WINDOW_DOWN(4U,true);}else{STRIX_A8_WINDOW_DOWN(8U,true);}}
+    if(window.down_type==gsq_a8::type_iq4_nl){
+        const auto iq_down=[&]<unsigned R>(){hipLaunchKernelGGL(HIP_KERNEL_NAME(down_window_iq<gsq_a8::type_iq4_nl,R>),down_grid,dim3(256),0,
+            stream,down,p.rows,p.csr,count,request.shape.hidden,request.shape.rows);};
+        if(count==2U)iq_down.template operator()<2U>();else if(count==4U)iq_down.template operator()<4U>();
+        else iq_down.template operator()<8U>();
+    }
+    else if(window.down_type==42U){
+        const auto q20_down=[&]<unsigned R>(){hipLaunchKernelGGL(HIP_KERNEL_NAME(down_window_q20<R>),down_grid,dim3(256),0,stream,
+            down,p.rows,p.csr,count,request.shape.hidden,request.shape.rows);};
+        if(count==2U)q20_down.template operator()<2U>();else if(count==4U)q20_down.template operator()<4U>();
+        else q20_down.template operator()<8U>();
+    }
+    else if(window.down_type==7U){if(count==2U){STRIX_A8_WINDOW_DOWN(2U,true);}else if(count==4U){STRIX_A8_WINDOW_DOWN(4U,true);}else{STRIX_A8_WINDOW_DOWN(8U,true);}}
     else {if(count==2U){STRIX_A8_WINDOW_DOWN(2U,false);}else if(count==4U){STRIX_A8_WINDOW_DOWN(4U,false);}else{STRIX_A8_WINDOW_DOWN(8U,false);}}
 #undef STRIX_A8_WINDOW_DOWN
     check(hipGetLastError(),"A8 window shared integer down");
 }
+PrefillKernelForm prefill_kernel_form(const Request& request,unsigned down_type,int form) {
+    const bool q20=gsq_a8::gate_type(request.gate_type);
+    // STRIX_PREFILL_MOE_WMMA=0/1: dot4 or iu8 WMMA kernels (bit-identical results; default WMMA).
+    static const int wmma_env=[]{const char* v=std::getenv("STRIX_PREFILL_MOE_WMMA");return v?std::atoi(v):-1;}();
+    // GSQ experts take the FP16 forms (hip_moe_gsq_f16_prefill.inc: every GSQ gate/up type with a GSQ down type, Q2_0 or
+    // IQ4_NL) unless STRIX_GSQ_PREFILL_F16=0 (gsq_prefill_f16_enabled).
+    static const bool gsq_f16_env=gsq_prefill_f16_enabled();
+    // The GSQ decoders read rows as whole dwords and 18-byte blocks in even/odd pairs (hip_moe_gsq_weights.inc): rows of
+    // another geometry keep the A8 forms.
+    const auto rows_ok=[](std::uint32_t type,std::uint32_t width) {
+        return width%gsq_a8::block_elements(type)==0U&&gsq_a8::row_bytes(type,width)%4U==0U&&
+            (gsq_a8::block_bytes(type)!=18U||(width/gsq_a8::block_elements(type))%2U==0U);
+    };
+    const bool gsq_f16=q20&&gsq_a8::down_type(down_type)&&rows_ok(request.gate_type,request.shape.hidden)&&
+        rows_ok(down_type,request.shape.rows);
+    // GSQ Q2_0 gate/up with Q2_0 down also has the iu8 WMMA form (hip_moe_gsq_wmma_prefill.inc, bit-identical to dot4).
+    const bool gsq_q20=q20&&request.gate_type==gsq_a8::type_q2_0&&down_type==gsq_a8::type_q2_0;
+    const bool fast_form=form>=3&&form<=66;
+    if(fast_form&&(!q20||(gsq_f16&&gsq_f16_env)))return PrefillKernelForm::f16_wmma;
+    // A GSQ expert the fast profile leaves on the A8 forms selects iu8 or dot4 as the A8 profile does (form -1:
+    // STRIX_PREFILL_MOE_WMMA, iu8 by default, dot4 with =0).
+    const int a8_form=fast_form?-1:form;
+    // Whole CTA tiles; the WMMA down is unrolled for width = max_rows.
+    const bool wmma_shape=request.shape.rows==max_rows&&request.shape.hidden%256U==0U;
+    return (!q20||gsq_q20)&&wmma_shape&&(a8_form>=0?a8_form>=1:wmma_env>=0?wmma_env==1:true)?PrefillKernelForm::iu8_wmma:
+        PrefillKernelForm::dot4;
+}
+unsigned prefill_effective_tune(const Request& request,unsigned count,unsigned down_type,int form) {
+    static const unsigned tune_env=[]{const char* v=std::getenv("STRIX_INTPREFILL_MOE_TUNE");
+        const int n=v?std::atoi(v):82;return n>=0&&n<=65535?static_cast<unsigned>(n):0U;}();
+    // Forms 4..34 = tunes 1..31, forms 35..66 = tunes 64..95 (bit 6).
+    // Bit 1 takes 128-assignment batches only when the prompt averages >= 96 assignments per expert: below that the
+    // 64-assignment batches already hold most experts' rows (one dequantization either way) and half of the 16 waves
+    // would have no rows.
+    const bool f16=prefill_kernel_form(request,down_type,form)==PrefillKernelForm::f16_wmma;
+    const unsigned tune_req=form>=4&&f16?static_cast<unsigned>(form<=34?form-3:form-3+32):tune_env;
+    // qpf2k core2 bit 3 (STRIX_QPF2K_MOE 9/11/13/15): keep the 128-assignment batches of bit 1 at every T (same bits:
+    // results do not depend on the batch composition). Never for GSQ experts (their kernels ignore STRIX_QPF2K_MOE).
+    const bool q20=gsq_a8::gate_type(request.gate_type);
+    return (tune_req&2U)&&static_cast<unsigned long long>(count)*request.shape.top_k<96ULL*request.shape.experts&&
+        !(!q20&&tune_req==82U&&(prefill_core2()&8U))?tune_req&~2U:tune_req;
+}
 void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned count,unsigned clear_words,
     const unsigned char* gate,const unsigned char* up,unsigned down_type,const unsigned char* down_weights,hipStream_t stream,int form) {
-    const bool q5k=request.gate_type==13U;
-    if((down_type!=7U&&down_type!=8U)||(request.gate_type!=12U&&!q5k)||!gate||!up||!down_weights||
+    const bool q5k=request.gate_type==13U,q20=gsq_a8::gate_type(request.gate_type);  // every GSQ gate type: dot4 form
+    prefill_fused_flag()=false;prefill_da16_flag()=false;prefill_small_flag()=false;prefill_clear_skipped_flag()=false;
+    if((down_type!=7U&&down_type!=8U&&!gsq_a8::down_type(down_type))||(request.gate_type!=12U&&!q5k&&!q20)||
+       (gsq_a8::down_type(down_type)&&!q20)||
+       !gate||!up||!down_weights||
        count<16U||count%8U||count>q51_known_rows::prefill_max_rows||request.shape.top_k>10U||request.shape.experts>512U||
        request.shape.hidden>max_hidden||request.shape.hidden%256U||request.shape.rows>max_rows||request.shape.rows%128U||
        request.shape.hidden%64U)
         throw std::invalid_argument("A8 prefill geometry/format is invalid");
+    // qpf2k/moe-mi ROUTE bits and DA16 are gated on the production Q4_K/Q5_K prefill only: with a GSQ gate type they are
+    // refused (fail-closed) until that combination has its own gate.
+    if(q20&&(prefill_route()!=0U||prefill_da16()))
+        throw std::invalid_argument("STRIX_QPF2K_MOE_ROUTE / STRIX_QPF2K_MOE_DA16 are not qualified with the GSQ prefill profile");
     // STRIX_PREFILL_MOE_BATCH: assignments of one expert per CTA (default 8).
     static const unsigned dot4_cap=[]{const char* v=std::getenv("STRIX_PREFILL_MOE_BATCH");const int n=v?std::atoi(v):8;
         return n>=1&&n<=64?static_cast<unsigned>(n):8U;}();
-    // STRIX_PREFILL_MOE_WMMA=0/1: dot4 or iu8 WMMA kernels (bit-identical results; default WMMA).
-    static const int wmma_env=[]{const char* v=std::getenv("STRIX_PREFILL_MOE_WMMA");return v?std::atoi(v):-1;}();
-    // Whole CTA tiles; the WMMA down is unrolled for width = max_rows.
-    const bool wmma_shape=request.shape.rows==max_rows&&request.shape.hidden%256U==0U;
-    const bool f16=form==3;
+    const PrefillKernelForm kernel_form=prefill_kernel_form(request,down_type,form);
+    const bool f16=kernel_form==PrefillKernelForm::f16_wmma;
+    const unsigned tune=prefill_effective_tune(request,count,down_type,form);
     if(f16&&(request.shape.rows%128U||request.shape.hidden%256U))throw std::invalid_argument("A8 prefill FP16 WMMA geometry is invalid");
-    const bool wmma=f16||(wmma_shape&&(form>=0?form>=1:wmma_env>=0?wmma_env==1:true));
-    const unsigned cap=f16?f16_batch:wmma?wmma_batch:dot4_cap;
+    const bool wmma=kernel_form!=PrefillKernelForm::dot4;
+    const unsigned cap=f16?((tune&2U)?2U*f16_batch:f16_batch):wmma?wmma_batch:dot4_cap;
     if(f16) {
         if(request.input!=InputKind::bf16)throw std::invalid_argument("A8 prefill FP16 WMMA requires BF16 input rows");
         check(hipPeekAtLastError(),"FP16 prefill prologue stale error");
+        // qpf2k/moe-mi STRIX_QPF2K_MOE_ROUTE bit 2 (hip_moe_prefill_route.inc): same words, one read of each row, one barrier.
+        const auto aligned16=[](const void* p,std::size_t stride){return reinterpret_cast<std::uintptr_t>(p)%16U==0U&&stride%16U==0U;};
+        // ROUTE bit 8 (hip_moe_prefill_route.inc): the accumulation view is not zeroed here; the caller's merge
+        // (known_moe_prefill_merge_kernel_z) writes the same zeros on its skip paths (clear_words == hidden: the same words).
+        const bool skip_clear=(prefill_route()&8U)!=0U&&(prefill_core2()&512U)==0U&&clear_words==request.shape.hidden;
+        if(skip_clear){prefill_clear_skipped_flag()=true;
+            static const bool witness=[]{std::fprintf(stderr,"qpf2k-moe-mi route clear moved to the merge\n");return true;}();(void)witness;}
+        const unsigned prologue_clear=skip_clear?0U:clear_words;
+        if((prefill_route()&2U)&&request.shape.hidden%8U==0U&&request.shape.hidden<=max_hidden&&request.shape.top_k<=32U&&
+            aligned16(rows.input.base,rows.input.stride)) {
+            static const bool witness=[]{std::fprintf(stderr,"qpf2k-moe-mi route prologue v2 active\n");return true;}();(void)witness;
+            hipLaunchKernelGGL(f16_prefill_prologue_v2,dim3(count),dim3(256),0,stream,rows,request.shape.hidden,request.shape.top_k,
+                request.shape.experts,prologue_clear,(tune&16U)?f16_prefill_a16():nullptr,
+                aligned16(rows.clear.base,rows.clear.stride)&&clear_words%4U==0U?1U:0U);
+        } else
         hipLaunchKernelGGL(f16_prefill_prologue,dim3(count),dim3(256),0,stream,rows,request.shape.hidden,request.shape.top_k,
-            request.shape.experts,clear_words);
+            request.shape.experts,prologue_clear,(tune&16U)?f16_prefill_a16():nullptr);
         check(hipGetLastError(),"FP16 prefill prologue");
     } else enqueue_prefill_prologue(request,rows,count,clear_words,stream);
     const unsigned assignments=count*request.shape.top_k;
     // The WMMA forms (and every T above the serial builder's 2048 rows) build the identical CSR with
     // the parallel builder; form 2 keeps the serial one.
     if(form==2&&count>serial_csr_max_rows)throw std::invalid_argument("A8 prefill serial CSR builder admits at most 2048 rows");
-    if((wmma&&form!=2)||count>serial_csr_max_rows)
+    if(((wmma&&form!=2)||count>serial_csr_max_rows)&&(prefill_route()&4U)) { // qpf2k/moe-mi route bit 4: multi-CTA CSR, same words
+        static const bool witness=[]{std::fprintf(stderr,"qpf2k-moe-mi route csr multi-cta active\n");return true;}();(void)witness;
+        const unsigned blocks=(count*request.shape.top_k+csr_mw_span-1U)/csr_mw_span;
+        if(blocks==0U||blocks>csr_mw_blocks_max())throw std::invalid_argument("qpf2k CSR multi-CTA block count out of range");
+        unsigned* scratch=csr_mw_scratch();
+        check(hipMemsetAsync(scratch,0,csr_mw_head*sizeof(unsigned),stream),"qpf2k CSR scratch clear");
+        hipLaunchKernelGGL(csr_mw_count,dim3(blocks),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,scratch);
+        hipLaunchKernelGGL(csr_mw_scan,dim3(1),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,cap,blocks,scratch);
+        hipLaunchKernelGGL(csr_mw_scatter,dim3(blocks),dim3(1024),0,stream,rows,count,request.shape.top_k,scratch);
+    } else if(((wmma&&form!=2)||count>serial_csr_max_rows)&&(prefill_route()&1U)) { // qpf2k/moe-mi route bit 1: same words
+        static const bool witness=[]{std::fprintf(stderr,"qpf2k-moe-mi route csr v2 active\n");return true;}();(void)witness;
+        hipLaunchKernelGGL(build_prefill_csr_waves_v2,dim3(1),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,cap);
+    } else if((wmma&&form!=2)||count>serial_csr_max_rows)
         hipLaunchKernelGGL(build_prefill_csr_waves,dim3(1),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,cap);
     else hipLaunchKernelGGL(build_prefill_csr,dim3(1),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,cap);
     check(hipGetLastError(),"A8 prefill CSR");
@@ -1498,24 +2303,292 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
             count,bucket[0],bucket[1],bucket[2],bucket[3],bucket[4],bucket[5],bucket[6],bucket[7],largest);
     }
     const unsigned batches=std::min(assignments,request.shape.experts+(assignments+cap-1U)/cap);
+    if(f16&&q20) {
+        // GSQ FP16 kernels: tune bits 1 and 4 and the diagnostic bits (the other bits are layout/dequantization
+        // forms of the production kernels with the same bytes).
+        const unsigned gtune=tune&gsq_f16_tune_mask;
+        const auto launch=[&]<unsigned Tune>() {
+            using Tile=F16Tile<Tune>;
+            constexpr unsigned Threads=Tile::Threads,Outs=Tile::Columns/2U;
+            const uint4* a16=(Tune&16U)?f16_prefill_a16():nullptr;
+            const auto gate_up=[&]<std::uint32_t G>() {
+                prefill_resources<project_prefill_f16g<G,Tune>,Threads>("gate_up_gsq",Tune);
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16g<G,Tune>),dim3(request.shape.rows/Outs,batches),dim3(Threads),0,
+                    stream,gate,up,rows,request.shape.hidden,request.shape.rows,a16);
+            };
+            const auto down=[&]<std::uint32_t D>() {
+                prefill_resources<down_prefill_f16g<D,Tune>,Threads>("down_gsq",Tune);
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16g<D,Tune>),dim3(request.shape.hidden/Tile::Columns,batches),dim3(Threads),0,
+                    stream,down_weights,rows,request.shape.hidden,request.shape.rows);
+            };
+            switch(request.gate_type) {
+            case gsq_a8::type_q2_0: gate_up.template operator()<gsq_a8::type_q2_0>(); break;
+            case gsq_a8::type_iq2_s: gate_up.template operator()<gsq_a8::type_iq2_s>(); break;
+            case gsq_a8::type_iq3_xxs: gate_up.template operator()<gsq_a8::type_iq3_xxs>(); break;
+            case gsq_a8::type_iq3_s: gate_up.template operator()<gsq_a8::type_iq3_s>(); break;
+            default: gate_up.template operator()<gsq_a8::type_iq4_xs>(); break;
+            }
+            check(hipGetLastError(),"GSQ FP16 prefill gate/up projection");
+            if(down_type==gsq_a8::type_q2_0)down.template operator()<gsq_a8::type_q2_0>();
+            else down.template operator()<gsq_a8::type_iq4_nl>();
+            check(hipGetLastError(),"GSQ FP16 prefill down");
+        };
+        const bool launched=[&]<unsigned... T>(std::integer_sequence<unsigned,T...>){
+            return ((gtune==T&&(launch.template operator()<T>(),true))||...);
+        }(std::integer_sequence<unsigned,0U,2U,16U,18U,272U,274U,528U,530U,1040U,1042U>{});
+        if(!launched)throw std::invalid_argument("GSQ FP16 prefill tune is not instantiated");
+        return;
+    }
     if(f16) {
-        const dim3 project_grid(request.shape.rows/128U,batches);
-        if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16<true>),project_grid,dim3(256),0,stream,
-            gate,up,rows,request.shape.hidden,request.shape.rows);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16<false>),project_grid,dim3(256),0,stream,
-            gate,up,rows,request.shape.hidden,request.shape.rows);
-        check(hipGetLastError(),"FP16 prefill WMMA gate/up projection");
-        const dim3 down_grid(request.shape.hidden/256U,batches);
-        if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16<true>),down_grid,dim3(256),0,
-            stream,down_weights,rows,request.shape.hidden,request.shape.rows);
-        else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16<false>),down_grid,dim3(256),0,
-            stream,down_weights,rows,request.shape.hidden,request.shape.rows);
-        check(hipGetLastError(),"FP16 prefill WMMA down");
+        // Forms 4..18 expose each schedule to byte-comparison fixtures. Form 3 uses
+        // the opt-in environment selector; no arithmetic/profile identity changes.
+        const auto launch=[&]<unsigned Tune>() {
+            if constexpr((Tune&~9U)!=0U) {
+                // Redone tiles (bits 1, 2, 4): grid x = output tile (the tiles of a batch run together), y = batch.
+                using Tile=F16Tile<Tune>;
+                constexpr unsigned Threads=Tile::Threads,Outs=Tile::Columns/2U;
+                if(q5k)prefill_resources<project_prefill_f16x<true,Tune>,Threads>("gate_up_q5k",Tune);
+                else prefill_resources<project_prefill_f16x<false,Tune>,Threads>("gate_up_q4k",Tune);
+                if(down_type==7U)prefill_resources<down_prefill_f16x<true,Tune>,Threads>("down_q51",Tune);
+                else prefill_resources<down_prefill_f16x<false,Tune>,Threads>("down_q80",Tune);
+                const uint4* a16=(Tune&16U)?f16_prefill_a16():nullptr;
+                const dim3 project_grid(request.shape.rows/Outs,batches);
+                // qpf2k core2 (STRIX_QPF2K_MOE = 1, 3, 5 or 7; production tunes 80 and 82 only): same bits.
+                // The depth-D pipeline primes D stages: K steps (hidden/64 for gate/up, rows/64 for down) must be >= 5.
+                if constexpr(Tune==80U||Tune==82U) if(const unsigned core=request.shape.hidden/64U>=5U&&request.shape.rows/64U>=5U?prefill_core2():0U) {
+                    if(core==257U) {
+                        // qpf2k P1 (hip_moe_prefill_p1.inc, design-5.md): gate/up and down in one ordered-claim launch; same bits.
+                        const unsigned lag=p1_lag();
+                        static bool seen=false;
+                        if(!seen){seen=true;std::fprintf(stderr,"qpf2k-moe p1 active tune=%u core=257 lag=%u\n",Tune,lag);}
+                        const unsigned G=request.shape.rows/Outs,Dn=request.shape.hidden/Tile::Columns;
+                        if(batches>p1_max_batches()||p1_pool_words()%2U)throw std::invalid_argument("qpf2k P1 batch counters exceed the pool");
+                        unsigned* pool=p1_counter_pool();
+                        check(hipMemsetAsync(pool,0,(2U+static_cast<std::size_t>(batches))*sizeof(unsigned),stream),"qpf2k P1 counters clear");
+                        unsigned* stats=p1_stats_enabled()?pool+p1_pool_words()-p1_stats_words:nullptr;
+                        if(stats)check(hipMemsetAsync(stats,0,p1_stats_words*sizeof(unsigned),stream),"qpf2k P1 stats clear");
+                        const P1Args pa{pool,pool+1,stats,batches,lag,G,Dn,lag==65535U?1U:0U};
+                        const dim3 grid((G+Dn)*batches);
+                        // qpf2k/moe-mi: P1 + DA16 (hip_moe_prefill_p1da16.inc) when STRIX_QPF2K_MOE_DA16=1. Same bits.
+                        const bool p1da16=prefill_da16()&&request.shape.rows<=max_rows;
+                        unsigned* arrive=nullptr;uint4* image=nullptr;
+                        if(p1da16) {
+                            prefill_da16_flag()=true;
+                            static bool seen16=false;
+                            if(!seen16){seen16=true;std::fprintf(stderr,"qpf2k-moe-mi p1+da16 active tune=%u\n",Tune);}
+                            if(batches>da16_counter_words())throw std::invalid_argument("qpf2k DA16 batch counters exceed the pool");
+                            arrive=da16_counters();image=da16_image();
+                            check(hipMemsetAsync(arrive,0,static_cast<std::size_t>(batches)*sizeof(unsigned),stream),"qpf2k P1+DA16 counters clear");
+                        }
+                        const auto go=[&]<bool QG,bool QD>(){
+                            if(p1da16)hipLaunchKernelGGL(HIP_KERNEL_NAME(p1_prefill_f16x_da16<QG,QD,Tune>),grid,dim3(Threads),0,stream,
+                                gate,up,down_weights,rows,request.shape.hidden,request.shape.rows,a16,pa,arrive,image);
+                            else
+                            hipLaunchKernelGGL(HIP_KERNEL_NAME(p1_prefill_f16x<QG,QD,Tune>),grid,dim3(Threads),0,stream,
+                                gate,up,down_weights,rows,request.shape.hidden,request.shape.rows,a16,pa);
+                        };
+                        if(q5k){if(down_type==7U)go.template operator()<true,true>();else go.template operator()<true,false>();}
+                        else {if(down_type==7U)go.template operator()<false,true>();else go.template operator()<false,false>();}
+                        check(hipGetLastError(),"FP16 prefill WMMA gate/up + down (qpf2k P1)");
+                        return;
+                    }
+                    if(core&1024U) {
+                        // qpf2k G3 core (hip_moe_prefill_g3.inc): same bits. Launch witness once per (tune, core).
+                        static bool seen[8192]{};
+                        if(!seen[core]){seen[core]=true;std::fprintf(stderr,"qpf2k-moe g3 active tune=%u core=%u\n",Tune,core);}
+                        const unsigned probe=(core>>11U)&3U;
+                        const auto by_probe=[&](const auto& f){
+                            if(probe==1U)f.template operator()<1U>();else if(probe==2U)f.template operator()<2U>();
+                            else if(probe==3U)f.template operator()<3U>();else f.template operator()<0U>();
+                        };
+                        // Depth (bit 5: 2 stages in flight; c22: depth 3 spills ~0.5 KB at BM 256): probes only at depth 1.
+                        const auto by_depth=[&](const auto& f){
+                            if(core&32U)f.template operator()<2U,0U>();else by_probe([&]<unsigned P>(){f.template operator()<1U,P>();});
+                        };
+                        const auto gu=[&]<unsigned BM>(){by_depth([&]<unsigned D,unsigned P>(){
+                            const dim3 grid(request.shape.rows/128U,batches);
+                            if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(g3_project<true,BM,P,D>),grid,dim3(2U*BM),0,stream,gate,up,rows,request.shape.hidden,request.shape.rows,a16,cap);
+                            else hipLaunchKernelGGL(HIP_KERNEL_NAME(g3_project<false,BM,P,D>),grid,dim3(2U*BM),0,stream,gate,up,rows,request.shape.hidden,request.shape.rows,a16,cap);
+                        });};
+                        const auto dn=[&]<unsigned BM>(){by_depth([&]<unsigned D,unsigned P>(){
+                            const dim3 grid(request.shape.hidden/256U,batches);
+                            if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(g3_down<true,BM,P,D>),grid,dim3(2U*BM),0,stream,down_weights,rows,request.shape.hidden,request.shape.rows,cap);
+                            else hipLaunchKernelGGL(HIP_KERNEL_NAME(g3_down<false,BM,P,D>),grid,dim3(2U*BM),0,stream,down_weights,rows,request.shape.hidden,request.shape.rows,cap);
+                        });};
+                        if(core&16U) {
+                            if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<true,Tune>),project_grid,dim3(Threads),0,stream,
+                                gate,up,rows,request.shape.hidden,request.shape.rows,a16);
+                            else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<false,Tune>),project_grid,dim3(Threads),0,stream,
+                                gate,up,rows,request.shape.hidden,request.shape.rows,a16);
+                        } else if(core&2U)gu.template operator()<128U>();
+                        else gu.template operator()<256U>();
+                        check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (g3)");
+                        if(core&4U) {
+                            const dim3 down_grid(request.shape.hidden/Tile::Columns,batches);
+                            if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<true,Tune>),down_grid,dim3(Threads),0,
+                                stream,down_weights,rows,request.shape.hidden,request.shape.rows,FuseNone{});
+                            else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<false,Tune>),down_grid,dim3(Threads),0,
+                                stream,down_weights,rows,request.shape.hidden,request.shape.rows,FuseNone{});
+                        } else if(core&2U)dn.template operator()<128U>();
+                        else dn.template operator()<256U>();
+                        check(hipGetLastError(),"FP16 prefill WMMA down (g3)");
+                        return;
+                    }
+                    const auto run=[&]<unsigned Core>() {
+                        // Launch witness (engine gates): once per process and (tune, core).
+                        static const bool witness=[]{std::fprintf(stderr,"qpf2k-moe core2 active tune=%u core=%u\n",Tune,Core);return true;}();
+                        (void)witness;
+                        if(q5k)prefill_resources<project_prefill_f16x<true,Tune,Core>,F16TileX<Tune,Core>::Threads>("gate_up_q5k_core2",Tune+1000U*Core);
+                        else prefill_resources<project_prefill_f16x<false,Tune,Core>,F16TileX<Tune,Core>::Threads>("gate_up_q4k_core2",Tune+1000U*Core);
+                        if(down_type==7U)prefill_resources<down_prefill_f16x<true,Tune,Core>,Threads>("down_q51_core2",Tune+1000U*Core);
+                        else prefill_resources<down_prefill_f16x<false,Tune,Core>,Threads>("down_q80_core2",Tune+1000U*Core);
+                        using TX=F16TileX<Tune,Core>;
+                        const dim3 pgrid(request.shape.rows/(TX::Columns/2U),batches);
+                        if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<true,Tune,Core>),pgrid,dim3(TX::Threads),0,stream,
+                            gate,up,rows,request.shape.hidden,request.shape.rows,a16);
+                        else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<false,Tune,Core>),pgrid,dim3(TX::Threads),0,stream,
+                            gate,up,rows,request.shape.hidden,request.shape.rows,a16);
+                        if constexpr((Core&256U)!=0U&&(Core&64U)!=0U) {
+                            // Split: the lone batches of the 256-row launch run as 128-row CTAs (same per-output chains).
+                            constexpr unsigned CN=Core&~64U;
+                            using TN=F16TileX<Tune,CN>;
+                            const dim3 ngrid(request.shape.rows/(TN::Columns/2U),batches);
+                            if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<true,Tune,CN>),ngrid,dim3(TN::Threads),0,stream,
+                                gate,up,rows,request.shape.hidden,request.shape.rows,a16);
+                            else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<false,Tune,CN>),ngrid,dim3(TN::Threads),0,stream,
+                                gate,up,rows,request.shape.hidden,request.shape.rows,a16);
+                        }
+                        check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (core2)");
+                        const dim3 down_grid(request.shape.hidden/Tile::Columns,batches);
+                        FuseArgT<Core> fa{};
+                        if constexpr((Core&512U)!=0U) {
+                            fa=FuseArgs{fuse_counter_pool(),request.shape.top_k,request.shape.hidden/Tile::Columns,count};
+                            check(hipMemsetAsync(fa.count,0,(static_cast<std::size_t>(count)*fa.tiles+1U)*sizeof(unsigned),stream),"fused merge counters clear");
+                            prefill_fused_flag()=true;
+                        }
+                        if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<true,Tune,Core>),down_grid,dim3(Threads),0,
+                            stream,down_weights,rows,request.shape.hidden,request.shape.rows,fa);
+                        else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<false,Tune,Core>),down_grid,dim3(Threads),0,
+                            stream,down_weights,rows,request.shape.hidden,request.shape.rows,fa);
+                        check(hipGetLastError(),"FP16 prefill WMMA down (core2)");
+                    };
+                    switch(core&~8U) {
+                    case 3U: run.template operator()<3U>(); break;
+                    case 5U: run.template operator()<5U>(); break;
+                    case 7U: run.template operator()<7U>(); break;
+                    case 17U: run.template operator()<17U>(); break;
+                    case 33U: run.template operator()<33U>(); break;
+                    case 49U: run.template operator()<49U>(); break;
+                    case 65U: if constexpr(Tune==82U) run.template operator()<65U>(); else run.template operator()<1U>(); break;
+                    case 81U: if constexpr(Tune==82U) run.template operator()<81U>(); else run.template operator()<17U>(); break;
+                    case 97U: if constexpr(Tune==82U) run.template operator()<97U>(); else run.template operator()<33U>(); break;
+                    case 129U: run.template operator()<129U>(); break;
+                    case 513U: run.template operator()<513U>(); break;
+                    case 641U: run.template operator()<641U>(); break;
+                    case 321U: if constexpr(Tune==82U) run.template operator()<321U>(); else run.template operator()<1U>(); break;
+                    case 449U: if constexpr(Tune==82U) run.template operator()<449U>(); else run.template operator()<129U>(); break;
+                    case 145U: run.template operator()<145U>(); break;
+                    default: run.template operator()<1U>(); break;
+                    }
+                    return;
+                }
+                // qpf2k/moe-mi DA16 (STRIX_QPF2K_MOE_DA16=1, hip_moe_prefill_da16.inc): the last gate/up tile of a batch writes the
+                // batch's FP16 down operand image once; the down stages it as a copy. Same bits.
+                if constexpr(Tune==80U||Tune==82U) if(prefill_da16()&&request.shape.rows<=max_rows&&request.shape.rows%64U==0U&&
+                    request.shape.hidden/64U>=5U&&request.shape.rows/64U>=5U) {
+                    prefill_da16_flag()=true;
+                    static const bool witness=[]{std::fprintf(stderr,"qpf2k-moe-mi da16 active\n");return true;}();(void)witness;
+                    if(batches>da16_counter_words())throw std::invalid_argument("qpf2k DA16 batch counters exceed the pool");
+                    unsigned* arrive=da16_counters();
+                    uint4* image=da16_image();
+                    check(hipMemsetAsync(arrive,0,static_cast<std::size_t>(batches)*sizeof(unsigned),stream),"qpf2k DA16 counters clear");
+                    if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_da16<true,Tune>),project_grid,dim3(Threads),0,stream,
+                        gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image);
+                    else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_da16<false,Tune>),project_grid,dim3(Threads),0,stream,
+                        gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image);
+                    check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (DA16)");
+                    const dim3 down_grid(request.shape.hidden/Tile::Columns,batches);
+                    if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16<true,Tune>),down_grid,dim3(Threads),0,
+                        stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
+                    else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16<false,Tune>),down_grid,dim3(Threads),0,
+                        stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
+                    check(hipGetLastError(),"FP16 prefill WMMA down (DA16)");
+                    return;
+                }
+                // qpf2k/moe-mi SMALL (STRIX_QPF2K_MOE_SMALL=<rows>, hip_moe_prefill_small.inc): gate/up batches with <= rows assignments
+                // run the core2 depth-3 body, the others the base body, in one launch; the base down. Same bits.
+                if constexpr(Tune==80U||Tune==82U) if(const unsigned small=prefill_small();small!=0U&&
+                    request.shape.hidden/64U>=5U&&request.shape.rows/64U>=5U) {
+                    prefill_small_flag()=true;
+                    static const bool witness=[]{std::fprintf(stderr,"qpf2k-moe-mi small active\n");return true;}();(void)witness;
+                    if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_small<true,Tune>),project_grid,dim3(Threads),0,stream,
+                        gate,up,rows,request.shape.hidden,request.shape.rows,a16,small);
+                    else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_small<false,Tune>),project_grid,dim3(Threads),0,stream,
+                        gate,up,rows,request.shape.hidden,request.shape.rows,a16,small);
+                    check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (SMALL)");
+                    const dim3 down_grid(request.shape.hidden/Tile::Columns,batches);
+                    if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<true,Tune>),down_grid,dim3(Threads),0,
+                        stream,down_weights,rows,request.shape.hidden,request.shape.rows,FuseNone{});
+                    else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<false,Tune>),down_grid,dim3(Threads),0,
+                        stream,down_weights,rows,request.shape.hidden,request.shape.rows,FuseNone{});
+                    check(hipGetLastError(),"FP16 prefill WMMA down (SMALL: base down)");
+                    return;
+                }
+                if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<true,Tune>),project_grid,dim3(Threads),0,stream,
+                    gate,up,rows,request.shape.hidden,request.shape.rows,a16);
+                else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<false,Tune>),project_grid,dim3(Threads),0,stream,
+                    gate,up,rows,request.shape.hidden,request.shape.rows,a16);
+                check(hipGetLastError(),"FP16 prefill WMMA gate/up projection");
+                const dim3 down_grid(request.shape.hidden/Tile::Columns,batches);
+                if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<true,Tune>),down_grid,dim3(Threads),0,
+                    stream,down_weights,rows,request.shape.hidden,request.shape.rows,FuseNone{});
+                else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x<false,Tune>),down_grid,dim3(Threads),0,
+                    stream,down_weights,rows,request.shape.hidden,request.shape.rows,FuseNone{});
+                check(hipGetLastError(),"FP16 prefill WMMA down");
+            } else {
+            constexpr unsigned Threads=256U,Outs=Threads/2U;
+            if(q5k)prefill_resources<project_prefill_f16<true,Tune>,Threads>("gate_up_q5k",Tune);
+            else prefill_resources<project_prefill_f16<false,Tune>,Threads>("gate_up_q4k",Tune);
+            if(down_type==7U)prefill_resources<down_prefill_f16<true,Tune>,Threads>("down_q51",Tune);
+            else prefill_resources<down_prefill_f16<false,Tune>,Threads>("down_q80",Tune);
+            const dim3 project_grid(request.shape.rows/Outs,batches);
+            if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16<true,Tune>),project_grid,dim3(Threads),0,stream,
+                gate,up,rows,request.shape.hidden,request.shape.rows);
+            else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16<false,Tune>),project_grid,dim3(Threads),0,stream,
+                gate,up,rows,request.shape.hidden,request.shape.rows);
+            check(hipGetLastError(),"FP16 prefill WMMA gate/up projection");
+            const dim3 down_grid(request.shape.hidden/Threads,batches);
+            if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16<true,Tune>),down_grid,dim3(Threads),0,
+                stream,down_weights,rows,request.shape.hidden,request.shape.rows);
+            else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16<false,Tune>),down_grid,dim3(Threads),0,
+                stream,down_weights,rows,request.shape.hidden,request.shape.rows);
+            check(hipGetLastError(),"FP16 prefill WMMA down");
+            }
+        };
+        [&]<unsigned... T>(std::integer_sequence<unsigned,T...>){(void)((tune==T&&(launch.template operator()<T>(),true))||...);}
+            (std::make_integer_sequence<unsigned,32U>{});
+        [&]<unsigned... T>(std::integer_sequence<unsigned,T...>){(void)((tune==64U+T&&(launch.template operator()<64U+T>(),true))||...);}
+            (std::make_integer_sequence<unsigned,32U>{});
+        // Diagnostic attribution tunes: 16, 18, 80 or 82 plus one or two of the bits 256/512/1024, or 82 plus 2048/4096.
+        [&]<unsigned... T>(std::integer_sequence<unsigned,T...>){(void)((tune==T&&(launch.template operator()<T>(),true))||...);}
+            (std::integer_sequence<unsigned,272U,528U,1040U,1552U,274U,530U,1042U,1554U,336U,592U,1104U,2130U,4178U,338U,594U>{});
+        // qpf2k/moe attribution (82 + 8192 hot A, + 16384 hot B, + 32768 no down raw-dot stores; wrong bits by design).
+        [&]<unsigned... T>(std::integer_sequence<unsigned,T...>){(void)((tune==T&&(launch.template operator()<T>(),true))||...);}
+            (std::integer_sequence<unsigned,8274U,16466U,24658U,32850U>{});
         return;
     }
     if(wmma) {
         // 16 waves per CTA (measured best against 8; down also against 4).
         constexpr unsigned project_waves=16U,down_waves=16U;
+        if(q20) {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_wmma_q20<project_waves>),dim3(batches,request.shape.rows/(8U*project_waves)),
+                dim3(32U*project_waves),0,stream,gate,up,rows,request.shape.hidden,request.shape.rows);
+            check(hipGetLastError(),"A8 prefill WMMA Q2_0 gate/up projection");
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_wmma_q20<down_waves>),dim3(batches,request.shape.hidden/(16U*down_waves)),
+                dim3(32U*down_waves),0,stream,down_weights,rows,request.shape.hidden,request.shape.rows);
+            check(hipGetLastError(),"A8 prefill WMMA Q2_0 down");
+            return;
+        }
         const dim3 project_grid(batches,request.shape.rows/(8U*project_waves));
         if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_wmma<true,project_waves>),project_grid,dim3(32U*project_waves),0,stream,
             gate,up,rows,request.shape.hidden,request.shape.rows);
@@ -1531,6 +2604,27 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
         return;
     }
     const dim3 project_grid(batches,request.shape.rows/32U);
+    if(q20) {
+        const auto iq_project=[&]<std::uint32_t T>(){hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_iq<T,4U>),project_grid,dim3(256),0,
+            stream,gate,up,rows,request.shape.hidden,request.shape.rows);};
+        if(request.gate_type==gsq_a8::type_iq2_s)iq_project.template operator()<gsq_a8::type_iq2_s>();
+        else if(request.gate_type==gsq_a8::type_iq3_xxs)iq_project.template operator()<gsq_a8::type_iq3_xxs>();
+        else if(request.gate_type==gsq_a8::type_iq3_s)iq_project.template operator()<gsq_a8::type_iq3_s>();
+        else if(request.gate_type==gsq_a8::type_iq4_xs)iq_project.template operator()<gsq_a8::type_iq4_xs>();
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_q20<4U>),project_grid,dim3(256),0,stream,gate,up,rows,
+            request.shape.hidden,request.shape.rows);
+        check(hipGetLastError(),"A8 prefill GSQ gate/up projection");
+        if(down_type==gsq_a8::type_iq4_nl)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_iq<gsq_a8::type_iq4_nl,8U>),
+            dim3(batches,request.shape.hidden/64U),dim3(256),0,stream,down_weights,rows,request.shape.hidden,request.shape.rows);
+        else if(down_type==42U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_q20<8U>),dim3(batches,request.shape.hidden/64U),dim3(256),0,
+            stream,down_weights,rows,request.shape.hidden,request.shape.rows);
+        else if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill<8U,true>),dim3(batches,request.shape.hidden/64U),dim3(256),0,
+            stream,down_weights,rows,request.shape.hidden,request.shape.rows);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill<8U,false>),dim3(batches,request.shape.hidden/64U),dim3(256),0,
+            stream,down_weights,rows,request.shape.hidden,request.shape.rows);
+        check(hipGetLastError(),"A8 prefill Q2_0 integer down");
+        return;
+    }
     if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill<4U,true>),project_grid,dim3(256),0,stream,gate,up,rows,
         request.shape.hidden,request.shape.rows);
     else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill<4U,false>),project_grid,dim3(256),0,stream,gate,up,rows,
@@ -1542,6 +2636,137 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
     else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill<8U,false>),down_grid,dim3(256),0,stream,down_weights,rows,
         request.shape.hidden,request.shape.rows);
     check(hipGetLastError(),"A8 prefill integer down");
+}
+void set_prefill_core2(int core){prefill_core2_override()=core;}
+void set_prefill_route(int bits){prefill_route_override()=bits;}
+void set_prefill_da16(int on){prefill_da16_override()=on;}
+void set_prefill_small(int rows){prefill_small_override()=rows;}
+bool prefill_small_ran(){return prefill_small_flag();}
+bool prefill_da16_ran(){return prefill_da16_flag();}
+bool prefill_clear_skipped(){return prefill_clear_skipped_flag();}
+void prefill_test_poison_da16(hipStream_t stream){check(hipMemsetAsync(da16_image(),0xa5,static_cast<std::size_t>(q51_known_rows::prefill_max_rows)*max_top_k*max_rows*2U,stream),"poison DA16 image");}
+void prefill_test_poison_a16(hipStream_t stream){check(hipMemsetAsync(f16_prefill_a16(),0xa5,static_cast<std::size_t>(q51_known_rows::prefill_max_rows)*max_hidden*2U,stream),"poison FP16 prefill A image");}
+bool prefill_fused_merge(){return prefill_fused_flag();}
+std::array<unsigned,8> prefill_p1_stats() {
+    std::array<unsigned,8> out{};
+    check(hipDeviceSynchronize(),"P1 stats sync");
+    check(hipMemcpy(out.data(),p1_counter_pool()+p1_pool_words()-p1_stats_words,sizeof(out),hipMemcpyDeviceToHost),"P1 stats read");
+    return out;
+}
+namespace {
+// The ordered merge's guards and non-finite flag after a fused down (known_moe_prefill_merge_kernel with the dot chain
+// already done by the last-arriving down CTA): a row the merge skips (any failure in header[0], a row status, an invalid
+// route) keeps the prologue's zero accumulation - the fused tail may have written it, so it is zeroed again here.
+__global__ void prefill_merge_check_kernel(PrefillRows v,unsigned* header,unsigned hidden,unsigned experts,unsigned top_k,const unsigned* flag) {
+    const unsigned row=blockIdx.y;
+    unsigned* status=at(v.status,row);
+    float* const acc_row=at(v.clear,row);
+    const unsigned out=blockIdx.x*blockDim.x+threadIdx.x;
+    // Guards in the merge kernel's order; a skipped row keeps (here: gets back) the prologue's +0 accumulation.
+    if(header[0]||*status){if(out<hidden)acc_row[out]=0.0F;return;}
+    if(out>=hidden)return;
+    for(unsigned slot=0;slot<top_k;++slot)if(at(v.routes,row)[slot]>=experts){acc_row[out]=0.0F;return;}
+    float current;
+    if(*flag) {
+        // Some fused value was non-finite: run the merge kernel's chain itself (same dots, order, instruction), so the
+        // header/status race outcome follows the serial merge.
+        const float* raw=at(v.rawdots,row);const float* w=at(v.route_weights,row);
+        float dots[10];
+#pragma unroll
+        for(unsigned slot=0;slot<10U;++slot)if(slot<top_k)dots[slot]=raw[static_cast<std::uint64_t>(slot)*hidden+out];
+        current=0.0F;
+#pragma unroll
+        for(unsigned slot=0;slot<10U;++slot)if(slot<top_k) {
+            const float weight=w[slot];
+            asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(current) : "s"(weight), "v"(dots[slot]));
+        }
+        acc_row[out]=current;
+    } else current=acc_row[out];
+    if((__float_as_uint(current)&0x7fffffffU)>=0x7f7f8000U){atomicOr(status,8U);atomicOr(header,8U);}
+}
+} // namespace
+void enqueue_prefill_merge_check(const PrefillRows& rows,unsigned count,unsigned hidden,unsigned experts,unsigned top_k,hipStream_t stream) {
+    const unsigned* flag=fuse_counter_pool()+static_cast<std::size_t>(count)*(hidden/256U);
+    hipLaunchKernelGGL(prefill_merge_check_kernel,dim3((hidden+255U)/256U,count),dim3(256),0,stream,rows,rows.csr.summary,hidden,experts,top_k,flag);
+    check(hipGetLastError(),"fused merge check");
+}
+std::array<unsigned long long,9> fast_dequant_selftest(unsigned long long seed,unsigned blocks) {
+    unsigned long long* counts=nullptr;
+    check(hipMalloc(&counts,9U*sizeof(unsigned long long)),"fast dequant self-test allocation");
+    check(hipMemset(counts,0,9U*sizeof(unsigned long long)),"fast dequant self-test clear");
+    hipLaunchKernelGGL(fast_dequant_selftest_kernel,dim3(blocks),dim3(256),0,nullptr,seed,counts);
+    check(hipGetLastError(),"fast dequant self-test launch");
+    std::array<unsigned long long,9> out{};
+    check(hipMemcpy(out.data(),counts,sizeof(out),hipMemcpyDeviceToHost),"fast dequant self-test read");
+    check(hipFree(counts),"fast dequant self-test free");
+    return out;
+}
+std::array<unsigned long long,5> gsq_q20_decode_selftest(unsigned seed,unsigned rows) {
+    const unsigned count=64U*rows;
+    unsigned char* blocks=nullptr;unsigned long long* counts=nullptr;
+    check(hipMalloc(&blocks,18ULL*count+16U),"GSQ Q2_0 decode self-test blocks");
+    check(hipMalloc(&counts,5U*sizeof(unsigned long long)),"GSQ Q2_0 decode self-test counts");
+    check(hipMemset(counts,0,5U*sizeof(unsigned long long)),"GSQ Q2_0 decode self-test clear");
+    hipLaunchKernelGGL(gsq_q20_fill_kernel,dim3((count+255U)/256U),dim3(256),0,nullptr,blocks,count,seed);
+    hipLaunchKernelGGL(gsq_q20_decode_kernel,dim3((count+255U)/256U),dim3(256),0,nullptr,blocks,count,counts);
+    check(hipGetLastError(),"GSQ Q2_0 decode self-test launch");
+    std::array<unsigned long long,5> out{};
+    check(hipMemcpy(out.data(),counts,sizeof(out),hipMemcpyDeviceToHost),"GSQ Q2_0 decode self-test read");
+    check(hipFree(blocks),"GSQ Q2_0 decode self-test free");check(hipFree(counts),"GSQ Q2_0 decode self-test free");
+    return out;
+}
+std::array<unsigned long long,5> gsq_iq_decode_selftest(std::uint32_t type,unsigned seed,unsigned blocks) {
+    if(type!=gsq_a8::type_iq2_s&&type!=gsq_a8::type_iq3_xxs&&type!=gsq_a8::type_iq3_s&&type!=gsq_a8::type_iq4_xs&&type!=gsq_a8::type_iq4_nl)
+        throw std::invalid_argument("GSQ IQ decode self-test: not an IQ type");
+    const unsigned width=type==gsq_a8::type_iq4_nl?640U:2560U,be=gsq_a8::block_elements(type),per_row=width/be;
+    blocks=(blocks+per_row-1U)/per_row*per_row;
+    const unsigned groups=blocks*(be/32U);
+    unsigned char* bytes=nullptr;unsigned long long* counts=nullptr;
+    const std::size_t total=static_cast<std::size_t>(blocks)*gsq_a8::block_bytes(type);
+    check(hipMalloc(&bytes,total),"GSQ IQ decode self-test blocks");  // no slack: the decoders read inside the rows
+    check(hipMalloc(&counts,3U*sizeof(unsigned long long)),"GSQ IQ decode self-test counts");
+    check(hipMemset(counts,0,3U*sizeof(unsigned long long)),"GSQ IQ decode self-test clear");
+    const auto run=[&]<std::uint32_t T>() {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(gsq_iq_fill_kernel<T>),dim3((blocks+255U)/256U),dim3(256),0,nullptr,bytes,blocks,seed);
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(gsq_iq_decode_kernel<T>),dim3((groups+255U)/256U),dim3(256),0,nullptr,bytes,groups,width,counts);
+    };
+    if(type==gsq_a8::type_iq2_s)run.template operator()<gsq_a8::type_iq2_s>();
+    else if(type==gsq_a8::type_iq3_xxs)run.template operator()<gsq_a8::type_iq3_xxs>();
+    else if(type==gsq_a8::type_iq3_s)run.template operator()<gsq_a8::type_iq3_s>();
+    else if(type==gsq_a8::type_iq4_xs)run.template operator()<gsq_a8::type_iq4_xs>();
+    else run.template operator()<gsq_a8::type_iq4_nl>();
+    check(hipGetLastError(),"GSQ IQ decode self-test launch");
+    std::array<unsigned long long,5> out{};
+    check(hipMemcpy(out.data(),counts,3U*sizeof(unsigned long long),hipMemcpyDeviceToHost),"GSQ IQ decode self-test read");
+    // Coverage of the fixture (host): distinct grid indices (or IQ4 nibble values) and sign patterns over all groups.
+    std::vector<unsigned char> host(total);
+    check(hipMemcpy(host.data(),bytes,total,hipMemcpyDeviceToHost),"GSQ IQ decode self-test bytes");
+    std::vector<char> grid(1024,0),signs(256,0);
+    const unsigned bb=gsq_a8::block_bytes(type);
+    for(unsigned b=0;b<blocks;++b) {
+        const unsigned char* x=host.data()+static_cast<std::size_t>(b)*bb;
+        if(type==gsq_a8::type_iq4_nl||type==gsq_a8::type_iq4_xs) {
+            const unsigned at=type==gsq_a8::type_iq4_nl?2U:8U;
+            for(unsigned i=at;i<bb;++i){grid[x[i]&15U]=1;grid[x[i]>>4U]=1;}
+            continue;
+        }
+        for(unsigned ib=0;ib<8U;++ib) {
+            if(type==gsq_a8::type_iq3_s) {
+                for(unsigned m=0;m<8U;++m)grid[x[2U+8U*ib+m]|(((x[66U+ib]>>m)&1U)<<8U)]=1;
+                for(unsigned l=0;l<4U;++l)signs[x[74U+4U*ib+l]]=1;
+            } else if(type==gsq_a8::type_iq3_xxs) {
+                for(unsigned m=0;m<8U;++m)grid[x[2U+8U*ib+m]]=1;
+                const unsigned aux=static_cast<unsigned>(x[66U+4U*ib])|static_cast<unsigned>(x[67U+4U*ib])<<8U|static_cast<unsigned>(x[68U+4U*ib])<<16U|static_cast<unsigned>(x[69U+4U*ib])<<24U;
+                for(unsigned l=0;l<4U;++l)signs[(aux>>(7U*l))&127U]=1;
+            } else {
+                for(unsigned l=0;l<4U;++l){grid[x[2U+4U*ib+l]|(((x[66U+ib]>>(2U*l))&3U)<<8U)]=1;signs[x[34U+4U*ib+l]]=1;}
+            }
+        }
+    }
+    for(const char c:grid)out[3]+=c?1ULL:0ULL;
+    for(const char c:signs)out[4]+=c?1ULL:0ULL;
+    check(hipFree(bytes),"GSQ IQ decode self-test free");check(hipFree(counts),"GSQ IQ decode self-test free");
+    return out;
 }
 void preflight(const Request& request,std::span<const Bindings> rows,const q51_known_rows::Workspace& workspace,hipStream_t stream) {
     (void)prepare(request,rows,workspace,stream);

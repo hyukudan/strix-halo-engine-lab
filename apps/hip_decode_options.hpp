@@ -7,6 +7,7 @@
 #include "strix/known_window_output_policy.hpp"
 #include "strix/session_snapshot.hpp"
 #include "strix/hip_model_residency.hpp"
+#include "strix/qpersist.hpp"
 #include "strix/raw_baseline_recording.hpp"
 #include "strix/final_generation_state_export.hpp"
 #include "strix/model_contract.hpp"
@@ -18,6 +19,7 @@
 #include "strix/mtp_depth_window_controller.hpp"
 #include <cerrno>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <sstream>
 #include <cmath>
@@ -138,6 +140,17 @@ struct MtpCliOptions {
     // default (=auto) runs it wherever it is admissible: its learned per-request gate stays closed unless
     // the output copies the context.
     bool ngram_draft=false,ngram_off=false;
+    // =ctx / =copy (experimental, never by default): the context drafter (strix/mtp_context_draft.hpp) replaces
+    // the extension, required like =on; copy also lets long context spans replace confident drafts.
+    bool ngram_context=false,ngram_copy_edit=false;
+    // =wide (experimental, never by default): the extension as =on for every ordinary cycle, plus the copy context
+    // drafter only observing and proposing --mtp-copy-wide-rows cycles (no ordinary cycle changes).
+    bool ngram_wide_only=false;
+    // --mtp-copy-wide-rows N[,M] (0 or absent = off, the default; a descending list of distinct sizes from 32 and 16):
+    // with =copy on the tiled MTP prompt, a cycle whose context span is long, unanimous and confident verifies N-1
+    // copied tokens in one N-row tiled known forward (the N-row tiled tail owner, all-rows heads) instead of the
+    // 8-row verify window, trying the largest size first (apps/hip_mtp_wide_copy.hpp). Empty = off.
+    std::vector<std::uint32_t> copy_wide_rows;
     // --mtp-draft-profile NAME: a qualified draft (strix/mtp_draft_profiles.hpp) whose identity and
     // provenance pins fill the sidecar options that are not given (a given pin must agree).
     std::string draft_profile;
@@ -344,6 +357,10 @@ struct Options {
     // sizes of default_known_prefill_tail_rows below T (D-056), none with `--known-prefix-tail-rows none`.
     std::vector<std::uint32_t> known_prefix_tail_rows;
     bool known_prefix_tail_rows_off = false;
+    // STRIX_QPF2K_SCHED bit 8: the smallest default tail size before pruning (MTP capture-slot bound; 0 = unused)
+    std::uint32_t known_prefix_tail_capture_rows = 0;
+    // STRIX_QPF2K_SCHED bit 8: the configured default tail ladder before pruning (S3 eligibility); empty = the owners'
+    std::vector<std::uint32_t> known_prefix_ladder_tail_rows;
     bool known_prefix_prefill_explicit = false;
     std::uint64_t known_prefill_workspace_budget = 0, known_prefill_metadata_budget = 0;
     std::uint64_t known_prefill_uma_budget = 0, known_prefill_host_headroom = 0;
@@ -364,6 +381,9 @@ struct Options {
     std::string prefix_cache_dir;
     std::uint64_t prefix_cache_disk_bytes = 0;
     std::uint64_t prefix_cache_every = 0;  // 0: every max(T, 4096) tokens, rounded to a multiple of T
+    // --prefix-cache-block-rows N (0: T): the cache's segment and checkpoint unit. N < T (dividing T): checkpoints also
+    // at the tail blocks' boundaries that are multiples of N, so large prefill blocks keep a fine resume granularity.
+    std::uint64_t prefix_cache_block_rows = 0;
     std::vector<std::string> prefix_cache_then_prompts;
     bool prefix_cache_disk_bytes_explicit = false, prefix_cache_every_explicit = false;
     // HTTP serving (docs/engine/serving/serving.md): after the MTP calibration replay the process serves
@@ -381,6 +401,12 @@ struct Options {
     std::uint32_t http_default_max_tokens = 4096;
     std::uint32_t http_max_queue = 64;
     std::uint32_t http_max_connections = 64;
+    // --rtx-state-import: opt-in /admin/rtx-import/* routes; a request whose prompt starts with a parked imported
+    // state starts from it (docs/rtx-state-import.md). Single-request serving only (not --http-batch).
+    bool rtx_state_import = false;
+    // --rtx-state-import-decode-threads N: background workers that decode X-Chunk-Encoding: bp-v1 chunks (the
+    // connection thread decodes too; created on the first encoded chunk).
+    std::uint32_t rtx_state_import_decode_threads = 4;
 };
 
 // The wrapper can omit a terminal stateless head without allocating a GPU
@@ -704,8 +730,12 @@ inline void validate_prefix_state_cache(const Options& o) {
             "lookup, serving, recording, reference, logprob or scalar-output modes");
     if (o.prefix_cache_disk_bytes_explicit && o.prefix_cache_dir.empty())
         throw std::invalid_argument("--prefix-cache-disk-bytes requires --prefix-cache-dir");
-    if (o.prefix_cache_every_explicit && (!o.prefix_cache_every || o.prefix_cache_every % o.known_prefix_prefill_rows))
-        throw std::invalid_argument("--prefix-cache-every must be a positive multiple of --known-prefix-prefill-rows");
+    if (o.prefix_cache_block_rows && (!o.prefix_cache_host_bytes || o.prefix_cache_block_rows % 8U ||
+        o.known_prefix_prefill_rows % o.prefix_cache_block_rows))
+        throw std::invalid_argument("--prefix-cache-block-rows needs the prefix cache and a multiple of 8 dividing --known-prefix-prefill-rows");
+    const std::uint64_t cache_unit = o.prefix_cache_block_rows ? o.prefix_cache_block_rows : o.known_prefix_prefill_rows;
+    if (o.prefix_cache_every_explicit && (!o.prefix_cache_every || o.prefix_cache_every % cache_unit))
+        throw std::invalid_argument("--prefix-cache-every must be a positive multiple of --known-prefix-prefill-rows (or of --prefix-cache-block-rows)");
     if (!o.prefix_cache_then_prompts.empty() && o.mtp.enabled)
         throw std::invalid_argument("--prefix-cache-then-prompt runs on the serial-decode tiled route only");
     if (o.prefix_cache_then_prompts.size() > 64U)
@@ -714,6 +744,9 @@ inline void validate_prefix_state_cache(const Options& o) {
 
 // HTTP serving runs the tiled MTP route: one calibration replay, then one request at a time.
 inline void validate_http_serve(const Options& o) {
+    if (o.rtx_state_import && (!o.http_serve || o.http_batch))
+        throw std::invalid_argument("--rtx-state-import requires --http-serve (the tiled MTP prompt) without --http-batch");
+    if (o.rtx_state_import_decode_threads > 64U) throw std::invalid_argument("--rtx-state-import-decode-threads is 0..64");
     if (!o.http_serve) return;
     if (!mtp_tiled_prompt(o) || !o.mtp.golden_dump.empty() || o.mtp.metadata_only)
         throw std::invalid_argument("--http-serve requires the tiled MTP route (--mtp with a calibration golden, "
@@ -742,6 +775,49 @@ inline void apply_default_known_prefill_tails(Options& options) {
         return;
     for (const auto rows : default_known_prefill_tail_rows)
         if (rows < options.known_prefix_prefill_rows) options.known_prefix_tail_rows.push_back(rows);
+    // STRIX_QPF2K_SCHED bit 8 (lazy tail owners): a single CLI request whose prompt is known here keeps only the default
+    // tail sizes its block ladder uses (each tail owner holds its own arena: up to 1.36 GB + 47.6 MB of plan metadata at
+    // T = 8192). The ladder (T blocks, then the largest tail that fits, then < 16 serial rows; with bit 4 balanced blocks
+    // and no tails) is the same on the pf cursor and the tiled MTP prompt. Not with anything that can start the prompt
+    // elsewhere or run other prompts (serving, cohorts, prefix caches / imports, wide copy cycles, lookup).
+    if (const char* v = std::getenv("STRIX_QPF2K_SCHED"); v && (std::strtoul(v, nullptr, 0) & 8UL) != 0UL &&
+        !options.tokens.empty() && !options.http_serve && options.mtp.cohort.empty() && options.serving_prefix_files.empty() &&
+        options.mtp.copy_wide_rows.empty() && !options.prefix_cache_roundtrip && !options.prefix_cache_host_bytes &&
+        options.prefix_cache_dir.empty() && !options.prefix_cache_block_rows && options.prefix_cache_then_prompts.empty() &&
+        !options.rtx_state_import && !options.prompt_lookup && !std::getenv("STRIX_RTX_EXPORT_STATE") && !std::getenv("STRIX_MTP_TILED_START") && !std::getenv("STRIX_MTP_WIDE_COST")) {
+        // Balanced blocks (bit 16) and merged tails (bit 4) apply only where both drivers apply them: terminal-row
+        // output, no all-rows heads (the defaults path already excludes teacher forcing and state-only).
+        const auto bits = std::strtoul(v, nullptr, 0);
+        const bool terminal = options.known_prefix_output_policy == strix::KnownWindowOutputPolicy::terminal_row;
+        const bool balanced = (bits & 16UL) != 0UL && terminal &&
+            strix::known_prefill_balanced_eligible(options.tokens.size(), options.known_prefix_prefill_rows,
+                options.known_prefix_tail_rows);
+        // The drivers decide the plan from the configured ladder, not from the pruned owner list.
+        options.known_prefix_ladder_tail_rows = options.known_prefix_tail_rows;
+        // The tiled MTP prompt sizes its capture slots by the smallest tail size (the serial remainder bound):
+        // keep the bound of the full default list whatever is pruned.
+        options.known_prefix_tail_capture_rows = options.known_prefix_tail_rows.empty() ? 0U : options.known_prefix_tail_rows.back();
+        const std::uint64_t t = options.known_prefix_prefill_rows;
+        // Balanced: the ladder's units off the 128-row grid run the last m mod 128 rows; otherwise the ladder after the T
+        // blocks, without the units bit 4 merges into the T owner.
+        const std::uint64_t left = balanced ? options.tokens.size() % strix::known_prefill_balanced_granule : options.tokens.size() % t;
+        const bool merged = !balanced && (bits & 4UL) != 0UL && terminal;
+        std::vector<std::uint32_t> used;
+        std::uint64_t m = left;
+        for (const auto rows : options.known_prefix_tail_rows)
+            if (m >= rows) {
+                if (!merged || !strix::known_prefill_tail_merged(left, t, options.known_prefix_tail_rows, rows)) used.push_back(rows);
+                m %= rows;
+            }
+        options.known_prefix_tail_rows = used;
+        if (used.empty()) options.known_prefix_tail_rows_off = true;
+        return;
+    }
+    // --mtp-copy-wide-rows: each wide size runs on a tail owner of exactly that many rows (descending order kept).
+    auto& tails = options.known_prefix_tail_rows;
+    for (const auto wide : options.mtp.copy_wide_rows)
+        if (wide < options.known_prefix_prefill_rows && std::find(tails.begin(), tails.end(), wide) == tails.end())
+            tails.insert(std::upper_bound(tails.begin(), tails.end(), wide, std::greater<std::uint32_t>()), wide);
 }
 
 inline void validate_known_prefill_options(const Options& options) {
@@ -758,6 +834,11 @@ inline void validate_known_prefill_options(const Options& options) {
         throw std::invalid_argument("known prefill requires explicit T16..2048, window, all budgets/headroom and no small-row or lookup selector");
     if (options.known_prefix_output_policy == strix::KnownWindowOutputPolicy::state_only && options.generate_tokens)
         throw std::invalid_argument("tiled state-only prefill cannot generate without a terminal output frontier");
+    // STRIX_QPF2K_SCHED bits 4/16 (merged / balanced blocks) are bitwise only where a dense row's form does not depend on its
+    // launch's row count: the dense8 component picks G64 or dense A8 by launch size (hip_dense_f16_wmma.hpp launch_prefill).
+    if (const char* v = std::getenv("STRIX_QPF2K_SCHED"); v && (std::strtoul(v, nullptr, 0) & 20UL) != 0UL &&
+        (numerical_profile_pair(options).fast_components & strix::kFastPrefillDense8) != 0U)
+        throw std::invalid_argument("STRIX_QPF2K_SCHED bits 4/16 (merged / balanced prefill blocks) exclude the dense8 prefill component");
     if (!options.known_prefix_tail_rows.empty() && (options.known_prefix_tail_rows.front() >= options.known_prefix_prefill_rows ||
         !options.known_prefix_full_rows || options.teacher_forced_score ||
         options.known_prefix_output_policy == strix::KnownWindowOutputPolicy::state_only))
@@ -924,8 +1005,10 @@ inline void validate_resolved_attention_kv_storage(const Options& options) {
             "without graph/integer head, GPU greedy, prefix cache, prompt lookup, serving, QSA GQA/hierarchical, "
             "RAW/reference or offline tuning");
     // The fast prefill QSA component reads BF16 keys and values; its identity would not describe an int8 cache.
-    if ((numerical_profile_pair(options).fast_components & strix::kFastPrefillQsa) != 0U)
-        throw std::invalid_argument("kv-int8-tok-v1 cannot run with the fast prefill QSA component");
+    // STRIX_QSA_FAST_INT8=1 (opt-in) gives the fast prefill QSA kernels int8 loaders (identity: fp16_rne of the
+    // dequantized value); without it the component reads BF16 keys and values and is rejected.
+    if ((numerical_profile_pair(options).fast_components & strix::kFastPrefillQsa) != 0U && !strix::qsa_fast_int8_enabled())
+        throw std::invalid_argument("kv-int8-tok-v1 cannot run with the fast prefill QSA component (STRIX_QSA_FAST_INT8=1 admits it)");
     if (!options.mtp.cohort.empty() || prefix_state_cache_requested(options) || options.http_serve)
         throw std::invalid_argument("kv-int8-tok-v1 is not admitted with cohort windows, the prefix state cache or HTTP serving");
 }
@@ -1034,6 +1117,15 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
         throw std::invalid_argument("MTP draft vocabulary options require --mtp-draft-chain");
     if(m.ngram_draft && (!m.draft_chain || !m.window_rows || !m.window_prefix || m.sample_options || m.metadata_only || !m.cohort.empty()))
         throw std::invalid_argument("--mtp-ngram-draft requires --mtp-draft-chain, prefix target windows, greedy selection and one request");
+    if(!m.copy_wide_rows.empty()) {
+        if(!m.ngram_copy_edit || !tiled || o.http_batch || m.metadata_only || !m.golden_dump.empty())
+            throw std::invalid_argument("--mtp-copy-wide-rows requires --mtp-ngram-draft=copy or =wide on the tiled MTP prompt, "
+                "one request and no golden dump");
+        for(const auto wide:m.copy_wide_rows)
+            if(std::find(o.known_prefix_tail_rows.begin(),o.known_prefix_tail_rows.end(),wide)==o.known_prefix_tail_rows.end())
+                throw std::invalid_argument("--mtp-copy-wide-rows requires a tiled tail block of each listed size "
+                    "(--known-prefix-tail-rows including it, below --known-prefix-prefill-rows)");
+    }
     if(m.draft_q4 && m.draft_vocab.empty() && !m.draft_context_vocab)
         throw std::invalid_argument("MTP draft Q4 head requires a draft vocabulary subset");
     if(m.sample_options) {
@@ -1097,7 +1189,7 @@ inline Options parse_options(
     if (argc < 2) {
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
-            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX (--mtp-golden FILE --mtp-golden-sha256 HEX | --mtp-golden-dump FILE) [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE[,FILE...]|auto:DIR] [--mtp-draft-context-vocab N] [--mtp-draft-exact] [--mtp-draft-q4] [--mtp-ngram-draft[=on|off|auto]]] [--mtp-draft-profile base|distill-d|distill-g] (explicit source/conversion/cast/budget options required)] "
+            "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX (--mtp-golden FILE --mtp-golden-sha256 HEX | --mtp-golden-dump FILE) [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE[,FILE...]|auto:DIR] [--mtp-draft-context-vocab N] [--mtp-draft-exact] [--mtp-draft-q4] [--mtp-ngram-draft[=on|off|auto|ctx|copy|wide]]] [--mtp-draft-profile base|distill-d|distill-g] (explicit source/conversion/cast/budget options required)] "
             "[--optimization-profile auto|manual] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1] [--prefill-numerical-profile NAME] "
             "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] [--dense-q6p-pack PATH] [--dense-trellis-pack PATH] "
@@ -1262,8 +1354,12 @@ inline Options parse_options(
         if(argument=="--mtp-ngram-draft" || argument.starts_with("--mtp-ngram-draft=")) {
             if(!mtp_option_names.insert("--mtp-ngram-draft").second)throw std::invalid_argument("duplicate MTP option");
             const auto mode=argument=="--mtp-ngram-draft"?std::string_view("on"):argument.substr(18);
-            if(mode!="on" && mode!="off" && mode!="auto")throw std::invalid_argument("--mtp-ngram-draft is on, off or auto");
-            options.mtp.supplied=true;options.mtp.ngram_draft=mode=="on";options.mtp.ngram_off=mode=="off";continue;
+            if(mode!="on" && mode!="off" && mode!="auto" && mode!="ctx" && mode!="copy" && mode!="wide")
+                throw std::invalid_argument("--mtp-ngram-draft is on, off, auto, ctx, copy or wide");
+            options.mtp.supplied=true;options.mtp.ngram_off=mode=="off";
+            options.mtp.ngram_context=mode=="ctx" || mode=="copy" || mode=="wide";
+            options.mtp.ngram_copy_edit=mode=="copy" || mode=="wide";options.mtp.ngram_wide_only=mode=="wide";
+            options.mtp.ngram_draft=mode=="on" || options.mtp.ngram_context;continue;
         }
         if(argument=="--mtp-draft-q4") {
             if(!mtp_option_names.insert(std::string(argument)).second)throw std::invalid_argument("duplicate MTP option");
@@ -1347,6 +1443,16 @@ inline Options parse_options(
                 if(value!="fixed" && value!="adaptive")throw std::invalid_argument("MTP sample schedule is fixed or adaptive");
                 m.sample_options=true;m.sample_timing_schedule=value=="adaptive";
             }
+            else if(key=="--mtp-copy-wide-rows") {
+                // 0 alone = off; otherwise a descending list of distinct sizes from {32, 16}.
+                if(value!="0") for(std::size_t begin=0;begin<=value.size();) {
+                    const auto end=std::min(value.find(',',begin),value.size());
+                    const auto rows=parse_u64(value.substr(begin,end-begin),"MTP copy wide rows");
+                    if((rows!=16U && rows!=32U) || (!m.copy_wide_rows.empty() && rows>=m.copy_wide_rows.back()))
+                        throw std::invalid_argument("MTP copy wide rows must be 0 or a descending list of distinct 32/16");
+                    m.copy_wide_rows.push_back(static_cast<std::uint32_t>(rows));begin=end+1U;
+                }
+            }
             else if(key=="--mtp-target-window-rows-set") {
                 for(std::size_t begin=0;begin<=value.size();) {
                     const auto end=std::min(value.find(',',begin),value.size());
@@ -1418,7 +1524,7 @@ inline Options parse_options(
         }
         if (argument == "--prefix-cache-host-bytes" || argument == "--prefix-cache-disk-bytes" ||
             argument == "--prefix-cache-every" || argument == "--prefix-cache-dir" ||
-            argument == "--prefix-cache-then-prompt") {
+            argument == "--prefix-cache-then-prompt" || argument == "--prefix-cache-block-rows") {
             if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
                 throw std::invalid_argument(std::string(argument) + " requires a value");
             const std::string_view value = argv[++index];
@@ -1427,6 +1533,9 @@ inline Options parse_options(
                 options.prefix_cache_dir = value;
             } else if (argument == "--prefix-cache-then-prompt") {
                 options.prefix_cache_then_prompts.emplace_back(value);
+            } else if (argument == "--prefix-cache-block-rows") {
+                if (options.prefix_cache_block_rows) throw std::invalid_argument("duplicate --prefix-cache-block-rows");
+                options.prefix_cache_block_rows = parse_u64(value, "prefix cache block rows");
             } else if (argument == "--prefix-cache-host-bytes") {
                 if (options.prefix_cache_host_bytes) throw std::invalid_argument("duplicate --prefix-cache-host-bytes");
                 options.prefix_cache_host_bytes = parse_u64(value, "prefix cache host bytes");
@@ -1447,9 +1556,15 @@ inline Options parse_options(
             options.http_serve = true;
             continue;
         }
+        if (argument == "--rtx-state-import") {
+            if (options.rtx_state_import) throw std::invalid_argument("duplicate --rtx-state-import");
+            options.rtx_state_import = true;
+            continue;
+        }
         if (argument == "--http-port" || argument == "--http-bind" || argument == "--http-model-id" ||
             argument == "--http-api-key-file" || argument == "--http-sampling" || argument == "--http-default-max-tokens" ||
-            argument == "--http-max-queue" || argument == "--http-max-connections" || argument == "--http-batch") {
+            argument == "--http-max-queue" || argument == "--http-max-connections" || argument == "--http-batch" ||
+            argument == "--rtx-state-import-decode-threads") {
             if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
                 throw std::invalid_argument(std::string(argument) + " requires a value");
             const std::string_view value = argv[++index];
@@ -1466,6 +1581,7 @@ inline Options parse_options(
             else if (argument == "--http-default-max-tokens") options.http_default_max_tokens = u32("HTTP default max tokens");
             else if (argument == "--http-max-queue") options.http_max_queue = u32("HTTP queue");
             else if (argument == "--http-batch") options.http_batch = u32("HTTP batch");
+            else if (argument == "--rtx-state-import-decode-threads") options.rtx_state_import_decode_threads = u32("rtx import decode threads");
             else options.http_max_connections = u32("HTTP connections");
             continue;
         }
@@ -2373,7 +2489,10 @@ inline OptimizationProfileResolution resolve_optimization_profile(
         return fallback("explicit-replay-reference");
     if (!has_q4k_a8_runtime)
         return fallback("a8-runtime-not-built");
-    if (content_identity != validated_model_content_identity)
+    // STRIX_GSQ_Q20_A8=1: the operator admits a GSQ-RCO file (or a GSQ/production composite) to the same
+    // bundle; its non-Q8 tensors run the GSQ kernels (own numerical identities and CPU oracles).
+    const char* gsq_admit = std::getenv("STRIX_GSQ_Q20_A8");
+    if (content_identity != validated_model_content_identity && !(gsq_admit && std::string_view(gsq_admit) == "1"))
         return fallback("checkpoint-content-not-qualified");
     if (options.context_explicit && options.context_tokens != 8192 && !options.unqualified_context)
         return fallback("context-not-qualified");
@@ -2479,7 +2598,10 @@ inline void apply_numerical_profile(
     if (numerical_profile_name(options.numerical_profile).empty())
         throw std::invalid_argument("unknown numerical profile");
     const auto canonical = ModelContract::qwen38_flash_next();
-    if (!has_q4k_a8_runtime || content_identity != validated_model_content_identity ||
+    // STRIX_GSQ_Q20_A8=1 admits GSQ-RCO content to the same profile (as in resolve_optimization_profile).
+    const char* gsq_admit = std::getenv("STRIX_GSQ_Q20_A8");
+    const bool gsq_content = gsq_admit && std::string_view(gsq_admit) == "1";
+    if (!has_q4k_a8_runtime || (content_identity != validated_model_content_identity && !gsq_content) ||
         !model.validate().empty() || model.hidden_size != canonical.hidden_size ||
         model.hidden_layers != canonical.hidden_layers || model.vocab_size != canonical.vocab_size ||
         model.hc_count != canonical.hc_count || model.hc_lowrank != canonical.hc_lowrank ||

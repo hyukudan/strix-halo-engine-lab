@@ -118,6 +118,13 @@ void shared_expert_known_prefill_rows_preflight(std::span<const ExecutionDispatc
     const HipSharedExpertLauncherConfig& config);
 void shared_expert_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipSharedExpertLauncherConfig& config);
+// Prefill, detached (STRIX_QPF2K_SCHED): the same T-row step on `stream`, its workspace rows at the arena's row stride in
+// the caller's [workspace, workspace + workspace_bytes) (the arena may give the step's own workspace to the routed
+// kernels that now run alongside it). Same kernels, launches and per-row arithmetic as the launch above; the first
+// kernel keeps its barrier (it follows a cross-stream wait). The caller orders `stream` after the step's input and
+// before its readers and owns stream and workspace through quiescence.
+void shared_expert_known_prefill_rows_launch_detached(std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config, void* stream, std::uintptr_t workspace, std::uint64_t workspace_bytes);
 
 class HipSharedExpertLauncherBundle {
 public:

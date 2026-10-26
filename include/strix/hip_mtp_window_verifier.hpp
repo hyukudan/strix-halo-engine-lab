@@ -19,7 +19,8 @@ struct HipMtpWindowVerificationPolicy {
 struct HipMtpVerifiedTargetRows {
     std::vector<HipMtpTargetHiddenTicket> committed_rows;
     std::vector<std::uint32_t> emitted_tokens;
-    std::uint32_t accepted_candidates=0;
+    // Candidate inputs actually evaluated (window payload excluding padding, or serial comparisons).
+    std::uint32_t verified_candidates=0,accepted_candidates=0;
     bool attempted_window=false,accepted_window=false,restored_checkpoint=false;
     std::uint32_t r2_dispatches=0,projection_launches_saved=0;
     std::uint32_t chosen_rows=1; // window owner rows, 1 = serial target steps
@@ -102,6 +103,8 @@ public:
     // per-row acceptance estimates (conditional on the earlier rows). They size the window like draft
     // rows but never enter the draft calibration (min-p controller only). Cleared by verify().
     void set_external_rows(std::size_t first,std::span<const double> acceptance);
+    // Clears external rows a cohort verification left (verify_cohort calibrates with them but does not clear).
+    void clear_external_rows() noexcept;
     // Setup only: every owner's window admission at the session's current frontier, so the
     // first window of each owner does not pay it inside the generation loop.
     void prepare_admission(const SerialSessionContext& session);
@@ -131,6 +134,23 @@ public:
     // configured prior, retaining the device owners. STRIX_MTP_REQUEST_RESET=0
     // retains the previous session's learned policy for controlled comparisons.
     void begin_session();
+    // Known prompt rows (STRIX_PROMPT_WINDOW, the serial suffix of a tiled MTP prompt): `tokens` (2, 4 or 8 known
+    // inputs at the session frontier, greedy target) run on the prefix owner of that many rows and every row is
+    // committed, as rows accepted by verify() are; each row's arithmetic is the serial row's. Returns the rows'
+    // tickets, or none (nothing ran) when no owner, capture pool, context room or lineage history admits them.
+    [[nodiscard]] std::vector<HipMtpTargetHiddenTicket> prompt_rows(SerialSessionContext&,std::span<const std::uint32_t> tokens);
+    // The known prompt rows of several sessions in one stream of steps (STRIX_PROMPT_WINDOW_COHORT): each session's
+    // window is the one prompt_rows() would run alone (same owner, inputs and per-row arithmetic; chunks of two or
+    // more sessions share the weight-only steps on an idle owner of their total rows, as verify_cohort does).
+    // Results in request order; a session that prompt_rows() would not admit gets no tickets (nothing ran for it).
+    struct PromptRowsRequest {HipMtpWindowVerifier* verifier=nullptr;SerialSessionContext* session=nullptr;std::span<const std::uint32_t> tokens;};
+    [[nodiscard]] static std::vector<std::vector<HipMtpTargetHiddenTicket>> prompt_rows_cohort(std::span<const PromptRowsRequest> requests);
+    // Wide copy verify (an external known forward over this session, apps/hip_mtp_wide_copy.hpp): before it, apply
+    // the pending deferred GDN rows on the owner that executed them, complete its PLE commit stream and invalidate
+    // every owner's persistent QSA pools; after it, skip_cycle_sample() keeps the external forward out of the next
+    // cycle's measured time. Idle and healthy only; owners, policy state and calibration are retained.
+    void flush_pending_window();
+    void skip_cycle_sample();
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

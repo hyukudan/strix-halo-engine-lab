@@ -1,4 +1,5 @@
 #include "strix/shared_expert_prefetch.hpp"
+#include "strix/moe_q4k_a8_contract.hpp"
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -39,7 +40,8 @@ void validate_layers(std::uint64_t hidden_layers, bool enabled,
                      std::span<const std::uint32_t> layers) {
     if (!enabled && !layers.empty())
         throw std::invalid_argument("shared prefetch layers require opt-in");
-    if (enabled && layers.empty())
+    // GSQ-RCO (STRIX_GSQ_Q20_A8=1): a file without Q8_0 matrices here leaves the prefetch with no step.
+    if (enabled && layers.empty() && !strix::moe_q4k_a8::q20_a8_enabled())
         throw std::invalid_argument("shared prefetch requires eligible step");
     std::optional<std::uint32_t> previous;
     for (auto layer : layers) {

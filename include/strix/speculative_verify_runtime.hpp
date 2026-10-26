@@ -66,6 +66,23 @@ struct KnownWindowExecutionHooks {
     // admission), with the step index and a resolver of each row's dispatch context. The observer may
     // enqueue copies of the step's outputs on the current stream before later steps reuse the arena.
     std::function<void(std::size_t, const std::function<ExecutionDispatchContext(std::uint32_t)>&)> after_step;
+    // Tiled prefill only (STRIX_QPF2K_SCHED schedules of the native owner): called just before each step of the launch
+    // phase is enqueued, with its step index and, for a full-T step, all T row contexts (empty for any other step).
+    // Returning true means the hook enqueued that full-T step itself (on its own stream, same kernels and arithmetic);
+    // the loop then only records it. The hook also orders later steps after such work (its joins).
+    std::function<bool(std::size_t, std::span<const ExecutionDispatchContext>)> prefill_step;
+    // Tiled prefill only (STRIX_QPF2K_SCHED bit 4): the block is the first tokens.size() rows of the compiled T arena
+    // (a multiple of 8, 16..T rows; terminal-row or state-only policy): the same per-row work as in a T block.
+    bool partial_rows = false;
+    // Optional, with after_step: the steps after_step actually reads (it returns at once for the others). Empty = every
+    // step. A STRIX_QPF2K_HC prefill fold never covers an observed step, so the observer sees the same bytes as unfolded.
+    std::function<bool(std::size_t)> after_step_observes;
+    // Tiled prefill only (STRIX_QPF2K_HC folds): called just before a full-T rows step is enqueued, with its row
+    // contexts, a predicate telling whether a later step of this block also runs as a full-T rows entry, and a
+    // resolver of that step's row contexts. Returning true means the hook enqueued that step's work itself (a fold
+    // that covers later steps returns true for them too); the loop then only records the step.
+    std::function<bool(std::size_t, std::span<const ExecutionDispatchContext>, const std::function<bool(std::size_t)>&,
+        const std::function<std::vector<ExecutionDispatchContext>(std::size_t)>&)> prefill_before_step;
 };
 
 struct KnownWindowR2Entry {

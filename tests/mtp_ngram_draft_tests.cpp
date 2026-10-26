@@ -95,6 +95,44 @@ int main() {
         d.finish_cycle(V{3});
         check(d.begin_cycle(3, V{1, 2}, 0, 7, acc).empty(), "no confident draft, no extension");
     }
+    {
+        // Cross-request lookup: request B copies text that only request A's context holds.
+        MtpNgramDraftConfig config;
+        config.prior = 0.6;  // open from the start for this test (the default prior keeps it closed until learned)
+        MtpNgramDraft a(config), b(config), c(config);
+        const V text{40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59};
+        a.reset(text);
+        b.reset(V{7, 8, 9});
+        c.reset(V{7, 8, 9});
+        std::vector<double> acc;
+        // B has no own match: without peers nothing, with peers A's continuation (4-token suffix 40..43 + draft 44).
+        check(c.begin_cycle(40, V{41, 42, 43, 44}, 4, 7, acc).empty(), "no peers, no cross-request extension");
+        b.set_peers({&a, &b});
+        auto ext = b.begin_cycle(40, V{41, 42, 43, 44}, 4, 7, acc);
+        check(ext.size() == 3 && ext[0] == 45 && ext[2] == 47 && acc.size() == 3, "peer context continues the chain");
+        b.used(ext.size());
+        b.finish_cycle(V{41, 42, 43, 44, 45, 46, 47, 48});
+        check(b.stats().peer_cycles == 1 && b.stats().peer_extension_rows == 3 && b.stats().peer_accepted_rows == 3,
+            "peer rows are counted and accepted");
+        check(b.peer_acceptance(0) > config.prior && b.acceptance(4, false, 0) == config.prior,
+            "peer rows learn in their own cells");
+        // A wrong peer continuation closes the peer cells, not the own ones.
+        MtpNgramDraft d(config);
+        d.reset(V{7, 8, 9});
+        d.set_peers({&a});
+        for (int cycle = 0; cycle < 12; ++cycle) {
+            auto e = d.begin_cycle(40, V{41, 42, 43, 44}, 4, 7, acc);
+            if (!e.empty()) d.used(e.size());
+            d.finish_cycle(V{41, 42, 43, 44, static_cast<std::uint32_t>(900 + cycle)});
+        }
+        check(d.peer_acceptance(0) < config.floor, "peer rows that are never right stop being proposed");
+        // Peers never shorten an own match: A's own lookup is unchanged by peers.
+        MtpNgramDraft e(config);
+        e.reset(V{1, 2, 3, 4, 5, 1, 2});
+        e.set_peers({&a});
+        auto own = e.begin_cycle(2, V{3, 4}, 2, 7, acc);
+        check(!own.empty() && own[0] == 5 && e.stats().peer_cycles == 0, "own context first");
+    }
     std::printf("mtp n-gram draft tests: failures=%d\n", failures);
     return failures ? 1 : 0;
 }

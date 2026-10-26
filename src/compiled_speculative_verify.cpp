@@ -4,6 +4,9 @@
 #include "strix/q8_projection_organization.hpp"
 #include "strix/shared_expert_prefetch.hpp"
 #include "strix/moe_q4k_a8_runtime.hpp"
+#include "strix/moe_q4k_a8_contract.hpp"
+#include "strix/gsq_a8_groups.hpp"
+#include <cstdlib>
 #include "strix/gguf_reader.hpp"
 
 #include <algorithm>
@@ -555,8 +558,11 @@ bool window_routed_union_types(const ModelManifest& manifest, const ExecutionTen
         window_require(tensor.dimensions==std::vector<std::uint64_t>{width,outputs,512ULL},
             "known window routed expert shape differs from canonical operands");
         const auto type=tensor.ggml_type;
-        const bool admitted=down ? type==7U || (profile.q80 && type==8U) :
-            (type==12U || (profile.q5k && type==13U)) && (!gate_type || type==gate_type);
+        // STRIX_GSQ_WINDOW_EXPERTS=0 (diagnostic): GSQ routed experts stay out of windows (per-op serial fallback).
+        static const bool gsq_window_experts=[]{const char* v=std::getenv("STRIX_GSQ_WINDOW_EXPERTS");return !v || v[0]!='0';}();
+        const bool q20=profile.a8 && moe_q4k_a8::q20_a8_enabled() && gsq_window_experts;
+        const bool admitted=down ? type==7U || (profile.q80 && type==8U) || (q20 && profile.q80 && gsq_a8::down_type(type)) :
+            (type==12U || (profile.q5k && type==13U) || (q20 && gsq_a8::gate_type(type))) && (!gate_type || type==gate_type);
         if(!down) gate_type=type;
         if(!admitted) {eligible=false;continue;}
         const auto geometry=gguf::tensor_type_geometry(tensor.ggml_type);
@@ -609,7 +615,17 @@ KnownWindowR2Variant routed_union_variant(std::uint32_t rows, RoutedUnionProfile
 bool window_matrix(const ManifestTensor& tensor, std::uint64_t width, std::uint64_t rows) {
     window_require(tensor.dimensions == std::vector<std::uint64_t>{width, rows},
         "known window promoted matrix shape differs from its canonical operand");
-    if (tensor.ggml_type != 8U) return false; // Explicit per-op serial fallback.
+    if (tensor.ggml_type != 8U) {
+        // GSQ-RCO files (STRIX_GSQ_Q20_A8=1): the dense A8 typed segments run these matrices at R rows.
+        // STRIX_GSQ_WINDOW_DENSE=0 (diagnostic): GSQ dense matrices stay out of windows (per-op serial fallback).
+        static const bool gsq_window_dense=[]{const char* v=std::getenv("STRIX_GSQ_WINDOW_DENSE");return !v || v[0]!='0';}();
+        if (!moe_q4k_a8::q20_a8_enabled() || !gsq_window_dense || !gsq_a8::dense_type(tensor.ggml_type) ||
+            width % gsq_a8::dense_block_elements(tensor.ggml_type))
+            return false; // Explicit per-op serial fallback.
+        window_require(tensor.byte_size == gsq_a8::dense_row_bytes(tensor.ggml_type, static_cast<std::uint32_t>(width)) * rows &&
+            tensor.absolute_offset % 4U == 0, "known window GSQ weight extent/alignment is invalid");
+        return true;
+    }
     const auto bytes = (width / 32U) * 34U * rows;
     window_require(width % 32U == 0 && tensor.byte_size == bytes && tensor.absolute_offset % 16U == 0 &&
         tensor.byte_size <= std::numeric_limits<std::uint64_t>::max() - tensor.absolute_offset,
@@ -679,8 +695,11 @@ WindowGdnFormat window_gdn_format(const ModelManifest& manifest, const Execution
         const bool q8 = window_matrix(tensor, item.second[0], item.second[1]);
         all_q8 = q8 && all_q8;
         if (index == 2U || index == 3U) {
-            f32_gates = tensor.ggml_type == 0U && f32_gates;
-            if (admit_f32_gates && tensor.ggml_type == 0U) {
+            f32_gates = (tensor.ggml_type == 0U || (tensor.ggml_type == 30U && moe_q4k_a8::q20_a8_enabled())) && f32_gates;
+            if (admit_f32_gates && tensor.ggml_type == 30U && moe_q4k_a8::q20_a8_enabled()) {
+                window_require(tensor.byte_size == 245760ULL && tensor.absolute_offset % 16U == 0,
+                    "known window BF16 gate extent/alignment is invalid");
+            } else if (admit_f32_gates && tensor.ggml_type == 0U) {
                 window_require(tensor.byte_size == 491520ULL && tensor.absolute_offset % 16U == 0 &&
                     tensor.byte_size <= std::numeric_limits<std::uint64_t>::max() - tensor.absolute_offset,
                     "known window F32 gate extent/alignment is invalid");
@@ -848,7 +867,8 @@ std::pair<std::uint64_t, std::uint64_t> known_window_identities(
         ple_rows==window.ple_rows_steps && head_rows==window.lm_head_rows_steps &&
         router_rows==window.router_rows_steps && elementwise_rows==window.combine_inject_rows_steps,
         "known window counters do not match its actual mode table");
-    window_require(avoided == window.logical_projection_weight_bytes_avoided &&
+    // GSQ-RCO files: the planner counts the actual (non-Q8) operand bytes; the launch count stays closed.
+    window_require((avoided == window.logical_projection_weight_bytes_avoided || moe_q4k_a8::q20_a8_enabled()) &&
         launches == window.projection_launches_saved,
         "known window logical projection counters differ from the closed operand shapes");
     hash_u64(kernel, avoided); hash_u64(kernel, launches);

@@ -92,7 +92,56 @@ void enqueue_prefill_prologue(const Request&, const PrefillRows&, unsigned rows,
 // with the serial CSR builder. Every output byte is identical across forms. A non-finite gate/up
 // value of a (row, slot) sets status bit 8 in its row and in the summary: gate/up still runs every
 // batch (the bytes it writes do not depend on CTA order), the down is skipped.
+// Form 3 is the separate FP16 prefill contract. Forms 4..34 (tunes 1..31) and 35..66 (tunes
+// 64..95) are its schedule candidates: bit 0 one register-prefetch stage, bit 1 batch-major
+// 128-assignment batches, bit 2 compact 128-column tile, bit 3 unpadded XOR-permuted LDS rows,
+// bit 4 prologue FP16 image of the prompt rows, bit 6 short exact dequantization.
+// Form 3 selects the same schedules with STRIX_INTPREFILL_MOE_TUNE (default 0).
 void enqueue_prefill(const Request&, const PrefillRows&, unsigned rows, unsigned clear_words,
     const unsigned char* gate, const unsigned char* up, unsigned down_type, const unsigned char* down_weights, hipStream_t,
     int form = -1);
+// Diagnostic: MoE tune bit 6 (short exact FP16 dequantization) against the base conversion on random scales and every
+// code. Returns tested/admitted/mismatched counts for K-quant sub-blocks and Q5_1 blocks, then the same for the rejected
+// Q8_0 offset form (informational: it differs in the sign of zero) (synchronizes).
+// The kernels enqueue_prefill runs for this request, down type and form (receipts count GSQ rows per form).
+enum class PrefillKernelForm : unsigned { dot4, iu8_wmma, f16_wmma };
+PrefillKernelForm prefill_kernel_form(const Request&, unsigned down_type, int form);
+// The MoE tune of a FP16 prefill call (STRIX_INTPREFILL_MOE_TUNE or the form, bit 1 cleared below 96 assignments per
+// expert); the GSQ FP16 kernels run it masked with gsq_f16_tune_mask (batch-major bit 1, A16 image bit 4, diagnostics).
+unsigned prefill_effective_tune(const Request&, unsigned count, unsigned down_type, int form);
+inline constexpr unsigned gsq_f16_tune_mask = 2U | 16U | 256U | 512U | 1024U;
+std::array<unsigned long long,9> fast_dequant_selftest(unsigned long long seed,unsigned blocks);
+// GSQ Q2_0 decoders of the prefill kernels (FP16 TPC 1/2, iu8 operands) against the reference values on rows of 64
+// blocks covering every FP16 scale pattern and every code byte per position: {FP16 words, differing, NaN references,
+// code bytes, differing}.
+std::array<unsigned long long,5> gsq_q20_decode_selftest(unsigned seed,unsigned rows);
+// GSQ IQ decoders of the FP16 prefill kernels (IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL) against round_f16 of the format's
+// element values on `blocks` random blocks (scale bits (b + seed) & 65535): {FP16 words, differing, NaN references,
+// distinct grid indices (IQ4: nibble values) seen, distinct sign patterns seen (IQ3_XXS: 7-bit; IQ4: 0)}.
+std::array<unsigned long long,5> gsq_iq_decode_selftest(std::uint32_t type,unsigned seed,unsigned blocks);
+// qpf2k core2 test hook: overrides STRIX_QPF2K_MOE for the routed prefill (-1 = use the environment).
+void set_prefill_core2(int core);
+// qpf2k/moe-mi test hook: overrides STRIX_QPF2K_MOE_ROUTE (bit 1 CSR v2, bit 2 prologue v2; -1 = use the environment).
+void set_prefill_route(int bits);
+// qpf2k/moe-mi test hook: overrides STRIX_QPF2K_MOE_DA16 (1 = FP16 down operand image written by the last gate/up tile; -1 = environment).
+void set_prefill_da16(int on);
+// qpf2k/moe-mi test hooks: whether the last enqueue_prefill of this thread took the DA16 path; fill the DA16 image with 0xa5.
+bool prefill_da16_ran();
+// True when the last enqueue_prefill of this thread left the accumulation view unzeroed (STRIX_QPF2K_MOE_ROUTE bit 8): the
+// caller must then run the merge variant that writes zeros on its skip paths (known_moe_prefill_merge_kernel_z).
+bool prefill_clear_skipped();
+void prefill_test_poison_da16(hipStream_t stream);
+// qpf2k/moe-mi test hooks: STRIX_QPF2K_MOE_SMALL override (batches with <= rows assignments take the depth-3 body; 0 = off,
+// -1 = environment) and whether the last enqueue_prefill of this thread took that path.
+void set_prefill_small(int rows);
+bool prefill_small_ran();
+// qpf2k/moe-mi test hook: fills the FP16 prefill A image (MoE tune bit 4) with 0xa5 bytes, so a gate sees missing writes.
+void prefill_test_poison_a16(hipStream_t stream);
+// True when the last enqueue_prefill of this thread fused the ordered merge into the down (STRIX_QPF2K_MOE bit 9): the caller
+// then launches enqueue_prefill_merge_check instead of its merge kernel (same accumulation, status and header bits).
+bool prefill_fused_merge();
+// qpf2k P1 test hook (STRIX_QPF2K_MOE=257 with STRIX_QPF2K_MOE_P1STATS=1), last call (synchronizes the device): [0] down items
+// that waited, [1] polls, [2] down items that ran, [3] down items that skipped, [4..5] total wait (u64 wall-clock ticks).
+std::array<unsigned,8> prefill_p1_stats();
+void enqueue_prefill_merge_check(const PrefillRows& rows,unsigned count,unsigned hidden,unsigned experts,unsigned top_k,hipStream_t stream);
 } // namespace strix::moe_q4k_a8::known_rows
