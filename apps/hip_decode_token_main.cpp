@@ -1212,6 +1212,7 @@ int STRIX_DECODE_ENTRY(
         std::cout << strix::decode_cli::effective_config_json(effective);
         return 0;
     }
+    strix::decode_cli::require_effective_prefill_execution(effective);
     strix::qpf2k::undo_pre_injected([](const char* name) { ::unsetenv(name); });
     strix::qpf2k::baseline = options.baseline;
     for (const auto& [name, value] : effective.environment) {
@@ -2044,10 +2045,9 @@ int STRIX_DECODE_ENTRY(
             // STRIX_PLE_RECLAIM_DECODE_BYTES can only raise it.
             const std::uint64_t lookups_per_token = options.mtp.enabled
                 ? (options.mtp.candidate_depth ? options.mtp.candidate_depth + 1ULL : 9ULL) : 1ULL;
-            config.decode_allowance_bytes = std::max<std::uint64_t>(256ULL << 20U,
-                (options.generate_tokens + 1U) * lookups_per_token * contract.head_count * 2U * page);
-            if (const char* v = std::getenv("STRIX_PLE_RECLAIM_DECODE_BYTES"))
-                config.decode_allowance_bytes = std::max<std::uint64_t>(config.decode_allowance_bytes, std::strtoull(v, nullptr, 10));
+            const char* decode_bytes = std::getenv("STRIX_PLE_RECLAIM_DECODE_BYTES");
+            config.decode_allowance_bytes = strix::ple_reclaim::decode_allowance(options.generate_tokens, lookups_per_token,
+                contract.head_count, page, decode_bytes ? std::strtoull(decode_bytes, nullptr, 10) : 0U);
             config.ahead_rows = 2U * options.known_prefix_prefill_rows;
             if (const char* v = std::getenv("STRIX_PLE_RECLAIM_AHEAD_ROWS"); v && std::strtoull(v, nullptr, 10))
                 config.ahead_rows = std::strtoull(v, nullptr, 10);

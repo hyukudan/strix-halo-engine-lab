@@ -70,6 +70,16 @@ struct Stats {
     bool bound_exceeded = false, mincore_failed = false;
 };
 
+// Pure prompt accounting, shared by pre-HIP admission and verified runtime setup.
+struct PromptPlan {
+    std::vector<std::uint32_t> rows;
+    Stats stats;
+};
+[[nodiscard]] PromptPlan plan_prompt(const Config& config, const PleHashContract& contract,
+    std::span<const std::uint32_t> prompt);
+[[nodiscard]] std::uint64_t decode_allowance(std::uint64_t generate_tokens, std::uint64_t lookups_per_token,
+    std::uint64_t heads, std::uint64_t page, std::uint64_t requested_bytes = 0);
+
 class Prefetcher {
 public:
     // Hashes the whole prompt (the launcher's chain: position 0 with EOS context) and builds the touched-page set,

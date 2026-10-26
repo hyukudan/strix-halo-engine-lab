@@ -419,16 +419,22 @@ struct Options {
     std::uint32_t rtx_state_import_decode_threads = 4;
 };
 
+// Shared by runtime setup and pre-HIP memory admission.
+[[nodiscard]] inline bool ple_reclaim_route_supported(const Options& options,
+    const HipModelResidencyPolicy& residency_policy, bool graph_mode) noexcept {
+    return options.residency == HipModelResidencyMode::registered_file_mapping &&
+        residency_policy.copy_tier == HipModelCopyTier::none && !residency_policy.promote_file_backed_candidates &&
+        !graph_mode && options.known_prefix_prefill_rows && !options.tokens.empty() && !options.http_serve &&
+        options.mtp.cohort.empty() && options.serving_prefix_files.empty() && !options.mtp.enabled &&
+        !options.planned_ple_io;
+}
+
 // Auto and explicit =1 share the original route gate; only =1 refuses an unsupported route.
 [[nodiscard]] inline ple_reclaim::Mode ple_reclaim_mode(const Options& options,
     const HipModelResidencyPolicy& residency_policy, bool graph_mode) {
     const auto mode = ple_reclaim::requested();
     if (mode == ple_reclaim::Mode::off) return mode;
-    if (options.residency != HipModelResidencyMode::registered_file_mapping ||
-        residency_policy.copy_tier != HipModelCopyTier::none || residency_policy.promote_file_backed_candidates ||
-        graph_mode || !options.known_prefix_prefill_rows || options.tokens.empty() || options.http_serve ||
-        !options.mtp.cohort.empty() || !options.serving_prefix_files.empty() || options.mtp.enabled ||
-        options.planned_ple_io) {
+    if (!ple_reclaim_route_supported(options, residency_policy, graph_mode)) {
         if (mode == ple_reclaim::Mode::required)
             throw std::invalid_argument("STRIX_PLE_RECLAIMABLE=1 requires --residency register without model copies or graph mode, "
                 "a tiled known prefill (--known-prefix-prefill-rows) and a plain-route CLI prompt (no MTP route, no "

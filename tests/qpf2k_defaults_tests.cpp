@@ -157,6 +157,8 @@ void ple_reclaim_tests() {
     expect(ple_reclaim::requested() == Mode::automatic, "unset L1 selects auto");
     defaults.set("0");
     expect(ple_reclaim::requested() == Mode::off, "DEFAULTS=0 disables unset L1 without startup injection");
+    defaults.set("00");
+    expect(ple_reclaim::requested() == Mode::off, "DEFAULTS=00 disables unset L1 without startup injection");
     defaults.set(nullptr);
     flag.set("auto");
     // Alternate owners after the environment has been read; default provenance must remain owner-local.

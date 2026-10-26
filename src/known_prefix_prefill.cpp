@@ -58,7 +58,7 @@ CompiledKnownPrefixPrefill compile_known_prefix_prefill(const ModelContract& mod
     validate_known_window_output_policy(request.output_policy);
     const auto payload=metadata_payload(request.logical_rows,serial.arena.allocations.size());
     if(payload>request.host_metadata_payload_budget_bytes)
-        throw std::invalid_argument("known prefill host metadata payload exceeds its budget: T = "+std::to_string(request.logical_rows)+
+        throw KnownPrefillBudgetExceeded("known prefill host metadata payload exceeds its budget: T = "+std::to_string(request.logical_rows)+
             " needs "+std::to_string(payload)+" bytes (--known-prefix-host-metadata-budget-bytes "+
             std::to_string(request.host_metadata_payload_budget_bytes)+")");
     CompiledKnownPrefixPrefill plan;plan.logical_rows=request.logical_rows;plan.output_policy=request.output_policy;
@@ -77,10 +77,11 @@ CompiledKnownPrefixPrefill compile_known_prefix_prefill(const ModelContract& mod
     // Every stripe/interval scales uniformly from the closed eight-row arena.
     // Its offsets are multiples of eight alignments, including odd T shapes.
     require(plan.tile8.arena.physical.total_bytes%8U==0U,"known prefill tile arena cannot be uniformly scaled");
-    require(multiply(plan.tile8.arena.physical.total_bytes/8U,request.logical_rows)<=request.workspace_budget_bytes,
-        "known prefill workspace exceeds its explicit arena budget");
+    if(multiply(plan.tile8.arena.physical.total_bytes/8U,request.logical_rows)>request.workspace_budget_bytes)
+        throw KnownPrefillBudgetExceeded("known prefill workspace exceeds its explicit arena budget");
     plan.arena=build_known_prefill_arena(serial.arena,serial.arena.alignment,request.logical_rows);
-    require(plan.arena.physical.total_bytes<=request.workspace_budget_bytes,"known prefill workspace exceeds its explicit arena budget");
+    if(plan.arena.physical.total_bytes>request.workspace_budget_bytes)
+        throw KnownPrefillBudgetExceeded("known prefill workspace exceeds its explicit arena budget");
     for(std::uint32_t row=0;row<request.logical_rows;++row)
         if(known_window_produces_logits(request.output_policy,row,request.logical_rows)) plan.logit_row_indices.push_back(row);
     const auto [execution,numerical]=identities(plan);plan.prefill_execution_identity=execution;plan.prefill_kernel_plan_identity=numerical;

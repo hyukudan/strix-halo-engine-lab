@@ -50,6 +50,234 @@ PrefillMemory ample_memory() {
         return PrefillRequirements{70U*gib,8U*gib,gib,2U*gib,512U*1024U*1024U,128U*1024U*1024U,0U,9U*gib};
     }};
 }
+void long_context_admission_tests(const RequestedOptions& original, const ModelContract& model,
+    const gguf::FileInfo& info, ModelManifest manifest, const PrefillCapabilities& capabilities) {
+    const auto contract = build_ple_hash_contract(model);
+    ManifestTensor table;
+    table.name = "ple.ngram_table.weight";
+    table.role = TensorRole::ngram_table;
+    table.residency = ResidencyPolicy::file_backed_candidate;
+    table.ggml_type = 20U;
+    table.dimensions = {160U,contract.minimum_table_rows};
+    table.absolute_offset = 4U*gib + 32U;
+    table.byte_size = table.dimensions[1] * 90U;
+    manifest.tensors.push_back(table);
+    manifest.layout_identity = model_manifest_layout_identity(manifest);
+    auto observed = ample_memory();
+    observed.available = UINT64_C(127800000000);
+    observed.gtt_limit = 128U*gib;
+    observed.gtt_used = 2U*gib;
+    observed.ple_reclaim_page = 4096U;
+    observed.estimate = [](const Options& options) {
+        auto required = PrefillRequirements{};
+        required.model_backing = 96U*gib;
+        required.state_d1 = options.context_tokens * 120U*1024U;
+        required.serial_scratch = gib;
+        required.workspace = options.known_prefix_prefill_rows * (gib / 2048U);
+        required.metadata = gib / 2U;
+        required.runtime_payload = gib / 8U;
+        required.device_base = 40U*gib;
+        required.tails = static_cast<std::uint64_t>(options.known_prefix_tail_rows.size()) * (gib / 16U);
+        return required;
+    };
+    const auto resolve = [&](const RequestedOptions& request, const PrefillMemory& memory) {
+        return resolve_effective_config(request,model,info,manifest,validated_model_content_identity,capabilities,memory);
+    };
+    {
+        ple_reclaim::Config config;
+        config.page = 4096U;
+        config.table_offset = table.absolute_offset;
+        config.table_rows = table.dimensions[1];
+        config.stored_row_bytes = 90U;
+        config.mapping_bytes = table.absolute_offset + table.byte_size;
+        config.decode_allowance_bytes = ple_reclaim::decode_allowance(1U,1U,contract.head_count,config.page);
+        config.reclaim = ple_reclaim::reclaim_intervals(config.table_offset,table.byte_size,config.page,
+            {{config.table_offset + 4096U,config.table_offset + 8192U}});
+        const auto plan = ple_reclaim::plan_prompt(config,contract,original.options.tokens);
+        std::set<std::uint64_t> touched;
+        std::array<std::uint32_t,PleHashContract::maximum_ngram - 1U> previous{};
+        const auto count = contract.ngram_size - 1U;
+        std::fill_n(previous.begin(),count,contract.eos_token_id);
+        std::size_t row_index = 0;
+        for (const auto token : original.options.tokens) {
+            const auto hash = hash_ple_token(contract,token,{previous.data(),count});
+            for (std::uint32_t h = 0; h < hash.row_count; ++h) {
+                const auto offset = config.table_offset + hash.row_ids[h] * config.stored_row_bytes;
+                expect(plan.rows[row_index++] == hash.row_ids[h], "ple_reclaim_prompt_rows: shared planner retains runtime hash rows");
+                for (auto page = offset / config.page; page <= (offset + config.stored_row_bytes - 1U) / config.page; ++page)
+                    for (const auto& interval : config.reclaim)
+                        if (page * config.page >= interval.begin && page * config.page < interval.end) touched.insert(page);
+            }
+            std::copy_n(hash.next_context.begin(),count,previous.begin());
+        }
+        std::uint64_t reclaimable = 0;
+        for (const auto& interval : config.reclaim) reclaimable += interval.end - interval.begin;
+        const auto touched_bytes = touched.size() * config.page;
+        const auto admitted_bytes = touched_bytes + (256U << 20U) + (64U << 20U) + touched_bytes / 64U;
+        expect(plan.stats.reclaimable_bytes == reclaimable && plan.stats.touched_bytes == touched_bytes &&
+            plan.stats.admitted_bytes == admitted_bytes && plan.stats.credit_bytes == reclaimable - admitted_bytes,
+            "ple_reclaim_exact_credit: unregistered interior minus unique prompt pages, decode allowance and margin");
+        expect(ple_reclaim::decode_allowance(100000U,1U,contract.head_count,config.page) ==
+            UINT64_C(100001) * contract.head_count * 2U * config.page,
+            "ple_reclaim_decode_bound: generation allowance grows beyond its 256 MiB floor");
+        bool overflow = false;
+        try { (void)ple_reclaim::decode_allowance(UINT64_MAX,1U,contract.head_count,config.page); }
+        catch (const std::overflow_error&) { overflow = true; }
+        expect(overflow, "ple_reclaim_decode_overflow: allowance arithmetic is checked");
+    }
+    auto request = original;
+    request.options.generate_tokens = 1U;
+    for (const auto n : {131072U,196608U,262143U}) {
+        request.options.tokens.resize(n,1U);
+        // Repeated, changing IDs exercise the full hash chain without loading a model or prompt file.
+        for (std::size_t i = 0; i < request.options.tokens.size(); ++i)
+            request.options.tokens[i] = static_cast<std::uint32_t>(i % 1024U);
+        const auto config = resolve(request,observed);
+        const auto expected_context = std::min(model.max_position_embeddings, static_cast<std::uint64_t>(n) + 512U);
+        expect(config.admitted && config.options.known_prefix_prefill_rows == 8192U &&
+            config.options.context_tokens == expected_context && config.ple_reclaim_credit > 24U*gib,
+            "long_context_l1_T8192: 128K/192K/262143 admit with observed memory and prompt-specific L1 credit");
+        const auto text = effective_config_json(config);
+        expect(text.find("\"ple_reclaim_credit_bytes\":" + std::to_string(config.ple_reclaim_credit)) != std::string::npos,
+            "long_context_l1_receipt: JSON reports the predicted reclaim credit");
+        auto no_l1 = observed; no_l1.ple_reclaim_page.reset();
+        const auto retained = resolve(request,no_l1);
+        expect(!retained.admitted || retained.options.known_prefix_prefill_rows < 8192U,
+            "long_context_l1_required_for_T8192: unsupported reclaim earns no credit");
+    }
+    // Tight GTT exercises the independent device cap: L1 cannot credit registered/device aliases.
+    const auto estimate = observed.estimate;
+    for (const auto chosen : {4096U,2048U,0U}) {
+        auto tight = observed;
+        tight.gtt_limit = 2U*gib + 40U*gib + (chosen == 4096U ? 3U*gib : chosen == 2048U ? 2U*gib : gib / 2U);
+        std::vector<std::uint32_t> attempts;
+        tight.estimate = [&](const Options& candidate) {
+            attempts.push_back(candidate.known_prefix_prefill_rows);
+            return estimate(candidate);
+        };
+        const auto config = resolve(request,tight);
+        const std::vector<std::uint32_t> expected = chosen == 4096U ? std::vector<std::uint32_t>{8192U,4096U} :
+            std::vector<std::uint32_t>{8192U,4096U,2048U};
+        expect(attempts == expected && config.admitted == (chosen != 0U) &&
+            (!chosen || config.options.known_prefix_prefill_rows == chosen),
+            "long_context_tile_fallback_order: T8192 then T4096 then T2048 before decline");
+        if (chosen == 2048U) {
+            const auto args = effective_prefill_argv(config.options);
+            const auto tail = std::find(args.begin(),args.end(),"--known-prefix-tail-rows");
+            expect(config.options.known_prefix_tail_rows == std::vector<std::uint32_t>{256U,16U} &&
+                config.options.known_prefix_ladder_tail_rows == config.options.known_prefix_tail_rows &&
+                config.sources.at("--known-prefix-tail-rows") == OptionSource::automatic &&
+                tail != args.end() && std::next(tail) != args.end() && *std::next(tail) == "256,16",
+                "long_context_T2048_tails: active/configured tails and replay argv use 256,16");
+        }
+        const auto notice = effective_config_notice(config);
+        expect(chosen ? notice.find("T" + std::to_string(chosen)) != std::string::npos &&
+            notice.find("T8192:insufficient-memory") != std::string::npos &&
+            effective_config_json(config).find("T8192:insufficient-memory") != std::string::npos :
+            notice.find("using serial prefill") == std::string::npos && !config.error.empty(),
+            "long_context_fallback_receipt: selection and memory reason reported; oversized serial is refused");
+    }
+    for (const auto chosen : {4096U,2048U}) {
+        auto tight = observed;
+        tight.available = 100U*gib;
+        const auto total = *tight.available;
+        const auto credit = prefill_reclaim_credit(resolve(request,observed).options,model,manifest,{},tight.ple_reclaim_page);
+        tight.estimate = [&](const Options& candidate) {
+            auto required = estimate(candidate);
+            const auto other = required.state_d1 + required.serial_scratch + required.metadata + required.runtime_payload +
+                required.tails + candidate.known_prefill_host_headroom;
+            const auto allowed_workspace = chosen == 4096U ? 3U*gib : gib + gib / 2U;
+            required.model_backing = total + credit - other - allowed_workspace;
+            return required;
+        };
+        const auto config = resolve(request,tight);
+        expect(config.admitted && config.options.known_prefix_prefill_rows == chosen,
+            "long_context_uma_fallback: retained host backing includes headroom and runtime payload, credit applied once");
+    }
+    auto compiler_failure = observed;
+    for (const auto* message : {"known prefill workspace exceeds its explicit arena budget",
+            "known prefill host metadata payload exceeds its budget: T = 8192 needs 1073741825 bytes"}) {
+        compiler_failure.estimate = [&](const Options& candidate) {
+            if (candidate.known_prefix_prefill_rows == 8192U) throw KnownPrefillBudgetExceeded(message);
+            return estimate(candidate);
+        };
+        const auto compiled = resolve(request,compiler_failure);
+        expect(compiled.admitted && compiled.options.known_prefix_prefill_rows == 4096U &&
+            compiled.tile_fallback == "T8192:insufficient-memory" && compiled.arithmetic_fallback.empty(),
+            "long_context_budget_fallback: workspace and metadata budget rejections report insufficient memory");
+    }
+    compiler_failure.estimate = [&](const Options& candidate) {
+        if (candidate.known_prefix_prefill_rows == 8192U) throw std::invalid_argument("plan budget exceeded");
+        return estimate(candidate);
+    };
+    const auto compiled = resolve(request,compiler_failure);
+    expect(compiled.admitted && compiled.options.known_prefix_prefill_rows == 4096U &&
+        compiled.tile_fallback == "T8192:candidate-not-admitted" && compiled.arithmetic_fallback.empty(),
+        "long_context_compiler_fallback: other validation failures retain candidate-not-admitted");
+    for (const auto* value : {"0","00"}) {
+        auto disabled = request;
+        disabled.environment["STRIX_QPF2K_DEFAULTS"] = value;
+        const auto config = resolve(disabled,observed);
+        expect(!config.admitted && config.reason == "feature-disabled" && config.ple_reclaim_credit == 0U,
+            "long_context_defaults_off: leading zero disables automatic admission and reclaim credit");
+    }
+    // These pure route checks share the runtime gate, including graph/copy/MTP/IO exclusions.
+    const auto admitted = resolve(request,observed);
+    expect(admitted.admitted, "long_context_reclaim_route_fixture");
+    if (admitted.admitted) {
+        const auto credit = [&](const Options& options, const Environment& environment, const ModelManifest& layout) {
+            return prefill_reclaim_credit(options,model,layout,environment,observed.ple_reclaim_page);
+        };
+        for (unsigned excluded = 0; excluded < 10U; ++excluded) {
+            auto options = admitted.options;
+            if (excluded == 0U) options.residency = HipModelResidencyMode::resident_copy;
+            if (excluded == 1U) options.model_copy_tier = HipModelCopyTier::all;
+            if (excluded == 2U) options.execution.mode = DecodeExecutionMode::graph;
+            if (excluded == 3U) options.known_prefix_prefill_rows = 0U;
+            if (excluded == 4U) options.http_serve = true;
+            if (excluded == 5U) options.mtp.enabled = true;
+            if (excluded == 6U) options.planned_ple_io = true;
+            if (excluded == 7U) options.serving_prefix_files.push_back("unused");
+            if (excluded == 8U) options.tokens.clear();
+            if (excluded == 9U) options.mtp.cohort.push_back({});
+            expect(credit(options,{},manifest) == 0U, "long_context_reclaim_exclusions: unsupported runtime route earns no credit");
+        }
+        for (const auto& environment : {Environment{{"STRIX_MODEL_COPY_ALL","1"}},
+                Environment{{"STRIX_MODEL_COPY_ALL","fine"}}, Environment{{"STRIX_MODEL_COPY_ALL","uc"}},
+                Environment{{"STRIX_MODEL_COPY_ALL","yes"}},
+                Environment{{"STRIX_PLE_RECLAIMABLE","off"}}, Environment{{"STRIX_PLE_RECLAIMABLE","0"}}})
+            expect(credit(admitted.options,environment,manifest) == 0U, "long_context_reclaim_environment: copy-all/off earns no credit");
+        expect(credit(admitted.options,{{"STRIX_PLE_RECLAIMABLE","1"}},manifest) == admitted.ple_reclaim_credit &&
+            credit(admitted.options,{{"STRIX_PLE_RECLAIMABLE","auto"}},manifest) == admitted.ple_reclaim_credit,
+            "long_context_reclaim_auto_required: auto and required use identical accounting");
+        const auto raised = credit(admitted.options,{{"STRIX_PLE_RECLAIM_DECODE_BYTES",std::to_string(gib)}},manifest);
+        expect(admitted.ple_reclaim_credit - raised == gib - (256U << 20U),
+            "long_context_reclaim_decode_allowance: explicit allowance only reduces credit");
+        auto pinned = manifest;
+        auto overlap = table;
+        overlap.residency = ResidencyPolicy::resident;
+        pinned.tensors.push_back(overlap);
+        expect(credit(admitted.options,{},pinned) == 0U, "long_context_reclaim_registered: registered table pages earn no credit");
+    }
+    for (const auto n : {261632U,261633U,262112U,262143U,262144U,262145U}) {
+        request.options.tokens.resize(n,1U);
+        for (const auto generate : {1U,32U,512U}) {
+            request.options.generate_tokens = generate;
+            const auto config = resolve(request,observed);
+            if (static_cast<std::uint64_t>(n) + generate <= model.max_position_embeddings) {
+                expect(config.admitted && config.options.context_tokens == model.max_position_embeddings,
+                    "long_context_clamp: padding is capped at the model contract limit");
+            } else {
+                bool refused = false;
+                try { require_effective_prefill_execution(config); } catch (const std::invalid_argument&) { refused = true; }
+                expect(!config.admitted && config.reason == "prompt-exceeds-model-context" && refused &&
+                    effective_config_notice(config).find("using serial prefill") == std::string::npos,
+                    "long_context_decline: prompt plus generation over model maximum is an explicit execution error");
+            }
+        }
+    }
+}
+
 }
 int main(int argc, char** arguments) {
     const auto model = ModelContract::qwen38_flash_next();
@@ -148,6 +376,7 @@ int main(int argc, char** arguments) {
             }
         }
     }
+    long_context_admission_tests(request,model,info,manifest,capabilities);
     const auto automatic = resolve(request,memory);
     expect(automatic.admitted && automatic.reason == "qualified-prompt", "plain default admits the measured prompt recipe");
     const auto argv = effective_prefill_argv(automatic.options);
@@ -207,6 +436,14 @@ int main(int argc, char** arguments) {
         expect(short_config.admitted && short_config.options.known_prefix_prefill_rows == rows,
             "short prompt chooses its measured T1024/T4096 class");
     }
+    auto four_k = request; four_k.options.tokens.resize(4096U);
+    auto four_k_receipt = argv;
+    four_k_receipt[1] = "8192";
+    four_k_receipt.erase(std::find(four_k_receipt.begin(),four_k_receipt.end(),"--unqualified-context"));
+    const auto tile_arg = std::find(four_k_receipt.begin(),four_k_receipt.end(),"--known-prefix-prefill-rows");
+    *std::next(tile_arg) = "4096";
+    expect(effective_prefill_argv(resolve(four_k,memory).options) == four_k_receipt,
+        "short_prompt_receipt_argv: 4K preserves the exact historical receipt argv order");
     // Compare all emitted organization/arithmetic/context/budget/tail decisions
     // with the frozen pre-policy resolver, rather than a second call to live logic.
     const auto historical_equal = [&](const RequestedOptions& input, const EffectiveConfig& actual) {
@@ -361,10 +598,17 @@ int main(int argc, char** arguments) {
     const auto notice = effective_config_notice(declined);
     expect(!declined.admitted && !declined.options.known_prefix_window &&
         effective_config_notice(declined).starts_with("Qwen auto-prefill declined: insufficient-memory;") &&
+        notice.find("using serial prefill") == std::string::npos && !declined.error.empty() &&
         std::count(notice.begin(),notice.end(),'\n') == 1,
-        "shortage restores serial and names the admission reason");
+        "shortage names the admission reason and refuses a prompt exceeding serial context");
     auto overflow = request; overflow.options.generate_tokens = UINT64_MAX;
-    expect(resolve(overflow,memory).reason == "memory-overflow", "implicit context arithmetic is checked");
+    expect(resolve(overflow,memory).reason == "prompt-exceeds-model-context", "implicit context rejects overflow without adding");
+    auto short_serial = request; short_serial.options.tokens.resize(4096U);
+    const auto serial = resolve(short_serial,small);
+    expect(!serial.admitted && serial.error.empty() &&
+        effective_config_notice(serial).find("using serial prefill") != std::string::npos,
+        "serial_fallback_fits: short prompts retain the historical serial fallback");
+    require_effective_prefill_execution(serial);
     auto diagnostic = request; diagnostic.environment["STRIX_RTX_EXPORT_STATE"] = "1";
     expect(!resolve(diagnostic,memory).admitted, "explicit state-export control owns its existing execution route");
     auto no_target = capabilities; no_target.target_qualified = false;
