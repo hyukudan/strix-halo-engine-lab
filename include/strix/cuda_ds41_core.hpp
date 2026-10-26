@@ -63,6 +63,7 @@ struct Q8A8View {
     // tiled only: launched with programmatic stream serialization (sm_90+): the weight slab is prefetched into L2
     // before waiting for the previous kernel; same bits
     bool pdl = false;
+    int occupancy = 0;  // 0: process default; 3: audit register allocation
     // tiled, split 1, not accumulate: 2 = also the next K-half (k_offset + width, the activation columns shifted by
     // width) in the same launch, out = y(half 0) + y(half 1): the bits of a second launch with accumulate
     std::uint32_t k_halves = 1;
@@ -128,6 +129,10 @@ void set_hc_norm_cluster(bool on);
 void set_q8_pdl_prefetch(bool on);
 // PDL prologue mode: 0 wait at entry, 1 L2 slab prefetch (default), 2 the first step's weights into registers
 void set_q8_pdl_mode(int mode);
+// Compact exact single-row Q8 kernel; generic fallback for other shapes.
+void set_q8_r1(bool on);
+void set_q8_r1_pad(bool on);
+void set_q8_occupancy(int blocks);
 // hc chunk partials with 5 warps per block (5 x the blocks) or 25 (the default); same bits
 void set_hc_partial_warps(unsigned warps);
 

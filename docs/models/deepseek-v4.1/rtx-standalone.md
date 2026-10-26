@@ -68,7 +68,8 @@ at least the requested prompt length. All filenames below are placeholders.
 
 The imported position plus the requested work and safety allowance must fit
 `--max-positions`; increase it for a later imported state. Size the arena and
-pinned-host budget for available memory; defaults are 80 GiB for the arena,
+pinned-host budget for available memory; defaults are 74.8 GiB for a keep-64 drafter arena (76.5 for keep-32,
+71.5 for a full drafter, 80 without a drafter),
 68 GiB maximum pinned allocation, and a 6 GiB available-host-memory margin.
 
 To load once and accept repeated requests:
@@ -102,37 +103,60 @@ options before applying their overrides. `--reset-cache warm` is the default;
 Model, arena, drafter pruning and decode kernel choices require a new worker.
 A request containing only `--quit` stops it. This is a file-queue worker.
 
-## Defaults on and reference switches
+## Optimizations (default ON) and off switches
 
-The table follows the argument parser and default-flip block in the replica
-source. These switches change scheduling, placement or draft proposals while
-the target's greedy tokens remain the exactness reference.
+These options change scheduling, placement or draft proposals. Committed
+outputs retain target-greedy exactness. Gains below describe prior qualification;
+this defaults change is checked on CPU and does not establish new GPU results.
 
-| Default | Off/reference switch |
-|---|---|
-| Deferred expert write-backs | `--no-wb-defer` restores boundary write-backs |
-| Built-in keep-64 drafter pruning | `--draft-keep 0` retains all draft experts |
-| Warm controller, built-in survival prior (`builtin:64`) | `--controller-prior none` starts cold and also drops the implicit seeded costs |
-| Priced controller costs, skipping the initial sweep | `--controller-costs none` removes seeded costs while retaining the prior |
-| Router form 2 | `--router-pf0` restores form 0 |
-| QA/KV split 1 | `--qakv-auto` restores automatic splitting |
-| Decode bundle: router v2, single-launch output projection, shared/attention forks, expansion fusion, routed MoE variant, four-warp attention and clustered normalization | `--dsrtxk-off` disables the default bundle |
-| Hyperconnection/shared-expert fusions | `--fuse-off` disables their defaults |
-| Deferred step records | `--records-inline` writes records before the next step |
-| 512 MiB host Engram record cache | `--engram-cache-mb 0` disables the cache |
+| Item | What | Default | Measured gain | Exact | Off switch |
+|---|---|---|---|---|---|
+| Decode kernels | Router, output projection, forks, expansion fusion, routed MoE, attention and normalization | ON | All-hit 12.62 to 10.50 ms/token; full loop 5.8-10.8% | Bitwise | `--dsrtxk-off` |
+| Fusions | Hyperconnection and shared expert | ON | Included in decode qualification | Bitwise at supported shapes | `--fuse-off` |
+| Records | Move records off the critical path | Deferred | Qualified; isolated gain not listed | Same outputs | `--records-inline` |
+| Router | Form 2 | ON | R1 17.3 to 15.4 us; 8-layer device time -0.5% | Bitwise rows 1-8 | `--router-pf0` |
+| QA/KV | Split 1 | ON | 8-layer device time -1.54 to -1.94% | Bitwise | `--qakv-auto` |
+| Q8 R1 | Compact single-row kernel, no padding | ON | 8-layer device time -0.80 / -0.53% | Bitwise | `--q8-r1-off`; `--q8-r1-pad` selects the padded form |
+| Drafter | Keep most-used experts per stage | 64 | Qualified; isolated gain not listed | Target-greedy | `--draft-keep 0` |
+| Controller | Built-in survival prior and seeded costs, no exploration or cost learning | Warm, chat scope | Qualified; isolated gain not listed | Target-greedy | `--controller-prior none` / `--controller-costs none`; `--controller-scope run` restores run scope |
+| Write-backs | Deferred scheduling | ON | Qualified; isolated gain not listed | Bitwise | `--no-wb-defer` |
+| Engram | RAM record cache | 512 MiB | Avoids repeat storage stalls | Same bytes | `--engram-cache-mb 0` |
+| Cold load | Tierstream pipeline | ON | Qualified; isolated gain not listed | Bitwise | `DG_LOAD_SERIAL=1` |
+| Graph warmup | Capture common graphs before worker readiness | `0,8` in serve mode | First 16 steps 56.05 to 33.99 ms/step | Bitwise | `--warmup-graphs none` |
+| Residency | Reuse valid prior placement, save on worker exit | Auto | Step 0 332.6 to 156.0 ms; first 16 steps -20% | Bitwise | `--residency-seed none` / `--residency-save none` |
 
-The router and QA/KV reference switches override their corresponding defaults.
-The bundle switches leave explicitly enabled options enabled. Controller
-exploration and cost learning are off by default. Window expert prefetch is
-also off by default; phases ending in `w` enable it, and omitting that suffix
-disables it. No throughput gain is established for window prefetch.
+`--baseline` restores all reference forms at that argument; later explicit
+flags override their own settings. `STRIX_DS41_RTX_BASELINE=1` applies the
+reference forms before all arguments. Baseline uses 96 host spares, run controller
+scope, a 71.5 GiB arena with a drafter (80 without), full draft vocabulary,
+and serial loading unless the caller already set `DG_LOAD_SERIAL`. It also
+restores phase-inferred row capacity and 4 pressure spares.
+`--dsrtxk`, `--fuse`, `--records-deferred`, `--router-pf`, `--qakv-s1`, and
+`--q8-r1` can re-enable those features after baseline.
+
+Normal defaults use 48 host spares, 8 pressure spares and 6 maximum rows.
+An explicit `--arena-gib` wins over the drafter-dependent arena rule.
+Vocabulary defaults to `auto:DIR` when `STRIX_DS41_DRAFT_VOCAB` names a directory,
+otherwise when `ds41-draft-vocab` exists beside the drafter; absent a directory,
+it uses `full` with a one-line notice. Explicit `--draft-vocab` wins.
+The auto residency path is `MODEL.gguf.residency`, overridden by
+`STRIX_DS41_RESIDENCY`. A missing seed quietly uses routes order; an invalid
+auto seed reports a one-line notice and falls back. Explicit seed files retain
+strict errors. Saves use a temporary file and rename. Unsupported Q8 R1 shapes
+use the generic exact kernel with a one-time notice. Non-serve runs do not
+warm up graphs or save residency unless explicitly requested.
+
+`--print-config` prints one resolved JSON object and exits before any CUDA call,
+fixture or model read. It can read small prior, pruning and residency files;
+model and draft paths may be dummy paths. The JSON reports effective prior
+counts and expert IDs so built-in and file-based configurations can be compared.
+`strix-cuda-ds41-config-tests` is registered with CTest and requires no GPU or model.
+Window expert prefetch remains opt-in through phases ending in `w`.
 
 ## Exactness check
 
 Use an off-switch run as the reference: repeat the same command and fixtures
-with `--no-wb-defer --draft-keep 0 --controller-prior none
---controller-costs none --router-pf0 --qakv-auto --dsrtxk-off --fuse-off
---records-inline --engram-cache-mb 0`. Compare complete per-chat token vectors
+with `--baseline`. Compare complete per-chat token vectors
 and state digests against the default run, with the same capacity and model.
 Drafter pruning and controller choices can change acceptance, never the
 committed target-greedy sequence.

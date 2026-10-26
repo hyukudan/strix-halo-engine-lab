@@ -1,6 +1,7 @@
 #include "strix/deepseek41_batch_dspark.hpp"
 #include "strix/deepseek41_batch_forward.hpp"
 #include "strix/deepseek41_batch_schedule.hpp"
+#include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/dist/communicator.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/ds41_dspark_files.hpp"
@@ -1136,6 +1137,7 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
 }  // namespace
 
 int main(int argc, char** argv) try {
+    const strix::deepseek41::pair_defaults::Effective production_defaults(strix::deepseek41::pair_defaults::App::batch, argc, argv, strix::deepseek41::pair_defaults::this_build());  // before any option or env read
     Args a;
     for (int i = 1; i < argc; ++i) {
         const std::string s = argv[i];
@@ -1156,7 +1158,9 @@ int main(int argc, char** argv) try {
         else if (s == "--fill") a.fill = u32();
         else if (s == "--fill-ids") a.fill_ids = next();
         else if (s == "--tp-attention") a.tp = true;
+        else if (s == "--no-tp-attention") a.tp = false;
         else if (s == "--engram-direct") a.engram_direct = true;
+        else if (s == "--engram-mapped") a.engram_direct = false;
         else if (s == "--check") a.check = true;
         else if (s == "--aba") a.aba = u32();
         else if (s == "--aba-flags") a.aba_flags = next();

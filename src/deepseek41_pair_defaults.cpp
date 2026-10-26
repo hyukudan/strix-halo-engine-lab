@@ -1,0 +1,235 @@
+#include "strix/deepseek41_pair_defaults.hpp"
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <iostream>
+#include <sstream>
+#include <system_error>
+
+namespace strix::deepseek41::pair_defaults {
+namespace {
+
+bool set(const char* v) { return v != nullptr && *v != 0; }
+bool zero(const char* v) { return v != nullptr && v[0] == '0' && v[1] == 0; }
+bool has(const std::vector<std::string>& args, const char* flag) { return std::find(args.begin(), args.end(), flag) != args.end(); }
+
+// The value of the last `flag VALUE` pair, or "".
+std::string last_value(const std::vector<std::string>& args, const char* flag) {
+    std::string v;
+    for (std::size_t i = 0; i + 1 < args.size(); ++i)
+        if (args[i] == flag) v = args[i + 1];
+    return v;
+}
+
+// MODEL.gguf: the first argument (the documented form), else the first .gguf that is not a flag's value.
+std::string model_path(const std::vector<std::string>& args) {
+    if (!args.empty() && !args[0].empty() && args[0][0] != '-') return args[0];
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const auto& s = args[i];
+        if (s.size() > 5 && s.ends_with(".gguf") && s[0] != '-' && (i == 0 || args[i - 1].rfind("--", 0) != 0)) return s;
+    }
+    return {};
+}
+
+std::string parent_dir(const std::string& path) {
+    const auto p = std::filesystem::path(path).parent_path().generic_string();
+    return p.empty() ? std::string(".") : p;
+}
+
+}  // namespace
+
+const char* app_name(App app) {
+    switch (app) {
+    case App::rank: return "strix-deepseek41-rank";
+    case App::batch: return "strix-deepseek41-batch";
+    case App::prefill: return "strix-deepseek41-prefill";
+    case App::serve: return "strix-deepseek41-serve";
+    }
+    return "?";
+}
+
+const std::vector<std::pair<std::string, std::string>>& baseline_off_items() {
+    // 2026-10-25 release: D1 shared expert as grouped SwiGLU pairs. 2026-10-26 release: D1b fused shared
+    // down, prefill MoE form 7, exact dense selector, attention window fold / live chunks / f16 tile, serve warm-up
+    // and the DSpark cost calibration that follows it.
+    static const std::vector<std::pair<std::string, std::string>> items = {
+        {"STRIX_DS41_SHARED_GROUPED", "0"}, {"STRIX_DS41_SHARED_DOWN_FUSED", "0"}, {"STRIX_DS41_MOE_PREFILL", "0"},
+        {"STRIX_DS41_DENSE_SELECT", "0"},   {"STRIX_DS41_ATTN_WINDOW_FOLD", "0"},  {"STRIX_DS41_ATTN_LIVE_CHUNKS", "0"},
+        {"STRIX_DS41_ATTN_TILE_F16", "0"},  {"STRIX_DS41_SERVE_WARM", "0"},        {"STRIX_DS41_DSPARK_CALIB", "0"},
+    };
+    return items;
+}
+
+Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& env, const Probe& probe, const Build& build) {
+    Resolved r;
+    std::vector<std::string> user;
+    for (const auto& a : in) {
+        if (a == "--print-effective-config") r.print_only = true;
+        else user.push_back(a);
+    }
+    const auto put = [&](const char* name, std::string value) {
+        if (env(name) == nullptr) r.set_env.emplace_back(name, std::move(value));
+    };
+    const auto notice = [&](const std::string& s) { r.notices.push_back(std::string("deepseek41 defaults: ") + s); };
+
+    if (const char* b = env("STRIX_DS41_BASELINE"); set(b) && !zero(b)) {
+        for (const auto& [name, value] : baseline_off_items()) put(name.c_str(), value);
+        r.args = std::move(user);
+        return r;
+    }
+
+    // Production identity: c-u6 dense overlay (CB4) and, outside the EP prefill, the trellis mix-B packs at every
+    // dense site. All or nothing: a partial identity was never measured.
+    const auto model = model_path(user);
+    const char* packs_env = env("STRIX_DS41_PACKS");
+    std::vector<std::string> roots;
+    if (set(packs_env) && !zero(packs_env)) roots.emplace_back(packs_env);
+    else if (!model.empty()) roots = {parent_dir(model) + "/packs", parent_dir(model)};
+    const auto find = [&](const std::string& name, bool directory) -> std::string {
+        for (const auto& root : roots) {
+            const auto p = root + "/" + name;
+            if (directory ? probe.dir(p) : probe.file(p)) return p;
+        }
+        return {};
+    };
+    const char* overlay_env = env("STRIX_DS41_OVERLAY");
+    const char* trellis_env = env("STRIX_DS41_TRELLIS");
+    if (zero(overlay_env)) r.unset_env.emplace_back("STRIX_DS41_OVERLAY");
+    if (zero(trellis_env)) r.unset_env.emplace_back("STRIX_DS41_TRELLIS");
+    if (zero(env("STRIX_DS41_TRELLIS_MIX"))) r.unset_env.emplace_back("STRIX_DS41_TRELLIS_MIX");
+    const bool want_trellis = app != App::prefill;
+    if (!zero(packs_env)) {
+        const bool overlay_auto = !set(overlay_env);
+        const bool trellis_auto = want_trellis && !set(trellis_env) && build.trellis_dense_r1;
+        const auto overlay = overlay_auto ? find("c-u6.gguf", false) : std::string();
+        const auto k4 = trellis_auto ? find("ours-K4", true) : std::string();
+        const auto k5 = trellis_auto ? find("ours-K5", true) : std::string();
+        std::string missing;
+        if (overlay_auto && overlay.empty()) missing += " c-u6.gguf";
+        if (trellis_auto && k4.empty()) missing += " ours-K4/";
+        if (trellis_auto && k5.empty()) missing += " ours-K5/";
+        if (want_trellis && !set(trellis_env) && !zero(trellis_env) && !build.trellis_dense_r1)
+            notice("trellis packs off (this build has no dense_r1 trellis library: CMake STRIX_DS41_TRELLIS_API=dense_r1)");
+        if (!missing.empty()) {
+            if (roots.empty()) notice("production packs off (no MODEL.gguf in the arguments)");
+            else notice("production packs off (not found:" + missing + " in " + roots.front() + (roots.size() > 1 ? " or " + roots[1] : "") +
+                        "; set STRIX_DS41_PACKS=DIR)");
+        } else {
+            if (!overlay.empty()) {
+                put("STRIX_DS41_OVERLAY", overlay);
+                put("STRIX_DS41_CB4", "1");
+            }
+            if (!k4.empty()) {
+                put("STRIX_DS41_TRELLIS", k4);
+                put("STRIX_DS41_TRELLIS_MIX", "head=" + k5);
+                put("STRIX_DS41_TRELLIS_SITES", "all");
+                put("STRIX_DS41_TRELLIS_DENSE_FULL", "1");
+                put("STRIX_DS41_TRELLIS_HEADOUT", "1");
+            }
+        }
+    }
+    if (app == App::prefill) put("STRIX_DS41_EXPERT_TP", "0");
+
+    std::vector<std::string> def;
+    const auto transport = last_value(user, "--transport");
+    const bool two_ranks = !transport.empty() && transport != "single";
+    if (app == App::rank || app == App::batch) {
+        if (two_ranks && !has(user, "--no-tp-attention")) def.emplace_back("--tp-attention");
+        if (!has(user, "--engram-mapped")) def.emplace_back("--engram-direct");
+    }
+    if (app == App::serve) {
+        def.insert(def.end(), {"--peer-timeout", "120", "--prefill-path", "device", "--slots", "8", "--prefill-rows", "2048"});
+        const char* rows16 = env("STRIX_DS41_BATCH_ROWS16");
+        if (has(user, "--no-dspark") || has(user, "--dspark") || model.empty()) {
+        } else if (rows16 != nullptr && rows16[0] == '1') {
+            notice("serve DSpark off (not qualified with STRIX_DS41_BATCH_ROWS16=1)");
+        } else if (has(user, "--prefix-session-snapshots")) {
+            notice("serve DSpark off (--prefix-session-snapshots is not exact with --dspark)");
+        } else {
+            std::string draft;
+            for (const auto& root : std::vector<std::string>{parent_dir(model), roots.empty() ? std::string() : roots.front()}) {
+                if (root.empty() || !draft.empty()) continue;
+                auto names = probe.list(root);
+                std::sort(names.begin(), names.end());
+                for (const auto& n : names)
+                    if (n.ends_with("-DSpark-MXFP4.gguf")) { draft = root + "/" + n; break; }
+            }
+            if (draft.empty()) {
+                notice("serve DSpark off (no *-DSpark-MXFP4.gguf next to the model)");
+            } else {
+                def.insert(def.end(), {"--dspark", draft});
+                const auto vocab = find("vocab", true);
+                if (!has(user, "--dspark-vocab")) {
+                    if (!vocab.empty() && probe.file(vocab + "/core48k.bin") && probe.file(vocab + "/core32k.bin"))
+                        def.insert(def.end(), {"--dspark-vocab", "auto:" + vocab});
+                    else notice("serve DSpark vocabulary full (no vocab/core48k.bin + core32k.bin in the packs)");
+                }
+            }
+        }
+    }
+    // MODEL first (the documented form), the defaults, then the rest of the user's arguments (theirs win).
+    if (!user.empty() && !user[0].empty() && user[0][0] != '-') {
+        r.args.push_back(user[0]);
+        r.args.insert(r.args.end(), def.begin(), def.end());
+        r.args.insert(r.args.end(), user.begin() + 1, user.end());
+    } else {
+        r.args = def;
+        r.args.insert(r.args.end(), user.begin(), user.end());
+    }
+    return r;
+}
+
+std::string describe(App app, const Resolved& r) {
+    std::ostringstream o;
+    o << "app " << app_name(app) << '\n';
+    for (const auto& [k, v] : r.set_env) o << "env " << k << '=' << v << '\n';
+    for (const auto& k : r.unset_env) o << "unset " << k << '\n';
+    for (const auto& a : r.args) o << "arg " << a << '\n';
+    for (const auto& n : r.notices) o << "notice " << n << '\n';
+    return o.str();
+}
+
+Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
+    std::vector<std::string> in(argv + 1, argv + argc);
+    Probe probe;
+    probe.file = [](const std::string& p) { std::error_code ec; return std::filesystem::is_regular_file(p, ec); };
+    probe.dir = [](const std::string& p) { std::error_code ec; return std::filesystem::is_directory(p, ec); };
+    probe.list = [](const std::string& d) {
+        std::vector<std::string> out;
+        std::error_code ec;
+        for (std::filesystem::directory_iterator it(d, ec), end; !ec && it != end; it.increment(ec)) out.push_back(it->path().filename().string());
+        return out;
+    };
+    auto r = resolve(app, in, [](const char* n) { return static_cast<const char*>(std::getenv(n)); }, probe, build);
+    for (const auto& [k, v] : r.set_env) {
+#ifdef _WIN32
+        _putenv_s(k.c_str(), v.c_str());
+#else
+        ::setenv(k.c_str(), v.c_str(), 0);
+#endif
+    }
+    for (const auto& k : r.unset_env) {
+#ifdef _WIN32
+        _putenv_s(k.c_str(), "");
+#else
+        ::unsetenv(k.c_str());
+#endif
+    }
+    if (r.print_only) {
+        std::cout << describe(app, r);
+        std::cout.flush();
+        std::exit(0);
+    }
+    for (const auto& n : r.notices) std::cerr << n << '\n';
+    storage_.reserve(r.args.size() + 1U);
+    storage_.emplace_back(argv[0]);
+    storage_.insert(storage_.end(), r.args.begin(), r.args.end());
+    for (auto& s : storage_) ptrs_.push_back(s.data());
+    ptrs_.push_back(nullptr);
+    argc = static_cast<int>(storage_.size());
+    argv = ptrs_.data();
+}
+
+}  // namespace strix::deepseek41::pair_defaults

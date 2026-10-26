@@ -1,5 +1,6 @@
 #include "strix/deepseek41_describe.hpp"
 #include "strix/deepseek41_device_forward.hpp"
+#include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/ds41_pipeline_dspark.hpp"
 #include "strix/ds41_pipeline_front.hpp"
 #include "strix/ds41_spec_tail.hpp"
@@ -1789,6 +1790,7 @@ std::string describe(const Args& a) {
 }  // namespace
 
 int main(int argc, char** argv) try {
+    const strix::deepseek41::pair_defaults::Effective production_defaults(strix::deepseek41::pair_defaults::App::rank, argc, argv, strix::deepseek41::pair_defaults::this_build());  // before any option or env read
     Args a;
     for (int i = 1; i < argc; ++i) {
         const std::string s = argv[i];
@@ -1810,8 +1812,10 @@ int main(int argc, char** argv) try {
         else if (s == "--op-hashes") a.op_hashes = true;
         else if (s == "--timing") a.timing = true;
         else if (s == "--engram-direct") a.engram_direct = true;
+        else if (s == "--engram-mapped") a.engram_direct = false;
         else if (s == "--no-gather") a.gather = false;
         else if (s == "--tp-attention") a.tp = true;
+        else if (s == "--no-tp-attention") a.tp = false;
         else if (s == "--split-shared") a.split_shared = true;
         else if (s == "--stream-experts") a.stream_experts = true;
         else if (s == "--routes") a.routes_path = next();

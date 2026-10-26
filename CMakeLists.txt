@@ -2801,7 +2801,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
 endif()
 # deepseek41 trimmed-model host reference (integration): plan interpreter over the formats/MoE pieces.
 add_library(strix_ds41_runtime STATIC src/deepseek41_host_forward.cpp src/deepseek41_attention_host.cpp src/ds41_weight_overlay.cpp
-    src/deepseek41_attention_state.cpp src/deepseek41_prefix_cache.cpp)
+    src/deepseek41_attention_state.cpp src/deepseek41_prefix_cache.cpp src/deepseek41_pair_defaults.cpp)
 target_link_libraries(strix_ds41_runtime PUBLIC strix_ds41_layer strix_ds41_formats strix_ds41_attention strix_family_deepseek41)
 strix_target_warnings(strix_ds41_runtime)
 if(NOT MSVC)
@@ -2855,6 +2855,10 @@ if(BUILD_TESTING)
     target_link_libraries(strix-deepseek41-prefix-cache-tests PRIVATE strix_ds41_runtime)
     strix_target_warnings(strix-deepseek41-prefix-cache-tests)
     add_test(NAME strix-deepseek41-prefix-cache-tests COMMAND strix-deepseek41-prefix-cache-tests)
+    add_executable(strix-deepseek41-pair-defaults-tests tests/deepseek41_pair_defaults_tests.cpp)
+    target_link_libraries(strix-deepseek41-pair-defaults-tests PRIVATE strix_ds41_runtime)
+    strix_target_warnings(strix-deepseek41-pair-defaults-tests)
+    add_test(NAME strix-deepseek41-pair-defaults-tests COMMAND strix-deepseek41-pair-defaults-tests)
     add_executable(strix-deepseek41-serve-sched-tests tests/deepseek41_serve_sched_tests.cpp)
     target_link_libraries(strix-deepseek41-serve-sched-tests PRIVATE strix_ds41_runtime)
     strix_target_warnings(strix-deepseek41-serve-sched-tests)
@@ -2901,7 +2905,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     # checked by its SHA256). No default location: pass -DSTRIX_DS41_TRELLIS_LIBRARY=<archive> and
     # -DSTRIX_DS41_TRELLIS_INCLUDE_DIR=<dir with strix_trellis.h>. ON by default only where both are given and exist;
     # OFF builds a stub that refuses STRIX_DS41_TRELLIS at load time, so every other build keeps working.
-    set(STRIX_DS41_TRELLIS_LIBRARY "" CACHE FILEPATH "Trellis library archive (v12, e.g. libstrix_trellis_fused_v12.a)")
+    set(STRIX_DS41_TRELLIS_LIBRARY "" CACHE FILEPATH "Trellis library archive (with the dense-r1 and grouped GEMV APIs for the default dense_r1 adapter)")
     set(STRIX_DS41_TRELLIS_INCLUDE_DIR "" CACHE PATH "Directory with strix_trellis.h")
     if(STRIX_DS41_TRELLIS_LIBRARY AND STRIX_DS41_TRELLIS_INCLUDE_DIR AND EXISTS "${STRIX_DS41_TRELLIS_LIBRARY}"
        AND EXISTS "${STRIX_DS41_TRELLIS_INCLUDE_DIR}/strix_trellis.h")
@@ -2910,7 +2914,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         set(strix_ds41_trellis_default OFF)
     endif()
     option(STRIX_DS41_TRELLIS "Link the trellis library for the deepseek41 dense sites" ${strix_ds41_trellis_default})
-    set(STRIX_DS41_TRELLIS_API "v12" CACHE STRING "Trellis adapter: v12, tp03, splitk04, dense_r1")
+    set(STRIX_DS41_TRELLIS_API "dense_r1" CACHE STRING "Trellis adapter: dense_r1 (qualified production identity), v12, tp03, splitk04")
     set_property(CACHE STRIX_DS41_TRELLIS_API PROPERTY STRINGS v12 tp03 splitk04 dense_r1)
     if(NOT STRIX_DS41_TRELLIS_API MATCHES "^(v12|tp03|splitk04|dense_r1)$")
         message(FATAL_ERROR "Unknown STRIX_DS41_TRELLIS_API=${STRIX_DS41_TRELLIS_API}")
@@ -2931,6 +2935,8 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         endif()
         if(STRIX_DS41_TRELLIS_API STREQUAL "dense_r1")
             target_compile_definitions(strix_ds41_trellis_hip PRIVATE STRIX_DS41_TRELLIS_DENSE_R1=1)
+            # the apps' production defaults (deepseek41_pair_defaults.hpp) put the trellis packs on only with this API
+            target_compile_definitions(strix_ds41_trellis_hip PUBLIC STRIX_DS41_PAIR_DENSE_R1=1)
         endif()
         message(STATUS "deepseek41 trellis: ${STRIX_DS41_TRELLIS_LIBRARY}")
         target_compile_definitions(strix_ds41_trellis_hip PRIVATE STRIX_DS41_TRELLIS_LIB=1)
@@ -3508,6 +3514,15 @@ if(STRIX_ENABLE_CUDA_DS41)
         add_executable(strix-cuda-ds41-replica apps/cuda_ds41_replica.cu)
         target_link_libraries(strix-cuda-ds41-replica PRIVATE strix_ds41_cuda_tier strix_ds41_cuda_prefill strix_ds41_cuda_dspark)
         list(APPEND strix_ds41_cuda_targets strix-cuda-ds41-replica)
+        if(BUILD_TESTING)
+            find_package(Python3 COMPONENTS Interpreter REQUIRED)
+            add_custom_target(strix-cuda-ds41-config-tests DEPENDS strix-cuda-ds41-replica)
+            add_test(NAME strix-cuda-ds41-config-tests
+                COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/cuda_ds41_config_test.py
+                    $<TARGET_FILE:strix-cuda-ds41-replica>)
+            set_tests_properties(strix-cuda-ds41-config-tests PROPERTIES LABELS "cpu;config" TIMEOUT 60)
+        endif()
+
     endif()
     # DSpark drafter on CUDA (design notes): the host reference library (built here in the CUDA-only tree) and
     # the device drafter, bitwise against the host reference on the real weights
