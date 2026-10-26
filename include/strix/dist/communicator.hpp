@@ -264,6 +264,15 @@ public:
     // same as exchange()'s, so a peer may use either call for the same collective. The calling thread does the transfer;
     // not between start() and finish().
     void exchange_host(std::span<const std::byte> local, std::span<std::byte> remote, const Tag& tag);
+    // STRIX_DIST_ASYNC_START=1: full-host chunked path only. Publish remote at start;
+    // destination_last_use must already be recorded after its last reader. Records
+    // source_free after all off-stream D2H: wait on it before overwriting local.
+    // finish only joins validation/copy submission and waits on the final H2D event.
+    // One exchange at a time. Returns false (ordinary start contract) on other paths;
+    // neither caller event is used then. Keep events/buffers alive until their
+    // queued device work completes; finish joins submission, not device execution.
+    bool start_async(hipStream_t stream, const void* local, void* remote, std::size_t bytes, const Tag& tag,
+                     hipEvent_t destination_last_use, hipEvent_t source_free);
     // GPU-direct: consumes a receive posted early for a guessed next exchange (DeviceExchange::quiesce), so that the
     // session can stay idle. Both ranks at the same point, between exchanges; nothing to do on the host path.
     void quiesce(hipStream_t stream);
@@ -391,7 +400,9 @@ private:
     class Pipeline;
     std::unique_ptr<Pipeline> pipeline_;
     bool pipeline_started_ = false;
-    void start_pipeline(hipStream_t stream, const void* local, std::size_t bytes);
+    bool async_start_ = false;
+    void start_pipeline(hipStream_t stream, const void* local, std::size_t bytes, void* remote = nullptr,
+                        hipEvent_t destination_last_use = nullptr, hipEvent_t source_free = nullptr);
     void finish_pipeline(hipStream_t stream, void* remote);
     std::unique_ptr<DeviceExchange> direct_;
     bool direct_started_ = false;

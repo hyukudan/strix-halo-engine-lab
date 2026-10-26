@@ -243,6 +243,7 @@ int main(int argc, char** argv) {
         }
         rd::apply_env(eff, [](const char* k, const char* v) { (void)::setenv(k, v, 0); });
         opt.mtp = eff.mtp.value == "1";
+        if (eff.max_rows.source != "explicit") opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
         if (eff.identity.source == "baseline") opt.identity = ge::IdentityMode::kR1;
         if (eff.decode_xch.source == "baseline") opt.decode_xfer = false;
         if (eff.baseline) std::printf("baseline: default-on optimizations off (old path), explicit settings kept\n");
@@ -331,7 +332,7 @@ int main(int argc, char** argv) {
         std::printf("\n");
         std::fflush(stdout);
         if (mem_plan) {
-            std::printf("rank %u prefill %s (requested %s)\n", opt.rank, prefill_mode.c_str(), prefill_requested.c_str());
+            std::printf("rank %u prefill %s (requested %s), pipeline %u\n", opt.rank, prefill_mode.c_str(), prefill_requested.c_str(), eng.prefill_pipeline());
             std::printf("rank %u: mem-plan ADMITTED (nothing loaded)\n", opt.rank);
             return 0;
         }
@@ -351,13 +352,13 @@ int main(int argc, char** argv) {
             }
             if (path) {
                 eng.set_prefill(std::move(path));
-                std::printf("rank %u prefill %s: max_rows %u, path %.2f GiB + workspace %.2f GiB (engine rows %.2f GiB)\n", opt.rank,
-                            prefill_mode.c_str(), opt.max_rows, static_cast<double>(b.path) / double(1ULL << 30),
+                std::printf("rank %u prefill %s: max_rows %u, pipeline %u, path %.2f GiB + workspace %.2f GiB (engine rows %.2f GiB)\n", opt.rank,
+                            prefill_mode.c_str(), opt.max_rows, eng.prefill_pipeline(), static_cast<double>(b.path) / double(1ULL << 30),
                             static_cast<double>(b.workspace) / double(1ULL << 30), static_cast<double>(b.engine_rows) / double(1ULL << 30));
             }
         }
 
-        std::printf("rank %u prefill %s (requested %s)\n", opt.rank, prefill_mode.c_str(), prefill_requested.c_str());
+        std::printf("rank %u prefill %s (requested %s), pipeline %u\n", opt.rank, prefill_mode.c_str(), prefill_requested.c_str(), eng.prefill_pipeline());
 
         if (!g3_tokens.empty() && g3_sweep) {  // per-layer residuals in both identities, one load: OUT-<r1|r1b>.f32 [T][L][4][4096]
             const auto tokens = read_u32(g3_tokens);
@@ -1403,6 +1404,9 @@ int main(int argc, char** argv) {
                 std::printf("rank %u %s   chunked prefill Tier B gemv == reference prefill, bitwise (token, rank logits bytes, state bytes to the prompt end)\n",
                             opt.rank, same ? "OK" : "FAIL");
                 phase(same, "gemv == reference");
+                // STRIX_GLM_PF_GATE_WMMA=0: exact gate only (the D10 wmma arm needs prepared attention linears)
+                const char* gw = std::getenv("STRIX_GLM_PF_GATE_WMMA");
+                if (gw == nullptr || std::string(gw) != "0") {
                 guarded_install("wmma");
                 const Run w1 = guarded_run(toks, true, "wmma prefill 1");
                 digest("wmma", w1, toks.size());
@@ -1422,6 +1426,9 @@ int main(int argc, char** argv) {
                 std::printf("rank %u DEV wmma vs ref: token %u vs %u, rank logits rel-L2 %.3e max |d| %.3e, state bytes equal %.4f %%; ref %.1f s, gemv %.1f s, wmma %.1f s\n",
                             opt.rank, w1.token, ref.token, den > 0 ? std::sqrt(num / den) : 0.0, mx,
                             ref.state.empty() ? 0.0 : 100.0 * double(eq) / double(ref.state.size()), ref.s, gv.s, w1.s);
+                } else {
+                    std::printf("rank %u pf-gate: wmma arm skipped (STRIX_GLM_PF_GATE_WMMA=0); ref %.1f s, gemv %.1f s\n", opt.rank, ref.s, gv.s);
+                }
             }
             if (!pf_ttft.empty()) {
                 std::size_t mb = 0;

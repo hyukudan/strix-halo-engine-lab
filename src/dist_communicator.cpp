@@ -1679,6 +1679,7 @@ public:
     hipEvent_t producer = nullptr, consumer = nullptr;
     std::vector<hipEvent_t> ready;
     std::atomic<void*> destination{nullptr};
+    bool async = false;
     double stage = 0, wire = 0, check_seconds = 0;
     std::unique_ptr<Worker> crc_send, crc_receive;
     std::atomic<std::size_t> prepared{0}, received{0};
@@ -1754,6 +1755,7 @@ Communicator::Communicator(Group group, std::unique_ptr<Transport> transport, st
             throw std::invalid_argument("STRIX_DIST_PROGRESS_SPIN_US must be 0..10000");
         progress_->worker.idle_spin(std::chrono::microseconds(duration));
     }
+    if (const char* v = std::getenv("STRIX_DIST_ASYNC_START"); v && std::string(v) == "1") async_start_ = true;
     if (const char* t = std::getenv("STRIX_DIST_WAIT_TIMEOUT_MS"); t && *t) wait_timeout_ = std::chrono::milliseconds(std::stoll(t));
     if (const char* t = std::getenv("STRIX_DIST_HOST_D2H_KERNEL_BYTES"); t && *t) {
         d2h_kernel_bytes_ = std::stoull(t);
@@ -2214,7 +2216,25 @@ void Communicator::start(hipStream_t stream, const void* local, std::size_t byte
     else start_host(stream, local, bytes);
 }
 
-void Communicator::start_pipeline(hipStream_t stream, const void* local, std::size_t bytes) {
+bool Communicator::start_async(hipStream_t stream, const void* local, void* remote, std::size_t bytes, const Tag& tag,
+                               hipEvent_t destination_last_use, hipEvent_t source_free) {
+    if (!async_start_ || !pipeline_ || bytes <= pipeline_->chunk || (direct_ && route(bytes).direct)) {
+        start(stream, local, bytes, tag);
+        return false;
+    }
+    if (!terminal_.empty()) throw std::runtime_error("dist exchange: the communicator stopped earlier: " + terminal_);
+    if (started_ || direct_started_ || staged_ || staged_prepared_ || staged_receive_held_)
+        throw std::logic_error("dist exchange: start() while a staged view or exchange is in flight");
+    if (!bytes || bytes > max_bytes_ || !local || !remote || !destination_last_use || !source_free)
+        throw std::invalid_argument("dist async exchange size, buffers or events");
+    if (trace_pending_) flush_trace();
+    tag_ = tag;
+    start_pipeline(stream, local, bytes, remote, destination_last_use, source_free);
+    return true;
+}
+
+void Communicator::start_pipeline(hipStream_t stream, const void* local, std::size_t bytes, void* remote,
+                                  hipEvent_t destination_last_use, hipEvent_t source_free) {
     latency::context().sequence = sequence_;
     latency::mark("pipeline_entry", bytes);
     auto& p = *pipeline_;
@@ -2222,7 +2242,8 @@ void Communicator::start_pipeline(hipStream_t stream, const void* local, std::si
     stats_.last_entry = entry;
     current_ = History{sequence_, bytes, tag_.kind, tag_.layer, tag_.request, 0, 0, 'P'};
     set_phase(Phase::reuse_wait);
-    if (receive_pending_) {
+    const bool defer_reuse = remote && receive_pending_;
+    if (receive_pending_ && !remote) {
         const auto deadline = entry + wait_timeout_;
         for (;;) {
             const auto e = hipEventQuery(receive_done_);
@@ -2233,7 +2254,14 @@ void Communicator::start_pipeline(hipStream_t stream, const void* local, std::si
         }
     }
     receive_pending_ = false;
+    p.async = remote != nullptr;
     p.destination.store(nullptr, std::memory_order_relaxed);
+    if (p.async) {
+        // Queue the actual last-use dependency before publishing the destination.
+        // RX remains ordered after the preceding message's H2D on the same stream.
+        check(hipStreamWaitEvent(p.rx, destination_last_use, 0), "pipeline destination lifetime");
+        p.destination.store(remote, std::memory_order_release);
+    }
     p.stage = p.wire = p.check_seconds = 0;
     p.failure = nullptr;
     p.failed.store(false, std::memory_order_relaxed);
@@ -2251,9 +2279,10 @@ void Communicator::start_pipeline(hipStream_t stream, const void* local, std::si
         check(hipEventRecord(p.ready[k], p.tx), "pipeline chunk ready");
     }
     check(hipEventRecord(send_ready_, p.tx), "pipeline all D2H");
-    // Preserve start()'s source lifetime contract: later writes to local on the
-    // caller stream cannot race our off-stream D2H copies.
-    check(hipStreamWaitEvent(stream, send_ready_, 0), "pipeline source lifetime");
+    // Ordinary start preserves its source lifetime contract on the caller stream.
+    // Async callers instead fence the next overwrite with their source_free event.
+    if (p.async) check(hipEventRecord(source_free, p.tx), "pipeline source free");
+    else check(hipStreamWaitEvent(stream, send_ready_, 0), "pipeline source lifetime");
     started_ = pipeline_started_ = true;
     set_phase(Phase::producer);
     const auto prepare = [this](std::size_t at, std::size_t k) {
@@ -2303,7 +2332,7 @@ void Communicator::start_pipeline(hipStream_t stream, const void* local, std::si
                     throw std::runtime_error("dist pipeline: finish did not provide a destination before timeout");
                 cpu_relax();
             }
-            check(hipStreamWaitEvent(q.rx, q.consumer, 0), "pipeline destination lifetime");
+            if (!q.async) check(hipStreamWaitEvent(q.rx, q.consumer, 0), "pipeline destination lifetime");
         }
         check(hipMemcpyAsync(static_cast<std::byte*>(destination) + at, q.receive + slot, n, hipMemcpyHostToDevice, q.rx), "pipeline H2D");
         latency::mark("chunk_h2d_enqueued", at);
@@ -2338,8 +2367,23 @@ void Communicator::start_pipeline(hipStream_t stream, const void* local, std::si
             check(hipEventRecord(receive_done_, q.rx), "pipeline receive complete");
         }));
     }
-    progress_->worker.post(guarded([this, prepare, receive] {
+    progress_->worker.post(guarded([this, prepare, receive, defer_reuse] {
         auto& q = *pipeline_;
+        // finish joined the previous workers, but its H2D may still read pinned
+        // receive staging. Guard reuse here, not on the submitting host thread.
+        // This query precedes this job's new record of receive_done_.
+        if (defer_reuse) {
+            const auto deadline = started_at_ + wait_timeout_;
+            for (unsigned spin = 0;; ++spin) {
+                const auto e = hipEventQuery(receive_done_);
+                if (e == hipSuccess) break;
+                if (e != hipErrorNotReady) check(e, "pipeline previous receive");
+                if ((spin & 1023U) == 0U && (q.failed.load(std::memory_order_acquire) || cancel_.load(std::memory_order_acquire) ||
+                                           std::chrono::steady_clock::now() >= deadline))
+                    throw std::runtime_error("pipeline receive-buffer reuse timeout");
+                cpu_relax();
+            }
+        }
         void* destination = nullptr;
         for (std::size_t at = 0, k = 0; at < bytes_; at += q.chunk, ++k) {
             const auto n = std::min(q.chunk, bytes_ - at), slot = at + k * sizeof(Trailer);
@@ -2364,8 +2408,12 @@ void Communicator::finish_pipeline(hipStream_t stream, void* remote) {
     latency::mark("pipeline_finish_begin");
     const auto entry = std::chrono::steady_clock::now();
     auto& p = *pipeline_;
-    check(hipEventRecord(p.consumer, stream), "pipeline consumer ready");
-    p.destination.store(remote, std::memory_order_release);
+    if (!p.async) {
+        check(hipEventRecord(p.consumer, stream), "pipeline consumer ready");
+        p.destination.store(remote, std::memory_order_release);
+    } else if (remote != p.destination.load(std::memory_order_acquire)) {
+        throw std::logic_error("dist pipeline: finish destination differs from start");
+    }
     const auto deadline = entry + 2 * wait_timeout_ + std::chrono::seconds(5);
     std::exception_ptr error;
     const auto join = [&](Worker& worker) {

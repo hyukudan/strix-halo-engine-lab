@@ -1729,19 +1729,48 @@ Use the v5 exact MLA output projection schedule.
 
 <a id="glm-pf-scores-v3"></a>
 
-### Prefill MLA scores v3
+### Prefill MLA scores v4
 
-**Engine:** `glm`. **Control:** `STRIX_GLM_PF_SCORES`. **Default:** 3.
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_SCORES`. **Default:** 4.
 
-Use the v3 exact MLA score kernel.
+Use the v4 exact MLA score kernel (same bits as v3 and v2).
 
 - **Preconditions:** Exact chunked prefill and supported score geometry.
-- **Automatic selection:** Unset resolves to 3; the engine default provides it; the resolver reports it. Explicit values win.
+- **Automatic selection:** Unset resolves to 4; the resolver reports it. Explicit values win.
 - **Fallback notice:** Outside supported geometry, keep the supported exact dispatch; invalid explicit combinations fail. No general per-item decline line.
-- **Exactness evidence:** Measurement: MLA scores v3 -22 %; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
-- **Off switch:** STRIX_GLM_PF_SCORES=2
-- **Measured gain:** MLA scores v3 -22 %
-- **Implementation / evidence:** [16-item resolver](../apps/glm_rank_defaults.hpp)
+- **Exactness evidence:** Bitwise equal to v3 on the kernel fixtures; complete same-identity tokens plus logits/state digests on the pair.
+- **Off switch:** STRIX_GLM_PF_SCORES=3 (v3) or =2 (v2)
+- **Measured gain:** v3 -22 % vs v2; v4 a further -8..-17 % vs v3
+- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
+
+### Prefill pipeline and async exchange start
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_PIPELINE`, `STRIX_DIST_ASYNC_START`. **Default:** 2 / 1.
+
+Overlap two whole layers of the chunked prefill, and start the host exchange asynchronously so it hides behind compute
+(only the pipeline uses the async start; other engines keep the ordinary start unless they set the variable).
+
+- **Preconditions:** Exact chunked prefill on two ranks; full-host chunked exchange path.
+- **Automatic selection:** The rank app sets both when unset; explicit values win.
+- **Fallback notice:** Other exchange paths use the ordinary start.
+- **Exactness evidence:** Prefill gate bitwise to the reference row-by-row prefill (token, logits, all state bytes); TTFT logits equal on both ranks at 1K/8K/32K.
+- **Off switch:** STRIX_GLM_PF_PIPELINE=1, STRIX_DIST_ASYNC_START=0, or --baseline
+- **Measured gain:** 8K about -4 %; the exchange is fully hidden (GPU idle per 2K prefill 0.97 to 0.09 s)
+- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
+
+### Prefill chunk rows 2048
+
+**Engine:** `glm`. **Control:** `--max-rows`. **Default:** 2048 (baseline 1024).
+
+Process prefill in 2048-row chunks.
+
+- **Preconditions:** Exact chunked prefill.
+- **Automatic selection:** Default 2048; --max-rows wins; --baseline uses 1024.
+- **Fallback notice:** None.
+- **Exactness evidence:** Logits equal to the reference prefill on both ranks at 1K/8K/32K.
+- **Off switch:** --max-rows 1024 or --baseline
+- **Measured gain:** 8K 35.65 to 31.39 s (-12 %) with the pipeline on
+- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
 
 <a id="glm-pf-indexer-v2"></a>
 

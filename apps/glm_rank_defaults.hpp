@@ -45,6 +45,10 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16"},
         {"hp-crc-overlap", "STRIX_DIST_HOST_CRC_OVERLAP", "1", "0", true, true, "Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16"},
         {"hp-chunk-bytes", "STRIX_DIST_HOST_CHUNK_BYTES", "1048576", "0", true, true, "Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16"},
+        {"pf-pipeline-2", "STRIX_GLM_PF_PIPELINE", "2", "1", true, true,
+         "Measurement: N=2 whole-layer prefill pipeline + async start, prefill gate bitwise, 8K -4.0 % (needs dist-async-start)"},
+        {"dist-async-start", "STRIX_DIST_ASYNC_START", "1", "0", true, true,
+         "Measurement: async exchange start (full-host chunked path; only the pipeline uses it)"},
         {"hsa-no-fragment-allocator", "HSA_DISABLE_FRAGMENT_ALLOCATOR", "1", "0", true, true,
          "Measurement: production decode and prefill configuration; allocator granules fit GTT"},
         {"r1b-dense-auto", "STRIX_GLM_R1B_DENSE", "7", "2", false, true,
@@ -65,7 +69,7 @@ inline const std::vector<EnvItem>& env_items() {
         {"pf-exact-moe-v3", "STRIX_GLM_PF_EXACTMOE_V", "3", "1", false, true,
          "Measurement: exact MoE v3 (W2 grouped experts) 1K/8K/32K 240/236/226 tok/s, logits bitwise"},
         {"pf-obar-v5", "STRIX_GLM_PF_OBAR", "5", "2", false, true, "Measurement: MLA o-bar v5 exact, 2.9x"},
-        {"pf-scores-v3", "STRIX_GLM_PF_SCORES", "3", "2", false, true, "Measurement: MLA scores v3 -22 %"},
+        {"pf-scores-v4", "STRIX_GLM_PF_SCORES", "4", "2", false, true, "Measurement: MLA scores v4 bitwise 75/0, -8..-17 % vs v3 (=3 restores v3)"},
         {"pf-indexer-v2", "STRIX_GLM_PF_IDX", "2", "1", false, true, "Measurement: indexer v2 -41 %"},
     };
     return items;
@@ -89,6 +93,7 @@ struct Request {
     std::uint32_t world = 2;
     std::optional<std::string> identity, prefill, decode_xch;
     std::optional<bool> mtp;
+    std::optional<unsigned> max_rows;
     bool spec = false, g3 = false, decode_or_batch = false, mem_plan = false, reference_gate = false;
     unsigned idcheck = 0;
     std::string xch = "comm";
@@ -112,6 +117,7 @@ inline Request scan(const std::vector<std::string>& args) {
         else if (a == "--identity") r.identity = v;
         else if (a == "--prefill") r.prefill = v;
         else if (a == "--mtp") r.mtp = std::stoul(v) != 0;
+        else if (a == "--max-rows") r.max_rows = static_cast<unsigned>(std::stoul(v));
         else if (a == "--spec") r.spec = std::stoul(v) != 0;
         else if (a == "--decode-xch") r.decode_xch = v;
         else if (a == "--xch") r.xch = v;
@@ -145,7 +151,7 @@ struct Value {
 
 struct Effective {
     bool baseline = false;
-    Value identity, prefill_requested, mtp, decode_xch;
+    Value identity, prefill_requested, mtp, decode_xch, max_rows;
     std::string prefill;  // resolved: gemv | ref | wmma
     std::string xch;
     std::map<std::string, Value> env;  // env name -> effective value
@@ -171,6 +177,9 @@ inline Effective resolve(const Request& r, const EnvGet& env) {
     else if (r.decode_xch) e.decode_xch = {*r.decode_xch, "explicit"};
     else e.decode_xch = {e.baseline ? "comm" : "xfer", src_b};
     e.xch = r.xch;
+    // prefill chunk rows: 2048 (measured with pipeline 2 + async: 8K 31.2 s vs 35.1 s at 1024); baseline 1024
+    if (r.max_rows) e.max_rows = {std::to_string(*r.max_rows), "explicit"};
+    else e.max_rows = {e.baseline ? "1024" : "2048", src_b};
     const bool g3_only = r.g3 && !r.decode_or_batch && r.idcheck == 0;
     const bool smoke_head = env_is(env, "STRIX_GLM_SMOKE_HEAD", "1");
     e.prefill = e.prefill_requested.value != "auto"
@@ -203,6 +212,7 @@ inline std::string print(const Effective& e) {
     line("mtp", e.mtp);
     s += "effective prefill=" + e.prefill + " (requested " + e.prefill_requested.value + ", " + e.prefill_requested.source + ")\n";
     line("decode-xch", e.decode_xch);
+    line("max-rows", e.max_rows);
     s += "effective xch=" + e.xch + "\n";
     for (const auto& it : env_items()) {
         const Value& v = e.env.at(it.env);

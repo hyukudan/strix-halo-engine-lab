@@ -42,6 +42,14 @@ void mla_attention_rows(const dev::DsaSlot& slot, const std::uint32_t* tokens, c
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
                         hipStream_t s);
 
+// Scores v4 is the default (STRIX_GLM_PF_SCORES=3 restores v3); STRIX_GLM_PF_OBAR=6 opts into o-bar v6 (exact, slower: not a default).
+// Explicit selectors for bitwise gates and paired stage timing, independent of cached environment values.
+// scores: 2/3/4; o-bar: 2/4/5/6 (5 falls back to 2 for heads=64); legacy pair: 1/1.
+// o-bar 5 with heads=32 uses lane-major e; all other pairs use token-order e.
+void mla_attention_rows_versions(const dev::DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
+                                 const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
+                                 hipStream_t s, unsigned scores_v, unsigned obar_v);
+
 // ---- R1 plain-weight chains for many rows (router, KDA f_a/f_b/g_a/g_b/b_proj, indexer wk/gate/weights_proj):
 // y[r][o] = chain over i ascending of fmaf(x[r][i], W[o0 + o][i], acc) from +0 = dev::dense bit for bit, as a tiled
 // VALU GEMM (each weight tile read once per 64 rows instead of once per row). `in` must be a multiple of 32.

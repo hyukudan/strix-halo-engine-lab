@@ -54,6 +54,7 @@ bool same_values(const rd::Effective& a, const rd::Effective& b, std::string* wh
     d = diff("prefill-requested", a.prefill_requested.value, b.prefill_requested.value) || d;
     d = diff("decode-xch", a.decode_xch.value, b.decode_xch.value) || d;
     d = diff("xch", a.xch, b.xch) || d;
+    d = diff("max-rows", a.max_rows.value, b.max_rows.value) || d;
     for (const auto& it : rd::env_items()) d = diff(it.env, a.env.at(it.env).value, b.env.at(it.env).value) || d;
     return !d;
 }
@@ -92,6 +93,11 @@ void test_plain_equals_receipt() {
     if (!why.empty()) std::fprintf(stderr, "  ttft receipt diff: %s\n", why.c_str());
     // the old code's default (--mtp 1) sent the plain decode command to the row-by-row reference prefill
     CHECK(resolve(cat(cat(kDeploy, kDecodeWork), {"--mtp", "1"}), {}).prefill == "ref");
+    // prefill chunk rows (x3): default 2048 = the TTFT receipts' --max-rows; baseline 1024 (the old app default); explicit wins
+    CHECK(plain.max_rows.value == "2048" && plain.max_rows.source == "default");
+    CHECK(resolve(cat(kDeploy, kTtftWork), {}).max_rows.source == "explicit");
+    CHECK(resolve(cat(cat(kDeploy, kDecodeWork), {"--max-rows", "1024"}), {}).max_rows.value == "1024");
+    CHECK(resolve(cat(cat(kDeploy, kDecodeWork), {"--baseline"}), {}).max_rows.value == "1024");
 }
 
 void test_apply_env_default() {
@@ -103,7 +109,8 @@ void test_apply_env_default() {
         if (it.app_sets) CHECK(set.count(it.env) == 1 && set[it.env] == it.on);
         else CHECK(set.count(it.env) == 0);
     }
-    CHECK(set == merge(kHp, {{"HSA_DISABLE_FRAGMENT_ALLOCATOR", "1"}}));  // = the receipt's optimization env
+    CHECK(set == merge(kHp, {{"HSA_DISABLE_FRAGMENT_ALLOCATOR", "1"}, {"STRIX_GLM_PF_PIPELINE", "2"},
+                              {"STRIX_DIST_ASYNC_START", "1"}}));  // = the receipt's optimization env + the prefill overlap
     // an explicit value is never overwritten
     const auto expl = resolve(cat(kDeploy, kDecodeWork), {{"STRIX_DIST_CRC_PARALLEL", "0"}});
     Env set2;

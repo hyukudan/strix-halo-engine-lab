@@ -421,6 +421,7 @@ void dsa_case(const DsaFix& fx, const std::string& label, unsigned T, const std:
     float* pO[3];
     for (int c = 0; c < 3; ++c) pO[c] = poison<float>(static_cast<std::size_t>(NQ) * kHeadCfgs[c].H * kMlaDim);
     bool wh_ok = true, keys_ok = true, inter_ok = true, lists_ok = true;
+    bool versions_ok[3] = {true, true, true};
     std::string first_bad;
     std::vector<std::uint16_t> lat_host;  // decode latent cache, for the host R13 intermediates
     unsigned t0 = 0;
@@ -454,6 +455,42 @@ void dsa_case(const DsaFix& fx, const std::string& label, unsigned T, const std:
             if (!lists_ok) break;  // never traverse a malformed list
             for (int c = 0; c < 3; ++c) {
                 const unsigned H = kHeadCfgs[c].H;
+                // Explicit paired gates in bounded batches: every queried row, both TP2 ranks and H=64.
+                // Compare all intermediates and outputs; canonicalize only the probability layout.
+                for (unsigned rb = 0; rb < Cq; rb += 32) {
+                    const unsigned rows = std::min(32U, Cq - rb);
+                    const auto* tk = ptok + static_cast<std::size_t>(qa + rb) * P::kMaxTokens;
+                    const float* qm = dqm[c] + static_cast<std::size_t>(qa + rb) * H * kMlaDim;
+                    float* out = pO[c] + static_cast<std::size_t>(qa + rb) * H * kMlaDim;
+                    auto call = [&](unsigned sv, unsigned ov) {
+                        P::mla_attention_rows_versions(ps.s, tk, pn + qa + rb, qm, kvb_dev[c], H,
+                                                       pqt, pe, pob, out, rows, nullptr, sv, ov);
+                    };
+                    call(3, 5);
+                    const auto qt_ref = down(pqt, static_cast<std::size_t>(rows) * H * kKvLora);
+                    const auto ob_ref = down(pob, static_cast<std::size_t>(rows) * H * kKvLora);
+                    const auto e_ref = down(pe, static_cast<std::size_t>(rows) * H * P::kEStride);
+                    const auto o_ref = down(out, static_cast<std::size_t>(rows) * H * kMlaDim);
+                    const auto decode = down(rO[c] + static_cast<std::size_t>(qa + rb) * H * kMlaDim, o_ref.size());
+                    for (unsigned v = 0; v < 3; ++v) {
+                        const unsigned sv = v == 1 ? 3U : 4U, ov = v == 0 ? 5U : 6U;
+                        call(sv, ov);
+                        bool same = bits_eq(qt_ref, down(pqt, qt_ref.size())) && bits_eq(ob_ref, down(pob, ob_ref.size())) &&
+                                    bits_eq(o_ref, down(out, o_ref.size())) && bits_eq(o_ref, decode) && all_finite(o_ref);
+                        const auto ep = down(pe, e_ref.size());
+                        for (unsigned rr = 0; rr < rows; ++rr)
+                            for (unsigned h = 0; h < H; ++h)
+                                for (unsigned j = 0; j < nh[rb + rr]; ++j) {
+                                    unsigned rev = 0;
+                                    for (unsigned bit = 0; bit < 8; ++bit) rev |= ((j >> bit) & 1U) << (7 - bit);
+                                    const unsigned lane = P::kObRounds * rev + j / 256;
+                                    const std::size_t base = (static_cast<std::size_t>(rr) * H + h) * P::kEStride;
+                                    same &= std::memcmp(&e_ref[base + (H == 32 ? lane : j)],
+                                                        &ep[base + (H == 32 && ov == 5 ? lane : j)], 4) == 0;
+                                }
+                        versions_ok[v] &= same;
+                    }
+                }
                 P::mla_attention_rows(ps.s, ptok + static_cast<std::size_t>(qa) * P::kMaxTokens, pn + qa, dqm[c] + static_cast<std::size_t>(qa) * H * kMlaDim,
                                       kvb_dev[c], H, pqt, pe, pob, pO[c] + static_cast<std::size_t>(qa) * H * kMlaDim, Cq, nullptr);
                 if (c == 0 && P::mla_e_lane_major(H)) {  // o-bar v5 intermediates (32 heads): lane-major p, padding +0, o-bar
@@ -546,6 +583,9 @@ void dsa_case(const DsaFix& fx, const std::string& label, unsigned T, const std:
         check(bad == 0 && all_finite(po), tag + ": MLA outputs, " + kHeadCfgs[c].label + " (H=" + std::to_string(kHeadCfgs[c].H) + "), == decode, finite (mismatches " +
                                               std::to_string(bad) + ")");
     }
+    for (unsigned v = 0; v < 3; ++v)
+        check(versions_ok[v], tag + ": explicit scores/obar " + (v == 0 ? "4/5" : v == 1 ? "3/6" : "4/6") +
+              " == 3/5 intermediates and decode outputs, all queried rows, H=32 ranks 0/1 and H=64");
     check(down(rflag, 1)[0] == 0 && down(pflag, 1)[0] == 0, tag + ": no C3/C4 flag on either path");
 }
 
@@ -818,6 +858,73 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
         check(down(rf4, 1)[0] != 0 && down(pf4, 1)[0] != 0, "DSA positive C4 alone: finite row 7 completing a pool with a preseeded +inf gate sets the flag on decode and prefill");
         free_all();
     }
+    {  // Direct MLA stress: tile/list boundaries and IEEE values without the append finiteness gate.
+        const std::vector<std::uint32_t> counts = {1, 31, 32, 33, 63, 64, 65, 255, 256, 257, 2048, P::kMaxTokens};
+        const unsigned C = static_cast<unsigned>(counts.size()), cap = 4096;
+        SlotBufs slot(cap);
+        std::vector<std::uint32_t> tokens(static_cast<std::size_t>(C) * P::kMaxTokens);
+        for (unsigned r = 0; r < C; ++r)
+            for (unsigned j = 0; j < counts[r]; ++j) tokens[static_cast<std::size_t>(r) * P::kMaxTokens + j] = (17 * j) % cap;
+        auto* tk = up(tokens);
+        auto* nn = up(counts);
+        for (unsigned H : {32U, 64U}) {
+            auto* kv = up(std::vector<std::uint16_t>(fx.kvb.begin(), fx.kvb.begin() + static_cast<std::size_t>(H) * 2 * kMlaDim * kKvLora));
+            auto qm = rnd(static_cast<std::size_t>(C) * H * kMlaDim, g, 1.0F);
+            auto* q = up(qm);
+            const std::size_t nq = static_cast<std::size_t>(C) * H * kKvLora;
+            const std::size_t ne = static_cast<std::size_t>(C) * H * P::kEStride, no = static_cast<std::size_t>(C) * H * kMlaDim;
+            float *qt = poison<float>(nq + 17), *ep = poison<float>(ne + 17), *ob = poison<float>(nq + 17), *out = poison<float>(no + 17);
+            for (unsigned ieee = 0; ieee < 2; ++ieee) {
+                std::vector<std::uint16_t> lat(static_cast<std::size_t>(cap) * kKvLora);
+                const std::uint16_t finite[] = {0x3F80, 0xBF80, 0x0000, 0x8000, 0x0001, 0x8001, 0x3EAB, 0xBEAB};
+                for (std::size_t i = 0; i < lat.size(); ++i) lat[i] = finite[(i + i / kKvLora) % 8];
+                if (ieee) { lat[3] = 0x7F80; lat[9] = 0xFF80; lat[17 * kKvLora + 5] = 0x7FC1; }
+                hok(hipMemcpy(slot.s.latent, lat.data(), lat.size() * 2, hipMemcpyHostToDevice), "MLA seed");
+                auto call = [&](unsigned sv, unsigned ov) {
+                    P::mla_attention_rows_versions(slot.s, tk, nn, q, kv, H, qt, ep, ob, out, C, nullptr, sv, ov);
+                };
+                call(3, 5);
+                const auto qr = down(qt, nq + 17), er = down(ep, ne + 17), obr = down(ob, nq + 17), oo = down(out, no + 17);
+                bool same = true;
+                auto guard_ok = [](const std::vector<float>& a, std::size_t count) {
+                    bool intact = true;
+                    for (std::size_t j = count; j < a.size(); ++j) {
+                        std::uint32_t u;
+                        std::memcpy(&u, &a[j], 4);
+                        intact &= u == 0xFFFFFFFFU;
+                    }
+                    return intact;
+                };
+                same &= guard_ok(qr, nq) && guard_ok(er, ne) && guard_ok(obr, nq) && guard_ok(oo, no);
+                for (unsigned v = 0; v < 3; ++v) {
+                    const unsigned sv = v == 1 ? 3U : 4U, ov = v == 0 ? 5U : 6U;
+                    call(sv, ov);
+                    const auto eo = down(ep, ne + 17);
+                    same &= bits_eq(qr, down(qt, nq + 17)) && bits_eq(obr, down(ob, nq + 17)) && bits_eq(oo, down(out, no + 17));
+                    for (unsigned r = 0; r < C; ++r)
+                        for (unsigned h = 0; h < H; ++h)
+                            for (unsigned j = 0; j < counts[r]; ++j) {
+                                unsigned rev = 0;
+                                for (unsigned bit = 0; bit < 8; ++bit) rev |= ((j >> bit) & 1U) << (7 - bit);
+                                const unsigned lane = P::kObRounds * rev + j / 256;
+                                const std::size_t base = (static_cast<std::size_t>(r) * H + h) * P::kEStride;
+                                same &= std::memcmp(&er[base + (H == 32 ? lane : j)], &eo[base + (H == 32 && ov == 5 ? lane : j)], 4) == 0;
+                            }
+                    for (unsigned j = 0; j < 17; ++j) {
+                        std::uint32_t u;
+                        std::memcpy(&u, &eo[ne + j], 4);
+                        same &= u == 0xFFFFFFFFU;
+                    }
+                }
+                // Byte comparisons deliberately include NaN payloads and the output guard regions.
+                check(same, "MLA explicit 4/5, 3/6, 4/6 == 3/5 bitwise intermediates/output/guards H=" + std::to_string(H) +
+                      (ieee ? " NaN/+Inf/-Inf latent" : " signed-zero/subnormal latent") + ", n=1..2051 tile boundaries");
+            }
+        }
+        free_all();
+    }
+    P::mla_attention_rows_versions({}, nullptr, nullptr, nullptr, nullptr, 32, nullptr, nullptr, nullptr, nullptr, 0, nullptr, 4, 6);
+    hok(hipGetLastError(), "MLA zero rows");
 }
 
 // ---------------------------------------------------------------- timing (informational, after a clean gate)

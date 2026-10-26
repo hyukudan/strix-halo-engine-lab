@@ -214,6 +214,7 @@ public:
     // runs pinned over the chunk, so it needs a prepared handle (raw-only experts are read by the grouped core directly).
     bool moe_by_row() const override { return tb_ == TierB::gemv && xmoe_ws_ == nullptr; }
     unsigned moe_row_block() const override { return gemv_block(); }
+    bool supports_pipeline() const override { return tb_ == TierB::gemv; }
     bool needs_prepared_shared() const override { return tb_ == TierB::wmma; }
     std::uint64_t admission_margin() const override { return margin_; }
     std::uint64_t margin_ = std::uint64_t{8} << 30;  // set by make_prefill_path (STRIX_GLM_PF_MARGIN_GIB)
