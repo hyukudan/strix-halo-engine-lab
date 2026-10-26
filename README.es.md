@@ -237,11 +237,11 @@ No se especifican las longitudes de prompt ni los tokens generados para estas ú
 
 | Trabajo de carga / servidor (2026-10-25) | Resultado medido | Estado |
 |---|---|---|
-| Carga de expertos en tubería | Carga completa **108,7 → 61,8 s**; llenado de expertos **83,1 → 38,0 s**, **2,25 → 6,73 GB/s**, limitado por disco | **En desarrollo** en este motor (cargador publicado en [tierstream](https://github.com/hyukudan/tierstream)); colocación y salidas idénticas bit a bit |
-| Proceso de trabajo persistente con modelo cargado | **8–18 s por petición** en las cargas de prueba sin recarga; reinicio de caché con carga nueva **3,4 s** | **En desarrollo**; cada petición idéntica bit a bit a un proceso nuevo |
+| Carga de expertos en tubería | Carga completa **108,7 → 61,8 s**; llenado de expertos **83,1 → 38,0 s**, **2,25 → 6,73 GB/s**, limitado por disco | **Publicada, activada por defecto** ([PR #52](https://github.com/hyukudan/strix-halo-engine-lab/pull/52)); colocación y salidas idénticas bit a bit |
+| Proceso de trabajo persistente con modelo cargado | **8–18 s por petición** en las cargas de prueba sin recarga; reinicio de caché con carga nueva **3,4 s** | **Publicado** (`--serve`, PR #52); cada petición idéntica bit a bit a un proceso nuevo |
 | Precarga de ventanas | Sin ganancia repetible en comparaciones equivalentes en caliente | Exacta; desactivada por defecto |
 
-**Arranque en frío, mismo perfil RTX independiente (2026-10-26).** Proceso de trabajo persistente en desarrollo,
+**Arranque en frío, mismo perfil RTX independiente (2026-10-26).** Proceso de trabajo persistente,
 binario probado `1569bce5`; los interruptores de escritura de vuelta/vaciado en ejecución conservan los tokens, logits y estado
 de un proceso nuevo (6/6 comparaciones offline). Son tiempos de pasos, no rendimiento de chat ni TTFT:
 
@@ -253,9 +253,12 @@ de un proceso nuevo (6/6 comparaciones offline). Son tiempos de pasos, no rendim
 | Proceso de trabajo, caché de expertos caliente | 10,9 ms | 11,63 ms | 11,49 ms |
 
 La precaptura de grafos añade **1,5 s antes de estar listo**. No se especifican el tipo ni la longitud de prompt para
-esta prueba de fase exacta. La carga en tubería y el servidor persistente siguen en desarrollo en este repositorio.
-La integración RTX activada por defecto (keep-64, escrituras diferidas, controlador caliente) aún espera su puerta final
-sin flags frente a configuración explícita; el rango medido de **82–95 tok/s** en código sigue siendo el resultado citado.
+esta prueba de fase exacta. El proceso persistente, la semilla de residencia y la precaptura de grafos se publicaron con
+[PR #52](https://github.com/hyukudan/strix-halo-engine-lab/pull/52) (2026-10-26): los ajustes exactos adoptados (keep-64, escrituras
+diferidas, controlador caliente, paquete de kernels de decode y fusiones) están activados por defecto con interruptores para
+desactivarlos, y una ejecución sin flags coincidió con la configuración explícita (todas las puertas 64/64, trazas especulativas
+idénticas, 21/21 tokens de chat) con una caché fijada reducida, así que esa puerta no da cifras de velocidad. El rango medido de
+**82–95 tok/s** en código sigue siendo el resultado citado. Compilar, ejecutar y valores por defecto: [docs/models/deepseek-v4.1/rtx-standalone.md](docs/models/deepseek-v4.1/rtx-standalone.md).
 
 ### Qwen3.8-Flash-Next
 

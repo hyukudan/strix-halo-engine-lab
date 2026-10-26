@@ -235,11 +235,11 @@ Prompt lengths and generated-token counts are unspecified for these latest decod
 
 | Loading / serving work (2026-10-25) | Measured result | Status |
 |---|---|---|
-| Pipelined expert loading | Full load **108.7 → 61.8 s**; expert fill **83.1 → 38.0 s**, **2.25 → 6.73 GB/s**, disk-bound | **In development** in this engine (loader published in [tierstream](https://github.com/hyukudan/tierstream)); bitwise-identical placement and outputs |
-| Persistent loaded worker | **8–18 s per request** on test workloads without reload; fresh-load cache reset **3.4 s** | **In development**; each request bitwise identical to a fresh process |
+| Pipelined expert loading | Full load **108.7 → 61.8 s**; expert fill **83.1 → 38.0 s**, **2.25 → 6.73 GB/s**, disk-bound | **Published, on by default** ([PR #52](https://github.com/hyukudan/strix-halo-engine-lab/pull/52)); bitwise-identical placement and outputs |
+| Persistent loaded worker | **8–18 s per request** on test workloads without reload; fresh-load cache reset **3.4 s** | **Published** (`--serve`, PR #52); each request bitwise identical to a fresh process |
 | Window prefetch | No repeatable gain in matched warm comparisons | Exact; default off |
 
-**Cold start, same standalone RTX profile (2026-10-26).** In-development persistent worker,
+**Cold start, same standalone RTX profile (2026-10-26).** Persistent worker,
 tested binary `1569bce5`; runtime write-back/flush switches preserve fresh-process tokens, logits and state
 (6/6 offline comparisons). These are step timings, not chat throughput or TTFT:
 
@@ -251,9 +251,12 @@ tested binary `1569bce5`; runtime write-back/flush switches preserve fresh-proce
 | Worker, warm expert cache | 10.9 ms | 11.63 ms | 11.49 ms |
 
 Graph pre-capture adds **1.5 s before readiness**. Prompt kind/length are unspecified for this exact-phase
-benchmark. Pipelined loading and persistent serving remain in development in this repository.
-The RTX default-on integration (keep-64, deferred write-backs, warm controller) still awaits its final
-no-flag-versus-explicit-configuration gate; the measured **82–95 tok/s** code range remains the quoted result.
+benchmark. The worker, residency seed and graph pre-capture are published with
+[PR #52](https://github.com/hyukudan/strix-halo-engine-lab/pull/52) (2026-10-26): the adopted exact settings (keep-64, deferred
+write-backs, warm controller, decode kernel bundle and fusions) are on by default with off switches, and a no-flag run
+matched the explicit configuration (all gates 64/64, identical speculation traces, 21/21 chat tokens) on a reduced
+pinned cache, so that gate does not give speed numbers. The measured **82–95 tok/s** code range remains the quoted result.
+Build, run and defaults: [docs/models/deepseek-v4.1/rtx-standalone.md](docs/models/deepseek-v4.1/rtx-standalone.md).
 
 ### Qwen3.8-Flash-Next
 

@@ -40,11 +40,11 @@ CUDA-graph instantiation fixes and the warm controller were adopted in the measu
 
 | RTX loading / serving work | Measured result | Date | Status / exactness |
 |---|---|---|---|
-| Pipelined expert loading | Full load **108.7 → 61.8 s**; expert fill **83.1 → 38.0 s**, **2.25 → 6.73 GB/s**, disk-bound | 2026-10-25 | In development in this repository (loader published in tierstream); placement and outputs bitwise identical |
-| Persistent loaded worker | R1 requests **13.9–18.3 s**, R2 **7.9–8.2 s**, no reload; fresh-load cache reset **~3.4 s** | 2026-10-25 | In development; fresh-process tokens/logits/state equal; request lengths unspecified |
+| Pipelined expert loading | Full load **108.7 → 61.8 s**; expert fill **83.1 → 38.0 s**, **2.25 → 6.73 GB/s**, disk-bound | 2026-10-25 | Published, on by default (PR #52); placement and outputs bitwise identical |
+| Persistent loaded worker | R1 requests **13.9–18.3 s**, R2 **7.9–8.2 s**, no reload; fresh-load cache reset **~3.4 s** | 2026-10-25 | Published (`--serve`, PR #52); fresh-process tokens/logits/state equal; request lengths unspecified |
 | Window prefetch | No repeatable gain in matched warm comparisons | 2026-10-26 | Exact; default off |
 
-**Cold start, same standalone RTX profile (2026-10-26).** In-development persistent worker,
+**Cold start, same standalone RTX profile (2026-10-26).** Persistent worker,
 tested binary `1569bce5`; runtime write-back/flush switches preserve fresh-process tokens, logits and state
 (6/6 offline comparisons). These are step timings, not chat throughput or TTFT:
 
@@ -56,9 +56,12 @@ tested binary `1569bce5`; runtime write-back/flush switches preserve fresh-proce
 | Worker, warm expert cache | 10.9 ms | 11.63 ms | 11.49 ms |
 
 Graph pre-capture adds **1.5 s before readiness**. Prompt kind/length are unspecified for this exact-phase
-benchmark. Pipelined loading and persistent serving remain in development in this repository.
-The RTX default-on integration (keep-64, deferred write-backs, warm controller) still awaits its final
-no-flag-versus-explicit-configuration gate; the measured **82–95 tok/s** code range remains the quoted result.
+benchmark. The worker, residency seed and graph pre-capture are published with
+[PR #52](https://github.com/hyukudan/strix-halo-engine-lab/pull/52) (2026-10-26): the adopted exact settings (keep-64, deferred
+write-backs, warm controller, decode kernel bundle and fusions) are on by default with off switches, and a no-flag run
+matched the explicit configuration (all gates 64/64, identical speculation traces, 21/21 chat tokens) on a reduced
+pinned cache, so that gate does not give speed numbers. The measured **82–95 tok/s** code range remains the quoted result.
+Build, run and defaults: [docs/models/deepseek-v4.1/rtx-standalone.md](../docs/models/deepseek-v4.1/rtx-standalone.md).
 
 The newer RTX kernel set is exact but does not establish an additional chat-throughput gain:
 
