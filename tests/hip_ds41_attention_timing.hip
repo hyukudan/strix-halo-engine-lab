@@ -154,9 +154,76 @@ int main(int argc, char** argv) {
         for (auto& b : kv) b = static_cast<std::uint8_t>(rng());
         for (std::size_t t = 0; t < ncache; ++t) for (unsigned b = 0; b < 32; ++b) kv[t * 288 + 256 + b] = 0x38;
         auto* dring = dev(ring); auto* dkv = dev(kv);
-        const std::string only = argc > 2 ? argv[2] : "";  // "compress": the compress cases alone
+        // "compress": the compress cases alone; "chain": the decode chain below; "chainab": R6/R8 at 640 keys, live chunks,
+        // window write + attention / fold / window write + attention again (A/B/A' control), interleaved 5 times
+        const std::string only = argc > 2 ? argv[2] : "";
+        if (only == "chain" || only == "chainab") {
+            const bool ab = only == "chainab";   // one TP rank (32 heads), R1 / R6 / R8 windows: window write, attention, both back to back
+            const auto norm = rnd(512, 0.5F, 1.5F);
+            auto* dnorm = dev(norm);
+            for (const unsigned rows : {1U, 6U, 8U})
+                for (const std::uint64_t last : {100ULL, 20000ULL}) {
+                    if (ab && (rows == 1U || last < 1000)) continue;   // ~100 positions (short context: 100 compressed keys) / 640 keys
+                    std::vector<std::uint64_t> pos(rows);
+                    for (unsigned r = 0; r < rows; ++r) pos[r] = last - (rows - 1) + r;
+                    std::vector<a::RopeRow> rope;
+                    for (const auto p : pos) rope.push_back(a::rope_row(a::RopeKind::compressed, p));
+                    const unsigned nc = last < 1000 ? static_cast<unsigned>(last + 1) : a::kTopK;
+                    std::vector<std::uint32_t> idx(rows * a::kTopK), cnt(rows, nc);
+                    for (unsigned r = 0; r < rows; ++r) for (unsigned i = 0; i < nc; ++i) idx[r * a::kTopK + i] = last < 1000 ? i : 7 * i;
+                    auto* dq = dev(rnd(rows * 32 * 512, -0.5F, 0.5F)); auto* dsink = dev(rnd(32, -2, 2));
+                    auto* dpos = dev(pos); auto* drope = dev(rope); auto* didx = dev(idx); auto* dcnt = dev(cnt);
+                    auto* dkvrow = dev(rnd(rows * 512, -3, 3));
+                    auto* dpart = dev_zero<float>(std::size_t{rows} * 32 * a::kMaxChunks * 514); auto* dout = dev_zero<float>(rows * 32 * 512);
+                    auto* dtick = dev_zero<std::uint32_t>(rows * g::kAttnGroupCount);
+                    g::AttentionView av{rows, cap, a::kTopK, dq, dsink, drope, dpos, dring, dkv, didx, dcnt, dpart, dout, dtick};
+                    av.heads = 32;
+                    const g::WindowView wv{dkvrow, dnorm, drope, dpos, rows, cap, dring};   // the layer's table, as in the engine
+                    const std::string tag = std::to_string(rows) + " rows, " + std::to_string(last < 128 ? last + 1 : 128U) + "-key window + " + std::to_string(nc) + " compressed";
+                    if (ab) {
+                        g::AttentionView lv = av;
+                        lv.max_visible = static_cast<std::uint32_t>(std::min<std::uint64_t>(last + 1, 128) + nc);
+                        g::AttentionView lf = lv;
+                        lf.kv = dkvrow; lf.kv_norm = dnorm; lf.ring_out = dring;
+                        for (unsigned k = 0; k < 5; ++k) {
+                            const std::string n = " #" + std::to_string(k) + ", live chunks, " + tag;
+                            measure(("A  window write + attention" + n).c_str(), [&] { g::enqueue_window_write(wv, nullptr); g::enqueue_attention(lv, nullptr); });
+                            measure(("B  attention + window fold" + n).c_str(), [&] { g::enqueue_attention(lf, nullptr); });
+                            measure(("A' window write + attention" + n).c_str(), [&] { g::enqueue_window_write(wv, nullptr); g::enqueue_attention(lv, nullptr); });
+                        }
+                        continue;
+                    }
+                    measure(("window write, " + tag).c_str(), [&] { g::enqueue_window_write(wv, nullptr); });
+                    measure(("attention 32 heads, " + tag).c_str(), [&] { g::enqueue_attention(av, nullptr); });
+                    g::set_attention_tile_f16(1);
+                    measure(("attention 32 heads, f16 tile, " + tag).c_str(), [&] { g::enqueue_attention(av, nullptr); });
+                    g::set_attention_tile_f16(-1);
+                    {   // STRIX_DS41_ATTN_LIVE_CHUNKS: grid and heads per wave from the bound on visible keys
+                        g::AttentionView lv = av;
+                        lv.max_visible = static_cast<std::uint32_t>(std::min<std::uint64_t>(last + 1, 128) + nc);
+                        measure(("attention 32 heads, live chunks, " + tag).c_str(), [&] { g::enqueue_attention(lv, nullptr); });
+                        g::set_attention_tile_f16(1);
+                        measure(("attention 32 heads, live chunks, f16 tile, " + tag).c_str(), [&] { g::enqueue_attention(lv, nullptr); });
+                        g::set_attention_tile_f16(-1);
+                        measure(("window write + attention 32 heads, live chunks, " + tag).c_str(), [&] { g::enqueue_window_write(wv, nullptr); g::enqueue_attention(lv, nullptr); });
+                        g::AttentionView lf = lv;
+                        lf.kv = dkvrow; lf.kv_norm = dnorm; lf.ring_out = dring;
+                        measure(("attention 32 heads + window fold, live chunks, " + tag).c_str(), [&] { g::enqueue_attention(lf, nullptr); });
+                        g::set_attention_tile_f16(1);
+                        measure(("attention 32 heads + window fold, live chunks, f16 tile, " + tag).c_str(), [&] { g::enqueue_attention(lf, nullptr); });
+                        g::set_attention_tile_f16(-1);
+                    }
+                    measure(("window write + attention 32 heads, " + tag).c_str(), [&] { g::enqueue_window_write(wv, nullptr); g::enqueue_attention(av, nullptr); });
+                    g::AttentionView fv = av;   // STRIX_DS41_ATTN_WINDOW_FOLD: attention alone does the window insert
+                    fv.kv = dkvrow; fv.kv_norm = dnorm; fv.ring_out = dring;
+                    measure(("attention 32 heads + window fold, " + tag).c_str(), [&] { g::enqueue_attention(fv, nullptr); });
+                    g::set_attention_tile_f16(1);
+                    measure(("attention 32 heads + window fold, f16 tile, " + tag).c_str(), [&] { g::enqueue_attention(fv, nullptr); });
+                    g::set_attention_tile_f16(-1);
+                }
+        }
         for (const unsigned rows : {1U, 8U}) {
-            if (only == "compress") break;
+            if (only == "compress" || only == "chain" || only == "chainab") break;
             std::vector<std::uint64_t> pos(rows);
             for (unsigned r = 0; r < rows; ++r) pos[r] = 100000 + r;
             std::vector<a::RopeRow> rope; for (const auto p : pos) rope.push_back(a::rope_row(a::RopeKind::compressed, p));
@@ -173,7 +240,7 @@ int main(int argc, char** argv) {
             measure(("attention, 640 keys, 32 heads, rows " + std::to_string(rows)).c_str(), [&] { g::enqueue_attention(tp, nullptr); });
         }
         // compress at ratio 1 and 2: the first row at an odd position (a group's last token at ratio 2)
-        {
+        if (only != "chain" && only != "chainab") {
             const auto norm = rnd(512, 0.5F, 1.5F), knorm = rnd(128, 0.5F, 1.5F);
             std::vector<std::uint16_t> wk(128 * 512);
             for (auto& h : wk) h = static_cast<std::uint16_t>(0x1800U + (rng() & 0xFFFU) + ((rng() & 1U) << 15U));
@@ -199,7 +266,7 @@ int main(int argc, char** argv) {
         }
         // index scores + select at 32K and 131K positions (ratio 1)
         for (const std::uint32_t count : {32768U, 131072U}) for (const unsigned rows : {1U, 8U}) {
-            if (only == "compress") break;
+            if (only == "compress" || only == "chain" || only == "chainab") break;
             std::vector<std::uint8_t> cache(std::size_t{count} * 68);
             for (auto& b : cache) b = static_cast<std::uint8_t>(rng());
             for (std::size_t t = 0; t < count; ++t) for (unsigned b = 0; b < 4; ++b) cache[t * 68 + 64 + b] = 124;

@@ -80,6 +80,10 @@ struct PrefixCacheStats {
     double write_seconds = 0.0, read_seconds = 0.0, scan_seconds = 0.0;
 };
 
+// The next token of a snapshot taken inside a prefill run (DevicePrefill::export_state_at): unknown, so lookup never
+// takes such a snapshot as a whole-prompt hit (it resumes from it with rows left to prefill).
+inline constexpr std::uint32_t kPrefixUnknownNextToken = 0xFFFFFFFFU;
+
 struct PrefixLookup {
     std::uint32_t resume = 0;   // longest snapshot boundary (multiple of block, <= tokens.size()); 0: none
     std::uint64_t key = 0;      // its node's chain key (0 when resume is 0)
@@ -198,6 +202,20 @@ private:
 // resume == total.
 [[nodiscard]] std::vector<std::uint32_t> plan_prefill_pieces(std::uint32_t resume, std::uint32_t shared, std::uint32_t total, std::uint32_t block,
                                                              std::uint32_t max_rows, std::uint32_t min_rows = 1, bool before_tail = false);
+
+// With in-run snapshots (DevicePrefill::set_snapshot_points): the runs end only every max_rows rows (as
+// plan_prefill_pieces splits them) and at total; the boundaries plan_prefill_pieces adds for the cache (the shared
+// block, the last full block, with before_tail one block before it) become snapshot points inside those runs instead
+// (ascending, each strictly inside a run). The same snapshots, without the extra runs. reach (0: any): a point more than
+// reach rows before its run's end splits the run there instead (an in-run point widens the decoder cone over every row
+// between it and the end, a split costs one more read of the experts), so only the points near the end stay inside.
+// extra (0: none): one more cache boundary (rounded down to a block), e.g. the end of a chat's system prompt + tools.
+struct PrefillRunPlan {
+    std::vector<std::uint32_t> ends, points;
+};
+[[nodiscard]] PrefillRunPlan plan_prefill_runs(std::uint32_t resume, std::uint32_t shared, std::uint32_t total, std::uint32_t block,
+                                               std::uint32_t max_rows, std::uint32_t min_rows = 1, bool before_tail = false,
+                                               std::uint32_t reach = 0, std::uint32_t extra = 0);
 
 // The bit-relevant configuration whose states a cache keeps: everything besides the model file and the layer count that
 // changes a state's bits. `text` is a canonical "key=value;" list (version, weights overlay + CB4, trellis pack, sites and

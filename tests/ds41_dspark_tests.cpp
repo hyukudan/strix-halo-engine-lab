@@ -473,6 +473,37 @@ void test_batch_controller() {
     const std::uint32_t one[2] = {1, 1};
     const auto noroom = e.plan_drafts(std::span(slots, 2), std::span(one, 2), 8);
     expect(!noroom[0] && !noroom[1], "batch controller: no room, no draft");
+    // the measured prior (seed) and the request's own evidence (design notes)
+    {
+        BatchWindowController s(2);
+        s.set_costs(c);
+        Draft low{};
+        low.confidence.fill(-0.5F);  // a never-verified bin: the unseen default 0.5 (pooled q 0.5)
+        expect(std::abs(s.probability(3, -0.5F) - 0.5) < 1e-9, "batch controller: unseen bin = default");
+        BatchWindowController::BinTable seen{}, hits{};
+        for (auto& r : seen) r.fill(32U);
+        for (auto& r : hits) r.fill(24U);
+        s.seed(seen, hits);
+        expect(std::abs(s.probability(3, -0.5F) - 0.75) < 0.01, "batch controller: the seeded bin carries the measured rate");
+        BatchWindowController::BinTable bad{};
+        bad[0][0] = 1U;
+        bool threw = false;
+        try {
+            s.seed(BatchWindowController::BinTable{}, bad);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        expect(threw, "batch controller: a seed with hits > seen is refused");
+        // a request that accepts everything: with its evidence on, stage 2 gives it at least as many rows as without
+        const std::uint32_t sl[1] = {0}, lim[1] = {6};
+        const std::vector<bool> drafted(1, true);
+        const std::vector<Draft> dd(1, low);
+        for (int i = 0; i < 6; ++i) s.observe(0, low, 5, 5);
+        const auto r0 = s.choose_rows(std::span(sl, 1), std::span(lim, 1), 8, drafted, dd);
+        s.set_request_weight(4.0);
+        const auto r1 = s.choose_rows(std::span(sl, 1), std::span(lim, 1), 8, drafted, dd);
+        expect(r1[0] >= r0[0] && r1[0] == 6U, "batch controller: the request's own full acceptance lengthens its window");
+    }
     // the local search (more than 4 requests) respects the budget and finds the obvious plan
     BatchWindowController big(8);
     c.draft = 0.0075F;

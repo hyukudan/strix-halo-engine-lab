@@ -50,6 +50,30 @@ int main(int argc, char** argv) try {
         ++index;
     }
     std::cout << "deepseek chat: " << equal << " of " << index << " cases equal the reference encoder\n";
+    // the stable prefix the API hands the engine (ApiService chat: system messages + tools rendered alone): a prefix of
+    // every recorded conversation that starts with system messages
+    std::size_t prefixes = 0;
+    for (const auto& c : cases.as_array()) {
+        const auto& messages = c.find("messages")->as_array();
+        std::size_t lead = 0;
+        while (lead + 1U < messages.size() && messages[lead].find("role") && messages[lead].find("role")->as_string() == "system") ++lead;
+        if (lead == 0U) continue;
+        ChatTemplateInput input;
+        input.messages = *c.find("messages");
+        if (const auto* t = c.find("tools"); t && t->is_array()) input.tools = *t;
+        input.enable_thinking = c.find("thinking")->as_bool();
+        if (const auto* e = c.find("reasoning_effort"); e && e->is_string()) input.reasoning_effort = e->as_string();
+        if (c.find("preserve_thinking")->as_bool()) input.preserve_thinking = true;
+        ChatTemplateInput head = input;
+        Json system = Json::array();
+        for (std::size_t i = 0; i < lead; ++i) system.push(messages[i]);
+        head.messages = system;
+        head.add_generation_prompt = false;
+        const auto full = render_deepseek_v41_chat(input), part = render_deepseek_v41_chat(head);
+        check(full.compare(0, part.size(), part) == 0 && part.size() < full.size(), "system + tools rendered alone begin the conversation");
+        ++prefixes;
+    }
+    std::cout << "deepseek chat: " << prefixes << " stable prefixes checked\n";
 
     // output parsing
     const std::string dsml = "\xEF\xBD\x9C" "DSML\xEF\xBD\x9C";

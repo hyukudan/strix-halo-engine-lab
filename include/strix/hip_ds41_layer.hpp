@@ -1,5 +1,7 @@
 #pragma once
 
+namespace strix::dist { struct ProducerStage; }
+
 // Device side of the deepseek41 layer sites (gfx1151, wave32). Every kernel reproduces the host
 // reference of ds41_layer.hpp bitwise; rows are independent tokens of a decode window or a prefill
 // block. All pointers are device pointers; every call only enqueues on `stream`.
@@ -113,6 +115,10 @@ struct NormView {
     const float* rope_sin = nullptr;
     const std::uint32_t* positions = nullptr;
     std::uint32_t rope_offset = 0, pairs = 0;
+    // Optional FP16 copy of the normalised values (round to nearest, row stride f16_stride), for the approximate FP16
+    // prefill backend (STRIX_DS41_PREFILL_FP16_FAST); nullptr: none (every other output keeps its bits)
+    std::uint16_t* f16 = nullptr;
+    std::uint32_t f16_stride = 0;
 };
 void enqueue_norm(const NormView& view, void* stream);
 // Plain RMSNorm of rows x n (row stride `stride`), in place allowed.
@@ -182,6 +188,10 @@ struct Q8A8View {
 };
 inline constexpr std::uint32_t packed_native_fp8 = 8;
 void enqueue_q8_0_a8(const Q8A8View& view, void* stream);
+// Optional coherent producer epilogue. Returns false WITHOUT launching when the
+// selected kernel has no epilogue; the caller retains its ordinary fallback.
+// No output A8/accumulation: stage.data == view.out, tightly packed GPU output.
+[[nodiscard]] bool enqueue_q8_0_a8_ready(const Q8A8View& view, dist::ProducerStage stage, void* stream);
 // Two sites over the same activation rows in one launch (e.g. q_a and kv on the attention input), every output
 // the bits of enqueue_q8_0_a8 for its own view; two launches when the views do not share one kernel form.
 void enqueue_q8_0_a8_pair(const Q8A8View& a, const Q8A8View& b, void* stream);
@@ -227,6 +237,7 @@ struct Q8A8DensePrefillView {
     std::uint32_t out_stride = 0;
     std::uint32_t row_width = 0, k_offset = 0;  // K-split parts, as Q8A8View
     bool accumulate = false;
+    std::uint32_t tall = 0;  // tall form RT * 10 + OT, 1 auto (the same bits); 0: STRIX_DS41_DENSE_TALL (default off)
 };
 void enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& view, void* stream);
 // F16 projection (weight [count rows of width]): out[r * out_stride + o] = f16_row_dot(row first + o, x_r),

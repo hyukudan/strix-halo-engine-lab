@@ -54,6 +54,23 @@ std::vector<float> random_vector(std::mt19937& rng, std::size_t n, float scale) 
     for (auto& x : v) x = d(rng);
     return v;
 }
+bool sites_mode() {
+    const char* e = std::getenv("STRIX_BENCH_SITES");
+    return e && e[0] == '1';
+}
+
+std::vector<unsigned> tall_forms() {
+    std::vector<unsigned> forms;
+    if (const char* e = std::getenv("STRIX_BENCH_TALL"))
+        for (const char* q = e; *q != '\0';) {
+            char* end = nullptr;
+            forms.push_back(static_cast<unsigned>(std::strtoul(q, &end, 10)));
+            q = *end == ',' ? end + 1 : end;
+            if (end == q && *q != '\0') break;
+        }
+    return forms;
+}
+
 double time_ms(int iterations, const std::function<void()>& launch) {
     hipEvent_t a, b;
     check(hipEventCreate(&a), "event");
@@ -108,8 +125,9 @@ void projection(std::mt19937& rng, const Site& s, std::uint32_t T, int iteration
     auto* out = dev<float>(std::size_t{T} * outputs);
     const auto hc = down(codes, std::size_t{T} * in_row);
     const auto hd = down(deltas, std::size_t{T} * in_row / 32);
-    // Bitwise check of three rows against product_q8_0 (host).
-    auto exact_rows = [&] {
+    // Bitwise check of three rows against product_q8_0 (host); split: the two K-halves of attn_output_b summed as
+    // production sums them (q8_0_a8_split_rows: h0, then + h1).
+    auto exact_rows = [&](bool split = false) {
         const auto got = down(out, std::size_t{T} * outputs);
         bool exact = true;
         for (const std::uint32_t t : {0U, T / 2U + 1U, T - 1U}) {
@@ -118,7 +136,8 @@ void projection(std::mt19937& rng, const Site& s, std::uint32_t T, int iteration
             full.deltas.assign(hd.begin() + static_cast<std::ptrdiff_t>(std::size_t{t} * in_row / 32), hd.begin() + static_cast<std::ptrdiff_t>(std::size_t{t + 1} * in_row / 32));
             full.sums.assign(in_row / 32, 0);
             std::vector<float> ref(outputs);
-            q8_0_a8_rows(w.data(), s.width, 0, outputs, s.per_group, full, ref.data());
+            if (split) q8_0_a8_split_rows(w.data(), s.width, outputs, 2, full, ref.data());
+            else q8_0_a8_rows(w.data(), s.width, 0, outputs, s.per_group, full, ref.data());
             exact = exact && std::memcmp(ref.data(), got.data() + std::size_t{t} * outputs, outputs * 4) == 0;
         }
         return exact;
@@ -130,7 +149,7 @@ void projection(std::mt19937& rng, const Site& s, std::uint32_t T, int iteration
         std::fflush(stdout);
     };
     if (s.width <= 5120) {
-        DeviceRoutes routes(prefill_site_routes(T, s.groups, 32));
+        DeviceRoutes routes(prefill_site_routes(T, s.groups, sites_mode() ? 16U : 32U));
         Q8A8PrefillView v;
         v.weight = dw; v.width = s.width; v.groups = s.groups; v.per_group = s.per_group; v.routes = routes.view;
         v.codes = codes; v.deltas = deltas; v.out = out;
@@ -147,6 +166,42 @@ void projection(std::mt19937& rng, const Site& s, std::uint32_t T, int iteration
         enqueue_q8_0_a8_dense_prefill(v, nullptr);
         const bool exact = exact_rows();
         print("dense-wmma", time_ms(iterations, [&] { enqueue_q8_0_a8_dense_prefill(v, nullptr); }), exact);
+    }
+    // STRIX_BENCH_TALL=form,form,...: the dense kernel per form (0 = wide) as production calls it: one call per o-group
+    // (o_a), the two K-halves of attn_output_b (h0 into out, h1 accumulated), else one call
+    std::vector<float> first_out;
+    for (const unsigned form : tall_forms()) {
+        const bool halves = s.width > 5120;
+        const auto launch = [&] {
+            for (std::uint32_t g = 0; g < s.groups; ++g)
+                for (std::uint32_t part = 0; part < (halves ? 2U : 1U); ++part) {
+                    Q8A8DensePrefillView v;
+                    v.weight = dw + std::size_t{g} * s.per_group * (s.width / 32U) * 34U;
+                    v.width = halves ? s.width / 2U : s.width;
+                    v.row_width = halves ? s.width : 0U;
+                    v.k_offset = part * v.width;
+                    v.accumulate = part == 1U;
+                    v.count = s.per_group;
+                    v.codes = codes + g * s.width + part * v.width;
+                    v.deltas = deltas + (g * s.width + part * v.width) / 32U;
+                    v.rows = T;
+                    v.x_stride = in_row;
+                    v.out = out + g * s.per_group;
+                    v.out_stride = outputs;
+                    v.tall = form;
+                    enqueue_q8_0_a8_dense_prefill(v, nullptr);
+                }
+        };
+        check(hipMemset(out, 0, std::size_t{T} * outputs * 4), "memset");
+        launch();
+        // the three rows against the host, and every output bit for bit against the first form of the list
+        bool exact = exact_rows(halves);
+        auto all = down(out, std::size_t{T} * outputs);
+        if (first_out.empty()) first_out = std::move(all);
+        else exact = exact && std::memcmp(first_out.data(), all.data(), first_out.size() * 4) == 0;
+        char name[32];
+        std::snprintf(name, sizeof name, "dense-tall-%u", form);
+        print(name, time_ms(iterations, launch), exact);
     }
     (void)hipFree(dw); (void)hipFree(dx); (void)hipFree(codes); (void)hipFree(deltas); (void)hipFree(sums); (void)hipFree(out);
 }
@@ -256,6 +311,16 @@ int main(int argc, char** argv) {
         {"attn_output_a", 4096, 8, 1024},
         {"attn_output_b", 8192, 1, 5120},
     };
+    // STRIX_BENCH_SITES=1: the attention sites only, at the production rows of a rank (row split: q_a / kv up to 4096
+    // rows of an 8K prompt; q_b / o_a / o_b per chunk of at most chunk_rows = 1024; batch routes of 16 rows as the
+    // prefill builds them)
+    if (sites_mode()) {
+        for (const std::uint32_t T : {512U, 1024U, 2048U, 3072U, 4096U})
+            for (const auto& s : {sites[0], sites[1]}) projection(rng, s, T, iterations);
+        for (const std::uint32_t T : {256U, 512U, 1024U})
+            for (const auto& s : {sites[2], sites[3], sites[4]}) projection(rng, s, T, iterations);
+        return 0;
+    }
     for (const std::uint32_t T : {512U, 2048U})
         for (const auto& s : sites) projection(rng, s, T, iterations);
     for (const std::uint32_t T : {1U, 2U, 4U, 8U, 512U, 2048U}) per_row(rng, T, std::max(iterations, T <= 8U ? 50 : 1));

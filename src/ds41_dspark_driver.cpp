@@ -146,6 +146,15 @@ BatchWindowController::BatchWindowController(std::uint32_t slots) : slot_seen_(s
     if (slots == 0U) throw std::invalid_argument("BatchWindowController needs at least one slot");
 }
 
+void BatchWindowController::seed(const BinTable& seen, const BinTable& hits) {
+    for (std::uint32_t j = 0; j < block_size; ++j)
+        for (std::uint32_t b = 0; b < WindowController::bins; ++b) {
+            if (hits[j][b] > seen[j][b]) throw std::invalid_argument("BatchWindowController::seed: hits > seen");
+            seen_[j][b] += seen[j][b];
+            hits_[j][b] += hits[j][b];
+        }
+}
+
 void BatchWindowController::reset(std::uint32_t slot) {
     slot_seen_.at(slot).fill(0U);
     slot_hits_.at(slot).fill(0U);
@@ -309,7 +318,16 @@ std::vector<std::uint32_t> BatchWindowController::choose_rows(std::span<const st
         ++drafting;
         double survival = 1.0, e = 1.0;
         for (std::uint32_t R = 2; R <= lim[i]; ++R) {
-            survival *= probability(R - 2U, drafts[i].confidence[R - 2U]);
+            const double pooled = probability(R - 2U, drafts[i].confidence[R - 2U]);
+            if (request_weight_ > 0.0) {
+                // the request's own rate at this depth, its count capped at 8: the confidence-based estimate keeps at
+                // least w / (8 + w) of the weight in long requests (its evidence ignores confidence)
+                const double seen = slot_seen_.at(slots[i])[R - 2U], hits = slot_hits_.at(slots[i])[R - 2U];
+                const double k = seen > 8.0 ? 8.0 / seen : 1.0;
+                survival *= (k * hits + request_weight_ * pooled) / (k * seen + request_weight_);
+            } else {
+                survival *= pooled;
+            }
             e += survival;
             expected[i].push_back(e);
         }

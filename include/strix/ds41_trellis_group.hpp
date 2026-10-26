@@ -2,8 +2,8 @@
 
 // Grouped trellis linears with column-strided input and output (identity ds41-trellis-k5-v1, o_a section):
 //   y[r][g N + n] = Linear_g(x[r][g I + i])   for r < rows, g < groups (every group: I inputs, N outputs, same K),
-// the wo_a groups of one layer (I 4096, N 1024; 4 per TP rank, 8 in one process). Default off: STRIX_DS41_TRELLIS_OA_GROUP
-// (unset / 0 = the per-group enqueue_trellis_linear calls of the attention hook; 1 = this runner; 2 = this runner with the
+// the wo_a groups of one layer (I 4096, N 1024; 4 per TP rank, 8 in one process). Default on: STRIX_DS41_TRELLIS_OA_GROUP
+// (0 = the per-group enqueue_trellis_linear calls of the attention hook; unset / 1 = this runner; 2 = this runner with the
 // groups' library calls on concurrent streams). Every row gets the bits of the per-group path: the same library calls
 // (same row count m per chunk, trellis_padded_rows, padding rows = copies of the chunk's last row), only the staging
 // changes:
@@ -26,7 +26,7 @@
 
 namespace strix::ds41 {
 
-// STRIX_DS41_TRELLIS_OA_GROUP: 0 (unset) / 1 / 2, see above. Throws on another value.
+// STRIX_DS41_TRELLIS_OA_GROUP: 0 / 1 (unset) / 2, see above. Throws on another value.
 [[nodiscard]] int trellis_oa_group_mode();
 
 class TrellisGroupRunner {

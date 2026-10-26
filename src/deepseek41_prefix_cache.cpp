@@ -454,6 +454,21 @@ PrefixNamespace prefix_namespace_from_env(bool expert_tp_decode) {
     const auto ep_map = env_or("STRIX_DS41_EP_MAP");
     t += "ep_map=" + (ep_map.empty() ? std::string("-") : path_digest(ep_map)) + ";";
     t += "prefill=ep;";
+    // Approximate prefill states must never alias the incumbent namespace.
+    if (env_or("STRIX_DS41_PREFILL_BF16_ATTN") == "1") t += "prefill_attention=bf16-hilo-v1;";
+    if (env_or("STRIX_DS41_PREFILL_FP16_DENSE") == "1") {
+        const auto picks = env_or("STRIX_DS41_FP16_CACHE");
+        if (picks.empty() || env_or("STRIX_DS41_FP16_CACHE_READONLY") != "1")
+            throw std::invalid_argument("FP16 prefill prefix cache requires a frozen solution cache (STRIX_DS41_FP16_CACHE_READONLY=1)");
+        t += "prefill_dense=fp16-lt-v1:" + path_digest(picks) + ";";
+    }
+    // every knob that changes an approximate prefill's arithmetic (unset in the exact default: no change to its namespace)
+    if (env_or("STRIX_DS41_PREFILL_BF16_ATTN") == "1" || env_or("STRIX_DS41_PREFILL_FP16_DENSE") == "1")
+        for (const char* k : {"STRIX_DS41_PREFILL_APPROX_LAYERS", "STRIX_DS41_BF16_ATTN_VARIANT", "STRIX_DS41_PREFILL_FP16_PROJ",
+                              "STRIX_DS41_PREFILL_FP16_MIN_ROWS", "STRIX_DS41_PREFILL_FP16_A8", "STRIX_DS41_PREFILL_FP16_FAST",
+                              "STRIX_DS41_PREFILL_FP16_WSPLIT"})
+            t += std::string(k + 11) + "=" + env_or(k) + ";";
+
     t += std::string("decode=") + (expert_tp_decode ? "ds41-expert-tp2-i1152-v1" : "ep") + ";";
     const auto* b = reinterpret_cast<const std::byte*>(t.data());
     PrefixNamespace ns;
@@ -508,6 +523,43 @@ std::vector<std::uint32_t> plan_prefill_pieces(std::uint32_t resume, std::uint32
         }
         out.push_back(e);
         at = e;
+    }
+    return out;
+}
+
+PrefillRunPlan plan_prefill_runs(std::uint32_t resume, std::uint32_t shared, std::uint32_t total, std::uint32_t block,
+                                 std::uint32_t max_rows, std::uint32_t min_rows, bool before_tail, std::uint32_t reach, std::uint32_t extra) {
+    if (block == 0U || block % 8U != 0U || max_rows < 8U) throw std::invalid_argument("plan_prefill_runs: block a multiple of 8, max_rows >= 8");
+    if (resume > total) throw std::invalid_argument("plan_prefill_runs: resume beyond the prompt");
+    min_rows = std::max<std::uint32_t>(min_rows, 1U);
+    if (min_rows > max_rows / 2U) throw std::invalid_argument("plan_prefill_runs: min_rows > max_rows / 2");
+    PrefillRunPlan out;
+    if (resume == total) return out;
+    // the runs: max_rows steps from resume (plan_prefill_pieces' split), then total
+    const std::uint32_t step = max_rows >= block ? max_rows / block * block : max_rows / 8U * 8U;
+    for (std::uint32_t at = resume; total - at > max_rows;) {
+        at = total - (at + step) >= min_rows ? at + step : (total - min_rows) / 8U * 8U;
+        out.ends.push_back(at);
+    }
+    out.ends.push_back(total);
+    // the cache's boundaries (plan_prefill_pieces): inside a run, a snapshot point
+    std::uint32_t last_full = total / block * block;
+    if (total - last_full != 0U && total - last_full < min_rows) last_full = last_full >= block ? last_full - block : 0U;
+    std::vector<std::uint32_t> cuts;
+    if (shared > resume && shared < last_full) cuts.push_back(shared);
+    if (last_full > resume && last_full < total) cuts.push_back(last_full);
+    if (before_tail && last_full >= block && last_full - block > resume) cuts.push_back(last_full - block);
+    if (const auto e = extra / block * block; e > resume && e + min_rows <= total) cuts.push_back(e);
+    std::sort(cuts.begin(), cuts.end());
+    cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+    for (const auto p : cuts)
+        if (!std::binary_search(out.ends.begin(), out.ends.end(), p)) out.points.push_back(p);
+    if (reach != 0U) {  // far points split their run (latest first: a split moves the end of the points before it)
+        for (auto it = out.points.rbegin(); it != out.points.rend(); ++it) {
+            const auto end = *std::upper_bound(out.ends.begin(), out.ends.end(), *it);
+            if (end - *it > reach) out.ends.insert(std::upper_bound(out.ends.begin(), out.ends.end(), *it), *it);
+        }
+        std::erase_if(out.points, [&](std::uint32_t p) { return std::binary_search(out.ends.begin(), out.ends.end(), p); });
     }
     return out;
 }
@@ -603,7 +655,8 @@ PrefixLookup PrefixCache::lookup(std::span<const std::uint32_t> tokens, std::uin
         const std::size_t left = tokens.size() - out.shared;
         const bool ram_snap = n != nullptr && n->snapshot;
         const bool disk_snap = d != nullptr && d->snapshot;
-        if ((ram_snap || disk_snap) && (left == 0U || left >= min_rows)) {
+        const bool whole = left == 0U && (ram_snap || disk_snap) && (ram_snap ? n->snapshot->next_token : d->next_token) != kPrefixUnknownNextToken;
+        if ((ram_snap || disk_snap) && (whole || left >= min_rows)) {
             out.resume = out.shared;
             out.key = key;
             out.next_token = ram_snap ? n->snapshot->next_token : d->next_token;

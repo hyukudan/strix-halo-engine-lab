@@ -53,7 +53,9 @@ void identities() {
     expect_eq(d::trellis_config_identity(k5, {"head", "shexp"}, false), "ds41-trellis-k5-v1:shexp,head", "K5 shexp,head (fixed order)");
     expect_eq(d::trellis_config_identity(k5, {"shexp", "head"}, true), "ds41-trellis-k5-v1:shexp,head:shexp-tp", "K5 shexp-tp");
     expect_eq(d::trellis_config_identity(k5, {"head"}, true), "ds41-trellis-k5-v1:head", "shexp-tp without shexp: no suffix");
-    expect_eq(d::trellis_config_identity(k5, {"q_a", "kv"}, false), "", "q_a / kv have no engine hook");
+    expect_eq(d::trellis_config_identity(k5, {"q_a", "kv"}, false), "", "no prepared q_a / kv weights");
+    expect_eq(d::trellis_config_identity({{"q_a", 4}, {"kv", 4}}, {"q_a", "kv"}, false),
+              "ds41-trellis-k4-v1:q_a,kv", "prepared q_a / kv are announced");
     expect_eq(d::trellis_config_identity(k5, {}, false), "", "no class");
 
     // mix-B: every dense class K4, head K5
@@ -94,10 +96,32 @@ void namespace_without_trellis() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     site_bytes();
     identities();
     namespace_without_trellis();
+    if (argc == 2) {  // Optional CPU-only check against actual pack headers and manifests.
+        const auto env = [](const char* key, const char* value) {
+#if defined(_WIN32)
+            _putenv_s(key, value);
+#else
+            setenv(key, value, 1);
+#endif
+        };
+        env("STRIX_DS41_TRELLIS_MIX", argv[1]);
+        env("STRIX_DS41_TRELLIS_SITES", "all");
+        env("STRIX_DS41_TRELLIS_DENSE_FULL", "0");
+        const auto original = strix::ds41::trellis_weights_namespace();
+        env("STRIX_DS41_TRELLIS_DENSE_FULL", "1");
+        const auto full = strix::ds41::trellis_weights_namespace();
+        expect(full != original, "complete dense routes cannot reuse original cache namespace");
+        expect(full.find("q_a=K4") != std::string::npos && full.find("kv=K4") != std::string::npos,
+               "complete mix-B namespace identifies q_a and kv");
+        env("STRIX_DS41_TRELLIS_QAKV_PAIR", "1");
+        expect_eq(strix::ds41::trellis_weights_namespace(), full, "exact pair keeps full namespace");
+        env("STRIX_DS41_TRELLIS_DENSE_FULL", "0");
+        expect_eq(strix::ds41::trellis_weights_namespace(), original, "default route namespace preserved");
+    }
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

@@ -5,6 +5,7 @@
 // where the activations are read from change.
 
 #include "strix/hip_ds41_rn_wide.hpp"
+#include "strix/dist/staged_ready.hpp"
 
 #include "strix/ds41_formats.hpp"
 
@@ -113,7 +114,7 @@ __device__ __forceinline__ int rn_dot32(const int (&q)[8], const int4& x0, const
 // R rows (exact), W outputs per wave, Waves waves per block (Waves * W outputs, all in one group), P the
 // weight format, Lds: the block's R activation rows staged in LDS (else read in place).
 template <unsigned R, unsigned W, unsigned Waves, unsigned P, bool Lds>
-__global__ __launch_bounds__(wave * Waves) void rn_kernel(Q8A8View v, const std::int8_t* __restrict__ codes,
+__device__ __forceinline__ void rn_body(Q8A8View v, const std::int8_t* __restrict__ codes,
                                                           const float* __restrict__ deltas, float* __restrict__ out) {
     extern __shared__ int4 rn_lds[];
     const unsigned w_id = threadIdx.x / wave, l = threadIdx.x % wave;
@@ -196,6 +197,18 @@ __global__ __launch_bounds__(wave * Waves) void rn_kernel(Q8A8View v, const std:
                 *y = v.accumulate ? *y + total : total;
             }
         }
+}
+
+template <unsigned R, unsigned W, unsigned Waves, unsigned P, bool Lds>
+__global__ __launch_bounds__(wave * Waves) void rn_kernel(Q8A8View v, const std::int8_t* __restrict__ codes,
+                                                        const float* __restrict__ deltas, float* __restrict__ out) {
+    rn_body<R, W, Waves, P, Lds>(v, codes, deltas, out);
+}
+template <unsigned R, unsigned P>
+__global__ __launch_bounds__(wave * 16) void rn_ready_kernel(Q8A8View v, dist::ProducerStage stage) {
+    // Production o_b uses W=1, Waves=16, LDS. Keep that exact body and grid.
+    rn_body<R, 1, 16, P, true>(v, v.codes, v.deltas, v.out);
+    dist::publish_staged_view(stage, gridDim.x);
 }
 
 // Flat form for widths whose group count is not a multiple of 32 (attn_q_b: 1,280 values = 40 groups, so lanes 8-31
@@ -697,6 +710,41 @@ void enqueue_q8_0_a8_rn(const Q8A8View& v, const RnWideShape& shape, void* strea
     else ok = rn_dispatch_rows<6>(view, shape, q);
     require(ok, "Q8_0 x A8 rn: shape not registered for this format");
     check(hipGetLastError(), "Q8_0 x A8 rn launch");
+}
+
+namespace {
+template <unsigned R, unsigned P>
+void rn_ready_launch(const Q8A8View& v, dist::ProducerStage stage, hipStream_t q) {
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(rn_ready_kernel<R, P>), dim3((v.count + 15U) / 16U), dim3(wave * 16),
+                       rn_lds_bytes(R, v.width, true), q, v, stage);
+}
+template <unsigned P>
+void rn_ready_rows(const Q8A8View& v, dist::ProducerStage stage, hipStream_t q) {
+    switch (v.rows) {
+    case 1: rn_ready_launch<1, P>(v, stage, q); break;
+    case 2: rn_ready_launch<2, P>(v, stage, q); break;
+    case 3: rn_ready_launch<3, P>(v, stage, q); break;
+    case 4: rn_ready_launch<4, P>(v, stage, q); break;
+    case 5: rn_ready_launch<5, P>(v, stage, q); break;
+    case 6: rn_ready_launch<6, P>(v, stage, q); break;
+    case 7: rn_ready_launch<7, P>(v, stage, q); break;
+    case 8: rn_ready_launch<8, P>(v, stage, q); break;
+    }
+}
+}
+
+bool enqueue_q8_0_a8_rn_ready(const Q8A8View& v, const RnWideShape& shape, dist::ProducerStage stage, void* stream) {
+    if (shape.form || shape.flat || !shape.lds || shape.outputs_per_wave != 1U || shape.waves != 16U ||
+        !rn_wide_supported(v, shape)) return false;
+    require(stage.data == v.out && stage.flag && stage.token && !v.a8_codes && !v.accumulate && v.out_stride == v.count,
+            "Q8 x A8 RN ready producer view");
+    const auto q = static_cast<hipStream_t>(stream);
+    if (v.packed == 0U) rn_ready_rows<0>(v, stage, q);
+    else if (v.packed == 4U) rn_ready_rows<4>(v, stage, q);
+    else if (v.packed == 5U) rn_ready_rows<5>(v, stage, q);
+    else rn_ready_rows<6>(v, stage, q);
+    check(hipGetLastError(), "Q8 x A8 RN ready epilogue launch");
+    return true;
 }
 
 } // namespace strix::ds41

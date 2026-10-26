@@ -72,7 +72,11 @@ GpuQueueIo open_linux_gpu_queue(const std::string& path, std::function<void()> p
     return {owner, [owner](unsigned long command, void* argument) {
         owner->current(); errno = 0; const int result = ::ioctl(owner->fd, command, argument);
         const int error = result < 0 ? errno : 0; owner->current(); return GpuQueueSyscall{result, error};
-    }, [owner] { owner->current(); }, [owner] { owner->current(); return owner->fd; }};
+    }, [owner] { owner->current(); }, [owner] { owner->current(); return owner->fd; },
+    [owner](unsigned long command, void* argument) {
+        owner->preflight(); errno = 0; const int result = ::ioctl(owner->fd, command, argument);
+        return GpuQueueSyscall{result, result < 0 ? errno : 0};
+    }};
 #else
     static_cast<void>(path); static_cast<void>(preflight);
     throw std::runtime_error("GPU queue requires Linux");
@@ -105,13 +109,27 @@ struct LinuxGpuQueue::Impl {
     GpuQueueSyscall raw(unsigned long command, void* argument) {
         current(false); const auto result = io.ioctl_call(command, argument); current(false); return result;
     }
-    void checked(unsigned long command, void* argument) {
-        const auto result = raw(command, argument);
+    // Hot operations between session transitions: lean skips the FD/pool metadata syscalls, never the
+    // failed state, operation identity or reply checks.
+    void hot() {
+        if (!expected.lean) { current(); return; }
+        if (failed) malformed("GPU queue is failed; only bounded cleanup/recovery is allowed");
+    }
+    GpuQueueSyscall hot_raw(unsigned long command, void* argument) {
+        return expected.lean ? io.ioctl_owned(command, argument) : raw(command, argument);
+    }
+    bool outstanding() const {
+        for (const auto& direction : operations)
+            for (const auto& candidate : direction) if (candidate && candidate->submitted && !candidate->complete) return true;
+        return false;
+    }
+    void checked(unsigned long command, void* argument, bool hot_path = false) {
+        const auto result = hot_path ? hot_raw(command, argument) : raw(command, argument);
         if (result.result != 0 || result.error != 0)
             throw std::system_error(result.error ? result.error : EIO, std::generic_category(), "GPU queue ioctl");
     }
     Entry& entry(const GpuQueueOperation& operation) {
-        current();
+        hot();
         if (!imported || operation.direction > 1 || operation.slot >= expected.depth)
             throw std::invalid_argument("GPU queue operation direction/slot is foreign");
         auto& candidate = operations[operation.direction][operation.slot];
@@ -120,10 +138,10 @@ struct LinuxGpuQueue::Impl {
             throw std::invalid_argument("GPU queue operation identity is stale or foreign");
         return *candidate;
     }
-    sgu_action action(unsigned long command, const GpuQueueOperation* operation = nullptr) {
+    sgu_action action(unsigned long command, const GpuQueueOperation* operation = nullptr, bool hot_path = false) {
         sgu_action value{}; value.fence = fence;
         if (operation) { value.handle = operation->handle; value.sequence = operation->sequence; value.direction = operation->direction; }
-        checked(command, &value);
+        checked(command, &value, hot_path);
         if (value.reserved || value.handle != (operation ? operation->handle : 0) ||
             value.sequence != (operation ? operation->sequence : 0) || value.direction != (operation ? operation->direction : 0))
             malformed("GPU queue action returned foreign operation identity");
@@ -138,7 +156,7 @@ LinuxGpuQueue::LinuxGpuQueue(GpuQueueIo io, GpuQueueExpected expected)
     : impl_(std::make_unique<Impl>(std::move(io), expected)) {
     auto& i = *impl_;
     if (!i.io.lifetime || !i.io.ioctl_call || !i.io.require_current || expected.depth < 2 || expected.depth > SGU_MAX_QUEUE_DEPTH ||
-        (expected.terminal != GpuQueueTerminal::application && expected.terminal != GpuQueueTerminal::kernel_header) ||
+        (expected.terminal != GpuQueueTerminal::application && expected.terminal != GpuQueueTerminal::kernel_header) || (expected.lean && !i.io.ioctl_owned) ||
         expected.ring_frames < 32 || expected.ring_frames > SGU_MAX_FRAMES || !nonzero(expected.local) || !nonzero(expected.peer) || expected.local == expected.peer)
         throw std::invalid_argument("GPU queue requires complete identity and bounded multi-slot geometry");
     i.observed.fence.abi_major = SGU_ABI_MAJOR; i.observed.fence.abi_minor = SGU_ABI_MINOR;
@@ -213,7 +231,7 @@ void LinuxGpuQueue::arm() {
 }
 GpuQueueOperation LinuxGpuQueue::prepare(std::uint32_t direction, std::uint32_t slot, std::uint64_t sequence,
     std::uint64_t bytes, std::uint32_t terminal_bytes) {
-    auto& i = *impl_; i.current();
+    auto& i = *impl_; i.hot();
     if (!i.armed || i.stopped || direction > 1 || slot >= depth() || !bytes || bytes > i.capacity || !terminal_bytes || terminal_bytes > SGU_FRAME_BYTES ||
         (required_terminal_bytes() && terminal_bytes != required_terminal_bytes()) ||
         !sequence || sequence <= i.prepared_sequence[direction] || i.operations[direction][slot] || i.last_handle == UINT64_MAX)
@@ -229,7 +247,7 @@ GpuQueueOperation LinuxGpuQueue::prepare(std::uint32_t direction, std::uint32_t 
     // blindly replayed and no slot becomes reusable on an ambiguous result.
     auto& entry = i.operations[direction][slot]; entry.emplace(); entry->operation = operation;
     entry->frames = static_cast<std::uint32_t>((bytes + SGU_FRAME_BYTES - 1) / SGU_FRAME_BYTES) + 1;
-    try { i.checked(SGU_IOC_PREPARE_SLOT, &value); i.prepared_sequence[direction] = sequence; return operation; }
+    try { i.checked(SGU_IOC_PREPARE_SLOT, &value, true); i.prepared_sequence[direction] = sequence; return operation; }
     catch (...) { i.failed = true; throw; }
 }
 void LinuxGpuQueue::gpu_produced(const GpuQueueOperation& operation) {
@@ -248,7 +266,7 @@ bool LinuxGpuQueue::submit(const GpuQueueOperation& operation) {
             throw std::logic_error("GPU queue SUBMIT would strand an earlier prepared sequence");
     sgu_action value{}; value.fence = i.fence; value.handle = operation.handle; value.sequence = operation.sequence; value.direction = operation.direction;
     try {
-        const auto result = i.raw(SGU_IOC_SUBMIT, &value);
+        const auto result = i.hot_raw(SGU_IOC_SUBMIT, &value);
         if (result.result < 0 && result.error == EAGAIN) {
             if (!equal_fence(value.fence, i.fence) || value.handle != operation.handle || value.sequence != operation.sequence ||
                 value.direction != operation.direction || value.result || value.queued_frames || value.reserved)
@@ -263,11 +281,13 @@ bool LinuxGpuQueue::submit(const GpuQueueOperation& operation) {
     } catch (...) { i.failed = true; throw; }
 }
 std::optional<GpuQueueCompletion> LinuxGpuQueue::poll() {
-    auto& i = *impl_; i.current();
+    auto& i = *impl_; i.hot();
     if (!i.imported || !i.armed || i.stopped) throw std::logic_error("GPU queue EVENT requires an armed import");
+    // Nothing submitted is incomplete: a valid EVENT cannot exist, so lean does not ask the kernel.
+    if (i.expected.lean && !i.outstanding()) return std::nullopt;
     sgu_event event{}; event.fence = i.fence;
     try {
-        const auto result = i.raw(SGU_IOC_EVENT, &event);
+        const auto result = i.hot_raw(SGU_IOC_EVENT, &event);
         if (result.result < 0 && (result.error == EAGAIN || result.error == EINTR)) return std::nullopt;
         if (result.result != 0 || result.error) throw std::system_error(result.error ? result.error : EIO, std::generic_category(), "GPU queue EVENT");
         if (equal_fence(event.fence, i.fence) && event.status == SGU_EVENT_FAILED && event.count <= SGU_EVENT_BATCH) {
@@ -317,7 +337,7 @@ void LinuxGpuQueue::peer_consumed(const GpuQueueOperation& operation) {
 void LinuxGpuQueue::retire(const GpuQueueOperation& operation) {
     auto& i = *impl_; const auto& entry = i.entry(operation);
     if (!entry.complete || !entry.consumed) throw std::logic_error("GPU queue RETIRE requires controller and consumer ownership completion");
-    try { const auto value = i.action(SGU_IOC_RETIRE, &operation); if (value.result || value.queued_frames) malformed("GPU queue RETIRE acknowledgment is invalid"); i.operations[operation.direction][operation.slot].reset(); }
+    try { const auto value = i.action(SGU_IOC_RETIRE, &operation, true); if (value.result || value.queued_frames) malformed("GPU queue RETIRE acknowledgment is invalid"); i.operations[operation.direction][operation.slot].reset(); }
     catch (...) { i.failed = true; throw; }
 }
 sgu_stats LinuxGpuQueue::stats() {

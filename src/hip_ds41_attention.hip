@@ -1,3 +1,4 @@
+#include "strix/ds41_prefill_tuning.hpp"
 // gfx1151 kernels of the deepseek41 decode attention. The arithmetic of each kernel is its host reference in
 // src/ds41_attention.cpp (same chains, same xor butterflies, same scalar helpers), so results match bit for bit.
 #include "strix/hip_ds41_attention.hpp"
@@ -73,27 +74,30 @@ __device__ __forceinline__ void rope512(float (&x)[16], const RopeRow& rope, uns
     }
 }
 
-__device__ __forceinline__ void window_write_body(const WindowView& v, const uint3 bid) {
-    DS41_TIMED(0U);
-    const unsigned r = bid.x, lane = threadIdx.x;
+// One wave: the ring entry of one kv row (lane: dims 16 lane .. +15, its 16 code bytes and, even lanes, the scale byte).
+__device__ __forceinline__ void window_entry(const float* kv, const float* norm, const RopeRow& rope, unsigned lane, std::uint8_t* entry) {
     float x[16];
 #pragma unroll
-    for (unsigned i = 0; i < 16; ++i) x[i] = v.kv[r * kHeadDim + 16 * lane + i];
-    norm512(x, v.norm, lane);
-    rope512(x, v.rope[r], lane, false);
+    for (unsigned i = 0; i < 16; ++i) x[i] = kv[16 * lane + i];
+    norm512(x, norm, lane);
+    rope512(x, rope, lane, false);
     float amax = 0.0F;
 #pragma unroll
     for (unsigned i = 0; i < 16; ++i) amax = fmaxf(amax, fabsf(x[i]));
     amax = fmaxf(fmaxf(amax, __shfl_xor(amax, 1, 32)), 1e-4F);
     const int e = log2_ceil(amax * (1.0F / 448.0F));
     const float s = pow2f(e);
-    std::uint8_t* entry = v.ring + (v.pos[r] % v.capacity) * kWindowEntryBytes;
     std::uint32_t w[4] = {0, 0, 0, 0};
 #pragma unroll
     for (unsigned i = 0; i < 16; ++i)
         w[i / 4] |= static_cast<std::uint32_t>(e4m3_encode(clampf(x[i] / s, -448.0F, 448.0F))) << (8U * (i % 4));
     *reinterpret_cast<uint4*>(entry + 16 * lane) = make_uint4(w[0], w[1], w[2], w[3]);
     if ((lane & 1U) == 0U) entry[512 + lane / 2] = static_cast<std::uint8_t>(e + 127);
+}
+__device__ __forceinline__ void window_write_body(const WindowView& v, const uint3 bid) {
+    DS41_TIMED(0U);
+    const unsigned r = bid.x;
+    window_entry(v.kv + r * kHeadDim, v.norm, v.rope[r], threadIdx.x, v.ring + (v.pos[r] % v.capacity) * kWindowEntryBytes);
 }
 
 // Ahead (STRIX_DS41_COMPRESS_AHEAD=1, default off): thread tid's index key row of wk is read kAheadSteps steps of 64
@@ -389,12 +393,24 @@ __device__ __forceinline__ void index_qprep_body(const IndexView& v, const uint3
 // rows' quantised queries are wave-uniform and no global store precedes their reads, so they come in with scalar
 // loads (the dot products take them as scalar operands); scores wait in LDS and are stored after every kMaxRows rows
 // (calls of up to kMaxCallRows rows: the key is still decoded once).
+// With IndexView::candidates (a candidate user) position t is scored for row r only if its block is one of the row's
+// candidates, and its key is read only if some row scores it; every other score stays unwritten (select never reads it).
 __device__ __forceinline__ void index_scores_body(const IndexView& v, const uint3 bid) {
     DS41_TIMED(3U);
     __shared__ float out_s[kMaxRows][256];
     const unsigned tid = threadIdx.x;
     const std::uint64_t t = static_cast<std::uint64_t>(bid.x) * 256U + tid;
     if (t >= v.max_count) return;
+    const std::uint8_t* cand = v.candidates;
+    const std::size_t cand_stride = cand != nullptr ? (v.max_count + v.block_size - 1U) / v.block_size : 0U;
+    const auto wanted = [&](unsigned r) {
+        return t < (v.pos[r] + 1U) / v.ratio && (cand == nullptr || cand[r * cand_stride + t / v.block_size] != 0U);
+    };
+    if (cand != nullptr) {
+        bool any = false;
+        for (unsigned r = 0; r < v.rows && !any; ++r) any = wanted(r);
+        if (!any) return;
+    }
     const QPrep* prep = static_cast<const QPrep*>(v.qprep);
     const std::uint32_t* e = reinterpret_cast<const std::uint32_t*>(v.idx_cache + t * kIdxEntryBytes);
     int kv8[32];
@@ -413,6 +429,7 @@ __device__ __forceinline__ void index_scores_body(const IndexView& v, const uint
         const unsigned nr = v.rows - r0 < kMaxRows ? v.rows - r0 : kMaxRows;
 #pragma unroll 1
         for (unsigned rr = 0; rr < nr; ++rr) {
+            if (cand != nullptr && !wanted(r0 + rr)) continue;
             const QPrep& q = prep[r0 + rr];
             float score = 0.0F;
 #pragma unroll 2
@@ -432,7 +449,7 @@ __device__ __forceinline__ void index_scores_body(const IndexView& v, const uint
         }
         for (unsigned rr = 0; rr < nr; ++rr) {
             const unsigned r = r0 + rr;
-            if (t < (v.pos[r] + 1U) / v.ratio) v.scores[r * v.max_count + t] = out_s[rr][tid];
+            if (cand != nullptr ? wanted(r) : t < (v.pos[r] + 1U) / v.ratio) v.scores[r * v.max_count + t] = out_s[rr][tid];
         }
     }
 }
@@ -531,10 +548,7 @@ __device__ void ordered_select(const std::uint32_t* keys, std::uint32_t n, std::
     }
 }
 
-__device__ __forceinline__ void select_body(const SelectView& v, const uint3 bid) {
-    DS41_TIMED(4U);
-    __shared__ unsigned hist[kSelWaves][256];
-    __shared__ unsigned warp_tot[33];
+__device__ __forceinline__ void select_core(const SelectView& v, const uint3 bid, unsigned (*hist)[256], unsigned* warp_tot) {
     const unsigned r = bid.x;
     const std::uint32_t n = static_cast<std::uint32_t>((v.pos[r] + 1U) / v.ratio);
     const float* scores = v.scores + static_cast<std::size_t>(r) * v.max_count;
@@ -575,7 +589,12 @@ __device__ __forceinline__ void select_body(const SelectView& v, const uint3 bid
     ordered_select(keys, n, thr, need, warp_tot, [&](std::uint32_t t, bool s, unsigned out) { if (s) idx[out] = t; });
     if (threadIdx.x == 0U) v.idx_count[r] = v.topk;
 }
-
+__device__ __forceinline__ void select_body(const SelectView& v, const uint3 bid) {
+    DS41_TIMED(4U);
+    __shared__ unsigned hist[kSelWaves][256];
+    __shared__ unsigned warp_tot[33];
+    select_core(v, bid, hist, warp_tot);
+}
 // Two-level selection for long rows (max_count > kSelSlice). Level one, one block per slice of 4096 positions: the
 // slice's keys in LDS, its own top-k (same rule: key, then the smaller position) written in position order and
 // padded to k with key 0 (below every float's key); for the candidate source also the slice's block maxima. Every
@@ -588,6 +607,48 @@ __device__ __forceinline__ SelScratch sel_scratch(const SelectView& v, unsigned 
     const unsigned slices = (v.max_count + kSelSlice - 1) / kSelSlice;
     std::uint32_t* base = v.keys + static_cast<std::size_t>(r) * v.max_count;
     return {base, base + static_cast<std::size_t>(slices) * v.topk, base + 2 * static_cast<std::size_t>(slices) * v.topk, slices};
+}
+// SelectView::compact (candidate user, STRIX_DS41_IDX_CAND_FILTER): the slice keeps only its candidate positions' keys,
+// in position order, and selects among them (padded with key 0 to k, as a short slice). Today's slice holds the key of
+// -inf at every other position. If every candidate key of the row is above -inf's and the row has more than k candidate
+// positions, the row's top-k are candidates only, every one of them is in its slice's candidate top-k, and the merge
+// over the survivors (keys, then positions in order) gives today's result. The slice records its candidate count and
+// whether a candidate key is at or below -inf's (in the block-maximum scratch, unused by users); the merge checks both and
+// otherwise runs today's one-block selection over the whole row.
+__device__ void select_slice_compact(const SelectView& v, unsigned s, std::uint32_t n, std::uint32_t t0, std::uint32_t m,
+    const float* scores, const std::uint8_t* cand, const SelScratch& sc, std::uint32_t* skeys, unsigned (*hist)[256], unsigned* warp_tot) {
+    __shared__ std::uint32_t boff[kSelSlice / 8U];
+    const std::uint32_t bs = v.block_size, b0 = t0 / bs, nsb = (m + bs - 1) / bs, ninf_key = order_key(-__builtin_inff());
+    const std::uint32_t b = b0 + threadIdx.x;
+    const unsigned len = threadIdx.x < nsb && cand[b] != 0U ? (n - b * bs < bs ? n - b * bs : bs) : 0U;
+    unsigned ms;
+    const unsigned off = block_exclusive_scan(len, warp_tot, ms);
+    if (threadIdx.x < nsb) boff[threadIdx.x] = off;
+    bool bad = false;
+    for (unsigned j = 0; j < len; ++j) {
+        const std::uint32_t key = order_key(scores[b * bs + j]);
+        skeys[off + j] = key;
+        bad = bad || key <= ninf_key;
+    }
+    bad = __syncthreads_or(bad ? 1 : 0) != 0;
+    if (threadIdx.x == 0U) { sc.bmax[2U * s] = ms; sc.bmax[2U * s + 1U] = bad ? 1U : 0U; }
+    if (n <= v.topk) return;
+    const auto position = [&](std::uint32_t i) {   // the slice block holding compacted index i: the last with boff <= i
+        std::uint32_t lo = 0, hi = nsb;
+        while (hi - lo > 1U) { const std::uint32_t mid = (lo + hi) / 2U; if (boff[mid] <= i) lo = mid; else hi = mid; }
+        return (b0 + lo) * bs + (i - boff[lo]);
+    };
+    std::uint32_t* ok = sc.keys + static_cast<std::size_t>(s) * v.topk;
+    std::uint32_t* op = sc.pos + static_cast<std::size_t>(s) * v.topk;
+    if (ms <= v.topk) {
+        for (std::uint32_t i = threadIdx.x; i < v.topk; i += kSelThreads) { ok[i] = i < ms ? skeys[i] : 0U; op[i] = i < ms ? position(i) : t0; }
+        return;
+    }
+    std::uint32_t thr, need;
+    radix_threshold(skeys, ms, v.topk, hist, thr, need);
+    ordered_select(skeys, ms, thr, need, warp_tot, [&](std::uint32_t i, bool sel, unsigned out) {
+        if (sel) { ok[out] = skeys[i]; op[out] = position(i); }
+    });
 }
 __device__ __forceinline__ void select_slice_body(const SelectView& v, const uint3 bid) {
     DS41_TIMED(4U);
@@ -602,6 +663,10 @@ __device__ __forceinline__ void select_slice_body(const SelectView& v, const uin
     const std::uint8_t* cand = v.candidates + static_cast<std::size_t>(r) * ((v.max_count + v.block_size - 1) / v.block_size);
     const SelScratch sc = sel_scratch(v, r);
     const float ninf = -__builtin_inff();
+    if (v.compact && v.pool == Pool::candidate_user) {
+        select_slice_compact(v, s, n, t0, m, scores, cand, sc, skeys, hist, warp_tot);
+        return;
+    }
     for (std::uint32_t i = threadIdx.x; i < m; i += kSelThreads) {
         const std::uint32_t t = t0 + i;
         skeys[i] = order_key(v.pool == Pool::candidate_user && cand[t / v.block_size] == 0U ? ninf : scores[t]);
@@ -658,11 +723,37 @@ __device__ __forceinline__ void select_merge_body(const SelectView& v, const uin
         if (threadIdx.x == 0U) v.idx_count[r] = n;
         return;
     }
+    if (v.compact && v.pool == Pool::candidate_user) {   // the compact slices' records (select_slice_compact)
+        std::uint32_t cnt = 0, bad = 0;
+        for (std::uint32_t k = threadIdx.x; k < (n + kSelSlice - 1) / kSelSlice; k += kSelThreads) { cnt += sc.bmax[2U * k]; bad |= sc.bmax[2U * k + 1U]; }
+        unsigned all_cnt;
+        (void)block_exclusive_scan(cnt, warp_tot, all_cnt);
+        if (__syncthreads_or(static_cast<int>(bad)) != 0 || all_cnt <= v.topk) {
+            select_core(v, make_uint3(r, 0U, 0U), hist, warp_tot);
+            return;
+        }
+    }
     const std::uint32_t total = ((n + kSelSlice - 1) / kSelSlice) * v.topk;
     std::uint32_t thr, need;
     radix_threshold(sc.keys, total, v.topk, hist, thr, need);
     ordered_select(sc.keys, total, thr, need, warp_tot, [&](std::uint32_t i, bool s, unsigned out) { if (s) idx[out] = sc.pos[i]; });
     if (threadIdx.x == 0U) v.idx_count[r] = v.topk;
+}
+
+// Every row's count <= topk: the selection of select_body without its scores (every position, in order) and, for the
+// candidate source, its pool: with nb <= cand_blocks select_body takes every block whose maximum is above -inf, and the
+// last block always (its key is +inf); a block's maximum of finite scores is finite, so every block of the row.
+__device__ __forceinline__ void select_direct_body(const SelectView& v, const uint3 bid) {
+    DS41_TIMED(4U);
+    const unsigned r = bid.x;
+    const std::uint32_t n = static_cast<std::uint32_t>((v.pos[r] + 1U) / v.ratio);
+    std::uint32_t* idx = v.idx + static_cast<std::size_t>(r) * v.topk;
+    for (std::uint32_t t = threadIdx.x; t < n; t += blockDim.x) idx[t] = t;
+    if (threadIdx.x == 0U) v.idx_count[r] = n;
+    if (v.pool != Pool::candidate_source) return;
+    std::uint8_t* cand = v.candidates + static_cast<std::size_t>(r) * ((v.max_count + v.block_size - 1) / v.block_size);
+    const std::uint32_t nb = (n + v.block_size - 1) / v.block_size;
+    for (std::uint32_t b = threadIdx.x; b < nb; b += blockDim.x) cand[b] = 1U;
 }
 
 // ---- attention: one block per (key chunk of 64, 8 Hpw heads, row); 8 waves of Hpw heads; lane = 16 dims of each head ----
@@ -679,17 +770,70 @@ struct KeyRaw { uint4 c0, c1; std::uint32_t sc; };
 // One key's dims 32 part .. +31 into its LDS row (zeros for a key past the chunk's end). Row layout: float4 i of lane l
 // (dims 16 l + 4 i .. +3) at i * 32 + l, so the wave's reads of one float4 index are conflict-free.
 __device__ __forceinline__ unsigned key_slot(unsigned part, unsigned i) { return (i % 4U) * 32U + 2U * part + i / 4U; }
+// Involutive permutation of 16-byte vectors, applied to both stores and reads.
+template <bool Swizzle>
+__device__ __forceinline__ unsigned lds_key_slot(unsigned slot) { return Swizzle ? slot ^ ((slot >> 3U) & 1U) : slot; }
+// STRIX_DS41_ATTN_TILE_F16: the tile as f16 pairs (dim 2 t in the low half). Row layout: 16-byte vector h of lane l
+// (dims 16 l + 8 h .. +7) at h * 32 + l. A dequantised key value is E4M3 x 2^k (4 significant bits) or E2M1 x E4M3
+// (at most 6), so it is exact in f16 unless its scale is out of range (checked per key, see store_key_f16); the store reports any value
+// that is not (or is NaN) and the block then stores that tile as today's f32 tile and runs today's tile code. The f16
+// operand reaches the f32 FMA by an exact conversion (folded into v_fma_mix_f32, one rounding as fmaf), so the dot
+// products see exactly the floats of today's f32 tile, without unpack instructions.
+// Writes the f16 pairs of the part's 32 values (today's f32 values, packed; exact when the check passes, so the
+// truncating pack keeps them); returns whether they are exact. Compressed: E2M1 x E4M3 is at most 2688 in steps of at
+// least 2^-10 (exact unless the scale is NaN). Window: E4M3 x 2^(b - 127) is exact for E8M0 b in [112, 134] (at most
+// 448 x 2^7 <= 65504, steps of at least 2^-24) unless a code is NaN.
+__device__ __forceinline__ bool store_key_f16(uint4* row, unsigned part, const KeyRaw& k, bool win, bool valid) {
+    const std::uint32_t cw[8] = {k.c0.x, k.c0.y, k.c0.z, k.c0.w, k.c1.x, k.c1.y, k.c1.z, k.c1.w};
+    float x[32];
+    bool exact = true;
+    if (!valid) {
+#pragma unroll
+        for (unsigned i = 0; i < 32; ++i) x[i] = 0.0F;
+    } else if (win) {
+        const std::uint32_t b = k.sc & 0xFFU;
+        std::uint32_t nan = 0;
+        const float sv = e8m0_value(static_cast<std::uint8_t>(b));
+#pragma unroll
+        for (unsigned i = 0; i < 8; ++i) {
+            const std::uint32_t w = cw[i];
+            nan |= ((w & 0x7F7F7F7FU) + 0x01010101U) & 0x80808080U;   // a byte with low 7 bits 0x7F (E4M3 NaN)
+#pragma unroll
+            for (unsigned t = 0; t < 4; ++t) x[4 * i + t] = e4m3_value(static_cast<std::uint8_t>(w >> (8U * t))) * sv;
+        }
+        exact = b >= 112U && b <= 134U && nan == 0U;
+    } else {
+        exact = ((k.sc & 0x7FU) != 0x7FU) && (((k.sc >> 8U) & 0x7FU) != 0x7FU);
+#pragma unroll
+        for (unsigned i = 0; i < 8; ++i) {
+            const std::uint32_t w = cw[i / 2] >> (16U * (i % 2));
+            const float sv = e4m3_value(static_cast<std::uint8_t>(k.sc >> (8U * (i / 4))));
+#pragma unroll
+            for (unsigned t = 0; t < 4; ++t) x[4 * i + t] = e2m1_value(static_cast<std::uint8_t>((w >> (4U * t)) & 15U)) * sv;
+        }
+    }
+#pragma unroll
+    for (unsigned v = 0; v < 4; ++v) {   // vector v: lane 2 part + v / 2, half v % 2 = dims 8 v .. 8 v + 7 of the part
+        std::uint32_t w[4];
+#pragma unroll
+        for (unsigned t = 0; t < 4; ++t)
+            w[t] = __builtin_bit_cast(std::uint32_t, __builtin_amdgcn_cvt_pkrtz(x[8 * v + 2 * t], x[8 * v + 2 * t + 1]));
+        row[(v % 2U) * 32U + 2U * part + v / 2U] = make_uint4(w[0], w[1], w[2], w[3]);
+    }
+    return exact;
+}
+template <bool Swizzle>
 __device__ __forceinline__ void store_key(float4* row, unsigned part, const KeyRaw& k, bool win, bool valid) {
     const std::uint32_t cw[8] = {k.c0.x, k.c0.y, k.c0.z, k.c0.w, k.c1.x, k.c1.y, k.c1.z, k.c1.w};
     if (!valid) {
 #pragma unroll
-        for (unsigned i = 0; i < 8; ++i) row[key_slot(part, i)] = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+        for (unsigned i = 0; i < 8; ++i) row[lds_key_slot<Swizzle>(key_slot(part, i))] = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
     } else if (win) {
         const float s = e8m0_value(static_cast<std::uint8_t>(k.sc));
 #pragma unroll
         for (unsigned i = 0; i < 8; ++i) {
             const std::uint32_t w = cw[i];
-            row[key_slot(part, i)] = make_float4(e4m3_value(static_cast<std::uint8_t>(w)) * s, e4m3_value(static_cast<std::uint8_t>(w >> 8U)) * s,
+            row[lds_key_slot<Swizzle>(key_slot(part, i))] = make_float4(e4m3_value(static_cast<std::uint8_t>(w)) * s, e4m3_value(static_cast<std::uint8_t>(w >> 8U)) * s,
                                  e4m3_value(static_cast<std::uint8_t>(w >> 16U)) * s, e4m3_value(static_cast<std::uint8_t>(w >> 24U)) * s);
         }
     } else {
@@ -697,7 +841,7 @@ __device__ __forceinline__ void store_key(float4* row, unsigned part, const KeyR
         for (unsigned i = 0; i < 8; ++i) {
             const std::uint32_t w = cw[i / 2] >> (16U * (i % 2));
             const float s = e4m3_value(static_cast<std::uint8_t>(k.sc >> (8U * (i / 4))));
-            row[key_slot(part, i)] = make_float4(e2m1_value(static_cast<std::uint8_t>(w & 15U)) * s, e2m1_value(static_cast<std::uint8_t>((w >> 4U) & 15U)) * s,
+            row[lds_key_slot<Swizzle>(key_slot(part, i))] = make_float4(e2m1_value(static_cast<std::uint8_t>(w & 15U)) * s, e2m1_value(static_cast<std::uint8_t>((w >> 4U) & 15U)) * s,
                                  e2m1_value(static_cast<std::uint8_t>((w >> 8U) & 15U)) * s, e2m1_value(static_cast<std::uint8_t>((w >> 12U) & 15U)) * s);
         }
     }
@@ -705,25 +849,48 @@ __device__ __forceinline__ void store_key(float4* row, unsigned part, const KeyR
 __device__ __forceinline__ float lane_value(float x, unsigned src) {
     return __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, x), static_cast<int>(src)));
 }
+// The lane's 16 dims of tile key j (dims 16 lane .. +15, in order) from the f32 tile or the f16 tile.
+template <bool Swizzle, bool Half>
+__device__ __forceinline__ void tile_key(const void* tile, unsigned j, unsigned lane, float (&k)[16]) {
+    if constexpr (Half) {
+        const auto* kb = static_cast<const uint4 (*)[kHeadDim / 8]>(tile);
+#pragma unroll
+        for (unsigned h = 0; h < 2; ++h) {
+            const uint4 u = kb[j][32U * h + lane];
+            const std::uint32_t w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+            for (unsigned t = 0; t < 4; ++t) {   // exact widening, folded into the consumers' FMAs (v_fma_mix_f32)
+                k[8 * h + 2 * t] = static_cast<float>(__builtin_bit_cast(_Float16, static_cast<std::uint16_t>(w[t])));
+                k[8 * h + 2 * t + 1] = static_cast<float>(__builtin_bit_cast(_Float16, static_cast<std::uint16_t>(w[t] >> 16U)));
+            }
+        }
+    } else {
+        const auto* ks = static_cast<const float4 (*)[kHeadDim / 4]>(tile);
+#pragma unroll
+        for (unsigned i = 0; i < 4; ++i) {
+            const float4 kk = ks[j][lds_key_slot<Swizzle>(32 * i + lane)];
+            k[4 * i] = kk.x; k[4 * i + 1] = kk.y; k[4 * i + 2] = kk.z; k[4 * i + 3] = kk.w;
+        }
+    }
+}
 // One tile's online-softmax step for the wave's Hpw heads over its first cnt keys (loops over keys kept rolled: the
 // kernel is instruction-fetch bound when fully unrolled).
-template <unsigned kAttnHpw>
-__device__ __forceinline__ void attention_tile(const float4 (*ks)[kHeadDim / 4], unsigned cnt, unsigned lane,
-    const float (&q)[kAttnHpw][16], float (&m)[kAttnHpw], float (&l)[kAttnHpw], float (&acc)[kAttnHpw][16]) {
+template <unsigned kAttnHpw, bool Swizzle, bool Half = false, bool Narrow = Half>
+__device__ __forceinline__ void attention_tile(const void* tile, unsigned cnt, unsigned lane,
+    const float (&q)[kAttnHpw][16], float (&m)[kAttnHpw], float (&l)[kAttnHpw], float (&acc)[kAttnHpw][16], [[maybe_unused]] bool mark = false) {
+    if (mark) DS41_CMARK(0U);   // timing build: the first tile's phases (QK + butterfly, softmax, PV)
     const float ninf = -__builtin_inff();
     const bool b4 = (lane & 16U) != 0U, b3 = (lane & 8U) != 0U, b2 = (lane & 4U) != 0U;
     float s[kAttnHpw][2];
 #pragma unroll 1
     for (unsigned sb = 0; sb < 2; ++sb) {
         float pt[kAttnHpw][8];
-#pragma unroll
+        // the f16 kernels at 4 heads per wave (both of their tile forms): 2 keys per unrolled step (8 spill); same order
+        constexpr unsigned kKeyUnroll = Narrow && kAttnHpw == 4U ? 2U : 8U;
+#pragma unroll kKeyUnroll
         for (unsigned jj = 0; jj < 8; ++jj) {
             float k[16];
-#pragma unroll
-            for (unsigned i = 0; i < 4; ++i) {
-                const float4 kk = ks[8 * sb + jj][32 * i + lane];
-                k[4 * i] = kk.x; k[4 * i + 1] = kk.y; k[4 * i + 2] = kk.z; k[4 * i + 3] = kk.w;
-            }
+            tile_key<Swizzle, Half>(tile, 8 * sb + jj, lane, k);
 #pragma unroll
             for (unsigned h = 0; h < kAttnHpw; ++h) {
                 float t = 0.0F;
@@ -757,6 +924,7 @@ __device__ __forceinline__ void attention_tile(const float4 (*ks)[kHeadDim / 4],
             if (sb == 0U) s[h][0] = sv; else s[h][1] = sv;
         }
     }
+    if (mark) DS41_CMARK(1U);
     float pr[kAttnHpw][2];
 #pragma unroll
     for (unsigned h = 0; h < kAttnHpw; ++h) {
@@ -774,14 +942,11 @@ __device__ __forceinline__ void attention_tile(const float4 (*ks)[kHeadDim / 4],
         for (unsigned i = 0; i < 16; ++i) acc[h][i] = acc[h][i] * sc;
         m[h] = mn;
     }
+    if (mark) DS41_CMARK(2U);
 #pragma unroll 1
     for (unsigned j = 0; j < cnt; ++j) {
         float k[16];
-#pragma unroll
-        for (unsigned i = 0; i < 4; ++i) {
-            const float4 kk = ks[j][32 * i + lane];
-            k[4 * i] = kk.x; k[4 * i + 1] = kk.y; k[4 * i + 2] = kk.z; k[4 * i + 3] = kk.w;
-        }
+        tile_key<Swizzle, Half>(tile, j, lane, k);
 #pragma unroll
         for (unsigned h = 0; h < kAttnHpw; ++h) {
             const float pj = lane_value(j < 8U ? pr[h][0] : pr[h][1], 4U * (j % 8));
@@ -789,6 +954,7 @@ __device__ __forceinline__ void attention_tile(const float4 (*ks)[kHeadDim / 4],
             for (unsigned i = 0; i < 16; ++i) acc[h][i] = fmaf(pj, k[i], acc[h][i]);
         }
     }
+    if (mark) DS41_CMARK(3U);
 }
 // Combine of one (row, head) in chunk order, sink, 1 / L, inverse RoPE.
 __device__ __forceinline__ void attention_combine_head(const AttentionView& v, unsigned r, unsigned h, unsigned lane, unsigned chunks) {
@@ -857,30 +1023,62 @@ __device__ __forceinline__ unsigned visible_keys(const AttentionView& v, unsigne
     nw = p + 1U < kWindow ? static_cast<unsigned>(p + 1U) : kWindow;
     return nw + (v.idx_count != nullptr ? v.idx_count[r] : 0U);
 }
-template <unsigned kAttnHpw>
+template <unsigned kAttnHpw, bool Swizzle, bool Half = false, bool Fold = false>
 __device__ __forceinline__ void attention_chunk_body(const AttentionView& v, const uint3 bid) {
     DS41_TIMED(5U);
-    __shared__ float4 ks[kTile][kHeadDim / 4];
+    __shared__ float4 ks[kTile][kHeadDim / 4];   // the f32 tile, or (STRIX_DS41_ATTN_TILE_F16) the f16 tile in its first half
+    auto* kb = reinterpret_cast<uint4 (*)[kHeadDim / 8]>(ks);
     __shared__ std::uint32_t cidx[kChunk];
     __shared__ unsigned last_s;
     const unsigned c = bid.x, r = bid.z, tid = threadIdx.x, lane = tid & 31U;
     const unsigned hb = (bid.y * (kAttnThreads / 32U) + (tid >> 5U)) * kAttnHpw;
     unsigned nw;
     const unsigned n = visible_keys(v, r, nw), chunks = (n + kChunk - 1) / kChunk;
+    if (v.max_visible != 0U && n > v.max_visible) __builtin_trap();   // the grid covers max_visible keys only
     if (c >= chunks) return;
     const unsigned j0 = c * kChunk, end = n - j0 < kChunk ? n : j0 + kChunk;
     const std::uint64_t p = v.pos[r];
     const unsigned first_slot = static_cast<unsigned>((p + 1U - nw) % v.capacity);
     if (tid < kChunk && j0 + tid < end && j0 + tid >= nw) cidx[tid] = v.idx[static_cast<std::size_t>(r) * v.topk + j0 + tid - nw];
+    const unsigned tk = tid / 16U, part = tid % 16U;
+    [[maybe_unused]] const std::uint64_t call0 = v.pos[0];   // the call's first row: positions call0 .. are this call's rows
+    // STRIX_DS41_ATTN_WINDOW_FOLD: the window keys of this call's rows 0..r that fall in this chunk, one wave per key
+    // (wave k = row k, window_write's own per-lane code) into an LDS copy of the ring entry; the row's own entry is also
+    // copied to its ring slot by head group 0 (the only writer; no block of this call reads those slots).
+    [[maybe_unused]] __shared__ __attribute__((aligned(16))) std::uint8_t fold_e[Fold ? kMaxRows : 1][kWindowEntryBytes];
+    if constexpr (Fold) {
+        const unsigned k = tid >> 5U;   // key of row k: visible index nw - 1 - (r - k); uniform per wave
+        if (k <= r && r - k < nw) {
+            const unsigned j = nw - 1U - (r - k);
+            if (j >= j0 && j < end) {
+                window_entry(v.kv + k * kHeadDim, v.kv_norm, v.rope[k], lane, fold_e[k]);
+                if (k == r && bid.y == 0U) {
+                    unsigned slot = first_slot + j;
+                    if (slot >= v.capacity) slot -= v.capacity;
+                    std::uint8_t* e = v.ring_out + static_cast<std::size_t>(slot) * kWindowEntryBytes;
+                    __builtin_amdgcn_wave_barrier();   // the wave's LDS bytes are written (same wave reads them back)
+                    *reinterpret_cast<uint4*>(e + 16 * lane) = *reinterpret_cast<const uint4*>(fold_e[k] + 16 * lane);
+                    if ((lane & 1U) == 0U) e[512 + lane / 2] = fold_e[k][512 + lane / 2];
+                }
+            }
+        }
+    }
     __syncthreads();
     DS41_MARK(0U);
-    const unsigned tk = tid / 16U, part = tid % 16U;
     const auto load = [&](unsigned t0, KeyRaw& k) {
         const unsigned j = t0 + tk;
         if (j >= end) return;
         if (j < nw) {
             unsigned slot = first_slot + j;
             if (slot >= v.capacity) slot -= v.capacity;
+            const std::uint64_t at = p + 1U - nw + j;   // the key's position
+            if (Fold && at >= call0) {                    // STRIX_DS41_ATTN_WINDOW_FOLD: a key of this call, computed above
+                const std::uint8_t* e = fold_e[at - call0];
+                const uint4* cp = reinterpret_cast<const uint4*>(e + 32 * part);
+                k.c0 = cp[0]; k.c1 = cp[1];
+                k.sc = e[512 + part];
+                return;
+            }
             const std::uint8_t* e = v.ring + static_cast<std::size_t>(slot) * kWindowEntryBytes;
             const uint4* cp = reinterpret_cast<const uint4*>(e + 32 * part);
             k.c0 = cp[0]; k.c1 = cp[1];
@@ -906,11 +1104,21 @@ __device__ __forceinline__ void attention_chunk_body(const AttentionView& v, con
     DS41_MARK(1U);
     for (unsigned t0 = j0; t0 < end; t0 += kTile) {
         const unsigned cnt = end - t0 < kTile ? end - t0 : kTile;
-        store_key(ks[tk], part, raw, t0 + tk < nw, tk < cnt);
-        __syncthreads();
+        bool f32_tile = true;
+        if constexpr (Half) {
+            f32_tile = __syncthreads_or(store_key_f16(kb[tk], part, raw, t0 + tk < nw, tk < cnt) ? 0 : 1) != 0;
+            if (f32_tile) {   // uniform: some value of the tile is not exact in f16: today's f32 tile over the same LDS
+                store_key<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt);
+                __syncthreads();
+            }
+        } else {
+            store_key<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt);
+            __syncthreads();
+        }
         DS41_MARK(2U + 2U * ((t0 - j0) / kTile));
         if (t0 + kTile < end) load(t0 + kTile, raw);
-        attention_tile<kAttnHpw>(ks, cnt, lane, q, m, l, acc);
+        if (!Half || f32_tile) attention_tile<kAttnHpw, Swizzle, false, Half>(ks, cnt, lane, q, m, l, acc, t0 == j0);
+        else attention_tile<kAttnHpw, Swizzle, true>(kb, cnt, lane, q, m, l, acc, t0 == j0);
         __syncthreads();
         DS41_MARK(3U + 2U * ((t0 - j0) / kTile));
     }
@@ -941,6 +1149,166 @@ __device__ __forceinline__ void attention_combine_body(const AttentionView& v, c
     unsigned nw;
     const unsigned n = visible_keys(v, bid.y, nw);
     attention_combine_head(v, bid.y, bid.x, threadIdx.x, (n + kChunk - 1) / kChunk);
+}
+
+
+// Prefill-only BF16 hi/lo attention. Packed K/V values fit BF16 in its normal
+// range; extreme underflow is lossy; queries and probabilities retain two terms.
+using bf16x16 = unsigned short __attribute__((ext_vector_type(16)));
+using f32x8 = float __attribute__((ext_vector_type(8)));
+__device__ unsigned short bf_rn(float f) {
+    unsigned u=__builtin_bit_cast(unsigned,f);
+    if ((u&0x7f800000U)==0x7f800000U) return static_cast<unsigned short>((u>>16U)|((u&0x7fffffU)?64U:0U));
+    return static_cast<unsigned short>((u+0x7fffU+((u>>16U)&1U))>>16U);
+}
+__device__ float bf_float(unsigned short b) { return __builtin_bit_cast(float,unsigned(b)<<16U); }
+__global__ __launch_bounds__(256) void attention_bf16_chunk(AttentionView v) {
+    __shared__ unsigned short qh[16][512],ql[16][512],keys[16][512],ph[16][16],pl[16][16];
+    __shared__ float scores[16][16],ms[16],ls[16],scale[16];
+    unsigned tid=threadIdx.x,lane=tid%32,wave=tid/32,lo=lane%16,half=lane/16;
+    unsigned row=blockIdx.z,h0=blockIdx.y*16,c=blockIdx.x,nw;
+    unsigned n=visible_keys(v,row,nw),chunks=(n+kChunk-1)/kChunk;
+    if(c>=chunks)return;
+    unsigned first=c*kChunk,end=min(n,first+kChunk);
+    auto pos=v.pos[row];unsigned first_slot=(pos+1-nw)%v.capacity;
+    for(unsigned h=wave;h<16;h+=8){
+        float q[16];
+        for(unsigned i=0;i<16;++i)q[i]=v.q[(std::size_t(row)*v.heads+h0+h)*512+lane*16+i];
+        rope512(q,v.rope[row],lane,false);
+        for(unsigned i=0;i<16;++i){unsigned d=lane*16+i;qh[h][d]=bf_rn(q[i]);ql[h][d]=bf_rn(q[i]-bf_float(qh[h][d]));}
+    }
+    if(tid<16){ms[tid]=-__builtin_inff();ls[tid]=0;}
+    f32x8 acc[4]{};
+    __syncthreads();
+    for(unsigned t0=first;t0<end;t0+=16){
+        unsigned tk=tid/16,part=tid%16,key_index=t0+tk,cnt=min(16U,end-t0);
+        KeyRaw raw{};bool valid=key_index<end,win=key_index<nw;
+        if(valid){
+            if(win){unsigned slot=(first_slot+key_index)%v.capacity;auto* e=v.ring+std::size_t(slot)*kWindowEntryBytes;auto* b=reinterpret_cast<const uint4*>(e+32*part);raw.c0=b[0];raw.c1=b[1];raw.sc=e[512+part];}
+            else{unsigned idx=v.idx[std::size_t(row)*v.topk+key_index-nw];auto* e=v.kv_cache+std::size_t(idx)*kKvEntryBytes;raw.c0=*reinterpret_cast<const uint4*>(e+16*part);raw.sc=*reinterpret_cast<const unsigned short*>(e+256+2*part);}
+        }
+        unsigned cw[8]={raw.c0.x,raw.c0.y,raw.c0.z,raw.c0.w,raw.c1.x,raw.c1.y,raw.c1.z,raw.c1.w};
+        for(unsigned i=0;i<32;++i){
+            float f=0;
+            if(valid && win)f=e4m3_value(static_cast<unsigned char>(cw[i/4]>>(8*(i%4))))*e8m0_value(static_cast<unsigned char>(raw.sc));
+            else if(valid)f=e2m1_value(static_cast<unsigned char>((cw[i/8]>>(4*(i%8)))&15))*e4m3_value(static_cast<unsigned char>(raw.sc>>(8*(i/16))));
+            keys[tk][part*32+i]=bf_rn(f);
+        }
+        __syncthreads();
+        if(wave==0){
+            f32x8 dot{};
+            for(unsigned k=0;k<512;k+=16){
+                bf16x16 a,b,al;
+                for(unsigned i=0;i<16;++i){a[i]=qh[lo][k+i];al[i]=ql[lo][k+i];b[i]=keys[lo][k+i];}
+                dot=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,dot);
+                dot=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(al,b,dot);
+            }
+            for(unsigned e=0;e<8;++e)scores[2*e+half][lo]=lo<cnt?dot[e]*kAttnScale:-__builtin_inff();
+        }
+        __syncthreads();
+        if(tid<16){
+            float tm=-__builtin_inff();for(unsigned j=0;j<cnt;++j)tm=fmaxf(tm,scores[tid][j]);
+            float mn=fmaxf(ms[tid],tm),sc=exp_f(ms[tid]-mn);scale[tid]=sc;float sum=ls[tid]*sc;
+            for(unsigned j=0;j<16;++j){float pr=j<cnt?exp_f(scores[tid][j]-mn):0;sum=sum+pr;ph[tid][j]=bf_rn(pr);pl[tid][j]=bf_rn(pr-bf_float(ph[tid][j]));}
+            ms[tid]=mn;ls[tid]=sum;
+        }
+        __syncthreads();
+        for(unsigned tile=0;tile<4;++tile){
+            for(unsigned e=0;e<8;++e)acc[tile][e]*=scale[2*e+half];
+            bf16x16 a,al,b;unsigned dim=wave*64+tile*16+lo;
+            for(unsigned j=0;j<16;++j){a[j]=ph[lo][j];al[j]=pl[lo][j];b[j]=keys[j][dim];}
+            acc[tile]=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,acc[tile]);
+            acc[tile]=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(al,b,acc[tile]);
+        }
+        __syncthreads();
+    }
+    if(tid<16){auto* pp=v.partial+((std::size_t(row)*v.heads+h0+tid)*kMaxChunks+c)*(2+512);pp[0]=ms[tid];pp[1]=ls[tid];}
+    for(unsigned tile=0;tile<4;++tile)for(unsigned e=0;e<8;++e){auto* pp=v.partial+((std::size_t(row)*v.heads+h0+2*e+half)*kMaxChunks+c)*(2+512);pp[2+wave*64+tile*16+lo]=acc[tile][e];}
+}
+
+// Variant 2 (STRIX_DS41_PREFILL_BF16_ATTN=2): the same hi/lo arithmetic per product, with the QK dot of each 16-key
+// step split over the 8 waves (64 dimensions each, partial tiles summed in a fixed tree) instead of wave 0 alone, and
+// the decoded keys written to LDS 16 bytes at a time instead of 2.
+__global__ __launch_bounds__(256) void attention_bf16_chunk2(AttentionView v) {
+    __shared__ __attribute__((aligned(16))) unsigned short qh[16][512], ql[16][512], keys[16][512];
+    __shared__ unsigned short ph[16][16], pl[16][16];
+    __shared__ float spart[8][16][16], scores[16][16], ms[16], ls[16], scale[16];
+    unsigned tid=threadIdx.x,lane=tid%32,wave=tid/32,lo=lane%16,half=lane/16;
+    unsigned row=blockIdx.z,h0=blockIdx.y*16,c=blockIdx.x,nw;
+    unsigned n=visible_keys(v,row,nw),chunks=(n+kChunk-1)/kChunk;
+    if(c>=chunks)return;
+    unsigned first=c*kChunk,end=min(n,first+kChunk);
+    auto pos=v.pos[row];unsigned first_slot=(pos+1-nw)%v.capacity;
+    for(unsigned h=wave;h<16;h+=8){
+        float q[16];
+        for(unsigned i=0;i<16;++i)q[i]=v.q[(std::size_t(row)*v.heads+h0+h)*512+lane*16+i];
+        rope512(q,v.rope[row],lane,false);
+        for(unsigned i=0;i<16;++i){unsigned d=lane*16+i;qh[h][d]=bf_rn(q[i]);ql[h][d]=bf_rn(q[i]-bf_float(qh[h][d]));}
+    }
+    if(tid<16){ms[tid]=-__builtin_inff();ls[tid]=0;}
+    f32x8 acc[4]{};
+    __syncthreads();
+    for(unsigned t0=first;t0<end;t0+=16){
+        unsigned tk=tid/16,part=tid%16,key_index=t0+tk,cnt=min(16U,end-t0);
+        KeyRaw raw{};bool valid=key_index<end,win=key_index<nw;
+        if(valid){
+            if(win){unsigned slot=(first_slot+key_index)%v.capacity;auto* e=v.ring+std::size_t(slot)*kWindowEntryBytes;auto* b=reinterpret_cast<const uint4*>(e+32*part);raw.c0=b[0];raw.c1=b[1];raw.sc=e[512+part];}
+            else{unsigned idx=v.idx[std::size_t(row)*v.topk+key_index-nw];auto* e=v.kv_cache+std::size_t(idx)*kKvEntryBytes;raw.c0=*reinterpret_cast<const uint4*>(e+16*part);raw.sc=*reinterpret_cast<const unsigned short*>(e+256+2*part);}
+        }
+        unsigned cw[8]={raw.c0.x,raw.c0.y,raw.c0.z,raw.c0.w,raw.c1.x,raw.c1.y,raw.c1.z,raw.c1.w};
+        unsigned packed[16];
+        for(unsigned i=0;i<32;i+=2){
+            float f0=0,f1=0;
+            if(valid && win){
+                const float s=e8m0_value(static_cast<unsigned char>(raw.sc));
+                f0=e4m3_value(static_cast<unsigned char>(cw[i/4]>>(8*(i%4))))*s;f1=e4m3_value(static_cast<unsigned char>(cw[(i+1)/4]>>(8*((i+1)%4))))*s;
+            }else if(valid){
+                const float s=e4m3_value(static_cast<unsigned char>(raw.sc>>(8*(i/16))));
+                f0=e2m1_value(static_cast<unsigned char>((cw[i/8]>>(4*(i%8)))&15))*s;f1=e2m1_value(static_cast<unsigned char>((cw[(i+1)/8]>>(4*((i+1)%8)))&15))*s;
+            }
+            packed[i/2]=unsigned(bf_rn(f0))|(unsigned(bf_rn(f1))<<16);
+        }
+        auto* kd=reinterpret_cast<uint4*>(&keys[tk][part*32]);
+        for(unsigned i=0;i<4;++i)kd[i]=uint4{packed[4*i],packed[4*i+1],packed[4*i+2],packed[4*i+3]};
+        __syncthreads();
+        {
+            f32x8 dot{};
+            for(unsigned k=wave*64;k<wave*64+64;k+=16){
+                bf16x16 a,b,al;
+                const auto* qa=reinterpret_cast<const uint4*>(&qh[lo][k]);const auto* qb=reinterpret_cast<const uint4*>(&ql[lo][k]);const auto* kb=reinterpret_cast<const uint4*>(&keys[lo][k]);
+                uint4 x0=qa[0],x1=qa[1],y0=qb[0],y1=qb[1],z0=kb[0],z1=kb[1];
+                unsigned xa[8]={x0.x,x0.y,x0.z,x0.w,x1.x,x1.y,x1.z,x1.w},ya[8]={y0.x,y0.y,y0.z,y0.w,y1.x,y1.y,y1.z,y1.w},za[8]={z0.x,z0.y,z0.z,z0.w,z1.x,z1.y,z1.z,z1.w};
+                for(unsigned i=0;i<8;++i){a[2*i]=static_cast<unsigned short>(xa[i]);a[2*i+1]=static_cast<unsigned short>(xa[i]>>16);al[2*i]=static_cast<unsigned short>(ya[i]);al[2*i+1]=static_cast<unsigned short>(ya[i]>>16);b[2*i]=static_cast<unsigned short>(za[i]);b[2*i+1]=static_cast<unsigned short>(za[i]>>16);}
+                dot=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,dot);
+                dot=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(al,b,dot);
+            }
+            for(unsigned e=0;e<8;++e)spart[wave][2*e+half][lo]=dot[e];
+        }
+        __syncthreads();
+        {
+            unsigned hh=tid/16,kk=tid%16;
+            float s=((spart[0][hh][kk]+spart[1][hh][kk])+(spart[2][hh][kk]+spart[3][hh][kk]))+((spart[4][hh][kk]+spart[5][hh][kk])+(spart[6][hh][kk]+spart[7][hh][kk]));
+            scores[hh][kk]=kk<cnt?s*kAttnScale:-__builtin_inff();
+        }
+        __syncthreads();
+        if(tid<16){
+            float tm=-__builtin_inff();for(unsigned j=0;j<cnt;++j)tm=fmaxf(tm,scores[tid][j]);
+            float mn=fmaxf(ms[tid],tm),sc=exp_f(ms[tid]-mn);scale[tid]=sc;float sum=ls[tid]*sc;
+            for(unsigned j=0;j<16;++j){float pr=j<cnt?exp_f(scores[tid][j]-mn):0;sum=sum+pr;ph[tid][j]=bf_rn(pr);pl[tid][j]=bf_rn(pr-bf_float(ph[tid][j]));}
+            ms[tid]=mn;ls[tid]=sum;
+        }
+        __syncthreads();
+        for(unsigned tile=0;tile<4;++tile){
+            for(unsigned e=0;e<8;++e)acc[tile][e]*=scale[2*e+half];
+            bf16x16 a,al,b;unsigned dim=wave*64+tile*16+lo;
+            for(unsigned j=0;j<16;++j){a[j]=ph[lo][j];al[j]=pl[lo][j];b[j]=keys[j][dim];}
+            acc[tile]=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,acc[tile]);
+            acc[tile]=__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(al,b,acc[tile]);
+        }
+        __syncthreads();
+    }
+    if(tid<16){auto* pp=v.partial+((std::size_t(row)*v.heads+h0+tid)*kMaxChunks+c)*(2+512);pp[0]=ms[tid];pp[1]=ls[tid];}
+    for(unsigned tile=0;tile<4;++tile)for(unsigned e=0;e<8;++e){auto* pp=v.partial+((std::size_t(row)*v.heads+h0+2*e+half)*kMaxChunks+c)*(2+512);pp[2+wave*64+tile*16+lo]=acc[tile][e];}
 }
 
 // ---- kernels: one call (the block's own coordinates), or several segments of one kind in one launch ----
@@ -1008,13 +1376,19 @@ __global__ __launch_bounds__(kSelThreads) void select_merge_seg_kernel(SegmentLa
     const uint3 b = segment_block(s, k);
     select_merge_body(s.v[k], b);
 }
-template <unsigned kAttnHpw>
-__global__ __launch_bounds__(kAttnThreads) void attention_chunk_kernel(AttentionView v) { attention_chunk_body<kAttnHpw>(v, own_block()); }
-template <unsigned kAttnHpw>
+__global__ __launch_bounds__(256) void select_direct_kernel(SelectView v) { select_direct_body(v, own_block()); }
+__global__ __launch_bounds__(256) void select_direct_seg_kernel(SegmentLaunch<SelectView> s) {
+    unsigned k;
+    const uint3 b = segment_block(s, k);
+    select_direct_body(s.v[k], b);
+}
+template <unsigned kAttnHpw, bool Swizzle, bool Half, bool Fold>
+__global__ __launch_bounds__(kAttnThreads) void attention_chunk_kernel(AttentionView v) { attention_chunk_body<kAttnHpw, Swizzle, Half, Fold>(v, own_block()); }
+template <unsigned kAttnHpw, bool Swizzle, bool Half, bool Fold>
 __global__ __launch_bounds__(kAttnThreads) void attention_chunk_seg_kernel(SegmentLaunch<AttentionView> s) {
     unsigned k;
     const uint3 b = segment_block(s, k);
-    attention_chunk_body<kAttnHpw>(s.v[k], b);
+    attention_chunk_body<kAttnHpw, Swizzle, Half, Fold>(s.v[k], b);
 }
 __global__ __launch_bounds__(32) void attention_combine_kernel(AttentionView v) { attention_combine_body(v, own_block()); }
 __global__ __launch_bounds__(32) void attention_combine_seg_kernel(SegmentLaunch<AttentionView> s) {
@@ -1044,7 +1418,8 @@ void check(hipError_t e, const char* what) {
     if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
 }
 void check_rows(std::uint32_t rows) {
-    if (rows == 0U || rows > kMaxCallRows) throw std::invalid_argument("ds41 attention: 1..kMaxCallRows rows per call");
+    const unsigned limit = strix::ds41::prefill_tuning::enabled("STRIX_DS41_PREFILL_SLABS") ? kMaxCallRows : kLegacyMaxCallRows;
+    if (rows == 0U || rows > limit) throw std::invalid_argument("ds41 attention: rows exceed enabled call limit");
 }
 
 }  // namespace
@@ -1101,6 +1476,8 @@ static unsigned select_slices(const SelectView& v) {
     const std::size_t slices = (v.max_count + kSelSlice - 1) / kSelSlice;
     if (2 * slices * v.topk + (v.max_count + v.block_size - 1) / v.block_size > v.max_count)
         throw std::invalid_argument("ds41 select: top-k or candidate block size too large for the key scratch");
+    if (v.compact && v.pool == Pool::candidate_user && (v.block_size < 8U || kSelSlice % v.block_size != 0U))
+        throw std::invalid_argument("ds41 select: compact selection needs a candidate block size >= 8 dividing the slice");
     return static_cast<unsigned>(slices);
 }
 static dim3 select_merge_grid(const SelectView& v) { return dim3(v.pool == Pool::candidate_source ? 2U : 1U, v.rows); }
@@ -1114,24 +1491,116 @@ void enqueue_select(const SelectView& v, hipStream_t stream) {
     }
     check(hipGetLastError(), "ds41 select");
 }
-// heads per wave of a call: the most that still gives >= 40 blocks (one per two CUs), else 1
+namespace {
+int index_candidate_filter_mode = -1, index_direct_mode = -1, attention_segment_hpw_mode = -1;
+unsigned attention_min_blocks_value = 0;
+// on unless the variable is "0" (exact and never slower in interleaved ABA measurements: default on, =0 turns it off)
+bool env_on_unless_zero(const char* name) { const char* e = std::getenv(name); return e == nullptr || !(e[0] == '0' && e[1] == 0); }
+}  // namespace
+void set_index_candidate_filter(int mode) { index_candidate_filter_mode = mode; }
+bool index_candidate_filter() {
+    static const bool env = env_on_unless_zero("STRIX_DS41_IDX_CAND_FILTER");
+    return index_candidate_filter_mode < 0 ? env : index_candidate_filter_mode != 0;
+}
+void set_index_direct(int mode) { index_direct_mode = mode; }
+bool index_direct() {
+    static const bool env = env_on_unless_zero("STRIX_DS41_IDX_DIRECT");
+    return index_direct_mode < 0 ? env : index_direct_mode != 0;
+}
+void set_attention_segment_hpw(int mode) { attention_segment_hpw_mode = mode; }
+void set_attention_min_blocks(unsigned blocks) { attention_min_blocks_value = blocks; }
+// the grid size below which a call takes fewer heads per wave (STRIX_DS41_ATTN_MIN_BLOCKS, default 40: one per two CUs)
+static unsigned attention_min_blocks() {
+    static const unsigned env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_MIN_BLOCKS"); return e != nullptr && e[0] != 0 ? static_cast<unsigned>(std::strtoul(e, nullptr, 10)) : 40U; }();
+    return attention_min_blocks_value != 0U ? attention_min_blocks_value : env;
+}
+static bool attention_segment_hpw() {
+    static const bool env = env_on_unless_zero("STRIX_DS41_ATTN_SEG_HPW");
+    return attention_segment_hpw_mode < 0 ? env : attention_segment_hpw_mode != 0;
+}
+static void check_select_direct(const SelectView& v) {
+    check_rows(v.rows);
+    if (v.max_count > v.topk) throw std::invalid_argument("ds41 select direct: a row may have more positions than top-k");
+    if (v.pool == Pool::candidate_source && (v.block_size == 0U || (v.max_count + v.block_size - 1) / v.block_size > v.cand_blocks))
+        throw std::invalid_argument("ds41 select direct: candidate pool parameters");
+}
+void enqueue_select_direct(const SelectView& v, hipStream_t stream) {
+    check_select_direct(v);
+    hipLaunchKernelGGL(select_direct_kernel, dim3(v.rows), dim3(256), 0, stream, v);
+    check(hipGetLastError(), "ds41 select direct");
+}
+// chunk blocks per row: all kMaxChunks, or (AttentionView::max_visible, STRIX_DS41_ATTN_LIVE_CHUNKS) the chunks of the
+// caller's bound on any row's visible keys
+static unsigned attention_chunks(const AttentionView& v) {
+    if (v.max_visible == 0U) return kMaxChunks;
+    const unsigned c = (v.max_visible + kChunk - 1) / kChunk;
+    return c < kMaxChunks ? c : kMaxChunks;
+}
+// heads per wave of a call: the most that still gives >= attention_min_blocks() blocks, else 1
 static unsigned attention_hpw(const AttentionView& v) {
     check_rows(v.rows);
     if (v.capacity < kWindow + v.rows || (v.idx_count != nullptr && v.topk > kTopK))
         throw std::invalid_argument("ds41 attention capacity / topk");
     if (v.heads == 0U || v.heads > kHeads || v.heads % kAttnMinBlockHeads != 0U) throw std::invalid_argument("ds41 attention heads: multiple of 8, at most 64");
-    const auto blocks = [&](unsigned hpw) { return kMaxChunks * (v.heads / (kAttnMinBlockHeads * hpw)) * v.rows; };
-    const auto fits = [&](unsigned hpw) { return v.heads % (kAttnMinBlockHeads * hpw) == 0U && blocks(hpw) >= 40U; };
+    const auto blocks = [&](unsigned hpw) { return attention_chunks(v) * (v.heads / (kAttnMinBlockHeads * hpw)) * v.rows; };
+    const auto fits = [&](unsigned hpw) { return v.heads % (kAttnMinBlockHeads * hpw) == 0U && blocks(hpw) >= attention_min_blocks(); };
     return fits(4U) ? 4U : fits(2U) ? 2U : 1U;
 }
-void enqueue_attention(const AttentionView& v, hipStream_t stream) {
+int attention_lds_swizzle_mode = -1;
+void set_attention_lds_swizzle(int mode) { attention_lds_swizzle_mode = mode; }
+static bool attention_lds_swizzle() {
+    static const bool env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_LDS_SWIZZLE"); return e && e[0] == '1' && e[1] == 0; }();
+    return attention_lds_swizzle_mode < 0 ? env : attention_lds_swizzle_mode != 0;
+}
+int attention_live_chunks_mode = -1;
+void set_attention_live_chunks(int mode) { attention_live_chunks_mode = mode; }
+bool attention_live_chunks() {
+    static const bool env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_LIVE_CHUNKS"); return !(e && e[0] == '0' && e[1] == 0); }();  // default on, =0 off
+    return attention_live_chunks_mode < 0 ? env : attention_live_chunks_mode != 0;
+}
+int attention_window_fold_mode = -1;
+void set_attention_window_fold(int mode) { attention_window_fold_mode = mode; }
+bool attention_window_fold() {
+    static const bool env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_WINDOW_FOLD"); return !(e && e[0] == '0' && e[1] == 0); }();  // default on, =0 off
+    return attention_window_fold_mode < 0 ? env : attention_window_fold_mode != 0;
+}
+int attention_tile_f16_mode = -1;
+void set_attention_tile_f16(int mode) { attention_tile_f16_mode = mode; }
+static bool attention_tile_f16() {
+    static const bool env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_TILE_F16"); return !(e && e[0] == '0' && e[1] == 0); }();  // default on, =0 off
+    return attention_tile_f16_mode < 0 ? env : attention_tile_f16_mode != 0;
+}
+static void check_fold(const AttentionView& v) {
+    if ((v.kv == nullptr) != (v.ring_out == nullptr) || (v.kv != nullptr && (v.kv_norm == nullptr || v.ring_out != v.ring || v.rows > kMaxRows)))
+        throw std::invalid_argument("ds41 attention: window fold needs kv, kv_norm and ring_out == ring together, at most kMaxRows rows");
+}
+template <bool Swizzle, bool Half, bool Fold>
+static void launch_attention(const AttentionView& v, hipStream_t stream) {
     const unsigned hpw = attention_hpw(v);
-    const dim3 grid(kMaxChunks, v.heads / (kAttnMinBlockHeads * hpw), v.rows);
-    if (hpw == 4U) hipLaunchKernelGGL(attention_chunk_kernel<4>, grid, dim3(kAttnThreads), 0, stream, v);
-    else if (hpw == 2U) hipLaunchKernelGGL(attention_chunk_kernel<2>, grid, dim3(kAttnThreads), 0, stream, v);
-    else hipLaunchKernelGGL(attention_chunk_kernel<1>, grid, dim3(kAttnThreads), 0, stream, v);
+    const dim3 grid(attention_chunks(v), v.heads / (kAttnMinBlockHeads * hpw), v.rows);
+    // the f16 tile at 1 and 2 heads per wave only (at 4 its two tile forms exceed the register file)
+    if (hpw == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<4, Swizzle, false, Fold>), grid, dim3(kAttnThreads), 0, stream, v);
+    else if (hpw == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<2, Swizzle, Half, Fold>), grid, dim3(kAttnThreads), 0, stream, v);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<1, Swizzle, Half, Fold>), grid, dim3(kAttnThreads), 0, stream, v);
     if (v.tickets == nullptr) hipLaunchKernelGGL(attention_combine_kernel, dim3(v.heads, v.rows), dim3(32), 0, stream, v);
     check(hipGetLastError(), "ds41 attention");
+}
+void enqueue_attention_bf16_prefill(const AttentionView& v, hipStream_t stream, int variant) {
+    static const int env_variant = [] { const char* e = std::getenv("STRIX_DS41_BF16_ATTN_VARIANT"); return e && e[0] == '2' ? 2 : 1; }();
+    if (variant == 0) variant = env_variant;
+    (void)attention_hpw(v); // retain the incumbent view validation
+    if(v.heads%16U)throw std::invalid_argument("BF16 prefill requires a multiple of 16 heads");
+    if (variant == 2) hipLaunchKernelGGL(attention_bf16_chunk2, dim3(kMaxChunks,v.heads/16,v.rows),dim3(256),0,stream,v);
+    else hipLaunchKernelGGL(attention_bf16_chunk, dim3(kMaxChunks,v.heads/16,v.rows),dim3(256),0,stream,v);
+    hipLaunchKernelGGL(attention_combine_kernel,dim3(v.heads,v.rows),dim3(32),0,stream,v);
+    check(hipGetLastError(),"BF16 hi/lo prefill attention");
+}
+void enqueue_attention(const AttentionView& v, hipStream_t stream) {
+    check_fold(v);
+    const bool fold = v.kv != nullptr;
+    if (attention_lds_swizzle() && !fold) launch_attention<true, false, false>(v, stream);
+    else if (attention_tile_f16()) fold ? launch_attention<false, true, true>(v, stream) : launch_attention<false, true, false>(v, stream);
+    else fold ? launch_attention<false, false, true>(v, stream) : launch_attention<false, false, false>(v, stream);
 }
 
 // ---- several requests' segments per launch (BatchForward): the per-call checks and grids, flushed at kMaxSegments ----
@@ -1176,6 +1645,13 @@ void enqueue_index_scores_segments(std::span<const IndexView> views, hipStream_t
     }, [](const IndexView& v) { return dim3((v.max_count + 255U) / 256U); });
     check(hipGetLastError(), "ds41 index scores (segments)");
 }
+void enqueue_select_direct_segments(std::span<const SelectView> views, hipStream_t stream) {
+    for (const auto& v : views) check_select_direct(v);
+    for_segments(views, [&](const SegmentBatch<SelectView>& b) {
+        hipLaunchKernelGGL(select_direct_seg_kernel, dim3(b.blocks()), dim3(256), 0, stream, b.s);
+    }, [](const SelectView& v) { return dim3(v.rows); });
+    check(hipGetLastError(), "ds41 select direct (segments)");
+}
 void enqueue_select_segments(std::span<const SelectView> views, hipStream_t stream) {
     for (const auto& v : views) (void)select_slices(v);
     for_segments(views, [&](const SegmentBatch<SelectView>& b) {
@@ -1189,21 +1665,49 @@ void enqueue_select_segments(std::span<const SelectView> views, hipStream_t stre
     }, [](const SelectView& v) { return select_slices(v) == 0U ? dim3(0) : select_merge_grid(v); });
     check(hipGetLastError(), "ds41 select (segments)");
 }
-void enqueue_attention_segments(std::span<const AttentionView> views, hipStream_t stream) {
-    for (const unsigned hpw : {4U, 2U, 1U}) {  // each segment keeps its own heads per wave (its kernel form)
-        const auto grid = [hpw](const AttentionView& v) {
-            return attention_hpw(v) == hpw ? dim3(kMaxChunks, v.heads / (kAttnMinBlockHeads * hpw), v.rows) : dim3(0);
+// STRIX_DS41_ATTN_SEG_HPW: one form for every segment, attention_hpw's rule over the blocks of all of them (0: off)
+static unsigned shared_segment_hpw(std::span<const AttentionView> views) {
+    if (!attention_segment_hpw()) return 0U;
+    for (const unsigned hpw : {4U, 2U}) {
+        unsigned blocks = 0;
+        bool fits = true;
+        for (const auto& v : views) {
+            fits = fits && v.heads % (kAttnMinBlockHeads * hpw) == 0U;
+            blocks += attention_chunks(v) * (v.heads / (kAttnMinBlockHeads * hpw)) * v.rows;
+        }
+        if (fits && blocks >= attention_min_blocks()) return hpw;
+    }
+    return 1U;
+}
+template <bool Swizzle, bool Half, bool Fold>
+static void launch_attention_segments(std::span<const AttentionView> views, hipStream_t stream) {
+    for (const auto& v : views) (void)attention_hpw(v);  // the per-call checks
+    const unsigned shared = shared_segment_hpw(views);
+    for (const unsigned hpw : {4U, 2U, 1U}) {  // each segment keeps its own heads per wave (its kernel form), or the shared one
+        const auto grid = [hpw, shared](const AttentionView& v) {
+            return (shared != 0U ? shared : attention_hpw(v)) == hpw ? dim3(attention_chunks(v), v.heads / (kAttnMinBlockHeads * hpw), v.rows) : dim3(0);
         };
         for_segments(views, [&](const SegmentBatch<AttentionView>& b) {
-            if (hpw == 4U) hipLaunchKernelGGL(attention_chunk_seg_kernel<4>, dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
-            else if (hpw == 2U) hipLaunchKernelGGL(attention_chunk_seg_kernel<2>, dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
-            else hipLaunchKernelGGL(attention_chunk_seg_kernel<1>, dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
+            if (hpw == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_seg_kernel<4, Swizzle, false, Fold>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
+            else if (hpw == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_seg_kernel<2, Swizzle, Half, Fold>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
+            else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_seg_kernel<1, Swizzle, Half, Fold>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
         }, grid);
     }
     for_segments(views, [&](const SegmentBatch<AttentionView>& b) {
         hipLaunchKernelGGL(attention_combine_seg_kernel, dim3(b.blocks()), dim3(32), 0, stream, b.s);
     }, [](const AttentionView& v) { return v.tickets == nullptr ? dim3(v.heads, v.rows) : dim3(0); });
     check(hipGetLastError(), "ds41 attention (segments)");
+}
+void enqueue_attention_segments(std::span<const AttentionView> views, hipStream_t stream) {
+    if (views.empty()) return;
+    const bool fold = views[0].kv != nullptr;
+    for (const auto& v : views) {
+        check_fold(v);
+        if ((v.kv != nullptr) != fold) throw std::invalid_argument("ds41 attention segments: window fold on some segments only");
+    }
+    if (attention_lds_swizzle() && !fold) launch_attention_segments<true, false, false>(views, stream);
+    else if (attention_tile_f16()) fold ? launch_attention_segments<false, true, true>(views, stream) : launch_attention_segments<false, true, false>(views, stream);
+    else fold ? launch_attention_segments<false, false, true>(views, stream) : launch_attention_segments<false, false, false>(views, stream);
 }
 
 }  // namespace strix::ds41::attn::hip

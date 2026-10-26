@@ -13,6 +13,7 @@
 #include <thread>
 #include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <array>
 #include <cstring>
 #include <fstream>
@@ -160,6 +161,9 @@ OpenedLink open_link(const Usb4LayoutStream& stream, const Usb4AutoOptions& opti
     link.expected.ring_frames = q.ring_frames;
     link.expected.depth = setup.depth;
     link.expected.terminal = transport::GpuQueueTerminal::kernel_header;
+    // STRIX_DIST_GPU_QUEUE_LEAN=1: FD identity checked on session transitions only, no EVENT while nothing is
+    // in flight (default off: every PREPARE/SUBMIT/EVENT/RETIRE re-checks the descriptor, as before).
+    if (const char* v = std::getenv("STRIX_DIST_GPU_QUEUE_LEAN"); v && v[0] == '1') link.expected.lean = true;
     link.arena = export_gpu_direct_arena(std::size_t{q.ring_frames} * SGU_FRAME_BYTES, generation);
     return out;
 }

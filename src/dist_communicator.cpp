@@ -1,6 +1,8 @@
 #include "strix/dist/communicator.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/dist/host_copy.hpp"
+#include "dist_crc32c_parallel.hpp"
+#include "dist_crc32c_vector.hpp"
 #include "dist_latency_trace.hpp"
 
 #include "strix/serve/json.hpp"
@@ -190,6 +192,10 @@ public:
         if (error_) std::rethrow_exception(error_);
         return true;
     }
+    // The last posted job has finished (wait() then returns at once, or rethrows its failure).
+    [[nodiscard]] bool idle() const {
+        return finished_.load(std::memory_order_acquire) == posted_.load(std::memory_order_relaxed);
+    }
 
 private:
     void run() {
@@ -332,11 +338,20 @@ public:
         if (out.size() != in.size()) fail("usb4 exchange: both directions carry the same size");
         run(&out, &in);
     }
+    void exchange_overlapped(std::span<const std::byte> out, std::span<std::byte> in, void (*on_wire)(void*), void* context) override {
+        if (out.size() != in.size()) fail("usb4 exchange: both directions carry the same size");
+        run(&out, &in, on_wire, context);
+    }
+    // Both ranks the same table (the pairing carries rank 0's in its plan).
+    void set_stream_table(const std::array<std::pair<std::size_t, std::size_t>, 4>& table) { table_ = table; }
     [[nodiscard]] std::string name() const override {
         std::string out = "usb4-host:";
         for (std::size_t k = 0; k < names_.size(); ++k)
             out += (k ? "," : "") + names_[k] + (fds_.size() > 1U ? "*" + std::to_string(weights_[k]) : "");
         if (min_part_) out += " (min part " + std::to_string(min_part_) + " B)";
+        for (std::size_t i = 0; i < table_.size() && table_[i].second; ++i)
+            out += std::string(i ? "," : " (streams ") + (table_[i].first == SIZE_MAX ? std::string("inf") : std::to_string(table_[i].first)) + ":" +
+                   std::to_string(table_[i].second) + (i + 1U == table_.size() || !table_[i + 1U].second ? ")" : "");
         if (eager_) out += " (eager up to " + std::to_string(eager_) + " B)";
         return out;
     }
@@ -344,6 +359,8 @@ public:
 private:
     // Streams used for a message of `size` bytes, and stream k's part of it.
     [[nodiscard]] std::size_t streams_for(std::size_t size) const {
+        for (std::size_t i = 0; i < table_.size() && table_[i].second; ++i)
+            if (size <= table_[i].first) return std::clamp<std::size_t>(table_[i].second, 1U, fds_.size());
         if (!min_part_) return fds_.size();
         return std::clamp<std::size_t>(size / min_part_, 1U, fds_.size());
     }
@@ -394,7 +411,11 @@ private:
         st.done_w.store(0, std::memory_order_relaxed);
         while (done < bytes.size()) {
             wait_ready(k, POLLOUT, deadline, "write");
+            latency::mark("write_syscall_begin", bytes.size() - done);
             const auto n = ::write(fds_[k], bytes.data() + done, bytes.size() - done);
+            const int call_errno = errno;
+            latency::mark("write_syscall_end", n > 0 ? static_cast<std::uint64_t>(n) : 0U);
+            errno = call_errno;
             if (n > 0) {
                 done += static_cast<std::size_t>(n);
                 st.done_w.store(done, std::memory_order_relaxed);
@@ -410,6 +431,7 @@ private:
             }
             fail_stream(k, n == 0 ? std::string("write returned 0") : "write: " + errno_text(errno));
         }
+        latency::mark("stream_write_end", k);
     }
     void read_part(std::size_t k, std::span<std::byte> bytes) {
         latency::mark("stream_read_begin", k);
@@ -420,7 +442,11 @@ private:
         st.done_r.store(0, std::memory_order_relaxed);
         while (done < bytes.size()) {
             wait_ready(k, POLLIN, deadline, "read");
+            latency::mark("read_syscall_begin", bytes.size() - done);
             const auto n = ::read(fds_[k], bytes.data() + done, bytes.size() - done);
+            const int call_errno = errno;
+            latency::mark("read_syscall_end", n > 0 ? static_cast<std::uint64_t>(n) : 0U);
+            errno = call_errno;
             if (n > 0) {
                 done += static_cast<std::size_t>(n);
                 st.done_r.store(done, std::memory_order_relaxed);
@@ -437,15 +463,19 @@ private:
             }
             fail_stream(k, "read: " + errno_text(errno));
         }
+        latency::mark("stream_read_end", k);
     }
     // The eager path: every unfinished direction of every used stream in one loop on the calling thread. Each pass
     // tries the reads and writes (non-blocking); a pass without progress polls them all, in slices so an abort or the
     // deadline (no progress on any of them for the timeout) ends the wait. Partial reads and writes are the norm.
-    void eager(const std::span<const std::byte>* out, const std::span<std::byte>* in, std::size_t used) {
+    // on_wire (if any) runs once, in the first pass after which every write is handed to the driver (the reads then wait
+    // for the peer), or at the end.
+    void eager(const std::span<const std::byte>* out, const std::span<std::byte>* in, std::size_t used, void (*on_wire)(void*) = nullptr,
+               void* context = nullptr) {
         std::array<std::span<const std::byte>, 8> wpart{};
         std::array<std::span<std::byte>, 8> rpart{};
         std::array<std::size_t, 8> wdone{}, rdone{};
-        std::size_t open = 0;
+        std::size_t open = 0, wopen = 0;
         for (std::size_t k = 0; k < used; ++k) {
             auto& st = stats_[k];
             if (out) {
@@ -453,6 +483,7 @@ private:
                 st.want_w.store(wpart[k].size(), std::memory_order_relaxed);
                 st.done_w.store(0, std::memory_order_relaxed);
                 open += !wpart[k].empty();
+                wopen += !wpart[k].empty();
             }
             if (in) {
                 rpart[k] = part(*in, k, used);
@@ -476,6 +507,7 @@ private:
                         st.last_w.store(now_ns(), std::memory_order_relaxed);
                         moved = true;
                         open -= wdone[k] == wpart[k].size();
+                        wopen -= wdone[k] == wpart[k].size();
                     } else if (n == 0 || (errno != EAGAIN && errno != EINTR)) {
                         fail_stream(k, n == 0 ? std::string("write returned 0") : "write: " + errno_text(errno));
                     }
@@ -494,6 +526,11 @@ private:
                         fail_stream(k, "read: " + errno_text(errno));
                     }
                 }
+            }
+            if (on_wire && !wopen && open) {
+                on_wire(context);
+                on_wire = nullptr;
+                continue; // the reads may have progressed meanwhile: try them before polling
             }
             if (!open) break;
             if (aborted_.load(std::memory_order_acquire)) throw Aborted{};
@@ -519,6 +556,7 @@ private:
                 if (fds[i].revents & POLLNVAL) fail_stream(stream[i], "descriptor closed");
             }
         }
+        if (on_wire) on_wire(context);
     }
     struct Aborted {};
     [[noreturn]] void fail_stream(std::size_t k, const std::string& what) {
@@ -530,7 +568,7 @@ private:
         aborted_.store(true, std::memory_order_release);
         fail(text);
     }
-    void run(const std::span<const std::byte>* out, const std::span<std::byte>* in) {
+    void run(const std::span<const std::byte>* out, const std::span<std::byte>* in, void (*on_wire)(void*) = nullptr, void* context = nullptr) {
         if (poisoned_.load(std::memory_order_acquire)) {
             std::lock_guard lock(root_mutex_);
             fail("usb4 host transport: unusable after an earlier stream failure (" + (poison_.empty() ? root_ : poison_) + ")");
@@ -539,7 +577,7 @@ private:
         const std::size_t used = streams_for(size);
         if (size <= eager_) {
             try {
-                eager(out, in, used);
+                eager(out, in, used, on_wire, context);
                 return;
             } catch (...) {
                 if (!aborted_.load(std::memory_order_acquire)) throw;
@@ -562,6 +600,7 @@ private:
                 readers_[k]->post([this, k, piece] { guarded([&] { read_part(k, piece); }); });
             }
         }
+        if (on_wire) on_wire(context); // the stream threads move the bytes meanwhile
         std::exception_ptr first;
         for (std::size_t k = 0; k < used; ++k) {
             if (out) try { writers_[k]->wait(); } catch (...) { if (!first) first = std::current_exception(); }
@@ -589,6 +628,7 @@ private:
     std::vector<int> fds_;
     std::vector<std::uint32_t> weights_;
     std::size_t min_part_ = 0, eager_ = 0;
+    std::array<std::pair<std::size_t, std::size_t>, 4> table_{}; // (message bytes up to, streams), STRIX_DIST_USB4_STREAMS
     std::chrono::milliseconds timeout_;
     const bool spin_ = [] { const char* v = std::getenv("STRIX_DIST_USB4_SPIN"); return v && v[0] == '1'; }();
     std::atomic<bool> aborted_{false};
@@ -652,7 +692,7 @@ void set_blocking(int fd, bool blocking) {
 // ---- Automatic pairing -------------------------------------------------------------------------------
 constexpr std::uint64_t hello_magic = 0x4f4c4548584e5453ULL; // "STNXHELO"
 constexpr std::uint64_t plan_magic = 0x4e414c50584e5453ULL;  // "STNXPLAN"
-constexpr std::uint16_t pairing_version = 2;
+constexpr std::uint16_t pairing_version = 3; // 3: the plan carries the stream table and the calibration mode
 constexpr std::size_t max_streams = 8;
 
 struct Hello {
@@ -678,10 +718,16 @@ struct Plan {
     std::uint32_t index[max_streams] = {};  // rank 0's candidate indices, in striping order
     std::uint32_t weight[max_streams] = {};
     std::uint32_t min_part = 0;  // bytes per stream below which a message uses fewer streams (rank 0's value)
+    // STRIX_DIST_USB4_STREAMS (rank 0's): a message of at most streams_up_to[i] bytes (payload + trailer) uses the first
+    // streams_count[i] streams of the striping order; the first matching entry wins, 0 entries: min_part decides.
+    std::uint32_t streams_up_to[4] = {};
+    std::uint8_t streams_count[4] = {};
+    std::uint32_t flags = 0;     // plan_joint: the weights are recalibrated with every cable at once (rank 0's choice)
     std::uint32_t crc = 0;
-    std::uint32_t pad[10] = {};
+    std::uint32_t pad[3] = {};
 };
 static_assert(sizeof(Plan) == 128);
+constexpr std::uint32_t plan_joint = 1U;
 
 template <class T> std::uint32_t body_crc(const T& value) {
     return crc32c(std::span<const std::byte>(reinterpret_cast<const std::byte*>(&value), offsetof(T, crc)));
@@ -1005,9 +1051,11 @@ Plan read_plan(int fd) {
     return check_plan(plan);
 }
 bool same_plan(const Plan& a, const Plan& b) {
-    if (a.count != b.count || a.min_part != b.min_part) return false;
+    if (a.count != b.count || a.min_part != b.min_part || a.flags != b.flags) return false;
     for (std::uint32_t i = 0; i < a.count; ++i)
         if (a.index[i] != b.index[i] || a.weight[i] != b.weight[i]) return false;
+    for (std::size_t i = 0; i < 4U; ++i)
+        if (a.streams_up_to[i] != b.streams_up_to[i] || a.streams_count[i] != b.streams_count[i]) return false;
     return true;
 }
 // Rank 0 sends the plan on its first stream; rank 1 echoes it after checking it.
@@ -1056,6 +1104,64 @@ double probe_exchange(const std::vector<int>& fds, std::size_t bytes, std::uint3
             if (in[k][i] != static_cast<std::byte>((i * 131U + k * 7U + (1U - rank)) & 0xffU))
                 fail("usb4 probe: corrupted bytes on stream " + std::to_string(k));
     return seconds;
+}
+
+// Every stream at once, stream k carrying parts[k] bytes each way: per stream, the seconds until both its write and its
+// read are complete (the rate each stream really gets while all of them share the host).
+std::vector<double> probe_joint(const std::vector<int>& fds, const std::vector<std::size_t>& parts, std::uint32_t rank) {
+    const std::size_t count = fds.size();
+    std::vector<std::vector<std::byte>> out(count), in(count);
+    for (std::size_t k = 0; k < count; ++k) {
+        out[k].resize(parts[k]);
+        in[k].resize(parts[k]);
+        for (std::size_t i = 0; i < parts[k]; ++i) out[k][i] = static_cast<std::byte>((i * 131U + k * 7U + rank) & 0xffU);
+    }
+    std::vector<std::chrono::steady_clock::time_point> wend(count), rend(count);
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<std::thread> threads;
+    std::vector<std::exception_ptr> errors(2U * count);
+    for (std::size_t k = 0; k < count; ++k) {
+        threads.emplace_back([&, k] {
+            try { write_all(fds[k], out[k], "usb4 joint probe"); } catch (...) { errors[2U * k] = std::current_exception(); }
+            wend[k] = std::chrono::steady_clock::now();
+        });
+        threads.emplace_back([&, k] {
+            try { read_all(fds[k], in[k], "usb4 joint probe"); } catch (...) { errors[2U * k + 1U] = std::current_exception(); }
+            rend[k] = std::chrono::steady_clock::now();
+        });
+    }
+    for (auto& t : threads) t.join();
+    for (const auto& e : errors)
+        if (e) std::rethrow_exception(e);
+    std::vector<double> seconds(count);
+    for (std::size_t k = 0; k < count; ++k) {
+        for (std::size_t i = 0; i < in[k].size(); ++i)
+            if (in[k][i] != static_cast<std::byte>((i * 131U + k * 7U + (1U - rank)) & 0xffU))
+                fail("usb4 joint probe: corrupted bytes on stream " + std::to_string(k));
+        seconds[k] = std::chrono::duration<double>(std::max(wend[k], rend[k]) - start).count();
+    }
+    return seconds;
+}
+
+// STRIX_DIST_USB4_STREAMS="UP_TO:N,..." (UP_TO in message bytes incl. the 128-byte trailer, or "inf"; at most 4 entries,
+// increasing): a message of at most UP_TO bytes uses the first N streams of the striping order (one per cable first).
+void parse_stream_table(const char* text, std::uint32_t (&up_to)[4], std::uint8_t (&count)[4]) {
+    std::stringstream input(text);
+    std::size_t n = 0;
+    std::uint64_t last = 0;
+    for (std::string item; std::getline(input, item, ',');) {
+        const auto colon = item.find(':');
+        if (n == 4U || colon == std::string::npos) fail("STRIX_DIST_USB4_STREAMS: at most 4 UP_TO:N entries");
+        const std::string limit = item.substr(0, colon);
+        const std::uint64_t bytes = limit == "inf" ? UINT32_MAX : std::stoull(limit);
+        const auto streams = std::stoul(item.substr(colon + 1U));
+        if (bytes == 0U || bytes > UINT32_MAX || bytes <= last || streams == 0U || streams > max_streams)
+            fail("STRIX_DIST_USB4_STREAMS: UP_TO increasing in 1..4294967295 (or inf), N in 1..8");
+        up_to[n] = static_cast<std::uint32_t>(bytes);
+        count[n] = static_cast<std::uint8_t>(streams);
+        last = bytes;
+        ++n;
+    }
 }
 
 class TcpTransport final : public Transport {
@@ -1115,7 +1221,12 @@ private:
 std::uint32_t crc32c(std::span<const std::byte> bytes) noexcept {
 #if defined(__x86_64__)
     static const bool hardware = __builtin_cpu_supports("sse4.2");
-    if (hardware) return crc32c_sse42(bytes);
+    if (hardware) {
+        static const bool parallel = [] { const char* v = std::getenv("STRIX_DIST_CRC_PARALLEL"); return !v || std::string(v) != "0"; }();  // default on
+        if (parallel && bytes.size() >= 1024U && detail::crc32c_vector_available()) return detail::crc32c_vector(bytes);
+        if (parallel && bytes.size() >= 12288U) return detail::crc32c_parallel(bytes);
+        return crc32c_sse42(bytes);
+    }
 #endif
     const auto& table = crc_table();
     std::uint32_t c = 0xffffffffU;
@@ -1392,7 +1503,56 @@ std::unique_ptr<Transport> usb4_host_auto(const Usb4AutoOptions& options, Usb4To
             const double rate = options.probe_bytes ? info.measured_gbps : info.link_gbps;
             weights.weight[k] = std::max<std::uint32_t>(1U, static_cast<std::uint32_t>(rate * 1000.0 / members));
         }
+        // Rank 0's choices (rank 1 adopts its plan): explicit weights, the stream table, the joint calibration.
+        // STRIX_DIST_USB4_WEIGHTS=W0,W1,... (striping order) replaces the measured weights. STRIX_DIST_USB4_CALIBRATE=joint
+        // re-measures them with every cable at once: each cable alone runs near the same rate, but together the Gen2
+        // cable's streams get less than the Gen3 ones, so per-cable weights leave the faster cable idle at the end of a
+        // bulk message (transport measurements).
+        bool explicit_weights = false;
+        if (options.rank == 0U) {
+            if (const char* w = std::getenv("STRIX_DIST_USB4_WEIGHTS"); w && *w) {
+                std::stringstream input(w);
+                std::size_t k = 0;
+                for (std::string item; std::getline(input, item, ','); ++k) {
+                    if (k == accepted.size()) fail("STRIX_DIST_USB4_WEIGHTS: more weights than streams");
+                    const auto value = std::stoul(item);
+                    if (value == 0U || value > 1000000U) fail("STRIX_DIST_USB4_WEIGHTS: weights in 1..1000000");
+                    weights.weight[k] = static_cast<std::uint32_t>(value);
+                }
+                if (k != accepted.size()) fail("STRIX_DIST_USB4_WEIGHTS: one weight per stream (" + std::to_string(accepted.size()) + ")");
+                explicit_weights = true;
+            }
+            if (const char* t = std::getenv("STRIX_DIST_USB4_STREAMS"); t && *t) parse_stream_table(t, weights.streams_up_to, weights.streams_count);
+            if (const char* c = std::getenv("STRIX_DIST_USB4_CALIBRATE"); c && std::string(c) == "joint" && !explicit_weights && accepted.size() > 1U)
+                weights.flags |= plan_joint;
+        }
         agree(fds[0], options.rank, weights);
+        if (weights.flags & plan_joint) {
+            const std::size_t total = std::max<std::size_t>(options.probe_bytes, std::size_t{16} << 20U) * order.size();
+            const auto barrier = [&] {
+                std::array<std::byte, 64> token{}, back{};
+                write_all(fds[0], token, "usb4 joint probe barrier");
+                read_all(fds[0], back, "usb4 joint probe barrier");
+            };
+            for (int round = 0; round < 2; ++round) {
+                std::uint64_t sum = 0;
+                for (std::size_t k = 0; k < accepted.size(); ++k) sum += weights.weight[k];
+                std::vector<std::size_t> parts(accepted.size());
+                for (std::size_t k = 0; k < accepted.size(); ++k) parts[k] = std::max<std::size_t>(64U, (total * weights.weight[k] / sum) & ~std::size_t{63});
+                std::vector<std::vector<double>> times(accepted.size());
+                for (int rep = 0; rep < 3; ++rep) {
+                    barrier();
+                    const auto t = probe_joint(fds, parts, options.rank);
+                    for (std::size_t k = 0; k < t.size(); ++k) times[k].push_back(t[k]);
+                }
+                for (std::size_t k = 0; k < accepted.size(); ++k) {
+                    std::sort(times[k].begin(), times[k].end());
+                    const double gbps = static_cast<double>(parts[k]) * 8.0 / times[k][1] / 1e9;  // median of 3, one direction
+                    weights.weight[k] = std::max<std::uint32_t>(1U, static_cast<std::uint32_t>(gbps * 1000.0));
+                }
+                agree(fds[0], options.rank, weights);  // rank 0's measurement decides
+            }
+        }
         std::vector<std::string> names;
         std::vector<std::uint32_t> stream_weights;
         for (std::size_t k = 0; k < accepted.size(); ++k) {
@@ -1405,6 +1565,10 @@ std::unique_ptr<Transport> usb4_host_auto(const Usb4AutoOptions& options, Usb4To
         for (const auto i : accepted) candidates[i].fd = -1; // owned by the transport from here on
         auto transport = std::make_unique<Usb4HostTransport>(std::move(fds), std::move(names), std::move(stream_weights), weights.min_part,
                                                              options.io_timeout);
+        std::array<std::pair<std::size_t, std::size_t>, 4> table{};
+        for (std::size_t i = 0; i < 4U && weights.streams_count[i]; ++i)
+            table[i] = {weights.streams_up_to[i] == UINT32_MAX ? SIZE_MAX : std::size_t{weights.streams_up_to[i]}, std::size_t{weights.streams_count[i]}};
+        transport->set_stream_table(table);
         topo.min_part_bytes = weights.min_part;
         if (topology) *topology = std::move(topo);
         return transport;
@@ -1469,6 +1633,80 @@ std::uint64_t wall_ns() {
 class Communicator::Progress {
 public:
     Worker worker;
+    // STRIX_DIST_CRC_DEFER: sequence + 1 of the last message whose job handed it to finish() (trailer identity
+    // checked) before its deferred CRC work; the job keeps running that work afterwards.
+    std::atomic<std::uint64_t> delivered{0};
+};
+
+// Opt-in full-host pipeline. Both ranks must use the same chunk size. Each chunk
+// carries the unchanged payload CRC plus the complete collective identity and its
+// offset/total/version; a failed chunk never becomes visible to a consumer kernel.
+class Communicator::Pipeline {
+public:
+    std::size_t chunk = 0;
+    std::byte *send = nullptr, *receive = nullptr;
+    hipStream_t tx = nullptr, rx = nullptr;
+    hipEvent_t producer = nullptr, consumer = nullptr;
+    std::vector<hipEvent_t> ready;
+    std::atomic<void*> destination{nullptr};
+    double stage = 0, wire = 0, check_seconds = 0;
+    std::unique_ptr<Worker> crc_send, crc_receive;
+    std::atomic<std::size_t> prepared{0}, received{0};
+    std::atomic<bool> failed{false};
+    std::mutex failure_mutex;
+    std::exception_ptr failure;
+    void publish(std::atomic<std::size_t>& counter, std::size_t value) {
+        { std::lock_guard lock(failure_mutex);
+          if (!failed.load(std::memory_order_relaxed)) counter.store(value, std::memory_order_release); }
+        counter.notify_one();
+    }
+    void fail(std::exception_ptr error = {}) {
+        { std::lock_guard lock(failure_mutex);
+          if (!failure && error) failure = error;
+          failed.store(true, std::memory_order_release);
+          prepared.store(SIZE_MAX, std::memory_order_release);
+          received.store(SIZE_MAX, std::memory_order_release); }
+        prepared.notify_all(); received.notify_all();
+    }
+    void wait_count(std::atomic<std::size_t>& counter, std::size_t target) {
+        for (auto seen = counter.load(std::memory_order_acquire); seen < target; seen = counter.load(std::memory_order_acquire)) {
+            if (failed.load(std::memory_order_acquire)) throw std::runtime_error("dist pipeline: a stage failed");
+            counter.wait(seen, std::memory_order_acquire);
+        }
+        if (failed.load(std::memory_order_acquire)) throw std::runtime_error("dist pipeline: a stage failed");
+    }
+    Pipeline(std::size_t capacity, std::size_t size) : chunk(size) {
+        const auto count = (capacity - 1U) / chunk + 1U;
+        const auto allocation = capacity + count * sizeof(Trailer);
+        try {
+            check(hipHostMalloc(reinterpret_cast<void**>(&send), allocation, hipHostMallocDefault), "pipeline send");
+            check(hipHostMalloc(reinterpret_cast<void**>(&receive), allocation, hipHostMallocDefault), "pipeline receive");
+            check(hipStreamCreateWithFlags(&tx, hipStreamNonBlocking), "pipeline tx stream");
+            check(hipStreamCreateWithFlags(&rx, hipStreamNonBlocking), "pipeline rx stream");
+            check(hipEventCreateWithFlags(&producer, hipEventDisableTiming), "pipeline producer");
+            check(hipEventCreateWithFlags(&consumer, hipEventDisableTiming), "pipeline consumer");
+            ready.resize(count, nullptr);
+            for (auto& e : ready) check(hipEventCreateWithFlags(&e, hipEventDisableTiming), "pipeline ready");
+            if (const char* v = std::getenv("STRIX_DIST_HOST_CRC_OVERLAP"); !v || std::string(v) != "0") {  // default on
+                crc_send = std::make_unique<Worker>(); crc_receive = std::make_unique<Worker>();
+                crc_send->name("u4-crctx"); crc_receive->name("u4-crcrx");
+            }
+        } catch (...) { cleanup(); throw; }
+    }
+    ~Pipeline() { cleanup(); }
+    void cleanup() {
+        fail();
+        crc_send.reset(); crc_receive.reset(); // join jobs before releasing their events and pinned memory
+        if (tx) (void)hipStreamSynchronize(tx);
+        if (rx) (void)hipStreamSynchronize(rx);
+        for (auto e : ready) if (e) (void)hipEventDestroy(e);
+        if (producer) (void)hipEventDestroy(producer);
+        if (consumer) (void)hipEventDestroy(consumer);
+        if (tx) (void)hipStreamDestroy(tx);
+        if (rx) (void)hipStreamDestroy(rx);
+        if (send) (void)hipHostFree(send);
+        if (receive) (void)hipHostFree(receive);
+    }
 };
 
 Communicator::Communicator(Group group, std::unique_ptr<Transport> transport, std::size_t max_bytes)
@@ -1492,6 +1730,8 @@ Communicator::Communicator(Group group, std::unique_ptr<Transport> transport, st
         if (d2h_kernel_bytes_ > (std::size_t{1} << 20U))
             throw std::invalid_argument("STRIX_DIST_HOST_D2H_KERNEL_BYTES must be 0..1048576");
     }
+    // default 262144 (with the lean releases of STRIX_DS41_READY_LEAN); =0: no readiness views
+    staged_ready_bytes_ = 262144U;
     if (const char* t = std::getenv("STRIX_DIST_STAGED_READY_BYTES"); t && *t) {
         staged_ready_bytes_ = std::stoull(t);
         if (staged_ready_bytes_ > (std::size_t{1} << 20U))
@@ -1549,6 +1789,16 @@ Communicator::Communicator(Group group, std::unique_ptr<Transport> transport, st
             (void)hipHostFree(send_host_);
             throw;
         }
+    }
+    // default on (ds41/xfer t1: R6 -0.7 %, R1/N8 equal or better, exact); =0: inline CRCs
+    crc_defer_ = true;
+    if (const char* v = std::getenv("STRIX_DIST_CRC_DEFER"); v && v[0] == '0' && v[1] == '\0') crc_defer_ = false;
+    {  // default 1 MiB chunks (w5); =0: one piece
+        const char* v = std::getenv("STRIX_DIST_HOST_CHUNK_BYTES");
+        const auto chunk = v && *v ? static_cast<std::size_t>(std::stoull(v)) : std::size_t{1048576};
+        if (chunk && (chunk < 65536U || chunk > (16U << 20U) || chunk % 64U))
+            throw std::invalid_argument("STRIX_DIST_HOST_CHUNK_BYTES: 0 or a multiple of 64 in [65536,16777216]");
+        if (chunk && max_bytes_ > chunk) pipeline_ = std::make_unique<Pipeline>(max_bytes_, chunk);
     }
     if (const char* t = std::getenv("STRIX_DIST_TRACE"); t && *t) {
         const auto path = std::string(t) + ".r" + std::to_string(group_.rank);
@@ -1732,6 +1982,10 @@ Communicator::~Communicator() {
     direct_.reset(); // waits for its in-flight exchange and releases its streams
     if (started_) {
         cancel_.store(true, std::memory_order_release); // the job's own waits stop
+        if (pipeline_started_) {
+            pipeline_->fail();
+            transport_->abort("dist pipeline: destroyed with an exchange in flight");
+        }
         try {
             if (!progress_->worker.wait_until(std::chrono::steady_clock::now() + wait_timeout_)) {
                 transport_->abort("dist exchange: destroyed with an exchange in flight");
@@ -1739,7 +1993,21 @@ Communicator::~Communicator() {
             }
         } catch (...) {}
     }
-    progress_.reset();
+    // Stage jobs use pipeline_ through this communicator, including their failure
+    // handler. Join them while the owning pointer is still non-null: unique_ptr
+    // reset clears it BEFORE entering Pipeline's destructor.
+    if (pipeline_) {
+        pipeline_->fail();
+    }
+    progress_.reset(); // no progress job may read the CRC-worker pointers after this
+    if (rx_pending_sequence_ && terminal_.empty())  // a collective sequence should end with an ordinary exchange
+        std::fprintf(stderr, "dist exchange: destroyed before the deferred CRC of exchange %llu was checked\n",
+                     static_cast<unsigned long long>(rx_pending_sequence_ - 1U));
+    if (pipeline_) {
+        pipeline_->crc_send.reset();
+        pipeline_->crc_receive.reset();
+    }
+    pipeline_.reset();
     // Teardown only: a forgotten release, a prepared-but-not-started producer or
     // a host timeout cannot free storage still referenced by this stream.
     if (staged_exposed_) (void)hipStreamSynchronize(staged_stream_);
@@ -1806,7 +2074,7 @@ ProducerStage Communicator::prepare_staged_ready(hipStream_t stream, std::size_t
     staged_prepared_bytes_ = bytes;
     staged_token_ = sequence_ + 1U;
     reset_staged_flag(producer_flag_, staged_token_);
-    return ProducerStage{staged_send_device_, producer_flag_device_, staged_token_};
+    return ProducerStage{staged_send_device_, producer_flag_device_, staged_token_, staged_counters_};
 }
 
 void Communicator::start_staged_ready(hipStream_t stream, std::size_t bytes, const Tag& tag) {
@@ -1836,7 +2104,7 @@ ConsumerStage Communicator::finish_staged_ready() {
     staged_receive_held_ = true;
     reset_staged_flag(consumer_flag_, staged_token_); // CPU payload writes happen before GPU's acquire
     latency::mark("consumer_view_ready");
-    return ConsumerStage{staged_receive_device_, consumer_flag_device_, staged_token_};
+    return ConsumerStage{staged_receive_device_, consumer_flag_device_, staged_token_, staged_counters_ + 1};
 }
 
 void Communicator::release_staged_ready(hipStream_t stream) {
@@ -1912,10 +2180,201 @@ void Communicator::start(hipStream_t stream, const void* local, std::size_t byte
     }
     if (bytes == 0U || bytes > max_bytes_ || !local) throw std::invalid_argument("dist exchange size or buffers");
     tag_ = tag;
-    start_host(stream, local, bytes);
+    if (pipeline_ && bytes > pipeline_->chunk) start_pipeline(stream, local, bytes);
+    else start_host(stream, local, bytes);
+}
+
+void Communicator::start_pipeline(hipStream_t stream, const void* local, std::size_t bytes) {
+    latency::context().sequence = sequence_;
+    latency::mark("pipeline_entry", bytes);
+    auto& p = *pipeline_;
+    const auto entry = std::chrono::steady_clock::now();
+    stats_.last_entry = entry;
+    current_ = History{sequence_, bytes, tag_.kind, tag_.layer, tag_.request, 0, 0, 'P'};
+    set_phase(Phase::reuse_wait);
+    if (receive_pending_) {
+        const auto deadline = entry + wait_timeout_;
+        for (;;) {
+            const auto e = hipEventQuery(receive_done_);
+            if (e == hipSuccess) break;
+            if (e != hipErrorNotReady) check(e, "pipeline previous receive");
+            if (std::chrono::steady_clock::now() >= deadline) stop("pipeline receive-buffer reuse timeout");
+            cpu_relax();
+        }
+    }
+    receive_pending_ = false;
+    p.destination.store(nullptr, std::memory_order_relaxed);
+    p.stage = p.wire = p.check_seconds = 0;
+    p.failure = nullptr;
+    p.failed.store(false, std::memory_order_relaxed);
+    p.prepared.store(0, std::memory_order_relaxed); p.received.store(0, std::memory_order_relaxed);
+    bytes_ = bytes;
+    started_at_ = entry;
+    if (!send_ready_) check(hipEventCreateWithFlags(&send_ready_, hipEventDisableTiming), "pipeline send event");
+    if (!receive_done_) check(hipEventCreateWithFlags(&receive_done_, hipEventDisableTiming), "pipeline receive event");
+    check(hipEventRecord(p.producer, stream), "pipeline producer");
+    check(hipStreamWaitEvent(p.tx, p.producer, 0), "pipeline producer dependency");
+    for (std::size_t at = 0, k = 0; at < bytes; at += p.chunk, ++k) {
+        const auto n = std::min(p.chunk, bytes - at);
+        const auto slot = at + k * sizeof(Trailer);
+        check(hipMemcpyAsync(p.send + slot, static_cast<const std::byte*>(local) + at, n, hipMemcpyDeviceToHost, p.tx), "pipeline D2H");
+        check(hipEventRecord(p.ready[k], p.tx), "pipeline chunk ready");
+    }
+    check(hipEventRecord(send_ready_, p.tx), "pipeline all D2H");
+    // Preserve start()'s source lifetime contract: later writes to local on the
+    // caller stream cannot race our off-stream D2H copies.
+    check(hipStreamWaitEvent(stream, send_ready_, 0), "pipeline source lifetime");
+    started_ = pipeline_started_ = true;
+    set_phase(Phase::producer);
+    const auto prepare = [this](std::size_t at, std::size_t k) {
+        auto& q = *pipeline_;
+        if (q.failed.load(std::memory_order_acquire)) throw std::runtime_error("dist pipeline: a stage failed");
+        const auto n = std::min(q.chunk, bytes_ - at), slot = at + k * sizeof(Trailer);
+        const auto deadline = started_at_ + wait_timeout_;
+        latency::mark("chunk_d2h_wait", at);
+        const auto t = std::chrono::steady_clock::now();
+        for (unsigned spin = 0;; ++spin) {
+            const auto e = hipEventQuery(q.ready[k]);
+            if (e == hipSuccess) break;
+            if (e != hipErrorNotReady) check(e, "pipeline event");
+            if ((spin & 1023U) == 0U && (q.failed.load(std::memory_order_acquire) || cancel_.load(std::memory_order_acquire) || std::chrono::steady_clock::now() >= deadline))
+                throw std::runtime_error("dist pipeline producer timeout");
+            cpu_relax();
+        }
+        latency::mark("chunk_crc_tx_begin", at);
+        Trailer sent;
+        sent.epoch = group_.epoch; sent.plan = group_.plan; sent.sequence = sequence_; sent.request = tag_.request;
+        sent.bytes = n; sent.rank = group_.rank; sent.tag = tag_.kind; sent.layer = tag_.layer;
+        sent.reserved[0] = 1U; sent.reserved[1] = at; sent.reserved[2] = bytes_; sent.reserved[3] = q.chunk;
+        sent.crc32c = crc32c({q.send + slot, n});
+        std::memcpy(q.send + slot + n, &sent, sizeof(sent));
+        q.stage += std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
+        latency::mark("chunk_crc_tx_end", at);
+    };
+    const auto receive = [this](std::size_t at, std::size_t k, void*& destination) {
+        auto& q = *pipeline_;
+        const auto n = std::min(q.chunk, bytes_ - at), slot = at + k * sizeof(Trailer);
+        latency::mark("chunk_crc_rx_begin", at);
+        const auto t = std::chrono::steady_clock::now();
+        Trailer peer, sent;
+        std::memcpy(&sent, q.send + slot + n, sizeof(sent));
+        std::memcpy(&peer, q.receive + slot + n, sizeof(peer));
+        if (peer.magic != trailer_magic || peer.epoch != sent.epoch || peer.plan != sent.plan || peer.sequence != sent.sequence ||
+            peer.request != sent.request || peer.bytes != n || peer.rank != 1U - group_.rank || peer.tag != sent.tag || peer.layer != sent.layer ||
+            !std::equal(std::begin(peer.reserved), std::end(peer.reserved), std::begin(sent.reserved)))
+            throw std::runtime_error("dist pipeline: peer chunk identity/offset/geometry mismatch");
+        if (peer.crc32c != crc32c({q.receive + slot, n})) throw std::runtime_error("dist pipeline: payload CRC mismatch");
+        q.check_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
+        latency::mark("chunk_validated", at);
+        if (!destination) {
+            const auto deadline = started_at_ + wait_timeout_;
+            for (unsigned spin = 0; !(destination = q.destination.load(std::memory_order_acquire)); ++spin) {
+                if ((spin & 1023U) == 0U && (q.failed.load(std::memory_order_acquire) || cancel_.load(std::memory_order_acquire) || std::chrono::steady_clock::now() >= deadline))
+                    throw std::runtime_error("dist pipeline: finish did not provide a destination before timeout");
+                cpu_relax();
+            }
+            check(hipStreamWaitEvent(q.rx, q.consumer, 0), "pipeline destination lifetime");
+        }
+        check(hipMemcpyAsync(static_cast<std::byte*>(destination) + at, q.receive + slot, n, hipMemcpyHostToDevice, q.rx), "pipeline H2D");
+        latency::mark("chunk_h2d_enqueued", at);
+    };
+    const auto guarded = [this](auto job) {
+        return [this, job] {
+            latency::context().sequence = sequence_;
+            try { job(); }
+            catch (...) {
+                pipeline_->fail(std::current_exception());
+                transport_->abort("dist pipeline: a stage failed");
+                throw;
+            }
+        };
+    };
+    if (p.crc_send) {
+        p.crc_send->post(guarded([this, prepare] {
+            auto& q = *pipeline_;
+            for (std::size_t at = 0, k = 0; at < bytes_; at += q.chunk, ++k) {
+                if (q.failed.load(std::memory_order_acquire)) throw std::runtime_error("dist pipeline: a stage failed");
+                prepare(at, k);
+                q.publish(q.prepared, k + 1U);
+            }
+        }));
+        p.crc_receive->post(guarded([this, receive] {
+            auto& q = *pipeline_;
+            void* destination = nullptr;
+            for (std::size_t at = 0, k = 0; at < bytes_; at += q.chunk, ++k) {
+                q.wait_count(q.received, k + 1U);
+                receive(at, k, destination);
+            }
+            check(hipEventRecord(receive_done_, q.rx), "pipeline receive complete");
+        }));
+    }
+    progress_->worker.post(guarded([this, prepare, receive] {
+        auto& q = *pipeline_;
+        void* destination = nullptr;
+        for (std::size_t at = 0, k = 0; at < bytes_; at += q.chunk, ++k) {
+            const auto n = std::min(q.chunk, bytes_ - at), slot = at + k * sizeof(Trailer);
+            if (q.crc_send) q.wait_count(q.prepared, k + 1U);
+            else prepare(at, k);
+            latency::mark("chunk_transport_begin", at);
+            set_phase(Phase::transfer);
+            const auto t = std::chrono::steady_clock::now();
+            transport_->exchange({q.send + slot, n + sizeof(Trailer)}, {q.receive + slot, n + sizeof(Trailer)});
+            q.wire += std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
+            latency::mark("chunk_transport_end", at);
+            if (q.crc_receive) {
+                q.publish(q.received, k + 1U);
+            } else receive(at, k, destination);
+        }
+        if (!q.crc_receive) check(hipEventRecord(receive_done_, q.rx), "pipeline receive complete");
+    }));
+    returned_at_ = std::chrono::steady_clock::now();
+}
+
+void Communicator::finish_pipeline(hipStream_t stream, void* remote) {
+    latency::mark("pipeline_finish_begin");
+    const auto entry = std::chrono::steady_clock::now();
+    auto& p = *pipeline_;
+    check(hipEventRecord(p.consumer, stream), "pipeline consumer ready");
+    p.destination.store(remote, std::memory_order_release);
+    const auto deadline = entry + 2 * wait_timeout_ + std::chrono::seconds(5);
+    std::exception_ptr error;
+    const auto join = [&](Worker& worker) {
+        try {
+            if (!worker.wait_until(deadline)) {
+                p.fail(std::make_exception_ptr(std::runtime_error("pipeline progress timeout")));
+                transport_->abort("pipeline progress timeout");
+                stop("pipeline progress timeout");
+            }
+        } catch (...) { if (!error) error = std::current_exception(); }
+    };
+    join(progress_->worker);
+    if (p.crc_send) { join(*p.crc_send); join(*p.crc_receive); }
+    { std::lock_guard lock(p.failure_mutex); if (p.failure) error = p.failure; }
+    if (error) {
+        try { std::rethrow_exception(error); }
+        catch (const std::exception& e) { stop(e.what()); }
+    }
+    check(hipStreamWaitEvent(stream, receive_done_, 0), "pipeline consumer dependency");
+    receive_pending_ = true;
+    started_ = pipeline_started_ = false;
+    set_phase(Phase::idle);
+    history_[history_next_++ % history_.size()] = current_;
+    ++sequence_;
+    ++stats_.exchanges;
+    stats_.bytes_sent += bytes_;
+    const auto end = std::chrono::steady_clock::now();
+    stats_.stage += p.stage;
+    stats_.wire += p.wire;
+    stats_.check += p.check_seconds;
+    stats_.overlap += std::chrono::duration<double>(entry - returned_at_).count();
+    stats_.finish_wait += std::chrono::duration<double>(end - entry).count();
+    stats_.seconds += std::chrono::duration<double>(end - started_at_).count();
+    latency::mark("pipeline_finish_end");
 }
 
 void Communicator::start_host(hipStream_t stream, const void* local, std::size_t bytes) {
+    drain_tail();
+    deferring_ = crc_defer_ && staged_started_ && !check_on_caller();
     latency::context().sequence = sequence_;
     latency::mark("host_entry", bytes);
     const auto entry = std::chrono::steady_clock::now();
@@ -1991,15 +2450,43 @@ void Communicator::start_host(hipStream_t stream, const void* local, std::size_t
         Trailer trailer;
         trailer.epoch = group_.epoch; trailer.plan = group_.plan; trailer.sequence = sequence_; trailer.request = tag_.request;
         trailer.bytes = bytes_; trailer.rank = group_.rank; trailer.tag = tag_.kind; trailer.layer = tag_.layer;
-        latency::mark("crc_tx_begin");
-        trailer.crc32c = crc32c(std::span<const std::byte>(send_host_, bytes_));
-        latency::mark("crc_tx_end");
+        // Every message carries the CRC of this rank's previous deferred one (if any), checked by the peer.
+        trailer.carried_sequence = tx_carry_sequence_;
+        trailer.carried_crc32c = tx_carry_crc_;
+        tx_carry_sequence_ = 0;
+        // Deferred: this message's own CRC is computed while it is on the wire and goes in the next trailer.
+        const bool defer = deferring_;
+        const std::uint64_t sequence = sequence_;
+        const std::span<const std::byte> payload(send_host_, bytes_);
+        const std::span<const std::byte> received(receive_host_, bytes_);
+        struct OnWire {
+            std::span<const std::byte> payload;
+            std::uint32_t crc;
+        } on_wire{payload, 0U};
+        if (defer) {
+            trailer.flags = trailer_crc_deferred;
+        } else {
+            latency::mark("crc_tx_begin");
+            trailer.crc32c = crc32c(payload);
+            latency::mark("crc_tx_end");
+        }
         if (trace_) trailer.staged_ns = t_staged_ = wall_ns();
         std::memcpy(send_host_ + bytes_, &trailer, sizeof(trailer));
         stats_.last_staged = std::chrono::steady_clock::now();
         latency::mark("transport_begin");
-        transport_->exchange(std::span<const std::byte>(send_host_, bytes_ + sizeof(Trailer)),
-                             std::span<std::byte>(receive_host_, bytes_ + sizeof(Trailer)));
+        if (defer)
+            transport_->exchange_overlapped(std::span<const std::byte>(send_host_, bytes_ + sizeof(Trailer)),
+                                            std::span<std::byte>(receive_host_, bytes_ + sizeof(Trailer)),
+                                            [](void* context) {
+                                                auto& w = *static_cast<OnWire*>(context);
+                                                latency::mark("crc_tx_wire_begin");
+                                                w.crc = crc32c(w.payload);
+                                                latency::mark("crc_tx_wire_end");
+                                            },
+                                            &on_wire);
+        else
+            transport_->exchange(std::span<const std::byte>(send_host_, bytes_ + sizeof(Trailer)),
+                                 std::span<std::byte>(receive_host_, bytes_ + sizeof(Trailer)));
         latency::mark("transport_end");
         stats_.last_received = std::chrono::steady_clock::now();
         if (trace_) t_received_ = wall_ns();
@@ -2012,14 +2499,41 @@ void Communicator::start_host(hipStream_t stream, const void* local, std::size_t
         // STRIX_DIST_CHECK_ON_CALLER=1: checked by finish() on the caller's thread instead (the earlier placement).
         if (!check_on_caller()) {
             latency::mark("crc_rx_begin");
-            validate_peer();
+            validate_peer(defer);
             latency::mark("crc_rx_end");
+        }
+        if (defer) {
+            tx_carry_sequence_ = sequence + 1U;
+            tx_carry_crc_ = on_wire.crc;
+            // finish() returns now; the consumer reads the receive view while its CRC is computed here. The next
+            // exchange's job (this worker runs one job at a time) checks it against the peer's next trailer.
+            progress_->delivered.store(sequence + 1U, std::memory_order_release);
+            latency::mark("crc_rx_deferred_begin");
+            rx_pending_crc_ = crc32c(received);
+            rx_pending_sequence_ = sequence + 1U;
+            latency::mark("crc_rx_deferred_end");
         }
     });
     returned_at_ = std::chrono::steady_clock::now();
 }
 
+void Communicator::drain_tail() {
+    if (!tail_pending_) return;
+    tail_pending_ = false;
+    try {
+        if (!progress_->worker.wait_until(std::chrono::steady_clock::now() + wait_timeout_))
+            stop("the previous exchange's deferred CRC work did not return within " + std::to_string(wait_timeout_.count()) + " ms");
+    } catch (const std::exception& e) {
+        stop(e.what());
+    }
+}
+
 void Communicator::finish(hipStream_t stream, void* remote) {
+    if (pipeline_started_) {
+        if (!remote) throw std::invalid_argument("dist pipeline receive buffer");
+        finish_pipeline(stream, remote);
+        return;
+    }
     if (direct_started_) {
         if (!remote) throw std::invalid_argument("dist exchange receive buffer");
         direct_started_ = false;
@@ -2090,6 +2604,7 @@ void Communicator::stop(const std::string& why) {
     if (terminal_.empty()) {
         terminal_ = why + tuple;
         cancel_.store(true, std::memory_order_release);
+        if (pipeline_started_) pipeline_->fail();
         std::fprintf(stderr, "%s\n%s\n", terminal_.c_str(), state.c_str());
         std::fflush(stderr);
         transport_->abort(terminal_); // closes the channel: the peer's pending reads end now
@@ -2102,14 +2617,23 @@ bool Communicator::check_on_caller() {
     return on;
 }
 
-void Communicator::validate_peer() {
+void Communicator::validate_peer(bool deferred) {
     Trailer peer;
     std::memcpy(&peer, receive_host_ + bytes_, sizeof(peer));
     if (peer.magic != trailer_magic || peer.epoch != group_.epoch || peer.plan != group_.plan || peer.sequence != sequence_ ||
         peer.request != tag_.request || peer.bytes != bytes_ || peer.rank != 1U - group_.rank || peer.tag != tag_.kind ||
         peer.layer != tag_.layer)
         throw std::runtime_error("dist exchange: the peer's trailer does not match this collective");
-    if (peer.crc32c != crc32c(std::span<const std::byte>(receive_host_, bytes_)))
+    // The previous deferred message's CRC (computed here after it was delivered) against the one the peer carries now.
+    if (peer.carried_sequence != rx_pending_sequence_)
+        throw std::runtime_error("dist exchange: deferred CRC carry mismatch (peer carries " + std::to_string(peer.carried_sequence) +
+                                 ", expected " + std::to_string(rx_pending_sequence_) + "; STRIX_DIST_CRC_DEFER must match on both ranks)");
+    if (rx_pending_sequence_ && peer.carried_crc32c != rx_pending_crc_)
+        throw std::runtime_error("dist exchange: payload CRC mismatch (deferred, exchange " + std::to_string(rx_pending_sequence_ - 1U) + ")");
+    rx_pending_sequence_ = 0;
+    if (((peer.flags & trailer_crc_deferred) != 0U) != deferred)
+        throw std::runtime_error("dist exchange: the peer's CRC deferral differs from this rank's (STRIX_DIST_CRC_DEFER must match)");
+    if (!deferred && peer.crc32c != crc32c(std::span<const std::byte>(receive_host_, bytes_)))
         throw std::runtime_error("dist exchange: payload CRC mismatch");
     peer_staged_ns_ = peer.staged_ns;
     if (trace_) t_validated_ = wall_ns();
@@ -2122,8 +2646,25 @@ void Communicator::finish_host(hipStream_t stream, void* remote) {
     try {
         // The job bounds its own waits (producer: wait_timeout_, each stream: the transport's no-progress timeout);
         // this bound is the last resort if it does not return.
-        if (!progress_->worker.wait_until(entry + 2 * wait_timeout_ + std::chrono::seconds(5)))
+        const auto bound = entry + 2 * wait_timeout_ + std::chrono::seconds(5);
+        if (deferring_) {
+            // Until the job delivers this message (it then computes the deferred CRCs) or ends (a failure: rethrown).
+            for (unsigned i = 0; progress_->delivered.load(std::memory_order_acquire) != sequence_ + 1U; ++i) {
+                if (progress_->worker.idle()) {
+                    progress_->worker.wait();
+                    if (progress_->delivered.load(std::memory_order_acquire) != sequence_ + 1U)
+                        throw std::logic_error("dist exchange: deferred job ended without delivering");
+                    break;
+                }
+                if ((i & 1023U) == 0U && std::chrono::steady_clock::now() >= bound)
+                    stop("the exchange's progress job did not deliver within " + std::to_string((2 * wait_timeout_ + std::chrono::seconds(5)).count()) + " ms");
+                cpu_relax();
+            }
+            tail_pending_ = true;
+            latency::mark("delivered");
+        } else if (!progress_->worker.wait_until(bound)) {
             stop("the exchange's progress job did not return within " + std::to_string((2 * wait_timeout_ + std::chrono::seconds(5)).count()) + " ms");
+        }
     } catch (const std::exception& e) {
         // Which collective was in flight: a stall shows the same one on both ranks, ranks that disagree on the
         // sequence of exchanges show different ones. The communicator stops and closes the channel (the peer wakes).
@@ -2141,6 +2682,7 @@ void Communicator::finish_host(hipStream_t stream, void* remote) {
         check(hipEventRecord(receive_done_, stream), "receive event");
         latency::mark("h2d_enqueued");
     }
+    latency::mark("h2d_enqueued");
     if (trace_) {
         if (!h2d_done_) check(hipEventCreate(&h2d_done_), "trace event");
         check(hipEventRecord(h2d_done_, stream), "trace event");

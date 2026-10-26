@@ -63,11 +63,17 @@ int main(int argc, char** argv) try {
         &ctx.prepare(pack, "layers.0.ffn.shared_experts.w3", {TrellisSlice::Kind::rows, 0, 1152}),
         &ctx.prepare(pack, "layers.0.ffn.shared_experts.w2", {TrellisSlice::Kind::columns, 0, 1152}),
         &ctx.prepare(pack, "head", {TrellisSlice::Kind::rows, 0, 64640})};
+    const auto& qa = ctx.prepare(pack, "layers.0.attn.wq_a");
+    const auto& kv = ctx.prepare(pack, "layers.0.attn.wkv");
+    const auto& whole_gate = ctx.prepare(pack, "layers.0.ffn.shared_experts.w1");
+    const auto& second_gate = ctx.prepare(pack, "layers.0.ffn.shared_experts.w1", {TrellisSlice::Kind::rows, 1152, 1152});
     ctx.reserve(s0.p, 8); ctx.reserve(s1.p, 8);
     const auto reserved = ctx.library_workspace_bytes();
     auto c = static_cast<strix_context>(ctx.library_context());
     std::uint64_t ws_bytes = 256;
-    for (const auto* site : sites) for (std::uint32_t r = 1; r <= 8; ++r) {
+    auto query_sites = sites;
+    query_sites.insert(query_sites.end(), {&qa, &kv, &whole_gate, &second_gate});
+    for (const auto* site : query_sites) for (std::uint32_t r = 1; r <= 8; ++r) {
         auto d = descriptor(*site, x0.f(), reference.f(), r);
         std::uint64_t b = 0;
         lib_check(strix_matmul_workspace_bytes(c, &d, &b)); ws_bytes = std::max(ws_bytes, b);
@@ -131,6 +137,54 @@ int main(int argc, char** argv) try {
     if (ctx.library_workspace_bytes() != reserved) {
         std::printf("DIFF workspace allocation grew after reserve\n"); ++failures;
     }
+    // New pair storage is independent of generic scratch and single-projection counters.
+    for (unsigned sweep = 0; sweep < 3U; ++sweep) {
+        for (unsigned which = 0; which < 2U; ++which) {
+            auto& x = which ? x1 : x0; auto& y = which ? y1 : y0;
+            const auto stream = which ? s1.p : s0.p;
+            for (std::uint32_t r : {1U, 6U, 8U, 2U, 4U, 3U, 7U, 5U, 1U}) {
+                compare(qa, r, x, y, stream, 391U + calls);
+                compare(kv, r, x, y, stream, 791U + calls);
+                check(hipMemsetAsync(y.p, 0xff, 8ULL * 64640U * 4U, stream));
+                enqueue_trellis_qakv(qa, kv, x.f(), y.f(), y.f() + 8U * 1280U, r, stream);
+                check_output(qa, r, x, y, stream);
+                // The kv member occupies a separate output span.
+                check(hipMemcpyAsync(y.f(), y.f() + 8U * 1280U, r * 512U * 4U, hipMemcpyDeviceToDevice, stream));
+                check_output(kv, r, x, y, stream);
+                compare(*sites.back(), r, x, y, stream, 113U + calls);
+                // Compare K4 row-halves with the whole S16 product, preserving output row stride.
+                if (whole_gate.bits == 4U) {
+                    enqueue_trellis_linear(*sites[2], x.f(), y.f(), r, 5120U, 2304U, false, stream);
+                    enqueue_trellis_linear(second_gate, x.f(), y.f() + 1152U, r, 5120U, 2304U, false, stream);
+                    check_output(whole_gate, r, x, y, stream);
+                }
+            }
+        }
+    }
+    const auto pair_reserved = ctx.library_workspace_bytes();
+    for (unsigned which = 0; which < 2U; ++which) {
+        auto& x = which ? x1 : x0; auto& y = which ? y1 : y0;
+        const auto stream = which ? s1.p : s0.p;
+        enqueue_trellis_qakv(qa, kv, x.f(), y.f(), y.f() + 8U * 1280U, 6U, stream);
+        check(hipStreamSynchronize(stream));
+        hipGraph_t graph = nullptr;
+        hipGraphExec_t exec = nullptr;
+        check(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal));
+        enqueue_trellis_qakv(qa, kv, x.f(), y.f(), y.f() + 8U * 1280U, 6U, stream);
+        check(hipStreamEndCapture(stream, &graph));
+        check(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        for (unsigned replay = 0; replay < 16U; ++replay) {
+            std::vector<float> values(6U * 5120U, (float(replay) - 8.0F) / 32.0F);
+            check(hipMemcpyAsync(x.p, values.data(), values.size() * 4U, hipMemcpyHostToDevice, stream));
+            check(hipMemsetAsync(y.p, 0xff, 8U * 1792U * 4U, stream));
+            check(hipGraphLaunch(exec, stream));
+            check_output(qa, 6U, x, y, stream);
+            check(hipMemcpyAsync(y.f(), y.f() + 8U * 1280U, 6U * 512U * 4U, hipMemcpyDeviceToDevice, stream));
+            check_output(kv, 6U, x, y, stream);
+        }
+        check(hipGraphExecDestroy(exec)); check(hipGraphDestroy(graph));
+    }
+    if (ctx.library_workspace_bytes() != pair_reserved) { ++failures; std::puts("DIFF pair workspace grew after warmup"); }
     std::printf("WORKSPACE_TEST %s calls %u mismatches %u library_bytes %llu version %s\n",
         failures ? "FAIL" : "PASS", calls, failures, static_cast<unsigned long long>(reserved), TrellisContext::library_version());
     return failures ? 1 : 0;

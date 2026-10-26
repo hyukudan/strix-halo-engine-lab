@@ -1,3 +1,4 @@
+#include "strix/ds41_prefill_tuning.hpp"
 #pragma clang fp contract(off)
 #include "strix/hip_ds41_prefill.hpp"
 
@@ -693,6 +694,18 @@ template <WeightFormat Format> inline constexpr unsigned tile_words = tile_rows 
 template <WeightFormat Format> inline constexpr unsigned tile_loads = (tile_words<Format> + split_threads - 1U) / split_threads;
 // Activation stage buffers of a form: 2 (double-buffered) from form 3 on, else the build default.
 template <int Form> inline constexpr unsigned stage_buffers_of = Form == 3 ? 2U : split_stage_buffers;
+// Forms 6 (= 1) and 7 (= 6 with a batched activation stage): the chunk loop's barriers are LDS-only (fence
+// workgroup/local + s_barrier), so the next weight tile stays in flight across them (__syncthreads drains vmcnt; barrier measurements
+// thread trace: 2 x 7 % of the gate/up kernel's latency). The same loads, stores and products: the same bits.
+template <int Form> __device__ __forceinline__ void split_sync() {
+    if constexpr (Form >= 5) {
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+    } else {
+        __syncthreads();
+    }
+}
 // Form 4: one barrier before the tile store and the activation stage, the stage's reads before the next tile's (so
 // the in-order load counter never makes the stage wait for the prefetch), then one barrier: two per chunk, not three.
 template <WeightFormat Format, int Form> inline constexpr bool merged_stage = Form == 4 && weight_lds<Format> && stage_buffers_of<Form> == 1U;
@@ -768,14 +781,14 @@ __device__ __forceinline__ void class_wave(unsigned char* lds, unsigned q, const
     for (unsigned chunk = 0; chunk < chunks; ++chunk) {
         const unsigned base = split_chunk_groups * chunk + split_classes * q;
         if constexpr (merged_stage<Format, Form>) {
-            __syncthreads();
+            split_sync<Form>();
             store_tile<Format>(tile, tile_next);
             stage_chunk<q2>(lds, chunk, width, row_of, count, codes, deltas);
             if (chunk + 1U < chunks) tile_next = load_tile<Format>(tile_rows_src, chunk + 1U, groups);
         } else if constexpr (wl) {
             // The tile of chunk c: previous readers are done (barrier), then the stage below is
             // written and the next tile's loads go out before the products.
-            __syncthreads();
+            split_sync<Form>();
             store_tile<Format>(tile, tile_next);
             if (chunk + 1U < chunks) tile_next = load_tile<Format>(tile_rows_src, chunk + 1U, groups);
         } else if constexpr (chunk_prefetch<Format>) {
@@ -791,17 +804,22 @@ __device__ __forceinline__ void class_wave(unsigned char* lds, unsigned q, const
         StagedItems ahead_items{};
         if constexpr (SB == 2U) {
             if (chunk == 0U) {
-                __syncthreads(); // the batch's row indices (written by other threads) are visible
+                split_sync<Form>(); // the batch's row indices (written by other threads) are visible
                 store_chunk_items<q2>(buffer, load_chunk_items(0U, width, row_of, count, codes, deltas), 0U, width);
             }
             if (chunk + 1U < chunks) ahead_items = load_chunk_items(chunk + 1U, width, row_of, count, codes, deltas);
-            __syncthreads(); // chunk's buffer written; the other buffer's readers (chunk - 1) are done
+            split_sync<Form>(); // chunk's buffer written; the other buffer's readers (chunk - 1) are done
         } else if constexpr (merged_stage<Format, Form>) {
-            __syncthreads();
+            split_sync<Form>();
+        } else if constexpr (Form == 7) {
+            // Form 7 (= 6): both of the thread's stage items are read before either is stored (one wait, not two).
+            split_sync<Form>();
+            store_chunk_items<q2>(lds, load_chunk_items(chunk, width, row_of, count, codes, deltas), chunk, width);
+            split_sync<Form>();
         } else {
-            __syncthreads();
+            split_sync<Form>();
             stage_chunk<q2>(lds, chunk, width, row_of, count, codes, deltas);
-            __syncthreads();
+            split_sync<Form>();
         }
         const auto* a = reinterpret_cast<const v4i*>(buffer);
         const auto* d = reinterpret_cast<const float*>(buffer + split_code_bytes);
@@ -1259,12 +1277,13 @@ bool stage_forced() {
     return forced;
 }
 // Prefill kernel forms (moe_kernel_tuning().prefill, STRIX_DS41_MOE_PREFILL): 0 = the original decoders; 1 = the lean
-// decoders (same integers, see decode_lean); 2 (default, -1) = lean with the IQ2_XXS sign table (decode_signs).
-// 3 = the lean decoders with the activations double-buffered; 4 = the lean decoders with the merged stage
-// (merged_stage). The default stays the original form until a form measures faster.
+// decoders (same integers, see decode_lean); 2 = lean with the IQ2_XXS sign table (decode_signs); 3 = the lean decoders
+// with the activations double-buffered; 4 = the lean decoders with the merged stage (merged_stage); 6 = 1 with LDS-only
+// chunk-loop barriers; 7 (default, -1) = 6 with a batched activation stage in gate/up (down runs form 6). Measured: the
+// joint MoE layer -5.7 / -3.2 / -5.1 % at T 600 / 2048 / 8192, gate/up -8.8 %; same bits. =0 keeps the original form.
 int prefill_form() {
     const int f = moe_kernel_tuning().prefill;
-    return f < 0 ? 0 : f;
+    return f < 0 ? 7 : f;
 }
 template <WeightFormat Format, int Form>
 void launch_split_gate_up_form(const PrefillGateUpView& view, hipStream_t stream) {
@@ -1278,6 +1297,8 @@ void launch_split_gate_up(const PrefillGateUpView& view, hipStream_t stream) {
     case 1: launch_split_gate_up_form<Format, 1>(view, stream); break;
     case 2: launch_split_gate_up_form<Format, 2>(view, stream); break;
     case 3: launch_split_gate_up_form<Format, 3>(view, stream); break;
+    case 6: launch_split_gate_up_form<Format, 6>(view, stream); break;
+    case 7: launch_split_gate_up_form<Format, 7>(view, stream); break;
     default: launch_split_gate_up_form<Format, 4>(view, stream); break;
     }
 }
@@ -1293,6 +1314,8 @@ void launch_split_down(const PrefillDownView& view, hipStream_t stream) {
     case 0: launch_split_down_form<Format, 0>(view, stream); break;
     case 1: case 2: launch_split_down_form<Format, 1>(view, stream); break;
     case 3: launch_split_down_form<Format, 3>(view, stream); break;
+    case 6: launch_split_down_form<Format, 6>(view, stream); break;
+    case 7: launch_split_down_form<Format, 6>(view, stream); break;  // the batched stage spills in the down kernel
     default: launch_split_down_form<Format, 4>(view, stream); break;
     }
 }
@@ -1399,7 +1422,8 @@ void enqueue_prefill_gate_up(WeightFormat format, const PrefillGateUpView& view,
         reinterpret_cast<std::uintptr_t>(view.codes) % 16U != 0U)
         throw std::invalid_argument("ds41 prefill gate/up view is inconsistent");
     const auto queue = static_cast<hipStream_t>(stream);
-    if (view.routes.batch_rows == 16U && !stage_forced() && view.hidden % 256U == 0U) {
+    if (view.routes.batch_rows == 16U && !stage_forced() &&
+        !(prefill_tuning::tiles() && format == WeightFormat::q8_0) && view.hidden % 256U == 0U) {
         if (format == WeightFormat::iq2_xxs) launch_split_gate_up<WeightFormat::iq2_xxs>(view, queue);
         else if (format == WeightFormat::q8_0) launch_split_gate_up<WeightFormat::q8_0>(view, queue);
         else launch_split_gate_up<WeightFormat::mxfp4>(view, queue);
@@ -1422,7 +1446,8 @@ void enqueue_prefill_down(WeightFormat format, const PrefillDownView& view, void
         reinterpret_cast<std::uintptr_t>(view.codes) % 16U != 0U)
         throw std::invalid_argument("ds41 prefill down view is inconsistent");
     const auto queue = static_cast<hipStream_t>(stream);
-    if (view.routes.batch_rows == 16U && !stage_forced() && view.width % 256U == 0U) {
+    if (view.routes.batch_rows == 16U && !stage_forced() &&
+        !(prefill_tuning::tiles() && (format == WeightFormat::q2_k || format == WeightFormat::q8_0 || prefill_tuning::down_stage(view.width, view.outputs))) && view.width % 256U == 0U) {
         if (format == WeightFormat::q2_k) launch_split_down<WeightFormat::q2_k>(view, queue);
         else if (format == WeightFormat::q8_0) launch_split_down<WeightFormat::q8_0>(view, queue);
         else launch_split_down<WeightFormat::mxfp4>(view, queue);
@@ -1520,6 +1545,11 @@ void PrefillMoe::enqueue_experts(const PrefillMoeInputs& in, std::uint32_t chunk
     experts_rows(in, row0, rows, stream);
 }
 // Routes and expert products of rows [row0, row0 + rows) of `in` (at most chunk_rows), by the selected path.
+unsigned PrefillMoe::selected_batch_rows(unsigned rows) const {
+    if (!prefill_tuning::tiles()) return 16U;
+    return prefill_tuning::tile_override("STRIX_DS41_PREFILL_MOE_TILE",
+        prefill_tuning::moe_rows(w_.hidden, w_.down_width, rows, top_k_, end_ - first_));
+}
 void PrefillMoe::experts_rows(const PrefillMoeInputs& in, std::uint32_t row0, std::uint32_t rows, void* stream) {
     const std::uint32_t owned = end_ - first_;
     const auto* ids = in.ids + static_cast<std::uint64_t>(row0) * top_k_;
@@ -1529,7 +1559,7 @@ void PrefillMoe::experts_rows(const PrefillMoeInputs& in, std::uint32_t row0, st
     }
     routes_.sparse_max = 0U;
     const bool window = static_cast<double>(rows) * top_k_ <= window_mean_ * owned;
-    const std::uint32_t batch_rows = window ? 8U : 16U;
+    const std::uint32_t batch_rows = window ? 8U : selected_batch_rows(rows);
     enqueue_build_prefill_routes(ids, rows, top_k_, experts_, split_, batch_rows, routes_, stream, first_, end_);
     if (window) {
         // Each batch (<= 8 entries of one expert) is one window block of the decode kernels.
@@ -1552,7 +1582,7 @@ void PrefillMoe::experts_rows(const PrefillMoeInputs& in, std::uint32_t row0, st
         enqueue_routes_product(w_.down_format, dn, stream);
         return;
     }
-    const auto view = prefill_routes_view(routes_, rows, top_k_, owned, 16U);
+    const auto view = prefill_routes_view(routes_, rows, top_k_, owned, batch_rows);
     PrefillGateUpView gu;
     gu.gate = w_.gate; gu.up = w_.up; gu.expert_stride_bytes = w_.gate_row_bytes * w_.inter; gu.row_bytes = w_.gate_row_bytes;
     gu.hidden = w_.hidden; gu.inter = w_.inter; gu.routes = view;
@@ -1573,7 +1603,8 @@ void PrefillMoe::enqueue_experts_split(const PrefillMoeInputs& in, std::uint32_t
     const std::uint32_t owned = end_ - first_;
     const auto* ids = in.ids + static_cast<std::uint64_t>(row0) * top_k_;
     routes_.sparse_max = window_mean_ > 0.0 ? static_cast<std::uint32_t>(window_mean_) : 0U;
-    enqueue_build_prefill_routes(ids, rows, top_k_, experts_, split_, 16U, routes_, stream, first_, end_);
+    const unsigned batch_rows = selected_batch_rows(rows);
+    enqueue_build_prefill_routes(ids, rows, top_k_, experts_, split_, batch_rows, routes_, stream, first_, end_);
     const auto* codes = in.codes + static_cast<std::uint64_t>(row0) * w_.hidden;
     const auto* deltas = in.deltas + static_cast<std::uint64_t>(row0) * (w_.hidden / 32U);
     if (routes_.sparse_max > 0U) {
@@ -1593,7 +1624,7 @@ void PrefillMoe::enqueue_experts_split(const PrefillMoeInputs& in, std::uint32_t
         dn.width = w_.down_width; dn.outputs = w_.hidden; dn.routes = dr; dn.codes = down_codes(); dn.deltas = down_deltas(); dn.out = raw_;
         enqueue_routes_product(w_.down_format, dn, stream);
     }
-    const auto view = prefill_routes_view(routes_, rows, top_k_, owned, 16U);
+    const auto view = prefill_routes_view(routes_, rows, top_k_, owned, batch_rows);
     PrefillGateUpView gu;
     gu.gate = w_.gate; gu.up = w_.up; gu.expert_stride_bytes = w_.gate_row_bytes * w_.inter; gu.row_bytes = w_.gate_row_bytes;
     gu.hidden = w_.hidden; gu.inter = w_.inter; gu.routes = view; gu.codes = codes; gu.deltas = deltas;

@@ -213,6 +213,50 @@ ds::PrefixCacheOptions disk_options(const fs::path& dir, std::uint64_t ram = 0, 
     return o;
 }
 
+void test_runs() {
+    using V = std::vector<std::uint32_t>;
+    const auto runs = [](std::uint32_t resume, std::uint32_t shared, std::uint32_t total, std::uint32_t max_rows, std::uint32_t min_rows, bool bt) {
+        return ds::plan_prefill_runs(resume, shared, total, 256, max_rows, min_rows, bt);
+    };
+    auto r = runs(0, 0, 1000, 4096, 9, true);
+    expect(r.ends == V{1000} && r.points == V{512, 768}, "miss: one run, the last full block and before-tail inside it");
+    r = runs(0, 512, 2000, 4096, 9, false);
+    expect(r.ends == V{2000} && r.points == V{512, 1792}, "branch point and last full block inside the run");
+    r = runs(0, 0, 10000, 4096, 9, true);
+    expect(r.ends == (V{4096, 8192, 10000}) && r.points == (V{9728, 9984}), "max_rows runs from resume; points inside the last");
+    r = runs(9728, 9728, 16573, 2048, 9, true);
+    expect(r.ends == (V{11776, 13824, 15872, 16573}) && r.points == (V{16128, 16384}), "agent turn: 4 runs instead of 6");
+    r = runs(0, 0, 8192, 4096, 9, true);
+    expect(r.ends == (V{4096, 8192}) && r.points == V{7936}, "aligned prompt: max_rows runs, before-tail inside the last");
+    r = runs(1024, 0, 1024, 4096, 9, true);
+    expect(r.ends.empty() && r.points.empty(), "full hit: nothing to run");
+    r = runs(0, 0, 100, 4096, 9, true);
+    expect(r.ends == V{100} && r.points.empty(), "short prompt: one run, no point");
+    // reach: a point far before its run's end splits the run; extra: one more boundary (a chat's stable prefix)
+    auto q = ds::plan_prefill_runs(0, 1280, 2020, 256, 2048, 9, true, 512);
+    expect(q.ends == (V{1280, 2020}) && q.points == (V{1536, 1792}), "reach: the branch point 740 rows before the end splits");
+    q = ds::plan_prefill_runs(0, 0, 2904, 256, 2048, 9, true, 512);
+    expect(q.ends == (V{2048, 2904}) && q.points == (V{2560, 2816}), "reach: near points stay inside");
+    q = ds::plan_prefill_runs(0, 0, 3000, 256, 4096, 9, false, 0, 1300);
+    expect(q.ends == V{3000} && q.points == (V{1280, 2816}), "extra point (stable prefix) inside the run");
+    q = ds::plan_prefill_runs(0, 0, 3000, 256, 4096, 9, false, 512, 1300);
+    expect(q.ends == (V{1280, 3000}) && q.points == V{2816}, "extra point beyond reach splits");
+    q = ds::plan_prefill_runs(1536, 1536, 3000, 256, 4096, 9, false, 512, 1300);
+    expect(q.ends == V{3000} && q.points == V{2816}, "extra point before the resume: none");
+    // a point's snapshot does not know the next token: never a whole-prompt hit, a resume with rows left still is
+    std::mt19937 rng(5);
+    ds::PrefixCache cache(ram_options(0U));
+    const auto a = random_tokens(1024, rng);
+    auto s = synthetic(a, 768U);
+    s.next_token = ds::kPrefixUnknownNextToken;
+    expect(cache.insert(s, 0U), "insert an in-run snapshot");
+    auto b = a;
+    b.resize(768);
+    expect(cache.lookup(b, 9).resume == 0U, "prompt == in-run snapshot: no whole-prompt hit");
+    expect(cache.lookup(a, 9).resume == 768U, "longer prompt resumes at the in-run snapshot");
+    expect(cache.insert(synthetic(a, 1024U), 7U) && cache.lookup(a, 9).resume == 1024U, "a run's own snapshot is a whole-prompt hit");
+}
+
 void flip_byte(const fs::path& f, std::size_t at) {
     std::fstream io(f, std::ios::in | std::ios::out | std::ios::binary);
     io.seekg(static_cast<std::streamoff>(at));
@@ -364,10 +408,26 @@ void test_namespace() {
     std::ofstream(overlay, std::ios::binary) << std::string(4096, 'o');
     std::ofstream(overlay2, std::ios::binary) << std::string(4095, 'o') << 'p';  // same size, other content
     for (const char* v : {"STRIX_DS41_OVERLAY", "STRIX_DS41_CB4", "STRIX_DS41_TRELLIS", "STRIX_DS41_TRELLIS_SITES", "STRIX_DS41_TRELLIS_MIX",
-                          "STRIX_DS41_SHEXP_TP", "STRIX_DS41_EP_MAP"})
+                          "STRIX_DS41_SHEXP_TP", "STRIX_DS41_EP_MAP", "STRIX_DS41_PREFILL_BF16_ATTN", "STRIX_DS41_PREFILL_FP16_DENSE",
+                          "STRIX_DS41_FP16_CACHE", "STRIX_DS41_FP16_CACHE_READONLY"})
         unsetenv(v);
     const auto base = ds::prefix_namespace_from_env(false);
     expect(base.text == ds::prefix_namespace_from_env(false).text && base.tag.size() == 16U, "namespace: deterministic, 16-digit tag");
+    setenv("STRIX_DS41_PREFILL_BF16_ATTN", "1", 1);
+    const auto bf16 = ds::prefix_namespace_from_env(false);
+    expect(bf16.tag != base.tag, "namespace: BF16 attention changes cache identity");
+    unsetenv("STRIX_DS41_PREFILL_BF16_ATTN");
+    setenv("STRIX_DS41_PREFILL_FP16_DENSE", "1", 1);
+    bool rejected = false;
+    try { (void)ds::prefix_namespace_from_env(false); } catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "namespace: FP16 dense requires frozen picks");
+    setenv("STRIX_DS41_FP16_CACHE", dir.string().c_str(), 1);
+    setenv("STRIX_DS41_FP16_CACHE_READONLY", "1", 1);
+    const auto fp16 = ds::prefix_namespace_from_env(false);
+    expect(fp16.tag != base.tag && fp16.tag != bf16.tag, "namespace: FP16 dense changes cache identity independently");
+    unsetenv("STRIX_DS41_PREFILL_FP16_DENSE");
+    unsetenv("STRIX_DS41_FP16_CACHE");
+    unsetenv("STRIX_DS41_FP16_CACHE_READONLY");
     const auto tp = ds::prefix_namespace_from_env(true);
     expect(tp.tag != base.tag, "namespace: the decode identity (expert TP) changes it");
     setenv("STRIX_DS41_OVERLAY", overlay.c_str(), 1);
@@ -421,6 +481,7 @@ int main() {
     test_roundtrip();
     test_budget();
     test_pieces();
+    test_runs();
     test_disk();
     test_namespace();
     if (failures != 0) {

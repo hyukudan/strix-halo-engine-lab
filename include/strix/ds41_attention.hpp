@@ -29,7 +29,7 @@ inline constexpr unsigned kHeadDim = 512, kRopeDim = 64, kRopePairs = 32, kHeads
 inline constexpr unsigned kIdxHeads = 32, kIdxDim = 128, kMaxRows = 8, kChunk = 64, kTile = 16;
 // Rows of one device call (consecutive positions; the prefill's windows). kMaxRows stays the decode window (it fixes
 // the ring capacity kWindow + kMaxRows); a call of more rows needs a ring of capacity >= kWindow + rows.
-inline constexpr unsigned kMaxCallRows = 64;
+inline constexpr unsigned kLegacyMaxCallRows = 64, kMaxCallRows = 256;
 inline constexpr unsigned kTopK = 512, kCandBlocks = 2048, kCandBlockSize = 8;
 inline constexpr unsigned kWindowEntryBytes = 528;  // 512 E4M3 codes + 16 E8M0 scales (one per 32)
 inline constexpr unsigned kKvEntryBytes = 288;      // 256 bytes of E2M1 pairs + 32 E4M3 scales (one per 16)
@@ -53,12 +53,18 @@ DS41A_HD int log2_ceil(float x) {  // ceil(log2(x)) from the bits, x > 0 (the re
     const std::uint32_t b = f2u(x);
     return static_cast<int>((b >> 23U) & 255U) - 127 + ((b & 0x7FFFFFU) != 0U ? 1 : 0);
 }
-DS41A_HD float f16_to_float(std::uint16_t h) {  // no branches, same bits (device: see ds41_layer.hpp f16_to_float)
+DS41A_HD float f16_to_float(std::uint16_t h) {  // exact half conversion; backend forms below
 #if defined(__CUDA_ARCH__)
     float f;
     asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
     const bool nan = (h & 0x7c00U) == 0x7c00U && (h & 0x3ffU) != 0U;
     return nan ? __uint_as_float((static_cast<std::uint32_t>(h & 0x8000U) << 16U) | 0x7f800000U | (static_cast<std::uint32_t>(h & 0x3ffU) << 13U)) : f;
+#elif defined(__HIPCC__)
+    // Keep the qualified HIP implementation; CUDA and host use their own forms.
+    const std::uint32_t sgn = static_cast<std::uint32_t>(h >> 15U) << 31U, e = (h >> 10U) & 31U, m = h & 1023U;
+    if (e == 0U) { const float v = static_cast<float>(m) * 5.9604644775390625e-08F; return sgn != 0U ? -v : v; }
+    if (e == 31U) return u2f(sgn | 0x7F800000U | (m << 13U));
+    return u2f(sgn | ((e + 112U) << 23U) | (m << 13U));
 #else
     const std::uint32_t sgn = static_cast<std::uint32_t>(h >> 15U) << 31U, e = (h >> 10U) & 31U, m = h & 1023U;
     const float v = static_cast<float>(m) * 5.9604644775390625e-08F;

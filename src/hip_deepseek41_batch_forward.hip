@@ -3,7 +3,7 @@
 #include "strix/deepseek41_attention_host.hpp"
 #include "strix/deepseek41_plan.hpp"
 #include "strix/dist/communicator.hpp"
-#include "strix/dist/staged_ready.hpp"
+#include "hip_ds41_staged_ready.hpp"
 #include "strix/ds41_engram.hpp"
 #include "strix/ds41_expert_tp.hpp"
 #include "strix/ds41_moe.hpp"
@@ -16,6 +16,7 @@
 #include "strix/hip_ds41_expert_tp.hpp"
 #include "strix/hip_ds41_formats.hpp"
 #include "strix/hip_ds41_layer.hpp"
+#include "hip_ds41_step_trace.hpp"
 
 #include "hip_ds41_prepared_load.hpp"
 
@@ -172,17 +173,6 @@ private:
 __global__ void add_halves(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, std::uint32_t n) {
     const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = a[i] + b[i];
-}
-// Staged readiness (STRIX_DIST_STAGED_READY_BYTES): the producer's release after the o_b product (one block), and the
-// add of the two halves behind the consumer acquire, publishing the consumer token at its end (every thread of every
-// block, no early return).
-__global__ void publish_ready_kernel(dist::StagedReady* flag, std::uint64_t token) { dist::publish_staged_block(flag, token, 1U); }
-__global__ void add_halves_ready(const float* a, const float* b, float* __restrict__ out, std::uint32_t n, dist::StagedReady* flag,
-                                 std::uint64_t token) {
-    dist::staged_acquire(flag, token);
-    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = a[i] + b[i];
-    dist::publish_staged_block(flag, token, gridDim.x);
 }
 // The same add for one column chunk of STRIX_DS41_OB_SPLIT: a and b hold [rows][cols], out the rows of `width` values
 // from column col0.
@@ -404,6 +394,8 @@ TrellisBytes trellis_bytes_for(const TargetModel& model, const Plan& plan, const
     const bool shexp_tp = shexp_tp_env != nullptr && *shexp_tp_env == '1';
     std::uint32_t head_slices = 0, head_count = 0;
     for (const auto& st : plan.steps) {
+        if (ds41::trellis_dense_full_enabled() && (st.op == Op::q_a || st.op == Op::kv) &&
+            ds41::trellis_class_enabled(classes, st.weights[0])) add(pack_of(st.weights[0]));
         if (st.op == Op::shared_expert && ds41::trellis_class_enabled(classes, st.weights[0])) {
             if (shexp_tp) {
                 for (std::uint32_t r = 0; r < ds41::shexp_tp_ranks; ++r) {
@@ -415,6 +407,11 @@ TrellisBytes trellis_bytes_for(const TargetModel& model, const Plan& plan, const
                 }
             } else {
                 for (std::size_t k = 0; k < 3U; ++k) add(pack_of(st.weights[k]));
+                const auto info = pack.info(pack_of(st.weights[0]));
+                if (ds41::trellis_dense_row_slices_enabled() && info->bits == 4U && info->rows == 2304U)
+                    for (std::size_t k = 0; k < 2U; ++k)
+                        for (std::uint32_t first : {0U, 1152U})
+                            add(pack_of(st.weights[k]), {ds41::TrellisSlice::Kind::rows, first, 1152U});
             }
         }
         if (st.op == Op::head && ds41::trellis_class_enabled(classes, "output.weight"))
@@ -494,6 +491,7 @@ struct BatchForward::Impl {
     // trellis attention projections (as DeviceForward): per layer, this process's linears in rank-slice order
     struct TrellisAttn { std::vector<const ds41::TrellisSite*> q_b, o_a, o_b; };
     std::vector<TrellisAttn> trellis_attn;
+    std::map<int, std::vector<const ds41::TrellisSite*>> trellis_shared_halves;
     std::unique_ptr<ds41::TrellisGroupRunner> trellis_oa;  // STRIX_DS41_TRELLIS_OA_GROUP=1|2: o_a groups in one staged call
     // trellis LM head (ds41-trellis-k5-v1:head): as DeviceForward, the vocabulary slices this process computes
     std::vector<std::pair<ds41::VocabSlice, const ds41::TrellisSite*>> trellis_head;
@@ -511,6 +509,11 @@ struct BatchForward::Impl {
         const auto it = trellis_sites.find(name);
         return it == trellis_sites.end() ? nullptr : it->second;
     }
+    std::unique_ptr<ds41::StepTrace> trace;
+    struct TraceEvents {
+        std::vector<hipEvent_t> events;
+        ~TraceEvents() { for (auto e : events) (void)hipEventDestroy(e); }
+    } trace_events;
     hipStream_t stream = nullptr;
     std::array<ds41::attn::LayerAttention, 40> roles{};
 
@@ -607,6 +610,13 @@ struct BatchForward::Impl {
     // world 2: while an exchange travels, read ahead the weights of the next steps (at most prefetch_bytes) so they
     // come from the MALL afterwards. STRIX_DS41_BATCH_PREFETCH=MB (0 off, default).
     std::uint64_t prefetch_bytes = 0;
+    // STRIX_DS41_PREFETCH_SIDE=1 (with BATCH_PREFETCH): the read-ahead on a lowest-priority stream that joins the main
+    // one after the exchange start, so the exchange's copy back never queues behind it; trellis sites (read from their
+    // own pack) are skipped. Only reads: the same bits. The budget is then also capped at STRIX_DS41_PREFETCH_ROW_MB
+    // (default 3) per row of the step: the exchange wait grows with the rows (N=2 with the whole 24 MB: +3.2 %).
+    std::uint64_t prefetch_row_bytes = 0;
+    hipStream_t prefetch_stream = nullptr;
+    hipEvent_t prefetch_ready = nullptr;
     Dev<std::uint32_t> never;
     std::vector<float> logits_host;  // [row][slice or vocab]
     std::uint64_t fixed_bytes = 0, expert_bytes = 0, state_bytes = 0, workspace = 0;
@@ -614,6 +624,8 @@ struct BatchForward::Impl {
         std::uint32_t slot, first, count, position;  // rows [first, first + count) of the last step, from `position`
     };
     std::vector<LastSegment> last_segments;
+    std::uint32_t last_first_layer = 0;  // the last step's first layer (step_boundary: its cut; commit skips the layers before)
+    std::vector<LastSegment> front_segments;  // the segments of the last step_front (its TAIL half may follow in this process)
     Dev<std::uint8_t> control;  // the serving control channel: [out][in], control_bytes each
 
     [[nodiscard]] bool distributed() const noexcept { return options.world == 2U; }
@@ -857,6 +869,11 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
             return &site;
         };
         for (auto& s : m.plan.steps) {
+            if (ds41::trellis_dense_full_enabled() && (s.op == Op::q_a || s.op == Op::kv) &&
+                ds41::trellis_class_enabled(m.trellis_classes, s.weights[0])) {
+                const auto* site = prepare(s.weights[0]);
+                s.identity = ds41::trellis_step_identity(site->bits, s.op == Op::q_a ? "q_a" : "kv");
+            }
             if (s.op == Op::shared_expert && ds41::trellis_class_enabled(m.trellis_classes, s.weights[0])) {
                 if (const char* t = std::getenv("STRIX_DS41_SHEXP_TP"); t != nullptr && *t == '1') {
                     // ds41-trellis-k5-v1:shexp-tp, the same slices as DeviceForward (world 2: own; one process: both)
@@ -881,6 +898,15 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
                     const auto* gate = prepare(s.weights[0]);
                     (void)prepare(s.weights[1]);
                     const auto* down = prepare(s.weights[2]);
+                    // K4 whole-2304 and row-1152 products both use legacy S16 and H128 blocks.
+                    // Keep the whole down product and its original association of sums.
+                    if (ds41::trellis_dense_row_slices_enabled() && gate->bits == 4U && gate->rows == 2304U) {
+                        auto& halves = m.trellis_shared_halves[s.layer];
+                        for (const auto& w : {s.weights[0], s.weights[1]})
+                            for (std::uint32_t first : {0U, 1152U})
+                                halves.push_back(&m.trellis->prepare(*m.trellis_pack, *ds41::trellis_pack_name(w),
+                                    {ds41::TrellisSlice::Kind::rows, first, 1152U}));
+                    }
                     s.identity = ds41::trellis_shexp_step_identity(gate->bits, down->bits, false);
                 }
             }
@@ -920,7 +946,7 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
             }
         }
         m.trellis->reserve(m.stream, m.row_capacity);
-        if (const int mode = ds41::trellis_oa_group_mode(); mode != 0)  // default off: the per-group calls below
+        if (const int mode = ds41::trellis_oa_group_mode(); mode != 0)  // default on (=0: the per-group calls below)
             for (const auto& ta : m.trellis_attn)
                 if (!ta.o_a.empty()) {
                     m.trellis_oa = std::make_unique<ds41::TrellisGroupRunner>(ta.o_a, mode, m.stream);
@@ -934,6 +960,17 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
         m.trellis_device = m.trellis->device_bytes() + m.trellis->staging_bytes() + (m.trellis_oa ? m.trellis_oa->staging_bytes() : 0U);
     }
     m.shexp_tp = !m.trellis_shexp_tp.empty();
+    ds41::trellis_shared_grouped_admit(m.shexp_tp, !m.trellis_shared_halves.empty(), BatchForward::configured_row_limit());
+    {  // STRIX_DS41_SHARED_DOWN_FUSED: inventory of every shared down site + startup probe, before any capture
+        std::vector<const ds41::TrellisSite*> downs;
+        std::size_t shared_layers = 0;
+        for (const auto& s : m.plan.steps) {
+            if (s.op != Op::shared_expert) continue;
+            ++shared_layers;
+            if (const auto* d = m.trellis_site(s.weights[2])) downs.push_back(d);
+        }
+        ds41::trellis_shared_down_fused_admit(downs, shared_layers, m.shexp_tp, BatchForward::configured_row_limit());
+    }
     if (const char* t = std::getenv("STRIX_DS41_SHEXP_TP"); t != nullptr && *t == '1' && !m.shexp_tp)
         throw std::invalid_argument("deepseek41 batch forward: STRIX_DS41_SHEXP_TP=1 needs STRIX_DS41_TRELLIS with the shexp class");
     if (m.shexp_tp && m.expert_tp)  // two per-rank partial folds into the half sums: no declared identity for the pair yet
@@ -1113,15 +1150,29 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
     m.shx_own = m.track<std::uint8_t>(W * I / 2U + W * I / 64U * 4U);
     m.shx_other = m.track<std::uint8_t>(W * I / 2U + W * I / 64U * 4U);
     if (m.distributed()) {
+        // overlap by default (measured: the shared expert fills the half-sum window, N8 -4.8 %, same bits, as
+        // DeviceForward's EP_OVERLAP); STRIX_DS41_BATCH_SHARED=off (or 0) = before the routed experts, split = split
         const char* v = std::getenv("STRIX_DS41_BATCH_SHARED");
-        const std::string mode = v ? v : "";
+        const std::string mode = v ? v : "overlap";
         m.shared_mode = mode == "overlap" ? 1 : mode == "split" ? 2 : 0;
         if (m.shared_mode == 2 && (I % 64U != 0U || H % 2U != 0U)) throw std::invalid_argument("deepseek41 batch forward: shared split geometry");
         if (m.shared_mode == 2)
             for (const auto& s : m.plan.steps)
                 if (s.op == Op::shared_expert && m.trellis_site(s.weights[0]) != nullptr)
                     throw std::invalid_argument("deepseek41 batch forward: the trellis shared expert is replicated (no STRIX_DS41_BATCH_SHARED=split)");
-        if (const char* pf = std::getenv("STRIX_DS41_BATCH_PREFETCH")) m.prefetch_bytes = std::strtoull(pf, nullptr, 10) << 20U;
+        // Production defaults: BATCH_PREFETCH 24 MB with PREFETCH_SIDE on (=0 turns each off; SIDE=0 is the slower main-stream form)
+        {
+            const char* pf = std::getenv("STRIX_DS41_BATCH_PREFETCH");
+            m.prefetch_bytes = (pf && *pf ? std::strtoull(pf, nullptr, 10) : 24U) << 20U;
+        }
+        if (const char* side = std::getenv("STRIX_DS41_PREFETCH_SIDE"); m.prefetch_bytes && !(side && *side == '0')) {
+            int least = 0, greatest = 0;
+            check(hipDeviceGetStreamPriorityRange(&least, &greatest), "stream priorities");
+            check(hipStreamCreateWithPriority(&m.prefetch_stream, hipStreamNonBlocking, least), "prefetch stream");
+            check(hipEventCreateWithFlags(&m.prefetch_ready, hipEventDisableTiming), "prefetch event");
+            const char* row = std::getenv("STRIX_DS41_PREFETCH_ROW_MB");
+            m.prefetch_row_bytes = (row && *row ? std::strtoull(row, nullptr, 10) : 3U) << 20U;
+        }
     }
     // also STRIX_DS41_BATCH_ENGRAM_ASYNC=1 (ds41/batch-perf cd5e640, the same per-layer reads on a host thread)
     m.engram_async = [] {
@@ -1188,6 +1239,11 @@ BatchForward::~BatchForward() {
     if (impl_ && impl_->stream != nullptr) {
         (void)hipStreamSynchronize(impl_->stream);
         (void)hipStreamDestroy(impl_->stream);
+    }
+    if (impl_ && impl_->prefetch_stream != nullptr) {
+        (void)hipStreamSynchronize(impl_->prefetch_stream);
+        (void)hipStreamDestroy(impl_->prefetch_stream);
+        (void)hipEventDestroy(impl_->prefetch_ready);
     }
 }
 
@@ -1450,7 +1506,7 @@ void BatchForward::commit(std::uint32_t slot, std::uint32_t kept) {
             check(hipGetLastError(), "rollback carry");
             n = 0;
         };
-        for (std::uint32_t l = 0; l < m.options.layers; ++l) {
+        for (std::uint32_t l = m.last_first_layer; l < m.options.layers; ++l) {  // a TAIL step ran no layer before its cut
             const auto& r = m.roles[l];
             if (!r.owns_kv || r.ratio != 2U) continue;
             auto& L = S.layers[l];
@@ -1461,7 +1517,7 @@ void BatchForward::commit(std::uint32_t slot, std::uint32_t kept) {
         }
         launch();
     }
-    for (std::uint32_t l = 0; l < m.options.layers && !m.compress_ring; ++l) {
+    for (std::uint32_t l = m.last_first_layer; l < m.options.layers && !m.compress_ring; ++l) {
         const auto& r = m.roles[l];
         if (!r.owns_kv || r.ratio != 2U) continue;
         auto& L = S.layers[l];
@@ -1489,7 +1545,26 @@ std::span<const float> BatchForward::row_logits(std::uint32_t row) const {
     return {m.logits_host.data() + std::size_t{row} * n, n};
 }
 
-const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> rows) {
+const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> rows) { return run_step(rows, 0U, {}, 0U, nullptr); }
+
+std::vector<ds41::pipe::Boundary> BatchForward::step_front(std::span<const BatchRow> rows, std::uint32_t cut) {
+    if (cut == 0U || cut >= impl_->options.layers) throw std::invalid_argument("deepseek41 batch forward: a FRONT step stops at a layer in [1, layers)");
+    std::vector<ds41::pipe::Boundary> out;
+    (void)run_step(rows, 0U, {}, cut, &out);
+    return out;
+}
+
+const std::vector<std::uint32_t>& BatchForward::step_boundary(std::span<const BatchRow> rows, std::uint32_t first_layer,
+                                                              std::span<const ds41::pipe::Boundary> boundaries) {
+    if (first_layer == 0U || first_layer >= impl_->options.layers)
+        throw std::invalid_argument("deepseek41 batch forward: a pipeline TAIL step starts at a layer in [1, layers)");
+    if (boundaries.empty()) throw std::invalid_argument("deepseek41 batch forward: a pipeline TAIL step needs the boundaries of its segments");
+    return run_step(rows, first_layer, boundaries, 0U, nullptr);
+}
+
+const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRow> rows, std::uint32_t first_layer,
+                                                         std::span<const ds41::pipe::Boundary> boundaries, std::uint32_t front_cut,
+                                                         std::vector<ds41::pipe::Boundary>* front_out) {
     auto& m = *impl_;
     const auto& c = m.model.config;
     namespace attn = ds41::attn;
@@ -1515,10 +1590,39 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
         if (s.count > max_rows) throw std::invalid_argument("deepseek41 batch forward: one request's segment has at most 8 rows");
     for (const auto& s : segments)
         if (s.position + s.count > m.slots[s.slot].capacity) throw std::out_of_range("deepseek41 batch forward: a request's context is full");
+    // pipeline TAIL (step_boundary): one boundary per segment, at its position, with its rows' tokens and the cut's sections
+    const bool tail = first_layer != 0U;
+    ds41::pipe::BoundaryPlan cut;
+    if (tail) {
+        if (boundaries.size() != segments.size())
+            throw std::invalid_argument("deepseek41 batch forward: " + std::to_string(boundaries.size()) + " boundaries for " +
+                                        std::to_string(segments.size()) + " segments");
+        cut = ds41::pipe::plan_boundary(m.model.layers, first_layer);
+        const auto geo = ds41::pipe::boundary_geometry(c);
+        for (std::size_t i = 0; i < segments.size(); ++i) {
+            const auto& g = segments[i];
+            const auto& b = boundaries[i];
+            if (b.position != g.position || b.rows != g.count || b.tokens.size() != g.count)
+                throw std::invalid_argument("deepseek41 batch forward: the boundary of slot " + std::to_string(g.slot) + " is at position " +
+                                            std::to_string(b.position) + " x " + std::to_string(b.rows) + ", its segment at " +
+                                            std::to_string(g.position) + " x " + std::to_string(g.count));
+            for (std::uint32_t k = 0; k < g.count; ++k)
+                if (b.tokens[k] != rows[g.first + k].token)
+                    throw std::invalid_argument("deepseek41 batch forward: a boundary's tokens differ from its segment's rows");
+            ds41::pipe::validate_boundary(b, cut, geo);
+        }
+    }
     const std::uint32_t H = c.hidden_size, hc = c.hc_mult, K = c.num_experts_per_tok, I = c.moe_intermediate_size;
     const std::uint32_t V = c.vocab_size, W = m.row_capacity;
     hipStream_t st = m.stream;
     const auto t_step = std::chrono::steady_clock::now();
+    if (!m.trace && ds41::StepTrace::env_level() != 0) {
+        m.trace = std::make_unique<ds41::StepTrace>(ds41::StepTrace::env_level(), m.options.rank);
+        m.trace_events.events.resize(m.plan.steps.size() + 1U);
+        for (auto& event : m.trace_events.events) check(hipEventCreate(&event), "batch trace event");
+    }
+    auto* tr = m.trace.get();
+    if (tr) tr->begin(R);
     const double comm_at_start = m.comm_seconds();
     stats_ = BatchStepStats{};
     stats_.rows = R;
@@ -1546,7 +1650,10 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
     const auto& e = m.model.engram;
     const std::uint32_t cols = e.rows_per_token(), engram_layers = static_cast<std::uint32_t>(e.layer_ids.size());
     std::uint32_t engram_in_range = 0;  // Engram layers of the range (a prefix of layer_ids)
-    while (engram_in_range < engram_layers && e.layer_ids[engram_in_range] < m.options.layers) ++engram_in_range;
+    const std::uint32_t layer_end = front_cut != 0U ? front_cut : m.options.layers;  // a FRONT step stops before layer front_cut
+    while (engram_in_range < engram_layers && e.layer_ids[engram_in_range] < layer_end) ++engram_in_range;
+    std::uint32_t engram_first = 0;  // a TAIL step reads layer_ids [engram_first, engram_in_range) only
+    while (engram_first < engram_in_range && e.layer_ids[engram_first] < first_layer) ++engram_first;
     std::vector<std::uint64_t> engram_rows(std::size_t{R} * engram_layers * cols);  // [row][engram layer][column]
     {
         std::vector<std::uint64_t> one(std::size_t{engram_layers} * cols);
@@ -1558,7 +1665,7 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
     // STRIX_DS41_ENGRAM_ASYNC (DeviceForward::step_window): layer li's rows in [row][column] order, read straight into
     // its pinned staging; Op::engram of the layer waits for them and uploads them. The previous step ended synchronised.
     // engram_io is declared last: on unwinding it joins the reads before the requests and promises they use go away.
-    const bool engram_async = m.engram_async && m.engram_reader && engram_in_range != 0U;
+    const bool engram_async = m.engram_async && m.engram_reader && engram_in_range > engram_first;
     std::vector<std::vector<ds41::EngramRowRequest>> layer_requests(engram_async ? engram_in_range : 0U);
     std::vector<std::promise<void>> engram_ready(layer_requests.size());
     std::vector<std::future<void>> engram_wait;
@@ -1566,14 +1673,18 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
     std::future<void> engram_io;
     if (engram_async) {
         for (std::uint32_t li = 0; li < engram_in_range; ++li) {
+            engram_wait.push_back(engram_ready[li].get_future());
+            if (li < engram_first) {  // a TAIL step never runs the layers before its range
+                engram_ready[li].set_value();
+                continue;
+            }
             for (std::uint32_t r = 0; r < R; ++r)
                 for (std::uint32_t k = 0; k < cols; ++k)
                     layer_requests[li].push_back({li, engram_rows[(std::size_t{r} * engram_layers + li) * cols + k]});
-            engram_wait.push_back(engram_ready[li].get_future());
         }
         engram_io = std::async(std::launch::async, [&] {
             const auto t0 = std::chrono::steady_clock::now();
-            std::uint32_t li = 0;
+            std::uint32_t li = engram_first;
             try {
                 for (; li < engram_in_range; ++li) {
                     std::uint8_t* out = m.erows_pinned.p + std::size_t{li} * R * cols * 264U;
@@ -1586,29 +1697,97 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
             engram_read_seconds = seconds_since(t0);
         });
     }
-    if (engram_in_range != 0U && !engram_async) {
+    if (engram_in_range > engram_first && !engram_async) {
+        const std::uint32_t engram_count = engram_in_range - engram_first;
         if (m.engram_reader) {  // every Engram layer of the range, every row, in one batch from the NVMe (O_DIRECT)
             const auto t0 = std::chrono::steady_clock::now();
             std::vector<ds41::EngramRowRequest> requests;
             for (std::uint32_t r = 0; r < R; ++r)
-                for (std::uint32_t li = 0; li < engram_in_range; ++li)
+                for (std::uint32_t li = engram_first; li < engram_in_range; ++li)
                     for (std::uint32_t k = 0; k < cols; ++k) requests.push_back({li, engram_rows[(std::size_t{r} * engram_layers + li) * cols + k]});
             m.engram_bytes.resize(requests.size() * 264U);
             m.engram_reader->read(requests, m.engram_bytes);
             stats_.engram_seconds = seconds_since(t0);
         }
-        for (std::uint32_t li = 0; li < engram_in_range; ++li)  // [layer][row][column]
+        for (std::uint32_t li = engram_first; li < engram_in_range; ++li)  // [layer][row][column]
             for (std::uint32_t r = 0; r < R; ++r) {
                 std::uint8_t* out = m.erows_pinned.p + ((std::size_t{li} * R + r) * cols) * 264U;
                 if (m.engram_reader) {
-                    std::copy_n(m.engram_bytes.data() + (std::size_t{r} * engram_in_range + li) * cols * 264U, std::size_t{cols} * 264U, out);
+                    std::copy_n(m.engram_bytes.data() + (std::size_t{r} * engram_count + (li - engram_first)) * cols * 264U, std::size_t{cols} * 264U,
+                                out);
                 } else {
                     const auto table = m.host_tensor("blk." + std::to_string(e.layer_ids[li]) + ".engram_embd.weight");
                     for (std::uint32_t k = 0; k < cols; ++k)
                         std::copy_n(table.data() + engram_rows[(std::size_t{r} * engram_layers + li) * cols + k] * 264U, 264, out + std::size_t{k} * 264U);
                 }
             }
-        check(hipMemcpyAsync(m.erows.p, m.erows_pinned.p, std::size_t{engram_in_range} * R * cols * 264U, hipMemcpyHostToDevice, st), "engram rows");
+        const std::size_t skip = std::size_t{engram_first} * R * cols * 264U;  // layers before the range: never read
+        check(hipMemcpyAsync(m.erows.p + skip, m.erows_pinned.p + skip, std::size_t{engram_count} * R * cols * 264U, hipMemcpyHostToDevice, st),
+              "engram rows");
+    }
+
+    // pipeline TAIL: the boundary of every segment (rows [g.first, g.first + g.count) of the step): the stream after layer
+    // first_layer - 1 and its FFN mix into the step's rows, the KV entries the FRONT completed into the slot's own caches
+    // of the source layers, the top-k rows into the scratch of their index sources and the candidate rows into the
+    // segment's part of the candidate pool (as the source layer's selection leaves them in a whole step)
+    std::vector<std::vector<std::uint32_t>> boundary_topk;  // host staging, alive until the step's synchronisation
+    if (tail) {
+        namespace pipe = ds41::pipe;
+        const std::size_t row_floats = std::size_t{hc} * H;
+        for (std::size_t i = 0; i < segments.size(); ++i) {
+            const auto& g = segments[i];
+            const auto& b = boundaries[i];
+            check(hipMemcpyAsync(m.streams[m.cur].p + std::size_t{g.first} * row_floats, b.stream_data(), std::size_t{g.count} * row_floats * 4U,
+                                 hipMemcpyHostToDevice, st),
+                  "boundary stream");
+            const auto* mix = b.find(pipe::SectionKind::mix_ffn, first_layer - 1U);
+            static_assert(sizeof(ds41::HcMix) == (2U * ds41::hc_copies + ds41::hc_copies * ds41::hc_copies) * 4U, "HcMix is pre, post, comb");
+            check(hipMemcpyAsync(m.mix_ffn.p + g.first, mix->bytes.data(), mix->bytes.size(), hipMemcpyHostToDevice, st), "boundary mix");
+            for (const auto& src : cut.kv_sources) {
+                const auto* k = b.find(pipe::SectionKind::kv_entries, src.layer);
+                const auto& L = m.slots[g.slot].layers[src.layer];
+                const std::size_t n = k->count;
+                if ((std::size_t{k->first} + n) * attn::kKvEntryBytes > L.kv_bytes || (std::size_t{k->first} + n) * attn::kIdxEntryBytes > L.idx_bytes)
+                    throw std::out_of_range("deepseek41 batch forward: boundary KV entries past the slot's caches");
+                if (n == 0U) continue;
+                check(hipMemcpyAsync(L.kv + std::size_t{k->first} * attn::kKvEntryBytes, k->bytes.data(), n * attn::kKvEntryBytes,
+                                     hipMemcpyHostToDevice, st),
+                      "boundary kv");
+                check(hipMemcpyAsync(L.idx + std::size_t{k->first} * attn::kIdxEntryBytes, k->bytes.data() + n * attn::kKvEntryBytes,
+                                     n * attn::kIdxEntryBytes, hipMemcpyHostToDevice, st),
+                      "boundary index keys");
+            }
+            for (const auto& src : cut.topk_sources) {
+                const auto* k = b.find(pipe::SectionKind::topk, src.layer);
+                auto& host = boundary_topk.emplace_back(std::size_t{g.count} * (1U + attn::kTopK), 0U);  // [counts][ids count x top-k]
+                std::size_t at = 0;
+                const auto word = [&] {
+                    std::uint32_t v;
+                    std::memcpy(&v, k->bytes.data() + at, 4);
+                    at += 4U;
+                    return v;
+                };
+                for (std::uint32_t r = 0; r < g.count; ++r) {
+                    const auto n = host[r] = word();
+                    for (std::uint32_t j = 0; j < n; ++j) host[g.count + std::size_t{r} * attn::kTopK + j] = word();
+                }
+                auto& X = m.scratch[src.layer];
+                check(hipMemcpyAsync(X.idx_count.p + g.first, host.data(), std::size_t{g.count} * 4U, hipMemcpyHostToDevice, st), "boundary top-k");
+                check(hipMemcpyAsync(X.idx.p + std::size_t{g.first} * attn::kTopK, host.data() + g.count, std::size_t{g.count} * attn::kTopK * 4U,
+                                     hipMemcpyHostToDevice, st),
+                      "boundary top-k");
+            }
+            if (cut.candidate_source >= 0) {
+                const auto* k = b.find(pipe::SectionKind::candidates, static_cast<std::uint32_t>(cut.candidate_source));
+                if (k->bytes.size() > std::size_t{g.count} * m.cand_bytes)
+                    throw std::out_of_range("deepseek41 batch forward: boundary candidates past the segment's pool");
+                if (!k->bytes.empty())
+                    check(hipMemcpyAsync(m.candidates.p + std::size_t{g.first} * m.cand_bytes, k->bytes.data(), k->bytes.size(), hipMemcpyHostToDevice,
+                                         st),
+                          "boundary candidates");
+            }
+        }
+        m.identity_pre = false;  // layer first_layer - 1's FFN ran: its pre collapses layer first_layer's attention input
     }
 
     if (m.options.layer_timing) stats_.layer_seconds.assign(m.options.layers, 0.0);
@@ -1622,10 +1801,23 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
     const std::size_t D = attn::kHeadDim;
     const auto enqueue_shared = [&](const auto& s) {
         if (const auto* gate = m.trellis_site(s.weights[0])) {  // trellis (ds41-trellis-k5-v1:shexp): F32 x, no A8
-            ds41::enqueue_trellis_linear(*gate, m.x.p, m.tr_gate.p, R, H, I, false, st);
-            ds41::enqueue_trellis_linear(*m.trellis_site(s.weights[1]), m.x.p, m.tr_up.p, R, H, I, false, st);
-            ds41::enqueue_swiglu_f32(m.tr_gate.p, m.tr_up.p, R, I, static_cast<float>(c.swiglu_limit), m.tr_act.p, st);
-            ds41::enqueue_trellis_linear(*m.trellis_site(s.weights[2]), m.tr_act.p, m.shared.p, R, I, H, false, st);
+            if (const auto it = m.trellis_shared_halves.find(s.layer); it != m.trellis_shared_halves.end()) {
+                if (ds41::trellis_shared_grouped_enabled() && I == 2304U) {
+                    // STRIX_DS41_SHARED_GROUPED: two SwiGLU pair launches write tr_act directly (same products and bits)
+                    ds41::enqueue_trellis_shared_swiglu(it->second.data(), m.x.p, m.tr_act.p, R,
+                                                        static_cast<float>(c.swiglu_limit), st);
+                } else {
+                    for (std::size_t k = 0; k < 4U; ++k)
+                        ds41::enqueue_trellis_linear(*it->second[k], m.x.p,
+                            (k < 2U ? m.tr_gate.p : m.tr_up.p) + (k % 2U) * 1152U, R, H, I, false, st);
+                    ds41::enqueue_swiglu_f32(m.tr_gate.p, m.tr_up.p, R, I, static_cast<float>(c.swiglu_limit), m.tr_act.p, st);
+                }
+            } else {
+                ds41::enqueue_trellis_linear(*gate, m.x.p, m.tr_gate.p, R, H, I, false, st);
+                ds41::enqueue_trellis_linear(*m.trellis_site(s.weights[1]), m.x.p, m.tr_up.p, R, H, I, false, st);
+                ds41::enqueue_swiglu_f32(m.tr_gate.p, m.tr_up.p, R, I, static_cast<float>(c.swiglu_limit), m.tr_act.p, st);
+            }
+            ds41::enqueue_trellis_shared_down(*m.trellis_site(s.weights[2]), m.tr_act.p, I, m.shared.p, H, R, st);
             return;
         }
         const auto& sr = m.shared_routes.at(R);
@@ -1719,6 +1911,27 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
         ds41::enqueue_hc_site(v, st);
         late_mix = nullptr;
     };
+    // Residual boundary fusions; each flag is independent and off by default.
+    static const bool qnorm_a8 = [] { const char* v = std::getenv("STRIX_DS41_R1FUSE_QNORM_A8"); return v && v[0] == '1'; }();
+    static const bool router_routes = [] { const char* v = std::getenv("STRIX_DS41_R1FUSE_ROUTES"); return v && v[0] == '1'; }();
+    bool q_a8 = false, routes_ready = false;
+    const auto route_view = [&] {
+        ds41::BuildRoutesView bv;
+        bv.ids = m.ids.p;
+        bv.rows = R;
+        bv.top_k = K;
+        bv.split = m.expert_tp ? c.n_routed_experts : m.plan.expert_split;  // expert TP: every slot in the rank's fold
+        bv.first = m.expert_first;
+        bv.end = m.expert_end;
+        bv.experts = m.built.experts.p;
+        bv.begins = m.built.begins.p;
+        bv.rows_out = m.built.rows.p;
+        bv.slots = m.built.slots.p;
+        bv.order = m.built.order.p;
+        bv.low_counts = m.built.low_counts.p;
+        bv.counts = m.built.counts.p;
+        return bv;
+    };
     bool x_a8 = false;  // codes/deltas/sums hold the A8 of the current x
     bool kv_done = false;
     bool o_a_trellis = false;  // an o_a ran from the trellis pack (no A8 of o_low for a Q8 o_b)
@@ -1764,26 +1977,77 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
     };
     // the weights of the steps after `from` (whole tensors in step order, the last one cut), up to prefetch_bytes;
     // the routed experts (which rows are unknown) and the embedding tables are skipped
+    static const bool past_experts = [] { const char* v = std::getenv("STRIX_DS41_PREFETCH_PAST_EXPERTS"); return v && v[0] == '1'; }();
     const auto prefetch_after = [&](const Step& from) {
         if (m.prefetch_bytes == 0U) return;
         std::uint64_t left = m.prefetch_bytes;
+        if (m.prefetch_row_bytes) left = std::min<std::uint64_t>(left, m.prefetch_row_bytes * R);
+        hipStream_t ps = st;
+        if (m.prefetch_stream != nullptr) {
+            check(hipEventRecord(m.prefetch_ready, st), "prefetch event");
+            check(hipStreamWaitEvent(m.prefetch_stream, m.prefetch_ready, 0), "prefetch wait");
+            ps = m.prefetch_stream;
+        }
         for (auto i = static_cast<std::size_t>(&from - m.plan.steps.data()) + 1U; i < m.plan.steps.size() && left; ++i)
             for (const auto& w : m.plan.steps[i].weights) {
                 if (!left) break;
+                // Stop at the routed experts: their ~100+ MB stream evicts from the MALL whatever was read ahead past them;
+                // and skip the shared expert when it runs later, inside the half-sum exchange (after the routed experts).
+                // N8 with both read ahead in the o_b window: +3.3 % (p6). STRIX_DS41_PREFETCH_PAST_EXPERTS=1: the old scope.
+                if (w.ends_with("_exps.weight") && !past_experts) { left = 0; break; }
                 if (w.ends_with("_exps.weight") || w.find("engram_embd") != std::string::npos || w == "token_embd.weight") continue;
+                if (m.shared_mode == 1 && !past_experts && w.find("_shexp.") != std::string::npos) continue;
+                // trellis sites (their own pack, this process's prepared slices): the library allocation of each, when the
+                // linked strix-trellis exposes it (strix_weights_device_span)
+                {
+                    const auto& si = m.plan.steps[i];
+                    std::vector<const ds41::TrellisSite*> sites;
+                    if (!m.trellis_attn.empty() && si.layer >= 0 && w == si.weights[0]) {
+                        const auto& ta = m.trellis_attn[static_cast<std::size_t>(si.layer)];
+                        if (si.op == Op::q_b) sites = ta.q_b;
+                        else if (si.op == Op::o_a) sites = ta.o_a;
+                        else if (si.op == Op::o_b) sites = ta.o_b;
+                    }
+                    if (sites.empty())
+                        if (const auto* t = m.trellis_site(w)) sites.push_back(t);
+                    if (!sites.empty()) {
+                        for (const auto* t : sites) {
+                            const void* data = nullptr;
+                            std::uint64_t n = 0;
+                            if (!left || !ds41::trellis_site_span(*t, &data, &n)) break;
+                            const std::uint64_t size = std::min<std::uint64_t>(n, left);
+                            if (size / 16U) touch_kernel<<<320, 256, 0, ps>>>(static_cast<const uint4*>(data), size / 16U, m.never.p);
+                            left -= size;
+                        }
+                        continue;
+                    }
+                }
                 // TP: this rank's rows of q_b and wo_a (the upper or lower half); wo_b is read by K-halves of every row
                 if (tp && w.ends_with("attn_output_b.weight")) continue;
+                if (m.prefetch_stream != nullptr && !m.weights.contains(w)) continue;
                 const auto& d = m.weights.at(w);
                 const bool half = tp && (w.ends_with("attn_q_b.weight") || w.ends_with("attn_output_a.weight"));
                 const std::uint8_t* base = d.p + (half ? d.n / 2U * m.options.rank : 0U);
                 const std::uint64_t size = std::min<std::uint64_t>(half ? d.n / 2U : d.n, left);
-                if (size / 16U) touch_kernel<<<320, 256, 0, st>>>(reinterpret_cast<const uint4*>(base), size / 16U, m.never.p);
+                if (size / 16U) touch_kernel<<<320, 256, 0, ps>>>(reinterpret_cast<const uint4*>(base), size / 16U, m.never.p);
                 left -= size;
             }
         check(hipGetLastError(), "prefetch");
     };
 
-    for (const auto& s : m.plan.steps) {
+    std::size_t trace_op = 0;
+    if (tr) {
+        check(hipEventRecord(m.trace_events.events[0], st), "batch trace begin");
+        tr->first_event(st);
+    }
+    std::size_t first_step = 0;  // a TAIL starts at the first step of layer first_layer (after the embedding and the layers before)
+    if (tail)
+        while (first_step < m.plan.steps.size() && (m.plan.steps[first_step].layer < 0 || static_cast<std::uint32_t>(m.plan.steps[first_step].layer) < first_layer))
+            ++first_step;
+    for (std::size_t step_index = first_step; step_index < m.plan.steps.size(); ++step_index) {
+        const auto& s = m.plan.steps[step_index];
+        if (front_cut != 0U && step_index != 0U && (s.layer < 0 || static_cast<std::uint32_t>(s.layer) >= front_cut)) break;
+        const double trace_comm = tr ? m.comm_seconds() : 0.0;
         const auto layer = static_cast<std::uint32_t>(std::max(s.layer, 0));
         const std::string p = "blk." + std::to_string(layer) + ".";
         if (m.options.layer_timing && s.layer >= 0 && s.layer != timed_layer) {
@@ -1852,7 +2116,7 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
                 const bool at = s.site == "attn";
                 const ds41::HcMix* collapse = at ? (m.identity_pre ? nullptr : m.mix_ffn.p) : m.mix_attn.p;
                 // not with STRIX_DS41_BATCH_PREFETCH: its touch kernel already fills the o_b exchange window (P17.5 G6: +0.6..1.2 ms)
-                const bool late = at && site_mix && m.distributed() && m.options.tp_attention && m.prefetch_bytes == 0U && late_hc_layer(layer);
+                const bool late = at && site_mix && m.distributed() && m.options.tp_attention && (m.prefetch_bytes == 0U || m.prefetch_stream != nullptr) && late_hc_layer(layer);
                 enqueue_site(late ? nullptr : site_mix, at ? m.mix_attn.p : m.mix_ffn.p, collapse, m.devf(s.weights[0]), m.x.p, m.codes.p,
                              m.deltas.p, m.sums.p);
                 if (late) late_mix = site_mix;
@@ -1862,13 +2126,33 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
             }
             float* v = s.site == "q" ? m.qr.p : s.site == "kv" ? m.kv.p : m.x.p;
             const std::uint32_t n = s.site == "q" ? c.q_lora_rank : s.site == "kv" ? c.head_dim : H;
-            ds41::enqueue_rms_norm(v, m.devf(s.weights[0]), R, n, n, 1e-20F, v, st);
+            if (s.site == "q" && qnorm_a8 && (m.trellis_attn.empty() || m.trellis_attn[layer].q_b.empty())) {
+                ds41::NormView nv;
+                nv.x = v; nv.x_stride = n; nv.weight = m.devf(s.weights[0]); nv.rows = R; nv.n = n;
+                nv.out = v; nv.out_stride = n; nv.codes = m.site_codes.p; nv.deltas = m.site_deltas.p;
+                nv.sums = m.site_sums.p; nv.a8_stride = n;
+                ds41::enqueue_norm(nv, st);  // same in-place norm, also emits the next projection's A8
+                q_a8 = true;
+            } else ds41::enqueue_rms_norm(v, m.devf(s.weights[0]), R, n, n, 1e-20F, v, st);
             break;
         }
         case Op::q_a: case Op::q_b: case Op::kv: case Op::o_a: case Op::o_b: {
             if (s.op == Op::kv && kv_done) {  // enqueued with q_a
                 kv_done = false;
                 break;
+            }
+            if (s.op == Op::q_a || s.op == Op::kv) {
+                if (const auto* site = m.trellis_site(s.weights[0])) {
+                    const auto* kv_site = m.trellis_site(p + "attn_kv.weight");
+                    if (s.op == Op::q_a && kv_site && ds41::trellis_qakv_pair_enabled()) {
+                        ds41::enqueue_trellis_qakv(*site, *kv_site, m.x.p, m.qr.p, m.kv.p, R, st);
+                        kv_done = true;
+                    } else {
+                        ds41::enqueue_trellis_linear(*site, m.x.p, s.op == Op::q_a ? m.qr.p : m.kv.p,
+                            R, H, site->rows, false, st);
+                    }
+                    break;
+                }
             }
             if (!m.trellis_attn.empty() && (s.op == Op::q_b || s.op == Op::o_a || s.op == Op::o_b)) {
                 // ds41-trellis-k5-v1 q_b / o_a / o_b (as DeviceForward): F32 inputs, no A8
@@ -1893,17 +2177,34 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
                     break;
                 }
                 if (s.op == Op::o_b && !ta.o_b.empty()) {
-                    if (tp) {
-                        ds41::enqueue_trellis_linear(*ta.o_b[0], m.o_low.p, m.half_own.p, R, o_half, H, false, st);
-                        if (m.prefetch_bytes) {
-                            m.options.communicator->start(st, m.half_own.p, std::size_t{R} * H * 4U,
-                                                          dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U});
-                            prefetch_after(s);
-                            m.options.communicator->finish(st, m.half_other.p);
-                        } else {
-                            m.options.communicator->exchange(st, m.half_own.p, m.half_other.p, std::size_t{R} * H * 4U,
-                                                             dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U});
+                    if (tp && ready_detail::trellis_ob())
+                        if (const auto stage = m.options.communicator->prepare_staged_ready(st, std::size_t{R} * H * 4U); stage.data) {
+                            // STRIX_DS41_TRELLIS_OB_READY (default, =0 off): the device half copied into the TX view by one kernel that publishes
+                            // it, the add straight from the RX view (no SDMA copies or events); same products, same add
+                            const std::uint32_t n = R * H;
+                            ds41::enqueue_trellis_linear(*ta.o_b[0], m.o_low.p, m.half_own.p, R, o_half, H, false, st);
+                            ready_detail::copy_publish(m.half_own.p, stage, n, st);
+                            m.options.communicator->start_staged_ready(st, std::size_t{R} * H * 4U,
+                                                                       dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U});
+                            enqueue_late_mix();
+                            if (m.prefetch_bytes) prefetch_after(s);
+                            const auto peer = m.options.communicator->finish_staged_ready();
+                            const auto* other = static_cast<const float*>(peer.data);
+                            ready_detail::add(m.options.rank == 0U ? m.half_own.p : other, m.options.rank == 0U ? other : m.half_own.p, m.y.p, n,
+                                              peer, st);
+                            m.options.communicator->release_staged_ready(st);
+                            break;
                         }
+                    if (tp) {
+                        // the late hc mix runs while the halves are exchanged, as on the Q8 path (same products, same add order);
+                        // no send staging: it may be host memory, which the trellis plans do not take as output
+                        const auto tag = dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U};
+                        ds41::enqueue_trellis_linear(*ta.o_b[0], m.o_low.p, m.half_own.p, R, o_half, H, false, st);
+                        m.options.communicator->start(st, m.half_own.p, std::size_t{R} * H * 4U, tag);
+                        enqueue_late_mix();
+                        prefetch_after(s);
+                        if (m.prefetch_bytes) prefetch_after(s);
+                        m.options.communicator->finish(st, m.half_other.p);
                         const float* h0 = m.options.rank == 0U ? m.half_own.p : m.half_other.p;
                         const float* h1 = m.options.rank == 0U ? m.half_other.p : m.half_own.p;
                         const std::uint32_t n = R * H;
@@ -1993,18 +2294,15 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
                     if (const auto stage = m.options.communicator->prepare_staged_ready(st, std::size_t{R} * H * 4U); stage.data) {
                         auto* own = static_cast<float*>(stage.data);
                         v.out = own;
-                        ds41::enqueue_q8_0_a8(v, st);
-                        publish_ready_kernel<<<1, 64, 0, st>>>(stage.flag, stage.token);
-                        check(hipGetLastError(), "publish ready");
+                        ready_detail::product(v, stage, st);
                         m.options.communicator->start_staged_ready(st, std::size_t{R} * H * 4U, dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U});
                         enqueue_late_mix();
                         if (m.prefetch_bytes) prefetch_after(s);
                         const auto peer = m.options.communicator->finish_staged_ready();
                         const auto* other = static_cast<const float*>(peer.data);
                         const std::uint32_t n = R * H;
-                        add_halves_ready<<<(n + 255U) / 256U, 256, 0, st>>>(m.options.rank == 0U ? own : other, m.options.rank == 0U ? other : own, m.y.p, n,
-                                                                         peer.flag, peer.token);
-                        check(hipGetLastError(), "add_halves_ready");
+                        ready_detail::add(m.options.rank == 0U ? own : other, m.options.rank == 0U ? other : own,
+                                          m.y.p, n, peer, st);
                         m.options.communicator->release_staged_ready(st);
                         break;
                     }
@@ -2063,7 +2361,7 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
                 if (x_a8) {
                     v.codes = m.codes.p;
                     v.deltas = m.deltas.p;
-                    if (fuse_qa_kv && s.op == Op::q_a) {
+                    if (fuse_qa_kv && s.op == Op::q_a && !m.trellis_site(p + "attn_kv.weight")) {
                         ds41::Q8A8View kv;
                         m.site_weight(kv, p + "attn_kv.weight");  // packed rows (STRIX_DS41_BATCH_PACKED) as q_a's own view
                         kv.first = 0;
@@ -2093,7 +2391,9 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
                 ds41::enqueue_q8_0_a8(v, st);
                 break;
             }
-            ds41::enqueue_quantize_a8(in, in_width, R, m.site_codes.p, m.site_deltas.p, m.site_sums.p, st);
+            if (s.op != Op::q_b || !q_a8)
+                ds41::enqueue_quantize_a8(in, in_width, R, m.site_codes.p, m.site_deltas.p, m.site_sums.p, st);
+            q_a8 = false;
             v.codes = m.site_codes.p;
             v.deltas = m.site_deltas.p;
             ds41::enqueue_q8_0_a8(v, st);
@@ -2102,6 +2402,7 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
         // ---- attention: the projections over every row, the stateful kernels per request segment ----
         // (STRIX_DS41_BATCH_SEGMENTS=1: every segment's call of a kernel in one launch, the same blocks and bits)
         case Op::window_write: {
+            if (attn::hip::attention_window_fold()) break;   // STRIX_DS41_ATTN_WINDOW_FOLD: the attention kernel inserts the rows
             const auto& r = m.roles[layer];
             std::array<attn::hip::WindowView, max_rows> views{};
             std::size_t nv = 0;
@@ -2170,9 +2471,12 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
             const auto& r = m.roles[layer];
             auto& X = m.scratch[layer];
             const std::uint32_t ratio = m.roles[static_cast<std::size_t>(r.kv_source)].ratio;
+            // STRIX_DS41_IDX_DIRECT: a segment whose every row selects all its positions (count <= top-k) needs no scores
+            const bool direct = attn::hip::index_direct();
+            const auto direct_segment = [&](const auto& g) { return direct && (g.position + g.count) / ratio <= attn::kTopK; };
             bool any = false;
-            for (const auto& g : segments) any = any || (g.position + g.count) / ratio != 0U;
-            if (any) {  // the indexer's projections over every row (a row with nothing compressed ignores them)
+            for (const auto& g : segments) any = any || ((g.position + g.count) / ratio != 0U && !direct_segment(g));
+            if (any) {  // the indexer's projections over every row (a row with nothing compressed or selected directly ignores them)
                 ds41::F16RowsView qv;
                 qv.weight = m.devh(p + "indexer.attn_q_b.weight");
                 qv.width = c.q_lora_rank;
@@ -2196,8 +2500,8 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
                 ds41::enqueue_f16_rows_pair(qv, wv, st);  // one launch with STRIX_DS41_F16_PAIR=1 (F16 q_b)
             }
             std::array<attn::hip::IndexView, max_rows> ivs{};
-            std::array<attn::hip::SelectView, max_rows> svs{};
-            std::size_t nv = 0;
+            std::array<attn::hip::SelectView, max_rows> svs{}, dvs{};
+            std::size_t nv = 0, nd = 0;
             for (const auto& g : segments) {
                 const std::uint32_t count = (g.position + g.count) / ratio;  // of the segment's last row
                 if (count == 0U) {
@@ -2217,7 +2521,6 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
                 iv.idx_cache = m.slots[g.slot].layers[static_cast<std::size_t>(r.kv_source)].idx;
                 iv.scores = m.index_scores.p + std::size_t{g.first} * m.max_count;
                 iv.qprep = m.index_qprep.p + std::size_t{g.first} * attn::hip::kIdxPrepBytes;
-                if (!batch_segments) attn::hip::enqueue_index_scores(iv, st);
                 attn::hip::SelectView sv{};
                 sv.rows = g.count;
                 sv.ratio = ratio;
@@ -2232,13 +2535,25 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
                 sv.keys = m.select_keys.p + std::size_t{g.first} * m.max_count;
                 sv.idx = X.idx.p + std::size_t{g.first} * attn::kTopK;
                 sv.idx_count = X.idx_count.p + g.first;
+                if (direct_segment(g)) {
+                    if (batch_segments) dvs[nd++] = sv;
+                    else attn::hip::enqueue_select_direct(sv, st);
+                    continue;
+                }
+                if (sv.pool == attn::Pool::candidate_user && count > attn::kCandBlocks * attn::kCandBlockSize && attn::hip::index_candidate_filter()) {
+                    iv.candidates = sv.candidates;
+                    iv.block_size = sv.block_size;
+                    sv.compact = true;
+                }
                 if (batch_segments) {
                     ivs[nv] = iv;
                     svs[nv++] = sv;
                 } else {
+                    attn::hip::enqueue_index_scores(iv, st);
                     attn::hip::enqueue_select(sv, st);
                 }
             }
+            if (nd != 0U) attn::hip::enqueue_select_direct_segments(std::span(dvs.data(), nd), st);
             if (nv != 0U) {
                 attn::hip::enqueue_index_scores_segments(std::span(ivs.data(), nv), st);
                 attn::hip::enqueue_select_segments(std::span(svs.data(), nv), st);
@@ -2260,6 +2575,21 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
                 v.rope = (r.rope == attn::RopeKind::window ? rope_window : rope_compressed) + g.first;
                 v.pos = m.pos64.p + g.first;
                 v.ring = S.layers[layer].ring.p;
+                if (attn::hip::attention_live_chunks()) {   // the segment's last row: window + selection bound
+                    const std::uint64_t last = std::uint64_t{g.position} + g.count;
+                    const std::uint64_t win = last < attn::kWindow ? last : attn::kWindow;
+                    std::uint64_t sel = 0;
+                    if (r.ratio != 0U) {
+                        sel = last / m.roles[static_cast<std::size_t>(r.kv_source)].ratio;
+                        if (sel > attn::kTopK) sel = attn::kTopK;
+                    }
+                    v.max_visible = static_cast<std::uint32_t>(win + sel);
+                }
+                if (attn::hip::attention_window_fold()) {   // the window insert of this segment's rows (window_write's inputs)
+                    v.kv = m.kv.p + std::size_t{g.first} * D;
+                    v.kv_norm = m.devf(p + "attn_kv_a_norm.weight");
+                    v.ring_out = S.layers[layer].ring.p;
+                }
                 if (r.ratio != 0U) {
                     v.kv_cache = S.layers[static_cast<std::size_t>(r.kv_source)].kv;
                     v.idx = m.scratch[static_cast<std::size_t>(r.index_source)].idx.p + std::size_t{g.first} * attn::kTopK;
@@ -2328,7 +2658,8 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
             v.ids = m.ids.p;
             v.weights = m.route_w.p;
             v.tickets = m.router_tickets.p;  // STRIX_DS41_ROUTER_FAST=1: the selection in the scores launch
-            ds41::enqueue_router(v, st);
+            routes_ready = router_routes && ds41::enqueue_router_routes(v, route_view(), st);
+            if (!routes_ready) ds41::enqueue_router(v, st);
             break;
         }
         case Op::shared_expert: {
@@ -2377,21 +2708,8 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
         case Op::routed_experts: {
             // routes of this rank's experts [expert_first, expert_end) from the router's ids: the union of every row's
             // selection, each expert once, its rows in row order
-            ds41::BuildRoutesView bv;
-            bv.ids = m.ids.p;
-            bv.rows = R;
-            bv.top_k = K;
-            bv.split = m.expert_tp ? c.n_routed_experts : m.plan.expert_split;  // expert TP: every slot in the rank's fold
-            bv.first = m.expert_first;
-            bv.end = m.expert_end;
-            bv.experts = m.built.experts.p;
-            bv.begins = m.built.begins.p;
-            bv.rows_out = m.built.rows.p;
-            bv.slots = m.built.slots.p;
-            bv.order = m.built.order.p;
-            bv.low_counts = m.built.low_counts.p;
-            bv.counts = m.built.counts.p;
-            ds41::enqueue_build_routes(bv, st);
+            const auto bv = route_view();
+            if (!routes_ready) ds41::enqueue_build_routes(bv, st);
             check(hipMemcpyAsync(m.counts_pinned.p + 2U * layer, m.built.counts.p, 8U, hipMemcpyDeviceToHost, st), "union counts");
             const ds41::RoutesView gate_routes{m.built.experts.p, m.built.begins.p, m.built.rows.p, m.built.slots.p, R * K, R, m.built.counts.p};
             const ds41::RoutesView down_routes{m.built.experts.p, m.built.begins.p, m.built.slots.p, m.built.slots.p, R * K, R, m.built.counts.p};
@@ -2494,6 +2812,28 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
                 v.top_k = K;
                 v.hidden = H;
                 v.half = m.expert_tp ? 0U : m.options.rank;  // expert TP: the fold of all the row's slots (low_counts = top_k)
+                // STRIX_DS41_MOE_READY=1: the half sum straight into the coherent TX view, the combine straight from RX
+                // (lean releases, no copies or events); same sums, same order. Above the view limit: as below.
+                if (!m.shexp_tp && ready_detail::moe())
+                    if (const auto stage = m.options.communicator->prepare_staged_ready(st, std::size_t{R} * H * 4U); stage.data) {
+                        auto* own = static_cast<float*>(stage.data);
+                        v.out = own;
+                        ds41::enqueue_half_sum_ready(v, stage, st);
+                        m.options.communicator->start_staged_ready(st, std::size_t{R} * H * 4U,
+                                                                   dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U});
+                        if (deferred_shared) {
+                            enqueue_shared(*deferred_shared);
+                            deferred_shared = nullptr;
+                        } else if (m.prefetch_bytes) {
+                            prefetch_after(s);
+                        }
+                        const auto peer = m.options.communicator->finish_staged_ready();
+                        const auto* other = static_cast<const float*>(peer.data);
+                        ds41::enqueue_canonical_sum_ready(m.shared.p, m.options.rank == 0U ? own : other, m.options.rank == 0U ? other : own,
+                                                          std::size_t{R} * H, m.y.p, peer, st);
+                        m.options.communicator->release_staged_ready(st);
+                        break;
+                    }
                 v.out = m.half_own.p;
                 ds41::enqueue_half_sum(v, st);
                 if (m.shexp_tp) {  // shexp-tp: S_r + P_r travels, y = (S0 + P0) + (S1 + P1)
@@ -2627,6 +2967,81 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
             break;
         }
         }
+        if (tr) {
+            ++trace_op;
+            check(hipEventRecord(m.trace_events.events[trace_op], st), "batch trace op");
+            tr->op(to_string(s.op), s.layer, s.site, m.comm_seconds() - trace_comm, static_cast<int>(trace_op));
+        }
+    }
+    if (tr) tr->last_event(st);
+    if (front_cut != 0U) {  // a FRONT step: the cut after layer front_cut - 1 of every segment, as a TAIL step_boundary reads it
+        namespace pipe = ds41::pipe;
+        flush_post();  // the last layer's expansion is still pending with the fused hc sites
+        if (engram_async) {
+            engram_io.get();
+            stats_.engram_seconds = engram_read_seconds;
+        }
+        const auto fcut = pipe::plan_boundary(m.model.layers, front_cut);
+        const auto geo = pipe::boundary_geometry(c);
+        const std::size_t row_floats = std::size_t{hc} * H;
+        const auto download = [&](const void* src, std::size_t bytes) {  // synchronous (a gate path)
+            std::vector<std::uint8_t> v(bytes);
+            if (bytes) {
+                check(hipMemcpyAsync(v.data(), src, bytes, hipMemcpyDeviceToHost, st), "front boundary");
+                check(hipStreamSynchronize(st), "front boundary");
+            }
+            return v;
+        };
+        check(hipStreamSynchronize(st), "front step");
+        front_out->clear();
+        for (const auto& g : segments) {
+            pipe::Boundary b;
+            b.position = g.position;
+            b.rows = g.count;
+            for (std::uint32_t k = 0; k < g.count; ++k) b.tokens.push_back(rows[g.first + k].token);
+            b.stream.resize(std::size_t{g.count} * row_floats);
+            check(hipMemcpyAsync(b.stream.data(), m.streams[m.cur].p + std::size_t{g.first} * row_floats, b.stream.size() * 4U, hipMemcpyDeviceToHost, st),
+                  "front stream");
+            pipe::Section mix{pipe::SectionKind::mix_ffn, front_cut - 1U, 0U, g.count, download(m.mix_ffn.p + g.first, std::size_t{g.count} * sizeof(ds41::HcMix))};
+            b.sections.push_back(std::move(mix));
+            for (const auto& src : fcut.kv_sources) {
+                const auto& L = m.slots[g.slot].layers[src.layer];
+                const std::uint32_t first = g.position / src.ratio, n = (g.position + g.count) / src.ratio - first;
+                pipe::Section k{pipe::SectionKind::kv_entries, src.layer, first, n, download(L.kv + std::size_t{first} * attn::kKvEntryBytes, std::size_t{n} * attn::kKvEntryBytes)};
+                const auto ix = download(L.idx + std::size_t{first} * attn::kIdxEntryBytes, std::size_t{n} * attn::kIdxEntryBytes);
+                k.bytes.insert(k.bytes.end(), ix.begin(), ix.end());
+                b.sections.push_back(std::move(k));
+            }
+            for (const auto& src : fcut.topk_sources) {
+                const auto& X = m.scratch[src.layer];
+                const auto counts = download(X.idx_count.p + g.first, std::size_t{g.count} * 4U);
+                const auto ids = download(X.idx.p + std::size_t{g.first} * attn::kTopK, std::size_t{g.count} * attn::kTopK * 4U);
+                pipe::Section k{pipe::SectionKind::topk, src.layer, 0U, g.count, {}};
+                for (std::uint32_t r = 0; r < g.count; ++r) {
+                    std::uint32_t n = 0;
+                    std::memcpy(&n, counts.data() + 4U * r, 4);
+                    k.bytes.insert(k.bytes.end(), counts.data() + 4U * r, counts.data() + 4U * r + 4U);
+                    k.bytes.insert(k.bytes.end(), ids.data() + std::size_t{r} * attn::kTopK * 4U, ids.data() + (std::size_t{r} * attn::kTopK + n) * 4U);
+                }
+                b.sections.push_back(std::move(k));
+            }
+            if (fcut.candidate_source >= 0) {
+                const std::uint32_t count = (g.position + g.count) / fcut.candidate_ratio;
+                const std::uint32_t stride = (count + geo.candidate_block - 1U) / geo.candidate_block;
+                pipe::Section k{pipe::SectionKind::candidates, static_cast<std::uint32_t>(fcut.candidate_source), stride, g.count,
+                                download(m.candidates.p + std::size_t{g.first} * m.cand_bytes, std::size_t{g.count} * stride)};
+                b.sections.push_back(std::move(k));
+            }
+            front_out->push_back(std::move(b));
+        }
+        check(hipStreamSynchronize(st), "front boundary");
+        // the slots' positions and Engram histories stay where they were: the TAIL half of the step (step_boundary) moves them
+        for (const auto& g : segments) m.slots[g.slot].hasher->truncate(g.position);
+        m.front_segments.clear();
+        for (const auto& g : segments) m.front_segments.push_back({g.slot, g.first, g.count, g.position});
+        tokens_.clear();
+        stats_.seconds = seconds_since(t_step);
+        return tokens_;
     }
     if (engram_async) {
         engram_io.get();
@@ -2643,13 +3058,20 @@ const std::vector<std::uint32_t>& BatchForward::step(std::span<const BatchRow> r
         m.slots[g.slot].position += g.count;
         m.last_segments.push_back({g.slot, g.first, g.count, g.position});
     }
-    for (std::uint32_t l = 0; l < m.options.layers; ++l) {
+    m.last_first_layer = first_layer;
+    if (tail && m.front_segments.size() == m.last_segments.size() &&
+        std::equal(m.front_segments.begin(), m.front_segments.end(), m.last_segments.begin(),
+                   [](const auto& a, const auto& b) { return a.slot == b.slot && a.first == b.first && a.count == b.count && a.position == b.position; }))
+        m.last_first_layer = 0;  // step_front ran the same rows in this process just before: the stash of every layer is this step's
+    m.front_segments.clear();
+    for (std::uint32_t l = first_layer; l < m.options.layers; ++l) {
         stats_.union_experts[l] = m.counts_pinned.p[2U * l];
         stats_.max_rows_per_expert[l] = m.counts_pinned.p[2U * l + 1U];
         stats_.expert_bytes += std::uint64_t{stats_.union_experts[l]} * m.expert_bytes;
     }
     stats_.exchange_seconds = m.comm_seconds() - comm_at_start;
     stats_.seconds = seconds_since(t_step);
+    if (tr) tr->finish(m.trace_events.events, stats_.seconds);
     return tokens_;
 }
 

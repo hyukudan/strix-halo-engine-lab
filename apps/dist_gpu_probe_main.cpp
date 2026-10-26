@@ -153,11 +153,16 @@ int main(int argc, char** argv) try {
                 }
                 strix::dist::ProducerStage produced{};
                 if (staged_ready) produced = c.prepare_staged_ready(s, size);
+                // STRIX_PROBE_STAGED=1: the fused staging path (send_staging / finish_staged), when readiness is not in use
+                const bool staged = !produced.data && env("STRIX_PROBE_STAGED", "0") == "1";
+                const void* received = remote;
                 if (produced.data) {
                     strix::dist::enqueue_staged_pattern(produced, size, value_of(i, rank), s);
                     used_staged_ready = true;
                 } else {
-                    check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(local), static_cast<int>(value_of(i, rank)), size / 4U, s), "producer");
+                    void* producer = staged ? c.send_staging(size) : local;
+                    if (!producer) throw std::runtime_error("staged probe requires fused staging and a host route");
+                    check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(producer), static_cast<int>(value_of(i, rank)), size / 4U, s), "producer");
                 }
                 check(hipStreamSynchronize(s), "producer");
                 if (pause_us && hot_gap) {
@@ -175,13 +180,17 @@ int main(int argc, char** argv) try {
                 double available = 0.0;
                 if (produced.data) {
                     c.start_staged_ready(s, size, strix::dist::Tag{1U, i, 0U});
-                    const auto received = c.finish_staged_ready();
+                    const auto ready = c.finish_staged_ready();
                     available = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
                     strix::dist::latency::mark("probe_ready_available", i);
                     // A qualification consumer, not part of the readiness latency. It proves that a GPU kernel
                     // reads the coherent view correctly and publishes its lifetime before the next RX can reuse it.
-                    strix::dist::enqueue_staged_consume(received, remote, size, s);
+                    strix::dist::enqueue_staged_consume(ready, remote, size, s);
                     c.release_staged_ready(s);
+                } else if (staged) {
+                    c.start_staged(s, size, strix::dist::Tag{1U, i, 0U});
+                    received = c.finish_staged(s);
+                    c.release_staged(s);
                 } else {
                     c.exchange(s, local, remote, size, strix::dist::Tag{1U, i, 0U});
                 }
@@ -190,7 +199,7 @@ int main(int argc, char** argv) try {
                 const double t = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
                 if (!produced.data) available = t;
                 const double c1 = cpu_seconds();
-                check(hipMemcpy(got.data(), remote, size, hipMemcpyDeviceToHost), "read back");
+                check(hipMemcpy(got.data(), received, size, hipMemcpyDefault), "read back");
                 const auto expect = value_of(i, 1U - rank);
                 bad += std::all_of(got.begin(), got.begin() + static_cast<std::ptrdiff_t>(size / 4U), [&](std::uint32_t w) { return w == expect; }) ? 0U : 1U;
                 if (i >= 10U) {
