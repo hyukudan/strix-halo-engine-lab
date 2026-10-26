@@ -1,0 +1,30 @@
+{
+  "schema": "mtp-copy-edit-prompts-v1",
+  "provenance": "Project-owned synthetic prompts; no imported benchmark text.",
+  "cases": [
+    {
+      "name": "code-edit-en",
+      "text": "Change only retry_limit from 3 to 5 in this module. Return the complete module, preserving every other byte.\n```python\nfrom dataclasses import dataclass\n\n@dataclass\nclass RetryPolicy:\n    retry_limit: int = 3\n    base_delay_ms: int = 120\n\ndef run_job(job, policy):\n    for attempt in range(policy.retry_limit):\n        result = job.execute()\n        if result.ok:\n            return result\n        job.wait(policy.base_delay_ms * (attempt + 1))\n    raise RuntimeError(\"job did not complete\")\n```"
+    },
+    {
+      "name": "code-edit-es",
+      "text": "Cambia solo limite_intentos de 3 a 5. Devuelve el módulo completo y conserva el resto del código.\n```python\nfrom dataclasses import dataclass\n\n@dataclass\nclass Politica:\n    limite_intentos: int = 3\n    espera_ms: int = 120\n\ndef ejecutar(tarea, politica):\n    for intento in range(politica.limite_intentos):\n        resultado = tarea.ejecutar()\n        if resultado.correcto:\n            return resultado\n        tarea.esperar(politica.espera_ms * (intento + 1))\n    raise RuntimeError(\"la tarea no terminó\")\n```"
+    },
+    {
+      "name": "quote-en",
+      "text": "Quote the paragraph between BEGIN and END exactly, without commentary or the markers.\nBEGIN\nThe archive opens at nine. Each visitor receives a numbered card and a pencil. The blue cabinet contains maps, the green cabinet contains letters, and the small desk holds the register. Return every item to its original folder before leaving.\nEND"
+    },
+    {
+      "name": "quote-es",
+      "text": "Cita exactamente el párrafo entre INICIO y FIN, sin comentarios ni marcadores.\nINICIO\nEl archivo abre a las nueve. Cada visitante recibe una tarjeta numerada y un lápiz. El armario azul contiene mapas, el verde contiene cartas y la mesa pequeña guarda el registro. Devuelve cada documento a su carpeta original antes de salir.\nFIN"
+    },
+    {
+      "name": "agent-edit-en",
+      "text": "User: Update the config to use port 9080 and preserve all other settings. First inspect the tool output, then return only the full updated file.\nAssistant tool call: read_file(\"service.conf\")\nTool result:\n[service]\nname = sample_catalog\nport = 8080\nhost = 127.0.0.1\nworkers = 4\nrequest_timeout_ms = 1500\n\n[logging]\nlevel = info\nformat = compact\nrotate_mb = 32\nkeep_files = 6\n\n[cache]\nenabled = true\ncapacity = 256\nexpiry_seconds = 120\n\nUser: The inspection is complete. Apply the one requested edit; include every section.\nAssistant:"
+    },
+    {
+      "name": "agent-edit-es",
+      "text": "Usuario: Cambia el puerto a 9080 y conserva las demás opciones. Revisa la salida de herramienta y devuelve solo el archivo actualizado completo.\nAsistente llama a herramienta: leer_archivo(\"servicio.conf\")\nResultado de herramienta:\n[servicio]\nnombre = catalogo_ejemplo\npuerto = 8080\ndireccion = 127.0.0.1\nprocesos = 4\nespera_peticion_ms = 1500\n\n[registro]\nnivel = info\nformato = compacto\nrotacion_mb = 32\narchivos = 6\n\n[cache]\nactivo = true\ncapacidad = 256\ncaducidad_segundos = 120\n\nUsuario: La inspección ha terminado. Aplica el único cambio solicitado e incluye todas las secciones.\nAsistente:"
+    }
+  ]
+}

@@ -51,6 +51,7 @@
 
 #include "hip_q6p_weights.hpp"
 #include "strix/q6p_registry.hpp"
+#include "strix/hip_gsq_a8_groups.hpp"
 
 namespace strix {
 // Launches that drop the AQL barrier bit for kernels proven independent of the one queued
@@ -71,6 +72,8 @@ struct Segments {
     const unsigned char* weights[kMaxSegments];
     std::uint32_t first[kMaxSegments + 1U];
     unsigned count;
+    // ggml type per segment; 0 = Q8_0 (every incumbent site). Other types: dense A8 GSQ form only.
+    std::uint32_t types[kMaxSegments];
 };
 
 inline Segments segments(std::initializer_list<std::pair<const void*, std::uint32_t>> parts) {
@@ -1162,16 +1165,29 @@ struct __attribute__((aligned(4))) DenseA8Dword4 { unsigned x, y, z, w; };
 // its codes sit two bytes in; an odd block starts two bytes before its scale (the previous
 // block's last codes) and its codes are dwords 1..8. Q8 rows hold an even block count, so
 // neither reads outside the row.
-template <unsigned Outs> struct DenseA8Weights {
+template <class Site> constexpr bool mall_nontemporal_of() {
+    if constexpr (requires { Site::mall_nontemporal; }) return Site::mall_nontemporal;
+    else return false;
+}
+template <unsigned Outs, bool Nontemporal = false> struct DenseA8Weights {
     unsigned d[Outs][9];
     __device__ __forceinline__ void load(const unsigned char* const (&w)[Outs], std::uint32_t b) {
 #pragma unroll
         for (unsigned o = 0; o < Outs; ++o) {
             const unsigned char* p = w[o] + (34U * b & ~3U);
+            if constexpr (Nontemporal) {
+                using Words = unsigned __attribute__((ext_vector_type(4), aligned(4)));
+                const auto lo = __builtin_nontemporal_load(reinterpret_cast<const Words*>(p));
+                const auto hi = __builtin_nontemporal_load(reinterpret_cast<const Words*>(p + 16U));
+#pragma unroll
+                for (unsigned k = 0; k < 4U; ++k) { d[o][k] = lo[k]; d[o][k + 4U] = hi[k]; }
+                d[o][8] = __builtin_nontemporal_load(reinterpret_cast<const unsigned*>(p) + 8U);
+            } else {
             const auto lo = reinterpret_cast<const DenseA8Dword4*>(p)[0], hi = reinterpret_cast<const DenseA8Dword4*>(p)[1];
             d[o][0] = lo.x; d[o][1] = lo.y; d[o][2] = lo.z; d[o][3] = lo.w;
             d[o][4] = hi.x; d[o][5] = hi.y; d[o][6] = hi.z; d[o][7] = hi.w;
             d[o][8] = reinterpret_cast<const unsigned*>(p)[8];
+            }
         }
     }
 };
@@ -1252,7 +1268,7 @@ __global__ __launch_bounds__(kThreads) void project_rows_dense_a8_kernel(Site si
     // Block 32s + l has the parity of l: byte selectors and scale half of the nine dwords.
     const unsigned odd = lane & 1U, select = odd ? 0x07060504U : 0x05040302U, shift = odd ? 16U : 0U;
     // Lanes past the last block repeat it; the chain never reads their slots.
-    using Weights = std::conditional_t<Q6, DenseA8Q6Weights<Outs>, DenseA8Weights<Outs>>;
+    using Weights = std::conditional_t<Q6, DenseA8Q6Weights<Outs>, DenseA8Weights<Outs, mall_nontemporal_of<Site>()>>;
     const auto fetch = [&](std::uint32_t t, Weights& into) {
         const std::uint32_t g = first + t / supers * step;
         typename RowsFormat<Q6>::Row w[Outs];
@@ -1478,9 +1494,9 @@ __global__ __launch_bounds__(128) void project_rows_dense_a8_wmma_kernel(Site si
 // Staged rows for the 4 x 2 WMMA form below: a block's 64 rows (codes of one block pair, plane-major
 // [K quarter q][A slot][16 bytes], A slot 16 t + i = the row lane i of tile t carries, so a tile's
 // operand is one conflict-free ds_load_b128 per K half) and their deltas, double-buffered.
-struct DenseA8Stage {
-    dense_a8_v4i codes[2][4][64];
-    float deltas[2][2][64];
+template <unsigned Buffers> struct DenseA8Stage {
+    dense_a8_v4i codes[Buffers][4][64];
+    float deltas[Buffers][2][64];
 };
 // 64 rows x 32 outputs per wave (4 x 2 tiles), rows staged in LDS. The Waves waves of a block share the
 // row tiles: each block pair's codes (64 rows x 64 bytes) and deltas (2 x 64) are loaded from memory
@@ -1490,14 +1506,14 @@ struct DenseA8Stage {
 // hoisting every tile's operands, which spills): per row tile, 2 x 2 WMMAs, then its 2 x 8 chain steps.
 // Weights stream one block pair ahead per wave. Same WMMAs, epilogue expressions and block order as
 // project_rows_dense_a8_wmma_kernel; one barrier per block pair.
-template <class Site, unsigned Waves>
+template <class Site, unsigned Waves, bool SingleLds = false>
 __global__ __launch_bounds__(32U * Waves) void project_rows_dense_a8_wmma_lds2_kernel(Site site, const std::int8_t* codes,
     const float* deltas) {
 #pragma clang fp contract(off)
     constexpr unsigned Rows = Site::rows, TM = 4U, TN = 2U, Threads = 32U * Waves;
     static_assert(Rows % 64U == 0U && Rows <= kDenseA8WideRows && Threads >= 128U);
     constexpr std::uint32_t pitch = dense_a8_pitch<Rows>();
-    __shared__ DenseA8Stage stage;
+    __shared__ DenseA8Stage<SingleLds ? 1U : 2U> stage;
     const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x / 32U, i = lane & 15U, h = lane >> 4U;
     constexpr std::uint32_t row_tiles = Rows / 64U;
     const std::uint32_t width = site.width, outputs = site.outputs, pairs = width / 64U;
@@ -1556,7 +1572,7 @@ __global__ __launch_bounds__(32U * Waves) void project_rows_dense_a8_wmma_lds2_k
     if (pairs > 1U) load(1U);
     __syncthreads();
     for (std::uint32_t p = 0; p < pairs; ++p) {
-        const unsigned buffer = p & 1U;
+        const unsigned buffer = SingleLds ? 0U : p & 1U;
         if (active) {
             dense_a8_v4i wb[2][TN][2];
             float dw[2][TN];
@@ -1596,8 +1612,11 @@ __global__ __launch_bounds__(32U * Waves) void project_rows_dense_a8_wmma_lds2_k
                     __builtin_amdgcn_sched_barrier(0);
                 }
         }
+        // A single LDS image must not be overwritten until every wave has read it.
+        // Register prefetch and the ascending per-Q8-block FMA chain are unchanged.
+        if constexpr (SingleLds) __syncthreads();
         if (p + 1U < pairs) {
-            store(buffer ^ 1U);
+            store(SingleLds ? 0U : buffer ^ 1U);
             if (p + 2U < pairs) load(p + 2U);
         }
         __syncthreads();
@@ -1690,9 +1709,14 @@ template <class Site> void launch_dense_a8_projection(const Site& site, const De
         if (!forced && (lds == 2U || (lds == 1U && lds_blocks >= 40U))) {
             static const unsigned lds_waves = env_unsigned("STRIX_DENSE_A8_LDS_WAVES", 8U);
             const auto staged = [&]<unsigned Waves>() {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(project_rows_dense_a8_wmma_lds2_kernel<Site, Waves>),
-                    dim3(Site::rows / 64U * ((site.outputs + 32U * Waves - 1U) / (32U * Waves))), dim3(32U * Waves), 0, stream,
-                    site, slot.codes, slot.deltas);
+                static const unsigned single = env_unsigned("STRIX_INTPREFILL_DENSE_A8_SINGLE_LDS", 0U);
+                const auto launch = [&]<bool Single>() {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(project_rows_dense_a8_wmma_lds2_kernel<Site, Waves, Single>),
+                        dim3(Site::rows / 64U * ((site.outputs + 32U * Waves - 1U) / (32U * Waves))), dim3(32U * Waves), 0, stream,
+                        site, slot.codes, slot.deltas);
+                };
+                if (single == 1U) launch.template operator()<true>();
+                else launch.template operator()<false>();
             };
             if (lds_waves == 4U) staged.template operator()<4U>(); else staged.template operator()<8U>();
             return;
@@ -1709,6 +1733,103 @@ template <class Site> void launch_dense_a8_projection(const Site& site, const De
     if (forced == 42U && pick.template operator()<4U, 2U>()) return;
     tiled.template operator()<TM, 1U>();
 }
+// GSQ-RCO dense A8 (opt-in by typed segments): the dense A8 quantizer and ascending
+// per-block FMA chain with segments of other GGUF types (gsq_a8_groups.hpp dense_group / dense_entry).
+// A one-scale type's block (32 weights) enters the chain as (s * delta, float(I)) exactly like Q8_0;
+// halves / min types as (v, 1) with v = (s0 * delta) * float(I0) + (s1 * delta) * float(I1) or
+// (s0 * delta) * float(I) - (s1 * delta) * float(S). Q8_0 segments of a typed site keep their Q8 bits.
+// Lane l takes block 32s + l of every 32-block superchunk (as project_rows_dense_a8_kernel) and the
+// chain runs over the superchunk in ascending order; R1 and 2..8-row windows give a row the same bits.
+// Dense A8 admits Q8_0 and, with STRIX_GSQ_Q20_A8=1 (GSQ-RCO files), the GSQ dense types.
+inline bool gsq_dense_enabled() {
+    static const bool on = [] { const char* v = std::getenv("STRIX_GSQ_Q20_A8"); return v && v[0] == '1' && !v[1]; }();
+    return on;
+}
+inline bool dense_a8_type(std::uint32_t type) { return type == 8U || (gsq_dense_enabled() && gsq_a8::dense_type(type)); }
+inline std::uint32_t segment_type(std::uint32_t type) { return type == 8U ? 0U : type; }
+inline bool gsq_segments(const Segments& s) {
+    for (unsigned m = 0; m < s.count; ++m) if (s.types[m] != 0U && s.types[m] != 8U) return true;
+    return false;
+}
+template <class F>
+__device__ __forceinline__ void gsq_dense_dispatch(std::uint32_t type, F&& f) {
+    switch (type) {
+    case 2U: f.template operator()<2U>(); break;
+    case 6U: f.template operator()<6U>(); break;
+    case 11U: f.template operator()<11U>(); break;
+    case 12U: f.template operator()<12U>(); break;
+    case 13U: f.template operator()<13U>(); break;
+    case 14U: f.template operator()<14U>(); break;
+    case 20U: f.template operator()<20U>(); break;
+    case 23U: f.template operator()<23U>(); break;
+    case 42U: f.template operator()<42U>(); break;
+    default: f.template operator()<8U>(); break;
+    }
+}
+template <class Site, unsigned Outs>
+__global__ __launch_bounds__(kThreads) void project_rows_dense_a8_gsq_kernel(Site site, const std::int8_t* codes, const float* deltas) {
+#pragma clang fp contract(off)
+    constexpr unsigned Rows = Site::rows, Pairs = Outs * Rows;
+    static_assert(Rows <= 8U && Pairs <= 16U);
+    constexpr unsigned ChainBlocks = 32U;
+    __shared__ float2 chain[kWaves][Pairs][ChainBlocks + 1U];
+    const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x / 32U;
+    const std::uint32_t width = site.width, blocks = width / 32U, supers = (blocks + 31U) / 32U;
+    const std::uint32_t groups = (site.outputs + Outs - 1U) / Outs;
+    for (std::uint32_t g = blockIdx.x * kWaves + wave; g < groups; g += gridDim.x * kWaves) {
+        float acc = 0.0F;
+        for (std::uint32_t s = 0; s < supers; ++s) {
+            const std::uint32_t b = min(32U * s + lane, blocks - 1U);
+            int a[Rows][8];
+            float delta[Rows];
+#pragma unroll
+            for (unsigned r = 0; r < Rows; ++r) {
+                const auto* p = reinterpret_cast<const int4*>(codes + static_cast<std::uint64_t>(r) * width + 32U * b);
+                const int4 x0 = p[0], x1 = p[1];
+                a[r][0] = x0.x; a[r][1] = x0.y; a[r][2] = x0.z; a[r][3] = x0.w;
+                a[r][4] = x1.x; a[r][5] = x1.y; a[r][6] = x1.z; a[r][7] = x1.w;
+                delta[r] = deltas[b * kDenseA8Rows + r];
+            }
+            wave_lds_order();
+#pragma unroll
+            for (unsigned o = 0; o < Outs; ++o) {
+                const std::uint32_t out = min(g * Outs + o, site.outputs - 1U);
+                unsigned m = 0;
+                while (m + 1U < site.segments.count && out >= site.segments.first[m + 1U]) ++m;
+                const std::uint32_t type = site.segments.types[m] ? site.segments.types[m] : 8U;
+                const unsigned char* row = site.segments.weights[m] +
+                    static_cast<std::uint64_t>(out - site.segments.first[m]) * gsq_a8::dense_row_bytes(type, width);
+                gsq_dense_dispatch(type, [&]<std::uint32_t T>() {
+                    const auto x = gsq_a8::dense_group<T>(row, b);
+#pragma unroll
+                    for (unsigned r = 0; r < Rows; ++r) {
+                        const float2 e = gsq_a8::dense_entry<T>(x, a[r], delta[r]);
+                        if (lane < ChainBlocks) chain[wave][o * Rows + r][lane] = e;
+                    }
+                });
+            }
+            wave_lds_order();
+            if (lane < Pairs) {
+                const std::uint32_t count = min(ChainBlocks, blocks - 32U * s);
+#pragma unroll
+                for (unsigned j = 0; j < ChainBlocks; ++j)
+                    if (j < count) { const float2 c = chain[wave][lane][j]; acc = __builtin_fmaf(c.x, c.y, acc); }
+            }
+        }
+        if (lane < Pairs) {
+            const std::uint32_t out = g * Outs + lane / Rows;
+            if (out < site.outputs) site.store(out, lane % Rows, dense_a8_canonical(acc));
+        }
+    }
+}
+template <class Site> void launch_dense_a8_gsq(const Site& site, const DenseA8Slot& slot, hipStream_t stream) {
+    constexpr unsigned Outs = dense_a8_outs_of<Site>();
+    const unsigned groups = (site.outputs + Outs - 1U) / Outs;
+    constexpr auto kernel = project_rows_dense_a8_gsq_kernel<Site, Outs>;
+    hipLaunchKernelGGL(kernel, dim3(std::min((groups + kWaves - 1U) / kWaves, resident_blocks<kernel, kThreads>(0U))), dim3(kThreads), 0,
+        stream, site, slot.codes, slot.deltas);
+}
+
 // Dense A8. Rows <= 8 whose activations fit LDS: one persistent launch that quantizes them
 // per block (the 6144-wide 3..8-row inputs do not fit; windows quantize those in their
 // producers, launch_dense_a8_quantized). Otherwise one quantizer launch into the family's
@@ -1722,6 +1843,16 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
             throw std::invalid_argument("q8_rows: dense A8 fixed-width contract differs");
     if (!dense_a8_width(site.width))
         throw std::invalid_argument("q8_rows: dense A8 requires a width that is a positive multiple of 64, at most 8192");
+    if (gsq_segments(site.segments)) {
+        if constexpr (Site::rows <= 8U) {
+            const auto slot = dense_a8_slot(a8_family_of<Site>());
+            const auto items = Site::rows * (site.width / 8U);
+            hipLaunchKernelGGL(dense_a8_quantize_kernel<Site>, dim3((items + kThreads - 1U) / kThreads), dim3(kThreads), 0, stream,
+                site, slot.codes, slot.deltas);
+            launch_dense_a8_gsq(site, slot, stream);
+            return;
+        } else throw std::invalid_argument("q8_rows: GSQ dense A8 supports 1..8 rows");
+    }
     for (unsigned m = 0; m < site.segments.count; ++m)
         if (reinterpret_cast<std::uintptr_t>(site.segments.weights[m]) % 4U)
             throw std::invalid_argument("q8_rows: dense A8 requires dword-aligned Q8 weights");
@@ -1771,6 +1902,7 @@ template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream,
     } else launch_dense_a8_projection(site, slot, stream);
 }
 
+
 // Projection only, from a slot its producer filled (dense_a8_quantize_lane): codes
 // [row][width], deltas [block * kDenseA8Rows + row] for rows 0..Site::rows-1.
 // 16/32 rows (cohort windows of several sessions): the WMMA projection from the same pitch-64 slot.
@@ -1784,6 +1916,10 @@ template <class Site> void launch_dense_a8_quantized(const Site& site, const Den
     for (unsigned m = 0; m < site.segments.count; ++m)
         if (reinterpret_cast<std::uintptr_t>(site.segments.weights[m]) % 4U)
             throw std::invalid_argument("q8_rows: dense A8 requires dword-aligned Q8 weights");
+    if (gsq_segments(site.segments)) {
+        if constexpr (Site::rows <= 8U) { launch_dense_a8_gsq(site, slot, stream); return; }
+        else throw std::invalid_argument("q8_rows: GSQ dense A8 supports 1..8 rows");
+    }
     if constexpr (Site::rows > 8U) { launch_dense_a8_projection(site, slot, stream); return; } else {
     constexpr unsigned Outs = dense_a8_outs_of<Site>();
     const unsigned groups = (site.outputs + Outs - 1U) / Outs;

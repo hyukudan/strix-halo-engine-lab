@@ -27,6 +27,12 @@ struct KnownPromptChunkRequest {
     // runs headless. The window backend delivers the non-terminal rows itself; the cursor still
     // keeps only the terminal frontier.
     bool all_row_heads = false;
+    // STRIX_QPF2K_SCHED bits 2/4 (deferred block completion, balanced blocks) apply only when set: the caller keeps no
+    // per-block observer of committed device state (e.g. a prefix state store capturing T-block boundaries).
+    bool schedule_extensions = false;
+    // The configured tail ladder (descending) for the S3 eligibility check; empty: the set tail backends' sizes.
+    std::vector<std::uint32_t> ladder_tail_rows{};
+    // Set by the cursor at the first unit: S3 balanced blocks apply to this prompt (bitwise equal to the ladder).
 };
 struct KnownPromptChunkProgress {
     std::uint64_t next_position = 0;
@@ -84,6 +90,7 @@ class KnownPromptChunkCursor final {
 public:
     KnownPromptChunkCursor(KnownPromptChunkRequest request,
         KnownPromptWindowBackend& windows, SerialGreedyStepBackend& serial);
+    ~KnownPromptChunkCursor();
     KnownPromptChunkCursor(const KnownPromptChunkCursor&) = delete;
     KnownPromptChunkCursor& operator=(const KnownPromptChunkCursor&) = delete;
     // True iff one complete configured window or serial suffix row completed. False after prefill/cancel.
@@ -107,6 +114,8 @@ private:
     std::vector<KnownPromptWindowBackend*> tails_;
     SerialGreedyStepBackend& serial_;
     KnownPromptChunkProgress progress_;
+    bool deferred_ = false;
+    int balanced_ = -1;     // STRIX_QPF2K_SCHED bit 4: -1 undecided, 0/1 eligibility of this prompt // STRIX_QPF2K_SCHED bit 2: the last block of windows_ awaits its completion checks
     std::vector<float> logits_;
     std::optional<std::uint32_t> selection_;
     std::optional<SerialGreedyRequestResult> generation_;

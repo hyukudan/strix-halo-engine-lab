@@ -25,6 +25,8 @@ struct MtpNgramDraftConfig {
     std::uint32_t max_rows = 7;                    // extension rows at most
     double prior = 0.2, prior_weight = 4.0;        // per-request acceptance prior (pseudo-counts)
     double floor = 0.5;                            // first extension row must reach this acceptance
+    // Cross-request lookup (set_peers): the shortest suffix matched in another request's committed context.
+    std::uint32_t peer_min_suffix = 4;
 };
 
 struct MtpNgramDraftStats {
@@ -34,6 +36,7 @@ struct MtpNgramDraftStats {
     std::uint64_t extended_cycles = 0; // cycles whose candidates were extended
     std::uint64_t extension_rows = 0;  // extension rows proposed to the verifier
     std::uint64_t accepted_rows = 0;   // extension rows accepted by the target
+    std::uint64_t peer_cycles = 0, peer_extension_rows = 0, peer_accepted_rows = 0; // the subset from set_peers
 };
 
 class MtpNgramDraft {
@@ -52,6 +55,13 @@ public:
     void finish_cycle(std::span<const std::uint32_t> emitted);
     [[nodiscard]] const MtpNgramDraftStats& stats() const noexcept { return stats_; }
     [[nodiscard]] double acceptance(std::uint32_t suffix, bool supported, std::size_t row) const;
+    // Opt-in cross-request lookup (joint speculation of concurrent conversations): when this request's own context
+    // has no match, the longest suffix (max_suffix down to peer_min_suffix) of context + confident drafts is looked
+    // up in these drafters' committed contexts (most recent occurrence first, peers in order). Peer proposals have
+    // their own learned acceptance cells (prior as the others), so a request whose peers do not help never gets
+    // an extension from them. Pointers are borrowed: the caller refreshes them (empty = off) before each cycle.
+    void set_peers(std::vector<const MtpNgramDraft*> peers) { peers_ = std::move(peers); }
+    [[nodiscard]] double peer_acceptance(std::size_t row) const;
     // Longest-suffix lookup over the context followed by `extra` (exposed for tests).
     std::vector<std::uint32_t> lookup(std::span<const std::uint32_t> extra, std::size_t length,
         std::uint32_t& suffix, std::uint32_t& support) const;
@@ -69,10 +79,14 @@ private:
     std::unordered_map<Key, std::vector<std::uint32_t>, KeyHash> index_;
     std::vector<double> right_, tried_;  // online acceptance table
     bool started_ = false;
+    std::vector<const MtpNgramDraft*> peers_;
+    // Continuation of the longest suffix of (context_ + extra) found in a peer's committed context.
+    std::vector<std::uint32_t> peer_lookup(std::span<const std::uint32_t> extra, std::size_t length) const;
+    [[nodiscard]] std::size_t shadow_cell(std::size_t row) const noexcept;
     struct Shadow {
         bool valid = false;
         std::vector<std::uint32_t> prefix, tokens;  // confident drafts it continues, extension rows
-        std::uint32_t suffix = 0; bool supported = false; std::size_t used = 0;
+        std::uint32_t suffix = 0; bool supported = false; bool peer = false; std::size_t used = 0;
     } shadow_;
     MtpNgramDraftStats stats_;
 };

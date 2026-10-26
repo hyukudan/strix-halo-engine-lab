@@ -1,9 +1,12 @@
+#include "strix/moe_q4k_a8_contract.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
+#include "strix/hip_ggml_weight_formats.hpp"
 #include "strix/hip_mtp_shared_expert.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_shared_expert_launcher.hpp"
 #include "hip_q8_rows_gemv.hpp"
+#include "hip_dense_f16_tiled.hpp"
 #include "strix/hip_shared_serving_cohort.hpp"
 #include "strix/q8_projection_organization.hpp"
 #include "strix/shared_expert_rows_diagnostic_contract.hpp"
@@ -79,6 +82,9 @@ enum class WeightKind {
     q8_0,
     iq4_nl,
     iq4_xs,
+#define STRIX_GGML_KIND_ENUM(kind, type) kind,
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_ENUM) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_ENUM)
+#undef STRIX_GGML_KIND_ENUM
 };
 
 struct TensorPair {
@@ -144,6 +150,9 @@ WeightKind weight_kind(
     case 8: return WeightKind::q8_0;
     case 20: return WeightKind::iq4_nl;
     case 23: return WeightKind::iq4_xs;
+#define STRIX_GGML_KIND_MAP(kind, type) case type: return WeightKind::kind;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_MAP) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_MAP)
+#undef STRIX_GGML_KIND_MAP
     case 30: return WeightKind::bf16;
     default:
         throw std::invalid_argument(
@@ -354,6 +363,24 @@ __device__ float load_weight<WeightKind::iq4_xs>(
                iq4_codebook[code]);
 }
 
+#define STRIX_GGML_KIND_LOAD(kind, type)                                                          \
+    template <>                                                                                   \
+    __device__ float load_weight<WeightKind::kind>(                                               \
+        const void* weights, std::uint32_t row_width, std::uint32_t row, std::uint32_t feature) { \
+        return hip_ggml::element<type>(weights, row_width, row, feature);                        \
+    }
+STRIX_GGML_KINDS_K(STRIX_GGML_KIND_LOAD) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_LOAD)
+#undef STRIX_GGML_KIND_LOAD
+
+std::uint32_t ggml_type_of(WeightKind kind) {
+    switch (kind) {
+#define STRIX_GGML_KIND_TYPE(k, type) case WeightKind::k: return type;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_TYPE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_TYPE)
+#undef STRIX_GGML_KIND_TYPE
+    default: return 0;
+    }
+}
+
 std::uint64_t required_weight_bytes(
     WeightKind kind,
     std::uint32_t input,
@@ -400,6 +427,13 @@ std::uint64_t required_weight_bytes(
                 input / 256U) *
             output *
             sizeof(IQ4XSBlock);
+    default: {
+        const auto g = hip_ggml::geometry(ggml_type_of(kind));
+        if (g.elements == 0 || input % g.elements != 0) {
+            throw std::invalid_argument("weight width is not a multiple of its GGUF block");
+        }
+        return static_cast<std::uint64_t>(input / g.elements) * output * g.bytes;
+    }
     }
     throw std::logic_error(
         "unreachable shared-expert weight kind");
@@ -868,6 +902,9 @@ void launch_projection_by_kind(
     case WeightKind::q8_0: STRIX_LAUNCH_CASE(q8_0); break;
     case WeightKind::iq4_nl: STRIX_LAUNCH_CASE(iq4_nl); break;
     case WeightKind::iq4_xs: STRIX_LAUNCH_CASE(iq4_xs); break;
+#define STRIX_GGML_KIND_CASE(k, type) case WeightKind::k: STRIX_LAUNCH_CASE(k); break;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE)
+#undef STRIX_GGML_KIND_CASE
     }
 #undef STRIX_LAUNCH_CASE
     check_hip(
@@ -890,6 +927,9 @@ void launch_scalar_by_kind(
     case WeightKind::q8_0: STRIX_SCALAR_CASE(q8_0); break;
     case WeightKind::iq4_nl: STRIX_SCALAR_CASE(iq4_nl); break;
     case WeightKind::iq4_xs: STRIX_SCALAR_CASE(iq4_xs); break;
+#define STRIX_GGML_KIND_CASE(k, type) case WeightKind::k: STRIX_SCALAR_CASE(k); break;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE)
+#undef STRIX_GGML_KIND_CASE
     }
 #undef STRIX_SCALAR_CASE
     check_hip(
@@ -922,6 +962,9 @@ void launch_down_by_kind(
     case WeightKind::q8_0: STRIX_DOWN_CASE(q8_0); break;
     case WeightKind::iq4_nl: STRIX_DOWN_CASE(iq4_nl); break;
     case WeightKind::iq4_xs: STRIX_DOWN_CASE(iq4_xs); break;
+#define STRIX_GGML_KIND_CASE(k, type) case WeightKind::k: STRIX_DOWN_CASE(k); break;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE)
+#undef STRIX_GGML_KIND_CASE
     }
 #undef STRIX_DOWN_CASE
     check_hip(
@@ -961,9 +1004,9 @@ void launch_typed(
     const bool dense = config.dense_a8_projections;
     if constexpr (std::is_same_v<Storage, std::uint16_t>) {
         if (dense) {
-            if (tensors.gate.manifest->ggml_type != 8U || tensors.up.manifest->ggml_type != 8U ||
-                tensors.down.manifest->ggml_type != 8U)
-                throw std::invalid_argument("HIP shared-expert dense A8 requires Q8_0 gate, up and down");
+            if (!q8_rows::dense_a8_type(tensors.gate.manifest->ggml_type) || !q8_rows::dense_a8_type(tensors.up.manifest->ggml_type) ||
+                !q8_rows::dense_a8_type(tensors.down.manifest->ggml_type))
+                throw std::invalid_argument("HIP shared-expert dense A8 requires Q8_0 (or GSQ dense) gate, up and down");
             launch_shared_dense_a8_gate_up(tensors, hidden, workspace, config.hidden_size, config.intermediate_size,
                 hip_execution_stream());
         }
@@ -1374,13 +1417,13 @@ register_for_compiled_execution(
     }
 
     ExecutionBindingRequest shape;shape.logical_rows=compiled.logical_rows;shape.request_concurrency=compiled.request_concurrency;
-    if(config_.prefetch_q8 && std::none_of(compiled.bindings.bindings.begin(),compiled.bindings.bindings.end(),
+    if(config_.prefetch_q8 && !strix::moe_q4k_a8::q20_a8_enabled() && std::none_of(compiled.bindings.bindings.begin(),compiled.bindings.bindings.end(),
         [](const auto& binding){return binding.op==SerialOp::shared_expert && binding.kernel_id &&
             binding.kernel_id->ends_with(shared_expert_prefetch::kernel_suffix);}))
         throw std::invalid_argument("shared prefetch bundle has no eligible step");
     std::vector<std::string> registered;bool saw_prefetch=false;
     for(std::size_t i=0;i<compiled.execution.steps.size();++i){if(compiled.execution.steps[i].op!=SerialOp::shared_expert)continue;const auto& binding=compiled.bindings.bindings[i];if(binding.host_or_runtime_step || !binding.kernel_id || binding.kernel_id->empty())throw std::invalid_argument("HIP shared step has no kernel binding");const bool prefetch=binding.kernel_id->ends_with(shared_expert_prefetch::kernel_suffix);if(prefetch!=shared_expert_prefetch::selected(config_.prefetch_q8,config_.prefetch_eligible_layers,compiled.execution.steps[i].layer))throw std::invalid_argument("shared prefetch bundle layer/config mismatch");auto* selected=prefetch?&config_:&fallback_config_;if(*binding.kernel_id!=kernel_id(shape,*selected))throw std::invalid_argument("HIP shared bundle permits only its base/prefetch pair");if(std::find(registered.begin(),registered.end(),*binding.kernel_id)==registered.end()){registry.add_kernel_launcher(make_hip_shared_expert_launcher(*binding.kernel_id,selected));registered.push_back(*binding.kernel_id);}saw_prefetch|=prefetch;}
-    if(config_.prefetch_q8 && !saw_prefetch)throw std::invalid_argument("shared prefetch bundle has no eligible step");
+    if(config_.prefetch_q8 && !saw_prefetch && !strix::moe_q4k_a8::q20_a8_enabled())throw std::invalid_argument("shared prefetch bundle has no eligible step");
 }
 
 }  // namespace strix
@@ -1505,6 +1548,11 @@ template <unsigned Rows> struct SharedGateUpRowsSite {
 template <unsigned Rows> struct SharedDownRowsSite {
     using Input = float;
     static constexpr unsigned rows = Rows;
+#if defined(STRIX_EXPERIMENTAL_MALL_SHARED_DOWN_NT)
+    // The routed expert rows overlap this dense stream and have reuse across window rows.
+    // Select only this site's Q8_0 dense-A8 weight loads; arithmetic and inputs stay unchanged.
+    static constexpr bool mall_nontemporal = true;
+#endif
     static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)
     static constexpr bool tree_upper_src0 = true;  // add(lower, upper) reads upper as src0 (lane VOPD tree)
     const void* input[Rows];
@@ -1519,6 +1567,35 @@ template <unsigned Rows> struct SharedDownRowsSite {
         float gated;
         asm("v_mul_f32 %0, %1, %2" : "=v"(gated) : "v"(*gate[r]), "v"(value));
         store_activation(output[r] + out, gated);
+    }
+};
+// STRIX_QPF2K_DENSE=1 (q8_rows::tiled): gate+up / down of all rows of a prefill stripe in one launch each; the same
+// store arithmetic as SharedGateUpRowsSite / SharedDownRowsSite (row r of every view at view(0) + r * stride).
+struct SharedGateUpTiledSite {
+    using Input = std::uint16_t;
+    const unsigned char* input0;
+    std::uint64_t input_stride;
+    q8_rows::Segments segments;
+    std::uint32_t width, outputs;
+    unsigned char* output0;
+    std::uint64_t output_stride;
+    __device__ void store(std::uint32_t out, std::uint32_t r, float value) const {
+        reinterpret_cast<float*>(output0 + r * output_stride)[out] = value;
+    }
+};
+struct SharedDownTiledSite {
+    using Input = float;
+    const unsigned char* input0;  // the workspace rows: activation [intermediate] then the shared gate
+    std::uint64_t input_stride;
+    q8_rows::Segments segments;
+    std::uint32_t width, outputs;
+    unsigned char* output0;
+    std::uint64_t output_stride;
+    __device__ void store(std::uint32_t out, std::uint32_t r, float value) const {
+        const float gate = reinterpret_cast<const float*>(input0 + r * input_stride)[width];
+        float gated;
+        asm("v_mul_f32 %0, %1, %2" : "=v"(gated) : "v"(gate), "v"(value));
+        store_activation(reinterpret_cast<std::uint16_t*>(output0 + r * output_stride) + out, gated);
     }
 };
 // R8/M640: retain two outputs per wave, but only allocate the twenty real Q8
@@ -1548,6 +1625,8 @@ void launch_shared_dense_a8_gate_up(const SharedTensors& tensors, const std::uin
     SharedGateUpRowsSite<1U> site{};
     site.segments = q8_rows::segments({{reinterpret_cast<const void*>(tensors.gate.runtime->address), intermediate_size},
         {reinterpret_cast<const void*>(tensors.up.runtime->address), intermediate_size}});
+    site.segments.types[0] = q8_rows::segment_type(tensors.gate.manifest->ggml_type);
+    site.segments.types[1] = q8_rows::segment_type(tensors.up.manifest->ggml_type);
     site.input[0] = hidden;
     site.output[0] = workspace;  // gate then up, contiguous
     site.width = hidden_size; site.outputs = 2U * intermediate_size;
@@ -1558,6 +1637,7 @@ void launch_shared_dense_a8_down(const SharedTensors& tensors, const float* inte
     std::uint16_t* output, std::uint32_t hidden_size, std::uint32_t intermediate_size, hipStream_t stream) {
     SharedDownRowsSite<1U> site{};
     site.segments = q8_rows::segments({{reinterpret_cast<const void*>(tensors.down.runtime->address), hidden_size}});
+    site.segments.types[0] = q8_rows::segment_type(tensors.down.manifest->ggml_type);
     site.input[0] = intermediate;
     site.gate[0] = shared_gate;
     site.output[0] = output;
@@ -1783,7 +1863,8 @@ KnownSharedR2Views known_shared_r2_views(std::span<const ExecutionDispatchContex
         tensors[index] = identify_tensors(row, access, config);
         const auto validate_weight = [&](const TensorPair& tensor, std::uint32_t width,
                                          std::uint32_t outputs, std::uint32_t type) {
-            if (!tensor.manifest || !tensor.runtime || tensor.manifest->ggml_type != type ||
+            const bool gsq = type == 8U && config.dense_a8_projections && q8_rows::dense_a8_type(tensor.manifest->ggml_type);
+            if (!tensor.manifest || !tensor.runtime || (tensor.manifest->ggml_type != type && !gsq) ||
                 tensor.manifest->layer != row.layer || !tensor.runtime->allocation_generation ||
                 tensor.manifest->absolute_offset % 16U || tensor.runtime->address % 16U)
                 throw std::invalid_argument("known-window shared R2 tensor type/layer/owner differs");
@@ -1793,7 +1874,9 @@ KnownSharedR2Views known_shared_r2_views(std::span<const ExecutionDispatchContex
                                   !(dims.size() == 2U && dims[1] == outputs)))
                 throw std::invalid_argument("known-window shared R2 tensor dimensions differ");
             validate_tensor(tensor, width, outputs, "known-window shared R2");
-            const auto required = required_weight_bytes(weight_kind(type), width, outputs);
+            const auto required = gsq && tensor.manifest->ggml_type != 8U
+                ? std::uint64_t{gsq_a8::dense_row_bytes(tensor.manifest->ggml_type, width)} * outputs
+                : required_weight_bytes(weight_kind(type), width, outputs);
             if (tensor.manifest->byte_size != required)
                 throw std::invalid_argument("known-window shared R2 tensor byte extent differs");
             known_shared_range({tensor.runtime->address, tensor.runtime->bytes});
@@ -1846,10 +1929,11 @@ KnownSharedR2Views known_shared_r2_views(std::span<const ExecutionDispatchContex
     result.input = {input[0].address, layout.input_bytes};
     result.output = {output[0].address, layout.output_bytes};
     result.workspace = {workspace[0].address, layout.workspace_bytes};
-    result.weights = {{tensors[0].gate.runtime->address, layout.gate_up_weight_bytes},
-        {tensors[0].up.runtime->address, layout.gate_up_weight_bytes},
-        {tensors[0].down.runtime->address, layout.down_weight_bytes},
-        {tensors[0].shared_gate.runtime->address, layout.scalar_weight_bytes}};
+    result.weights = {{tensors[0].gate.runtime->address, tensors[0].gate.manifest->byte_size},
+        {tensors[0].up.runtime->address, tensors[0].up.manifest->byte_size},
+        {tensors[0].down.runtime->address, tensors[0].down.manifest->byte_size},
+        {tensors[0].shared_gate.runtime->address, layout.scalar_weight_bytes},
+        tensors[0].gate.manifest->ggml_type, tensors[0].up.manifest->ggml_type, tensors[0].down.manifest->ggml_type};
     (void)shared_expert_rows_diagnostic::validate(result.shape, result.input, result.weights,
         result.workspace, result.output, shared_expert_rows_diagnostic::Arm::shared_q8_rows);
     return result;
@@ -1864,6 +1948,7 @@ void known_shared_engine_projection(bool down, const KnownSharedR2Views& views, 
     if (down) {
         SharedDownRowsSite<Rows> site{};
         site.segments = q8_rows::segments({{reinterpret_cast<const void*>(views.weights.down_q8.address), s.hidden}});
+        site.segments.types[0] = q8_rows::segment_type(views.weights.down_type);
         site.width = s.intermediate; site.outputs = s.hidden;
         for (unsigned r = 0; r < Rows; ++r) {
             const auto workspace = row(views.workspace, s.workspace_stride_bytes, r);
@@ -1877,6 +1962,8 @@ void known_shared_engine_projection(bool down, const KnownSharedR2Views& views, 
         SharedGateUpRowsSite<Rows> site{};
         site.segments = q8_rows::segments({{reinterpret_cast<const void*>(views.weights.gate_q8.address), s.intermediate},
             {reinterpret_cast<const void*>(views.weights.up_q8.address), s.intermediate}});
+        site.segments.types[0] = q8_rows::segment_type(views.weights.gate_type);
+        site.segments.types[1] = q8_rows::segment_type(views.weights.up_type);
         site.width = s.hidden; site.outputs = 2U * s.intermediate;
         for (unsigned r = 0; r < Rows; ++r) {
             site.input[r] = reinterpret_cast<const void*>(row(views.input, s.input_stride_bytes, r));
@@ -2064,7 +2151,7 @@ KnownSharedR2Views known_shared_prefill_views(std::span<const ExecutionDispatchC
     return views;
 }
 void known_shared_prefill_enqueue(std::span<const ExecutionDispatchContext> rows, const KnownSharedR2Views& views,
-    hipStream_t stream, const HipSharedExpertLauncherConfig& config) {
+    hipStream_t stream, const HipSharedExpertLauncherConfig& config, bool first_barrier = false) {
     const auto& s = views.shape;
     const auto at = [&](std::uint64_t r) {
         auto v = views;
@@ -2079,15 +2166,46 @@ void known_shared_prefill_enqueue(std::span<const ExecutionDispatchContext> rows
         return n == 64 || n == 128 ? static_cast<std::uint32_t>(n) : 256U;
     }();
     const std::uint32_t dense_wide = config.dense_a8_projections ? dense_env : 0U;
+    // STRIX_QPF2K_DENSE=1: the rows of the >= 32-row stripes (launch_dense_f16 when dense_f16_prefill and not g64) in one
+    // q8_rows::tiled launch per projection, same bits; the 16/8-row remainder keeps its launches.
+    const std::uint64_t tiled_rows = config.dense_f16_prefill && !config.dense_g64_prefill && rows.size() / 32U * 32U >= q8_rows::tiled::min_rows()
+        ? rows.size() / 32U * 32U : 0U;
+    const auto tiled = [&](bool down) -> std::uint64_t {
+        if (!tiled_rows || !q8_rows::tiled::site_enabled(down ? 32U : 16U) || tiled_rows < q8_rows::tiled::min_rows(down ? 32U : 16U)) return 0U;
+        const auto n = static_cast<std::uint32_t>(tiled_rows);
+        if (down) {
+            SharedDownTiledSite site{};
+            site.segments = q8_rows::segments({{reinterpret_cast<const void*>(views.weights.down_q8.address), s.hidden}});
+            site.width = s.intermediate; site.outputs = s.hidden;
+            site.input0 = reinterpret_cast<const unsigned char*>(views.workspace.address); site.input_stride = s.workspace_stride_bytes;
+            site.output0 = reinterpret_cast<unsigned char*>(views.output.address); site.output_stride = s.output_stride_bytes;
+            if (!q8_rows::tiled::supported(site, n)) return 0U;
+            q8_rows::tiled::launch(site, n, stream);
+        } else {
+            SharedGateUpTiledSite site{};
+            site.segments = q8_rows::segments({{reinterpret_cast<const void*>(views.weights.gate_q8.address), s.intermediate},
+                {reinterpret_cast<const void*>(views.weights.up_q8.address), s.intermediate}});
+            site.width = s.hidden; site.outputs = 2U * s.intermediate;
+            site.input0 = reinterpret_cast<const unsigned char*>(views.input.address); site.input_stride = s.input_stride_bytes;
+            site.output0 = reinterpret_cast<unsigned char*>(views.workspace.address); site.output_stride = s.workspace_stride_bytes;
+            if (!q8_rows::tiled::supported(site, n)) return 0U;
+            // Any-order convert as launch_dense_f16's (it reads only the MoE input, independent of the router's top-k).
+            q8_rows::tiled::launch(site, n, stream, strix_any_order_enabled());
+        }
+        check_hip(hipGetLastError(), "known shared prefill tiled projection launch");
+        return tiled_rows;
+    };
     const auto each_width = [&](bool down) {
-        for (std::uint64_t r = 0; r < rows.size();) {
+        for (std::uint64_t r = tiled(down); r < rows.size();) {
             const auto left = rows.size() - r;
-            if (dense_wide >= 256U && left >= 256U) { known_shared_engine_projection<256U>(down, at(r), stream, config); r += 256U; }
-            else if (dense_wide >= 128U && left >= 128U) { known_shared_engine_projection<128U>(down, at(r), stream, config); r += 128U; }
-            else if (left >= 64U) { known_shared_engine_projection<64U>(down, at(r), stream, config); r += 64U; }
-            else if (left >= 32U) { known_shared_engine_projection<32U>(down, at(r), stream, config); r += 32U; }
-            else if (left >= 16U) { known_shared_engine_projection<16U>(down, at(r), stream, config); r += 16U; }
-            else { known_shared_engine_projection<8U>(down, at(r), stream, config); r += 8U; }
+            // Detached: the first launch follows a cross-stream wait and keeps its barrier (the rest as before).
+            const bool any = !(first_barrier && !down && r == 0U);
+            if (dense_wide >= 256U && left >= 256U) { known_shared_engine_projection<256U>(down, at(r), stream, config, any); r += 256U; }
+            else if (dense_wide >= 128U && left >= 128U) { known_shared_engine_projection<128U>(down, at(r), stream, config, any); r += 128U; }
+            else if (left >= 64U) { known_shared_engine_projection<64U>(down, at(r), stream, config, any); r += 64U; }
+            else if (left >= 32U) { known_shared_engine_projection<32U>(down, at(r), stream, config, any); r += 32U; }
+            else if (left >= 16U) { known_shared_engine_projection<16U>(down, at(r), stream, config, any); r += 16U; }
+            else { known_shared_engine_projection<8U>(down, at(r), stream, config, any); r += 8U; }
         }
     };
     each_width(false);
@@ -2112,6 +2230,29 @@ void shared_expert_known_prefill_rows_launch(std::span<const ExecutionDispatchCo
     const auto stream = known_shared_rows_stream();
     check_hip(hipPeekAtLastError(), "known shared prefill stale launch error");
     known_shared_prefill_enqueue(rows, views, stream, config);
+}
+
+void shared_expert_known_prefill_rows_launch_detached(std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config, void* raw_stream, std::uintptr_t workspace, std::uint64_t workspace_bytes) {
+    auto views = known_shared_prefill_views(rows, config);
+    const auto stream = static_cast<hipStream_t>(raw_stream);
+    // Same admission as the launch on the owner's stream (explicit eager stream, no capture), then the own workspace.
+    static_cast<void>(known_shared_rows_stream());
+    // Compact rows: one row's workspace view rounded up to 256 bytes (the arena's row stride spans the whole row view).
+    const auto row_bytes = resolve_dispatch_temporary(rows[0], 0).bytes;
+    const auto stride = (row_bytes + 255U) / 256U * 256U;
+    if (!stream || !workspace || workspace % 256U || !row_bytes || row_bytes > views.shape.workspace_stride_bytes ||
+        stride > UINT64_MAX / rows.size() || workspace_bytes < stride * rows.size() || workspace_bytes > UINTPTR_MAX - workspace)
+        throw std::invalid_argument("detached known shared prefill workspace is invalid");
+    for (const auto& r : rows) {
+        const auto input = resolve_dispatch_read(r, 0), output = resolve_dispatch_write(r, 0);
+        for (const auto& owned : {input, output})
+            if (owned.address < workspace + workspace_bytes && workspace < owned.address + owned.bytes)
+                throw std::invalid_argument("detached known shared prefill workspace aliases row storage");
+    }
+    views.workspace.address = workspace; views.shape.workspace_stride_bytes = stride;
+    check_hip(hipPeekAtLastError(), "detached known shared prefill stale launch error");
+    known_shared_prefill_enqueue(rows, views, stream, config, true);
 }
 
 void shared_expert_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
@@ -2198,6 +2339,8 @@ void known_shared_cohort_enqueue(std::span<const KnownSharedR2Views> segments, s
         SharedGateUpRowsSite<Rows> site{};
         site.segments = q8_rows::segments({{reinterpret_cast<const void*>(weights.gate_q8.address), s.intermediate},
             {reinterpret_cast<const void*>(weights.up_q8.address), s.intermediate}});
+        site.segments.types[0] = q8_rows::segment_type(weights.gate_type);
+        site.segments.types[1] = q8_rows::segment_type(weights.up_type);
         site.width = s.hidden; site.outputs = 2U * s.intermediate;
         unsigned row = 0;
         for (std::size_t k = 0; k < segments.size(); ++k)
@@ -2224,6 +2367,7 @@ void known_shared_cohort_enqueue(std::span<const KnownSharedR2Views> segments, s
     {
         SharedDownRowsSite<Rows> site{};
         site.segments = q8_rows::segments({{reinterpret_cast<const void*>(weights.down_q8.address), s.hidden}});
+        site.segments.types[0] = q8_rows::segment_type(weights.down_type);
         site.width = s.intermediate; site.outputs = s.hidden;
         unsigned row = 0;
         for (std::size_t k = 0; k < segments.size(); ++k)

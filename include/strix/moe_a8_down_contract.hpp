@@ -13,6 +13,16 @@ inline constexpr std::string_view q80_a8_down_numerical_identity =
     "q80-a8g32-down-v1:s8xs8-i32:delta*(d*S):separate-f32:"
     "silu-div-expf-times-up:g32-sym127-f32delta-rne:tiny-lt2^-119-zero1:"
     "blocks-mod4-ascending:tree-xor1-xor2:raw-slot-major:finite-failclosed";
+inline constexpr std::string_view q20_a8_down_numerical_identity =
+    "q20-a8g32-down-v1:s8xu2-i32:delta*(d*(I-S)):separate-f32:"
+    "silu-div-expf-times-up:g32-sym127-f32delta-rne:tiny-lt2^-119-zero1:"
+    "blocks-mod4-ascending:tree-xor1-xor2:raw-slot-major:finite-failclosed";
+inline constexpr std::string_view iq4nl_a8_down_numerical_identity =
+    "iq4nl-a8g32-down-v1:s8xs8-i32:delta*(d*I):separate-f32:"
+    "silu-div-expf-times-up:g32-sym127-f32delta-rne:tiny-lt2^-119-zero1:"
+    "blocks-mod4-ascending:tree-xor1-xor2:raw-slot-major:finite-failclosed";
+// Bytes of one down row of `intermediate` inputs for weight type 7 (Q5_1), 8 (Q8_0) or 42 (Q2_0).
+[[nodiscard]] std::uint64_t down_row_bytes(std::uint32_t weight_type, std::uint32_t intermediate);
 struct DownShape { std::uint32_t hidden=0, intermediate=0, experts=0, top_k=0; };
 struct DownRequest {
     bool enabled=false;

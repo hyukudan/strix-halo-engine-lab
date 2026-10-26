@@ -16,7 +16,13 @@ namespace strix {
 
 class HipSetupQuiescenceGuard;
 // Experts omit source registration except shared boundary pages; require gap zero.
-enum class HipModelCopyTier : std::uint8_t { none, normalization, hot_nonexpert, experts };
+// all: every promoted local tensor is copied into one page-congruent HIP arena and nothing of the model is
+// registered (no KFD userptr range, so page-cache reclaim/compaction of the GGUF never evicts the process's queues);
+// selected only through STRIX_MODEL_COPY_ALL (opt-in, not a CLI tier). Same bytes at the same page offsets.
+enum class HipModelCopyTier : std::uint8_t { none, normalization, hot_nonexpert, experts, all };
+// STRIX_MODEL_COPY_ALL=1|fine|uc (opt-in, default off): 1 = hipMalloc arena, fine = fine-grained device memory,
+// uc = uncached device memory (the MTYPE the fine-grained registered mapping streams with). 0 when unset.
+[[nodiscard]] unsigned hip_model_copy_all_mode() noexcept;
 [[nodiscard]] std::string_view hip_model_copy_tier_name(HipModelCopyTier);
 
 enum class HipModelResidencyMode {
@@ -75,6 +81,8 @@ struct SelectiveCopyPlan {
     std::uint64_t payload_bytes = 0, arena_bytes = 0;
 };
 [[nodiscard]] bool selective_copy_eligible(const ManifestTensor&, HipModelCopyTier) noexcept;
+// Sum of the selected tensors' payload bytes (the pin build_selective_copy_plan requires).
+[[nodiscard]] std::uint64_t selective_copy_payload_bytes(const ModelManifest&, HipModelCopyTier) noexcept;
 // Pure pre-allocation layout; padding copies actual source bytes only.
 [[nodiscard]] SelectiveCopyPlan build_selective_copy_plan(const ModelManifest&,
     const HipModelResidencyPolicy&, std::uint64_t file_bytes, std::uint64_t page);

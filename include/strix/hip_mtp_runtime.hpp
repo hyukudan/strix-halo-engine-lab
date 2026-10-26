@@ -1,4 +1,6 @@
 #pragma once
+#include <string>
+#include <optional>
 #include "strix/hip_mtp_draft_head.hpp"
 #include "strix/hip_mtp_resources.hpp"
 #include "strix/hip_mtp_target_hidden.hpp"
@@ -41,6 +43,9 @@ struct HipMtpExecutionStats {
 // Qualified adapter calls remain subject to their existing qualification gates.
 // Output views are reused on the next input. One serialized caller retains all
 // real target tickets and resources until native work has completed.
+// STRIX_MTP_DRAFT_BATCH_VERIFY coverage counters (members, steps, partial four-slot groups, selection rows,
+// shrinking steps, divergent-depth cycles, min-p below/equal/above).
+[[nodiscard]] std::string draft_batch_verify_coverage();
 class HipMtpRuntime final : public MtpForwardExecutionBackend,
     public MtpRuntimeCycleInputProvider,public MtpRuntimeTokenReader {
 public:
@@ -72,6 +77,13 @@ public:
     // ticket chain exists for these rows: the next cycle starts without a primed predecessor ticket.
     void prime_hidden_rows(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,
         std::span<const MtpDeviceView> hidden,std::span<const std::uint32_t> next_tokens);
+    // The same rows in two phases (prime_hidden_rows = submit + complete): submit enqueues every row on the
+    // MTP stream and returns without waiting (false: no rows, nothing pending); until complete, the caller keeps
+    // the hidden rows alive and unchanged and calls no other runtime operation (each requires an idle owner).
+    [[nodiscard]] bool prime_hidden_rows_submit(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,
+        std::span<const MtpDeviceView> hidden,std::span<const std::uint32_t> next_tokens);
+    void prime_hidden_rows_complete();
+    [[nodiscard]] bool prime_hidden_rows_pending() const noexcept;
     // Prefix state cache: the caller wrote durable cache rows [0, source) back into this fresh idle
     // runtime's KV/raw-index backing; republish `source` as its frontier.
     void restore_cache_frontier(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,std::uint64_t source);
@@ -106,6 +118,36 @@ public:
     [[nodiscard]] bool propose_chain_launch_step();
     [[nodiscard]] bool propose_chain_after_step();
     [[nodiscard]] std::vector<std::uint32_t> propose_chain_finish();
+    // Multi-session draft batch (STRIX_MTP_DRAFT_BATCH=1, apps cohort/joint cycles): open chains of several
+    // sessions run step k as ONE multi-token forward on a batch stream, each row with its own position, caches,
+    // wide state, workspaces, status words and draft head reply; every row's results equal its own
+    // propose_chain_launch_step bit for bit. Protocol per cycle, after every member's propose_chain_begin:
+    //   draft_batch_compatible(members) (all open on the fast greedy chain, one model/weights, production
+    //   kernel branches; returns the shared draft-head prefix rows, or nullopt) -> draft_batch_enter(members,
+    //   stream) (the batch stream waits for each owner's earlier work) -> while rows left: draft_batch_launch(
+    //   rows with a step left, stream, shared) and each row's propose_chain_after_step (its waits poll the batch
+    //   stream) -> draft_batch_leave() on each row once its chain stopped (its owner stream waits for the batch
+    //   stream; propose_chain_finish and failure leave implicitly). A failed batch launch fails every member.
+    [[nodiscard]] bool draft_batch_open() const noexcept;
+    [[nodiscard]] static std::optional<std::uint32_t> draft_batch_compatible(std::span<HipMtpRuntime* const> members);
+    static void draft_batch_enter(std::span<HipMtpRuntime* const> members,void* stream);
+    static void draft_batch_launch(std::span<HipMtpRuntime* const> rows,void* stream,std::uint32_t shared_head_rows);
+    void draft_batch_leave();
+    // Exactness check of the batch (STRIX_MTP_DRAFT_BATCH_VERIFY=1, diagnostic): before draft_batch_enter, each
+    // member runs its chain alone on its owner stream; the drafts, probabilities, every per-step buffer, the
+    // proposal KV/raw-index rows and the head logits are recorded, the step buffers are poisoned and the chain
+    // rewinds to its begin state (wide input re-copied from the cycle ticket, head reply cleared). After the batch
+    // steps (before propose_chain_finish), draft_batch_verify_check compares everything bytewise and returns the
+    // number of differing members (details on stderr).
+    // Diagnostic (STRIX_MTP_DRAFT_BATCH_VERIFY_STAGGER=1): caps a freshly begun chain's requested depth, so that the
+    // verified members of a cycle request different depths (fewer drafts; the target still verifies every token).
+    void draft_batch_verify_cap(std::uint32_t requested);
+    static void draft_batch_verify_reference(std::span<HipMtpRuntime* const> members);
+    // Inside draft_batch_launch (verify only): each row's state after batched stage `stage` (0..11) against its own
+    // chain's same step and stage. After each batched step: members that stopped must keep their final state.
+    static void draft_batch_verify_stage(std::span<HipMtpRuntime* const> rows,void* stream,unsigned stage);
+    static void draft_batch_verify_step(std::span<HipMtpRuntime* const> members,std::span<HipMtpRuntime* const> rows,void* stream);
+    [[nodiscard]] static std::uint32_t draft_batch_verify_check(std::span<HipMtpRuntime* const> members,void* stream);
     [[nodiscard]] std::span<const float> draft_probabilities() const noexcept;
     // Sampled drafts (temperature > 0), set once on an enabled draft chain before cycles:
     // every draft step completes, its token is drawn from the draft distribution and

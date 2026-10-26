@@ -9,6 +9,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <cstdlib>
 #include <vector>
 using namespace strix::moe_q4k_a8;
 namespace {
@@ -44,11 +45,17 @@ void finite_case(unsigned type,unsigned hidden,unsigned width,unsigned slots,
     const strix::HipSetupQuiescenceGuard& guard,hipStream_t stream) {
     constexpr unsigned experts=3;
     const auto block_bytes=type==7?24U:34U;
-    const std::size_t weight_size=static_cast<std::size_t>(experts)*hidden*(width/32U)*block_bytes;
+    const auto row_bytes=static_cast<std::size_t>(down_row_bytes(type,width));
+    const std::size_t weight_size=static_cast<std::size_t>(experts)*hidden*row_bytes;
     std::vector<std::byte> weights(weight_size);
     // Distinct expert/row/block headers and code bytes, including all qh bits,
     // both Q5 nibbles, Q8 -128 and misaligned34-byte block starts.
-    for(unsigned e=0;e<experts;++e) for(unsigned row=0;row<hidden;++row) for(unsigned g=0;g<width/32U;++g) {
+    if(type==42 || type==20) for(unsigned e=0;e<experts;++e) for(unsigned row=0;row<hidden;++row) for(unsigned b=0;b<width/(type==42?64U:32U);++b) {
+        const auto at=(static_cast<std::size_t>(e)*hidden+row)*row_bytes+b*18U;
+        put16(weights,at,(row+b)%3U==0?0x3000U:0xb000U);
+        for(unsigned j=2;j<18;++j) weights[at+j]=std::byte((row*29U+e*43U+b*19U+j*71U)&255U);
+    }
+    else for(unsigned e=0;e<experts;++e) for(unsigned row=0;row<hidden;++row) for(unsigned g=0;g<width/32U;++g) {
         const auto at=(static_cast<std::size_t>(e)*hidden+row)*(width/32U)*block_bytes+g*block_bytes;
         put16(weights,at,(row+g)%3U==0?0x3000U:0xb000U);
         if(type==7) {
@@ -95,8 +102,8 @@ void finite_case(unsigned type,unsigned hidden,unsigned width,unsigned slots,
         }
         expect(std::equal(q.codes.begin(),q.codes.end(),actual_codes.begin()+slot*width),"full codes independent CPU quantizer");
         for(unsigned row=0;row<hidden;++row) {
-            const auto at=(static_cast<std::size_t>(routes[slot])*hidden+row)*(width/32U)*block_bytes;
-            const auto weight_row=std::span<const std::byte>(weights).subspan(at,(width/32U)*block_bytes);
+            const auto at=(static_cast<std::size_t>(routes[slot])*hidden+row)*row_bytes;
+            const auto weight_row=std::span<const std::byte>(weights).subspan(at,row_bytes);
             const auto expected=evaluate_down_row(weight_row,q,type);
             expect(std::bit_cast<unsigned>(expected)==std::bit_cast<unsigned>(actual_raw[slot*hidden+row]),"full ordered rawdot FP32 bits vs original-byte CPU oracle");
             if(type==7) {auto mutant=std::vector<std::byte>(weight_row.begin(),weight_row.end());
@@ -140,7 +147,9 @@ void finite_case(unsigned type,unsigned hidden,unsigned width,unsigned slots,
 int main() try {
     strix::HipSetupQuiescenceGuard guard;expect(guard.architecture().starts_with("gfx1151"),"actual gfx1151 required");
     require_f32_environment();Stream stream(guard);
-    for(unsigned type:{7U,8U}) for(unsigned width:{128U,640U}) for(unsigned slots:{1U,10U})
+    // GSQ-RCO Q2_0 down (type 42) is opt-in: the fixture enables it for the whole process.
+    setenv("STRIX_GSQ_Q20_A8","1",1);
+    for(unsigned type:{7U,8U,42U,20U}) for(unsigned width:{128U,640U}) for(unsigned slots:{1U,10U})
         finite_case(type,width==128U?64U:2560U,width,slots,guard,stream.value);
     std::cout<<"A8 down component fixtures PASS; no model quality/performance qualification\n";
 } catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

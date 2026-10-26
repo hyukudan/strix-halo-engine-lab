@@ -73,6 +73,10 @@ public:
         std::uint64_t byte_offset,
         std::span<std::byte> destination) const;
 
+    // Drops the unmapped clean page-cache pages of [byte_offset, byte_offset + bytes) (POSIX_FADV_DONTNEED).
+    // Advisory, no error: used before a large copy arena is allocated (STRIX_MODEL_COPY_ALL).
+    void advise_dontneed(std::uint64_t byte_offset, std::uint64_t bytes) const noexcept;
+
 private:
     void release() noexcept;
 

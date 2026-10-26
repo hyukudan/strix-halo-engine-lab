@@ -132,6 +132,14 @@ void warm_file_backed_tensors(const strix::MappedModelFile& mapped, const strix:
         const auto end = mapped.base_address() + tensor.absolute_offset + tensor.byte_size;
         auto* address = reinterpret_cast<void*>(begin);
         const auto length = static_cast<std::size_t>(end - begin);
+        // STRIX_MODEL_COPY_ALL: the arena allocation can push the table out of the page cache; populate it with
+        // readahead (sequential) before marking it random-access, instead of one 4 KiB read per fault.
+        if (strix::hip_model_copy_all_mode()) {
+            (void)madvise(address, length, MADV_SEQUENTIAL);
+#if defined(MADV_POPULATE_READ)
+            (void)madvise(address, length, MADV_POPULATE_READ);
+#endif
+        }
         (void)madvise(address, length, MADV_RANDOM);
 #if defined(MADV_POPULATE_READ)
         if (madvise(address, length, MADV_POPULATE_READ) != 0)
@@ -977,6 +985,12 @@ void write_logit_hashes(std::span<const std::string> hashes) {
     std::cout << ']';
 }
 
+// The prefix cache's segment / checkpoint unit: --prefix-cache-block-rows, else T.
+template <class O>
+std::uint32_t prefix_cache_unit(const O& options) {
+    return static_cast<std::uint32_t>(options.prefix_cache_block_rows ? options.prefix_cache_block_rows : options.known_prefix_prefill_rows);
+}
+
 }  // namespace
 
 #ifndef STRIX_DECODE_ENTRY
@@ -1282,7 +1296,9 @@ int STRIX_DECODE_ENTRY(
     const auto q4k_a8_layers = options.q4k_a8g32_gate_up ?
         strix::moe_q4k_a8::classify_runtime_manifest(model,manifest) :
         strix::moe_q4k_a8::RuntimeLayerClassification{};
-    if(options.grouped_exact_q51_down && q4k_a8_layers.q4k_with_q51_down_layers.empty())
+    // A GSQ-RCO manifest (STRIX_GSQ_Q20_A8=1) has no Q5_1 down layer: every routed layer runs the GSQ A8 down.
+    if(options.grouped_exact_q51_down && q4k_a8_layers.q4k_with_q51_down_layers.empty() &&
+        !strix::moe_q4k_a8::q20_manifest(q4k_a8_layers))
         throw std::invalid_argument("--grouped-exact-q51-down requires a Q4_K gate/up layer with Q5_1 down");
     if (options.q51_slot_parallel_down)
         strix::moe_q4k_a8::validate_slot_parallel_manifest(model, q4k_a8_layers);
@@ -1383,6 +1399,16 @@ int STRIX_DECODE_ENTRY(
         if (options.prefill_numerical_profile && *options.prefill_numerical_profile == strix::DecodeNumericalProfile::fast_prefill_f16wmma_v1)
             std::cout << "  \"prefill_moe_f16wmma_rows\":"
                 << (q4k_a8_stats ? q4k_a8_stats->prefill_f16wmma_submissions.load(std::memory_order_relaxed) : 0) << ",\n";
+        // GSQ-RCO routed experts (STRIX_GSQ_Q20_A8=1): prompt rows x layers per prefill kernel form (only when any ran).
+        if (q4k_a8_stats) {
+            const auto gf = q4k_a8_stats->prefill_gsq_f16wmma_submissions.load(std::memory_order_relaxed);
+            const auto gi = q4k_a8_stats->prefill_gsq_iu8_submissions.load(std::memory_order_relaxed);
+            const auto gd = q4k_a8_stats->prefill_gsq_dot4_submissions.load(std::memory_order_relaxed);
+            const auto gb = q4k_a8_stats->prefill_gsq_f16wmma_batch128_submissions.load(std::memory_order_relaxed);
+            if (gf || gi || gd)
+                std::cout << "  \"prefill_moe_gsq_rows\": {\"f16wmma\": " << gf << ", \"f16wmma_batch128\": " << gb
+                          << ", \"iu8wmma\": " << gi << ", \"dot4\": " << gd << "},\n";
+        }
         if (options.numerical_profile != strix::DecodeNumericalProfile::exact_v5)
             std::cout
                  << "  \"hc_splitk_f32_submissions\":"
@@ -1433,7 +1459,9 @@ int STRIX_DECODE_ENTRY(
                 (tensor.name.ends_with(".attn_qkv.weight") || tensor.name.ends_with(".attn_gate.weight")))
                 meaningful_q8 = true;
         }
-        if (!meaningful_q8 || model.hidden_size % 32U != 0U)
+        // GSQ-RCO (STRIX_GSQ_Q20_A8=1): GDN inputs may all be typed (dense A8 segments); the virtual Q8 view then
+        // covers only the Q8_0 ones.
+        if ((!meaningful_q8 && !strix::moe_q4k_a8::q20_a8_enabled()) || model.hidden_size % 32U != 0U)
             throw std::invalid_argument("--virtual-q8-gdn-input requires an aligned Q8_0 GDN input projection");
     }
     if(options.virtual_q8_gdn_output) strix::validate_virtual_q8_gdn_output_manifest(model,manifest);
@@ -1662,7 +1690,20 @@ int STRIX_DECODE_ENTRY(
         auto prefill_binding_request = binding_request;
         auto prefill_buffer_request = buffer_request;
         prefill_binding_request.dense_a8 = prefill_buffer_request.dense_a8 = prefill_dense_a8;
-        if (fast) prefill_binding_request.prefill_arithmetic_identity = strix::numerical_profile_pair_identity(profile_pair);
+        std::string gsq_moe_receipt;
+        if (fast) {
+            auto identity = strix::numerical_profile_pair_identity(profile_pair);
+            // GSQ-RCO routed experts (STRIX_GSQ_Q20_A8=1) under the fast moe component: the effective GSQ expert prefill
+            // arithmetic (STRIX_GSQ_PREFILL_F16) is part of the prefill arithmetic identity, so the prefill execution
+            // identity and everything keyed by it (prefix-cache checkpoints) tell the two apart. Non-GSQ files: unchanged.
+            if (!q4k_a8_layers.q20_layers.empty() && (profile_pair.fast_components & strix::kFastPrefillMoe) != 0U) {
+                for (const std::uint64_t word : {std::uint64_t{0x4753514d4f455046ULL} /* GSQMOEPF */,
+                         strix::moe_q4k_a8::gsq_fast_prefill_moe_identity()})
+                    for (unsigned i = 0; i < 8; ++i) { identity ^= (word >> (8U * i)) & 0xffU; identity *= 0x100000001b3ULL; }
+                gsq_moe_receipt = "  \"prefill_gsq_moe_arithmetic\": \"" + std::string(strix::moe_q4k_a8::gsq_fast_prefill_moe_name()) + "\",\n";
+            }
+            prefill_binding_request.prefill_arithmetic_identity = identity;
+        }
         prefill_catalog_config.numerical_profile = profile_pair.prefill;
         prefill_catalog_config.dense_a8 = prefill_dense_a8;
         prefill_catalog_config.fast_prefill_components = profile_pair.fast_components;
@@ -1672,6 +1713,7 @@ int STRIX_DECODE_ENTRY(
         compiled_prefill = strix::compile_serial_execution(model, prefill_kernel_registry,
             prefill_binding_request, prefill_buffer_request, 256);
         strix::validate_sibling_serial_executions(*compiled_prefill, compiled);
+        optimization_profile_receipt += gsq_moe_receipt;
         optimization_profile_receipt +=
             "  \"prefill_dense_a8_configured\": " + std::string(prefill_dense_a8 ? "true" : "false") + ",\n" +
             "  \"prefill_fast_components\": " + std::to_string(profile_pair.fast_components) + ",\n" +
@@ -1858,7 +1900,32 @@ int STRIX_DECODE_ENTRY(
     residency_policy.copy_payload_bytes = options.model_copy_payload_bytes;
     residency_policy.reservation_limits.retained_bytes = options.model_retained_budget;
     residency_policy.reservation_limits.setup_peak_bytes = options.model_setup_peak_budget;
+    // STRIX_MODEL_COPY_ALL (opt-in): the registered model becomes one page-congruent copied arena, without any
+    // userptr registration (see hip_model_residency.hpp). Only replaces the default registered backing.
+    if (strix::hip_model_copy_all_mode() && options.residency == strix::HipModelResidencyMode::registered_file_mapping &&
+        options.model_copy_tier == strix::HipModelCopyTier::none && !graph_mode) {
+        residency_policy.copy_tier = strix::HipModelCopyTier::all;
+        residency_policy.coalesce_gap_bytes = 0; // nothing is registered: the registration gap has no ranges to merge
+        residency_policy.copy_payload_bytes = strix::selective_copy_payload_bytes(manifest, strix::HipModelCopyTier::all);
+        residency_policy.reservation_limits.retained_bytes = std::numeric_limits<std::uint64_t>::max();
+        residency_policy.reservation_limits.setup_peak_bytes = std::numeric_limits<std::uint64_t>::max();
+        std::cerr << "model residency: STRIX_MODEL_COPY_ALL copies " << *residency_policy.copy_payload_bytes
+                  << " payload bytes into one arena (no registration)\n";
+    }
 
+    // STRIX_LOAD_BALLOON_BYTES=N (opt-in, default 0): reserve N bytes of device memory BEFORE the model is registered
+    // and release them after registration and the PLE warm. The page-cache reclaim that the later engine reservations
+    // (KV/state, workspaces, arenas, MTP sidecar) would cause then happens while nothing is registered, and those
+    // reservations find the released memory free, so the load reclaim never invalidates registered model pages
+    // (an invalidated userptr range evicts every queue of the process until it is revalidated).
+    void* load_balloon = nullptr;
+    if (const char* v = std::getenv("STRIX_LOAD_BALLOON_BYTES"); v && std::strtoull(v, nullptr, 10) &&
+        options.residency == strix::HipModelResidencyMode::registered_file_mapping) {
+        const auto bytes = static_cast<std::size_t>(std::strtoull(v, nullptr, 10));
+        if (hipMalloc(&load_balloon, bytes) != hipSuccess) { load_balloon = nullptr; (void)hipGetLastError(); }
+        else if (hipMemset(load_balloon, 0, bytes) != hipSuccess || hipDeviceSynchronize() != hipSuccess) (void)hipGetLastError();
+        std::cerr << "load balloon: " << (load_balloon ? "reserved " : "could not reserve ") << bytes << " bytes before registration\n";
+    }
     auto model_owner = std::make_shared<strix::HipModelResidency>(
         strix::HipModelResidency::create(mapped_owner, manifest, generations, residency_policy));
     auto& model_residency = *model_owner;
@@ -1894,6 +1961,7 @@ int STRIX_DECODE_ENTRY(
     };
     // After registration: pinning the model may evict anything populated before it.
     warm_file_backed_tensors(mapped, manifest);
+    if (load_balloon) { (void)hipFree(load_balloon); load_balloon = nullptr; std::cerr << "load balloon: released\n"; }
     // Keep the actual registration/copy owner and its exact map control block
     // pinned in the optional inventory; this is virtual backing, not RSS/PFN evidence.
     std::optional<strix::UmaOwnerInventory> model_owner_inventory;
@@ -2449,6 +2517,12 @@ int STRIX_DECODE_ENTRY(
     std::vector<std::shared_ptr<KnownPromptMemory>> known_tail_memories;
     std::vector<std::shared_ptr<strix::HipKnownPrefixWindow>> known_tail_owners;
     std::vector<std::unique_ptr<strix::HipKnownPromptBackend>> known_tail_backends;
+    // --mtp-copy-wide-rows with a split prefill numerical profile: the wide copy verify owners run decode rows, so
+    // they are compiled on the DECODE execution (decode catalog and resources), apart from the prompt tails, which
+    // keep the prefill profile. Empty with one profile (the tails themselves verify the wide cycles).
+    std::vector<std::shared_ptr<strix::CompiledKnownPrefixPrefill>> known_wide_plans;
+    std::vector<std::shared_ptr<KnownPromptMemory>> known_wide_memories;
+    std::vector<std::shared_ptr<strix::HipKnownPrefixWindow>> known_wide_owners;
     std::optional<strix::UmaReservationEstimate> known_prefill_reservation;
     std::uint64_t known_prefill_runtime_payload = 0;
     std::shared_ptr<KnownPromptMemory> known_prefix_memory;
@@ -2459,6 +2533,9 @@ int STRIX_DECODE_ENTRY(
     // Block-boundary prefix state cache (--prefix-cache-host-bytes): store and live-session view.
     std::shared_ptr<strix::PrefixStateCache> prefix_store;
     std::unique_ptr<strix::decode_cli::HipPrefixStateCacheSession> prefix_state;
+    // --rtx-state-import / STRIX_RTX_EXPORT_STATE without a prefix cache: the same component registry over no store
+    // (no capture, no lookup, no disk tier).
+    std::unique_ptr<strix::decode_cli::HipPrefixStateCacheSession> rtx_state_session;
     strix::ModelContentIdentity prefix_cache_identity;
     std::uint64_t prefix_cache_every = 0;
     std::uint64_t known_prefix_union_bytes = 0; // routed-union scratch of the tiled prefill owners (0: none)
@@ -2480,12 +2557,29 @@ int STRIX_DECODE_ENTRY(
                  options.known_window_router_rows || options.known_prefix_full_rows,
                  options.known_prefix_full_rows, options.known_prefix_full_rows, options.known_prefix_full_rows,
                  options.teacher_forced_score}));
-            for (const auto tail_rows : options.known_prefix_tail_rows)
+            // --mtp-copy-wide-rows N[,M]: each listed size's tail owner also verifies wide copy cycles, so it computes
+            // every row's head (all-rows policy; its prompt blocks that need no logits still run without heads).
+            for (const auto tail_rows : options.known_prefix_tail_rows) {
+                const bool wide_tail = !compiled_prefill &&
+                    std::find(options.mtp.copy_wide_rows.begin(), options.mtp.copy_wide_rows.end(), tail_rows) !=
+                    options.mtp.copy_wide_rows.end();
                 known_tail_plans.push_back(std::make_shared<strix::CompiledKnownPrefixPrefill>(strix::compile_known_prefix_prefill(model,
                     compiled_prefill ? *compiled_prefill : compiled, manifest, tensor_access,
                     {tail_rows, true, true, true, options.known_prefix_expert_union,
-                     options.known_prefix_output_policy, options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U,
-                     true, true, true, true, true, false})));
+                     wide_tail ? strix::KnownWindowOutputPolicy::all_rows : options.known_prefix_output_policy,
+                     options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U,
+                     true, true, true, true, true,
+                     // and its multi-row head (eight-row packs, the one-row head's leaf and reduction tree per row)
+                     wide_tail})));
+            }
+            if (compiled_prefill)
+                for (const auto wide_rows : options.mtp.copy_wide_rows)
+                    known_wide_plans.push_back(std::make_shared<strix::CompiledKnownPrefixPrefill>(strix::compile_known_prefix_prefill(model,
+                        compiled, manifest, tensor_access,
+                        {wide_rows, true, true, true, options.known_prefix_expert_union,
+                         strix::KnownWindowOutputPolicy::all_rows,
+                         options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U,
+                         true, true, true, true, true, true})));
             known_prefix_plan = known_prefill_plan->tile8; // selection ledger, never a relabelled T forward
         } else {
             const bool full = options.known_prefix_full_rows;
@@ -2563,6 +2657,10 @@ int STRIX_DECODE_ENTRY(
                 growth = add(growth, add(tail->arena.physical.total_bytes, add(8U, union_bytes)));
                 growth = add(growth, tail->host_metadata_payload_bytes);
             }
+            for (const auto& wide : known_wide_plans) { // same for each decode-profile wide owner (split profile)
+                growth = add(growth, add(wide->arena.physical.total_bytes, add(8U, union_bytes)));
+                growth = add(growth, wide->host_metadata_payload_bytes);
+            }
             // Batched MTP slots (cohort requests on the tiled prompt, --http-batch N): each further slot's block
             // and tail owners share the arenas above but hold their own metadata copy and completion records
             // (about 286 MB per slot at T = 8192).
@@ -2607,6 +2705,19 @@ int STRIX_DECODE_ENTRY(
                     std::static_pointer_cast<const void>(known_tail_memory),
                     union_bytes ? strix::q51_known_rows::Workspace{known_tail_memory->union_scratch,
                         std::static_pointer_cast<const void>(known_tail_memory)} : strix::q51_known_rows::Workspace{}));
+            }
+            for (const auto& known_wide_plan : known_wide_plans) {
+                const auto wide_retained = std::make_shared<PrefillRetained>(PrefillRetained{
+                    experiment_owner, d1_pin, prefill_ple_owner, retained_ple_source, known_wide_plan});
+                const auto known_wide_memory = std::make_shared<KnownPromptMemory>(*known_wide_plan, generations.next(),
+                    generations.next(), wide_retained, original_work_device, union_bytes,
+                    union_bytes ? generations.next() : 0);
+                known_wide_memories.push_back(known_wide_memory);
+                known_wide_owners.push_back(std::make_shared<strix::HipKnownPrefixWindow>(*known_wide_plan,
+                    compiled, model, catalog_config, resources, known_wide_memory->scratch, known_wide_memory->scope,
+                    std::static_pointer_cast<const void>(known_wide_memory),
+                    union_bytes ? strix::q51_known_rows::Workspace{known_wide_memory->union_scratch,
+                        std::static_pointer_cast<const void>(known_wide_memory)} : strix::q51_known_rows::Workspace{}));
             }
         } else {
             known_prefix_memory = std::make_shared<KnownPromptMemory>(*known_prefix_plan, arena_generation,
@@ -2662,7 +2773,10 @@ int STRIX_DECODE_ENTRY(
             known_group_backend = std::make_unique<strix::HipKnownPromptBackend>(known_group_owner, session,
                 known_group_memory->scratch, model.vocab_size, original_work_device);
         }
-        if (strix::decode_cli::prefix_state_cache_requested(options)) {
+        const bool rtx_state_registry = !strix::decode_cli::prefix_state_cache_requested(options) &&
+            strix::decode_cli::mtp_tiled_prompt(options) && (options.rtx_state_import || strix::decode_cli::rtx_state_export_request() ||
+            strix::decode_cli::prompt_state_digest_request());
+        if (strix::decode_cli::prefix_state_cache_requested(options) || rtx_state_registry) {
             if (!known_prefill_plan || !known_prefix_backend)
                 throw std::logic_error("prefix state cache reached a route other than the tiled known-prefix prefill");
             const auto pair = strix::decode_cli::numerical_profile_pair(options);
@@ -2685,14 +2799,19 @@ int STRIX_DECODE_ENTRY(
             in.context_tokens = options.context_tokens;
             prefix_cache_identity = strix::decode_cli::prefix_state_cache_identity(in);
             const std::uint64_t rows = options.known_prefix_prefill_rows;
-            prefix_cache_every = options.prefix_cache_every ? options.prefix_cache_every
-                : std::max<std::uint64_t>(rows, (4096U + rows - 1U) / rows * rows);
-            prefix_store = std::make_shared<strix::PrefixStateCache>(strix::PrefixStateCachePolicy{
-                options.prefix_cache_host_bytes, options.prefix_cache_dir, options.prefix_cache_disk_bytes},
-                strix::decode_cli::hip_pinned_prefix_buffer);
-            prefix_state = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(prefix_store,
-                prefix_cache_identity, options.known_prefix_prefill_rows, prefix_cache_every, model, state_layout,
-                memory.state());
+            if (rtx_state_registry) {
+                rtx_state_session = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(nullptr,
+                    prefix_cache_identity, options.known_prefix_prefill_rows, rows, model, state_layout, memory.state());
+            } else {
+                prefix_cache_every = options.prefix_cache_every ? options.prefix_cache_every
+                    : std::max<std::uint64_t>(rows, (4096U + rows - 1U) / rows * rows);
+                prefix_store = std::make_shared<strix::PrefixStateCache>(strix::PrefixStateCachePolicy{
+                    options.prefix_cache_host_bytes, options.prefix_cache_dir, options.prefix_cache_disk_bytes},
+                    strix::decode_cli::hip_pinned_prefix_buffer);
+                prefix_state = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(prefix_store,
+                    prefix_cache_identity, prefix_cache_unit(options), prefix_cache_every, model, state_layout,
+                    memory.state());
+            }
         }
     }
 
@@ -2725,10 +2844,17 @@ int STRIX_DECODE_ENTRY(
             tiled.blocks = known_prefix_backend.get(); tiled.block_owner = known_prefix_owner;
             for (std::size_t t = 0; t < known_tail_backends.size(); ++t)
                 tiled.tails.push_back({known_tail_backends[t].get(), known_tail_owners[t], options.known_prefix_tail_rows[t]});
+            for (std::size_t w = 0; w < known_wide_owners.size(); ++w)
+                tiled.wide.push_back({nullptr, known_wide_owners[w], options.mtp.copy_wide_rows[w]});
             tiled.rows = options.known_prefix_prefill_rows;
             // Split prefill profile: the block backends above hand the session to the prefill execution.
             tiled.prefill_execution_identity = compiled_prefill ? compiled_prefill->execution_identity : 0U;
-            tiled.cache = prefix_state.get();
+            tiled.cache = prefix_state ? prefix_state.get() : rtx_state_session.get();
+            tiled.cache_tails = prefix_state && prefix_cache_unit(options) < options.known_prefix_prefill_rows;
+            tiled.ladder_tail_rows = options.known_prefix_ladder_tail_rows;
+            if (options.rtx_state_import)
+                tiled.rtx_import = std::make_shared<strix::RtxStateImportRegistry>(strix::decode_cli::hip_pinned_prefix_buffer, 2,
+                    options.rtx_state_import_decode_threads);
             tiled.reset_state = [&] {
                 check_hip(hipDeviceSynchronize(), "tiled MTP prompt reset fence");
                 strix::initialize_hip_fresh_runtime_memory(memory.scratch(), memory.state());
@@ -2893,7 +3019,10 @@ int STRIX_DECODE_ENTRY(
             }
             if (prefix_store)
                 stack.cache = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(prefix_store, prefix_cache_identity,
-                    options.known_prefix_prefill_rows, prefix_cache_every, model, state_layout, stack.memory->state());
+                    prefix_cache_unit(options), prefix_cache_every, model, state_layout, stack.memory->state());
+            else if (rtx_state_session)   // STRIX_PROMPT_STATE_DIGEST without a prefix cache: each slot gets its own registry
+                stack.cache = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(nullptr, prefix_cache_identity,
+                    options.known_prefix_prefill_rows, options.known_prefix_prefill_rows, model, state_layout, stack.memory->state());
             auto& tiled = stack.parents->tiled;
             tiled.blocks = stack.blocks.get(); tiled.block_owner = stack.block_owner;
             for (std::size_t t = 0; t < stack.tails.size(); ++t)
@@ -2901,6 +3030,7 @@ int STRIX_DECODE_ENTRY(
             tiled.rows = options.known_prefix_prefill_rows;
             tiled.prefill_execution_identity = compiled_prefill ? compiled_prefill->execution_identity : 0U;
             tiled.cache = stack.cache.get();
+            tiled.cache_tails = prefix_store && prefix_cache_unit(options) < options.known_prefix_prefill_rows;
             tiled.reset_state = [slot_memory = stack.memory] {
                 check_hip(hipDeviceSynchronize(), "batched MTP slot reset fence");
                 strix::initialize_hip_fresh_runtime_memory(slot_memory->scratch(), slot_memory->state());
@@ -2947,7 +3077,8 @@ int STRIX_DECODE_ENTRY(
         auto make_window = window_factory_for(parents, batch_stream);
         if (options.http_serve && !batch_slots)
             parents->serve = strix::decode_cli::make_http_serve(options, "native MTP greedy decode, profile " +
-                std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens));
+                std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens),
+                parents->tiled.rtx_import);
         setup_phase.reset();
         // --mtp-sample-repeats N: N independent requests (seeds seed..seed+N-1), each from a fresh
         // session over the same loaded model; one receipt per request.
@@ -3642,6 +3773,8 @@ int STRIX_DECODE_ENTRY(
             paired.output_policy = options.known_prefix_output_policy;
             // Teacher-forced: no headless block, and the serial suffix rows are scored like serial rows.
             paired.all_row_heads = options.teacher_forced_score;
+            paired.schedule_extensions = !prefix_state;
+            paired.ladder_tail_rows = options.known_prefix_ladder_tail_rows;
             strix::KnownPromptChunkCursor chunks(paired, *known_prefix_backend,
                 options.teacher_forced_score ? *generation_backend : static_cast<strix::SerialGreedyStepBackend&>(backend));
             for (auto& tail : known_tail_backends) chunks.set_tail_backend(*tail);
@@ -3826,7 +3959,7 @@ int STRIX_DECODE_ENTRY(
             const auto store = prefix_store->stats();
             std::ostringstream out;
             out << "  \"prefix_state_cache\":{\"identity\":\"" << strix::model_content_identity_hex(prefix_cache_identity)
-                << "\",\"block_rows\":" << options.known_prefix_prefill_rows << ",\"capture_every_tokens\":" << prefix_cache_every
+                << "\",\"block_rows\":" << prefix_cache_unit(options) << ",\"capture_every_tokens\":" << prefix_cache_every
                 << ",\"row_bytes_per_position\":" << prefix_state->row_bytes() << ",\"fixed_bytes_per_checkpoint\":" << prefix_state->fixed_bytes()
                 << ",\"host_byte_budget\":" << options.prefix_cache_host_bytes
                 << ",\"disk_directory\":\"" << strix::decode_receipt::escape_json_string(options.prefix_cache_dir)

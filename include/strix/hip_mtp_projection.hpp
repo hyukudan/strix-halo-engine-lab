@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/hip_mtp_resources.hpp"
+#include <span>
 #include <string_view>
 namespace strix {
 inline constexpr std::string_view mtp_hyper_q8_profile_v1 =
@@ -14,6 +15,13 @@ void launch_hip_mtp_hyper_mix(const MtpNativeContext&,MtpHyperRole,void* stream)
 // Draft-only HC mix: prepare norm + FP32 split-K projection (injection from the F32
 // [4][10240] copy inject_f32; null for head) + lane-chain output, as in target decode.
 void launch_hip_mtp_hyper_mix_draft(const MtpNativeContext&,MtpHyperRole,const float* inject_f32,void* stream);
+// Multi-session draft batch of launch_hip_mtp_hyper_mix_draft: every context's HC mix for `role` as one rows mix
+// on `stream` (each row = its own one-token draft mix, bit for bit). inject_f32 is one session's F32 injection
+// copy (every copy holds the same dequantized values). Supported only on the production draft branch
+// (STRIX_MTP_HC_ROWS on, STRIX_MTP_HC_PERSISTENT off); at most 8 contexts.
+[[nodiscard]] bool hip_mtp_hyper_mix_draft_rows_supported();
+void launch_hip_mtp_hyper_mix_draft_rows(std::span<const MtpNativeContext> contexts,MtpHyperRole role,const float* inject_f32,
+    void* stream);
 void preflight_hip_mtp_routed_experts(const MtpNativeContext&);
 // All-Q8 gate/up/down, original ascending-slot FP32 accumulation, final BF16.
 // Uses owner's sticky status (never clears it); owner completes/checks before

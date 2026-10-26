@@ -71,6 +71,21 @@ ElementwiseRowsViews inject_known_window_rows_views(std::span<const ExecutionDis
     const HipElementwiseLauncherConfig& config);
 ElementwiseRowsViews moe_combine_known_window_rows_views(std::span<const ExecutionDispatchContext> rows,
     const HipElementwiseLauncherConfig& config);
+// Prefill (STRIX_QPF2K_HC): the views of an admitted full-T inject / MoE-combine rows call (the prefill launch's
+// admission, nothing enqueued) when every view is one uniform row stride apart: row r of a view at base + r * stride.
+// Returns false (views unset) otherwise.
+struct ElementwisePrefillViews {
+    const void* first = nullptr;
+    const void* second = nullptr;
+    const float* weights = nullptr;
+    void* output = nullptr;
+    std::uint64_t first_stride = 0, second_stride = 0, weights_stride = 0, output_stride = 0;
+    std::uint32_t count = 0;
+};
+bool inject_known_prefill_rows_views(std::span<const ExecutionDispatchContext> rows, const HipElementwiseLauncherConfig& config,
+    ElementwisePrefillViews& views);
+bool moe_combine_known_prefill_rows_views(std::span<const ExecutionDispatchContext> rows, const HipElementwiseLauncherConfig& config,
+    ElementwisePrefillViews& views);
 void moe_combine_known_window_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipElementwiseLauncherConfig& config);
 // The inject rows of several sessions' windows (segments of 2/4/8 rows, each admitted as its window; up to
@@ -125,6 +140,10 @@ struct MtpNativeContext;
 enum class MtpInjectRole : unsigned { attention, mlp };
 void preflight_hip_mtp_inject(const MtpNativeContext&,MtpInjectRole);
 void launch_hip_mtp_inject(const MtpNativeContext&,MtpInjectRole,void* stream);
+// Multi-session draft batch (at most 8 contexts, on `stream`): every context's inject, and every context's
+// publish_next_state copy (wide_next -> wide_current); each row equals its own one-token launch/copy.
+void launch_hip_mtp_inject_rows(std::span<const MtpNativeContext> contexts,MtpInjectRole,void* stream);
+void launch_hip_mtp_publish_next_rows(std::span<const MtpNativeContext> contexts,void* stream);
 void preflight_hip_mtp_moe_combine(const MtpNativeContext&);
 void launch_hip_mtp_moe_combine(const MtpNativeContext&,void* stream);
 

@@ -7,6 +7,7 @@
 
 #include "strix/dispatch_resources.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -2112,10 +2113,68 @@ void route_prefill(std::span<const ExecutionDispatchContext> rows, const HipMoeR
     };
     // Fast prefill profile, router component: BF16 WMMA logits with two-term weights (hip_router_fast_prefill.inc).
     if (config.router_fast_prefill && config.activation == HipActivationStorage::bf16 && config.hidden_size % router_fast::kK == 0U &&
-        config.expert_count % router_fast::kN == 0U)
-        hipLaunchKernelGGL(router_fast::logits_kernel<2U>, dim3((tiles * 8U + router_fast::kM - 1U) / router_fast::kM,
-            config.expert_count / router_fast::kN), dim3(256U), 0, stream, args, f32, config.hidden_size, tiles * 8U);
-    else if (tiles_per_lane > 1U && hidden_aligned) {
+        config.expert_count % router_fast::kN == 0U) {
+        // STRIX_PREFILL_ROUTER_TUNE: pre-split weights and K steps of 64 (router_fast::logits_presplit_kernel, same bits), 1 with
+        // 64 experts per workgroup, 2 (default) with 128 from 2048 rows (32K prefill: 3.56 -> 1.21 ms per 8192-row call) and
+        // 64 below (as many workgroups as logits_kernel<2>); 0 runs logits_kernel<2>.
+        // STRIX_PREFILL_ROUTER_CHECK=1 (diagnostic, synchronizes): also runs logits_kernel<2> on the same rows and prints the
+        // number of logits whose bits differ.
+        static const unsigned router_tune = [] { const char* v = std::getenv("STRIX_PREFILL_ROUTER_TUNE"); return v ? static_cast<unsigned>(std::atoi(v)) : 2U; }();
+        static const bool router_check = [] { const char* v = std::getenv("STRIX_PREFILL_ROUTER_CHECK"); return v && v[0] == '1'; }();
+        const std::uint32_t total = tiles * 8U, experts = config.expert_count;
+        const dim3 grid((total + router_fast::kM - 1U) / router_fast::kM, experts / router_fast::kN);
+        const auto original = [&] {
+            hipLaunchKernelGGL(router_fast::logits_kernel<2U>, grid, dim3(256U), 0, stream, args, f32, config.hidden_size, total);
+            check_hip(hipGetLastError(), "router prefill BF16 WMMA logits launch");
+        };
+        const unsigned presplit_n = router_tune == 2U && experts % 128U == 0U && total >= 2048U ? 128U : 64U;
+        if ((router_tune == 1U || router_tune == 2U) && config.hidden_size % router_fast::kK2 == 0U) {
+            const std::size_t weights = static_cast<std::size_t>(experts) * config.hidden_size;
+            static std::uint16_t* split = nullptr;
+            static std::size_t split_capacity = 0;
+            if (split_capacity < weights) {
+                if (split) check_hip(hipFree(split), "router split weights release");
+                split = nullptr; split_capacity = 0;
+                check_hip(hipMalloc(&split, 2U * weights * sizeof(std::uint16_t)), "router split weights allocation");
+                split_capacity = weights;
+            }
+            static float* copy = nullptr;
+            static std::size_t copy_capacity = 0;
+            static unsigned* mismatches = nullptr;
+            const std::size_t logits_count = static_cast<std::size_t>(total) * experts;
+            if (router_check) {
+                if (copy_capacity < logits_count) {
+                    if (copy) check_hip(hipFree(copy), "router check copy release");
+                    copy = nullptr; copy_capacity = 0;
+                    check_hip(hipMalloc(&copy, logits_count * sizeof(float)), "router check copy allocation");
+                    copy_capacity = logits_count;
+                }
+                if (!mismatches) check_hip(hipMalloc(&mismatches, sizeof(unsigned)), "router check counter allocation");
+                check_hip(hipMemsetAsync(mismatches, 0, sizeof(unsigned), stream), "router check counter clear");
+                original();
+                hipLaunchKernelGGL(router_fast::check_logits, dim3(total), dim3(256U), 0, stream, args, copy, mismatches, experts, total, 0U);
+                check_hip(hipGetLastError(), "router check copy launch");
+            }
+            hipLaunchKernelGGL(router_fast::split_weights, dim3(static_cast<unsigned>(std::min<std::size_t>((weights + 255U) / 256U, 4096U))),
+                dim3(256U), 0, stream, f32, split, split + weights, static_cast<std::uint32_t>(weights));
+            check_hip(hipGetLastError(), "router weight split launch");
+            if (presplit_n == 128U)
+                hipLaunchKernelGGL(router_fast::logits_presplit_kernel<128U>, dim3(grid.x, experts / 128U), dim3(256U), 0, stream, args,
+                    split, split + weights, config.hidden_size, total);
+            else
+                hipLaunchKernelGGL(router_fast::logits_presplit_kernel<64U>, grid, dim3(256U), 0, stream, args, split, split + weights,
+                    config.hidden_size, total);
+            check_hip(hipGetLastError(), "router prefill pre-split logits launch");
+            if (router_check) {
+                hipLaunchKernelGGL(router_fast::check_logits, dim3(total), dim3(256U), 0, stream, args, copy, mismatches, experts, total, 1U);
+                check_hip(hipGetLastError(), "router check compare launch");
+                unsigned bad = 0;
+                check_hip(hipMemcpyAsync(&bad, mismatches, sizeof(bad), hipMemcpyDeviceToHost, stream), "router check read");
+                check_hip(hipStreamSynchronize(stream), "router check sync");
+                std::fprintf(stderr, "router-presplit-check rows=%u experts=%u mismatched_logits=%u\n", total, experts, bad);
+            }
+        } else original();
+    } else if (tiles_per_lane > 1U && hidden_aligned) {
         if (config.activation == HipActivationStorage::bf16) by_tiles.template operator()<std::uint16_t>();
         else by_tiles.template operator()<float>();
     } else if (config.activation == HipActivationStorage::bf16)
@@ -2362,6 +2421,60 @@ void launch_hip_mtp_route(const MtpNativeContext& c,void* stream) {
         reinterpret_cast<std::uint32_t*>(c.resources->view(HipMtpBuffer::routes).address),
         reinterpret_cast<float*>(c.resources->view(HipMtpBuffer::route_weights).address));
     check_hip(hipGetLastError(),"MTP native parallel route selection launch");
+}
+// Multi-session draft batch: launch_hip_mtp_route of every context on `stream`. The staged logits kernel exists
+// for 1, 2, 4 and 8 rows (same ascending FMA chain per expert and row at every row count; rows never reduce
+// across each other), so the live rows run as groups of 8, 4, 2 and 1; the selection runs once per row with
+// the one-token kernel's row body (rows_moe_route_select_kernel<wave>). Only the staged production branch.
+bool hip_mtp_route_rows_supported() {
+    static const bool staged=[]{const char* v=std::getenv("STRIX_ROUTER_STAGED");return !v||v[0]!='0';}();
+    return staged;
+}
+void launch_hip_mtp_route_rows(std::span<const MtpNativeContext> contexts,void* raw_stream) {
+    if(contexts.empty() || contexts.size()>kRouterMaxRows || !raw_stream)
+        throw std::invalid_argument("MTP router batch size or stream is invalid");
+    const bool staged=hip_mtp_route_rows_supported();
+    const auto& c0=contexts.front();
+    const auto h=static_cast<std::uint32_t>(c0.model->hidden_size);
+    const auto e=static_cast<std::uint32_t>(c0.model->num_experts);
+    const auto k=static_cast<std::uint32_t>(c0.model->num_experts_per_token);
+    const auto* router=reinterpret_cast<const float*>(c0.tensors->router.runtime->address);
+    RouterRowsArgs args{};
+    for(std::size_t t=0;t<contexts.size();++t) {
+        const auto& c=contexts[t];
+        preflight_hip_mtp_route(c);
+        const auto hidden0=c.resources->view(HipMtpBuffer::hidden0).address;
+        if(!staged || h!=20U*128U || hidden0%16U || c.tensors->router.runtime->address%16U ||
+           reinterpret_cast<const float*>(c.tensors->router.runtime->address)!=router ||
+           c.model->hidden_size!=h || c.model->num_experts!=e || c.model->num_experts_per_token!=k ||
+           c.model->norm_topk_probability!=c0.model->norm_topk_probability)
+            throw std::invalid_argument("MTP router batch needs the staged branch and one shared router");
+        args.hidden[t]=reinterpret_cast<const void*>(hidden0);
+        args.workspace[t]=reinterpret_cast<float*>(c.resources->view(HipMtpBuffer::router_workspace).address);
+        args.indices[t]=reinterpret_cast<std::uint32_t*>(c.resources->view(HipMtpBuffer::routes).address);
+        args.weights[t]=reinterpret_cast<float*>(c.resources->view(HipMtpBuffer::route_weights).address);
+    }
+    const auto stream=reinterpret_cast<hipStream_t>(raw_stream);
+    check_hip(hipGetLastError(),"MTP router batch pending HIP error");
+    std::uint32_t first=0;const auto count=static_cast<std::uint32_t>(contexts.size());
+    const auto group=[&]<std::uint32_t R>() {
+        RouterRowsArgs g{};
+        for(std::uint32_t r=0;r<R;++r){g.hidden[r]=args.hidden[first+r];g.workspace[r]=args.workspace[first+r];}
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,R,20U,8U>),dim3((e+15U)/16U),
+            dim3(32U*(staged_router_chain_waves<R>()+8U)),0,stream,g,router,e);
+        check_hip(hipGetLastError(),"MTP router batch logits launch");
+        first+=R;
+    };
+    while(first<count) {
+        const auto left=count-first;
+        if(left>=8U) group.template operator()<8U>();
+        else if(left>=4U) group.template operator()<4U>();
+        else if(left>=2U) group.template operator()<2U>();
+        else group.template operator()<1U>();
+    }
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave>),dim3(count),dim3(kThreads),0,stream,
+        args,e,k,c0.model->norm_topk_probability);
+    check_hip(hipGetLastError(),"MTP router batch selection launch");
 }
 
 }  // namespace strix

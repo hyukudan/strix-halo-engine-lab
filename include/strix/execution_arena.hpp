@@ -59,10 +59,16 @@ class ArenaLookupIndex {
 public:
     ArenaLookupIndex() = default;
     explicit ArenaLookupIndex(std::span<const ExecutionArenaPlan* const> plans);
+    // Row views of one compiled arena (a tiled prefill's T rows): when every view holds the same uses in the same
+    // order, one use -> position map answers them all (the first allocation of the use, as the linear search
+    // returns); otherwise an empty index. Kept views must stay alive and unmodified for the index's lifetime.
+    [[nodiscard]] static ArenaLookupIndex uniform_views(std::span<const ExecutionArenaPlan> views);
+    [[nodiscard]] bool empty() const noexcept { return !plans_ && !uniform_; }
 
 private:
     friend class ArenaLookupScope;
     std::shared_ptr<const void> plans_;
+    std::shared_ptr<const void> uniform_;
 };
 
 // While one is alive, find_arena_allocation on this thread indexes each plan it is asked about once

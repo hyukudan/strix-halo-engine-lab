@@ -83,6 +83,19 @@ public:
     // Tiled prefill block whose logits are not needed: runs every step but the terminal head.
     [[nodiscard]] KnownWindowResult execute_without_head(SerialSessionContext& session,
         std::span<const std::uint32_t> tokens);
+    // STRIX_QPF2K_SCHED bit 2: the same headless block without the host fence at its end; its completion checks run when
+    // the next block of this owner completes (which must follow before any other use of the session's state) or at
+    // finish_pending_completion().
+    [[nodiscard]] KnownWindowResult execute_without_head_deferred(SerialSessionContext& session,
+        std::span<const std::uint32_t> tokens);
+    [[nodiscard]] bool completion_pending() const noexcept;
+    // STRIX_QPF2K_SCHED bit 4: a block of the first tokens.size() rows of this tiled owner's T arena (16..T rows, a
+    // multiple of 8): with its head (terminal row) or headless; `defer` as execute_without_head_deferred (headless only).
+    [[nodiscard]] KnownWindowResult execute_partial(SerialSessionContext& session, std::span<const std::uint32_t> tokens,
+        bool head, bool defer = false);
+    void finish_pending_completion();
+    // A failure while a deferred block is unchecked: the owner fails, its stream is drained (recover or fail-stop).
+    void abandon_pending_completion();
     // Optional serving delivery validation AFTER producer/D1 completion but
     // BEFORE publishing any session state/generations. Callback is synchronous
     // on the owned eager scope; throws follow the existing poison/drain path.
@@ -109,7 +122,9 @@ public:
     // Tiled prefill owners only: observer called after each step of every later block is enqueued
     // (see KnownWindowExecutionHooks::after_step). Set while idle; an empty function removes it.
     using PrefillStepObserver = std::function<void(std::size_t, const std::function<ExecutionDispatchContext(std::uint32_t)>&)>;
-    void set_prefill_step_observer(PrefillStepObserver observer);
+    // observes (optional): the steps the observer reads (it must return at once for the others); empty = every step.
+    // STRIX_QPF2K_HC prefill folds stay off for observed steps only.
+    void set_prefill_step_observer(PrefillStepObserver observer, std::function<bool(std::size_t)> observes = {});
     // Diagnostics only: the same observer for verify windows (every step after it was enqueued). Set while idle.
     void set_window_step_observer(PrefillStepObserver observer);
     [[nodiscard]] std::uint32_t logical_rows() const noexcept;

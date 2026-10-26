@@ -414,8 +414,14 @@ struct PlanIndex {
     std::unordered_map<UseKey, std::size_t, UseHash> first;
 };
 using LookupCache = std::unordered_map<const ExecutionArenaPlan*, PlanIndex>;
+// Views with identical use sequences: one first-position map, and each view's allocation storage and size.
+struct UniformViews {
+    std::unordered_map<UseKey, std::size_t, UseHash> first;
+    std::unordered_map<const ExecutionArenaPlan*, std::pair<const ExecutionArenaAllocation*, std::size_t>> plans;
+};
 struct ActiveLookup {
     const LookupCache* persistent = nullptr;
+    const UniformViews* uniform = nullptr;
     LookupCache transient;
 };
 thread_local ActiveLookup* active_lookup = nullptr;
@@ -461,9 +467,27 @@ ArenaLookupIndex::ArenaLookupIndex(std::span<const ExecutionArenaPlan* const> pl
 
 ArenaLookupScope::ArenaLookupScope() : previous_(active_lookup) { active_lookup = new ActiveLookup; }
 
+ArenaLookupIndex ArenaLookupIndex::uniform_views(std::span<const ExecutionArenaPlan> views) {
+    ArenaLookupIndex index;
+    if (views.empty()) return index;
+    const auto& lead = views.front().allocations;
+    for (const auto& view : views) {
+        if (view.allocations.size() != lead.size()) return index;
+        for (std::size_t i = 0; i < lead.size(); ++i)
+            if (!(view.allocations[i].use == lead[i].use)) return index;
+    }
+    auto uniform = std::make_shared<UniformViews>();
+    for (std::size_t i = 0; i < lead.size(); ++i) uniform->first.try_emplace(UseKey{lead[i].use}, i);
+    uniform->plans.reserve(views.size());
+    for (const auto& view : views) uniform->plans.emplace(&view, std::pair{view.allocations.data(), view.allocations.size()});
+    index.uniform_ = std::move(uniform);
+    return index;
+}
+
 ArenaLookupScope::ArenaLookupScope(const ArenaLookupIndex& persistent) : previous_(active_lookup) {
     active_lookup = new ActiveLookup;
     active_lookup->persistent = static_cast<const LookupCache*>(persistent.plans_.get());
+    active_lookup->uniform = static_cast<const UniformViews*>(persistent.uniform_.get());
 }
 
 ArenaLookupScope::~ArenaLookupScope() {
@@ -475,6 +499,17 @@ const ExecutionArenaAllocation* find_arena_allocation(
     const ExecutionArenaPlan& plan,
     ExecutionBufferUse use) noexcept {
     if (active_lookup) {
+        // A uniform view still at its indexed storage and size: its use sits where it sits in every view.
+        if (const auto* uniform = active_lookup->uniform) {
+            const auto view = uniform->plans.find(&plan);
+            if (view != uniform->plans.end() && view->second.first == plan.allocations.data() &&
+                view->second.second == plan.allocations.size()) {
+                const auto found = uniform->first.find(UseKey{use});
+                if (found == uniform->first.end()) return nullptr;
+                const auto* allocation = &plan.allocations[found->second];
+                if (allocation->use == use) return allocation;
+            }
+        }
         const auto* persistent = active_lookup->persistent;
         const auto fixed = persistent ? persistent->find(&plan) : LookupCache::const_iterator{};
         if (persistent && fixed != persistent->end()) {

@@ -1,13 +1,18 @@
 #include "strix/hip_mtp_native_validation.hpp"
+#include "strix/hip_ggml_weight_formats.hpp"
 #include "strix/hip_embedding_launcher.hpp"
 #include "strix/hip_launch_context.hpp"
 
 #include "strix/dispatch_resources.hpp"
+#include "strix/rows_launch_registry.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <span>
 
+#include <algorithm>
 #include <array>
+#include <span>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -55,6 +60,9 @@ enum class EmbeddingWeightKind {
     bf16,
     q8_0,
     iq4_xs,
+#define STRIX_GGML_KIND_ENUM(kind, type) kind,
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_ENUM) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_ENUM) STRIX_GGML_KIND_ENUM(iq4_nl, 20)
+#undef STRIX_GGML_KIND_ENUM
 };
 
 void hash_u64(
@@ -118,6 +126,9 @@ EmbeddingWeightKind weight_kind(
         return EmbeddingWeightKind::q8_0;
     case 23:
         return EmbeddingWeightKind::iq4_xs;
+#define STRIX_GGML_KIND_MAP(kind, type) case type: return EmbeddingWeightKind::kind;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_MAP) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_MAP) STRIX_GGML_KIND_MAP(iq4_nl, 20)
+#undef STRIX_GGML_KIND_MAP
     case 30:
         return EmbeddingWeightKind::bf16;
     default:
@@ -311,6 +322,15 @@ __device__ float load_weight<
             iq4_codebook[code]);
 }
 
+#define STRIX_GGML_KIND_LOAD(kind, type)                                                          \
+    template <>                                                                                   \
+    __device__ float load_weight<EmbeddingWeightKind::kind>(                                               \
+        const void* weights, std::uint32_t row_width, std::uint32_t row, std::uint32_t feature) { \
+        return hip_ggml::element<type>(weights, row_width, row, feature);                        \
+    }
+STRIX_GGML_KINDS_K(STRIX_GGML_KIND_LOAD) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_LOAD) STRIX_GGML_KIND_LOAD(iq4_nl, 20)
+#undef STRIX_GGML_KIND_LOAD
+
 template <
     typename Output,
     EmbeddingWeightKind Kind>
@@ -339,6 +359,21 @@ __global__ void embedding_kernel(
     }
 }
 
+// Rows of a tiled prefill block in one launch (STRIX_PREFILL_PIPE bit 16): blockIdx.y selects the row, whose
+// output starts pitch elements after the previous one; each element is embedding_kernel's.
+constexpr std::uint32_t kEmbeddingRowsMax = 256;
+struct EmbeddingRowsTokens {
+    std::uint32_t id[kEmbeddingRowsMax];
+};
+template <typename Output, EmbeddingWeightKind Kind>
+__global__ void embedding_rows_kernel(const void* weights, std::uint32_t row_width, EmbeddingRowsTokens tokens,
+    Output* output, std::uint64_t pitch) {
+    Output* row = output + static_cast<std::uint64_t>(blockIdx.y) * pitch;
+    for (std::uint64_t feature = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x; feature < row_width;
+         feature += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
+        store_output(&row[feature], load_weight<Kind>(weights, row_width, tokens.id[blockIdx.y], static_cast<std::uint32_t>(feature)));
+}
+
 template <typename Output, EmbeddingWeightKind Kind>
 __global__ void device_token_embedding_kernel(
     const void* weights, std::uint32_t row_width, std::uint32_t vocabulary_size,
@@ -347,6 +382,19 @@ __global__ void device_token_embedding_kernel(
     for (std::uint64_t feature = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          feature < row_width; feature += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
         store_output(&output[feature], load_weight<Kind>(weights, row_width, id, static_cast<std::uint32_t>(feature)));
+}
+
+// Multi-session draft batch: row blockIdx.y loads its token's row as the one-token kernels do (a device token
+// word with its out-of-vocabulary row-0 rule, or a host token already admitted by preflight).
+struct MtpEmbeddingRows { const std::uint32_t* token[8]; std::uint32_t value[8]; std::uint16_t* output[8]; };
+template <typename Output, EmbeddingWeightKind Kind>
+__global__ void mtp_embedding_rows_kernel(const void* weights, std::uint32_t row_width, std::uint32_t vocabulary_size,
+    MtpEmbeddingRows rows) {
+    const auto r = blockIdx.y;
+    const auto id = rows.token[r] ? (*rows.token[r] < vocabulary_size ? *rows.token[r] : 0U) : rows.value[r];
+    for (std::uint64_t feature = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         feature < row_width; feature += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
+        store_output(&rows.output[r][feature], load_weight<Kind>(weights, row_width, id, static_cast<std::uint32_t>(feature)));
 }
 
 template <typename Output, EmbeddingWeightKind Kind>
@@ -399,6 +447,21 @@ void launch_graph_by_kind(
         launch_graph_typed<Output, EmbeddingWeightKind::q8_0>(config, weights, vocabulary_size, context_tokens, arguments, output, status, stream); break;
     case EmbeddingWeightKind::iq4_xs:
         launch_graph_typed<Output, EmbeddingWeightKind::iq4_xs>(config, weights, vocabulary_size, context_tokens, arguments, output, status, stream); break;
+#define STRIX_GGML_KIND_CASE(KIND, type) \
+    case EmbeddingWeightKind::KIND: \
+        launch_graph_typed<Output, EmbeddingWeightKind::KIND>(config, weights, vocabulary_size, context_tokens, arguments, output, status, stream); break;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE) STRIX_GGML_KIND_CASE(iq4_nl, 20)
+#undef STRIX_GGML_KIND_CASE
+    }
+}
+
+
+std::uint32_t ggml_type_of(EmbeddingWeightKind kind) {
+    switch (kind) {
+#define STRIX_GGML_KIND_TYPE(k, type) case EmbeddingWeightKind::k: return type;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_TYPE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_TYPE) STRIX_GGML_KIND_TYPE(iq4_nl, 20)
+#undef STRIX_GGML_KIND_TYPE
+    default: return 0;
     }
 }
 
@@ -440,6 +503,13 @@ std::uint64_t required_weight_bytes(
                 row_width / 256U) *
             rows *
             sizeof(IQ4XSBlock);
+    default: {
+        const auto g = hip_ggml::geometry(ggml_type_of(kind));
+        if (g.elements == 0 || row_width % g.elements != 0) {
+            throw std::invalid_argument("weight width is not a multiple of its GGUF block");
+        }
+        return static_cast<std::uint64_t>(row_width / g.elements) * rows * g.bytes;
+    }
     }
     throw std::logic_error(
         "unreachable embedding weight kind");
@@ -530,6 +600,18 @@ void launch_by_weight(
                 token_id,
                 output);
         return;
+#define STRIX_GGML_KIND_CASE(KIND, type) \
+    case EmbeddingWeightKind::KIND: \
+        launch_typed< \
+            Output, \
+            EmbeddingWeightKind::KIND>( \
+                weight, \
+                config, \
+                token_id, \
+                output); \
+        return;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE) STRIX_GGML_KIND_CASE(iq4_nl, 20)
+#undef STRIX_GGML_KIND_CASE
     }
     throw std::logic_error(
         "unreachable embedding weight kind");
@@ -700,6 +782,64 @@ void launch_embedding(
     throw std::logic_error(
         "unreachable embedding output storage");
 }
+
+template <typename Output, EmbeddingWeightKind Kind>
+void launch_rows_typed(const RuntimeTensorBinding& weight, const HipEmbeddingLauncherConfig& config,
+    std::span<const ExecutionDispatchContext> rows, std::uintptr_t output, std::uint64_t pitch) {
+    const auto blocks = std::min<std::uint32_t>(32U, (config.hidden_size - 1U) / kThreads + 1U);
+    for (std::size_t first = 0; first < rows.size(); first += kEmbeddingRowsMax) {
+        const auto count = static_cast<std::uint32_t>(std::min<std::size_t>(kEmbeddingRowsMax, rows.size() - first));
+        EmbeddingRowsTokens tokens{};
+        for (std::uint32_t r = 0; r < count; ++r) tokens.id[r] = rows[first + r].input_token_id;
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(embedding_rows_kernel<Output, Kind>), dim3(blocks, count), dim3(kThreads), 0,
+            hip_execution_stream(), reinterpret_cast<const void*>(weight.address), config.hidden_size, tokens,
+            reinterpret_cast<Output*>(output) + first * pitch, pitch);
+        check_hip(hipGetLastError(), "HIP embedding rows kernel launch");
+    }
+}
+template <typename Output>
+void launch_rows_by_weight(EmbeddingWeightKind kind, const RuntimeTensorBinding& weight, const HipEmbeddingLauncherConfig& config,
+    std::span<const ExecutionDispatchContext> rows, std::uintptr_t output, std::uint64_t pitch) {
+    switch (kind) {
+    case EmbeddingWeightKind::f32: launch_rows_typed<Output, EmbeddingWeightKind::f32>(weight, config, rows, output, pitch); return;
+    case EmbeddingWeightKind::f16: launch_rows_typed<Output, EmbeddingWeightKind::f16>(weight, config, rows, output, pitch); return;
+    case EmbeddingWeightKind::bf16: launch_rows_typed<Output, EmbeddingWeightKind::bf16>(weight, config, rows, output, pitch); return;
+    case EmbeddingWeightKind::q8_0: launch_rows_typed<Output, EmbeddingWeightKind::q8_0>(weight, config, rows, output, pitch); return;
+    case EmbeddingWeightKind::iq4_xs: launch_rows_typed<Output, EmbeddingWeightKind::iq4_xs>(weight, config, rows, output, pitch); return;
+#define STRIX_GGML_KIND_CASE(KIND, type)     case EmbeddingWeightKind::KIND: launch_rows_typed<Output, EmbeddingWeightKind::KIND>(weight, config, rows, output, pitch); return;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE) STRIX_GGML_KIND_CASE(iq4_nl, 20)
+#undef STRIX_GGML_KIND_CASE
+    }
+    throw std::logic_error("unreachable embedding weight kind");
+}
+// Every row is admitted as launch_embedding admits it; false (nothing enqueued) unless all rows read one table
+// and their outputs sit at one pitch.
+bool launch_embedding_rows(std::span<const ExecutionDispatchContext> rows, void* user_data) {
+    if (rows.size() < 2U) return false;
+    if (const auto* scope = current_hip_launch_context(); scope && scope->graph_capture) return false;
+    const auto first = prepare_embedding(rows[0], user_data);
+    const auto element = static_cast<std::uint64_t>(static_cast<std::uint32_t>(first.config.output));
+    const auto second = prepare_embedding(rows[1], user_data);
+    if (second.output.address <= first.output.address) return false;
+    const auto pitch_bytes = static_cast<std::uint64_t>(second.output.address - first.output.address);
+    if (pitch_bytes % element != 0U || pitch_bytes < static_cast<std::uint64_t>(first.config.hidden_size) * element) return false;
+    for (std::size_t r = 1; r < rows.size(); ++r) {
+        const auto row = r == 1U ? second : prepare_embedding(rows[r], user_data);
+        if (row.output.address != first.output.address + r * pitch_bytes || row.runtime_tensor.address != first.runtime_tensor.address ||
+            row.kind != first.kind || &row.config != &first.config)
+            return false;
+    }
+    switch (first.config.output) {
+    case HipActivationStorage::bf16:
+        launch_rows_by_weight<std::uint16_t>(first.kind, first.runtime_tensor, first.config, rows, first.output.address, pitch_bytes / element);
+        return true;
+    case HipActivationStorage::fp32:
+        launch_rows_by_weight<float>(first.kind, first.runtime_tensor, first.config, rows, first.output.address, pitch_bytes / element);
+        return true;
+    }
+    throw std::logic_error("unreachable embedding output storage");
+}
+[[maybe_unused]] const bool embedding_rows_registered = register_rows_launch(&launch_embedding, &launch_embedding_rows);
 
 std::string kernel_id(
     const ExecutionBindingRequest& request,
@@ -920,10 +1060,47 @@ void launch_hip_mtp_embedding(const MtpNativeContext& c,std::uint32_t token,void
     case EmbeddingWeightKind::bf16:launch.template operator()<EmbeddingWeightKind::bf16>();break;
     case EmbeddingWeightKind::q8_0:launch.template operator()<EmbeddingWeightKind::q8_0>();break;
     case EmbeddingWeightKind::iq4_xs:launch.template operator()<EmbeddingWeightKind::iq4_xs>();break;
+#define STRIX_GGML_KIND_CASE(KIND, type) case EmbeddingWeightKind::KIND:launch.template operator()<EmbeddingWeightKind::KIND>();break;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE) STRIX_GGML_KIND_CASE(iq4_nl, 20)
+#undef STRIX_GGML_KIND_CASE
     }
     check_hip(hipGetLastError(),"MTP native embedding launch");
 }
 
+void launch_hip_mtp_embedding_rows(std::span<const MtpNativeContext> contexts,std::span<const std::uint32_t* const> tokens,
+    std::span<const std::uint32_t> values,void* stream) {
+    if(contexts.empty() || contexts.size()>8U || tokens.size()!=contexts.size() || values.size()!=contexts.size() || !stream)
+        throw std::invalid_argument("MTP embedding batch is invalid");
+    const auto& c0=contexts.front();
+    MtpEmbeddingRows rows{};
+    for(std::size_t t=0;t<contexts.size();++t) {
+        const auto& c=contexts[t];
+        preflight_hip_mtp_embedding(c,tokens[t]?0U:values[t]);
+        if(c.tensors->embedding.runtime->address!=c0.tensors->embedding.runtime->address || c.model->hidden_size!=c0.model->hidden_size ||
+           c.model->vocab_size!=c0.model->vocab_size)
+            throw std::invalid_argument("MTP embedding batch members do not share one embedding table");
+        rows.token[t]=tokens[t];rows.value[t]=values[t];
+        rows.output[t]=reinterpret_cast<std::uint16_t*>(c.resources->view(HipMtpBuffer::embedding).address);
+    }
+    check_hip(hipGetLastError(),"MTP embedding batch pending HIP error");
+    auto launch=[&]<EmbeddingWeightKind Kind>() {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_embedding_rows_kernel<std::uint16_t,Kind>),
+            dim3((static_cast<std::uint32_t>(c0.model->hidden_size)+kThreads-1)/kThreads,static_cast<unsigned>(contexts.size())),
+            dim3(kThreads),0,reinterpret_cast<hipStream_t>(stream),reinterpret_cast<const void*>(c0.tensors->embedding.runtime->address),
+            static_cast<std::uint32_t>(c0.model->hidden_size),static_cast<std::uint32_t>(c0.model->vocab_size),rows);
+    };
+    switch(weight_kind(c0.tensors->embedding.manifest->ggml_type)) {
+    case EmbeddingWeightKind::f32:launch.template operator()<EmbeddingWeightKind::f32>();break;
+    case EmbeddingWeightKind::f16:launch.template operator()<EmbeddingWeightKind::f16>();break;
+    case EmbeddingWeightKind::bf16:launch.template operator()<EmbeddingWeightKind::bf16>();break;
+    case EmbeddingWeightKind::q8_0:launch.template operator()<EmbeddingWeightKind::q8_0>();break;
+    case EmbeddingWeightKind::iq4_xs:launch.template operator()<EmbeddingWeightKind::iq4_xs>();break;
+#define STRIX_GGML_KIND_CASE(KIND, type) case EmbeddingWeightKind::KIND:launch.template operator()<EmbeddingWeightKind::KIND>();break;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE) STRIX_GGML_KIND_CASE(iq4_nl, 20)
+#undef STRIX_GGML_KIND_CASE
+    }
+    check_hip(hipGetLastError(),"MTP embedding batch launch");
+}
 void launch_hip_mtp_embedding_device(const MtpNativeContext& c,const std::uint32_t* token,void* stream) {
     if(!token) throw std::invalid_argument("MTP device-token embedding requires a token word");
     preflight_hip_mtp_embedding(c,0U);mtp_native::stream(c,stream);
@@ -941,6 +1118,9 @@ void launch_hip_mtp_embedding_device(const MtpNativeContext& c,const std::uint32
     case EmbeddingWeightKind::bf16:launch.template operator()<EmbeddingWeightKind::bf16>();break;
     case EmbeddingWeightKind::q8_0:launch.template operator()<EmbeddingWeightKind::q8_0>();break;
     case EmbeddingWeightKind::iq4_xs:launch.template operator()<EmbeddingWeightKind::iq4_xs>();break;
+#define STRIX_GGML_KIND_CASE(KIND, type) case EmbeddingWeightKind::KIND:launch.template operator()<EmbeddingWeightKind::KIND>();break;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE) STRIX_GGML_KIND_CASE(iq4_nl, 20)
+#undef STRIX_GGML_KIND_CASE
     }
     check_hip(hipGetLastError(),"MTP device-token embedding launch");
 }

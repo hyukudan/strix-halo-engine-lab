@@ -17,6 +17,7 @@ namespace strix {
 namespace {
 constexpr unsigned threads=256;
 constexpr std::uint32_t max_slots=16;
+constexpr std::uint32_t max_batch=8;
 // sum: sum of exp(logit - value) over the finite rows of the partial (softmax denominator at its max).
 // second: the largest finite logit after the selected row (-inf when none; runner-up kernels only).
 struct Partial {float value;std::uint32_t token,bad,valid;float sum,second;};
@@ -103,7 +104,81 @@ __global__ __launch_bounds__(256) void draft_q4_head(const std::uint16_t* hidden
     for(unsigned d=16;d;d>>=1U) sum+=__shfl_xor(sum,static_cast<int>(d),32);
     if(!lane) logits[row]=sum;
 }
-template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_partials(const float* logits,const std::uint32_t* ids,
+// draft_q4_head's body for the draft batch's own-row (tail) kernel; the one-token kernel above stays as it was.
+__device__ __forceinline__ void draft_q4_head_body(const std::uint16_t* hidden,const std::uint8_t* rows,
+    std::uint32_t blocks,std::uint32_t count,float* logits,std::uint32_t row) {
+    const auto lane=threadIdx.x%32U;
+    if(row>=count) return;
+    const auto* q=rows+static_cast<std::uint64_t>(row)*blocks*18U;
+    float sum=0.0F;
+    for(std::uint32_t b=lane;b<blocks;b+=32U) {
+        const auto* block=q+b*18U;const auto* x=hidden+b*32U;
+        float local=0.0F;
+        for(unsigned j=0;j<16;++j) {
+            const unsigned v=block[2+j];
+            local=fmaf(static_cast<float>(static_cast<int>(v&15U)-8),__uint_as_float(static_cast<unsigned>(x[j])<<16U),local);
+            local=fmaf(static_cast<float>(static_cast<int>(v>>4U)-8),__uint_as_float(static_cast<unsigned>(x[j+16])<<16U),local);
+        }
+        sum=fmaf(__half2float(*reinterpret_cast<const __half*>(block)),local,sum);
+    }
+    for(unsigned d=16;d;d>>=1U) sum+=__shfl_xor(sum,static_cast<int>(d),32);
+    if(!lane) logits[row]=sum;
+}
+// Draft batch. Rows [0, shared) hold the same ids in every session's compact copy (one gather rule from one
+// Q8 head, so the same bytes): one wave reads each such row once and runs every session's unchanged chain
+// on it (per session the same blocks per lane, the same code order, the same local/scale FMAs and tree as
+// draft_q4_head), writing that session's logits[row]. Rows [shared, rows_t) of session t run the one-token
+// body on its own copy (blockIdx.y = session).
+struct DraftHeadRows {
+    const std::uint16_t* hidden[max_batch];
+    const std::uint8_t* compact[max_batch];
+    float* logits[max_batch];
+    std::uint32_t rows[max_batch];
+    const std::uint32_t* ids[max_batch];
+    Partial* partials[max_batch];
+    std::uint32_t* slots[max_batch];
+    Reply* reply[max_batch];
+};
+template<unsigned Count>
+__global__ __launch_bounds__(256) void draft_q4_head_shared(DraftHeadRows h,std::uint32_t blocks,std::uint32_t shared) {
+    const auto lane=threadIdx.x%32U,row=blockIdx.x*8U+threadIdx.x/32U;
+    if(row>=shared) return;
+    const auto* q=h.compact[0]+static_cast<std::uint64_t>(row)*blocks*18U;
+    float sum[Count];
+#pragma unroll
+    for(unsigned t=0;t<Count;++t) sum[t]=0.0F;
+    for(std::uint32_t b=lane;b<blocks;b+=32U) {
+        const auto* block=q+b*18U;
+        float lo[16],hi[16];
+#pragma unroll
+        for(unsigned j=0;j<16;++j) {
+            const unsigned v=block[2+j];
+            lo[j]=static_cast<float>(static_cast<int>(v&15U)-8);hi[j]=static_cast<float>(static_cast<int>(v>>4U)-8);
+        }
+        const float scale=__half2float(*reinterpret_cast<const __half*>(block));
+#pragma unroll
+        for(unsigned t=0;t<Count;++t) {
+            const auto* x=h.hidden[t]+b*32U;
+            float local=0.0F;
+#pragma unroll
+            for(unsigned j=0;j<16;++j) {
+                local=fmaf(lo[j],__uint_as_float(static_cast<unsigned>(x[j])<<16U),local);
+                local=fmaf(hi[j],__uint_as_float(static_cast<unsigned>(x[j+16])<<16U),local);
+            }
+            sum[t]=fmaf(scale,local,sum[t]);
+        }
+    }
+#pragma unroll
+    for(unsigned t=0;t<Count;++t) for(unsigned d=16;d;d>>=1U) sum[t]+=__shfl_xor(sum[t],static_cast<int>(d),32);
+    if(lane) return;
+#pragma unroll
+    for(unsigned t=0;t<Count;++t) h.logits[t][row]=sum[t];
+}
+__global__ __launch_bounds__(256) void draft_q4_head_tails(DraftHeadRows h,std::uint32_t blocks,std::uint32_t shared) {
+    const auto t=blockIdx.y;
+    draft_q4_head_body(h.hidden[t],h.compact[t],blocks,h.rows[t],h.logits[t],shared+blockIdx.x*8U+threadIdx.x/32U);
+}
+template<bool Second> __device__ __forceinline__ void draft_argmax_partials_body(const float* logits,const std::uint32_t* ids,
     std::uint32_t rows,Partial* partials) {
     __shared__ Partial values[threads];
     const auto lane=static_cast<unsigned>(threadIdx.x);
@@ -123,7 +198,16 @@ template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_pa
     best.sum=block_sum(sums,value.valid && best.valid?expf(value.value-best.value):0.0F);
     if(!lane) partials[blockIdx.x]=best;
 }
-template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_finish(const Partial* partials,std::uint32_t count,
+template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_partials(const float* logits,const std::uint32_t* ids,
+    std::uint32_t rows,Partial* partials) {
+    draft_argmax_partials_body<Second>(logits,ids,rows,partials);
+}
+template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_partials_rows(DraftHeadRows h) {
+    const auto t=blockIdx.y;
+    if(blockIdx.x>=(h.rows[t]-1U)/threads+1U) return;
+    draft_argmax_partials_body<Second>(h.logits[t],h.ids[t],h.rows[t],h.partials[t]);
+}
+template<bool Second> __device__ __forceinline__ void draft_argmax_finish_body(const Partial* partials,std::uint32_t count,
     std::uint32_t step,std::uint32_t* slots,Reply* reply) {
     __shared__ Partial values[threads];
     const auto lane=static_cast<unsigned>(threadIdx.x);
@@ -152,6 +236,14 @@ template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_fi
         __threadfence_system();
         __hip_atomic_store(&reply->completed,step+1U,__ATOMIC_RELEASE,__HIP_MEMORY_SCOPE_SYSTEM);
     }
+}
+template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_finish(const Partial* partials,std::uint32_t count,
+    std::uint32_t step,std::uint32_t* slots,Reply* reply) {
+    draft_argmax_finish_body<Second>(partials,count,step,slots,reply);
+}
+template<bool Second> __global__ __launch_bounds__(threads) void draft_argmax_finish_rows(DraftHeadRows h,std::uint32_t step) {
+    const auto t=blockIdx.y;
+    draft_argmax_finish_body<Second>(h.partials[t],(h.rows[t]-1U)/threads+1U,step,h.slots[t],h.reply[t]);
 }
 } // namespace
 
@@ -267,6 +359,65 @@ void HipMtpDraftHead::launch(const std::uint16_t* hidden,std::uint32_t step,void
     }
     check(hipGetLastError(),"MTP draft argmax finish");
 }
+std::uint32_t HipMtpDraftHead::shared_rows(std::span<HipMtpDraftHead* const> heads) {
+    require(!heads.empty() && heads.size()<=max_batch,"MTP draft head batch size is invalid");
+    const auto& a=*heads.front()->impl_;
+    std::uint32_t shared=a.rows;
+    for(auto* head:heads) {
+        const auto& b=*head->impl_;
+        if(b.config.full || !b.config.q4 || b.head!=a.head || b.config.hidden_size!=a.config.hidden_size ||
+           b.config.runner_up!=a.config.runner_up || b.runner_logits || !b.rows) return UINT32_MAX;
+        std::uint32_t n=0;const auto limit=std::min(shared,b.rows);
+        while(n<limit && a.host_ids[n]==b.host_ids[n]) ++n;
+        shared=n;
+    }
+    return shared;
+}
+void HipMtpDraftHead::launch_rows(std::span<HipMtpDraftHead* const> heads,std::span<const std::uint16_t* const> hidden,
+    std::uint32_t step,std::uint32_t shared,void* stream) {
+    require(!heads.empty() && heads.size()<=max_batch && hidden.size()==heads.size() && stream,"MTP draft head batch is invalid");
+    const auto& a=*heads.front()->impl_;
+    DraftHeadRows h{};std::uint32_t tail_blocks=0,partial_blocks=0;
+    for(std::size_t t=0;t<heads.size();++t) {
+        auto& p=*heads[t]->impl_;
+        require(step<p.config.max_depth && p.rows && p.config.q4 && !p.config.full && !p.runner_logits && p.head==a.head &&
+            p.config.hidden_size==a.config.hidden_size && p.config.runner_up==a.config.runner_up && shared<=p.rows && hidden[t],
+            "MTP draft head batch member is incompatible");
+        h.hidden[t]=hidden[t];h.compact[t]=p.compact;h.logits[t]=p.logits;h.rows[t]=p.rows;h.ids[t]=p.ids;
+        h.partials[t]=p.partials;h.slots[t]=p.slots;h.reply[t]=p.device_reply;
+        tail_blocks=std::max(tail_blocks,(p.rows-shared+7U)/8U);partial_blocks=std::max(partial_blocks,(p.rows-1U)/threads+1U);
+    }
+    const auto s=static_cast<hipStream_t>(stream);const auto n=static_cast<unsigned>(heads.size());
+    const auto blocks=a.config.hidden_size/32U;
+    if(shared) {
+        const dim3 grid((shared+7U)/8U);
+        switch(n) {
+        case 1:hipLaunchKernelGGL(HIP_KERNEL_NAME(draft_q4_head_shared<1U>),grid,dim3(256),0,s,h,blocks,shared);break;
+        case 2:hipLaunchKernelGGL(HIP_KERNEL_NAME(draft_q4_head_shared<2U>),grid,dim3(256),0,s,h,blocks,shared);break;
+        case 3:hipLaunchKernelGGL(HIP_KERNEL_NAME(draft_q4_head_shared<3U>),grid,dim3(256),0,s,h,blocks,shared);break;
+        case 4:hipLaunchKernelGGL(HIP_KERNEL_NAME(draft_q4_head_shared<4U>),grid,dim3(256),0,s,h,blocks,shared);break;
+        case 5:hipLaunchKernelGGL(HIP_KERNEL_NAME(draft_q4_head_shared<5U>),grid,dim3(256),0,s,h,blocks,shared);break;
+        case 6:hipLaunchKernelGGL(HIP_KERNEL_NAME(draft_q4_head_shared<6U>),grid,dim3(256),0,s,h,blocks,shared);break;
+        case 7:hipLaunchKernelGGL(HIP_KERNEL_NAME(draft_q4_head_shared<7U>),grid,dim3(256),0,s,h,blocks,shared);break;
+        default:hipLaunchKernelGGL(HIP_KERNEL_NAME(draft_q4_head_shared<8U>),grid,dim3(256),0,s,h,blocks,shared);break;
+        }
+        check(hipGetLastError(),"MTP draft Q4 head batch (shared rows)");
+    }
+    if(tail_blocks) {
+        hipLaunchKernelGGL(draft_q4_head_tails,dim3(tail_blocks,n),dim3(256),0,s,h,blocks,shared);
+        check(hipGetLastError(),"MTP draft Q4 head batch (own rows)");
+    }
+    if(a.config.runner_up) {
+        hipLaunchKernelGGL(draft_argmax_partials_rows<true>,dim3(partial_blocks,n),dim3(threads),0,s,h);
+        check(hipGetLastError(),"MTP draft argmax partials batch");
+        hipLaunchKernelGGL(draft_argmax_finish_rows<true>,dim3(1,n),dim3(threads),0,s,h,step);
+    } else {
+        hipLaunchKernelGGL(draft_argmax_partials_rows<false>,dim3(partial_blocks,n),dim3(threads),0,s,h);
+        check(hipGetLastError(),"MTP draft argmax partials batch");
+        hipLaunchKernelGGL(draft_argmax_finish_rows<false>,dim3(1,n),dim3(threads),0,s,h,step);
+    }
+    check(hipGetLastError(),"MTP draft argmax finish batch");
+}
 const std::uint32_t* HipMtpDraftHead::device_token(std::uint32_t step) const {
     require(step<impl_->config.max_depth,"MTP draft token slot is invalid");return impl_->slots+step;
 }
@@ -282,8 +433,10 @@ float HipMtpDraftHead::probability(std::uint32_t step) const {
     const auto& p=*impl_;require(step<p.config.max_depth,"MTP draft probability step is invalid");
     const volatile float* mapped=p.reply->probabilities;return mapped[step];
 }
-void HipMtpDraftHead::wait_step(std::uint32_t step,void* stream) const {
-    const auto& p=*impl_;require(step<p.config.max_depth && stream==p.stream,"MTP draft wait step/stream is invalid");
+void HipMtpDraftHead::wait_step(std::uint32_t step,void* raw_stream) const {
+    const auto& p=*impl_;require(step<p.config.max_depth && raw_stream,"MTP draft wait step/stream is invalid");
+    // The stream that carries the step: the head's own, or the multi-session draft batch stream.
+    const auto stream=static_cast<hipStream_t>(raw_stream);
     // STRIX_MTP_DRAFT_POLL=0 synchronises the stream as before.
     static const bool poll=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_POLL");return !v || v[0]!='0';}();
     if(poll) {
@@ -291,13 +444,13 @@ void HipMtpDraftHead::wait_step(std::uint32_t step,void* stream) const {
         for(unsigned spin=0;;++spin) {
             if(__atomic_load_n(&p.reply->completed,__ATOMIC_ACQUIRE)>step) return;
             if((spin&1023U)==1023U) {
-                const auto state=hipStreamQuery(p.stream);
+                const auto state=hipStreamQuery(stream);
                 if(state!=hipErrorNotReady) break; // idle or failed: the synchronisation returns or reports it
                 if(std::chrono::steady_clock::now()>deadline) break;
             }
         }
     }
-    check(hipStreamSynchronize(p.stream),"MTP draft early-stop step");
+    check(hipStreamSynchronize(stream),"MTP draft early-stop step");
 }
 void HipMtpDraftHead::read_logits(std::vector<float>& out) const {
     const auto& p=*impl_;out.resize(p.rows);

@@ -110,6 +110,16 @@ void hyper_mix_known_window_cohort_launch(std::span<const std::span<const Execut
     const HipHyperMixLauncherConfig& config);
 void hyper_mix_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipHyperMixLauncherConfig& config);
+// Prefill, STRIX_QPF2K_HC bits 1 / 2 (fast prefill profile): the full-T inject rows step that writes this HC step's input
+// streams (and, with combine_rows non-empty, the MoE-combine rows step whose output that inject reads) folded into the
+// HC normalisation (one kernel), then the HC projection and output kernels. Streams, combined rows and every HC output
+// are the bytes of the separate launches (STRIX_QPF2K_HC_CHECK=1 compares them). Returns false, with nothing enqueued,
+// when the views are not uniformly strided, do not chain or alias (the caller then launches the steps itself).
+bool hyper_mix_prefill_fold_enabled(bool combine);
+bool hyper_mix_known_prefill_rows_launch_folded(std::span<const ExecutionDispatchContext> combine_rows,
+    std::span<const ExecutionDispatchContext> inject_rows, std::span<const ExecutionDispatchContext> rows,
+    const HipHyperMixLauncherConfig& config, const HipElementwiseLauncherConfig& elementwise);
+std::uint64_t hip_hyper_mix_testing_prefill_folds();
 
 class HipHyperMixLauncherBundle {
 public:

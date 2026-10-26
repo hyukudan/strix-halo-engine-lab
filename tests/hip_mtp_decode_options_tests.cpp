@@ -1,4 +1,5 @@
 #include "../apps/hip_decode_options.hpp"
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -257,12 +258,90 @@ void campaign_defaults_contract(){
     require(parse(mode).mtp.ngram_off && !parse(mode).mtp.ngram_draft,"=off parses");
     mode=request();mode.push_back("--mtp-ngram-draft=auto");
     require(!parse(mode).mtp.ngram_off && !parse(mode).mtp.ngram_draft,"=auto parses");
+    require(!n.ngram_context && !n.ngram_copy_edit,"the context drafter is never a default");
+    mode=request();mode.push_back("--mtp-ngram-draft=copy");
+    reject(mode,"copy still requires the chain and prefix windows");
+    mode=request();mode.push_back("--mtp-ngram-draft=ctx");
+    reject(mode,"ctx still requires the chain and prefix windows");
+    mode=request();mode.insert(mode.end(),{"--mtp-draft-chain","--mtp-target-window-rows","8","--mtp-window-prefix",
+        "--mtp-window-capture-bytes","8192","--mtp-window-checkpoint-bytes","8192",
+        "--mtp-window-total-bytes","32768","--mtp-window-arena-bytes","8192",
+        "--mtp-window-history-intervals","32","--mtp-ngram-draft=copy"});
+    set(mode,"--mtp-candidate-depth","7");
+    const auto copied=parse(mode).mtp;
+    require(copied.ngram_draft && copied.ngram_context && copied.ngram_copy_edit && !copied.ngram_off,
+        "copy parses as a required context drafter with the exact window prerequisites");
+    mode.back()="--mtp-ngram-draft=ctx";
+    const auto context=parse(mode).mtp;
+    require(context.ngram_draft && context.ngram_context && !context.ngram_copy_edit,"ctx parses without copy-first");
+    mode.back()="--mtp-ngram-draft=wide";
+    const auto wide_only=parse(mode).mtp;
+    require(wide_only.ngram_draft && wide_only.ngram_context && wide_only.ngram_copy_edit && wide_only.ngram_wide_only,
+        "wide parses as the extension plus an observing copy drafter");
+    require(!copied.ngram_wide_only && !context.ngram_wide_only && !n.ngram_wide_only,"only =wide is observe-only");
     mode=request();mode.push_back("--mtp-ngram-draft=maybe");
-    reject_as(mode,"--mtp-ngram-draft is on, off or auto","an unknown n-gram mode is rejected");
+    reject_as(mode,"--mtp-ngram-draft is on, off, auto, ctx, copy or wide","an unknown n-gram mode is rejected");
     mode=request();mode.insert(mode.end(),{"--mtp-ngram-draft=off","--mtp-ngram-draft"});
     reject(mode,"duplicate n-gram option rejected");
     mode=request();mode.push_back("--mtp-ngram-draft");
     reject(mode,"an explicit n-gram draft still requires the chain and prefix windows");
+
+    // --mtp-copy-wide-rows: off by default; 32, 16 or 32,16 need =copy on the tiled MTP prompt and add their tail blocks.
+    require(parse(request()).mtp.copy_wide_rows.empty(),"wide copy verify is off by default");
+    auto wide=request();wide.insert(wide.end(),{"--mtp-draft-chain","--mtp-target-window-rows","8","--mtp-window-prefix",
+        "--mtp-window-capture-bytes","8192","--mtp-window-checkpoint-bytes","8192",
+        "--mtp-window-total-bytes","32768","--mtp-window-arena-bytes","8192",
+        "--mtp-window-history-intervals","32","--mtp-ngram-draft=copy","--mtp-calibration-rows","2",
+        "--known-prefix-window","--known-prefix-full-rows","--known-prefix-prefill-rows","256",
+        "--known-prefix-workspace-budget-bytes","1","--known-prefix-host-metadata-budget-bytes","2",
+        "--known-prefix-uma-budget-bytes","1","--known-prefix-host-headroom-bytes","0"});
+    set(wide,"--mtp-candidate-depth","7");
+    const auto narrow=parse(wide);
+    require(narrow.mtp.copy_wide_rows.empty() && narrow.known_prefix_tail_rows==std::vector<std::uint32_t>{64U,16U},
+        "the tiled copy route keeps its default tails without the wide option");
+    auto wide32=wide;wide32.insert(wide32.end(),{"--mtp-copy-wide-rows","32"});
+    const auto parsed_wide=parse(wide32);
+    require(parsed_wide.mtp.copy_wide_rows==std::vector<std::uint32_t>{32U} && parsed_wide.known_prefix_tail_rows==std::vector<std::uint32_t>{64U,32U,16U},
+        "--mtp-copy-wide-rows 32 parses and adds the 32-row tail block in descending order");
+    auto off=wide;off.push_back("--mtp-copy-wide-rows=0");
+    require(parse(off).mtp.copy_wide_rows.empty(),"an explicit 0 keeps the feature off");
+    for(const auto* bad:{"31","64","8","16,32","32,32","32,16,16","0,32"}) {
+        auto other=wide;other.insert(other.end(),{"--mtp-copy-wide-rows",bad});
+        reject_as(other,"MTP copy wide rows must be 0 or a descending list of distinct 32/16",
+            "wide rows other than 0 or a descending list from 32 and 16 are rejected");
+    }
+    auto both=wide;both.insert(both.end(),{"--mtp-copy-wide-rows","32,16"});
+    const auto parsed_both=parse(both);
+    require(parsed_both.mtp.copy_wide_rows==std::vector<std::uint32_t>{32U,16U} &&
+        parsed_both.known_prefix_tail_rows==std::vector<std::uint32_t>{64U,32U,16U},
+        "--mtp-copy-wide-rows 32,16 parses largest first and adds every listed tail block once");
+    auto only16=wide;only16.push_back("--mtp-copy-wide-rows=16");
+    const auto parsed16=parse(only16);
+    require(parsed16.mtp.copy_wide_rows==std::vector<std::uint32_t>{16U} &&
+        parsed16.known_prefix_tail_rows==std::vector<std::uint32_t>{64U,16U},"a single 16 keeps the default tails");
+    auto missing16=both;missing16.insert(missing16.end(),{"--known-prefix-tail-rows","64,32"});
+    reject_as(missing16,"--mtp-copy-wide-rows requires a tiled tail block of each listed size "
+        "(--known-prefix-tail-rows including it, below --known-prefix-prefill-rows)","explicit tails must include every wide size");
+    const auto wide_requires="--mtp-copy-wide-rows requires --mtp-ngram-draft=copy or =wide on the tiled MTP prompt, "
+        "one request and no golden dump";
+    auto ctx=wide32;for(auto& value:ctx)if(value=="--mtp-ngram-draft=copy")value="--mtp-ngram-draft=ctx";
+    reject_as(ctx,wide_requires,"wide rows require copy mode, not ctx");
+    auto no_copy=wide32;no_copy.erase(std::find(no_copy.begin(),no_copy.end(),std::string("--mtp-ngram-draft=copy")));
+    reject_as(no_copy,wide_requires,"wide rows require the copy drafter");
+    auto wide_mode=wide32;for(auto& value:wide_mode)if(value=="--mtp-ngram-draft=copy")value="--mtp-ngram-draft=wide";
+    const auto parsed_mode=parse(wide_mode).mtp;
+    require(parsed_mode.ngram_wide_only && parsed_mode.copy_wide_rows==std::vector<std::uint32_t>{32U},"wide rows accept =wide");
+    auto serial_prompt=request();serial_prompt.insert(serial_prompt.end(),{"--mtp-draft-chain","--mtp-target-window-rows","8",
+        "--mtp-window-prefix","--mtp-window-capture-bytes","8192","--mtp-window-checkpoint-bytes","8192",
+        "--mtp-window-total-bytes","32768","--mtp-window-arena-bytes","8192","--mtp-window-history-intervals","32",
+        "--mtp-ngram-draft=copy","--mtp-copy-wide-rows","32"});
+    set(serial_prompt,"--mtp-candidate-depth","7");
+    reject_as(serial_prompt,wide_requires,"wide rows require the tiled MTP prompt");
+    auto no_tail=wide32;no_tail.insert(no_tail.end(),{"--known-prefix-tail-rows","64,16"});
+    reject_as(no_tail,"--mtp-copy-wide-rows requires a tiled tail block of each listed size "
+        "(--known-prefix-tail-rows including it, below --known-prefix-prefill-rows)","explicit tails must include the wide rows");
+    auto with_tail=wide32;with_tail.insert(with_tail.end(),{"--known-prefix-tail-rows","128,32"});
+    require(parse(with_tail).known_prefix_tail_rows==std::vector<std::uint32_t>{128U,32U},"explicit tails including 32 are kept");
 }
 
 int main(){try{

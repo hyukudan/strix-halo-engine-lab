@@ -7,6 +7,7 @@
 #include <bit>
 #include <cmath>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 
@@ -52,7 +53,7 @@ __device__ float rounded(float v,HipMtpInputRounding rounding) {
 // Threads >= 256 (when launched wider) only join the element-wise output pass: the sum and
 // its 256-lane tree are the first 256 threads' exactly as in a 256-thread launch.
 template<unsigned Threads=256U>
-__global__ __launch_bounds__(Threads) void mtp_input_norms(HipMtpInputFusionRequest r) {
+__device__ __forceinline__ void mtp_input_norms_body(const HipMtpInputFusionRequest& r) {
     __shared__ float sums[256];
     __shared__ float shared_inverse;
     const unsigned lane=threadIdx.x;
@@ -75,6 +76,16 @@ __global__ __launch_bounds__(Threads) void mtp_input_norms(HipMtpInputFusionRequ
         const float normalized=load_value(input,i,storage)*inverse;
         out[i]=rounded(normalized*gain,r.normalized_rounding);
     }
+}
+template<unsigned Threads=256U>
+__global__ __launch_bounds__(Threads) void mtp_input_norms(HipMtpInputFusionRequest r) {mtp_input_norms_body<Threads>(r);}
+// Draft batch: token blockIdx.y runs the one-token norms on its own views (same body, same bits).
+template<unsigned Threads=256U>
+__global__ __launch_bounds__(Threads) void mtp_input_norms_rows(HipMtpInputFusionRequest r,HipMtpInputFusionRows rows) {
+    auto q=r;
+    q.embedding.address=rows.embedding[blockIdx.y];q.wide_hidden.address=rows.wide_hidden[blockIdx.y];
+    q.normalized_scratch.address=rows.normalized[blockIdx.y];
+    mtp_input_norms_body<Threads>(q);
 }
 __device__ float coefficient(const unsigned char* row,unsigned column) {
     const auto* block=row+(column/32U)*34U;
@@ -210,6 +221,62 @@ __global__ __launch_bounds__(256) void mtp_input_projections_wave_rows(HipMtpInp
         }
     }
 }
+// Draft batch: mtp_input_projections_wave_rows with one output row per wave and Count tokens. The wave
+// decodes its row's codes once per column group; every token keeps the one-token kernel's chains (same
+// column groups, the same rounded es*code and ws*code products, element and stream order, same tree and
+// rounding/output casts). Rows per wave only regroup independent rows, so R=1 here matches any R there.
+// Tokens come in groups of Count per block (blockIdx.y = group, `total` tokens): 40 accumulators per token, so a
+// group of 8 spilled (t3 trace: 1.9 ms at 8 tokens against 42 us for one); groups only regroup independent tokens.
+template<bool Q4,unsigned Count>
+__global__ __launch_bounds__(256) void mtp_input_projections_batch(HipMtpInputFusionRequest r,HipMtpInputFusionRows all,
+    const unsigned char* weights,unsigned total) {
+    constexpr unsigned block=Q4?18U:34U,hc=4U;
+    const unsigned lane=threadIdx.x%32U,row=blockIdx.x*8U+threadIdx.x/32U,h=r.hidden_size;
+    if(row>=h)return;
+    const unsigned first=blockIdx.y*Count,valid=total-first<Count?total-first:Count;
+    HipMtpInputFusionRows rows{};
+#pragma unroll
+    for(unsigned t=0;t<Count;++t){const auto u=first+(t<valid?t:0U);rows.normalized[t]=all.normalized[u];rows.output[t]=all.output[u];}
+    const auto* packed=weights+static_cast<std::uint64_t>(row)*(2U*h/32U)*block;
+    float embedding[Count],sums[Count][hc];
+#pragma unroll
+    for(unsigned t=0;t<Count;++t){embedding[t]=0.0F;for(unsigned s=0;s<hc;++s)sums[t][s]=0.0F;}
+    for(unsigned base=8U*lane;base<h;base+=256U) {
+        const auto* e=packed+(base/32U)*block;const auto* w=packed+((h+base)/32U)*block;
+        const float es=__half2float(*reinterpret_cast<const __half*>(e)),ws=__half2float(*reinterpret_cast<const __half*>(w));
+        float ec[8],wc[8];
+#pragma unroll
+        for(unsigned i=0;i<8U;++i){ec[i]=es*block_code<Q4>(e,base%32U+i);wc[i]=ws*block_code<Q4>(w,base%32U+i);}
+#pragma unroll
+        for(unsigned t=0;t<Count;++t) {
+            const auto* input=reinterpret_cast<const float*>(rows.normalized[t]);
+#pragma unroll
+            for(unsigned i=0;i<8U;++i) {
+                embedding[t]=fmaf(ec[i],input[base+i],embedding[t]);
+#pragma unroll
+                for(unsigned s=0;s<hc;++s) sums[t][s]=fmaf(wc[i],input[h+s*h+base+i],sums[t][s]);
+            }
+        }
+    }
+#pragma unroll
+    for(unsigned t=0;t<Count;++t) {
+        for(unsigned d=16U;d;d>>=1U) {
+            embedding[t]+=__shfl_xor(embedding[t],static_cast<int>(d),32);
+            for(unsigned s=0;s<hc;++s) sums[t][s]+=__shfl_xor(sums[t][s],static_cast<int>(d),32);
+        }
+    }
+    if(lane)return;
+#pragma unroll
+    for(unsigned t=0;t<Count;++t) {
+        if(t>=valid) break;
+        const float projected=rounded(embedding[t],r.projection_rounding);
+        for(unsigned s=0;s<hc;++s) {
+            const float v=projected+rounded(sums[t][s],r.projection_rounding);
+            if(r.output_storage==HipMtpInputStorage::bf16)reinterpret_cast<std::uint16_t*>(rows.output[t])[s*h+row]=to_bf16(v);
+            else reinterpret_cast<float*>(rows.output[t])[s*h+row]=v;
+        }
+    }
+}
 template<bool Q4>
 __global__ __launch_bounds__(256) void mtp_input_projections_wave(HipMtpInputFusionRequest r,const unsigned char* weights) {
     constexpr unsigned block=Q4?18U:34U;
@@ -314,5 +381,40 @@ void launch_hip_mtp_input_fusion_draft(const HipMtpInputFusionRequest& r,void* r
     else if(q4) hipLaunchKernelGGL(mtp_input_projections_wave<true>,dim3((r.hidden_size+7U)/8U),dim3(256U),0U,stream,r,q4);
     else hipLaunchKernelGGL(mtp_input_projections_wave<false>,dim3((r.hidden_size+7U)/8U),dim3(256U),0U,stream,r,q8);
     check(hipGetLastError(),"MTP draft fused projection launch");
+}
+void launch_hip_mtp_input_fusion_draft_rows(std::span<const HipMtpInputFusionRequest> requests,void* raw_stream) {
+    if(requests.empty() || requests.size()>8U || !raw_stream)throw std::invalid_argument("MTP input fusion batch size/stream is invalid");
+    const auto& r=requests.front();
+    HipMtpInputFusionRows rows{};
+    for(std::size_t t=0;t<requests.size();++t) {
+        const auto& q=requests[t];
+        preflight_hip_mtp_input_fusion(q);
+        // Only per-session views may differ: the profile, weights and norms are the batch's.
+        if(hip_mtp_input_fusion_profile_identity(q)!=hip_mtp_input_fusion_profile_identity(r) ||
+           q.embedding_norm.address!=r.embedding_norm.address || q.hidden_norm.address!=r.hidden_norm.address ||
+           q.packed_projection.address!=r.packed_projection.address || q.projection_row_stride_bytes!=r.projection_row_stride_bytes ||
+           q.embedding.bytes!=r.embedding.bytes || q.wide_hidden.bytes!=r.wide_hidden.bytes ||
+           q.normalized_scratch.bytes!=r.normalized_scratch.bytes || q.output.bytes!=r.output.bytes)
+            throw std::invalid_argument("MTP input fusion batch requests differ beyond their per-session views");
+        rows.embedding[t]=q.embedding.address;rows.wide_hidden[t]=q.wide_hidden.address;
+        rows.normalized[t]=q.normalized_scratch.address;rows.output[t]=q.output.address;
+    }
+    const auto* q8=reinterpret_cast<const unsigned char*>(r.packed_projection.address);
+    const auto* q4=static_cast<const unsigned char*>(hip_mtp_draft_q4(q8));
+    // The batch reproduces the one-token draft launcher's production branch only (Q4 copy, HC 4).
+    if(!q4 || r.hc_count!=4U)throw std::invalid_argument("MTP input fusion batch needs the Q4 copy and four HC streams");
+    const auto stream=static_cast<hipStream_t>(raw_stream);
+    const auto n=static_cast<unsigned>(requests.size());
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_norms_rows<1024U>),dim3(2U,n),dim3(1024U),0U,stream,r,rows);
+    check(hipGetLastError(),"MTP input norms batch launch");
+    // STRIX_MTP_DRAFT_BATCH_PROJ_GROUP=1|2|4: tokens per block (default 2).
+    static const unsigned group=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_BATCH_PROJ_GROUP");
+        const unsigned g=v?static_cast<unsigned>(std::atoi(v)):2U;return g==1U||g==4U?g:2U;}();
+    const auto g=std::min(group,n);
+    const dim3 grid((r.hidden_size+7U)/8U,(n+g-1U)/g);
+    if(g==1U) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_projections_batch<true,1U>),grid,dim3(256U),0U,stream,r,rows,q4,n);
+    else if(g==2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_projections_batch<true,2U>),grid,dim3(256U),0U,stream,r,rows,q4,n);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_projections_batch<true,4U>),grid,dim3(256U),0U,stream,r,rows,q4,n);
+    check(hipGetLastError(),"MTP draft fused projection batch launch");
 }
 } // namespace strix

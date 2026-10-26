@@ -5,11 +5,14 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <span>
 #include <cfenv>
 #include <cfloat>
 #include <cmath>
 #include <limits>
+#include <cstdlib>
 #include <stdexcept>
+#include <string_view>
 
 namespace strix::moe_q4k_a8 {
 namespace {
@@ -137,7 +140,14 @@ float evaluate_row(std::span<const std::byte> weights, const QuantizedRow& row) 
 std::string_view numerical_identity_for_gate_type(std::uint32_t gate_type) {
     if (gate_type == 12) return numerical_identity;
     if (gate_type == 13) return q5k_numerical_identity;
-    throw std::invalid_argument("A8 gate/up requires type12 or type13");
+    if (gate_type == 42 && q20_a8_enabled()) return q20_numerical_identity;
+    if (q20_a8_enabled()) {
+        if (gate_type == 22) return iq2s_numerical_identity;
+        if (gate_type == 18) return iq3xxs_numerical_identity;
+        if (gate_type == 21) return iq3s_numerical_identity;
+        if (gate_type == 23) return iq4xs_numerical_identity;
+    }
+    throw std::invalid_argument("A8 gate/up requires type12 or type13 (or type42 with STRIX_GSQ_Q20_A8=1)");
 }
 std::array<std::uint8_t,32> decode_q5k_codes(std::span<const std::byte> block, std::uint32_t group) {
     check(block.size() == 176 && group < 8, "Q5K block/group invalid");
@@ -199,6 +209,136 @@ float evaluate_q5k_row(std::span<const std::byte> weights, const QuantizedRow& r
     check(std::isfinite(left) && std::isfinite(right) && std::isfinite(result), "Q5K A8 combine overflow/nonfinite");
     return result;
 }
+float evaluate_q20_row(std::span<const std::byte> weights, const QuantizedRow& row) {
+    require_f32_environment(); check_row(row);
+    check(weights.size() == row.codes.size()/64U*18U, "Q2_0 packed row size mismatch");
+    std::array<float,8> lanes{};
+    for (std::size_t group = 0; group < row.deltas.size(); ++group) {
+        const auto* block = weights.data() + (group/2U)*18U;
+        std::int64_t integer = 0;
+        for (unsigned j = 0; j < 32; ++j) {
+            const auto element = (group%2U)*32U + j;
+            const auto q = (byte(block[2U + element/4U]) >> (2U*(element%4U))) & 3U;
+            integer += static_cast<std::int64_t>(q)*row.codes[group*32U+j];
+        }
+        const auto difference = integer - row.sums[group];
+        check(std::abs(difference) <= 16256, "Q2_0 integer bound violated");
+        const float d = half_bits_to_float(le16(block));
+        check(std::isfinite(d), "Q2_0 A8 header must be finite");
+        const float scaled = d*static_cast<float>(difference);
+        const float value = row.deltas[group]*scaled;
+        lanes[group%8U] = lanes[group%8U]+value;
+        check(std::isfinite(scaled) && std::isfinite(value) && std::isfinite(lanes[group%8U]),
+            "Q2_0 A8 accumulation outside qualified scope");
+    }
+    const float a01 = lanes[0]+lanes[1], a23 = lanes[2]+lanes[3], a45 = lanes[4]+lanes[5], a67 = lanes[6]+lanes[7];
+    const float left = a01+a23, right = a45+a67;
+    const float result = left+right;
+    check(std::isfinite(result), "Q2_0 A8 combine overflow/nonfinite");
+    return result;
+}
+namespace {
+constexpr std::uint64_t gsq_iq2s_grid[1024] = {
+#include "strix/qwen_iq2_s_grid.inc"
+};
+constexpr std::uint32_t gsq_iq3xxs_grid[256] = {
+#include "strix/qwen_iq3_xxs_grid.inc"
+};
+constexpr std::uint32_t gsq_iq3s_grid[512] = {
+#include "strix/qwen_iq3_s_grid.inc"
+};
+constexpr std::array<std::int8_t,16> gsq_kvalues{-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+std::uint32_t u8(std::span<const std::byte> b, std::size_t at) { return byte(b[at]); }
+}
+GsqGroup gsq_iq_group(std::uint32_t type, std::span<const std::byte> row, std::uint32_t group) {
+    const std::uint32_t be = type == 20 ? 32U : 256U;
+    const std::uint32_t bb = type == 20 ? 18U : type == 22 ? 82U : type == 18 ? 98U : type == 21 ? 110U : type == 23 ? 136U : 0U;
+    check(bb != 0, "GSQ IQ group type invalid");
+    const auto x = row.subspan(static_cast<std::size_t>(group * 32U / be) * bb, bb);
+    const std::uint32_t ib = (group * 32U % be) / 32U;
+    const float d = half_bits_to_float(le16(x.data()));
+    GsqGroup r{};
+    if (type == 20 || type == 23) {
+        const std::size_t qs = type == 20 ? 2U : 8U + ib * 16U;
+        if (type == 20) r.s0 = d;
+        else {
+            const std::uint32_t scales_h = u8(x, 2) | (u8(x, 3) << 8U);
+            const int ls = static_cast<int>(((u8(x, 4U + ib / 2U) >> (4U * (ib % 2U))) & 0xFU) | (((scales_h >> (2U * ib)) & 3U) << 4U));
+            r.s0 = d * static_cast<float>(ls - 32);
+        }
+        for (unsigned j = 0; j < 16; ++j) {
+            r.v[j] = gsq_kvalues[u8(x, qs + j) & 15U];
+            r.v[j + 16U] = gsq_kvalues[u8(x, qs + j) >> 4U];
+        }
+    } else if (type == 21) {
+        const std::uint32_t nib = ib % 2U == 0U ? (u8(x, 106U + ib / 2U) & 15U) : (u8(x, 106U + ib / 2U) >> 4U);
+        r.s0 = d * static_cast<float>(1 + 2 * static_cast<int>(nib));
+        const std::uint32_t qh = u8(x, 66U + ib);
+        for (unsigned l = 0; l < 4; ++l) for (unsigned second = 0; second < 2; ++second) {
+            const auto grid = gsq_iq3s_grid[u8(x, 2U + ib * 8U + 2U * l + second) | ((qh << (8U - 2U * l - second)) & 256U)];
+            const auto signs = u8(x, 74U + ib * 4U + l);
+            for (unsigned j = 0; j < 4; ++j) {
+                const auto e = second * 4U + j;
+                const int g = static_cast<int>((grid >> (8U * j)) & 255U);
+                r.v[l * 8U + e] = static_cast<std::int8_t>((signs >> e) & 1U ? -g : g);
+            }
+        }
+    } else if (type == 18) {
+        const std::uint32_t aux = u8(x, 66U + 4U * ib) | (u8(x, 67U + 4U * ib) << 8U) | (u8(x, 68U + 4U * ib) << 16U) | (u8(x, 69U + 4U * ib) << 24U);
+        r.s0 = (d * (0.5F + static_cast<float>(aux >> 28U))) * 0.5F;
+        for (unsigned l = 0; l < 4; ++l) {
+            const std::uint32_t s7 = (aux >> (7U * l)) & 127U;
+            const std::uint32_t signs = s7 | ((static_cast<std::uint32_t>(std::popcount(s7)) & 1U) << 7U);
+            for (unsigned second = 0; second < 2; ++second) {
+                const auto grid = gsq_iq3xxs_grid[u8(x, 2U + ib * 8U + 2U * l + second)];
+                for (unsigned j = 0; j < 4; ++j) {
+                    const auto e = second * 4U + j;
+                    const int g = static_cast<int>((grid >> (8U * j)) & 255U);
+                    r.v[l * 8U + e] = static_cast<std::int8_t>((signs >> e) & 1U ? -g : g);
+                }
+            }
+        }
+    } else {  // 22
+        const std::uint32_t sc = u8(x, 74U + ib), qh = u8(x, 66U + ib);
+        r.s0 = (d * (0.5F + static_cast<float>(sc & 15U))) * 0.25F;
+        r.s1 = (d * (0.5F + static_cast<float>(sc >> 4U))) * 0.25F;
+        for (unsigned l = 0; l < 4; ++l) {
+            const auto grid = gsq_iq2s_grid[u8(x, 2U + ib * 4U + l) | ((qh << (8U - 2U * l)) & 0x300U)];
+            const auto signs = u8(x, 34U + ib * 4U + l);
+            for (unsigned j = 0; j < 8; ++j) {
+                const int g = static_cast<int>((grid >> (8U * j)) & 255U);
+                r.v[l * 8U + j] = static_cast<std::int8_t>((signs >> j) & 1U ? -g : g);
+            }
+        }
+    }
+    return r;
+}
+float evaluate_gsq_row(std::uint32_t type, std::span<const std::byte> weights, const QuantizedRow& row) {
+    if (type == 42) return evaluate_q20_row(weights, row);
+    require_f32_environment(); check_row(row);
+    std::array<float,8> lanes{};
+    for (std::size_t group = 0; group < row.deltas.size(); ++group) {
+        const auto g = gsq_iq_group(type, weights, static_cast<std::uint32_t>(group));
+        std::int64_t i0 = 0, i1 = 0;
+        for (unsigned j = 0; j < 32; ++j) (j < 16 ? i0 : i1) += static_cast<std::int64_t>(g.v[j]) * row.codes[group*32U+j];
+        float value;
+        if (type == 22) {
+            const float u0 = g.s0*static_cast<float>(i0), u1 = g.s1*static_cast<float>(i1);
+            const float t = u0+u1;
+            value = row.deltas[group]*t;
+        } else {
+            const float scaled = g.s0*static_cast<float>(i0+i1);
+            value = row.deltas[group]*scaled;
+        }
+        lanes[group%8U] = lanes[group%8U]+value;
+        check(std::isfinite(value) && std::isfinite(lanes[group%8U]), "GSQ IQ A8 accumulation outside qualified scope");
+    }
+    const float a01 = lanes[0]+lanes[1], a23 = lanes[2]+lanes[3], a45 = lanes[4]+lanes[5], a67 = lanes[6]+lanes[7];
+    const float left = a01+a23, right = a45+a67;
+    const float result = left+right;
+    check(std::isfinite(result), "GSQ IQ A8 combine overflow/nonfinite");
+    return result;
+}
 void validate(const Request& request, const Bindings& b) {
     check(request.enabled && request.approved_numerical_identity == numerical_identity_for_gate_type(request.gate_type),
         "Q4K A8 probe requires explicit matching numerical identity approval");
@@ -209,7 +349,9 @@ void validate(const Request& request, const Bindings& b) {
     check(request.input == InputKind::bf16 || request.input == InputKind::fp32, "Q4K A8 input storage unsupported");
     check(request.gate_type == request.up_type && !request.fused_gate_up,
         "A8 prototype requires separate matching type12 or type13 gate/up tensors");
-    const std::uint64_t block_bytes = request.gate_type == 13 ? 176U : 144U;
+    const std::uint64_t block_bytes = request.gate_type == 13 ? 176U : request.gate_type == 42 ? 72U :  // per 256
+        request.gate_type == 22 ? 82U : request.gate_type == 18 ? 98U : request.gate_type == 21 ? 110U :
+        request.gate_type == 23 ? 136U : 144U;
     const std::uint64_t weight_bytes = static_cast<std::uint64_t>(s.experts)*s.rows*(s.hidden/256U)*block_bytes;
     const std::uint64_t output_bytes = static_cast<std::uint64_t>(s.top_k)*2U*s.rows*4U;
     const std::array<DeviceBytes,9> views{b.input,b.gate,b.up,b.routes,b.codes,b.deltas,b.sums,b.status,b.output};

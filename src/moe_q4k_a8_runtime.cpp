@@ -1,5 +1,7 @@
 #include "strix/moe_q4k_a8_runtime.hpp"
 #include "strix/q6p_registry.hpp"
+#include "strix/moe_q4k_a8_contract.hpp"
+#include "strix/gsq_a8_groups.hpp"
 #include <array>
 #include <limits>
 #include <stdexcept>
@@ -28,6 +30,10 @@ std::uint64_t weight_bytes(std::uint32_t type, std::uint64_t input,
     case 13: block = 256; bytes = 176; break;
     case 20: block = 32; bytes = 18; break;
     case 23: block = 256; bytes = 136; break;
+    case 18: block = 256; bytes = 98; break;    // GSQ-RCO IQ3_XXS
+    case 21: block = 256; bytes = 110; break;   // GSQ-RCO IQ3_S
+    case 22: block = 256; bytes = 82; break;    // GSQ-RCO IQ2_S
+    case 42: block = 64; bytes = 18; break;     // GSQ-RCO Q2_0
     default: throw std::invalid_argument("Q4K A8 runtime unsupported down type");
     }
     if (input % block != 0) throw std::invalid_argument("Q4K A8 weight block width mismatch");
@@ -114,6 +120,15 @@ RuntimeLayerClassification classify_runtime_manifest(
         const auto& ts = layers[layer];
         if (!ts[0] || !ts[1] || !ts[2])
             throw std::invalid_argument("Q4K A8 routed tensor family is missing");
+        if (gsq_a8::gate_type(ts[0]->ggml_type) && ts[1]->ggml_type == ts[0]->ggml_type && q20_a8_enabled()) {
+            check_tensor(*ts[0], model.hidden_size, model.moe_intermediate_size, model.num_experts);
+            check_tensor(*ts[1], model.hidden_size, model.moe_intermediate_size, model.num_experts);
+            check_tensor(*ts[2], model.moe_intermediate_size, model.hidden_size, model.num_experts);
+            if (!gsq_a8::down_type(ts[2]->ggml_type) && ts[2]->ggml_type != 7 && ts[2]->ggml_type != 8)
+                throw std::invalid_argument("GSQ A8 gate/up requires a Q2_0, IQ4_NL, Q5_1 or Q8_0 down");
+            result.q20_layers.push_back(layer);
+            continue;
+        }
         if (ts[0]->ggml_type != ts[1]->ggml_type ||
             (ts[0]->ggml_type != 12 && ts[0]->ggml_type != 13))
             throw std::invalid_argument("Q4K A8 requires paired Q4K or Q5K gate/up");
@@ -128,14 +143,23 @@ RuntimeLayerClassification classify_runtime_manifest(
         if(ts[0]->ggml_type==13 && ts[2]->ggml_type==8)
             result.q5k_with_q80_down_layers.push_back(layer);
     }
-    if (result.quantized_layers.empty()) throw std::invalid_argument("Q4K A8 requires a Q4K routed layer");
+    if (result.quantized_layers.empty() && result.q20_layers.size() != model.hidden_layers)
+        throw std::invalid_argument("Q4K A8 requires a Q4K routed layer");
     return result;
+}
+GsqPrefillRows& gsq_prefill_rows() {
+    static GsqPrefillRows rows;
+    return rows;
+}
+bool q20_manifest(const RuntimeLayerClassification& c) {
+    return q20_a8_enabled() && !c.q20_layers.empty() && c.quantized_layers.empty() && c.legacy_q5k_layers.empty();
 }
 void validate_slot_parallel_manifest(const ModelContract& model, const RuntimeLayerClassification& classification) {
     if (!model.validate().empty() || model.hidden_layers != 48U || model.hidden_size != 2560U ||
         model.moe_intermediate_size != 640U || model.num_experts != 512U ||
         model.num_experts_per_token != 10U || model.bytes_fp32 != 4U)
         throw std::invalid_argument("Q5_1 slot-parallel down requires canonical 48-layer geometry");
+    if (q20_manifest(classification)) return;  // no Q5_1 slot-parallel layer; every layer runs the A8 down
     std::vector<std::uint32_t> expected;
     for (std::uint32_t layer = 0; layer < 48U; ++layer)
         if (layer != 2U && layer != 4U && layer != 30U && layer != 46U && layer != 47U)
@@ -150,6 +174,10 @@ void validate_a8_down_manifest(const ModelContract& model,
     if (q80 && !q51)
         throw std::invalid_argument("Q8_0 A8 down phase b requires the Q5_1 A8 down profile");
     validate_slot_parallel_manifest(model, classification);
+    if (q20_manifest(classification)) {
+        if (classification.q20_layers.size() != 48U) throw std::invalid_argument("Q2_0 A8 requires every routed layer");
+        return;
+    }
     std::vector<std::uint32_t> q4k;
     for (std::uint32_t layer = 0; layer < 48U; ++layer)
         if (layer != 2U) q4k.push_back(layer);
@@ -162,6 +190,7 @@ void validate_a8_down_manifest(const ModelContract& model,
 void validate_q5k_a8_manifest(const ModelContract& model,
     const RuntimeLayerClassification& classification) {
     validate_a8_down_manifest(model, classification, true, true);
+    if (q20_manifest(classification)) return;  // no Q5_K layer: the Q5_K recipe flag has nothing to select
     if (classification.legacy_q5k_layers != std::vector<std::uint32_t>{2U} ||
         classification.q5k_with_q80_down_layers != std::vector<std::uint32_t>{2U})
         throw std::invalid_argument("Q5_K A8 requires only canonical layer 2 paired with Q8_0 down");
@@ -172,7 +201,9 @@ void validate_a8_down_content(const ModelContentIdentity& content) {
     constexpr std::array<std::uint8_t,32> expected{
         0x37,0x26,0xd6,0xf0,0xd9,0xba,0x30,0xb9,0xd6,0x55,0xba,0x30,0x35,0x95,0x11,0x89,
         0x41,0xba,0xec,0xa5,0xe6,0x94,0x5f,0xc8,0x78,0x5f,0x93,0x8e,0x0f,0x54,0x55,0xe4};
-    if (content.bytes != expected && !q6p::derived_content_admitted(content.bytes.data()))
+    // STRIX_GSQ_Q20_A8=1 is the explicit opt-in that admits a GSQ-RCO file (or hybrid) for the A8 path;
+    // its kernels carry their own numerical identity and CPU oracle (moe_q4k_a8_contract).
+    if (content.bytes != expected && !q6p::derived_content_admitted(content.bytes.data()) && !q20_a8_enabled())
         throw std::invalid_argument("A8 down requires the admitted model content identity");
 }
 }  // namespace strix::moe_q4k_a8

@@ -1,5 +1,7 @@
 #include "strix/hip_model_residency.hpp"
 #include <algorithm>
+#include <cstdlib>
+#include <string_view>
 #include <limits>
 #include <stdexcept>
 namespace strix {
@@ -26,10 +28,13 @@ std::string_view hip_model_copy_tier_name(HipModelCopyTier tier) {
     case HipModelCopyTier::normalization: return "normalization";
     case HipModelCopyTier::hot_nonexpert: return "hot_nonexpert";
     case HipModelCopyTier::experts: return "experts";
+    case HipModelCopyTier::all: return "all";
     }
     throw std::invalid_argument("invalid model copy tier");
 }
 bool selective_copy_eligible(const ManifestTensor& tensor, HipModelCopyTier tier) noexcept {
+    if (tier == HipModelCopyTier::all)
+        return tensor.placement.kind == PlacementKind::local && tensor.residency != ResidencyPolicy::file_backed_candidate;
     if (tensor.placement.kind != PlacementKind::local || tensor.residency != ResidencyPolicy::resident)
         return false;
     if (tier == HipModelCopyTier::normalization) return tensor.role == TensorRole::normalization;
@@ -42,6 +47,22 @@ bool selective_copy_eligible(const ManifestTensor& tensor, HipModelCopyTier tier
     default: return false;
     }
 }
+std::uint64_t selective_copy_payload_bytes(const ModelManifest& manifest, HipModelCopyTier tier) noexcept {
+    std::uint64_t total = 0;
+    for (const auto& tensor : manifest.tensors)
+        if (selective_copy_eligible(tensor, tier)) total += tensor.byte_size;
+    return total;
+}
+unsigned hip_model_copy_all_mode() noexcept {
+    static const unsigned mode = [] {
+        const char* v = std::getenv("STRIX_MODEL_COPY_ALL");
+        if (!v || !v[0] || v[0] == '0') return 0U;
+        if (std::string_view(v) == "fine") return 2U;
+        if (std::string_view(v) == "uc") return 3U;
+        return 1U;
+    }();
+    return mode;
+}
 SelectiveCopyPlan build_selective_copy_plan(const ModelManifest& manifest,
     const HipModelResidencyPolicy& policy, std::uint64_t file_bytes, std::uint64_t page) {
     (void)hip_model_copy_tier_name(policy.copy_tier);
@@ -52,8 +73,8 @@ SelectiveCopyPlan build_selective_copy_plan(const ModelManifest& manifest,
     }
     if (policy.mode != HipModelResidencyMode::registered_file_mapping || policy.promote_file_backed_candidates)
         throw std::invalid_argument("selective model copy requires registered mode without file candidate promotion");
-    if (policy.copy_tier == HipModelCopyTier::experts && policy.coalesce_gap_bytes)
-        throw std::invalid_argument("expert model copy requires zero registration coalescing gap");
+    if ((policy.copy_tier == HipModelCopyTier::experts || policy.copy_tier == HipModelCopyTier::all) && policy.coalesce_gap_bytes)
+        throw std::invalid_argument("expert/all model copy requires zero registration coalescing gap");
     if (!policy.copy_payload_bytes || !*policy.copy_payload_bytes || !policy.reservation_limits.retained_bytes ||
         !policy.reservation_limits.setup_peak_bytes)
         throw std::invalid_argument("selective model copy requires payload and retained/setup budgets");

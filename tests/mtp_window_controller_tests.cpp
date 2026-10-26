@@ -1,6 +1,7 @@
 #include "strix/mtp_window_controller.hpp"
 #include "strix/mtp_batch_window_controller.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -182,6 +183,73 @@ int main() {
         const auto no_draft=joint.plan(q,16);
         expect(no_draft==std::vector<std::uint32_t>({0,0}),"joint planning skips expensive unproductive drafts");
         joint.reset(0);joint.reset(1);
+    }
+    {
+        // Plan rules (STRIX_MTP_JOINT_PLAN): a cap bounds every planned owner, probes included; the pooled
+        // prior follows the request's own measured acceptance where deep history is thin.
+        strix::MtpBatchWindowController::Rule capped;capped.cap=4;
+        strix::MtpBatchWindowController cap(4,capped),production(4);
+        const std::vector<strix::MtpBatchWindowController::Request> q{{0,8,{}},{1,8,{}},{2,8,{}},{3,8,{}}};
+        for(int k=0;k<40;++k) {
+            const auto planned=cap.plan(q,32);
+            expect(std::all_of(planned.begin(),planned.end(),[](std::uint32_t r){return r<=4U;}),"cap4 plans no R8 owner");
+        }
+        expect(production.plan(q,32)==std::vector<std::uint32_t>({2,2,2,2}) && production.last_plan().probe,
+            "the first production plan is the R2 exploration probe");
+        strix::MtpBatchWindowController::Rule pool;pool.pooled=true;
+        strix::MtpBatchWindowController pooled(2,pool),flat(2);
+        const std::vector<strix::MtpBatchWindowController::Request> two{{0,8,{}},{1,8,{}}};
+        const std::array<std::uint32_t,2> r2{2,2};
+        const std::vector<float> one(1,0.5F);
+        const std::vector<strix::MtpBatchWindowController::Request> seen{{0,8,one},{1,8,one}};
+        // Depth 0 is seen 60 times and accepted 30 % of the time; deeper depths are never reached.
+        for(int n=0;n<60;++n) {
+            const std::array<std::uint32_t,2> acc{n%10<3?1U:0U,n%10<3?1U:0U};
+            pooled.observe(seen,r2,acc,2.0,48.0,2U);flat.observe(seen,r2,acc,2.0,48.0,2U);
+        }
+        for(int k=0;k<9;++k) {static_cast<void>(pooled.plan(two,16));static_cast<void>(flat.plan(two,16));}
+        const auto a=pooled.plan(two,16),b=flat.plan(two,16);
+        expect(pooled.last_plan().expected<flat.last_plan().expected,"the pooled prior is below 0.8 at 30 % acceptance");
+        expect(a[0]<=b[0] && a[1]<=b[1],"the pooled prior never plans deeper than the 0.8 prior");
+    }
+    {
+        // Calibrated choose: confident-looking drafts (p 0.95) that the run keeps rejecting stop earning rows; the
+        // production blend follows the per-depth history instead. Rule text round trip and in-process switch.
+        const auto parsed=strix::MtpBatchWindowController::parse_rule("calibrated,cap4");
+        expect(parsed.calibrated && parsed.cap==4U && !parsed.pooled,"rule text parses");
+        const auto none=strix::MtpBatchWindowController::parse_rule("");
+        expect(!none.calibrated && !none.pooled && none.cap==8U,"empty rule text = production");
+        strix::MtpBatchWindowController c(2);
+        const std::vector<float> sure(7,0.95F);
+        const std::vector<strix::MtpBatchWindowController::Request> q{{0,8,sure},{1,8,sure}};
+        const std::array<std::uint32_t,2> r8{8,8},deep{6,6},none_acc{0,0};
+        // 60 cycles of p 0.5 drafts accepted deep (6 of 7) make the depth history favourable; 40 cycles where every
+        // p 0.95 draft fails make the 0.95 bin bad.
+        const std::vector<float> half(7,0.5F);
+        const std::vector<strix::MtpBatchWindowController::Request> h{{0,8,half},{1,8,half}};
+        for(int n=0;n<60;++n) c.observe(h,r8,deep,1.0,60.0,14U);
+        for(int n=0;n<40;++n) c.observe(q,r8,none_acc,1.0,60.0,14U);
+        const auto blended=c.choose(q,16);
+        strix::MtpBatchWindowController::Rule cal;cal.calibrated=true;c.set_rule(cal);
+        const auto calibrated=c.choose(q,16);
+        expect(blended==std::vector<std::uint32_t>({8,8}),"the production blend follows the favourable depth history");
+        expect(calibrated==std::vector<std::uint32_t>({2,2}),"calibrated choose verifies R2 for drafts that keep failing");
+        std::vector<strix::MtpBatchWindowController::Request> ctx{{0,8,sure},{1,8,sure}};
+        ctx[0].external_first=0;ctx[1].external_first=0;
+        expect(c.choose(ctx,16)==blended,"context rows keep the production estimate under the calibrated rule");
+    }
+    {
+        // Shared-state snapshot: plans after a restore repeat the plans after the save (costs, counters, bins).
+        strix::MtpBatchWindowController c(2);
+        const std::vector<strix::MtpBatchWindowController::Request> q{{0,8,{}},{1,8,{}}};
+        expect(!c.restore_shared(),"restore without a snapshot is refused");
+        for(int k=0;k<12;++k) static_cast<void>(c.plan(q,16));
+        c.save_shared();
+        std::vector<std::vector<std::uint32_t>> first,second;
+        for(int k=0;k<40;++k) first.push_back(c.plan(q,16));
+        expect(c.restore_shared(),"restore after a snapshot");
+        for(int k=0;k<40;++k) second.push_back(c.plan(q,16));
+        expect(first==second,"a restored controller replays the same plans");
     }
     if(failures) {std::cerr<<failures<<" failure(s)\n";return 1;}
     std::cout<<"mtp window controller: legacy R2 share "<<share(stuck,2)<<", robust R8 share "<<share(fixed,8)

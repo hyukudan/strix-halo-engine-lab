@@ -417,10 +417,86 @@ void benchmark() {
         std::cout << "  commit 4 rows " << commit * 1000.0F << " us, commit 0 rows " << empty * 1000.0F << " us\n";
     }
 }
+// `bench-cold`: the decode case, where the 36 layers' 113 MB of recurrent state stream through the 32 MB MALL
+// between two windows of one layer. A 96 MB write before every sample evicts the layer's 3 MiB matrix; the
+// window and commit times are swept over the pending rows (0 = no matrix store). Run it under a kernel trace
+// for per-kernel times; the event times printed here include the projections.
+void benchmark_cold() {
+    Fixture fixture(GdnRecurrentStorage::key_value, HipGdnRecurrentLayout::transposed, false, false, 3U);
+    fixture.reset();
+    const auto window_layer = fixture.layer(fixture.window);
+    void* flush = nullptr;
+    constexpr std::size_t flush_bytes = 96ULL << 20U;
+    check(hipMalloc(&flush, flush_bytes), "allocate MALL flush buffer");
+    hipEvent_t start, stop;
+    check(hipEventCreate(&start), "event"); check(hipEventCreate(&stop), "event");
+    const auto cold_ms = [&](auto&& run) {
+        std::vector<float> samples;
+        for (unsigned i = 0; i < 25U; ++i) {
+            check(hipMemsetAsync(flush, static_cast<int>(i), flush_bytes, fixture.owner.stream), "MALL flush");
+            check(hipEventRecord(start, fixture.owner.stream), "record"); run(); check(hipEventRecord(stop, fixture.owner.stream), "record");
+            check(hipEventSynchronize(stop), "sync"); samples.push_back(elapsed(start, stop));
+        }
+        std::sort(samples.begin(), samples.end());
+        return samples[samples.size() / 2U] * 1000.0F;
+    };
+    for (const unsigned t : {2U, 4U, 8U}) {
+        const auto views = fixture.rows(fixture.window, 0U, t);
+        for (const unsigned pending : {0U, 1U, 2U, 4U, 8U}) {
+            fixture.set_control(pending, 0U);
+            std::cout << "cold T=" << t << " pending=" << pending << ": window "
+                      << cold_ms([&] { gdn_window_enqueue(window_layer, views, fixture.device_control(), fixture.config, fixture.owner.stream); })
+                      << " us\n";
+        }
+    }
+    for (const unsigned pending : {0U, 1U, 4U, 8U}) {
+        fixture.set_control(pending, 0U);
+        std::cout << "cold commit pending=" << pending << ": "
+                  << cold_ms([&] { gdn_window_commit_enqueue(window_layer, fixture.device_control(), fixture.config, fixture.owner.stream); })
+                  << " us\n";
+    }
+    (void)hipEventDestroy(start); (void)hipEventDestroy(stop);
+    check(hipFree(flush), "free MALL flush buffer");
+}
+// `bench-gates`: windows of T = 2, 4, 8 rows with nothing pending, warm (back to back) and cold (MALL evicted),
+// 25 samples each (event times). Run it under a kernel trace with STRIX_GDN_GATES_ANYORDER=1
+// and =0: the trace gives the Q8 input projection, the F32 gates and the next kernel's start per window.
+void benchmark_gates() {
+    Fixture fixture(GdnRecurrentStorage::key_value, HipGdnRecurrentLayout::transposed, false, false, 3U);
+    fixture.reset();
+    const auto window_layer = fixture.layer(fixture.window);
+    void* flush = nullptr;
+    constexpr std::size_t flush_bytes = 96ULL << 20U;
+    check(hipMalloc(&flush, flush_bytes), "allocate MALL flush buffer");
+    hipEvent_t start, stop;
+    check(hipEventCreate(&start), "event"); check(hipEventCreate(&stop), "event");
+    fixture.set_control(0U, 0U);
+    for (const bool cold : {false, true})
+        for (const unsigned t : {2U, 4U, 8U}) {
+            const auto views = fixture.rows(fixture.window, 0U, t);
+            // Untimed warm-up of this specialization (first launch, code object load).
+            gdn_window_enqueue(window_layer, views, fixture.device_control(), fixture.config, fixture.owner.stream);
+            check(hipStreamSynchronize(fixture.owner.stream), "warm-up");
+            std::vector<float> samples;
+            for (unsigned i = 0; i < 25U; ++i) {
+                if (cold) check(hipMemsetAsync(flush, static_cast<int>(i), flush_bytes, fixture.owner.stream), "MALL flush");
+                check(hipEventRecord(start, fixture.owner.stream), "record");
+                gdn_window_enqueue(window_layer, views, fixture.device_control(), fixture.config, fixture.owner.stream);
+                check(hipEventRecord(stop, fixture.owner.stream), "record");
+                check(hipEventSynchronize(stop), "sync"); samples.push_back(elapsed(start, stop));
+            }
+            std::sort(samples.begin(), samples.end());
+            std::cout << (cold ? "cold" : "warm") << " T=" << t << ": window " << samples[samples.size() / 2U] * 1000.0F << " us\n";
+        }
+    (void)hipEventDestroy(start); (void)hipEventDestroy(stop);
+    check(hipFree(flush), "free MALL flush buffer");
+}
 } // namespace
 int main(int argc, char** argv) {
     try {
         if (argc > 1 && std::string_view(argv[1]) == "bench") { benchmark(); return 0; }
+        if (argc > 1 && std::string_view(argv[1]) == "bench-cold") { benchmark_cold(); return 0; }
+        if (argc > 1 && std::string_view(argv[1]) == "bench-gates") { benchmark_gates(); return 0; }
         unsigned cases = 0;
         struct Variant { GdnRecurrentStorage storage; HipGdnRecurrentLayout layout; bool q8, bf16_small; };
         for (const auto variant : {Variant{GdnRecurrentStorage::key_value, HipGdnRecurrentLayout::baseline, false, false},

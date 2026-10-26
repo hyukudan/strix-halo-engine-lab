@@ -2,6 +2,7 @@
 #include "strix/known_prefill_limits.hpp"
 
 #include "strix/hip_known_prefix_window.hpp"
+#include "strix/dispatch_resources.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/serial_decode_replay.hpp"
@@ -15,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
+#include <span>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -131,13 +133,18 @@ struct HipKnownPromptBackend::Impl {
             throw std::invalid_argument("known prompt terminal logits are outside the retained window arena");
     }
 
-    std::vector<float> execute(std::span<const std::uint32_t> tokens, std::uint64_t position,bool state_only=false) {
+    std::vector<float> execute(std::span<const std::uint32_t> tokens, std::uint64_t position,bool state_only=false,bool defer=false,
+        bool partial=false) {
         if (failed) throw std::logic_error("known prompt adapter cannot be reused after an exception");
         const auto committed_before = session.committed_tokens;
-        const auto rows = window->logical_rows();
+        // STRIX_QPF2K_SCHED bit 4: a partial block (the first tokens.size() rows of the tiled owner's T arena).
+        const auto rows = partial ? static_cast<std::uint32_t>(tokens.size()) : window->logical_rows();
         bool window_attempted = false;
         started = true;
         try {
+            if (partial && (!window->supports_tiled_prefill() || rows < 16U || rows % 8U || rows > window->logical_rows() ||
+                    window->output_policy() == KnownWindowOutputPolicy::all_rows || all_rows_sink))
+                throw std::invalid_argument("known prompt partial block needs 16..T rows in multiples of 8 on a terminal-row or state-only tiled owner");
             guard->require_original();
             const auto policy=window->output_policy();
             validate_known_window_output_policy(policy);
@@ -159,10 +166,33 @@ struct HipKnownPromptBackend::Impl {
                     throw std::invalid_argument("known prompt token exceeds vocabulary");
             // Allocate host return storage before any model-state consumption.
             std::vector<float> logits(state_only?0U:static_cast<std::size_t>(vocab_size));
+            // STRIX_PREFILL_TIMING=1: host milliseconds of the hand-offs and the block (stderr).
+            static const bool timing=[]{const char* v=std::getenv("STRIX_PREFILL_TIMING");return v&&v[0]=='1';}();
+            auto mark=std::chrono::steady_clock::now();
+            const auto lap=[&](const char* name) {
+                if(!timing) return;
+                const auto now=std::chrono::steady_clock::now();
+                std::fprintf(stderr,"prefill block %-12s %8.2f ms\n",name,std::chrono::duration<double,std::milli>(now-mark).count());mark=now;
+            };
+            // STRIX_PREFILL_PIPE bit 8: the model binding is validated once for the hand-offs and the block (each
+            // validation inside this scope is skipped for the same manifest/weights pair, which the scope validated).
+            static const bool one_validation=[]{const char* v=std::getenv("STRIX_PREFILL_PIPE");return v&&(std::strtoul(v,nullptr,0)&8UL)!=0UL;}();
+            std::optional<ValidatedModelBindingScope> binding_scope;
+            if (one_validation && handoff && handoff->first.resources && !handoff->first.resources->distributed_stage &&
+                handoff->first.resources->model_manifest && handoff->first.resources->model_weights)
+                binding_scope.emplace(*handoff->first.resources->model_manifest, *handoff->first.resources->model_weights);
+            lap("scope");
             if (handoff) hand_off_serial_session(session, handoff->first, handoff->second);
+            lap("handoff-in");
             window_attempted = true;
-            const auto result = headless ? window->execute_without_head(session, tokens) : window->execute(session, tokens);
+            // STRIX_QPF2K_SCHED bit 2: a deferred headless block (no fence; the next block of this owner checks it).
+            const auto result = partial ? window->execute_partial(session, tokens, !state_only, defer) :
+                headless ? (defer ? window->execute_without_head_deferred(session, tokens) :
+                window->execute_without_head(session, tokens)) : window->execute(session, tokens);
+            lap("execute");
             if (handoff) hand_off_serial_session(session, handoff->second, handoff->first);
+            lap("handoff-out");
+            binding_scope.reset();
             // A window with deferred GDN or per-row PLE keeps every row of a known prompt: commit them all
             // and apply the pending GDN rows now (both are no-ops for windows without those operators).
             if (!window->supports_tiled_prefill()) { window->commit_prefix(rows); window->flush_deferred(); }
@@ -193,7 +223,17 @@ struct HipKnownPromptBackend::Impl {
                     static_cast<std::size_t>(logits_bytes), hipMemcpyDeviceToHost));
                 guard->require_original();
                 validate_serial_decode_engine_logits(logits, vocab_size);
+                // STRIX_PREFILL_LOGITS_DIGEST=1: FNV-1a 64 of the terminal row's FP32 logit bytes (stderr), for
+                // bitwise comparisons of prefill variants.
+                static const bool digest=[]{const char* v=std::getenv("STRIX_PREFILL_LOGITS_DIGEST");return v&&v[0]=='1';}();
+                if(digest) {
+                    std::uint64_t hash=14695981039346656037ULL;
+                    for(const auto byte:std::as_bytes(std::span<const float>(logits))){hash^=static_cast<unsigned char>(byte);hash*=1099511628211ULL;}
+                    std::fprintf(stderr,"prefill terminal logits fnv64 %016llx position %llu\n",static_cast<unsigned long long>(hash),
+                        static_cast<unsigned long long>(position+rows-1U));
+                }
             }
+            lap("output");
             // Publish only completed successful adapter returns, from the
             // actual native result. Saturation is telemetry, never admission.
             auto next = observed;
@@ -217,6 +257,12 @@ struct HipKnownPromptBackend::Impl {
             return logits;
         } catch (...) {
             failed = true;
+            // STRIX_QPF2K_SCHED bit 2: a previous block of this owner still unchecked (any failure of this call, also
+            // in admission) poisons the session and drains the owner's stream; nothing of it is published further.
+            if (window->completion_pending()) {
+                session.health = SerialSessionHealth::poisoned; session.arithmetic_lineage.tainted = true;
+                try { window->abandon_pending_completion(); } catch (...) { std::terminate(); }
+            }
             // A rejected window leaves a ready session: return it to the decode executor.
             if (handoff && session.health == SerialSessionHealth::ready && handoff->second.compiled &&
                 session.execution_identity == handoff->second.compiled->execution_identity) {
@@ -255,6 +301,23 @@ std::vector<float> HipKnownPromptBackend::execute_rows(std::span<const std::uint
 }
 void HipKnownPromptBackend::execute_state_rows(std::span<const std::uint32_t> tokens,std::uint64_t position) {
     (void)impl_->execute(tokens,position,true);
+}
+void HipKnownPromptBackend::execute_state_rows_deferred(std::span<const std::uint32_t> tokens,std::uint64_t position) {
+    if(!impl_->window->supports_tiled_prefill()||impl_->window->output_policy()==KnownWindowOutputPolicy::state_only) {
+        (void)impl_->execute(tokens,position,true);return;
+    }
+    (void)impl_->execute(tokens,position,true,true);
+}
+std::vector<float> HipKnownPromptBackend::execute_rows_partial(std::span<const std::uint32_t> tokens, std::uint64_t position) {
+    return impl_->execute(tokens,position,false,false,true);
+}
+void HipKnownPromptBackend::execute_state_rows_partial(std::span<const std::uint32_t> tokens, std::uint64_t position, bool defer) {
+    (void)impl_->execute(tokens,position,true,defer && impl_->window->output_policy()!=KnownWindowOutputPolicy::state_only,true);
+}
+void HipKnownPromptBackend::finish_deferred() {
+    if(!impl_->window->completion_pending()) return;
+    try {impl_->window->finish_pending_completion();}
+    catch(...) {impl_->failed=true;impl_->session.health=SerialSessionHealth::poisoned;impl_->session.arithmetic_lineage.tainted=true;throw;}
 }
 HipKnownPromptBackendStats HipKnownPromptBackend::stats() const noexcept {
     return impl_->observed;

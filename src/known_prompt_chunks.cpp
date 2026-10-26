@@ -5,9 +5,12 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
+#include <span>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace strix {
@@ -57,7 +60,13 @@ void KnownPromptChunkCursor::set_tail_backend(KnownPromptWindowBackend& tail) {
 
 bool KnownPromptChunkCursor::advance() {
     if(progress_.failed) throw std::logic_error("failed known-prompt cursor cannot resume");
-    if(progress_.cancelled || progress_.prefill_complete) return false;
+    if(progress_.cancelled || progress_.prefill_complete) {
+        if(deferred_) {
+            deferred_=false;
+            try {windows_.finish_deferred();} catch(...) {progress_.failed=true;has_logits_=false;selection_.reset();throw;}
+        }
+        return false;
+    }
     const auto consumed=static_cast<std::size_t>(progress_.consumed_prompt_tokens);
     const auto remaining=request_.prompt_tokens.size()-consumed;
     const bool state_only=request_.output_policy==KnownWindowOutputPolicy::state_only;
@@ -66,27 +75,91 @@ bool KnownPromptChunkCursor::advance() {
     KnownPromptWindowBackend* backend=&windows_;
     std::uint32_t block=request_.logical_rows;
     bool tail=false;
+    // STRIX_QPF2K_SCHED bit 16: balanced blocks. The prompt's rows down to a multiple of 128 run as k = ceil(remaining / T)
+    // blocks of a multiple of 128 rows (at most T), each as the first rows of the T owner's arena, instead of T blocks and
+    // the 1024/256 tails; the last remaining mod 128 rows then run as the ladder runs them (64/16 tails, serial rows).
+    // Bit 4: the ladder's leading multiple-of-128 tail units merged into one partial block of the T owner.
+    static const bool balanced_env=[]{const char* v=std::getenv("STRIX_QPF2K_SCHED");return v&&(std::strtoul(v,nullptr,0)&16UL)!=0UL;}();
+    static const bool merged_env=[]{const char* v=std::getenv("STRIX_QPF2K_SCHED");return v&&(std::strtoul(v,nullptr,0)&4UL)!=0UL;}();
+    // Per prompt (decided at its first unit): only where the balanced plan is bitwise equal to the ladder.
+    if(balanced_<0) {
+        std::vector<std::uint32_t> ladder=request_.ladder_tail_rows;
+        if(ladder.empty()) for(auto* t:tails_) ladder.push_back(t->logical_rows());
+        balanced_=balanced_env&&known_prefill_balanced_eligible(remaining,request_.logical_rows,ladder)?1:0;
+        if(balanced_env) std::fprintf(stderr,"qpf2k sched balanced %s for %zu rows\n",balanced_?"on":"off (ladder differs)",remaining);
+    }
+    const bool balanced=balanced_==1&&request_.schedule_extensions&&request_.tiled_prefill&&!request_.all_row_heads&&!state_only&&
+        windows_.supports_tiled_prefill()&&windows_.output_policy()!=KnownWindowOutputPolicy::all_rows&&
+        known_prefill_balanced_rows(remaining,request_.logical_rows)!=0U;
+    bool partial=false;
+    if(balanced) {
+        const auto size=known_prefill_balanced_rows(remaining,request_.logical_rows);
+        window=true;tail=false;backend=&windows_;block=static_cast<std::uint32_t>(size);partial=block!=request_.logical_rows;
+    }
+    // Bit 4 (not balanced): merge the ladder's leading multiple-of-128 tail units into one partial block of the T owner.
+    if(!window&&merged_env&&balanced_==0&&request_.schedule_extensions&&request_.tiled_prefill&&!request_.all_row_heads&&!state_only&&
+       windows_.supports_tiled_prefill()&&windows_.output_policy()!=KnownWindowOutputPolicy::all_rows) {
+        std::vector<std::uint32_t> ladder=request_.ladder_tail_rows;
+        if(ladder.empty()) for(auto* t:tails_) ladder.push_back(t->logical_rows());
+        if(const auto merged=known_prefill_merged_tail_rows(remaining,request_.logical_rows,ladder)) {
+            window=true;tail=false;backend=&windows_;block=static_cast<std::uint32_t>(merged);partial=true;
+        }
+    }
     if(!window) for(auto* candidate:tails_) if(remaining>=candidate->logical_rows()) {
         tail=window=true;backend=candidate;block=candidate->logical_rows();break;
+    }
+    // STRIX_QPF2K_SCHED bit 8 fail-closed: with a pruned owner list (ladder_tail_rows set), rows the ladder runs in one unit
+    // must not fall to a smaller tail owner or to the serial suffix (row classes sit on a 128-row grid per block: other
+    // arithmetic, silently). The owners are a subset of the ladder, so a chosen tail owner is never larger than the unit.
+    if(!request_.ladder_tail_rows.empty() && remaining<request_.logical_rows) {
+        std::uint32_t want=0;
+        for(const auto r:request_.ladder_tail_rows) if(r && remaining>=r) {want=r;break;}
+        if(want && (!window || (tail && block<want)))
+            throw std::logic_error("qpf2k sched: the ladder's "+std::to_string(want)+"-row unit has no tail owner (pruned)");
     }
     // Tiled prefill: a window with more prompt after it is never read, so it runs without its head.
     // STRIX_PREFILL_HEADLESS=0 keeps the head on every block.
     static const bool allow_headless=[]{const char* v=std::getenv("STRIX_PREFILL_HEADLESS");return !v||v[0]!='0';}();
     const bool headless=allow_headless&&!request_.all_row_heads&&request_.tiled_prefill&&!state_only&&window&&remaining>block;
+    // A deferred block of windows_ is completed by the next block of windows_; anything else completes it first.
+    if(deferred_ && (!window || backend!=&windows_)) {
+        deferred_=false;
+        try {windows_.finish_deferred();} catch(...) {progress_.failed=true;has_logits_=false;selection_.reset();throw;}
+    }
+    // deferred_ stays set until the next block of windows_ (which completes it) succeeded: a failure leaves the
+    // cleanup (cancel / destructor) its responsibility.
     try {
         if(headless) {
-            backend->execute_state_rows(request_.prompt_tokens.subspan(consumed,block),progress_.next_position);
+            // STRIX_QPF2K_SCHED bit 2: when the next unit is another block of this same backend (it completes this one
+            // before publishing anything), this block ends without a host fence.
+            static const bool defer_env=[]{const char* v=std::getenv("STRIX_QPF2K_SCHED");return v&&(std::strtoul(v,nullptr,0)&2UL)!=0UL;}();
+            const bool defer=defer_env&&request_.schedule_extensions&&!tail&&backend==&windows_&&remaining-block>=(balanced?16U:request_.logical_rows);
+            if(partial) backend->execute_state_rows_partial(request_.prompt_tokens.subspan(consumed,block),progress_.next_position,defer);
+            else if(defer) backend->execute_state_rows_deferred(request_.prompt_tokens.subspan(consumed,block),progress_.next_position);
+            else backend->execute_state_rows(request_.prompt_tokens.subspan(consumed,block),progress_.next_position);
+            deferred_=defer;
             has_logits_=false;selection_.reset();
         } else if(state_only&&(no_output||window||remaining>1U)) {
             if(window) {
-                windows_.execute_state_rows(request_.prompt_tokens.subspan(consumed,request_.logical_rows),progress_.next_position);
+                windows_.execute_state_rows(request_.prompt_tokens.subspan(consumed,request_.logical_rows),progress_.next_position);deferred_=false;
                 ++progress_.state_only_windows;
             } else serial_.execute_state(request_.prompt_tokens[consumed],progress_.next_position);
             has_logits_=false;selection_.reset();
         } else {
-            auto values=window ? backend->execute_rows(request_.prompt_tokens.subspan(consumed, block),
-                    progress_.next_position) : serial_.execute(request_.prompt_tokens[consumed],progress_.next_position);
+            auto values=window ? (partial ? backend->execute_rows_partial(request_.prompt_tokens.subspan(consumed, block),progress_.next_position) :
+                    backend->execute_rows(request_.prompt_tokens.subspan(consumed, block),
+                    progress_.next_position)) : serial_.execute(request_.prompt_tokens[consumed],progress_.next_position);
+            if(window) deferred_=false;
             validate_serial_decode_engine_logits(values,request_.vocab_size);
+            // STRIX_PREFILL_LOGITS_DIGEST=1: the terminal row's FP32 logits FNV-1a 64 also when the prompt ends in a serial
+            // suffix row (the tiled backend prints it for a block that ends the prompt).
+            static const bool digest=[]{const char* v=std::getenv("STRIX_PREFILL_LOGITS_DIGEST");return v&&v[0]=='1';}();
+            if(digest&&!window&&consumed+1U==request_.prompt_tokens.size()) {
+                std::uint64_t hash=14695981039346656037ULL;
+                for(const auto byte:std::as_bytes(std::span<const float>(values))){hash^=static_cast<unsigned char>(byte);hash*=1099511628211ULL;}
+                std::fprintf(stderr,"prefill terminal logits fnv64 %016llx position %llu\n",static_cast<unsigned long long>(hash),
+                    static_cast<unsigned long long>(progress_.next_position));
+            }
             std::copy(values.begin(),values.end(),logits_.begin());
             has_logits_=true;
         }
@@ -105,7 +178,13 @@ bool KnownPromptChunkCursor::advance() {
     }
 }
 
+KnownPromptChunkCursor::~KnownPromptChunkCursor() {
+    // Abandoned with a deferred block: check it (a failed check poisons the session in the backend).
+    if(deferred_) {deferred_=false;try{windows_.finish_deferred();}catch(...){}}
+}
+
 void KnownPromptChunkCursor::cancel() noexcept {
+    if(deferred_) {deferred_=false;try{windows_.finish_deferred();}catch(...){progress_.failed=true;}}
     if(!progress_.generation_complete && !progress_.failed) progress_.cancelled=true;
 }
 

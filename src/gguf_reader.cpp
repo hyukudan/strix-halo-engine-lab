@@ -307,6 +307,9 @@ private:
     }
 
     static bool valid_ggml_type(std::uint32_t type) {
+        if (type == 42) {  // Q2_0: block 64, fp16 d + 2-bit codes (GSQ-RCO builds)
+            return true;
+        }
         if (type > 39) {
             return false;
         }
@@ -448,6 +451,7 @@ std::optional<TensorTypeGeometry> tensor_type_geometry(
     case 34: return TensorTypeGeometry{256, 54};
     case 35: return TensorTypeGeometry{256, 66};
     case 39: return TensorTypeGeometry{32, 17};
+    case 42: return TensorTypeGeometry{64, 18};
     default: return std::nullopt;
     }
 }

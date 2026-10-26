@@ -14,6 +14,7 @@
 #include <chrono>
 #include "strix/serial_request.hpp"
 #include "strix/arithmetic_lineage.hpp"
+#include "strix/model_content_hash.hpp"
 #include <algorithm>
 #include <optional>
 #include <stdexcept>
@@ -64,6 +65,8 @@ struct HipMtpTargetHiddenTicket::Lease {
     std::optional<SerialSessionContext> prefix_committed;
     // Set for a row adopted from a tiled prefill block: the block's first position.
     std::optional<std::uint64_t> block_begin;
+    // STRIX_SERIAL_LOGITS_DIGEST=1 (diagnostic): SHA-256 of this serial row's FP32 logits.
+    std::optional<ModelContentIdentity> logits_digest;
 };
 struct HipMtpTargetHidden::Impl {
     struct Slot {
@@ -153,6 +156,7 @@ std::uint64_t HipMtpTargetHiddenTicket::source_position() const {if(!lease_)thro
 std::uint32_t HipMtpTargetHiddenTicket::input_token() const {if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");return lease_->token;}
 std::uint32_t HipMtpTargetHiddenTicket::predicted_token() const {if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");return lease_->predicted;}
 const SerialSessionContext& HipMtpTargetHiddenTicket::committed_session() const {if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");return lease_->prefix_committed?*lease_->prefix_committed:lease_->batch?lease_->batch->committed_session():lease_->committed;}
+std::optional<ModelContentIdentity> HipMtpTargetHiddenTicket::serial_logits_digest() const {return lease_ ? lease_->logits_digest : std::nullopt;}
 ModelContentIdentity HipMtpTargetHiddenTicket::target_content_identity() const {if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");return lease_->content;}
 std::uint64_t HipMtpTargetHiddenTicket::producer_execution_identity() const {
     if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");
@@ -338,6 +342,14 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial(
                     std::chrono::duration<double>(t1-t0).count(),
                     std::chrono::duration<double>(std::chrono::steady_clock::now()-t1).count(),1U);
             }
+            // STRIX_SERIAL_LOGITS_DIGEST=1 (diagnostic, gates): the row's FP32 logits digest (prompt receipts report the terminal one).
+            static const bool logits_digest=[]{const char* v=std::getenv("STRIX_SERIAL_LOGITS_DIGEST");return v && v[0]=='1';}();
+            if(logits_digest) {
+                std::vector<float> row;
+                read_hip_logits_row(i.logits,static_cast<std::uint32_t>(i.model->vocab_size),i.stream,row);
+                const auto bytes=std::as_bytes(std::span<const float>(row));
+                lease->logits_digest=sha256_bytes(std::vector<std::byte>(bytes.begin(),bytes.end()));
+            }
             if(i.shadow)i.shadow->publish();
         });
         lease->committed=session;
@@ -511,6 +523,31 @@ std::vector<HipMtpTargetHiddenTicket> HipMtpTargetHidden::accept_verified_prefix
         lease->position=batch->source_position(row);lease->token=batch->input_token(row);
         lease->predicted=batch->predicted_token(row);lease->content=batch->target_content_identity();
         lease->prefix_committed=target; // every prefix row's chunk ends at the accepted frontier
+        HipMtpTargetHiddenTicket ticket;ticket.lease_=std::move(lease);result.push_back(std::move(ticket));
+    }
+    return result;
+}
+std::vector<HipMtpTargetHiddenTicket> HipMtpTargetHidden::accept_known_rows(
+    std::shared_ptr<const HipMtpTargetWindowBatch> batch,const SerialSessionContext& target) {
+    auto& i=*impl_;i.guard->require_original();i.memory->validate_inventory_ownership();
+    if(!batch || !batch->valid() || i.busy || i.failed ||
+       !same_target_state(batch->source_state_memory_binding(),i.memory->state()) ||
+       !same_target_weights(batch->source_weights_binding(),i.weights->binding()) ||
+       batch->target_content_identity()!=i.weights->binding().model_content_identity ||
+       target.health!=SerialSessionHealth::ready || batch->chunk_begin()!=batch->base_session().next_position ||
+       batch->chunk_begin()+batch->logical_rows()!=target.next_position ||
+       target.committed_tokens!=batch->base_session().committed_tokens+batch->logical_rows() ||
+       !arithmetic_lineage_valid(target.arithmetic_lineage,target.next_position))
+        throw std::invalid_argument("MTP known prompt rows lack exact actual target chunk binding");
+    std::vector<HipMtpTargetHiddenTicket> result;result.reserve(batch->logical_rows());
+    for(std::uint32_t row=0;row<batch->logical_rows();++row) {
+        if(batch->source_position(row)!=batch->chunk_begin()+row)
+            throw std::invalid_argument("MTP window source positions are not the actual contiguous chunk");
+        auto lease=std::make_shared<HipMtpTargetHiddenTicket::Lease>();
+        lease->owner=shared_from_this();lease->batch=batch;lease->batch_row=row;
+        lease->position=batch->source_position(row);lease->token=batch->input_token(row);
+        lease->predicted=batch->predicted_token(row);lease->content=batch->target_content_identity();
+        lease->prefix_committed=target;
         HipMtpTargetHiddenTicket ticket;ticket.lease_=std::move(lease);result.push_back(std::move(ticket));
     }
     return result;

@@ -1,4 +1,5 @@
 #include "strix/graph_inputs.hpp"
+#include "strix/ggml_dequant.hpp"
 
 #include <bit>
 #include <cstring>
@@ -86,7 +87,11 @@ void validate_graph_embedding_bindings(
     case 1: case 30: block_bytes = 2; break;
     case 8: block_elements = 32; block_bytes = 34; break;
     case 23: block_elements = 256; block_bytes = 136; break;
-    default: throw std::invalid_argument("graph embedding weight encoding is unsupported");
+    default: {
+        const auto g = ggml_dequant::geometry(ggml_type);  // GSQ-RCO block formats (Q3_K, Q2_0, ...)
+        if (!g || g->block_elements < 32) throw std::invalid_argument("graph embedding weight encoding is unsupported");
+        block_elements = g->block_elements; block_bytes = g->block_bytes; break;
+    }
     }
     if (width % block_elements != 0 || weights.storage != RuntimeTensorStorage::resident ||
         weights.allocation_generation == 0 || output.allocation_generation == 0 || output.use.generation == 0 ||

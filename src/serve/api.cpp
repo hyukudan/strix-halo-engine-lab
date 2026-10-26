@@ -391,6 +391,19 @@ struct ApiService::Impl {
             if (!ngram->is_bool()) throw ApiError(400, "invalid_request_error", "ngram_draft must be a boolean", "ngram_draft");
             job.ngram_draft = ngram->as_bool();
         }
+        if (const auto* depth = body.find("draft_depth_max"); depth && !depth->is_null()) {
+            if (!depth->is_number() || depth->as_int() < 0 || depth->as_int() > 8)
+                throw ApiError(400, "invalid_request_error", "draft_depth_max must be an integer in [0, 8]", "draft_depth_max");
+            job.draft_depth_max = static_cast<std::uint32_t>(depth->as_int());
+        }
+        if (const auto* tool = body.find("tool_draft"); tool && !tool->is_null()) {
+            if (!tool->is_bool()) throw ApiError(400, "invalid_request_error", "tool_draft must be a boolean", "tool_draft");
+            job.tool_draft = tool->as_bool();
+        }
+        if (const auto* peers = body.find("ngram_peers"); peers && !peers->is_null()) {
+            if (!peers->is_bool()) throw ApiError(400, "invalid_request_error", "ngram_peers must be a boolean", "ngram_peers");
+            job.ngram_peers = peers->as_bool();
+        }
         auto ticket = queue.submit(std::move(job));
         if (!ticket) throw ApiError(429, "rate_limit_error", "the request queue is full");
         return ticket;
@@ -425,6 +438,14 @@ struct ApiService::Impl {
         e.set("mtp_proposed", Json(o.stats.proposed));
         e.set("ngram_rows", Json(o.stats.ngram_rows));
         e.set("ngram_accepted", Json(o.stats.ngram_accepted));
+        if (o.stats.tool_rows) { e.set("tool_rows", Json(o.stats.tool_rows)); e.set("tool_accepted", Json(o.stats.tool_accepted)); }
+        if (o.stats.source_shadow || o.stats.frame_cycles) {
+            Json d = Json::array();
+            for (const auto v : {o.stats.source_shadow, o.stats.source_scored, o.stats.source_right, o.stats.frame_cycles, o.stats.frame_shadow})
+                d.push(Json(v));
+            e.set("draft_sources", std::move(d)); // [shadow, scored, right rows, frame cycles, frame shadows]
+        }
+        for (const auto& [name, value] : o.stats.engine_extra) e.set(name, parse_json(value));
         return e;
     }
     static Json tool_calls_json(const Json& calls) {
@@ -908,6 +929,7 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& response
         if (request.method == "GET" && request.path == "/metrics") { response.send(200, "text/plain; version=0.0.4", impl.metrics()); return; }
         if (request.method == "GET" && request.path == "/api/status") { response.send(200, "application/json", impl.status().dump()); return; }
         impl.authorize(request);
+        if (impl.config.engine_routes && impl.config.engine_routes(request, response)) return;
         if (request.method == "POST" && request.path == "/admin/drain" && impl.config.on_drain) {
             impl.config.on_drain();
             { const std::lock_guard lock(impl.mutex); if (impl.state != "failed") impl.state = "draining"; }

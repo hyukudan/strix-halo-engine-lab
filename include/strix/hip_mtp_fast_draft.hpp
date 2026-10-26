@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <span>
 
 namespace strix {
 // Draft-only MTP MoE for the canonical Q8_0 sidecar (hidden 2560, intermediate
@@ -28,6 +29,23 @@ inline constexpr std::uint32_t hip_mtp_fast_moe_workspace_floats=11U*640U+1U;
 void launch_hip_mtp_draft_q8_gemv(const void* input,bool input_bf16,const void* q8,std::uint32_t width,
     std::uint32_t rows,void* output,bool output_bf16,void* stream,bool any_order=false);
 void launch_hip_mtp_fast_moe(const HipMtpFastMoeViews&,void* stream);
+// Multi-session draft batch (STRIX_MTP_DRAFT_BATCH): at most this many tokens (one per session) per batched step.
+inline constexpr std::uint32_t hip_mtp_draft_batch_rows=8U;
+// Batched draft GEMV: up to three weight segments sharing one width (outputs first[s]..first[s+1]-1 of the
+// launch are rows of weights[s], written to output[s][t] for token t). Each token's output equals
+// launch_hip_mtp_draft_q8_gemv on that token's input alone, bit for bit (same Q4 copy rule, same chains).
+struct HipMtpDraftGemvRows {
+    const void* weights[3]{};
+    std::uint32_t first[4]{};
+    std::uint32_t segments=0;
+    const void* input[hip_mtp_draft_batch_rows]{};
+    void* output[3][hip_mtp_draft_batch_rows]{};
+};
+void launch_hip_mtp_draft_q8_gemv_rows(const HipMtpDraftGemvRows&,std::uint32_t count,bool input_bf16,std::uint32_t width,
+    bool output_bf16,void* stream);
+// Batched fast MoE: token t runs launch_hip_mtp_fast_moe's Q4 kernels on views[t] (same blocks, same bits).
+struct HipMtpFastMoeRows {HipMtpFastMoeViews views[hip_mtp_draft_batch_rows];};
+void launch_hip_mtp_fast_moe_rows(std::span<const HipMtpFastMoeViews> views,void* stream);
 // Draft-only Q4_0 copy of a Q8_0 tensor (elements % 32 == 0), converted on `stream` with the
 // draft head's rule and kept for the process. The draft GEMV, fast MoE and fused input
 // projection read the copy whenever every tensor they need has one.
@@ -39,6 +57,17 @@ const void* hip_mtp_draft_q4(const void* q8) noexcept;
 // holds 10240+320 floats.
 void enqueue_hip_mtp_hyper_mix_q8(const std::uint16_t* input,const float* norm,const void* down,const void* inject,const void* up,
     float* workspace,float* injection,std::uint16_t* output,float epsilon,bool draft,void* stream);
+// Multi-session draft batch of enqueue_hip_mtp_hyper_mix_q8(..., draft=true, ...): row t is one session's draft HC
+// mix (its input streams, workspace of 10240+320 floats, 16-aligned, injection or null with inject, output) and
+// equals the one-token draft mix bit for bit. Production draft branch only (hip_mtp_hyper_mix_draft_rows_supported).
+struct HipMtpHyperDraftRows {
+    const std::uint16_t* input[hip_mtp_draft_batch_rows]{};
+    std::uint16_t* output[hip_mtp_draft_batch_rows]{};
+    float* workspace[hip_mtp_draft_batch_rows]{};
+    float* injection[hip_mtp_draft_batch_rows]{};
+};
+void enqueue_hip_mtp_hyper_mix_q8_rows(const HipMtpHyperDraftRows&,std::uint32_t count,const float* norm,const void* down,
+    const float* inject,const void* up,float epsilon,void* stream);
 // Flat Q8_0 -> F32 (elements % 32 == 0): out[i]=scale*code, the Q8 loader value.
 void launch_hip_mtp_dequantize_q8(const void* q8,std::uint64_t elements,float* output,void* stream);
 // Raw exact-path sequences behind the MTP routed/shared launchers (no owner

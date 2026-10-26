@@ -72,12 +72,13 @@ __device__ unsigned block_exclusive(unsigned v, unsigned* waves, unsigned& total
     return before + x - v;
 }
 
+// tile: the TR-row tile of the group (blockIdx.x of union_kernel / attend_kernel).
 template <unsigned Rows, unsigned TR>
-__global__ __launch_bounds__(256) void union_kernel(Views<Rows> v, std::uint32_t union_at) {
+__device__ __forceinline__ void union_body(const Views<Rows>& v, std::uint32_t union_at, unsigned tile) {
     __shared__ std::uint32_t mask[kRangeBlocks];
     __shared__ std::uint32_t weight[TR * 4U];
     __shared__ std::uint32_t waves[8];
-    const unsigned t = threadIdx.x, r0 = blockIdx.x * TR;
+    const unsigned t = threadIdx.x, r0 = tile * TR;
     unsigned blocks = 0U;
     for (unsigned r = 0; r < TR; ++r) blocks = max(blocks, (v.visible[r0 + r] + 3U) / 4U);
     if (t < TR * 4U) weight[t] = 0U;
@@ -117,6 +118,16 @@ __global__ __launch_bounds__(256) void union_kernel(Views<Rows> v, std::uint32_t
     }
 }
 
+template <unsigned Rows, unsigned TR>
+__global__ __launch_bounds__(256) void union_kernel(Views<Rows> v, std::uint32_t union_at) {
+    union_body<Rows, TR>(v, union_at, blockIdx.x);
+}
+// Several groups of one call in one launch (STRIX_QSA_ATTEND_BATCH): block x = group * (Rows / TR) + tile.
+template <unsigned Rows, unsigned TR>
+__global__ __launch_bounds__(256) void union_multi_kernel(const Views<Rows>* groups, std::uint32_t union_at) {
+    union_body<Rows, TR>(groups[blockIdx.x / (Rows / TR)], union_at, blockIdx.x % (Rows / TR));
+}
+
 // One workgroup: G column groups of 16 query columns, each run by a pair of compute waves that split the 256
 // features (each keeps its half of Q as FP16 WMMA fragments in registers, forms the partial scores over that
 // half, and accumulates that half of O), and four loader waves. The loaders keep D chunks in flight in
@@ -124,20 +135,39 @@ __global__ __launch_bounds__(256) void union_kernel(Views<Rows> v, std::uint32_t
 // waves run the other. Per chunk: partial scores, barrier, exchange (each wave adds the pair's halves in
 // the same order, so both hold the same scores and run the same softmax), values, barrier. debug (fixture
 // ablations): bit 0 loads token 0 for every slot, bit 1 skips the compute.
-template <unsigned Rows, unsigned TR, unsigned G, unsigned D = 3U>
-__global__ __launch_bounds__((2U * G + 4U) * 32U) void attend_kernel(Views<Rows> v, const std::uint16_t* kv, std::uint32_t kv_heads,
-    std::uint32_t heads, std::uint32_t union_at, std::uint32_t splits, std::uint32_t debug = 0U) {
+// Int8 (STRIX_QSA_FAST_INT8=1 with kv-int8-tok-v1): the loaders read the int8 codes (8 bytes per task instead of 16)
+// and stage them as FP16 (exact: |code| <= 127); loader lanes 0..31 stage the chunk's 16 K and 16 V FP32 scales of the
+// KV head. The compute waves apply the scale of a token to its FP32 score (S = (codes . q) * s_k) and to its FP16
+// probability operand of the value product (P * s_v), so O = sum P s_v codes_v. Identity kv8-fast-qsa-v1: the same
+// selection, masks, online softmax and combine; only the place where the dequantization scale enters changes.
+__device__ __forceinline__ unsigned q8x2_to_f16x2(unsigned codes, unsigned shift) {
+    const _Float16 a = static_cast<_Float16>(static_cast<float>(static_cast<std::int8_t>((codes >> shift) & 0xffU)));
+    const _Float16 b = static_cast<_Float16>(static_cast<float>(static_cast<std::int8_t>((codes >> (shift + 8U)) & 0xffU)));
+    return static_cast<unsigned>(__builtin_bit_cast(unsigned short, a)) |
+        (static_cast<unsigned>(__builtin_bit_cast(unsigned short, b)) << 16U);
+}
+typedef unsigned u32x2 __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ u32x2 load8(const void* p) {
+    return *reinterpret_cast<const __attribute__((address_space(1))) u32x2*>(reinterpret_cast<std::uintptr_t>(p));
+}
+__device__ __forceinline__ float load_scale(const void* p) {
+    return *reinterpret_cast<const __attribute__((address_space(1))) float*>(reinterpret_cast<std::uintptr_t>(p));
+}
+template <unsigned Rows, unsigned TR, unsigned G, unsigned D, bool Int8>
+__device__ __forceinline__ void attend_body(const Views<Rows>& v, const std::uint16_t* kv, std::uint32_t kv_heads,
+    std::uint32_t heads, std::uint32_t union_at, std::uint32_t splits, std::uint32_t debug, unsigned tile, unsigned yb) {
     constexpr unsigned HPW = 16U / TR, HG = G * HPW, Loaders = 128U, Compute = 2U * G;
     constexpr unsigned KT = kChunk * 32U / Loaders; // V: one task per loader thread
     __shared__ __align__(16) _Float16 k_lds[2][kChunk][kPitch];
     __shared__ __align__(16) _Float16 v_lds[2][kDim][kChunk];
     __shared__ __align__(16) float xch[G][2][32][8];
     __shared__ uint2 meta_lds[2][4];
+    __shared__ float scale_lds[Int8 ? 2 : 1][Int8 ? 32 : 1]; // Int8: [buf][K slots 0..15, V slots 0..15]
     const unsigned t = threadIdx.x, lane = t % 32U, w = t / 32U, col = lane % 16U, half = lane / 16U;
     const bool loader = w >= Compute;
-    const unsigned r0 = blockIdx.x * TR;
+    const unsigned r0 = tile * TR;
     const unsigned per_kv = heads / kv_heads, groups = per_kv / HG;
-    const unsigned kvh = blockIdx.y / groups, hg = blockIdx.y % groups, split = blockIdx.z;
+    const unsigned kvh = yb / groups, hg = yb % groups, split = blockIdx.z;
     unsigned tile_visible = 0U;
     for (unsigned i = 0; i < TR; ++i) tile_visible = max(tile_visible, v.visible[r0 + i]);
     const auto* header = reinterpret_cast<const std::uint32_t*>(v.scratch[r0] + union_at);
@@ -148,6 +178,8 @@ __global__ __launch_bounds__((2U * G + 4U) * 32U) void attend_kernel(Views<Rows>
 
     if (loader) {
         struct Regs { u32x4 k[KT]; u32x4 v[4]; unsigned valid; };
+        struct Regs8 { u32x2 k[KT]; u32x2 v[4]; float scale; unsigned valid; };
+        using R = std::conditional_t<Int8, Regs8, Regs>;
         // Lane i < 4 of each loader wave holds the chunk's (block, mask) i; a slot's block comes by lane
         // shuffle (not an indexed array, which would live in scratch, whose loads wait for every load in flight).
         const auto meta_at = [&](unsigned c) { return lane < 4U ? pairs[4U * c + lane] : make_uint2(0U, 0U); };
@@ -157,27 +189,70 @@ __global__ __launch_bounds__((2U * G + 4U) * 32U) void attend_kernel(Views<Rows>
         const auto row_elements = static_cast<std::uint64_t>(kv_heads) * kDim * 2U;
         const auto* k_base = kv + static_cast<std::uint64_t>(kvh) * kDim;
         const auto* v_base = kv + static_cast<std::uint64_t>(kv_heads + kvh) * kDim;
+        // Int8 row: [K codes kv_width | V codes kv_width | FP32 scales: K heads, then V heads] (kv_int8_row_bytes).
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(kv);
+        const auto kv_width = static_cast<std::uint64_t>(kv_heads) * kDim;
+        const auto row_bytes = 2U * kv_width + 8ULL * kv_heads;
         const unsigned lt = t - Compute * 32U;
         // K task i = (token i / 32, 8 features 8 (i % 32)); V task = (tokens 4 (lt % 4) .. + 3, 8 features
         // 8 (lt / 4)). Every load is issued (a token past the tile's visible prefix reads the last visible one
         // and is staged as zero), so no load waits on a branch.
-        const auto fetch = [&](uint2 m, Regs& g) {
+        const auto fetch = [&](uint2 m, R& g) {
             g.valid = 0U;
 #pragma unroll
             for (unsigned i = 0; i < KT; ++i) {
                 const unsigned task = lt + i * Loaders;
                 const unsigned token = (debug & 1U) ? 0U : token_of(m, task / 32U);
                 g.valid |= (token < tile_visible ? 1U : 0U) << i;
-                g.k[i] = load16(k_base + (token < tile_visible ? token : tile_visible - 1U) * row_elements + 8U * (task % 32U));
+                const unsigned at = token < tile_visible ? token : tile_visible - 1U;
+                if constexpr (Int8) g.k[i] = load8(bytes + at * row_bytes + static_cast<std::uint64_t>(kvh) * kDim + 8U * (task % 32U));
+                else g.k[i] = load16(k_base + at * row_elements + 8U * (task % 32U));
             }
 #pragma unroll
             for (unsigned h = 0; h < 4U; ++h) {
                 const unsigned token = (debug & 1U) ? 0U : token_of(m, 4U * (lt % 4U) + h);
                 g.valid |= (token < tile_visible ? 1U : 0U) << (KT + h);
-                g.v[h] = load16(v_base + (token < tile_visible ? token : tile_visible - 1U) * row_elements + 8U * (lt / 4U));
+                const unsigned at = token < tile_visible ? token : tile_visible - 1U;
+                if constexpr (Int8) g.v[h] = load8(bytes + at * row_bytes + kv_width + static_cast<std::uint64_t>(kvh) * kDim + 8U * (lt / 4U));
+                else g.v[h] = load16(v_base + at * row_elements + 8U * (lt / 4U));
+            }
+            if constexpr (Int8) { // lane lt % 32: K scale of slot lt % 16 (lt % 32 < 16) or V scale of slot lt % 16
+                const unsigned slot = lt % 16U, token = (debug & 1U) ? 0U : token_of(m, slot);
+                const bool value = (lt % 32U) >= 16U;
+                g.valid |= (token < tile_visible ? 1U : 0U) << 31U;
+                g.scale = load_scale(bytes + (token < tile_visible ? token : tile_visible - 1U) * row_bytes + 2U * kv_width +
+                    4ULL * ((value ? kv_heads : 0U) + kvh));
             }
         };
-        const auto stage = [&](const Regs& g, uint2 m, unsigned buf) {
+        // Int8: the eight codes of a task as four FP16 pairs (features 2k, 2k + 1), zero when not valid.
+        const auto pairs8 = [](u32x2 c, bool keep, unsigned (&f)[4]) {
+            const u32x2 x = keep ? c : u32x2{0U, 0U};
+            f[0] = q8x2_to_f16x2(x.x, 0U); f[1] = q8x2_to_f16x2(x.x, 16U);
+            f[2] = q8x2_to_f16x2(x.y, 0U); f[3] = q8x2_to_f16x2(x.y, 16U);
+        };
+        const auto stage = [&](const R& g, uint2 m, unsigned buf) {
+          if constexpr (Int8) {
+#pragma unroll
+            for (unsigned i = 0; i < KT; ++i) {
+                const unsigned task = lt + i * Loaders;
+                unsigned f[4];
+                pairs8(g.k[i], ((g.valid >> i) & 1U) != 0U, f);
+                *reinterpret_cast<uint4*>(&k_lds[buf][task / 32U][8U * (task % 32U)]) = uint4{f[0], f[1], f[2], f[3]};
+            }
+            unsigned f[4][4];
+#pragma unroll
+            for (unsigned h = 0; h < 4U; ++h) pairs8(g.v[h], ((g.valid >> (KT + h)) & 1U) != 0U, f[h]);
+            const unsigned feature = 8U * (lt / 4U), slot = 4U * (lt % 4U);
+#pragma unroll
+            for (unsigned k = 0; k < 4U; ++k) {
+                *reinterpret_cast<uint2*>(&v_lds[buf][v_row(feature + 2U * k)][slot]) =
+                    make_uint2((f[0][k] & 0xffffU) | (f[1][k] << 16U), (f[2][k] & 0xffffU) | (f[3][k] << 16U));
+                *reinterpret_cast<uint2*>(&v_lds[buf][v_row(feature + 2U * k + 1U)][slot]) =
+                    make_uint2((f[0][k] >> 16U) | (f[1][k] & 0xffff0000U), (f[2][k] >> 16U) | (f[3][k] & 0xffff0000U));
+            }
+            if (lt < 4U) meta_lds[buf][lt] = m;
+            if (lt < 32U) scale_lds[Int8 ? buf : 0U][Int8 ? lt : 0U] = (g.valid >> 31U) ? g.scale : 0.0F;
+          } else {
             const auto keep = [&](u32x4 x, unsigned b) { return ((g.valid >> b) & 1U) ? x : u32x4{0U, 0U, 0U, 0U}; };
 #pragma unroll
             for (unsigned i = 0; i < KT; ++i) {
@@ -202,6 +277,7 @@ __global__ __launch_bounds__((2U * G + 4U) * 32U) void attend_kernel(Views<Rows>
                     make_uint2((f[0][k] >> 16U) | (f[1][k] & 0xffff0000U), (f[2][k] >> 16U) | (f[3][k] & 0xffff0000U));
             }
             if (lt < 4U) meta_lds[buf][lt] = m;
+          }
         };
         // D chunks in flight, slot k of the loop unrolled by D: before step c, r[k] holds chunk c + 1 (fetched
         // with meta held[k]) and raw[k] the meta of chunk c + 1 + D, loaded D chunks before its fetch (so a wait
@@ -210,10 +286,10 @@ __global__ __launch_bounds__((2U * G + 4U) * 32U) void attend_kernel(Views<Rows>
         // last chunk; what the tail stages goes to the buffer the compute waves no longer read).
         if (c0 < c1) {
             const auto chunk = [&](unsigned c) { return c < c1 ? c : c1 - 1U; };
-            Regs r[D];
+            R r[D];
             uint2 held[D], raw[D];
             {
-                Regs first;
+                R first;
                 const uint2 m = meta_at(c0);
                 fetch(m, first);
                 stage(first, m, 0U);
@@ -297,7 +373,9 @@ __global__ __launch_bounds__((2U * G + 4U) * 32U) void attend_kernel(Views<Rows>
             const uint2 blk = meta[e / 2U];
             const unsigned token = blk.x * 4U + 2U * (e % 2U) + half;
             const bool live = (blk.y & bit) != 0U && token < visible;
-            p[e] = live ? s[e] * score_scale : -INFINITY;
+            float score = s[e];
+            if constexpr (Int8) score = score * scale_lds[Int8 ? buf : 0U][Int8 ? 2U * e + half : 0U];
+            p[e] = live ? score * score_scale : -INFINITY;
             top = fmaxf(top, p[e]);
         }
         top = fmaxf(top, swap16(top));
@@ -322,8 +400,13 @@ __global__ __launch_bounds__((2U * G + 4U) * 32U) void attend_kernel(Views<Rows>
 #pragma unroll
         for (unsigned e = 0; e < 8U; ++e) {
             const float o = swap16(p[e]);
-            pb[2U * e] = static_cast<_Float16>(half ? o : p[e]);
-            pb[2U * e + 1U] = static_cast<_Float16>(half ? p[e] : o);
+            float lo = half ? o : p[e], hi = half ? p[e] : o; // token slots 2e, 2e + 1
+            if constexpr (Int8) {
+                lo = lo * scale_lds[Int8 ? buf : 0U][Int8 ? 16U + 2U * e : 0U];
+                hi = hi * scale_lds[Int8 ? buf : 0U][Int8 ? 17U + 2U * e : 0U];
+            }
+            pb[2U * e] = static_cast<_Float16>(lo);
+            pb[2U * e + 1U] = static_cast<_Float16>(hi);
         }
 #pragma unroll
         for (unsigned n = 0; n < 8U; ++n) {
@@ -353,6 +436,29 @@ __global__ __launch_bounds__((2U * G + 4U) * 32U) void attend_kernel(Views<Rows>
     for (unsigned n = 0; n < 8U; ++n)
 #pragma unroll
         for (unsigned e = 0; e < 8U; ++e) partial[2U + fh * (kDim / 2U) + 16U * n + 2U * e + half] = acc[n][e];
+}
+
+template <unsigned Rows, unsigned TR, unsigned G, unsigned D = 3U, bool Int8 = false>
+__global__ __launch_bounds__((2U * G + 4U) * 32U) void attend_kernel(Views<Rows> v, const std::uint16_t* kv, std::uint32_t kv_heads,
+    std::uint32_t heads, std::uint32_t union_at, std::uint32_t splits, std::uint32_t debug = 0U) {
+    attend_body<Rows, TR, G, D, Int8>(v, kv, kv_heads, heads, union_at, splits, debug, blockIdx.x, blockIdx.y);
+}
+// FP16 KV only (the launcher queues no Int8 group).
+template <unsigned Rows, unsigned TR, unsigned G, unsigned D = 3U>
+__global__ __launch_bounds__((2U * G + 4U) * 32U) void attend_multi_kernel(const Views<Rows>* groups, const std::uint16_t* kv,
+    std::uint32_t kv_heads, std::uint32_t heads, std::uint32_t union_at) {
+    attend_body<Rows, TR, G, D, false>(groups[blockIdx.x / (Rows / TR)], kv, kv_heads, heads, union_at, 1U, 0U, blockIdx.x % (Rows / TR), blockIdx.y);
+}
+// qpf2k/attn candidate I (STRIX_QPF2K_QSA bit 6): attend_multi_kernel's body under a one-dimensional grid ordered
+// group-major, x = (group * ys + y) * (Rows / TR) + tile with ys = kv_heads * head groups: the workgroups resident at a
+// time cover as few row groups (whose unions overlap) as possible, so the KV blocks they gather stay in the last-level
+// cache. Scheduling only: every workgroup runs the same (group, tile, y) body, so the outputs are bitwise the same.
+template <unsigned Rows, unsigned TR, unsigned G, unsigned D = 3U>
+__global__ __launch_bounds__((2U * G + 4U) * 32U) void attend_order_kernel(const Views<Rows>* groups, const std::uint16_t* kv,
+    std::uint32_t kv_heads, std::uint32_t heads, std::uint32_t union_at, std::uint32_t ys) {
+    constexpr unsigned tiles = Rows / TR;
+    const unsigned bx = blockIdx.x, tile = bx % tiles, y = (bx / tiles) % ys, g = bx / (tiles * ys);
+    attend_body<Rows, TR, G, D, false>(groups[g], kv, kv_heads, heads, union_at, 1U, 0U, tile, y);
 }
 
 template <unsigned Rows>

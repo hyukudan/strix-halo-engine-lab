@@ -3,6 +3,7 @@
 // Every written byte (prologue codes, intermediates, down image, raw slot dots, statuses, the
 // summary word) must be identical. Default mode: the bitwise cases. "bench": timing per form.
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
+#include "strix/hip_ggml_weight_formats.hpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <algorithm>
@@ -14,7 +15,9 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
+#include <fstream>
 
 namespace {
 namespace a8 = strix::moe_q4k_a8;
@@ -34,18 +37,35 @@ __device__ std::uint64_t device_mix(std::uint64_t x) {
 // flavor 2 also infinities and NaNs (rows fail); flavor 3: those in the down weights only.
 __device__ unsigned short scale_bits(std::uint64_t r, unsigned flavor) {
     const unsigned pick = static_cast<unsigned>(r & 4095U);
-    if (flavor && pick < 48U) {
+    if ((flavor == 1U || flavor == 2U) && pick < 48U) {
         const unsigned short special[12]{0x0000U, 0x8000U, 0x0001U, 0x03ffU, 0x8200U, 0x7bffU, 0xfbffU, 0x0400U, 0x7a00U, 0x7c00U, 0xfc00U, 0x7e00U};
         return special[pick % (flavor == 2U ? 12U : 9U)];
     }
-    // 2^-12 .. 2^-6 with random mantissa, sign mostly positive.
-    const unsigned exponent = 3U + static_cast<unsigned>((r >> 12U) % 7U), mantissa = static_cast<unsigned>((r >> 16U) & 1023U);
+    // 2^-12 .. 2^-6 with random mantissa, sign mostly positive; flavor 4: one binade (2^-9, as production scales),
+    // so whole waves take the short dequantization of MoE tune bit 6.
+    // (flavor 4 also sets the lowest mantissa bit: the scale pairs of a block then share their lowest bit, as the
+    // production blocks do closely enough that every one passes the bit-6 check.)
+    const unsigned exponent = flavor == 4U ? 6U : 3U + static_cast<unsigned>((r >> 12U) % 7U);
+    const unsigned mantissa = static_cast<unsigned>((r >> 16U) & 1023U) | (flavor == 4U ? 1U : 0U);
     const unsigned sign = ((r >> 30U) & 15U) == 0U ? 0x8000U : 0U;
     return static_cast<unsigned short>(sign | exponent << 10U | mantissa);
 }
-// Random packed blocks with format-correct fp16 headers. kind: 12 Q4_K, 13 Q5_K, 7 Q5_1, 8 Q8_0.
+// Bytes and weights of one block. kind: 12 Q4_K, 13 Q5_K, 7 Q5_1, 8 Q8_0, GSQ 42 Q2_0, 22 IQ2_S, 18 IQ3_XXS, 21 IQ3_S,
+// 23 IQ4_XS, 20 IQ4_NL.
+__host__ __device__ constexpr bool kind_iq(unsigned kind) { return kind == 22U || kind == 18U || kind == 21U || kind == 23U || kind == 20U; }
+__host__ __device__ constexpr unsigned kind_block_bytes(unsigned kind) {
+    return kind == 12U ? 144U : kind == 13U ? 176U : kind == 7U ? 24U : kind == 42U ? 18U : kind == 22U ? 82U : kind == 18U ? 98U :
+        kind == 21U ? 110U : kind == 23U ? 136U : kind == 20U ? 18U : 34U;
+}
+__host__ __device__ constexpr unsigned kind_block_elements(unsigned kind) {
+    return kind == 12U || kind == 13U || kind == 22U || kind == 18U || kind == 21U || kind == 23U ? 256U : kind == 42U ? 64U : 32U;
+}
+__host__ __device__ constexpr std::uint64_t kind_row_bytes(unsigned kind, unsigned width) {
+    return static_cast<std::uint64_t>(width / kind_block_elements(kind)) * kind_block_bytes(kind);
+}
+// Random packed blocks with format-correct fp16 headers.
 __global__ void fill_blocks(unsigned char* bytes, std::uint64_t blocks, unsigned kind, std::uint64_t seed, unsigned flavor) {
-    const unsigned block_bytes = kind == 12U ? 144U : kind == 13U ? 176U : kind == 7U ? 24U : 34U;
+    const unsigned block_bytes = kind_block_bytes(kind);
     for (std::uint64_t b = blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x; b < blocks;
          b += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
         unsigned char* p = bytes + b * block_bytes;
@@ -55,8 +75,10 @@ __global__ void fill_blocks(unsigned char* bytes, std::uint64_t blocks, unsigned
             p[i] = static_cast<unsigned char>(r >> (8U * (i & 7U)));
         }
         const auto put = [&](unsigned at, unsigned short v) { p[at] = static_cast<unsigned char>(v); p[at + 1U] = static_cast<unsigned char>(v >> 8U); };
-        put(0U, scale_bits(device_mix(r + 1U), flavor));
-        if (kind != 8U) put(2U, scale_bits(device_mix(r + 2U), flavor));
+        put(0U, scale_bits(device_mix(r + 1U), flavor == 6U ? 0U : flavor));
+        if (kind != 8U && kind != 42U && !kind_iq(kind)) put(2U, scale_bits(device_mix(r + 2U), flavor));
+        if (kind == 42U && flavor == 6U)  // one code per 32-weight half block: q = 0, 1, 2 or 3 throughout
+            for (unsigned i = 0; i < 16U; ++i) p[2U + i] = static_cast<unsigned char>(0x55U * ((b + i / 8U + (r & 1U)) % 4U));
     }
 }
 struct Buffer {
@@ -75,9 +97,29 @@ struct Buffer {
     }
     void poison(hipStream_t s) const { check(hipMemsetAsync(base, 0xa5, bytes, s), "poison buffer"); }
 };
+// group > 0: row t routes slot s to expert s + 10 * (t / group), so every expert of a full group of rows has exactly
+// `group` assignments (experts >= 10 * ceil(rows / group)). flavor 6 (GSQ Q2_0): extreme / cancelling codes (code bytes
+// 0x00, 0x55, 0xaa, 0xff) and inputs of one magnitude (A8 codes +-127).
 struct Case {
     const char* name; unsigned experts, rows, gate_type, down_type, flavor; bool duplicates, skew, nan_input = false;
+    unsigned group = 0;
+    // qpf2k/moe: skew exponent (expert = experts * u^power) and optional real weights: the GGUF file and the absolute
+    // byte offsets of one layer's ffn_gate_exps / ffn_up_exps / ffn_down_exps tensors (512 experts).
+    double power = 3.0; const char* gguf = nullptr; std::uint64_t gate_at = 0, up_at = 0, down_at = 0;
+    // crafted: experts get exact counts at the tile boundaries (0, 1, 15, 16, 17, 63, 64, 65, 127, 128, 129, 255, 256, 257,
+    // 500 for experts 0..14; the rest share the remaining assignments), filled slot-major so no row repeats an expert;
+    // bad_route: one route of row T/3 is out of range (the CSR fails closed).
+    bool crafted = false, bad_route = false, full128 = false;  // full128: every expert count a multiple of 128 (T*K/128 >= experts)
 };
+void read_file(const char* path, std::uint64_t at, std::uint64_t bytes, void* device) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error(std::string("open ") + path);
+    std::vector<char> host(bytes);
+    f.seekg(static_cast<std::streamoff>(at));
+    f.read(host.data(), static_cast<std::streamsize>(bytes));
+    if (!f) throw std::runtime_error("short read of GGUF tensor");
+    check(hipMemcpy(device, host.data(), bytes, hipMemcpyHostToDevice), "upload real weights");
+}
 struct Fixture {
     static constexpr unsigned H = 2560U, I = 640U, K = 10U;
     Case c; hipStream_t stream = nullptr;
@@ -88,15 +130,23 @@ struct Fixture {
         check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create stream");
         request.enabled = true; request.input = a8::InputKind::bf16;
         request.shape = {H, I, c.experts, K, c.rows}; request.gate_type = request.up_type = c.gate_type;
-        const unsigned gb = c.gate_type == 12U ? 144U : 176U, db = c.down_type == 7U ? 24U : 34U;
-        const std::uint64_t gate_blocks = static_cast<std::uint64_t>(c.experts) * I * (H / 256U);
-        const std::uint64_t down_blocks = static_cast<std::uint64_t>(c.experts) * H * (I / 32U);
+        const unsigned gb = kind_block_bytes(c.gate_type), db = kind_block_bytes(c.down_type);
+        const std::uint64_t gate_blocks = static_cast<std::uint64_t>(c.experts) * I * (H / kind_block_elements(c.gate_type));
+        const std::uint64_t down_blocks = static_cast<std::uint64_t>(c.experts) * H * (I / kind_block_elements(c.down_type));
         gate = Buffer(1, gate_blocks * gb); up = Buffer(1, gate_blocks * gb); down = Buffer(1, down_blocks * db);
         const std::uint64_t seed = mix(c.experts * 131U + c.rows * 7U + c.gate_type * 3U + c.down_type + c.flavor * 99U);
-        hipLaunchKernelGGL(fill_blocks, dim3(1024), dim3(256), 0, stream, static_cast<unsigned char*>(gate.base), gate_blocks, c.gate_type, seed ^ 1U, c.flavor == 3U ? 0U : c.flavor);
-        hipLaunchKernelGGL(fill_blocks, dim3(1024), dim3(256), 0, stream, static_cast<unsigned char*>(up.base), gate_blocks, c.gate_type, seed ^ 2U, c.flavor == 3U ? 0U : c.flavor);
-        hipLaunchKernelGGL(fill_blocks, dim3(1024), dim3(256), 0, stream, static_cast<unsigned char*>(down.base), down_blocks, c.down_type, seed ^ 3U, c.flavor == 3U ? 2U : c.flavor);
+        if (c.gguf) {
+            read_file(c.gguf, c.gate_at, gate_blocks * gb, gate.base); read_file(c.gguf, c.up_at, gate_blocks * gb, up.base);
+            read_file(c.gguf, c.down_at, down_blocks * db, down.base);
+        } else {
+        hipLaunchKernelGGL(fill_blocks, dim3(1024), dim3(256), 0, stream, static_cast<unsigned char*>(gate.base), gate_blocks, c.gate_type, seed ^ 1U, c.flavor == 3U || c.flavor == 5U ? 0U : c.flavor);
+        hipLaunchKernelGGL(fill_blocks, dim3(1024), dim3(256), 0, stream, static_cast<unsigned char*>(up.base), gate_blocks, c.gate_type, seed ^ 2U,
+            c.flavor == 3U || c.flavor == 5U ? 0U : c.flavor);
+        // flavor 3: non-finite scales in the down weights only; 5: edge scales in the down weights only.
+        hipLaunchKernelGGL(fill_blocks, dim3(1024), dim3(256), 0, stream, static_cast<unsigned char*>(down.base), down_blocks, c.down_type, seed ^ 3U,
+            c.flavor == 3U ? 2U : c.flavor == 5U ? 1U : c.flavor);
         check(hipGetLastError(), "fill weights");
+        }
         const unsigned T = c.rows;
         input = Buffer(T, 2U * H); routes = Buffer(T, 4U * K); weights = Buffer(T, 4U * K);
         codes = Buffer(T, H); deltas = Buffer(T, 4U * (H / 32U)); sums = Buffer(T, 4U * (H / 32U)); status = Buffer(T, 4U);
@@ -108,12 +158,31 @@ struct Fixture {
         std::vector<std::uint32_t> rt(static_cast<std::size_t>(routes.stride / 4U) * T, 0U);
         std::vector<float> rw(static_cast<std::size_t>(weights.stride / 4U) * T, 0.0F);
         std::uint64_t r = seed;
+        std::vector<unsigned> crafted_seq;
+        if (c.crafted) {
+            const unsigned fixed[15]{0U, 1U, 15U, 16U, 17U, 63U, 64U, 65U, 127U, 128U, 129U, 255U, 256U, 257U, 500U};
+            unsigned used = 0;
+            if (c.full128) {
+                const unsigned batches = T * K / 128U, two = batches > c.experts ? batches - c.experts : 0U;
+                for (unsigned e = 0; e < c.experts && crafted_seq.size() < static_cast<std::size_t>(T) * K; ++e)
+                    for (unsigned k = 0; k < (e < two ? 256U : 128U); ++k) crafted_seq.push_back(e);
+                used = static_cast<unsigned>(crafted_seq.size());
+            } else
+            for (unsigned e = 0; e < 15U && e < c.experts; ++e) { for (unsigned k = 0; k < fixed[e] && k < T; ++k) crafted_seq.push_back(e); used += std::min(fixed[e], T); }
+            const unsigned rest = c.experts > 15U ? c.experts - 15U : 1U;
+            for (unsigned k = 0; crafted_seq.size() < static_cast<std::size_t>(T) * K; ++k) crafted_seq.push_back(15U + (k * rest) / (T * K - used + 1U));
+            (void)used;
+        }
         const auto bf16 = [](float f) { std::uint32_t u; std::memcpy(&u, &f, 4); return static_cast<std::uint16_t>((u + 0x7fffU + ((u >> 16U) & 1U)) >> 16U); };
         for (unsigned t = 0; t < T; ++t) {
             for (unsigned k = 0; k < H; ++k) {
                 r = mix(r);
                 float v = static_cast<float>(static_cast<std::int64_t>(r % 2001U) - 1000) / 500.0F;
                 if (k % 97U == 5U) v *= 40.0F;
+                if (c.flavor == 6U) {  // 32-value groups all +1, all -1 or alternating (A8 codes +-127)
+                    const unsigned kind = (k / 32U + t) % 3U;
+                    v = kind == 0U ? 1.0F : kind == 1U ? -1.0F : (k % 2U ? -1.0F : 1.0F);
+                }
                 if (c.flavor == 1U || c.flavor == 2U) {
                     const unsigned block = (k / 32U + t) % 23U;
                     if (block == 1U) v = 0.0F;
@@ -128,9 +197,18 @@ struct Fixture {
             if (c.nan_input && t == T / 2U) x[static_cast<std::size_t>(t) * (input.stride / 2U) + 77U] = 0x7fc0U;
             for (unsigned s = 0; s < K; ++s) {
                 unsigned e;
+                if (c.crafted) {
+                    e = std::min(crafted_seq[static_cast<std::size_t>(s) * T + t], c.experts - 1U);
+                    if (c.bad_route && t == T / 3U && s == 4U) e = c.experts;
+                    rt[static_cast<std::size_t>(t) * (routes.stride / 4U) + s] = e;
+                    r = mix(r);
+                    rw[static_cast<std::size_t>(t) * (weights.stride / 4U) + s] = 0.05F + static_cast<float>((r >> 20U) % 1000U) / 1000.0F;
+                    continue;
+                }
                 for (;;) {
                     r = mix(r);
-                    if (c.skew) { const double u = static_cast<double>(r >> 11U) / 9007199254740992.0; e = static_cast<unsigned>(c.experts * u * u * u); }
+                    if (c.group) e = s + 10U * (t / c.group);
+                    else if (c.skew) { const double u = static_cast<double>(r >> 11U) / 9007199254740992.0; e = static_cast<unsigned>(c.experts * std::pow(u, c.power)); }
                     else e = static_cast<unsigned>(r % c.experts);
                     e = std::min(e, c.experts - 1U);
                     bool seen = false;
@@ -161,6 +239,22 @@ struct Fixture {
         kr::enqueue_prefill(request, view, rows ? rows : c.rows, H, static_cast<const unsigned char*>(gate.base),
             static_cast<const unsigned char*>(up.base), c.down_type, static_cast<const unsigned char*>(down.base), stream, form);
     }
+    // Every written byte of one run over other weights (same rows, routes and views).
+    std::vector<std::vector<unsigned char>> run_as(int form, unsigned gate_type, unsigned down_type, const Buffer& g, const Buffer& u,
+        const Buffer& d) {
+        for (const auto* b : written()) b->poison(stream);
+        csr.poison(stream);
+        a8::Request other = request; other.gate_type = other.up_type = gate_type;
+        kr::enqueue_prefill(other, view, c.rows, H, static_cast<const unsigned char*>(g.base), static_cast<const unsigned char*>(u.base),
+            down_type, static_cast<const unsigned char*>(d.base), stream, form);
+        check(hipStreamSynchronize(stream), "run prefill (other weights)");
+        std::vector<std::vector<unsigned char>> out;
+        for (const auto* b : written()) out.push_back(b->read());
+        std::uint32_t summary = 0;
+        check(hipMemcpy(&summary, view.csr.summary, 4U, hipMemcpyDeviceToHost), "read summary");
+        out.push_back(std::vector<unsigned char>(reinterpret_cast<unsigned char*>(&summary), reinterpret_cast<unsigned char*>(&summary) + 4));
+        return out;
+    }
     // The first `rows` prompt rows only (a shorter prefill block over the same row views).
     std::vector<unsigned char> run_rawdots(int form, unsigned rows) {
         for (const auto* b : written()) b->poison(stream);
@@ -184,10 +278,91 @@ struct Fixture {
         return out;
     }
 };
+// qpf2k/moe: order-free 64-bit digest of a device buffer (sum over words of mix(index, word)); equal digests of
+// two runs = the same bytes (up to a 2^-64 collision). Reads nothing back but 8 bytes.
+__global__ void digest_kernel(const unsigned* words, std::uint64_t n, unsigned long long* out) {
+    unsigned long long acc = 0;
+    for (std::uint64_t i = blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x; i < n; i += static_cast<std::uint64_t>(gridDim.x) * blockDim.x)
+        acc += device_mix((i << 32U) ^ words[i] ^ 0x5bd1e995ULL * (i >> 32U));
+    for (int stride = 16; stride != 0; stride /= 2) acc += __shfl_xor(acc, stride, 32);
+    if ((threadIdx.x & 31U) == 0U) atomicAdd(out, acc);
+}
+std::vector<unsigned long long> digests(Fixture& f) {
+    unsigned long long* d = nullptr;
+    const auto bufs = f.written();
+    check(hipMalloc(&d, 8U * (bufs.size() + 1U)), "digest alloc");
+    check(hipMemsetAsync(d, 0, 8U * (bufs.size() + 1U), f.stream), "digest clear");
+    for (std::size_t k = 0; k < bufs.size(); ++k)
+        hipLaunchKernelGGL(digest_kernel, dim3(1024), dim3(256), 0, f.stream, static_cast<const unsigned*>(bufs[k]->base), bufs[k]->bytes / 4U, d + k);
+    hipLaunchKernelGGL(digest_kernel, dim3(1), dim3(32), 0, f.stream, static_cast<const unsigned*>(static_cast<const void*>(f.view.csr.summary)), std::uint64_t{32}, d + bufs.size());
+    std::vector<unsigned long long> out(bufs.size() + 1U);
+    check(hipMemcpyAsync(out.data(), d, 8U * out.size(), hipMemcpyDeviceToHost, f.stream), "digest read");
+    check(hipStreamSynchronize(f.stream), "digest");
+    (void)hipFree(d);
+    return out;
+}
+// The engine's ordered merge (known_moe_prefill_merge_kernel) over the fixture's views: guards, slot-order v_fmac chain with
+// the route weight as the SGPR operand, accumulation (PrefillRows::clear) and the non-finite flag.
+__global__ void reference_merge_kernel(kr::PrefillRows v, unsigned* header, unsigned hidden, unsigned experts, unsigned top_k) {
+    const unsigned row = blockIdx.y;
+    auto* status = reinterpret_cast<unsigned*>(reinterpret_cast<unsigned char*>(v.status.base) + static_cast<std::uint64_t>(row) * v.status.stride);
+    if (header[0] || *status) return;
+    const unsigned out = blockIdx.x * blockDim.x + threadIdx.x;
+    if (out >= hidden) return;
+    const auto* routes = reinterpret_cast<const unsigned*>(reinterpret_cast<const unsigned char*>(v.routes.base) + static_cast<std::uint64_t>(row) * v.routes.stride);
+    for (unsigned slot = 0; slot < top_k; ++slot) if (routes[slot] >= experts) return;
+    const auto* raw = reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(v.rawdots.base) + static_cast<std::uint64_t>(row) * v.rawdots.stride);
+    const auto* w = reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(v.route_weights.base) + static_cast<std::uint64_t>(row) * v.route_weights.stride);
+    float dots[10];
+#pragma unroll
+    for (unsigned slot = 0; slot < 10U; ++slot) if (slot < top_k) dots[slot] = raw[static_cast<std::uint64_t>(slot) * hidden + out];
+    float current = 0.0F;
+#pragma unroll
+    for (unsigned slot = 0; slot < 10U; ++slot) if (slot < top_k) {
+        const float weight = w[slot];
+        asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(current) : "s"(weight), "v"(dots[slot]));
+    }
+    auto* acc = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(v.clear.base) + static_cast<std::uint64_t>(row) * v.clear.stride);
+    acc[out] = current;
+    if ((__float_as_uint(current) & 0x7fffffffU) >= 0x7f7f8000U) { atomicOr(status, 8U); atomicOr(header, 8U); }
+}
+// qpf2k/moe-mi: reference_merge_kernel when the prologue left the accumulation unzeroed (ROUTE bit 8), mirroring the engine's
+// known_moe_prefill_merge_kernel_z: a zero store on each path where the base merge returns without a store.
+__global__ void reference_merge_kernel_z(kr::PrefillRows v, unsigned* header, unsigned hidden, unsigned experts, unsigned top_k) {
+    const unsigned row = blockIdx.y;
+    auto* status = reinterpret_cast<unsigned*>(reinterpret_cast<unsigned char*>(v.status.base) + static_cast<std::uint64_t>(row) * v.status.stride);
+    auto* acc = reinterpret_cast<float*>(reinterpret_cast<unsigned char*>(v.clear.base) + static_cast<std::uint64_t>(row) * v.clear.stride);
+    const unsigned out = blockIdx.x * blockDim.x + threadIdx.x;
+    if (header[0] || *status) { if (out < hidden) acc[out] = 0.0F; return; }
+    if (out >= hidden) return;
+    const auto* routes = reinterpret_cast<const unsigned*>(reinterpret_cast<const unsigned char*>(v.routes.base) + static_cast<std::uint64_t>(row) * v.routes.stride);
+    for (unsigned slot = 0; slot < top_k; ++slot) if (routes[slot] >= experts) { acc[out] = 0.0F; return; }
+    const auto* raw = reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(v.rawdots.base) + static_cast<std::uint64_t>(row) * v.rawdots.stride);
+    const auto* w = reinterpret_cast<const float*>(reinterpret_cast<const unsigned char*>(v.route_weights.base) + static_cast<std::uint64_t>(row) * v.route_weights.stride);
+    float dots[10];
+#pragma unroll
+    for (unsigned slot = 0; slot < 10U; ++slot) if (slot < top_k) dots[slot] = raw[static_cast<std::uint64_t>(slot) * hidden + out];
+    float current = 0.0F;
+#pragma unroll
+    for (unsigned slot = 0; slot < 10U; ++slot) if (slot < top_k) {
+        const float weight = w[slot];
+        asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(current) : "s"(weight), "v"(dots[slot]));
+    }
+    acc[out] = current;
+    if ((__float_as_uint(current) & 0x7fffffffU) >= 0x7f7f8000U) { atomicOr(status, 8U); atomicOr(header, 8U); }
+}
 const char* const names[] = {"codes", "deltas", "sums", "status", "intermediates", "clear", "down_codes", "down_deltas", "down_sums", "rawdots", "summary"};
-bool compare(const Case& c) {
+bool extreme_coverage(const Fixture& f);
+bool compare(const Case& c, unsigned repeats = 1) {
     Fixture f(c);
+    if (c.gate_type == 42U && (kr::prefill_kernel_form(f.request, c.down_type, 0) != kr::PrefillKernelForm::dot4 ||
+                               kr::prefill_kernel_form(f.request, c.down_type, 1) != kr::PrefillKernelForm::iu8_wmma)) {
+        std::printf("%-34s forms 0/1 are not dot4/iu8\n", c.name);
+        return false;
+    }
     const auto ref = f.run(0), got = f.run(1);
+    for (unsigned r = 1; r < repeats; ++r)
+        if (f.run(1) != got) { std::printf("%-34s form 1 repeat %u differs from its first run\n", c.name, r); return false; }
     // The parallel CSR builder (form 1) against the serial one (form 2, same batch cap): the whole
     // CSR allocation, summary words included, and every output byte.
     const auto csr_parallel = f.csr.read();
@@ -220,6 +395,10 @@ bool compare(const Case& c) {
     std::uint32_t summary; std::memcpy(&summary, ref.back().data(), 4);
     std::size_t bad_rows = 0;
     for (unsigned t = 0; t < c.rows; ++t) { std::uint32_t s; std::memcpy(&s, ref[3].data() + t * f.status.stride, 4); bad_rows += s != 0U; }
+    if (c.gate_type == 42U && c.flavor == 6U) ok = extreme_coverage(f) && ok;
+    if (c.gate_type == 42U && (c.flavor == 0U || c.flavor == 6U) && !c.nan_input && (summary != 0U || bad_rows != 0U)) {
+        std::printf("  unexpected failed rows on a clean fixture\n"); ok = false;
+    }
     std::printf("%-34s %s (summary %#x, rows with status %zu/%u, non-finite words %zu, NaN %zu, NaN sign/payload differences %zu)\n",
         c.name, ok ? "PASS" : "FAIL", summary, bad_rows, c.rows, nonfinite, nan_words, nan_payload);
     return ok;
@@ -248,59 +427,78 @@ __device__ float weight_at(const unsigned char* row, unsigned k, unsigned kind) 
         const unsigned q = (i < 16U ? b[8U + i] & 15U : b[8U + i - 16U] >> 4U) | ((qh >> i) & 1U) << 4U;
         return half_at(b) * static_cast<float>(q) + half_at(b + 2);
     }
+    if (kind_iq(kind)) {
+        const unsigned char* b = row + (k / kind_block_elements(kind)) * kind_block_bytes(kind);
+        const unsigned e = k % kind_block_elements(kind);
+        namespace hg = strix::hip_ggml;
+        return kind == 22U ? hg::block_element<hg::type_iq2_s>(b, e) : kind == 18U ? hg::block_element<hg::type_iq3_xxs>(b, e) :
+            kind == 21U ? hg::block_element<hg::type_iq3_s>(b, e) : kind == 23U ? hg::block_element<hg::type_iq4_xs>(b, e) :
+            hg::block_element<hg::type_iq4_nl>(b, e);
+    }
+    if (kind == 42U) {
+        const unsigned char* b = row + (k / 64U) * 18U;
+        const unsigned i = k % 64U;
+        return half_at(b) * static_cast<float>(static_cast<int>((b[2U + i / 4U] >> (2U * (i % 4U))) & 3U) - 1);
+    }
     const unsigned char* b = row + (k / 32U) * 34U;
     return half_at(b) * static_cast<float>(static_cast<signed char>(b[2U + k % 32U]));
 }
+// Acc = double: the float64 oracle (exact FP32 weight values and BF16 inputs, FP64 sums, h and SiLU in FP64).
+template <class Acc>
 __global__ void reference_gate_up(const unsigned char* gate, const unsigned char* up, unsigned kind, kr::StridedRows<const void> input,
-    kr::StridedRows<const unsigned> routes, unsigned T, unsigned H, unsigned I, unsigned K, float* h) {
+    kr::StridedRows<const unsigned> routes, unsigned T, unsigned H, unsigned I, unsigned K, Acc* h) {
     const unsigned o = blockIdx.x * blockDim.x + threadIdx.x, a = blockIdx.y;
     if (o >= I || a >= T * K) return;
     const unsigned r = a / K, s = a % K;
     const auto* x = reinterpret_cast<const unsigned short*>(static_cast<const unsigned char*>(input.base) + r * input.stride);
     const unsigned e = *(reinterpret_cast<const unsigned*>(reinterpret_cast<const unsigned char*>(routes.base) + r * routes.stride) + s);
-    const std::uint64_t row_bytes = (H / 256U) * (kind == 12U ? 144U : 176U);
+    const std::uint64_t row_bytes = kind_row_bytes(kind, H);
     const unsigned char* gr = gate + (static_cast<std::uint64_t>(e) * I + o) * row_bytes;
     const unsigned char* ur = up + (static_cast<std::uint64_t>(e) * I + o) * row_bytes;
-    float g = 0.0F, u = 0.0F;
+    Acc g = 0, u = 0;
     for (unsigned k = 0; k < H; ++k) {
-        const float v = __uint_as_float(static_cast<unsigned>(x[k]) << 16U);
-        g = fmaf(v, weight_at(gr, k, kind), g); u = fmaf(v, weight_at(ur, k, kind), u);
+        const Acc v = __uint_as_float(static_cast<unsigned>(x[k]) << 16U);
+        g = fma(v, static_cast<Acc>(weight_at(gr, k, kind)), g); u = fma(v, static_cast<Acc>(weight_at(ur, k, kind)), u);
     }
-    h[static_cast<std::uint64_t>(a) * I + o] = (g / (1.0F + expf(-g))) * u;
+    h[static_cast<std::uint64_t>(a) * I + o] = (g / (Acc(1) + exp(-g))) * u;
 }
-__global__ void reference_down(const unsigned char* down, unsigned kind, kr::StridedRows<const unsigned> routes, const float* h,
-    unsigned T, unsigned H, unsigned I, unsigned K, float* raw) {
+template <class Acc>
+__global__ void reference_down(const unsigned char* down, unsigned kind, kr::StridedRows<const unsigned> routes, const Acc* h,
+    unsigned T, unsigned H, unsigned I, unsigned K, Acc* raw) {
     const unsigned n = blockIdx.x * blockDim.x + threadIdx.x, a = blockIdx.y;
     if (n >= H || a >= T * K) return;
     const unsigned r = a / K, s = a % K;
     const unsigned e = *(reinterpret_cast<const unsigned*>(reinterpret_cast<const unsigned char*>(routes.base) + r * routes.stride) + s);
-    const unsigned char* row = down + (static_cast<std::uint64_t>(e) * H + n) * (I / 32U) * (kind == 7U ? 24U : 34U);
-    float acc = 0.0F;
-    for (unsigned k = 0; k < I; ++k) acc = fmaf(h[static_cast<std::uint64_t>(a) * I + k], weight_at(row, k, kind), acc);
+    const unsigned char* row = down + (static_cast<std::uint64_t>(e) * H + n) * kind_row_bytes(kind, I);
+    Acc acc = 0;
+    for (unsigned k = 0; k < I; ++k) acc = fma(h[static_cast<std::uint64_t>(a) * I + k], static_cast<Acc>(weight_at(row, k, kind)), acc);
     raw[static_cast<std::uint64_t>(a) * H + n] = acc;
 }
 // Error of the raw slot dots and of the route-weighted per-row sums of forms 1 (A8) and 3 (FP16)
 // against the reference; form 3 must be deterministic and fail no row.
+// Acc = double (GSQ mode): the float64 oracle; form 1 is then the GSQ dot4 form (GSQ types have no iu8 WMMA form).
+template <class Acc = float>
 bool accuracy(const Case& c) {
     Fixture f(c);
     const unsigned T = c.rows, H = Fixture::H, I = Fixture::I, K = Fixture::K;
-    float *h = nullptr, *raw = nullptr;
-    check(hipMalloc(&h, sizeof(float) * T * K * I), "reference h"); check(hipMalloc(&raw, sizeof(float) * T * K * H), "reference raw");
-    hipLaunchKernelGGL(reference_gate_up, dim3((I + 127U) / 128U, T * K), dim3(128), 0, f.stream, static_cast<const unsigned char*>(f.gate.base),
+    Acc *h = nullptr, *raw = nullptr;
+    check(hipMalloc(&h, sizeof(Acc) * T * K * I), "reference h"); check(hipMalloc(&raw, sizeof(Acc) * T * K * H), "reference raw");
+    hipLaunchKernelGGL(reference_gate_up<Acc>, dim3((I + 127U) / 128U, T * K), dim3(128), 0, f.stream, static_cast<const unsigned char*>(f.gate.base),
         static_cast<const unsigned char*>(f.up.base), c.gate_type, f.view.input, f.view.routes, T, H, I, K, h);
-    hipLaunchKernelGGL(reference_down, dim3((H + 127U) / 128U, T * K), dim3(128), 0, f.stream, static_cast<const unsigned char*>(f.down.base),
+    hipLaunchKernelGGL(reference_down<Acc>, dim3((H + 127U) / 128U, T * K), dim3(128), 0, f.stream, static_cast<const unsigned char*>(f.down.base),
         c.down_type, f.view.routes, h, T, H, I, K, raw);
     check(hipStreamSynchronize(f.stream), "reference");
-    std::vector<float> ref(static_cast<std::size_t>(T) * K * H);
-    check(hipMemcpy(ref.data(), raw, ref.size() * 4U, hipMemcpyDeviceToHost), "read reference");
+    std::vector<Acc> ref(static_cast<std::size_t>(T) * K * H);
+    check(hipMemcpy(ref.data(), raw, ref.size() * sizeof(Acc), hipMemcpyDeviceToHost), "read reference");
     (void)hipFree(h); (void)hipFree(raw);
     std::vector<float> rw(f.weights.bytes / 4U);
     check(hipMemcpy(rw.data(), f.weights.base, f.weights.bytes, hipMemcpyDeviceToHost), "read route weights");
     bool ok = true;
-    std::vector<unsigned char> first3;
+    std::vector<unsigned char> first3, first1;
     for (const int form : {1, 3, 3}) {
         const auto out = f.run(form);
         const auto& rd = out[9];
+        if (form == 1) first1 = rd;
         std::uint32_t summary; std::memcpy(&summary, out.back().data(), 4);
         if (form == 3 && first3.empty()) first3 = rd;
         else if (form == 3 && rd != first3) { std::printf("  form 3 is not deterministic\n"); ok = false; }
@@ -322,6 +520,26 @@ bool accuracy(const Case& c) {
         std::printf("%-34s form %d: summary %#x, raw dots rel RMS error %.3e, max |error| %.3e (%.2f RMS), merged rel RMS error %.3e\n",
             c.name, form, summary, std::sqrt(e2 / r2), emax, emax / rms, std::sqrt(m2 / mr2));
         if (summary) ok = false;
+        if constexpr (std::is_same_v<Acc, double>) {
+            // FP16 activations (~2^-12 relative per value) bound the FP16 form well below 2e-3; A8 codes (delta / 2 per
+            // value) bound the dot4 form below 3e-2. Non-finite errors fail.
+            const double limit = form == 3 ? 2e-3 : 3e-2, raw_rel = std::sqrt(e2 / r2), merged = std::sqrt(m2 / mr2);
+            if (!(raw_rel <= limit) || !(merged <= limit) || !std::isfinite(emax)) {
+                std::printf("  form %d error above the limit %.0e\n", form, limit);
+                ok = false;
+            }
+        }
+    }
+    {
+        // Form 3 against form 1 directly (GSQ: FP16 WMMA vs the dot4 A8 form).
+        double d2 = 0, x2 = 0;
+        for (unsigned t = 0; t < T; ++t) for (unsigned n = 0; n < K * H; ++n) {
+            float a, b;
+            std::memcpy(&a, first1.data() + static_cast<std::size_t>(t) * f.rawdots.stride + 4U * n, 4);
+            std::memcpy(&b, first3.data() + static_cast<std::size_t>(t) * f.rawdots.stride + 4U * n, 4);
+            d2 += (static_cast<double>(b) - a) * (static_cast<double>(b) - a); x2 += static_cast<double>(a) * a;
+        }
+        std::printf("%-34s form 3 vs form 1: raw dots rel RMS difference %.3e\n", c.name, std::sqrt(d2 / x2));
     }
     // A shorter block (other CSR batches, other batch neighbours) gives each of its rows the same bytes.
     if (c.rows >= 32U) {
@@ -334,14 +552,153 @@ bool accuracy(const Case& c) {
     }
     return ok;
 }
+// GSQ equivalence fixtures. Q2_0 gate/up rows whose four blocks per 256 weights share one positive scale hold the
+// same values as Q4_K blocks with sc = m = 1 and dmin = d (d*q - d = d*(q - 1), and q = 1 gives +0 both ways); every
+// Q2_0 down block holds the values of two Q8_0 blocks with codes q - 1 (d * float(q - 1) both ways, any scale).
+__device__ unsigned q20_code(const unsigned char* block, unsigned k) { return (block[2U + k / 4U] >> (2U * (k % 4U))) & 3U; }
+__global__ void q20_share_scales(unsigned char* q20, std::uint64_t superblocks) {
+    for (std::uint64_t s = blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x; s < superblocks;
+         s += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+        unsigned char* b = q20 + s * 72U;
+        const unsigned char lo = b[0], hi = static_cast<unsigned char>(b[1] & 0x7fU);
+        for (unsigned j = 0; j < 4U; ++j) { b[18U * j] = lo; b[18U * j + 1U] = hi; }
+    }
+}
+__global__ void q20_to_q4k(const unsigned char* q20, unsigned char* q4k, std::uint64_t superblocks) {
+    for (std::uint64_t s = blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x; s < superblocks;
+         s += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+        const unsigned char* b = q20 + s * 72U;
+        unsigned char* o = q4k + s * 144U;
+        o[0] = b[0]; o[1] = b[1]; o[2] = b[0]; o[3] = b[1];
+        for (unsigned j = 0; j < 8U; ++j) o[4U + j] = 1U;
+        for (unsigned j = 0; j < 4U; ++j) o[12U + j] = 0x11U;
+        for (unsigned p = 0; p < 4U; ++p)
+            for (unsigned i = 0; i < 32U; ++i)
+                o[16U + 32U * p + i] = static_cast<unsigned char>(q20_code(b + 18U * p, i) | q20_code(b + 18U * p, 32U + i) << 4U);
+    }
+}
+__global__ void q20_to_q80(const unsigned char* q20, unsigned char* q80, std::uint64_t blocks) {
+    for (std::uint64_t b = blockIdx.x * static_cast<std::uint64_t>(blockDim.x) + threadIdx.x; b < blocks;
+         b += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+        const unsigned char* src = q20 + b * 18U;
+        for (unsigned h = 0; h < 2U; ++h) {
+            unsigned char* o = q80 + (2U * b + h) * 34U;
+            o[0] = src[0]; o[1] = src[1];
+            for (unsigned i = 0; i < 32U; ++i) o[2U + i] = static_cast<unsigned char>(static_cast<int>(q20_code(src, 32U * h + i)) - 1);
+        }
+    }
+}
+// Every written byte of two runs (FP32 views: NaN positions must match, not their sign/payload).
+bool same_outputs(const std::vector<std::vector<unsigned char>>& ref, const std::vector<std::vector<unsigned char>>& got, const char* what) {
+    bool ok = true;
+    for (std::size_t v = 0; v < ref.size(); ++v) {
+        const bool fp32 = v == 1U || v == 4U || v == 5U || v == 7U || v == 9U;
+        std::size_t diff = 0, first = ref[v].size();
+        for (std::size_t k = 0; k < ref[v].size(); k += fp32 ? 4U : 1U) {
+            if (fp32) {
+                std::uint32_t a, b; std::memcpy(&a, ref[v].data() + k, 4); std::memcpy(&b, got[v].data() + k, 4);
+                if (a == b) continue;
+                if ((a & 0x7fffffffU) > 0x7f800000U && (b & 0x7fffffffU) > 0x7f800000U) continue;
+            } else if (ref[v][k] == got[v][k]) continue;
+            ++diff; first = std::min(first, k);
+        }
+        if (!diff) continue;
+        ok = false;
+        std::printf("  %s: %s: %zu %s differ, first at byte %zu\n", what, names[v], diff, fp32 ? "words" : "bytes", first);
+    }
+    return ok;
+}
+// Largest CSR batch of the last run (assignments of one expert per CTA).
+unsigned largest_batch(const Fixture& f) {
+    const auto layout = strix::q51_known_rows::scratch_layout(f.c.rows, f.c.experts, Fixture::K, true);
+    const auto bytes = f.csr.read();
+    const auto word = [&](std::uint64_t at) { std::uint32_t v; std::memcpy(&v, bytes.data() + at, 4); return v; };
+    const unsigned batches = word(layout.header + 8U);
+    unsigned largest = 0;
+    for (unsigned b = 0; b < batches; ++b) largest = std::max(largest, word(layout.batch_begins + 4U * (b + 1U)) - word(layout.batch_begins + 4U * b));
+    return largest;
+}
+// Flavor 6 reaches the extreme integers of the Q2_0 A8 group: I = +-12192 (codes +-127 against q = 3), S = +-4064 and
+// I - S = 0 with S != 0 (q = 1); counted over rows 0..7, every slot, outputs 0..63 of the gate weights.
+bool extreme_coverage(const Fixture& f) {
+    const auto codes = f.codes.read(), routes = f.routes.read(), gate = f.gate.read();
+    unsigned long long hit_i = 0, hit_neg_i = 0, hit_s = 0, cancel = 0;
+    const std::uint64_t row_bytes = kind_row_bytes(42U, Fixture::H);
+    for (unsigned t = 0; t < 8U; ++t) for (unsigned slot = 0; slot < Fixture::K; ++slot) {
+        std::uint32_t e; std::memcpy(&e, routes.data() + t * f.routes.stride + 4U * slot, 4);
+        for (unsigned o = 0; o < 64U; ++o) {
+            const unsigned char* w = gate.data() + (static_cast<std::uint64_t>(e) * Fixture::I + o) * row_bytes;
+            for (unsigned g = 0; g < Fixture::H / 32U; ++g) {
+                int dot = 0, sum = 0;
+                for (unsigned k = 0; k < 32U; ++k) {
+                    const unsigned idx = 32U * g + k;
+                    const int a = static_cast<signed char>(codes[t * f.codes.stride + idx]);
+                    const int q = (w[(idx / 64U) * 18U + 2U + (idx % 64U) / 4U] >> (2U * (idx % 4U))) & 3;
+                    dot += a * q; sum += a;
+                }
+                hit_i += dot == 12192; hit_neg_i += dot == -12192; hit_s += sum == 4064 || sum == -4064; cancel += sum != 0 && dot == sum;
+            }
+        }
+    }
+    std::printf("  extreme integers: I=+12192 %llu, I=-12192 %llu, |S|=4064 %llu, I=S!=0 %llu\n", hit_i, hit_neg_i, hit_s, cancel);
+    return hit_i && hit_neg_i && hit_s && cancel;
+}
+bool gsq_equivalence(const Case& c, std::initializer_list<int> forms) {
+    Fixture f(c);
+    const std::uint64_t superblocks = static_cast<std::uint64_t>(c.experts) * Fixture::I * (Fixture::H / 256U);
+    const std::uint64_t down_blocks = static_cast<std::uint64_t>(c.experts) * Fixture::H * (Fixture::I / 64U);
+    hipLaunchKernelGGL(q20_share_scales, dim3(1024), dim3(256), 0, f.stream, static_cast<unsigned char*>(f.gate.base), superblocks);
+    hipLaunchKernelGGL(q20_share_scales, dim3(1024), dim3(256), 0, f.stream, static_cast<unsigned char*>(f.up.base), superblocks);
+    Buffer g4(1, superblocks * 144U), u4(1, superblocks * 144U), d8(1, down_blocks * 68U);
+    hipLaunchKernelGGL(q20_to_q4k, dim3(1024), dim3(256), 0, f.stream, static_cast<const unsigned char*>(f.gate.base), static_cast<unsigned char*>(g4.base), superblocks);
+    hipLaunchKernelGGL(q20_to_q4k, dim3(1024), dim3(256), 0, f.stream, static_cast<const unsigned char*>(f.up.base), static_cast<unsigned char*>(u4.base), superblocks);
+    hipLaunchKernelGGL(q20_to_q80, dim3(1024), dim3(256), 0, f.stream, static_cast<const unsigned char*>(f.down.base), static_cast<unsigned char*>(d8.base), down_blocks);
+    check(hipGetLastError(), "equivalence images"); check(hipStreamSynchronize(f.stream), "equivalence images");
+    bool ok = true;
+    const bool clean = (c.flavor == 0U || c.flavor == 6U) && !c.nan_input;
+    a8::Request production = f.request; production.gate_type = production.up_type = 12U;
+    for (const int form : forms) {
+        // The library's own selection: FP16 kernels for both runs.
+        if (kr::prefill_kernel_form(f.request, 42U, form) != kr::PrefillKernelForm::f16_wmma ||
+            kr::prefill_kernel_form(production, 8U, form) != kr::PrefillKernelForm::f16_wmma) {
+            std::printf("%-40s form %2d: not the FP16 kernels\n", c.name, form); ok = false; continue;
+        }
+        const auto ref = f.run_as(form, 12U, 8U, g4, u4, d8), got = f.run(form);
+        std::uint32_t summary; std::memcpy(&summary, ref.back().data(), 4);
+        const bool same = same_outputs(ref, got, c.name);
+        // CSR batches: up to 128 assignments when the effective tune keeps bit 1, else 64; forced groups fill them.
+        const unsigned tune = kr::prefill_effective_tune(f.request, c.rows, 42U, form), cap = (tune & 2U) ? 128U : 64U;
+        const unsigned largest = largest_batch(f), expected = c.group ? std::min(c.group, cap) : largest;
+        bool status_ok = true;
+        if (clean) {
+            const auto& st = got[3];
+            for (unsigned t = 0; t < c.rows; ++t) { std::uint32_t v; std::memcpy(&v, st.data() + t * f.status.stride, 4); status_ok = status_ok && v == 0U; }
+            status_ok = status_ok && summary == 0U;
+        }
+        std::printf("%-40s form %2d: GSQ Q2_0 FP16 == production Q4_K/Q8_0 FP16 %s (summary %#x, tune %u, largest batch %u%s)\n", c.name, form,
+            same ? "PASS" : "FAIL", summary, tune, largest, status_ok ? "" : ", UNEXPECTED FAILED ROWS");
+        if (largest > cap || largest != expected) { std::printf("  largest batch %u, expected %u (cap %u)\n", largest, expected, cap); ok = false; }
+        ok = ok && same && status_ok;
+    }
+    if (c.flavor == 6U) { (void)f.run(1); ok = extreme_coverage(f) && ok; }  // the A8 run writes the activation codes
+    return ok;
+}
 void bench(const Case& c, int reps) {
     Fixture f(c);
     hipEvent_t start, stop;
     check(hipEventCreate(&start), "event"); check(hipEventCreate(&stop), "event");
-    // BENCH_FORMS: digits of the forms to time (default 013: dot4, iu8 WMMA, FP16 WMMA).
+    // BENCH_FORMS: digits of the forms to time (default 013: dot4, iu8 WMMA, FP16 WMMA), or a comma-separated
+    // list (forms 4..66: FP16 schedules) timed in BENCH_ROUNDS alternating rounds.
     const char* forms = std::getenv("BENCH_FORMS");
-    for (const char* fp = forms ? forms : "013"; *fp; ++fp) {
-        const int form = *fp - '0';
+    std::vector<int> list;
+    const std::string fs = forms ? forms : "013";
+    if (fs.find(',') == std::string::npos) for (const char ch : fs) list.push_back(ch - '0');
+    else for (std::size_t at = 0; at <= fs.size();) {
+        const std::size_t end = std::min(fs.find(',', at), fs.size());
+        list.push_back(std::atoi(fs.substr(at, end - at).c_str())); at = end + 1U;
+    }
+    const int rounds = std::getenv("BENCH_ROUNDS") ? std::atoi(std::getenv("BENCH_ROUNDS")) : 1;
+    for (int round = 0; round < rounds; ++round) for (const int form : list) {
         f.enqueue(form);
         check(hipStreamSynchronize(f.stream), "warm");
         std::vector<float> ms;
@@ -354,7 +711,9 @@ void bench(const Case& c, int reps) {
         }
         std::sort(ms.begin(), ms.end());
         const double macs = static_cast<double>(c.rows) * Fixture::K * 3.0 * Fixture::H * Fixture::I;
-        std::printf("%-30s form %d (%s): median %.3f ms (min %.3f) per %u rows, %.2f effective TOPS\n", c.name, form, form == 3 ? "f16 wmma" : form ? "wmma" : "dot4",
+        const auto kind = kr::prefill_kernel_form(f.request, c.down_type, form);
+        const char* backend = kind == kr::PrefillKernelForm::f16_wmma ? "f16 wmma" : kind == kr::PrefillKernelForm::iu8_wmma ? "iu8 wmma" : "dot4";
+        std::printf("%-30s form %d (%s): median %.3f ms (min %.3f) per %u rows, %.2f effective TOPS\n", c.name, form, backend,
             ms[ms.size() / 2], ms.front(), c.rows, 2.0 * macs / (ms[ms.size() / 2] * 1e9));
     }
     (void)hipEventDestroy(start); (void)hipEventDestroy(stop);
@@ -364,14 +723,340 @@ void bench(const Case& c, int reps) {
 int main(int argc, char** argv) {
     try {
         const std::string mode = argc > 1 ? argv[1] : "test";
+        if (mode == "schedule") {
+            unsigned cases = 0;
+            for (unsigned g : {12U, 13U}) for (unsigned d : {7U, 8U})
+                for (unsigned flavor : {0U, 1U, 2U, 3U, 4U}) {
+                    Fixture f({"FP16 schedule", 40U, 48U, g, d, flavor, true, true, flavor == 2U});
+                    const auto base = f.run(3);
+                    for (int form = 4; form <= 66; ++form) {
+                        if (f.run(form) != base) throw std::runtime_error("FP16 schedule changed written bytes");
+                        ++cases;
+                    }
+                }
+            // Full CSR batches, multiple output tiles and a short final batch: 16 experts (85 assignments each, one
+            // 64 + 21 or one 128-assignment batch), 12 experts (skewed: several above 128) and 10 experts (136
+            // assignments each on average: the batch-major forms take 128-assignment batches).
+            for (unsigned experts : {16U, 12U, 10U}) for (unsigned g : {12U, 13U}) for (unsigned d : {7U, 8U}) for (unsigned flavor : {0U, 4U}) {
+                Fixture f({"FP16 schedule full batches", experts, 136U, g, d, flavor, true, true, false});
+                const auto base = f.run(3);
+                for (int form = 4; form <= 66; ++form) {
+                    if (f.run(form) != base) throw std::runtime_error("FP16 full-batch schedule changed written bytes");
+                    ++cases;
+                }
+            }
+            std::printf("FP16 schedules: %u byte-identical cases PASS\n", cases);
+            return 0;
+        }
+        if (mode == "core2" || mode == "bench2" || mode == "g3" || mode == "p1" || mode == "p1da16" || mode == "route" || mode == "da16" || mode == "small") {
+            // qpf2k/moe. Real-layer specs: "<gguf>:<gate_at>:<up_at>:<down_at>:<gate type>:<down type>" (absolute offsets).
+            struct Spec { std::string path; std::uint64_t g, u, d; unsigned gt, dt; };
+            const auto parse = [](const std::string& x) {
+                Spec r{}; std::size_t at = 0; std::vector<std::string> f;
+                for (;;) { const std::size_t e = x.find(':', at); f.push_back(x.substr(at, e == std::string::npos ? std::string::npos : e - at)); if (e == std::string::npos) break; at = e + 1U; }
+                if (f.size() != 6U) throw std::invalid_argument("layer spec needs 6 fields");
+                r.path = f[0]; r.g = std::stoull(f[1]); r.u = std::stoull(f[2]); r.d = std::stoull(f[3]);
+                r.gt = static_cast<unsigned>(std::stoul(f[4])); r.dt = static_cast<unsigned>(std::stoul(f[5]));
+                return r;
+            };
+            // BENCH_MERGE=1 (bench2): every call includes the ordered merge (reference merge kernel, or the merge check after a
+            // fused down), so a fused-merge core is timed against base down + merge.
+            static const bool with_merge = std::getenv("BENCH_MERGE") && std::getenv("BENCH_MERGE")[0] == '1';
+            const auto merge_only = [](Fixture& f, unsigned rows) {
+                if (!with_merge) return;
+                if (kr::prefill_fused_merge()) kr::enqueue_prefill_merge_check(f.view, rows, Fixture::H, f.c.experts, Fixture::K, f.stream);
+                else if (kr::prefill_clear_skipped()) hipLaunchKernelGGL(reference_merge_kernel_z, dim3((Fixture::H + 255U) / 256U, rows), dim3(256), 0, f.stream, f.view, f.view.csr.summary, Fixture::H, f.c.experts, Fixture::K);
+                else hipLaunchKernelGGL(reference_merge_kernel, dim3((Fixture::H + 255U) / 256U, rows), dim3(256), 0, f.stream, f.view, f.view.csr.summary, Fixture::H, f.c.experts, Fixture::K);
+            };
+            const auto call = [&](Fixture& f, unsigned rows) {
+                f.enqueue(3, rows);
+                merge_only(f, rows);
+            };
+            // pre_merge (p1 gate): summary[0] after the MoE call and before the merge (the merge itself may set bit 8).
+            unsigned da16_missing = 0; // da16 mode: DA16 runs that fell back to the base path (a gate failure)
+            // route mode (qpf2k/moe-mi): csr_bytes = the whole CSR allocation after the MoE call, before the merge.
+            const auto run_digest = [&](Fixture& f, int core, unsigned rows, unsigned* pre_merge = nullptr, int route = 0,
+                                        std::vector<unsigned char>* csr_bytes = nullptr) {
+                kr::set_prefill_core2(core);
+                kr::set_prefill_route((route & 3) | ((route & 32) ? 4 : 0) | ((route & 64) ? 8 : 0)); // bits 0-1, 5 (ROUTE 4), 6 (ROUTE 8)
+                kr::set_prefill_da16((route >> 2) & 1); // route bit 2: STRIX_QPF2K_MOE_DA16
+                { static const int small_rows[4]{0, 32, 64, 128}; kr::set_prefill_small(small_rows[(route >> 3) & 3]); } // bits 3-4: SMALL
+                for (const auto* b : f.written()) b->poison(f.stream);
+                f.csr.poison(f.stream);
+                if (csr_bytes) kr::prefill_test_poison_a16(f.stream); // route mode: the prologue's FP16 image must be rewritten
+                if (route & 4) kr::prefill_test_poison_da16(f.stream); // da16 mode: the DA16 image must be rewritten
+                f.enqueue(3, rows);
+                if ((route & 4) && !kr::prefill_da16_ran()) ++da16_missing; // the DA16 path must actually run
+                if ((route & 24) && !(route & 4) && !kr::prefill_small_ran()) ++da16_missing; // SMALL must actually run
+                if (pre_merge || csr_bytes) {
+                    check(hipStreamSynchronize(f.stream), "core2 run (pre-merge)");
+                    if (pre_merge) check(hipMemcpy(pre_merge, f.view.csr.summary, sizeof(unsigned), hipMemcpyDeviceToHost), "pre-merge summary word");
+                    if (csr_bytes) *csr_bytes = f.csr.read();
+                }
+                merge_only(f, rows);
+                check(hipStreamSynchronize(f.stream), "core2 run");
+                return digests(f);
+            };
+            if (mode == "bench2") {
+                // bench2 <reps> <T> <gate type> <down type> <power (0 = uniform)> <flavor> [layer spec]; BENCH_CORES = list.
+                if (argc < 8) throw std::invalid_argument("bench2 <reps> <T> <g> <d> <power> <flavor> [spec]");
+                const int reps = std::atoi(argv[2]);
+                const unsigned T = static_cast<unsigned>(std::atoi(argv[3]));
+                const double power = std::atof(argv[6]);
+                Case c{"bench2", 512U, T, static_cast<unsigned>(std::atoi(argv[4])), static_cast<unsigned>(std::atoi(argv[5])),
+                    static_cast<unsigned>(std::atoi(argv[7])), false, power > 0.0, false, 0U, power};
+                // BENCH_FULL128=1: every expert count a multiple of 128 (one tile-count copy everywhere; t1b settling test)
+                if (std::getenv("BENCH_FULL128") && std::getenv("BENCH_FULL128")[0] == '1') { c.crafted = true; c.full128 = true; }
+                Spec sp{};
+                if (argc > 8) { sp = parse(argv[8]); c.gguf = sp.path.c_str(); c.gate_at = sp.g; c.up_at = sp.u; c.down_at = sp.d; c.gate_type = sp.gt; c.down_type = sp.dt; }
+                Fixture f(c);
+                const std::string cs = std::getenv("BENCH_CORES") ? std::getenv("BENCH_CORES") : "0,1,0";
+                std::vector<int> cores;
+                for (std::size_t at = 0; at <= cs.size();) { const std::size_t e = std::min(cs.find(',', at), cs.size()); cores.push_back(std::atoi(cs.substr(at, e - at).c_str())); at = e + 1U; }
+                const auto ref = run_digest(f, 0, T);
+                hipEvent_t start, stop;
+                check(hipEventCreate(&start), "event"); check(hipEventCreate(&stop), "event");
+                // BENCH_ROUTES (qpf2k/moe-mi): STRIX_QPF2K_MOE_ROUTE value per arm (same length as BENCH_CORES; default 0 each).
+                std::vector<int> routes;
+                if (const char* rv = std::getenv("BENCH_ROUTES")) {
+                    const std::string rstr = rv;
+                    for (std::size_t at = 0; at <= rstr.size();) { const std::size_t e = std::min(rstr.find(',', at), rstr.size()); routes.push_back(std::atoi(rstr.substr(at, e - at).c_str())); at = e + 1U; }
+                    if (routes.size() != cores.size()) throw std::invalid_argument("BENCH_ROUTES needs one value per BENCH_CORES arm");
+                }
+                for (std::size_t arm = 0; arm < cores.size(); ++arm) {
+                    const int core = cores[arm], route = routes.empty() ? 0 : routes[arm];
+                    // BENCH_NOCHECK=1: attribution probes (G3 cores >= 2048) write wrong bits by design; time them anyway.
+                    static const bool nocheck = std::getenv("BENCH_NOCHECK") && std::getenv("BENCH_NOCHECK")[0] == '1';
+                    const bool same = run_digest(f, core, T, nullptr, route) == ref;
+                    if (!routes.empty()) std::printf("bench2 arm %zu: route %d\n", arm, route);
+                    if (!same && !nocheck) { std::printf("bench2 T%u core %d: bits DIFFER from core 0 -> abort\n", T, core); return 1; }
+                    std::vector<float> ms;
+                    for (int i = 0; i < reps; ++i) {
+                        check(hipEventRecord(start, f.stream), "record"); call(f, T); check(hipEventRecord(stop, f.stream), "record");
+                        check(hipEventSynchronize(stop), "sync");
+                        float t = 0; check(hipEventElapsedTime(&t, start, stop), "elapsed"); ms.push_back(t);
+                    }
+                    std::sort(ms.begin(), ms.end());
+                    const double flop = 2.0 * static_cast<double>(T) * Fixture::K * 3.0 * Fixture::H * Fixture::I;
+                    std::printf("bench2 T%u g%u d%u power %.2f flavor %u %s core %d: median %.3f ms (min %.3f max %.3f) %.2f TOPS bits %s\n",
+                        T, c.gate_type, c.down_type, power, c.flavor, c.full128 ? (c.gguf ? "real-full128" : "synthetic-full128") : c.gguf ? "real" : "synthetic", core, static_cast<double>(ms[ms.size() / 2]),
+                        static_cast<double>(ms.front()), static_cast<double>(ms.back()), flop / (static_cast<double>(ms[ms.size() / 2]) * 1e9), same ? "IDENTICAL" : "DIFFER");
+                    static const bool p1stats = std::getenv("STRIX_QPF2K_MOE_P1STATS") && std::getenv("STRIX_QPF2K_MOE_P1STATS")[0] == '1';
+                    if (core == 257 && p1stats) {
+                        const auto st = kr::prefill_p1_stats();
+                        int khz = 0; check(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, 0), "wall clock rate");
+                        const double ticks = static_cast<double>(st[4]) + 4294967296.0 * static_cast<double>(st[5]);
+                        std::printf("bench2 T%u core 257 p1 stats (last call): down items ran %u skipped %u, waited %u (%.1f %%), polls %u, total wait %.3f ms (sum over items), mean %.1f us per waiting item\n",
+                            T, st[2], st[3], st[0], st[2] ? 100.0 * st[0] / st[2] : 0.0, st[1], khz ? ticks / khz : -1.0, (khz && st[0]) ? 1000.0 * ticks / khz / st[0] : 0.0);
+                    }
+                }
+                (void)hipEventDestroy(start); (void)hipEventDestroy(stop);
+                kr::set_prefill_core2(-1);
+                return 0;
+            }
+            unsigned cases = 0, failed = 0, scratch = 0, early = 0;
+            // Returns the base path's pre-merge summary[0].
+            const auto compare_cores = [&](Fixture& f, unsigned rows, const std::string& what) -> unsigned {
+                // p1 mode (qpf2k P1, design 5): when BOTH paths fail closed in the MoE call with a projection failure only
+                // (pre-merge summary[0] == 8 on both; route/prologue bits 1/2/4 are set before the launch, so both paths skip every
+                // down and the raw dots are compared; a merge-only failure is not pre-merge) the raw dots are scratch the merge never
+                // reads (the base down skipped every batch; P1 down items that started earlier wrote theirs): not compared. Every
+                // status and all 32 summary words are always compared.
+                unsigned pre_base = 0;
+                if (mode == "route" || mode == "da16" || mode == "small") {
+                    // qpf2k/moe-mi STRIX_QPF2K_MOE_ROUTE bits 1/2/3 vs 0 on the base core: the whole CSR allocation (every array,
+                    // the 32 summary words, words left unwritten keep the poison), every written view and summary after the merge.
+                    std::vector<unsigned char> csr_base;
+                    const auto rbase = run_digest(f, 0, rows, &pre_base, 0, &csr_base);
+                    // da16 mode: value 4 (DA16 alone) and 7 (DA16 + route bits 1 and 2).
+                    for (const int route : mode == "da16" ? std::vector<int>{4, 7} : mode == "small" ? std::vector<int>{8, 16, 24, 27} : std::vector<int>{1, 2, 3, 32, 34, 64, 98}) {
+                        unsigned pre_got = 0;
+                        std::vector<unsigned char> csr_got;
+                        const auto got = run_digest(f, 0, rows, &pre_got, route, &csr_got);
+                        ++cases;
+                        bool differ = pre_got != pre_base || csr_got != csr_base;
+                        if (differ) std::printf("  DIFFER %s rows %u route %d: pre-merge summary[0] %u vs %u, csr %s\n", what.c_str(), rows, route,
+                            pre_got, pre_base, csr_got == csr_base ? "same" : "differ");
+                        for (std::size_t k = 0; k < got.size(); ++k) if (got[k] != rbase[k]) {
+                            differ = true;
+                            std::printf("  DIFFER %s rows %u route %d: %s\n", what.c_str(), rows, route, k < 10U ? names[k] : "summary");
+                        }
+                        failed += differ ? 1U : 0U;
+                    }
+                    kr::set_prefill_route(-1);
+                    kr::set_prefill_da16(-1);
+                    kr::set_prefill_small(-1);
+                    return pre_base;
+                }
+                const auto base = run_digest(f, 0, rows, &pre_base);
+                // g3 mode: the qpf2k G3 core (BM 256 both, BM 128 both, G3 gate/up + base down, base gate/up + G3 down; + 32: depth 2).
+                static const std::vector<int> core2_list{1, 17, 65, 129, 145, 321, 449}, g3_list{1025, 1027, 1029, 1041, 1057, 1059, 1061, 1073}, p1_list{257};
+                for (const int core : mode == "g3" ? g3_list : (mode == "p1" || mode == "p1da16") ? p1_list : core2_list) {
+                    unsigned pre_got = 0;
+                    const auto got = run_digest(f, core, rows, &pre_got, mode == "p1da16" ? 4 : 0); // p1da16: P1 + DA16 (route bit 2)
+                    ++cases;
+                    const bool skip_raw = (mode == "p1" || mode == "p1da16") && pre_base == 8U && pre_got == 8U;
+                    scratch += skip_raw ? 1U : 0U;
+                    if (skip_raw && got[9] != base[9]) ++early; // P1 down work that ran before the failure (witness)
+                    bool differ = pre_got != pre_base;
+                    if (differ) std::printf("  DIFFER %s rows %u core %d: pre-merge summary[0] %u vs %u\n", what.c_str(), rows, core, pre_got, pre_base);
+                    for (std::size_t k = 0; k < got.size(); ++k) if (got[k] != base[k] && !(skip_raw && k == 9U)) {
+                        differ = true;
+                        std::printf("  DIFFER %s rows %u core %d: %s\n", what.c_str(), rows, core, k < 10U ? names[k] : "summary");
+                    }
+                    failed += differ ? 1U : 0U;
+                }
+                return pre_base;
+            };
+            std::vector<std::string> keep2; keep2.reserve(256);
+            for (unsigned g : {12U, 13U}) for (unsigned d : {7U, 8U}) {
+                const std::string fmt = " g" + std::to_string(g) + " d" + std::to_string(d);
+                for (unsigned flavor : {0U, 1U, 2U, 3U, 4U}) {
+                    keep2.push_back("E40 T48 dup skew" + fmt + " flavor " + std::to_string(flavor));
+                    Fixture f({keep2.back().c_str(), 40U, 48U, g, d, flavor, true, true, flavor == 2U});
+                    for (unsigned rows : {48U, 24U, 16U}) compare_cores(f, rows, keep2.back());
+                }
+                for (unsigned experts : {16U, 12U, 10U}) for (unsigned flavor : {0U, 4U}) {
+                    keep2.push_back("E" + std::to_string(experts) + " T136 dup skew" + fmt + " flavor " + std::to_string(flavor));
+                    Fixture f({keep2.back().c_str(), experts, 136U, g, d, flavor, true, true, false});
+                    compare_cores(f, 136U, keep2.back());
+                }
+                keep2.push_back("E512 T2048 uniform" + fmt + " flavor 1");
+                { Fixture f({keep2.back().c_str(), 512U, 2048U, g, d, 1U, false, false, false}); compare_cores(f, 2048U, keep2.back()); }
+                keep2.push_back("E512 T8192 skew^1.5" + fmt + " flavor 4");
+                { Fixture f({keep2.back().c_str(), 512U, 8192U, g, d, 4U, false, true, false, 0U, 1.5});
+                  for (unsigned rows : {8192U, 4920U, 4912U, 4096U, 1320U}) compare_cores(f, rows, keep2.back()); }
+            }
+            // Exact expert counts at every tile boundary (T 1024, 512 experts; T 520 for expert counts up to the row count),
+            // all format pairs, plus an invalid route (fails closed in the CSR on both paths).
+            for (unsigned g : {12U, 13U}) for (unsigned d : {7U, 8U}) for (unsigned T : {1024U, 520U}) for (bool bad : {false, true}) {
+                keep2.push_back("crafted T" + std::to_string(T) + " g" + std::to_string(g) + " d" + std::to_string(d) + (bad ? " bad route" : ""));
+                Case c{keep2.back().c_str(), 512U, T, g, d, 4U, false, false, false};
+                c.crafted = true; c.bad_route = bad;
+                Fixture f(c);
+                compare_cores(f, T, keep2.back());
+            }
+            std::printf("core2 synthetic: %u comparisons, %u differ\n", cases, failed);
+            for (int a = 2; a < argc; ++a) {
+                const Spec sp = parse(argv[a]);
+                for (const double power : {0.0, 1.5, 3.0}) {
+                    keep2.push_back("REAL @" + std::to_string(sp.g) + " g" + std::to_string(sp.gt) + " d" + std::to_string(sp.dt) +
+                        (power > 0.0 ? " skew^" + std::to_string(power) : std::string(" uniform")));
+                    Case c{keep2.back().c_str(), 512U, 8192U, sp.gt, sp.dt, 0U, false, power > 0.0, false, 0U, power, sp.path.c_str(), sp.g, sp.u, sp.d};
+                    Fixture f(c);
+                    for (unsigned rows : {8192U, 4920U, 4096U, 1320U, 136U, 24U, 16U}) compare_cores(f, rows, keep2.back());
+                    std::printf("%s: done (%u comparisons so far, %u differ)\n", keep2.back().c_str(), cases, failed);
+                }
+                if (mode == "p1" || mode == "p1da16" || mode == "route" || mode == "da16" || mode == "small") {
+                    // One non-finite input row (row 4096 = T/2): its batches fail while other batches' down items may already have
+                    // run; then 4096 / 1320 rows (without that row) succeed on the same allocations and counter pool.
+                    keep2.push_back("REAL @" + std::to_string(sp.g) + " skew^1.5 one NaN row");
+                    Case c{keep2.back().c_str(), 512U, 8192U, sp.gt, sp.dt, 0U, false, true, true, 0U, 1.5, sp.path.c_str(), sp.g, sp.u, sp.d};
+                    Fixture f(c);
+                    // Expected pre-merge summary[0]: 8 (projection failure) with row 4096 included, 0 without, 8 again at the end.
+                    const unsigned expect[5]{8U, 8U, 0U, 0U, 8U};
+                    unsigned at = 0;
+                    for (unsigned rows : {8192U, 4920U, 4096U, 1320U, 8192U}) {
+                        const unsigned s = compare_cores(f, rows, keep2.back());
+                        if (s != expect[at]) { ++failed; std::printf("  UNEXPECTED %s rows %u: pre-merge summary[0] %u, expected %u\n", keep2.back().c_str(), rows, s, expect[at]); }
+                        ++at;
+                    }
+                    std::printf("%s: done (%u comparisons so far, %u differ)\n", keep2.back().c_str(), cases, failed);
+                }
+            }
+            kr::set_prefill_core2(-1);
+            if (mode == "p1" || mode == "p1da16") std::printf("p1: %u comparisons with a projection-only failure on both paths (raw-dot scratch not compared), %u of them with P1 down work before the failure\n", scratch, early);
+            if (mode == "da16" || mode == "small" || mode == "p1da16") { std::printf("da16: %u runs without the DA16 path\n", da16_missing); failed += da16_missing; }
+            std::printf("%s: %u comparisons, %u differ -> %s\n", mode.c_str(), cases, failed, failed ? "FAIL" : "PASS");
+            return failed ? 1 : 0;
+        }
+        if (mode == "fuse") {
+            // qpf2k/moe core2 bit 9: base (core 0 + reference ordered merge) vs fused (core 513/641 + merge check): every written
+            // buffer (accumulation = clear, statuses, raw dots, ...) and the 32 summary words. Args: real layer specs.
+            unsigned cases = 0, failed = 0;
+            const auto run = [](Fixture& f, int core, unsigned rows) {
+                kr::set_prefill_core2(core);
+                for (const auto* b : f.written()) b->poison(f.stream);
+                f.csr.poison(f.stream);
+                f.enqueue(3, rows);
+                if (core && kr::prefill_fused_merge()) kr::enqueue_prefill_merge_check(f.view, rows, Fixture::H, f.c.experts, Fixture::K, f.stream);
+                else hipLaunchKernelGGL(reference_merge_kernel, dim3((Fixture::H + 255U) / 256U, rows), dim3(256), 0, f.stream, f.view, f.view.csr.summary, Fixture::H, f.c.experts, Fixture::K);
+                check(hipGetLastError(), "merge");
+                check(hipStreamSynchronize(f.stream), "fuse run");
+                const bool fused = kr::prefill_fused_merge();
+                auto d = digests(f);
+                d.push_back(fused ? 1ULL : 0ULL);
+                return d;
+            };
+            const auto cmp = [&](Fixture& f, unsigned rows, const std::string& what) {
+                auto base = run(f, 0, rows);
+                // The serial merge races header reads against non-finite ORs: a base that is not reproducible is skipped.
+                if (run(f, 0, rows) != base) { std::printf("  RACY base %s rows %u: skipped\n", what.c_str(), rows); return; }
+                for (const int core : {513, 641}) {
+                    auto got = run(f, core, rows);
+                    ++cases;
+                    const bool fused = got.back() == 1ULL;
+                    got.back() = 0ULL;
+                    if (!fused) { ++failed; std::printf("  NOT FUSED %s rows %u core %d\n", what.c_str(), rows, core); continue; }
+                    if (got != base) { ++failed; for (std::size_t k = 0; k + 1 < got.size(); ++k) if (got[k] != base[k])
+                        std::printf("  DIFFER %s rows %u core %d: %s\n", what.c_str(), rows, core, k < 10U ? names[k] : "summary"); }
+                }
+            };
+            static std::vector<std::string> keep3; keep3.reserve(128);
+            for (unsigned g : {12U, 13U}) for (unsigned d : {7U, 8U}) for (unsigned flavor : {0U, 1U, 2U, 3U, 4U}) {
+                keep3.push_back("fuse E40 T48 g" + std::to_string(g) + " d" + std::to_string(d) + " flavor " + std::to_string(flavor));
+                Fixture f({keep3.back().c_str(), 40U, 48U, g, d, flavor, true, true, flavor == 2U});
+                cmp(f, 48U, keep3.back());
+            }
+            for (unsigned g : {12U, 13U}) for (bool bad : {false, true}) {
+                keep3.push_back(std::string("fuse crafted T520 g") + std::to_string(g) + (bad ? " bad route" : ""));
+                Case c{keep3.back().c_str(), 512U, 520U, g, 7U, 4U, false, false, false}; c.crafted = true; c.bad_route = bad;
+                Fixture f(c); cmp(f, 520U, keep3.back());
+            }
+            for (unsigned g : {12U, 13U}) for (unsigned d : {7U, 8U}) {
+                keep3.push_back("fuse E512 T2048 g" + std::to_string(g) + " d" + std::to_string(d));
+                Fixture f({keep3.back().c_str(), 512U, 2048U, g, d, 4U, false, true, false, 0U, 1.5});
+                cmp(f, 2048U, keep3.back());
+                Case c{keep3.back().c_str(), 512U, 1024U, g, d, 4U, false, false, false}; c.crafted = true;
+                Fixture fc(c); cmp(fc, 1024U, keep3.back() + " crafted");
+            }
+            for (int a = 2; a < argc; ++a) {
+                const std::string x = argv[a];
+                std::vector<std::string> fl; std::size_t at = 0;
+                for (;;) { const std::size_t e = x.find(':', at); fl.push_back(x.substr(at, e == std::string::npos ? std::string::npos : e - at)); if (e == std::string::npos) break; at = e + 1U; }
+                keep3.push_back("fuse REAL " + fl[1]);
+                Case c{keep3.back().c_str(), 512U, 8192U, static_cast<unsigned>(std::stoul(fl[4])), static_cast<unsigned>(std::stoul(fl[5])), 0U, false, true, false, 0U, 1.5,
+                    nullptr, std::stoull(fl[1]), std::stoull(fl[2]), std::stoull(fl[3])};
+                c.gguf = fl[0].c_str();
+                Fixture f(c);
+                for (unsigned rows : {8192U, 4096U, 1320U}) cmp(f, rows, keep3.back());
+            }
+            kr::set_prefill_core2(-1);
+            std::printf("fuse: %u comparisons, %u differ -> %s\n", cases, failed, failed ? "FAIL" : "PASS");
+            return failed ? 1 : 0;
+        }
+        if (mode == "fastdq") {
+            // MoE tune bit 6: short exact FP16 dequantization == base conversion wherever its check admits it.
+            const unsigned blocks = argc > 2 ? static_cast<unsigned>(std::atoi(argv[2])) : 4096U;
+            const auto c = kr::fast_dequant_selftest(0x5eed5eedULL, blocks);
+            std::printf("fastdq K-quant tested %llu admitted %llu mismatched words %llu | Q5_1 %llu %llu %llu | Q8_0 %llu %llu %llu\n",
+                c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8]);
+            const bool ok = c[2] == 0U && c[5] == 0U && c[1] > 0U && c[4] > 0U;  // Q8_0 (c[6..8]) is informational
+            std::printf("fastdq %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
         if (mode == "bench1") {
-            // bench1 <reps> <T> <gate type> <down type> <skew 0/1>
+            // bench1 <reps> <T> <gate type> <down type> <skew 0/1> [flavor]
             if (argc < 7) throw std::invalid_argument("bench1 <reps> <T> <gate type> <down type> <skew>");
             const unsigned T = static_cast<unsigned>(std::atoi(argv[3])), g = static_cast<unsigned>(std::atoi(argv[4]));
             const unsigned d = static_cast<unsigned>(std::atoi(argv[5]));
-            const std::string name = "E512 T" + std::to_string(T) + (g == 12U ? " q4k" : " q5k") + (d == 7U ? "/q51" : "/q80") +
+            const std::string name = "E512 T" + std::to_string(T) + (g == 12U ? " q4k" : g == 42U ? " q20" : " q5k") +
+                (d == 7U ? "/q51" : d == 42U ? "/q20" : "/q80") +
                 (argv[6][0] == '1' ? " skew" : "");
-            bench({name.c_str(), 512U, T, g, d, 0U, false, argv[6][0] == '1', false}, std::atoi(argv[2]));
+            // Optional argv[7]: weight-scale flavor (4 = one binade, as the production Qwen scales: MoE tune bit 6 admits
+            // every block of them; 0 = scales over seven binades).
+            const unsigned flavor = argc > 7 ? static_cast<unsigned>(std::atoi(argv[7])) : 0U;
+            bench({name.c_str(), 512U, T, g, d, flavor, false, argv[6][0] == '1', false}, std::atoi(argv[2]));
             return 0;
         }
         if (mode == "f16") {
@@ -387,6 +1072,141 @@ int main(int argc, char** argv) {
             failed += accuracy({"E40 T48 skew q5k/q80", 40U, 48U, 13U, 8U, 0U, false, true, false}) ? 0U : 1U;
             failed += accuracy({"E512 T1024 q4k/q51 skew", 512U, 1024U, 12U, 7U, 0U, false, true, false}) ? 0U : 1U;
             std::printf("f16: %u failed\n", failed);
+            return failed ? 1 : 0;
+        }
+        if (mode == "gsq") {
+            // GSQ Q2_0 experts in the fast prefill profile: (1) byte-equivalence with the production FP16 kernels on
+            // weights both formats hold, over FP16 schedule forms; (2) accuracy of the dot4 (form 1) and FP16 (form 3)
+            // forms against the float64 oracle, determinism and batch independence; (3) every schedule form writes the
+            // bytes of form 3, also on edge and non-finite scales.
+            unsigned failed = 0;
+            static std::vector<std::string> labels;
+            labels.reserve(96);
+            // (D) Decoders: every FP16 scale pattern in an even and an odd block, every code byte per position.
+            for (const unsigned seed : {0U, 1U}) {
+                const auto d = kr::gsq_q20_decode_selftest(seed, 1024U);
+                std::printf("gsq Q2_0 decode seed %u: FP16 words %llu, differing %llu (NaN references %llu); iu8 code bytes %llu, differing %llu\n",
+                    seed, d[0], d[1], d[2], d[3], d[4]);
+                failed += d[1] != 0U || d[4] != 0U || d[0] != 128ULL * 65536U || d[3] != 64ULL * 65536U ? 1U : 0U;
+            }
+            // (0) A8 profile: the iu8 WMMA Q2_0 form (forms 1, 2) writes the bytes of the dot4 form (form 0), NaN sign/payload
+            // aside; forced per-expert counts 1..16 (CSR batches of 16), extreme codes, repeated runs.
+            for (unsigned g = 1; g <= 16U; ++g) {
+                labels.push_back("E512 T48 group " + std::to_string(g) + " q20/q20");
+                failed += compare({labels.back().c_str(), 512U, 48U, 42U, 42U, 0U, false, false, false, g}, 2U) ? 0U : 1U;
+            }
+            labels.push_back("E512 T256 extreme q20/q20"); failed += compare({labels.back().c_str(), 512U, 256U, 42U, 42U, 6U, false, false, false}, 3U) ? 0U : 1U;
+            labels.push_back("E40 T48 skew extreme q20/q20"); failed += compare({labels.back().c_str(), 40U, 48U, 42U, 42U, 6U, false, true, false}, 3U) ? 0U : 1U;
+            for (const unsigned flavor : {0U, 1U, 2U, 3U}) {
+                const std::string fmt = std::string("q20/q20") + (flavor == 1U ? " edge" : flavor == 2U ? " nonfinite" : flavor == 3U ? " nonfinite-down" : "");
+                labels.push_back("E512 T256 " + fmt); failed += compare({labels.back().c_str(), 512U, 256U, 42U, 42U, flavor, false, false, false}) ? 0U : 1U;
+                labels.push_back("E64 T128 dup " + fmt); failed += compare({labels.back().c_str(), 64U, 128U, 42U, 42U, flavor, true, false, false}) ? 0U : 1U;
+                labels.push_back("E40 T48 skew " + fmt); failed += compare({labels.back().c_str(), 40U, 48U, 42U, 42U, flavor, false, true, false}) ? 0U : 1U;
+            }
+            labels.push_back("E512 T2048 q20/q20 skew"); failed += compare({labels.back().c_str(), 512U, 2048U, 42U, 42U, 0U, false, true, false}) ? 0U : 1U;
+            labels.push_back("E10 T24 dup q20/q20"); failed += compare({labels.back().c_str(), 10U, 24U, 42U, 42U, 0U, true, true, false}) ? 0U : 1U;
+            labels.push_back("E512 T64 q20/q20 nan input"); failed += compare({labels.back().c_str(), 512U, 64U, 42U, 42U, 0U, false, false, true}) ? 0U : 1U;
+            const std::initializer_list<int> forms{3, 4, 5, 19, 21, 35, 55, 66};
+            const auto equiv = [&](const char* name, unsigned experts, unsigned rows, unsigned flavor, bool dup, bool skew, bool nan) {
+                labels.push_back(name);
+                failed += gsq_equivalence({labels.back().c_str(), experts, rows, 42U, 42U, flavor, dup, skew, nan}, forms) ? 0U : 1U;
+            };
+            equiv("equiv E512 T256 q20", 512U, 256U, 0U, false, false, false);
+            equiv("equiv E64 T128 dup q20", 64U, 128U, 0U, true, false, false);
+            equiv("equiv E40 T48 skew q20", 40U, 48U, 0U, false, true, false);
+            equiv("equiv E16 T136 full batches q20", 16U, 136U, 0U, true, true, false);
+            equiv("equiv E10 T136 full batches q20", 10U, 136U, 0U, true, true, false);
+            equiv("equiv E512 T1024 skew q20", 512U, 1024U, 0U, false, true, false);
+            equiv("equiv E512 T2048 q20", 512U, 2048U, 0U, false, false, false);
+            equiv("equiv E16 T16 q20", 16U, 16U, 0U, false, false, false);
+            equiv("equiv E512 T256 edge-down q20", 512U, 256U, 5U, false, false, false);
+            equiv("equiv E512 T256 nonfinite-down q20", 512U, 256U, 3U, false, false, false);
+            equiv("equiv E512 T64 nan input q20", 512U, 64U, 0U, false, false, true);
+            equiv("equiv E512 T256 extreme q20", 512U, 256U, 6U, false, false, false);
+            // Forced counts at the FP16 batch boundaries (64; 128 with tune bit 1, which needs >= 96 assignments per
+            // expert of the request, hence experts = 10 * groups).
+            const auto forced = [&](unsigned group, unsigned rows) {
+                labels.push_back("equiv group " + std::to_string(group) + " T" + std::to_string(rows) + " q20");
+                const unsigned experts = 10U * ((rows + group - 1U) / group);
+                failed += gsq_equivalence({labels.back().c_str(), experts, rows, 42U, 42U, 0U, false, false, false, group}, forms) ? 0U : 1U;
+            };
+            forced(63U, 128U); forced(64U, 128U); forced(65U, 136U); forced(127U, 512U); forced(128U, 512U); forced(129U, 512U);
+            const auto acc = [&](const char* name, unsigned experts, unsigned rows, bool dup, bool skew) {
+                labels.push_back(name);
+                failed += accuracy<double>({labels.back().c_str(), experts, rows, 42U, 42U, 0U, dup, skew, false}) ? 0U : 1U;
+            };
+            acc("E512 T256 q20/q20", 512U, 256U, false, false);
+            acc("E64 T128 dup q20/q20", 64U, 128U, true, false);
+            acc("E40 T48 skew q20/q20", 40U, 48U, false, true);
+            acc("E512 T1024 skew q20/q20", 512U, 1024U, false, true);
+            acc("E512 T2048 q20/q20", 512U, 2048U, false, false);
+            // (I) IQ types: decoders against the format's element values; FP16 forms against the float64 oracle (the dot4
+            // form as the A8 baseline), determinism and batch independence; schedules.
+            for (const unsigned type : {22U, 18U, 21U, 23U, 20U}) for (const unsigned seed : {0U, 1U}) {
+                const auto d = kr::gsq_iq_decode_selftest(type, seed, 65536U + 4096U);
+                // 69,640 blocks (whole rows): 17,827,840 values for the 256-weight types, 2,228,480 for IQ4_NL; every grid
+                // index (512 / 256 / 1024; IQ4: 16 nibbles) and every sign pattern (256; IQ3_XXS 128 7-bit) seen.
+                const unsigned long long words = type == 20U ? 2228480ULL : 17827840ULL;
+                const unsigned long long gridn = type == 21U ? 512U : type == 18U ? 256U : type == 22U ? 1024U : 16U;
+                const unsigned long long signn = type == 18U ? 128U : type == 20U || type == 23U ? 0U : 256U;
+                std::printf("gsq IQ type %u decode seed %u: FP16 words %llu, differing %llu (NaN references %llu), grid %llu/%llu, signs %llu/%llu\n",
+                    type, seed, d[0], d[1], d[2], d[3], gridn, d[4], signn);
+                failed += d[1] != 0U || d[0] != words || d[3] != gridn || d[4] != signn ? 1U : 0U;
+            }
+            {   // Geometry admission: rows that are not whole dwords keep the A8 forms (H 2304 = 9 IQ3_S blocks, 990 bytes).
+                a8::Request r; r.enabled = true; r.input = a8::InputKind::bf16; r.gate_type = r.up_type = 21U;
+                r.shape = {2304U, 640U, 512U, 10U, 16U};
+                const bool guard = kr::prefill_kernel_form(r, 20U, 3) != kr::PrefillKernelForm::f16_wmma;
+                r.shape.hidden = 2560U;
+                const bool admit = kr::prefill_kernel_form(r, 20U, 3) == kr::PrefillKernelForm::f16_wmma;
+                std::printf("gsq geometry: H 2304 IQ3_S %s, H 2560 %s\n", guard ? "kept on A8" : "FP16 (WRONG)", admit ? "FP16" : "not FP16 (WRONG)");
+                failed += guard && admit ? 0U : 1U;
+            }
+            for (const unsigned g : {22U, 18U, 21U, 23U}) for (const unsigned d : {20U, 42U}) {
+                labels.push_back("E512 T256 iq" + std::to_string(g) + "/" + std::to_string(d));
+                failed += accuracy<double>({labels.back().c_str(), 512U, 256U, g, d, 0U, false, false, false}) ? 0U : 1U;
+            }
+            labels.push_back("E512 T1024 skew iq21/iq20"); failed += accuracy<double>({labels.back().c_str(), 512U, 1024U, 21U, 20U, 0U, false, true, false}) ? 0U : 1U;
+            unsigned cases = 0;
+            // TPC 2 (128-assignment batches: forced groups of 128 at T 512, 40 experts) against TPC 1 forms on the same
+            // fixture: both B layouts write the same bytes; backend and batch sizes asserted.
+            for (const unsigned g : {22U, 18U, 21U, 23U, 42U}) for (const unsigned d : {20U, 42U}) {
+                Fixture f({"GSQ FP16 TPC2 vs TPC1", 40U, 512U, g, d, 0U, false, false, false, 128U});
+                if (kr::prefill_kernel_form(f.request, d, 3) != kr::PrefillKernelForm::f16_wmma ||
+                    !(kr::prefill_effective_tune(f.request, 512U, d, 3) & 2U)) { std::printf("  type %u/%u: not FP16 with bit 1\n", g, d); ++failed; continue; }
+                const auto base = f.run(3);
+                const unsigned largest = largest_batch(f);
+                std::uint32_t summary; std::memcpy(&summary, base.back().data(), 4);
+                bool ok = largest == 128U && summary == 0U;
+                for (const int form : {4, 19, 35, 55}) ok = same_outputs(base, f.run(form), "GSQ FP16 TPC2 vs TPC1") && ok;
+                std::printf("GSQ FP16 TPC2 (batch %u) vs TPC1 forms, gate %u down %u: %s (summary %#x)\n", largest, g, d, ok ? "PASS" : "FAIL", summary);
+                failed += ok ? 0U : 1U;
+            }
+            for (const unsigned g : {22U, 18U, 21U, 23U}) {
+                Fixture f({"GSQ IQ FP16 schedule", 40U, 48U, g, g == 23U ? 42U : 20U, 0U, true, true, false});
+                const auto base = f.run(3);
+                for (int form = 4; form <= 66; ++form) {
+                    if (!same_outputs(base, f.run(form), "GSQ IQ FP16 schedule")) { ++failed; std::printf("  form %d differs (type %u)\n", form, g); }
+                    ++cases;
+                }
+            }
+            for (unsigned flavor : {0U, 1U, 2U, 3U}) {
+                Fixture f({"GSQ FP16 schedule", 40U, 48U, 42U, 42U, flavor, true, true, flavor == 2U});
+                const auto base = f.run(3);
+                for (int form = 4; form <= 66; ++form) {
+                    if (!same_outputs(base, f.run(form), "GSQ FP16 schedule")) { ++failed; std::printf("  form %d differs (flavor %u)\n", form, flavor); }
+                    ++cases;
+                }
+            }
+            for (unsigned experts : {16U, 10U}) {
+                Fixture f({"GSQ FP16 schedule full batches", experts, 136U, 42U, 42U, 0U, true, true, false});
+                const auto base = f.run(3);
+                for (int form = 4; form <= 66; ++form) {
+                    if (!same_outputs(base, f.run(form), "GSQ FP16 schedule full batches")) { ++failed; std::printf("  form %d differs\n", form); }
+                    ++cases;
+                }
+            }
+            std::printf("GSQ FP16 schedules: %u cases\ngsq: %u failed\n", cases, failed);
             return failed ? 1 : 0;
         }
         if (mode == "bench") {

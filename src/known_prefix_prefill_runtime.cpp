@@ -6,6 +6,7 @@
 #include "strix/launch_dispatch.hpp"
 #include "strix/ple_lookup.hpp"
 #include "strix/runtime_launchers.hpp"
+#include "strix/rows_launch_registry.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -64,19 +65,35 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         std::find(hooks.preflight_memo->begin(),hooks.preflight_memo->end(),preflight_key)!=hooks.preflight_memo->end();
     if(!preflight_known) validate_compiled_known_prefix_prefill(plan,serial);
     lap("plan");
-    const auto rows=plan.logical_rows;const auto steps=serial.execution.steps.size();
+    // STRIX_QPF2K_SCHED bit 4: a partial block runs the first tokens.size() rows of the compiled T arena.
+    const auto rows=hooks.partial_rows?static_cast<std::uint32_t>(tokens.size()):plan.logical_rows;const auto steps=serial.execution.steps.size();
     require(tokens.size()==rows,"known prefill token count differs from compiled T");
+    if(hooks.partial_rows)
+        require(rows>=16U&&rows%8U==0U&&rows<=plan.logical_rows&&plan.output_policy!=KnownWindowOutputPolicy::all_rows,
+            "known prefill partial block needs 16..T rows in multiples of 8 and a terminal-row or state-only plan");
     require(hooks.preflight_scope&&hooks.complete&&hooks.quiesce_or_fail_stop,"known prefill requires scope/completion/fail-stop hooks");
     if(session.health!=SerialSessionHealth::ready) throw std::logic_error("known prefill requires a ready serial session");
     require(session.execution_identity==serial.execution_identity&&session.execution_identity,"known prefill source session identity differs");
-    validate_execution_runtime_resources(serial.execution_identity,serial.arena,serial_resources,session.next_position);
     // Every row context binds these model objects: the launch's tensor lookups skip re-validating
     // the whole binding (about 1000 lookups per row, 61 % of the host time of a 4K prompt).
+    // STRIX_PREFILL_PIPE bit 8: the scope opens (validating the pair) before the resource check, which then skips it.
+    static const bool early_scope=[]{const char* v=std::getenv("STRIX_PREFILL_PIPE");return v&&(std::strtoul(v,nullptr,0)&8UL)!=0UL;}();
     std::optional<ValidatedModelBindingScope> binding_scope;
-    if(!serial_resources.distributed_stage) binding_scope.emplace(*serial_resources.model_manifest,*serial_resources.model_weights);
+    if(early_scope&&!serial_resources.distributed_stage&&serial_resources.model_manifest&&serial_resources.model_weights)
+        binding_scope.emplace(*serial_resources.model_manifest,*serial_resources.model_weights);
+    lap("binding");
+    validate_execution_runtime_resources(serial.execution_identity,serial.arena,serial_resources,session.next_position);
+    lap("resources");
+    if(!binding_scope&&!serial_resources.distributed_stage) binding_scope.emplace(*serial_resources.model_manifest,*serial_resources.model_weights);
     // Likewise each row's arena plan is indexed once instead of searched linearly per buffer.
-    const ArenaLookupScope arena_lookup;
+    // STRIX_PREFILL_PIPE bit 128: the owner's persistent uniform index of its row views answers them instead
+    // (no per-block indexing of every row view and no teardown of those indices at the end of the block).
+    static const bool persistent_views=[]{const char* v=std::getenv("STRIX_PREFILL_PIPE");return v&&(std::strtoul(v,nullptr,0)&128UL)!=0UL;}();
+    std::optional<ArenaLookupScope> arena_lookup;
+    if(persistent_views&&hooks.arena_index&&!hooks.arena_index->empty()) arena_lookup.emplace(*hooks.arena_index);
+    else arena_lookup.emplace();
     const auto identities=build_runtime_execution_identities(serial.execution_identity,serial.arena,serial_resources);
+    lap("identities");
     require(session.runtime_compatibility_identity==identities.compatibility_identity&&
         session.state_layout_identity==serial_resources.session_state_layout->layout_identity&&
         plan.tile8.manifest_layout_identity==serial_resources.model_manifest->layout_identity&&
@@ -89,6 +106,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     auto lineage=prepare_prefill_chunk_lineage(session.arithmetic_lineage,session.next_position,post,
         plan.prefill_execution_identity,plan.prefill_kernel_plan_identity,plan.prefill_execution_identity);
     validate_execution_memory_binding(plan.prefill_execution_identity,plan.arena.physical,memory);
+    lap("lineage");
     const auto disjoint=[&](std::uintptr_t base,std::uint64_t bytes) {
         if(!bytes) return;
         require(base&&bytes<=UINTPTR_MAX-base,"known prefill borrowed owner extent overflows");
@@ -99,6 +117,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     const auto& state_memory=*serial_resources.session_state_memory;
     disjoint(state_memory.device_base,state_memory.device_bytes);disjoint(state_memory.host_base,state_memory.host_bytes);
     for(const auto& tensor:serial_resources.model_weights->tensors) if(tensor.address) disjoint(tensor.address,tensor.bytes);
+    lap("disjoint");
     require(!serial_resources.ple_prefetch||!serial_resources.ple_prefetch->active,"known prefill cannot borrow an active PLE lookup");
     require(launch.execution_identity==plan.prefill_execution_identity&&launch.plan_identity&&launch.steps.size()==steps,
         "known prefill requires a fresh source launcher plan");
@@ -147,7 +166,9 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     };
     // Full T admission is streamed on the host. No T*steps context table or T
     // copies of compiled topology/catalogs are created.
+    lap("launchers");
     validate_execution_runtime_resources(plan.prefill_execution_identity,plan.arena.physical,resources,session.next_position);
+    lap("resources2");
     EagerExecutionRequest request;request.input_token_id=tokens[0];request.position=session.next_position;request.state=session.state;
     validate_eager_execution_preflight(serial.execution,serial.bindings,serial.io,plan.arena.row_view[0],request,
         resources.session_state_layout,resources.session_state_memory,&resources);
@@ -159,7 +180,26 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     require(steps<=UINT32_MAX/rows,"known prefill logical work counter overflows");
     KnownWindowResult result;result.execution.state=session.state;
     const bool headless=hooks.skip_head;
-    if(!headless) {result.logit_row_indices=plan.logit_row_indices;result.logits.resize(plan.logit_row_indices.size());}
+    // A headless block skips its head. STRIX_PREFILL_PIPE bit 4: it also skips the final hyper mix before it, whose
+    // rows only the head reads (the MTP tap is the last MLP injection; no state is written after it).
+    static const bool skip_final_mix=[]{const char* v=std::getenv("STRIX_PREFILL_PIPE");return v&&(std::strtoul(v,nullptr,0)&4UL)!=0UL;}();
+    std::size_t headless_from=steps-1U-(skip_final_mix&&steps>=2U&&serial.execution.steps[steps-2U].op==SerialOp::final_hyper_mix&&
+        serial.execution.steps[steps-2U].writes_state==PersistentState::none?1U:0U);
+    // STRIX_PREFILL_PIPE bit 64: with no step observer, a headless block stops after its last persistent-state write
+    // (the last layer's KV/recurrent update): the rest of that layer, the final mix and the head feed nothing the
+    // session keeps, and the next block starts from its own embeddings.
+    static const bool skip_tail=[]{const char* v=std::getenv("STRIX_PREFILL_PIPE");return v&&(std::strtoul(v,nullptr,0)&64UL)!=0UL;}();
+    if(skip_tail&&headless&&!hooks.after_step) {
+        std::size_t last_write=0;
+        for(std::size_t i=0;i<steps;++i) if(serial.execution.steps[i].writes_state!=PersistentState::none) last_write=i;
+        if(last_write+1U<headless_from) headless_from=last_write+1U;
+    }
+    if(!headless) {
+        if(hooks.partial_rows) {
+            if(plan.output_policy==KnownWindowOutputPolicy::terminal_row) result.logit_row_indices={rows-1U};
+        } else result.logit_row_indices=plan.logit_row_indices;
+        result.logits.resize(result.logit_row_indices.size());
+    }
     result.omitted_lm_heads=rows-static_cast<std::uint32_t>(result.logit_row_indices.size());
     result.logical_row_steps=static_cast<std::uint32_t>(rows*steps)-result.omitted_lm_heads;
     result.execution.completion_order.reserve(rows*steps);
@@ -167,8 +207,8 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         const auto c=context(steps-1U,row);require(c.writes.size()==1U,"known prefill head needs one output");
         const auto output=resolve_dispatch_write(c,0);
         require(serial.vocab_size<=UINT64_MAX/sizeof(float)&&output.bytes>=serial.vocab_size*sizeof(float),"known prefill logit row is undersized");
-        const auto found=std::find(plan.logit_row_indices.begin(),plan.logit_row_indices.end(),row);
-        if(found!=plan.logit_row_indices.end()) result.logits[static_cast<std::size_t>(found-plan.logit_row_indices.begin())]=output;
+        const auto found=std::find(result.logit_row_indices.begin(),result.logit_row_indices.end(),row);
+        if(found!=result.logit_row_indices.end()) result.logits[static_cast<std::size_t>(found-result.logit_row_indices.begin())]=output;
     }
     const auto position=resolve_dispatch_state(context(0,0),SessionStateComponent::position_history);
     require(position.storage==SessionStateStorage::host&&position.address&&position.bytes>=8U&&position.bytes<=UINTPTR_MAX-position.address,
@@ -199,7 +239,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         // (re-running those costs ~17 ms of idle GPU per 64-row block). Their launchers still admit
         // each context before enqueueing, so an out-of-capacity block fails during launch (session
         // poisoned) instead of before it; capacity and positions are checked above for every block.
-        if(preflight_known||(headless&&step+1U==steps)) continue;
+        if(preflight_known||(headless&&step>=headless_from)) continue;
         const auto step_begin=timing?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         const auto step_done=[&]{
             if(timing) mode_ms[static_cast<std::size_t>(mode)%mode_ms.size()]+=
@@ -266,14 +306,29 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
                 ~LaunchLap(){if(on){total+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();++count;}}
             } launch_lap{timing,launch_begin,launch_ms[static_cast<std::size_t>(mode)%launch_ms.size()],launch_steps[static_cast<std::size_t>(mode)%launch_steps.size()]};
             const bool rows_entry=known_window_rows_mode(mode);
-            if(headless&&step+1U==steps) break;
+            if(headless&&step>=headless_from) break;
             if(rows_entry&&full_by_id[id]&&rows%8U==0U) {
                 std::vector<ExecutionDispatchContext> all(rows);for(std::uint32_t r=0;r<rows;++r) all[r]=context(step,r);
                 auto correlation=current_execution_correlation();correlation.execution_identity=plan.prefill_execution_identity;
                 correlation.position=all[0].position;correlation.step_id=source.id;correlation.op=source.op;correlation.layer=source.layer.value_or(UINT32_MAX);
                 correlation.rows=rows;correlation.row=UINT32_MAX;correlation.phase=ExecutionPhase::operator_step;
                 ExecutionCorrelationScope observed(correlation);
-                full_by_id[id]->launch(all,full_by_id[id]->config);
+                // STRIX_QPF2K_HC: the owner may enqueue this step folded with the full-T steps after it.
+                // A step the after_step observer reads is never folded (nor folded into an earlier step's fold).
+                const auto step_observed=[&](std::size_t s) {return hooks.after_step&&(!hooks.after_step_observes||hooks.after_step_observes(s));};
+                const auto full_entry=[&](std::size_t s) {
+                    if(s>=steps||(headless&&s>=headless_from)||step_observed(s)) return false;
+                    const auto m=plan.tile8.mode[s];const auto i=static_cast<std::uint32_t>(plan.tile8.r2_variant[s]);
+                    return known_window_rows_mode(m)&&full_by_id[i]!=nullptr&&rows%8U==0U;
+                };
+                const auto contexts_of=[&](std::size_t s) {
+                    std::vector<ExecutionDispatchContext> v(rows);for(std::uint32_t r=0;r<rows;++r) v[r]=context(s,r);return v;
+                };
+                // STRIX_QPF2K_SCHED first: its hook enqueues only the detached shared expert itself and records the
+                // side-stream join before every other step, so a step that the HC fold enqueues (below) is ordered after it.
+                if(!(hooks.prefill_step&&hooks.prefill_step(step,all))
+                    &&!(hooks.prefill_before_step&&!step_observed(step)&&hooks.prefill_before_step(step,all,full_entry,contexts_of)))
+                    full_by_id[id]->launch(all,full_by_id[id]->config);
                 // Counted per 8-row tile, like the tile path, so receipts compare across both.
                 const auto tiles=rows/8U;
                 if(mode==KnownWindowStepMode::shared_rows) result.shared_rows_dispatches+=tiles;
@@ -287,6 +342,23 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
                 observe(step);
                 continue;
             }
+            // STRIX_PREFILL_PIPE bit 16: a row-loop step with a registered rows form (same per-element arithmetic,
+            // every row admitted as its one-row launch admits it) runs all rows in one launch when their buffers sit
+            // at one pitch; otherwise (or with telemetry) row by row below. Position readers and the head stay per row.
+            // Any other step: the schedule hook only orders it after work it detached (never enqueues it).
+            if(hooks.prefill_step&&hooks.prefill_step(step,{})) throw std::logic_error("known prefill schedule hook took a row step");
+            static const bool rows_loops=[]{const char* v=std::getenv("STRIX_PREFILL_PIPE");return v&&(std::strtoul(v,nullptr,0)&16UL)!=0UL;}();
+            if(rows_loops&&mode==KnownWindowStepMode::r1_row_loop&&rows>1U&&step+1U!=steps&&!launch.steps[step].runtime_step&&
+                !reads_position(source.reads_state)&&source.op!=SerialOp::ple&&!current_execution_telemetry())
+                if(const auto batched=rows_launch_for(launch.steps[step].function)) {
+                    std::vector<ExecutionDispatchContext> all(rows);for(std::uint32_t r=0;r<rows;++r) all[r]=context(step,r);
+                    if(batched(all,launch.steps[step].user_data)) {
+                        result.row_loop_dispatches+=rows;result.execution.kernel_steps+=rows;result.execution.completed_steps+=rows;
+                        for(std::uint32_t r=0;r<rows;++r){result.execution.completion_order.push_back(source.id);result.execution.state.publish_write(source.writes_state);}
+                        observe(step);
+                        continue;
+                    }
+                }
             const auto width=mode==KnownWindowStepMode::r1_row_loop?1U:(rows_entry?8U:2U);
             // All tiles of this source step run before advancing to its next
             // consumer/layer. Recurrent/conv/PLE/QSA rows remain increasing.

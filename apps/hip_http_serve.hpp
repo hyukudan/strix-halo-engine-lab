@@ -4,6 +4,7 @@
 // own threads and only exchange tokens with it through tickets (docs/engine/serving/serving.md).
 #include "hip_decode_options.hpp"
 #include "hip_mtp_decode_bridge.hpp"
+#include "rtx_state_import_routes.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/engine.hpp"
@@ -58,6 +59,7 @@ public:
         stats.decode_ms = result.decode_ms;
         stats.finish = result.finish;
         stats.sampling = "greedy";
+        if (!result.rtx_import_json.empty()) stats.engine_extra.emplace_back("rtx_import", result.rtx_import_json);
         return stats;
     }
     [[nodiscard]] std::uint64_t context_tokens() const override { return context_; }
@@ -85,8 +87,10 @@ inline std::string read_http_api_key(const std::string& path) {
 }
 
 // Serves until SIGINT/SIGTERM or an engine failure (rethrown after the server stops).
-inline MtpDecodeServe make_http_serve(const Options& options, std::string engine_description) {
-    return [&options, engine_description = std::move(engine_description)](const MtpServeRunner& run) {
+// rtx_import (--rtx-state-import): the /admin/rtx-import/* routes over these imports; null: no route.
+inline MtpDecodeServe make_http_serve(const Options& options, std::string engine_description,
+    std::shared_ptr<RtxStateImportRegistry> rtx_import = {}) {
+    return [&options, engine_description = std::move(engine_description), rtx_import](const MtpServeRunner& run) {
         const auto tokenizer = serve::BpeTokenizer::load_gguf(options.model_path);
         serve::ApiConfig config;
         config.model_id = options.http_model_id;
@@ -99,6 +103,10 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         if (options.eos_token) config.stop_tokens.push_back(*options.eos_token);
         std::sort(config.stop_tokens.begin(), config.stop_tokens.end());
         config.stop_tokens.erase(std::unique(config.stop_tokens.begin(), config.stop_tokens.end()), config.stop_tokens.end());
+        if (rtx_import)
+            config.engine_routes = [rtx_import](const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
+                return handle_rtx_state_import_route(*rtx_import, request, response);
+            };
 
         MtpBridgeEngine engine(run, options.context_tokens);
         serve::GenerationQueue queue(options.http_max_queue);
@@ -107,6 +115,8 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         http.bind_address = options.http_bind;
         http.port = static_cast<std::uint16_t>(options.http_port);
         http.max_connections = options.http_max_connections;
+        // Import chunks of up to 256 MiB (opt-in route only; the default limit stays 64 MiB).
+        if (rtx_import) http.max_body_bytes = std::max<std::uint64_t>(http.max_body_bytes, 256ULL << 20U);
         serve::HttpServer server(http, [&api](const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
             api.handle(request, response);
         });
@@ -157,6 +167,10 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         std::sort(config.stop_tokens.begin(), config.stop_tokens.end());
         config.stop_tokens.erase(std::unique(config.stop_tokens.begin(), config.stop_tokens.end()), config.stop_tokens.end());
         const bool samples = options.http_sampling == "sample";
+        // Strict tool-call frame proposals (opt-in) need the template's frame tokens.
+        if (const auto open = tokenizer->find("<tool_call>"), close = tokenizer->find("</tool_call>");
+            open != UINT32_MAX && close != UINT32_MAX && open != close)
+            runner.frame_tokens = {open, close};
 
         serve::GenerationQueue queue(options.http_max_queue);
         serve::ApiService api(config, tokenizer, queue, options.context_tokens, samples);
@@ -202,6 +216,10 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
             request.max_tokens = job.max_tokens;
             request.stop_tokens = job.stop_tokens;
             request.on_tokens = job.on_tokens;
+            request.ngram_draft = job.ngram_draft;
+            request.draft_depth_max = job.draft_depth_max;
+            request.tool_draft = job.tool_draft;
+            request.ngram_peers = job.ngram_peers;
             std::string sampling = "greedy";
             if (samples && job.sampling.temperature > 0.0) {
                 TokenSamplingPolicy policy;
@@ -226,6 +244,15 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                 stats.accepted = result.accepted;
                 stats.prefill_ms = result.prompt_ms;
                 stats.decode_ms = result.decode_ms;
+                stats.ngram_rows = result.ngram_rows;
+                stats.ngram_accepted = result.ngram_accepted;
+                stats.tool_rows = result.tool_rows;
+                stats.tool_accepted = result.tool_accepted;
+                stats.source_shadow = result.source_shadow;
+                stats.source_scored = result.source_scored;
+                stats.source_right = result.source_right;
+                stats.frame_cycles = result.frame_cycles;
+                stats.frame_shadow = result.frame_shadow;
                 stats.finish = result.finish;
                 stats.sampling = sampling;
                 queue.finish(*taken, std::move(stats));

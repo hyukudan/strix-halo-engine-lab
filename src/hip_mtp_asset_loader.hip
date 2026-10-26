@@ -76,9 +76,17 @@ std::shared_ptr<const HipMtpAssets> HipMtpAssets::load(const ModelContract& mode
     s.sidecar_manifest=build_mtp_sidecar_manifest(model,info,evidence);
     s.source=inspect_mtp_sidecar_source(model,info,evidence);
     // The existing planner applies explicit limits BEFORE actual HIP resources.
-    (void)plan_hip_model_residency_reservation(*s.sidecar_map,s.sidecar_manifest,request.residency);
+    // STRIX_MODEL_COPY_ALL (opt-in): the registered sidecar becomes a page-congruent copied arena too (tier all, no
+    // userptr registration), under the same explicit sidecar budgets.
+    auto residency=request.residency;
+    if(hip_model_copy_all_mode() && residency.mode==HipModelResidencyMode::registered_file_mapping &&
+       residency.copy_tier==HipModelCopyTier::none && !residency.promote_file_backed_candidates) {
+        residency.copy_tier=HipModelCopyTier::all;residency.coalesce_gap_bytes=0;
+        residency.copy_payload_bytes=selective_copy_payload_bytes(s.sidecar_manifest,HipModelCopyTier::all);
+    }
+    (void)plan_hip_model_residency_reservation(*s.sidecar_map,s.sidecar_manifest,residency);
     s.sidecar=std::make_shared<const HipModelResidency>(HipModelResidency::create(
-        s.sidecar_map,s.sidecar_manifest,generations,request.residency));
+        s.sidecar_map,s.sidecar_manifest,generations,residency));
     s.sidecar_map->validate_unchanged();s.target_map->validate_unchanged();
     s.shared=bind_mtp_shared_target_tensors(model,s.source,s.sidecar_manifest,s.sidecar->binding(),
         s.target_manifest,s.target->binding(),request.expected_target_content,s.sidecar,s.target);

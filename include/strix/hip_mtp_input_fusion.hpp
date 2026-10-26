@@ -1,6 +1,7 @@
 #pragma once
 #include "strix/mtp_forward_semantics.hpp"
 #include <cstdint>
+#include <span>
 
 namespace strix {
 struct HipMtpInputFusionView {
@@ -33,6 +34,14 @@ void preflight_hip_mtp_input_fusion(const HipMtpInputFusionRequest&);
 // Draft-only variant: same norms, then one fused wave-per-row projection and
 // broadcast add (different summation order; replay/teacher rows keep the exact one).
 void launch_hip_mtp_input_fusion_draft(const HipMtpInputFusionRequest&,void* stream);
+// Multi-session draft batch: per-session addresses of the views that differ between sessions.
+struct HipMtpInputFusionRows {
+    std::uintptr_t embedding[8]{},wide_hidden[8]{},normalized[8]{},output[8]{};
+};
+// Batched launch_hip_mtp_input_fusion_draft (production branch: Q4 copy, HC 4): token t's output equals the
+// one-token draft launcher on requests[t] alone, bit for bit. Requests may differ only in their per-session
+// views (embedding, wide hidden, scratch, output); at most 8 requests.
+void launch_hip_mtp_input_fusion_draft_rows(std::span<const HipMtpInputFusionRequest> requests,void* stream);
 // Includes geometry, norm encoding, reduction and all declared cast boundaries.
 // An identity is not readiness, checkpoint equivalence or native qualification.
 [[nodiscard]] std::uint64_t hip_mtp_input_fusion_profile_identity(const HipMtpInputFusionRequest&);

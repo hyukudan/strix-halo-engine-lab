@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #pragma clang fp contract(off)
+#include "strix/hip_gsq_a8_groups.hpp"
 #if defined(__HIP_DEVICE_COMPILE__)
 #if !defined(__gfx1151__)
 #error "Experimental Q4K A8 probe admits gfx1151 only"
@@ -269,6 +270,82 @@ __global__ void project_q5k(const unsigned char* gate,const unsigned char* up,co
     acc=acc+__shfl_xor(acc,4,32);
     if(c==0) output[(slot*2U+which)*rows+row]=acc;
 }
+// GSQ-RCO Q2_0 gate/up (q20_numerical_identity): 8 lanes per output row, lane c owns the A8 groups
+// g = c (mod 8). Group g = half g%2 of the 18-byte block g/2 (fp16 d, then 64 2-bit codes, element j
+// at bits 2(j%4) of byte j/4): each code byte expands to one u8x4 word in element order.
+__device__ __forceinline__ unsigned q20_word(unsigned byte) {
+    return (byte|(byte<<6U)|(byte<<12U)|(byte<<18U))&0x03030303U;
+}
+__device__ __forceinline__ unsigned q20_u16(const unsigned char* p) {
+    return static_cast<unsigned>(p[0])|(static_cast<unsigned>(p[1])<<8U);
+}
+// delta_g * (d * float(I - S)) of one 32-code group: half of `block`, activation image `a` (8 words).
+__device__ __forceinline__ float q20_group(const unsigned char* block,unsigned half,const int* a,int sum,float delta) {
+    const auto* codes=block+2U+half*8U;
+    const unsigned w01=q20_u16(codes),w23=q20_u16(codes+2U),w45=q20_u16(codes+4U),w67=q20_u16(codes+6U);
+    int integer=dot(a[0],q20_word(w01&255U),0);integer=dot(a[1],q20_word(w01>>8U),integer);
+    integer=dot(a[2],q20_word(w23&255U),integer);integer=dot(a[3],q20_word(w23>>8U),integer);
+    integer=dot(a[4],q20_word(w45&255U),integer);integer=dot(a[5],q20_word(w45>>8U),integer);
+    integer=dot(a[6],q20_word(w67&255U),integer);integer=dot(a[7],q20_word(w67>>8U),integer);
+    const float d=half_float(q20_u16(block));
+    const float scaled=d*static_cast<float>(integer-sum);
+    return delta*scaled;
+}
+__global__ void project_q20(const unsigned char* gate,const unsigned char* up,const unsigned* routes,
+    const signed char* codes,const float* deltas,const int* sums,const unsigned* status,
+    float* output,unsigned hidden,unsigned rows) {
+    __shared__ __align__(16) signed char local_codes[max_hidden];
+    __shared__ __align__(16) float local_deltas[max_hidden/32U];
+    __shared__ __align__(16) int local_sums[max_hidden/32U];
+    if(*status!=0) return;
+    for(unsigned i=threadIdx.x;i<hidden;i+=256U) local_codes[i]=codes[i];
+    for(unsigned i=threadIdx.x;i<hidden/32U;i+=256U) {local_deltas[i]=deltas[i];local_sums[i]=sums[i];}
+    __syncthreads();
+    const unsigned lane=threadIdx.x&31U,c=lane&7U;
+    const unsigned row=blockIdx.x*32U+(threadIdx.x/32U)*4U+lane/8U;
+    const unsigned which=blockIdx.y,slot=blockIdx.z,expert=routes[slot];
+    const unsigned groups=hidden/32U;
+    const auto* weights=(which==0?gate:up)+(static_cast<unsigned long long>(expert)*rows+row)*(hidden/64U)*18U;
+    float acc=0.0F;
+    #pragma unroll 1
+    for(unsigned g=c;g<groups;g+=8U) {
+        const float value=q20_group(weights+(g/2U)*18U,g&1U,reinterpret_cast<const int*>(local_codes+g*32U),
+            local_sums[g],local_deltas[g]);
+        acc=acc+value;
+    }
+    acc=acc+__shfl_xor(acc,1,32);
+    acc=acc+__shfl_xor(acc,2,32);
+    acc=acc+__shfl_xor(acc,4,32);
+    if(c==0) output[(slot*2U+which)*rows+row]=acc;
+}
+// GSQ IQ gate/up (gsq_a8_groups.hpp): project_q20 lanes/tree with signed int8 group weights.
+template<std::uint32_t T>
+__global__ void project_iq(const unsigned char* gate,const unsigned char* up,const unsigned* routes,
+    const signed char* codes,const float* deltas,const unsigned* status,
+    float* output,unsigned hidden,unsigned rows) {
+    __shared__ __align__(16) signed char local_codes[max_hidden];
+    __shared__ __align__(16) float local_deltas[max_hidden/32U];
+    if(*status!=0) return;
+    for(unsigned i=threadIdx.x;i<hidden;i+=256U) local_codes[i]=codes[i];
+    for(unsigned i=threadIdx.x;i<hidden/32U;i+=256U) local_deltas[i]=deltas[i];
+    __syncthreads();
+    const unsigned lane=threadIdx.x&31U,c=lane&7U;
+    const unsigned row=blockIdx.x*32U+(threadIdx.x/32U)*4U+lane/8U;
+    const unsigned which=blockIdx.y,slot=blockIdx.z,expert=routes[slot];
+    const unsigned groups=hidden/32U;
+    const auto* weights=(which==0?gate:up)+(static_cast<unsigned long long>(expert)*rows+row)*gsq_a8::row_bytes(T,hidden);
+    float acc=0.0F;
+    #pragma unroll 1
+    for(unsigned g=c;g<groups;g+=8U) {
+        const auto x=gsq_a8::iq_group<T>(weights,g);
+        const float value=gsq_a8::iq_apply<T>(x,reinterpret_cast<const int*>(local_codes+g*32U),local_deltas[g]);
+        acc=acc+value;
+    }
+    acc=acc+__shfl_xor(acc,1,32);
+    acc=acc+__shfl_xor(acc,2,32);
+    acc=acc+__shfl_xor(acc,4,32);
+    if(c==0) output[(slot*2U+which)*rows+row]=acc;
+}
 // Two independent projection DAGs consume the same staged activation values.
 // Keep all affine corrections, operand order and rounding boundaries literal.
 __device__ __forceinline__ float paired_shared(const unsigned char* packed,int4 a0,int4 a1,
@@ -349,7 +426,7 @@ void admit_q5k_stream(hipStream_t stream) {
 }
 void enqueue_probe(const Request& request,const Bindings& b,hipStream_t stream) {
     validate(request,b);
-    if (request.gate_type == 13) admit_q5k_stream(stream);
+    if (request.gate_type == 13 || gsq_a8::gate_type(request.gate_type)) admit_q5k_stream(stream);
     check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
     auto* status=reinterpret_cast<unsigned*>(b.status.address);
     const auto* routes=reinterpret_cast<const unsigned*>(b.routes.address);
@@ -361,7 +438,20 @@ void enqueue_probe(const Request& request,const Bindings& b,hipStream_t stream) 
     if(request.input==InputKind::bf16) quantize<true><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
     else quantize<false><<<1,256,0,stream>>>(input,request.shape.hidden,codes,deltas,sums,status);
     check(hipGetLastError(),"Q4K A8 quantizer enqueue");
-    if (request.gate_type == 13) {
+    const auto iq=[&]<std::uint32_t T>(){
+        project_iq<T><<<dim3(request.shape.rows/32U,2,request.shape.top_k),256,0,stream>>>(
+            reinterpret_cast<const unsigned char*>(b.gate.address),reinterpret_cast<const unsigned char*>(b.up.address),
+            routes,codes,deltas,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows);
+    };
+    if (request.gate_type == gsq_a8::type_iq2_s) iq.template operator()<gsq_a8::type_iq2_s>();
+    else if (request.gate_type == gsq_a8::type_iq3_xxs) iq.template operator()<gsq_a8::type_iq3_xxs>();
+    else if (request.gate_type == gsq_a8::type_iq3_s) iq.template operator()<gsq_a8::type_iq3_s>();
+    else if (request.gate_type == gsq_a8::type_iq4_xs) iq.template operator()<gsq_a8::type_iq4_xs>();
+    else if (request.gate_type == 42) {
+        project_q20<<<dim3(request.shape.rows/32U,2,request.shape.top_k),256,0,stream>>>(
+            reinterpret_cast<const unsigned char*>(b.gate.address),reinterpret_cast<const unsigned char*>(b.up.address),
+            routes,codes,deltas,sums,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows);
+    } else if (request.gate_type == 13) {
         project_q5k<<<dim3(request.shape.rows/32U,2,request.shape.top_k),256,0,stream>>>(
             reinterpret_cast<const unsigned char*>(b.gate.address),reinterpret_cast<const unsigned char*>(b.up.address),
             routes,codes,deltas,sums,status,reinterpret_cast<float*>(b.output.address),request.shape.hidden,request.shape.rows);
@@ -393,7 +483,7 @@ void enqueue_probe_shared_gate_up(const Request& request,const Bindings& b,hipSt
 }
 void enqueue_quantize_only(const Request& request,const Bindings& b,hipStream_t stream) {
     validate(request,b);
-    if (request.gate_type == 13) admit_q5k_stream(stream);
+    if (request.gate_type == 13 || gsq_a8::gate_type(request.gate_type)) admit_q5k_stream(stream);
     check(hipPeekAtLastError(),"Q4K A8 pre-enqueue stale error");
     auto* status=reinterpret_cast<unsigned*>(b.status.address);
     const auto* routes=reinterpret_cast<const unsigned*>(b.routes.address);
@@ -525,6 +615,51 @@ __global__ void down_rawdots(const unsigned char* weights,const unsigned* routes
     acc=acc+__shfl_xor(acc,2,32);
     if(owner==0) rawdots[slot*hidden+row]=acc;
 }
+// Q2_0 down (q20_a8_down_numerical_identity): down_rawdots lanes and tree, group g = half g%2 of block
+// g/2; contribution delta * (d * float(I - S)).
+__global__ void down_rawdots_q20(const unsigned char* weights,const unsigned* routes,
+    const signed char* codes,const float* deltas,const int* sums,float* rawdots,
+    unsigned* status,unsigned* aggregate,unsigned hidden,unsigned width,unsigned experts) {
+    if(*status!=0) return;
+    const unsigned lane=threadIdx.x&31U,owner=lane&3U;
+    const unsigned row=blockIdx.x*64U+(threadIdx.x/32U)*8U+lane/4U;
+    const unsigned slot=blockIdx.y,expert=routes[slot],groups=width/32U;
+    if(expert>=experts) {if(threadIdx.x==0) down_error(status,aggregate,down_invalid_route);return;}
+    const auto* row_weights=weights+(static_cast<unsigned long long>(expert)*hidden+row)*(width/64U)*18U;
+    float acc=0.0F;
+    #pragma unroll 1
+    for(unsigned group=owner;group<groups;group+=4U) {
+        const float contribution=q20_group(row_weights+(group/2U)*18U,group&1U,
+            reinterpret_cast<const int*>(codes+slot*width+group*32U),sums[slot*groups+group],deltas[slot*groups+group]);
+        acc=acc+contribution;
+    }
+    acc=acc+__shfl_xor(acc,1,32);
+    acc=acc+__shfl_xor(acc,2,32);
+    if(owner==0) rawdots[slot*hidden+row]=acc;
+}
+// GSQ IQ4_NL down: down_rawdots lanes and tree, contribution delta * (d * float(I)).
+template<std::uint32_t T>
+__global__ void down_rawdots_iq(const unsigned char* weights,const unsigned* routes,
+    const signed char* codes,const float* deltas,float* rawdots,
+    unsigned* status,unsigned* aggregate,unsigned hidden,unsigned width,unsigned experts) {
+    if(*status!=0) return;
+    const unsigned lane=threadIdx.x&31U,owner=lane&3U;
+    const unsigned row=blockIdx.x*64U+(threadIdx.x/32U)*8U+lane/4U;
+    const unsigned slot=blockIdx.y,expert=routes[slot],groups=width/32U;
+    if(expert>=experts) {if(threadIdx.x==0) down_error(status,aggregate,down_invalid_route);return;}
+    const auto* row_weights=weights+(static_cast<unsigned long long>(expert)*hidden+row)*gsq_a8::row_bytes(T,width);
+    float acc=0.0F;
+    #pragma unroll 1
+    for(unsigned group=owner;group<groups;group+=4U) {
+        const auto x=gsq_a8::iq_group<T>(row_weights,group);
+        const float contribution=gsq_a8::iq_apply<T>(x,reinterpret_cast<const int*>(codes+slot*width+group*32U),
+            deltas[slot*groups+group]);
+        acc=acc+contribution;
+    }
+    acc=acc+__shfl_xor(acc,1,32);
+    acc=acc+__shfl_xor(acc,2,32);
+    if(owner==0) rawdots[slot*hidden+row]=acc;
+}
 void down_admit(const DownRequest& request,const DownBindings& b,hipStream_t stream) {
     validate_down(request,b);
     if(!stream || stream==hipStreamLegacy || stream==hipStreamPerThread)
@@ -550,7 +685,21 @@ void enqueue_down_activation_quantize(const DownRequest& r,const DownBindings& b
 }
 void enqueue_down_rawdots(const DownRequest& r,const DownBindings& b,hipStream_t stream) {
     down_admit(r,b,stream);
-    if(r.weight_type==7) {
+    if(r.weight_type==gsq_a8::type_iq4_nl) {
+        down_rawdots_iq<gsq_a8::type_iq4_nl><<<dim3(r.shape.hidden/64U,r.shape.top_k),256,0,stream>>>(
+            reinterpret_cast<const unsigned char*>(b.weights.address),reinterpret_cast<const unsigned*>(b.routes.address),
+            reinterpret_cast<const signed char*>(b.codes.address),reinterpret_cast<const float*>(b.deltas.address),
+            reinterpret_cast<float*>(b.rawdots.address),
+            reinterpret_cast<unsigned*>(b.status.address),reinterpret_cast<unsigned*>(b.aggregate_status.address),
+            r.shape.hidden,r.shape.intermediate,r.shape.experts);
+    } else if(r.weight_type==42) {
+        down_rawdots_q20<<<dim3(r.shape.hidden/64U,r.shape.top_k),256,0,stream>>>(
+            reinterpret_cast<const unsigned char*>(b.weights.address),reinterpret_cast<const unsigned*>(b.routes.address),
+            reinterpret_cast<const signed char*>(b.codes.address),reinterpret_cast<const float*>(b.deltas.address),
+            reinterpret_cast<const int*>(b.sums.address),reinterpret_cast<float*>(b.rawdots.address),
+            reinterpret_cast<unsigned*>(b.status.address),reinterpret_cast<unsigned*>(b.aggregate_status.address),
+            r.shape.hidden,r.shape.intermediate,r.shape.experts);
+    } else if(r.weight_type==7) {
         down_rawdots<true><<<dim3(r.shape.hidden/64U,r.shape.top_k),256,0,stream>>>(
             reinterpret_cast<const unsigned char*>(b.weights.address),reinterpret_cast<const unsigned*>(b.routes.address),
             reinterpret_cast<const signed char*>(b.codes.address),reinterpret_cast<const float*>(b.deltas.address),

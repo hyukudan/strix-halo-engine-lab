@@ -1,4 +1,5 @@
 #include "strix/hip_mtp_native_validation.hpp"
+#include "strix/hip_ggml_weight_formats.hpp"
 #ifdef STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC
 #include "strix/hip_gdn_lm_wave8_diagnostic.hpp"
 #endif
@@ -72,6 +73,9 @@ enum class WeightKind {
     q8_0,
     iq4_nl,
     iq4_xs,
+#define STRIX_GGML_KIND_ENUM(kind, type) kind,
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_ENUM) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_ENUM)
+#undef STRIX_GGML_KIND_ENUM
 };
 
 void hash_u64(
@@ -134,6 +138,9 @@ WeightKind weight_kind(
     case 8: return WeightKind::q8_0;
     case 20: return WeightKind::iq4_nl;
     case 23: return WeightKind::iq4_xs;
+#define STRIX_GGML_KIND_MAP(kind, type) case type: return WeightKind::kind;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_MAP) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_MAP)
+#undef STRIX_GGML_KIND_MAP
     case 30: return WeightKind::bf16;
     default:
         throw std::invalid_argument(
@@ -326,6 +333,24 @@ __device__ float load_weight<WeightKind::iq4_xs>(
                iq4_codebook[code]);
 }
 
+#define STRIX_GGML_KIND_LOAD(kind, type)                                                          \
+    template <>                                                                                   \
+    __device__ float load_weight<WeightKind::kind>(                                               \
+        const void* weights, std::uint32_t row_width, std::uint32_t row, std::uint32_t feature) { \
+        return hip_ggml::element<type>(weights, row_width, row, feature);                        \
+    }
+STRIX_GGML_KINDS_K(STRIX_GGML_KIND_LOAD) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_LOAD)
+#undef STRIX_GGML_KIND_LOAD
+
+std::uint32_t ggml_type_of(WeightKind kind) {
+    switch (kind) {
+#define STRIX_GGML_KIND_TYPE(k, type) case WeightKind::k: return type;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_TYPE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_TYPE)
+#undef STRIX_GGML_KIND_TYPE
+    default: return 0;
+    }
+}
+
 std::uint64_t required_weight_bytes(
     WeightKind kind,
     std::uint32_t row_width,
@@ -372,6 +397,13 @@ std::uint64_t required_weight_bytes(
                 row_width / 256U) *
             rows *
             sizeof(IQ4XSBlock);
+    default: {
+        const auto g = hip_ggml::geometry(ggml_type_of(kind));
+        if (g.elements == 0 || row_width % g.elements != 0) {
+            throw std::invalid_argument("weight width is not a multiple of its GGUF block");
+        }
+        return static_cast<std::uint64_t>(row_width / g.elements) * rows * g.bytes;
+    }
     }
     throw std::logic_error(
         "unreachable LM-head weight kind");
@@ -986,6 +1018,13 @@ void launch_by_weight(
         launch_typed<Input, WeightKind::iq4_xs>(
             weights, config, hidden, logits);
         return;
+#define STRIX_GGML_KIND_CASE(KIND, type) \
+    case WeightKind::KIND: \
+        launch_typed<Input, WeightKind::KIND>( \
+            weights, config, hidden, logits); \
+        return;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE)
+#undef STRIX_GGML_KIND_CASE
     }
     throw std::logic_error(
         "unreachable LM-head weight kind");
@@ -1409,6 +1448,23 @@ void lm_head_known_window_rows_launch(std::span<const ExecutionDispatchContext> 
         check_hip(hipGetLastError(), "known-window lean LM head rows launch");
         return;
     }
+    // STRIX_LM_HEAD_COHORT_LEAN=1 (default off): cohorts of several sessions (9..32 rows) run as pieces of eight rows
+    // on the lean rows head (two logits per wave unless STRIX_LM_HEAD_ROWS_LEAN=1), a last piece of fewer than five
+    // rows on the rows head; every logit is bit-identical to the R1 head either way.
+    static const bool cohort_lean = [] { const char* v = std::getenv("STRIX_LM_HEAD_COHORT_LEAN"); return v && v[0] == '1'; }();
+    if (cohort_lean && rows.size() > lm_head_window_max_rows) {
+        auto lean = config;
+        lean.rows_lean = config.rows_lean ? config.rows_lean : 2U;
+        for (std::size_t first = 0; first < rows.size(); first += 8U) {
+            const auto n = static_cast<unsigned>(std::min<std::size_t>(8U, rows.size() - first));
+            LmHeadRowsViews part{};
+            for (unsigned r = 0; r < n; ++r) { part.input[r] = p.views.input[first + r]; part.output[r] = p.views.output[first + r]; }
+            if (lean_rows_admitted(lean, n)) launch_lean_rows(lean.rows_lean, n, part, p.weights, h, v, nullptr, stream);
+            else launch_lm_head_rows_up_to_16(n, part, p.weights, h, v, stream);
+        }
+        check_hip(hipGetLastError(), "known-window lean LM head cohort rows launch");
+        return;
+    }
     // Cohorts of several sessions (9..32 rows): unstaged launches of at most 16 rows (per row the same DAG).
     if (rows.size() > lm_head_window_max_rows) {
         for (std::size_t first = 0; first < rows.size(); first += 16U) {
@@ -1619,6 +1675,9 @@ void launch_hip_mtp_lm_head(const MtpNativeContext& c,void* stream) {
     case WeightKind::q8_0:launch.template operator()<WeightKind::q8_0>();break;
     case WeightKind::iq4_nl:launch.template operator()<WeightKind::iq4_nl>();break;
     case WeightKind::iq4_xs:launch.template operator()<WeightKind::iq4_xs>();break;
+#define STRIX_GGML_KIND_CASE(KIND, type) case WeightKind::KIND:launch.template operator()<WeightKind::KIND>();break;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE)
+#undef STRIX_GGML_KIND_CASE
     }
     check_hip(hipGetLastError(),"MTP native LM head launch");
 }

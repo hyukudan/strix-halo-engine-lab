@@ -23,6 +23,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include <array>
+#include <functional>
+#include <bit>
+#include <string>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -130,6 +133,26 @@ struct HipMtpRuntime::Impl {
     std::uint64_t ticketless_frontier=0;
     std::uint32_t step=0,pending_token=0;
     bool active=false,cycle=false,have_replay=false,broken=false,cache_only_active=false,first_cache_reusable=false;
+    // Rows of a submitted, not yet completed prime_hidden_rows_submit (STRIX_PREFILL_PIPE).
+    std::size_t primed_rows=0;
+    // Multi-session draft batch: the batch stream carrying this chain's steps (null outside a batch) and the
+    // entry/exit events ordering it with the owner stream.
+    hipStream_t batch_stream=nullptr;
+    hipEvent_t batch_entry=nullptr,batch_exit=nullptr;
+    struct BatchReference {
+        std::uint32_t depth=0,steps=0;std::uint64_t first=0;
+        std::vector<std::uint32_t> tokens;std::vector<float> probabilities,runner_ups;
+        // Per step and stage: every step buffer, attention workspace, status words, fast-MoE workspace, head logits, slots.
+        std::vector<std::vector<std::vector<std::vector<std::uint8_t>>>> stages;
+        std::vector<std::uint8_t> kv,index;std::uint64_t prefix_hash=0,guard_rows=0;
+        std::string mismatch;
+    };
+    std::optional<BatchReference> batch_reference;
+    // STRIX_MTP_DRAFT_BATCH_VERIFY only: called after each of the 12 stages of a one-token draft step (null otherwise).
+    std::function<void(unsigned)> stage_hook;
+    void stage_mark(unsigned stage) {if(stage_hook) stage_hook(stage);}
+    void batch_verify_poison(std::uint64_t first,std::uint64_t rows,std::uint64_t guard);
+    std::uint64_t verify_previous_first=0;std::uint32_t verify_previous_steps=0;
     explicit Impl(std::shared_ptr<HipMtpResources> actual):owner(std::move(actual)) {
         require(owner && !owner.owner_before(owner->weak_from_this().lock()) &&
             !owner->weak_from_this().lock().owner_before(owner),"MTP runtime requires its actual retained native owner");
@@ -208,7 +231,23 @@ struct HipMtpRuntime::Impl {
         check(hipMemcpyAsync(reinterpret_cast<void*>(destination.address),reinterpret_cast<const void*>(source.address),
             static_cast<std::size_t>(source.bytes),hipMemcpyDeviceToDevice,static_cast<hipStream_t>(owner->stream())),"MTP owned copy enqueue failed");
     }
-    void failure() noexcept {broken=true;active=false;cache_only_active=false;first_cache_reusable=false;owner->fail();validation.reset();}
+    void failure() noexcept {
+        if(batch_stream) {(void)hipStreamSynchronize(batch_stream);batch_stream=nullptr;}
+        broken=true;active=false;cache_only_active=false;first_cache_reusable=false;primed_rows=0;owner->fail();validation.reset();
+    }
+    // The owner stream waits for every batch step enqueued for this chain (before completion or reuse).
+    void batch_leave() {
+        if(!batch_stream) return;
+        if(!batch_exit) check(hipEventCreateWithFlags(&batch_exit,hipEventDisableTiming),"MTP draft batch exit event");
+        check(hipEventRecord(batch_exit,batch_stream),"MTP draft batch exit record");
+        check(hipStreamWaitEvent(static_cast<hipStream_t>(owner->stream()),batch_exit,0),"MTP draft batch exit wait");
+        batch_stream=nullptr;
+    }
+    ~Impl() {
+        if(batch_stream) (void)hipStreamSynchronize(batch_stream);
+        if(batch_entry) (void)hipEventDestroy(batch_entry);
+        if(batch_exit) (void)hipEventDestroy(batch_exit);
+    }
     void stage(const MtpForwardStepContext& call) {
         const auto& input=*call.cycle_input;
         require(active && !cache_only_active && step<native_steps.size() && call.step_index==step && call.step==native_steps[step] &&
@@ -420,18 +459,22 @@ struct HipMtpRuntime::Impl {
                 else launch_hip_mtp_embedding(c,pending_token,stream);
                 if(draft_exact) launch_hip_mtp_input_fusion(fusion(),stream);
                 else launch_hip_mtp_input_fusion_draft(fusion(),stream);
-                hyper(c,MtpHyperRole::attention,stream);
-                launch_hip_mtp_indexer(c,stream);
+                stage_mark(0);
+                hyper(c,MtpHyperRole::attention,stream);stage_mark(1);
+                launch_hip_mtp_indexer(c,stream);stage_mark(2);
                 if(draft_exact) launch_hip_mtp_sparse_attention(c,stream); else launch_hip_mtp_sparse_attention_draft(c,stream);
-                launch_hip_mtp_inject(c,MtpInjectRole::attention,stream);hyper(c,MtpHyperRole::mlp,stream);
-                launch_hip_mtp_route(c,stream);
+                stage_mark(3);
+                launch_hip_mtp_inject(c,MtpInjectRole::attention,stream);stage_mark(4);
+                hyper(c,MtpHyperRole::mlp,stream);stage_mark(5);
+                launch_hip_mtp_route(c,stream);stage_mark(6);
                 if(draft_exact) {
                     launch_hip_mtp_shared_expert(c,stream);launch_hip_mtp_routed_experts(c,stream);launch_hip_mtp_moe_combine(c,stream);
                 } else launch_hip_mtp_fast_moe(fast_moe(),stream);
-                launch_hip_mtp_inject(c,MtpInjectRole::mlp,stream);
-                copy(owner->view(HipMtpBuffer::wide_current),owner->view(HipMtpBuffer::wide_next));
-                hyper(c,MtpHyperRole::head,stream);
-                draft->launch(hidden,k,stream);
+                stage_mark(7);
+                launch_hip_mtp_inject(c,MtpInjectRole::mlp,stream);stage_mark(8);
+                copy(owner->view(HipMtpBuffer::wide_current),owner->view(HipMtpBuffer::wide_next));stage_mark(9);
+                hyper(c,MtpHyperRole::head,stream);stage_mark(10);
+                draft->launch(hidden,k,stream);stage_mark(11);
                 if(device_draft) {
                     // The sampled token overwrites the argmax in the step's slot before the next step reads it.
                     const auto t0=std::chrono::steady_clock::now();
@@ -459,7 +502,7 @@ struct HipMtpRuntime::Impl {
         try {
             const auto k=cs.k++;
             if((cs.min_probability>0.0F || cs.keep) && k+1U<cs.requested) {
-                if(!sampler || cs.device_draft) draft->wait_step(k,owner->stream());
+                if(!sampler || cs.device_draft) draft->wait_step(k,batch_stream?static_cast<void*>(batch_stream):owner->stream());
                 host_phase_mark("2w draft step wait");
                 if(cs.min_probability>0.0F && draft->probability(k)<cs.min_probability) {cs.depth=k+1U;cs.stop=true;return false;}
                 if(cs.keep) {
@@ -473,6 +516,7 @@ struct HipMtpRuntime::Impl {
     }
     std::vector<std::uint32_t> chain_finish() {
         try {
+            batch_leave();
             auto depth=cs.depth;
             const bool device_draft=cs.device_draft;
             owner->complete();
@@ -583,10 +627,14 @@ void HipMtpRuntime::prime_committed_rows(const QualifiedMtpDraftPlan& plan,const
 }
 void HipMtpRuntime::prime_hidden_rows(const QualifiedMtpDraftPlan& plan,const ActivatedMtpDraftPlan& activated,
     std::span<const MtpDeviceView> hidden,std::span<const std::uint32_t> next_tokens) {
+    if(prime_hidden_rows_submit(plan,activated,hidden,next_tokens)) prime_hidden_rows_complete();
+}
+bool HipMtpRuntime::prime_hidden_rows_submit(const QualifiedMtpDraftPlan& plan,const ActivatedMtpDraftPlan& activated,
+    std::span<const MtpDeviceView> hidden,std::span<const std::uint32_t> next_tokens) {
     auto& p=*impl_;p.qualification(plan,activated);
     require(!p.cycle && !p.active && !p.validation && !p.broken && hidden.size()==next_tokens.size() &&
         p.stats.cache_only_rows<=UINT64_MAX-hidden.size(),"MTP hidden-row priming requires an idle owner and one token per row");
-    if(hidden.empty()) return;
+    if(hidden.empty()) return false;
     const auto wide=p.owner->view(HipMtpBuffer::wide_current);
     p.validation.emplace(p.owner->admit_native_entry());
     try {
@@ -606,8 +654,18 @@ void HipMtpRuntime::prime_hidden_rows(const QualifiedMtpDraftPlan& plan,const Ac
             launch_hip_mtp_embedding(c,next_tokens[i],stream);p.cache_row_front(c,stream);
             launch_hip_mtp_cache_rows(c,stream);
         }
+    } catch(...) {p.failure();throw;}
+    p.primed_rows=hidden.size();
+    return true;
+}
+bool HipMtpRuntime::prime_hidden_rows_pending() const noexcept {return impl_->primed_rows!=0U;}
+void HipMtpRuntime::prime_hidden_rows_complete() {
+    auto& p=*impl_;
+    require(p.primed_rows && p.active && p.cache_only_active && !p.cycle,"MTP hidden-row completion requires submitted priming rows");
+    const auto rows=p.primed_rows;p.primed_rows=0;
+    try {
         p.owner->complete();
-        p.active=false;p.cache_only_active=false;p.next_source+=hidden.size();p.stats.cache_only_rows+=hidden.size();p.validation.reset();
+        p.active=false;p.cache_only_active=false;p.next_source+=rows;p.stats.cache_only_rows+=rows;p.validation.reset();
         p.last_target.reset();p.last_teacher_next_input.reset();p.first_cache_reusable=false;p.ticketless_frontier=p.next_source;
     } catch(...) {p.failure();throw;}
 }
@@ -694,6 +752,348 @@ bool HipMtpRuntime::propose_chain_begin(const QualifiedMtpDraftPlan& plan,const 
     validate_mtp_draft_proposal_phase(p.owner->binding(),proposal,target,DraftProposalStatePhase::proposal_active);
     require(p.cycle && p.cycle_base && same_session(target,p.cycle_base->committed_session()),"MTP draft chain does not match its native cycle");
     return p.chain_begin(depth,min_probability,keep_drafting);
+}
+namespace {
+bool draft_batch_env_branches() {
+    return hip_mtp_hyper_mix_draft_rows_supported() && hip_mtp_attention_draft_rows_supported() && hip_mtp_route_rows_supported();
+}
+// Every owner holds its own copy of the model contract: the fields the draft step depends on must be equal.
+bool same_draft_model(const ModelContract& a,const ModelContract& b) {
+    return a.vocab_size==b.vocab_size && a.hidden_size==b.hidden_size && a.max_position_embeddings==b.max_position_embeddings &&
+        a.hc_count==b.hc_count && a.hc_lowrank==b.hc_lowrank && a.attention_heads==b.attention_heads && a.kv_heads==b.kv_heads &&
+        a.head_dim==b.head_dim && a.indexer_n_heads==b.indexer_n_heads && a.indexer_kv_heads==b.indexer_kv_heads &&
+        a.indexer_head_dim==b.indexer_head_dim && a.indexer_budget==b.indexer_budget && a.indexer_compress_ratio==b.indexer_compress_ratio &&
+        a.partial_rotary_factor==b.partial_rotary_factor && a.rope_theta==b.rope_theta && a.moe_intermediate_size==b.moe_intermediate_size &&
+        a.shared_expert_intermediate_size==b.shared_expert_intermediate_size && a.num_experts==b.num_experts &&
+        a.num_experts_per_token==b.num_experts_per_token && a.rms_norm_epsilon==b.rms_norm_epsilon &&
+        a.norm_topk_probability==b.norm_topk_probability && a.attention_kv_storage==b.attention_kv_storage;
+}
+}
+bool HipMtpRuntime::draft_batch_open() const noexcept {
+    const auto& p=*impl_;
+    // A keep callback (cost-model chain cut, ordinary cycles only) is never batched.
+    return p.active && p.draft && !p.draft_exact && !p.sampler && !p.cs.device_draft && !p.cs.keep && !p.cs.stop &&
+        p.cs.k<p.cs.requested && !p.batch_stream && !p.broken;
+}
+std::optional<std::uint32_t> HipMtpRuntime::draft_batch_compatible(std::span<HipMtpRuntime* const> members) {
+    if(members.size()<2U || members.size()>hip_mtp_draft_batch_rows || !draft_batch_env_branches()) return std::nullopt;
+    const auto& a=*members.front()->impl_;
+    const auto& ta=a.owner->tensors();
+    std::vector<HipMtpDraftHead*> heads;
+    for(auto* m:members) {
+        if(!m || !m->draft_batch_open()) return std::nullopt;
+        const auto& p=*m->impl_;const auto& t=p.owner->tensors();
+        for(std::size_t o=0;o<heads.size();++o) if(heads[o]==p.draft.get()) return std::nullopt;
+        // One model, plan, profile and weights (the shared sidecar residency); every buffer stays per owner.
+        if(!same_draft_model(p.owner->model(),a.owner->model()) || p.owner->plan().plan_identity!=a.owner->plan().plan_identity ||
+           p.profile!=a.profile || p.cs.k!=a.cs.k ||
+           t.embedding.runtime->address!=ta.embedding.runtime->address || t.eh_projection.runtime->address!=ta.eh_projection.runtime->address ||
+           t.attention_hc_inject.runtime->address!=ta.attention_hc_inject.runtime->address ||
+           t.mlp_hc_inject.runtime->address!=ta.mlp_hc_inject.runtime->address || t.router.runtime->address!=ta.router.runtime->address ||
+           t.expert_gate.runtime->address!=ta.expert_gate.runtime->address || t.shared_gate.runtime->address!=ta.shared_gate.runtime->address ||
+           !p.hc_inject || !p.fast_workspace)
+            return std::nullopt;
+        // The batched launchers' alignment requirements (staged router, HC rows workspaces, 16-byte state copy):
+        // a member that the one-token chain would run on another branch stays out of the batch.
+        if(p.owner->view(HipMtpBuffer::hidden0).address%16U || t.router.runtime->address%16U ||
+           p.owner->view(HipMtpBuffer::hyper_workspace).address%16U || p.owner->view(HipMtpBuffer::wide_current).address%16U ||
+           p.owner->view(HipMtpBuffer::wide_next).address%16U || reinterpret_cast<std::uintptr_t>(p.hc_inject.get())%16U)
+            return std::nullopt;
+        // The batched launchers run only the Q4-copy branch: every draft weight they read must have its copy, and
+        // every member reads the same tensors.
+        for(const auto* v:{&t.eh_projection,&t.query,&t.key,&t.value,&t.attention_output,&t.expert_gate,&t.expert_up,&t.expert_down,
+                           &t.shared_gate,&t.shared_up,&t.shared_down})
+            if(!hip_mtp_draft_q4(reinterpret_cast<const void*>(v->runtime->address))) return std::nullopt;
+        if(t.query.runtime->address!=ta.query.runtime->address || t.key.runtime->address!=ta.key.runtime->address ||
+           t.value.runtime->address!=ta.value.runtime->address || t.attention_output.runtime->address!=ta.attention_output.runtime->address ||
+           t.index_query.runtime->address!=ta.index_query.runtime->address || t.index_key.runtime->address!=ta.index_key.runtime->address ||
+           t.expert_up.runtime->address!=ta.expert_up.runtime->address || t.expert_down.runtime->address!=ta.expert_down.runtime->address ||
+           t.shared_up.runtime->address!=ta.shared_up.runtime->address || t.shared_down.runtime->address!=ta.shared_down.runtime->address ||
+           t.shared_scalar_gate.runtime->address!=ta.shared_scalar_gate.runtime->address ||
+           t.attention_hc_down.runtime->address!=ta.attention_hc_down.runtime->address ||
+           t.attention_hc_up.runtime->address!=ta.attention_hc_up.runtime->address ||
+           t.mlp_hc_down.runtime->address!=ta.mlp_hc_down.runtime->address || t.mlp_hc_up.runtime->address!=ta.mlp_hc_up.runtime->address ||
+           t.head_down.runtime->address!=ta.head_down.runtime->address || t.head_up.runtime->address!=ta.head_up.runtime->address ||
+           t.enorm.runtime->address!=ta.enorm.runtime->address || t.hnorm.runtime->address!=ta.hnorm.runtime->address ||
+           t.attention_hc_norm.runtime->address!=ta.attention_hc_norm.runtime->address ||
+           t.mlp_hc_norm.runtime->address!=ta.mlp_hc_norm.runtime->address || t.head_norm.runtime->address!=ta.head_norm.runtime->address ||
+           t.query_norm.runtime->address!=ta.query_norm.runtime->address || t.key_norm.runtime->address!=ta.key_norm.runtime->address ||
+           t.index_query_norm.runtime->address!=ta.index_query_norm.runtime->address ||
+           t.index_key_norm.runtime->address!=ta.index_key_norm.runtime->address)
+            return std::nullopt;
+        heads.push_back(p.draft.get());
+    }
+    const auto shared=HipMtpDraftHead::shared_rows(heads);
+    if(shared==UINT32_MAX) return std::nullopt;
+    return shared;
+}
+void HipMtpRuntime::draft_batch_enter(std::span<HipMtpRuntime* const> members,void* stream) {
+    require(stream && !members.empty(),"MTP draft batch needs a stream");
+    for(auto* m:members) {
+        auto& p=*m->impl_;
+        require(m->draft_batch_open(),"MTP draft batch member has no open fast greedy chain");
+        try {
+            if(!p.batch_entry) check(hipEventCreateWithFlags(&p.batch_entry,hipEventDisableTiming),"MTP draft batch entry event");
+            // The cycle-base copy, the head's row gathers and any earlier owner work precede the batch steps.
+            check(hipEventRecord(p.batch_entry,static_cast<hipStream_t>(p.owner->stream())),"MTP draft batch entry record");
+            check(hipStreamWaitEvent(static_cast<hipStream_t>(stream),p.batch_entry,0),"MTP draft batch entry wait");
+            p.batch_stream=static_cast<hipStream_t>(stream);
+        } catch(...) {p.failure();throw;}
+    }
+}
+void HipMtpRuntime::draft_batch_leave() {
+    auto& p=*impl_;
+    try {p.batch_leave();} catch(...) {p.failure();throw;}
+}
+namespace {
+// Per-owner buffers a draft step writes before it reads them (poisoned between the reference and the batch, and
+// captured after every step together with the attention workspace and the status words).
+constexpr std::array<HipMtpBuffer,14> batch_step_buffers{HipMtpBuffer::embedding,HipMtpBuffer::normalized_input,
+    HipMtpBuffer::fused_wide,HipMtpBuffer::wide_work,HipMtpBuffer::hidden0,HipMtpBuffer::hidden1,HipMtpBuffer::injection,
+    HipMtpBuffer::routes,HipMtpBuffer::route_weights,HipMtpBuffer::hyper_workspace,HipMtpBuffer::router_workspace,
+    HipMtpBuffer::attention_workspace,HipMtpBuffer::wide_next,HipMtpBuffer::wide_current};
+std::vector<std::uint8_t> read_device(std::uintptr_t address,std::uint64_t bytes) {
+    std::vector<std::uint8_t> v(static_cast<std::size_t>(bytes));
+    if(bytes) check(hipMemcpy(v.data(),reinterpret_cast<const void*>(address),static_cast<std::size_t>(bytes),hipMemcpyDeviceToHost),
+        "MTP draft batch verify readback");
+    return v;
+}
+// One step's state of this owner (the caller completed the stream that carried it).
+std::vector<std::vector<std::uint8_t>> draft_batch_step_state(const HipMtpResources& owner,const HipMtpDraftHead& head,const float* fast) {
+    std::vector<std::vector<std::uint8_t>> out;
+    for(const auto b:batch_step_buffers) {const auto v=owner.view(b);out.push_back(read_device(v.address,v.bytes));}
+    {const auto v=owner.view(HipMtpBuffer::status);out.push_back(read_device(v.address,v.bytes));}
+    out.push_back(read_device(reinterpret_cast<std::uintptr_t>(fast),hip_mtp_fast_moe_workspace_floats*sizeof(float)));
+    out.push_back(read_device(reinterpret_cast<std::uintptr_t>(head.logits()),static_cast<std::uint64_t>(head.stats().rows)*sizeof(float)));
+    out.push_back(read_device(reinterpret_cast<std::uintptr_t>(head.device_token(0)),static_cast<std::uint64_t>(owner.budget().maximum_candidate_depth)*4U));
+    return out;
+}
+std::string draft_batch_state_difference(const std::vector<std::vector<std::uint8_t>>& a,const std::vector<std::vector<std::uint8_t>>& b) {
+    static constexpr const char* names[]={"embedding","normalized","fused_wide","wide_work","hidden0","hidden1","injection","routes",
+        "route_weights","hyper_ws","router_ws","attention_ws","wide_next","wide_current","status","moe_ws","head_logits","head_slots"};
+    std::string what;
+    for(std::size_t i=0;i<a.size() && i<b.size();++i) if(a[i]!=b[i]) {what+=" ";what+=i<std::size(names)?names[i]:"?";}
+    if(a.size()!=b.size()) what+=" shape";
+    return what;
+}
+}
+namespace {
+std::uint64_t fnv(const std::vector<std::uint8_t>& v) {
+    std::uint64_t h=1469598103934665603ULL;for(const auto b:v) {h^=b;h*=1099511628211ULL;}return h;
+}
+// Verify coverage counters (printed with the verify summary).
+struct VerifyCoverage {std::uint64_t members=0,steps=0,partial_groups=0,selection_rows=0,full_rows=0,selection_transitions=0,
+    shrinking_steps=0,divergent_cycles=0,min_p_below=0,min_p_equal=0,min_p_above=0,after_rejection=0;};
+VerifyCoverage& verify_coverage() {static VerifyCoverage c;return c;}
+}
+std::string draft_batch_verify_coverage() {
+    const auto& c=verify_coverage();
+    return "members="+std::to_string(c.members)+" steps="+std::to_string(c.steps)+" partial_groups="+std::to_string(c.partial_groups)+
+        " selection_rows="+std::to_string(c.selection_rows)+" full_rows="+std::to_string(c.full_rows)+
+        " selection_transitions="+std::to_string(c.selection_transitions)+" shrinking_steps="+std::to_string(c.shrinking_steps)+
+        " divergent_requested="+std::to_string(c.divergent_cycles)+" min_p_below="+std::to_string(c.min_p_below)+
+        " min_p_equal="+std::to_string(c.min_p_equal)+" min_p_above="+std::to_string(c.min_p_above)+
+        " after_rejection="+std::to_string(c.after_rejection);
+}
+// Scratch both executions start from: the step buffers (except the wide input), the fast-MoE workspace, the head
+// logits and device slots, the proposal cache rows the chain may write and a guard window past them, all 0xFF.
+void HipMtpRuntime::Impl::batch_verify_poison(std::uint64_t first,std::uint64_t rows,std::uint64_t guard) {
+    const auto stream=static_cast<hipStream_t>(owner->stream());
+    const auto capacity=owner->context_capacity();
+    const auto kv=owner->view(HipMtpBuffer::kv);const auto ix=owner->view(HipMtpBuffer::raw_index);
+    const auto kv_row=kv.bytes/capacity,ix_row=ix.bytes/capacity;
+    const auto poison=[&](std::uintptr_t address,std::uint64_t bytes) {
+        if(bytes) check(hipMemsetAsync(reinterpret_cast<void*>(address),0xff,static_cast<std::size_t>(bytes),stream),"MTP draft batch verify poison");
+    };
+    for(const auto b:batch_step_buffers) if(b!=HipMtpBuffer::wide_current) {const auto v=owner->view(b);poison(v.address,v.bytes);}
+    poison(reinterpret_cast<std::uintptr_t>(fast_workspace.get()),hip_mtp_fast_moe_workspace_floats*sizeof(float));
+    poison(reinterpret_cast<std::uintptr_t>(draft->logits()),static_cast<std::uint64_t>(draft->stats().rows)*sizeof(float));
+    poison(reinterpret_cast<std::uintptr_t>(draft->device_token(0)),static_cast<std::uint64_t>(owner->budget().maximum_candidate_depth)*4U);
+    poison(kv.address+first*kv_row,(rows+guard)*kv_row);poison(ix.address+first*ix_row,(rows+guard)*ix_row);
+    copy(owner->view(HipMtpBuffer::wide_current),cycle_base->view());
+    draft->begin_chain();
+    check(hipStreamSynchronize(stream),"MTP draft batch verify poison");
+}
+void HipMtpRuntime::draft_batch_verify_cap(std::uint32_t requested) {
+    auto& p=*impl_;
+    require(draft_batch_open() && p.cs.k==0U && requested,"MTP draft batch depth cap needs a freshly begun chain");
+    if(requested<p.cs.requested) p.cs.requested=p.cs.depth=requested;
+}
+void HipMtpRuntime::draft_batch_verify_reference(std::span<HipMtpRuntime* const> members) {
+    auto& coverage=verify_coverage();
+    for(auto* m:members) {
+        auto& p=*m->impl_;
+        require(m->draft_batch_open() && p.cs.k==0U && p.cycle_base,"MTP draft batch verify needs a freshly begun chain");
+        try {
+            const auto saved=p.cs;
+            const auto stream=static_cast<hipStream_t>(p.owner->stream());
+            const auto capacity=p.owner->context_capacity();
+            const auto kv=p.owner->view(HipMtpBuffer::kv);const auto ix=p.owner->view(HipMtpBuffer::raw_index);
+            require(kv.bytes%capacity==0U && ix.bytes%capacity==0U,"MTP draft batch verify cache rows are not uniform");
+            const auto kv_row=kv.bytes/capacity,ix_row=ix.bytes/capacity;
+            Impl::BatchReference ref;ref.first=p.next_source;
+            const auto rows=std::min<std::uint64_t>(saved.requested,capacity-ref.first);
+            ref.guard_rows=std::min<std::uint64_t>(8U,capacity-ref.first-rows);
+            // The committed prefix must be identical before the reference and after the batch.
+            ref.prefix_hash=fnv(read_device(kv.address,ref.first*kv_row))^(fnv(read_device(ix.address,ref.first*ix_row))*31U);
+            p.batch_verify_poison(ref.first,rows,ref.guard_rows);
+            p.stage_hook=[&](unsigned stage) {
+                check(hipStreamSynchronize(stream),"MTP draft batch verify reference stage");
+                if(stage==0U) ref.stages.emplace_back();
+                ref.stages.back().push_back(draft_batch_step_state(*p.owner,*p.draft,p.fast_workspace.get()));
+            };
+            try {while(p.chain_launch_step() && p.chain_after_step()) {}} catch(...) {p.stage_hook=nullptr;throw;}
+            p.stage_hook=nullptr;
+            check(hipStreamSynchronize(stream),"MTP draft batch verify reference");
+            ref.depth=p.cs.depth;ref.steps=p.cs.k;
+            ref.tokens=p.draft->read(ref.steps);
+            for(std::uint32_t k=0;k<ref.steps;++k) {
+                ref.probabilities.push_back(p.draft->probability(k));ref.runner_ups.push_back(p.draft->runner_up_probability(k));
+                // Only steps followed by a stop decision (not the last requested one).
+                if(saved.min_probability>0.0F && k+1U<saved.requested) {
+                    if(ref.probabilities[k]<saved.min_probability) ++coverage.min_p_below;
+                    else if(ref.probabilities[k]==saved.min_probability) ++coverage.min_p_equal;
+                    else ++coverage.min_p_above;
+                }
+                const auto visible=ref.first+k+1U;const auto& mm=p.owner->model();
+                const auto blocks=visible/mm.indexer_compress_ratio,topk=mm.indexer_budget/mm.indexer_compress_ratio;
+                const auto selected=std::min(blocks,topk)*mm.indexer_compress_ratio+visible%mm.indexer_compress_ratio;
+                if(selected%4U) ++coverage.partial_groups;
+                if(blocks>topk) ++coverage.selection_rows; else ++coverage.full_rows;
+                if(k && (blocks>topk)!=((visible-1U)/mm.indexer_compress_ratio>topk)) ++coverage.selection_transitions;
+            }
+            // The previous verified cycle of this owner proposed more rows than the target committed (a rejection),
+            // and this cycle drafts after the teacher overwrite of the rejected rows.
+            if(p.verify_previous_first && ref.first-p.verify_previous_first<p.verify_previous_steps+1U) ++coverage.after_rejection;
+            ref.kv=read_device(kv.address+ref.first*kv_row,ref.steps*kv_row);
+            ref.index=read_device(ix.address+ref.first*ix_row,ref.steps*ix_row);
+            p.cs=saved;
+            p.batch_verify_poison(ref.first,rows,ref.guard_rows);
+            p.verify_previous_first=ref.first;p.verify_previous_steps=ref.steps;
+            p.batch_reference=std::move(ref);
+            ++coverage.members;
+        } catch(...) {p.failure();throw;}
+    }
+}
+void HipMtpRuntime::draft_batch_verify_stage(std::span<HipMtpRuntime* const> rows,void* stream,unsigned stage) {
+    check(hipStreamSynchronize(static_cast<hipStream_t>(stream)),"MTP draft batch verify stage");
+    for(auto* m:rows) {
+        auto& p=*m->impl_;
+        if(!p.batch_reference) continue;
+        auto& ref=*p.batch_reference;
+        const auto k=p.cs.k;
+        if(k>=ref.stages.size() || stage>=ref.stages[k].size()) {ref.mismatch+=" extra-step"+std::to_string(k);continue;}
+        const auto what=draft_batch_state_difference(draft_batch_step_state(*p.owner,*p.draft,p.fast_workspace.get()),ref.stages[k][stage]);
+        if(!what.empty()) ref.mismatch+=" step"+std::to_string(k)+"/stage"+std::to_string(stage)+":"+what;
+    }
+}
+void HipMtpRuntime::draft_batch_verify_step(std::span<HipMtpRuntime* const> members,std::span<HipMtpRuntime* const> rows,void* stream) {
+    // Members that already stopped must keep their final state while the others step on.
+    check(hipStreamSynchronize(static_cast<hipStream_t>(stream)),"MTP draft batch verify step");
+    auto& coverage=verify_coverage();++coverage.steps;
+    if(rows.size()<members.size()) ++coverage.shrinking_steps;
+    for(auto* m:members) {
+        if(std::find(rows.begin(),rows.end(),m)!=rows.end()) continue;
+        auto& p=*m->impl_;
+        if(!p.batch_reference || p.batch_reference->stages.empty()) continue;
+        auto& ref=*p.batch_reference;
+        const auto what=draft_batch_state_difference(draft_batch_step_state(*p.owner,*p.draft,p.fast_workspace.get()),ref.stages.back().back());
+        if(!what.empty()) ref.mismatch+=" stopped-row-changed:"+what;
+    }
+}
+std::uint32_t HipMtpRuntime::draft_batch_verify_check(std::span<HipMtpRuntime* const> members,void* stream) {
+    check(hipStreamSynchronize(static_cast<hipStream_t>(stream)),"MTP draft batch verify completion");
+    std::uint32_t differing=0;std::uint32_t lo=UINT32_MAX,hi=0;
+    for(auto* m:members) {
+        auto& p=*m->impl_;
+        std::string what;
+        if(!p.batch_reference) what=" no-reference";
+        else {
+            const auto ref=std::move(*p.batch_reference);p.batch_reference.reset();
+            what=ref.mismatch;lo=std::min(lo,ref.steps);hi=std::max(hi,ref.steps);
+            const auto capacity=p.owner->context_capacity();
+            const auto kv=p.owner->view(HipMtpBuffer::kv);const auto ix=p.owner->view(HipMtpBuffer::raw_index);
+            const auto kv_row=kv.bytes/capacity,ix_row=ix.bytes/capacity;
+            if(p.cs.depth!=ref.depth || p.cs.k!=ref.steps) what+=" depth/steps";
+            else {
+                if(p.draft->read(ref.steps)!=ref.tokens) what+=" tokens";
+                for(std::uint32_t k=0;k<ref.steps;++k) {
+                    if(std::bit_cast<std::uint32_t>(p.draft->probability(k))!=std::bit_cast<std::uint32_t>(ref.probabilities[k])) {what+=" probability";break;}
+                    if(std::bit_cast<std::uint32_t>(p.draft->runner_up_probability(k))!=std::bit_cast<std::uint32_t>(ref.runner_ups[k])) {what+=" runner-up";break;}
+                }
+                if(read_device(kv.address+ref.first*kv_row,ref.steps*kv_row)!=ref.kv) what+=" kv-rows";
+                if(read_device(ix.address+ref.first*ix_row,ref.steps*ix_row)!=ref.index) what+=" index-rows";
+                if((fnv(read_device(kv.address,ref.first*kv_row))^(fnv(read_device(ix.address,ref.first*ix_row))*31U))!=ref.prefix_hash)
+                    what+=" committed-prefix";
+                // Rows past the chain's last step, and the guard window past the requested ones, must hold the poison.
+                const auto requested=std::min<std::uint64_t>(p.cs.requested,capacity-ref.first);
+                const auto tail=requested-ref.steps+ref.guard_rows;
+                if(tail) {
+                    const auto tail_kv=read_device(kv.address+(ref.first+ref.steps)*kv_row,tail*kv_row);
+                    const auto tail_ix=read_device(ix.address+(ref.first+ref.steps)*ix_row,tail*ix_row);
+                    if(std::any_of(tail_kv.begin(),tail_kv.end(),[](std::uint8_t x){return x!=0xffU;}) ||
+                       std::any_of(tail_ix.begin(),tail_ix.end(),[](std::uint8_t x){return x!=0xffU;})) what+=" write-outside-proposal";
+                }
+            }
+        }
+        if(!what.empty()) {
+            ++differing;
+            std::fprintf(stderr,"draft batch verify MISMATCH at=%llu steps=%u rows=%zu:%s\n",static_cast<unsigned long long>(p.next_source),
+                p.cs.k,members.size(),what.c_str());
+        }
+    }
+    {
+        std::uint32_t rlo=UINT32_MAX,rhi=0;
+        for(auto* m:members) {rlo=std::min(rlo,m->impl_->cs.requested);rhi=std::max(rhi,m->impl_->cs.requested);}
+        if(rlo!=rhi) ++verify_coverage().divergent_cycles;
+    }
+    (void)lo;(void)hi;
+    return differing;
+}
+void HipMtpRuntime::draft_batch_launch(std::span<HipMtpRuntime* const> rows,void* stream,std::uint32_t shared_head_rows) {
+    require(!rows.empty() && rows.size()<=hip_mtp_draft_batch_rows && stream,"MTP draft batch launch is invalid");
+    try {
+        const auto n=rows.size();
+        std::vector<MtpNativeContext> contexts;contexts.reserve(n);
+        std::vector<HipMtpInputFusionRequest> fusion;fusion.reserve(n);
+        std::vector<HipMtpFastMoeViews> moe;moe.reserve(n);
+        std::vector<const std::uint32_t*> tokens(n,nullptr);std::vector<std::uint32_t> values(n,0U);
+        std::vector<HipMtpDraftHead*> heads(n,nullptr);std::vector<const std::uint16_t*> hidden(n,nullptr);
+        const auto k=rows.front()->impl_->cs.k;
+        for(std::size_t r=0;r<n;++r) {
+            auto& p=*rows[r]->impl_;
+            require(p.active && p.batch_stream==static_cast<hipStream_t>(stream) && p.draft && !p.draft_exact && !p.sampler &&
+                !p.cs.device_draft && !p.cs.stop && p.cs.k<p.cs.requested && p.cs.k==k,"MTP draft batch row is not an entered open chain at this step");
+            contexts.push_back(p.context(p.next_source+k));
+            fusion.push_back(p.fusion());moe.push_back(p.fast_moe());
+            if(k) tokens[r]=p.draft->device_token(k-1U); else values[r]=p.pending_token;
+            heads[r]=p.draft.get();hidden[r]=p.cs.hidden;
+        }
+        const auto& lead=*rows.front()->impl_;
+        constexpr std::uint64_t inject=4U*10240U;
+        const auto* hc=lead.hc_inject.get();
+        // Step k of every row, in the one-token chain's order (chain_launch_step, fast greedy branch).
+        // STRIX_MTP_DRAFT_BATCH_VERIFY: each stage's per-row state against the member's own chain at that stage.
+        const bool verify=rows.front()->impl_->batch_reference.has_value();
+        const auto stage=[&](unsigned s) {if(verify) draft_batch_verify_stage(rows,stream,s);};
+        launch_hip_mtp_embedding_rows(contexts,tokens,values,stream);
+        launch_hip_mtp_input_fusion_draft_rows(fusion,stream);stage(0);
+        launch_hip_mtp_hyper_mix_draft_rows(contexts,MtpHyperRole::attention,hc,stream);stage(1);
+        launch_hip_mtp_indexer_rows(contexts,stream);stage(2);
+        launch_hip_mtp_sparse_attention_draft_rows(contexts,stream);stage(3);
+        launch_hip_mtp_inject_rows(contexts,MtpInjectRole::attention,stream);stage(4);
+        launch_hip_mtp_hyper_mix_draft_rows(contexts,MtpHyperRole::mlp,hc+inject,stream);stage(5);
+        launch_hip_mtp_route_rows(contexts,stream);stage(6);
+        launch_hip_mtp_fast_moe_rows(moe,stream);stage(7);
+        launch_hip_mtp_inject_rows(contexts,MtpInjectRole::mlp,stream);stage(8);
+        launch_hip_mtp_publish_next_rows(contexts,stream);stage(9);
+        launch_hip_mtp_hyper_mix_draft_rows(contexts,MtpHyperRole::head,nullptr,stream);stage(10);
+        HipMtpDraftHead::launch_rows(heads,hidden,k,shared_head_rows,stream);stage(11);
+        host_phase_mark("2l draft batch step launch");
+    } catch(...) {
+        for(auto* m:rows) m->impl_->failure();
+        throw;
+    }
 }
 bool HipMtpRuntime::propose_chain_launch_step() {return impl_->chain_launch_step();}
 bool HipMtpRuntime::propose_chain_after_step() {return impl_->chain_after_step();}

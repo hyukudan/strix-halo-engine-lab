@@ -1924,6 +1924,85 @@ void bench_hyper_rows(bool splitk, bool lane, std::uint32_t count, bool cold) {
         << " T=" << count << (cold ? " cold" : " warm") << " serial_us=" << serial << " rows_us=" << rows
         << " rows_q6p32_us=" << q6_rows << " speedup=" << serial / rows << '\n';
 }
+// The decode's weight memory: `sets` copies of the HC tensors in host pages registered fine-grained (MTYPE UC, as
+// the model residency registers the GGUF), each window mix reading its own copy as the 97 mixes of a window do.
+// Per-mix time = one event pair around `sets` back-to-back rows launches; median over 15 samples. The launch path
+// (three kernels / persistent / static B) follows the process environment.
+void bench_hyper_rows_uc(std::uint32_t count, std::uint32_t sets) {
+    HyperFixture f(SerialOp::attn_hyper_mix, true, true, count);
+    f.prepare(0U); write(f.scratch, f.seed);
+    std::vector<std::uint64_t> offsets;
+    std::uint64_t set_bytes = 0;
+    for (const auto& weight : f.weights) { offsets.push_back(set_bytes); set_bytes += (weight.original.size() + 4095U) / 4096U * 4096U; }
+    const auto total = set_bytes * sets;
+    void* host = std::aligned_alloc(4096U, static_cast<std::size_t>(total));
+    require(host != nullptr, "UC bench host allocation");
+    for (std::uint32_t s = 0; s < sets; ++s)
+        for (std::size_t i = 0; i < f.weights.size(); ++i)
+            std::memcpy(static_cast<unsigned char*>(host) + s * set_bytes + offsets[i], f.weights[i].original.data(), f.weights[i].original.size());
+    check(hipHostRegister(host, static_cast<std::size_t>(total), hipHostRegisterMapped), "register UC bench weights");
+    void* device = nullptr;
+    check(hipHostGetDevicePointer(&device, host, 0), "UC bench device alias");
+    const auto original = f.runtime.tensors;
+    const auto select = [&](std::uint32_t s) {
+        for (std::size_t i = 0; i < f.weights.size(); ++i)
+            f.runtime.tensors[i].address = reinterpret_cast<std::uintptr_t>(device) + s * set_bytes + offsets[i];
+    };
+    hipEvent_t start{}, stop{};
+    check(hipEventCreate(&start), "create UC bench event"); check(hipEventCreate(&stop), "create UC bench event");
+    std::vector<float> samples;
+    {
+        const HipLaunchScope owned(f.scope());
+        for (unsigned i = 0; i < 18U; ++i) {
+            check(hipEventRecord(start, f.owner.stream), "record UC bench start");
+            for (std::uint32_t s = 0; s < sets; ++s) { select(s); hyper_mix_known_window_rows_launch(f.rows, f.config); }
+            check(hipEventRecord(stop, f.owner.stream), "record UC bench stop");
+            check(hipEventSynchronize(stop), "complete UC bench sample");
+            float ms = 0.0F; check(hipEventElapsedTime(&ms, start, stop), "UC bench elapsed");
+            if (i >= 3U) samples.push_back(ms * 1000.0F / static_cast<float>(sets));
+        }
+    }
+    f.runtime.tensors = original;
+    f.owner.finish();
+    std::string phases;
+    if (std::getenv("STRIX_HC_PERSISTENT_TRACE")) {
+        // Last launch: per phase, min / median / max over blocks, us after the earliest block start.
+        const auto trace = hip_hyper_mix_testing_persistent_trace();
+        std::uint64_t first = UINT64_MAX;
+        for (std::size_t b = 0; b < 40U; ++b) first = std::min(first, trace[b * 8U]);
+        // Per block: the last wave's unit end minus the first wave's (static form), and the block's B end.
+        if (std::getenv("STRIX_HC_UC_WAVES")) {
+            std::string blocks = " waves(block: first-last-Bdone us)";
+            for (std::size_t b = 0; b < 40U; ++b) {
+                std::uint64_t lo = UINT64_MAX, hi = 0;
+                for (std::size_t w = 0; w < 16U; ++w) { const auto v = trace[40U * 8U + 16U + b * 16U + w]; lo = std::min(lo, v); hi = std::max(hi, v); }
+                char cell[64];
+                std::snprintf(cell, sizeof(cell), " %zu:%.1f-%.1f-%.1f", b, static_cast<double>(lo - first) / 100.0,
+                    static_cast<double>(hi - first) / 100.0, static_cast<double>(trace[b * 8U + 3U] - first) / 100.0);
+                blocks += cell;
+            }
+            phases += blocks;
+        }
+        phases += " phases(start,A,bar1,B,bar2,Cchain,end,unit0)";
+        for (unsigned k = 0; k < 8U; ++k) {
+            std::vector<double> v;
+            for (std::size_t b = 0; b < 40U; ++b) v.push_back(static_cast<double>(trace[b * 8U + k] - first) / 100.0);
+            std::sort(v.begin(), v.end());
+            char cell[48];
+            std::snprintf(cell, sizeof(cell), " %.1f/%.1f/%.1f", v.front(), v[v.size() / 2U], v.back());
+            phases += cell;
+        }
+    }
+    (void)hipEventDestroy(start); (void)hipEventDestroy(stop);
+    check(hipHostUnregister(host), "unregister UC bench weights");
+    std::free(host);
+    std::sort(samples.begin(), samples.end());
+    const char* b = std::getenv("STRIX_HC_PERSISTENT_B");
+    const char* p = std::getenv("STRIX_HC_PERSISTENT");
+    std::cout << "hc-uc-bench T=" << count << " sets=" << sets << " persistent=" << (p ? p : "-") << " B=" << (b ? b : "queue")
+        << " us/mix min/med/max=" << samples.front() << '/' << samples[samples.size() / 2U] << '/' << samples.back()
+        << " floor_us=" << static_cast<double>(set_bytes) / 236e3 << phases << '\n';
+}
 // Terminal head over real window row views: the configured prefetch R1 head
 // per row is the oracle; device greedy rows land in host-mapped memory.
 // Cohort heads of 9..32 rows: the rows of several 8-row windows (own arenas; the last one partly used), in
@@ -2439,6 +2518,11 @@ int main(int argc, char** argv) try {
         return 0;
     }
     // HC rows only (the persistent ctest runs this with STRIX_HC_PERSISTENT=1 and requires its launches).
+    if (argc > 1 && std::string_view(argv[1]) == "--hc-uc-bench") {
+        const auto sets = argc > 2 ? static_cast<std::uint32_t>(std::atoi(argv[2])) : 24U;
+        for (std::uint32_t rows : {2U, 4U, 8U}) bench_hyper_rows_uc(rows, sets);
+        return 0;
+    }
     if (argc > 1 && std::string_view(argv[1]) == "--hc-rows") {
         std::uint32_t cases = 0;
         for (auto op : {SerialOp::attn_hyper_mix, SerialOp::mlp_hyper_mix, SerialOp::final_hyper_mix})
@@ -2464,11 +2548,11 @@ int main(int argc, char** argv) try {
                 // Last launch: per phase, min / median / max over blocks, us after the earliest block start.
                 const auto trace = hip_hyper_mix_testing_persistent_trace();
                 std::uint64_t start = UINT64_MAX;
-                for (std::size_t b = 0; b < trace.size() / 8U; ++b) start = std::min(start, trace[b * 8U]);
+                for (std::size_t b = 0; b < 40U; ++b) start = std::min(start, trace[b * 8U]);
                 std::cout << "  trace T=" << rows << (cold ? " cold" : " warm") << " (start, A done, barrier1, B done, barrier2, C chain, end):";
                 for (unsigned k = 0; k < 7U; ++k) {
                     std::vector<double> v;
-                    for (std::size_t b = 0; b < trace.size() / 8U; ++b) v.push_back(static_cast<double>(trace[b * 8U + k] - start) / 100.0);
+                    for (std::size_t b = 0; b < 40U; ++b) v.push_back(static_cast<double>(trace[b * 8U + k] - start) / 100.0);
                     std::sort(v.begin(), v.end());
                     std::cout << ' ' << v.front() << '/' << v[v.size() / 2U] << '/' << v.back();
                 }
