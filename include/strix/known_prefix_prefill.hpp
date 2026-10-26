@@ -2,8 +2,12 @@
 
 #include "strix/compiled_speculative_verify.hpp"
 #include "strix/speculative_verify_runtime.hpp"
+#include <stdexcept>
 
 namespace strix {
+struct KnownPrefillBudgetExceeded : std::invalid_argument {
+    using std::invalid_argument::invalid_argument;
+};
 struct KnownPrefillRequest {
     std::uint32_t logical_rows=16;
     bool r2_shared_expert=false,r2_gdn=false,r2_gdn_f32_gates=false,routed_expert_union=false;

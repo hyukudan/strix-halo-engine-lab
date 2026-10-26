@@ -103,6 +103,83 @@ std::vector<Interval> reclaim_intervals(std::uint64_t table_offset, std::uint64_
     return result;
 }
 
+std::uint64_t decode_allowance(std::uint64_t generate_tokens, std::uint64_t lookups_per_token,
+    std::uint64_t heads, std::uint64_t page, std::uint64_t requested_bytes) {
+    const auto lookups = checked_mul(checked_add(generate_tokens, 1U), checked_mul(lookups_per_token, heads));
+    return std::max<std::uint64_t>({256ULL << 20U, checked_mul(lookups, checked_mul(2U, page)), requested_bytes});
+}
+
+PromptPlan plan_prompt(const Config& config, const PleHashContract& contract,
+    std::span<const std::uint32_t> prompt) {
+    const auto page = config.page;
+    if (!page || (page & (page - 1U)) || !config.stored_row_bytes || !config.table_rows ||
+        config.table_rows > std::numeric_limits<std::uint32_t>::max())
+        throw std::invalid_argument("PLE reclaim configuration is incomplete");
+    PromptPlan result;
+    const auto in_reclaim = [&](std::uint64_t pg) {
+        const auto byte = pg * page;
+        const auto it = std::upper_bound(config.reclaim.begin(), config.reclaim.end(), byte,
+            [](std::uint64_t value, const Interval& interval) { return value < interval.begin; });
+        return it != config.reclaim.begin() && byte < std::prev(it)->end;
+    };
+    const auto table_bytes = checked_mul(config.table_rows, config.stored_row_bytes);
+    if (checked_add(config.table_offset, table_bytes) > config.mapping_bytes)
+        throw std::invalid_argument("PLE reclaim table exceeds the model mapping");
+    if (prompt.empty()) throw std::invalid_argument("PLE reclaim requires the known prompt tokens");
+    if (!contract.head_count || contract.head_count > PleHashContract::maximum_heads || contract.ngram_size < 2 ||
+        contract.ngram_size > PleHashContract::maximum_ngram)
+        throw std::invalid_argument("PLE reclaim hash contract is invalid");
+    std::uint64_t reclaimable = 0;
+    for (std::size_t i = 0; i < config.reclaim.size(); ++i) {
+        const auto& r = config.reclaim[i];
+        if (r.begin >= r.end || r.begin % page || r.end % page || r.end > config.mapping_bytes ||
+            r.begin < config.table_offset || r.end > config.table_offset + table_bytes ||
+            (i && r.begin < config.reclaim[i - 1].end))
+            throw std::invalid_argument("PLE reclaim intervals must be sorted page-aligned table interior ranges");
+        reclaimable = checked_add(reclaimable, r.end - r.begin);
+    }
+    if (config.reclaim.empty()) throw std::invalid_argument("PLE reclaim table has no unregistered interior page");
+    const auto first_page = config.reclaim.front().begin / page;
+    const auto last_page = config.reclaim.back().end / page;
+    const auto span_pages = last_page - first_page;
+    std::vector<std::uint64_t> touched(static_cast<std::size_t>((span_pages + 63U) / 64U), 0U);
+
+    // The launcher's hash chain (hip_ple_launcher.hip launch: position 0 starts from EOS context, then next_context).
+    const auto heads = contract.head_count;
+    const auto positions = prompt.size();
+    result.rows.resize(static_cast<std::size_t>(checked_mul(positions, heads)));
+    const auto context_count = static_cast<std::size_t>(contract.ngram_size - 1U);
+    std::array<std::uint32_t, PleHashContract::maximum_ngram - 1> previous{};
+    std::fill_n(previous.begin(), context_count, contract.eos_token_id);
+    std::uint64_t touched_pages = 0;
+    for (std::uint64_t p = 0; p < positions; ++p) {
+        const auto hash = hash_ple_token(contract, prompt[static_cast<std::size_t>(p)],
+            std::span<const std::uint32_t>(previous.data(), context_count));
+        if (hash.row_count != heads) throw std::logic_error("PLE reclaim hash row count differs from the contract");
+        for (std::uint32_t h = 0; h < heads; ++h) {
+            const auto row = hash.row_ids[h];
+            if (row >= config.table_rows) throw std::out_of_range("PLE reclaim row id exceeds the table");
+            result.rows[static_cast<std::size_t>(p * heads + h)] = static_cast<std::uint32_t>(row);
+            const auto begin = config.table_offset + row * config.stored_row_bytes;
+            for (auto pg = begin / page; pg <= (begin + config.stored_row_bytes - 1U) / page; ++pg) {
+                if (pg < first_page || pg >= last_page || !in_reclaim(pg)) continue;
+                if (!test_bit(touched, pg - first_page)) { set_bit(touched, pg - first_page); ++touched_pages; }
+            }
+        }
+        std::copy_n(hash.next_context.begin(), context_count, previous.begin());
+    }
+    const auto touched_bytes = checked_mul(touched_pages, page);
+    const auto margin = checked_add(64ULL << 20U, touched_bytes / 64U);
+    const auto admitted = checked_add(checked_add(touched_bytes, config.decode_allowance_bytes), margin);
+    const auto credit = reclaimable > admitted ? reclaimable - admitted : 0U;
+    result.stats.reclaimable_bytes = reclaimable;
+    result.stats.touched_bytes = touched_bytes;
+    result.stats.admitted_bytes = admitted;
+    result.stats.credit_bytes = credit;
+
+    return result;
+}
+
 bool Prefetcher::in_reclaim(std::uint64_t page_index) const noexcept {
     const auto byte = page_index * config_.page;
     const auto it = std::upper_bound(config_.reclaim.begin(), config_.reclaim.end(), byte,
@@ -121,60 +198,16 @@ Prefetcher::Prefetcher(Config config, const PleHashContract& contract, std::span
     if (!config_.mapping_base || !page || (page & (page - 1U)) || config_.mapping_base % page || !config_.stored_row_bytes ||
         !config_.table_rows || config_.table_rows > std::numeric_limits<std::uint32_t>::max() || !config_.drop_page_cache)
         throw std::invalid_argument("PLE reclaim configuration is incomplete");
-    const auto table_bytes = checked_mul(config_.table_rows, config_.stored_row_bytes);
-    if (checked_add(config_.table_offset, table_bytes) > config_.mapping_bytes)
-        throw std::invalid_argument("PLE reclaim table exceeds the model mapping");
-    if (prompt.empty()) throw std::invalid_argument("PLE reclaim requires the known prompt tokens");
-    if (!contract.head_count || contract.head_count > PleHashContract::maximum_heads || contract.ngram_size < 2)
-        throw std::invalid_argument("PLE reclaim hash contract is invalid");
-    std::uint64_t reclaimable = 0;
-    for (std::size_t i = 0; i < config_.reclaim.size(); ++i) {
-        const auto& r = config_.reclaim[i];
-        if (r.begin >= r.end || r.begin % page || r.end % page || r.end > config_.mapping_bytes ||
-            r.begin < config_.table_offset || r.end > config_.table_offset + table_bytes ||
-            (i && r.begin < config_.reclaim[i - 1].end))
-            throw std::invalid_argument("PLE reclaim intervals must be sorted page-aligned table interior ranges");
-        reclaimable = checked_add(reclaimable, r.end - r.begin);
-    }
-    if (config_.reclaim.empty()) throw std::invalid_argument("PLE reclaim table has no unregistered interior page");
-    first_page_ = config_.reclaim.front().begin / page;
-    last_page_ = config_.reclaim.back().end / page;
-    const auto span_pages = last_page_ - first_page_;
-    issued_.assign(static_cast<std::size_t>((span_pages + 63U) / 64U), 0U);
-    std::vector<std::uint64_t> touched(issued_.size(), 0U);
-
-    // The launcher's hash chain (hip_ple_launcher.hip launch: position 0 starts from EOS context, then next_context).
+    auto plan = plan_prompt(config_, contract, prompt);
     heads_ = contract.head_count;
     positions_ = prompt.size();
-    rows_.resize(static_cast<std::size_t>(checked_mul(positions_, heads_)));
-    const auto context_count = static_cast<std::size_t>(contract.ngram_size - 1U);
-    std::array<std::uint32_t, PleHashContract::maximum_ngram - 1> previous{};
-    std::fill_n(previous.begin(), context_count, contract.eos_token_id);
-    std::uint64_t touched_pages = 0;
-    for (std::uint64_t p = 0; p < positions_; ++p) {
-        const auto hash = hash_ple_token(contract, prompt[static_cast<std::size_t>(p)],
-            std::span<const std::uint32_t>(previous.data(), context_count));
-        if (hash.row_count != heads_) throw std::logic_error("PLE reclaim hash row count differs from the contract");
-        for (std::uint32_t h = 0; h < heads_; ++h) {
-            const auto row = hash.row_ids[h];
-            if (row >= config_.table_rows) throw std::out_of_range("PLE reclaim row id exceeds the table");
-            rows_[static_cast<std::size_t>(p * heads_ + h)] = static_cast<std::uint32_t>(row);
-            const auto begin = config_.table_offset + row * config_.stored_row_bytes;
-            for (auto pg = begin / page; pg <= (begin + config_.stored_row_bytes - 1U) / page; ++pg) {
-                if (pg < first_page_ || pg >= last_page_ || !in_reclaim(pg)) continue;
-                if (!test_bit(touched, pg - first_page_)) { set_bit(touched, pg - first_page_); ++touched_pages; }
-            }
-        }
-        std::copy_n(hash.next_context.begin(), context_count, previous.begin());
-    }
-    const auto touched_bytes = checked_mul(touched_pages, page);
-    const auto margin = checked_add(64ULL << 20U, touched_bytes / 64U);
-    admitted_ = checked_add(checked_add(touched_bytes, config_.decode_allowance_bytes), margin);
-    credit_ = reclaimable > admitted_ ? reclaimable - admitted_ : 0U;
-    stats_.reclaimable_bytes = reclaimable;
-    stats_.touched_bytes = touched_bytes;
-    stats_.admitted_bytes = admitted_;
-    stats_.credit_bytes = credit_;
+    rows_ = std::move(plan.rows);
+    stats_ = plan.stats;
+    admitted_ = stats_.admitted_bytes;
+    credit_ = stats_.credit_bytes;
+    first_page_ = config_.reclaim.front().begin / page;
+    last_page_ = config_.reclaim.back().end / page;
+    issued_.assign(static_cast<std::size_t>((last_page_ - first_page_ + 63U) / 64U), 0U);
 
     // Drop before the large allocations: never leave the choice of victim pages to kernel reclaim (registered model
     // pages are unpinned userptr pages; reclaiming one evicts every queue of the process).

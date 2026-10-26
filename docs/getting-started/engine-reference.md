@@ -143,12 +143,19 @@ organization flags, and target-input export/diagnostic routes. **MTP decode and 
 fast prefill automatically yet.** GSQ manifests decline the new auto route; default-injected settings are
 filtered per GSQ owner, so GSQ runs without the former requirement to disable the whole default set.
 
+Long prompts run with the default command up to the model maximum of 262,144 tokens (prompt plus generation):
+the automatic context is clamped to that maximum, the admission estimate credits the PLE pages that reclaim will
+free, and the tile falls back from T8192 to T4096 and then T2048 before the route declines. A prompt plus generation
+above the maximum is refused (`prompt-exceeds-model-context`); a tile that does not fit the memory budget reports
+`insufficient-memory`. Measured with the plain command: 131,072 tokens 92.34 s, 262,143 tokens 201.13 s.
+
 Diagnostic and execution-control variables also decline the auto route (reason
 `explicit-diagnostic-or-execution-control`, with the decline line): `STRIX_PREFILL_LOGITS_DIGEST`,
 `STRIX_RTX_EXPORT_STATE`, `STRIX_QRTX_STEP_DUMP` and `STRIX_PROMPT_BATCH_ROWS` (any value other than empty or `0`).
 A declined run uses the historical resolution, including its 8192-token default context: a prompt longer than
-that fails with "input token sequence exceeds allocated context" unless `--context` is given, and a long prompt
-runs serial prefill (much slower than the auto route). Leave these variables unset for normal runs; use
+that is refused before any work ("Qwen auto-prefill declined: <reason>; prompt has N tokens, exceeding serial
+prefill context C; cannot use serial prefill"); pass `--context` for a serial run, which is much slower than the
+auto route. Leave these variables unset for normal runs; use
 `--print-effective-config` to check which route a command resolves to.
 
 Off switches:
