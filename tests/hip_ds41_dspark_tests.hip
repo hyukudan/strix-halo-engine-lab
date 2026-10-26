@@ -1,3 +1,4 @@
+// Modified for optional StrixLookahead integration, 2026-10-26.
 // DSpark drafter fixtures: every device kernel against the host reference bitwise on synthetic data,
 // then (with STRIX_DS41_Q2_GGUF and STRIX_DS41_DSPARK_GGUF) the whole drafter on the real weights:
 // main rows, ring seeding with wrap-around, draft steps (tokens, confidence, logits, every stage's
@@ -13,6 +14,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -213,6 +215,117 @@ void compare_drafts(const Draft& dev, const Draft& host, const std::string& labe
     std::cout << '\n';
 }
 
+// The same resident weights, committed rings and input token exercise the
+// original fused head, the uncached library and the cached library. Keeping
+// logits also checks the predecessor embeddings consumed by confidence.
+void test_lookahead_binding(DeviceDrafter& device, std::span<const float> main) {
+    const auto initial = device.lookahead_stats();
+    if (!initial.compiled) {
+        std::cout << "lookahead integration checks skipped (external backend not compiled)\n";
+        return;
+    }
+    const auto failures_before = failures;
+    const auto original = [&](const Vocab& vocabulary, std::uint32_t token) {
+        device.configure_lookahead(false);
+        expect(!device.lookahead_stats().active && device.lookahead_stats().capacity == 0U &&
+                   device.lookahead_stats().payload_bytes == 0U,
+               "disabled integration reports zero effective capacity and payload");
+        device.set_vocabulary(vocabulary);
+        return device.draft(token, true);
+    };
+    const auto compare_modes = [&](const Vocab& vocabulary, const std::string& label) {
+        const auto reference = original(vocabulary, 42U);
+        device.configure_lookahead(true, 0U);
+        const auto before_uncached = device.lookahead_stats();
+        compare_drafts(device.draft(42U, true), reference, "lookahead uncached " + label);
+        const auto after_uncached = device.lookahead_stats();
+        expect(after_uncached.active && after_uncached.steps == before_uncached.steps + block_size &&
+                   after_uncached.hits == before_uncached.hits && after_uncached.misses == before_uncached.misses + block_size,
+               "uncached integration executes all proposal rows without hits");
+        device.configure_lookahead(true, 16U);
+        compare_drafts(device.draft(42U, true), reference, "lookahead cold " + label);
+        compare_drafts(device.draft(42U, true), reference, "lookahead repeated " + label);
+    };
+    compare_modes(Vocab{}, "full vocabulary");
+    Vocab first;
+    first.core = 32768;
+    first.extra = {40000U, 100000U, 128000U};
+    compare_modes(first, "core and extra vocabulary");
+
+    // Equal sizes and stable source buffers do not imply an equal ordered map.
+    Vocab reordered = first;
+    std::reverse(reordered.extra.begin(), reordered.extra.end());
+    const auto reordered_reference = original(reordered, 42U);
+    Vocab grown = reordered;
+    grown.extra.push_back(125000U);
+    const auto grown_reference = original(grown, 42U);
+    device.set_vocabulary(first);
+    device.configure_lookahead(true, 16U);
+    (void)device.draft(42U, false);
+    const auto before_reorder = device.lookahead_stats();
+    device.set_vocabulary(reordered);
+    expect(device.lookahead_stats().map_rebuilds == before_reorder.map_rebuilds + 1U,
+           "same-size vocabulary reordering creates a new immutable binding");
+    compare_drafts(device.draft(42U, true), reordered_reference, "lookahead reordered mapping");
+    const std::array<std::uint32_t, 3> extra{125000U, 125000U, 42U};
+    const auto before_growth = device.lookahead_stats();
+    expect(device.add_vocabulary(extra) == 1U, "lookahead vocabulary growth deduplicates ids");
+    expect(device.lookahead_stats().map_rebuilds == before_growth.map_rebuilds + 1U,
+           "vocabulary growth rebuilds even when the source allocation has spare capacity");
+    compare_drafts(device.draft(42U, true), grown_reference, "lookahead appended candidate");
+    const auto before_noop = device.lookahead_stats();
+    expect(device.add_vocabulary(extra) == 0U, "lookahead repeated context ids do not grow the vocabulary");
+    expect(device.lookahead_stats().map_rebuilds == before_noop.map_rebuilds,
+           "no-op vocabulary additions retain the binding");
+
+    // A one-candidate context gives a deterministic reuse pattern independent
+    // of the checkpoint: all five predecessors are the same global token.
+    const Vocab one{0U, {100000U}};
+    device.configure_lookahead(false);
+    device.set_sequences(2U);
+    device.select(1U);
+    device.set_vocabulary(one);
+    device.append(main.first(static_cast<std::size_t>(3U) * hidden), 3U);
+    const auto one_reference = device.draft(100000U, true);
+    device.configure_lookahead(true, 16U);
+    const auto check_reuse = [&](std::uint64_t expected_hits, const std::string& label) {
+        const auto before = device.lookahead_stats();
+        compare_drafts(device.draft(100000U, true), one_reference, label);
+        const auto after = device.lookahead_stats();
+        expect(after.steps == before.steps + block_size && after.hits == before.hits + expected_hits &&
+                   after.misses == before.misses + block_size - expected_hits,
+               label + ": exact per-step hit/miss counters");
+    };
+    check_reuse(block_size - 1U, "lookahead singleton cold");
+    check_reuse(block_size, "lookahead singleton warm");
+    device.select(0U);
+    compare_drafts(device.draft(42U, true), grown_reference, "lookahead original context restored");
+    device.select(1U);
+    check_reuse(block_size, "lookahead warm cache survives context swaps");
+    device.reset();
+    device.append(main.first(static_cast<std::size_t>(3U) * hidden), 3U);
+    check_reuse(block_size - 1U, "lookahead reset invalidates the selected context");
+    // set_sequences recreates every context except context zero, even when
+    // its requested count is unchanged. No old slot-one cache may survive.
+    device.set_sequences(2U);
+    device.select(1U);
+    expect(device.next() == 0U, "recreated context starts with empty rings");
+    device.set_vocabulary(one);
+    device.append(main.first(static_cast<std::size_t>(3U) * hidden), 3U);
+    check_reuse(block_size - 1U, "lookahead recreated context has a cold cache");
+    device.select(0U);
+    device.set_sequences(1U);
+    device.set_vocabulary(Vocab{});
+    device.configure_lookahead(initial.requested, initial.capacity);
+    // The campaign requires this receipt and a successful process exit. A
+    // binary that skips the model or external backend cannot qualify timing.
+    if (failures == failures_before)
+        std::cout << "STRIX_LOOKAHEAD_MODEL_TEST {\"schema_version\":1,\"backend\":\"hip\","
+                     "\"adapter_compiled\":true,\"real_weights\":true,"
+                     "\"fixture\":\"real_weights_synthetic_hidden\","
+                     "\"draft_outputs_bitwise_equal\":true,\"failures\":0}\n";
+}
+
 void test_real(const Files& f) {
     const auto t0 = std::chrono::steady_clock::now();
     const auto model = load_model(f);
@@ -313,6 +426,8 @@ void test_real(const Files& f) {
         }
         device.set_vocabulary(Vocab{});
     }
+
+    test_lookahead_binding(device, host_main);
 
     // Smoke timing (single runs, warm): draft steps without keeping logits.
     for (int i = 0; i < 3; ++i) {

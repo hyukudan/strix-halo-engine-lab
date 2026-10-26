@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -17,6 +18,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -141,6 +143,41 @@ struct RowRecord {
     std::uint64_t hash = 0;
 };
 using Trace = std::map<std::uint32_t, RowRecord>;  // by position, per request
+
+// Modified for optional StrixLookahead integration, 2026-10-26.
+// Opt-in machine-readable receipts for qualification.
+// Preserve strings as JSON even when a caller supplies a path or vocabulary
+// label containing control characters. No receipt output occurs inside timing.
+void lookahead_json_string(std::string_view value) {
+    std::putchar('"');
+    for (const char raw : value) {
+        const auto c = static_cast<unsigned char>(raw);
+        if (c == '"' || c == '\\') std::printf("\\%c", static_cast<int>(c));
+        else if (c < 0x20U) std::printf("\\u%04x", static_cast<unsigned>(c));
+        else std::putchar(static_cast<int>(c));
+    }
+    std::putchar('"');
+}
+
+void lookahead_json_ids(std::span<const std::uint32_t> ids) {
+    std::putchar('[');
+    for (std::size_t i = 0; i < ids.size(); ++i) std::printf("%s%u", i ? "," : "", ids[i]);
+    std::putchar(']');
+}
+
+std::uint64_t lookahead_trace_digest(const Trace& trace) {
+    std::uint64_t hash = 14695981039346656037ULL;
+    const auto word = [&](std::uint64_t value, unsigned bytes) {
+        for (unsigned i = 0; i < bytes; ++i, value >>= 8U) hash = (hash ^ (value & 0xffU)) * 1099511628211ULL;
+    };
+    for (const auto& [position, row] : trace) {
+        word(position, 4U);
+        word(row.fed, 4U);
+        word(row.argmax, 4U);
+        word(row.hash, 8U);
+    }
+    return hash;
+}
 
 struct RunResult {
     std::vector<Trace> traces;
@@ -501,6 +538,7 @@ bool spec_gate(BatchForward& fwd, strix::ds41::dspark::DeviceDrafter* drafter, c
         }
         return a.spec_only || check.report(fwd, a, n, alone, alone_state);
     }
+    const auto lookahead_before = drafter->lookahead_stats();
     strix::deepseek41::BatchSpecOptions so;
     so.vocabulary = a.vocab;
     so.prompt_rows = a.prompt_rows;
@@ -592,9 +630,12 @@ bool spec_gate(BatchForward& fwd, strix::ds41::dspark::DeviceDrafter* drafter, c
             }
         }
     std::uint64_t states = 0;  // each request's final attention state (this rank's) against its run alone
+    std::vector<std::uint64_t> state_hashes;
     if (!a.spec_only && a.check)
-        for (std::uint32_t i = 0; i < n; ++i)
-            if (fwd.export_state(i).digest(true) != alone_state[i]) ++states;
+        for (std::uint32_t i = 0; i < n; ++i) {
+            state_hashes.push_back(fwd.export_state(i).digest(true));
+            if (state_hashes.back() != alone_state[i]) ++states;
+        }
     if (print) {
         const auto& st = spec.stats();
         const double agg = st.decode_seconds > 0.0 ? static_cast<double>(st.decode_tokens) / st.decode_seconds : 0.0;
@@ -621,6 +662,60 @@ bool spec_gate(BatchForward& fwd, strix::ds41::dspark::DeviceDrafter* drafter, c
                         differ == 0U && states == 0U ? "PASS" : "FAIL", static_cast<unsigned long long>(compared),
                         a.check ? (a.gather ? "tokens + full logits" : "tokens + this rank's logits slice") : "tokens",
                         static_cast<unsigned long long>(differ), !a.check ? "not compared (no --check)" : states == 0U ? "== alone" : "DIFFER");
+        const char* receipt = std::getenv("STRIX_LOOKAHEAD_RECEIPT");
+        if (receipt && std::strcmp(receipt, "1") == 0) {
+            const auto after = drafter->lookahead_stats();
+            const auto delta = [](std::uint64_t end, std::uint64_t start) {
+                if (end < start) throw std::runtime_error("lookahead statistics regressed during a request");
+                return static_cast<unsigned long long>(end - start);
+            };
+            std::printf("STRIX_LOOKAHEAD_RUN {\"schema_version\":1,\"backend\":\"hip\",\"transport\":");
+            lookahead_json_string(a.transport);
+            std::printf(",\"world\":%u,\"mode\":\"spec\",\"sampler\":\"greedy\",\"layers\":%u,"
+                        "\"max_positions\":%u,\"vocabulary\":", two_ranks ? 2U : 1U, a.layers, a.max_positions);
+            lookahead_json_string(a.vocab);
+            std::printf(",\"window\":");
+            lookahead_json_string(a.window);
+            std::printf(",\"generate\":%u,\"concurrency\":%u,\"sync_start\":%s,\"prompt_rows\":%u,\"prompts\":[",
+                        a.generate, n, a.sync_start ? "true" : "false", a.prompt_rows);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                if (i) std::putchar(',');
+                lookahead_json_ids(prompts[i]);
+            }
+            std::printf("],\"tokens\":[");
+            for (std::uint32_t i = 0; i < n; ++i) {
+                if (i) std::putchar(',');
+                lookahead_json_ids(seqs[i].generated);
+            }
+            std::printf("],\"decode_tokens\":%llu,\"decode_seconds\":%.17g,\"wall_decode_seconds\":%.17g,"
+                        "\"request_seconds\":%.17g,\"gate\":{\"enabled\":%s,\"check\":%s,\"gather\":%s,"
+                        "\"passed\":%s,\"compared_rows\":%llu,\"differing_rows\":%llu,\"differing_states\":%llu},"
+                        "\"kept_rows_fnv64\":[",
+                        static_cast<unsigned long long>(st.decode_tokens), st.decode_seconds, wall_decode, wall,
+                        a.spec_only ? "false" : "true", a.check ? "true" : "false", a.gather ? "true" : "false",
+                        a.spec_only ? "null" : differ == 0U && states == 0U ? "true" : "false",
+                        static_cast<unsigned long long>(compared), static_cast<unsigned long long>(differ),
+                        static_cast<unsigned long long>(states));
+            for (std::uint32_t i = 0; i < n; ++i)
+                std::printf("%s\"%016llx\"", i ? "," : "", static_cast<unsigned long long>(lookahead_trace_digest(traces[i])));
+            std::printf("],\"state_fnv64\":");
+            if (state_hashes.empty()) std::printf("null");
+            else {
+                std::putchar('[');
+                for (std::size_t i = 0; i < state_hashes.size(); ++i)
+                    std::printf("%s\"%016llx\"", i ? "," : "", static_cast<unsigned long long>(state_hashes[i]));
+                std::putchar(']');
+            }
+            std::printf(",\"adapter\":{\"compiled\":%s,\"requested\":%s,\"active\":%s,\"capacity\":%u,"
+                        "\"vocabulary_size\":%u,\"payload_bytes\":%llu,\"steps\":%llu,\"hits\":%llu,\"misses\":%llu,\"map_rebuilds\":%llu,"
+                        "\"fallback_windows\":%llu,\"errors\":%llu}}\n",
+                        after.compiled ? "true" : "false", after.requested ? "true" : "false", after.active ? "true" : "false",
+                        after.capacity, after.vocabulary_size, static_cast<unsigned long long>(after.payload_bytes),
+                        delta(after.steps, lookahead_before.steps),
+                        delta(after.hits, lookahead_before.hits), delta(after.misses, lookahead_before.misses),
+                        delta(after.map_rebuilds, lookahead_before.map_rebuilds),
+                        delta(after.fallback_windows, lookahead_before.fallback_windows), delta(after.errors, lookahead_before.errors));
+        }
         std::fflush(stdout);
     }
     return differ == 0U && states == 0U;

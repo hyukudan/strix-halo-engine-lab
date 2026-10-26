@@ -1,5 +1,7 @@
 #pragma once
 
+// Modified for optional StrixLookahead integration, 2026-10-26.
+
 // Device side of the DSpark drafter (gfx1151, wave32): the kernels of ds41_dspark.hpp's declared
 // operations and a resident drafter that runs a draft step. Every result equals the host reference
 // bitwise (tests/hip_ds41_dspark_tests.hip).
@@ -58,6 +60,18 @@ struct DraftTimes {
     double head_ms = 0.0;
 };
 
+// Opt-in head cache telemetry, aggregated over this drafter's sequence contexts.
+// The cache changes proposal-head work only; target verification and rollback
+// remain owned by the original driver. `active` describes the selected context.
+struct LookaheadStats {
+    bool compiled = false, requested = false, active = false;
+    // Snapshot capacity is zero when disabled; configuration defaults to 16.
+    std::uint32_t capacity = 16, vocabulary_size = 0;
+    std::uint64_t payload_bytes = 0;
+    std::uint64_t steps = 0, hits = 0, misses = 0, map_rebuilds = 0;
+    std::uint64_t fallback_windows = 0, errors = 0;
+};
+
 class DeviceDrafter {
 public:
     // Uploads every tensor the drafter reads (draft stages, the target's token embedding and output head).
@@ -88,6 +102,16 @@ public:
     // id; 8 bytes) through `exchange`; both ranks take the better (larger value, lower id), so the tokens
     // equal the one-rank draft. Everything else of the drafter is replicated (same inputs, same bits).
     void set_rank(std::uint32_t rank, std::uint32_t world, RankExchange exchange);
+    // Explicit binding outside graph capture, on the drafter's owning device.
+    // Disabled by default. STRIX_LOOKAHEAD_CAPACITY=N requests the same binding
+    // at construction: N=0 compares the uncached library, N>0 enables caching.
+    // Each sequence owns an immutable vocabulary binding; vocabulary mutations
+    // rebuild it before the next head call. Vocabulary-sharded world=2 uses the
+    // original head and records fallback_windows. Allocation/runtime errors throw.
+    // The payload budget applies to each context and excludes small metadata.
+    void configure_lookahead(bool enabled, std::uint32_t capacity = 16,
+                             std::uint64_t payload_budget_bytes = 64ULL * 1024U * 1024U);
+    [[nodiscard]] LookaheadStats lookahead_stats() const noexcept;
     // Forgets every appended row (new sequence).
     void reset();
     // An empty context continues a sequence at `position` whose earlier rows it never saw (e.g. a prompt read by the
@@ -106,11 +130,16 @@ public:
 
     // Device bytes a drafter over `weights` with `sequences` contexts allocates (no device needed: the sizes of the
     // constructor's uploads, its scratch and set_sequences' contexts; hipMalloc rounding not included).
+    // With STRIX_LOOKAHEAD_CAPACITY set, includes a conservative full-vocabulary
+    // cache/mapping/workspace reservation for every context, before allocation.
+    // A manual configure_lookahead call must reserve lookahead_footprint first.
     struct Footprint {
-        std::uint64_t weights = 0, scratch = 0, contexts = 0;
-        [[nodiscard]] std::uint64_t total() const noexcept { return weights + scratch + contexts; }
+        std::uint64_t weights = 0, scratch = 0, contexts = 0, lookahead = 0;
+        [[nodiscard]] std::uint64_t total() const noexcept { return weights + scratch + contexts + lookahead; }
     };
     [[nodiscard]] static Footprint footprint(const Weights& weights, std::uint32_t sequences);
+    [[nodiscard]] static std::uint64_t lookahead_footprint(std::uint32_t capacity, std::uint32_t sequences,
+        std::uint64_t payload_budget_bytes = 64ULL * 1024U * 1024U);
 
 private:
     struct Impl;
