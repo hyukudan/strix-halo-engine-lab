@@ -28,6 +28,36 @@
 #include <cstdint>
 #include <exception>
 #include <deque>
+
+// qpf2k adopted exact prefill set ON BY DEFAULT (USER rule 2026-10-26 00:44): every STRIX_QPF2K_* switch of the combined
+// arm C that is unset gets C's value before any parser reads it (all parsers are lazy function-local statics, evaluated
+// after static initialisation). Setting a switch explicitly (e.g. =0) keeps it: =0 restores the old path. The two MoE items
+// are recorded in STRIX_QPF2K_MOE_DEFAULTED (bit 1 DA16, bit 2 ROUTE) so the GSQ prefill profile turns them off instead of
+// refusing (an explicit setting with a GSQ gate type is still refused, see enqueue_prefill).
+namespace {
+const bool qpf2k_default_env = [] {
+    // STRIX_QPF2K_DEFAULTS=0: no defaults at all (every unset switch keeps its old OFF meaning).
+    if (const char* d = std::getenv("STRIX_QPF2K_DEFAULTS"); d && d[0] == '0') return false;
+    const auto put = [](const char* name, const char* value) {
+        if (std::getenv(name)) return false;
+        ::setenv(name, value, 0);
+        return true;
+    };
+    put("STRIX_QPF2K_SCHED", "12");
+    put("STRIX_QPF2K_DENSE", "1");
+    put("STRIX_QPF2K_GDN", "1");                       // default parts 55 (decay-NaN dispatch)
+    put("STRIX_QPF2K_GDN_GATES_BATCH", "1");           // qpfx 8f22961a (exact; gates -17.5 % per call)
+    put("STRIX_QPF2K_GDN_CORE16", "1");                // qpfx 4c44767a (exact; GDN out from FP16 core rows)
+    if (put("STRIX_QPF2K_QSA", "1")) put("STRIX_QPF2K_QSA_MASK", "0x57");
+    if (put("STRIX_QPF2K_HC", "1")) put("STRIX_QPF2K_HC_MASK", "14");
+    unsigned moe = 0U;
+    if (put("STRIX_QPF2K_MOE_DA16", "1")) moe |= 1U;
+    if (put("STRIX_QPF2K_MOE_ROUTE", "14")) moe |= 2U;
+    if (moe != 0U && !std::getenv("STRIX_QPF2K_MOE_DEFAULTED"))
+        ::setenv("STRIX_QPF2K_MOE_DEFAULTED", moe == 3U ? "3" : moe == 1U ? "1" : "2", 0);
+    return true;
+}();
+}  // namespace
 #include <limits>
 #include <memory>
 #include <stdexcept>

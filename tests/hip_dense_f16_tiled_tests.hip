@@ -643,7 +643,62 @@ void bench_ab_inline(hipStream_t stream) {
         }
     }
 }
+// STRIX_QPF2K_DENSE_AB=4 ("producers emit the consumer's format"): the FP32-A sites (GDN out,
+// QSA out, shared down) as they run today (inline FP32 A, form 3, default raster) against the projection reading FP16 A
+// rows that a producer wrote directly (the kPre scratch layout, convert done before timing: what the projection costs
+// once the producer stores fp16(x) itself) at forms 3 and 4 / rasters 1 and 2, and against convert + kPre (no producer
+// change). Bits: kPre forms 3/4 on FP32 sites are already in the fail-closed gates (fp16(x) RNE, same K16 order).
+void bench_ab_fp16a(hipStream_t stream) {
+    Buffer flush(256U << 20U);
+    for (const auto& shape : shapes()) {
+        if (shape.bf16 || std::string(shape.name).rfind("tail", 0) == 0) continue;
+        for (const std::uint32_t rows : {8192U, 4096U, 2048U, 1316U}) {
+            auto p = make_problem(shape, rows, 0U, 11U);
+            const auto site = tiled_site<float>(p, p.out->as<float>());
+            const double flop = 2.0 * rows * p.width * p.outputs;
+            _Float16* a16 = q8_rows::tiled::scratch(stream, static_cast<std::uint64_t>(p.rows_up) * q8_rows::tiled::scratch_pitch(p.width));
+            const auto items_c = static_cast<std::uint64_t>(p.rows) * (p.width / 8U);
+            const auto convert = [&] {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_rows::tiled::convert_kernel<TiledSite<float>>), dim3(static_cast<unsigned>((items_c + 255U) / 256U)), dim3(256U), 0,
+                    stream, site, p.rows, a16, q8_rows::dense_f16_overflow_counter());
+            };
+            convert();
+            const auto today = [&] { q8_rows::tiled::launch(site, rows, stream, false, q8_rows::tiled::kF32, 2U, 3U); };  // the engine default, env-independent
+            const auto pre = [&](unsigned form, unsigned r) {
+                return [&, form, r] { q8_rows::tiled::launch_projection<TiledSite<float>, q8_rows::tiled::kPre>(site, rows, stream, false, form, r, a16); };
+            };
+            const auto conv_pre4 = [&] { q8_rows::tiled::launch(site, rows, stream, false, q8_rows::tiled::kPre, 1U, 4U); };
+            const std::string n = std::string(shape.name) + " T " + std::to_string(rows);
+            for (const bool cold : {true, false}) {
+                Buffer* fl = cold ? &flush : nullptr;
+                const std::string c = cold ? " cold" : " warm";
+                print_ab(n + c + " A=today(inline f32,f3) B=fp16A f4 r1", flop, time_ab(today, pre(4U, 1U), stream, fl, 10U));
+                print_ab(n + c + " A=today(inline f32,f3) B=fp16A f4 r2", flop, time_ab(today, pre(4U, 2U), stream, fl, 10U));
+                print_ab(n + c + " A=today(inline f32,f3) B=fp16A f3 r1", flop, time_ab(today, pre(3U, 1U), stream, fl, 10U));
+                print_ab(n + c + " A=today(inline f32,f3) B=convert+pre f4", flop, time_ab(today, conv_pre4, stream, fl, 10U));
+            }
+        }
+    }
+}
+// STRIX_QPF2K_DENSE_AB=5 (K-5120 collapse, falsifier): fine K sweep at raster 1, N 16384, T 8192, FP16 rows in place,
+// projection only, warm: form 3 vs form 4 at K 2560 .. 5120 step 512 (+ 4096 + 64 and 4608 + 64 to probe address aliasing).
+void bench_ab_ksweep(hipStream_t stream) {
+    for (const std::uint32_t width : {2560U, 3072U, 3584U, 4096U, 4160U, 4608U, 4672U, 5120U}) {
+        const Shape shape{"ksweep", width, {16384U}, true, 512U};
+        auto p = make_problem(shape, 8192U, 0U, 9U);
+        const auto site = tiled_site<std::uint16_t>(p, p.out->as<float>());
+        _Float16* a16 = q8_rows::tiled::scratch(stream, static_cast<std::uint64_t>(p.rows_up) * q8_rows::tiled::scratch_pitch(p.width));
+        const auto items = static_cast<std::uint64_t>(p.rows) * (p.width / 8U);
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_rows::tiled::convert_kernel<TiledSite<std::uint16_t>>), dim3(static_cast<unsigned>((items + 255U) / 256U)), dim3(256U), 0,
+            stream, site, p.rows, a16, q8_rows::dense_f16_overflow_counter());
+        const double flop = 2.0 * p.rows * p.width * p.outputs;
+        const auto f = [&](unsigned form) { return [&, form] { q8_rows::tiled::launch_projection<TiledSite<std::uint16_t>, q8_rows::tiled::kPre>(site, p.rows, stream, false, form, 1U, a16); }; };
+        print_ab("ksweep K " + std::to_string(width) + " T 8192 N 16384 r1 projection warm", flop, time_ab(f(3U), f(4U), stream, nullptr, 6U));
+    }
+}
 void bench_ab(hipStream_t stream) {
+    if (std::getenv("STRIX_QPF2K_DENSE_AB")[0] == '5') { bench_ab_ksweep(stream); return; }
+    if (std::getenv("STRIX_QPF2K_DENSE_AB")[0] == '4') { bench_ab_fp16a(stream); return; }
     if (std::getenv("STRIX_QPF2K_DENSE_AB")[0] == '2') { bench_ab_raster(stream); return; }
     if (std::getenv("STRIX_QPF2K_DENSE_AB")[0] == '3') { bench_ab_inline(stream); return; }
     Buffer flush(256U << 20U);

@@ -2235,6 +2235,12 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
         throw std::invalid_argument("A8 prefill geometry/format is invalid");
     // qpf2k/moe-mi ROUTE bits and DA16 are gated on the production Q4_K/Q5_K prefill only: with a GSQ gate type they are
     // refused (fail-closed) until that combination has its own gate.
+    // Defaulted (not explicitly set) ROUTE / DA16 are turned off for a GSQ gate type (STRIX_QPF2K_MOE_DEFAULTED, set by the
+    // default-ON initialiser in hip_known_prefix_window.hip); explicit settings are still refused.
+    {
+        static const unsigned defaulted=[]{const char* v=std::getenv("STRIX_QPF2K_MOE_DEFAULTED");return v?static_cast<unsigned>(std::atoi(v))&3U:0U;}();
+        prefill_moe_gsq_off()=q20?defaulted:0U;
+    }
     if(q20&&(prefill_route()!=0U||prefill_da16()))
         throw std::invalid_argument("STRIX_QPF2K_MOE_ROUTE / STRIX_QPF2K_MOE_DA16 are not qualified with the GSQ prefill profile");
     // STRIX_PREFILL_MOE_BATCH: assignments of one expert per CTA (default 8).

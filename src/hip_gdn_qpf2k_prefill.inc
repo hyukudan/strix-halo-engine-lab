@@ -229,6 +229,12 @@ void gdn_qpf2k_cols_kernel(GdnPrefillRows rows, std::uint32_t count, float* stat
 // Sched bit 1 (O >= 2): a scheduling fence after each 256-feature step keeps the step's 8 LDS reads next to its FMAs
 // (otherwise the compiler hoists the reads of all steps and the O x 80 weights no longer fit in registers). Placement
 // only: every chain, tree and transform is unchanged.
+// Sched bit 4 (STRIX_QPF2K_GDN_GATES_BATCH): dt / a are loaded once per wave (not on every row's serial
+// tail), and the transforms run across lanes: each row's raw total (lane 0 after the same tree, rounded to BF16 as
+// before) is parked in lane (row - r0) % 32 of a register (readfirstlane + per-lane select), and every 32 rows (or at
+// the end of the block's rows) all lanes apply the unchanged sigmoid / softplus expression to their own row at once
+// (the lane-0 tail was ~158 alpha / ~38 beta instructions per row with one active lane). The chains, the tree, the
+// BF16 rounding and the transform expressions are the same per value; only the lane that evaluates them changes.
 template <unsigned O, unsigned W, unsigned RC, unsigned RB, unsigned Width = 2560U, unsigned Sched = 0U>
 __global__ __launch_bounds__(W * 32U)
 void gdn_qpf2k_gates_kernel(const std::uint16_t* input, std::uint64_t input_stride, const float* beta_weights,
@@ -277,6 +283,34 @@ void gdn_qpf2k_gates_kernel(const std::uint16_t* input, std::uint64_t input_stri
         }
     };
     constexpr bool Prefetch = (Sched & 2U) == 0U;   // Sched bit 2: no prefetch (rows staged right before use)
+    constexpr bool Batch = (Sched & 4U) != 0U;      // Sched bit 4: parameters preloaded, transforms across lanes
+    static_assert(!Batch || RB % RC == 0U);
+    float param_dt[O], param_a[O], held[O];
+#pragma unroll
+    for (unsigned o = 0; o < O; ++o) {
+        param_dt[o] = param_a[o] = held[o] = 0.0F;
+        if constexpr (Batch) {
+            const unsigned g = g0 + o;
+            if (g >= heads) { param_dt[o] = load_small(dt, dt_kind, g - heads); param_a[o] = load_small(a, a_kind, g - heads); }
+        }
+    }
+    // Batch: lanes 0 .. n - 1 hold the raw totals of rows base .. base + n - 1; all lanes transform and store them.
+    const auto flush = [&](unsigned base, unsigned n) {
+#pragma unroll
+        for (unsigned o = 0; o < O; ++o) {
+            if (lane < n) {
+                const unsigned g = g0 + o, row = base + lane;
+                const bool alpha = g >= heads;
+                const unsigned out = alpha ? g - heads : g;
+                const float raw = held[o];
+                const auto offset = row * rows.stride + out;
+                if (alpha) {
+                    const float biased = raw + param_dt[o];
+                    rows.gate[offset] = param_a[o] * softplus(biased);
+                } else rows.beta[offset] = round_bf16(1.0F / (1.0F + expf(-raw)));
+            }
+        }
+    };
     if constexpr (Prefetch) fetch(r0);
     for (unsigned first = r0; first < r0 + RB; first += RC) {
         __syncthreads();
@@ -314,7 +348,10 @@ void gdn_qpf2k_gates_kernel(const std::uint16_t* input, std::uint64_t input_stri
                 total = gdn_window_add(total, gdn_window_down<4U>(total));
                 total = gdn_window_add(total, gdn_window_down<2U>(total));
                 total = gdn_window_add(total, gdn_window_down<1U>(total));
-                if (lane == 0U) {
+                if constexpr (Batch) {
+                    const float raw = round_bf16(__int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(total))));
+                    if (lane == (first + r - r0) % 32U) held[o] = raw;
+                } else if (lane == 0U) {
                     const unsigned g = g0 + o, row = first + r;
                     const bool alpha = g >= heads;
                     const unsigned out = alpha ? g - heads : g;
@@ -326,6 +363,10 @@ void gdn_qpf2k_gates_kernel(const std::uint16_t* input, std::uint64_t input_stri
                     } else rows.beta[offset] = round_bf16(1.0F / (1.0F + expf(-raw)));
                 }
             }
+        }
+        if constexpr (Batch) {
+            const unsigned done = first + RC - r0;
+            if (done % 32U == 0U || done == RB) flush(r0 + (done - 1U) / 32U * 32U, (done - 1U) % 32U + 1U);
         }
     }
 }
@@ -349,6 +390,9 @@ struct NormExchange {
     unsigned* consumed;                      // [heads][2] chunks of the partner consumed
     unsigned base;                           // flag value at launch start (flags are never reset; base advances)
     const unsigned* decay_nan;               // the call's decay-NaN flag (gdn_decay_nan_kernel); read only when Nan is 1 or 2
+    _Float16* core16 = nullptr;              // owned compact output rows (F16 lean core only)
+    std::uint32_t core16_pitch = 0;          // halves per row, tiled::scratch_pitch(value_width)
+    unsigned* core16_overflow = nullptr;     // dense FP16 diagnostic: one count per aligned group of 8
 };
 // production gated-norm product value * inv * weight * gate in the production ISA's operand order
 __device__ __forceinline__ float gated_norm_product(float value, float inv, float weight, float gate) {
@@ -458,12 +502,13 @@ __device__ __forceinline__ float gdn_v_conv_value(const std::uint16_t (&vraw)[Ri
 // outputs; compiled only with QPF2K_GDN_BENCH_DIAG): 16 = no pair wait (the peer sums are replaced by the own sums),
 // 32 = no norm (the raw outputs are stored).
 template <GdnRecurrentStorage Storage, unsigned G, unsigned Cc, unsigned W, unsigned Chunk, unsigned Opt, bool Pipe = false,
-    unsigned Lean = 0U, unsigned Nan = 3U>
+    unsigned Lean = 0U, unsigned Nan = 3U, bool F16 = false>
 __global__ __launch_bounds__(W * 32U) __attribute__((amdgpu_waves_per_eu(5, 16)))
 void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std::uint32_t key_heads, std::uint16_t* conv_state,
     const void* conv_weights, SmallWeightKind conv_kind, const void* norm_weights, SmallWeightKind norm_kind, float epsilon,
     NormExchange xch) {
 #pragma clang fp contract(off)
+    static_assert(!F16 || Lean == 1U, "FP16 output requires the lean gated-norm epilogue");
     // Nan 1/2: both blocks of a pair read the same flag, so a pair always runs (or skips) together.
     if (decay_nan_skip<Nan>(xch.decay_nan)) return;
     using Shape = ColsShape<G, Cc, W>;
@@ -754,7 +799,16 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
                     for (unsigned part = 0; part < 2U; ++part) {
                         const auto channel = part * 64U + 32U * half + lane;
                         const float gate_value = 1.0F / (1.0F + expf(-zv[i][part]));
-                        rows.core[base + channel] = gated_norm_product(outs[r][part * 32U + lane], inv, nw[part], gate_value);
+                        const float normed = gated_norm_product(outs[r][part * 32U + lane], inv, nw[part], gate_value);
+                        if constexpr (F16) {
+                            // Same FP32 value and RNE conversion as tiled kF32 staging; no FP32 reader on this route.
+                            xch.core16[static_cast<std::uint64_t>(first + r) * xch.core16_pitch + value_head * 128U + channel] =
+                                static_cast<_Float16>(normed);
+                            // Each aligned 8-lane group is one row's 8 consecutive channels (including across heads).
+                            const auto bad = __ballot(isfinite(normed) && !(fabsf(normed) <= 65504.0F));
+                            if (bad != 0ULL && lane % 8U == 0U && ((bad >> lane) & 0xffULL) != 0ULL)
+                                atomicAdd(xch.core16_overflow, 1U);
+                        } else rows.core[base + channel] = normed;
                     }
                 }
                 __syncthreads();

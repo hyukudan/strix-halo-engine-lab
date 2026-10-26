@@ -13,6 +13,7 @@
 // would have run. The image and the counters are private scratch (not a contract view).
 inline int& prefill_da16_override(){static int v=-1;return v;}
 inline bool prefill_da16() {
+    if(prefill_moe_gsq_off()&1U)return false;
     static const bool env=[]{const char* v=std::getenv("STRIX_QPF2K_MOE_DA16");return v&&v[0]=='1'&&v[1]=='\0';}();
     const int o=prefill_da16_override();
     return o<0?env:o==1;

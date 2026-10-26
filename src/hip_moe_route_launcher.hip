@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -1045,6 +1046,134 @@ __global__ void rows_moe_route_select_kernel(Args rows, std::uint32_t expert_cou
         parallel_moe_route_select_row(route_tiled(rows.workspace[r], rows.tile_workspace, rows), expert_count, top_k, normalize_selected, route_tiled(rows.indices[r], rows.tile_indices, rows), route_tiled(rows.weights[r], rows.tile_weights, rows));
 }
 
+// Prefill selection, one wave per row (STRIX_PREFILL_ROUTER_SELECT=1): bit-identical to
+// rows_moe_route_select_kernel<wave> (one 256-thread block per row). Lane l holds experts l + 32 i in
+// registers. The maximum is order-free (fmaxf over the non-NaN logits, -INFINITY start; its zero sign
+// cannot change exp(x - maximum)). The denominator replays the block's sum exactly: thread t = l + 32 j
+// held (0 + p[t]) + p[t + 256], then the tree strides 128 / 64 / 32 (registers j + 4, j + 2, j + 1) and
+// 16..1 (shuffle down; lane 0 ends with scratch[0]). Same division, the same wave top-k (better(),
+// NaN excluded), the same serial selected_sum in slot order. 8 rows (one tile) per 256-thread block.
+__device__ __forceinline__ void wave_route_select_row(const float* workspace, std::uint32_t* indices, float* weights,
+    std::uint32_t expert_count, std::uint32_t top_k, bool normalize_selected, std::uint32_t lane) {
+    float p[kWaveCandidates];
+#pragma unroll
+    for (std::uint32_t i = 0; i < kWaveCandidates; ++i) {
+        const auto expert = lane + kRouterWave * i;
+        p[i] = expert < expert_count ? workspace[expert] : 0.0F;
+    }
+    float maximum = -INFINITY;
+#pragma unroll
+    for (std::uint32_t i = 0; i < kWaveCandidates; ++i)
+        if (lane + kRouterWave * i < expert_count) maximum = fmaxf(maximum, p[i]);
+#pragma unroll
+    for (std::uint32_t mask = kRouterWave / 2U; mask > 0; mask >>= 1U)
+        maximum = fmaxf(maximum, __shfl_xor(maximum, static_cast<int>(mask), kRouterWave));
+#pragma unroll
+    for (std::uint32_t i = 0; i < kWaveCandidates; ++i)
+        if (lane + kRouterWave * i < expert_count) p[i] = expf(p[i] - maximum);
+    constexpr std::uint32_t half = kThreads / kRouterWave;   // 8 partials per lane: threads l + 32 j
+    float partial[half];
+#pragma unroll
+    for (std::uint32_t j = 0; j < half; ++j) {
+        float sum = 0.0F;
+        if (lane + kRouterWave * j < expert_count) sum += p[j];
+        if (lane + kRouterWave * (j + half) < expert_count) sum += p[j + half];
+        partial[j] = sum;
+    }
+#pragma unroll
+    for (std::uint32_t j = 0; j < 4U; ++j) partial[j] += partial[j + 4U];   // stride 128
+#pragma unroll
+    for (std::uint32_t j = 0; j < 2U; ++j) partial[j] += partial[j + 2U];   // stride 64
+    partial[0] += partial[1];                                                 // stride 32
+    float total = partial[0];
+#pragma unroll
+    for (std::uint32_t stride = kRouterWave / 2U; stride > 0; stride >>= 1U)
+        total += __shfl_down(total, stride, kRouterWave);
+    const float denominator = __shfl(total, 0, kRouterWave);
+    float values[kWaveCandidates];
+    std::uint32_t available = 0;
+#pragma unroll
+    for (std::uint32_t i = 0; i < kWaveCandidates; ++i) {
+        const auto expert = lane + kRouterWave * i;
+        values[i] = expert < expert_count ? p[i] / denominator : 0.0F;
+        if (expert < expert_count && values[i] == values[i]) available |= 1U << i;
+    }
+    float mine = -INFINITY;
+    std::uint32_t mine_index = expert_count;
+    for (std::uint32_t slot = 0; slot < top_k; ++slot) {
+        bool has = false;
+        float best = -INFINITY;
+        std::uint32_t index = expert_count;
+#pragma unroll
+        for (std::uint32_t i = 0; i < kWaveCandidates; ++i) {
+            if ((available & (1U << i)) != 0) {
+                const auto expert = lane + kRouterWave * i;
+                if (!has || better(values[i], expert, best, index)) {
+                    has = true; best = values[i]; index = expert;
+                }
+            }
+        }
+#pragma unroll
+        for (std::uint32_t mask = kRouterWave / 2U; mask > 0; mask >>= 1U) {
+            const float other = __shfl_xor(best, static_cast<int>(mask), kRouterWave);
+            const auto other_index = __shfl_xor(index, static_cast<int>(mask), kRouterWave);
+            const int other_has = __shfl_xor(static_cast<int>(has), static_cast<int>(mask), kRouterWave);
+            if (other_has != 0 && (!has || better(other, other_index, best, index))) {
+                has = true; best = other; index = other_index;
+            }
+        }
+        if (lane == slot) { mine = has ? best : -INFINITY; mine_index = has ? index : expert_count; }
+        if (has && index % kRouterWave == lane) available &= ~(1U << (index / kRouterWave));
+    }
+    float selected_sum = 0.0F;
+    for (std::uint32_t slot = 0; slot < top_k; ++slot) selected_sum += __shfl(mine, static_cast<int>(slot), kRouterWave);
+    if (!normalize_selected) selected_sum = 1.0F;
+    if (lane < top_k) {
+        indices[lane] = mine_index;
+        weights[lane] = mine / selected_sum;
+    }
+}
+template <class Args>
+__global__ void __launch_bounds__(256) wave_rows_route_select_kernel(Args rows, std::uint32_t expert_count,
+    std::uint32_t top_k, bool normalize_selected, std::uint32_t row_count) {
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x) % kRouterWave;
+    // Row = wave of the block, plus blockDim/32 rows per block in x (the window form launches one 32-thread block per row,
+    // spread over the CUs: 8 rows in one block were 12.8 vs 11.4 us in the engine).
+    const auto r = static_cast<std::uint32_t>(blockIdx.x) * (blockDim.x / kRouterWave) + static_cast<std::uint32_t>(threadIdx.x) / kRouterWave;
+    if (r >= row_count) return;   // waves without a row; no barrier follows
+    wave_route_select_row(route_tiled(rows.workspace[r], rows.tile_workspace, rows), route_tiled(rows.indices[r], rows.tile_indices, rows),
+        route_tiled(rows.weights[r], rows.tile_weights, rows), expert_count, top_k, normalize_selected, lane);
+}
+// STRIX_PREFILL_ROUTER_FUSE=1: the logits kernel's tail. Every block of a 128-row tile releases its stores and counts in;
+// the last of the gridDim.y blocks (acquire) runs wave_route_select_row for the tile's rows (8 waves, 16 rows each) from
+// the just-written logits and resets the tile counter. Same logits, same selection code: same bits as logits + select.
+struct RouterSelectTail {
+    unsigned* counters; std::uint32_t expert_count, top_k; bool normalize;
+    __device__ void operator()(const RouterTileRowsArgs& rows, unsigned m0, unsigned total_rows) const {
+        __shared__ unsigned last;
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0U) {
+            const unsigned seen = atomicAdd(&counters[blockIdx.x], 1U);
+            last = seen + 1U == gridDim.y ? 1U : 0U;
+            if (last) atomicExch(&counters[blockIdx.x], 0U);
+        }
+        __syncthreads();
+        if (!last) return;
+        __threadfence();
+        const unsigned lane = threadIdx.x % kRouterWave, wave = threadIdx.x / kRouterWave;
+        for (unsigned r = wave; r < router_fast::kM; r += blockDim.x / kRouterWave) {
+            const unsigned g = m0 + r;
+            if (g >= total_rows) break;
+            const auto at = [&](auto* base, std::uint64_t stride) {
+                return reinterpret_cast<decltype(base)>(reinterpret_cast<std::uintptr_t>(base) + static_cast<std::uint64_t>(g / 8U) * stride);
+            };
+            wave_route_select_row(at(rows.workspace[g % 8U], rows.tile_workspace), at(rows.indices[g % 8U], rows.tile_indices),
+                at(rows.weights[g % 8U], rows.tile_weights), expert_count, top_k, normalize, lane);
+        }
+    }
+};
+
 // Window rows share each staged weight tile; lane (expert, row) keeps the
 // serial chain: fused, ascending from feature zero, carried across tiles.
 constexpr std::uint32_t kRowsExpertsPerBlock = 2;
@@ -1183,17 +1312,32 @@ __device__ __forceinline__ void router_lds_barrier() {
 template <std::uint32_t Rows, std::uint32_t Experts = 16U> constexpr std::uint32_t staged_router_chain_waves() {
     return (Rows * Experts + 31U) / 32U;
 }
-template <typename Activation, std::uint32_t Rows, std::uint32_t Steps, std::uint32_t Loaders, bool Bf16 = false, std::uint32_t Experts = 16U>
+// StageAct (STRIX_ROUTER_STAGE_ACT=1): the block first copies its rows' activations into LDS (one barrier), so the chains
+// read each chunk's activations from LDS instead of one L2/DRAM round trip per chunk (the chunk loop was paced by that
+// round trip: ~1.9 us x 20 chunks at one row). Same values, same FMA order: bit-identical logits.
+template <typename Activation, std::uint32_t Rows, std::uint32_t Steps, std::uint32_t Loaders, bool Bf16 = false, std::uint32_t Experts = 16U,
+    bool StageAct = false, std::uint32_t Chunk = 128U>
 __global__ void __launch_bounds__(32U * (staged_router_chain_waves<Rows, Experts>() + Loaders)) staged_rows_moe_route_logits_kernel(
     RouterRowsArgs rows, const void* __restrict__ weights, std::uint32_t expert_count) {
     static_assert(Rows == 1U || Rows == 2U || Rows == 4U || Rows == 8U);
-    constexpr std::uint32_t chunk = 128U, hidden_size = Steps * chunk, experts = Experts, vectors = chunk / 4U;
+    // Chunk 256 (STRIX_ROUTER_CHUNK256=1, needs StageAct): half the staging rendezvous; the chains stream their activations
+    // from the LDS copy per float4 (no register pack arrays). Same coefficients, same ascending fused chain.
+    static_assert(Chunk == 128U || (Chunk == 256U && StageAct));
+    constexpr std::uint32_t chunk = Chunk, hidden_size = Steps * chunk, experts = Experts, vectors = chunk / 4U;
     constexpr std::uint32_t chains = staged_router_chain_waves<Rows, Experts>();
     // 16 float4 of ring per loader thread (a deeper ring, 32, measured slower).
     constexpr std::uint32_t per_loader = experts * vectors / (32U * Loaders), depth = 16U / per_loader, pitch = vectors + 1U;
     static_assert(per_loader * 32U * Loaders == experts * vectors && depth * per_loader == 16U);
     constexpr std::uint32_t per_vector = 16U / sizeof(Activation);
     __shared__ float4 stage[2][experts * pitch];
+    constexpr std::uint32_t packs_per_row = hidden_size / per_vector;
+    static_assert(!StageAct || Rows * packs_per_row * 16U <= 48U * 1024U, "staged activations exceed the LDS budget");
+    __shared__ uint4 act[StageAct ? Rows : 1U][StageAct ? packs_per_row : 1U];
+    if constexpr (StageAct) {
+        for (std::uint32_t i = threadIdx.x; i < Rows * packs_per_row; i += blockDim.x)
+            act[i / packs_per_row][i % packs_per_row] = reinterpret_cast<const uint4*>(rows.hidden[i / packs_per_row])[i % packs_per_row];
+        __syncthreads();
+    }
     const auto wave = threadIdx.x / 32U, lane = threadIdx.x % 32U;
     const auto first_expert = static_cast<std::uint32_t>(blockIdx.x) * experts;
     if (wave < chains) {
@@ -1202,11 +1346,38 @@ __global__ void __launch_bounds__(32U * (staged_router_chain_waves<Rows, Experts
         const auto row = lane % Rows, expert = first_expert + local;
         const auto* hidden = static_cast<const Activation*>(rows.hidden[row]);
         float sum = 0.0F;
+        if constexpr (Chunk != 128U) {
+            (void)hidden;
+            constexpr std::uint32_t packs = chunk / per_vector;
+#pragma unroll 1
+            for (std::uint32_t step = 0; step < Steps; ++step) {
+                router_lds_barrier();
+                const float4* coefficients = stage[step % 2U] + local * pitch;
+                const uint4* packed_row = act[row] + step * packs;
+#pragma unroll
+                for (std::uint32_t q = 0; q < vectors; ++q) {
+                    const auto c = coefficients[q];
+                    const uint4 packed = packed_row[(4U * q) / per_vector];
+                    const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+                    const auto value = [&](std::uint32_t k) {
+                        const auto i = k % per_vector;
+                        if constexpr (sizeof(Activation) == 2U)
+                            return bf16_to_float(static_cast<std::uint16_t>(i % 2U ? words[i / 2U] >> 16U : words[i / 2U] & 0xffffU));
+                        else return __uint_as_float(words[i]);
+                    };
+                    sum = __builtin_fmaf(value(4U * q + 0U), c.x, sum);
+                    sum = __builtin_fmaf(value(4U * q + 1U), c.y, sum);
+                    sum = __builtin_fmaf(value(4U * q + 2U), c.z, sum);
+                    sum = __builtin_fmaf(value(4U * q + 3U), c.w, sum);
+                }
+            }
+        } else {
         // The next chunk's activations are requested before this chunk's FMAs (L2 round trip per chunk).
         constexpr std::uint32_t packs = chunk / per_vector;
         uint4 next[packs];
 #pragma unroll
-        for (std::uint32_t v = 0; v < packs; ++v) next[v] = *reinterpret_cast<const uint4*>(hidden + v * per_vector);
+        for (std::uint32_t v = 0; v < packs; ++v)
+            next[v] = StageAct ? act[StageAct ? row : 0U][v] : *reinterpret_cast<const uint4*>(hidden + v * per_vector);
 #pragma unroll 1
         for (std::uint32_t step = 0; step < Steps; ++step) {
             uint4 raw[packs];
@@ -1215,7 +1386,8 @@ __global__ void __launch_bounds__(32U * (staged_router_chain_waves<Rows, Experts
             if (step + 1U < Steps)
 #pragma unroll
                 for (std::uint32_t v = 0; v < packs; ++v)
-                    next[v] = *reinterpret_cast<const uint4*>(hidden + (step + 1U) * chunk + v * per_vector);
+                    next[v] = StageAct ? act[StageAct ? row : 0U][(step + 1U) * packs + v]
+                                       : *reinterpret_cast<const uint4*>(hidden + (step + 1U) * chunk + v * per_vector);
             router_lds_barrier();
             const float4* coefficients = stage[step % 2U] + local * pitch;
             // Activations decoded at their FMA (no 128-float staging array: register budget), same values and order.
@@ -1235,6 +1407,7 @@ __global__ void __launch_bounds__(32U * (staged_router_chain_waves<Rows, Experts
                 sum = __builtin_fmaf(activation(4U * q + 2U), c.z, sum);
                 sum = __builtin_fmaf(activation(4U * q + 3U), c.w, sum);
             }
+        }
         }
         if (chain < experts && expert < expert_count) rows.workspace[row][expert] = sum;
     } else {
@@ -1926,6 +2099,34 @@ void launch_router_rows_typed(const PreparedRouterRows& p, const HipMoeRouteLaun
             if (staged && config.hidden_size == 20U * 128U) {
                 // 16 experts per block: R / 2 chain waves and 8 loader waves keeping 8 chunks in flight.
                 constexpr std::uint32_t experts = 16U, loaders = 8U;
+                // STRIX_ROUTER_STAGE_ACT=1: one-row launches; =2: also the 2- and 4-row window launches (in-situ test).
+                // Default (unset) = 2 (measured in the engine: R1 38.9 -> 30.0 us, R2 35.9 -> 32.6, R4 36.5 -> 35.8; R8 stays unstaged); =0 off.
+                static const unsigned stage_mode = [] { const char* v = std::getenv("STRIX_ROUTER_STAGE_ACT"); return !v || !*v ? 2U :
+                    v[0] == '1' || v[0] == '2' ? static_cast<unsigned>(v[0] - '0') : 0U; }();
+                const bool stage_act = stage_mode == 1U ? R == 1U : stage_mode == 2U && R <= 4U;
+                static const bool chunk256 = [] { const char* v = std::getenv("STRIX_ROUTER_CHUNK256"); return v && v[0] == '1'; }();
+                if constexpr (R == 1U) if (stage_act && chunk256) {   // fixture: the staged forms win at one row only
+                    if (half)
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 10U, loaders, true, experts, true, 256U>),
+                            dim3((config.expert_count + experts - 1U) / experts), dim3(32U * (staged_router_chain_waves<R>() + loaders)),
+                            0, stream, p.args, bf16->base, config.expert_count);
+                    else
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 10U, loaders, false, experts, true, 256U>),
+                            dim3((config.expert_count + experts - 1U) / experts), dim3(32U * (staged_router_chain_waves<R>() + loaders)),
+                            0, stream, p.args, f32, config.expert_count);
+                    return;
+                }
+                if constexpr (R <= 4U && (sizeof(Activation) == 2U || R <= 2U)) if (stage_act) {
+                    if (half)
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 20U, loaders, true, experts, true>),
+                            dim3((config.expert_count + experts - 1U) / experts), dim3(32U * (staged_router_chain_waves<R>() + loaders)),
+                            0, stream, p.args, bf16->base, config.expert_count);
+                    else
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 20U, loaders, false, experts, true>),
+                            dim3((config.expert_count + experts - 1U) / experts), dim3(32U * (staged_router_chain_waves<R>() + loaders)),
+                            0, stream, p.args, f32, config.expert_count);
+                    return;
+                }
                 if (half)
                     hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<Activation, R, 20U, loaders, true>),
                         dim3((config.expert_count + experts - 1U) / experts), dim3(32U * (staged_router_chain_waves<R>() + loaders)),
@@ -1966,7 +2167,13 @@ void launch_router_rows_typed(const PreparedRouterRows& p, const HipMoeRouteLaun
     else hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_logits_kernel<Activation, WeightKind, 8U>),
         grid, dim3(256U), 0, stream, p.args, weights, config.hidden_size, config.expert_count);
     check_hip(hipGetLastError(), "known-window router rows logits launch");
-    if (config.wave_topk) hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave>),
+    // STRIX_WINDOW_ROUTER_SELECT=1: the window's rows in one block, one wave per row (wave_rows_route_select_kernel, same bits
+    // as the block-per-row wave form).
+    static const bool window_wave_rows = [] { const char* v = std::getenv("STRIX_WINDOW_ROUTER_SELECT"); return v && v[0] == '1'; }();
+    if (config.wave_topk && window_wave_rows && p.rows <= 8U && config.expert_count <= kMaxExperts && config.top_k <= kRouterWave)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_route_select_kernel<RouterRowsArgs>),
+            dim3(p.rows), dim3(kRouterWave), 0, stream, p.args, config.expert_count, config.top_k, config.normalize_selected, p.rows);
+    else if (config.wave_topk) hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave>),
         dim3(p.rows), dim3(kThreads), 0, stream, p.args, config.expert_count, config.top_k, config.normalize_selected);
     else if (config.ranked_topk) hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::ranked>),
         dim3(p.rows), dim3(kThreads), 0, stream, p.args, config.expert_count, config.top_k, config.normalize_selected);
@@ -2158,6 +2365,23 @@ void route_prefill(std::span<const ExecutionDispatchContext> rows, const HipMoeR
             hipLaunchKernelGGL(router_fast::split_weights, dim3(static_cast<unsigned>(std::min<std::size_t>((weights + 255U) / 256U, 4096U))),
                 dim3(256U), 0, stream, f32, split, split + weights, static_cast<std::uint32_t>(weights));
             check_hip(hipGetLastError(), "router weight split launch");
+            static const bool fuse = [] { const char* v = std::getenv("STRIX_PREFILL_ROUTER_FUSE"); return v && v[0] == '1'; }();
+            if (fuse && presplit_n == 128U && !router_check && experts <= kMaxExperts && config.top_k <= kRouterWave) {
+                static unsigned* counters = nullptr;
+                static std::uint32_t counter_capacity = 0;
+                if (counter_capacity < grid.x) {
+                    if (counters) check_hip(hipFree(counters), "router fuse counters release");
+                    counters = nullptr; counter_capacity = 0;
+                    check_hip(hipMalloc(&counters, sizeof(unsigned) * grid.x), "router fuse counters allocation");
+                    check_hip(hipMemsetAsync(counters, 0, sizeof(unsigned) * grid.x, stream), "router fuse counters clear");
+                    counter_capacity = grid.x;
+                }
+                const RouterSelectTail tail{counters, experts, config.top_k, config.normalize_selected};
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(router_fast::logits_presplit_kernel<128U, RouterSelectTail>), dim3(grid.x, experts / 128U),
+                    dim3(256U), 0, stream, args, split, split + weights, config.hidden_size, total, tail);
+                check_hip(hipGetLastError(), "router prefill fused logits + select launch");
+                return;
+            }
             if (presplit_n == 128U)
                 hipLaunchKernelGGL(router_fast::logits_presplit_kernel<128U>, dim3(grid.x, experts / 128U), dim3(256U), 0, stream, args,
                     split, split + weights, config.hidden_size, total);
@@ -2184,8 +2408,15 @@ void route_prefill(std::span<const ExecutionDispatchContext> rows, const HipMoeR
         hipLaunchKernelGGL(HIP_KERNEL_NAME(lanes_rows_moe_route_logits_kernel<float, 8U, 128U, RouterTileRowsArgs>),
             logits, dim3(256U), 0, stream, args, f32, config.hidden_size, config.expert_count);
     check_hip(hipGetLastError(), "router prefill rows logits launch");
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave, RouterTileRowsArgs>),
-        dim3(8U, tiles), dim3(kThreads), 0, stream, args, config.expert_count, config.top_k, config.normalize_selected);
+    // STRIX_PREFILL_ROUTER_SELECT=1: one wave per row, 8 rows per block (wave_rows_route_select_kernel, same bits).
+    // Default ON (bitwise; =0 restores the block-per-row form).
+    static const bool wave_rows_select = [] { const char* v = std::getenv("STRIX_PREFILL_ROUTER_SELECT"); return !v || v[0] != '0'; }();
+    if (wave_rows_select && config.expert_count <= kMaxExperts && config.top_k <= kRouterWave)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_route_select_kernel<RouterTileRowsArgs>),
+            dim3(1U, tiles), dim3(kThreads), 0, stream, args, config.expert_count, config.top_k, config.normalize_selected, 8U);
+    else
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave, RouterTileRowsArgs>),
+            dim3(8U, tiles), dim3(kThreads), 0, stream, args, config.expert_count, config.top_k, config.normalize_selected);
     check_hip(hipGetLastError(), "router prefill rows selection launch");
 }
 }  // namespace
@@ -2406,6 +2637,23 @@ void launch_hip_mtp_route(const MtpNativeContext& c,void* stream) {
     static const bool staged=[]{const char* v=std::getenv("STRIX_ROUTER_STAGED");return !v||v[0]!='0';}();
     if(staged && h==20U*128U && hidden0%16U==0U && c.tensors->router.runtime->address%16U==0U) {
         RouterRowsArgs args{};args.hidden[0]=reinterpret_cast<const void*>(hidden0);args.workspace[0]=workspace;
+        static const bool stage_act=[]{const char* v=std::getenv("STRIX_ROUTER_STAGE_ACT");return !v||v[0]!='0';}();   // default ON
+        static const bool chunk256=[]{const char* v=std::getenv("STRIX_ROUTER_CHUNK256");return v&&v[0]=='1';}();
+        // STRIX_ROUTER_LOADERS16=1 (with STAGE_ACT=1): 16 loader waves, ring depth 16 (4 MiB lookahead).
+        static const bool loaders16=[]{const char* v=std::getenv("STRIX_ROUTER_LOADERS16");return v&&v[0]=='1';}();
+        if(stage_act&&loaders16)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,1U,20U,16U,false,16U,true>),dim3((e+15U)/16U),
+            dim3(32U*(staged_router_chain_waves<1U>()+16U)),0,reinterpret_cast<hipStream_t>(stream),args,
+            reinterpret_cast<const float*>(c.tensors->router.runtime->address),e);
+        else if(stage_act&&chunk256)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,1U,10U,8U,false,16U,true,256U>),dim3((e+15U)/16U),
+            dim3(32U*(staged_router_chain_waves<1U>()+8U)),0,reinterpret_cast<hipStream_t>(stream),args,
+            reinterpret_cast<const float*>(c.tensors->router.runtime->address),e);
+        else if(stage_act)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,1U,20U,8U,false,16U,true>),dim3((e+15U)/16U),
+            dim3(32U*(staged_router_chain_waves<1U>()+8U)),0,reinterpret_cast<hipStream_t>(stream),args,
+            reinterpret_cast<const float*>(c.tensors->router.runtime->address),e);
+        else
         hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<std::uint16_t,1U,20U,8U>),dim3((e+15U)/16U),
             dim3(32U*(staged_router_chain_waves<1U>()+8U)),0,reinterpret_cast<hipStream_t>(stream),args,
             reinterpret_cast<const float*>(c.tensors->router.runtime->address),e);
@@ -2475,6 +2723,178 @@ void launch_hip_mtp_route_rows(std::span<const MtpNativeContext> contexts,void* 
     hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave>),dim3(count),dim3(kThreads),0,stream,
         args,e,k,c0.model->norm_topk_probability);
     check_hip(hipGetLastError(),"MTP router batch selection launch");
+}
+
+std::array<double, 4> router_prefill_select_selftest(std::uint32_t flavor, std::uint32_t tiles, std::uint32_t experts,
+    std::uint32_t top_k, bool normalize, std::uint32_t seed, std::uint32_t bench_reps) {
+    if (experts == 0U || experts > kMaxExperts || top_k == 0U || top_k > kRouterWave || top_k > experts || tiles == 0U || tiles > 65535U)
+        throw std::invalid_argument("router select self-test: bad shape");
+    const std::uint64_t rows = 8ULL * tiles, n = rows * experts;
+    std::vector<std::uint32_t> host(n);
+    std::uint64_t state = 0x9e3779b97f4a7c15ULL ^ (static_cast<std::uint64_t>(seed) << 17U) ^ flavor;
+    const auto next = [&] { state ^= state << 13U; state ^= state >> 7U; state ^= state << 17U; return state; };
+    const auto bits = [](float f) { std::uint32_t u; std::memcpy(&u, &f, 4); return u; };
+    const auto uniform = [&](float lo, float hi) { return lo + (hi - lo) * static_cast<float>(next() >> 40U) / 16777216.0F; };
+    const std::uint32_t specials[] = {0x7fc00000U, 0xffc12345U, 0x7f800001U, 0x7f800000U, 0xff800000U, 0x00000000U, 0x80000000U,
+        0x00000001U, 0x807fffffU, 0x7f7fffffU, 0xff7fffffU, 0x3f800000U};
+    for (std::uint64_t r = 0; r < rows; ++r) {
+        const std::uint32_t kind = flavor == 4U ? static_cast<std::uint32_t>(r % 5U) : 0U;
+        for (std::uint32_t e = 0; e < experts; ++e) {
+            float v = uniform(-8.0F, 8.0F);
+            std::uint32_t u = bits(v);
+            if (flavor == 1U) u = bits(static_cast<float>(static_cast<int>(next() % 7U)) * 0.5F - 1.0F);          // ties
+            else if (flavor == 2U && next() % 64U == 0U) u = specials[next() % 3U];                              // NaN payloads
+            else if (flavor == 3U && next() % 8U == 0U) u = specials[next() % 12U];                              // +-Inf, +-0, denormals, max
+            else if (flavor == 4U) u = kind == 0U ? 0x7fc00000U : kind == 1U ? 0xff800000U : kind == 2U ? 0x40400000U :
+                kind == 3U ? (e < top_k / 2U ? 0x7fc00000U : u) : (e % 3U == 0U ? 0x7f800000U : u);              // all NaN / -Inf / equal / few NaN / +Inf
+            else if (flavor == 5U) u = bits(uniform(-120.0F, 120.0F));                                           // exp underflow ties at 0
+            host[r * experts + e] = u;
+        }
+    }
+    float* workspace = nullptr; std::uint32_t* indices[2] = {}; float* weights[2] = {};
+    const std::uint64_t outs = rows * top_k;
+    check_hip(hipMalloc(&workspace, n * 4U), "select self-test workspace");
+    for (int a = 0; a < 2; ++a) {
+        check_hip(hipMalloc(&indices[a], outs * 4U), "select self-test indices");
+        check_hip(hipMalloc(&weights[a], outs * 4U), "select self-test weights");
+        check_hip(hipMemset(indices[a], 0xab, outs * 4U), "select self-test poison");
+        check_hip(hipMemset(weights[a], 0xcd, outs * 4U), "select self-test poison");
+    }
+    check_hip(hipMemcpy(workspace, host.data(), n * 4U, hipMemcpyHostToDevice), "select self-test upload");
+    const auto make = [&](int a) {
+        RouterTileRowsArgs args{};
+        for (std::uint32_t r = 0; r < 8U; ++r) {
+            args.hidden[r] = nullptr;
+            args.workspace[r] = workspace + static_cast<std::uint64_t>(r) * experts;
+            args.indices[r] = indices[a] + static_cast<std::uint64_t>(r) * top_k;
+            args.weights[r] = weights[a] + static_cast<std::uint64_t>(r) * top_k;
+        }
+        args.tile_hidden = 0; args.tile_workspace = 32ULL * experts; args.tile_indices = 32ULL * top_k; args.tile_weights = 32ULL * top_k;
+        return args;
+    };
+    const auto a0 = make(0), a1 = make(1);
+    const auto old_form = [&] { hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave, RouterTileRowsArgs>),
+        dim3(8U, tiles), dim3(kThreads), 0, nullptr, a0, experts, top_k, normalize); };
+    const auto new_form = [&] { hipLaunchKernelGGL(HIP_KERNEL_NAME(wave_rows_route_select_kernel<RouterTileRowsArgs>),
+        dim3(1U, tiles), dim3(kThreads), 0, nullptr, a1, experts, top_k, normalize, 8U); };
+    old_form(); new_form();
+    check_hip(hipGetLastError(), "select self-test launch");
+    check_hip(hipDeviceSynchronize(), "select self-test sync");
+    std::vector<std::uint32_t> i0(outs), i1(outs), w0(outs), w1(outs);
+    check_hip(hipMemcpy(i0.data(), indices[0], outs * 4U, hipMemcpyDeviceToHost), "read");
+    check_hip(hipMemcpy(i1.data(), indices[1], outs * 4U, hipMemcpyDeviceToHost), "read");
+    check_hip(hipMemcpy(w0.data(), weights[0], outs * 4U, hipMemcpyDeviceToHost), "read");
+    check_hip(hipMemcpy(w1.data(), weights[1], outs * 4U, hipMemcpyDeviceToHost), "read");
+    double differing = 0;
+    for (std::uint64_t r = 0; r < rows; ++r) {
+        bool same = true;
+        for (std::uint32_t k = 0; k < top_k; ++k) same = same && i0[r * top_k + k] == i1[r * top_k + k] && w0[r * top_k + k] == w1[r * top_k + k];
+        differing += same ? 0.0 : 1.0;
+    }
+    double us[2] = {0.0, 0.0};
+    if (bench_reps > 0U) {
+        hipEvent_t start, stop;
+        check_hip(hipEventCreate(&start), "event"); check_hip(hipEventCreate(&stop), "event");
+        for (int round = 0; round < 3; ++round) for (int a = 0; a < 2; ++a) {   // A B A B A B: the last two rounds count
+            check_hip(hipEventRecord(start, nullptr), "event");
+            for (std::uint32_t k = 0; k < bench_reps; ++k) { if (a == 0) old_form(); else new_form(); }
+            check_hip(hipEventRecord(stop, nullptr), "event");
+            check_hip(hipEventSynchronize(stop), "event");
+            float ms = 0.0F; check_hip(hipEventElapsedTime(&ms, start, stop), "event");
+            if (round > 0) us[a] += 1000.0 * ms / bench_reps / 2.0;
+        }
+        check_hip(hipEventDestroy(start), "event"); check_hip(hipEventDestroy(stop), "event");
+    }
+    check_hip(hipFree(workspace), "free");
+    for (int a = 0; a < 2; ++a) { check_hip(hipFree(indices[a]), "free"); check_hip(hipFree(weights[a]), "free"); }
+    return {static_cast<double>(rows), differing, us[0], us[1]};
+}
+
+std::array<double, 4> router_staged_logits_selftest(std::uint32_t rows_count, bool float_activation, std::uint32_t flavor,
+    std::uint32_t seed, std::uint32_t bench_reps) {
+    constexpr std::uint32_t hidden = 2560U, experts = 512U;
+    if (rows_count != 1U && rows_count != 2U && rows_count != 4U && rows_count != 8U) throw std::invalid_argument("staged self-test: rows");
+    if (float_activation && rows_count > 2U) throw std::invalid_argument("staged self-test: float activations take <= 2 rows");
+    if ((flavor & 4U) != 0U && rows_count > 4U) throw std::invalid_argument("staged self-test: the chunk-256 form takes <= 4 rows");
+    if ((flavor & 8U) != 0U && rows_count != 1U) throw std::invalid_argument("staged self-test: the 16-loader form takes 1 row");
+    std::uint64_t state = 0x2545f4914f6cdd1dULL ^ (static_cast<std::uint64_t>(seed) << 21U) ^ flavor;
+    const auto next = [&] { state ^= state << 13U; state ^= state >> 7U; state ^= state << 17U; return state; };
+    const auto uniform = [&] { return static_cast<float>(static_cast<double>(next() >> 40U) / 16777216.0 * 2.0 - 1.0); };
+    const auto f2u = [](float f) { std::uint32_t u; std::memcpy(&u, &f, 4); return u; };
+    std::vector<float> w(static_cast<std::size_t>(experts) * hidden);
+    for (auto& x : w) {
+        x = uniform() * 0.05F;
+        if ((flavor & 3U) == 1U && next() % 4096U == 0U) { const std::uint32_t u = (next() & 1U) ? 0x7fc00000U : 0x7f800000U; std::memcpy(&x, &u, 4); }
+    }
+    const std::size_t act_bytes = static_cast<std::size_t>(hidden) * (float_activation ? 4U : 2U);
+    std::vector<unsigned char> act(act_bytes * rows_count);
+    for (std::uint32_t r = 0; r < rows_count; ++r)
+        for (std::uint32_t k = 0; k < hidden; ++k) {
+            float v = uniform() * 4.0F;
+            if ((flavor & 3U) == 1U && next() % 2048U == 0U) { const std::uint32_t u = 0xff800000U; std::memcpy(&v, &u, 4); }
+            if (float_activation) std::memcpy(act.data() + r * act_bytes + 4U * k, &v, 4);
+            else { const std::uint16_t h = static_cast<std::uint16_t>(f2u(v) >> 16U); std::memcpy(act.data() + r * act_bytes + 2U * k, &h, 2); }
+        }
+    float* weights = nullptr; unsigned char* hidden_rows = nullptr; float* out[2] = {};
+    check_hip(hipMalloc(&weights, w.size() * 4U), "staged self-test weights");
+    check_hip(hipMalloc(&hidden_rows, act.size()), "staged self-test rows");
+    for (auto& o : out) {
+        check_hip(hipMalloc(&o, 4ULL * experts * rows_count), "staged self-test out");
+        check_hip(hipMemset(o, 0xa5, 4ULL * experts * rows_count), "poison");
+    }
+    check_hip(hipMemcpy(weights, w.data(), w.size() * 4U, hipMemcpyHostToDevice), "upload");
+    check_hip(hipMemcpy(hidden_rows, act.data(), act.size(), hipMemcpyHostToDevice), "upload");
+    const auto make = [&](int a) {
+        RouterRowsArgs args{};
+        for (std::uint32_t r = 0; r < rows_count; ++r) {
+            args.hidden[r] = hidden_rows + r * act_bytes;
+            args.workspace[r] = out[a] + static_cast<std::uint64_t>(r) * experts;
+        }
+        return args;
+    };
+    const auto a0 = make(0), a1 = make(1);
+    const dim3 grid(experts / 16U);
+    const auto run = [&]<typename A, std::uint32_t R>(bool staged) {
+        const dim3 threads(32U * (staged_router_chain_waves<R>() + 8U));
+        if (staged && (flavor & 8U) != 0U) {
+            if constexpr (R == 1U) hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<A, R, 20U, 16U, false, 16U, true>), grid,
+                dim3(32U * (staged_router_chain_waves<R>() + 16U)), 0, nullptr, a1, weights, experts);
+        } else if (staged && (flavor & 4U) != 0U) {
+            if constexpr (R <= 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<A, R, 10U, 8U, false, 16U, true, 256U>), grid, threads, 0, nullptr, a1, weights, experts);
+        } else if (staged) hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<A, R, 20U, 8U, false, 16U, true>), grid, threads, 0, nullptr, a1, weights, experts);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(staged_rows_moe_route_logits_kernel<A, R, 20U, 8U>), grid, threads, 0, nullptr, a0, weights, experts);
+    };
+    const auto both = [&](bool staged) {
+        if (float_activation) { if (rows_count == 1U) run.template operator()<float, 1U>(staged); else run.template operator()<float, 2U>(staged); }
+        else if (rows_count == 1U) run.template operator()<std::uint16_t, 1U>(staged);
+        else if (rows_count == 2U) run.template operator()<std::uint16_t, 2U>(staged);
+        else if (rows_count == 4U) run.template operator()<std::uint16_t, 4U>(staged);
+        else run.template operator()<std::uint16_t, 8U>(staged);
+    };
+    both(false); both(true);
+    check_hip(hipGetLastError(), "staged self-test launch");
+    check_hip(hipDeviceSynchronize(), "sync");
+    std::vector<std::uint32_t> o0(experts * rows_count), o1(experts * rows_count);
+    check_hip(hipMemcpy(o0.data(), out[0], o0.size() * 4U, hipMemcpyDeviceToHost), "read");
+    check_hip(hipMemcpy(o1.data(), out[1], o1.size() * 4U, hipMemcpyDeviceToHost), "read");
+    double differing = 0;
+    for (std::size_t i = 0; i < o0.size(); ++i) differing += o0[i] != o1[i] ? 1.0 : 0.0;
+    double us[2] = {0.0, 0.0};
+    if (bench_reps > 0U) {
+        hipEvent_t start, stop;
+        check_hip(hipEventCreate(&start), "event"); check_hip(hipEventCreate(&stop), "event");
+        for (int round = 0; round < 3; ++round) for (int a = 0; a < 2; ++a) {
+            check_hip(hipEventRecord(start, nullptr), "event");
+            for (std::uint32_t k = 0; k < bench_reps; ++k) both(a == 1);
+            check_hip(hipEventRecord(stop, nullptr), "event"); check_hip(hipEventSynchronize(stop), "event");
+            float ms = 0.0F; check_hip(hipEventElapsedTime(&ms, start, stop), "event");
+            if (round > 0) us[a] += 1000.0 * ms / bench_reps / 2.0;
+        }
+        check_hip(hipEventDestroy(start), "event"); check_hip(hipEventDestroy(stop), "event");
+    }
+    check_hip(hipFree(weights), "free"); check_hip(hipFree(hidden_rows), "free");
+    for (auto& o : out) check_hip(hipFree(o), "free");
+    return {static_cast<double>(o0.size()), differing, us[0], us[1]};
 }
 
 }  // namespace strix
