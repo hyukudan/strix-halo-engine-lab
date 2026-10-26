@@ -25,7 +25,7 @@ rows only for the named build and workload. Raw receipts and review corresponden
 
 | Engine / profile | Hardware and workload | Latest measured result | Verification / publication |
 |---|---|---|---|
-| DeepSeek V4.1 Flash 1017, Q2 experts + 6.5-bit/trellis dense | Two nodes TP2 over USB4, short R1 / six-row verify / N8 benchmarks, 2026-10-26 | **28.48 ms/token / 53.34 ms/window / 71.48 ms/step**; **59.2 / 58.6 / 65.0 %** of calculated ceilings | Shared-down fusion `cb5ef228`; exact gates, three pairs per cell; in development |
+| DeepSeek V4.1 Flash 1017, Q2 experts + 6.5-bit/trellis dense | Two nodes expert TP2 over USB4, short R1 / six-row verify / N8 benchmarks, 2026-10-26 | **28.333 ms/token / 52.70 ms/window / 70.24 ms/step**; N8 **113.9 tok/s** aggregate (calculated); R1 / N8 **59.5 / 66.2 %** of calculated ceilings | `6a5604bf`; published pair default; tokens / verify window / batch rows equal the reference |
 | DeepSeek standalone RTX, Q2 GGUF + Q8_0 dense | RTX PRO 6000 (96 GB, Windows WDDM), exclusive VRAM + pinned-host cache, DSpark keep-64, code / English / Spanish, 2026-10-25 | Same-load **82.3 / 87.7 / 94.4 tok/s**; **51–58 %** of the ceiling for the 6.18 ms all-hit floor; code **82–95 tok/s** across loads | Exact for this profile; prompt lengths/counts unspecified; default-binary integration gate pending |
 | Qwen3.8-Flash-Next, UD-Q4_K_XL, dense A8 | One node, exact prefill sweep, 2026-10-26 | **3.00–240.62 s** across 4K–262,143 tokens; **40.5–45.3 %** of route-matched contract ceilings | `8b99cf58` shipped in PR #49; HC v3 band 16 shipped in #50; later measurements below |
 | Qwen MTP decode, UD-Q4_K_XL, dense A8 | One node, code 1K / 8K, auto windows, 256 generated tokens; `702bc074`, 2026-10-25 | **59.59 / 54.00 tok/s**; 1K **69 %** of 86.8 tok/s byte ceiling | Recipe golden equal; prose 8K **49.58 tok/s** on `226bb691`, exact |
@@ -111,31 +111,30 @@ Batched MTP drafting remains opt-in. GSQ below is a separate speed-over-quality 
 
 ### DeepSeek pair optimization status
 
-**Newer pair measurements — in development (2026-10-26).** Same Q2/6.5-bit/trellis profile and USB4 TP2;
-shared-down fusion in `cb5ef228` (integrated into `69176409`), three interleaved pairs per cell:
+**On by default since 2026-10-26** in the pair build (`6a5604bf`): shared-down fusion
+(`STRIX_DS41_SHARED_DOWN_FUSED=0` to disable), split gate/up MoE prefill kernel "form 7"
+(`STRIX_DS41_MOE_PREFILL=0`), exact per-site dense prefill selector (`STRIX_DS41_DENSE_SELECT=0`;
+FP16 forms stay off), attention window fold / live chunks / f16 tile
+(`STRIX_DS41_ATTN_WINDOW_FOLD=0` / `STRIX_DS41_ATTN_LIVE_CHUNKS=0` / `STRIX_DS41_ATTN_TILE_F16=0`),
+and server warm-up + DSpark calibration (`STRIX_DS41_SERVE_WARM=0` / `STRIX_DS41_DSPARK_CALIB=0`).
+Measured gains versus `69c6bdab`, with the same GPU turns, Q2 experts + 6.5-bit/trellis dense profile,
+and two Strix Halo nodes using expert tensor parallel over USB4:
 
-| Decode benchmark | Measured median | Calculated ceiling share | Verification |
+| Measurement | `69c6bdab` → `6a5604bf` | Change | Verification / conditions |
 |---|---:|---:|---|
-| One stream | **28.48 ms/token** | **59.2 %** (16.87 ms floor) | tokens equal on both ranks |
-| Six-row verify window | **53.34 ms/window** | **58.6 %** (31.28 ms floor) | window/reject and operation-hash gates equal |
-| Eight streams, no drafting | **71.48 ms/step** (111.9 tok/s aggregate, calculated) | **65.0 %** (46.48 ms floor) | all batch rows equal the reference |
+| Device prefill TTFT, 1K | 2.098 → **1.954 s** | −6.9 % | median of 4 |
+| Device prefill TTFT, 8K | 11.090 → **9.757 s** | −12.0 % | median of 3 |
+| Greedy decode, R1 | 28.873 → **28.333 ms/token** | −1.9 % | 2 interleaved pairs; tokens identical; 35.3 tok/s, 59.5 % of calculated ceiling (16.87 ms floor) |
+| Six-row verify window, R6 | 54.01 → **52.70 ms/window** | −2.4 % | identical |
+| Eight streams, no drafting, N8 | 71.84 → **70.24 ms/step** | −2.2 % | all rows equal the reference; 113.9 tok/s aggregate (calculated), 66.2 % of calculated ceiling (46.48 ms floor) |
+| Warmed server, 8-category short set, C1 / C2 / C4 / C8 | 43.58 / 61.13 / 66.53 / 75.72 → **48.00 / 63.97 / 69.20 / 77.00 tok/s** aggregate | +9.9 / +3.0 / +2.9 / +1.7 % | token IDs 64/64 equal in every run |
+| Streaming, single client | 54.67 → **58.77 tok/s** | +7.4 % | same warmed-server campaign |
 
-Prompt kind/context are unspecified for these short decode benchmarks. Gains versus `69c6bdab` are about
-**1.4 / 1.7 / 1.0 %**, respectively. Publication and complete serving qualification remain pending:
-`69c6bdab` measured **−6.2 %** single-client serving throughput versus the preceding build in both test orders
-(**44.05 / 43.68 vs 46.75 / 46.76 tok/s**, warmed short-set campaign, reference IDs equal).
-The single-request benchmark does not establish serving performance.
-
-**Exact split gate/up MoE prefill kernel ("form 7") — in development (2026-10-26).** Two nodes, same profile,
-one model load per comparison, all logits bit-identical to the archived reference: 2K TTFT **−2.75 %** (8/8 interleaved
-pairs, a second run −3.7 %), 8K TTFT **−0.43 s, −3.81 %** (4/4 pairs). MoE layer time −3 to −6 % at 600–8,192 tokens.
-Pending 1K confirmation and publication.
-
-**Exact dense-prefill selector — in development, opt-in (2026-10-26, `78ccffce`).** Two nodes, row-split
-prefill, 6.5-bit dense overlay, expert TP off: 2K TTFT **3.96 → 3.74 s (−5.5 %)** and 8K
-**11.68 → 11.08 s (−5.1 %)**, same-process A/B; logits identical. The full-depth reference gate is bitwise
-on both ranks. Prompt kind is unspecified. Attention-TP, prefix/extend and longer-context qualification
-remain pending; FP16 arithmetic variants are off because they fail quality qualification.
+Prefill uses benchmark prompts of unspecified kind; logits are bit-identical to the archived reference
+on every run on both ranks. Prompt kind/context are unspecified for the short decode benchmarks.
+Server: two runs per arm in both orders; one of the two new-build runs had a single prefill unit stall
+of 3.8 s (cause under investigation), so C8 uses the clean run. The 2026-10-26 pair build supersedes
+the earlier single-client serving regression: it serves faster than `69c6bdab`.
 
 The shared gate/up bandwidth redesign remains off: on 2026-10-26, a cold-rotation native microbenchmark
 (R1, 24 weight sets, three rounds) measured a co-producer chain at **74.54 µs** versus **73.91 µs** for the
@@ -260,11 +259,13 @@ ranks, batch tokens equal the campaign reference, and the server's token ids equ
 
 | What | Value | Date | Conditions |
 |---|---|---|---|
-| Greedy decode, 1 stream *(campaign)* | **28.5 tok/s** | 2026-10-22 | production defaults with eager small sends (P17.3); bits identical with and without |
+| Greedy decode, 1 stream, R1 | **28.333 ms/token = 35.3 tok/s**; 59.5 % of calculated ceiling (16.87 ms floor) | 2026-10-26 | `6a5604bf`; 2 interleaved pairs; tokens identical; prompt kind/context unspecified |
 | DSpark speculative decode, 1 stream, 8 English / 8 Spanish / 8 code prompts × 256 tokens | **37.5 / 39.3 / 62.3 tok/s**, 46.4 over all 24 | 2026-10-22 | DSpark drafter on both ranks (P17.1) |
-| Batched decode, 8 streams, aggregate *(campaign)* | **95.9 tok/s** | 2026-10-23 | production defaults, segmented batch steps, 8 prompts × 48 tokens, no drafting |
-| Device prefill, 8K tokens *(campaign)* | **734 tok/s** | 2026-10-23 | expert-parallel prefill on the pair, final KV by owner (P17.5) |
+| Batched decode, 8 streams, no drafting, N8 | **70.24 ms/step = 113.9 tok/s** aggregate (calculated); 66.2 % of calculated ceiling (46.48 ms floor) | 2026-10-26 | `6a5604bf`; all rows equal the reference; prompt kind/context unspecified |
+| Device prefill, 8K tokens | TTFT **9.757 s** | 2026-10-26 | `6a5604bf`; median of 3; benchmark prompts, kind unspecified; logits bit-identical on both ranks |
+| Device prefill, 1K tokens | TTFT **1.954 s** | 2026-10-26 | `6a5604bf`; median of 4; benchmark prompts, kind unspecified; logits bit-identical on both ranks |
 | Device prefill, 1K / 4K / 16K tokens | 458 / 640 / 758 tok/s | 2026-10-22 | P17.1 build, before fused staging and final KV by owner |
+| Warmed server, 8-category short set, aggregate at 1 / 2 / 4 / 8 clients | **48.00 / 63.97 / 69.20 / 77.00 tok/s** | 2026-10-26 | `6a5604bf`; same short set; 64/64 token IDs equal; C8 clean run (see optimization status) |
 | Server, 8-category short set, aggregate at 1 / 2 / 4 / 8 clients *(campaign)* | **38.4 / 52.7 / 59.3 / 66.8 tok/s** | 2026-10-22 | `strix-deepseek41-serve`, 8 slots, DSpark (drafting paused above 4 requests in flight), P17.4 |
 | Server, 8 chats × 128 tokens at 1 / 2 / 4 / 8 clients | 41.4 / 54.0 / 59.7 / 67.9 tok/s | 2026-10-22 | same |
 | Server, one client, prose / code chat, decode after the first token | 34.9 / **66.9 tok/s** (31.8 / 55.4 including time to first token; TTFT p50 0.50 s) | 2026-10-22 | P17.1 build |
