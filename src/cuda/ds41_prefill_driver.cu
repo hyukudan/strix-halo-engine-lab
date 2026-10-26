@@ -3,6 +3,7 @@
 
 #include "strix/cuda_ds41_prefill.hpp"
 #include "strix/cuda_ds41_replay.hpp"
+#include "strix/cuda_ds41_router_v2.hpp"
 
 #include "ds41_expert_streamer.hpp"
 #include "strix/cuda_ds41_attention.hpp"
@@ -42,6 +43,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include <tuple>
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -264,12 +266,20 @@ public:
         for (std::uint32_t l = first; l < end; ++l) layer_bytes_ = std::max(layer_bytes_, extents_[l].total());
         STRIX_CUDA_CHECK(cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking));
         (void)load_stream;
-        // pinned staging of file reads (resident layers at load, file-tier layers per run)
-        staging_.resize(kStaging);
-        for (auto& st : staging_) {
-            st.buf = std::make_unique<PinnedBuffer>(kStagingBytes + 2U * FileReader::alignment);
-            st.done = std::make_unique<Event>();
-            pinned_bytes_ += st.buf->size();
+        // pinned staging of file reads (resident layers at load, file-tier layers per run): only when something uses it
+        // (copy_file_to_device). A decode-only object with no device-tier layer and no slots allocates none (0.25 GiB).
+        bool uploads = false, streams = false;
+        for (std::uint32_t l = first; l < end; ++l) {
+            uploads = uploads || tiers_[l] == ExpertTier::device;
+            streams = streams || tiers_[l] == ExpertTier::file || tiers_[l] == ExpertTier::host;
+        }
+        if (uploads || (streams && slots != 0U)) {
+            staging_.resize(kStaging);
+            for (auto& st : staging_) {
+                st.buf = std::make_unique<PinnedBuffer>(kStagingBytes + 2U * FileReader::alignment);
+                st.done = std::make_unique<Event>();
+                pinned_bytes_ += st.buf->size();
+            }
         }
         resident_.resize(end);
         host_.resize(end);
@@ -498,6 +508,7 @@ private:
 
     // file -> pinned staging -> device (the copy stream), aligned superset pieces; blocks until enqueued.
     void copy_file_to_device(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* dst) {
+        if (staging_.empty()) throw std::logic_error("ds41 cuda prefill: file -> device copy without staging (no device tier and no slots)");
         const std::uint64_t A = FileReader::alignment;
         std::uint64_t done = 0;
         while (done < bytes) {
@@ -705,6 +716,15 @@ __global__ void copy_pre_kernel(const float* __restrict__ mix, float* __restrict
     if (i < rows * 4U) pre[i] = mix[std::size_t{i / 4U} * 24U + i % 4U];
 }
 
+// Drafter input of a step's rows (CudaStepIo::draft_hidden): out[r * out_stride + c] = (((s0 + s1) + s2) + s3) * 0.25 of
+// the layer's input stream row r (copies s0..s3 of [4][hidden]), the HIP target's main_hidden_kernel formula.
+__global__ void draft_hidden_kernel(const float* __restrict__ stream, std::uint32_t hidden, float* __restrict__ out, std::uint32_t out_stride) {
+    const std::uint32_t c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (c >= hidden) return;
+    const float* s = stream + std::size_t{r} * 4U * hidden;
+    out[std::size_t{r} * out_stride + c] = (((s[c] + s[hidden + c]) + s[2U * hidden + c]) + s[3U * hidden + c]) * 0.25F;
+}
+
 }  // namespace
 
 // ================================================================================================ Impl
@@ -713,6 +733,12 @@ struct CudaPrefill::Impl {
     deepseek41::Config cfg;
     LayerCoreGeometry g;
     std::unique_ptr<TensorFile> file;
+    std::filesystem::path gguf_path;
+    // STRIX_DS41_CUDA_ENGRAM_CHECK=1 at construction, set_engram_check() later: re-read every Engram job (diagnostics)
+    bool engram_check = [] {
+        const char* v = std::getenv("STRIX_DS41_CUDA_ENGRAM_CHECK");
+        return v && v[0] == '1';
+    }();
     std::filesystem::path file_path;
     std::unique_ptr<FileReader> reader;         // routed-expert reads (the provider's loader thread)
     std::unique_ptr<FileReader> engram_reader;  // Engram rows (their own thread: a FileReader serves one caller at a time)
@@ -766,6 +792,29 @@ struct CudaPrefill::Impl {
     std::uint32_t last_row = 0;  // row of context 0's index sources' last selection (export_state)
     std::uint32_t last_step_rows = 0;  // rows of the last step not yet committed (commit_window), 0: none
     bool fresh = false;                // reset_sequence(): steps may start at position 0
+    // sequence slots (set_sequences / select_sequence): the per-sequence part of the object (attention state, token
+    // history, Engram n-gram state) of every slot but the selected one, which lives in the fields above
+    struct Sequence {
+        std::unique_ptr<at::AttentionState> attn;
+        std::unique_ptr<EngramHasher> hasher;
+        std::uint32_t last_T = 0, last_next = 0, last_row = 0, last_step_rows = 0;
+        std::vector<std::uint32_t> last_tokens;
+        bool fresh = false;
+    };
+    std::vector<Sequence> sequences;  // [slot]; the selected slot's entry is empty (moved into the fields above)
+    std::uint32_t sequence = 0;       // the selected slot
+    at::LayerAttentionOptions attn_options;
+    void swap_sequence(Sequence& q) {
+        // public multi-seq tree: the attention state and the token history live in seq0() (context 0)
+        std::swap(seq0().attn, q.attn);
+        std::swap(hasher, q.hasher);
+        std::swap(seq0().last_T, q.last_T);
+        std::swap(seq0().last_next, q.last_next);
+        std::swap(last_row, q.last_row);
+        std::swap(last_step_rows, q.last_step_rows);
+        std::swap(seq0().last_tokens, q.last_tokens);
+        std::swap(fresh, q.fresh);
+    }
     std::vector<ExpertExtent> extents;
 
     // ---- incremental decode (step)
@@ -889,10 +938,12 @@ namespace {
 
 // The decode's Engram row reads on their own thread: one job = the rows of every Engram layer of a step, read layer
 // by layer (one overlapped read per record, all of a layer in flight at once); the step waits per layer. A job is
-// issued at the start of a step or, for the next token, as soon as a head step knows its greedy token.
+// issued at the start of a step or, for the next token, as soon as a head step knows its greedy token. With a cache
+// (cache_records > 0) a record already read is copied from RAM (the file is immutable): only the misses are read.
 class EngramIoThread {
 public:
-    explicit EngramIoThread(FileReader& reader) : reader_(reader), th_([this] { loop(); }) {}
+    explicit EngramIoThread(FileReader& reader, std::size_t cache_records = 0)
+        : reader_(reader), cache_(cache_records), th_([this] { loop(); }) {}
     ~EngramIoThread() {
         {
             std::lock_guard<std::mutex> g(mu_);
@@ -939,6 +990,62 @@ public:
     }
 
 private:
+    static constexpr std::size_t kRecord = 264U;
+    // Engram records by file offset (clock replacement); used by the I/O thread only.
+    struct RowCache {
+        explicit RowCache(std::size_t n) : cap(n), rows(n * kRecord), key(n), ref(n, 0) { where.reserve(n); }
+        std::size_t cap = 0, used = 0, hand = 0;
+        std::vector<std::uint8_t> rows;
+        std::vector<std::uint64_t> key;
+        std::vector<std::uint8_t> ref;
+        std::unordered_map<std::uint64_t, std::uint32_t> where;
+        void insert(std::uint64_t off, const std::uint8_t* rec) {
+            if (where.count(off)) return;
+            std::size_t slot;
+            if (used < cap) {
+                slot = used++;
+            } else {
+                while (ref[hand]) {
+                    ref[hand] = 0;
+                    hand = (hand + 1U) % cap;
+                }
+                slot = hand;
+                hand = (hand + 1U) % cap;
+                where.erase(key[slot]);
+            }
+            std::memcpy(rows.data() + slot * kRecord, rec, kRecord);
+            key[slot] = off;
+            ref[slot] = 0;
+            where.emplace(off, static_cast<std::uint32_t>(slot));
+        }
+    };
+    // one layer's records: hits from the cache, the misses read in one queued batch (then cached)
+    void read_layer(const std::vector<std::uint64_t>& offs, std::uint8_t* out) {
+        if (cache_.cap == 0U) {
+            reader_.read_records_queued(offs, kRecord, out);
+            return;
+        }
+        miss_at_.clear();
+        miss_off_.clear();
+        for (std::size_t k = 0; k < offs.size(); ++k) {
+            const auto it = cache_.where.find(offs[k]);
+            if (it != cache_.where.end()) {
+                std::memcpy(out + k * kRecord, cache_.rows.data() + std::size_t{it->second} * kRecord, kRecord);
+                cache_.ref[it->second] = 1;
+            } else {
+                miss_at_.push_back(k);
+                miss_off_.push_back(offs[k]);
+            }
+        }
+        if (miss_off_.empty()) return;
+        miss_rows_.resize(miss_off_.size() * kRecord);
+        reader_.read_records_queued(miss_off_, kRecord, miss_rows_.data());
+        for (std::size_t j = 0; j < miss_at_.size(); ++j) {
+            std::memcpy(out + miss_at_[j] * kRecord, miss_rows_.data() + j * kRecord, kRecord);
+            cache_.insert(miss_off_[j], miss_rows_.data() + j * kRecord);
+        }
+    }
+
     void loop() {
 #ifdef _WIN32
         // the completions of the reads are delivered to this thread: it must not wait behind normal-priority work
@@ -961,7 +1068,7 @@ private:
             std::exception_ptr err;
             for (std::size_t i = 0; i < offsets.size(); ++i) {
                 try {
-                    if (!err && !offsets[i].empty()) reader_.read_records_queued(offsets[i], 264U, outs[i]);
+                    if (!err && !offsets[i].empty()) read_layer(offsets[i], outs[i]);
                 } catch (...) {
                     err = std::current_exception();
                 }
@@ -993,6 +1100,10 @@ private:
     std::uint64_t generation_ = 0;
     bool busy_ = false, stop_ = false;
     double last_seconds_ = 0.0, last_issue_seconds_ = 0.0;
+    RowCache cache_;
+    std::vector<std::size_t> miss_at_;
+    std::vector<std::uint64_t> miss_off_;
+    std::vector<std::uint8_t> miss_rows_;
     std::thread th_;  // last: starts after the members above exist
 };
 
@@ -1090,11 +1201,18 @@ struct CudaPrefill::Impl::Decode {
     static constexpr std::size_t kParamsPos = 0, kParamsTokens = 64, kParamsCand = 128, kParamsBytes = 256;
     // Engram reads (o.engram == "file"); a prefetched job for the token `pf_token` at position `pf_position`
     std::unique_ptr<EngramIoThread> engram_io;
+    // STRIX_DS41_CUDA_ENGRAM_CHECK=1 (diagnostics): every job's records read again through a plain buffered stream once
+    // the step has consumed them, compared byte for byte (CudaStepResult::engram_checked / engram_check_mismatches)
+    std::vector<std::vector<std::uint64_t>> check_offsets;
+    std::vector<std::uint8_t*> check_outs;
+    std::unique_ptr<std::ifstream> check_file;
     bool pf_pending = false;
     std::uint32_t pf_position = 0, pf_token = 0;
     void drain_engram() {
         if (engram_io) engram_io->wait_idle();
         pf_pending = false;
+        check_offsets.clear();  // a dropped job's records are never re-read against the next job's rows
+        check_outs.clear();
     }
     PinnedBuffer params;         // pos uint64[8], tokens uint32[8], candidates ArgmaxCandidate[8]
     PinnedBuffer engram;         // [engram layer][row][col][264]
@@ -1102,6 +1220,11 @@ struct CudaPrefill::Impl::Decode {
     PinnedBuffer logits;         // R x vocab
     DeviceBuffer<std::uint64_t> pos;
     DeviceBuffer<float> kvrows;
+    DeviceBuffer<std::uint32_t> router_counters;  // router v2 arrival counters: [0] the step's router, [1] route_other
+    // decode_shared_fork: the shared expert's side branch and its per-layer fork / join events
+    std::unique_ptr<Stream> shared_side;
+    std::vector<std::unique_ptr<Event>> shared_fork, shared_join;
+    std::vector<std::unique_ptr<Event>> attn_fork, attn_join;  // decode_attn_fork (on shared_side)
     // sparse experts (non-resident layers in eager steps)
     std::unique_ptr<FileReader> reader;
     std::unique_ptr<DeviceBuffer<std::uint8_t>> slot;
@@ -1111,10 +1234,16 @@ struct CudaPrefill::Impl::Decode {
         std::uint32_t rows, bucket, stop;
         bool stream_in, stream_out, timing;
         std::uint32_t sections_cut;
-        bool moe_site = false;  // the MoE sites are the caller's (captured with them)
+        std::uint32_t sequence;  // the slot: a captured graph reads that slot's attention state
+        bool moe_site = false;   // the MoE sites are the caller's (captured with them)
+        std::uint32_t moe_epoch = 0;  // CudaStepIo::moe_site_epoch
+        const float* draft_hidden = nullptr;  // CudaStepIo::draft_hidden (the captured kernel writes there)
+        std::uint32_t draft_first = 0;
+        const float* draft_raw = nullptr;     // CudaStepIo::draft_hidden_raw
         bool operator<(const Key& k) const {
-            return std::tie(rows, bucket, stop, stream_in, stream_out, timing, sections_cut, moe_site) <
-                   std::tie(k.rows, k.bucket, k.stop, k.stream_in, k.stream_out, k.timing, k.sections_cut, k.moe_site);
+            return std::tie(rows, bucket, stop, stream_in, stream_out, timing, sections_cut, sequence, moe_site, moe_epoch, draft_hidden, draft_first, draft_raw) <
+                   std::tie(k.rows, k.bucket, k.stop, k.stream_in, k.stream_out, k.timing, k.sections_cut, k.sequence, k.moe_site, k.moe_epoch,
+                            k.draft_hidden, k.draft_first, k.draft_raw);
         }
     };
     struct Captured {
@@ -1159,8 +1288,11 @@ void alloc_run_buffers(CudaPrefill::Impl& m) {
     const std::size_t before = device_buffer_bytes();
     // context 0's row buffers (row_capacity: max_positions, or one bounded pass), its positions max_positions; the
     // batch contexts stay allocated
-    m.alloc_seq(m.seq0(), m.row_capacity, {});
+    // decode_only (the single-GPU replica): step() uses its own decode buffers, so none of run()'s row /
+    // chunk / window buffers are allocated (they would take the arena's headroom); the fast-attention buffers stay
     m.seq0().capacity = o.max_positions;
+    if (!o.decode_only) {
+    m.alloc_seq(m.seq0(), m.row_capacity, {});
     {
         std::vector<std::uint64_t> pos(T + 1U);
         for (std::size_t i = 0; i <= T; ++i) pos[i] = i;
@@ -1182,6 +1314,7 @@ void alloc_run_buffers(CudaPrefill::Impl& m) {
     m.block_keys.resize(W * m.seq0().attn->cand_stride());
     m.survivors.resize(std::max<std::size_t>(1, at::select_survivor_words(static_cast<std::uint32_t>(W), static_cast<std::uint32_t>(T + 1U), at::kTopK)));
     m.router_scores.resize(C * c.n_routed_experts);
+    }
     if (o.fast_attention) {
         m.fast_index = o.fast_index && at::fast_index_supported(o.device);
         m.win16.resize((std::size_t{m.row_capacity} + (o.pass_rows ? at::kWindow : 0U)) * D);
@@ -1195,8 +1328,8 @@ void alloc_run_buffers(CudaPrefill::Impl& m) {
             m.fsurvivors.resize(std::max<std::size_t>(1, at::select_survivor_words(IC, static_cast<std::uint32_t>(T + 1U), at::kTopK)));
         }
     }
-    m.erows.resize(C * m.g.engram_cols * 264U);
-    m.ws.resize(std::max({hc_mix_workspace_bytes(static_cast<std::uint32_t>(C), c.hidden_size),
+    if (!o.decode_only) m.erows.resize(C * m.g.engram_cols * 264U);
+    if (!o.decode_only) m.ws.resize(std::max({hc_mix_workspace_bytes(static_cast<std::uint32_t>(C), c.hidden_size),
                           shared_expert_workspace_bytes(static_cast<std::uint32_t>(C), c.moe_intermediate_size),
                           engram_workspace_bytes(static_cast<std::uint32_t>(C), m.g.engram_cols, c.hidden_size)}));
     m.run_buffer_bytes = device_buffer_bytes() - before;
@@ -1246,6 +1379,7 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
     auto& m = *impl_;
     const auto t0 = std::chrono::steady_clock::now();
     m.o = options;
+    m.gguf_path = gguf;
     auto& o = m.o;
     if (o.pass_rows != 0U) {
         require(o.max_positions > 0U && o.max_positions <= 2097152U, "long context capacity 1..2M");
@@ -1356,6 +1490,7 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
     m.seq0().capacity = o.max_positions;
     m.seq0().attn = std::make_unique<at::AttentionState>(m.plan, ao);
     m.last_batch_ctx.assign(1, 0U);
+    m.attn_options = ao;
 
     // routed experts
     std::vector<ExpertExtent> extents(c.num_hidden_layers);
@@ -1400,10 +1535,12 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
     const std::size_t H = c.hidden_size, MC = o.moe_chunk_rows;
     const std::size_t buffers0 = device_buffer_bytes();
     alloc_run_buffers(m);
-    m.raw.resize(MC * c.num_experts_per_tok * H);
+    // the routed scratch: run()'s chunks, or only the decode rows (decode_only: no run buffers)
+    const std::size_t MR = o.decode_only ? std::size_t{o.decode_rows} : MC;
+    m.raw.resize(MR * c.num_experts_per_tok * H);
     if (o.expert_tp) m.raw1.resize(std::size_t{o.decode_rows} * c.num_experts_per_tok * H);
-    m.moe_ws.resize(std::max(moe_layer_workspace_bytes(static_cast<std::uint32_t>(MC), m.moe_shape),
-                             o.fast_moe ? moe_fast_workspace_bytes(static_cast<std::uint32_t>(MC), m.moe_shape) : std::size_t{0}));
+    m.moe_ws.resize(std::max(moe_layer_workspace_bytes(static_cast<std::uint32_t>(MR), m.moe_shape),
+                             o.fast_moe ? moe_fast_workspace_bytes(static_cast<std::uint32_t>(MR), m.moe_shape) : std::size_t{0}));
     if (!o.trellis_shexp.empty()) {
 #ifdef STRIX_DS41_CUDA_TRELLIS
         const std::uint32_t I = c.moe_intermediate_size, HS = c.hidden_size;
@@ -1695,6 +1832,9 @@ double CudaPrefill::decode_residency(std::uint32_t stop, bool release_run_buffer
 }
 std::string CudaPrefill::decode_residency_report() const { return impl_->last_residency; }
 
+const std::uint8_t* CudaPrefill::device_tensor(const std::string& name) { return impl_->file->device(name); }
+Q8Tiled CudaPrefill::head_tiled() const noexcept { return impl_->core ? impl_->core->head_tiled() : Q8Tiled{}; }
+
 std::string CudaPrefill::describe() const {
     const auto& m = *impl_;
     std::ostringstream s;
@@ -1731,6 +1871,14 @@ std::string CudaPrefill::describe() const {
       << ",\"expert_tp\":" << (m.o.expert_tp ? "\"ds41-expert-tp2-i1152-v1\"" : "false")
       << ",\"decode_fuse_hc\":" << (m.o.decode_fuse_hc ? "true" : "false")
       << ",\"decode_fuse_shared\":" << (m.o.decode_fuse_shared ? "true" : "false")
+      << ",\"decode_router_v2\":" << (m.o.decode_router_v2 ? "true" : "false")
+      << ",\"decode_pdl\":" << (m.o.decode_pdl ? "true" : "false")
+      << ",\"decode_ob_one\":" << (m.o.decode_ob_one ? "true" : "false")
+      << ",\"decode_shared_fork\":" << (m.o.decode_shared_fork ? "true" : "false")
+      << ",\"decode_attn_fork\":" << (m.o.decode_attn_fork ? "true" : "false")
+      << ",\"decode_qakv_s1\":" << (m.o.decode_qakv_s1 ? "true" : "false")
+      << ",\"decode_ob_expand\":" << (m.o.decode_ob_expand && m.o.decode_ob_one ? "true" : "false")
+      << ",\"decode_moe_expand\":" << (m.o.decode_moe_expand ? "true" : "false")
       << ",\"overlay\":\"" << m.file->overlay_description() << "\"";
     s << ",\"residency\":\"" << (m.o.expert_residency ? "expert" : "layer") << "\",\"transport\":\"" << (m.streamer ? "streamer" : "provider") << "\"";
     if (m.streamer) {
@@ -2040,6 +2188,8 @@ std::vector<CudaPrefillResult> CudaPrefill::run_batch(std::span<const CudaBatchI
 
 std::vector<CudaPrefillResult> CudaPrefill::run_contexts(std::span<const CudaBatchItem> items, const std::vector<std::size_t>& ctx) {
     auto& m = *impl_;
+    require(!m.o.decode_only, "run() on a decode_only object (it has no prefill buffers)");
+    require(m.sequence == 0U, "run() on sequence slot 0 only (its prefill graphs read slot 0's attention state)");
     if (m.dec) m.dec->drain_engram();  // a prefetch of the previous sequence's next token
     if (m.decode_mode) {  // undo decode_residency(): the run's tiers and buffers (the decode graphs held their addresses)
         m.experts->clear_decode();
@@ -3378,6 +3528,39 @@ void CudaPrefill::set_timing(bool on, bool ops) noexcept {
     impl_->o.timing_ops = ops;
 }
 
+void CudaPrefill::set_sequences(std::uint32_t count) {
+    auto& m = *impl_;
+    require(count >= 1U, "at least one sequence slot");
+    require(m.sequence == 0U, "set_sequences with slot 0 selected");
+    if (m.dec) m.dec->drain_engram();
+    if (m.sequences.empty()) m.sequences.resize(1);  // slot 0: the fields of the object
+    while (m.sequences.size() > count) {
+        m.state_bytes -= m.sequences.back().attn->device_bytes();
+        m.sequences.pop_back();
+    }
+    while (m.sequences.size() < count) {
+        Impl::Sequence q;
+        q.attn = std::make_unique<at::AttentionState>(m.plan, m.attn_options);
+        q.attn->reset(m.st);
+        q.hasher = std::make_unique<EngramHasher>(m.model->engram);
+        m.state_bytes += q.attn->device_bytes();
+        m.sequences.push_back(std::move(q));
+    }
+    STRIX_CUDA_CHECK(cudaStreamSynchronize(m.st));
+}
+void CudaPrefill::select_sequence(std::uint32_t slot) {
+    auto& m = *impl_;
+    require(slot < std::max<std::size_t>(m.sequences.size(), 1U), "no such sequence slot");
+    if (slot == m.sequence) return;
+    if (m.dec) m.dec->drain_engram();                   // a prefetch belongs to the selected sequence's next token
+    STRIX_CUDA_CHECK(cudaStreamSynchronize(m.st));      // nothing still reads the selected slot's buffers
+    m.swap_sequence(m.sequences[m.sequence]);           // the selected slot back into its entry
+    m.swap_sequence(m.sequences[slot]);                 // the new one into the fields
+    m.sequence = slot;
+}
+std::uint32_t CudaPrefill::sequences() const noexcept { return static_cast<std::uint32_t>(std::max<std::size_t>(impl_->sequences.size(), 1U)); }
+std::uint32_t CudaPrefill::sequence() const noexcept { return impl_->sequence; }
+
 void CudaPrefill::reset_sequence() {
     auto& m = *impl_;
     if (m.dec) m.dec->drain_engram();
@@ -3498,6 +3681,10 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
     release_idle_preload();  // defer_idle_preload: end the run state the last run() left held (as the next run would)
     if (!m.dec) m.dec = std::make_unique<Impl::Decode>();
     auto& D = *m.dec;
+    if (D.router_counters.size() == 0U) {
+        D.router_counters.resize(2);
+        D.router_counters.zero();
+    }
     const auto R = static_cast<std::uint32_t>(tokens.size());
     const std::uint32_t P = m.seq0().last_T;
     require(P >= 1U || m.fresh, "step after a run(), an import_state() or a reset_sequence()");
@@ -3555,7 +3742,11 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
     const std::uint32_t bucket = (P + R - 1U) / o.decode_bucket;
     const std::uint64_t pos_bound = std::min<std::uint64_t>(std::uint64_t{bucket + 1U} * o.decode_bucket - 1U, o.max_positions - 1U);
     const bool timing = o.timing;
-    const Impl::Decode::Key key{R, bucket, stop, !embed, want_out, timing, io.sections_cut, hooked};
+    const std::uint32_t draft_first = io.draft_hidden ? (io.draft_hidden_first != ~0U ? io.draft_hidden_first : c.num_hidden_layers - 3U) : 0U;
+    require(!io.draft_hidden_raw || io.draft_hidden, "draft_hidden_raw needs draft_hidden");
+    require(!io.draft_hidden || (draft_first >= first && draft_first + 3U <= stop), "draft_hidden layers inside the step's layers");
+    const Impl::Decode::Key key{R, bucket, stop, !embed, want_out, timing, io.sections_cut, m.sequence, hooked, hooked ? io.moe_site_epoch : 0U,
+                                io.draft_hidden, draft_first, io.draft_hidden_raw};
     // ---- boundary sections of the cut: which sources, where they land in the staging / pinned buffers
     struct SecKv {
         std::uint32_t layer, ratio, n;
@@ -3656,6 +3847,15 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
         const auto& aw = m.attn_w[layer];
         HcMixView hc_mix;
         mark(layer, 0);
+        if (io.draft_hidden && layer >= draft_first && layer < draft_first + 3U) {
+            op("draft_hidden");
+            draft_hidden_kernel<<<dim3((H + 255U) / 256U, R), 256, 0, st>>>(b.stream.get(), H, io.draft_hidden + std::size_t{layer - draft_first} * H,
+                                                                          3U * H);
+            STRIX_CUDA_CHECK(cudaGetLastError());
+            if (io.draft_hidden_raw)
+                STRIX_CUDA_CHECK(cudaMemcpy2DAsync(io.draft_hidden_raw + std::size_t{layer - draft_first} * SR, 3U * SR * 4U, b.stream.get(), SR * 4U,
+                                                   SR * 4U, R, cudaMemcpyDeviceToDevice, st));
+        }
         if (engram_li[layer] != ~0U) {
             op("engram");
             STRIX_CUDA_CHECK(cudaMemcpyAsync(b.engram_rows.get(), D.engram.get() + std::size_t{engram_li[layer]} * o.decode_rows * erow_bytes,
@@ -3712,6 +3912,8 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
             v.out = b.qkv.get();
             v.split_scratch = b.split_scratch.get();
             v.split_scratch_floats = b.split_scratch.size();
+            if (o.decode_qakv_s1) v.split = 1U;
+            v.pdl = o.decode_pdl;
             enqueue_q8_0_a8(v, st);
         }
         op("q_norm");
@@ -3727,6 +3929,34 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
             n.a8.rows = R;
             enqueue_norm(n, st);
         }
+        // decode_attn_fork: the attention preparation (reads x, qr, kv, pos) on the side branch while q_b runs
+        const float* kv_rows = b.qkv.get() + b.kv_offset;  // the window kernel reads contiguous 512-value kv rows
+        if (R > 1U) {
+            STRIX_CUDA_CHECK(cudaMemcpy2DAsync(D.kvrows.get(), at::kHeadDim * 4U, kv_rows, std::size_t{b.qkv_stride} * 4U, at::kHeadDim * 4U, R,
+                                               cudaMemcpyDeviceToDevice, st));
+            kv_rows = D.kvrows.get();
+        }
+        at::LayerIo lio;
+        lio.rows = R;
+        lio.pos = D.pos.get();
+        lio.pos_bound = pos_bound;
+        lio.x = b.x.get();
+        lio.qr = b.qr.get();
+        lio.q = b.q.get();
+        lio.kv = kv_rows;
+        lio.o = b.o.get();
+        if (o.decode_attn_fork) {
+            if (!D.shared_side) D.shared_side = std::make_unique<Stream>();
+            while (D.attn_fork.size() <= layer) {
+                D.attn_fork.push_back(std::make_unique<Event>());
+                D.attn_join.push_back(std::make_unique<Event>());
+            }
+            const cudaStream_t side = D.shared_side->get();
+            STRIX_CUDA_CHECK(cudaEventRecord(D.attn_fork[layer]->e, st));
+            STRIX_CUDA_CHECK(cudaStreamWaitEvent(side, D.attn_fork[layer]->e, 0));
+            m.seq0().attn->enqueue_layer(layer, aw, lio, side, at::AttentionState::Phase::prep);
+            STRIX_CUDA_CHECK(cudaEventRecord(D.attn_join[layer]->e, side));
+        }
         op("q_b");
         {
             Q8A8View qb;
@@ -3737,26 +3967,14 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
             qb.out = b.q.get();
             qb.split_scratch = b.split_scratch.get();
             qb.split_scratch_floats = b.split_scratch.size();
+            qb.pdl = o.decode_pdl;
             enqueue_q8_0_a8(qb, st);
         }
         op("attention");
-        {
-            // the window kernel reads contiguous 512-value kv rows
-            const float* kv = b.qkv.get() + b.kv_offset;
-            if (R > 1U) {
-                STRIX_CUDA_CHECK(cudaMemcpy2DAsync(D.kvrows.get(), at::kHeadDim * 4U, kv, std::size_t{b.qkv_stride} * 4U, at::kHeadDim * 4U, R,
-                                                   cudaMemcpyDeviceToDevice, st));
-                kv = D.kvrows.get();
-            }
-            at::LayerIo lio;
-            lio.rows = R;
-            lio.pos = D.pos.get();
-            lio.pos_bound = pos_bound;
-            lio.x = b.x.get();
-            lio.qr = b.qr.get();
-            lio.q = b.q.get();
-            lio.kv = kv;
-            lio.o = b.o.get();
+        if (o.decode_attn_fork) {
+            STRIX_CUDA_CHECK(cudaStreamWaitEvent(st, D.attn_join[layer]->e, 0));
+            m.seq0().attn->enqueue_layer(layer, aw, lio, st, at::AttentionState::Phase::attend);
+        } else {
             m.seq0().attn->enqueue_layer(layer, aw, lio, st);
         }
         op("o_a_o_b");
@@ -3774,11 +3992,12 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
             a.out = b.o_low.get();
             a.split_scratch = b.split_scratch.get();
             a.split_scratch_floats = b.split_scratch.size();
+            a.pdl = o.decode_pdl;
             enqueue_q8_0_a8(a, st);
             auto la = b.la.view();
             la.rows = R;
             enqueue_quantize_a8({b.o_low.get(), R, ol, 0, la}, st);
-            for (std::uint32_t h = 0; h < 2U; ++h) {
+            for (std::uint32_t h = 0; h < (o.decode_ob_one ? 1U : 2U); ++h) {
                 Q8A8View v;
                 v.tiled = w.o_b.view();
                 v.count = H;
@@ -3787,13 +4006,21 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
                 v.x = {la.codes + h * half, la.deltas + h * half / 32U, la.sums + h * half / 32U, R, half, ol};
                 v.out = b.y.get();
                 v.accumulate = h > 0;
+                if (o.decode_ob_one) v.k_halves = 2U;  // both halves, same bits
+                if (o.decode_ob_one && o.decode_ob_expand) {  // the hc_expand below, in the epilogue
+                    v.hc_residual = b.stream.get();
+                    v.hc_mixes = b.mix_attn.get();
+                    v.hc_out = b.stream.get();
+                    v.hc_hidden = H;
+                }
                 v.split_scratch = b.split_scratch.get();
                 v.split_scratch_floats = b.split_scratch.size();
-                enqueue_q8_0_a8(v, st);
+                v.pdl = o.decode_pdl;
+            enqueue_q8_0_a8(v, st);
             }
         }
         op("hc_post");
-        enqueue_hc_expand({b.y.get(), 0, b.stream.get(), b.mix_attn.get(), R, H, b.stream.get()}, st);
+        if (!(o.decode_ob_one && o.decode_ob_expand)) enqueue_hc_expand({b.y.get(), 0, b.stream.get(), b.mix_attn.get(), R, H, b.stream.get()}, st);
         mark(layer, 1);
         op(o.decode_fuse_hc ? "hc_norm_ffn" : "hc_mix_ffn");
         {
@@ -3825,6 +4052,16 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
             if (o.decode_fuse_hc) enqueue_hc_mixes_norm(hc_mix, n, st);
             else enqueue_norm(n, st);
         }
+        // decode_shared_fork: the fork point is here, before the router (the shared expert reads only the norm's A8)
+        const bool shared_fork = o.decode_shared_fork && hooked;
+        if (shared_fork) {
+            if (!D.shared_side) D.shared_side = std::make_unique<Stream>();
+            while (D.shared_fork.size() <= layer) {
+                D.shared_fork.push_back(std::make_unique<Event>());
+                D.shared_join.push_back(std::make_unique<Event>());
+            }
+            STRIX_CUDA_CHECK(cudaEventRecord(D.shared_fork[layer]->e, st));
+        }
         op("router");
         {
             RouterView rv;
@@ -3838,7 +4075,8 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
             rv.scores = b.scores.get();
             rv.ids = b.route_ids.get();
             rv.weights = b.route_w.get();
-            enqueue_router(rv, st);
+            if (o.decode_router_v2 && router_v2_supported(rv)) enqueue_router_v2(rv, D.router_counters.get(), st);
+            else enqueue_router(rv, st);
         }
         const auto shared_expert = [&](cudaStream_t s) {
             SharedExpertView e;
@@ -3849,6 +4087,7 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
             e.x.rows = R;
             e.out = b.shared.get();
             e.workspace = b.workspace.get();
+            e.pdl = o.decode_pdl;
 #ifdef STRIX_DS41_CUDA_TRELLIS
             if (!m.tshexp.empty()) {  // trellis shared expert: F32 x -> gate, up -> clamped SwiGLU (F32) -> down
                 const auto& ts = m.tshexp[layer - o.first_layer];
@@ -3880,7 +4119,13 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
             if (o.decode_fuse_shared && R == 1U) enqueue_shared_expert_fused(e, s);
             else enqueue_shared_expert(e, s);
         };
-        if (hooked) {  // the caller's routed-expert site (it enqueues the shared expert)
+        if (shared_fork) {
+            const cudaStream_t side = D.shared_side->get();
+            STRIX_CUDA_CHECK(cudaStreamWaitEvent(side, D.shared_fork[layer]->e, 0));
+            shared_expert(side);
+            STRIX_CUDA_CHECK(cudaEventRecord(D.shared_join[layer]->e, side));
+        }
+        if (hooked) {  // the caller's routed-expert site (it enqueues the shared expert, or joins its side branch)
             op("moe_site");
             mark(layer, 2);
             CudaMoeSite site;
@@ -3894,7 +4139,31 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
             site.shared = b.shared.get();
             site.raw = m.raw.get();
             site.y = b.y.get();
-            site.shared_expert = shared_expert;
+            if (shared_fork) site.shared_join = D.shared_join[layer]->e;
+            else site.shared_expert = shared_expert;
+            if (o.decode_moe_expand) {  // the hc_post below, in the site's combine
+                site.hc_residual = b.stream.get();
+                site.hc_mixes = b.mix_ffn.get();
+                site.hc_out = b.stream.get();
+                site.hc_pre_carry = o.decode_fuse_hc ? b.pre_carry.get() : nullptr;
+            }
+            site.x_f32 = b.x.get();
+            site.route_other = [&core, &b, &g, &o, &D, R, H](std::uint32_t ly, std::uint32_t k, float* sc, std::uint32_t* ids, float* wts, cudaStream_t s2) {
+                const auto& w2 = core.weights(ly);
+                RouterView rv;
+                rv.x = b.x.get();
+                rv.rows = R;
+                rv.weight = {w2.router, g.experts, H};
+                rv.bias = w2.bias;
+                rv.bias_image = w2.bias_image;
+                rv.top_k = k;
+                rv.route_scale = g.route_scale;
+                rv.scores = sc;
+                rv.ids = ids;
+                rv.weights = wts;
+                if (o.decode_router_v2 && router_v2_supported(rv)) enqueue_router_v2(rv, D.router_counters.get() + 1, s2);
+                else enqueue_router(rv, s2);
+            };
             io.moe_site(site);
         } else {
         op("shared");
@@ -3954,13 +4223,14 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
             v.raw1 = o.expert_tp ? m.raw1.get() : nullptr;  // ds41-expert-tp2-i1152-v1 sum order (decode steps)
             v.y = b.y.get();
             v.workspace = m.moe_ws.get();
-            v.capacity = o.moe_chunk_rows;
+            v.capacity = o.decode_only ? o.decode_rows : o.moe_chunk_rows;  // the rows moe_ws / raw were sized for
             enqueue_moe_layer(v, st);
         }
         }  // hooked
         op("hc_post");
-        enqueue_hc_expand({b.y.get(), 0, b.stream.get(), b.mix_ffn.get(), R, H, b.stream.get(),
-                           o.decode_fuse_hc ? b.pre_carry.get() : nullptr}, st);
+        if (!(hooked && o.decode_moe_expand))
+            enqueue_hc_expand({b.y.get(), 0, b.stream.get(), b.mix_ffn.get(), R, H, b.stream.get(),
+                               o.decode_fuse_hc ? b.pre_carry.get() : nullptr}, st);
         // the next attention input collapses with this site's pre
         if (!o.decode_fuse_hc) STRIX_CUDA_CHECK(cudaMemcpy2DAsync(b.pre_carry.get(), 4U * sizeof(float), b.mix_ffn.get(), 24U * sizeof(float), 4U * sizeof(float), R,
                                            cudaMemcpyDeviceToDevice, st));
@@ -4032,11 +4302,11 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
             }
         }
     };
-    const auto run_segment = [&](std::size_t j) {
-        if (!use_graphs) {
-            segment_body(j);
-            return;
-        }
+    // A missing segment graph is captured and instantiated here. Every one of the step's missing segments is captured
+    // before the step's first launch (see the launch loop): instantiating while an earlier segment of the same gated
+    // step runs can block on the device (a spinning device-gated wait) and deadlock the service until the wait deadline
+    // (review finding: token 71 = the first R4 capture, 'a wait timed out at gated layer 1').
+    const auto capture_segment = [&](std::size_t j) {
         cudaGraphExec_t& exec = cap.exec[j];
         if (exec == nullptr) {
             STRIX_CUDA_CHECK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
@@ -4058,7 +4328,14 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
             STRIX_CUDA_CHECK(inst);
             ++result.graph_captures;
         }
-        STRIX_CUDA_CHECK(cudaGraphLaunch(exec, st));
+    };
+    const auto run_segment = [&](std::size_t j) {
+        if (!use_graphs) {
+            segment_body(j);
+            return;
+        }
+        capture_segment(j);  // a no-op: the launch loop captured every missing segment first
+        STRIX_CUDA_CHECK(cudaGraphLaunch(cap.exec[j], st));
     };
     // Engram rows of the step's tokens (the history follows every step): one job on the Engram I/O thread with the
     // rows of every Engram layer of the step, in layer order; the host waits for a layer's rows right before the
@@ -4073,14 +4350,17 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
             object_li.push_back(engram_li[l]);
             if (l < stop) step_li.push_back(engram_li[l]);
         }
-    if (file_engram && !D.engram_io) D.engram_io = std::make_unique<EngramIoThread>(*m.engram_reader);
-    // the job of `nrows` rows `rows` ([row][layer][column]) of the Engram layers `lis` into D.engram
-    const auto submit_engram = [&](const std::vector<std::uint64_t>& rows, std::uint32_t nrows, const std::vector<std::uint32_t>& lis) {
+    if (file_engram && !D.engram_io)
+        D.engram_io = std::make_unique<EngramIoThread>(*m.engram_reader, std::size_t{o.engram_cache_mb} * (std::size_t{1} << 20) / 264U);
+    // the job of `nrows` rows `rows` ([row][layer][column]) of the Engram layers `lis` into D.engram from row `r0` on
+    // (r0 = 1: row 0 came with a prefetch; its records stay in the re-read check)
+    const auto submit_engram = [&](const std::vector<std::uint64_t>& rows, std::uint32_t nrows, const std::vector<std::uint32_t>& lis,
+                                   std::uint32_t r0) {
         std::vector<std::vector<std::uint64_t>> offs(lis.size());
         std::vector<std::uint8_t*> outs(lis.size());
         for (std::size_t i = 0; i < lis.size(); ++i) {
             const std::uint32_t li = lis[i];
-            outs[i] = D.engram.get() + std::size_t{li} * o.decode_rows * erow_bytes;
+            outs[i] = D.engram.get() + (std::size_t{li} * o.decode_rows + r0) * erow_bytes;
             offs[i].resize(std::size_t{nrows} * ecols);
             for (std::uint32_t r = 0; r < nrows; ++r)
                 for (std::uint32_t k = 0; k < ecols; ++k) {
@@ -4089,25 +4369,48 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
                     offs[i][std::size_t{r} * ecols + k] = m.engram_tables[li].file_offset + row * 264U;
                 }
         }
+        if (m.engram_check) {
+            if (r0 == 0U) {
+                D.check_offsets = offs;
+                D.check_outs = outs;
+            } else {
+                D.check_offsets.insert(D.check_offsets.end(), offs.begin(), offs.end());
+                D.check_outs.insert(D.check_outs.end(), outs.begin(), outs.end());
+            }
+        }
         D.engram_io->submit(std::move(offs), std::move(outs));
     };
-    bool prefetched = false;
+    bool prefetched = false, row0 = false;
     if (D.pf_pending) {
         D.pf_pending = false;
-        prefetched = R == 1U && P == D.pf_position && tokens[0] == D.pf_token;
-        if (!prefetched) {
+        const bool same = P == D.pf_position && tokens[0] == D.pf_token;
+        prefetched = R == 1U && same;
+        row0 = R > 1U && same;  // a window whose row 0 was prefetched: rows 1..R-1 follow
+        if (!prefetched && !row0) {
             // another token at this position: the prefetched rows are dropped (its job ends first: same buffer)
+            const auto tw = std::chrono::steady_clock::now();
             D.engram_io->wait_idle();
+            const double waited = seconds_since(tw);  // before any segment: the GPU idles
+            result.engram_wait_seconds += waited;
+            result.engram_wait_first_seconds += waited;
             m.hasher->truncate(P);
         }
     }
-    result.engram_prefetched = prefetched;
+    result.engram_prefetched = prefetched || row0;
     if (!prefetched) {
-        std::vector<std::uint64_t> all(std::size_t{R} * per);
-        for (std::uint32_t r = 0; r < R; ++r) m.hasher->push(tokens[r], std::span<std::uint64_t>(all.data() + std::size_t{r} * per, per));
+        const std::uint32_t r0 = row0 ? 1U : 0U;
+        std::vector<std::uint64_t> all(std::size_t{R - r0} * per);
+        for (std::uint32_t r = r0; r < R; ++r)
+            m.hasher->push(tokens[r], std::span<std::uint64_t>(all.data() + std::size_t{r - r0} * per, per));
         if (file_engram) {
-            if (D.engram_io) D.engram_io->wait_idle();
-            submit_engram(all, R, step_li);
+            if (D.engram_io) {
+                const auto tw = std::chrono::steady_clock::now();
+                D.engram_io->wait_idle();  // the previous job (row 0's prefetch: its rows are complete after this)
+                const double waited = seconds_since(tw);
+                result.engram_wait_seconds += waited;
+                result.engram_wait_first_seconds += waited;
+            }
+            submit_engram(all, R - r0, step_li, r0);
         } else {
             for (const auto li : step_li) std::memset(D.engram.get() + std::size_t{li} * o.decode_rows * erow_bytes, 0, std::size_t{R} * erow_bytes);
         }
@@ -4120,9 +4423,13 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
         const auto at = static_cast<std::uint32_t>(std::find(job_li.begin(), job_li.end(), li) - job_li.begin());
         const auto t0 = std::chrono::steady_clock::now();
         D.engram_io->wait_layer(at, o.decode_spin);
-        result.engram_wait_seconds += seconds_since(t0);
+        const double waited = seconds_since(t0);
+        result.engram_wait_seconds += waited;
+        if (at == 0U) result.engram_wait_first_seconds += waited;
     };
 
+    if (use_graphs)  // capture + instantiate before anything of the step runs (nothing of the gated step spins yet)
+        for (std::size_t j = 0; j < nseg; ++j) capture_segment(j);
     STRIX_CUDA_CHECK(cudaEventRecord(D.start->e, st));
     for (std::size_t j = 0; j < nseg; ++j) {
         wait_engram(cuts[j]);
@@ -4130,6 +4437,7 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
     }
     STRIX_CUDA_CHECK(cudaEventRecord(D.done->e, st));
     result.enqueue_seconds = seconds_since(t_step);
+    if (io.after_launch) io.after_launch();  // the caller's host work while the step runs
     wait_event(D.done->e, o.decode_spin);
     if (!use_graphs) ++cap.eager_steps;
     if (file_engram && job_li.size() == step_li.size()) {
@@ -4137,13 +4445,26 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
         D.engram_io->wait_idle();
         result.engram_seconds = D.engram_io->last_seconds();
         result.engram_issue_seconds = D.engram_io->last_issue_seconds();
+        if (!D.check_offsets.empty()) {
+            if (!D.check_file) D.check_file = std::make_unique<std::ifstream>(m.gguf_path, std::ios::binary);
+            std::uint8_t rec[264];
+            for (std::size_t i = 0; i < D.check_offsets.size(); ++i)
+                for (std::size_t k = 0; k < D.check_offsets[i].size(); ++k) {
+                    D.check_file->seekg(static_cast<std::streamoff>(D.check_offsets[i][k]));
+                    D.check_file->read(reinterpret_cast<char*>(rec), 264);
+                    ++result.engram_checked;
+                    if (!*D.check_file || std::memcmp(rec, D.check_outs[i] + k * 264U, 264U) != 0) ++result.engram_check_mismatches;
+                    D.check_file->clear();
+                }
+            D.check_offsets.clear();
+        }
     }
     // prefetch: the rows of the greedy token of a one-row head step, issued before the downloads and the caller's work
     if (head && R == 1U && file_engram && o.engram_prefetch && hcand[2] != 0U && P + 1U < o.max_positions) {
         const std::uint32_t next = hcand[1];
         std::vector<std::uint64_t> rows(per);
         m.hasher->push(next, std::span<std::uint64_t>(rows.data(), per));
-        submit_engram(rows, 1U, object_li);
+        submit_engram(rows, 1U, object_li, 0U);
         D.pf_pending = true;
         D.pf_position = P + 1U;
         D.pf_token = next;
@@ -4227,6 +4548,61 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
     m.last_step_rows = R;
     result.seconds = seconds_since(t_step);
     return result;
+}
+
+void CudaPrefill::set_engram_check(bool on) noexcept { impl_->engram_check = on; }
+
+void CudaPrefill::wait_io() {
+    auto& m = *impl_;
+    if (m.dec && m.dec->engram_io) m.dec->engram_io->wait_idle();
+}
+
+void CudaPrefill::prefetch_engram(std::uint32_t token) {
+    auto& m = *impl_;
+    const auto& o = m.o;
+    const auto& c = m.cfg;
+    auto* D = m.dec.get();
+    if (!D || !D->engram_io || o.engram != "file" || !o.engram_prefetch) return;
+    require(m.last_step_rows == 0U, "prefetch_engram after commit_window");
+    require(token < c.vocab_size, "prefetch_engram: token in the vocabulary");
+    const std::uint32_t P = m.seq0().last_T;
+    if (P + 1U >= o.max_positions) return;
+    if (D->pf_pending) {
+        if (D->pf_position == P && D->pf_token == token) return;  // the head step issued it already
+        D->engram_io->wait_idle();
+        D->pf_pending = false;
+        m.hasher->truncate(P);
+    }
+    const std::uint32_t ecols = m.g.engram_cols, elayers = static_cast<std::uint32_t>(c.engram_layer_ids.size());
+    const std::size_t per = std::size_t{elayers} * ecols, erow_bytes = std::size_t{ecols} * 264U;
+    if (D->engram.size() < std::size_t{elayers} * o.decode_rows * erow_bytes) return;  // no step has sized the buffer
+    D->engram_io->wait_idle();  // one job at a time
+    std::vector<std::uint32_t> lis;  // the object's Engram layers in layer order (as the head step's prefetch)
+    for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
+        for (std::uint32_t li = 0; li < elayers; ++li)
+            if (c.engram_layer_ids[li] == l) lis.push_back(li);
+    std::vector<std::uint64_t> rows(per);
+    m.hasher->push(token, std::span<std::uint64_t>(rows.data(), per));
+    std::vector<std::vector<std::uint64_t>> offs(lis.size());
+    std::vector<std::uint8_t*> outs(lis.size());
+    for (std::size_t i = 0; i < lis.size(); ++i) {
+        const std::uint32_t li = lis[i];
+        outs[i] = D->engram.get() + std::size_t{li} * o.decode_rows * erow_bytes;
+        offs[i].resize(ecols);
+        for (std::uint32_t k = 0; k < ecols; ++k) {
+            const std::uint64_t row = rows[std::size_t{li} * ecols + k];
+            if (row >= m.engram_tables[li].rows) throw std::runtime_error("ds41 cuda decode: Engram row out of range");
+            offs[i][k] = m.engram_tables[li].file_offset + row * 264U;
+        }
+    }
+    if (m.engram_check) {
+        D->check_offsets = offs;
+        D->check_outs = outs;
+    }
+    D->engram_io->submit(std::move(offs), std::move(outs));
+    D->pf_pending = true;
+    D->pf_position = P;
+    D->pf_token = token;
 }
 
 void CudaPrefill::commit_window(std::uint32_t kept, std::uint32_t next_token) {

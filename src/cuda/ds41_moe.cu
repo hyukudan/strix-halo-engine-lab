@@ -491,15 +491,48 @@ __global__ __launch_bounds__(kThreads) void combine_kernel(MoeCombineView c, int
     const std::uint32_t r = static_cast<std::uint32_t>(i / c.hidden), o = static_cast<std::uint32_t>(i % c.hidden);
     const std::uint32_t low_count = c.low_counts[r];
     float low = 0.0F, high = 0.0F;
-    for (std::uint32_t k = 0; k < c.top_k; ++k) {
-        const std::uint64_t slot = c.order[r * c.top_k + k];
-        const bool is_low = k < low_count;
-        if ((mode == 1 && !is_low) || (mode == 2 && is_low)) continue;
-        const float term = c.weights[slot] * c.raw[slot * c.hidden + o];
-        if (is_low) low = low + term;
-        else high = high + term;
+    // steps of 8 slots: the step's slot ids, then its weights and raw values, are loaded before the same in-order sums
+    constexpr std::uint32_t kStep = 8;
+    for (std::uint32_t k0 = 0; k0 < c.top_k; k0 += kStep) {
+        std::uint64_t slot[kStep];
+        float wv[kStep], rv[kStep];
+#pragma unroll
+        for (std::uint32_t q = 0; q < kStep; ++q) slot[q] = k0 + q < c.top_k ? c.order[r * c.top_k + k0 + q] : 0U;
+#pragma unroll
+        for (std::uint32_t q = 0; q < kStep; ++q) {
+            const std::uint32_t k = k0 + q;
+            const bool is_low = k < low_count;
+            const bool use = k < c.top_k && !((mode == 1 && !is_low) || (mode == 2 && is_low));
+            wv[q] = use ? c.weights[slot[q]] : 0.0F;
+            rv[q] = use ? c.raw[slot[q] * c.hidden + o] : 0.0F;
+        }
+#pragma unroll
+        for (std::uint32_t q = 0; q < kStep; ++q) {
+            const std::uint32_t k = k0 + q;
+            if (k >= c.top_k) break;
+            const bool is_low = k < low_count;
+            if ((mode == 1 && !is_low) || (mode == 2 && is_low)) continue;
+            const float term = wv[q] * rv[q];
+            if (is_low) low = low + term;
+            else high = high + term;
+        }
     }
-    c.out[i] = mode == 0 ? (c.shared[i] + low) + high : mode == 1 ? low : high;
+    const float y = mode == 0 ? (c.shared[i] + low) + high : mode == 1 ? low : high;
+    c.out[i] = y;
+    if (mode == 0 && c.hc_out) {  // hc_expand_kernel's arithmetic for (r, o) with sub = y
+        const float* mix = c.hc_mixes + std::size_t{r} * 24U;
+        if (c.hc_pre_carry && o == 0U)
+            for (int q = 0; q < 4; ++q) c.hc_pre_carry[std::size_t{r} * 4U + q] = mix[q];
+        float res[4];
+        for (int j = 0; j < 4; ++j) res[j] = c.hc_residual[(std::size_t{r} * 4U + j) * c.hidden + o];
+        float yk[4];
+        for (int k = 0; k < 4; ++k) {
+            float s = 0.0F;
+            for (int j = 0; j < 4; ++j) s = s + mix[8 + j * 4 + k] * res[j];
+            yk[k] = mix[4 + k] * y + s;
+        }
+        for (int k = 0; k < 4; ++k) c.hc_out[(std::size_t{r} * 4U + k) * c.hidden + o] = yk[k];
+    }
 }
 // Expert TP combine: each part folded over the row's slots in ascending expert id from 0, then (shared + S0) + S1.
 __global__ __launch_bounds__(kThreads) void combine_tp_kernel(MoeCombineView c) {
@@ -625,6 +658,8 @@ void enqueue_moe_combine(const MoeCombineView& c, cudaStream_t stream) {
         return;
     }
     const int mode = c.half < 0 ? 0 : c.half == 0 ? 1 : 2;
+    if (c.hc_out && (mode != 0 || !c.hc_residual || !c.hc_mixes))
+        throw std::invalid_argument("ds41 cuda moe combine: the hc_expand epilogue needs the whole combine");
     combine_kernel<<<static_cast<unsigned>((n + kThreads - 1U) / kThreads), kThreads, 0, stream>>>(c, mode);
     STRIX_CUDA_CHECK(cudaGetLastError());
 }

@@ -666,19 +666,29 @@ __global__ __launch_bounds__(kSelThreads) void select_merge_kernel(SelectView v,
 //    butterfly; item l (head l / 16, key l % 16) ends in lane l, so each lane evaluates one exp_f;
 //  - the tile maximum is a max over the head's 16 lanes; p_j are broadcast for the in-order sums of l and acc.
 // Partials (m, l, acc) per chunk; the combine kernel finishes in chunk order.
+// AllTiles (set_attention_prefetch): the chunk's 4 tiles are copied into 4 raw buffers at once, so the block waits for
+// one memory latency instead of one per tile (double buffering hid only the short dequant/compute of a tile); the
+// tiles are then processed exactly as before.
 __device__ __forceinline__ float e2m1_lut(const float* lut, unsigned c) { return lut[c]; }
 
-constexpr std::size_t kAttnSmem = sizeof(float4) * kTile * 4 * 32 + 2U * kTile * kWindowEntryBytes + 16 * 4 + kChunk * 4;
+constexpr unsigned kChunkTiles = kChunk / kTile;
+constexpr std::size_t attn_smem(unsigned raw_buffers) {
+    return sizeof(float4) * kTile * 4 * 32 + std::size_t{raw_buffers} * kTile * kWindowEntryBytes + 16 * 4 + kChunk * 4;
+}
+constexpr std::size_t kAttnSmem = attn_smem(2), kAttnSmemAll = attn_smem(kChunkTiles);
 
-template <unsigned Warps>
+template <unsigned Warps, unsigned H = 2, bool AllTiles = false>
 __global__ __launch_bounds__(Warps * 32) void attention_chunk_kernel(AttentionView v) {
+    static_assert(H == 1 || H == 2, "heads per warp");
+    static_assert(kChunkTiles == 4, "AllTiles waits by tile index");
+    constexpr unsigned kRawBuffers = AllTiles ? kChunkTiles : 2U;
     extern __shared__ float4 dyn[];
     float4* keys = dyn;                                                                  // the tile, dequantised
-    std::uint8_t* raw = reinterpret_cast<std::uint8_t*>(dyn + kTile * 4 * 32);            // 2 x 16 entries of 528 B
-    float* lut = reinterpret_cast<float*>(raw + 2U * kTile * kWindowEntryBytes);         // E2M1 values
+    std::uint8_t* raw = reinterpret_cast<std::uint8_t*>(dyn + kTile * 4 * 32);            // 2 (4) x 16 entries of 528 B
+    float* lut = reinterpret_cast<float*>(raw + kRawBuffers * kTile * kWindowEntryBytes);  // E2M1 values
     std::uint32_t* sel_s = reinterpret_cast<std::uint32_t*>(lut + 16);                   // the chunk's selected positions
     const unsigned c = blockIdx.x, r = blockIdx.z, tid = threadIdx.x, lane = tid & 31U, w = tid >> 5U;
-    const unsigned h0 = blockIdx.y * 2U * Warps + 2U * w;
+    const unsigned h0 = blockIdx.y * H * Warps + H * w;
     const std::uint64_t p = v.pos[r];
     const unsigned nw = static_cast<unsigned>(p + 1U < kWindow ? p + 1U : kWindow);
     const unsigned nc = v.idx_count != nullptr ? v.idx_count[r] : 0U;
@@ -686,9 +696,9 @@ __global__ __launch_bounds__(Warps * 32) void attention_chunk_kernel(AttentionVi
     if (c * kChunk >= n) return;
     if (tid < 16U) lut[tid] = e2m1_value(static_cast<std::uint8_t>(tid));
     const RopeRow& rope = v.rope[p];
-    float q[2][16];
+    float q[H][16];
 #pragma unroll
-    for (unsigned hh = 0; hh < 2; ++hh) {
+    for (unsigned hh = 0; hh < H; ++hh) {
         const float4* src = reinterpret_cast<const float4*>(v.q + (std::size_t{r} * v.heads + h0 + hh) * kHeadDim + 16 * lane);
 #pragma unroll
         for (unsigned i = 0; i < 4; ++i) {
@@ -697,14 +707,17 @@ __global__ __launch_bounds__(Warps * 32) void attention_chunk_kernel(AttentionVi
         }
         rope512(q[hh], rope, lane, false);
     }
-    float acc[2][16];
+    float acc[H][16];
 #pragma unroll
-    for (unsigned hh = 0; hh < 2; ++hh)
+    for (unsigned hh = 0; hh < H; ++hh)
 #pragma unroll
         for (unsigned i = 0; i < 16; ++i) acc[hh][i] = 0.0F;
-    float mc[2] = {-__builtin_inff(), -__builtin_inff()}, lc[2] = {0.0F, 0.0F};
+    float mc[H], lc[H];
+#pragma unroll
+    for (unsigned hh = 0; hh < H; ++hh) { mc[hh] = -__builtin_inff(); lc[hh] = 0.0F; }
     const unsigned cb = c * kChunk, end = min(n, cb + kChunk);
-    if (tid < kChunk && cb + tid >= nw && cb + tid < end) sel_s[tid] = v.idx[std::size_t{r} * v.topk + (cb + tid - nw)];
+    for (unsigned t = tid; t < kChunk; t += Warps * 32U)  // every slot also for one-warp blocks
+        if (cb + t >= nw && cb + t < end) sel_s[t] = v.idx[std::size_t{r} * v.topk + (cb + t - nw)];
     __syncthreads();
     // raw entries of a tile into raw[buf] by asynchronous 16-byte copies (window 33 pieces, compressed 18)
     const auto issue = [&](unsigned t0, unsigned buf) {
@@ -720,12 +733,26 @@ __global__ __launch_bounds__(Warps * 32) void attention_chunk_kernel(AttentionVi
         }
         __pipeline_commit();
     };
-    const unsigned item_h = lane >> 4U, item_j = lane & 15U;
-    issue(cb, 0U);
+    // H = 2: item l = (head l / 16, key l % 16) in lane l; H = 1: key j in lanes 2 j and 2 j + 1
+    const unsigned item_h = H == 2 ? lane >> 4U : 0U, item_j = H == 2 ? lane & 15U : lane >> 1U;
+    if constexpr (AllTiles) {  // one commit group per tile slot (empty past the chunk's end), tile i in raw buffer i
+#pragma unroll
+        for (unsigned i = 0; i < kChunkTiles; ++i) {
+            if (cb + i * kTile < end) issue(cb + i * kTile, i);
+            else __pipeline_commit();
+        }
+    } else {
+        issue(cb, 0U);
+    }
     unsigned it = 0;
     for (unsigned t0 = cb; t0 < end; t0 += kTile, ++it) {
-        const unsigned cnt = min(kTile, n - t0), buf = it & 1U;
-        if (t0 + kTile < end) {
+        const unsigned cnt = min(kTile, n - t0), buf = AllTiles ? it : it & 1U;
+        if constexpr (AllTiles) {  // tile it's group done: at most 3 - it later groups pending
+            if (it == 0U) __pipeline_wait_prior(3);
+            else if (it == 1U) __pipeline_wait_prior(2);
+            else if (it == 2U) __pipeline_wait_prior(1);
+            else __pipeline_wait_prior(0);
+        } else if (t0 + kTile < end) {
             issue(t0 + kTile, buf ^ 1U);
             __pipeline_wait_prior(1);
         } else {
@@ -759,8 +786,8 @@ __global__ __launch_bounds__(Warps * 32) void attention_chunk_kernel(AttentionVi
             for (unsigned i = 0; i < 4; ++i) keys[(j * 4 + i) * 32 + l] = make_float4(d[4 * i], d[4 * i + 1], d[4 * i + 2], d[4 * i + 3]);
         }
         __syncthreads();
-        // lane partials of the 32 items (head hh, key j): fmaf chains over the lane's 16 dims
-        float part[32];
+        // lane partials of the 16 H items (head hh, key j): fmaf chains over the lane's 16 dims
+        float part[16 * H];
 #pragma unroll
         for (unsigned j = 0; j < kTile; ++j) {
             float a0 = 0.0F, a1 = 0.0F;
@@ -770,16 +797,23 @@ __global__ __launch_bounds__(Warps * 32) void attention_chunk_kernel(AttentionVi
                     const float4 k = keys[(j * 4 + i) * 32 + lane];
                     a0 = fmaf(q[0][4 * i], k.x, a0); a0 = fmaf(q[0][4 * i + 1], k.y, a0);
                     a0 = fmaf(q[0][4 * i + 2], k.z, a0); a0 = fmaf(q[0][4 * i + 3], k.w, a0);
-                    a1 = fmaf(q[1][4 * i], k.x, a1); a1 = fmaf(q[1][4 * i + 1], k.y, a1);
-                    a1 = fmaf(q[1][4 * i + 2], k.z, a1); a1 = fmaf(q[1][4 * i + 3], k.w, a1);
+                    if constexpr (H == 2) {
+                        a1 = fmaf(q[H - 1][4 * i], k.x, a1); a1 = fmaf(q[H - 1][4 * i + 1], k.y, a1);
+                        a1 = fmaf(q[H - 1][4 * i + 2], k.z, a1); a1 = fmaf(q[H - 1][4 * i + 3], k.w, a1);
+                    }
                 }
             }
             part[j] = a0;
-            part[16 + j] = a1;
+            if constexpr (H == 2) part[16 * (H - 1) + j] = a1;
         }
-        // transposed butterfly: item l ends in lane l
+        // transposed butterfly: H = 2: item l ends in lane l; H = 1: item j ends in lanes 2 j and 2 j + 1 (the last
+        // distance adds the partner's partial of the same item, as the per-key butterfly does)
 #pragma unroll
-        for (unsigned d = 16, m = 16; d != 0; d /= 2, m /= 2) {
+        for (unsigned d = 16, m = 8 * H; d != 0; d /= 2, m /= 2) {
+            if (m == 0U) {
+                part[0] = part[0] + __shfl_xor_sync(kFull, part[0], d);
+                continue;
+            }
             const bool upper = (lane & d) != 0U;
 #pragma unroll
             for (unsigned i = 0; i < m; ++i) {
@@ -791,19 +825,26 @@ __global__ __launch_bounds__(Warps * 32) void attention_chunk_kernel(AttentionVi
         const bool valid = item_j < cnt;
         const float s = part[0] * kAttnScale;
         float tm = valid ? s : -__builtin_inff();
+        // the tile maximum over the head's 16 items: xor distances 8, 4, 2, 1 on the item index
 #pragma unroll
-        for (unsigned d = 8; d != 0; d /= 2) tm = fmaxf(tm, __shfl_xor_sync(kFull, tm, d));
-        const float tm_other = __shfl_xor_sync(kFull, tm, 16);
-        const float tmh[2] = {item_h == 0U ? tm : tm_other, item_h == 0U ? tm_other : tm};
-        float mn[2], scl[2];
+        for (unsigned d = 8; d != 0; d /= 2) tm = fmaxf(tm, __shfl_xor_sync(kFull, tm, H == 2 ? d : 2U * d));
+        float tmh[H];
+        if constexpr (H == 2) {
+            const float tm_other = __shfl_xor_sync(kFull, tm, 16);
+            tmh[0] = item_h == 0U ? tm : tm_other;
+            tmh[H - 1] = item_h == 0U ? tm_other : tm;
+        } else {
+            tmh[0] = tm;
+        }
+        float mn[H], scl[H];
 #pragma unroll
-        for (unsigned hh = 0; hh < 2; ++hh) { mn[hh] = fmaxf(mc[hh], tmh[hh]); scl[hh] = exp_f(mc[hh] - mn[hh]); }
+        for (unsigned hh = 0; hh < H; ++hh) { mn[hh] = fmaxf(mc[hh], tmh[hh]); scl[hh] = exp_f(mc[hh] - mn[hh]); }
         const float pv = valid ? exp_f(s - mn[item_h]) : 0.0F;
-        float pr[32];
+        float pr[16 * H];
 #pragma unroll
-        for (unsigned i = 0; i < 32; ++i) pr[i] = __shfl_sync(kFull, pv, i);
+        for (unsigned i = 0; i < 16 * H; ++i) pr[i] = __shfl_sync(kFull, pv, H == 2 ? i : 2U * i);
 #pragma unroll
-        for (unsigned hh = 0; hh < 2; ++hh) {
+        for (unsigned hh = 0; hh < H; ++hh) {
             lc[hh] = lc[hh] * scl[hh];
 #pragma unroll
             for (unsigned j = 0; j < kTile; ++j)
@@ -818,7 +859,7 @@ __global__ __launch_bounds__(Warps * 32) void attention_chunk_kernel(AttentionVi
                 for (unsigned i = 0; i < 4; ++i) {
                     const float4 k = keys[(j * 4 + i) * 32 + lane];
 #pragma unroll
-                    for (unsigned hh = 0; hh < 2; ++hh) {
+                    for (unsigned hh = 0; hh < H; ++hh) {
                         acc[hh][4 * i] = fmaf(pr[16 * hh + j], k.x, acc[hh][4 * i]);
                         acc[hh][4 * i + 1] = fmaf(pr[16 * hh + j], k.y, acc[hh][4 * i + 1]);
                         acc[hh][4 * i + 2] = fmaf(pr[16 * hh + j], k.z, acc[hh][4 * i + 2]);
@@ -827,11 +868,11 @@ __global__ __launch_bounds__(Warps * 32) void attention_chunk_kernel(AttentionVi
                 }
             }
         }
-        mc[0] = mn[0];
-        mc[1] = mn[1];
+#pragma unroll
+        for (unsigned hh = 0; hh < H; ++hh) mc[hh] = mn[hh];
     }
 #pragma unroll
-    for (unsigned hh = 0; hh < 2; ++hh) {
+    for (unsigned hh = 0; hh < H; ++hh) {
         float* part = v.partial + ((std::size_t{r} * v.heads + h0 + hh) * kMaxChunks + c) * kPartStride;
         if (lane == 0U) { part[0] = mc[hh]; part[1] = lc[hh]; }
         float4* pa = reinterpret_cast<float4*>(part + 4);
@@ -840,6 +881,9 @@ __global__ __launch_bounds__(Warps * 32) void attention_chunk_kernel(AttentionVi
     }
 }
 
+// AllChunks (set_attention_prefetch): every chunk's accumulator is loaded together with the (m, l) pairs, before the
+// max / exp chains (one memory latency instead of one per 4 chunks after them); the same fmaf chains in chunk order.
+template <bool AllChunks = false>
 __global__ __launch_bounds__(32) void attention_combine_kernel(AttentionView v) {
     const unsigned h = blockIdx.x, r = blockIdx.y, lane = threadIdx.x;
     const std::uint64_t p = v.pos[r];
@@ -847,26 +891,71 @@ __global__ __launch_bounds__(32) void attention_combine_kernel(AttentionView v) 
     const unsigned nc = v.idx_count != nullptr ? v.idx_count[r] : 0U;
     const unsigned chunks = (nw + nc + kChunk - 1U) / kChunk;
     const float* base = v.partial + (std::size_t{r} * v.heads + h) * kMaxChunks * kPartStride;
+    // every chunk's (m, l) loaded first (independent loads), then the same max / exp / fmaf chains in chunk order
+    float pm[kMaxChunks], pl[kMaxChunks];
+    float4 all[AllChunks ? kMaxChunks : 1][4];
+#pragma unroll
+    for (unsigned c = 0; c < kMaxChunks; ++c) {
+        pm[c] = c < chunks ? base[c * kPartStride] : 0.0F;
+        pl[c] = c < chunks ? base[c * kPartStride + 1] : 0.0F;
+        if constexpr (AllChunks) {
+            const float4* pa = reinterpret_cast<const float4*>(base + c * kPartStride + 4);
+#pragma unroll
+            for (unsigned i = 0; i < 4; ++i) all[c][i] = c < chunks ? pa[lane * 4 + i] : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+        }
+    }
     float mm = -__builtin_inff();
-    for (unsigned c = 0; c < chunks; ++c) mm = fmaxf(mm, base[c * kPartStride]);
+#pragma unroll
+    for (unsigned c = 0; c < kMaxChunks; ++c)
+        if (c < chunks) mm = fmaxf(mm, pm[c]);
     float e[kMaxChunks], lsum = 0.0F;
-    for (unsigned c = 0; c < chunks; ++c) {
-        e[c] = exp_f(base[c * kPartStride] - mm);
-        lsum = fmaf(base[c * kPartStride + 1], e[c], lsum);
+#pragma unroll
+    for (unsigned c = 0; c < kMaxChunks; ++c) {
+        if (c < chunks) {
+            e[c] = exp_f(pm[c] - mm);
+            lsum = fmaf(pl[c], e[c], lsum);
+        }
     }
     lsum = lsum + exp_f(v.sink[h] - mm);
     float o[16];
 #pragma unroll
     for (unsigned i = 0; i < 16; ++i) o[i] = 0.0F;
-    for (unsigned c = 0; c < chunks; ++c) {
-        const float4* pa = reinterpret_cast<const float4*>(base + c * kPartStride + 4);
+    if constexpr (AllChunks) {
 #pragma unroll
-        for (unsigned i = 0; i < 4; ++i) {
-            const float4 a = pa[lane * 4 + i];
-            o[4 * i] = fmaf(a.x, e[c], o[4 * i]);
-            o[4 * i + 1] = fmaf(a.y, e[c], o[4 * i + 1]);
-            o[4 * i + 2] = fmaf(a.z, e[c], o[4 * i + 2]);
-            o[4 * i + 3] = fmaf(a.w, e[c], o[4 * i + 3]);
+        for (unsigned c = 0; c < kMaxChunks; ++c) {
+            if (c >= chunks) break;
+            const float ec = e[c];
+#pragma unroll
+            for (unsigned i = 0; i < 4; ++i) {
+                o[4 * i] = fmaf(all[c][i].x, ec, o[4 * i]);
+                o[4 * i + 1] = fmaf(all[c][i].y, ec, o[4 * i + 1]);
+                o[4 * i + 2] = fmaf(all[c][i].z, ec, o[4 * i + 2]);
+                o[4 * i + 3] = fmaf(all[c][i].w, ec, o[4 * i + 3]);
+            }
+        }
+    }
+    // chunks in steps of 4: the step's accumulator loads are issued first, then the same fmaf chains in chunk order
+    // (one chunk at a time paid an L2 round trip per chunk)
+    constexpr unsigned kStep = 4;
+    for (unsigned c0 = 0; c0 < (AllChunks ? 0U : chunks); c0 += kStep) {
+        float4 a[kStep][4];
+#pragma unroll
+        for (unsigned k = 0; k < kStep; ++k) {
+            const float4* pa = reinterpret_cast<const float4*>(base + (c0 + k) * kPartStride + 4);
+#pragma unroll
+            for (unsigned i = 0; i < 4; ++i) a[k][i] = c0 + k < chunks ? pa[lane * 4 + i] : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+        }
+#pragma unroll
+        for (unsigned k = 0; k < kStep; ++k) {
+            if (c0 + k >= chunks) break;
+            const float ec = e[c0 + k];
+#pragma unroll
+            for (unsigned i = 0; i < 4; ++i) {
+                o[4 * i] = fmaf(a[k][i].x, ec, o[4 * i]);
+                o[4 * i + 1] = fmaf(a[k][i].y, ec, o[4 * i + 1]);
+                o[4 * i + 2] = fmaf(a[k][i].z, ec, o[4 * i + 2]);
+                o[4 * i + 3] = fmaf(a[k][i].w, ec, o[4 * i + 3]);
+            }
         }
     }
 #pragma unroll
@@ -963,11 +1052,35 @@ void enqueue_select(const SelectView& v, cudaStream_t stream) {
     }
 }
 
+namespace {
+unsigned g_chunk_warps = 2;  // decode rows: warps per attention block, 2 or 1 (2 heads each) or 4 (1 head each)
+bool g_attn_prefetch = false;  // the 4-warp chunk kernel with every tile issued at once + the all-chunk combine
+}  // namespace
+void set_attention_chunk_warps(unsigned warps) { g_chunk_warps = warps == 1U || warps == 4U ? warps : 2U; }
+void set_attention_prefetch(bool on) { g_attn_prefetch = on; }
+
 void enqueue_attention(const AttentionView& v, cudaStream_t stream) {
     if (v.rows == 0U || v.heads == 0U || v.heads % 4U != 0U || v.capacity < kWindow + v.rows || v.topk > kTopK)
         throw std::invalid_argument("ds41 cuda attention geometry");
-    // 16 heads per block when there are enough blocks for the device, else 4 (more blocks for a decode row)
-    if (v.heads % 16U == 0U && std::size_t{v.rows} * kMaxChunks * (v.heads / 16U) >= 376U) {
+    // 16 heads per block when there are enough blocks for the device, else 4 (more blocks for a decode row), or 2
+    // (set_attention_chunk_warps(1): twice the blocks, each head's arithmetic unchanged)
+    if (g_chunk_warps == 4U && !(v.heads % 16U == 0U && std::size_t{v.rows} * kMaxChunks * (v.heads / 16U) >= 376U)) {
+        // one head per warp, 4 per block (set_attention_chunk_warps(4)): twice the warps of <2, 2>, one tile per block
+        if (g_attn_prefetch) {
+            static const bool opt41a =
+                cudaFuncSetAttribute(attention_chunk_kernel<4, 1, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kAttnSmemAll) == cudaSuccess;
+            if (!opt41a) throw std::runtime_error("ds41 cuda attention: shared memory opt-in");
+            attention_chunk_kernel<4, 1, true><<<dim3(kMaxChunks, v.heads / 4U, v.rows), 4 * 32, kAttnSmemAll, stream>>>(v);
+        } else {
+            static const bool opt41 = cudaFuncSetAttribute(attention_chunk_kernel<4, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, kAttnSmem) == cudaSuccess;
+            if (!opt41) throw std::runtime_error("ds41 cuda attention: shared memory opt-in");
+            attention_chunk_kernel<4, 1><<<dim3(kMaxChunks, v.heads / 4U, v.rows), 4 * 32, kAttnSmem, stream>>>(v);
+        }
+    } else if (g_chunk_warps == 1U && !(v.heads % 16U == 0U && std::size_t{v.rows} * kMaxChunks * (v.heads / 16U) >= 376U)) {
+        static const bool opt1 = cudaFuncSetAttribute(attention_chunk_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, kAttnSmem) == cudaSuccess;
+        if (!opt1) throw std::runtime_error("ds41 cuda attention: shared memory opt-in");
+        attention_chunk_kernel<1><<<dim3(kMaxChunks, v.heads / 2U, v.rows), 32, kAttnSmem, stream>>>(v);
+    } else if (v.heads % 16U == 0U && std::size_t{v.rows} * kMaxChunks * (v.heads / 16U) >= 376U) {
         static const bool opt8 = cudaFuncSetAttribute(attention_chunk_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, kAttnSmem) == cudaSuccess;
         if (!opt8) throw std::runtime_error("ds41 cuda attention: shared memory opt-in");
         attention_chunk_kernel<8><<<dim3(kMaxChunks, v.heads / 16U, v.rows), 8 * 32, kAttnSmem, stream>>>(v);
@@ -977,7 +1090,8 @@ void enqueue_attention(const AttentionView& v, cudaStream_t stream) {
         attention_chunk_kernel<2><<<dim3(kMaxChunks, v.heads / 4U, v.rows), 2 * 32, kAttnSmem, stream>>>(v);
     }
     STRIX_CUDA_CHECK(cudaGetLastError());
-    attention_combine_kernel<<<dim3(v.heads, v.rows), 32, 0, stream>>>(v);
+    if (g_attn_prefetch) attention_combine_kernel<true><<<dim3(v.heads, v.rows), 32, 0, stream>>>(v);
+    else attention_combine_kernel<<<dim3(v.heads, v.rows), 32, 0, stream>>>(v);
     STRIX_CUDA_CHECK(cudaGetLastError());
 }
 

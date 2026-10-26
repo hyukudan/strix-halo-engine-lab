@@ -31,18 +31,26 @@ inline constexpr std::uint32_t hc_mix_count = (2U + hc_copies) * hc_copies;  // 
 
 STRIX_DS41_HD inline float declared_sigmoid(float x) { return 1.0F / (1.0F + declared_exp(-x)); }
 STRIX_DS41_HD inline float declared_rsqrt(float x) { return 1.0F / declared_sqrt(x); }
-// IEEE half to float (exact).
+// IEEE half to float (exact; NaN payloads kept). No branches: a GPU kernel can then issue all its loads before
+// converting any of them (with branches, each loaded half was waited for right after its load). On the device the
+// hardware conversion (exact for every non-NaN half: normals, subnormals, signed zeros, infinities) and one select
+// that restores a NaN's payload (the hardware returns a canonical NaN); nvcc turned the select chain below back into
+// branches on sm_120. The host keeps the formula.
 STRIX_DS41_HD inline float f16_to_float(std::uint16_t h) {
+#if defined(__CUDA_ARCH__)
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+    const bool nan = (h & 0x7c00U) == 0x7c00U && (h & 0x3ffU) != 0U;
+    return nan ? __uint_as_float((static_cast<std::uint32_t>(h & 0x8000U) << 16U) | 0x7f800000U | (static_cast<std::uint32_t>(h & 0x3ffU) << 13U)) : f;
+#else
     const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000U) << 16U;
-    std::uint32_t exponent = (h >> 10U) & 0x1fU, mantissa = h & 0x3ffU;
-    if (exponent == 0x1fU) return __builtin_bit_cast(float, sign | 0x7f800000U | (mantissa << 13U));
-    if (exponent == 0) {
-        if (mantissa == 0) return __builtin_bit_cast(float, sign);
-        // subnormal half: mantissa * 2^-24, exact in float
-        const float v = static_cast<float>(mantissa) * 5.9604644775390625e-8F;
-        return sign ? -v : v;
-    }
-    return __builtin_bit_cast(float, sign | ((exponent + 112U) << 23U) | (mantissa << 13U));
+    const std::uint32_t exponent = (h >> 10U) & 0x1fU, mantissa = h & 0x3ffU;
+    const std::uint32_t special = sign | 0x7f800000U | (mantissa << 13U);
+    // zero or subnormal half: mantissa * 2^-24, exact in float (+0 for a zero mantissa), with the sign bit
+    const std::uint32_t small = sign | __builtin_bit_cast(std::uint32_t, static_cast<float>(mantissa) * 5.9604644775390625e-8F);
+    const std::uint32_t normal = sign | ((exponent + 112U) << 23U) | (mantissa << 13U);
+    return __builtin_bit_cast(float, exponent == 0x1fU ? special : exponent == 0U ? small : normal);
+#endif
 }
 // f16_to_float by selects instead of branches (so that loads ahead of it are not held behind a branch per
 // value): the same bits for every input, NaN payloads included (the host tests compare all 65536).

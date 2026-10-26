@@ -136,6 +136,11 @@ struct AttentionView {
 };
 inline constexpr unsigned kPartStride = 4 + kHeadDim;  // per chunk: m, l, 2 pad, acc[512]
 inline constexpr std::size_t kPartialFloats = std::size_t{kMaxChunks} * kPartStride;  // per (row, head)
+// Decode rows: 1 = one warp (two heads) per attention block instead of 2 (twice the blocks; same bits). Process-wide.
+void set_attention_chunk_warps(unsigned warps);
+// 4-warp chunk kernel: every tile of a chunk copied at once (4 raw buffers), and the combine loads every chunk's
+// accumulator with the (m, l) pairs; the same arithmetic (same bits)
+void set_attention_prefetch(bool on);
 void enqueue_attention(const AttentionView& v, cudaStream_t stream);
 
 // ---- RoPE tables ----------------------------------------------------------------------------------------------------
@@ -209,7 +214,10 @@ public:
 
     // The layer's attention for io.rows consecutive rows: window write, compress (KV source), index scores and
     // selection (index source), attention. Every buffer of io is read on `stream` in order.
-    void enqueue_layer(std::uint32_t layer, const LayerWeights& w, const LayerIo& io, cudaStream_t stream);
+    // phase: all (default); prep = everything before the attention kernels (reads x, qr, kv, pos; never q);
+    // attend = the attention kernels only (after a prep call of the same layer and io, ordered before it).
+    enum class Phase { all, prep, attend };
+    void enqueue_layer(std::uint32_t layer, const LayerWeights& w, const LayerIo& io, cudaStream_t stream, Phase phase = Phase::all);
 
     struct Caches {
         std::uint8_t* ring = nullptr;       // ring_capacity x 528
