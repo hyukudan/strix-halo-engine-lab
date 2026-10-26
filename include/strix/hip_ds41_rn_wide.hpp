@@ -38,5 +38,9 @@ struct RnWideShape {
 [[nodiscard]] bool rn_wide_supported(const Q8A8View& view, const RnWideShape& shape);
 // Every shape gives the same bits. Shapes outside the registered set throw (P 4 / 5 only take the default ones).
 void enqueue_q8_0_a8_rn(const Q8A8View& view, const RnWideShape& shape, void* stream);
+// Same selected form and arithmetic, with coherent producer completion. False
+// means no launch (the caller must retain its unfused fallback).
+[[nodiscard]] bool enqueue_q8_0_a8_rn_ready(const Q8A8View& view, const RnWideShape& shape,
+                                          dist::ProducerStage stage, void* stream);
 
 } // namespace strix::ds41

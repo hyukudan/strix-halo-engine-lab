@@ -168,6 +168,15 @@ int main(int argc, char** argv) {
             const auto a = down(ya, std::size_t{R} * YW), b = down(yb, std::size_t{R} * YW), c = down(yc, std::size_t{R} * YW);
             for (std::uint32_t r = 0; r < R; ++r) {
                 ++compared;
+                if (std::memcmp(a.data() + std::size_t{r} * YW, b.data() + std::size_t{r} * YW, YW * 4U) != 0) {
+                    std::size_t k = 0;
+                    while (std::memcmp(a.data() + std::size_t{r} * YW + k, b.data() + std::size_t{r} * YW + k, 4U) == 0) ++k;
+                    std::size_t nd = 0;
+                    for (std::size_t j = 0; j < YW; ++j)
+                        nd += std::memcmp(a.data() + std::size_t{r} * YW + j, b.data() + std::size_t{r} * YW + j, 4U) != 0 ? 1U : 0U;
+                    std::printf("{\"differ\":\"B\",\"set\":%zu,\"R\":%u,\"row\":%u,\"col\":%zu,\"values\":%zu,\"a\":%a,\"b\":%a}\n", si, R, r, k,
+                                nd, static_cast<double>(a[std::size_t{r} * YW + k]), static_cast<double>(b[std::size_t{r} * YW + k]));
+                }
                 differ_b += std::memcmp(a.data() + std::size_t{r} * YW, b.data() + std::size_t{r} * YW, YW * 4U) != 0 ? 1U : 0U;
                 differ_c += std::memcmp(a.data() + std::size_t{r} * YW, c.data() + std::size_t{r} * YW, YW * 4U) != 0 ? 1U : 0U;
                 differ_r1 += std::memcmp(a.data() + std::size_t{r} * YW, alone[r].data(), YW * 4U) != 0 ? 1U : 0U;

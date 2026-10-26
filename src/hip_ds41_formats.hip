@@ -1,12 +1,14 @@
 #pragma clang fp contract(off)
 #include "strix/hip_ds41_formats.hpp"
 #include "strix/hip_ds41_routes_fast.hpp"
+#include "hip_ds41_routes_fast_body.hpp"
 #include "strix/ds41_scalar_codecs.hpp"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include "strix/ds41_moe.hpp"
+#include "strix/dist/staged_ready.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -37,6 +39,24 @@ __device__ __forceinline__ unsigned long long load_u64(const unsigned char* p) {
     __builtin_memcpy(&v, p, 8);
     return v;
 }
+#if defined(STRIX_EXPERIMENTAL_MALL_Q2_DOWN_NT)
+// Cache policy only: preserve each Q2_K code, scale, group order and arithmetic.
+// These unaligned types match the packed weight storage, including TP half tails.
+using MallQ2Words = unsigned __attribute__((ext_vector_type(8), aligned(1)));
+using MallQ2Word = unsigned __attribute__((aligned(1)));
+using MallQ2Half = unsigned short __attribute__((aligned(1)));
+__device__ __forceinline__ void mall_q2_codes(unsigned (&q)[8], const unsigned char* p) {
+    const auto v = __builtin_nontemporal_load(reinterpret_cast<const MallQ2Words*>(p));
+#pragma unroll
+    for (unsigned k = 0; k < 8U; ++k) q[k] = v[k];
+}
+__device__ __forceinline__ unsigned mall_q2_word(const unsigned char* p) {
+    return __builtin_nontemporal_load(reinterpret_cast<const MallQ2Word*>(p));
+}
+__device__ __forceinline__ unsigned short mall_q2_half(const unsigned char* p) {
+    return __builtin_nontemporal_load(reinterpret_cast<const MallQ2Half*>(p));
+}
+#endif
 // Scalar codecs: the shared host/device definitions (ds41_scalar_codecs.hpp).
 __device__ __forceinline__ float e8m0_device(unsigned code) { return codec::e8m0(static_cast<std::uint8_t>(code)); }
 __device__ __forceinline__ float e8m0_half_device(unsigned code) { return codec::e8m0_half(static_cast<std::uint8_t>(code)); }
@@ -96,13 +116,25 @@ __device__ __forceinline__ Q2Group q2_group(const unsigned char* block, unsigned
     Q2Group out;
     const unsigned half = group / 4U, shift = 2U * (group % 4U);
     unsigned q[8];
+#if defined(STRIX_EXPERIMENTAL_MALL_Q2_DOWN_NT)
+    mall_q2_codes(q, block + 16U + 32U * half);
+#else
     __builtin_memcpy(q, block + 16U + 32U * half, 32);
+#endif
 #pragma unroll
     for (unsigned k = 0; k < 8U; ++k) out.w[k] = static_cast<int>((q[k] >> shift) & 0x03030303U);
+#if defined(STRIX_EXPERIMENTAL_MALL_Q2_DOWN_NT)
+    const unsigned scales = mall_q2_half(block + 8U * half + 2U * (group % 4U));
+    out.scale0 = scales & 0xffU;
+    out.scale1 = scales >> 8U;
+    out.d = half_bits_to_float(mall_q2_half(block + 80U));
+    out.dmin = half_bits_to_float(mall_q2_half(block + 82U));
+#else
     out.scale0 = block[8U * half + 2U * (group % 4U)];
     out.scale1 = block[8U * half + 2U * (group % 4U) + 1U];
     out.d = half_bits_to_float(load_u16(block + 80U));
     out.dmin = half_bits_to_float(load_u16(block + 82U));
+#endif
     return out;
 }
 // Raw bytes of one 32-weight group, loaded apart from their decoding so that a wave can have the
@@ -132,9 +164,15 @@ __device__ __forceinline__ RawGroup<Format> load_raw(const unsigned char* row, u
     } else if constexpr (Format == WeightFormat::q2_k) {
         const auto* block = row + g / 8U * q2_k_block_bytes;
         const unsigned group = g % 8U, half = group / 4U;
+#if defined(STRIX_EXPERIMENTAL_MALL_Q2_DOWN_NT)
+        mall_q2_codes(raw.q, block + 16U + 32U * half);
+        raw.scales = mall_q2_half(block + 8U * half + 2U * (group % 4U));
+        raw.dm = mall_q2_word(block + 80U);
+#else
         __builtin_memcpy(raw.q, block + 16U + 32U * half, 32);
         raw.scales = load_u16_raw(block + 8U * half + 2U * (group % 4U));
         __builtin_memcpy(&raw.dm, block + 80U, 4);
+#endif
         raw.shift = 2U * (group % 4U);
     } else if constexpr (Format == WeightFormat::q8_0) {
         const auto* block = row + g * q8_0_block_bytes;
@@ -389,9 +427,15 @@ __device__ __forceinline__ RawGroup<Format> load_group(const unsigned char* row,
             RawGroup<Format> raw;
             const auto* half = row + whole * q2_k_block_bytes;
             const unsigned group = g % 4U;
+#if defined(STRIX_EXPERIMENTAL_MALL_Q2_DOWN_NT)
+            mall_q2_codes(raw.q, half + 8U);
+            raw.scales = mall_q2_half(half + 2U * group);
+            raw.dm = mall_q2_word(half + 40U);
+#else
             __builtin_memcpy(raw.q, half + 8U, 32);
             raw.scales = load_u16_raw(half + 2U * group);
             __builtin_memcpy(&raw.dm, half + 40U, 4);
+#endif
             raw.shift = 2U * group;
             return raw;
         }
@@ -729,12 +773,17 @@ __device__ __forceinline__ HeldGroup<Format> load_held_group(__amdgpu_buffer_rsr
         raw.aux = aux[0] | (static_cast<unsigned long long>(aux[1]) << 32U);
     } else {
         const unsigned block = g / 8U * static_cast<unsigned>(q2_k_block_bytes), group = g % 8U, half = group / 4U;
-        const auto q0 = __builtin_amdgcn_raw_buffer_load_b128(rsrc, static_cast<int>(block + 16U + 32U * half), row, 0);
-        const auto q1 = __builtin_amdgcn_raw_buffer_load_b128(rsrc, static_cast<int>(block + 32U + 32U * half), row, 0);
+#if defined(STRIX_EXPERIMENTAL_MALL_Q2_DOWN_NT)
+        constexpr int policy = 6;  // gfx1151 SLC + DLC, as the non-temporal global loads above.
+#else
+        constexpr int policy = 0;
+#endif
+        const auto q0 = __builtin_amdgcn_raw_buffer_load_b128(rsrc, static_cast<int>(block + 16U + 32U * half), row, policy);
+        const auto q1 = __builtin_amdgcn_raw_buffer_load_b128(rsrc, static_cast<int>(block + 32U + 32U * half), row, policy);
 #pragma unroll
         for (unsigned k = 0; k < 4U; ++k) { raw.q[k] = q0[k]; raw.q[k + 4U] = q1[k]; }
-        raw.scales = __builtin_amdgcn_raw_buffer_load_b32(rsrc, static_cast<int>(block + 8U * half + 2U * (group % 4U)), row, 0);
-        raw.dm = __builtin_amdgcn_raw_buffer_load_b32(rsrc, static_cast<int>(block + 80U), row, 0);
+        raw.scales = __builtin_amdgcn_raw_buffer_load_b32(rsrc, static_cast<int>(block + 8U * half + 2U * (group % 4U)), row, policy);
+        raw.dm = __builtin_amdgcn_raw_buffer_load_b32(rsrc, static_cast<int>(block + 80U), row, policy);
     }
     return raw;
 }
@@ -1106,7 +1155,7 @@ __global__ __launch_bounds__(32U * Waves) void gate_up_rows_kernel(GateUpView vi
 // experts in [first, end) in ascending id with entries in ascending row, every row's slots in ascending id
 // with its low-half count, counts[0] = union experts and counts[1] = the most entries of one expert.
 // Equal to build_window_routes / restrict_routes.
-__global__ __launch_bounds__(64) void build_routes_kernel(BuildRoutesView view) {
+__device__ __forceinline__ void build_routes_body(const BuildRoutesView& view) {
     __shared__ unsigned id[64];
     __shared__ unsigned leader[64];
     const unsigned t = threadIdx.x, n = view.rows * view.top_k;
@@ -1160,6 +1209,7 @@ __global__ __launch_bounds__(64) void build_routes_kernel(BuildRoutesView view) 
     }
 }
 
+__global__ __launch_bounds__(64) void build_routes_kernel(BuildRoutesView view) { build_routes_body(view); }
 
 __device__ __forceinline__ void combine_body(const float* __restrict__ raw, const float* __restrict__ shared,
                                              const float* __restrict__ weights, const std::uint32_t* __restrict__ order,
@@ -1510,6 +1560,18 @@ static_assert(router_row_waves >= product_max_rows);
 __global__ __launch_bounds__(32U * product_max_rows) void router_select_waves_kernel(RouterView view) {
     router_select_wave(view, threadIdx.x / 32U, threadIdx.x % 32U);
 }
+// All selected ids are visible before the integer route builder reads them. No global counter or
+// change to the score/weight arithmetic; the CSR retains ascending expert and slot order. The builder is
+// build_routes_fast_kernel's (the default builder): r1fuse took build_routes_kernel's, whose
+// thread 0 reduces every entry against every entry alone (2,352 serial steps at 8 rows), which made the fused form
+// slower than selection + fast builder at R6/N8.
+__global__ __launch_bounds__(256) void router_select_routes_kernel(RouterView view, BuildRoutesView routes, bool fast) {
+    const unsigned r = threadIdx.x / 32U;
+    if (r < view.rows) router_select_wave(view, r, threadIdx.x % 32U);
+    __syncthreads();
+    if (fast) build_routes_fast_body(routes);
+    else build_routes_body(routes);
+}
 void launch_router_row_select(const RouterView& v, hipStream_t s) {
     hipLaunchKernelGGL(router_row_select_kernel, dim3((v.experts * v.rows + router_row_waves - 1U) / router_row_waves),
                        dim3(32U * router_row_waves), 0, s, v);
@@ -1542,6 +1604,20 @@ __device__ __forceinline__ void half_sum_body(const float* __restrict__ raw, con
 }
 __global__ __launch_bounds__(256) void half_sum_kernel(HalfSumView view) {
     half_sum_body(view.raw, view.weights, view.order, view.low_counts, view.top_k, view.hidden, view.half, view.out);
+}
+// Lanes past hidden skip the body but still take part in the release (padding included).
+__global__ __launch_bounds__(256) void half_sum_ready_kernel(HalfSumView view, dist::ProducerStage stage) {
+    if (blockIdx.x * 256U + threadIdx.x < view.hidden)
+        half_sum_body(view.raw, view.weights, view.order, view.low_counts, view.top_k, view.hidden, view.half, view.out);
+    dist::publish_staged_block_lean(stage.flag, stage.counter, stage.token, gridDim.x * gridDim.y);
+}
+__global__ __launch_bounds__(256) void canonical_sum_ready_kernel(const float* __restrict__ shared, const float* low, const float* high,
+                                                                  unsigned long long count, float* __restrict__ out,
+                                                                  dist::StagedReady* flag, unsigned* counter, std::uint64_t token) {
+    dist::staged_acquire_lean();
+    const unsigned long long i = static_cast<unsigned long long>(blockIdx.x) * 256U + threadIdx.x;
+    if (i < count) out[i] = (shared[i] + low[i]) + high[i];
+    dist::publish_staged_reads_block_lean(flag, counter, token, gridDim.x);
 }
 __global__ __launch_bounds__(256) void canonical_sum_kernel(const float* __restrict__ shared, const float* __restrict__ low,
                                                             const float* __restrict__ high, unsigned long long count,
@@ -2102,7 +2178,7 @@ void enqueue_combine(const CombineView& view, void* stream) {
     check(hipGetLastError(), "combine launch");
 }
 
-void enqueue_router(const RouterView& view, void* stream) {
+static void enqueue_router_impl(const RouterView& view, void* stream, const BuildRoutesView* routes) {
     if (view.rows > product_max_rows && view.rows <= 16U && view.x && view.scores && view.ids && view.weights) {
         for (unsigned first = 0; first < view.rows; first += product_max_rows) {
             RouterView part = view;
@@ -2149,8 +2225,22 @@ void enqueue_router(const RouterView& view, void* stream) {
     else if (view.rows <= 2U) hipLaunchKernelGGL(router_scores_kernel<2>, grid, block, 0, queue, view);
     else if (view.rows <= 4U) hipLaunchKernelGGL(router_scores_kernel<4>, grid, block, 0, queue, view);
     else hipLaunchKernelGGL(router_scores_kernel<8>, grid, block, 0, queue, view);
-    hipLaunchKernelGGL(router_select_kernel, dim3(view.rows), dim3(256), 0, queue, view);
+    if (routes) hipLaunchKernelGGL(router_select_routes_kernel, dim3(1), dim3(256), 0, queue, view, *routes, routes_fast_enabled());
+    else hipLaunchKernelGGL(router_select_kernel, dim3(view.rows), dim3(256), 0, queue, view);
     check(hipGetLastError(), "router launch");
+}
+void enqueue_router(const RouterView& view, void* stream) { enqueue_router_impl(view, stream, nullptr); }
+bool enqueue_router_routes(const RouterView& view, const BuildRoutesView& routes, void* stream) {
+    // Fast router modes already fuse selection into a producer. Preserve those launch contracts.
+    const char* fast = std::getenv("STRIX_DS41_ROUTER_FAST");
+    if (view.fast || (fast && fast[0] == '1') || !view.rows || view.rows > product_max_rows ||
+        view.rows != routes.rows || view.top_k != routes.top_k || view.ids != routes.ids ||
+        view.rows * view.top_k > 64U) return false;
+    if (!routes.experts || !routes.begins || !routes.rows_out || !routes.slots || !routes.order ||
+        !routes.low_counts || !routes.counts || routes.first >= routes.end || routes.base > routes.first)
+        throw std::invalid_argument("ds41 fused router routes view is inconsistent");
+    enqueue_router_impl(view, stream, &routes);
+    return true;
 }
 void enqueue_half_sum(const HalfSumView& view, void* stream) {
     if (!view.raw || !view.weights || !view.order || !view.low_counts || !view.out || view.rows == 0U || view.top_k == 0U ||
@@ -2164,6 +2254,24 @@ void enqueue_canonical_sum(const float* shared, const float* low, const float* h
     hipLaunchKernelGGL(canonical_sum_kernel, dim3(static_cast<unsigned>((count + 255U) / 256U)), dim3(256), 0,
                        static_cast<hipStream_t>(stream), shared, low, high, static_cast<unsigned long long>(count), out);
     check(hipGetLastError(), "canonical sum launch");
+}
+
+void enqueue_half_sum_ready(const HalfSumView& view, dist::ProducerStage stage, void* stream) {
+    if (!view.raw || !view.weights || !view.order || !view.low_counts || view.out != stage.data || !stage.data || !stage.flag ||
+        !stage.counter || !stage.token || view.rows == 0U || view.top_k == 0U || view.hidden == 0U || view.half > 1U)
+        throw std::invalid_argument("ds41 half sum ready view is inconsistent");
+    hipLaunchKernelGGL(half_sum_ready_kernel, dim3((view.hidden + 255U) / 256U, view.rows), dim3(256), 0, static_cast<hipStream_t>(stream),
+                       view, stage);
+    check(hipGetLastError(), "half sum ready launch");
+}
+void enqueue_canonical_sum_ready(const float* shared, const float* low, const float* high, std::size_t count, float* out,
+                                 dist::ConsumerStage peer, void* stream) {
+    if (!shared || !low || !high || !out || count == 0U || !peer.data || !peer.flag || !peer.counter || !peer.token)
+        throw std::invalid_argument("ds41 canonical sum ready view is inconsistent");
+    hipLaunchKernelGGL(canonical_sum_ready_kernel, dim3(static_cast<unsigned>((count + 255U) / 256U)), dim3(256), 0,
+                       static_cast<hipStream_t>(stream), shared, low, high, static_cast<unsigned long long>(count), out, peer.flag,
+                       peer.counter, peer.token);
+    check(hipGetLastError(), "canonical sum ready launch");
 }
 
 void enqueue_canonical_sum_split(const float* shared_lo, const float* shared_hi, const float* low, const float* high,

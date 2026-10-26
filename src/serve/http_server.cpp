@@ -71,6 +71,7 @@ public:
         if (!content_type.empty()) out += "Content-Type: " + std::string(content_type) + "\r\n";
         if (cors_) out += "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
         for (const auto& [name, value] : headers) out += name + ": " + value + "\r\n";
+        for (const auto& [name, value] : extra_) out += name + ": " + value + "\r\n";
         out += keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
         return out;
     }
@@ -118,13 +119,18 @@ public:
         }
         return false;
     }
-    void reset() { responded_ = streaming_ = false; }
+    void add_response_header(std::string name, std::string value) override { extra_.emplace_back(std::move(name), std::move(value)); }
+    void reset() {
+        responded_ = streaming_ = false;
+        extra_.clear();
+    }
     bool responded() const { return responded_; }
     bool keep_alive = true;
 private:
     int fd_;
     bool cors_;
     bool responded_ = false, streaming_ = false, gone_ = false;
+    std::vector<std::pair<std::string, std::string>> extra_;  // add_response_header() of the current request
 };
 }  // namespace
 

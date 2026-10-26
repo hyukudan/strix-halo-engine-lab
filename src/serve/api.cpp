@@ -5,8 +5,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
+#include <limits>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <sstream>
 
@@ -196,6 +199,70 @@ private:
     bool leading_ = false, reasoning_leading_ = true;
 };
 
+// C1: an inbound X-Request-Id is used when it has 8-64 characters of [A-Za-z0-9._-]; anything else is ignored.
+bool valid_request_id(std::string_view id) {
+    if (id.size() < 8U || id.size() > 64U) return false;
+    for (const char c : id)
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-')) return false;
+    return true;
+}
+// The accepted X-Request-Id of the request this connection thread is handling (ApiService::handle sets and clears it;
+// the ring record of the request is written on the same thread).
+thread_local std::string current_request_id;
+
+// "detail=1" among the &-separated items of a query string.
+bool detail_requested(std::string_view query) {
+    for (std::size_t at = 0; at <= query.size();) {
+        const auto end = std::min(query.find('&', at), query.size());
+        if (query.substr(at, end - at) == "detail=1") return true;
+        at = end + 1U;
+    }
+    return false;
+}
+// A label value of the metrics text exposition format.
+std::string label_value(std::string_view text) {
+    std::string out;
+    for (const char c : text) {
+        if (c == '\\') out += "\\\\";
+        else if (c == '"') out += "\\\"";
+        else if (c == '\n') out += "\\n";
+        else out += c;
+    }
+    return out;
+}
+// {"buckets": [{"le": bound, "count": cumulative}, ..., {"le": "+Inf", "count": count}], "sum", "count"}
+template <std::size_t N>
+Json histogram_json(const ObserveHistogram<N>& h, const std::array<double, N>& bounds) {
+    Json buckets = Json::array();
+    std::uint64_t cumulative = 0;
+    for (std::size_t i = 0; i < N; ++i) {
+        cumulative += h.counts[i];
+        Json b = Json::object();
+        b.set("le", Json(bounds[i])); b.set("count", Json(cumulative));
+        buckets.push(std::move(b));
+    }
+    Json inf = Json::object();
+    inf.set("le", Json("+Inf")); inf.set("count", Json(h.count));
+    buckets.push(std::move(inf));
+    Json out = Json::object();
+    out.set("buckets", std::move(buckets));
+    out.set("sum", Json(h.sum));
+    out.set("count", Json(h.count));
+    return out;
+}
+template <std::size_t N>
+void histogram_text(std::ostringstream& m, const char* name, const char* help, const ObserveHistogram<N>& h, const std::array<double, N>& bounds) {
+    m << "# HELP " << name << ' ' << help << "\n# TYPE " << name << " histogram\n";
+    std::uint64_t cumulative = 0;
+    for (std::size_t i = 0; i < N; ++i) {
+        cumulative += h.counts[i];
+        char le[32];
+        std::snprintf(le, sizeof(le), "%g", bounds[i]);  // the bound as written (the stream prints round-trip digits)
+        m << name << "_bucket{le=\"" << le << "\"} " << cumulative << '\n';
+    }
+    m << name << "_bucket{le=\"+Inf\"} " << h.count << '\n' << name << "_sum " << h.sum << '\n' << name << "_count " << h.count << '\n';
+}
+
 struct RecentRequest {
     RecentRequest() = default;
     RecentRequest(std::string i, std::string r, std::string s, std::int64_t t)
@@ -205,6 +272,13 @@ struct RecentRequest {
     std::uint64_t prompt = 0, cached = 0, output = 0, cycles = 0, accepted = 0, proposed = 0;
     double queue_ms = 0, prefill_ms = 0, decode_ms = 0;
     std::string stop_reason;
+    // armed: an observed request (submitted after arming: its measurements are complete); its first token as the
+    // engine reported it; C8 imported tokens (kept for every record: the prefill rate excludes them; a status field only
+    // when observed); the response body's id when an inbound X-Request-Id names the record
+    bool armed = false;
+    std::optional<double> first_token_ms;
+    std::uint64_t imported = 0;
+    std::string response_id;
 };
 
 std::vector<std::string> stop_strings(const Json* stop) {
@@ -246,14 +320,35 @@ struct ApiService::Impl {
     std::string state = "idle";
     std::uint64_t requests_total = 0, requests_failed = 0;
     std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    const std::string instance = random_id("").substr(0, 16);  // this process's engine instance, chosen once (status, metrics)
+    const std::int64_t start_unix = unix_now();
+    std::int64_t armed_unix = 0;  // when this service armed the instrumentation's current period (0: armed elsewhere)
+    // the expiry this service's arming requests carry (observe_expiry_seconds; 0: never; observe_arm)
+    double expiry_seconds = 0.0;
 
+    static double expiry_from(const std::optional<double>& configured) {
+        constexpr double longest = 1e9;  // seconds (a deadline stays representable)
+        if (configured) return *configured > 0.0 ? std::min(*configured, longest) : 0.0;
+        if (const char* env = std::getenv("STRIX_SERVE_OBSERVE_EXPIRY_S"); env && *env) {
+            char* end = nullptr;
+            const double v = std::strtod(env, &end);
+            if (end != env && *end == '\0' && v >= 0.0) return std::min(v, longest);
+            std::fprintf(stderr, "STRIX_SERVE_OBSERVE_EXPIRY_S=%s is not a number of seconds >= 0: 60 s\n", env);
+        }
+        return 60.0;
+    }
     Impl(ApiConfig c, std::shared_ptr<const BpeTokenizer> t, GenerationQueue& q, std::uint64_t context, bool samples)
-        : config(std::move(c)), tokenizer(std::move(t)), queue(q), context_tokens(context), engine_samples(samples) {}
+        : config(std::move(c)), tokenizer(std::move(t)), queue(q), context_tokens(context), engine_samples(samples),
+          expiry_seconds(expiry_from(config.observe_expiry_seconds)) {}
 
     bool is_stop_token(std::uint32_t id) const {
         return std::find(config.stop_tokens.begin(), config.stop_tokens.end(), id) != config.stop_tokens.end();
     }
     void record(RecentRequest entry) {
+        if (!current_request_id.empty()) {
+            if (!entry.id.empty() && entry.id != current_request_id) entry.response_id = entry.id;
+            entry.id = current_request_id;
+        }
         const std::lock_guard lock(mutex);
         ++requests_total;
         if (entry.status == "error") ++requests_failed;
@@ -304,7 +399,7 @@ struct ApiService::Impl {
     }
 
     // ---- chat ----
-    struct ChatPrompt { std::vector<std::uint32_t> tokens; bool thinking; Json tools; };
+    struct ChatPrompt { std::vector<std::uint32_t> tokens; bool thinking; Json tools; std::uint32_t stable_prefix = 0; };
     ChatPrompt chat_prompt(const Json& body) const {
         const auto* messages = body.find("messages");
         if (!messages || !messages->is_array() || messages->size() == 0U)
@@ -342,12 +437,31 @@ struct ApiService::Impl {
         out.tokens = tokenizer->encode(text, true);
         out.thinking = !input.enable_thinking || *input.enable_thinking;
         out.tools = input.tools;
+        // the stable prefix: the leading system messages and the tools rendered alone, when their tokens begin the prompt
+        std::size_t lead = 0;
+        while (lead + 1U < normalized.size()) {
+            const auto* role = normalized.as_array()[lead].find("role");
+            if (!role || !role->is_string() || role->as_string() != "system") break;
+            ++lead;
+        }
+        if (lead > 0U) {
+            ChatTemplateInput head = input;
+            Json system = Json::array();
+            for (std::size_t i = 0; i < lead; ++i) system.push(normalized.as_array()[i]);
+            head.messages = system;
+            head.add_generation_prompt = false;
+            try {
+                const auto ids = tokenizer->encode(config.chat_renderer ? config.chat_renderer(head) : render_chat_template(head), true);
+                if (ids.size() < out.tokens.size() && std::equal(ids.begin(), ids.end(), out.tokens.begin()))
+                    out.stable_prefix = static_cast<std::uint32_t>(ids.size());
+            } catch (const ChatTemplateError&) {}
+        }
         return out;
     }
 
     // Drives one ticket: decodes tokens to text, applies stop strings, hands text to `on_text`.
     struct Outcome { std::string text; GenerationStats stats; std::string finish; std::string matched; std::string error; std::uint64_t output_tokens = 0;
-        std::vector<std::uint32_t> token_ids; };
+        std::vector<std::uint32_t> token_ids; bool observed = false; };
     Outcome drive(const std::shared_ptr<GenerationTicket>& ticket, const std::vector<std::string>& stops,
         const std::function<bool(const std::string&)>& on_text, const std::function<bool()>& client_alive) {
         Outcome out;
@@ -375,15 +489,17 @@ struct ApiService::Impl {
             if (!tail.empty()) { out.text += tail; if (on_text) on_text(tail); }
         }
         out.stats = ticket->stats();
+        out.observed = ticket->observed();
         out.error = ticket->error();
         out.finish = !out.matched.empty() ? "stop" : out.stats.finish == "stop" ? "stop" : out.stats.finish == "cancelled" ? "cancelled" : "length";
         return out;
     }
 
     std::shared_ptr<GenerationTicket> submit(std::vector<std::uint32_t> prompt, std::uint32_t max_tokens, const SamplingParameters& sampling,
-        const Json& body) {
+        const Json& body, std::uint32_t stable_prefix = 0) {
         GenerationJob job;
         job.prompt = std::move(prompt);
+        job.stable_prefix = stable_prefix;
         job.max_tokens = max_tokens;
         job.stop_tokens = config.stop_tokens;
         job.sampling = sampling;
@@ -415,7 +531,7 @@ struct ApiService::Impl {
         usage.set("completion_tokens", Json(o.output_tokens));
         usage.set("total_tokens", Json(o.stats.prompt_tokens + o.output_tokens));
         Json details = Json::object();
-        details.set("cached_tokens", Json(o.stats.cached_tokens));
+        details.set("cached_tokens", Json(o.stats.cached_tokens + o.stats.imported_tokens));  // not prefilled for this request
         usage.set("prompt_tokens_details", std::move(details));
         return usage;
     }
@@ -474,7 +590,7 @@ struct ApiService::Impl {
         bool include_usage = false;
         if (const auto* options = body.find("stream_options"); options && options->is_object()) include_usage = bool_or(*options, "include_usage", false);
         const auto limit = max_tokens(body, prompt.tokens.size());
-        auto ticket = submit(prompt.tokens, limit, sampling_params, body);
+        auto ticket = submit(prompt.tokens, limit, sampling_params, body, prompt.stable_prefix);
         const auto id = random_id("chatcmpl-");
         const auto created = unix_now();
         RecentRequest entry{id, "chat.completions", "ok", created};
@@ -708,7 +824,7 @@ struct ApiService::Impl {
         const auto* max = body.find("max_tokens");
         if (!max || !max->is_number()) throw ApiError(400, "invalid_request_error", "max_tokens is required", "max_tokens");
         const auto limit = max_tokens(body, prompt.tokens.size());
-        auto ticket = submit(prompt.tokens, limit, sampling_params, body);
+        auto ticket = submit(prompt.tokens, limit, sampling_params, body, prompt.stable_prefix);
         const auto id = random_id("msg_");
         RecentRequest entry{id, "messages", "ok", unix_now()};
         const auto stop_reason = [&](const Outcome& o, bool tools) {
@@ -718,8 +834,9 @@ struct ApiService::Impl {
         };
         const auto usage = [&](const Outcome& o) {
             Json u = Json::object();
-            u.set("input_tokens", Json(o.stats.prompt_tokens - std::min(o.stats.prompt_tokens, o.stats.cached_tokens)));
-            u.set("cache_read_input_tokens", Json(o.stats.cached_tokens));
+            const auto reused = o.stats.cached_tokens + o.stats.imported_tokens;  // prefix cache + imported state
+            u.set("input_tokens", Json(o.stats.prompt_tokens - std::min(o.stats.prompt_tokens, reused)));
+            u.set("cache_read_input_tokens", Json(reused));
             u.set("cache_creation_input_tokens", Json(0));
             u.set("output_tokens", Json(o.output_tokens));
             return u;
@@ -834,12 +951,20 @@ struct ApiService::Impl {
         entry.prompt = o.stats.prompt_tokens; entry.cached = o.stats.cached_tokens; entry.output = o.output_tokens;
         entry.cycles = o.stats.cycles; entry.accepted = o.stats.accepted; entry.proposed = o.stats.proposed;
         entry.queue_ms = o.stats.queue_ms; entry.prefill_ms = o.stats.prefill_ms; entry.decode_ms = o.stats.decode_ms;
+        entry.imported = o.stats.imported_tokens;  // every record (its prefill rate); reported as a field only when observed
+        if (o.observed) { entry.armed = true; entry.first_token_ms = o.stats.first_token_ms; }
         record(entry);
     }
 
     // ---- service endpoints ----
+    // An arming request: arms (a new period when the last one expired); the period lasts this service's expiry more.
+    void arm() {
+        if (observe_arm(expiry_seconds)) { const std::lock_guard lock(mutex); armed_unix = unix_now(); }
+    }
     Json status() {
         const auto q = queue.snapshot();
+        const bool armed = observe_armed();
+        const auto ob = armed ? queue.observed() : ObserveSnapshot{};
         Json out = Json::object();
         out.set("schema", Json("strix-serve-status-v1"));
         out.set("model", Json(config.model_id));
@@ -865,30 +990,73 @@ struct ApiService::Impl {
             e.set("prompt_tokens", Json(r.prompt)); e.set("reused_tokens", Json(r.cached)); e.set("output_tokens", Json(r.output));
             e.set("queue_ms", Json(r.queue_ms)); e.set("prefill_ms", Json(r.prefill_ms)); e.set("decode_ms", Json(r.decode_ms));
             e.set("duration_ms", Json(r.queue_ms + r.prefill_ms + r.decode_ms));
-            e.set("prefill_tok_s", Json(r.prefill_ms > 0 ? 1000.0 * static_cast<double>(r.prompt - std::min(r.prompt, r.cached)) / r.prefill_ms : 0.0));
+            // the rate of the rows this engine computed: prompt - cached - imported (imported rows were not prefilled here)
+            e.set("prefill_tok_s", Json(r.prefill_ms > 0 ? 1000.0 * static_cast<double>(r.prompt - std::min(r.prompt, r.cached + r.imported)) / r.prefill_ms : 0.0));
             e.set("decode_tok_s", Json(r.decode_ms > 0 ? 1000.0 * static_cast<double>(r.output) / r.decode_ms : 0.0));
             e.set("mtp_cycles", Json(r.cycles)); e.set("mtp_accepted", Json(r.accepted)); e.set("mtp_proposed", Json(r.proposed));
+            if (r.armed) {  // C8 and C1 fields of observed requests (others: absent, never zero)
+                const auto restored = r.cached + r.imported;
+                e.set("cached_tokens", Json(r.cached)); e.set("imported_tokens", Json(r.imported));
+                e.set("computed_tokens", Json(r.output != 0U && r.prompt > restored ? r.prompt - restored : std::uint64_t{0}));
+                e.set("first_token_ms", r.first_token_ms ? Json(*r.first_token_ms) : Json());
+                if (!r.response_id.empty()) e.set("response_id", Json(r.response_id));
+            }
             list.push(std::move(e));
         }
         out.set("requests", std::move(list));
+        {  // always present (no arming): tells an engine restart from a counter reset; fixed at startup, no token path
+            Json instance_json = Json::object();
+            instance_json.set("id", Json(instance)); instance_json.set("start_time", Json(start_unix));
+            out.set("instance", std::move(instance_json));
+        }
+        if (armed) {
+            out.set("armed", Json(true));
+            out.set("armed_since", armed_unix != 0 ? Json(armed_unix) : Json());
+            Json o = Json::object();
+            o.set("since", Json("armed"));
+            o.set("requests", Json(ob.requests)); o.set("prompt_tokens", Json(ob.prompt_tokens));
+            o.set("cached_tokens", Json(ob.cached_tokens)); o.set("imported_tokens", Json(ob.imported_tokens));
+            o.set("computed_tokens", Json(ob.computed_tokens));
+            o.set("ttft_seconds", histogram_json(ob.ttft_seconds, ttft_seconds_bounds));
+            o.set("decode_tokens_per_second", histogram_json(ob.decode_tokens_per_second, decode_tok_s_bounds));
+            out.set("observed", std::move(o));
+        }
         if (config.status_extra) config.status_extra(out);
         return out;
     }
     std::string metrics() {
         const auto q = queue.snapshot();
         std::ostringstream m;
-        const auto counter = [&](const char* name, const char* help, double value, const char* type = "counter") {
+        // exact values: integers print as integers, doubles round-trip (the default 6 significant digits rounded every
+        // count above 10^6)
+        m.precision(std::numeric_limits<double>::max_digits10);
+        const auto counter = [&](const char* name, const char* help, auto value, const char* type = "counter") {
             m << "# HELP " << name << ' ' << help << "\n# TYPE " << name << ' ' << type << '\n' << name << ' ' << value << '\n';
         };
-        counter("strix_requests_completed_total", "Generations completed.", static_cast<double>(q.completed));
-        counter("strix_requests_failed_total", "Generations that failed.", static_cast<double>(q.failed));
-        counter("strix_requests_cancelled_total", "Generations cancelled (client gone or stop string).", static_cast<double>(q.cancelled));
-        counter("strix_prompt_tokens_total", "Prompt tokens of finished generations.", static_cast<double>(q.prompt_tokens));
-        counter("strix_prompt_tokens_cached_total", "Prompt tokens restored from the prefix state cache.", static_cast<double>(q.cached_tokens));
-        counter("strix_generated_tokens_total", "Generated tokens.", static_cast<double>(q.generated_tokens));
+        counter("strix_requests_completed_total", "Generations completed.", q.completed);
+        counter("strix_requests_failed_total", "Generations that failed.", q.failed);
+        counter("strix_requests_cancelled_total", "Generations cancelled (client gone or stop string).", q.cancelled);
+        counter("strix_prompt_tokens_total", "Prompt tokens of finished generations.", q.prompt_tokens);
+        counter("strix_prompt_tokens_cached_total", "Prompt tokens restored from the prefix state cache.", q.cached_tokens);
+        counter("strix_generated_tokens_total", "Generated tokens.", q.generated_tokens);
         counter("strix_engine_busy_seconds_total", "Seconds the engine spent on generations.", q.busy_seconds);
-        counter("strix_queue_waiting", "Generations waiting in the queue.", static_cast<double>(q.queued), "gauge");
-        counter("strix_queue_running", "Generations running.", static_cast<double>(q.running), "gauge");
+        counter("strix_queue_waiting", "Generations waiting in the queue.", q.queued, "gauge");
+        counter("strix_queue_running", "Generations running.", q.running, "gauge");
+        if (observe_armed()) {
+            const auto ob = queue.observed();
+            counter("strix_instrumentation_armed", "1 while the instrumentation is armed (a scrape arms it; it expires after the last one).", 1, "gauge");
+            m << "# HELP strix_engine_info Engine instance of this process.\n# TYPE strix_engine_info gauge\nstrix_engine_info{instance=\""
+              << instance << "\",model=\"" << label_value(config.model_id) << "\"} 1\n";
+            counter("strix_engine_start_time_seconds", "Unix time the engine process started serving.", start_unix, "gauge");
+            counter("strix_prompt_tokens_imported_total", "Prompt tokens whose state was imported from another device (since armed).",
+                ob.imported_tokens);
+            counter("strix_prompt_tokens_computed_total", "Prompt tokens prefilled by this engine: prompt - cached - imported (since armed).",
+                ob.computed_tokens);
+            histogram_text(m, "strix_ttft_seconds", "Engine-observed time from submit to the first published token (since armed).",
+                ob.ttft_seconds, ttft_seconds_bounds);
+            histogram_text(m, "strix_decode_tokens_per_second", "Per-request decode rate: generated tokens / decode time (since armed).",
+                ob.decode_tokens_per_second, decode_tok_s_bounds);
+        }
         if (config.metrics_extra) m << config.metrics_extra();
         return m.str();
     }
@@ -902,8 +1070,21 @@ ApiService::~ApiService() = default;
 std::vector<std::uint32_t> ApiService::chat_prompt(const Json& body) const { return impl_->chat_prompt(body).tokens; }
 void ApiService::set_state(std::string state) { const std::lock_guard lock(impl_->mutex); impl_->state = std::move(state); }
 
-void ApiService::handle(const HttpRequest& request, HttpResponseWriter& response) {
+void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_response) {
     auto& impl = *impl_;
+    // C1: a valid X-Request-Id names this request's ring record and is echoed on its response
+    struct CurrentId {
+        explicit CurrentId(const std::string& id) : previous(std::move(current_request_id)) {
+            current_request_id = valid_request_id(id) ? id : std::string{};
+        }
+        ~CurrentId() { current_request_id = std::move(previous); }
+        std::string previous;
+        CurrentId(const CurrentId&) = delete;
+        CurrentId& operator=(const CurrentId&) = delete;
+    } const current_id(request.header("x-request-id"));
+    // the accepted id is echoed in the response head; the body and stream writes go to the connection directly
+    if (!current_request_id.empty()) raw_response.add_response_header("X-Request-Id", current_request_id);
+    HttpResponseWriter& response = raw_response;
     const bool anthropic = request.path == "/v1/messages";
     const auto error_body = [&](const ApiError& e) {
         Json detail = Json::object();
@@ -926,8 +1107,12 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& response
             response.send(failed || draining ? 503 : 200, "application/json", out.dump());
             return;
         }
-        if (request.method == "GET" && request.path == "/metrics") { response.send(200, "text/plain; version=0.0.4", impl.metrics()); return; }
-        if (request.method == "GET" && request.path == "/api/status") { response.send(200, "application/json", impl.status().dump()); return; }
+        if (request.method == "GET" && request.path == "/metrics") { impl.arm(); response.send(200, "text/plain; version=0.0.4", impl.metrics()); return; }
+        if (request.method == "GET" && request.path == "/api/status") {
+            if (detail_requested(request.query)) impl.arm();
+            response.send(200, "application/json", impl.status().dump());
+            return;
+        }
         impl.authorize(request);
         if (impl.config.engine_routes && impl.config.engine_routes(request, response)) return;
         if (request.method == "POST" && request.path == "/admin/drain" && impl.config.on_drain) {

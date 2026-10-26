@@ -7,6 +7,7 @@
 #include "strix/dist/communicator.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/ds41_layer.hpp"
+#include "strix/hip_ds41_attention.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -73,6 +74,13 @@
 // windows of the listed sizes, cycled; every N-th window keeps only some rows and the rest is fed again), printing per
 // row "wc rank r pos p rows R kept k argmax t slice s fnv": the FNV of each vocabulary slice of the head this process
 // computes (world 1: both). With R = 1 it is the R1 reference: every pos must have the same argmax and slice FNVs.
+// --state-in FILE: start from a saved attention state (strix-deepseek41-longctx / --state-out) instead of position 0.
+// --aba N [--aba-flags filter,direct,seghpw,fold,f16,live]: the prompt + generation and the --window-rows windows 2N times in this
+// process from the same start (--state-in or position 0), the listed attention flags (STRIX_DS41_IDX_CAND_FILTER,
+// STRIX_DS41_IDX_DIRECT, STRIX_DS41_ATTN_SEG_HPW, STRIX_DS41_ATTN_WINDOW_FOLD,
+// STRIX_DS41_ATTN_TILE_F16, STRIX_DS41_ATTN_LIVE_CHUNKS) off in even arms and on in odd ones; per arm one "aba arm" line
+// (R1 ms/token, window ms, fingerprints of the R1 tokens + local logits slice, the window tokens and the attention state)
+// and at the end "aba exact IDENTICAL|DIFFER" (every arm's fingerprints == arm 0's).
 //   Route recording: --routes-seqs FILE --routes OUT [--max-positions N] teacher-forces every sequence of FILE from a
 //   reset state (verify windows of 8 rows) and writes the router's top-k per row and layer, for placement studies.
 // The per-step lines (and --op-hashes lines) use the format of strix-deepseek41-trimmed, so a rank's output diffs
@@ -80,7 +88,9 @@
 namespace {
 
 struct Args {
-    std::string model, prompt, transport = "emulate", logits_path, routes_path, state_path;
+    std::string model, prompt, transport = "emulate", logits_path, routes_path, state_path, state_in;
+    std::uint32_t aba = 0;           // --aba N: 2N arms, flags off / on alternately
+    std::string aba_flags = "filter,direct,seghpw";
     std::uint32_t rank = 0, layers = 40, generate = 8, max_positions = 4096, fill = 0, windows = 16;
     std::vector<std::uint32_t> window_rows;  // --window-rows R[,R...]
     bool op_timing = false;
@@ -1367,13 +1377,11 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
     // no transport: one node alone (world 1; with --stream-experts the experts are read from the file per layer)
     const bool single = transport == nullptr;
     std::unique_ptr<strix::dist::Communicator> comm_owner;
-    // a pipeline TAIL's verify window STEP frame or its rows' logits slices (<= 1 MB control chunks) go in one exchange;
-    // every other role keeps the production 512 KB chunks
-    const std::size_t comm_chunk = a.role == "pipeline-stage" ? std::size_t{1} << 20U : std::size_t{512} << 10U;
+    // max message 1 MB: a verify window's STEP frame or its rows' logits slices (<= 1 MB control chunks) in one exchange
     if (!single && gpu_direct)
         comm_owner = std::make_unique<strix::dist::Communicator>(strix::dist::Group{rank, 2U, 1U, 0x64733431ULL}, std::move(transport),
-                                                                 std::move(gpu_direct), comm_chunk);
-    else if (!single) comm_owner = std::make_unique<strix::dist::Communicator>(strix::dist::Group{rank, 2U, 1U, 0x64733431ULL}, std::move(transport), comm_chunk);
+                                                                 std::move(gpu_direct), std::size_t{1} << 20U);
+    else if (!single) comm_owner = std::make_unique<strix::dist::Communicator>(strix::dist::Group{rank, 2U, 1U, 0x64733431ULL}, std::move(transport), std::size_t{1} << 20U);
     const strix::dist::CommunicatorStats no_stats{};
     strix::deepseek41::DeviceForwardOptions o;
     o.layers = a.layers;
@@ -1446,6 +1454,13 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
     if (a.prompt != "-")
         for (std::string t; std::getline(ss, t, ',');) seq.push_back(static_cast<std::uint32_t>(std::stoul(t)));
     for (std::string t; std::getline(ss, t, ',');) seq.push_back(static_cast<std::uint32_t>(std::stoul(t)));
+    strix::deepseek41::AttentionState start;
+    if (!a.state_in.empty()) {
+        start = strix::deepseek41::load_attention_state(a.state_in);
+        fwd.import_state(start);
+        if (print) std::printf("state in: %s, position %u, digest %016llx\n", a.state_in.c_str(), start.position,
+                               static_cast<unsigned long long>(start.digest()));
+    }
     if (!a.window_check.empty()) {  // R1 / verify-window logits check (see the header)
         constexpr std::uint32_t V = 129280U;
         std::vector<strix::ds41::VocabSlice> slices;
@@ -1485,6 +1500,10 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
                 }
                 std::printf("%s\n", line.c_str());
             }
+            // Preserve the R1 operation evidence in a mixed R1/verify-window exactness gate.
+            if (a.op_hashes && rows == 1U)
+                for (const auto& [name, hash] : fwd.last_step_hashes())
+                    std::printf("  %s %016llx\n", name.c_str(), static_cast<unsigned long long>(hash));
             std::fflush(stdout);
         };
         (void)fwd.step(seq[0]);  // a window may not start before position 0
@@ -1506,6 +1525,32 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
         save_state();
         return;
     }
+    const std::vector<std::uint32_t> prompt_seq = seq;
+    const std::uint32_t arms = a.aba == 0U ? 1U : 2U * a.aba;
+    std::vector<std::array<std::uint64_t, 3>> arm_prints;
+    const bool aba_filter = a.aba_flags.find("filter") != std::string::npos, aba_direct = a.aba_flags.find("direct") != std::string::npos,
+               aba_seghpw = a.aba_flags.find("seghpw") != std::string::npos, aba_fold = a.aba_flags.find("fold") != std::string::npos,
+               aba_f16 = a.aba_flags.find("f16") != std::string::npos, aba_live = a.aba_flags.find("live") != std::string::npos;
+    const auto slice = strix::ds41::vocab_slice(129280U, single ? 1U : 2U, single ? 0U : rank);
+    std::vector<float> slice_host(slice.count);
+    for (std::uint32_t arm = 0; arm < arms; ++arm) {
+    if (a.aba != 0U) {
+        const int on = static_cast<int>(arm % 2U);
+        namespace ah = strix::ds41::attn::hip;
+        ah::set_index_candidate_filter(aba_filter ? on : -1);
+        ah::set_index_direct(aba_direct ? on : -1);
+        ah::set_attention_segment_hpw(aba_seghpw ? on : -1);
+        ah::set_attention_window_fold(aba_fold ? on : -1);   // STRIX_DS41_ATTN_WINDOW_FOLD
+        ah::set_attention_tile_f16(aba_f16 ? on : -1);     // STRIX_DS41_ATTN_TILE_F16
+        ah::set_attention_live_chunks(aba_live ? on : -1);   // STRIX_DS41_ATTN_LIVE_CHUNKS
+        if (arm != 0U) {
+            seq = prompt_seq;
+            if (!a.state_in.empty()) fwd.import_state(start);
+            else fwd.reset();
+        }
+    }
+    std::uint64_t fp_r1 = 14695981039346656037ULL, fp_win = 14695981039346656037ULL;
+    const auto mix = [](std::uint64_t& h, std::uint64_t v) { h = (h ^ v) * 1099511628211ULL; };
     const std::size_t total = seq.size() + a.generate;
     double decode_seconds = 0.0;
     std::size_t decode_steps = 0;
@@ -1542,6 +1587,14 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
     for (std::size_t pos = 0; pos < seq.size(); ++pos) {
         const auto& logits = fwd.step(seq[pos]);
         const auto next = fwd.next_token();
+        if (a.aba != 0U) {  // fingerprint: the token and this process's vocabulary slice of the logits
+            const auto lr = fwd.device_logits_rows(slice.first);
+            if (hipMemcpyAsync(slice_host.data(), lr.p, std::size_t{slice.count} * 4U, hipMemcpyDeviceToHost, static_cast<hipStream_t>(fwd.stream())) != hipSuccess ||
+                hipStreamSynchronize(static_cast<hipStream_t>(fwd.stream())) != hipSuccess)
+                throw std::runtime_error("aba: logits download");
+            mix(fp_r1, next);
+            mix(fp_r1, fnv(slice_host));
+        }
         if (pos >= 1U) {  // the first step pays one-time costs
             decode_seconds += fwd.last_step_seconds();
             ++decode_steps;
@@ -1633,6 +1686,7 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
             }
     }
     std::vector<std::pair<std::uint32_t, OpSums>> op_windows;  // per window size
+    std::vector<double> window_means;
     for (const std::uint32_t rows : a.window_rows) {  // verify windows of R rows (the DSpark verifier's shape), every row committed
         if (rows == 0U || rows > strix::deepseek41::DeviceForward::max_window_rows) throw std::invalid_argument("--window-rows 1..8");
         OpSums& sums = op_windows.emplace_back(rows, OpSums{}).second;
@@ -1641,7 +1695,7 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
         for (std::uint32_t w = 0; w < a.windows + 1U; ++w) {
             window.clear();
             for (std::uint32_t r = 0; r < rows; ++r) window.push_back(seq[(w * rows + r) % seq.size()]);
-            fwd.step_window(window);
+            for (const auto t : fwd.step_window(window)) mix(fp_win, t);
             fwd.commit_window(rows);
             if (w == 0U) continue;  // the first window pays one-time costs
             if (a.op_timing) sums.add(fwd.last_op_timing(), fwd.last_step_seconds() * 1e3);
@@ -1649,6 +1703,24 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
         }
         if (print && !a.op_timing && a.windows != 0U)
             std::printf("verify windows of %u rows: mean step wall %.2f ms over %u windows\n", rows, wall / a.windows, a.windows);
+        window_means.push_back(a.windows != 0U ? wall / a.windows : 0.0);
+    }
+    if (a.aba != 0U) {
+        std::uint64_t fp_state = 14695981039346656037ULL;
+        for (const auto& [name, h] : fwd.state_hashes()) mix(fp_state, h);
+        arm_prints.push_back({fp_r1, fp_win, fp_state});
+        if (print) {
+            std::printf("aba arm %u flags %s %s r1_ms %.3f", arm, a.aba_flags.c_str(), arm % 2U ? "on" : "off",
+                        decode_steps ? decode_seconds * 1e3 / static_cast<double>(decode_steps) : 0.0);
+            for (std::size_t k = 0; k < window_means.size(); ++k) std::printf(" r%u_ms %.3f", a.window_rows[k], window_means[k]);
+            std::printf(" fp_r1 %016llx fp_win %016llx fp_state %016llx\n", static_cast<unsigned long long>(fp_r1),
+                        static_cast<unsigned long long>(fp_win), static_cast<unsigned long long>(fp_state));
+            std::fflush(stdout);
+        }
+        if (arm + 1U < arms) continue;
+        bool same = true;
+        for (const auto& f : arm_prints) same = same && f == arm_prints[0];
+        if (print) std::printf("aba exact %s (%u arms; R1 tokens + logits slice, window tokens, attention state)\n", same ? "IDENTICAL" : "DIFFER", arms);
     }
     if (print && !a.export_state.empty()) {  // the state after every fed position (the last generated token is next_token)
         const auto state = fwd.export_state();
@@ -1656,7 +1728,7 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
         std::printf("exported state %s: position %u, next token %u, digest %016llx\n", a.export_state.c_str(), state.position, state.next_token,
                     static_cast<unsigned long long>(state.digest()));
     }
-    if (!print) return;
+    if (!print) continue;
     op_r1.print("decode steps", 1U, a.op_timing_out);
     for (const auto& [rows, sums] : op_windows) sums.print("verify windows", rows, a.op_timing_out);
     save_state();
@@ -1675,6 +1747,7 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
             std::printf("  layer %2u %7.3f %7.3f %7.3f\n", l, t, e, t - e);
         }
         std::printf("  sum      %7.3f %7.3f %7.3f\n", tot, ex, tot - ex);
+    }
     }
 }
 
@@ -1731,6 +1804,9 @@ int main(int argc, char** argv) try {
         else if (s == "--max-positions") a.max_positions = static_cast<std::uint32_t>(std::stoul(next()));
         else if (s == "--logits") a.logits_path = next();
         else if (s == "--state-out") a.state_path = next();
+        else if (s == "--state-in") a.state_in = next();
+        else if (s == "--aba") a.aba = static_cast<std::uint32_t>(std::stoul(next()));
+        else if (s == "--aba-flags") a.aba_flags = next();
         else if (s == "--op-hashes") a.op_hashes = true;
         else if (s == "--timing") a.timing = true;
         else if (s == "--engram-direct") a.engram_direct = true;

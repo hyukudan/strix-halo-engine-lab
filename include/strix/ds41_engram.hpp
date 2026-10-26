@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
+#include <memory>
 #include <span>
 #include <thread>
 #include <vector>
@@ -56,8 +57,17 @@ struct EngramRowRequest {
 };
 struct EngramReaderStats {
     std::uint64_t requests = 0, page_reads = 0, page_bytes = 0, batches = 0;
+    // Unique offsets served by the payload cache / disk, and repeated offsets within a batch.
+    std::uint64_t payload_hits = 0, payload_misses = 0, batch_duplicates = 0;
+    std::uint64_t payload_hit_bytes = 0, duplicate_bytes = 0, output_bytes = 0;
+    std::uint64_t cache_capacity = 0, cache_entries = 0, cache_storage_bytes = 0, cache_evictions = 0;
     double busy_seconds = 0.0;  // wall time inside read()
 };
+
+// STRIX_DS41_ENGRAM_PAYLOAD_CACHE=1 enables a per-reader CLOCK cache and batch offset deduplication.
+// Default off. Budget is at most 1/64 of available host RAM and 256 MiB, including the fixed index;
+// STRIX_DS41_ENGRAM_PAYLOAD_CACHE_MIB optionally lowers that budget. Unknown RAM disables caching.
+[[nodiscard]] std::uint64_t engram_payload_cache_budget();
 
 // Random 264-byte row reads from the model file by a pool of worker threads. With direct I/O
 // (default) every row is read as the aligned 4 KiB page(s) holding it (O_DIRECT), which leaves the
@@ -66,7 +76,7 @@ struct EngramReaderStats {
 class EngramRowReader {
 public:
     EngramRowReader(const std::filesystem::path& file, std::vector<EngramTable> tables, unsigned threads = 16,
-                    bool direct_io = true);
+                    bool direct_io = true, std::uint64_t payload_cache_bytes = engram_payload_cache_budget());
     ~EngramRowReader();
     EngramRowReader(const EngramRowReader&) = delete;
     EngramRowReader& operator=(const EngramRowReader&) = delete;
@@ -75,6 +85,7 @@ public:
     [[nodiscard]] EngramReaderStats stats() const;
 
 private:
+    struct PayloadCache;
     void worker();
     void read_one(const EngramRowRequest& request, std::uint8_t* out, std::uint8_t* page);
     int fd_ = -1;
@@ -82,9 +93,12 @@ private:
     std::uint64_t file_bytes_ = 0;
     std::vector<EngramTable> tables_;
     std::vector<std::thread> threads_;
+    std::unique_ptr<PayloadCache> cache_;
+    mutable std::mutex read_mutex_;  // serializes callers and statistics, including async reader clients
     std::mutex mutex_;
     std::condition_variable wake_, done_;
     std::span<const EngramRowRequest> batch_;
+    std::span<const std::size_t> destinations_;
     std::uint8_t* out_ = nullptr;
     std::uint64_t generation_ = 0;
     std::atomic<std::size_t> next_{0};

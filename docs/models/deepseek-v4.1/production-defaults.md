@@ -25,6 +25,61 @@ Unchanged (off unless set): `STRIX_DS41_PREPARED_LOAD`, the tpserve prefill
 (opt-in for agent loops: prompts shorter than a 256-token block are never cached), `STRIX_DS41_COMPRESS_FAST`,
 `STRIX_DS41_EXPERT_ROWS`.
 
+## Additional qualified two-node code defaults (unset = on, `=0` = off)
+
+Qualified on 2026-10-23 with three interleaved ABA rounds, every run bitwise against its reference, and the
+full-workload gate; confirmed in a combined measurement.
+
+| setting | default | qualification effect |
+|---|---|---|
+| `STRIX_DIST_CRC_PARALLEL`, `STRIX_DIST_HOST_CRC_OVERLAP` | on | hp: R6 -1.37 %, N8 -1.77 %, TTFT 2K/8K/32K -1.15/-1.24/-0.89 % |
+| `STRIX_DIST_HOST_CHUNK_BYTES` | 1048576 (`=0`: one piece) | part of hp |
+| `STRIX_DS41_ENGRAM_PAYLOAD_CACHE` | on (`_MIB` caps the budget) | TTFT -0.66/-1.17/-1.63 %, decode equal |
+| `STRIX_DS41_PREFILL_TILES` | on for prefill runs of >= `STRIX_DS41_PREFILL_TILES_MIN_ROWS` rows (default 2048) | TTFT 2K/8K/32K -0.37/-1.26/-1.13 %; at 1K the unsplit tiles were slower (2.251 vs 2.194 s without; few rows per expert leave the unsplit kernels with too few CTAs), so below 2048 rows the split-K kernels stay |
+| `STRIX_DIST_STAGED_READY_BYTES` | 262144 (`=0`: no readiness views) | needed by the two below |
+| `STRIX_DS41_READY_LEAN`, `STRIX_DS41_MOE_READY` | on | Lean ready releases, MoE half sum through ready views |
+| `STRIX_DS41_OB_READY_EPILOGUE`, `STRIX_DS41_READY_READS_ONLY` | follow `READY_LEAN` | without the lean form they are the slower previous epilogue |
+| `STRIX_DS41_BATCH_PREFETCH` + `STRIX_DS41_PREFETCH_SIDE` | 24 MB, side stream on (`PREFETCH_ROW_MB` 3) | MALL read-ahead on a lowest-priority stream during the exchange waits; N2/N4/N8 -2.1/-4.9/-3.3 % on the Q8 sites |
+| `STRIX_DS41_DECODE_PREFETCH` | 2 MB per row, o_b window | R6 -1.8 %, R1 0 on the Q8 sites |
+| `STRIX_DS41_TRELLIS_OB_READY` | on | TP trellis o_b through the ready views (one copy+publish kernel into TX, add from RX; no SDMA D2H/H2D or events); with CRC_DEFER R1 -1.6 %, R6 -1.9 %, N8 -0.7 %, same bits |
+| `STRIX_DIST_CRC_DEFER` | on | ready-view exchanges compute the TX CRC during the wire and the RX CRC after delivery, each checked through the next trailer (a step still fails on corruption; mixed modes fail at once) |
+| `STRIX_DS41_IDX_DIRECT`, `STRIX_DS41_IDX_CAND_FILTER`, `STRIX_DS41_ATTN_SEG_HPW` | on | indexer skipped when the count is <= 512, candidate-only scoring for pool layers above 16K entries, shared heads-per-wave for N8 segments; short R1/R6/N8 -2.0/-2.7/-1.0 %, 128K -0.8/-1.9/-3.3 %, same bits |
+| `STRIX_DS41_BATCH_SHARED` | `overlap` (`off`/`0`: before the routed experts; `split` unchanged) | BatchForward shared expert inside the half-sum exchange, N1/N2/N4/N8 -2.8/-3.2/-5.1/-5.2 % in qualification, same bits |
+
+Attention-core qualification (in-process ABA x3 per cell, every arm bitwise on both
+ranks: tokens, logits slices, attention states; prefill 32K / 400 rows logits + state digest equal):
+
+| setting | default | effect |
+|---|---|---|
+| `STRIX_DS41_IDX_DIRECT` | on (`=0` off) | count <= 512: no indexer projections / scores / select. Short context R1 -2.0 %, R6 -2.7 %, N8 -1.0 % |
+| `STRIX_DS41_IDX_CAND_FILTER` | on (`=0` off) | candidate users read and select only candidate blocks (> 16K entries). 128K R1 -0.8 %, R6 -1.9 % |
+| `STRIX_DS41_ATTN_SEG_HPW` | on (`=0` off) | N8 segments share one heads-per-wave form (Hpw 4 instead of 1). With the above: N8 8K -1.1 %, 32K -1.4 %, 128K -3.3 % |
+
+Still off (measured slower or neutral): `STRIX_DS41_PREFILL_SLABS` (8K +0.76 %), `STRIX_DS41_R1FUSE_QNORM_A8`,
+`STRIX_DS41_R1FUSE_ROUTES` (now on the fast builder, exact, in the noise), `STRIX_DS41_NORM_ILP` (exact, in the noise), `STRIX_DS41_GRAPHS` (only 0.21 ms/step of GPU idle waits for the host), `STRIX_DS41_ATTN_LDS_SWIZZLE`, CMake `STRIX_EXPERIMENTAL_MALL_Q2_DOWN_NT`.
+With the trellis o_b site (below) the o_b product is the trellis plan, so the Q8 o_b ready epilogue does not run there;
+the MoE half-sum ready path does.
+The read-ahead skips trellis sites (their own pack) and runs only in the Q8 o_b exchange windows, so with the trellis
+attention set it has little left to read in decode; it is kept on because it is exact and never slower.
+
+## Current two-node defaults (2026-10-26)
+
+The qualified two-node revision `481aeb0f` keeps these additional defaults. Each was gated on the nodes;
+this publication merge does not establish a new device qualification.
+
+| setting | default | override or constraint |
+|---|---|---|
+| `STRIX_DS41_DENSE_SELECT` | on: exact per-site dense prefill selector | `=0` restores the configured dense forms |
+| `STRIX_DS41_ATTN_WINDOW_FOLD`, `STRIX_DS41_ATTN_LIVE_CHUNKS`, `STRIX_DS41_ATTN_TILE_F16` | on: exact attention window folding, live chunk scheduling and half-precision tiles | `=0` disables each independently |
+| `STRIX_DS41_MOE_PREFILL` | split MoE prefill form 7 | `=0` disables it |
+| `STRIX_DS41_SERVE_WARM` | warm the serving paths before READY | `=0` disables it; the default logs and skips decode warm-up if the KV pool cannot hold the dummy slots; explicit `=1` still fails when they do not fit; split decode skips it |
+| `STRIX_DS41_DSPARK_CALIB` | on with the warm-up setting outside split decode | explicit `=0` / `=1` overrides it |
+| `STRIX_SERVE_OBSERVE_EXPIRY_S` | 60 seconds after an arming request | `=0` keeps observation armed until process exit; `/metrics` and `/api/status?detail=1` renew it |
+
+Approximate BF16 attention and FP16 dense prefill remain opt-in. Their projection, layer range, row threshold,
+A8, fast and split-workspace controls are part of the prefix-cache namespace, so incompatible states do not share
+cache entries. The optional FP16 dense backend requires CMake `STRIX_DS41_PREFILL_FP16_LT=ON`.
+
 ## Transport and USB4 layout (P17.4)
 
 - Every app takes `--transport usb4gpu` (prefill: `usb4-gpu`); the serve manifest kind is `usb4_gpu_auto`.
@@ -43,9 +98,18 @@ Unchanged (off unless set): `STRIX_DS41_PREPARED_LOAD`, the tpserve prefill
 ```
 STRIX_DS41_OVERLAY=<requant>/ov/c-u6.gguf STRIX_DS41_CB4=1
 STRIX_DS41_TRELLIS=<packs>/ours-K4 STRIX_DS41_TRELLIS_MIX=head=<packs>/ours-K5
-STRIX_DS41_TRELLIS_SITES=shexp,head STRIX_DS41_TRELLIS_HEADOUT=1
+STRIX_DS41_TRELLIS_SITES=all STRIX_DS41_TRELLIS_DENSE_FULL=1 STRIX_DS41_TRELLIS_HEADOUT=1
 ```
 
-Trellis mix-B (shexp + head sites, K4 dense / K5 head) is the production identity after its quality gate
+Attention sites on trellis in the qualified two-node configuration: every mix-B dense class incl. q_a / kv / q_b / o_a / o_b
+reads its K4 pack. Needs the build `STRIX_DS41_TRELLIS_API=dense_r1` linked against a trellis library with the dense-r1 and grouped GEMV APIs
+(grouped wo_a GEMV, dense-r1 q_a + kv pair, cold schedules). `STRIX_DS41_TRELLIS_OA_GROUP` (grouped o_a) and
+`STRIX_DS41_TRELLIS_QAKV_PAIR` (q_a + kv in one launch) are on by default and bit-identical to their off forms (=0).
+Measured (pair, ABA, same binary, only the env differs): R1 34.7 -> 31.15 ms/token (-10.2 %), R6 window 63.17 -> 60.59 ms
+(-4.1 %), N8 85.38 -> 83.56 ms/step (-2.1 %), every run exact against its reference. The previous production set
+`STRIX_DS41_TRELLIS_SITES=shexp,head` keeps its bits on this build. Quality: mix-B with all dense classes on
+K4 is the configuration of the trellis quality report (full set KL 0.0446, paired vs c-u6 -0.0001).
+
+The earlier trellis mix-B (shexp + head sites, K4 dense / K5 head) passed its quality gate
 (full-set KL equal to the 6.5-bit format). Either trellis library (CMake `STRIX_DS41_TRELLIS_API` v12 or splitk04)
 gives the same bits. Serve: `--prefill-path device --dspark <DSpark.gguf> --dspark-vocab auto:<vocab>`.

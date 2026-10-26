@@ -1,3 +1,5 @@
+#include "strix/ds41_prefill_tuning.hpp"
+#include "strix/hip_ds41_dense_fp16.hpp"
 #include "strix/deepseek41_prefill.hpp"
 
 #include "strix/deepseek41_attention_host.hpp"
@@ -26,6 +28,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <sstream>
+#include <string>
 #include <condition_variable>
 #include <future>
 #include <mutex>
@@ -98,6 +102,44 @@ std::vector<T> download(const T* p, std::size_t n, hipStream_t s) {
     check(hipMemcpyAsync(out.data(), p, n * sizeof(T), hipMemcpyDeviceToHost, s), "download");
     check(hipStreamSynchronize(s), "download");
     return out;
+}
+
+// Diagnostics (PrefillOptions::null_ulp_layer / trace): the last mantissa bit of every finite nonzero value flipped,
+// and an order-independent 64-bit hash per stream row.
+// seed != 0: one ulp up or down (magnitude +-1 in the bit pattern) by a hash of (seed, i), so seeds sample the noise.
+__global__ void ulp_flip_kernel(float* p, std::size_t n, std::uint32_t seed) {
+    const std::size_t i = blockIdx.x * 256ULL + threadIdx.x;
+    if (i >= n) return;
+    const float f = p[i];
+    if (f == 0.0F || !isfinite(f)) return;
+    if (seed == 0U) {
+        p[i] = __int_as_float(__float_as_int(f) ^ 1);
+        return;
+    }
+    std::uint64_t x = (std::uint64_t{seed} << 40) ^ i;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    x ^= x >> 31;
+    const int b = __float_as_int(f);
+    p[i] = __int_as_float((x & 1U) || (b & 0x7FFFFF) == 0 ? b + 1 : b - 1);
+}
+__global__ void row_hash_kernel(const float* s, std::size_t row, std::uint64_t* out) {
+    __shared__ std::uint64_t red[256];
+    const float* r = s + blockIdx.x * row;
+    std::uint64_t h = 0;
+    for (std::size_t i = threadIdx.x; i < row; i += 256) {
+        std::uint64_t x = (std::uint64_t{static_cast<std::uint32_t>(__float_as_int(r[i]))} | (std::uint64_t{i} << 32)) + 0x9E3779B97F4A7C15ULL;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+        h += x ^ (x >> 31);
+    }
+    red[threadIdx.x] = h;
+    __syncthreads();
+    for (unsigned d = 128; d; d /= 2) {
+        if (threadIdx.x < d) red[threadIdx.x] += red[threadIdx.x + d];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[blockIdx.x] = red[0];
 }
 
 class Mapped {
@@ -356,9 +398,59 @@ struct DevicePrefill::Impl {
     bool pack = true;
     Dev<std::uint32_t> pack_send, pack_recv;
     // sites run on the dense WMMA kernel instead of the batch kernel (STRIX_DS41_PREFILL_DENSE_SITES, comma list of
-    // q_a, kv, q_b; default q_a,kv, faster on the dense kernel at 512 and 2048 rows; "none" = all on the batch kernel):
-    // both give the decode's bits
-    bool dense_q_a = true, dense_kv = true, dense_q_b = false;
+    // q_a, kv, q_b, o_a; default q_a,kv, faster on the dense kernel at 512 and 2048 rows; "none" = all on the batch
+    // kernel; o_a: one dense call per o-group): both give the decode's bits
+    bool dense_q_a = true, dense_kv = true, dense_q_b = false, dense_o_a = false;
+    // set_dense_select: the selector forced on (auto form on every exact dense call, q_b / o_a dense; default on,
+    // STRIX_DS41_DENSE_SELECT=0 off); env_* = loaded
+    bool dense_select = false, env_dense_q_b = false, env_dense_o_a = false;
+    // q_b / o_a take the dense kernel only from this many rows per call (STRIX_DS41_PREFILL_DENSE_MIN_ROWS, default 256:
+    // the selector's per-site forms start there; smaller chunks, cone tails and extends stay on the batch kernel)
+    std::uint32_t dense_min_rows = 256;
+#ifdef STRIX_DS41_PREFILL_FP16_LT
+    ds41::DenseFp16Cache dense_fp16;
+#endif
+    // projection bit (PrefillOptions::fp16_projections) of a layer's call of `rows` rows on the FP16 backend
+    bool fp16_at(std::uint32_t bit, std::uint32_t layer, std::uint32_t rows) const {
+        // FP16 output form: calls under 128 rows stay exact (hipBLASLt loses there: 64 x 8192 x 5120 0.46-0.51 vs 0.40 ms)
+        return options.fp16_dense && (options.fp16_projections & bit) != 0U && layer >= options.approx_layer_first &&
+               layer < options.approx_layer_end && rows >= std::max(options.fp16_min_rows, options.fp16_fast ? 128U : 0U);
+    }
+    // FP16 output form: the norms' FP16 activations (x for q_a / kv, qr for q_b), sized as x / qr on first use
+    Dev<std::uint16_t> x16, qr16;
+    bool fast_at(std::uint32_t bits, std::uint32_t layer) const {
+        return options.fp16_dense && options.fp16_fast && (options.fp16_projections & bits) != 0U && layer >= options.approx_layer_first &&
+               layer < options.approx_layer_end;
+    }
+    bool fast_used = false;
+    void fast(const ds41::Q8A8DensePrefillView* views, unsigned count, std::uint32_t rows, const std::uint16_t* a16, std::uint32_t a16_stride,
+              const float* input_x, void* st, unsigned groups = 1) {
+        (void)views, (void)count, (void)rows, (void)a16, (void)a16_stride, (void)input_x, (void)st, (void)groups;
+#ifdef STRIX_DS41_PREFILL_FP16_LT
+        dense_fp16.enqueue_fast(views, count, rows, a16, a16_stride, input_x, st, groups, options.fp16_wsplit);
+        fast_used = true;
+#else
+        throw std::runtime_error("FP16 dense prefill requires STRIX_DS41_PREFILL_FP16_LT");
+#endif
+    }
+    bool bf16_at(std::uint32_t layer) const {
+        return options.bf16_attention && layer >= options.approx_layer_first && layer < options.approx_layer_end;
+    }
+    void dense(const ds41::Q8A8DensePrefillView& v, const float* input_x, void* st, bool fp16) {
+        (void)input_x;
+        if (fp16) {
+#ifdef STRIX_DS41_PREFILL_FP16_LT
+            dense_fp16.enqueue(v,input_x,st,options.fp16_keep_a8);
+#else
+            throw std::runtime_error("FP16 dense prefill requires STRIX_DS41_PREFILL_FP16_LT");
+#endif
+        } else if (dense_select && v.tall == 0U) {
+            auto w = v;
+            w.tall = 1U;  // auto
+            ds41::enqueue_q8_0_a8_dense_prefill(w,st);
+        } else ds41::enqueue_q8_0_a8_dense_prefill(v,st);
+    }
+
     // row_split MoE: PrefillMoe::enqueue_half_joint (one route build and expert pass over the peer's and this rank's
     // rows; opt-in, STRIX_DS41_PREFILL_JOINT=1. Default: two passes, peer rows first; P11: joint -4 % at 2K, 0 at 16K)
     bool moe_joint = false;
@@ -414,6 +506,10 @@ struct DevicePrefill::Impl {
     // run on several lanes. Its live window goes to the layer's decode ring at the end.
     Dev<std::uint8_t> prefill_ring;
     std::uint32_t prefill_capacity = 0;
+    // in-run snapshots (set_snapshot_points): the points of the next run, those of the last run and their rings
+    // (point-major, one ring_capacity ring per layer)
+    std::vector<std::uint32_t> snap_next, snap_points;
+    std::vector<Dev<std::uint8_t>> snap_rings;
     // a stream and the scratch of one attention window per lane
     struct Lane {
         hipStream_t stream = nullptr;
@@ -472,7 +568,11 @@ struct DevicePrefill::Impl {
     // world 2: half sums of every row; TP attention: this rank's and the peer's wo_b K-half of a chunk
     Dev<float> half_own, half_other, y_own, y_other;
     // head (last row)
-    Dev<float> h, logits;
+    Dev<float> h, logits, quality_h, quality_logits;
+    Dev<std::uint64_t> trace_hash;
+    Dev<std::int8_t> quality_codes;
+    Dev<float> quality_deltas;
+    Dev<std::int32_t> quality_sums;
     Dev<std::int8_t> hcodes;
     Dev<float> hdeltas;
     Dev<std::int32_t> hsums;
@@ -519,11 +619,49 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     // STRIX_DS41_PREFILL_WINDOW=W: rows per attention call and row-split unit (same bits for any W)
     if (const char* v = std::getenv("STRIX_DS41_PREFILL_WINDOW"); v != nullptr && *v != 0)
         options.window_rows = static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10));
+    // An explicit WINDOW takes precedence. Selection happens before any scratch allocation
+    // or row-owner map is built, and stays fixed for this DevicePrefill's lifetime.
+    const bool large_slabs = ds41::prefill_tuning::enabled("STRIX_DS41_PREFILL_SLABS");
+    if (large_slabs && options.window_rows == PrefillOptions{}.window_rows &&
+        (std::getenv("STRIX_DS41_PREFILL_WINDOW") == nullptr || !*std::getenv("STRIX_DS41_PREFILL_WINDOW"))) {
+        const auto rows = options.max_rows != 0U ? options.max_rows : options.max_positions;
+        options.window_rows = ds41::prefill_tuning::attention_rows(rows, options.chunk_rows, ds41::attn::kHeads,
+                                                                 options.max_positions, options.attention_lanes);
+    }
+    if(const char* e=std::getenv("STRIX_DS41_PREFILL_FP16_DENSE");e && std::string(e)=="1")options.fp16_dense=true;
+    if(const char* e=std::getenv("STRIX_DS41_PREFILL_BF16_ATTN");e && std::string(e)=="1")options.bf16_attention=true;
+    // Per-shape selector of the FP16 backend: STRIX_DS41_PREFILL_FP16_PROJ (comma list of q_a, kv, q_b, o_a, o_b),
+    // STRIX_DS41_PREFILL_FP16_MIN_ROWS (calls of at least that many rows), STRIX_DS41_PREFILL_APPROX_LAYERS=first-end,
+    // STRIX_DS41_PREFILL_FP16_A8=1 (operands from the A8 codes)
+    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_PROJ"); e != nullptr && *e != 0) {
+        std::uint32_t mask = 0;
+        std::stringstream ss(e);
+        for (std::string t; std::getline(ss, t, ',');) {
+            if (t == "q_a") mask |= 1U;
+            else if (t == "kv") mask |= 2U;
+            else if (t == "q_b") mask |= 4U;
+            else if (t == "o_a") mask |= 8U;
+            else if (t == "o_b") mask |= 16U;
+            else throw std::invalid_argument("STRIX_DS41_PREFILL_FP16_PROJ: " + t);
+        }
+        options.fp16_projections = mask;
+    }
+    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_MIN_ROWS"); e != nullptr && *e != 0)
+        options.fp16_min_rows = static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10));
+    if (const char* e = std::getenv("STRIX_DS41_PREFILL_APPROX_LAYERS"); e != nullptr && *e != 0) {
+        char* end = nullptr;
+        options.approx_layer_first = static_cast<std::uint32_t>(std::strtoul(e, &end, 10));
+        if (end == nullptr || *end != '-') throw std::invalid_argument("STRIX_DS41_PREFILL_APPROX_LAYERS: first-end");
+        options.approx_layer_end = static_cast<std::uint32_t>(std::strtoul(end + 1, nullptr, 10));
+    }
+    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_A8"); e != nullptr && std::string(e) == "1") options.fp16_keep_a8 = true;
+    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_FAST"); e != nullptr && std::string(e) == "1") options.fp16_fast = true;
+    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_WSPLIT"); e != nullptr && std::string(e) == "1") options.fp16_wsplit = true;
     m.options = options;
     if (options.world != 1U && options.world != 2U) throw std::invalid_argument("deepseek41 prefill: world must be 1 or 2");
     if (options.world == 2U && (options.communicator == nullptr || options.rank > 1U))
         throw std::invalid_argument("deepseek41 prefill: world 2 needs a communicator and rank 0 or 1");
-    if (options.window_rows == 0U || options.window_rows > ds41::attn::kMaxCallRows || options.chunk_rows == 0U ||
+    if (options.window_rows == 0U || options.window_rows > (large_slabs ? ds41::attn::kMaxCallRows : ds41::attn::kLegacyMaxCallRows) || options.chunk_rows == 0U ||
         options.chunk_rows % options.window_rows != 0U)
         throw std::invalid_argument("deepseek41 prefill: window_rows 1..kMaxCallRows dividing chunk_rows");
     if (options.attention_lanes == 0U || options.attention_lanes > 16U) throw std::invalid_argument("deepseek41 prefill: attention_lanes 1..16");
@@ -545,6 +683,17 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
         m.dense_q_a = list.find(",q_a,") != std::string::npos;
         m.dense_kv = list.find(",kv,") != std::string::npos;
         m.dense_q_b = list.find(",q_b,") != std::string::npos;
+        m.dense_o_a = list.find(",o_a,") != std::string::npos;
+    }
+    if (const char* v = std::getenv("STRIX_DS41_PREFILL_DENSE_MIN_ROWS"); v != nullptr && *v != 0) m.dense_min_rows = static_cast<std::uint32_t>(std::stoul(v));
+    m.env_dense_q_b = m.dense_q_b;
+    m.env_dense_o_a = m.dense_o_a;
+    // the exact dense selector is the default (bitwise EQUAL, 2K -5.5 % / 8K -5.1 % TTFT);
+    // STRIX_DS41_DENSE_SELECT=0 = the loaded configuration above (STRIX_DS41_DENSE_TALL / PREFILL_DENSE_SITES)
+    if (const char* v = std::getenv("STRIX_DS41_DENSE_SELECT"); !(v != nullptr && v[0] == '0' && v[1] == 0)) {
+        m.dense_select = true;
+        m.dense_q_b = true;
+        m.dense_o_a = true;
     }
     m.model = validate_target(read_file(gguf));
     m.plan = build_decode_plan(m.model, 0, options.layers);
@@ -760,6 +909,7 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     m.scores = Dev<float>(T * c.n_routed_experts);
     m.route_w = Dev<float>(T * K);
     m.ids = Dev<std::uint32_t>(T * K);
+    m.trace_hash = Dev<std::uint64_t>(T);
     m.image_rows = Dev<std::uint8_t>(T);
     m.image_rows.zero(m.stream);
     m.q = Dev<float>(C * QH);
@@ -801,6 +951,19 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
             m.y_other = Dev<float>(C * H);
         }
     }
+    if(options.quality_head_rows>1) {
+        if(options.row_split || options.cone || options.quality_head_rows>64)
+            throw std::invalid_argument("quality head rows requires no row split, no cone, <=64 rows");
+        auto nr=options.quality_head_rows;
+        m.quality_h=Dev<float>(std::size_t(nr)*H);
+        m.quality_logits=Dev<float>(std::size_t(nr)*c.vocab_size);
+        m.quality_codes=Dev<std::int8_t>(std::size_t(nr)*H);
+        m.quality_deltas=Dev<float>(std::size_t(nr)*H/32);
+        m.quality_sums=Dev<std::int32_t>(std::size_t(nr)*H/32);
+    }
+#ifndef STRIX_DS41_PREFILL_FP16_LT
+    if(options.fp16_dense)throw std::invalid_argument("FP16 prefill backend not built");
+#endif
     m.h = Dev<float>(H);
     m.logits = Dev<float>(c.vocab_size);
     m.hcodes = Dev<std::int8_t>(H);
@@ -1104,6 +1267,38 @@ std::unique_ptr<PrefillTask> DevicePrefill::begin_from(std::span<const std::uint
     return std::unique_ptr<PrefillTask>(new PrefillTask(std::move(s)));
 }
 
+void DevicePrefill::set_precision_for_new_sequence(bool dense,bool attention) {
+    if(impl_->task)throw std::logic_error("cannot change precision during a prefill task");
+#ifndef STRIX_DS41_PREFILL_FP16_LT
+    if(dense)throw std::invalid_argument("FP16 prefill backend not built");
+#endif
+    impl_->options.fp16_dense=dense;impl_->options.bf16_attention=attention;impl_->broken=true;
+}
+
+void DevicePrefill::set_dense_select(bool on) {
+    if (impl_->task) throw std::logic_error("cannot change the dense selector during a prefill task");
+    auto& m = *impl_;
+    m.dense_select = on;
+    m.dense_q_b = on || m.env_dense_q_b;
+    m.dense_o_a = on || m.env_dense_o_a;
+    m.broken = true;
+}
+
+void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
+    set_precision_for_new_sequence(p.fp16_dense, p.bf16_attention);
+    auto& o = impl_->options;
+    o.fp16_projections = p.fp16_projections;
+    o.approx_layer_first = p.approx_layer_first;
+    o.approx_layer_end = p.approx_layer_end;
+    o.fp16_min_rows = p.fp16_min_rows;
+    o.fp16_keep_a8 = p.fp16_keep_a8;
+    o.fp16_fast = p.fp16_fast;
+    o.fp16_wsplit = p.fp16_wsplit;
+    o.null_ulp_layer = p.null_ulp_layer;
+    o.null_seed = p.null_seed;
+    o.trace = p.trace;
+}
+
 PrefillResult DevicePrefill::run(std::span<const std::uint32_t> tokens) {
     if (impl_->task != nullptr) throw std::logic_error("deepseek41 prefill: a task is in progress");
     return run_from(tokens, 0U);
@@ -1165,12 +1360,19 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     const auto& c = m.model.config;
     namespace attn = ds41::attn;
     const std::uint32_t T = static_cast<std::uint32_t>(tokens.size());  // rows of this run, at positions [P0, P0 + T)
+    ds41::prefill_tuning::set_run_rows(T);  // the tile policy's size rule (ds41_prefill_tuning.hpp)
     const std::uint32_t P0 = start;
     const std::uint32_t max_rows = m.options.max_rows != 0U ? m.options.max_rows : m.options.max_positions;
     if (T == 0U || T > max_rows || std::uint64_t{P0} + T > m.options.max_positions)
         throw std::invalid_argument("deepseek41 prefill: rows outside 1..max_rows or positions beyond max_positions");
     if (P0 % m.options.window_rows != 0U) throw std::invalid_argument("deepseek41 prefill: extend needs the rows so far to be a multiple of window_rows");
     if (m.pos_base != P0) m.upload_positions(P0, m.stream);
+    m.snap_points = std::exchange(m.snap_next, {});
+    for (const auto p : m.snap_points)
+        if (p <= P0 || p >= P0 + T || p % m.options.window_rows != 0U)
+            throw std::invalid_argument("deepseek41 prefill: snapshot point outside the run or not a multiple of window_rows");
+    while (m.snap_rings.size() < m.snap_points.size() * m.options.layers)
+        m.snap_rings.emplace_back(std::size_t{AttentionHost::ring_capacity} * attn::kWindowEntryBytes);
     for (const auto t : tokens)
         if (t >= c.vocab_size) throw std::invalid_argument("deepseek41 prefill: token outside the vocabulary");
     const std::uint32_t H = c.hidden_size, hc = c.hc_mult, K = c.num_experts_per_tok, I = c.moe_intermediate_size;
@@ -1206,6 +1408,18 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             r.o0 = down(pl.out_begin);
             r.k0 = down(pl.kv_begin);
             r.x0 = m.roles[pl.layer].owns_kv ? 0U : r.k0;
+        }
+        // in-run snapshot points: also the cone of the state at p (one contiguous suffix per layer: the union)
+        for (const auto p : m.snap_points) {
+            ds41::SuffixReplayGeometry gp = g;
+            gp.draft_rows = 0;
+            for (const auto& pl : ds41::plan_suffix_replay(gp, 0U, p - P0).layers) {
+                if (pl.layer >= m.options.layers) continue;
+                auto& r = rows[pl.layer];
+                r.o0 = std::min(r.o0, down(pl.out_begin));
+                r.k0 = std::min(r.k0, down(pl.kv_begin));
+                r.x0 = m.roles[pl.layer].owns_kv ? 0U : r.k0;
+            }
         }
         result.row_layers = 0;
         for (const auto& r : rows) result.row_layers += T - r.o0;
@@ -1447,6 +1661,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     };
     auto t_head = t_run;
 
+    std::vector<std::uint32_t> trace_router;  // options.trace: this layer's router ids until the layer's end
     for (const auto& s : m.plan.steps) {
         const auto layer = static_cast<std::uint32_t>(std::max(s.layer, 0));
         if (s.layer >= 0 && s.layer != cut_layer) {  // a layer starts: hc / norms / q_a / kv (and Engram)
@@ -1551,13 +1766,42 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             v.deltas = (q ? m.qdeltas.p : m.xdeltas.p) + std::size_t{r0} * n / 32U;
             v.sums = (q ? m.qsums.p : m.xsums.p) + std::size_t{r0} * n / 32U;
             v.a8_stride = n;
+            if (m.fast_at(q ? 4U : 3U, layer)) {
+                auto& b = q ? m.qr16 : m.x16;
+                if (b.n == 0U) b = Dev<std::uint16_t>(q ? m.qr.n : m.x.n);
+                v.f16 = b.p + std::size_t{r0} * n;
+                v.f16_stride = n;
+            }
             ds41::enqueue_norm(v, st);
             break;
         }
         case Op::q_a: case Op::kv: {
             const std::uint32_t r0 = s.op == Op::q_a ? o0 : L0.k0;
             if (r0 == Tn) break;
-            if (s.op == Op::q_a ? m.dense_q_a : m.dense_kv) {
+            const bool fp16 = m.fp16_at(s.op == Op::q_a ? 1U : 2U, layer, Tn - r0);
+            if (m.options.fp16_fast && fp16) {
+                // q_a || kv: one GEMM over rows [min(o0, k0), Tn) when both are FP16 here (run at q_a, skipped at kv)
+                const bool joint = o0 < Tn && L0.k0 < Tn && m.fp16_at(1U, layer, Tn - o0) && m.fp16_at(2U, layer, Tn - L0.k0);
+                if (joint && s.op == Op::kv) break;
+                ds41::Q8A8DensePrefillView v[2];
+                unsigned count = 0;
+                for (const Op op : {Op::q_a, Op::kv}) {
+                    if (op != s.op && !joint) continue;
+                    auto& d = v[count++];
+                    const std::uint32_t d0 = op == Op::q_a ? o0 : L0.k0;
+                    d.weight = m.dev(op == Op::q_a ? s.weights[0] : p + "attn_kv.weight");
+                    d.width = H;
+                    d.count = op == Op::q_a ? QA : D;
+                    d.rows = Tn - d0;
+                    d.x_stride = H;
+                    d.out = op == Op::q_a ? m.qr.p + std::size_t{d0} * QA : m.kv.p + std::size_t{d0} * D;
+                    d.out_stride = d.count;
+                }
+                const std::uint32_t first = joint ? std::min(o0, L0.k0) : r0;
+                m.fast(v, count, Tn - first, m.x16.p + std::size_t{first} * H, H, nullptr, st);
+                break;
+            }
+            if (fp16 || (s.op == Op::q_a ? m.dense_q_a : m.dense_kv)) {
                 ds41::Q8A8DensePrefillView v;
                 v.weight = m.dev(s.weights[0]);
                 v.width = H;
@@ -1568,7 +1812,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 v.x_stride = H;
                 v.out = s.op == Op::q_a ? m.qr.p + std::size_t{r0} * QA : m.kv.p + std::size_t{r0} * D;
                 v.out_stride = v.count;
-                ds41::enqueue_q8_0_a8_dense_prefill(v, st);
+                m.dense(v, m.x.p + std::size_t{r0} * H, st, fp16);
                 break;
             }
             ds41::Q8A8PrefillView v;
@@ -1628,6 +1872,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 if (split && !final_kv) start_gather();  // window K/V and compressor inputs are ready; the indexer runs while they cross
                 const auto index_projections = [&] {
                     if (!r.owns_index) return;
+                    // STRIX_DS41_IDX_DIRECT: every window of the run selects all its positions (below): no projections
+                    if (attn::hip::index_direct() && (std::uint64_t{P0} + T) / m.roles[static_cast<std::size_t>(r.kv_source)].ratio <= attn::kTopK) return;
                     f16(p + "indexer.attn_q_b.weight", m.qr.p, QA, attn::kIdxHeads * attn::kIdxDim, m.iq.p, o0);
                     f16(p + "indexer.proj.weight", m.x.p, H, attn::kIdxHeads, m.iw.p, o0);
                 };
@@ -1769,15 +2015,21 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 mark_part(1);
                 // TP: the peer's K-half of the chunk at `pending` (if any), then y = h0 + h1 of its rows
                 std::uint32_t pending = T;
+                float* staged_half = nullptr;
                 const auto close_halves = [&] {
                     if (pending == T) return;
                     const std::uint32_t n = std::min(C, Tn - pending);
-                    m.options.communicator->finish(st, m.y_other.p);
-                    const float* h0 = m.options.rank == 0U ? m.y_own.p : m.y_other.p;
-                    const float* h1 = m.options.rank == 0U ? m.y_other.p : m.y_own.p;
+                    const float* peer = m.y_other.p;
+                    if (staged_half) peer = static_cast<const float*>(m.options.communicator->finish_staged(st));
+                    else m.options.communicator->finish(st, m.y_other.p);
+                    const float* own = staged_half ? staged_half : m.y_own.p;
+                    const float* h0 = m.options.rank == 0U ? own : peer;
+                    const float* h1 = m.options.rank == 0U ? peer : own;
                     const std::uint32_t count = n * H;
                     add_halves_kernel<<<(count + 255U) / 256U, 256, 0, st>>>(h0, h1, m.y.p + std::size_t{pending} * H, count);
                     check(hipGetLastError(), "add halves");
+                    if (staged_half) m.options.communicator->release_staged(st);
+                    staged_half = nullptr;
                     pending = T;
                 };
                 // task units: one per chunk (TP form: none, a chunk's wo_b halves are in flight across chunks); the
@@ -1791,7 +2043,18 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         cut(PrefillUnitLevel::finest, s.layer, "attn.chunk");
                         ++chunks_cut;
                     }
-                    if (m.dense_q_b) {
+                    const bool fp16_q_b = m.fp16_at(4U, layer, n);
+                    if (fp16_q_b && m.options.fp16_fast) {
+                        ds41::Q8A8DensePrefillView v;
+                        v.weight = q8_rows(m.dev(p + "attn_q_b.weight"), std::size_t{head0} * c.head_dim, QA);
+                        v.width = QA;
+                        v.count = QL;
+                        v.rows = n;
+                        v.x_stride = QA;
+                        v.out = m.q.p;
+                        v.out_stride = QL;
+                        m.fast(&v, 1U, n, m.qr16.p + std::size_t{r0} * QA, QA, nullptr, st);
+                    } else if (fp16_q_b || (m.dense_q_b && n >= m.dense_min_rows)) {
                         ds41::Q8A8DensePrefillView v;
                         v.weight = q8_rows(m.dev(p + "attn_q_b.weight"), std::size_t{head0} * c.head_dim, QA);
                         v.width = QA;
@@ -1802,7 +2065,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         v.x_stride = QA;
                         v.out = m.q.p;
                         v.out_stride = QL;
-                        ds41::enqueue_q8_0_a8_dense_prefill(v, st);
+                        m.dense(v, m.qr.p + std::size_t{r0} * QA, st, fp16_q_b);
                     } else {
                         ds41::Q8A8PrefillView v;
                         v.weight = q8_rows(m.dev(p + "attn_q_b.weight"), std::size_t{head0} * c.head_dim, QA);
@@ -1842,7 +2105,6 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                                 iv.idx_cache = m.attn[static_cast<std::size_t>(r.kv_source)].idx_cache.p;
                                 iv.scores = ln.index_scores.p;
                                 iv.qprep = ln.index_qprep.p;
-                                attn::hip::enqueue_index_scores(iv, ls);
                                 attn::hip::SelectView sv{};
                                 sv.rows = Rw;
                                 sv.ratio = ratio;
@@ -1858,7 +2120,17 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                                 sv.keys = ln.select_keys.p;
                                 sv.idx = L.idx.p + std::size_t{w0} * attn::kTopK;
                                 sv.idx_count = L.idx_count.p + w0;
-                                attn::hip::enqueue_select(sv, ls);
+                                if (count <= attn::kTopK && attn::hip::index_direct()) {  // every position selected
+                                    attn::hip::enqueue_select_direct(sv, ls);
+                                } else {
+                                    if (sv.pool == attn::Pool::candidate_user && count > attn::kCandBlocks * attn::kCandBlockSize && attn::hip::index_candidate_filter()) {
+                                        iv.candidates = sv.candidates;
+                                        iv.block_size = sv.block_size;
+                                        sv.compact = true;
+                                    }
+                                    attn::hip::enqueue_index_scores(iv, ls);
+                                    attn::hip::enqueue_select(sv, ls);
+                                }
                             }
                         }
                         attn::hip::AttentionView v{};
@@ -1880,7 +2152,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         v.partial = ln.attn_partial.p;
                         v.tickets = ln.attn_tickets.p;
                         v.o = m.o.p + std::size_t{w0 - r0} * QL;
-                        attn::hip::enqueue_attention(v, ls);
+                        if(m.bf16_at(layer)) attn::hip::enqueue_attention_bf16_prefill(v,ls);
+                        else attn::hip::enqueue_attention(v, ls);
                     }
                     close_halves();  // the previous chunk's wo_b halves crossed meanwhile; y_own is free again
                     for (auto& ln : m.lanes) {
@@ -1888,7 +2161,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         check(hipStreamWaitEvent(st, ln.done, 0), "chunk join");
                     }
                     mark_part(3);
-                    ds41::enqueue_quantize_a8(m.o.p, QL, n, m.ocodes.p, m.odeltas.p, m.osums.p, st);
+                    const bool fast_o_a = m.options.fp16_fast && m.fp16_at(8U, layer, n);
+                    if (!fast_o_a) ds41::enqueue_quantize_a8(m.o.p, QL, n, m.ocodes.p, m.odeltas.p, m.osums.p, st);
                     {
                         ds41::Q8A8PrefillView v;
                         v.width = QH / c.o_groups;
@@ -1899,11 +2173,48 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         v.codes = m.ocodes.p;
                         v.deltas = m.odeltas.p;
                         v.out = m.o_low.p;
-                        ds41::enqueue_q8_0_a8_prefill(v, st);
+                        if (fast_o_a) {
+                            // the o-groups: one FP16 conversion of the row, one GEMM per group, one finish
+                            ds41::Q8A8DensePrefillView d;
+                            d.weight = v.weight;
+                            d.width = v.width;
+                            d.count = c.o_lora_rank;
+                            d.rows = n;
+                            d.x_stride = QL;
+                            d.out = m.o_low.p;
+                            d.out_stride = OLL;
+                            m.fast(&d, 1U, n, nullptr, 0U, m.o.p, st, groups);
+                        } else if(m.fp16_at(8U, layer, n)) {
+                            for(unsigned g=0;g<groups;++g){
+                                ds41::Q8A8DensePrefillView d;
+                                d.weight=q8_rows(v.weight,std::size_t(g)*c.o_lora_rank,v.width);
+                                d.width=v.width;d.count=c.o_lora_rank;d.rows=n;d.x_stride=QL;
+                                d.codes=m.ocodes.p+g*v.width;d.deltas=m.odeltas.p+g*v.width/32U;
+                                d.out=m.o_low.p+g*c.o_lora_rank;d.out_stride=OLL;
+                                m.dense(d,m.o.p+g*v.width,st,true);
+                            }
+                        } else if (m.dense_o_a && n >= m.dense_min_rows) {
+                            // one dense call per o-group (the same group products as the grouped batch kernel)
+                            for (unsigned g = 0; g < groups; ++g) {
+                                ds41::Q8A8DensePrefillView d;
+                                d.weight = q8_rows(v.weight, std::size_t{g} * c.o_lora_rank, v.width);
+                                d.width = v.width;
+                                d.count = c.o_lora_rank;
+                                d.rows = n;
+                                d.x_stride = QL;
+                                d.codes = m.ocodes.p + g * v.width;
+                                d.deltas = m.odeltas.p + g * v.width / 32U;
+                                d.out = m.o_low.p + g * c.o_lora_rank;
+                                d.out_stride = OLL;
+                                m.dense(d, m.o.p + g * v.width, st, false);
+                            }
+                        } else ds41::enqueue_q8_0_a8_prefill(v, st);
                     }
-                    ds41::enqueue_quantize_a8(m.o_low.p, OLL, n, m.olcodes.p, m.oldeltas.p, m.olsums.p, st);
+                    const bool fast_o_b = m.options.fp16_fast && m.fp16_at(16U, layer, n);
+                    if (!fast_o_b) ds41::enqueue_quantize_a8(m.o_low.p, OLL, n, m.olcodes.p, m.oldeltas.p, m.olsums.p, st);
                     {
                         // wo_b as two K-halves h0 (columns 0..4095) + h1 (4096..8191): h0 into y, then h1 accumulated
+                        const bool fp16_o_b = m.fp16_at(16U, layer, n);
                         ds41::Q8A8DensePrefillView v;
                         v.weight = m.dev(p + "attn_output_b.weight");
                         v.width = OL / 2U;
@@ -1918,18 +2229,25 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                             v.k_offset = m.options.rank * (OL / 2U);
                             v.codes = m.olcodes.p;
                             v.deltas = m.oldeltas.p;
-                            v.out = m.y_own.p;
-                            ds41::enqueue_q8_0_a8_dense_prefill(v, st);
-                            m.options.communicator->start(st, m.y_own.p, std::size_t{n} * H * 4U,
-                                                          dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, r0 / C});
+                            const std::size_t bytes = std::size_t{n} * H * 4U;
+                            staged_half = static_cast<float*>(m.options.communicator->send_staging(bytes));
+                            v.out = staged_half ? staged_half : m.y_own.p;
+                            if (fast_o_b) m.fast(&v, 1U, n, nullptr, 0U, m.o_low.p, st);
+                            else m.dense(v,m.o_low.p,st,fp16_o_b);
+                            const dist::Tag tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, r0 / C};
+                            if (staged_half) m.options.communicator->start_staged(st, bytes, tag);
+                            else m.options.communicator->start(st, m.y_own.p, bytes, tag);
                             pending = r0;
+                        } else if (fast_o_b) {
+                            v.width = OL;  // the whole K in one GEMM
+                            m.fast(&v, 1U, n, nullptr, 0U, m.o_low.p, st);
                         } else {
                             for (std::uint32_t part = 0; part < 2U; ++part) {
                                 v.k_offset = part * (OL / 2U);
                                 v.codes = m.olcodes.p + part * (OL / 2U);
                                 v.deltas = m.oldeltas.p + part * (OL / 2U) / 32U;
                                 v.accumulate = part == 1U;
-                                ds41::enqueue_q8_0_a8_dense_prefill(v, st);
+                                m.dense(v,m.o_low.p+part*(OL/2U),st,fp16_o_b);
                             }
                         }
                     }
@@ -1938,6 +2256,14 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 for (; !tp && chunks_cut < chunks_most; ++chunks_cut) cut(PrefillUnitLevel::finest, s.layer, "attn.pad");
                 close_halves();
                 mark_part(4);
+                for (std::size_t k = 0; k < m.snap_points.size(); ++k) {  // the ring at each in-run snapshot point
+                    auto& ring = m.snap_rings[k * m.options.layers + layer];
+                    check(hipMemcpyAsync(ring.p, L.ring.p, L.ring.n, hipMemcpyDeviceToDevice, st), "snapshot ring");
+                    const std::uint32_t end = m.snap_points[k], first = end > attn::kWindow ? end - attn::kWindow : 0U;
+                    ring_copy_kernel<<<end - first, 160, 0, st>>>(reinterpret_cast<const std::uint32_t*>(m.prefill_ring.p), m.prefill_capacity,
+                                                                  reinterpret_cast<std::uint32_t*>(ring.p), AttentionHost::ring_capacity, first);
+                    check(hipGetLastError(), "snapshot ring copy");
+                }
                 {
                     const std::uint32_t end = P0 + T, first = end > attn::kWindow ? end - attn::kWindow : 0U;
                     ring_copy_kernel<<<end - first, 160, 0, st>>>(reinterpret_cast<const std::uint32_t*>(m.prefill_ring.p), m.prefill_capacity,
@@ -1956,6 +2282,41 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             m.cur = next;
             if (s.site == "ffn") {
                 m.identity_pre = false;
+                if (m.options.null_ulp_layer == static_cast<int>(layer) && no > 0U) {
+                    const std::size_t count = std::size_t{no} * stream_row;
+                    ulp_flip_kernel<<<static_cast<unsigned>((count + 255U) / 256U), 256, 0, st>>>(stream_now() + std::size_t{o0} * stream_row, count,
+                                                                                     m.options.null_seed);
+                    check(hipGetLastError(), "ulp flip");
+                }
+                if (m.options.trace) {
+                    PrefillLayerTrace t;
+                    t.router_ids = std::move(trace_router);
+                    trace_router.clear();
+                    if (m.roles[layer].owns_index) {
+                        const auto idx = download(m.attn[layer].idx.p, std::size_t{Tn} * attn::kTopK, st);
+                        const auto cnt = download(m.attn[layer].idx_count.p, Tn, st);
+                        t.index_sets.resize(Tn);
+                        for (std::uint32_t r = 0; r < Tn; ++r) {
+                            std::uint64_t h = 0;
+                            const std::uint32_t k = std::min<std::uint32_t>(cnt[r], attn::kTopK);
+                            for (std::uint32_t j = 0; j < k; ++j) {
+                                std::uint64_t x = idx[std::size_t{r} * attn::kTopK + j] + 0x9E3779B97F4A7C15ULL;
+                                x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+                                x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+                                h += x ^ (x >> 31);
+                            }
+                            t.index_sets[r] = h ^ (std::uint64_t{k} << 48);
+                        }
+                    }
+                    if (no > 0U) {
+                        row_hash_kernel<<<no, 256, 0, st>>>(stream_now() + std::size_t{o0} * stream_row, stream_row, m.trace_hash.p);
+                        check(hipGetLastError(), "row hash");
+                        t.row_hashes = download(m.trace_hash.p, no, st);
+                    }
+                    const std::uint32_t tail = std::min(std::max(m.options.quality_head_rows, 1U), Tn);
+                    t.tail = download(stream_now() + std::size_t{Tn - tail} * stream_row, std::size_t{tail} * stream_row, st);
+                    result.trace.push_back(std::move(t));
+                }
                 if (m.options.stream_hashes)  // the last row's stream, on its owner (row_split: 0 on the other rank)
                     result.stream_hashes.push_back(last_local ? fnv_bytes(download(stream_now() + std::size_t{Tn - 1U} * stream_row, stream_row, st).data(),
                                                                           stream_row * 4U)
@@ -1988,6 +2349,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             v.ids = m.ids.p + std::size_t{o0} * K;
             v.weights = m.route_w.p + std::size_t{o0} * K;
             ds41::enqueue_prefill_router(v, st);
+            if (m.options.trace) trace_router = download(m.ids.p + std::size_t{o0} * K, std::size_t{no} * K, st);
             if (split) start_gather();  // the MoE input of this rank's rows is ready; the shared expert runs while it crosses
             if (m.options.routing_loads) {  // per-expert entries of this layer's output rows
                 const auto ids = download(m.ids.p + std::size_t{o0} * K, std::size_t{no} * K, st);
@@ -2189,6 +2551,30 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             break;
         }
         case Op::head: {
+            if(m.options.quality_head_rows>1) {
+                unsigned nr=std::min(m.options.quality_head_rows,Tn),first=Tn-nr;
+                ds41::enqueue_hc_collapse(stream_now()+std::size_t(first)*stream_row,m.identity_pre?nullptr:m.mix_ffn.p+first,nr,H,m.quality_h.p,st);
+                ds41::enqueue_rms_norm(m.quality_h.p,m.devf("output_norm.weight"),nr,H,H,1e-20F,m.quality_h.p,st);
+                ds41::enqueue_quantize_a8(m.quality_h.p,H,nr,m.quality_codes.p,m.quality_deltas.p,m.quality_sums.p,st);
+                ds41::Q8A8DensePrefillView q;
+                q.weight=m.dev("output.weight");q.width=H;q.count=m.head_slice.count;q.codes=m.quality_codes.p;q.deltas=m.quality_deltas.p;
+                q.rows=nr;q.x_stride=H;q.out_stride=q.count;q.out=m.quality_logits.p;
+                ds41::enqueue_q8_0_a8_dense_prefill(q,st);
+                auto own=download(q.out,std::size_t(nr)*q.count,st);
+                result.teacher_logits.assign(std::size_t(nr)*c.vocab_size,0);
+                std::vector<float> other;
+                auto sl=ds41::vocab_slice(c.vocab_size,2U,1U-m.options.rank);
+                if(m.distributed()) {
+                    m.options.communicator->exchange(st,q.out,m.quality_logits.p+std::size_t(nr)*q.count,std::size_t(nr)*q.count*4U,
+                        dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control),4U,T-1U});
+                    other=download(m.quality_logits.p+std::size_t(nr)*q.count,std::size_t(nr)*sl.count,st);
+                }
+                for(unsigned r=0;r<nr;++r) {
+                    std::copy_n(own.data()+std::size_t(r)*q.count,q.count,result.teacher_logits.data()+std::size_t(r)*c.vocab_size+m.head_slice.first);
+                    if(m.distributed())std::copy_n(other.data()+std::size_t(r)*sl.count,sl.count,result.teacher_logits.data()+std::size_t(r)*c.vocab_size+sl.first);
+                }
+            }
+
             const std::size_t last = Tn - 1U;  // the last row, local on its owner
             if (last_local) {
                 ds41::enqueue_hc_collapse(stream_now() + last * stream_row, m.identity_pre ? nullptr : m.mix_ffn.p + last, 1, H, m.h.p, st);
@@ -2275,6 +2661,14 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     m.rows_done = P0 + T;
     m.local_rows_done = Tn;
     m.last_row_local = last_local;
+#ifdef STRIX_DS41_PREFILL_FP16_LT
+    if (m.fast_used) {
+        // FP16 output form: no value of this run may have left the FP16 range (checked after the timed run)
+        m.fast_used = false;
+        if (const unsigned bad = m.dense_fp16.take_nonfinite(m.stream); bad != 0U)
+            throw std::runtime_error("FP16 output form: " + std::to_string(bad) + " non-finite projection outputs");
+    }
+#endif
     result.seconds = seconds_since(t_run);
     return result;
 }
@@ -2434,6 +2828,45 @@ AttentionState DevicePrefill::export_state() const {
                 S.topk = download(L.idx.p + std::size_t{last} * attn::kTopK, count, m.stream);
             }
         }
+    }
+    return s;
+}
+
+void DevicePrefill::set_snapshot_points(std::vector<std::uint32_t> positions) {
+    if (impl_->task != nullptr) throw std::logic_error("deepseek41 prefill: a task is in progress");
+    std::sort(positions.begin(), positions.end());
+    positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
+    impl_->snap_next = std::move(positions);
+}
+
+AttentionState DevicePrefill::export_state_at(std::uint32_t position) const {
+    const auto& m = *impl_;
+    namespace attn = ds41::attn;
+    const auto it = std::find(m.snap_points.begin(), m.snap_points.end(), position);
+    if (it == m.snap_points.end() || position > m.rows_done)
+        throw std::invalid_argument("deepseek41 prefill: export_state_at: not a snapshot point of the last run");
+    const std::size_t k = static_cast<std::size_t>(it - m.snap_points.begin());
+    AttentionState s;
+    s.position = position;
+    s.layers.resize(m.options.layers);
+    for (std::uint32_t l = 0; l < m.options.layers; ++l) {
+        const auto& r = m.roles[l];
+        const auto& L = m.attn[l];
+        auto& S = s.layers[l];
+        S.owns_kv = r.owns_kv;
+        S.owns_index = r.owns_index;
+        S.ratio = r.ratio;
+        S.ring = download(m.snap_rings[k * m.options.layers + l].p, L.ring.n, m.stream);
+        if (r.owns_kv) {
+            const std::size_t entries = position / r.ratio;
+            S.kv = download(L.kv_cache.p, entries * attn::kKvEntryBytes, m.stream);
+            S.idx_keys = download(L.idx_cache.p, entries * attn::kIdxEntryBytes, m.stream);
+            if (r.ratio == 2U) {  // after an odd last row no group is pending: the compressor leaves zeros, invalid
+                S.carry.assign(L.carry[L.carry_cur].n, 0.0F);
+                S.carry_valid = false;
+            }
+        }
+        S.topk_known = !r.owns_index;
     }
     return s;
 }

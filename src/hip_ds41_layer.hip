@@ -1,4 +1,6 @@
+#include "strix/ds41_prefill_tuning.hpp"
 #include "strix/hip_ds41_layer.hpp"
+#include "strix/dist/staged_ready.hpp"
 #include "strix/hip_ds41_f16_rows.hpp"
 #include "strix/hip_ds41_rn_table.hpp"
 #include "strix/hip_ds41_rn_wide.hpp"
@@ -6,10 +8,16 @@
 
 #include "strix/hip_ds41_formats.hpp"
 
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <array>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -208,10 +216,11 @@ __device__ __forceinline__ float norm_input(const float* x, unsigned x_stride, c
 }
 // Normalised value i of row r: weight * (x * rr), then the optional RoPE of the tail (pairs on adjacent
 // lanes), stored to out and/or quantised (the group of 32 is the wave).
-__device__ __forceinline__ void norm_emit(const NormView& v, float* out, std::int8_t* __restrict__ codes, float* __restrict__ deltas,
-                                          std::int32_t* __restrict__ sums, unsigned r, unsigned i, unsigned group, float x, float rr) {
+__device__ __forceinline__ void norm_emit_weight(const NormView& v, float* out, std::int8_t* __restrict__ codes, float* __restrict__ deltas,
+                                                 std::int32_t* __restrict__ sums, unsigned r, unsigned i, unsigned group, float x, float rr,
+                                                 float weight) {
     const unsigned l = threadIdx.x % wave;
-    float y = v.weight[i] * (x * rr);
+    float y = weight * (x * rr);
     if (v.pairs) {
         const float partner = __shfl_xor(y, 1, wave);
         if (i >= v.rope_offset && i < v.rope_offset + 2U * v.pairs) {
@@ -222,10 +231,15 @@ __device__ __forceinline__ void norm_emit(const NormView& v, float* out, std::in
         }
     }
     if (out) out[static_cast<std::size_t>(r) * v.out_stride + i] = y;
+    if (v.f16) v.f16[static_cast<std::size_t>(r) * v.f16_stride + i] = __half_as_ushort(__float2half_rn(y));
     if (codes) {
         const std::size_t g = static_cast<std::size_t>(r) * (v.a8_stride / 32U) + group;
         a8_group(y, l, codes + static_cast<std::size_t>(r) * v.a8_stride + i, deltas + g, sums + g);
     }
+}
+__device__ __forceinline__ void norm_emit(const NormView& v, float* out, std::int8_t* __restrict__ codes, float* __restrict__ deltas,
+                                          std::int32_t* __restrict__ sums, unsigned r, unsigned i, unsigned group, float x, float rr) {
+    norm_emit_weight(v, out, codes, deltas, sums, r, i, group, x, rr, v.weight[i]);
 }
 __device__ __forceinline__ void collapse_pre(const HcMix* __restrict__ mixes, unsigned r, float* pre) {
 #pragma unroll
@@ -255,6 +269,50 @@ __global__ __launch_bounds__(1024) void norm_kernel(NormView v) {
 #pragma unroll
     for (unsigned k = 0; k < chunk_k; ++k)
         if (k < k_count) norm_emit(v, v.out, v.codes, v.deltas, v.sums, r, c0 + k * wave + l, c0 / 32U + k, y[k], rr);
+}
+
+// STRIX_DS41_NORM_ILP=1 (default off): norm_kernel's values, sums (same order) and stores, with the loads
+// gathered: every x value of the lane's chunk is read before the first add and every weight before the first store (in
+// place, x == out, the compiler may not move a weight load past a store). One row at q_lora_rank 1280 is two waves
+// (chunk 640) and norm_kernel waited on its 20 x loads and 20 weight loads one by one: ~18 us a launch for 5 KB
+// (r1fuse D1 trace), on the R1 critical path once per layer.
+__global__ __launch_bounds__(1024) void norm_ilp_kernel(NormView v) {
+    __shared__ float sums[32];
+    const unsigned c = threadIdx.x / wave, l = threadIdx.x % wave, r = blockIdx.x, n = v.n;
+    const unsigned chunks = blockDim.x / wave, c0 = c * chunk, len = c0 + chunk < n ? chunk : n - c0, k_count = len / wave;
+    float y[chunk_k], w[chunk_k];
+    float pre[hc_copies];
+    collapse_pre(v.mixes, r, pre);
+    if (k_count == chunk_k) {
+#pragma unroll
+        for (unsigned k = 0; k < chunk_k; ++k) y[k] = norm_input(v.x, v.x_stride, v.hc_stream, n, r, c0 + k * wave + l, pre);
+#pragma unroll
+        for (unsigned k = 0; k < chunk_k; ++k) w[k] = v.weight[c0 + k * wave + l];
+    } else {
+#pragma unroll
+        for (unsigned k = 0; k < chunk_k; ++k)
+            if (k < k_count) y[k] = norm_input(v.x, v.x_stride, v.hc_stream, n, r, c0 + k * wave + l, pre);
+#pragma unroll
+        for (unsigned k = 0; k < chunk_k; ++k)
+            if (k < k_count) w[k] = v.weight[c0 + k * wave + l];
+    }
+    float acc = 0.0F;
+#pragma unroll
+    for (unsigned k = 0; k < chunk_k; ++k)
+        if (k < k_count) acc = acc + y[k] * y[k];
+    acc = butterfly(acc);
+    if (l == 0) sums[c] = acc;
+    __syncthreads();
+    float total = 0.0F;
+    for (unsigned j = 0; j < chunks; ++j) total = total + sums[j];
+    const float rr = declared_rsqrt(total / static_cast<float>(n) + v.eps);
+#pragma unroll
+    for (unsigned k = 0; k < chunk_k; ++k)
+        if (k < k_count) norm_emit_weight(v, v.out, v.codes, v.deltas, v.sums, r, c0 + k * wave + l, c0 / 32U + k, y[k], rr, w[k]);
+}
+bool norm_ilp_enabled() {
+    static const bool on = [] { const char* e = std::getenv("STRIX_DS41_NORM_ILP"); return e && *e == '1'; }();
+    return on;
 }
 
 // Few rows, out not overlapping the input: block (c, r) recomputes the row's sum of squares exactly as
@@ -936,6 +994,13 @@ template <unsigned MaxRows, unsigned W, unsigned P = 0>
 __global__ __launch_bounds__(32 * q8_waves) void q8_0_a8_kernel(Q8A8View v) {
     q8_0_a8_body<MaxRows, W, P>(v, v.weight, v.codes, v.deltas, v.out, blockIdx.x);
 }
+template <unsigned MaxRows, unsigned W, unsigned P = 0>
+__global__ __launch_bounds__(32 * q8_waves) void q8_0_a8_ready_kernel(Q8A8View v, dist::ProducerStage stage) {
+    q8_0_a8_body<MaxRows, W, P>(v, v.weight, v.codes, v.deltas, v.out, blockIdx.x);
+    // Body returns (including padding waves) reconverge here. Every lane
+    // releases its own stores before the last block publishes the TX token.
+    dist::publish_staged_view(stage, gridDim.x);
+}
 // Two sites in one launch: the first a_blocks blocks are site a's, the rest site b's (each output the bits of its own launch).
 template <unsigned MaxRows, unsigned W, unsigned P = 0>
 __global__ __launch_bounds__(32 * q8_waves) void q8_0_a8_pair_kernel(Q8A8View a, Q8A8View b, unsigned a_blocks) {
@@ -1027,6 +1092,11 @@ __device__ __forceinline__ void q8_0_a8_staged_body(const Q8A8View& v, const std
 template <unsigned P = 0>
 __global__ __launch_bounds__(32 * q8_waves) void q8_0_a8_staged_kernel(Q8A8View v) {
     q8_0_a8_staged_body<P>(v, v.weight, v.codes, v.deltas, v.out);
+}
+template <unsigned P = 0>
+__global__ __launch_bounds__(32 * q8_waves) void q8_0_a8_staged_ready_kernel(Q8A8View v, dist::ProducerStage stage) {
+    q8_0_a8_staged_body<P>(v, v.weight, v.codes, v.deltas, v.out);
+    dist::publish_staged_view(stage, gridDim.x);
 }
 
 // ---- native FP8 x A8 sites (ds41_native_fp8.hpp) --------------------------------------------------
@@ -1190,29 +1260,29 @@ constexpr unsigned wide_waves = 4, wide_outs = 2, wide_classes = 32 / wide_waves
 // takes its eight row deltas with two 16-byte reads per group instead of eight cross-lane reads per output tile. The
 // group term keeps its operations and order (float(dot) * (scale * delta), then the add), unfused: the same bits.
 constexpr int wide_magic = 0x4b400000;
-template <bool Staged>
+template <bool Staged, unsigned Outputs = wide_outs>
 __device__ __forceinline__ void q8_wide_body(const Q8A8DensePrefillView& v, const std::uint8_t* __restrict__ weight,
                                              const std::int8_t* __restrict__ codes, const float* __restrict__ deltas,
                                              float* __restrict__ out) {
-    __shared__ float part[wide_waves][wide_outs][8][32];
+    __shared__ float part[wide_waves][Outputs][8][32];
     __shared__ float4 dsh[Staged ? 32U : 1U][2][2];  // [group of the chunk][h][e / 4] = deltas of rows 2e + h
     const unsigned w = threadIdx.x / wave, l = threadIdx.x % wave, h = l >> 4U, lo = l & 15U;
-    const unsigned row = blockIdx.x * 16U + lo, o0 = blockIdx.y * (16U * wide_outs);
+    const unsigned row = blockIdx.x * 16U + lo, o0 = blockIdx.y * (16U * Outputs);
     const unsigned groups = v.width / 32U, row_bytes = (v.row_width ? v.row_width : v.width) / 32U * 34U;
     const bool live = row < v.rows;
     const signed char* arow = reinterpret_cast<const signed char*>(codes) + static_cast<std::size_t>(live ? row : 0U) * v.x_stride;
     const float* drow = deltas + static_cast<std::size_t>(live ? row : 0U) * (v.x_stride / 32U);
-    const std::uint8_t* wrow[wide_outs];
+    const std::uint8_t* wrow[Outputs];
 #pragma unroll
-    for (unsigned t = 0; t < wide_outs; ++t) {
+    for (unsigned t = 0; t < Outputs; ++t) {
         const unsigned o = o0 + t * 16U + lo;
         wrow[t] = weight + v.k_offset / 32U * 34U + static_cast<std::size_t>(o < v.count ? o : v.count - 1U) * row_bytes;
     }
-    float acc[wide_classes][wide_outs][8];
+    float acc[wide_classes][Outputs][8];
 #pragma unroll
     for (unsigned j = 0; j < wide_classes; ++j)
 #pragma unroll
-        for (unsigned t = 0; t < wide_outs; ++t)
+        for (unsigned t = 0; t < Outputs; ++t)
 #pragma unroll
             for (unsigned e = 0; e < 8; ++e) acc[j][t][e] = 0.0F;
     const v8i zero{0, 0, 0, 0, 0, 0, 0, 0};
@@ -1247,7 +1317,7 @@ __device__ __forceinline__ void q8_wide_body(const Q8A8DensePrefillView& v, cons
                 rd[0] = d0.x; rd[1] = d0.y; rd[2] = d0.z; rd[3] = d0.w; rd[4] = d1.x; rd[5] = d1.y; rd[6] = d1.z; rd[7] = d1.w;
             }
 #pragma unroll
-            for (unsigned t = 0; t < wide_outs; ++t) {
+            for (unsigned t = 0; t < Outputs; ++t) {
                 const Q8Raw raw = load_q8(wrow[t], g);
                 const v4i b0{raw.q[0], raw.q[1], raw.q[2], raw.q[3]}, b1{raw.q[4], raw.q[5], raw.q[6], raw.q[7]};
                 const float scale = f16_to_float(raw.d);
@@ -1267,7 +1337,7 @@ __device__ __forceinline__ void q8_wide_body(const Q8A8DensePrefillView& v, cons
         }
     }
 #pragma unroll
-    for (unsigned t = 0; t < wide_outs; ++t)
+    for (unsigned t = 0; t < Outputs; ++t)
 #pragma unroll
         for (unsigned e = 0; e < 8; ++e) {
             const float s = ((acc[0][t][e] + acc[4][t][e]) + (acc[2][t][e] + acc[6][t][e])) +
@@ -1275,21 +1345,245 @@ __device__ __forceinline__ void q8_wide_body(const Q8A8DensePrefillView& v, cons
             part[w][t][e][l] = s;
         }
     __syncthreads();
-    // Wave w writes output tile t = w / 2, elements e = 4 (w % 2) .. + 3.
-    const unsigned t = w / 2U, o = o0 + t * 16U + lo;
+    if constexpr (Outputs == 2U) {
+        const unsigned t = w / 2U, o = o0 + t * 16U + lo;
 #pragma unroll
-    for (unsigned q = 0; q < 4; ++q) {
-        const unsigned e = 4U * (w % 2U) + q, r = blockIdx.x * 16U + 2U * e + h;
-        const float y = (part[0][t][e][l] + part[2][t][e][l]) + (part[1][t][e][l] + part[3][t][e][l]);
+        for (unsigned q = 0; q < 4; ++q) {
+            const unsigned e = 4U * (w % 2U) + q, r = blockIdx.x * 16U + 2U * e + h;
+            const float y = (part[0][t][e][l] + part[2][t][e][l]) + (part[1][t][e][l] + part[3][t][e][l]);
+            if (o < v.count && r < v.rows) {
+                float* dst = out + static_cast<std::size_t>(r) * v.out_stride + o;
+                *dst = v.accumulate ? *dst + y : y;
+            }
+        }
+    } else {
+    // Disjoint stores of the tile. The reduction for each element is unchanged.
+    for (unsigned item = threadIdx.x; item < Outputs * 8U * 32U; item += 32U * wide_waves) {
+        const unsigned t = item / (8U * 32U), e = (item / 32U) % 8U, lane = item % 32U;
+        const unsigned o = o0 + t * 16U + (lane & 15U), r = blockIdx.x * 16U + 2U * e + (lane >> 4U);
+        const float y = (part[0][t][e][lane] + part[2][t][e][lane]) + (part[1][t][e][lane] + part[3][t][e][lane]);
         if (o < v.count && r < v.rows) {
             float* dst = out + static_cast<std::size_t>(r) * v.out_stride + o;
             *dst = v.accumulate ? *dst + y : y;
         }
     }
+    }
 }
-template <bool Staged>
+template <bool Staged, unsigned Outputs = wide_outs>
 __global__ __launch_bounds__(32 * wide_waves) void q8_0_a8_wide_kernel(Q8A8DensePrefillView v) {
-    q8_wide_body<Staged>(v, v.weight, v.codes, v.deltas, v.out);
+    q8_wide_body<Staged, Outputs>(v, v.weight, v.codes, v.deltas, v.out);
+}
+
+// Tall form (STRIX_DS41_DENSE_TALL=RT OT, opt-in): the staged form's group terms and tree, bit for bit, on larger
+// tiles: a block of 8 waves owns RT x OT tiles of 16 x 16 (16 RT rows x 16 OT outputs), so a weight block read by a
+// wave serves RT row tiles and an activation block OT output tiles. Wave v owns classes v, v + 8, v + 16, v + 24 (group
+// 32 s + v + 8 j adds to its accumulator j, ascending as before). Tree: t_v = (c_v + c_v+16) + (c_v+8 + c_v+24) in the
+// wave (the staged form's levels 16 and 8), then through LDS S_w = t_w + t_w+4 (level 4) and (S0 + S2) + (S1 + S3).
+constexpr unsigned tall_waves = 8;
+// ColFirst (forms 112 / 114): blockIdx.x walks the output tiles and blockIdx.y the row tiles, so consecutive blocks share
+// their activation rows (with many rows, row-fastest order re-reads activations larger than the L2 from DRAM once per
+// column tile). Only the block order changes: every output keeps its bits.
+// Lean (forms 2xx / 3xx with ColFirst): the magic accumulator init made opaque once, so it stays in eight VGPRs instead of
+// being rebuilt from scalars before every WMMA pair, and the weight scale by the branchless f16_to_float_select (the
+// same bits for every half, NaN payloads included). Only instruction selection changes: every output keeps its bits.
+// Lean >= 2 (forms 4xx / 5xx with ColFirst): also no zeroing or predicates on the activation loads (rows past the end
+// read the clamped row 0; their outputs are never stored, and every stored output depends on its own row only), the
+// activation codes by raw buffer loads (scalar base, 32-bit offsets: no 64-bit address math per row and group), and the
+// delta staging with the row clamped instead of predicated.
+// Lean >= 3 (forms 6xx): also the weight records by raw buffer loads (32-bit offsets) and the scale by the hardware
+// v_cvt_f32_f16, which equals f16_to_float for every non-NaN half (device check: --conv); a NaN scale (never in a valid
+// Q8_0 tensor) would keep NaN but may lose its payload bits.
+// Lean >= 4 (forms 8xx / 914 with ColFirst; 422 / 822 are the 2x2 tile at Lean 2 / 4): Lean 3 with every weight record
+// of a group loaded before its first WMMA. Lean 5 (forms 15xx / 16xx with ColFirst): Lean 4 with opaque f32 scales.
+// Lean 6 (forms 17xx / 18xx with ColFirst): Lean 5 with each group's weight records loaded one group ahead (the first
+// group before the chunk loop, the next one before this group's WMMAs; never past the last group).
+// k6: Lean 5/6 issue fewer VALU but run slower: the opaque scale consumes the loaded half at the load, so each tile waits
+// vmcnt before the next tile's loads issue (the Lean 3 serialization again). Lean 7 (forms 19xx / 20xx with ColFirst) and
+// Lean 8 (forms 21xx / 22xx with ColFirst) are Lean 5 / 6 with the scale made opaque at its use instead, after the
+// tile's WMMA pair (the asm also takes the WMMA result, so it cannot be scheduled before it; it is not volatile, so the
+// deltas are not re-read from LDS for every tile).
+template <unsigned RT, unsigned OT, bool ColFirst = false, unsigned Lean = 0>
+__global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8DensePrefillView v) {
+    __shared__ float part[tall_waves][RT * OT][8][32];
+    __shared__ float4 dsh[RT][32][2][2];
+    const unsigned w = threadIdx.x / wave, l = threadIdx.x % wave, h = l >> 4U, lo = l & 15U;
+    const unsigned r0 = (ColFirst ? blockIdx.y : blockIdx.x) * 16U * RT, o0 = (ColFirst ? blockIdx.x : blockIdx.y) * 16U * OT;
+    const unsigned groups = v.width / 32U, row_bytes = (v.row_width ? v.row_width : v.width) / 32U * 34U;
+    const signed char* arow[RT];
+    bool live[RT];
+#pragma unroll
+    for (unsigned rt = 0; rt < RT; ++rt) {
+        const unsigned row = r0 + rt * 16U + lo;
+        live[rt] = row < v.rows;
+        arow[rt] = reinterpret_cast<const signed char*>(v.codes) + static_cast<std::size_t>(live[rt] ? row : 0U) * v.x_stride;
+    }
+    const std::uint8_t* wrow[OT];
+#pragma unroll
+    for (unsigned t = 0; t < OT; ++t) {
+        const unsigned o = o0 + t * 16U + lo;
+        wrow[t] = v.weight + v.k_offset / 32U * 34U + static_cast<std::size_t>(o < v.count ? o : v.count - 1U) * row_bytes;
+    }
+    float acc[4][RT][OT][8];
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j)
+#pragma unroll
+        for (unsigned rt = 0; rt < RT; ++rt)
+#pragma unroll
+            for (unsigned t = 0; t < OT; ++t)
+#pragma unroll
+                for (unsigned e = 0; e < 8; ++e) acc[j][rt][t][e] = 0.0F;
+    v8i magic{wide_magic, wide_magic, wide_magic, wide_magic, wide_magic, wide_magic, wide_magic, wide_magic};
+    if constexpr (Lean >= 1) asm volatile("" : "+v"(magic));
+    // Lean >= 2: the activation codes as a buffer (raw, stride 0, offsets in bytes) and each row's byte offset
+    const std::size_t abytes = static_cast<std::size_t>(v.rows) * v.x_stride;
+    [[maybe_unused]] const __amdgpu_buffer_rsrc_t abuf = __builtin_amdgcn_make_buffer_rsrc(
+        const_cast<std::int8_t*>(v.codes), static_cast<short>(0), (abytes < 0x7fffffffU ? abytes : std::size_t{0x7fffffffU}), 0x31004000);
+    [[maybe_unused]] unsigned aoff[RT];
+#pragma unroll
+    for (unsigned rt = 0; rt < RT; ++rt) {
+        const unsigned row = r0 + rt * 16U + lo;
+        aoff[rt] = (row < v.rows ? row : 0U) * v.x_stride;
+    }
+    // Lean >= 3: the weight tensor as a buffer and each output row's byte offset (K-offset included)
+    const std::size_t wbytes = static_cast<std::size_t>(v.count) * row_bytes;
+    [[maybe_unused]] const __amdgpu_buffer_rsrc_t wbuf = __builtin_amdgcn_make_buffer_rsrc(
+        const_cast<std::uint8_t*>(v.weight), static_cast<short>(0), (wbytes < 0x7fffffffU ? wbytes : std::size_t{0x7fffffffU}), 0x31004000);
+    [[maybe_unused]] unsigned woff[OT];
+#pragma unroll
+    for (unsigned t = 0; t < OT; ++t) {
+        const unsigned o = o0 + t * 16U + lo;
+        woff[t] = (o < v.count ? o : v.count - 1U) * row_bytes + v.k_offset / 32U * 34U;
+    }
+    // Lean >= 4: one group's weight records (OT tiles) as WMMA operands and f32 scales; Lean >= 5 keeps each scale an
+    // opaque f32 VGPR, so the scale products are plain v_mul_f32 (dual-issuable) instead of v_fma_mix with the f16 scale.
+    [[maybe_unused]] const auto load_w = [&](unsigned gg, v4i (&b0)[OT], v4i (&b1)[OT], float (&sc)[OT]) {
+#pragma unroll
+        for (unsigned t = 0; t < OT; ++t) {
+            const int off = static_cast<int>(woff[t] + 34U * gg);
+            const auto dw16 = __builtin_amdgcn_raw_buffer_load_b16(wbuf, off, 0, 0);
+            const auto q0 = __builtin_amdgcn_raw_buffer_load_b128(wbuf, off + 2, 0, 0);
+            const auto q1 = __builtin_amdgcn_raw_buffer_load_b128(wbuf, off + 18, 0, 0);
+            b0[t] = v4i{static_cast<int>(q0[0]), static_cast<int>(q0[1]), static_cast<int>(q0[2]), static_cast<int>(q0[3])};
+            b1[t] = v4i{static_cast<int>(q1[0]), static_cast<int>(q1[1]), static_cast<int>(q1[2]), static_cast<int>(q1[3])};
+            sc[t] = static_cast<float>(__builtin_bit_cast(_Float16, static_cast<unsigned short>(dw16)));
+            if constexpr (Lean == 5 || Lean == 6) asm volatile("" : "+v"(sc[t]));
+        }
+    };
+    [[maybe_unused]] v4i pb0[OT], pb1[OT];
+    [[maybe_unused]] float pscale[OT];
+    if constexpr (Lean == 6 || Lean == 8)
+        if (w < groups) load_w(w, pb0, pb1, pscale);
+    for (unsigned s0 = 0; s0 < groups; s0 += 32U) {
+        __syncthreads();  // the previous chunk's deltas are read
+        auto* d = reinterpret_cast<float*>(dsh);
+        for (unsigned i = threadIdx.x; i < RT * 32U * 16U; i += 32U * tall_waves) {
+            const unsigned rt = i / 512U, gl = (i / 16U) % 32U, rr = i % 16U, r = r0 + rt * 16U + rr, g = s0 + gl;
+            if constexpr (Lean >= 2)
+                d[((rt * 32U + gl) * 2U + (rr & 1U)) * 8U + (rr >> 1U)] =
+                    g < groups ? v.deltas[static_cast<std::size_t>(r < v.rows ? r : 0U) * (v.x_stride / 32U) + g] : 0.0F;
+            else
+                d[((rt * 32U + gl) * 2U + (rr & 1U)) * 8U + (rr >> 1U)] =
+                    r < v.rows && g < groups ? v.deltas[static_cast<std::size_t>(r) * (v.x_stride / 32U) + g] : 0.0F;
+        }
+        __syncthreads();
+#pragma unroll
+        for (unsigned j = 0; j < 4; ++j) {
+            const unsigned g = s0 + w + 8U * j;
+            if (g >= groups) continue;
+            v4i a0[RT], a1[RT];
+#pragma unroll
+            for (unsigned rt = 0; rt < RT; ++rt) {
+                if constexpr (Lean >= 2) {
+                    const auto x0 = __builtin_amdgcn_raw_buffer_load_b128(abuf, static_cast<int>(aoff[rt] + 32U * g), 0, 0);
+                    const auto x1 = __builtin_amdgcn_raw_buffer_load_b128(abuf, static_cast<int>(aoff[rt] + 32U * g + 16U), 0, 0);
+                    a0[rt] = v4i{static_cast<int>(x0[0]), static_cast<int>(x0[1]), static_cast<int>(x0[2]), static_cast<int>(x0[3])};
+                    a1[rt] = v4i{static_cast<int>(x1[0]), static_cast<int>(x1[1]), static_cast<int>(x1[2]), static_cast<int>(x1[3])};
+                    continue;
+                }
+                a0[rt] = v4i{0, 0, 0, 0};
+                a1[rt] = v4i{0, 0, 0, 0};
+                if (live[rt]) {
+                    const auto* x = reinterpret_cast<const int4*>(arow[rt] + 32U * g);
+                    const int4 x0 = x[0], x1 = x[1];
+                    a0[rt] = v4i{x0.x, x0.y, x0.z, x0.w};
+                    a1[rt] = v4i{x1.x, x1.y, x1.z, x1.w};
+                }
+            }
+            // Lean >= 4: every weight record of the chunk issued before the first WMMA (Lean 3 left each tile's buffer loads
+            // next to its WMMA pair, waiting vmcnt(0) per tile).
+            [[maybe_unused]] v4i wb0[OT], wb1[OT];
+            [[maybe_unused]] float wscale[OT];
+            if constexpr (Lean == 6 || Lean == 8) {
+                // Lean 6 / 8: this group's records were loaded one group ahead; issue the next group's now
+#pragma unroll
+                for (unsigned t = 0; t < OT; ++t) {
+                    wb0[t] = pb0[t];
+                    wb1[t] = pb1[t];
+                    wscale[t] = pscale[t];
+                }
+                const unsigned gn = j < 3U ? g + 8U : s0 + 32U + w;
+                if (gn < groups) load_w(gn, pb0, pb1, pscale);
+            } else if constexpr (Lean >= 4) {
+                load_w(g, wb0, wb1, wscale);
+            }
+#pragma unroll
+            for (unsigned t = 0; t < OT; ++t) {
+                v4i b0, b1;
+                float scale;
+                if constexpr (Lean >= 4) {
+                    b0 = wb0[t];
+                    b1 = wb1[t];
+                    scale = wscale[t];
+                } else if constexpr (Lean >= 3) {
+                    const int off = static_cast<int>(woff[t] + 34U * g);
+                    const auto dw16 = __builtin_amdgcn_raw_buffer_load_b16(wbuf, off, 0, 0);
+                    const auto q0 = __builtin_amdgcn_raw_buffer_load_b128(wbuf, off + 2, 0, 0);
+                    const auto q1 = __builtin_amdgcn_raw_buffer_load_b128(wbuf, off + 18, 0, 0);
+                    b0 = v4i{static_cast<int>(q0[0]), static_cast<int>(q0[1]), static_cast<int>(q0[2]), static_cast<int>(q0[3])};
+                    b1 = v4i{static_cast<int>(q1[0]), static_cast<int>(q1[1]), static_cast<int>(q1[2]), static_cast<int>(q1[3])};
+                    scale = static_cast<float>(__builtin_bit_cast(_Float16, static_cast<unsigned short>(dw16)));
+                } else {
+                    const Q8Raw raw = load_q8(wrow[t], g);
+                    b0 = v4i{raw.q[0], raw.q[1], raw.q[2], raw.q[3]};
+                    b1 = v4i{raw.q[4], raw.q[5], raw.q[6], raw.q[7]};
+                    scale = Lean >= 1 ? f16_to_float_select(raw.d) : f16_to_float(raw.d);
+                }
+#pragma unroll
+                for (unsigned rt = 0; rt < RT; ++rt) {
+                    const float4 d0 = dsh[rt][g - s0][h][0], d1 = dsh[rt][g - s0][h][1];
+                    const float rd[8] = {d0.x, d0.y, d0.z, d0.w, d1.x, d1.y, d1.z, d1.w};
+                    v8i c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0[rt], true, b0, magic, false);
+                    c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1[rt], true, b1, c, false);
+                    float sc = scale;
+                    if constexpr (Lean >= 7) asm("" : "+v"(sc) : "v"(c[0]));  // not volatile: no barrier for the LDS reads
+#pragma unroll
+                    for (unsigned e = 0; e < 8; ++e) {
+                        const float dot = __fsub_rn(__int_as_float(c[e]), 0x1.8p23F);
+                        acc[j][rt][t][e] = __fadd_rn(acc[j][rt][t][e], __fmul_rn(dot, __fmul_rn(sc, rd[e])));
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned rt = 0; rt < RT; ++rt)
+#pragma unroll
+        for (unsigned t = 0; t < OT; ++t)
+#pragma unroll
+            for (unsigned e = 0; e < 8; ++e)
+                part[w][rt * OT + t][e][l] = (acc[0][rt][t][e] + acc[2][rt][t][e]) + (acc[1][rt][t][e] + acc[3][rt][t][e]);
+    __syncthreads();
+    for (unsigned i = threadIdx.x; i < RT * OT * 8U * 32U; i += 32U * tall_waves) {
+        const unsigned ln = i % 32U, e = (i / 32U) % 8U, tile = i / 256U, rt = tile / OT, t = tile % OT;
+        const unsigned o = o0 + t * 16U + (ln & 15U), r = r0 + rt * 16U + 2U * e + (ln >> 4U);
+        const float s0 = part[0][tile][e][ln] + part[4][tile][e][ln], s1 = part[1][tile][e][ln] + part[5][tile][e][ln];
+        const float s2 = part[2][tile][e][ln] + part[6][tile][e][ln], s3 = part[3][tile][e][ln] + part[7][tile][e][ln];
+        const float y = (s0 + s2) + (s1 + s3);
+        if (o < v.count && r < v.rows) {
+            float* dst = v.out + static_cast<std::size_t>(r) * v.out_stride + o;
+            *dst = v.accumulate ? *dst + y : y;
+        }
+    }
 }
 
 __device__ __forceinline__ void f16_rows_body(const F16RowsView& v, const std::uint16_t* __restrict__ weight,
@@ -1724,6 +2018,7 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
 void enqueue_norm(const NormView& v, void* stream) {
     const unsigned chunks = (v.n + chunk - 1U) / chunk;
     require(v.weight && v.rows && v.n && v.n % 32U == 0 && chunks <= 32U && (v.x || v.hc_stream) && (v.out || v.codes) &&
+                (!v.f16 || v.f16_stride >= v.n) &&
                 (!v.out || v.out_stride >= v.n) && (!v.x || v.x_stride >= v.n) &&
                 (!v.codes || (v.deltas && v.sums && v.a8_stride >= v.n && v.a8_stride % 32U == 0)) &&
                 (!v.pairs || (v.rope_cos && v.rope_sin && v.positions && v.rope_offset % 2U == 0 && v.rope_offset + 2U * v.pairs <= v.n)),
@@ -1736,6 +2031,8 @@ void enqueue_norm(const NormView& v, void* stream) {
                        !overlap(in, in_bytes, v.codes, v.codes ? std::size_t{v.rows} * v.a8_stride : 0);
     if (v.rows <= 8U && chunks > 1U && apart)
         hipLaunchKernelGGL(norm_split_kernel, dim3(chunks, v.rows), dim3(wave * chunks), 0, as_stream(stream), v);
+    else if (norm_ilp_enabled())
+        hipLaunchKernelGGL(norm_ilp_kernel, dim3(v.rows), dim3(wave * chunks), 0, as_stream(stream), v);
     else
         hipLaunchKernelGGL(norm_kernel, dim3(v.rows), dim3(wave * chunks), 0, as_stream(stream), v);
     check(hipGetLastError(), "norm launch");
@@ -1917,6 +2214,62 @@ void enqueue_q8_0_a8(const Q8A8View& v, void* stream) {
     check(hipGetLastError(), "Q8_0 x A8 launch");
 }
 
+namespace {
+template <unsigned R, unsigned W, unsigned P>
+void launch_q8_ready(const Q8A8View& v, dist::ProducerStage stage, hipStream_t q) {
+    const dim3 grid((v.count + q8_waves * W - 1U) / (q8_waves * W));
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_ready_kernel<R, W, P>), grid, dim3(32 * q8_waves), 0, q, v, stage);
+}
+template <unsigned P>
+void launch_q8_ready_rows(const Q8A8View& v, dist::ProducerStage stage, hipStream_t q) {
+    static const unsigned packed_w = [] {
+        const char* e = std::getenv("STRIX_DS41_PACKED_W");
+        return e && (e[0] == '2' || e[0] == '4') ? unsigned(e[0] - '0') : 1U;
+    }();
+    const bool cap = P != 0U && v.rows <= 2;
+    const bool w4 = v.per_group % 4U == 0 && !(cap && packed_w < 4U);
+    const bool w2 = v.per_group % 2U == 0 && !(cap && packed_w < 2U);
+    if (v.rows == 1) {
+        if (w4) launch_q8_ready<1, 4, P>(v, stage, q);
+        else if (w2) launch_q8_ready<1, 2, P>(v, stage, q);
+        else launch_q8_ready<1, 1, P>(v, stage, q);
+    } else if (v.rows == 2) {
+        if (w4) launch_q8_ready<2, 4, P>(v, stage, q);
+        else if (w2) launch_q8_ready<2, 2, P>(v, stage, q);
+        else launch_q8_ready<2, 1, P>(v, stage, q);
+    } else if (v.rows <= 4) {
+        if (w2) launch_q8_ready<4, 2, P>(v, stage, q);
+        else launch_q8_ready<4, 1, P>(v, stage, q);
+    } else if (v.per_group % q8_staged_outputs == 0 && v.count / q8_staged_outputs >= 32U) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_staged_ready_kernel<P>), dim3((v.count + 31U) / 32U),
+                           dim3(32 * q8_waves), 0, q, v, stage);
+    } else launch_q8_ready<8, 1, P>(v, stage, q);
+}
+}
+
+bool enqueue_q8_0_a8_ready(const Q8A8View& v, dist::ProducerStage stage, void* stream) {
+    require(stage.data == v.out && stage.flag && stage.token, "Q8 x A8 ready producer view");
+    // Publishing only a partial output or A8 from another launch is not supported.
+    if (v.packed == packed_native_fp8 || v.rows > max_rows || v.accumulate || v.a8_codes ||
+        v.a8_deltas || v.a8_sums || v.out_stride != v.count) return false;
+    const auto view = checked_q8_0_a8(v);
+    if (v.rows >= 2) {
+        if (const int mode = rn_wide_mode(); mode != 0) {
+            RnWideShape shape;
+            const bool rn = mode == 2 ? rn_table_select(view, shape) : (shape = rn_wide_default_shape(view), true);
+            if (rn && rn_wide_supported(view, shape))
+                return enqueue_q8_0_a8_rn_ready(view, shape, stage, stream);
+        }
+    }
+    const auto q = as_stream(stream);
+    if (view.packed == 0U) launch_q8_ready_rows<0>(view, stage, q);
+    else if (view.packed == 4U) launch_q8_ready_rows<4>(view, stage, q);
+    else if (view.packed == 5U) launch_q8_ready_rows<5>(view, stage, q);
+    else launch_q8_ready_rows<6>(view, stage, q);
+    check(hipGetLastError(), "Q8 x A8 ready epilogue launch");
+    return true;
+}
+
 void enqueue_q8_0_a8_pair(const Q8A8View& a, const Q8A8View& b, void* stream) {
     if (a.packed == packed_native_fp8 || b.packed == packed_native_fp8) {  // the native FP8 kernel takes one site per launch
         enqueue_q8_0_a8(a, stream);
@@ -2068,18 +2421,344 @@ void enqueue_q8_0_a8_prefill(const Q8A8PrefillView& v, void* stream) {
     enqueue_prefill_down(WeightFormat::q8_0, d, stream);
 }
 
+// Post-order form (tall = 96..99, opt-in): the same group terms, class sums and tree as the staged wide form, bit for
+// bit, on 64 x 64 blocks. Block: 8 waves; wave w owns rows 16 (w & 3) .. +16 and outputs 32 (w >> 2) .. +32 (two
+// 16 x 16 tiles) and walks ALL groups itself, class-major: the classes in the order of the tree (T0 T4 T2 T6 T1 T5 T3
+// T7, with T(v) = (c_v + c_v+16) + (c_v+8 + c_v+24)), each class's groups ascending from +0 as before, and each finished
+// class folds into the tree at once (post-order): S(w) = T(w) + T(w + 4), y = (S0 + S2) + (S1 + S3). At most six partial
+// sums per output are live, instead of the 32 class sums. A chunk of post_chunk groups (in that order) is staged in
+// LDS for the block: activation codes (row stride 48 B), weight codes (one 34-byte block per output and group, read
+// once per block, by dword loads), weight scales as f32 and row deltas, so every operand is read from global memory
+// once per block. Variants (measured against each other, all the same bits):
+//   Prefetch: the next chunk's operands are loaded into registers while the current chunk runs its WMMAs;
+//   Direct: the classes at tree positions 4t and 4t + 2 accumulate straight into the pair partials P and Q (from +0,
+//           the same adds), so a finished class needs no copy.
+constexpr unsigned post_waves = 8, post_chunk = 4, post_row = 48;
+static_assert(post_chunk * 64U == 32U * post_waves, "one weight block and one delta per thread and chunk");
+__device__ __constant__ unsigned char post_class_order[32] = {0,  16, 8,  24, 4, 20, 12, 28, 2, 18, 10, 26, 6, 22, 14, 30,
+                                                             1,  17, 9,  25, 5, 21, 13, 29, 3, 19, 11, 27, 7, 23, 15, 31};
+template <bool Prefetch, bool Direct>
+__global__ __launch_bounds__(32 * post_waves) void q8_0_a8_post_kernel(Q8A8DensePrefillView v) {
+    __shared__ __attribute__((aligned(16))) signed char sa[post_chunk][64][post_row];  // activation codes [group][row]
+    __shared__ __attribute__((aligned(16))) signed char sw[post_chunk][64][post_row];  // weight codes [group][output]
+    __shared__ float ss[post_chunk][64];                                               // weight scales
+    __shared__ __attribute__((aligned(16))) float sd[post_chunk][4][2][8];             // deltas [group][tile][h][e]
+    __shared__ unsigned short order[256];                                              // group of flattened step f
+    __shared__ unsigned char last[256];                                                // step f ends its class
+    const unsigned w = threadIdx.x / wave, l = threadIdx.x % wave, h = l >> 4U, lo = l & 15U;
+    const unsigned rt = w & 3U, cp = w >> 2U;
+    const unsigned r0 = blockIdx.x * 64U, o0 = blockIdx.y * 64U;
+    const unsigned groups = v.width / 32U, row_bytes = (v.row_width ? v.row_width : v.width) / 32U * 34U;
+    if (threadIdx.x == 0) {  // the flattened class-major order (groups <= 256)
+        unsigned f = 0;
+        for (unsigned p = 0; p < 32U; ++p) {
+            const unsigned c = post_class_order[p];
+            for (unsigned g = c; g < groups; g += 32U) {
+                order[f] = static_cast<unsigned short>(g);
+                last[f] = g + 32U >= groups ? static_cast<unsigned char>(1U) : static_cast<unsigned char>(0U);
+                ++f;
+            }
+        }
+    }
+    __syncthreads();
+    // live partials of the tree: cs (class), P, Q (pairs of a T), TA (first T of an S), SA (first S of a half), L (S0+S2)
+    float cs[2][8], P[2][8], Q[2][8], TA[2][8], SA[2][8], L[2][8];
+#pragma unroll
+    for (unsigned t = 0; t < 2; ++t)
+#pragma unroll
+        for (unsigned e = 0; e < 8; ++e) cs[t][e] = P[t][e] = Q[t][e] = TA[t][e] = SA[t][e] = L[t][e] = 0.0F;
+    const v8i magic{wide_magic, wide_magic, wide_magic, wide_magic, wide_magic, wide_magic, wide_magic, wide_magic};
+    unsigned p = 0;  // tree position of the class being summed (uniform across the block)
+    // the finished class (its sum in cs, or with Direct in P / Q at positions 4t / 4t + 2) at tree position p; cs back
+    // to +0, p advances. An empty class (groups < 32) folds as a +0 sum, exactly as its zero class sum did.
+    const auto fold_class = [&]() {
+#pragma unroll
+        for (unsigned t = 0; t < 2; ++t)
+#pragma unroll
+            for (unsigned e = 0; e < 8; ++e) {
+                const float c_ = cs[t][e];
+                switch (p & 3U) {
+                    case 0: if constexpr (!Direct) P[t][e] = c_; break;
+                    case 1: P[t][e] = __fadd_rn(P[t][e], c_); break;
+                    case 2: if constexpr (!Direct) Q[t][e] = c_; break;
+                    default: {
+                        const float T = __fadd_rn(P[t][e], __fadd_rn(Q[t][e], c_));
+                        if constexpr (Direct) P[t][e] = Q[t][e] = 0.0F;  // the next T's pair sums start at +0
+                        if (((p >> 2U) & 1U) == 0U) TA[t][e] = T;
+                        else {
+                            const float S = __fadd_rn(TA[t][e], T);
+                            switch (p >> 3U) {
+                                case 0: SA[t][e] = S; break;
+                                case 1: L[t][e] = __fadd_rn(SA[t][e], S); break;
+                                case 2: SA[t][e] = S; break;
+                                default: L[t][e] = __fadd_rn(L[t][e], __fadd_rn(SA[t][e], S)); break;
+                            }
+                        }
+                    }
+                }
+                cs[t][e] = 0.0F;
+            }
+        ++p;
+    };
+    // Staging (thread i of 256): activation pieces i and i + 256 (group k = piece / 128, row, half), weight block i
+    // (group i / 64, output i % 64), delta i (group i / 64, row i % 64).
+    int4 rx[2];
+    unsigned short rdw = 0;
+    int rq[8];
+    float rdl = 0.0F;
+    const auto load_chunk = [&](unsigned f0) {
+        const unsigned n = groups - f0 < post_chunk ? groups - f0 : post_chunk;
+#pragma unroll
+        for (unsigned j = 0; j < 2; ++j) {
+            const unsigned i = threadIdx.x + j * 256U, k = i / 128U, r = (i / 2U) % 64U, half = i % 2U, row = r0 + r;
+            rx[j] = int4{0, 0, 0, 0};
+            if (k < n && row < v.rows)
+                rx[j] = *reinterpret_cast<const int4*>(reinterpret_cast<const signed char*>(v.codes) + static_cast<std::size_t>(row) * v.x_stride +
+                                                       32U * order[f0 + k] + 16U * half);
+        }
+        const unsigned k = threadIdx.x / 64U, o = threadIdx.x % 64U, out = o0 + o;
+        if (k < n) {
+            // a 34-byte block starts at 4 n (scale aligned, codes at +2: nine dwords realigned by 2 bytes) or at 4 n + 2
+            // (scale alone, codes dword-aligned): only dword loads either way
+            const std::uint8_t* block = v.weight + static_cast<std::size_t>(out < v.count ? out : v.count - 1U) * row_bytes +
+                                        (v.k_offset / 32U + order[f0 + k]) * 34U;
+            if ((reinterpret_cast<std::uintptr_t>(block) & 3U) == 0U) {
+                const auto* u = reinterpret_cast<const unsigned*>(block);
+                unsigned t[9];
+#pragma unroll
+                for (unsigned m = 0; m < 9; ++m) t[m] = u[m];
+                rdw = static_cast<unsigned short>(t[0] & 0xffffU);
+#pragma unroll
+                for (unsigned m = 0; m < 8; ++m) rq[m] = static_cast<int>(__builtin_amdgcn_alignbyte(t[m + 1], t[m], 2U));
+            } else {
+                rdw = *reinterpret_cast<const unsigned short*>(block);
+                const auto* u = reinterpret_cast<const unsigned*>(block + 2);
+#pragma unroll
+                for (unsigned m = 0; m < 8; ++m) rq[m] = static_cast<int>(u[m]);
+            }
+            const unsigned row = r0 + o;
+            rdl = row < v.rows ? v.deltas[static_cast<std::size_t>(row) * (v.x_stride / 32U) + order[f0 + k]] : 0.0F;
+        }
+    };
+    const auto store_chunk = [&](unsigned f0) {
+        const unsigned n = groups - f0 < post_chunk ? groups - f0 : post_chunk;
+#pragma unroll
+        for (unsigned j = 0; j < 2; ++j) {
+            const unsigned i = threadIdx.x + j * 256U, k = i / 128U, r = (i / 2U) % 64U, half = i % 2U;
+            if (k < n) *reinterpret_cast<int4*>(&sa[k][r][16U * half]) = rx[j];
+        }
+        const unsigned k = threadIdx.x / 64U, o = threadIdx.x % 64U;
+        if (k < n) {
+            ss[k][o] = f16_to_float(rdw);
+            *reinterpret_cast<int4*>(&sw[k][o][0]) = int4{rq[0], rq[1], rq[2], rq[3]};
+            *reinterpret_cast<int4*>(&sw[k][o][16]) = int4{rq[4], rq[5], rq[6], rq[7]};
+            (&sd[k][0][0][0])[(o / 16U) * 16U + (o % 2U) * 8U + (o % 16U) / 2U] = rdl;
+        }
+    };
+    if constexpr (Prefetch) load_chunk(0);
+    for (unsigned f0 = 0; f0 < groups; f0 += post_chunk) {
+        __syncthreads();  // the previous chunk is consumed
+        const unsigned n = groups - f0 < post_chunk ? groups - f0 : post_chunk;
+        if constexpr (!Prefetch) load_chunk(f0);
+        store_chunk(f0);
+        __syncthreads();
+        if constexpr (Prefetch)
+            if (f0 + post_chunk < groups) load_chunk(f0 + post_chunk);
+        // the chunk's class ends, once per chunk, as scalars
+        unsigned ends = 0;
+#pragma unroll
+        for (unsigned k = 0; k < post_chunk; ++k)
+            if (k < n) ends |= static_cast<unsigned>(__builtin_amdgcn_readfirstlane(last[f0 + k])) << k;
+#pragma unroll
+        for (unsigned k = 0; k < post_chunk; ++k) {
+            if (k >= n) break;
+            const int4 x0 = *reinterpret_cast<const int4*>(&sa[k][rt * 16U + lo][0]);
+            const int4 x1 = *reinterpret_cast<const int4*>(&sa[k][rt * 16U + lo][16]);
+            const v4i a0{x0.x, x0.y, x0.z, x0.w}, a1{x1.x, x1.y, x1.z, x1.w};
+            const float4 d0 = *reinterpret_cast<const float4*>(&sd[k][rt][h][0]), d1 = *reinterpret_cast<const float4*>(&sd[k][rt][h][4]);
+            const float rd[8] = {d0.x, d0.y, d0.z, d0.w, d1.x, d1.y, d1.z, d1.w};
+            float term[2][8];
+#pragma unroll
+            for (unsigned t = 0; t < 2; ++t) {
+                const unsigned o = cp * 32U + t * 16U + lo;
+                const int4 w0 = *reinterpret_cast<const int4*>(&sw[k][o][0]), w1 = *reinterpret_cast<const int4*>(&sw[k][o][16]);
+                const v4i b0{w0.x, w0.y, w0.z, w0.w}, b1{w1.x, w1.y, w1.z, w1.w};
+                const float scale = ss[k][o];
+                v8i c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, magic, false);
+                c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, c, false);
+#pragma unroll
+                for (unsigned e = 0; e < 8; ++e)
+                    term[t][e] = __fmul_rn(__fsub_rn(__int_as_float(c[e]), 0x1.8p23F), __fmul_rn(scale, rd[e]));
+            }
+            // the group term into the class sum (ascending): with Direct straight into P / Q at positions 4t / 4t + 2
+            const unsigned slot = Direct ? (p & 3U) : 1U;
+#pragma unroll
+            for (unsigned t = 0; t < 2; ++t)
+#pragma unroll
+                for (unsigned e = 0; e < 8; ++e) {
+                    if (slot == 0U) P[t][e] = __fadd_rn(P[t][e], term[t][e]);
+                    else if (slot == 2U) Q[t][e] = __fadd_rn(Q[t][e], term[t][e]);
+                    else cs[t][e] = __fadd_rn(cs[t][e], term[t][e]);
+                }
+            if ((ends >> k) & 1U) {
+                fold_class();
+                while (p < 32U && post_class_order[p] >= groups) fold_class();  // empty classes (groups < 32): +0 sums
+            }
+        }
+    }
+    while (p < 32U) fold_class();
+#pragma unroll
+    for (unsigned t = 0; t < 2; ++t)
+#pragma unroll
+        for (unsigned e = 0; e < 8; ++e) {
+            const unsigned o = o0 + cp * 32U + t * 16U + lo, r = r0 + rt * 16U + 2U * e + h;
+            if (o < v.count && r < v.rows) {
+                float* dst = v.out + static_cast<std::size_t>(r) * v.out_stride + o;
+                *dst = v.accumulate ? *dst + L[t][e] : L[t][e];
+            }
+        }
+}
+
 void enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) {
     require(v.weight && v.codes && v.deltas && v.out && v.count && v.rows && v.width && v.width % 32U == 0 && v.x_stride >= v.width &&
                 v.x_stride % 16U == 0 && v.out_stride >= v.count && reinterpret_cast<std::uintptr_t>(v.codes) % 16U == 0 &&
                 (!v.row_width || (v.row_width % 32U == 0 && v.k_offset % 32U == 0 && v.k_offset + v.width <= v.row_width)),
             "Q8_0 x A8 dense prefill view");
-    const dim3 grid((v.rows + 15U) / 16U, (v.count + 16U * wide_outs - 1U) / (16U * wide_outs));
+    unsigned outputs = 32U;
+    if (prefill_tuning::tiles())
+        outputs = prefill_tuning::tile_override("STRIX_DS41_PREFILL_DENSE_TILE", prefill_tuning::dense_outputs(v.width, v.count, v.rows));
+    const dim3 grid((v.rows + 15U) / 16U, (v.count + outputs - 1U) / outputs);
     static const bool staged = [] {
         const char* e = std::getenv("STRIX_DS41_DENSE_FORM");
         return !(e && e[0] == '0');
     }();
-    if (staged) hipLaunchKernelGGL(q8_0_a8_wide_kernel<true>, grid, dim3(32 * wide_waves), 0, as_stream(stream), v);
-    else hipLaunchKernelGGL(q8_0_a8_wide_kernel<false>, grid, dim3(32 * wide_waves), 0, as_stream(stream), v);
+    // STRIX_DS41_DENSE_TALL=22 / 41 / 14 / 21 / 12: RT OT of the tall form for every call (staged only); auto: by shape,
+    // from the gfx1151 smoke (prefill measurements): >= 3072 rows, or 2048 rows and >= 1024 outputs: 1 x 4 (q_a / kv);
+    // >= 256 rows with >= 4096 outputs and width >= 4096: 1 x 2 (wo_b halves); else the wide form. Every form: the same bits.
+    static const unsigned tall_env = [] {
+        const char* e = std::getenv("STRIX_DS41_DENSE_TALL");
+        if (e != nullptr && std::string(e) == "auto") return 1U;
+        return e ? static_cast<unsigned>(std::strtoul(e, nullptr, 10)) : 0U;
+    }();
+    unsigned tall = v.tall ? v.tall : tall_env;
+    if (tall == 1U) {
+        // auto, by the production attention sites (site benchmark, gfx1151, every form bitwise): from 256 rows the Lean 4
+        // forms, 1 x 4 rows-first (814) for q_a / kv up to 6143 rows and q_b (wide outputs, K <= 1536), column-first
+        // (914) for q_a / kv from 6144 rows and o_a groups (K 4096 -> 1024) from 512 rows, 2 x 2 (822) for the o_b
+        // K-halves (row_width 8192) and smaller o_a; else the earlier rule (14 / 12 / wide). Views past the lean
+        // buffer limit take the Lean 0 form of the same tile.
+        const bool lean_ok = static_cast<std::size_t>(v.rows) * v.x_stride < 0x7fffffffULL &&
+                             static_cast<std::size_t>(v.count) * ((v.row_width ? v.row_width : v.width) / 32U * 34U) < 0x7fffffffULL;
+        unsigned pick = 0U;
+        if (v.rows >= 256U) {
+            if (v.width == 5120U && v.count <= 1536U) pick = v.rows >= 6144U ? 914U : 814U;
+            else if (v.width <= 1536U && v.count >= 4096U) pick = 814U;
+            else if (v.width == 4096U && v.count == 1024U) pick = v.rows >= 512U ? 914U : 822U;
+            else if (v.row_width == 8192U && v.width == 4096U) pick = 822U;
+        }
+        // STRIX_DS41_DENSE_TALL_ROTATE=1 (exactness gates only): every call takes the next of 814 / 914 / 822 in turn,
+        // whatever its shape, so one --reference run covers the three selector forms on every site
+        static const bool rotate = [] {
+            const char* e = std::getenv("STRIX_DS41_DENSE_TALL_ROTATE");
+            return e != nullptr && e[0] == '1';
+        }();
+        static std::atomic<unsigned> turn{0U};
+        if (rotate) pick = std::array<unsigned, 3>{814U, 914U, 822U}[turn.fetch_add(1U, std::memory_order_relaxed) % 3U];
+        if (pick != 0U && !lean_ok) pick = pick == 914U ? 114U : pick == 822U ? 22U : 14U;
+        tall = pick != 0U ? pick
+               : v.rows >= 3072U || (v.rows >= 2048U && v.count >= 1024U) ? 14U
+               : v.rows >= 256U && v.count >= 4096U && v.width >= 4096U  ? 12U
+                                                                          : 0U;
+    }
+    // STRIX_DS41_DENSE_STATS=1 (diagnostics): calls and rows per (form, width, count, row_width), printed at exit
+    static const bool stats = [] {
+        const char* e = std::getenv("STRIX_DS41_DENSE_STATS");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (stats) {
+        struct Count { unsigned long long calls = 0, rows = 0; };
+        static std::mutex lock;
+        static std::map<std::array<unsigned, 4>, Count> counts;
+        static const bool printer = [] {
+            std::atexit([] {
+                std::lock_guard<std::mutex> g(lock);
+                for (const auto& [k, c] : counts)
+                    std::fprintf(stderr, "dense stats: form %u width %u count %u row_width %u calls %llu rows %llu\n", k[0], k[1], k[2], k[3], c.calls, c.rows);
+            });
+            return true;
+        }();
+        (void)printer;
+        std::lock_guard<std::mutex> g(lock);
+        auto& c = counts[{staged ? tall : 0U, v.width, v.count, v.row_width}];
+        ++c.calls;
+        c.rows += v.rows;
+    }
+    const auto tall_grid = [&](unsigned rt, unsigned ot) { return dim3((v.rows + 16U * rt - 1U) / (16U * rt), (v.count + 16U * ot - 1U) / (16U * ot)); };
+    if (tall >= 96U && tall <= 99U) {  // post-order forms: 99 prefetch + direct, 98 direct, 97 prefetch, 96 neither
+        require(v.width / 32U <= 256U, "Q8_0 x A8 dense post form: at most 256 groups");
+        const dim3 pg((v.rows + 63U) / 64U, (v.count + 63U) / 64U), pb(32 * post_waves);
+        if (tall == 99U) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_post_kernel<true, true>), pg, pb, 0, as_stream(stream), v);
+        else if (tall == 98U) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_post_kernel<false, true>), pg, pb, 0, as_stream(stream), v);
+        else if (tall == 97U) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_post_kernel<true, false>), pg, pb, 0, as_stream(stream), v);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_post_kernel<false, false>), pg, pb, 0, as_stream(stream), v);
+    } else if (staged && tall == 22U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 2>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 41U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<4, 1>), tall_grid(4, 1), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 14U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 114U)
+        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, true>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 112U)
+        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 2, true>), dim3(tall_grid(1, 2).y, tall_grid(1, 2).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 214U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, false, 1U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 212U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 2, false, 1U>), tall_grid(1, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 314U)
+        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, true, 1U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 312U)
+        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 2, true, 1U>), dim3(tall_grid(1, 2).y, tall_grid(1, 2).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    // Lean >= 2 forms address the activations / weights through raw buffers of at most 0x7fffffff bytes
+    else if ((tall == 414U || tall == 412U || tall == 514U || tall == 614U || tall == 612U || tall == 714U || tall == 422U ||
+              tall == 814U || tall == 812U || tall == 914U || tall == 822U || tall >= 1500U) &&
+             (static_cast<std::size_t>(v.rows) * v.x_stride >= 0x7fffffffULL ||
+              static_cast<std::size_t>(v.count) * ((v.row_width ? v.row_width : v.width) / 32U * 34U) >= 0x7fffffffULL))
+        throw std::invalid_argument("Q8_0 x A8 dense prefill: lean buffer form beyond 2 GiB");
+    else if (staged && tall == 414U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, false, 2U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 412U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 2, false, 2U>), tall_grid(1, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 514U)
+        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, true, 2U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 614U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, false, 3U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 612U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 2, false, 3U>), tall_grid(1, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 714U)
+        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, true, 3U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 814U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, false, 4U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 812U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 2, false, 4U>), tall_grid(1, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 914U)
+        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, true, 4U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 422U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 2, false, 2U>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 822U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 2, false, 4U>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 1514U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, false, 5U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 1522U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 2, false, 5U>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 1614U)
+        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, true, 5U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 1714U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, false, 6U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 1722U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 2, false, 6U>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 1814U)
+        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, true, 6U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 1914U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, false, 7U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 1922U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 2, false, 7U>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 2014U)
+        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, true, 7U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 2114U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, false, 8U>), tall_grid(1, 4), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 2122U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 2, false, 8U>), tall_grid(2, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 2214U)
+        hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 4, true, 8U>), dim3(tall_grid(1, 4).y, tall_grid(1, 4).x), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 21U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<2, 1>), tall_grid(2, 1), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (staged && tall == 12U) hipLaunchKernelGGL((q8_0_a8_tall_kernel<1, 2>), tall_grid(1, 2), dim3(32 * tall_waves), 0, as_stream(stream), v);
+    else if (outputs == 16U) {
+        if (staged) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_wide_kernel<true, 1>), grid, dim3(32 * wide_waves), 0, as_stream(stream), v);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_wide_kernel<false, 1>), grid, dim3(32 * wide_waves), 0, as_stream(stream), v);
+    } else {
+        if (staged) hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_wide_kernel<true, 2>), grid, dim3(32 * wide_waves), 0, as_stream(stream), v);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(q8_0_a8_wide_kernel<false, 2>), grid, dim3(32 * wide_waves), 0, as_stream(stream), v);
+    }
     check(hipGetLastError(), "Q8_0 x A8 dense prefill launch");
 }
 

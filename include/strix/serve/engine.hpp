@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -17,6 +18,27 @@
 
 namespace strix::serve {
 
+// Armed instrumentation: one process-wide word, unarmed until a GET /metrics or GET /api/status?detail=1 arms it
+// (ApiService). The arming expires: each arming request carries its service's expiry (ApiConfig::observe_expiry_seconds:
+// default 60 s, STRIX_SERVE_OBSERVE_EXPIRY_S, 0 = never) and the armed period ends at the latest of its requests' times
+// plus their expiries (never, once a request without an expiry armed it), when the process-wide expiry thread disarms;
+// the next arming request arms again. Unarmed, every instrumentation path is this one relaxed load: the engine threads
+// only read the word (none of them reads a clock or takes a lock for the expiry). What was observed stays across periods.
+// The word counts the transitions: odd = armed. Arming (even to odd) and the expiry (odd to even) each add one under the
+// arming lock, so it is written once per transition (later scrapes only read it: the line the engine threads read stays
+// shared; the time of the last arming request lives elsewhere). A request is observed when it was submitted in an armed
+// period and the word still holds that period when it finishes: an expiry (or an expiry and a new arming) in between
+// changes it, and since every reader reads this one location, a thread that saw the instrumentation unarmed reads the
+// changed word afterwards (no ordering between two variables is needed).
+inline std::atomic<std::uint64_t> serve_observe_period_{0};
+[[nodiscard]] inline std::uint64_t observe_period() noexcept { return serve_observe_period_.load(std::memory_order_relaxed); }
+[[nodiscard]] inline bool observe_armed() noexcept { return (observe_period() & 1U) != 0U; }
+// An arming request (HTTP threads): arms when unarmed; the period lasts at least `expiry_seconds` more (0: it does not
+// expire). True: this call started a period.
+bool observe_arm(double expiry_seconds);
+// Ends the armed period now (tests; a service that wants the instrumentation off at once).
+void observe_disarm();
+
 struct SamplingParameters {
     double temperature = 0.0; // 0 = greedy (exact)
     double top_p = 1.0;
@@ -30,6 +52,9 @@ struct SamplingParameters {
 // step with the newly verified tokens (stop tokens included); returning false stops generation.
 struct GenerationJob {
     std::vector<std::uint32_t> prompt;
+    // chat requests: the prompt's first tokens that render the system prompt and the tools (a prefix every turn of the
+    // conversation, and often other conversations, repeat: a prefix cache may snapshot there); 0: none known
+    std::uint32_t stable_prefix = 0;
     std::uint32_t max_tokens = 256;
     std::vector<std::uint32_t> stop_tokens;
     SamplingParameters sampling;
@@ -46,6 +71,14 @@ struct GenerationJob {
     // extension; unset = the engine's setting (STRIX_BATCH_NGRAM_PEERS, off by default). Drafts only.
     std::optional<bool> ngram_peers;
     std::function<bool(std::span<const std::uint32_t>)> on_tokens;
+    // Set by GenerationQueue::submit: the request was submitted after the instrumentation armed, so every armed
+    // measurement of it (first token, drafts) is complete. Engines measure only these requests. When the armed period
+    // expires before the request finishes, the queue reports it as not observed (GenerationTicket::observed), and an
+    // engine reports its armed-only measurements only when observation_complete() still holds at its finish (else they
+    // stopped at the expiry and are partial).
+    bool observed = false;
+    std::uint64_t observed_period = 0;  // set by submit: observe_period() then
+    [[nodiscard]] bool observation_complete() const noexcept { return observed && observe_period() == observed_period; }
 };
 
 struct GenerationStats {
@@ -56,6 +89,14 @@ struct GenerationStats {
     std::uint64_t tool_rows = 0, tool_accepted = 0; // strict tool-call frame rows (batched decoding, opt-in)
     std::uint64_t source_shadow = 0, source_scored = 0, source_right = 0, frame_cycles = 0, frame_shadow = 0; // diagnostics
     double queue_ms = 0.0, prefill_ms = 0.0, decode_ms = 0.0;
+    // first_token_ms, set by engines for observed requests (GenerationJob::observed): submit to the first published
+    // token; engines on GenerationQueue::take/finish measure it from TakenJob::submitted (the queue adds nothing),
+    // engines on GenerationQueue::run from their generate() entry (run() adds queue_ms). Absent: not reported.
+    // imported_tokens, set by engines for every request: prompt tokens whose state was imported from another device;
+    // computed prefill = prompt - cached - imported (the status's prefill rate uses it for every request; the field
+    // and the C8 totals are reported for observed requests only).
+    std::optional<double> first_token_ms;
+    std::uint64_t imported_tokens = 0;
     // "stop" (a stop token), "length" (max_tokens), "context" (context full), "cancelled".
     std::string finish = "length";
     std::string sampling = "greedy";
@@ -86,6 +127,9 @@ public:
     bool publish(std::span<const std::uint32_t> tokens);
     void finish(GenerationStats stats, std::string error = {});
     [[nodiscard]] std::uint64_t queue_position() const noexcept { return queue_position_.load(); }
+    // The job was submitted after the instrumentation armed (GenerationJob::observed; fixed before the job is queued) and
+    // its armed period did not expire before it finished (the queue clears it then, before finishing the ticket).
+    [[nodiscard]] bool observed() const noexcept { return observed_; }
     std::atomic<std::uint64_t> queue_position_{0};
 private:
     void notify();
@@ -96,6 +140,9 @@ private:
     std::string error_;
     bool done_ = false;
     std::atomic<bool> cancelled_{false};
+    bool observed_ = false;
+    std::uint64_t period_ = 0;  // observe_period() at submit
+    friend class GenerationQueue;
 };
 
 // A job taken by a batching engine (GenerationQueue::take). on_tokens already publishes into the
@@ -104,6 +151,47 @@ struct TakenJob {
     GenerationJob job;
     std::shared_ptr<GenerationTicket> ticket;
     std::chrono::steady_clock::time_point submitted, started;
+};
+
+// Fixed-bucket histogram (cumulative only when rendered): counts[i] = observations <= bounds[i] and > bounds[i - 1];
+// counts[N] = above the last bound.
+template <std::size_t N>
+struct ObserveHistogram {
+    std::array<std::uint64_t, N + 1> counts{};
+    double sum = 0.0;
+    std::uint64_t count = 0;
+    // the bucket of a value (N: above the last bound), N + 1 when it is not an observation (NaN, negative, absurd)
+    static std::size_t bucket(double value, const std::array<double, N>& bounds) noexcept {
+        if (!(value >= 0.0) || value > 1e12) return N + 1;
+        std::size_t i = 0;
+        while (i < N && value > bounds[i]) ++i;
+        return i;
+    }
+    void add(std::size_t i, double value) noexcept {
+        if (i > N) return;
+        ++counts[i];
+        sum += value;
+        ++count;
+    }
+    void observe(double value, const std::array<double, N>& bounds) noexcept { add(bucket(value, bounds), value); }
+};
+inline constexpr std::array<double, 10> ttft_seconds_bounds{0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0};
+inline constexpr std::array<double, 12> decode_tok_s_bounds{1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0, 75.0, 100.0};
+
+// What the queue observed: observed requests (submitted after arming) that finished without an error; the prompt
+// accounting only of those that produced a token (their prompt was read). It sums every armed period (an expiry keeps it).
+struct ObserveSnapshot {
+    std::uint64_t requests = 0, prompt_tokens = 0, cached_tokens = 0, imported_tokens = 0, computed_tokens = 0;
+    ObserveHistogram<ttft_seconds_bounds.size()> ttft_seconds;            // from first_token_ms, when reported
+    ObserveHistogram<decode_tok_s_bounds.size()> decode_tokens_per_second; // generated / decode time, >= 2 tokens
+};
+
+// One observed request's contribution, computed before the queue lock (which then only adds it). No member
+// initializers: an unobserved request never initializes one; GenerationQueue::observe_delta() sets every member.
+struct ObserveDelta {
+    std::uint64_t requests, prompt_tokens, cached_tokens, imported_tokens, computed_tokens;
+    std::size_t ttft_bucket, decode_bucket;  // N + 1: none
+    double ttft_seconds, decode_tokens_per_second;
 };
 
 struct QueueSnapshot {
@@ -125,12 +213,21 @@ public:
     // queued, or after shutdown). Jobs cancelled while queued are finished here.
     std::optional<TakenJob> take(bool wait);
     // The end of a taken job: fills queue_ms, updates the totals and finishes its ticket.
+    // Engines may call it inside their own timed regions (a batching runner that times a prompt unit and completes a
+    // request in it). The observation it adds reads and writes only the queue's own counters, never an engine's
+    // scheduling state; its cost is fixed: one branch unarmed, and armed a contribution computed from the job's stats
+    // before the lock plus a few additions under it (no allocation, no syscall). A runner's timed region that encloses
+    // the call therefore sees at most that constant, on top of the totals update it already contained.
     void finish(TakenJob& job, GenerationStats stats, std::string error = {},
         const std::function<void(const GenerationStats&)>& observe = {});
     [[nodiscard]] bool stopping() const;
     void shutdown();
     [[nodiscard]] QueueSnapshot snapshot() const;
+    [[nodiscard]] ObserveSnapshot observed() const;
 private:
+    static bool still_observed(GenerationTicket& ticket) noexcept;
+    static ObserveDelta observe_delta(const GenerationStats& stats, const std::string& error) noexcept;
+    void observe_locked(const ObserveDelta& d) noexcept;
     struct Entry { GenerationJob job; std::shared_ptr<GenerationTicket> ticket; std::chrono::steady_clock::time_point submitted; };
     mutable std::mutex mutex_;
     std::condition_variable ready_;
@@ -138,6 +235,7 @@ private:
     std::size_t max_queued_;
     bool stopping_ = false;
     QueueSnapshot totals_;
+    ObserveSnapshot observed_;
 };
 
 }  // namespace strix::serve

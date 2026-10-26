@@ -179,6 +179,13 @@ public:
     [[nodiscard]] double plain_cost(std::uint32_t n) const;
     [[nodiscard]] double probability(std::uint32_t depth, float confidence) const;
     [[nodiscard]] double slot_survival(std::uint32_t slot, std::uint32_t depth) const;
+    using BinTable = std::array<std::array<std::uint32_t, WindowController::bins>, block_size>;
+    // A measured prior for the pooled depth x confidence table (pseudo-observations added to seen / hits): with true
+    // row prices stage 2 rarely verifies low-confidence drafts, so their cells would stay at the unseen default and
+    // never be learned (the exploration trap; design notes).
+    void seed(const BinTable& seen, const BinTable& hits);
+    // Stage 2 with the request's own evidence: P(depth) = (its hits + w * pooled) / (its verified + w); 0 = off.
+    void set_request_weight(double w) noexcept { request_weight_ = w; }
 
 private:
     // the best rows per request for expected tokens expected[i][R - 1] under the budget; the step pays `drafting`
@@ -189,6 +196,7 @@ private:
     std::array<std::array<std::uint32_t, WindowController::bins>, block_size> seen_{}, hits_{};  // pooled, by confidence
     std::vector<std::array<std::uint32_t, block_size>> slot_seen_, slot_hits_;
     std::uint64_t plans_ = 0;
+    double request_weight_ = 0.0;
 };
 
 // Survival tables as text: the line "ds41-dspark-survival-v1 bins 8", then one line per depth j = 1..5:

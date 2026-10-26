@@ -50,14 +50,18 @@ class LinuxGpuQueueTests(unittest.TestCase):
                         str(ROOT/'src/linux_gpu_queue.cpp'), str(ROOT/'src/gpu_queue_session.cpp'), str(ROOT/'tests/linux_gpu_queue_test.cpp'),
                         str(tmp/'driver.o'), '-o', str(cls.binary)], check=True)
 
-    def run_case(self, case):
+    def run_case(self, case, lean=False):
         result = subprocess.run([str(self.binary), case], capture_output=True, text=True, timeout=30,
-                                env={**os.environ, 'ASAN_OPTIONS': 'detect_leaks=1:abort_on_error=1'})
+                                env={**os.environ, 'ASAN_OPTIONS': 'detect_leaks=1:abort_on_error=1',
+                                     'STRIX_TEST_GPU_QUEUE_LEAN': '1' if lean else '0'})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('PASS ' + case, result.stdout)
 
 for case in CASES:
     setattr(LinuxGpuQueueTests, 'test_' + case, lambda self, case=case: self.run_case(case))
+# The same cases on the lean hot path (identity is per call there by design: covered by 'lean').
+for case in (*(c for c in CASES if c != 'identity'), 'lean'):
+    setattr(LinuxGpuQueueTests, 'test_lean_' + case, lambda self, case=case: self.run_case(case, lean=True))
 
 if __name__ == '__main__':
     unittest.main()

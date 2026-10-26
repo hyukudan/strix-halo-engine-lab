@@ -6,6 +6,8 @@
 
 #include "strix/ds41_formats.hpp"
 
+namespace strix::dist { struct ProducerStage; struct ConsumerStage; }
+
 #include <cstddef>
 #include <cstdint>
 
@@ -193,6 +195,12 @@ struct HalfSumView {
 void enqueue_half_sum(const HalfSumView& view, void* stream);
 // out = (shared + low) + high elementwise: the combine from the two half sums.
 void enqueue_canonical_sum(const float* shared, const float* low, const float* high, std::size_t count, float* out, void* stream);
+// Ready forms of the MoE half-sum exchange (STRIX_DS41_MOE_READY=1, staged_ready.hpp lean releases): the half sum
+// written into the coherent TX view, every block publishing it; the combine reading the coherent RX view, every
+// block releasing it (reads only: out stays GPU-owned on the same stream). Same arithmetic as the two above.
+void enqueue_half_sum_ready(const HalfSumView& view, dist::ProducerStage stage, void* stream);
+void enqueue_canonical_sum_ready(const float* shared, const float* low, const float* high, std::size_t count, float* out,
+                                 dist::ConsumerStage peer, void* stream);
 // The same combine with the shared expert's output split by rows over two ranks: row r of shared is
 // shared_lo[r * hidden / 2 ...] then shared_hi[r * hidden / 2 ...]. shared_out (optional) receives the
 // assembled [rows][hidden] shared output.
@@ -226,5 +234,9 @@ struct BuildRoutesView {
     std::uint32_t* counts = nullptr;
 };
 void enqueue_build_routes(const BuildRoutesView& view, void* stream);
+// Select routes and build the same integer CSR in one block after the ordinary router scores.
+// Returns false without enqueueing for unsupported shapes or an explicitly selected fast router.
+// The caller owns the opt-in flag and skips enqueue_build_routes only when this returns true.
+[[nodiscard]] bool enqueue_router_routes(const RouterView& router, const BuildRoutesView& routes, void* stream);
 
 } // namespace strix::ds41

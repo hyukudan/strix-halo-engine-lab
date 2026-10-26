@@ -2,6 +2,7 @@
 
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/deepseek41_model.hpp"
+#include "strix/ds41_pipeline_wire.hpp"
 
 #include <array>
 #include <cstdint>
@@ -128,6 +129,23 @@ public:
     // One forward step over `rows` (1..row_limit(), at most max_rows per request's segment);
     // returns each row's greedy token, in the order of `rows`.
     const std::vector<std::uint32_t>& step(std::span<const BatchRow> rows);
+    // Pipeline TAIL of several requests (strix/ds41-pipeline-v1, ds41_pipeline_wire.hpp): a step whose layers
+    // [0, first_layer) ran elsewhere (a FRONT stage). boundaries[i] is the cut after layer first_layer - 1 of the step's
+    // i-th segment (the runs of equal slots of `rows`, in order): its position, rows, tokens, the stream after that
+    // layer, its FFN mix and the sections the cut carries (the KV entries the FRONT completed go into the slot's own
+    // caches of those source layers, the top-k and candidate rows into the step's scratch). The step then runs layers
+    // [first_layer, layers) and the head over every row exactly as step() does from those inputs, so every row's bits
+    // are those of the whole step (and of running its request alone). The slots' states of layers < first_layer are
+    // not advanced (their sequences live in the FRONT): export_state() of such a slot is valid only for layers >=
+    // first_layer and the KV sources the cut carries. Engram rows are read only for layers >= first_layer.
+    const std::vector<std::uint32_t>& step_boundary(std::span<const BatchRow> rows, std::uint32_t first_layer,
+                                                    std::span<const ds41::pipe::Boundary> boundaries);
+    // The FRONT half of a step on this forward (tests and single-node gates of the split): layers [0, cut) of `rows`, then
+    // the cut after layer cut - 1 of every segment as step_boundary reads it (stream, FFN mix, the slot's KV entries the
+    // rows completed on the cut's KV sources, the rows' top-k and candidate blocks). The slots' positions and Engram
+    // histories do not move; step_boundary(rows, cut, boundaries) right after completes the step, bitwise the step() of
+    // the same rows (a commit() after it rolls back every layer, as after step()).
+    [[nodiscard]] std::vector<ds41::pipe::Boundary> step_front(std::span<const BatchRow> rows, std::uint32_t cut);
     [[nodiscard]] const std::vector<std::uint32_t>& last_tokens() const noexcept { return tokens_; }
     // Verify windows: after a step, keep rows [0, kept) of `slot`'s segment and roll the others back (its position,
     // the ratio-2 compressor carry, the Engram history; ring and compressed entries of dropped rows are rewritten
@@ -179,6 +197,9 @@ public:
     struct Impl;
 
 private:
+    const std::vector<std::uint32_t>& run_step(std::span<const BatchRow> rows, std::uint32_t first_layer,
+                                               std::span<const ds41::pipe::Boundary> boundaries, std::uint32_t front_cut,
+                                               std::vector<ds41::pipe::Boundary>* front_out);
     std::unique_ptr<Impl> impl_;
     std::vector<std::uint32_t> tokens_;
     BatchStepStats stats_;

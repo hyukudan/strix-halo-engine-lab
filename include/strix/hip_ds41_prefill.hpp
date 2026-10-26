@@ -180,6 +180,7 @@ public:
 private:
     void enqueue_experts(const PrefillMoeInputs& in, std::uint32_t chunk, std::uint32_t& row0, std::uint32_t& rows, void* stream);
     void enqueue_experts_split(const PrefillMoeInputs& in, std::uint32_t row0, std::uint32_t rows, void* stream);
+    [[nodiscard]] unsigned selected_batch_rows(unsigned rows) const;
     void experts_rows(const PrefillMoeInputs& in, std::uint32_t row0, std::uint32_t rows, void* stream);
     void half_rows(const float* weights, std::uint32_t first_row, std::uint32_t rows, std::uint32_t half, float* out, void* stream);
     void pad_activations(std::uint32_t rows, void* stream);  // down_width > inter only

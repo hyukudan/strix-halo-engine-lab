@@ -18,7 +18,7 @@ void expect(bool ok, const char* message) {
 }
 std::uint32_t pattern(unsigned rank, unsigned i) { return 0x9e3779b1U * (i + 1U) ^ (rank ? 0x35a5a55aU : 0x735a5aa5U); }
 
-void stress() {
+void stress(bool reads_only) {
     constexpr std::size_t stride = 262144, batch = 32;
     auto pair = strix::dist::memory_pair();
     hipStream_t s[2]{};
@@ -52,7 +52,11 @@ void stress() {
                 bool rejected = false;
                 try { (void)c[r]->prepare_staged_ready(s[r], size); } catch (const std::logic_error&) { rejected = true; }
                 expect(rejected, "unreleased consumer must block a new view");
-                strix::dist::enqueue_staged_consume(v, static_cast<unsigned char*>(output[r]) + slot * stride, size, s[r]);
+                auto* dst = static_cast<unsigned char*>(output[r]) + slot * stride;
+                if (reads_only) {
+                    const std::array<unsigned, 5> grids{1, 5, 20, 160, 257};
+                    strix::dist::enqueue_staged_consume_reads(v, dst, size, s[r], grids[i % grids.size()]);
+                } else strix::dist::enqueue_staged_consume(v, dst, size, s[r]);
                 c[r]->release_staged_ready(s[r]);
             }
             if (slot + 1U == batch) {
@@ -73,10 +77,11 @@ void stress() {
         expect(a.stats().exchanges == 512 && b.stats().exchanges == 512, "lost staged exchange");
     }
     for (unsigned r = 0; r < 2; ++r) { check(hipFree(output[r])); check(hipStreamDestroy(s[r])); }
-    std::cout << "staged readiness: 512 generations, 1..262144 B, async producer/consumer and reuse PASS\n";
+    std::cout << "staged readiness: 512 generations, 1..262144 B, async producer/consumer and reuse "
+              << (reads_only ? "READS_ONLY/padding257 " : "FULL_FENCE ") << "PASS\n";
 }
 
-void mixed_fallback() {
+void mixed_fallback(bool reads_only) {
     // Alternate ready views, event-based fused fallback and ordinary copies on
     // the same communicator, without draining consumers between generations.
     ::setenv("STRIX_DIST_STAGING", "ready", 1);
@@ -124,7 +129,8 @@ void mixed_fallback() {
                 if (mode == 0U) {
                     const auto v = c[r]->finish_staged_ready();
                     expect(!c[r]->send_staging(size), "held ready view admitted fused producer");
-                    strix::dist::enqueue_staged_consume(v, dst, size, s[r]);
+                    if (reads_only) strix::dist::enqueue_staged_consume_reads(v, dst, size, s[r], 160);
+                    else strix::dist::enqueue_staged_consume(v, dst, size, s[r]);
                     c[r]->release_staged_ready(s[r]);
                 } else if (mode == 1U) {
                     const auto* v = c[r]->finish_staged(s[r]);
@@ -159,7 +165,8 @@ void mixed_fallback() {
         check(hipFree(input[r])); check(hipFree(output[r])); check(hipStreamDestroy(s[r]));
     }
     ::unsetenv("STRIX_DIST_STAGING");
-    std::cout << "staged readiness: 128 mixed ready/fused/copy generations, oversized fallback and RX lifetime PASS\n";
+    std::cout << "staged readiness: 128 mixed ready/fused/copy generations, oversized fallback and RX lifetime "
+              << (reads_only ? "READS_ONLY " : "FULL_FENCE ") << "PASS\n";
 }
 
 void producer_failures() {
@@ -200,6 +207,7 @@ public:
     std::string name() const override { return "memory-corrupt-test"; }
 };
 void crc_failure() {
+    ::setenv("STRIX_DIST_CRC_DEFER", "0", 1); // inline CRC: rejected before the consumer view (deferred: see crc defer tests)
     auto pair = strix::dist::memory_pair();
     hipStream_t s[2]{};
     for (auto& stream : s) check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
@@ -216,12 +224,13 @@ void crc_failure() {
         (void)b.finish_staged_ready(); // no consumer launch: destructor must still drain safely
     }
     for (auto stream : s) check(hipStreamDestroy(stream));
+    ::unsetenv("STRIX_DIST_CRC_DEFER");
     std::cout << "staged readiness: payload CRC corruption rejected before consumer PASS\n";
 }
 }
 int main() try {
     ::setenv("STRIX_DIST_STAGED_READY_BYTES", "262144", 1);
-    stress(); mixed_fallback(); producer_failures(); crc_failure();
+    stress(false); stress(true); mixed_fallback(false); mixed_fallback(true); producer_failures(); crc_failure();
     std::cout << "staged readiness tests passed\n";
     return 0;
 } catch (const std::exception& e) {

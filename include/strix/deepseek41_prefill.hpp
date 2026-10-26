@@ -27,6 +27,22 @@ class Communicator;
 namespace strix::deepseek41 {
 
 struct PrefillOptions {
+    bool fp16_dense = false;          // non-exact, optional hipBLASLt backend
+    bool bf16_attention = false;      // non-exact, prefill only, independent of dense
+    // Diagnostics/selection for the non-exact paths (no effect while both switches above are off, except null_ulp_layer):
+    // projection bits 1 q_a, 2 kv, 4 q_b, 8 o_a, 16 o_b; layers [approx_layer_first, approx_layer_end); FP16 only at
+    // calls of at least fp16_min_rows rows; fp16_keep_a8: FP16 operands from the A8 codes (the exact path's activations)
+    std::uint32_t fp16_projections = 31, approx_layer_first = 0, approx_layer_end = 1000, fp16_min_rows = 0;
+    bool fp16_keep_a8 = false;
+    // FP16 output form of the FP16 backend (STRIX_DS41_PREFILL_FP16_FAST=1; needs fp16_dense): hipBLASLt writes FP16,
+    // the attention norms emit the FP16 activations (no conversion pass), q_a || kv run as one GEMM, o_b as one K
+    // (not two halves) outside TP
+    bool fp16_fast = false;
+    bool fp16_wsplit = false;  // FP16 output form with the weights as hi + lo FP16 halves (STRIX_DS41_PREFILL_FP16_WSPLIT=1)
+    int null_ulp_layer = -1;          // >=0: flip the last mantissa bit of every stream value after that layer (sensitivity probe)
+    std::uint32_t null_seed = 0;      // with null_ulp_layer, != 0: each value moves one ulp up or down by a hash of (seed, index)
+    bool trace = false;               // per-layer router ids, indexer selections and stream row hashes (PrefillResult::trace)
+    std::uint32_t quality_head_rows = 1; // >1: last N teacher-forced positions, no cone/row split
     std::uint32_t layers = 40;           // target layers [0, layers)
     std::uint32_t max_positions = 16384; // prompt rows the state and the buffers are sized for
     // Rows of one run (0: max_positions). With extend() a long prompt runs in pieces of at most max_rows rows: the row
@@ -101,7 +117,16 @@ struct PrefillLayerTiming {
     double seconds = 0.0, attention = 0.0, moe = 0.0, exchange = 0.0, exchange_blocked = 0.0;
 };
 
+struct PrefillLayerTrace {
+    std::vector<std::uint32_t> router_ids;   // rows x top_k, this rank's output rows
+    std::vector<std::uint64_t> index_sets;   // per row: order-independent hash of the selected compressed entries (owners only)
+    std::vector<std::uint64_t> row_hashes;   // per row: hash of the stream row after the layer
+    std::vector<float> tail;                 // the last quality_head_rows stream rows after the layer
+};
+
 struct PrefillResult {
+    std::vector<float> teacher_logits; // quality_head_rows x vocabulary; empty in normal operation
+    std::vector<PrefillLayerTrace> trace; // options.trace
     std::vector<float> logits;        // last row (world 2 without gather_logits: this rank's slice, other entries zero)
     std::uint32_t next_token = 0;
     std::vector<std::uint64_t> stream_hashes;  // last row, after each layer (stream_hashes)
@@ -202,6 +227,15 @@ public:
     DevicePrefill(const DevicePrefill&) = delete;
     DevicePrefill& operator=(const DevicePrefill&) = delete;
 
+    // Discards the live sequence: the next operation must be run(). External prefix/state caches
+    // must use separate precision identities. Intended for controlled quality comparisons.
+    void set_precision_for_new_sequence(bool fp16_dense, bool bf16_attention);
+    // The same, with every diagnostic/selection field of PrefillOptions (fp16_*, approx_*, null_ulp_layer, trace).
+    void set_precision_for_new_sequence(const PrefillOptions& precision);
+    // The exact dense selector for the next sequences (same bits either way; in-process A/B of its speed): on = every
+    // exact dense call with the per-site form of STRIX_DS41_DENSE_TALL=auto and q_b / o_a on the dense kernel; off =
+    // the loaded configuration (environment).
+    void set_dense_select(bool on);
     // The whole prompt from position 0 (a fresh sequence).
     PrefillResult run(std::span<const std::uint32_t> tokens);
     // The next piece of the same sequence: tokens at positions [rows so far, + tokens.size()), reading the attention
@@ -232,6 +266,15 @@ public:
     // Continue a sequence from a state (another run's export, read from a file): rings, caches, carries, the Engram
     // history of state.tokens and the rows so far = state.position (a multiple of window_rows); then extend().
     void import_state(const AttentionState& state);
+    // In-run snapshots (the serve's --prefix-inrun-snapshots): positions p of the next run / extend / begin_* (P0 < p <
+    // P0 + rows, multiples of window_rows) where that run also keeps the attention state, so a prefix cache snapshots p
+    // without splitting the run there (a split reads every expert once more and replays the cone again). The decoder
+    // layers' cone then also covers the rows the state at p depends on (the extra rows are exact), and each layer's ring
+    // at p is copied out of the run's ring before the next layer reuses it. After the run, export_state_at(p) gives the
+    // state a run ending at p exports, bitwise (rings, the caches' first p / ratio entries, a ratio-2 carry: empty at an
+    // even p), with topk_known false; tokens and next_token are the caller's. The points apply to one run only.
+    void set_snapshot_points(std::vector<std::uint32_t> positions);
+    [[nodiscard]] AttentionState export_state_at(std::uint32_t position) const;
     [[nodiscard]] std::uint64_t weight_bytes() const noexcept;         // loaded (owned) by this prefill
     [[nodiscard]] std::uint64_t shared_weight_bytes() const noexcept;  // read in place from shared_weights
     [[nodiscard]] double load_seconds() const noexcept;

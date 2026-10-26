@@ -255,6 +255,41 @@ void test_silent_peer() {
     expect(ms < 1500.0, "the deadline is honoured (" + std::to_string(ms) + " ms)");
     std::cout << "silent peer: failed after " << ms << " ms: " << message << '\n';
 }
+// exchange_overlapped (STRIX_DIST_CRC_DEFER's TX CRC during the wire): the hook runs exactly once per exchange on the
+// calling thread, on the eager path and on the stream threads' path, and the bytes are the same as exchange().
+void test_on_wire() {
+    for (const char* eager : {"0", "65536"}) {
+        ::setenv("STRIX_DIST_USB4_EAGER", eager, 1);
+        auto pair = make_pair(4, 0, std::chrono::milliseconds(5000), true, 8192);
+        for (const std::size_t size : {std::size_t{200}, std::size_t{20608}, std::size_t{163968}, std::size_t{1} << 20U}) {
+            std::vector<std::byte> out_a(size), out_b(size), in_a(size), in_b(size);
+            for (std::size_t i = 0; i < size; ++i) {
+                out_a[i] = static_cast<std::byte>(i * 7U + 1U);
+                out_b[i] = static_cast<std::byte>(i * 13U + 5U);
+            }
+            struct Hook {
+                std::span<const std::byte> out;
+                unsigned calls = 0;
+                std::uint32_t crc = 0;
+            } ha{out_a}, hb{out_b};
+            const auto hook = [](void* context) {
+                auto& h = *static_cast<Hook*>(context);
+                ++h.calls;
+                h.crc = strix::dist::crc32c(h.out);
+            };
+            std::exception_ptr error;
+            std::thread peer([&] { try { pair.b->exchange_overlapped(out_b, in_b, hook, &hb); } catch (...) { error = std::current_exception(); } });
+            pair.a->exchange_overlapped(out_a, in_a, hook, &ha);
+            peer.join();
+            if (error) std::rethrow_exception(error);
+            expect(ha.calls == 1U && hb.calls == 1U, "on_wire runs once (eager " + std::string(eager) + ", " + std::to_string(size) + " B)");
+            expect(ha.crc == strix::dist::crc32c(out_a) && hb.crc == strix::dist::crc32c(out_b), "on_wire reads the outgoing bytes");
+            expect(in_a == out_b && in_b == out_a, "overlapped exchange bytes (eager " + std::string(eager) + ", " + std::to_string(size) + " B)");
+        }
+    }
+    ::unsetenv("STRIX_DIST_USB4_EAGER");
+    std::cout << "on-wire hook: once per exchange, eager and stream threads, 200 B .. 1 MiB PASS\n";
+}
 } // namespace
 
 int main() try {
@@ -265,6 +300,7 @@ int main() try {
     test_sizes(true);
     test_eager_partial();
     test_eager_abort();
+    test_on_wire();
     test_peer_failure();
     test_silent_peer();
     if (failures == 0) std::cout << "dist transport tests passed\n";
