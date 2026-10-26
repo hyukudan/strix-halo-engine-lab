@@ -1,0 +1,464 @@
+// Exact grouped routed + shared experts. Arithmetic helpers retain their original provenance.
+#include "glm/prefill/glm_pf_exact_moe.hpp"
+#include "glm/moe/glm_trellis_device.hpp"
+#include "glm/common/glm_math.hpp"
+#include <array>
+#include <cstddef>
+#include <cstdlib>
+#include <stdexcept>
+#include <string>
+
+namespace strix::glm::pf::exact_moe {
+namespace {
+namespace d = moe::dev;
+constexpr unsigned H = moe::kHidden, I = moe::kInter, E = moe::kExperts, P = 9;
+constexpr std::size_t align256(std::size_t x) { return (x + 255) & ~std::size_t{255}; }
+struct Layout {
+    std::size_t table = 0, pairs, tiles, groups, gu, at, output, input, bytes;
+    explicit Layout(unsigned rows) {
+        if (rows == 0 || rows > 65536) throw std::invalid_argument("exact moe: max_rows must be 1..65536");
+        const std::size_t n = std::size_t{rows} * P;
+        pairs = align256((E + 1) * sizeof(moe::ExpertSlices));  // [E] = the shared expert
+        tiles = pairs + align256(n * sizeof(unsigned));
+        groups = tiles + align256((n / 16 + E + 1) * sizeof(Tile));
+        gu = groups + align256((E + 1) * sizeof(Tile));
+        at = gu + align256(n * 2 * I * sizeof(float));
+        output = at + align256(n * I * sizeof(std::uint16_t));
+        input = output + align256(n * H * sizeof(float));
+        // V2/V3 cache both matrix-specific gate/up transforms; V1 leaves this region untouched.
+        bytes = input + align256(n * 2 * H * sizeof(std::uint16_t));
+    }
+};
+void ok(hipError_t e, const char* what) {
+    if (e != hipSuccess) throw std::runtime_error(std::string("exact moe: ") + what + ": " + hipGetErrorString(e));
+}
+struct Args {
+    unsigned rows;
+    const float* x;
+    const float* weights;
+    float* out;
+    const moe::ExpertSlices* experts;
+    moe::ExpertSlices shared;
+    const unsigned* pairs;
+    const Tile* tiles;
+    const Tile* groups;
+    float* gu;
+    _Float16* at;
+    float* output;
+    _Float16* input;
+};
+// One global load from the device table (entry E = the shared expert): selecting a member of a by-value / kernarg
+// struct with a runtime index forces the struct to scratch (328 B/lane in the first draft).
+static_assert(offsetof(moe::ExpertSlices, up) == sizeof(moe::Exl3) && offsetof(moe::ExpertSlices, down) == 2 * sizeof(moe::Exl3),
+              "gate, up, down contiguous");
+__device__ __forceinline__ moe::Exl3 matrix(const Args& a, unsigned expert, unsigned m) {
+    return (&a.experts[expert].gate)[m];
+}
+
+// Each wave transforms one H128 block exactly once per (pair, matrix). The
+// materialized FP16 values have the same boundary as the V1 LDS staging.
+__global__ void input_kernel(Args a) {
+    const Tile tile = a.tiles[blockIdx.y];
+    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
+    const unsigned m = blockIdx.z;
+    const moe::Exl3 w = matrix(a, tile.expert, m);
+    // One CTA covers 1024 input channels for every row in this expert tile.
+    // Eight H128 waves avoid a separate tiny CTA for each transform block.
+    for (unsigned r = 0; r < tile.count; ++r) {
+        const unsigned pair = a.pairs[tile.first + r];
+        const unsigned begin = (blockIdx.x * 8U + wave) * 128U;
+        d::transform_block_at(a.x + std::size_t{pair / P} * H, w.suh,
+                              a.input + (std::size_t{pair} * 2U + m) * H + begin, begin, 0, lane);
+    }
+}
+
+// One wave per 16-output tile, eight waves per H128 block. Each decoded operand is reused
+// across TM independent row chains by compute_slot; the helper fixes DOT2 pair order.
+// Full reference splits are consumed in order, never selected from the tile row count.
+template<int Bits, int TM, bool Down, bool Cached>
+__device__ __forceinline__ void core(Args a, Tile tile, moe::Exl3 w, unsigned m,
+                                    _Float16* xs, float* fin) {
+    constexpr unsigned KPS = Down ? 16U : 8U, Splits = Down ? 4U : 32U;
+    constexpr unsigned Chunk = KPS * 16U;
+    constexpr unsigned N = Down ? H : I;
+    const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x >> 5U;
+    const unsigned col = blockIdx.x * 8U + wave;
+    const d::LaneGeom<Bits> geo(lane);
+    const auto* packed = reinterpret_cast<const unsigned char*>(d::uniform(w.trellis));
+    // V2 keeps ascending split totals in LDS, freeing TM*2 accumulator VGPRs.
+    float total[Cached ? 1 : TM][2] = {};
+    if constexpr (Cached) {
+        for (unsigned q = threadIdx.x; q < tile.count * 128U; q += 256U) fin[q] = 0.0F;
+        __syncthreads();
+    }
+    for (unsigned sp = 0; sp < Splits; ++sp) {
+        if constexpr (Down || Cached) {
+            for (unsigned q = threadIdx.x; q < tile.count * (Chunk / 2); q += 256) {
+                const unsigned r = q / (Chunk / 2), c = q % (Chunk / 2);
+                const unsigned pair = a.pairs[tile.first + r];
+                const _Float16* input;
+                if constexpr (Down) input = a.at + std::size_t{pair} * I;
+                else input = a.input + (std::size_t{pair} * 2U + m) * H;
+                reinterpret_cast<std::uint32_t*>(xs)[q] =
+                    reinterpret_cast<const std::uint32_t*>(input)[sp * (Chunk / 2) + c];
+            }
+        } else {
+            for (unsigned r = wave; r < tile.count; r += 8) {
+                const unsigned pair = a.pairs[tile.first + r];
+                d::transform_block_at(a.x + std::size_t{pair / P} * H, w.suh,
+                                      xs + r * Chunk, sp * Chunk, 0, lane);
+            }
+        }
+        __syncthreads();
+        float sums[TM][2] = {};
+        std::uint32_t pa = 0, pb = 0, pc = 0;
+        if constexpr (Cached) {
+            const auto* raw = packed + (std::size_t{sp * KPS} * (N / 16) + col) * Bits * 32;
+            pa = d::load_u32(raw, geo.oa);
+            pb = d::load_u32(raw, geo.ob);
+            pc = d::load_u32(raw, geo.oc);
+        }
+        for (unsigned kk = 0; kk < KPS; ++kk) {
+            const unsigned k = sp * KPS + kk;
+            const unsigned char* raw = packed + (std::size_t{k} * (N / 16) + col) * Bits * 32;
+            d::Slot<Bits, TM> s;
+            if constexpr (Cached) { s.a = pa; s.b = pb; s.c = pc; }
+            else {
+                s.a = d::load_u32(raw, geo.oa);
+                s.b = d::load_u32(raw, geo.ob);
+                s.c = d::load_u32(raw, geo.oc);
+            }
+#pragma unroll
+            for (int r = 0; r < TM; ++r) {
+                // Padded rows use defined zero operands; no scratch from a previous call is read.
+                s.act[r][0] = d::Half2{};
+                s.act[r][1] = d::Half2{};
+                if (static_cast<unsigned>(r) < tile.count) {
+                    const auto* p = reinterpret_cast<const std::uint32_t*>(xs + static_cast<unsigned>(r) * Chunk + kk * 16) + (lane & 3U);
+                    s.act[r][0] = __builtin_bit_cast(d::Half2, p[0]);
+                    s.act[r][1] = __builtin_bit_cast(d::Half2, p[4]);
+                }
+            }
+            if constexpr (Cached) {
+                // Issue the next trellis words before this tile's decode/DOT2 chain.
+                // Do not prefetch past a split (especially the final allocation tile).
+                if (kk + 1U < KPS) {
+                    const auto* next = raw + std::size_t{N / 16} * Bits * 32;
+                    pa = d::load_u32(next, geo.oa);
+                    pb = d::load_u32(next, geo.ob);
+                    pc = d::load_u32(next, geo.oc);
+                }
+            }
+            d::compute_slot<Bits, TM>(s, geo, tile.count, sums);
+        }
+#pragma unroll
+        for (int r = 0; r < TM; ++r) {
+            const float v0 = d::reduce4(sums[r][0]), v1 = d::reduce4(sums[r][1]);
+            if constexpr (Cached) {
+                if ((lane & 3U) == 0 && static_cast<unsigned>(r) < tile.count) {
+                    const unsigned o = static_cast<unsigned>(r) * 128U + wave * 16U + lane / 4U;
+                    fin[o] = fin[o] + v0;
+                    fin[o + 8U] = fin[o + 8U] + v1;
+                }
+            } else {
+                total[r][0] = total[r][0] + v0;
+                total[r][1] = total[r][1] + v1;
+            }
+        }
+        __syncthreads(); // all waves have finished reading xs before its next split
+    }
+    if constexpr (!Cached) {
+        if ((lane & 3U) == 0)
+#pragma unroll
+            for (int r = 0; r < TM; ++r)
+                if (static_cast<unsigned>(r) < tile.count) {
+                    fin[static_cast<unsigned>(r) * 128 + wave * 16 + lane / 4] = total[r][0];
+                    fin[static_cast<unsigned>(r) * 128 + wave * 16 + lane / 4 + 8] = total[r][1];
+                }
+    }
+    __syncthreads();
+    for (unsigned r = wave; r < tile.count; r += 8) {
+        float v[4];
+#pragma unroll
+        for (unsigned j = 0; j < 4; ++j) v[j] = fin[r * 128 + lane + 32 * j];
+        d::hadamard128(v, lane);
+        const unsigned pair = a.pairs[tile.first + r];
+#pragma unroll
+        for (unsigned j = 0; j < 4; ++j) {
+            const unsigned o = blockIdx.x * 128 + lane + 32 * j;
+            const float value = v[j] * d::half_bits(w.svh[o]);
+            if constexpr (Down) a.output[std::size_t{pair} * H + o] = value;
+            else a.gu[(std::size_t{pair} * 2 + m) * I + o] = value;
+        }
+    }
+}
+template<int TM, bool Down, bool Cached = false>
+__global__ __launch_bounds__(256) void linear_kernel(Args a) {
+    constexpr unsigned Chunk = Down ? 256U : 128U;
+    __shared__ _Float16 xs[TM * Chunk];
+    __shared__ float fin[TM * 128];
+    const Tile tile = a.tiles[blockIdx.y];
+    const unsigned m = Down ? 2U : blockIdx.z;
+    const moe::Exl3 w = matrix(a, tile.expert, m);
+    if (w.bits == 6) core<6, TM, Down, Cached>(a, tile, w, m, xs, fin);
+    else core<4, TM, Down, Cached>(a, tile, w, m, xs, fin);
+}
+// V3: dense operand schedule, with one CTA per (expert, output block, matrix).
+// The descriptor address is wave-uniform; load it once outside all row/split loops.
+// Bits is a launch-time specialization, never a per-row or per-k branch.
+template<int Bits, bool Down>
+__device__ __forceinline__ void core_v3(Args a, Tile tile, moe::Exl3 w, unsigned m,
+                                       std::uint32_t* act, float* total) {
+    constexpr unsigned KPS = Down ? 16U : 8U, Splits = Down ? 4U : 32U;
+    constexpr unsigned Pairs = KPS * 8U, N = Down ? H : I;
+    const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x >> 5U;
+    const unsigned col = blockIdx.x * 8U + wave;
+    const d::LaneGeom<Bits> geo(lane);
+    const auto* packed = reinterpret_cast<const unsigned char*>(w.trellis);
+    for (unsigned q = threadIdx.x; q < 16U * 128U; q += 256U) total[q] = 0.0F;
+    __syncthreads();
+    for (unsigned sp = 0; sp < Splits; ++sp) {
+        for (unsigned q = threadIdx.x; q < 16U * Pairs; q += 256U) {
+            const unsigned r = q / Pairs, c = q % Pairs;
+            std::uint32_t value = 0;
+            if (r < tile.count) {
+                const unsigned pair = a.pairs[tile.first + r];
+                const _Float16* input;
+                if constexpr (Down) input = a.at + std::size_t{pair} * I;
+                else input = a.input + (std::size_t{pair} * 2U + m) * H;
+                __builtin_memcpy(&value, input + (sp * Pairs + c) * 2U, sizeof(value));
+            }
+            act[q] = value;
+        }
+        __syncthreads();
+        float sums[16][2] = {};
+        for (unsigned kk = 0; kk < KPS; ++kk) {
+            const auto* raw = packed + (std::size_t{sp * KPS + kk} * (N / 16U) + col) * Bits * 32U;
+            const d::TileStates<Bits> st(raw, geo);
+            const d::Half2 w0 = d::mul1_pair(st.template state<0>(), st.template state<1>());
+            const d::Half2 w1 = d::mul1_pair(st.template state<2>(), st.template state<3>());
+            const d::Half2 w2 = d::mul1_pair(st.template state<4>(), st.template state<5>());
+            const d::Half2 w3 = d::mul1_pair(st.template state<6>(), st.template state<7>());
+#pragma unroll
+            for (unsigned r = 0; r < 16U; ++r) {
+                const unsigned p = r * Pairs + kk * 8U + (lane & 3U);
+                const d::Half2 a0 = __builtin_bit_cast(d::Half2, act[p]);
+                const d::Half2 a1 = __builtin_bit_cast(d::Half2, act[p + 4U]);
+                sums[r][0] = __builtin_amdgcn_fdot2(w0, a0, sums[r][0], false);
+                sums[r][0] = __builtin_amdgcn_fdot2(w1, a1, sums[r][0], false);
+                sums[r][1] = __builtin_amdgcn_fdot2(w2, a0, sums[r][1], false);
+                sums[r][1] = __builtin_amdgcn_fdot2(w3, a1, sums[r][1], false);
+            }
+        }
+#pragma unroll
+        for (unsigned r = 0; r < 16U; ++r) {
+            const float v0 = d::reduce4(sums[r][0]), v1 = d::reduce4(sums[r][1]);
+            if ((lane & 3U) == 0) {
+                const unsigned o = r * 128U + wave * 16U + lane / 4U;
+                total[o] = total[o] + v0;
+                total[o + 8U] = total[o + 8U] + v1;
+            }
+        }
+        __syncthreads(); // finish LDS reads before staging the next split
+    }
+    for (unsigned r = wave; r < tile.count; r += 8U) {
+        float v[4];
+#pragma unroll
+        for (unsigned j = 0; j < 4U; ++j) v[j] = total[r * 128U + lane + 32U * j];
+        d::hadamard128(v, lane);
+        const unsigned pair = a.pairs[tile.first + r];
+#pragma unroll
+        for (unsigned j = 0; j < 4U; ++j) {
+            const unsigned o = blockIdx.x * 128U + lane + 32U * j;
+            const float value = v[j] * d::half_bits(w.svh[o]);
+            if constexpr (Down) a.output[std::size_t{pair} * H + o] = value;
+            else a.gu[(std::size_t{pair} * 2U + m) * I + o] = value;
+        }
+    }
+    __syncthreads(); // other waves must finish total before the next row tile clears it
+}
+constexpr unsigned kSharedRows = 64;
+template<int Bits, bool Down, bool Shared>
+__global__ __launch_bounds__(256) void linear_kernel_v3(Args a) {
+    __shared__ std::uint32_t act[16U * (Down ? 128U : 64U)];
+    __shared__ float total[16U * 128U];
+    const unsigned expert = Shared ? E : blockIdx.y;
+    const Tile group = a.groups[expert];
+    if (group.count == 0) return; // uniform, before any barrier
+    const unsigned m = Down ? 2U : blockIdx.z;
+    const auto* descriptor = d::uniform((&a.experts[expert].gate) + m);
+    moe::Exl3 w = *descriptor;
+    w.trellis = d::uniform(w.trellis);
+    w.suh = d::uniform(w.suh);
+    w.svh = d::uniform(w.svh);
+    // The shared expert has every row: its row tiles are spread over blockIdx.y slices of kSharedRows rows
+    // (a routed expert has ~57 rows at R 2048 and keeps one CTA per output block).
+    const unsigned r0 = Shared ? blockIdx.y * kSharedRows : 0U;
+    const unsigned r1 = Shared ? (group.count < r0 + kSharedRows ? group.count : r0 + kSharedRows) : group.count;
+    for (unsigned r = r0; r < r1; r += 16U) {
+        const Tile tile{expert, group.first + r, r1 - r < 16U ? r1 - r : 16U};
+        core_v3<Bits, Down>(a, tile, w, m, act, total);
+    }
+}
+template<bool Down>
+void launch_linear_v3(Args a, unsigned shared_bits, hipStream_t stream) {
+    constexpr unsigned N = Down ? H : I;
+    linear_kernel_v3<4, Down, false><<<dim3(N / 128U, E, Down ? 1U : 2U), 256, 0, stream>>>(a);
+    ok(hipGetLastError(), "v3 routed linear");
+    if (shared_bits == 6U)
+        linear_kernel_v3<6, Down, true><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
+    else
+        linear_kernel_v3<4, Down, true><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
+    ok(hipGetLastError(), "v3 shared linear");
+}
+__global__ void activation_kernel(Args a) {
+    const Tile tile = a.tiles[blockIdx.y];
+    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
+    const moe::Exl3 down = matrix(a, tile.expert, 2);
+    for (unsigned r = wave; r < tile.count; r += 8) {
+        const unsigned pair = a.pairs[tile.first + r];
+        float v[4];
+#pragma unroll
+        for (unsigned j = 0; j < 4; ++j) {
+            const unsigned i = blockIdx.x * 128 + lane + 32 * j;
+            const float g = a.gu[(std::size_t{pair} * 2) * I + i];
+            const float u = a.gu[(std::size_t{pair} * 2 + 1) * I + i];
+            const float gg = g > kClamp ? kClamp : g;
+            const float uu = u > kClamp ? kClamp : (u < -kClamp ? -kClamp : u);
+            const float act = silu(gg) * uu;
+            const float scaled = d::materialize(act * d::half_bits(down.suh[i]));
+            v[j] = static_cast<float>(static_cast<_Float16>(scaled));
+        }
+        d::hadamard128(v, lane);
+#pragma unroll
+        for (unsigned j = 0; j < 4; ++j)
+            a.at[std::size_t{pair} * I + blockIdx.x * 128 + lane + 32 * j] = static_cast<_Float16>(v[j]);
+    }
+}
+__global__ void combine_kernel(Args a) {
+    const unsigned row = blockIdx.y, i = blockIdx.x * 256 + threadIdx.x;
+    float y = 0.0F;
+    for (unsigned k = 0; k < 8; ++k)
+        y = __builtin_fmaf(a.weights[row * 8 + k], a.output[(std::size_t{row} * P + k) * H + i], y);
+    a.out[std::size_t{row} * H + i] = y + a.output[(std::size_t{row} * P + 8) * H + i];
+}
+template<int TM, bool Cached> void launch(Args a, unsigned tiles, hipStream_t stream) {
+    if constexpr (Cached) {
+        input_kernel<<<dim3(H / 1024, tiles, 2), 256, 0, stream>>>(a);
+        ok(hipGetLastError(), "gate/up input transform");
+    }
+    linear_kernel<TM, false, Cached><<<dim3(I / 128, tiles, 2), 256, 0, stream>>>(a);
+    ok(hipGetLastError(), "gate/up");
+    activation_kernel<<<dim3(I / 128, tiles), 256, 0, stream>>>(a);
+    ok(hipGetLastError(), "R15/down transform");
+    linear_kernel<TM, true, Cached><<<dim3(H / 128, tiles), 256, 0, stream>>>(a);
+    ok(hipGetLastError(), "down");
+    combine_kernel<<<dim3(H / 256, a.rows), 256, 0, stream>>>(a);
+    ok(hipGetLastError(), "R16");
+}
+void check_matrix(const moe::Exl3& w, unsigned input, unsigned output, bool shared) {
+    if (!w.trellis || !w.suh || !w.svh || w.input != input || w.output != output ||
+        (w.bits != 4 && !(shared && w.bits == 6)))
+        throw std::invalid_argument("exact moe: invalid raw matrix");
+}
+} // namespace
+Plan::Plan(unsigned max_rows) : capacity(max_rows) {
+    (void)Layout(max_rows);
+    pairs.reserve(std::size_t{max_rows} * P);
+    tiles.reserve(std::size_t{max_rows} * P / 16 + E + 1);
+}
+std::size_t workspace_bytes(unsigned max_rows) { return Layout(max_rows).bytes; }
+const std::uint16_t* pair_down_input(void* ws, unsigned rows, unsigned pair) {
+    return reinterpret_cast<const std::uint16_t*>(static_cast<unsigned char*>(ws) + Layout(rows).at) + std::size_t{pair} * I;
+}
+const float* pair_gate_up(void* ws, unsigned rows, unsigned pair) {
+    return reinterpret_cast<const float*>(static_cast<unsigned char*>(ws) + Layout(rows).gu) + std::size_t{pair} * 2 * I;
+}
+const float* pair_output(void* ws, unsigned rows, unsigned pair) {
+    return reinterpret_cast<const float*>(static_cast<unsigned char*>(ws) + Layout(rows).output) + std::size_t{pair} * H;
+}
+void enqueue(const View& v, Plan& plan, void* ws, std::size_t bytes, hipStream_t stream, unsigned tm) {
+    const Layout l(plan.capacity);
+    if (!v.rows || v.rows > plan.capacity || !v.experts || !v.x || !v.ids || !v.weights || !v.out || !ws || bytes < l.bytes)
+        throw std::invalid_argument("exact moe: invalid view/workspace");
+    if (tm == 0) {
+        const char* s = std::getenv("STRIX_GLM_PF_EXACTMOE_TM");
+        if (!s || std::string(s) == "16") tm = 16;
+        else if (std::string(s) == "32") tm = 32;
+        else throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_TM must be 16 or 32");
+    }
+    if (tm != 16 && tm != 32) throw std::invalid_argument("exact moe: TM must be 16 or 32");
+    const char* variant = std::getenv("STRIX_GLM_PF_EXACTMOE_V");
+    const bool v2 = variant && std::string(variant) == "2";
+    // v3 is the measured default (real pair, 1K/8K/32K TTFT logits bitwise == v1 on both ranks, -10..-11 % ms/token);
+    // STRIX_GLM_PF_EXACTMOE_V=1 restores v1.
+    const bool v3 = !variant || std::string(variant) == "3";
+    if (variant && std::string(variant) != "1" && !v2 && !v3)
+        throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_V must be 1, 2 or 3");
+    for (unsigned e = 0; e <= E; ++e) {
+        const auto& ex = e == E ? v.shared : v.experts[e];
+        check_matrix(ex.gate, H, I, e == E);
+        check_matrix(ex.up, H, I, e == E);
+        check_matrix(ex.down, I, H, e == E);
+    }
+    if (v.shared.gate.bits != v.shared.up.bits)
+        throw std::invalid_argument("exact moe: shared gate/up bits must match decode contract");
+    std::array<Tile, E + 1> groups{};
+    std::array<unsigned, E + 1> count{}, offset{}, cursor{};
+    count[E] = v.rows;
+    for (unsigned r = 0; r < v.rows; ++r)
+        for (unsigned k = 0; k < 8; ++k) {
+            const unsigned e = v.ids[r * 8 + k];
+            if (e >= E || (k && e <= v.ids[r * 8 + k - 1]))
+                throw std::invalid_argument("exact moe: ids must be distinct, ascending and <288");
+            ++count[e];
+        }
+    unsigned n = 0;
+    for (unsigned e = 0; e <= E; ++e) {
+        offset[e] = cursor[e] = n;
+        groups[e] = {e, n, count[e]};
+        n += count[e];
+    }
+    plan.pairs.resize(n);
+    plan.tiles.clear();
+    for (unsigned r = 0; r < v.rows; ++r) {
+        for (unsigned k = 0; k < 8; ++k) plan.pairs[cursor[v.ids[r * 8 + k]]++] = r * P + k;
+        plan.pairs[cursor[E]++] = r * P + 8;
+    }
+    for (unsigned e = 0; e <= E; ++e)
+        for (unsigned r = 0; r < count[e]; r += tm)
+            plan.tiles.push_back({e, offset[e] + r, count[e] - r < tm ? count[e] - r : tm});
+    auto* base = static_cast<unsigned char*>(ws);
+    auto* table = reinterpret_cast<moe::ExpertSlices*>(base + l.table);
+    auto* pairs = reinterpret_cast<unsigned*>(base + l.pairs);
+    auto* tiles = reinterpret_cast<Tile*>(base + l.tiles);
+    auto* device_groups = reinterpret_cast<Tile*>(base + l.groups);
+    ok(hipMemcpyAsync(table, v.experts, E * sizeof(moe::ExpertSlices), hipMemcpyHostToDevice, stream), "expert table");
+    ok(hipMemcpyAsync(table + E, &v.shared, sizeof(moe::ExpertSlices), hipMemcpyHostToDevice, stream), "shared expert");
+    ok(hipMemcpyAsync(pairs, plan.pairs.data(), plan.pairs.size() * sizeof(unsigned), hipMemcpyHostToDevice, stream), "pairs");
+    ok(hipMemcpyAsync(tiles, plan.tiles.data(), plan.tiles.size() * sizeof(Tile), hipMemcpyHostToDevice, stream), "tiles");
+    if (v3) ok(hipMemcpyAsync(device_groups, groups.data(), sizeof(groups), hipMemcpyHostToDevice, stream), "expert groups");
+    // Owns host upload lifetimes even when callers immediately reuse their table or Plan.
+    ok(hipStreamSynchronize(stream), "plan upload");
+    Args a{v.rows, v.x, v.weights, v.out, table, v.shared, pairs, tiles, device_groups,
+           reinterpret_cast<float*>(base + l.gu), reinterpret_cast<_Float16*>(base + l.at), reinterpret_cast<float*>(base + l.output),
+           reinterpret_cast<_Float16*>(base + l.input)};
+    const unsigned nt = static_cast<unsigned>(plan.tiles.size());
+    if (v3) {
+        input_kernel<<<dim3(H / 1024, nt, 2), 256, 0, stream>>>(a);
+        ok(hipGetLastError(), "v3 gate/up input transform");
+        launch_linear_v3<false>(a, v.shared.gate.bits, stream);
+        activation_kernel<<<dim3(I / 128, nt), 256, 0, stream>>>(a);
+        ok(hipGetLastError(), "v3 R15/down transform");
+        launch_linear_v3<true>(a, v.shared.down.bits, stream);
+        combine_kernel<<<dim3(H / 256, a.rows), 256, 0, stream>>>(a);
+        ok(hipGetLastError(), "v3 R16");
+    } else if (v2) {
+        if (tm == 16) launch<16, true>(a, nt, stream);
+        else launch<32, true>(a, nt, stream);
+    } else {
+        if (tm == 16) launch<16, false>(a, nt, stream);
+        else launch<32, false>(a, nt, stream);
+    }
+}
+} // namespace strix::glm::pf::exact_moe
