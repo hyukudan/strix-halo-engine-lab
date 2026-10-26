@@ -1,0 +1,249 @@
+{
+  "schema_version": 1,
+  "engine": "minimax-pair",
+  "$comment": "Measured 2026-10-26 with this kit on two Strix Halo nodes (USB4 pair) running binaries built from public main 1f930f6c; kit prompt set, quick suite, one run; every DSpark output equals greedy. Hashes only: sha256 of the prompt and output token-id lists plus the engine digests. Null or absent means NO-REFERENCE.",
+  "reference_keys": {
+    "0e36599b601348cd8f810daccc4cd05ede356d4eaa975ce8727ded8561ece0c1": {
+      "engine": "minimax-pair",
+      "profile": "exl3-3.06-usb4gpu:default",
+      "environment": {
+        "sessions": {
+          "STRIX_MM_XFER": "default",
+          "STRIX_MM_PFX": "default",
+          "STRIX_MM_PF_INTERLEAVE": "default",
+          "STRIX_MMX_MOE_WIDE": "2",
+          "STRIX_MM_INDEX_CONC": "1",
+          "STRIX_MMX_CRC": "deferred",
+          "STRIX_MM_XB_WAIT": "1",
+          "STRIX_MM_XB_INPLACE": "1",
+          "STRIX_MM_XB_PUBLISH": "1",
+          "STRIX_MM_XB_POSTILP": "2",
+          "STRIX_MM_XB_WARM": "8",
+          "STRIX_MM_DSPARK_ATTN": "2",
+          "STRIX_MM_DRAFT_LIN": "opt",
+          "STRIX_MMX_PREFILL_CORE": "v4",
+          "STRIX_MM_PF_MSA_BATCH": "1",
+          "STRIX_MM_PF_ATTEND4": "1",
+          "STRIX_MM_PF_ROUTER_BATCH": "1",
+          "STRIX_MMX_PREFILL_MTFIT": "1",
+          "STRIX_MM_PF_MSA_REWORK": "3",
+          "STRIX_MMX_PREFILL_PIPE": "1",
+          "STRIX_MM_PF_KV_TILE": "auto",
+          "STRIX_MM_PF_TX_UNCACHED": "1",
+          "STRIX_DIST_CRC_PARALLEL": "1",
+          "STRIX_DIST_HOST_CRC_OVERLAP": "1",
+          "STRIX_DIST_HOST_CHUNK_BYTES": "1048576"
+        }
+      },
+      "prompt_set_sha256": "1e068336054c42369159f8e066526ee7552408451af124314808c5f9ec514efd",
+      "model_sha256s": [
+        "01a13fa194313b925b4f7b69b7aa315aa13ee68a47d4ddb4a8e73e2cf8768ff8",
+        "01a13fa194313b925b4f7b69b7aa315aa13ee68a47d4ddb4a8e73e2cf8768ff8",
+        "0706ae8b93b3489a3b3bc7f48a5f29fb34b1449ebebb37586250e4d5fa8f5e35",
+        "0d590eff2c085753447280604dd5dacffc4c8ebb489cf32abe22b07b5d1eea73",
+        "154e30c6c3cf15f6388c69d614c7222453246ae2a7157a9f2f93469b1644bbf1",
+        "15caca9f74fbce9b86dc014e9324cbefa56703d81ccd6d56020faa1c41d2eae5",
+        "15caca9f74fbce9b86dc014e9324cbefa56703d81ccd6d56020faa1c41d2eae5",
+        "1cc609c81468cc5540576a7864472fef0342cb271c4668ebe5bbfb9f630b9c52",
+        "272d19efac5060ff8c9f76c7ed67909a5da1be466284ee4f1f1bd2a810c6fad2",
+        "2eae6f9b5c591d364d3539e9b913bfd413f5cec977e5ff86b3475c1089aec9fb",
+        "30485a1fdfa051c8ec2c9f4cf67a83589da7b5298d63140df8cfdc73cc0b119f",
+        "36785da1dc7a00324048bd7c537c24247fca97c626884818257fd0b92287de31",
+        "401b624ec44507183d1dc65c74f7f3387699a77971aa19fa5a0cc57a3989ba97",
+        "401b624ec44507183d1dc65c74f7f3387699a77971aa19fa5a0cc57a3989ba97",
+        "45890ab98759ee6bea63f281dcfb82c6f459a3e097280fee0419e31636a6e079",
+        "4ed3df7b5baa33bae305eaec1c01c69e2e8130c953665aab6b42affc545d349d",
+        "593f6315b17044d94d5a7e1d231669bcc4dbf9efb06657816d945f1f45c82a6a",
+        "63f277741fb061e615cb604286a845d971178ba4716732a59cf42b3752c0ce4e",
+        "63f277741fb061e615cb604286a845d971178ba4716732a59cf42b3752c0ce4e",
+        "66a58bff02a2551dc53cf8d53eb44695352f439dba0540fcf4d3a34c6c917c85",
+        "7c3b6f9ff2f9b1daad27a31a6826e3822b8d72c8707b7a5abb558172af3571af",
+        "7c83b166a4e56923b6ecad96c9c653ed91f4ed3d306b2df4782bedda193ed5fa",
+        "8218f98634c365608a98ea887bfebac37131ec2acdb8445188350490de7cf994",
+        "836c3e4aff06f88bd2891b18292424ed7a90158b508d9235d490a33d9e3cba32",
+        "9a8f7b510e915b286b1130f9daf343586b1289fa4c9ca948b0b3660d0593c2a1",
+        "a5b7882fc33ca53e7236aa6eca79b0ea08844aab997cdc99047ad25ae7cb021b",
+        "a71a16355b4e772383a433f92c8c452dc24b5bb82046142b8221576c6c5fe23c",
+        "b37d0a302c37e5c6000cfc4fa775473153602feb6482cf49cecf3f8d3549e3a1",
+        "b44c066b5dc34c800c4e3ecbd85f3e95ce3bfdbf8a5fe30223e005175103578a",
+        "b44c066b5dc34c800c4e3ecbd85f3e95ce3bfdbf8a5fe30223e005175103578a",
+        "b9073e059987e466494f283763ea5011a9c8dc8a502c875b3c5cb6ad46b49b76",
+        "bb1f1626cf01448f1e3b6036d0a061ffc66c91d9046aada14ea23a5441b5ad6e",
+        "bb1f1626cf01448f1e3b6036d0a061ffc66c91d9046aada14ea23a5441b5ad6e",
+        "bf9ceb18221107a7ebdebbc9171fe066efd46bad903db02b20d9d920edefd671",
+        "c02bec4ab6fe55375072a3e99073296f18f6b63c43c89a1023ce6ed77f951795",
+        "c1e053dd40967d6bb11a043388042ac5cb661cf0d2fcb851697156552959ae25",
+        "c556b80622c6ccab005c6d9bb28ecefc483d4a85f21cfcbc2e8bae043daeffea",
+        "ca47ea60cf5bd48832586adc264f439d0ea4254176b24a95f85eaa9750e2b5f9",
+        "ca47ea60cf5bd48832586adc264f439d0ea4254176b24a95f85eaa9750e2b5f9",
+        "ced0f8d85d73f8722fecb26033d2d91ecf4a4e5112c91ce1b1522ca7edd0943d",
+        "d07019a083738402fa9d99ff0624e30d67240704fe6eefe90859eeb3c7dc0f2a",
+        "d3f2ef9a308be0c5689e98b348d8cff73b90487db22ba79e9269f9b1f25cfa3a",
+        "d6959473568cdee51e45cb74c0c17fe8a59a0a6e98e0598e72350db296849617",
+        "d7327371f5e49c8c5ca7201add5738a7630a00c2f8b7eabd2f228ccd2e28a8b4",
+        "daeaf6eee77b5b041a4eb7f1f7fb6265872d99deadfaa71a5d4c6eb73166a35f",
+        "dbfa5d84d04bef126ed8afa6bb4ac9f56cdb2cfeb5d957527a4e908127ecc80a",
+        "e9439e2c524d3cb6e6b9f8ef85fca731bbf8b126954ef847771afbbf55fbd113",
+        "fc27eeea348f83a0f6367b76a6714bf22e7e95c12e5a9056441271f7e8be83d2"
+      ]
+    }
+  },
+  "identities": {
+    "0e36599b601348cd8f810daccc4cd05ede356d4eaa975ce8727ded8561ece0c1": {
+      "exl3-3.06-usb4gpu:default:chat-ctx1024:greedy:128": {
+        "prompt_sha256": "4f34148498e5ff0bf568da000e220739f93c3dbb9343589bee50fc93df59c545",
+        "token_ids_sha256": "29857078ffabf1e9d5f3e20ee97d708d295218094a7af15c4ed5c9343f1b5015",
+        "engine_digest": {
+          "tokens_fnv": "5dd6b861b51ffd05",
+          "state_fnv": "6b5b92c0e78fb111",
+          "final_rows_fnv": "2c0798646fd2209e"
+        },
+        "actual_tokens": 128
+      },
+      "exl3-3.06-usb4gpu:default:chat-es-ctx1024:greedy:128": {
+        "prompt_sha256": "6978b5d08cb6a37e01b69076a69231401df9ca0f52425eabff687f88e2db1e2b",
+        "token_ids_sha256": "fd162dc7adf39c97a6ed4be45acb5ff914639476b98a071d6074c9b2a24d55a0",
+        "engine_digest": {
+          "tokens_fnv": "9dbad936f0551a9f",
+          "state_fnv": "f9a92aa104af8c7f",
+          "final_rows_fnv": "da05f3958f55df0f"
+        },
+        "actual_tokens": 128
+      },
+      "exl3-3.06-usb4gpu:default:code-ctx1024:greedy:128": {
+        "prompt_sha256": "628dcbcf4bb86a9b2e3f791f121e3ec016303f8f151972dd3214ad4cae11a6f6",
+        "token_ids_sha256": "76f617abbed209d10649289187d3e3b653b57200bae9dea1b80a2e86772ec318",
+        "engine_digest": {
+          "tokens_fnv": "9c334efe3dec6ed3",
+          "state_fnv": "fd8a1a7c13a56b18",
+          "final_rows_fnv": "78be89c86887510f"
+        },
+        "actual_tokens": 128
+      },
+      "exl3-3.06-usb4gpu:default:json-ctx1024:greedy:128": {
+        "prompt_sha256": "1c6558b729e372ddc87057cd15ccfd148f2f44b43125815a38a0f42074b71065",
+        "token_ids_sha256": "dfb63f49b1863418eae412a5da236a3646db117efdd717bd898f7a657645f181",
+        "engine_digest": {
+          "tokens_fnv": "ab984d5a1f75ad9b",
+          "state_fnv": "8ef331a497650353",
+          "final_rows_fnv": "61fac6409234da28"
+        },
+        "actual_tokens": 128
+      },
+      "exl3-3.06-usb4gpu:default:math-ctx1024:greedy:128": {
+        "prompt_sha256": "685ff08ff9f9eadf100e10a7c24b5734f3e0debb47e5e6b44392ecfc039a9481",
+        "token_ids_sha256": "abbd086037528a20798c100c3874921319649abc9bc3eda34150f7b8f1a2165e",
+        "engine_digest": {
+          "tokens_fnv": "bfa7891d33745fda",
+          "state_fnv": "4cb028989af7afd5",
+          "final_rows_fnv": "8b459c0d6649e33b"
+        },
+        "actual_tokens": 128
+      },
+      "exl3-3.06-usb4gpu:default:prose-ctx1024:greedy:128": {
+        "prompt_sha256": "65d80cb20bb68d0a2795e9cc0245f2529ea17507767051b9ad12deca3587486e",
+        "token_ids_sha256": "e7fe4c82e086d248442b5bf826562479783c78f4c7dcf86ceeda0fd28b699525",
+        "engine_digest": {
+          "tokens_fnv": "07f3bd5d58cf9e6f",
+          "state_fnv": "3b72de1b1119951b",
+          "final_rows_fnv": "e1775f54cac6ae4c"
+        },
+        "actual_tokens": 128
+      },
+      "exl3-3.06-usb4gpu:default:summary-ctx1024:greedy:128": {
+        "prompt_sha256": "c888da7ae58e48b189a3c56b1128e6960cd16494ff2cabc52b6a882480f407ba",
+        "token_ids_sha256": "0563d3e099dc21d6729f68c70ce3a1d187445d1913a1d3a45b1e0ed13b1aaf7a",
+        "engine_digest": {
+          "tokens_fnv": "d39e010381269da8",
+          "state_fnv": "ed5fd8824055dfb1",
+          "final_rows_fnv": "dcc9615258505edc"
+        },
+        "actual_tokens": 128
+      },
+      "exl3-3.06-usb4gpu:default:sql-ctx1024:greedy:128": {
+        "prompt_sha256": "c096271c4d226033b44505a2db68c2e2c5ac504ef04e1e191131eb4fdf03f590",
+        "token_ids_sha256": "233704a4eecfff7c48fac4e2669848c1c9cbd01f2e11c57f561d092c091754b4",
+        "engine_digest": {
+          "tokens_fnv": "8f8c1f36fb06d05c",
+          "state_fnv": "359718fe2352e3bc",
+          "final_rows_fnv": "c1e48186355c87d5"
+        },
+        "actual_tokens": 128
+      },
+      "exl3-3.06-usb4gpu:default:prefill-1024:ttft:1": {
+        "prompt_sha256": "4f34148498e5ff0bf568da000e220739f93c3dbb9343589bee50fc93df59c545",
+        "token_ids_sha256": "d5d7694ab3caf6d315b9d717b725284a12965d83e92e180678780c2ca42f087c",
+        "engine_digest": {
+          "tokens_fnv": "a7c302841c0390e8",
+          "state_fnv": "6b5b92c0e78fb111",
+          "final_rows_fnv": "2c0798646fd2209e"
+        },
+        "actual_tokens": 1
+      },
+      "exl3-3.06-usb4gpu:default:chat-ctx1024:spec:128": {
+        "prompt_sha256": "4f34148498e5ff0bf568da000e220739f93c3dbb9343589bee50fc93df59c545",
+        "token_ids_sha256": "29857078ffabf1e9d5f3e20ee97d708d295218094a7af15c4ed5c9343f1b5015",
+        "engine_digest": {
+          "tokens_fnv": "5dd6b861b51ffd05"
+        },
+        "actual_tokens": 128
+      },
+      "exl3-3.06-usb4gpu:default:chat-es-ctx1024:spec:128": {
+        "prompt_sha256": "6978b5d08cb6a37e01b69076a69231401df9ca0f52425eabff687f88e2db1e2b",
+        "token_ids_sha256": "fd162dc7adf39c97a6ed4be45acb5ff914639476b98a071d6074c9b2a24d55a0",
+        "engine_digest": {
+          "tokens_fnv": "9dbad936f0551a9f"
+        },
+        "actual_tokens": 128
+      },
+      "exl3-3.06-usb4gpu:default:code-ctx1024:spec:128": {
+        "prompt_sha256": "628dcbcf4bb86a9b2e3f791f121e3ec016303f8f151972dd3214ad4cae11a6f6",
+        "token_ids_sha256": "76f617abbed209d10649289187d3e3b653b57200bae9dea1b80a2e86772ec318",
+        "engine_digest": {
+          "tokens_fnv": "9c334efe3dec6ed3"
+        },
+        "actual_tokens": 128
+      },
+      "exl3-3.06-usb4gpu:default:json-ctx1024:spec:128": {
+        "prompt_sha256": "1c6558b729e372ddc87057cd15ccfd148f2f44b43125815a38a0f42074b71065",
+        "token_ids_sha256": "dfb63f49b1863418eae412a5da236a3646db117efdd717bd898f7a657645f181",
+        "engine_digest": {
+          "tokens_fnv": "ab984d5a1f75ad9b"
+        },
+        "actual_tokens": 128
+      },
+      "exl3-3.06-usb4gpu:default:math-ctx1024:spec:128": {
+        "prompt_sha256": "685ff08ff9f9eadf100e10a7c24b5734f3e0debb47e5e6b44392ecfc039a9481",
+        "token_ids_sha256": "abbd086037528a20798c100c3874921319649abc9bc3eda34150f7b8f1a2165e",
+        "engine_digest": {
+          "tokens_fnv": "bfa7891d33745fda"
+        },
+        "actual_tokens": 128
+      },
+      "exl3-3.06-usb4gpu:default:prose-ctx1024:spec:128": {
+        "prompt_sha256": "65d80cb20bb68d0a2795e9cc0245f2529ea17507767051b9ad12deca3587486e",
+        "token_ids_sha256": "e7fe4c82e086d248442b5bf826562479783c78f4c7dcf86ceeda0fd28b699525",
+        "engine_digest": {
+          "tokens_fnv": "07f3bd5d58cf9e6f"
+        },
+        "actual_tokens": 128
+      },
+      "exl3-3.06-usb4gpu:default:summary-ctx1024:spec:128": {
+        "prompt_sha256": "c888da7ae58e48b189a3c56b1128e6960cd16494ff2cabc52b6a882480f407ba",
+        "token_ids_sha256": "0563d3e099dc21d6729f68c70ce3a1d187445d1913a1d3a45b1e0ed13b1aaf7a",
+        "engine_digest": {
+          "tokens_fnv": "d39e010381269da8"
+        },
+        "actual_tokens": 128
+      },
+      "exl3-3.06-usb4gpu:default:sql-ctx1024:spec:128": {
+        "prompt_sha256": "c096271c4d226033b44505a2db68c2e2c5ac504ef04e1e191131eb4fdf03f590",
+        "token_ids_sha256": "233704a4eecfff7c48fac4e2669848c1c9cbd01f2e11c57f561d092c091754b4",
+        "engine_digest": {
+          "tokens_fnv": "8f8c1f36fb06d05c"
+        },
+        "actual_tokens": 128
+      }
+    }
+  }
+}

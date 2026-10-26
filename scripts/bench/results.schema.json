@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Public engine benchmark results",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "kit_version",
+    "repo_commit",
+    "engine",
+    "identity",
+    "identity_sha256",
+    "status",
+    "hardware",
+    "prompts",
+    "measurements",
+    "exactness"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kit_version": {
+      "type": "string"
+    },
+    "repo_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "engine": {
+      "enum": [
+        "qwen",
+        "deepseek-pair",
+        "deepseek-rtx",
+        "glm-pair",
+        "minimax-pair"
+      ]
+    },
+    "identity": {
+      "type": "object"
+    },
+    "identity_sha256": {
+      "$ref": "#/$defs/hash"
+    },
+    "status": {
+      "enum": [
+        "complete",
+        "failed",
+        "mismatch"
+      ]
+    },
+    "hardware": {
+      "type": "object"
+    },
+    "prompts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "tokens",
+          "sha256",
+          "construction"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "tokens": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "sha256": {
+            "$ref": "#/$defs/hash"
+          },
+          "construction": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "measurements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "prompt_id",
+          "mode",
+          "unit",
+          "repeat_count",
+          "samples",
+          "median",
+          "min",
+          "max"
+        ],
+        "properties": {
+          "unit": {
+            "enum": [
+              "s",
+              "tok/s"
+            ]
+          },
+          "repeat_count": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "samples": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            }
+          },
+          "median": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          },
+          "min": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          },
+          "max": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          }
+        }
+      }
+    },
+    "exactness": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "prompt_id",
+          "mode",
+          "generate_length",
+          "actual_tokens",
+          "prompt_sha256",
+          "token_ids_sha256",
+          "engine_digest",
+          "repeat_stable",
+          "verdict"
+        ],
+        "properties": {
+          "verdict": {
+            "enum": [
+              "EXACT",
+              "MISMATCH",
+              "NO-REFERENCE"
+            ]
+          },
+          "prompt_sha256": {
+            "$ref": "#/$defs/hash"
+          },
+          "token_ids_sha256": {
+            "$ref": "#/$defs/hash"
+          },
+          "engine_digest": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "repeat_stable": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "reference_sha256": {
+      "$ref": "#/$defs/hash"
+    },
+    "reference_key": {
+      "type": "object"
+    }
+  },
+  "$defs": {
+    "hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "engine": "qwen",
+  "$comment": "No measured public token references yet. Replace unmeasured with an actual identity SHA256 after maintainer review. Null always means NO-REFERENCE.",
+  "identities": {
+    "unmeasured": {
+      "chat:plain:256": null,
+      "chat:spec:256": null,
+      "code:plain:256": null,
+      "code:spec:256": null,
+      "prose:plain:256": null,
+      "prose:spec:256": null,
+      "code-edit-en:plain:256": null,
+      "code-edit-en:spec:256": null,
+      "quote-en:plain:256": null,
+      "quote-en:spec:256": null,
+      "prefill-1024:ttft:1": null,
+      "prefill-8192:ttft:1": null,
+      "prefill-32768:ttft:1": null
+    }
+  }
+}

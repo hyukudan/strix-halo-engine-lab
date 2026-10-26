@@ -1,5 +1,7 @@
 # Measured performance
 
+For current benchmark commands, model requirements, reference verdicts and machine interfaces, see [Reproduce engine measurements](reproduce.md).
+
 Every speed number quoted in the [README](../README.md) is listed here with its date, configuration and
 exactness check. All numbers are measured in the lab; values are medians of 3 or more runs unless a row
 says otherwise. The overnight snapshot states counts where recorded; unspecified counts must not be assumed to be medians.

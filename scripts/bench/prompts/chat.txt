@@ -1,0 +1,1 @@
+Explain how a queue helps a small workshop keep track of incoming repair jobs. Use three clear sentences and no headings.

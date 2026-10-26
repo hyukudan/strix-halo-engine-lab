@@ -127,6 +127,8 @@ The core knows no model: each family is a module with its own contract, plan, ke
 
 ## How fast
 
+Use the [benchmark kit and reproduction guide](docs/reproduce.md) for current commands, model requirements, machine interfaces and issue-ready reports.
+
 Every speed below is measured in the lab with greedy decoding (temperature 0). Exactness is relative to the
 named numerical profile; the trellis RTX pipeline split and GLM R1b decode have separate identities, as
 noted below. Bandwidth ceilings are calculated bounds, not measured throughput. Evidence, methods and older values are in

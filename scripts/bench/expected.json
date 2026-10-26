@@ -1,0 +1,258 @@
+{
+  "schema_version": 1,
+  "$comment": "Only published README values. No extrapolated rates. WARN while workload match cannot be established.",
+  "rows": [
+    {
+      "engine": "qwen",
+      "prompt_id": "code",
+      "mode": "spec",
+      "value": 59.59,
+      "unit": "tok/s",
+      "tolerance": 0.1,
+      "workload_match": false,
+      "$comment": "README.md How fast / Qwen: MTP decode, 1K code auto windows, 2026-10-25, 702bc074. Kit short prompt is different; context reference only."
+    },
+    {
+      "engine": "qwen",
+      "prompt_id": "prose",
+      "mode": "spec",
+      "value": 55.7,
+      "unit": "tok/s",
+      "tolerance": 0.1,
+      "workload_match": false,
+      "$comment": "README.md How fast / Qwen: MTP decode, 1K typical prose, 0117a140. Published prompt text unavailable."
+    },
+    {
+      "engine": "qwen",
+      "prompt_id": "prefill-1024",
+      "mode": "ttft",
+      "value": 1.12,
+      "unit": "s",
+      "tolerance": 0.15,
+      "workload_match": false,
+      "$comment": "README.md How fast / Qwen: Prefill TTFT, one node, 2026-10-24/25. Sweep prompt kind unspecified; kit seed differs."
+    },
+    {
+      "engine": "qwen",
+      "prompt_id": "prefill-32768",
+      "mode": "ttft",
+      "value": 22.95,
+      "unit": "s",
+      "tolerance": 0.15,
+      "workload_match": false,
+      "$comment": "README.md How fast / Qwen: Prefill TTFT, one node, 2026-10-24/25. Sweep prompt kind unspecified; kit seed differs."
+    },
+    {
+      "engine": "deepseek-pair",
+      "prompt_id": "code",
+      "mode": "greedy",
+      "value": 34.5,
+      "unit": "tok/s",
+      "tolerance": 0.1,
+      "workload_match": false,
+      "$comment": "README.md How fast / DeepSeek: Greedy decode 29.0 ms/token (34.5 tok/s), 69c6bdab; short benchmark prompt unspecified."
+    },
+    {
+      "engine": "deepseek-pair",
+      "prompt_id": "code",
+      "mode": "spec",
+      "value": 70.6,
+      "unit": "tok/s",
+      "tolerance": 0.1,
+      "workload_match": false,
+      "$comment": "README.md How fast / DeepSeek: DSpark decode, eight prompts per type x 256 tokens, code, cab238d6. Original prompt set not published."
+    },
+    {
+      "engine": "deepseek-pair",
+      "prompt_id": "prose",
+      "mode": "spec",
+      "value": 41.9,
+      "unit": "tok/s",
+      "tolerance": 0.1,
+      "workload_match": false,
+      "$comment": "README.md How fast / DeepSeek: DSpark decode, English typical, eight prompts x 256, cab238d6."
+    },
+    {
+      "engine": "deepseek-pair",
+      "prompt_id": "prefill-1024",
+      "mode": "ttft",
+      "value": 2.18,
+      "unit": "s",
+      "tolerance": 0.15,
+      "workload_match": false,
+      "$comment": "README.md How fast / DeepSeek: Device prefill TTFT, 1K cab238d6 / 8K f9332f3e / 32K 43086d05. Prompt texts unspecified."
+    },
+    {
+      "engine": "deepseek-pair",
+      "prompt_id": "prefill-8192",
+      "mode": "ttft",
+      "value": 10.78,
+      "unit": "s",
+      "tolerance": 0.15,
+      "workload_match": false,
+      "$comment": "README.md How fast / DeepSeek: Device prefill TTFT, 1K cab238d6 / 8K f9332f3e / 32K 43086d05. Prompt texts unspecified."
+    },
+    {
+      "engine": "deepseek-pair",
+      "prompt_id": "prefill-32768",
+      "mode": "ttft",
+      "value": 39.6,
+      "unit": "s",
+      "tolerance": 0.15,
+      "workload_match": false,
+      "$comment": "README.md How fast / DeepSeek: Device prefill TTFT, 1K cab238d6 / 8K f9332f3e / 32K 43086d05. Prompt texts unspecified."
+    },
+    {
+      "engine": "deepseek-pair",
+      "prompt_id": "http-c1",
+      "mode": "aggregate-wall",
+      "value": 39.88,
+      "unit": "tok/s",
+      "tolerance": 0.1,
+      "workload_match": false,
+      "$comment": "README.md How fast / DeepSeek: Server eight-category short set, C1/C4/C8, cab238d6. Kit uses eight fixed requests drawn from three original texts."
+    },
+    {
+      "engine": "deepseek-pair",
+      "prompt_id": "http-c4",
+      "mode": "aggregate-wall",
+      "value": 66.53,
+      "unit": "tok/s",
+      "tolerance": 0.1,
+      "workload_match": false,
+      "$comment": "README.md How fast / DeepSeek: Server eight-category short set, C1/C4/C8, cab238d6. Kit uses eight fixed requests drawn from three original texts."
+    },
+    {
+      "engine": "deepseek-pair",
+      "prompt_id": "http-c8",
+      "mode": "aggregate-wall",
+      "value": 74.25,
+      "unit": "tok/s",
+      "tolerance": 0.1,
+      "workload_match": false,
+      "$comment": "README.md How fast / DeepSeek: Server eight-category short set, C1/C4/C8, cab238d6. Kit uses eight fixed requests drawn from three original texts."
+    },
+    {
+      "engine": "deepseek-rtx",
+      "prompt_id": "code",
+      "mode": "spec",
+      "value": 82.3,
+      "unit": "tok/s",
+      "tolerance": 0.1,
+      "workload_match": false,
+      "$comment": "README.md How fast / Standalone RTX: same-load code DSpark 2026-10-25. Original prompt lengths/counts unspecified; kit uses 96 prompt + 128 steps."
+    },
+    {
+      "engine": "deepseek-rtx",
+      "prompt_id": "prose",
+      "mode": "spec",
+      "value": 87.7,
+      "unit": "tok/s",
+      "tolerance": 0.1,
+      "workload_match": false,
+      "$comment": "README.md How fast / Standalone RTX: same-load English DSpark 2026-10-25. Original prompt lengths/counts unspecified."
+    },
+    {
+      "engine": "minimax-pair",
+      "prompt_id": "*",
+      "mode": "greedy",
+      "value": 22.44,
+      "unit": "tok/s",
+      "tolerance": 0.1,
+      "workload_match": false,
+      "$comment": "README.md How fast / MiniMax M3.1 Flash, 2026-10-26: Greedy decode 1K benchmark prompt, 44.57 ms/token (22.44 tok/s), 8cc30ac0. Prompt unpublished."
+    },
+    {
+      "engine": "minimax-pair",
+      "prompt_id": "prefill-1024",
+      "mode": "ttft",
+      "value": 2.75,
+      "unit": "s",
+      "tolerance": 0.15,
+      "workload_match": false,
+      "$comment": "README.md How fast / MiniMax M3.1 Flash, 2026-10-26: Combined prefill same process, 1K, 2.73-2.77 s (midpoint), 561de319."
+    },
+    {
+      "engine": "minimax-pair",
+      "prompt_id": "json",
+      "mode": "spec",
+      "value": 54.4,
+      "unit": "tok/s",
+      "tolerance": 0.1,
+      "workload_match": false,
+      "$comment": "README.md How fast / MiniMax M3.1 Flash, 2026-10-26: DSpark JSON, 256 tokens, 8cc30ac0. README task is a JSON conversion (copy-heavy); kit JSON prompt differs."
+    },
+    {
+      "engine": "minimax-pair",
+      "prompt_id": "code",
+      "mode": "spec",
+      "value": 34.1,
+      "unit": "tok/s",
+      "tolerance": 0.1,
+      "workload_match": false,
+      "$comment": "README.md How fast / MiniMax M3.1 Flash, 2026-10-26: DSpark Python, 256 tokens, 8cc30ac0."
+    },
+    {
+      "engine": "minimax-pair",
+      "prompt_id": "prose",
+      "mode": "spec",
+      "value": 24.1,
+      "unit": "tok/s",
+      "tolerance": 0.1,
+      "workload_match": false,
+      "$comment": "README.md How fast / MiniMax M3.1 Flash, 2026-10-26: DSpark prose, 256 tokens, 8cc30ac0."
+    },
+    {
+      "engine": "glm-pair",
+      "profile": "r1",
+      "prompt_id": "*",
+      "mode": "greedy",
+      "value": 22.08,
+      "unit": "tok/s",
+      "tolerance": 0.1,
+      "workload_match": false,
+      "$comment": "README.md How fast / GLM-5.3 Flash, 2026-10-26: Greedy decode R1, 31-token chat prompt + 64 tokens, 45.29 ms/token, 1836c99c."
+    },
+    {
+      "engine": "glm-pair",
+      "profile": "r1b",
+      "prompt_id": "*",
+      "mode": "greedy",
+      "value": 23.84,
+      "unit": "tok/s",
+      "tolerance": 0.1,
+      "workload_match": false,
+      "$comment": "README.md How fast / GLM-5.3 Flash, 2026-10-26: R1b-fast row, same chat benchmark, 41.93-41.96 ms/token (41.94 -> 23.84 tok/s), 8877de1d."
+    },
+    {
+      "engine": "glm-pair",
+      "prompt_id": "prefill-1024",
+      "mode": "ttft",
+      "value": 4.268,
+      "unit": "s",
+      "tolerance": 0.15,
+      "workload_match": false,
+      "$comment": "README.md How fast / GLM-5.3 Flash, 2026-10-26: Exact chunked prefill 1K, 875ca821/41d8cfdc; prompt kind unspecified."
+    },
+    {
+      "engine": "glm-pair",
+      "prompt_id": "prefill-8192",
+      "mode": "ttft",
+      "value": 34.7,
+      "unit": "s",
+      "tolerance": 0.15,
+      "workload_match": false,
+      "$comment": "README.md How fast / GLM-5.3 Flash, 2026-10-26: Exact chunked prefill 8K."
+    },
+    {
+      "engine": "glm-pair",
+      "prompt_id": "prefill-32768",
+      "mode": "ttft",
+      "value": 144.75,
+      "unit": "s",
+      "tolerance": 0.15,
+      "workload_match": false,
+      "$comment": "README.md How fast / GLM-5.3 Flash, 2026-10-26: Exact chunked prefill 32K."
+    }
+  ]
+}
