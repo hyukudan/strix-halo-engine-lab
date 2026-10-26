@@ -1,3 +1,4 @@
+// Modified for optional LookaheadCache integration, 2026-10-26.
 #pragma clang fp contract(off)
 #include "strix/hip_ds41_dspark.hpp"
 
@@ -5,16 +6,24 @@
 #include <hip/hip_runtime.h>
 
 #include "strix/hip_ds41_formats.hpp"
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+#include "strix_lookahead/device.h"
+#endif
 
 #include <algorithm>
+#include <charconv>
+#include <cerrno>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace strix::ds41::dspark {
 namespace {
@@ -23,6 +32,42 @@ void check(hipError_t status, const char* what) {
     if (status != hipSuccess) throw std::runtime_error(std::string("ds41 dspark: ") + what + ": " + hipGetErrorString(status));
 }
 hipStream_t as_stream(void* stream) { return static_cast<hipStream_t>(stream); }
+
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+static_assert(std::string_view{STRIX_LOOKAHEAD_LIBRARY_VERSION} == "0.4.2",
+              "lookahead footprint requires LookaheadCache 0.4.2");
+static_assert(markov_rank == SL_PAIR_RANK);
+constexpr std::uint32_t lookahead_status_offset = block_size + 1U;
+constexpr std::uint32_t lookahead_hit_offset = lookahead_status_offset + block_size;
+constexpr std::uint32_t lookahead_token_slots = lookahead_hit_offset + block_size;
+#endif
+
+void bump(std::uint64_t& value, std::uint64_t amount = 1U) {
+    const auto limit = std::numeric_limits<std::uint64_t>::max();
+    value = amount > limit - value ? limit : value + amount;
+}
+
+void lookahead_json_string(std::FILE* file, std::string_view value) {
+    std::fputc('"', file);
+    for (const char raw : value) {
+        const auto c = static_cast<unsigned char>(raw);
+        if (c == '"' || c == '\\') std::fprintf(file, "\\%c", static_cast<int>(c));
+        else if (c < 0x20U) std::fprintf(file, "\\u%04x", static_cast<unsigned>(c));
+        else std::fputc(static_cast<int>(c), file);
+    }
+    std::fputc('"', file);
+}
+
+std::optional<std::uint32_t> environment_lookahead_capacity() {
+    const auto* value = std::getenv("STRIX_LOOKAHEAD_CAPACITY");
+    if (!value) return std::nullopt;
+    std::uint32_t capacity = 0;
+    const auto* end = value + std::strlen(value);
+    const auto parsed = std::from_chars(value, end, capacity);
+    if (value == end || parsed.ec != std::errc{} || parsed.ptr != end)
+        throw std::invalid_argument("lookahead-cache: STRIX_LOOKAHEAD_CAPACITY must be an unsigned decimal integer");
+    return capacity;
+}
 
 __device__ __forceinline__ float f16_device(std::uint16_t bits) { return __half2float(__ushort_as_half(bits)); }
 // Wave-order reduction: every lane holds its ascending partial sum; butterfly d = 16..1.
@@ -236,6 +281,33 @@ __global__ __launch_bounds__(32) void confidence_kernel(const float* weight, con
     acc = butterfly(acc);
     if (lane == 0U) out[r] = acc;
 }
+
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+// Publish the optional head's tokens and telemetry in the existing confidence
+// launch. The normal confidence arithmetic is identical to confidence_kernel.
+// A failed row never reads a stale predecessor embedding, and is rejected on
+// the host before any Draft is returned to target verification.
+__global__ __launch_bounds__(32) void lookahead_confidence_kernel(const float* weight, const float* x,
+    const float* markov, const sl_device_result* results, std::uint32_t* tokens, float* out) {
+    const unsigned lane = threadIdx.x, r = blockIdx.x;
+    const auto result = results[r];
+    if (lane == 0U) {
+        tokens[r + 1U] = result.status == SL_OK ? result.selection.token : vocab;
+        tokens[lookahead_status_offset + r] = result.status;
+        tokens[lookahead_hit_offset + r] = result.selection.cache_hit;
+    }
+    if (result.status != SL_OK) {
+        if (lane == 0U) out[r] = __builtin_nanf("");
+        return;
+    }
+    const float* xr = x + static_cast<std::size_t>(r) * hidden;
+    const float* er = markov + static_cast<std::size_t>(r) * markov_rank;
+    float acc = 0.0F;
+    for (unsigned j = lane; j < confidence_width; j += 32U) acc = acc + weight[j] * (j < hidden ? xr[j] : er[j - hidden]);
+    acc = butterfly(acc);
+    if (lane == 0U) out[r] = acc;
+}
+#endif
 
 // ---- router of the draft rows (reference_router of ds41_moe.hpp): one wave per (expert, row) for
 // the scores, then one block per row for the top-k ----
@@ -526,6 +598,30 @@ struct Buffer {
 template <class T>
 Buffer<T> upload_span(std::span<const T> s) { return Buffer<T>(s.data(), s.size()); }
 
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+struct LookaheadBinding {
+    Buffer<std::uint32_t> mapping;
+    sl_hip_pair* handle = nullptr;
+    std::uint32_t size = 0;
+    LookaheadBinding() = default;
+    LookaheadBinding(const LookaheadBinding&) = delete;
+    LookaheadBinding& operator=(const LookaheadBinding&) = delete;
+    sl_status close() noexcept {
+        if (!handle) return SL_OK;
+        const auto status = sl_hip_pair_destroy(handle);
+        if (status == SL_OK || status == SL_DEVICE_ERROR) handle = nullptr;
+        return status;
+    }
+    ~LookaheadBinding() {
+        const auto status = close();
+        if (status != SL_OK)
+            std::fprintf(stderr, "lookahead-cache: binding cleanup failed: %s\n", sl_status_string(status));
+    }
+};
+#endif
+
+struct TraceCloser { void operator()(std::FILE* file) const noexcept { if (file) (void)std::fclose(file); } };
+
 struct DeviceQ8 {
     Buffer<std::uint8_t> bytes;
     std::uint32_t width = 0, outputs = 0;
@@ -669,7 +765,18 @@ struct DeviceDrafter::Impl {
     Buffer<float> rope_table{static_cast<std::size_t>(max_rows) * rope_dim};
     Buffer<std::uint32_t> zero{1};
     // Draft step buffers (5 rows).
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+    Buffer<std::uint32_t> tokens{lookahead_token_slots};
+    Buffer<sl_device_result> lookahead_results{block_size};
+    std::unique_ptr<LookaheadBinding> lookahead_binding;
+#else
     Buffer<std::uint32_t> tokens{block_size + 1U};
+#endif
+    LookaheadStats lookahead_counts;
+    std::uint64_t lookahead_budget = 64ULL * 1024U * 1024U;
+    std::uint64_t vocabulary_epoch = 1, next_vocabulary_epoch = 1;
+    bool used_lookahead = false;
+    std::unique_ptr<std::FILE, TraceCloser> lookahead_trace;
     Buffer<float> streams{static_cast<std::size_t>(block_size) * stream_width}, streams2{static_cast<std::size_t>(block_size) * stream_width};
     Buffer<float> attn_mix{block_size * mix_count}, ffn_mix{block_size * mix_count}, pre_mix{block_size * mix_count},
         identity{block_size * mix_count};
@@ -725,6 +832,10 @@ struct DeviceDrafter::Impl {
         Buffer<std::uint32_t> extra_ids;
         Buffer<std::uint8_t> extra_rows;
         Buffer<float> logits_extra;
+        std::uint64_t vocabulary_epoch = 0;
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+        std::unique_ptr<LookaheadBinding> lookahead_binding;
+#endif
     };
     std::vector<Context> parked;
     std::uint32_t active = 0;
@@ -739,6 +850,10 @@ struct DeviceDrafter::Impl {
         std::swap(extra_ids, other.extra_ids);
         std::swap(extra_rows, other.extra_rows);
         std::swap(logits_extra, other.logits_extra);
+        std::swap(vocabulary_epoch, other.vocabulary_epoch);
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+        std::swap(lookahead_binding, other.lookahead_binding);
+#endif
     }
     // A fresh context: empty rings, position 0, the full vocabulary (as a new DeviceDrafter).
     Context fresh_context() {
@@ -752,6 +867,7 @@ struct DeviceDrafter::Impl {
         ctx.extra_ids = Buffer<std::uint32_t>(8192);
         ctx.extra_rows = Buffer<std::uint8_t>(static_cast<std::size_t>(8192) * output.row_bytes);
         ctx.logits_extra = Buffer<float>(static_cast<std::size_t>(block_size) * 8192);
+        advance_epoch(ctx.vocabulary_epoch);
         return ctx;
     }
 
@@ -820,7 +936,142 @@ struct DeviceDrafter::Impl {
         memlog("route tables + extra rows", gtt_mark, std::uint64_t{extra_capacity} * output.row_bytes);
     }
     std::uint64_t memlog_stages_expected = 0;
-    ~Impl() { (void)hipStreamDestroy(stream); }
+    ~Impl() {
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+        // Bindings borrow weights and this stream. Destroy both active and
+        // parked handles before the stream and the model buffers disappear.
+        lookahead_binding.reset();
+        for (auto& context : parked) context.lookahead_binding.reset();
+#endif
+        (void)hipStreamDestroy(stream);
+    }
+
+    void require_outside_capture() const {
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        check(hipStreamIsCapturing(stream, &capture), "lookahead capture state");
+        if (capture != hipStreamCaptureStatusNone)
+            throw std::logic_error("lookahead-cache: binding changes require a stream outside graph capture");
+    }
+    void advance_epoch(std::uint64_t& epoch) {
+        if (next_vocabulary_epoch == std::numeric_limits<std::uint64_t>::max())
+            throw std::overflow_error("lookahead-cache: vocabulary epoch exhausted");
+        epoch = ++next_vocabulary_epoch;
+    }
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+    void clear_lookahead(std::unique_ptr<LookaheadBinding>& binding) {
+        if (!binding) return;
+        const auto status = binding->close();
+        if (status != SL_OK) {
+            bump(lookahead_counts.errors);
+            throw std::runtime_error(std::string("lookahead-cache: close binding: ") + sl_status_string(status));
+        }
+        binding.reset();
+    }
+    void bind_lookahead(std::unique_ptr<LookaheadBinding>& binding, std::uint32_t selected_core,
+                        const std::vector<std::uint32_t>& selected_extra) {
+        if (!lookahead_counts.requested || world != 1U || binding) return;
+        require_outside_capture();
+        auto fresh = std::make_unique<LookaheadBinding>();
+        fresh->size = selected_core + static_cast<std::uint32_t>(selected_extra.size());
+        std::vector<std::uint32_t> mapping;
+        if (!selected_extra.empty()) {
+            mapping.resize(fresh->size);
+            for (std::uint32_t i = 0; i < selected_core; ++i) mapping[i] = i;
+            std::copy(selected_extra.begin(), selected_extra.end(), mapping.begin() + selected_core);
+            fresh->mapping = Buffer<std::uint32_t>(mapping.size());
+            fresh->mapping.upload(mapping.data(), mapping.size(), stream);
+        }
+        sl_pair_config config;
+        sl_pair_config_init(&config);
+        config.vocabulary_size = fresh->size;
+        config.embedding_rows = vocab;
+        config.capacity_entries = lookahead_counts.capacity;
+        config.head_layout = SL_PAIR_HEAD_GLOBAL;
+        config.head = markov_head.data;
+        config.embeddings = markov_embed.data;
+        config.token_ids = fresh->mapping.data;
+        config.payload_budget_bytes = lookahead_budget;
+        // Each binding owns its mapping and lives under one immutable weight
+        // instance. The library never uses opaque identity bytes as a hash.
+        const auto status = sl_hip_pair_create(&config, stream, &fresh->handle);
+        if (status != SL_OK) {
+            bump(lookahead_counts.errors);
+            throw std::runtime_error(std::string("lookahead-cache: create binding: ") + sl_status_string(status));
+        }
+        binding = std::move(fresh);
+        bump(lookahead_counts.map_rebuilds);
+    }
+#endif
+    void invalidate_active_lookahead() {
+        require_outside_capture();
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+        clear_lookahead(lookahead_binding);
+#endif
+        advance_epoch(vocabulary_epoch);
+    }
+    void bind_active_lookahead() {
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+        bind_lookahead(lookahead_binding, core, extra_host);
+#endif
+    }
+    void reset_active_lookahead() {
+        require_outside_capture();
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+        if (lookahead_binding) {
+            const auto status = sl_hip_pair_reset(lookahead_binding->handle);
+            if (status != SL_OK) {
+                bump(lookahead_counts.errors);
+                throw std::runtime_error(std::string("lookahead-cache: reset binding: ") + sl_status_string(status));
+            }
+        }
+#endif
+        advance_epoch(vocabulary_epoch);
+    }
+
+    void record_lookahead(const std::vector<std::uint32_t>& downloaded) {
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+        if (used_lookahead) {
+            // Validate every position before the caller can observe a draft.
+            for (std::uint32_t r = 0; r < block_size; ++r)
+                if (downloaded[lookahead_status_offset + r] != SL_OK || downloaded[r + 1U] >= vocab) {
+                    bump(lookahead_counts.errors);
+                    throw std::runtime_error("lookahead-cache: device proposal failed; draft discarded");
+                }
+            for (std::uint32_t r = 0; r < block_size; ++r) {
+                bump(lookahead_counts.steps);
+                bump(downloaded[lookahead_hit_offset + r] ? lookahead_counts.hits : lookahead_counts.misses);
+            }
+        }
+#endif
+        if (!lookahead_trace) return;
+        const auto mode = !lookahead_counts.requested ? "baseline" : !used_lookahead ? "fallback" :
+                          lookahead_counts.capacity == 0U ? "uncached" : "cached";
+        std::fprintf(lookahead_trace.get(),
+            "{\"event\":\"draft\",\"context_id\":%u,\"vocabulary_epoch\":%llu,\"vocabulary_size\":%u,"
+            "\"capacity\":%u,\"mode\":\"%s\",\"predecessors\":[",
+            active, static_cast<unsigned long long>(vocabulary_epoch), core + static_cast<std::uint32_t>(extra_host.size()),
+            lookahead_counts.requested ? lookahead_counts.capacity : 0U, mode);
+        for (std::uint32_t r = 0; r < block_size; ++r)
+            std::fprintf(lookahead_trace.get(), "%s%u", r ? "," : "", downloaded[r]);
+        std::fputs("],\"cache_hits\":[", lookahead_trace.get());
+        for (std::uint32_t r = 0; r < block_size; ++r) {
+            std::uint32_t hit = 0;
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+            if (used_lookahead) hit = downloaded[lookahead_hit_offset + r];
+#endif
+            std::fprintf(lookahead_trace.get(), "%s%u", r ? "," : "", hit);
+        }
+        std::fputs("],\"library_version\":", lookahead_trace.get());
+        lookahead_json_string(lookahead_trace.get(), lookahead_counts.library_version);
+        std::fputs(",\"library_config\":", lookahead_trace.get());
+        lookahead_json_string(lookahead_trace.get(), lookahead_counts.library_config);
+        if (lookahead_counts.requested && !used_lookahead)
+            std::fprintf(lookahead_trace.get(), ",\"fallback_reason\":\"%s\"",
+                lookahead_counts.compiled ? "vocabulary_sharded" : "not_compiled");
+        std::fputs("}\n", lookahead_trace.get());
+        if (std::fflush(lookahead_trace.get()) != 0 || std::ferror(lookahead_trace.get()))
+            throw std::runtime_error("lookahead-cache: trace write failed");
+    }
 
     // y[rows][outputs] = Q8_0 linear of x (A8 per row), launched in row chunks whose staged rows fit in LDS.
     void q8_linear(const DeviceQ8& w, const float* xin, std::uint32_t rows, float* out) {
@@ -1002,6 +1253,34 @@ struct DeviceDrafter::Impl {
             v.weights = extra_rows.data + static_cast<std::size_t>(eb) * output.row_bytes; v.outputs = ec; v.out = logits_extra.data;
             enqueue_product(WeightFormat::q8_0, v, stream);
         }
+        used_lookahead = false;
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+        if (lookahead_counts.requested && world == 1U) {
+            if (!lookahead_binding || lookahead_binding->size != cc + ec || cb != 0U || eb != 0U)
+                throw std::logic_error("lookahead-cache: head has no matching vocabulary binding");
+            for (std::uint32_t i = 0; i < rows; ++i) {
+                const auto* predecessor = i == 0U ? tokens.data : &lookahead_results.data[i - 1U].selection.token;
+                const auto status = sl_hip_pair_enqueue_step(lookahead_binding->handle, predecessor,
+                    cc ? logits.data + static_cast<std::size_t>(i) * cc : nullptr,
+                    ec ? logits_extra.data + static_cast<std::size_t>(i) * ec : nullptr, cc,
+                    lookahead_results.data + i, markov.data + static_cast<std::size_t>(i) * markov_rank, nullptr);
+                if (status != SL_OK) {
+                    bump(lookahead_counts.errors);
+                    throw std::runtime_error(std::string("lookahead-cache: enqueue failed; draft discarded: ") + sl_status_string(status));
+                }
+            }
+            hipLaunchKernelGGL(lookahead_confidence_kernel, dim3(rows), dim3(32), 0, stream,
+                confidence.data, x.data, markov.data, lookahead_results.data, tokens.data, confidence_out.data);
+            const auto error = hipGetLastError();
+            if (error != hipSuccess) {
+                bump(lookahead_counts.errors);
+                check(error, "lookahead confidence launch");
+            }
+            used_lookahead = true;
+            return;
+        }
+#endif
+        if (lookahead_counts.requested) bump(lookahead_counts.fallback_windows);
         HeadView h{logits.data, cc, cb, logits_extra.data, ec, eb, extra_ids.data, markov_embed.data, markov_head.data, tokens.data,
                    markov.data, best_values.data, best_ids.data};
         for (std::uint32_t i = 0; i < rows; ++i) {
@@ -1028,7 +1307,21 @@ struct DeviceDrafter::Impl {
     }
 };
 
-DeviceDrafter::DeviceDrafter(const Weights& weights) : impl_(std::make_unique<Impl>(weights)) {}
+DeviceDrafter::DeviceDrafter(const Weights& weights) : impl_(std::make_unique<Impl>(weights)) {
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+    impl_->lookahead_counts.compiled = true;
+    impl_->lookahead_counts.library_version = STRIX_LOOKAHEAD_LIBRARY_VERSION;
+    impl_->lookahead_counts.library_config = STRIX_LOOKAHEAD_LIBRARY_CONFIG;
+#endif
+    if (const auto* path = std::getenv("STRIX_LOOKAHEAD_TRACE")) {
+        // A trace starts with the first draft and must not overwrite or append
+        // to another run. Use a distinct filename per process/drafter.
+        auto* file = std::fopen(path, "wx");
+        if (!file) throw std::runtime_error(std::string("lookahead-cache: create trace: ") + std::strerror(errno));
+        impl_->lookahead_trace.reset(file);
+    }
+    if (const auto capacity = environment_lookahead_capacity()) configure_lookahead(true, *capacity);
+}
 DeviceDrafter::~DeviceDrafter() = default;
 std::uint64_t DeviceDrafter::next() const noexcept { return impl_->next; }
 void DeviceDrafter::set_vocabulary(const Vocab& vocabulary) {
@@ -1039,6 +1332,7 @@ void DeviceDrafter::set_vocabulary(const Vocab& vocabulary) {
         if (id < vocabulary.core || id >= vocab || seen[id]) throw std::invalid_argument("ds41 dspark draft vocabulary: bad extra id");
         seen[id] = 1U;
     }
+    m.invalidate_active_lookahead();
     m.core = vocabulary.core;
     m.extra_host.clear();
     std::fill(m.member.begin(), m.member.end(), 0U);
@@ -1053,17 +1347,58 @@ std::size_t DeviceDrafter::add_vocabulary(std::span<const std::uint32_t> ids) {
             fresh.push_back(id);
         }
     for (const auto id : fresh) m.member[id] = 0U; // push_extra sets them again
-    m.push_extra(fresh);
+    if (!fresh.empty()) {
+        m.invalidate_active_lookahead();
+        m.push_extra(fresh);
+    }
     return fresh.size();
 }
 void DeviceDrafter::set_rank(std::uint32_t rank, std::uint32_t world, RankExchange exchange) {
     if (world == 0U || world > 2U || rank >= world || (world == 2U && !exchange)) throw std::invalid_argument("ds41 dspark rank");
+    impl_->require_outside_capture();
     impl_->rank = rank;
     impl_->world = world;
     impl_->exchange = std::move(exchange);
+    configure_lookahead(impl_->lookahead_counts.requested, impl_->lookahead_counts.capacity, impl_->lookahead_budget);
+}
+void DeviceDrafter::configure_lookahead(bool enabled, std::uint32_t capacity, std::uint64_t payload_budget_bytes) {
+    auto& m = *impl_;
+    m.require_outside_capture();
+    if (enabled) (void)lookahead_footprint(capacity, sequences(), payload_budget_bytes);
+    // All handles borrow the same stream/model. Clear them at reconfiguration;
+    // each context binds once on its next draft after rank/vocabulary setup.
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+    m.clear_lookahead(m.lookahead_binding);
+    for (auto& context : m.parked) m.clear_lookahead(context.lookahead_binding);
+#endif
+    m.lookahead_counts.requested = enabled;
+    m.lookahead_counts.capacity = capacity;
+    m.lookahead_budget = payload_budget_bytes;
+    m.advance_epoch(m.vocabulary_epoch);
+    for (std::size_t i = 0; i < m.parked.size(); ++i) {
+        if (i == m.active) continue;
+        auto& context = m.parked[i];
+        m.advance_epoch(context.vocabulary_epoch);
+    }
+}
+LookaheadStats DeviceDrafter::lookahead_stats() const noexcept {
+    auto result = impl_->lookahead_counts;
+    // Report effective capacity; a disabled adapter has no resident cache.
+    if (!result.requested) result.capacity = 0U;
+    result.vocabulary_size = impl_->core + static_cast<std::uint32_t>(impl_->extra_host.size());
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+    result.active = result.requested && impl_->world == 1U && impl_->lookahead_binding != nullptr;
+    const auto payload = [&](const std::unique_ptr<LookaheadBinding>& binding) {
+        if (binding) bump(result.payload_bytes, std::uint64_t{result.capacity} * binding->size * sizeof(float));
+    };
+    payload(impl_->lookahead_binding);
+    for (const auto& context : impl_->parked) payload(context.lookahead_binding);
+#endif
+    return result;
 }
 Vocab DeviceDrafter::vocabulary() const { return Vocab{impl_->core, impl_->extra_host}; }
 void DeviceDrafter::reset() {
+    impl_->reset_active_lookahead();
     for (auto& s : impl_->stage) check(hipMemsetAsync(s.ring.data, 0, s.ring.count, impl_->stream), "clear ring");
     check(hipStreamSynchronize(impl_->stream), "reset");
     impl_->next = 0;
@@ -1113,11 +1448,43 @@ DeviceDrafter::Footprint DeviceDrafter::footprint(const Weights& w, std::uint32_
     e1 += B * K * inter + B * inter;                                                                               // act / shared codes
     e4 += slots + (slots + 1U) + 3U * B * K + B;                                                                   // device routes
     e4 += B * vocab + 2U + 2U + B * markov_rank + 2U * u64{markov_blocks} + B;                                     // logits .. confidence_out
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+    e4 += 2U * B;  // status/hit words transferred with the normal token download
+    e1 += B * sizeof(sl_device_result);
+#endif
     f.scratch = 4U * e4 + e1;
     // a context: the stage rings, the extra vocabulary ids / head rows and their logits (the active one lives in Impl)
     const u64 context = u64{stages} * window * entry_bytes + 8192U * 4U + 8192U * w.output.row_bytes() + B * 8192U * 4U;
     f.contexts = context * std::max<std::uint32_t>(sequences, 1U);
+    if (const auto capacity = environment_lookahead_capacity()) f.lookahead = lookahead_footprint(*capacity, sequences);
+    std::uint64_t total = 0;
+    for (const auto bytes : {f.weights, f.scratch, f.contexts, f.lookahead}) {
+        if (bytes > std::numeric_limits<std::uint64_t>::max() - total)
+            throw std::overflow_error("lookahead-cache: total device reservation overflow");
+        total += bytes;
+    }
     return f;
+}
+std::uint64_t DeviceDrafter::lookahead_footprint(std::uint32_t capacity, std::uint32_t sequences,
+                                              std::uint64_t payload_budget_bytes) {
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+    const auto payload = std::uint64_t{capacity} * vocab * sizeof(float);
+    if (payload_budget_bytes != 0U && payload > payload_budget_bytes)
+        throw std::invalid_argument("lookahead-cache: full-vocabulary payload exceeds the per-context budget");
+    // LookaheadCache 0.4.2: entry={uint32 token,valid}; partial winner is four
+    // 32-bit words, at most 512 blocks. Reserve mapping even for dense vocabularies.
+    const auto one = payload + std::uint64_t{vocab} * sizeof(std::uint32_t) +
+                     std::uint64_t{capacity} * 2U * sizeof(std::uint32_t) + 512U * 4U * sizeof(std::uint32_t);
+    const auto contexts = std::max<std::uint32_t>(sequences, 1U);
+    if (one > std::numeric_limits<std::uint64_t>::max() / contexts)
+        throw std::overflow_error("lookahead-cache: context device reservation overflow");
+    return one * contexts;
+#else
+    (void)capacity;
+    (void)sequences;
+    (void)payload_budget_bytes;
+    return 0;
+#endif
 }
 std::uint32_t DeviceDrafter::sequences() const noexcept { return impl_->parked.empty() ? 1U : static_cast<std::uint32_t>(impl_->parked.size()); }
 void DeviceDrafter::select(std::uint32_t sequence) {
@@ -1175,6 +1542,8 @@ Draft DeviceDrafter::draft(std::uint32_t token, bool keep_logits, DraftTimes* ti
     auto& m = *impl_;
     constexpr std::uint32_t rows = block_size;
     if (token >= vocab) throw std::invalid_argument("ds41 dspark draft token");
+    // Bind once after rank/vocabulary setup, before any draft work is enqueued.
+    m.bind_active_lookahead();
     const auto start = clock::now();
     const std::uint64_t first = m.next, oldest = std::max(first > window ? first - window : std::uint64_t{0}, m.start);
     const auto ring_keys = static_cast<std::uint32_t>(first - oldest);
@@ -1223,9 +1592,14 @@ Draft DeviceDrafter::draft(std::uint32_t token, bool keep_logits, DraftTimes* ti
     enqueue_hc_pre(m.streams.data, rows, pre, mix_count, m.x.data, m.stream);
     enqueue_rms_norm(m.x.data, rows, hidden, m.final_norm.data, m.xn.data, m.stream);
     m.head(rows);
-    const auto tokens = m.tokens.download(m.stream);
+    std::size_t downloaded_tokens = block_size + 1U;
+#if defined(STRIX_ENABLE_LOOKAHEAD)
+    if (m.used_lookahead) downloaded_tokens = lookahead_token_slots;
+#endif
+    const auto tokens = m.tokens.download(m.stream, downloaded_tokens);
+    m.record_lookahead(tokens);
     const auto conf = m.confidence_out.download(m.stream);
-    std::copy(tokens.begin(), tokens.end(), out.tokens.begin());
+    std::copy_n(tokens.begin(), block_size + 1U, out.tokens.begin());
     std::copy(conf.begin(), conf.end(), out.confidence.begin());
     const auto local = m.local_rows();
     out.candidates.fill(local.core_count + local.extra_count);

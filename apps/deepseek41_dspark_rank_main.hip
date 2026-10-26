@@ -644,6 +644,17 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
             std::printf("\n");
             std::printf("draft per window %.2f ms; single steps (gate) %u\n", S.draft * 1e3 / std::max(1U, S.windows), S.plain_steps);
         }
+        // STRIX_LOOKAHEAD_CAPACITY runs: cumulative adapter counters of this process, so a qualification can reject a
+        // silent fallback (requested but no steps) without enabling the per-draft trace
+        if (drafter && drafter->lookahead_stats().requested) {
+            const auto l = drafter->lookahead_stats();
+            std::printf("lookahead-cache: compiled %d active %d capacity %u library %s payload %llu B steps %llu hits %llu misses %llu "
+                        "rebuilds %llu fallback windows %llu errors %llu\n", l.compiled, l.active, l.capacity, l.library_version,
+                        static_cast<unsigned long long>(l.payload_bytes), static_cast<unsigned long long>(l.steps),
+                        static_cast<unsigned long long>(l.hits), static_cast<unsigned long long>(l.misses),
+                        static_cast<unsigned long long>(l.map_rebuilds), static_cast<unsigned long long>(l.fallback_windows),
+                        static_cast<unsigned long long>(l.errors));
+        }
         std::printf("exchanges %llu, %.1f MB sent, %.3f s in exchange (stage %.3f, wire %.3f, check %.3f); wall %.1f s\n",
                     static_cast<unsigned long long>(cs.exchanges), static_cast<double>(cs.bytes_sent) / 1e6, cs.seconds, cs.stage, cs.wire, cs.check,
                     since(t_start));
