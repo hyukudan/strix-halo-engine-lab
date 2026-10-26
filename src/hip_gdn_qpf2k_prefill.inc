@@ -19,7 +19,16 @@ namespace qpf2k_gdn {
 //   1 = as 0, but the kernel returns at entry when the call's decay-NaN flag is set;
 //   2 = pinned order (per-lane VGPR decay, asm v_mul retained, decay; exact for every input, the multiplies lose
 //       VOPD), returns at entry when the flag is clear;
-//   3 = pinned order, no flag (default: c4bc77c1).
+//   3 = pinned order, no flag (default: c4bc77c1);
+//   4 = NaN witness (PARTS bit 128; gdn_core_kernel lean only): SGPR decay, no pinned order, and the
+//       kernel writes its final recurrent state / v conv history into scratch (xch.state_out / xch.conv_out) instead of
+//       the live buffers and sets *xch.witness when any final state element or any row's first-level norm sum is NaN.
+//       Without a NaN operand IEEE add / mul / fma give the same bits in either operand order and in every lane, so a
+//       kernel with the production's reduction pairs (stride-halving tree over the 128 keys: any G) is bitwise equal to
+//       production unless a NaN arises in a column chain; every such NaN reaches that column's final state (delta NaN ->
+//       fma(k, NaN, r)) or that row's output (q phase), which the witness tests. The launcher then runs the pinned Nan 2
+//       kernel guarded by the witness word (it reads the untouched live state / conv history) and otherwise copies the
+//       scratch into the live buffers (gdn_witness_commit_kernel).
 // STRIX_QPF2K_GDN_PARTS bit 32 (decay-NaN dispatch): gdn_decay_nan_kernel sets the flag, then the launcher runs Nan 2
 // and Nan 1 on the same arguments: exactly one of them does the work, so every call is exact and calls without a NaN
 // decay (all real prompts) run the VOPD-paired loop.
@@ -28,7 +37,7 @@ __device__ __forceinline__ float uniform(float value) {
     if constexpr (Opt & 2U) return __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(value)));
     else return value;
 }
-template <unsigned Nan> constexpr bool kPinDecay = Nan >= 2U;
+template <unsigned Nan> constexpr bool kPinDecay = Nan == 2U || Nan == 3U;
 // gdn_lane_tree's in-lane tree (level h adds p[j] + p[j + h], h = K/2 .. 1) evaluated in post order: node (r, s) =
 // node (r, 2s) + node (r + s, 2s), node (r, K) = leaf r. The same additions with the same operands in the same order;
 // only the evaluation order changes, so at most log2(K) + 1 partial sums are live instead of K products (Opt bit 4).
@@ -41,6 +50,28 @@ __device__ __forceinline__ float gdn_post_tree(const F& leaf) {
         const float upper = gdn_post_tree<K, R + S, 2U * S>(leaf);
         return lower + upper;
     }
+}
+// Two post-order trees evaluated node by node (leaf returns {a, b}): each tree has exactly gdn_post_tree's nodes and
+// operands; the two independent trees are interleaved (witness Opt bit 64).
+template <unsigned K, unsigned R = 0U, unsigned S = 1U, class F>
+__device__ __forceinline__ float2 gdn_post_tree2(const F& leaf) {
+#pragma clang fp contract(off)
+    if constexpr (S == K) return leaf(std::integral_constant<unsigned, R>{});
+    else {
+        const float2 lower = gdn_post_tree2<K, R, 2U * S>(leaf);
+        const float2 upper = gdn_post_tree2<K, R + S, 2U * S>(leaf);
+        return make_float2(lower.x + upper.x, lower.y + upper.y);
+    }
+}
+// gdn_lane_group_sum's pairs (row_xmask G/2 .. 1) with an identity-0, bound_ctrl DPP source so the DPP combiner can fuse
+// the move into the add (witness Opt bit 32; the operand order is free under the witness; all lanes of a row are valid).
+template <unsigned G>
+__device__ __forceinline__ float gdn_lane_group_sum_fused(float sum) {
+#pragma clang fp contract(off)
+    if constexpr (G > 1U) {
+        sum = sum + __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(sum), 0x160 + static_cast<int>(G / 2U), 0xf, 0xf, true));
+        return gdn_lane_group_sum_fused<G / 2U>(sum);
+    } else return sum;
 }
 // true when this Nan variant does no work for the call (flag read once, uniform: a scalar load and branch)
 template <unsigned Nan>
@@ -393,7 +424,22 @@ struct NormExchange {
     _Float16* core16 = nullptr;              // owned compact output rows (F16 lean core only)
     std::uint32_t core16_pitch = 0;          // halves per row, tiled::scratch_pitch(value_width)
     unsigned* core16_overflow = nullptr;     // dense FP16 diagnostic: one count per aligned group of 8
+    float* state_out;                        // Nan 4 (witness): final recurrent state written here (live layout)
+    std::uint16_t* conv_out;                 // Nan 4: v conv history written here (conv_state layout)
+    unsigned* witness;                       // Nan 4: set to 1 when a NaN arose (the pinned fallback then runs)
 };
+__device__ __forceinline__ bool is_nan_bits(float x) { return (__float_as_uint(x) & 0x7fffffffU) > 0x7f800000U; }
+// Nan 4 commit: when the witness is clear, the scratch state and v conv history become the live ones.
+template <unsigned Block = 256U>
+__global__ __launch_bounds__(Block) void gdn_witness_commit_kernel(const unsigned* witness, const float* state_out, float* state,
+    std::uint64_t state_quads, const std::uint16_t* conv_out, std::uint16_t* conv_state, std::uint64_t conv_begin, std::uint64_t conv_n) {
+    if (__builtin_amdgcn_readfirstlane(static_cast<int>(*witness)) != 0) return;
+    const std::uint64_t step = static_cast<std::uint64_t>(gridDim.x) * 256U;
+    for (std::uint64_t i = static_cast<std::uint64_t>(blockIdx.x) * 256U + threadIdx.x; i < state_quads; i += step)
+        reinterpret_cast<float4*>(state)[i] = reinterpret_cast<const float4*>(state_out)[i];
+    for (std::uint64_t i = static_cast<std::uint64_t>(blockIdx.x) * 256U + threadIdx.x; i < conv_n; i += step)
+        conv_state[conv_begin + i] = conv_out[conv_begin + i];
+}
 // production gated-norm product value * inv * weight * gate in the production ISA's operand order
 __device__ __forceinline__ float gated_norm_product(float value, float inv, float weight, float gate) {
     return mul_src0(gate, mul_src0(mul_src0(inv, value), weight));
@@ -490,6 +536,26 @@ __device__ __forceinline__ float gdn_v_conv_value(const std::uint16_t (&vraw)[Ri
     const float silu = sum / (1.0F + expf(-sum));
     return round_bf16(silu);
 }
+// Nan 4 (witness) compact stage: key i of a row at [i / G / 4][i % G][i / G % 4], so lane sub reads its keys sub + G m
+// (m = 0..K-1) as K/4 float4 at a stride of G float4 (the padded ColsStage at G 8 needs 27.3 KB per block: 5 blocks per
+// WGP would exceed 128 KiB and the cooperative launch would not be resident).
+template <unsigned G, unsigned Chunk> struct KrStage {
+    static constexpr unsigned K = 128U / G;
+    alignas(16) float key[Chunk][K / 4U][G][4];
+    alignas(16) float query[Chunk][K / 4U][G][4];
+    alignas(16) float value[Chunk][64];
+    float beta[Chunk], decay[Chunk];
+};
+// gdn_v_conv_value's expressions up to the SiLU (before round_bf16): the witness kernel tests it for NaN, because
+// float_to_bf16 maps some NaN payloads to infinities or zeros (a NaN whose payload depends on operand order could vanish).
+template <unsigned Ring, unsigned Columns>
+__device__ __forceinline__ float gdn_v_conv_silu(const std::uint16_t (&vraw)[Ring][Columns], const float (&vweight)[Columns][kGdnWindowKernel],
+    unsigned row, unsigned lc) {
+    float sum = 0.0F;
+    for (std::uint32_t index = 0; index < kGdnWindowKernel; ++index)
+        sum += bf16_to_float(vraw[(row + Ring - 3U + index) % Ring][lc]) * vweight[lc][index];
+    return sum / (1.0F + expf(-sum));
+}
 // (3) Recurrence (gdn_cols_norm_kernel's layout and norm exchange) whose block stages its 64 RAW v columns of each
 // chunk in a BF16 ring and forms their conv/SiLU (gdn_prefill_conv_kernel's v expressions) into the stage; the block
 // updates the conv history of its 64 v channels at the end (no other block owns them).
@@ -511,12 +577,25 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
     static_assert(!F16 || Lean == 1U, "FP16 output requires the lean gated-norm epilogue");
     // Nan 1/2: both blocks of a pair read the same flag, so a pair always runs (or skips) together.
     if (decay_nan_skip<Nan>(xch.decay_nan)) return;
+    constexpr bool Witness = Nan == 4U;
+    static_assert(!Witness || (Lean == 1U && !Pipe && Chunk == 8U && G >= 4U));
+    constexpr bool DeferNorm = Witness && (Opt & 256U) != 0U;
+    static_assert(!DeferNorm || (G == 4U && Cc == 2U && W == 4U));
+    // Opt bit 512: packed two-row v conv is a witness-only extension of deferred norm.
+    constexpr bool PackedValue = (Opt & 512U) != 0U;
+    static_assert(!PackedValue || (Witness && DeferNorm && Opt == (374U | 512U)));
+    static_assert((374U | 512U) == 886U);
+    // Opt bit 1024: schedule the previous chunk's sigmoid gates inside the next recurrence.
+    constexpr bool PendingSigmoid = (Opt & 1024U) != 0U;
+    static_assert(!PendingSigmoid || (Witness && DeferNorm && !PackedValue && Opt == (374U | 1024U)));
+    static_assert((374U | 1024U) == 1398U);
+    [[maybe_unused]] bool nan_seen = false;   // Nan 4 only
     using Shape = ColsShape<G, Cc, W>;
     constexpr unsigned Threads = Shape::threads, Columns = Shape::columns, K = Shape::keys, Ring = 12U;
     static_assert(Columns == 64U && Chunk + 3U <= Ring && Chunk % W == 0U);
     constexpr unsigned KeyQuads = (Chunk * 64U + Threads - 1U) / Threads;
     constexpr unsigned ValueQuads = (Chunk * Columns / 4U + Threads - 1U) / Threads;
-    using Stage = ColsStage<G, Cc, W, Chunk>;
+    using Stage = std::conditional_t<Witness, KrStage<G, Chunk>, ColsStage<G, Cc, W, Chunk>>;
     __shared__ Stage stage[2];
     __shared__ std::uint16_t vraw[Ring][Columns];
     __shared__ float vweight[Columns][kGdnWindowKernel];
@@ -565,8 +644,13 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
                 const auto key = (within % 32U) * 4U;
                 auto& target = within < 32U ? s.key[row] : s.query[row];
                 const float parts[4] = {key_query[i].x, key_query[i].y, key_query[i].z, key_query[i].w};
+                if constexpr (Witness) {
+#pragma unroll
+                    for (unsigned c = 0; c < 4U; ++c) target[(key + c) / G / 4U][(key + c) % G][(key + c) / G % 4U] = parts[c];
+                } else {
 #pragma unroll
                 for (unsigned c = 0; c < 4U; ++c) target[(key + c) % G][(key + c) / G] = parts[c];
+                }
             }
         }
 #pragma unroll
@@ -585,6 +669,11 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
     const auto convolve = [&](Stage& s, std::uint32_t first) {
         for (unsigned i = thread; i < Chunk * Columns; i += Threads) {
             const unsigned r = i / Columns, lc = i % Columns, row = first + r;
+            if constexpr (Witness) {
+                const float silu = gdn_v_conv_silu<Ring, Columns>(vraw, vweight, row, lc);
+                nan_seen |= is_nan_bits(silu);
+                s.value[r][lc] = round_bf16(silu);
+            } else
             s.value[r][lc] = gdn_v_conv_value<Ring, Columns>(vraw, vweight, row, lc);
         }
     };
@@ -638,6 +727,76 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
         publish(outs, n);
         finish(outs, first, n);
     };
+    constexpr unsigned PendingRows = Chunk / W;
+    float pending_mine[PendingRows], pending_z[PendingRows][2], pending_nw[2];
+    // Opt bit 256 (witness only): retain Lean sums and z across the next recurrence.
+    const auto publish_pending = [&](float (&outs)[Chunk][Columns], std::uint32_t first, unsigned n) {
+#pragma unroll
+        for (unsigned part = 0; part < 2U; ++part) {
+            const auto channel = part * 64U + 32U * half + lane;
+            pending_nw[part] = load_small(norm_weights, norm_kind, channel);
+#pragma unroll
+            for (unsigned i = 0; i < PendingRows; ++i)
+                pending_z[i][part] = rows.z[static_cast<std::uint64_t>(first + wave + i * W) * rows.stride + value_head * 128U + channel];
+        }
+        if (n >= kNormRing && thread == 0U)
+            while (load_acquire(peer_con) < xch.base + n - kNormRing + 1U) __builtin_amdgcn_s_sleep(1);
+        __syncthreads();
+#pragma unroll
+        for (unsigned i = 0; i < PendingRows; ++i) {
+            const unsigned r = wave + i * W;
+            const float lo = outs[r][lane], hi = outs[r][32U + lane];
+            pending_mine[i] = gdn_window_add(lo * lo, hi * hi);
+            if constexpr (Witness) nan_seen |= is_nan_bits(pending_mine[i]);   // NaN iff lo or hi is NaN
+            my_ring[((n % kNormRing) * Chunk + r) * 32U + lane] = pending_mine[i];
+        }
+        __syncthreads();
+#ifdef QPF2K_GDN_BENCH_DELAY_PARTNER
+        if (half == 1U && thread == 0U)
+            for (unsigned delay = 0; delay < QPF2K_GDN_BENCH_DELAY_PARTNER; ++delay) __builtin_amdgcn_s_sleep(1);
+#endif
+        if (thread == 0U) { __threadfence(); store_release(my_pub, xch.base + n + 1U); }
+    };
+    const auto finish_pending = [&](float (&outs)[Chunk][Columns], std::uint32_t first, unsigned n, bool gates_ready) {
+        if (thread == 0U) while (load_acquire(peer_pub) < xch.base + n + 1U) __builtin_amdgcn_s_sleep(1);
+        __syncthreads();
+#pragma unroll
+        for (unsigned i = 0; i < PendingRows; ++i) {
+            const unsigned r = wave + i * W;
+            const float peer = __hip_atomic_load(&peer_ring[((n % kNormRing) * Chunk + r) * 32U + lane], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            float sum = half == 0U ? gdn_window_add(pending_mine[i], peer) : gdn_window_add(peer, pending_mine[i]);
+            sum = gdn_window_add(sum, gdn_window_down<16U>(sum));
+            sum = gdn_window_add(sum, gdn_window_down<8U>(sum));
+            sum = gdn_window_add(sum, gdn_window_down<4U>(sum));
+            sum = gdn_window_add(sum, gdn_window_down<2U>(sum));
+            sum = gdn_window_add(sum, gdn_window_down<1U>(sum));
+            sum = __int_as_float(__builtin_amdgcn_readfirstlane(__float_as_int(sum)));
+            float head_dim_f;   // opaque divisor: the production runtime IEEE division (see finish)
+            asm volatile("v_mov_b32 %0, 0x43000000" : "=v"(head_dim_f));
+            const float inv = rsqrtf(sum / head_dim_f + epsilon);
+            const std::uint64_t base = static_cast<std::uint64_t>(first + r) * rows.stride + value_head * 128U;
+#pragma unroll
+            for (unsigned part = 0; part < 2U; ++part) {
+                const auto channel = part * 64U + 32U * half + lane;
+                // The final drain has no following recurrence: its z entries are still raw.
+                const float gate_value = PendingSigmoid && gates_ready ? pending_z[i][part]
+                    : 1.0F / (1.0F + expf(-pending_z[i][part]));
+                const float normed = gated_norm_product(outs[r][part * 32U + lane], inv, pending_nw[part], gate_value);
+                if constexpr (Witness) nan_seen |= is_nan_bits(normed);
+                if constexpr (F16) {
+                    // Same FP32 value and RNE conversion as tiled kF32 staging; no FP32 reader on this route.
+                    xch.core16[static_cast<std::uint64_t>(first + r) * xch.core16_pitch + value_head * 128U + channel] =
+                        static_cast<_Float16>(normed);
+                    // Each aligned 8-lane group is one row's 8 consecutive channels (including across heads).
+                    const auto bad = __ballot(isfinite(normed) && !(fabsf(normed) <= 65504.0F));
+                    if (bad != 0ULL && lane % 8U == 0U && ((bad >> lane) & 0xffULL) != 0ULL)
+                        atomicAdd(xch.core16_overflow, 1U);
+                } else rows.core[base + channel] = normed;
+            }
+        }
+        __syncthreads();
+        if (thread == 0U) store_release(my_con, xch.base + n + 1U);
+    };
     float retained[Cc][K];
 #pragma unroll
     for (unsigned c = 0; c < Cc; ++c)
@@ -648,26 +807,148 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
     __syncthreads();
     commit(stage[0], 0U);
     __syncthreads();
-    convolve(stage[0], 0U);
+    if constexpr (!PackedValue) convolve(stage[0], 0U);
     __syncthreads();
     unsigned n = 0;
     for (std::uint32_t first = 0, buffer = 0; first < count; first += Chunk, buffer ^= 1U, ++n) {
         const bool more = first + Chunk < count;
         if (more) fetch(first + Chunk);
         const Stage& s = stage[buffer];
-        const float4* key = reinterpret_cast<const float4*>(s.key[0][sub]);
-        const float4* query = reinterpret_cast<const float4*>(s.query[0][sub]);
+        // Witness (compact stage): a lane's key quads are G float4 apart, rows 32 float4 apart.
+        constexpr unsigned QuadStep = Witness ? G : 1U, RowStep = Witness ? 32U : G * Shape::pitch / 4U;
+        const float4* key;
+        const float4* query;
+        if constexpr (Witness) {
+            key = reinterpret_cast<const float4*>(&s.key[0][0][sub][0]);
+            query = reinterpret_cast<const float4*>(&s.query[0][0][sub][0]);
+        } else {
+            key = reinterpret_cast<const float4*>(s.key[0][sub]);
+            query = reinterpret_cast<const float4*>(s.query[0][sub]);
+        }
         const float* value = &s.value[0][local];
         const float* beta = s.beta;
         const float* decay = s.decay;
-        // Row outputs overwrite the row's v slots (read before, by the same wave) and feed the norm.
+        // Raw outputs feed norm; the non-packed path overwrites staged conv inputs after their last read.
         float* out_row = &stage[buffer].value[0][local];
+        // Witness + Opt bit 16: software-pipelined rows: the query phase of row r - 1 (reads the retained state after
+        // row r - 1's update) is issued together with the key phase of row r (decay, products, tree, delta, update), two
+        // independent reduction trees per column per iteration. Every value is formed by the same operations on the
+        // same operands with the same pairs as the plain loop; only the issue order of independent work changes (operand
+        // order inside an operation is free under the NaN witness).
+        if constexpr (Witness && (Opt & 16U) != 0U) {
+            static_assert((Opt & 4U) != 0U);
+            const auto load_quads = [&](const float4* p, float (&dst)[K]) {
+#pragma unroll
+                for (unsigned j = 0; j < K / 4U; ++j) {
+                    const float4 v4 = p[j * QuadStep];
+                    dst[4U * j] = v4.x; dst[4U * j + 1U] = v4.y; dst[4U * j + 2U] = v4.z; dst[4U * j + 3U] = v4.w;
+                }
+            };
+            const auto group_sum = [](float x) {
+                if constexpr ((Opt & 32U) != 0U) return gdn_lane_group_sum_fused<G>(x);
+                else return gdn_lane_group_sum<G>(x);
+            };
+            float packed = 0.0F;
+            const auto pack_pair = [&](unsigned r) {
+                // Match the standalone conv's contraction context, outside the recurrence arithmetic.
+#pragma clang fp contract(on)
+                const unsigned conv_column = local + (sub & 1U);
+                const unsigned conv_row = first + r + (sub >> 1U);
+                const float silu = gdn_v_conv_silu<Ring, Columns>(vraw, vweight, conv_row, conv_column);
+                nan_seen |= is_nan_bits(silu);   // before BF16 rounding can erase a NaN payload
+                packed = round_bf16(silu);
+            };
+            const auto recurrence_value = [&](unsigned r, unsigned c) {
+                if constexpr (PackedValue) {
+                    // Every lane participates with full EXEC; shuffles only transport the rounded bits.
+                    return __shfl(packed, static_cast<int>((lane & ~3U) + 2U * (r & 1U) + c), 32);
+                } else return value[r * Columns + c];
+            };
+            const auto key_phase = [&](unsigned r, const float (&k)[K]) {
+                const float d = uniform<Opt>(decay[r]), b = uniform<Opt>(beta[r]);
+#pragma unroll
+                for (unsigned c = 0; c < Cc; ++c) {
+#pragma unroll
+                    for (unsigned j = 0; j < K; ++j) retained[c][j] = retained[c][j] * d;
+                    const float sum = gdn_post_tree<K>([&](auto jj) {
+#pragma clang fp contract(off)
+                        return retained[c][decltype(jj)::value] * k[decltype(jj)::value];
+                    });
+                    const float delta = (recurrence_value(r, c) - group_sum(sum)) * b;
+#pragma unroll
+                    for (unsigned j = 0; j < K; ++j) retained[c][j] = __builtin_fmaf(k[j], delta, retained[c][j]);
+                }
+            };
+            // Opt bit 64: row r - 1's query tree and row r's key tree in one paired post-order walk; each leaf reads the
+            // updated state for the query product before the decay overwrites it.
+            const auto paired_phase = [&](unsigned r, const float (&qv)[K], const float (&k)[K], float (&out)[Cc]) {
+                const float d = uniform<Opt>(decay[r]), b = uniform<Opt>(beta[r]);
+#pragma unroll
+                for (unsigned c = 0; c < Cc; ++c) {
+                    const float2 sums = gdn_post_tree2<K>([&](auto jj) {
+#pragma clang fp contract(off)
+                        constexpr unsigned j = decltype(jj)::value;
+                        const float updated = retained[c][j];
+                        const float qp = updated * qv[j];
+                        retained[c][j] = updated * d;
+                        return make_float2(qp, retained[c][j] * k[j]);
+                    });
+                    out[c] = group_sum(sums.x);
+                    const float delta = (recurrence_value(r, c) - group_sum(sums.y)) * b;
+#pragma unroll
+                    for (unsigned j = 0; j < K; ++j) retained[c][j] = __builtin_fmaf(k[j], delta, retained[c][j]);
+                }
+            };
+            const auto query_phase = [&](const float (&qv)[K], float (&out)[Cc]) {
+#pragma unroll
+                for (unsigned c = 0; c < Cc; ++c)
+                    out[c] = group_sum(gdn_post_tree<K>([&](auto jj) {
+#pragma clang fp contract(off)
+                        return retained[c][decltype(jj)::value] * qv[decltype(jj)::value];
+                    }));
+            };
+            float k[K], qv[K], out[Cc];
+            load_quads(key, k);
+            if constexpr (PackedValue) pack_pair(0U);
+            key_phase(0U, k);
+#pragma unroll 1
+            for (unsigned r = 1; r < Chunk; ++r) {
+                load_quads(query + (r - 1U) * RowStep, qv);
+                load_quads(key + r * RowStep, k);
+                if constexpr (PackedValue) { if ((r & 1U) == 0U) pack_pair(r); }
+                if constexpr ((Opt & 64U) != 0U) paired_phase(r, qv, k, out);
+                else {
+                    query_phase(qv, out);          // row r - 1 (state after its update)
+                    key_phase(r, k);               // row r
+                }
+                if (sub == 0U) {
+#pragma unroll
+                    for (unsigned c = 0; c < Cc; ++c) out_row[(r - 1U) * Columns + c] = out[c];
+                }
+                if constexpr (PendingSigmoid) {
+                    // Full Chunk=8 rows only (launcher admission); chunk zero has no pending z.
+                    // Literal subscripts keep all four entries in registers, with no indexed scratch.
+                    if (n != 0U) {
+                        if (r == 1U) pending_z[0][0] = 1.0F / (1.0F + expf(-pending_z[0][0]));
+                        if (r == 3U) pending_z[0][1] = 1.0F / (1.0F + expf(-pending_z[0][1]));
+                        if (r == 5U) pending_z[1][0] = 1.0F / (1.0F + expf(-pending_z[1][0]));
+                        if (r == 7U) pending_z[1][1] = 1.0F / (1.0F + expf(-pending_z[1][1]));
+                    }
+                }
+            }
+            load_quads(query + (Chunk - 1U) * RowStep, qv);
+            query_phase(qv, out);
+            if (sub == 0U) {
+#pragma unroll
+                for (unsigned c = 0; c < Cc; ++c) out_row[(Chunk - 1U) * Columns + c] = out[c];
+            }
+        } else
 #pragma unroll 1
         for (unsigned r = 0; r < Chunk; ++r) {
             float k[K];
 #pragma unroll
             for (unsigned j = 0; j < K / 4U; ++j) {
-                const float4 v4 = key[j];
+                const float4 v4 = key[j * QuadStep];
                 k[4U * j] = v4.x; k[4U * j + 1U] = v4.y; k[4U * j + 2U] = v4.z; k[4U * j + 3U] = v4.w;
             }
             // Pinned (Nan >= 2): decay a per-lane VGPR multiplied as src1 (production lanes kernel ISA: retained src0,
@@ -703,7 +984,7 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
             float qv[K];
 #pragma unroll
             for (unsigned j = 0; j < K / 4U; ++j) {
-                const float4 v4 = query[j];
+                const float4 v4 = query[j * QuadStep];
                 qv[4U * j] = v4.x; qv[4U * j + 1U] = v4.y; qv[4U * j + 2U] = v4.z; qv[4U * j + 3U] = v4.w;
             }
             float out[Cc];
@@ -730,7 +1011,18 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
 #pragma unroll
                 for (unsigned c = 0; c < Cc; ++c) out_row[c] = out[c];
             }
-            key += G * Shape::pitch / 4U; query += G * Shape::pitch / 4U; value += Columns; ++beta; ++decay; out_row += Columns;
+            key += RowStep; query += RowStep; value += Columns; ++beta; ++decay; out_row += Columns;
+        }
+        if constexpr (DeferNorm) {
+            // Packed conv now reads vraw during recurrence: no wave may commit over another wave's taps.
+            // Later chunks already rendezvous in finish_pending; chunk zero has no pending norm to finish.
+            if constexpr (PackedValue) { if (n == 0U && more) __syncthreads(); }
+            if (n) finish_pending(stage[buffer ^ 1U].value, first - Chunk, n - 1U, PendingSigmoid);
+            if (more) commit(stage[buffer ^ 1U], first + Chunk);
+            publish_pending(stage[buffer].value, first, n);
+            if constexpr (!PackedValue) { if (more) convolve(stage[buffer ^ 1U], first + Chunk); }
+            __syncthreads();
+            continue;
         }
         if constexpr (Lean != 0U) {
             static_assert(!Pipe && Chunk % W == 0U);
@@ -771,6 +1063,7 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
                     const unsigned r = wave + i * W;
                     const float lo = outs[r][lane], hi = outs[r][32U + lane];
                     mine[i] = gdn_window_add(lo * lo, hi * hi);
+                    if constexpr (Witness) nan_seen |= is_nan_bits(mine[i]);   // NaN iff lo or hi is NaN
                     my_ring[((n % kNormRing) * Chunk + r) * 32U + lane] = mine[i];
                 }
                 __syncthreads();
@@ -800,6 +1093,7 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
                         const auto channel = part * 64U + 32U * half + lane;
                         const float gate_value = 1.0F / (1.0F + expf(-zv[i][part]));
                         const float normed = gated_norm_product(outs[r][part * 32U + lane], inv, nw[part], gate_value);
+                        if constexpr (Witness) nan_seen |= is_nan_bits(normed);
                         if constexpr (F16) {
                             // Same FP32 value and RNE conversion as tiled kF32 staging; no FP32 reader on this route.
                             xch.core16[static_cast<std::uint64_t>(first + r) * xch.core16_pitch + value_head * 128U + channel] =
@@ -828,16 +1122,26 @@ void gdn_core_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std
         }
         if (more) { convolve(stage[buffer ^ 1U], first + Chunk); __syncthreads(); }
     }
+    if constexpr (DeferNorm) finish_pending(stage[(n - 1U) % 2U].value, (n - 1U) * Chunk, n - 1U, false);
     if constexpr (Pipe) finish(stage[(n - 1U) % 2U].value, (n - 1U) * Chunk, n - 1U);
     // conv history of this block's v channels: the last 4 raw rows (ring slots).
+    std::uint16_t* const conv_target = Witness ? xch.conv_out : conv_state;
+    float* const state_target = Witness ? xch.state_out : state;
     for (auto i = thread; i < Columns * kGdnWindowKernel; i += Threads) {
         const auto lc = i / kGdnWindowKernel, t = i % kGdnWindowKernel;
-        conv_state[static_cast<std::uint64_t>(value_offset + column_of(lc)) * kGdnWindowKernel + t] = vraw[(count - kGdnWindowKernel + t) % Ring][lc];
+        conv_target[static_cast<std::uint64_t>(value_offset + column_of(lc)) * kGdnWindowKernel + t] = vraw[(count - kGdnWindowKernel + t) % Ring][lc];
     }
 #pragma unroll
     for (unsigned c = 0; c < Cc; ++c)
 #pragma unroll
-        for (unsigned j = 0; j < K; ++j)
-            state[gdn_window_state_index<Storage>(value_head, sub + j * G, column + c, 128U)] = retained[c][j];
+        for (unsigned j = 0; j < K; ++j) {
+            if constexpr (Witness) nan_seen |= is_nan_bits(retained[c][j]);
+            state_target[gdn_window_state_index<Storage>(value_head, sub + j * G, column + c, 128U)] = retained[c][j];
+        }
+    if constexpr (Witness) {
+        // one relaxed agent-scope atomic OR per wave; the replay launch follows on the same stream (kernel boundary)
+        if (__builtin_amdgcn_ballot_w32(nan_seen) != 0U && lane == 0U)
+            __hip_atomic_fetch_or(xch.witness, 1U, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
 }
 }  // namespace qpf2k_gdn

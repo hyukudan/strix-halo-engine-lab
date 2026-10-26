@@ -295,6 +295,7 @@ std::uint32_t HipKnownPromptBackend::logical_rows() const noexcept {
     return impl_->window->logical_rows();
 }
 bool HipKnownPromptBackend::supports_tiled_prefill() const noexcept {return impl_->window->supports_tiled_prefill();}
+bool HipKnownPromptBackend::gsq_model() const noexcept {return impl_->window->gsq_model();}
 KnownWindowOutputPolicy HipKnownPromptBackend::output_policy() const noexcept {return impl_->window->output_policy();}
 std::vector<float> HipKnownPromptBackend::execute_rows(std::span<const std::uint32_t> tokens, std::uint64_t position) {
     return impl_->execute(tokens, position);

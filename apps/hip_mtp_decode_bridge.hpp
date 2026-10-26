@@ -314,8 +314,10 @@ public:
             // ceil(rest / T) blocks of a multiple of 128 rows <= T, each the first rows of the T arena; the last rest mod 128
             // rows then run as the ladder runs them). Bit 4: the ladder's leading multiple-of-128 tail units merged into one
             // partial block of the T owner. Not with a prefix store (its captures are at T boundaries) nor small units.
-            static const bool balanced_env=[]{const char* v=std::getenv("STRIX_QPF2K_SCHED");return v&&(std::strtoul(v,nullptr,0)&16UL)!=0UL;}();
-            static const bool merged_env=[]{const char* v=std::getenv("STRIX_QPF2K_SCHED");return v&&(std::strtoul(v,nullptr,0)&4UL)!=0UL;}();
+            static const bool balanced_raw=[]{const char* v=std::getenv("STRIX_QPF2K_SCHED");return v&&(std::strtoul(v,nullptr,0)&16UL)!=0UL;}();
+            static const bool merged_raw=[]{const char* v=std::getenv("STRIX_QPF2K_SCHED");return v&&(std::strtoul(v,nullptr,0)&4UL)!=0UL;}();
+            const bool defaults_off=qpf2k::suppressed(qpf2k::Item::sched,backend.gsq_model());
+            const bool balanced_env=balanced_raw&&!defaults_off,merged_env=merged_raw&&!defaults_off;
             // Per prompt, decided at its first unit: only where the balanced plan is bitwise equal to the ladder.
             if(blocks && (balanced_env || merged_env) && balanced_<0) {
                 std::vector<std::uint32_t> ladder=tiled_.ladder_tail_rows;

@@ -1052,7 +1052,7 @@ int STRIX_DECODE_ENTRY(
     auto options =
         parse_options(
             argc,
-            argv);
+            argv, true);
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     const bool target_input_export = strix::tests::mtp_target_input_export_requested();
     if(target_input_export)strix::tests::validate_mtp_target_input_export(options,false);
@@ -1161,6 +1161,9 @@ int STRIX_DECODE_ENTRY(
     const auto manifest =
         strix::build_model_manifest(
             info);
+    const strix::qpf2k::ModelScope defaults_scope(strix::qpf2k::has_gsq_gate(manifest));
+    if (strix::qpf2k::defaulted_items & strix::qpf2k::bit(strix::qpf2k::Item::sched))
+        strix::decode_cli::apply_default_known_prefill_tails(options);
     strix::AllocationGenerationSource
         generations;
     std::shared_ptr<const strix::MappedModelFile> mapped_owner = std::make_shared<strix::MappedModelFile>(

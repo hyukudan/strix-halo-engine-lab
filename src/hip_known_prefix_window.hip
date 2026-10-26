@@ -29,34 +29,13 @@
 #include <exception>
 #include <deque>
 
-// qpf2k adopted exact prefill set ON BY DEFAULT (USER rule 2026-10-26 00:44): every STRIX_QPF2K_* switch of the combined
-// arm C that is unset gets C's value before any parser reads it (all parsers are lazy function-local statics, evaluated
-// after static initialisation). Setting a switch explicitly (e.g. =0) keeps it: =0 restores the old path. The two MoE items
-// are recorded in STRIX_QPF2K_MOE_DEFAULTED (bit 1 DA16, bit 2 ROUTE) so the GSQ prefill profile turns them off instead of
-// refusing (an explicit setting with a GSQ gate type is still refused, see enqueue_prefill).
+// Default-ON values keep their provenance so a GSQ owner can exclude the entire
+// unqualified set without changing explicit settings or another owner's caches.
 namespace {
 const bool qpf2k_default_env = [] {
-    // STRIX_QPF2K_DEFAULTS=0: no defaults at all (every unset switch keeps its old OFF meaning).
-    if (const char* d = std::getenv("STRIX_QPF2K_DEFAULTS"); d && d[0] == '0') return false;
-    const auto put = [](const char* name, const char* value) {
-        if (std::getenv(name)) return false;
-        ::setenv(name, value, 0);
-        return true;
-    };
-    put("STRIX_QPF2K_SCHED", "12");
-    put("STRIX_QPF2K_DENSE", "1");
-    put("STRIX_QPF2K_GDN", "1");                       // default parts 55 (decay-NaN dispatch)
-    put("STRIX_QPF2K_GDN_GATES_BATCH", "1");           // qpfx 8f22961a (exact; gates -17.5 % per call)
-    put("STRIX_QPF2K_GDN_CORE16", "1");                // qpfx 4c44767a (exact; GDN out from FP16 core rows)
-    if (put("STRIX_QPF2K_QSA", "1")) put("STRIX_QPF2K_QSA_MASK", "0x257");   // 0x200: stage batching (exact; 32K -0.39 s, 5 of 6 pairs)
-    if (put("STRIX_QPF2K_HC", "1")) put("STRIX_QPF2K_HC_MASK", "14");
-    put("STRIX_QPF2K_HC_OUTPUT3", "1");                // lane-chain output v3 (exact; fixtures + in-engine FNV)
-    put("STRIX_QPF2K_HC_OUTPUT3_BAND", "16");          // band 16 (CTA permutation only; v3 kernel -6.4 %, 32K -0.52 s)
-    unsigned moe = 0U;
-    if (put("STRIX_QPF2K_MOE_DA16", "1")) moe |= 1U;
-    if (put("STRIX_QPF2K_MOE_ROUTE", "14")) moe |= 2U;
-    if (moe != 0U && !std::getenv("STRIX_QPF2K_MOE_DEFAULTED"))
-        ::setenv("STRIX_QPF2K_MOE_DEFAULTED", moe == 3U ? "3" : moe == 1U ? "1" : "2", 0);
+    strix::qpf2k::defaulted_items = strix::qpf2k::initialize(
+        [](const char* name) { return std::getenv(name); },
+        [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; });
     return true;
 }();
 }  // namespace
@@ -275,6 +254,8 @@ struct HipKnownPrefixWindow::Impl {
         : actual_owner(std::move(owner)), window(std::move(source)), serial(std::move(serial_source)),
           model(std::move(model_source)), config(std::move(config_source)), resources(serial_resources),
           scratch(memory), scope(native_scope), routed_workspace(std::move(union_workspace)) {
+        scope.gsq_model = resources.model_manifest && qpf2k::has_gsq_gate(*resources.model_manifest);
+        const qpf2k::ModelScope defaults_scope(scope.gsq_model);
         prefill=std::move(tiled);
         if (!actual_owner) throw std::invalid_argument("known-window native owner requires retained actual owners");
         if (const auto error = model.validate(); !error.empty()) throw std::invalid_argument(error);
@@ -515,9 +496,9 @@ struct HipKnownPrefixWindow::Impl {
     // the side stream next to the routed experts (forked after the router, like detach_shared for verify windows),
     // with its workspace rows in an owner-held compact buffer; the MoE combine waits for it. Same kernels, launches
     // and per-row arithmetic; only the stream and the workspace address differ.
-    static unsigned prefill_schedule() {
+    unsigned prefill_schedule() const {
         static const unsigned v = [] { const char* e = std::getenv("STRIX_QPF2K_SCHED"); return e ? static_cast<unsigned>(std::strtoul(e, nullptr, 0)) : 0U; }();
-        return v;
+        return qpf2k::suppressed(qpf2k::Item::sched, scope.gsq_model) ? 0U : v;
     }
     bool prefill_schedule_step(std::size_t i, std::span<const ExecutionDispatchContext> rows) {
         const auto& step = serial.execution.steps[i];
@@ -2376,6 +2357,7 @@ void HipKnownPrefixWindow::attach_greedy_rows(ExecutionBufferAddress partials,Hi
 }
 std::uint32_t HipKnownPrefixWindow::logical_rows() const noexcept { return impl_->logical_rows(); }
 bool HipKnownPrefixWindow::supports_tiled_prefill() const noexcept {return impl_->prefill.has_value();}
+bool HipKnownPrefixWindow::gsq_model() const noexcept {return impl_->scope.gsq_model;}
 KnownWindowOutputPolicy HipKnownPrefixWindow::output_policy() const noexcept { return impl_->prefill?impl_->prefill->output_policy:impl_->window.output_policy; }
 std::optional<HipKnownPrefixUnionObservation> HipKnownPrefixWindow::latest_routed_union_observation() const noexcept {
     return impl_->failed?std::nullopt:impl_->last_union_observation;

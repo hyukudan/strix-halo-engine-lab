@@ -5009,9 +5009,9 @@ unsigned qpf2k_gdn_parts() {
         if (!v || v[0] != '1') return 0U;
         const char* p = std::getenv("STRIX_QPF2K_GDN_PARTS");
         // default 55 = 23 | 32 (decay-NaN dispatch ON: exact, t5 in-engine 32K core 1434.8 -> 1287.2 + 3.7 ms flag; 32K ABA never slower)
-        return p ? static_cast<unsigned>(std::atoi(p)) & 127U : 55U;
+        return p ? static_cast<unsigned>(std::atoi(p)) & 255U : 55U;
     }();
-    return parts;
+    return qpf2k::suppressed(qpf2k::Item::gdn) ? 0U : parts;
 }
 // Fused core resources: the norm exchange (per stream) and the q/k segment-boundary side buffer.
 constexpr unsigned kQpf2kSegments = 8U, kQpf2kCoreWaves = 4U;
@@ -5033,12 +5033,75 @@ Qpf2kCoreScratch qpf2k_core_scratch(hipStream_t stream, std::uint32_t value_head
     x.exchange.consumed = x.exchange.published + value_heads * 2U;
     x.exchange.base = 0;
     x.exchange.decay_nan = x.exchange.consumed + value_heads * 2U;   // one word (16 bytes reserved), zeroed with the counters
+    x.exchange.witness = x.exchange.consumed + value_heads * 2U + 1U;  // PARTS bit 128: the NaN witness (next word, zeroed too)
     x.side = reinterpret_cast<std::uint16_t*>(x.exchange.consumed + value_heads * 2U + 4U);
     x.side_bytes = side_bytes;
     for (auto& [s, scratch] : pool)
         if (s == stream) { scratch = x; return scratch; }  // grown (the old block stays allocated: in-flight launches)
     pool.emplace_back(stream, x);
     return pool.back().second;
+}
+// PARTS bit 128: per-stream scratch for the witness kernel's final state and v conv history.
+struct Qpf2kWitnessScratch { float* state = nullptr; std::uint16_t* conv = nullptr; std::uint64_t state_bytes = 0, conv_bytes = 0; };
+Qpf2kWitnessScratch qpf2k_witness_scratch(hipStream_t stream, std::uint64_t state_bytes, std::uint64_t conv_bytes) {
+    static std::mutex mutex;
+    static std::vector<std::pair<hipStream_t, Qpf2kWitnessScratch>> pool;
+    std::lock_guard<std::mutex> lock(mutex);
+    for (auto& [s, scratch] : pool)
+        if (s == stream && scratch.state_bytes >= state_bytes && scratch.conv_bytes >= conv_bytes) return scratch;
+    for (auto& [s, scratch] : pool)
+        if (s == stream) { state_bytes = std::max(state_bytes, scratch.state_bytes); conv_bytes = std::max(conv_bytes, scratch.conv_bytes); }
+    Qpf2kWitnessScratch x;
+    void* p = nullptr;
+    const std::uint64_t state_aligned = (state_bytes + 255U) / 256U * 256U;
+    if (hipMalloc(&p, state_aligned + conv_bytes) != hipSuccess) throw std::runtime_error("qpf2k GDN witness scratch allocation failed");
+    x.state = static_cast<float*>(p);
+    x.conv = reinterpret_cast<std::uint16_t*>(static_cast<unsigned char*>(p) + state_aligned);
+    x.state_bytes = state_bytes; x.conv_bytes = conv_bytes;
+    for (auto& [s, scratch] : pool)
+        if (s == stream) { scratch = x; return scratch; }  // grown (the old block stays allocated: in-flight launches)
+    pool.emplace_back(stream, x);
+    return pool.back().second;
+}
+// Bit 128 layout (STRIX_QPF2K_GDN_KR_G = 4 (default) | 8 | 16): G-lane groups, 4 waves, 64 columns per block, Cc = G / 2.
+// G 4 runs Opt 118 (pipelined rows, paired query/key trees, fused DPP group sums: bench -0.25 ms per 8K call vs the
+// decay-NaN dispatch) + bit 256 by default (Opt 374, qpf2k_kr_opt); G 8 / 16 run Opt 6 (bench: slower).
+unsigned qpf2k_kr_g() {
+    static const unsigned g = [] {
+        const char* v = std::getenv("STRIX_QPF2K_GDN_KR_G");
+        const int x = v ? std::atoi(v) : 4;
+        return x == 16 ? 16U : x == 8 ? 8U : 4U;
+    }();
+    return g;
+}
+template <unsigned G> constexpr unsigned kQpf2kKrOpt = G == 4U ? 118U : 6U;
+// G 4 default Opt 374 (+ bit 256: norm completion deferred one chunk; engine 8K: -0.30 ms per call vs Opt 118 in 5 / 5
+// alternating pairs, receipts == BASE); STRIX_QPF2K_GDN_KR_OPT=118 restores Opt 118; 886 / 1398 are NO-GAIN variants.
+unsigned qpf2k_kr_opt() {
+    static const unsigned opt = [] {
+        const char* v = std::getenv("STRIX_QPF2K_GDN_KR_OPT");
+        return v && std::strcmp(v, "1398") == 0 ? 1398U : v && std::strcmp(v, "886") == 0 ? 886U : v && std::strcmp(v, "118") == 0 ? 118U : 374U;
+    }();
+    return opt;
+}
+// Capacity (co-resident blocks) of the witness kernel, computed once per process (one device per engine process) and
+// compared with every call's block count.
+template <GdnRecurrentStorage S, unsigned G, unsigned Opt = kQpf2kKrOpt<G>, bool F16 = false>
+bool qpf2k_kr_fits(std::uint32_t blocks) {
+    static const std::uint64_t capacity = [] {
+        int device = 0, cooperative = 0, units = 0, per_unit = 0;
+        if (hipGetDevice(&device) != hipSuccess) return std::uint64_t{0};
+        if (hipDeviceGetAttribute(&cooperative, hipDeviceAttributeCooperativeLaunch, device) != hipSuccess || !cooperative) return std::uint64_t{0};
+        if (hipDeviceGetAttribute(&units, hipDeviceAttributeMultiprocessorCount, device) != hipSuccess) return std::uint64_t{0};
+        if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_unit,
+                reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, G, G / 2U, 4U, 8U, Opt, false, 1U, 4U, F16>), 128, 0) != hipSuccess)
+            return std::uint64_t{0};
+        const auto c = static_cast<std::uint64_t>(units) * static_cast<std::uint64_t>(per_unit);
+        std::fprintf(stderr, "QPF2K GDN core residency (witness G %u Opt %u F16 %u): units %d blocks/unit %d capacity %llu\n", G, Opt, static_cast<unsigned>(F16), units, per_unit,
+            static_cast<unsigned long long>(c));
+        return c;
+    }();
+    return capacity >= blocks;
 }
 // All 2 * value_heads blocks of gdn_core_kernel must be co-resident (cooperative launch); decided once, before any
 // q/k row is rewritten.
@@ -5119,7 +5182,8 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
         (first.value_heads * 2U) % (QGatesO * QGatesW) == 0U && input_stride % 8U == 0U &&
         reinterpret_cast<std::uintptr_t>(first.input.address) % 16U == 0U;
     // STRIX_QPF2K_GDN_GATES_BATCH=1: the same kernel with Sched bit 4 (dt/a preloaded, transforms across lanes).
-    static const bool gates_batch = [] { const char* v = std::getenv("STRIX_QPF2K_GDN_GATES_BATCH"); return v && v[0] == '1'; }();
+    static const bool gates_batch_env = [] { const char* v = std::getenv("STRIX_QPF2K_GDN_GATES_BATCH"); return v && v[0] == '1'; }();
+    const bool gates_batch = gates_batch_env && !qpf2k::suppressed(qpf2k::Item::gdn_gates_batch);
     if (qpf2k_gates && gates_batch)
         hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_gates_kernel<QGatesO, QGatesW, QGatesRC, QGatesRB, 2560U, 4U>),
             dim3(first.value_heads * 2U / (QGatesO * QGatesW), count / QGatesRB), dim3(QGatesW * 32U), 0, stream,
@@ -5165,11 +5229,32 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
             return vk ? qpf2k_core_fits<GdnRecurrentStorage::value_key, 1U, Cc, Nan>(blocks) : qpf2k_core_fits<GdnRecurrentStorage::key_value, 1U, Cc, Nan>(blocks);
         };
         const bool dispatch_bit = lean && (qpf2k & 32U);
+        // bit 128: witness core (Nan 4, G-lane layout) + pinned Nan 2 fallback guarded by the witness;
+        // needs the 2-column Nan 2 kernel resident too.
+        const unsigned kr_g = qpf2k_kr_g(), kr_opt = qpf2k_kr_opt();
+        const bool witness = lean && (qpf2k & 128U) && !(qpf2k & 64U) &&
+            (vk ? (kr_g == 16U ? qpf2k_kr_fits<GdnRecurrentStorage::value_key, 16U>(blocks) : kr_g == 8U ? qpf2k_kr_fits<GdnRecurrentStorage::value_key, 8U>(blocks)
+                                 : (kr_opt == 1398U ? qpf2k_kr_fits<GdnRecurrentStorage::value_key, 4U, 1398U>(blocks)
+                                 : kr_opt == 886U ? qpf2k_kr_fits<GdnRecurrentStorage::value_key, 4U, 886U>(blocks)
+                                 : kr_opt == 374U ? qpf2k_kr_fits<GdnRecurrentStorage::value_key, 4U, 374U>(blocks) : qpf2k_kr_fits<GdnRecurrentStorage::value_key, 4U>(blocks)))
+                : (kr_g == 16U ? qpf2k_kr_fits<GdnRecurrentStorage::key_value, 16U>(blocks) : kr_g == 8U ? qpf2k_kr_fits<GdnRecurrentStorage::key_value, 8U>(blocks)
+                                 : (kr_opt == 1398U ? qpf2k_kr_fits<GdnRecurrentStorage::key_value, 4U, 1398U>(blocks)
+                                 : kr_opt == 886U ? qpf2k_kr_fits<GdnRecurrentStorage::key_value, 4U, 886U>(blocks)
+                                 : kr_opt == 374U ? qpf2k_kr_fits<GdnRecurrentStorage::key_value, 4U, 374U>(blocks) : qpf2k_kr_fits<GdnRecurrentStorage::key_value, 4U>(blocks)))) &&
+            fits_of.template operator()<2U, 2U>();
+        Qpf2kWitnessScratch witness_scratch{};
+        const std::uint64_t witness_state_elems = std::uint64_t{first.value_heads} * 128U * 128U;
+        const std::uint64_t witness_conv_elems = (std::uint64_t{first.key_heads} * 2U * 128U + std::uint64_t{first.value_heads} * 128U) * kGdnWindowKernel;
+        if (witness) {
+            try { witness_scratch = qpf2k_witness_scratch(stream, witness_state_elems * 4U, witness_conv_elems * 2U); }
+            catch (const std::exception&) { witness_scratch = {}; (void)hipGetLastError(); }   // clear the failed allocation
+        }
+        const bool witness_ok = witness && witness_scratch.state != nullptr;
         const bool four = lean && (qpf2k & 64U) &&
             (dispatch_bit ? fits_of.template operator()<4U, 1U>() && fits_of.template operator()<4U, 2U>() : fits_of.template operator()<4U, 3U>());
-        const bool dispatch = dispatch_bit &&
+        const bool dispatch = !witness_ok && dispatch_bit &&
             (four || (fits_of.template operator()<2U, 1U>() && fits_of.template operator()<2U, 2U>()));
-        const bool fits = four || dispatch
+        const bool fits = witness_ok || four || dispatch
                         || (lean ? (vk ? qpf2k_core_fits<GdnRecurrentStorage::value_key, 1U>(blocks) : qpf2k_core_fits<GdnRecurrentStorage::key_value, 1U>(blocks))
                                  : (vk ? qpf2k_core_fits<GdnRecurrentStorage::value_key>(blocks) : qpf2k_core_fits<GdnRecurrentStorage::key_value>(blocks)));
         if ((qpf2k & 4U) && !fused_a8 && count % 8U == 0U && count >= 8U && first.head_dim == 128U && fits) {
@@ -5178,9 +5263,19 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
                 return vk ? qpf2k_core_fits<GdnRecurrentStorage::value_key, 1U, Cc, Nan, true>(blocks)
                           : qpf2k_core_fits<GdnRecurrentStorage::key_value, 1U, Cc, Nan, true>(blocks);
             };
-            const bool f16 = core16 && lean && (four
+            const auto kr_fits16 = [&]<GdnRecurrentStorage S>() {
+                if (kr_g == 16U) return qpf2k_kr_fits<S, 16U, kQpf2kKrOpt<16U>, true>(blocks);
+                if (kr_g == 8U) return qpf2k_kr_fits<S, 8U, kQpf2kKrOpt<8U>, true>(blocks);
+                if (kr_opt == 374U) return qpf2k_kr_fits<S, 4U, 374U, true>(blocks);
+                if (kr_opt == 118U) return qpf2k_kr_fits<S, 4U, 118U, true>(blocks);
+                return false;   // Opt 886 / 1398 remain FP32-only.
+            };
+            const bool f16 = core16 && lean && (witness_ok
+                ? (vk ? kr_fits16.template operator()<GdnRecurrentStorage::value_key>()
+                      : kr_fits16.template operator()<GdnRecurrentStorage::key_value>()) && fits16.template operator()<2U, 2U>()
+                : (four
                 ? (dispatch ? fits16.template operator()<4U, 1U>() && fits16.template operator()<4U, 2U>() : fits16.template operator()<4U, 3U>())
-                : (dispatch ? fits16.template operator()<2U, 1U>() && fits16.template operator()<2U, 2U>() : fits16.template operator()<2U, 3U>()));
+                : (dispatch ? fits16.template operator()<2U, 1U>() && fits16.template operator()<2U, 2U>() : fits16.template operator()<2U, 3U>())));
             if (f16) core16->a16 = qpf2k_core16_scratch(stream, count);
             const auto qk_channels = first.key_heads * 2U * 128U;
             const unsigned segs = count >= 64U * kQpf2kSegments ? kQpf2kSegments : 1U;
@@ -5195,8 +5290,8 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
                 strided, count, seg_rows, conv_state, static_cast<const std::uint16_t*>(scratch.side), conv_w, conv_kind, first.key_heads,
                 first.head_dim, config.model.gdn_qk_l2_epsilon);
             check_hip(hipGetLastError(), "qpf2k GDN q/k conv launch");
-            check_hip(hipMemsetAsync(scratch.exchange.published, 0, std::uint64_t{first.value_heads} * 2U * 2U * 4U + 4U, stream),
-                "qpf2k GDN exchange reset");   // counters + the decay-NaN flag
+            check_hip(hipMemsetAsync(scratch.exchange.published, 0, std::uint64_t{first.value_heads} * 2U * 2U * 4U + 8U, stream),
+                "qpf2k GDN exchange reset");   // counters + the decay-NaN flag + the NaN witness
             if (dispatch) {
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_decay_nan_kernel<>), dim3(64), dim3(256), 0, stream, strided, count,
                     first.value_heads, const_cast<unsigned*>(scratch.exchange.decay_nan));
@@ -5235,6 +5330,43 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
                 return reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, 2U, kQpf2kCoreWaves, 8U, 6U, false, 1U, Nan>);
             };
             const unsigned threads = four ? 64U : kQpf2kCoreWaves * 32U;
+            if (witness_ok) {
+                const std::uint64_t state_elems = witness_state_elems;
+                const auto& ws = witness_scratch;
+                xch.state_out = ws.state; xch.conv_out = ws.conv;
+                const auto kr_of = [&]<GdnRecurrentStorage S, bool F16 = false>() -> const void* {
+                    if (kr_g == 16U) return reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 16U, 8U, 4U, 8U, kQpf2kKrOpt<16U>, false, 1U, 4U, F16>);
+                    if (kr_g == 8U) return reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 8U, 4U, 4U, 8U, kQpf2kKrOpt<8U>, false, 1U, 4U, F16>);
+                    if constexpr (!F16) {
+                        if (kr_opt == 1398U) return reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, 2U, 4U, 8U, 1398U, false, 1U, 4U, F16>);
+                        if (kr_opt == 886U) return reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, 2U, 4U, 8U, 886U, false, 1U, 4U, F16>);
+                    }
+                    if (kr_opt == 374U) return reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, 2U, 4U, 8U, 374U, false, 1U, 4U, F16>);
+                    return reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, 2U, 4U, 8U, kQpf2kKrOpt<4U>, false, 1U, 4U, F16>);
+                };
+                const void* kr = f16
+                    ? (vk ? kr_of.template operator()<GdnRecurrentStorage::value_key, true>() : kr_of.template operator()<KV::value, true>())
+                    : (vk ? kr_of.template operator()<GdnRecurrentStorage::value_key>() : kr_of.template operator()<KV::value>());
+                check_hip(hipLaunchCooperativeKernel(kr, dim3(blocks), dim3(128), args, 0, stream), "qpf2k GDN witness core cooperative launch");
+                // fallback: pinned Nan 2 (exact for every input) from the untouched live state, iff the witness is set; its
+                // exchange counters continue from the witness kernel's (count / 8 chunks published and consumed per block).
+                // Witness excludes bit 64, so variant selects 2 columns and inherits f16 for a full core16 replay.
+                xch.base = count / 8U; xch.decay_nan = xch.witness;
+                const void* pinned = vk ? variant.template operator()<GdnRecurrentStorage::value_key, 2U>() : variant.template operator()<KV::value, 2U>();
+                check_hip(hipLaunchCooperativeKernel(pinned, dim3(blocks), dim3(threads), args, 0, stream), "qpf2k GDN witness fallback cooperative launch");
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_witness_commit_kernel<>), dim3(256), dim3(256), 0, stream,
+                    static_cast<const unsigned*>(xch.witness), static_cast<const float*>(ws.state), matrix_state, state_elems / 4U,
+                    static_cast<const std::uint16_t*>(ws.conv), conv_state, std::uint64_t{first.key_heads} * 2U * 128U * kGdnWindowKernel,
+                    std::uint64_t{first.value_heads} * 128U * kGdnWindowKernel);
+                check_hip(hipGetLastError(), "qpf2k GDN witness commit launch");
+                qpf2k_gdn_witness(kr_g == 16U ? "recurrence gdn_core_kernel<16,8,4,8,6,lean,witness> + pinned fallback (fused conv + norm)"
+                                  : kr_g == 8U ? "recurrence gdn_core_kernel<8,4,4,8,6,lean,witness> + pinned fallback (fused conv + norm)"
+                                                : kr_opt == 1398U ? "recurrence gdn_core_kernel<4,2,4,8,1398,lean,witness> + pinned fallback (pending sigmoid + deferred norm)"
+                                                : kr_opt == 886U ? "recurrence gdn_core_kernel<4,2,4,8,886,lean,witness> + pinned fallback (packed conv + deferred norm)"
+                                               : kr_opt == 374U ? "recurrence gdn_core_kernel<4,2,4,8,374,lean,witness> + pinned fallback (fused conv + norm)"
+                                               : "recurrence gdn_core_kernel<4,2,4,8,118,lean,witness> + pinned fallback (fused conv + norm)", count);
+                return;
+            }
             if (dispatch) {
                 const void* pinned = vk ? variant.template operator()<GdnRecurrentStorage::value_key, 2U>() : variant.template operator()<KV::value, 2U>();
                 const void* paired = vk ? variant.template operator()<GdnRecurrentStorage::value_key, 1U>() : variant.template operator()<KV::value, 1U>();
@@ -5513,7 +5645,7 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
             const int n = v ? std::atoi(v) : 2048;
             return n >= 0 ? static_cast<std::uint32_t>(n) : 2048U;
         }();
-        if (!enabled || !tiled_rows || !q8_rows::tiled::site_enabled(2U) || count < minimum ||
+        if (!enabled || qpf2k::suppressed(qpf2k::Item::gdn_core16) || !tiled_rows || !q8_rows::tiled::site_enabled(2U) || count < minimum ||
             first.value_width != 6144U || first.head_dim != 128U) return false;
         hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
         if (hipStreamIsCapturing(stream, &capture) != hipSuccess || capture != hipStreamCaptureStatusNone) return false;
@@ -6471,6 +6603,66 @@ void gdn_known_window_rows_projection_probe(GdnKnownWindowProjectionDirection di
     case 32: enqueue_gdn_wide_projection_probe<32U>(bf16, a8, input, weights, output, width, outputs, native_stream); break;
     case 64: enqueue_gdn_wide_projection_probe<64U>(bf16, a8, input, weights, output, width, outputs, native_stream); break;
     default: enqueue_gdn_wide_projection_probe<8U>(bf16, a8, input, weights, output, width, outputs, native_stream); break;
+    }
+}
+template <unsigned Rows>
+void enqueue_gdn_gsq_rows_probe(bool bf16, std::span<const std::uint32_t> types,
+    std::span<const GdnKnownWindowProjectionView> weights, std::span<const std::uint32_t> counts,
+    std::span<const GdnKnownWindowProjectionView> input, std::span<const GdnKnownWindowProjectionView> output,
+    std::uint32_t width, hipStream_t stream) {
+    q8_rows::Segments segments{};
+    for (unsigned m = 0; m < types.size(); ++m) {
+        segments.weights[m] = reinterpret_cast<const unsigned char*>(weights[m].address);
+        segments.types[m] = q8_rows::segment_type(types[m]);
+        segments.first[m + 1U] = segments.first[m] + counts[m];
+    }
+    segments.count = static_cast<unsigned>(types.size());
+    if (bf16) {
+        GdnInputRowsSite<Rows> site{};
+        site.segments = segments; site.width = width; site.outputs = segments.first[segments.count];
+        for (unsigned r = 0; r < Rows; ++r) {
+            site.input[r] = reinterpret_cast<const void*>(input[r].address);
+            for (unsigned m = 0; m < segments.count; ++m) site.output[m][r] = reinterpret_cast<float*>(output[m * Rows + r].address);
+        }
+        q8_rows::launch(site, true, stream);
+    } else {
+        GdnOutputRowsSite<Rows> site{};
+        site.segments = segments; site.width = width; site.outputs = segments.first[1];
+        for (unsigned r = 0; r < Rows; ++r) {
+            site.input[r] = reinterpret_cast<const void*>(input[r].address);
+            site.output[r] = reinterpret_cast<std::uint16_t*>(output[r].address);
+        }
+        q8_rows::launch(site, true, stream);
+    }
+    check_hip(hipGetLastError(), "GDN GSQ typed rows diagnostic launch");
+}
+void gdn_gsq_rows_projection_probe(GdnKnownWindowProjectionDirection direction, std::span<const std::uint32_t> types,
+    std::span<const GdnKnownWindowProjectionView> weights, std::span<const std::uint32_t> counts,
+    std::span<const GdnKnownWindowProjectionView> input, std::span<const GdnKnownWindowProjectionView> output,
+    std::uint32_t width, void* stream) {
+    const auto rows = static_cast<std::uint32_t>(input.size());
+    const bool bf16 = direction == GdnKnownWindowProjectionDirection::bf16_to_fp32;
+    if (rows < 1U || rows > 8U || types.empty() || types.size() > (bf16 ? 4U : 1U) || weights.size() != types.size() ||
+        counts.size() != types.size() || output.size() != types.size() * rows || !q8_rows::dense_a8_width(width) ||
+        !stream || static_cast<hipStream_t>(stream) == hipStreamLegacy || static_cast<hipStream_t>(stream) == hipStreamPerThread)
+        throw std::invalid_argument("GDN GSQ typed rows diagnostic requires 1..8 rows, 1..4 input (1 output) segments and an owned stream");
+    for (unsigned m = 0; m < types.size(); ++m)
+        if (!gsq_a8::dense_type(types[m]) || weights[m].bytes < gsq_a8::dense_row_bytes(types[m], width) * counts[m])
+            throw std::invalid_argument("GDN GSQ typed rows diagnostic segment type or weight extent");
+    for (unsigned m = 0; m < types.size(); ++m)
+        if (width % gsq_a8::dense_block_elements(types[m]))
+            throw std::invalid_argument("GDN GSQ typed rows diagnostic: width is not whole blocks of a segment type");
+    const auto native_stream = static_cast<hipStream_t>(stream);
+    check_hip(hipPeekAtLastError(), "GDN GSQ typed rows diagnostic pre-enqueue stale error");
+    switch (rows) {
+    case 1: enqueue_gdn_gsq_rows_probe<1U>(bf16, types, weights, counts, input, output, width, native_stream); break;
+    case 2: enqueue_gdn_gsq_rows_probe<2U>(bf16, types, weights, counts, input, output, width, native_stream); break;
+    case 3: enqueue_gdn_gsq_rows_probe<3U>(bf16, types, weights, counts, input, output, width, native_stream); break;
+    case 4: enqueue_gdn_gsq_rows_probe<4U>(bf16, types, weights, counts, input, output, width, native_stream); break;
+    case 5: enqueue_gdn_gsq_rows_probe<5U>(bf16, types, weights, counts, input, output, width, native_stream); break;
+    case 6: enqueue_gdn_gsq_rows_probe<6U>(bf16, types, weights, counts, input, output, width, native_stream); break;
+    case 7: enqueue_gdn_gsq_rows_probe<7U>(bf16, types, weights, counts, input, output, width, native_stream); break;
+    default: enqueue_gdn_gsq_rows_probe<8U>(bf16, types, weights, counts, input, output, width, native_stream); break;
     }
 }
 #endif

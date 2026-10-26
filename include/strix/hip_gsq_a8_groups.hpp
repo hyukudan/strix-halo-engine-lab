@@ -200,8 +200,13 @@ __device__ __forceinline__ IqGroup dense_group(const unsigned char* row, std::ui
 // Dense A8 chain entry of one group for one activation row (codes a, block delta):
 // one scale -> (s0 * delta, float(I)), the Q8_0 entry; halves -> ((s0 * delta) * float(I0) + (s1 * delta) * float(I1), 1);
 // min -> ((s0 * delta) * float(I) - (s1 * delta) * float(S), 1), S = sum of the group's codes.
+// Every operation rounds once, whatever the including TU's flags: the engine TUs (strix_hip_runtime) compile with the
+// HIP default -ffp-contract=fast-honor-pragmas and the kernel's own pragma does not reach this inlined header code, so
+// without this pragma u0 + u1 / u0 - u1 become an FMA whose fused operand the backend picks per instantiation (R1 and
+// the 2..8-row windows then differ by one rounding, and neither is the contract).
 template <std::uint32_t T>
 __device__ __forceinline__ float2 dense_entry(const IqGroup& x, const int (&a)[8], float delta) {
+#pragma clang fp contract(off)
     constexpr DenseKind kind = dense_kind<T>();
     if constexpr (kind == DenseKind::one) {
         int dot = 0;
@@ -231,9 +236,11 @@ __device__ __forceinline__ float2 dense_entry(const IqGroup& x, const int (&a)[8
     }
 }
 
-// delta * (s * float(I)) of one group against the A8 image `a` (8 words); IQ2_S: two halves.
+// delta * (s * float(I)) of one group against the A8 image `a` (8 words); IQ2_S: two halves. Rounded per operation
+// (as dense_entry; its users already compile with -ffp-contract=off, so their code is unchanged).
 template <std::uint32_t T>
 __device__ __forceinline__ float iq_apply(const IqGroup& x, const int* a, float delta) {
+#pragma clang fp contract(off)
     if constexpr (T == type_iq2_s) {
         int i0 = sdot(a[0], x.w[0], 0); i0 = sdot(a[1], x.w[1], i0); i0 = sdot(a[2], x.w[2], i0); i0 = sdot(a[3], x.w[3], i0);
         int i1 = sdot(a[4], x.w[4], 0); i1 = sdot(a[5], x.w[5], i1); i1 = sdot(a[6], x.w[6], i1); i1 = sdot(a[7], x.w[7], i1);

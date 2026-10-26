@@ -476,6 +476,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-known-prompt-chunks-tests PRIVATE strix_core)
     strix_target_warnings(strix-known-prompt-chunks-tests)
     add_test(NAME strix-known-prompt-chunks-tests COMMAND strix-known-prompt-chunks-tests)
+    add_executable(strix-qpf2k-defaults-tests tests/qpf2k_defaults_tests.cpp)
+    target_include_directories(strix-qpf2k-defaults-tests PRIVATE apps)
+    target_link_libraries(strix-qpf2k-defaults-tests PRIVATE strix_core)
+    strix_target_warnings(strix-qpf2k-defaults-tests)
+    add_test(NAME strix-qpf2k-defaults-tests COMMAND strix-qpf2k-defaults-tests)
     add_executable(strix-offline-compile-provenance-tests tests/offline_compile_provenance_tests.cpp)
     target_link_libraries(strix-offline-compile-provenance-tests PRIVATE strix_core)
     strix_target_warnings(strix-offline-compile-provenance-tests)
@@ -2096,6 +2101,17 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_link_libraries(strix-hip-gsq-dense-a8-tests PRIVATE strix_hip_runtime strix_core)
         strix_target_warnings(strix-hip-gsq-dense-a8-tests)
         add_test(NAME strix-hip-gsq-dense-a8-tests COMMAND strix-hip-gsq-dense-a8-tests)
+        # The engine's own GSQ typed site kernels (compiled in strix_hip_runtime with its flags) through the launchers'
+        # diagnostic probes: every row alone == batched T = 1..8 == the host contract.
+        add_executable(strix-hip-gsq-typed-sites-tests tests/hip_gsq_typed_sites_tests.hip)
+        set_target_properties(strix-hip-gsq-typed-sites-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_compile_definitions(strix-hip-gsq-typed-sites-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
+        target_compile_options(strix-hip-gsq-typed-sites-tests PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-gsq-typed-sites-tests PRIVATE strix_hip_runtime strix_core)
+        strix_target_warnings(strix-hip-gsq-typed-sites-tests)
+        add_test(NAME strix-hip-gsq-typed-sites-tests COMMAND strix-hip-gsq-typed-sites-tests)
         add_test(NAME strix-hip-prefill-dense-schedule-tests COMMAND ${CMAKE_COMMAND} -E env
             STRIX_INTPREFILL_GATES=1 $<TARGET_FILE:strix-hip-dense-a8-wmma-tests>)
         # Whole-T register-blocked dense FP16 projections (STRIX_QPF2K_DENSE=1) == launch_dense_f16, bitwise.

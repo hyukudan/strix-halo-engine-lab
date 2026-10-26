@@ -5144,7 +5144,7 @@ unsigned qpf2k_qsa_mask() {
         const char* m = std::getenv("STRIX_QPF2K_QSA_MASK");
         return m ? static_cast<unsigned>(std::strtoul(m, nullptr, 0)) : 0x3U; // default: the qualified parts (scorer, selection)
     }();
-    return mask;
+    return qpf2k::suppressed(qpf2k::Item::qsa) ? 0U : mask;
 }
 // STRIX_QSA_INDEX_ROWS=1: BF16 input matrices of prefill groups (the indexer q/k projections) run
 // qsa_index::rows_kernel (the same chains and tree as linear_to_float_rows_kernel, all rows of the group per launch).
@@ -5162,9 +5162,11 @@ bool qsa_norm_group_enabled() {
 std::uint32_t kind_ggml_type(WeightKind kind) {
     return kind == WeightKind::q8_0 ? 8U : kind == WeightKind::iq4_xs ? 23U : ggml_type_of(kind);
 }
+// typed_rows8: rows > 8 of a GSQ typed kind under dense A8 run as 8-row typed A8 sites (cohort windows: every row
+// gets its 1..8-row bits); otherwise (prefill groups) they keep the Slice-row FP32 kernels below.
 template <WeightKind Kind, unsigned Rows>
 void launch_qsa_rows_input(bool prefetch, bool a8, const QsaRowsInputViews<Rows>& views, std::uint32_t hidden, hipStream_t stream,
-    bool any_order = false) {
+    bool any_order = false, bool typed_rows8 = false) {
     // GSQ-RCO dense types under dense A8: the typed q8_rows site (the R1 dense A8 bits).
     if constexpr (Kind != WeightKind::q8_0 && Rows <= 8U) if (a8 && q8_rows::dense_a8_type(kind_ggml_type(Kind))) {
         QsaInputRowsSite<Rows> site{};
@@ -5242,7 +5244,8 @@ void launch_qsa_rows_input(bool prefetch, bool a8, const QsaRowsInputViews<Rows>
                     dim3(kThreads), 0, stream, slice, hidden);
             }
         };
-        if (slice_rows == 8U || Rows % slice_rows) run.template operator()<8U>();
+        if (slice_rows == 8U || Rows % slice_rows || (typed_rows8 && a8 && q8_rows::dense_a8_type(kind_ggml_type(Kind))))
+            run.template operator()<8U>();
         else if (slice_rows == 16U) run.template operator()<16U>();
         else if constexpr (Rows % 32U == 0U) run.template operator()<32U>();
         else run.template operator()<16U>();
@@ -5573,7 +5576,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         const auto deferred_before = qpf2k_index_batch().deferred;
         dispatch_weight_kind(matrices[lead]->manifest->ggml_type, [&](auto kind) {
             launch_qsa_rows_input<decltype(kind)::value, Rows>(prepared.prefetch[lead], config.dense_a8_projections,
-                input, a.hidden, stream, any_order && launched_group);
+                input, a.hidden, stream, any_order && launched_group, cohort_slot != nullptr);
         });
         // A group deferred by STRIX_QPF2K_QSA bit 7 launched nothing: the next group must not start any-order behind it.
         if (qpf2k_index_batch().deferred == deferred_before) launched_group = true;
@@ -7234,6 +7237,82 @@ void launch_hip_qsa_rows_projection_probe(HipQsaRowsProjection projection, HipQs
     else if (rows == 32U) enqueue_qsa_rows_probe<32U>(input_side, a8, input, weights, output, width, outputs, native);
     else enqueue_qsa_rows_probe<64U>(input_side, a8, input, weights, output, width, outputs, native);
     check_hip(hipGetLastError(), "QSA rows projection diagnostic launch");
+}
+namespace {
+template <unsigned Rows>
+void enqueue_qsa_gsq_rows_probe(bool input_side, std::span<const std::uint32_t> types, std::span<const HipQsaInputProjectionView> weights,
+    std::span<const std::uint32_t> counts, std::span<const HipQsaInputProjectionView> input,
+    std::span<const HipQsaInputProjectionView> output, std::uint32_t width, hipStream_t stream) {
+    q8_rows::Segments segments{};
+    for (unsigned m = 0; m < types.size(); ++m) {
+        segments.weights[m] = reinterpret_cast<const unsigned char*>(weights[m].address);
+        segments.types[m] = q8_rows::segment_type(types[m]);
+        segments.first[m + 1U] = segments.first[m] + counts[m];
+    }
+    segments.count = static_cast<unsigned>(types.size());
+    if (input_side) {
+        QsaInputRowsSite<Rows> site{};
+        site.segments = segments; site.width = width; site.outputs = segments.first[segments.count];
+        for (unsigned r = 0; r < Rows; ++r) {
+            site.input[r] = reinterpret_cast<const void*>(input[r].address);
+            for (unsigned m = 0; m < segments.count; ++m) site.output[m][r] = reinterpret_cast<float*>(output[m * Rows + r].address);
+        }
+        q8_rows::launch(site, true, stream);
+    } else {
+        QsaOutputRowsSite<Rows> site{};
+        site.segments = segments; site.width = width; site.outputs = segments.first[1];
+        for (unsigned r = 0; r < Rows; ++r) {
+            site.input[r] = reinterpret_cast<const void*>(input[r].address);
+            site.output[r] = reinterpret_cast<std::uint16_t*>(output[r].address);
+        }
+        q8_rows::launch(site, true, stream);
+    }
+}
+// 16 / 32 rows of one typed kind: the cohort window dispatcher (launch_qsa_rows_input with typed_rows8).
+template <unsigned Rows>
+void enqueue_qsa_gsq_cohort_probe(std::span<const std::uint32_t> types, std::span<const HipQsaInputProjectionView> weights,
+    std::span<const std::uint32_t> counts, std::span<const HipQsaInputProjectionView> input,
+    std::span<const HipQsaInputProjectionView> output, std::uint32_t width, hipStream_t stream) {
+    QsaRowsInputViews<Rows> views{};
+    for (unsigned m = 0; m < types.size(); ++m) {
+        views.weights[m] = reinterpret_cast<const void*>(weights[m].address);
+        views.first[m + 1U] = views.first[m] + counts[m];
+        for (unsigned r = 0; r < Rows; ++r) views.output[m][r] = reinterpret_cast<float*>(output[m * Rows + r].address);
+    }
+    views.count = static_cast<std::uint32_t>(types.size());
+    for (unsigned r = 0; r < Rows; ++r) views.input[r] = reinterpret_cast<const std::uint16_t*>(input[r].address);
+    dispatch_weight_kind(types[0], [&](auto kind) {
+        launch_qsa_rows_input<decltype(kind)::value, Rows>(false, true, views, width, stream, false, true);
+    });
+}
+} // namespace
+void launch_hip_qsa_gsq_rows_probe(HipQsaRowsProjection projection, std::span<const std::uint32_t> types,
+    std::span<const HipQsaInputProjectionView> weights, std::span<const std::uint32_t> counts,
+    std::span<const HipQsaInputProjectionView> input, std::span<const HipQsaInputProjectionView> output,
+    std::uint32_t width, void* stream) {
+    const auto rows = static_cast<unsigned>(input.size());
+    const bool input_side = projection == HipQsaRowsProjection::input;
+    const bool cohort = rows == 16U || rows == 32U;
+    if ((rows != 1U && rows != 2U && rows != 4U && rows != 8U && !(cohort && input_side)) || types.empty() || types.size() > (input_side ? 5U : 1U) ||
+        weights.size() != types.size() || counts.size() != types.size() || output.size() != types.size() * rows ||
+        (!input_side && projection != HipQsaRowsProjection::output) || !q8_rows::dense_a8_width(width) ||
+        !stream || static_cast<hipStream_t>(stream) == hipStreamLegacy || static_cast<hipStream_t>(stream) == hipStreamPerThread)
+        throw std::invalid_argument("QSA GSQ typed rows diagnostic requires 1/2/4/8 rows, 1..5 input (1 output) segments and an owned stream");
+    for (unsigned m = 0; m < types.size(); ++m)
+        if (!gsq_a8::dense_type(types[m]) || weights[m].bytes < gsq_a8::dense_row_bytes(types[m], width) * counts[m])
+            throw std::invalid_argument("QSA GSQ typed rows diagnostic segment type or weight extent");
+    for (unsigned m = 0; m < types.size(); ++m)
+        if (width % gsq_a8::dense_block_elements(types[m]) || (cohort && (types[m] != types[0] || types[m] == 8U)))
+            throw std::invalid_argument("QSA GSQ typed rows diagnostic: width is not whole blocks, or a 16/32-row cohort is not one typed kind");
+    const auto native = static_cast<hipStream_t>(stream);
+    check_hip(hipPeekAtLastError(), "QSA GSQ typed rows diagnostic pre-enqueue stale error");
+    if (rows == 16U) enqueue_qsa_gsq_cohort_probe<16U>(types, weights, counts, input, output, width, native);
+    else if (rows == 32U) enqueue_qsa_gsq_cohort_probe<32U>(types, weights, counts, input, output, width, native);
+    else if (rows == 1U) enqueue_qsa_gsq_rows_probe<1U>(input_side, types, weights, counts, input, output, width, native);
+    else if (rows == 2U) enqueue_qsa_gsq_rows_probe<2U>(input_side, types, weights, counts, input, output, width, native);
+    else if (rows == 4U) enqueue_qsa_gsq_rows_probe<4U>(input_side, types, weights, counts, input, output, width, native);
+    else enqueue_qsa_gsq_rows_probe<8U>(input_side, types, weights, counts, input, output, width, native);
+    check_hip(hipGetLastError(), "QSA GSQ typed rows diagnostic launch");
 }
 #endif
 

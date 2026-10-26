@@ -1,6 +1,7 @@
 #pragma once
 #include "strix/decode_execution_options.hpp"
 #include "strix/known_prefill_limits.hpp"
+#include "strix/qpf2k_defaults.hpp"
 #include "strix/decode_numerical_profile.hpp"
 #include "strix/gdn_recurrent_layout.hpp"
 #include "strix/gdn_recurrent_storage.hpp"
@@ -780,7 +781,7 @@ inline void apply_default_known_prefill_tails(Options& options) {
     // T = 8192). The ladder (T blocks, then the largest tail that fits, then < 16 serial rows; with bit 4 balanced blocks
     // and no tails) is the same on the pf cursor and the tiled MTP prompt. Not with anything that can start the prompt
     // elsewhere or run other prompts (serving, cohorts, prefix caches / imports, wide copy cycles, lookup).
-    if (const char* v = std::getenv("STRIX_QPF2K_SCHED"); v && (std::strtoul(v, nullptr, 0) & 8UL) != 0UL &&
+    if (const char* v = std::getenv("STRIX_QPF2K_SCHED"); !strix::qpf2k::suppressed(strix::qpf2k::Item::sched) && v && (std::strtoul(v, nullptr, 0) & 8UL) != 0UL &&
         !options.tokens.empty() && !options.http_serve && options.mtp.cohort.empty() && options.serving_prefix_files.empty() &&
         options.mtp.copy_wide_rows.empty() && !options.prefix_cache_roundtrip && !options.prefix_cache_host_bytes &&
         options.prefix_cache_dir.empty() && !options.prefix_cache_block_rows && options.prefix_cache_then_prompts.empty() &&
@@ -836,7 +837,7 @@ inline void validate_known_prefill_options(const Options& options) {
         throw std::invalid_argument("tiled state-only prefill cannot generate without a terminal output frontier");
     // STRIX_QPF2K_SCHED bits 4/16 (merged / balanced blocks) are bitwise only where a dense row's form does not depend on its
     // launch's row count: the dense8 component picks G64 or dense A8 by launch size (hip_dense_f16_wmma.hpp launch_prefill).
-    if (const char* v = std::getenv("STRIX_QPF2K_SCHED"); v && (std::strtoul(v, nullptr, 0) & 20UL) != 0UL &&
+    if (const char* v = std::getenv("STRIX_QPF2K_SCHED"); !strix::qpf2k::suppressed(strix::qpf2k::Item::sched) && v && (std::strtoul(v, nullptr, 0) & 20UL) != 0UL &&
         (numerical_profile_pair(options).fast_components & strix::kFastPrefillDense8) != 0U)
         throw std::invalid_argument("STRIX_QPF2K_SCHED bits 4/16 (merged / balanced prefill blocks) exclude the dense8 prefill component");
     if (!options.known_prefix_tail_rows.empty() && (options.known_prefix_tail_rows.front() >= options.known_prefix_prefill_rows ||
@@ -1185,7 +1186,9 @@ inline void validate_resolved_mtp_cli(const Options& o) {
 
 inline Options parse_options(
     int argc,
-    char** argv) {
+    char** argv, bool defer_qpf2k_defaults = false) {
+    // The executable resolves injected schedule defaults after reading the manifest.
+    const strix::qpf2k::ModelScope defaults_scope(defer_qpf2k_defaults || strix::qpf2k::gsq_model);
     if (argc < 2) {
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
@@ -2374,7 +2377,8 @@ inline Options parse_options(
         throw std::invalid_argument("offline compile provenance requires --offline-tuning-cache");
     validate_moe_token_cost_options(options);
     validate_prompt_lookup_snapshot_options(options);
-    apply_default_known_prefill_tails(options);
+    if (!defer_qpf2k_defaults || !(strix::qpf2k::defaulted_items & strix::qpf2k::bit(strix::qpf2k::Item::sched)))
+        apply_default_known_prefill_tails(options);
     validate_known_prefill_options(options);
     validate_serving_prefix_cache_limits(options);
     if (options.serving_prefix_files.empty() && (options.serving_tensor_cohort_explicit || options.serving_concurrency_explicit || options.serving_memory_explicit ||
