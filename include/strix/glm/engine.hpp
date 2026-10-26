@@ -177,6 +177,10 @@ class Exchange {
 public:
     virtual ~Exchange() = default;
     virtual void reduce(float* p, unsigned rows, hipStream_t s) = 0;
+    // One reduction in flight, on one stream: start, enqueue independent work, finish.
+    // The default is synchronous; implementations may overlap transport, preserving reduce() arithmetic.
+    virtual void start_reduce(float* p, unsigned rows, hipStream_t s) { reduce(p, rows, s); }
+    virtual void finish_reduce(hipStream_t /*s*/) {}
     // (value, id) of each row's local argmax -> the global one on both ranks (larger value, ties -> lower id).
     virtual void argmax(float* value, std::uint32_t* id, unsigned rows, hipStream_t s) = 0;
     // Completion point of a call that ends without argmax (prefill chunk, gate_residual): returns once every exchange
@@ -219,6 +223,8 @@ public:
         (void)m, (void)c, (void)x, (void)I, (void)y;
         throw std::logic_error("PrefillPath::dense not implemented by this seam");
     }
+    // Exact under consecutive half-row calls on one stream (including recurrence / cache commits).
+    virtual bool supports_pipeline() const { return false; }
     // Largest LinearRunner workspace any call of this path needs; Engine::set_prefill reserves it up front.
     virtual std::uint64_t linear_workspace_bytes() const { return 0; }
     // Free-memory margin (device and host) the reservation must leave; the path's own admission uses the same one.
@@ -259,6 +265,8 @@ struct Options {
                                          // (set_exchange) before the first forward (e.g. XferExchange)
     bool decode_xfer = true;             // TP2 Communicator: plain forwards with 1..8 rows borrow its transport.
                                          // STRIX_GLM_DECODE_XCH=comm|xfer overrides this option on both ranks.
+    unsigned pf_pipeline = 1;           // 1: current schedule; 2: half-row whole-layer overlap
+                                         // STRIX_GLM_PF_PIPELINE=1|2 overrides this option on both ranks.
 };
 struct LoadReport {
     double seconds = 0, gib_read = 0, device_gib = 0;
@@ -312,6 +320,7 @@ public:
     void set_exchange(std::shared_ptr<Exchange> p);
     [[nodiscard]] std::shared_ptr<Exchange> exchange() const;  // installed fallback, independent of the last forward
     [[nodiscard]] bool decode_xfer_enabled() const;
+    [[nodiscard]] unsigned prefill_pipeline() const;
     void set_prefill(std::shared_ptr<PrefillPath> p);
     // Bytes the installed MoE seam would still allocate lazily (sum of warm_bytes over the loaded MoE layers); 0 after
     // a prefill install or a set_moe with a prefill installed (test hook: a prefill must not allocate).

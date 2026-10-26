@@ -602,7 +602,7 @@ Full item lists, preconditions, notices and evidence: [optimization catalog](doc
 | MiniMax: decode/exchange | Wide MoE, concurrent index, fused boundaries | On (22-item resolver) | Boundary set: 48.56 → 44.40 ms/token | Built-in gates | `STRIX_MM_BASELINE=1` |
 | MiniMax: prefill/transport | v4 core, batching, pipeline, CRC overlap | On/auto | Prefill bundle: 8K TTFT −20% | Bitwise gates | Per-item off values; see catalog |
 | GLM: R1b decode | Faster FP32 summation identity | On | 41.93–41.96 vs R1 47.33–47.48 ms/token | Own identity; differs from R1 | `--identity r1` |
-| GLM: exact chunked prefill | R1 gemv identity, MoE/MLA/indexer kernels | Auto (16 env items) | 1K/8K/32K: 240/236/226 tok/s | R1 bitwise | `--prefill ref` |
+| GLM: exact chunked prefill | R1 gemv identity, MoE/MLA/indexer kernels, two-layer pipeline with async exchange, 2048-row chunks | Auto (18 env items) | 8K: 31.2 s (262 tok/s); 32K: 134.5 s (244 tok/s) | R1 bitwise | `--prefill ref`; `--baseline` |
 
 Master baselines: Qwen `--baseline` / `STRIX_BASELINE=1`; DeepSeek pair `STRIX_DS41_BASELINE=1`;
 RTX `--baseline` / `STRIX_DS41_RTX_BASELINE=1`; MiniMax `STRIX_MM_BASELINE=1`;

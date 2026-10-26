@@ -441,18 +441,40 @@ int main(int argc, char** argv) {
         {  // MLA stage split (one extra call on the same inputs; outside the measured passes)
             hipEvent_t pe[6];
             for (auto& ev : pe) hok(hipEventCreate(&ev), "ev");
-            P::set_mla_profile(pe);
-            P::mla_attention_rows(slot, tok, n, qb, kv_b, kHeadsR, qt, e, ob, mo, C, g_hs);
-            P::set_mla_profile(nullptr);
-            hok(hipEventSynchronize(pe[5]), "ev");
-            const char* nm[5] = {"absorb", "scores", "softmax", "o-bar", "out"};
-            std::printf("   MLA stages:");
-            for (int i = 0; i < 5; ++i) {
-                float ms = 0;
-                hok(hipEventElapsedTime(&ms, pe[i], pe[i + 1]), "ev");
-                std::printf(" %s %.2f ms (%.2f us/row)", nm[i], ms, ms * 1000.0 / C);
+            // Paired stage timings, independent of environment selection. Run with
+            // 2048 0 2048 6144 2048 30720 to cover the three qualification positions.
+            const unsigned sv[4] = {3, 4, 3, 4}, ov[4] = {5, 5, 6, 6};
+            float stage_us[4][3][5]{};
+            for (unsigned rep = 0; rep < 4; ++rep) {
+                // Alternate pair order to limit systematic warm-cache/clock bias.
+                for (unsigned i = 0; i < 4; ++i) {
+                    const unsigned v = rep & 1U ? 3 - i : i;
+                    P::set_mla_profile(pe);
+                    P::mla_attention_rows_versions(slot, tok, n, qb, kv_b, kHeadsR, qt, e, ob, mo, C, g_hs, sv[v], ov[v]);
+                    P::set_mla_profile(nullptr);
+                    hok(hipEventSynchronize(pe[5]), "ev");
+                    if (!rep) continue;
+                    for (unsigned j = 0; j < 5; ++j) {
+                        float ms = 0;
+                        hok(hipEventElapsedTime(&ms, pe[j], pe[j + 1]), "ev");
+                        stage_us[v][rep - 1][j] = ms * 1000.0F;
+                    }
+                }
             }
-            std::printf("\n");
+            for (unsigned v = 0; v < 4; ++v) {
+                float sc[3], obar[3], total[3];
+                for (unsigned rep = 0; rep < 3; ++rep) {
+                    sc[rep] = stage_us[v][rep][1];
+                    obar[rep] = stage_us[v][rep][3];
+                    total[rep] = std::accumulate(stage_us[v][rep], stage_us[v][rep] + 5, 0.0F);
+                }
+                std::sort(sc, sc + 3);
+                std::sort(obar, obar + 3);
+                std::sort(total, total + 3);
+                std::printf("   MLA paired median C=%u t0=%u H=%u scores=v%u %.2f us/layer (%.3f us/row), "
+                            "obar=v%u %.2f us/layer (%.3f us/row), total %.2f us/layer\n",
+                            C, t0, kHeadsR, sv[v], sc[1], sc[1] / C, ov[v], obar[1], obar[1] / C, total[1]);
+            }
             for (auto& ev : pe) hok(hipEventDestroy(ev), "ev");
         }
         std::printf("== C=%u t0=%u (DSA rows see P up to %u pools, n up to %u tokens); passes bitwise equal: %s\n", C, t0, cap / kKpool,

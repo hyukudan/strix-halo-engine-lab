@@ -1112,14 +1112,36 @@
   },
   {
     "engine": "glm",
-    "name": "Prefill MLA scores v3",
+    "name": "Prefill MLA scores v4",
     "flag_or_env": "STRIX_GLM_PF_SCORES",
-    "default": "3",
-    "exact": "Measurement: MLA scores v3 -22 %; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.",
-    "gain": "MLA scores v3 -22 %",
+    "default": "4",
+    "exact": "Bitwise equal to v3 on kernel fixtures; same-identity tokens and digests on the pair.",
+    "gain": "v3 -22 % vs v2; v4 -8..-17 % vs v3",
     "preconditions": "Exact chunked prefill and supported score geometry.",
-    "off_switch": "STRIX_GLM_PF_SCORES=2",
-    "doc_anchor": "docs/optimizations.md#glm-pf-scores-v3"
+    "off_switch": "STRIX_GLM_PF_SCORES=3 (or 2)",
+    "doc_anchor": "docs/optimizations.md#prefill-mla-scores-v4"
+  },
+  {
+    "engine": "glm",
+    "name": "Prefill pipeline and async exchange start",
+    "flag_or_env": "STRIX_GLM_PF_PIPELINE, STRIX_DIST_ASYNC_START",
+    "default": "2 / 1",
+    "exact": "Prefill gate bitwise to the reference row-by-row prefill; TTFT logits equal on both ranks at 1K/8K/32K.",
+    "gain": "8K about -4 %; exchange fully hidden",
+    "preconditions": "Exact chunked prefill on two ranks; full-host chunked exchange path.",
+    "off_switch": "STRIX_GLM_PF_PIPELINE=1, STRIX_DIST_ASYNC_START=0, or --baseline",
+    "doc_anchor": "docs/optimizations.md#prefill-pipeline-and-async-exchange-start"
+  },
+  {
+    "engine": "glm",
+    "name": "Prefill chunk rows 2048",
+    "flag_or_env": "--max-rows",
+    "default": "2048",
+    "exact": "Logits equal to the reference prefill on both ranks at 1K/8K/32K.",
+    "gain": "8K 35.65 to 31.39 s (-12 %)",
+    "preconditions": "Exact chunked prefill.",
+    "off_switch": "--max-rows 1024 or --baseline",
+    "doc_anchor": "docs/optimizations.md#prefill-chunk-rows-2048"
   },
   {
     "engine": "glm",

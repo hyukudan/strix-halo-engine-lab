@@ -238,6 +238,8 @@ public:
         : comm_(comm), rank_(rank), remote_(dalloc<float>(static_cast<std::size_t>(max_rows) * kHidden)),
           am_l_(dalloc<std::uint64_t>(max_rows)), am_r_(dalloc<std::uint64_t>(max_rows)) {}
     ~CommExchange() override {
+        for (auto e : source_free_) if (e) (void)hipEventDestroy(e);
+        for (auto e : remote_last_use_) if (e) (void)hipEventDestroy(e);
         (void)hipFree(remote_);
         (void)hipFree(am_l_);
         (void)hipFree(am_r_);
@@ -252,6 +254,52 @@ public:
         const float* p1 = rank_ == 0 ? remote_ : p;
         sum2_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(p0, p1, p, n);
         hip_ok(hipGetLastError(), "sum2");
+    }
+    void start_reduce(float* p, unsigned rows, hipStream_t s) override {
+        start_reduce_region(p, rows, 0, -1, s);
+    }
+    // Only the N=2 opt-in schedule supplies a half and a disjoint row region.
+    void wait_source(unsigned half, hipStream_t s) {
+        if (source_pending_[half]) {
+            hip_ok(hipStreamWaitEvent(s, source_free_[half], 0), "prefill source lifetime");
+            source_pending_[half] = false;
+        }
+    }
+    void start_reduce_region(float* p, unsigned rows, unsigned offset, int half, hipStream_t s) {
+        if (pending_part_ != nullptr) throw std::logic_error("prefill reduction already in flight");
+        dist::Tag tag;
+        tag.kind = static_cast<std::uint32_t>(dist::TagKind::half_sum);
+        tag.request = seq_++;
+        pending_remote_ = remote_ + static_cast<std::size_t>(offset) * kHidden;
+        pending_half_ = half;
+        const std::size_t bytes = static_cast<std::size_t>(rows) * kHidden * sizeof(float);
+        if (half >= 0) {
+            if (!source_free_[half]) hip_ok(hipEventCreateWithFlags(&source_free_[half], hipEventDisableTiming), "prefill source event");
+            if (!remote_last_use_[half]) {
+                hip_ok(hipEventCreateWithFlags(&remote_last_use_[half], hipEventDisableTiming), "prefill remote event");
+                hip_ok(hipEventRecord(remote_last_use_[half], s), "prefill initial remote lifetime");
+            }
+            source_pending_[half] = comm_.start_async(s, p, pending_remote_, bytes, tag, remote_last_use_[half], source_free_[half]);
+        } else comm_.start(s, p, bytes, tag);
+        pending_part_ = p;
+        pending_rows_ = rows;
+    }
+    void finish_reduce(hipStream_t s) override {
+        if (pending_part_ == nullptr) throw std::logic_error("prefill reduction not in flight");
+        float* p = pending_part_;
+        const std::size_t n = static_cast<std::size_t>(pending_rows_) * kHidden;
+        pending_part_ = nullptr;  // a failed finish stops the communicator; do not retry it during unwinding
+        // finish waits for checked peer bytes. Each half's last-use event protects
+        // its remote region from the next off-stream H2D; pinned staging is owned by comm_.
+        comm_.finish(s, pending_remote_);
+        const float* p0 = rank_ == 0 ? p : pending_remote_;
+        const float* p1 = rank_ == 0 ? pending_remote_ : p;
+        sum2_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, s>>>(p0, p1, p, n);
+        hip_ok(hipGetLastError(), "sum2 prefill pipeline");
+        if (pending_half_ >= 0) hip_ok(hipEventRecord(remote_last_use_[pending_half_], s), "prefill remote last use");
+    }
+    void complete(hipStream_t s) override {
+        if (pending_part_ != nullptr) finish_reduce(s);
     }
     void argmax(float* value, std::uint32_t* id, unsigned rows, hipStream_t s) override {
         std::vector<float> v(rows);
@@ -326,6 +374,12 @@ private:
     float* remote_;
     std::uint64_t *am_l_, *am_r_;
     std::uint64_t seq_ = 0;
+    float* pending_part_ = nullptr;
+    unsigned pending_rows_ = 0;
+    float* pending_remote_ = nullptr;
+    int pending_half_ = -1;
+    hipEvent_t source_free_[2] = {}, remote_last_use_[2] = {};
+    bool source_pending_[2] = {};
 };
 
 // ---------------------------------------------------------------- layer weights
@@ -463,6 +517,12 @@ struct Engine::Impl {
     mem::Snapshot base;
 
     Impl(Options o, dist::Communicator* c) : opt(std::move(o)), comm(c), pack(opt.model_dir), lib(pack, opt.raw_linears) {
+        if (const char* v = std::getenv("STRIX_GLM_PF_PIPELINE"); v != nullptr) {
+            const std::string value(v);
+            if (value != "1" && value != "2") throw std::invalid_argument("STRIX_GLM_PF_PIPELINE must be 1 or 2");
+            opt.pf_pipeline = value == "2" ? 2U : 1U;
+        }
+        if (opt.pf_pipeline != 1 && opt.pf_pipeline != 2) throw std::invalid_argument("pf_pipeline must be 1 or 2");
         if (opt.world != 1 && opt.world != 2) throw std::invalid_argument("world must be 1 or 2");
         // STRIX_GLM_LOAD_TEST=1: one rank's slice loaded without a peer (load timing only; any forward throws).
         load_test = opt.world == 2 && comm == nullptr && std::getenv("STRIX_GLM_LOAD_TEST") != nullptr &&
@@ -1049,11 +1109,134 @@ struct Engine::Impl {
         std::swap(X, X2);
     }
 
+    // N=2 whole-layer schedule. Only transport progresses off-stream; every seam and boundary is
+    // enqueued on stream. Each half swaps its own residual pointers twice per layer, ending in X.
+    void layers_forward_pipeline(std::span<const Row> rows, unsigned n_layers) {
+        const unsigned R = static_cast<unsigned>(rows.size()), A = (R + 1) / 2;
+        struct Half {
+            unsigned offset, count;
+            float *x, *out;
+        };
+        Half a{0, A, X, X2};
+        Half b{A, R - A, X + static_cast<std::size_t>(A) * kHc * kHidden,
+               X2 + static_cast<std::size_t>(A) * kHc * kHidden};
+        CommExchange* async_xch = nullptr;
+        if (const char* v = std::getenv("STRIX_DIST_ASYNC_START"); v && std::string(v) == "1")
+            async_xch = dynamic_cast<CommExchange*>(xch.get());
+        auto wait_source = [&](const Half& h) {
+            if (async_xch) async_xch->wait_source(h.offset == 0 ? 0U : 1U, stream);
+        };
+        auto context = [&](const Half& h) {
+            return CallCtx{&lib, rows.subspan(h.offset, h.count), slot_d + h.offset, pos_d + h.offset,
+                           flag, stream, false, nullptr};
+        };
+        auto partial = [&](const Half& h) { return part + static_cast<std::size_t>(h.offset) * kHidden; };
+        auto pre = [&](const Half& h, const HcSite& site, const std::uint16_t* norm) {
+            const std::size_t q = h.offset;
+            glm::pf::hc_pre_rows(h.x, site.fn, site.base, site.scale, F + q * kHc * kHidden,
+                                 hz + q * kHcMix, mix + q * kHcMix, xc + q * kHidden, h.count, stream);
+            D::rmsnorm(xc + q * kHidden, norm, D::WType::BF16, kHidden, kEps, xn + q * kHidden, h.count, stream);
+            mark(segHc);
+        };
+        auto attention = [&](const Half& h, LayerW& w) {
+            wait_source(h);  // this half's seam may overwrite part; the other half remains independent
+            pre(h, w.hc_attn, w.in_norm);
+            const CallCtx c = context(h);
+            const float* x = xn + static_cast<std::size_t>(h.offset) * kHidden;
+            if (w.kda) pf->kda(w.kdaw, w.kst, c, x, partial(h));
+            else pf->dsa(w.dsaw, w.dst, c, x, partial(h));
+            mark(w.kda ? segKda : segDsa);
+        };
+        auto ffn = [&](const Half& h, LayerW& w) {
+            wait_source(h);
+            pre(h, w.hc_ffn, w.post_norm);
+            const CallCtx c = context(h);
+            const std::size_t q = h.offset;
+            const float* x = xn + q * kHidden;
+            if (w.moe) {
+                float* log = rlog + q * kExperts;
+                std::uint32_t* id = ids + q * kTopE;
+                float* wt = wts + q * kTopE;
+                glm::pf::dense_rows(x, w.moew.router, D::WType::F16, kHidden, 0, kExperts, log, h.count, stream);
+                D::route(log, w.moew.bias, id, wt, h.count, stream);
+                if (pf->moe_by_row()) {
+                    const unsigned B = std::clamp(pf->moe_row_block(), 1U, 8U);
+                    for (unsigned r = 0; r < h.count; r += B) {
+                        const CallCtx cr{&lib, c.rows.subspan(r, std::min(B, h.count - r)), slot_d + q + r,
+                                         pos_d + q + r, flag, stream, false, nullptr};
+                        moe->forward(w.moew, cr, x + static_cast<std::size_t>(r) * kHidden,
+                                     id + static_cast<std::size_t>(r) * kTopE, wt + static_cast<std::size_t>(r) * kTopE,
+                                     partial(h) + static_cast<std::size_t>(r) * kHidden);
+                    }
+                } else pf->moe(w.moew, c, x, id, wt, partial(h));
+            } else pf->dense(w.dense, c, x, dense_i, partial(h));
+            mark(w.moe ? segMoe : segDense);
+        };
+        auto start = [&](const Half& h) {
+            if (async_xch) async_xch->start_reduce_region(partial(h), h.count, h.offset, h.offset == 0 ? 0 : 1, stream);
+            else xch->start_reduce(partial(h), h.count, stream);
+        };
+        auto finish = [&] {
+            xch->finish_reduce(stream);
+            mark(segXch);
+        };
+        auto expand = [&](Half& h) {
+            D::hc_expand(h.x, mix + static_cast<std::size_t>(h.offset) * kHcMix, partial(h), h.out, flag, h.count, stream);
+            mark(segHc);
+            std::swap(h.x, h.out);
+        };
+        try {
+            for (unsigned li = 0; li < n_layers; ++li) {
+                LayerW& w = layers[li];
+                cur_layer = li;
+                attention(a, w);
+                // B's previous FFN may overlap next-layer attention A. Retire before the next start.
+                if (li != 0 && b.count != 0) {
+                    finish();
+                    expand(b);
+                }
+                start(a);
+                if (b.count != 0) attention(b, w);  // A's recurrence / cache commits precede B on stream
+                finish();
+                if (b.count != 0) start(b);
+                expand(a);
+                ffn(a, w);
+                if (b.count != 0) finish();
+                start(a);
+                if (b.count != 0) {
+                    expand(b);
+                    ffn(b, w);
+                }
+                finish();
+                if (b.count != 0) start(b);
+                expand(a);
+            }
+            if (n_layers != 0 && b.count != 0) {
+                finish();
+                expand(b);
+            }
+        } catch (...) {
+            // Do not leave a producer / host transfer borrowing row buffers after a seam throws.
+            try { xch->complete(stream); } catch (...) {}
+            throw;
+        }
+        check_flag("layers");
+    }
+
     // sp != nullptr: speculative verify rows (one slot): checkpoints go to sp->row_flag[r], nothing throws here.
     // pfc: a chunk of a chunked prefill (rows of one slot, any count <= max_rows): attention, MoE and the dense FFN go
     // through the PrefillPath seam; the row-batched Tier A sites use pf::hc_pre_rows / pf::dense_rows (== decode bits).
     void layers_forward(std::span<const Row> rows, unsigned n_layers, const SpecRows* sp = nullptr, bool pfc = false, bool plain = false) {
         const auto R = static_cast<unsigned>(rows.size());
+        if (pfc && opt.pf_pipeline == 2) {
+            if (sp != nullptr || layer_dump != nullptr || null_layer >= 0)
+                throw std::logic_error("prefill pipeline 2 does not support spec / layer_dump / null_layer hooks");
+            if (!pf->supports_pipeline()) throw std::logic_error("prefill pipeline 2 needs an exact half-row PrefillPath");
+            if (rows.empty()) throw std::invalid_argument("prefill pipeline 2 needs nonempty rows");
+            for (unsigned r = 1; r < R; ++r)
+                if (rows[r].slot != rows[0].slot || rows[r].pos != rows[0].pos + r)
+                    throw std::invalid_argument("prefill pipeline 2 needs consecutive positions of one slot");
+        }
         std::vector<std::uint32_t> tk(R), sl(R);
         std::vector<std::uint64_t> ps(R);
         for (unsigned r = 0; r < R; ++r) {
@@ -1081,6 +1264,10 @@ struct Engine::Impl {
         if (R > std::max<unsigned>(8U, opt.max_rows)) throw std::invalid_argument("layers_forward: rows > max_rows");
         if (pfc && r1b) throw std::logic_error("r1b-all needs the reference prefill; the chunked prefill implements R1 prompts");
         select_exchange(plain, R, sp, pfc);
+        if (pfc && opt.pf_pipeline == 2) {
+            layers_forward_pipeline(rows, n_layers);
+            return;
+        }
         const CallCtx c{&lib, rows, slot_d, pos_d, flag, stream, !pfc, sp};
         unsigned* const c1 = sp ? sp->row_flag : flag;  // C1 per row in spec mode
         const unsigned c1_stride = sp ? 1U : 0U;
@@ -1522,6 +1709,7 @@ void Engine::set_exchange(std::shared_ptr<Exchange> p) {
 }
 std::shared_ptr<Exchange> Engine::exchange() const { return impl_->fallback_xch; }
 bool Engine::decode_xfer_enabled() const { return impl_->decode_xch != nullptr; }
+unsigned Engine::prefill_pipeline() const { return impl_->opt.pf_pipeline; }
 void Engine::set_prefill(std::shared_ptr<PrefillPath> p) {
     // Before load() the path is only stored; load() installs it once the weights exist (Impl::install_prefill).
     if (p && impl_->loaded) impl_->install_prefill(*p);
