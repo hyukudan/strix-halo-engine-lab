@@ -53,9 +53,9 @@ std::vector<std::uint16_t> random_f16(std::size_t n) {
 std::vector<float> random_f(std::size_t n, float lo, float hi) { std::vector<float> v(n); for (auto& x : v) x = uni(lo, hi); return v; }
 
 // Window ring and compression over 0..npos-1 in verify windows of 1..8 rows; host and device caches equal.
-void caches(unsigned ratio, unsigned npos, int compress_fast = 0) {
+void caches(unsigned ratio, unsigned npos, int compress_fast = 0, unsigned call_rows = 8) {
     g::set_compress_fast(compress_fast);
-    const unsigned cap = a::kWindow + a::kMaxRows;
+    const unsigned cap = a::kWindow + call_rows;
     const auto norm = random_f(512, 0.5F, 1.5F), cnorm = random_f(512, 0.5F, 1.5F), knorm = random_f(128, 0.5F, 1.5F);
     const auto wk = random_f16(128 * 512);
     std::vector<std::uint8_t> ring(cap * a::kWindowEntryBytes), kv(npos * a::kKvEntryBytes), ix(npos * a::kIdxEntryBytes);
@@ -67,12 +67,18 @@ void caches(unsigned ratio, unsigned npos, int compress_fast = 0) {
     std::uint64_t p = 0;
     bool flip = false;
     for (unsigned step = 0; p < npos; ++step) {
-        const unsigned rows = std::min<unsigned>(1U + (step * 5U) % 8U, static_cast<unsigned>(npos - p));
+        const unsigned rows = std::min<unsigned>(call_rows == 8U ? 1U + (step * 5U) % 8U : call_rows, static_cast<unsigned>(npos - p));
         std::vector<std::uint64_t> pos(rows);
         for (unsigned r = 0; r < rows; ++r) pos[r] = p + r;
         const auto kvp = random_f(rows * 512, -3, 3), sc = random_f(rows * 512, -4, 4);
-        a::window_write({kvp, norm, pos, cap, a::RopeKind::compressed}, ring);
-        a::compress({ratio, kvp, sc, cnorm, wk, knorm, pos}, state, kv, ix);
+        for (unsigned first = 0; first < rows; first += a::kMaxRows) {
+            const unsigned count = std::min(a::kMaxRows, rows - first);
+            const auto k = std::span<const float>(kvp).subspan(std::size_t{first} * 512U, count * 512U);
+            const auto score = std::span<const float>(sc).subspan(std::size_t{first} * 512U, count * 512U);
+            const auto positions = std::span<const std::uint64_t>(pos).subspan(first, count);
+            a::window_write({k, norm, positions, cap, a::RopeKind::compressed}, ring);
+            a::compress({ratio, k, score, cnorm, wk, knorm, positions}, state, kv, ix);
+        }
         Dev<float> dkvp(kvp), dsc(sc);
         Dev<std::uint64_t> dpos(pos);
         Dev<a::RopeRow> drope(ropes(a::RopeKind::compressed, pos)), dcrope(ropes(a::RopeKind::compressed, pos, ratio));
@@ -213,7 +219,14 @@ void index_and_select(std::uint64_t last, unsigned rows, unsigned ratio, unsigne
     const auto cache = random_idx_cache(max_count);
     const auto q = random_f(rows * 32 * 128, -2, 2), w = random_f(rows * 32, -1, 1);
     std::vector<std::vector<float>> scores;
-    a::index_scores({q, w, pos, ratio, a::RopeKind::compressed}, cache, scores);
+    for (unsigned first = 0; first < rows; first += a::kMaxRows) {
+        const unsigned count = std::min(a::kMaxRows, rows - first);
+        std::vector<std::vector<float>> part;
+        a::index_scores({std::span<const float>(q).subspan(std::size_t{first}*32U*128U,count*32U*128U),
+                         std::span<const float>(w).subspan(std::size_t{first}*32U,count*32U),
+                         std::span<const std::uint64_t>(pos).subspan(first,count),ratio,a::RopeKind::compressed},cache,part);
+        scores.insert(scores.end(),part.begin(),part.end());
+    }
     Dev<std::uint8_t> dcache(cache);
     Dev<float> dq(q), dw(w), dscores(std::size_t{rows} * max_count);
     Dev<std::uint64_t> dpos(pos);
@@ -268,14 +281,143 @@ void index_and_select(std::uint64_t last, unsigned rows, unsigned ratio, unsigne
     check(hipEventDestroy(e0)); check(hipEventDestroy(e1));
 }
 
+// STRIX_DS41_IDX_CAND_FILTER and STRIX_DS41_IDX_DIRECT against today's path on the same inputs. Filter: the candidate
+// user's scores over a poisoned buffer (NaN bytes) with the source's pool, then select == the unfiltered selection, and
+// every candidate position's score == the unfiltered one. Direct (count <= topk): idx, counts and pool bytes == select.
+void index_filter_direct(std::uint64_t last, unsigned rows, unsigned ratio, unsigned topk, unsigned cand, unsigned bs, bool bench) {
+    std::vector<std::uint64_t> pos(rows);
+    for (unsigned r = 0; r < rows; ++r) pos[r] = last - (rows - 1) + r;
+    const std::uint32_t max_count = static_cast<std::uint32_t>((last + 1) / ratio), nb = (max_count + bs - 1) / bs;
+    const auto cache = random_idx_cache(max_count);
+    const auto q = random_f(rows * 32 * 128, -2, 2), w = random_f(rows * 32, -1, 1);
+    Dev<std::uint8_t> dcache(cache), dprep(std::size_t{rows} * g::kIdxPrepBytes), dcand(std::size_t{rows} * nb), dcand2(std::size_t{rows} * nb);
+    Dev<float> dq(q), dw(w), dscores(std::size_t{rows} * max_count), dscores2(std::size_t{rows} * max_count);
+    Dev<std::uint64_t> dpos(pos);
+    Dev<a::RopeRow> drope(ropes(a::RopeKind::compressed, pos));
+    Dev<std::uint32_t> dkeys(std::size_t{rows} * max_count), didx(std::size_t{rows} * topk), dcnt(rows), didx2(std::size_t{rows} * topk), dcnt2(rows);
+    const auto poison = [&] {
+        for (auto* d : {&didx, &dcnt, &didx2, &dcnt2, &dkeys}) check(hipMemset(d->p, 0xA5, d->n * 4));
+        check(hipMemset(dscores2.p, 0xFF, dscores2.n * 4));
+        check(hipMemset(dcand2.p, 0xA5, dcand2.n));
+    };
+    const g::IndexView iv{rows, ratio, max_count, dq.p, dw.p, drope.p, dpos.p, dcache.p, dscores.p, dprep.p};
+    const auto sel = [&](a::Pool pool, float* scores, std::uint8_t* c, std::uint32_t* idx, std::uint32_t* cnt) {
+        return g::SelectView{rows, ratio, max_count, topk, cand, bs, pool, dpos.p, scores, c, dkeys.p, idx, cnt};
+    };
+    poison();
+    check(hipMemset(dcand.p, 0xA5, dcand.n));
+    g::enqueue_index_scores(iv, nullptr);
+    g::enqueue_select(sel(a::Pool::candidate_source, dscores.p, dcand.p, didx.p, dcnt.p), nullptr);   // publishes the pool
+    g::enqueue_select(sel(a::Pool::candidate_user, dscores.p, dcand.p, didx.p, dcnt.p), nullptr);
+    check(hipDeviceSynchronize());
+    const auto ref_idx = didx.get(), ref_cnt = dcnt.get();
+    const auto ref_scores = dscores.get();
+    const auto pool_bytes = dcand.get();
+    g::IndexView fv = iv;
+    fv.scores = dscores2.p;
+    fv.candidates = dcand.p;
+    fv.block_size = bs;
+    g::enqueue_index_scores(fv, nullptr);
+    g::enqueue_select(sel(a::Pool::candidate_user, dscores2.p, dcand.p, didx2.p, dcnt2.p), nullptr);
+    check(hipDeviceSynchronize());
+    const auto fs = dscores2.get();
+    bool scores_ok = true;
+    std::size_t scored = 0;
+    for (unsigned r = 0; r < rows; ++r) {
+        const std::uint32_t n = static_cast<std::uint32_t>((pos[r] + 1) / ratio);
+        for (std::uint32_t t = 0; t < n; ++t)
+            if (pool_bytes[std::size_t{r} * nb + t / bs] != 0U) {
+                ++scored;
+                scores_ok = scores_ok && std::memcmp(&fs[std::size_t{r} * max_count + t], &ref_scores[std::size_t{r} * max_count + t], 4) == 0;
+            }
+    }
+    expect(scores_ok, "filtered candidate scores == unfiltered, count " + std::to_string(max_count));
+    expect(didx2.get() == ref_idx && dcnt2.get() == ref_cnt, "filtered user selection == unfiltered, count " + std::to_string(max_count));
+    for (auto* d : {&didx2, &dcnt2, &dkeys}) check(hipMemset(d->p, 0xA5, d->n * 4));
+    auto compact = sel(a::Pool::candidate_user, dscores2.p, dcand.p, didx2.p, dcnt2.p);
+    compact.compact = true;
+    g::enqueue_select(compact, nullptr);
+    check(hipDeviceSynchronize());
+    expect(didx2.get() == ref_idx && dcnt2.get() == ref_cnt, "compact user selection == unfiltered, count " + std::to_string(max_count));
+    for (auto* d : {&didx2, &dcnt2, &dkeys}) check(hipMemset(d->p, 0xA5, d->n * 4));
+    const std::vector<g::SelectView> compact_one{compact};
+    g::enqueue_select_segments(compact_one, nullptr);
+    check(hipDeviceSynchronize());
+    expect(didx2.get() == ref_idx && dcnt2.get() == ref_cnt, "compact user selection (segments) == unfiltered, count " + std::to_string(max_count));
+    if (max_count > 4096U) {   // a candidate score of -inf: the compact path must fall back to today's selection
+        std::vector<float> poked = dscores2.get();
+        for (std::uint32_t t = 0; t < max_count; ++t)
+            if (pool_bytes[t / bs] != 0U) { poked[t] = -std::numeric_limits<float>::infinity(); break; }
+        dscores2.put(poked);
+        auto plain_user = compact;
+        plain_user.compact = false;
+        g::enqueue_select(plain_user, nullptr);
+        check(hipDeviceSynchronize());
+        const auto want_idx = didx2.get(), want_cnt = dcnt2.get();
+        for (auto* d : {&didx2, &dcnt2, &dkeys}) check(hipMemset(d->p, 0xA5, d->n * 4));
+        g::enqueue_select(compact, nullptr);
+        check(hipDeviceSynchronize());
+        expect(didx2.get() == want_idx && dcnt2.get() == want_cnt, "compact user selection with a -inf candidate == today, count " + std::to_string(max_count));
+    }
+    if (max_count <= topk) {
+        for (const auto pool : {a::Pool::candidate_source, a::Pool::candidate_user, a::Pool::plain}) {
+            poison();
+            check(hipMemset(dcand.p, 0xA5, dcand.n));
+            g::enqueue_index_scores(iv, nullptr);
+            g::enqueue_select(sel(pool, dscores.p, dcand.p, didx.p, dcnt.p), nullptr);
+            g::enqueue_select_direct(sel(pool, dscores2.p, dcand2.p, didx2.p, dcnt2.p), nullptr);
+            check(hipDeviceSynchronize());
+            expect(didx2.get() == didx.get() && dcnt2.get() == dcnt.get() && dcand2.get() == dcand.get(),
+                   "direct selection == select, pool " + std::to_string(static_cast<int>(pool)) + " count " + std::to_string(max_count));
+            check(hipMemset(didx2.p, 0xA5, didx2.n * 4)); check(hipMemset(dcnt2.p, 0xA5, dcnt2.n * 4)); check(hipMemset(dcand2.p, 0xA5, dcand2.n));
+            const std::vector<g::SelectView> one{sel(pool, dscores2.p, dcand2.p, didx2.p, dcnt2.p)};
+            g::enqueue_select_direct_segments(one, nullptr);
+            check(hipDeviceSynchronize());
+            expect(didx2.get() == didx.get() && dcnt2.get() == dcnt.get() && dcand2.get() == dcand.get(),
+                   "direct selection (segments) == select, pool " + std::to_string(static_cast<int>(pool)));
+        }
+    }
+    std::printf("index filter / direct: rows %u, count up to %u, topk %u, candidates %u x %u: %zu of %zu row positions scored, == today\n",
+                rows, max_count, topk, cand, bs, scored, std::size_t{rows} * max_count);
+    if (!bench) return;
+    hipEvent_t e0, e1;
+    check(hipEventCreate(&e0)); check(hipEventCreate(&e1));
+    static Dev<std::uint8_t> sweep(std::size_t{512} << 20);
+    const auto time = [&](auto f) {   // cold: index keys and scores evicted by a 512 MB write before each run
+        std::vector<float> ms;
+        for (int i = 0; i < 15; ++i) {
+            check(hipMemsetAsync(sweep.p, i, sweep.n, nullptr));
+            check(hipEventRecord(e0)); f(); check(hipEventRecord(e1)); check(hipEventSynchronize(e1));
+            float t; check(hipEventElapsedTime(&t, e0, e1)); ms.push_back(t);
+        }
+        std::sort(ms.begin(), ms.end()); return ms[7];
+    };
+    const auto user = sel(a::Pool::candidate_user, dscores.p, dcand.p, didx.p, dcnt.p);
+    const float t_off = time([&] { g::enqueue_index_scores(iv, nullptr); }), t_on = time([&] { g::enqueue_index_scores(fv, nullptr); });
+    const float t_sel = time([&] { g::enqueue_select(user, nullptr); });
+    auto user_compact = user;
+    user_compact.compact = true;
+    const float t_csel = time([&] { g::enqueue_select(user_compact, nullptr); });
+    std::printf("  bench count %u rows %u (cold): user scores %.1f -> %.1f us filtered, user select %.1f -> %.1f us compact\n", max_count, rows,
+                t_off * 1e3, t_on * 1e3, t_sel * 1e3, t_csel * 1e3);
+    if (max_count <= topk) {
+        const auto src = sel(a::Pool::candidate_source, dscores.p, dcand.p, didx.p, dcnt.p);
+        const float t_today = time([&] { g::enqueue_index_scores(iv, nullptr); g::enqueue_select(src, nullptr); });
+        const float t_direct = time([&] { g::enqueue_select_direct(src, nullptr); });
+        std::printf("  bench count %u rows %u (cold): source scores + select %.1f us, direct %.1f us (projections excluded)\n", max_count, rows, t_today * 1e3, t_direct * 1e3);
+    }
+    check(hipEventDestroy(e0)); check(hipEventDestroy(e1));
+}
+
 // Attention with random caches: window-only and compressed visible sets, 1..8 rows.
+unsigned ring_scale_lo = 118;   // window E8M0 scale bytes (1..4: f32-subnormal key values, the f16 tile's fallback)
 void attention(std::uint64_t last, unsigned rows, unsigned nc, bool bench) {
     // compressed keys: 4096, or every position of a long context (selected indices up to the last position, ratio 1)
     const unsigned cap = a::kWindow + a::kMaxRows, ncache = last >= 65536U ? static_cast<unsigned>(last + 1U) : 4096U;
     std::vector<std::uint8_t> ring(cap * a::kWindowEntryBytes), kv(ncache * a::kKvEntryBytes);
     for (std::size_t s = 0; s < cap; ++s) {
         for (unsigned d = 0; d < 512; ++d) { std::uint8_t c; do c = static_cast<std::uint8_t>(rng()); while ((c & 0x7FU) == 0x7FU); ring[s * 528 + d] = c; }
-        for (unsigned b = 0; b < 16; ++b) ring[s * 528 + 512 + b] = static_cast<std::uint8_t>(118 + rng() % 4);
+        for (unsigned b = 0; b < 16; ++b) ring[s * 528 + 512 + b] = static_cast<std::uint8_t>(ring_scale_lo + rng() % 4);
     }
     for (std::size_t t = 0; t < ncache; ++t) {
         for (unsigned i = 0; i < 256; ++i) kv[t * 288 + i] = static_cast<std::uint8_t>(rng());
@@ -479,7 +621,9 @@ void segments() {
         return out;
     };
     unsigned cases = 0;
+    for (const int seg_hpw : {0, 1})     // STRIX_DS41_ATTN_SEG_HPW: one heads-per-wave form for all segments
     for (const int form : {0, 1, 2}) {   // compress default, ahead, fast
+        g::set_attention_segment_hpw(seg_hpw);
         g::set_compress_ahead(form == 1 ? 1 : 0);
         g::set_compress_fast(form == 2 ? 1 : 0);
         for (const auto pool : {a::Pool::candidate_source, a::Pool::candidate_user, a::Pool::plain})
@@ -528,20 +672,309 @@ void segments() {
                     return snapshot();
                 };
                 const auto loop = run(false), seg = run(true);
-                expect(loop == seg, "segments == per-segment calls, compress form " + std::to_string(form) + " pool " +
+                expect(loop == seg, "segments == per-segment calls, seg hpw " + std::to_string(seg_hpw) + " compress form " + std::to_string(form) + " pool " +
                                         std::to_string(static_cast<int>(pool)) + " attention arm " + std::to_string(att));
                 ++cases;
             }
     }
     g::set_compress_ahead(-1);
     g::set_compress_fast(-1);
+    g::set_attention_segment_hpw(-1);
     std::printf("segment launches == per-segment calls (window, compress, index, select, attention), %zu segments, %u cases\n", segs.size(), cases);
+}
+
+// STRIX_DS41_ATTN_SEG_HPW on the N8 TP decode shape: `segs` requests of `rows` rows, `heads` heads each, a full visible
+// set (window 128 + top-k 512 at position 5000), one segment launch; outputs == per-call, then warm median times.
+void segment_hpw_bench(unsigned segs, unsigned rows, unsigned heads) {
+    const unsigned cap = a::kWindow + a::kMaxRows;
+    struct One {
+        std::unique_ptr<Dev<std::uint8_t>> ring, kv;
+        std::unique_ptr<Dev<std::uint32_t>> idx, cnt, tick;
+        std::unique_ptr<Dev<float>> q, part, out;
+        std::unique_ptr<Dev<std::uint64_t>> pos;
+        std::unique_ptr<Dev<a::RopeRow>> rope;
+    };
+    std::vector<One> x(segs);
+    const auto sink = random_f(heads, -2, 2);
+    Dev<float> dsink(sink);
+    std::vector<g::AttentionView> views;
+    for (unsigned k = 0; k < segs; ++k) {
+        std::vector<std::uint64_t> pos;
+        for (unsigned r = 0; r < rows; ++r) pos.push_back(5000U + 37U * k + r);
+        std::vector<std::uint8_t> ring(std::size_t{cap} * a::kWindowEntryBytes), kv(4096U * a::kKvEntryBytes);
+        for (std::size_t e = 0; e < cap; ++e) {
+            for (unsigned d = 0; d < 512; ++d) { std::uint8_t c; do c = static_cast<std::uint8_t>(rng()); while ((c & 0x7FU) == 0x7FU); ring[e * 528 + d] = c; }
+            for (unsigned c = 0; c < 16; ++c) ring[e * 528 + 512 + c] = static_cast<std::uint8_t>(118 + rng() % 4);
+        }
+        for (std::size_t t = 0; t < 4096U; ++t) {
+            for (unsigned i = 0; i < 256; ++i) kv[t * 288 + i] = static_cast<std::uint8_t>(rng());
+            for (unsigned c = 0; c < 32; ++c) kv[t * 288 + 256 + c] = static_cast<std::uint8_t>(0x30 + rng() % 16);
+        }
+        std::vector<std::uint32_t> idx(std::size_t{rows} * a::kTopK), cnt(rows, a::kTopK);
+        for (unsigned r = 0; r < rows; ++r)
+            for (unsigned i = 0; i < a::kTopK; ++i) idx[std::size_t{r} * a::kTopK + i] = 8U * i + (rng() % 8U);
+        auto& o = x[k];
+        o.ring = std::make_unique<Dev<std::uint8_t>>(ring);
+        o.kv = std::make_unique<Dev<std::uint8_t>>(kv);
+        o.idx = std::make_unique<Dev<std::uint32_t>>(idx);
+        o.cnt = std::make_unique<Dev<std::uint32_t>>(cnt);
+        o.tick = std::make_unique<Dev<std::uint32_t>>(std::size_t{rows} * g::kAttnGroupCount);
+        o.q = std::make_unique<Dev<float>>(random_f(std::size_t{rows} * heads * 512, -0.5F, 0.5F));
+        o.part = std::make_unique<Dev<float>>(std::size_t{rows} * heads * a::kMaxChunks * 514);
+        o.out = std::make_unique<Dev<float>>(std::size_t{rows} * heads * 512);
+        o.pos = std::make_unique<Dev<std::uint64_t>>(pos);
+        o.rope = std::make_unique<Dev<a::RopeRow>>(ropes(a::RopeKind::compressed, pos));
+        g::AttentionView v{rows, cap, a::kTopK, o.q->p, dsink.p, o.rope->p, o.pos->p, o.ring->p, o.kv->p, o.idx->p, o.cnt->p, o.part->p, o.out->p};
+        v.tickets = o.tick->p;
+        v.heads = heads;
+        views.push_back(v);
+    }
+    const auto outputs = [&] { std::vector<float> all; for (auto& o : x) { const auto v = o.out->get(); all.insert(all.end(), v.begin(), v.end()); } return all; };
+    for (const auto& v : views) g::enqueue_attention(v, nullptr);
+    check(hipDeviceSynchronize());
+    const auto ref = outputs();
+    hipEvent_t e0, e1;
+    check(hipEventCreate(&e0)); check(hipEventCreate(&e1));
+    float t[2];
+    for (const int mode : {0, 1}) {
+        g::set_attention_segment_hpw(mode);
+        for (auto& o : x) check(hipMemset(o.out->p, 0xA5, o.out->n * 4));
+        g::enqueue_attention_segments(views, nullptr);
+        check(hipDeviceSynchronize());
+        expect(outputs() == ref, "segment hpw " + std::to_string(mode) + " == per-call attention, " + std::to_string(segs) + " x " + std::to_string(rows) + " rows");
+        std::vector<float> ms;
+        for (int i = 0; i < 200; ++i) {
+            check(hipEventRecord(e0)); g::enqueue_attention_segments(views, nullptr); check(hipEventRecord(e1)); check(hipEventSynchronize(e1));
+            float m; check(hipEventElapsedTime(&m, e0, e1)); ms.push_back(m);
+        }
+        std::sort(ms.begin(), ms.end());
+        t[mode] = ms[100];
+    }
+    g::set_attention_segment_hpw(-1);
+    std::printf("  bench attention segments %u x %u rows, %u heads, 640 keys: per-segment hpw %.1f us, shared hpw %.1f us\n", segs, rows, heads,
+                t[0] * 1e3, t[1] * 1e3);
+    check(hipEventDestroy(e0)); check(hipEventDestroy(e1));
+}
+
+// STRIX_DS41_ATTN_WINDOW_FOLD: window write + attention (today) vs attention alone with the fold, the call's ring slots
+// poisoned first: ring bytes and every output equal; `heads` per call, `segs` requests in one segment launch.
+bool fold_live = false;   // window_fold's fold arm also passes max_visible (STRIX_DS41_ATTN_LIVE_CHUNKS)
+// kv mode 1: adversarial rows (zero row, tiny, huge, one dominant element, values at E4M3 rounding ties); segments get
+// rows - k % rows rows each (heterogeneous); kind: the layer's RoPE table (window or compressed).
+void window_fold(std::uint64_t last, unsigned rows, unsigned nc, unsigned heads, unsigned segs, a::RopeKind kind = a::RopeKind::compressed,
+                 int kv_mode = 0) {
+    const unsigned cap = a::kWindow + a::kMaxRows;
+    const auto norm = random_f(512, 0.5F, 1.5F);
+    Dev<float> dnorm(norm);
+    struct One {
+        std::vector<std::uint64_t> pos;
+        std::unique_ptr<Dev<std::uint8_t>> ring, kvc;
+        std::unique_ptr<Dev<std::uint32_t>> idx, cnt, tick;
+        std::unique_ptr<Dev<float>> q, part, out, kv;
+        std::unique_ptr<Dev<std::uint64_t>> dpos;
+        std::unique_ptr<Dev<a::RopeRow>> rope;
+        std::vector<std::uint8_t> ring0;
+    };
+    std::vector<One> x(segs);
+    const auto sink = random_f(heads, -2, 2);
+    Dev<float> dsink(sink);
+    for (unsigned k = 0; k < segs; ++k) {
+        auto& o = x[k];
+        const unsigned rk = segs > 1U ? rows - k % rows : rows;
+        for (unsigned r = 0; r < rk; ++r) o.pos.push_back(last + 3U * k - (rk - 1) + r);
+        o.ring0.resize(std::size_t{cap} * a::kWindowEntryBytes);
+        for (std::size_t e = 0; e < cap; ++e) {
+            for (unsigned d = 0; d < 512; ++d) { std::uint8_t c; do c = static_cast<std::uint8_t>(rng()); while ((c & 0x7FU) == 0x7FU); o.ring0[e * 528 + d] = c; }
+            for (unsigned c = 0; c < 16; ++c) o.ring0[e * 528 + 512 + c] = static_cast<std::uint8_t>(118 + rng() % 4);
+        }
+        std::vector<std::uint8_t> kv(4096U * a::kKvEntryBytes);
+        for (std::size_t t = 0; t < 4096U; ++t) {
+            for (unsigned i = 0; i < 256; ++i) kv[t * 288 + i] = static_cast<std::uint8_t>(rng());
+            for (unsigned c = 0; c < 32; ++c) kv[t * 288 + 256 + c] = static_cast<std::uint8_t>(0x30 + rng() % 16);
+        }
+        std::vector<std::uint32_t> idx(std::size_t{rk} * a::kTopK), cnt(rk, nc);
+        for (unsigned r = 0; r < rk; ++r)
+            for (unsigned i = 0; i < nc; ++i) idx[std::size_t{r} * a::kTopK + i] = 7U * i + (rng() % 7U);
+        o.ring = std::make_unique<Dev<std::uint8_t>>(o.ring0);
+        o.kvc = std::make_unique<Dev<std::uint8_t>>(kv);
+        o.idx = std::make_unique<Dev<std::uint32_t>>(idx);
+        o.cnt = std::make_unique<Dev<std::uint32_t>>(cnt);
+        o.tick = std::make_unique<Dev<std::uint32_t>>(std::size_t{rk} * g::kAttnGroupCount);
+        o.q = std::make_unique<Dev<float>>(random_f(std::size_t{rk} * heads * 512, -0.5F, 0.5F));
+        auto kvrows = random_f(std::size_t{rk} * 512, -3, 3);
+        if (kv_mode == 1)
+            for (unsigned r = 0; r < rk; ++r) {
+                float* row = &kvrows[std::size_t{r} * 512];
+                switch ((r + k) % 5U) {
+                case 0: for (unsigned d = 0; d < 512; ++d) row[d] = 0.0F; break;                       // zero row
+                case 1: for (unsigned d = 0; d < 512; ++d) row[d] *= 1e-30F; break;                     // tiny
+                case 2: for (unsigned d = 0; d < 512; ++d) row[d] *= 1e18F; break;                      // huge (sum of squares overflows)
+                case 3: row[(7U * r + 3U) % 512U] = 1e6F; break;                                        // one dominant element
+                default: for (unsigned d = 0; d < 512; ++d) row[d] = static_cast<float>(d % 17U) * 0.0625F - 0.5F; break;  // ties
+                }
+            }
+        o.kv = std::make_unique<Dev<float>>(kvrows);
+        o.part = std::make_unique<Dev<float>>(std::size_t{rk} * heads * a::kMaxChunks * 514);
+        o.out = std::make_unique<Dev<float>>(std::size_t{rk} * heads * 512);
+        o.dpos = std::make_unique<Dev<std::uint64_t>>(o.pos);
+        o.rope = std::make_unique<Dev<a::RopeRow>>(ropes(kind, o.pos));
+    }
+    const auto run = [&](bool fold) {
+        std::vector<g::WindowView> wv;
+        std::vector<g::AttentionView> av;
+        for (auto& o : x) {
+            o.ring->put(o.ring0);
+            if (fold) {   // poison the call's slots: the fold must write them
+                std::vector<std::uint8_t> r = o.ring0;
+                for (const auto p : o.pos) std::memset(&r[(p % cap) * a::kWindowEntryBytes], 0x5A, a::kWindowEntryBytes);
+                o.ring->put(r);
+            }
+            check(hipMemset(o.out->p, 0xA5, o.out->n * 4));
+            const unsigned rk = static_cast<unsigned>(o.pos.size());
+            wv.push_back({o.kv->p, dnorm.p, o.rope->p, o.dpos->p, rk, cap, o.ring->p});
+            g::AttentionView v{rk, cap, a::kTopK, o.q->p, dsink.p, o.rope->p, o.dpos->p, o.ring->p, o.kvc->p, o.idx->p,
+                               nc != 0U ? o.cnt->p : nullptr, o.part->p, o.out->p, o.tick->p};
+            v.heads = heads;
+            if (fold) { v.kv = o.kv->p; v.kv_norm = dnorm.p; v.ring_out = o.ring->p; }
+            if (fold && fold_live) v.max_visible = static_cast<std::uint32_t>(std::min<std::uint64_t>(o.pos.back() + 1, a::kWindow) + nc);
+            av.push_back(v);
+        }
+        if (segs > 1U) {
+            if (!fold) g::enqueue_window_write_segments(wv, nullptr);
+            g::enqueue_attention_segments(av, nullptr);
+        } else {
+            if (!fold) g::enqueue_window_write(wv[0], nullptr);
+            g::enqueue_attention(av[0], nullptr);
+        }
+        check(hipDeviceSynchronize());
+        std::vector<std::vector<std::uint8_t>> res;
+        for (auto& o : x) { res.push_back(o.ring->get()); res.push_back(bytes_of(o.out->get())); }
+        return res;
+    };
+    const auto today = run(false), folded = run(true);
+    const std::string tag = "last " + std::to_string(last) + " rows " + std::to_string(rows) + " compressed " + std::to_string(nc) + " heads " +
+                            std::to_string(heads) + " segments " + std::to_string(segs) + (kind == a::RopeKind::window ? " window RoPE" : "") +
+                            (kv_mode == 1 ? " adversarial kv" : "") + (fold_live ? " live chunks" : "");
+    expect(today == folded, "window fold == window write + attention, " + tag);
+    std::printf("window fold: %s: ring bytes and outputs == window write + attention\n", tag.c_str());
+}
+
+// STRIX_DS41_ATTN_TILE_F16 against today's f32 tile, device against device (same arithmetic after the tile, so outputs,
+// NaN payloads included, must match byte for byte). mode 0: ring entries cover every E4M3 code x every E8M0 scale byte
+// and compressed entries every E2M1 code x every E4M3 scale byte (zeros, NaN, infinities, subnormal products); mode 1:
+// normal scales except one exceptional value in every other 16-key tile (alternating fast / low-plane tiles).
+void tile_f16_sweep(int mode, unsigned rows, unsigned heads) {
+    const unsigned cap = a::kWindow + a::kMaxRows;
+    std::vector<std::uint8_t> ring(std::size_t{cap} * a::kWindowEntryBytes), kv(4096U * a::kKvEntryBytes);
+    unsigned code = 0, scale = 0;
+    for (std::size_t e = 0; e < cap; ++e) {
+        for (unsigned d = 0; d < 512; ++d) ring[e * 528 + d] = static_cast<std::uint8_t>(mode == 0 ? (code++ & 255U) : (rng() & 0x7EU));
+        for (unsigned c = 0; c < 16; ++c) ring[e * 528 + 512 + c] = static_cast<std::uint8_t>(mode == 0 ? (scale++ & 255U) : 118U + rng() % 4U);
+        if (mode == 1 && (e / 16U) % 2U == 1U && e % 16U == 5U) ring[e * 528 + 512 + 3] = 2U;   // one subnormal group in the tile
+    }
+    for (std::size_t t = 0; t < 4096U; ++t) {
+        for (unsigned i = 0; i < 256; ++i) kv[t * 288 + i] = static_cast<std::uint8_t>(mode == 0 ? (code++ & 255U) : rng());
+        for (unsigned c = 0; c < 32; ++c) kv[t * 288 + 256 + c] = static_cast<std::uint8_t>(mode == 0 ? (scale++ & 255U) : 0x30U + rng() % 16U);
+    }
+    std::vector<std::uint64_t> pos(rows);
+    for (unsigned r = 0; r < rows; ++r) pos[r] = 5000U - (rows - 1) + r;
+    std::vector<std::uint32_t> idx(std::size_t{rows} * a::kTopK), cnt(rows, a::kTopK);
+    for (unsigned r = 0; r < rows; ++r)
+        for (unsigned i = 0; i < a::kTopK; ++i) idx[std::size_t{r} * a::kTopK + i] = 8U * i + r;
+    Dev<std::uint8_t> dring(ring), dkv(kv);
+    Dev<std::uint32_t> didx(idx), dcnt(cnt), dtick(std::size_t{rows} * g::kAttnGroupCount);
+    Dev<float> dq(random_f(std::size_t{rows} * heads * 512, -0.5F, 0.5F)), dsink(random_f(heads, -2, 2));
+    Dev<float> dpart(std::size_t{rows} * heads * a::kMaxChunks * 514), dout(std::size_t{rows} * heads * 512);
+    Dev<std::uint64_t> dpos(pos);
+    Dev<a::RopeRow> drope(ropes(a::RopeKind::compressed, pos));
+    g::AttentionView v{rows, cap, a::kTopK, dq.p, dsink.p, drope.p, dpos.p, dring.p, dkv.p, didx.p, dcnt.p, dpart.p, dout.p, dtick.p};
+    v.heads = heads;
+    std::vector<std::vector<float>> outs;
+    for (const int bf : {0, 1}) {
+        g::set_attention_tile_f16(bf);
+        check(hipMemset(dout.p, 0xA5, dout.n * 4));
+        g::enqueue_attention(v, nullptr);
+        check(hipDeviceSynchronize());
+        outs.push_back(dout.get());
+    }
+    g::set_attention_tile_f16(-1);
+    expect(bytes_of(outs[0]) == bytes_of(outs[1]), "f16 tile == f32 tile, sweep mode " + std::to_string(mode) + " rows " + std::to_string(rows) +
+                                                     " heads " + std::to_string(heads));
+    std::printf("f16 tile sweep mode %d (%s), rows %u, heads %u: outputs byte-identical to the f32 tile\n", mode,
+                mode == 0 ? "every code x every scale byte" : "alternating fast / low-plane tiles", rows, heads);
+}
+
+// Large slabs vs legacy 64-row calls over identical input/state, including a
+// non-multiple tail. No change to the key/chunk/softmax sequence of any row.
+void slab_attention(unsigned rows, unsigned heads, bool fused) {
+    const unsigned cap=a::kWindow+rows, nc=37U, ncache=4096U;
+    std::vector<std::uint8_t> ring(cap*a::kWindowEntryBytes), kv(ncache*a::kKvEntryBytes);
+    for (unsigned slot=0;slot<cap;++slot) {
+        for(unsigned i=0;i<512;++i) ring[slot*528+i]=static_cast<std::uint8_t>(rng()%120U);
+        for(unsigned i=0;i<16;++i) ring[slot*528+512+i]=120U;
+    }
+    for(unsigned t=0;t<ncache;++t) {
+        for(unsigned i=0;i<256;++i) kv[t*288+i]=static_cast<std::uint8_t>(rng());
+        for(unsigned i=0;i<32;++i) kv[t*288+256+i]=0x30U;
+    }
+    std::vector<std::uint64_t> pos(rows);for(unsigned r=0;r<rows;++r)pos[r]=4096U+r;
+    std::vector<std::uint32_t> idx(std::size_t{rows}*a::kTopK), cnt(rows,nc);
+    for(unsigned r=0;r<rows;++r)for(unsigned i=0;i<nc;++i)idx[std::size_t{r}*a::kTopK+i]=i*7U;
+    Dev<std::uint8_t> dring(ring),dkv(kv);
+    Dev<float> dq(random_f(std::size_t{rows}*heads*512,-0.5F,0.5F)), dsink(random_f(heads,-2,2));
+    Dev<std::uint64_t> dpos(pos);Dev<std::uint32_t> didx(idx),dcnt(cnt);
+    Dev<a::RopeRow> drope(ropes(a::RopeKind::compressed,pos));
+    Dev<float> partial(std::size_t{rows}*heads*a::kMaxChunks*514),out(std::size_t{rows}*heads*512);
+    Dev<std::uint32_t> tickets(std::vector<std::uint32_t>(std::size_t{rows}*g::kAttnGroupCount,0));
+    Dev<std::int8_t> codes(out.n);Dev<float> deltas(out.n/32);Dev<std::int32_t> sums(out.n/32);
+    const auto run=[&](unsigned slab) {
+        for(unsigned r=0;r<rows;r+=slab) {
+            g::AttentionView v{std::min(slab,rows-r),cap,a::kTopK,dq.p+std::size_t{r}*heads*512,dsink.p,
+                drope.p+r,dpos.p+r,dring.p,dkv.p,didx.p+std::size_t{r}*a::kTopK,dcnt.p+r,
+                partial.p+std::size_t{r}*heads*a::kMaxChunks*514,out.p+std::size_t{r}*heads*512};
+            v.heads=heads;v.tickets=fused?tickets.p+std::size_t{r}*g::kAttnGroupCount:nullptr;
+            v.codes=codes.p+std::size_t{r}*heads*512;v.deltas=deltas.p+std::size_t{r}*heads*16;
+            v.sums=sums.p+std::size_t{r}*heads*16;
+            g::enqueue_attention(v,nullptr);
+        }
+        check(hipDeviceSynchronize());
+        std::vector<std::uint8_t> bytes;
+        const auto append=[&](const auto& dev) { const auto h=dev.get();const auto* p=reinterpret_cast<const std::uint8_t*>(h.data());bytes.insert(bytes.end(),p,p+h.size()*sizeof(h[0])); };
+        append(out);append(codes);append(deltas);append(sums);append(tickets);
+        return bytes;
+    };
+    const auto ref=run(64),got=run(rows);
+    expect(ref==got,"slab == 64-row calls rows="+std::to_string(rows)+" heads="+std::to_string(heads)+" fused="+std::to_string(fused));
+    std::printf("slab rows=%u heads=%u fused=%u bytes=%zu equal=%u\n",rows,heads,fused,ref.size(),ref==got);
 }
 
 }  // namespace
 
 int main() {
     try {
+        if (std::getenv("STRIX_DS41_SLAB_TESTS_ONLY")) {
+            for (unsigned rows : {65U, 128U, 256U})
+                for (unsigned heads : {32U, 64U})
+                    for (bool fused : {false, true}) slab_attention(rows,heads,fused);
+            for (unsigned rows : {65U, 128U, 256U}) { caches(1,519,0,rows); caches(2,519,0,rows); }
+            index_and_select(90,65,1,64,8,8,false);
+            std::puts(failures==0?"large attention slab checks PASS":"FAILED");
+            return failures?1:0;
+        }
+        if (std::getenv("STRIX_DS41_DSATTN_BENCH")) {   // attention benchmarks only
+            for (const std::uint64_t n : {511ULL, 1023ULL, 8191ULL, 32767ULL, 131071ULL}) for (const unsigned rows : {1U, 6U, 8U})
+                index_filter_direct(n, rows, 1, a::kTopK, a::kCandBlocks, a::kCandBlockSize, true);
+            for (const unsigned segs : {1U, 2U, 4U, 8U}) for (const unsigned heads : {32U, 64U}) segment_hpw_bench(segs, 1U, heads);
+            segment_hpw_bench(8U, 2U, 32U);
+            for (const unsigned mb : {40U, 20U, 10U}) {   // one call (R1 / R6 / R8, TP and full heads) per grid threshold
+                g::set_attention_min_blocks(mb);
+                std::printf("  min blocks %u:\n", mb);
+                for (const unsigned rows : {1U, 6U, 8U}) for (const unsigned heads : {32U, 64U}) segment_hpw_bench(1U, rows, heads);
+            }
+            g::set_attention_min_blocks(0U);
+            std::puts(failures == 0 ? "attention benchmarks pass" : "FAILED");
+            return failures ? 1 : 0;
+        }
         const bool bench = std::getenv("STRIX_DS41_ATTN_BENCH") != nullptr;
         caches(2, 333);
         caches(1, 300);
@@ -558,12 +991,75 @@ int main() {
         index_and_select(4000, 2, 1, 64, 8, 8, false);                                          // small pool parameters
         index_and_select(9000, 2, 1, 64, 8, 8, false);                                          // two-level selection, small k
         index_and_select(4600, 3, 1, a::kTopK, a::kCandBlocks, a::kCandBlockSize, false);     // two slices, the last short
+        index_filter_direct(99, 1, 1, a::kTopK, a::kCandBlocks, a::kCandBlockSize, false);    // direct, one row
+        index_filter_direct(1023, 8, 2, a::kTopK, a::kCandBlocks, a::kCandBlockSize, false);  // direct, ratio 2, count 512
+        index_filter_direct(511, 8, 1, a::kTopK, a::kCandBlocks, a::kCandBlockSize, false);   // direct at count = topk
+        index_filter_direct(70, 64, 1, a::kTopK, a::kCandBlocks, a::kCandBlockSize, false);   // direct, 64 rows
+        index_filter_direct(20007, 8, 1, a::kTopK, a::kCandBlocks, a::kCandBlockSize, false); // filter: 2501 blocks > 2048
+        index_filter_direct(40001, 64, 1, a::kTopK, a::kCandBlocks, a::kCandBlockSize, false); // filter, 64 rows, two-level select
+        index_filter_direct(4000, 2, 1, 64, 8, 8, false);                                        // filter, small pool
+        index_filter_direct(9000, 3, 1, 64, 8, 8, false);                                        // filter, small pool, two-level
+        index_filter_direct(50, 5, 1, 64, 8, 8, false);                                          // direct, small pool
         attention(5, 1, 0, false);       // window only, partial window
         attention(1000, 3, 0, false);
         attention(1000, 1, 300, false);
         attention(20, 2, 37, false);     // partial window and compressed keys in one tile
         attention(5000, 8, a::kTopK, false);
         segments();
+        g::set_attention_lds_swizzle(1);
+        attention(5, 1, 0, false);
+        attention(20, 2, 37, false);
+        attention(8191, 8, a::kTopK, false);
+        attention(32767, 8, a::kTopK, false);
+        attention(8191, 1, a::kTopK, false);
+        attention(32767, 1, a::kTopK, false);
+        segments();
+        g::set_attention_lds_swizzle(-1);
+        for (const int bf : {0, 1}) {     // STRIX_DS41_ATTN_WINDOW_FOLD, f32 and f16 tiles
+            g::set_attention_tile_f16(bf);
+            window_fold(0, 1, 0, 64, 1);       // the first position: window of one key
+            window_fold(7, 8, 0, 32, 1);       // rows 0..7, window-only layer
+            window_fold(100, 1, 101, 32, 1);
+            window_fold(140, 6, 141, 32, 1);   // ring wrap (capacity 136)
+            window_fold(5000, 8, a::kTopK, 32, 1);
+            window_fold(5000, 6, a::kTopK, 64, 1);
+            window_fold(5001, 1, a::kTopK, 32, 8);   // N8 segment launch
+            window_fold(301, 2, 302, 32, 3);
+            window_fold(130, 1, 0, 64, 1, a::RopeKind::window);        // window-only layer, window RoPE table
+            window_fold(6000, 7, 0, 32, 1, a::RopeKind::window);
+            window_fold(63, 3, 64, 32, 1, a::RopeKind::compressed, 1); // adversarial rows across a chunk boundary
+            window_fold(2000, 8, a::kTopK, 32, 1, a::RopeKind::compressed, 1);
+            window_fold(4000, 5, 400, 32, 8, a::RopeKind::compressed, 1);   // heterogeneous segments (5, 4, 3, 2, 1 rows)
+        }
+        fold_live = true;                 // + STRIX_DS41_ATTN_LIVE_CHUNKS (grid and heads per wave from the bound)
+        for (const int bf : {0, 1}) {
+            g::set_attention_tile_f16(bf);
+            window_fold(0, 1, 0, 64, 1);
+            window_fold(100, 1, 101, 32, 1);
+            window_fold(140, 6, 141, 32, 1);
+            window_fold(100, 8, 101, 32, 1);
+            window_fold(5000, 6, a::kTopK, 32, 1);
+            window_fold(301, 2, 302, 32, 3);
+            window_fold(4000, 5, 400, 32, 8, a::RopeKind::compressed, 1);
+        }
+        g::set_attention_tile_f16(-1);
+        fold_live = false;
+        for (const unsigned rows : {1U, 6U, 8U})
+            for (const unsigned heads : {32U, 64U}) { tile_f16_sweep(0, rows, heads); tile_f16_sweep(1, rows, heads); }
+        g::set_attention_tile_f16(1);   // STRIX_DS41_ATTN_TILE_F16: the same host references
+        attention(5, 1, 0, false);
+        attention(1000, 3, 0, false);
+        attention(1000, 1, 300, false);
+        attention(20, 2, 37, false);
+        attention(5000, 8, a::kTopK, false);
+        attention(8191, 6, a::kTopK, false);
+        attention(32767, 1, a::kTopK, false);
+        ring_scale_lo = 1;               // subnormal window values: those tiles fall back to f32
+        attention(1000, 3, 0, false);
+        attention(5000, 6, a::kTopK, false);
+        ring_scale_lo = 118;
+        segments();
+        g::set_attention_tile_f16(-1);
         // long context: 512K positions (ratio 1: 512K index keys, 128 select slices; ratio 2: 256K), attention at 1M
         index_and_select(524287, 1, 1, a::kTopK, a::kCandBlocks, a::kCandBlockSize, false);
         index_and_select(524287, 2, 2, a::kTopK, a::kCandBlocks, a::kCandBlockSize, false);

@@ -17,6 +17,7 @@ __global__ __launch_bounds__(256) void pattern_kernel(ProducerStage view, std::s
     publish_staged_block(view.flag, view.token, gridDim.x);
 }
 
+template<bool ReadsOnly>
 __global__ __launch_bounds__(256) void consume_kernel(ConsumerStage view, unsigned char* output, std::size_t bytes) {
     staged_acquire(view.flag, view.token);
     const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -30,7 +31,8 @@ __global__ __launch_bounds__(256) void consume_kernel(ConsumerStage view, unsign
     } else {
         for (std::size_t i = index; i < bytes; i += stride) output[i] = static_cast<const unsigned char*>(view.data)[i];
     }
-    publish_staged_block(view.flag, view.token, gridDim.x);
+    if constexpr (ReadsOnly) publish_staged_reads_block(view.flag, view.token, gridDim.x);
+    else publish_staged_block(view.flag, view.token, gridDim.x);
 }
 
 unsigned blocks(std::size_t bytes) {
@@ -49,7 +51,14 @@ void enqueue_staged_pattern(ProducerStage view, std::size_t bytes, std::uint32_t
 }
 void enqueue_staged_consume(ConsumerStage view, void* output, std::size_t bytes, hipStream_t stream) {
     if (!view.data || !view.flag || !view.token || !output || !bytes) throw std::invalid_argument("staged consumer view");
-    hipLaunchKernelGGL(consume_kernel, dim3(blocks(bytes)), dim3(256), 0, stream, view, static_cast<unsigned char*>(output), bytes);
+    hipLaunchKernelGGL(consume_kernel<false>, dim3(blocks(bytes)), dim3(256), 0, stream, view, static_cast<unsigned char*>(output), bytes);
+    check_launch();
+}
+void enqueue_staged_consume_reads(ConsumerStage view, void* output, std::size_t bytes, hipStream_t stream, unsigned grid_blocks) {
+    if (!view.data || !view.flag || !view.token || !output || !bytes || grid_blocks > 4096U)
+        throw std::invalid_argument("staged read-only consumer view/grid");
+    hipLaunchKernelGGL(consume_kernel<true>, dim3(grid_blocks ? grid_blocks : blocks(bytes)), dim3(256), 0, stream,
+                       view, static_cast<unsigned char*>(output), bytes);
     check_launch();
 }
 }

@@ -3,6 +3,7 @@
 #include "gpu_queue_driver_bridge/bridge.h"
 #include <cassert>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -15,18 +16,21 @@
 using namespace strix::transport;
 namespace {
 template<class Function> void rejects(Function fn) { bool threw=false;try{fn();}catch(const std::exception&){threw=true;}assert(threw); }
+// STRIX_TEST_GPU_QUEUE_LEAN=1 runs every case on the lean hot path (GpuQueueExpected::lean).
+bool lean_mode() { const char* v=std::getenv("STRIX_TEST_GPU_QUEUE_LEAN");return v&&v[0]=='1'; }
 struct Fixture {
     std::shared_ptr<void> driver;
     bool gpu_idle=true,change_identity=false,auto_complete=false;
     int mutate_event=0,submit_again=0;unsigned long mutate_cleanup=0;
-    unsigned ioctls=0; bool corrupt_reset=false;
+    unsigned ioctls=0,owned_ioctls=0,events=0,identity_checks=0; bool corrupt_reset=false;
     std::unique_ptr<LinuxGpuQueue> queue;
-    Fixture(unsigned depth=8,unsigned frames=32,bool reverse=false) {
+    Fixture(unsigned depth=8,unsigned frames=32,bool reverse=false,bool lean=lean_mode()) {
         driver={queue_fixture_create(frames),queue_fixture_destroy};
         GpuQueueExpected expected;expected.local.fill(0x11);expected.peer.fill(0x22);expected.depth=depth;expected.ring_frames=frames;
         if(reverse){queue_fixture_reverse_endpoints(driver.get());std::swap(expected.local,expected.peer);}
-        GpuQueueIo io{driver,[this](unsigned long command,void* argument){
-            ++ioctls;
+        expected.lean=lean;
+        const auto call=[this](unsigned long command,void* argument){
+            ++ioctls;events+=command==SGU_IOC_EVENT;
             if(command==SGU_IOC_SUBMIT&&submit_again){--submit_again;return GpuQueueSyscall{-1,EAGAIN};}
             if(command==SGU_IOC_EVENT&&auto_complete)queue_fixture_complete_pending(driver.get());
             int result=queue_fixture_ioctl(driver.get(),command,argument);
@@ -41,12 +45,14 @@ struct Fixture {
             if(!result&&command==SGU_IOC_RESET_GROUP&&corrupt_reset)static_cast<sgu_reset_group*>(argument)->members[0].fence.import_generation++;
             if(!result&&command==mutate_cleanup)static_cast<sgu_action*>(argument)->result=99;
             return GpuQueueSyscall{result<0?-1:result,result<0?-result:0};
-        },[this]{if(change_identity)throw std::runtime_error("injected owner replacement");},[this]{return queue_fixture_fd(driver.get());}};
+        };
+        GpuQueueIo io{driver,call,[this]{++identity_checks;if(change_identity)throw std::runtime_error("injected owner replacement");},
+            [this]{return queue_fixture_fd(driver.get());},[this,call](unsigned long command,void* argument){++owned_ioctls;return call(command,argument);}};
         queue=std::make_unique<LinuxGpuQueue>(std::move(io),expected);
     }
     GpuQueuePool pool() {
         GpuQueuePool p;queue_fixture_pool(driver.get(),&p.tx,&p.rx);p.lifetime=driver;
-        p.require_current=[this]{if(change_identity)throw std::runtime_error("injected pool replacement");};
+        p.require_current=[this]{++identity_checks;if(change_identity)throw std::runtime_error("injected pool replacement");};
         p.gpu_quiescent=[this]{return gpu_idle;};return p;
     }
     void start(std::uint64_t epoch=1){queue->import_pool(pool(),epoch,101+epoch);queue->arm();}
@@ -135,6 +141,24 @@ void stop_retention() {
 void identity() {
     Fixture f;f.start();f.change_identity=true;rejects([&]{f.queue->prepare(0,0,1,1,32);});assert(!f.queue->release());
     f.change_identity=false;assert(f.queue->release());
+}
+// Lean: no FD/pool metadata check and no EVENT between session transitions; the next transition
+// (here RELEASE) still sees a replaced owner, and operation identity is still enforced.
+void lean() {
+    Fixture f(8,32,false,true);f.start();
+    const auto checks=f.identity_checks,ioctls=f.ioctls;
+    for(unsigned n=0;n<4;++n)assert(!f.queue->poll());
+    assert(f.ioctls==ioctls&&f.events==0);
+    auto op=f.queue->prepare(1,0,1,4097,32);assert(f.queue->submit(op));
+    assert(!f.queue->poll()&&f.events==1);
+    const auto e=f.finish(op);assert(e.operation==op);
+    assert(!f.queue->poll()&&f.events==2); // the completion EVENT only: complete, not yet retired
+    f.consume(op);assert(!f.queue->poll()&&f.events==2);
+    assert(f.identity_checks==checks&&f.owned_ioctls==f.ioctls-ioctls);
+    auto foreign=op;++foreign.handle;rejects([&]{f.queue->gpu_consumed(foreign);});
+    f.change_identity=true;assert(!f.queue->poll()); // nothing in flight: no check, no EVENT
+    rejects([&]{static_cast<void>(f.queue->stats());});
+    assert(!f.queue->release()&&f.queue->failed());f.change_identity=false;assert(f.queue->release());
 }
 void wire() {
     GpuQueuePeerFrame a;a.campaign.fill(1);a.local.fill(2);a.peer.fill(3);a.device_instance.fill(4);
@@ -261,7 +285,7 @@ int main(int argc,char** argv) {
     else if(name=="failed_dependency")failed_dependency();else if(name=="recovery")recovery();else if(name=="stop_retention")stop_retention();
     else if(name.starts_with("ambiguous"))ambiguous_cleanup(name);
     else if(name.starts_with("paired"))paired(name);
-    else if(name=="identity")identity();else if(name=="wire")wire();else if(name.starts_with("session"))session(name);
+    else if(name=="identity")identity();else if(name=="lean")lean();else if(name=="wire")wire();else if(name.starts_with("session"))session(name);
     else if(name.starts_with("corruption"))corruption(std::stoi(name.substr(10)));else assert(false);
     std::cout<<"PASS "<<name<<'\n';
 }

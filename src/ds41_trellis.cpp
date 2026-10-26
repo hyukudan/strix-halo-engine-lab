@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -13,6 +14,7 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 
 namespace strix::ds41 {
 namespace {
@@ -282,8 +284,10 @@ std::uint64_t trellis_site_bytes(const TrellisTensorInfo& info, const TrellisSli
 
 namespace {
 
-// Site classes with an engine hook (q_a and kv keep today's form) and the mix classes each one reads.
-constexpr std::array<std::pair<const char*, std::array<const char*, 2>>, 5> hooked_classes{{
+// Site classes with engine hooks and the mix classes each one reads.
+constexpr std::array<std::pair<const char*, std::array<const char*, 2>>, 7> hooked_classes{{
+    {"q_a", {"q_a", nullptr}},
+    {"kv", {"kv", nullptr}},
     {"q_b", {"q_b", nullptr}},
     {"o_a", {"o_a", nullptr}},
     {"o_b", {"o_b", nullptr}},
@@ -305,11 +309,17 @@ std::string representative_pack_name(const std::string& mix_class, int layer) {
 }
 
 // The enabled site classes that have an engine hook, in the fixed order above.
-std::vector<std::string> hooked(const std::vector<std::string>& site_classes) {
+std::vector<std::string> hooked(const std::vector<std::string>& site_classes, bool dense_full = false) {
     std::vector<std::string> out;
     for (const auto& [site, mix] : hooked_classes)
-        if (std::find(site_classes.begin(), site_classes.end(), site) != site_classes.end()) out.emplace_back(site);
+        if ((dense_full || (std::string_view(site) != "q_a" && std::string_view(site) != "kv")) &&
+            std::find(site_classes.begin(), site_classes.end(), site) != site_classes.end()) out.emplace_back(site);
     return out;
+}
+
+bool dense_full_from_env() {
+    const auto* e = std::getenv("STRIX_DS41_TRELLIS_DENSE_FULL");
+    return e != nullptr && e[0] == '1';
 }
 
 std::uint64_t fnv1a(const std::string& s, std::uint64_t h = 14695981039346656037ULL) {
@@ -357,7 +367,7 @@ std::string trellis_shexp_step_identity(std::uint32_t w13_bits, std::uint32_t w2
 
 std::string trellis_config_identity(const std::map<std::string, std::uint32_t>& bits_by_mix_class,
                                     const std::vector<std::string>& site_classes, bool shexp_tp) {
-    const auto sites = hooked(site_classes);
+    const auto sites = hooked(site_classes, bits_by_mix_class.contains("q_a") || bits_by_mix_class.contains("kv"));
     if (sites.empty()) return {};
     std::map<std::string, std::uint32_t> used;  // mix class -> K over the enabled sites
     for (const auto& site : sites)
@@ -399,7 +409,7 @@ std::string trellis_config_identity(const std::map<std::string, std::uint32_t>& 
 
 std::map<std::string, std::uint32_t> trellis_class_bits(TrellisPack& pack, const std::vector<std::string>& site_classes, int layer) {
     std::map<std::string, std::uint32_t> out;
-    for (const auto& site : hooked(site_classes))
+    for (const auto& site : hooked(site_classes, dense_full_from_env()))
         for (const auto& [cls, mix] : hooked_classes)
             if (site == cls)
                 for (const char* m : mix)
@@ -417,7 +427,7 @@ std::string trellis_weights_namespace() {
     if (spec.empty()) return {};
     const char* sites_env = std::getenv("STRIX_DS41_TRELLIS_SITES");
     const auto classes = parse_trellis_site_classes(sites_env != nullptr ? sites_env : "");
-    const auto sites = hooked(classes);
+    const auto sites = hooked(classes, dense_full_from_env());
     if (sites.empty()) return {};
     const char* tp = std::getenv("STRIX_DS41_SHEXP_TP");
     TrellisPack pack(spec);
@@ -430,6 +440,18 @@ std::string trellis_weights_namespace() {
         first = false;
     }
     return out;
+}
+
+namespace {
+std::atomic<std::uint64_t> plans_created{0}, plan_nanoseconds{0};
+}
+
+TrellisPlanStats trellis_plan_stats() noexcept {
+    return {plans_created.load(std::memory_order_relaxed), static_cast<double>(plan_nanoseconds.load(std::memory_order_relaxed)) * 1e-9};
+}
+void note_trellis_plan_created(double seconds) noexcept {
+    plans_created.fetch_add(1, std::memory_order_relaxed);
+    plan_nanoseconds.fetch_add(static_cast<std::uint64_t>(seconds * 1e9), std::memory_order_relaxed);
 }
 
 }  // namespace strix::ds41

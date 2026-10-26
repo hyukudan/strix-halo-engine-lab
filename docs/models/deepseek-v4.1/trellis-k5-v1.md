@@ -191,7 +191,7 @@ process without TP attention runs both ranks' linears itself, so its bits equal 
   the row count: 16 K-splits at 1, 4, 8 rows, 32 otherwise): every o_a call has 1, 4 or 8 rows; a chunk of 2-3 rows is
   padded to 4, 5-7 rows to 8, with copies of its last row (outputs of the pad rows discarded). Rows of 1-, 4- and
   8-row calls are bitwise equal (bench, both rank slices, L10).
-  Staging is not part of the identity: `STRIX_DS41_TRELLIS_OA_GROUP=1|2` (default off, ds41_trellis_group.hpp) submits
+  Staging is not part of the identity: `STRIX_DS41_TRELLIS_OA_GROUP=1|2` (default 1 in the qualified two-node configuration, =0 for per-group calls, ds41_trellis_group.hpp) submits
   the same library calls with the same row counts and pad rows, but a 1-row chunk reads o / writes o_low in place and a
   longer chunk stages all groups (and pad rows) with one kernel into [G][m][4096] and scatters the real rows back with
   one kernel (mode 2: the groups' calls on concurrent streams). Same bits (bench: 296 rows, R 1..16,
@@ -291,3 +291,14 @@ Equivalent spec without a file: `STRIX_DS41_TRELLIS_MIX="default=<K4 dir>,head=<
   all + HEADOUT + OA_GROUP: K5 R1 38.00 / 38.34, R6 65.27 / 65.44; mix-B R1 36.94 / 36.85, R6 68.30 / 68.29 (R6 +3 ms vs
   K5, +4.7 vs no trellis: the v12 K4 forms of the attention sites are slower at R6 than K5's; e.g. o_a group K4 R6
   29.2 us vs K5 20.7 us (K5 pads R6 to its fast 8-row split-16 form)).
+
+## Current two-node adapter qualification
+
+The qualified two-node revision `481aeb0f` uses `STRIX_DS41_TRELLIS_API=dense_r1` with all dense sites enabled
+(`STRIX_DS41_TRELLIS_SITES=all`, `STRIX_DS41_TRELLIS_DENSE_FULL=1`) for the K4 dense / K5 head production mix.
+This extends the earlier v12 results above: q_a and kv now have dense-r1 hooks, including a paired launch
+(`STRIX_DS41_TRELLIS_QAKV_PAIR`, on by default, `=0` off). Grouped o_a is on by default
+(`STRIX_DS41_TRELLIS_OA_GROUP=0` restores per-group calls). Grouped GEMV plans are cached per layer weights,
+input and output buffers, strides and row count, and reuse workspace serially on the runner's stream.
+The qualified paths keep their reference bits. Select the external archive and headers explicitly with
+`STRIX_DS41_TRELLIS_LIBRARY` and `STRIX_DS41_TRELLIS_INCLUDE_DIR`; no machine-specific library path is assumed.

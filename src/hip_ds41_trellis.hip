@@ -6,6 +6,9 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <map>
@@ -79,6 +82,102 @@ bool trellis_headout_enabled() noexcept {
     }();
     return on;
 }
+bool trellis_dense_full_enabled() noexcept {
+    static const bool on = [] { const auto* e = std::getenv("STRIX_DS41_TRELLIS_DENSE_FULL"); return e && e[0] == '1'; }();
+    return on;
+}
+bool trellis_dense_row_slices_enabled() noexcept {
+#if defined(STRIX_DS41_TRELLIS_SPLITK)
+    return trellis_dense_full_enabled();
+#else
+    return false;
+#endif
+}
+bool trellis_qakv_pair_enabled() noexcept {
+    // default on (=0 off): the pair has the bits of the individual q_a / kv submissions
+    static const bool on = [] { const auto* e = std::getenv("STRIX_DS41_TRELLIS_QAKV_PAIR"); return !(e && e[0] == '0'); }();
+    return on;
+}
+bool trellis_row_views_enabled() noexcept {
+#if defined(STRIX_DS41_TRELLIS_DENSE_R1)
+    static const bool on = [] { const auto* e = std::getenv("STRIX_DS41_TRELLIS_ROW_VIEWS"); return e && e[0] == '1'; }();
+    return on;
+#else
+    return false;
+#endif
+}
+namespace {
+// STRIX_DS41_SHARED_GROUPED read once: -1 unset/empty (implicit default), 1 explicit on, 0 any other value (off).
+int shared_grouped_env() noexcept {
+    static const int v = [] {
+        const auto* e = std::getenv("STRIX_DS41_SHARED_GROUPED");
+        if (e == nullptr || e[0] == '\0') return -1;
+        return e[0] == '1' ? 1 : 0;
+    }();
+    return v;
+}
+// Implicit default: on only after a startup admission found the configuration admissible; any inadmissible admission
+// in the process switches it off for good (both routes are bit-identical, so this only selects the faster one).
+std::atomic<bool> shared_grouped_implicit{false};
+std::atomic<bool> shared_grouped_implicit_refused{false};
+} // namespace
+bool trellis_shared_grouped_enabled() noexcept {
+    // explicit =1 on; unset = on where admitted (trellis_shared_grouped_admit); any other value off. Only a dense-r1
+    // build linking a library with the declared SwiGLU pair epilogue can run it.
+#if defined(STRIX_DS41_TRELLIS_LIB) && defined(STRIX_DS41_TRELLIS_DENSE_R1) && defined(STRIX_TP_SWIGLU_CLAMPED_DECLARED)
+    static const bool explicit_on = [] {
+        const bool v = shared_grouped_env() == 1;
+        if (v) std::fprintf(stderr, "ds41 trellis: shared gate/up as SwiGLU pair launches (STRIX_DS41_SHARED_GROUPED=1)\n");
+        return v;
+    }();
+    return explicit_on || shared_grouped_implicit.load(std::memory_order_relaxed);
+#else
+    return false;
+#endif
+}
+void trellis_shared_grouped_admit(bool shexp_tp, bool halves_route, std::uint32_t row_limit) {
+    const int env = shared_grouped_env();
+    if (env == 0) return;
+    if (env < 0) {
+#if defined(STRIX_DS41_TRELLIS_LIB) && defined(STRIX_DS41_TRELLIS_DENSE_R1) && defined(STRIX_TP_SWIGLU_CLAMPED_DECLARED)
+        const char* why = shexp_tp ? "STRIX_DS41_SHEXP_TP=1"
+                        : !halves_route ? "no K4 shared row-halves route"
+                        : row_limit > 8U ? "more than 8 rows per step" : nullptr;
+#else
+        const char* why = "build without the declared SwiGLU pair";
+#endif
+        if (why != nullptr) {
+            shared_grouped_implicit.store(false, std::memory_order_relaxed);
+            if (!shared_grouped_implicit_refused.exchange(true))
+                std::fprintf(stderr, "ds41 trellis: shared gate/up SwiGLU pair launches not admitted by default (%s): old path\n", why);
+        } else if (!shared_grouped_implicit_refused.load() && !shared_grouped_implicit.exchange(true)) {
+            std::fprintf(stderr, "ds41 trellis: shared gate/up as SwiGLU pair launches (default; STRIX_DS41_SHARED_GROUPED=0 off)\n");
+        }
+        return;
+    }
+    if (!trellis_shared_grouped_enabled())
+        throw std::invalid_argument("ds41 trellis: STRIX_DS41_SHARED_GROUPED=1 needs a dense-r1 build linking the declared SwiGLU pair");
+    if (shexp_tp) throw std::invalid_argument("ds41 trellis: STRIX_DS41_SHARED_GROUPED=1 is refused with STRIX_DS41_SHEXP_TP=1");
+    if (!halves_route)
+        throw std::invalid_argument("ds41 trellis: STRIX_DS41_SHARED_GROUPED=1 needs the K4 shared row-halves route "
+                                    "(trellis shexp K4, STRIX_DS41_TRELLIS_DENSE_FULL=1)");
+    if (row_limit > 8U)
+        throw std::invalid_argument("ds41 trellis: STRIX_DS41_SHARED_GROUPED=1 is not qualified with more than 8 rows per step "
+                                    "(STRIX_DS41_BATCH_ROWS16)");
+}
+bool trellis_site_span(const TrellisSite& site, const void** data, std::uint64_t* bytes) noexcept {
+#if defined(STRIX_DS41_TRELLIS_LIB) && defined(STRIX_TRELLIS_HAS_WEIGHTS_SPAN)
+    std::uint64_t n = 0;
+    if (site.weights == nullptr || strix_weights_device_span(static_cast<strix_weights>(site.weights), data, &n) != STRIX_SUCCESS) return false;
+    *bytes = n;
+    return true;
+#else
+    (void)site;
+    (void)data;
+    (void)bytes;
+    return false;
+#endif
+}
 std::uint32_t trellis_submit_sizes(const TrellisSite& site) noexcept { return trellis_submit_sizes(site.columns, site.rows, site.bits); }
 std::uint32_t trellis_chunk_rows(const TrellisSite& site) noexcept {
     const auto m = trellis_submit_sizes(site);
@@ -107,14 +206,15 @@ strix_stream lib_stream(hipStream_t s) {
     st.hip_stream = s;
     return st;
 }
-void set_tensor(strix_tensor_desc& t, void* data, std::uint32_t rows, std::uint32_t width) {
+void set_tensor(strix_tensor_desc& t, void* data, std::uint32_t rows, std::uint32_t width, std::size_t stride = 0) {
+    if (stride == 0) stride = width;
     t.data = data;
-    t.buffer_bytes = std::uint64_t{rows} * width * sizeof(float);
+    t.buffer_bytes = (std::uint64_t{rows - 1U} * stride + width) * sizeof(float);
     t.dtype = STRIX_DTYPE_F32;
     t.rank = 2;
     t.shape[0] = rows;
     t.shape[1] = width;
-    t.strides[0] = width;
+    t.strides[0] = stride;
     t.strides[1] = 1;
 }
 }  // namespace
@@ -123,7 +223,8 @@ struct TrellisContext::Impl {
     strix_context context = nullptr;
     std::deque<TrellisSite> sites;
 #if defined(STRIX_DS41_TRELLIS_PREPARED)
-    using PlanKey = std::tuple<std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uint32_t>;
+    using PlanKey = std::tuple<std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uint32_t, std::size_t,
+                               std::size_t>;  // ..., rows, x row stride, y row stride
     struct Plan { strix_linear_plan linear = nullptr; strix_tp_dense_plan tp = nullptr; };
     std::map<PlanKey, Plan> plans;
 #endif
@@ -137,6 +238,27 @@ struct TrellisContext::Impl {
         std::uint64_t bytes = 0;
     };
     std::map<SplitKey, SplitWorkspace> split_workspaces;
+    using PairKey = std::tuple<std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t,
+                               std::uintptr_t, std::uintptr_t, std::uint32_t>;
+    std::map<PairKey, strix_tp_dense_pair_plan> pair_plans;
+#if defined(STRIX_DS41_TRELLIS_DENSE_R1)
+    std::map<PairKey, strix_tp_dense_plan> pair_r1_plans;  // dense-r1 q_a + kv in one dispatch (LEGACY partitions)
+#endif
+    using PairWorkspaceKey = std::tuple<std::uintptr_t, std::uint32_t, std::uint32_t, std::uint32_t>;
+    std::map<PairWorkspaceKey, SplitWorkspace> pair_workspaces;
+#if defined(STRIX_DS41_TRELLIS_DENSE_R1) && defined(STRIX_TP_SWIGLU_CLAMPED_DECLARED)
+    // STRIX_DS41_SHARED_GROUPED: shared gate/up SwiGLU pair plans keyed like the q_a+kv pair (gate, up, x, act half,
+    // 0, stream, rows); their counter workspaces per (stream, gate bits, up bits, rows), separate from the q_a+kv ones.
+    std::map<PairKey, strix_tp_swiglu_plan> swiglu_plans;
+    std::map<PairWorkspaceKey, SplitWorkspace> swiglu_workspaces;
+#endif
+#endif
+#if defined(STRIX_LINEAR_TRANSFORMS_FUSED_DECLARED)
+    // STRIX_DS41_SHARED_DOWN_FUSED: declared single-launch shared down plans (weights, act, out, workspace, stream, rows)
+    using SharedDownKey = std::tuple<std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uintptr_t, std::uint32_t>;
+    std::map<SharedDownKey, strix_linear_plan> shared_down_plans;
+#endif
+#if defined(STRIX_DS41_TRELLIS_SPLITK)
     const SplitWorkspace& split_workspace(const TrellisSite& site, std::uint32_t rows, hipStream_t stream, std::uint64_t bytes) {
         const SplitKey key{reinterpret_cast<std::uintptr_t>(stream), site.columns, site.rows, site.bits, rows};
         if (const auto it = split_workspaces.find(key); it != split_workspaces.end()) {
@@ -178,6 +300,12 @@ TrellisContext::TrellisContext() : impl_(std::make_unique<Impl>()) {
 TrellisContext::~TrellisContext() {
     if (!impl_) return;
     (void)hipDeviceSynchronize();
+#if defined(STRIX_LINEAR_TRANSFORMS_FUSED_DECLARED)
+    for (const auto& [key, plan] : impl_->shared_down_plans) {
+        (void)key;
+        (void)strix_linear_plan_destroy(plan);
+    }
+#endif
 #if defined(STRIX_DS41_TRELLIS_PREPARED)
     for (const auto& [key, p] : impl_->plans) {
         (void)key;
@@ -186,6 +314,24 @@ TrellisContext::~TrellisContext() {
     }
 #endif
 #if defined(STRIX_DS41_TRELLIS_SPLITK)
+    for (const auto& [key, plan] : impl_->pair_plans) {
+        (void)key;
+        (void)strix_tp_dense_pair_plan_destroy(plan);
+    }
+#if defined(STRIX_DS41_TRELLIS_DENSE_R1)
+    for (const auto& [key, plan] : impl_->pair_r1_plans) {
+        (void)key;
+        (void)strix_tp_dense_plan_destroy(plan);
+    }
+#endif
+#if defined(STRIX_DS41_TRELLIS_DENSE_R1) && defined(STRIX_TP_SWIGLU_CLAMPED_DECLARED)
+    for (const auto& [key, plan] : impl_->swiglu_plans) {
+        (void)key;
+        (void)strix_tp_swiglu_plan_destroy(plan);
+    }
+    impl_->swiglu_workspaces.clear();
+#endif
+    impl_->pair_workspaces.clear();
     impl_->split_workspaces.clear();
 #endif
     for (auto& w : impl_->workspaces) {
@@ -199,7 +345,9 @@ TrellisContext::~TrellisContext() {
 
 bool TrellisContext::available() noexcept { return true; }
 const char* TrellisContext::library_version() noexcept {
-#if defined(STRIX_DS41_TRELLIS_SPLITK)
+#if defined(STRIX_DS41_TRELLIS_DENSE_R1)
+    return "strix_trellis dense-r1 LEGACY (C ABI 1)";
+#elif defined(STRIX_DS41_TRELLIS_SPLITK)
     return "strix_trellis 0.3 + split-K 7b5b9b3 (C ABI 1)";
 #elif defined(STRIX_DS41_TRELLIS_PREPARED)
     return "strix_trellis 0.3 ef48b33 prepared TP (C ABI 1)";
@@ -214,33 +362,52 @@ namespace {
     if (s.bits != 4U && s.bits != 5U) return false;
     return (s.columns == 1280U && s.rows == 16384U) || (s.columns == 4096U && s.rows == 5120U) ||
            (s.columns == 5120U && (s.rows == 1152U || s.rows == 1280U || s.rows == 512U)) ||
-           (s.columns == 1152U && s.rows == 5120U);
+           (s.columns == 1152U && s.rows == 5120U)
+#if defined(STRIX_DS41_TRELLIS_DENSE_R1)
+           || (s.columns == 5120U && (s.rows == 64640U || s.rows == 129280U))
+#endif
+           ;
 }
 }
 
 void TrellisContext::submit(const TrellisSite& site, const float* x, float* y, std::uint32_t rows, void* workspace,
                             std::uint64_t bytes, void* stream) {
+    submit(site, x, 0, y, 0, rows, workspace, bytes, stream);
+}
+void TrellisContext::submit(const TrellisSite& site, const float* x, std::size_t x_stride, float* y, std::size_t y_stride,
+                            std::uint32_t rows, void* workspace, std::uint64_t bytes, void* stream) {
+    if (x_stride == site.columns) x_stride = 0;
+    if (y_stride == site.rows) y_stride = 0;
     strix_matmul_desc d{};
     strix_matmul_desc_init(&d);
     d.weights = static_cast<strix_weights>(site.weights);
-    set_tensor(d.input, const_cast<float*>(x), rows, site.columns);
-    set_tensor(d.output, y, rows, site.rows);
+    set_tensor(d.input, const_cast<float*>(x), rows, site.columns, x_stride);
+    set_tensor(d.output, y, rows, site.rows, y_stride);
     d.workspace = workspace;
     d.workspace_bytes = bytes;
     const auto st = lib_stream(as_stream(stream));
 #if defined(STRIX_DS41_TRELLIS_PREPARED)
     const Impl::PlanKey key{reinterpret_cast<std::uintptr_t>(site.weights), reinterpret_cast<std::uintptr_t>(x),
         reinterpret_cast<std::uintptr_t>(y), reinterpret_cast<std::uintptr_t>(workspace),
-        reinterpret_cast<std::uintptr_t>(stream), rows};
+        reinterpret_cast<std::uintptr_t>(stream), rows, x_stride, y_stride};
     auto it = impl_->plans.find(key);
     if (it == impl_->plans.end()) {
         hipStreamCaptureStatus capture{};
         check(hipStreamIsCapturing(as_stream(stream), &capture), "plan capture check");
         if (capture != hipStreamCaptureStatusNone)
             throw std::logic_error("ds41 trellis: warm this site/buffer/row plan before capture: " + site.key);
+        const auto created = std::chrono::steady_clock::now();
         Impl::Plan p;
         bool tp = tp_shape(site);
-#if defined(STRIX_DS41_TRELLIS_SPLITK)
+#if defined(STRIX_DS41_TRELLIS_DENSE_R1)
+        if (tp) {
+            std::uint64_t required = 0;
+            lib_check(strix_tp_dense_r1_workspace_bytes(impl_->context, &d, 0, STRIX_DENSE_R1_LEGACY, &required), "dense-r1 workspace " + site.key);
+            const auto& pool = impl_->split_workspace(site, rows, as_stream(stream), required);
+            d.workspace = pool.data.get(); d.workspace_bytes = pool.bytes;
+            lib_check(strix_tp_dense_plan_create_r1(impl_->context, &d, &st, 0, STRIX_DENSE_R1_LEGACY, &p.tp), "dense-r1 plan " + site.key);
+        }
+#elif defined(STRIX_DS41_TRELLIS_SPLITK)
         // Frozen per-shape selection: q_b K5 R8 retains the linear plan.
         // shared_down retains the qualified 0.3 kernel (zero workspace query).
         tp = tp && !(site.columns == 1280U && site.rows == 16384U && site.bits == 5U && rows == 8U);
@@ -270,6 +437,7 @@ void TrellisContext::submit(const TrellisSite& site, const float* x, float* y, s
         if (!tp) lib_check(strix_linear_plan_create(impl_->context, &d, &st, STRIX_OPERATION_GEMV, &p.linear),
                             "linear plan " + site.key);
         it = impl_->plans.emplace(key, p).first;
+        note_trellis_plan_created(std::chrono::duration<double>(std::chrono::steady_clock::now() - created).count());
     }
     if (it->second.tp) lib_check(strix_tp_dense_plan_submit(it->second.tp), "TP submit " + site.key);
     else lib_check(strix_linear_plan_submit(it->second.linear), "linear submit " + site.key);
@@ -279,6 +447,14 @@ void TrellisContext::submit(const TrellisSite& site, const float* x, float* y, s
 }
 
 void TrellisContext::release_plans(void* workspace) noexcept {
+#if defined(STRIX_LINEAR_TRANSFORMS_FUSED_DECLARED)
+    for (auto it = impl_->shared_down_plans.begin(); it != impl_->shared_down_plans.end();) {
+        if (std::get<3>(it->first) == reinterpret_cast<std::uintptr_t>(workspace)) {
+            (void)strix_linear_plan_destroy(it->second);
+            it = impl_->shared_down_plans.erase(it);
+        } else ++it;
+    }
+#endif
 #if defined(STRIX_DS41_TRELLIS_PREPARED)
     for (auto it = impl_->plans.begin(); it != impl_->plans.end();) {
         if (std::get<3>(it->first) == reinterpret_cast<std::uintptr_t>(workspace)) {
@@ -287,7 +463,7 @@ void TrellisContext::release_plans(void* workspace) noexcept {
             it = impl_->plans.erase(it);
         } else ++it;
     }
-#else
+#elif !defined(STRIX_LINEAR_TRANSFORMS_FUSED_DECLARED)
     (void)workspace;
 #endif
 }
@@ -364,7 +540,12 @@ void TrellisContext::reserve(void* stream, std::uint32_t max_rows) {
             std::uint64_t bytes = 0;
             lib_check(strix_matmul_workspace_bytes(impl_->context, &d, &bytes), "workspace query " + s.key);
             w.lib_bytes = std::max(w.lib_bytes, bytes);
-#if defined(STRIX_DS41_TRELLIS_SPLITK)
+#if defined(STRIX_DS41_TRELLIS_DENSE_R1)
+            if (tp_shape(s)) {
+                lib_check(strix_tp_dense_r1_workspace_bytes(impl_->context, &d, 0, STRIX_DENSE_R1_LEGACY, &bytes), "dense-r1 workspace " + s.key);
+                (void)impl_->split_workspace(s, r, hs, bytes);
+            }
+#elif defined(STRIX_DS41_TRELLIS_SPLITK)
             if (tp_shape(s) && !(s.columns == 1280U && s.rows == 16384U && s.bits == 5U && r == 8U)) {
                 lib_check(strix_tp_dense_workspace_bytes(impl_->context, &d, 0, &bytes), "split-K workspace " + s.key);
                 if (bytes != 0U) (void)impl_->split_workspace(s, r, hs, bytes);
@@ -373,6 +554,40 @@ void TrellisContext::reserve(void* stream, std::uint32_t max_rows) {
         }
     }
     constexpr std::uint32_t chunk_max = 8;
+#if defined(STRIX_DS41_TRELLIS_SPLITK)
+    // Pair counters have their own layout and must never share the single-projection pool.
+    // Reserve all R layouts before capture, just as for individual projections above.
+    for (const auto& qa : impl_->sites) {
+        const auto at = qa.key.find(".wq_a@");
+        if (at == std::string::npos) continue;
+        auto kv_key = qa.key;
+        kv_key.replace(at, 6U, ".wkv@");
+        const auto ki = std::find_if(impl_->sites.begin(), impl_->sites.end(), [&](const auto& s) { return s.key == kv_key; });
+        if (ki == impl_->sites.end()) continue;
+        for (std::uint32_t r = 1; r <= 8U; ++r) {
+            strix_tp_dense_pair_desc d{};
+            strix_tp_dense_pair_desc_init(&d);
+            set_tensor(d.input, reinterpret_cast<void*>(std::uintptr_t{1} << 40U), r, 5120U);
+            d.member[0].weights = static_cast<strix_weights>(qa.weights);
+            d.member[1].weights = static_cast<strix_weights>(ki->weights);
+            set_tensor(d.member[0].output, reinterpret_cast<void*>(std::uintptr_t{1} << 41U), r, 1280U);
+            set_tensor(d.member[1].output, reinterpret_cast<void*>(std::uintptr_t{1} << 42U), r, 512U);
+            std::uint64_t bytes = 0;
+#if defined(STRIX_DS41_TRELLIS_DENSE_R1)
+            lib_check(strix_tp_dense_pair_r1_workspace_bytes(impl_->context, &d, STRIX_DENSE_R1_LEGACY, &bytes), "pair workspace reserve");
+#else
+            lib_check(strix_tp_dense_pair_workspace_bytes(impl_->context, &d, &bytes), "pair workspace reserve");
+#endif
+            const Impl::PairWorkspaceKey key{reinterpret_cast<std::uintptr_t>(stream), qa.bits, ki->bits, r};
+            if (!impl_->pair_workspaces.contains(key)) {
+                void* p = nullptr;
+                check(hipMalloc(&p, bytes), "pair workspace reserve");
+                Impl::SplitWorkspace owned{std::unique_ptr<void, Impl::HipFree>(p), bytes};
+                impl_->pair_workspaces.emplace(key, std::move(owned));
+            }
+        }
+    }
+#endif
     check(hipMalloc(&w.lib, std::max<std::uint64_t>(w.lib_bytes, 256U)), "workspace");
     check(hipMalloc(reinterpret_cast<void**>(&w.xs), std::size_t{chunk_max} * max_i * sizeof(float)), "x staging");
     check(hipMalloc(reinterpret_cast<void**>(&w.ys), std::size_t{chunk_max} * max_n * sizeof(float)), "y staging");
@@ -390,6 +605,10 @@ std::uint64_t TrellisContext::library_workspace_bytes() const noexcept {
     for (const auto& w : impl_->workspaces) b += std::max<std::uint64_t>(w.lib_bytes, 256U);
 #if defined(STRIX_DS41_TRELLIS_SPLITK)
     for (const auto& [key, w] : impl_->split_workspaces) {
+        (void)key;
+        b += w.bytes;
+    }
+    for (const auto& [key, w] : impl_->pair_workspaces) {
         (void)key;
         b += w.bytes;
     }
@@ -433,10 +652,16 @@ void enqueue_trellis_linear(const TrellisSite& site, const float* x, float* y, s
     const std::uint32_t chunk = trellis_chunk_rows(site);
     const std::size_t xb = std::size_t{site.columns} * 4U;
     const bool headout = trellis_headout_enabled();
+    const bool views = trellis_row_views_enabled() && tp_shape(site);  // strided rows straight to the dense-r1 plan
     for (std::uint32_t begin = 0; begin < rows; begin += chunk) {
         const std::uint32_t n = std::min(chunk, rows - begin);
         const std::uint32_t m = trellis_padded_rows(site, n);  // library rows of this chunk (n real + m - n copies of the last)
         const float* xin = x + std::size_t{begin} * x_stride;
+        float* yrow = y + std::size_t{begin} * y_stride;
+        if (views && n > 1U && m == n && !accumulate) {  // one row needs no staging: R1 keeps its plans as they are
+            site.context->submit(site, xin, x_stride, yrow, y_stride, n, w.lib, std::max<std::uint64_t>(w.lib_bytes, 256U), hs);
+            continue;
+        }
         if ((x_stride != site.columns && !(headout && n == 1U)) || m != n) {
             check(hipMemcpy2DAsync(w.xs, xb, xin, x_stride * 4U, xb, n, hipMemcpyDeviceToDevice, hs), "x staging copy");
             for (std::uint32_t k = n; k < m; ++k)
@@ -444,7 +669,6 @@ void enqueue_trellis_linear(const TrellisSite& site, const float* x, float* y, s
                       "x padding copy");
             xin = w.xs;
         }
-        float* yrow = y + std::size_t{begin} * y_stride;
         const bool direct = !accumulate && (y_stride == site.rows || (headout && n == 1U)) && m == n;
         float* yout = direct ? yrow : w.ys;
         site.context->submit(site, xin, yout, m, w.lib, std::max<std::uint64_t>(w.lib_bytes, 256U), hs);
@@ -471,12 +695,18 @@ void enqueue_trellis_linear_rows(const TrellisSite& site, const float* x, float*
     const auto& w = impl.workspace(hs);
     const std::uint32_t chunk = trellis_chunk_rows(site);
     const std::size_t xb = std::size_t{site.columns} * 4U;
+    const bool views = trellis_row_views_enabled() && tp_shape(site);  // as enqueue_trellis_linear
     for (std::uint32_t begin = 0; begin < rows; begin += chunk) {
         const std::uint32_t n = std::min(chunk, rows - begin);
         std::uint32_t m = trellis_padded_rows(site, n);
         if (pad_from != 0U && n >= pad_from && begin + chunk <= capacity) m = std::max(m, chunk);
         const bool fits = begin + m <= capacity;  // rows [n, m) of x / y are the caller's scratch rows
         const float* xin = x + std::size_t{begin} * x_stride;
+        if (views && fits && m > 1U) {  // padding rows are the caller's scratch rows at the same strides; R1 as before
+            site.context->submit(site, xin, x_stride, y + std::size_t{begin} * y_stride, y_stride, m, w.lib,
+                                 std::max<std::uint64_t>(w.lib_bytes, 256U), hs);
+            continue;
+        }
         if (!(fits && (m == 1U || x_stride == site.columns))) {  // staged as enqueue_trellis_linear
             check(hipMemcpy2DAsync(w.xs, xb, xin, x_stride * 4U, xb, n, hipMemcpyDeviceToDevice, hs), "x staging copy");
             for (std::uint32_t k = n; k < m; ++k)
@@ -531,6 +761,312 @@ void enqueue_trellis_linear_rows(const TrellisSite&, const float*, float*, std::
 std::uint64_t TrellisContext::staging_bytes_for(std::uint32_t max_columns, std::uint32_t max_rows) noexcept {
     // reserve(): x / y staging of 8 rows (every chunk has at most 8), widths at least 128
     return 8U * (std::uint64_t{std::max(max_columns, 128U)} + std::max(max_rows, 128U)) * sizeof(float);
+}
+
+void enqueue_trellis_qakv(const TrellisSite& qa, const TrellisSite& kv, const float* x, float* q, float* k,
+                          std::uint32_t rows, void* stream) {
+    if (qa.context == nullptr || qa.context != kv.context || qa.columns != 5120U || kv.columns != 5120U ||
+        qa.rows != 1280U || kv.rows != 512U)
+        throw std::invalid_argument("ds41 trellis: invalid q_a+kv pair");
+    for (std::uint32_t first = 0; first < rows; first += 8U) {
+        const auto n = std::min(8U, rows - first);
+        const float* in = x + std::size_t{first} * 5120U;
+        float* qo = q + std::size_t{first} * 1280U;
+        float* ko = k + std::size_t{first} * 512U;
+#if defined(STRIX_DS41_TRELLIS_SPLITK)
+        auto& impl = qa.context->impl();
+        const TrellisContext::Impl::PairKey key{reinterpret_cast<std::uintptr_t>(qa.weights),
+            reinterpret_cast<std::uintptr_t>(kv.weights), reinterpret_cast<std::uintptr_t>(in),
+            reinterpret_cast<std::uintptr_t>(qo), reinterpret_cast<std::uintptr_t>(ko),
+            reinterpret_cast<std::uintptr_t>(stream), n};
+#if defined(STRIX_DS41_TRELLIS_DENSE_R1)
+        auto it = impl.pair_r1_plans.find(key);
+        if (it == impl.pair_r1_plans.end()) {
+#else
+        auto it = impl.pair_plans.find(key);
+        if (it == impl.pair_plans.end()) {
+#endif
+            hipStreamCaptureStatus capture{};
+            check(hipStreamIsCapturing(as_stream(stream), &capture), "pair capture check");
+            if (capture != hipStreamCaptureStatusNone)
+                throw std::logic_error("ds41 trellis: warm q_a+kv buffers/rows before capture");
+            const auto created = std::chrono::steady_clock::now();
+            strix_tp_dense_pair_desc d{};
+            strix_tp_dense_pair_desc_init(&d);
+            set_tensor(d.input, const_cast<float*>(in), n, 5120U);
+            d.member[0].weights = static_cast<strix_weights>(qa.weights);
+            d.member[1].weights = static_cast<strix_weights>(kv.weights);
+            set_tensor(d.member[0].output, qo, n, 1280U);
+            set_tensor(d.member[1].output, ko, n, 512U);
+            std::uint64_t bytes = 0;
+#if defined(STRIX_DS41_TRELLIS_DENSE_R1)
+            lib_check(strix_tp_dense_pair_r1_workspace_bytes(impl.context, &d, STRIX_DENSE_R1_LEGACY, &bytes), "pair workspace");
+#else
+            lib_check(strix_tp_dense_pair_workspace_bytes(impl.context, &d, &bytes), "pair workspace");
+#endif
+            const TrellisContext::Impl::PairWorkspaceKey wk{reinterpret_cast<std::uintptr_t>(stream), qa.bits, kv.bits, n};
+            auto wi = impl.pair_workspaces.find(wk);
+            if (wi == impl.pair_workspaces.end()) {
+                void* p = nullptr;
+                check(hipMalloc(&p, bytes), "pair persistent workspace");
+                TrellisContext::Impl::SplitWorkspace owned{std::unique_ptr<void, TrellisContext::Impl::HipFree>(p), bytes};
+                wi = impl.pair_workspaces.emplace(wk, std::move(owned)).first;
+            }
+            if (wi->second.bytes != bytes) throw std::logic_error("ds41 trellis: inconsistent pair workspace");
+            d.workspace = wi->second.data.get();
+            d.workspace_bytes = bytes;
+            const auto st = lib_stream(as_stream(stream));
+#if defined(STRIX_DS41_TRELLIS_DENSE_R1)
+            strix_tp_dense_plan plan = nullptr;
+            lib_check(strix_tp_dense_pair_plan_create_r1(impl.context, &d, &st, STRIX_DENSE_R1_LEGACY, &plan), "dense-r1 q_a+kv plan");
+            it = impl.pair_r1_plans.emplace(key, plan).first;
+            note_trellis_plan_created(std::chrono::duration<double>(std::chrono::steady_clock::now() - created).count());
+        }
+        lib_check(strix_tp_dense_plan_submit(it->second), "dense-r1 q_a+kv submit");
+#else
+            d.strategy = STRIX_TP_SPLITK_SINGLE;
+            strix_tp_dense_pair_plan plan = nullptr;
+            lib_check(strix_tp_dense_pair_plan_create(impl.context, &d, &st, &plan), "q_a+kv plan");
+            it = impl.pair_plans.emplace(key, plan).first;
+            note_trellis_plan_created(std::chrono::duration<double>(std::chrono::steady_clock::now() - created).count());
+        }
+        lib_check(strix_tp_dense_pair_plan_submit(it->second), "q_a+kv submit");
+#endif
+#else
+        enqueue_trellis_linear(qa, in, qo, n, 5120U, 1280U, false, stream);
+        enqueue_trellis_linear(kv, in, ko, n, 5120U, 512U, false, stream);
+#endif
+    }
+}
+
+void enqueue_trellis_shared_swiglu(const TrellisSite* const halves[4], const float* x, float* act, std::uint32_t rows,
+                                   float limit, void* stream) {
+#if defined(STRIX_DS41_TRELLIS_LIB) && defined(STRIX_DS41_TRELLIS_DENSE_R1) && defined(STRIX_TP_SWIGLU_CLAMPED_DECLARED)
+    constexpr std::uint32_t H = 5120U, HALF = 1152U, I = 2U * HALF;
+    for (int k = 0; k < 4; ++k)
+        if (halves[k] == nullptr || halves[k]->context == nullptr || halves[k]->context != halves[0]->context ||
+            halves[k]->columns != H || halves[k]->rows != HALF || halves[k]->bits != halves[0]->bits)
+            throw std::invalid_argument("ds41 trellis: invalid shared gate/up halves for the SwiGLU pair");
+    auto& impl = halves[0]->context->impl();
+    const auto hs = as_stream(stream);
+    for (std::uint32_t first = 0; first < rows; first += 8U) {
+        const auto n = std::min(8U, rows - first);
+        const float* in = x + std::size_t{first} * H;
+        for (std::uint32_t h = 0; h < 2U; ++h) {
+            const TrellisSite& gate = *halves[h];
+            const TrellisSite& up = *halves[2U + h];
+            float* out = act + std::size_t{first} * I + std::size_t{h} * HALF;
+            const TrellisContext::Impl::PairKey key{reinterpret_cast<std::uintptr_t>(gate.weights),
+                reinterpret_cast<std::uintptr_t>(up.weights), reinterpret_cast<std::uintptr_t>(in),
+                reinterpret_cast<std::uintptr_t>(out), std::uintptr_t{__builtin_bit_cast(std::uint32_t, limit)},
+                reinterpret_cast<std::uintptr_t>(stream), n};  // the activation limit is part of the key
+            auto it = impl.swiglu_plans.find(key);
+            if (it == impl.swiglu_plans.end()) {
+                hipStreamCaptureStatus capture{};
+                check(hipStreamIsCapturing(hs, &capture), "shared swiglu capture check");
+                if (capture != hipStreamCaptureStatusNone)
+                    throw std::logic_error("ds41 trellis: warm the shared SwiGLU pair buffers/rows before capture");
+                const auto created = std::chrono::steady_clock::now();
+                strix_tp_swiglu_desc d{};
+                strix_tp_swiglu_desc_init(&d);
+                set_tensor(d.input, const_cast<float*>(in), n, H);
+                d.gate = static_cast<strix_weights>(gate.weights);
+                d.up = static_cast<strix_weights>(up.weights);
+                // [n][1152] at row stride 2304 inside act (the rows of this half only)
+                d.hidden_output.data = out;
+                d.hidden_output.buffer_bytes = (std::uint64_t{n - 1U} * I + HALF) * sizeof(float);
+                d.hidden_output.dtype = STRIX_DTYPE_F32;
+                d.hidden_output.rank = 2;
+                d.hidden_output.shape[0] = n;
+                d.hidden_output.shape[1] = HALF;
+                d.hidden_output.strides[0] = I;
+                d.hidden_output.strides[1] = 1;
+                d.strategy = STRIX_TP_SPLITK_SINGLE;
+                d.activation = STRIX_TP_SWIGLU_CLAMPED_DECLARED;
+                d.limit = limit;
+                std::uint64_t bytes = 0;
+                lib_check(strix_tp_swiglu_workspace_bytes(impl.context, &d, &bytes), "shared swiglu workspace");
+                const TrellisContext::Impl::PairWorkspaceKey wk{reinterpret_cast<std::uintptr_t>(stream), gate.bits, up.bits, n};
+                auto wi = impl.swiglu_workspaces.find(wk);
+                if (wi == impl.swiglu_workspaces.end()) {
+                    void* p = nullptr;
+                    check(hipMalloc(&p, bytes), "shared swiglu persistent workspace");
+                    TrellisContext::Impl::SplitWorkspace owned{std::unique_ptr<void, TrellisContext::Impl::HipFree>(p), bytes};
+                    wi = impl.swiglu_workspaces.emplace(wk, std::move(owned)).first;
+                }
+                if (wi->second.bytes != bytes) throw std::logic_error("ds41 trellis: inconsistent shared swiglu workspace");
+                d.workspace = wi->second.data.get();
+                d.workspace_bytes = bytes;
+                const auto st = lib_stream(hs);
+                strix_tp_swiglu_plan plan = nullptr;
+                lib_check(strix_tp_swiglu_plan_create(impl.context, &d, &st, &plan), "shared swiglu plan");
+                it = impl.swiglu_plans.emplace(key, plan).first;
+                note_trellis_plan_created(std::chrono::duration<double>(std::chrono::steady_clock::now() - created).count());
+                static bool announced = false;  // diagnostic evidence that the grouped route really executes
+                if (!announced) {
+                    announced = true;
+                    std::fprintf(stderr, "ds41 trellis: shared SwiGLU pair plan created (rows %u, %u-bit)\n", n, gate.bits);
+                }
+            }
+            lib_check(strix_tp_swiglu_plan_submit(it->second), "shared swiglu submit");
+        }
+    }
+#else
+    (void)halves; (void)x; (void)act; (void)rows; (void)limit; (void)stream;
+    throw std::logic_error("ds41 trellis: STRIX_DS41_SHARED_GROUPED needs a dense-r1 build with the declared SwiGLU pair");
+#endif
+}
+
+
+// ---- STRIX_DS41_SHARED_DOWN_FUSED: the shared down as one declared library launch ----------------------------------
+#if defined(STRIX_DS41_TRELLIS_LIB) && defined(STRIX_LINEAR_TRANSFORMS_FUSED_DECLARED)
+#define STRIX_DS41_SHARED_DOWN_ROUTE 1
+#endif
+namespace {
+#if defined(STRIX_DS41_SHARED_DOWN_ROUTE)
+constexpr std::uint32_t shared_down_input = 2304U, shared_down_output = 5120U, shared_down_bits = 4U;
+#endif
+// read once: -1 unset/empty (implicit default), 1 explicit on, 0 any other value (off)
+int shared_down_env() noexcept {
+    static const int v = [] {
+        const auto* e = std::getenv("STRIX_DS41_SHARED_DOWN_FUSED");
+        if (e == nullptr || e[0] == '\0') return -1;
+        return e[0] == '1' ? 1 : 0;
+    }();
+    return v;
+}
+// Off until an admission admits it; an implicit refusal holds for the process. Once the route ran (`used`) the
+// selection is frozen: a later admission that would change it throws instead.
+std::atomic<bool> shared_down_on{false};
+std::atomic<bool> shared_down_refused{false};
+std::atomic<bool> shared_down_used{false};
+}  // namespace
+
+bool trellis_shared_down_fused_enabled() noexcept {
+#if defined(STRIX_DS41_SHARED_DOWN_ROUTE)
+    return shared_down_on.load(std::memory_order_relaxed);
+#else
+    return false;
+#endif
+}
+
+void trellis_shared_down_fused_admit(const std::vector<const TrellisSite*>& downs, std::size_t layers, bool shexp_tp,
+                                     std::uint32_t row_limit) {
+    const int env = shared_down_env();
+    if (env == 0) return;
+    std::string why;
+#if defined(STRIX_DS41_SHARED_DOWN_ROUTE)
+    if (shexp_tp) why = "STRIX_DS41_SHEXP_TP=1";
+    else if (downs.empty()) why = "no trellis shared down site";
+    else if (downs.size() != layers)
+        why = std::to_string(downs.size()) + " trellis shared down sites for " + std::to_string(layers) + " shared experts";
+    for (const auto* d : downs) {
+        if (!why.empty()) break;
+        if (d == nullptr || d->context == nullptr || d->context != downs.front()->context)
+            why = "shared down sites of different contexts";
+        else if (d->bits != shared_down_bits || d->columns != shared_down_input || d->rows != shared_down_output)
+            why = "shared down site " + d->key + " is K" + std::to_string(d->bits) + " [" + std::to_string(d->rows) + ", " +
+                  std::to_string(d->columns) + "], not K4 [5120, 2304]";
+    }
+    // Startup probe of the linked library: a valid declared workspace query per site and row count. The staged query
+    // of the same descriptor must succeed, so INVALID_ARGUMENT from the declared one is a confirmed rejection of the
+    // selector (an older library, another geometry or a context whose kernels failed the creation-time check).
+    const std::uint32_t probe_rows = std::min(8U, std::max(row_limit, 1U));
+    for (std::size_t k = 0; why.empty() && k < downs.size(); ++k) {
+        const auto& site = *downs[k];
+        for (std::uint32_t r = 1; why.empty() && r <= probe_rows; ++r) {
+            strix_matmul_desc d{};
+            strix_matmul_desc_init(&d);
+            d.weights = static_cast<strix_weights>(site.weights);
+            // query only: host descriptors are validated, device memory is not touched (addresses must not overlap)
+            set_tensor(d.input, reinterpret_cast<void*>(std::uintptr_t{1} << 40U), r, site.columns);
+            set_tensor(d.output, reinterpret_cast<void*>(std::uintptr_t{1} << 41U), r, site.rows);
+            std::uint64_t staged = 0, declared = 0;
+            lib_check(strix_matmul_workspace_bytes(site.context->impl().context, &d, &staged), "shared down staged probe " + site.key);
+            d.reserved[0] = STRIX_LINEAR_TRANSFORMS_FUSED_DECLARED;
+            const strix_status s = strix_matmul_workspace_bytes(site.context->impl().context, &d, &declared);
+            if (s == STRIX_ERROR_INVALID_ARGUMENT)
+                why = "the linked library rejects the declared route (" + site.key + ", " + std::to_string(r) + " rows)";
+            else if (s != STRIX_SUCCESS)
+                throw std::runtime_error("ds41 trellis: shared down declared probe " + site.key + ": " + strix_status_string(s));
+            else if (declared != staged)
+                throw std::runtime_error("ds41 trellis: shared down declared probe " + site.key + ": workspace size differs");
+        }
+    }
+#else
+    (void)downs;
+    (void)layers;
+    (void)shexp_tp;
+    (void)row_limit;
+    why = "build without the declared shared down route";
+#endif
+    if (env == 1 && !why.empty()) throw std::invalid_argument("ds41 trellis: STRIX_DS41_SHARED_DOWN_FUSED=1: " + why);
+    if (!why.empty()) {
+        if (shared_down_used.load() && shared_down_on.load())
+            throw std::logic_error("ds41 trellis: shared down fused route already in use, a later admission refuses it (" + why + ")");
+        shared_down_on.store(false);
+        if (!shared_down_refused.exchange(true))
+            std::fprintf(stderr, "ds41 trellis: shared down fused launch not admitted by default (%s): old path\n", why.c_str());
+        return;
+    }
+    if (shared_down_refused.load()) return;  // an earlier implicit refusal holds for the process
+    if (!shared_down_on.exchange(true))
+        std::fprintf(stderr, "ds41 trellis: shared down as one fused launch (%zu K4 sites, probe R1..R%u; %s)\n", downs.size(),
+                     std::min(8U, std::max(row_limit, 1U)),
+                     env == 1 ? "STRIX_DS41_SHARED_DOWN_FUSED=1" : "default; STRIX_DS41_SHARED_DOWN_FUSED=0 off");
+}
+
+void enqueue_trellis_shared_down(const TrellisSite& site, const float* act, std::size_t act_stride, float* out,
+                                 std::size_t out_stride, std::uint32_t rows, void* stream) {
+    if (!trellis_shared_down_fused_enabled()) {
+        enqueue_trellis_linear(site, act, out, rows, act_stride, out_stride, false, stream);
+        return;
+    }
+#if defined(STRIX_DS41_SHARED_DOWN_ROUTE)
+    if (rows == 0U) return;
+    if (site.context == nullptr || site.bits != shared_down_bits || site.columns != shared_down_input ||
+        site.rows != shared_down_output || act_stride != shared_down_input || out_stride != shared_down_output)
+        throw std::invalid_argument("ds41 trellis: shared down fused call outside the admitted geometry: " + site.key);
+    shared_down_used.store(true, std::memory_order_relaxed);
+    auto& impl = site.context->impl();
+    const auto hs = as_stream(stream);
+    const auto& w = impl.workspace(hs);
+    const std::uint64_t ws_bytes = std::max<std::uint64_t>(w.lib_bytes, 256U);
+    for (std::uint32_t first = 0; first < rows; first += 8U) {
+        const auto n = std::min(8U, rows - first);
+        const float* in = act + std::size_t{first} * shared_down_input;
+        float* o = out + std::size_t{first} * shared_down_output;
+        const TrellisContext::Impl::SharedDownKey key{reinterpret_cast<std::uintptr_t>(site.weights), reinterpret_cast<std::uintptr_t>(in),
+            reinterpret_cast<std::uintptr_t>(o), reinterpret_cast<std::uintptr_t>(w.lib), reinterpret_cast<std::uintptr_t>(stream), n};
+        auto it = impl.shared_down_plans.find(key);
+        if (it == impl.shared_down_plans.end()) {
+            hipStreamCaptureStatus capture{};
+            check(hipStreamIsCapturing(hs, &capture), "shared down capture check");
+            if (capture != hipStreamCaptureStatusNone)
+                throw std::logic_error("ds41 trellis: warm the shared down fused plans (buffers/rows) before capture: " + site.key);
+            const auto created = std::chrono::steady_clock::now();
+            strix_matmul_desc d{};
+            strix_matmul_desc_init(&d);
+            d.weights = static_cast<strix_weights>(site.weights);
+            set_tensor(d.input, const_cast<float*>(in), n, shared_down_input);
+            set_tensor(d.output, o, n, shared_down_output);
+            d.workspace = w.lib;
+            d.workspace_bytes = ws_bytes;
+            d.reserved[0] = STRIX_LINEAR_TRANSFORMS_FUSED_DECLARED;
+            const auto st = lib_stream(hs);
+            strix_linear_plan plan = nullptr;
+            lib_check(strix_linear_plan_create(impl.context, &d, &st, STRIX_OPERATION_GEMV, &plan), "shared down fused plan " + site.key);
+            it = impl.shared_down_plans.emplace(key, plan).first;
+            note_trellis_plan_created(std::chrono::duration<double>(std::chrono::steady_clock::now() - created).count());
+            static std::atomic<bool> announced{false};  // diagnostic evidence that the fused route really executes
+            if (!announced.exchange(true))
+                std::fprintf(stderr, "ds41 trellis: shared down fused plan created (rows %u, %u-bit)\n", n, site.bits);
+        }
+        lib_check(strix_linear_plan_submit(it->second), "shared down fused submit " + site.key);
+    }
+#else
+    throw std::logic_error("ds41 trellis: STRIX_DS41_SHARED_DOWN_FUSED needs a library with the declared route");
+#endif
 }
 
 }  // namespace strix::ds41

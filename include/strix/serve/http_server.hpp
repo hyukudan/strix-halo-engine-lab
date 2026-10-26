@@ -33,6 +33,9 @@ public:
     virtual bool write(std::string_view data) = 0;
     virtual void end_stream() = 0;
     [[nodiscard]] virtual bool client_gone() const = 0;
+    // A header the response head of the current request carries (plain, streamed or an error the server sends); the
+    // server clears these for every request. A writer without a response head of its own ignores it.
+    virtual void add_response_header(std::string name, std::string value) { (void)name; (void)value; }
 };
 
 using HttpHandler = std::function<void(const HttpRequest&, HttpResponseWriter&)>;

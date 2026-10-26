@@ -8,6 +8,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -34,6 +35,9 @@ struct ApiConfig {
     // POST /admin/drain (authenticated): stop admitting and finish what runs; /health answers 503 "draining" after it.
     // Unset: the route answers 404.
     std::function<void()> on_drain;
+    // An arming request to this service (GET /metrics, GET /api/status?detail=1) keeps the instrumentation armed this
+    // many seconds more (observe_arm); 0: until the process ends. Unset: STRIX_SERVE_OBSERVE_EXPIRY_S, else 60.
+    std::optional<double> observe_expiry_seconds;
     // Further engine routes (authenticated), tried before the built-in POST routes: true when the hook answered.
     // Unset: nothing changes.
     std::function<bool(const HttpRequest&, HttpResponseWriter&)> engine_routes;

@@ -132,6 +132,15 @@ private:
 // SHA256 manifest <dir>.sha256 when present, else of its file names and sizes. Reads the pack headers only.
 [[nodiscard]] std::string trellis_weights_namespace();
 
+// Prepared plans created on first use, process-wide (every TrellisContext and TrellisGroupRunner): the count and the
+// wall seconds of the creations (each one synchronises). A server warms them before READY; later creations are misses.
+struct TrellisPlanStats {
+    std::uint64_t created = 0;
+    double seconds = 0.0;
+};
+[[nodiscard]] TrellisPlanStats trellis_plan_stats() noexcept;
+void note_trellis_plan_created(double seconds) noexcept;
+
 // ---- device side (hip_ds41_trellis.hip) -------------------------------------------------------------------------
 
 class TrellisContext;
@@ -186,6 +195,9 @@ public:
     // The first call binds a prepared plan outside capture; subsequent calls only submit it.
     void submit(const TrellisSite& site, const float* x, float* y, std::uint32_t rows, void* workspace,
                 std::uint64_t workspace_bytes, void* stream);
+    // The same with F32 row views: x rows x_stride apart, y rows y_stride apart (elements; 0 = contiguous rows).
+    void submit(const TrellisSite& site, const float* x, std::size_t x_stride, float* y, std::size_t y_stride, std::uint32_t rows,
+                void* workspace, std::uint64_t workspace_bytes, void* stream);
     void release_plans(void* workspace) noexcept;
     struct Impl;
     [[nodiscard]] Impl& impl() noexcept { return *impl_; }
@@ -204,6 +216,24 @@ void enqueue_trellis_linear(const TrellisSite& site, const float* x, float* y, s
 // STRIX_DS41_TRELLIS_HEADOUT=1 (default off; read once): the trellis LM head's adapter without staging copies.
 // Also lets enqueue_trellis_linear submit a single-row chunk in place whatever its strides (one row is contiguous).
 [[nodiscard]] bool trellis_headout_enabled() noexcept;
+// Opt-in completion of the dense pack routes: q_a / kv and K4 shared gate/up row halves.
+// Unset keeps the original engine routes, including in a v12 build.
+[[nodiscard]] bool trellis_dense_full_enabled() noexcept;
+// Only the explicit split-K build changes existing K4 shared gate/up call shapes.
+[[nodiscard]] bool trellis_dense_row_slices_enabled() noexcept;
+// Independently opt in to the q_a+kv pair. v12 submits the same two legacy linears;
+// splitk04 uses the library pair plan. Inputs and outputs are contiguous F32 rows.
+[[nodiscard]] bool trellis_qakv_pair_enabled() noexcept;
+// STRIX_DS41_TRELLIS_ROW_VIEWS=1 (default off; read once): in a dense-r1 build, a TP-shape site's strided rows go to its
+// plan as row views (the library takes row stride >= width) instead of through the workspace and hipMemcpy2DAsync staging
+// copies; same kernel, schedule and products (the stride only moves addresses). Chunks with padding rows still stage;
+// single-row chunks (R1) keep their existing plans, so R1 runs exactly the code path it runs without the flag.
+[[nodiscard]] bool trellis_row_views_enabled() noexcept;
+// The site's device bytes (the library's single allocation: trellis, suh, svh, ...), for read-ahead into the MALL;
+// false when the linked library has no strix_weights_device_span (then nothing is read ahead for trellis sites).
+[[nodiscard]] bool trellis_site_span(const TrellisSite& site, const void** data, std::uint64_t* bytes) noexcept;
+void enqueue_trellis_qakv(const TrellisSite& qa, const TrellisSite& kv, const float* x, float* q, float* k,
+                          std::uint32_t rows, void* stream);
 // y[r][0, N) = Linear(x[r][0, I)) for r < rows, no staging where the call's layout allows it: x and y each hold at least
 // `capacity` rows at their strides, rows in [rows, capacity) are scratch (read as padding inputs, overwritten by padding
 // outputs). A chunk of n >= pad_from rows (pad_from 0 = never) is submitted as a full chunk (trellis_chunk_rows) when it
@@ -216,5 +246,43 @@ void enqueue_trellis_linear_rows(const TrellisSite& site, const float* x, float*
 // act[r][i] = swiglu_clamped(gate[r][i], up[r][i], limit) in F32 (ds41_moe.hpp), rows x width, strides width.
 void enqueue_swiglu_f32(const float* gate, const float* up, std::uint32_t rows, std::uint32_t width, float limit, float* act,
                         void* stream);
+
+// STRIX_DS41_SHARED_GROUPED (read once; dense-r1 builds with the K4 shared row-halves route only): =1 on, =0 off,
+// unset = on wherever the startup admission finds it admissible (else the old path, one log line):
+// the shared expert's four gate/up row halves + enqueue_swiglu_f32 run as two library SwiGLU pair launches (one per
+// 1152-row half: gate and up products of that half and the clamped declared SwiGLU in the completing block), writing
+// act[r][h * 1152 + j] (row stride 2 * 1152). Same products (per-shape split-K order) and the same activation bits.
+[[nodiscard]] bool trellis_shared_grouped_enabled() noexcept;
+// Startup admission. Unset: enables the implicit default when admissible, otherwise keeps the old path for the whole
+// process (one log line). =1: throws when the build cannot run it (no dense-r1
+// or no declared SwiGLU pair in the linked library), with the shexp-tp route, without the K4 shared row-halves route
+// (the flag would be ignored), or with more than 8 rows per step (STRIX_DS41_BATCH_ROWS16: not qualified yet).
+void trellis_shared_grouped_admit(bool shexp_tp, bool halves_route, std::uint32_t row_limit);
+// halves = {gate rows [0,1152), gate rows [1152,2304), up rows [0,1152), up rows [1152,2304)} (5120 -> 1152 each);
+// x [rows][5120] contiguous, act [rows][2304] contiguous; rows chunked by 8.
+void enqueue_trellis_shared_swiglu(const TrellisSite* const halves[4], const float* x, float* act, std::uint32_t rows,
+                                   float limit, void* stream);
+
+// STRIX_DS41_SHARED_DOWN_FUSED (read once): =1 on (throwing diagnostics), =0 off, unset = on wherever the startup
+// admission finds it admissible (else the old path for the whole process, one log line). The shared expert's down
+// (shexp_w2, mul1 K4 [N=5120, I=2304]) runs as one library launch (STRIX_LINEAR_TRANSFORMS_FUSED_DECLARED: the input
+// transform, the K16 product and the output transform folded with the three-launch route's bits) instead of three.
+// The output stays the F32 [rows][5120] shared buffer. On only after trellis_shared_down_fused_admit admitted it.
+[[nodiscard]] bool trellis_shared_down_fused_enabled() noexcept;
+// Startup admission, after every shared down site is prepared and before any capture; the selection it makes is frozen
+// once the route ran. `downs` = the trellis shared down site of every layer, `layers` = the shared expert steps of the
+// plan: every one must have a K4 [5120, 2304] site of one context (mul1 is the pack format), else the old path. Then a
+// startup probe of the linked library: for each site and 1..min(row_limit, 8) rows, the staged workspace query must
+// succeed (else throws) and the declared one either succeeds (admitted) or returns STRIX_ERROR_INVALID_ARGUMENT
+// (confirmed rejection: old path); any other status throws. Refused with STRIX_DS41_SHEXP_TP=1 (its down is a TP
+// slice) and in builds whose library header has no declared route. =1 throws where the implicit default would refuse.
+void trellis_shared_down_fused_admit(const std::vector<const TrellisSite*>& downs, std::size_t layers, bool shexp_tp,
+                                     std::uint32_t row_limit);
+// out[r][0, 5120) = down(act[r][0, 2304)) for r < rows (row strides act_stride / out_stride). The declared route when
+// enabled (contiguous rows, chunks of 8, one prepared plan per site, buffers, stream and row count, created outside
+// capture and counted in note_trellis_plan_created; the first one logs "shared down fused plan created"), else exactly
+// enqueue_trellis_linear(site, act, out, rows, act_stride, out_stride, false, stream).
+void enqueue_trellis_shared_down(const TrellisSite& site, const float* act, std::size_t act_stride, float* out,
+                                 std::size_t out_stride, std::uint32_t rows, void* stream);
 
 }  // namespace strix::ds41

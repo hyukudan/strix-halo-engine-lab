@@ -6,6 +6,7 @@
 #include "strix/hip_ds41_dspark.hpp"
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -51,11 +52,18 @@ struct BatchSpecOptions {
     // false: on rank 0 (the server's rank 1 does not see a prompt read in rows before it is read). imported()
     // requests always go to rank slot % 2.
     bool split_started = true;
+    // The wall time of the last target step for the cost model (empty: target.last_stats().seconds). A split decode
+    // (ds41_hetero_stage.hpp) passes the step it waited for: the FRONT's boundaries, the forward and the TAIL step.
+    std::function<double()> step_seconds;
+    // The cost calibration's default (STRIX_DS41_DSPARK_CALIB=0/1 overrides it): the server turns it on with its
+    // warm-up (the qualification measured the two together); off: the old estimator.
+    bool calib = false;
 };
 
 struct BatchSpecStats {
     std::uint64_t steps = 0, drafted_steps = 0, windows = 0, plain_rows = 0, drafts_verified = 0, drafts_accepted = 0, rows = 0;
     std::uint64_t decode_steps = 0, decode_tokens = 0;  // steps without prompt rows and the tokens they emitted
+    std::uint64_t probe_rows = 0;  // calib: extra rows verified as price-independent probes (every 32nd drafted plan, at most one)
     double draft_seconds = 0.0, step_seconds = 0.0, finish_seconds = 0.0, plan_seconds = 0.0;
     double decode_seconds = 0.0;  // wall of the decode-only steps (plan + drafts + step + finish)
     std::array<std::uint64_t, ds41::dspark::block_size + 2U> window_rows{};  // windows by rows (1 = plain row)
@@ -106,6 +114,12 @@ public:
     bool follow_round(std::span<const BatchRow> last_rows, std::span<const std::uint32_t> last_tokens, std::uint64_t step);
     bool follow_packet(std::span<const std::byte> packet, std::span<const BatchRow> last_rows, std::span<const std::uint32_t> last_tokens,
                        std::uint64_t step, std::vector<std::pair<std::uint32_t, std::uint32_t>>* commits = nullptr);
+    // Several plans in flight (micro-batches of a split decode): park() takes the plan of the last plan() out of the
+    // speculator, resume() puts one back; finish() then verifies that plan (its step must be the target's last step).
+    // plan() A, park A, ..., resume A, step A, finish A: groups of requests alternate without mixing their windows.
+    struct ParkedPlan;
+    [[nodiscard]] std::shared_ptr<ParkedPlan> park();
+    void resume(const std::shared_ptr<ParkedPlan>& plan);
     // world 2, rank 1: `slot` was reset (a new request comes): its context is no longer this rank's.
     void release(std::uint32_t slot) { owners_.at(slot) = 0U; }
     static constexpr std::uint32_t round_magic = 0x44524631U;
@@ -147,6 +161,48 @@ private:
     std::array<std::uint32_t, ds41::dspark::BatchWindowController::max_requests + 1U> plain_n_{};
     double row_mean_ = 0.0, draft_mean_ = 0.0, round_mean_ = 0.0;
     std::uint32_t row_n_ = 0, draft_n_ = 0, round_n_ = 0;
+    // STRIX_DS41_DSPARK_CALIB (default BatchSpecOptions::calib; =0: the estimates above alone, =1: on): the step costs from EVERY decode step
+    // (design notes). The row cost is a least-squares slope over pairs of steps of the same requests at most 2 steps
+    // apart (their contexts differ by a few positions, so the drift cancels), with the default as a prior and capped at
+    // half a one-request step. plain[n] is a fast mean of wall - row * x per request set (an LRU table), plus the
+    // measured per-step loop overhead. First use (the first step of each row count, the drafter's first call, the first
+    // split round) is not a sample; a step with prompt rows is not a sample and breaks the pairs.
+    bool calib_ = false, cost_log_ = false, seen_draft_ = false, seen_round_ = false;
+    std::array<bool, 64> seen_rows_{};  // a decode step of this many rows ran
+    std::array<std::uint8_t, ds41::dspark::BatchWindowController::max_requests> epoch_{};  // per slot: requests started
+    std::uint64_t planned_key_ = 0;  // the step's decoding requests (slot, epoch)
+    // per request set (key; 8 entries, least recently used replaced): its plain wall estimate and its last sample (a
+    // pair needs the same requests in steps at most 2 apart: two interleaved groups still pair, a stale sample does not)
+    struct CostGroup {
+        std::uint64_t key = 0, used = 0, prev_step = 0;
+        std::uint32_t n = 0, base_n = 0, prev_x = 0;
+        double base = 0.0, prev_wall = 0.0;
+        bool prev_ok = false;
+    };
+    std::array<CostGroup, 8> groups_{};
+    std::uint64_t steps_ = 0;  // finish() calls (every step)
+    // the most recently used group with n requests (nullptr: none); plain[n] and stage 1 read it
+    [[nodiscard]] const CostGroup* cost_group(std::uint32_t n) const noexcept;
+    // the row slope: decayed sums of dx * dy and dx^2 over the pairs (a least-squares slope through the origin, so a pair
+    // whose rows differ more weighs more), seeded with the controller's default as 4 pseudo-pairs of dx = 1
+    double pair_xy_ = 0.0, pair_xx_ = 0.0;
+    std::uint32_t pairs_ = 0;
+    // the per-step cost outside the step wall that every plan pays alike: the loop's time between a decode step's
+    // finish and the next plan (control exchange, publishing, admission) plus plan() without its drafts. A sample is
+    // dropped (not clipped) when larger than 3x the estimate (before 4 samples: larger than the step's own wall): a
+    // prefill or an idle period between steps is not a per-step cost; after 8 drops in a row samples count again. Added
+    // to every plain[n] so the controller prices extra rows against the whole step cycle.
+    double overhead_ = 0.0;
+    std::uint32_t overhead_n_ = 0, overhead_drops_ = 0;  // drops in a row: after 8 the regime changed, samples count again
+    // the price-independent probe: every 32 decode plans one is due; the next drafted plan whose windows are all one row
+    // verifies one extra row of a drafted request (exact verify; a pair with dx != 0 whatever the current price)
+    std::uint64_t probe_plans_ = 0;
+    bool probe_due_ = false, planned_probe_ = false;
+    double base1_last_ = 0.0;  // the last 1-request base (the prior's seed survives the LRU)
+    std::array<bool, ds41::dspark::BatchWindowController::max_requests + 1U> measured_n_{};  // stage 1: a sampled step of n ran
+    double planned_gap_ = -1.0, planned_overhead_ = 0.0;  // the current plan's gap before it (-1: none) and plan time without drafts
+    bool last_finish_ok_ = false;  // the last finish() was a decode-step sample and no request started since: the gap counts
+    std::chrono::steady_clock::time_point last_finish_end_{};
     std::vector<std::uint32_t> pending_commits_;  // world 2: slot << 16 | kept, for the next draft round
     // world 2, rank 1: what it knows of each slot (prompt, position) to stage the kept rows of its own requests
     std::vector<std::vector<std::uint32_t>> prompts_;

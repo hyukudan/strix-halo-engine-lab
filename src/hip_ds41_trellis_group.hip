@@ -4,9 +4,11 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -18,8 +20,10 @@
 namespace strix::ds41 {
 
 int trellis_oa_group_mode() {
+    // default 1 (=0 off): same bits as the per-group calls; with a grouped library GEMV it is one dispatch per layer
     const char* e = std::getenv("STRIX_DS41_TRELLIS_OA_GROUP");
-    if (e == nullptr || *e == 0 || std::strcmp(e, "0") == 0) return 0;
+    if (e == nullptr || *e == 0) return 1;
+    if (std::strcmp(e, "0") == 0) return 0;
     if (std::strcmp(e, "1") == 0) return 1;
     if (std::strcmp(e, "2") == 0) return 2;
     throw std::invalid_argument(std::string("STRIX_DS41_TRELLIS_OA_GROUP must be 0, 1 or 2, got ") + e);
@@ -156,8 +160,16 @@ struct TrellisGroupRunner::Impl {
         }
     }
 #if defined(STRIX_TRELLIS_HAS_GROUPED_GEMV)
-    // the library's grouped strided GEMV (a requested library extension): rows of every group in one submission, each row
-    // the bits of strix_gemv R1 of that row alone; chunks of up to 8 rows, no padding, no staging
+    // the library's grouped strided GEMV plans: rows of every group in one dispatch, each row the bits of strix_gemv R1 of
+    // that row alone; chunks of up to 8 rows, no padding, no staging. A plan freezes the weights, x / y, rows and stream;
+    // plans are cached per (layer weights, x, y, rows) and share grouped_ws serially on the runner's stream.
+    struct GroupKey {
+        std::uintptr_t w0, x, y;
+        std::size_t xs, ys;
+        std::uint32_t rows;
+        auto operator<=>(const GroupKey&) const = default;
+    };
+    mutable std::map<GroupKey, strix_grouped_gemv_plan> group_plans;
     strix_status grouped(const std::vector<const TrellisSite*>& sites, const float* x, std::size_t x_stride, float* y,
                          std::size_t y_stride, std::uint32_t rows, bool query, std::uint64_t* bytes) const {
         std::vector<strix_weights> w(sites.size());
@@ -186,10 +198,25 @@ struct TrellisGroupRunner::Impl {
                 *bytes = std::max(*bytes, b);
                 continue;
             }
-            d.workspace = grouped_ws;
-            d.workspace_bytes = grouped_bytes;
-            const auto st = lib_stream(stream);
-            const auto s = strix_grouped_gemv(context, &d, &st);
+            const GroupKey key{reinterpret_cast<std::uintptr_t>(w[0]), reinterpret_cast<std::uintptr_t>(d.input),
+                               reinterpret_cast<std::uintptr_t>(d.output), x_stride, y_stride, n};
+            auto it = group_plans.find(key);
+            if (it == group_plans.end()) {
+                hipStreamCaptureStatus capture{};
+                check(hipStreamIsCapturing(stream, &capture), "grouped plan capture check");
+                if (capture != hipStreamCaptureStatusNone)
+                    throw std::logic_error("ds41 trellis group: warm this grouped o_a plan before capture: " + sites[0]->key);
+                const auto created = std::chrono::steady_clock::now();
+                d.workspace = grouped_ws;
+                d.workspace_bytes = grouped_bytes;
+                const auto st = lib_stream(stream);
+                strix_grouped_gemv_plan plan = nullptr;
+                const auto s = strix_grouped_gemv_plan_create(context, &d, &st, &plan);
+                if (s != STRIX_SUCCESS) return s;
+                it = group_plans.emplace(key, plan).first;
+                note_trellis_plan_created(std::chrono::duration<double>(std::chrono::steady_clock::now() - created).count());
+            }
+            const auto s = strix_grouped_gemv_plan_submit(it->second);
             if (s != STRIX_SUCCESS) return s;
         }
         return STRIX_SUCCESS;
@@ -240,7 +267,7 @@ TrellisGroupRunner::TrellisGroupRunner(const std::vector<const TrellisSite*>& si
         m.why_not_grouped = "STRIX_DS41_TRELLIS_OA_GROUP_LIB=0";
     } else {
         // feature check: the query must accept the shape at R = 1..8, then the grouped rows must equal the staged rows
-        // bitwise (the identity) at every R = 1..8 on these sites with a deterministic input
+        // bitwise (the identity) at every R = 1..8 and again at R = 8..1 on these sites with a deterministic input
         std::uint64_t bytes = 0;
         const std::size_t xw = std::size_t{m.groups} * m.I, yw = std::size_t{m.groups} * m.N;
         const auto q = m.grouped(sites, reinterpret_cast<const float*>(std::uintptr_t{1} << 40U), xw, reinterpret_cast<float*>(std::uintptr_t{1} << 41U),
@@ -263,7 +290,9 @@ TrellisGroupRunner::TrellisGroupRunner(const std::vector<const TrellisSite*>& si
             check(hipMemcpyAsync(dx, hx.data(), hx.size() * 4U, hipMemcpyHostToDevice, m.stream), "self-check upload");
             bool same = true;
             std::uint32_t bad_r = 0;
-            for (std::uint32_t r = 1; r <= 8U && same; ++r) {
+            // two passes: the second reuses the plans of the first after every other row count ran on the workspace
+            for (std::uint32_t pass = 0; pass < 16U && same; ++pass) {
+                const std::uint32_t r = pass < 8U ? pass + 1U : 16U - pass;
                 check(hipMemsetAsync(ya, 0xff, 8U * yw * 4U, m.stream), "self-check clear");
                 check(hipMemsetAsync(yb, 0xfe, 8U * yw * 4U, m.stream), "self-check clear");
                 m.staged(sites, dx, xw, ya, yw, r);
@@ -290,6 +319,8 @@ TrellisGroupRunner::TrellisGroupRunner(const std::vector<const TrellisSite*>& si
             } else if (bad_r != 0U) {
                 m.why_not_grouped = "grouped GEMV rows differ from the staged path at R" + std::to_string(bad_r);
             }
+            for (const auto& [key, plan] : m.group_plans) (void)strix_grouped_gemv_plan_destroy(plan);
+            m.group_plans.clear();  // self-check plans point at the self-check buffers
             if (!m.grouped_lib) {
                 (void)hipFree(m.grouped_ws);
                 m.grouped_ws = nullptr;
@@ -308,6 +339,10 @@ TrellisGroupRunner::~TrellisGroupRunner() {
         m.owner->release_plans(p);
         (void)hipFree(p);
     }
+#if defined(STRIX_TRELLIS_HAS_GROUPED_GEMV)
+    for (const auto& [key, plan] : m.group_plans) (void)strix_grouped_gemv_plan_destroy(plan);
+    m.group_plans.clear();
+#endif
     (void)hipFree(m.xs);
     (void)hipFree(m.ys);
     (void)hipFree(m.grouped_ws);

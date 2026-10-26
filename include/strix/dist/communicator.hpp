@@ -4,7 +4,7 @@
 // Two-rank communicator for the distributed runtime: whole-message transports between two ranks and a
 // device-buffer exchange on top of them.
 //
-// Wire format: a message is its payload followed by a 64-byte trailer, so the trailer is the last
+// Wire format: a message is its payload followed by a 128-byte trailer, so the trailer is the last
 // thing to arrive; its sequence number tells a receiver (or, later, a device poll on the receive window)
 // that the payload before it is complete, and a mismatch in epoch, plan, rank, tag, sequence, size or
 // CRC-32C fails the exchange. Message sizes always come from data both ranks already share (routes, rows,
@@ -47,11 +47,19 @@ struct Trailer {
     std::uint32_t layer = 0;
     std::uint32_t crc32c = 0;
     std::uint64_t staged_ns = 0; // sender's wall clock when the payload was staged (for clock-aligned traces)
-    std::uint64_t reserved[7] = {};
+    // STRIX_DIST_CRC_DEFER=1: the CRC of the sender's previous message when that one went with crc32c = 0
+    // (flags & trailer_crc_deferred); carried_sequence is its sequence + 1, 0 when nothing is carried.
+    std::uint64_t carried_sequence = 0;
+    std::uint32_t carried_crc32c = 0;
+    std::uint32_t flags = 0;
+    std::uint64_t reserved[5] = {};
 };
 static_assert(sizeof(Trailer) == 128);
+inline constexpr std::uint32_t trailer_crc_deferred = 1U; // this message's CRC travels in the next trailer
 
-// CRC-32C (Castagnoli) of the payload; the SSE4.2 instruction when the CPU has it.
+// CRC-32C (Castagnoli) of the payload; SSE4.2 when available. STRIX_DIST_CRC_PARALLEL=1
+// selects vector folding when supported, otherwise three independent chains on
+// large inputs; both preserve the identical 32 bits.
 [[nodiscard]] std::uint32_t crc32c(std::span<const std::byte> bytes) noexcept;
 
 // Moves whole messages (payload + trailer) between the two ranks, in order. Payloads are host memory.
@@ -66,6 +74,12 @@ public:
     // Sends `out` and receives `in` at the same time (both ranks call it with their own message); the
     // backends do it with persistent progress threads, never one thread per call.
     virtual void exchange(std::span<const std::byte> out, std::span<std::byte> in) = 0;
+    // The same exchange; on_wire(context) runs exactly once on the calling thread, while the bytes move when the
+    // backend can (USB4 host: once every write is handed to the streams), else after the exchange. It may read `out`.
+    virtual void exchange_overlapped(std::span<const std::byte> out, std::span<std::byte> in, void (*on_wire)(void*), void* context) {
+        exchange(out, in);
+        on_wire(context);
+    }
     [[nodiscard]] virtual std::string name() const = 0;
     // Stops the transport for good and closes its channel, so the peer's pending reads end at once (the peer sees
     // the close) instead of at its own deadline. Called by the communicator when a local wait expires.
@@ -108,7 +122,9 @@ public:
 //      grouped, and each cable's throughput is measured with a short exchange on all its streams.
 //   4. Rank 0 sends the plan (stream order and integer striping weights, proportional to the measured
 //      cable throughput and shared equally among the cable's streams); rank 1 checks it against its own
-//      pairing and echoes it.
+//      pairing and echoes it. Rank 0's environment can replace the weights (STRIX_DIST_USB4_WEIGHTS=W0,W1,...),
+//      re-measure them with every cable at once (STRIX_DIST_USB4_CALIBRATE=joint, two rounds) and set the
+//      streams per message size (STRIX_DIST_USB4_STREAMS=UP_TO:N,...); the plan carries all of it to rank 1.
 // The detected topology is returned in `topology` (and its receipt() is the log line).
 struct Usb4AutoOptions {
     std::uint32_t rank = 0;
@@ -225,6 +241,12 @@ public:
     // before sending; the copy into `remote` is enqueued on `stream` (later work on the stream sees it),
     // and the CPU waits for that copy before the receive buffer is used again by the next exchange. Both
     // ranks pass the same size and tag.
+    // STRIX_DIST_HOST_CHUNK_BYTES=N (default 0) pipelines full-host messages above N
+    // on separate copy streams, with an independently checked trailer per chunk.
+    // Both ranks must use the same N; direct/mixed routes and staged exchanges keep
+    // their existing protocol. No consumer work is released after a failed chunk.
+    // STRIX_DIST_HOST_CRC_OVERLAP=1 additionally prepares TX CRCs and validates RX
+    // chunks on persistent workers while the progress thread moves other chunks.
     void exchange(hipStream_t stream, const void* local, void* remote, std::size_t bytes, const Tag& tag);
     // The same exchange in two halves, so that work enqueued in between overlaps the transfer. start()
     // enqueues the copy of `local` on `stream` and returns; the progress thread waits on the CPU for that
@@ -296,6 +318,15 @@ private:
     hipStream_t staged_stream_ = nullptr;
     bool staged_exposed_ = false, staged_prepared_ = false, staged_started_ = false, staged_receive_held_ = false;
     void wait_staged_flag(StagedReady* flag, std::uint64_t token, std::chrono::steady_clock::time_point deadline);
+    // STRIX_DIST_CRC_DEFER (default on, =0 off; both ranks the same), ready-view exchanges only: the TX CRC is computed while
+    // the message is on the wire and travels in the NEXT trailer; finish_staged_ready() returns once the trailer's identity
+    // is checked, and the progress thread then computes the RX CRC, checked against the peer's next trailer. Every
+    // exchange (deferred or not) carries and checks the previous deferred CRC, so a step that ends with an ordinary
+    // exchange (the argmax / logits) has every payload checked before its result is returned; a mismatch fails it.
+    bool crc_defer_ = false, deferring_ = false, tail_pending_ = false;
+    std::uint64_t tx_carry_sequence_ = 0, rx_pending_sequence_ = 0; // sequence + 1; progress thread only
+    std::uint32_t tx_carry_crc_ = 0, rx_pending_crc_ = 0;
+    void drain_tail(); // waits for the previous job's deferred CRC work (it reads the staged buffers)
     std::uint64_t sequence_ = 0;
     hipEvent_t receive_done_ = nullptr;
     hipEvent_t send_ready_ = nullptr;
@@ -320,7 +351,7 @@ private:
     } pending_;
     bool trace_pending_ = false;
     void flush_trace();
-    void validate_peer(); // the peer's trailer and CRC of the received message
+    void validate_peer(bool deferred = false); // the peer's trailer and CRC of the received message (deferred: identity only)
     // Bounded waits (STRIX_DIST_WAIT_TIMEOUT_MS, default 120000): the producer's copy, the reuse of the receive buffer,
     // and the progress job. On expiry (or any failed host exchange) the communicator stops for good, prints its state
     // (the collective in flight and its phase, the last collectives, the streams' progress) to stderr and closes the
@@ -350,6 +381,11 @@ private:
     static bool check_on_caller();
     class Progress;
     std::unique_ptr<Progress> progress_;
+    class Pipeline;
+    std::unique_ptr<Pipeline> pipeline_;
+    bool pipeline_started_ = false;
+    void start_pipeline(hipStream_t stream, const void* local, std::size_t bytes);
+    void finish_pipeline(hipStream_t stream, void* remote);
     std::unique_ptr<DeviceExchange> direct_;
     bool direct_started_ = false;
     std::vector<Route> routes_;

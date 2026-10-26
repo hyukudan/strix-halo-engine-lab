@@ -2,6 +2,7 @@
 #include "strix/deepseek41_batch_forward.hpp"
 #include "strix/deepseek41_prefill.hpp"
 #include "strix/deepseek41_prefix_cache.hpp"
+#include "strix/ds41_expert_tp.hpp"
 #include "strix/dist/communicator.hpp"
 
 #include <algorithm>
@@ -32,6 +33,7 @@
 //   strix-deepseek41-prefix MODEL.gguf --prompt FILE (comma-separated ids) [--rows N] [--layers L]
 //       [--world 1 [--stream-experts] | --transport emulate | --rank R --transport usb4-auto]
 //       [--block 256] [--max-rows 4096] [--cache-mb 0] [--warm W1,W2,...] [--decode G] [--repeat-hit K] [--before-tail]
+//       [--inrun [--inrun-check]]
 //       [--cache-dir DIR [--disk-mb 0] [--phase all|write|read|fresh] [--no-fresh] [--fork F] [--rewind R]
 //        [--corrupt block|snapshot] [--session G]]
 //
@@ -52,6 +54,9 @@
 // --corrupt block|snapshot damaged one file; disk hit, a warm hit from disk and a RAM hit against the reference file,
 // decode against its tokens), "fresh" (only the fresh prefill, against the reference file). --no-fresh: the miss is the
 // reference (long prompts: one prefill per turn).
+// --inrun: the cache's snapshots inside the prefill runs (plan_prefill_runs, DevicePrefill::set_snapshot_points /
+// export_state_at), as the serve's --prefix-inrun-snapshots; --inrun-check also compares every in-run snapshot's state
+// with a fresh prefill of exactly its tokens (a run ending there), bitwise.
 namespace {
 
 namespace ds = strix::deepseek41;
@@ -62,7 +67,7 @@ struct Args {
     std::string cache_dir, phase = "all", corrupt;
     std::uint64_t disk_mb = 0;
     std::uint32_t fork = 0, rewind = 0, session = 0;
-    bool before_tail = false, no_fresh = false;
+    bool before_tail = false, no_fresh = false, inrun = false, inrun_check = false;
     std::uint32_t rank = 0, world = 1, layers = 40, rows = 0, block = 256, max_rows = 4096, decode = 0, repeat_hit = 1;
     std::uint64_t cache_mb = 0;
     unsigned connect_timeout = 60;
@@ -145,6 +150,7 @@ public:
         o.stream_experts = a.stream_experts;
         min_rows_ = comm ? o.window_rows + 1U : 1U;
         if (batch_ && a.shared) o.shared_weights = batch_->file_form_weights();
+        o.expert_tp = batch_ ? batch_->expert_tp() : false;  // the batch forward's expert identity, read in place (as the serve)
         const auto t0 = Clock::now();
         prefill_ = std::make_unique<ds::DevicePrefill>(a.model, o);
         if (print_)
@@ -233,13 +239,34 @@ public:
         } else {
             o.lookup_seconds = since(t0);
         }
-        o.pieces = ds::plan_prefill_pieces(hit.resume, hit.shared, N, a_.block, a_.max_rows, min_rows_, a_.before_tail);
+        std::vector<std::uint32_t> points;
+        if (a_.inrun) {
+            auto plan = ds::plan_prefill_runs(hit.resume, hit.shared, N, a_.block, a_.max_rows, min_rows_, a_.before_tail);
+            o.pieces = std::move(plan.ends);
+            points = std::move(plan.points);
+        } else {
+            o.pieces = ds::plan_prefill_pieces(hit.resume, hit.shared, N, a_.block, a_.max_rows, min_rows_, a_.before_tail);
+        }
         ds::PrefillResult r;
         std::uint32_t at = hit.resume;
         for (const auto end : o.pieces) {
             const std::span<const std::uint32_t> piece(prompt.data() + at, end - at);
+            std::vector<std::uint32_t> inside;
+            for (const auto p : points)
+                if (p > at && p < end) inside.push_back(p);
+            if (a_.inrun) prefill_->set_snapshot_points(inside);
             r = at == 0U ? prefill_->run(piece) : prefill_->extend(piece);
             at = end;
+            for (const auto p : inside) {
+                const auto t1 = Clock::now();
+                auto s = prefill_->export_state_at(p);
+                s.tokens.assign(prompt.begin(), prompt.begin() + p);
+                s.next_token = ds::kPrefixUnknownNextToken;
+                (void)cache_->insert(s, 0U);
+                o.export_seconds += since(t1);
+                if (a_.inrun_check && std::none_of(inrun_.begin(), inrun_.end(), [&](const auto& x) { return x.tokens == s.tokens; }))
+                    inrun_.push_back(std::move(s));
+            }
             if (end % a_.block == 0U) {
                 const auto t1 = Clock::now();
                 auto s = prefill_->export_state();
@@ -312,6 +339,8 @@ public:
     }
 
     ds::PrefixCache& cache() { return *cache_; }
+    // --inrun-check: the in-run snapshots taken so far (one per distinct token prefix)
+    [[nodiscard]] const std::vector<ds::AttentionState>& inrun_states() const { return inrun_; }
     [[nodiscard]] bool has_batch() const { return batch_ != nullptr; }
 
 private:
@@ -329,6 +358,7 @@ private:
     std::unique_ptr<ds::BatchForward> batch_;
     std::unique_ptr<ds::DevicePrefill> prefill_;
     std::unique_ptr<ds::PrefixCache> cache_;
+    std::vector<ds::AttentionState> inrun_;
 };
 
 std::string list(const std::vector<std::uint32_t>& v) {
@@ -399,6 +429,21 @@ int run(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint32_t r
         std::printf("  cache after the first prompt (%ld tokens): %llu B in %llu blocks + %llu snapshots = %.0f B per cached token\n", W,
                     static_cast<unsigned long long>(st.bytes), static_cast<unsigned long long>(st.blocks), static_cast<unsigned long long>(st.snapshots),
                     static_cast<double>(st.bytes) / static_cast<double>(W / a.block * a.block));
+    }
+    // every in-run snapshot against a fresh prefill of its tokens (the state a run ending there exports)
+    for (const auto& s : std::vector<ds::AttentionState>(g.inrun_states())) {
+        const auto f = g.fresh(s.tokens);
+        auto x = s, y = f.state;
+        x.next_token = y.next_token = 0;  // the in-run snapshot does not know it
+        Outcome ox, oy;
+        ox.digest = x.digest(true);
+        ox.hashes = x.hashes();
+        oy.digest = y.digest(true);
+        oy.hashes = y.hashes();
+        ox.next_token = oy.next_token;
+        ox.logits = oy.logits;
+        ox.resume = s.position;
+        bad += compare(rank, "inrun" + std::to_string(s.position), oy, ox);
     }
     if (a.decode != 0U && g.has_batch()) {
         double import_seconds = 0.0;
@@ -687,6 +732,8 @@ int main(int argc, char** argv) try {
         else if (s == "--repeat-hit") a.repeat_hit = std::max<std::uint32_t>(1U, u32());
         else if (s == "--no-shared-weights") a.shared = false;
         else if (s == "--before-tail") a.before_tail = true;
+        else if (s == "--inrun") a.inrun = true;
+        else if (s == "--inrun-check") a.inrun = a.inrun_check = true;
         else if (s == "--cache-dir") a.cache_dir = next();
         else if (s == "--disk-mb") a.disk_mb = std::stoull(next());
         else if (s == "--phase") a.phase = next();
@@ -703,6 +750,10 @@ int main(int argc, char** argv) try {
     if (a.phase != "all" && a.phase != "write" && a.phase != "read" && a.phase != "fresh") throw std::invalid_argument("--phase all|write|read|fresh");
     if (a.session != 0U && a.decode == 0U) throw std::invalid_argument("--session needs --decode (the batch forward)");
     if (a.stream_experts && a.decode != 0U) throw std::invalid_argument("--decode needs the experts resident (not --stream-experts)");
+    // The expert layout as the serve sets it: expert TP only when STRIX_DS41_EXPERT_TP=1, then the dup layout the TP
+    // prefill reads in place (else the two-rank default would load expert TP and the prefill a second expert copy).
+    strix::ds41::expert_tp::set_decode_default(false);
+    if (strix::ds41::expert_tp::enabled_from_env()) strix::ds41::expert_tp::set_packed(0);
     const auto prompt = read_prompt(a.prompt_path, a.rows);
     std::printf("prompt %zu tokens, block %u, max rows %u, layers %u\n", prompt.size(), a.block, a.max_rows, a.layers);
     if (a.world == 1U) return run(a, prompt, 0U, nullptr, true) == 0 ? 0 : 1;
@@ -734,6 +785,8 @@ int main(int argc, char** argv) try {
     auto transport = open_transport(a.transport, a.rank, a.connect_timeout);
     ::alarm(0);
     strix::dist::Communicator comm(strix::dist::Group{a.rank, 2U, 1U, 0x70726678ULL}, std::move(transport), std::size_t{22} << 20U);
+    std::printf("connected (rank %u of 2)\n", a.rank);  // the pair launchers' watchdog waits for this line
+    std::fflush(stdout);
     return run(a, prompt, a.rank, &comm, true) == 0 ? 0 : 1;
 } catch (const std::exception& e) {
     std::cerr << "error: " << e.what() << '\n';

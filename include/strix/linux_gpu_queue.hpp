@@ -19,6 +19,10 @@ struct GpuQueueIo {
     std::function<void()> require_current;
     // Optional until GROUP_RESET is used. Never accept an unowned numeric FD.
     std::function<int()> native_descriptor{};
+    // Optional: the same ioctl on the privately owned FD without the per-call
+    // fstat/fcntl identity checks (the route preflight still runs). Required by
+    // GpuQueueExpected::lean, which uses it between session transitions only.
+    std::function<GpuQueueSyscall(unsigned long, void*)> ioctl_owned{};
 };
 // Opens one nonblocking, close-on-exec character-device FD. The preflight must
 // verify the deliberately provisioned gpu_direct route/module before opening.
@@ -40,6 +44,12 @@ struct GpuQueueExpected {
     std::array<std::uint8_t, 16> local{}, peer{};
     std::uint32_t ring_frames = 0, depth = 0;
     GpuQueueTerminal terminal = GpuQueueTerminal::application;
+    // Lean hot path: FD and pool identity are validated on session transitions
+    // (open, QUERY/QUEUE, IMPORT, ARM, STATS, STOP, RELEASE, RECOVER, group
+    // reset), not around every PREPARE/SUBMIT/EVENT/RETIRE; EVENT is skipped
+    // while no submitted operation is incomplete. Operation identity, fences and
+    // every EVENT field are checked exactly as before.
+    bool lean = false;
 };
 // EVENT reported SGU_FRAME_ERROR_TERMINAL: the peer's kernel-built terminal did
 // not match this operation (epoch, sequence, size, frame count or slot), or a

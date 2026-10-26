@@ -66,6 +66,9 @@ struct Args {
                   split_min_rows = strix::deepseek41::PrefillOptions{}.split_min_rows,
                   joint_max_rows = strix::deepseek41::PrefillOptions{}.joint_max_rows;
     unsigned connect_timeout = 60;
+    bool select_ab = false;  // --select-ab: run k with the exact dense selector off (k even) / on (k odd), one load
+    std::uint32_t extend_check = 0;  // --extend-check S: after the runs, run() + extend() in S-row pieces == the whole run
+    std::string select_pattern;  // --select-pattern OSSO...: run k off ('O') / on ('S') by the k-th letter (cyclic)
     bool timing = false, reference = false, cone = true, loads = false, tp = true, stream_experts = false, row_split = true, decode_reference = false,
          state_timing = false;
     bool ttft = false;  // --ttft-timing
@@ -682,6 +685,11 @@ void run_rank(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint
         for (std::uint32_t k = 0; k < a.repeat; ++k) {
             barrier(comm, k);  // the run's time does not include the peer still loading its weights
             const auto before = comm.stats();
+            if (a.select_ab) {
+                const bool on = a.select_pattern.empty() ? k % 2U == 1U : a.select_pattern[k % a.select_pattern.size()] == 'S';
+                pre.set_dense_select(on);
+                if (print) std::printf("arm %s (run %u)\n", on ? "SEL" : "OFF", k);
+            }
             r = pre.run(prompt);
             if (print) {
                 print_result(rank == 0U ? "rank 0 prefill" : "rank 1 prefill", r, prompt.size(), a.timing, rank == 0U ? a.loads_out : std::string{});
@@ -703,6 +711,24 @@ void run_rank(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint
             for (const auto& [name, h] : exported.hashes()) digest = (digest ^ h) * 1099511628211ULL;
             std::printf("  export_state: %.2f ms, %.2f MB, state digest %016llx\n", ms, static_cast<double>(bytes) / 1e6,
                         static_cast<unsigned long long>(digest));
+        }
+        if (a.extend_check != 0U) {
+            // the prompt again as run() of its first piece + extend() of the rest: last-row logits and every state hash
+            // must equal the last whole run's (with --select-ab / --select-pattern: the selector on)
+            const auto whole_hashes = pre.state_hashes();
+            const auto whole_logits = fnv(r.logits);
+            if (a.select_ab) pre.set_dense_select(true);
+            barrier(comm, a.repeat);
+            strix::deepseek41::PrefillResult e;
+            for (std::size_t p0 = 0; p0 < prompt.size(); p0 += a.extend_check) {
+                const std::span<const std::uint32_t> part(prompt.data() + p0, std::min<std::size_t>(a.extend_check, prompt.size() - p0));
+                e = p0 == 0U ? pre.run(part) : pre.extend(part);
+            }
+            const bool same = fnv(e.logits) == whole_logits && pre.state_hashes() == whole_hashes;
+            if (print)
+                std::printf("extend check (%u-row pieces): %s; logits %016llx vs whole %016llx\n", a.extend_check, same ? "bitwise EQUAL" : "MISMATCH",
+                            static_cast<unsigned long long>(fnv(e.logits)), static_cast<unsigned long long>(whole_logits));
+            if (!same) task_failed = true;
         }
         if (decode_reference || out_state != nullptr) state = pre.state_hashes();
         if (!a.task_levels.empty()) {
@@ -781,6 +807,9 @@ int main(int argc, char** argv) try {
         else if (s == "--repeat") a.repeat = static_cast<std::uint32_t>(std::stoul(next()));
         else if (s == "--timing") a.timing = true;
         else if (s == "--reference") a.reference = true;
+        else if (s == "--select-ab") a.select_ab = true;
+        else if (s == "--extend-check") a.extend_check = static_cast<std::uint32_t>(std::stoul(next()));
+        else if (s == "--select-pattern") a.select_ab = true, a.select_pattern = next();
         else if (s == "--decode-reference") a.reference = a.decode_reference = true;  // emulate: also the two-rank decode
         else if (s == "--no-cone") a.cone = false;
         else if (s == "--state-timing") a.state_timing = true;
