@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -100,7 +102,8 @@ double WindowController::window_rate(std::uint32_t drafts, const std::array<doub
 
 bool WindowController::draft_next() {
     explore_ = false;
-    const bool exploring = ++decisions_ % explore_every == 0U;
+    ++decisions_;
+    const bool exploring = explore_every_ != 0U && decisions_ % explore_every_ == 0U;
     if (sweep_ < block_size) return true;  // the initial sweep drafts
     std::array<double, block_size> p{};
     for (std::uint32_t j = 0; j < block_size; ++j) p[j] = pooled(j);
@@ -321,6 +324,89 @@ void BatchWindowController::observe(std::uint32_t slot, const Draft& d, std::uin
         ++slot_seen_.at(slot)[j];
         if (j < accepted) ++hits_[j][b], ++slot_hits_.at(slot)[j];
     }
+}
+
+WindowController::Table WindowController::table() const {
+    Table t;
+    t.seen = seen_;
+    t.hits = hits_;
+    return t;
+}
+
+void WindowController::set_table(const Table& table) {
+    for (std::uint32_t j = 0; j < block_size; ++j)
+        for (std::uint32_t b = 0; b < bins; ++b)
+            if (table.hits[j][b] > table.seen[j][b]) throw std::invalid_argument("survival table: hits above seen");
+    seen_ = table.seen;
+    hits_ = table.hits;
+}
+
+namespace {
+WindowController::Table parse_survival_table(std::istream& in, const std::string& path, std::uint32_t cap);
+// Node probe prior (6 lines), the adopted default warm start
+constexpr const char* kBuiltinSurvival = "ds41-dspark-survival-v1 bins 8\n"
+    "d1 22 343 1008 1069 760 840 930 893 0 80 411 647 624 815 925 892\n"
+    "d2 41 431 921 819 557 577 600 431 8 101 393 513 479 558 599 431\n"
+    "d3 45 348 637 562 390 404 438 248 6 95 291 381 332 390 437 248\n"
+    "d4 25 270 392 362 296 325 366 136 4 72 169 245 248 315 365 136\n"
+    "d5 21 161 238 269 237 298 261 62 4 53 114 184 197 289 260 62\n";
+}  // namespace
+
+WindowController::Table builtin_survival_table(std::uint32_t cap) {
+    std::istringstream in(kBuiltinSurvival);
+    return parse_survival_table(in, "<builtin node prior>", cap);
+}
+
+WindowController::Table read_survival_table(const std::string& path, std::uint32_t cap) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("survival table: cannot read " + path);
+    return parse_survival_table(in, path, cap);
+}
+
+namespace {
+WindowController::Table parse_survival_table(std::istream& in, const std::string& path, std::uint32_t cap) {
+    std::string magic, word;
+    std::uint32_t nbins = 0;
+    if (!(in >> magic >> word >> nbins) || magic != "ds41-dspark-survival-v1" || word != "bins" || nbins != WindowController::bins)
+        throw std::runtime_error("survival table: bad header in " + path);
+    WindowController::Table t;
+    for (std::uint32_t j = 0; j < block_size; ++j) {
+        if (!(in >> word) || word != "d" + std::to_string(j + 1U)) throw std::runtime_error("survival table: bad depth line in " + path);
+        for (auto& v : t.seen[j])
+            if (!(in >> v)) throw std::runtime_error("survival table: short seen counts in " + path);
+        for (auto& v : t.hits[j])
+            if (!(in >> v)) throw std::runtime_error("survival table: short hit counts in " + path);
+        std::uint64_t total = 0;
+        for (std::uint32_t b = 0; b < WindowController::bins; ++b) {
+            if (t.hits[j][b] > t.seen[j][b]) throw std::runtime_error("survival table: hits above seen in " + path);
+            total += t.seen[j][b];
+        }
+        if (cap > 0U && total > cap) {
+            const double f = static_cast<double>(cap) / static_cast<double>(total);
+            for (std::uint32_t b = 0; b < WindowController::bins; ++b) {
+                const auto s = static_cast<std::uint32_t>(std::lround(t.seen[j][b] * f));
+                const auto h = static_cast<std::uint32_t>(std::lround(t.hits[j][b] * f));
+                t.seen[j][b] = s;
+                t.hits[j][b] = std::min(h, s);
+            }
+        }
+    }
+    if (in >> word) throw std::runtime_error("survival table: trailing data in " + path);
+    return t;
+}
+}  // namespace
+
+void write_survival_table(const std::string& path, const WindowController::Table& table) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) throw std::runtime_error("survival table: cannot write " + path);
+    out << "ds41-dspark-survival-v1 bins " << WindowController::bins << '\n';
+    for (std::uint32_t j = 0; j < block_size; ++j) {
+        out << 'd' << j + 1U;
+        for (const auto v : table.seen[j]) out << ' ' << v;
+        for (const auto v : table.hits[j]) out << ' ' << v;
+        out << '\n';
+    }
+    if (!out) throw std::runtime_error("survival table: write failed " + path);
 }
 
 std::uint32_t WindowPolicy::choose(const Draft& d) const {

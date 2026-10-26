@@ -33,8 +33,17 @@ __device__ __forceinline__ float butterfly(float v) {
 template <class A, class B>
 __device__ __forceinline__ float lane_dot(A a, B b, std::uint32_t n, std::uint32_t lane) {
     float acc = 0.0F;
-#pragma unroll 16
-    for (std::uint32_t i = lane; i < n; i += 32U) acc = acc + a(i) * b(i);
+    std::uint32_t i = lane;
+    // steps of 8 class elements: the step's 16 loads are issued before its products (a loop that loads and adds one
+    // element at a time pays a full load latency per element); the products are added in the same ascending order
+    for (; i + 224U < n; i += 256U) {
+        float av[8], bv[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) { av[k] = a(i + 32U * k); bv[k] = b(i + 32U * k); }
+#pragma unroll
+        for (int k = 0; k < 8; ++k) acc = acc + av[k] * bv[k];
+    }
+    for (; i < n; i += 32U) acc = acc + a(i) * b(i);
     return butterfly(acc);
 }
 

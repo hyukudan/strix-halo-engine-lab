@@ -60,6 +60,19 @@ struct Q8A8View {
     float* out = nullptr;
     std::uint32_t out_stride = 0;          // 0 = count
     bool accumulate = false;
+    // tiled only: launched with programmatic stream serialization (sm_90+): the weight slab is prefetched into L2
+    // before waiting for the previous kernel; same bits
+    bool pdl = false;
+    // tiled, split 1, not accumulate: 2 = also the next K-half (k_offset + width, the activation columns shifted by
+    // width) in the same launch, out = y(half 0) + y(half 1): the bits of a second launch with accumulate
+    std::uint32_t k_halves = 1;
+    // tiled, split 1, not accumulate, first 0, count = hc_hidden: the epilogue also runs hc_expand with
+    // sub = out for its outputs (hc_out[r][k][i] from hc_residual[r][j][i] and hc_mixes[r][24]; hc_out == hc_residual
+    // allowed); the bits of enqueue_hc_expand after this launch
+    const float* hc_residual = nullptr;
+    const float* hc_mixes = nullptr;
+    float* hc_out = nullptr;
+    std::uint32_t hc_hidden = 0;
 };
 void enqueue_q8_0_a8(const Q8A8View& view, cudaStream_t stream);
 // The tensor-core form (view.tiled set): the integer dot of each group comes from mma.m16n8k32.s8; the FP32 terms,
@@ -109,6 +122,14 @@ void enqueue_hc_mixes(const HcMixView& view, cudaStream_t stream);
 // Two launches instead of three: chunk partials, then independent Sinkhorn and collapse/norm/A8 blocks.
 // norm.pre must refer to the PREVIOUS site's coefficients (never mix.mixes); matching stream/rows/hidden.
 void enqueue_hc_mixes_norm(const HcMixView& mix, const NormView& norm, cudaStream_t stream);
+// hc_mixes_norm as one cluster of norm parts per row on compute capability 9.0+ (same bits; default off)
+void set_hc_norm_cluster(bool on);
+// the PDL prologue of the tiled Q8 GEMV prefetches its weights into L2 (default) or only waits
+void set_q8_pdl_prefetch(bool on);
+// PDL prologue mode: 0 wait at entry, 1 L2 slab prefetch (default), 2 the first step's weights into registers
+void set_q8_pdl_mode(int mode);
+// hc chunk partials with 5 warps per block (5 x the blocks) or 25 (the default); same bits
+void set_hc_partial_warps(unsigned warps);
 
 // hc_expand: out[r][k][i] = post[k] * sub[r][i] + (sum over j ascending from 0 of comb[j][k] * residual[r][j][i]);
 // out == residual allowed (the stream updated in place).
@@ -155,6 +176,7 @@ struct SharedExpertView {
     float* out = nullptr;                // [row][hidden]
     std::uint32_t out_stride = 0;        // 0 = hidden
     void* workspace = nullptr;           // shared_expert_workspace_bytes(rows, inter)
+    bool pdl = false;                    // the tiled gate/up and down GEMVs launched as Q8A8View::pdl
 };
 [[nodiscard]] std::size_t shared_expert_workspace_bytes(std::uint32_t rows, std::uint32_t inter);
 void enqueue_shared_expert(const SharedExpertView& view, cudaStream_t stream);

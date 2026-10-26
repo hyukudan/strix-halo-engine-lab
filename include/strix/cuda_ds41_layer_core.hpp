@@ -87,6 +87,7 @@ public:
     void ffn_core(std::uint32_t layer, cudaStream_t s);     // router + shared expert
     void ffn_output(std::uint32_t layer, cudaStream_t s);   // reads buffers().y
     void head(cudaStream_t s);                             // logits + candidates
+    [[nodiscard]] Q8Tiled head_tiled() const noexcept { return has_head_ ? output_.view() : Q8Tiled{}; }  // output.weight, tiled
 
 private:
     void tap(const std::string& label, const float* p, std::uint32_t count, std::uint32_t stride = 0) const;

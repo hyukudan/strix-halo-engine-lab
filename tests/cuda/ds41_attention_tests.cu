@@ -1173,6 +1173,16 @@ int main() {
     try {
         const auto dev_info = strix::ds41::cuda::select_device(0);
         std::printf("device %s (sm_%d%d, %d SMs)\n", dev_info.name.c_str(), dev_info.major, dev_info.minor, dev_info.sms);
+        // STRIX_DS41_ATTN_CHUNK_WARPS=1|2|4: the decode attention block form (set_attention_chunk_warps), same bits
+        if (const char* e = std::getenv("STRIX_DS41_ATTN_CHUNK_WARPS")) {
+            ca::set_attention_chunk_warps(static_cast<unsigned>(std::atoi(e)));
+            std::printf("attention chunk warps %s\n", e);
+        }
+        // STRIX_DS41_ATTN_PREFETCH=1: with 4 chunk warps, every tile issued at once + the all-chunk combine, same bits
+        if (const char* e = std::getenv("STRIX_DS41_ATTN_PREFETCH"); e != nullptr && e[0] == '1') {
+            ca::set_attention_prefetch(true);
+            std::printf("attention prefetch on\n");
+        }
         if (const char* mode = std::getenv("STRIX_DS41_SELECT_LONG"); mode && mode[0] == '1') {
             if (dev_info.name.find("RTX PRO 6000") == std::string::npos) throw std::runtime_error("long selection test requires RTX PRO 6000");
             long_selection_cases();

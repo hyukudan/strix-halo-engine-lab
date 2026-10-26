@@ -173,6 +173,24 @@ void test_layer(c::TensorFile& f, std::uint32_t layer, bool timing, cudaStream_t
             same(label + "/" + site + "/norm", norm[1], norm[0], std::size_t{R} * H);
             same_a8(label + "/" + site + "/A8", xa[1], xa[0]);
             if (timing && R <= 8U) bench(label + "/" + site + "/hc_norm", s, [&] { run(0); }, [&] { run(1); }, flush);
+            // the clustered split/norm (arm 1 outputs poisoned first), against the same legacy outputs
+            c::set_hc_norm_cluster(true);
+            STRIX_CUDA_CHECK(cudaMemsetAsync(mix[1], 0xff, R * 24U * sizeof(float), s));
+            STRIX_CUDA_CHECK(cudaMemsetAsync(collapse[1], 0xff, std::size_t{R} * H * sizeof(float), s));
+            STRIX_CUDA_CHECK(cudaMemsetAsync(norm[1], 0xff, std::size_t{R} * H * sizeof(float), s));
+            STRIX_CUDA_CHECK(cudaMemsetAsync(xa[1].codes, 0x5a, std::size_t{R} * H, s));
+            STRIX_CUDA_CHECK(cudaMemsetAsync(xa[1].deltas, 0xff, std::size_t{R} * H / 32U * sizeof(float), s));
+            STRIX_CUDA_CHECK(cudaMemsetAsync(xa[1].sums, 0xff, std::size_t{R} * H / 32U * sizeof(std::int32_t), s));
+            run(1);
+            Graph cluster_graph(s, [&] { run(1); });
+            if (cluster_graph.nodes != 2U) throw std::runtime_error("HC cluster graph node count");
+            for (int replay = 0; replay < 8; ++replay) { legacy_graph.run(s); cluster_graph.run(s); }
+            same(label + "/" + site + "/cluster/mix", mix[1], mix[0], R * 24U);
+            same(label + "/" + site + "/cluster/collapse", collapse[1], collapse[0], std::size_t{R} * H);
+            same(label + "/" + site + "/cluster/norm", norm[1], norm[0], std::size_t{R} * H);
+            same_a8(label + "/" + site + "/cluster/A8", xa[1], xa[0]);
+            if (timing && R <= 8U) bench(label + "/" + site + "/hc_norm_cluster", s, [&] { run(0); }, [&] { run(1); }, flush);
+            c::set_hc_norm_cluster(false);
         }
         const auto post = [&](int arm) {
             c::enqueue_hc_expand({sub, 0U, stream, mix[0], R, H, expanded[arm], arm ? carry[arm] : nullptr}, s);

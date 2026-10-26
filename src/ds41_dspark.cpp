@@ -207,7 +207,7 @@ std::vector<float> block_attention(std::span<const float> q, std::uint32_t rows,
     require(q.size() == static_cast<std::size_t>(rows) * q_width && block_entries.size() == static_cast<std::size_t>(rows) * entry_bytes &&
                 sinks.size() == heads && ring.next == first,
             "block attention geometry");
-    const std::uint64_t oldest = first > window ? first - window : 0U;
+    const std::uint64_t oldest = std::max<std::uint64_t>(first > window ? first - window : 0U, ring.start);
     const auto ring_keys = static_cast<std::uint32_t>(first - oldest), keys = ring_keys + rows;
     std::vector<std::span<const std::uint8_t>> key(keys);
     for (std::uint32_t j = 0; j < ring_keys; ++j)

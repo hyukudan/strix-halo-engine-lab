@@ -15,6 +15,7 @@
 // is read once per chunk).
 #include "strix/cuda_ds41_attention.hpp"
 #include "strix/cuda_ds41_common.hpp"
+#include "strix/cuda_ds41_core.hpp"
 #include "strix/deepseek41_attention_state.hpp"
 
 #include <array>
@@ -79,6 +80,9 @@ struct CudaPrefillOptions {
     std::uint32_t chunk_rows = 1024;                // row-local chunk (q_b, attention windows, o_a / o_b, Engram)
     std::uint32_t moe_chunk_rows = 4096;            // routed-expert chunk
     std::uint32_t window_rows = 64;                 // attention call rows (<= attn::kMaxCallRows)
+    // An object that only imports a state and decodes (step): none of run()'s prefill buffers (sized by max_positions,
+    // chunk_rows, moe_chunk_rows) are allocated, the routed scratch is sized for decode_rows, and run() is refused.
+    bool decode_only = false;
     bool cone = true;                               // exact suffix replay (only with the full 40 layers)
     std::uint32_t draft_rows = 0;                   // drafter seed rows the cone also covers
     // Approximate bounded decoder replay: 0 (default) keeps the exact cone; 256 caps
@@ -107,6 +111,7 @@ struct CudaPrefillOptions {
     bool engram_direct = true;                      // unbuffered reads of the Engram rows / file-tier experts
     unsigned io_threads = 8;                        // expert file reads (8 MB pieces)
     unsigned engram_threads = 64;                   // Engram row reads (queue depth of the random 4 KiB reads)
+    std::uint32_t engram_cache_mb = 0;              // decode steps: Engram records kept in RAM by file offset (0 = off)
     std::uint32_t head_rows = 1;                     // logits of the last head_rows rows (quality gate: KL over positions)
     bool stream_hashes = false;                     // FNV of the last row's stream after each layer
     // Timing (events, no host synchronisation). timing: per-layer device times (begin, attention end, MoE begin, end)
@@ -155,6 +160,27 @@ struct CudaPrefillOptions {
     // Exact launch fusions of decode sites only (each default off).
     bool decode_fuse_hc = false;
     bool decode_fuse_shared = false;  // two-launch shared at R1; wider rows retain the legacy plan
+    // router of decode steps (and the predictor's route_other) as one launch with the weight rows streamed at full
+    // width and the selection in the last block (cuda_ds41_router_v2.hpp, same bits); rows 1..8
+    bool decode_router_v2 = false;
+    // dense Q8_0 GEMVs of decode steps launched with programmatic dependent launch, weight slab prefetched into L2
+    // before the dependency wait (sm_90+; same bits)
+    bool decode_pdl = false;
+    // o_b's two K-halves as one launch (Q8A8View::k_halves = 2; same bits as the write + accumulate pair)
+    bool decode_ob_one = false;
+    // with a moe_site hook, the shared expert on a side branch forked before the router and joined before the
+    // site's combine (CudaMoeSite::shared_join); same bits
+    bool decode_shared_fork = false;
+    // a layer's attention preparation (window write, compressor, indexer, selection) on a side branch forked
+    // after q_norm, concurrent with q_b; joined before the attention kernels; same bits
+    bool decode_attn_fork = false;
+    // the decode qa_kv GEMV (112 tiles) with the class split S = 1 instead of the automatic 2 (no
+    // scratch + reduce kernel; the split is documented bit-preserving); same bits
+    bool decode_qakv_s1 = false;
+    // with decode_ob_one, the attention site's hc_expand in o_b's epilogue (one launch fewer); same bits
+    bool decode_ob_expand = false;
+    // with a moe_site hook, the FFN site's hc_expand in the site's combine (CudaMoeSite::hc_*); same bits
+    bool decode_moe_expand = false;
     bool decode_graphs = true;
     std::uint32_t decode_graph_warmup = 1;
     std::uint32_t decode_bucket = 512;              // positions per graph bucket
@@ -274,6 +300,20 @@ struct CudaMoeSite {
     float* raw = nullptr;              // [rows * top_k][hidden] scratch for the raw expert vectors
     float* y = nullptr;                // [rows][hidden]: the site's output, y = (shared + low) + high
     std::function<void(cudaStream_t)> shared_expert;  // enqueues the shared expert into `shared`
+    // Non-null: the shared expert is already enqueued on a side branch (shared_expert is empty); the callee makes
+    // `stream` wait on this event before it reads `shared` (the combine), and the branch joins there.
+    cudaEvent_t shared_join = nullptr;
+    // Non-null hc_out (decode_moe_expand): the callee runs hc_expand (sub = y, residual / mixes / out / pre_carry as
+    // enqueue_hc_expand) in its combine, and the step skips its own; same bits.
+    const float* hc_residual = nullptr;
+    const float* hc_mixes = nullptr;
+    float* hc_out = nullptr;
+    float* hc_pre_carry = nullptr;
+    // The router's F32 input [rows][hidden] (the layer's normed MoE input) and a launcher of ANOTHER layer's router on
+    // it (that layer's weights / bias / bias_image, top_k <= 32, scores [rows][experts], ids / weights [rows][top_k]):
+    // routed-expert prefetchers predict the next layer's experts with it. Capturable; never touches ids / weights.
+    const float* x_f32 = nullptr;
+    std::function<void(std::uint32_t layer, std::uint32_t top_k, float* scores, std::uint32_t* ids, float* weights, cudaStream_t)> route_other;
 };
 
 struct CudaStepIo {
@@ -285,6 +325,9 @@ struct CudaStepIo {
     // moe_site only enqueues capturable device work that stays valid for later replays (it is called while the
     // step's segments are captured, not at replays): the step may then run as graphs like a resident step.
     bool moe_site_graphs = false;
+    // Captured graphs are keyed by this value too: a caller that changes what its moe_site enqueues (another callee,
+    // other options, other buffers) sets a new epoch so the step captures again instead of replaying the old graphs.
+    std::uint32_t moe_site_epoch = 0;
     // Input of layer first (required when first_layer > 0, else ignored): the residual stream rows x 4 x hidden FP32
     // after layer first - 1 and that layer's FFN hc mix rows x 24 (pre 4, post 4, comb 16; its pre collapses the next
     // attention input).
@@ -304,6 +347,17 @@ struct CudaStepIo {
     // source < cut that a layer >= cut reads, the step rows' top-k of every index source < cut used >= cut, and the
     // step rows' candidate blocks when the candidate source is < cut and a user is >= cut. In CudaStepResult::sections.
     std::uint32_t sections_cut = 0;
+    // DSpark drafter input (optional, device memory [rows][3 * hidden]): the step writes, for every row, the mean over
+    // the four hyper-connection copies of the input stream of layers draft_hidden_first .. + 2 (~0 = the last three
+    // layers), ((s0 + s1) + s2) + s3 then * 0.25, concatenated by layer, inside its own launches (graphs keyed by the
+    // address). Extra writes only: the step's other outputs are unchanged. draft_hidden_raw (optional, tests, device
+    // memory [rows][3][4 * hidden]): the same layers' input streams themselves.
+    float* draft_hidden = nullptr;
+    std::uint32_t draft_hidden_first = ~0U;
+    float* draft_hidden_raw = nullptr;
+    // Called by step() once its device work is enqueued, before it waits for it: caller host work that may overlap the
+    // step (e.g. the previous step's records). Not called by a step that fails before that point.
+    std::function<void()> after_launch;
 };
 
 struct CudaStepSections {
@@ -334,8 +388,10 @@ struct CudaStepResult {
     double enqueue_seconds = 0.0;                // host time until the last launch returned
     double engram_seconds = 0.0;                 // Engram row reads of the step's rows (I/O thread; prefetched: issued by the previous step)
     double engram_wait_seconds = 0.0;            // host waits for them before the segments that start at an Engram layer
+    double engram_wait_first_seconds = 0.0;      // of engram_wait_seconds: the wait before the first Engram layer (GPU idle)
     double engram_issue_seconds = 0.0;           // of engram_seconds: issuing the reads (the rest: waiting for them)
     bool engram_prefetched = false;              // the rows were issued by the previous step (its greedy token)
+    std::uint32_t engram_checked = 0, engram_check_mismatches = 0;  // STRIX_DS41_CUDA_ENGRAM_CHECK=1: records re-read and compared
     double expert_io_seconds = 0.0;              // sparse expert reads (non-resident layers)
     float device_ms = 0.0F;                      // device time of the step (first launch to the last op; timing)
     bool graphs = false;
@@ -402,6 +458,17 @@ public:
     // A fresh sequence at position 0 without a prefill: every cache, carry and selection zeroed, no tokens; the next
     // step's rows start at position 0 (a pipeline FRONT that feeds the prompt as decode rows, as the pair's decode does).
     void reset_sequence();
+    // Sequence slots (a FRONT of several requests): `count` attention states that share the weights and buffers of this
+    // object. select_sequence(i) makes slot i the sequence that step(), import_state(), reset_sequence(), commit_window(),
+    // export_state(), state_hashes(), position(), next_token() and the boundary section copies act on; each slot keeps its
+    // own rings, caches, carries, selections, token history and Engram n-gram state, so a slot's steps are bitwise the
+    // steps of an object of its own (every slot has the geometry of slot 0; its graphs are captured per slot). Slot 0 is
+    // the object's own state (run() needs it selected). New slots start empty (reset_sequence() or import_state()).
+    // Selecting another slot synchronizes the stream; outputs of the last step (stream_view) stay valid until the next step.
+    void set_sequences(std::uint32_t count);
+    void select_sequence(std::uint32_t slot);
+    [[nodiscard]] std::uint32_t sequences() const noexcept;
+    [[nodiscard]] std::uint32_t sequence() const noexcept;
     // Partial commit of the last step (a verify window of R rows): keep its first `kept` rows (1..R), as if the step had
     // been those rows only; `next_token` becomes the state's next token (the target's token after the kept rows). Local
     // and cheap (no state export): position, tokens, Engram history, the ratio-2 compressor carries and the last row
@@ -417,6 +484,17 @@ public:
     // reaches past `stop` stay non-resident. Returns the host seconds; decode_residency_report() is a JSON line.
     double decode_residency(std::uint32_t stop, bool release_run_buffers = true);
     [[nodiscard]] std::string decode_residency_report() const;
+    // Waits for the decode's outstanding Engram reads (e.g. the next token's prefetch issued by the last head step); the
+    // prefetch stays valid for the next step.
+    void wait_io();
+    // Issues the Engram rows of `token` at the next position (after commit_window: e.g. a verify window's token after
+    // its kept rows) on the I/O thread while the caller drafts; the next step uses them for its row 0 (R = 1: the whole
+    // job, as the head step's own prefetch; R > 1: rows 1..R-1 are read after it). No-op without file Engram, before
+    // the first step, or when the head step already issued this token.
+    void prefetch_engram(std::uint32_t token);
+    // Diagnostics: every Engram job's records read again after use and compared (CudaStepResult::engram_checked /
+    // engram_check_mismatches); the initial value comes from STRIX_DS41_CUDA_ENGRAM_CHECK=1.
+    void set_engram_check(bool on) noexcept;
     [[nodiscard]] std::uint32_t position() const noexcept;
     [[nodiscard]] std::uint32_t next_token() const noexcept;
     // Boundary sections of the last step for a pipeline cut (strix/ds41-pipeline-v1): compressed entries [first,
@@ -447,6 +525,12 @@ public:
     [[nodiscard]] std::size_t device_bytes() const noexcept;
     [[nodiscard]] std::size_t pinned_bytes() const noexcept;   // pinned host memory held
     [[nodiscard]] std::string describe() const;                // tiers, budgets, sizes (one line of JSON)
+    // Device copy of a model tensor's GGUF bytes (uploaded on first use and kept by this object; e.g. a drafter on the
+    // same device reads token_embd.weight / output.weight from here instead of holding its own copies).
+    [[nodiscard]] const std::uint8_t* device_tensor(const std::string& name);
+    // The head (output.weight) in the tiled layout the decode reads (empty without the head): a drafter on the same device
+    // reads it instead of a raw copy (device_tensor would upload the raw rows again, ~0.65 GiB).
+    [[nodiscard]] Q8Tiled head_tiled() const noexcept;
 
     struct Impl;
 

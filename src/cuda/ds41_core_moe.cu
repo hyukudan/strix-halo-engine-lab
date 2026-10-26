@@ -112,6 +112,8 @@ __global__ void __launch_bounds__(kSwigluThreads)
 swiglu_a8_kernel(const float* __restrict__ gate, const float* __restrict__ up, std::uint32_t inter, std::uint32_t in_stride, float limit,
                  float* __restrict__ act,
                  std::int8_t* __restrict__ codes, float* __restrict__ deltas, std::int32_t* __restrict__ sums, std::uint32_t a8_stride) {
+    // no early PDL trigger: a dependent GEMV launched at this kernel's entry sat resident beside it and slowed this
+    // latency-bound kernel ~2x on the PRO; every CTA triggers implicitly when it exits
     extern __shared__ float ys[];
     const std::uint32_t r = blockIdx.x;
     for (std::uint32_t i = threadIdx.x; i < inter; i += blockDim.x) {
@@ -122,6 +124,29 @@ swiglu_a8_kernel(const float* __restrict__ gate, const float* __restrict__ up, s
     __syncthreads();
     detail::a8_row(ys, inter, codes + std::size_t{r} * a8_stride, deltas + std::size_t{r} * a8_stride / 32U,
                    sums + std::size_t{r} * a8_stride / 32U);
+}
+
+// One warp per 32-value group (block = 8 groups of a row): the same swiglu_clamped per value and a8_group per group as
+// swiglu_a8_kernel's a8_row, spread over rows x inter / 256 blocks instead of one block per row.
+__global__ void __launch_bounds__(256)
+swiglu_a8_wide_kernel(const float* __restrict__ gate, const float* __restrict__ up, std::uint32_t inter, std::uint32_t in_stride, float limit,
+                      float* __restrict__ act, std::int8_t* __restrict__ codes, float* __restrict__ deltas, std::int32_t* __restrict__ sums,
+                      std::uint32_t a8_stride) {
+    // no early PDL trigger: a dependent GEMV launched at this kernel's entry sat resident beside it and slowed this
+    // latency-bound kernel ~2x on the PRO; every CTA triggers implicitly when it exits
+    const std::uint32_t r = blockIdx.y, g = blockIdx.x * 8U + threadIdx.x / 32U, lane = threadIdx.x & 31U;
+    if (g >= inter / 32U) return;
+    const std::uint32_t i = 32U * g + lane;
+    const float y = swiglu_clamped(gate[std::size_t{r} * in_stride + i], up[std::size_t{r} * in_stride + i], limit);
+    if (act) act[std::size_t{r} * inter + i] = y;
+    float delta;
+    std::int32_t sum;
+    const auto code = detail::a8_group(y, delta, sum);
+    codes[std::size_t{r} * a8_stride + i] = static_cast<std::int8_t>(code);
+    if (lane == 0) {
+        deltas[std::size_t{r} * a8_stride / 32U + g] = delta;
+        sums[std::size_t{r} * a8_stride / 32U + g] = sum;
+    }
 }
 
 struct SharedScratch {
@@ -170,6 +195,13 @@ void enqueue_router(const RouterView& v, cudaStream_t stream) {
 
 void enqueue_swiglu_a8(const SwigluA8View& v, cudaStream_t stream) {
     require(v.rows > 0 && v.inter > 0 && v.inter % 32U == 0 && v.inter <= kMaxInter && v.a8.codes, "SwiGLU A8 geometry");
+    if (v.a8.sums) {  // the per-group form (sums are always written there)
+        swiglu_a8_wide_kernel<<<dim3((v.inter / 32U + 7U) / 8U, v.rows), 256, 0, stream>>>(
+            v.gate, v.up, v.inter, v.in_stride ? v.in_stride : v.inter, v.limit, v.act, v.a8.codes, v.a8.deltas, v.a8.sums,
+            v.a8.stride ? v.a8.stride : v.inter);
+        STRIX_CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     swiglu_a8_kernel<<<v.rows, kSwigluThreads, v.inter * sizeof(float), stream>>>(v.gate, v.up, v.inter,
                                                                                  v.in_stride ? v.in_stride : v.inter, v.limit, v.act, v.a8.codes,
                                                                                  v.a8.deltas, v.a8.sums, v.a8.stride ? v.a8.stride : v.inter);
@@ -199,6 +231,7 @@ void enqueue_shared_expert(const SharedExpertView& v, cudaStream_t stream) {
         g.count = 2U * inter;
         g.x = v.x;
         g.out = s.gate;
+        g.pdl = v.pdl;
         enqueue_q8_0_a8(g, stream);
         enqueue_swiglu_a8({s.gate, s.gate + inter, rows, inter, 2U * inter, v.limit, nullptr, act}, stream);
         d.tiled = v.down_tiled;
@@ -219,6 +252,7 @@ void enqueue_shared_expert(const SharedExpertView& v, cudaStream_t stream) {
     d.x = act;
     d.out = v.out;
     d.out_stride = v.out_stride ? v.out_stride : hidden;
+    d.pdl = v.pdl && tiled;
     enqueue_q8_0_a8(d, stream);
 }
 
@@ -230,7 +264,7 @@ void enqueue_shared_expert_fused(const SharedExpertView& v, cudaStream_t stream)
                 (!v.out_stride || v.out_stride >= hidden), "fused shared expert geometry");
     const auto s = shared_scratch(v.workspace, v.x.rows, inter);
     Q8A8View g;
-    g.tiled = v.gate_up_tiled; g.count = 2U * inter; g.x = v.x; g.out = s.gate;
+    g.tiled = v.gate_up_tiled; g.count = 2U * inter; g.x = v.x; g.out = s.gate; g.pdl = v.pdl;
     enqueue_q8_0_a8(g, stream);
     enqueue_swiglu_a8_down(s.gate, v.x.rows, v.limit, v.down_tiled, v.out, v.out_stride, {}, stream);
 }
