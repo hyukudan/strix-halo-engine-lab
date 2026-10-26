@@ -105,6 +105,7 @@
 #include "ds41_hetero_stage.hpp"
 #include "strix/deepseek41_batch_forward.hpp"
 #include "strix/deepseek41_batch_schedule.hpp"
+#include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/ds41_dspark_files.hpp"
 #include "strix/hip_ds41_dspark.hpp"
 #include "strix/deepseek41_prefill.hpp"
@@ -2745,6 +2746,7 @@ void describe(const Args& a) {
 }  // namespace
 
 int main(int argc, char** argv) try {
+    const strix::deepseek41::pair_defaults::Effective production_defaults(strix::deepseek41::pair_defaults::App::serve, argc, argv, strix::deepseek41::pair_defaults::this_build());  // before any option or env read
     // The dist layer's own deadlines below the serve watchdog (120 s): a rare stall ends in the communicator's state
     // report (collective in flight, phase, per-stream bytes) instead of a bare POISONED. An explicit value wins.
     (void)::setenv("STRIX_DIST_USB4_TIMEOUT_MS", "60000", 0);
@@ -2767,6 +2769,7 @@ int main(int argc, char** argv) try {
         else if (s == "--pool-positions") a.pool = u32();
         else if (s == "--prompt-rows") a.prompt_rows = u32();
         else if (s == "--dspark") a.dspark = next();
+        else if (s == "--no-dspark") a.dspark.clear();
         else if (s == "--dspark-window") a.dspark_window = next();
         else if (s == "--dspark-vocab") a.dspark_vocab = next();
         else if (s == "--dspark-ranks") a.dspark_ranks = u32();

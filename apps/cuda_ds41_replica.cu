@@ -9,6 +9,19 @@
 //       --chat-prompt P --chat-steps N --seqs-file SEQS] [--timing] [--json OUT] [--timeline OUT] [--verify N]
 //       [--engram MODE] [--host-margin-gib G] [--fuse-hc] [--fuse-shared]
 //
+// Defaults: dsrtxk, fusions, deferred records, router form 2, qakv-s1, unpadded q8-r1,
+// keep-64, warm controller (chat scope), deferred WB, Engram RAM 512 MB, pipelined load.
+// Off: --dsrtxk-off --fuse-off --records-inline --router-pf0 --qakv-auto --q8-r1-off
+// (--q8-r1-pad: padded form), --draft-keep 0 --controller-prior none --controller-costs none
+// --no-wb-defer --engram-cache-mb 0; DG_LOAD_SERIAL=1. --host-spares defaults to 48.
+// Arena GiB: keep64=74.8, keep32=76.5, full=71.5, no draft=80; --arena-gib overrides.
+// Vocab: auto directory from STRIX_DS41_DRAFT_VOCAB or beside draft, else full.
+// Serve: --warmup-graphs 0,8, auto model.gguf.residency seed/save (STRIX_DS41_RESIDENCY override).
+// --warmup-graphs none / --residency-seed none / --residency-save none disable each.
+// --baseline restores old defaults at that argument; later flags override each item.
+// STRIX_DS41_RTX_BASELINE=1 applies baseline before all arguments. --print-config emits
+// resolved JSON and exits before CUDA, fixtures or model reads (dummy model paths allowed).
+//
 // Phases, in the given order, in one loaded process (each re-imports the state):
 //   exact0 / exact<K>   greedy steps from the imported state with prediction off / K predicted experts per layer:
 //                       every step compared with the pair's greedy log (fed token, argmax, logits FNV); the phase fails
@@ -261,6 +274,40 @@ double host_available_gib() {
 
 }  // namespace
 
+// Only the pinned model identity and requested geometry are consulted; never reads the model.
+static std::vector<std::uint32_t> residency_keys(const std::string& path, std::uint32_t L, std::uint32_t E) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("cannot read residency seed");
+    std::string head;
+    std::getline(in, head);
+    const auto& pin = strix::deepseek41::pinned_file(strix::deepseek41::PinnedFileKind::target_q2);
+    const std::string want = "ds41-residency-v1 sha256=" + std::string(pin.sha256_hex) + " layers=" + std::to_string(L) + " experts=" + std::to_string(E);
+    if (head.rfind(want + " ", 0) != 0) throw std::runtime_error("residency seed: model / geometry mismatch");
+    std::vector<std::uint32_t> keys;
+    std::string tok;
+    while (in >> tok) {
+        std::size_t used = 0;
+        const auto k = std::stoull(tok, &used);
+        if (used != tok.size() || k >= std::uint64_t{L} * E) throw std::runtime_error("residency seed: invalid key");
+        keys.push_back(static_cast<std::uint32_t>(k));
+    }
+    if (keys.empty()) throw std::runtime_error("residency seed: no keys");
+    return keys;
+}
+
+static std::optional<strix::ds41::dspark::WindowController::Table> resolve_prior(const std::string& spec, std::uint32_t* cap_out = nullptr) {
+    if (spec.empty() || spec == "none") return std::nullopt;
+    std::string path = spec;
+    std::uint32_t cap = 64;
+    if (const auto colon = path.rfind(':'); colon != std::string::npos && colon > 1U && colon + 1U < path.size() &&
+        path.find_first_not_of("0123456789", colon + 1U) == std::string::npos) {
+        cap = static_cast<std::uint32_t>(std::stoul(path.substr(colon + 1U)));
+        path.erase(colon);
+    }
+    if (cap_out) *cap_out = cap;
+    return path == "builtin" ? strix::ds41::dspark::builtin_survival_table(cap) : strix::ds41::dspark::read_survival_table(path, cap);
+}
+
 int main(int argc, char** argv) {
     // lazy module loading + a kernel spinning on a host flag can deadlock the first launch of another kernel
 #ifdef _WIN32
@@ -271,9 +318,9 @@ int main(int argc, char** argv) {
     if (argc < 2) usage("MODEL.gguf [options]");
     const std::string model = argv[1];
     std::string state_file, ref_file, routes, seqmod = "5:0", chats_arg, seqs_file, json_out, timeline_out, phases_arg = "exact0,pressure,exact8,chats8,chats0";
-    std::uint32_t steps = 64, chat_prompt = 96, chat_steps = 128, spares = 96, host_spares = 96, predict = 8, verify_n = 0, warm = 4, pressure_spares = 4;
+    std::uint32_t steps = 64, chat_prompt = 96, chat_steps = 128, spares = 96, host_spares = 48, predict = 8, verify_n = 0, warm = 4, pressure_spares = 8;
     std::uint32_t pf_layer = 4, pf_token = 48, layers_arg = 40, pressure_free = 2, pressure_recent = 12;
-    double arena_gib = 80.0, host_margin_gib = 6.0, max_pinned_gib = 68.0;
+    double arena_gib = -1.0, host_margin_gib = 6.0, max_pinned_gib = 68.0;
     std::string receipt, cache_kind = "tierstream";
     bool chat_logits = false, moe_v1b3 = false, router_form0 = false, qakv_auto = false, dsrtxk_on = true, fuse_on = true, flush_ready = false;
     std::uint32_t wb_alt = 0;  // --wb-alt N: chats phases alternate the spare target --spares / 0 every N decode tokens
@@ -282,7 +329,7 @@ int main(int argc, char** argv) {
     std::string winpf_prior_file;
     TierWinpf winpf_knobs;
     bool wb_defer = true;  // adopted default: deferred write-backs; --no-wb-defer = boundary write-backs
-    std::string draft_file, draft_vocab = "full", window_arg = "controller", controller_scope = "run";
+    std::string draft_file, draft_vocab = "auto", window_arg = "controller", controller_scope = "chat";
     std::string draft_keep_from;  // --draft-keep-from FILE: route_stats lines of an earlier run (summed)
     std::uint32_t draft_keep = 64;  // --draft-keep N: the N most routed experts per drafter stage stay (0: all); adopted default 64
     bool route_stats = false;  // --route-stats: the drafter's routed-expert usage per speculative phase (pruning study)
@@ -295,7 +342,7 @@ int main(int argc, char** argv) {
     std::uint32_t controller_explore = 0;
     bool controller_learn = false;
     int draft_device = -1;
-    std::uint32_t max_rows = 0;
+    std::uint32_t max_rows = 6;
     std::uint32_t attn_warps = 0;  // 0: the attention default (--attn1 / --attn-h1 / replica default)
     bool records_inline = false;   // --records-inline: no deferred step records (the earlier order of host work)
     constexpr std::uint32_t kQualifySteps = 64;  // an exact phase qualifies only with at least this many compared steps
@@ -307,11 +354,47 @@ int main(int argc, char** argv) {
     double serve_idle_s = 300.0;
     std::uint32_t serve_max = 0, max_positions_arg = 0;
     bool test_hooks_arg = false, serve_keep_on_fail = false;
-    std::string residency_save, residency_seed;  // the residency at shutdown / the next load's seed
-    std::string warmup_graphs;                   // K list; every (K, rows, logits, capture) graph before ready
+    std::string residency_save = "auto", residency_seed = "auto";  // the residency at shutdown / the next load's seed
+    std::string warmup_graphs = "auto";                   // K list; every (K, rows, logits, capture) graph before ready
     bool qual = false;  // --qual: qualification records (every window row's token + logits FNV, prompt windows, chat token
                         // vectors and end states, draft confidences as bits); off = today's lines byte for byte
     std::vector<std::string> req_env;  // --env NAME=VALUE (request variables, applied at the request's start)
+    bool print_config = false, baseline_arena = false, residency_auto = false;
+    bool q8_r1 = true, q8_r1_pad = false, router_pf_explicit = false, hc_cluster = false;
+    const auto baseline = [&]() {
+        dsrtxk_on = fuse_on = false;
+        o.decode_fuse_hc = o.decode_fuse_shared = false;
+        o.decode_router_v2 = o.decode_ob_one = o.decode_shared_fork = o.decode_attn_fork = false;
+        o.decode_ob_expand = o.decode_moe_expand = o.decode_qakv_s1 = moe_v1b3 = false;
+        attn_warps = 0;
+        records_inline = router_form0 = qakv_auto = true;
+        router_pf_explicit = hc_cluster = false;
+        q8_r1 = false;
+        q8_r1_pad = false;
+        draft_keep = 0;
+        controller_prior = controller_costs = "none";
+        controller_costs_given = false;
+        wb_defer = false;
+        controller_scope = "run";
+        host_spares = 96;
+        pressure_spares = 4;
+        max_rows = 0;
+        arena_gib = -1.0;
+        baseline_arena = true;
+        draft_vocab = "full";
+        warmup_graphs = residency_seed = residency_save = "none";
+        o.engram_cache_mb = 0;
+        // Respect a caller's explicit load policy, including DG_LOAD_SERIAL=0.
+        if (!std::getenv("DG_LOAD_SERIAL")) {
+#ifdef _WIN32
+            _putenv_s("DG_LOAD_SERIAL", "1");
+#else
+            setenv("DG_LOAD_SERIAL", "1", 0);
+#endif
+        }
+    };
+    const char* baseline_env = std::getenv("STRIX_DS41_RTX_BASELINE");
+    if (baseline_env && std::string(baseline_env) == "1") baseline();
     const auto parse_args = [&](const std::vector<std::string>& args) {
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string a = args[i];
@@ -328,7 +411,16 @@ int main(int argc, char** argv) {
             }
         };
         bool known = true;  // two chains: one else-if chain this long nests too deeply for MSVC inside a lambda
-        if (a == "--import-state") state_file = next();
+        if (a == "--baseline") baseline();
+        else if (a == "--print-config") print_config = true;
+        else if (a == "--q8-r1") q8_r1 = true;
+        else if (a == "--q8-r1-off") q8_r1 = false;
+        else if (a == "--q8-r1-pad") q8_r1_pad = true;
+        else if (a == "--q8-r1-nopad") q8_r1_pad = false;
+        else if (a == "--dsrtxk") dsrtxk_on = true;
+        else if (a == "--fuse") fuse_on = true;
+        else if (a == "--records-deferred") records_inline = false;
+        else if (a == "--import-state") state_file = next();
         else if (a == "--ref") ref_file = next();
         else if (a == "--steps") steps = u32();
         else if (a == "--arena-gib") arena_gib = std::stod(next());
@@ -397,7 +489,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-wb-defer") wb_defer = false;  // persist: a request turns it off again
         else if (a == "--wb-alt") wb_alt = u32();           // write-back probe: spare target --spares / 0 every N tokens
         else if (a == "--router-v2") o.decode_router_v2 = true;      // router v2 (bitwise, kern-bench router)
-        else if (a == "--router-pf") strix::ds41::cuda::set_router_v2_form(2);  // router v2 loads moved earlier (same bits)
+        else if (a == "--router-pf") { router_form0 = false; router_pf_explicit = true; }  // router v2 loads moved earlier (same bits)
         else if (a == "--router-pf0") router_form0 = true;  // router v2 form 0 (the earlier default)
         else if (a == "--pdl") o.decode_pdl = true;                  // PDL + L2 prefetch for the dense GEMVs (sm_90+)
         else if (a == "--pdl-np") {  // PDL for the dense GEMVs without the L2 weight prefetch (sm_90+)
@@ -409,7 +501,7 @@ int main(int argc, char** argv) {
             strix::ds41::cuda::set_q8_pdl_mode(2);
         }
         else if (a == "--shared-fork") o.decode_shared_fork = true;  // shared expert on a side branch (same bits)
-        else if (a == "--qakv-s1") o.decode_qakv_s1 = true;
+        else if (a == "--qakv-s1") { o.decode_qakv_s1 = true; qakv_auto = false; }
         else if (a == "--qakv-auto") qakv_auto = true;  // qa_kv with the automatic split (the earlier default)
         else if (a == "--attn-fork") o.decode_attn_fork = true;      // attention prep concurrent with q_b (same bits)
         else if (a == "--ob-expand") o.decode_ob_expand = true;      // with --ob-one, hc_expand in o_b's epilogue (same bits)
@@ -420,7 +512,7 @@ int main(int argc, char** argv) {
         else if (a == "--attn-pf") strix::ds41::cuda::attn::set_attention_prefetch(true);  // attention loads at once (same bits)
         // clustered hc split/norm (sm_90+); same bits. The 25-warp partials stay: with the cluster the 5-warp form
         // measured slower on the PRO (hc mixes+norm 11.26 vs 10.88 us); --hc-partial5 keeps it opt-in
-        else if (a == "--hc-cluster") strix::ds41::cuda::set_hc_norm_cluster(true);
+        else if (a == "--hc-cluster") hc_cluster = true;
         else if (a == "--hc-partial5") strix::ds41::cuda::set_hc_partial_warps(5);  // 5-warp hc partials (same bits)
         else if (a == "--moe-v1b3") moe_v1b3 = true;                  // v1b gate/up + v3 down (same bits)
         else if (a == "--dsrtxk-off") dsrtxk_on = false;              // the nine dsrtxk options below off (baseline arm)
@@ -443,6 +535,178 @@ int main(int argc, char** argv) {
     };
     const std::vector<std::string> launch_args(argv + 2, argv + argc);
     parse_args(launch_args);
+    namespace fs = std::filesystem;
+    if (arena_gib < 0) arena_gib = draft_file.empty() ? 80.0 : baseline_arena ? 71.5 : draft_keep == 64 ? 74.8 : draft_keep == 32 ? 76.5 : 71.5;
+    if (draft_vocab == "auto") {
+        const char* dir = std::getenv("STRIX_DS41_DRAFT_VOCAB");
+        std::error_code ec;
+        fs::path vp = dir && *dir ? fs::path(dir) : fs::path();
+        if (vp.empty() || !fs::is_directory(vp, ec)) vp = fs::path(draft_file).parent_path() / "ds41-draft-vocab";
+        ec.clear();
+        if (!draft_file.empty() && fs::is_directory(vp, ec)) draft_vocab = "auto:" + vp.string();
+        else {
+            draft_vocab = "full";
+            if (!draft_file.empty()) std::fprintf(stderr, "draft vocab: no auto directory; using full\n");
+        }
+    }
+    const char* residency_env = std::getenv("STRIX_DS41_RESIDENCY");
+    const std::string auto_path = residency_env && *residency_env ? residency_env : model + ".residency";
+    if (residency_seed == "auto") {
+        residency_auto = true;
+        residency_seed.clear();
+        std::error_code ec;
+        if (fs::exists(auto_path, ec)) {
+            try {
+                // The admitted target has 384 routed experts per layer. Rechecked against the reader below.
+                residency_keys(auto_path, layers_arg, 384);
+                residency_seed = auto_path;
+                std::fprintf(stderr, "residency: auto seed %s\n", auto_path.c_str());
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "residency: %s; using routes order\n", e.what());
+            }
+        }
+    }
+    if (residency_save == "auto") residency_save = serve_dir.empty() ? "" : auto_path;
+    if (warmup_graphs == "auto") warmup_graphs = serve_dir.empty() ? "" : "0,8";
+    if (residency_seed == "none") residency_seed.clear();
+    if (!residency_auto && !residency_seed.empty()) {
+        try { residency_keys(residency_seed, layers_arg, 384); }
+        catch (const std::exception& e) { usage(e.what()); }
+    }
+    if (residency_save == "none") residency_save.clear();
+    if (warmup_graphs == "none") warmup_graphs.clear();
+    const auto resolve_keep = [&](const auto& emit) {
+        CudaDrafterOptions dopt;
+        if (draft_keep != 0U && draft_keep_from.empty()) {  // the built-in keep-64 lists (held-out route statistics)
+            if (draft_keep != 64U) usage("--draft-keep N other than 64 needs --draft-keep-from FILE (route_stats lines)");
+            static constexpr std::uint16_t kKeep64[3][64] = {
+{97, 86, 43, 85, 36, 8, 117, 5, 47, 3, 33, 19, 124, 92, 123, 95, 61, 31, 27, 2, 72, 6, 17, 14, 99, 101, 23, 110, 24, 93, 68, 34, 4, 88, 109, 15, 62, 21, 74, 54, 70, 60, 26, 89, 11, 57, 63, 96, 38, 64, 13, 71, 58, 66, 113, 59, 49, 106, 77, 53, 115, 65, 118, 20},
+{121, 98, 51, 109, 61, 58, 78, 31, 113, 114, 82, 53, 56, 52, 122, 24, 26, 55, 41, 66, 5, 62, 25, 27, 45, 10, 97, 32, 115, 79, 111, 28, 39, 35, 68, 49, 11, 4, 21, 77, 63, 1, 19, 47, 118, 89, 126, 76, 37, 7, 101, 116, 100, 64, 36, 112, 102, 125, 18, 110, 71, 12, 43, 80},
+{101, 19, 48, 81, 58, 1, 103, 127, 97, 78, 6, 98, 9, 12, 17, 38, 102, 16, 122, 51, 83, 88, 53, 27, 96, 21, 111, 15, 84, 120, 93, 67, 14, 80, 13, 49, 45, 66, 112, 69, 77, 20, 87, 35, 94, 24, 59, 11, 91, 82, 119, 10, 47, 52, 79, 116, 118, 0, 2, 3, 4, 5, 7, 8},
+            };
+            dopt.keep.assign(3, {});
+            for (std::uint32_t s = 0; s < 3U; ++s) dopt.keep[s].assign(kKeep64[s], kKeep64[s] + 64);
+            emit("{\"event\":\"draft_keep\",\"keep\":64,\"source\":\"builtin\"}");
+        } else if (draft_keep != 0U) {  // expert pruning: the N most routed per stage in the stats file (ties: lower id)
+            namespace dsp = strix::ds41::dspark;
+            const std::uint32_t E = dsp::experts, S = dsp::stages;
+            std::vector<double> cnt(std::size_t{S} * E, 0.0);
+            std::ifstream kf(draft_keep_from);
+            std::string line;
+            std::uint32_t lines = 0;
+            while (std::getline(kf, line)) {
+                if (line.find("\"event\":\"route_stats\"") == std::string::npos) continue;
+                const auto a = line.find("\"counts\":["), b = line.find(']', a);
+                if (a == std::string::npos || b == std::string::npos) continue;
+                std::istringstream cs(line.substr(a + 10, b - a - 10));
+                std::string tok;
+                std::size_t i = 0;
+                while (std::getline(cs, tok, ',') && i < cnt.size()) cnt[i++] += std::stod(tok);
+                if (i != cnt.size()) throw std::runtime_error("--draft-keep-from: a route_stats line without " + std::to_string(cnt.size()) + " counts");
+                ++lines;
+            }
+            if (lines == 0) throw std::runtime_error("--draft-keep-from: no route_stats line in " + draft_keep_from);
+            std::ostringstream ks;
+            ks << "{\"event\":\"draft_keep\",\"keep\":" << draft_keep << ",\"lines\":" << lines << ",\"route_share\":[";
+            dopt.keep.resize(S);
+            for (std::uint32_t s = 0; s < S; ++s) {
+                std::vector<std::uint32_t> ids(E);
+                for (std::uint32_t e = 0; e < E; ++e) ids[e] = e;
+                const double* c = cnt.data() + std::size_t{s} * E;
+                std::stable_sort(ids.begin(), ids.end(), [&](std::uint32_t x, std::uint32_t y) { return c[x] > c[y]; });
+                ids.resize(std::min(draft_keep, E));
+                double tot = 0, kept = 0;
+                for (std::uint32_t e = 0; e < E; ++e) tot += c[e];
+                for (const auto e : ids) kept += c[e];
+                ks << (s ? "," : "") << (tot > 0 ? kept / tot : 0.0);
+                dopt.keep[s] = std::move(ids);
+            }
+            ks << "]}";
+            emit(ks.str());
+        }
+        return dopt.keep;
+    };
+    if (max_rows == 0 && serve_dir.empty()) {
+        bool windows = false;
+        for (const auto& ph : split(phases_arg, ','))
+            windows = windows || ph.rfind("wforce", 0) == 0 || ph.rfind("spec", 0) == 0 || ph.rfind("schats", 0) == 0 || ph.rfind("wsmoke", 0) == 0;
+        max_rows = windows ? 6U : 1U;
+    }
+    if (print_config) {
+        // Resolve the same feature expansion as below, without calling any CUDA entry point.
+        std::ostringstream j;
+        j << std::boolalpha << "{";
+        bool first = true;
+        const auto field = [&](const char* k, const auto& v) {
+            if (!first) j << ',';
+            first = false;
+            j << rs::json_str(k) << ':' << v;
+        };
+        const auto str = [&](const char* k, const std::string& v) { field(k, rs::json_str(v)); };
+        field("dsrtxk", dsrtxk_on); field("fuse", fuse_on); field("records_inline", records_inline);
+        field("router_form", router_form0 ? 0 : (dsrtxk_on || router_pf_explicit) ? 2 : 0);
+        field("qakv_s1", !qakv_auto && (dsrtxk_on || o.decode_qakv_s1));
+        field("q8_r1", q8_r1); field("q8_r1_pad", q8_r1_pad);
+        field("draft_keep", draft_keep); field("arena_gib", arena_gib); str("draft_vocab", draft_vocab);
+        str("controller_scope", controller_scope);
+        // Source filenames are provenance, not different runtime settings. Compare effective data below in CPU tests.
+        std::string prior = "none";
+        if (!controller_prior.empty() && controller_prior != "none") {
+            const auto t = *resolve_prior(controller_prior);
+            std::ostringstream ps;
+            for (const auto& row : t.seen) for (auto v : row) ps << v << ',';
+            ps << '/';
+            for (const auto& row : t.hits) for (auto v : row) ps << v << ',';
+            prior = ps.str();
+        }
+        str("controller_prior", prior); str("controller_costs", controller_costs);
+        const auto keep = resolve_keep([](const std::string&) {});
+        std::ostringstream kj;
+        kj << '[';
+        for (std::size_t st = 0; st < keep.size(); ++st) {
+            kj << (st ? ",[" : "[");
+            for (std::size_t n = 0; n < keep[st].size(); ++n) kj << (n ? "," : "") << keep[st][n];
+            kj << ']';
+        }
+        kj << ']';
+        field("draft_keep_ids", kj.str());
+        field("controller_explore", controller_explore); field("controller_learn", controller_learn);
+        field("controller_prior_alt", controller_prior_alt); str("controller_save", controller_save);
+        field("spares", spares); field("host_spares", host_spares); field("predict", predict);
+        field("max_rows", max_rows); str("window", window_arg); field("pressure_spares", pressure_spares);
+        field("pressure_free", pressure_free); field("pressure_recent", pressure_recent);
+        field("prefetch_layer", pf_layer); field("prefetch_token", pf_token);
+        field("host_margin_gib", host_margin_gib); field("max_pinned_gib", max_pinned_gib);
+        str("engram", o.engram); field("engram_cache_mb", o.engram_cache_mb);
+        field("wb_defer", wb_defer); field("wb_alt", wb_alt); field("flush_ready", flush_ready);
+        str("warmup_graphs", warmup_graphs.empty() ? "none" : warmup_graphs);
+        str("residency_seed", residency_seed.empty() ? "none" : (residency_auto ? "auto:" : "") + residency_seed);
+        str("residency_save", residency_save.empty() ? "none" : residency_save);
+        const char* serial = std::getenv("DG_LOAD_SERIAL");
+        field("load_serial", serial && std::string(serial) == "1");
+        field("layers", layers_arg); field("warm", warm); field("draft_device", draft_device);
+        field("attn_warps", attn_warps ? attn_warps : dsrtxk_on ? 4 : 0);
+        field("max_positions", max_positions_arg); str("cache", cache_kind); str("reset_cache", reset_cache);
+        field("decode_fuse_hc", fuse_on || o.decode_fuse_hc);
+        field("decode_fuse_shared", fuse_on || o.decode_fuse_shared);
+        field("decode_router_v2", dsrtxk_on || o.decode_router_v2);
+        field("decode_ob_one", dsrtxk_on || o.decode_ob_one);
+        field("decode_shared_fork", dsrtxk_on || o.decode_shared_fork);
+        field("decode_attn_fork", dsrtxk_on || o.decode_attn_fork);
+        field("decode_ob_expand", dsrtxk_on || o.decode_ob_expand);
+        field("decode_moe_expand", dsrtxk_on || o.decode_moe_expand);
+        field("moe_v1b3", dsrtxk_on || moe_v1b3);
+        field("hc_cluster", dsrtxk_on || hc_cluster);
+        field("decode_pdl", o.decode_pdl);
+        str("winpf_prior", winpf_prior_file);
+        field("winpf_l1_cap", winpf_knobs.l1_cap); field("winpf_pmin", winpf_knobs.l1_pmin);
+        field("winpf_prior_cap", winpf_knobs.prior_cap); field("winpf_prior_pmin", winpf_knobs.prior_pmin);
+        field("winpf_revert", winpf_knobs.revert_unused);
+        field("serve", !serve_dir.empty()); field("serve_idle", serve_idle_s); field("serve_max", serve_max);
+        j << "}";
+        std::puts(j.str().c_str());
+        return 0;
+    }
     const bool launch_wb_defer = wb_defer, launch_flush_ready = flush_ready;  // a worker without ts_dg_set_sched keeps them
     const auto set_env = [](const std::string& n, const std::string& v) {  // "\x01" = unset
 #ifdef _WIN32
@@ -485,6 +749,10 @@ int main(int argc, char** argv) {
         // vs the bracketing parents; bench q_a S=1 11.4 vs S=2 12.9 us, bitwise); --qakv-auto restores the automatic split
         o.decode_qakv_s1 = true;
     }
+    strix::ds41::cuda::set_q8_r1(q8_r1);
+    strix::ds41::cuda::set_q8_r1_pad(q8_r1_pad);
+    strix::ds41::cuda::set_hc_norm_cluster(dsrtxk_on || hc_cluster);
+    if (router_pf_explicit) strix::ds41::cuda::set_router_v2_form(2);
     if (router_form0) strix::ds41::cuda::set_router_v2_form(0);
     if (qakv_auto) o.decode_qakv_s1 = false;  // --qakv-auto wins over --qakv-s1 and the default  // --router-pf0 wins over --router-pf and the default
     if (attn_warps) strix::ds41::cuda::attn::set_attention_chunk_warps(attn_warps);
@@ -660,53 +928,7 @@ int main(int argc, char** argv) {
                 dopt.token_embd = reinterpret_cast<const std::uint16_t*>(p.device_tensor("token_embd.weight"));
                 dopt.output_tiled = p.head_tiled();  // the target's tiled head (no raw copy)
             }
-            if (draft_keep != 0U && draft_keep_from.empty()) {  // the built-in keep-64 lists (held-out route statistics)
-                if (draft_keep != 64U) usage("--draft-keep N other than 64 needs --draft-keep-from FILE (route_stats lines)");
-                static constexpr std::uint16_t kKeep64[3][64] = {
-    {97, 86, 43, 85, 36, 8, 117, 5, 47, 3, 33, 19, 124, 92, 123, 95, 61, 31, 27, 2, 72, 6, 17, 14, 99, 101, 23, 110, 24, 93, 68, 34, 4, 88, 109, 15, 62, 21, 74, 54, 70, 60, 26, 89, 11, 57, 63, 96, 38, 64, 13, 71, 58, 66, 113, 59, 49, 106, 77, 53, 115, 65, 118, 20},
-    {121, 98, 51, 109, 61, 58, 78, 31, 113, 114, 82, 53, 56, 52, 122, 24, 26, 55, 41, 66, 5, 62, 25, 27, 45, 10, 97, 32, 115, 79, 111, 28, 39, 35, 68, 49, 11, 4, 21, 77, 63, 1, 19, 47, 118, 89, 126, 76, 37, 7, 101, 116, 100, 64, 36, 112, 102, 125, 18, 110, 71, 12, 43, 80},
-    {101, 19, 48, 81, 58, 1, 103, 127, 97, 78, 6, 98, 9, 12, 17, 38, 102, 16, 122, 51, 83, 88, 53, 27, 96, 21, 111, 15, 84, 120, 93, 67, 14, 80, 13, 49, 45, 66, 112, 69, 77, 20, 87, 35, 94, 24, 59, 11, 91, 82, 119, 10, 47, 52, 79, 116, 118, 0, 2, 3, 4, 5, 7, 8},
-                };
-                dopt.keep.assign(3, {});
-                for (std::uint32_t s = 0; s < 3U; ++s) dopt.keep[s].assign(kKeep64[s], kKeep64[s] + 64);
-                emit("{\"event\":\"draft_keep\",\"keep\":64,\"source\":\"builtin\"}");
-            } else if (draft_keep != 0U) {  // expert pruning: the N most routed per stage in the stats file (ties: lower id)
-                namespace dsp = strix::ds41::dspark;
-                const std::uint32_t E = dsp::experts, S = dsp::stages;
-                std::vector<double> cnt(std::size_t{S} * E, 0.0);
-                std::ifstream kf(draft_keep_from);
-                std::string line;
-                std::uint32_t lines = 0;
-                while (std::getline(kf, line)) {
-                    if (line.find("\"event\":\"route_stats\"") == std::string::npos) continue;
-                    const auto a = line.find("\"counts\":["), b = line.find(']', a);
-                    if (a == std::string::npos || b == std::string::npos) continue;
-                    std::istringstream cs(line.substr(a + 10, b - a - 10));
-                    std::string tok;
-                    std::size_t i = 0;
-                    while (std::getline(cs, tok, ',') && i < cnt.size()) cnt[i++] += std::stod(tok);
-                    if (i != cnt.size()) throw std::runtime_error("--draft-keep-from: a route_stats line without " + std::to_string(cnt.size()) + " counts");
-                    ++lines;
-                }
-                if (lines == 0) throw std::runtime_error("--draft-keep-from: no route_stats line in " + draft_keep_from);
-                std::ostringstream ks;
-                ks << "{\"event\":\"draft_keep\",\"keep\":" << draft_keep << ",\"lines\":" << lines << ",\"route_share\":[";
-                dopt.keep.resize(S);
-                for (std::uint32_t s = 0; s < S; ++s) {
-                    std::vector<std::uint32_t> ids(E);
-                    for (std::uint32_t e = 0; e < E; ++e) ids[e] = e;
-                    const double* c = cnt.data() + std::size_t{s} * E;
-                    std::stable_sort(ids.begin(), ids.end(), [&](std::uint32_t x, std::uint32_t y) { return c[x] > c[y]; });
-                    ids.resize(std::min(draft_keep, E));
-                    double tot = 0, kept = 0;
-                    for (std::uint32_t e = 0; e < E; ++e) tot += c[e];
-                    for (const auto e : ids) kept += c[e];
-                    ks << (s ? "," : "") << (tot > 0 ? kept / tot : 0.0);
-                    dopt.keep[s] = std::move(ids);
-                }
-                ks << "]}";
-                emit(ks.str());
-            }
+            dopt.keep = resolve_keep(emit);
             {
                 DeviceScope ds(ddev);
                 drafter = std::make_unique<CudaDrafter>(lw->weights, dopt);
@@ -756,24 +978,16 @@ int main(int argc, char** argv) {
             to.host_spares = host_spares;
             if (!routes.empty()) to.seed = seed_order(routes, seqmod, L, E);
             if (!residency_seed.empty()) {  // the last session's residency first (validated), then the routes' order
-                std::ifstream rf(residency_seed);
-                if (!rf) usage("cannot read --residency-seed");
-                std::string head;
-                std::getline(rf, head);
-                const auto& pin = strix::deepseek41::pinned_file(strix::deepseek41::PinnedFileKind::target_q2);
-                const std::string want = "ds41-residency-v1 sha256=" + std::string(pin.sha256_hex) + " layers=" + std::to_string(L) + " experts=" + std::to_string(E);
-                if (head.rfind(want + " ", 0) != 0) usage("--residency-seed: not a residency file of this model / geometry");
                 std::vector<std::uint32_t> keys;
-                std::string tok;
-                while (rf >> tok) {
-                    const unsigned long k = std::stoul(tok);
-                    if (k >= std::uint64_t{L} * E) usage("--residency-seed: a key outside the model");
-                    keys.push_back(static_cast<std::uint32_t>(k));
+                try { keys = residency_keys(residency_seed, L, E); }
+                catch (const std::exception& e) {
+                    if (!residency_auto) usage(e.what());
+                    std::fprintf(stderr, "residency: %s; using routes order\n", e.what());
                 }
-                if (keys.empty()) usage("--residency-seed: no keys");
+                const bool seeded_residency = !keys.empty();
                 keys.insert(keys.end(), to.seed.begin(), to.seed.end());
                 to.seed = std::move(keys);
-                emit("{\"event\":\"residency_seed\",\"keys\":" + std::to_string(to.seed.size()) + "}");
+                if (seeded_residency) emit("{\"event\":\"residency_seed\",\"keys\":" + std::to_string(to.seed.size()) + "}");
             }
             to.split = E / 2U;
             to.max_rows = max_rows;  // verify windows: banks and dg_max_ids of R rows (R x top_k <= 64)
@@ -1131,14 +1345,8 @@ int main(int argc, char** argv) {
             controller = strix::ds41::dspark::WindowController{};
             prior_table.reset();
             if (!controller_prior.empty() && controller_prior != "none") {
-                std::string path = controller_prior;
                 std::uint32_t cap = 64;
-                if (const auto colon = path.rfind(':'); colon != std::string::npos && colon > 1U && colon + 1U < path.size() &&
-                    path.find_first_not_of("0123456789", colon + 1U) == std::string::npos) {
-                    cap = static_cast<std::uint32_t>(std::stoul(path.substr(colon + 1U)));
-                    path.erase(colon);
-                }
-                prior_table = path == "builtin" ? strix::ds41::dspark::builtin_survival_table(cap) : strix::ds41::dspark::read_survival_table(path, cap);
+                prior_table = resolve_prior(controller_prior, &cap);
                 controller.set_table(*prior_table);
                 emit("{\"event\":\"controller_prior\",\"cap\":" + std::to_string(cap) + "}");
             }

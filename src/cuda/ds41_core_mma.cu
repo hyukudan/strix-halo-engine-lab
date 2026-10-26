@@ -14,6 +14,8 @@
 
 #include "strix/cuda_ds41_core.hpp"
 
+#include <cstdio>
+
 namespace strix::ds41::cuda {
 namespace {
 
@@ -78,11 +80,15 @@ struct MmaArgs {
     const float* hc_mixes = nullptr;
     float* hc_out = nullptr;
     std::uint32_t hc_hidden = 0;
+    int occ = 1;  // 3 = the 1-row-tile split-1 kernel compiled for 3 blocks per SM (host dispatch only)
 };
 
 // grid (tiles, S, row passes), 8 warps. T row tiles of 8 per pass. NC = 32 / U classes per unit.
-template <int T, int S, bool SwigluDown = false>
-__global__ void __launch_bounds__(256) q8_mma_kernel(MmaArgs a) {
+// MB: minimum resident blocks per SM asked of the register allocator (--q8-occ3: MB = 3 for T = 1,
+// S = 1, i.e. <= 85 registers instead of ~111, 564 block slots instead of 376 - o_a's 512 tiles in one wave). Register
+// allocation only: the same arithmetic.
+template <int T, int S, bool SwigluDown = false, int MB = 1>
+__global__ void __launch_bounds__(256, MB) q8_mma_kernel(MmaArgs a) {
     extern __shared__ unsigned char activation[];
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
@@ -268,6 +274,107 @@ __global__ void __launch_bounds__(256) q8_mma_kernel(MmaArgs a) {
     }  // halves
 }
 
+// R1, S = 1 only: MMA columns are activation rows. Only tig == 0, c[0] (gid, 0)
+// and c[2] (gid + 8, 0) survive; all lanes still participate in the MMA and its operand loads.
+// launch bounds without a minimum-blocks cap (measured: the 3-blocks/SM cap cost +2 % in the graph)
+__global__ void __launch_bounds__(256) q8_mma_r1_kernel(MmaArgs a) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (a.pdl && a.pdl_mode != 2) {
+        constexpr int Up = 8;
+        const unsigned char* base = reinterpret_cast<const unsigned char*>(a.codes + std::size_t{a.tile_first + blockIdx.x} * a.groups_total * 32U);
+        for (std::uint32_t i = threadIdx.x; a.pdl_mode == 1 && i < a.groups * 4U; i += blockDim.x) {
+            const std::uint32_t g = i / 4U;
+            if ((g % Up) / 8U != blockIdx.y) continue;
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(base + (std::size_t{a.g_off} + g) * 512U + (i % 4U) * 128U));
+        }
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+#endif
+    bool pending_wait = a.pdl && a.pdl_mode == 2;
+    (void)pending_wait;
+    constexpr int U = 8, NC = 4, B = 4;
+    __shared__ float red[8][16];
+    const std::uint32_t tile = blockIdx.x, warp = threadIdx.x / 32U, lane = threadIdx.x & 31U;
+    const std::uint32_t gid = lane / 4U, tig = lane % 4U, u = warp;
+    const std::uint32_t wt = a.tile_first + tile;
+    const uint4* wc = a.codes + std::size_t{wt} * a.groups_total * 32U + lane;
+    const std::uint16_t* ws = a.scales + std::size_t{wt} * a.groups_total * 16U;
+    const std::size_t xoff = std::size_t{tile / a.per_group_tiles} * a.x_group_width;
+    float acc[NC][2];
+#pragma unroll
+    for (int k = 0; k < NC; ++k)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) acc[k][j] = 0.0F;
+    // Same four-group steps and ascending class chains as q8_mma_kernel<1, 1>.
+    for (std::uint32_t m0 = 0; u + U * m0 < a.groups; m0 += B) {
+        uint4 w[B];
+        float sc0[B], sc1[B], d0[B];
+        int2 bv[B];
+        std::uint16_t s0r[B], s1r[B];
+#pragma unroll
+        for (int q = 0; q < B; ++q) {
+            const std::uint32_t g = u + U * (m0 + q), gg = a.g_off + g;
+            const bool ok = g < a.groups;
+            w[q] = ok ? __ldg(wc + std::size_t{gg} * 32U) : make_uint4(0, 0, 0, 0);
+            s0r[q] = ok ? ws[std::size_t{gg} * 16U + gid] : std::uint16_t{0};
+            s1r[q] = ok ? ws[std::size_t{gg} * 16U + gid + 8U] : std::uint16_t{0};
+        }
+#pragma unroll
+        for (int q = 0; q < B; ++q) {
+            const bool ok = u + U * (m0 + q) < a.groups;
+            sc0[q] = ok ? f16_to_float(s0r[q]) : 0.0F;
+            sc1[q] = ok ? f16_to_float(s1r[q]) : 0.0F;
+        }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        if (pending_wait) {
+            asm volatile("griddepcontrol.wait;" ::: "memory");
+            pending_wait = false;
+        }
+#endif
+#pragma unroll
+        for (int q = 0; q < B; ++q) {
+            const std::uint32_t g = u + U * (m0 + q);
+            const bool ok = g < a.groups;
+            bv[q] = ok && gid == 0U ? *reinterpret_cast<const int2*>(a.x + xoff + 32U * g + 8U * tig) : make_int2(0, 0);
+            d0[q] = ok && tig == 0U ? a.deltas[xoff / 32U + g] : 0.0F;
+        }
+#pragma unroll
+        for (int q = 0; q < B; ++q) {
+            if (u + U * (m0 + q) >= a.groups) break;
+            const int k = q % NC;
+            int c[4];
+            mma_s8(w[q], bv[q].x, bv[q].y, c);
+            if (tig == 0U) {
+                acc[k][0] = acc[k][0] + static_cast<float>(c[0]) * (sc0[q] * d0[q]);
+                acc[k][1] = acc[k][1] + static_cast<float>(c[2]) * (sc1[q] * d0[q]);
+            }
+        }
+    }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if (pending_wait) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+        pending_wait = false;
+    }
+#endif
+    if (tig == 0U) {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const float v = (acc[0][j] + acc[2][j]) + (acc[1][j] + acc[3][j]);
+            red[warp][gid + (j ? 8U : 0U)] = v;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < 16U) {
+        const std::uint32_t mo = threadIdx.x;
+        float x4[4];
+        for (int l = 0; l < 4; ++l) x4[l] = red[l][mo] + red[l + 4][mo];
+        const float x2a = x4[0] + x4[2], x2b = x4[1] + x4[3];
+        const float y = x2a + x2b;
+        a.out[std::size_t{tile} * 16U + mo] = y;
+    }
+}
+
 // S > 1: the tree levels d < U across the U unit values, per (tile, row, output).
 __global__ void q8_mma_reduce_kernel(const float* __restrict__ scratch, std::uint32_t tiles, std::uint32_t units, std::uint32_t rows,
                                      float* out, std::uint32_t out_stride, bool accumulate) {
@@ -285,22 +392,40 @@ __global__ void q8_mma_reduce_kernel(const float* __restrict__ scratch, std::uin
     *o = accumulate ? *o + v[0] : v[0];
 }
 
-template <int T, int S>
+int g_q8_occ = 1;
+bool g_q8_r1_pad = false;  // measured: the 40 KB pad slowed the concurrent routed gate/up (+54 us/step) and shexp down
+bool g_q8_r1 = false;
+
+template <int T, int S, bool R1 = false>
 void launch_mma(const MmaArgs& a, std::uint32_t tiles, cudaStream_t stream) {
     const dim3 grid(tiles, S, (a.rows + T * 8U - 1U) / (T * 8U));
+    void (*kernel)(MmaArgs) = q8_mma_kernel<T, S>;
+    if constexpr (T == 1 && S == 1) {
+        if (a.occ == 3) kernel = q8_mma_kernel<1, 1, false, 3>;
+    }
+    std::size_t pad = 0;  // unused dynamic shared memory: caps the resident blocks per SM (scheduling only)
+    if constexpr (R1) {
+        static_assert(T == 1 && S == 1);
+        kernel = q8_mma_r1_kernel;
+        // measured: at 73 registers the R1 kernel runs 3 blocks per SM, and 3 blocks per SM cost +2 % in the decode
+        // graph (--q8-occ3); 40 KB of unused shared memory per block keeps it at 2 like the generic kernel (sm_120: <= 100 KB
+        // of shared memory per SM -> 2 x 41.5 KB fit, 3 do not)
+        pad = g_q8_r1_pad ? 40U * 1024U : 0U;
+    }
     if (a.pdl) {
         cudaLaunchConfig_t cfg{};
         cfg.gridDim = grid;
         cfg.blockDim = dim3(256);
+        cfg.dynamicSmemBytes = pad;
         cfg.stream = stream;
         cudaLaunchAttribute attr{};
         attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
         attr.val.programmaticStreamSerializationAllowed = 1;
         cfg.attrs = &attr;
         cfg.numAttrs = 1;
-        STRIX_CUDA_CHECK(cudaLaunchKernelEx(&cfg, q8_mma_kernel<T, S>, a));
+        STRIX_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, a));
     } else {
-        q8_mma_kernel<T, S><<<grid, 256, 0, stream>>>(a);
+        kernel<<<grid, 256, pad, stream>>>(a);
     }
     STRIX_CUDA_CHECK(cudaGetLastError());
     if constexpr (S > 1) {
@@ -316,6 +441,9 @@ int g_pdl_mode = 1;
 }  // namespace
 
 void set_q8_pdl_prefetch(bool on) { g_pdl_mode = on ? 1 : 0; }
+void set_q8_occupancy(int blocks) { g_q8_occ = blocks == 3 ? 3 : 1; }
+void set_q8_r1(bool on) { g_q8_r1 = on; }
+void set_q8_r1_pad(bool on) { g_q8_r1_pad = on; }
 void set_q8_pdl_mode(int mode) { g_pdl_mode = mode == 0 || mode == 2 ? mode : 1; }
 
 std::size_t q8_tiled_code_bytes(std::uint32_t rows, std::uint32_t width) { return std::size_t{rows} / 16U * (width / 32U) * 512U; }
@@ -375,6 +503,7 @@ void enqueue_q8_0_a8_tiled(const Q8A8View& v, cudaStream_t stream) {
         pdl_ok = pdl_cap[dev] == 1;
     }
     a.pdl = v.pdl && pdl_ok;
+    a.occ = v.occupancy ? v.occupancy : g_q8_occ;
     require(!v.hc_out || (v.hc_residual && v.hc_mixes && v.hc_hidden == v.count && v.first == 0U && !v.accumulate && v.k_halves <= 2U),
             "tiled Q8_0 x A8: the hc_expand epilogue needs count = hidden, first 0, no accumulate");
     a.hc_residual = v.hc_residual;
@@ -393,7 +522,16 @@ void enqueue_q8_0_a8_tiled(const Q8A8View& v, cudaStream_t stream) {
     require(split == 1U || (v.split_scratch && v.split_scratch_floats >= q8_0_a8_split_scratch_floats(v.count, v.x.rows, split)),
             "tiled Q8_0 x A8 split scratch");
     const bool big = v.x.rows > 8U;
-    if (split == 1U) big ? launch_mma<4, 1>(a, tiles, stream) : launch_mma<1, 1>(a, tiles, stream);
+    if (g_q8_r1 && !(a.rows == 1U && split == 1U && a.halves == 1U && !a.accumulate && !a.hc_out)) {
+        static bool noticed = false;
+        if (!noticed) {
+            std::fprintf(stderr, "q8-r1: shape requires generic Q8; using exact fallback\n");
+            noticed = true;
+        }
+    }
+    if (g_q8_r1 && a.rows == 1U && split == 1U && a.halves == 1U && !a.accumulate && !a.hc_out)
+        launch_mma<1, 1, true>(a, tiles, stream);  // no SwiGLU preparation on this entry point
+    else if (split == 1U) big ? launch_mma<4, 1>(a, tiles, stream) : launch_mma<1, 1>(a, tiles, stream);
     else if (split == 2U) big ? launch_mma<4, 2>(a, tiles, stream) : launch_mma<1, 2>(a, tiles, stream);
     else if (split == 4U) big ? launch_mma<4, 4>(a, tiles, stream) : launch_mma<1, 4>(a, tiles, stream);
     else require(false, "tiled Q8_0 x A8 split must be 1, 2 or 4");

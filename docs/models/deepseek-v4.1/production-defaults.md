@@ -80,6 +80,45 @@ Approximate BF16 attention and FP16 dense prefill remain opt-in. Their projectio
 A8, fast and split-workspace controls are part of the prefix-cache namespace, so incompatible states do not share
 cache entries. The optional FP16 dense backend requires CMake `STRIX_DS41_PREFILL_FP16_LT=ON`.
 
+## Default invocation = the measured production command (2026-10-26)
+
+The rank, batch, prefill and serve apps resolve their production environment and flags themselves
+(`include/strix/deepseek41_pair_defaults.hpp`), so the plain command
+
+```
+strix-deepseek41-serve MODEL.gguf --rank R --transport usb4auto      # rank / batch the same; prefill: --transport usb4-auto
+```
+
+runs what the 2026-10-26 qualification measured, when the binaries were built with the trellis library:
+
+```
+cmake ... -DSTRIX_DS41_TRELLIS=ON -DSTRIX_DS41_TRELLIS_LIBRARY=<trellis archive> \
+  -DSTRIX_DS41_TRELLIS_INCLUDE_DIR=<dir with strix_trellis.h>    # STRIX_DS41_TRELLIS_API defaults to dense_r1
+```
+
+Without the library the build still works; the trellis packs are then skipped with one notice. Measured (TTFT 1K 2.098 -> 1.954 s, 8K 11.090 -> 9.757 s; R1 -1.9 %, R6 -2.4 %, N8 -2.2 %;
+serve C1 43.58 -> 48.00 tok/s; every run exact):
+
+| item | default | off |
+|---|---|---|
+| production identity: `STRIX_DS41_OVERLAY=<packs>/c-u6.gguf STRIX_DS41_CB4=1` | on when the pack is found | `STRIX_DS41_OVERLAY=0` |
+| trellis mix-B at every dense site: `STRIX_DS41_TRELLIS=<packs>/ours-K4 STRIX_DS41_TRELLIS_MIX=head=<packs>/ours-K5 STRIX_DS41_TRELLIS_SITES=all STRIX_DS41_TRELLIS_DENSE_FULL=1 STRIX_DS41_TRELLIS_HEADOUT=1` (not the EP prefill app) | on when both packs are found and the build links the dense_r1 trellis library | `STRIX_DS41_TRELLIS=0` |
+| rank / batch `--tp-attention --engram-direct` | on (TP attention with two ranks) | `--no-tp-attention`, `--engram-mapped` |
+| prefill `STRIX_DS41_EXPERT_TP=0` (EP prefill) | on | an explicit value |
+| serve `--peer-timeout 120 --prefill-path device --slots 8 --prefill-rows 2048` | on | the explicit flag |
+| serve `--dspark <model dir>/*-DSpark-MXFP4.gguf --dspark-vocab auto:<packs>/vocab` | on when the draft (and the vocabulary's `core48k.bin` / `core32k.bin`) are found; off with `STRIX_DS41_BATCH_ROWS16=1` or `--prefix-session-snapshots` | `--no-dspark`, `--dspark-vocab full` |
+
+`<packs>` is `STRIX_DS41_PACKS` when set, else `<model dir>/packs`, else the model's directory (`STRIX_DS41_PACKS=0`:
+no packs). An argument on the command line wins over the default, a variable already in the environment is never changed,
+and a missing precondition drops its item with one `deepseek41 defaults:` line on stderr. `--print-effective-config`
+prints the resolved environment and arguments and exits before any device work.
+
+Master switch `STRIX_DS41_BASELINE=1`: nothing above is added, and the code defaults adopted on 2026-10-25/26 are set
+to `=0` (`STRIX_DS41_SHARED_GROUPED`, `SHARED_DOWN_FUSED`, `MOE_PREFILL`, `DENSE_SELECT`, `ATTN_WINDOW_FOLD`,
+`ATTN_LIVE_CHUNKS`, `ATTN_TILE_F16`, `SERVE_WARM`, `DSPARK_CALIB`) unless set explicitly: the plain command as it ran
+before, without those items. The CPU test `strix-deepseek41-pair-defaults-tests` checks the resolved command against the receipt
+and every off switch.
+
 ## Transport and USB4 layout (P17.4)
 
 - Every app takes `--transport usb4gpu` (prefill: `usb4-gpu`); the serve manifest kind is `usb4_gpu_auto`.
@@ -102,7 +141,7 @@ STRIX_DS41_TRELLIS_SITES=all STRIX_DS41_TRELLIS_DENSE_FULL=1 STRIX_DS41_TRELLIS_
 ```
 
 Attention sites on trellis in the qualified two-node configuration: every mix-B dense class incl. q_a / kv / q_b / o_a / o_b
-reads its K4 pack. Needs the build `STRIX_DS41_TRELLIS_API=dense_r1` linked against a trellis library with the dense-r1 and grouped GEMV APIs
+reads its K4 pack. Needs the build `STRIX_DS41_TRELLIS_API=dense_r1` (the CMake default) linked against a trellis library with the dense-r1 and grouped GEMV APIs
 (grouped wo_a GEMV, dense-r1 q_a + kv pair, cold schedules). `STRIX_DS41_TRELLIS_OA_GROUP` (grouped o_a) and
 `STRIX_DS41_TRELLIS_QAKV_PAIR` (q_a + kv in one launch) are on by default and bit-identical to their off forms (=0).
 Measured (pair, ABA, same binary, only the env differs): R1 34.7 -> 31.15 ms/token (-10.2 %), R6 window 63.17 -> 60.59 ms

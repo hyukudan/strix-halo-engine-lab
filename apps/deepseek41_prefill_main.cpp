@@ -1,5 +1,6 @@
 #include "strix/deepseek41_batch_forward.hpp"
 #include "strix/deepseek41_device_forward.hpp"
+#include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/deepseek41_prefill.hpp"
 #include "strix/dist/communicator.hpp"
 #include "strix/dist/gpu_direct.hpp"
@@ -783,6 +784,7 @@ void run_rank(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint
 }  // namespace
 
 int main(int argc, char** argv) try {
+    const strix::deepseek41::pair_defaults::Effective production_defaults(strix::deepseek41::pair_defaults::App::prefill, argc, argv, strix::deepseek41::pair_defaults::this_build());  // before any option or env read
     Args a;
     for (int i = 1; i < argc; ++i) {
         const std::string s = argv[i];
