@@ -120,9 +120,12 @@ __global__ __launch_bounds__(256) void split_weights(const float* weights, std::
     }
 }
 constexpr unsigned kK2 = 64U, kPitch2 = kK2 + 8U;
-template <unsigned N>
+// Tail: runs after the block's logits are stored (no-op by default). The launcher's select tail (STRIX_PREFILL_ROUTER_FUSE=1)
+// lets the last of the gridDim.y expert blocks of a 128-row tile select those rows' top-k from the fresh logits.
+struct NoTail { __device__ void operator()(const RouterTileRowsArgs&, unsigned, unsigned) const {} };
+template <unsigned N, class Tail = NoTail>
 __global__ __launch_bounds__(256) void logits_presplit_kernel(RouterTileRowsArgs rows, const std::uint16_t* wh, const std::uint16_t* wm_,
-    std::uint32_t hidden, std::uint32_t total_rows) {
+    std::uint32_t hidden, std::uint32_t total_rows, Tail tail = Tail{}) {
     static_assert(N == 64U || N == 128U);
     constexpr unsigned NT = N / 32U, BJ = N / 16U; // B tiles of 16 per wave; B staging tasks per thread
     __shared__ __align__(16) std::uint16_t a_lds[kM][kPitch2];
@@ -186,6 +189,7 @@ __global__ __launch_bounds__(256) void logits_presplit_kernel(RouterTileRowsArgs
 #pragma unroll
             for (unsigned j = 0; j < NT; ++j) out[n0 + wn + 16U * j + col] = acc[i][j][e];
         }
+    tail(rows, m0, total_rows);
 }
 // STRIX_PREFILL_ROUTER_CHECK=1 (diagnostic): copy[r * experts + e] = logit (r, e) (pass 0), or count the differing bit
 // patterns against copy (pass 1).

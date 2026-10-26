@@ -5042,7 +5042,7 @@ Qpf2kCoreScratch qpf2k_core_scratch(hipStream_t stream, std::uint32_t value_head
 }
 // All 2 * value_heads blocks of gdn_core_kernel must be co-resident (cooperative launch); decided once, before any
 // q/k row is rewritten.
-template <GdnRecurrentStorage S, unsigned Lean = 0U, unsigned Cc = 2U, unsigned Nan = 3U>
+template <GdnRecurrentStorage S, unsigned Lean = 0U, unsigned Cc = 2U, unsigned Nan = 3U, bool F16 = false>
 bool qpf2k_core_fits(std::uint32_t blocks) {
     // Opt 6 (post-order tree) for the 4-column core and for the dispatched kernels (Nan 1 / 2); Opt 2 for the default Nan 3
     constexpr unsigned Waves = Cc == 4U ? 2U : kQpf2kCoreWaves, Chunk = Cc == 4U ? 4U : 8U, Opt = Cc == 4U || Nan == 1U || Nan == 2U ? 6U : 2U;
@@ -5052,7 +5052,7 @@ bool qpf2k_core_fits(std::uint32_t blocks) {
         if (hipDeviceGetAttribute(&cooperative, hipDeviceAttributeCooperativeLaunch, device) != hipSuccess || !cooperative) return false;
         if (hipDeviceGetAttribute(&units, hipDeviceAttributeMultiprocessorCount, device) != hipSuccess) return false;
         if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_unit,
-                reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, Cc, Waves, Chunk, Opt, false, Lean, Nan>),
+                reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, Cc, Waves, Chunk, Opt, false, Lean, Nan, F16>),
                 static_cast<int>(Waves * 32U), 0) != hipSuccess) return false;
         const bool ok = static_cast<std::uint64_t>(units) * static_cast<std::uint64_t>(per_unit) >= blocks;
         std::fprintf(stderr, "QPF2K GDN core residency (%u columns per lane group, nan %u): units %d blocks/unit %d need %u -> %s\n", Cc,
@@ -5061,9 +5061,37 @@ bool qpf2k_core_fits(std::uint32_t blocks) {
     }();
     return fits;
 }
+// The projection must not borrow tiled::scratch: another projection can grow and release it.
+// Calls on a stream reuse these owned rows only after that stream's preceding projection.
+struct Qpf2kCore16Route {
+    GdnOutputTiledSite site{};
+    _Float16* a16 = nullptr;                 // non-null only after a supported lean core selects this route
+    unsigned form = 4U, raster = 2U;
+};
+_Float16* qpf2k_core16_scratch(hipStream_t stream, std::uint32_t rows) {
+    struct Slot { void* p = nullptr; std::uint64_t bytes = 0; };
+    static std::mutex mutex;
+    static std::vector<std::pair<hipStream_t, Slot>> pool;
+    const std::lock_guard lock(mutex);
+    auto it = std::find_if(pool.begin(), pool.end(), [&](const auto& entry) { return entry.first == stream; });
+    if (it == pool.end()) it = pool.emplace(pool.end(), stream, Slot{});
+    auto& s = it->second;
+    const auto bytes = (static_cast<std::uint64_t>(rows) + q8_rows::tiled::kBM - 1U) / q8_rows::tiled::kBM *
+        q8_rows::tiled::kBM * q8_rows::tiled::scratch_pitch(6144U) * 2U;
+    if (s.bytes < bytes) {
+        if (s.p) {
+            check_hip(hipStreamSynchronize(stream), "qpf2k GDN core16 scratch drain");
+            check_hip(hipFree(s.p), "qpf2k GDN core16 scratch release");
+            s = {};
+        }
+        check_hip(hipMalloc(&s.p, bytes), "qpf2k GDN core16 scratch allocation");
+        s.bytes = bytes;
+    }
+    return static_cast<_Float16*>(s.p);
+}
 void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRow, 8U>>& tiles,
     const GdnPrefillRows& strided, std::uint64_t input_stride, const HipGdnLauncherConfig& config, const q8_rows::DenseA8Slot* fused_a8,
-    unsigned qpf2k = qpf2k_gdn_parts()) {
+    unsigned qpf2k = qpf2k_gdn_parts(), Qpf2kCore16Route* core16 = nullptr) {
     const auto stream = hip_execution_stream();
     const auto& first = tiles[0][0];
     const auto count = static_cast<std::uint32_t>(tiles.size() * 8U);
@@ -5090,7 +5118,18 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     const bool qpf2k_gates = (qpf2k & 2U) && first.hidden == 2560U && count % QGatesRB == 0U &&
         (first.value_heads * 2U) % (QGatesO * QGatesW) == 0U && input_stride % 8U == 0U &&
         reinterpret_cast<std::uintptr_t>(first.input.address) % 16U == 0U;
-    if (qpf2k_gates)
+    // STRIX_QPF2K_GDN_GATES_BATCH=1: the same kernel with Sched bit 4 (dt/a preloaded, transforms across lanes).
+    static const bool gates_batch = [] { const char* v = std::getenv("STRIX_QPF2K_GDN_GATES_BATCH"); return v && v[0] == '1'; }();
+    if (qpf2k_gates && gates_batch)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_gates_kernel<QGatesO, QGatesW, QGatesRC, QGatesRB, 2560U, 4U>),
+            dim3(first.value_heads * 2U / (QGatesO * QGatesW), count / QGatesRB), dim3(QGatesW * 32U), 0, stream,
+            reinterpret_cast<const std::uint16_t*>(first.input.address), input_stride,
+            reinterpret_cast<const float*>(first.tensors.beta.runtime->address),
+            reinterpret_cast<const float*>(first.tensors.alpha.runtime->address), strided,
+            reinterpret_cast<const void*>(first.tensors.dt.runtime->address), small_weight_kind(first.tensors.dt.manifest->ggml_type),
+            reinterpret_cast<const void*>(first.tensors.a.runtime->address), small_weight_kind(first.tensors.a.manifest->ggml_type),
+            first.value_heads);
+    else if (qpf2k_gates)
         hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_gates_kernel<QGatesO, QGatesW, QGatesRC, QGatesRB>),
             dim3(first.value_heads * 2U / (QGatesO * QGatesW), count / QGatesRB), dim3(QGatesW * 32U), 0, stream,
             reinterpret_cast<const std::uint16_t*>(first.input.address), input_stride,
@@ -5099,7 +5138,7 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
             reinterpret_cast<const void*>(first.tensors.dt.runtime->address), small_weight_kind(first.tensors.dt.manifest->ggml_type),
             reinterpret_cast<const void*>(first.tensors.a.runtime->address), small_weight_kind(first.tensors.a.manifest->ggml_type),
             first.value_heads);
-    if (qpf2k_gates) qpf2k_gdn_witness("gates gdn_qpf2k_gates_kernel<1,8,4,64>", count);
+    if (qpf2k_gates) qpf2k_gdn_witness(gates_batch ? "gates gdn_qpf2k_gates_kernel<1,8,4,64,batch>" : "gates gdn_qpf2k_gates_kernel<1,8,4,64>", count);
     else if (rows_fit)
         hipLaunchKernelGGL(HIP_KERNEL_NAME(gdn_gates::gdn_gates_rows_kernel<GatesRB, GatesO, GatesS, GatesC>),
             dim3(first.value_heads * 2U / (GatesO * GatesS), count / GatesRB), dim3(GatesS * 256U), 0, stream,
@@ -5134,6 +5173,15 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
                         || (lean ? (vk ? qpf2k_core_fits<GdnRecurrentStorage::value_key, 1U>(blocks) : qpf2k_core_fits<GdnRecurrentStorage::key_value, 1U>(blocks))
                                  : (vk ? qpf2k_core_fits<GdnRecurrentStorage::value_key>(blocks) : qpf2k_core_fits<GdnRecurrentStorage::key_value>(blocks)));
         if ((qpf2k & 4U) && !fused_a8 && count % 8U == 0U && count >= 8U && first.head_dim == 128U && fits) {
+            // Check the actual FP16 variants' cooperative residency before replacing any FP32 stores.
+            const auto fits16 = [&]<unsigned Cc, unsigned Nan>() {
+                return vk ? qpf2k_core_fits<GdnRecurrentStorage::value_key, 1U, Cc, Nan, true>(blocks)
+                          : qpf2k_core_fits<GdnRecurrentStorage::key_value, 1U, Cc, Nan, true>(blocks);
+            };
+            const bool f16 = core16 && lean && (four
+                ? (dispatch ? fits16.template operator()<4U, 1U>() && fits16.template operator()<4U, 2U>() : fits16.template operator()<4U, 3U>())
+                : (dispatch ? fits16.template operator()<2U, 1U>() && fits16.template operator()<2U, 2U>() : fits16.template operator()<2U, 3U>()));
+            if (f16) core16->a16 = qpf2k_core16_scratch(stream, count);
             const auto qk_channels = first.key_heads * 2U * 128U;
             const unsigned segs = count >= 64U * kQpf2kSegments ? kQpf2kSegments : 1U;
             const unsigned seg_rows = (count / segs + 31U) / 32U * 32U, nseg = (count + seg_rows - 1U) / seg_rows;
@@ -5159,6 +5207,11 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
             const void* norm_w = reinterpret_cast<const void*>(first.tensors.norm.runtime->address);
             auto norm_kind = small_weight_kind(first.tensors.norm.manifest->ggml_type);
             float eps = config.model.rms_norm_epsilon; auto xch = scratch.exchange;
+            if (f16) {
+                xch.core16 = core16->a16;
+                xch.core16_pitch = q8_rows::tiled::scratch_pitch(6144U);
+                xch.core16_overflow = q8_rows::dense_f16_overflow_counter();
+            }
             void* args[] = {&rows_arg, &count_arg, &state_arg, &key_heads_arg, &conv_arg, &conv_w_arg, &conv_kind_arg, &norm_w, &norm_kind,
                 &eps, &xch};
             using KV = std::integral_constant<GdnRecurrentStorage, GdnRecurrentStorage::key_value>;
@@ -5168,8 +5221,15 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
                                             : reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<GdnRecurrentStorage::value_key, 4U, 2U, kQpf2kCoreWaves, 8U, 2U>))
                                     : (pipe ? reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<KV::value, 4U, 2U, kQpf2kCoreWaves, 8U, 2U, true>)
                                             : reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<KV::value, 4U, 2U, kQpf2kCoreWaves, 8U, 2U>));
+            if (f16) kernel = vk
+                ? reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<GdnRecurrentStorage::value_key, 4U, 2U, kQpf2kCoreWaves, 8U, 2U, false, 1U, 3U, true>)
+                : reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<KV::value, 4U, 2U, kQpf2kCoreWaves, 8U, 2U, false, 1U, 3U, true>);
             // gdn-dense variants (lean only): Nan 2 (pinned, runs iff the flag is set) then Nan 1 (VOPD, runs iff clear).
             const auto variant = [&]<GdnRecurrentStorage S, unsigned Nan>() -> const void* {
+                if (f16) {
+                    if (four) return reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, 4U, 2U, 4U, 6U, false, 1U, Nan, true>);
+                    return reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, 2U, kQpf2kCoreWaves, 8U, 6U, false, 1U, Nan, true>);
+                }
                 if (four) return reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, 4U, 2U, 4U, 6U, false, 1U, Nan>);
                 // t1 (bench): the post-order tree (Opt 6, 201 VGPRs) is faster than Opt 2 at 2 columns too (9.92 vs 10.10 ms per 8K call)
                 return reinterpret_cast<const void*>(&qpf2k_gdn::gdn_core_kernel<S, 4U, 2U, kQpf2kCoreWaves, 8U, 6U, false, 1U, Nan>);
@@ -5445,7 +5505,50 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
         check_hip(hipGetLastError(), "GDN prefill tiled input projection launch");
         return true;
     };
+    Qpf2kCore16Route core16;
+    const auto prepare_core16 = [&]() {
+        static const bool enabled = [] { const char* v = std::getenv("STRIX_QPF2K_GDN_CORE16"); return v && v[0] == '1'; }();
+        static const auto minimum = [] {
+            const char* v = std::getenv("STRIX_QPF2K_GDN_CORE16_MIN_ROWS");
+            const int n = v ? std::atoi(v) : 2048;
+            return n >= 0 ? static_cast<std::uint32_t>(n) : 2048U;
+        }();
+        if (!enabled || !tiled_rows || !q8_rows::tiled::site_enabled(2U) || count < minimum ||
+            first.value_width != 6144U || first.head_dim != 128U) return false;
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        if (hipStreamIsCapturing(stream, &capture) != hipSuccess || capture != hipStreamCaptureStatusNone) return false;
+        std::uint64_t si = 0, so = 0;
+        if (!uniform(0U, count, [](const auto& row) { return static_cast<const void*>(row.workspace.core); }, si) ||
+            !uniform(0U, count, [](const auto& row) { return reinterpret_cast<const void*>(row.output.address); }, so)) return false;
+        auto& out = core16.site;
+        out.segments = q8_rows::segments({{reinterpret_cast<const void*>(first.tensors.out.runtime->address), first.hidden}});
+        out.width = first.value_width; out.outputs = first.hidden;
+        out.input0 = reinterpret_cast<const unsigned char*>(first.workspace.core); out.input_stride = si;
+        out.output0 = reinterpret_cast<unsigned char*>(first.output.address); out.output_stride = so;
+        if (!q8_rows::tiled::supported(out, count, q8_rows::tiled::kPre)) return false;
+        core16.form = gdn_prefill_env("STRIX_QPF2K_GDN_CORE16_FORM", 4U, {0U, 1U, 2U, 3U, 4U});
+        static const auto raster = [] {
+            const char* v = std::getenv("STRIX_QPF2K_GDN_CORE16_RASTER");
+            const int n = v ? std::atoi(v) : 2;
+            return n >= 1 && n <= 64 ? static_cast<unsigned>(n) : 2U;
+        }();
+        core16.raster = raster;
+        return true;                        // the core still must select a resident F16 lean variant
+    };
     const auto tiled_out = [&]() {
+        if (core16.a16) {
+            // Same FP16 bits and K16 order as inline FP32 staging. Forms 3/4 have the same per-output arithmetic;
+            // the fixture gates forms 0..4 bitwise in kPre and inline modes. Bypass launch()'s conversion/form policy.
+            q8_rows::tiled::launch_projection<GdnOutputTiledSite, q8_rows::tiled::kPre>(core16.site, count, stream, false,
+                core16.form, core16.raster, core16.a16);
+            check_hip(hipGetLastError(), "qpf2k GDN core16 output projection launch");
+            static std::once_flag once;
+            std::call_once(once, [&] {
+                std::fprintf(stderr, "qpf2k GDN core16: fp16 core rows + output projection form %u raster %u rows %u\n",
+                    core16.form, core16.raster, count);
+            });
+            return true;
+        }
         if (!tiled_rows || !q8_rows::tiled::site_enabled(2U)) return false;
         std::uint64_t si = 0, so = 0;
         if (!uniform(0U, count, [](const auto& row) { return static_cast<const void*>(row.workspace.core); }, si) ||
@@ -5485,6 +5588,8 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
     const auto input_stride = gdn_prefill_input_stride(tiles);
     const bool rows = rows_env && input_stride && gdn_prefill_rows_shape(first, strided, count);
     static const bool qpf2k_check = [] { const char* v = std::getenv("STRIX_QPF2K_GDN_CHECK"); return v && v[0] == '1'; }();
+    // Decide before the producer: check modes and every fallback must retain FP32 core rows.
+    const bool core16_candidate = rows && !check && !qpf2k_check && prepare_core16();
     if (rows && qpf2k_check && qpf2k_gdn_parts() && !check) {
         // The production row kernels on a snapshot of the inputs, then the qpf2k kernels on the same inputs.
         const GdnPrefillSnapshot inputs(first, strided, count, false);
@@ -5508,7 +5613,8 @@ void enqueue_gdn_prefill_rows(const std::vector<std::array<GdnKnownWindowRow, 8U
     if (!rows || !check) {
         if (rows) {
             if (fused_slot.codes) fused_a8 = &fused_slot;
-            enqueue_gdn_prefill_core_rows(tiles, strided, input_stride, config, fused_a8);
+            enqueue_gdn_prefill_core_rows(tiles, strided, input_stride, config, fused_a8, qpf2k_gdn_parts(),
+                core16_candidate ? &core16 : nullptr);
         } else enqueue_gdn_prefill_core_tiles(tiles, strided, config);
         if (!tiled_out()) each_width(project_out, none);
         return;

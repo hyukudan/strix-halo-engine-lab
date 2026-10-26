@@ -4,6 +4,7 @@
 #include "strix/hip_runtime_launchers.hpp"
 #include "strix/launch_dispatch.hpp"
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <memory>
@@ -81,6 +82,16 @@ void moe_route_known_prefill_rows_preflight(std::span<const ExecutionDispatchCon
     const HipMoeRouteLauncherConfig& config);
 void moe_route_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipMoeRouteLauncherConfig& config);
+// Bit-identity self-test + bench of the prefill selection forms (STRIX_PREFILL_ROUTER_SELECT=1 wave-per-row kernel vs the
+// block-per-row kernel) on generated logits (flavor 0 uniform, 1 ties, 2 NaN payloads, 3 +-Inf/+-0/denormals/max, 4 degenerate
+// rows, 5 exp underflow). Returns {rows, rows differing, old us/call, new us/call} (bench only when bench_reps > 0).
+// Bit-identity self-test + bench of the decode staged router logits with activations staged in LDS (STRIX_ROUTER_STAGE_ACT=1)
+// vs the incumbent staged kernel: E512 x 2560 F32 weights, rows 1/2/4/8 (BF16 activations; float for <= 2 rows), flavor 1 adds
+// NaN/Inf weights and -Inf activations. Returns {logits, logits differing, old us/call, new us/call} (bench when bench_reps > 0).
+std::array<double, 4> router_staged_logits_selftest(std::uint32_t rows_count, bool float_activation, std::uint32_t flavor,
+    std::uint32_t seed, std::uint32_t bench_reps);
+std::array<double, 4> router_prefill_select_selftest(std::uint32_t flavor, std::uint32_t tiles, std::uint32_t experts,
+    std::uint32_t top_k, bool normalize, std::uint32_t seed, std::uint32_t bench_reps);
 
 // Source-only native MTP entry points; qualification is separate.
 struct MtpNativeContext;

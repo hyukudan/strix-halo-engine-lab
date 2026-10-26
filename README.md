@@ -254,7 +254,7 @@ node decodes; 64 generated tokens identical to the node-only run at every length
 
 | Mode | Hardware | 1K | 4K | 8K | 16K | 32K | Date | Build |
 |---|---|---:|---:|---:|---:|---:|---|---|
-| Prefill, TTFT | 1 node | **1.12 s** | **3.02 s** | | **14.64 s** | **22.95 s** | 2026-10-24 (1K/16K); 2026-10-25 (4K/32K) | `0117a140` (1K/16K); combined opt-in profile below |
+| Prefill, TTFT | 1 node | **1.12 s** | **3.02 s** | | **14.64 s** | **22.95 s** | 2026-10-24 (1K/16K); 2026-10-25 (4K/32K) | `0117a140` (1K/16K); combined profile below (default on) |
 | Prefill offload, TTFT | RTX PRO + 1 node | **1.36 s** | **1.92 s** | **2.94 s** | **4.95 s** | **8.99 s** | 2026-10-24 | `70b93af3` |
 | Same server without the RTX, TTFT | 1 node | 1.80 s | 5.20 s | 10.46 s | 21.43 s | 44.02 s | 2026-10-24 | same server build |
 
@@ -269,10 +269,10 @@ two replicas at concurrency 4 and 8: 3.9 % and 3.6 % more wall throughput, and a
 concurrency 4. Details in [docs/performance.md](docs/performance.md#qwen38-flash-next-1).
 
 **Exact combined prefill optimization (2026-10-25).** One Strix Halo node, Qwen3.8-Flash-Next
-UD-Q4_K_XL, opt-in flags; TTFT includes prompt processing. Prompt kind, repetition counts and generated-token
+UD-Q4_K_XL, combined profile (on by default); TTFT includes prompt processing. Prompt kind, repetition counts and generated-token
 counts are unspecified for these latest measurements.
 
-| Prompt length (2026-10-25) | Baseline TTFT | Opt-in TTFT | Change | Opt-in tok/s |
+| Prompt length (2026-10-25) | Baseline TTFT | Combined TTFT | Change | Combined tok/s |
 |---|---:|---:|---:|---:|
 | 4K | 3.31 s | **3.02 s** | −8.6 % | 1,356 |
 | 17.7K | 14.63 s | **12.52 s** | −14.4 % | 1,414 |
@@ -282,11 +282,12 @@ counts are unspecified for these latest measurements.
 | 262,143 tokens | 294.5 s | **248.0 s** | −15.8 % | 1,057 |
 
 About **39–49 %** of the calculated single-node bandwidth ceiling. The 128K result used an earlier variant.
-The combined profile remains opt-in; outputs are exact. Build `443166fa` covers 4K, 17.7K and 64K;
+The combined profile is on by default and exact; `STRIX_QPF2K_DEFAULTS=0` (or one switch set to `0`) restores the baseline path. Build `443166fa` covers 4K, 17.7K and 64K;
 32K and 262,143 tokens used the same optimization set on earlier builds.
 
-Exact MTP draft attention is enabled by default in build `226bb691`. Decode-router work remains under evaluation:
-one-row activation staging improves the draft router, but the combined end-to-end gain is not yet established.
+Exact MTP draft attention is enabled by default in build `226bb691`. Two exact router changes are on by default:
+activation staging for the draft and 1/2/4-row window router logits (`STRIX_ROUTER_STAGE_ACT=0` turns it off) and the
+prefill router's wave-per-row selection (`STRIX_PREFILL_ROUTER_SELECT=0`); their combined end-to-end gain is not yet established.
 Batched MTP drafting remains opt-in. The GSQ measurements below cover a separate opt-in speed-over-quality
 profile.
 

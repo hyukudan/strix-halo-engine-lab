@@ -31,7 +31,7 @@ raw lab receipts and review correspondence remain outside Git.
 | DeepSeek V4.1 Flash 1017, Q2 experts + 6.5-bit/trellis dense | Two Strix Halo nodes TP2 over USB4, short R1 benchmark; `69c6bdab` | Median **29.0 ms/token** (34.5 tok/s); **58.2 %** of calculated bandwidth ceiling | Three interleaved pairs; token/window/reject and batch reference gates pass |
 | Same, batch N=8 | Same hardware, fixed decode benchmark | Median **72.20 ms/step** (110.8 tok/s aggregate); **64.4 %** of bandwidth ceiling | Three interleaved pairs; all batch rows match the reference |
 | DeepSeek standalone RTX, Q2 GGUF (IQ2_XXS gate/up, Q2_K down), Q8_0 dense | RTX PRO 6000 (96 GB, Windows WDDM), exclusive VRAM + pinned-host cache, DSpark pruned to 64 experts per stage; code / English / Spanish workloads | Same-load warm controller + write-backs: **82.3 / 87.7 / 94.4 tok/s**, **51–58 %** of the ceiling corresponding to the calculated 6.18 ms/token all-hit floor; code range across loads **82–95 tok/s** | Exact gates pass; compare within one load |
-| Qwen3.8-Flash-Next, UD-Q4_K_XL, combined prefill candidate | One Strix Halo node, opt-in flags; prompt lengths in table below | TTFT **3.02–248.0 s** across 4K–262,143 tokens; **~39–49 %** of single-node bandwidth ceiling | Exact; 128K measured on an earlier variant |
+| Qwen3.8-Flash-Next, UD-Q4_K_XL, combined prefill (on by default) | One Strix Halo node, combined profile; prompt lengths in table below | TTFT **3.02–248.0 s** across 4K–262,143 tokens; **~39–49 %** of single-node bandwidth ceiling | Exact; 128K measured on an earlier variant |
 | Qwen MTP decode, UD-Q4_K_XL, dense A8 | One node, code 1K / 8K, auto windows, 256 generated tokens; `702bc074`, 2026-10-25 | **59.59 / 54.00 tok/s**; 1K **69 %** of the 86.8 tok/s byte ceiling | Each run matches its recipe golden; prose 8K **49.58 tok/s** on `226bb691`, same date, exact |
 | DeepSeek pipeline, expert-TP identity | RTX PRO + pair over 1 GbE, two request groups; pair `6525d5e8`, CUDA `463c08ec` line | Batch N2/4/8 **60.1 / 97.5 / 137.2 tok/s**; DSpark N1/2/4 **52.4 / 91.3 / 156.8 tok/s** wall aggregate (2026-10-24); short-set server C1/2/4/8 **43.2 / 65.8 / 77.9 / 91.7 tok/s** (2026-10-25) | Batch: 8 benchmark prompts × 48 tokens; bitwise reference gates. Server: 8-category short set, token IDs equal pair-only in 32/32 requests |
 | MiniMax M3.1 Flash, EXL3 3.06 bpw, exchange-boundary candidate | Two Strix Halo nodes TP2 over USB4, matched replay, 1K / 8K | **44.40 / 48.32 ms/token** (22.52 / 20.70 tok/s); **65.7 / 60.4 %** of bandwidth ceiling | Exact replay; defaults integrated in `8cc30ac0`, combined confirmation pending |
@@ -52,7 +52,7 @@ are unspecified for the latest RTX and GLM decode measurements.
 | Persistent loaded worker | **8–18 s per request** on test workloads without reload; cache reset to fresh-load state **3.4 s** | **In development**; each request bitwise identical to a fresh process |
 | Window prefetch | Gain not established | Implemented, exact; default off, under investigation |
 
-| Qwen combined exact prefill, one node, 2026-10-25 | Baseline TTFT | Opt-in TTFT | Change | Opt-in tok/s |
+| Qwen combined exact prefill, one node, 2026-10-25 | Baseline TTFT | Combined TTFT | Change | Combined tok/s |
 |---|---:|---:|---:|---:|
 | 4K | 3.31 s | **3.02 s** | −8.6 % | 1,356 |
 | 17.7K | 14.63 s | **12.52 s** | −14.4 % | 1,414 |
@@ -61,7 +61,7 @@ are unspecified for the latest RTX and GLM decode measurements.
 | 128K | 122.2 s | **114.2 s** | −6.5 % | 1,147 |
 | 262,143 tokens | 294.5 s | **248.0 s** | −15.8 % | 1,057 |
 
-Qwen's combined profile remains opt-in; the 128K measurement used an earlier variant.
+Qwen's combined profile is on by default (`STRIX_QPF2K_DEFAULTS=0` restores the baseline); the 128K measurement used an earlier variant.
 Build `443166fa` covers 4K / 17.7K / 64K; earlier builds measured the same optimization set at 32K / 262,143.
 Prompt kind and generated-token counts are unspecified in these latest prefill measurements.
 
@@ -69,7 +69,7 @@ The pair's shared-expert grouped launches remain enabled where admitted; server 
 because its first-request benefit did not extend across serving workloads. R6 never-slower behavior and the
 latest serving campaign remain unresolved.
 
-Qwen's combined prefill candidate stays opt-in. Exact MTP draft attention is enabled in the integration
+Qwen's combined prefill is on by default. Exact MTP draft attention is enabled in the integration
 line; batched MTP drafting and router changes still need complete-workload qualification. GSQ is an opt-in
 speed-over-quality profile, never the default; its complete code-decode comparison and measured quality cost
 are in the [README GSQ table](../README.md#gsq-opt-in-speed-over-quality-profile).

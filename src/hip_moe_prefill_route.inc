@@ -22,7 +22,10 @@
 // same bytes after the merge in every case (only when clear_words == hidden, i.e. exactly the words the merge covers).
 inline bool& prefill_clear_skipped_flag(){static thread_local bool v=false;return v;}
 inline int& prefill_route_override(){static int v=-1;return v;}
+// Per-call (this thread): bit 1 DA16, bit 2 ROUTE defaulted ON but off for this GSQ call (see enqueue_prefill).
+inline unsigned& prefill_moe_gsq_off(){static thread_local unsigned v=0U;return v;}
 inline unsigned prefill_route() {
+    if(prefill_moe_gsq_off()&2U)return 0U;
     static const unsigned env=[]{const char* v=std::getenv("STRIX_QPF2K_MOE_ROUTE");const int n=v?std::atoi(v):0;
         return n>=0&&n<=15?static_cast<unsigned>(n):0U;}();
     const int o=prefill_route_override();
