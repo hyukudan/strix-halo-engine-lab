@@ -17,9 +17,10 @@ This is our own C++/HIP inference engine for **AMD Strix Halo** (Ryzen AI Max+ 3
   RTX PRO 6000 reading the prompt, a 32K-token prompt gets its first token in **9.0 s**.
 - **DeepSeek V4.1 Flash** split across **two nodes over USB4** (expert tensor parallel), optionally with an
   **RTX PRO 6000** taking the first 22 layers. Code prompts decode at **70.6 tok/s** on the pair (prose about
-  42-45 tok/s) and **81.1 tok/s** with the RTX PRO; the latest batch benchmark reaches **110.8 tok/s** aggregate.
+  42-45 tok/s) and **81.1 tok/s** with the RTX PRO; a newer batch build reaches **111.9 tok/s** aggregate (2026-10-26, pending publication).
 - **MiniMax M3.1 Flash** on the pair has passed its eight-text quality gate; greedy decode takes
-  **44.40 ms/token at 1K**. **GLM-5.3 Flash** now decodes on the pair at **21.07 tok/s**.
+  **44.57 ms/token at 1K**; fresh 8K prefill takes **17.73 s**. **GLM-5.3 Flash** reaches
+  **22.1 tok/s** in the default R1 identity on its latest measured build (2026-10-26; conditions below).
 - **DeepSeek on an RTX PRO 6000 (96 GB, Windows WDDM)** runs the target and DSpark draft on that GPU,
   with an exclusive VRAM + pinned-host cache: exact decode **82–95 tok/s** for code; same-load code / English /
   Spanish rates are **82.3 / 87.7 / 94.4 tok/s** (2026-10-25; conditions below).
@@ -107,8 +108,8 @@ The command produces a JSON receipt with token IDs and timing. Actual model file
 | **DeepSeek V4.1 Flash** (1017; 2-bit experts, 6.5-bit + trellis dense) | 2 nodes over USB4 | **Production** (two-node defaults D-061) | Expert tensor parallel decode, expert parallel device prefill, DSpark speculative decode, batched decode, server; bitwise gates |
 | DeepSeek V4.1 Flash + RTX PRO 6000 | RTX PRO (layers 0-21) + 2 nodes (22-39) | **Production** (D-064) | Pipeline split over 1 GbE, CUDA prefill service, hot-expert placement |
 | DeepSeek V4.1 Flash, standalone RTX | RTX PRO 6000 (96 GB, Windows WDDM) | **Production** | Q2 GGUF experts, Q8_0 dense; exclusive VRAM + pinned-host cache; on-GPU DSpark with warm controller selected as the speculative default |
-| MiniMax M3.1 Flash (EXL3, 3.06 bpw) | 2 nodes TP2 over USB4 | **Production** | Eight-text quality gate passed; exact prefill and decode; newer combined optimizations await confirmation |
-| GLM-5.3 Flash (EXL3, 4.05 bpw) | 2 nodes TP2 over USB4 | **Production** | Exact default R1 decode, fused attention projections; R≥3 buffer fault fixed; R1b summation order remains an opt-in, versioned identity |
+| MiniMax M3.1 Flash (EXL3, 3.06 bpw) | 2 nodes TP2 over USB4 | **Production** | Eight-text quality gate passed; exact prefill and decode; measured prefill and exchange improvements pending publication |
+| GLM-5.3 Flash (EXL3, 4.05 bpw) | 2 nodes TP2 over USB4 | **Production** | Exact R1 decode and real-model chunked prefill; R≥3 fix verified on the pair; R1b remains a separate opt-in identity |
 
 The core knows no model: each family is a module with its own contract, plan, kernels and gates
 ([docs/models/model-families.md](docs/models/model-families.md)). The automatic profiles only admit the pinned model files listed in
@@ -138,8 +139,8 @@ How to read the tables:
 - **tok/s** is decode speed after the prompt has been read, for one request unless the concurrency says
   otherwise. **TTFT** is time to first token.
 - **Build** identifies the measured code revision; results apply to that build and configuration.
-- Medians of 3 or more runs unless stated otherwise; repetition counts are unspecified for the latest
-  2026-10-25 measurements. Older dates remain where that mode has not been re-measured.
+- Medians of 3 or more runs unless stated otherwise. The latest 2026-10-25/26 rows give repetition counts
+  where recorded; unspecified counts must not be assumed to be medians. Older dates remain for modes not re-measured.
 
 Hardware: **1 node** = one Strix Halo (128 GB). **2 nodes** = two Strix Halo joined by two USB4 cables.
 **RTX PRO** = an RTX PRO 6000 Blackwell (96 GB) in a PC on 1 GbE.
@@ -164,6 +165,33 @@ a 6.5-bit overlay with trellis-coded attention, shared-expert and head weights. 
 | Server, 8-category short set | 2 nodes | 36-303-token prompts | 1 / 2 / 4 / 8 | | **39.88 / 61.66 / 66.53 / 74.25 tok/s** aggregate | 2026-10-24 | `cab238d6` |
 | Server TTFT | 2 nodes | 8K, warm server idle | 1 | **11.80 s** | **26.40 s** while 4 other streams decode; fresh-server first request 12.72 s | 2026-10-24 | `cab238d6` |
 
+**Newer pair measurements — in development (2026-10-26).** Same Q2/6.5-bit/trellis profile and USB4 TP2;
+shared-down fusion in `cb5ef228` (integrated into `69176409`), three interleaved pairs per cell:
+
+| Decode benchmark | Measured median | Calculated ceiling share | Verification |
+|---|---:|---:|---|
+| One stream | **28.48 ms/token** | **59.2 %** (16.87 ms floor) | tokens equal on both ranks |
+| Six-row verify window | **53.34 ms/window** | **58.6 %** (31.28 ms floor) | window/reject and operation-hash gates equal |
+| Eight streams, no drafting | **71.48 ms/step** (111.9 tok/s aggregate, calculated) | **65.0 %** (46.48 ms floor) | all batch rows equal the reference |
+
+Prompt kind/context are unspecified for these short decode benchmarks. Gains versus `69c6bdab` are about
+**1.4 / 1.7 / 1.0 %**, respectively. Publication and complete serving qualification remain pending:
+`69c6bdab` measured **−6.2 %** single-client serving throughput versus the preceding build in both test orders
+(**44.05 / 43.68 vs 46.75 / 46.76 tok/s**, warmed short-set campaign, reference IDs equal).
+The single-request benchmark does not establish serving performance.
+
+**Exact split gate/up MoE prefill kernel ("form 7") — in development (2026-10-26).** Two nodes, same profile,
+one model load per comparison, all logits bit-identical to the archived reference: 2K TTFT **−2.75 %** (8/8 interleaved
+pairs, a second run −3.7 %), 8K TTFT **−0.43 s, −3.81 %** (4/4 pairs). MoE layer time −3 to −6 % at 600–8,192 tokens.
+Pending 1K confirmation and publication.
+
+**Exact dense-prefill selector — in development, opt-in (2026-10-26, `78ccffce`).** Two nodes, row-split
+prefill, 6.5-bit dense overlay, expert TP off: 2K TTFT **3.96 → 3.74 s (−5.5 %)** and 8K
+**11.68 → 11.08 s (−5.1 %)**, same-process A/B; logits identical. The full-depth reference gate is bitwise
+on both ranks. Prompt kind is unspecified. Attention-TP, prefix/extend and longer-context qualification
+remain pending; FP16 arithmetic variants are off because they fail quality qualification.
+
+The `69c6bdab` benchmark rows above also await publication.
 The pair retains grouped shared-expert launches where admitted. Server plan warm-up remains off by
 default: its first-request gain did not hold across the complete serving workload. These pair results do not
 imply that every verify-window or serving configuration is faster.
@@ -207,9 +235,25 @@ Prompt lengths and generated-token counts are unspecified for these latest decod
 
 | Loading / serving work (2026-10-25) | Measured result | Status |
 |---|---|---|
-| Pipelined expert loading | Full load **108.7 → 61.8 s**; expert fill **83.1 → 38.0 s**, **2.25 → 6.73 GB/s**, disk-bound | **In development**; bitwise-identical placement and outputs |
+| Pipelined expert loading | Full load **108.7 → 61.8 s**; expert fill **83.1 → 38.0 s**, **2.25 → 6.73 GB/s**, disk-bound | **In development** in this engine (loader published in [tierstream](https://github.com/hyukudan/tierstream)); bitwise-identical placement and outputs |
 | Persistent loaded worker | **8–18 s per request** on test workloads without reload; fresh-load cache reset **3.4 s** | **In development**; each request bitwise identical to a fresh process |
-| Window prefetch | Gain not established | Implemented, exact; default off, under investigation |
+| Window prefetch | No repeatable gain in matched warm comparisons | Exact; default off |
+
+**Cold start, same standalone RTX profile (2026-10-26).** In-development persistent worker,
+tested binary `1569bce5`; runtime write-back/flush switches preserve fresh-process tokens, logits and state
+(6/6 offline comparisons). These are step timings, not chat throughput or TTFT:
+
+| Configuration | Step 0 | Mean steps 0–15 | Mean steps 16–63 |
+|---|---:|---:|---:|
+| Fresh load | 332.6 ms | 56.05 ms | 28.15 ms |
+| Fresh load with saved residency seed | 156.0 ms | 44.67 ms | 25.66 ms |
+| Worker with graph pre-capture | 11.0 ms | 33.99 ms | 27.26 ms |
+| Worker, warm expert cache | 10.9 ms | 11.63 ms | 11.49 ms |
+
+Graph pre-capture adds **1.5 s before readiness**. Prompt kind/length are unspecified for this exact-phase
+benchmark. Pipelined loading and persistent serving remain in development in this repository.
+The RTX default-on integration (keep-64, deferred write-backs, warm controller) still awaits its final
+no-flag-versus-explicit-configuration gate; the measured **82–95 tok/s** code range remains the quoted result.
 
 ### Qwen3.8-Flash-Next
 
@@ -268,28 +312,42 @@ every run exact): TTFT 2.3 % (1K), 3.4 % (4K) and 5.1 % (16K, 32K) lower; decode
 two replicas at concurrency 4 and 8: 3.9 % and 3.6 % more wall throughput, and a 6.9 % lower TTFT at
 concurrency 4. Details in [docs/performance.md](docs/performance.md#qwen38-flash-next-1).
 
-**Exact combined prefill optimization (2026-10-25).** One Strix Halo node, Qwen3.8-Flash-Next
-UD-Q4_K_XL, combined profile (on by default); TTFT includes prompt processing. Prompt kind, repetition counts and generated-token
-counts are unspecified for these latest measurements.
+**Exact combined prefill (2026-10-26).** One Strix Halo node, Qwen3.8-Flash-Next UD-Q4_K_XL,
+dense A8 profile; build `8b99cf58`, defaults without environment overrides. Same-node comparisons
+against `4a44683b`, except the maximum-context same-build off comparison. Terminal FP32 logits and tokens
+match the reference at every length; code-1K and prose-8K qualification receipts match the archived baseline.
+Prompt kind is unspecified for the length sweep.
 
-| Prompt length (2026-10-25) | Baseline TTFT | Combined TTFT | Change | Combined tok/s |
-|---|---:|---:|---:|---:|
-| 4K | 3.31 s | **3.02 s** | −8.6 % | 1,356 |
-| 17.7K | 14.63 s | **12.52 s** | −14.4 % | 1,414 |
-| 32K | 25.78 s | **22.95 s** | −11.0 % | 1,428 |
-| 64K | 52.98 s | **46.86 s** | −11.5 % | 1,398 |
-| 128K | 122.2 s | **114.2 s** | −6.5 % | 1,147 |
-| 262,143 tokens | 294.5 s | **248.0 s** | −15.8 % | 1,057 |
+| Prompt tokens | Baseline TTFT | Default TTFT | Change | Default tok/s | Contract ceiling share |
+|---|---:|---:|---:|---:|---:|
+| 4,096 | 3.53 s | **3.00 s** | −15.0 % | 1,363 | 43.4 % of 3,139 tok/s |
+| 17,700 | 14.97 s | **12.81 s** | −14.4 % | 1,382 | 44.7 % of 3,089 tok/s |
+| 32,768 | 25.95 s | **23.49 s** | −9.5 % | 1,395 | 45.3 % of 3,078 tok/s |
+| 65,536 | 55.37 s | **48.18 s** | −13.0 % | 1,360 | 44.9 % of 3,030 tok/s |
+| 131,072 | 120.96 s | **105.84 s** | −12.5 % | 1,238 | 42.6 % of 2,907 tok/s |
+| 262,143 | 291.82 s (same-build off) | **240.62 s** | −17.5 % | 1,089 | 40.5 % of 2,687 tok/s |
 
-About **39–49 %** of the calculated single-node bandwidth ceiling. The 128K result used an earlier variant.
-The combined profile is on by default and exact; `STRIX_QPF2K_DEFAULTS=0` (or one switch set to `0`) restores the baseline path. Build `443166fa` covers 4K, 17.7K and 64K;
-32K and 262,143 tokens used the same optimization set on earlier builds.
+Two runs per arm at 4K / 17,700; 32K has one baseline and two default runs; longer rows are single runs.
+Prompt tiles: 4,096 at 4K / 128K, 8,192 at 17,700 / 32K / 64K, 2,048 with 256/16-row tails at 262,143.
+Run-to-run and node-to-node spread reaches ~5 %; single comparisons are indicative.
 
-Exact MTP draft attention is enabled by default in build `226bb691`. Two exact router changes are on by default:
-activation staging for the draft and 1/2/4-row window router logits (`STRIX_ROUTER_STAGE_ACT=0` turns it off) and the
-prefill router's wave-per-row selection (`STRIX_PREFILL_ROUTER_SELECT=0`); their combined end-to-end gain is not yet established.
-Batched MTP drafting remains opt-in. The GSQ measurements below cover a separate opt-in speed-over-quality
-profile.
+[PR #49](https://github.com/hyukudan/strix-halo-engine-lab/pull/49) ships combined prefill, GDN gates batching/core16,
+and router selection/activation staging as defaults. [PR #50](https://github.com/hyukudan/strix-halo-engine-lab/pull/50)
+adds HC output v3 with band 16 (`5011b842`): 32K TTFT **−0.52 s (−2.2 %)** in three alternating pairs,
+4K **−54 ms (−1.8 %)** in two pairs; logits and tokens remain equal. A later single 32K run on that build
+measured **22.03 s, 1,487 tok/s (48.3 % of the 3,078 tok/s contract ceiling)**.
+`STRIX_QPF2K_DEFAULTS=0` restores the earlier prefill path; HC-specific off switches are
+`STRIX_QPF2K_HC_OUTPUT3=0` / `STRIX_QPF2K_HC_OUTPUT3_BAND=0`.
+
+**QSA stage batching — on by default (2026-10-26, [PR #51](https://github.com/hyukudan/strix-halo-engine-lab/pull/51)).**
+Exact 32K TTFT **22.21 / 22.66 / 22.76 → 21.57 / 22.32 / 22.58 s** (three pairs, mean **−0.39 s, −1.7 %**);
+on the published build, 32K in four ABBA pairs **−0.17 s** on average (every pair faster) and 64K **46.76 → 46.01 s (−1.6 %)**;
+17,700 **12.54 → 12.46 s** (one pair). Tokens, terminal logits and the code-1K / prose-8K qualification receipts match.
+`STRIX_QPF2K_QSA_MASK=0x57` restores the previous stages (default `0x257`).
+These timings are separate comparisons, not a new full-length sweep.
+
+Exact MTP draft attention and the router defaults are enabled in the public Qwen line.
+Batched MTP drafting remains opt-in. GSQ below is a separate speed-over-quality profile.
 
 ### GSQ: opt-in speed-over-quality profile
 
@@ -322,25 +380,29 @@ GSQ auto reaches about 64 % (113.8 tok/s ceiling) and the quality recipe about 6
 
 ### MiniMax M3.1 Flash
 
-All rows: MiniMax M3.1 Flash, EXL3 trellis weights at 3.06 bits per weight, two Strix Halo nodes TP2 over USB4.
-Production engine; batch and speculative rows retain their measured build.
+All rows: EXL3 trellis weights at 3.06 bpw, two Strix Halo nodes TP2 over USB4, greedy reference.
+The engine is Production; the newer optimization sets below are **in development, pending publication**.
 
-| Mode | Hardware | Prompt / context | Concurrency | Best | Typical | Date | Build |
-|---|---|---|---:|---:|---:|---|---|
-| Output check | 2 nodes | chat-templated prompts (prose, code, JSON, C++ edit) | 1 | coherent answers; speculative ids equal plain greedy in 4/4 | | 2026-10-24 | `44ec61f4` |
-| Greedy decode, exchange-boundary optimization | 2 nodes | 1K matched replay | 1 | **44.40 ms/token** (22.52 tok/s; 65.7 % of bandwidth ceiling) | exact replay against same-build baseline | 2026-10-25 | integrated in `8cc30ac0`; combined confirmation pending |
-| Greedy decode, exchange-boundary optimization | 2 nodes | 8K matched replay | 1 | **48.32 ms/token** (20.70 tok/s; 60.4 % of bandwidth ceiling) | exact replay against same-build baseline | 2026-10-25 | `8cc30ac0` |
-| Prefill, fresh baseline | 2 nodes | 1K / 8K benchmark prompts | 1 | TTFT **3.210 / 21.874 s** (8K: 374.5 tok/s) | exact; combined fresh result not yet measured | 2026-10-25 | `a1bbaefd` |
-| Prefill, combined optimizations | 2 nodes | 1K / 8K, same-process alternating runs | 1 | **2.73–2.75 / 19.6–20.2 s** | **0.82–0.85× / 0.78–0.83×** baseline time; bitwise state and final-row checks | 2026-10-25 | `a1bbaefd`; integrated in `561de319` |
-| Batched decode | 2 nodes | all-defaults bench | 1 / 2 / 4 / 8 | **20.75 / 30.52 / 42.09 / 57.59 tok/s** aggregate | each row identical to running alone | 2026-10-24 | `3ba49a3d` |
-| DSpark speculative decode | 2 nodes | JSON table conversion, 256 tokens | 1 | **52.03 tok/s** (×2.52) | | 2026-10-24 | `3ba49a3d` |
-| DSpark speculative decode | 2 nodes | Python code / prose, 256 tokens | 1 | **32.73 tok/s** (code, ×1.59) | DSpark roughly at or below plain speed on prose: 0.88-0.95× on a 6-language set (2026-10-25) | 2026-10-24 | `3ba49a3d` |
+| Mode | Prompt / context | Measured result | Date | Build / exactness |
+|---|---|---|---|---|
+| Greedy decode | 1K / 8K benchmark prompts, 256 tokens | **44.57 / 46.10 ms/token** (22.44 / 21.69 tok/s) | 2026-10-26 | `8cc30ac0`; ranks agree, reference IDs equal |
+| Fresh combined prefill | 8K benchmark prompt | **17.731 s**, 462 tok/s; baseline 21.874 s (**−19 %**); **36–39 %** of the calculated 6.3–7.0 s kernel floor | 2026-10-26 | `e0bad3d1`; both ranks' state/final logits equal archived production |
+| Fresh combined prefill | 32K benchmark prompt | **91.508 s**, 358 tok/s; **28–32 %** of the calculated 26–29 s kernel floor | 2026-10-26 | `e0bad3d1`; new reference, not an archived-reference exactness comparison |
+| Combined prefill, same process | 1K / 8K, three alternating pairs | **2.73–2.77 / 20.3–20.8 s**, **0.848–0.853× / 0.783–0.797×** baseline time | 2026-10-26 | `561de319`; state/final-row checks and tokens equal on both ranks |
+| Batch, fresh process per arm | N=1 / N=8, 1K benchmark | **43.92 / 130.24 ms/step** (N8: **61.4 tok/s aggregate**, calculated) | 2026-10-26 | `8cc30ac0`; each row equals running alone; batch invariance passes |
+| DSpark | JSON / Python / prose, 256 tokens | **54.4 / 34.1 / 24.1 tok/s** | 2026-10-26 | `8cc30ac0`; IDs equal greedy |
 
-The older DSpark and batch rows retain their measured build; they have not been re-timed on the new decode
-optimization. New exact prefill items measure **0.78–0.83×** baseline time at 8K and **0.82–0.85×** at 1K
-in the same process;
-a fresh run with all changes enabled is not yet measured. The bitwise expert gate/up kernel fix reduces MoE
-layer time by **4–8 %**; engine A/B confirmation is pending.
+Prompt kinds are unspecified for the prefill and batch benchmarks. Fresh-prefill rows are single runs;
+the 1K first-use result was **3.509 s**. The combined run later hit its time limit in another arm; only completed
+measurements are quoted. New prefill defaults in `561de319` include tiled dense projections, batched attention/router
+and exact-fit MoE row tiles. They preserve the production identity.
+
+Exchange-boundary defaults in `8cc30ac0` are qualified at 1K/8K/16K (16K synthetic repetition): matched
+replays save **4.20 / 2.82 / 3.09 ms/token**. In fresh-process batch A/B, N1/N8 fall from **48.22 / 134.03**
+to **43.92 / 130.24 ms/step**; the earlier N8 slowdown was traced to GPU thermal/power throttling under
+sustained load (about 96 °C, shader clock −20 % within ~100 s), not to the engine. The rows above are
+cold-start numbers from fresh processes; under sustained serving, measured decode is about 5 % and prefill
+about 15 % slower on this cooling (29 sequential requests: 44.9 → 47.2 ms/step). This does not justify a general serving speed claim. Further MoE/attention variants remain off.
 
 **Quality gate (2026-10-25): passed** the pre-registered eight-text evaluation, including two independent,
 byte-identical TP2 runs and all prompt/regime checks. Mean KL to the exact reference is **0.1449** versus
@@ -350,24 +412,25 @@ qualification is conditional on those eight texts; it supersedes the earlier two
 
 ### GLM-5.3 Flash
 
-EXL3 4.05 bpw, two Strix Halo nodes TP2 over USB4; default R1 identity.
-Prompt lengths and generated-token counts are unspecified for the latest decode measurement.
+EXL3 4.05 bpw, two Strix Halo nodes TP2 over USB4. Production engine; newer builds below are
+**in development, pending publication**. R1 remains the default numerical identity.
 
-| Mode | Prompt / context | Measured | Date | Status / exactness |
+| Mode | Prompt / context | Measured | Date | Build / exactness |
 |---|---|---:|---|---|
-| Greedy decode | Decode workload; default R1 | **47.47–47.51 ms/token = 21.07 tok/s**, previously 54.82 ms/token | 2026-10-25 | exact |
-| Fraction of bandwidth ceiling | same | **49 %** (calculated 23.2 ms/token floor) | 2026-10-25 | calculated bound |
-| Exact prefill rework | Synthetic gate model | **12.98 → 3.80 ms/token** (**3.4×** faster) | 2026-10-25 | real-model TTFT not yet measured |
-| R1b summation-order experiment | Alternative numerical identity | **99.14 %** top-1 agreement; closer to a float64 reference | 2026-10-25 | opt-in; not the default |
+| Greedy decode, R1 | 31-token chat prompt + 64 generated tokens | **45.29 ms/token = 22.1 tok/s**; **51 %** of calculated 23.2 ms floor | 2026-10-26 | `1836c99c`; tokens equal the reference |
+| Batch decode, R1 | Eight independent rows, benchmark context unspecified | **122.0 ms/step = 65.5 tok/s aggregate** | 2026-10-26 | `1836c99c`; tokens equal the earlier real-pair reference |
+| Exact chunked prefill | 1K / 8K / 32K benchmark prompts, kind unspecified | TTFT **4.268 / 34.70 / 144.75 s** (240 / 236 / 226 tok/s) | 2026-10-26 | `875ca821`, integrated in `41d8cfdc`; both ranks' logits bitwise equal the previous exact prefill |
+| R1b-fast, opt-in identity | Same chat benchmark, 96-token alternating comparison | **41.93–41.96 ms/token**, vs R1 47.33–47.48 (**−11.5 %**, **55 %** of 23.2 ms floor) | 2026-10-26 | `8877de1d`; stable within each identity, not bitwise to R1 |
+| R1b teacher-forced agreement | 32 prompts, 256 positions each; chat, code, JSON, math, reasoning, translation | **8,126/8,192 = 99.19 %** top-1; mean KL **~1.8e-3 nats** | 2026-10-26 | `4dad4c19`; free runs diverge on **28/32** prompts within 19–227 tokens |
 
-Fused attention projections and the revised HC path preserve the default identity. The R≥3 memory fault was
-fixed by removing a shadowed dimension constant; synthetic multi-row checks pass, while real-pair batch timing
-still needs confirmation. The exact prefill speedup above is measured only on the synthetic gate model;
-real-model TTFT remains unmeasured.
+The R≥3 buffer fix is verified on the real pair. The latest integration uses direct exchange for plain
+forwards and exact MoE v3 for prefill; the speculative oracle also passes with drained exchange switching.
+Prefill rows are single runs. They replace the earlier synthetic-only result.
 
-R1b changes FP32 summation order: it diverges from default greedy output on chat and code, while the tested
-prose and JSON continuations agree. Wider quality and timing qualification remains open; it is never silently
-substituted for R1.
+R1b changes FP32 summation order and remains opt-in; which identity is closer to float64 at full depth is
+unresolved. HIP graphs are **not implemented**: the latest profile (`41d8cfdc`) keeps the GPU busy **96.3 %** of each forward (was 80.8 %; 909 launches instead of 1,679) and leaves only **2.10 ms idle per forward**
+and a calculated recoverable gap of **≤1.8 ms** (a bound, not a measured speedup). Host progress across
+exchange boundaries requires segmented capture; device kernels and rank skew take priority.
 
 ## How exact, how good
 
@@ -565,9 +628,9 @@ The full record, with alternatives, evidence and the condition for reopening eac
 
 In progress, without promised numbers:
 
-- **MiniMax M3.1 Flash (EXL3) on the pair:** confirm combined decode defaults, measure combined prefill changes,
-  and finish serving qualification; the eight-text quality gate has passed.
-- **GLM-5.3 Flash:** faster default decode, real-pair prefill and batch confirmation, and wider R1b qualification.
+- **MiniMax M3.1 Flash (EXL3) on the pair:** publish the measured prefill/exchange defaults and resolve
+  order-dependent serving slowdown; the eight-text quality gate has passed.
+- **GLM-5.3 Flash:** publish measured R1 decode/prefill changes, reduce rank skew and qualify R1b more widely.
 - **DeepSeek:** a lower-latency ready path for the USB4 exchange and a closed defaults campaign for the newest
   opt-in flags; end-to-end time to first token of the exact CUDA prefill through the pair's server.
 - **Qwen:** continue combined prefill and decode-router qualification; GSQ remains an opt-in speed-over-quality profile.
