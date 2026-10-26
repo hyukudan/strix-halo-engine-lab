@@ -17,7 +17,7 @@ This is our own C++/HIP inference engine for **AMD Strix Halo** (Ryzen AI Max+ 3
   RTX PRO 6000 reading the prompt, a 32K-token prompt gets its first token in **9.0 s**.
 - **DeepSeek V4.1 Flash** split across **two nodes over USB4** (expert tensor parallel), optionally with an
   **RTX PRO 6000** taking the first 22 layers. Code prompts decode at **70.6 tok/s** on the pair (prose about
-  42-45 tok/s) and **81.1 tok/s** with the RTX PRO; a newer batch build reaches **111.9 tok/s** aggregate (2026-10-26, pending publication).
+  42-45 tok/s) and **91.3 tok/s** with the RTX PRO (2026-10-26); the 2026-10-26 pair build reaches **113.9 tok/s** aggregate (N8, calculated).
 - **MiniMax M3.1 Flash** on the pair has passed its eight-text quality gate; greedy decode takes
   **44.57 ms/token at 1K**; fresh 8K prefill takes **17.73 s**. **GLM-5.3 Flash** reaches
   **22.1 tok/s** in the default R1 identity on its latest measured build (2026-10-26; conditions below).
@@ -153,56 +153,52 @@ a 6.5-bit overlay with trellis-coded attention, shared-expert and head weights. 
 
 | Mode | Hardware | Prompt / context | Concurrency | Best | Typical | Date | Build |
 |---|---|---|---:|---:|---:|---|---|
-| Greedy decode | 2 nodes | short decode benchmark | 1 | **29.0 ms/token** (34.5 tok/s; 58.2 % of bandwidth ceiling) | same benchmark, median of 3 | 2026-10-25 evening | `69c6bdab` |
+| Greedy decode | 2 nodes | short decode benchmark, R1 | 1 | **28.333 ms/token** (35.3 tok/s; 59.5 % of calculated ceiling, 16.87 ms floor) | 2 interleaved pairs; tokens identical | 2026-10-26 | `6a5604bf` |
 | DSpark speculative decode | 2 nodes | 8 prompts per type, 256 tokens each | 1 | **70.6 tok/s** (code) | 41.9 (English) / 45.3 (Spanish); 50.0 over all 24 | 2026-10-24 | `cab238d6` |
-| Batched decode, no drafting | 2 nodes | N=8 decode benchmark, rows checked against reference | 8 | **72.20 ms/step** (110.8 tok/s aggregate; 64.4 % of bandwidth ceiling) | median of 3 | 2026-10-25 evening | `69c6bdab` |
-| Device prefill (expert parallel) | 2 nodes | 1K | 1 | TTFT **2.18 s** (469 tok/s) | | 2026-10-24 | `cab238d6` |
-| Device prefill | 2 nodes | 8K | 1 | TTFT **10.78 s** (760 tok/s) | | 2026-10-24 | `f9332f3e` |
+| Batched decode, no drafting | 2 nodes | N8 decode benchmark, all rows equal the reference | 8 | **70.24 ms/step** (113.9 tok/s aggregate, calculated; 66.2 % of calculated ceiling, 46.48 ms floor) | | 2026-10-26 | `6a5604bf` |
+| Device prefill (expert parallel) | 2 nodes | 1K benchmark prompt, kind unspecified | 1 | TTFT **1.954 s** | median of 4; logits bit-identical on both ranks | 2026-10-26 | `6a5604bf` |
+| Device prefill | 2 nodes | 8K benchmark prompt, kind unspecified | 1 | TTFT **9.757 s** | median of 3; logits bit-identical on both ranks | 2026-10-26 | `6a5604bf` |
 | Device prefill | 2 nodes | 16K | 1 | TTFT **20.40 s** (803 tok/s) | | 2026-10-24 | `f9332f3e` |
 | Device prefill | 2 nodes | 32K | 1 | TTFT **39.6 s** (828 tok/s), 2 runs | | 2026-10-23 | `43086d05` + prefill defaults |
 | Server, one client, chat | 2 nodes | chat prompt | 1 | **66.9 tok/s** (code) | 34.9 tok/s (prose) | 2026-10-22 | release |
 | Server, 8 chats × 128 tokens | 2 nodes | chat prompts | 1 / 2 / 4 / 8 | **41.4 / 54.0 / 59.7 / 67.9 tok/s** aggregate | | 2026-10-22 | release |
 | Server, 8-category short set | 2 nodes | 36-303-token prompts | 1 / 2 / 4 / 8 | | **39.88 / 61.66 / 66.53 / 74.25 tok/s** aggregate | 2026-10-24 | `cab238d6` |
+| Warmed server, 8-category short set | 2 nodes | same short set as above | 1 / 2 / 4 / 8 | **48.00 / 63.97 / 69.20 / 77.00 tok/s** aggregate | 64/64 IDs equal; C8 clean run (see below) | 2026-10-26 | `6a5604bf` |
 | Server TTFT | 2 nodes | 8K, warm server idle | 1 | **11.80 s** | **26.40 s** while 4 other streams decode; fresh-server first request 12.72 s | 2026-10-24 | `cab238d6` |
 
-**Newer pair measurements — in development (2026-10-26).** Same Q2/6.5-bit/trellis profile and USB4 TP2;
-shared-down fusion in `cb5ef228` (integrated into `69176409`), three interleaved pairs per cell:
+**On by default since 2026-10-26** in the pair build (`6a5604bf`): shared-down fusion
+(`STRIX_DS41_SHARED_DOWN_FUSED=0` to disable), split gate/up MoE prefill kernel "form 7"
+(`STRIX_DS41_MOE_PREFILL=0`), exact per-site dense prefill selector (`STRIX_DS41_DENSE_SELECT=0`;
+FP16 forms stay off), attention window fold / live chunks / f16 tile
+(`STRIX_DS41_ATTN_WINDOW_FOLD=0` / `STRIX_DS41_ATTN_LIVE_CHUNKS=0` / `STRIX_DS41_ATTN_TILE_F16=0`),
+and server warm-up + DSpark calibration (`STRIX_DS41_SERVE_WARM=0` / `STRIX_DS41_DSPARK_CALIB=0`).
+Measured gains versus `69c6bdab`, with the same GPU turns, Q2 experts + 6.5-bit/trellis dense profile,
+and two Strix Halo nodes using expert tensor parallel over USB4:
 
-| Decode benchmark | Measured median | Calculated ceiling share | Verification |
+| Measurement | `69c6bdab` → `6a5604bf` | Change | Verification / conditions |
 |---|---:|---:|---|
-| One stream | **28.48 ms/token** | **59.2 %** (16.87 ms floor) | tokens equal on both ranks |
-| Six-row verify window | **53.34 ms/window** | **58.6 %** (31.28 ms floor) | window/reject and operation-hash gates equal |
-| Eight streams, no drafting | **71.48 ms/step** (111.9 tok/s aggregate, calculated) | **65.0 %** (46.48 ms floor) | all batch rows equal the reference |
+| Device prefill TTFT, 1K | 2.098 → **1.954 s** | −6.9 % | median of 4 |
+| Device prefill TTFT, 8K | 11.090 → **9.757 s** | −12.0 % | median of 3 |
+| Greedy decode, R1 | 28.873 → **28.333 ms/token** | −1.9 % | 2 interleaved pairs; tokens identical; 35.3 tok/s, 59.5 % of calculated ceiling (16.87 ms floor) |
+| Six-row verify window, R6 | 54.01 → **52.70 ms/window** | −2.4 % | identical |
+| Eight streams, no drafting, N8 | 71.84 → **70.24 ms/step** | −2.2 % | all rows equal the reference; 113.9 tok/s aggregate (calculated), 66.2 % of calculated ceiling (46.48 ms floor) |
+| Warmed server, 8-category short set, C1 / C2 / C4 / C8 | 43.58 / 61.13 / 66.53 / 75.72 → **48.00 / 63.97 / 69.20 / 77.00 tok/s** aggregate | +9.9 / +3.0 / +2.9 / +1.7 % | token IDs 64/64 equal in every run |
+| Streaming, single client | 54.67 → **58.77 tok/s** | +7.4 % | same warmed-server campaign |
 
-Prompt kind/context are unspecified for these short decode benchmarks. Gains versus `69c6bdab` are about
-**1.4 / 1.7 / 1.0 %**, respectively. Publication and complete serving qualification remain pending:
-`69c6bdab` measured **−6.2 %** single-client serving throughput versus the preceding build in both test orders
-(**44.05 / 43.68 vs 46.75 / 46.76 tok/s**, warmed short-set campaign, reference IDs equal).
-The single-request benchmark does not establish serving performance.
-
-**Exact split gate/up MoE prefill kernel ("form 7") — in development (2026-10-26).** Two nodes, same profile,
-one model load per comparison, all logits bit-identical to the archived reference: 2K TTFT **−2.75 %** (8/8 interleaved
-pairs, a second run −3.7 %), 8K TTFT **−0.43 s, −3.81 %** (4/4 pairs). MoE layer time −3 to −6 % at 600–8,192 tokens.
-Pending 1K confirmation and publication.
-
-**Exact dense-prefill selector — in development, opt-in (2026-10-26, `78ccffce`).** Two nodes, row-split
-prefill, 6.5-bit dense overlay, expert TP off: 2K TTFT **3.96 → 3.74 s (−5.5 %)** and 8K
-**11.68 → 11.08 s (−5.1 %)**, same-process A/B; logits identical. The full-depth reference gate is bitwise
-on both ranks. Prompt kind is unspecified. Attention-TP, prefix/extend and longer-context qualification
-remain pending; FP16 arithmetic variants are off because they fail quality qualification.
-
-The `69c6bdab` benchmark rows above also await publication.
-The pair retains grouped shared-expert launches where admitted. Server plan warm-up remains off by
-default: its first-request gain did not hold across the complete serving workload. These pair results do not
-imply that every verify-window or serving configuration is faster.
+Prefill uses benchmark prompts of unspecified kind; logits are bit-identical to the archived reference
+on every run on both ranks. Prompt kind/context are unspecified for the short decode benchmarks.
+Server: two runs per arm in both orders; one of the two new-build runs had a single prefill unit stall
+of 3.8 s (cause under investigation), so C8 uses the clean run. The 2026-10-26 pair build supersedes
+the earlier single-client serving regression: it serves faster than `69c6bdab`.
 
 **DeepSeek with the RTX PRO, pipeline split** (same model files; the RTX runs layers 0-21 with CUDA, the two nodes run
 layers 22-39 and the head):
 
 | Mode | Hardware | Prompt / context | Concurrency | Best | Typical | Date | Build |
 |---|---|---|---:|---:|---:|---|---|
-| DSpark speculative decode | RTX PRO + 2 nodes | 8 prompts per type, 256 tokens each | 1 | **81.1 tok/s** (code) | 50.3 (English) / 54.2 (Spanish); 61.8 over all 24 | 2026-10-22 | release |
-| Greedy decode | RTX PRO + 2 nodes | short prompt | 1 | **38.3 tok/s** | same | 2026-10-22 | release |
+| DSpark speculative decode | RTX PRO + 2 nodes | 8 prompts per type, 256 tokens each | 1 | **91.3 tok/s** (code) | 56.0 (English) / 61.5 (Spanish); 69.6 over all 24 (was 61.8, +12.6 %); tokens 24/24 identical to the 2026-10-22 run; exact identity without trellis shared expert: 90.0 / 54.9 / 59.6, 68.2 over all 24 (was 61.7) | 2026-10-26 | pair `6a5604bf`; RTX front = PR #52 code + decode-option wiring (pending publication) |
+| Greedy decode | RTX PRO + 2 nodes | same 24 prompts, 256 tokens each | 1 | **43.2 tok/s** (was 38.3, +12.8 %) | same; tokens 24/24 identical, reference-gated | 2026-10-26 | pair `6a5604bf`; RTX front = PR #52 code + decode-option wiring (pending publication) |
+| Server TTFT | RTX PRO + 2 nodes | 1K / 8K, warm | 1 | **2.14 / 10.92 s** | pair-only on the same pair build 2.11 / 10.74 s (the split adds 23 / 181 ms); token IDs equal | 2026-10-26 | pair `6a5604bf`; RTX front = PR #52 code + decode-option wiring (pending publication) |
 | Batched decode, no drafting | RTX PRO + 2 nodes | 8 benchmark prompts, 48 tokens; 2 groups in flight | 2 / 4 / 8 | **60.1 / 97.5 / 137.2 tok/s** aggregate | bitwise equal to pair-only reference | 2026-10-24 | pair `6525d5e8`, CUDA `463c08ec` line |
 | Batched DSpark decode | RTX PRO + 2 nodes | same benchmark, controller windows | 1 / 2 / 4 | **52.4 / 91.3 / 156.8 tok/s** wall aggregate | bitwise reference gates | 2026-10-24 | same line |
 | Server, 8-category short set | RTX PRO + 2 nodes | short prompts, DSpark; 2 groups in flight | 1 / 2 / 4 / 8 | **43.2 / 65.8 / 77.9 / 91.7 tok/s** aggregate | token IDs equal pair-only in 32/32 requests | 2026-10-25 | pair `6525d5e8`, CUDA `463c08ec` |
