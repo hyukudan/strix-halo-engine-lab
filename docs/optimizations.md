@@ -1758,18 +1758,18 @@ Overlap two whole layers of the chunked prefill, and start the host exchange asy
 - **Measured gain:** 8K about -4 %; the exchange is fully hidden (GPU idle per 2K prefill 0.97 to 0.09 s)
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
 
-### Prefill chunk rows 2048
+### Prefill chunk rows 4096
 
-**Engine:** `glm`. **Control:** `--max-rows`. **Default:** 2048 (baseline 1024).
+**Engine:** `glm`. **Control:** `--max-rows`. **Default:** 4096 (baseline 1024).
 
-Process prefill in 2048-row chunks.
+Process prefill in 4096-row chunks.
 
 - **Preconditions:** Exact chunked prefill.
-- **Automatic selection:** Default 2048; --max-rows wins; --baseline uses 1024.
+- **Automatic selection:** Default 4096; --max-rows wins; --baseline uses 1024.
 - **Fallback notice:** None.
 - **Exactness evidence:** Logits equal to the reference prefill on both ranks at 1K/8K/32K.
-- **Off switch:** --max-rows 1024 or --baseline
-- **Measured gain:** 8K 35.65 to 31.39 s (-12 %) with the pipeline on
+- **Off switch:** --max-rows 2048 / 1024, or --baseline
+- **Measured gain:** with the pipeline on: 8K 35.1 s at 1024, 32.1 s at 2048, 30.1-30.8 s at 4096; 32K 136.7 to 128.4 s vs 2048
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
 
 <a id="glm-pf-indexer-v2"></a>

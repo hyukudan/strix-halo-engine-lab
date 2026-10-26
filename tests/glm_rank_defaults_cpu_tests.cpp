@@ -93,8 +93,8 @@ void test_plain_equals_receipt() {
     if (!why.empty()) std::fprintf(stderr, "  ttft receipt diff: %s\n", why.c_str());
     // the old code's default (--mtp 1) sent the plain decode command to the row-by-row reference prefill
     CHECK(resolve(cat(cat(kDeploy, kDecodeWork), {"--mtp", "1"}), {}).prefill == "ref");
-    // prefill chunk rows (x3): default 2048 = the TTFT receipts' --max-rows; baseline 1024 (the old app default); explicit wins
-    CHECK(plain.max_rows.value == "2048" && plain.max_rows.source == "default");
+    // prefill chunk rows: default 4096; baseline 1024 (the old app default); explicit wins
+    CHECK(plain.max_rows.value == "4096" && plain.max_rows.source == "default");
     CHECK(resolve(cat(kDeploy, kTtftWork), {}).max_rows.source == "explicit");
     CHECK(resolve(cat(cat(kDeploy, kDecodeWork), {"--max-rows", "1024"}), {}).max_rows.value == "1024");
     CHECK(resolve(cat(cat(kDeploy, kDecodeWork), {"--baseline"}), {}).max_rows.value == "1024");
