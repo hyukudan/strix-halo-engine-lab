@@ -708,13 +708,18 @@ bool spec_gate(BatchForward& fwd, strix::ds41::dspark::DeviceDrafter* drafter, c
             }
             std::printf(",\"adapter\":{\"compiled\":%s,\"requested\":%s,\"active\":%s,\"capacity\":%u,"
                         "\"vocabulary_size\":%u,\"payload_bytes\":%llu,\"steps\":%llu,\"hits\":%llu,\"misses\":%llu,\"map_rebuilds\":%llu,"
-                        "\"fallback_windows\":%llu,\"errors\":%llu}}\n",
+                        "\"fallback_windows\":%llu,\"errors\":%llu",
                         after.compiled ? "true" : "false", after.requested ? "true" : "false", after.active ? "true" : "false",
                         after.capacity, after.vocabulary_size, static_cast<unsigned long long>(after.payload_bytes),
                         delta(after.steps, lookahead_before.steps),
                         delta(after.hits, lookahead_before.hits), delta(after.misses, lookahead_before.misses),
                         delta(after.map_rebuilds, lookahead_before.map_rebuilds),
                         delta(after.fallback_windows, lookahead_before.fallback_windows), delta(after.errors, lookahead_before.errors));
+            std::printf(",\"library_version\":");
+            lookahead_json_string(after.library_version);
+            std::printf(",\"library_config\":");
+            lookahead_json_string(after.library_config);
+            std::printf("}}\n");
         }
         std::fflush(stdout);
     }

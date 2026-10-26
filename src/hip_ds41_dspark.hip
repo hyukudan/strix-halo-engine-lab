@@ -23,6 +23,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace strix::ds41::dspark {
 namespace {
@@ -33,6 +34,8 @@ void check(hipError_t status, const char* what) {
 hipStream_t as_stream(void* stream) { return static_cast<hipStream_t>(stream); }
 
 #if defined(STRIX_ENABLE_LOOKAHEAD)
+static_assert(std::string_view{STRIX_LOOKAHEAD_LIBRARY_VERSION} == "0.4.2",
+              "lookahead footprint requires LookaheadCache 0.4.2");
 static_assert(markov_rank == SL_PAIR_RANK);
 constexpr std::uint32_t lookahead_status_offset = block_size + 1U;
 constexpr std::uint32_t lookahead_hit_offset = lookahead_status_offset + block_size;
@@ -42,6 +45,17 @@ constexpr std::uint32_t lookahead_token_slots = lookahead_hit_offset + block_siz
 void bump(std::uint64_t& value, std::uint64_t amount = 1U) {
     const auto limit = std::numeric_limits<std::uint64_t>::max();
     value = amount > limit - value ? limit : value + amount;
+}
+
+void lookahead_json_string(std::FILE* file, std::string_view value) {
+    std::fputc('"', file);
+    for (const char raw : value) {
+        const auto c = static_cast<unsigned char>(raw);
+        if (c == '"' || c == '\\') std::fprintf(file, "\\%c", static_cast<int>(c));
+        else if (c < 0x20U) std::fprintf(file, "\\u%04x", static_cast<unsigned>(c));
+        else std::fputc(static_cast<int>(c), file);
+    }
+    std::fputc('"', file);
 }
 
 std::optional<std::uint32_t> environment_lookahead_capacity() {
@@ -854,9 +868,6 @@ struct DeviceDrafter::Impl {
         ctx.extra_rows = Buffer<std::uint8_t>(static_cast<std::size_t>(8192) * output.row_bytes);
         ctx.logits_extra = Buffer<float>(static_cast<std::size_t>(block_size) * 8192);
         advance_epoch(ctx.vocabulary_epoch);
-#if defined(STRIX_ENABLE_LOOKAHEAD)
-        bind_lookahead(ctx.lookahead_binding, ctx.core, ctx.extra_host);
-#endif
         return ctx;
     }
 
@@ -958,9 +969,8 @@ struct DeviceDrafter::Impl {
     }
     void bind_lookahead(std::unique_ptr<LookaheadBinding>& binding, std::uint32_t selected_core,
                         const std::vector<std::uint32_t>& selected_extra) {
-        if (!lookahead_counts.requested || world != 1U) return;
+        if (!lookahead_counts.requested || world != 1U || binding) return;
         require_outside_capture();
-        if (binding) throw std::logic_error("lookahead-cache: attempted to overwrite a live binding");
         auto fresh = std::make_unique<LookaheadBinding>();
         fresh->size = selected_core + static_cast<std::uint32_t>(selected_extra.size());
         std::vector<std::uint32_t> mapping;
@@ -1051,7 +1061,10 @@ struct DeviceDrafter::Impl {
 #endif
             std::fprintf(lookahead_trace.get(), "%s%u", r ? "," : "", hit);
         }
-        std::fputc(']', lookahead_trace.get());
+        std::fputs("],\"library_version\":", lookahead_trace.get());
+        lookahead_json_string(lookahead_trace.get(), lookahead_counts.library_version);
+        std::fputs(",\"library_config\":", lookahead_trace.get());
+        lookahead_json_string(lookahead_trace.get(), lookahead_counts.library_config);
         if (lookahead_counts.requested && !used_lookahead)
             std::fprintf(lookahead_trace.get(), ",\"fallback_reason\":\"%s\"",
                 lookahead_counts.compiled ? "vocabulary_sharded" : "not_compiled");
@@ -1297,6 +1310,8 @@ struct DeviceDrafter::Impl {
 DeviceDrafter::DeviceDrafter(const Weights& weights) : impl_(std::make_unique<Impl>(weights)) {
 #if defined(STRIX_ENABLE_LOOKAHEAD)
     impl_->lookahead_counts.compiled = true;
+    impl_->lookahead_counts.library_version = STRIX_LOOKAHEAD_LIBRARY_VERSION;
+    impl_->lookahead_counts.library_config = STRIX_LOOKAHEAD_LIBRARY_CONFIG;
 #endif
     if (const auto* path = std::getenv("STRIX_LOOKAHEAD_TRACE")) {
         // A trace starts with the first draft and must not overwrite or append
@@ -1322,7 +1337,6 @@ void DeviceDrafter::set_vocabulary(const Vocab& vocabulary) {
     m.extra_host.clear();
     std::fill(m.member.begin(), m.member.end(), 0U);
     m.push_extra(vocabulary.extra);
-    m.bind_active_lookahead();
 }
 std::size_t DeviceDrafter::add_vocabulary(std::span<const std::uint32_t> ids) {
     auto& m = *impl_;
@@ -1336,7 +1350,6 @@ std::size_t DeviceDrafter::add_vocabulary(std::span<const std::uint32_t> ids) {
     if (!fresh.empty()) {
         m.invalidate_active_lookahead();
         m.push_extra(fresh);
-        m.bind_active_lookahead();
     }
     return fresh.size();
 }
@@ -1352,8 +1365,8 @@ void DeviceDrafter::configure_lookahead(bool enabled, std::uint32_t capacity, st
     auto& m = *impl_;
     m.require_outside_capture();
     if (enabled) (void)lookahead_footprint(capacity, sequences(), payload_budget_bytes);
-    // All handles borrow the same stream/model; reconfiguration is a binding
-    // boundary, not a reset/rebind performed from the inference hot path.
+    // All handles borrow the same stream/model. Clear them at reconfiguration;
+    // each context binds once on its next draft after rank/vocabulary setup.
 #if defined(STRIX_ENABLE_LOOKAHEAD)
     m.clear_lookahead(m.lookahead_binding);
     for (auto& context : m.parked) m.clear_lookahead(context.lookahead_binding);
@@ -1362,14 +1375,10 @@ void DeviceDrafter::configure_lookahead(bool enabled, std::uint32_t capacity, st
     m.lookahead_counts.capacity = capacity;
     m.lookahead_budget = payload_budget_bytes;
     m.advance_epoch(m.vocabulary_epoch);
-    m.bind_active_lookahead();
     for (std::size_t i = 0; i < m.parked.size(); ++i) {
         if (i == m.active) continue;
         auto& context = m.parked[i];
         m.advance_epoch(context.vocabulary_epoch);
-#if defined(STRIX_ENABLE_LOOKAHEAD)
-        m.bind_lookahead(context.lookahead_binding, context.core, context.extra_host);
-#endif
     }
 }
 LookaheadStats DeviceDrafter::lookahead_stats() const noexcept {
@@ -1533,6 +1542,8 @@ Draft DeviceDrafter::draft(std::uint32_t token, bool keep_logits, DraftTimes* ti
     auto& m = *impl_;
     constexpr std::uint32_t rows = block_size;
     if (token >= vocab) throw std::invalid_argument("ds41 dspark draft token");
+    // Bind once after rank/vocabulary setup, before any draft work is enqueued.
+    m.bind_active_lookahead();
     const auto start = clock::now();
     const std::uint64_t first = m.next, oldest = std::max(first > window ? first - window : std::uint64_t{0}, m.start);
     const auto ring_keys = static_cast<std::uint32_t>(first - oldest);

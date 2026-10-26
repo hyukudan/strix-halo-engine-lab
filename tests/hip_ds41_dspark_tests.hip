@@ -215,6 +215,33 @@ void compare_drafts(const Draft& dev, const Draft& host, const std::string& labe
     std::cout << '\n';
 }
 
+void test_lookahead_changed_context(DeviceDrafter& device, std::span<const float> main) {
+    // Distinct cache slots keep the initial predecessor warm across the window.
+    const Vocab candidates{0U, {100000U, 100001U}};
+    const auto seed = main.first(static_cast<std::size_t>(3U) * hidden);
+    const auto changed = normal_values(static_cast<std::size_t>(3U) * main_width, 1.0F, 90);
+    device.configure_lookahead(false);
+    device.reset();
+    device.set_vocabulary(candidates);
+    device.append(seed, 3U);
+    const auto before = device.draft(100000U, true);
+    device.append_hidden(changed, 3U);
+    const auto after = device.draft(100000U, true);
+    expect(mismatches(before.logits, after.logits) != 0U,
+           "lookahead changed context changes existing-path base logits");
+
+    device.reset();
+    device.append(seed, 3U);
+    device.configure_lookahead(true, 16U);
+    compare_drafts(device.draft(100000U, true), before, "lookahead changed context cold");
+    const auto warm = device.lookahead_stats();
+    device.append_hidden(changed, 3U);
+    compare_drafts(device.draft(100000U, true), after, "lookahead changed context warm");
+    const auto repeated = device.lookahead_stats();
+    expect(repeated.hits > warm.hits && repeated.map_rebuilds == warm.map_rebuilds,
+           "lookahead changed context hits without rebinding");
+}
+
 // The same resident weights, committed rings and input token exercise the
 // original fused head, the uncached library and the cached library. Keeping
 // logits also checks the predecessor embeddings consumed by confidence.
@@ -264,15 +291,15 @@ void test_lookahead_binding(DeviceDrafter& device, std::span<const float> main) 
     (void)device.draft(42U, false);
     const auto before_reorder = device.lookahead_stats();
     device.set_vocabulary(reordered);
+    compare_drafts(device.draft(42U, true), reordered_reference, "lookahead reordered mapping");
     expect(device.lookahead_stats().map_rebuilds == before_reorder.map_rebuilds + 1U,
            "same-size vocabulary reordering creates a new immutable binding");
-    compare_drafts(device.draft(42U, true), reordered_reference, "lookahead reordered mapping");
     const std::array<std::uint32_t, 3> extra{125000U, 125000U, 42U};
     const auto before_growth = device.lookahead_stats();
     expect(device.add_vocabulary(extra) == 1U, "lookahead vocabulary growth deduplicates ids");
+    compare_drafts(device.draft(42U, true), grown_reference, "lookahead appended candidate");
     expect(device.lookahead_stats().map_rebuilds == before_growth.map_rebuilds + 1U,
            "vocabulary growth rebuilds even when the source allocation has spare capacity");
-    compare_drafts(device.draft(42U, true), grown_reference, "lookahead appended candidate");
     const auto before_noop = device.lookahead_stats();
     expect(device.add_vocabulary(extra) == 0U, "lookahead repeated context ids do not grow the vocabulary");
     expect(device.lookahead_stats().map_rebuilds == before_noop.map_rebuilds,
@@ -313,6 +340,7 @@ void test_lookahead_binding(DeviceDrafter& device, std::span<const float> main) 
     device.set_vocabulary(one);
     device.append(main.first(static_cast<std::size_t>(3U) * hidden), 3U);
     check_reuse(block_size - 1U, "lookahead recreated context has a cold cache");
+    test_lookahead_changed_context(device, main);
     device.select(0U);
     device.set_sequences(1U);
     device.set_vocabulary(Vocab{});
@@ -464,6 +492,7 @@ void test_two_ranks(const Files& f) {
     auto [ta, tb] = strix::dist::memory_pair();
     std::unique_ptr<strix::dist::Transport> transports[2] = {std::move(ta), std::move(tb)};
     Draft results[2][3];
+    LookaheadStats fallback_before[2], fallback_after[2];
     double head_ms[2] = {};
     std::exception_ptr errors[2];
     std::thread ranks[2];
@@ -473,10 +502,12 @@ void test_two_ranks(const Files& f) {
                 strix::dist::Communicator comm({r, 2U, 1U, 88U}, std::move(transports[r]), 64U);
                 std::uint64_t request = 0;
                 DeviceDrafter d(w);
+                d.configure_lookahead(true, 16U);
                 d.set_rank(r, 2U, [&](void* stream, const void* local, void* remote, std::size_t bytes) {
                     comm.exchange(static_cast<hipStream_t>(stream), local, remote, bytes,
                                   strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::argmax), 0U, request++});
                 });
+                fallback_before[r] = d.lookahead_stats();
                 d.append_hidden(std::span<const float>(seed).first(static_cast<std::size_t>(128) * main_width), 128);
                 d.append_hidden(std::span<const float>(seed).subspan(static_cast<std::size_t>(128) * main_width), 2);
                 DraftTimes t;
@@ -486,10 +517,19 @@ void test_two_ranks(const Files& f) {
                 results[r][1] = d.draft(h1.tokens[3], false);
                 d.set_vocabulary(restricted);
                 results[r][2] = d.draft(h1.tokens[3], false);
+                fallback_after[r] = d.lookahead_stats();
             } catch (...) { errors[r] = std::current_exception(); }
         });
     for (auto& t : ranks) t.join();
     for (auto& e : errors) if (e) std::rethrow_exception(e);
+    for (std::uint32_t r = 0; r < 2U; ++r) {
+        const auto& before = fallback_before[r];
+        const auto& after = fallback_after[r];
+        expect(before.requested && !before.active && before.payload_bytes == 0U && before.map_rebuilds == 0U &&
+                   after.requested && !after.active && after.payload_bytes == 0U && after.map_rebuilds == 0U &&
+                   after.fallback_windows == before.fallback_windows + 3U && after.steps == 0U,
+               "lookahead requested TP2 fallback never creates a binding, rank " + std::to_string(r));
+    }
     const Draft* host_drafts[3] = {&h1, &h2, &h3};
     for (std::uint32_t r = 0; r < 2U; ++r)
         for (std::uint32_t k = 0; k < 3U; ++k) {

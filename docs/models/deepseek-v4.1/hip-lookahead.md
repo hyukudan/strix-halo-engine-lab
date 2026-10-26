@@ -2,7 +2,7 @@
 
 The HIP resident drafter can use the external
 [LookaheadCache](https://github.com/hyukudan/lookahead-cache) C ABI package,
-version 0.4.2 or later, for its rank-256 proposal head. The library is installed
+exactly version 0.4.2, for its rank-256 proposal head. The library is installed
 separately. Its source, models and benchmark data are not copied into this engine.
 The library is AMD Strix Halo (HIP) first and modular; its CUDA backend exists
 in the library, and CUDA engine integration is in progress (not part of this PR).
@@ -31,8 +31,8 @@ Access to the dependency repository or a preinstalled HIP package must be
 provided separately by its owner. The engine does not fetch the dependency over
 the network during configuration or compilation.
 
-Use an authorized, separate LookaheadCache checkout whose package version is at
-least 0.4.2. The 0.4.2 source revision used for this integration is
+Use an authorized, separate LookaheadCache checkout whose package version is
+exactly 0.4.2. The 0.4.2 source revision used for this integration is
 [`9d060f7a59d3bf0bc6fe626cbd73309e85240036`](https://github.com/hyukudan/lookahead-cache/commit/9d060f7a59d3bf0bc6fe626cbd73309e85240036).
 The commands below assume it already exists at `../lookahead-cache` and that
 ROCm is installed at `/opt/rocm`; adjust the SDK prefix and HIP compiler when
@@ -67,9 +67,13 @@ cmake --build build-lookahead \
   --target strix-deepseek41-batch strix-hip-ds41-dspark-tests --parallel 2
 ```
 
-CMake requires the installed `LookaheadCache::hip` target when the adapter is
+CMake uses `find_package(LookaheadCache 0.4.2 EXACT CONFIG REQUIRED)` and
+requires the installed `LookaheadCache::hip` target when the adapter is
 enabled. A default build does not search for the package. To return to a build
 without the adapter, configure with `-DSTRIX_ENABLE_LOOKAHEAD_CACHE=OFF`.
+A compile-time version guard protects the hardcoded entry/workspace footprint.
+To bump the dependency, re-qualify the new version, update that footprint and its
+guard, and update the exact CMake pin together.
 
 ## Runtime modes and memory
 
@@ -93,7 +97,12 @@ A caller that enables the adapter manually must reserve
 `configure_lookahead`. Actual active and parked payload bytes are exposed by
 `lookahead_stats().payload_bytes`.
 
-Each sequence context owns its binding and cache. Context switching preserves
+Each sequence context allocates its binding on the first draft after rank and
+vocabulary setup, outside graph capture and before draft work is enqueued. No
+lookahead binding or payload is allocated during construction or setup; a drafter
+configured with `world=2` before drafting never allocates either. Vocabulary
+changes clear the old binding and defer rebuilding until the next draft.
+Context switching preserves
 that context's entries; reset invalidates them. Vocabulary replacement, including
 reordering without a size change, rebuilds the binding. Vocabulary growth also
 rebuilds it; adding only IDs already present retains it. Binding and reset calls
@@ -109,6 +118,24 @@ device-result failures stop the draft instead of silently changing paths midway
 through its token chain.
 
 ## Correctness before timing
+
+PR #54 stays draft until all of the following pass on the intended native device:
+
+- The library's native HIP contracts.
+- The real-weight integration fixture, including a multi-candidate warm hit after
+  different committed hidden rows change the base logits, with bitwise proposal,
+  confidence, embedding, base-logit and stage-output equality.
+- Full-model (40-layer) target token, retained-row and final-state gates for the
+  existing head, capacity zero and the requested cached capacity, with active
+  adapter work in the library arms.
+- Request-slot reuse, including context recreation/reset without stale cache or
+  target state, and vocabulary replacement/growth.
+- Requested TP2 vocabulary-sharded fallback, including rank 0 of 2, with no
+  lookahead binding ever created, zero resident payload and recorded fallbacks.
+
+Skipped device/model tests count as unavailable, not passes. Host tests,
+configuration and linking do not satisfy these gates. No native qualification or
+performance result is claimed here.
 
 First run the library's native HIP contract test on the intended device:
 
@@ -131,10 +158,14 @@ The integration fixture uses real checkpoint weights and synthetic hidden inputs
 It compares the existing head, the uncached library and the cached library for
 tokens, confidence, predecessor embeddings, base logits and stage outputs. It
 also exercises reduced vocabularies, same-size reordering, growth, context
-switching, reset and context recreation. A successful integration fixture emits
+switching, reset, context recreation, changed contextual logits on warm hits and
+requested TP2 fallback. A successful single-rank integration fixture emits
 `STRIX_LOOKAHEAD_MODEL_TEST` with `fixture=real_weights_synthetic_hidden`; both that
 receipt and successful process exit are required. Skipping the weights or the
-compiled adapter does not qualify the integration.
+compiled adapter does not qualify the integration. The subsequent two-rank
+fixture must also pass; the single-rank receipt alone does not cover TP2 fallback.
+Request-slot reuse in the complete batch workload remains a separate gate and
+must be recorded explicitly; the command below alone does not establish it.
 
 The target verifier can correct changed proposals, so an end-to-end token check
 alone cannot establish proposal/confidence equivalence. After the native fixture,
@@ -172,12 +203,20 @@ The row/state FNV checks are digests, not collision-free bitwise proofs.
 `STRIX_LOOKAHEAD_RECEIPT=1` adds one `STRIX_LOOKAHEAD_RUN` JSON record per batch
 case, outside the measured decode loop. It includes the effective mode, payload
 bytes, step/hit/miss counters, binding rebuilds, fallbacks and errors, together
-with workload and target-verification fields. Rebuild deltas include setup since
-the case began, while decode time excludes that setup; do not interpret those
-deltas as a decode-only breakdown.
+with workload and target-verification fields. `library_version` and
+`library_config` identify the exact package version and resolved package config
+path captured at configure time (empty when the adapter is not compiled). The
+0.4.2 installed package exports no library git revision; its provenance file
+contains historical baseline/review revisions rather than an installed revision.
+Record the actual dependency checkout revision and binary fingerprint separately
+with qualification evidence. Rebuild deltas cover the case since setup began.
+Bindings are created lazily on the first draft after setup or vocabulary changes,
+so their cost is included
+when that draft falls inside the measured decode interval.
 
 `STRIX_LOOKAHEAD_TRACE=/path/to/new-file.jsonl` records each draft's predecessor
-tokens, cache-hit flags, context, vocabulary epoch and capacity after the existing
+tokens, cache-hit flags, context, vocabulary epoch, capacity and the same library
+identity fields after the existing
 result download. The file must not already exist. Records are flushed and checked;
 tracing adds host I/O and must be disabled for timing. A separate file is required
 per process/drafter. `qualify_engine.py --trace` enables separate qualification
