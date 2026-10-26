@@ -4686,8 +4686,7 @@ bool launch_persistent_hyper_rows(const PreparedHyperMix& p, const HyperRows& ro
     return true;
 }
 bool persistent_hyper_rows_enabled() {
-    static const bool enabled = strix_fuse_switch("STRIX_HC_PERSISTENT");
-    return enabled;
+    return strix_hc_persistent_enabled();
 }
 // STRIX_MTP_HC_PERSISTENT=1 (STRIX_DISPATCH_FUSE=1): one HC mix of the draft chain (one row, BF16 streams,
 // F32 norm, Q8_0 down/up, F32 [4][10240] injection or none) as the persistent launch: one dispatch instead of
@@ -4929,7 +4928,7 @@ std::vector<std::uint64_t> hip_hyper_mix_testing_persistent_trace() {
 bool hyper_mix_known_window_rows_launch_injected(std::span<const ExecutionDispatchContext> inject_rows,
     const HipElementwiseLauncherConfig& inject_config, std::span<const ExecutionDispatchContext> rows,
     const HipHyperMixLauncherConfig& config) {
-    static const bool enabled = strix_fuse_switch("STRIX_HC_PERSISTENT_INJECT");
+    const bool enabled = strix_hc_persistent_inject_enabled();
     if (!enabled || inject_rows.size() != rows.size()) return false;
     const auto prepared = prepare_hyper_rows(rows, config);
     if (!persistent_hyper_rows_eligible(prepared, config) || inject_config.activation != config.activation ||

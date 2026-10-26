@@ -122,6 +122,14 @@ enum class HipQsaRowsProbeMode { rows, rows_a8, row_loop };
 void launch_hip_qsa_rows_projection_probe(HipQsaRowsProjection, HipQsaRowsProbeMode,
     std::span<const HipQsaInputProjectionView> input, HipQsaInputProjectionView weights,
     std::span<const HipQsaInputProjectionView> output, std::uint32_t width, std::uint32_t outputs, void* stream);
+// T = 1/2/4/8 rows of the dense A8 sites with GSQ-RCO typed segments (ggml types, 8 = Q8_0) through the engine's own
+// site types and q8_rows::launch: input = BF16 rows -> BF16-rounded FP32 (1..5 segments, output[m * rows + r]),
+// output = FP32 rows -> BF16 (one segment, output[r]). Input side, 16 / 32 rows of one typed (non-Q8) kind: the cohort
+// window dispatcher (launch_qsa_rows_input with typed_rows8 = true).
+void launch_hip_qsa_gsq_rows_probe(HipQsaRowsProjection, std::span<const std::uint32_t> types,
+    std::span<const HipQsaInputProjectionView> weights, std::span<const std::uint32_t> counts,
+    std::span<const HipQsaInputProjectionView> input, std::span<const HipQsaInputProjectionView> output,
+    std::uint32_t width, void* stream);
 #endif
 
 // Experimental post-projection C1 norm/RoPE/KV stage. Async on caller's

@@ -20,7 +20,7 @@ This is our own C++/HIP inference engine for **AMD Strix Halo** (Ryzen AI Max+ 3
   42-45 tok/s) and **91.3 tok/s** with the RTX PRO (2026-10-26); the 2026-10-26 pair build reaches **113.9 tok/s** aggregate (N8, calculated).
 - **MiniMax M3.1 Flash** on the pair has passed its eight-text quality gate; greedy decode takes
   **44.57 ms/token at 1K**; fresh 8K prefill takes **17.73 s**. **GLM-5.3 Flash** reaches
-  **22.1 tok/s** in the default R1 identity on its latest measured build (2026-10-26; conditions below).
+  **22.1 tok/s** in the measured R1 identity on its latest measured build (2026-10-26; conditions below).
 - **DeepSeek on an RTX PRO 6000 (96 GB, Windows WDDM)** runs the target and DSpark draft on that GPU,
   with an exclusive VRAM + pinned-host cache: exact decode **82–95 tok/s** for code; same-load code / English /
   Spanish rates are **82.3 / 87.7 / 94.4 tok/s** (2026-10-25; conditions below).
@@ -54,7 +54,7 @@ For detailed implementation internals, use [How it works](#how-it-works) and the
 
 ## Quick start: build and run one model
 
-This minimal example is for **one Linux Strix Halo node** with the required ROCm toolchain, model GGUF and a tokenizer-produced `prompt.ids` file. It runs **plain greedy Qwen decoding**, not the speculative benchmark configuration.
+This minimal example is for **one Linux Strix Halo node** with the required ROCm toolchain, model GGUF and a tokenizer-produced `prompt.ids` file. It runs **Qwen generation with the production defaults**, including automatic fast prefill for eligible prompts.
 
 ```bash
 git clone https://github.com/hyukudan/strix-halo-engine-lab.git
@@ -74,11 +74,10 @@ ctest --test-dir build --output-on-failure
 With the matching Qwen model and token IDs available in your working directory:
 
 ```bash
-./build/strix-hip-decode-token Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf $(cat prompt.ids) \
-  --context 8192 --execution-mode eager --residency register --generate 256 \
-  --optimization-profile auto \
-  --numerical-profile hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1
+./build/strix-hip-decode-token Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf $(cat prompt.ids) --generate 256
 ```
+
+Add `--print-effective-config` to see what it resolves to before HIP initialization. `--baseline` (or `STRIX_BASELINE=1`) restores the previous minimal resolution.
 
 The command produces a JSON receipt with token IDs and timing. Actual model files and prompt tokens are **not included**. For model assets, optional MTP/DSpark acceleration, serving and two-node transport, continue with [requirements](#what-you-need), [build](#build), [run](#run), and the [full engine reference](docs/getting-started/engine-reference.md). Some CTest cases require the GPU and model assets.
 
@@ -93,6 +92,7 @@ The command produces a JSON receipt with token IDs and timing. Actual model file
 [What you need](#what-you-need) ·
 [Build](#build) ·
 [Run](#run) ·
+[Optimizations](#optimizations) ·
 [How it works](#how-it-works) ·
 [Design decisions](#design-decisions) ·
 [Roadmap](#roadmap) ·
@@ -108,8 +108,8 @@ The command produces a JSON receipt with token IDs and timing. Actual model file
 | **DeepSeek V4.1 Flash** (1017; 2-bit experts, 6.5-bit + trellis dense) | 2 nodes over USB4 | **Production** (two-node defaults D-061) | Expert tensor parallel decode, expert parallel device prefill, DSpark speculative decode, batched decode, server; bitwise gates |
 | DeepSeek V4.1 Flash + RTX PRO 6000 | RTX PRO (layers 0-21) + 2 nodes (22-39) | **Production** (D-064) | Pipeline split over 1 GbE, CUDA prefill service, hot-expert placement |
 | DeepSeek V4.1 Flash, standalone RTX | RTX PRO 6000 (96 GB, Windows WDDM) | **Production** | Q2 GGUF experts, Q8_0 dense; exclusive VRAM + pinned-host cache; on-GPU DSpark with warm controller selected as the speculative default |
-| MiniMax M3.1 Flash (EXL3, 3.06 bpw) | 2 nodes TP2 over USB4 | **Production** | Eight-text quality gate passed; exact prefill and decode; measured prefill and exchange improvements pending publication |
-| GLM-5.3 Flash (EXL3, 4.05 bpw) | 2 nodes TP2 over USB4 | **Production** | Exact R1 decode and real-model chunked prefill; R≥3 fix verified on the pair; R1b remains a separate opt-in identity |
+| MiniMax M3.1 Flash (EXL3, 3.06 bpw) | 2 nodes TP2 over USB4 | **Production** | Eight-text quality gate passed; exact prefill and decode; qualified prefill and exchange optimizations on by default |
+| GLM-5.3 Flash (EXL3, 4.05 bpw) | 2 nodes TP2 over USB4 | **Production** | R1b decode identity by default; exact R1 chunked prefill; `--identity r1` restores R1; R≥3 fix verified on the pair |
 
 The core knows no model: each family is a module with its own contract, plan, kernels and gates
 ([docs/models/model-families.md](docs/models/model-families.md)). The automatic profiles only admit the pinned model files listed in
@@ -128,7 +128,7 @@ The core knows no model: each family is a module with its own contract, plan, ke
 ## How fast
 
 Every speed below is measured in the lab with greedy decoding (temperature 0). Exactness is relative to the
-named numerical profile; the trellis RTX pipeline split and GLM R1b experiment have separate identities, as
+named numerical profile; the trellis RTX pipeline split and GLM R1b decode have separate identities, as
 noted below. Bandwidth ceilings are calculated bounds, not measured throughput. Evidence, methods and older values are in
 **[docs/performance.md](docs/performance.md)**.
 
@@ -312,7 +312,7 @@ two replicas at concurrency 4 and 8: 3.9 % and 3.6 % more wall throughput, and a
 concurrency 4. Details in [docs/performance.md](docs/performance.md#qwen38-flash-next-1).
 
 **Exact combined prefill (2026-10-26).** One Strix Halo node, Qwen3.8-Flash-Next UD-Q4_K_XL,
-dense A8 profile; build `8b99cf58`, defaults without environment overrides. Same-node comparisons
+dense-A8 decode with a separate fast FP16 prefill identity; build `8b99cf58`, defaults without environment overrides. Same-node comparisons
 against `4a44683b`, except the maximum-context same-build off comparison. Terminal FP32 logits and tokens
 match the reference at every length; code-1K and prose-8K qualification receipts match the archived baseline.
 Prompt kind is unspecified for the length sweep.
@@ -335,7 +335,7 @@ and router selection/activation staging as defaults. [PR #50](https://github.com
 adds HC output v3 with band 16 (`5011b842`): 32K TTFT **−0.52 s (−2.2 %)** in three alternating pairs,
 4K **−54 ms (−1.8 %)** in two pairs; logits and tokens remain equal. A later single 32K run on that build
 measured **22.03 s, 1,487 tok/s (48.3 % of the 3,078 tok/s contract ceiling)**.
-`STRIX_QPF2K_DEFAULTS=0` restores the earlier prefill path; HC-specific off switches are
+`STRIX_QPF2K_DEFAULTS=0` suppresses the prefill default set and declines automatic tiling; HC-specific off switches are
 `STRIX_QPF2K_HC_OUTPUT3=0` / `STRIX_QPF2K_HC_OUTPUT3_BAND=0`.
 
 **QSA stage batching — on by default (2026-10-26, [PR #51](https://github.com/hyukudan/strix-halo-engine-lab/pull/51)).**
@@ -344,6 +344,14 @@ on the published build, 32K in four ABBA pairs **−0.17 s** on average (every p
 17,700 **12.54 → 12.46 s** (one pair). Tokens, terminal logits and the code-1K / prose-8K qualification receipts match.
 `STRIX_QPF2K_QSA_MASK=0x57` restores the previous stages (default `0x257`).
 These timings are separate comparisons, not a new full-length sweep.
+
+The plain CLI now resolves to the measured production route. On one Strix Halo node, the fast FP16
+prefill identity measured **22.03 s / 1,487 tok/s at 32K**, **100.3 s at 131,072 tokens**, and
+**202.8 s / 1,293 tok/s at 262,143 tokens** (T8192 at the long lengths, PLE page reclaim admitted).
+Digests match that identity's reference at 32K/64K/128K/262K; this is not dense-A8 serial bit equality
+or a new long-context model-fidelity qualification. The previous documented default was reported at
+about 119 tok/s prefill, versus about 822 with expert union and router rows; that external observation
+is separate from the local measurements. See the [catalog](docs/optimizations.md#qwen-tiled).
 
 Exact MTP draft attention and the router defaults are enabled in the public Qwen line.
 Batched MTP drafting remains opt-in. GSQ below is a separate speed-over-quality profile.
@@ -380,7 +388,7 @@ GSQ auto reaches about 64 % (113.8 tok/s ceiling) and the quality recipe about 6
 ### MiniMax M3.1 Flash
 
 All rows: EXL3 trellis weights at 3.06 bpw, two Strix Halo nodes TP2 over USB4, greedy reference.
-The engine is Production; the newer optimization sets below are **in development, pending publication**.
+The engine is Production; the qualified optimization sets below are public and on by default.
 
 | Mode | Prompt / context | Measured result | Date | Build / exactness |
 |---|---|---|---|---|
@@ -411,22 +419,22 @@ qualification is conditional on those eight texts; it supersedes the earlier two
 
 ### GLM-5.3 Flash
 
-EXL3 4.05 bpw, two Strix Halo nodes TP2 over USB4. Production engine; newer builds below are
-**in development, pending publication**. R1 remains the default numerical identity.
+EXL3 4.05 bpw, two Strix Halo nodes TP2 over USB4. Production engine. R1b is the default decode identity; prompts use exact R1 chunked prefill.
+`--identity r1` restores R1 throughout. The historical R1 measurements below keep their original identity.
 
 | Mode | Prompt / context | Measured | Date | Build / exactness |
 |---|---|---:|---|---|
 | Greedy decode, R1 | 31-token chat prompt + 64 generated tokens | **45.29 ms/token = 22.1 tok/s**; **51 %** of calculated 23.2 ms floor | 2026-10-26 | `1836c99c`; tokens equal the reference |
 | Batch decode, R1 | Eight independent rows, benchmark context unspecified | **122.0 ms/step = 65.5 tok/s aggregate** | 2026-10-26 | `1836c99c`; tokens equal the earlier real-pair reference |
 | Exact chunked prefill | 1K / 8K / 32K benchmark prompts, kind unspecified | TTFT **4.268 / 34.70 / 144.75 s** (240 / 236 / 226 tok/s) | 2026-10-26 | `875ca821`, integrated in `41d8cfdc`; both ranks' logits bitwise equal the previous exact prefill |
-| R1b-fast, opt-in identity | Same chat benchmark, 96-token alternating comparison | **41.93–41.96 ms/token**, vs R1 47.33–47.48 (**−11.5 %**, **55 %** of 23.2 ms floor) | 2026-10-26 | `8877de1d`; stable within each identity, not bitwise to R1 |
+| R1b-fast, now the default decode identity | Same chat benchmark, 96-token alternating comparison | **41.93–41.96 ms/token**, vs R1 47.33–47.48 (**−11.5 %**, **55 %** of 23.2 ms floor) | 2026-10-26 | `8877de1d`; stable within each identity, not bitwise to R1 |
 | R1b teacher-forced agreement | 32 prompts, 256 positions each; chat, code, JSON, math, reasoning, translation | **8,126/8,192 = 99.19 %** top-1; mean KL **~1.8e-3 nats** | 2026-10-26 | `4dad4c19`; free runs diverge on **28/32** prompts within 19–227 tokens |
 
 The R≥3 buffer fix is verified on the real pair. The latest integration uses direct exchange for plain
 forwards and exact MoE v3 for prefill; the speculative oracle also passes with drained exchange switching.
 Prefill rows are single runs. They replace the earlier synthetic-only result.
 
-R1b changes FP32 summation order and remains opt-in; which identity is closer to float64 at full depth is
+R1b changes FP32 summation order and is not bit-identical to R1; which identity is closer to float64 at full depth is
 unresolved. HIP graphs are **not implemented**: the latest profile (`41d8cfdc`) keeps the GPU busy **96.3 %** of each forward (was 80.8 %; 909 launches instead of 1,679) and leaves only **2.10 ms idle per forward**
 and a calculated recoverable gap of **≤1.8 ms** (a bound, not a measured speedup). Host progress across
 exchange boundaries requires segmented capture; device kernels and rank skew take priority.
@@ -527,14 +535,22 @@ the host and device tests (many device tests need the GPU and the model files). 
 
 ## Run
 
-**Qwen, simplest run:** plain greedy decode with the recommended profile, 256 tokens.
+<a id="qwen-recommended-command"></a>
+
+**Qwen, recommended run:** the plain command selects the production defaults, 256 tokens.
 
 ```sh
-./build/strix-hip-decode-token Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf $(cat prompt.ids) \
-  --context 8192 --execution-mode eager --residency register --generate 256 \
-  --optimization-profile auto \
-  --numerical-profile hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1
+./build/strix-hip-decode-token Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf $(cat prompt.ids) --generate 256
 ```
+
+Add `--print-effective-config` to see what it resolves to before HIP initialization. `--baseline` (or `STRIX_BASELINE=1`) restores the previous minimal resolution.
+
+Eligible plain CLI prompts automatically select known-prefix tiled prefill (T8192 for long prompts,
+T4096 at 4K), expert union, router rows and `fast-prefill-f16wmma-v1`. Context is sized automatically;
+beyond 8192 the resolver adds `--unqualified-context`. Registered residency (`--residency register`)
+is the default on UMA. FP16 prefill has its own exact reference and is not bit-identical to dense-A8 serial prefill.
+MTP decode and the HTTP server **do not get fast prefill automatically yet**. See the
+[auto route and off switches](docs/getting-started/engine-reference.md#command-line).
 
 `prompt.ids` holds the prompt as token IDs from the model's tokenizer; the engine prints a JSON receipt with
 `generated_tokens` and timings. For the speeds above add the speculative options (MTP sidecar, verify windows
@@ -564,6 +580,33 @@ router or its control channel; the two-node DeepSeek ranks exchange tensors over
 (pipeline stage TCP port) and the expert servers talk plain TCP: none of these carry authentication, so they must
 stay on a direct cable or a private network. Per-user keys, TLS and a secure configuration interface are
 work items, not features.
+
+## Optimizations
+
+The fast path is the default for all five engines. `auto` applies the documented admission guards;
+exactness is relative to the named numerical identity. Gains are workload-specific and must not be added.
+Full item lists, preconditions, notices and evidence: [optimization catalog](docs/optimizations.md)
+([machine-readable catalog](docs/optimizations.json)). Coding agents: [AGENTS.md](AGENTS.md).
+
+| Engine / optimization | What | Default | Gain | Exact? | Off switch |
+|---|---|---|---|---|---|
+| Qwen: tiled prefill | Auto tile/context, expert union, router rows | Auto | 32K: 22.03 s, 1,487 tok/s | Own FP16 reference; differs from dense A8 | `STRIX_PREFILL_F16=0` |
+| Qwen: QPF2K + wrapper kernels | Dense/GDN/QSA/HC/MoE, dispatch and head work | On when admitted | Combined 32K 25.95 → 23.49 s | Within profile | `STRIX_QPF2K_DEFAULTS=0` |
+| Qwen: PLE reclaim | Drop and prefetch file pages for long tiled prompts | Auto | Enables T8192 at 128K/262K | Same bytes | `STRIX_PLE_RECLAIMABLE=0` |
+| DeepSeek pair: production resolver | Discover packs/draft, TP attention, device prefill | Auto | Build: 8K TTFT −12.0% | Within pack identity | `STRIX_DS41_BASELINE=1` |
+| DeepSeek pair: operators/transport | Dense, MoE, attention, shared down, CRC and overlap | On/auto | R1 −1.9%, N8 −2.2% (build) | Bitwise gates | Per-item `=0`; see catalog |
+| DeepSeek RTX: decode/cache | Kernels, fusions, Q8 R1, write-backs, load/residency | On/auto | All-hit 12.62 → 10.50 ms/token | Within Q2/Q8 identity | `--baseline` |
+| DeepSeek RTX: drafter/controller | Keep-64, warm controller, auto vocabulary | On/auto | Keep-64: code +16% at four rows | Target-greedy | `--draft-keep 0`; `--controller-prior none` |
+| MiniMax: decode/exchange | Wide MoE, concurrent index, fused boundaries | On (22-item resolver) | Boundary set: 48.56 → 44.40 ms/token | Built-in gates | `STRIX_MM_BASELINE=1` |
+| MiniMax: prefill/transport | v4 core, batching, pipeline, CRC overlap | On/auto | Prefill bundle: 8K TTFT −20% | Bitwise gates | Per-item off values; see catalog |
+| GLM: R1b decode | Faster FP32 summation identity | On | 41.93–41.96 vs R1 47.33–47.48 ms/token | Own identity; differs from R1 | `--identity r1` |
+| GLM: exact chunked prefill | R1 gemv identity, MoE/MLA/indexer kernels | Auto (16 env items) | 1K/8K/32K: 240/236/226 tok/s | R1 bitwise | `--prefill ref` |
+
+Master baselines: Qwen `--baseline` / `STRIX_BASELINE=1`; DeepSeek pair `STRIX_DS41_BASELINE=1`;
+RTX `--baseline` / `STRIX_DS41_RTX_BASELINE=1`; MiniMax `STRIX_MM_BASELINE=1`;
+GLM `--baseline` / `STRIX_GLM_BASELINE=1`. Each restores its resolver's preceding configuration;
+see the catalog for scope and explicit-override precedence. Inspect the resolution with
+`--print-effective-config` (RTX: `--print-config`) before running. Avoid legacy opt-in flags on the plain path.
 
 ## How it works
 

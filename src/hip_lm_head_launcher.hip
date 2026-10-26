@@ -1,3 +1,4 @@
+#include "strix/qpf2k_defaults.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
 #ifdef STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC
@@ -1452,7 +1453,7 @@ void lm_head_known_window_rows_launch(std::span<const ExecutionDispatchContext> 
     // on the lean rows head (two logits per wave unless STRIX_LM_HEAD_ROWS_LEAN=1), a last piece of fewer than five
     // rows on the rows head; every logit is bit-identical to the R1 head either way.
     static const bool cohort_lean = [] { const char* v = std::getenv("STRIX_LM_HEAD_COHORT_LEAN"); return v && v[0] == '1'; }();
-    if (cohort_lean && rows.size() > lm_head_window_max_rows) {
+    if (!qpf2k::suppressed(qpf2k::Item::cohort_lean) && cohort_lean && rows.size() > lm_head_window_max_rows) {
         auto lean = config;
         lean.rows_lean = config.rows_lean ? config.rows_lean : 2U;
         for (std::size_t first = 0; first < rows.size(); first += 8U) {

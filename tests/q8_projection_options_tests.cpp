@@ -27,6 +27,10 @@ template<class F> void rejects(F&& action, const char* message) {
 }
 }
 int main() {
+    const auto route_off = parse({"decoder","m","1","--generate","1","--known-window-router-rows=0"});
+    expect(!route_off.known_window_router_rows && !route_off.known_prefix_full_rows &&
+        route_off.disabled_prefill_features.contains("--known-window-router-rows"),
+        "router off records an automatic full-row veto without enabling any projection");
     const auto model = ModelContract::qwen38_flash_next();
     gguf::FileInfo info;
     ModelManifest manifest; manifest.architecture = "qwen3next";

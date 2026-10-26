@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/qpf2k_defaults.hpp"
 #include "strix/known_prefill_limits.hpp"
 #include "hip_decode_experiment.hpp"
 #include "hip_decode_options.hpp"
@@ -314,8 +315,10 @@ public:
             // ceil(rest / T) blocks of a multiple of 128 rows <= T, each the first rows of the T arena; the last rest mod 128
             // rows then run as the ladder runs them). Bit 4: the ladder's leading multiple-of-128 tail units merged into one
             // partial block of the T owner. Not with a prefix store (its captures are at T boundaries) nor small units.
-            static const bool balanced_env=[]{const char* v=std::getenv("STRIX_QPF2K_SCHED");return v&&(std::strtoul(v,nullptr,0)&16UL)!=0UL;}();
-            static const bool merged_env=[]{const char* v=std::getenv("STRIX_QPF2K_SCHED");return v&&(std::strtoul(v,nullptr,0)&4UL)!=0UL;}();
+            static const bool balanced_raw=[]{const char* v=std::getenv("STRIX_QPF2K_SCHED");return v&&(std::strtoul(v,nullptr,0)&16UL)!=0UL;}();
+            static const bool merged_raw=[]{const char* v=std::getenv("STRIX_QPF2K_SCHED");return v&&(std::strtoul(v,nullptr,0)&4UL)!=0UL;}();
+            const bool defaults_off=qpf2k::suppressed(qpf2k::Item::sched,backend.gsq_model());
+            const bool balanced_env=balanced_raw&&!defaults_off,merged_env=merged_raw&&!defaults_off;
             // Per prompt, decided at its first unit: only where the balanced plan is bitwise equal to the ladder.
             if(blocks && (balanced_env || merged_env) && balanced_<0) {
                 std::vector<std::uint32_t> ladder=tiled_.ladder_tail_rows;
@@ -516,10 +519,10 @@ private:
     // STRIX_PREFILL_PIPE (bit mask, default 0): 1 = a T block's predictor rows build on the MTP stream while the next
     // block runs (completed before any other use of the predictor, the held row or the prefix cache);
     // 2 = the tap rows of a block in one strided copy.
-    static unsigned pipe_flags() {static const unsigned v=[]{const char* e=std::getenv("STRIX_PREFILL_PIPE");return e?static_cast<unsigned>(std::strtoul(e,nullptr,0)):0U;}();return v;}
-    static bool pipe_mtp() {return (pipe_flags()&1U)!=0U;}
-    static bool pipe_tap_copy() {return (pipe_flags()&2U)!=0U;}
-    static bool pipe_worker() {return (pipe_flags()&32U)!=0U;}
+    unsigned pipe_flags() const {static const unsigned v=[]{const char* e=std::getenv("STRIX_PREFILL_PIPE");return e?static_cast<unsigned>(std::strtoul(e,nullptr,0)):0U;}();return strix::qpf2k::suppressed(strix::qpf2k::Item::pipe, resources_.model_manifest && strix::qpf2k::has_gsq_gate(*resources_.model_manifest))?0U:v;}
+    bool pipe_mtp() const {return (pipe_flags()&1U)!=0U;}
+    bool pipe_tap_copy() const {return (pipe_flags()&2U)!=0U;}
+    bool pipe_worker() const {return (pipe_flags()&32U)!=0U;}
     void drain_priming() {
         if(!priming_) return;
         priming_=false;

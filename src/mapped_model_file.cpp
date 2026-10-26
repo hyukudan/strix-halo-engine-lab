@@ -229,6 +229,17 @@ void MappedModelFile::advise_dontneed(std::uint64_t byte_offset, std::uint64_t b
 #endif
 }
 
+int MappedModelFile::drop_page_cache(std::uint64_t byte_offset, std::uint64_t bytes) const noexcept {
+#if defined(__linux__)
+    if (fd_ < 0) return EBADF;
+    if (!bytes || byte_offset >= bytes_ || bytes > bytes_ - byte_offset) return EINVAL;
+    return ::posix_fadvise(fd_, static_cast<off_t>(byte_offset), static_cast<off_t>(bytes), POSIX_FADV_DONTNEED);
+#else
+    (void)byte_offset; (void)bytes;
+    return ENOSYS;
+#endif
+}
+
 void MappedModelFile::read_at(
     std::uint64_t byte_offset,
     std::span<std::byte> destination) const {

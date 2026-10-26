@@ -21,7 +21,7 @@ unsigned qpf2k_hc_mask() {
         const char* m = std::getenv("STRIX_QPF2K_HC_MASK");
         return m ? static_cast<unsigned>(std::strtoul(m, nullptr, 0)) : 0xffU;
     }();
-    return mask;
+    return qpf2k::suppressed(qpf2k::Item::hc) ? 0U : mask;
 }
 bool qpf2k_hc_check() {
     static const bool on = [] { const char* v = std::getenv("STRIX_QPF2K_HC_CHECK"); return v && v[0] == '1'; }();
@@ -220,8 +220,8 @@ __device__ __forceinline__ float qpf2k_cvt_ubyte(unsigned w, unsigned b) {
     }
 }
 bool qpf2k_hc_output3() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_QPF2K_HC_OUTPUT3"); return qpf2k_hc_mask() != 0U && v && v[0] == '1'; }();
-    return on;
+    static const bool on = [] { const char* v = std::getenv("STRIX_QPF2K_HC_OUTPUT3"); return v && v[0] == '1'; }();
+    return on && !qpf2k::suppressed(qpf2k::Item::hc_output3) && qpf2k_hc_mask() != 0U;
 }
 // STRIX_QPF2K_HC_OUTPUT3_BAND (0 default, 1..8, 12, 16, 24, 32, 48, 64): CTA permutation only; identical chains/epilogue.
 constexpr bool qpf2k_hc_output3_band_valid(unsigned band) {
@@ -239,7 +239,7 @@ unsigned qpf2k_hc_output3_band() {
         }
         return qpf2k_hc_output3_band_valid(value) ? value : 0U;
     }();
-    return band;
+    return qpf2k::suppressed(qpf2k::Item::hc_output3_band) ? 0U : band;
 }
 // Bulk scalar-cache prefetch (Q > 0): one s_load_b32 per 64-byte line of the low values of Q rank steps, into a dummy SGPR
 // that is consumed only after the next compiler-inserted lgkmcnt(0) (which waits for every scalar load in flight); s[100:101]
@@ -257,8 +257,8 @@ bool qpf2k_hc_upcopy() {
     return on;
 }
 bool qpf2k_hc_upcopy_base() {
-    static const bool on = [] { const char* v = std::getenv("STRIX_QPF2K_HC_UPCOPY_BASE"); return qpf2k_hc_mask() != 0U && v && v[0] == '1'; }();
-    return on;
+    static const bool on = [] { const char* v = std::getenv("STRIX_QPF2K_HC_UPCOPY_BASE"); return v && v[0] == '1'; }();
+    return on && qpf2k_hc_mask() != 0U;
 }
 __global__ __launch_bounds__(256) void qpf2k_hc_up_copy_kernel(const uint4* __restrict__ from, uint4* __restrict__ to, std::uint64_t n) {
     const std::uint64_t i = static_cast<std::uint64_t>(blockIdx.x) * 256U + threadIdx.x;

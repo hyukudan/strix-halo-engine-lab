@@ -296,7 +296,7 @@ int main() {
         catch(const std::invalid_argument&){rejected=true;}
         expect(rejected&&target.inputs.empty(),"unknown or mismatched output-policy backend rejects before consuming any input");
     }
-    for(const unsigned width:{16U,17U,32U,2048U})
+    for(const unsigned width:{16U,17U,32U,1024U,2048U,4096U,8192U})
     for(const unsigned count:{1U,width,width+1U,2U*width})
     for(const auto policy:{Policy::all_rows,Policy::terminal_row,Policy::state_only}) {
         Rows target;target.tiled=true;target.width=width;target.policy=policy;

@@ -1,3 +1,4 @@
+#include "strix/qpf2k_defaults.hpp"
 #include "strix/hip_known_prompt_backend.hpp"
 #include "strix/known_prefill_limits.hpp"
 
@@ -178,7 +179,7 @@ struct HipKnownPromptBackend::Impl {
             // validation inside this scope is skipped for the same manifest/weights pair, which the scope validated).
             static const bool one_validation=[]{const char* v=std::getenv("STRIX_PREFILL_PIPE");return v&&(std::strtoul(v,nullptr,0)&8UL)!=0UL;}();
             std::optional<ValidatedModelBindingScope> binding_scope;
-            if (one_validation && handoff && handoff->first.resources && !handoff->first.resources->distributed_stage &&
+            if (one_validation && !qpf2k::suppressed(qpf2k::Item::pipe, window->gsq_model()) && handoff && handoff->first.resources && !handoff->first.resources->distributed_stage &&
                 handoff->first.resources->model_manifest && handoff->first.resources->model_weights)
                 binding_scope.emplace(*handoff->first.resources->model_manifest, *handoff->first.resources->model_weights);
             lap("scope");
@@ -295,6 +296,7 @@ std::uint32_t HipKnownPromptBackend::logical_rows() const noexcept {
     return impl_->window->logical_rows();
 }
 bool HipKnownPromptBackend::supports_tiled_prefill() const noexcept {return impl_->window->supports_tiled_prefill();}
+bool HipKnownPromptBackend::gsq_model() const noexcept {return impl_->window->gsq_model();}
 KnownWindowOutputPolicy HipKnownPromptBackend::output_policy() const noexcept {return impl_->window->output_policy();}
 std::vector<float> HipKnownPromptBackend::execute_rows(std::span<const std::uint32_t> tokens, std::uint64_t position) {
     return impl_->execute(tokens, position);

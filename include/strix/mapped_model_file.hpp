@@ -76,6 +76,9 @@ public:
     // Drops the unmapped clean page-cache pages of [byte_offset, byte_offset + bytes) (POSIX_FADV_DONTNEED).
     // Advisory, no error: used before a large copy arena is allocated (STRIX_MODEL_COPY_ALL).
     void advise_dontneed(std::uint64_t byte_offset, std::uint64_t bytes) const noexcept;
+    // Same drop, but reports failure: 0 on success, else an errno value (EBADF without an open descriptor,
+    // EINVAL for a range outside the file, or posix_fadvise's own error). Used by STRIX_PLE_RECLAIMABLE.
+    [[nodiscard]] int drop_page_cache(std::uint64_t byte_offset, std::uint64_t bytes) const noexcept;
 
 private:
     void release() noexcept;

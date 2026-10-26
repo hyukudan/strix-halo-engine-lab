@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <map>
 #include <mutex>
+#include "strix/qpf2k_defaults.hpp"
 
 namespace strix::q8_rows::tiled {
 
@@ -47,7 +48,8 @@ __host__ __device__ constexpr std::uint32_t scratch_pitch(std::uint32_t width) {
 
 inline bool enabled() {
     static const bool on = [] { const char* v = std::getenv("STRIX_QPF2K_DENSE"); return v && v[0] == '1'; }();
-    return on;
+    // GSQ owners must keep their typed projections; these tiled loaders assume Q8_0.
+    return on && !qpf2k::suppressed(qpf2k::Item::dense);
 }
 // Bit mask of sites (STRIX_QPF2K_DENSE_SITES, default all): 1 GDN in, 2 GDN out, 4 QSA q/k/v, 8 QSA out,
 // 16 shared gate+up, 32 shared down.

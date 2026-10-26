@@ -54,6 +54,13 @@ void launch_hip_shared_rows_projection_probe(HipSharedQ8ProjectionRole, HipShare
     std::span<const HipSharedQ8ProjectionView> input, HipSharedQ8ProjectionView weights,
     std::span<const HipSharedQ8ProjectionView> gate, std::span<const HipSharedQ8ProjectionView> output,
     std::uint32_t width, std::uint32_t outputs, void* stream);
+// T = 1/2/4/8 rows of the dense A8 sites with GSQ-RCO typed segments (ggml types, 8 = Q8_0) through the engine's own
+// site types: gate/up (1..2 segments, output[r] holds every segment's outputs) or down (one segment, per-row FP32
+// gate, BF16 out; narrow = the R8/M640 SharedDownR8NarrowSite organization).
+void launch_hip_shared_gsq_rows_probe(HipSharedQ8ProjectionRole, bool narrow, std::span<const std::uint32_t> types,
+    std::span<const HipSharedQ8ProjectionView> weights, std::span<const std::uint32_t> counts,
+    std::span<const HipSharedQ8ProjectionView> input, std::span<const HipSharedQ8ProjectionView> gate,
+    std::span<const HipSharedQ8ProjectionView> output, std::uint32_t width, void* stream);
 #endif
 
 void register_hip_shared_expert_kernel_variant(

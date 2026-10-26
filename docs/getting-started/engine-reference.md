@@ -104,29 +104,85 @@ ninja -C build strix-hip-decode-token
 receipt to stdout that includes `generated_tokens`, cycle counts and timings. `--help` lists the general options;
 the MTP options are documented in [mtp-native-cli.md](../engine/speculative/mtp-native-cli.md).
 
+The recommended single-request CLI command is:
+
+```sh
+strix-hip-decode-token MODEL.gguf $(cat prompt.ids) --generate 256
+```
+
+Add `--print-effective-config` to print deterministic resolution JSON and exit **before HIP initialization**.
+It includes effective arguments, environment values and their provenance, T, context, budgets and profile pair.
+`--baseline` / `STRIX_BASELINE=1` restores the previous minimal resolution of the same arguments.
+Registered mmap residency (`--residency register`) is the default on UMA; it avoids a second full model copy.
+
+For the pinned, content-verified Qwen checkpoint on a qualified Strix Halo target with the A8 runtime built,
+at least 16 prompt tokens and positive generation, the resolver selects eager known-prefix full-row tiling,
+routed expert union, router rows and terminal-row output. It chooses the largest prompt-fitting T from
+8192, 4096, 2048, 1024, 256, 64 and 16: T8192 for long prompts and T4096 at 4K. Short tails use the admitted
+tail ladder and then serial rows. Implicit context is at least 8192 and rounds prompt length plus
+`max(generation, 512)` up to 512 tokens; beyond 8192 it adds `--unqualified-context` automatically.
+An explicit context is preserved and retains its validation requirements.
+
+Admission needs unambiguous Linux UMA/GTT observations and sufficient simultaneous backing capacity.
+The full-capacity budgets are 8 GiB workspace, 1 GiB metadata, 120 GiB UMA and 4 GiB host headroom;
+smaller available memory scales them down (headroom is at least 1 GiB). This is an admission limit,
+not a promise to allocate that much memory. The receipt uses dense-A8 decode with
+`fast-prefill-f16wmma-v1` prefill when FP16 operands and planning are admitted. FP16 prefill is its own
+numerical identity, exact against its own reference, **not bit-identical to dense-A8 serial prefill**.
+FP16 operand/plan refusal keeps dense-A8 tiled prefill with an arithmetic-fallback reason.
+Digest equality at 32K/64K/128K/262K does not extend the 8192 model-fidelity qualification.
+
+An admitted run prints `Qwen auto-prefill: automatic T... context=...`, including the longer-context
+acknowledgement when applicable. Missing content/target/build qualification, memory observation or capacity,
+ineligible prompts and controlled off values retain serial resolution with one line:
+`Qwen auto-prefill declined: <reason>; using serial prefill`.
+
+Explicit routes keep their own options, without that serial-decline notice. This includes explicit
+`--mtp` or MTP cohorts, HTTP serving, serving prefix files, prompt lookup, explicit known-prefix or low-level
+organization flags, and target-input export/diagnostic routes. **MTP decode and the HTTP server do not get
+fast prefill automatically yet.** GSQ manifests decline the new auto route; default-injected settings are
+filtered per GSQ owner, so GSQ runs without the former requirement to disable the whole default set.
+
+Off switches:
+
+- `--baseline` / `STRIX_BASELINE=1`: disable the new policy and all controlled QPF2K, PLE and wrapper defaults;
+  resolve the same arguments historically (implicit context 8192, ordinary-generation exact-v5 organization,
+  prepared execution, shared overlap and GDN islands). Explicit arithmetic/organization still has historical validators.
+- `STRIX_PREFILL_F16=0`: decline automatic tiling and retain historical resolution.
+- `--prefill-numerical-profile dense-a8`: retain automatic tiling with the dense-A8 prefill identity.
+- `STRIX_QPF2K_DEFAULTS=0`: stop default injection and decline automatic tiling; explicit environment values remain.
+- Individual controlled feature values `=0` also decline automatic tiling. To measure a single operator inside
+  the same tiled identity, use an explicit tiled route with the same T, budgets and profile pair.
+- `STRIX_PLE_RECLAIMABLE=0`: keep the original warm PLE pages; `auto` has its own route/setup admission.
+- `--known-prefix-window=0`: disable automatic tiling. The full-rows, expert-union, router-rows and prefill-rows
+  route flags also accept `=0`.
+
+The admitted environment includes `STRIX_DISPATCH_FUSE=1`, `STRIX_INTPREFILL_DENSE_ROWS=512`,
+`STRIX_PREFILL_PIPE=255`, `STRIX_QSA_ATTEND_BATCH=1`, `STRIX_QSA_SCORE_PARK=1`, `STRIX_QSA_NORM_GROUP=1`,
+`STRIX_QSA_INDEX_ROWS=1`, `STRIX_LM_HEAD_COHORT_LEAN=1`, `STRIX_LM_HEAD_ROWS_LEAN=2`, the 13 QPF2K settings
+and `STRIX_PLE_RECLAIMABLE=auto`. These nine wrapper settings are injected only for the admitted decoder
+route; declined MTP/serving/cohort/diagnostic/model/memory routes keep historical defaults and explicit overrides.
+Pre-main initialization retains the historical tiled settings and route-gated PLE reclaim for other clients.
+See the [full catalog](../optimizations.md#qwen-defaults) for every value and guard.
+
+The following explicit MTP configuration remains useful for speculative runs. Its low-level flags own that
+route; do not append them to the recommended plain command to request defaults that are already automatic.
+
 A speculative run has four groups of options.
 
-**1. Target model and generation**
+**1. Target model and generation for the explicit MTP route**
 
-```
-strix-hip-decode-token MODEL.gguf TOKEN_ID TOKEN_ID ... \
-  --context 8192 --execution-mode eager --residency register --generate 256 \
+```sh
+strix-hip-decode-token MODEL.gguf $(cat prompt.ids) --generate 256 \
+  --context 8192 --execution-mode eager --residency register \
   --optimization-profile auto \
   --numerical-profile hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1
 ```
 
-The recommended profile adds dense A8: the dense Q8_0 projections (GDN, QSA, shared expert) also take int8
-activations per group of 32. It is faster in prefill and decode at a small quality cost (D-032). To keep the dense
-projections in FP32 (the exact profile), use `hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1`.
-
-The automatic optimization profile is admitted at context 8192 for the pinned model content. Other context sizes
-need `--context N --unqualified-context`; they run the same profiles but are not covered by the automatic
-profile's numerical and timing gates (see [optimization-profile.md](../engine/decode/optimization-profile.md)).
-
-`--prefill-numerical-profile NAME` runs the prompt prefill (tiled known-prefix prefill or the MTP prompt) under a
-different profile from decode; today only the dense-A8 sibling of `--numerical-profile` is admitted. Decode and MTP
-windows always use `--numerical-profile`, MTP goldens record both profiles, and MTP stays exact from the state the
-prefill produced. See [prefill-numerical-profile.md](../engine/prefill/prefill-numerical-profile.md) (D-033).
+The admitted production decode profile is dense A8: dense Q8_0 projections use int8 activations per group
+of 32. This has a separate numerical/quality identity (D-032). Explicit arithmetic retains its profile validators.
+`--prefill-numerical-profile NAME` records a prefill/decode profile pair; MTP verifies from the state that
+prefill produced. See [profile identities](../engine/prefill/prefill-numerical-profile.md).
 
 Teacher-forced scoring (`--teacher-forced-score`, `--teacher-logits-file`) also runs over the tiled prefill with the
 all-rows output policy, producing byte-identical logits files to the serial route within a profile, several times
@@ -267,7 +323,7 @@ Defaults are the measured configuration.
 | `STRIX_WINDOW_ROUTE_LOG=1` | Diagnostic, never timed: after every router step of a verify window, the routed expert ids of each row (`route pos= rows= row= layer= ids=` on stderr); synchronizes the device per layer. With `--mtp-spec-min-p 0` every cycle is an R8 window, which gives the routing of all eight rows. |
 | `STRIX_GDN_WINDOW_TILED=1` | Window GDN recurrence with one block per (value head, 32 value columns): the state slice is read and written with coalesced loads through LDS and each wave runs `STRIX_GDN_WINDOW_COLUMNS` (2, 4 or 8; default 8) columns, so the per-row dependent chain is shorter. Key-value storage, head dim 128. Same arithmetic per column; bit-identical outputs and state. Off by default. |
 | `STRIX_GDN_WINDOW_PREPARE_GATES=1` | Window GDN prepare with the beta/gate scalar transforms spread over (value head, row) pairs instead of a serial row loop per head (that block was the longest one of the prepare at R4/R8). Same per-element arithmetic; bit-identical. Off by default. |
-| `STRIX_LM_HEAD_ROWS_LEAN=2` | Verify windows of 5-8 rows: lean rows LM head. Inputs staged in LDS and read as 16-byte words, two logits per wave sharing them, and the lane and local reduction trees evaluated two partial sums per register (each add keeps its operand pair). The greedy partials of every row are computed in the same kernel, so the separate pass over the logits disappears (`STRIX_LM_HEAD_ROWS_GREEDY=0` keeps it). `=1` is the one-logit-per-wave form (slower). Logits bit-identical to the R1 head; same greedy replies. Off by default. |
+| `STRIX_LM_HEAD_ROWS_LEAN=2` | Verify windows of 5-8 rows: lean rows LM head. Inputs staged in LDS and read as 16-byte words, two logits per wave sharing them, and the lane and local reduction trees evaluated two partial sums per register (each add keeps its operand pair). The greedy partials of every row are computed in the same kernel, so the separate pass over the logits disappears (`STRIX_LM_HEAD_ROWS_GREEDY=0` keeps it). `=1` is the one-logit-per-wave form (slower). Logits bit-identical to the R1 head; same greedy replies. Defaulted for admitted plain CLI auto-prefill; MTP/serving routes retain their previous setting. |
 | `STRIX_QSA_WINDOW_POOLED=1` | Verify windows of 2/4/8 rows score the indexer blocks as prefill groups do: one pass forms every complete block's pooled, normalised and rotated key, then the pooled scoring kernel reads them (instead of pooling and reducing inside the per-block kernel with LDS trees). The block scores are bitwise the same (`STRIX_QSA_POOLED_CHECK=1` compares them). Off by default. |
 | `STRIX_QSA_WINDOW_GROUPED=1` | Verify windows of 2/4/8 rows score attention with the prefill groups' KV-head-grouped kernel: each key row is read once per group of query heads. Same products and reduction order per (row, head, slot); bitwise the same scores. `STRIX_QSA_WINDOW_SLOTS=4\|8\|16` slots per wave (default 8). Off by default. |
 | `STRIX_HC_LANE_SPLIT=0` | 8-row verify windows keep the LDS form of the lane-chain HC output instead of the row-split form (D-049); `=2`, `4` or `8` forces that many wave groups (also at 4 rows). Same bits. |

@@ -1,5 +1,6 @@
 #include "strix/known_prompt_chunks.hpp"
 #include "strix/known_prefill_limits.hpp"
+#include "strix/qpf2k_defaults.hpp"
 
 #include "strix/serial_decode_replay.hpp"
 
@@ -79,8 +80,10 @@ bool KnownPromptChunkCursor::advance() {
     // blocks of a multiple of 128 rows (at most T), each as the first rows of the T owner's arena, instead of T blocks and
     // the 1024/256 tails; the last remaining mod 128 rows then run as the ladder runs them (64/16 tails, serial rows).
     // Bit 4: the ladder's leading multiple-of-128 tail units merged into one partial block of the T owner.
-    static const bool balanced_env=[]{const char* v=std::getenv("STRIX_QPF2K_SCHED");return v&&(std::strtoul(v,nullptr,0)&16UL)!=0UL;}();
-    static const bool merged_env=[]{const char* v=std::getenv("STRIX_QPF2K_SCHED");return v&&(std::strtoul(v,nullptr,0)&4UL)!=0UL;}();
+    static const bool balanced_raw=[]{const char* v=std::getenv("STRIX_QPF2K_SCHED");return v&&(std::strtoul(v,nullptr,0)&16UL)!=0UL;}();
+    static const bool merged_raw=[]{const char* v=std::getenv("STRIX_QPF2K_SCHED");return v&&(std::strtoul(v,nullptr,0)&4UL)!=0UL;}();
+    const bool defaults_off=qpf2k::suppressed(qpf2k::Item::sched,windows_.gsq_model());
+    const bool balanced_env=balanced_raw&&!defaults_off,merged_env=merged_raw&&!defaults_off;
     // Per prompt (decided at its first unit): only where the balanced plan is bitwise equal to the ladder.
     if(balanced_<0) {
         std::vector<std::uint32_t> ladder=request_.ladder_tail_rows;
@@ -133,7 +136,7 @@ bool KnownPromptChunkCursor::advance() {
             // STRIX_QPF2K_SCHED bit 2: when the next unit is another block of this same backend (it completes this one
             // before publishing anything), this block ends without a host fence.
             static const bool defer_env=[]{const char* v=std::getenv("STRIX_QPF2K_SCHED");return v&&(std::strtoul(v,nullptr,0)&2UL)!=0UL;}();
-            const bool defer=defer_env&&request_.schedule_extensions&&!tail&&backend==&windows_&&remaining-block>=(balanced?16U:request_.logical_rows);
+            const bool defer=defer_env&&!defaults_off&&request_.schedule_extensions&&!tail&&backend==&windows_&&remaining-block>=(balanced?16U:request_.logical_rows);
             if(partial) backend->execute_state_rows_partial(request_.prompt_tokens.subspan(consumed,block),progress_.next_position,defer);
             else if(defer) backend->execute_state_rows_deferred(request_.prompt_tokens.subspan(consumed,block),progress_.next_position);
             else backend->execute_state_rows(request_.prompt_tokens.subspan(consumed,block),progress_.next_position);

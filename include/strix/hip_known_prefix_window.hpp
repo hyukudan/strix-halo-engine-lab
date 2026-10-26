@@ -129,6 +129,7 @@ public:
     void set_window_step_observer(PrefillStepObserver observer);
     [[nodiscard]] std::uint32_t logical_rows() const noexcept;
     [[nodiscard]] bool supports_tiled_prefill() const noexcept;
+    [[nodiscard]] bool gsq_model() const noexcept;
     // Immutable compiler-selected intent; verification consumers require all_rows.
     [[nodiscard]] KnownWindowOutputPolicy output_policy() const noexcept;
     // Last eligible layer in the last SUCCESSFULLY completed window only.

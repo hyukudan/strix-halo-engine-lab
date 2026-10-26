@@ -181,6 +181,13 @@ void gdn_known_window_rows_projection_probe(GdnKnownWindowProjectionDirection,
     std::span<const GdnKnownWindowProjectionView> output,
     std::uint32_t width, std::uint32_t outputs, void* stream,
     GdnKnownWindowRowsProbeMode mode = GdnKnownWindowRowsProbeMode::rows);
+// T = 1..8 rows of the dense A8 sites with GSQ-RCO typed segments (ggml types, 8 = Q8_0) through the engine's own
+// site types and q8_rows::launch: bf16_to_fp32 = the input site (1..4 segments, output[m * rows + r]),
+// fp32_to_bf16 = the output site (one segment, output[r]).
+void gdn_gsq_rows_projection_probe(GdnKnownWindowProjectionDirection, std::span<const std::uint32_t> types,
+    std::span<const GdnKnownWindowProjectionView> weights, std::span<const std::uint32_t> counts,
+    std::span<const GdnKnownWindowProjectionView> input, std::span<const GdnKnownWindowProjectionView> output,
+    std::uint32_t width, void* stream);
 #endif
 
 void register_hip_gdn_kernel_variant(
