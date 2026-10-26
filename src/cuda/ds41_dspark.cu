@@ -896,6 +896,7 @@ void CudaDrafter::clear_route_stats() {
     if (m.route_counts.size()) STRIX_CUDA_CHECK(cudaMemsetAsync(m.route_counts.get(), 0, m.route_counts.size() * sizeof(std::uint32_t), m.st));
 }
 void CudaDrafter::reset(std::uint64_t position) {
+    STRIX_CUDA_CHECK(cudaStreamSynchronize(impl_->st));
     for (auto& s : impl_->stage) STRIX_CUDA_CHECK(cudaMemsetAsync(s.ring.get(), 0, s.ring.size(), impl_->st));
     STRIX_CUDA_CHECK(cudaStreamSynchronize(impl_->st));
     impl_->next = position;

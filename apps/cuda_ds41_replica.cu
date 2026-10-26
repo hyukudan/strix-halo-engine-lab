@@ -4,10 +4,11 @@
 // expert in its pinned host tier, missing / predicted experts copied in over PCIe by the library at each MoE site (TierSite).
 //
 //   strix-cuda-ds41-replica MODEL.gguf --import-state STATE --ref PAIR_LOG [--steps N] --arena-gib G [--spares N]
+//       [--arena-gib auto|G (default 80)] [--arena-headroom-gib G (auto: default 1.5)] [--positions N (alias --max-positions)]
 //       [--host-spares N] [--predict K] [--prefetch-layer N] [--prefetch-token N] [--pressure-spares N]
 //       [--phases exact0,pressure,exact8,chats8,chats0] [--routes ROUTES [--seqmod M:K]] [--chats I,J,..
 //       --chat-prompt P --chat-steps N --seqs-file SEQS] [--timing] [--json OUT] [--timeline OUT] [--verify N]
-//       [--engram MODE] [--host-margin-gib G] [--fuse-hc] [--fuse-shared]
+//       [--engram MODE] [--host-margin-gib G] [--fuse-hc] [--fuse-shared] [--no-lean-state]
 //
 // Defaults: dsrtxk, fusions, deferred records, router form 2, qakv-s1, unpadded q8-r1,
 // keep-64, warm controller (chat scope), deferred WB, Engram RAM 512 MB, pipelined load.
@@ -85,10 +86,13 @@
 
 #include "cuda_ds41_replica_serve.hpp"
 
+#include "strix/cuda_ds41_moe_v2.hpp"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -321,6 +325,8 @@ int main(int argc, char** argv) {
     std::uint32_t steps = 64, chat_prompt = 96, chat_steps = 128, spares = 96, host_spares = 48, predict = 8, verify_n = 0, warm = 4, pressure_spares = 8;
     std::uint32_t pf_layer = 4, pf_token = 48, layers_arg = 40, pressure_free = 2, pressure_recent = 12;
     double arena_gib = -1.0, host_margin_gib = 6.0, max_pinned_gib = 68.0;
+    bool arena_auto = false;
+    double arena_headroom_gib = 1.5;
     std::string receipt, cache_kind = "tierstream";
     bool chat_logits = false, moe_v1b3 = false, router_form0 = false, qakv_auto = false, dsrtxk_on = true, fuse_on = true, flush_ready = false;
     std::uint32_t wb_alt = 0;  // --wb-alt N: chats phases alternate the spare target --spares / 0 every N decode tokens
@@ -380,7 +386,9 @@ int main(int argc, char** argv) {
         pressure_spares = 4;
         max_rows = 0;
         arena_gib = -1.0;
+        arena_auto = false;
         baseline_arena = true;
+        o.lean_state = false;
         draft_vocab = "full";
         warmup_graphs = residency_seed = residency_save = "none";
         o.engram_cache_mb = 0;
@@ -423,7 +431,12 @@ int main(int argc, char** argv) {
         else if (a == "--import-state") state_file = next();
         else if (a == "--ref") ref_file = next();
         else if (a == "--steps") steps = u32();
-        else if (a == "--arena-gib") arena_gib = std::stod(next());
+        else if (a == "--arena-gib") {
+            const auto value = next();
+            arena_auto = value == "auto";
+            if (!arena_auto) arena_gib = std::stod(value);
+        }
+        else if (a == "--arena-headroom-gib") arena_headroom_gib = std::stod(next());
         else if (a == "--spares") spares = u32();
         else if (a == "--host-spares") host_spares = u32();
         else if (a == "--predict") predict = u32();
@@ -437,6 +450,8 @@ int main(int argc, char** argv) {
         else if (a == "--chat-prompt") chat_prompt = u32();
         else if (a == "--chat-steps") chat_steps = u32();
         else if (a == "--seqs-file") seqs_file = next();
+        else if (a == "--no-lean-state") o.lean_state = false;
+        else if (a == "--lean-state") o.lean_state = true;
         else if (a == "--timing") timing = true;
         else if (a == "--json") json_out = next();
         else if (a == "--timeline") timeline_out = next();
@@ -521,7 +536,7 @@ int main(int argc, char** argv) {
         else if (a == "--serve") serve_dir = next();                  // persist: the worker's spool directory
         else if (a == "--serve-idle") serve_idle_s = std::stod(next());  // persist: exit after S s without a request
         else if (a == "--serve-max") serve_max = u32();               // persist: exit after N requests (0: no limit)
-        else if (a == "--max-positions") max_positions_arg = u32();   // capacity: absolute position bound (frozen at load)
+        else if (a == "--max-positions" || a == "--positions") max_positions_arg = u32();   // capacity: absolute position bound (frozen at load)
         else if (a == "--serve-keep-on-fail") serve_keep_on_fail = true;  // persist: a failed gate does not end the worker
         else if (a == "--qual") qual = true;                          // qualification records (runtime)
         else if (a == "--residency-save") residency_save = next();    // write the residency at exit
@@ -647,7 +662,8 @@ int main(int argc, char** argv) {
         field("router_form", router_form0 ? 0 : (dsrtxk_on || router_pf_explicit) ? 2 : 0);
         field("qakv_s1", !qakv_auto && (dsrtxk_on || o.decode_qakv_s1));
         field("q8_r1", q8_r1); field("q8_r1_pad", q8_r1_pad);
-        field("draft_keep", draft_keep); field("arena_gib", arena_gib); str("draft_vocab", draft_vocab);
+        field("draft_keep", draft_keep); field("arena_gib", arena_gib); field("arena_auto", arena_auto); field("lean_state", o.lean_state);
+        str("draft_vocab", draft_vocab);
         str("controller_scope", controller_scope);
         // Source filenames are provenance, not different runtime settings. Compare effective data below in CPU tests.
         std::string prior = "none";
@@ -730,6 +746,8 @@ int main(int argc, char** argv) {
         }
     };
     apply_env();
+    if (!std::isfinite(arena_headroom_gib) || arena_headroom_gib < 0.0 || arena_headroom_gib > 1024.0)
+        usage("--arena-headroom-gib must be finite in 0..1024");
     const bool serving = !serve_dir.empty();
     if (serving && max_positions_arg == 0) usage("--serve needs --max-positions N (the absolute capacity every request and its fresh reference share)");
     if (serving && max_rows == 0) usage("--serve needs --max-rows R");
@@ -898,9 +916,11 @@ int main(int argc, char** argv) {
         // capacity: --max-positions N (absolute; required with --serve: every request and its fresh-process reference
         // share it - it sizes the attention state and bounds the decode scan, part of the launch geometry), else what
         // the phases need above the imported position (as before)
-        if (max_positions_arg != 0 && max_positions_arg < imported.position + needed_extra())
+        const auto required_positions = std::uint64_t{imported.position} + needed_extra();
+        if (required_positions >= 0xffffffffULL) usage("request context capacity overflows positions");
+        if (max_positions_arg != 0 && max_positions_arg < required_positions)
             usage("--max-positions below what the phases need (imported position + steps + 16 / chat prompt + steps + 16)");
-        o.max_positions = max_positions_arg != 0 ? max_positions_arg : imported.position + needed_extra();
+        o.max_positions = max_positions_arg != 0 ? max_positions_arg : static_cast<std::uint32_t>(required_positions);
         o.end_layer = layers_arg;
         o.tiers.assign(40, ExpertTier::file);
         o.slots = 0;  // no expert bytes of its own (and no background expert loader): the MoE sites are TierSite's
@@ -945,15 +965,62 @@ int main(int argc, char** argv) {
         auto reader = std::make_unique<GgufExpertReader>(model);
         auto shape = reader->shape();
         if (shape.top_k == 0) shape.top_k = 6;
+        DeviceBuffer<float> hidden_dev, hidden_raw;
+        if (load_drafter || o.stream_hashes) hidden_dev.resize(std::size_t{8} * 3U * shape.hidden);
+        // the drafter on another GPU: the step's capture writes the rows straight into portable mapped pinned memory
+        // (stores from the kernel, no copy engine: a D2H copy would queue behind the stream cache's writebacks) and the
+        // drafter's GPU reads them from there
+        struct HostRows {
+            float* p = nullptr;
+            ~HostRows() { if (p) cudaFreeHost(p); }
+        } hidden_map;
+        // STRIX_DS41_REPLICA_MAPPED_HIDDEN=1: the mapped capture also on one GPU (qualifies it in csmoke on a single GPU)
+        const bool force_mapped = [] {
+            const char* v = std::getenv("STRIX_DS41_REPLICA_MAPPED_HIDDEN");
+            return v && v[0] == '1';
+        }();
+        if ((load_drafter && ddev != target_device) || (force_mapped && (load_drafter || o.stream_hashes)))
+            STRIX_CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&hidden_map.p), std::size_t{8} * 3U * shape.hidden * sizeof(float),
+                                           cudaHostAllocPortable | cudaHostAllocMapped));
+        float* const hidden_cap = hidden_map.p ? hidden_map.p : hidden_dev.get();  // the speculative phases' capture
+        if (o.stream_hashes) hidden_raw.resize(std::size_t{8} * 3U * 4U * shape.hidden);
+        struct DecodeGraphReset {
+            CudaPrefill& p;
+            ~DecodeGraphReset() { p.clear_decode_graphs(); }
+        };
+        if (arena_auto) p.reserve_decode_buffers();
+
         const std::uint32_t L = layers_arg, E = shape.experts;
         // --arena-gib = the experts kept on the device; the free-slot target comes on top of it
-        const std::uint32_t slots = static_cast<std::uint32_t>(arena_gib * 1073741824.0 / static_cast<double>(shape.expert_bytes())) + spares;
+        std::uint32_t slots = static_cast<std::uint32_t>(arena_gib * 1073741824.0 / static_cast<double>(shape.expert_bytes())) + spares;
+        const std::uint32_t spare_reserve = std::max(spares, pressure_spares);
+        const std::uint64_t headroom_bytes = static_cast<std::uint64_t>(arena_headroom_gib * 1073741824.0);
+        const std::uint64_t graph_reserve = 256ULL << 20U;
+        const std::uint64_t bank_reserve = (2ULL * shape.top_k * max_rows + 1U) * shape.expert_bytes();
+        const std::uint64_t site_reserve = 4ULL * (L + 1U) + 4ULL * L * 64U +
+            4ULL * max_rows * E + 4ULL * 64U + moe_layer_workspace_bytes(max_rows, shape);
+        std::uint64_t fixed_bytes = 0, free_at_arena = 0;
+        if (arena_auto) {
+            std::size_t free_b = 0, total_b = 0;
+            STRIX_CUDA_CHECK(cudaDeviceSynchronize());
+            STRIX_CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+            free_at_arena = free_b;
+            fixed_bytes = total_b - free_b;
+            const auto reserve = headroom_bytes + graph_reserve + bank_reserve + site_reserve;
+            if (free_b <= reserve) throw std::runtime_error("auto arena: no memory after fixed reserves and headroom");
+            const auto available_slots = (free_b - reserve) / shape.expert_bytes();
+            slots = static_cast<std::uint32_t>(std::min<std::uint64_t>(available_slots, std::uint64_t{L} * E + spare_reserve));
+            if (slots <= spare_reserve) throw std::runtime_error("auto arena: no resident slots after spare reserve");
+        }
+        const std::uint32_t requested_slots = slots;
         // budgets before any big allocation
         {
             std::size_t free_b = 0, total_b = 0;
             STRIX_CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
-            const double need_dev = (static_cast<double>(slots) + 2.0 * shape.top_k * max_rows) * static_cast<double>(shape.expert_bytes()) / 1073741824.0 + 1.5;
-            const double need_host = (static_cast<double>(L * E - (slots - spares) + host_spares) * static_cast<double>(shape.expert_bytes()) +
+            const double need_dev = arena_auto ? double(std::uint64_t{slots} * shape.expert_bytes() + bank_reserve +
+                site_reserve + graph_reserve + headroom_bytes) / 1073741824.0 :
+                (static_cast<double>(slots) + 2.0 * shape.top_k * max_rows) * static_cast<double>(shape.expert_bytes()) / 1073741824.0 + 1.5;
+            const double need_host = (static_cast<double>(L * E - (slots - (arena_auto ? spare_reserve : spares)) + host_spares) * static_cast<double>(shape.expert_bytes()) +
                                       16.0 * static_cast<double>(shape.down_expert_bytes())) / 1073741824.0 + host_margin_gib;  // + load staging (8 workers x 2)
             const double have_dev = static_cast<double>(free_b) / 1073741824.0, have_host = host_available_gib();
             // host blocks + the two load bounce buffers + the engine's own pinned buffers (Engram rows, staging)
@@ -962,7 +1029,7 @@ int main(int argc, char** argv) {
             os << "{\"event\":\"budget\",\"engine_pinned_gib\":" << static_cast<double>(p.pinned_bytes()) / 1073741824.0 << ",\"pinned_peak_gib\":" << pinned_peak << ",\"max_pinned_gib\":" << max_pinned_gib << ",\"device_free_gib\":" << have_dev << ",\"device_need_gib\":" << need_dev << ",\"host_avail_gib\":" << have_host
                << ",\"host_need_gib\":" << need_host << "}";
             emit(os.str());
-            if (have_dev < need_dev) throw std::runtime_error("not enough device memory for the arena");
+            if (!arena_auto && have_dev < need_dev) throw std::runtime_error("not enough device memory for the arena");
             if (have_host < need_host) throw std::runtime_error("not enough available host memory for the pinned tier");
             if (pinned_peak > max_pinned_gib) throw std::runtime_error("the pinned peak exceeds --max-pinned-gib");
         }
@@ -1009,15 +1076,25 @@ int main(int argc, char** argv) {
             tier_test_hooks = to.test_hooks;
             std::size_t free_b = 0, total_b = 0;
             STRIX_CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
-            to.device_bytes = static_cast<std::uint64_t>(free_b) - (std::uint64_t{3} << 29);  // 1.5 GiB for graphs / workspaces
+            const auto reserve = arena_auto ? headroom_bytes + graph_reserve + site_reserve : (std::uint64_t{3} << 29);
+            if (free_b <= reserve) throw std::runtime_error("no memory after arena reserves");
+            to.device_bytes = static_cast<std::uint64_t>(free_b) - reserve;
             to.host_bytes = static_cast<std::uint64_t>((max_pinned_gib - static_cast<double>(p.pinned_bytes()) / 1073741824.0) * 1073741824.0);
             tier = std::make_unique<TierSite>(*reader, to);
         }
+        DecodeGraphReset graph_destinations{p};
         reader.reset();  // no buffered handle on the model file while decoding (Engram reads share the disk)
         const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load).count();
         {
             std::ostringstream os;
             os << "{\"event\":\"loaded\",\"cache\":\"" << cache_kind << "\",\"describe\":" << p.describe() << ",\"arena_slots\":" << slots << ",\"device_experts\":" << tier->device_experts()
+               << ",\"arena_auto\":" << (arena_auto ? "true" : "false")
+               << ",\"arena_requested_slots\":" << requested_slots << ",\"arena_effective_slots\":" << tier->device_bytes() / shape.expert_bytes()
+               << ",\"arena_fixed_bytes\":" << fixed_bytes << ",\"arena_free_bytes\":" << free_at_arena
+               << ",\"arena_headroom_bytes\":" << (arena_auto ? headroom_bytes : (std::uint64_t{3} << 29))
+               << ",\"arena_graph_reserve_bytes\":" << (arena_auto ? graph_reserve : 0U)
+               << ",\"arena_site_reserve_bytes\":" << (arena_auto ? site_reserve : 0U)
+               << ",\"arena_bank_reserve_bytes\":" << bank_reserve << ",\"arena_spare_slots\":" << spare_reserve
                << ",\"arena_gb\":" << static_cast<double>(tier->device_bytes()) / 1e9 << ",\"host_gb\":" << static_cast<double>(tier->host_bytes()) / 1e9
                << ",\"spares\":" << spares << ",\"predict\":" << predict << ",\"prefetch_layer\":" << pf_layer << ",\"prefetch_token\":" << pf_token
                << ",\"dense_s\":" << dense_s << ",\"load_s\":" << load_s << "}";
@@ -1207,25 +1284,6 @@ int main(int argc, char** argv) {
             tier->hint_window(t, n);
             hinted_rows += n;
         };
-        DeviceBuffer<float> hidden_dev, hidden_raw;
-        if (load_drafter || o.stream_hashes) hidden_dev.resize(std::size_t{8} * 3U * shape.hidden);
-        // the drafter on another GPU: the step's capture writes the rows straight into portable mapped pinned memory
-        // (stores from the kernel, no copy engine: a D2H copy would queue behind the stream cache's writebacks) and the
-        // drafter's GPU reads them from there
-        struct HostRows {
-            float* p = nullptr;
-            ~HostRows() { if (p) cudaFreeHost(p); }
-        } hidden_map;
-        // STRIX_DS41_REPLICA_MAPPED_HIDDEN=1: the mapped capture also on one GPU (qualifies it in csmoke on a single GPU)
-        const bool force_mapped = [] {
-            const char* v = std::getenv("STRIX_DS41_REPLICA_MAPPED_HIDDEN");
-            return v && v[0] == '1';
-        }();
-        if ((load_drafter && ddev != target_device) || (force_mapped && (load_drafter || o.stream_hashes)))
-            STRIX_CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&hidden_map.p), std::size_t{8} * 3U * shape.hidden * sizeof(float),
-                                           cudaHostAllocPortable | cudaHostAllocMapped));
-        float* const hidden_cap = hidden_map.p ? hidden_map.p : hidden_dev.get();  // the speculative phases' capture
-        if (o.stream_hashes) hidden_raw.resize(std::size_t{8} * 3U * 4U * shape.hidden);
         const auto run_window = [&](const std::vector<std::uint32_t>& rows, WindowTimes& wt) {
             const auto t0 = std::chrono::steady_clock::now();
             // winpf: the rows not hinted yet (all of them outside the speculative loop); no-op when off
@@ -1632,11 +1690,26 @@ int main(int argc, char** argv) {
         std::vector<std::uint64_t> smoke_ref;
         std::map<std::string, std::uint32_t> seen_phase;
         const CudaStepIo io0 = io;  // the step io right after setup: every request starts from it
+        const auto drain_request_state = [&]() {
+            p.wait_io();
+            STRIX_CUDA_CHECK(cudaDeviceSynchronize());
+            if (drafter) {
+                DeviceScope ds(ddev);
+                STRIX_CUDA_CHECK(cudaStreamSynchronize(drafter->stream()));
+            }
+        };
+        const auto import_request_state = [&]() {
+            if (imported.position >= o.max_positions) usage("import exceeds context capacity");
+            drain_request_state();
+            p.import_state(imported);
+        };
+
         // Per-request reset (design notes), at a quiescent point (the previous request drained):
         // the tier knobs at their launch values, the step io, and every piece of app state a fresh process starts with.
         // The engine's sequence state is re-imported by every phase / chat (import_state), the drafter's by reset();
         // warm by design: the Engram record cache (the same bytes), the decode graphs (epoch_of), the expert placement.
         const auto reset_request_state = [&]() {
+            drain_request_state();
             if (TierSite::can_set_sched()) tier->set_sched(wb_defer, flush_ready);
             spare_now = spares;
             tier->set_budgets(spares, pf_layer, pf_token);
@@ -1707,6 +1780,7 @@ int main(int argc, char** argv) {
                 const std::size_t total = guard + body + guard;
                 DeviceBuffer<float> dst_a(total), dst_b_dev(force_mapped ? 0 : total);
                 HostRows dst_b_map;
+                DecodeGraphReset graph_reset{p};
                 if (force_mapped)
                     STRIX_CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&dst_b_map.p), total * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped));
                 float* const pa = dst_a.get();
@@ -1735,7 +1809,7 @@ int main(int argc, char** argv) {
                     p.set_decode_graphs(pass == 1);
                     paint(pa);
                     paint(pb);
-                    p.import_state(imported);
+                    import_request_state();
                     const std::uint32_t P0 = p.position(), end = P0 + steps;
                     std::uint32_t w = 0;
                     while (p.position() < end) {
@@ -1795,7 +1869,7 @@ int main(int argc, char** argv) {
                 if (smoke_ref.empty()) throw std::runtime_error("csmoke needs an earlier smoke phase (its hashes)");
                 set_predict(static_cast<std::uint32_t>(std::stoul(ph.substr(6))));
                 ph_bank = ph_res = ph_mid = 0;
-                p.import_state(imported);
+                import_request_state();
                 const std::uint32_t P0 = p.position(), end = P0 + steps, H = shape.hidden;
                 std::uint32_t windows = 0, rows_same = 0, rows_all = 0, cap_rows = 0, cap_same = 0, link_ok = 0, links = 0;
                 while (p.position() < end) {
@@ -1853,7 +1927,7 @@ int main(int argc, char** argv) {
                 io.draft_hidden = nullptr;
                 ph_bank = ph_res = ph_mid = 0;
                 window_pressure(true);
-                p.import_state(imported);
+                import_request_state();
                 const std::uint32_t P0 = p.position(), end = P0 + steps;
                 WindowSchedule sched(max_rows);
                 std::uint32_t same = 0, rows_checked = 0, windows = 0;
@@ -1897,7 +1971,7 @@ int main(int argc, char** argv) {
                 set_predict(static_cast<std::uint32_t>(std::stoul(ph.substr(pressure ? 6 : 5))));
                 if (pressure) set_pressure(pressure_spares, pressure_free, pressure_recent);  // the arena is fixed at open: size it with --arena-gib
                 ph_bank = ph_res = ph_mid = 0;
-                p.import_state(imported);
+                import_request_state();
                 have_last = false;
                 std::vector<std::uint64_t> hs;
                 for (std::uint32_t i = 0; i < steps; ++i) {
@@ -1930,7 +2004,7 @@ int main(int argc, char** argv) {
                 if (pressure_phase) set_pressure(pressure_spares, pressure_free, pressure_recent);
                 compared = matched = 0;
                 ph_bank = ph_res = ph_mid = 0;
-                p.import_state(imported);
+                import_request_state();
                 have_last = false;
                 std::uint32_t next = imported.next_token;
                 for (std::uint32_t i = 0; i < steps; ++i) {
@@ -1973,7 +2047,7 @@ int main(int argc, char** argv) {
                 set_predict(k);
                 compared = matched = 0;
                 ph_bank = ph_res = ph_mid = 0;
-                p.import_state(imported);
+                import_request_state();
                 std::uint32_t next = imported.next_token;
                 const std::uint32_t P0 = p.position(), end = P0 + steps;
                 std::uint32_t windows = 0;
@@ -2065,7 +2139,7 @@ int main(int argc, char** argv) {
                 tier->set_budgets(spares, bpos == std::string::npos ? pf_layer : static_cast<std::uint32_t>(std::stoul(kb.substr(bpos + 1))), pf_token);
                 for (const auto& c : split(chats_arg, ',')) {
                     const auto& sq = seqs.at(std::stoul(c));
-                    p.import_state(imported);
+                    import_request_state();
                     const auto parts = split(sq.first, ':');
                     const std::string name = ph + "#" + std::to_string(occurrence) + "-" + c + "-" + (parts.size() > 1 ? parts[1] : std::string("x"));
                     const std::uint32_t P = std::min<std::uint32_t>(chat_prompt, static_cast<std::uint32_t>(sq.second.size()));
@@ -2134,7 +2208,7 @@ int main(int argc, char** argv) {
                 tier->set_budgets(spares, budget, pf_token);
                 for (const auto& c : split(chats_arg, ',')) {
                     const auto& sq = seqs.at(std::stoul(c));
-                    p.import_state(imported);
+                    import_request_state();
                     have_last = false;
                     const auto parts = split(sq.first, ':');
                     const std::string name = ph + "#" + std::to_string(occurrence) + "-" + c + "-" + (parts.size() > 1 ? parts[1] : std::string("x"));
@@ -2246,7 +2320,7 @@ int main(int argc, char** argv) {
                 for (const bool logits : {true, false})
                     for (int hid = 0; hid < (drafter ? 2 : 1); ++hid)
                         for (std::uint32_t R = 1; R <= max_rows; ++R) {
-                            p.import_state(imported);
+                            import_request_state();
                             io.logits = logits;
                             io.draft_hidden = hid ? hidden_cap : nullptr;
                             const std::vector<std::uint32_t> rows(R, imported.next_token);
@@ -2256,7 +2330,7 @@ int main(int argc, char** argv) {
                             ++wsteps;
                         }
             }
-            p.import_state(imported);
+            import_request_state();
             p.wait_io();
             STRIX_CUDA_CHECK(cudaDeviceSynchronize());
             io = io0;
@@ -2359,7 +2433,8 @@ int main(int argc, char** argv) {
                 if (rc == 0 && !quit && !ping) {
                     try {
                         emit("{\"event\":\"request_start\",\"name\":" + rs::json_str(*name) + ",\"seq\":" + std::to_string(served) + "}");
-                        if (reset_cache == "open") {  // the expert cache back to the open state (quiescent: drained above)
+                        if (reset_cache == "open") {  // the expert cache back to the open state
+                            drain_request_state();
                             const auto tr = std::chrono::steady_clock::now();
                             tier->reset_cache();
                             emit("{\"event\":\"reset_cache\",\"mode\":\"open\",\"ms\":" +

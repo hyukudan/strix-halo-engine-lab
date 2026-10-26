@@ -3362,6 +3362,12 @@ endif()
 # mma.sync / ldmatrix / cp.async these architectures share (same bits on each); select_device() refuses a device
 # the build has no code for.
 if(STRIX_ENABLE_CUDA_DS41)
+    add_executable(strix-cuda-ds41-attention-alloc-tests tests/cuda/ds41_attention_alloc_tests.cpp)
+    target_link_libraries(strix-cuda-ds41-attention-alloc-tests PRIVATE strix_ds41_attention strix_ds41_prefill)
+    strix_target_warnings(strix-cuda-ds41-attention-alloc-tests)
+    if(BUILD_TESTING)
+        add_test(NAME strix-cuda-ds41-attention-alloc-tests COMMAND strix-cuda-ds41-attention-alloc-tests)
+    endif()
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         set(CMAKE_CUDA_ARCHITECTURES "120;89;86")
     endif()
