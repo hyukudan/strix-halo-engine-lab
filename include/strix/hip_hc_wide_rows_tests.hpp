@@ -24,6 +24,8 @@ struct WideHyperRowsTestViews {
     const void* normalized16 = nullptr;
     std::uint32_t normalized16_pitch = 0;  // halves; 0 = 10240
     bool normalized16_only = false;        // the output's stream mix reads the FP16 rows too
+    unsigned output3_band = UINT32_MAX;     // output 7 only: 0..8, 12/16/24/32/48/64 override the read-once env; UINT32_MAX uses it
+    bool output3_zero_low_rank_stride = false;  // bench-only output 7 / band 0 / projection skipped; outputs discarded
 };
 void enqueue_wide_hyper_rows_test(const HipHyperMixLauncherConfig& config, const WideHyperRowsTestViews& views,
     unsigned projection_kernel, unsigned output_kernel, hipStream_t stream);
