@@ -200,8 +200,12 @@ template <unsigned Rows> struct NormGroupViews {
     std::uint64_t position[Rows];
     float2* table; // [Rows][rotary_dim / 2] (cosine, sine)
 };
-template <unsigned Rows>
-__global__ __launch_bounds__(64) void rope_table_kernel(NormGroupViews<Rows> views, std::uint32_t rotary_dim, float theta) {
+template <unsigned Rows, bool Batch = false>
+__global__ __launch_bounds__(64) void rope_table_kernel(NormGroupViews<Rows> single, std::uint32_t rotary_dim, float theta, const NormGroupViews<Rows>* groups = nullptr) {
+    const auto& views = [&]() -> const NormGroupViews<Rows>& {
+        if constexpr (Batch) return groups[blockIdx.y];
+        else return single;
+    }();
     const auto row = static_cast<std::uint32_t>(blockIdx.x), pair = static_cast<std::uint32_t>(threadIdx.x);
     const auto half = rotary_dim / 2U;
     if (pair >= half) return;
@@ -212,8 +216,13 @@ __global__ __launch_bounds__(64) void rope_table_kernel(NormGroupViews<Rows> vie
     views.table[static_cast<std::uint64_t>(row) * half + pair] = make_float2(cosine, sine);
 }
 // grid (heads[0] + heads[1] + heads[2], Rows), block 256 (dim <= 256).
-template <SmallWeightKind Kind, unsigned Rows>
-__global__ __launch_bounds__(256) void norm_rope_group_kernel(NormGroupViews<Rows> views, float epsilon, std::uint32_t rotary_dim) {
+template <SmallWeightKind Kind, unsigned Rows, bool Batch = false>
+__global__ __launch_bounds__(256) void norm_rope_group_kernel(NormGroupViews<Rows> single, float epsilon, std::uint32_t rotary_dim, const NormGroupViews<Rows>* groups = nullptr) {
+    const auto& views = [&]() -> const NormGroupViews<Rows>& {
+        if constexpr (Batch) return groups[blockIdx.z];
+        else return single;
+    }();
+    if constexpr (Batch) if (blockIdx.x >= views.heads[0] + views.heads[1] + views.heads[2]) return;
     __shared__ float source[256], reduction[256];
     const auto row = static_cast<std::uint32_t>(blockIdx.y), feature = static_cast<std::uint32_t>(threadIdx.x);
     auto head = static_cast<std::uint32_t>(blockIdx.x);

@@ -4,7 +4,8 @@
 // Times the QSA prefill part-2 kernels of one layer-chunk (T rows from position P) on synthetic data, the
 // way enqueue_qsa_known_rows runs them for 64-row groups (pool, block scores, selection, batched union +
 // attend), and checks the qpf2k kernels (src/hip_qsa_prefill_flash.inc) bitwise against the production ones.
-// The production device code below is copied verbatim from src/hip_indexed_attention_launcher.hip
+// Pool/store kernels are shared directly with src/hip_qsa_prefill_stages.inc.
+// The remaining production reference code below is copied verbatim from src/hip_indexed_attention_launcher.hip
 // (0998a0e5); hip_qsa_fast_prefill.inc and hip_qsa_prefill_flash.inc are included from src/.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -195,44 +196,7 @@ template <unsigned P, unsigned Step = 0U> __device__ __forceinline__ void qsa_sc
         qsa_scatter<P, Step + 1U>(v, lane);
     }
 }
-template <SmallWeightKind Kind>
-__global__ void block_pool_kernel(const std::uint16_t* raw_keys, std::uint32_t first_block, std::uint32_t head_dim,
-    std::uint32_t compress_ratio, const void* key_norm, float epsilon, std::uint32_t rotary_dim, float theta, float* pooled_keys) {
-    const auto block = first_block + static_cast<std::uint32_t>(blockIdx.x);
-    const auto feature = static_cast<std::uint32_t>(threadIdx.x);
-    if (feature >= head_dim) return;
-    extern __shared__ float shared[];
-    auto* pooled = shared;
-    auto* scratch = shared + head_dim;
-    float mean = 0.0F;
-    const auto token_start = static_cast<std::uint64_t>(block) * compress_ratio;
-    for (std::uint32_t offset = 0; offset < compress_ratio; ++offset)
-        mean += bf16_to_float(raw_keys[(token_start + offset) * head_dim + feature]);
-    mean /= static_cast<float>(compress_ratio);
-    mean = round_bf16(mean);
-    pooled[feature] = mean;
-    scratch[feature] = mean * mean;
-    __syncthreads();
-    for (std::uint32_t stride = head_dim / 2U; stride > 0; stride >>= 1U) {
-        if (feature < stride) scratch[feature] += scratch[feature + stride];
-        __syncthreads();
-    }
-    const float inv_rms = rsqrtf(scratch[0] / static_cast<float>(head_dim) + epsilon);
-    pooled[feature] = round_bf16(mean * inv_rms * load_small_weight<Kind>(key_norm, feature));
-    __syncthreads();
-    float rotated = pooled[feature];
-    if (feature < rotary_dim) {
-        const auto half = rotary_dim / 2U;
-        const auto pair = feature % half;
-        const float exponent = 2.0F * static_cast<float>(pair) / static_cast<float>(rotary_dim);
-        const float angle = static_cast<float>(token_start) * powf(theta, -exponent);
-        const float cosine = cosf(angle);
-        const float sine = sinf(angle);
-        if (feature < half) rotated = pooled[feature] * cosine - pooled[feature + half] * sine;
-        else rotated = pooled[feature] * cosine + pooled[feature - half] * sine;
-    }
-    pooled_keys[static_cast<std::uint64_t>(block) * head_dim + feature] = round_bf16(rotated);
-}
+#include "../src/hip_qsa_prefill_stages.inc"
 template <unsigned Rows> struct QsaRowsInputViews {
     const std::uint16_t* input[Rows];
     const void* weights[5];
