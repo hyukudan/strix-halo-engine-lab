@@ -1,0 +1,204 @@
+#include "glm/prefill/glm_pf_exact.hpp"
+#include "glm/moe/glm_trellis_device.hpp"
+#include <strix_trellis.h>
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <string>
+
+namespace strix::glm::pf::exact {
+namespace {
+namespace d = strix::glm::moe::dev;
+using Mat = engine::Exl3Raw;
+std::size_t align256(std::size_t n) { return (n + 255U) & ~std::size_t{255}; }
+bool aligned(const void* p, std::uintptr_t a) { return p && (reinterpret_cast<std::uintptr_t>(p) & (a - 1U)) == 0; }
+void ok(hipError_t e) {
+    if (e != hipSuccess) throw std::runtime_error(std::string("glm pf exact: ") + hipGetErrorString(e));
+}
+// Linear's codebook tag is authoritative, including prepared-only linears.
+// Prepared spans use the pinned v03 no-bias file layout.
+bool parts(const engine::Linear& l, Mat& m) {
+    m = l.raw;
+    if (!m.input || !m.output || m.input % 128U || m.output % 128U ||
+        m.bits < 2 || m.bits > 8 || m.codebook != 2 ||
+        m.input > static_cast<unsigned>(INT32_MAX) || m.output > static_cast<unsigned>(INT32_MAX)) return false;
+    const std::size_t limit = std::numeric_limits<std::size_t>::max();
+    if (std::size_t{m.input} / 8U > (limit - 1024U) / m.output / m.bits) return false;
+    if (l.prepared) {
+        const void* base = nullptr;
+        std::uint64_t bytes = 0;
+        if (strix_weights_device_span(static_cast<strix_weights>(l.prepared), &base, &bytes) != STRIX_SUCCESS || !base) return false;
+        const std::size_t tr = std::size_t{m.input} / 8U * m.output * m.bits;
+        const std::size_t so = align256(tr), vo = align256(so + std::size_t{m.input} * 2U);
+        if (bytes != align256(vo + std::size_t{m.output} * 2U)) return false;
+        const auto* b = static_cast<const unsigned char*>(base);
+        m.trellis = reinterpret_cast<const std::uint32_t*>(b);
+        m.suh = reinterpret_cast<const std::uint16_t*>(b + so);
+        m.svh = reinterpret_cast<const std::uint16_t*>(b + vo);
+    }
+    return aligned(m.trellis, 4) && aligned(m.suh, 2) && aligned(m.svh, 2);
+}
+// Original-input fused routes partition H128 before converting to K16.
+// This matters for e.g. K5 5120->2304. Fused-both uses the same graph.
+bool h128_partition(const Mat& m) {
+    return (m.bits == 6 && m.input == 5120 && m.output == 1280) ||
+        (m.bits == 5 && ((m.input == 4096 && m.output == 1024) ||
+         (m.input == 8192 && m.output == 5120) || (m.input == 5120 && m.output == 2304) ||
+         (m.input == 2304 && m.output == 5120)));
+}
+__global__ void input_kernel(const float* x, std::size_t xs, Mat m, unsigned rows, _Float16* t) {
+    const std::size_t job = std::size_t{blockIdx.x} * 4U + threadIdx.x / 32U;
+    const unsigned blocks = m.input / 128U;
+    if (job >= std::size_t{rows} * blocks) return;
+    d::transform_block(x + (job / blocks) * xs, m.suh, t + (job / blocks) * m.input,
+                       static_cast<unsigned>(job % blocks) * 128U, threadIdx.x & 31U);
+}
+// Eight waves, one 16-column tile each. Static row indices keep the two
+// chains per row in registers. Ascending split totals live in LDS.
+template<int Bits, unsigned TM>
+__global__ __launch_bounds__(256) void core_kernel(Mat m, const _Float16* t, float* y,
+                                                  std::size_t ys, unsigned rows, unsigned splits, bool hp) {
+    __shared__ std::uint32_t act[TM][64];
+    __shared__ float total[TM][128];
+    const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x / 32U;
+    const unsigned row0 = blockIdx.y * TM, col0 = blockIdx.x * 128U;
+    const unsigned nr = rows - row0 < TM ? rows - row0 : TM;
+    const unsigned coltile = col0 / 16U + wave, kt = m.input / 16U;
+    for (unsigned q = threadIdx.x; q < TM * 128U; q += 256U) total[q / 128U][q % 128U] = 0.0F;
+    __syncthreads();
+    const d::LaneGeom<Bits> geo(lane);
+    const auto* weights = reinterpret_cast<const unsigned char*>(d::uniform(m.trellis));
+    for (unsigned sp = 0; sp < splits; ++sp) {
+        const unsigned units = hp ? m.input / 128U : kt;
+        const unsigned begin = static_cast<unsigned>(std::uint64_t{units} * sp / splits) * (hp ? 8U : 1U);
+        const unsigned end = static_cast<unsigned>(std::uint64_t{units} * (sp + 1U) / splits) * (hp ? 8U : 1U);
+        float sums[TM][2];
+#pragma unroll
+        for (unsigned r = 0; r < TM; ++r) sums[r][0] = sums[r][1] = 0.0F;
+        for (unsigned base = begin; base < end; base += 8U) {
+            for (unsigned q = threadIdx.x; q < TM * 64U; q += 256U) {
+                const unsigned r = q / 64U, p = q % 64U;
+                std::uint32_t v = 0;
+                if (r < nr && base + p / 8U < end)
+                    __builtin_memcpy(&v, t + std::size_t{row0 + r} * m.input + base * 16U + p * 2U, 4);
+                act[r][p] = v;
+            }
+            __syncthreads();
+            for (unsigned kk = 0; kk < 8U && base + kk < end; ++kk) {
+                const std::size_t off = (std::size_t{base + kk} * (m.output / 16U) + coltile) * Bits * 32U;
+                const d::TileStates<Bits> st(weights + off, geo);
+                const d::Half2 w0 = d::mul1_pair(st.template state<0>(), st.template state<1>());
+                const d::Half2 w1 = d::mul1_pair(st.template state<2>(), st.template state<3>());
+                const d::Half2 w2 = d::mul1_pair(st.template state<4>(), st.template state<5>());
+                const d::Half2 w3 = d::mul1_pair(st.template state<6>(), st.template state<7>());
+#pragma unroll
+                for (unsigned r = 0; r < TM; ++r) {
+                    // Padded rows are initialized and isolated, never published.
+                    const d::Half2 a0 = __builtin_bit_cast(d::Half2, act[r][kk * 8U + (lane & 3U)]);
+                    const d::Half2 a1 = __builtin_bit_cast(d::Half2, act[r][kk * 8U + (lane & 3U) + 4U]);
+                    sums[r][0] = __builtin_amdgcn_fdot2(w0, a0, sums[r][0], false);
+                    sums[r][0] = __builtin_amdgcn_fdot2(w1, a1, sums[r][0], false);
+                    sums[r][1] = __builtin_amdgcn_fdot2(w2, a0, sums[r][1], false);
+                    sums[r][1] = __builtin_amdgcn_fdot2(w3, a1, sums[r][1], false);
+                }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (unsigned r = 0; r < TM; ++r) {
+            const float v0 = d::reduce4(sums[r][0]), v1 = d::reduce4(sums[r][1]);
+            if ((lane & 3U) == 0) {
+                total[r][wave * 16U + lane / 4U] += v0;
+                total[r][wave * 16U + lane / 4U + 8U] += v1;
+            }
+        }
+    }
+    __syncthreads();
+    for (unsigned r = wave; r < nr; r += 8U) {
+        float v[4];
+#pragma unroll
+        for (unsigned j = 0; j < 4; ++j) v[j] = total[r][lane + 32U * j];
+        d::hadamard128(v, lane);
+#pragma unroll
+        for (unsigned j = 0; j < 4; ++j) {
+            const unsigned c = col0 + lane + 32U * j;
+            y[std::size_t{row0 + r} * ys + c] = v[j] * d::half_bits(m.svh[c]);
+        }
+    }
+}
+template<int B, unsigned TM>
+void launch(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, hipStream_t s, std::size_t* scratch) {
+    if (scratch) {
+        hipFuncAttributes a{};
+        ok(hipFuncGetAttributes(&a, reinterpret_cast<const void*>(&core_kernel<B, TM>)));
+        *scratch = a.localSizeBytes;
+        return;
+    }
+    core_kernel<B, TM><<<dim3(m.output / 128U, (rows - 1U) / TM + 1U), 256, 0, s>>>(
+        m, t, y, ys, rows, vector_splits(m.input, m.output, m.bits), h128_partition(m));
+    ok(hipGetLastError());
+}
+template<unsigned TM>
+void dispatch(Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, hipStream_t s, std::size_t* scratch) {
+#define CASE(B) case B: launch<B, TM>(m, t, y, ys, rows, s, scratch); break
+    switch (m.bits) {
+    CASE(2); CASE(3); CASE(4); CASE(5); CASE(6); CASE(7); CASE(8);
+    default: throw std::invalid_argument("glm pf exact: bits");
+    }
+#undef CASE
+}
+void dispatch_tm(unsigned tm, Mat m, const _Float16* t, float* y, std::size_t ys, unsigned rows, hipStream_t s,
+                 std::size_t* scratch = nullptr) {
+    switch (tm) {
+    case 16: dispatch<16>(m, t, y, ys, rows, s, scratch); break;
+    case 32: dispatch<32>(m, t, y, ys, rows, s, scratch); break;
+    case 64: dispatch<64>(m, t, y, ys, rows, s, scratch); break;
+    default: throw std::invalid_argument("STRIX_GLM_PF_EXACT_TM must be 16, 32 or 64");
+    }
+}
+}  // namespace
+unsigned vector_splits(unsigned input, unsigned output, unsigned bits) {
+    const unsigned s = bits == 5 && input == 4096 && output == 1024 ? 16U :
+        (output <= 1024 ? 32U : (output <= 4096 && input >= 4096 ? 16U : 4U));
+    return std::min(s, input / 16U);
+}
+bool supported(const engine::Linear& l) { Mat m; return parts(l, m); }
+std::size_t workspace_bytes(unsigned rows, unsigned input) {
+    if (std::size_t{rows} > (std::numeric_limits<std::size_t>::max() - 255U) / 2U / std::max(1U, input))
+        throw std::overflow_error("glm pf exact: workspace size");
+    return align256(std::size_t{rows} * input * 2U);
+}
+unsigned tile_rows() {
+    const char* p = std::getenv("STRIX_GLM_PF_EXACT_TM");
+    // default 16 (measurement: TM16 1.8-2.1x vs strix_gemv 8-row blocks, ~200 GB/s weight stream; TM32/64 slower)
+    if (!p || std::strcmp(p, "16") == 0) return 16;
+    if (std::strcmp(p, "32") == 0) return 32;
+    if (std::strcmp(p, "64") == 0) return 64;
+    throw std::invalid_argument("STRIX_GLM_PF_EXACT_TM must be 16, 32 or 64");
+}
+void linear_rows(const engine::Linear& l, const float* x, std::size_t xs, float* y, std::size_t ys,
+                 unsigned rows, void* ws, std::size_t bytes, hipStream_t s) {
+    Mat m;
+    if (!parts(l, m)) throw std::invalid_argument("glm pf exact: unsupported linear");
+    if (!rows || !aligned(x, 4) || !aligned(y, 4) || xs < m.input || ys < m.output ||
+        !aligned(ws, 256) || bytes < workspace_bytes(rows, m.input) ||
+        std::size_t{rows} * (m.input / 128U) > std::size_t{UINT32_MAX} * 4U ||
+        std::size_t{rows} > std::numeric_limits<std::size_t>::max() / sizeof(float) / std::max(xs, ys))
+        throw std::invalid_argument("glm pf exact: rows, strides or workspace");
+    const unsigned tm = tile_rows();
+    auto* t = static_cast<_Float16*>(ws);
+    const auto grid = static_cast<unsigned>((std::size_t{rows} * (m.input / 128U) + 3U) / 4U);
+    input_kernel<<<grid, 128, 0, s>>>(x, xs, m, rows, t);
+    ok(hipGetLastError());
+    dispatch_tm(tm, m, t, y, ys, rows, s);
+}
+std::size_t scratch_bytes(const engine::Linear& l, unsigned tm) {
+    Mat m;
+    if (!parts(l, m)) throw std::invalid_argument("glm pf exact: unsupported linear");
+    std::size_t bytes = 0;
+    dispatch_tm(tm, m, nullptr, nullptr, 0, 1, nullptr, &bytes);
+    return bytes;
+}
+}  // namespace strix::glm::pf::exact

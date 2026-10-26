@@ -1,0 +1,214 @@
+// strix-glm5-rank defaults: optimizations are ON by default in code and switched OFF per item, or all at
+// once with the baseline master switch). Host-only, no HIP: the rank app resolves its route here, --print-effective-config
+// prints the resolution without touching a GPU or a peer, and tests/glm_rank_defaults_cpu_tests.cpp diffs the plain
+// default invocation against the measured decode, batch, and host-path prefill configuration.
+//
+// Rules: an explicit flag or environment value always wins; the default resolves to the receipt's route + flags + env;
+// --baseline / STRIX_GLM_BASELINE=1 restores the old path of every item (except where noted) unless that item is set
+// explicitly; a default whose precondition fails falls back with one notice line (prefill auto at world 1, see the app).
+#pragma once
+
+#include <cstdint>
+#include <cstdlib>
+#include <functional>
+#include <map>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace strix::glm::rank_defaults {
+
+using EnvGet = std::function<const char*(const char*)>;
+
+inline EnvGet process_env() {
+    return [](const char* k) -> const char* { return std::getenv(k); };
+}
+
+// One environment-switched item. on = what the default resolves to, off = the old path. app_sets: the app applies `on`
+// (setenv if unset) because the code's own default is the old path; otherwise `on` is the engine's built-in default and is
+// only reported. in_baseline: the baseline switch sets `off` (if unset).
+struct EnvItem {
+    const char* item;
+    const char* env;
+    const char* on;
+    const char* off;
+    bool app_sets;
+    bool in_baseline;
+    const char* receipt;
+};
+
+// MoE: STRIX_GLM_MOE=ref (DefaultMoe) stays a per-item switch but is not in the baseline: its prepared experts do not
+// fit the TP2 rank's GTT on the real model (measured OOM: 36,288 x 4 MiB granules), so it is no runnable old path.
+inline const std::vector<EnvItem>& env_items() {
+    static const std::vector<EnvItem> items = {
+        {"hp-crc-parallel", "STRIX_DIST_CRC_PARALLEL", "1", "0", true, true,
+         "Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16"},
+        {"hp-crc-overlap", "STRIX_DIST_HOST_CRC_OVERLAP", "1", "0", true, true, "Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16"},
+        {"hp-chunk-bytes", "STRIX_DIST_HOST_CHUNK_BYTES", "1048576", "0", true, true, "Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16"},
+        {"hsa-no-fragment-allocator", "HSA_DISABLE_FRAGMENT_ALLOCATOR", "1", "0", true, true,
+         "Measurement: production decode and prefill configuration; allocator granules fit GTT"},
+        {"r1b-dense-auto", "STRIX_GLM_R1B_DENSE", "7", "2", false, true,
+         "Measurement: R1b-fast kernels -7.8 % R1 / -5.4 % R8, same tokens"},
+        {"r1b-hc-v4", "STRIX_GLM_R1B_HC", "4", "1", false, true, "Measurement: with r1b-dense-auto, R1b-fast kernels -7.8 % R1 / -5.4 % R8, same tokens"},
+        {"hc-pre-v7", "STRIX_GLM_HC_PRE_V", "7", "4", false, true,
+         "Measurement: hc_pre 77.4-77.9 vs 102.1-102.8 us, gates 0-7 bitwise; tokens match reference"},
+        {"post-exchange-fast", "STRIX_GLM_POST", "fast", "ref", false, true,
+         "Measurement: fast post-exchange consumers match STRIX_GLM_POST=ref and reference (real model, 6 layers)"},
+        {"attn-fast", "STRIX_GLM_ATTN", "fast", "ref", false, true,
+         "Measurement: FastAttn matches STRIX_GLM_ATTN=ref (G3), Tier A 12-40x"},
+        {"attn-tierb-fused", "STRIX_GLM_TIERB", "fused", "lib", false, true,
+         "Measurement: fused Tier B -2.46 ms/token vs strix_gemv, tokens match reference"},
+        {"xfer-boundary-fused", "STRIX_GLM_BOUNDARY", "1", "0", false, true,
+         "Measurement: Xfer reduce +1.41 -> fused boundary ~+1.10 ms/token over local, bitwise"},
+        {"moe-fast", "STRIX_GLM_MOE", "fast", "ref", false, false,
+         "Measurement: FastMoe matches DefaultMoe bitwise (real TP2 slices); raw-only experts (fits GTT)"},
+        {"pf-exact-moe-v3", "STRIX_GLM_PF_EXACTMOE_V", "3", "1", false, true,
+         "Measurement: exact MoE v3 (W2 grouped experts) 1K/8K/32K 240/236/226 tok/s, logits bitwise"},
+        {"pf-obar-v5", "STRIX_GLM_PF_OBAR", "5", "2", false, true, "Measurement: MLA o-bar v5 exact, 2.9x"},
+        {"pf-scores-v3", "STRIX_GLM_PF_SCORES", "3", "2", false, true, "Measurement: MLA scores v3 -22 %"},
+        {"pf-indexer-v2", "STRIX_GLM_PF_IDX", "2", "1", false, true, "Measurement: indexer v2 -41 %"},
+    };
+    return items;
+}
+
+// Options with no value (everything else the rank app accepts takes exactly one value).
+inline bool is_value_free(const std::string& a) {
+    return a == "--g3-sweep" || a == "--pf-install-before-load" || a == "--pf-swap-moe" || a == "--mem-plan" ||
+           a == "--profile" || a == "--tf-check" || a == "--baseline" || a == "--print-effective-config";
+}
+
+// Gate / measurement modes that install their own prefill path (prefill auto -> ref under them).
+inline bool is_reference_gate(const std::string& a) {
+    return a == "--ab" || a == "--aba" || a == "--g3-sweep" || a == "--aba-attn3" || a == "--aba-xch" || a == "--g4" ||
+           a == "--tf" || a == "--spec-oracle" || a == "--spec-run" || a == "--state-in" || a == "--state-out" ||
+           a == "--pf-gate" || a == "--pf-ttft" || a == "--pf-null-study";
+}
+
+// The part of the command line the defaults depend on (args = argv[2..], i.e. without program and MODEL_DIR).
+struct Request {
+    std::uint32_t world = 2;
+    std::optional<std::string> identity, prefill, decode_xch;
+    std::optional<bool> mtp;
+    bool spec = false, g3 = false, decode_or_batch = false, mem_plan = false, reference_gate = false;
+    unsigned idcheck = 0;
+    std::string xch = "comm";
+    bool baseline_flag = false, print = false;
+};
+
+inline Request scan(const std::vector<std::string>& args) {
+    Request r;
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (is_reference_gate(a)) r.reference_gate = true;
+        if (is_value_free(a)) {
+            if (a == "--mem-plan") r.mem_plan = true;
+            else if (a == "--baseline") r.baseline_flag = true;
+            else if (a == "--print-effective-config") r.print = true;
+            continue;
+        }
+        if (i + 1 >= args.size()) break;  // the app's own parser reports the missing value
+        const std::string& v = args[++i];
+        if (a == "--world") r.world = static_cast<std::uint32_t>(std::stoul(v));
+        else if (a == "--identity") r.identity = v;
+        else if (a == "--prefill") r.prefill = v;
+        else if (a == "--mtp") r.mtp = std::stoul(v) != 0;
+        else if (a == "--spec") r.spec = std::stoul(v) != 0;
+        else if (a == "--decode-xch") r.decode_xch = v;
+        else if (a == "--xch") r.xch = v;
+        else if (a == "--idcheck") r.idcheck = static_cast<unsigned>(std::stoul(v));
+        else if (a == "--g3") r.g3 = !v.empty();
+        else if (a == "--decode" || a == "--batch") r.decode_or_batch = r.decode_or_batch || std::stoul(v) != 0;
+    }
+    return r;
+}
+
+inline bool env_is(const EnvGet& env, const char* k, const char* v) {
+    const char* e = env(k);
+    return e != nullptr && std::string(e) == v;
+}
+
+inline bool baseline_requested(const Request& r, const EnvGet& env) {
+    return r.baseline_flag || env_is(env, "STRIX_GLM_BASELINE", "1");
+}
+
+// The exact chunked prefill (gemv identity) is the default for runs that prefill in R1 without MTP/spec; the reference
+// (row by row, same bits) for MTP/spec, r1b-all, G3/smoke/mem-plan, --idcheck and the gate modes.
+inline std::string resolve_prefill_auto(bool mtp, bool spec, bool g3_only, bool smoke_head, bool mem_plan, bool r1b_all,
+                                        unsigned idcheck, bool reference_gate) {
+    return !mtp && !spec && !g3_only && !smoke_head && !mem_plan && !r1b_all && idcheck == 0 && !reference_gate ? "gemv" : "ref";
+}
+
+struct Value {
+    std::string value;
+    std::string source;  // default | explicit | baseline
+};
+
+struct Effective {
+    bool baseline = false;
+    Value identity, prefill_requested, mtp, decode_xch;
+    std::string prefill;  // resolved: gemv | ref | wmma
+    std::string xch;
+    std::map<std::string, Value> env;  // env name -> effective value
+};
+
+inline Effective resolve(const Request& r, const EnvGet& env) {
+    Effective e;
+    e.baseline = baseline_requested(r, env);
+    const char* src_b = e.baseline ? "baseline" : "default";
+    // identity: STRIX_GLM_IDENTITY overrides --identity (engine rule)
+    if (const char* v = env("STRIX_GLM_IDENTITY")) e.identity = {v, "explicit"};
+    else if (r.identity) e.identity = {*r.identity, "explicit"};
+    else e.identity = {e.baseline ? "r1" : "r1b", src_b};
+    // MTP layer: the measured production command runs --mtp 0 (prefill auto needs it); --mtp 1 for --spec-run / drafting
+    if (r.mtp) e.mtp = {*r.mtp ? "1" : "0", "explicit"};
+    else e.mtp = {e.baseline ? "1" : "0", src_b};
+    // prefill: --prefill wins over STRIX_GLM_PREFILL
+    if (r.prefill) e.prefill_requested = {*r.prefill, "explicit"};
+    else if (const char* v = env("STRIX_GLM_PREFILL")) e.prefill_requested = {v, "explicit"};
+    else e.prefill_requested = {e.baseline ? "ref" : "auto", src_b};
+    // decode Xfer exchange: STRIX_GLM_DECODE_XCH overrides --decode-xch (engine rule)
+    if (const char* v = env("STRIX_GLM_DECODE_XCH")) e.decode_xch = {v, "explicit"};
+    else if (r.decode_xch) e.decode_xch = {*r.decode_xch, "explicit"};
+    else e.decode_xch = {e.baseline ? "comm" : "xfer", src_b};
+    e.xch = r.xch;
+    const bool g3_only = r.g3 && !r.decode_or_batch && r.idcheck == 0;
+    const bool smoke_head = env_is(env, "STRIX_GLM_SMOKE_HEAD", "1");
+    e.prefill = e.prefill_requested.value != "auto"
+                    ? e.prefill_requested.value
+                    : resolve_prefill_auto(e.mtp.value == "1", r.spec, g3_only, smoke_head, r.mem_plan,
+                                           e.identity.value == "r1b-all", r.idcheck, r.reference_gate);
+    for (const auto& it : env_items()) {
+        if (const char* v = env(it.env)) e.env[it.env] = {v, "explicit"};
+        else if (e.baseline && it.in_baseline) e.env[it.env] = {it.off, "baseline"};
+        else e.env[it.env] = {it.on, "default"};
+    }
+    return e;
+}
+
+// Process environment for the resolved items (setenv if unset: an explicit value always wins). Default: the app-set
+// items' `on`; baseline: every baseline item's `off` (engine items included, they read the environment at load).
+inline void apply_env(const Effective& e, const std::function<void(const char*, const char*)>& setenv_if_unset) {
+    for (const auto& it : env_items()) {
+        const Value& v = e.env.at(it.env);
+        if (v.source == "explicit") continue;
+        if (v.source == "baseline" || it.app_sets) setenv_if_unset(it.env, v.value.c_str());
+    }
+}
+
+inline std::string print(const Effective& e) {
+    std::string s;
+    auto line = [&](const std::string& k, const Value& v) { s += "effective " + k + "=" + v.value + " (" + v.source + ")\n"; };
+    s += std::string("effective baseline=") + (e.baseline ? "1" : "0") + "\n";
+    line("identity", e.identity);
+    line("mtp", e.mtp);
+    s += "effective prefill=" + e.prefill + " (requested " + e.prefill_requested.value + ", " + e.prefill_requested.source + ")\n";
+    line("decode-xch", e.decode_xch);
+    s += "effective xch=" + e.xch + "\n";
+    for (const auto& it : env_items()) {
+        const Value& v = e.env.at(it.env);
+        s += std::string("effective env ") + it.env + "=" + v.value + " (" + v.source + ", item " + it.item + ")\n";
+    }
+    return s;
+}
+
+}  // namespace strix::glm::rank_defaults

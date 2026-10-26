@@ -1,0 +1,53 @@
+{
+ "lm_head": [
+  6
+ ],
+ "model.language_model.layers.N.eh_proj": [
+  5
+ ],
+ "model.language_model.layers.N.mlp.down_proj": [
+  5
+ ],
+ "model.language_model.layers.N.mlp.experts.E.down_proj": [
+  4
+ ],
+ "model.language_model.layers.N.mlp.experts.E.gate_proj": [
+  4
+ ],
+ "model.language_model.layers.N.mlp.experts.E.up_proj": [
+  4
+ ],
+ "model.language_model.layers.N.mlp.gate_proj": [
+  5
+ ],
+ "model.language_model.layers.N.mlp.shared_experts.down_proj": [
+  6
+ ],
+ "model.language_model.layers.N.mlp.shared_experts.gate_proj": [
+  6
+ ],
+ "model.language_model.layers.N.mlp.shared_experts.up_proj": [
+  6
+ ],
+ "model.language_model.layers.N.mlp.up_proj": [
+  5
+ ],
+ "model.language_model.layers.N.self_attn.indexer.wq_b": [
+  6
+ ],
+ "model.language_model.layers.N.self_attn.kv_a_proj_with_mqa": [
+  6
+ ],
+ "model.language_model.layers.N.self_attn.o_proj": [
+  6
+ ],
+ "model.language_model.layers.N.self_attn.q_a_proj": [
+  6
+ ],
+ "model.language_model.layers.N.self_attn.q_b_proj": [
+  6
+ ],
+ "model.language_model.layers.N.self_attn.qkv_proj": [
+  6
+ ]
+}

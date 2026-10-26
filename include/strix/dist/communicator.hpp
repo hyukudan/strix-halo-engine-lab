@@ -287,6 +287,9 @@ public:
     [[nodiscard]] const CommunicatorStats& stats() const noexcept { return stats_; }
     [[nodiscard]] const Group& group() const noexcept { return group_; }
     [[nodiscard]] std::string transport_name() const;
+    // The transport, for a module that borrows it between this communicator's exchanges (both ranks at the same point,
+    // nothing in flight here: e.g. an in-process A/B of XferExchange against CommExchange).
+    [[nodiscard]] Transport& transport() noexcept { return *transport_; }
     [[nodiscard]] const DeviceExchange* device_exchange() const noexcept { return direct_.get(); }
     // The size router (with a device exchange): STRIX_DIST_ROUTE=table (default: the measured table; with host
     // streams, small messages on the host path, two rings up to 1 MB, mixed 35 % host above; without, one ring up to
