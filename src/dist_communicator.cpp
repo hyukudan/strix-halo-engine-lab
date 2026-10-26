@@ -877,12 +877,14 @@ std::string describe(const Hello& h) {
 // afterwards.
 struct Handshake {
     std::uint32_t rank;
+    std::uint16_t version = pairing_version;
     std::uint64_t nonce;
     std::string host;
     std::chrono::milliseconds answer{1500}, closed_wait{500}, resend{250};
 };
 Hello make(const Handshake& hs, const Candidate& c, std::uint32_t index, std::uint16_t kind) {
     Hello h;
+    h.version = hs.version;
     h.nonce = hs.nonce; h.rank = hs.rank; h.stream = index; h.kind = kind; h.device = trailing_number(c.info.device);
     h.generation = c.generation;
     std::memcpy(h.host, hs.host.data(), std::min(hs.host.size(), sizeof(h.host)));
@@ -981,7 +983,7 @@ bool handshake_step(Candidate& c, std::uint32_t index, const Handshake& hs) {
         c.have = 0;
         Hello h;
         std::memcpy(&h, c.in.data(), sizeof(h));
-        if (h.magic != hello_magic || h.crc != body_crc(h) || h.version != pairing_version) {
+        if (h.magic != hello_magic || h.crc != body_crc(h) || h.version != hs.version) {
             ++c.garbage; // stale bytes of an earlier session (whole 64-byte units)
             note(c, "read garbage unit");
         } else if (h.kind == 1U) {
@@ -1004,11 +1006,37 @@ bool handshake_step(Candidate& c, std::uint32_t index, const Handshake& hs) {
     return moved;
 }
 
+// Version 2 used the same 128 bytes, with its CRC immediately after min_part and zero padding thereafter.
+// Normalize it to Plan only inside this process; version 3 retains its existing wire representation.
 void write_plan(int fd, const Plan& plan) {
-    write_all(fd, std::span<const std::byte>(reinterpret_cast<const std::byte*>(&plan), sizeof(plan)), "usb4 plan");
+    if (plan.version != 2U) {
+        write_all(fd, std::span<const std::byte>(reinterpret_cast<const std::byte*>(&plan), sizeof(plan)), "usb4 plan");
+        return;
+    }
+    Plan wire = plan;
+    if (plan.version == 2U) {
+        constexpr auto prefix = offsetof(Plan, streams_up_to);
+        auto* bytes = reinterpret_cast<std::byte*>(&wire);
+        const auto crc = crc32c(std::span<const std::byte>(bytes, prefix));
+        std::memset(bytes + prefix, 0, sizeof(wire) - prefix);
+        std::memcpy(bytes + prefix, &crc, sizeof(crc));
+    }
+    write_all(fd, std::span<const std::byte>(reinterpret_cast<const std::byte*>(&wire), sizeof(wire)), "usb4 plan");
 }
-Plan check_plan(const Plan& plan) {
-    if (plan.magic != plan_magic || plan.crc != body_crc(plan) || plan.version != pairing_version || plan.count > max_streams ||
+Plan check_plan(Plan plan, std::uint32_t version = pairing_version) {
+    bool crc_ok = false;
+    if (version == 2U) {
+        constexpr auto prefix = offsetof(Plan, streams_up_to);
+        auto* bytes = reinterpret_cast<std::byte*>(&plan);
+        std::uint32_t crc;
+        std::memcpy(&crc, bytes + prefix, sizeof(crc));
+        crc_ok = crc == crc32c(std::span<const std::byte>(bytes, prefix));
+        std::memset(bytes + prefix, 0, sizeof(plan) - prefix);
+        plan.crc = 0;
+    } else {
+        crc_ok = plan.crc == body_crc(plan);
+    }
+    if (plan.magic != plan_magic || !crc_ok || plan.version != version || plan.count > max_streams ||
         plan.count == 0U)
         fail("usb4 pairing: malformed plan from the peer");
     return plan;
@@ -1016,7 +1044,7 @@ Plan check_plan(const Plan& plan) {
 // Pairing reads have a deadline (poll), so a peer that died or a link that went down mid-pairing fails
 // the pairing instead of blocking it.
 constexpr std::chrono::milliseconds plan_wait{20000};
-Plan read_plan(int fd) {
+Plan read_plan(int fd, std::uint32_t version = pairing_version) {
     Plan plan;
     auto* bytes = reinterpret_cast<std::byte*>(&plan);
     std::size_t done = 0;
@@ -1048,7 +1076,7 @@ Plan read_plan(int fd) {
         }
         done += static_cast<std::size_t>(n);
     }
-    return check_plan(plan);
+    return check_plan(plan, version);
 }
 bool same_plan(const Plan& a, const Plan& b) {
     if (a.count != b.count || a.min_part != b.min_part || a.flags != b.flags) return false;
@@ -1063,9 +1091,9 @@ void agree(int fd, std::uint32_t rank, Plan& plan) {
     plan.crc = body_crc(plan);
     if (rank == 0U) {
         write_plan(fd, plan);
-        if (!same_plan(read_plan(fd), plan)) fail("usb4 pairing: the peer did not echo the plan");
+        if (!same_plan(read_plan(fd, plan.version), plan)) fail("usb4 pairing: the peer did not echo the plan");
     } else {
-        const auto theirs = read_plan(fd);
+        const auto theirs = read_plan(fd, plan.version);
         bool ok = theirs.count == plan.count;
         for (std::uint32_t i = 0; ok && i < plan.count; ++i) ok = theirs.index[i] == plan.index[i];
         write_plan(fd, theirs);
@@ -1320,6 +1348,7 @@ std::unique_ptr<Transport> usb4_host_auto(const Usb4AutoOptions& options, Usb4To
     std::random_device random;
     Handshake hs;
     hs.rank = options.rank;
+    hs.version = options.minimax_compat ? 2U : pairing_version;
     hs.host = topo.local_host;
     hs.nonce = (static_cast<std::uint64_t>(random()) << 32U) ^ random() ^
         static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) ^ static_cast<std::uint64_t>(::getpid());
@@ -1396,6 +1425,7 @@ std::unique_ptr<Transport> usb4_host_auto(const Usb4AutoOptions& options, Usb4To
         // acknowledgement, which rank 1 writes when it completes). Rank 0 sends its set on its first
         // stream; rank 1 looks for it on all of its streams, keeps that set and echoes it.
         Plan plan;
+        plan.version = hs.version;
         std::size_t plan_stream = accepted[0];
         if (options.rank == 0U) {
             plan.count = static_cast<std::uint32_t>(accepted.size());
@@ -1403,7 +1433,7 @@ std::unique_ptr<Transport> usb4_host_auto(const Usb4AutoOptions& options, Usb4To
             plan.crc = body_crc(plan);
             set_blocking(candidates[plan_stream].fd, true);
             write_plan(candidates[plan_stream].fd, plan);
-            if (!same_plan(read_plan(candidates[plan_stream].fd), plan)) fail("usb4 pairing: the peer did not echo the plan");
+            if (!same_plan(read_plan(candidates[plan_stream].fd, hs.version), plan)) fail("usb4 pairing: the peer did not echo the plan");
         } else {
             std::map<std::size_t, std::pair<std::array<std::byte, sizeof(Plan)>, std::size_t>> partial;
             const auto deadline = std::chrono::steady_clock::now() + options.timeout;
@@ -1417,7 +1447,7 @@ std::unique_ptr<Transport> usb4_host_auto(const Usb4AutoOptions& options, Usb4To
                     else if (n == 0) fail("usb4 pairing: the peer closed " + candidates[i].info.key + " before sending the plan");
                     if (have == buffer.size()) {
                         std::memcpy(&plan, buffer.data(), sizeof(plan));
-                        (void)check_plan(plan);
+                        plan = check_plan(plan, hs.version);
                         plan_stream = i;
                         found = true;
                         break;
@@ -1522,8 +1552,8 @@ std::unique_ptr<Transport> usb4_host_auto(const Usb4AutoOptions& options, Usb4To
                 if (k != accepted.size()) fail("STRIX_DIST_USB4_WEIGHTS: one weight per stream (" + std::to_string(accepted.size()) + ")");
                 explicit_weights = true;
             }
-            if (const char* t = std::getenv("STRIX_DIST_USB4_STREAMS"); t && *t) parse_stream_table(t, weights.streams_up_to, weights.streams_count);
-            if (const char* c = std::getenv("STRIX_DIST_USB4_CALIBRATE"); c && std::string(c) == "joint" && !explicit_weights && accepted.size() > 1U)
+            if (const char* t = std::getenv("STRIX_DIST_USB4_STREAMS"); !options.minimax_compat && t && *t) parse_stream_table(t, weights.streams_up_to, weights.streams_count);
+            if (const char* c = std::getenv("STRIX_DIST_USB4_CALIBRATE"); !options.minimax_compat && c && std::string(c) == "joint" && !explicit_weights && accepted.size() > 1U)
                 weights.flags |= plan_joint;
         }
         agree(fds[0], options.rank, weights);
@@ -1675,7 +1705,7 @@ public:
         }
         if (failed.load(std::memory_order_acquire)) throw std::runtime_error("dist pipeline: a stage failed");
     }
-    Pipeline(std::size_t capacity, std::size_t size) : chunk(size) {
+    Pipeline(std::size_t capacity, std::size_t size, bool minimax_compat) : chunk(size) {
         const auto count = (capacity - 1U) / chunk + 1U;
         const auto allocation = capacity + count * sizeof(Trailer);
         try {
@@ -1687,7 +1717,7 @@ public:
             check(hipEventCreateWithFlags(&consumer, hipEventDisableTiming), "pipeline consumer");
             ready.resize(count, nullptr);
             for (auto& e : ready) check(hipEventCreateWithFlags(&e, hipEventDisableTiming), "pipeline ready");
-            if (const char* v = std::getenv("STRIX_DIST_HOST_CRC_OVERLAP"); !v || std::string(v) != "0") {  // default on
+            if (const char* v = std::getenv("STRIX_DIST_HOST_CRC_OVERLAP"); minimax_compat ? (v && std::string(v) == "1") : (!v || std::string(v) != "0")) {  // default on
                 crc_send = std::make_unique<Worker>(); crc_receive = std::make_unique<Worker>();
                 crc_send->name("u4-crctx"); crc_receive->name("u4-crcrx");
             }
@@ -1731,7 +1761,7 @@ Communicator::Communicator(Group group, std::unique_ptr<Transport> transport, st
             throw std::invalid_argument("STRIX_DIST_HOST_D2H_KERNEL_BYTES must be 0..1048576");
     }
     // default 262144 (with the lean releases of STRIX_DS41_READY_LEAN); =0: no readiness views
-    staged_ready_bytes_ = 262144U;
+    staged_ready_bytes_ = group_.minimax_compat ? 0U : 262144U;
     if (const char* t = std::getenv("STRIX_DIST_STAGED_READY_BYTES"); t && *t) {
         staged_ready_bytes_ = std::stoull(t);
         if (staged_ready_bytes_ > (std::size_t{1} << 20U))
@@ -1791,14 +1821,14 @@ Communicator::Communicator(Group group, std::unique_ptr<Transport> transport, st
         }
     }
     // default on (ds41/xfer t1: R6 -0.7 %, R1/N8 equal or better, exact); =0: inline CRCs
-    crc_defer_ = true;
+    crc_defer_ = !group_.minimax_compat;
     if (const char* v = std::getenv("STRIX_DIST_CRC_DEFER"); v && v[0] == '0' && v[1] == '\0') crc_defer_ = false;
     {  // default 1 MiB chunks (w5); =0: one piece
         const char* v = std::getenv("STRIX_DIST_HOST_CHUNK_BYTES");
-        const auto chunk = v && *v ? static_cast<std::size_t>(std::stoull(v)) : std::size_t{1048576};
+        const auto chunk = v && *v ? static_cast<std::size_t>(std::stoull(v)) : (group_.minimax_compat ? std::size_t{0} : std::size_t{1048576});
         if (chunk && (chunk < 65536U || chunk > (16U << 20U) || chunk % 64U))
             throw std::invalid_argument("STRIX_DIST_HOST_CHUNK_BYTES: 0 or a multiple of 64 in [65536,16777216]");
-        if (chunk && max_bytes_ > chunk) pipeline_ = std::make_unique<Pipeline>(max_bytes_, chunk);
+        if (chunk && max_bytes_ > chunk) pipeline_ = std::make_unique<Pipeline>(max_bytes_, chunk, group_.minimax_compat);
     }
     if (const char* t = std::getenv("STRIX_DIST_TRACE"); t && *t) {
         const auto path = std::string(t) + ".r" + std::to_string(group_.rank);

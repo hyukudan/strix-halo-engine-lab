@@ -36,6 +36,8 @@ inline std::atomic<std::uint64_t> serve_observe_period_{0};
 // An arming request (HTTP threads): arms when unarmed; the period lasts at least `expiry_seconds` more (0: it does not
 // expire). True: this call started a period.
 bool observe_arm(double expiry_seconds);
+// Permanent arming for services with process-lifetime instrumentation.
+inline void observe_arm() { (void)observe_arm(0.0); }
 // Ends the armed period now (tests; a service that wants the instrumentation off at once).
 void observe_disarm();
 

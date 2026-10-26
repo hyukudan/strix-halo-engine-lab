@@ -1,0 +1,165 @@
+// MiniMax M3.1 defaults-on resolver: the table of default-ON items, the baseline master switch and the canonical
+// effective configuration (see mm_defaults.hpp).
+#include "minimax/engine/mm_defaults.hpp"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+
+#ifndef STRIX_MM_GU4_SCALAR
+#define STRIX_MM_GU4_SCALAR 1
+#endif
+
+namespace strix::minimax::defaults {
+namespace {
+
+// Measurement evidence for the adopted production defaults.
+constexpr Item kItems[] = {
+    // decode
+    {"moe_wide", "STRIX_MMX_MOE_WIDE", "2", "0",
+     "Measurement: rows == alone, wide expert kernels at N2-4, N2 -3.0..-3.5 %, N4 -4..-6 %"},
+    {"index_conc", "STRIX_MM_INDEX_CONC", "1", "0",
+     "Measurement: ids identical, 17/18 in-process block pairs faster, ~-0.2 ms/token"},
+    {"xfer_crc_deferred", "STRIX_MMX_CRC", "deferred", "1",
+     "Measurement: tokens identical in 7 processes, each deferred arm below its inline neighbours by 0.04-0.12 ms/token"},
+    {"xb_wait", "STRIX_MM_XB_WAIT", "1", "0", "Exchange boundary measurement: exact, 1K 48.56 -> 44.40 ms/token"},
+    {"xb_inplace", "STRIX_MM_XB_INPLACE", "1", "0", "Exchange boundary measurement: exact, 1K 48.56 -> 44.40 ms/token"},
+    {"xb_publish", "STRIX_MM_XB_PUBLISH", "1", "0",
+     "Exchange boundary measurement: exact, 1K 48.56 -> 44.40 ms/token (falls back without the v4/overlap cores)"},
+    {"xb_postilp", "STRIX_MM_XB_POSTILP", "2", "0", "Exchange boundary measurement: exact, 1K 48.56 -> 44.40 ms/token"},
+    {"xb_warm", "STRIX_MM_XB_WARM", "8", "0", "Exchange boundary measurement: exact, 1K 48.56 -> 44.40 ms/token"},
+    {"dspark_attn", "STRIX_MM_DSPARK_ATTN", "2", "0",
+     "Drafter measurement: bitwise, drafter attention B/A 0.964-0.975 / 0.918-0.924 / 0.815-0.819 at ctx 300/1000/4095"},
+    {"draft_lin", "STRIX_MM_DRAFT_LIN", "opt", "lib", "Optimized draft linears (measurement evidence)"},
+    // prefill
+    {"pf_core_v4", "STRIX_MMX_PREFILL_CORE", "v4", "lib", "Prefill core measurement: bitwise everywhere, whole call 0.34-0.58x lib"},
+    {"pf_msa_batch", "STRIX_MM_PF_MSA_BATCH", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
+    {"pf_attend4", "STRIX_MM_PF_ATTEND4", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
+    {"pf_router_batch", "STRIX_MM_PF_ROUTER_BATCH", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
+    {"pf_mtfit", "STRIX_MMX_PREFILL_MTFIT", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
+    {"pf_msa_rework", "STRIX_MM_PF_MSA_REWORK", "3", "0", "Prefill attention measurement: exact, 8K B/A 0.963 / 0.957 / 0.972"},
+    {"pf_moe_pipe", "STRIX_MMX_PREFILL_PIPE", "1", "0", "Prefill measurement: exact, 8K B/A 0.973 / 0.935 / 0.924"},
+    {"pf_kv_tile", "STRIX_MM_PF_KV_TILE", "auto", "off",
+     "Prefill measurement: exact, 8K B/A 0.960 / 0.949 / 1.017; needs the Trellis tile hook, else a logged no-op"},
+    {"pf_tx_uncached", "STRIX_MM_PF_TX_UNCACHED", "1", "0",
+     "Prefill exchange measurement: exact, exchange-send 0.23 -> 0.002 s GPU, ~1.3 % (prefill module route)"},
+    // transport (host path, bits unchanged)
+    {"dist_crc_parallel", "STRIX_DIST_CRC_PARALLEL", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
+    {"dist_host_crc_overlap", "STRIX_DIST_HOST_CRC_OVERLAP", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
+    {"dist_host_chunk", "STRIX_DIST_HOST_CHUNK_BYTES", "1048576", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
+};
+
+// Route switches whose code default is the production route; printed as set or "default".
+constexpr const char* kRoute[] = {"STRIX_MM_XFER", "STRIX_MM_PFX", "STRIX_MM_PF_INTERLEAVE"};
+
+std::mutex g_mutex;
+bool g_applied = false;
+std::set<std::string> g_exported;
+
+const char* process_env(const char* name) { return std::getenv(name); }
+
+}  // namespace
+
+std::span<const Item> items() { return kItems; }
+
+bool baseline(const Lookup& env) {
+    const char* v = env(kBaselineEnv);
+    return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+}
+
+std::vector<Resolved> resolve(const Lookup& env) {
+    const bool base = baseline(env);
+    std::vector<Resolved> out;
+    out.reserve(std::size(kItems));
+    for (const Item& it : kItems) {
+        Resolved r;
+        r.item = &it;
+        if (const char* v = env(it.env); v != nullptr) {
+            r.value = v;
+            r.source = Source::env;
+        } else {
+            r.value = base ? it.off : it.on;
+            r.source = base ? Source::baseline : Source::on;
+        }
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+void apply() {
+    std::lock_guard<std::mutex> g(g_mutex);
+    if (g_applied) return;
+    g_applied = true;
+    const Lookup env = process_env;
+    for (const Resolved& r : resolve(env)) {
+        if (r.source == Source::env) continue;
+        (void)::setenv(r.item->env, r.value.c_str(), 0);
+        g_exported.insert(r.item->env);
+    }
+    if (baseline(env))
+        std::printf("minimax defaults: %s=1, the %zu optimization items are off (an explicit item value wins)\n", kBaselineEnv,
+                    std::size(kItems));
+}
+
+bool from_defaults(const char* env) {
+    std::lock_guard<std::mutex> g(g_mutex);
+    return g_exported.count(env) != 0;
+}
+
+Cli parse_cli(const std::string& app, const std::vector<std::string>& args) {
+    if (app != "rank" && app != "serve") throw std::invalid_argument("parse_cli: app must be rank or serve");
+    Cli c;
+    c.app = app;
+    std::size_t i = 0;
+    if (app == "rank") {  // MODEL_DIR RANK TRANSPORT OUT_DIR [options]
+        if (args.size() > 2 && args[2].rfind("--", 0) != 0) c.transport = args[2];
+        i = 4;
+    } else {
+        i = 1;  // MODEL_DIR [options]
+    }
+    for (; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        const bool has = i + 1 < args.size();
+        if (a == "--slots" && has) c.slots = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        else if (a == "--capacity" && has) c.capacity = std::stoull(args[++i]);
+        else if (a == "--max-rows" && has) c.max_rows = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        else if (a == "--transport" && has && app == "serve") c.transport = args[++i];
+    }
+    return c;
+}
+
+std::string effective_config(const Cli& cli, const Lookup& env) {
+    std::ostringstream o;
+    o << "app=" << cli.app << "\n"
+      << "transport=" << cli.transport << "\n"
+      << "slots=" << cli.slots << "\n"
+      << "capacity=" << cli.capacity << "\n"
+      << "max_rows=" << cli.max_rows << "\n";
+    for (const char* r : kRoute) {
+        const char* v = env(r);
+        o << r << "=" << (v != nullptr ? v : "default") << "\n";
+    }
+    o << "build.gu4_scalar=" << (STRIX_MM_GU4_SCALAR ? "on" : "off") << "\n";
+    for (const Resolved& r : resolve(env)) o << r.item->env << "=" << r.value << "\n";
+    return o.str();
+}
+
+bool print_or_apply(const std::string& app, int argc, char** argv) {
+    std::vector<std::string> args;
+    bool print = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], kPrintFlag) == 0) print = true;
+        else args.emplace_back(argv[i]);
+    }
+    apply();
+    if (!print) return false;
+    std::fputs(effective_config(parse_cli(app, args), process_env).c_str(), stdout);
+    std::fflush(stdout);
+    return true;
+}
+
+}  // namespace strix::minimax::defaults
