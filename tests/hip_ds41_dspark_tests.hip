@@ -216,7 +216,7 @@ void compare_drafts(const Draft& dev, const Draft& host, const std::string& labe
 }
 
 void test_lookahead_changed_context(DeviceDrafter& device, std::span<const float> main) {
-    // Distinct cache slots keep the initial predecessor warm across the window.
+    // Slots 9 and 5 at capacity 16 keep both candidate predecessors warm.
     const Vocab candidates{0U, {100000U, 100001U}};
     const auto seed = main.first(static_cast<std::size_t>(3U) * hidden);
     const auto changed = normal_values(static_cast<std::size_t>(3U) * main_width, 1.0F, 90);
@@ -225,8 +225,10 @@ void test_lookahead_changed_context(DeviceDrafter& device, std::span<const float
     device.set_vocabulary(candidates);
     device.append(seed, 3U);
     const auto before = device.draft(100000U, true);
+    const auto before_second = device.draft(100001U, true);
     device.append_hidden(changed, 3U);
     const auto after = device.draft(100000U, true);
+    const auto after_second = device.draft(100001U, true);
     expect(mismatches(before.logits, after.logits) != 0U,
            "lookahead changed context changes existing-path base logits");
 
@@ -234,12 +236,19 @@ void test_lookahead_changed_context(DeviceDrafter& device, std::span<const float
     device.append(seed, 3U);
     device.configure_lookahead(true, 16U);
     compare_drafts(device.draft(100000U, true), before, "lookahead changed context cold");
+    compare_drafts(device.draft(100001U, true), before_second, "lookahead changed context prime second predecessor");
     const auto warm = device.lookahead_stats();
     device.append_hidden(changed, 3U);
     compare_drafts(device.draft(100000U, true), after, "lookahead changed context warm");
     const auto repeated = device.lookahead_stats();
-    expect(repeated.hits > warm.hits && repeated.map_rebuilds == warm.map_rebuilds,
-           "lookahead changed context hits without rebinding");
+    expect(repeated.steps == warm.steps + block_size && repeated.hits == warm.hits + block_size &&
+               repeated.misses == warm.misses && repeated.map_rebuilds == warm.map_rebuilds,
+           "lookahead changed context all rows hit without rebinding");
+    compare_drafts(device.draft(100001U, true), after_second, "lookahead changed context warm second predecessor");
+    const auto repeated_second = device.lookahead_stats();
+    expect(repeated_second.steps == repeated.steps + block_size && repeated_second.hits == repeated.hits + block_size &&
+               repeated_second.misses == repeated.misses && repeated_second.map_rebuilds == warm.map_rebuilds,
+           "lookahead changed context second predecessor all rows hit without rebinding");
 }
 
 // The same resident weights, committed rings and input token exercise the
