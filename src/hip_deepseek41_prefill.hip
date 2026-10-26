@@ -67,8 +67,10 @@ struct Dev {
     std::size_t n = 0;
     bool owned = true;  // false: memory of another object (PrefillOptions::shared_weights), never freed here
     Dev() = default;
+    // 256 bytes of slack past the end: the prefill split kernels' weight tiles read whole 4-group chunks, up to 252 bytes
+    // past a row's last group (never decoded); on the last row of the last expert that is past the tensor.
     explicit Dev(std::size_t count) : n(count) {
-        check(hipMalloc(reinterpret_cast<void**>(&p), std::max<std::size_t>(count, 1) * sizeof(T)), "hipMalloc");
+        check(hipMalloc(reinterpret_cast<void**>(&p), std::max<std::size_t>(count, 1) * sizeof(T) + 256U), "hipMalloc");
     }
     static Dev borrow(const void* data, std::size_t count) {
         Dev d;

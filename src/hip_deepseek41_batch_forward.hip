@@ -58,8 +58,10 @@ struct Dev {
     T* p = nullptr;
     std::size_t n = 0;
     Dev() = default;
+    // 256 bytes of slack past the end: the prefill split kernels' weight tiles read whole 4-group chunks, up to 252 bytes
+    // past a row's last group (never decoded); on the last row of the last expert that is past the tensor.
     explicit Dev(std::size_t count) : n(count) {
-        check(hipMalloc(reinterpret_cast<void**>(&p), std::max<std::size_t>(count, 1) * sizeof(T)), "hipMalloc");
+        check(hipMalloc(reinterpret_cast<void**>(&p), std::max<std::size_t>(count, 1) * sizeof(T) + 256U), "hipMalloc");
     }
     ~Dev() {
         if (p != nullptr) (void)hipFree(p);
