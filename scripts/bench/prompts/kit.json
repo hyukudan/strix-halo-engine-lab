@@ -1,0 +1,42 @@
+[
+  {
+    "id": "chat",
+    "category": "chat EN",
+    "text": "Explain why a clear night can feel colder than a cloudy night in three sentences."
+  },
+  {
+    "id": "chat-es",
+    "category": "chat ES",
+    "text": "Explica en tres frases cómo organizar una pequeña biblioteca de barrio."
+  },
+  {
+    "id": "code",
+    "category": "code",
+    "text": "Write a Python function that returns the first repeated integer in a list, or None. Include two examples."
+  },
+  {
+    "id": "json",
+    "category": "JSON",
+    "text": "Return only JSON with keys city, transport, and activities for a one-day visit to a fictional coastal town."
+  },
+  {
+    "id": "math",
+    "category": "math",
+    "text": "A box contains 5 red and 7 blue counters. Two are drawn without replacement. Compute the probability both are blue and explain the fraction."
+  },
+  {
+    "id": "prose",
+    "category": "prose",
+    "text": "Write a short scene in which a gardener finds a handwritten note inside an empty flowerpot."
+  },
+  {
+    "id": "summary",
+    "category": "summary",
+    "text": "Summarize in two bullet points: The community workshop opens at nine. Volunteers repair bicycles until noon. Visitors bring their own spare parts. A free safety lesson starts at eleven."
+  },
+  {
+    "id": "sql",
+    "category": "SQL",
+    "text": "Given orders(id, customer_id, total, created_at), write SQL to find the five customers with the highest total order value in 2025."
+  }
+]

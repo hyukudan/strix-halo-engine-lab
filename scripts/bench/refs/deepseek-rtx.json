@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "engine": "deepseek-rtx",
+  "$comment": "No measured public token references yet. Replace unmeasured with an actual identity SHA256 after maintainer review. Null always means NO-REFERENCE.",
+  "identities": {
+    "unmeasured": {
+      "chat:plain:128": null,
+      "chat:spec:128": null,
+      "code:plain:128": null,
+      "code:spec:128": null,
+      "prose:plain:128": null,
+      "prose:spec:128": null,
+      "code-edit-en:plain:128": null,
+      "code-edit-en:spec:128": null,
+      "quote-en:plain:128": null,
+      "quote-en:spec:128": null,
+      "prefill-1024:ttft:1": null,
+      "prefill-8192:ttft:1": null,
+      "prefill-32768:ttft:1": null
+    }
+  }
+}
