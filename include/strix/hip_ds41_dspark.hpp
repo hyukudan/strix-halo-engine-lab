@@ -1,6 +1,6 @@
 #pragma once
 
-// Modified for optional StrixLookahead integration, 2026-10-26.
+// Modified for optional LookaheadCache integration, 2026-10-26.
 
 // Device side of the DSpark drafter (gfx1151, wave32): the kernels of ds41_dspark.hpp's declared
 // operations and a resident drafter that runs a draft step. Every result equals the host reference

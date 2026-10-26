@@ -1,4 +1,4 @@
-// Modified for optional StrixLookahead integration, 2026-10-26.
+// Modified for optional LookaheadCache integration, 2026-10-26.
 #pragma clang fp contract(off)
 #include "strix/hip_ds41_dspark.hpp"
 
@@ -51,7 +51,7 @@ std::optional<std::uint32_t> environment_lookahead_capacity() {
     const auto* end = value + std::strlen(value);
     const auto parsed = std::from_chars(value, end, capacity);
     if (value == end || parsed.ec != std::errc{} || parsed.ptr != end)
-        throw std::invalid_argument("strix-lookahead: STRIX_LOOKAHEAD_CAPACITY must be an unsigned decimal integer");
+        throw std::invalid_argument("lookahead-cache: STRIX_LOOKAHEAD_CAPACITY must be an unsigned decimal integer");
     return capacity;
 }
 
@@ -601,7 +601,7 @@ struct LookaheadBinding {
     ~LookaheadBinding() {
         const auto status = close();
         if (status != SL_OK)
-            std::fprintf(stderr, "strix-lookahead: binding cleanup failed: %s\n", sl_status_string(status));
+            std::fprintf(stderr, "lookahead-cache: binding cleanup failed: %s\n", sl_status_string(status));
     }
 };
 #endif
@@ -939,11 +939,11 @@ struct DeviceDrafter::Impl {
         hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
         check(hipStreamIsCapturing(stream, &capture), "lookahead capture state");
         if (capture != hipStreamCaptureStatusNone)
-            throw std::logic_error("strix-lookahead: binding changes require a stream outside graph capture");
+            throw std::logic_error("lookahead-cache: binding changes require a stream outside graph capture");
     }
     void advance_epoch(std::uint64_t& epoch) {
         if (next_vocabulary_epoch == std::numeric_limits<std::uint64_t>::max())
-            throw std::overflow_error("strix-lookahead: vocabulary epoch exhausted");
+            throw std::overflow_error("lookahead-cache: vocabulary epoch exhausted");
         epoch = ++next_vocabulary_epoch;
     }
 #if defined(STRIX_ENABLE_LOOKAHEAD)
@@ -952,7 +952,7 @@ struct DeviceDrafter::Impl {
         const auto status = binding->close();
         if (status != SL_OK) {
             bump(lookahead_counts.errors);
-            throw std::runtime_error(std::string("strix-lookahead: close binding: ") + sl_status_string(status));
+            throw std::runtime_error(std::string("lookahead-cache: close binding: ") + sl_status_string(status));
         }
         binding.reset();
     }
@@ -960,7 +960,7 @@ struct DeviceDrafter::Impl {
                         const std::vector<std::uint32_t>& selected_extra) {
         if (!lookahead_counts.requested || world != 1U) return;
         require_outside_capture();
-        if (binding) throw std::logic_error("strix-lookahead: attempted to overwrite a live binding");
+        if (binding) throw std::logic_error("lookahead-cache: attempted to overwrite a live binding");
         auto fresh = std::make_unique<LookaheadBinding>();
         fresh->size = selected_core + static_cast<std::uint32_t>(selected_extra.size());
         std::vector<std::uint32_t> mapping;
@@ -986,7 +986,7 @@ struct DeviceDrafter::Impl {
         const auto status = sl_hip_pair_create(&config, stream, &fresh->handle);
         if (status != SL_OK) {
             bump(lookahead_counts.errors);
-            throw std::runtime_error(std::string("strix-lookahead: create binding: ") + sl_status_string(status));
+            throw std::runtime_error(std::string("lookahead-cache: create binding: ") + sl_status_string(status));
         }
         binding = std::move(fresh);
         bump(lookahead_counts.map_rebuilds);
@@ -1011,7 +1011,7 @@ struct DeviceDrafter::Impl {
             const auto status = sl_hip_pair_reset(lookahead_binding->handle);
             if (status != SL_OK) {
                 bump(lookahead_counts.errors);
-                throw std::runtime_error(std::string("strix-lookahead: reset binding: ") + sl_status_string(status));
+                throw std::runtime_error(std::string("lookahead-cache: reset binding: ") + sl_status_string(status));
             }
         }
 #endif
@@ -1025,7 +1025,7 @@ struct DeviceDrafter::Impl {
             for (std::uint32_t r = 0; r < block_size; ++r)
                 if (downloaded[lookahead_status_offset + r] != SL_OK || downloaded[r + 1U] >= vocab) {
                     bump(lookahead_counts.errors);
-                    throw std::runtime_error("strix-lookahead: device proposal failed; draft discarded");
+                    throw std::runtime_error("lookahead-cache: device proposal failed; draft discarded");
                 }
             for (std::uint32_t r = 0; r < block_size; ++r) {
                 bump(lookahead_counts.steps);
@@ -1057,7 +1057,7 @@ struct DeviceDrafter::Impl {
                 lookahead_counts.compiled ? "vocabulary_sharded" : "not_compiled");
         std::fputs("}\n", lookahead_trace.get());
         if (std::fflush(lookahead_trace.get()) != 0 || std::ferror(lookahead_trace.get()))
-            throw std::runtime_error("strix-lookahead: trace write failed");
+            throw std::runtime_error("lookahead-cache: trace write failed");
     }
 
     // y[rows][outputs] = Q8_0 linear of x (A8 per row), launched in row chunks whose staged rows fit in LDS.
@@ -1244,7 +1244,7 @@ struct DeviceDrafter::Impl {
 #if defined(STRIX_ENABLE_LOOKAHEAD)
         if (lookahead_counts.requested && world == 1U) {
             if (!lookahead_binding || lookahead_binding->size != cc + ec || cb != 0U || eb != 0U)
-                throw std::logic_error("strix-lookahead: head has no matching vocabulary binding");
+                throw std::logic_error("lookahead-cache: head has no matching vocabulary binding");
             for (std::uint32_t i = 0; i < rows; ++i) {
                 const auto* predecessor = i == 0U ? tokens.data : &lookahead_results.data[i - 1U].selection.token;
                 const auto status = sl_hip_pair_enqueue_step(lookahead_binding->handle, predecessor,
@@ -1253,7 +1253,7 @@ struct DeviceDrafter::Impl {
                     lookahead_results.data + i, markov.data + static_cast<std::size_t>(i) * markov_rank, nullptr);
                 if (status != SL_OK) {
                     bump(lookahead_counts.errors);
-                    throw std::runtime_error(std::string("strix-lookahead: enqueue failed; draft discarded: ") + sl_status_string(status));
+                    throw std::runtime_error(std::string("lookahead-cache: enqueue failed; draft discarded: ") + sl_status_string(status));
                 }
             }
             hipLaunchKernelGGL(lookahead_confidence_kernel, dim3(rows), dim3(32), 0, stream,
@@ -1302,7 +1302,7 @@ DeviceDrafter::DeviceDrafter(const Weights& weights) : impl_(std::make_unique<Im
         // A trace starts with the first draft and must not overwrite or append
         // to another run. Use a distinct filename per process/drafter.
         auto* file = std::fopen(path, "wx");
-        if (!file) throw std::runtime_error(std::string("strix-lookahead: create trace: ") + std::strerror(errno));
+        if (!file) throw std::runtime_error(std::string("lookahead-cache: create trace: ") + std::strerror(errno));
         impl_->lookahead_trace.reset(file);
     }
     if (const auto capacity = environment_lookahead_capacity()) configure_lookahead(true, *capacity);
@@ -1451,7 +1451,7 @@ DeviceDrafter::Footprint DeviceDrafter::footprint(const Weights& w, std::uint32_
     std::uint64_t total = 0;
     for (const auto bytes : {f.weights, f.scratch, f.contexts, f.lookahead}) {
         if (bytes > std::numeric_limits<std::uint64_t>::max() - total)
-            throw std::overflow_error("strix-lookahead: total device reservation overflow");
+            throw std::overflow_error("lookahead-cache: total device reservation overflow");
         total += bytes;
     }
     return f;
@@ -1461,14 +1461,14 @@ std::uint64_t DeviceDrafter::lookahead_footprint(std::uint32_t capacity, std::ui
 #if defined(STRIX_ENABLE_LOOKAHEAD)
     const auto payload = std::uint64_t{capacity} * vocab * sizeof(float);
     if (payload_budget_bytes != 0U && payload > payload_budget_bytes)
-        throw std::invalid_argument("strix-lookahead: full-vocabulary payload exceeds the per-context budget");
-    // StrixLookahead 0.4.1: entry={uint32 token,valid}; partial winner is four
+        throw std::invalid_argument("lookahead-cache: full-vocabulary payload exceeds the per-context budget");
+    // LookaheadCache 0.4.2: entry={uint32 token,valid}; partial winner is four
     // 32-bit words, at most 512 blocks. Reserve mapping even for dense vocabularies.
     const auto one = payload + std::uint64_t{vocab} * sizeof(std::uint32_t) +
                      std::uint64_t{capacity} * 2U * sizeof(std::uint32_t) + 512U * 4U * sizeof(std::uint32_t);
     const auto contexts = std::max<std::uint32_t>(sequences, 1U);
     if (one > std::numeric_limits<std::uint64_t>::max() / contexts)
-        throw std::overflow_error("strix-lookahead: context device reservation overflow");
+        throw std::overflow_error("lookahead-cache: context device reservation overflow");
     return one * contexts;
 #else
     (void)capacity;

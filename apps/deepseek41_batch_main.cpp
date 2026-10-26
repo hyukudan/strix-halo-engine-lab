@@ -144,7 +144,7 @@ struct RowRecord {
 };
 using Trace = std::map<std::uint32_t, RowRecord>;  // by position, per request
 
-// Modified for optional StrixLookahead integration, 2026-10-26.
+// Modified for optional LookaheadCache integration, 2026-10-26.
 // Opt-in machine-readable receipts for qualification.
 // Preserve strings as JSON even when a caller supplies a path or vocabulary
 // label containing control characters. No receipt output occurs inside timing.

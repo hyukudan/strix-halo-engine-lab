@@ -1,4 +1,4 @@
-// Modified for optional StrixLookahead integration, 2026-10-26.
+// Modified for optional LookaheadCache integration, 2026-10-26.
 // DSpark drafter fixtures: every device kernel against the host reference bitwise on synthetic data,
 // then (with STRIX_DS41_Q2_GGUF and STRIX_DS41_DSPARK_GGUF) the whole drafter on the real weights:
 // main rows, ring seeding with wrap-around, draft steps (tokens, confidence, logits, every stage's

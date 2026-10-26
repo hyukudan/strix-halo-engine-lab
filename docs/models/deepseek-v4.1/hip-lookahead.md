@@ -1,11 +1,14 @@
-# Optional StrixLookahead proposal-head cache
+# Optional LookaheadCache proposal-head cache
 
 The HIP resident drafter can use the external
-[StrixLookahead](https://github.com/hyukudan/strix-lookahead) C ABI package,
-version 0.4.1 or later, for its rank-256 proposal head. The library is installed
+[LookaheadCache](https://github.com/hyukudan/lookahead-cache) C ABI package,
+version 0.4.2 or later, for its rank-256 proposal head. The library is installed
 separately. Its source, models and benchmark data are not copied into this engine.
+The library is AMD Strix Halo (HIP) first and modular; its CUDA backend exists
+in the library, and CUDA engine integration is in progress (not part of this PR).
 
-The build option `STRIX_ENABLE_LOOKAHEAD` defaults to `OFF`. An enabled build
+The build option `STRIX_ENABLE_LOOKAHEAD_CACHE` defaults to `OFF`.
+`STRIX_ENABLE_LOOKAHEAD` remains accepted as a deprecated alias. An enabled build
 still selects the existing head until `STRIX_LOOKAHEAD_CAPACITY` is set or the
 caller explicitly invokes `DeviceDrafter::configure_lookahead`.
 
@@ -28,10 +31,10 @@ Access to the dependency repository or a preinstalled HIP package must be
 provided separately by its owner. The engine does not fetch the dependency over
 the network during configuration or compilation.
 
-Use an authorized, separate StrixLookahead checkout whose package version is at
-least 0.4.1. The 0.4.1 source revision used for this integration is
-[`d44244e098c72fb22a09c06c05a54de023037d73`](https://github.com/hyukudan/strix-lookahead/commit/d44244e098c72fb22a09c06c05a54de023037d73).
-The commands below assume it already exists at `../strix-lookahead` and that
+Use an authorized, separate LookaheadCache checkout whose package version is at
+least 0.4.2. The 0.4.2 source revision used for this integration is
+[`9d060f7a59d3bf0bc6fe626cbd73309e85240036`](https://github.com/hyukudan/lookahead-cache/commit/9d060f7a59d3bf0bc6fe626cbd73309e85240036).
+The commands below assume it already exists at `../lookahead-cache` and that
 ROCm is installed at `/opt/rocm`; adjust the SDK prefix and HIP compiler when
 using another location. For a reproducible qualification, record both
 repositories' exact commit IDs and the compiler versions. If the package is
@@ -39,9 +42,9 @@ already installed, skip its build/install commands and set
 `STRIX_LOOKAHEAD_PREFIX` to that installation prefix.
 
 ```sh
-STRIX_LOOKAHEAD_PREFIX="$PWD/../strix-lookahead/local-install"
+STRIX_LOOKAHEAD_PREFIX="$PWD/../lookahead-cache/local-install"
 
-cmake -S ../strix-lookahead -B ../strix-lookahead/build-hip \
+cmake -S ../lookahead-cache -B ../lookahead-cache/build-hip \
   -DCMAKE_BUILD_TYPE=Release \
   -DSL_ENABLE_HIP=ON \
   -DSL_BUILD_EXAMPLES=OFF \
@@ -49,24 +52,24 @@ cmake -S ../strix-lookahead -B ../strix-lookahead/build-hip \
   -DCMAKE_HIP_ARCHITECTURES=gfx1151 \
   -DCMAKE_PREFIX_PATH=/opt/rocm \
   -DCMAKE_INSTALL_PREFIX="$STRIX_LOOKAHEAD_PREFIX"
-cmake --build ../strix-lookahead/build-hip \
+cmake --build ../lookahead-cache/build-hip \
   --target strix_lookahead_hip sl_hip_test --parallel 2
-cmake --install ../strix-lookahead/build-hip
+cmake --install ../lookahead-cache/build-hip
 
 cmake -S . -B build-lookahead \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_TESTING=ON \
   -DSTRIX_ENABLE_HIP_RUNTIME=ON \
-  -DSTRIX_ENABLE_LOOKAHEAD=ON \
+  -DSTRIX_ENABLE_LOOKAHEAD_CACHE=ON \
   -DCMAKE_HIP_ARCHITECTURES=gfx1151 \
   -DCMAKE_PREFIX_PATH="$STRIX_LOOKAHEAD_PREFIX;/opt/rocm"
 cmake --build build-lookahead \
   --target strix-deepseek41-batch strix-hip-ds41-dspark-tests --parallel 2
 ```
 
-CMake requires the installed `StrixLookahead::hip` target when the adapter is
+CMake requires the installed `LookaheadCache::hip` target when the adapter is
 enabled. A default build does not search for the package. To return to a build
-without the adapter, configure with `-DSTRIX_ENABLE_LOOKAHEAD=OFF`.
+without the adapter, configure with `-DSTRIX_ENABLE_LOOKAHEAD_CACHE=OFF`.
 
 ## Runtime modes and memory
 
@@ -110,7 +113,7 @@ through its token chain.
 First run the library's native HIP contract test on the intended device:
 
 ```sh
-ctest --test-dir ../strix-lookahead/build-hip \
+ctest --test-dir ../lookahead-cache/build-hip \
   -R '^lookahead[.]hip_device_contract$' --output-on-failure
 ```
 
@@ -139,7 +142,7 @@ the external library's qualification tool runs three arms: the existing head,
 capacity zero, and the requested cached capacity.
 
 ```sh
-python3 ../strix-lookahead/tools/qualify_engine.py \
+python3 ../lookahead-cache/tools/qualify_engine.py \
   --executable ./build-lookahead/strix-deepseek41-batch \
   --native-test ./build-lookahead/strix-hip-ds41-dspark-tests \
   --model /path/to/target.gguf \
