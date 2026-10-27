@@ -1254,6 +1254,17 @@
     "doc_anchor": "docs/optimizations.md#qwen-hc"
   },
   {
+    "engine": "qwen",
+    "name": "HTTP API surface: Responses route, capabilities, stream receipts, keepalive",
+    "flag_or_env": "--http-responses; --http-capabilities; --http-stream-receipts; --http-sse-keepalive",
+    "default": "on; on; on; 10 seconds",
+    "exact": "Changes no generated token: Responses prompt IDs equal the equivalent chat request (CPU tests); greedy token IDs equal with the features on and off, and stream bytes with every switch off equal the previous build after normalizing ids and timings (GPU gate). Seeded sampled requests produce the same token IDs as before the seed moved to the API layer, and an echoed seed replays an unseeded run (GPU gate).",
+    "gain": "Usability: stateless Responses clients, capability discovery, explicit applied policy (filters, echoed seed), connections kept alive through long prefills; no speed claim",
+    "preconditions": "--http-serve (Qwen) or strix-deepseek41-serve (shared server layer).",
+    "off_switch": "--http-responses off; --http-capabilities off; --http-stream-receipts off; --http-sse-keepalive 0 (per request: strix.keepalive false)",
+    "doc_anchor": "docs/optimizations.md#qwen-serve-api"
+  },
+  {
     "engine": "deepseek",
     "name": "Bounded serving observation",
     "flag_or_env": "STRIX_SERVE_OBSERVE_EXPIRY_S",

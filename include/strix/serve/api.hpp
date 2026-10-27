@@ -22,6 +22,13 @@ struct ApiConfig {
     // Requests with temperature > 0 on an engine without sampling: "greedy" runs them greedy and
     // says so in the response, "reject" answers 400.
     std::string sampling_policy = "greedy";
+    std::optional<double> default_temperature, default_top_p, default_min_p;
+    std::optional<std::uint32_t> default_top_k;
+    bool capabilities = true;
+    bool responses = true;
+    bool stream_receipts = true;
+    double sse_keepalive_seconds = 10.0;      // 0: no SSE comments
+    std::function<void(Json&)> capabilities_extra; // optional engine members, included in the content hash
     std::vector<std::uint32_t> stop_tokens;  // generation ends at any of these (not emitted)
     std::size_t recent_requests = 50;
     std::string engine_description;          // free text for /api/status
@@ -43,7 +50,7 @@ struct ApiConfig {
     std::function<bool(const HttpRequest&, HttpResponseWriter&)> engine_routes;
 };
 
-// OpenAI-compatible (/v1/chat/completions, /v1/completions, /v1/models) and Anthropic-compatible
+// OpenAI-compatible (/v1/chat/completions, /v1/completions, /v1/responses, /v1/models) and Anthropic-compatible
 // (/v1/messages) endpoints over one generation queue, plus /health, /metrics (Prometheus text),
 // /api/status (JSON) and /tokenize, /detokenize.
 class ApiService {

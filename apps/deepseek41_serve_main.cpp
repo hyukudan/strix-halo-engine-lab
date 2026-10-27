@@ -10,7 +10,8 @@
 //       [--group-manifest FILE] [--layers 40] [--context 4096] [--slots 4] [--prompt-rows 8] [--tp-attention]
 //       [--pool-positions N] (a shared KV pool of N positions over all slots: a request holds prompt + max_tokens of it)
 //       [--engram-direct] [--http-bind 127.0.0.1] [--http-port 0] [--http-api-key-file F] [--http-max-queue 64]
-//       [--http-max-connections 64] [--model-id deepseek-v4.1-flash] [--default-max-tokens 1024]
+//       [--http-max-connections 64] [--http-responses on|off] [--http-capabilities on|off]
+//       [--http-stream-receipts on|off] [--http-sse-keepalive 10] [--model-id deepseek-v4.1-flash] [--default-max-tokens 1024]
 //       [--connect-timeout 60] [--peer-timeout 60]
 //       [--prefill-path rows|device] [--prefill-rows 4096] [--prefill-min 0]
 //       [--prefix-cache-mb 0] [--prefix-block 256] [--prefix-reserve-mb 4096] [--import-parked 1]
@@ -128,6 +129,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -168,6 +170,8 @@ struct Args {
     std::uint32_t rank = 0, layers = 40, context = 4096, slots = 4, prompt_rows = 8, http_port = 0, max_queue = 64, max_connections = 64;
     std::uint32_t pool = 0;  // BatchForwardOptions::pool_positions (0: every slot owns `context` positions)
     std::uint32_t default_max_tokens = 1024;
+    bool http_responses = true, http_capabilities = true, http_stream_receipts = true;  // ApiConfig defaults (on)
+    double http_sse_keepalive = 10.0;                                                    // seconds, 0: off
     std::uint32_t import_parked = 1;  // imported states parked in slots at most (POST /admin/import-state)
     std::uint32_t import_frames_port = 0;  // --import-frames PORT: the same imports as strix::handoff sessions (0: off)
     unsigned connect_timeout = 60, peer_timeout = 60;
@@ -1462,6 +1466,10 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
     config.default_max_tokens = a.default_max_tokens;
     config.default_thinking = false;  // chat mode unless the request enables thinking
     config.sampling_policy = "greedy";
+    config.responses = a.http_responses;
+    config.capabilities = a.http_capabilities;
+    config.stream_receipts = a.http_stream_receipts;
+    config.sse_keepalive_seconds = a.http_sse_keepalive;
     config.engine_description = "deepseek41 engine group (2 ranks, EP experts" + std::string(a.tp ? " + TP attention" : "") + "), " +
                                 std::to_string(a.slots) + " slots, greedy, exact per request";
     config.stop_tokens = {tokenizer->eos_token()};
@@ -2791,6 +2799,18 @@ int main(int argc, char** argv) try {
         else if (s == "--http-api-key-file") a.api_key_file = next();
         else if (s == "--http-max-queue") a.max_queue = u32();
         else if (s == "--http-max-connections") a.max_connections = u32();
+        else if (s == "--http-responses" || s == "--http-capabilities" || s == "--http-stream-receipts") {
+            const auto v = next();
+            if (v != "on" && v != "off") throw std::invalid_argument(s + " requires on|off");
+            (s == "--http-responses" ? a.http_responses : s == "--http-capabilities" ? a.http_capabilities : a.http_stream_receipts) = v == "on";
+        }
+        else if (s == "--http-sse-keepalive") {
+            const auto v = next();
+            std::size_t used = 0;
+            a.http_sse_keepalive = std::stod(v, &used);
+            if (used != v.size() || !std::isfinite(a.http_sse_keepalive) || a.http_sse_keepalive < 0.0)
+                throw std::invalid_argument("--http-sse-keepalive needs seconds >= 0");
+        }
         else if (s == "--model-id") a.model_id = next();
         else if (s == "--default-max-tokens") a.default_max_tokens = u32();
         else if (s == "--import-parked") a.import_parked = u32();

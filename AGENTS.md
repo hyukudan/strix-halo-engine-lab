@@ -31,6 +31,9 @@ are already defaults: they can force an explicit route and decline the automatic
 Inspection exits before device work; preserve the engine's required assets and two-rank launch contract
 for execution. Check [all item guards, fallback notices and off switches](docs/optimizations.md) or
 the [JSON catalog](docs/optimizations.json). Qwen auto fast prefill currently excludes MTP and HTTP serving.
+HTTP servers (Qwen, DeepSeek) describe what they execute at `GET /v1/capabilities`; the `strix` object of each response
+states the applied policy (requested vs effective sampling). Generation fields the server does not execute are refused
+with a 400 naming the field ([list](docs/engine/serving/serving.md#chat-requests)).
 Fast FP16 Qwen prefill is its own identity, not dense-A8 serial bit equality. GLM defaults to R1b decode
 with R1 prompt prefill; `--identity r1` restores R1. Exactness references must match that identity.
 

@@ -223,6 +223,7 @@ Json typed_value(const std::string& text, const Json* schema) {
 
 AssistantOutput parse_assistant_output(const std::string& text, bool thinking, const Json& tools) {
     AssistantOutput out;
+    out.tool_calls = Json::array();  // also when the reply ends inside the thinking block
     std::string rest = text;
     if (thinking) {
         const auto end = rest.find("</think>");
@@ -231,13 +232,13 @@ AssistantOutput parse_assistant_output(const std::string& text, bool thinking, c
         out.reasoning_complete = true;
         rest = rest.substr(end + 8U);
     }
-    out.tool_calls = Json::array();
     const auto first_call = rest.find("<tool_call>");
     out.content = strip(first_call == std::string::npos ? rest : rest.substr(0, first_call));
     for (auto at = first_call; at != std::string::npos; at = rest.find("<tool_call>", at)) {
         const auto close = rest.find("</tool_call>", at);
         const auto block = rest.substr(at + 11U, close == std::string::npos ? std::string::npos : close - at - 11U);
         at = close == std::string::npos ? rest.size() : close + 12U;
+        if (close == std::string::npos) out.unfinished_call = true;
         const auto function = block.find("<function=");
         if (function == std::string::npos) continue;
         const auto name_end = block.find('>', function);
@@ -261,6 +262,7 @@ AssistantOutput parse_assistant_output(const std::string& text, bool thinking, c
         call.set("name", Json(name));
         call.set("arguments", std::move(arguments));
         out.tool_calls.push(std::move(call));
+        out.call_complete.push_back(close != std::string::npos);
     }
     return out;
 }

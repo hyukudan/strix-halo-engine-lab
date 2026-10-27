@@ -423,6 +423,30 @@ MoE PK/MERGE, QSA_OUT16 and attend pairing are exact experiments with neutral or
 gains. They are not part of the default set. Do not infer an environment spelling from these experiment names;
 use only controls exposed by the current source and require the corresponding device gates before promotion.
 
+<a id="qwen-serve-api"></a>
+
+### HTTP API surface: Responses route, capabilities, stream receipts, keepalive
+
+**Engine:** `qwen` (also `strix-deepseek41-serve`, same shared server layer). **Control:** `--http-responses`,
+`--http-capabilities`, `--http-stream-receipts`, `--http-sse-keepalive`. **Default:** on, on, on, 10 seconds.
+
+Serving features that change no generated token: a stateless `POST /v1/responses` route translated onto the chat
+prompt path, a versioned `GET /v1/capabilities` document, the applied policy (requested vs effective sampling and
+output limit, each sampling filter with its source, the effective seed of a sampled request) at the start and end of
+every stream, and SSE keepalive comments while a stream waits. Sampling filters resolve request -> server default
+(`--http-default-temperature`, `--http-default-top-k`, `--http-default-top-p`, `--http-default-min-p`; a positive
+default temperature is a token-changing operator choice and needs `--http-sampling sample`) -> built-in greedy; an
+unseeded sampled request gets a seed, echoed in the receipt (stream receipts on), so the same request with that seed
+reproduces it.
+
+- **Preconditions:** `--http-serve` (Qwen) or the DeepSeek serve app.
+- **Automatic selection:** Always on in the server; a request disables its keepalive with `"strix":{"keepalive":false}`.
+- **Fallback notice:** Unsupported Responses fields are refused with a 400 naming the field; nothing is ignored silently.
+- **Exactness evidence:** Responses prompt IDs equal the equivalent chat request (CPU tests); greedy token IDs equal with
+  the features on and off, and the stream bytes with every switch off equal the previous build after normalizing ids
+  and timings (GPU gate).
+- **Off switch:** `--http-responses off`, `--http-capabilities off`, `--http-stream-receipts off`, `--http-sse-keepalive 0`
+
 ## DeepSeek two-node
 
 ```sh

@@ -404,6 +404,10 @@ struct Options {
     std::string http_bind = "127.0.0.1";
     std::string http_model_id = "qwen3.8-flash-next";
     std::string http_api_key_file;
+    bool http_responses = true, http_capabilities = true, http_stream_receipts = true;
+    double http_sse_keepalive = 10.0;
+    std::optional<double> http_default_temperature, http_default_top_p, http_default_min_p;
+    std::optional<std::uint32_t> http_default_top_k;
     std::string http_sampling = "greedy";  // temperature > 0: "greedy" (downgrade, noted), "reject" or "sample" (--http-batch)
     // 0: one request at a time (each from the single request state). 1..8: batched decoding with that many
     // request slots: requests are admitted between decode cycles and decoded together (cohort windows).
@@ -785,15 +789,17 @@ inline void validate_http_serve(const Options& o) {
     if (o.rtx_state_import && (!o.http_serve || o.http_batch))
         throw std::invalid_argument("--rtx-state-import requires --http-serve (the tiled MTP prompt) without --http-batch");
     if (o.rtx_state_import_decode_threads > 64U) throw std::invalid_argument("--rtx-state-import-decode-threads is 0..64");
+    if (o.http_default_temperature.value_or(0.0) > 0.0 && o.http_sampling != "sample")
+        throw std::invalid_argument("--http-default-temperature > 0 requires --http-sampling sample");
     if (!o.http_serve) return;
     if (!mtp_tiled_prompt(o) || !o.mtp.golden_dump.empty() || o.mtp.metadata_only)
         throw std::invalid_argument("--http-serve requires the tiled MTP route (--mtp with a calibration golden, "
             "--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T)");
     if (o.http_port > 65535U || o.http_bind.empty() || o.http_model_id.empty() || !o.http_default_max_tokens ||
-        !o.http_max_queue || !o.http_max_connections || o.http_batch > 8U ||
+        !std::isfinite(o.http_sse_keepalive) || o.http_sse_keepalive < 0.0 || !o.http_max_queue || !o.http_max_connections || o.http_batch > 8U ||
         (o.http_sampling != "greedy" && o.http_sampling != "reject" && o.http_sampling != "sample"))
         throw std::invalid_argument("--http-* values: port <= 65535, non-empty bind/model id, positive limits, batch 0..8, "
-            "sampling greedy|reject|sample");
+            "sampling greedy|reject|sample, keepalive seconds >= 0");
     if (o.http_sampling == "sample" && !o.http_batch)
         throw std::invalid_argument("--http-sampling sample runs on the batched route (--http-batch N)");
     if (o.http_batch && (!o.mtp.window_prefix || !o.mtp.draft_chain || o.mtp.window_rows_set != std::vector<std::uint32_t>{2U, 4U, 8U}))
@@ -1628,7 +1634,10 @@ inline Options parse_options(
             continue;
         }
         if (argument == "--http-port" || argument == "--http-bind" || argument == "--http-model-id" ||
-            argument == "--http-api-key-file" || argument == "--http-sampling" || argument == "--http-default-max-tokens" ||
+            argument == "--http-responses" || argument == "--http-capabilities" || argument == "--http-stream-receipts" ||
+            argument == "--http-sse-keepalive" || argument == "--http-api-key-file" || argument == "--http-sampling" || argument == "--http-default-max-tokens" ||
+            argument == "--http-default-temperature" || argument == "--http-default-top-k" ||
+            argument == "--http-default-top-p" || argument == "--http-default-min-p" ||
             argument == "--http-max-queue" || argument == "--http-max-connections" || argument == "--http-batch" ||
             argument == "--rtx-state-import-decode-threads") {
             if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
@@ -1639,12 +1648,38 @@ inline Options parse_options(
                 if (parsed > UINT32_MAX) throw std::invalid_argument(std::string(what) + " exceeds uint32");
                 return static_cast<std::uint32_t>(parsed);
             };
-            if (argument == "--http-port") options.http_port = u32("HTTP port");
+            const auto on_off = [&] {
+                if (value != "on" && value != "off") throw std::invalid_argument(std::string(argument) + " requires on|off");
+                return value == "on";
+            };
+            if (argument == "--http-responses") options.http_responses = on_off();
+            else if (argument == "--http-capabilities") options.http_capabilities = on_off();
+            else if (argument == "--http-stream-receipts") options.http_stream_receipts = on_off();
+            else if (argument == "--http-sse-keepalive") {
+                options.http_sse_keepalive = parse_double(value, "HTTP SSE keepalive");
+                if (options.http_sse_keepalive < 0.0) throw std::invalid_argument("HTTP SSE keepalive must be >= 0");
+            } else if (argument == "--http-port") options.http_port = u32("HTTP port");
             else if (argument == "--http-bind") options.http_bind = value;
             else if (argument == "--http-model-id") options.http_model_id = value;
             else if (argument == "--http-api-key-file") options.http_api_key_file = value;
             else if (argument == "--http-sampling") options.http_sampling = value;
-            else if (argument == "--http-default-max-tokens") options.http_default_max_tokens = u32("HTTP default max tokens");
+            else if (argument == "--http-default-top-k") options.http_default_top_k = u32("HTTP default top_k");
+            else if (argument == "--http-default-temperature" || argument == "--http-default-top-p" || argument == "--http-default-min-p") {
+                const double v = parse_double(value, "HTTP default filter");
+                if (argument == "--http-default-temperature") {
+                    if (!std::isfinite(v) || v < 0 || v > 2 || (v > 0 && !(static_cast<float>(v) > 0.0F)))
+                        throw std::invalid_argument("--http-default-temperature must be 0 or in (0, 2] as a float");
+                    options.http_default_temperature = v;
+                } else if (argument == "--http-default-top-p") {
+                    if (!std::isfinite(v) || v <= 0 || v > 1 || !(static_cast<float>(v) > 0.0F))
+                        throw std::invalid_argument("--http-default-top-p must be in (0, 1] as a float");
+                    options.http_default_top_p = v;
+                } else {
+                    if (!std::isfinite(v) || v < 0 || v >= 1 || !(static_cast<float>(v) < 1.0F))
+                        throw std::invalid_argument("--http-default-min-p must be in [0, 1) as a float");
+                    options.http_default_min_p = v;
+                }
+            } else if (argument == "--http-default-max-tokens") options.http_default_max_tokens = u32("HTTP default max tokens");
             else if (argument == "--http-max-queue") options.http_max_queue = u32("HTTP queue");
             else if (argument == "--http-batch") options.http_batch = u32("HTTP batch");
             else if (argument == "--rtx-state-import-decode-threads") options.rtx_state_import_decode_threads = u32("rtx import decode threads");

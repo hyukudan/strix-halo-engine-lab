@@ -17,7 +17,6 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
-#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -97,6 +96,14 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         config.default_max_tokens = options.http_default_max_tokens;
         config.api_key = read_http_api_key(options.http_api_key_file);
         config.sampling_policy = options.http_sampling;
+        config.default_temperature = options.http_default_temperature;
+        config.default_top_k = options.http_default_top_k;
+        config.default_top_p = options.http_default_top_p;
+        config.default_min_p = options.http_default_min_p;
+        config.responses = options.http_responses;
+        config.capabilities = options.http_capabilities;
+        config.stream_receipts = options.http_stream_receipts;
+        config.sse_keepalive_seconds = options.http_sse_keepalive;
         config.engine_description = engine_description;
         config.stop_tokens.push_back(tokenizer->eos_token());
         if (const auto end = tokenizer->find("<|endoftext|>"); end != UINT32_MAX) config.stop_tokens.push_back(end);
@@ -160,6 +167,14 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         config.default_max_tokens = options.http_default_max_tokens;
         config.api_key = read_http_api_key(options.http_api_key_file);
         config.sampling_policy = options.http_sampling;
+        config.default_temperature = options.http_default_temperature;
+        config.default_top_k = options.http_default_top_k;
+        config.default_top_p = options.http_default_top_p;
+        config.default_min_p = options.http_default_min_p;
+        config.responses = options.http_responses;
+        config.capabilities = options.http_capabilities;
+        config.stream_receipts = options.http_stream_receipts;
+        config.sse_keepalive_seconds = options.http_sse_keepalive;
         config.engine_description = engine_description;
         config.stop_tokens.push_back(tokenizer->eos_token());
         if (const auto end = tokenizer->find("<|endoftext|>"); end != UINT32_MAX) config.stop_tokens.push_back(end);
@@ -203,7 +218,6 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         const auto release = [&](const std::shared_ptr<serve::TakenJob>& taken) {
             live.erase(std::remove(live.begin(), live.end(), taken), live.end());
         };
-        std::random_device entropy;
         const auto admit = [&](serve::TakenJob taken_job) {
             auto taken = std::make_shared<serve::TakenJob>(std::move(taken_job));
             auto& job = taken->job;
@@ -227,10 +241,14 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                 policy.top_k = job.sampling.top_k;
                 policy.top_p = static_cast<float>(job.sampling.top_p);
                 policy.min_p = static_cast<float>(job.sampling.min_p);
-                policy.seed = job.sampling.seeded ? job.sampling.seed
-                                                  : (static_cast<std::uint64_t>(entropy()) << 32U) | entropy();
-                validate_token_sampling_policy(policy);
-                request.sampler = std::make_shared<TokenSampler>(policy);
+                policy.seed = job.sampling.seed;
+                try {
+                    validate_token_sampling_policy(policy);
+                    request.sampler = std::make_shared<TokenSampler>(policy);
+                } catch (const std::exception& e) {  // this request fails alone; the server keeps serving
+                    queue.finish(*taken, {}, std::string("sampling policy refused: ") + e.what());
+                    return;
+                }
                 sampling = "sampling-v1";
             }
             const auto prompt_tokens = job.prompt.size();
