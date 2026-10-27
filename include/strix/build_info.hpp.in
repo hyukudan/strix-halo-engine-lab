@@ -1,0 +1,10 @@
+#pragma once
+#include <string_view>
+
+namespace strix {
+// Immutable configured evidence, with no runtime file or subprocess access.
+[[nodiscard]] inline constexpr std::string_view build_info() noexcept {
+    return R"strix(@STRIX_BUILD_JSON@)strix";
+}
+[[nodiscard]] inline constexpr std::string_view build_info_json() noexcept { return build_info(); }
+} // namespace strix

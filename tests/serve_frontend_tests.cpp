@@ -25,6 +25,9 @@ std::string read_file(const char* path) {
 }
 
 void json_tests() {
+    check(parse_json("\"\xff\"").as_string() == "\xff", "legacy JSON preserves raw bytes");
+    check(parse_json(R"("\ud800")").as_string() == "\xef\xbf\xbd", "legacy JSON replaces lone surrogate");
+    check(parse_json(R"("\udfff")").as_string() == "\xef\xbf\xbd", "legacy JSON replaces lone low surrogate");
     const auto value = parse_json(R"({"b":1,"a":[true,false,null,-2.5e3,"x\"\\\n\u00e9\ud83d\ude00"],"b":2})");
     check(value.as_object().size() == 2U && value.as_object()[0].first == "b", "JSON keeps first key position");
     check(value.find("b")->as_int() == 2, "JSON duplicate key keeps the last value");

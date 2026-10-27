@@ -1,5 +1,9 @@
+#include "strix/asset_manifest.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/model_manifest.hpp"
+
+#include <fstream>
+#include <map>
 
 #include <iomanip>
 #include <iostream>
@@ -40,6 +44,44 @@ void print_dimensions(const std::vector<std::uint64_t>& dimensions) {
 }  // namespace
 
 int main(int argc, char** argv) try {
+    if (argc > 1 && (std::string(argv[1]) == "bundle-create" || std::string(argv[1]) == "bundle-verify")) {
+        try {
+            const bool create = std::string(argv[1]) == "bundle-create";
+            std::map<std::string, std::string> options;
+            std::vector<std::string> roles;
+            for (int i = 2; i < argc; i += 2) {
+                if (i + 1 >= argc) throw std::invalid_argument("missing bundle option value");
+                const std::string key = argv[i];
+                if (!create && key == "--role") roles.emplace_back(argv[i + 1]);
+                else if (key == "--root" || (create && (key == "--spec" || key == "--output")) || (!create && key == "--manifest")) {
+                    if (!options.emplace(key, argv[i + 1]).second) throw std::invalid_argument("duplicate bundle option");
+                } else throw std::invalid_argument("unknown bundle option");
+            }
+            if (options.size() != (create ? 3U : 2U)) throw std::invalid_argument("missing bundle options");
+            const auto input = strix::read_asset_json(options.at(create ? "--spec" : "--manifest"));
+            if (create) {
+                const auto result = strix::create_asset_manifest(input, options.at("--root"));
+                std::ofstream out(options.at("--output"), std::ios::binary);
+                out << result << '\n';
+                out.close();
+                if (!out) throw std::runtime_error("asset output failed");
+            } else std::cout << strix::verify_asset_manifest(input, options.at("--root"), roles) << '\n';
+            return 0;
+        } catch (const strix::AssetMismatch& e) {
+            std::cout << '{';
+            if (!e.role.empty()) {
+                std::cout << "\"index\":" << e.index << ',';
+                if (!e.key.empty()) std::cout << "\"key\":\"" << json_escape(e.key) << "\",";
+                else std::cout << "\"key_digest\":\"" << e.key_digest << "\",";
+                std::cout << "\"role\":\"" << e.role << "\",";
+            }
+            std::cout << "\"reason\":\"" << json_escape(e.what()) << "\",\"verification\":\"failed\"}\n";
+            return 2;
+        } catch (const std::exception&) {
+            std::cerr << "error: invalid bundle input or I/O failure\n";
+            return 1;
+        }
+    }
     if (argc != 2) {
         throw std::invalid_argument("usage: strix-model-manifest MODEL.gguf");
     }

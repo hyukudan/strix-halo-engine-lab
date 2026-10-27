@@ -53,6 +53,11 @@ suffix and decoding run the decode profile, and decoding is exact from the state
 The calibration golden is that of the decode profile. The prefix state cache keys its checkpoints by
 the pair, both executions and T.
 
+Before any device work the process prints one `strix-build-info` and one `strix-startup-event`
+JSON line on stderr: configured build identity and a read-only memory preflight (GTT/VRAM, host
+memory, 2 MiB-equivalent free blocks, compaction counters, memlock, KFD clients), with warnings derived
+only from known plan terms ([startup-preflight.md](../../operations/startup-preflight.md); default ON,
+`STRIX_PREFLIGHT=0` / `STRIX_RELEASE_EVENTS=0` to switch off).
 The process prints `strix serve: listening on ADDR:PORT` on stderr once it accepts requests, and a
 one-line JSON receipt (`"mode":"native-mtp-http-serve"`, the number of served requests) on stdout
 when it stops.
@@ -190,7 +195,7 @@ window stream shared by all slots. The calibration replay runs once.
 | `GET /v1/models` | the served model (with `capabilities_id`) |
 | `GET /v1/capabilities` | what this server executes: endpoints, sampling policy and modes, stream features, unavailable features |
 | `POST /tokenize`, `POST /detokenize` | `{"text"}` ↔ `{"tokens"}` with the model tokenizer |
-| `GET /health`, `GET /v1/health` | `{"status":"ok"}`, or 503 `{"status":"failed"}` after an engine failure |
+| `GET /health`, `GET /v1/health` | Qwen [service health record](../../operations/service-health.md), with build/assets, resolved settings and backend evidence; `STRIX_SERVE_HEALTH_RECORD=0` restores the legacy body (including `capabilities_id` when enabled). Failed/draining: 503 |
 | `GET /metrics` | Prometheus text: request counters, token counters, queue depth, busy time |
 | `GET /api/status` | JSON snapshot (`"schema":"strix-serve-status-v1"`): state, queue, totals, recent requests |
 

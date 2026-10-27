@@ -60,13 +60,7 @@ const char* status_name(LinuxUmaReadStatus s) {
 }
 #if defined(__linux__)
 std::pair<std::string,LinuxUmaReadStatus> read(const std::filesystem::path& path) {
-    std::ifstream input(path,std::ios::binary);
-    if(!input) return {{},LinuxUmaReadStatus::unavailable};
-    std::string bytes(limit+1U,'\0');input.read(bytes.data(),static_cast<std::streamsize>(bytes.size()));
-    const auto n=input.gcount();
-    if(input.bad() || n<0) return {{},LinuxUmaReadStatus::unavailable};
-    if(static_cast<std::uint64_t>(n)>limit) return {{},LinuxUmaReadStatus::oversized};
-    bytes.resize(static_cast<std::size_t>(n));return {std::move(bytes),LinuxUmaReadStatus::read};
+    return read_linux_uma_text(path);
 }
 std::uint64_t now() noexcept {
     const auto value=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -78,6 +72,16 @@ std::uint64_t next_id() noexcept {
     return 0;
 }
 #endif
+}
+std::pair<std::string,LinuxUmaReadStatus> read_linux_uma_text(const std::filesystem::path& path,std::size_t cap) {
+    std::ifstream input(path,std::ios::binary);
+    if(!input) return {{},LinuxUmaReadStatus::unavailable};
+    if(cap>limit) cap=limit;
+    std::string bytes(cap+1U,'\0');input.read(bytes.data(),static_cast<std::streamsize>(bytes.size()));
+    const auto n=input.gcount();
+    if(input.bad() || n<0) return {{},LinuxUmaReadStatus::unavailable};
+    if(static_cast<std::uint64_t>(n)>cap) return {{},LinuxUmaReadStatus::oversized};
+    bytes.resize(static_cast<std::size_t>(n));return {std::move(bytes),LinuxUmaReadStatus::read};
 }
 LinuxUmaObservation parse_linux_uma_observation(std::string_view meminfo,std::string_view process,std::uint64_t id) {
     if(!id) throw std::invalid_argument("UMA observation requires a nonzero actual read/fixture identity");

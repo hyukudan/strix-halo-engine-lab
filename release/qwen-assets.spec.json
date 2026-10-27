@@ -1,0 +1,240 @@
+{
+  "format": "strix-assets",
+  "revision": 1,
+  "engine": "qwen",
+  "model_key": "Qwen3.8-Flash-Next",
+  "profile_pair": "bench-kit",
+  "required": {
+    "target": [
+      "target"
+    ],
+    "draft": [
+      "distill-g"
+    ],
+    "vocabulary": [
+      "core32k.bin",
+      "core48k.bin",
+      "core64k.bin",
+      "pack-de16k.bin",
+      "pack-es16k.bin",
+      "pack-fr16k.bin",
+      "pack-it16k.bin",
+      "pack-ja16k.bin",
+      "pack-pt16k.bin",
+      "pack-ru16k.bin",
+      "pack-zh16k.bin",
+      "pack2-de.bin",
+      "pack2-es.bin",
+      "pack2-fr.bin",
+      "pack2-it.bin",
+      "pack2-ja.bin",
+      "pack2-pt.bin",
+      "pack2-ru.bin",
+      "pack2-zh.bin",
+      "README.md"
+    ]
+  },
+  "files": [
+    {
+      "role": "target",
+      "key": "target",
+      "member": "Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf",
+      "source_revision": "38bb39ee97821de2c9009abb7e93950eec396e66",
+      "expected_sha256": "8003d03db822cb089ab55caa5fff0f82f6f4199fe6ac58368bc9989365b6f8c2",
+      "audit": "gguf"
+    },
+    {
+      "role": "draft",
+      "key": "distill-g",
+      "member": "mtp-Qwen3.8-Flash-Next-shared-distillG-Q8_0.gguf",
+      "source_revision": "1a0eed49be3995d8ea15eeb6dd370dd16d9c04db",
+      "expected_sha256": "5516d3ce407783a424315b6a2a0d8b06341665bb3541b98e5db0fe944add4c3c",
+      "bytes": 2786568256,
+      "audit": "mtp"
+    },
+    {
+      "role": "vocabulary",
+      "key": "core32k.bin",
+      "member": "draft-vocab/core32k.bin",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "85578fdf1c47aba24568ed60d117e215dbb176db3f50973924a5dfa6bf78ead2",
+      "bytes": 131072
+    },
+    {
+      "role": "vocabulary",
+      "key": "core48k.bin",
+      "member": "draft-vocab/core48k.bin",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "785a50f70a006f5ba57430139d837e357af9ee18dbea9852ddf1ee78cc35d532",
+      "bytes": 196608
+    },
+    {
+      "role": "vocabulary",
+      "key": "core64k.bin",
+      "member": "draft-vocab/core64k.bin",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "6e734f27923153487e855fcbed7edc8c956063d90833f9b6fdfcff27a697e0d1",
+      "bytes": 262144
+    },
+    {
+      "role": "vocabulary",
+      "key": "pack-de16k.bin",
+      "member": "draft-vocab/pack-de16k.bin",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "1646667d002945442f61f9965bd9d412a5cebb8e8ac5f9767c7681260d8ca677",
+      "bytes": 65536
+    },
+    {
+      "role": "vocabulary",
+      "key": "pack-es16k.bin",
+      "member": "draft-vocab/pack-es16k.bin",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "84ac5b184a8b2212b0fcb471203a7afbfb70814eefbd549e9f11832bf226a772",
+      "bytes": 65536
+    },
+    {
+      "role": "vocabulary",
+      "key": "pack-fr16k.bin",
+      "member": "draft-vocab/pack-fr16k.bin",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "c59a60b8b2100b88c08911bc2dbacda3172561aadf282c9d3f59da320efa5115",
+      "bytes": 65536
+    },
+    {
+      "role": "vocabulary",
+      "key": "pack-it16k.bin",
+      "member": "draft-vocab/pack-it16k.bin",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "797b152ef302744e51f0d494b4f6f39dae4522f86582d6e0ee4e5341bf2a2f0f",
+      "bytes": 65536
+    },
+    {
+      "role": "vocabulary",
+      "key": "pack-ja16k.bin",
+      "member": "draft-vocab/pack-ja16k.bin",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "7859afeeaf063c86b46e6e65706ca7a60bf85d0df7d7fca613d7fd563ac10170",
+      "bytes": 65536
+    },
+    {
+      "role": "vocabulary",
+      "key": "pack-pt16k.bin",
+      "member": "draft-vocab/pack-pt16k.bin",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "910c1dc30b18c9526e07e98b4c5dddf2b0d02b654a63ca4b1fd2bde2dc6f0b8a",
+      "bytes": 65536
+    },
+    {
+      "role": "vocabulary",
+      "key": "pack-ru16k.bin",
+      "member": "draft-vocab/pack-ru16k.bin",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "f9b6164bba32c2915ff4c2d7105a236d7fe2f0b3f5b6207ba9c13dbae9861223",
+      "bytes": 65536
+    },
+    {
+      "role": "vocabulary",
+      "key": "pack-zh16k.bin",
+      "member": "draft-vocab/pack-zh16k.bin",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "39f9197b1e571a7888536c15455e150e52c0cfab1af1617b3d0cf1e26b5ea381",
+      "bytes": 65536
+    },
+    {
+      "role": "vocabulary",
+      "key": "pack2-de.bin",
+      "member": "draft-vocab/pack2-de.bin",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "4c1154228128cde72c8a45384aa5f5f204241398535c05d2eff4bf286ecc3da2",
+      "bytes": 65536
+    },
+    {
+      "role": "vocabulary",
+      "key": "pack2-es.bin",
+      "member": "draft-vocab/pack2-es.bin",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "62c2ad417d85ca026bab4add824b9b22e9ca9a794771c7180a9f365dc845f261",
+      "bytes": 65536
+    },
+    {
+      "role": "vocabulary",
+      "key": "pack2-fr.bin",
+      "member": "draft-vocab/pack2-fr.bin",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "1ba7876bda448d88e526484854e1a20076a4c361d85a8b1bd66364e3fedbfc6b",
+      "bytes": 65536
+    },
+    {
+      "role": "vocabulary",
+      "key": "pack2-it.bin",
+      "member": "draft-vocab/pack2-it.bin",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "b4dbcfbc59ddf8e247c172833082a9e86b0040268da46ced725e429ef871ff58",
+      "bytes": 65536
+    },
+    {
+      "role": "vocabulary",
+      "key": "pack2-ja.bin",
+      "member": "draft-vocab/pack2-ja.bin",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "bb55228979f2c2f319a7b3e1b378ab2023110f908d83d5755c917c9815678b4b",
+      "bytes": 65536
+    },
+    {
+      "role": "vocabulary",
+      "key": "pack2-pt.bin",
+      "member": "draft-vocab/pack2-pt.bin",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "ecd376f566f9bce6d007b830d152508423be5f60cec19b5df8212efc890c9c6f",
+      "bytes": 65536
+    },
+    {
+      "role": "vocabulary",
+      "key": "pack2-ru.bin",
+      "member": "draft-vocab/pack2-ru.bin",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "e533e7af546834e857cf024c472eecb0b4af8ba196605fdba73afb575362254e",
+      "bytes": 65536
+    },
+    {
+      "role": "vocabulary",
+      "key": "pack2-zh.bin",
+      "member": "draft-vocab/pack2-zh.bin",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "4b01353de01e2f876c22ab01af51f481e886ffd4519131da1f7e902aa5f10326",
+      "bytes": 131072
+    },
+    {
+      "role": "vocabulary",
+      "key": "README.md",
+      "member": "draft-vocab/README.md",
+      "source_revision": "efc9dcc3df555fd86750d9949088c2699b100106",
+      "expected_sha256": "624fa36660bcba9fc5676ce1de66b46880e8dfabfe916b64be2a1f1ecc7c047e",
+      "bytes": 1977
+    }
+  ],
+  "provenance": [
+    {
+      "type": "https",
+      "value": "https://github.com/hyukudan/strix-halo-engine-lab/blob/9288c1b4b7a821f33c0c956ea98e9f568a080bd8/scripts/bench/engines/qwen.sh"
+    },
+    {
+      "type": "https",
+      "value": "https://github.com/hyukudan/strix-halo-engine-lab/blob/9288c1b4b7a821f33c0c956ea98e9f568a080bd8/include/strix/mtp_draft_profiles.hpp"
+    },
+    {
+      "type": "member",
+      "value": "draft-vocab/README.md"
+    }
+  ],
+  "licenses": [
+    {
+      "type": "public-id",
+      "value": "Qwen-Community-License"
+    },
+    {
+      "type": "member",
+      "value": "LICENSE"
+    }
+  ]
+}

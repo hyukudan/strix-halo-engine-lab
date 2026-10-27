@@ -1905,6 +1905,18 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
         if (request.method == "GET" && (request.path == "/health" || request.path == "/v1/health")) {
             std::string state;
             { const std::lock_guard lock(impl.mutex); state = impl.state; }
+            if (impl.config.health_record && serve_health_record_enabled()) {
+                BackendHealth evidence;
+                try {
+                    if (impl.config.health_record->backend_probe_enabled && impl.config.health_provider)
+                        evidence = impl.config.health_provider();
+                } catch (...) { evidence.state = BackendState::failed; }
+                const auto health = render_health(*impl.config.health_record, evidence, state,
+                    impl.config.model_id, impl.queue.snapshot(),
+                    impl.config.capabilities ? std::string_view(impl.capabilities_id) : std::string_view{});
+                response.send(health.status, "application/json", health.body.dump());
+                return;
+            }
             const bool failed = state == "failed", draining = state == "draining";
             Json out = Json::object(); out.set("status", Json(failed ? "failed" : draining ? "draining" : "ok")); out.set("model", Json(impl.config.model_id));
             if (impl.config.capabilities) out.set("capabilities_id", Json(impl.capabilities_id));

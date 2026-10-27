@@ -4,9 +4,13 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace strix {
 enum class LinuxUmaReadStatus : std::uint8_t { unavailable, read, malformed, oversized, unsupported };
+// Shared bounded host reader; a cap hit never returns partial data as valid.
+[[nodiscard]] std::pair<std::string,LinuxUmaReadStatus> read_linux_uma_text(
+    const std::filesystem::path&, std::size_t cap = 64U*1024U);
 struct LinuxUmaObservation {
     UmaMemoryObservation memory;
     bool supported = false;

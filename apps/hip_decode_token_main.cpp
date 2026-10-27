@@ -1,5 +1,6 @@
 #include "http_slot_capacity.hpp"
 #include "qwen_prefill_plan.hpp"
+#include "strix/preflight.hpp"
 #include "deferred_moe_receipt.hpp"
 #include "strix/lane_chain_hyper_output.hpp"
 #include "qsa_input_receipt.hpp"
@@ -1053,6 +1054,7 @@ int STRIX_DECODE_ENTRY(
             "  --http-serve [--http-bind ADDR] [--http-port N] [--http-model-id NAME] [--http-api-key-file FILE]\n"
             "      [--http-sampling greedy|reject] [--http-default-max-tokens N] [--http-max-queue N] [--http-max-connections N]\n"
             "      (OpenAI/Anthropic-compatible HTTP server on the tiled MTP route; the prompt is the calibration prompt)\n"
+            "  --release-manifest FILE (HTTP only, no multi-input modes; verify assets rooted beside FILE)\n"
             "  --prefetch-q8-qsa-input (opt-in exact-tree Q8 input projections)\n"
             "  --prefetch-q8-shared-expert (opt-in exact-tree Q8 gate/up/down)\n"
             "  --execution-mode eager|graph (default eager)\n"
@@ -1071,6 +1073,8 @@ int STRIX_DECODE_ENTRY(
         parse_options(
             argc,
             argv, true);
+    const auto startup_preflight = strix::emit_qwen_startup_diagnostics(options.print_effective_config);
+    const auto release_assets = strix::decode_cli::verify_http_release_assets(options);
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     const bool target_input_export = strix::tests::mtp_target_input_export_requested();
     if(target_input_export)strix::tests::validate_mtp_target_input_export(options,false);
@@ -3320,14 +3324,15 @@ int STRIX_DECODE_ENTRY(
             parents->grow_batch_slot = build_slot;
             parents->serve_batch = options.http_serve
                 ? strix::decode_cli::make_http_batch_serve(options, "native MTP batched decode (" + std::to_string(batch_slots) +
-                    " slots), profile " + std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens))
+                    " slots), profile " + std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens),
+                    startup_preflight, release_assets)
                 : strix::decode_cli::make_cohort_tiled_run(options, model, std::cout);
         }
         auto make_window = window_factory_for(parents, batch_stream);
         if (options.http_serve && !batch_slots)
             parents->serve = strix::decode_cli::make_http_serve(options, "native MTP greedy decode, profile " +
                 std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens),
-                parents->tiled.rtx_import);
+                parents->tiled.rtx_import, startup_preflight, release_assets);
         setup_phase.reset();
         // --mtp-sample-repeats N: N independent requests (seeds seed..seed+N-1), each from a fresh
         // session over the same loaded model; one receipt per request.
