@@ -202,7 +202,7 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
                 dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream,
                 reinterpret_cast<const std::uint16_t*>(a.raw_state.address), pool->valid, a.index_dim, ratio,
                 reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address), model.rms_norm_epsilon, rotary,
-                model.rope_theta, pool->keys, slot.bounds, groups);
+                model.rope_theta, pool->keys, slot.bounds, groups, pool->packed);
         });
         check_hip(hipGetLastError(), "QSA stage batch pool launch");
         hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<true>), dim3((total_new + 255U) / 256U),
@@ -213,10 +213,16 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
     if (max_blocks) {
         constexpr unsigned W = qsa_flash::kScoreWaves;
         const auto score = [&]<unsigned R>() {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<64U, R, W, false, false, true, 1U, true>),
-                dim3(((max_blocks + 31U) / 32U + W - 1U) / W, 64U / R, groups), dim3(W * 32U), 0, stream,
-                QsaRowsScoreViews<64U>{}, static_cast<const float*>(pool->keys), 0U, a.index_dim, nullptr, 0U,
-                static_cast<const uint2*>(qpf2k_key_ranges(pool->capacity)), nullptr, slot.scores);
+            if (pool->packed)
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<64U, R, W, false, false, true, 1U, true, true>),
+                    dim3(((max_blocks + 31U) / 32U + W - 1U) / W, 64U / R, groups), dim3(W * 32U), 0, stream,
+                    QsaRowsScoreViews<64U>{}, static_cast<const void*>(pool->packed), 0U, a.index_dim, nullptr, 0U,
+                    static_cast<const uint2*>(qpf2k_key_ranges(pool->capacity)), nullptr, slot.scores);
+            else
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<64U, R, W, false, false, true, 1U, true>),
+                    dim3(((max_blocks + 31U) / 32U + W - 1U) / W, 64U / R, groups), dim3(W * 32U), 0, stream,
+                    QsaRowsScoreViews<64U>{}, static_cast<const float*>(pool->keys), 0U, a.index_dim, nullptr, 0U,
+                    static_cast<const uint2*>(qpf2k_key_ranges(pool->capacity)), nullptr, slot.scores);
         };
         if (qsa_flash::score_rows(max_blocks) != 16U) {
             static const bool witness = [] { std::fprintf(stderr, "qpf2k qsa score rows > 16 active\n"); return true; }();

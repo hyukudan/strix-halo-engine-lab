@@ -766,6 +766,24 @@ inline void validate_resolved_teacher_forced_score(const Options& options, std::
         o.prefix_cache_every_explicit || !o.prefix_cache_then_prompts.empty();
 }
 
+// Persistent pooled index keys for eager serial decode (STRIX_QSA_DECODE_POOL, qpf2k::long_context_item_enabled policy):
+// only where one process appends to one session state allocation. Excluded: graph mode, MTP (windows/rollback), HTTP
+// serving, prompt lookup, prefix-cache roundtrip, the prefix state cache (resets and refills the same state allocation
+// for follow-up prompts), serving prefixes, teacher scoring and hierarchical selection.
+[[nodiscard]] inline bool qsa_decode_pool_route(const Options& o, bool gsq) noexcept {
+    return qpf2k::long_context_item_enabled("STRIX_QSA_DECODE_POOL", gsq) && !o.baseline &&
+        o.execution.mode != DecodeExecutionMode::graph && !o.mtp.enabled && !o.mtp.supplied && o.mtp.cohort.empty() &&
+        !o.http_serve && !o.prompt_lookup && !o.prefix_cache_roundtrip && !prefix_state_cache_requested(o) &&
+        o.serving_prefix_files.empty() && !o.teacher_forced_score && !o.qsa_hierarchical_selection;
+}
+// Device bytes of that pool at the session context: one FP32 pooled key per complete block per QSA layer, plus the
+// decode selection's 4-block maxima row (at least 16384 floats).
+[[nodiscard]] inline std::uint64_t qsa_decode_pool_bytes(const Options& o, const ModelContract& model) noexcept {
+    const auto blocks = o.context_tokens / model.indexer_compress_ratio;
+    const auto groups = std::max<std::uint64_t>((blocks + 3U) / 4U, 16384U);
+    return model.full_attention_layers * blocks * model.indexer_head_dim * sizeof(float) + groups * sizeof(float);
+}
+
 // The prefix state cache restores and captures whole tiled blocks: it runs only on the tiled
 // known-prefix prefill (full rows, a terminal head for generation) of an ordinary request.
 inline void validate_prefix_state_cache(const Options& o) {

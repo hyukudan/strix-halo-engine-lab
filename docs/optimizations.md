@@ -497,6 +497,72 @@ Reuse loaded superblock headers between gate and up within the DA16 tune 80/82 p
 - **Measured gain:** ~−0.07 s at 32K; combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)
 - **Implementation / evidence:** [defaults](../include/strix/qpf2k_defaults.hpp), [engine reference](getting-started/engine-reference.md)
 
+<a id="qwen-qsa-union-merge"></a>
+
+### QSA attend-union merge
+
+**Engine:** `qwen`. **Control:** `STRIX_QSA_UNION_MERGE`. **Default:** 1 (from 49,152 blocks; range form below).
+
+Build the attend union by merging per-row selections instead of the range form; same (block, mask) pairs, order and token counts.
+
+- **Preconditions:** Qwen QSA prefill from 49,152 blocks (about 196K tokens); below that the range form runs.
+- **Automatic selection:** On when unset; explicit values win; `--baseline`, `STRIX_QPF2K_DEFAULTS=0` and the GSQ profile turn all four off; each appears in `--print-effective-config`.
+- **Fallback notice:** Below its threshold or outside the plain route, the previous exact form runs.
+- **Exactness evidence:** Exact: union, score and decode fixtures byte-identical (score rows R16/R32/R64 to 262,144 blocks); at 262,143 tokens the 456-call QSA trace with these defaults is byte-identical to all levers off and the token matches; tokens identical at 32K/131K/262,080.
+- **Off switch:** STRIX_QSA_UNION_MERGE=0
+- **Measured gain:** union kernel −46 % at 75K blocks, −73 % at 262K blocks
+- **Implementation / evidence:** [QSA launcher](../src/hip_indexed_attention_launcher.hip)
+
+<a id="qwen-qsa-decode-pool"></a>
+
+### QSA persistent pooled decode keys
+
+**Engine:** `qwen`. **Control:** `STRIX_QSA_DECODE_POOL`. **Default:** 1 (plain append-only serial decode).
+
+Keep pooled keys across decode steps instead of rebuilding them; `STRIX_QSA_DECODE_POOL_CHECK=1` re-derives and compares them.
+
+- **Preconditions:** Plain append-only serial decode on the CLI route (not MTP, HTTP, prompt lookup, prefix round trip, the prefix state cache, serving prefixes or graphs). The pool's device memory is charged in admission and reported as `qsa_decode_pool_bytes` (384 MiB at 262K, 1.5 GiB at 1M).
+- **Automatic selection:** On when unset; explicit values win; `--baseline`, `STRIX_QPF2K_DEFAULTS=0` and the GSQ profile turn all four off; each appears in `--print-effective-config`.
+- **Fallback notice:** Below its threshold or outside the plain route, the previous exact form runs.
+- **Exactness evidence:** Exact: union, score and decode fixtures byte-identical (score rows R16/R32/R64 to 262,144 blocks); at 262,143 tokens the 456-call QSA trace with these defaults is byte-identical to all levers off and the token matches; tokens identical at 32K/131K/262,080.
+- **Off switch:** STRIX_QSA_DECODE_POOL=0
+- **Measured gain:** decode at 262K 75.7 → 53.0 ms/step (−30 %), at 131K −14.7 % (measured with decode selection also on)
+- **Implementation / evidence:** [QSA launcher](../src/hip_indexed_attention_launcher.hip)
+
+<a id="qwen-qsa-decode-select"></a>
+
+### QSA decode selection from 4-block maxima
+
+**Engine:** `qwen`. **Control:** `STRIX_QSA_DECODE_SELECT`. **Default:** 1.
+
+Select decode blocks from precomputed 4-block maxima; same selected blocks.
+
+- **Preconditions:** Plain append-only serial decode on the CLI route (not MTP, HTTP, prompt lookup, prefix round trip, the prefix state cache, serving prefixes or graphs).
+- **Automatic selection:** On when unset; explicit values win; `--baseline`, `STRIX_QPF2K_DEFAULTS=0` and the GSQ profile turn all four off; each appears in `--print-effective-config`.
+- **Fallback notice:** Below its threshold or outside the plain route, the previous exact form runs.
+- **Exactness evidence:** Exact: union, score and decode fixtures byte-identical (score rows R16/R32/R64 to 262,144 blocks); at 262,143 tokens the 456-call QSA trace with these defaults is byte-identical to all levers off and the token matches; tokens identical at 32K/131K/262,080.
+- **Off switch:** STRIX_QSA_DECODE_SELECT=0
+- **Measured gain:** Not separately measured (no change at 131K: 50.69 vs 50.87 ms/step); an exact reorganisation for depth
+- **Implementation / evidence:** [QSA launcher](../src/hip_indexed_attention_launcher.hip)
+
+<a id="qwen-qsa-score-rows64"></a>
+
+### QSA scorer R64 above 65,536 blocks
+
+**Engine:** `qwen`. **Control:** `STRIX_QSA_SCORE_ROWS64`. **Default:** 1 (from 65,536 blocks; per-group 64-row scoring follows the policy).
+
+Use 64-row scorer tiles at very long contexts (previously pinned to 16 rows above 262K).
+
+- **Preconditions:** Scorer from 65,536 blocks, i.e. beyond the native 262,144-token context: no effect on native runs today.
+- **Automatic selection:** On when unset; explicit values win; `--baseline`, `STRIX_QPF2K_DEFAULTS=0` and the GSQ profile turn all four off; each appears in `--print-effective-config`.
+- **Fallback notice:** Below its threshold or outside the plain route, the previous exact form runs.
+- **Exactness evidence:** Exact: union, score and decode fixtures byte-identical (score rows R16/R32/R64 to 262,144 blocks); at 262,143 tokens the 456-call QSA trace with these defaults is byte-identical to all levers off and the token matches; tokens identical at 32K/131K/262,080. R64 evidence is fixture-only: no native shape reaches 65,536 blocks.
+- **Off switch:** STRIX_QSA_SCORE_ROWS64=0
+- **Measured gain:** scorer at 1M tokens R16 → R64 −42 %
+- **Implementation / evidence:** [QSA launcher](../src/hip_indexed_attention_launcher.hip)
+
+`STRIX_QSA_POOL_PACKED=1` (packed BF16 pooled keys) is included as an exact opt-in; it is not a default.
+
 ### Exact options that remain opt-in
 
 MoE PK/MERGE, QSA_OUT16, attend pairing and `STRIX_QPF2K_HC_LOWBAND` are exact experiments with neutral or unmeasured complete-workload

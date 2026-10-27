@@ -25,6 +25,9 @@ class HipQsaWindowPool;
 // its session's committed prefix (discard_deferred does this), and retain it
 // through stream drain. Rejected/window rows are invalidated from the next frontier.
 [[nodiscard]] std::shared_ptr<HipQsaWindowPool> make_hip_qsa_window_pool();
+// Serial decode pool (STRIX_QSA_DECODE_POOL): one entry per QSA layer, allocated per entry; a failed allocation leaves
+// that layer on block_score_kernel.
+[[nodiscard]] std::shared_ptr<HipQsaWindowPool> make_hip_qsa_decode_pool();
 void invalidate_hip_qsa_window_pool(const std::shared_ptr<HipQsaWindowPool>&);
 
 struct HipIndexedAttentionLauncherConfig {
@@ -53,6 +56,11 @@ struct HipIndexedAttentionLauncherConfig {
     // fast-prefill-f16wmma-v1, qsa component: prefill groups run the fused union attention (hip_qsa_fast_prefill.inc).
     bool qsa_fast_prefill = false;
     std::shared_ptr<HipQsaWindowPool> window_pool;
+    // Eager serial decode of an append-only session (the plain CLI route; set through HipLauncherCatalogConfig::
+    // qsa_decode_pool): complete blocks are pooled once and scored by block_score_pooled_rows_kernel, bitwise the
+    // scores of block_score_kernel. The owner must not let another writer rewrite raw index keys below the position of a
+    // later serial step (no windows, rollback, restore or slot reuse on this config).
+    std::shared_ptr<HipQsaWindowPool> decode_pool;
 };
 
 enum class HipQsaInputProjectionMode {legacy256,virtual256,prefetch8};

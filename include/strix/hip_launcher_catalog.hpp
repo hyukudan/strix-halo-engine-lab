@@ -75,6 +75,8 @@ struct HipLauncherCatalogConfig {
     // Fast prefill profile components (kFastPrefill* bits; zero for every other profile): the prefill
     // launchers' HC (hyper_mix), dense (GDN/QSA/shared expert) and routed MoE arithmetic.
     std::uint32_t fast_prefill_components = 0;
+    // HipIndexedAttentionLauncherConfig::decode_pool for the runtime's QSA launcher (plain append-only serial decode).
+    bool qsa_decode_pool = false;
 };
 
 void register_complete_hip_kernel_catalog(

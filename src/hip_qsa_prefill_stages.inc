@@ -51,7 +51,7 @@ __global__ void store_rows_kernel(QsaRowsStoreViews<Rows> single, std::uint16_t*
 template <SmallWeightKind Kind, bool Batch = false>
 __global__ void block_pool_kernel(const std::uint16_t* raw_keys, std::uint32_t first_block, std::uint32_t head_dim,
     std::uint32_t compress_ratio, const void* key_norm, float epsilon, std::uint32_t rotary_dim, float theta, float* pooled_keys,
-    const uint2* bounds = nullptr, std::uint32_t groups = 0U) {
+    const uint2* bounds = nullptr, std::uint32_t groups = 0U, std::uint16_t* packed_keys = nullptr) {
     auto local = static_cast<std::uint32_t>(blockIdx.x);
     if constexpr (Batch) {
         const auto absolute = first_block + local;
@@ -95,5 +95,9 @@ __global__ void block_pool_kernel(const std::uint16_t* raw_keys, std::uint32_t f
         if (feature < half) rotated = pooled[feature] * cosine - pooled[feature + half] * sine;
         else rotated = pooled[feature] * cosine + pooled[feature - half] * sine;
     }
-    pooled_keys[static_cast<std::uint64_t>(block) * head_dim + feature] = round_bf16(rotated);
+    const float stored = round_bf16(rotated);
+    pooled_keys[static_cast<std::uint64_t>(block) * head_dim + feature] = stored;
+    // packed_keys (STRIX_QSA_POOL_PACKED): the same key as its upper 16 bits. round_bf16 leaves the lower 16 bits zero,
+    // so widening (bits << 16) gives back the stored float bit for bit, NaN payloads and signed zeros included.
+    if (packed_keys) packed_keys[static_cast<std::uint64_t>(block) * head_dim + feature] = static_cast<std::uint16_t>(__float_as_uint(stored) >> 16U);
 }

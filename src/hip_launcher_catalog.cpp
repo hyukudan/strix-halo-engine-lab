@@ -58,7 +58,7 @@ indexed_attention_config(
     bool wave8_output = false, bool hierarchical_selection = false,
     std::shared_ptr<QsaHierarchicalSelectionStats> selection_stats = {},
     std::uint32_t gqa_heads = 1, std::shared_ptr<QsaHierarchicalSelectionStats> gqa_stats = {}, bool dense_a8 = false,
-    bool dense_f16 = false, bool dense_trellis = false) {
+    bool dense_f16 = false, bool dense_trellis = false, bool decode_pool = false) {
     HipIndexedAttentionLauncherConfig config;
     config.model = model;
     config.activation = activation;
@@ -74,6 +74,7 @@ indexed_attention_config(
     config.dense_a8_projections = dense_a8;
     config.dense_f16_prefill = dense_f16;
     config.dense_trellis_projections = dense_trellis;
+    if (decode_pool) config.decode_pool = make_hip_qsa_decode_pool();
     return config;
 }
 
@@ -612,7 +613,8 @@ HipLauncherCatalog::HipLauncherCatalog(
           indexed_attention_config(
               model,
               config.activation, config.enable_device_graph_inputs, config.prefetch_q8_qsa_input, config.qsa_input_prefetch_layers, config.qsa_input_prefetch_stats, config.wave8_q8_qsa_output, config.qsa_hierarchical_selection, config.qsa_selection_stats, config.qsa_gqa_heads_per_block, config.qsa_gqa_stats, config.dense_a8,
-              (config.fast_prefill_components & kFastPrefillDense) != 0U, numerical_profile_dense_trellis(config.numerical_profile))),
+              (config.fast_prefill_components & kFastPrefillDense) != 0U, numerical_profile_dense_trellis(config.numerical_profile),
+              config.qsa_decode_pool && !config.enable_device_graph_inputs)),
       embedding_(
           embedding_config(
               model,

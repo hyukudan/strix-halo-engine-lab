@@ -4,6 +4,7 @@
 #include "strix/model_manifest.hpp"
 
 #include <array>
+#include <cstdlib>
 #include <cstdint>
 
 namespace strix::qpf2k {
@@ -60,6 +61,15 @@ inline bool baseline = false;
 inline thread_local bool gsq_model = false;
 inline bool suppressed(Item item, bool gsq = gsq_model) noexcept {
     return baseline || (gsq && (defaulted_items & bit(item)) != 0U);
+}
+// Code-default exact long-context items (STRIX_QSA_UNION_MERGE, STRIX_QSA_SCORE_ROWS64, STRIX_QSA_DECODE_POOL,
+// STRIX_QSA_DECODE_SELECT): on unless their variable is "0", the baseline is requested, STRIX_QPF2K_DEFAULTS=0, or the
+// model is a GSQ checkpoint (the same exclusions as the injected defaults above).
+inline bool long_context_item_enabled(const char* name, bool gsq = gsq_model) noexcept {
+    if (baseline || gsq) return false;
+    if (const char* d = std::getenv("STRIX_QPF2K_DEFAULTS"); d && d[0] == '0') return false;
+    const char* v = std::getenv(name);
+    return !(v && v[0] == '0');
 }
 class ModelScope {
 public:

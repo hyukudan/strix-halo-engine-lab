@@ -1625,6 +1625,9 @@ int STRIX_DECODE_ENTRY(
     catalog_config.grouped_exact_q51_down = options.grouped_exact_q51_down;
     catalog_config.q51_slot_parallel_down = options.q51_slot_parallel_down;
     catalog_config.qsa_hierarchical_selection = options.qsa_hierarchical_selection;
+    // STRIX_QSA_DECODE_POOL (default on; =0 or the baseline off): persistent pooled index keys for eager serial decode,
+    // only where one process appends to one session (no MTP windows, serving, prompt lookup, prefix/session restores).
+    catalog_config.qsa_decode_pool = strix::decode_cli::qsa_decode_pool_route(options, strix::qpf2k::gsq_model);
     catalog_config.qsa_selection_stats = qsa_selection_stats;
     catalog_config.qsa_gqa_heads_per_block = binding_request.qsa_gqa_heads_per_block = options.qsa_gqa_heads_per_block;
     catalog_config.qsa_gqa_stats = qsa_gqa_stats;
