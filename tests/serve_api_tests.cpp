@@ -2,6 +2,9 @@
 // SSE), tool calls, stop strings, Anthropic messages (plain and events), errors and API keys,
 // two concurrent clients through the FIFO queue, and cancellation when a client disconnects.
 #include "strix/serve/api.hpp"
+#include "strix/serve/constraint_selection.hpp"
+
+#include <limits>
 #include "strix/serve/deepseek_chat.hpp"
 #include "strix/serve/http_server.hpp"
 
@@ -48,10 +51,21 @@ std::shared_ptr<const BpeTokenizer> tiny_tokenizer() {
 
 class ScriptedEngine final : public GenerationEngine {
 public:
-    explicit ScriptedEngine(std::shared_ptr<const BpeTokenizer> t) : tokenizer_(std::move(t)) {}
+    explicit ScriptedEngine(std::shared_ptr<const BpeTokenizer> t) : tokenizer_(std::move(t)), trie_(std::make_shared<TokenByteTrie>(*tokenizer_)) {}
+    bool supports_constraints() const override { return true; }
+    std::vector<std::string> constraint_execution_routes() const override { return {"serial-host"}; }
     GenerationStats generate(GenerationJob& job) override {
         { const std::lock_guard lock(mutex_); prompts_.push_back({job.prompt, job.stable_prefix}); sampling_.push_back(job.sampling); }
+        if (job.constraint) return constrained(job);
         const auto prompt = tokenizer_->decode(job.prompt);
+        const bool progress = prompt.find("PROGRESS") != std::string::npos;
+        if (progress) {
+            const auto total = static_cast<std::uint64_t>(job.prompt.size());
+            for (std::uint64_t step = 0; step <= 4; ++step) {
+                if (job.on_progress) job.on_progress({GenerationPhase::prefill, (total - 1) * step / 4, 1, total});
+                std::this_thread::sleep_for(std::chrono::milliseconds(240));
+            }
+        }
         if (prompt.find("SLOW") != std::string::npos) std::this_thread::sleep_for(std::chrono::milliseconds(750));
         if (prompt.find("ENGINE_ERROR") != std::string::npos) throw std::runtime_error("scripted failure");
         std::string script = "Let me think.\n</think>\n\nHello there, friend.<|im_end|>";
@@ -77,6 +91,7 @@ public:
             calls.fetch_add(1);
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             if (!job.on_tokens(step)) { stats.finish = "cancelled"; cancelled.fetch_add(1); return stats; }
+            if (progress && at == 0) std::this_thread::sleep_for(std::chrono::milliseconds(250));
             if (stop) { stats.finish = "stop"; return stats; }
             if (stats.generated_tokens >= job.max_tokens) { stats.finish = "length"; return stats; }
             at += n;
@@ -90,10 +105,54 @@ public:
     std::vector<SamplingParameters> sampling() { const std::lock_guard lock(mutex_); return sampling_; }
     std::vector<Captured> prompts() { const std::lock_guard lock(mutex_); return prompts_; }
 private:
+    GenerationStats constrained(GenerationJob& job) {
+        ConstraintSelection selector(job.constraint, trie_, tokenizer_);
+        GenerationStats stats; stats.prompt_tokens = job.prompt.size();
+        const auto prompt = tokenizer_->decode(job.prompt);
+        std::vector<std::uint32_t> desired;
+        if (job.constraint->starts_in_reasoning) {
+            desired = tokenizer_->encode("why", false);
+            desired.push_back(*job.constraint->end_thinking_id);
+        }
+        const auto answer = tokenizer_->encode(" \n{\"a\":\"<tool_call> </think> caf\xC3\xA9\"}", false);
+        desired.insert(desired.end(), answer.begin(), answer.end());
+        desired.push_back(job.constraint->eos_ids.front());
+        try {
+            for (std::size_t i = 0; stats.generated_tokens < job.max_tokens; ++i) {
+                if (i == 1 && prompt.find("CONSTRAINT_CONTEXT") != std::string::npos) { stats.finish = "context"; break; }
+                if ((prompt.find("EXECUTION_ANSWER") != std::string::npos && selector.verdict("length", "serial-host").accepting) ||
+                    (prompt.find("EXECUTION_REASONING") != std::string::npos && i == 1)) {
+                    stats.finish = "execution_failure";
+                    stats.constraint = selector.verdict(stats.finish, "serial-host");
+                    throw GenerationRequestError(std::move(stats), "injected execution failure");
+                }
+                auto prepared = selector.prepare();
+                std::vector<float> logits(tokenizer_->vocab_size(), -100.0F);
+                logits[desired.at(i)] = 10.0F;
+                if (!prepared.state.reasoning) {
+                    logits[tokenizer_->find("<tool_call>")] = 100.0F; // invalid control wins without masking
+                    logits[job.constraint->eos_ids.front()] = 90.0F; // blocked until accepting
+                    if (desired.at(i) == static_cast<std::uint32_t>('a')) logits['b'] = 10.0F;
+                }
+                if (prompt.find("CONSTRAINT_FAILURE") != std::string::npos) logits[0] = std::numeric_limits<float>::infinity();
+                if (prompt.find("CONSTRAINT_REASON_EOS") != std::string::npos) logits[job.constraint->eos_ids.front()] = 200;
+                const auto staged = selector.select(logits, prepared);
+                selector.commit(staged); // commit before publishing the pending output token
+                ++stats.generated_tokens; ++stats.cycles; calls.fetch_add(1);
+                if (!job.on_tokens(std::span<const std::uint32_t>(&staged.token, 1))) { stats.finish = "cancelled"; break; }
+                if (selector.state().terminal) { stats.finish = "stop"; break; }
+            }
+            stats.constraint = selector.verdict(stats.finish, "serial-host");
+        } catch (const ConstraintError&) {
+            stats.constraint = selector.verdict("constraint_failure", "serial-host");
+        }
+        return stats;
+    }
     std::mutex mutex_;
     std::vector<Captured> prompts_;
     std::vector<SamplingParameters> sampling_;
     std::shared_ptr<const BpeTokenizer> tokenizer_;
+    std::shared_ptr<const TokenByteTrie> trie_;
 };
 
 // Member access that names the missing key and the document instead of dereferencing null.
@@ -187,9 +246,202 @@ void test_batched_queue() {
     check(!queue.take(true) && queue.stopping(), "batched queue after shutdown");
 }
 
+// A fake target owns the predicted frontier, just like the HIP ticket. The
+// production serial adapter must stage, replace that frontier, then commit before
+// publication; aborting a row must not change the committed cursor.
+void test_constraint_row(const std::shared_ptr<const BpeTokenizer>& tokenizer) {
+    const auto trie=std::make_shared<TokenByteTrie>(*tokenizer);
+    auto spec=std::make_shared<ConstraintSpec>();
+    spec->program=std::make_shared<ConstraintProgram>(compile_json_object());
+    spec->eos_ids={tokenizer->find("<|im_end|>")};
+    const auto selection=std::make_shared<ConstraintSelection>(spec,trie,tokenizer);
+    auto adapter=std::make_shared<ConstraintRowSelection>(selection);
+    std::vector<float> row(tokenizer->vocab_size(),-100.0F);
+    row['x']=100;row['{']=10;
+    std::uint32_t pending='x', consumed=0;
+    const auto execute=[&](std::uint32_t input) {
+        consumed=input;
+        // Target finite first-max predicts x; the host callback replaces it.
+        std::uint32_t predicted='x';
+        predicted=adapter->select(row);
+        return predicted;
+    };
+    auto first=execute(7);
+    check(first=='{' && !selection->prepare().mask.contains('}'), "terminal row stages constrained ticket without commit");
+    adapter->commit();pending=first;
+    check(adapter->verdict("length").reason=="max_output_tokens", "budget one reports incomplete first token");
+    row['{']=-100;row['}']=10;
+    adapter->prepare();auto next=execute(pending);
+    check(consumed=='{' && next=='}' && !selection->state().cursor.complete(), "serial target consumes constrained pending token before staging successor");
+    adapter->commit();pending=next;
+    check(selection->state().cursor.complete() && adapter->verdict("context").reason=="context", "serial commit advances exact output frontier");
+    check(adapter->verdict("cancelled").reason=="cancelled", "row cancellation receipt");
+    const auto execution = adapter->verdict("execution_failure");
+    check(execution.status=="failed" && execution.reason=="execution_failure" && execution.accepting && execution.phase=="answer",
+        "execution failure snapshots accepting committed row before EOS");
+    row[spec->eos_ids.front()]=200;
+    adapter->prepare();next=execute(pending);adapter->commit();
+    check(next==spec->eos_ids.front() && adapter->verdict("stop").status=="complete", "serial EOS completes only after commit");
+    // A dropped callback/state never leaks into a reused slot sharing this trie.
+    std::weak_ptr<ConstraintRowSelection> retired=adapter;adapter.reset();
+    check(retired.expired(), "request row adapter released at finish");
+    auto fresh=std::make_shared<ConstraintSelection>(spec,trie,tokenizer);
+    {
+        ConstraintRowSelection aborted(fresh);
+        row.assign(row.size(),-100);row['{']=10;
+        check(aborted.select(row)=='{', "aborted row stages token");
+    }
+    check(!fresh->prepare().mask.contains('}'), "aborted row leaves next request frontier unchanged");
+    ConstraintRowSelection failed(fresh);
+    row['x']=std::numeric_limits<float>::quiet_NaN();
+    bool refused=false;
+    try {(void)failed.select(row);} catch(const ConstraintError&) {refused=true;}
+    check(refused && failed.verdict("constraint_failure").status=="failed" && !fresh->prepare().mask.contains('}'),
+        "row refusal preserves committed state and failed receipt");
+}
+
+void test_constraint_request_failure() {
+    class FailingRequest final : public GenerationEngine {
+    public:
+        std::uint64_t context_tokens() const override {return 32;}
+        GenerationStats generate(GenerationJob& job) override {
+            GenerationStats stats;
+            if(job.prompt.front()==1U) {
+                stats.finish="constraint_failure";
+                stats.constraint=ConstraintVerdict{"failed",false,"answer","constraint_failure","serial-host"};
+                throw GenerationRequestError(std::move(stats),"empty constraint mask");
+            }
+            stats.finish="stop";
+            return stats;
+        }
+    } engine;
+    GenerationQueue queue;
+    GenerationJob failed;failed.prompt={1};
+    GenerationJob healthy;healthy.prompt={2};
+    const auto first=queue.submit(std::move(failed)),second=queue.submit(std::move(healthy));
+    std::thread worker([&]{queue.run(engine);});
+    for(const auto& ticket:{first,second}) {
+        bool done=false;
+        while(!done) (void)ticket->wait(std::chrono::milliseconds(50),done);
+    }
+    queue.shutdown();worker.join();
+    const auto stats=first->stats();
+    check(first->error()=="empty constraint mask" && stats.finish=="constraint_failure" && stats.constraint &&
+        stats.constraint->status=="failed" && stats.constraint->execution=="serial-host", "single queue retains failure receipt and error");
+    check(second->error().empty() && second->stats().finish=="stop", "constraint refusal does not poison next queued request");
+}
+
+void test_constraint_late_cancellation() {
+    for (const bool batched : {false, true}) for (const bool reasoning : {false, true}) {
+        GenerationQueue queue;
+        GenerationJob job; job.prompt = {1};
+        auto ticket = queue.submit(std::move(job));
+        GenerationStats stats; stats.finish = "stop";
+        stats.constraint = ConstraintVerdict{"complete", !reasoning, reasoning ? "reasoning" : "answer", "", "serial-host"};
+        if (batched) {
+            auto taken = queue.take(false);
+            ticket->cancel();
+            queue.finish(*taken, stats);
+        } else {
+            class LateCancel final : public GenerationEngine {
+            public:
+                std::uint64_t context_tokens() const override { return 32; }
+                GenerationStats generate(GenerationJob&) override {
+                    ticket->cancel(); queue->shutdown(); return stats;
+                }
+                GenerationQueue* queue;
+                std::shared_ptr<GenerationTicket> ticket;
+                GenerationStats stats;
+            } engine;
+            engine.queue = &queue; engine.ticket = ticket; engine.stats = stats;
+            queue.run(engine);
+        }
+        const auto result = ticket->stats();
+        check(result.finish == "cancelled" && result.constraint && result.constraint->status == "incomplete" &&
+            result.constraint->reason == "cancelled" && result.constraint->phase == stats.constraint->phase &&
+            result.constraint->accepting == stats.constraint->accepting && result.constraint->execution == "serial-host",
+            "late cancellation reconciles single/batched stats while preserving frontier");
+    }
+}
+
+void test_constraint_selection(const std::shared_ptr<const BpeTokenizer>& tokenizer) {
+    const auto trie = std::make_shared<TokenByteTrie>(*tokenizer);
+    auto spec = std::make_shared<ConstraintSpec>();
+    spec->program = std::make_shared<ConstraintProgram>(compile_json_object());
+    spec->eos_ids = {tokenizer->find("<|im_end|>")}; spec->end_thinking_id = tokenizer->find("</think>");
+    spec->identity = "json-object";
+    const auto throws = [](const auto& operation) { try { operation(); } catch (const ConstraintError&) { return true; } return false; };
+    ConstraintSelection selector(spec, trie, tokenizer);
+    std::vector<float> row(tokenizer->vocab_size(), -100.0F);
+    row['{'] = 1; row[spec->eos_ids.front()] = 100;
+    auto first = selector.select(row, selector.prepare());
+    check(first.token == '{' && !selector.state().cursor.complete(), "first position masks EOS without committing");
+    check(!selector.prepare().mask.contains('}'), "staged brace has not advanced live cursor");
+    auto branch = selector.prepare(first.state);
+    check(branch.mask.contains('}'), "branch has staged cursor");
+    row['{'] = -100; row['}'] = 1;
+    auto second = selector.select(row, branch);
+    check(second.state.cursor.complete() && !selector.state().cursor.complete(), "branch accepts without advancing live cursor");
+    selector.commit(second);
+    check(selector.state().cursor.complete(), "accepted prefix commits correction token");
+    check(throws([&] { selector.commit(second); }) && throws([&] { selector.commit(first); }), "duplicate and stale commits refused");
+    auto eos = selector.select(row, selector.prepare());
+    check(eos.token == spec->eos_ids.front(), "accepting boundary admits EOS"); selector.commit(eos);
+    check(selector.verdict("stop", "serial-host").status == "complete", "committed EOS completes constraint");
+    check(throws([&] { (void)selector.prepare(); }), "no selection after EOS");
+    ConstraintSelection tie(spec, trie, tokenizer);
+    std::fill(row.begin(), row.end(), -100); row[' '] = -0.0F; row['{'] = 0.0F;
+    check(tie.select(row, tie.prepare()).token == ' ', "signed-zero tie chooses lowest ID");
+    row[tokenizer->find("<tool_call>")] = std::numeric_limits<float>::quiet_NaN();
+    check(throws([&] { (void)tie.select(row, tie.prepare()); }), "nonfinite even in masked entry fails");
+    auto empty = tie.prepare(); std::fill(empty.mask.words.begin(), empty.mask.words.end(), 0);
+    std::fill(row.begin(), row.end(), 0);
+    check(throws([&] { (void)tie.select(row, empty); }), "empty mask fails explicitly");
+    auto thinking_spec = std::make_shared<ConstraintSpec>(*spec); thinking_spec->starts_in_reasoning = true;
+    ConstraintSelection thinking(thinking_spec, trie, tokenizer);
+    const auto execution = thinking.verdict("execution_failure", "serial-host");
+    check(execution.status == "failed" && execution.reason == "execution_failure" && execution.phase == "reasoning" && !execution.accepting,
+        "execution failure preserves reasoning frontier");
+    row[*spec->end_thinking_id] = 10;
+    auto closing = thinking.select(row, thinking.prepare());
+    check(thinking.state().reasoning && !closing.state.reasoning, "end-thinking transition is staged");
+    thinking.commit(closing);
+    check(!thinking.state().reasoning && !thinking.prepare().mask.contains('x'), "next position uses answer mask");
+    ConstraintSelection early(thinking_spec, trie, tokenizer);
+    row[spec->eos_ids.front()] = 20; auto stop = early.select(row, early.prepare()); early.commit(stop);
+    const auto early_verdict = early.verdict("stop", "serial-host");
+    check(early_verdict.status == "incomplete" && early_verdict.reason == "reasoning_eos", "reasoning EOS stays unmasked and incomplete");
+    check(thinking.verdict("context", "serial-host").reason == "context", "context verdict");
+    check(thinking.verdict("cancelled", "serial-host").reason == "cancelled", "cancellation verdict");
+    check(thinking.verdict("constraint_failure", "serial-host").status == "failed", "constraint failure verdict");
+    ConstraintSelection accepting(spec, trie, tokenizer);
+    row.assign(row.size(), -100); row['{'] = 1; accepting.commit(accepting.select(row, accepting.prepare()));
+    row['{'] = -100; row['}'] = 1; accepting.commit(accepting.select(row, accepting.prepare()));
+    const auto budget = accepting.verdict("length", "serial-host");
+    check(budget.status == "incomplete" && budget.accepting && budget.reason == "max_output_tokens", "accepting budget boundary is still incomplete");
+}
+
 int main() try {
+    {
+        GenerationTicket ticket;
+        check(ticket.progress().phase == GenerationPhase::queued, "ticket starts queued");
+        for (std::uint64_t n = 0; n <= 100; ++n) ticket.report_progress({GenerationPhase::prefill, n, 10, 110});
+        const auto progress = ticket.progress();
+        check(progress.prefilled_tokens == 100 && progress.cached_tokens == 10 && progress.total_tokens == 110, "ticket coalesces completed units");
+        const std::array<std::uint32_t, 1> token{42};
+        ticket.publish(token);
+        check(ticket.progress().phase == GenerationPhase::decode && ticket.progress().prefilled_tokens == 100, "first token changes phase only");
+        bool done = false;
+        check(ticket.wait(std::chrono::milliseconds(0), done) == std::vector<std::uint32_t>{42}, "progress preserves token publication");
+        GenerationTicket silent; silent.publish(token);
+        check(silent.progress().phase == GenerationPhase::queued, "no fabricated engine report");
+    }
     test_batched_queue();
     const auto tokenizer = tiny_tokenizer();
+    test_constraint_selection(tokenizer);
+    test_constraint_row(tokenizer);
+    test_constraint_request_failure();
+    test_constraint_late_cancellation();
     ScriptedEngine engine(tokenizer);
     GenerationQueue queue;
     ApiConfig config;
@@ -197,7 +449,16 @@ int main() try {
     config.stop_tokens = {tokenizer->find("<|im_end|>"), tokenizer->find("<|endoftext|>")};
     config.api_key = "secret";
     config.sse_keepalive_seconds = 0.3;
+    config.engine_progress = true;
+    config.sse_progress_seconds = 0.15;
     ApiService api(config, tokenizer, queue, engine.context_tokens(), false);
+    auto constrained_config = config;
+    constrained_config.engine_constraints = engine.supports_constraints();
+    constrained_config.constraint_execution_routes = engine.constraint_execution_routes();
+    ApiService constrained_api(constrained_config, tokenizer, queue, engine.context_tokens(), true);
+    ApiService constrained_greedy_api(constrained_config, tokenizer, queue, engine.context_tokens(), false);
+    constrained_config.stream_receipts = false;
+    ApiService constrained_quiet_api(constrained_config, tokenizer, queue, engine.context_tokens(), true);
     auto off_config = config;
     off_config.capabilities = false; off_config.responses = false;
     ApiService off_api(off_config, tokenizer, queue, engine.context_tokens(), false);
@@ -206,6 +467,8 @@ int main() try {
     ApiService legacy_api(legacy_config, tokenizer, queue, engine.context_tokens(), false);
     auto quiet_config = config; quiet_config.sse_keepalive_seconds = 0;
     ApiService quiet_api(quiet_config, tokenizer, queue, engine.context_tokens(), false);
+    auto progress_off_config = config; progress_off_config.sse_progress_seconds = 0;
+    ApiService progress_off_api(progress_off_config, tokenizer, queue, engine.context_tokens(), false);
     auto sample_config = config; sample_config.sampling_policy = "sample";
     sample_config.capabilities_extra = [](Json& doc) { doc.set("engine_feature", Json(true)); };
     ApiService sample_api(sample_config, tokenizer, queue, engine.context_tokens(), true);
@@ -219,8 +482,12 @@ int main() try {
     http_config.port = 0;
     HttpServer server(http_config, [&](const HttpRequest& r, HttpResponseWriter& w) {
         const auto mode = r.header("x-test-config");
-        if (mode == "off") off_api.handle(r, w);
+        if (mode == "constraints") constrained_api.handle(r, w);
+        else if (mode == "constraints-greedy") constrained_greedy_api.handle(r, w);
+        else if (mode == "constraints-quiet") constrained_quiet_api.handle(r, w);
+        else if (mode == "off") off_api.handle(r, w);
         else if (mode == "legacy") legacy_api.handle(r, w);
+        else if (mode == "progress-off") progress_off_api.handle(r, w);
         else if (mode == "quiet") quiet_api.handle(r, w);
         else if (mode == "defaults") defaults_api.handle(r, w);
         else if (mode == "sample") sample_api.handle(r, w);
@@ -249,6 +516,152 @@ int main() try {
     };
 
     try {
+    {
+        const std::string mode = auth + "X-Test-Config: constraints\r\n";
+        const std::string quiet = auth + "X-Test-Config: constraints-quiet\r\n";
+        const std::string expected = " \n{\"a\":\"<tool_call> </think> caf\xC3\xA9\"}";
+        const auto schema = parse_json(R"({"type":"object","properties":{"a":{"type":"string"}},"required":["a"],"additionalProperties":false})");
+        const auto validate = [&](const std::string& answer) {
+            const auto parsed = parse_json(answer);
+            check(at(parsed, "a").as_string() == "<tool_call> </think> caf\xC3\xA9", "marker bytes and lowest-id tie retained");
+            auto program = compile_json_schema(schema); ConstraintCursor cursor(program);
+            cursor = advance_token(cursor, answer); check(cursor.complete(), "answer independently validates against schema");
+        };
+        const auto verdict = [&](const Json& out, const std::string& status) {
+            const auto& v = at(at(out, "strix"), "constraint");
+            check(at(v, "status").as_string() == status && at(v, "execution").as_string() == "serial-host", "engine constraint verdict");
+            check(at(v, "selection").as_string() == "greedy-lowest-id", "selection identity");
+        };
+        for (bool thinking : {false, true}) for (bool schema_mode : {false, true}) {
+            Json format = parse_json(R"({"type":"json_object"})");
+            Json chat_format = format;
+            if (schema_mode) {
+                format.set("type", Json("json_schema")); format.set("name", Json("answer")); format.set("schema", schema); format.set("strict", Json(false));
+                chat_format = parse_json(R"({"type":"json_schema"})");
+                Json envelope = format; chat_format.set("json_schema", envelope);
+            }
+            auto chat = parse_json(R"({"messages":[{"role":"user","content":"JSON"}],"max_tokens":256})");
+            chat.set("enable_thinking", Json(thinking)); chat.set("response_format", chat_format);
+            auto responses = parse_json(R"({"input":"JSON","max_output_tokens":256})");
+            responses.set("enable_thinking", Json(thinking)); Json text = Json::object(); text.set("format", format); responses.set("text", text);
+            const auto chat_reply = http(port, "POST", "/v1/chat/completions", chat.dump(), mode);
+            check(chat_reply.status == 200, "constrained chat admitted");
+            const auto c = parse_json(chat_reply.body); verdict(c, "complete");
+            const auto answer = at(at(first_choice(c), "message"), "content").as_string();
+            check(answer == expected, "exact constrained chat bytes incl leading whitespace"); validate(answer);
+            const auto response_reply = http(port, "POST", "/v1/responses", responses.dump(), mode);
+            check(response_reply.status == 200, "constrained Responses admitted");
+            const auto r = parse_json(response_reply.body); verdict(r, "complete");
+            check(at(r, "status").as_string() == "completed", "completed constrained Responses");
+            const auto& output = at(r, "output").as_array();
+            check(at(at(output.back(), "content").as_array().front(), "text").as_string() == answer, "chat and Responses bytes match");
+            const auto prompts = engine.prompts(); check(prompts[prompts.size()-1].first == prompts[prompts.size()-2].first, "constrained endpoint prompt IDs equal");
+            chat.set("stream", Json(true)); responses.set("stream", Json(true));
+            for (const auto& headers : {mode, quiet}) {
+                const auto cs = http(port, "POST", "/v1/chat/completions", chat.dump(), headers);
+                check(stream_text(cs.body, nullptr, nullptr, nullptr, nullptr) == answer, "chat SSE bytes equal nonstream bytes");
+                const auto events = sse_data(cs.body); verdict(events.front(), "in_progress"); verdict(events.back(), "complete");
+                if (headers == quiet) check(at(events.front(), "strix").size() == 1 && at(events.back(), "strix").size() == 1, "receipts off retains only mandatory constraint metadata");
+                const auto rs = sse_data(http(port, "POST", "/v1/responses", responses.dump(), headers).body);
+                std::string joined;
+                for (const auto& event : rs) if (at(event, "type").as_string() == "response.output_text.delta") joined += at(event, "delta").as_string();
+                check(joined == answer, "Responses SSE bytes equal nonstream bytes");
+                verdict(at(rs.front(), "response"), "in_progress"); verdict(at(rs.back(), "response"), "complete");
+            }
+            chat.set("stream", Json(false)); chat.set("max_tokens", Json(1));
+            const auto cut = parse_json(http(port, "POST", "/v1/chat/completions", chat.dump(), quiet).body); verdict(cut, "incomplete");
+            check(at(first_choice(cut), "finish_reason").as_string() == "length", "chat budget keeps finish vocabulary");
+            responses.set("stream", Json(false)); responses.set("max_output_tokens", Json(1));
+            const auto cut_r = parse_json(http(port, "POST", "/v1/responses", responses.dump(), quiet).body); verdict(cut_r, "incomplete");
+            check(at(cut_r, "status").as_string() == "incomplete" && at(at(cut_r, "incomplete_details"), "reason").as_string() == "max_output_tokens", "Responses budget verdict");
+        }
+        for (const bool response_endpoint : {false, true}) {
+            const std::string path = response_endpoint ? "/v1/responses" : "/v1/chat/completions";
+            auto body = response_endpoint ? parse_json(R"({"input":"JSON"})") : parse_json(R"({"messages":[{"role":"user","content":"JSON"}]})");
+            const auto set_format = [&](const Json& f) {
+                if (response_endpoint) { Json text = Json::object(); text.set("format", f); body.set("text", text); }
+                else body.set("response_format", f);
+            };
+            const auto before = engine.prompts().size();
+            auto bad_schema = parse_json(R"({"type":"json_schema","name":"answer","schema":{"type":"object","properties":{"age":{"type":"integer","minimum":0}}},"strict":false})");
+            Json envelope = bad_schema;
+            if (!response_endpoint) { envelope = parse_json(R"({"type":"json_schema"})"); envelope.set("json_schema", bad_schema); }
+            set_format(envelope);
+            auto error = parse_json(http(port, "POST", path, body.dump(), mode).body);
+            const auto& e = at(error, "error");
+            check(at(e, "param").as_string() == (response_endpoint ? "text.format.schema.properties.age.minimum" : "response_format.json_schema.schema.properties.age.minimum"), "full schema error path");
+            check(at(e, "keyword").as_string() == "minimum" && at(e, "code").as_string() == "unsupported_schema_keyword", "schema error code and keyword");
+            bad_schema.set("strict", Json("yes"));
+            if (!response_endpoint) envelope.set("json_schema", bad_schema); else envelope = bad_schema;
+            set_format(envelope); check(http(port, "POST", path, body.dump(), mode).status == 400, "strict requires boolean");
+            set_format(parse_json(R"({"type":"json_object"})"));
+            check(http(port, "POST", path, body.dump(), auth).status == 400, "unsupported engine refuses constraints");
+            for (const auto& extra : {parse_json(R"({"stop":["x"]})"), parse_json(R"({"temperature":0.5})"), parse_json(R"({"tools":[{"type":"function","name":"f","function":{"name":"f","parameters":{}}}]})")}) {
+                auto request = parse_json(body.dump()); for (const auto& [key, value] : extra.as_object()) request.set(key, value);
+                check(http(port, "POST", path, request.dump(), mode).status == 400, "unsupported constraint combination refused");
+            }
+            check(engine.prompts().size() == before, "constraint refusals never submitted");
+            for (const auto& tools : {Json(), Json::array()}) {
+                auto request = parse_json(body.dump()); request.set("tools", tools);
+                check(http(port, "POST", path, request.dump(), mode).status == 200, "null and empty tools admitted with constraints");
+            }
+            for (const auto& headers : {mode, quiet}) for (const auto& scenario : {"CONSTRAINT_FAILURE", "EXECUTION_ANSWER", "EXECUTION_REASONING"}) {
+                auto request = parse_json(body.dump());
+                const bool execution = std::string(scenario) != "CONSTRAINT_FAILURE";
+                const bool reasoning = std::string(scenario) == "EXECUTION_REASONING";
+                request.set("enable_thinking", Json(reasoning));
+                if (response_endpoint) request.set("input", Json(scenario));
+                else request.set("messages", parse_json(std::string("[{\"role\":\"user\",\"content\":\"") + scenario + "\"}]"));
+                const auto reply = http(port, "POST", path, request.dump(), headers);
+                check(reply.status == 500, "terminal constrained failure retains HTTP 500");
+                const auto failure_body = parse_json(reply.body); verdict(failure_body, "failed");
+                const auto& v = at(at(failure_body, "strix"), "constraint");
+                check(at(v, "reason").as_string() == (execution ? "execution_failure" : "constraint_failure"), "HTTP preserves engine failure reason");
+                check(at(v, "phase").as_string() == (reasoning ? "reasoning" : "answer") &&
+                    at(v, "accepting").as_bool() == (execution && !reasoning), "HTTP preserves engine failure frontier");
+                check(at(failure_body, "error").is_object(), "failure envelope retains error detail");
+                if (headers == quiet) check(at(failure_body, "strix").size() == 1, "mandatory failure verdict with receipts off");
+            }
+        }
+        {
+            auto body = parse_json(R"({"messages":[{"role":"user","content":"JSON"}],"response_format":{"type":"json_object"},"enable_thinking":false,"stop":"","temperature":0.7,"tools":[],"tool_choice":"none"})");
+            const auto reply = http(port, "POST", "/v1/chat/completions", body.dump(), auth + "X-Test-Config: constraints-greedy\r\n");
+            check(reply.status == 200, "effective greedy downgrade, empty stop and disabled tools admitted"); verdict(parse_json(reply.body), "complete");
+        }
+        for (const auto& scenario : {std::string("CONSTRAINT_FAILURE"), std::string("CONSTRAINT_CONTEXT"), std::string("CONSTRAINT_REASON_EOS")}) {
+            auto body = parse_json(R"({"input":"JSON","text":{"format":{"type":"json_object"}},"max_output_tokens":128})");
+            body.set("input", Json(scenario));
+            const bool failed = scenario == "CONSTRAINT_FAILURE";
+            const std::string status = failed ? "failed" : "incomplete";
+            const std::string reason = failed ? "constraint_failure" : scenario == "CONSTRAINT_CONTEXT" ? "context" : "reasoning_eos";
+            for (const bool stream : {false, true}) {
+                body.set("stream", Json(stream));
+                const auto reply = http(port, "POST", "/v1/responses", body.dump(), quiet);
+                if (failed && !stream) {  // a failure is not a reply: 500, as for unconstrained requests
+                    check(reply.status == 500, "non-streamed constraint failure answers 500");
+                    continue;
+                }
+                const auto events = stream ? sse_data(reply.body) : std::vector<Json>{};
+                const auto terminal = stream ? at(events.back(), "response") : parse_json(reply.body);
+                verdict(terminal, status);
+                check(at(terminal, "status").as_string() == status, "Responses terminal failure/context/reasoning status");
+                check(at(at(at(terminal, "strix"), "constraint"), "reason").as_string() == reason, "terminal constraint reason retained");
+                if (!failed) check(at(at(terminal, "incomplete_details"), "reason").as_string() == reason, "Responses incomplete reason retained");
+            }
+            auto chat = parse_json(R"({"messages":[{"role":"user","content":"CONSTRAINT_FAILURE"}],"response_format":{"type":"json_object"},"stream":true})");
+            if (failed) {
+                const auto events = sse_data(http(port, "POST", "/v1/chat/completions", chat.dump(), quiet).body);
+                verdict(events.back(), "failed");
+            }
+        }
+        for (const auto& headers : {auth, mode}) {
+            const auto caps = parse_json(http(port, "GET", "/v1/capabilities", "", headers).body);
+            const bool enabled = headers == mode;
+            check(at(caps, "json_object").as_bool() == enabled && at(caps, "json_schema").as_bool() == enabled, "capabilities follow engine execution");
+            check(at(at(caps, "constraints"), "identities").size() == (enabled ? 2U : 0U), "constraint identity inventory");
+        }
+    }
+
     {
         const auto request = [&](const std::string& fields, const std::string& mode = "sample") {
             return http(port, "POST", "/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}],\"max_tokens\":1" + fields + "}",
@@ -376,7 +789,7 @@ int main() try {
             check(at(parse_json(http(port, "GET", path, "", auth).body), "capabilities_id").as_string() == id, "capabilities reference " + std::string(path));
         const auto models = parse_json(http(port, "GET", "/v1/models", "", auth).body);
         check(at(at(models, "data").as_array()[0], "capabilities_id").as_string() == id, "models capabilities reference");
-        for (const char* key : {"json_schema", "strict_tools", "penalties", "logit_bias", "logprobs", "retry", "thinking_budget", "prefill_progress"})
+        for (const char* key : {"json_schema", "strict_tools", "penalties", "logit_bias", "logprobs", "retry", "thinking_budget"})
             check(!at(doc, key).as_bool(), "unavailable capability " + std::string(key));
         check(!at(at(doc, "sampling"), "sample").as_bool(), "greedy-only capability");
         for (const auto* field : {"temperature", "top_k", "top_p", "min_p"}) {
@@ -385,6 +798,9 @@ int main() try {
             check(at(entry, "value").as_double() == (std::string(field) == "top_p" ? 1.0 : 0.0), "capabilities builtin value");
         }
         check(ApiConfig{}.sse_keepalive_seconds == 10.0, "default keepalive interval");
+        check(ApiConfig{}.sse_progress_seconds == 1.0 && !ApiConfig{}.engine_progress, "default progress policy");
+        const auto& progress = at(at(doc, "stream"), "progress");
+        check(at(progress, "interval_seconds").as_double() == config.sse_progress_seconds && at(progress, "engine_reports").as_bool() && at(doc, "prefill_progress").as_bool(), "progress capability");
         const auto sampled = parse_json(http(port, "GET", "/v1/capabilities", "", auth + "X-Test-Config: sample\r\n").body);
         check(at(at(sampled, "sampling"), "sample").as_bool() && at(sampled, "engine_feature").as_bool() && at(sampled, "capabilities_id").as_string() != id, "sampling capabilities and engine hook");
         const auto rejected = parse_json(http(port, "GET", "/v1/capabilities", "", auth + "X-Test-Config: reject\r\n").body);
@@ -567,6 +983,57 @@ int main() try {
         for (const char* route : {"/v1/chat/completions", "/v1/messages", "/v1/completions", "/v1/responses"}) {
             auto request = parse_json(R"({"stream":true,"max_tokens":1000,"return_token_ids":true})");
             const std::string path = route;
+            if (path == "/v1/responses") request.set("input", Json("PROGRESS"));
+            else if (path == "/v1/completions") request.set("prompt", Json("PROGRESS"));
+            else request.set("messages", parse_json(R"([{"role":"user","content":"PROGRESS"}])"));
+            const auto active = http(port, "POST", path, request.dump(), auth);
+            const auto off = http(port, "POST", path, request.dump(), auth + "X-Test-Config: progress-off\r\n");
+            request.set("strix", parse_json(R"({"progress":false})"));
+            const auto disabled = http(port, "POST", path, request.dump(), auth);
+            check(off.body.find(": progress ") == std::string::npos && disabled.body.find(": progress ") == std::string::npos, "progress off switches " + path);
+            std::int64_t prefilled = 0, cached = 0;
+            bool saw_prefill = false, saw_decode = false;
+            for (auto pos = active.body.find(": progress "); pos != std::string::npos; pos = active.body.find(": progress ", pos + 1)) {
+                const auto value = parse_json(active.body.substr(pos + 11, active.body.find("\n\n", pos) - pos - 11));
+                const auto n = at(value, "prefilled_tokens").as_int(), c = at(value, "cached_tokens").as_int(), t = at(value, "total_tokens").as_int();
+                check(n >= prefilled && c >= cached && n + c <= t, "progress counters " + path);
+                check(value.dump() == "{\"phase\":\"" + at(value, "phase").as_string() + "\",\"prefilled_tokens\":" + std::to_string(n) + ",\"cached_tokens\":" + std::to_string(c) + ",\"total_tokens\":" + std::to_string(t) + "}", "compact ordered progress JSON " + path);
+                prefilled = n; cached = c;
+                if (at(value, "phase").as_string() == "prefill") { check(!saw_decode, "progress phase order " + path); saw_prefill = true; }
+                else { check(saw_prefill, "prefill before decode " + path); saw_decode = true; }
+            }
+            check(saw_prefill && saw_decode, "progress phases " + path);
+            check(active.body.find(": keepalive") == std::string::npos, "progress resets keepalive " + path);
+            const auto a = sse_data(active.body), b = sse_data(off.body), c = sse_data(disabled.body);
+            const std::function<Json(const Json&)> payload = [&](const Json& value) -> Json {
+                if (value.is_array()) { Json out = Json::array(); for (const auto& v : value.as_array()) out.push(payload(v)); return out; }
+                if (!value.is_object()) return value;
+                Json out = Json::object();
+                for (const auto& [key, v] : value.as_object())
+                    if (key != "id" && key != "item_id" && key != "created" && key != "created_at" && key != "strix") out.set(key, payload(v));
+                return out;
+            };
+            check(a.size() == b.size() && a.size() == c.size(), "progress data count " + path);
+            for (std::size_t i = 0; i < a.size() && i < b.size() && i < c.size(); ++i) {
+                check(payload(a[i]).dump() == payload(b[i]).dump() && payload(a[i]).dump() == payload(c[i]).dump(), "progress data events identical " + path);
+                // IDs and timestamps are request-local; compare the generation payloads and final token IDs.
+                for (const char* key : {"choices", "delta", "token_ids"})
+                    if (const auto* v = a[i].find(key)) check(b[i].find(key) && c[i].find(key) && v->dump() == at(b[i], key).dump() && v->dump() == at(c[i], key).dump(), "progress data unchanged " + path);
+            }
+            const auto ids = [&](const std::vector<Json>& values) {
+                const auto& last = values.back();
+                return at(path == "/v1/responses" ? at(at(last, "response"), "strix") : at(last, "strix"), "token_ids").dump();
+            };
+            check(ids(a) == ids(b) && ids(a) == ids(c), "progress token IDs identical " + path);
+            request.set("stream", Json(false)); request.set("strix", Json::object());
+            const auto plain = http(port, "POST", path, request.dump(), auth);
+            check(plain.body.find(": progress ") == std::string::npos, "non-stream has no progress " + path);
+        }
+    }
+    {
+        for (const char* route : {"/v1/chat/completions", "/v1/messages", "/v1/completions", "/v1/responses"}) {
+            auto request = parse_json(R"({"stream":true,"max_tokens":1000,"return_token_ids":true})");
+            const std::string path = route;
             if (path == "/v1/responses") request.set("input", Json("SLOW"));
             else if (path == "/v1/completions") request.set("prompt", Json("SLOW"));
             else request.set("messages", parse_json(R"([{"role":"user","content":"SLOW"}])"));
@@ -577,6 +1044,7 @@ int main() try {
             std::size_t opening = 0;
             for (auto at_ = active.body.find("data: "); at_ < keepalive; at_ = active.body.find("data: ", at_ + 1)) ++opening;
             const std::size_t expected = path == "/v1/responses" ? 2U : 1U;
+            check(active.body.find(": progress ") == std::string::npos, "no fabricated progress " + path);
             check(keepalive != std::string::npos && opening == expected, "keepalive before the first generated text " + path);
             const auto quiet = http(port, "POST", path, request.dump(), auth + "X-Test-Config: quiet\r\n");
             request.set("strix", parse_json(R"({"keepalive":false})"));

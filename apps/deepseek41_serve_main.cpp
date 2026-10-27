@@ -171,6 +171,7 @@ struct Args {
     std::uint32_t pool = 0;  // BatchForwardOptions::pool_positions (0: every slot owns `context` positions)
     std::uint32_t default_max_tokens = 1024;
     bool http_responses = true, http_capabilities = true, http_stream_receipts = true;  // ApiConfig defaults (on)
+    double http_sse_progress_interval = 1.0;
     double http_sse_keepalive = 10.0;                                                    // seconds, 0: off
     std::uint32_t import_parked = 1;  // imported states parked in slots at most (POST /admin/import-state)
     std::uint32_t import_frames_port = 0;  // --import-frames PORT: the same imports as strix::handoff sessions (0: off)
@@ -1470,6 +1471,7 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
     config.capabilities = a.http_capabilities;
     config.stream_receipts = a.http_stream_receipts;
     config.sse_keepalive_seconds = a.http_sse_keepalive;
+    config.sse_progress_seconds = a.http_sse_progress_interval;
     config.engine_description = "deepseek41 engine group (2 ranks, EP experts" + std::string(a.tp ? " + TP attention" : "") + "), " +
                                 std::to_string(a.slots) + " slots, greedy, exact per request";
     config.stop_tokens = {tokenizer->eos_token()};
@@ -2803,6 +2805,13 @@ int main(int argc, char** argv) try {
             const auto v = next();
             if (v != "on" && v != "off") throw std::invalid_argument(s + " requires on|off");
             (s == "--http-responses" ? a.http_responses : s == "--http-capabilities" ? a.http_capabilities : a.http_stream_receipts) = v == "on";
+        }
+        else if (s == "--http-sse-progress-interval") {
+            const auto v = next();
+            std::size_t used = 0;
+            a.http_sse_progress_interval = std::stod(v, &used);
+            if (used != v.size() || !std::isfinite(a.http_sse_progress_interval) || a.http_sse_progress_interval < 0.0)
+                throw std::invalid_argument("--http-sse-progress-interval needs seconds >= 0");
         }
         else if (s == "--http-sse-keepalive") {
             const auto v = next();

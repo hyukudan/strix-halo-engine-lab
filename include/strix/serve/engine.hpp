@@ -12,11 +12,30 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace strix::serve {
+
+class ConstraintProgram;
+struct ConstraintSpec {
+    std::shared_ptr<const ConstraintProgram> program;
+    std::vector<std::uint32_t> eos_ids;
+    std::optional<std::uint32_t> end_thinking_id;
+    bool starts_in_reasoning = false;
+    std::string identity; // "json-object" or "strix-json-schema-v1"
+};
+
+// Reported by the executing engine, never inferred from decoded output.
+struct ConstraintVerdict {
+    std::string status = "in_progress";
+    bool accepting = false;
+    std::string phase = "answer";
+    std::string reason;
+    std::string execution;
+};
 
 // Armed instrumentation: one process-wide word, unarmed until a GET /metrics or GET /api/status?detail=1 arms it
 // (ApiService). The arming expires: each arming request carries its service's expiry (ApiConfig::observe_expiry_seconds:
@@ -50,9 +69,19 @@ struct SamplingParameters {
     bool seeded = false;
 };
 
+// A coalesced host snapshot: computed prefill and restored cache counts are separate.
+enum class GenerationPhase { queued, prefill, decode };
+struct GenerationProgress {
+    GenerationPhase phase = GenerationPhase::queued;
+    std::uint64_t prefilled_tokens = 0, cached_tokens = 0, total_tokens = 0;
+    bool operator==(const GenerationProgress&) const = default;
+};
+
 // One generation on the engine. on_tokens runs on the engine thread after each completed decode
 // step with the newly verified tokens (stop tokens included); returning false stops generation.
 struct GenerationJob {
+    std::function<void(GenerationProgress)> on_progress; // optional, host-only completed prefill units
+    std::shared_ptr<const ConstraintSpec> constraint; // null: existing unconstrained route
     std::vector<std::uint32_t> prompt;
     // chat requests: the prompt's first tokens that render the system prompt and the tools (a prefix every turn of the
     // conversation, and often other conversations, repeat: a prefix cache may snapshot there); 0: none known
@@ -84,6 +113,7 @@ struct GenerationJob {
 };
 
 struct GenerationStats {
+    std::optional<ConstraintVerdict> constraint;
     std::uint64_t prompt_tokens = 0, cached_tokens = 0, generated_tokens = 0;
     std::uint64_t cycles = 0, proposed = 0, accepted = 0;
     // Context n-gram extension rows proposed / accepted (0 when it did not run or never opened).
@@ -106,6 +136,14 @@ struct GenerationStats {
     std::vector<std::pair<std::string, std::string>> engine_extra;
 };
 
+// A request-local failure preserves its terminal receipt without poisoning the engine.
+class GenerationRequestError : public std::runtime_error {
+public:
+    GenerationRequestError(GenerationStats result, const std::string& message)
+        : std::runtime_error(message), stats(std::move(result)) {}
+    GenerationStats stats;
+};
+
 class GenerationEngine {
 public:
     virtual ~GenerationEngine() = default;
@@ -113,6 +151,8 @@ public:
     [[nodiscard]] virtual std::uint64_t context_tokens() const = 0;
     // The sampling modes this engine executes; others are rejected or downgraded by the API.
     [[nodiscard]] virtual bool supports_sampling() const { return false; }
+    [[nodiscard]] virtual bool supports_constraints() const { return false; }
+    [[nodiscard]] virtual std::vector<std::string> constraint_execution_routes() const { return {}; }
 };
 
 // A request in flight: the engine thread publishes tokens into it and the HTTP thread drains them.
@@ -124,9 +164,11 @@ public:
     // Waits for new tokens or completion (or the timeout); returns the new tokens.
     // wake_on_cancel false: a cancellation does not end the wait (a caller that cancelled waits for the finish)
     std::vector<std::uint32_t> wait(std::chrono::milliseconds timeout, bool& done, bool wake_on_cancel = true);
+    [[nodiscard]] GenerationProgress progress() const;
     [[nodiscard]] GenerationStats stats() const;
     [[nodiscard]] std::string error() const;
-    // Engine side.
+    // Engine side. Progress replaces the snapshot without allocating or waking the HTTP thread.
+    void report_progress(GenerationProgress progress);
     bool publish(std::span<const std::uint32_t> tokens);
     void finish(GenerationStats stats, std::string error = {});
     [[nodiscard]] std::uint64_t queue_position() const noexcept { return queue_position_.load(); }
@@ -139,6 +181,7 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable changed_;
     std::vector<std::uint32_t> pending_;
+    GenerationProgress progress_;
     GenerationStats stats_;
     std::string error_;
     bool done_ = false;

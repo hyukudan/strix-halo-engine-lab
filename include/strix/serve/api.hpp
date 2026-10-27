@@ -27,7 +27,13 @@ struct ApiConfig {
     bool capabilities = true;
     bool responses = true;
     bool stream_receipts = true;
-    double sse_keepalive_seconds = 10.0;      // 0: no SSE comments
+    // Resolved engine support: enable only after every constrained selection path executes it.
+    bool engine_constraints = false;
+    // From GenerationEngine::constraint_execution_routes(); the first route handles new requests.
+    std::vector<std::string> constraint_execution_routes;
+    double sse_keepalive_seconds = 10.0;      // 0: no keepalive comments
+    double sse_progress_seconds = 1.0;       // 0: no progress comments
+    bool engine_progress = false;           // engine reports completed prefill units
     std::function<void(Json&)> capabilities_extra; // optional engine members, included in the content hash
     std::vector<std::uint32_t> stop_tokens;  // generation ends at any of these (not emitted)
     std::size_t recent_requests = 50;

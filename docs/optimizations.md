@@ -447,6 +447,26 @@ reproduces it.
   and timings (GPU gate).
 - **Off switch:** `--http-responses off`, `--http-capabilities off`, `--http-stream-receipts off`, `--http-sse-keepalive 0`
 
+<a id="qwen-serve-constraints"></a>
+
+### Constrained JSON output
+
+**Engine:** `qwen`. **Control:** `--http-constraints`. **Default:** on (requests opt in with `response_format` /
+`text.format`).
+
+Token selection restricted to a declared JSON language (`json-object` or a `strix-json-schema-v1` schema), greedy, on a
+serial host route for the constrained request only.
+
+- **Preconditions:** `--http-serve`; a request with `response_format` / `text.format` `json_object` or `json_schema`,
+  greedy, no stop strings, no tools.
+- **Automatic selection:** Only requests that ask for it; other requests and other batch slots are unchanged.
+- **Fallback notice:** Unsupported schema keywords, sampling, stop strings or tools are refused with a 400; output is
+  never produced unconstrained in their place.
+- **Exactness evidence:** Constrained output is exact relative to its declared constrained target (masked greedy), not
+  to unconstrained greedy. Unconstrained requests, alone and sharing the batch with constrained ones, keep their token
+  IDs and draft counters (GPU gate).
+- **Off switch:** `--http-constraints off`
+
 ## DeepSeek two-node
 
 ```sh

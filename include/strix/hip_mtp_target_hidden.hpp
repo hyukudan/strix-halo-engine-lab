@@ -3,6 +3,7 @@
 #include "strix/launch_dispatch.hpp"
 #include "strix/serial_session.hpp"
 #include "strix/token_sampling.hpp"
+#include <functional>
 #include <optional>
 #include <span>
 namespace strix {
@@ -45,6 +46,10 @@ struct HipMtpTargetDeferredConfig {
     const SerialSessionStateLayout* state_layout=nullptr;
     AllocationGenerationSource* generations=nullptr;
 };
+// Optional host selection is per-call and never retained by the producer. The
+// callback sees a fully validated finite row and replaces the actual ticket token.
+using HipMtpHostRowSelector = std::function<std::uint32_t(std::span<const float>)>;
+
 // Serialized eager target producer. Owns its stream and bounded capture slots;
 // direct dispatch uses that stream through the existing native launch scope.
 // This producer supplies actual target rows; it does not qualify MTP arithmetic.
@@ -91,7 +96,8 @@ public:
     // otherwise it is the finite first-max token and `draft` must be null.
     [[nodiscard]] HipMtpTargetHiddenTicket execute_serial(
         SerialSessionContext&,const ExecutionRuntimeResources&,
-        DirectLaunchDispatcher&,std::uint32_t input_token,const TokenDraft* draft=nullptr);
+        DirectLaunchDispatcher&,std::uint32_t input_token,const TokenDraft* draft=nullptr,
+        const HipMtpHostRowSelector& host_selector={});
     // Sampled decoding (temperature > 0): set once; later serial rows select by it.
     void set_token_sampler(std::shared_ptr<TokenSampler>);
     // Serving several requests on one producer: the sampler of the next request (null: first-max), on an idle
@@ -111,11 +117,14 @@ public:
     // first-max rule. The caller guarantees both come from that completed block (the tiled
     // prefill computes every row exactly as a serial row of the same execution).
     [[nodiscard]] HipMtpTargetHiddenTicket adopt_prefill_row(const SerialSessionContext& session,
-        std::uint32_t input_token,MtpDeviceView hidden,std::span<const float> logits);
+        std::uint32_t input_token,MtpDeviceView hidden,std::span<const float> logits,
+        const HipMtpHostRowSelector& host_selector={});
     [[nodiscard]] HipMtpTargetHiddenTicket hand_off_prompt(SerialSessionContext&,
         const HipMtpTargetHiddenTicket& pending,const ExecutionRuntimeResources& prompt_resources,
         const ExecutionRuntimeResources& decode_resources);
 private:
+    [[nodiscard]] HipMtpTargetHiddenTicket execute_serial_unselected(
+        SerialSessionContext&,const ExecutionRuntimeResources&,DirectLaunchDispatcher&,std::uint32_t,const TokenDraft*);
     HipMtpTargetHidden();
     friend class HipMtpTargetHiddenTicket;
     friend struct HipMtpTargetHiddenTicket::Lease;

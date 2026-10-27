@@ -603,6 +603,7 @@ Full item lists, preconditions, notices and evidence: [optimization catalog](doc
 | MiniMax: prefill/transport | v4 core, batching, pipeline, CRC overlap | On/auto | Prefill bundle: 8K TTFT −20% | Bitwise gates | Per-item off values; see catalog |
 | GLM: R1b decode | Faster FP32 summation identity | On | 41.93–41.96 vs R1 47.33–47.48 ms/token | Own identity; differs from R1 | `--identity r1` |
 | GLM: exact chunked prefill | R1 gemv identity, MoE/MLA/indexer kernels, two-layer pipeline with async exchange, 4096-row chunks | Auto (18 env items) | 8K: 30.1 s (273 tok/s); 32K: 128.4 s (255 tok/s) | R1 bitwise | `--prefill ref`; `--baseline` |
+| Qwen server: constrained JSON output | `json_object` / JSON-schema answers valid by construction (greedy, serial host route) | On (opt-in per request) | Usability (no speed claim) | Exact to its constrained target; other requests unchanged | `--http-constraints off`; [catalog](docs/optimizations.md#qwen-serve-constraints) |
 | Qwen/DeepSeek server: API surface | Stateless `/v1/responses`, `/v1/capabilities`, applied policy (filters, echoed seed) in every stream, SSE keepalive | On | Usability (no speed claim) | Same token IDs on/off | `--http-responses off` etc.; [catalog](docs/optimizations.md#qwen-serve-api) |
 
 Master baselines: Qwen `--baseline` / `STRIX_BASELINE=1`; DeepSeek pair `STRIX_DS41_BASELINE=1`;
