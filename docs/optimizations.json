@@ -759,6 +759,17 @@
     "doc_anchor": "docs/optimizations.md#rtx-vocab"
   },
   {
+    "engine": "deepseek-rtx",
+    "name": "Automatic scored eviction",
+    "flag_or_env": "--evict lru|scored|auto",
+    "default": "auto",
+    "exact": "Only residency changes: chat token vectors identical across all 8 arms (lru/auto, forced-window and pressure gates).",
+    "gain": "DSpark misses/token 10.55 → 9.08 (−14 %), median +6.4 % tok/s (7 chats); plain decode neutral",
+    "preconditions": "Standalone RTX replica with a tierstream that provides the auto policy (SS_DG_AUTO_EVICT); an older tierstream keeps lru with a notice.",
+    "off_switch": "--evict lru",
+    "doc_anchor": "docs/optimizations.md#rtx-evict-auto"
+  },
+  {
     "engine": "minimax",
     "name": "Wide expert decode",
     "flag_or_env": "STRIX_MMX_MOE_WIDE",

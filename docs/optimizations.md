@@ -1141,6 +1141,22 @@ Select vocabulary directory for the drafter.
 - **Measured gain:** No isolated measurement
 - **Implementation / evidence:** [Standalone defaults and gates](models/deepseek-v4.1/rtx-standalone.md#optimizations-default-on-and-off-switches)
 
+<a id="rtx-evict-auto"></a>
+
+### Automatic scored eviction
+
+**Engine:** `deepseek-rtx`. **Control:** `--evict lru|scored|auto`. **Default:** auto.
+
+After a DSpark verify window, evict experts by the tierstream's learned score; after one-row plain steps keep the LRU walk.
+
+- **Preconditions:** Standalone RTX replica with a tierstream that provides the auto policy (SS_DG_AUTO_EVICT); an older tierstream keeps lru with a notice.
+- **Automatic selection:** auto when the linked tierstream has the policy; explicit `--evict` wins; `--baseline` = lru.
+- **Fallback notice:** Older tierstream: one notice, lru.
+- **Exactness evidence:** Only residency changes: chat token vectors identical across all 8 arms (lru/auto, forced-window and pressure gates).
+- **Off switch:** --evict lru
+- **Measured gain:** DSpark misses/token 10.55 → 9.08 (−14 %), median +6.4 % tok/s (7 chats); plain decode neutral
+- **Implementation / evidence:** [Standalone defaults and gates](models/deepseek-v4.1/rtx-standalone.md#optimizations-default-on-and-off-switches)
+
 ### Lean decode state
 
 **Engine:** `deepseek-rtx`. **Control:** `--lean-state`. **Default:** ON.

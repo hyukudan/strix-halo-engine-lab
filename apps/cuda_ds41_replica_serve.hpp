@@ -35,6 +35,15 @@ struct RequestReject : std::runtime_error {
 
 // The options a request may carry (section 2): everything else needs a new worker. Values only change what the next
 // phases do; the per-request reset restores every one of them to the launch value first.
+inline const char* eviction_error(const std::string& policy, bool supported, bool auto_supported = false) {
+    if (policy != "lru" && policy != "scored" && policy != "auto") return "--evict lru | scored | auto";
+    if (policy == "auto" && (!supported || !auto_supported))
+        return "--evict auto: this tierstream has no ts_dg_end_rows; rebuild against a supporting library";
+    if (policy == "scored" && !supported)
+        return "--evict scored: this tierstream has no ts_dg_set_policy; rebuild against a supporting library";
+    return nullptr;
+}
+
 inline const std::set<std::string>& runtime_options() {
     static const std::set<std::string> s{
         "--phases", "--steps", "--ref", "--chats", "--chat-prompt", "--chat-steps", "--seqs-file", "--json", "--timeline",
@@ -44,7 +53,7 @@ inline const std::set<std::string>& runtime_options() {
         "--draft-vocab", "--winpf-l1-cap", "--winpf-pmin", "--winpf-prior-cap", "--winpf-prior-pmin", "--winpf-revert",
         "--wb-alt", "--import-state", "--reset-cache", "--env", "--qual",
         // runtime when the linked tierstream has ts_dg_set_sched (the worker refuses them otherwise)
-        "--wb-defer", "--no-wb-defer", "--flush-ready", "--no-flush-ready"};
+        "--wb-defer", "--no-wb-defer", "--flush-ready", "--no-flush-ready", "--evict", "--census", "--no-census"};
     return s;
 }
 inline bool is_runtime_option(const std::string& a) { return runtime_options().count(a) != 0U; }
@@ -58,7 +67,7 @@ inline bool is_request_env(const std::string& name) {
 // here only tokens starting with "--" that are not values of the previous option are checked).
 inline void check_request_args(const std::vector<std::string>& args) {
     static const std::set<std::string> flags{"--chat-logits", "--controller-prior-alt", "--controller-learn", "--qual", "--wb-defer",
-                                             "--no-wb-defer", "--flush-ready", "--no-flush-ready"};
+                                             "--no-wb-defer", "--flush-ready", "--no-flush-ready", "--census", "--no-census"};
     for (std::size_t i = 0; i < args.size(); ++i) {
         const auto& a = args[i];
         if (a.rfind("--", 0) != 0) throw RequestReject("unexpected argument '" + a + "' (options only)");
