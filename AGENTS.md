@@ -69,6 +69,10 @@ Do not add individual gains from different workloads or call a changed numerical
 Qwen long-context answers are checked with `tools/qualification/longctx_fidelity/` (generator ground truth,
 CPU tests first; its README states what a pilot does and does not establish). Keep comparative-runtime
 reference results out of that public kit.
+Kernel/IOMMU settings (including the optional GPU PerfOpt, `amdgpu.iommu_perfopt`) are host decisions made
+by the machine owner as root; record the running kernel and that parameter with any timing receipt, never
+disable the IOMMU to gain speed (USB4 controllers must stay translated), and compare PerfOpt only on vs off
+on the same kernel.
 Keep deployment endpoints, machine/account identifiers, private paths, prompts, receipts and unpublished
 benchmark/review material out of public changes. Use relative asset placeholders in commands and public
 implementation or qualification contracts for links.

@@ -1575,5 +1575,16 @@
     "preconditions": "MiniMax build and supported expert layout.",
     "off_switch": "STRIX_MINIMAX_GU4_SCALAR=OFF at CMake configure time",
     "doc_anchor": "docs/optimizations.md#mm-gu4"
+  },
+  {
+    "engine": "platform",
+    "name": "GPU IOMMU PerfOpt (optional)",
+    "flag_or_env": "amdgpu.iommu_perfopt (kernel module parameter)",
+    "default": "not used (optional kernel)",
+    "exact": "Same kernel build, PerfOpt on vs amdgpu.iommu_perfopt=0, interleaved boots: tokens identical in every arm; GPU identity domain, USB4 NHIs still DMA-FQ, iommu_dma_protection=1, no AMD-Vi fault lines after two-node traffic.",
+    "gain": "Qwen 32K prefill +2.9 % / +3.1 % (two repeats, one node, same power, equal or lower GPU clock); DeepSeek two-node decode within ±1 % with one node on PerfOpt, both-node run pending",
+    "preconditions": "Kernel with AMD's PerfOpt patches (Linux 7.4 or the IOMMU tree) and the GPU in an identity domain; dedicated inference host without GPU unbind, VFIO, kexec/kdump or suspend.",
+    "off_switch": "options amdgpu iommu_perfopt=0, or boot the previous kernel",
+    "doc_anchor": "docs/optimizations.md#platform-perfopt"
   }
 ]
