@@ -4,9 +4,11 @@
 // summary word) must be identical. Default mode: the bitwise cases. "bench": timing per form.
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
+#include "strix/deferred_moe_status.hpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <chrono>
 #include <cstdint>
@@ -124,9 +126,9 @@ struct Fixture {
     static constexpr unsigned H = 2560U, I = 640U, K = 10U;
     Case c; hipStream_t stream = nullptr;
     a8::Request request;
-    Buffer gate, up, down, input, routes, weights, codes, deltas, sums, status, output, clear, dcodes, ddeltas, dsums, rawdots, csr;
+    Buffer gate, up, down, input, routes, weights, codes, deltas, sums, status, output, clear, dcodes, ddeltas, dsums, rawdots, csr, admission;
     kr::PrefillRows view;
-    explicit Fixture(const Case& cs) : c(cs) {
+    explicit Fixture(const Case& cs) : c(cs), admission(1, 4U) {
         check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create stream");
         request.enabled = true; request.input = a8::InputKind::bf16;
         request.shape = {H, I, c.experts, K, c.rows}; request.gate_type = request.up_type = c.gate_type;
@@ -350,6 +352,77 @@ __global__ void reference_merge_kernel_z(kr::PrefillRows v, unsigned* header, un
     }
     acc[out] = current;
     if ((__float_as_uint(current) & 0x7fffffffU) >= 0x7f7f8000U) { atomicOr(status, 8U); atomicOr(header, 8U); }
+}
+// MoE merge+commit: the engine's known_moe_prefill_commit_kernel over the fixture's views (BF16 output rows out16), and the
+// merge+commit candidate built from the engine's own body (src/hip_moe_prefill_commit.inc).
+template <class T> __device__ T* fixture_row(kr::StridedRows<T> v, unsigned r) {
+    return reinterpret_cast<T*>(reinterpret_cast<std::uintptr_t>(v.base) + static_cast<std::uint64_t>(r) * v.stride);
+}
+__global__ void reference_commit_kernel(kr::PrefillRows v, unsigned* header, unsigned row_count, unsigned hidden,
+    kr::StridedRows<std::uint16_t> out16, unsigned* record) {
+    const unsigned failure = header[0];
+    if (blockIdx.x == 0U && blockIdx.y == 0U) {
+        __shared__ unsigned first_bad;
+        if (threadIdx.x == 0U) first_bad = row_count;
+        __syncthreads();
+        for (unsigned r = threadIdx.x; r < row_count; r += blockDim.x)
+            if (*fixture_row(v.status, r)) { atomicMin(&first_bad, r); break; }
+        __syncthreads();
+        if (threadIdx.x == 0U) {
+            if (failure & 7U) for (const auto word : {1U, 2U, 4U, 5U}) header[word] = 0U;
+            if (failure & 7U) for (unsigned word = 8U; word < 24U; ++word) header[word] = 0U;
+            if (first_bad < row_count)
+                strix::merge_deferred_moe_first_error(*reinterpret_cast<strix::DeferredMoeFirstError*>(record),
+                    *fixture_row(v.status, first_bad), strix::DeferredMoeDomain::q4k_a8);
+        }
+    }
+    if (failure) return;
+    const unsigned out = blockIdx.x * blockDim.x + threadIdx.x;
+    if (out < hidden) {
+        const auto bits = __float_as_uint(fixture_row(v.clear, blockIdx.y)[out]);
+        fixture_row(out16, blockIdx.y)[out] = static_cast<std::uint16_t>((bits + 0x7fffU + ((bits >> 16U) & 1U)) >> 16U);
+    }
+}
+using strix::DeferredMoeFirstError;
+using strix::DeferredMoeDomain;
+using strix::merge_deferred_moe_first_error;
+#include "../src/hip_moe_prefill_commit.inc"
+// Adapter to the engine's shared merge_z / logical-commit bodies.
+struct FixtureTailView {
+    kr::StridedRows<const unsigned> routes;
+    kr::StridedRows<const float> route_weights;
+    kr::StridedRows<unsigned> status;
+    kr::StridedRows<float> rawdots, accumulation;
+    kr::StridedRows<std::uint16_t> output;
+};
+__device__ FixtureTailView fixture_tail_view(kr::PrefillRows v, kr::StridedRows<std::uint16_t> output) {
+    return {v.routes, v.route_weights, v.status, v.rawdots, v.clear, output};
+}
+template <bool Acc>
+__global__ void candidate_merge_commit_kernel(kr::PrefillRows v, unsigned* header, unsigned hidden, unsigned experts, unsigned top_k,
+    kr::StridedRows<std::uint16_t> out16) {
+    moe_prefill_merge_z_body<true, Acc>(fixture_tail_view(v, out16), header, hidden, experts, top_k,
+        [](auto v, unsigned r) { return fixture_row(v, r); }, v.unsafe);
+}
+__global__ void candidate_finish_kernel(kr::PrefillRows v, unsigned* header, unsigned row_count, unsigned hidden,
+    kr::StridedRows<std::uint16_t> out16, unsigned* record) {
+    moe_prefill_finish_body<32>(fixture_tail_view(v, out16), header, row_count, hidden, record, v.unsafe,
+        [](auto v, unsigned r) { return fixture_row(v, r); }, [](std::uint16_t* p, float value) {
+            const auto bits=__float_as_uint(value);
+            *p=static_cast<std::uint16_t>((bits+0x7fffU+((bits>>16U)&1U))>>16U);
+        });
+}
+// Post-down fixture mutations must recompute the private proof before selecting a tail.
+// This is test-only: production checks these same values in the CSR count and down epilogue.
+__global__ void fixture_certificate(kr::PrefillRows v, unsigned rows, unsigned hidden, unsigned top_k) {
+    const unsigned t=blockIdx.x*blockDim.x+threadIdx.x;
+    bool bad=false;
+    for (unsigned i=t;i<rows*top_k;i+=gridDim.x*blockDim.x)
+        bad|=(__float_as_uint(fixture_row(v.route_weights,i/top_k)[i%top_k])&0x7fffffffU)>0x3f800000U;
+    for (unsigned i=t;i<rows*top_k*hidden;i+=gridDim.x*blockDim.x)
+        bad|=(__float_as_uint(fixture_row(v.rawdots,i/(top_k*hidden))[i%(top_k*hidden)])&0x7fffffffU)>=0x7b800000U;
+    const unsigned mask=static_cast<unsigned>(__ballot(bad));
+    if(mask&&(threadIdx.x&31U)==0U)atomicOr(v.unsafe,1U);
 }
 const char* const names[] = {"codes", "deltas", "sums", "status", "intermediates", "clear", "down_codes", "down_deltas", "down_sums", "rawdots", "summary"};
 bool extreme_coverage(const Fixture& f);
@@ -969,6 +1042,510 @@ int main(int argc, char** argv) {
             if (mode == "da16" || mode == "small" || mode == "p1da16") { std::printf("da16: %u runs without the DA16 path\n", da16_missing); failed += da16_missing; }
             std::printf("%s: %u comparisons, %u differ -> %s\n", mode.c_str(), cases, failed, failed ? "FAIL" : "PASS");
             return failed ? 1 : 0;
+        }
+        if (mode == "mc") {
+            // B uses unchanged producers/tail; C requests the production certificate chain and uses
+            // the shared engine merge/finish only when the per-call producer witness is true.
+            // Every reproducible failure class is exact, including patterned old output. Racy bases
+            // are separate, never passes; the suite cannot qualify with missing reproducible coverage.
+            unsigned cases = 0, failed = 0, racy = 0, rejected = 0, certified = 0, admitted = 0, unproven = 0, cert_pre = 0, cert_merge = 0, unproven_success = 0, n_success = 0, n_pre = 0;
+            // kind 0: slot 0 weight 1.0, dot = target bits, slots 1..9 dot +0 (sum = target, -0 becomes +0); kind 1: route of
+            // slot 4 set out of range after prefill; kind 2: weight 1+ulp before producers; kinds 3/4:
+            // all ten large dots with aligned or cancelling weights (including zero/subnormal).
+            struct Inject { unsigned row = ~0U, element = 0; std::uint32_t target = 0; unsigned kind = 0; };
+            struct Run { std::vector<unsigned long long> d; std::vector<std::vector<unsigned char>> bytes; unsigned pre = 0, post = 0, unsafe = 0; bool certificate = false; };
+            const char* const tail_names[] = {"status", "csr", "out16", "accumulation", "record"};
+            const auto run = [&](Fixture& f, Buffer& out16, Buffer& record, unsigned rows, int arm, const Inject& inj, std::uint64_t record_init) {
+                Run r;
+                const unsigned hidden=inj.kind==5U?Fixture::H-1U:Fixture::H;
+                kr::set_prefill_core2(0); kr::set_prefill_route(14); kr::set_prefill_da16(1); kr::set_prefill_small(0);
+                for (const auto* b : f.written()) b->poison(f.stream);
+                f.csr.poison(f.stream);
+                std::vector<unsigned char> old_output(out16.bytes);
+                for (std::size_t i=0;i<old_output.size();++i) old_output[i]=static_cast<unsigned char>((i*37U+(i>>8U)*11U+19U)&255U);
+                check(hipMemcpyAsync(out16.base, old_output.data(), out16.bytes, hipMemcpyHostToDevice, f.stream), "patterned old output");
+                f.view.unsafe=arm?static_cast<unsigned*>(f.admission.base):nullptr;
+                check(hipMemcpyAsync(record.base, &record_init, 8U, hipMemcpyHostToDevice, f.stream), "record init");
+                std::array<float,Fixture::K> saved_weights{}, injected_weights{};
+                auto* weight0=static_cast<unsigned char*>(f.weights.base)+(inj.row==~0U?0U:inj.row)*f.weights.stride;
+                if (inj.row!=~0U && inj.kind!=1U) {
+                    check(hipMemcpy(saved_weights.data(),weight0,4U*Fixture::K,hipMemcpyDeviceToHost),"weight save");
+                    injected_weights=saved_weights;
+                    auto& weights=injected_weights;
+                    weights[0]=inj.kind==2U?std::nextafter(1.0F,2.0F):1.0F;
+                    if (inj.kind>=3U) for (unsigned slot=0;slot<Fixture::K;++slot) {
+                        const std::uint32_t bits=inj.kind==3U?0x3f800000U:
+                            slot==8U?0U:slot==9U?1U:(slot&1U)?0xbf800000U:0x3f800000U;
+                        std::memcpy(&weights[slot],&bits,4U);
+                    }
+                    check(hipMemcpyAsync(weight0,weights.data(),4U*Fixture::K,hipMemcpyHostToDevice,f.stream),"weight before producers");
+                }
+                f.enqueue(3, rows);
+                r.certificate=kr::prefill_certificate_produced();
+                if (!kr::prefill_clear_skipped()) throw std::runtime_error("mc: ROUTE 14 did not skip the clear");
+                check(hipStreamSynchronize(f.stream), "mc prefill");
+                if (inj.row != ~0U && inj.kind != 1U) {
+                    auto* row = static_cast<unsigned char*>(f.rawdots.base) + inj.row * f.rawdots.stride;
+                    for (unsigned s = 0; s < Fixture::K; ++s) {
+                        const std::uint32_t v = s == 0U || inj.kind>=3U ? inj.target : 0U;
+                        check(hipMemcpy(row + 4U * (static_cast<std::uint64_t>(s) * Fixture::H + inj.element), &v, 4U, hipMemcpyHostToDevice), "inject");
+                    }
+                }
+                std::uint32_t saved_route = 0;
+                auto* route4 = static_cast<unsigned char*>(f.routes.base) + (inj.row == ~0U ? 0U : inj.row) * f.routes.stride + 16U;
+                if (inj.row != ~0U && inj.kind == 1U) {
+                    check(hipMemcpy(&saved_route, route4, 4U, hipMemcpyDeviceToHost), "route save");
+                    const std::uint32_t bad = f.c.experts;
+                    check(hipMemcpy(route4, &bad, 4U, hipMemcpyHostToDevice), "route inject");
+                }
+                if (r.certificate && inj.kind==2U) {
+                    unsigned upstream=0U;
+                    check(hipMemcpy(&upstream,f.view.unsafe,4U,hipMemcpyDeviceToHost),"weight producer certificate");
+                    if (!upstream) throw std::runtime_error("mc: CSR producer missed weight above one");
+                }
+                if (r.certificate && inj.row != ~0U) {
+                    // Mutation invalidated the earlier proof. Re-run it without clearing earlier producer failures.
+                    hipLaunchKernelGGL(fixture_certificate, dim3(32), dim3(256), 0, f.stream, f.view, rows, Fixture::H, Fixture::K);
+                    check(hipStreamSynchronize(f.stream), "recomputed fixture certificate");
+                }
+                if (r.certificate) check(hipMemcpy(&r.unsafe, f.view.unsafe, 4U, hipMemcpyDeviceToHost), "fixture admission");
+                check(hipMemcpy(&r.pre, f.view.csr.summary, 4U, hipMemcpyDeviceToHost), "pre-merge summary");
+                const dim3 grid((Fixture::H + 255U) / 256U, rows);
+                const kr::StridedRows<std::uint16_t> o{static_cast<std::uint16_t*>(out16.base), out16.stride};
+                auto* rec = static_cast<unsigned*>(record.base);
+                if (arm == 0 || !r.certificate) {
+                    hipLaunchKernelGGL(reference_merge_kernel_z, grid, dim3(256), 0, f.stream, f.view, f.view.csr.summary, hidden, f.c.experts, Fixture::K);
+                    hipLaunchKernelGGL(reference_commit_kernel, grid, dim3(256), 0, f.stream, f.view, f.view.csr.summary, rows, hidden, o, rec);
+                } else {
+                    if (arm == 2) hipLaunchKernelGGL(candidate_merge_commit_kernel<true>, grid, dim3(256), 0, f.stream, f.view, f.view.csr.summary, hidden, f.c.experts, Fixture::K, o);
+                    else hipLaunchKernelGGL(candidate_merge_commit_kernel<false>, grid, dim3(256), 0, f.stream, f.view, f.view.csr.summary, hidden, f.c.experts, Fixture::K, o);
+                    hipLaunchKernelGGL(candidate_finish_kernel, dim3(32), dim3(256), 0, f.stream, f.view, f.view.csr.summary, rows, hidden, o, rec);
+                }
+                check(hipGetLastError(), "mc merge/commit");
+                check(hipStreamSynchronize(f.stream), "mc run");
+                if (inj.row != ~0U && inj.kind == 1U) check(hipMemcpy(route4, &saved_route, 4U, hipMemcpyHostToDevice), "route restore");
+                check(hipMemcpy(&r.post, f.view.csr.summary, 4U, hipMemcpyDeviceToHost), "post-merge summary");
+                if (inj.row!=~0U && inj.kind!=1U) check(hipMemcpy(weight0,saved_weights.data(),4U*Fixture::K,hipMemcpyHostToDevice),"weight restore");
+                r.d = digests(f);
+                r.bytes = {f.status.read(), f.csr.read(), out16.read(), f.clear.read(), record.read()};
+                // Every row has patterned padding; boundary helper also leaves its final logical lane untouched.
+                for (unsigned row=0;row<f.c.rows;++row) for (std::uint64_t i=2ULL*hidden;i<out16.stride;++i)
+                    if (r.bytes[2][row*out16.stride+i]!=old_output[row*out16.stride+i])
+                        throw std::runtime_error("mc: output canary changed");
+                if (r.post && r.bytes[2]!=old_output) throw std::runtime_error("mc: rejected call changed patterned old output");
+                return r;
+            };
+            const auto diff = [](const std::vector<unsigned char>& a, const std::vector<unsigned char>& b, std::size_t& first) {
+                std::size_t n = 0; first = ~std::size_t{0};
+                for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) if (a[i] != b[i]) { if (!n) first = i; ++n; }
+                return n + (a.size() != b.size() ? 1U : 0U);
+            };
+            static std::vector<std::string> keep4; keep4.reserve(256);
+            const auto cmp = [&](Fixture& f, unsigned rows, const std::string& what, const Inject& inj = {}) {
+                Buffer out16(f.c.rows, 2U * Fixture::H + 32U), record(1, 8U);
+                for (const std::uint64_t record_init : {0ULL, 0x40ULL << 32U | 2ULL}) {
+                    const auto base = run(f, out16, record, rows, 0, inj, record_init);
+                    const auto again = run(f, out16, record, rows, 0, inj, record_init);
+                    const bool merge_rejected = base.pre == 0U && base.post != 0U;
+                    const char* cls = base.pre ? "PRE" : merge_rejected ? "MERGE" : "SUCCESS";
+                    if (again.d != base.d || again.bytes != base.bytes || again.post != base.post) {
+                        ++racy; std::printf("  RACY base %s %s rows %u\n", cls, what.c_str(), rows);
+                        continue; // excluded from exact comparisons, and prevents a qualification PASS below
+                    }
+                    rejected += merge_rejected ? 1U : 0U; n_success += base.post == 0U ? 1U : 0U; n_pre += base.pre != 0U ? 1U : 0U;
+                    if (base.post == 0U) {  // the output must have been stored: not the poison image
+                        // At least one active output word must replace the patterned old image.
+                        bool stored=false;
+                        for (unsigned row=0;row<rows;++row) for (unsigned i=0;i<2U*Fixture::H;++i) {
+                            const auto pos=row*out16.stride+i;
+                            stored|=base.bytes[2][pos]!=static_cast<unsigned char>((pos*37U+(pos>>8U)*11U+19U)&255U);
+                        }
+                        if (!stored) throw std::runtime_error("mc: reference output not stored");
+                    }
+                    for (const int arm : {1, 2}) {
+                        const auto got = run(f, out16, record, rows, arm, inj, record_init);
+                        ++cases;
+                        bool bad = got.pre != base.pre || got.post != base.post;
+                        if (got.certificate) {
+                            ++certified; if (got.unsafe) ++unproven; else if (!got.post) ++admitted;
+                            cert_pre+=got.pre!=0U; cert_merge+=got.pre==0U&&got.post!=0U;
+                            unproven_success+=got.unsafe!=0U&&got.post==0U;
+                        }
+                        if (what=="mc reset sequence safe" && (!got.certificate || got.unsafe))
+                            throw std::runtime_error("mc: unsafe word did not reset on the next eligible call");
+                        if (inj.row!=~0U && inj.kind==2U && got.certificate && !got.unsafe)
+                            throw std::runtime_error("mc: weight above one was admitted");
+                        for (std::size_t k = 0; k < 10U; ++k) if (k != 3U && k != 5U && got.d[k] != base.d[k]) {  // upstream views
+                            bad = true; std::printf("  DIFFER %s %s rows %u arm %d: upstream %s\n", cls, what.c_str(), rows, arm, names[k]);
+                        }
+                        for (std::size_t k = 0; k < got.bytes.size(); ++k) {
+                            if (k == 3U && arm == 1 && got.certificate && !got.unsafe && !got.pre) continue;  // mode 1 does not write the accumulation
+                            std::size_t first = 0;
+                            const auto n = diff(got.bytes[k], base.bytes[k], first);
+                            if (!n) continue;
+                            std::printf("  %s %s %s rows %u arm %d record0 %llx: %s %zu bytes differ, first at %zu\n", "DIFFER",
+                                cls, what.c_str(), rows, arm, static_cast<unsigned long long>(record_init), tail_names[k], n, first);
+                            bad = true;
+                        }
+                        failed += bad ? 1U : 0U;
+                    }
+                }
+            };
+            for (unsigned g : {12U, 13U}) for (unsigned d : {7U, 8U}) for (unsigned flavor : {0U, 1U, 2U, 3U, 4U}) {
+                keep4.push_back("mc E40 T48 g" + std::to_string(g) + " d" + std::to_string(d) + " flavor " + std::to_string(flavor));
+                Fixture f({keep4.back().c_str(), 40U, 48U, g, d, flavor, true, true, flavor == 2U});
+                cmp(f, 48U, keep4.back());
+                if (flavor == 0U) cmp(f, 16U, keep4.back());
+            }
+            {
+                keep4.push_back("mc E40 T48 group 16");
+                Case c{keep4.back().c_str(), 40U, 48U, 12U, 7U, 4U, false, false, false, 16U};
+                Fixture f(c); cmp(f, 48U, keep4.back());
+            }
+            for (unsigned g : {12U, 13U}) for (bool bad : {false, true}) {
+                keep4.push_back(std::string("mc crafted T520 g") + std::to_string(g) + (bad ? " bad route" : ""));
+                Case c{keep4.back().c_str(), 512U, 520U, g, 7U, 4U, false, false, false}; c.crafted = true; c.bad_route = bad;
+                Fixture f(c); cmp(f, 520U, keep4.back());
+            }
+            {
+                keep4.push_back("mc crafted full128 T1024");
+                Case c{keep4.back().c_str(), 64U, 1024U, 12U, 8U, 4U, false, false, false}; c.crafted = true; c.full128 = true;
+                Fixture f(c); cmp(f, 1024U, keep4.back());
+            }
+            for (unsigned g : {12U, 13U}) for (unsigned d : {7U, 8U}) {
+                keep4.push_back("mc E512 T2048 g" + std::to_string(g) + " d" + std::to_string(d));
+                Fixture f({keep4.back().c_str(), 512U, 2048U, g, d, 4U, false, true, false, 0U, 1.5});
+                cmp(f, 2048U, keep4.back());
+                Case c{keep4.back().c_str(), 512U, 1024U, g, d, 4U, false, false, false}; c.crafted = true;
+                Fixture fc(c); cmp(fc, 1024U, keep4.back() + " crafted");
+            }
+            {
+                // Injected merge inputs: admitted edges are byte-identical; rejected sums give the base statuses/summary/record.
+                Fixture f({"mc inject E16 T48", 16U, 48U, 12U, 7U, 4U, true, true, false});
+                std::vector<unsigned char> bounded(f.weights.bytes,0U);
+                for (unsigned r=0;r<f.c.rows;++r) for(unsigned slot=0;slot<Fixture::K;++slot) {
+                    const float w=0.5F;
+                    std::memcpy(bounded.data()+r*f.weights.stride+4U*slot,&w,4U);
+                }
+                check(hipMemcpy(f.weights.base,bounded.data(),f.weights.bytes,hipMemcpyHostToDevice),"bounded admission weights");
+                const std::uint32_t targets[] = {0x7b7fffffU, 0xfb7fffffU, 0x7b800000U, 0xfb800000U, 0x7f7f7fffU, 0xff7f7fffU, 0x7f7f8000U, 0xff7f8000U, 0x80000000U, 0x00000001U, 0x80000001U,
+                    0x00800000U, 0x7f800000U, 0xff800000U, 0x7fc12345U, 0xffa00001U, 0x7f7effffU};
+                for (const auto t : targets) for (const unsigned row : {0U, 29U, 47U}) for (const unsigned el : {0U, 255U, 2559U}) {
+                    char b[96]; std::snprintf(b, sizeof b, "mc inject %08x row %u el %u", t, row, el);
+                    keep4.push_back(b);
+                    cmp(f, 48U, keep4.back(), Inject{row, el, t});
+                }
+                cmp(f,48U,"mc helper boundary hidden2559",Inject{~0U,0U,0U,5U});
+                cmp(f,48U,"mc admitted all ten aligned",Inject{0U,0U,0x7b7fffffU,3U});
+                cmp(f,48U,"mc admitted cancellation/zero/subnormal weights",Inject{0U,2559U,0x7b7fffffU,4U});
+                cmp(f,48U,"mc unproven large cancellation",Inject{0U,255U,0x7b800000U,4U});
+                // Repeated calls share one fixture/word: unproven -> safe -> unproven, including changed row counts.
+                cmp(f, 48U, "mc unsafe sequence first", Inject{0U,0U,0x7b800000U});
+                cmp(f, 40U, "mc reset sequence safe");
+                cmp(f, 48U, "mc unsafe sequence last", Inject{0U,0U,0x3f800000U,2U});
+                // Separate streams/fixtures own separate admission words. Leave A unsafe while B runs safely.
+                Fixture other({"mc independent owner",16U,48U,12U,7U,4U,true,true,false});
+                check(hipMemcpy(other.weights.base,bounded.data(),other.weights.bytes,hipMemcpyHostToDevice),"second owner weights");
+                Buffer out_a(48U,2U*Fixture::H+32U),out_b(48U,2U*Fixture::H+32U),rec_a(1,8U),rec_b(1,8U);
+                const auto unsafe_a=run(f,out_a,rec_a,48U,2,Inject{0U,0U,0x3f800000U,2U},0ULL);
+                const auto safe_a=run(f,out_a,rec_a,40U,2,Inject{},0ULL);
+                const auto unsafe_again=run(f,out_a,rec_a,48U,2,Inject{0U,0U,0x3f800000U,2U},0ULL);
+                const auto safe_b=run(other,out_b,rec_b,48U,2,Inject{},0ULL);
+                unsigned retained=0U; check(hipMemcpy(&retained,f.admission.base,4U,hipMemcpyDeviceToHost),"owner isolation");
+                if (!unsafe_a.unsafe||safe_a.unsafe||!unsafe_again.unsafe||safe_b.unsafe||!retained)
+                    throw std::runtime_error("mc: admission reset/owner isolation failed");
+                for (const unsigned row : {0U, 29U, 47U}) {  // the merge's own invalid-route branch (a SUCCESS call: zeros committed)
+                    keep4.push_back("mc inject route row " + std::to_string(row));
+                    cmp(f, 48U, keep4.back(), Inject{row, 0U, 0U, 1U});
+                }
+            }
+            for (unsigned g : {12U,13U}) for (unsigned d : {7U,8U}) {
+                Fixture f({"mc dense certificate formats",16U,48U,g,d,4U,true,true,false});
+                cmp(f,48U,"mc dense certificate formats");
+            }
+            for (unsigned failure : {0U,1U,2U}) {
+                Case c{"mc certificate pre-rejection",16U,48U,12U,7U,failure==2U?3U:4U,true,true,failure==1U};
+                Fixture f(c);
+                if (failure==0U) {
+                    const unsigned bad=16U;  // == experts: out of range
+                    check(hipMemcpy(f.routes.base,&bad,4U,hipMemcpyHostToDevice),"route before producers");
+                }
+                cmp(f,48U,"mc certified route/input/projection rejection");
+            }
+            for (int a = 2; a < argc; ++a) {
+                const std::string x = argv[a];
+                std::vector<std::string> fl; std::size_t at = 0;
+                for (;;) { const std::size_t e = x.find(':', at); fl.push_back(x.substr(at, e == std::string::npos ? std::string::npos : e - at)); if (e == std::string::npos) break; at = e + 1U; }
+                keep4.push_back("mc REAL " + fl[1]);
+                Case c{keep4.back().c_str(), 512U, 8192U, static_cast<unsigned>(std::stoul(fl[4])), static_cast<unsigned>(std::stoul(fl[5])), 0U, false, true, false, 0U, 1.5,
+                    nullptr, std::stoull(fl[1]), std::stoull(fl[2]), std::stoull(fl[3])};
+                c.gguf = fl[0].c_str();
+                Fixture f(c);
+                for (unsigned rows : {8192U, 1320U}) cmp(f, rows, keep4.back());
+            }
+            kr::set_prefill_core2(-1); kr::set_prefill_route(-1); kr::set_prefill_da16(-1); kr::set_prefill_small(-1);
+            std::printf("mc: %u exact comparisons (%u SUCCESS, %u PRE, %u MERGE), %u differ, %u RACY excluded; "
+                "%u certificate calls (%u admitted, %u unproven) -> %s\n", cases,n_success,n_pre,rejected,failed,racy,certified,admitted,unproven,
+                failed||racy||!n_success||!n_pre||!rejected||!admitted||!unproven_success||!cert_pre||!cert_merge ? "FAIL/UNQUALIFIED" : "PASS");
+            return failed||racy||!n_success||!n_pre||!rejected||!admitted||!unproven_success||!cert_pre||!cert_merge ? 1 : 0;
+        }
+        if (mode == "hdr" || mode == "hdrbench") {
+            // MoE header reuse (STRIX_QPF2K_MOE_HDR): default chain (form 3, ROUTE 14, DA16 1) with the base gate/up kernel vs the
+            // header-reuse kernel. hdr [specs...]: every written view and the summary word byte-identical (exact compares),
+            // synthetic Q4_K/Q5_K x Q5_1/Q8_0 flavors 0..4, skew/crafted routes, T48..2048 (tunes 80 and 82), then real layers
+            // at T8192/T4096/T1320. hdrbench <reps> <spec> [rows]: complete routed call (prologue..down), ABBA hipEvent medians.
+            const auto parse = [](const std::string& x) {
+                std::vector<std::string> fl; std::size_t at = 0;
+                for (;;) { const std::size_t e = x.find(':', at); fl.push_back(x.substr(at, e == std::string::npos ? std::string::npos : e - at)); if (e == std::string::npos) break; at = e + 1U; }
+                if (fl.size() != 6U) throw std::invalid_argument("layer spec needs 6 fields");
+                return fl;
+            };
+            kr::set_prefill_core2(0); kr::set_prefill_route(14); kr::set_prefill_da16(1);
+            if (mode == "hdrbench") {
+                if (argc < 4) throw std::invalid_argument("hdrbench <reps> <layer spec> [rows]");
+                const int reps = std::atoi(argv[2]);
+                if (reps <= 0) throw std::invalid_argument("hdrbench: reps must be positive");
+                const auto fl = parse(argv[3]);
+                const unsigned rows = argc > 4 ? static_cast<unsigned>(std::atoi(argv[4])) : 8192U;
+                Case c{"hdrbench", 512U, rows, static_cast<unsigned>(std::stoul(fl[4])), static_cast<unsigned>(std::stoul(fl[5])), 0U, false, true, false, 0U, 1.5,
+                    nullptr, std::stoull(fl[1]), std::stoull(fl[2]), std::stoull(fl[3])};
+                c.gguf = fl[0].c_str();
+                Fixture f(c);
+                hipEvent_t e0, e1;
+                check(hipEventCreate(&e0), "event"); check(hipEventCreate(&e1), "event");
+                const auto timed = [&](int hdr) {
+                    kr::set_prefill_hdr(hdr);
+                    check(hipEventRecord(e0, f.stream), "record");
+                    f.enqueue(3, rows);
+                    check(hipEventRecord(e1, f.stream), "record");
+                    check(hipEventSynchronize(e1), "sync");
+                    float ms = 0.0F; check(hipEventElapsedTime(&ms, e0, e1), "elapsed");
+                    return static_cast<double>(ms);
+                };
+                timed(0); timed(1);
+                std::vector<double> a, b;
+                for (int r = 0; r < reps; ++r) { a.push_back(timed(0)); b.push_back(timed(1)); b.push_back(timed(1)); a.push_back(timed(0)); }
+                const auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+                double round_med = 0.0; { std::vector<double> d; for (std::size_t r = 0; r + 1U < a.size(); r += 2U) d.push_back((a[r] + a[r + 1U] - b[r] - b[r + 1U]) / 2.0); round_med = med(d); }
+                std::printf("hdrbench rows %u reps %d: base %.4f ms, header reuse %.4f ms, delta %.4f ms (%.2f %%), per-round median saving %.4f ms\n",
+                    rows, reps, med(a), med(b), med(b) - med(a), 100.0 * (med(b) - med(a)) / med(a), round_med);
+                std::printf("  base:"); for (const double v : a) std::printf(" %.4f", v);
+                std::printf("\n  hdr:"); for (const double v : b) std::printf(" %.4f", v);
+                std::printf("\n");
+                kr::set_prefill_hdr(-1); kr::set_prefill_core2(-1); kr::set_prefill_route(-1); kr::set_prefill_da16(-1);
+                return 0;
+            }
+            unsigned cases = 0, failed = 0, hdr_ran = 0;
+            const auto cmp = [&](Fixture& f, unsigned rows, const std::string& what) {
+                const auto run = [&](int hdr) {
+                    kr::set_prefill_hdr(hdr);
+                    for (const auto* b : f.written()) b->poison(f.stream);
+                    f.csr.poison(f.stream);
+                    f.enqueue(3, rows);
+                    check(hipStreamSynchronize(f.stream), "hdr run");
+                    if (!kr::prefill_da16_ran()) throw std::runtime_error("hdr: the DA16 path did not run (" + what + ")");
+                    std::vector<std::vector<unsigned char>> out;
+                    for (const auto* b : f.written()) out.push_back(b->read());
+                    out.push_back(f.csr.read());
+                    return out;
+                };
+                const auto base = run(0);
+                if (run(0) != base) { ++failed; std::printf("  RACY base %s rows %u\n", what.c_str(), rows); return; }
+                const auto got = run(1);
+                ++cases; ++hdr_ran;
+                for (std::size_t k = 0; k < got.size(); ++k) if (got[k] != base[k]) {
+                    std::size_t n = 0, first = ~std::size_t{0};
+                    for (std::size_t i = 0; i < got[k].size() && i < base[k].size(); ++i) if (got[k][i] != base[k][i]) { if (!n) first = i; ++n; }
+                    ++failed; std::printf("  DIFFER %s rows %u: %s %zu bytes, first at %zu\n", what.c_str(), rows, k < 10U ? names[k] : "csr", n, first);
+                }
+            };
+            static std::vector<std::string> keep5; keep5.reserve(128);
+            for (unsigned g : {12U, 13U}) for (unsigned d : {7U, 8U}) for (unsigned flavor : {0U, 1U, 2U, 3U, 4U}) {
+                keep5.push_back("hdr E40 T48 g" + std::to_string(g) + " d" + std::to_string(d) + " flavor " + std::to_string(flavor));
+                Fixture f({keep5.back().c_str(), 40U, 48U, g, d, flavor, true, true, flavor == 2U});
+                cmp(f, 48U, keep5.back());
+            }
+            for (unsigned g : {12U, 13U}) for (unsigned d : {7U, 8U}) {
+                keep5.push_back("hdr E512 T2048 g" + std::to_string(g) + " d" + std::to_string(d));
+                Fixture f({keep5.back().c_str(), 512U, 2048U, g, d, 4U, false, true, false, 0U, 1.5});
+                cmp(f, 2048U, keep5.back());
+                Case c{keep5.back().c_str(), 512U, 1024U, g, d, 4U, false, false, false}; c.crafted = true;
+                Fixture fc(c); cmp(fc, 1024U, keep5.back() + " crafted");
+                Case cf{keep5.back().c_str(), 64U, 1024U, g, d, 4U, false, false, false}; cf.crafted = true; cf.full128 = true;
+                Fixture ff(cf); cmp(ff, 1024U, keep5.back() + " full128");
+            }
+            for (int a = 2; a < argc; ++a) {
+                const auto fl = parse(argv[a]);
+                keep5.push_back("hdr REAL " + fl[1]);
+                Case c{keep5.back().c_str(), 512U, 8192U, static_cast<unsigned>(std::stoul(fl[4])), static_cast<unsigned>(std::stoul(fl[5])), 0U, false, true, false, 0U, 1.5,
+                    nullptr, std::stoull(fl[1]), std::stoull(fl[2]), std::stoull(fl[3])};
+                c.gguf = fl[0].c_str();
+                Fixture f(c);
+                for (unsigned rows : {8192U, 4096U, 1320U}) cmp(f, rows, keep5.back());
+            }
+            kr::set_prefill_hdr(-1); kr::set_prefill_core2(-1); kr::set_prefill_route(-1); kr::set_prefill_da16(-1);
+            std::printf("hdr: %u comparisons (%u with the header-reuse kernel), %u differ/racy -> %s\n", cases, hdr_ran, failed,
+                failed || !cases ? "FAIL" : "PASS");
+            return failed || !cases ? 1 : 0;
+        }
+        if (mode == "hdrmc") {
+            // MoE header reuse through the real tail: X = HDR 0, Y = HDR 1, both with the certificate producers and the F02
+            // merge+commit/finish selection (C arm of mcbench), X/Y/Y/X per round, hipEvent time of the complete transaction.
+            if (argc < 4) throw std::invalid_argument("hdrmc <reps> <layer spec> [rows]");
+            const int reps = std::atoi(argv[2]);
+            if (reps<=0) throw std::invalid_argument("hdrmc: reps must be positive");
+            const std::string x = argv[3];
+            std::vector<std::string> fl; std::size_t at = 0;
+            for (;;) { const std::size_t e = x.find(':', at); fl.push_back(x.substr(at, e == std::string::npos ? std::string::npos : e - at)); if (e == std::string::npos) break; at = e + 1U; }
+            const unsigned rows = argc > 4 ? static_cast<unsigned>(std::atoi(argv[4])) : 8192U;
+            Case c{"hdrmc", 512U, rows, static_cast<unsigned>(std::stoul(fl[4])), static_cast<unsigned>(std::stoul(fl[5])), 0U, false, true, false, 0U, 1.5,
+                nullptr, std::stoull(fl[1]), std::stoull(fl[2]), std::stoull(fl[3])};
+            c.gguf = fl[0].c_str();
+            Fixture f(c);
+            // The fixture's random route generator permits weights above one. Use normalized routes
+            // for the admitted measurement; measure a 1+ulp route separately below.
+            std::vector<unsigned char> route_weights=f.weights.read();
+            for (unsigned r=0;r<rows;++r) {
+                float total=0.0F;
+                for (unsigned slot=0;slot<Fixture::K;++slot) { float w; std::memcpy(&w,route_weights.data()+r*f.weights.stride+4U*slot,4U); total+=w; }
+                for (unsigned slot=0;slot<Fixture::K;++slot) {
+                    float w; auto* dst=route_weights.data()+r*f.weights.stride+4U*slot;
+                    std::memcpy(&w,dst,4U); w/=total; std::memcpy(dst,&w,4U);
+                }
+            }
+            check(hipMemcpy(f.weights.base,route_weights.data(),f.weights.bytes,hipMemcpyHostToDevice),"normalized benchmark routes");
+            Buffer out16(rows, 2U * Fixture::H), record(1, 8U);
+            kr::set_prefill_core2(0); kr::set_prefill_route(14); kr::set_prefill_da16(1); kr::set_prefill_small(0);
+            const dim3 grid((Fixture::H + 255U) / 256U, rows);
+            const kr::StridedRows<std::uint16_t> o{static_cast<std::uint16_t*>(out16.base), out16.stride};
+            auto* rec = static_cast<unsigned*>(record.base);
+            const auto tail = [&](bool cand) {
+                if (!cand || !kr::prefill_certificate_produced()) {
+                    hipLaunchKernelGGL(reference_merge_kernel_z, grid, dim3(256), 0, f.stream, f.view, f.view.csr.summary, Fixture::H, f.c.experts, Fixture::K);
+                    hipLaunchKernelGGL(reference_commit_kernel, grid, dim3(256), 0, f.stream, f.view, f.view.csr.summary, rows, Fixture::H, o, rec);
+                } else {
+                    hipLaunchKernelGGL(candidate_merge_commit_kernel<false>, grid, dim3(256), 0, f.stream, f.view, f.view.csr.summary, Fixture::H, f.c.experts, Fixture::K, o);
+                    hipLaunchKernelGGL(candidate_finish_kernel, dim3(32), dim3(256), 0, f.stream, f.view, f.view.csr.summary, rows, Fixture::H, o, rec);
+                }
+            };
+            hipEvent_t e0, e1;
+            check(hipEventCreate(&e0), "event"); check(hipEventCreate(&e1), "event");
+            const auto timed = [&](int hdr) {
+                kr::set_prefill_hdr(hdr);
+                f.view.unsafe=static_cast<unsigned*>(f.admission.base);
+                check(hipEventRecord(e0, f.stream), "record");
+                f.enqueue(3, rows);
+                tail(true);
+                check(hipEventRecord(e1, f.stream), "record");
+                check(hipEventSynchronize(e1), "sync");
+                float ms = 0.0F; check(hipEventElapsedTime(&ms, e0, e1), "elapsed");
+                return static_cast<double>(ms);
+            };
+            timed(0); timed(1);
+            const bool produced=kr::prefill_certificate_produced();
+            unsigned unsafe=0U;
+            check(hipStreamSynchronize(f.stream),"witness");
+            if (produced) check(hipMemcpy(&unsafe,f.view.unsafe,4U,hipMemcpyDeviceToHost),"admission");
+            std::vector<double> t0, t1, d;
+            for (int r = 0; r < reps; ++r) {
+                const double x1 = timed(0), y1 = timed(1), y2 = timed(1), x2 = timed(0);
+                t0.push_back(x1); t0.push_back(x2); t1.push_back(y1); t1.push_back(y2); d.push_back((x1 + x2 - y1 - y2) / 2.0);
+            }
+            const auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+            unsigned positive = 0; for (const double v : d) positive += v > 0.0 ? 1U : 0U;
+            std::printf("hdrmc rows %u reps %d certificate=%u unsafe=%u: HDR0 %.4f ms, HDR1 %.4f ms, per-round median saving %.4f ms (%.2f %%), rounds > 0: %u/%d\n",
+                rows, reps, produced ? 1U : 0U, unsafe, med(t0), med(t1), med(d), 100.0 * med(d) / med(t0), positive, reps);
+            std::printf("  hdr0:"); for (const double v : t0) std::printf(" %.4f", v);
+            std::printf("\n  hdr1:"); for (const double v : t1) std::printf(" %.4f", v);
+            std::printf("\n");
+            check(hipEventDestroy(e0),"destroy event"); check(hipEventDestroy(e1),"destroy event");
+            kr::set_prefill_hdr(-1); kr::set_prefill_core2(-1); kr::set_prefill_route(-1); kr::set_prefill_da16(-1); kr::set_prefill_small(-1);
+            return 0;
+        }
+        if (mode == "mcbench") {
+            // B/P/C/C/P/B: B base; P certificate producers + base tail; C selected merge/finish.
+            // Sparse tune-80 calls deliberately use B in every arm, matching production selection.
+            if (argc < 4) throw std::invalid_argument("mcbench <reps> <layer spec> [rows]");
+            const int reps = std::atoi(argv[2]);
+            if (reps<=0) throw std::invalid_argument("mcbench: reps must be positive");
+            const std::string x = argv[3];
+            std::vector<std::string> fl; std::size_t at = 0;
+            for (;;) { const std::size_t e = x.find(':', at); fl.push_back(x.substr(at, e == std::string::npos ? std::string::npos : e - at)); if (e == std::string::npos) break; at = e + 1U; }
+            const unsigned rows = argc > 4 ? static_cast<unsigned>(std::atoi(argv[4])) : 8192U;
+            Case c{"mcbench", 512U, rows, static_cast<unsigned>(std::stoul(fl[4])), static_cast<unsigned>(std::stoul(fl[5])), 0U, false, true, false, 0U, 1.5,
+                nullptr, std::stoull(fl[1]), std::stoull(fl[2]), std::stoull(fl[3])};
+            c.gguf = fl[0].c_str();
+            Fixture f(c);
+            // The fixture's random route generator permits weights above one. Use normalized routes
+            // for the admitted measurement; measure a 1+ulp route separately below.
+            std::vector<unsigned char> route_weights=f.weights.read();
+            for (unsigned r=0;r<rows;++r) {
+                float total=0.0F;
+                for (unsigned slot=0;slot<Fixture::K;++slot) { float w; std::memcpy(&w,route_weights.data()+r*f.weights.stride+4U*slot,4U); total+=w; }
+                for (unsigned slot=0;slot<Fixture::K;++slot) {
+                    float w; auto* dst=route_weights.data()+r*f.weights.stride+4U*slot;
+                    std::memcpy(&w,dst,4U); w/=total; std::memcpy(dst,&w,4U);
+                }
+            }
+            check(hipMemcpy(f.weights.base,route_weights.data(),f.weights.bytes,hipMemcpyHostToDevice),"normalized benchmark routes");
+            Buffer out16(rows, 2U * Fixture::H), record(1, 8U);
+            kr::set_prefill_core2(0); kr::set_prefill_route(14); kr::set_prefill_da16(1); kr::set_prefill_small(0);
+            const dim3 grid((Fixture::H + 255U) / 256U, rows);
+            const kr::StridedRows<std::uint16_t> o{static_cast<std::uint16_t*>(out16.base), out16.stride};
+            auto* rec = static_cast<unsigned*>(record.base);
+            const auto tail = [&](bool cand) {
+                if (!cand || !kr::prefill_certificate_produced()) {
+                    hipLaunchKernelGGL(reference_merge_kernel_z, grid, dim3(256), 0, f.stream, f.view, f.view.csr.summary, Fixture::H, f.c.experts, Fixture::K);
+                    hipLaunchKernelGGL(reference_commit_kernel, grid, dim3(256), 0, f.stream, f.view, f.view.csr.summary, rows, Fixture::H, o, rec);
+                } else {
+                    hipLaunchKernelGGL(candidate_merge_commit_kernel<false>, grid, dim3(256), 0, f.stream, f.view, f.view.csr.summary, Fixture::H, f.c.experts, Fixture::K, o);
+                    hipLaunchKernelGGL(candidate_finish_kernel, dim3(32), dim3(256), 0, f.stream, f.view, f.view.csr.summary, rows, Fixture::H, o, rec);
+                }
+            };
+            hipEvent_t e0, e1;
+            check(hipEventCreate(&e0), "event"); check(hipEventCreate(&e1), "event");
+            const auto timed = [&](bool call, unsigned arm) {
+                f.view.unsafe=(!call||arm)?static_cast<unsigned*>(f.admission.base):nullptr;
+                check(hipEventRecord(e0, f.stream), "record");
+                if (call) f.enqueue(3, rows);
+                tail(arm==2U);
+                check(hipEventRecord(e1, f.stream), "record");
+                check(hipEventSynchronize(e1), "sync");
+                float ms = 0.0F; check(hipEventElapsedTime(&ms, e0, e1), "elapsed");
+                return static_cast<double>(ms);
+            };
+            for (bool force_unsafe : {false,true}) {
+                const float one_plus=std::nextafter(1.0F,2.0F);
+                check(hipMemcpy(f.weights.base,route_weights.data(),f.weights.bytes,hipMemcpyHostToDevice),"restore benchmark routes");
+                if (force_unsafe) check(hipMemcpy(f.weights.base,&one_plus,4U,hipMemcpyHostToDevice),"unproven benchmark route");
+                f.view.unsafe=static_cast<unsigned*>(f.admission.base);
+                f.enqueue(3, rows);
+                const bool produced=kr::prefill_certificate_produced();
+                check(hipStreamSynchronize(f.stream),"benchmark producer witness");
+                unsigned unsafe=0U;
+                if (produced) check(hipMemcpy(&unsafe,f.view.unsafe,4U,hipMemcpyDeviceToHost),"benchmark admission");
+                std::printf("mcbench %s selection: certificate=%u unsafe=%u (sparse/unsupported calls use base tail)\n",
+                    force_unsafe?"unproven":"normal",produced?1U:0U,unsafe);
+                if (produced && unsafe!=static_cast<unsigned>(force_unsafe)) throw std::runtime_error("mcbench: unexpected admission selection");
+                tail(false); tail(true); check(hipStreamSynchronize(f.stream), "warm");
+                unsigned summary = 0; check(hipMemcpy(&summary, f.view.csr.summary, 4U, hipMemcpyDeviceToHost), "summary");
+                if (summary) throw std::runtime_error("mcbench: the real-layer call failed (summary nonzero)");
+                for (const bool call : {false, true}) {
+                    std::vector<double> tb,tp,tc;
+                    for (int r=0;r<reps;++r) {
+                        // B/P/C/C/P/B balances first-order drift. Tail arms reuse the warm certificate.
+                        tb.push_back(timed(call,0U)); tp.push_back(timed(call,1U)); tc.push_back(timed(call,2U));
+                        tc.push_back(timed(call,2U)); tp.push_back(timed(call,1U)); tb.push_back(timed(call,0U));
+                    }
+                    const auto med=[](std::vector<double> v){std::sort(v.begin(),v.end());return v[v.size()/2];};
+                    std::printf("mcbench %s rows %u reps %d: B %.4f ms, P %.4f ms, C %.4f ms, P-B %.4f ms, B-C %.4f ms\n",
+                        call?"call":"tail",rows,reps,med(tb),med(tp),med(tc),med(tp)-med(tb),med(tb)-med(tc));
+                    for (const auto* v : {&tb,&tp,&tc}) { for (double ms:*v) std::printf(" %.4f",ms); std::printf("\n"); }
+                }
+            }
+            check(hipEventDestroy(e0),"destroy event"); check(hipEventDestroy(e1),"destroy event");
+            kr::set_prefill_core2(-1); kr::set_prefill_route(-1); kr::set_prefill_da16(-1); kr::set_prefill_small(-1);
+            return 0;
         }
         if (mode == "fuse") {
             // qpf2k/moe core2 bit 9: base (core 0 + reference ordered merge) vs fused (core 513/641 + merge check): every written

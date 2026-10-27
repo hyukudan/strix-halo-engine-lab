@@ -308,6 +308,61 @@
     "doc_anchor": "docs/optimizations.md#qwen-gdn-witness"
   },
   {
+    "engine": "qwen",
+    "name": "QSA scorer row batching",
+    "flag_or_env": "STRIX_QPF2K_SCORE_ROWS",
+    "default": "auto (32 rows above 4096 blocks, 16 otherwise)",
+    "exact": "Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.",
+    "gain": "≈ −1.6 s at 262K together with PLE row batching (~−10 ms at 32K); combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)",
+    "preconditions": "Automatic decoder route (CLI), admitted tiled prefill; MTP/HTTP serving and cohorts keep it opt-in; not applied under GSQ.",
+    "off_switch": "STRIX_QPF2K_SCORE_ROWS=0 (16 rows)",
+    "doc_anchor": "docs/optimizations.md#qwen-qsa-score-rows"
+  },
+  {
+    "engine": "qwen",
+    "name": "PLE row batching",
+    "flag_or_env": "STRIX_PREFILL_PLE_BATCH",
+    "default": "1",
+    "exact": "Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.",
+    "gain": "Included in the scorer figure above (−0.16 s raw kernel time at 262K); combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)",
+    "preconditions": "Automatic decoder route (CLI), admitted tiled prefill; MTP/HTTP serving and cohorts keep it opt-in; not applied under GSQ.",
+    "off_switch": "STRIX_PREFILL_PLE_BATCH=0",
+    "doc_anchor": "docs/optimizations.md#qwen-ple-batch"
+  },
+  {
+    "engine": "qwen",
+    "name": "Shared-expert operand preimage",
+    "flag_or_env": "STRIX_QPF2K_SHARED_PRE",
+    "default": "1",
+    "exact": "Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.",
+    "gain": "~−1 % TTFT at 32K; combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)",
+    "preconditions": "Automatic decoder route (CLI), admitted tiled prefill; MTP/HTTP serving and cohorts keep it opt-in; not applied under GSQ.",
+    "off_switch": "STRIX_QPF2K_SHARED_PRE=0",
+    "doc_anchor": "docs/optimizations.md#qwen-shared-pre"
+  },
+  {
+    "engine": "qwen",
+    "name": "MoE ordered merge + BF16 commit",
+    "flag_or_env": "STRIX_QPF2K_MOE_MC",
+    "default": "1 (mode 1; mode 2 needs an explicit value)",
+    "exact": "Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.",
+    "gain": "~−0.10 s at 32K; combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)",
+    "preconditions": "Automatic decoder route (CLI), admitted tiled prefill; MTP/HTTP serving and cohorts keep it opt-in; not applied under GSQ.",
+    "off_switch": "STRIX_QPF2K_MOE_MC=0",
+    "doc_anchor": "docs/optimizations.md#qwen-moe-merge-commit"
+  },
+  {
+    "engine": "qwen",
+    "name": "MoE gate/up header reuse",
+    "flag_or_env": "STRIX_QPF2K_MOE_HDR",
+    "default": "1",
+    "exact": "Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.",
+    "gain": "~−0.07 s at 32K; combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)",
+    "preconditions": "Automatic decoder route (CLI), admitted tiled prefill; MTP/HTTP serving and cohorts keep it opt-in; not applied under GSQ.",
+    "off_switch": "STRIX_QPF2K_MOE_HDR=0",
+    "doc_anchor": "docs/optimizations.md#qwen-moe-header-reuse"
+  },
+  {
     "engine": "deepseek",
     "name": "Production dense overlay",
     "flag_or_env": "STRIX_DS41_OVERLAY; STRIX_DS41_CB4",

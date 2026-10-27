@@ -70,16 +70,25 @@
         }
         if constexpr((Tune&4096U)!=0U)return;
         const unsigned char* blk=b_src+(step/4U)*block_bytes;
-        r.h=f16_load(blk);
+#ifdef STRIX_F16X_HDR_REUSE
+        // MoE header reuse (STRIX_QPF2K_MOE_HDR): two register stages alternate even/odd steps (f16_pipeline, Tune bit 0
+        // clear, Core 0), so the stage of step s last held step s-2: the same superblock (same header and Q5_K qh words,
+        // whose addresses do not depend on s%4) whenever s%4 >= 2. Those loads are skipped; the register holds the bytes.
+        constexpr bool hdr_reuse=STRIX_F16X_HDR_REUSE&&Core==0U&&(Tune&1U)==0U;
+#else
+        constexpr bool hdr_reuse=false;
+#endif
+        const bool hdr_load=!hdr_reuse||step%4U<2U;
+        if(hdr_load)r.h=f16_load(blk);
         if constexpr(BWords>=4U) {
 #pragma unroll
         for(unsigned w=0;w<BWords/4U;++w) {
             r.q[w]=f16_load(blk+qs_at+32U*(step%4U)+4U*BWords*b_part+16U*w);
-            if constexpr(Q5K)r.qh[w]=f16_load(blk+16U+4U*BWords*b_part+16U*w);
+            if constexpr(Q5K)if(hdr_load)r.qh[w]=f16_load(blk+16U+4U*BWords*b_part+16U*w);
         }
         } else {
             r.q[0]=f16_load8(blk+qs_at+32U*(step%4U)+4U*BWords*b_part);
-            if constexpr(Q5K)r.qh[0]=f16_load8(blk+16U+4U*BWords*b_part);
+            if constexpr(Q5K)if(hdr_load)r.qh[0]=f16_load8(blk+16U+4U*BWords*b_part);
         }
     };
     bool fast_block=false;

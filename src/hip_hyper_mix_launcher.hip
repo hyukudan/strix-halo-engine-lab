@@ -3086,6 +3086,9 @@ struct HyperWideRows {
     // written by the wide2 projection when set.
     float* low_t = nullptr;
     std::uint32_t low_t_pitch = 0;
+    // STRIX_QPF2K_HC_LOWBAND bit 0: low_t in 512-row bands, low_t[(r / 512) * 320 * 512 + k * 512 + r % 512] (low_t_pitch
+    // 512); only the qpf2k projection and the output v3 band kernel use this layout.
+    bool low_t_band = false;
     // Optional FP16 copy of the normalized rows (row r at normalized16 + r * normalized16_pitch halves), written by the
     // fast-profile HC norm and read by the FP16-input WMMA projection.
     const _Float16* normalized16 = nullptr;
@@ -5250,7 +5253,7 @@ float* wide2_low_scratch() {
 // transposed low values of projection kernel 1; with another projection kernel 0 runs).
 void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, const void* inject, const void* up,
     const HipHyperMixLauncherConfig& config, unsigned projection_kernel, unsigned output_kernel, hipStream_t stream,
-    unsigned output3_band = UINT32_MAX, bool output3_zero_low_rank_stride = false) {
+    unsigned output3_band = UINT32_MAX, bool output3_zero_low_rank_stride = false, unsigned low_band = UINT32_MAX) {
     // The wide2 output kernel reads the transposed low values the wide2 projection writes (rows padded
     // to whole 32-row groups).
     HyperWideRows wide = wide_in;
@@ -5279,6 +5282,39 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
         output_kernel = 0U;
     }
     if (wide.inverse && !wide.low_t) throw std::invalid_argument("HC norm-free rows require the lane-chain output");
+    // STRIX_HC_WIDE2_OUTPUT_ROWS / _ORDER of the lane-chain output below (read here: the low layout depends on its route).
+    static const unsigned output_rows16 = [] { const char* v = std::getenv("STRIX_HC_WIDE2_OUTPUT_ROWS"); return v && std::atoi(v) == 16; }();
+    static const bool output_rows_first = [] { const char* v = std::getenv("STRIX_HC_WIDE2_OUTPUT_ORDER"); return !v || v[0] != 'f'; }();
+    const unsigned output3_band_used = qpf2k_output3_form == 0U || qpf2k_output3_form == 7U ?
+        (output3_band == UINT32_MAX ? qpf2k_hc_output3_band() : output3_band) : 0U;
+    // STRIX_QPF2K_HC_LOWBAND (test seam: low_band): only on the engine's qpf2k projection -> output v3 band 16 route.
+    unsigned low_mode = 0U;
+    {
+        const bool output3_route = output_kernel == 1U && wide.low_t && !output_rows16 && !wide.normalized16 && !wide.inverse &&
+            config.hidden_size == 2560U && (qpf2k_output3 || (!qpf2k_output && output_rows_first && config.fast_prefill_wmma && qpf2k_hc_output3()));
+        const bool qpf2k_projection_route = projection_kernel == 2U && !wide.normalized16 && !wide.inverse && !qpf2k_hc_check() &&
+            (qpf2k_projection ? qpf2k_projection_form == 4U : (qpf2k_hc_mask() & 8U) != 0U);
+        if (output3_route && qpf2k_projection_route && output3_band_used == 16U && !output3_zero_low_rank_stride)
+            low_mode = (low_band == UINT32_MAX ? qpf2k_hc_lowband() : low_band) & 3U;
+        if (wide.low_t_pitch <= kQpf2kLowBandRows) low_mode &= ~1U;
+        if (low_mode & 1U) { wide.low_t_band = true; wide.low_t_pitch = kQpf2kLowBandRows; }
+        // Output-only test seams (projection skipped) read the low values an earlier call left in the shared scratch: refused when
+        // that call wrote another layout (bit 0: low_t banded) or skipped low16 (bit 1). Every projection records what it wrote.
+        static std::atomic<unsigned> low_state{0U};
+        if (projection_kernel == kSkipKernel) {
+            if (output_kernel != kSkipKernel && (((low_state.load() & 1U) && output_kernel == 1U && wide.low_t) ||
+                                                 ((low_state.load() & 2U) && output_kernel == 2U)))
+                throw std::invalid_argument("HC wide rows test: the last projection left the low values in another layout");
+        } else if (projection_kernel == 2U) {
+            low_state.store(((wide.low_t ? low_mode : low_state.load()) & 1U) | (low_mode & 2U));
+        } else if (wide.low_t) {
+            low_state.fetch_and(~1U);
+        }
+        // Path witness (once per process and mode set): the engine receipt shows the candidate route ran.
+        static std::atomic<unsigned> witnessed{0U};
+        if (low_mode && !(witnessed.fetch_or(1U << low_mode) & (1U << low_mode)))
+            std::fprintf(stderr, "qpf2k HC lowband mode %u active (rows %u, low pitch %u)\n", low_mode, wide.count, wide.low_t_pitch);
+    }
     static const unsigned projection_rows = [] {
         const char* v = std::getenv("STRIX_HC_WIDE_PROJECTION_ROWS"); return v ? static_cast<unsigned>(std::atoi(v)) : 0U; }();
     static const unsigned projection_waves = [] {
@@ -5309,8 +5345,18 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
                     if (qpf2k_projection_form == 3U)
                         hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_projection_kernel<2U>), grid, dim3(256U), 0, stream, wide, scratch.down,
                             static_cast<const float*>(inject), config.hc_count, scratch.low16);
-                    else hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_projection_kernel<1U>), grid, dim3(256U), 0, stream, wide, scratch.down,
-                            static_cast<const float*>(inject), config.hc_count, scratch.low16);
+                    else {
+                        const auto launch = [&]<unsigned LowMode>() {
+                            hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_projection_kernel<1U, LowMode>), grid, dim3(256U), 0, stream, wide,
+                                scratch.down, static_cast<const float*>(inject), config.hc_count, scratch.low16);
+                        };
+                        switch (low_mode) {
+                        case 1U: launch.template operator()<1U>(); break;
+                        case 2U: launch.template operator()<2U>(); break;
+                        case 3U: launch.template operator()<3U>(); break;
+                        default: launch.template operator()<0U>();
+                        }
+                    }
                 };
                 if (!qpf2k_hc_check() || qpf2k_projection) qpf2k();
                 else {
@@ -5415,8 +5461,6 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
             // Row groups fastest in the grid: the 32-row groups of one feature block run together, so its up
             // weights (174 KB) stay in L2 (in prefill 1898 -> 1556 us per call at 4K). STRIX_HC_WIDE2_OUTPUT_ORDER=features:
             // feature blocks fastest.
-            static const unsigned rows16 = [] { const char* v = std::getenv("STRIX_HC_WIDE2_OUTPUT_ROWS"); return v && std::atoi(v) == 16; }();
-            static const bool rows_first = [] { const char* v = std::getenv("STRIX_HC_WIDE2_OUTPUT_ORDER"); return !v || v[0] != 'f'; }();
             const auto run = [&]<unsigned R>() {
                 const unsigned features = config.hidden_size / (32U * kWide2OutputWaves), groups = (wide.count + R - 1U) / R;
                 if (wide.normalized16_only) {
@@ -5431,13 +5475,13 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
                 }
                 if constexpr (R == 32U) {
                     // STRIX_QPF2K_HC_OUTPUT3 (fast profile): output v3, the same arithmetic as the kernel below; same bytes.
-                    if (qpf2k_output3 || (!qpf2k_output && rows_first && config.fast_prefill_wmma && qpf2k_hc_output3() && config.hidden_size == 2560U)) {
+                    if (qpf2k_output3 || (!qpf2k_output && output_rows_first && config.fast_prefill_wmma && qpf2k_hc_output3() && config.hidden_size == 2560U)) {
                         const dim3 grid(groups, features);
                         // Engine path: the up weights via the cached per-call copy (seam forms keep the fixture's buffer).
                         const void* up3 = !qpf2k_output3 && qpf2k_hc_upcopy() ?
                             qpf2k_hc_up_copy(up, std::uint64_t{kWideStreams} * config.hidden_size * 340U, wide.count, stream) : up;
-                        const unsigned band = qpf2k_output3_form == 0U || qpf2k_output3_form == 7U ?
-                            (output3_band == UINT32_MAX ? qpf2k_hc_output3_band() : output3_band) : 0U;
+                        const unsigned band = output3_band_used;
+                        if (wide.low_t_band && band != 16U) throw std::logic_error("qpf2k HC banded low values without output v3 band 16");
                         const auto qpf2k3 = [&] {
                             if (output3_zero_low_rank_stride) wide.low_t_pitch = 0U;  // test seam diagnostic only; outputs discarded
                             if (band) {
@@ -5455,7 +5499,12 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
                                 case 7U: launch.template operator()<7U>(); break;
                                 case 8U: launch.template operator()<8U>(); break;
                                 case 12U: launch.template operator()<12U>(); break;
-                                case 16U: launch.template operator()<16U>(); break;
+                                case 16U:
+                                    if (wide.low_t_band)
+                                        hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_hc_output3_band_kernel<Storage, 16U, true>), grid, dim3(128U), 0,
+                                            stream, wide, up3, config.hidden_size);
+                                    else launch.template operator()<16U>();
+                                    break;
                                 case 24U: launch.template operator()<24U>(); break;
                                 case 32U: launch.template operator()<32U>(); break;
                                 case 48U: launch.template operator()<48U>(); break;
@@ -5486,7 +5535,7 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
                         return;
                     }
                     // STRIX_QPF2K_HC bit 0 (fast profile): packed coefficients, double-buffered low values; same bytes.
-                    if (qpf2k_output || (rows_first && config.fast_prefill_wmma && (qpf2k_hc_mask() & 1U) && config.hidden_size == 2560U)) {
+                    if (qpf2k_output || (output_rows_first && config.fast_prefill_wmma && (qpf2k_hc_mask() & 1U) && config.hidden_size == 2560U)) {
                         const auto qpf2k = [&] {
                             auto* coef = qpf2k_hc_coef_scratch(stream);
                             hipLaunchKernelGGL(qpf2k_hc_pack_coef_kernel, dim3((config.hidden_size * 10U + 255U) / 256U), dim3(256U), 0, stream,
@@ -5512,7 +5561,7 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
                         return;
                     }
                 }
-                if (rows_first) {
+                if (output_rows_first) {
                     // STRIX_QPF2K_HC_UPCOPY_BASE (attribution): the base kernel on the cached up weight copy.
                     const void* upb = config.fast_prefill_wmma && qpf2k_hc_upcopy_base() ?
                         qpf2k_hc_up_copy(up, std::uint64_t{kWideStreams} * config.hidden_size * 340U, wide.count, stream) : up;
@@ -5522,7 +5571,7 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
                 else hipLaunchKernelGGL(HIP_KERNEL_NAME(wide2_hyper_output_kernel<Storage, R, false>), dim3(features, groups),
                         dim3(32U * kWide2OutputWaves), 0, stream, wide, up, config.hidden_size);
             };
-            if (rows16) run.template operator()<16U>(); else run.template operator()<32U>();
+            if (output_rows16) run.template operator()<16U>(); else run.template operator()<32U>();
             return;
         }
         const auto output = [&]<unsigned Rows>() {
@@ -5915,7 +5964,8 @@ void testing::enqueue_wide_hyper_rows_test(const HipHyperMixLauncherConfig& conf
         !aligned(views.up, 4U) || (projection_kernel > 4U && projection_kernel != kSkipKernel) ||
         (output_kernel > 13U && output_kernel != kSkipKernel) ||
         (views.output3_band != UINT32_MAX && (!qpf2k_hc_output3_band_valid(views.output3_band) || output_kernel != 7U)) ||
-        (views.output3_zero_low_rank_stride && (output_kernel != 7U || projection_kernel != kSkipKernel || views.output3_band != 0U)))
+        (views.output3_zero_low_rank_stride && (output_kernel != 7U || projection_kernel != kSkipKernel || views.output3_band != 0U)) ||
+        (views.low_band != UINT32_MAX && views.low_band > 3U))
         throw std::invalid_argument("wide HC rows test views invalid");
     HyperWideRows wide{};
     wide.normalized = views.normalized; wide.normalized_stride = views.normalized_stride;
@@ -5926,8 +5976,11 @@ void testing::enqueue_wide_hyper_rows_test(const HipHyperMixLauncherConfig& conf
     wide.normalized16_pitch = views.normalized16_pitch ? views.normalized16_pitch : 10240U;
     wide.normalized16_only = views.normalized16 && views.normalized16_only;
     launch_wide_hyper_kernels(wide, views.down, views.inject, views.up, config, projection_kernel, output_kernel, stream,
-        views.output3_band, views.output3_zero_low_rank_stride);
+        views.output3_band, views.output3_zero_low_rank_stride, views.low_band);
 }
+
+const float* testing::wide_hyper_rows_test_low_t() { return wide2_low_scratch(); }
+const void* testing::wide_hyper_rows_test_low16() { return hcw_scratch().low16; }
 
 void testing::enqueue_qpf2k_inject_norm_test(const HipHyperMixLauncherConfig& config, const Qpf2kInjectNormTestViews& v, bool reference,
     hipStream_t stream) {

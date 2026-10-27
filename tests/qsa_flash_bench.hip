@@ -1,4 +1,4 @@
-// qpf2k/attn microbench (standalone; build: amdclang++ -O3 -std=gnu++20 --offload-arch=gfx1151 -x hip, the engine TU's flags).
+// qpf2k/attn microbench (standalone; build: amdclang++ -O3 -std=gnu++20 --offload-arch=gfx1151 -Iinclude -x hip, the engine TU's flags).
 // Times the QSA prefill part-2 kernels of one layer-chunk (T rows from position P) on synthetic data, the
 // way enqueue_qsa_known_rows runs them for 64-row groups (pool, block scores, selection, batched union +
 // attend), and checks the qpf2k kernels bitwise against the production ones (tests/qsa_flash_prod.inc).

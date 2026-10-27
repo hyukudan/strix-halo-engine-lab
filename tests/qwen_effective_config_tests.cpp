@@ -475,7 +475,17 @@ int main(int argc, char** arguments) {
     for (const auto& entry : qpf2k::defaults) {
         auto off = request; off.environment[entry.name] = "0";
         const auto config = resolve(off,memory);
-        historical_equal(off,config);
+        if (qpf2k::exact_prefill_items & qpf2k::bit(entry.item)) {
+            expect(config.admitted && effective_prefill_argv(config.options) == effective_prefill_argv(automatic.options),
+                "an exact prefill off switch keeps the admitted route");
+            for (const auto& other : qpf2k::defaults)
+                if (other.item != entry.item)
+                    expect(config.environment.at(other.name) == other.value && config.sources.at(other.name) == OptionSource::automatic,
+                        "an exact prefill off switch disables only that item");
+            expect(effective_config_json(config).find(std::string("\"") + entry.name +
+                "\":{\"value\":\"0\",\"source\":\"explicit\"}") != std::string::npos,
+                "effective config reports the explicit per-item off switch");
+        } else historical_equal(off,config);
         expect(config.environment.at(entry.name) == "0" && config.sources.at(entry.name) == OptionSource::explicit_value,
             "every feature off switch preserves explicit zero");
     }

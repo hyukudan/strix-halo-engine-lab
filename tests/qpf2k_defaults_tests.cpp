@@ -17,17 +17,27 @@ namespace {
 using namespace strix;
 void expect(bool ok, const char* why) { if (!ok) throw std::runtime_error(why); }
 using Environment = std::map<std::string, std::string>;
-unsigned initialize(Environment& env) {
+unsigned initialize(Environment& env, unsigned allowed = ~0U) {
     return qpf2k::initialize([&](const char* name) -> const char* {
         const auto it = env.find(name);
         return it == env.end() ? nullptr : it->second.c_str();
-    }, [&](const char* name, const char* value) { return env.emplace(name, value).second; });
+    }, [&](const char* name, const char* value) { return env.emplace(name, value).second; }, allowed);
 }
 void policy_tests() {
     Environment automatic;
     const auto all = initialize(automatic);
     expect(all == (1U << qpf2k::defaults.size()) - 1U, "every injected item retains provenance");
     expect(automatic.at("STRIX_QPF2K_MOE_DEFAULTED") == "3", "MoE provenance is preserved");
+    expect(automatic.at("STRIX_QPF2K_SCORE_ROWS") == "auto" && automatic.at("STRIX_PREFILL_PLE_BATCH") == "1" &&
+        automatic.at("STRIX_QPF2K_SHARED_PRE") == "1" && automatic.at("STRIX_QPF2K_MOE_MC") == "1" &&
+        automatic.at("STRIX_QPF2K_MOE_HDR") == "1" && !automatic.contains("STRIX_QPF2K_HC_LOWBAND"),
+        "exact prefill defaults use auto scoring and MC mode 1; LOWBAND stays opt-in");
+    Environment startup;
+    expect(initialize(startup, qpf2k::startup_items) == qpf2k::startup_items &&
+        !(qpf2k::startup_items & qpf2k::exact_prefill_items), "exact prefill defaults wait for decoder admission");
+    for (const auto& entry : qpf2k::defaults)
+        if (qpf2k::exact_prefill_items & qpf2k::bit(entry.item))
+            expect(!startup.contains(entry.name), "non-decoder clients retain exact prefill opt-ins");
     qpf2k::defaulted_items = all;
     for (const auto& entry : qpf2k::defaults) {
         expect(automatic.at(entry.name) == entry.value, "non-GSQ default values are unchanged");
@@ -55,8 +65,12 @@ void policy_tests() {
             expect(!explicit_env.contains(entry.item == qpf2k::Item::qsa ? "STRIX_QPF2K_QSA_MASK" : "STRIX_QPF2K_HC_MASK"),
                 "an explicit parent does not acquire a default mask");
     }
-    Environment disabled{{"STRIX_QPF2K_DEFAULTS", "0"}, {"STRIX_QPF2K_MOE_ROUTE", "14"}};
-    expect(initialize(disabled) == 0U && disabled.size() == 2U, "DEFAULTS=0 injects nothing and preserves explicit settings");
+    for (const auto* value : {"0", "00", "0disabled"}) {
+        Environment disabled{{"STRIX_QPF2K_DEFAULTS", value}, {"STRIX_QPF2K_MOE_ROUTE", "14"}};
+        expect(initialize(disabled) == 0U && disabled.size() == 2U, "DEFAULTS=0* injects nothing and preserves explicit settings");
+    }
+    Environment baseline{{"STRIX_BASELINE", "1"}, {"STRIX_QPF2K_MOE_MC", "0"}};
+    expect(initialize(baseline) == 0U && baseline.size() == 2U, "environment baseline injects nothing and preserves explicit zero");
     ModelManifest manifest;
     ManifestTensor gate;
     gate.name = "blk.0.ffn_gate_exps.weight";
@@ -264,7 +278,7 @@ int main(int argc, char** argv) {
         expect(strix_hc_inject_fusion_enabled(), "explicit fusion survives GSQ filtering");
         return 0;
     }
-    expect(qpf2k::defaults.size() == 23U, "all scoped prompt defaults are part of the injected-item contract");
+    expect(qpf2k::defaults.size() == 28U, "all scoped prompt defaults are part of the injected-item contract");
     qpf2k::baseline = true;
     std::map<std::string,std::string> baseline_env;
     expect(initialize(baseline_env) == 0U && baseline_env.empty(), "baseline injects no defaults");

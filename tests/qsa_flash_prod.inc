@@ -1,12 +1,13 @@
 // qpf2k/attn microbench + fixtures: production QSA prefill kernels copied verbatim from
 // src/hip_indexed_attention_launcher.hip (0998a0e5) and the qpf2k kernels (src/hip_qsa_prefill_flash.inc).
-// qpf2k/attn microbench (standalone; build: amdclang++ -O3 -std=gnu++20 --offload-arch=gfx1151 -x hip).
+// qpf2k/attn microbench (standalone; build: amdclang++ -O3 -std=gnu++20 --offload-arch=gfx1151 -Iinclude -x hip).
 // Times the QSA prefill part-2 kernels of one layer-chunk (T rows from position P) on synthetic data, the
 // way enqueue_qsa_known_rows runs them for 64-row groups (pool, block scores, selection, batched union +
 // attend), and checks the qpf2k kernels (src/hip_qsa_prefill_flash.inc) bitwise against the production ones.
 // Pool/store kernels are shared directly with src/hip_qsa_prefill_stages.inc.
 // The remaining production reference code below is copied verbatim from src/hip_indexed_attention_launcher.hip
 // (0998a0e5); hip_qsa_fast_prefill.inc and hip_qsa_prefill_flash.inc are included from src/.
+#include "strix/qpf2k_defaults.hpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <algorithm>

@@ -22,6 +22,25 @@
 namespace qsa_flash {
 constexpr unsigned kHeads = 4U, kDim = 128U;
 constexpr unsigned kScoreRows = 16U, kScoreWaves = 8U; // engine geometry: rows per CTA, waves (32-block tiles) per CTA
+// STRIX_QPF2K_SCORE_ROWS=32 / 64 / auto (stage-batch scorer only, unset 16; decoder injects auto): each CTA keeps its wave's 32 keys in
+// registers across 32 / 64 query rows instead of 16. Every score is the same lane's block_score of the same row and key
+// with the same guard (row range per row, key range per 32-block wave tile), so the bits do not depend on RowsPerCta.
+// auto: 32 rows once a call scores more than kScoreRowsAutoBlocks blocks (deep chunks, where the keys of a group
+// outgrow the cache), 16 below (measured: 32 rows lose 5-10 % on calls of <= 4096 blocks).
+constexpr unsigned kScoreRowsAuto = 1U, kScoreRowsAutoBlocks = 4096U;
+inline unsigned score_rows_mode() {
+    static const unsigned rows = [] {
+        const char* v = std::getenv("STRIX_QPF2K_SCORE_ROWS");
+        if (v && std::strcmp(v, "auto") == 0) return kScoreRowsAuto;
+        const int n = v ? std::atoi(v) : 16;
+        return n == 32 || n == 64 ? static_cast<unsigned>(n) : kScoreRows;
+    }();
+    return qpf2k::suppressed(qpf2k::Item::score_rows) ? kScoreRows : rows;
+}
+inline unsigned score_rows(std::uint32_t max_blocks) {
+    const unsigned mode = score_rows_mode();
+    return mode != kScoreRowsAuto ? mode : max_blocks > kScoreRowsAutoBlocks ? 32U : kScoreRows;
+}
 constexpr unsigned kGroup = 4U; // blocks per selection group (score_kernel maxima, select_kernel)
 typedef __attribute__((address_space(4))) const float* uniform_ptr;
 

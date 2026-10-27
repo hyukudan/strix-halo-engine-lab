@@ -1,5 +1,5 @@
 // qpf2k/attn directed fixtures (standalone; build with the engine TU's flags: amdclang++ -O3 -std=gnu++20
-// --offload-arch=gfx1151 -x hip). Exit 0 only if every check passes and every path counter it requires is non-zero.
+// --offload-arch=gfx1151 -Iinclude -x hip). Exit 0 only if every check passes and every path counter it requires is non-zero.
 //  S: scorer cases (crafted BF16 queries and pooled keys) - qsa_flash::score_kernel<Rows, 16, 8> (both query feeds)
 //     vs the production kernel of that group size (block_score_parked_kernel<64, 4>; block_score_pooled_rows_kernel
 //     <Rows, 4> for 16 / 32 rows), every score bitwise; raw head dots (before relu) of the fused and the separate

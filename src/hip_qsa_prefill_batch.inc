@@ -211,18 +211,30 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
         check_hip(hipGetLastError(), "QSA stage batch range launch");
     }
     if (max_blocks) {
-        constexpr unsigned R = qsa_flash::kScoreRows, W = qsa_flash::kScoreWaves;
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<64U, R, W, false, false, true, 1U, true>),
-            dim3(((max_blocks + 31U) / 32U + W - 1U) / W, 64U / R, groups), dim3(W * 32U), 0, stream,
-            QsaRowsScoreViews<64U>{}, static_cast<const float*>(pool->keys), 0U, a.index_dim, nullptr, 0U,
-            static_cast<const uint2*>(qpf2k_key_ranges(pool->capacity)), nullptr, slot.scores);
+        constexpr unsigned W = qsa_flash::kScoreWaves;
+        const auto score = [&]<unsigned R>() {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<64U, R, W, false, false, true, 1U, true>),
+                dim3(((max_blocks + 31U) / 32U + W - 1U) / W, 64U / R, groups), dim3(W * 32U), 0, stream,
+                QsaRowsScoreViews<64U>{}, static_cast<const float*>(pool->keys), 0U, a.index_dim, nullptr, 0U,
+                static_cast<const uint2*>(qpf2k_key_ranges(pool->capacity)), nullptr, slot.scores);
+        };
+        if (qsa_flash::score_rows(max_blocks) != 16U) {
+            static const bool witness = [] { std::fprintf(stderr, "qpf2k qsa score rows > 16 active\n"); return true; }();
+            (void)witness;
+        }
+        switch (qsa_flash::score_rows(max_blocks)) {
+        case 32U: score.template operator()<32U>(); break;
+        case 64U: score.template operator()<64U>(); break;
+        default: score.template operator()<qsa_flash::kScoreRows>(); break;
+        }
         check_hip(hipGetLastError(), "QSA stage batch score launch");
         qpf2k_launch_score.fetch_add(1U, std::memory_order_relaxed);
     }
     if (wave_norm) qpf2k_launch_norm_wave.fetch_add(1U, std::memory_order_relaxed);
     pool->valid = valid;
     if (qpf2k_trace_enabled())
-        std::fprintf(stderr, "qpf2k qsa stage_batch groups %u pool %u range %u score %u rope 1 norm 1 store 1 fallback 0\n",
-            groups, max_new ? 1U : 0U, max_new ? 1U : 0U, max_blocks ? 1U : 0U);
+        std::fprintf(stderr, "qpf2k qsa stage_batch groups %u pool %u range %u score %u rope 1 norm 1 store 1 fallback 0%s\n",
+            groups, max_new ? 1U : 0U, max_new ? 1U : 0U, max_blocks ? 1U : 0U,
+            !max_blocks || qsa_flash::score_rows(max_blocks) == 16U ? "" : qsa_flash::score_rows(max_blocks) == 32U ? " score_rows 32" : " score_rows 64");
     return true;
 }

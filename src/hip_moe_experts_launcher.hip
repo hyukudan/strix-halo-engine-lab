@@ -27,6 +27,8 @@
 #include <algorithm>
 #include <limits>
 #include <optional>
+#include <mutex>
+#include <vector>
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -2728,54 +2730,55 @@ __global__ void known_moe_prefill_merge_kernel(KnownMoePrefillDevice view, std::
 // qpf2k/moe-mi (STRIX_QPF2K_MOE_ROUTE bit 8): known_moe_prefill_merge_kernel when the routed prologue did not zero the
 // accumulation view: the same kernel, plus a zero store on each path where the base returns without a store (the zero the
 // prologue would have left there; the prologue clears exactly hidden words per row). Successful rows: identical.
+#include "hip_moe_prefill_commit.inc"
 __global__ void known_moe_prefill_merge_kernel_z(KnownMoePrefillDevice view, std::uint32_t* header,
     std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k) {
-    const auto row = blockIdx.y;
-    auto* status = known_moe_prefill_row(view.status, row);
-    const auto out = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (header[0] || *status) { if (out < hidden_size) known_moe_prefill_row(view.accumulation, row)[out] = 0.0F; return; }
-    if (out >= hidden_size) return;
-    const auto* routes = known_moe_prefill_row(view.routes, row);
-    for (std::uint32_t slot = 0; slot < top_k; ++slot) if (routes[slot] >= experts) { known_moe_prefill_row(view.accumulation, row)[out] = 0.0F; return; }
-    const auto* rawdots = known_moe_prefill_row(view.rawdots, row);
-    const auto* route_weights = known_moe_prefill_row(view.route_weights, row);
-    float dots[10];
-#pragma unroll
-    for (std::uint32_t slot = 0; slot < 10U; ++slot) if (slot < top_k) dots[slot] = rawdots[static_cast<std::uint64_t>(slot) * hidden_size + out];
-    float current = 0.0F;
-#pragma unroll
-    for (std::uint32_t slot = 0; slot < 10U; ++slot) if (slot < top_k) {
-        const float weight = route_weights[slot];
-        asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(current) : "s"(weight), "v"(dots[slot]));
-    }
-    known_moe_prefill_row(view.accumulation, row)[out] = current;
-    if ((__float_as_uint(current) & 0x7fffffffU) >= 0x7f7f8000U) { atomicOr(status, 8U); atomicOr(header, 8U); }
+    moe_prefill_merge_z_body(view, header, hidden_size, experts, top_k,
+        [](auto v, unsigned r) { return known_moe_prefill_row(v, r); });
 }
-// known_moe_rows_commit_kernel over T rows; header[0] is the OR of every row status.
 __global__ void known_moe_prefill_commit_kernel(KnownMoePrefillDevice view, std::uint32_t* header,
     std::uint32_t row_count, std::uint32_t hidden_size, std::uint32_t* record) {
-    const std::uint32_t failure = header[0];
-    if (blockIdx.x == 0U && blockIdx.y == 0U) {
-        // The serial merge over rows 0..T-1 records only the first nonzero row status (a merge of
-        // a zero status changes nothing): the block finds that row in parallel, thread 0 merges it.
-        __shared__ std::uint32_t first_bad;
-        if (threadIdx.x == 0U) first_bad = row_count;
-        __syncthreads();
-        for (std::uint32_t r = threadIdx.x; r < row_count; r += blockDim.x)
-            if (*known_moe_prefill_row(view.status, r)) { atomicMin(&first_bad, r); break; }
-        __syncthreads();
-        if (threadIdx.x == 0U) {
-            if (failure & 7U) for (const auto word : {1U, 2U, 4U, 5U}) header[word] = 0U;
-            if (failure & 7U) for (std::uint32_t word = 8U; word < 24U; ++word) header[word] = 0U;
-            if (first_bad < row_count)
-                merge_deferred_moe_first_error(*reinterpret_cast<DeferredMoeFirstError*>(record),
-                    *known_moe_prefill_row(view.status, first_bad), DeferredMoeDomain::q4k_a8);
-        }
-    }
-    if (failure) return;
-    const auto out = blockIdx.x * blockDim.x + threadIdx.x;
-    if (out < hidden_size) store_activation(known_moe_prefill_row(view.output, blockIdx.y) + out,
-        known_moe_prefill_row(view.accumulation, blockIdx.y)[out]);
+    moe_prefill_commit_body(view, header, row_count, hidden_size, record, blockIdx.x, blockIdx.y,
+        [](auto v, unsigned r) { return known_moe_prefill_row(v, r); },
+        [](auto* p, float v) { store_activation(p, v); });
+}
+// MC entry points only: base wrappers above inline the original statement order.
+template <bool Acc>
+__global__ void known_moe_prefill_merge_commit_kernel(KnownMoePrefillDevice view, std::uint32_t* header,
+    std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k, const unsigned* unsafe) {
+    moe_prefill_merge_z_body<true, Acc>(view, header, hidden_size, experts, top_k,
+        [](auto v, unsigned r) { return known_moe_prefill_row(v, r); }, unsafe);
+}
+template <unsigned CTAs>
+__global__ void known_moe_prefill_finish_kernel(KnownMoePrefillDevice view, std::uint32_t* header,
+    std::uint32_t row_count, std::uint32_t hidden, std::uint32_t* record, const unsigned* unsafe) {
+    moe_prefill_finish_body<CTAs>(view, header, row_count, hidden, record, unsafe,
+        [](auto v, unsigned r) { return known_moe_prefill_row(v, r); },
+        [](auto* p, float v) { store_activation(p, v); });
+}
+// STRIX_QPF2K_MOE_MC: 0/unset base merge + commit, 1 merge+commit (decoder default), 2 also writes the accumulation.
+unsigned prefill_merge_commit(bool gsq) {
+    static const unsigned mode = [] {
+        const char* v = std::getenv("STRIX_QPF2K_MOE_MC");
+        const unsigned m = v && (v[0] == '1' || v[0] == '2') && v[1] == '\0' ? static_cast<unsigned>(v[0] - '0') : 0U;
+        return m;
+    }();
+    return qpf2k::suppressed(qpf2k::Item::moe_mc, gsq) ? 0U : mode;
+}
+// Retained allocations (never freed, so queued work never sees a released word). Different devices/explicit streams
+// never share admission state; reuse on one stream is ordered through finish before the next prologue. The mutex only
+// guards lookup/allocation: calls on one stream must be submitted serially (the prefill scheduler contract; graph
+// capture and per-thread/default streams are rejected before this point).
+unsigned* prefill_admission_word(hipStream_t stream) {
+    struct Word { int device; hipStream_t stream; unsigned* ptr; };
+    static std::mutex mutex;
+    static std::vector<Word> words;
+    int device=0; check_hip(hipGetDevice(&device), "MC admission device");
+    const std::lock_guard<std::mutex> lock(mutex);
+    for (const auto& w : words) if (w.device==device && w.stream==stream) return w.ptr;
+    void* ptr=nullptr; check_hip(hipMalloc(&ptr, sizeof(unsigned)), "MC admission allocation");
+    words.push_back({device,stream,static_cast<unsigned*>(ptr)});
+    return static_cast<unsigned*>(ptr);
 }
 struct KnownMoePrefillPrepared {
     moe_q4k_a8::Request request;
@@ -2977,8 +2980,12 @@ KnownMoePrefillPrepared prepare_known_moe_prefill(std::span<const ExecutionDispa
 }
 void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherConfig& config, const KnownMoePrefillPrepared& p) {
     const auto stream = hip_execution_stream();
+    const bool gsq = qpf2k::gsq_model || gsq_a8::gate_type(p.request.gate_type);
     check_hip(hipPeekAtLastError(), "known prefill routed rows stale error");
-    moe_q4k_a8::known_rows::enqueue_prefill(p.request, p.rows, count, p.clear_words, p.gate, p.up, p.down_type, p.down, stream,
+    bool committed = false;
+    auto rows = p.rows;
+    if (prefill_merge_commit(gsq)) rows.unsafe = prefill_admission_word(stream);
+    moe_q4k_a8::known_rows::enqueue_prefill(p.request, rows, count, p.clear_words, p.gate, p.up, p.down_type, p.down, stream,
         config.prefill_f16wmma ? 3 : -1);
     // qpf2k core2 bit 9 (STRIX_QPF2K_MOE): the down already ran the ordered merge (last arrival); its guards and non-finite
     // flag run here instead (same accumulation, status and header bits).
@@ -2989,7 +2996,29 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
             throw std::logic_error("known prefill fused merge: accumulation view differs from the prologue clear view");
         moe_q4k_a8::known_rows::enqueue_prefill_merge_check(p.rows, count, config.hidden_size, config.expert_count, config.top_k, stream);
     }
+    // Only on the default chain whose merge is merge_z (ROUTE bit 8: the prologue left the accumulation unzeroed).
+    else if (const auto mc = moe_q4k_a8::known_rows::prefill_certificate_produced() ? prefill_merge_commit(gsq) : 0U) {
+        static const bool witness = [mc] { std::fprintf(stderr, "qpf2k moe merge+commit active (mode %u)\n", mc); return true; }();
+        (void)witness;
+        // The fallback choice is device-side and per call. No host fallback count/witness can observe it
+        // without a readback; do not add synchronization or claim a host-observed fallback.
+        if (mc == 2U)
+            hipLaunchKernelGGL(known_moe_prefill_merge_commit_kernel<true>, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0,
+                stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe);
+        else
+            hipLaunchKernelGGL(known_moe_prefill_merge_commit_kernel<false>, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0,
+                stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe);
+        check_hip(hipGetLastError(), "known prefill routed rows ordered merge + commit");
+        hipLaunchKernelGGL(known_moe_prefill_finish_kernel<32>, dim3(32), dim3(256), 0, stream,
+            p.device, p.rows.csr.summary, count, config.hidden_size, hip_deferred_moe_status(), rows.unsafe);
+        check_hip(hipGetLastError(), "known prefill routed rows commit record");
+        committed = true;
+    }
     else {
+    if (prefill_merge_commit(gsq)) {
+        static const bool witness=[] { std::fprintf(stderr,"qpf2k moe MC base tail (certificate not produced)\n"); return true; }();
+        (void)witness;
+    }
     if (moe_q4k_a8::known_rows::prefill_clear_skipped()) // qpf2k/moe-mi ROUTE bit 8: the zeros move into the merge
         hipLaunchKernelGGL(known_moe_prefill_merge_kernel_z, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
             p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k);
@@ -2998,9 +3027,11 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
         p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k);
     check_hip(hipGetLastError(), "known prefill routed rows ordered merge");
     }
+    if (!committed) {
     hipLaunchKernelGGL(known_moe_prefill_commit_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0, stream,
         p.device, p.rows.csr.summary, count, config.hidden_size, hip_deferred_moe_status());
     check_hip(hipGetLastError(), "known prefill routed rows output commit");
+    }
     if (config.q4k_a8_stats) {
         auto& stats = *config.q4k_a8_stats;
         if (config.batched_slot_activation) {

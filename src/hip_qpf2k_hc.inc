@@ -241,6 +241,28 @@ unsigned qpf2k_hc_output3_band() {
     }();
     return qpf2k::suppressed(qpf2k::Item::hc_output3_band) ? 0U : band;
 }
+// STRIX_QPF2K_HC_LOWBAND (default 0; decimal 0..3, anything else = 0), with the qpf2k projection (mask bit 3) and output v3
+// band 16 (the defaults); same values, same chains, only where the low values are stored:
+//  bit 0  the projection writes low_t in 512-row bands, low_t[(r / 512) * 320 * 512 + k * 512 + r % 512]: the output's rank
+//         stride is 2 KiB instead of the padded row count times 4 bytes (32 KiB at 8192 rows). A band-16 CTA's 32 rows lie in
+//         one 512-row band (row0 % 32 == 0), so each step's 32 values stay contiguous (one 128-byte segment) as before.
+//  bit 1  the projection skips the FP16 low copy (low16), read only by the WMMA output (STRIX_HCW_OUTPUT=2) and check mode.
+// Declines (old layout and stores) under STRIX_QPF2K_HC_CHECK, FP16 normalized rows, norm-free rows, other projection or
+// output forms. Calls of at most 512 padded rows keep the old low_t layout (bit 0 only: one band, the layouts coincide up to
+// the pitch); bit 1 still applies to them.
+constexpr std::uint32_t kQpf2kLowBandRows = 512U;
+unsigned qpf2k_hc_lowband() {
+    static const unsigned mode = [] {
+        const char* v = std::getenv("STRIX_QPF2K_HC_LOWBAND");
+        if (!v || !v[0] || v[1] || v[0] < '0' || v[0] > '3') return 0U;
+        return static_cast<unsigned>(v[0] - '0');
+    }();
+    return qpf2k_hc_mask() != 0U ? mode : 0U;
+}
+__device__ __forceinline__ std::uint64_t qpf2k_low_band_index(std::uint32_t k, std::uint32_t r) {
+    return static_cast<std::uint64_t>(r / kQpf2kLowBandRows) * (kHcwRank * kQpf2kLowBandRows) + k * kQpf2kLowBandRows +
+        r % kQpf2kLowBandRows;
+}
 // Bulk scalar-cache prefetch (Q > 0): one s_load_b32 per 64-byte line of the low values of Q rank steps, into a dummy SGPR
 // that is consumed only after the next compiler-inserted lgkmcnt(0) (which waits for every scalar load in flight); s[100:101]
 // is a clobbered scratch pair for the running step address. The values are never used.
@@ -305,10 +327,13 @@ __global__ __launch_bounds__(128) void qpf2k_hc_output3_kernel(HyperWideRows row
     static_assert(Q == 0U || U % Q == 0U);
     const unsigned lane = threadIdx.x % 32U, wave = threadIdx.x / 32U, row0 = blockIdx.x * R;
     const std::uint64_t feature = (static_cast<std::uint64_t>(blockIdx.y) * kWide2OutputWaves + wave) * 32U + lane;
+    const unsigned low0 = row0;
 #include "hip_qpf2k_hc_output3_body.inc"
 }
 
-template <typename Storage, unsigned Band>
+// LowBand (STRIX_QPF2K_HC_LOWBAND bit 0): the CTA's low values start at its row group's offset in the banded table (rank
+// pitch rows.low_t_pitch = 512); the body's loads are otherwise unchanged.
+template <typename Storage, unsigned Band, bool LowBand = false>
 __global__ __launch_bounds__(128) void qpf2k_hc_output3_band_kernel(HyperWideRows rows, const void* __restrict__ up, std::uint32_t hidden) {
     constexpr unsigned U = 16U, A = 1U, P = 8U, Q = 0U;
     constexpr unsigned R = 32U, S = kWideStreams, kBlocks = 10U, kRowBytes = kBlocks * 34U, Steps = 2U;
@@ -319,6 +344,7 @@ __global__ __launch_bounds__(128) void qpf2k_hc_output3_band_kernel(HyperWideRow
     // Within each band, visit its row groups for one feature tile, then the next feature tile (tail uses count).
     const unsigned row0 = (base + local % count) * R;
     const std::uint64_t feature = (static_cast<std::uint64_t>(local / count) * kWide2OutputWaves + wave) * 32U + lane;
+    const unsigned low0 = LowBand ? static_cast<unsigned>(qpf2k_low_band_index(0U, row0)) : row0;
 #include "hip_qpf2k_hc_output3_body.inc"
 }
 
@@ -335,7 +361,8 @@ __global__ __launch_bounds__(128) void qpf2k_hc_output3_band_kernel(HyperWideRow
 // and waited for them at once (global_load_b128 + s_waitcnt vmcnt(0) per stage). Depth 2 (v1) kept two stages in
 // registers; its 80 VGPRs made the compiler serialize the LDS fragment loads (ds_load pair, lgkmcnt(0), 2 WMMA)
 // (t2c: 3.67 ms vs 2.94 ms).
-template <unsigned Depth>
+// LowMode (STRIX_QPF2K_HC_LOWBAND): bit 0 low_t in 512-row bands, bit 1 no low16 stores; the stored values are unchanged.
+template <unsigned Depth, unsigned LowMode = 0U>
 __global__ __launch_bounds__(256) void qpf2k_hc_projection_kernel(HyperWideRows rows, const _Float16* __restrict__ pack,
     const float* __restrict__ inject, unsigned streams, _Float16* __restrict__ low16) {
     __shared__ __align__(16) _Float16 bs[2][kHcwProjCols * kHcwPitch];
@@ -440,8 +467,9 @@ __global__ __launch_bounds__(256) void qpf2k_hc_projection_kernel(HyperWideRows 
                 if (r >= rows.count) continue;
                 const float scaled = acc[t][c][e] / divisor, low = scaled * sigmoid(scaled);
                 wide_row(rows.normalized, rows.normalized_stride, r)[kHcwWidth + col] = low;
-                low16[static_cast<std::uint64_t>(r) * kHcwRank + col] = static_cast<_Float16>(low);
-                if (rows.low_t) rows.low_t[static_cast<std::uint64_t>(col) * rows.low_t_pitch + r] = low;
+                if constexpr (!(LowMode & 2U)) low16[static_cast<std::uint64_t>(r) * kHcwRank + col] = static_cast<_Float16>(low);
+                if constexpr ((LowMode & 1U) != 0U) rows.low_t[qpf2k_low_band_index(col, r)] = low;
+                else if (rows.low_t) rows.low_t[static_cast<std::uint64_t>(col) * rows.low_t_pitch + r] = low;
             }
     if (!injecting) return;
 #pragma unroll

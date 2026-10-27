@@ -26,9 +26,14 @@ struct WideHyperRowsTestViews {
     bool normalized16_only = false;        // the output's stream mix reads the FP16 rows too
     unsigned output3_band = UINT32_MAX;     // output 7 only: 0..8, 12/16/24/32/48/64 override the read-once env; UINT32_MAX uses it
     bool output3_zero_low_rank_stride = false;  // bench-only output 7 / band 0 / projection skipped; outputs discarded
+    unsigned low_band = UINT32_MAX;         // STRIX_QPF2K_HC_LOWBAND override 0..3 (projection 4, output 7, band 16); UINT32_MAX uses it
 };
 void enqueue_wide_hyper_rows_test(const HipHyperMixLauncherConfig& config, const WideHyperRowsTestViews& views,
     unsigned projection_kernel, unsigned output_kernel, hipStream_t stream);
+// The transposed low table the last lane-chain-output test call used (320 x 8192 FP32 values, layout per that call).
+const float* wide_hyper_rows_test_low_t();
+// The FP16 low copy (low16, 8192 x 320 halves) the WMMA projections write.
+const void* wide_hyper_rows_test_low16();
 // STRIX_QPF2K_HC folded inject (+ MoE combine) + HC norm over `rows` uniformly strided BF16 rows (hidden 2560, 4 streams,
 // FP32 norm weights [4][2560]); combine when routed is set. reference = only the production prefill norm kernel
 // rows_prepare_hyper_norm_kernel<bf16, HyperTileRows> on the streams (rows a multiple of 8; the caller runs the production

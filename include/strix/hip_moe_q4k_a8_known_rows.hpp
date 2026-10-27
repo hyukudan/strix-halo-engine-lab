@@ -79,6 +79,7 @@ struct PrefillRows {
     StridedRows<signed char> down_codes; StridedRows<float> down_deltas; StridedRows<int> down_sums;
     StridedRows<float> rawdots;
     CsrRows csr; // q51_known_rows::scratch_layout(T, experts, top_k, true) in an exclusive allocation
+    unsigned* unsafe = nullptr; // Private admission sidecar, stream-owned; null selects base producers.
 };
 // T CTAs: each row's clear, route checks and quantizer exactly as the window prologue.
 void enqueue_prefill_prologue(const Request&, const PrefillRows&, unsigned rows, unsigned clear_words, hipStream_t);
@@ -125,11 +126,15 @@ void set_prefill_core2(int core);
 void set_prefill_route(int bits);
 // qpf2k/moe-mi test hook: overrides STRIX_QPF2K_MOE_DA16 (1 = FP16 down operand image written by the last gate/up tile; -1 = environment).
 void set_prefill_da16(int on);
+// MoE header reuse test hook: overrides STRIX_QPF2K_MOE_HDR (1 = gate/up header reuse kernel; -1 = environment).
+void set_prefill_hdr(int on);
 // qpf2k/moe-mi test hooks: whether the last enqueue_prefill of this thread took the DA16 path; fill the DA16 image with 0xa5.
 bool prefill_da16_ran();
 // True when the last enqueue_prefill of this thread left the accumulation view unzeroed (STRIX_QPF2K_MOE_ROUTE bit 8): the
 // caller must then run the merge variant that writes zeros on its skip paths (known_moe_prefill_merge_kernel_z).
 bool prefill_clear_skipped();
+// True only after all three certificate producer specializations were enqueued for this call.
+bool prefill_certificate_produced();
 void prefill_test_poison_da16(hipStream_t stream);
 // qpf2k/moe-mi test hooks: STRIX_QPF2K_MOE_SMALL override (batches with <= rows assignments take the depth-3 body; 0 = off,
 // -1 = environment) and whether the last enqueue_prefill of this thread took that path.

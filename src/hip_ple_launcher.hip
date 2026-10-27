@@ -2278,32 +2278,7 @@ register_for_compiled_execution(
         "compiled execution has no PLE step");
 }
 
-// Prefill key / value projections of 64 strided rows through the wide q8_rows kernels, with the
-// arithmetic of project_wave8_q8_bf16_to_fp32_rows_kernel per row: coefficient scale * code, chain
-// acc += x * c over features 8L + l + 256k, shuffle-down lane tree then the leaf tree.
-__device__ __forceinline__ float ple_rows_tree_add(float lower, float upper) {
-    float result;
-    asm("v_add_f32 %0, %1, %2" : "=v"(result) : "v"(upper), "v"(lower));
-    return result;
-}
-template <unsigned Rows> struct PleRowsSite {
-    using Input = std::uint16_t;
-    static constexpr unsigned rows = Rows;
-    static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)
-    static constexpr bool tree_upper_src0 = true;  // add(lower, upper) reads upper as src0 (lane VOPD tree)
-    q8_rows::Segments segments;
-    std::uint32_t width, outputs, in_stride, out_stride;
-    const std::uint16_t* base;
-    float* out;
-    __device__ const std::uint16_t* row_input(unsigned r) const { return base + static_cast<std::uint64_t>(r) * in_stride; }
-    __device__ static float coefficient(unsigned scale, std::int8_t code) {
-        return __half2float(__ushort_as_half(static_cast<unsigned short>(scale))) * static_cast<float>(code);
-    }
-    __device__ static void fma(float& acc, float c, float x) { acc += x * c; }
-    __device__ static float add(float lower, float upper) { return ple_rows_tree_add(lower, upper); }
-    __device__ void store(std::uint32_t o, unsigned r, float value) const { out[static_cast<std::uint64_t>(r) * out_stride + o] = value; }
-};
-constexpr std::uint32_t kPleWideRows = 64U;
+#include "hip_ple_rows_site.inc"
 
 // Gathers rows (heads row ids each) from the file-mapped table into staging + r * stride on up to 8 threads, each with
 // its own stateless FileMappedPleLookupBackend: the same calls as the launch path's deferred gather.
@@ -2356,6 +2331,7 @@ struct HipPleKnownWindow::Impl {
     std::array<bool, 2> recorded{};
     std::byte* snapshots = nullptr;
     float* projections = nullptr;   // every row's key, then every row's value
+    q8_rows::LaneBuffer batch_rows; // barrier-ordered scratch owned by this window
     float* gates = nullptr;         // prefill: every row's stream gates (rows-form tail)
     std::uintptr_t conv_address = 0, ngram_address = 0;
     std::vector<PleHashResult> hashes;
@@ -2380,6 +2356,7 @@ struct HipPleKnownWindow::Impl {
         if (snapshots) (void)hipFree(snapshots);
         if (projections) (void)hipFree(projections);
         if (gates) (void)hipFree(gates);
+        if (batch_rows.base) (void)hipFree(batch_rows.base);
     }
     // Key and value projections of all rows, each Q8 weight block read once (the per-row
     // wave8 arithmetic). False when a projection is not wave8 Q8: rows project one by one.
@@ -2402,6 +2379,34 @@ struct HipPleKnownWindow::Impl {
         project(reinterpret_cast<const void*>(p.tensors.value.runtime->address), hidden,
             projections + static_cast<std::uint64_t>(max_rows) * expanded + static_cast<std::uint64_t>(first) * hidden);
         check_hip(hipGetLastError(), "prefill PLE wide rows projection launch");
+        return true;
+    }
+    bool project_rows_batch(const PreparedPleLaunch& p, const std::uint16_t* gathered, std::uint32_t groups) {
+        const auto width = static_cast<std::uint32_t>(config.model.ple_embed_dim);
+        if (!groups || weight_kind(p.tensors.key.manifest->ggml_type) != WeightKind::q8_0 ||
+            weight_kind(p.tensors.value.manifest->ggml_type) != WeightKind::q8_0 ||
+            (reinterpret_cast<std::uintptr_t>(gathered) | stride) % 16U || stride / 2U > UINT32_MAX) return false;
+        const auto expanded = static_cast<std::uint32_t>(p.expanded), hidden = static_cast<std::uint32_t>(config.model.hidden_size);
+        const auto site = [&](const void* weights, std::uint32_t outputs, float* out) {
+            PleRowsSite<kPleWideRows> result{};
+            result.segments = q8_rows::segments({{weights, outputs}});
+            result.width = width; result.outputs = outputs;
+            result.in_stride = static_cast<std::uint32_t>(stride / 2U); result.out_stride = outputs;
+            result.base = gathered; result.out = out;
+            return result;
+        };
+        const auto key = site(reinterpret_cast<const void*>(p.tensors.key.runtime->address), expanded, projections);
+        const auto value = site(reinterpret_cast<const void*>(p.tensors.value.runtime->address), hidden,
+            projections + static_cast<std::uint64_t>(max_rows) * expanded);
+        if (!ple_batch_admits(key, groups) || !ple_batch_admits(value, groups)) return false;
+        if (!ple_batch_reserve(batch_rows, static_cast<std::uint64_t>(groups) * kPleWideRows * width * sizeof(float))) return false;
+        // Resolve both caches before submitting consumers.
+        const auto kw = q8_rows::lane_weights(key, hip_execution_stream());
+        const auto vw = q8_rows::lane_weights(value, hip_execution_stream());
+        auto* packed = static_cast<float*>(batch_rows.base);
+        ple_batch_launch(key, kw, groups, packed, hip_execution_stream());
+        ple_batch_launch(value, vw, groups, packed, hip_execution_stream());
+        check_hip(hipGetLastError(), "prefill PLE batched projection launch");
         return true;
     }
     bool project_rows(const PreparedPleLaunch& p, const std::uint16_t* gathered, std::uint32_t count, std::uint32_t first = 0U) const {
@@ -2760,6 +2765,13 @@ void HipPleKnownWindow::launch(std::span<const ExecutionDispatchContext> rows) {
         };
         const auto total = static_cast<std::uint32_t>(rows.size());
         std::uint32_t first = 0;
+        static const bool batch = [] { const char* v = std::getenv("STRIX_PREFILL_PLE_BATCH"); return v && v[0] == '1' && v[1] == '\0'; }();
+        if (wide && batch && !qpf2k::suppressed(qpf2k::Item::ple_batch) &&
+            total >= kPleWideRows && w.project_rows_batch(prepared[0], at(0), total / kPleWideRows)) {
+            static const bool witness = [] { std::fprintf(stderr, "qpf2k ple row batch active\n"); return true; }();
+            (void)witness;
+            first = total / kPleWideRows * kPleWideRows;
+        }
         if (wide)
             while (total - first >= kPleWideRows && w.project_rows_wide(prepared[first], at(first), first)) first += kPleWideRows;
         if (check && first) {

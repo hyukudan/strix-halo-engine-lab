@@ -31,13 +31,15 @@ template<class T> struct F16LdsOf {
     using Rows=F16Rows<T::Table?T::Batch:1U>;
 };
 // The base kernel bodies (the same source the kernels include) for one (batch, tile) item, LDS passed in.
-template<bool Q5K,unsigned Tune,unsigned Core>
+template<bool Q5K,unsigned Tune,unsigned Core,bool Reuse=false>
 __device__ __forceinline__ void project_f16x_body(const unsigned char* gate,const unsigned char* up,const PrefillRows& view,
     unsigned hidden,unsigned outputs,const uint4* a16,const unsigned p1_batch,const unsigned p1_tile,
     typename F16LdsOf<F16TileX<Tune,Core>>::Stage* const p1_sb,typename F16LdsOf<F16TileX<Tune,Core>>::Rows& p1_rows) {
 #define STRIX_F16X_BATCH_TILE const unsigned batch=p1_batch,tile=p1_tile;
 #define STRIX_F16X_LDS(S,R) S* const sb=p1_sb; R& rows=p1_rows;
+#define STRIX_F16X_HDR_REUSE Reuse
 #include "hip_moe_f16x_project_body.inc"
+#undef STRIX_F16X_HDR_REUSE
 #undef STRIX_F16X_BATCH_TILE
 #undef STRIX_F16X_LDS
 }

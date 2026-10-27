@@ -229,7 +229,8 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
             return decline("explicit-diagnostic-or-execution-control");
     }
     for (const auto& entry : qpf2k::defaults)
-        if (env_is(request.environment, entry.name, "0")) return decline("feature-disabled");
+        if (!(qpf2k::exact_prefill_items & qpf2k::bit(entry.item)) &&
+            env_is(request.environment, entry.name, "0")) return decline("feature-disabled");
     const auto defaults = request.environment.find("STRIX_QPF2K_DEFAULTS");
     if (defaults != request.environment.end() && !defaults->second.empty() && defaults->second[0] == '0')
         return decline("feature-disabled");

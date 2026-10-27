@@ -165,8 +165,9 @@ Off switches:
   prepared execution, shared overlap and GDN islands). Explicit arithmetic/organization still has historical validators.
 - `STRIX_PREFILL_F16=0`: decline automatic tiling and retain historical resolution.
 - `--prefill-numerical-profile dense-a8`: retain automatic tiling with the dense-A8 prefill identity.
-- `STRIX_QPF2K_DEFAULTS=0`: stop default injection and decline automatic tiling; explicit environment values remain.
-- Individual controlled feature values `=0` also decline automatic tiling. To measure a single operator inside
+- `STRIX_QPF2K_DEFAULTS=0` (any value starting with `0`): stop default injection and decline automatic tiling; explicit environment values remain.
+- Individual controlled feature values `=0` also decline automatic tiling, except the five exact prefill
+  alternatives below, whose `=0` disables only that item and keeps the route. To measure a single operator inside
   the same tiled identity, use an explicit tiled route with the same T, budgets and profile pair.
 - `STRIX_PLE_RECLAIMABLE=0`: keep the original warm PLE pages; `auto` has its own route/setup admission.
 - `--known-prefix-window=0`: disable automatic tiling. The full-rows, expert-union, router-rows and prefill-rows
@@ -179,6 +180,19 @@ and `STRIX_PLE_RECLAIMABLE=auto`. These nine wrapper settings are injected only 
 route; declined MTP/serving/cohort/diagnostic/model/memory routes keep historical defaults and explicit overrides.
 Pre-main initialization retains the historical tiled settings and route-gated PLE reclaim for other clients.
 See the [full catalog](../optimizations.md#qwen-defaults) for every value and guard.
+
+The same decoder admission also defaults five exact prefill alternatives when unset (bitwise identical results;
+deferred at startup, so MTP/HTTP serving, cohorts and other binaries keep their opt-ins; filtered per GSQ owner):
+
+| Default | Operation and retained gate | Off switch |
+|---|---|---|
+| `STRIX_QPF2K_SCORE_ROWS=auto` | Stage-batch QSA scorer: 32 rows above 4096 blocks, 16 otherwise. | `STRIX_QPF2K_SCORE_ROWS=0` (16 rows) |
+| `STRIX_PREFILL_PLE_BATCH=1` | PLE 64-row groups; wide lane recipe, layout and scratch admission still apply. | `STRIX_PREFILL_PLE_BATCH=0` |
+| `STRIX_QPF2K_SHARED_PRE=1` | Shared-expert FP16 operand preimage; existing tiled down admission and fallback apply. | `STRIX_QPF2K_SHARED_PRE=0` |
+| `STRIX_QPF2K_MOE_MC=1` | Ordered MoE merge + BF16 commit (mode 1) behind the existing DA16/ROUTE=14 certificate. | `STRIX_QPF2K_MOE_MC=0` |
+| `STRIX_QPF2K_MOE_HDR=1` | Gate/up superblock header reuse within the DA16 tune 80/82 path. | `STRIX_QPF2K_MOE_HDR=0` |
+
+`STRIX_QPF2K_HC_LOWBAND` remains opt-in; MC mode 2 requires an explicit value.
 
 The following explicit MTP configuration remains useful for speculative runs. Its low-level flags own that
 route; do not append them to the recommended plain command to request defaults that are already automatic.

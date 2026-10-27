@@ -1,5 +1,6 @@
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
 #include "strix/moe_a8_down_contract.hpp"
+#include "strix/qpf2k_defaults.hpp"
 #if defined(__FAST_MATH__) || (defined(__FINITE_MATH_ONLY__) && __FINITE_MATH_ONLY__)
 #error "A8 CSR gate/up requires strict floating-point semantics"
 #endif
@@ -2225,6 +2226,7 @@ unsigned prefill_effective_tune(const Request& request,unsigned count,unsigned d
 void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned count,unsigned clear_words,
     const unsigned char* gate,const unsigned char* up,unsigned down_type,const unsigned char* down_weights,hipStream_t stream,int form) {
     const bool q5k=request.gate_type==13U,q20=gsq_a8::gate_type(request.gate_type);  // every GSQ gate type: dot4 form
+    prefill_certificate_flag()=false;
     prefill_fused_flag()=false;prefill_da16_flag()=false;prefill_small_flag()=false;prefill_clear_skipped_flag()=false;
     if((down_type!=7U&&down_type!=8U&&!gsq_a8::down_type(down_type))||(request.gate_type!=12U&&!q5k&&!q20)||
        (gsq_a8::down_type(down_type)&&!q20)||
@@ -2249,6 +2251,11 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
     const PrefillKernelForm kernel_form=prefill_kernel_form(request,down_type,form);
     const bool f16=kernel_form==PrefillKernelForm::f16_wmma;
     const unsigned tune=prefill_effective_tune(request,count,down_type,form);
+    // Binding requests certification; the launcher supplies it only with MC on. Fail closed on every other recipe.
+    const bool certificate=rows.unsafe&&form==3&&!q20&&f16&&(tune==82U||tune==80U)&&prefill_route()==14U&&
+        prefill_da16()&&prefill_core2()==0U&&prefill_small()==0U&&clear_words==request.shape.hidden&&
+        request.shape.hidden/64U>=5U&&request.shape.rows/64U>=5U&&
+        reinterpret_cast<std::uintptr_t>(rows.input.base)%16U==0U&&rows.input.stride%16U==0U;
     if(f16&&(request.shape.rows%128U||request.shape.hidden%256U))throw std::invalid_argument("A8 prefill FP16 WMMA geometry is invalid");
     const bool wmma=kernel_form!=PrefillKernelForm::dot4;
     const unsigned cap=f16?((tune&2U)?2U*f16_batch:f16_batch):wmma?wmma_batch:dot4_cap;
@@ -2266,6 +2273,10 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
         if((prefill_route()&2U)&&request.shape.hidden%8U==0U&&request.shape.hidden<=max_hidden&&request.shape.top_k<=32U&&
             aligned16(rows.input.base,rows.input.stride)) {
             static const bool witness=[]{std::fprintf(stderr,"qpf2k-moe-mi route prologue v2 active\n");return true;}();(void)witness;
+            if(certificate)hipLaunchKernelGGL(f16_prefill_prologue_v2_certificate,dim3(count),dim3(256),0,stream,rows,request.shape.hidden,request.shape.top_k,
+                request.shape.experts,prologue_clear,(tune&16U)?f16_prefill_a16():nullptr,
+                aligned16(rows.clear.base,rows.clear.stride)&&clear_words%4U==0U?1U:0U);
+            else
             hipLaunchKernelGGL(f16_prefill_prologue_v2,dim3(count),dim3(256),0,stream,rows,request.shape.hidden,request.shape.top_k,
                 request.shape.experts,prologue_clear,(tune&16U)?f16_prefill_a16():nullptr,
                 aligned16(rows.clear.base,rows.clear.stride)&&clear_words%4U==0U?1U:0U);
@@ -2284,6 +2295,8 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
         if(blocks==0U||blocks>csr_mw_blocks_max())throw std::invalid_argument("qpf2k CSR multi-CTA block count out of range");
         unsigned* scratch=csr_mw_scratch();
         check(hipMemsetAsync(scratch,0,csr_mw_head*sizeof(unsigned),stream),"qpf2k CSR scratch clear");
+        if(certificate)hipLaunchKernelGGL(csr_mw_count_certificate,dim3(blocks),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,scratch);
+        else
         hipLaunchKernelGGL(csr_mw_count,dim3(blocks),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,scratch);
         hipLaunchKernelGGL(csr_mw_scan,dim3(1),dim3(1024),0,stream,rows,count,request.shape.experts,request.shape.top_k,cap,blocks,scratch);
         hipLaunchKernelGGL(csr_mw_scatter,dim3(blocks),dim3(1024),0,stream,rows,count,request.shape.top_k,scratch);
@@ -2508,12 +2521,28 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                     unsigned* arrive=da16_counters();
                     uint4* image=da16_image();
                     check(hipMemsetAsync(arrive,0,static_cast<std::size_t>(batches)*sizeof(unsigned),stream),"qpf2k DA16 counters clear");
+                    if(prefill_hdr_reuse(q20||qpf2k::gsq_model)) {
+                        static const bool hdr_witness=[]{std::fprintf(stderr,"qpf2k moe gate/up header reuse active\n");return true;}();(void)hdr_witness;
+                        if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_da16_mg<true,Tune>),project_grid,dim3(Threads),0,stream,
+                            gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image);
+                        else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_da16_mg<false,Tune>),project_grid,dim3(Threads),0,stream,
+                            gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image);
+                    } else
                     if(q5k)hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_da16<true,Tune>),project_grid,dim3(Threads),0,stream,
                         gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image);
                     else hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_da16<false,Tune>),project_grid,dim3(Threads),0,stream,
                         gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image);
                     check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (DA16)");
                     const dim3 down_grid(request.shape.hidden/Tile::Columns,batches);
+                    if constexpr(Tune==82U||Tune==80U) if(certificate) {  // 80 = 82 below 96 assignments per expert
+                        if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate<true,Tune>),down_grid,dim3(Threads),0,
+                            stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
+                        else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate<false,Tune>),down_grid,dim3(Threads),0,
+                            stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
+                        check(hipGetLastError(),"FP16 prefill WMMA down (DA16 certificate)");
+                        prefill_certificate_flag()=true; // publish only after the entire producer chain was enqueued
+                        return;
+                    }
                     if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16<true,Tune>),down_grid,dim3(Threads),0,
                         stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
                     else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16<false,Tune>),down_grid,dim3(Threads),0,
@@ -2646,9 +2675,11 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
 void set_prefill_core2(int core){prefill_core2_override()=core;}
 void set_prefill_route(int bits){prefill_route_override()=bits;}
 void set_prefill_da16(int on){prefill_da16_override()=on;}
+void set_prefill_hdr(int on){prefill_hdr_override()=on;}
 void set_prefill_small(int rows){prefill_small_override()=rows;}
 bool prefill_small_ran(){return prefill_small_flag();}
 bool prefill_da16_ran(){return prefill_da16_flag();}
+bool prefill_certificate_produced(){return prefill_certificate_flag();}
 bool prefill_clear_skipped(){return prefill_clear_skipped_flag();}
 void prefill_test_poison_da16(hipStream_t stream){check(hipMemsetAsync(da16_image(),0xa5,static_cast<std::size_t>(q51_known_rows::prefill_max_rows)*max_top_k*max_rows*2U,stream),"poison DA16 image");}
 void prefill_test_poison_a16(hipStream_t stream){check(hipMemsetAsync(f16_prefill_a16(),0xa5,static_cast<std::size_t>(q51_known_rows::prefill_max_rows)*max_hidden*2U,stream),"poison FP16 prefill A image");}

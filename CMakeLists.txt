@@ -2065,6 +2065,9 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             endforeach()
         endforeach()
 
+        add_test(NAME strix-hip-shared-pre-fixtures COMMAND strix-hip-shared-known-window-rows-tests)
+        set_tests_properties(strix-hip-shared-pre-fixtures PROPERTIES ENVIRONMENT "STRIX_SHARED_PRE_FIXTURES_ONLY=1")
+
         add_executable(strix-hip-gdn-retained-window-tests tests/hip_gdn_retained_window_tests.hip)
         set_target_properties(strix-hip-gdn-retained-window-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
