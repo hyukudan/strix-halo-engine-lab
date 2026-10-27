@@ -1,3 +1,4 @@
+#include "minimax/engine/route_identity.hpp"
 // minimax-m3 index projections in one launch, exact dense_t order (src/minimax/attn/index_proj.hpp).
 #include "index_proj.hpp"
 
@@ -332,9 +333,14 @@ void enqueue_index_proj_tiled(const IndexProjView& v, hipStream_t stream) {
 
 void enqueue_index_proj(const IndexProjView& v, hipStream_t stream) {
     // Measured (ABA x3): one row = ring 32; two or more rows = ring 16, row pairs per wave (never slower).
-    const unsigned ring = ring_override() != 0 ? ring_override() : v.rows == 1 ? 32U : 16U;
-    if (v.rows >= 2 && v.rows <= 8 && lds_default() != 0U) enqueue_index_proj_decode_lds(v, stream);
-    else if (v.rows <= 8) enqueue_index_proj_decode(v, ring, stream, v.rows > 2 ? split_default() : 0U);
+    // Preserve the original lazy environment capture order: prefill must not
+    // initialize the decode-only LDS/split defaults before the first decode.
+    const unsigned ring = ring_override();
+    const unsigned lds = v.rows >= 2 && v.rows <= 8 ? lds_default() : 0U;
+    const unsigned split = v.rows <= 8 && v.rows > 2 && lds == 0 ? split_default() : 0U;
+    const auto choice = route::index_route(v.rows, ring, split, lds);
+    if (choice.lds) enqueue_index_proj_decode_lds(v, stream);
+    else if (!choice.tiled) enqueue_index_proj_decode(v, choice.ring, stream, choice.rows_per_wave);
     else enqueue_index_proj_tiled(v, stream);
 }
 

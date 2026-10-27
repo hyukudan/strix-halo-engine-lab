@@ -1,4 +1,5 @@
 #pragma once
+#include "minimax/engine/route_identity.hpp"
 // minimax-m3 prefill WMMA core v2: the same arithmetic as the library wmma_core port in
 // mmx_prefill.hip (wmma_item), scheduled for many rows per decoded weight tile.
 //
@@ -629,7 +630,7 @@ __global__ __launch_bounds__(128) void grouped_core8_kernel(const Item* items, u
 }
 
 // Row-tile class of an item with `rows` rows: MT in {1, 2, 4, 8} (index 0..3).
-inline unsigned mt_class(unsigned rows) { return rows <= 16 ? 0U : rows <= 32 ? 1U : rows <= 64 ? 2U : 3U; }
-inline unsigned mt_of_class(unsigned cls) { return 1U << cls; }
+inline unsigned mt_class(unsigned rows) { return route::mt_class(rows); }
+inline unsigned mt_of_class(unsigned cls) { return route::mt_of_class(cls); }
 
 }  // namespace strix::minimax::moe::opt::pfk
