@@ -62,6 +62,9 @@ class Exl3Linears:
         files = sorted(Path(exl3_dir).glob("*.safetensors"))
         self.file = st.SafetensorsFile(files[0])
 
+    def has(self, rel):
+        return D.P + rel + ".trellis" in self.file.header
+
     def linear(self, rel):
         w = self.st.load_exl3(self.file, D.P + rel)
         r16, r32, r64 = self.F.dequant_fast(w.trellis, w.bits, w.codebook, True)
@@ -71,15 +74,66 @@ class Exl3Linears:
         return torch.from_numpy(np.ascontiguousarray(W.T, dtype=np.float32))
 
 
+class AltHead:
+    """A draft-only head [vocab, 6144] float32 (exact float64 reconstruction of an EXL3 lm_head, applied as y @ W^T in
+    float32): `K8` = the target pack's own head through this float path (numerics control against Head's prod stages),
+    `rtn<bits>:<group>` = that K8 head RTN-requantized (a pessimistic CPU proxy for an EXL3 requant), else a
+    quant_head.py output dir (language_model.lm_head.* EXL3 tensors)."""
+
+    NAME = "language_model.lm_head"
+
+    def __init__(self, src, model, trellis_python):
+        rtn = src.startswith("rtn")
+        d = Path(model) if src == "K8" or rtn else Path(src)
+        idx = json.loads((d / "model.safetensors.index.json").read_text())["weight_map"]
+        lin = Exl3Linears(d, trellis_python)
+        lin.file = lin.st.SafetensorsFile(d / idx[self.NAME + ".trellis"])
+        w = lin.st.load_exl3(lin.file, self.NAME)
+        self.bits = float(w.bits)
+        # Exl3Linears.linear's reconstruction in chunks of 8192 outputs (every step is per element or per 128-block of
+        # one axis, so the chunks give the same bits) -> host peak ~6 GB instead of ~35 GB for the 200064 x 6144 head
+        tr, suh, svh = np.asarray(w.trellis), np.asarray(w.suh, np.float64), np.asarray(w.svh, np.float64)
+        Hd = lin.st.hadamard
+        self.W = torch.empty(svh.shape[0], suh.shape[0], dtype=torch.float32)
+        for o0 in range(0, svh.shape[0], 8192):
+            o1 = min(o0 + 8192, svh.shape[0])
+            _, _, r64 = lin.F.dequant_fast(tr[:, o0 // 16:o1 // 16], w.bits, w.codebook, True)
+            t = Hd(np.ascontiguousarray(Hd(r64).T)).T
+            Wc = suh[:, None] * t * svh[None, o0:o1]  # [in, out chunk]
+            self.W[o0:o1] = torch.from_numpy(np.ascontiguousarray(Wc.T, dtype=np.float32))
+        if rtn:
+            b, g = src[3:].split(":")
+            self.bits = float(b)
+            self.W = torch.cat([int4_rtn(self.W[r:r + 8192], int(g), int(b)) for r in range(0, self.W.shape[0], 8192)])
+
+    def __call__(self, y):  # y [n, 6144] float32 numpy -> logits [n, vocab]
+        return (torch.from_numpy(np.ascontiguousarray(y, np.float32)) @ self.W.T).numpy()
+
+
+def int4_rtn(W, group, bits=4):
+    """Round-to-nearest asymmetric INT<bits> (default 4) per group of `group` inputs (scale = (max - min) / (2^bits - 1),
+    zero = min), dequantized to float32 [out, in]: the candidate format for a bandwidth-bound draft gemv (report §14)."""
+    out, inp = W.shape
+    top = float(2 ** bits - 1)
+    g = W.reshape(out, inp // group, group)
+    lo, hi = g.amin(dim=2, keepdim=True), g.amax(dim=2, keepdim=True)
+    scale = torch.clamp((hi - lo) / top, min=1e-12)
+    q = torch.clamp(torch.round((g - lo) / scale), 0, top)
+    return (q * scale + lo).reshape(out, inp).to(torch.float32)
+
+
 class Draft32:
-    def __init__(self, draft_dir, exl3=None):
+    def __init__(self, draft_dir, exl3=None, int4_group=0):
         torch.set_default_dtype(torch.float32)
         dr = D.Draft(draft_dir)
         dr.cast = torch.float32
         if exl3 is not None:
             dr.linear = exl3.linear  # linears from the requant, everything else as shipped
+        elif int4_group:
+            shipped = dr.linear
+            dr.linear = lambda rel: int4_rtn(shipped(rel), int4_group)  # block linears only (fc and heads as shipped)
         self.dr = dr
-        self.fc = dr.plain("fc.weight")
+        self.fc = exl3.linear("fc") if exl3 is not None and exl3.has("fc") else dr.plain("fc.weight")
         self.hn = dr.plain("hidden_norm.weight")
         self.fn = dr.plain("final_norm.weight")
         self.L = []
@@ -218,6 +272,10 @@ def main():
     ap.add_argument("--no-filter", action="store_true", help="plumbing check: keep anchors off the greedy path")
     ap.add_argument("--copy-only", action="store_true", help="score only the copy drafter (no draft model, no head)")
     ap.add_argument("--exl3-linears", help="EXL3 requant dir (quant_draft.py): draft linears from it")
+    ap.add_argument("--int4", type=int, default=0, help="block linears RTN INT4 with this group size (0 = as shipped)")
+    ap.add_argument("--head-alt", help="draft-only head arm: 'K8' (float-path control) or a quant_head.py dir; scored on "
+                                       "the same anchors and blocks, plus per-depth agreement of its drafts with the K8 head's")
+    ap.add_argument("--head-hessian", help="write the head-input Hessian (sum y y^T over draft rows, count) here as .npz")
     a = ap.parse_args()
     td = Path(a.taps)
     meta = json.loads((td / "meta.json").read_text())
@@ -227,11 +285,14 @@ def main():
     taps = np.memmap(td / "taps.f32", np.float32, "r", shape=(n, D.TAPS, H))
     segs = [(s.split(":")[0], int(s.split(":")[1]), int(s.split(":")[2])) for s in a.segments] or [("all", 0, n)]
     t0 = time.time()
+    alt, head_h = None, None
     if not a.copy_only:
         head = Head(a.model, a.trellis_python)
-        dr = Draft32(a.draft, Exl3Linears(a.exl3_linears, a.trellis_python) if a.exl3_linears else None)
+        dr = Draft32(a.draft, Exl3Linears(a.exl3_linears, a.trellis_python) if a.exl3_linears else None, a.int4)
         if a.hessians:
             dr.hess = {}
+        alt = AltHead(a.head_alt, a.model, a.trellis_python) if a.head_alt else None
+        head_h = [torch.zeros(H, H, dtype=torch.float64), 0] if a.head_hessian else None
         K, V = dr.context(taps)
     embed_cache = {}
 
@@ -268,13 +329,29 @@ def main():
         acc_hist = np.zeros(T + 1, np.int64)
         depth_try, depth_ok = np.zeros(T, np.int64), np.zeros(T, np.int64)
         censored = 0
+        alt_hist = np.zeros(T + 1, np.int64)
+        agree_base, agree_draft, agree_n = np.zeros(T, np.int64), np.zeros(T, np.int64), 0
         for b0 in range(0, len(anchors), a.batch):
             batch = anchors[b0:b0 + a.batch]
             rows = np.stack([embed([int(toks[P])] + [D.NOISE] * (T - 1)) for P in batch])
             y = dr.blocks(rows, batch, K, V)
-            base = head(y.reshape(-1, H).numpy()).reshape(len(batch), T, -1)
+            yf = y.reshape(-1, H)
+            if head_h is not None:
+                y64 = yf.double()
+                head_h[0] += y64.T @ y64
+                head_h[1] += y64.shape[0]
+            base = head(yf.numpy()).reshape(len(batch), T, -1)
+            base_alt = alt(yf.numpy()).reshape(len(batch), T, -1) if alt is not None else None
             for bi, P in enumerate(batch):
                 d, conf = dr.sample(base[bi], y[bi], int(toks[P]))
+                if base_alt is not None:
+                    # alt arm: its own Markov chain from its own draws; agreement = same draft token at depth i (and
+                    # same base argmax), over every anchor (no censoring)
+                    da, _ = dr.sample(base_alt[bi], y[bi], int(toks[P]))
+                    agree_n += 1
+                    agree_draft += np.array([da[i] == d[i] for i in range(T)], np.int64)
+                    agree_base += (base_alt[bi].argmax(-1) == base[bi].argmax(-1)).astype(np.int64)
+                    alt_hist[score(da, P, toks, greedy)[0]] += 1
                 acc = 0
                 for i in range(1, T + 1):
                     depth_try[i - 1] += 1
@@ -296,12 +373,19 @@ def main():
                          "tau_fixed7": float((acc_hist * np.arange(T + 1)).sum() / max(1, cnt) + 1),
                          "accepted_hist": acc_hist.tolist(),
                          "depth_accept": [float(depth_ok[i] / max(1, depth_try[i])) for i in range(T)], "copy": copy_res}
+        if alt is not None:
+            results[name]["head_alt"] = {"src": a.head_alt, "bits": alt.bits, "accepted_hist": alt_hist.tolist(),
+                                         "tau_fixed7": float((alt_hist * np.arange(T + 1)).sum() / max(1, alt_hist.sum()) + 1),
+                                         "agree_draft": (agree_draft / max(1, agree_n)).tolist(),
+                                         "agree_base_argmax": (agree_base / max(1, agree_n)).tolist()}
     out = {"draft": a.draft, "taps": a.taps, "stride": a.stride, "segments": results, "seconds": round(time.time() - t0)}
     Path(a.out).write_text(json.dumps(out, indent=1))
     if calib:
         np.save(Path(a.out).with_suffix(".calib.npy"), np.array([(i, c, o) for _, i, c, o in calib], dtype=np.float64))
     if a.hessians and not a.copy_only:
         np.savez(a.hessians, **{k: v[0].numpy() for k, v in dr.hess.items()}, **{"n." + k: v[1] for k, v in dr.hess.items()})
+    if head_h is not None:
+        np.savez(a.head_hessian, head=head_h[0].numpy(), **{"n.head": head_h[1]})
     print(json.dumps(out), flush=True)
 
 

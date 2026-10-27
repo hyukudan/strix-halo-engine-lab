@@ -3763,7 +3763,7 @@ if(STRIX_FAMILY_MINIMAX)
                 -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee>)
             strix_target_warnings(strix_minimax_engine)
             # DSpark speculative draft (src/minimax/dspark): host reference + gfx1151 kernels.
-            add_library(strix_minimax_dspark STATIC src/minimax/dspark/hip_minimax_dspark.hip src/minimax/dspark/minimax_dspark_host.cpp
+            add_library(strix_minimax_dspark STATIC src/minimax/dspark/hip_minimax_dspark.hip src/minimax/dspark/markov_cand.hip src/minimax/dspark/minimax_dspark_host.cpp
                 src/minimax/dspark/minimax_dspark_files.cpp src/minimax/dspark/minimax_ngram.cpp)
             target_include_directories(strix_minimax_dspark PUBLIC src/minimax/dspark "${STRIX_HIP_INCLUDE_DIR}")
             target_link_libraries(strix_minimax_dspark PUBLIC "${STRIX_HIP_RUNTIME_LIBRARY}" Threads::Threads)
@@ -3777,6 +3777,11 @@ if(STRIX_FAMILY_MINIMAX)
                 target_link_libraries(strix-mm-dspark-tests PRIVATE strix_minimax_dspark)
                 target_compile_options(strix-mm-dspark-tests PRIVATE -ffp-contract=off)
                 add_test(NAME strix-mm-dspark-tests COMMAND strix-mm-dspark-tests)
+                add_executable(strix-hip-mm-markov-cand-tests src/minimax/dspark/tests/hip_markov_cand_tests.hip)
+                target_link_libraries(strix-hip-mm-markov-cand-tests PRIVATE strix_minimax_dspark Threads::Threads)
+                set_target_properties(strix-hip-mm-markov-cand-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+                target_compile_options(strix-hip-mm-markov-cand-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+                    -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
                 add_executable(strix-hip-mm-dspark-tests src/minimax/dspark/tests/hip_minimax_dspark_tests.hip)
                 target_link_libraries(strix-hip-mm-dspark-tests PRIVATE strix_minimax_dspark)
                 set_target_properties(strix-hip-mm-dspark-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)

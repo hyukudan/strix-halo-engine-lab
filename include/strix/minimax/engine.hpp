@@ -109,6 +109,9 @@ public:
     [[nodiscard]] std::vector<float> last_logits(std::size_t rows) const;
     // Control channel: `bytes` (1..65536) of host memory sent, the peer's `bytes` received (both ranks, same size).
     void exchange_bytes(const void* out, void* in, std::size_t bytes);
+    // Data channel for device buffers of any size (both ranks, same size): `local` (ordered after its producer on
+    // `stream`) to the peer, the peer's bytes into `remote` (enqueued on `stream`). One control-tagged comm.exchange.
+    void exchange_device(const void* local, void* remote, std::size_t bytes, void* stream);
     [[nodiscard]] std::uint64_t capacity() const;
     [[nodiscard]] std::uint32_t slots() const;
     // Copy positions [0, positions) of every layer's caches from slot `src` to slot `dst` (no exchange).
@@ -143,6 +146,15 @@ public:
     // model.safetensors.index.json and <name>.{trellis,suh,svh,mul1}; ref/quant_draft.py). Whole linears on both ranks
     // (the draft is replicated); gemv for <= 8 rows, gemm above. Draft numerics change acceptance only.
     void attach_draft_exl3(const std::string& dir, dspark::DeviceDrafter& drafter);
+    // Draft-only head (DSpark): this rank's vocabulary slice of an EXL3 requant of the lm_head (dir with
+    // model.safetensors.index.json and language_model.lm_head.{trellis,suh,svh}; ref/quant_head.py) replaces the target's
+    // head in head_logits() (the drafter's call). Decode and verify keep the target's head, so outputs stay exact; the
+    // draft's acceptance can change. STRIX_MM_DRAFT_HEAD=lib (strix_gemv, default) | sched (enqueue_linears_scheduled).
+    void attach_draft_head(const std::string& dir);
+    // attach_draft_head may be called several times (in-process comparisons): set_draft_head(i) selects the i-th attached
+    // head (default: the last one), -1 the target's head.
+    [[nodiscard]] int draft_heads() const;
+    void set_draft_head(int index);
     // With STRIX_MM_DRAFT_LIN=load: switch the drafter's block linears between enqueue_linears (true) and strix_gemv (same bits).
     void set_draft_linears_opt(bool on);
 

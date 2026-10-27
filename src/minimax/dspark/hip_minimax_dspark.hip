@@ -713,6 +713,9 @@ DeviceDrafter::DeviceDrafter(const Weights& host, Options options) : opt_(option
         ring_v_.push_back(alloc<std::uint16_t>(ring));
         ring_pos_.emplace_back(window, -1);
         ring_bytes_ += 4 * ring;
+        staged_.push_back(alloc<float>(32 * tap_width));
+        staged_n_.push_back(0);
+        staged_pos_.push_back(0);
     }
     constexpr std::size_t chunk = 32;  // context rows per launch
     r_ = alloc<float>(block * hidden);
@@ -823,7 +826,7 @@ void DeviceDrafter::linear(std::uint32_t layer, std::uint32_t kind, const float*
     const auto t0 = std::chrono::steady_clock::now();
     linear_impl(layer, kind, x, rows, out, st);
     hip_ok(hipDeviceSynchronize(), "profile");
-    lin_s_[kind] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    (in_append_ ? lin_app_s_ : lin_s_)[kind] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     ++lin_n_[kind];
 }
 
@@ -840,7 +843,8 @@ void DeviceDrafter::linear_group(std::uint32_t layer, std::initializer_list<std:
         const bool done = group_hook_(layer, kinds.begin(), n, x, rows, outs.begin(), st);
         hip_ok(hipDeviceSynchronize(), "profile");
         if (done) {
-            lin_s_[kinds.begin()[0]] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            (in_append_ ? lin_app_s_ : lin_s_)[kinds.begin()[0]] +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             for (const std::uint32_t k : kinds) ++lin_n_[k];
             return;
         }
@@ -901,7 +905,42 @@ void DeviceDrafter::head_norm_rope(float* x, std::size_t rows, std::uint32_t cou
 }
 
 void DeviceDrafter::append(std::uint32_t slot, const float* taps_rows, std::size_t n, std::uint64_t pos0, hipStream_t st) {
+    flush(slot, st);
+    append_now(slot, taps_rows, n, pos0, st);
+}
+
+void DeviceDrafter::flush(std::uint32_t slot, hipStream_t st) {
+    if (slot >= opt_.slots) throw std::invalid_argument("dspark: flush slot");
+    if (staged_n_[slot] == 0) return;
+    const std::size_t n = staged_n_[slot];
+    staged_n_[slot] = 0;
+    append_now(slot, staged_[slot], n, staged_pos_[slot], st);
+}
+
+void DeviceDrafter::append_deferred(std::uint32_t slot, const float* taps_rows, std::size_t n, std::uint64_t pos0,
+                                    hipStream_t st) {
     if (slot >= opt_.slots) throw std::invalid_argument("dspark: append slot");
+    if (staged_n_[slot] > 0 && pos0 != staged_pos_[slot] + staged_n_[slot]) flush(slot, st);  // not contiguous
+    if (staged_n_[slot] + n > 32) flush(slot, st);
+    if (n > 32) {
+        append_now(slot, taps_rows, n, pos0, st);
+        return;
+    }
+    if (staged_n_[slot] == 0) staged_pos_[slot] = pos0;
+    hip_ok(hipMemcpyAsync(staged_[slot] + staged_n_[slot] * tap_width, taps_rows, n * tap_width * sizeof(float),
+                          hipMemcpyDeviceToDevice, st),
+           "stage taps");
+    staged_n_[slot] += n;
+    if (staged_n_[slot] == 32) flush(slot, st);
+}
+
+void DeviceDrafter::append_now(std::uint32_t slot, const float* taps_rows, std::size_t n, std::uint64_t pos0, hipStream_t st) {
+    if (slot >= opt_.slots) throw std::invalid_argument("dspark: append slot");
+    in_append_ = true;  // profile attribution: linears of this call are context-append time
+    struct Mark {
+        bool& f;
+        ~Mark() { f = false; }
+    } mark{in_append_};
     if (pos0 + n > opt_.capacity) throw std::out_of_range("dspark: append beyond capacity");
     // Rows older than the window of the last one are never read: skip them.
     const std::size_t skip = n > window ? n - window : 0;
@@ -928,6 +967,7 @@ void DeviceDrafter::append(std::uint32_t slot, const float* taps_rows, std::size
 void DeviceDrafter::forward_block(std::uint32_t slot, const std::uint16_t* anchor_row, const std::uint16_t* noise_row, std::uint64_t position,
                           hipStream_t st) {
     if (slot >= opt_.slots) throw std::invalid_argument("dspark: block slot");
+    flush(slot, st);
     if (position + block > opt_.capacity) throw std::out_of_range("dspark: block beyond capacity");
     const std::uint64_t first = position > context_keys ? position - context_keys : 0;
     const auto ctx = static_cast<std::uint32_t>(position - first);

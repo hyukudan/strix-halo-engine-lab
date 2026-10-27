@@ -331,7 +331,8 @@ double SurvivalController::probability(std::uint32_t depth, float confidence) co
 
 std::uint32_t SurvivalController::choose(std::span<const float> conf, std::span<const double> cost) {
     const auto max_k = static_cast<std::uint32_t>(std::min<std::size_t>({cost.size() - 1, conf.size(), std::size_t{block}}));
-    if (calls_++ == 0 || (explore_ != 0 && calls_ % explore_ == 0)) return max_k;
+    if (calls_++ == 0) return max_k;
+    const bool explore = explore_ != 0 && calls_ % explore_ == 0;
     std::uint32_t best = 0;
     double expected = 1.0, survival = 1.0, best_rate = expected / cost[0];
     for (std::uint32_t k = 1; k <= max_k; ++k) {
@@ -343,7 +344,7 @@ std::uint32_t SurvivalController::choose(std::span<const float> conf, std::span<
             best = k;
         }
     }
-    return best;
+    return explore ? std::min(max_k, best + 2) : best;
 }
 
 void SurvivalController::observe(std::span<const float> conf, std::uint32_t k, std::uint32_t accepted) {
@@ -370,6 +371,12 @@ void DraftGate::observe(bool drafted, std::uint32_t emitted, double seconds, dou
     const double t_plain = t_plain_ > 0 ? t_plain_ : plain_estimate;
     if (t_plain <= 0) return;
     const double x = static_cast<double>(emitted) - seconds / t_plain;
+    if (agreed_) {
+        n_ = 0.97 * n_ + 1;
+        sx_ = 0.97 * sx_ + x;
+        sxx_ = 0.97 * sxx_ + x * x;
+        return;
+    }
     n_ += 1;
     sx_ += x;
     sxx_ += x * x;
@@ -382,6 +389,21 @@ void DraftGate::observe(bool drafted, std::uint32_t emitted, double seconds, dou
     } else if (mean - half > 0) {
         backoff_ = 8;
     }
+}
+
+std::uint32_t DraftGate::proposal() {
+    if (n_ < min_) return 0;
+    const double mean = sx_ / n_;
+    const double half = z_ * std::sqrt(std::max(0.0, sxx_ / n_ - mean * mean) / n_);
+    if (mean + half < 0) return backoff_;
+    if (mean - half > 0) backoff_ = 8;
+    return 0;
+}
+
+void DraftGate::pause(std::uint32_t cycles) {
+    if (cycles == 0) return;
+    skip_ = cycles;
+    backoff_ = std::min<std::uint32_t>(128, 2 * cycles);
 }
 
 } // namespace strix::minimax::dspark

@@ -35,6 +35,17 @@ constexpr Item kItems[] = {
     {"dspark_attn", "STRIX_MM_DSPARK_ATTN", "2", "0",
      "Drafter measurement: bitwise, drafter attention B/A 0.964-0.975 / 0.918-0.924 / 0.815-0.819 at ctx 300/1000/4095"},
     {"draft_lin", "STRIX_MM_DRAFT_LIN", "opt", "lib", "Optimized draft linears (measurement evidence)"},
+    {"linear_v11", "STRIX_MMX_LINEAR_V11", "1", "0",
+     "Draft linear measurement: same bits as v10 (bitwise, ids == greedy 36/36), DSpark draft block -11.9 %"},
+    // DSpark Markov chain (acceptance only, verify unchanged; C / |H| / top-C act on the cand form)
+    {"markov_cand", "STRIX_MM_MARKOV", "cand", "full",
+     "Markov measurement: cand C4096/H8192 + device exchange + top-C v2, verify exact, acceptance unchanged"},
+    {"markov_cand_c", "STRIX_MM_MARKOV_C", "4096", "1024",
+     "Markov measurement: C 4096 (offline approx1-K3: C4096/H8192 0 acceptance changes on 1857 anchors)"},
+    {"markov_cand_h", "STRIX_MM_MARKOV_H", "8192", "2048",
+     "Markov measurement: |H| 8192 (offline approx1-K3: C4096/H8192 0 acceptance changes on 1857 anchors)"},
+    {"markov_topc_v2", "STRIX_MM_MARKOV_TOPC", "v2", "v1",
+     "Markov measurement: top-C v2 = v1 canonical set / scores / picks (payload gates v1/v2 vs CPU)"},
     // prefill
     {"pf_core_v4", "STRIX_MMX_PREFILL_CORE", "v4", "lib", "Prefill core measurement: bitwise everywhere, whole call 0.34-0.58x lib"},
     {"pf_msa_batch", "STRIX_MM_PF_MSA_BATCH", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},

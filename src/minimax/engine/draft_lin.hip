@@ -258,7 +258,7 @@ void DraftLinears::run_group(unsigned layer, const std::uint32_t* kinds, unsigne
         j[i] = {raw_[s], x, dims_[s].cols, outs[i], dims_[s].rows};
         if (i > 0 && dims_[s].cols != j[0].x_stride) throw std::invalid_argument("draft linears: a group shares one input width");
     }
-    mmoe::enqueue_linears_scheduled(j, count, static_cast<unsigned>(rows), opt_ws_, stream);
+    mmoe::enqueue_linears_scheduled(j, count, static_cast<unsigned>(rows), opt_ws_, stream, /*draft_block=*/true);
 }
 
 void DraftLinears::warm_up() {
@@ -273,7 +273,7 @@ void DraftLinears::warm_up() {
     if (!raw_.empty())
         for (unsigned s = 0; s < kBlock; ++s) {
             const mmoe::LinearJob one{raw_[s], sx_, dims_[s].cols, sy_, dims_[s].rows};
-            mmoe::enqueue_linears_scheduled(&one, 1, 7, opt_ws_, nullptr);
+            mmoe::enqueue_linears_scheduled(&one, 1, 7, opt_ws_, nullptr, /*draft_block=*/true);
         }
     dl_hip(hipDeviceSynchronize(), "warm-up");
 }

@@ -132,8 +132,14 @@ void enqueue_linears(const LinearJob* jobs, unsigned count, unsigned rows, void*
                      hipEvent_t* marks = nullptr);
 // The same with the measured per-shape / N schedule regardless of STRIX_MMX_LINEAR_V (which is read once per process
 // and pinned by the engine for its own sites): for callers such as the DSpark drafter. Same output bits.
-void enqueue_linears_scheduled(const LinearJob* jobs, unsigned count, unsigned rows, void* workspace, hipStream_t stream);
-// decode (STRIX_MM_XB_PREP): the input transform of the two-launch forms written by the producer of x instead of the
+// draft_block (v11): the caller is the DSpark draft block (DraftLinears); at 7 rows its q+k+v / o / gate+up groups
+// then take linear core v11 (same bits, measured faster there; STRIX_MMX_LINEAR_V11=0 disables). Other callers: false.
+void enqueue_linears_scheduled(const LinearJob* jobs, unsigned count, unsigned rows, void* workspace, hipStream_t stream,
+                               bool draft_block = false);
+// One form for this call (1, 3..10, as STRIX_MMX_LINEAR_V=version would select it), for callers whose shape the schedule
+// does not cover (the DSpark draft-only head: v9 at R=7). Same output bits.
+void enqueue_linears_version(const LinearJob* jobs, unsigned count, unsigned rows, void* workspace, hipStream_t stream, int version);
+// monodec (STRIX_MM_XB_PREP): the input transform of the two-launch forms written by the producer of x instead of the
 // prepare launch. linear_xt_offsets gives, per job, the offset in halves (_Float16) of its transformed input inside the
 // workspace (row r of job i at workspace + offs[i] + r * input); the producer writes it with dev::transform_block (the
 // prepare kernel's function, same bits) and the call then passes inputs_prepared = true (no prepare launch). Only the

@@ -145,18 +145,20 @@ public:
         const std::uint8_t *tr = nullptr, *suh = nullptr, *svh = nullptr;
         std::uint64_t tr_bytes = 0, suh_bytes = 0, svh_bytes = 0, rows = 0, cols = 0, bits = 0;
     };
-    Staged stage_out(const std::string& prefix, std::uint64_t o0, std::uint64_t n) {
-        const TensorInfo &tr = pack_.info(prefix + ".trellis"), &suh = pack_.info(prefix + ".suh"), &svh = pack_.info(prefix + ".svh");
+    Staged stage_out(const std::string& prefix, std::uint64_t o0, std::uint64_t n) { return stage_out(pack_, prefix, o0, n); }
+    // The same from another pack (a draft-only requant of a target tensor, Engine::attach_draft_head).
+    Staged stage_out(PackReader& pk, const std::string& prefix, std::uint64_t o0, std::uint64_t n) {
+        const TensorInfo &tr = pk.info(prefix + ".trellis"), &suh = pk.info(prefix + ".suh"), &svh = pk.info(prefix + ".svh");
         if (o0 % 128 != 0 || n % 128 != 0 || o0 + n > svh.shape[0]) throw std::invalid_argument("bad output slice " + prefix);
         const std::uint64_t in_tiles = tr.shape[0], out_tiles = tr.shape[1], w = tr.shape[2] * 2;  // bytes per tile
         const std::uint64_t tr_bytes = in_tiles * (n / 16) * w;
         if (whole_.size() < tr.bytes) whole_.resize(tr.bytes);
-        pack_.read(tr, 0, tr.bytes, whole_.data());
+        pk.read(tr, 0, tr.bytes, whole_.data());
         std::uint8_t* t = stage(tr_bytes + suh.bytes + n * 2);
         for (std::uint64_t i = 0; i < in_tiles; ++i)
             std::memcpy(t + i * (n / 16) * w, whole_.data() + (i * out_tiles + o0 / 16) * w, (n / 16) * w);
-        pack_.read(suh, 0, suh.bytes, t + tr_bytes);
-        pack_.read(svh, o0 * 2, n * 2, t + tr_bytes + suh.bytes);
+        pk.read(suh, 0, suh.bytes, t + tr_bytes);
+        pk.read(svh, o0 * 2, n * 2, t + tr_bytes + suh.bytes);
         return {t, t + tr_bytes, t + tr_bytes + suh.bytes, tr_bytes, suh.bytes, n * 2, n, suh.shape[0], tr.shape[2] / 16};
     }
     Staged stage_in(const std::string& prefix, std::uint64_t i0, std::uint64_t n) {
@@ -170,10 +172,17 @@ public:
         return {t, t + tr_bytes, t + tr_bytes + n * 2, tr_bytes, n * 2, svh.bytes, svh.shape[0], n, tr.shape[2] / 16};
     }
     Lin out_slice(const std::string& prefix, std::uint64_t o0, std::uint64_t n) { return prepared(prefix, stage_out(prefix, o0, n)); }
+    Lin out_slice(PackReader& pk, const std::string& prefix, std::uint64_t o0, std::uint64_t n) {
+        return prepared(prefix, stage_out(pk, prefix, o0, n));
+    }
     Lin in_slice(const std::string& prefix, std::uint64_t i0, std::uint64_t n) { return prepared(prefix, stage_in(prefix, i0, n)); }
     // The same slices as raw device buffers in the strix-trellis device layout (= file layout), for the MiniMax MoE
     // kernels (src/minimax/moe): trellis words, suh / svh FP16.
     mmoe::Exl3 raw_out(const std::string& prefix, std::uint64_t o0, std::uint64_t n) { return raw(stage_out(prefix, o0, n)); }
+    // From another pack into its own exact-size device allocation (not the 1 GiB arena chunks: a draft-only copy).
+    mmoe::Exl3 raw_out(PackReader& pk, const std::string& prefix, std::uint64_t o0, std::uint64_t n) {
+        return raw(stage_out(pk, prefix, o0, n), true);
+    }
     mmoe::Exl3 raw_in(const std::string& prefix, std::uint64_t i0, std::uint64_t n) { return raw(stage_in(prefix, i0, n)); }
     // Raw bytes of a plain tensor to device memory through the staging buffer.
     void upload_raw(const std::string& name, void* dst) {
@@ -293,8 +302,17 @@ private:
         arena_left_ -= bytes;
         return r;
     }
-    mmoe::Exl3 raw(const Staged& g) {
-        std::uint8_t* d = arena(g.tr_bytes + 256 + g.suh_bytes + 256 + g.svh_bytes);
+    mmoe::Exl3 raw(const Staged& g, bool own = false) {
+        const std::uint64_t bytes = g.tr_bytes + 256 + g.suh_bytes + 256 + g.svh_bytes;
+        std::uint8_t* d = nullptr;
+        if (own) {
+            void* p = nullptr;
+            hip_ok(hipMalloc(&p, bytes), "raw");
+            arenas_.push_back(p);
+            d = static_cast<std::uint8_t*>(p);
+        } else {
+            d = arena(bytes);
+        }
         std::uint8_t* d_suh = d + ((g.tr_bytes + 255) & ~std::uint64_t{255});
         std::uint8_t* d_svh = d_suh + ((g.suh_bytes + 255) & ~std::uint64_t{255});
         hip_ok(hipMemcpy(d, g.tr, g.tr_bytes, hipMemcpyHostToDevice), "raw trellis");
@@ -2209,8 +2227,96 @@ struct Engine::Impl {
     }
     const float* head_logits(const float* rows_in, std::size_t n) {
         if (n == 0 || n > kMaxStepRows) throw std::invalid_argument("head_logits: 1..8 rows");
-        lib.mm(head, rows_in, logits, n, true);
+        const DraftHead* d = dhead_sel >= 0 ? &dheads[static_cast<std::size_t>(dhead_sel)] : nullptr;
+        if (d != nullptr && d->ws) {
+            const mmoe::LinearJob j{d->raw, rows_in, static_cast<std::uint32_t>(kHidden), logits, static_cast<std::uint32_t>(vn)};
+            if (d->version != 0) mmoe::enqueue_linears_version(&j, 1, static_cast<unsigned>(n), d->ws.get(), nullptr, d->version);
+            else mmoe::enqueue_linears_scheduled(&j, 1, static_cast<unsigned>(n), d->ws.get(), nullptr);
+        } else {
+            lib.mm(d != nullptr ? d->lin : head, rows_in, logits, n, true);
+        }
         return logits;
+    }
+    // Draft-only head (attach_draft_head): this rank's slice of a requant of the lm_head, read by head_logits() only.
+    // STRIX_MM_DRAFT_HEAD=lib (default: strix_gemv) | sched (enqueue_linears_scheduled on a raw copy, strix_gemv bits) |
+    // sched:V (that enqueue_linears form, V in 4 8 9 10; measured at R=7: K4 v9 1.77 ms vs K8 strix_gemv 2.96 ms).
+    struct HipFree {
+        void operator()(void* p) const { (void)hipFree(p); }
+    };
+    // Several may be attached (in-process comparisons); head_logits() reads dheads[dhead_sel], the last attached by
+    // default, the target's head when dhead_sel < 0 (set_draft_head).
+    struct DraftHead {
+        Lin lin;                            // lib
+        mmoe::Exl3 raw{};                   // sched
+        std::unique_ptr<void, HipFree> ws;  // sched: enqueue_linears workspace (block counters zeroed)
+        int version = 0;                    // sched:V
+    };
+    std::vector<DraftHead> dheads;
+    int dhead_sel = -1;
+    void attach_draft_head(const std::string& dir) {
+        no_task("attach_draft_head");
+        const auto t0 = Clock::now();
+        const char* e = std::getenv("STRIX_MM_DRAFT_HEAD");
+        const std::string spec = e != nullptr ? e : "lib";
+        const std::string mode = spec.substr(0, spec.find(':'));
+        int version = 0;
+        if (mode == "sched" && spec.size() > 5) {
+            const std::string vs = spec.substr(6);
+            version = vs == "4" ? 4 : vs == "8" ? 8 : vs == "9" ? 9 : vs == "10" ? 10 : -1;
+        }
+        if ((mode != "lib" && mode != "sched") || version < 0 || (mode == "lib" && spec != "lib"))
+            throw std::invalid_argument("STRIX_MM_DRAFT_HEAD must be lib, sched or sched:4|8|9|10");
+        PackReader pk(dir);
+        const std::string nm = "language_model.lm_head";
+        {  // the same shape as the target's head, MUL1 trellis (the library and the kernels assume it) of 3..8 bits
+            const TensorInfo &tr = pk.info(nm + ".trellis"), &suh = pk.info(nm + ".suh"), &svh = pk.info(nm + ".svh");
+            const bool ok = tr.shape.size() == 3 && suh.shape.size() == 1 && svh.shape.size() == 1 && suh.shape[0] == kHidden &&
+                            svh.shape[0] == kVocab && tr.shape[0] == kHidden / 16 && tr.shape[1] == kVocab / 16 &&
+                            tr.shape[2] % 16 == 0 && tr.shape[2] / 16 >= 3 && tr.shape[2] / 16 <= 8 &&
+                            (mode == "lib" || tr.shape[2] / 16 != 7);
+            if (!ok) throw std::invalid_argument("attach_draft_head: " + dir + " lm_head is not a 3..8-bit " + std::to_string(kVocab) + " x " +
+                                                 std::to_string(kHidden) + " EXL3 tensor" + (mode == "sched" ? " (sched: not 7 bits)" : ""));
+            const TensorInfo& mul1 = pk.info(nm + ".mul1");
+            const bool types = tr.dtype == "I16" && tr.bytes == tr.shape[0] * tr.shape[1] * tr.shape[2] * 2 && suh.dtype == "F16" &&
+                               suh.bytes == kHidden * 2 && svh.dtype == "F16" && svh.bytes == kVocab * 2 && mul1.dtype == "I32" &&
+                               mul1.bytes == 4;
+            if (!types) throw std::invalid_argument("attach_draft_head: " + dir + " lm_head dtypes / sizes differ from the target pack's");
+            if (version == 10 && (kVocabPad % 256 != 0 || (kVocab - kVocabPad) % 256 != 0))  // both ranks refuse together
+                throw std::invalid_argument("attach_draft_head: v10 needs a multiple of 256 outputs on both ranks (slices " +
+                                            std::to_string(kVocabPad) + ", " + std::to_string(kVocab - kVocabPad) + ")");
+        }
+        struct Release {  // the pinned staging buffer and the whole-trellis host copy go on every exit
+            Lib& l;
+            ~Release() { l.release_staging(); }
+        } release{lib};
+        const std::uint64_t v0 = opt.rank == 0 ? 0 : kVocabPad;
+        std::uint64_t bits = 0;
+        if (mode == "sched") {
+            const mmoe::Exl3 r = lib.raw_out(pk, nm, v0, vn);
+            const mmoe::LinearJob j{r, nullptr, 0, nullptr, 0};
+            const std::size_t wb = mmoe::linear_workspace_bytes(&j, 1);
+            std::unique_ptr<void, HipFree> ws(dalloc<std::uint8_t>(wb));
+            hip_ok(hipMemset(ws.get(), 0, wb), "draft head workspace");  // block counters start at 0 (plan_linears)
+            hip_ok(hipDeviceSynchronize(), "load draft head");
+            DraftHead dh;
+            dh.raw = r;
+            dh.ws = std::move(ws);
+            dh.version = version;
+            dheads.push_back(std::move(dh));
+            bits = r.bits;
+        } else {
+            const Lin l = lib.out_slice(pk, nm, v0, vn);
+            lib.reserve_workspace(std::max(lib.workspace_bytes(), lib.workspace_bound(l, hn, logits, kMaxStepRows)));
+            hip_ok(hipDeviceSynchronize(), "load draft head");
+            DraftHead dh;
+            dh.lin = l;
+            dheads.push_back(std::move(dh));
+            bits = l.bits;
+        }
+        dhead_sel = static_cast<int>(dheads.size()) - 1;
+        std::printf("rank %u: DSpark draft-only head #%d %s (K%llu, %s, vocabulary [%llu, %llu)), %.1f ms\n", opt.rank, dhead_sel, dir.c_str(),
+                    static_cast<unsigned long long>(bits), spec.c_str(), static_cast<unsigned long long>(v0),
+                    static_cast<unsigned long long>(v0 + vn), std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
     }
     // DSpark draft linears (attach_draft_exl3): DraftLinears, STRIX_MM_DRAFT_LIN=opt (default: q+k+v and gate+up grouped on
     // enqueue_linears, strix_gemv bits) | lib (strix_gemv per linear, 9bc47241) | load (both, Engine::set_draft_linears_opt).
@@ -2264,6 +2370,14 @@ struct Engine::Impl {
         hip_ok(hipMemcpy(in, ctl_remote, bytes, hipMemcpyDeviceToHost), "ctl r");
     }
 
+    void exchange_device(const void* src_dev, void* dst_dev, std::size_t bytes, hipStream_t on) {
+        if (bytes == 0) throw std::invalid_argument("exchange_device: bytes must be > 0");
+        dist::Tag tag;
+        tag.kind = static_cast<std::uint32_t>(dist::TagKind::control);
+        tag.request = controls++;
+        comm.exchange(on, src_dev, dst_dev, bytes, tag);
+    }
+
     std::uint32_t peer(std::uint32_t val) {
         std::uint32_t mine[2] = {val, 0}, theirs[2] = {0, 0};
         hip_ok(hipMemcpy(am_local, mine, 8, hipMemcpyHostToDevice), "ctl");
@@ -2308,6 +2422,12 @@ std::pair<std::uint32_t, std::uint32_t> Engine::vocab_range() const {
 const float* Engine::head_logits(const float* rows, std::size_t n) { return impl_->head_logits(rows, n); }
 std::array<std::uint32_t, 2> Engine::peer2(std::uint32_t a, std::uint32_t b) { return impl_->peer2(a, b); }
 void Engine::attach_draft_exl3(const std::string& dir, dspark::DeviceDrafter& drafter) { impl_->attach_draft_exl3(dir, drafter); }
+void Engine::attach_draft_head(const std::string& dir) { impl_->attach_draft_head(dir); }
+int Engine::draft_heads() const { return static_cast<int>(impl_->dheads.size()); }
+void Engine::set_draft_head(int index) {
+    if (index < -1 || index >= static_cast<int>(impl_->dheads.size())) throw std::out_of_range("set_draft_head: no such draft head");
+    impl_->dhead_sel = index;
+}
 void Engine::set_draft_linears_opt(bool on) {
     if (!impl_->dlin) throw std::logic_error("set_draft_linears_opt: no EXL3 drafter attached");
     impl_->dlin->set_opt(on);
@@ -2327,6 +2447,9 @@ std::vector<float> Engine::last_logits(std::size_t rows) const {
     return out;
 }
 void Engine::exchange_bytes(const void* out, void* in, std::size_t bytes) { impl_->exchange_bytes(out, in, bytes); }
+void Engine::exchange_device(const void* local, void* remote, std::size_t bytes, void* stream) {
+    impl_->exchange_device(local, remote, bytes, static_cast<hipStream_t>(stream));
+}
 std::uint64_t Engine::capacity() const { return impl_->opt.capacity; }
 std::uint32_t Engine::slots() const { return impl_->opt.slots; }
 void Engine::copy_slot(std::uint32_t dst, std::uint32_t src, std::uint64_t positions) { impl_->copy_slot(dst, src, positions); }

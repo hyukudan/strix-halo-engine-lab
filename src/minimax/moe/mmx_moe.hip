@@ -2035,6 +2035,150 @@ __global__ __launch_bounds__(128) void linear_core10_kernel(LinArgs a) {
     }
 }
 
+// Linear v11 (reached only from enqueue_linears_scheduled at 7 rows, the DSpark draft block; STRIX_MMX_LINEAR_V11=0
+// disables): the v10 core with (a) an exact 7-row bucket (no padded eighth row), (b) W waves per CTA sharing ONE LDS copy
+// of the split inputs (W = 8 doubles the resident waves per SIMD at the same LDS; v10 is W = 4), (c) a register ring of
+// D k-rows, (d) for K3 the two-word reader (the third word of the lane window never reaches a K3 state: lane shifts
+// 3/11/19/27, the cross-word states need the top 2/5 bits of `low`). Per-column chains, split boundaries, reductions and
+// the finish (ascending splits, H128, svh) are those of v10 -> the same bits (measured: 56 forms x 5 layers x 2 calls ==
+// enqueue_linears_scheduled). CTA = W waves x one split; wave w owns 4 adjacent tile columns;
+// CTA = 4W columns = W/2 output blocks.
+template <int Bits, int R, bool Two>
+__device__ __forceinline__ void v11_compute(std::uint32_t a_, std::uint32_t b_, std::uint32_t c_, const d::LaneGeom<Bits>& g,
+                                            const d::Half2 (&act)[R][2], float (&sums)[R][2]) {
+    d::TileStates<Bits> t;
+    t.high = __builtin_amdgcn_alignbit(a_, b_, g.align);
+    if constexpr (Two) {
+        t.low = b_ << (32U - g.align);
+        t.tail = 0;
+    } else {
+        t.low = __builtin_amdgcn_alignbit(b_, c_, g.align);
+        t.tail = c_ << (32U - g.align);
+    }
+    const d::Half2 w0 = d::mul1_pair(t.template state<0>(), t.template state<1>());
+    const d::Half2 w1 = d::mul1_pair(t.template state<2>(), t.template state<3>());
+    const d::Half2 w2 = d::mul1_pair(t.template state<4>(), t.template state<5>());
+    const d::Half2 w3 = d::mul1_pair(t.template state<6>(), t.template state<7>());
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        sums[r][0] = __builtin_amdgcn_fdot2(w0, act[r][0], sums[r][0], false);
+        sums[r][0] = __builtin_amdgcn_fdot2(w1, act[r][1], sums[r][0], false);
+        sums[r][1] = __builtin_amdgcn_fdot2(w2, act[r][0], sums[r][1], false);
+        sums[r][1] = __builtin_amdgcn_fdot2(w3, act[r][1], sums[r][1], false);
+    }
+}
+template <int Bits, int R, int D, int W>
+__global__ __launch_bounds__(32 * W) void linear_core11_kernel(LinArgs a) {
+    extern __shared__ __attribute__((aligned(16))) unsigned char lin11_smem[];  // [R][xs_stride] halves, then W rows
+    unsigned ji = 0;
+    while (ji + 1 < a.count && blockIdx.x >= a.job[ji + 1].cta_begin) ++ji;
+    const LinJob& j = a.job[ji];
+    constexpr unsigned kCols = 4U * W;
+    const unsigned cols = j.w.output / 16U, groups = j.w.output / (16U * kCols);
+    const unsigned local = blockIdx.x - j.cta_begin, split = local / groups, group = local % groups;
+    const unsigned rows = a.rows;
+    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
+    const unsigned kt = j.w.input / 16, k0 = kt * split / j.splits, k1 = kt * (split + 1) / j.splits;
+    const unsigned ch = (k1 - k0) * 16;
+    const auto* xt = reinterpret_cast<const _Float16*>(a.ws) + j.xt_off;
+    auto* xs = reinterpret_cast<_Float16*>(lin11_smem);
+    for (unsigned q = threadIdx.x; q < static_cast<unsigned>(R) * (ch / 2); q += 32U * W) {
+        const unsigned r = q / (ch / 2), c = q % (ch / 2);
+        reinterpret_cast<std::uint32_t*>(xs)[r * (a.xs_stride / 2) + c] =
+            reinterpret_cast<const std::uint32_t*>(xt + static_cast<std::size_t>(r) * j.w.input + k0 * 16)[c];
+    }
+    __syncthreads();
+    const unsigned col0 = group * kCols + wave * 4U;
+    float* part = reinterpret_cast<float*>(a.ws) + j.part_off;
+    using V4 = std::uint32_t __attribute__((ext_vector_type(4)));
+    constexpr unsigned runU = 8U * Bits, UPL = (runU + 31U) / 32U;
+    constexpr bool Two = Bits == 3;
+    auto* rowbuf = reinterpret_cast<V4*>(lin11_smem + static_cast<std::size_t>(R) * a.xs_stride * 2) + wave * runU;
+    const auto* gw = reinterpret_cast<const V4*>(d::uniform(j.w.trellis));
+    const std::size_t kstride = static_cast<std::size_t>(cols) * 2U * Bits;
+    const std::size_t cbase = static_cast<std::size_t>(col0) * 2U * Bits;
+    V4 ring[D][UPL] = {};
+    const d::LaneGeom<Bits> geo(lane);
+    float sums[4][R][2];
+#pragma unroll
+    for (int c = 0; c < 4; ++c)
+#pragma unroll
+        for (int r = 0; r < R; ++r) sums[c][r][0] = sums[c][r][1] = 0.0F;
+    const auto* rl = (d::LocalU32*)(reinterpret_cast<const std::uint32_t*>(rowbuf));
+    const auto* xw = (d::LocalU32*)(reinterpret_cast<const std::uint32_t*>(xs)) + (lane & 3U);
+#pragma unroll
+    for (int q = 0; q < D; ++q)
+        if (k0 + static_cast<unsigned>(q) < k1)
+#pragma unroll
+            for (unsigned u = 0; u < UPL; ++u) {
+                const unsigned e = lane + 32U * u;
+                if (e < runU) ring[q][u] = gw[static_cast<std::size_t>(k0 + static_cast<unsigned>(q)) * kstride + cbase + e];
+            }
+    for (unsigned kb = k0; kb < k1; kb += D) {
+#pragma unroll
+        for (int q = 0; q < D; ++q) {
+            const unsigned k = kb + static_cast<unsigned>(q);
+            if (k < k1) {
+#pragma unroll
+                for (unsigned u = 0; u < UPL; ++u) {
+                    const unsigned e = lane + 32U * u;
+                    if (e < runU) rowbuf[e] = ring[q][u];
+                }
+                if (k + D < k1)
+#pragma unroll
+                    for (unsigned u = 0; u < UPL; ++u) {
+                        const unsigned e = lane + 32U * u;
+                        if (e < runU) ring[q][u] = gw[static_cast<std::size_t>(k + D) * kstride + cbase + e];
+                    }
+                d::Half2 act[R][2];
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const auto* pr = xw + (static_cast<unsigned>(r) * a.xs_stride) / 2U + (k - k0) * 8U;
+                    act[r][0] = __builtin_bit_cast(d::Half2, pr[0]);
+                    act[r][1] = __builtin_bit_cast(d::Half2, pr[4]);
+                }
+#pragma unroll
+                for (unsigned c = 0; c < 4; ++c) {
+                    const unsigned tw = c * Bits * 8U;
+                    const std::uint32_t wa = rl[tw + geo.oa / 4U], wb = rl[tw + geo.ob / 4U];
+                    const std::uint32_t wc = Two ? 0U : rl[tw + geo.oc / 4U];
+                    v11_compute<Bits, R, Two>(wa, wb, wc, geo, act, sums[c]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned c = 0; c < 4; ++c) {
+        float acc[R][2];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            acc[r][0] = 0.0F + d::reduce4(sums[c][r][0]);
+            acc[r][1] = 0.0F + d::reduce4(sums[c][r][1]);
+        }
+        linear_store_partial<R>(j, part, split, col0 + c, rows, lane, acc);
+    }
+    auto* counters = reinterpret_cast<std::uint32_t*>(a.ws + a.counter_off);
+#pragma unroll
+    for (unsigned h = 0; h < W / 2; ++h) {
+        const unsigned block = group * (W / 2) + h;
+        if (last_arrival(counters + j.block_begin + block, j.splits)) {
+            for (unsigned r = wave; r < rows; r += W) {  // = linear_finish with a W-wave row stride (same bits per row)
+                float v[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+                for (unsigned sp = 0; sp < j.splits; ++sp)
+#pragma unroll
+                    for (int qq = 0; qq < 4; ++qq)
+                        v[qq] += load_agent(part + (static_cast<std::size_t>(sp) * rows + r) * j.w.output + block * 128 + lane + 32U * static_cast<unsigned>(qq));
+                d::hadamard128(v, lane);
+#pragma unroll
+                for (int qq = 0; qq < 4; ++qq) {
+                    const unsigned i = block * 128 + lane + 32U * static_cast<unsigned>(qq);
+                    j.y[static_cast<std::size_t>(r) * j.y_stride + i] = v[qq] * d::half_bits(j.w.svh[i]);
+                }
+            }
+        }
+    }
+}
+
 struct LinPlan {
     LinArgs args{};
     unsigned ctas = 0, prep_ctas = 0;
@@ -2156,6 +2300,54 @@ int v9_mode() {
     }();
     return m;
 }
+// v11 schedule (bracketed A-V-A x3 vs enqueue_linears_scheduled at 7 rows, K3 / K4, 5 layers; V/A medians):
+//   q+k+v (3 jobs 6144 -> 8192 / 512 / 512)  K3 D6 W8 0.79   K4 D4 W8 0.78
+//   o (8192 -> 6144)                          K3 D4 W8 0.80   K4 D4 W8 0.81
+//   gate+up (2 jobs 6144 -> 12288)            K3 D6 W8 0.84   K4 D8 W4 0.93
+//   down (12288 -> 6144): every v10/v11 form slower than v9 -> not taken.
+// try_linear_v11 returns false when the call is not one of these (the caller keeps its schedule).
+namespace {
+bool linear_v11_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRIX_MMX_LINEAR_V11");
+        return e == nullptr || e[0] != '0';
+    }();
+    return on;
+}
+template <int Bits, int D, int W> void launch_v11(const LinPlan& p, unsigned max_bits, hipStream_t stream) {
+    LinPlan q = p;  // re-based grid: per job (output / (64 W)) x splits CTAs
+    unsigned ctas = 0;
+    for (unsigned i = 0; i < q.args.count; ++i) {
+        q.args.job[i].cta_begin = ctas;
+        ctas += (q.args.job[i].w.output / (64U * W)) * q.args.job[i].splits;
+    }
+    const std::size_t lds = std::size_t{7} * q.args.xs_stride * 2 + std::size_t{W} * 128 * max_bits;
+    hipLaunchKernelGGL((linear_core11_kernel<Bits, 7, D, W>), dim3(ctas), dim3(32 * W), lds, stream, q.args);
+    launched("linear core11");
+}
+bool try_linear_v11(const LinPlan& p, const LinearJob* jobs, unsigned count, unsigned rows, hipStream_t stream) {
+    if (!linear_v11_enabled() || rows != 7) return false;
+    const unsigned bits = jobs[0].w.bits;
+    if (bits != 3 && bits != 4) return false;
+    for (unsigned i = 0; i < count; ++i)
+        if (jobs[i].w.bits != bits || jobs[i].w.output % 512 != 0) return false;
+    const Exl3& w = jobs[0].w;
+    const bool qkv = count == 3 && w.input == 6144 && w.output == 8192 && jobs[1].w.input == 6144 && jobs[1].w.output == 512 &&
+                     jobs[2].w.input == 6144 && jobs[2].w.output == 512;
+    const bool o = count == 1 && w.input == 8192 && w.output == 6144;
+    const bool gu = count == 2 && w.input == 6144 && w.output == 12288 && jobs[1].w.input == 6144 && jobs[1].w.output == 12288;
+    if (!qkv && !o && !gu) return false;
+    if (bits == 3) {
+        if (o) launch_v11<3, 4, 8>(p, 3, stream);
+        else launch_v11<3, 6, 8>(p, 3, stream);
+    } else {
+        if (gu) launch_v11<4, 8, 4>(p, 4, stream);
+        else launch_v11<4, 4, 8>(p, 4, stream);
+    }
+    return true;
+}
+}  // namespace
+
 template <int R> void launch_linear_core10_r(const LinPlan& p, hipStream_t stream) {
     unsigned max_bits = 0, ctas = 0;
     for (unsigned i = 0; i < p.args.count; ++i) {
@@ -2231,12 +2423,14 @@ std::size_t linear_workspace_bytes(const LinearJob* jobs, unsigned count) {
 
 namespace {
 void enqueue_linears_impl(const LinearJob* jobs, unsigned count, unsigned rows, void* workspace, hipStream_t stream,
-                          hipEvent_t* marks, bool force_schedule, bool prepared = false, const PublishTarget* pub = nullptr) {
+                          hipEvent_t* marks, bool force_schedule, bool prepared = false, const PublishTarget* pub = nullptr,
+                          bool draft_block = false, int force_version = 0) {
     LinPlan p = plan_linears(jobs, count, rows);
     p.args.ws = static_cast<unsigned char*>(workspace);
     p.args.trace = g_lin_trace;
-    const bool sched = force_schedule || linear_version() == 0;
-    const int v = sched ? scheduled_linear_version(jobs, count, rows) : linear_version();
+    // force_version (enqueue_linears_version): that form exactly as STRIX_MMX_LINEAR_V=force_version selects it
+    const bool sched = force_version == 0 && (force_schedule || linear_version() == 0);
+    const int v = force_version != 0 ? force_version : (sched ? scheduled_linear_version(jobs, count, rows) : linear_version());
     if (pub != nullptr && pub->flag != nullptr) {
         if (v != 4) throw std::logic_error("minimax linears: the publish epilogue needs the v4 core (STRIX_MMX_LINEAR_V=4)");
         p.args.pub = *pub;
@@ -2269,6 +2463,7 @@ void enqueue_linears_impl(const LinearJob* jobs, unsigned count, unsigned rows, 
         launched("linear prepare");
     }
     if (marks != nullptr) (void)hipEventRecord(marks[0], stream);
+    if (force_schedule && draft_block && try_linear_v11(p, jobs, count, rows, stream)) return;  // v11: draft block, 7 rows
     if (v == 10) {
         if (rows == 1) launch_linear_core10_r<1>(p, stream);
         else if (rows == 2) launch_linear_core10_r<2>(p, stream);
@@ -2322,8 +2517,13 @@ void linear_xt_offsets(const LinearJob* jobs, unsigned count, std::size_t* offs)
     const LinPlan p = plan_linears(jobs, count, 1);  // the xt layout depends on the jobs' inputs only (kMaxRows rows each)
     for (unsigned i = 0; i < count; ++i) offs[i] = p.args.job[i].xt_off;
 }
-void enqueue_linears_scheduled(const LinearJob* jobs, unsigned count, unsigned rows, void* workspace, hipStream_t stream) {
-    enqueue_linears_impl(jobs, count, rows, workspace, stream, nullptr, true);
+void enqueue_linears_scheduled(const LinearJob* jobs, unsigned count, unsigned rows, void* workspace, hipStream_t stream,
+                               bool draft_block) {
+    enqueue_linears_impl(jobs, count, rows, workspace, stream, nullptr, true, false, nullptr, draft_block);
+}
+void enqueue_linears_version(const LinearJob* jobs, unsigned count, unsigned rows, void* workspace, hipStream_t stream, int version) {
+    if (version != 1 && (version < 3 || version > 10)) throw std::invalid_argument("enqueue_linears_version: 1 or 3..10");
+    enqueue_linears_impl(jobs, count, rows, workspace, stream, nullptr, false, false, nullptr, false, version);
 }
 
 }  // namespace strix::minimax::moe::opt
