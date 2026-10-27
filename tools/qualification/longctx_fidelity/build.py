@@ -7,12 +7,12 @@ import json
 import math
 from pathlib import Path
 try:
-    from .common import VERSION, NATIVE_CAP, canonical, sha, atomic, ids_bytes, file_sha, case_id
-    from .tasks import generate, filler_units
+    from .common import VERSION, NATIVE_CAP, canonical, sha, atomic, ids_bytes, file_sha, case_id, mode_budget
+    from .tasks import generate, filler_units, default_generate
     from .tok import FakeTokenizer, StrixTokenize, PREFIX, SUFFIX, TEMPLATE_SHA256, validate_symbols
 except ImportError:
-    from common import VERSION, NATIVE_CAP, canonical, sha, atomic, ids_bytes, file_sha, case_id
-    from tasks import generate, filler_units
+    from common import VERSION, NATIVE_CAP, canonical, sha, atomic, ids_bytes, file_sha, case_id, mode_budget
+    from tasks import generate, filler_units, default_generate
     from tok import FakeTokenizer, StrixTokenize, PREFIX, SUFFIX, TEMPLATE_SHA256, validate_symbols
 
 
@@ -20,13 +20,15 @@ def source_identity():
     return {p.name: file_sha(p) for p in sorted(Path(__file__).parent.glob("*.py"))}
 
 
-def build_case(family, depth, position, seed, tokenizer, generate_tokens=32,
-               stratum="prose", variant="normal"):
+def build_case(family, depth, position, seed, tokenizer, generate_tokens=None,
+               stratum="prose", variant="normal", short=False, mode="native", context=None):
+    if generate_tokens is None:
+        generate_tokens = default_generate(family, variant)
+    requested_depth = depth
     if not isinstance(depth, int) or not isinstance(generate_tokens, int) or depth < 1 or generate_tokens < 1:
         raise ValueError("D and G must be positive integers")
-    if depth + generate_tokens > NATIVE_CAP:
-        raise ValueError("native budget requires D + G <= 262144")
-    if depth == 262143 and (generate_tokens != 1 or variant != "symbol"):
+    cap, requested_context = mode_budget(mode, depth, generate_tokens, context)
+    if mode == "native" and depth == 262143 and (generate_tokens != 1 or variant != "symbol"):
         raise ValueError("last-token edge probe requires G=1 and validated symbol answers")
     task = generate(family, depth, position, seed, variant)
     header = PREFIX + task["rule"] + "\nEvidence and unrelated observations follow.\n"
@@ -38,6 +40,11 @@ def build_case(family, depth, position, seed, tokenizer, generate_tokens=32,
     desired = [round(a * depth) for a, _, _ in ordered]
     fixed = header + "".join(facts) + tail
     fixed_count = tokenizer.count(fixed)
+    if short:
+        depth = fixed_count
+        cap, requested_context = mode_budget(mode, depth, generate_tokens, context)
+        desired = tokenizer.boundaries(tokenizer.encode(fixed),
+                    [len(header) + sum(map(len, facts[:i])) + 1 for i in range(len(facts))])
     if fixed_count > depth:
         raise ValueError("depth too short for immutable task/template")
     ratio = len(fixed) / max(1, fixed_count)
@@ -56,6 +63,8 @@ def build_case(family, depth, position, seed, tokenizer, generate_tokens=32,
         lengths.append(max(0, round((target - previous) * ratio)))
         previous = max(target, previous) + len(fact) / ratio
     lengths.append(max(0, round((depth - previous - len(tail) / ratio) * ratio)))
+    if short:
+        lengths = [0] * (len(facts) + 1)
     pad = ""
     text = ""
     # Close to the budget, the final filler gap is cut at a line boundary and the
@@ -155,11 +164,12 @@ def build_case(family, depth, position, seed, tokenizer, generate_tokens=32,
     answer = task["answer"]
     if isinstance(answer, str) and len(answer) > 24:
         raise ValueError("normal scalar answer exceeds 24 characters")
-    identifier = case_id(family, depth, position, seed, stratum, variant)
+    identifier = case_id(family, depth, position, seed, stratum, variant, mode) + (".short" if short else "")
     manifest = {"schema": 1, "generator_version": VERSION, "case_id": identifier,
-                "mode": "native", "family": family, "seed": seed, "position": position,
+                "mode": mode, "family": family, "seed": seed, "position": position,
                 "depth": depth, "generate": generate_tokens, "stratum": stratum,
-                "variant": variant, "status": "PLANNED", "ground_truth": answer,
+                "variant": variant, "short": short, "requested_depth": requested_depth,
+                "status": "PLANNED", "ground_truth": answer,
                 "ground_truth_sha256": sha(canonical(answer)), "text_sha256": sha(text.encode()),
                 "ids_sha256": sha(ids_bytes(ids)), "prompt_tokens": len(ids),
                 "last_input_position": depth - 1, "first_output_position": depth,
@@ -175,6 +185,8 @@ def build_case(family, depth, position, seed, tokenizer, generate_tokens=32,
                 "requested": {"context": "auto", "native_limit": NATIVE_CAP,
                               "generate": generate_tokens, "rope_mode": "native"},
                 "resolved": None, "reference_sha256": None, "state_lineage": None}
+    if mode != "native":
+        manifest["requested"] = {"context": requested_context, "rope_mode": mode, "limit": cap}
     return text, ids, manifest
 
 
@@ -192,9 +204,12 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--family", default="niah_single")
     p.add_argument("--depth", type=int, required=True)
+    p.add_argument("--mode", choices=("native", "yarn2", "yarn4"), default="native")
+    p.add_argument("--context", type=int, help="explicit YaRN engine context capacity")
     p.add_argument("--position", type=float, default=.5)
     p.add_argument("--seed", type=int, default=104729)
-    p.add_argument("--generate", type=int, default=32)
+    p.add_argument("--generate", type=int, help="family default when omitted")
+    p.add_argument("--short", action="store_true", help="same immutable task, no filler")
     p.add_argument("--stratum", choices=("prose", "records", "similar-records"), default="prose")
     p.add_argument("--variant", choices=("normal", "symbol"), default="normal")
     p.add_argument("--fake", action="store_true")
@@ -205,7 +220,8 @@ def main():
     p.add_argument("--manifest-only", action="store_true")
     a = p.parse_args()
     tok = FakeTokenizer() if a.fake else StrixTokenize(a.tokenizer, a.model, a.model_receipt)
-    result = build_case(a.family, a.depth, a.position, a.seed, tok, a.generate, a.stratum, a.variant)
+    result = build_case(a.family, a.depth, a.position, a.seed, tok, a.generate, a.stratum, a.variant, a.short,
+                        mode=a.mode, context=a.context)
     print(write_case(a.out, *result, manifest_only=a.manifest_only))
 
 

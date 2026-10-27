@@ -9,9 +9,9 @@ import json
 from pathlib import Path
 import shlex
 try:
-    from .common import canonical, atomic, file_sha
+    from .common import canonical, atomic, file_sha, read_ids, prompt_ids_file
 except ImportError:
-    from common import canonical, atomic, file_sha
+    from common import canonical, atomic, file_sha, read_ids, prompt_ids_file
 
 
 def relative(path):
@@ -37,6 +37,9 @@ def make_script(binary, model, model_receipt, turn_list, receipts, script, predi
         case = relative((listing.parent / listed).resolve().relative_to(Path.cwd().resolve()))
         stem = str(Path(case).with_suffix(""))
         paths += [case, stem + ".txt", stem + ".u32"]
+        metadata = json.loads(Path(case).read_text(encoding="utf-8"))
+        if metadata["mode"] != "native":
+            paths.append(relative(prompt_ids_file(receipts, metadata, read_ids(stem + ".u32"))))
     kit = Path("tools/qualification/longctx_fidelity")
     paths += [p.as_posix() for p in kit.glob("*.py")]
     if prediction_table:

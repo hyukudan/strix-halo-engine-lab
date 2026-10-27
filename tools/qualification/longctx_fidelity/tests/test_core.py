@@ -104,8 +104,8 @@ class CoreTests(unittest.TestCase):
 
     def test_golden_id_hashes(self):
         golden = {"niah_single": "c5a7f7037673ae1d026767555e4a4e119db2c642c65493f76bd804ee5ad6249a",
-                  "aggregate": "69a116f9880e70a8f74b33b2e921000368f7ca0060dd2c30ce16d5c0cf82aaf0",
-                  "multihop": "fb4df434b53c5df84413d8016a9754473927c14875b8b809663b4150185ac1b2"}
+                  "aggregate": "e5d1e04cb0982e462e583695f611e5312baac8278fdf7fd1b386d1a6aacec7ae",
+                  "multihop": "b9c08275c8bdf112b1550f664ecd2676a436327a980e3110c648733371473f6e"}
         for family, expected in golden.items():
             a = build_case(family, 8192, .5, 104729, FakeTokenizer())
             b = build_case(family, 8192, .5, 104729, FakeTokenizer())

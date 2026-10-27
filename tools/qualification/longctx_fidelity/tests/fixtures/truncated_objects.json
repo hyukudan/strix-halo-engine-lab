@@ -1,0 +1,39 @@
+{
+  "description": "Truncated object-form answer excerpt; complete leading objects match ground truth.",
+  "answer": [
+    [
+      "4674eee8841b35b3c2faaccf129f7b10-00",
+      "0daf71e8"
+    ],
+    [
+      "4674eee8841b35b3c2faaccf129f7b10-01",
+      "aeafb33d"
+    ],
+    [
+      "4674eee8841b35b3c2faaccf129f7b10-02",
+      "2823391d"
+    ],
+    [
+      "4674eee8841b35b3c2faaccf129f7b10-03",
+      "67047fa5"
+    ],
+    [
+      "4674eee8841b35b3c2faaccf129f7b10-04",
+      "355fa8cb"
+    ],
+    [
+      "4674eee8841b35b3c2faaccf129f7b10-05",
+      "21dc3652"
+    ],
+    [
+      "4674eee8841b35b3c2faaccf129f7b10-06",
+      "81c84125"
+    ],
+    [
+      "4674eee8841b35b3c2faaccf129f7b10-07",
+      "5d365881"
+    ]
+  ],
+  "text": "```json\n[\n  {\n    \"key\": \"4674eee8841b35b3c2faaccf129f7b10-00\",\n    \"value\": \"0daf71e8\"\n  },\n  {\n    \"key\": \"4674eee8841b35b3c2faaccf129f7b10-01\",\n    \"value\": \"aeafb33d\"\n  },\n  {\n    \"key\": \"4674eee8841b35b3c2faaccf129f7b10-02\",\n    \"value\": \"2823391d\"\n  },\n  {\n    \"key\": \"4674eee8841b35b3c2faaccf129f7b10-03\",\n    \"value\": \"67047fa5\"\n  },\n  {\n    \"key\": \"4674eee8841b35b3c2fa",
+  "complete_objects": 4
+}

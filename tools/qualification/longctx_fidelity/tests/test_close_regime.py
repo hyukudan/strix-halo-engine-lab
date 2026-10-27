@@ -114,8 +114,8 @@ class CloseRegimeTests(unittest.TestCase):
 
     def test_close_regime_all_facts_and_placement_correction(self):
         tok = CutTokenizer()
-        result, states = traced_build(tok, 8192, "vartrack")
-        self.assert_case(result, tok, 8192, "vartrack")
+        result, states = traced_build(tok, 8100, "vartrack")
+        self.assert_case(result, tok, 8100, "vartrack")
         self.assertGreater(len(result[2]["spans"]), 1)
         self.assertTrue(any(s["attempt"] >= 12 and s["snap"] for s in states))
         # A zero-error snapped candidate is followed by another attempt: placement

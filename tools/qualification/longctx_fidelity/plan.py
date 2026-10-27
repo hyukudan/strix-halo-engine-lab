@@ -6,11 +6,14 @@ import math
 import os
 from pathlib import Path
 try:
-    from .common import canonical, atomic, case_id
+    from .common import canonical, atomic, case_id, mode_budget
+    from .tasks import default_generate
 except ImportError:
-    from common import canonical, atomic, case_id
+    from common import canonical, atomic, case_id, mode_budget
+    from tasks import default_generate
 
-PREFILL = {8192: 4, 32768: 25, 65536: 50, 131072: 105, 196608: 160, 262144: 210}
+PREFILL = {8192: 4, 32768: 25, 65536: 50, 131072: 105, 196608: 160, 262144: 210,
+           393216: 330, 524288: 470, 786432: 710, 1048576: 950}
 
 
 def predicted(case, table=None, load=40, decode=.03):
@@ -27,18 +30,20 @@ def predicted(case, table=None, load=40, decode=.03):
     return value
 
 
-def matrix(modes, depths, families, seeds, positions, generate=32, stratum="prose", variant="normal"):
+def matrix(modes, depths, families, seeds, positions, generate=None, stratum="prose", variant="normal"):
     cells = []
     for m, d, f, s, p in sorted(itertools.product(modes, depths, families, seeds, positions)):
-        if m != "native" or not 1 <= d or not 1 <= generate or d + generate > 262144:
-            raise ValueError("matrix cell violates native D+G budget")
-        if d == 262143 and (generate != 1 or variant != "symbol"):
+        g = default_generate(f, variant) if generate is None else generate
+        cap, context = mode_budget(m, d, g)
+        if m == "native" and d == 262143 and (g != 1 or variant != "symbol"):
             raise ValueError("edge matrix requires G=1 and symbol answers")
         if not math.isfinite(p) or not 0 <= p <= 1:
             raise ValueError("invalid matrix position")
         cells.append({"mode": m, "depth": d, "family": f, "seed": s, "position": p,
-                      "generate": generate, "stratum": stratum, "variant": variant,
+                      "generate": g, "stratum": stratum, "variant": variant,
                       "case_id": case_id(f, d, p, s, stratum, variant, m), "status": "PLANNED"})
+        if m != "native":
+            cells[-1]["requested"] = {"context": context, "rope_mode": m, "limit": cap}
     if len({c["case_id"] for c in cells}) != len(cells):
         raise ValueError("duplicate matrix cells")
     return cells
