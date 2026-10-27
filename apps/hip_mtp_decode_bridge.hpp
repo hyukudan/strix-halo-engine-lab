@@ -587,6 +587,8 @@ public:
         // Reserve the terminal row for host selection, including prompt cohorts.
         const auto end=n_-(final_selector_?1U:0U);
         if(phase_!=Phase::serial || end-pos_<2U) return 0U;
+        // A window extends the session's arithmetic lineage: the first prompt row always runs serially.
+        if(!pos_) {run_serial_row();report_progress();if(end-pos_<2U) return 0U;}
         if((end-pos_)%2U) {run_serial_row();report_progress();}
         std::uint32_t rows=8U;
         while(rows>end-pos_) rows/=2U;

@@ -390,7 +390,8 @@ struct HipMtpWindowVerifier::Impl {
         const auto capacity=std::min(resources.session_state_layout->context_tokens,target->model().max_position_embeddings);
         if(session.next_position>=capacity) return false;
         const bool pad=prefix && min_probability>0.0F;
-        const bool history=session.arithmetic_lineage.intervals.size()<maximum_history_intervals;
+        // Capture::begin needs a valid lineage: a window never starts an empty session.
+        const bool history=!session.arithmetic_lineage.intervals.empty() && session.arithmetic_lineage.intervals.size()<maximum_history_intervals;
         return budget>=o.rows && capacity-session.next_position>=o.rows && history &&
             (pad?candidates!=0U:candidates+1U>=o.rows);
     }
