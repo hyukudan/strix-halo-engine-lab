@@ -24,26 +24,58 @@
 
 namespace strix::decode_cli {
 
-// One engine for the queue: a request is one bridge run. A failure inside the runner leaves the
-// target in an unknown state, so it fails every later request and stops the server.
+// Used only on the bridge thread. The tokenizer-wide trie is built lazily once
+// per server; mutable selection frontiers are created afresh for each request.
+class HttpConstraintRequests {
+public:
+    explicit HttpConstraintRequests(std::shared_ptr<const serve::BpeTokenizer> tokenizer)
+        : tokenizer_(std::move(tokenizer)) {}
+    bool available(std::span<const std::uint32_t> stops) const {
+        const auto id=tokenizer_->find("</think>");
+        return id!=UINT32_MAX && tokenizer_->token_bytes(id)=="</think>" &&
+            (tokenizer_->type(id)==serve::BpeTokenizer::TokenType::control ||
+             tokenizer_->type(id)==serve::BpeTokenizer::TokenType::user_defined) &&
+            std::find(stops.begin(),stops.end(),id)==stops.end();
+    }
+    std::shared_ptr<MtpConstraintRow> make(const std::shared_ptr<const serve::ConstraintSpec>& spec) {
+        if(!spec) return {};
+        if(!trie_) trie_=std::make_shared<serve::TokenByteTrie>(*tokenizer_,spec->eos_ids);
+        return std::make_shared<MtpConstraintRow>(std::make_shared<serve::ConstraintSelection>(spec,trie_,tokenizer_));
+    }
+private:
+    std::shared_ptr<const serve::BpeTokenizer> tokenizer_;
+    std::shared_ptr<const serve::TokenByteTrie> trie_;
+};
+// Execution failures stop the server; constraint refusals carry request-local receipts.
 class MtpBridgeEngine final : public serve::GenerationEngine {
 public:
-    MtpBridgeEngine(const MtpServeRunner& run, std::uint64_t context_tokens) : run_(run), context_(context_tokens) {}
+    MtpBridgeEngine(const MtpServeRunner& run, std::uint64_t context_tokens,
+        HttpConstraintRequests& constraints, bool enabled)
+        : run_(run), context_(context_tokens), constraints_(constraints), constraints_enabled_(enabled) {}
     serve::GenerationStats generate(serve::GenerationJob& job) override {
         if (failed_.load()) throw std::runtime_error("the engine failed during an earlier request; restart the server");
         if (job.prompt.empty() || job.prompt.size() >= context_) throw std::invalid_argument("prompt is empty or fills the context");
         MtpServeRequest request;
+        request.constraint = constraints_.make(job.constraint);
         request.prompt = job.prompt;
         request.max_tokens = job.max_tokens;
         request.stop_tokens = job.stop_tokens;
         request.ngram_draft = job.ngram_draft;
         request.on_tokens = job.on_tokens;
+        request.on_progress = job.on_progress;
         MtpServeResult result;
         try {
             result = run_(request);
         } catch (...) {
             failed_.store(true);
-            throw;
+            if (!request.constraint) throw;
+            serve::GenerationStats stats;
+            stats.prompt_tokens = job.prompt.size();
+            stats.finish = "execution_failure";
+            stats.constraint = request.constraint->verdict(stats.finish);
+            try { throw; }
+            catch (const std::exception& e) { throw serve::GenerationRequestError(std::move(stats), e.what()); }
+            catch (...) { throw serve::GenerationRequestError(std::move(stats), "engine failure"); }
         }
         serve::GenerationStats stats;
         stats.prompt_tokens = job.prompt.size();
@@ -56,16 +88,22 @@ public:
         stats.ngram_accepted = result.ngram_accepted;
         stats.prefill_ms = result.prompt_ms;
         stats.decode_ms = result.decode_ms;
+        stats.constraint = result.constraint;
         stats.finish = result.finish;
         stats.sampling = "greedy";
         if (!result.rtx_import_json.empty()) stats.engine_extra.emplace_back("rtx_import", result.rtx_import_json);
+        if(!result.error.empty()) throw serve::GenerationRequestError(std::move(stats),result.error);
         return stats;
     }
     [[nodiscard]] std::uint64_t context_tokens() const override { return context_; }
+    [[nodiscard]] bool supports_constraints() const override {return constraints_enabled_;}
+    [[nodiscard]] std::vector<std::string> constraint_execution_routes() const override {return constraints_enabled_?std::vector<std::string>{"serial-host"}:std::vector<std::string>{};}
     [[nodiscard]] bool failed() const noexcept { return failed_.load(); }
 private:
     const MtpServeRunner& run_;
     std::uint64_t context_;
+    HttpConstraintRequests& constraints_;
+    bool constraints_enabled_;
     std::atomic<bool> failed_{false};
 };
 
@@ -104,18 +142,23 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         config.capabilities = options.http_capabilities;
         config.stream_receipts = options.http_stream_receipts;
         config.sse_keepalive_seconds = options.http_sse_keepalive;
+        config.sse_progress_seconds = options.http_sse_progress_interval;
+        config.engine_progress = true;
         config.engine_description = engine_description;
         config.stop_tokens.push_back(tokenizer->eos_token());
         if (const auto end = tokenizer->find("<|endoftext|>"); end != UINT32_MAX) config.stop_tokens.push_back(end);
         if (options.eos_token) config.stop_tokens.push_back(*options.eos_token);
         std::sort(config.stop_tokens.begin(), config.stop_tokens.end());
         config.stop_tokens.erase(std::unique(config.stop_tokens.begin(), config.stop_tokens.end()), config.stop_tokens.end());
+        HttpConstraintRequests constraints(tokenizer);
+        config.engine_constraints = options.http_constraints && constraints.available(config.stop_tokens);
+        if(config.engine_constraints) config.constraint_execution_routes={"serial-host"};
         if (rtx_import)
             config.engine_routes = [rtx_import](const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
                 return handle_rtx_state_import_route(*rtx_import, request, response);
             };
 
-        MtpBridgeEngine engine(run, options.context_tokens);
+        MtpBridgeEngine engine(run, options.context_tokens, constraints, config.engine_constraints);
         serve::GenerationQueue queue(options.http_max_queue);
         serve::ApiService api(config, tokenizer, queue, options.context_tokens, false);
         serve::HttpServerConfig http;
@@ -175,12 +218,17 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         config.capabilities = options.http_capabilities;
         config.stream_receipts = options.http_stream_receipts;
         config.sse_keepalive_seconds = options.http_sse_keepalive;
+        config.sse_progress_seconds = options.http_sse_progress_interval;
+        config.engine_progress = true;
         config.engine_description = engine_description;
         config.stop_tokens.push_back(tokenizer->eos_token());
         if (const auto end = tokenizer->find("<|endoftext|>"); end != UINT32_MAX) config.stop_tokens.push_back(end);
         if (options.eos_token) config.stop_tokens.push_back(*options.eos_token);
         std::sort(config.stop_tokens.begin(), config.stop_tokens.end());
         config.stop_tokens.erase(std::unique(config.stop_tokens.begin(), config.stop_tokens.end()), config.stop_tokens.end());
+        HttpConstraintRequests constraints(tokenizer);
+        config.engine_constraints = runner.supports_constraints() && constraints.available(config.stop_tokens);
+        if(config.engine_constraints) config.constraint_execution_routes=runner.constraint_execution_routes();
         const bool samples = options.http_sampling == "sample";
         // Strict tool-call frame proposals (opt-in) need the template's frame tokens.
         if (const auto open = tokenizer->find("<tool_call>"), close = tokenizer->find("</tool_call>");
@@ -226,10 +274,12 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                 return;
             }
             MtpBatchRequest request;
+            request.constraint = constraints.make(job.constraint);
             request.prompt = job.prompt;
             request.max_tokens = job.max_tokens;
             request.stop_tokens = job.stop_tokens;
             request.on_tokens = job.on_tokens;
+            request.on_progress = job.on_progress;
             request.ngram_draft = job.ngram_draft;
             request.draft_depth_max = job.draft_depth_max;
             request.tool_draft = job.tool_draft;
@@ -271,9 +321,10 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                 stats.source_right = result.source_right;
                 stats.frame_cycles = result.frame_cycles;
                 stats.frame_shadow = result.frame_shadow;
+                stats.constraint = result.constraint;
                 stats.finish = result.finish;
                 stats.sampling = sampling;
-                queue.finish(*taken, std::move(stats));
+                queue.finish(*taken, std::move(stats), result.error);
                 release(taken);
             };
             live.push_back(taken);
@@ -301,8 +352,10 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         if (!failure.empty()) {
             // The target state of every slot is unknown: fail the requests in flight and stop.
             failed.store(true);
+            runner.fail_requests(failure);
             for (auto& taken : std::vector<std::shared_ptr<serve::TakenJob>>(live)) queue.finish(*taken, {}, failure);
             live.clear();
+            runner.abandon();
         }
         finished.store(true);
         watcher.join();

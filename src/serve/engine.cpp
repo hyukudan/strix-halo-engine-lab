@@ -101,6 +101,15 @@ std::vector<std::uint32_t> GenerationTicket::wait(std::chrono::milliseconds time
     return out;
 }
 
+GenerationProgress GenerationTicket::progress() const {
+    const std::lock_guard lock(mutex_);
+    return progress_;
+}
+void GenerationTicket::report_progress(GenerationProgress progress) {
+    const std::lock_guard lock(mutex_);
+    progress_ = progress; // coalesced: no queue, allocation or wakeup per unit
+}
+
 GenerationStats GenerationTicket::stats() const {
     const std::lock_guard lock(mutex_);
     return stats_;
@@ -113,6 +122,7 @@ std::string GenerationTicket::error() const {
 bool GenerationTicket::publish(std::span<const std::uint32_t> tokens) {
     {
         const std::lock_guard lock(mutex_);
+        if (!tokens.empty() && progress_.phase == GenerationPhase::prefill) progress_.phase = GenerationPhase::decode;
         pending_.insert(pending_.end(), tokens.begin(), tokens.end());
         changed_.notify_all();
     }
@@ -132,6 +142,8 @@ std::shared_ptr<GenerationTicket> GenerationQueue::submit(GenerationJob job) {
     const std::lock_guard lock(mutex_);
     if (stopping_ || entries_.size() >= max_queued_) return nullptr;
     ticket->queue_position_.store(entries_.size() + totals_.running);
+    ticket->progress_.total_tokens = job.prompt.size();
+    job.on_progress = [ptr = ticket.get()](GenerationProgress progress) { ptr->report_progress(progress); };
     ticket->period_ = observe_period();  // one read: armed (odd) and the period still_observed() compares
     job.observed = ticket->observed_ = (ticket->period_ & 1U) != 0U;
     job.observed_period = ticket->period_;
@@ -163,9 +175,14 @@ void GenerationQueue::run(GenerationEngine& engine, const std::function<void(con
         else {
             entry.job.on_tokens = [ticket](std::span<const std::uint32_t> tokens) { return ticket->publish(tokens); };
             try { stats = engine.generate(entry.job); }
+            catch (const GenerationRequestError& e) { stats = e.stats; error = e.what(); }
             catch (const std::exception& e) { error = e.what(); }
             catch (...) { error = "engine failure"; }
             if (ticket->cancelled() && error.empty()) stats.finish = "cancelled";
+        }
+        if (stats.finish == "cancelled" && stats.constraint) {
+            stats.constraint->status = "incomplete";
+            stats.constraint->reason = "cancelled";
         }
         stats.queue_ms = std::chrono::duration<double, std::milli>(started - entry.submitted).count();
         const auto busy = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
@@ -222,6 +239,10 @@ std::optional<TakenJob> GenerationQueue::take(bool wait) {
 void GenerationQueue::finish(TakenJob& job, GenerationStats stats, std::string error,
     const std::function<void(const GenerationStats&)>& observe) {
     if (job.ticket->cancelled() && error.empty()) stats.finish = "cancelled";
+    if (stats.finish == "cancelled" && stats.constraint) {
+        stats.constraint->status = "incomplete";
+        stats.constraint->reason = "cancelled";
+    }
     stats.queue_ms = std::chrono::duration<double, std::milli>(job.started - job.submitted).count();
     // Batched jobs overlap: busy time adds each job's own service time.
     const auto busy = std::chrono::duration<double>(std::chrono::steady_clock::now() - job.started).count();

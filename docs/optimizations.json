@@ -1265,6 +1265,17 @@
     "doc_anchor": "docs/optimizations.md#qwen-serve-api"
   },
   {
+    "engine": "qwen",
+    "name": "Constrained JSON output",
+    "flag_or_env": "--http-constraints",
+    "default": "on (requests opt in with response_format / text.format)",
+    "exact": "Exact relative to the declared constrained target (masked greedy, lowest id on ties), not to unconstrained greedy. Unconstrained requests, alone and sharing the batch with constrained ones, keep their token IDs and draft counters (GPU gate).",
+    "gain": "Usability: schema-valid JSON answers by construction; no speed claim (constrained requests decode serially)",
+    "preconditions": "--http-serve; json_object or strix-json-schema-v1 json_schema format, greedy, no stop strings, no tools.",
+    "off_switch": "--http-constraints off",
+    "doc_anchor": "docs/optimizations.md#qwen-serve-constraints"
+  },
+  {
     "engine": "deepseek",
     "name": "Bounded serving observation",
     "flag_or_env": "STRIX_SERVE_OBSERVE_EXPIRY_S",

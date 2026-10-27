@@ -330,6 +330,8 @@ strix_target_warnings(strix-inspect-gguf)
 # Host-only serving front end (no GPU): JSON, tokenizer, chat template, HTTP and the API mapping.
 add_library(strix_serve STATIC
     src/serve/json.cpp
+    src/serve/json_constraint.cpp
+    src/serve/constraint_selection.cpp
     src/serve/bpe_tokenizer.cpp
     src/serve/chat_template.cpp
     src/serve/deepseek_chat.cpp
@@ -402,6 +404,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-serve-api-tests PRIVATE strix_serve)
     strix_target_warnings(strix-serve-api-tests)
     add_test(NAME strix-serve-api-tests COMMAND strix-serve-api-tests)
+
+    add_executable(strix-serve-json-constraint-tests tests/serve_json_constraint_tests.cpp)
+    target_link_libraries(strix-serve-json-constraint-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-serve-json-constraint-tests)
+    add_test(NAME strix-serve-json-constraint-tests COMMAND strix-serve-json-constraint-tests)
     add_executable(strix-serve-observe-tests tests/serve_observe_tests.cpp)
     target_link_libraries(strix-serve-observe-tests PRIVATE strix_serve)
     strix_target_warnings(strix-serve-observe-tests)

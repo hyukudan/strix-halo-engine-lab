@@ -1,6 +1,7 @@
 #include "strix/serve/api.hpp"
 
 #include "strix/serve/chat_template.hpp"
+#include "strix/serve/json_constraint.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -23,14 +24,17 @@ using Headers = std::vector<std::pair<std::string, std::string>>;
 
 class ApiError : public std::runtime_error {
 public:
-    ApiError(int status, std::string type, const std::string& message, std::string param = {})
-        : std::runtime_error(message), status_(status), type_(std::move(type)), param_(std::move(param)) {}
+    ApiError(int status, std::string type, const std::string& message, std::string param = {}, std::string code = {}, std::string keyword = {})
+        : std::runtime_error(message), status_(status), type_(std::move(type)), param_(std::move(param)), code_(std::move(code)), keyword_(std::move(keyword)) {}
+    Json strix;
+    const std::string& code() const { return code_; }
+    const std::string& keyword() const { return keyword_; }
     int status() const { return status_; }
     const std::string& type() const { return type_; }
     const std::string& param() const { return param_; }
 private:
     int status_;
-    std::string type_, param_;
+    std::string type_, param_, code_, keyword_;
 };
 
 std::string random_id(std::string_view prefix) {
@@ -348,10 +352,38 @@ struct ApiService::Impl {
         out.set("sampling", std::move(sampling));
         Json stream = Json::object(); stream.set("sse", Json(true));
         stream.set("receipts", Json(config.stream_receipts)); stream.set("keepalive_seconds", Json(config.sse_keepalive_seconds));
+        Json progress = Json::object();
+        progress.set("interval_seconds", Json(config.sse_progress_seconds));
+        progress.set("engine_reports", Json(config.engine_progress));
+        stream.set("progress", std::move(progress));
         out.set("stream", std::move(stream));
         for (const char* name : {"json_schema", "json_object", "strict_tools", "penalties", "logit_bias", "logprobs", "retry",
                 "thinking_budget", "prefill_progress", "response_storage", "required_tool_choice", "named_tool_choice",
                 "grammar", "background", "conversation", "encrypted_reasoning", "image_input", "file_input"}) out.set(name, Json(false));
+        out.set("prefill_progress", Json(config.engine_progress));
+        out.set("json_object", Json(config.engine_constraints));
+        out.set("json_schema", Json(config.engine_constraints));
+        Json constraints = Json::object(), identities = Json::array(), routes = Json::array(), limits = Json::object();
+        if (config.engine_constraints) {
+            identities.push(Json("json-object")); identities.push(Json("strix-json-schema-v1"));
+            for (const auto& route : config.constraint_execution_routes) routes.push(Json(route));
+        }
+        const ConstraintLimits bound;
+        limits.set("schema_bytes", Json(static_cast<std::uint64_t>(bound.schema_bytes)));
+        limits.set("nodes", Json(static_cast<std::uint64_t>(bound.nodes)));
+        limits.set("depth", Json(static_cast<std::uint64_t>(bound.depth)));
+        limits.set("properties", Json(static_cast<std::uint64_t>(bound.properties)));
+        limits.set("enum_values", Json(static_cast<std::uint64_t>(bound.enum_values)));
+        limits.set("max_string_length", Json(static_cast<std::uint64_t>(bound.max_string_length)));
+        limits.set("max_output_bytes", Json(static_cast<std::uint64_t>(bound.max_output_bytes)));
+        limits.set("compilation_steps", Json(static_cast<std::uint64_t>(bound.compilation_steps)));
+        limits.set("literal_bytes", Json(static_cast<std::uint64_t>(bound.literal_bytes)));
+        limits.set("trie_nodes", Json(static_cast<std::uint64_t>(bound.trie_nodes)));
+        limits.set("alternative_expansions", Json(static_cast<std::uint64_t>(bound.alternative_expansions)));
+        limits.set("mask_cache_bytes", Json(static_cast<std::uint64_t>(bound.mask_cache_bytes)));
+        constraints.set("identities", std::move(identities)); constraints.set("limits", std::move(limits));
+        constraints.set("selection", Json("greedy")); constraints.set("sampling", Json(false));
+        constraints.set("execution", std::move(routes)); out.set("constraints", std::move(constraints));
         out.set("default_max_tokens", Json(static_cast<std::uint64_t>(config.default_max_tokens)));
         out.set("default_thinking", Json(config.default_thinking));
         out.set("function_tools", Json(true)); out.set("plaintext_reasoning", Json(true));
@@ -375,16 +407,40 @@ struct ApiService::Impl {
             if (!bool_or(*s, "keepalive", true)) return 0.0;
         return config.sse_keepalive_seconds;
     }
+    double progress_seconds(const Json& body) const {
+        if (const auto* s = body.find("strix"); s && s->is_object())
+            if (!bool_or(*s, "progress", true)) return 0.0;
+        return config.sse_progress_seconds;
+    }
     struct StreamWriter {
         HttpResponseWriter& response;
         double interval;
+        double progress_interval;
+        GenerationProgress previous;
+        std::chrono::steady_clock::time_point last_progress = std::chrono::steady_clock::now();
+        StreamWriter(HttpResponseWriter& r, double keepalive, double progress)
+            : response(r), interval(keepalive), progress_interval(progress) {}
         std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
         bool write(const std::string& bytes) {
             const bool ok = response.write(bytes);
             if (ok) last = std::chrono::steady_clock::now();
             return ok;
         }
-        bool idle() {
+        bool idle(const GenerationTicket& ticket) {
+            const auto now = std::chrono::steady_clock::now();
+            if (progress_interval > 0.0) {
+                const auto progress = ticket.progress();
+                if (progress.phase != GenerationPhase::queued && progress != previous &&
+                    std::chrono::duration<double>(now - last_progress).count() >= progress_interval) {
+                    Json value = Json::object();
+                    value.set("phase", Json(progress.phase == GenerationPhase::decode ? "decode" : "prefill"));
+                    value.set("prefilled_tokens", Json(progress.prefilled_tokens));
+                    value.set("cached_tokens", Json(progress.cached_tokens));
+                    value.set("total_tokens", Json(progress.total_tokens));
+                    if (!write(": progress " + value.dump() + "\n\n")) return false;
+                    previous = progress; last_progress = last;
+                }
+            }
             if (interval > 0.0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - last).count() >= interval)
                 return write(": keepalive\n\n");
             return !response.client_gone();
@@ -423,7 +479,7 @@ struct ApiService::Impl {
 
     // Generation-affecting fields this server does not execute yet: a non-neutral value is refused (400 naming the
     // field), never ignored. Neutral values (0 penalties, empty bias, logprobs false, text format, auto/none choice) pass.
-    static void refuse_unexecuted(const Json& body) {
+    static void refuse_unexecuted(const Json& body, bool allow_constraints = false) {
         const auto refuse = [](const std::string& param, const std::string& what) {
             throw ApiError(400, "invalid_request_error", what + " is not supported by this server yet (see /v1/capabilities)", param);
         };
@@ -436,7 +492,7 @@ struct ApiService::Impl {
         if (const auto* v = set("top_logprobs"); v && (!v->is_number() || v->as_double() != 0.0)) refuse("top_logprobs", "top_logprobs");
         if (const auto* v = set("response_format")) {
             const auto* type = v->is_object() ? v->find("type") : nullptr;
-            if (!type || !type->is_string() || type->as_string() != "text") refuse("response_format", "response_format other than text");
+            if (!type || !type->is_string() || (type->as_string() != "text" && !(allow_constraints && (type->as_string() == "json_object" || type->as_string() == "json_schema")))) refuse("response_format", "response_format other than text");
         }
         if (const auto* v = set("parallel_tool_calls"); v && !(v->is_bool() && v->as_bool())) refuse("parallel_tool_calls", "parallel_tool_calls false");
         if (const auto* v = set("tool_choice")) {
@@ -554,8 +610,8 @@ struct ApiService::Impl {
         s.requested_sample = s.temperature > 0.0;
         return s;
     }
-    ResolvedSampling sampling(const Json& body, std::string& note) const {
-        refuse_unexecuted(body);
+    ResolvedSampling sampling(const Json& body, std::string& note, bool allow_constraints = false) const {
+        refuse_unexecuted(body, allow_constraints);
         auto s = resolve_filters(body);
         if (const auto* seed = body.find("seed"); seed && !seed->is_null()) {
             s.seed = unsigned_integer(*seed, "seed", INT64_MAX); s.seeded = true;
@@ -663,13 +719,87 @@ struct ApiService::Impl {
         return out;
     }
 
+    std::shared_ptr<const ConstraintSpec> constraint(const Json& body, const ChatPrompt& prompt,
+        const SamplingParameters& sampling_params, const std::vector<std::string>& stops, bool responses = false) const {
+        const Json* format = body.find("response_format");
+        std::string prefix = "response_format";
+        if (responses) {
+            const auto* text = body.find("text");
+            format = text && text->is_object() ? text->find("format") : nullptr;
+            prefix = "text.format";
+        }
+        if (!format || format->is_null()) return {};
+        const auto bad = [&](const std::string& path, const std::string& message) {
+            throw ApiError(400, "invalid_request_error", message, path);
+        };
+        const auto* type = format->is_object() ? format->find("type") : nullptr;
+        if (!type || !type->is_string()) bad(prefix, "format must be an object with a string type");
+        const auto& kind = type->as_string();
+        if (kind == "text") return {};
+        if (kind != "json_object" && kind != "json_schema") bad(prefix, "unsupported response format");
+        if (!config.engine_constraints) bad(prefix, "this engine does not execute constraints (see /v1/capabilities)");
+        auto spec = std::make_shared<ConstraintSpec>();
+        spec->identity = kind == "json_object" ? "json-object" : "strix-json-schema-v1";
+        const Json* envelope = format;
+        if (kind == "json_schema" && !responses) { envelope = format->find("json_schema"); prefix += ".json_schema"; }
+        if (!envelope || !envelope->is_object()) bad(prefix, "json_schema must be an object");
+        if (const auto* strict = envelope->find("strict"); strict && !strict->is_bool()) bad(prefix + ".strict", "strict must be a boolean");
+        try {
+            if (kind == "json_object") spec->program = std::make_shared<ConstraintProgram>(compile_json_object());
+            else {
+                const auto* name = envelope->find("name");
+                if (!name || !name->is_string() || name->as_string().empty()) bad(prefix + ".name", "name must be a nonempty string");
+                const auto* schema = envelope->find("schema");
+                if (!schema) bad(prefix + ".schema", "schema is required");
+                spec->program = std::make_shared<ConstraintProgram>(compile_json_schema(*schema));
+            }
+        } catch (const SchemaError& e) {
+            throw ApiError(400, "invalid_request_error", e.what(), prefix + ".schema" + (e.path.empty() ? "" : "." + e.path),
+                std::string(e.what()).find("unsupported") != std::string::npos || std::string(e.what()).find("Unsupported") != std::string::npos
+                    ? "unsupported_schema_keyword" : "invalid_schema", e.keyword);
+        }
+        if (std::any_of(stops.begin(), stops.end(), [](const auto& stop) { return !stop.empty(); })) bad("stop", "stop strings cannot be combined with constraints");
+        if (sampling_params.temperature > 0.0) bad("temperature", "constraints require effective greedy selection");
+        const auto* choice = body.find("tool_choice");
+        const bool tools_off = choice && choice->is_string() && choice->as_string() == "none";
+        if (const auto* tools = body.find("tools"); tools && tools->is_array() && tools->size() && !tools_off) bad("tools", "tools cannot be combined with constraints");
+        spec->eos_ids = config.stop_tokens;
+        const auto eos = tokenizer->eos_token();
+        if (eos < tokenizer->vocab_size() && std::find(spec->eos_ids.begin(), spec->eos_ids.end(), eos) == spec->eos_ids.end()) spec->eos_ids.push_back(eos);
+        spec->starts_in_reasoning = prompt.thinking;
+        const auto end = tokenizer->find("</think>");
+        if (end < tokenizer->vocab_size() && std::find(spec->eos_ids.begin(), spec->eos_ids.end(), end) == spec->eos_ids.end()) spec->end_thinking_id = end;
+        if (prompt.thinking && !spec->end_thinking_id) bad(responses ? "text.format" : "response_format", "constraints unavailable: missing end-thinking token");
+        return spec;
+    }
+    static Json constraint_json(const ConstraintSpec& spec, const ConstraintVerdict& verdict) {
+        Json out = Json::object();
+        out.set("identity", Json(spec.identity)); out.set("selection", Json("greedy-lowest-id"));
+        out.set("execution", Json(verdict.execution)); out.set("phase", Json(verdict.phase));
+        out.set("status", Json(verdict.status)); out.set("accepting", Json(verdict.accepting));
+        out.set("reason", verdict.reason.empty() ? Json() : Json(verdict.reason)); return out;
+    }
+    ConstraintVerdict initial_verdict(const ConstraintSpec& spec) const {
+        ConstraintVerdict v; v.phase = spec.starts_in_reasoning ? "reasoning" : "answer";
+        if (!config.constraint_execution_routes.empty()) v.execution = config.constraint_execution_routes.front();
+        return v;
+    }
+
     // Drives one ticket: decodes tokens to text, applies stop strings, hands text to `on_text`.
     struct Outcome { std::string text; GenerationStats stats; std::string finish; std::string matched; std::string error; std::uint64_t output_tokens = 0;
-        std::vector<std::uint32_t> token_ids; bool observed = false; };
+        std::vector<std::uint32_t> token_ids; bool observed = false;
+        std::shared_ptr<const ConstraintSpec> constraint; std::string reasoning; };
     Outcome drive(const std::shared_ptr<GenerationTicket>& ticket, const std::vector<std::string>& stops,
         const std::function<bool(const std::string&)>& on_text, const std::function<bool()>& client_alive,
-        const std::function<bool()>& idle = {}) {
+        const std::function<bool()>& idle = {}, std::shared_ptr<const ConstraintSpec> spec = {},
+        const std::function<bool(const std::vector<ChatSplitter::Delta>&)>& on_delta = {}) {
         Outcome out;
+        out.constraint = spec;
+        bool reasoning = spec && spec->starts_in_reasoning;
+        const auto emit = [&](const std::string& text) {
+            if (reasoning) out.reasoning += text; else out.text += text;
+            return !on_delta || text.empty() || on_delta({{reasoning, text}});
+        };
         StopFilter filter(stops);
         Utf8StreamDecoder utf8;
         bool stopped = false;
@@ -680,6 +810,15 @@ struct ApiService::Impl {
                 if (stopped) break;
                 ++out.output_tokens;
                 out.token_ids.push_back(id);
+                if (spec) {
+                    if (std::find(spec->eos_ids.begin(), spec->eos_ids.end(), id) != spec->eos_ids.end()) { stopped = true; break; }
+                    if (reasoning && spec->end_thinking_id == id) {
+                        if (!emit(utf8.flush())) { ticket->cancel(); stopped = true; }
+                        reasoning = false; continue;
+                    }
+                    if (!emit(utf8.push(tokenizer->token_bytes(id)))) { ticket->cancel(); stopped = true; }
+                    continue;
+                }
                 if (is_stop_token(id)) { stopped = true; break; }
                 const auto text = filter.push(utf8.push(tokenizer->token_bytes(id)));
                 if (!text.empty()) {
@@ -691,20 +830,33 @@ struct ApiService::Impl {
             if (client_alive && !client_alive()) ticket->cancel();
             if (!done && !ticket->cancelled() && idle && !idle()) ticket->cancel();
         }
-        if (!out.matched.size()) {
+        if (spec) { if (!emit(utf8.flush())) ticket->cancel(); }
+        else if (!out.matched.size()) {
             const auto tail = filter.push(utf8.flush()) + filter.finish();
             if (!tail.empty()) { out.text += tail; if (on_text) on_text(tail); }
         }
         out.stats = ticket->stats();
         out.observed = ticket->observed();
         out.error = ticket->error();
+        if (spec && !out.stats.constraint) {
+            auto v = initial_verdict(*spec); v.phase = reasoning ? "reasoning" : "answer";
+            if (out.stats.finish == "cancelled" && out.error.empty()) { v.status = "incomplete"; v.reason = "cancelled"; }
+            else {
+                v.status = "failed";
+                v.reason = out.error.empty() ? "constraint_failure" : "execution_failure";
+                if (out.error.empty()) out.error = "engine omitted terminal constraint verdict";
+            }
+            out.stats.constraint = std::move(v);
+        }
+        if (spec && out.stats.constraint->status == "failed" && out.error.empty()) out.error = "constraint selection failed";
         out.finish = !out.matched.empty() ? "stop" : out.stats.finish == "stop" ? "stop" : out.stats.finish == "cancelled" ? "cancelled" : "length";
         return out;
     }
 
     std::shared_ptr<GenerationTicket> submit(std::vector<std::uint32_t> prompt, std::uint32_t max_tokens, const SamplingParameters& sampling,
-        const Json& body, std::uint32_t stable_prefix = 0) {
+        const Json& body, std::uint32_t stable_prefix = 0, std::shared_ptr<const ConstraintSpec> spec = {}) {
         GenerationJob job;
+        job.constraint = std::move(spec);
         job.prompt = std::move(prompt);
         job.stable_prefix = stable_prefix;
         job.max_tokens = max_tokens;
@@ -769,11 +921,19 @@ struct ApiService::Impl {
             e.set("draft_sources", std::move(d)); // [shadow, scored, right rows, frame cycles, frame shadows]
         }
         for (const auto& [name, value] : o.stats.engine_extra) e.set(name, parse_json(value));
+        if (o.constraint && o.stats.constraint) e.set("constraint", constraint_json(*o.constraint, *o.stats.constraint));
         return e;
     }
     // The applied policy: alone at the start of a stream (o == nullptr), after the engine members at its end.
-    Json receipt(const Outcome* o, const std::string& note, const Json& body, std::uint32_t limit, const ResolvedSampling& resolved) const {
+    Json receipt(const Outcome* o, const std::string& note, const Json& body, std::uint32_t limit, const ResolvedSampling& resolved, std::shared_ptr<const ConstraintSpec> spec = {}) const {
+        if (spec && !config.stream_receipts) {
+            Json out = Json::object();
+            out.set("constraint", constraint_json(*spec, o && o->stats.constraint ? *o->stats.constraint : initial_verdict(*spec)));
+            if (!note.empty()) out.set("note", Json(note));
+            return out;
+        }
         auto out = o ? engine_json(*o, note, body) : Json::object();
+        if (spec && !o) out.set("constraint", constraint_json(*spec, initial_verdict(*spec)));
         if (!note.empty()) out.set("note", Json(note));
         const bool requested_sample = resolved.requested_sample;
         out.set("sampling_requested", Json(requested_sample ? "sample" : "greedy"));
@@ -789,6 +949,10 @@ struct ApiService::Impl {
         stream.set("keepalive_seconds", Json(keepalive_seconds(body))); stream.set("receipts", Json(config.stream_receipts));
         if (const auto* options = body.find("stream_options"); options && options->is_object())
             stream.set("include_usage", Json(bool_or(*options, "include_usage", false)));
+        Json progress = Json::object();
+        progress.set("interval_seconds", Json(progress_seconds(body)));
+        progress.set("engine_reports", Json(config.engine_progress));
+        stream.set("progress", std::move(progress));
         out.set("stream", std::move(stream));
         return out;
     }
@@ -807,27 +971,46 @@ struct ApiService::Impl {
         return out;
     }
 
+    AssistantOutput parsed_output(const Outcome& o, const ChatPrompt& prompt) const {
+        if (o.constraint) { AssistantOutput p; p.content = o.text; p.reasoning = o.reasoning; p.tool_calls = Json::array(); return p; }
+        return config.output_parser ? config.output_parser(o.text, prompt.thinking, prompt.tools) : parse_assistant_output(o.text, prompt.thinking, prompt.tools);
+    }
+    static std::string response_status(const Outcome& o) {
+        if (!o.error.empty() || (o.stats.constraint && o.stats.constraint->status == "failed")) return "failed";
+        if (o.stats.constraint) return o.stats.constraint->status == "complete" ? "completed" : "incomplete";
+        return o.finish == "length" ? "incomplete" : "completed";
+    }
+
     void chat_completions(const HttpRequest&, HttpResponseWriter& response, const Json& body) {
         const auto prompt = chat_prompt(body);
         if (const auto* n = body.find("n"); n && n->is_number() && n->as_int() != 1)
             throw ApiError(400, "invalid_request_error", "only n = 1 is supported", "n");
         std::string note;
-        const auto sampling_params = sampling(body, note);
+        const auto sampling_params = sampling(body, note, true);
         const auto stops = stop_strings(body.find("stop"));
+        const auto spec = constraint(body, prompt, sampling_params, stops);
         const bool stream = bool_or(body, "stream", false);
         const auto interval = keepalive_seconds(body);
+        const auto progress_interval = progress_seconds(body);
         bool include_usage = false;
         if (const auto* options = body.find("stream_options"); options && options->is_object()) include_usage = bool_or(*options, "include_usage", false);
         const auto limit = max_tokens(body, prompt.tokens.size());
-        const auto initial_receipt = config.stream_receipts ? receipt(nullptr, note, body, limit, sampling_params) : Json();
-        auto ticket = submit(prompt.tokens, limit, sampling_params, body, prompt.stable_prefix);
+        const auto initial_receipt = config.stream_receipts || spec ? receipt(nullptr, note, body, limit, sampling_params, spec) : Json();
+        auto ticket = submit(prompt.tokens, limit, sampling_params, body, prompt.stable_prefix, spec);
         const auto id = random_id("chatcmpl-");
         const auto created = unix_now();
         RecentRequest entry{id, "chat.completions", "ok", created};
         if (!stream) {
-            auto outcome = drive(ticket, stops, {}, [&] { return !response.client_gone(); });
-            if (!outcome.error.empty()) throw ApiError(500, "server_error", outcome.error);
-            const auto parsed = (config.output_parser ? config.output_parser(outcome.text, prompt.thinking, prompt.tools) : parse_assistant_output(outcome.text, prompt.thinking, prompt.tools));
+            auto outcome = drive(ticket, stops, {}, [&] { return !response.client_gone(); }, {}, spec);
+            if (!outcome.error.empty()) {
+                ApiError error(500, "server_error", outcome.error);
+                if (spec && outcome.stats.constraint) {
+                    error.strix = Json::object();
+                    error.strix.set("constraint", constraint_json(*spec, *outcome.stats.constraint));
+                }
+                throw error;
+            }
+            const auto parsed = parsed_output(outcome, prompt);
             Json message = Json::object();
             message.set("role", Json("assistant"));
             message.set("content", parsed.content.empty() && parsed.tool_calls.size() ? Json() : Json(sanitize_utf8(parsed.content)));
@@ -852,7 +1035,7 @@ struct ApiService::Impl {
             return;
         }
         if (!response.begin_stream(200, "text/event-stream")) { ticket->cancel(); return; }
-        StreamWriter writer{response, interval};
+        StreamWriter writer{response, interval, progress_interval};
         bool first_chunk = true;
         Json final_receipt;
         const auto chunk = [&](Json delta, const Json& finish) {
@@ -866,7 +1049,7 @@ struct ApiService::Impl {
             out.set("model", Json(config.model_id));
             Json choices = Json::array(); choices.push(std::move(choice));
             out.set("choices", std::move(choices));
-            if (config.stream_receipts && (first_chunk || !finish.is_null()))
+            if ((config.stream_receipts || spec) && (first_chunk || !finish.is_null()))
                 out.set("strix", first_chunk ? initial_receipt : final_receipt);
             first_chunk = false;
             return writer.write("data: " + out.dump() + "\n\n");
@@ -890,8 +1073,8 @@ struct ApiService::Impl {
             return true;
         };
         auto outcome = drive(ticket, stops, [&](const std::string& text) { return send_deltas(splitter.push(text)); },
-            [&] { return !response.client_gone(); }, [&] { return writer.idle(); });
-        send_deltas(splitter.finish());
+            [&] { return !response.client_gone(); }, [&] { return writer.idle(*ticket); }, spec, send_deltas);
+        if (!spec) send_deltas(splitter.finish());
         std::string finish = outcome.finish == "cancelled" ? "stop" : outcome.finish;
         if (!outcome.error.empty()) {
             Json error = Json::object();
@@ -899,7 +1082,7 @@ struct ApiService::Impl {
             error.set("error", std::move(detail));
             writer.write("data: " + error.dump() + "\n\n");
         } else if (splitter.saw_tools()) {
-            const auto parsed = (config.output_parser ? config.output_parser(outcome.text, prompt.thinking, prompt.tools) : parse_assistant_output(outcome.text, prompt.thinking, prompt.tools));
+            const auto parsed = parsed_output(outcome, prompt);
             if (parsed.tool_calls.size()) {
                 auto calls = tool_calls_json(parsed.tool_calls);
                 std::int64_t index = 0;
@@ -910,7 +1093,7 @@ struct ApiService::Impl {
                 if (finish == "stop") finish = "tool_calls";
             }
         }
-        if (config.stream_receipts) final_receipt = receipt(&outcome, note, body, limit, sampling_params);
+        if (config.stream_receipts || spec) final_receipt = receipt(&outcome, note, body, limit, sampling_params, spec);
         chunk(Json::object(), Json(finish));
         if (include_usage) {
             Json out = Json::object();
@@ -946,11 +1129,9 @@ struct ApiService::Impl {
             if (const auto* verbosity = text->find("verbosity"); verbosity && !verbosity->is_null() &&
                     !(verbosity->is_string() && verbosity->as_string() == "medium"))
                 reject("text.verbosity", "text.verbosity other than medium is not supported");
-            if (const auto* format = text->find("format"); format && !format->is_null()) {
-                const auto* type = format->find("type");
-                if (!format->is_object() || !type || !type->is_string() || type->as_string() != "text" || format->size() != 1U)
-                    reject("text.format", "text.format other than {type:text} is not yet supported");
-            }
+            if (const auto* format = text->find("format"); format && format->is_object())
+                if (const auto* type = format->find("type"); type && type->is_string() && type->as_string() == "text" && format->size() != 1U)
+                    reject("text.format", "text format must be {type:text}");
         }
         Json chat = Json::object();
         for (const auto& [key, value] : body.as_object())
@@ -1091,10 +1272,12 @@ struct ApiService::Impl {
         std::string note;
         const auto params = sampling(chat, note);
         const auto stops = stop_strings(chat.find("stop"));
+        const auto spec = constraint(body, prompt, params, stops, true);
         const bool stream = bool_or(chat, "stream", false);
         const auto interval = keepalive_seconds(chat);
+        const auto progress_interval = progress_seconds(chat);
         const auto limit = max_tokens(chat, prompt.tokens.size());
-        auto ticket = submit(prompt.tokens, limit, params, chat, prompt.stable_prefix);
+        auto ticket = submit(prompt.tokens, limit, params, chat, prompt.stable_prefix, spec);
         const auto id = random_id("resp_");
         const auto created = unix_now();
         RecentRequest entry{id, "responses", "ok", created};
@@ -1115,7 +1298,7 @@ struct ApiService::Impl {
             Json out = Json::object(); out.set("id", Json(id)); out.set("object", Json("response")); out.set("created_at", Json(created));
             out.set("status", Json(status)); out.set("model", Json(config.model_id)); out.set("output", std::move(output));
             if (status == "incomplete") {  // the budget ran out, or a tool call was cut (stop string, end of sequence)
-                Json d = Json::object(); d.set("reason", Json(o.finish == "length" ? "max_output_tokens" : "unfinished_tool_call"));
+                Json d = Json::object(); d.set("reason", Json(o.stats.constraint ? o.stats.constraint->reason : o.finish == "length" ? "max_output_tokens" : "unfinished_tool_call"));
                 out.set("incomplete_details", std::move(d));
             }
             if (status == "failed") { Json e = Json::object(); e.set("code", Json("server_error")); e.set("message", Json(o.error)); out.set("error", std::move(e)); }
@@ -1123,7 +1306,7 @@ struct ApiService::Impl {
             Json details = Json::object(); details.set("cached_tokens", Json(o.stats.cached_tokens + o.stats.imported_tokens));
             usage.set("input_tokens_details", std::move(details)); usage.set("output_tokens", Json(o.output_tokens));
             usage.set("output_tokens_details", Json::object()); usage.set("total_tokens", Json(o.stats.prompt_tokens + o.output_tokens));
-            out.set("usage", std::move(usage)); out.set("strix", config.stream_receipts ? receipt(run, note, chat, limit, params) : engine_json(o, note, chat)); return out;
+            out.set("usage", std::move(usage)); out.set("strix", config.stream_receipts || spec ? receipt(run, note, chat, limit, params, spec) : engine_json(o, note, chat)); return out;
         };
         // a call whose frame did not close (cut by the budget, a stop string or EOS) is not marked completed
         const auto call_status = [](const AssistantOutput& parsed, std::size_t i) {
@@ -1142,10 +1325,17 @@ struct ApiService::Impl {
             out.set("arguments", Json(call.find("arguments")->dump())); out.set("status", Json(status)); return out;
         };
         if (!stream) {
-            auto o = drive(ticket, stops, {}, [&] { return !response.client_gone(); });
-            if (!o.error.empty()) throw ApiError(500, "server_error", o.error);
-            const auto parsed = config.output_parser ? config.output_parser(o.text, prompt.thinking, prompt.tools) : parse_assistant_output(o.text, prompt.thinking, prompt.tools);
-            const std::string status = o.finish == "length" || cut_call(parsed) ? "incomplete" : "completed";
+            auto o = drive(ticket, stops, {}, [&] { return !response.client_gone(); }, {}, spec);
+            if (!o.error.empty()) {
+                ApiError error(500, "server_error", o.error);
+                if (spec && o.stats.constraint) {
+                    error.strix = Json::object();
+                    error.strix.set("constraint", constraint_json(*spec, *o.stats.constraint));
+                }
+                throw error;
+            }
+            const auto parsed = parsed_output(o, prompt);
+            const std::string status = spec ? response_status(o) : o.finish == "length" || cut_call(parsed) ? "incomplete" : "completed";
             Json output = Json::array();
             if (!parsed.reasoning.empty()) output.push(item(true, parsed.reasoning, random_id("rs_"), status));
             output.push(item(false, parsed.content, random_id("msg_"), status));
@@ -1154,7 +1344,7 @@ struct ApiService::Impl {
             response.send(200, "application/json", envelope(&o, std::move(output), status).dump()); finish_entry(entry, o); return;
         }
         if (!response.begin_stream(200, "text/event-stream")) { ticket->cancel(); return; }
-        StreamWriter writer{response, interval};
+        StreamWriter writer{response, interval, progress_interval};
         std::uint64_t sequence = 0;
         const auto event = [&](const std::string& type, Json data) {
             data.set("type", Json(type)); data.set("sequence_number", Json(sequence++));
@@ -1167,7 +1357,7 @@ struct ApiService::Impl {
             if (stream_started) return true;
             stream_started = true;
             auto initial = envelope(nullptr, Json::array(), "in_progress");
-            if (!config.stream_receipts) {
+            if (!config.stream_receipts && !spec) {
                 Json copy = Json::object(); for (const auto& [key, value] : initial.as_object()) if (key != "strix") copy.set(key, value);
                 initial = std::move(copy);
             }
@@ -1214,11 +1404,11 @@ struct ApiService::Impl {
             return true;
         };
         auto o = drive(ticket, stops, [&](const std::string& t) { return deltas(splitter.push(t)); },
-            [&] { return !response.client_gone(); }, [&] { return writer.idle(); });
-        deltas(splitter.finish());
+            [&] { return !response.client_gone(); }, [&] { return writer.idle(*ticket); }, spec, deltas);
+        if (!spec) deltas(splitter.finish());
         // parsed whether or not the splitter saw a full marker: a frame cut inside its opening tag still counts
-        const auto parsed = config.output_parser ? config.output_parser(o.text, prompt.thinking, prompt.tools) : parse_assistant_output(o.text, prompt.thinking, prompt.tools);
-        const std::string status = !o.error.empty() ? "failed" : o.finish == "length" || cut_call(parsed) ? "incomplete" : "completed";
+        const auto parsed = parsed_output(o, prompt);
+        const std::string status = spec ? response_status(o) : !o.error.empty() ? "failed" : o.finish == "length" || cut_call(parsed) ? "incomplete" : "completed";
         // items end completed or incomplete; a failure is the response's status
         const std::string item_status = status == "completed" ? "completed" : "incomplete";
         close(item_status);
@@ -1271,6 +1461,7 @@ struct ApiService::Impl {
         const auto stops = stop_strings(body.find("stop"));
         const bool stream = bool_or(body, "stream", false);
         const auto interval = keepalive_seconds(body);
+        const auto progress_interval = progress_seconds(body);
         const auto limit = max_tokens(body, prompt.size());
         const auto initial_receipt = config.stream_receipts ? receipt(nullptr, note, body, limit, sampling_params) : Json();
         auto ticket = submit(prompt, limit, sampling_params, body);
@@ -1300,11 +1491,11 @@ struct ApiService::Impl {
             return;
         }
         if (!response.begin_stream(200, "text/event-stream")) { ticket->cancel(); return; }
-        StreamWriter writer{response, interval};
+        StreamWriter writer{response, interval, progress_interval};
         // with receipts: an empty first chunk carries the policy right after the headers (keepalive comments follow it)
         if (config.stream_receipts) writer.write("data: " + chunk("", Json(), false, nullptr).dump() + "\n\n");
         auto outcome = drive(ticket, stops, [&](const std::string& text) {
-            return writer.write("data: " + chunk(text, Json(), false, nullptr).dump() + "\n\n"); }, [&] { return !response.client_gone(); }, [&] { return writer.idle(); });
+            return writer.write("data: " + chunk(text, Json(), false, nullptr).dump() + "\n\n"); }, [&] { return !response.client_gone(); }, [&] { return writer.idle(*ticket); });
         writer.write("data: " + chunk("", Json(outcome.finish == "cancelled" ? "stop" : outcome.finish), true, &outcome).dump() + "\n\n");
         writer.write("data: [DONE]\n\n");
         response.end_stream();
@@ -1410,6 +1601,7 @@ struct ApiService::Impl {
         const auto stops = stop_strings(body.find("stop_sequences"));
         const bool stream = bool_or(body, "stream", false);
         const auto interval = keepalive_seconds(body);
+        const auto progress_interval = progress_seconds(body);
         const auto* max = body.find("max_tokens");
         if (!max || !max->is_number()) throw ApiError(400, "invalid_request_error", "max_tokens is required", "max_tokens");
         const auto limit = max_tokens(body, prompt.tokens.size());
@@ -1461,7 +1653,7 @@ struct ApiService::Impl {
             return;
         }
         if (!response.begin_stream(200, "text/event-stream")) { ticket->cancel(); return; }
-        StreamWriter writer{response, interval};
+        StreamWriter writer{response, interval, progress_interval};
         const auto event = [&](const char* name, const Json& data) {
             return writer.write(std::string("event: ") + name + "\ndata: " + data.dump() + "\n\n");
         };
@@ -1515,7 +1707,7 @@ struct ApiService::Impl {
             return true;
         };
         auto outcome = drive(ticket, stops, [&](const std::string& text) { return send_deltas(splitter.push(text)); },
-            [&] { return !response.client_gone(); }, [&] { return writer.idle(); });
+            [&] { return !response.client_gone(); }, [&] { return writer.idle(*ticket); });
         send_deltas(splitter.finish());
         bool tools = false;
         if (splitter.saw_tools()) {
@@ -1694,8 +1886,10 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
             return out.dump();
         }
         detail.set("message", Json(std::string(e.what()))); detail.set("type", Json(e.type()));
-        detail.set("param", e.param().empty() ? Json() : Json(e.param())); detail.set("code", Json());
+        detail.set("param", e.param().empty() ? Json() : Json(e.param())); detail.set("code", e.code().empty() ? Json() : Json(e.code()));
+        if (!e.keyword().empty()) detail.set("keyword", Json(e.keyword()));
         Json out = Json::object(); out.set("error", std::move(detail));
+        if (!e.strix.is_null()) out.set("strix", e.strix);
         return out.dump();
     };
     try {

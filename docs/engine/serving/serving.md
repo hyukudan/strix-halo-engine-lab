@@ -33,7 +33,9 @@ Serving runs on the tiled MTP route, so it takes the flags of a tiled MTP reques
 | `--http-max-connections N` | `64` | open connections before new ones get 503 |
 | `--http-responses on\|off` | `on` | the stateless `POST /v1/responses` route ([below](#responses-stateless)); `off`: 404 |
 | `--http-capabilities on\|off` | `on` | `GET /v1/capabilities` and its `capabilities_id` in `/health`, `/v1/models`, `/api/status`; `off`: 404, no id |
-| `--http-stream-receipts on\|off` | `on` | the applied-policy `strix` object at the start and end of every stream ([below](#applied-policy-and-keepalive)); `off` together with `--http-sse-keepalive 0`: the previous build's bytes |
+| `--http-stream-receipts on\|off` | `on` | the applied-policy `strix` object at the start and end of every stream ([below](#applied-policy-and-keepalive)); `off` together with `--http-sse-keepalive 0 --http-sse-progress-interval 0`: the previous build's bytes |
+| `--http-constraints on\|off` | `on` | constrained JSON output ([below](#constrained-json-output)); `off`: such requests get 400 and capabilities say unavailable |
+| `--http-sse-progress-interval SECONDS` | `1` | coalesced completed prefill progress as SSE comments; `0`: none; request opt-out: `"strix":{"progress":false}` |
 | `--http-sse-keepalive SECONDS` | `10` | SSE comment `: keepalive` after this long without a write while a stream waits (queue, prefill, decode); `0`: none |
 
 The token IDs on the command line are the **calibration prompt**: its first
@@ -156,7 +158,7 @@ window stream shared by all slots. The calibration replay runs once.
   `stream_options.include_usage`, `n` (only 1), `temperature`, `top_p`, `top_k`, `seed`.
 - Generation fields the server does not execute yet are refused with a 400 naming the field, on every route:
   non-zero `presence_penalty` / `frequency_penalty`, `repetition_penalty` other than 1, a non-empty `logit_bias`,
-  `logprobs` / `top_logprobs`, `response_format` other than text, `parallel_tool_calls: false`, `required` or named
+  `logprobs` / `top_logprobs`, `response_format` other than text / `json_object` / `json_schema` ([constrained output](#constrained-json-output)), `parallel_tool_calls: false`, `required` or named
   `tool_choice` (Anthropic: `any` / `tool`, `disable_parallel_tool_use: true`), `strict` tools, legacy `functions` /
   `function_call`; on completions also `n` / `best_of` other than 1, a `suffix` and a numeric `logprobs`; on
   messages `thinking.type` other than `enabled` / `disabled` and non-null `output_config` members. Neutral values are accepted.
@@ -188,7 +190,7 @@ to the following assistant message. The prompt token IDs equal those of the equi
 Responses request generates the same tokens as its chat form.
 
 The route keeps no state: `previous_response_id`, `store: true`, `conversation` and `background` are refused with
-400, as are features the server does not execute yet: `text.format` other than text, `text.verbosity` other than
+400, as are features the server does not execute yet: `text.format` other than text / `json_object` / `json_schema`, `text.verbosity` other than
 `medium`, `strict: true` tools, `required` or named `tool_choice`, non-function tools, image or file input,
 encrypted-only reasoning, reasoning summaries, `include`, `truncation` other than `disabled`, `max_tool_calls`,
 unknown or duplicate `call_id`s; the 400 names the field. A `null` member counts as absent. The reply is a response
@@ -201,7 +203,48 @@ and an increasing `sequence_number`): `response.created`, `response.in_progress`
 `response.function_call_arguments.delta`/`.done`, `response.content_part.done`, `response.output_item.done`, and
 exactly one of `response.completed`, `response.incomplete`, `response.failed`. There is no `[DONE]`.
 
+### Constrained JSON output
+
+`response_format` (chat) or `text.format` (Responses) set to `{"type":"json_object"}` or to a JSON schema
+(`{"type":"json_schema","json_schema":{"name","schema","strict"}}` in chat, `{"type":"json_schema","name","schema","strict"}`
+in Responses) makes the answer a JSON value that the token selection itself keeps valid: at every answer position the
+server picks the highest-logit token among those whose bytes keep the output a valid prefix (lowest id on ties), and
+end of sequence only once the value is complete. Thinking, when on, runs unconstrained until the end-of-thinking token;
+the constraint applies to the answer after it. The answer bytes are returned exactly (no tool parsing, no trimming).
+
+The schema language is `strix-json-schema-v1`: `type` (also type arrays), `properties`, `required`, boolean
+`additionalProperties`, `items`, `minItems` / `maxItems`, `minLength` / `maxLength` (Unicode scalars), `enum`, `const`,
+`anyOf`, local acyclic `$defs` / `$ref`, and the annotations `title`, `description`, `$comment`. Any other keyword
+(`minimum`, `pattern`, `format`, `oneOf`, ...) is refused with a 400 whose `param` is the keyword's full path (for
+example `text.format.schema.properties.age.minimum`) and `code` `unsupported_schema_keyword`; `strict: false` does not
+turn the refusal into silent ignoring. Output follows a documented generation language (standard JSON with at most two
+whitespace characters between tokens, no duplicate keys, integers without fraction or exponent, `enum` / `const` in
+their compact spelling). Compilation is bounded (schema size, nodes, depth, properties, enum values, work, memory);
+limits are listed in `GET /v1/capabilities` under `constraints`.
+
+Constraints run greedy only, on a serial host route (`execution: serial-host`): the request's target logits row is read
+back and selected on the host, and the request decodes without speculative drafts; other requests in the batch keep
+their normal speculative decoding. Constraints are refused with stop strings, with effective sampling
+(`temperature > 0` on a sampling server) and with a non-empty tool offering. Every constrained response carries
+`strix.constraint` (also with stream receipts off): `identity` (`json-object` or `strix-json-schema-v1`), `selection`,
+`execution`, `phase`, `status` (`complete`, `incomplete`, `failed`), `accepting` and `reason` (`max_output_tokens`,
+`context`, `reasoning_eos`, `cancelled`, `constraint_failure`, `execution_failure`). A reply cut by the budget is
+reported incomplete, never repaired; Responses then has `status: incomplete`.
+
 ### Applied policy and keepalive
+
+Streaming replies may emit compact comments such as
+`: progress {"phase":"prefill","prefilled_tokens":128,"cached_tokens":64,"total_tokens":256}`
+followed by a blank line. Counts describe completed host-visible prefill units: computed tokens and restored
+cached tokens separately; their sum never exceeds the prompt total. The phase becomes `decode` at the first
+published token. Snapshots are coalesced, so short phases and intermediate counts may be skipped. No progress
+is invented for engines that do not report it. `/v1/capabilities` advertises `stream.progress.interval_seconds`
+and `engine_reports`; the applied stream receipt reports the request-effective interval. The interval defaults
+to one second; `--http-sse-progress-interval 0` or `"strix":{"progress":false}` disables comments.
+Progress comments are shared by chat, Messages, Responses and completions streams, never non-stream replies
+or data events. They count as writes for keepalive. Reports use existing host counters at completed blocks,
+serial rows and windows, including cache restore; they introduce no device synchronization or scheduling changes.
+Progress-on/off GPU token/state equality remains a native qualification gate; CPU fake-engine tests cover wire equality.
 
 With `--http-stream-receipts on` (the default), every response's `strix` object states the policy that ran: `sampling_requested` and `sampling_effective`
 (`greedy` or `sample`, with `note` when a sampled request ran greedy), `filters` (each of `temperature`,

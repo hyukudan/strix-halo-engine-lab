@@ -249,7 +249,29 @@ std::shared_ptr<HipMtpTargetHidden> HipMtpTargetHidden::create(
     }
     return result;
 }
+// Host selection runs after the execution transaction: a selector refusal leaves a
+// healthy committed model row. The caller discards this request, never retries unmasked.
 HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial(
+    SerialSessionContext& session,const ExecutionRuntimeResources& resources,
+    DirectLaunchDispatcher& dispatcher,std::uint32_t token,const TokenDraft* draft,
+    const HipMtpHostRowSelector& host_selector) {
+    auto ticket=execute_serial_unselected(session,resources,dispatcher,token,draft);
+    if(host_selector) {
+        auto& i=*impl_;
+        try {
+            read_hip_logits_row(i.logits,static_cast<std::uint32_t>(i.model->vocab_size),i.stream,i.sampled_logits);
+        } catch(...) {
+            i.failed=true;i.guard->recover_or_fail_stop();
+            session.health=SerialSessionHealth::poisoned;session.arithmetic_lineage.tainted=true;
+            throw;
+        }
+        const auto selected=host_selector(i.sampled_logits);
+        if(selected>=i.model->vocab_size) throw std::invalid_argument("host row selector token outside vocabulary");
+        std::const_pointer_cast<HipMtpTargetHiddenTicket::Lease>(ticket.lease_)->predicted=selected;
+    }
+    return ticket;
+}
+HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial_unselected(
     SerialSessionContext& session,const ExecutionRuntimeResources& resources,
     DirectLaunchDispatcher& dispatcher,std::uint32_t token,const TokenDraft* draft) {
     auto& i=*impl_;
@@ -375,7 +397,8 @@ void HipMtpTargetHidden::replace_token_sampler(std::shared_ptr<TokenSampler> sam
 }
 std::shared_ptr<TokenSampler> HipMtpTargetHidden::token_sampler() const noexcept {return impl_->sampler;}
 HipMtpTargetHiddenTicket HipMtpTargetHidden::adopt_prefill_row(const SerialSessionContext& session,
-    std::uint32_t token,MtpDeviceView hidden,std::span<const float> logits) {
+    std::uint32_t token,MtpDeviceView hidden,std::span<const float> logits,
+    const HipMtpHostRowSelector& host_selector) {
     auto& i=*impl_;
     const auto& lineage=session.arithmetic_lineage;
     const auto* last=lineage.intervals.empty()?nullptr:&lineage.intervals.back();
@@ -400,6 +423,10 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::adopt_prefill_row(const SerialSessi
     lease->predicted=select_greedy_token(logits,i.model->vocab_size);
     // Sampled decoding: the block's last row selects through the sampler, as a final serial row would.
     if(i.sampler) lease->predicted=i.sampler->decide(logits,session.next_position,nullptr).token;
+    if(host_selector) {
+        lease->predicted=host_selector(logits);
+        if(lease->predicted>=i.model->vocab_size) throw std::invalid_argument("host row selector token outside vocabulary");
+    }
     i.busy=true;
     try {
         check(hipMemcpyAsync(reinterpret_cast<void*>(slot->view.address),reinterpret_cast<const void*>(hidden.address),

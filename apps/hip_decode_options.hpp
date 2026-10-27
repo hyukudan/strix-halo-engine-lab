@@ -400,12 +400,14 @@ struct Options {
     // OpenAI/Anthropic-compatible requests until SIGINT/SIGTERM. The command-line prompt is the
     // calibration prompt only. Port 0 binds any free port (printed on stderr).
     bool http_serve = false;
+    bool http_constraints = true;
     std::uint32_t http_port = 8080;
     std::string http_bind = "127.0.0.1";
     std::string http_model_id = "qwen3.8-flash-next";
     std::string http_api_key_file;
     bool http_responses = true, http_capabilities = true, http_stream_receipts = true;
     double http_sse_keepalive = 10.0;
+    double http_sse_progress_interval = 1.0;
     std::optional<double> http_default_temperature, http_default_top_p, http_default_min_p;
     std::optional<std::uint32_t> http_default_top_k;
     std::string http_sampling = "greedy";  // temperature > 0: "greedy" (downgrade, noted), "reject" or "sample" (--http-batch)
@@ -796,10 +798,11 @@ inline void validate_http_serve(const Options& o) {
         throw std::invalid_argument("--http-serve requires the tiled MTP route (--mtp with a calibration golden, "
             "--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T)");
     if (o.http_port > 65535U || o.http_bind.empty() || o.http_model_id.empty() || !o.http_default_max_tokens ||
+        !std::isfinite(o.http_sse_progress_interval) || o.http_sse_progress_interval < 0.0 ||
         !std::isfinite(o.http_sse_keepalive) || o.http_sse_keepalive < 0.0 || !o.http_max_queue || !o.http_max_connections || o.http_batch > 8U ||
         (o.http_sampling != "greedy" && o.http_sampling != "reject" && o.http_sampling != "sample"))
         throw std::invalid_argument("--http-* values: port <= 65535, non-empty bind/model id, positive limits, batch 0..8, "
-            "sampling greedy|reject|sample, keepalive seconds >= 0");
+            "sampling greedy|reject|sample, keepalive/progress seconds >= 0");
     if (o.http_sampling == "sample" && !o.http_batch)
         throw std::invalid_argument("--http-sampling sample runs on the batched route (--http-batch N)");
     if (o.http_batch && (!o.mtp.window_prefix || !o.mtp.draft_chain || o.mtp.window_rows_set != std::vector<std::uint32_t>{2U, 4U, 8U}))
@@ -1634,8 +1637,8 @@ inline Options parse_options(
             continue;
         }
         if (argument == "--http-port" || argument == "--http-bind" || argument == "--http-model-id" ||
-            argument == "--http-responses" || argument == "--http-capabilities" || argument == "--http-stream-receipts" ||
-            argument == "--http-sse-keepalive" || argument == "--http-api-key-file" || argument == "--http-sampling" || argument == "--http-default-max-tokens" ||
+            argument == "--http-constraints" || argument == "--http-responses" || argument == "--http-capabilities" || argument == "--http-stream-receipts" ||
+            argument == "--http-sse-progress-interval" || argument == "--http-sse-keepalive" || argument == "--http-api-key-file" || argument == "--http-sampling" || argument == "--http-default-max-tokens" ||
             argument == "--http-default-temperature" || argument == "--http-default-top-k" ||
             argument == "--http-default-top-p" || argument == "--http-default-min-p" ||
             argument == "--http-max-queue" || argument == "--http-max-connections" || argument == "--http-batch" ||
@@ -1652,9 +1655,14 @@ inline Options parse_options(
                 if (value != "on" && value != "off") throw std::invalid_argument(std::string(argument) + " requires on|off");
                 return value == "on";
             };
-            if (argument == "--http-responses") options.http_responses = on_off();
+            if (argument == "--http-constraints") options.http_constraints = on_off();
+            else if (argument == "--http-responses") options.http_responses = on_off();
             else if (argument == "--http-capabilities") options.http_capabilities = on_off();
             else if (argument == "--http-stream-receipts") options.http_stream_receipts = on_off();
+            else if (argument == "--http-sse-progress-interval") {
+                options.http_sse_progress_interval = parse_double(value, "HTTP SSE progress interval");
+                if (options.http_sse_progress_interval < 0.0) throw std::invalid_argument("HTTP SSE progress interval must be >= 0");
+            }
             else if (argument == "--http-sse-keepalive") {
                 options.http_sse_keepalive = parse_double(value, "HTTP SSE keepalive");
                 if (options.http_sse_keepalive < 0.0) throw std::invalid_argument("HTTP SSE keepalive must be >= 0");
