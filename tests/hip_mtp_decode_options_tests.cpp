@@ -587,6 +587,11 @@ int main(){try{
         args.back()="invalid";reject_as(args,"--http-selection-mtp requires on|off","selection MTP invalid value");
         args.pop_back();reject_as(args,"--http-selection-mtp requires a value","selection MTP missing value");
     }
+    {
+        auto args=request();require(parse(args).http_selection_fast,"argmax-first selection defaults on");
+        args.insert(args.end(),{"--http-selection-fast","off"});require(!parse(args).http_selection_fast,"argmax-first selection off");
+        args.back()="invalid";reject_as(args,"--http-selection-fast requires on|off","argmax-first invalid value");
+    }
     expert_copy_cli_contract();
     depth_policy_options_contract();
     return 0;

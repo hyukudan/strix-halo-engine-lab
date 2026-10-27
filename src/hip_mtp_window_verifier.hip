@@ -117,8 +117,13 @@ struct HipMtpWindowVerifier::Impl {
         void* stream,std::span<const std::uint32_t> candidates,std::uint32_t rows,std::uint32_t budget,
         std::span<const std::uint32_t> eos) {
         return [&transaction,stream,candidates,rows,budget,eos,host=std::vector<float>{},vocab=target->model().vocab_size](
-            std::span<const ExecutionBufferAddress> logits) mutable {
+            std::span<const ExecutionBufferAddress> logits,std::span<const HipGreedyRowsReply> replies) mutable {
             return walk_mtp_selection(candidates,rows,budget,eos,[&](std::size_t r) {
+                const auto t0=std::chrono::steady_clock::now();
+                struct Timed {MtpSelectionTransaction& t;std::chrono::steady_clock::time_point t0;
+                    ~Timed(){t.note_row_ns(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t0).count()));}}
+                    timed{transaction,t0};
+                if(r<replies.size()) if(const auto known=transaction.select_known(replies[r].token,replies[r].status)) return *known;
                 read_hip_logits_row(logits[r],static_cast<std::uint32_t>(vocab),stream,host);
                 return transaction.select(host);
             });

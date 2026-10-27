@@ -1458,12 +1458,12 @@
   {
     "engine": "qwen",
     "name": "Constrained JSON output",
-    "flag_or_env": "--http-constraints; --http-selection-mtp",
+    "flag_or_env": "--http-constraints; --http-selection-mtp; --http-selection-fast",
     "default": "on (requests opt in with response_format / text.format)",
     "exact": "Exact relative to the declared constrained target (masked greedy, lowest id on ties), not to unconstrained greedy. Unconstrained requests, alone and sharing the batch with constrained ones, keep their token IDs (GPU gate).",
     "gain": "Usability: schema-valid JSON answers by construction; no speed claim",
     "preconditions": "--http-serve; json_object or strix-json-schema-v1 json_schema format, greedy, no stop strings, no tools. Host selection uses admitted serial-equivalent mtp-host windows or serial-host fallback; receipt states route/reason. No MTP speed claim.",
-    "off_switch": "--http-constraints off; --http-selection-mtp off (serial host selection)",
+    "off_switch": "--http-constraints off; --http-selection-mtp off (serial host selection); --http-selection-fast off walks the full mask for every row",
     "doc_anchor": "docs/optimizations.md#qwen-serve-constraints"
   },
   {

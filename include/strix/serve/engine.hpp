@@ -66,6 +66,10 @@ struct ConstraintVerdict {
     std::uint32_t reasoning_tokens = 0;
     std::vector<std::uint32_t> forced_ids{};
     std::string execution_fallback{};
+    // Host selection cost (wall time, every selected row including rejected window rows): mask build, select
+    // (transforms, argmax, scores) and, on MTP windows, the whole row (readback + mask + select).
+    std::uint64_t profile_rows = 0, profile_window_rows = 0, profile_known_rows = 0;
+    double profile_mask_ms = 0, profile_select_ms = 0, profile_window_row_ms = 0;
 };
 
 // Armed instrumentation: one process-wide word, unarmed until a GET /metrics or GET /api/status?detail=1 arms it

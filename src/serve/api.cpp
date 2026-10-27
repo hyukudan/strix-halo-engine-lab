@@ -972,7 +972,12 @@ struct ApiService::Impl {
         out.set("identity", Json(spec.identity)); out.set("selection", Json("greedy-lowest-id"));
         out.set("execution", Json(verdict.execution)); out.set("phase", Json(verdict.phase));
         out.set("status", Json(verdict.status)); out.set("accepting", Json(verdict.accepting));
-        out.set("reason", verdict.reason.empty() ? Json() : Json(verdict.reason)); return out;
+        out.set("reason", verdict.reason.empty() ? Json() : Json(verdict.reason));
+        Json profile = Json::object();
+        profile.set("rows", Json(verdict.profile_rows)); profile.set("mask_ms", Json(verdict.profile_mask_ms));
+        profile.set("select_ms", Json(verdict.profile_select_ms)); profile.set("window_rows", Json(verdict.profile_window_rows));
+        profile.set("window_row_ms", Json(verdict.profile_window_row_ms)); profile.set("known_rows", Json(verdict.profile_known_rows));
+        out.set("host_profile", std::move(profile)); return out;
     }
     ConstraintVerdict initial_verdict(const ConstraintSpec& spec) const {
         ConstraintVerdict v; v.phase = spec.starts_in_reasoning ? "reasoning" : "answer";
