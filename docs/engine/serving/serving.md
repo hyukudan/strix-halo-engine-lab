@@ -690,6 +690,19 @@ python3 tests/batch_service_gpu_gate.py --scenario nest --reference "$OUT/servic
 python3 tests/http_slots_gpu_gate.py --prompt A.ids --prompt B.ids --out "$OUT/slots" --modes auto -- CMD...
 ```
 
-The gates compare full token IDs, the final frontier and every committed target component (the prompt digest
-only within one route: the batched route takes it before its last prompt window is folded in) and require
-witnesses (`service_rounds`, `nested_admits`, `cancel_points_cancelled`, `lazy_slot_builds`).
+The gates compare full token IDs, the final frontier and every committed target component and require
+witnesses (`service_rounds`, `nested_admits`, `cancel_points_cancelled`, `lazy_slot_builds`). Prompt digests
+materialize accepted GDN window rows before hashing, as do prompt-end exports before copying state.
+Every serial prompt row also materializes pending rows before consuming recurrent/conv state, including
+fallback after history exhaustion. Serial decode entry folds first too; accepted windows fold their predecessor.
+`STRIX_FINAL_STATE_DIGEST=1` with `STRIX_PROMPT_STATE_DIGEST=1` registers state and reports the final committed
+digest/frontier (and components with `STRIX_PREFIX_CACHE_DIGEST_COMPONENTS=1`) without observing prompt state.
+It logs prompt execution receipts without a prompt digest, so observation-free continuation gates can require
+the actual accepted/refused window boundary. The general slots gate retains its prompt-digest
+exclusion pending GPU qualification across all prompt/predictor layouts; same-route checks still compare it.
+The opt-in `tests/http_slots_gpu_gate.py --export-roundtrip` arm explicitly compares prompt digests for a
+T+4 terminal-R4 prompt, every saved component, and a verified batch-export -> single-import continuation.
+The `--window-state-arm digest-only`, `live-continuation`, and `history-exhaustion` arms isolate prompt
+digest materialization, live batch continuation, and R8 acceptance followed by refused R4/serial fallback.
+The last also compares against a live batch producer exporting at T+8 before the fallback.
+See the gate docstring for separate short commands; missing cold-window/import witnesses fail the gate.
