@@ -54,12 +54,15 @@ private:
 class MtpBridgeEngine final : public serve::GenerationEngine {
 public:
     MtpBridgeEngine(const MtpServeRunner& run, std::uint64_t context_tokens,
-        HttpConstraintRequests& constraints, bool enabled, bool thinking_enabled,bool selection_mtp_available)
-        : run_(run), context_(context_tokens), constraints_(constraints), constraints_enabled_(enabled), thinking_enabled_(thinking_enabled),selection_mtp_available_(selection_mtp_available) {}
+        HttpConstraintRequests& constraints, bool enabled, bool thinking_enabled, bool selection_mtp_available,
+        serve::BackendProbeSlot* probe = nullptr)
+        : run_(run), context_(context_tokens), constraints_(constraints), constraints_enabled_(enabled),
+          thinking_enabled_(thinking_enabled), selection_mtp_available_(selection_mtp_available), probe_(probe) {}
     serve::GenerationStats generate(serve::GenerationJob& job) override {
         if (failed_.load()) throw std::runtime_error("the engine failed during an earlier request; restart the server");
         if (job.prompt.empty() || job.prompt.size() >= context_) throw std::invalid_argument("prompt is empty or fills the context");
         MtpServeRequest request;
+        request.backend_probe = probe_;
         request.constraint = constraints_.make(job.constraint);
         request.prompt = job.prompt;
         request.max_tokens = job.max_tokens;
@@ -72,6 +75,7 @@ public:
             result = run_(request);
         } catch (...) {
             failed_.store(true);
+            if (probe_) probe_->fail();
             if (!request.constraint) throw;
             serve::GenerationStats stats;
             stats.prompt_tokens = job.prompt.size();
@@ -119,6 +123,7 @@ private:
     bool thinking_enabled_;
     bool selection_mtp_available_;
     std::atomic<bool> failed_{false};
+    serve::BackendProbeSlot* probe_;
 };
 
 inline std::atomic<bool>& http_serve_stop_requested() {
@@ -180,8 +185,15 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
 
         if (serve::serve_health_record_enabled())
             config.health_record = http_health_record(options, 1, startup, assets);
-        MtpBridgeEngine engine(run, options.context_tokens, constraints, config.engine_constraints, config.engine_thinking_budget,selection_mtp_available);
         serve::GenerationQueue queue(options.http_max_queue);
+        serve::BackendProbeSlot probe([&] { queue.wake_control(); });
+        const bool probing = config.health_record && config.health_record->backend_probe_enabled;
+        if (probing) {
+            queue.set_idle_control([&] { probe.boundary(serve::BackendProof::control_only); });
+            config.health_provider = [&] { return probe.snapshot(); };
+        }
+        MtpBridgeEngine engine(run, options.context_tokens, constraints, config.engine_constraints, config.engine_thinking_budget,
+            selection_mtp_available, probing ? &probe : nullptr);
         serve::ApiService api(config, tokenizer, queue, options.context_tokens, false);
         serve::HttpServerConfig http;
         http.bind_address = options.http_bind;
@@ -266,6 +278,12 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
             runner.frame_tokens = {open, close};
 
         serve::GenerationQueue queue(options.http_max_queue);
+        serve::BackendProbeSlot probe([&] { queue.wake_control(); });
+        const bool probing = config.health_record && config.health_record->backend_probe_enabled;
+        if (probing) {
+            queue.set_idle_control([&] { probe.boundary(serve::BackendProof::control_only); });
+            config.health_provider = [&] { return probe.snapshot(); };
+        }
         serve::ApiService api(config, tokenizer, queue, options.context_tokens, samples);
         serve::HttpServerConfig http;
         http.bind_address = options.http_bind;
@@ -395,7 +413,11 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                     if (queue.stopping()) break;
                     continue;
                 }
-                runner.step();
+                const auto generation = probing ? probe.pending_generation() : 0;
+                if (generation) {
+                    const bool completed = runner.step<true>();
+                    if (completed) probe.complete(generation, serve::BackendProof::work_completion);
+                } else runner.step();
             }
         } catch (const std::exception& e) {
             failure = e.what();
@@ -405,6 +427,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         if (!failure.empty()) {
             // The target state of every slot is unknown: fail the requests in flight and stop.
             failed.store(true);
+            if (probing) probe.fail();
             runner.fail_requests(failure);
             for (auto& taken : std::vector<std::shared_ptr<serve::TakenJob>>(live)) queue.finish(*taken, {}, failure);
             live.clear();

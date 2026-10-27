@@ -27,9 +27,9 @@
     "name": "Service health record",
     "flag_or_env": "STRIX_SERVE_HEALTH_RECORD; STRIX_SERVE_BACKEND_PROBE; --release-manifest",
     "default": "ON",
-    "exact": "Cached host metadata and queue snapshot only; no device calls, runner locks, observation arming or numerical changes. CPU contracts pass; real device liveness is not implemented.",
+    "exact": "Generation-coalesced owner completion proof; no health device calls, runner locks or observation arming. Unrequested owner hook is one relaxed atomic load. Measurement: token ids identical with the probe on and off (3 concurrent greedy completions on the batched route, health polled every 50 ms).",
     "gain": "No throughput claim",
-    "preconditions": "Qwen HTTP serving; optional manifest verified before model startup. Interim unchecked health keeps legacy HTTP success, with ready false.",
+    "preconditions": "Qwen HTTP serving; optional manifest verified before model startup. Fresh completion-boundary proof establishes readiness for one second; HTTP waits at most 100 ms. Pending proof keeps HTTP 200 and ready false. Idle owners wake for control-only acknowledgement; scratch-event proof is not implemented.",
     "off_switch": "STRIX_SERVE_HEALTH_RECORD=0 restores legacy JSON; STRIX_SERVE_BACKEND_PROBE=0 returns unchecked/503 with the health record enabled.",
     "doc_anchor": "docs/operations/service-health.md"
   },

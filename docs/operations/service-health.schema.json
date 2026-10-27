@@ -476,7 +476,7 @@
         "proof": {
           "enum": [
             "control-only",
-            "work-completion",
+            "completion-boundary",
             "idle-scratch-event",
             null
           ]

@@ -154,12 +154,24 @@ std::shared_ptr<GenerationTicket> GenerationQueue::submit(GenerationJob job) {
     return ticket;
 }
 
+void GenerationQueue::wake_control() {
+    const std::lock_guard lock(mutex_);
+    control_pending_ = true;
+    ready_.notify_one();
+}
+
 void GenerationQueue::run(GenerationEngine& engine, const std::function<void(const GenerationStats&)>& observe) {
     for (;;) {
         Entry entry;
         {
             std::unique_lock lock(mutex_);
-            ready_.wait(lock, [&] { return stopping_ || !entries_.empty(); });
+            ready_.wait(lock, [&] { return stopping_ || !entries_.empty() || control_pending_; });
+            if (entries_.empty() && control_pending_ && !stopping_) {
+                control_pending_ = false;
+                lock.unlock();
+                if (idle_control_) idle_control_();
+                continue;
+            }
             if (entries_.empty()) return;
             entry = std::move(entries_.front());
             entries_.pop_front();
@@ -216,7 +228,13 @@ std::optional<TakenJob> GenerationQueue::take(bool wait) {
         Entry entry;
         {
             std::unique_lock lock(mutex_);
-            if (wait) ready_.wait(lock, [&] { return stopping_ || !entries_.empty(); });
+            if (wait) ready_.wait(lock, [&] { return stopping_ || !entries_.empty() || control_pending_; });
+            if (wait && entries_.empty() && control_pending_ && !stopping_) {
+                control_pending_ = false;
+                lock.unlock();
+                if (idle_control_) idle_control_();
+                return std::nullopt;
+            }
             if (entries_.empty()) return std::nullopt;
             entry = std::move(entries_.front());
             entries_.pop_front();

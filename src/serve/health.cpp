@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <limits>
+#include <thread>
 
 namespace strix::serve {
 namespace {
@@ -102,13 +104,76 @@ const char* state_name(BackendState state) {
 const char* proof_name(BackendProof proof) {
     switch (proof) {
     case BackendProof::control_only: return "control-only";
-    case BackendProof::work_completion: return "work-completion";
+    case BackendProof::work_completion: return "completion-boundary";
     case BackendProof::idle_scratch_event: return "idle-scratch-event";
     case BackendProof::none: return nullptr;
     }
     return nullptr;
 }
 } // namespace
+BackendProbeSlot::BackendProbeSlot(std::function<void()> wake, Clock clock, Pause pause)
+    : wake_(std::move(wake)), clock_(std::move(clock)), pause_(std::move(pause)) {
+    if (!clock_) clock_ = [] { return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    if (!pause_) pause_ = [] { std::this_thread::sleep_for(std::chrono::milliseconds(1)); };
+}
+void BackendProbeSlot::acknowledge(std::uint64_t generation, BackendProof proof) noexcept {
+    // Only requested boundaries read a clock. Low two bits hold the proof kind.
+    const auto now = static_cast<std::uint64_t>(clock_());
+    const std::uint64_t kind = proof == BackendProof::work_completion ? 2U :
+        proof == BackendProof::idle_scratch_event ? 3U : 1U;
+    stamp_.store((now & ~std::uint64_t{3}) | kind, std::memory_order_release);
+    owner_generation_ = generation;
+    acknowledged_.store(generation, std::memory_order_release);
+}
+BackendHealth BackendProbeSlot::cached(std::int64_t now) const {
+    BackendHealth out;
+    out.state = BackendState::probe_pending;
+    out.required_ranks = 1;
+    out.responsive_ranks = 0;
+    const auto stamp = stamp_.load(std::memory_order_acquire);
+    if (stamp) {
+        const auto time = static_cast<std::int64_t>(stamp & ~std::uint64_t{3});
+        const double age_seconds = now >= time ? static_cast<double>(now - time) / 1e9 : 2.0;
+        out.proof = (stamp & 3U) == 2U ? BackendProof::work_completion :
+            (stamp & 3U) == 3U ? BackendProof::idle_scratch_event : BackendProof::control_only;
+        out.probe_age_seconds = age_seconds;
+        if (out.proof != BackendProof::control_only) {
+            out.last_completion_age_seconds = age_seconds;
+            if (age_seconds <= 1.0) {
+                out.state = BackendState::responsive;
+                out.responsive_ranks = 1;
+            }
+        }
+    }
+    if (failed_.load(std::memory_order_acquire)) out.state = BackendState::failed;
+    return out;
+}
+BackendHealth BackendProbeSlot::snapshot() const {
+    const auto start = clock_();
+    auto out = cached(start);
+    if (out.state == BackendState::failed ||
+        (out.probe_age_seconds && *out.probe_age_seconds <= 1.0)) return out;
+    auto generation = acknowledged_.load(std::memory_order_acquire);
+    // Zero is reserved: generations never wrap or reset during this slot's lifetime.
+    if (generation == std::numeric_limits<std::uint64_t>::max()) {
+        failed_.store(true, std::memory_order_release);
+        return cached(start);
+    }
+    // A racing reader joins the same generation; it never appends another request.
+    if (requested_.compare_exchange_strong(generation, generation + 1U,
+            std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        ++generation;
+        if (wake_) wake_();
+    }
+    for (;;) {
+        const auto acknowledged = acknowledged_.load(std::memory_order_acquire);
+        const auto now = clock_();
+        out = cached(now);
+        if (out.state == BackendState::failed || acknowledged >= generation || now - start >= 100000000) return out;
+        pause_();
+    }
+}
 bool serve_health_record_enabled() noexcept {
     const auto* value = std::getenv("STRIX_SERVE_HEALTH_RECORD");
     return !value || std::string_view(value) != "0";
@@ -126,7 +191,7 @@ HealthResponse render_health(const ServeHealthRecord& c, const BackendHealth& ev
         *backend.last_completion_age_seconds <= 1.0 && backend.required_ranks && *backend.required_ranks > 0 &&
         backend.responsive_ranks == backend.required_ranks;
     const bool interim = c.backend_probe_enabled && c.interim_unchecked_http_success &&
-        backend.state == BackendState::unchecked && !failed && !draining;
+        (backend.state == BackendState::unchecked || backend.state == BackendState::probe_pending) && !failed && !draining;
     auto preflight = object({{"state", "unavailable"}, {"warnings", Json::array()}, {"advisories", Json::array()},
         {"sample_age_seconds", Json()}});
     if (c.preflight && c.preflight_assessment) {

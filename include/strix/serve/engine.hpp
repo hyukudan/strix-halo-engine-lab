@@ -290,6 +290,9 @@ struct QueueSnapshot {
 class GenerationQueue {
 public:
     explicit GenerationQueue(std::size_t max_queued = 64) : max_queued_(max_queued) {}
+    // Install before starting the owner. HTTP wakeups share the existing idle wait.
+    void set_idle_control(std::function<void()> control) { idle_control_ = std::move(control); }
+    void wake_control();
     // nullptr when the queue is full or shut down.
     std::shared_ptr<GenerationTicket> submit(GenerationJob job);
     // Runs jobs until shutdown(); `observe` (optional) sees every finished job's stats.
@@ -321,6 +324,8 @@ private:
     std::deque<Entry> entries_;
     std::size_t max_queued_;
     bool stopping_ = false;
+    bool control_pending_ = false;
+    std::function<void()> idle_control_;
     QueueSnapshot totals_;
     ObserveSnapshot observed_;
 };

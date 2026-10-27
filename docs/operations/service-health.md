@@ -18,25 +18,43 @@ The legacy body retains its `capabilities_id` only when capabilities are on.
 Health never arms performance observation, submits generation work, reads a cache
 inventory, takes runner locks, or calls a device API.
 
-## Readiness and interim liveness
+## Readiness and backend liveness
 
 `ready` requires service state ready and fresh device completion evidence for every
 required rank. `backend.state` is one of `starting`, `responsive`, `probe_pending`,
 `unresponsive`, `failed`, `draining`, or `unchecked`. Proof is null when unknown,
-`control-only` for an owner acknowledgement, `work-completion` for completed device
+`control-only` for an owner acknowledgement, `completion-boundary` for completed device
 work, or `idle-scratch-event` for an isolated completed probe. Control acknowledgements
-cannot establish readiness. Ages are nonnegative seconds; proof and last completion
-must both be at most one second old. Missing or stale peer evidence prevents readiness.
+cannot establish readiness. Ages are nonnegative seconds; device proof must be at
+most one second old. Missing or stale peer evidence prevents readiness.
 
-**Interim Qwen rule:** this version has no real device probe. It reports `unchecked`,
-null proof/ages/rank counts, and `ready: false`. With `STRIX_SERVE_BACKEND_PROBE` unset
-or 1, an otherwise healthy service retains HTTP 200 for compatibility. This HTTP
-success establishes reachability only. `STRIX_SERVE_BACKEND_PROBE=0` explicitly disables
-proof and returns unchecked, ready false and HTTP 503 with the health record enabled.
-Failed or draining services always return HTTP 503. Pending or stale evidence from a
-future probe also returns 503; this alone is not a device fault or a restart trigger.
-Real device progress, idle probing, coalescing and owner-boundary integration are
-reserved for the next implementation phase.
+Qwen enables backend probing by default. Concurrent health readers share one pending
+generation in fixed atomic storage. Generations never wrap; exhaustion permanently
+latches backend failure before the reserved zero value can be published. A reader waits
+up to 100 ms for its acknowledgement, then returns available evidence. Fresh cached evidence is reused for one second.
+The actual backend owner acknowledges at completed work boundaries: after the batched
+runner returns from successful decode work, or after the single-request bridge has a
+completed target prediction or verified cycle. No prompt, token, generation ticket,
+sampling operation or device synchronization is submitted for a health request.
+The unrequested owner hook performs one relaxed atomic load; clock reads and evidence
+publication occur only when a request is pending, outside batch runner timing scopes.
+
+This implementation uses the idle fallback: a health control request wakes the owner's
+existing queue wait, and the fully idle owner acknowledges `control-only`. It does not
+allocate or submit a scratch event. Idle control proof keeps `backend.state` at
+`probe_pending` and `ready: false`. A prompt-only batch step leaves the probe
+pending; device readiness conservatively waits for successful decode completion.
+An earlier device proof can establish readiness while it remains fresh, even after
+its request finishes. A busy owner without a completed boundary leaves the request
+pending; this can occur during a healthy long prefill and is not a GPU fault.
+
+An otherwise healthy Qwen service retains HTTP 200 while proof is pending, with
+`ready: false`. Use `ready` and the proof fields to assess backend progress; HTTP
+success alone establishes reachability. `STRIX_SERVE_BACKEND_PROBE=0` explicitly
+skips probing and returns `unchecked`, `ready: false` and HTTP 503 with the health
+record enabled. Failed or draining services always return HTTP 503. Pending evidence
+alone is not a restart trigger. Idle scratch-event integration and native device
+qualification remain outstanding; CPU tests do not establish inference exactness.
 
 ## Fields and evidence
 
