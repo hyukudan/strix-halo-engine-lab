@@ -526,7 +526,7 @@ Keep pooled keys across decode steps instead of rebuilding them; `STRIX_QSA_DECO
 - **Fallback notice:** Below its threshold or outside the plain route, the previous exact form runs.
 - **Exactness evidence:** Exact: union, score and decode fixtures byte-identical (score rows R16/R32/R64 to 262,144 blocks); at 262,143 tokens the 456-call QSA trace with these defaults is byte-identical to all levers off and the token matches; tokens identical at 32K/131K/262,080.
 - **Off switch:** STRIX_QSA_DECODE_POOL=0
-- **Measured gain:** decode at 262K 75.7 → 53.0 ms/step (−30 %), at 131K −14.7 % (measured with decode selection also on)
+- **Measured gain:** plain serial CLI decode at 262K 75.7 → 53.0 ms/step (−30 %), at 131K −14.7 % (measured with decode selection also on; the default MTP/HTTP route does not use the pool yet)
 - **Implementation / evidence:** [QSA launcher](../src/hip_indexed_attention_launcher.hip)
 
 <a id="qwen-qsa-decode-select"></a>
