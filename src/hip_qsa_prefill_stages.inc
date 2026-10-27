@@ -48,10 +48,11 @@ __global__ void store_rows_kernel(QsaRowsStoreViews<Rows> single, std::uint16_t*
     }
 }
 
-template <SmallWeightKind Kind, bool Batch = false>
+template <SmallWeightKind Kind, bool Batch = false, class... Source>
 __global__ void block_pool_kernel(const std::uint16_t* raw_keys, std::uint32_t first_block, std::uint32_t head_dim,
     std::uint32_t compress_ratio, const void* key_norm, float epsilon, std::uint32_t rotary_dim, float theta, float* pooled_keys,
-    const uint2* bounds = nullptr, std::uint32_t groups = 0U, std::uint16_t* packed_keys = nullptr) {
+    const uint2* bounds = nullptr, std::uint32_t groups = 0U, std::uint16_t* packed_keys = nullptr,
+    Source... rotary_source) {
     auto local = static_cast<std::uint32_t>(blockIdx.x);
     if constexpr (Batch) {
         const auto absolute = first_block + local;
@@ -70,6 +71,7 @@ __global__ void block_pool_kernel(const std::uint16_t* raw_keys, std::uint32_t f
     auto* scratch = shared + head_dim;
     float mean = 0.0F;
     const auto token_start = static_cast<std::uint64_t>(block) * compress_ratio;
+    if (!(rotary_source.check(token_start) && ...)) return;
     for (std::uint32_t offset = 0; offset < compress_ratio; ++offset)
         mean += bf16_to_float(raw_keys[(token_start + offset) * head_dim + feature]);
     mean /= static_cast<float>(compress_ratio);
@@ -85,15 +87,27 @@ __global__ void block_pool_kernel(const std::uint16_t* raw_keys, std::uint32_t f
     pooled[feature] = round_bf16(mean * inv_rms * load_small_weight<Kind>(key_norm, feature));
     __syncthreads();
     float rotated = pooled[feature];
-    if (feature < rotary_dim) {
-        const auto half = rotary_dim / 2U;
-        const auto pair = feature % half;
-        const float exponent = 2.0F * static_cast<float>(pair) / static_cast<float>(rotary_dim);
-        const float angle = static_cast<float>(token_start) * powf(theta, -exponent);
-        const float cosine = cosf(angle);
-        const float sine = sinf(angle);
-        if (feature < half) rotated = pooled[feature] * cosine - pooled[feature + half] * sine;
-        else rotated = pooled[feature] * cosine + pooled[feature - half] * sine;
+    if constexpr (sizeof...(Source) == 0) {
+        if (feature < rotary_dim) {
+            const auto half = rotary_dim / 2U;
+            const auto pair = feature % half;
+            const float exponent = 2.0F * static_cast<float>(pair) / static_cast<float>(rotary_dim);
+            const float angle = static_cast<float>(token_start) * powf(theta, -exponent);
+            const float cosine = cosf(angle);
+            const float sine = sinf(angle);
+            if (feature < half) rotated = pooled[feature] * cosine - pooled[feature + half] * sine;
+            else rotated = pooled[feature] * cosine + pooled[feature - half] * sine;
+        }
+    } else {
+        if (feature < rotary_dim) {
+            const auto half = rotary_dim / 2U;
+            const auto pair = feature % half;
+            const float2 cs = (rotary_source.cs[token_start * 32ULL + pair], ...);
+            const float cosine = cs.x;
+            const float sine = cs.y;
+            if (feature < half) rotated = pooled[feature] * cosine - pooled[feature + half] * sine;
+            else rotated = pooled[feature] * cosine + pooled[feature - half] * sine;
+        }
     }
     const float stored = round_bf16(rotated);
     pooled_keys[static_cast<std::uint64_t>(block) * head_dim + feature] = stored;

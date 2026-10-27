@@ -1,5 +1,6 @@
 #include "strix/batch_nested_prefill.hpp"
 #include "strix/hip_known_prefix_window.hpp"
+#include "strix/hip_qwen_rotary_table.hpp"
 #include "strix/dispatch_fuse.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/hip_mtp_target_window.hpp"
@@ -262,6 +263,8 @@ struct HipKnownPrefixWindow::Impl {
         : actual_owner(std::move(owner)), window(std::move(source)), serial(std::move(serial_source)),
           model(std::move(model_source)), config(std::move(config_source)), resources(serial_resources),
           scratch(memory), scope(native_scope), routed_workspace(std::move(union_workspace)) {
+        require_qwen_rotary_device_payload(model.rotary_identity(),model.qwen_rotary_table.get());
+        if(model.qwen_rotary_table) validate_qwen_rotary_reader(*model.qwen_rotary_table,scope.stream);
         scope.gsq_model = resources.model_manifest && qpf2k::has_gsq_gate(*resources.model_manifest);
         const qpf2k::ModelScope defaults_scope(scope.gsq_model);
         prefill=std::move(tiled);
@@ -2425,6 +2428,7 @@ void HipKnownPrefixWindow::attach_greedy_rows(ExecutionBufferAddress partials,Hi
 }
 std::uint32_t HipKnownPrefixWindow::logical_rows() const noexcept { return impl_->logical_rows(); }
 bool HipKnownPrefixWindow::supports_tiled_prefill() const noexcept {return impl_->prefill.has_value();}
+RotaryIdentity HipKnownPrefixWindow::rotary_identity() const { return impl_->model.rotary_identity(); }
 bool HipKnownPrefixWindow::gsq_model() const noexcept {return impl_->scope.gsq_model;}
 KnownWindowOutputPolicy HipKnownPrefixWindow::output_policy() const noexcept { return impl_->prefill?impl_->prefill->output_policy:impl_->window.output_policy; }
 std::optional<HipKnownPrefixUnionObservation> HipKnownPrefixWindow::latest_routed_union_observation() const noexcept {

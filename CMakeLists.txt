@@ -105,6 +105,15 @@ function(strix_target_warnings target)
     endif()
 endfunction()
 
+# Named host-table arithmetic: no reassociation or implicit multiply-add.
+if(MSVC)
+    set_source_files_properties(src/rotary_descriptor.cpp src/qwen_yarn_table.cpp
+        PROPERTIES COMPILE_OPTIONS "/fp:strict")
+else()
+    set_source_files_properties(src/rotary_descriptor.cpp src/qwen_yarn_table.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off;-frounding-math")
+endif()
+
 find_package(Threads REQUIRED)
 
 if(STRIX_CUDA_DS41_ONLY)
@@ -119,6 +128,8 @@ add_library(strix_core STATIC
 )
 else()
 add_library(strix_core STATIC
+    src/rotary_descriptor.cpp
+    src/qwen_yarn_table.cpp
     src/final_generation_state_export.cpp
     src/greedy_serving_scheduler.cpp
     src/serving_cohort.cpp
@@ -410,6 +421,14 @@ if(BUILD_TESTING)
     target_compile_features(strix-batch-service-handoff-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-batch-service-handoff-tests)
     add_test(NAME strix-batch-service-handoff-tests COMMAND strix-batch-service-handoff-tests)
+    add_executable(strix-rotary-descriptor-tests tests/rotary_descriptor_tests.cpp)
+    target_link_libraries(strix-rotary-descriptor-tests PRIVATE strix_core)
+    strix_target_warnings(strix-rotary-descriptor-tests)
+    add_test(NAME strix-rotary-descriptor-tests COMMAND strix-rotary-descriptor-tests)
+    add_executable(strix-qwen-yarn-table-tests tests/qwen_yarn_table_tests.cpp)
+    target_link_libraries(strix-qwen-yarn-table-tests PRIVATE strix_core)
+    strix_target_warnings(strix-qwen-yarn-table-tests)
+    add_test(NAME strix-qwen-yarn-table-tests COMMAND strix-qwen-yarn-table-tests)
 endif()
 
 if(BUILD_TESTING)
@@ -540,6 +559,15 @@ if(BUILD_TESTING)
     target_link_libraries(strix-http-slot-capacity-tests PRIVATE strix_core)
     strix_target_warnings(strix-http-slot-capacity-tests)
     add_test(NAME strix-http-slot-capacity-tests COMMAND strix-http-slot-capacity-tests)
+    add_executable(strix-qwen-yarn-schedule-tests tests/qwen_yarn_schedule_tests.cpp)
+    target_compile_definitions(strix-qwen-yarn-schedule-tests PRIVATE STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME=1)
+    target_link_libraries(strix-qwen-yarn-schedule-tests PRIVATE strix_core)
+    strix_target_warnings(strix-qwen-yarn-schedule-tests)
+    foreach(schedule 0 8 13 16 12)
+        add_test(NAME strix-qwen-yarn-schedule-${schedule} COMMAND strix-qwen-yarn-schedule-tests)
+        set_tests_properties(strix-qwen-yarn-schedule-${schedule} PROPERTIES ENVIRONMENT "STRIX_QPF2K_SCHED=${schedule}")
+    endforeach()
+
     add_executable(strix-qwen-effective-config-tests tests/qwen_effective_config_tests.cpp)
     target_compile_definitions(strix-qwen-effective-config-tests PRIVATE STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME=1)
     target_link_libraries(strix-qwen-effective-config-tests PRIVATE strix_core)
@@ -1508,6 +1536,9 @@ if(BUILD_TESTING)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME strix-qwen-yarn-python-check
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tools/oracles/qwen_yarn_table_check.py
+                --emitter $<TARGET_FILE:strix-qwen-yarn-table-tests>)
         add_test(NAME strix-ctest-evidence-tests
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/ctest_evidence_tests.py)
         add_test(NAME strix-queue-trace-evidence-tests
@@ -1661,6 +1692,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/hip_distributed_stage_resources.hip
         src/hip_distributed_greedy.hip
         src/hip_hyper_mix_launcher.hip
+        src/hip_qwen_rotary_table.hip
         src/hip_indexed_attention_launcher.hip
         src/hip_qsa_selection_diagnostic.hip
         src/hip_serial_graph.hip
@@ -1725,6 +1757,18 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_SHARED_EXPERT_ROWS_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_QSA_GQA_REUSE_DIAGNOSTIC=1)
+        target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_QWEN_ROTARY_DIAGNOSTIC=1)
+        add_executable(strix-hip-qwen-yarn-rotary-tests tests/hip_qwen_yarn_rotary_tests.hip)
+        target_link_libraries(strix-hip-qwen-yarn-rotary-tests PRIVATE strix_hip_runtime)
+        set_target_properties(strix-hip-qwen-yarn-rotary-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        strix_target_warnings(strix-hip-qwen-yarn-rotary-tests)
+        add_test(NAME strix-hip-qwen-yarn-rotary-tests COMMAND strix-hip-qwen-yarn-rotary-tests)
+        add_test(NAME strix-qwen-rotary-host-admission-tests COMMAND strix-hip-qwen-yarn-rotary-tests --host-admission-only)
+        add_test(NAME strix-qwen-rotary-watchdog-tests COMMAND ${CMAKE_COMMAND}
+            -DFIXTURE=$<TARGET_FILE:strix-hip-qwen-yarn-rotary-tests>
+            -P ${CMAKE_SOURCE_DIR}/tests/qwen_rotary_watchdog_test.cmake)
+        set_tests_properties(strix-hip-qwen-yarn-rotary-tests PROPERTIES LABELS "gpu" SKIP_RETURN_CODE 77)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_QPERSIST_DIAGNOSTIC=1)
         target_compile_definitions(strix_hip_runtime PRIVATE STRIX_BUILD_MOE_BATCHED_ACTIVATION_DIAGNOSTIC=1)
         foreach(mtp_fixture input-fusion forward-replay target-checkpoint draft-head fast-draft draft-batch)
@@ -2054,6 +2098,15 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                  COMMAND strix-hip-hyper-mix-launcher-tests prefetch)
         add_test(NAME strix-hip-hyper-output-prefetch-tests
                  COMMAND strix-hip-hyper-mix-launcher-tests output-prefetch)
+
+        if(STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
+            add_executable(strix-qwen-yarn-host-compile-tests tests/qwen_yarn_host_compile_tests.cpp)
+            target_compile_definitions(strix-qwen-yarn-host-compile-tests PRIVATE STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME=1)
+            target_link_libraries(strix-qwen-yarn-host-compile-tests PRIVATE strix_hip_runtime)
+            strix_target_warnings(strix-qwen-yarn-host-compile-tests)
+            add_test(NAME strix-qwen-yarn-host-compile-tests COMMAND strix-qwen-yarn-host-compile-tests)
+            set_tests_properties(strix-qwen-yarn-host-compile-tests PROPERTIES LABELS "cpu" RUN_SERIAL TRUE TIMEOUT 180)
+        endif()
 
         add_executable(
             strix-hip-launcher-catalog-tests

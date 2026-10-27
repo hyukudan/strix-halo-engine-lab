@@ -684,7 +684,7 @@ register_for_compiled_execution(
     const CompiledSerialExecution& compiled,
     ExecutionLauncherRegistry& registry,
     const ExecutionRuntimeResources* resources,
-    std::shared_ptr<HipGdnIslands> gdn_islands) {
+    std::shared_ptr<HipGdnIslands> gdn_islands, bool perform_device_setup) {
     if (splitk_deferred_norm_) validate_deferred_hc_catalog_model(compiled,resources);
     if (gdn_islands && (device_graph_inputs_ || alternate_lm_head_ || !deferred_moe_status_ || !resources ||
         (gdn_config_.wave8_q8_input_projections != gdn_config_.wave8_q8_output_projection) ||
@@ -707,7 +707,7 @@ register_for_compiled_execution(
     gdn_.
         register_for_compiled_execution(
             compiled,
-            registry, gdn_islands.get());
+            registry, gdn_islands.get(), perform_device_setup);
     indexed_attention_.
         register_for_compiled_execution(
             compiled,
@@ -719,7 +719,7 @@ register_for_compiled_execution(
     hyper_mix_.
         register_for_compiled_execution(
             compiled,
-            registry, resources);
+            registry, resources, perform_device_setup);
     moe_route_.
         register_for_compiled_execution(
             compiled,
@@ -727,7 +727,7 @@ register_for_compiled_execution(
     moe_experts_.
         register_for_compiled_execution(
             compiled,
-            registry);
+            registry, perform_device_setup);
     if (alternate_lm_head_) alternate_lm_head_->register_for_compiled_execution(compiled, registry);
     else lm_head_.register_for_compiled_execution(compiled, registry);
     shared_expert_.

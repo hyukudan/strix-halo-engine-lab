@@ -568,6 +568,8 @@ encode|plain|decode FILE` exposes the tokenizer on the command line.
 - Batched: prompt blocks of several requests may form a segmented group; one native prompt unit owns the shared
   prefill arena at a time. With more than four decoding requests a cycle forms several 8-row cohort windows (two
   rows per request); joint planning (`STRIX_MTP_BATCH_JOINT=1`) runs in groups of at most eight requests.
+- The experimental YaRN mode (`--rope-yarn`) is CLI-only: the HTTP server and MTP refuse it, and a request cannot
+  change the rotary mode.
 - Every built slot holds a full context of state memory and its own window owners; memory grows with the built
   slots. A nested prompt pauses the long prompt for its own prefill; boundary cancellation is not on the
   one-at-a-time route.

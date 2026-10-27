@@ -1,9 +1,12 @@
 #pragma once
 
+#include "strix/hip_qwen_rotary_table.hpp"
 #include <cstdint>
 #include <string>
 
 namespace strix {
+
+class HipQwenRotaryTable;
 
 // Storage of the target model's QSA attention KV cache (the MTP head keeps its
 // own BF16 cache). bf16 is the canonical model dtype. int8_token is the opt-in
@@ -53,6 +56,17 @@ struct ModelContract {
     std::uint64_t indexer_budget = 2048;
     std::uint64_t indexer_compress_ratio = 4;
     float partial_rotary_factor = 0.25F;
+    // Experimental internal seam; every model copy retains the actual allocation.
+    // Admission may bind the host-generated identity before the device upload.
+    RotaryIdentity resolved_rotary;
+    std::uint64_t effective_max_positions() const noexcept {
+        return rotary_identity().descriptor().mode() == RotaryMode::yarn
+            ? rotary_identity().descriptor().effective_max() : max_position_embeddings;
+    }
+    std::shared_ptr<const HipQwenRotaryTable> qwen_rotary_table = nullptr;
+    const RotaryIdentity& rotary_identity() const noexcept {
+        return qwen_rotary_table ? qwen_rotary_table->identity() : resolved_rotary;
+    }
     float rope_theta = 10'000'000.0F;
     std::uint64_t moe_intermediate_size = 640;
     std::uint64_t shared_expert_intermediate_size = 640;
@@ -92,4 +106,11 @@ struct ModelContract {
     [[nodiscard]] std::string validate() const;
 };
 
+// Shared numerical predicate for captures, MTP and merged QSA rows. A table
+// allocation may be replaced by byte-identical coefficients for eager work;
+// captured graphs additionally require the original live allocation generation.
+inline bool same_rotary_model(const ModelContract& a, const ModelContract& b) {
+    return a.rotary_identity() == b.rotary_identity() && a.rope_theta == b.rope_theta &&
+        a.partial_rotary_factor == b.partial_rotary_factor && a.rotary_dim() == b.rotary_dim();
+}
 }  // namespace strix

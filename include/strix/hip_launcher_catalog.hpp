@@ -106,7 +106,9 @@ public:
         const CompiledSerialExecution& compiled,
         ExecutionLauncherRegistry& registry,
         const ExecutionRuntimeResources* resources = nullptr,
-        std::shared_ptr<HipGdnIslands> gdn_islands = {});
+        std::shared_ptr<HipGdnIslands> gdn_islands = {},
+        // False constructs metadata-only descriptors: no device queries or allocations.
+        bool perform_device_setup = true);
 
     [[nodiscard]] const HipGdnLauncherConfig& gdn_config() const noexcept { return gdn_config_; }
 

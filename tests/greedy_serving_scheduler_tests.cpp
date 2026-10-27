@@ -1,3 +1,4 @@
+#include "rotary_mock.hpp"
 #include "strix/greedy_serving_scheduler.hpp"
 
 #include <atomic>
@@ -80,6 +81,22 @@ int main() try {
             result.steps_executed == 5 && result.final_position == 5,
             "chunk boundaries changed greedy tokens or the last-emitted/unconsumed frontier");
     }
+    for (auto factor : {2U, 4U}) {
+        auto key = compatibility(); key.rotary = mock_rotary(factor)->identity();
+        require(key != compatibility(), "same-shape serving numerical compatibility binds rotary mode");
+        auto other = compatibility(); other.rotary = mock_rotary(factor == 2U ? 4U : 2U)->identity();
+        require(key != other, "same-shape factor-2/factor-4 cohorts differ");
+        strix::GreedyServingScheduler scheduler(policy(),key,owner);
+        for(const auto& mismatch : {compatibility(),other}) {
+            unsigned setups=0;
+            auto rejected=scheduler.submit({prefix,16,10,3,15},mismatch,99,1,1024,owner,[&] {
+                ++setups;return std::make_unique<Backend>(calls);
+            });
+            require(rejected.admission==strix::ServingAdmission::incompatible && !setups,
+                "rotary serving mismatch refuses before backend allocation or publication");
+        }
+    }
+
     calls->store(0);
     // Stop boundaries retain the final emitted token without consuming it.
     for (const auto budget : {0U, 1U, 5U}) {

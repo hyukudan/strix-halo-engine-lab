@@ -6413,7 +6413,7 @@ void preflight_q8_hyper_output_model(const CompiledSerialExecution& compiled,
 }
 
 void preflight_splitk_hyper_projection_model(const CompiledSerialExecution& compiled,
-    const ExecutionRuntimeResources& resources, const HipHyperMixLauncherConfig& config) {
+    const ExecutionRuntimeResources& resources, const HipHyperMixLauncherConfig& config, bool validate_device) {
     validate_config(config);
     if (!config.splitk_projection || !compiled.logical_rows || compiled.logical_rows > 65535U ||
         compiled.request_concurrency != 1U || compiled.io.steps.size() != compiled.execution.steps.size())
@@ -6517,6 +6517,7 @@ void preflight_splitk_hyper_projection_model(const CompiledSerialExecution& comp
         throw std::invalid_argument("deferred HC RMS requires all 97 canonical mixers");
     // Device queries happen once, after every host owner has been admitted, and
     // before the bundle registers its first launcher or captures any graph.
+    if (!validate_device) return;
     int device = 0;hipDeviceProp_t properties{};
     check_hip(hipGetDevice(&device),"split-K HC preflight device");
     check_hip(hipGetDeviceProperties(&properties,device),"split-K HC preflight properties");
@@ -6528,7 +6529,7 @@ void HipHyperMixLauncherBundle::
 register_for_compiled_execution(
     const CompiledSerialExecution& compiled,
     ExecutionLauncherRegistry& registry,
-    const ExecutionRuntimeResources* resources) {
+    const ExecutionRuntimeResources* resources, bool validate_device) {
     if(config_.prefetch_hc_projection_next_tile) {
         validate_config(config_);
         if(!resources || compiled.logical_rows!=1U || compiled.request_concurrency!=1U || compiled.device_graph_inputs)
@@ -6538,7 +6539,7 @@ register_for_compiled_execution(
         if(resources && resources->distributed_stage)
             throw std::invalid_argument("capacity stages do not admit experimental split-K HC");
         if (!resources) throw std::invalid_argument("split-K HC bundle requires whole-model preflight resources");
-        preflight_splitk_hyper_projection_model(compiled,*resources,config_);
+        preflight_splitk_hyper_projection_model(compiled,*resources,config_,validate_device);
     }
     if(config_.lane_chain_output){
         validate_config(config_);

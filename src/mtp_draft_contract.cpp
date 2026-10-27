@@ -38,6 +38,7 @@ std::uint64_t checked_mul(
 std::uint64_t build_identity(
     const MtpDraftStructuralContract& contract) noexcept {
     std::uint64_t hash = fnv_offset;
+    hash = append_rotary_identity(hash, contract.rotary);
     hash_u64(hash, contract.proposal_identity);
     hash_u64(
         hash,
@@ -147,6 +148,7 @@ build_mtp_draft_structural_contract(
         model.head_dim;
     contract.rotary_dim =
         model.rotary_dim();
+    contract.rotary = model.rotary_identity();
     contract.rope_theta =
         model.rope_theta;
 
@@ -193,7 +195,7 @@ void validate_mtp_draft_structural_contract(
             model,
             binding);
 
-    if (contract.proposal_identity !=
+    if (contract.rotary != expected.rotary || contract.proposal_identity !=
             expected.proposal_identity ||
         contract.model_content_bound_identity !=
             expected.model_content_bound_identity ||

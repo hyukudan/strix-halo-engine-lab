@@ -201,7 +201,8 @@ void register_hip_gdn_kernel_variant(
 [[nodiscard]] ExecutionLauncher
 make_hip_gdn_launcher(
     std::string kernel_id,
-    HipGdnLauncherConfig* config);
+    HipGdnLauncherConfig* config,
+    bool reserve_device_scratch = true);
 
 class HipGdnLauncherBundle {
 public:
@@ -221,7 +222,8 @@ public:
     // Caller retains islands until all borrowing plans/dispatchers and their work are quiescent.
     void register_for_compiled_execution(
         const CompiledSerialExecution& compiled,
-        ExecutionLauncherRegistry& registry, HipGdnIslands* islands = nullptr);
+        ExecutionLauncherRegistry& registry, HipGdnIslands* islands = nullptr,
+        bool reserve_device_scratch = true);
 
 private:
     HipGdnLauncherConfig config_;

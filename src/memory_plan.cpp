@@ -190,6 +190,9 @@ MemoryBreakdown build_memory_plan(const ModelContract& model,
 
     MemoryBreakdown plan;
     const auto positions = checked_mul(request.context_tokens, request.sessions);
+    if (model.rotary_identity().descriptor().mode() == RotaryMode::yarn &&
+        (!request.context_tokens || request.context_tokens > model.effective_max_positions()))
+        throw std::invalid_argument("memory-plan context is outside the model limit");
     plan.base_kv = checked_mul(base_kv_bytes_per_token(model), positions);
     plan.mtp_kv = request.include_mtp_kv
                       ? checked_mul(mtp_kv_bytes_per_token(model), positions)

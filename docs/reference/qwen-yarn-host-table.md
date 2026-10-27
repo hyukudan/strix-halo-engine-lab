@@ -1,0 +1,251 @@
+# Qwen host YaRN table contract (experimental)
+
+The plain serial CLI accepts experimental static YaRN with explicit
+`--rope-yarn 2|4` (or `STRIX_QWEN_ROPE_YARN=2|4`) and explicit `--context C`,
+where `262144 < C <= 262144*factor`. Equal CLI/environment values agree;
+conflicting non-off factors refuse. CLI `--rope-yarn off` overrides the environment.
+`--baseline` or `STRIX_BASELINE=1` suppresses YaRN before YaRN validation and
+reports the suppressed request in effective config and stderr. Native capacity
+validation still applies, so baseline cannot admit oversized contexts. `off` selects native. This mode changes
+outputs at every position, including position zero, and is not exact to native.
+On gfx1151 the rotary device fixtures (every rotary site, factors 2 and 4, table
+lifetime) match the host table byte for byte and native outputs are unchanged.
+Measured single-needle retrieval with the plain command (synthetic filler, one seed):
+
+| Factor | Context | Prompt tokens | Evidence at token | Result | Wall incl. load |
+|---:|---:|---:|---:|---|---:|
+| 2 | 300,000 | 8,192 | 4,502 | exact (also multi-hop and aggregation) | 11 s |
+| 4 | 600,000 | 8,192 | 4,502 | exact | 12 s |
+| 2 | 300,000 | 299,000 | 284,051 | exact | 277 s |
+| 2 | 393,216 | 393,000 | 373,345 | exact | 355 s |
+| 2 | 520,192 | 520,000 | 493,999 | exact | 476 s |
+
+A single-needle pass is a capability check, not an accuracy rate. Model-fidelity and complete-workload qualification are
+not done; 1,048,576 tokens is not demonstrated: prefill time grows faster than linearly
+(476 s at 520,000 tokens), and a 1M prompt needs resumable, segmented prefill, which this mode does not provide. Admission depends on the PLE pages
+a prompt touches: the measured runs used synthetic filler, and diverse text at
+the same length touches more pages and can be refused.
+
+```sh
+strix-hip-decode-token MODEL.gguf --prompt-ids prompt.ids \
+  --rope-yarn 2 --context 300000 --generate 256 --print-effective-config
+```
+
+`--prompt-ids` reads whitespace-separated decimal token IDs without shell
+argument-size limits. Remove `--print-effective-config` to execute an admitted
+request. Inspection exits before device work and prints the resolved rotary
+identity/table digest plus an `admission` block in bytes. Native/off inspection
+now always includes a `rotary` status with `rope_mode: native`. This is an
+inspection schema change; native identity serialization and hash bytes remain
+empty and unchanged. Qwen HTTP `/v1/capabilities` declares native rotary at
+server scope and YaRN unsupported (`CLI-only`). Both HTTP factories publish
+that same contract. The table is uploaded once and retained by all launcher readers.
+
+Only the eager plain serial route is admitted. MTP, HTTP, teacher scoring,
+graph capture, alternative KV storage, unaudited execution environment controls,
+cache/replay/recording and explicit
+low-level execution routes refuse with named reasons. No request field may
+change process-wide mode. Prompt plus generation must fit the requested
+capacity; occupied positions are strictly below capacity. Native CLI parsing
+continues to enforce `C<=262144` before resolver or inspection, including with
+`--unqualified-context`. The standalone native memory estimator retains its
+historical zero-context and above-model sizing behavior (for example,
+`strix-memory-plan --tokens 524288` returns JSON). Its capacity bound applies
+only when an explicit YaRN descriptor/table is present.
+
+Environment classification applies equally to automatic defaults and explicit
+values, including off switches and masks. It classifies the complete resolved
+environment before any admission estimate or verified reclaim callback. A new
+or unknown item refuses by name until its code paths have been audited; matching
+a default value is not evidence of rotary coverage. Nonrotary controls remain
+subject to their normal kernel/shape/resource checks.
+
+| Environment item | Performs RoPE? | Covered site / operation |
+|---|---|---|
+| `STRIX_QPF2K_SCHED` | No | Must resolve to `12`; owner inventory and tail pruning cover only this schedule |
+| `STRIX_QPF2K_DENSE` | No | Dense projections |
+| `STRIX_QPF2K_GDN` | No | Gated recurrence |
+| `STRIX_QPF2K_GDN_GATES_BATCH` | No | Batched recurrence gates |
+| `STRIX_QPF2K_GDN_CORE16` | No | Recurrence core |
+| `STRIX_QPF2K_HC` | No | Hyper-connection mix |
+| `STRIX_QPF2K_HC_MASK` | No | Hyper-connection selection |
+| `STRIX_QPF2K_HC_OUTPUT3` | No | Hyper-connection output |
+| `STRIX_QPF2K_HC_OUTPUT3_BAND` | No | Hyper-connection output bands |
+| `STRIX_QPF2K_MOE_DA16` | No | Expert activation/down |
+| `STRIX_QPF2K_MOE_ROUTE` | No | Expert routing |
+| `STRIX_QPF2K_MOE_DEFAULTED` | No | Two-bit MoE provenance mask; both defaults produce `3` |
+| `STRIX_PLE_RECLAIMABLE` | No | Page reclaim |
+| `STRIX_INTPREFILL_DENSE_ROWS` | No | Projection row grouping |
+| `STRIX_PREFILL_PIPE` | No | Pipeline scheduling, row dispatch and embedding copies; MTP remains excluded |
+| `STRIX_QSA_ATTEND_BATCH` | No | Selection/attention on already rotated inputs |
+| `STRIX_QSA_SCORE_PARK` | No | Scoring already rotated pooled keys |
+| `STRIX_QSA_INDEX_ROWS` | No | Index projection batching |
+| `STRIX_LM_HEAD_COHORT_LEAN` | No | Head projection; HTTP remains excluded |
+| `STRIX_LM_HEAD_ROWS_LEAN` | No | Head projection |
+| `STRIX_DISPATCH_FUSE` | No | Dispatch organization; verification/MTP remain excluded |
+| `STRIX_QPF2K_SCORE_ROWS` | No | Stage-batch scorer row tiling over already rotated pooled keys |
+| `STRIX_PREFILL_PLE_BATCH` | No | PLE projection batching |
+| `STRIX_QPF2K_SHARED_PRE` | No | Shared-expert projection |
+| `STRIX_QPF2K_MOE_MC` | No | Expert merge/commit |
+| `STRIX_QPF2K_MOE_HDR` | No | Expert dispatch headers |
+| `STRIX_QPF2K_QSA` | Yes | B3 sites A-F below |
+| `STRIX_QPF2K_QSA_MASK` | Yes | B3 sites A-F below, including grouped/batched alternatives |
+| `STRIX_QSA_NORM_GROUP` | Yes | B3 sites B, C, E below |
+| `STRIX_QPF2K_DEFAULTS`, `STRIX_PREFILL_F16` | No | Injection policy / dense operand profile |
+| `STRIX_QWEN_ROPE_YARN` | Selects identity | Must agree with the resolved factor |
+
+The B3-covered rotary sites are listed below. Paths with a table source use
+`with_qwen_rotary`; grouped/wave consumers read the table rows it constructs.
+File:line citations refer to the implementation inventory, not model qualification.
+
+- A: `src/hip_indexed_attention_launcher.hip:5768` and `:5773`,
+  `norm_rope_rows_kernel` (fallback direct Q/K/index-query normalization).
+- B: `src/hip_indexed_attention_launcher.hip:5809`,
+  `qsa_index::rope_table_kernel` (group coefficient construction).
+- C: `src/hip_indexed_attention_launcher.hip:5820` and `:5824`,
+  `qsa_flash::norm_rope_wave_kernel` / `qsa_index::norm_rope_group_kernel`
+  (consume the constructed coefficients).
+- D: `src/hip_indexed_attention_launcher.hip:5885`,
+  `block_pool_kernel` (raw index-key normalization/rotation).
+- E: `src/hip_qsa_prefill_batch.inc:193`, `:199`, `:203`, `:216`,
+  batched coefficient construction, wave/group consumers and pooled index keys.
+- F: `src/hip_indexed_attention_launcher.hip:5993` and `:6015`,
+  `block_score_rows_kernel` (unpooled index-key normalization/rotation).
+
+YaRN requires effective `STRIX_QPF2K_SCHED=12` before reclaim or estimation.
+Other schedule values, including unset with default injection disabled, refuse
+by name; native scheduling is unchanged. The
+inventory covers merged primary CSR and the pruned tail owners for schedule 12.
+
+Execution order is environment classification, host admission, table upload,
+then execution. `--print-effective-config` stops after host admission and emits
+its complete owner/limit block, including a memory refusal when applicable;
+inspection never uploads the table. Passing classification does not bypass
+memory admission or establish model fidelity.
+
+Admission compiles T=8192,4096,2048 in one numerical lineage. It reports target
+KV/raw index, recurrent and convolution state, host state/shadow/alignment,
+model backing, rotary table, shared and slab pool bounds, launcher scratch,
+compiled workspace/tails, metadata, PLE staging and runtime payload. It reserves
+an additional 8 GiB for host/allocator/driver peaks. The shared prefill pool is counted once across layers; window/slab routes
+are excluded. Launcher and staging owners use conservative payload bounds. Required bytes must fit the observed total UMA
+ceiling, incremental MemAvailable and GTT headroom; MemAvailable is never
+increased by PLE credit. Only a successful page drop verified with mincore
+earns credit. Inspection may perform that CPU-only drop. After registration,
+credit and available headroom are checked again before state allocation.
+A refusal lists owners, verified credit, limits and the smallest T tried.
+There is no context shrink, KV8 substitution or native fallback.
+
+The immutable descriptor preserves checkpoint original maximum 262144 and
+distinguishes it from effective table extent 524288 or 1048576. Requested context
+is a separate admission input. Both main and index heads use 64 rotary
+coordinates (32 frequency pairs). Sections are 11/11/10, interleaved on the
+frequency axis; text positions coincide on all three axes. Coordinate pairing
+is `(i,i+32)`. Nonrotary tails and V are unchanged.
+
+For pair `i`, the named `qwen-yarn-hf64-v1` mathematics are:
+
+```text
+c(beta) = 64*ln(262144/(2*pi*beta))/(2*ln(10000000))
+low = max(0,floor(c(32))) = 14
+high = min(63,ceil(c(1))) = 22
+r = clamp((i-low)/(high-low),0,1)
+u = 10000000**(-2*i/64)
+w = u*(1-r) + (u/factor)*r
+A = 1 + 0.1*ln(factor)
+cs[p][i] = (RNE_f32(A*cos(double(p)*w)), RNE_f32(A*sin(double(p)*w)))
+```
+
+Truncation of correction bounds is enabled. The generator uses C++ double
+`std::log`, `std::pow`, `std::cos`, `std::sin` from the host libm, without fast
+math or contraction, and requires round-to-nearest-even. Transcendental
+rounding ties can vary by libm; cross-platform bit identity is not claimed.
+Retain the compiler/libm provenance alongside the artifact and its SHA256.
+The Python oracle checks independent algebra with decimal-base powers and
+binary32 conversion. Neither host implementation establishes model fidelity
+or device qualification.
+
+`generate_qwen_yarn_rows` delivers `[first,end)` in chunks of at most 4096
+rows (default 256), with positions strictly below the effective maximum.
+Each row has 32 interleaved binary32 cosine/sine pairs (256 bytes). A full
+factor-2 table is 128 MiB; factor 4 is 256 MiB. The writer makes two bounded
+passes, first hashing, then writing. It holds no full-table copy. Readers
+validate without publishing unchecked rows. Native generation emits nothing,
+including no header, and retains the existing in-kernel FP32 arithmetic.
+
+The table is a standalone format; raw native table files are not accepted as
+this format. All multibyte integers and floating point bit patterns below are
+little-endian:
+
+| Offset | Field |
+|---|---|
+| 0 | 8-byte magic `STYARN01` |
+| 8 | u32 schema = 1 |
+| 12 | u32 endian marker = 0x01020304 |
+| 16 | u32 canonical descriptor byte length D |
+| 20 | u32 first position |
+| 24 | u32 row count |
+| 28 | u64 payload byte count = row count * 256 |
+| 36 | D descriptor bytes |
+| 36+D | 32 raw SHA256 bytes of payload |
+| 68+D | binary32 interleaved cosine/sine rows |
+
+The canonical descriptor starts with NUL-terminated UTF-8 strings
+`STRIX-ROTARY-V1`, `yarn`, `qwen-yarn-hf64-v1`,
+`fp64-libm-to-f32-rne`. Next are u64 fields: factor, original maximum,
+effective maximum, main rotary dimension, index rotary dimension, theta bits,
+three section counts, interleaved boolean, beta-fast bits, beta-slow bits,
+truncate boolean, attention-factor bits. Double fields use IEEE binary64 bits.
+Bench reference receipts cross-check rotary payloads against effective argv,
+requested arguments, environment and resolver reason. A YaRN signal requires
+a complete non-native payload with an agreeing factor and table digest;
+deleting the whole rotary object or replacing it with native is refused.
+Legacy receipts may omit rotary only when no non-native signal is present.
+
+Native identity serialization is an empty payload: appending it changes no
+existing compiled execution, session layout or MTP identity bytes. Later
+runtime integration must bind the table digest as well as this mathematical
+descriptor to owners, caches and compatibility checks before execution.
+
+Validation rejects metadata/endianness mismatches, incorrect ranges, nonfinite
+coefficients, wrong hashes, truncation and trailing data. SHA256 is an integrity
+check, not authentication or evidence of numerical qualification.
+
+The HIP runtime has an internal test seam: `HipQwenRotaryTable` generates the
+full table with bounded host staging, uploads each chunk once, and exposes a
+read-only device pointer, extent and payload SHA256. Its owner must outlive all
+stream and captured-graph readers. `ModelContract::qwen_rotary_table` carries
+a shared owning handle; null selects the original native kernels. Host admission
+binds the same coefficient digest before the device allocation.
+
+An empty compile-time source pack retains the native kernel arguments and
+FP32 expressions. Table instances read `float2 cs[position][32]`, including A.
+Direct Q/K and index-query normalization, dynamic graph positions, pooled
+raw-index keys, known-row kernels, grouped/batched prefill table construction,
+wave/group consumers and MTP normalization/scoring share these coefficients.
+Raw index keys remain pre-normalization and pre-rotation. Pool reuse refuses a
+different table owner, and an MTP batch requires the same table handle.
+
+Scalar positions refuse before enqueue; device-table instances additionally
+trap on an invalid position before reading coefficients or writing their
+outputs. Grouped table construction copies the selected full-table rows.
+Dynamic graph capacity must fit the table. Cross-owner identities bind the resolved table payload; callers must not mutate a live
+configuration or release its table while a graph retains it.
+
+`strix-hip-qwen-yarn-rotary-tests` is a device fixture target, labeled `gpu` in
+CTest. It exercises actual kernels against a coefficient/BF16 CPU reference
+and frozen project-owned native implementations. Building it does not execute
+it. Device exactness and model qualification require separate authorized runs.
+The compiler inspection helper opens no device:
+
+```sh
+python3 scripts/qualification/qwen_rotary_isa.py \
+  --object BUILD/CMakeFiles/strix_hip_runtime.dir/src/hip_indexed_attention_launcher.hip.o \
+  --out PRIVATE_OUTPUT
+```
+
+Run against both revisions with identical toolchain/options. Keep the extracted
+code objects, disassembly, metadata and per-symbol SHA256 manifest outside Git.
+Compare native symbol bytes and VGPR/scratch counts; whole `.text` hashes change
+when new table specializations are added. ISA equality does not replace device
+token/logit/state qualification.

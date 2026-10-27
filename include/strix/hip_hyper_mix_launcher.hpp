@@ -76,7 +76,8 @@ void preflight_q8_hyper_output_model(const CompiledSerialExecution& compiled,
     const ExecutionRuntimeResources& resources, const HipHyperMixLauncherConfig& config);
 
 void preflight_splitk_hyper_projection_model(const CompiledSerialExecution& compiled,
-    const ExecutionRuntimeResources& resources, const HipHyperMixLauncherConfig& config);
+    const ExecutionRuntimeResources& resources, const HipHyperMixLauncherConfig& config,
+    bool validate_device = true);
 
 // Known-window rows (2..8 C1 contexts of one attn/mlp/final HC step). Each row
 // produces the bytes of its serial typed prefetched Q8 launch (split-K or v8
@@ -138,7 +139,8 @@ public:
     void register_for_compiled_execution(
         const CompiledSerialExecution& compiled,
         ExecutionLauncherRegistry& registry,
-        const ExecutionRuntimeResources* resources = nullptr);
+        const ExecutionRuntimeResources* resources = nullptr,
+        bool validate_device = true);
 
 private:
     HipHyperMixLauncherConfig config_;

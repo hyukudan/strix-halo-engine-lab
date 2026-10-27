@@ -276,6 +276,15 @@ public:
         HipMtpHostRowSelector final_selector={},std::function<void(serve::GenerationProgress)> progress={})
         :tokens_(tokens.begin(),tokens.end()),tiled_(tiled),session_(session),target_(target),runtime_(runtime),qualified_(qualified),
          activated_(activated),resources_(resources),dispatcher_(dispatcher),held_(held),final_sampler_(std::move(final_sampler)),final_selector_(std::move(final_selector)),progress_(std::move(progress)) {
+        producer_rotary_=model.rotary_identity();
+        require_rotary_producer_identity(producer_rotary_,target_.model().rotary_identity());
+        require_rotary_producer_identity(producer_rotary_,runtime_.resources().model().rotary_identity());
+        const auto admit_owner=[&](const std::shared_ptr<HipKnownPrefixWindow>& owner) {
+            if(owner) require_rotary_producer_identity(owner->rotary_identity(),producer_rotary_);
+        };
+        admit_owner(tiled_.block_owner);admit_owner(tiled_.group_owner);
+        for(const auto& tail:tiled_.tails) admit_owner(tail.owner);
+        for(const auto& wide:tiled_.wide) admit_owner(wide.owner);
         n_=static_cast<std::uint64_t>(tokens_.size());
         if(!n_)throw std::invalid_argument("tiled MTP prompt is empty");
         // Sampled decoding: only the final prompt row selects through the sampler (earlier rows' predictions
@@ -468,7 +477,7 @@ public:
             int device=0;check(hipGetDevice(&device),"get priming device");
             const auto submit=[this,device,stream,last,views=std::move(views),next=std::move(next)] {
                 check(hipSetDevice(device),"bind priming device");
-                const bool pending=runtime_.prime_hidden_rows_submit(qualified_,activated_,views,next);
+                const bool pending=runtime_.prime_hidden_rows_submit(qualified_,activated_,views,next,producer_rotary_);
                 check(hipMemcpyAsync(held_,last,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice,stream),"tiled MTP held copy");
                 if(!pending) check(hipStreamSynchronize(stream),"tiled MTP held copy");
                 return pending;
@@ -489,7 +498,7 @@ public:
         if(pos_){views.push_back(view(held_));next.push_back(tokens_[static_cast<std::size_t>(pos_)]);}
         for(std::uint32_t r=0;r+1U<rows;++r){views.push_back(view(block_hidden_+static_cast<std::size_t>(r)*width_));
             next.push_back(tokens_[static_cast<std::size_t>(pos_+r+1U)]);}
-        runtime_.prime_hidden_rows(qualified_,activated_,views,next);
+        runtime_.prime_hidden_rows(qualified_,activated_,views,next,producer_rotary_);
         check(hipMemcpy(held_,block_hidden_+static_cast<std::size_t>(rows-1U)*width_,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
             "tiled MTP held copy");
         pos_+=rows;
@@ -505,7 +514,7 @@ public:
                 final_logits_digest_=sha256_bytes(std::vector<std::byte>(bytes.begin(),bytes.end()));
             }
             if(final_sampler_) target_.replace_token_sampler(final_sampler_);
-            pending_=target_.adopt_prefill_row(session_,tokens_[static_cast<std::size_t>(n_-1U)],view(held_),logits,final_selector_);
+            pending_=target_.adopt_prefill_row(session_,tokens_[static_cast<std::size_t>(n_-1U)],view(held_),logits,producer_rotary_,final_selector_);
             adopted_=true;
             phase_=Phase::done;
         }
@@ -665,7 +674,7 @@ public:
         std::vector<MtpDeviceView> views;std::vector<std::uint32_t> next;
         if(pos_){views.push_back(view(held_));next.push_back(tokens_[static_cast<std::size_t>(pos_)]);}
         for(std::uint32_t r=0;r+1U<rows;++r){views.push_back(tickets[r].view());next.push_back(tokens_[static_cast<std::size_t>(pos_+r+1U)]);}
-        runtime_.prime_hidden_rows(qualified_,activated_,views,next);
+        runtime_.prime_hidden_rows(qualified_,activated_,views,next,producer_rotary_);
         check(hipMemcpy(held_,reinterpret_cast<const void*>(tickets.back().view().address),static_cast<std::size_t>(width_),
             hipMemcpyDeviceToDevice),"tiled MTP held window copy");
         pending_=std::move(tickets.back());pos_+=rows;window_rows_+=rows;
@@ -691,7 +700,7 @@ private:
             pos_+1U==n_?final_selector_:HipMtpHostRowSelector{});
         if(pos_) {
             const std::array<MtpDeviceView,1> one{view(held_)};const std::array<std::uint32_t,1> token{tokens_[static_cast<std::size_t>(pos_)]};
-            runtime_.prime_hidden_rows(qualified_,activated_,one,token);
+            runtime_.prime_hidden_rows(qualified_,activated_,one,token,producer_rotary_);
         }
         check(hipMemcpy(held_,reinterpret_cast<const void*>(ticket.view().address),static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
             "tiled MTP held ticket copy");
@@ -702,6 +711,7 @@ private:
     std::vector<std::uint32_t> tokens_;
     MtpDecodeTargetParents::TiledPrompt& tiled_;
     SerialSessionContext& session_;
+    RotaryIdentity producer_rotary_;
     HipMtpTargetHidden& target_;
     HipMtpRuntime& runtime_;
     const QualifiedMtpDraftPlan& qualified_;
@@ -1737,7 +1747,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     native_budget.normalized_rounding=m.normalized_rounding=="fp32"?HipMtpInputRounding::fp32:HipMtpInputRounding::bf16_rne;
     native_budget.projection_rounding=m.projection_rounding=="fp32"?HipMtpInputRounding::fp32:HipMtpInputRounding::bf16_rne;
     auto native=HipMtpResources::create(model,assets->compiled(),assets->sidecar_manifest(),assets->sidecar_residency(),
-        assets->target_manifest(),assets->target_residency(),assets->shared_target(),native_budget,actual.allocator);
+        assets->target_manifest(),assets->target_residency(),assets->shared_target(),native_budget,actual.allocator,model.rotary_identity());
     auto runtime=std::make_shared<HipMtpRuntime>(native);
     if(m.metadata_only){
         assets->validate_assets_unchanged();
@@ -2001,7 +2011,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                     slot->parents=setup.parents;slot->session=setup.session;slot->dispatcher=setup.dispatcher;
                     const auto& own=*setup.parents->experiment;
                     slot->native=HipMtpResources::create(model,assets->compiled(),assets->sidecar_manifest(),assets->sidecar_residency(),
-                        assets->target_manifest(),assets->target_residency(),assets->shared_target(),native_budget,own.allocator);
+                        assets->target_manifest(),assets->target_residency(),assets->shared_target(),native_budget,own.allocator,model.rotary_identity());
                     HipMtpTargetDeferredConfig own_d1;
                     if(deferred_status)own_d1={setup.parents->resources.session_state_layout,&generations};
                     slot->target=HipMtpTargetHidden::create(model,compiled,own.memory,own.model,own.allocator,

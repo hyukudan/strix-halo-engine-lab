@@ -34,7 +34,7 @@ GraphExecutionContract verify_graph_contract(const CompiledSpeculativeVerifyExec
     for (const auto& binding : compiled.bindings.bindings) {
         safe = safe && !binding.host_or_runtime_step && binding.kernel_id.has_value();
     }
-    return {compiled.execution_identity, compiled.kernel_plan_identity, compiled.candidate_depth, safe};
+    return {compiled.execution_identity, compiled.kernel_plan_identity, compiled.candidate_depth, safe, compiled.rotary_table};
 }
 } // namespace
 
@@ -79,6 +79,7 @@ std::uint64_t build_identity(
     const ExecutionBufferRequest& buffer_request) noexcept {
     std::uint64_t hash = fnv_offset;
 
+    hash = append_rotary_identity(hash, model.rotary_identity());
     hash_u64(hash, model.vocab_size);
     hash_u64(hash, model.hidden_size);
     hash_u64(hash, model.max_position_embeddings);
@@ -215,6 +216,7 @@ compile_speculative_verify_execution(
         throw std::invalid_argument("router kernel request differs from buffer admission");
 
     CompiledSpeculativeVerifyExecution compiled;
+    compiled.rotary_table = model.qwen_rotary_table;
     compiled.vocab_size =
         model.vocab_size;
     compiled.candidate_depth =
@@ -906,9 +908,11 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
         model.num_experts == 512 && model.num_experts_per_token == 10 &&
         model.bytes_bf16 == 2 && model.bytes_fp32 == 4,
         "known window currently supports the canonical R2 model only");
+    // The serial limit follows the resolved rotary identity, independently of
+    // the checkpoint's native maximum and the allocated session context.
     window_require(serial.execution_identity && serial.kernel_plan_identity && serial.logical_rows == 1 &&
         serial.request_concurrency == 1 && !serial.device_graph_inputs &&
-        serial.vocab_size == model.vocab_size && serial.max_position_embeddings == model.max_position_embeddings &&
+        serial.vocab_size == model.vocab_size && serial.max_position_embeddings == model.effective_max_positions() &&
         serial.bindings.missing_steps == 0 && serial.bindings.bindings.size() == serial.execution.steps.size(),
         "known window requires a complete eager C1 serial source");
     window_require(manifest.layout_identity && tensor_access.plan_identity &&

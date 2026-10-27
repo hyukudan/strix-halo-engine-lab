@@ -7,6 +7,7 @@
 #include "rtx_state_import_routes.hpp"
 #include "strix/serve/api.hpp"
 #include "qwen_service_health.hpp"
+#include "qwen_rotary_capabilities.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/engine.hpp"
 #include "strix/serve/http_server.hpp"
@@ -161,6 +162,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         config.default_min_p = options.http_default_min_p;
         config.responses = options.http_responses;
         config.capabilities = options.http_capabilities;
+        config.capabilities_extra = qwen_rotary_capabilities;
         config.stream_receipts = options.http_stream_receipts;
         config.sse_keepalive_seconds = options.http_sse_keepalive;
         config.sse_progress_seconds = options.http_sse_progress_interval;
@@ -252,6 +254,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         config.default_min_p = options.http_default_min_p;
         config.responses = options.http_responses;
         config.capabilities = options.http_capabilities;
+        config.capabilities_extra = qwen_rotary_capabilities;
         config.stream_receipts = options.http_stream_receipts;
         config.sse_keepalive_seconds = options.http_sse_keepalive;
         config.sse_progress_seconds = options.http_sse_progress_interval;

@@ -192,6 +192,7 @@ void validate_known_prefix_window_formats(
     const ModelManifest& manifest, const ExecutionTensorAccessPlan& tensor_access);
 
 struct CompiledSpeculativeVerifyExecution {
+    std::shared_ptr<const HipQwenRotaryTable> rotary_table = nullptr;
     SerialExecutionPlan topology;
     SpeculativeVerifyPlan verify;
     ExecutionBindingPlan bindings;

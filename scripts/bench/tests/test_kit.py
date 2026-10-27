@@ -47,6 +47,125 @@ class KitTests(unittest.TestCase):
         self.assertEqual(identity['identity']['environment'],env)
         self.assertEqual(identity['reference_key']['environment'],env)
 
+    def test_qwen_notices_do_not_hide_effective_json(self):
+        # Engine stderr notice lines precede the stdout JSON in the captured text.
+        native_status = dict(rope_mode='native', factor=0, original_max=262144, effective_max=262144)
+        env = {'STRIX_QPF2K_SCHED': {'value': '12', 'source': 'automatic'},
+               'STRIX_QWEN_ROPE_YARN': {'value': 'off', 'source': 'baseline'}}
+        baseline = ('Qwen baseline: suppressed YaRN request (STRIX_QWEN_ROPE_YARN=2); rotary=native\n' +
+                    json.dumps(dict(rotary=native_status, suppressed_yarn_request='STRIX_QWEN_ROPE_YARN=2',
+                                    admitted=True, environment=env, argv=['--context', '8192', '--baseline'])))
+        parsed = k.parse_effective(baseline)
+        self.assertEqual(parsed['environment']['STRIX_QPF2K_SCHED'], '12')
+        self.assertEqual(parsed['environment']['STRIX_QWEN_ROPE_YARN'], 'off')
+        self.assertEqual(k.qwen_rotary_reference({'decode': parsed}), {})
+        payload = dict(rope_mode='yarn', factor=2, original_max=262144, effective_max=524288,
+                       rotary_dim=64, index_rotary_dim=64, theta=10000000, mrope_sections=[11,11,10],
+                       mrope_interleaved=True, beta_fast=32, beta_slow=1, truncate=True,
+                       attention_factor=1.0693147180559945, math_version='qwen-yarn-hf64-v1',
+                       generator='fp64-libm-to-f32-rne', table_sha256='1'*64)
+        active = ('Qwen experimental YaRN: factor=2 context=300000 T=8192; qualification=experimental; '
+                  'verified PLE credit=28322006848 bytes\n' +
+                  json.dumps(dict(rotary=payload, admission={'host_reserve_bytes': 8589934592}, admitted=True,
+                                  environment={'STRIX_QPF2K_SCHED': {'value': '12', 'source': 'automatic'}},
+                                  argv=['--context', '300000', '--rope-yarn', '2'])))
+        parsed = k.parse_effective(active)
+        self.assertEqual(parsed['arguments'][-2:], ['--rope-yarn', '2'])
+        self.assertNotEqual(k.qwen_rotary_reference({'decode': parsed}), {})
+
+    def test_rotary_reference_identity(self):
+        native = {'decode': {'settings': {}}}
+        self.assertEqual(k.qwen_rotary_reference(native), {})
+        payload = dict(rope_mode='yarn', factor=2, original_max=262144, effective_max=524288,
+                       rotary_dim=64, index_rotary_dim=64, theta=10000000, mrope_sections=[11,11,10],
+                       mrope_interleaved=True, beta_fast=32, beta_slow=1, truncate=True,
+                       attention_factor=1.0693147180559945, math_version='qwen-yarn-hf64-v1',
+                       generator='fp64-libm-to-f32-rne', table_sha256='1'*64)
+        config = {'decode': {'settings': {'rotary': payload}}}
+        key = k.qwen_rotary_reference(config)
+        signals = [dict(arguments=['--rope-yarn','2']), dict(arguments=['--rope-yarn=2']),
+                   dict(requested_args=['--rope-yarn','2']), dict(requested_args={'--rope-yarn':'2'}), dict(requested_arguments='--rope-yarn 2'),
+                   dict(environment={'STRIX_QWEN_ROPE_YARN':'2'}),
+                   dict(settings=dict(reason='experimental-yarn')),
+                   dict(settings=dict(environment={'STRIX_QWEN_ROPE_YARN':dict(value='2',source='explicit')})),
+                   dict(requested=dict(argv=['--rope-yarn','2'])),
+                   dict(settings=dict(resolver_reason='experimental-yarn'))]
+        for signal in signals:
+            for native_payload in (None, dict(rope_mode='native')):
+                changed = copy.deepcopy(signal)
+                changed.setdefault('settings', {})
+                if native_payload is not None: changed['settings']['rotary'] = native_payload
+                with self.subTest(signal=signal, native=native_payload), self.assertRaises(ValueError):
+                    k.qwen_rotary_reference({'decode':changed})
+            changed = copy.deepcopy(signal)
+            changed.setdefault('settings', {})['rotary'] = payload
+            self.assertEqual(key, k.qwen_rotary_reference({'decode':changed}))
+        for signal in (dict(arguments=['--rope-yarn','4']), dict(arguments=['--rope-yarn','off']),
+                       dict(environment={'STRIX_QWEN_ROPE_YARN':'4'}),
+                       dict(requested_args=['--rope-yarn=4'])):
+            changed = dict(signal, settings=dict(rotary=payload))
+            with self.assertRaises(ValueError): k.qwen_rotary_reference({'decode':changed})
+        removed = copy.deepcopy(config)
+        removed['decode']['settings']['reason'] = 'experimental-yarn'
+        removed['decode']['arguments'] = ['--context','300000','--rope-yarn','2']
+        del removed['decode']['settings']['rotary']
+        with self.assertRaises(ValueError): k.qwen_rotary_reference(removed)
+
+        for field in payload:
+            changed = copy.deepcopy(config)
+            value = changed['decode']['settings']['rotary'][field]
+            if field == 'table_sha256': value = '2'*64
+            elif field == 'rope_mode': continue
+            elif isinstance(value, bool): value = not value
+            elif isinstance(value, (int, float)): value += 1
+            elif isinstance(value, list): value[0] += 1
+            else: value += '-changed'
+            changed['decode']['settings']['rotary'][field] = value
+            self.assertNotEqual(key, k.qwen_rotary_reference(changed), field)
+        for missing in payload:
+            changed = copy.deepcopy(config)
+            del changed['decode']['settings']['rotary'][missing]
+            with self.assertRaises(ValueError): k.qwen_rotary_reference(changed)
+        changed = copy.deepcopy(config)
+        changed['decode']['settings']['rotary']['table_sha256'] = None
+        with self.assertRaises(ValueError): k.qwen_rotary_reference(changed)
+        changed = copy.deepcopy(config)
+        changed['decode']['settings']['rotary']['factor'] = 4
+        changed['decode']['settings']['rotary']['effective_max'] = 1048576
+        self.assertNotEqual(key, k.qwen_rotary_reference(changed))
+
+    def test_rotary_refusal_does_not_publish(self):
+        inv=dict(build_options={},binary_sha256s=[],model_files=[],repo_commit='0'*40,
+                 tracked_dirty=False,hardware=dict(rocm_version=None,hip_version=None,kernel='test'))
+        k.dump(self.out/'local-inventory.json',inv)
+        cases = [dict(rotary={}), dict(rotary=dict(factor=2)),
+                 dict(rope_mode='yarn',rotary=dict(rope_mode='native')),
+                 dict(rope_mode='native',rotary=dict(rope_mode='yarn')),
+                 dict(rotary=dict(rope_mode='native',factor=2)),
+                 dict(rotary=dict(rope_mode='native',effective_max=524288)),
+                 dict(rotary=dict(rope_mode='native',table_sha256='1'*64)),
+                 dict(rotary=dict(rope_mode='native',descriptor_sha256='1'*64)),
+                 dict(rotary=dict(rope_mode='native'),rotary_identity=dict(rope_mode='yarn'))]
+        for settings in cases:
+            k.dump(self.out/'effective-decode.json',dict(settings=settings))
+            with patch.object(k,'ENGINE','qwen'), patch.dict(k.os.environ,{'BENCH_PROFILE':'default','BENCH_SUITE':'quick','BENCH_PROMPTS':'kit'}):
+                with self.assertRaises(ValueError): k.initialize(self.out)
+            self.assertFalse((self.out/'identity.json').exists(), settings)
+        native=dict(rope_mode='native',factor=0,original_max=262144,effective_max=262144,
+                    rotary_dim=64,index_rotary_dim=64,theta=10000000,mrope_sections=[11,11,10],
+                    mrope_interleaved=True,beta_fast=32,beta_slow=1,truncate=True,attention_factor=1,
+                    math_version='qwen-yarn-hf64-v1',generator='fp64-libm-to-f32-rne',table_sha256=None,table_bytes=0)
+        self.assertEqual(k.qwen_rotary_reference({'decode':dict(settings=dict(rotary=native))}), {})
+        native['descriptor_sha256']=k.hashlib.sha256(b'').hexdigest()
+        with patch.object(k,'ENGINE','qwen'), patch.dict(k.os.environ,{'BENCH_PROFILE':'default','BENCH_SUITE':'quick','BENCH_PROMPTS':'kit'}):
+            k.dump(self.out/'effective-decode.json',dict(settings={}))
+            k.initialize(self.out)
+            historical=k.read(self.out/'identity.json')['reference_sha256']
+            k.dump(self.out/'effective-decode.json',dict(settings=dict(rotary=native)))
+            k.initialize(self.out)
+            self.assertEqual(k.read(self.out/'identity.json')['reference_sha256'],historical)
+
+
     def test_qwen_auto_config_and_admission(self):
         config={'admitted':True,'environment':{'STRIX_PREFILL_PIPE':{'value':'255','source':'automatic'}},
                 'argv':['--context','8192'],'T':1024,'context':8192,
@@ -77,6 +196,7 @@ class KitTests(unittest.TestCase):
         self.assertEqual(identity['identity']['environment'],env)
         self.assertEqual(identity['reference_key']['environment'],env)
         self.assertEqual(identity['reference_key']['profile_pairs']['prefill']['prefill_profile'],'fast-prefill-f16wmma-v1')
+        self.assertEqual(identity['reference_sha256'], '294a5ed80404d42c03741e36165dc54202753397446161f7ba16a30a1956a40e')
         with patch.dict(k.os.environ,{'BENCH_SELECTED_PROFILE':'baseline'}):
             self.assertEqual(k.parse_effective('{"load_serial":true,"draft_vocab":"full"}')['environment'],{'DG_LOAD_SERIAL':'1'})
 

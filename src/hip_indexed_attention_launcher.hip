@@ -1,4 +1,9 @@
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/hip_qwen_rotary_table.hpp"
+#include "strix/hip_qwen_rotary_diagnostic.hpp"
+#if defined(STRIX_BUILD_QWEN_ROTARY_DIAGNOSTIC)
+#include "../tests/hip_qwen_rotary_watchdog.hpp"
+#endif
 #include "strix/moe_q4k_a8_contract.hpp"
 #include "strix/known_window_cohort.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
@@ -24,6 +29,10 @@
 #include "strix/hip_qsa_gqa_reuse_diagnostic.hpp"
 #include "strix/execution_plan.hpp"
 
+#include "strix/hip_qwen_rotary_diagnostic.hpp"
+#include <iostream>
+#include <chrono>
+#include <thread>
 #include <cstdlib>
 #include <hip/hip_fp16.h>
 #include <hip/hip_ext.h>
@@ -53,6 +62,47 @@
 
 namespace strix {
 namespace {
+
+// An empty Source pack preserves the native kernel ABI and arithmetic. Only
+// table instances carry this additional argument; no native runtime branch.
+struct QwenRotarySource {
+    const float2* cs;
+    std::uint32_t extent;
+    std::uint32_t* status = nullptr;
+    __device__ bool check(std::uint64_t position) const {
+        // Uniform workgroup failure before any output. Never substitute row zero.
+        if (position >= extent) {
+            if (status) { atomicExch(status, 1U); return false; }
+            __builtin_trap();
+        }
+        return true;
+    }
+};
+template <class F>
+void with_qwen_rotary(const ModelContract& model, hipStream_t stream, F&& launch) {
+    require_qwen_rotary_device_payload(model.rotary_identity(),model.qwen_rotary_table.get());
+    if (const auto* table = model.qwen_rotary_table.get()) {
+        if (model.rotary_dim() != 64 || model.rope_theta != 10000000.0F || !table->sha256().valid())
+            throw std::invalid_argument("YaRN device table/model mismatch");
+        validate_qwen_rotary_reader(*table, stream);
+        // Arm captured graph ownership before recording any kernel. Eager
+        // event leases must follow all readers, including a partially failed launch.
+        hipStreamCaptureStatus status{};
+        if (hipStreamIsCapturing(stream, &status) != hipSuccess)
+            throw std::runtime_error("cannot inspect rotary reader stream capture");
+        if (status == hipStreamCaptureStatusActive) retain_qwen_rotary_reader(model.qwen_rotary_table, stream);
+        try {
+            launch(QwenRotarySource{static_cast<const float2*>(table->data()), table->extent()});
+        } catch (...) {
+            if (status != hipStreamCaptureStatusActive) retain_qwen_rotary_reader(model.qwen_rotary_table, stream);
+            throw;
+        }
+        if (status != hipStreamCaptureStatusActive) retain_qwen_rotary_reader(model.qwen_rotary_table, stream);
+    } else launch();
+}
+void check_qwen_rotary_position(const ModelContract& model, std::uint64_t position) {
+    if (model.qwen_rotary_table) model.qwen_rotary_table->check_position(position);
+}
 
 constexpr std::uint32_t kThreads = 256;
 constexpr std::uint64_t kLauncherTag =
@@ -909,7 +959,7 @@ void linear_prefetch8_wave8_q8_float_to_bf16_kernel(
 }
 
 // Shared by the C1 kernel and its known-window rows wrapper (one row per grid.y).
-template <SmallWeightKind Kind>
+template <SmallWeightKind Kind, class... Source>
 __device__ __forceinline__ void norm_rope_body(
     float* values,
     std::uint32_t head_count,
@@ -920,8 +970,9 @@ __device__ __forceinline__ void norm_rope_body(
     std::uint32_t rotary_dim,
     float theta,
     std::uint64_t position,
-    GraphPositionKernelArguments dynamic) {
+    GraphPositionKernelArguments dynamic, Source... rotary_source) {
     if (dynamic.position != nullptr) position = *dynamic.position;
+    if (!(rotary_source.check(position) && ...)) return;
     // Another head can report arithmetic failure while this block starts.
     // Broadcast a single atomic observation before any block-wide barriers;
     // per-thread early exits could otherwise diverge around __syncthreads.
@@ -994,43 +1045,73 @@ __device__ __forceinline__ void norm_rope_body(
 
     float result =
         source[feature];
-    if (feature < rotary_dim) {
-        const auto half =
-            rotary_dim / 2U;
-        const auto pair =
-            feature % half;
-        const float exponent =
-            2.0F *
-            static_cast<float>(pair) /
-            static_cast<float>(
-                rotary_dim);
-        const float angle =
-            static_cast<float>(
-                position) *
-            powf(
-                theta,
-                -exponent);
-        const float cosine =
-            cosf(angle);
-        const float sine =
-            sinf(angle);
+    if constexpr (sizeof...(Source) == 0) {
+        if (feature < rotary_dim) {
+            const auto half =
+                rotary_dim / 2U;
+            const auto pair =
+                feature % half;
+            const float exponent =
+                2.0F *
+                static_cast<float>(pair) /
+                static_cast<float>(
+                    rotary_dim);
+            const float angle =
+                static_cast<float>(
+                    position) *
+                powf(
+                    theta,
+                    -exponent);
+            const float cosine =
+                cosf(angle);
+            const float sine =
+                sinf(angle);
 
-        if (feature < half) {
-            result =
-                source[feature] *
-                    cosine -
-                source[
-                    feature +
-                    half] *
-                    sine;
-        } else {
-            result =
-                source[feature] *
-                    cosine +
-                source[
-                    feature -
-                    half] *
-                    sine;
+            if (feature < half) {
+                result =
+                    source[feature] *
+                        cosine -
+                    source[
+                        feature +
+                        half] *
+                        sine;
+            } else {
+                result =
+                    source[feature] *
+                        cosine +
+                    source[
+                        feature -
+                        half] *
+                        sine;
+            }
+        }
+    } else {
+        if (feature < rotary_dim) {
+            const auto half =
+                rotary_dim / 2U;
+            const auto pair =
+                feature % half;
+            const float2 cs = (rotary_source.cs[position * 32ULL + pair], ...);
+            const float cosine = cs.x;
+            const float sine = cs.y;
+
+            if (feature < half) {
+                result =
+                    source[feature] *
+                        cosine -
+                    source[
+                        feature +
+                        half] *
+                        sine;
+            } else {
+                result =
+                    source[feature] *
+                        cosine +
+                    source[
+                        feature -
+                        half] *
+                        sine;
+            }
         }
     }
     const float rounded = round_bf16(result);
@@ -1041,12 +1122,12 @@ __device__ __forceinline__ void norm_rope_body(
     values[index] = rounded;
 }
 
-template <SmallWeightKind Kind>
+template <SmallWeightKind Kind, class... Source>
 __global__ void norm_rope_kernel(float* values, std::uint32_t head_count, std::uint32_t head_dim,
     std::uint32_t head_stride, const void* norm_weights, float epsilon, std::uint32_t rotary_dim,
-    float theta, std::uint64_t position, GraphPositionKernelArguments dynamic) {
-    norm_rope_body<Kind>(values, head_count, head_dim, head_stride, norm_weights, epsilon,
-        rotary_dim, theta, position, dynamic);
+    float theta, std::uint64_t position, GraphPositionKernelArguments dynamic, Source... rotary_source) {
+    norm_rope_body<Kind, Source...>(values, head_count, head_dim, head_stride, norm_weights, epsilon,
+        rotary_dim, theta, position, dynamic, rotary_source...);
 }
 
 __global__ void initialize_graph_attention_status(
@@ -1145,7 +1226,7 @@ __global__ void store_kv_int8_kernel(
         static_cast<std::uint32_t>(blockIdx.x), head_dim);
 }
 
-template <SmallWeightKind Kind>
+template <SmallWeightKind Kind, class... Source>
 __global__ void block_score_kernel(
     const float* index_query,
     const std::uint16_t* raw_keys,
@@ -1156,7 +1237,7 @@ __global__ void block_score_kernel(
     float epsilon,
     std::uint32_t rotary_dim,
     float theta,
-    float* block_scores, GraphSelectionArguments dynamic) {
+    float* block_scores, GraphSelectionArguments dynamic, Source... rotary_source) {
     const auto block =
         static_cast<std::uint32_t>(
             blockIdx.x);
@@ -1182,6 +1263,7 @@ __global__ void block_score_kernel(
         static_cast<std::uint64_t>(
             block) *
         compress_ratio;
+    if (!(rotary_source.check(token_start) && ...)) return;
     for (std::uint32_t offset = 0;
          offset < compress_ratio;
          ++offset) {
@@ -1239,42 +1321,71 @@ __global__ void block_score_kernel(
 
     float rotated =
         pooled[feature];
-    if (feature < rotary_dim) {
-        const auto half =
-            rotary_dim / 2U;
-        const auto pair =
-            feature % half;
-        const float exponent =
-            2.0F *
-            static_cast<float>(pair) /
-            static_cast<float>(
-                rotary_dim);
-        const float angle =
-            static_cast<float>(
-                token_start) *
-            powf(
-                theta,
-                -exponent);
-        const float cosine =
-            cosf(angle);
-        const float sine =
-            sinf(angle);
-        if (feature < half) {
-            rotated =
-                pooled[feature] *
-                    cosine -
-                pooled[
-                    feature +
-                    half] *
-                    sine;
-        } else {
-            rotated =
-                pooled[feature] *
-                    cosine +
-                pooled[
-                    feature -
-                    half] *
-                    sine;
+    if constexpr (sizeof...(Source) == 0) {
+        if (feature < rotary_dim) {
+            const auto half =
+                rotary_dim / 2U;
+            const auto pair =
+                feature % half;
+            const float exponent =
+                2.0F *
+                static_cast<float>(pair) /
+                static_cast<float>(
+                    rotary_dim);
+            const float angle =
+                static_cast<float>(
+                    token_start) *
+                powf(
+                    theta,
+                    -exponent);
+            const float cosine =
+                cosf(angle);
+            const float sine =
+                sinf(angle);
+            if (feature < half) {
+                rotated =
+                    pooled[feature] *
+                        cosine -
+                    pooled[
+                        feature +
+                        half] *
+                        sine;
+            } else {
+                rotated =
+                    pooled[feature] *
+                        cosine +
+                    pooled[
+                        feature -
+                        half] *
+                        sine;
+            }
+        }
+    } else {
+        if (feature < rotary_dim) {
+            const auto half =
+                rotary_dim / 2U;
+            const auto pair =
+                feature % half;
+            const float2 cs = (rotary_source.cs[token_start * 32ULL + pair], ...);
+            const float cosine = cs.x;
+            const float sine = cs.y;
+            if (feature < half) {
+                rotated =
+                    pooled[feature] *
+                        cosine -
+                    pooled[
+                        feature +
+                        half] *
+                        sine;
+            } else {
+                rotated =
+                    pooled[feature] *
+                        cosine +
+                    pooled[
+                        feature -
+                        half] *
+                        sine;
+            }
         }
     }
     // Every lane must finish reading its RoPE partner before any lane writes
@@ -1335,7 +1446,7 @@ __global__ void block_score_kernel(
     }
 }
 // block_score_kernel's body for the draft batch's rows kernel; the one-token kernel above stays as it was.
-template <SmallWeightKind Kind>
+template <SmallWeightKind Kind, class... Source>
 __device__ __forceinline__ void block_score_body(
     const float* index_query,
     const std::uint16_t* raw_keys,
@@ -1346,7 +1457,7 @@ __device__ __forceinline__ void block_score_body(
     float epsilon,
     std::uint32_t rotary_dim,
     float theta,
-    float* block_scores, GraphSelectionArguments dynamic) {
+    float* block_scores, GraphSelectionArguments dynamic, Source... rotary_source) {
     const auto block =
         static_cast<std::uint32_t>(
             blockIdx.x);
@@ -1372,6 +1483,7 @@ __device__ __forceinline__ void block_score_body(
         static_cast<std::uint64_t>(
             block) *
         compress_ratio;
+    if (!(rotary_source.check(token_start) && ...)) return;
     for (std::uint32_t offset = 0;
          offset < compress_ratio;
          ++offset) {
@@ -1429,42 +1541,71 @@ __device__ __forceinline__ void block_score_body(
 
     float rotated =
         pooled[feature];
-    if (feature < rotary_dim) {
-        const auto half =
-            rotary_dim / 2U;
-        const auto pair =
-            feature % half;
-        const float exponent =
-            2.0F *
-            static_cast<float>(pair) /
-            static_cast<float>(
-                rotary_dim);
-        const float angle =
-            static_cast<float>(
-                token_start) *
-            powf(
-                theta,
-                -exponent);
-        const float cosine =
-            cosf(angle);
-        const float sine =
-            sinf(angle);
-        if (feature < half) {
-            rotated =
-                pooled[feature] *
-                    cosine -
-                pooled[
-                    feature +
-                    half] *
-                    sine;
-        } else {
-            rotated =
-                pooled[feature] *
-                    cosine +
-                pooled[
-                    feature -
-                    half] *
-                    sine;
+    if constexpr (sizeof...(Source) == 0) {
+        if (feature < rotary_dim) {
+            const auto half =
+                rotary_dim / 2U;
+            const auto pair =
+                feature % half;
+            const float exponent =
+                2.0F *
+                static_cast<float>(pair) /
+                static_cast<float>(
+                    rotary_dim);
+            const float angle =
+                static_cast<float>(
+                    token_start) *
+                powf(
+                    theta,
+                    -exponent);
+            const float cosine =
+                cosf(angle);
+            const float sine =
+                sinf(angle);
+            if (feature < half) {
+                rotated =
+                    pooled[feature] *
+                        cosine -
+                    pooled[
+                        feature +
+                        half] *
+                        sine;
+            } else {
+                rotated =
+                    pooled[feature] *
+                        cosine +
+                    pooled[
+                        feature -
+                        half] *
+                        sine;
+            }
+        }
+    } else {
+        if (feature < rotary_dim) {
+            const auto half =
+                rotary_dim / 2U;
+            const auto pair =
+                feature % half;
+            const float2 cs = (rotary_source.cs[token_start * 32ULL + pair], ...);
+            const float cosine = cs.x;
+            const float sine = cs.y;
+            if (feature < half) {
+                rotated =
+                    pooled[feature] *
+                        cosine -
+                    pooled[
+                        feature +
+                        half] *
+                        sine;
+            } else {
+                rotated =
+                    pooled[feature] *
+                        cosine +
+                    pooled[
+                        feature -
+                        half] *
+                        sine;
+            }
         }
     }
     // Every lane must finish reading its RoPE partner before any lane writes
@@ -2660,28 +2801,33 @@ void launch_norm_rope_typed(
     const ModelContract& model,
     std::uint64_t position,
     GraphPositionKernelArguments dynamic = {}, hipStream_t stream = hipStreamLegacy) {
-    hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(
-            norm_rope_kernel<Kind>),
-        dim3(heads),
-        dim3(head_dim),
-        2ULL *
-            head_dim *
-            sizeof(float),
-        stream,
-        values,
-        heads,
-        head_dim,
-        head_stride,
-        reinterpret_cast<
-            const void*>(
-                norm.address),
-        model.rms_norm_epsilon,
-        checked_u32(
-            model.rotary_dim(),
-            "rotary_dim"),
-        model.rope_theta,
-        position, dynamic);
+    check_qwen_rotary_position(model, position);
+    if (model.qwen_rotary_table && dynamic.position && dynamic.context_tokens > model.qwen_rotary_table->extent())
+        throw std::out_of_range("YaRN graph capacity exceeds table extent");
+    with_qwen_rotary(model, stream, [&](auto... rotary_source) {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(
+                norm_rope_kernel<Kind, decltype(rotary_source)...>),
+            dim3(heads),
+            dim3(head_dim),
+            2ULL *
+                head_dim *
+                sizeof(float),
+            stream,
+            values,
+            heads,
+            head_dim,
+            head_stride,
+            reinterpret_cast<
+                const void*>(
+                    norm.address),
+            model.rms_norm_epsilon,
+            checked_u32(
+                model.rotary_dim(),
+                "rotary_dim"),
+            model.rope_theta,
+            position, dynamic, rotary_source...);
+    });
     check_hip(
         hipGetLastError(),
         "HIP indexed-attention norm/rope launch");
@@ -2731,40 +2877,42 @@ void launch_block_scores_typed(
     const TensorPair& k_norm,
     const ModelContract& model,
     std::uint32_t complete_blocks, GraphSelectionArguments dynamic) {
-    hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(
-            block_score_kernel<Kind>),
-        dim3(complete_blocks),
-        dim3(
+    with_qwen_rotary(model, hip_execution_stream(), [&](auto... rotary_source) {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(
+                block_score_kernel<Kind, decltype(rotary_source)...>),
+            dim3(complete_blocks),
+            dim3(
+                checked_u32(
+                    model.indexer_head_dim,
+                    "indexer_head_dim")),
+            2ULL *
+                model.indexer_head_dim *
+                sizeof(float),
+            hip_execution_stream(),
+            workspace.index_query,
+            reinterpret_cast<
+                const std::uint16_t*>(
+                    raw_state.address),
+            checked_u32(
+                model.indexer_n_heads,
+                "indexer_n_heads"),
             checked_u32(
                 model.indexer_head_dim,
-                "indexer_head_dim")),
-        2ULL *
-            model.indexer_head_dim *
-            sizeof(float),
-        hip_execution_stream(),
-        workspace.index_query,
-        reinterpret_cast<
-            const std::uint16_t*>(
-                raw_state.address),
-        checked_u32(
-            model.indexer_n_heads,
-            "indexer_n_heads"),
-        checked_u32(
-            model.indexer_head_dim,
-            "indexer_head_dim"),
-        checked_u32(
-            model.indexer_compress_ratio,
-            "indexer_compress_ratio"),
-        reinterpret_cast<
-            const void*>(
-                k_norm.runtime->address),
-        model.rms_norm_epsilon,
-        checked_u32(
-            model.rotary_dim(),
-            "rotary_dim"),
-        model.rope_theta,
-        workspace.block_scores, dynamic);
+                "indexer_head_dim"),
+            checked_u32(
+                model.indexer_compress_ratio,
+                "indexer_compress_ratio"),
+            reinterpret_cast<
+                const void*>(
+                    k_norm.runtime->address),
+            model.rms_norm_epsilon,
+            checked_u32(
+                model.rotary_dim(),
+                "rotary_dim"),
+            model.rope_theta,
+            workspace.block_scores, dynamic, rotary_source...);
+    });
     check_hip(
         hipGetLastError(),
         "HIP indexed-attention block-score launch");
@@ -2959,6 +3107,7 @@ PreparedIndexedLaunch prepare_indexed_attention_launch(
     }
     const auto& model =
         config.model;
+    check_qwen_rotary_position(model, context.position);
 
     const auto input =
         resolve_dispatch_read(
@@ -3168,7 +3317,7 @@ PreparedIndexedLaunch prepare_indexed_attention_launch(
 
     if (config.qsa_hierarchical_selection || config.qsa_gqa_heads_per_block != 1) {
         if ((config.qsa_hierarchical_selection && session_layout.context_tokens > qsa_hierarchical_selection_max_visible) ||
-            session_layout.context_tokens > 262144 || temporary.address % 8U ||
+            session_layout.context_tokens > model.effective_max_positions() || temporary.address % 8U ||
             !context.layer || *context.layer >= 48 || device_graph)
             throw std::invalid_argument("hierarchical QSA context, layer or workspace alignment is outside admission");
         const auto& record = current_hip_launch_context()->deferred_moe_status;
@@ -3211,7 +3360,7 @@ PreparedIndexedLaunch prepare_indexed_attention_launch(
     if (device_graph) {
         const auto& scope = *current_hip_launch_context();
         if (!config.enable_device_graph_inputs || scope.context_tokens != session_layout.context_tokens ||
-            scope.context_tokens > model.max_position_embeddings ||
+            scope.context_tokens > model.effective_max_positions() ||
             scope.context_tokens > std::numeric_limits<std::uint32_t>::max()) {
             throw std::invalid_argument("indexed-attention device graph context/configuration is invalid");
         }
@@ -3260,6 +3409,7 @@ PreparedIndexedLaunch prepare_indexed_attention_launch_like(const PreparedIndexe
         context.reads_state != a.reads_state || context.writes_state != a.writes_state || head.device_graph ||
         config.qsa_hierarchical_selection || config.qsa_gqa_heads_per_block != 1)
         throw std::invalid_argument("QSA prefill row differs from its head row");
+    check_qwen_rotary_position(config.model, context.position);
     PreparedIndexedLaunch p = head;
     // Rows sharing a head are row views of one known-window/prefill arena (unique uses, same order):
     // the previous row's allocation indices admit this row without searching its arena.
@@ -3625,7 +3775,8 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
         check_hip(hipGetLastError(), "HIP QSA grouped attention control");
         using namespace qsa_gqa_reuse_diagnostic;
         const Shape shape{attention_heads, kv_heads, head_dim,
-            checked_u32(prepared.session_layout->context_tokens, "QSA GQA context")};
+            checked_u32(prepared.session_layout->context_tokens, "QSA GQA context"),
+            checked_u32(config.model.effective_max_positions(), "QSA GQA maximum")};
         const auto maximum = maximum_selected_tokens(shape);
         const Bindings views{
             {reinterpret_cast<std::uintptr_t>(workspace.q_gate), static_cast<std::uint64_t>(q_gate_width) * sizeof(float)},
@@ -3945,12 +4096,12 @@ template <unsigned Rows> struct QsaRowsNormViews {
     float* values[Rows];
     std::uint64_t position[Rows];
 };
-template <SmallWeightKind Kind, unsigned Rows>
+template <SmallWeightKind Kind, unsigned Rows, class... Source>
 __global__ void norm_rope_rows_kernel(QsaRowsNormViews<Rows> views, std::uint32_t head_count,
     std::uint32_t head_dim, std::uint32_t head_stride, const void* norm_weights, float epsilon,
-    std::uint32_t rotary_dim, float theta) {
-    norm_rope_body<Kind>(views.values[blockIdx.y], head_count, head_dim, head_stride, norm_weights,
-        epsilon, rotary_dim, theta, views.position[blockIdx.y], GraphPositionKernelArguments{});
+    std::uint32_t rotary_dim, float theta, Source... rotary_source) {
+    norm_rope_body<Kind, Source...>(views.values[blockIdx.y], head_count, head_dim, head_stride, norm_weights,
+        epsilon, rotary_dim, theta, views.position[blockIdx.y], GraphPositionKernelArguments{}, rotary_source...);
 }
 
 #include "hip_qsa_prefill_stages.inc"
@@ -3972,10 +4123,10 @@ template <unsigned Rows> struct QsaRowsScoreViews {
     float* block_scores[Rows];
     std::uint32_t blocks[Rows]; // 0 when the row selects all visible tokens
 };
-template <SmallWeightKind Kind, unsigned Rows>
+template <SmallWeightKind Kind, unsigned Rows, class... Source>
 __global__ void block_score_rows_kernel(QsaRowsScoreViews<Rows> views, const std::uint16_t* raw_keys,
     std::uint32_t index_heads, std::uint32_t head_dim, std::uint32_t compress_ratio,
-    const void* key_norm, float epsilon, std::uint32_t rotary_dim, float theta) {
+    const void* key_norm, float epsilon, std::uint32_t rotary_dim, float theta, Source... rotary_source) {
     const auto block = static_cast<std::uint32_t>(blockIdx.x);
     const auto feature = static_cast<std::uint32_t>(threadIdx.x);
     if (feature >= head_dim) return;
@@ -3984,6 +4135,7 @@ __global__ void block_score_rows_kernel(QsaRowsScoreViews<Rows> views, const std
     auto* scratch = shared + head_dim;
     float mean = 0.0F;
     const auto token_start = static_cast<std::uint64_t>(block) * compress_ratio;
+    if (!(rotary_source.check(token_start) && ...)) return;
     for (std::uint32_t offset = 0; offset < compress_ratio; ++offset)
         mean += bf16_to_float(raw_keys[(token_start + offset) * head_dim + feature]);
     mean /= static_cast<float>(compress_ratio);
@@ -3999,15 +4151,27 @@ __global__ void block_score_rows_kernel(QsaRowsScoreViews<Rows> views, const std
     pooled[feature] = round_bf16(mean * inv_rms * load_small_weight<Kind>(key_norm, feature));
     __syncthreads();
     float rotated = pooled[feature];
-    if (feature < rotary_dim) {
-        const auto half = rotary_dim / 2U;
-        const auto pair = feature % half;
-        const float exponent = 2.0F * static_cast<float>(pair) / static_cast<float>(rotary_dim);
-        const float angle = static_cast<float>(token_start) * powf(theta, -exponent);
-        const float cosine = cosf(angle);
-        const float sine = sinf(angle);
-        if (feature < half) rotated = pooled[feature] * cosine - pooled[feature + half] * sine;
-        else rotated = pooled[feature] * cosine + pooled[feature - half] * sine;
+    if constexpr (sizeof...(Source) == 0) {
+        if (feature < rotary_dim) {
+            const auto half = rotary_dim / 2U;
+            const auto pair = feature % half;
+            const float exponent = 2.0F * static_cast<float>(pair) / static_cast<float>(rotary_dim);
+            const float angle = static_cast<float>(token_start) * powf(theta, -exponent);
+            const float cosine = cosf(angle);
+            const float sine = sinf(angle);
+            if (feature < half) rotated = pooled[feature] * cosine - pooled[feature + half] * sine;
+            else rotated = pooled[feature] * cosine + pooled[feature - half] * sine;
+        }
+    } else {
+        if (feature < rotary_dim) {
+            const auto half = rotary_dim / 2U;
+            const auto pair = feature % half;
+            const float2 cs = (rotary_source.cs[token_start * 32ULL + pair], ...);
+            const float cosine = cs.x;
+            const float sine = cs.y;
+            if (feature < half) rotated = pooled[feature] * cosine - pooled[feature + half] * sine;
+            else rotated = pooled[feature] * cosine + pooled[feature - half] * sine;
+        }
     }
     __syncthreads();
     pooled[feature] = round_bf16(rotated);
@@ -5550,7 +5714,14 @@ struct QsaPrefillPool {
     // reads save (tests/qsa_score_rows.hip: +3-4 % at <= 32768 blocks, -3 % at 129024 / 262144 vs 32 rows, +5 % vs 64).
     std::uint16_t* packed = nullptr;
     std::uint32_t capacity = 0, valid = 0;
+    std::shared_ptr<const HipQwenRotaryTable> rotary_table;
 };
+void bind_qwen_pool(QsaPrefillPool* pool, const ModelContract& model) {
+    if (!pool) return;
+    if (pool->valid && pool->rotary_table != model.qwen_rotary_table)
+        throw std::invalid_argument("QSA pool rotary source mismatch");
+    pool->rotary_table = model.qwen_rotary_table;
+}
 bool qsa_pool_packed_enabled() {
     static const bool enabled = [] { const char* v = std::getenv("STRIX_QSA_POOL_PACKED"); return v && v[0] == '1'; }();
     return !qpf2k::baseline && enabled;
@@ -5573,6 +5744,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     const qsa_flash::ScoreGroup<Rows>* staged = nullptr) {
     if (staged) subparts &= ~7U; // norms, append and scores already completed in stream order
     const auto& model = config.model;
+    bind_qwen_pool(pool, model);
     const auto& a = prepared.row[0];
     const auto& tensors = a.tensors;
     // STRIX_QPF2K_QSA_TRACE witness: prefill groups by size (attention part; 64 / 32 / 16 / 8 rows).
@@ -5635,12 +5807,16 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         for (unsigned r = 0; r < Rows; ++r) { views.values[r] = prepared.row[r].workspace.*target; views.position[r] = prepared.position[r]; }
         dispatch_small_kind(weights.manifest->ggml_type, [&](auto kind) {
             if (unordered)
-                hipExtLaunchKernelGGL(HIP_KERNEL_NAME(norm_rope_rows_kernel<decltype(kind)::value, Rows>), dim3(heads, Rows), dim3(head_dim),
-                    2ULL * head_dim * sizeof(float), stream, nullptr, nullptr, hipExtAnyOrderLaunch, views, heads, head_dim, stride,
-                    reinterpret_cast<const void*>(weights.runtime->address), model.rms_norm_epsilon, rotary, model.rope_theta);
-            else hipLaunchKernelGGL(HIP_KERNEL_NAME(norm_rope_rows_kernel<decltype(kind)::value, Rows>), dim3(heads, Rows), dim3(head_dim),
-                2ULL * head_dim * sizeof(float), stream, views, heads, head_dim, stride,
-                reinterpret_cast<const void*>(weights.runtime->address), model.rms_norm_epsilon, rotary, model.rope_theta);
+                with_qwen_rotary(model, stream, [&](auto... rotary_source) {
+                    hipExtLaunchKernelGGL(HIP_KERNEL_NAME(norm_rope_rows_kernel<decltype(kind)::value, Rows, decltype(rotary_source)...>), dim3(heads, Rows), dim3(head_dim),
+                        2ULL * head_dim * sizeof(float), stream, nullptr, nullptr, hipExtAnyOrderLaunch, views, heads, head_dim, stride,
+                        reinterpret_cast<const void*>(weights.runtime->address), model.rms_norm_epsilon, rotary, model.rope_theta, rotary_source...);
+                });
+            else with_qwen_rotary(model, stream, [&](auto... rotary_source) {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(norm_rope_rows_kernel<decltype(kind)::value, Rows, decltype(rotary_source)...>), dim3(heads, Rows), dim3(head_dim),
+                    2ULL * head_dim * sizeof(float), stream, views, heads, head_dim, stride,
+                    reinterpret_cast<const void*>(weights.runtime->address), model.rms_norm_epsilon, rotary, model.rope_theta, rotary_source...);
+            });
         });
         check_hip(hipGetLastError(), "QSA known-window norm/rope launch");
     };
@@ -5672,8 +5848,10 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             }
             for (unsigned r = 0; r < Rows; ++r) norm_views.position[r] = prepared.position[r];
             norm_views.table = rope_table;
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rope_table_kernel<Rows>), dim3(Rows), dim3(64), 0, stream, norm_views, rotary,
-                model.rope_theta);
+            with_qwen_rotary(model, stream, [&](auto... rotary_source) {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rope_table_kernel<Rows, false, decltype(rotary_source)...>), dim3(Rows), dim3(64), 0, stream, norm_views, rotary,
+                    model.rope_theta, static_cast<const qsa_index::NormGroupViews<Rows>*>(nullptr), rotary_source...);
+            });
             // STRIX_QPF2K_QSA bit 2: one wave per (row, head) (qsa_flash::norm_rope_wave_kernel, the same values); needs every
             // head dim >= 32 and the rotation partner in the same lane (rotary_dim / 2 a multiple of 32).
             bool wave_norm = !cohort_slot && (qpf2k_qsa_mask() & 4U) && (rotary / 2U) % 32U == 0U;
@@ -5746,11 +5924,13 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         {
             if (scored_blocks > pool->valid) {
                 dispatch_small_kind(tensors.index_k_norm.manifest->ggml_type, [&](auto kind) {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<decltype(kind)::value>), dim3(scored_blocks - pool->valid),
-                        dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream,
-                        reinterpret_cast<const std::uint16_t*>(a.raw_state.address), pool->valid, a.index_dim, s0.ratio,
-                        reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address), model.rms_norm_epsilon, rotary,
-                        model.rope_theta, pool->keys, nullptr, 0U, pool->packed);
+                    with_qwen_rotary(model, stream, [&](auto... rotary_source) {
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<decltype(kind)::value, false, decltype(rotary_source)...>), dim3(scored_blocks - pool->valid),
+                            dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream,
+                            reinterpret_cast<const std::uint16_t*>(a.raw_state.address), pool->valid, a.index_dim, s0.ratio,
+                            reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address), model.rms_norm_epsilon, rotary,
+                            model.rope_theta, pool->keys, static_cast<const uint2*>(nullptr), 0U, pool->packed, rotary_source...);
+                    });
                 });
                 check_hip(hipGetLastError(), "QSA prefill block-pool launch");
                 // STRIX_QPF2K_QSA bit 0: the new blocks' magnitude ranges for the scorer's guard.
@@ -5868,10 +6048,12 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                 };
                 const auto fast = copy();
                 dispatch_small_kind(tensors.index_k_norm.manifest->ggml_type, [&](auto kind) {
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_rows_kernel<decltype(kind)::value, Rows>), dim3(scored_blocks, Rows <= 8U ? 1U : Rows / 8U),
-                        dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream, scores,
-                        reinterpret_cast<const std::uint16_t*>(a.raw_state.address), index_heads, a.index_dim, s0.ratio,
-                        reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address), model.rms_norm_epsilon, rotary, model.rope_theta);
+                    with_qwen_rotary(model, stream, [&](auto... rotary_source) {
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_rows_kernel<decltype(kind)::value, Rows, decltype(rotary_source)...>), dim3(scored_blocks, Rows <= 8U ? 1U : Rows / 8U),
+                            dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream, scores,
+                            reinterpret_cast<const std::uint16_t*>(a.raw_state.address), index_heads, a.index_dim, s0.ratio,
+                            reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address), model.rms_norm_epsilon, rotary, model.rope_theta, rotary_source...);
+                    });
                 });
                 const auto reference = copy();
                 std::size_t differing = 0;
@@ -5888,11 +6070,13 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         }
     } else if ((subparts & 4U) && scored_blocks) {
         dispatch_small_kind(tensors.index_k_norm.manifest->ggml_type, [&](auto kind) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_rows_kernel<decltype(kind)::value, Rows>),
-                dim3(scored_blocks, Rows <= 8U ? 1U : Rows / 8U), dim3(a.index_dim),
-                2ULL * a.index_dim * sizeof(float), stream, scores, reinterpret_cast<const std::uint16_t*>(a.raw_state.address),
-                index_heads, a.index_dim, s0.ratio, reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address),
-                model.rms_norm_epsilon, rotary, model.rope_theta);
+            with_qwen_rotary(model, stream, [&](auto... rotary_source) {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_rows_kernel<decltype(kind)::value, Rows, decltype(rotary_source)...>),
+                    dim3(scored_blocks, Rows <= 8U ? 1U : Rows / 8U), dim3(a.index_dim),
+                    2ULL * a.index_dim * sizeof(float), stream, scores, reinterpret_cast<const std::uint16_t*>(a.raw_state.address),
+                    index_heads, a.index_dim, s0.ratio, reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address),
+                    model.rms_norm_epsilon, rotary, model.rope_theta, rotary_source...);
+            });
         });
         check_hip(hipGetLastError(), "QSA known-window block-score launch");
     }
@@ -6235,6 +6419,7 @@ std::uint64_t implementation_identity(
     const HipIndexedAttentionLauncherConfig& config) noexcept {
     std::uint64_t hash =
         fnv_offset;
+    hash = append_rotary_identity(hash, config.model.rotary_identity());
     hash_u64(hash, kLauncherTag);
     hash_u64(
         hash,
@@ -6875,6 +7060,9 @@ bool qsa_decode_pool_scores(const PreparedIndexedLaunch& a, const HipIndexedAtte
     std::uint32_t complete_blocks, std::uint32_t ratio) {
     const auto& model = config.model;
     if (!config.decode_pool || a.index_dim != 128U || model.indexer_n_heads != 4U || !ratio || !complete_blocks) return false;
+    // The decode pool forms keys with the native rotary instance only; explicit YaRN keeps the
+    // table-backed block_score_kernel route (same selection inputs, no native coefficients).
+    if (model.qwen_rotary_table) return false;
     auto* pool = config.decode_pool->get(a, ratio, position);
     if (!pool || !pool->keys || complete_blocks > pool->capacity) return false;
     const auto stream = hip_execution_stream();
@@ -7042,6 +7230,11 @@ struct QsaCohortPrepared {
 };
 QsaCohortPrepared prepare_qsa_cohort(std::span<const HipQsaCohortSegment> segments) {
     if (segments.size() < 2U) throw std::invalid_argument("QSA cohort window requires two or more session segments");
+    // Reject mixed numerics before preparing any row or querying device state.
+    for (const auto& segment : segments)
+        if (!segment.config || !segments[0].config ||
+            !same_rotary_model(segment.config->model, segments[0].config->model))
+            throw std::invalid_argument("QSA cohort rotary identity differs");
     QsaCohortPrepared out;
     for (const auto& segment : segments) {
         if (!segment.config || out.count + segment.rows.size() > 32U)
@@ -7068,7 +7261,7 @@ QsaCohortPrepared prepare_qsa_cohort(std::span<const HipQsaCohortSegment> segmen
     for (std::size_t s = 0; s < segments.size(); ++s) {
         const auto& c = *segments[s].config;
         const auto& b = std::visit([](const auto& p) -> const PreparedIndexedLaunch& { return p.row[0]; }, out.segments[s]);
-        if (c.dense_a8_projections != c0.dense_a8_projections || c.dense_trellis_projections != c0.dense_trellis_projections || c.wave8_q8_output != c0.wave8_q8_output ||
+        if (!same_rotary_model(c.model, c0.model) || c.dense_a8_projections != c0.dense_a8_projections || c.dense_trellis_projections != c0.dense_trellis_projections || c.wave8_q8_output != c0.wave8_q8_output ||
             c.prefetch_q8_input != c0.prefetch_q8_input || std::visit([](const auto& p) { return p.prefetch; }, out.segments[s]) != prefetch0 ||
             *segments[s].rows[0].layer != *segments[0].rows[0].layer || b.hidden != a.hidden || b.attention_width != a.attention_width)
             throw std::invalid_argument("QSA cohort window segments differ in layer or arithmetic");
@@ -8139,6 +8332,7 @@ struct MtpAttentionPrepared {
 };
 MtpAttentionPrepared prepare_mtp_attention(const MtpNativeContext& c) {
     mtp_native::context(c);const auto& m=*c.model;const auto& t=*c.tensors;
+    check_qwen_rotary_position(m, c.position);
     HipIndexedAttentionLauncherConfig config;config.model=m;validate_config(config);
     const auto hidden=checked_u32(m.hidden_size,"MTP attention hidden");
     const auto heads=checked_u32(m.attention_heads,"MTP attention heads");
@@ -8290,10 +8484,12 @@ void launch_hip_mtp_indexer(const MtpNativeContext& c,void* raw_stream) {
         hipLaunchKernelGGL(fill_visible_indices_kernel,dim3((p.visible+kThreads-1U)/kThreads),dim3(kThreads),0,stream,w.selected_indices,p.visible);
         check_hip(hipGetLastError(),"MTP full-visible index enqueue");
     } else {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_kernel<SmallWeightKind::f32>),dim3(p.blocks),dim3(p.index_dim),
-            2ULL*p.index_dim*sizeof(float),stream,w.index_query,reinterpret_cast<const std::uint16_t*>(p.index.address),
-            checked_u32(m.indexer_n_heads,"MTP index heads"),p.index_dim,p.ratio,reinterpret_cast<const void*>(p.tensors.index_k_norm.runtime->address),
-            m.rms_norm_epsilon,checked_u32(m.rotary_dim(),"MTP rotary dimension"),m.rope_theta,w.block_scores,selection);
+        with_qwen_rotary(m, stream, [&](auto... rotary_source) {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_kernel<SmallWeightKind::f32, decltype(rotary_source)...>),dim3(p.blocks),dim3(p.index_dim),
+                2ULL*p.index_dim*sizeof(float),stream,w.index_query,reinterpret_cast<const std::uint16_t*>(p.index.address),
+                checked_u32(m.indexer_n_heads,"MTP index heads"),p.index_dim,p.ratio,reinterpret_cast<const void*>(p.tensors.index_k_norm.runtime->address),
+                m.rms_norm_epsilon,checked_u32(m.rotary_dim(),"MTP rotary dimension"),m.rope_theta,w.block_scores,selection, rotary_source...);
+        });
         check_hip(hipGetLastError(),"MTP compressed index score enqueue");
         mtp_attention_finite(p,w.block_scores,p.blocks,stream);
         hipLaunchKernelGGL(select_blocks_kernel,dim3(1),dim3(kSelectThreads),0,stream,w.block_scores,p.blocks,p.topk,p.ratio,p.visible,w.selected_indices,selection);
@@ -8461,11 +8657,11 @@ __global__ void linear_to_float_rows_kernel(MtpBatchLinearRows rows, const void*
     }
 }
 struct MtpBatchNormRopeRows { float* values[kMtpBatchRows]; std::uint64_t position[kMtpBatchRows]; };
-template <SmallWeightKind Kind>
+template <SmallWeightKind Kind, class... Source>
 __global__ void norm_rope_rows_kernel(MtpBatchNormRopeRows rows, std::uint32_t head_count, std::uint32_t head_dim,
-    std::uint32_t head_stride, const void* norm_weights, float epsilon, std::uint32_t rotary_dim, float theta) {
-    norm_rope_body<Kind>(rows.values[blockIdx.y], head_count, head_dim, head_stride, norm_weights, epsilon, rotary_dim,
-        theta, rows.position[blockIdx.y], GraphPositionKernelArguments{});
+    std::uint32_t head_stride, const void* norm_weights, float epsilon, std::uint32_t rotary_dim, float theta, Source... rotary_source) {
+    norm_rope_body<Kind, Source...>(rows.values[blockIdx.y], head_count, head_dim, head_stride, norm_weights, epsilon, rotary_dim,
+        theta, rows.position[blockIdx.y], GraphPositionKernelArguments{}, rotary_source...);
 }
 struct MtpBatchFiniteRows { const float* values[kMtpBatchRows]; std::uint32_t* status[kMtpBatchRows]; };
 __global__ void validate_indexed_graph_values_rows(MtpBatchFiniteRows rows, std::uint32_t count) {
@@ -8496,14 +8692,14 @@ __global__ void fill_visible_indices_rows_kernel(MtpBatchSelectRows rows) {
     const auto index = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index < rows.visible[r]) rows.selected[r][index] = index;
 }
-template <SmallWeightKind Kind>
+template <SmallWeightKind Kind, class... Source>
 __global__ void block_score_rows_kernel(MtpBatchSelectRows rows, std::uint32_t index_heads, std::uint32_t head_dim,
     std::uint32_t compress_ratio, const void* key_norm, float epsilon, std::uint32_t rotary_dim, float theta,
-    GraphSelectionArguments dynamic) {
+    GraphSelectionArguments dynamic, Source... rotary_source) {
     const auto r = blockIdx.y;
     if (blockIdx.x >= rows.blocks[r]) return;
-    block_score_body<Kind>(rows.index_query[r], rows.raw_keys[r], index_heads, head_dim, compress_ratio, key_norm, epsilon,
-        rotary_dim, theta, rows.block_scores[r], dynamic);
+    block_score_body<Kind, Source...>(rows.index_query[r], rows.raw_keys[r], index_heads, head_dim, compress_ratio, key_norm, epsilon,
+        rotary_dim, theta, rows.block_scores[r], dynamic, rotary_source...);
 }
 __global__ __launch_bounds__(kSelectThreads) void select_blocks_rows_kernel(MtpBatchSelectRows rows, std::uint32_t select_blocks,
     std::uint32_t compress_ratio, GraphSelectionArguments dynamic) {
@@ -8614,9 +8810,11 @@ void mtp_batch_norm_rope(const std::vector<MtpAttentionPrepared>& rows, const st
         n.values[i] = rows[members[i]].workspace.*field; n.position[i] = contexts[members[i]].position;
     }
     const auto& m = *contexts.front().model;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(norm_rope_rows_kernel<SmallWeightKind::f32>), dim3(heads, static_cast<unsigned>(members.size())),
-        dim3(head_dim), 2ULL * head_dim * sizeof(float), stream, n, heads, head_dim, head_stride,
-        reinterpret_cast<const void*>(norm.address), m.rms_norm_epsilon, checked_u32(m.rotary_dim(), "rotary_dim"), m.rope_theta);
+    with_qwen_rotary(m, stream, [&](auto... rotary_source) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(norm_rope_rows_kernel<SmallWeightKind::f32, decltype(rotary_source)...>), dim3(heads, static_cast<unsigned>(members.size())),
+            dim3(head_dim), 2ULL * head_dim * sizeof(float), stream, n, heads, head_dim, head_stride,
+            reinterpret_cast<const void*>(norm.address), m.rms_norm_epsilon, checked_u32(m.rotary_dim(), "rotary_dim"), m.rope_theta, rotary_source...);
+    });
     check_hip(hipGetLastError(), "MTP batch norm/RoPE enqueue");
 }
 std::vector<MtpAttentionPrepared> mtp_batch_prepare(std::span<const MtpNativeContext> contexts) {
@@ -8644,7 +8842,7 @@ std::vector<MtpAttentionPrepared> mtp_batch_prepare(std::span<const MtpNativeCon
     // the first context (each context's owner binding is validated by prepare_mtp_attention).
     const auto& m0 = *contexts.front().model;
     for (const auto& c : contexts)
-        if (c.model->rms_norm_epsilon != m0.rms_norm_epsilon || c.model->rope_theta != m0.rope_theta ||
+        if (!same_rotary_model(*c.model, m0) || c.model->rms_norm_epsilon != m0.rms_norm_epsilon || c.model->rope_theta != m0.rope_theta ||
             c.model->rotary_dim() != m0.rotary_dim() || c.model->indexer_n_heads != m0.indexer_n_heads)
             throw std::invalid_argument("MTP attention batch members use different model contracts");
     return rows;
@@ -8711,10 +8909,12 @@ void launch_hip_mtp_indexer_rows(std::span<const MtpNativeContext> contexts, voi
             b.block_scores[i] = p.workspace.block_scores; b.selected[i] = p.workspace.selected_indices;
             b.visible[i] = p.visible; b.blocks[i] = p.blocks; blocks = std::max(blocks, p.blocks);
         }
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_rows_kernel<SmallWeightKind::f32>), dim3(blocks, static_cast<unsigned>(select.size())),
-            dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream, b, checked_u32(m.indexer_n_heads, "MTP index heads"), a.index_dim,
-            a.ratio, reinterpret_cast<const void*>(a.tensors.index_k_norm.runtime->address), m.rms_norm_epsilon,
-            checked_u32(m.rotary_dim(), "MTP rotary dimension"), m.rope_theta, selection);
+        with_qwen_rotary(m, stream, [&](auto... rotary_source) {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_rows_kernel<SmallWeightKind::f32, decltype(rotary_source)...>), dim3(blocks, static_cast<unsigned>(select.size())),
+                dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream, b, checked_u32(m.indexer_n_heads, "MTP index heads"), a.index_dim,
+                a.ratio, reinterpret_cast<const void*>(a.tensors.index_k_norm.runtime->address), m.rms_norm_epsilon,
+                checked_u32(m.rotary_dim(), "MTP rotary dimension"), m.rope_theta, selection, rotary_source...);
+        });
         check_hip(hipGetLastError(), "MTP batch compressed index score enqueue");
         // Each row validates its own block count (the one-token check covers p.blocks scores).
         for (std::size_t i = 0; i < select.size(); ++i) {
@@ -8783,6 +8983,9 @@ void launch_hip_mtp_sparse_attention_draft_rows(std::span<const MtpNativeContext
     }
     launch_hip_mtp_draft_q8_gemv_rows(out, n, false, a.attention_width, true, stream);
 }
+#if defined(STRIX_BUILD_QWEN_ROTARY_DIAGNOSTIC)
+#include "../tests/hip_qwen_rotary_fixtures.inc"
+#endif
 } // namespace strix
 
 #if defined(STRIX_BUILD_QPERSIST_DIAGNOSTIC)

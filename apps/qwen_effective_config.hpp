@@ -27,6 +27,7 @@ struct PrefillRequirements {
     std::uint64_t model_backing = 0, state_d1 = 0, serial_scratch = 0;
     std::uint64_t workspace = 0, metadata = 0, runtime_payload = 0, tails = 0;
     std::uint64_t device_base = 0;
+    std::map<std::string, std::uint64_t> owners{};
     std::map<std::string, std::uint64_t> organization{};
 };
 struct PrefillMemory {
@@ -34,6 +35,9 @@ struct PrefillMemory {
     std::function<PrefillRequirements(const Options&)> estimate;
     // Present only for Linux reclaim support; host tests can supply the observation.
     std::optional<std::uint64_t> ple_reclaim_page{};
+    std::optional<std::uint64_t> total{};
+    // Must drop and verify with mincore. A predicted page union is never credit.
+    std::function<std::uint64_t(const Options&)> verify_ple_credit{};
 };
 struct EffectiveConfig {
     Options options;
@@ -49,6 +53,8 @@ struct EffectiveConfig {
     bool admitted = false;
     bool gsq_owner = false;
     std::map<std::string, std::uint64_t> host_compilation;
+    std::map<std::string, std::uint64_t> admission;
+    RotaryIdentity rotary_identity;
 };
 inline bool env_is(const Environment& env, const char* name, std::string_view value) {
     const auto it = env.find(name);
@@ -91,18 +97,18 @@ inline std::uint64_t prefill_checked_add(std::uint64_t a, std::uint64_t b) {
 }
 // Predict only the route's reclaim credit. Runtime still verifies the drop and
 // admits allocations against the actual credit, including zero on setup failure.
-inline std::uint64_t prefill_reclaim_credit(const Options& options, const ModelContract& model,
+inline std::optional<ple_reclaim::Config> prefill_reclaim_config(const Options& options, const ModelContract& model,
     const ModelManifest& manifest, const Environment& environment, std::optional<std::uint64_t> page) {
-    if (!page || !*page) return 0;
+    if (!page || !*page) return {};
     const auto mode = environment.find("STRIX_PLE_RECLAIMABLE");
-    if (mode != environment.end() && mode->second != "auto" && mode->second != "1") return 0;
+    if (mode != environment.end() && mode->second != "auto" && mode->second != "1") return {};
     const auto copy = environment.find("STRIX_MODEL_COPY_ALL");
-    if (copy != environment.end() && !copy->second.empty() && copy->second[0] != '0') return 0;
+    if (copy != environment.end() && !copy->second.empty() && copy->second[0] != '0') return {};
     HipModelResidencyPolicy policy;
     policy.copy_tier = options.model_copy_tier;
     const bool graph = options.execution.mode != DecodeExecutionMode::eager;
     policy.promote_file_backed_candidates = graph;
-    if (!ple_reclaim_route_supported(options, policy, graph)) return 0;
+    if (!ple_reclaim_route_supported(options, policy, graph)) return {};
     try {
         const ManifestTensor* table = nullptr;
         std::vector<ple_reclaim::Interval> registered;
@@ -110,14 +116,14 @@ inline std::uint64_t prefill_reclaim_credit(const Options& options, const ModelC
             if (tensor.residency == ResidencyPolicy::file_backed_candidate) {
                 if (table || tensor.role != TensorRole::ngram_table || tensor.dimensions.size() != 2U ||
                     (tensor.ggml_type != 20U && tensor.ggml_type != 30U) ||
-                    (tensor.ggml_type == 20U && tensor.dimensions[0] % 32U)) return 0;
+                    (tensor.ggml_type == 20U && tensor.dimensions[0] % 32U)) return {};
                 table = &tensor;
             } else if (tensor.placement.kind == PlacementKind::local) {
                 registered.push_back({tensor.absolute_offset / *page * *page,
                     prefill_checked_add(prefill_checked_add(tensor.absolute_offset, tensor.byte_size), *page - 1U) / *page * *page});
             }
         }
-        if (!table) return 0;
+        if (!table) return {};
         std::sort(registered.begin(), registered.end(), [](const auto& a, const auto& b) { return a.begin < b.begin; });
         std::vector<ple_reclaim::Interval> merged;
         for (const auto& range : registered) {
@@ -131,14 +137,21 @@ inline std::uint64_t prefill_reclaim_credit(const Options& options, const ModelC
         config.table_rows = table->dimensions[1];
         config.stored_row_bytes = table->ggml_type == 20U ? table->dimensions[0] / 32U * 18U : table->dimensions[0] * 2U;
         if (!config.stored_row_bytes || config.table_rows > UINT64_MAX / config.stored_row_bytes ||
-            config.stored_row_bytes * config.table_rows != table->byte_size) return 0;
+            config.stored_row_bytes * config.table_rows != table->byte_size) return {};
         config.mapping_bytes = prefill_checked_add(config.table_offset, table->byte_size);
         config.reclaim = ple_reclaim::reclaim_intervals(config.table_offset, table->byte_size, *page, std::move(merged));
         const auto contract = build_ple_hash_contract(model);
         const auto allowance = environment.find("STRIX_PLE_RECLAIM_DECODE_BYTES");
         config.decode_allowance_bytes = ple_reclaim::decode_allowance(options.generate_tokens, 1U, contract.head_count, *page,
             allowance == environment.end() ? 0U : std::strtoull(allowance->second.c_str(), nullptr, 10));
-        return ple_reclaim::plan_prompt(config, contract, options.tokens).stats.credit_bytes;
+        return config;
+    } catch (const std::exception&) { return {}; }
+}
+inline std::uint64_t prefill_reclaim_credit(const Options& options, const ModelContract& model,
+    const ModelManifest& manifest, const Environment& environment, std::optional<std::uint64_t> page) {
+    try {
+        const auto config = prefill_reclaim_config(options,model,manifest,environment,page);
+        return config ? ple_reclaim::plan_prompt(*config,build_ple_hash_contract(model),options.tokens).stats.credit_bytes : 0;
     } catch (const std::exception&) { return 0; }
 }
 inline void require_effective_prefill_execution(const EffectiveConfig& config) {
@@ -166,9 +179,14 @@ inline void validate_effective_options(const Options& o, const ModelContract& mo
     validate_resolved_requested_logprobs(o, model.vocab_size);
     validate_resolved_teacher_forced_score(o, model.vocab_size);
 }
+#include "qwen_yarn_admission.inc"
+
 inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     const ModelContract& model, const gguf::FileInfo& info, const ModelManifest& manifest,
     std::string_view verified_content, const PrefillCapabilities& capabilities, const PrefillMemory& memory) {
+    if (request.options.rotary.mode() == RotaryMode::yarn && !request.options.baseline &&
+        !env_is(request.environment, "STRIX_BASELINE", "1"))
+        return resolve_yarn_config(request, model, info, manifest, verified_content, capabilities, memory);
     EffectiveConfig result;
     result.options = request.options;
     result.gsq_owner = qpf2k::has_gsq_gate(manifest);
@@ -176,6 +194,12 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     for (const auto& name : request.options.supplied_options) result.sources[name] = OptionSource::explicit_value;
     auto& o = result.options;
     const bool baseline = o.baseline || env_is(request.environment, "STRIX_BASELINE", "1");
+    if (o.rotary.mode() == RotaryMode::native && o.supplied_options.contains("--rope-yarn") &&
+        result.environment.contains("STRIX_QWEN_ROPE_YARN")) {
+        result.suppressed.emplace_back("STRIX_QWEN_ROPE_YARN");
+        result.environment["STRIX_QWEN_ROPE_YARN"] = "off";
+        result.sources["STRIX_QWEN_ROPE_YARN"] = OptionSource::explicit_value;
+    }
     const auto inject = [&](unsigned allowed) {
         const unsigned injected = qpf2k::initialize([&](const char* name) -> const char* {
             const auto it = result.environment.find(name);
@@ -192,6 +216,15 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     // argv organization/arithmetic still goes through the historical resolver.
     o.baseline = baseline;
     if (baseline) {
+        if (o.rotary.mode() == RotaryMode::yarn) {
+            o.suppressed_yarn_request = "--rope-yarn=" + std::to_string(o.rotary.factor());
+            o.rotary = validate_qwen_rotary_request(0,o.context_explicit,o.context_tokens,true);
+        }
+        if (result.environment.contains("STRIX_QWEN_ROPE_YARN")) {
+            result.suppressed.emplace_back("STRIX_QWEN_ROPE_YARN");
+            result.environment["STRIX_QWEN_ROPE_YARN"] = "off";
+            result.sources["STRIX_QWEN_ROPE_YARN"] = OptionSource::baseline;
+        }
         for (const auto& entry : qpf2k::defaults) {
             if (result.environment.contains(entry.name)) result.suppressed.emplace_back(entry.name);
             result.environment[entry.name] = "0";
@@ -383,7 +416,10 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
 inline PrefillMemory observe_prefill_memory(PrefillCapabilities& capabilities) {
     PrefillMemory result;
     const auto observed = observe_linux_uma_memory();
-    if (observed.memory.observation_identity) result.available = observed.memory.mem_available_bytes;
+    if (observed.memory.observation_identity) {
+        result.available = observed.memory.mem_available_bytes;
+        result.total = observed.memory.mem_total_bytes;
+    }
 #ifdef __linux__
     const auto page = ::sysconf(_SC_PAGESIZE);
     if (page > 0) result.ple_reclaim_page = static_cast<std::uint64_t>(page);
@@ -428,6 +464,13 @@ inline PrefillMemory observe_prefill_memory(PrefillCapabilities& capabilities) {
     return result;
 }
 inline std::string effective_config_notice(const EffectiveConfig& config) {
+    if (!config.options.suppressed_yarn_request.empty())
+        return "Qwen baseline: suppressed YaRN request (" + config.options.suppressed_yarn_request + "); rotary=native\n";
+    if (config.options.rotary.mode() == RotaryMode::yarn && config.admitted)
+        return "Qwen experimental YaRN: factor=" + std::to_string(config.options.rotary.factor()) +
+            " context=" + std::to_string(config.options.context_tokens) + " T=" +
+            std::to_string(config.options.known_prefix_prefill_rows) + "; qualification=experimental; verified PLE credit=" +
+            std::to_string(config.ple_reclaim_credit) + " bytes\n";
     if (config.admitted) {
         std::string line = "Qwen auto-prefill: automatic T" + std::to_string(config.options.known_prefix_prefill_rows) +
             " context=" + std::to_string(config.options.context_tokens);
@@ -446,6 +489,7 @@ inline std::string effective_config_notice(const EffectiveConfig& config) {
 }
 inline std::vector<std::string> effective_prefill_argv(const Options& o) {
     std::vector<std::string> args{"--context", std::to_string(o.context_tokens)};
+    if (o.rotary.mode() == RotaryMode::yarn) args.insert(args.end(), {"--rope-yarn",std::to_string(o.rotary.factor())});
     if (o.unqualified_context) args.emplace_back("--unqualified-context");
     args.insert(args.end(), {"--execution-mode", o.execution.mode == DecodeExecutionMode::eager ? "eager" : "graph",
         "--residency", o.residency == HipModelResidencyMode::registered_file_mapping ? "register" : "copy",
@@ -506,10 +550,36 @@ inline std::vector<std::string> effective_prefill_argv(const Options& o) {
     if (o.prefill_numerical_profile) args.insert(args.end(), {"--prefill-numerical-profile", std::string(numerical_profile_name(*o.prefill_numerical_profile))});
     return args;
 }
+inline std::string yarn_json_error(std::string_view value) {
+    std::ostringstream out;
+    constexpr char hex[] = "0123456789abcdef";
+    for (const unsigned char ch : value) {
+        if (ch == '"' || ch == '\\') out << '\\' << static_cast<char>(ch);
+        else if (ch < 32U) out << "\\u00" << hex[ch >> 4U] << hex[ch & 15U];
+        else out << static_cast<char>(ch);
+    }
+    return out.str();
+}
 inline std::string effective_config_json(const EffectiveConfig& config) {
     const auto& o = config.options;
     std::ostringstream out;
-    out << "{\"http_slots\":{";
+    // Inspection status is separate from native identity serialization (zero bytes).
+    if (o.rotary.mode() == strix::RotaryMode::yarn)
+        out << "{\"rotary\":" << (config.rotary_identity.descriptor().mode() == RotaryMode::yarn ?
+            config.rotary_identity.json() : o.rotary.json()) << ',';
+    else out << "{\"rotary\":" << o.rotary.json() << ',';
+    if (!o.suppressed_yarn_request.empty())
+        out << "\"suppressed_yarn_request\":\"" << yarn_json_error(o.suppressed_yarn_request) << "\",";
+    if (o.rotary.mode() == RotaryMode::yarn) {
+        out << "\"admission\":{";
+        bool first = true;
+        for (const auto& [name, bytes] : config.admission) {
+            out << (first ? "" : ",") << '"' << name << "\":" << bytes;
+            first = false;
+        }
+        out << "},";
+    }
+    out << "\"http_slots\":{";
     out << "\"mode\":\"" << (o.http_batch_explicit ? (o.http_batch_cap ? "cap" : "single") : "auto")
         << "\",\"cap\":" << o.http_batch_cap << ",\"slots\":";
     if (o.http_serve && o.http_batch) out << "null"; else out << 1;
@@ -517,7 +587,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         << "\",\"reason\":\"" << o.http_slot_reason << "\"},";
     out << "\"admitted\":" << (config.admitted ? "true" : "false") << ",\"reason\":\"" << config.reason
         << "\",\"tile_fallback\":\"" << config.tile_fallback
-        << "\",\"error\":\"" << config.error
+        << "\",\"error\":\"" << (o.rotary.mode() == RotaryMode::yarn ? yarn_json_error(config.error) : config.error)
         << "\",\"ple_reclaim_credit_bytes\":" << config.ple_reclaim_credit
         << ",\"arithmetic_fallback\":\"" << config.arithmetic_fallback
         << "\",\"longer_context_qualified\":" << (o.context_tokens > 8192U ? "false" : "null")

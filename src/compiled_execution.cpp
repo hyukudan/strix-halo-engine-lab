@@ -29,7 +29,7 @@ GraphExecutionContract serial_graph_contract(const CompiledSerialExecution& comp
             binding.op == SerialOp::position_prepare) ||
             (!binding.host_or_runtime_step && binding.kernel_id.has_value()));
     }
-    return {compiled.execution_identity, compiled.kernel_plan_identity, compiled.logical_rows, safe};
+    return {compiled.execution_identity, compiled.kernel_plan_identity, compiled.logical_rows, safe, compiled.rotary_table};
 }
 } // namespace
 
@@ -89,6 +89,7 @@ void hash_buffer_use(
 void hash_model(
     std::uint64_t& hash,
     const ModelContract& model) noexcept {
+    hash = append_rotary_identity(hash, model.rotary_identity());
     hash_u64(hash, model.vocab_size);
     hash_u64(hash, model.hidden_size);
     hash_u64(hash, model.max_position_embeddings);
@@ -416,6 +417,7 @@ CompiledSerialExecution compile_serial_execution(
         throw std::invalid_argument("Q4K A8 runtime supports only C1 one-row execution");
 
     CompiledSerialExecution compiled;
+    compiled.rotary_table = model.qwen_rotary_table;
     if (binding_request.device_graph_inputs && (!binding_request.require_graph_safe ||
         binding_request.logical_rows != 1 || binding_request.request_concurrency != 1)) {
         throw std::invalid_argument("device graph topology requires explicit graph-safe C1 selection");
@@ -427,7 +429,7 @@ CompiledSerialExecution compile_serial_execution(
         binding_request.request_concurrency;
     compiled.vocab_size = model.vocab_size;
     compiled.max_position_embeddings =
-        model.max_position_embeddings;
+        model.effective_max_positions();
 
     compiled.execution =
         build_serial_decode_execution_plan(model);

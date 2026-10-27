@@ -139,6 +139,7 @@ public:
     [[nodiscard]] std::uint32_t logical_rows() const noexcept;
     [[nodiscard]] bool supports_tiled_prefill() const noexcept;
     [[nodiscard]] bool gsq_model() const noexcept;
+    [[nodiscard]] RotaryIdentity rotary_identity() const;
     // Immutable compiler-selected intent; verification consumers require all_rows.
     [[nodiscard]] KnownWindowOutputPolicy output_policy() const noexcept;
     // Last eligible layer in the last SUCCESSFULLY completed window only.

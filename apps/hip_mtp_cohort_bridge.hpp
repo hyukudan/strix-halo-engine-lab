@@ -96,7 +96,7 @@ inline void run_mtp_cohort_bridge(const Options& options, const ModelContract& m
                     throw std::invalid_argument("MTP cohort golden prompt chain or full-row geometry differs before target execution");
             }
             l.native = HipMtpResources::create(model, assets->compiled(), assets->sidecar_manifest(), assets->sidecar_residency(),
-                assets->target_manifest(), assets->target_residency(), assets->shared_target(), native_budget, actual.allocator);
+                assets->target_manifest(), assets->target_residency(), assets->shared_target(), native_budget, actual.allocator, model.rotary_identity());
             l.runtime = std::make_shared<HipMtpRuntime>(l.native);
             if (golden.target_content != assets->shared_target().target_model_content_identity ||
                 golden.sidecar_content != assets->shared_target().sidecar_model_content_identity ||

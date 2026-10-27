@@ -749,11 +749,12 @@ public:
     RequestedLogprobBackend(strix::SerialGreedyStepBackend& target, std::span<const std::uint32_t> ids,
         std::uint64_t vocabulary, std::uint64_t capacity, strix::SerialSessionContext& session,
         std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard,
-        std::span<const std::uint32_t> teacher_inputs = {}, std::string teacher_logits_path = {})
+        std::span<const std::uint32_t> teacher_inputs = {}, std::string teacher_logits_path = {},
+        std::uint64_t effective_max_positions = 262144U)
         : target_(target), ids_(ids.begin(), ids.end()), teacher_inputs_(teacher_inputs.begin(), teacher_inputs.end()),
           vocabulary_(vocabulary), maximum_rows_(teacher_inputs.empty() ? capacity : teacher_inputs.size() - 1U),
           session_(session), guard_(std::move(guard)) {
-        if (!guard_ || !capacity || capacity > 262144U ||
+        if (!guard_ || !capacity || capacity > effective_max_positions ||
             (teacher_inputs_.empty() && (ids_.empty() || ids_.size() > 64U || capacity > 1048576U / ids_.size())) ||
             (!teacher_inputs_.empty() && (!ids_.empty() || teacher_inputs_.size() < 2U || teacher_inputs_.size() > capacity)))
             throw std::invalid_argument("invalid bounded requested logprob ledger");
@@ -1210,15 +1211,61 @@ int STRIX_DECODE_ENTRY(
             strix::q6p::admit_derived_content(identity);
         }
     }
+    // Resolve actual host coefficient bytes in bounded chunks without a device.
+    // The immutable identity is replaced by an owning HIP table only after admission.
+    const bool yarn = options.rotary.mode() == strix::RotaryMode::yarn;
+    if (yarn) {
+        strix::Sha256Fast hash;
+        strix::generate_qwen_yarn_rows(options.rotary,0,options.rotary.effective_max(),
+            [&](auto, auto rows) { hash.update(std::as_bytes(rows)); });
+        model.resolved_rotary = strix::RotaryIdentity(options.rotary,hash.finalize());
+    }
+    std::unique_ptr<strix::ple_reclaim::Prefetcher> yarn_preflight_reclaimer;
     strix::decode_cli::PrefillCapabilities prompt_capabilities;
     prompt_capabilities.a8_runtime = has_auto_a8_runtime;
     auto prompt_memory = strix::decode_cli::observe_prefill_memory(prompt_capabilities);
     prompt_memory.estimate = [&](const strix::decode_cli::Options& candidate) {
         return strix::decode_cli::compile_prompt_requirements(candidate, model, manifest, mapped.bytes());
     };
+    if (yarn) prompt_memory.verify_ple_credit = [&](const strix::decode_cli::Options& candidate) -> std::uint64_t {
+        const auto environment = strix::decode_cli::requested_prefill_environment();
+        auto config = strix::decode_cli::prefill_reclaim_config(candidate,model,manifest,environment,prompt_memory.ple_reclaim_page);
+        if (!config) {
+            if (strix::decode_cli::env_is(environment,"STRIX_PLE_RECLAIMABLE","1"))
+                throw std::invalid_argument("YaRN required PLE reclaim route unavailable before device setup");
+            return 0;
+        }
+        config->mapping_base = mapped.base_address();
+        config->mapping_bytes = mapped.bytes();
+        config->ahead_rows = 0; // no speculative prefetch during pre-device admission
+        config->drop_page_cache = [&mapped](auto offset, auto bytes) { return mapped.drop_page_cache(offset,bytes); };
+        try {
+            yarn_preflight_reclaimer = std::make_unique<strix::ple_reclaim::Prefetcher>(*config,
+                strix::build_ple_hash_contract(model),candidate.tokens,true);
+            return yarn_preflight_reclaimer->credit_bytes();
+        } catch (const std::exception&) {
+            if (strix::decode_cli::env_is(environment,"STRIX_PLE_RECLAIMABLE","1")) throw;
+            return 0; // an automatic unverified drop earns no credit
+        }
+    };
     if (target_input_export) options.route_owned = true;
+    auto requested_environment = strix::decode_cli::requested_prefill_environment();
+#if defined(__linux__)
+    if (yarn) for (auto entry = ::environ; entry && *entry; ++entry) {
+        const std::string_view text(*entry);
+        const auto equal = text.find('=');
+        if (text.starts_with("STRIX_") && equal != std::string_view::npos) {
+            const auto name = text.substr(0, equal);
+            const bool injected = (name == "STRIX_QPF2K_MOE_DEFAULTED" && strix::qpf2k::pre_injected_moe_marker) ||
+                std::any_of(strix::qpf2k::defaults.begin(), strix::qpf2k::defaults.end(), [&](const auto& item) {
+                    return name == item.name && (strix::qpf2k::pre_injected & strix::qpf2k::bit(item.item));
+                });
+            if (!injected) requested_environment.emplace(std::string(name),std::string(text.substr(equal+1U)));
+        }
+    }
+#endif
     auto effective = strix::decode_cli::resolve_effective_config(
-        {options, strix::decode_cli::requested_prefill_environment(), !target_input_export}, model, info, manifest,
+        {options, requested_environment, !target_input_export}, model, info, manifest,
         admitted_content, prompt_capabilities, prompt_memory);
     options = effective.options;
     model.attention_kv_storage = options.attention_kv_storage;
@@ -1228,6 +1275,7 @@ int STRIX_DECODE_ENTRY(
         return 0;
     }
     strix::decode_cli::require_effective_prefill_execution(effective);
+    yarn_preflight_reclaimer.reset(); // runtime owns a fresh verified drop after registration
     strix::qpf2k::undo_pre_injected([](const char* name) { ::unsetenv(name); });
     strix::qpf2k::baseline = options.baseline;
     for (const auto& [name, value] : effective.environment) {
@@ -1321,6 +1369,7 @@ int STRIX_DECODE_ENTRY(
         "  \"optimization_profile_reason\": \"" + optimization_profile.reason + "\",\n" +
         "  \"optimization_profile_automatic_applied\": " +
         (optimization_profile.automatic_applied ? "true" : "false") + ",\n" + ple_cpu_helper_receipt;
+    if (yarn) optimization_profile_receipt += "  \"rotary\":" + model.rotary_identity().json() + ",\n";
     if (options.ple_cache_rows)
         optimization_profile_receipt += "  \"ple_row_cache_requested_rows\":" + std::to_string(options.ple_cache_rows) + ",\n" +
             "  \"ple_row_cache_payload_budget_bytes\":" + std::to_string(options.ple_cache_budget_bytes) + ",\n" +
@@ -1330,7 +1379,7 @@ int STRIX_DECODE_ENTRY(
         ? "  \"eager_submission_mode\":\"prepared-static-plan-experimental-v1\",\n"
         : std::string{};
     if (options.context_tokens >
-        model.max_position_embeddings) {
+        model.effective_max_positions()) {
         throw std::invalid_argument(
             "requested context exceeds model maximum");
     }
@@ -1569,6 +1618,12 @@ int STRIX_DECODE_ENTRY(
         std::string(options.deferred_moe_status ? "true" : "false") + ",\n";
     const strix::decode_detail::SharedPrefetchDispatchReceipt shared_dispatch_receipt(shared_prefetch_stats);
     const auto original_work_device = std::make_shared<strix::HipSetupQuiescenceGuard>();
+    if (yarn) {
+        model.qwen_rotary_table = std::make_shared<const strix::HipQwenRotaryTable>(options.rotary);
+        if (model.qwen_rotary_table->identity() != model.resolved_rotary)
+            throw std::runtime_error("YaRN uploaded table differs from admitted host identity");
+        strix::validate_qwen_rotary_reader(*model.qwen_rotary_table,nullptr);
+    }
     auto target_architecture = original_work_device->architecture();
     if (const auto suffix = target_architecture.find(':'); suffix != std::string::npos)
         target_architecture.resize(suffix);
@@ -1906,26 +1961,7 @@ int STRIX_DECODE_ENTRY(
         strix::build_serial_execution_tensor_requirements(compiled.execution));
     strix::qsa_input_prefetch::validate_tensor_access(qsa_prefetch_plan,manifest,compiled.execution,tensor_access);
     strix::shared_expert_prefetch::validate_tensor_access(shared_prefetch_plan,manifest,compiled.execution,tensor_access);
-    if (hc_splitk_f32) {
-        const auto require_hc_tensor = [&](std::uint32_t step, std::uint32_t slot,
-            std::uint32_t type, std::vector<std::uint64_t> dimensions, std::uint64_t bytes) {
-            const auto* access = strix::find_execution_tensor_access(tensor_access, step, slot);
-            if (!access || access->tensor_indices.size() != 1U || access->tensor_indices[0] >= manifest.tensors.size())
-                throw std::invalid_argument("HC numerical profile requires complete canonical tensor access before allocation");
-            const auto& tensor = manifest.tensors[access->tensor_indices[0]];
-            if (tensor.ggml_type != type || tensor.dimensions != dimensions || tensor.byte_size != bytes)
-                throw std::invalid_argument("HC numerical profile tensor format, shape or extent differs before allocation");
-        };
-        for (const auto& step : compiled.execution.steps) {
-            if (step.op != strix::SerialOp::attn_hyper_mix && step.op != strix::SerialOp::mlp_hyper_mix &&
-                step.op != strix::SerialOp::final_hyper_mix) continue;
-            require_hc_tensor(step.id, 0U, 0U, {10240U}, 40960U);
-            require_hc_tensor(step.id, 1U, 8U, {10240U,320U}, 3481600U);
-            require_hc_tensor(step.id, 2U, 8U, {320U,10240U}, 3481600U);
-            if (step.op != strix::SerialOp::final_hyper_mix)
-                require_hc_tensor(step.id, 3U, 0U, {10240U,4U}, 163840U);
-        }
-    }
+    strix::decode_cli::validate_prompt_tensor_contract(options,manifest,compiled,tensor_access);
     const auto hc_next_tile_plan = strix::hc_projection_prefetch::build_plan(
         model, manifest, compiled, tensor_access, options.prefetch_hc_projection_next_tile);
 
@@ -2082,6 +2118,20 @@ int STRIX_DECODE_ENTRY(
         }
         if (ple_reclaimer) strix::ple_reclaim::set_active(ple_reclaimer.get());
     }
+    if (yarn) {
+        if ((ple_reclaimer ? ple_reclaimer->credit_bytes() : 0U) < effective.ple_reclaim_credit)
+            throw std::runtime_error("YaRN verified PLE credit lost after model registration; refusing state allocation");
+        yarn_preflight_reclaimer.reset();
+        const auto observed = strix::observe_linux_uma_memory();
+        if (!observed.memory.mem_available_bytes ||
+            *observed.memory.mem_available_bytes < effective.admission.at("incremental_bytes") - options.rotary.table_bytes())
+            throw std::runtime_error("YaRN available headroom lost after model registration; refusing state allocation");
+        auto post_capabilities = prompt_capabilities;
+        const auto post = strix::decode_cli::observe_prefill_memory(post_capabilities);
+        if (!post.gtt_limit || !post.gtt_used || *post.gtt_used > *post.gtt_limit ||
+            effective.admission.at("device_growth_bytes") - options.rotary.table_bytes() > *post.gtt_limit - *post.gtt_used)
+            throw std::runtime_error("YaRN GTT headroom lost after model registration; refusing state allocation");
+    }
     const auto model_owner_inventory_receipt = [&]() -> std::string {
         if (!model_owner_inventory) return {};
         const auto& inventory = *model_owner_inventory;
@@ -2209,7 +2259,7 @@ int STRIX_DECODE_ENTRY(
         policy.reservation_budget_bytes = options.serving_memory_budget;
         policy.shared_reservation_bytes = shared_bytes;
         strix::ServingCompatibility compatibility{model_residency.binding().model_content_identity,
-            compiled.kernel_plan_identity, original_work_device->device_index()};
+            compiled.kernel_plan_identity, original_work_device->device_index(), model.rotary_identity()};
         strix::GreedyServingScheduler scheduler(policy, compatibility, model_owner, cohort);
         std::vector<std::shared_ptr<ServingSessionOwner>> owners;
         std::vector<strix::ServingRequestHandle> handles;
@@ -3964,7 +4014,7 @@ int STRIX_DECODE_ENTRY(
             requested_logprobs = std::make_unique<RequestedLogprobBackend>(backend, options.logprob_token_ids,
                 model.vocab_size, options.context_tokens, session, original_work_device,
                 options.teacher_forced_score ? std::span<const std::uint32_t>{options.tokens} : std::span<const std::uint32_t>{},
-                options.teacher_logits_path);
+                options.teacher_logits_path, model.effective_max_positions());
         strix::SerialGreedyStepBackend* generation_backend = requested_logprobs
             ? static_cast<strix::SerialGreedyStepBackend*>(requested_logprobs.get())
             : static_cast<strix::SerialGreedyStepBackend*>(&backend);

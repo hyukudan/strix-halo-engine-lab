@@ -74,6 +74,7 @@ public:
             if(!owner || !owner->supports_tiled_prefill() || owner->output_policy()!=KnownWindowOutputPolicy::all_rows ||
                owner->logical_rows()<2U || (!sizes_.empty() && owner->logical_rows()>=sizes_.back().rows))
                 throw std::invalid_argument("MTP wide copy verify requires tiled all-rows owners of strictly descending rows");
+            require_rotary_producer_identity(owner->rotary_identity(),target_.model().rotary_identity());
             Size size;size.rows=owner->logical_rows();size.owner=std::move(owner);
             sizes_.push_back(std::move(size));
         }
@@ -211,7 +212,7 @@ public:
             }
             std::vector<MtpDeviceView> views{initial.view()};
             for(std::uint32_t r=0;r+1U<n;++r) views.push_back(view(r));
-            auto final_target=target_.adopt_prefill_row(session,inputs.back(),view(wide_rows-1U),logits_);
+            auto final_target=target_.adopt_prefill_row(session,inputs.back(),view(wide_rows-1U),logits_,target_.model().rotary_identity());
             host_phase_mark("w4 adopt");
             verifier->skip_cycle_sample();
             auto out=greedy.finish_wide_cycle(initial,std::move(final_target),views,

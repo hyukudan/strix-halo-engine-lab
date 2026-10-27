@@ -207,6 +207,7 @@ struct HipMtpRuntime::Impl {
     void validate_ticket(const HipMtpTargetHiddenTicket& ticket) const {
         require(ticket.valid() && ticket.target_content_identity()==owner->shared_target().target_model_content_identity,
             "MTP target hidden is not an actual compatible committed ticket");
+        ticket.admit_rotary_reader(owner->model().rotary_identity());
         const auto v=ticket.view();const auto& session=ticket.committed_session();
         require(v.bytes==owner->view(HipMtpBuffer::wide_current).bytes && v.address && v.allocation_generation &&
             ticket.source_position()<owner->context_capacity() && ticket.source_position()!=UINT64_MAX &&
@@ -254,6 +255,10 @@ struct HipMtpRuntime::Impl {
             call.input_token==current.seed_token_id && call.target_position==current.seed_position &&
             call.predictor_position==current.hidden_source_position && call.plan_identity==owner->plan().plan_identity &&
             call.proposal_identity==owner->plan().proposal_identity && same_input(input,current),"MTP native dispatch order/input changed");
+        require(current.hidden_source_position!=UINT64_MAX &&
+            current.seed_position==current.hidden_source_position+1U &&
+            call.predictor_position+1U==call.target_position,
+            "MTP hidden source/cache position i requires logical seed i+1");
         const auto c=context(current.hidden_source_position);void* stream=owner->stream();
         switch(call.step) {
         case MtpDraftPlanStep::input_fusion:launch_hip_mtp_embedding(c,current.seed_token_id,stream);launch_hip_mtp_input_fusion(fusion(),stream);break;
@@ -276,6 +281,7 @@ struct HipMtpRuntime::Impl {
         require(input.hidden_source_position==next_source && input.seed_position==next_source+1U &&
             input.seed_token_id<owner->model().vocab_size,"MTP source position/seed is not the next native row");
         require(!active && !validation,"MTP input cannot replace an active native admission");
+        if(source) validate_ticket(*source);
         validation.emplace(owner->admit_native_entry());
         try {
             preflight(next_source,input.seed_token_id,false,cache_only);
@@ -336,6 +342,9 @@ struct HipMtpRuntime::Impl {
         // predictor-wide result, logits or scratch payload is a cache input.
         start(input,&ticket,true);
         try {
+            require(current.hidden_source_position!=UINT64_MAX &&
+                current.seed_position==current.hidden_source_position+1U,
+                "MTP cache-only source i requires logical seed i+1");
             const auto c=context(current.hidden_source_position);void* stream=owner->stream();
             launch_hip_mtp_embedding(c,current.seed_token_id,stream);
             cache_row_front(c,stream);
@@ -369,6 +378,7 @@ struct HipMtpRuntime::Impl {
     void teacher_cache_rows(std::span<const HipMtpReplayRow> rows,bool fast_cache=false) {
         if(rows.empty()) return;
         require(!active && !validation && stats.cache_only_rows<=UINT64_MAX-rows.size(),"MTP batched cache rows require an idle owner");
+        for(const auto& row:rows) row.hidden.admit_rotary_reader(owner->model().rotary_identity());
         validation.emplace(owner->admit_native_entry());
         try {
             for(std::size_t i=0;i<rows.size();++i) {
@@ -424,6 +434,7 @@ struct HipMtpRuntime::Impl {
         sampled.clear();
         if(!depth) return false;
         require(stats.full_forward_rows<=UINT64_MAX-depth && epoch!=UINT64_MAX,"MTP draft chain counters exhausted");
+        cycle_base->admit_rotary_reader(owner->model().rotary_identity());
         validation.emplace(owner->admit_native_entry());
         try {
             for(std::uint32_t k=0;k<depth;++k) preflight(next_source+k,k?0U:pending_token,true);
@@ -613,6 +624,7 @@ HipMtpNativeRowResult HipMtpRuntime::execute_diagnostic(const HipMtpTargetHidden
 }
 void HipMtpRuntime::prime_committed_rows(const QualifiedMtpDraftPlan& plan,const ActivatedMtpDraftPlan& activated,std::span<const HipMtpReplayRow> rows) {
     auto& p=*impl_;p.qualification(plan,activated);require(!p.cycle && !p.active,"MTP priming cannot interleave a proposal");
+    for(const auto& row:rows) row.hidden.admit_rotary_reader(p.owner->model().rotary_identity());
     {
     const auto admission=p.owner->admit_native_entry();
     for(std::size_t i=0;i<rows.size();++i) {
@@ -626,12 +638,16 @@ void HipMtpRuntime::prime_committed_rows(const QualifiedMtpDraftPlan& plan,const
     else for(const auto& row:rows) p.teacher_cache(row.hidden,row.next_input_token);
 }
 void HipMtpRuntime::prime_hidden_rows(const QualifiedMtpDraftPlan& plan,const ActivatedMtpDraftPlan& activated,
-    std::span<const MtpDeviceView> hidden,std::span<const std::uint32_t> next_tokens) {
-    if(prime_hidden_rows_submit(plan,activated,hidden,next_tokens)) prime_hidden_rows_complete();
+    std::span<const MtpDeviceView> hidden,std::span<const std::uint32_t> next_tokens,
+    const RotaryIdentity& producer_rotary) {
+    if(prime_hidden_rows_submit(plan,activated,hidden,next_tokens,producer_rotary)) prime_hidden_rows_complete();
 }
 bool HipMtpRuntime::prime_hidden_rows_submit(const QualifiedMtpDraftPlan& plan,const ActivatedMtpDraftPlan& activated,
-    std::span<const MtpDeviceView> hidden,std::span<const std::uint32_t> next_tokens) {
-    auto& p=*impl_;p.qualification(plan,activated);
+    std::span<const MtpDeviceView> hidden,std::span<const std::uint32_t> next_tokens,
+    const RotaryIdentity& producer_rotary) {
+    auto& p=*impl_;
+    require_rotary_producer_identity(producer_rotary,p.owner->model().rotary_identity());
+    p.qualification(plan,activated);
     require(!p.cycle && !p.active && !p.validation && !p.broken && hidden.size()==next_tokens.size() &&
         p.stats.cache_only_rows<=UINT64_MAX-hidden.size(),"MTP hidden-row priming requires an idle owner and one token per row");
     if(hidden.empty()) return false;
@@ -759,7 +775,7 @@ bool draft_batch_env_branches() {
 }
 // Every owner holds its own copy of the model contract: the fields the draft step depends on must be equal.
 bool same_draft_model(const ModelContract& a,const ModelContract& b) {
-    return a.vocab_size==b.vocab_size && a.hidden_size==b.hidden_size && a.max_position_embeddings==b.max_position_embeddings &&
+    return same_rotary_model(a,b) && a.vocab_size==b.vocab_size && a.hidden_size==b.hidden_size && a.max_position_embeddings==b.max_position_embeddings &&
         a.hc_count==b.hc_count && a.hc_lowrank==b.hc_lowrank && a.attention_heads==b.attention_heads && a.kv_heads==b.kv_heads &&
         a.head_dim==b.head_dim && a.indexer_n_heads==b.indexer_n_heads && a.indexer_kv_heads==b.indexer_kv_heads &&
         a.indexer_head_dim==b.indexer_head_dim && a.indexer_budget==b.indexer_budget && a.indexer_compress_ratio==b.indexer_compress_ratio &&

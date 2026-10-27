@@ -1,4 +1,6 @@
+#include "rotary_mock.hpp"
 #include "strix/compiled_execution.hpp"
+#include "strix/rotary_descriptor.hpp"
 
 #include <set>
 #include <string>
@@ -164,6 +166,17 @@ int main() {
             buffer_request,
             256);
 
+    auto rotary_model = model;
+    std::uint64_t previous = compiled.execution_identity;
+    for (auto factor : {2U, 4U}) {
+        rotary_model.qwen_rotary_table = mock_rotary(factor);
+        const auto plan = strix::compile_serial_execution(rotary_model, registry,
+            binding_request, buffer_request, 256);
+        expect(plan.execution_identity != compiled.execution_identity && plan.execution_identity != previous,
+            "same shapes and kernels cannot alias native/2/4 compiled identities");
+        previous = plan.execution_identity;
+    }
+
     expect(compiled.bindings.missing_steps == 0,
            "compiled execution is fully bound");
     expect(compiled.kernel_plan_identity != 0 &&
@@ -171,6 +184,8 @@ int main() {
            "compiled execution has stable non-zero identities");
     // Captured from the pinned, pre-router implementation with this fixture.
     expect(compiled.execution_identity == 5195923158154663034ULL &&
+               strix::append_rotary_identity(compiled.execution_identity, strix::RotaryDescriptor::native()) ==
+                   5195923158154663034ULL &&
                compiled.kernel_plan_identity == 4048923307928001002ULL &&
                compiled.arena.total_bytes == 998400ULL,
            "default serial identities and arena retain the pre-router receipt");

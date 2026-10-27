@@ -36,6 +36,12 @@ std::uint64_t identity(const GraphCapturePlan& p) noexcept {
          m.executable_bytes_per_instance, m.capture_peak_bytes, m.budget_bytes, p.instance_count, p.charged_bytes}) {
         hash_word(hash, value);
     }
+    if (p.execution.rotary_table) {
+        hash = append_rotary_identity(hash, p.execution.rotary_table->identity());
+        hash_word(hash, reinterpret_cast<std::uintptr_t>(p.execution.rotary_table->data()));
+        hash_word(hash, p.execution.rotary_table->generation());
+        hash_word(hash, static_cast<std::uint64_t>(p.execution.rotary_table->device()));
+    }
     return hash;
 }
 void validate_arguments(const GraphExecutionContract& execution, const GraphDynamicArguments& a) {
@@ -122,6 +128,11 @@ GraphEligibility assess_graph_replay_eligibility(
     if (capture.execution != execution) { result.reasons.push_back("compiled execution/shape/graph-safety contract changed"); }
     if (capture.arguments != current_arguments) { result.reasons.push_back("device token/position argument addresses/generations/ABI changed"); }
     try {
+        if (execution.rotary_table) {
+            execution.rotary_table->check_position(position);
+            if (execution.logical_rows > execution.rotary_table->extent() - position)
+                throw std::out_of_range("graph rows exceed rotary table extent");
+        }
         validate_execution_runtime_resources(execution.execution_identity, arena, current_resources, position);
         if (execution.logical_rows == 0 || execution.logical_rows > current_resources.session_state_layout->context_tokens - position) {
             throw std::out_of_range("graph row window exceeds current context allocation");

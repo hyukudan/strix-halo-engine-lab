@@ -2032,7 +2032,7 @@ void register_hip_moe_experts_kernel_variant(
 ExecutionLauncher
 make_hip_moe_experts_launcher(
     std::string kernel_id_value,
-    HipMoeExpertsLauncherConfig* config) {
+    HipMoeExpertsLauncherConfig* config, bool perform_device_setup) {
     if (kernel_id_value.empty() ||
         config == nullptr) {
         throw std::invalid_argument(
@@ -2049,7 +2049,7 @@ make_hip_moe_experts_launcher(
         throw std::invalid_argument("grouped exact Q5_1 launcher id differs from config");
     if (kernel_id_value.ends_with(moe_q4k_a8::runtime_kernel_suffix) != config->q4k_a8g32_gate_up)
         throw std::invalid_argument("Q4K A8 launcher id differs from config");
-    if (config->q4k_a8g32_gate_up && !config->q4k_a8_quiescence)
+    if (perform_device_setup && config->q4k_a8g32_gate_up && !config->q4k_a8_quiescence)
         config->q4k_a8_quiescence = std::make_shared<HipSetupQuiescenceGuard>();
     return ExecutionLauncher{
         std::move(kernel_id_value),
@@ -2064,7 +2064,7 @@ make_hip_moe_experts_launcher(
 void HipMoeExpertsLauncherBundle::
 register_for_compiled_execution(
     const CompiledSerialExecution& compiled,
-    ExecutionLauncherRegistry& registry) {
+    ExecutionLauncherRegistry& registry, bool perform_device_setup) {
     if (compiled.execution_identity == 0 ||
         compiled.execution.steps.size() !=
             compiled.bindings.bindings.size()) {
@@ -2104,7 +2104,7 @@ register_for_compiled_execution(
             registry.add_kernel_launcher(
                 make_hip_moe_experts_launcher(
                     registered_id,
-                    &config_));
+                    &config_, perform_device_setup));
         } else if (registered_id !=
                    *binding.kernel_id) {
             throw std::invalid_argument(
