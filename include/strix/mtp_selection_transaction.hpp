@@ -32,7 +32,12 @@ public:
     virtual void reset() = 0;
     virtual void discard() noexcept = 0;
     virtual std::uint32_t select(std::span<const float>) = 0;
+    // The row's unmasked lowest-ID maximum and finite status (device greedy reply). Returns the selected
+    // token when it equals select() on the full row; nullopt: read the row and call select().
+    virtual std::optional<std::uint32_t> select_known(std::uint32_t, std::uint32_t) { return std::nullopt; }
     virtual std::unique_ptr<MtpSelectionReceipt> seal() = 0;
+    // Wall time of one window row (readback and selection); profiling only.
+    virtual void note_row_ns(std::uint64_t) noexcept {}
 };
 
 enum class MtpSelectionStop { eos, output_limit, row_limit, no_draft, rejection, selection_failure };

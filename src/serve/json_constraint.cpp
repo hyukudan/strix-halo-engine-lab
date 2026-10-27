@@ -1335,6 +1335,8 @@ TokenByteTrie::TokenByteTrie(std::span<const std::string> bytes, std::span<const
 }
 void TokenByteTrie::insert(std::string_view bytes, std::uint32_t id) {
     if (bytes.empty()) return;
+    if (members_.size() < vocab_size_) members_.resize(vocab_size_, false);
+    members_.at(id) = true;
     std::size_t at = 0;
     for (unsigned char b : bytes) {
         const auto it = std::find_if(nodes_[at].edges.begin(), nodes_[at].edges.end(), [&](auto e) { return e.first == b; });

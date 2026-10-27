@@ -37,6 +37,7 @@ Serving runs on the tiled MTP route, so it takes the flags of a tiled MTP reques
 | `--http-anthropic-thinking-budget enforce\|note` | `note` | Messages `thinking.budget_tokens`: `note` accepts it and states in `strix.note` that it is not enforced (the request keeps speculative decoding); `enforce` applies `thinking-budget-v1` (resolved host selection route) |
 | `--http-thinking-budget on\|off` | `on` | makes the opt-in `thinking-budget-v1` policy available ([below](#thinking-budget)); `off`: explicit policy requests get 400 |
 | `--http-selection-mtp on\|off` | `on` | policy selection uses admitted serial-equivalent MTP windows; `off` forces `serial-host` for JSON, budgets, scores and transforms |
+| `--http-selection-fast on\|off` | `on` | argmax-first policy selection: rows whose unmasked argmax the constraint admits skip the mask walk (and, on `mtp-host`, the logits readback); `off` walks the full mask for every row |
 | `--http-logprobs on\|off` | `on` | Qwen host logprobs; `off` refuses score requests |
 | `--http-logit-transforms on\|off` | `on` | Qwen opt-in logit transforms; `off` refuses non-neutral transforms |
 | `--http-constraints on\|off` | `on` | constrained JSON output ([below](#constrained-json-output)); `off`: such requests get 400 and capabilities say unavailable |
@@ -385,7 +386,11 @@ Constraints run greedy only with host target selection on the resolved route des
 `strix.constraint` (also with stream receipts off): `identity` (`json-object` or `strix-json-schema-v1`), `selection`,
 `execution`, `phase`, `status` (`complete`, `incomplete`, `failed`), `accepting` and `reason` (`max_output_tokens`,
 `context`, `reasoning_eos`, `cancelled`, `constraint_failure`, `execution_failure`). A reply cut by the budget is
-reported incomplete, never repaired; Responses then has `status: incomplete`.
+reported incomplete, never repaired; Responses then has `status: incomplete`. `host_profile` reports the host
+selection cost of the request (wall time, informational, differs between runs): `known_rows` selected
+argmax-first (below), `rows` / `select_ms` selected on the full row (transforms, argmax, scores),
+`mask_ms` building constraint masks and, on `mtp-host`, `window_rows` / `window_row_ms` for whole window
+rows (logits readback and selection). Rows of rejected window suffixes are included.
 
 ### Policy selection routes
 
@@ -397,6 +402,18 @@ recipes and window-only inject/normalization or combine folds are excluded here.
 These conservative exclusions fall back before drafting. The existing prefix gate
 compares full-logit digests and committed state, including rejection depths and
 owner changes; matching argmax IDs alone is insufficient.
+
+Argmax-first selection (`--http-selection-fast on`, default) applies on every route. Masked greedy
+picks the lowest-ID maximum over admitted IDs, so when a row's unmasked lowest-ID maximum is admitted
+it is the masked result: the row needs only a membership check of that one token against the
+constraint cursor (EOS only at a complete value, never the end-of-thinking ID), not the full mask
+walk. On `mtp-host` the maximum comes from the window's GPU reduction (same finite first-max rule, both
+zeros equal), so such rows also skip the logits readback and finite scan; on `serial-host` and serial
+replays the host computes it from the row it read. Forced closure and reasoning-phase rows use it
+directly. Rows with a nonfinite logit or a refused maximum, and requests with scores or transforms, are
+selected on the full row; token IDs are identical either way. One difference to `--http-selection-fast
+off` (every row walks the full mask): a full walk can stop a request on a mask-walk evaluation limit
+reached by another token, which a membership check does not walk; all routes of one setting behave the same.
 
 Every policy response reports `strix.selection_execution` (`mtp-host` or
 `serial-host`) and `strix.selection_fallback` (null when admitted). Fallbacks are

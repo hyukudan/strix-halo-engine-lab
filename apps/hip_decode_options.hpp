@@ -402,6 +402,7 @@ struct Options {
     bool http_serve = false;
     bool http_constraints = true;
     bool http_selection_mtp = true;
+    bool http_selection_fast = true;
     bool http_logprobs = true, http_logit_transforms = true;
     bool http_thinking_budget = true;
     bool http_anthropic_thinking_budget_enforce = false;  // --http-anthropic-thinking-budget enforce|note
@@ -1698,7 +1699,7 @@ inline Options parse_options(
             continue;
         }
         if (argument == "--http-port" || argument == "--http-bind" || argument == "--http-model-id" ||
-            argument == "--http-selection-mtp" || argument == "--http-logprobs" || argument == "--http-logit-transforms" || argument == "--http-thinking-budget" || argument == "--http-anthropic-thinking-budget" || argument == "--http-constraints" || argument == "--http-responses" || argument == "--http-capabilities" || argument == "--http-stream-receipts" ||
+            argument == "--http-selection-mtp" || argument == "--http-selection-fast" || argument == "--http-logprobs" || argument == "--http-logit-transforms" || argument == "--http-thinking-budget" || argument == "--http-anthropic-thinking-budget" || argument == "--http-constraints" || argument == "--http-responses" || argument == "--http-capabilities" || argument == "--http-stream-receipts" ||
             argument == "--http-sse-progress-interval" || argument == "--http-sse-keepalive" || argument == "--release-manifest" || argument == "--http-api-key-file" || argument == "--http-sampling" || argument == "--http-default-max-tokens" ||
             argument == "--http-default-temperature" || argument == "--http-default-top-k" ||
             argument == "--http-default-top-p" || argument == "--http-default-min-p" ||
@@ -1717,6 +1718,7 @@ inline Options parse_options(
                 return value == "on";
             };
             if (argument == "--http-selection-mtp") options.http_selection_mtp = on_off();
+            else if (argument == "--http-selection-fast") options.http_selection_fast = on_off();
             else if (argument == "--http-logprobs") options.http_logprobs = on_off();
             else if (argument == "--http-logit-transforms") options.http_logit_transforms = on_off();
             else if (argument == "--http-thinking-budget") options.http_thinking_budget = on_off();

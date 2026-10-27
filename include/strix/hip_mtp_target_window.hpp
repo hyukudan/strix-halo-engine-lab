@@ -73,7 +73,9 @@ public:
     // tokens; it may replace tokens. Empty (the default) keeps first-max selection.
     using RowSelection=std::function<void(std::span<const ExecutionBufferAddress>,std::span<std::uint32_t>)>;
     void set_row_selection(RowSelection);
-    using TransactionSelection=std::function<MtpSelectionPrefix(std::span<const ExecutionBufferAddress>)>;
+    // Rows' FP32 logits and, when the owner reduces them on the GPU, each row's unmasked finite first-max
+    // reply (token, status); empty otherwise.
+    using TransactionSelection=std::function<MtpSelectionPrefix(std::span<const ExecutionBufferAddress>,std::span<const HipGreedyRowsReply>)>;
     void set_transaction_selection(TransactionSelection);
 private:
     friend class HipKnownPrefixWindow;

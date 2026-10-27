@@ -871,6 +871,9 @@ int main() try {
             const auto& v = at(at(out, "strix"), "constraint");
             check(at(v, "status").as_string() == status && at(v, "execution").as_string() == "serial-host", "engine constraint verdict");
             check(at(v, "selection").as_string() == "greedy-lowest-id", "selection identity");
+            const auto& profile = at(v, "host_profile");
+            check(at(profile, "rows").is_number() && at(profile, "mask_ms").is_number() && at(profile, "select_ms").is_number() &&
+                at(profile, "window_rows").is_number() && at(profile, "window_row_ms").is_number(), "host selection profile reported");
         };
         for (bool thinking : {false, true}) for (bool schema_mode : {false, true}) {
             Json format = parse_json(R"({"type":"json_object"})");

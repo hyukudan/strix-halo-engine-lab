@@ -85,12 +85,15 @@ public:
     // Also useful for tokenizer-independent host fixtures. IDs are vector positions.
     explicit TokenByteTrie(std::span<const std::string> bytes, std::span<const std::uint32_t> excluded = {});
     [[nodiscard]] std::size_t vocab_size() const { return vocab_size_; }
+    // Whether the ID is an eligible (inserted) token: exactly the IDs a mask walk can admit.
+    [[nodiscard]] bool contains(std::uint32_t id) const { return id < members_.size() && members_[id]; }
     struct Node { std::vector<std::pair<unsigned char, std::size_t>> edges; std::vector<std::uint32_t> ids; };
     [[nodiscard]] const std::vector<Node>& nodes() const { return nodes_; }
 private:
     void insert(std::string_view, std::uint32_t);
     std::size_t vocab_size_ = 0;
     std::vector<Node> nodes_{1};
+    std::vector<bool> members_;
     std::shared_ptr<const unsigned char> identity_ = std::make_shared<const unsigned char>(0);
     friend struct ConstraintAccess;
 };

@@ -582,7 +582,124 @@ void masks_and_cohorts() {
 }
 }  // namespace
 
+// Argmax-first selection: admits() equals the prepared mask for every ID, select_row() (argmax-first on)
+// stages exactly what prepare() + select() stage on the full row, and a window mixing known and
+// full-row selections publishes the same frontier and scores as serial selection.
+std::size_t known_answer = 0, known_forced = 0, known_reasoning = 0, known_declined = 0;
+bool same_state(const ConstraintSelection::State& x, const ConstraintSelection::State& y, const ConstraintSpec& spec, const TokenByteTrie& trie) {
+    if (!(x.reply_counts == y.reply_counts && x.reasoning == y.reasoning && x.terminal == y.terminal &&
+          x.reasoning_tokens == y.reasoning_tokens && x.forced_ids == y.forced_ids &&
+          x.cursor.complete() == y.cursor.complete() && x.cursor.dead() == y.cursor.dead())) return false;
+    if (spec.program && !x.terminal)
+        return allowed(*spec.program, x.cursor, trie, spec.eos_ids).words == allowed(*spec.program, y.cursor, trie, spec.eos_ids).words;
+    return true;
+}
+void argmax_first() {
+    // Multi-byte tokens; 9 = EOS (excluded from the trie, as in serving), 10 = end of thinking.
+    const std::vector<std::string> vocab{"{", "}", "\"a\"", ":", "12", ",", "\"", "{\"", "\":", "z", "x", "1}", "a"};
+    const std::uint32_t eos = 9, end_thinking = 10, n = static_cast<std::uint32_t>(vocab.size());
+    Fixture f(vocab);
+    const std::array<std::uint32_t, 1> excluded{eos};
+    f.trie = std::make_shared<TokenByteTrie>(*f.tokenizer, excluded);
+    for (std::uint32_t id = 0; id < n; ++id) check(f.trie->contains(id) == (id != eos), "trie membership");
+    check(!f.trie->contains(n) && !f.trie->contains(UINT32_MAX), "trie membership outside vocabulary");
+    const std::array<const char*, 3> schemas{"", "{\"const\":{}}", "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"}}}"};
+    constexpr std::array<float, 7> values{-1, -0.0F, 0.0F, 1, 2, 2, 3};
+    std::uint64_t seed = 12345;
+    const auto next = [&] { seed = seed * 6364136223846793005ULL + 1442695040888963407ULL; return static_cast<std::uint32_t>(seed >> 33); };
+    const auto random_row = [&] { std::vector<float> row(n); for (auto& v : row) v = values[next() % values.size()]; return row; };
+    const auto lowest_max = [](const std::vector<float>& row) {
+        std::uint32_t g = 0;
+        for (std::uint32_t i = 1; i < row.size(); ++i) if (row[i] > row[g]) g = i;
+        return g;
+    };
+    for (unsigned program = 0; program < 3; ++program) for (unsigned policy = 0; policy < 4; ++policy) for (unsigned thinking = 0; thinking < 2; ++thinking) {
+        ConstraintSpec spec; spec.eos_ids = {eos}; spec.end_thinking_id = end_thinking;
+        spec.program = std::make_shared<ConstraintProgram>(program ? compile_json_schema(parse_json(schemas[program])) : compile_json_object());
+        spec.logprobs = policy == 1; spec.top_logprobs = 3;
+        if (policy == 2) spec.transform.bias = {{1, 0.5}};
+        if (policy == 3) spec.program.reset();
+        if (thinking) { spec.starts_in_reasoning = true; spec.thinking = ThinkingPolicy{0, 0, 3, {end_thinking, 5}}; }
+        for (unsigned walk = 0; walk < 16; ++walk) {
+            auto fast = f.selection(copy_spec(spec)), full = f.selection(copy_spec(spec));
+            fast->set_argmax_first(true);
+            for (unsigned depth = 0; depth < 16 && !fast->state().terminal; ++depth) {
+                const auto& state = fast->state();
+                check(same_state(state, full->state(), spec, *f.trie), "fast and full frontiers agree");
+                std::optional<ConstraintSelection::Prepared> prepared;
+                try { prepared = fast->prepare(state); } catch (const ConstraintError&) {}
+                if (spec.program && !state.reasoning)
+                    for (std::uint32_t id = 0; id < n; ++id)
+                        check(fast->admits(state, id) == (prepared && prepared->mask.contains(id)), "admits equals the prepared mask");
+                // the off switch never takes the known path
+                check(!full->select_known(full->state(), lowest_max(random_row()), 0), "argmax-first off declines");
+                std::vector<float> chosen;
+                for (unsigned trial = 0; trial < 24; ++trial) {
+                    auto row = random_row();
+                    const auto g = lowest_max(row);
+                    check(!fast->select_known(state, g, 1), "nonfinite status declines");
+                    const auto known = fast->select_known(state, g, 0);
+                    if (spec.logprobs || spec.transform.active()) check(!known, "scores and transforms decline");
+                    if (known) {
+                        const bool force = state.reasoning && spec.thinking && state.reasoning_tokens >= spec.thinking->reasoning_limit;
+                        if (force) ++known_forced; else if (state.reasoning || !spec.program) ++known_reasoning; else ++known_answer;
+                    } else ++known_declined;
+                    // select_row (any route) equals prepare + select on the full row, including refusals
+                    std::optional<ConstraintSelection::Staged> a, b;
+                    bool a_failed = false, b_failed = false;
+                    try { a = fast->select_row(row, state); } catch (const ConstraintError&) { a_failed = true; }
+                    try { b = full->select(row, full->prepare(full->state())); } catch (const ConstraintError&) { b_failed = true; }
+                    check(a_failed == b_failed, "select_row refuses exactly when the full row refuses");
+                    if (a && b) {
+                        check(a->token == b->token && a->forced_control == b->forced_control && same_state(a->state, b->state, spec, *f.trie),
+                            "select_row equals full-row selection");
+                        if (known) check(known->token == a->token, "known token equals select_row");
+                        chosen = row;
+                    }
+                    auto bad = row; bad[next() % n] = std::numeric_limits<float>::quiet_NaN();
+                    bool fast_nan = false, full_nan = false;
+                    try { (void)fast->select_row(bad, state); } catch (const ConstraintError&) { fast_nan = true; }
+                    try { (void)full->select(bad, full->prepare(full->state())); } catch (const ConstraintError&) { full_nan = true; }
+                    check(fast_nan && full_nan, "nonfinite rows refuse on both paths");
+                }
+                if (chosen.empty()) break;
+                try {
+                    fast->commit(fast->select_row(chosen, fast->state()));
+                    full->commit(full->select(chosen, full->prepare(full->state())));
+                } catch (const ConstraintError&) { break; }
+            }
+            // A window mixing known and full-row selections publishes what serial selection commits.
+            const auto serial_spec = copy_spec(spec), window_spec = copy_spec(spec);
+            auto serial = f.selection(serial_spec), windowed = f.selection(window_spec);
+            serial->set_argmax_first(true); windowed->set_argmax_first(true);
+            auto t = windowed->window_transaction();
+            std::size_t staged = 0;
+            for (unsigned row_index = 0; row_index < 6 && !serial->state().terminal; ++row_index) {
+                const auto row = random_row();
+                std::optional<ConstraintSelection::Staged> s;
+                try { s = serial->select_row(row, serial->state()); } catch (const ConstraintError&) { break; }
+                std::uint32_t id = 0;
+                if (row_index % 2 == 0) {
+                    auto k = t->select_known(lowest_max(row), 0);
+                    id = k ? *k : t->select(row);
+                } else id = t->select(row);
+                check(id == s->token, "window row equals serial row");
+                serial->commit(*s); ++staged;
+            }
+            if (staged) {
+                auto receipt = t->seal();
+                check(receipt->size() == staged, "window receipt size");
+                receipt->publish();
+                check(same_state(windowed->state(), serial->state(), spec, *f.trie), "published window equals serial frontier");
+                scores_equal(window_spec->scores->tokens, serial_spec->scores->tokens);
+            }
+        }
+    }
+    check(known_answer > 100 && known_forced > 10 && known_reasoning > 100 && known_declined > 1000, "argmax-first coverage");
+}
+
 int main() try {
+    argmax_first();
     selection_failures(); routes_and_reuse(); boundaries(); allocation_failures(); masks_and_cohorts(); enumeration(); masked_enumeration(); grammar_and_thinking();
     // A four-row window can reject comparisons at rows 0..2; row 3 is bonus.
     check(rejection_rows[0] && rejection_rows[1] && rejection_rows[2], "rejection coverage");

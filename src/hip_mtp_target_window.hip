@@ -173,7 +173,10 @@ void HipMtpTargetWindowCapture::completed_before_publish(){
         "MTP window completed without every wide snapshot");
     if(i.transaction_selection) {
         require(!i.row_selection,"MTP selection callbacks are mutually exclusive");
-        auto plan=i.transaction_selection(i.logit_views);
+        // The window stream already completed: the device replies are final (unvalidated here; a nonzero
+        // status sends that row to the full-row selector, which reports it exactly as serial selection does).
+        auto plan=i.transaction_selection(i.logit_views,i.device_greedy?std::span<const HipGreedyRowsReply>(i.device_greedy,i.rows):
+            std::span<const HipGreedyRowsReply>{});
         require((plan.decided_rows || plan.stop==MtpSelectionStop::selection_failure) && plan.decided_rows<=i.rows && plan.selected_ids.size()==plan.decided_rows,
             "MTP transaction returned an invalid decided prefix");
         std::fill(i.active->predictions.begin(),i.active->predictions.end(),UINT32_MAX);

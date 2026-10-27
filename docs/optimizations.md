@@ -538,7 +538,9 @@ Token selection restricted to a declared JSON language (`json-object` or a `stri
 resolved `mtp-host` / `serial-host` route for the constrained request only.
 
 Host selection defaults to admitted serial-equivalent MTP windows (`mtp-host`), with
-`serial-host` fallback and per-request route/reason receipts. No MTP speed claim;
+`serial-host` fallback and per-request route/reason receipts. Argmax-first selection
+(`--http-selection-fast`, default on) skips the mask walk, and on `mtp-host` the logits readback, for rows whose
+unmasked argmax the constraint admits (same token IDs). No speed claim;
 [route admission and exactness](engine/serving/serving.md#policy-selection-routes).
 
 - **Preconditions:** `--http-serve`; a request with `response_format` / `text.format` `json_object` or `json_schema`,
@@ -549,7 +551,7 @@ Host selection defaults to admitted serial-equivalent MTP windows (`mtp-host`), 
 - **Exactness evidence:** Constrained output is exact relative to its declared constrained target (masked greedy), not
   to unconstrained greedy. Unconstrained requests, alone and sharing the batch with constrained ones, keep their token
   IDs (GPU gate).
-- **Off switch:** `--http-constraints off`; `--http-selection-mtp off` keeps policy selection serial
+- **Off switch:** `--http-constraints off`; `--http-selection-mtp off` keeps policy selection serial; `--http-selection-fast off` walks the full mask for every row
 
 <a id="qwen-serve-progress"></a>
 

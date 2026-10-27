@@ -29,8 +29,8 @@ namespace strix::decode_cli {
 // per server; mutable selection frontiers are created afresh for each request.
 class HttpConstraintRequests {
 public:
-    explicit HttpConstraintRequests(std::shared_ptr<const serve::BpeTokenizer> tokenizer)
-        : tokenizer_(std::move(tokenizer)) {}
+    HttpConstraintRequests(std::shared_ptr<const serve::BpeTokenizer> tokenizer,bool argmax_first)
+        : tokenizer_(std::move(tokenizer)),argmax_first_(argmax_first) {}
     bool available(std::span<const std::uint32_t> stops) const {
         const auto id=tokenizer_->find("</think>");
         return id!=UINT32_MAX && tokenizer_->token_bytes(id)=="</think>" &&
@@ -41,11 +41,14 @@ public:
     std::shared_ptr<MtpConstraintRow> make(const std::shared_ptr<const serve::ConstraintSpec>& spec) {
         if(!spec) return {};
         if(!trie_) trie_=std::make_shared<serve::TokenByteTrie>(*tokenizer_,spec->eos_ids);
-        return std::make_shared<MtpConstraintRow>(std::make_shared<serve::ConstraintSelection>(spec,trie_,tokenizer_));
+        auto selection=std::make_shared<serve::ConstraintSelection>(spec,trie_,tokenizer_);
+        selection->set_argmax_first(argmax_first_);
+        return std::make_shared<MtpConstraintRow>(std::move(selection));
     }
 private:
     std::shared_ptr<const serve::BpeTokenizer> tokenizer_;
     std::shared_ptr<const serve::TokenByteTrie> trie_;
+    bool argmax_first_;
 };
 // Execution failures stop the server; constraint refusals carry request-local receipts.
 class MtpBridgeEngine final : public serve::GenerationEngine {
@@ -163,7 +166,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         if (options.eos_token) config.stop_tokens.push_back(*options.eos_token);
         std::sort(config.stop_tokens.begin(), config.stop_tokens.end());
         config.stop_tokens.erase(std::unique(config.stop_tokens.begin(), config.stop_tokens.end()), config.stop_tokens.end());
-        HttpConstraintRequests constraints(tokenizer);
+        HttpConstraintRequests constraints(tokenizer,options.http_selection_fast);
         config.engine_logprobs = options.http_logprobs;
         config.engine_logit_transforms = options.http_logit_transforms;
         config.engine_constraints = options.http_constraints && constraints.available(config.stop_tokens);
@@ -247,7 +250,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         if (options.eos_token) config.stop_tokens.push_back(*options.eos_token);
         std::sort(config.stop_tokens.begin(), config.stop_tokens.end());
         config.stop_tokens.erase(std::unique(config.stop_tokens.begin(), config.stop_tokens.end()), config.stop_tokens.end());
-        HttpConstraintRequests constraints(tokenizer);
+        HttpConstraintRequests constraints(tokenizer,options.http_selection_fast);
         config.engine_logprobs = options.http_logprobs;
         config.engine_logit_transforms = options.http_logit_transforms;
         config.engine_constraints = runner.supports_constraints() && constraints.available(config.stop_tokens);

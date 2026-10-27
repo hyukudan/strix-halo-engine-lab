@@ -1,6 +1,7 @@
 #include "strix/serve/constraint_selection.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <type_traits>
 
@@ -16,6 +17,10 @@ ConstraintSelection::Prepared ConstraintSelection::prepare(const State& state) c
     if (state.terminal) throw ConstraintError("selection after constraint termination");
     Prepared p{state, {}};
     if (!state.reasoning && spec_->program) {
+        const auto t0 = std::chrono::steady_clock::now();
+        struct Timed { const std::chrono::steady_clock::time_point& t0; std::uint64_t& ns;
+            ~Timed() { ns += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()); } }
+            timed{t0, profile_.mask_ns};
         p.mask = allowed(*spec_->program, state.cursor, *trie_, spec_->eos_ids);
         if (spec_->end_thinking_id) p.mask.set(*spec_->end_thinking_id, false);
         if (std::none_of(p.mask.words.begin(), p.mask.words.end(), [](auto word) { return word != 0; }))
@@ -24,6 +29,10 @@ ConstraintSelection::Prepared ConstraintSelection::prepare(const State& state) c
     return p;
 }
 ConstraintSelection::Staged ConstraintSelection::select(std::span<const float> logits, const Prepared& p) const {
+    const auto t0 = std::chrono::steady_clock::now();
+    struct Timed { const std::chrono::steady_clock::time_point& t0; Profile& p;
+        ~Timed() { ++p.rows; p.select_ns += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()); } }
+        timed{t0, profile_};
     if (logits.size() != trie_->vocab_size()) throw ConstraintError("constraint logits vocabulary mismatch");
     // Preserve the target's all-vocabulary finite-row contract, including masked entries.
     for (const auto value : logits) if (!std::isfinite(value)) throw ConstraintError("nonfinite target logits");
@@ -75,17 +84,45 @@ ConstraintSelection::Staged ConstraintSelection::select(std::span<const float> l
         });
         for (std::size_t i = 0; i < n; ++i) staged.score.top.emplace_back(order[i], score(order[i]));
     }
+    advance(staged, p.state, force);
+    return staged;
+}
+void ConstraintSelection::advance(Staged& staged, const State& prior, bool force) const {
+    const auto id = staged.token;
     if (spec_->transform.active()) ++staged.state.reply_counts[id];
-    staged.state.frontier = std::make_shared<Frontier>(Frontier{p.state.frontier});
+    staged.state.frontier = std::make_shared<Frontier>(Frontier{prior.frontier});
     const bool eos = std::find(spec_->eos_ids.begin(), spec_->eos_ids.end(), id) != spec_->eos_ids.end();
     if (eos) staged.state.terminal = true;
-    else if (p.state.reasoning) {
+    else if (prior.reasoning) {
         if (force) {
             staged.state.forced_ids.push_back(id);
             if (staged.state.forced_ids.size() == spec_->thinking->closure_ids.size()) staged.state.reasoning = false;
         } else if (spec_->end_thinking_id == id) staged.state.reasoning = false;
         else ++staged.state.reasoning_tokens;
-    } else if (spec_->program) staged.state.cursor = advance_token(p.state.cursor, tokenizer_->token_bytes(id));
+    } else if (spec_->program) staged.state.cursor = advance_token(prior.cursor, tokenizer_->token_bytes(id));
+}
+bool ConstraintSelection::admits(const State& state, std::uint32_t id) const {
+    // prepare(): the walk admits trie tokens whose bytes all advance the cursor, EOS IDs are then set to
+    // cursor.complete(), and the end-of-thinking ID is cleared last.
+    if (spec_->end_thinking_id && *spec_->end_thinking_id == id) return false;
+    if (std::find(spec_->eos_ids.begin(), spec_->eos_ids.end(), id) != spec_->eos_ids.end()) return state.cursor.complete();
+    if (!trie_->contains(id)) return false;
+    auto cursor = state.cursor;
+    for (unsigned char b : tokenizer_->token_bytes(id)) if (!cursor.advance(b)) return false;
+    return true;
+}
+std::optional<ConstraintSelection::Staged> ConstraintSelection::select_known(const State& state, std::uint32_t token, std::uint32_t status) const {
+    // A nonfinite row, a terminal state and score or transform requests take the full-row path (its errors and
+    // their order stay those of prepare()/select()).
+    if (!argmax_first_ || status != 0 || token >= trie_->vocab_size() || state.terminal || spec_->logprobs || spec_->transform.active())
+        return std::nullopt;
+    const bool force = state.reasoning && spec_->thinking && state.reasoning_tokens >= spec_->thinking->reasoning_limit;
+    std::uint32_t id = token;
+    if (force) id = spec_->thinking->closure_ids.at(state.forced_ids.size());
+    else if (!state.reasoning && spec_->program && !admits(state, token)) return std::nullopt;
+    ++profile_.known_rows;
+    Staged staged{id, state, force, {id, {}, {}, force}};
+    advance(staged, state, force);
     return staged;
 }
 void ConstraintSelection::commit(const Staged& staged) {
@@ -156,6 +193,18 @@ private:
     bool published_ = false;
 };
 
+ConstraintSelection::Staged ConstraintSelection::select_row(std::span<const float> row, const State& state) const {
+    if (argmax_first_ && row.size() == trie_->vocab_size() && !row.empty()) {
+        // The host form of the device reduction: lowest-ID maximum (both zeros equal), status 1 on any nonfinite.
+        std::uint32_t best = 0, status = 0;
+        for (std::uint32_t i = 0; i < row.size(); ++i) {
+            if (!std::isfinite(row[i])) { status = 1; break; }
+            if (row[i] > row[best]) best = i;
+        }
+        if (auto known = select_known(state, best, status)) return std::move(*known);
+    }
+    return select(row, prepare(state));
+}
 std::unique_ptr<MtpSelectionTransaction> ConstraintSelection::window_transaction() {
     return std::make_unique<ConstraintWindowSelection>(shared_from_this());
 }
@@ -173,10 +222,20 @@ void ConstraintWindowSelection::reset() {
 void ConstraintWindowSelection::discard() noexcept { records_.clear(); branch_.reset(); base_.reset(); }
 std::uint32_t ConstraintWindowSelection::select(std::span<const float> row) try {
     if (!branch_) throw ConstraintError("inactive constraint window");
-    auto staged = selection_->select(row, selection_->prepare(*branch_));
+    auto staged = selection_->select_row(row, *branch_);
     auto next = staged.state;
     const auto id = staged.token;
     records_.push_back(std::move(staged));
+    *branch_ = std::move(next);
+    return id;
+} catch(const ConstraintError& e) {throw MtpSelectionError(e.what());}
+std::optional<std::uint32_t> ConstraintWindowSelection::select_known(std::uint32_t token, std::uint32_t status) try {
+    if (!branch_) throw ConstraintError("inactive constraint window");
+    auto staged = selection_->select_known(*branch_, token, status);
+    if (!staged) return std::nullopt;
+    auto next = staged->state;
+    const auto id = staged->token;
+    records_.push_back(std::move(*staged));
     *branch_ = std::move(next);
     return id;
 } catch(const ConstraintError& e) {throw MtpSelectionError(e.what());}
@@ -190,6 +249,9 @@ std::unique_ptr<MtpSelectionReceipt> ConstraintWindowSelection::seal() {
 
 ConstraintVerdict ConstraintSelection::verdict(std::string finish, std::string execution) const {
     ConstraintVerdict v;
+    v.profile_rows = profile_.rows; v.profile_window_rows = profile_.window_rows; v.profile_known_rows = profile_.known_rows;
+    v.profile_mask_ms = static_cast<double>(profile_.mask_ns) / 1e6; v.profile_select_ms = static_cast<double>(profile_.select_ns) / 1e6;
+    v.profile_window_row_ms = static_cast<double>(profile_.window_row_ns) / 1e6;
     v.reasoning_tokens = state_.reasoning_tokens;
     v.forced_ids = state_.forced_ids;
     v.closure = state_.forced_ids.empty() ? "natural" : "forced";
