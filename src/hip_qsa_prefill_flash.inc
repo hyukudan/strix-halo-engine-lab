@@ -26,8 +26,10 @@ constexpr unsigned kScoreRows = 16U, kScoreWaves = 8U; // engine geometry: rows 
 // registers across 32 / 64 query rows instead of 16. Every score is the same lane's block_score of the same row and key
 // with the same guard (row range per row, key range per 32-block wave tile), so the bits do not depend on RowsPerCta.
 // auto: 32 rows once a call scores more than kScoreRowsAutoBlocks blocks (deep chunks, where the keys of a group
-// outgrow the cache), 16 below (measured: 32 rows lose 5-10 % on calls of <= 4096 blocks).
-constexpr unsigned kScoreRowsAuto = 1U, kScoreRowsAutoBlocks = 4096U;
+// outgrow the cache), 16 below (measured: 32 rows lose 5-10 % on calls of <= 4096 blocks); 64 rows from
+// kScoreRowsAuto64Blocks (beyond the native context; tests/qsa_score_rows.hip, T8192: 65536 blocks -7 % vs 32 rows,
+// 129024 / 262144 blocks -6 % / -8 %), unless STRIX_QSA_SCORE_ROWS64=0.
+constexpr unsigned kScoreRowsAuto = 1U, kScoreRowsAutoBlocks = 4096U, kScoreRowsAuto64Blocks = 65536U;
 inline unsigned score_rows_mode() {
     static const unsigned rows = [] {
         const char* v = std::getenv("STRIX_QPF2K_SCORE_ROWS");
@@ -39,7 +41,9 @@ inline unsigned score_rows_mode() {
 }
 inline unsigned score_rows(std::uint32_t max_blocks) {
     const unsigned mode = score_rows_mode();
-    return mode != kScoreRowsAuto ? mode : max_blocks > kScoreRowsAutoBlocks ? 32U : kScoreRows;
+    if (mode != kScoreRowsAuto) return mode;
+    if (max_blocks >= kScoreRowsAuto64Blocks && qpf2k::long_context_item_enabled("STRIX_QSA_SCORE_ROWS64")) return 64U;
+    return max_blocks > kScoreRowsAutoBlocks ? 32U : kScoreRows;
 }
 constexpr unsigned kGroup = 4U; // blocks per selection group (score_kernel maxima, select_kernel)
 typedef __attribute__((address_space(4))) const float* uniform_ptr;
@@ -161,8 +165,11 @@ template <unsigned Rows> struct ScoreGroup {
     std::uint32_t blocks, maxima_stride;
     float* maxima;
 };
-template <unsigned Rows, unsigned RowsPerCta, unsigned W, bool Stats = false, bool QueryLds = false, bool Fence = true, unsigned RowUnroll = 1U, bool Batch = false>
-__global__ __launch_bounds__(W * 32U) void score_kernel(QsaRowsScoreViews<Rows> single, const float* pooled_keys,
+// Packed: pooled_keys holds the pool's packed BF16 copy (u16 per feature, block_pool_kernel's packed_keys); each key is
+// widened back to the identical float, so every product, tree and guard is unchanged and the key reads halve.
+template <unsigned Rows, unsigned RowsPerCta, unsigned W, bool Stats = false, bool QueryLds = false, bool Fence = true, unsigned RowUnroll = 1U, bool Batch = false,
+    bool Packed = false>
+__global__ __launch_bounds__(W * 32U) void score_kernel(QsaRowsScoreViews<Rows> single, const void* pooled_keys,
     std::uint32_t scored_blocks, std::uint32_t head_dim, float* maxima, std::uint32_t maxima_stride, const uint2* key_ranges,
     std::uint32_t* stats = nullptr, const ScoreGroup<Rows>* groups = nullptr) {
     const auto& views = [&]() -> const QsaRowsScoreViews<Rows>& {
@@ -204,8 +211,22 @@ __global__ __launch_bounds__(W * 32U) void score_kernel(QsaRowsScoreViews<Rows> 
     if (base >= scored_blocks) return;
     const unsigned b = base + lane;
     float k[kDim];
-    {
-        const auto* key = reinterpret_cast<const float4*>(pooled_keys + static_cast<std::uint64_t>(b < scored_blocks ? b : scored_blocks - 1U) * kDim);
+    if constexpr (Packed) {
+        const auto* key = reinterpret_cast<const uint4*>(static_cast<const std::uint16_t*>(pooled_keys) +
+            static_cast<std::uint64_t>(b < scored_blocks ? b : scored_blocks - 1U) * kDim);
+#pragma unroll
+        for (unsigned i = 0; i < kDim / 8U; ++i) {
+            const uint4 x = key[i];
+            const unsigned words[4] = {x.x, x.y, x.z, x.w};
+#pragma unroll
+            for (unsigned j = 0; j < 4U; ++j) {
+                k[8U * i + 2U * j] = __uint_as_float(words[j] << 16U);
+                k[8U * i + 2U * j + 1U] = __uint_as_float(words[j] & 0xffff0000U);
+            }
+        }
+    } else {
+        const auto* key = reinterpret_cast<const float4*>(static_cast<const float*>(pooled_keys) +
+            static_cast<std::uint64_t>(b < scored_blocks ? b : scored_blocks - 1U) * kDim);
 #pragma unroll
         for (unsigned i = 0; i < kDim / 4U; ++i) {
             const float4 x = key[i];
@@ -372,6 +393,20 @@ struct SelectRow { float* scores; std::uint32_t* selected; const float* maxima; 
 __global__ __launch_bounds__(kSelectThreads) void select_batch_kernel(const SelectRow* rows, std::uint32_t compress_ratio, std::uint32_t block_topk) {
     const SelectRow row = rows[blockIdx.x];
     select_row_body<false>(row.scores, row.selected, row.visible, row.maxima, compress_ratio, block_topk, nullptr);
+}
+// One serial decode row (STRIX_QSA_DECODE_SELECT): the 4-block group maxima of a finished score row, with score_kernel's
+// expression fmaxf(fmaxf(s0, s1), fmaxf(s2, s3)) and -inf past the row's blocks, then select_row_body over them.
+__global__ __launch_bounds__(256) void row_maxima_kernel(const float* scores, std::uint32_t blocks, float* maxima) {
+    const auto g = static_cast<std::uint32_t>(blockIdx.x) * 256U + threadIdx.x;
+    if (g >= (blocks + kGroup - 1U) / kGroup) return;
+    float s[kGroup];
+#pragma unroll
+    for (unsigned i = 0; i < kGroup; ++i) s[i] = kGroup * g + i < blocks ? scores[kGroup * g + i] : -INFINITY;
+    maxima[g] = fmaxf(fmaxf(s[0], s[1]), fmaxf(s[2], s[3]));
+}
+__global__ __launch_bounds__(kSelectThreads) void select_one_kernel(float* scores, std::uint32_t* selected, std::uint32_t visible,
+    const float* maxima, std::uint32_t compress_ratio, std::uint32_t block_topk) {
+    select_row_body<false>(scores, selected, visible, maxima, compress_ratio, block_topk, nullptr);
 }
 // STRIX_QPF2K_QSA_TRACE=1 (diagnostic, independent of STRIX_QPF2K_QSA): order-independent 64-bit hashes of every prefill
 // row's block scores before and after selection, its selected token list and its attention output, summed over the

@@ -680,6 +680,36 @@ int main(int argc, char** arguments) {
     expect(!baseline_absent.admitted && baseline_absent.options.numerical_profile == DecodeNumericalProfile::exact_v5 &&
         !baseline_absent.options.prefill_numerical_profile && baseline_absent.options.context_tokens == request.options.context_tokens,
         "baseline never forces dense-A8 or grows context when model/build admission fails");
+    {
+        // Serial decode pool route: plain append-only CLI only; every multi-request or rewriting route is excluded.
+        const auto route = [&](std::vector<std::string> extra) {
+            std::vector<std::string> args{"decoder","target.gguf","1","2","3","--generate","4"};
+            args.insert(args.end(), extra.begin(), extra.end());
+            return qsa_decode_pool_route(parse(args), false);
+        };
+        expect(route({}), "decode pool on for the plain CLI route");
+        expect(!qsa_decode_pool_route(parse({"decoder","target.gguf","1","2","3","--generate","4"}), true), "decode pool off for GSQ models");
+        auto cached = parse({"decoder","target.gguf","1","2","3","--generate","4"});
+        cached.prefix_cache_host_bytes = UINT64_C(1) << 30U;
+        expect(!qsa_decode_pool_route(cached, false), "decode pool off with the prefix state cache");
+        cached.prefix_cache_host_bytes = 0U;
+        cached.prefix_cache_then_prompts = {"4,5,6"};
+        expect(!qsa_decode_pool_route(cached, false), "decode pool off for follow-up prefix-cache prompts");
+        expect(!route({"--baseline"}), "decode pool off with --baseline");
+        ::setenv("STRIX_QSA_DECODE_POOL", "0", 1);
+        expect(!route({}), "STRIX_QSA_DECODE_POOL=0 disables the decode pool");
+        ::unsetenv("STRIX_QSA_DECODE_POOL");
+        ::setenv("STRIX_QPF2K_DEFAULTS", "0", 1);
+        expect(!route({}), "STRIX_QPF2K_DEFAULTS=0 disables the decode pool");
+        ::unsetenv("STRIX_QPF2K_DEFAULTS");
+        auto sized = parse({"decoder","target.gguf","1","2","3","--generate","4"});
+        sized.context_tokens = 262144U;
+        expect(qsa_decode_pool_bytes(sized, model) == UINT64_C(12) * 65536U * 128U * 4U + 16384U * 4U,
+            "decode pool bytes at 262144: 12 layers x 65536 blocks x 512 B + the maxima row");
+        sized.context_tokens = 1048576U;
+        expect(qsa_decode_pool_bytes(sized, model) == UINT64_C(12) * 262144U * 128U * 4U + 65536U * 4U,
+            "decode pool bytes at 1048576: 1.5 GiB + 256 KiB maxima");
+    }
     std::cout << "qwen effective config: " << failures << " failures\n";
     return failures ? 1 : 0;
 }

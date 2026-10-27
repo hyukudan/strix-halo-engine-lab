@@ -10,6 +10,8 @@
 // Data: BF16-valued pooled keys and index queries (pseudo-normal), with edge values outside the fused-form
 // guard (tiny, huge, subnormal, inf, NaN, -0) in some query rows and some key blocks, all-zero query rows and
 // all-zero key blocks, so both guard forms run.
+// Packed arms (STRIX_QSA_POOL_PACKED): the same scorer reading the pool's packed BF16 copy (score_kernel<..., Packed>),
+// R = 16 / 32 / 64, must equal the FP32-key R = 16 arm byte for byte too, and join the timing rounds.
 #include "qsa_flash_prod.inc"
 using namespace strix;
 static void check(hipError_t e, const char* what) { if (e != hipSuccess) { std::fprintf(stderr, "%s: %s\n", what, hipGetErrorString(e)); std::exit(2); } }
@@ -50,14 +52,17 @@ int main(int argc, char** argv) {
         for (auto& x : keys) x = bf(nd());
         // key edge blocks: every 997th block one edge value, every 4093rd block all zero
         for (std::uint64_t b = 0; b < blocks_max; b += 997U) keys[b * dim + (b * 13U) % dim] = bf(edge[(b / 997U) % 8U]);
-        for (std::uint64_t b = 1; b < blocks_max; b += 4093U) std::fill_n(keys.begin() + b * dim, dim, 0.0F);
+        for (std::uint64_t b = 1; b < blocks_max; b += 4093U) std::fill_n(keys.begin() + static_cast<std::ptrdiff_t>(b * dim), dim, 0.0F);
         std::vector<float> q(T * heads * dim);
         for (auto& x : q) x = bf(nd());
         for (std::uint64_t g = 0; g < groups; ++g) {
             for (unsigned e = 0; e < 8U; ++e) q[(g * 64U + 5U + 7U * e) * heads * dim + (e * 37U) % (heads * dim)] = bf(edge[e]);
-            if (g % 8U == 0U) std::fill_n(q.begin() + (g * 64U + 3U) * heads * dim, heads * dim, 0.0F);
+            if (g % 8U == 0U) std::fill_n(q.begin() + static_cast<std::ptrdiff_t>((g * 64U + 3U) * heads * dim), heads * dim, 0.0F);
         }
         auto* d_k = dalloc<float>(keys.size()); check(hipMemcpy(d_k, keys.data(), keys.size() * 4, hipMemcpyHostToDevice), "h2d keys");
+        std::vector<std::uint16_t> packed(keys.size());
+        for (std::size_t i = 0; i < keys.size(); ++i) { std::uint32_t b; std::memcpy(&b, &keys[i], 4); packed[i] = static_cast<std::uint16_t>(b >> 16U); }
+        auto* d_p = dalloc<std::uint16_t>(packed.size()); check(hipMemcpy(d_p, packed.data(), packed.size() * 2, hipMemcpyHostToDevice), "h2d packed");
         auto* d_q = dalloc<float>(q.size()); check(hipMemcpy(d_q, q.data(), q.size() * 4, hipMemcpyHostToDevice), "h2d q");
         auto* d_r = dalloc<uint2>(blocks_max);
         if (blocks_max)
@@ -79,7 +84,7 @@ int main(int argc, char** argv) {
         }
         std::printf("P %llu L %llu blocks_max %llu max_blocks %u pairs %.4e\n", (unsigned long long)P, (unsigned long long)L,
             (unsigned long long)blocks_max, max_blocks, static_cast<double>(pairs));
-        if (!max_blocks) { std::printf("  no scored rows\n"); check(hipFree(d_k), "free"); check(hipFree(d_q), "free"); check(hipFree(d_r), "free"); continue; }
+        if (!max_blocks) { std::printf("  no scored rows\n"); check(hipFree(d_k), "free"); check(hipFree(d_p), "free"); check(hipFree(d_q), "free"); check(hipFree(d_r), "free"); continue; }
         struct Arm { float* scores; float* maxima; std::uint32_t* stats; qsa_flash::ScoreGroup<64U>* d; };
         const auto make = [&] {
             Arm a{dalloc<float>(T * stride), dalloc<float>(maxima_count + 1U), dalloc<std::uint32_t>(qsa_flash::kStats), nullptr};
@@ -92,23 +97,31 @@ int main(int argc, char** argv) {
             check(hipMemcpy(a.d, d.data(), groups * sizeof(d[0]), hipMemcpyHostToDevice), "h2d desc");
             return a;
         };
-        Arm arm[3] = {make(), make(), make()};
-        const auto launch = [&]<unsigned R, bool Stats>(const Arm& a) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<64U, R, W, Stats, false, true, 1U, true>),
+        constexpr unsigned kArms = 6U;
+        const char* names[kArms] = {"R16", "R32", "R64", "R16P", "R32P", "R64P"};
+        Arm arm[kArms] = {make(), make(), make(), make(), make(), make()};
+        const auto launch = [&]<unsigned R, bool Stats, bool Packed>(const Arm& a) {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<64U, R, W, Stats, false, true, 1U, true, Packed>),
                 dim3(((max_blocks + 31U) / 32U + W - 1U) / W, 64U / R, static_cast<std::uint32_t>(groups)), dim3(W * 32U), 0, s,
-                QsaRowsScoreViews<64U>{}, d_k, 0U, dim, nullptr, 0U, d_r, Stats ? a.stats : nullptr, a.d);
+                QsaRowsScoreViews<64U>{}, Packed ? static_cast<const void*>(d_p) : static_cast<const void*>(d_k), 0U, dim, nullptr, 0U, d_r,
+                Stats ? a.stats : nullptr, a.d);
         };
         const auto run = [&]<bool Stats>(unsigned which) {
-            if (which == 0) launch.template operator()<16U, Stats>(arm[0]);
-            else if (which == 1) launch.template operator()<32U, Stats>(arm[1]);
-            else launch.template operator()<64U, Stats>(arm[2]);
+            switch (which) {
+            case 0: launch.template operator()<16U, Stats, false>(arm[0]); break;
+            case 1: launch.template operator()<32U, Stats, false>(arm[1]); break;
+            case 2: launch.template operator()<64U, Stats, false>(arm[2]); break;
+            case 3: launch.template operator()<16U, Stats, true>(arm[3]); break;
+            case 4: launch.template operator()<32U, Stats, true>(arm[4]); break;
+            default: launch.template operator()<64U, Stats, true>(arm[5]); break;
+            }
         };
         // exact gate
         for (auto& a : arm) {
             check(hipMemsetAsync(a.scores, 0xA5, T * stride * 4, s), "canary"); check(hipMemsetAsync(a.maxima, 0xA5, (maxima_count + 1U) * 4, s), "canary");
             check(hipMemsetAsync(a.stats, 0, qsa_flash::kStats * 4, s), "stats");
         }
-        for (unsigned w = 0; w < 3U; ++w) run.template operator()<true>(w);
+        for (unsigned w = 0; w < kArms; ++w) run.template operator()<true>(w);
         check(hipGetLastError(), "launch"); check(hipStreamSynchronize(s), "sync");
         std::vector<std::uint32_t> base_s(T * stride), base_m(maxima_count + 1U), base_st(qsa_flash::kStats), x;
         check(hipMemcpy(base_s.data(), arm[0].scores, base_s.size() * 4, hipMemcpyDeviceToHost), "d2h");
@@ -124,7 +137,7 @@ int main(int argc, char** argv) {
             static_cast<double>(pairs), (unsigned long long)nan_scores, base_st[qsa_flash::kFused], base_st[qsa_flash::kSeparate]);
         bool ok = written == pairs && base_st[qsa_flash::kFused] > 0U && base_st[qsa_flash::kSeparate] > 0U;
         if (!ok) std::printf("  FAIL baseline witness (written != pairs or a guard form never ran)\n");
-        for (unsigned w = 1; w < 3U; ++w) {
+        for (unsigned w = 1; w < kArms; ++w) {
             std::uint64_t ds = 0, dm = 0, dst = 0;
             x.resize(base_s.size()); check(hipMemcpy(x.data(), arm[w].scores, x.size() * 4, hipMemcpyDeviceToHost), "d2h");
             for (std::size_t i = 0; i < x.size(); ++i) ds += x[i] != base_s[i];
@@ -132,8 +145,8 @@ int main(int argc, char** argv) {
             for (std::size_t i = 0; i < x.size(); ++i) dm += x[i] != base_m[i];
             x.resize(base_st.size()); check(hipMemcpy(x.data(), arm[w].stats, x.size() * 4, hipMemcpyDeviceToHost), "d2h");
             for (std::size_t i = 0; i < x.size(); ++i) dst += x[i] != base_st[i];
-            std::printf("  R%u vs R16: score words differ %llu of %llu, maxima words differ %llu of %llu, guard counters differ %llu\n",
-                w == 1 ? 32U : 64U, (unsigned long long)ds, (unsigned long long)base_s.size(), (unsigned long long)dm,
+            std::printf("  %s vs R16: score words differ %llu of %llu, maxima words differ %llu of %llu, guard counters differ %llu\n",
+                names[w], (unsigned long long)ds, (unsigned long long)base_s.size(), (unsigned long long)dm,
                 (unsigned long long)base_m.size(), (unsigned long long)dst);
             ok = ok && ds == 0 && dm == 0 && dst == 0;
         }
@@ -144,10 +157,10 @@ int main(int argc, char** argv) {
                 check(hipEventRecord(e0, s), "rec"); run.template operator()<false>(which); check(hipEventRecord(e1, s), "rec");
                 check(hipEventSynchronize(e1), "sync"); float ms = 0; check(hipEventElapsedTime(&ms, e0, e1), "elapsed"); return ms;
             };
-            for (unsigned w = 0; w < 3U; ++w) { timed(w); timed(w); } // warm
-            std::vector<float> aa0, aa1, t[3];
+            for (unsigned w = 0; w < kArms; ++w) { timed(w); timed(w); } // warm
+            std::vector<float> aa0, aa1, t[kArms];
             for (unsigned r = 0; r < rounds; ++r) { aa0.push_back(timed(0)); aa1.push_back(timed(0)); }
-            const unsigned order[6] = {0, 1, 2, 2, 1, 0};
+            const unsigned order[2U * kArms] = {0, 1, 2, 3, 4, 5, 5, 4, 3, 2, 1, 0};
             for (unsigned r = 0; r < rounds; ++r) for (unsigned o : order) t[o].push_back(timed(o));
             check(hipGetLastError(), "timed launch");
             const auto med = [](std::vector<float> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
@@ -155,12 +168,12 @@ int main(int argc, char** argv) {
             const auto hi = [](const std::vector<float>& v) { return *std::max_element(v.begin(), v.end()); };
             const float m0 = med(t[0]);
             std::printf("  A/A R16 med %.3f / %.3f ms (%.2f %%)\n", med(aa0), med(aa1), 100.0 * (med(aa1) - med(aa0)) / med(aa0));
-            for (unsigned w = 0; w < 3U; ++w)
-                std::printf("  R%-2u med %8.3f ms  min %8.3f  max %8.3f  vs R16 %+6.2f %%  (n %zu)\n", w == 0 ? 16U : w == 1 ? 32U : 64U,
+            for (unsigned w = 0; w < kArms; ++w)
+                std::printf("  %-4s med %8.3f ms  min %8.3f  max %8.3f  vs R16 %+6.2f %%  (n %zu)\n", names[w],
                     med(t[w]), lo(t[w]), hi(t[w]), 100.0 * (med(t[w]) - m0) / m0, t[w].size());
         }
         for (auto& a : arm) { check(hipFree(a.scores), "free"); check(hipFree(a.maxima), "free"); check(hipFree(a.stats), "free"); check(hipFree(a.d), "free"); }
-        check(hipFree(d_k), "free"); check(hipFree(d_q), "free"); check(hipFree(d_r), "free");
+        check(hipFree(d_k), "free"); check(hipFree(d_p), "free"); check(hipFree(d_q), "free"); check(hipFree(d_r), "free");
     }
     std::printf("%s\n", failures ? "RESULT FAIL" : "RESULT PASS");
     return failures ? 1 : 0;

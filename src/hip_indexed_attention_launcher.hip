@@ -2898,6 +2898,14 @@ struct PreparedIndexedSelection {
     std::uint32_t visible, ratio, block_topk, complete_blocks, selected_count;
     GraphSelectionArguments dynamic_selection;
 };
+// Eager serial step with HipIndexedAttentionLauncherConfig::decode_pool: block scores from the persistent pooled keys
+// (defined after HipQsaWindowPool). False when the pool cannot serve this step; the caller then runs block_score_kernel.
+bool qsa_decode_pool_scores(const PreparedIndexedLaunch& a, const HipIndexedAttentionLauncherConfig& config, std::uint64_t position,
+    std::uint32_t complete_blocks, std::uint32_t ratio);
+// After qsa_decode_pool_scores: the selection from the scores' 4-block group maxima (qsa_flash::select_row_body, the
+// selected set, order and -inf writes of select_blocks_kernel). False when not enabled or no maxima scratch.
+bool qsa_decode_pool_select(const PreparedIndexedLaunch& a, const HipIndexedAttentionLauncherConfig& config,
+    const PreparedIndexedSelection& selection);
 
 PreparedIndexedLaunch prepare_indexed_attention_launch(
     const ExecutionDispatchContext& context, const HipIndexedAttentionLauncherConfig* config_ptr) {
@@ -3506,6 +3514,9 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
                 "HIP hierarchical QSA local status reset");
             score_selection.position.status = workspace.selection_status;
         }
+        const bool decode_pooled = !device_graph && !config.qsa_hierarchical_selection && config.decode_pool &&
+            qsa_decode_pool_scores(prepared, config, context.position, complete_blocks, ratio);
+        if (!decode_pooled)
         launch_block_scores(
             workspace,
             raw_state,
@@ -3527,7 +3538,7 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
                 config.selection_stats->submissions.fetch_add(1, std::memory_order_relaxed);
                 config.selection_stats->layer_submissions[*context.layer].fetch_add(1, std::memory_order_relaxed);
             }
-        } else {
+        } else if (!decode_pooled || !qsa_decode_pool_select(prepared, config, selection)) {
         hipLaunchKernelGGL(
             select_blocks_kernel,
             dim3(1),
@@ -5346,6 +5357,10 @@ bool qsa_attend_batch_enabled() {
     static const bool enabled = [] { const char* v = std::getenv("STRIX_QSA_ATTEND_BATCH"); return v && v[0] == '1'; }();
     return !qpf2k::suppressed(qpf2k::Item::attend_batch) && enabled;
 }
+// STRIX_QSA_UNION_MERGE (default on; =0 or the baseline keeps the range form): the attend union of a row tile
+// is built by merging the rows' ascending selections (qsa_fast::union_merge), so its cost no longer grows with
+// the visible block range. Same (block, mask) pairs, order and token counts.
+bool qsa_union_merge_enabled() { return qpf2k::long_context_item_enabled("STRIX_QSA_UNION_MERGE"); }
 // STRIX_QSA_FAST_STATS=1 (diagnostic): counts of the fast prefill / fused tail launch kinds, printed on stderr at exit
 // ("qsa launch stats ..."), so gates can show which path ran (e.g. kv-int8 fast attend, no int8 group in the attend batch).
 struct QsaLaunchStats {
@@ -5390,8 +5405,19 @@ void qsa_fast_batch_flush(hipStream_t stream) {
     if (auto* stats = qsa_launch_stats()) stats->batch_groups.fetch_add(b.groups.size(), std::memory_order_relaxed);
     const auto n = static_cast<std::uint32_t>(b.groups.size());
     constexpr unsigned TR = 4U, G = 3U, HG = G * (16U / TR);
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<64U, TR>), dim3(n * (64U / TR)), dim3(256), 0, stream,
-        slot.views, b.union_at);
+    // The merge-capable kernel only where some tile can reach the merge threshold: below it that kernel runs the range
+    // form with the merge form's larger LDS footprint (lower occupancy).
+    const bool merge_reachable = [&] {
+        for (const auto& g : b.groups)
+            for (const auto visible : g.visible) if ((visible + 3U) / 4U > qsa_fast::kMergeMinBlocks) return true;
+        return false;
+    }();
+    if (merge_reachable && qsa_union_merge_enabled())
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<64U, TR, true>), dim3(n * (64U / TR)), dim3(256), 0, stream,
+            slot.views, b.union_at);
+    else
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_multi_kernel<64U, TR, false>), dim3(n * (64U / TR)), dim3(256), 0, stream,
+            slot.views, b.union_at);
     // STRIX_QPF2K_QSA bit 5: the batch's KV prefix (tokens [0, max visible)) converted once to FP16 with the loaders'
     // bf16x2_to_f16x2 (same bits), then the attend without per-chunk conversion (qsa_fast::attend_shadow_multi_kernel).
     // Memory: one layer's prefix, 4 x kv_heads x 256 bytes per token (2 KiB with 2 KV heads: 64 MiB at 32K, 256 MiB at
@@ -5493,7 +5519,14 @@ bool launch_qsa_fast_prefill(const QsaKnownRows<Rows>& prepared, const PreparedI
             }
         }
         need_selections();
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_kernel<Rows, TR>), dim3(Rows / TR), dim3(256), 0, stream, views, union_at);
+        const bool merge_reachable = [&] {
+            for (unsigned r = 0; r < Rows; ++r) if ((views.visible[r] + 3U) / 4U > qsa_fast::kMergeMinBlocks) return true;
+            return false;
+        }();
+        if (merge_reachable && qsa_union_merge_enabled())
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_kernel<Rows, TR, true>), dim3(Rows / TR), dim3(256), 0, stream, views, union_at);
+        else
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_kernel<Rows, TR, false>), dim3(Rows / TR), dim3(256), 0, stream, views, union_at);
         count_qsa_launch(Int8 ? &QsaLaunchStats::fast_int8 : &QsaLaunchStats::fast_f16);
         hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_kernel<Rows, TR, G, 3U, Int8>), dim3(Rows / TR, a.kv_heads * (per_kv / HG), splits),
             dim3((2U * G + 4U) * 32U), 0, stream, views, reinterpret_cast<const std::uint16_t*>(a.kv_state.address), a.kv_heads, heads, union_at, splits, 0U);
@@ -5511,8 +5544,17 @@ bool launch_qsa_fast_prefill(const QsaKnownRows<Rows>& prepared, const PreparedI
 // raw keys this call's groups and the earlier context left; keys has room for capacity blocks.
 struct QsaPrefillPool {
     float* keys = nullptr;
+    // STRIX_QSA_POOL_PACKED=1 (prefill pool, opt-in; the baseline keeps it off): the same keys as BF16 bits, written by
+    // the pool kernels together with keys and read by qsa_flash::score_kernel instead of them (half the key reads, same
+    // bits). Off by default: with 32/64 rows per CTA the scorer is arithmetic-bound and the widening costs more than the
+    // reads save (tests/qsa_score_rows.hip: +3-4 % at <= 32768 blocks, -3 % at 129024 / 262144 vs 32 rows, +5 % vs 64).
+    std::uint16_t* packed = nullptr;
     std::uint32_t capacity = 0, valid = 0;
 };
+bool qsa_pool_packed_enabled() {
+    static const bool enabled = [] { const char* v = std::getenv("STRIX_QSA_POOL_PACKED"); return v && v[0] == '1'; }();
+    return !qpf2k::baseline && enabled;
+}
 
 // parts: 1 input projections, 2 norm/store/selection/attention, 4 output projection. Rows > 8
 // (prefill groups of 8-row tiles) store every row's index key and K/V before any row selects
@@ -5708,7 +5750,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                         dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream,
                         reinterpret_cast<const std::uint16_t*>(a.raw_state.address), pool->valid, a.index_dim, s0.ratio,
                         reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address), model.rms_norm_epsilon, rotary,
-                        model.rope_theta, pool->keys);
+                        model.rope_theta, pool->keys, nullptr, 0U, pool->packed);
                 });
                 check_hip(hipGetLastError(), "QSA prefill block-pool launch");
                 // STRIX_QPF2K_QSA bit 0: the new blocks' magnitude ranges for the scorer's guard.
@@ -5735,7 +5777,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                 if constexpr (Rows >= 16U) if (!cohort_slot && (qpf2k_qsa_mask() & 1U) && [&] {
                         for (unsigned r = 0; r < Rows; ++r) if (reinterpret_cast<std::uintptr_t>(scores.index_query[r]) % 16U) return false;
                         return true; }()) {
-                    constexpr unsigned RowsPerCta = Rows < qsa_flash::kScoreRows ? Rows : qsa_flash::kScoreRows, W = qsa_flash::kScoreWaves;
+                    constexpr unsigned W = qsa_flash::kScoreWaves;
                     const unsigned tiles = (scored_blocks + 31U) / 32U;
                     // Bit 1: the group maxima for qsa_flash::select_kernel (one group's rows at a time: stream order).
                     float* maxima = nullptr;
@@ -5774,9 +5816,25 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                         qpf2k_maxima = buffer;
                     }
                     qpf2k_launch_score.fetch_add(1U, std::memory_order_relaxed);
-                    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, RowsPerCta, W>), dim3((tiles + W - 1U) / W, Rows / RowsPerCta),
-                        dim3(W * 32U), 0, stream, scores, static_cast<const float*>(pool->keys), scored_blocks, a.index_dim, maxima, maxima_stride,
-                        static_cast<const uint2*>(qpf2k_key_ranges(pool->capacity)));
+                    const auto launch = [&]<unsigned RowsPerCta>() {
+                        if (pool->packed)
+                            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, RowsPerCta, W, false, false, true, 1U, false, true>),
+                                dim3((tiles + W - 1U) / W, Rows / RowsPerCta), dim3(W * 32U), 0, stream, scores, static_cast<const void*>(pool->packed),
+                                scored_blocks, a.index_dim, maxima, maxima_stride, static_cast<const uint2*>(qpf2k_key_ranges(pool->capacity)));
+                        else
+                            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, RowsPerCta, W>), dim3((tiles + W - 1U) / W, Rows / RowsPerCta),
+                                dim3(W * 32U), 0, stream, scores, static_cast<const float*>(pool->keys), scored_blocks, a.index_dim, maxima, maxima_stride,
+                                static_cast<const uint2*>(qpf2k_key_ranges(pool->capacity)));
+                    };
+                    // 64-row groups use the stage batch's rows-per-CTA policy (qsa_flash::score_rows): this path scores every group above
+                    // 65536 blocks, where the stage batch declines. Same bits for every RowsPerCta (tests/qsa_score_rows.hip).
+                    constexpr unsigned BaseRows = Rows < qsa_flash::kScoreRows ? Rows : qsa_flash::kScoreRows;
+                    if constexpr (Rows == 64U) {
+                        const auto rows = qsa_flash::score_rows(scored_blocks);
+                        if (rows == 64U) launch.template operator()<64U>();
+                        else if (rows == 32U) launch.template operator()<32U>();
+                        else launch.template operator()<BaseRows>();
+                    } else launch.template operator()<BaseRows>();
                     qpf2k_maxima_row_stride = maxima_stride;
                     return;
                 }
@@ -6497,11 +6555,18 @@ void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const 
             if (pool_storage.keys) {
                 check_hip(hipStreamSynchronize(hip_execution_stream()), "QSA prefill block-pool resize sync");
                 check_hip(hipFree(pool_storage.keys), "QSA prefill block-pool free");
+                if (pool_storage.packed) check_hip(hipFree(pool_storage.packed), "QSA prefill packed block-pool free");
                 pool_storage = {};
             }
             void* keys = nullptr;
             check_hip(hipMalloc(&keys, static_cast<std::uint64_t>(blocks) * a.index_dim * sizeof(float)), "QSA prefill block-pool allocation");
             pool_storage.keys = static_cast<float*>(keys);
+            if (qsa_pool_packed_enabled()) {
+                void* packed = nullptr;
+                check_hip(hipMalloc(&packed, static_cast<std::uint64_t>(blocks) * a.index_dim * sizeof(std::uint16_t)),
+                    "QSA prefill packed block-pool allocation");
+                pool_storage.packed = static_cast<std::uint16_t*>(packed);
+            }
             pool_storage.capacity = blocks;
         }
         pool_storage.valid = 0;
@@ -6687,6 +6752,8 @@ void indexed_attention_known_window_rows_preflight(std::span<const ExecutionDisp
 // This cache belongs to one eager owner, never to an address-keyed process singleton.
 // The committed prefix is immutable until the owner's explicit discard/reset.
 class HipQsaWindowPool {
+    // false: per-entry allocations whose failure returns no pool (the serial decode pool).
+    bool slab_allowed_ = true;
     struct Entry {
         std::uintptr_t raw = 0, norm = 0;
         std::uint64_t raw_generation = 0, norm_generation = 0;
@@ -6699,11 +6766,21 @@ class HipQsaWindowPool {
     static constexpr std::uint32_t kSlabEntries = 16U;
     struct Slab { void* base = nullptr; std::uint64_t entry_bytes = 0; std::uint32_t used = 0; };
     std::vector<Slab> slabs_;
+    // Serial decode pool only: one row of 4-block group maxima (qsa_decode_pool_select), reused by every layer and step on
+    // the owner's stream; grown with a stream drain, freed at teardown.
+    float* maxima_ = nullptr;
+    std::uint32_t maxima_capacity_ = 0;
     hipStream_t stream_ = nullptr;
     int device_ = -1;
     static bool slab_enabled() { static const bool on = qsa_env_default_on("STRIX_QSA_POOL_SLAB"); return on; }
 public:
+    HipQsaWindowPool() = default;
+    explicit HipQsaWindowPool(bool slab_allowed) : slab_allowed_(slab_allowed) {}
     ~HipQsaWindowPool() {
+        if (maxima_) {
+            if (hipStreamSynchronize(stream_) != hipSuccess || hipFree(maxima_) != hipSuccess) std::terminate();
+            maxima_ = nullptr;
+        }
         if (entries_.empty()) return;
         // Every entry's last consumer is ordered on this one owner stream.
         if (hipStreamSynchronize(stream_) != hipSuccess) std::terminate();
@@ -6711,6 +6788,26 @@ public:
         for (auto& entry : entries_) if (entry.pool.keys && hipFree(entry.pool.keys) != hipSuccess) std::terminate();
     }
     void invalidate() noexcept { for (auto& entry : entries_) entry.pool.valid = 0U; }
+    // The decode selection's maxima row (at least groups floats) on the owner's device/stream; null when it cannot be
+    // allocated (the caller then keeps select_blocks_kernel).
+    float* maxima(std::uint32_t groups) {
+        int device = -1;
+        check_hip(hipGetDevice(&device), "QSA decode maxima device");
+        const auto stream = hip_execution_stream();
+        if (device_ < 0) { device_ = device; stream_ = stream; }
+        if (device != device_ || stream != stream_) return nullptr;
+        if (groups <= maxima_capacity_) return maxima_;
+        if (maxima_) {
+            check_hip(hipStreamSynchronize(stream_), "QSA decode maxima resize sync");
+            check_hip(hipFree(maxima_), "QSA decode maxima free");
+            maxima_ = nullptr; maxima_capacity_ = 0;
+        }
+        const auto grown = std::max<std::uint32_t>(groups, 16384U);
+        void* p = nullptr;
+        if (hipMalloc(&p, std::size_t{grown} * sizeof(float)) != hipSuccess) { static_cast<void>(hipGetLastError()); return nullptr; }
+        maxima_ = static_cast<float*>(p); maxima_capacity_ = grown;
+        return maxima_;
+    }
     QsaPrefillPool* get(const PreparedIndexedLaunch& a, std::uint32_t ratio, std::uint64_t position) {
         int device = -1;
         check_hip(hipGetDevice(&device), "QSA persistent pool device");
@@ -6734,11 +6831,21 @@ public:
         entry.raw = a.raw_state.address; entry.raw_generation = a.raw_state.allocation_generation;
         entry.norm = norm.address; entry.norm_generation = norm.allocation_generation;
         entry.pool.capacity = blocks;
+        if (!slab_allowed_) {
+            void* keys = nullptr;
+            if (hipMalloc(&keys, static_cast<std::uint64_t>(blocks) * a.index_dim * sizeof(float)) != hipSuccess) {
+                static_cast<void>(hipGetLastError()); // an allocation failure must not poison the next launch check
+                return nullptr;
+            }
+            entry.pool.keys = static_cast<float*>(keys);
+            entries_.push_back(entry);
+            return &entries_.back().pool;
+        }
         // Allocate the host slot before taking ownership of a device allocation.
         entries_.push_back(entry);
         const auto bytes = (static_cast<std::uint64_t>(blocks) * a.index_dim * sizeof(float) + 255U) / 256U * 256U;
         // A slab pool never mixes with per-entry allocations (the destructor frees one kind).
-        if (slab_enabled() && (!slabs_.empty() || entries_.size() == 1U)) {
+        if (slab_allowed_ && slab_enabled() && (!slabs_.empty() || entries_.size() == 1U)) {
             Slab* slab = nullptr;
             for (auto& s : slabs_) if (s.entry_bytes == bytes && s.used < kSlabEntries) { slab = &s; break; }
             if (!slab) {
@@ -6756,6 +6863,114 @@ public:
     }
 };
 std::shared_ptr<HipQsaWindowPool> make_hip_qsa_window_pool() { return std::make_shared<HipQsaWindowPool>(); }
+std::shared_ptr<HipQsaWindowPool> make_hip_qsa_decode_pool() { return std::make_shared<HipQsaWindowPool>(false); }
+
+// Serial decode from the persistent pool: the new complete blocks (at most one per step after the first) are formed by
+// block_pool_kernel (the statements of block_score_kernel's pooled part), then block_score_pooled_rows_kernel<1, 1> scores
+// every complete block with block_score_kernel's products, 128-feature tree, relu head sum and division: bitwise the same
+// block scores (STRIX_QSA_DECODE_POOL_CHECK=1 recomputes them with block_score_kernel and compares, synchronizing per
+// step). The selection that follows is unchanged. get() drops every block at or after floor(position / ratio).
+namespace {
+bool qsa_decode_pool_scores(const PreparedIndexedLaunch& a, const HipIndexedAttentionLauncherConfig& config, std::uint64_t position,
+    std::uint32_t complete_blocks, std::uint32_t ratio) {
+    const auto& model = config.model;
+    if (!config.decode_pool || a.index_dim != 128U || model.indexer_n_heads != 4U || !ratio || !complete_blocks) return false;
+    auto* pool = config.decode_pool->get(a, ratio, position);
+    if (!pool || !pool->keys || complete_blocks > pool->capacity) return false;
+    const auto stream = hip_execution_stream();
+    const auto rotary = checked_u32(model.rotary_dim(), "rotary_dim");
+    const auto& norm = a.tensors.index_k_norm;
+    if (complete_blocks > pool->valid) {
+        dispatch_small_kind(norm.manifest->ggml_type, [&](auto kind) {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<decltype(kind)::value>), dim3(complete_blocks - pool->valid),
+                dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream,
+                reinterpret_cast<const std::uint16_t*>(a.raw_state.address), pool->valid, a.index_dim, ratio,
+                reinterpret_cast<const void*>(norm.runtime->address), model.rms_norm_epsilon, rotary, model.rope_theta, pool->keys);
+        });
+        check_hip(hipGetLastError(), "QSA decode block-pool launch");
+        pool->valid = complete_blocks;
+    }
+    QsaRowsScoreViews<1U> views{};
+    views.index_query[0] = a.workspace.index_query;
+    views.block_scores[0] = a.workspace.block_scores;
+    views.blocks[0] = complete_blocks;
+    const auto waves = (complete_blocks + 31U) / 32U;
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<1U, 1U>), dim3((waves + 7U) / 8U), dim3(kThreads), 0, stream,
+        views, static_cast<const float*>(pool->keys), complete_blocks, a.index_dim);
+    check_hip(hipGetLastError(), "QSA decode pooled block-score launch");
+    static const bool check = [] { const char* v = std::getenv("STRIX_QSA_DECODE_POOL_CHECK"); return v && v[0] == '1'; }();
+    if (check) {
+        std::vector<float> pooled(complete_blocks), reference(complete_blocks);
+        check_hip(hipMemcpyAsync(pooled.data(), a.workspace.block_scores, complete_blocks * sizeof(float), hipMemcpyDeviceToHost, stream),
+            "QSA decode pool check copy");
+        check_hip(hipStreamSynchronize(stream), "QSA decode pool check sync");
+        launch_block_scores(a.workspace, a.raw_state, norm, model, complete_blocks, GraphSelectionArguments{});
+        check_hip(hipMemcpyAsync(reference.data(), a.workspace.block_scores, complete_blocks * sizeof(float), hipMemcpyDeviceToHost, stream),
+            "QSA decode pool check copy");
+        check_hip(hipStreamSynchronize(stream), "QSA decode pool check sync");
+        std::size_t differing = 0;
+        for (std::uint32_t i = 0; i < complete_blocks; ++i) differing += std::memcmp(&pooled[i], &reference[i], sizeof(float)) != 0;
+        static std::atomic<std::uint64_t> steps{0}, compared{0}, total_differing{0};
+        const auto s = steps.fetch_add(1U) + 1U;
+        const auto c = compared.fetch_add(complete_blocks) + complete_blocks;
+        const auto d = total_differing.fetch_add(differing) + differing;
+        if (differing || s % 48U == 0U)
+            std::fprintf(stderr, "QSA decode pool check: position %llu, %u scores, %zu differ (total %llu layer-steps, %llu scores, %llu differ)\n",
+                static_cast<unsigned long long>(position), complete_blocks, differing, static_cast<unsigned long long>(s),
+                static_cast<unsigned long long>(c), static_cast<unsigned long long>(d));
+    }
+    return true;
+}
+bool qsa_decode_pool_select(const PreparedIndexedLaunch& a, const HipIndexedAttentionLauncherConfig& config,
+    const PreparedIndexedSelection& selection) {
+    static const bool enabled = qpf2k::long_context_item_enabled("STRIX_QSA_DECODE_SELECT");
+    if (!enabled || !config.decode_pool || selection.ratio != qsa_flash::kGroup || selection.dynamic_selection.position.position) return false;
+    const auto groups = (selection.complete_blocks + qsa_flash::kGroup - 1U) / qsa_flash::kGroup;
+    const auto stream = hip_execution_stream();
+    float* const maxima = config.decode_pool->maxima(groups);
+    if (!maxima) return false;
+    // STRIX_QSA_DECODE_POOL_CHECK=1 also runs select_blocks_kernel on a copy of the scores and compares the selected list
+    // and the post-selection scores bitwise (synchronizes per layer-step).
+    static const bool check = [] { const char* v = std::getenv("STRIX_QSA_DECODE_POOL_CHECK"); return v && v[0] == '1'; }();
+    const auto blocks = selection.complete_blocks, count = selection.selected_count;
+    std::vector<float> before;
+    if (check) {
+        before.resize(blocks);
+        check_hip(hipMemcpyAsync(before.data(), a.workspace.block_scores, blocks * sizeof(float), hipMemcpyDeviceToHost, stream), "QSA decode select check copy");
+        check_hip(hipStreamSynchronize(stream), "QSA decode select check sync");
+    }
+    hipLaunchKernelGGL(qsa_flash::row_maxima_kernel, dim3((groups + 255U) / 256U), dim3(256), 0, stream,
+        static_cast<const float*>(a.workspace.block_scores), selection.complete_blocks, maxima);
+    hipLaunchKernelGGL(qsa_flash::select_one_kernel, dim3(1), dim3(kSelectThreads), 0, stream,
+        a.workspace.block_scores, a.workspace.selected_indices, selection.visible, static_cast<const float*>(maxima),
+        selection.ratio, selection.block_topk);
+    check_hip(hipGetLastError(), "QSA decode maxima selection launch");
+    if (check) {
+        std::vector<float> scores(blocks), reference_scores(blocks);
+        std::vector<std::uint32_t> selected(count), reference(count);
+        const auto pull = [&](std::vector<float>& s, std::vector<std::uint32_t>& sel) {
+            check_hip(hipMemcpyAsync(s.data(), a.workspace.block_scores, blocks * sizeof(float), hipMemcpyDeviceToHost, stream), "QSA decode select check copy");
+            check_hip(hipMemcpyAsync(sel.data(), a.workspace.selected_indices, count * sizeof(std::uint32_t), hipMemcpyDeviceToHost, stream),
+                "QSA decode select check copy");
+            check_hip(hipStreamSynchronize(stream), "QSA decode select check sync");
+        };
+        pull(scores, selected);
+        check_hip(hipMemcpyAsync(a.workspace.block_scores, before.data(), blocks * sizeof(float), hipMemcpyHostToDevice, stream), "QSA decode select check restore");
+        hipLaunchKernelGGL(select_blocks_kernel, dim3(1), dim3(kSelectThreads), 0, stream, a.workspace.block_scores, blocks,
+            selection.block_topk, selection.ratio, selection.visible, a.workspace.selected_indices, GraphSelectionArguments{});
+        check_hip(hipGetLastError(), "QSA decode select check launch");
+        pull(reference_scores, reference);
+        const bool same = std::memcmp(scores.data(), reference_scores.data(), blocks * sizeof(float)) == 0 && selected == reference;
+        static std::atomic<std::uint64_t> steps{0}, differing{0};
+        const auto s = steps.fetch_add(1U) + 1U;
+        const auto d = differing.fetch_add(same ? 0U : 1U) + (same ? 0U : 1U);
+        if (!same || s % 48U == 0U)
+            std::fprintf(stderr, "QSA decode select check: %u blocks, %u selected, %s (total %llu layer-steps, %llu differ)\n", blocks, count,
+                same ? "same" : "DIFFER", static_cast<unsigned long long>(s), static_cast<unsigned long long>(d));
+    }
+    return true;
+}
+} // namespace
 void invalidate_hip_qsa_window_pool(const std::shared_ptr<HipQsaWindowPool>& pool) { if (pool) pool->invalidate(); }
 
 // STRIX_QSA_WINDOW_POOLED=1: verify windows score the indexer blocks as prefill groups do: one

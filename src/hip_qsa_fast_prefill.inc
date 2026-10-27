@@ -72,10 +72,104 @@ __device__ unsigned block_exclusive(unsigned v, unsigned* waves, unsigned& total
     return before + x - v;
 }
 
-// tile: the TR-row tile of the group (blockIdx.x of union_kernel / attend_kernel).
+// First index of the ascending block list blk[0, n) whose block is >= b.
+__device__ __forceinline__ unsigned lower_bound_block(const std::uint32_t* blk, unsigned n, unsigned b) {
+    unsigned lo = 0U, hi = n;
+    while (lo < hi) {
+        const unsigned mid = (lo + hi) / 2U;
+        if (blk[mid] < b) lo = mid + 1U; else hi = mid;
+    }
+    return lo;
+}
+// Merge form of the union (STRIX_QSA_UNION_MERGE, default on): the same (block, mask) pairs in the same order,
+// with work bounded by the selections instead of the block range. The rows' selections are staged in LDS as block
+// IDs (token / 4). Every union block has one owner: its first token in the lowest row that selected it. A block's
+// place in the union is the number of owners of smaller blocks, sum over rows r' of the owners before
+// lower_bound_r'(b), from per-row owner prefix counts. Needs non-decreasing selections of at most kMergeCap tokens;
+// returns false (nothing written, weights untouched) otherwise, and the caller runs the range form. Only tiles of up
+// to four rows (the attend batch's TR) fit their lists and prefix table; larger tiles always run the range form.
+constexpr unsigned kMergeCap = 2052U;
+// The merge form costs about the same at any depth; the range form costs one pass per kRangeBlocks window
+// (tests/qsa_union_merge_tests.hip, T8192 layer-chunk: dense 0.15 vs 1.30 ms, ~75K blocks 8.7 vs 4.7 ms, ~262K
+// blocks 19.4 vs 5.2 ms). The merge form runs from kMergeMinBlocks (six windows) up.
+constexpr unsigned kMergeMinBlocks = 6U * kRangeBlocks;
+template <unsigned TR> constexpr bool kMergeFits = TR <= 4U;
+template <unsigned TR> constexpr unsigned kUnionLdsWords = kMergeFits<TR> && TR * kMergeCap > kRangeBlocks ? TR * kMergeCap : kRangeBlocks;
 template <unsigned Rows, unsigned TR>
+__device__ __forceinline__ bool union_merge(const Views<Rows>& v, unsigned r0, unsigned blocks, std::uint32_t* lists,
+    std::uint16_t* pre, std::uint32_t* weight, std::uint32_t* waves, uint2* pairs, unsigned& written) {
+    __shared__ unsigned unsorted;
+    const unsigned t = threadIdx.x;
+    if (t == 0U) unsorted = 0U;
+    __syncthreads();
+    unsigned count[TR];
+#pragma unroll
+    for (unsigned r = 0; r < TR; ++r) {
+        const auto* sel = v.selected[r0 + r];
+        const unsigned n = count[r] = v.count[r0 + r];
+        if (n > kMergeCap) { if (t == 0U) unsorted = 1U; continue; }
+        for (unsigned i = t; i < n; i += 256U) {
+            const unsigned token = sel[i];
+            if (i > 0U && token < sel[i - 1U]) unsorted = 1U;
+            lists[r * kMergeCap + i] = token / 4U;
+        }
+    }
+    __syncthreads();
+    if (unsorted) return false;
+    for (unsigned r = 0; r < TR; ++r) {
+        const auto* sel = v.selected[r0 + r];
+        const unsigned n = count[r];
+        const auto* blk = lists + r * kMergeCap;
+        auto* row = pre + r * (kMergeCap + 1U);
+        unsigned running = 0U;
+        for (unsigned base = 0; base < n; base += 256U) {
+            const unsigned i = base + t;
+            unsigned owner = 0U;
+            if (i < n) {
+                const unsigned b = blk[i];
+                if (sel[i] < 4U) atomicAdd(&weight[r * 4U + sel[i]], 1U);
+                owner = b < blocks && (i == 0U || blk[i - 1U] != b) ? 1U : 0U;
+                for (unsigned q = 0; owner && q < r; ++q) {
+                    const auto* other = lists + q * kMergeCap;
+                    const unsigned at = lower_bound_block(other, count[q], b);
+                    if (at < count[q] && other[at] == b) owner = 0U;
+                }
+            }
+            unsigned total;
+            const unsigned before = block_exclusive(owner, waves, total);
+            if (i < n) row[i] = static_cast<std::uint16_t>(running + before);
+            running += total;
+        }
+        if (t == 0U) row[n] = static_cast<std::uint16_t>(running);
+        written += running;
+    }
+    __syncthreads();
+    for (unsigned r = 0; r < TR; ++r) {
+        const unsigned n = count[r];
+        const auto* blk = lists + r * kMergeCap;
+        const auto* row = pre + r * (kMergeCap + 1U);
+        for (unsigned i = t; i < n; i += 256U) {
+            if (row[i + 1U] == row[i]) continue; // not an owner (row[n] holds the row's total)
+            const unsigned b = blk[i];
+            unsigned at = 0U, bits = 0U;
+#pragma unroll
+            for (unsigned q = 0; q < TR; ++q) {
+                const auto* other = lists + q * kMergeCap;
+                const unsigned lb = q == r ? i : lower_bound_block(other, count[q], b);
+                at += pre[q * (kMergeCap + 1U) + lb];
+                if (lb < count[q] && other[lb] == b) bits |= 1U << q;
+            }
+            pairs[at] = make_uint2(b, bits);
+        }
+    }
+    return true;
+}
+
+// tile: the TR-row tile of the group (blockIdx.x of union_kernel / attend_kernel).
+template <unsigned Rows, unsigned TR, bool Merge = true>
 __device__ __forceinline__ void union_body(const Views<Rows>& v, std::uint32_t union_at, unsigned tile) {
-    __shared__ std::uint32_t mask[kRangeBlocks];
+    __shared__ std::uint32_t mask[kUnionLdsWords<TR>]; // the range form's block masks, or the merge form's block lists
+    __shared__ std::uint16_t merge_prefix[Merge && kMergeFits<TR> ? TR * (kMergeCap + 1U) : 1U];
     __shared__ std::uint32_t weight[TR * 4U];
     __shared__ std::uint32_t waves[8];
     const unsigned t = threadIdx.x, r0 = tile * TR;
@@ -85,7 +179,9 @@ __device__ __forceinline__ void union_body(const Views<Rows>& v, std::uint32_t u
     auto* header = reinterpret_cast<std::uint32_t*>(v.scratch[r0] + union_at);
     auto* pairs = reinterpret_cast<uint2*>(header + 4U + TR);
     unsigned written = 0U;
-    for (unsigned base = 0; base < blocks; base += kRangeBlocks) {
+    bool merged = false;
+    if constexpr (Merge && kMergeFits<TR>) merged = blocks > kMergeMinBlocks && union_merge<Rows, TR>(v, r0, blocks, mask, merge_prefix, weight, waves, pairs, written);
+    for (unsigned base = 0; !merged && base < blocks; base += kRangeBlocks) {
         const unsigned span = min(kRangeBlocks, blocks - base);
         for (unsigned i = t; i < span; i += 256U) mask[i] = 0U;
         __syncthreads();
@@ -118,14 +214,14 @@ __device__ __forceinline__ void union_body(const Views<Rows>& v, std::uint32_t u
     }
 }
 
-template <unsigned Rows, unsigned TR>
+template <unsigned Rows, unsigned TR, bool Merge = true>
 __global__ __launch_bounds__(256) void union_kernel(Views<Rows> v, std::uint32_t union_at) {
-    union_body<Rows, TR>(v, union_at, blockIdx.x);
+    union_body<Rows, TR, Merge>(v, union_at, blockIdx.x);
 }
 // Several groups of one call in one launch (STRIX_QSA_ATTEND_BATCH): block x = group * (Rows / TR) + tile.
-template <unsigned Rows, unsigned TR>
+template <unsigned Rows, unsigned TR, bool Merge = true>
 __global__ __launch_bounds__(256) void union_multi_kernel(const Views<Rows>* groups, std::uint32_t union_at) {
-    union_body<Rows, TR>(groups[blockIdx.x / (Rows / TR)], union_at, blockIdx.x % (Rows / TR));
+    union_body<Rows, TR, Merge>(groups[blockIdx.x / (Rows / TR)], union_at, blockIdx.x % (Rows / TR));
 }
 
 // One workgroup: G column groups of 16 query columns, each run by a pair of compute waves that split the 256
