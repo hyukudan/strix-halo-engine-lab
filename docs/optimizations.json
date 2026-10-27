@@ -818,6 +818,17 @@
     "doc_anchor": "docs/optimizations.md#rtx-evict-auto"
   },
   {
+    "engine": "deepseek-rtx",
+    "name": "Prefill pinned host expert tier (opt-in)",
+    "flag_or_env": "--host-gib-auto G; --overlay OVERLAY.gguf; --host-pin-order layer|deadline|early",
+    "default": "off (file-only streaming)",
+    "exact": "Exact: prefill state sha256, logits FNV and next token identical to file-only streaming on every exercised path (implicit and explicit tier, export modes, pipeline, whole-layer provider, forced demotion).",
+    "gain": "TTFT 1K −24..−30 % (16.2 → 12.4 s interleaved), 8K −28 %, 30K −12 %",
+    "preconditions": "DeepSeek CUDA prefill service on the RTX PRO with free pinned host memory; mandatory allocations are made first, each layer gets one non-waiting admission, demoted layers stream from file with the same bits.",
+    "off_switch": "omit --host-gib-auto",
+    "doc_anchor": "docs/optimizations.md#rtx-prefill-host-tier"
+  },
+  {
     "engine": "minimax",
     "name": "Wide expert decode",
     "flag_or_env": "STRIX_MMX_MOE_WIDE",

@@ -1,5 +1,6 @@
 // deepseek41 CUDA prefill: routed experts with per-expert residency and grouped transport (ds41_expert_streamer.hpp).
 #include "ds41_expert_streamer.hpp"
+#include "strix/ds41_memory_budget.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -52,53 +53,35 @@ std::unique_ptr<PinnedBytes> PinnedBytes::try_alloc(std::size_t n, std::uint32_t
     }
     return nullptr;
 }
-// System commit / physical room (bytes); {inf, inf} where it is not tracked.
-static void system_room(double& free_commit, double& free_phys) {
-    free_commit = free_phys = 1e30;
-#ifdef _WIN32
-    MEMORYSTATUSEX ms{};
-    ms.dwLength = sizeof(ms);
-    if (GlobalMemoryStatusEx(&ms)) {
-        free_commit = double(ms.ullAvailPageFile);
-        free_phys = double(ms.ullAvailPhys);
-    }
-#endif
+// Telemetry failure is explicit; optional pins decline when measurements fail.
+static void system_room(double& commit, double& physical) {
+    const auto r = ds41::host_memory_room();
+    commit = r.known ? double(r.free_commit) : -1;
+    physical = r.known ? double(r.free_physical) : -1;
 }
-std::unique_ptr<PinnedBytes> PinnedBytes::try_alloc_floor(std::size_t n, double floor_gib, std::chrono::steady_clock::time_point deadline,
-                                                          std::uint32_t& waits) {
-    const double floor = floor_gib * double(1ULL << 30), phys_floor = floor + double(4ULL << 30);
-    for (;;) {
-        double commit = 0.0, phys = 0.0;
-        system_room(commit, phys);
-        if (phys < double(n) + phys_floor) return nullptr;  // physical memory does not grow: stop here
-        // one more buffer of margin: the charge of the previous buffer (and of other processes) can land late
-        if (commit >= 2.0 * double(n) + floor) {
-            void* p = nullptr;
-            if (cudaHostAlloc(&p, n, cudaHostAllocDefault) == cudaSuccess && p) {
-                auto out = std::make_unique<PinnedBytes>();
-                out->p_ = static_cast<std::uint8_t*>(p);
-                out->n_ = n;
-                // let this buffer's charge settle before the next decision (up to 3 s)
-                for (int i = 0; i < 30; ++i) {
-                    double c2 = 0.0, p2 = 0.0;
-                    system_room(c2, p2);
-                    if (commit - c2 >= 0.9 * double(n)) break;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                }
-                return out;
-            }
-            (void)cudaGetLastError();
-        } else {
+std::unique_ptr<PinnedBytes> PinnedBytes::try_alloc_floor(std::size_t n, double floor_gib,
+        std::chrono::steady_clock::time_point deadline, std::uint32_t& waits,
+        bool implicit, bool allow_first, HostPinReason& reason) {
+    std::unique_ptr<PinnedBytes> out;
+    std::uint64_t before_commit = 0;
+    reason = ds41::allocate_host_pin(n, floor_gib, implicit, allow_first, deadline, waits,
+        [&] { auto r = ds41::host_memory_room(); before_commit = r.free_commit; return r; }, [&] { out = PinnedBytes::try_alloc(n, 1, 0); return bool(out); },
+        [](double ask) {
 #ifdef _WIN32
-            // a commit request beyond the limit fails without charging anything and makes the OS grow the pagefile
-            const double ask = commit + double(n) + double(8ULL << 30);
             if (void* q = VirtualAlloc(nullptr, static_cast<SIZE_T>(ask), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) VirtualFree(q, 0, MEM_RELEASE);
+#else
+            (void)ask;
 #endif
+        }, [] { std::this_thread::sleep_for(std::chrono::milliseconds(1000)); },
+        [] { return std::chrono::steady_clock::now(); });
+    if (!implicit && reason == HostPinReason::none) {
+        for (int i = 0; i < 30 && std::chrono::steady_clock::now() < deadline; ++i) {
+            const auto r = ds41::host_memory_room();
+            if (!r.known || (before_commit >= r.free_commit && double(before_commit - r.free_commit) >= .9 * double(n))) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        if (std::chrono::steady_clock::now() >= deadline) return nullptr;
-        ++waits;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
+    return out;
 }
 PinnedBytes::~PinnedBytes() {
     if (p_) cudaFreeHost(p_);
@@ -164,30 +147,52 @@ ExpertStreamer::ExpertStreamer(FileReader& file, StreamerPlan plan) : file_(file
         }
         STRIX_CUDA_CHECK(cudaStreamSynchronize(copy_));
     }
+    const std::uint32_t nslots = streamed_.empty() ? 0U : std::min<std::uint32_t>(std::max(1U, p_.slots), static_cast<std::uint32_t>(streamed_.size()));
+    slot_bytes_ = std::uint64_t{smax_} * eb;
+    std::uint32_t max_groups = 0;
+    for (const auto l : streamed_) max_groups = std::max(max_groups, groups(l));
+    for (std::uint32_t k = 0; k < nslots; ++k) {
+        slots_.emplace_back();
+        auto& s = slots_.back();
+        s.buf = std::make_unique<DeviceBuffer<std::uint8_t>>(slot_bytes_);
+        for (std::uint32_t g = 0; g < max_groups; ++g) s.group_ready.push_back(std::make_unique<Event>());
+        s.free = std::make_unique<Event>();
+        device_bytes_ += slot_bytes_;
+    }
+    if (p_.timing) {
+        origin_ = std::make_unique<Event>(true);
+        for (const auto l : streamed_) {
+            copy_begin_[l] = std::make_unique<Event>(true);
+            copy_end_[l] = std::make_unique<Event>(true);
+        }
+    }
     // host tier: the streamed experts packed in virtual order [gate s][up s][down s]
     {
         PinnedBytes page(kStagingBytes + 2U * FileReader::alignment);
         std::vector<std::uint32_t> owners;  // host layers with their own copy
         std::uint32_t host_layers = 0;
-        const auto pin_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(static_cast<std::int64_t>(p_.host_pin_wait_s * 1000.0));
+        const auto pin_deadline = host_pin_deadline(p_.host_pin_wait_s);
         for (const auto l : streamed_) {
             if (p_.stream_tier[l] != ExpertTier::host) continue;
             const std::uint32_t r = p_.resident[l], s = E - r;
+            host_pin_stats_.requested_bytes += std::uint64_t{s} * eb;
+            HostPinReason reason = HostPinReason::alloc;
             if (p_.host_alias != 0U && host_layers >= p_.host_alias) {
                 // timing only: another host layer's bytes (wrong weights, real transfers; owners hold smax experts)
                 host_view_[l] = host_view_[owners[host_layers % p_.host_alias]];
             } else {
                 const std::uint32_t cap = p_.host_alias != 0U ? smax_ : s;
                 const auto t_pin = std::chrono::steady_clock::now();
-                host_[l] = p_.host_commit_floor_gib > 0.0 && p_.host_alias == 0U
-                               ? PinnedBytes::try_alloc_floor(std::uint64_t{cap} * eb, p_.host_commit_floor_gib, pin_deadline, host_pin_waits_)
+                host_[l] = (p_.host_tier_implicit || (p_.host_commit_floor_gib > 0.0 && p_.host_alias == 0U))
+                               ? PinnedBytes::try_alloc_floor(std::uint64_t{cap} * eb, p_.host_commit_floor_gib, pin_deadline, host_pin_waits_, p_.host_tier_implicit, p_.host_pin_wait_s == 0.0, reason)
                                : PinnedBytes::try_alloc(std::uint64_t{cap} * eb, p_.host_pin_attempts, p_.host_pin_retry_ms);
                 host_pin_s_ += seconds_since(t_pin);
                 if (!host_[l]) {
                     // no pinned memory left (commit limit / physical): this layer streams from the file instead;
                     // the file path reads the same virtual order run by run, so the bits do not change
-                    if (p_.host_alias != 0U) throw std::runtime_error("ds41 expert streamer: pinned host allocation failed");
+                    if (p_.host_alias != 0U && !p_.host_tier_implicit) throw std::runtime_error("ds41 expert streamer: pinned host allocation failed");
                     p_.stream_tier[l] = ExpertTier::file;
+                    host_pin_stats_.demotions.push_back({l, reason});
                     ++host_pin_failed_;
                     continue;
                 }
@@ -215,26 +220,9 @@ ExpertStreamer::ExpertStreamer(FileReader& file, StreamerPlan plan) : file_(file
                 host_view_[l] = base;
                 owners.push_back(l);
             }
+            host_pin_stats_.layers.push_back(l);
+            host_pin_stats_.effective_bytes += std::uint64_t{s} * eb;
             ++host_layers;
-        }
-    }
-    const std::uint32_t nslots = streamed_.empty() ? 0U : std::min<std::uint32_t>(std::max(1U, p_.slots), static_cast<std::uint32_t>(streamed_.size()));
-    slot_bytes_ = std::uint64_t{smax_} * eb;
-    std::uint32_t max_groups = 0;
-    for (const auto l : streamed_) max_groups = std::max(max_groups, groups(l));
-    for (std::uint32_t k = 0; k < nslots; ++k) {
-        slots_.emplace_back();
-        auto& s = slots_.back();
-        s.buf = std::make_unique<DeviceBuffer<std::uint8_t>>(slot_bytes_);
-        for (std::uint32_t g = 0; g < max_groups; ++g) s.group_ready.push_back(std::make_unique<Event>());
-        s.free = std::make_unique<Event>();
-        device_bytes_ += slot_bytes_;
-    }
-    if (p_.timing) {
-        origin_ = std::make_unique<Event>(true);
-        for (const auto l : streamed_) {
-            copy_begin_[l] = std::make_unique<Event>(true);
-            copy_end_[l] = std::make_unique<Event>(true);
         }
     }
     if (!slots_.empty()) worker_ = std::thread([this] { loop(); });

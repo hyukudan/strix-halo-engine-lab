@@ -191,50 +191,34 @@ private:
     bool mapped_ = false;
 };
 
-// System free commit / free physical memory in bytes ({inf, inf} where not tracked).
-void system_room(double& free_commit, double& free_phys) {
-    free_commit = free_phys = 1e30;
-#ifdef _WIN32
-    MEMORYSTATUSEX ms{};
-    ms.dwLength = sizeof(ms);
-    if (GlobalMemoryStatusEx(&ms)) {
-        free_commit = double(ms.ullAvailPageFile);
-        free_phys = double(ms.ullAvailPhys);
-    }
-#endif
+// Telemetry failure is explicit; optional pins decline when measurements fail.
+static void system_room(double& commit, double& physical) {
+    const auto r = ds41::host_memory_room();
+    commit = r.known ? double(r.free_commit) : -1;
+    physical = r.known ? double(r.free_physical) : -1;
 }
-
-// A pinned host buffer of n bytes under a free-commit floor (WDDM charges pinned and device memory to the system
-// commit): allocated only while free commit stays >= 2 n + floor (one more buffer of margin: charges land late) and
-// free physical >= n + floor + 4 GiB; below the commit floor a failing commit probe makes the OS grow the pagefile and
-// the caller waits (1 s steps) until `deadline`. false: no room (the layer then streams from the file).
-bool pin_with_floor(PinnedBuffer& out, std::size_t n, double floor_gib, std::chrono::steady_clock::time_point deadline, std::uint32_t& waits) {
-    const double floor = floor_gib * double(1ULL << 30), phys_floor = floor + double(4ULL << 30);
-    for (;;) {
-        double commit = 0.0, phys = 0.0;
-        system_room(commit, phys);
-        if (phys < double(n) + phys_floor) return false;  // physical memory does not grow
-        if (commit >= 2.0 * double(n) + floor) {
-            if (out.try_resize(n)) {
-                for (int i = 0; i < 30; ++i) {  // let this buffer's charge settle before the next decision (<= 3 s)
-                    double c2 = 0.0, p2 = 0.0;
-                    system_room(c2, p2);
-                    if (commit - c2 >= 0.9 * double(n)) break;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                }
-                return true;
-            }
-        } else {
+bool pin_with_floor(PinnedBuffer& out, std::size_t n, double floor_gib,
+        std::chrono::steady_clock::time_point deadline, std::uint32_t& waits,
+        bool implicit, bool allow_first, HostPinReason& reason) {
+    std::uint64_t before_commit = 0;
+    reason = ds41::allocate_host_pin(n, floor_gib, implicit, allow_first, deadline, waits,
+        [&] { auto r = ds41::host_memory_room(); before_commit = r.free_commit; return r; }, [&] { return out.try_resize(n); },
+        [](double ask) {
 #ifdef _WIN32
-            // a commit request beyond the limit fails without charging anything and makes the OS grow the pagefile
-            const double ask = commit + double(n) + double(8ULL << 30);
             if (void* q = VirtualAlloc(nullptr, static_cast<SIZE_T>(ask), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) VirtualFree(q, 0, MEM_RELEASE);
+#else
+            (void)ask;
 #endif
+        }, [] { std::this_thread::sleep_for(std::chrono::milliseconds(1000)); },
+        [] { return std::chrono::steady_clock::now(); });
+    if (!implicit && reason == HostPinReason::none) {
+        for (int i = 0; i < 30 && std::chrono::steady_clock::now() < deadline; ++i) {
+            const auto r = ds41::host_memory_room();
+            if (!r.known || (before_commit >= r.free_commit && double(before_commit - r.free_commit) >= .9 * double(n))) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        if (std::chrono::steady_clock::now() >= deadline) return false;
-        ++waits;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
+    return reason == HostPinReason::none;
 }
 
 struct Event {
@@ -260,7 +244,7 @@ class ExpertProvider {
 public:
     ExpertProvider(FileReader& file, std::vector<ExpertExtent> extents, std::vector<ExpertTier> tiers, std::uint32_t first,
                    std::uint32_t end, std::uint32_t slots, cudaStream_t load_stream, std::uint32_t host_alias = 0,
-                   double host_commit_floor_gib = 0.0, double host_pin_wait_s = 360.0)
+                   double host_commit_floor_gib = 0.0, double host_pin_wait_s = 360.0, bool implicit = false)
         : file_(file), extents_(std::move(extents)), tiers_(std::move(tiers)), first_(first), end_(end), host_alias_(host_alias) {
         layer_bytes_ = 0;
         for (std::uint32_t l = first; l < end; ++l) layer_bytes_ = std::max(layer_bytes_, extents_[l].total());
@@ -308,19 +292,22 @@ public:
             device_bytes_ += layer_bytes_;
         }
         const auto pin_t0 = std::chrono::steady_clock::now();
-        const auto pin_deadline = pin_t0 + std::chrono::milliseconds(static_cast<std::int64_t>(host_pin_wait_s * 1000.0));
+        const auto pin_deadline = host_pin_deadline(host_pin_wait_s);
         for (std::uint32_t l = first; l < end; ++l) {
             if (tiers_[l] != ExpertTier::host) continue;
+            host_pin_stats_.requested_bytes += extents_[l].total();
+            HostPinReason reason = HostPinReason::alloc;
             if (host_alias_ != 0U && host_layers_ >= host_alias_) {
                 // timing only: this layer's copy reads another host layer's bytes (wrong weights, real transfers)
                 host_view_[l] = host_view_[alias_of_[host_layers_ % host_alias_]];
             } else {
                 host_[l] = std::make_unique<PinnedBuffer>();
-                if (host_commit_floor_gib > 0.0 && host_alias_ == 0U) {
-                    if (!pin_with_floor(*host_[l], extents_[l].total(), host_commit_floor_gib, pin_deadline, host_pin_waits_)) {
+                if ((implicit || (host_commit_floor_gib > 0.0 && host_alias_ == 0U))) {
+                    if (!pin_with_floor(*host_[l], extents_[l].total(), host_commit_floor_gib, pin_deadline, host_pin_waits_, implicit, host_pin_wait_s == 0.0, reason)) {
                         // no room above the floor: this layer streams from the file (same bytes, slower)
                         host_[l].reset();
                         tiers_[l] = ExpertTier::file;
+                        host_pin_stats_.demotions.push_back({l, reason});
                         ++host_pin_failed_;
                         continue;
                     }
@@ -336,6 +323,8 @@ public:
                 host_view_[l] = host_[l]->get();
                 alias_of_.push_back(l);
             }
+            host_pin_stats_.layers.push_back(l);
+            host_pin_stats_.effective_bytes += extents_[l].total();
             ++host_layers_;
         }
         host_pin_s_ = seconds_since(pin_t0);
@@ -471,6 +460,7 @@ public:
     }
     [[nodiscard]] bool decode_resident(std::uint32_t layer) const { return tiers_[layer] == ExpertTier::device || decode_view_[layer] != nullptr; }
     [[nodiscard]] const std::vector<ExpertTier>& tiers() const { return tiers_; }
+    [[nodiscard]] const HostPinStats& host_pin_stats() const { return host_pin_stats_; }
     [[nodiscard]] std::uint32_t host_pin_failed_layers() const { return host_pin_failed_; }
     [[nodiscard]] std::uint32_t host_pin_waits() const { return host_pin_waits_; }
     [[nodiscard]] double host_pin_seconds() const { return host_pin_s_; }
@@ -665,6 +655,7 @@ private:
     std::vector<const std::uint8_t*> decode_view_;
     std::vector<std::unique_ptr<DeviceBuffer<std::uint8_t>>> promoted_;
     std::unique_ptr<Event> decode_event_;
+    HostPinStats host_pin_stats_;
     std::uint32_t host_pin_failed_ = 0, host_pin_waits_ = 0;
     double host_pin_s_ = 0.0;
 };
@@ -729,6 +720,7 @@ __global__ void draft_hidden_kernel(const float* __restrict__ stream, std::uint3
 
 // ================================================================================================ Impl
 struct CudaPrefill::Impl {
+    std::shared_ptr<attn::ExportCapture> export_capture;
     CudaPrefillOptions o;
     deepseek41::Config cfg;
     LayerCoreGeometry g;
@@ -1371,6 +1363,17 @@ std::vector<ExpertTier> default_tiers(const CudaPrefillOptions& o, std::uint32_t
             --dev_left;
         }
     }
+    if (o.host_pin_order != HostPinOrder::layer) {
+        std::vector<std::uint64_t> bytes(n_layers, 0);
+        for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
+            if (t[l] == ExpertTier::file) bytes[l] = layer_bytes;
+        const auto budget = o.host_expert_gib * double(1ULL << 30);
+        const auto host = o.host_pin_order == HostPinOrder::early ? early_host_layers(bytes, o.slots, budget)
+                                                                  : deadline_host_layers(bytes, o.slots, budget);
+        for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
+            if (host[l]) t[l] = ExpertTier::host;
+        return t;
+    }
     for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
         if (t[l] == ExpertTier::file && host_left > 0) {
             t[l] = ExpertTier::host;
@@ -1387,6 +1390,8 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
     m.o = options;
     m.gguf_path = gguf;
     auto& o = m.o;
+    require(valid_host_pin_policy(o.host_commit_floor_gib, o.host_pin_wait_s), "host floor/wait must be finite and nonnegative");
+    require(o.host_pin_order == HostPinOrder::layer || o.host_pin_order == HostPinOrder::deadline || o.host_pin_order == HostPinOrder::early, "host pin order layer, deadline or early");
     if (o.decode_only) o.pass_rows = 0;
     if (o.pass_rows != 0U) {
         require(o.max_positions > 0U && o.max_positions <= 2097152U, "long context capacity 1..2M");
@@ -1644,6 +1649,17 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
         m.batch_bytes += q.row_bytes + q.attn->device_bytes();
     }
 
+    // Service request buffers are mandatory: allocate every configured context's
+    // worst-case Engram rows and the fast-export capture before optional experts.
+    if (o.service_host_buffers && !o.pass_rows) {
+        for (auto& q : m.seqs)
+            q->engram_host.resize(c.engram_layer_ids.size() * std::size_t{q->capacity} * m.g.engram_cols * 264U, true);
+    }
+    if (o.reserve_export_capture) {
+        m.export_capture = std::make_shared<attn::ExportCapture>();
+        m.export_capture->reserve(m.seq0().attn->capture_bound(o.first_layer, o.end_layer, o.max_positions));
+    }
+
     // ---- routed experts last: budgets (from the device when asked), tiers or per-expert residency, the provider
     // (device layers, slots, then the pinned host tier: with a commit floor it takes what is left) or the streamer
     STRIX_CUDA_CHECK(cudaStreamSynchronize(m.st));
@@ -1673,7 +1689,7 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
         m.tiers = o.tiers.empty() ? default_tiers(o, c.num_hidden_layers, layer_bytes) : o.tiers;
         require(m.tiers.size() >= o.end_layer, "tiers cover the layer range");
         m.experts = std::make_unique<ExpertProvider>(*m.reader, extents, m.tiers, o.first_layer, o.end_layer, o.slots, m.st, o.host_alias_layers,
-                                                     o.host_commit_floor_gib, o.host_pin_wait_s);
+                                                     o.host_commit_floor_gib, o.host_pin_wait_s, o.host_tier_implicit);
         m.tiers = m.experts->tiers();  // a host layer that could not be pinned streams from the file
     } else {
         const std::uint32_t E = c.n_routed_experts;
@@ -1698,6 +1714,7 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
         sp.host_alias = o.host_alias_layers;
         sp.host_commit_floor_gib = o.host_commit_floor_gib;
         sp.host_pin_wait_s = o.host_pin_wait_s;
+        sp.host_tier_implicit = o.host_tier_implicit;
         sp.timing = o.timing;
         if (!o.expert_residency) {
             // whole layers through the streamer: device = all resident, host / file = all streamed, identity order
@@ -1764,6 +1781,19 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
                 res.insert(res.end(), str.begin(), str.end());
                 sp.order[l] = std::move(res);
             }
+            if (o.host_pin_order != HostPinOrder::layer) {
+                // Preserve the legacy budget's resident expert IDs / virtual permutation.
+                // Changing the source must not change which experts are resident, or the
+                // range arithmetic. FILE can read the same non-identity permutation as HOST.
+                std::vector<std::uint64_t> bytes(o.end_layer, 0);
+                for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
+                    bytes[l] = std::uint64_t{E - sp.resident[l]} * expert_bytes;
+                const auto budget = o.host_expert_gib * double(1ULL << 30);
+                const auto host = o.host_pin_order == HostPinOrder::early ? early_host_layers(bytes, sp.slots, budget)
+                                                                          : deadline_host_layers(bytes, sp.slots, budget);
+                for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
+                    sp.stream_tier[l] = host[l] ? ExpertTier::host : ExpertTier::file;
+            }
             m.tiers.assign(c.num_hidden_layers, ExpertTier::device);
             for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
                 m.tiers[l] = sp.resident[l] == E ? ExpertTier::device : sp.stream_tier[l];
@@ -1818,6 +1848,12 @@ std::size_t CudaPrefill::device_bytes() const noexcept {
     const auto& m = *impl_;
     return m.dense_bytes + m.buffer_bytes + m.state_bytes + m.batch_bytes + (m.streamer ? m.streamer->device_bytes() : m.experts->device_bytes());
 }
+std::shared_ptr<attn::ExportCapture> CudaPrefill::export_capture() const noexcept { return impl_->export_capture; }
+
+const HostPinStats& CudaPrefill::host_pin_stats() const noexcept {
+    return impl_->streamer ? impl_->streamer->host_pin_stats() : impl_->experts->host_pin_stats();
+}
+
 std::size_t CudaPrefill::pinned_bytes() const noexcept {
     const auto& m = *impl_;
     std::size_t decode = 0;
@@ -1897,6 +1933,7 @@ std::string CudaPrefill::describe() const {
     const std::size_t expert_dev = m.streamer ? m.streamer->device_bytes() : m.experts->device_bytes();
     const std::size_t expert_pin = m.streamer ? m.streamer->pinned_bytes() : m.experts->pinned_bytes();
     const std::size_t slots_dev = m.streamer ? m.streamer->slot_count() * m.streamer->slot_bytes() : m.experts->device_bytes() - m.experts->resident_bytes();
+    const auto& pins = host_pin_stats();
     s << "\",\"slots\":" << (m.streamer ? m.streamer->slot_count() : m.experts->slot_count())
       << ",\"expert_layer_gb\":" << double(m.moe_shape.expert_bytes() * m.cfg.n_routed_experts) / 1e9
       << ",\"device_gb\":" << double(device_bytes()) / 1e9 << ",\"dense_gb\":" << double(m.dense_bytes) / 1e9
@@ -1926,6 +1963,28 @@ std::string CudaPrefill::describe() const {
       << ",\"decode_ob_expand\":" << (m.o.decode_ob_expand && m.o.decode_ob_one ? "true" : "false")
       << ",\"decode_moe_expand\":" << (m.o.decode_moe_expand ? "true" : "false")
       << ",\"overlay\":\"" << m.file->overlay_description() << "\"";
+    s << ",\"host_tier_policy\":\"" << (m.o.host_tier_implicit ? "implicit" : "explicit")
+      << "\",\"host_requested_bytes\":" << pins.requested_bytes
+      << ",\"host_effective_bytes\":" << pins.effective_bytes
+      << ",\"host_pin_wait_s\":" << m.o.host_pin_wait_s
+      << ",\"host_effective_wait_s\":" << (m.o.host_tier_implicit ? 0.0 : m.o.host_pin_wait_s)
+      << ",\"export_capture_pinned_bytes\":" << (m.export_capture ? m.export_capture->pinned_bytes() : 0)
+      << ",\"service_pinned_bytes\":" << pinned_bytes() + (m.export_capture ? m.export_capture->pinned_bytes() : 0)
+      << ",\"host_demotions\":[";
+    for (std::size_t i = 0; i < pins.demotions.size(); ++i)
+        s << (i ? "," : "") << "{\"layer\":" << pins.demotions[i].layer << ",\"reason\":\""
+          << host_pin_reason_name(pins.demotions[i].reason) << "\"}";
+    const auto room = ds41::host_memory_room();
+    s << "],\"host_free_physical_bytes\":" << (room.known ? std::to_string(room.free_physical) : "\"unknown\"")
+      << ",\"host_free_commit_bytes\":" << (room.known ? std::to_string(room.free_commit) : "\"unknown\"");
+    s << ",\"host_pin_order\":\"" << host_pin_order_name(m.o.host_pin_order) << "\",\"host_layers\":[";
+    bool first_host = true;
+    for (std::uint32_t l = m.o.first_layer; l < m.o.end_layer; ++l) {
+        if (m.run_tiers[l] != ExpertTier::host) continue;
+        s << (first_host ? "" : ",") << l;
+        first_host = false;
+    }
+    s << "]";
     s << ",\"residency\":\"" << (m.o.expert_residency ? "expert" : "layer") << "\",\"transport\":\"" << (m.streamer ? "streamer" : "provider") << "\"";
     if (m.streamer) {
         s << ",\"residency_plan\":\"" << m.residency_plan << "\"";

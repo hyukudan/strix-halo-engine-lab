@@ -17,6 +17,8 @@
 #include "strix/cuda_ds41_common.hpp"
 #include "strix/cuda_ds41_core.hpp"
 #include "strix/deepseek41_attention_state.hpp"
+#include "strix/ds41_host_pin_plan.hpp"
+#include "strix/ds41_host_pin_admission.hpp"
 
 #include <array>
 #include <cstdint>
@@ -96,15 +98,20 @@ struct CudaPrefillOptions {
     // Expert tiers per layer (size end_layer, entries outside the range ignored); empty: from the budgets below.
     std::vector<ExpertTier> tiers;
     double device_expert_gib = 0.0;                 // budget of resident expert layers on the device
+    bool host_tier_implicit = false;
+    bool service_host_buffers = false;
+    bool reserve_export_capture = false;
     double host_expert_gib = 0.0;                   // budget of pinned host memory for expert layers
+    HostPinOrder host_pin_order = HostPinOrder::layer;  // deadline: pin streamed suffix; early: ascending fill; both exclude idle-preload slots
     std::uint32_t slots = 2;                        // device slots for non-resident layers (0: none; decode-only objects)
     // TIMING ONLY (not the model's bits): host-tier layers beyond this many share the pinned copies of the first ones
     // (real transfers, wrong weights), to measure a RAM tier larger than the free memory (0: off).
     std::uint32_t host_alias_layers = 0;
-    // Host tier under a free-commit floor (WDDM charges pinned and device memory to the system commit): > 0: a host
-    // layer is pinned only while free commit stays >= this floor plus one more layer and free physical >= floor + 4 GiB;
-    // below it a failing commit probe makes the OS grow the pagefile and the load waits (up to host_pin_wait_s for the
-    // whole tier); a layer that still has no room streams from the file (same bits). 0: pin every host layer at once.
+    // Optional host admission: commit >= 2n + floor, physical >= n + floor + 4 GiB.
+    // Implicit service tiers always use immediate admission, even with floor 0:
+    // no commit-growth probe or wait; failed/unknown telemetry demotes to FILE.
+    // Explicit budgets with a positive floor may grow commit and wait up to the
+    // shared deadline. Explicit floor 0 retains the legacy allocation path.
     double host_commit_floor_gib = 0.0;
     double host_pin_wait_s = 360.0;
     // Engram rows: "file" (the model file's tables), "zero" (no rows read: timing only, NOT the model's bits).
@@ -526,6 +533,8 @@ public:
     [[nodiscard]] double load_seconds() const noexcept;
     // dense weights + resident experts + slots + buffers + attention state held by this object (describe() splits it)
     [[nodiscard]] std::size_t device_bytes() const noexcept;
+    [[nodiscard]] std::shared_ptr<attn::ExportCapture> export_capture() const noexcept;
+    [[nodiscard]] const HostPinStats& host_pin_stats() const noexcept;
     [[nodiscard]] std::size_t pinned_bytes() const noexcept;   // pinned host memory held
     [[nodiscard]] std::string describe() const;                // tiers, budgets, sizes (one line of JSON)
     // Device copy of a model tensor's GGUF bytes (uploaded on first use and kept by this object; e.g. a drafter on the

@@ -1207,6 +1207,22 @@ After a DSpark verify window, evict experts by the tierstream's learned score; a
 - **Measured gain:** DSpark misses/token 10.55 → 9.08 (−14 %), median +6.4 % tok/s (7 chats); plain decode neutral
 - **Implementation / evidence:** [Standalone defaults and gates](models/deepseek-v4.1/rtx-standalone.md#optimizations-default-on-and-off-switches)
 
+<a id="rtx-prefill-host-tier"></a>
+
+### Prefill pinned host expert tier (opt-in)
+
+**Engine:** `deepseek-rtx`. **Control:** `--host-gib-auto G; --overlay OVERLAY.gguf; --host-pin-order layer|deadline|early`. **Default:** off (file-only streaming).
+
+Keep up to G GiB of prefill experts in pinned host memory when it is available, instead of streaming every layer from file.
+
+- **Preconditions:** DeepSeek CUDA prefill service on the RTX PRO with free pinned host memory; mandatory allocations are made first, each layer gets one non-waiting admission, demoted layers stream from file with the same bits.
+- **Automatic selection:** None yet: opt-in until coexistence with the other services on the same GPU is qualified.
+- **Fallback notice:** Layers that do not get a pinned slot stream from file; `/health` reports host-tier accounting.
+- **Exactness evidence:** Exact: prefill state sha256, logits FNV and next token identical to file-only streaming on every exercised path (implicit and explicit tier, export modes, pipeline, whole-layer provider, forced demotion).
+- **Off switch:** omit `--host-gib-auto`
+- **Measured gain:** TTFT 1K −24..−30 % (16.2 → 12.4 s interleaved), 8K −28 %, 30K −12 %
+- **Implementation / evidence:** [host tier](models/deepseek-v4.1/rtx-prefill-host-tier.md)
+
 ### Lean decode state
 
 **Engine:** `deepseek-rtx`. **Control:** `--lean-state`. **Default:** ON.

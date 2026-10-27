@@ -294,7 +294,8 @@ public:
     [[nodiscard]] std::uint64_t digest() const;                 // sealed: AttentionState::digest()
     [[nodiscard]] std::uint32_t position() const noexcept;
     [[nodiscard]] const deepseek41::AttentionFrame& frame() const noexcept;
-    [[nodiscard]] std::size_t capacity() const noexcept;       // pinned bytes held
+    [[nodiscard]] std::size_t capacity() const noexcept;       // usable capture buffer bytes
+    [[nodiscard]] std::size_t pinned_bytes() const noexcept;   // buffer plus pinned metadata
     struct Timing {
         double capture_ms = 0;   // host wall of capture_state (counts round trip + pack + D2H + frame)
         double meta_ms = 0;      // host wall of the counts gather + D2H + synchronization
