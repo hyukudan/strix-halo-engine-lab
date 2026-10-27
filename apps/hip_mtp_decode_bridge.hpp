@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/serve/health.hpp"
 #include "strix/batch_service_handoff.hpp"
 #include "strix/batch_nested_prefill.hpp"
 #include "strix/execution_telemetry.hpp"
@@ -57,6 +58,7 @@ namespace strix::decode_cli {
 // cached block boundary matches) and decodes greedily with MTP verification.
 using MtpConstraintRow = serve::ConstraintRowSelection;
 struct MtpServeRequest {
+    serve::BackendProbeSlot* backend_probe = nullptr;
     std::shared_ptr<MtpConstraintRow> constraint;
     std::span<const std::uint32_t> prompt;
     std::uint64_t max_tokens = 0;
@@ -1037,8 +1039,12 @@ public:
     // `prompt_share` times the time of the previous units (STRIX_BATCH_PROMPT_SHARE, default 0: one unit per
     // step; always when nothing decodes). Then one decode cycle
     // of every request past its prompt: a cohort cycle with two or more, the ordinary cycle with one.
-    void step() {
+    // Only a pending probe uses completion tracking. The default specialization
+    // has no additional tracking or health calls in its timing scopes.
+    template<bool track_completion = false>
+    auto step() {
         EngineCall call(engine_call_);
+        [[maybe_unused]] bool serial_completed = false;
         using clock = std::chrono::steady_clock;
         Slot* prompt = nullptr;
         bool decoding = false;
@@ -1077,6 +1083,8 @@ public:
         for(auto& owner:slots_) {
             auto& s=*owner;
             if(!s.active || s.prefilling || !s.request.constraint || s.greedy) continue;
+            [[maybe_unused]] std::uint64_t previous_cycles = 0;
+            if constexpr (track_completion) previous_cycles = s.result.cycles;
             const auto serial_start=clock::now();
             ++stats_.steps;++stats_.solo_steps;
             try {
@@ -1091,8 +1099,10 @@ public:
             // Serial work pays prompt debt too, including when no ordinary slot
             // remains to run the cohort timing scope below.
             prompt_debt_ms_-=std::chrono::duration<double,std::milli>(clock::now()-serial_start).count();
+            if constexpr (track_completion) serial_completed |= s.result.cycles != previous_cycles;
         }
-        run_decode_round();
+        if constexpr (track_completion) return run_decode_round() || serial_completed;
+        else (void)run_decode_round();
     }
 private:
     bool run_decode_round() {
@@ -2115,6 +2125,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         const auto is_stop=[&](std::uint32_t t){return std::find(q.stop_tokens.begin(),q.stop_tokens.end(),t)!=q.stop_tokens.end();};
                         const std::array<std::uint32_t,1> first{pending.predicted_token()};
                         out.generated_tokens=1;
+                        if(q.backend_probe) q.backend_probe->boundary(serve::BackendProof::work_completion);
                         if(!q.on_tokens(first))out.finish="cancelled";
                         else if(is_stop(first[0]))out.finish="stop";
                         while(out.finish=="length" && out.generated_tokens<q.max_tokens) {
@@ -2125,6 +2136,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                                     [state=q.constraint](auto row){return state->select(row);});
                                 q.constraint->commit();pending=std::move(next);++out.cycles;++out.generated_tokens;
                                 const std::array<std::uint32_t,1> token{pending.predicted_token()};
+                                if(q.backend_probe) q.backend_probe->boundary(serve::BackendProof::work_completion);
                                 if(!q.on_tokens(token))out.finish="cancelled";
                                 else if(is_stop(token[0]))out.finish="stop";
                                 continue;
@@ -2143,6 +2155,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                             pending=result.final_target;++out.cycles;
                             out.proposed+=result.proposed_candidates;out.accepted+=result.accepted_candidates;
                             out.generated_tokens+=result.emitted_tokens.size();
+                            if(q.backend_probe) q.backend_probe->boundary(serve::BackendProof::work_completion);
                             if(!q.on_tokens(result.emitted_tokens)){out.finish="cancelled";break;}
                             if(is_stop(result.emitted_tokens.back()))out.finish="stop";
                         }

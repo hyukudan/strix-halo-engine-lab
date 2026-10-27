@@ -7,6 +7,10 @@
 #include <unistd.h>
 #endif
 
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <fstream>
 #include <random>
 
@@ -55,6 +59,327 @@ public:
     mutable unsigned reads = 0;
     BackendHealth snapshot() const override { ++reads; return value; }
 };
+// Private-member access is confined to this test TU. Explicit instantiation permits
+// naming private members without a production seeding API or altered class definition.
+template<class Tag, typename Tag::Type Member> struct TestMember {
+    friend typename Tag::Type member(Tag) { return Member; }
+};
+struct RequestedTag {
+    using Type = std::atomic<std::uint64_t> BackendProbeSlot::*;
+    friend Type member(RequestedTag);
+};
+struct AcknowledgedTag {
+    using Type = std::atomic<std::uint64_t> BackendProbeSlot::*;
+    friend Type member(AcknowledgedTag);
+};
+struct OwnerTag {
+    using Type = std::uint64_t BackendProbeSlot::*;
+    friend Type member(OwnerTag);
+};
+template struct TestMember<RequestedTag, &BackendProbeSlot::requested_>;
+template struct TestMember<AcknowledgedTag, &BackendProbeSlot::acknowledged_>;
+template struct TestMember<OwnerTag, &BackendProbeSlot::owner_generation_>;
+
+// Deadlines are hang safeguards, never latency/performance assertions. On ordinary
+// failures callers release their rendezvous and shut down before joining. If an
+// internal queue deadlock prevents cleanup, the watchdog terminates this test process.
+class Watchdog {
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool done_ = false;
+    std::thread thread_;
+public:
+    Watchdog() : thread_([this] {
+        std::unique_lock lock(mutex_);
+        if (!changed_.wait_for(lock, std::chrono::seconds(20), [&] { return done_; })) {
+            std::cerr << "FAIL: concurrency watchdog expired\n";
+            std::_Exit(1);
+        }
+    }) {}
+    ~Watchdog() {
+        { std::lock_guard lock(mutex_); done_ = true; }
+        changed_.notify_all();
+        thread_.join();
+    }
+};
+struct Rendezvous {
+    std::mutex mutex;
+    std::condition_variable changed;
+    unsigned arrived = 0;
+    bool released = false;
+    void arrive() {
+        std::lock_guard lock(mutex);
+        ++arrived;
+        changed.notify_all();
+    }
+    bool wait(unsigned count) {
+        std::unique_lock lock(mutex);
+        return changed.wait_for(lock, std::chrono::seconds(5), [&] { return arrived >= count; });
+    }
+    void park() {
+        std::unique_lock lock(mutex);
+        ++arrived;
+        changed.notify_all();
+        if (!changed.wait_for(lock, std::chrono::seconds(5), [&] { return released; })) {
+            released = true;
+            changed.notify_all();
+        }
+    }
+    void release() {
+        std::lock_guard lock(mutex);
+        released = true;
+        changed.notify_all();
+    }
+};
+
+void probe_slot_tests() {
+    struct CounterSpy {
+        mutable unsigned loads = 0;
+        std::uint64_t load(std::memory_order order) const {
+            check(order == std::memory_order_relaxed, "owner load is relaxed");
+            ++loads; return 0;
+        }
+    } counter;
+    unsigned callbacks = 0;
+    if (detail::probe_generation(counter, 0)) ++callbacks;
+    check(counter.loads == 1 && callbacks == 0, "no-probe path exactly one load and no callback");
+    std::int64_t now = 4000000000;
+    unsigned clocks = 0, pauses = 0, wakes = 0;
+    BackendProbeSlot* slot_ptr = nullptr;
+    bool acknowledge = false;
+    BackendProbeSlot slot([&] { ++wakes; }, [&] { ++clocks; return now; }, [&] {
+        ++pauses; now += 10000000;
+        if (acknowledge) slot_ptr->boundary(BackendProof::work_completion);
+    });
+    slot_ptr = &slot;
+    slot.boundary(BackendProof::work_completion);
+    check(clocks == 0 && wakes == 0 && pauses == 0, "unrequested boundary has no clock/wake/wait");
+    auto health = slot.snapshot();
+    check(health.state == BackendState::probe_pending && now == 4100000000 && pauses == 10 && wakes == 1,
+        "no ACK has injectable 100 ms wait bound");
+    health = slot.snapshot();
+    check(wakes == 1 && now == 4200000000, "timeouts retain one pending generation");
+    acknowledge = true;
+    health = slot.snapshot();
+    check(health.state == BackendState::responsive && wakes == 1, "late ACK services original generation");
+    const auto paused = pauses;
+    health = slot.snapshot();
+    check(health.state == BackendState::responsive && pauses == paused && wakes == 1, "fresh proof cached without request");
+    now += 1000000001;
+    acknowledge = false;
+    health = slot.snapshot();
+    check(health.state == BackendState::probe_pending && wakes == 2 && *health.probe_age_seconds > 1.0,
+        "stale proof cannot establish readiness");
+    slot.boundary(BackendProof::control_only);
+    health = slot.snapshot();
+    check(health.state == BackendState::probe_pending && health.proof == BackendProof::control_only &&
+        !health.last_completion_age_seconds, "idle control ACK is explicitly not device proof");
+    slot.fail();
+    check(slot.snapshot().state == BackendState::failed, "failure latched independently of cached proof");
+
+    std::int64_t failure_time = 8000000000;
+    BackendProbeSlot* failing_ptr = nullptr;
+    BackendProbeSlot failing({}, [&] { return failure_time; }, [&] {
+        failure_time += 1000000;
+        failing_ptr->fail();
+    });
+    failing_ptr = &failing;
+    check(failing.snapshot().state == BackendState::failed && failure_time == 8001000000,
+        "failure during bounded wait returns without waiting for timeout");
+
+    unsigned exhausted_wakes = 0;
+    BackendProbeSlot exhausted([&] { ++exhausted_wakes; }, [] { return 4000000000LL; });
+    const auto maximum = std::numeric_limits<std::uint64_t>::max();
+    (exhausted.*member(RequestedTag{})).store(maximum);
+    (exhausted.*member(AcknowledgedTag{})).store(maximum);
+    exhausted.*member(OwnerTag{}) = maximum;
+    for (unsigned i = 0; i < 3; ++i) {
+        const auto evidence = exhausted.snapshot();
+        const auto response = render_health({}, evidence, "ready", "model", {});
+        check(evidence.state == BackendState::failed && response.status == 503,
+            "exhaustion permanently fails closed");
+        check((exhausted.*member(RequestedTag{})).load() == maximum &&
+            (exhausted.*member(AcknowledgedTag{})).load() == maximum &&
+            exhausted.pending_generation() == 0 && exhausted_wakes == 0,
+            "exhaustion never publishes zero or wakes owner");
+        exhausted.boundary(BackendProof::work_completion);
+    }
+
+    Watchdog watchdog;
+    // Concurrent real HTTP readers wait on one owner, with no generated jobs or observation arming.
+    GenerationQueue queue;
+    std::atomic<unsigned> wake_count{0}, clock_count{0};
+    BackendProbeSlot concurrent([&] { ++wake_count; }, [&] {
+        ++clock_count;
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    });
+    auto record = std::make_shared<ServeHealthRecord>();
+    record->interim_unchecked_http_success = true;
+    ApiConfig config; config.health_record = record;
+    config.health_provider = [&] { return concurrent.snapshot(); };
+    ApiService api(config, {}, queue, 8192, false); api.set_state("ready");
+    constexpr unsigned readers = 24;
+    Rendezvous start;
+    std::atomic<unsigned> pending{0};
+    std::vector<std::thread> threads;
+    for (unsigned i = 0; i < readers; ++i) threads.emplace_back([&] {
+        start.park();
+        const auto response = get(api);
+        const auto body = parse_json(response.body);
+        if (response.status == 200 && !at(body, "ready").as_bool() &&
+            at(at(body, "backend"), "state").as_string() == "probe_pending") ++pending;
+    });
+    observe_disarm();
+    check(start.wait(readers), "all pending readers rendezvous");
+    start.release();
+    for (auto& reader : threads) reader.join();
+    check(pending == readers && wake_count == 1, "many HTTP readers coalesce into one pending request");
+    const auto before = clock_count.load();
+    const auto generation = concurrent.pending_generation();
+    check(generation != 0, "batch owner captures pending generation before step");
+    concurrent.complete(generation, BackendProof::work_completion);
+    check(concurrent.pending_generation() == 0, "batch ACK clears captured generation");
+    check(clock_count == before + 1, "owner ACK uses one clock and never waits for readers");
+    check(at(parse_json(get(api).body), "ready").as_bool(), "owner completion makes API ready");
+    check(queue.snapshot().queued == 0 && queue.snapshot().running == 0 && !observe_armed(),
+        "health consumes no jobs and never arms observation");
+    concurrent.fail(); check(get(api).status == 503, "latched owner failure overrides interim 200");
+
+    Rendezvous rendezvous;
+    std::atomic<unsigned> ack_wakes{0}, responsive{0};
+    std::atomic<std::int64_t> controlled_now{4000000000};
+    BackendProbeSlot live_probe([&] { ++ack_wakes; }, [&] { return controlled_now.load(); }, [&] {
+        thread_local bool first_pause = true;
+        if (first_pause) { first_pause = false; rendezvous.park(); }
+        else std::this_thread::yield();
+    });
+    config.health_provider = [&] { return live_probe.snapshot(); };
+    ApiService live_api(config, {}, queue, 8192, false); live_api.set_state("ready");
+    threads.clear();
+    for (unsigned i = 0; i < readers; ++i) threads.emplace_back([&] {
+        const auto response = get(live_api);
+        if (response.status == 200 && at(parse_json(response.body), "ready").as_bool()) ++responsive;
+    });
+    const bool all_waiting = rendezvous.wait(readers);
+    check(all_waiting, "all ACK readers rendezvous under controlled clock");
+    if (all_waiting) live_probe.boundary(BackendProof::work_completion);
+    else live_probe.fail(); // release all readers even if the rendezvous failed
+    rendezvous.release();
+    for (auto& reader : threads) reader.join();
+    check(ack_wakes == 1 && responsive == readers, "concurrent HTTP readers share one owner ACK");
+}
+void queue_control_tests() {
+    Watchdog watchdog;
+    struct RecordingEngine final : GenerationEngine {
+        std::vector<std::uint32_t> seen;
+        GenerationStats generate(GenerationJob& job) override {
+            seen.push_back(job.prompt.at(0));
+            GenerationStats stats; stats.finish = "stop"; return stats;
+        }
+        std::uint64_t context_tokens() const override { return 8192; }
+    };
+    for (const bool batch : {false, true}) {
+        // Use the same engine and completion path for each owner API.
+        const auto own = [batch](GenerationQueue& queue, RecordingEngine& engine) {
+            if (!batch) { queue.run(engine); return; }
+            while (!queue.stopping()) {
+                if (auto job = queue.take(true)) queue.finish(*job, engine.generate(job->job));
+            }
+        };
+        // Retain the queue/probe integration check with a controlled clock.
+        GenerationQueue idle;
+        RecordingEngine idle_engine;
+        BackendProbeSlot idle_probe([&] { idle.wake_control(); }, [] { return 4000000000LL; },
+            [] { std::this_thread::yield(); });
+        idle.set_idle_control([&] { idle_probe.boundary(BackendProof::control_only); });
+        std::thread idle_owner([&] { own(idle, idle_engine); });
+        const auto idle_health = idle_probe.snapshot();
+        idle.shutdown();
+        idle_owner.join();
+        check(idle_health.state == BackendState::probe_pending && idle_health.proof == BackendProof::control_only &&
+            idle_engine.seen.empty(), "idle owner wake returns control-only proof without generation");
+
+        GenerationQueue fifo(128);
+        RecordingEngine engine;
+        std::vector<std::shared_ptr<GenerationTicket>> tickets;
+        std::vector<std::uint32_t> expected;
+        unsigned cancelled = 0;
+        for (std::uint32_t id = 0; id < 100; ++id) {
+            GenerationJob job; job.prompt = {id};
+            auto ticket = fifo.submit(std::move(job));
+            if (id % 7 == 0) { ticket->cancel(); ++cancelled; }
+            else expected.push_back(id);
+            tickets.push_back(std::move(ticket));
+        }
+        bool control_after_work = false;
+        unsigned controls = 0;
+        fifo.set_idle_control([&] {
+            ++controls;
+            const auto load = fifo.snapshot(); // callback must run outside queue mutex
+            control_after_work = engine.seen == expected && load.queued == 0 && load.running == 0 &&
+                load.completed == expected.size() && load.cancelled == cancelled;
+            fifo.shutdown(); // callback re-entry must not deadlock
+        });
+        for (unsigned i = 0; i < 100; ++i) fifo.wake_control();
+        std::thread owner([&] { own(fifo, engine); });
+        owner.join();
+        check(controls == 1 && control_after_work, "FIFO work and cancelled jobs precede coalesced control");
+        for (std::size_t i = 0; i < tickets.size(); ++i) {
+            bool done = false;
+            (void)tickets[i]->wait(std::chrono::milliseconds(0), done);
+            check(done && tickets[i]->stats().finish == (i % 7 == 0 ? "cancelled" : "stop"),
+                "every queued ticket completes with expected cancellation status");
+        }
+        check(!fifo.submit({}), "submission rejected after callback shutdown");
+
+        // First control is pending before the wait. Every subsequent wake follows
+        // an individually acknowledged callback and races its return to the wait.
+        GenerationQueue racing;
+        RecordingEngine no_work;
+        Rendezvous callbacks;
+        constexpr unsigned iterations = 128;
+        racing.set_idle_control([&] {
+            (void)racing.snapshot();
+            callbacks.arrive();
+        });
+        racing.wake_control();
+        std::thread waiter([&] { own(racing, no_work); });
+        bool all_wakes = true;
+        for (unsigned i = 1; i <= iterations; ++i) {
+            if (!callbacks.wait(i)) { all_wakes = false; break; }
+            if (i < iterations) racing.wake_control();
+        }
+        // Always clean up, including a failed handshake. No thread is detached.
+        racing.shutdown();
+        waiter.join();
+        check(all_wakes && callbacks.arrived == iterations && no_work.seen.empty(),
+            "bounded acknowledged wake/wait races lose no control and create no work");
+        check(!racing.submit({}), "submission rejected after wake/wait shutdown");
+
+        // Shutdown suppresses a pending control and cancels queued work, even
+        // when both predicates were established before the owner begins waiting.
+        GenerationQueue stopped;
+        RecordingEngine stopped_engine;
+        unsigned stopped_controls = 0;
+        stopped.set_idle_control([&] { ++stopped_controls; (void)stopped.snapshot(); });
+        auto dropped = stopped.submit({});
+        stopped.wake_control();
+        stopped.shutdown();
+        std::thread stopped_owner([&] {
+            if (batch) (void)stopped.take(true);
+            else stopped.run(stopped_engine);
+        });
+        stopped_owner.join();
+        bool done = false;
+        (void)dropped->wait(std::chrono::milliseconds(0), done);
+        check(stopped_controls == 0 && stopped_engine.seen.empty() && done &&
+            dropped->stats().finish == "cancelled" && stopped.snapshot().queued == 0,
+            "pending-control shutdown suppresses callback and cancels queued ticket");
+        check(!stopped.submit({}), "submission rejected after pending-control shutdown");
+    }
+}
+
 } // namespace
 int main(int argc, char** argv) {
     // CPU startup harness: the production helper and the decoder's generic outer-handler contract.
@@ -104,6 +429,8 @@ int main(int argc, char** argv) {
     }
     using namespace strix::serve;
     env("STRIX_SERVE_HEALTH_RECORD", nullptr);
+    probe_slot_tests();
+    queue_control_tests();
     GenerationQueue queue;
     ApiConfig legacy;
     legacy.model_id = "public-model-\"seed";
