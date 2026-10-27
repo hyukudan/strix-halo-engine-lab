@@ -117,6 +117,9 @@ private:
             row.prepare(); const auto id = row.select(logits); row.commit(); ++stats.generated_tokens;
             if (!job.on_tokens(std::span<const std::uint32_t>(&id, 1))) { stats.finish = "cancelled"; break; }
         }
+        const auto text=tokenizer_->decode(job.prompt);
+        if(text.find("ROUTE_MTP")!=std::string::npos)row.set_execution("mtp-host");
+        if(text.find("ROUTE_OFF")!=std::string::npos)row.set_execution("serial-host","selection-mtp-off");
         stats.constraint = row.verdict(stats.finish); return stats;
     }
     GenerationStats thinking_budget(GenerationJob& job) {
@@ -669,11 +672,20 @@ int main() try {
         auto reply = call("/v1/chat/completions", base, false);
         check(reply.status == 200, "chat score request executes");
         auto result = parse_json(reply.body);
+        check(at(at(result,"strix"),"selection_execution").as_string()=="serial-host" &&
+            at(at(result,"strix"),"selection_fallback").is_null(),"score-only resolved route receipt");
         const auto scores = at(at(first_choice(result), "logprobs"), "content");
         check(scores.size() == 3 && at(scores.as_array()[0], "token").as_string() == "a", "chat first-token and every score emitted");
         double sum = 0; for (std::size_t i = 0; i < tokenizer->vocab_size(); ++i) sum += std::exp((i == 'a' || i == 'b' ? 2.0 : i == 'c' ? -1.0 : -100.0) - 2);
         check(at(scores.as_array()[0], "logprob").as_double() == -std::log(sum), "wire logprob exactly equals reference");
         check(at(at(result, "strix"), "scoring").find("basis")->as_string() == "target-row-log-softmax", "score basis receipt");
+        for(const auto* marker:{"ROUTE_MTP","ROUTE_OFF"}) {
+            auto routed=base;routed.set("messages",parse_json(std::string("[{\"role\":\"user\",\"content\":\"")+marker+"\"}]"));
+            const auto wire=parse_json(call("/v1/chat/completions",routed,false).body);
+            const auto& receipt=at(wire,"strix");
+            check(at(receipt,"selection_execution").as_string()==(std::string(marker)=="ROUTE_MTP"?"mtp-host":"serial-host"),"wire resolved selection route");
+            check(std::string(marker)=="ROUTE_MTP"?at(receipt,"selection_fallback").is_null():at(receipt,"selection_fallback").as_string()=="selection-mtp-off","wire selection fallback reason");
+        }
         Json streamed = Json::array();
         for (const auto& e : sse_data(call("/v1/chat/completions", base, true).body)) {
             const auto* choices = e.find("choices"); if (!choices || !choices->size()) continue;
@@ -889,7 +901,7 @@ int main() try {
                 const auto cs = http(port, "POST", "/v1/chat/completions", chat.dump(), headers);
                 check(stream_text(cs.body, nullptr, nullptr, nullptr, nullptr) == answer, "chat SSE bytes equal nonstream bytes");
                 const auto events = sse_data(cs.body); verdict(events.front(), "in_progress"); verdict(events.back(), "complete");
-                if (headers == quiet) check(at(events.front(), "strix").size() == 1 && at(events.back(), "strix").size() == 1, "receipts off retains only mandatory constraint metadata");
+                if (headers == quiet) check(at(events.front(), "strix").size() == 3 && at(events.back(), "strix").size() == 3, "receipts off retains only mandatory constraint metadata");
                 const auto rs = sse_data(http(port, "POST", "/v1/responses", responses.dump(), headers).body);
                 std::string joined;
                 for (const auto& event : rs) if (at(event, "type").as_string() == "response.output_text.delta") joined += at(event, "delta").as_string();
@@ -948,7 +960,7 @@ int main() try {
                 check(at(v, "phase").as_string() == (reasoning ? "reasoning" : "answer") &&
                     at(v, "accepting").as_bool() == (execution && !reasoning), "HTTP preserves engine failure frontier");
                 check(at(failure_body, "error").is_object(), "failure envelope retains error detail");
-                if (headers == quiet) check(at(failure_body, "strix").size() == 1, "mandatory failure verdict with receipts off");
+                if (headers == quiet) check(at(failure_body, "strix").size() == 3, "mandatory failure verdict with receipts off");
             }
         }
         {

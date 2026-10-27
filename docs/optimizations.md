@@ -535,7 +535,11 @@ reproduces it.
 `text.format`).
 
 Token selection restricted to a declared JSON language (`json-object` or a `strix-json-schema-v1` schema), greedy, on a
-serial host route for the constrained request only.
+resolved `mtp-host` / `serial-host` route for the constrained request only.
+
+Host selection defaults to admitted serial-equivalent MTP windows (`mtp-host`), with
+`serial-host` fallback and per-request route/reason receipts. No MTP speed claim;
+[route admission and exactness](engine/serving/serving.md#policy-selection-routes).
 
 - **Preconditions:** `--http-serve`; a request with `response_format` / `text.format` `json_object` or `json_schema`,
   greedy, no stop strings, no tools.
@@ -544,8 +548,8 @@ serial host route for the constrained request only.
   never produced unconstrained in their place.
 - **Exactness evidence:** Constrained output is exact relative to its declared constrained target (masked greedy), not
   to unconstrained greedy. Unconstrained requests, alone and sharing the batch with constrained ones, keep their token
-  IDs and draft counters (GPU gate).
-- **Off switch:** `--http-constraints off`
+  IDs (GPU gate).
+- **Off switch:** `--http-constraints off`; `--http-selection-mtp off` keeps policy selection serial
 
 <a id="qwen-serve-progress"></a>
 
@@ -573,13 +577,17 @@ they prefill, from a host snapshot the engine updates after each completed prefi
 `thinking-budget-v1` closes reasoning no later than the request's budget by feeding the end-of-thinking token and the
 template separator through target execution, then lets the answer run (greedy or JSON-constrained).
 
+Host selection defaults to admitted serial-equivalent MTP windows (`mtp-host`), with
+`serial-host` fallback and per-request route/reason receipts. No MTP speed claim;
+[route admission and exactness](engine/serving/serving.md#policy-selection-routes).
+
 - **Preconditions:** `--http-serve`; a request with `strix.thinking_policy` (or Messages `budget_tokens` with
   `--http-anthropic-thinking-budget enforce`), thinking on, greedy, no stop strings, no tools.
-- **Automatic selection:** Only requests that ask for it; they decode on the serial host route, other slots unchanged.
+- **Automatic selection:** Only requests that ask for it; they use the resolved `mtp-host` / `serial-host` route, other slots unchanged.
 - **Fallback notice:** Impossible budgets and unsupported combinations are refused with 400.
 - **Exactness evidence:** Changes tokens by design (declared policy, reported as `closure: natural|forced`). A budget that
   is never reached yields the same token IDs as ordinary speculative greedy decoding (GPU gate).
-- **Off switch:** `--http-thinking-budget off`; Messages budgets are enforced only with `--http-anthropic-thinking-budget enforce`
+- **Off switch:** `--http-selection-mtp off` keeps policy selection serial; `--http-thinking-budget off`; Messages budgets are enforced only with `--http-anthropic-thinking-budget enforce`
 
 <a id="qwen-serve-logprobs"></a>
 
@@ -590,12 +598,16 @@ template separator through target execution, then lets the answer run (greedy or
 `logprobs` / `top_logprobs` report the log-softmax of the exact row each token was selected from. `logit-transform-v1`
 applies repetition (on raw logits), presence and frequency penalties and `logit_bias` before greedy selection.
 
+Host selection defaults to admitted serial-equivalent MTP windows (`mtp-host`), with
+`serial-host` fallback and per-request route/reason receipts. No MTP speed claim;
+[route admission and exactness](engine/serving/serving.md#policy-selection-routes).
+
 - **Preconditions:** `--http-serve`; greedy requests (sampling with these is refused for now).
-- **Automatic selection:** Only requests that ask for them (non-neutral values); they decode on the serial host route.
+- **Automatic selection:** Only requests that ask for them (non-neutral values); they use the resolved `mtp-host` / `serial-host` route.
 - **Fallback notice:** Neutral values (zero penalties, empty bias, `logprobs` false) keep the ordinary route.
 - **Exactness evidence:** Logprobs never change the selected tokens: IDs equal ordinary speculative greedy decoding
   (GPU gate). Transforms change tokens by design and are labelled `greedy-logit-transform-v1`.
-- **Off switch:** `--http-logprobs off`, `--http-logit-transforms off`
+- **Off switch:** `--http-logprobs off`, `--http-logit-transforms off`; `--http-selection-mtp off` keeps policy selection serial
 
 ## DeepSeek two-node
 

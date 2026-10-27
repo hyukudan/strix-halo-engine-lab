@@ -580,6 +580,13 @@ int main(){try{
         baseline.push_back("--staged-moe-router-logits");
         reject_as(baseline,"duplicate staged MoE router logits option","duplicate staged logits rejected");
     }
+    {
+        auto args=request();require(parse(args).http_selection_mtp,"selection MTP defaults on");
+        args.insert(args.end(),{"--http-selection-mtp","off"});require(!parse(args).http_selection_mtp,"selection MTP off");
+        args.back()="on";require(parse(args).http_selection_mtp,"selection MTP on");
+        args.back()="invalid";reject_as(args,"--http-selection-mtp requires on|off","selection MTP invalid value");
+        args.pop_back();reject_as(args,"--http-selection-mtp requires a value","selection MTP missing value");
+    }
     expert_copy_cli_contract();
     depth_policy_options_contract();
     return 0;

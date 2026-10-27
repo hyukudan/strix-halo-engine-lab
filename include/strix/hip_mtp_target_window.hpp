@@ -2,6 +2,7 @@
 #include "strix/hip_mtp_resources.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/speculative_verify_runtime.hpp"
+#include "strix/mtp_selection_transaction.hpp"
 #include <functional>
 #include <memory>
 #include <span>
@@ -20,6 +21,7 @@ public:
     HipMtpTargetWindowBatch()=default;
     [[nodiscard]] bool valid() const noexcept;
     [[nodiscard]] std::uint32_t logical_rows() const;
+    [[nodiscard]] const MtpSelectionPrefix* selection_prefix() const;
     [[nodiscard]] std::uint64_t chunk_begin() const;
     [[nodiscard]] std::uint64_t chunk_end() const;
     [[nodiscard]] std::uint64_t source_position(std::uint32_t row) const;
@@ -71,6 +73,8 @@ public:
     // tokens; it may replace tokens. Empty (the default) keeps first-max selection.
     using RowSelection=std::function<void(std::span<const ExecutionBufferAddress>,std::span<std::uint32_t>)>;
     void set_row_selection(RowSelection);
+    using TransactionSelection=std::function<MtpSelectionPrefix(std::span<const ExecutionBufferAddress>)>;
+    void set_transaction_selection(TransactionSelection);
 private:
     friend class HipKnownPrefixWindow;
     friend class HipMtpTargetWindowBatch;

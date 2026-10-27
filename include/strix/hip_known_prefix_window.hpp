@@ -147,6 +147,7 @@ public:
     // Prefix acceptance (deferred GDN / PLE rows windows). The window executed all rows but only
     // [0, n_keep) are committed; the caller rewinds its session frontier to match.
     [[nodiscard]] bool defers_state() const noexcept;
+    [[nodiscard]] bool policy_selection_admitted() const noexcept;
     void commit_prefix(std::uint32_t n_keep);
     // Applies pending GDN rows before any ordinary serial token touches GDN state.
     void flush_deferred();

@@ -19,6 +19,8 @@ struct HipMtpWindowVerificationPolicy {
 struct HipMtpVerifiedTargetRows {
     std::vector<HipMtpTargetHiddenTicket> committed_rows;
     std::vector<std::uint32_t> emitted_tokens;
+    std::shared_ptr<MtpSelectionReceipt> selection_receipt;
+    std::optional<std::string> selection_failure;
     // Candidate inputs actually evaluated (window payload excluding padding, or serial comparisons).
     std::uint32_t verified_candidates=0,accepted_candidates=0;
     bool attempted_window=false,accepted_window=false,restored_checkpoint=false;
@@ -48,6 +50,7 @@ struct HipMtpCohortVerifyRequest {
     std::uint32_t rows=0;
     // Sampled decoding: one draft distribution per candidate (empty when the target selects first-max).
     std::span<const TokenDraft> drafts;
+    MtpSelectionTransaction* transaction=nullptr;
 };
 // One actual closed known-row window per cycle, with retained capture pools per owner.
 // Several prefix owners (distinct 2/4/8 rows over one session) share one deferred
@@ -84,7 +87,8 @@ public:
         const HipMtpTargetHiddenTicket& initial,std::span<const std::uint32_t> candidates,
         std::uint32_t output_budget,std::span<const std::uint32_t> eos_tokens,
         std::span<const float> candidate_probabilities={},std::span<const TokenDraft> sampled_drafts={},
-        std::span<const float> candidate_runner_ups={});
+        std::span<const float> candidate_runner_ups={},MtpSelectionTransaction* transaction=nullptr);
+    [[nodiscard]] bool policy_selection_admitted() const noexcept;
     // Whether one more draft can still pay off. Min-p controller: the next larger window, with the remaining
     // drafts assumed as likely as the last one, beats the best window the current drafts already allow.
     // Survival controller: some longer chain, at the calibrated lookahead acceptance, beats the best option

@@ -155,6 +155,17 @@ struct CompiledKnownPrefixWindow {
         window.gdn_deferred_rows_steps || window.ple_rows_steps || window.lm_head_rows_steps ||
         window.router_rows_steps || window.combine_inject_rows_steps;
 }
+// Closed serial-derived rows only. Actual native owner admission also checks
+// runtime folds/model family. Recipe identities describe the executed window;
+// they are not relabelled as serial identities to claim equivalence.
+[[nodiscard]] inline bool known_window_policy_serial_rows(const CompiledKnownPrefixWindow& window) noexcept {
+    if(window.output_policy!=KnownWindowOutputPolicy::all_rows ||
+       (window.logical_rows!=2U && window.logical_rows!=4U && window.logical_rows!=8U))return false;
+    for(const auto v:window.r2_variant)
+        if(v==KnownWindowR2Variant::gdn_q8_virtual256_r2_v1 ||
+           static_cast<std::uint32_t>(v)>static_cast<std::uint32_t>(KnownWindowR2Variant::routed_a8_union_rows8_v1))return false;
+    return true;
+}
 // Modes dispatched through one KnownWindowRowsEntry covering every row.
 [[nodiscard]] inline bool known_window_rows_mode(KnownWindowStepMode mode) noexcept {
     return mode == KnownWindowStepMode::shared_rows || mode == KnownWindowStepMode::gdn_rows ||

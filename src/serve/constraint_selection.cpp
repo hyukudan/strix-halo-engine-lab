@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <type_traits>
 
 namespace strix::serve {
 
@@ -99,6 +100,92 @@ void ConstraintSelection::commit(const Staged& staged) {
     // Descendants still identify this frontier, but serial requests do not retain
     // a token-count-sized ancestry chain (or recursively destroy one at finish).
     state_.frontier->parent.reset();
+}
+
+void ConstraintSelection::publish_prefix(const std::shared_ptr<Frontier>& base, const std::vector<Staged>& records) {
+    if (base != state_.frontier) throw ConstraintError("stale or empty constraint window");
+    if(records.empty())return;
+    auto parent = base;
+    for (const auto& record : records) {
+        if (!record.state.frontier || record.state.frontier->parent != parent)
+            throw ConstraintError("noncontiguous constraint window");
+        parent = record.state.frontier;
+    }
+    // All copying/allocation and lock acquisition precede publication. Each score
+    // move and the final state installation are nonthrowing after reserve.
+    auto final_state = records.back().state;
+    std::vector<TokenScore> scores;
+    if (spec_->logprobs) {
+        scores.reserve(records.size());
+        for (const auto& record : records) scores.push_back(record.score);
+    }
+    static_assert(std::is_nothrow_move_constructible_v<TokenScore>);
+    static_assert(std::is_nothrow_move_assignable_v<State>);
+    const auto install = [&]() noexcept {
+        for (auto& score : scores) spec_->scores->tokens.push_back(std::move(score));
+        state_ = std::move(final_state);
+        state_.frontier->parent.reset();
+    };
+    if (spec_->logprobs) {
+        std::lock_guard lock(spec_->scores->mutex);
+        auto& tokens = spec_->scores->tokens;
+        if (scores.size() > tokens.max_size() - tokens.size()) throw std::length_error("constraint score storage overflow");
+        tokens.reserve(tokens.size() + scores.size());
+        install();
+    } else install();
+}
+
+class ConstraintWindowReceipt final : public MtpSelectionReceipt {
+public:
+    explicit ConstraintWindowReceipt(std::shared_ptr<ConstraintSelection> selection,
+        std::shared_ptr<ConstraintSelection::Frontier> base)
+        : selection_(std::move(selection)), base_(std::move(base)) {}
+    void publish() override {
+        if (published_) throw ConstraintError("already published constraint window");
+        selection_->publish_prefix(base_, records_);
+        published_ = true;
+    }
+    std::size_t size() const noexcept override { return records_.size(); }
+private:
+    friend class ConstraintWindowSelection;
+    // Binding the request owner, not a slot address, is the request-generation
+    // identity: a receipt can never publish into a replacement slot's selector.
+    std::shared_ptr<ConstraintSelection> selection_;
+    std::shared_ptr<ConstraintSelection::Frontier> base_;
+    std::vector<ConstraintSelection::Staged> records_;
+    bool published_ = false;
+};
+
+std::unique_ptr<MtpSelectionTransaction> ConstraintSelection::window_transaction() {
+    return std::make_unique<ConstraintWindowSelection>(shared_from_this());
+}
+ConstraintWindowSelection::ConstraintWindowSelection(std::shared_ptr<ConstraintSelection> selection)
+    : selection_(std::move(selection)) {
+    if (!selection_) throw std::invalid_argument("null constraint selection");
+    reset();
+}
+void ConstraintWindowSelection::reset() {
+    auto state = selection_->state();
+    discard();
+    base_ = state.frontier;
+    branch_ = std::move(state);
+}
+void ConstraintWindowSelection::discard() noexcept { records_.clear(); branch_.reset(); base_.reset(); }
+std::uint32_t ConstraintWindowSelection::select(std::span<const float> row) try {
+    if (!branch_) throw ConstraintError("inactive constraint window");
+    auto staged = selection_->select(row, selection_->prepare(*branch_));
+    auto next = staged.state;
+    const auto id = staged.token;
+    records_.push_back(std::move(staged));
+    *branch_ = std::move(next);
+    return id;
+} catch(const ConstraintError& e) {throw MtpSelectionError(e.what());}
+std::unique_ptr<MtpSelectionReceipt> ConstraintWindowSelection::seal() {
+    if (!branch_) throw ConstraintError("inactive or empty constraint window");
+    auto receipt = std::make_unique<ConstraintWindowReceipt>(selection_, base_);
+    receipt->records_.swap(records_);
+    discard();
+    return receipt;
 }
 
 ConstraintVerdict ConstraintSelection::verdict(std::string finish, std::string execution) const {

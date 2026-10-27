@@ -113,6 +113,17 @@ struct HipMtpWindowVerifier::Impl {
     std::vector<double> external;
     bool timing_independent=false;
     std::vector<float> sampled_logits;
+    HipMtpTargetWindowCapture::TransactionSelection transaction_selection(MtpSelectionTransaction& transaction,
+        void* stream,std::span<const std::uint32_t> candidates,std::uint32_t rows,std::uint32_t budget,
+        std::span<const std::uint32_t> eos) {
+        return [&transaction,stream,candidates,rows,budget,eos,host=std::vector<float>{},vocab=target->model().vocab_size](
+            std::span<const ExecutionBufferAddress> logits) mutable {
+            return walk_mtp_selection(candidates,rows,budget,eos,[&](std::size_t r) {
+                read_hip_logits_row(logits[r],static_cast<std::uint32_t>(vocab),stream,host);
+                return transaction.select(host);
+            });
+        };
+    }
     std::unique_ptr<MtpMinPWindowController> minp;
     std::unique_ptr<MtpDepthWindowController> depth;
     std::unique_ptr<HipTokenSamplerDevice> device_sampler; // sampling-v1 on the GPU (STRIX_SAMPLE_PATH=host: host)
@@ -481,8 +492,17 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
         SerialSessionContext previous;
         std::shared_ptr<HipMtpTargetWindowCapture> capture;
     };
+    struct DiscardAttempts {std::span<const HipMtpCohortVerifyRequest> requests;
+        ~DiscardAttempts(){for(const auto& q:requests)if(q.transaction)q.transaction->discard();}} discard_attempts{requests};
     std::vector<Prepared> prepared(requests.size());
     std::vector<HipKnownPrefixCohortMember> members(requests.size());
+    if(std::any_of(requests.begin(),requests.end(),[](const auto& q){return q.transaction!=nullptr;}))
+        for(const auto* primary:primaries)require(!primary || primary->policy_selection_admitted(),"MTP cohort primary arithmetic is not serial equivalent");
+    // The selections borrow the requests' spans: never leave them attached past the call.
+    struct ClearSelections {
+        std::vector<Prepared>& p;
+        ~ClearSelections(){for(auto& x:p) if(x.capture) {x.capture->set_row_selection({});x.capture->set_transaction_selection({});}}
+    } clear_selections{prepared};
     for(std::size_t a=0;a<requests.size();++a) {
         const auto& q=requests[a];
         require(q.verifier && q.session && q.initial,"MTP cohort verification request is incomplete");
@@ -518,14 +538,14 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
         for(std::uint32_t r=1;r<q.rows;++r) p.inputs.push_back(q.candidates.empty()?pending:
             q.candidates[std::min<std::size_t>(r-1U,q.candidates.size()-1U)]);
         members[a]={owner->window.get(),q.session,p.inputs,p.capture};
+        if(q.transaction) {
+            require(!sampler && q.verifier->policy_selection_admitted(),"MTP cohort policy route is not serial equivalent");
+            q.transaction->reset();
+            p.capture->set_transaction_selection(i.transaction_selection(*q.transaction,p.capture->source_stream(),q.candidates,q.rows,q.budget,q.eos));
+        }
         if(sampler) p.capture->set_row_selection(i.sampled_selection(sampler,session.next_position+1U,p.capture->source_stream(),
             q.rows,std::min(q.rows,q.budget),q.drafts,q.eos));
     }
-    // The selections borrow the requests' spans: never leave them attached past the call.
-    struct ClearSelections {
-        std::vector<Prepared>& p;
-        ~ClearSelections(){for(auto& x:p) if(x.capture) x.capture->set_row_selection({});}
-    } clear_selections{prepared};
     for(auto& p:prepared) {
         // The previous owner's PLE commit runs on its own stream.
         if(p.impl->last && p.impl->last!=p.owner &&
@@ -550,28 +570,35 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
             result.projection_launches_saved=natives[a].execution.projection_launches_saved;
             auto provisional=std::make_shared<const HipMtpTargetWindowBatch>(std::move(natives[a].batch));
             std::vector<std::uint32_t> selected;selected.reserve(rows);
-            for(std::uint32_t row=0;row<rows;++row)selected.push_back(provisional->predicted_token(row));
+            for(std::uint32_t row=0;row<(provisional->selection_prefix()?provisional->selection_prefix()->decided_rows:rows);++row)selected.push_back(provisional->predicted_token(row));
             // Longest accepted prefix: row a+1's input equals row a's prediction.
             std::uint32_t k=0;
-            while(k+1U<rows && k<q.candidates.size() && k+1U<q.budget && p.inputs[k+1U]==selected[k] && !is_eos(selected[k])) ++k;
-            const auto n_keep=k+1U;
-            p.owner->window->commit_prefix(n_keep);i.last=p.owner;
-            if(n_keep<rows) {
-                const auto dropped=rows-n_keep;
+            while(!q.transaction && k+1U<rows && k<q.candidates.size() && k+1U<q.budget && p.inputs[k+1U]==selected[k] && !is_eos(selected[k])) ++k;
+            const auto n_keep=q.transaction?static_cast<std::uint32_t>(provisional->selection_prefix()->decided_rows):k+1U;
+            if(q.transaction) k=static_cast<std::uint32_t>(provisional->selection_prefix()->accepted_draft_inputs);
+            // Prefix owners require one consumed input at row-zero failure.
+            // Never promote a ticket or emit an ID for that undecided row.
+            const auto committed=std::max(1U,n_keep);
+            if(q.transaction)result.selection_failure=provisional->selection_prefix()->selection_failure;
+            p.owner->window->commit_prefix(committed);i.last=p.owner;
+            if(committed<rows) {
+                const auto dropped=rows-committed;
                 session.next_position-=dropped;session.committed_tokens-=dropped;
                 const auto& last=session.arithmetic_lineage.intervals.back();
                 session.arithmetic_lineage=prepare_known_window_chunk_lineage(p.previous.arithmetic_lineage,last.begin,
-                    last.begin+n_keep,last.numerical_plan_identity,last.reduction_plan_identity,last.state_update_identity);
+                    last.begin+committed,last.numerical_plan_identity,last.reduction_plan_identity,last.state_update_identity);
                 write_position_word(i.resources,session.next_position-1U);
             }
-            result.committed_rows=i.target->accept_verified_prefix(provisional,*q.initial,session,n_keep);
+            if(n_keep)result.committed_rows=i.target->accept_verified_prefix(provisional,*q.initial,session,n_keep);
             result.emitted_tokens.assign(selected.begin(),selected.begin()+n_keep);
             result.accepted_candidates=k;result.accepted_window=n_keep==rows;
-            if(q.probabilities.size()==q.candidates.size())i.minp->calibrate(q.probabilities,k,rows-1U);
+            if(q.transaction) {result.selection_receipt=q.transaction->seal();
+                require(result.selection_receipt->size()==n_keep && result.committed_rows.size()==n_keep,"MTP cohort receipt lengths differ");}
+            if(!q.transaction && q.probabilities.size()==q.candidates.size())i.minp->calibrate(q.probabilities,k,rows-1U);
             i.skip_sample();
             provisional.reset();
             natives[a]={};
-            p.capture->set_row_selection({});
+            p.capture->set_row_selection({});p.capture->set_transaction_selection({});
             p.capture.reset();
             i.busy=false;
         }
@@ -805,11 +832,15 @@ std::vector<HipMtpWindowOptionStats> HipMtpWindowVerifier::option_stats() const 
     out.push_back({0U,0U,impl_->draft_samples,impl_->draft_ms_ema});
     return out;
 }
+bool HipMtpWindowVerifier::policy_selection_admitted() const noexcept {
+    return std::all_of(impl_->owners.begin(),impl_->owners.end(),[](const auto& o){return o.window->policy_selection_admitted();});
+}
 HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& session,DirectLaunchDispatcher& dispatcher,
     const HipMtpTargetHiddenTicket& initial,std::span<const std::uint32_t> candidates,
     std::uint32_t budget,std::span<const std::uint32_t> eos,std::span<const float> probabilities,
-    std::span<const TokenDraft> drafts,std::span<const float> runner_ups) {
+    std::span<const TokenDraft> drafts,std::span<const float> runner_ups,MtpSelectionTransaction* transaction) {
     auto& i=*impl_;
+    struct DiscardAttempt {MtpSelectionTransaction* t;~DiscardAttempt(){if(t)t->discard();}} discard_attempt{transaction};
     // Matched-position diagnostics: execute a physical owner, but commit only one
     // exact target row. Every arm therefore visits the same target frontiers.
     const bool diagnostic=hip_mtp_full_chain_diagnostic();
@@ -865,7 +896,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
     const auto active=option?option->active:rows;
     out.chosen_rows=active;
     const auto calibrate=[&](std::size_t accepted,std::size_t verified) {
-        if(probabilities.size()!=candidates.size()) return;
+        if(transaction || probabilities.size()!=candidates.size()) return;
         if(survival) i.survival_calibrate(probabilities,runner_ups,accepted,verified);
         else {
             i.minp->calibrate(probabilities,accepted,verified);
@@ -877,6 +908,8 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
         else i.observe(window?owner:nullptr,emitted);
     };
     std::shared_ptr<HipMtpTargetWindowCapture> capture;
+    struct ClearSelection {std::shared_ptr<HipMtpTargetWindowCapture>& c;~ClearSelection(){if(c){c->set_row_selection({});c->set_transaction_selection({});}}} clear_selection{capture};
+    if(transaction) {require(!sampler && policy_selection_admitted(),"MTP policy route is not serial equivalent");transaction->reset();}
     if(use_window) {
         for(const auto& pool:owner->captures)if(pool->ready_for_reuse()){capture=pool;break;}
         require(!!capture,"MTP window capture pools are retained by previous batch readers");
@@ -886,9 +919,15 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
         if(sampler) capture->set_row_selection(i.sampled_selection(sampler,session.next_position+1U,capture->source_stream(),
             active,std::min(active,budget),drafts,eos)); // padding rows are never decided
         else capture->set_row_selection({});
+        if(transaction) capture->set_transaction_selection(i.transaction_selection(*transaction,capture->source_stream(),
+            candidates,diagnostic?1U:active,budget,eos));
     }
     // The selection borrows this call's locals: never leave it attached past the call.
-    struct ClearSelection {HipMtpTargetWindowCapture* c;~ClearSelection(){if(c)c->set_row_selection({});}} clear_selection{sampler?capture.get():nullptr};
+
+    const auto seal=[&] {if(transaction) {out.accepted_candidates=static_cast<std::uint32_t>(out.emitted_tokens.empty()?0:out.emitted_tokens.size()-1U);
+        out.selection_receipt=transaction->seal();
+        require(out.selection_receipt->size()==out.emitted_tokens.size() && out.committed_rows.size()==out.emitted_tokens.size(),
+            "MTP transaction retained rows, IDs and records differ");}};
     i.busy=true;bool attempted_target=false;
     try {
         if(use_window && i.prefix) {
@@ -907,24 +946,29 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             out.projection_launches_saved=native.execution.projection_launches_saved;
             auto provisional=std::make_shared<const HipMtpTargetWindowBatch>(std::move(native.batch));
             std::vector<std::uint32_t> selected;selected.reserve(rows);
-            for(std::uint32_t row=0;row<rows;++row)selected.push_back(provisional->predicted_token(row));
+            for(std::uint32_t row=0;row<(provisional->selection_prefix()?provisional->selection_prefix()->decided_rows:rows);++row)selected.push_back(provisional->predicted_token(row));
             // Longest accepted prefix: row a+1's input equals row a's prediction.
             std::uint32_t a=0;
-            while(!diagnostic && a+1U<active && a<candidates.size() && a+1U<budget && inputs[a+1U]==selected[a] && !is_eos(selected[a])) ++a;
-            const auto n_keep=a+1U;
+            while(!transaction && !diagnostic && a+1U<active && a<candidates.size() && a+1U<budget && inputs[a+1U]==selected[a] && !is_eos(selected[a])) ++a;
+            const auto n_keep=transaction?static_cast<std::uint32_t>(provisional->selection_prefix()->decided_rows):a+1U;
+            if(transaction) a=static_cast<std::uint32_t>(provisional->selection_prefix()->accepted_draft_inputs);
             host_phase_mark("7a select/accept");
-            owner->window->commit_prefix(n_keep);i.last=owner;
+            // Prefix owners require one consumed input at row-zero failure.
+            // Never promote a ticket or emit an ID for that undecided row.
+            const auto committed=std::max(1U,n_keep);
+            if(transaction)out.selection_failure=provisional->selection_prefix()->selection_failure;
+            owner->window->commit_prefix(committed);i.last=owner;
             host_phase_mark("7b commit prefix");
-            if(n_keep<rows) {
-                const auto dropped=rows-n_keep;
+            if(committed<rows) {
+                const auto dropped=rows-committed;
                 session.next_position-=dropped;session.committed_tokens-=dropped;
                 const auto& last=session.arithmetic_lineage.intervals.back();
                 session.arithmetic_lineage=prepare_known_window_chunk_lineage(previous.arithmetic_lineage,last.begin,
-                    last.begin+n_keep,last.numerical_plan_identity,last.reduction_plan_identity,last.state_update_identity);
+                    last.begin+committed,last.numerical_plan_identity,last.reduction_plan_identity,last.state_update_identity);
                 write_position_word(i.resources,session.next_position-1U);
             }
             host_phase_mark("7c lineage");
-            out.committed_rows=i.target->accept_verified_prefix(provisional,initial,session,n_keep);
+            if(n_keep)out.committed_rows=i.target->accept_verified_prefix(provisional,initial,session,n_keep);
             host_phase_mark("7d accept prefix");
             out.emitted_tokens.assign(selected.begin(),selected.begin()+n_keep);
             out.accepted_candidates=a;out.accepted_window=n_keep==active;
@@ -935,9 +979,9 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             host_phase_mark("7f release provisional");
             {auto done=std::move(native);}
             host_phase_mark("7g release native");
-            capture.reset();
+            capture->set_transaction_selection({});capture->set_row_selection({});capture.reset();
             host_phase_mark("7h release capture");
-            i.busy=false;return out;
+            seal();i.busy=false;return out;
         }
         if(i.prefix && i.last) i.last->window->flush_deferred();
         if(use_window) {
@@ -954,23 +998,37 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             out.projection_launches_saved=native.execution.projection_launches_saved;
             auto provisional=std::make_shared<const HipMtpTargetWindowBatch>(std::move(native.batch));
             std::vector<std::uint32_t> selected;selected.reserve(rows);
-            for(std::uint32_t row=0;row<rows;++row)selected.push_back(provisional->predicted_token(row));
-            const auto decision=assess_mtp_target_window(inputs,selected,pending,budget,eos,vocabulary);
-            if(decision.accepts_complete_chunk()) {
+            for(std::uint32_t row=0;row<(provisional->selection_prefix()?provisional->selection_prefix()->decided_rows:rows);++row)selected.push_back(provisional->predicted_token(row));
+            const bool complete=transaction?(selected.size()==rows && provisional->selection_prefix()->accepted_draft_inputs==rows-1U &&
+                std::none_of(inputs.begin(),inputs.end(),is_eos)):
+                assess_mtp_target_window(inputs,selected,pending,budget,eos,vocabulary).accepts_complete_chunk();
+            if(complete) {
                 out.committed_rows=i.target->accept_verified_window(provisional,initial,session,eos,budget);
                 out.emitted_tokens=std::move(selected);out.accepted_candidates=rows-1;out.accepted_window=true;
-                i.checkpoint->discard();i.observe(owner,rows);i.busy=false;return out;
+                i.checkpoint->discard();i.observe(owner,rows);seal();i.busy=false;return out;
             }
             // No provisional row has been promoted. Restore the exact actual
             // checkpoint, then select/reverify the serial greedy continuation.
             if(i.bounded)i.checkpoint->restore_window(session,*provisional);else i.checkpoint->restore(session);
+            if(transaction)out.selection_failure=provisional->selection_prefix()->selection_failure;
+            if(out.selection_failure.has_value())out.emitted_tokens=std::move(selected);
             provisional.reset();out.restored_checkpoint=true;
             require(session_equal(initial.committed_session(),session),"MTP rejected window did not restore exact target frontier");
+            if(out.selection_failure.has_value()) {
+                // The request ends: retain its decided selection records while
+                // leaving this checkpoint owner at the restored model frontier.
+                out.selection_receipt=transaction->seal();i.busy=false;return out;
+            }
+            if(transaction){transaction->discard();transaction->reset();}
         }
         for(std::size_t index=0;out.emitted_tokens.size()<budget && session.next_position<capacity;++index) {
             auto ticket=i.target->execute_serial(session,i.resources,dispatcher,pending,
-                index<drafts.size()?&drafts[index]:nullptr);
+                index<drafts.size()?&drafts[index]:nullptr,
+                transaction?HipMtpHostRowSelector{[&](auto row){
+                    try{return transaction->select(row);}catch(const MtpSelectionError& e){out.selection_failure=e.what();return 0U;}
+                }}:HipMtpHostRowSelector{});
             attempted_target=true;
+            if(out.selection_failure.has_value())break;
             pending=ticket.predicted_token();out.committed_rows.push_back(std::move(ticket));out.emitted_tokens.push_back(pending);
             if(index<candidates.size()) out.verified_candidates=std::max(out.verified_candidates,static_cast<std::uint32_t>(index+1U));
             const bool accepted=index<candidates.size() && candidates[index]==pending;
@@ -979,8 +1037,9 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
         }
         calibrate(out.accepted_candidates,out.emitted_tokens.size());
         observe(use_window,out.emitted_tokens.size());
-        i.busy=false;return out;
+        seal();i.busy=false;return out;
     } catch(...) {
+        if(transaction)transaction->discard();
         i.failed=true;i.busy=false;
         // Producers/checkpoint own cleanup for their submitted operations.
         // Do not synchronize or poison a purely rejected predispatch scope.

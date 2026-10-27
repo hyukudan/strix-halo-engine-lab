@@ -2430,6 +2430,11 @@ KnownWindowOutputPolicy HipKnownPrefixWindow::output_policy() const noexcept { r
 std::optional<HipKnownPrefixUnionObservation> HipKnownPrefixWindow::latest_routed_union_observation() const noexcept {
     return impl_->failed?std::nullopt:impl_->last_union_observation;
 }
+bool HipKnownPrefixWindow::policy_selection_admitted() const noexcept {
+    const auto& i=*impl_;
+    if(i.prefill || i.scope.gsq_model || i.inject_norm_enabled() || i.combine_inject_enabled() || i.commit_combine_enabled()) return false;
+    return known_window_policy_serial_rows(i.window);
+}
 bool HipKnownPrefixWindow::defers_state() const noexcept {
     return impl_->window.gdn_deferred_rows_steps || impl_->window.ple_rows_steps;
 }

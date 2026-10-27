@@ -2,14 +2,18 @@
 
 #include <stdexcept>
 #include <unordered_map>
+#include "strix/mtp_selection_transaction.hpp"
 #include "strix/serve/engine.hpp"
 #include "strix/serve/json_constraint.hpp"
 
 namespace strix::serve {
 
+class ConstraintWindowSelection;
+class ConstraintWindowReceipt;
+
 // A branch is a copy of the committed output frontier. Selection advances only
 // that branch; publish it with commit only after the model prefix commits.
-class ConstraintSelection {
+class ConstraintSelection : public std::enable_shared_from_this<ConstraintSelection> {
 public:
     struct Frontier {
         std::shared_ptr<Frontier> parent;
@@ -39,13 +43,32 @@ public:
     [[nodiscard]] Prepared prepare(const State&) const;
     [[nodiscard]] Staged select(std::span<const float>, const Prepared&) const;
     void commit(const Staged&);
+    [[nodiscard]] std::unique_ptr<MtpSelectionTransaction> window_transaction();
     [[nodiscard]] const State& state() const { return state_; }
     [[nodiscard]] ConstraintVerdict verdict(std::string finish, std::string execution) const;
 private:
+    friend class ConstraintWindowReceipt;
+    void publish_prefix(const std::shared_ptr<Frontier>&, const std::vector<Staged>&);
     std::shared_ptr<const ConstraintSpec> spec_;
     std::shared_ptr<const TokenByteTrie> trie_;
     std::shared_ptr<const BpeTokenizer> tokenizer_;
     State state_;
+};
+
+// One request-owned attempt. Sealing transfers all records to a receipt; reset
+// starts a new attempt at the current committed frontier, including after replay.
+class ConstraintWindowSelection final : public MtpSelectionTransaction {
+public:
+    explicit ConstraintWindowSelection(std::shared_ptr<ConstraintSelection>);
+    void reset() override;
+    void discard() noexcept override;
+    std::uint32_t select(std::span<const float>) override;
+    std::unique_ptr<MtpSelectionReceipt> seal() override;
+private:
+    std::shared_ptr<ConstraintSelection> selection_;
+    std::optional<ConstraintSelection::State> branch_;
+    std::shared_ptr<ConstraintSelection::Frontier> base_;
+    std::vector<ConstraintSelection::Staged> records_;
 };
 
 // One serial output transaction. A per-call target callback stages the token;
@@ -64,9 +87,12 @@ public:
         if (!staged_) throw std::logic_error("constraint row did not select a token");
         selection_->commit(*staged_); staged_.reset(); prepared_.reset();
     }
-    ConstraintVerdict verdict(const std::string& finish) const { return selection_->verdict(finish, "serial-host"); }
+    [[nodiscard]] std::unique_ptr<MtpSelectionTransaction> window_transaction() {return selection_->window_transaction();}
+    void set_execution(std::string route,std::string fallback={}) {execution_=std::move(route);fallback_=std::move(fallback);}
+    ConstraintVerdict verdict(const std::string& finish) const {auto v=selection_->verdict(finish,execution_);v.execution_fallback=fallback_;return v;}
 private:
     std::shared_ptr<ConstraintSelection> selection_;
+    std::string execution_="serial-host",fallback_;
     std::optional<ConstraintSelection::Prepared> prepared_;
     std::optional<ConstraintSelection::Staged> staged_;
 };
