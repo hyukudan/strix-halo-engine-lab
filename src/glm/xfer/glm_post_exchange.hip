@@ -27,7 +27,7 @@ __device__ __forceinline__ float reduce(const float* local, const float* peer, u
 }
 
 __global__ __launch_bounds__(256) void post_expand_kernel(const float* X, const float* mix, const float* local, const float* peer,
-                                                          RxView v, unsigned rank, float* Xo, unsigned* flag) {
+                                                          RxView v, unsigned rank, float* Xo, unsigned* flag, unsigned flag_stride) {
     if (peer == nullptr) {
         glmx_wait(v);
         peer = static_cast<const float*>(v.payload);
@@ -42,7 +42,7 @@ __global__ __launch_bounds__(256) void post_expand_kernel(const float* X, const 
         const float mx = ((c[0 * kHc + i] * Xr[d] + c[1 * kHc + i] * Xr[kHidden + d]) + c[2 * kHc + i] * Xr[2 * kHidden + d]) +
                          c[3 * kHc + i] * Xr[3 * kHidden + d];
         const float o = m[kHc + i] * yd + mx;
-        flag_if(flag, o);
+        flag_if(flag ? flag + blockIdx.y * flag_stride : nullptr, o);
         Xo[static_cast<std::size_t>(r) * kHc * kHidden + i * kHidden + d] = o;
     }
 }
@@ -58,7 +58,7 @@ __global__ __launch_bounds__(256) void hc_bracket_kernel(const float* X, const f
 }
 
 __global__ __launch_bounds__(256) void post_expand_bracket_kernel(const float* B, const float* mix, const float* local, const float* peer,
-                                                                  RxView v, unsigned rank, float* Xo, unsigned* flag) {
+                                                                  RxView v, unsigned rank, float* Xo, unsigned* flag, unsigned flag_stride) {
     if (peer == nullptr) {
         glmx_wait(v);
         peer = static_cast<const float*>(v.payload);
@@ -70,7 +70,7 @@ __global__ __launch_bounds__(256) void post_expand_bracket_kernel(const float* B
     for (unsigned i = 0; i < kHc; ++i) {
         const std::size_t k = static_cast<std::size_t>(r) * kHc * kHidden + i * kHidden + d;
         const float o = m[kHc + i] * yd + B[k];
-        flag_if(flag, o);
+        flag_if(flag ? flag + blockIdx.y * flag_stride : nullptr, o);
         Xo[k] = o;
     }
 }
@@ -157,8 +157,8 @@ void hc_pre_v2(const float* X, const float* fn, const float* base, const float* 
 }
 
 void post_expand(const float* X, const float* mix, const float* local, const float* peer, const RxView& view, unsigned rank,
-                 float* Xout, unsigned* flag, unsigned rows, hipStream_t s) {
-    post_expand_kernel<<<dim3(kHidden / 256, rows), 256, 0, s>>>(X, mix, local, peer, view, rank, Xout, flag);
+                 float* Xout, unsigned* flag, unsigned rows, hipStream_t s, unsigned flag_stride) {
+    post_expand_kernel<<<dim3(kHidden / 256, rows), 256, 0, s>>>(X, mix, local, peer, view, rank, Xout, flag, flag_stride);
     ok(hipGetLastError(), "glm post_expand");
 }
 void hc_bracket(const float* X, const float* mix, float* B, unsigned rows, hipStream_t s) {
@@ -166,8 +166,8 @@ void hc_bracket(const float* X, const float* mix, float* B, unsigned rows, hipSt
     ok(hipGetLastError(), "glm hc_bracket");
 }
 void post_expand_bracket(const float* B, const float* mix, const float* local, const float* peer, const RxView& view,
-                         unsigned rank, float* Xout, unsigned* flag, unsigned rows, hipStream_t s) {
-    post_expand_bracket_kernel<<<dim3(kHidden / 256, rows), 256, 0, s>>>(B, mix, local, peer, view, rank, Xout, flag);
+                         unsigned rank, float* Xout, unsigned* flag, unsigned rows, hipStream_t s, unsigned flag_stride) {
+    post_expand_bracket_kernel<<<dim3(kHidden / 256, rows), 256, 0, s>>>(B, mix, local, peer, view, rank, Xout, flag, flag_stride);
     ok(hipGetLastError(), "glm post_expand_bracket");
 }
 

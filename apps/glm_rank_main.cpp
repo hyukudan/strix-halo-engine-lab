@@ -14,7 +14,9 @@
 //                                    emitted tokens, every committed row's logits and the flushed frontier-bounded
 //                                    state must equal the plain run's bit for bit
 //   --spec-run K[,K,...] --decode N --prompt A.u32[,B.u32,...]   paired fixed-count MTP benchmark; requires
-//                                    --spec 1 --mtp 1 --prefill ref, identity r1b|r1, automatic decode Xfer; SPV1 records
+//                                    --spec 1 --mtp 1, identity r1b|r1, automatic decode Xfer; SPV1 records
+//   --mtp-prefill ref|chunked       spec-run bootstrap (default ref; chunked uses exact gemv, rejects WMMA)
+//   --mtp-prefill-gate PROMPT.u32   one-load bitwise bootstrap/state + K=3 continuation gate; --decode N (default 32)
 //   --g4 RMAX --steps N --prompt T.u32   G4 mandatory-bitwise half: the probe stream (prompt prefill + N greedy steps) runs
 //                                    inside batches R = 1..RMAX, at row/slot 0 and at row/slot R-1, next to synthetic
 //                                    streams (token 1000 + r from position 0); its per-step logits bits and tokens must
@@ -30,9 +32,12 @@
 //                                    rows and the flushed state up to T must be equal bit for bit (the --tf identity)
 //   --mem-plan                       memory plan only (design notes): dry-run plan of every device allocation,
 //                                    calibration of one hipMalloc's physical cost, admission check; loads no weight, no peer
+// Options: --mtp-spec 0|1 (STRIX_GLM_MTP_SPEC; CLI wins), --mtp-k 0..7, --mtp-adaptive 0|1
+//   --spec-run also accepts a for adaptive Kmax=3; normal eligible decode defaults to adaptive Kmax=3.
 // Options: --slots S --capacity C --mtp 0|1 --raw-linears 0|1 --out FILE --identity r1|r1b|r1b-all
 // Defaults (glm_rank_defaults.hpp): every measured optimization is ON and resolves to the production receipt
-// (R1b, exact chunked prefill, --mtp 0, hp host path, ...); each has its own off switch, --baseline / STRIX_GLM_BASELINE=1
+// (R1b, exact chunked prefill, MTP self-speculation on eligible decode when the model has a complete MTP head, hp host
+// path, ...); each has its own off switch (--mtp 0 / --mtp-spec 0: plain decode), --baseline / STRIX_GLM_BASELINE=1
 // switches all of them off (explicit settings win), --print-effective-config prints the resolution and exits (no GPU).
 // Identity default: r1b = R1 prompts + R1b generated forwards.
 // r1 = R1 throughout; r1b-all = R1b throughout (reference prefill required).
@@ -54,6 +59,7 @@
 #include "glm/engine/glm_fast_moe.hpp"
 #include "glm/prefill/glm_pf_path.hpp"
 #include "glm/spec/glm_spec_host.hpp"
+#include "glm/spec/glm_spec_run.hpp"
 #include "glm/xfer/glm_xfer_exchange.hpp"
 
 #include <unistd.h>
@@ -142,6 +148,7 @@ int main(int argc, char** argv) {
         ge::Options opt;
         opt.model_dir = argv[1];
         std::string transport_spec, g3_tokens, prompt, out_path, tf_tokens, state_out, state_in;
+        std::string mtp_prefill = "ref", mtp_prefill_gate;
         std::string prefill_mode = "auto", pf_gate, pf_ttft, pf_ttft_mode = "gemv", pf_null_study, pf_nulls;
         bool reference_gate = false;
         bool pf_before_load = false, pf_swap_moe = false;
@@ -163,7 +170,7 @@ int main(int argc, char** argv) {
             };
             if (a == "--ab" || a == "--aba" || a == "--g3-sweep" || a == "--aba-attn3" || a == "--aba-xch" ||
                 a == "--g4" || a == "--tf" || a == "--spec-oracle" || a == "--spec-run" || a == "--state-in" || a == "--state-out" ||
-                a == "--pf-gate" || a == "--pf-ttft" || a == "--pf-null-study")  // the pf modes install their own paths
+                a == "--mtp-prefill-gate" || a == "--pf-gate" || a == "--pf-ttft" || a == "--pf-null-study")  // the pf modes install their own paths
                 reference_gate = true;
             if (a == "--world") opt.world = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--rank") opt.rank = static_cast<std::uint32_t>(std::stoul(next()));
@@ -188,6 +195,8 @@ int main(int argc, char** argv) {
             else if (a == "--steps") batch_steps = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--slots") opt.slots = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--capacity") opt.capacity = std::stoull(next());
+            else if (a == "--mtp-prefill") mtp_prefill = next();
+            else if (a == "--mtp-prefill-gate") mtp_prefill_gate = next();
             else if (a == "--prefill") prefill_mode = next();  // auto (default) | ref | gemv (exact) | wmma (D10)
             else if (a == "--pf-install-before-load") pf_before_load = true;
             else if (a == "--pf-swap-moe") pf_swap_moe = true;  // --pf-gate test (world 2): a fresh fast MoE seam set right before the gemv run  // test: --prefill path set before load() (installed at its end)
@@ -201,7 +210,8 @@ int main(int argc, char** argv) {
             else if (a == "--raw-linears") opt.raw_linears = std::stoul(next()) != 0;
             else if (a == "--spec") opt.spec = std::stoul(next()) != 0;
             else if (a == "--spec-oracle") spec_k = static_cast<unsigned>(std::stoul(next()));
-            else if (a == "--spec-run") spec_run = static_cast<unsigned>(std::stoul(next()));
+            else if (a == "--spec-run") { (void)next(); spec_run = 1; }
+            else if (a == "--mtp-spec" || a == "--mtp-k" || a == "--mtp-adaptive") (void)next();
             else if (a == "--pattern") {
                 std::string v = next();
                 for (std::size_t p = 0; p < v.size();) {
@@ -235,8 +245,10 @@ int main(int argc, char** argv) {
             else if (a == "--print-effective-config") print_config = true;
             else throw std::invalid_argument("unknown option " + a);
         }
+        if (mtp_prefill != "ref" && mtp_prefill != "chunked")
+            throw std::invalid_argument("--mtp-prefill must be ref or chunked");
         namespace rd = strix::glm::rank_defaults;
-        const auto eff = rd::resolve(rd::scan(std::vector<std::string>(argv + 2, argv + argc)), rd::process_env());
+        const auto eff = rd::resolve(rd::scan(std::vector<std::string>(argv + 2, argv + argc)), rd::process_env(), rd::probe_model_mtp(argv[1]));
         if (print_config) {  // dry run: no environment change, no GPU, no peer
             std::fputs(rd::print(eff).c_str(), stdout);
             return 0;
@@ -244,6 +256,10 @@ int main(int argc, char** argv) {
         rd::apply_env(eff, [](const char* k, const char* v) { (void)::setenv(k, v, 0); });
         opt.mtp = eff.mtp.value == "1";
         if (eff.max_rows.source != "explicit") opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
+        opt.spec = eff.spec.value == "1";
+        bool mtp_spec_on = eff.mtp_spec.value == "1";
+        if (!mtp_prefill_gate.empty() && (!opt.spec || !opt.mtp))
+            throw std::invalid_argument("--mtp-prefill-gate requires --spec 1 --mtp 1");
         if (eff.identity.source == "baseline") opt.identity = ge::IdentityMode::kR1;
         if (eff.decode_xch.source == "baseline") opt.decode_xfer = false;
         if (eff.baseline) std::printf("baseline: default-on optimizations off (old path), explicit settings kept\n");
@@ -264,7 +280,7 @@ int main(int argc, char** argv) {
         if (pf_before_load && prefill_mode != "gemv" && prefill_mode != "wmma")
             throw std::invalid_argument("--pf-install-before-load needs --prefill gemv|wmma");
         if (prefill_mode == "auto")
-            prefill_mode = rd::resolve_prefill_auto(opt.mtp, opt.spec, g3_only, smoke_head, mem_plan, r1b_all, idcheck_n, reference_gate);
+            prefill_mode = rd::resolve_prefill_auto(opt.mtp, opt.spec, g3_only, smoke_head, mem_plan, r1b_all, idcheck_n, reference_gate, mtp_spec_on);
         if (prefill_mode != eff.prefill) throw std::logic_error("prefill resolution differs from --print-effective-config");
         if (batch_r > opt.slots) opt.slots = batch_r;
         if (g4_rmax > opt.slots) opt.slots = g4_rmax;
@@ -322,9 +338,13 @@ int main(int argc, char** argv) {
         }
         const auto lr = eng.load();
         const auto load_identity = eng.identity_mode();
-        std::printf("rank %u: load %.1f s, %.1f GiB read, device %.1f GiB (layers %u, mtp %d) identity %s decode-xch %s", opt.rank, lr.seconds,
+        std::printf("rank %u: load %.1f s, %.1f GiB read, device %.1f GiB (layers %u, mtp %d) identity %s decode-xch %s%s%s%s%s", opt.rank, lr.seconds,
                     lr.gib_read, lr.device_gib, opt.layers, opt.mtp ? 1 : 0, ge::identity_mode_name(load_identity),
-                    xfer_exchange ? "xfer (external)" : opt.world == 1 ? "local" : eng.decode_xfer_enabled() ? "xfer" : "comm");
+                    xfer_exchange ? "xfer (external)" : opt.world == 1 ? "local" : eng.decode_xfer_enabled() ? "xfer" : "comm",
+                    std::getenv("STRIX_GLM_HC_NORM") ? " hc-norm=" : "",
+                    std::getenv("STRIX_GLM_HC_NORM") ? std::getenv("STRIX_GLM_HC_NORM") : "",
+                    std::getenv("STRIX_GLM_MOE_PIPE") ? " moe-pipe=" : "",
+                    std::getenv("STRIX_GLM_MOE_PIPE") ? std::getenv("STRIX_GLM_MOE_PIPE") : "");
         if (load_identity != ge::IdentityMode::kR1) {
             const char* hc = std::getenv("STRIX_GLM_R1B_HC");
             std::printf(" r1b-dense %d r1b-hc %d", strix::glm::r1b::dense_variant(), hc ? std::atoi(hc) : 4);
@@ -336,10 +356,87 @@ int main(int argc, char** argv) {
             std::printf("rank %u: mem-plan ADMITTED (nothing loaded)\n", opt.rank);
             return 0;
         }
+        // Cache exactly the truncated token lists consumed by normal decode, including their order.
+        std::vector<std::vector<std::uint32_t>> decode_prompts;
+        std::uint32_t prompt_hash = 2166136261U;
+        // Gate modes (--mtp-prefill-gate, ...) return before the decode loop and may
+        // carry --decode without --prompt.
+        if (decode_n > 0 && spec_k == 0 && spec_run == 0 && !prompt.empty()) {
+            for (std::size_t a = 0; a <= prompt.size();) {
+                const auto b = std::min(prompt.find(',', a), prompt.size());
+                auto toks = read_u32(prompt.substr(a, b - a));
+                if (prompt_max > 0 && toks.size() > prompt_max) toks.resize(prompt_max);
+                // boundaries are part of the agreement: each prompt's length, then its tokens, then the prompt count
+                auto mix = [&](std::uint32_t w) {
+                    for (unsigned byte = 0; byte < 4; ++byte) prompt_hash = (prompt_hash ^ ((w >> (8 * byte)) & 255U)) * 16777619U;
+                };
+                mix(static_cast<std::uint32_t>(toks.size()));
+                for (const auto token : toks) mix(token);
+                decode_prompts.push_back(std::move(toks));
+                a = b + 1;
+            }
+            for (unsigned byte = 0; byte < 4; ++byte)
+                prompt_hash = (prompt_hash ^ ((static_cast<std::uint32_t>(decode_prompts.size()) >> (8 * byte)) & 255U)) * 16777619U;
+        }
+        // External Xfer never resolves mtp-spec and must not be initialized by this handshake.
+        if (xch_kind == "xfer" && mtp_spec_on)
+            throw std::logic_error("external Xfer must not resolve mtp-spec");
+        if (xch_kind == "comm" && opt.world == 2 && decode_n > 0 && !reference_gate) {
+            // Admission (eng.load) precedes agreement: a one-node admission failure is an error, not a fallback.
+            // Use the fallback CommExchange, including ranks that locally resolved plain decode.
+            const bool eligible = mtp_spec_on && opt.mtp && opt.spec && opt.layers == 45 &&
+                                  (prefill_mode == "ref" || prefill_mode == "gemv");
+            // bits: kmax[0:3], adaptive[4], prefill[5:6], identity[7:8], spec-xch[9], decode-xfer[10].
+            const std::uint32_t packed = eff.kmax | (eff.adaptive ? 1U << 4 : 0U) |
+                ((prefill_mode == "ref" ? 1U : prefill_mode == "gemv" ? 2U : 3U) << 5) |
+                (static_cast<std::uint32_t>(load_identity) << 7) |
+                (eff.env.at("STRIX_GLM_SPEC_XCH").value == "xfer" ? 1U << 9 : 0U) |
+                (eng.decode_xfer_enabled() ? 1U << 10 : 0U);
+            const std::uint32_t fields[] = {
+                eligible ? 1U : 0U, packed, opt.max_rows, decode_n,
+                static_cast<std::uint32_t>(opt.capacity), static_cast<std::uint32_t>(opt.capacity >> 32),
+                opt.slots, prompt_hash};
+            const char* names[] = {"eligible", "config", "max_rows", "decode_n", "capacity-lo", "capacity-hi", "slots", "prompt-fnv1a"};
+            constexpr unsigned field_count = sizeof(fields) / sizeof(fields[0]);
+            static_assert(field_count <= 8);
+            ge::Exchange::MergeRow rows[field_count];
+            for (unsigned i = 0; i < field_count; ++i) {
+                rows[i].value = static_cast<float>(fields[i]);
+                rows[i].id = fields[i];
+                rows[i].flag = eligible ? 0U : 1U;
+            }
+            ge::Exchange::MergeCtl ctl;
+            ctl.kind = strix::glm::spec::kEligibilityMerge;
+            // Engine exposes no stream accessor. nullptr is safe only for this Comm fallback:
+            // CommExchange::merge synchronizes with hipMemcpy/hipStreamSynchronize; rows are host data.
+            eng.exchange()->merge(rows, field_count, ctl, nullptr);
+            bool mismatch = false;
+            std::string local_fields;
+            for (unsigned i = 0; i < field_count; ++i) {
+                // field 0 (eligibility) may differ: that is the coordinated plain fallback, not a mismatch
+                mismatch = mismatch || (i != 0 && rows[i].id != fields[i]);
+                if (i != 0) local_fields += ", ";
+                local_fields += std::string(names[i]) + "=" + std::to_string(fields[i]);
+            }
+            // R18 picks the maximum value (ties: lower id); only the losing rank may see a difference.
+            // OR that observation in a second round so both ranks reject before any forward.
+            ge::Exchange::MergeRow vote;
+            vote.flag = mismatch ? 1U : 0U;
+            ge::Exchange::MergeCtl vote_ctl;
+            vote_ctl.kind = strix::glm::spec::kConfigurationMismatchMerge;
+            eng.exchange()->merge(&vote, 1, vote_ctl, nullptr);
+            if (vote.flag != 0)
+                throw std::runtime_error("TP2 ranks resolved different decode configurations: " + local_fields);
+            mtp_spec_on = rows[0].flag == 0;
+            if (!mtp_spec_on)
+                std::printf("rank %u mtp-spec: unavailable on at least one rank (head or precondition); using plain decode\n", opt.rank);
+        }
+        if (mtp_spec_on && profile)
+            std::printf("rank %u mtp-spec: --profile covers plain steps only; skipping decode profile\n", opt.rank);
         if (prefill_mode != "ref" && !pf_before_load) {  // chunked prefill, installed after the load so its admission check sees real free memory
             namespace pf = strix::glm::pf;
             const unsigned heads = 64 / opt.world;
-            const auto b = pf::prefill_budget(heads, heads, opt.capacity, opt.max_rows);
+            const auto b = pf::prefill_budget(heads, heads, opt.capacity, opt.max_rows, opt.mtp);
             std::shared_ptr<ge::PrefillPath> path;
             try {
                 path = pf::make_prefill_path(heads, heads, opt.capacity, opt.max_rows,
@@ -468,12 +565,147 @@ int main(int argc, char** argv) {
             if (!tok_eq || mism != 0 || !state_eq) throw std::runtime_error("SP1a FAIL");
             std::printf("rank %u SP1a PASS\n", opt.rank);
         }
+        if (!mtp_prefill_gate.empty()) {
+            namespace pf = strix::glm::pf;
+            namespace sp = strix::glm::spec;
+            if (eng.identity_mode() == ge::IdentityMode::kR1bAll || prefill_mode == "wmma")
+                throw std::invalid_argument("MTP prefill gate requires R1 prompts and the exact gemv identity");
+            const auto toks = read_u32(mtp_prefill_gate);
+            const unsigned N = decode_n == 0 ? 32U : decode_n;
+            if (toks.empty() || toks.size() > opt.capacity || N + 8ULL > opt.capacity - toks.size())
+                throw std::invalid_argument("MTP prefill gate needs a nonempty prompt and L + N + 8 <= capacity");
+            for (auto t : toks)
+                if (t >= 154880U) throw std::invalid_argument("MTP prefill gate token outside vocabulary");
+            struct Result {
+                std::uint32_t y0 = 0;
+                ge::Engine::MtpOut mtp;
+                std::vector<std::uint8_t> hp, state;
+                std::vector<std::uint32_t> tokens;
+                double bootstrap_ms = 0, decode_ms = 0;
+            };
+            auto run = [&](bool chunked) {
+                eng.reset(0);
+                const auto identity = eng.identity_mode();
+                std::uint32_t seq = 0;
+                auto ctl = [&](unsigned kind) {
+                    ge::Exchange::MergeCtl c;
+                    c.kind = kind;
+                    c.step = seq++;
+                    return c;
+                };
+                Result r;
+                const auto t0 = Clock::now();
+                if (chunked) {
+                    auto c = ctl(2);
+                    const auto b = eng.prefill_mtp(0, toks, 0, c);
+                    r.y0 = b.y0;
+                    r.mtp = b.mtp;
+                } else {
+                    struct Scope {
+                        ge::Engine& e;
+                        ge::IdentityMode saved;
+                        explicit Scope(ge::Engine& engine) : e(engine), saved(e.identity_mode()) {
+                            e.set_identity_mode(ge::IdentityMode::kR1);
+                        }
+                        ~Scope() { e.set_identity_mode(saved); }
+                    } scope(eng);
+                    for (std::size_t j = 0; j < toks.size(); ++j) {
+                        const ge::Row row{0, toks[j], j};
+                        r.y0 = eng.step({&row, 1})[0];
+                        const auto t = j + 1 < toks.size() ? toks[j + 1] : r.y0;
+                        auto c = ctl(2);
+                        r.mtp = eng.mtp(0, eng.last_hidden(), {&t, 1}, j, c);
+                    }
+                }
+                const auto t1 = Clock::now();
+                r.bootstrap_ms = 1000.0 * secs(t0, t1);
+                r.hp.resize(4096 * sizeof(float));
+                if (hipMemcpy(r.hp.data(), eng.mtp_hidden(), r.hp.size(), hipMemcpyDeviceToHost) != hipSuccess)
+                    throw std::runtime_error("MTP prefill gate hidden copy");
+                r.state = eng.state_bytes(0);  // deliberately includes every unused DSA/indexer suffix
+                r.tokens.push_back(r.y0);
+                const float* hp = eng.mtp_hidden();
+                std::vector<std::uint32_t> drafts;
+                if (!r.mtp.flagged) drafts.push_back(r.mtp.id[0]);
+                std::uint64_t p = toks.size();
+                const auto td = Clock::now();
+                while (r.tokens.size() < N) {
+                    const auto remaining = N - static_cast<unsigned>(r.tokens.size());
+                    const unsigned limit = std::min(3U, remaining - 1);
+                    if (drafts.size() > limit) drafts.resize(limit);
+                    while (!drafts.empty() && drafts.size() < limit) {
+                        const auto t = drafts.back();
+                        auto c = ctl(3);
+                        const auto m = eng.mtp(0, hp, {&t, 1}, p + drafts.size() - 1, c);
+                        if (m.flagged) break;
+                        drafts.push_back(m.id[0]);
+                        hp = eng.mtp_hidden();
+                    }
+                    std::vector<std::uint32_t> rows{r.tokens.back()};
+                    rows.insert(rows.end(), drafts.begin(), drafts.end());
+                    auto c = ctl(1);
+                    const auto v = eng.verify(0, rows, p, c);
+                    unsigned first_flag = sp::kNoFlag;
+                    for (unsigned j = 0; j < v.flag.size(); ++j)
+                        if (v.flag[j] != 0 && first_flag == sp::kNoFlag) first_flag = j;
+                    if (v.replay_flag) throw std::runtime_error("MTP prefill gate replay flagged");
+                    const auto a = sp::accept_greedy(drafts, v.id, first_flag, sp::Terminal{sp::kNoFlag, remaining});
+                    if (a.abort) throw std::runtime_error("MTP prefill gate required row flagged");
+                    r.tokens.insert(r.tokens.end(), drafts.begin(), drafts.begin() + a.m);
+                    if (a.has_bonus) r.tokens.push_back(a.bonus);
+                    eng.commit(0, a.rows, p);
+                    if (!a.stop) {
+                        if (!a.has_bonus) throw std::logic_error("MTP prefill gate missing bonus");
+                        std::vector<std::uint32_t> cu(drafts.begin(), drafts.begin() + a.m);
+                        cu.push_back(a.bonus);
+                        drafts.clear();
+                        auto cm = ctl(2);
+                        const auto m = eng.mtp(0, eng.last_hidden(), cu, p, cm);
+                        if (!m.flagged) {
+                            drafts.push_back(m.id[a.m]);
+                            hp = eng.mtp_hidden() + static_cast<std::size_t>(a.m) * 4096;
+                        }
+                    }
+                    p += a.rows;
+                }
+                eng.flush(0);
+                r.decode_ms = 1000.0 * secs(td, Clock::now());
+                if (eng.identity_mode() != identity) throw std::logic_error("MTP bootstrap identity was not restored");
+                return r;
+            };
+            eng.set_prefill(ge::reference_prefill());
+            const auto ref = run(false);
+            const unsigned heads = 64 / opt.world;
+            eng.set_prefill(pf::make_prefill_path(heads, heads, opt.capacity, opt.max_rows, pf::TierB::gemv));
+            const auto chunk = run(true);
+            const bool y = ref.y0 == chunk.y0;
+            const bool m = ref.mtp.id == chunk.mtp.id && ref.mtp.flagged == chunk.mtp.flagged &&
+                           std::memcmp(&ref.mtp.confidence, &chunk.mtp.confidence, sizeof(float)) == 0;
+            const bool h = ref.hp == chunk.hp, s = ref.state == chunk.state, t = ref.tokens == chunk.tokens;
+            const bool ok = y && m && h && s && t;
+            std::printf("rank %u %s mtp-prefill chunked == bootstrap (L=%zu C=%u N=%u y0=%u mtp=%u hp=%u state=%u tokens=%u state_bytes=%zu ref_ms=%.3f chunked_ms=%.3f ref_decode_ms=%.3f chunked_decode_ms=%.3f)\n",
+                        opt.rank, ok ? "OK" : "FAIL", toks.size(), opt.max_rows, N, y, m, h, s, t, ref.state.size(),
+                        ref.bootstrap_ms, chunk.bootstrap_ms, ref.decode_ms, chunk.decode_ms);
+            if (!ok) throw std::runtime_error("MTP prefill bitwise gate failed");
+            return 0;
+        }
         if (spec_run > 0) {
+            namespace pf = strix::glm::pf;
             namespace sp = strix::glm::spec;
             if (!opt.spec || !opt.mtp || decode_n < 2 || prompt.empty())
                 throw std::invalid_argument("--spec-run needs --spec 1 --mtp 1 --decode N (N >= 2) and nonempty prompts");
-            if (prefill_mode != "ref" || pf_before_load)
-                throw std::invalid_argument("--spec-run requires --prefill ref (no installed chunked PrefillPath)");
+            if (mtp_prefill == "ref" && (prefill_mode != "ref" || pf_before_load))
+                throw std::invalid_argument("--spec-run with --mtp-prefill ref requires --prefill ref");
+            if (mtp_prefill == "chunked" && prefill_mode == "wmma")
+                throw std::invalid_argument("--mtp-prefill chunked requires the exact gemv identity");
+            std::shared_ptr<ge::PrefillPath> mtp_path;
+            if (mtp_prefill == "chunked") {
+                eng.set_prefill(ge::reference_prefill());
+                const unsigned heads = 64 / opt.world;
+                mtp_path = pf::make_prefill_path(heads, heads, opt.capacity, opt.max_rows, pf::TierB::gemv);
+                eng.set_prefill(mtp_path);  // admit/warm once before the timed bootstrap
+                eng.set_prefill(ge::reference_prefill());
+            }
             const auto identity = eng.identity_mode();
             if (identity != ge::IdentityMode::kR1b && identity != ge::IdentityMode::kR1)
                 throw std::invalid_argument("--spec-run requires actual identity r1b or r1");
@@ -486,15 +718,11 @@ int main(int argc, char** argv) {
             for (std::size_t a = 0; a <= raw_ks.size();) {
                 const auto b = std::min(raw_ks.find(',', a), raw_ks.size());
                 // Each element is exactly one decimal digit: reject signs, whitespace and suffixes.
-                if (b != a + 1 || raw_ks[a] < '1' || raw_ks[a] > '7')
-                    throw std::invalid_argument("--spec-run expects a comma list of integers 1..7");
-                ks.push_back(static_cast<unsigned>(raw_ks[a] - '0'));
+                if (b != a + 1 || (raw_ks[a] != 'a' && (raw_ks[a] < '1' || raw_ks[a] > '7')))
+                    throw std::invalid_argument("--spec-run expects a comma list of integers 1..7 or a");
+                ks.push_back(raw_ks[a] == 'a' ? 0U : static_cast<unsigned>(raw_ks[a] - '0'));
                 a = b + 1;
             }
-            const unsigned max_r = std::max(4U, *std::max_element(ks.begin(), ks.end()) + 1);
-            // CommExchange's merge packet includes control plus 12 bytes per row.
-            if (opt.world == 2 && std::size_t{opt.max_rows} * 8 < sizeof(ge::Exchange::MergeCtl) + 12 * max_r)
-                throw std::invalid_argument("--spec-run needs larger --max-rows for speculative merge packets");
             struct Prompt {
                 std::string name, category;
                 std::vector<std::uint32_t> tokens;
@@ -523,14 +751,6 @@ int main(int argc, char** argv) {
                 prompts.push_back(std::move(pr));
                 a = b + 1;
             }
-            struct IdentityScope {
-                ge::Engine& engine;
-                ge::IdentityMode saved;
-                explicit IdentityScope(ge::Engine& e) : engine(e), saved(e.identity_mode()) {
-                    engine.set_identity_mode(ge::IdentityMode::kR1);
-                }
-                ~IdentityScope() { engine.set_identity_mode(saved); }
-            };
             auto ms = [](Clock::time_point a, Clock::time_point b) { return 1000.0 * secs(a, b); };
             auto equal = [&](const Prompt& pr, unsigned k, const auto& expected, const auto& actual) {
                 for (std::size_t j = 0; j < std::max(expected.size(), actual.size()); ++j) {
@@ -544,7 +764,7 @@ int main(int argc, char** argv) {
                     }
                 }
             };
-            struct Sample { unsigned kind, r, replay; double elapsed; };  // 1 verify, 2 extension, 3 catch-up
+            using Sample = sp::TimingSample;  // 1 verify, 2 extension, 3 catch-up
             struct Pool { std::string category; std::vector<Sample> samples; };
             std::vector<Pool> pools;
             auto curve = [&](const char* name, unsigned k, const char* scope, const std::vector<Sample>& samples) {
@@ -598,6 +818,7 @@ int main(int argc, char** argv) {
                 const auto& pr = prompts[pi];
                 const auto& toks = pr.tokens;
                 const std::uint64_t L = toks.size();
+                auto plain_cost = sp::seeded_cost_table();
                 auto plain = [&](const char* pass) {
                     eng.reset(0);
                     eng.set_identity_mode(identity);
@@ -608,7 +829,9 @@ int main(int argc, char** argv) {
                     const auto t1 = Clock::now();
                     for (unsigned j = 1; j < decode_n; ++j) {
                         const ge::Row row{0, out.back(), L + j - 1};
+                        const auto ts = Clock::now();
                         out.push_back(eng.step({&row, 1})[0]);
+                        if (opt.rank == 0) sp::observe_cost(plain_cost, 0, ms(ts, Clock::now()));
                     }
                     eng.flush(0);
                     const auto t2 = Clock::now();
@@ -619,139 +842,39 @@ int main(int argc, char** argv) {
                 };
                 const auto T = plain("A0");
                 for (std::size_t ki = 0; ki < ks.size(); ++ki) {
-                    const unsigned kmax = ks[(ki + pi % 3) % ks.size()];
+                    const unsigned selected = ks[(ki + pi % 3) % ks.size()];
+                    const bool adaptive = selected == 0;
+                    const unsigned kmax = adaptive ? 3U : selected;
                     eng.reset(0);
                     eng.set_identity_mode(identity);
-                    std::uint32_t cycle = 0, step_id = 0;
-                    auto ctl_for = [&](unsigned kind) {
-                        ge::Exchange::MergeCtl c;
-                        c.cycle = cycle;
-                        c.step = step_id++;
-                        c.kind = kind;
-                        return c;
-                    };
-                    struct Cycle {
-                        std::uint64_t p = 0;
-                        unsigned k = 0, replay = 0, accepted = 0, emitted = 0, rows = 0;
-                        double extend = 0, verify = 0, commit = 0, catchup = 0, other = 0;
-                    };
-                    struct Depth { unsigned offered = 0, reached = 0, accepted = 0; };
-                    Depth depths[8] = {};
-                    std::vector<Cycle> records;
-                    records.reserve(decode_n - 1);
+                    sp::ControlState control;
+                    control.rank = opt.rank;
+                    control.publisher = plain_cost;
+                    std::vector<sp::CycleRecord> records;
                     std::vector<Sample> samples;
-                    samples.reserve(static_cast<std::size_t>(decode_n) * (kmax + 2));
-                    std::vector<std::uint32_t> out, drafts;
-                    out.reserve(decode_n);
-                    drafts.reserve(kmax);
-                    const float* hp = nullptr;
+                    control.on_cycle = [&](const sp::CycleRecord& rec) { records.push_back(rec); };
+                    control.on_sample = [&](const Sample& sample) { samples.push_back(sample); };
                     const auto tb0 = Clock::now();
-                    {
-                        IdentityScope scope(eng);
-                        for (std::uint64_t j = 0; j < L; ++j) {
-                            const ge::Row row{0, toks[j], j};
-                            const auto nx = eng.step({&row, 1})[0];
-                            if (j + 1 == L) equal(pr, kmax, std::vector<std::uint32_t>{T[0]}, std::vector<std::uint32_t>{nx});
-                            const auto pair_tok = j + 1 < L ? toks[j + 1] : nx;
-                            auto c = ctl_for(2);
-                            const auto m = eng.mtp(0, eng.last_hidden(), {&pair_tok, 1}, j, c);
-                            if (j + 1 == L) {
-                                out.push_back(nx);
-                                if (!m.flagged) drafts.push_back(m.id[0]);
-                                hp = eng.mtp_hidden();
-                            }
-                        }
-                    }
+                    if (mtp_path) eng.set_prefill(mtp_path);
+                    const auto seed = sp::bootstrap(eng, 0, toks, mtp_path ? sp::BootstrapPolicy::Chunked :
+                                                                         sp::BootstrapPolicy::Reference, control);
+                    if (mtp_path) eng.set_prefill(ge::reference_prefill());
+                    equal(pr, kmax, std::vector<std::uint32_t>{T[0]}, std::vector<std::uint32_t>{seed.y0});
                     const auto tb1 = Clock::now();
-                    std::uint64_t p = L;
-                    unsigned pending = 0, accepted = 0, offered = 0;
-                    while (out.size() < decode_n) {
-                        const auto tc0 = Clock::now();
-                        Cycle rec;
-                        rec.p = p;
-                        rec.replay = pending;
-                        const unsigned remaining = decode_n - static_cast<unsigned>(out.size());
-                        const auto limit = static_cast<unsigned>(std::min<std::uint64_t>(
-                            std::min(kmax, remaining - 1), opt.capacity - 1 - p));
-                        if (drafts.size() > limit) drafts.resize(limit);
-                        while (!drafts.empty() && drafts.size() < limit) {
-                            const auto t = drafts.back();
-                            auto c = ctl_for(3);
-                            const auto a = Clock::now();
-                            const auto m = eng.mtp(0, hp, {&t, 1}, p + drafts.size() - 1, c);
-                            const auto b = Clock::now();
-                            const double dt = ms(a, b);
-                            rec.extend += dt;
-                            samples.push_back({2, 1, 0, dt});
-                            if (m.flagged) break;
-                            drafts.push_back(m.id[0]);
-                            hp = eng.mtp_hidden();
-                        }
-                        rec.k = static_cast<unsigned>(drafts.size());
-                        std::vector<std::uint32_t> rows{out.back()};
-                        rows.insert(rows.end(), drafts.begin(), drafts.end());
-                        auto cv = ctl_for(1);
-                        const auto tv0 = Clock::now();
-                        const auto v = eng.verify(0, rows, p, cv);
-                        const auto tv1 = Clock::now();
-                        rec.verify = ms(tv0, tv1);
-                        samples.push_back({1, rec.k + 1, pending, rec.verify});
-                        unsigned first_flag = sp::kNoFlag;
-                        for (unsigned j = 0; j <= rec.k; ++j)
-                            if (v.flag[j] != 0 && first_flag == sp::kNoFlag) first_flag = j;
-                        if (v.replay_flag) throw std::runtime_error("non-finite committed KDA row (replay)");
-                        const auto acc = sp::accept_greedy(drafts, v.id, first_flag, sp::Terminal{sp::kNoFlag, remaining});
-                        if (acc.abort) throw std::runtime_error("non-finite required row: request aborted (as plain greedy)");
-                        for (unsigned d = 1; d <= rec.k; ++d) {
-                            ++depths[d].offered;
-                            if (d <= acc.m + 1 && d <= remaining) ++depths[d].reached;
-                            if (d <= acc.m) ++depths[d].accepted;
-                        }
-                        for (unsigned j = 0; j < acc.m; ++j) out.push_back(drafts[j]);
-                        if (acc.has_bonus) out.push_back(acc.bonus);
-                        const auto tm0 = Clock::now();
-                        eng.commit(0, acc.rows, p);
-                        const auto tm1 = Clock::now();
-                        rec.commit = ms(tm0, tm1);
-                        pending = acc.rows;
-                        rec.accepted = acc.m;
-                        rec.emitted = acc.m + (acc.has_bonus ? 1U : 0U);
-                        rec.rows = acc.rows;
-                        accepted += acc.m;
-                        offered += rec.k;
-                        // A terminal accepted draft has no bonus. Do not read it or run catch-up after stop.
-                        if (!acc.stop) {
-                            if (!acc.has_bonus) throw std::logic_error("nonterminal acceptance without bonus");
-                            std::vector<std::uint32_t> cu(drafts.begin(), drafts.begin() + acc.m);
-                            cu.push_back(acc.bonus);
-                            drafts.clear();
-                            auto c = ctl_for(2);
-                            const auto a = Clock::now();
-                            const auto m = eng.mtp(0, eng.last_hidden(), cu, p, c);
-                            const auto b = Clock::now();
-                            rec.catchup = ms(a, b);
-                            samples.push_back({3, acc.m + 1, 0, rec.catchup});
-                            if (!m.flagged) {
-                                drafts.push_back(m.id[acc.m]);
-                                hp = eng.mtp_hidden() + static_cast<std::size_t>(acc.m) * 4096;
-                            }
-                        }
-                        p += acc.rows;
-                        ++cycle;
-                        rec.other = ms(tc0, Clock::now()) - rec.extend - rec.verify - rec.commit - rec.catchup;
-                        records.push_back(rec);
-                        if (acc.stop) break;
-                    }
-                    const auto tl1 = Clock::now();
-                    eng.flush(0);
-                    const auto tt1 = Clock::now();
+                    const auto result = sp::decode_greedy(eng, 0, seed, {kmax, adaptive, kmax, opt.capacity}, decode_n, control);
+                    const auto& out = result.tokens;
+                    const auto& depths = result.depths;
+                    const auto cycle = result.cycles, offered = result.offered, accepted = result.accepted;
                     equal(pr, kmax, T, out);
-                    const double bootstrap_ms = ms(tb0, tb1), loop_ms = ms(tb1, tl1), tail_ms = ms(tl1, tt1);
+                    const double bootstrap_ms = ms(tb0, tb1), loop_ms = result.loop_ms, tail_ms = result.tail_ms;
                     for (std::size_t ci = 0; ci < records.size(); ++ci) {
                         const auto& r = records[ci];
                         std::printf("SPV1_CYCLE rank=%u prompt=%s Kmax=%u cycle=%zu p=%llu K=%u replay=%u accepted=%u emitted=%u rows=%u extend_ms=%.6f verify_ms=%.6f commit_ms=%.6f catchup_ms=%.6f other_ms=%.6f\n",
                                     opt.rank, pr.name.c_str(), kmax, ci, static_cast<unsigned long long>(r.p), r.k, r.replay,
                                     r.accepted, r.emitted, r.rows, r.extend, r.verify, r.commit, r.catchup, r.other);
+                        if (adaptive)
+                            std::printf("SPV1_DECISION rank=%u cycle=%zu K=%u table_version=%u checksum=%08x\n",
+                                        opt.rank, ci, r.k, r.table_version, r.checksum);
                     }
                     for (unsigned d = 1; d <= kmax; ++d) {
                         const auto& x = depths[d];
@@ -788,18 +911,23 @@ int main(int argc, char** argv) {
         // decode mode: --prompt A[,B,...] runs each prompt in turn (slot 0 reset per prompt); --prompt-max N keeps the
         // first N tokens of each; --logits-out PREFIX writes the rank's logits slice after each prefill
         // (PREFIX-p<i>-r<rank>.f32, the first generated token's distribution) for identity comparisons.
-        std::size_t pa = 0;
+        namespace sp = strix::glm::spec;
+        sp::ControlState decode_control;
+        decode_control.rank = opt.rank;
         unsigned pi = 0;
-        while (decode_n > 0 && spec_k == 0 && spec_run == 0 && pa <= prompt.size()) {
-            const std::size_t pb = std::min(prompt.find(',', pa), prompt.size());
-            auto toks = read_u32(prompt.substr(pa, pb - pa));
-            pa = pb + 1;
-            if (prompt_max > 0 && toks.size() > prompt_max) toks.resize(prompt_max);
+        for (const auto& toks : decode_prompts) {
             eng.reset(0);
             std::size_t free0 = 0, free1 = 0, total = 0;
             if (hipMemGetInfo(&free0, &total) != hipSuccess) throw std::runtime_error("mem info");
             const auto t0 = Clock::now();
-            std::uint32_t next = eng.prefill(0, toks, 0);
+            auto& control = decode_control;
+            sp::Seed seed;
+            std::uint32_t next = 0;
+            if (mtp_spec_on) {
+                seed = sp::bootstrap(eng, 0, toks, prefill_mode == "gemv" ? sp::BootstrapPolicy::Chunked :
+                                                                         sp::BootstrapPolicy::Reference, control);
+                next = seed.y0;
+            } else next = eng.prefill(0, toks, 0);
             const auto t1 = Clock::now();
             if (hipMemGetInfo(&free1, &total) != hipSuccess) throw std::runtime_error("mem info");
             std::printf("rank %u pf dev free delta %+.1f MiB (%zu rows)\n", opt.rank,
@@ -828,15 +956,20 @@ int main(int argc, char** argv) {
             const auto t1d = Clock::now();  // decode timing starts after the digests / logits dump
             std::vector<std::uint32_t> out{next};
             std::uint64_t pos = toks.size();
-            if (profile) eng.set_profiling(true);  // decode steps only (after the prefill)
+            const bool decode_profile = profile && !mtp_spec_on;
+            if (decode_profile) eng.set_profiling(true);  // decode steps only (after the prefill)
             const ge::Profile p0 = eng.profile();
-            for (unsigned i = 1; i < decode_n; ++i) {
+            sp::RunResult result;
+            if (mtp_spec_on) {
+                result = sp::decode_greedy(eng, 0, seed, {eff.kmax, eff.adaptive, eff.kmax, opt.capacity}, decode_n, control);
+                out = result.tokens;
+            } else for (unsigned i = 1; i < decode_n; ++i) {
                 const ge::Row r{0, next, pos++};
                 next = eng.step({&r, 1})[0];
                 out.push_back(next);
             }
             const auto t2 = Clock::now();
-            if (profile) {
+            if (decode_profile) {
                 eng.set_profiling(false);
                 const ge::Profile& p = eng.profile();
                 const double n = static_cast<double>(p.calls - p0.calls);
@@ -853,6 +986,15 @@ int main(int argc, char** argv) {
             std::printf("rank %u decode: prompt %zu tokens prefill %.2f s, %u tokens, %.2f ms/token (%.2f tok/s), tokens fnv %016llx\n",
                         opt.rank, toks.size(), secs(t0, t1), decode_n, ms, ms > 0 ? 1000.0 / ms : 0.0,
                         static_cast<unsigned long long>(fnv(out.data(), out.size() * 4)));
+            if (mtp_spec_on) {
+                std::printf("rank %u mtp-spec: cycles %u offered %u accepted %u (d1 %u/%u, d2 %u/%u, d3 %u/%u) K hist k1 %u k2 %u k3 %u tok/cycle %.6f\n",
+                            opt.rank, result.cycles, result.offered, result.accepted,
+                            result.depths[1].accepted, result.depths[1].offered,
+                            result.depths[2].accepted, result.depths[2].offered,
+                            result.depths[3].accepted, result.depths[3].offered,
+                            result.histogram[1], result.histogram[2], result.histogram[3],
+                            result.cycles ? double(decode_n - 1) / result.cycles : 0.0);
+            }
             std::printf("rank %u tokens:", opt.rank);
             for (auto t : out) std::printf(" %u", t);
             std::printf("\n");

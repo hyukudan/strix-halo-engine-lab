@@ -37,7 +37,8 @@ with a 400 naming the field ([list](docs/engine/serving/serving.md#chat-requests
 answers (`response_format` / `text.format`, [constrained output](docs/engine/serving/serving.md#constrained-json-output)):
 exact to the constrained target, not to unconstrained greedy.
 Fast FP16 Qwen prefill is its own identity, not dense-A8 serial bit equality. GLM defaults to R1b decode
-with R1 prompt prefill; `--identity r1` restores R1. Exactness references must match that identity.
+with R1 prompt prefill and exact MTP self-speculation (`--mtp 0` = plain decode, same tokens); `--identity r1`
+restores R1. Exactness references must match that identity.
 
 Qwen HTTP serving: omitted `--http-batch` = as many slots as memory admits (startup line `http slots N (...)`, built on demand), `N` caps, `0` = one request at a time. In-block decode service, short-first, nested admission and boundary cancellation are on (`STRIX_BATCH_SERVICE_MS`, `STRIX_BATCH_SHORT_FIRST_ROWS`, `STRIX_BATCH_NEST_ROWS`, `STRIX_BATCH_CANCEL_POINTS`; `0` = off). Gates: `tests/batch_service_gpu_gate.py`, `tests/http_slots_gpu_gate.py` ([serving](docs/engine/serving/serving.md#scheduling-qualification)).
 

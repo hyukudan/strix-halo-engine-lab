@@ -13,9 +13,11 @@
 //               slice --rank (gate/up output halves, down input half).
 //   --router P: P.weight.f16 [288 x 4096] and P.bias.f32 [288] (real L3 router); else synthetic.
 //   --test: bitwise B == A (out, per-pair expert outputs, router logits / ids / weights) for R = 1..8 and several
-//           routing patterns; batch invariance; untouched padding rows; router ties.
+//           routing patterns; pipeline/current intermediates x3; batch invariance; untouched padding rows; router ties.
+//           Real qualification runs this suite separately with --rank 0 and --rank 1.
 //   --bench: per cell (R x pattern) A B A B A B A (ABA x3), each the mean over --iters calls rotating over --layers
 //            distinct weight copies (cold); GB/s of the weight bytes read; B parts per launch; read ceiling.
+//            R1/R8 additionally time current/pipeline/current x3 on the same rotation.
 #include "glm/common/glm_math.hpp"
 #include "glm/kernels/glm_tier_a.hpp"
 #include "glm/moe/glm_moe.hpp"
@@ -685,6 +687,7 @@ struct Bench {
         hip_ok(hipMemcpy(outB, p.data(), p.size() * 4, hipMemcpyHostToDevice), "poison");
         hip_ok(hipMemset(dbg_gu, 0xff, static_cast<std::size_t>(moe::kMaxPairs) * 2 * I * 4), "poison dbg");
         for (unsigned q = 0; q < moe::kMaxPairs; ++q) {
+            hip_ok(hipMemset(const_cast<float*>(moe::moe_pair_gate_partials(ws, q)), 0xff, 2 * 32 * I * 4ULL), "poison partials");
             hip_ok(hipMemset(const_cast<float*>(moe::moe_pair_output(ws, q)), 0xff, H * 4ULL), "poison y");
             hip_ok(hipMemset(const_cast<std::uint16_t*>(moe::moe_pair_down_input(ws, q)), 0xff, I * 2ULL), "poison at");
         }
@@ -714,6 +717,46 @@ struct Bench {
         return where;
     }
 
+    // Snapshot every materialized intermediate, including raw split partials. Counters
+    // reset between calls; re-poison data only, so no stale correct value can hide a miss.
+    std::vector<std::uint8_t> pipe_snapshot(unsigned rows, unsigned pairs, bool router) {
+        std::vector<std::uint8_t> bytes;
+        auto append = [&](const auto& h) {
+            const auto* b = reinterpret_cast<const std::uint8_t*>(h.data());
+            bytes.insert(bytes.end(), b, b + h.size() * sizeof(h[0]));
+        };
+        append(d2h(outB, 16ULL * H));
+        if (router) {
+            append(d2h(logitsB, rows * E)); append(d2h(idsB, rows * K)); append(d2h(wB, rows * K));
+        }
+        for (unsigned p = 0; p < pairs; ++p) {
+            append(d2h(dbg_gu + static_cast<std::size_t>(p) * 2 * I, 2 * I));
+            append(d2h(moe::moe_pair_gate_partials(ws, p), 2 * 32 * I));
+            append(d2h(moe::moe_pair_down_input(ws, p), I));
+            append(d2h(moe::moe_pair_output(ws, p), H));
+        }
+        return bytes;
+    }
+    void compare_pipe(moe::MoeView v, bool router, unsigned pairs, const std::string& tag) {
+        const auto old = pipe_snapshot(v.rows, pairs, router);
+        bool exact = true;
+        for (unsigned rep = 0; rep < 3; ++rep) {
+            const std::vector<float> poison(16ULL * H, std::nanf(""));
+            hip_ok(hipMemcpy(outB, poison.data(), poison.size() * 4, hipMemcpyHostToDevice), "pipe poison out");
+            hip_ok(hipMemset(dbg_gu, 0xff, static_cast<std::size_t>(moe::kMaxPairs) * 2 * I * 4), "pipe poison gu");
+            for (unsigned p = 0; p < pairs; ++p) {
+                hip_ok(hipMemset(const_cast<float*>(moe::moe_pair_gate_partials(ws, p)), 0xff, 2 * 32 * I * 4ULL), "pipe poison partials");
+                hip_ok(hipMemset(const_cast<float*>(moe::moe_pair_output(ws, p)), 0xff, H * 4ULL), "pipe poison down");
+                hip_ok(hipMemset(const_cast<std::uint16_t*>(moe::moe_pair_down_input(ws, p)), 0xff, I * 2ULL), "pipe poison at");
+            }
+            if (router) moe::enqueue_moe_pipe(v, st);
+            else moe::enqueue_experts_pipe(v, st);
+            hip_ok(hipDeviceSynchronize(), "pipe compare");
+            exact = same_bits(old, pipe_snapshot(v.rows, pairs, router)) && exact;
+        }
+        check(exact, tag + " pipeline == current: all split/gate/up/down-input/down/R16 bits, padding, x3");
+    }
+
     // Bitwise B == A for given ids (enqueue_experts): out, every pair's gate / up / down linear outputs.
     bool test_experts(unsigned rows, const std::vector<std::uint32_t>& ids, const std::string& tag, std::vector<float>* outB_h = nullptr) {
         const auto w = make_weights(ids, 99 + rows);
@@ -726,6 +769,7 @@ struct Bench {
         v.debug_gate_up = dbg_gu;
         moe::enqueue_experts(v, st);
         hip_ok(hipDeviceSynchronize(), "B");
+        compare_pipe(v, false, rows * (K + 1), tag);
         const auto a = d2h(outA, 16ULL * H), b = d2h(outB, 16ULL * H);
         std::size_t first = 0;
         const bool ok = same_bits(a, b, &first);  // includes the untouched (NaN-bit-identical) padding rows
@@ -752,6 +796,7 @@ struct Bench {
         v.debug_gate_up = dbg_gu;
         moe::enqueue_moe(v, st);
         hip_ok(hipDeviceSynchronize(), "B");
+        compare_pipe(v, true, rows * (K + 1), tag);
         const bool lg = same_bits(d2h(logitsA, rows * E), d2h(logitsB, rows * E));
         const bool id = same_bits(ids, d2h(idsB, rows * K));
         const bool wt = same_bits(d2h(wA, rows * K), d2h(wB, rows * K));
@@ -767,6 +812,31 @@ struct Bench {
         if (outB_h) *outB_h = b;
         return lg && id && wt && out && pairs_ok;
     }
+    // Canonical per-row ordering: shared, then that row's ascending expert ids.
+    // Compare bytes (including all 32 split partials), rather than a hash.
+    std::vector<std::vector<std::uint8_t>> row_intermediates(unsigned rows, const std::vector<std::uint32_t>& ids) {
+        std::vector<std::vector<std::uint8_t>> result(rows);
+        for (unsigned r = 0; r < rows; ++r) {
+            auto append = [&](const auto& h) {
+                const auto* b = reinterpret_cast<const std::uint8_t*>(h.data());
+                result[r].insert(result[r].end(), b, b + h.size() * sizeof(h[0]));
+            };
+            for (unsigned k = 0; k <= K; ++k) {
+                unsigned pair = r;
+                if (k != 0) {
+                    const unsigned e = ids[r * K + k - 1];
+                    pair = rows;
+                    for (unsigned j = 0; j < rows * K; ++j)
+                        pair += ids[j] < e || (ids[j] == e && j / K < r) ? 1U : 0U;
+                }
+                append(d2h(dbg_gu + static_cast<std::size_t>(pair) * 2 * I, 2 * I));
+                append(d2h(moe::moe_pair_gate_partials(ws, pair), 2 * 32 * I));
+                append(d2h(moe::moe_pair_down_input(ws, pair), I));
+                append(d2h(moe::moe_pair_output(ws, pair), H));
+            }
+        }
+        return result;
+    }
     // Rows of y8 (host, 8 rows) picked by `sel` into y (rest NaN).
     void load_rows(const std::vector<float>& y8, const std::vector<unsigned>& sel) {
         std::vector<float> h(16ULL * H, std::nanf(""));
@@ -776,7 +846,8 @@ struct Bench {
     // Invariance: a subset / permutation of the rows of an 8-row call, through enqueue_experts (ids, weights taken
     // along) or enqueue_moe (router), gives each row the same bits as inside the 8-row call.
     bool sub_call(const std::vector<float>& y8, const std::vector<std::uint32_t>& ids8, const std::vector<float>& w8,
-                  const std::vector<float>& out8, const std::vector<unsigned>& sel, bool router) {
+                  const std::vector<float>& out8, const std::vector<std::vector<std::uint8_t>>& mids8,
+                  const std::vector<unsigned>& sel, bool router) {
         load_rows(y8, sel);
         poison_out();
         const auto n = static_cast<unsigned>(sel.size());
@@ -789,17 +860,23 @@ struct Bench {
             }
             hip_ok(hipMemcpy(idsA, ids.data(), ids.size() * 4, hipMemcpyHostToDevice), "ids");
             hip_ok(hipMemcpy(wA, w.data(), w.size() * 4, hipMemcpyHostToDevice), "w");
-            moe::enqueue_experts(view(n, 0, false), st);
+            auto v = view(n, 0, false);
+            v.debug_gate_up = dbg_gu;
+            moe::enqueue_experts_pipe(v, st);
         } else {
-            moe::enqueue_moe(view(n, 0, true), st);
+            auto v = view(n, 0, true);
+            v.debug_gate_up = dbg_gu;
+            moe::enqueue_moe_pipe(v, st);
         }
         hip_ok(hipDeviceSynchronize(), "sub");
         const auto b = d2h(outB, static_cast<std::size_t>(n) * H);
+        const auto mids = row_intermediates(n, d2h(router ? idsB : idsA, n * K));
         bool ok = true;
-        for (unsigned i = 0; i < n; ++i) ok = ok && std::memcmp(b.data() + i * H, out8.data() + sel[i] * H, H * 4) == 0;
+        for (unsigned i = 0; i < n; ++i)
+            ok = same_bits(mids[i], mids8[sel[i]]) && std::memcmp(b.data() + i * H, out8.data() + sel[i] * H, H * 4) == 0 && ok;
         return ok;
     }
-    void invariance(const std::string& tag, bool router) {
+    void invariance(const std::string& tag, bool router, int pattern = 0) {
         const std::string kind = router ? "enqueue_moe" : "enqueue_experts";
         set_y(8, router ? 920 : 900);
         const auto y8 = d2h(y, 8ULL * H);
@@ -811,17 +888,23 @@ struct Bench {
             ids8 = d2h(idsB, 8ULL * K);
             w8 = d2h(wB, 8ULL * K);
         } else {
-            ids8 = make_ids(8, 0, 901);
+            ids8 = make_ids_ext(8, pattern, 901);
             test_experts(8, ids8, tag + " invariance base " + kind, &out8);
             w8 = make_weights(ids8, 99 + 8);
         }
         bool ok = true;
-        for (unsigned r = 0; r < 8; ++r) ok = sub_call(y8, ids8, w8, out8, {r}, router) && ok;
-        ok = sub_call(y8, ids8, w8, out8, {2, 3, 4}, router) && ok;
-        ok = sub_call(y8, ids8, w8, out8, {0, 1, 2, 3, 4}, router) && ok;
-        ok = sub_call(y8, ids8, w8, out8, {7, 6, 5, 4, 3, 2, 1, 0}, router) && ok;
-        ok = sub_call(y8, ids8, w8, out8, {5, 0, 7, 2}, router) && ok;
-        check(ok, tag + " batch invariance " + kind + ": R1 x8, R3, R5, reversed R8, permuted R4 rows == inside R8");
+        const auto mids8 = row_intermediates(8, ids8);
+        for (unsigned r = 0; r < 8; ++r) ok = sub_call(y8, ids8, w8, out8, mids8, {r}, router) && ok;
+        ok = sub_call(y8, ids8, w8, out8, mids8, {2, 3, 4}, router) && ok;
+        ok = sub_call(y8, ids8, w8, out8, mids8, {0, 1, 2, 3, 4}, router) && ok;
+        ok = sub_call(y8, ids8, w8, out8, mids8, {7, 6, 5, 4, 3, 2, 1, 0}, router) && ok;
+        ok = sub_call(y8, ids8, w8, out8, mids8, {5, 0, 7, 2}, router) && ok;
+        for (unsigned n = 1; n <= 8; ++n) {
+            std::vector<unsigned> sel;
+            for (unsigned r = 0; r < n; ++r) sel.push_back((r + 3) % 8);
+            ok = sub_call(y8, ids8, w8, out8, mids8, sel, router) && ok;
+        }
+        check(ok, tag + " batch invariance " + kind + ": R1 x8, R3, R5, reversed R8, permuted R1..8 rows: all intermediates and outputs == inside R8");
     }
     // Back-to-back: three different calls queued without host synchronisation and without clearing the workspace
     // (counters must reset themselves), each into its own output; each must equal the same call run alone.
@@ -865,8 +948,8 @@ struct Bench {
             v.weights = k.wd[r];
             v.logits = nullptr;
             v.out = k.out[r];
-            if (k.router) moe::enqueue_moe(v, st);
-            else moe::enqueue_experts(v, st);
+            if (k.router) moe::enqueue_moe_pipe(v, st);
+            else moe::enqueue_experts_pipe(v, st);
         };
         bool base_ok = true;
         for (auto& k : calls) {  // alone (repetition slot 0), validated against the reference chain A, then re-poisoned
@@ -928,7 +1011,7 @@ struct Bench {
             test_experts(rows, make_ids_ext(rows, 0, 610 + rows), tag + " edge inputs experts");
             test_router(rows, tag + " edge inputs enqueue_moe");
         }
-        invariance(tag, false);
+        for (int p = 0; p < kPatterns; ++p) invariance(tag + " " + pattern_name(p), false, p);
         invariance(tag, true);
         back_to_back(tag);
         // Router ties and saturation.
@@ -1006,6 +1089,18 @@ struct Bench {
                 auto B = [&](unsigned l) { moe::enqueue_moe(view(rows, l, true), st); };
                 auto Ax = [&](unsigned l) { chain_A_timed(l, ids, rows); };
                 auto Bx = [&](unsigned l) { moe::enqueue_experts(view(rows, l, false), st); };
+                if (rows == 1 || rows == 8) {
+                    auto pipe = [&](unsigned l) { moe::enqueue_experts_pipe(view(rows, l, false), st); };
+                    for (unsigned l = 0; l < layers; ++l) { Bx(l); pipe(l); }
+                    hip_ok(hipDeviceSynchronize(), "pipe warm");
+                    for (unsigned rep = 0; rep < 3; ++rep) {
+                        const double old0 = time_us(Bx, iters, layers);
+                        const double piped = time_us(pipe, iters, layers);
+                        const double old1 = time_us(Bx, iters, layers);
+                        std::printf("pipe COLD %s %s R%u rep %u old/new/old %.1f %.1f %.1f us\n",
+                                    tag.c_str(), pattern_name(p), rows, rep, old0, piped, old1);
+                    }
+                }
                 for (unsigned l = 0; l < layers; ++l) {  // outside timing: library copies of every layer, code warm
                     A(l);
                     B(l);

@@ -193,8 +193,9 @@ public:
         if (I != kMoeInter) b += R * kTopE * (3 * kHidden * 4 + 2 * 4);
         return b;
     }
+    // Include MTP eh_proj (2H -> H), also in the pf_mem_budget exact-linear scratch mirror.
     static std::size_t exact_workspace_bytes(unsigned Hk, unsigned Hm, unsigned Rmax) {
-        const unsigned K = std::max({kHidden, Hk * kKdaDim, Hm * kMlaDim, kDenseI * Hk / kKdaHeads, kExpertI * Hk / kKdaHeads});
+        const unsigned K = std::max({2 * kHidden, Hk * kKdaDim, Hm * kMlaDim, kDenseI * Hk / kKdaHeads, kExpertI * Hk / kKdaHeads});
         return exact::workspace_bytes(Rmax, K);
     }
     // Largest strix_gemm_pinned (s = 1) workspace of the path's linears at Rmax rows (strix-trellis backend.hip
@@ -335,6 +336,13 @@ public:
         linear(c, m.up, x, tb_big(R, I), R, kHidden, I);
         D::swiglu(ta_big(R, I), tb_big(R, I), tc_big(R, I), static_cast<std::size_t>(R) * I, c.stream);
         linear(c, m.down, tc_big(R, I), y, R, I, kHidden);
+    }
+
+    bool exact_linears() const override { return tb_ == TierB::gemv; }
+    void linear_exact(const Linear& l, const CallCtx& c, const float* x, float* y,
+                      unsigned K, unsigned N) const override {
+        if (!exact_linears()) throw std::logic_error("MTP prefill requires the exact gemv identity");
+        linear(c, l, x, y, rows(c), K, N);
     }
 
 private:
@@ -509,13 +517,13 @@ unsigned gemv_block() {
     return b;
 }
 
-PrefillBudget prefill_budget(unsigned kda_heads, unsigned mla_heads, std::uint64_t capacity, unsigned max_rows) {
+PrefillBudget prefill_budget(unsigned kda_heads, unsigned mla_heads, std::uint64_t capacity, unsigned max_rows, bool mtp) {
     check_geometry(kda_heads, mla_heads, capacity, max_rows);
     PrefillBudget b;
     b.path = GlmPfPath::device_bytes(kda_heads, mla_heads, capacity, max_rows);
     b.workspace = GlmPfPath::workspace_bytes(kda_heads, mla_heads, max_rows);
     const std::uint64_t RC = std::max(8U, max_rows);
-    b.engine_rows = RC * ((3ULL * kHc * kHidden + 2ULL * kHcMix + 3ULL * kHidden + kExperts + kTopE) * 4 + (kTopE + 2) * 4 + 8);
+    b.engine_rows = RC * ((3ULL * kHc * kHidden + 2ULL * kHcMix + (5ULL + (mtp ? 9ULL : 0ULL)) * kHidden + kExperts + kTopE) * 4 + (kTopE + 2) * 4 + 8);
     return b;
 }
 

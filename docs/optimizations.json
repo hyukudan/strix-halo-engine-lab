@@ -1255,6 +1255,17 @@
   },
   {
     "engine": "glm",
+    "name": "MTP self-speculation",
+    "flag_or_env": "--mtp; --mtp-spec; STRIX_GLM_MTP_SPEC; STRIX_GLM_SPEC_XCH; STRIX_GLM_SPEC_KDA_TREE",
+    "default": "on (Xfer verify exchange, KDA tree 2, adaptive K)",
+    "exact": "Full token vectors and prompt logits equal --mtp 0 on 7 prompts, both ranks; MTP-fill prefill equals the row-by-row bootstrap; speculative runs exact in every arm with identical adaptive decisions on both ranks.",
+    "gain": "Decode chat / code / JSON 40.3-40.6 -> 26.98 / 22.46 / 24.98 ms/token (1.50x / 1.79x / 1.62x); cost: TTFT 8K +2.9 %, 32K +8.7 % (MTP cache fill)",
+    "preconditions": "Two-rank TP2 decode with the model's MTP layer; both ranks must agree on the configuration (checked at start).",
+    "off_switch": "--mtp 0 (or --mtp-spec 0, STRIX_GLM_MTP_SPEC=0, --baseline); STRIX_GLM_SPEC_XCH=comm and STRIX_GLM_SPEC_KDA_TREE=1 restore the previous verify exchange and tree",
+    "doc_anchor": "docs/optimizations.md#glm-mtp-spec"
+  },
+  {
+    "engine": "glm",
     "name": "Prefill indexer v2",
     "flag_or_env": "STRIX_GLM_PF_IDX",
     "default": "2",

@@ -1945,6 +1945,25 @@ Process prefill in 4096-row chunks.
 - **Measured gain:** with the pipeline on: 8K 35.1 s at 1024, 32.1 s at 2048, 30.1-30.8 s at 4096; 32K 136.7 to 128.4 s vs 2048
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
 
+<a id="glm-mtp-spec"></a>
+
+### MTP self-speculation
+
+**Engine:** `glm`. **Control:** `--mtp; --mtp-spec; STRIX_GLM_MTP_SPEC; STRIX_GLM_SPEC_XCH; STRIX_GLM_SPEC_KDA_TREE`. **Default:** on (Xfer verify exchange, KDA tree 2, adaptive K).
+
+The model's own MTP layer drafts tokens that the target verifies in the normal `--decode` path; the prompt fills the MTP
+cache in chunks during prefill. Committed tokens are the target's greedy tokens.
+
+- **Preconditions:** Two-rank TP2 decode with the model's MTP layer; both ranks must agree on the configuration (checked at start).
+- **Automatic selection:** The resolver item mtp-spec is on unless switched off; `--print-effective-config` shows `mtp-spec=1`.
+- **Fallback notice:** A rank disagreement on the speculative configuration stops at start instead of decoding.
+- **Exactness evidence:** Full token vectors and prompt logits equal --mtp 0 on 7 prompts, both ranks; MTP-fill prefill equals the row-by-row bootstrap; speculative runs exact in every arm with identical adaptive decisions on both ranks.
+- **Off switch:** --mtp 0 (or --mtp-spec 0, STRIX_GLM_MTP_SPEC=0, --baseline); STRIX_GLM_SPEC_XCH=comm and STRIX_GLM_SPEC_KDA_TREE=1 restore the previous verify exchange and tree
+- **Measured gain:** Decode chat / code / JSON 40.3-40.6 -> 26.98 / 22.46 / 24.98 ms/token (1.50x / 1.79x / 1.62x); cost: TTFT 8K +2.9 %, 32K +8.7 % (MTP cache fill)
+- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [spec runtime](../src/glm/spec/glm_spec_run.cpp)
+
+`STRIX_GLM_HC_NORM=1` and `STRIX_GLM_MOE_PIPE=1` are included as opt-in experiments (default off, not yet gated).
+
 <a id="glm-pf-indexer-v2"></a>
 
 ### Prefill indexer v2
