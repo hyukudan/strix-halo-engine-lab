@@ -172,6 +172,7 @@ and [performance.md](performance.md).
 
 ## Research
 
+- [Experimental PTX verification pilot](../lab/ptx_verifier/README.md): Optional local one-CTA verification runner, fixed kernel contracts, receipt interpretation and qualification boundaries.
 - [Native runtime investigation scope](research/README.md): Short stub: native runtime investigation scope and publication boundary for research.
 - [Experimental selected dense projections](research/dense-trellis-g1.md): Experimental Hadamard/trellis K5 dense projections (dense-a8-trellis-g1) for selected Qwen projections. *Historical.*
 - [Design acceptance actions](research/history/2026-09-28-design-acceptance.md): Design-review acceptance requirements recorded 2026-09-28 plus spec v1 draft integration notes (D-015..D-020). *Historical.*
@@ -182,3 +183,4 @@ and [performance.md](performance.md).
 - [Execution optimization gates](research/proposals/2026-10-12-execution-optimization-gates.md): Draft proposal (OPT-xxx): gates for launches, graph lifetime, caches, prefill fairness, numerics, recovery.
 - [Shared-expert row reuse diagnostic](research/shared-expert-row-diagnostic.md): Standalone shared-expert R2/R4/R8 row-reuse diagnostic component.
 - [Dated implementation notes](research/history/README.md): 35 notes from 2026-10-11 to 2026-10-15, indexed by date.
+

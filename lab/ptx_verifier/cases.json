@@ -1,0 +1,86 @@
+{
+  "schema": "strix/ptx-verifier-cases-v1",
+  "verifier": {
+    "repository": "https://github.com/francois141/ptx_verifier",
+    "revision": "0c7e372f27e5599ee3ad28215f487115b1883585",
+    "license": "MIT"
+  },
+  "cases": [
+    {
+      "id": "carry_even_row0",
+      "kernel": "carry_restore_kernel",
+      "source_path": "src/cuda/ds41_attention.cu",
+      "source_kernel": "carry_restore_kernel",
+      "source_revision": "86e169e1ff2839d461560419a80bba2845868a81",
+      "spec": "specs/carry_even_row0.spec",
+      "block": [256, 1, 1],
+      "grid": [1, 1, 1],
+      "arrays": [
+        {"name": "stash", "base": 65536, "elem_width": 4, "length": 1024, "kind": "in"},
+        {"name": "state", "base": 131072, "elem_width": 4, "length": 1024, "kind": "out"},
+        {"name": "valid", "base": 196608, "elem_width": 4, "length": 1, "kind": "out"}
+      ],
+      "params": [
+        {"kind": "ptr", "value": "stash"},
+        {"kind": "ptr", "value": "state"},
+        {"kind": "ptr", "value": "valid"},
+        {"kind": "int", "value": 0},
+        {"kind": "int", "value": 0}
+      ],
+      "dims": {"N": 1024, "ONE": 1},
+      "expected_elements": 1025
+    },
+    {
+      "id": "carry_even_row1",
+      "kernel": "carry_restore_kernel",
+      "source_path": "src/cuda/ds41_attention.cu",
+      "source_kernel": "carry_restore_kernel",
+      "source_revision": "86e169e1ff2839d461560419a80bba2845868a81",
+      "spec": "specs/carry_even_row1.spec",
+      "block": [256, 1, 1],
+      "grid": [1, 1, 1],
+      "arrays": [
+        {"name": "stash", "base": 65536, "elem_width": 4, "length": 2048, "kind": "in"},
+        {"name": "state", "base": 131072, "elem_width": 4, "length": 1024, "kind": "out"},
+        {"name": "valid", "base": 196608, "elem_width": 4, "length": 1, "kind": "out"}
+      ],
+      "params": [
+        {"kind": "ptr", "value": "stash"},
+        {"kind": "ptr", "value": "state"},
+        {"kind": "ptr", "value": "valid"},
+        {"kind": "int", "value": 0},
+        {"kind": "int", "value": 1}
+      ],
+      "dims": {"N": 1024, "ONE": 1, "STASH_ROWS": 2},
+      "expected_elements": 1025
+    },
+    {
+      "id": "hc_expand_rows1_h32",
+      "kernel": "hc_expand_kernel",
+      "source_path": "src/cuda/ds41_core_norm.cu",
+      "source_kernel": "hc_expand_kernel",
+      "source_revision": "86e169e1ff2839d461560419a80bba2845868a81",
+      "spec": "specs/hc_expand_rows1.spec",
+      "block": [256, 1, 1],
+      "grid": [1, 1, 1],
+      "arrays": [
+        {"name": "sub", "base": 65536, "elem_width": 4, "length": 32, "kind": "in"},
+        {"name": "residual", "base": 131072, "elem_width": 4, "length": 128, "kind": "in"},
+        {"name": "mixes", "base": 196608, "elem_width": 4, "length": 24, "kind": "in"},
+        {"name": "out", "base": 262144, "elem_width": 4, "length": 128, "kind": "out"}
+      ],
+      "params": [
+        {"kind": "ptr", "value": "sub"},
+        {"kind": "int", "value": 32},
+        {"kind": "ptr", "value": "residual"},
+        {"kind": "ptr", "value": "mixes"},
+        {"kind": "int", "value": 1},
+        {"kind": "int", "value": 32},
+        {"kind": "ptr", "value": "out"},
+        {"kind": "int", "value": 0}
+      ],
+      "dims": {"H": 32, "STREAMS": 4, "MIX_COUNT": 24},
+      "expected_elements": 128
+    }
+  ]
+}
