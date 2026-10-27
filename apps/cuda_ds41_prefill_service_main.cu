@@ -4,7 +4,8 @@
 //
 //   strix-cuda-ds41-prefill-service MODEL.gguf [--host 127.0.0.1] [--port 8095] [--positions N]
 //       [--vram-cap-gib G] [--vram-reserve-gib G] [--no-auto-budget [--device-gib G | --tiers DHF..]] [--no-expert-residency]
-//       [--expert-rank FILE] [--xfer-group N] [--xfer-piece-mib N] [--host-gib G] [--host-commit-floor-gib F] [--host-pin-wait-s S] [--slots S] [--chunk C] [--moe-chunk M]
+//       [--expert-rank FILE] [--xfer-group N] [--xfer-piece-mib N] [--host-gib G | --host-gib-auto G (opportunistic, e.g. 32)] [--overlay OVERLAY.gguf] [--host-pin-order layer|deadline|early]
+//       [--host-commit-floor-gib F (20 with --host-gib-auto)] [--host-pin-wait-s S] [--slots S] [--chunk C] [--moe-chunk M]
 //       [--window W] [--io-threads N] [--engram-threads N] [--buffered] [--engram-upload mapped|stream]
 //       [--engram-cache-mib N] [--no-gpu-probe] [--device D] [--layers L]
 //       [--exact | --no-fast-dense | --no-fast-moe | --no-fast-attention] [--fast-attention-min-rows N] [--fast-moe-signed-lut] [--fast-moe-wide-tiles]
@@ -604,10 +605,8 @@ class Service {
 public:
     Service(CudaPrefill& p, const CudaPrefillOptions& o, Config c) : p_(p), o_(o), c_(std::move(c)) {
         if (c_.handoff_queue == 0U) c_.handoff_queue = 1U;
-        if (c_.fast_export) {
-            capture_ = std::make_unique<attn::ExportCapture>();
-            capture_->reserve(p_.capture_bound());
-        }
+        capture_ = p_.export_capture();
+        pinned_snapshot_.store(p_.pinned_bytes() + (capture_ ? capture_->pinned_bytes() : 0));
         worker_ = std::thread([this] { loop(); });
         if (c_.pipeline) handoff_worker_ = std::thread([this] { handoff_loop(); });
     }
@@ -645,9 +644,41 @@ public:
         return f;
     }
 
+    Json host_memory_snapshot() const {
+        Json h = Json::object();
+        const auto& pins = p_.host_pin_stats(); // immutable after construction
+        h.set("policy", Json(o_.host_tier_implicit ? "implicit" : "explicit"));
+        h.set("budget_bytes", Json(o_.host_expert_gib * double(1ULL << 30)));
+        h.set("requested_bytes", Json(pins.requested_bytes));
+        h.set("effective_bytes", Json(pins.effective_bytes));
+        h.set("floor_gib", Json(o_.host_commit_floor_gib));
+        h.set("wait_s", Json(o_.host_pin_wait_s));
+        h.set("effective_wait_s", Json(o_.host_tier_implicit ? 0.0 : o_.host_pin_wait_s));
+        h.set("total_service_pinned_bytes", Json(pinned_snapshot_.load()));
+        Json layers = Json::array(), demotions = Json::array();
+        for (auto l : pins.layers) layers.push(Json(std::uint64_t{l}));
+        for (auto d : pins.demotions) {
+            Json v = Json::object();
+            v.set("layer", Json(std::uint64_t{d.layer}));
+            v.set("reason", Json(strix::ds41::host_pin_reason_name(d.reason)));
+            demotions.push(std::move(v));
+        }
+        h.set("host_layers", std::move(layers));
+        h.set("demotion_count", Json(std::uint64_t{pins.demotions.size()}));
+        h.set("demotions", std::move(demotions));
+        const auto room = strix::ds41::host_memory_room();
+        h.set("free_physical_bytes", room.known ? Json(room.free_physical) : Json("unknown"));
+        h.set("free_commit_bytes", room.known ? Json(room.free_commit) : Json("unknown"));
+        const double floor = o_.host_commit_floor_gib * double(1ULL << 30);
+        h.set("pressure", Json(!room.known ? "unknown" :
+            (double(room.free_commit) < floor || double(room.free_physical) < floor + double(4ULL << 30)) ? "low" : "ok"));
+        return h;
+    }
+
     Json health() {
         const std::lock_guard lock(mu_);
         Json h = Json::object();
+        h.set("host_tier", host_memory_snapshot());
         h.set("status", Json(failed_ ? "failed" : "ok"));
         h.set("busy", Json(busy_));
         h.set("queued", Json(static_cast<std::uint64_t>(queue_.size())));
@@ -693,9 +724,14 @@ public:
     Json describe() {
         Json out = Json::object();
         std::string d;
+        std::size_t device_bytes = 0, contexts = 0;
+        double load_s = 0;
         {
             const std::lock_guard lock(run_mu_);  // describe() reads the object the worker runs
             d = p_.describe();
+            device_bytes = p_.device_bytes();
+            contexts = p_.batch_contexts();
+            load_s = p_.load_seconds();
         }
         try {
             out.set("describe", strix::serve::parse_json(d));
@@ -703,6 +739,7 @@ public:
             std::replace(d.begin(), d.end(), '\\', '/');
             out.set("describe", strix::serve::parse_json(d));
         }
+        out.set("host_tier", host_memory_snapshot());
         Json s = Json::object();
         s.set("fast_dense", Json(c_.fast_dense));
         s.set("fast_moe", Json(c_.fast_moe));
@@ -721,10 +758,10 @@ public:
         s.set("batch_sum_tokens", Json(static_cast<std::uint64_t>(c_.batch_sum_tokens)));
         s.set("batch_alone_rows", Json(static_cast<std::uint64_t>(c_.batch_alone_rows)));
         s.set("batch_max_overtakes", Json(static_cast<std::uint64_t>(c_.batch_max_overtakes)));
-        s.set("batch_contexts", Json(static_cast<std::uint64_t>(p_.batch_contexts())));
-        s.set("load_s", Json(p_.load_seconds()));
-        s.set("device_gb", Json(double(p_.device_bytes()) / 1e9));
-        s.set("pinned_gb", Json(double(p_.pinned_bytes()) / 1e9));
+        s.set("batch_contexts", Json(static_cast<std::uint64_t>(contexts)));
+        s.set("load_s", Json(load_s));
+        s.set("device_gb", Json(double(device_bytes) / 1e9));
+        s.set("pinned_gb", Json(double(pinned_snapshot_.load()) / 1e9));
         {
             const std::lock_guard lock(mu_);
             s.set("served", Json(served_));
@@ -955,6 +992,10 @@ private:
         }
         {
             const std::lock_guard lock(run_mu_);
+            struct PublishPins {
+                Service& s;
+                ~PublishPins() { s.pinned_snapshot_.store(s.p_.pinned_bytes() + (s.capture_ ? s.capture_->pinned_bytes() : 0)); }
+            } publish{*this};
             if (B == 1U) {
                 auto& cap = *caps[0];
                 const Job& job = *jobs[0];
@@ -1231,6 +1272,12 @@ private:
             sec.set("handoff_queue", Json(handoff_queue_s));
         }
         Json pre = Json::object();
+        pre.set("host_pin_order", Json(strix::ds41::host_pin_order_name(o_.host_pin_order)));
+        Json host_layers = Json::array();
+        // Placement is immutable after load, including any pin-allocation demotions.
+        for (std::uint32_t l = o_.first_layer; l < o_.end_layer; ++l)
+            if (p_.tiers()[l] == ExpertTier::host) host_layers.push(Json(static_cast<std::uint64_t>(l)));
+        pre.set("host_layers", std::move(host_layers));
         pre.set("engram_s", Json(res.engram_seconds));
         pre.set("expert_io_s", Json(res.expert_io_seconds));
         pre.set("expert_gb_streamed", Json(double(res.expert_bytes_streamed) / 1e9));
@@ -1278,6 +1325,7 @@ private:
     CudaPrefill& p_;
     const CudaPrefillOptions o_;
     Config c_;
+    std::atomic<std::uint64_t> pinned_snapshot_{0};
     std::mutex mu_, run_mu_;
     std::condition_variable cv_, hcv_, hcv_full_;
     std::deque<std::unique_ptr<Job>> queue_;
@@ -1289,7 +1337,7 @@ private:
     std::uint64_t served_ = 0, batches_ = 0;
     double prefill_total_ = 0.0;
     std::shared_ptr<const std::vector<std::uint8_t>> last_state_;
-    std::unique_ptr<attn::ExportCapture> capture_;  // --fast-export (one; the worker runs one job at a time)
+    std::shared_ptr<attn::ExportCapture> capture_;  // --fast-export (one; the worker runs one job at a time)
     std::string last_sha_;
     std::uint32_t last_position_ = 0;
     std::thread worker_, handoff_worker_;
@@ -1396,6 +1444,8 @@ int main(int argc, char** argv) {
     o.max_positions = 8192;
     o.expert_residency = true;
     o.auto_budget = true;
+    bool host_gib_given = false, host_floor_given = false, host_wait_given = false, host_gib_auto_given = false;
+    double host_gib_auto = 0.0;
     Config c;
     std::string tiers;
     for (int i = 2; i < argc; ++i) {
@@ -1426,9 +1476,16 @@ int main(int argc, char** argv) {
         else if (a == "--engram-upload") o.engram_upload = next();
         else if (a == "--engram-cache-mib") o.engram_cache_mib = std::stoul(next());
         else if (a == "--no-gpu-probe") o.gpu_probe = false;
-        else if (a == "--host-gib") o.host_expert_gib = std::stod(next());
-        else if (a == "--host-commit-floor-gib") o.host_commit_floor_gib = std::stod(next());
-        else if (a == "--host-pin-wait-s") o.host_pin_wait_s = std::stod(next());
+        else if (a == "--host-gib") { o.host_expert_gib = std::stod(next()); host_gib_given = true; }
+        else if (a == "--host-gib-auto") { host_gib_auto = std::stod(next()); host_gib_auto_given = true; }
+        else if (a == "--overlay") o.weights_overlay = next();  // dense weights overlay (e.g. c-u6.gguf: the pair's prefill identity)
+        else if (a == "--host-pin-order") {
+            const auto value = next();
+            try { o.host_pin_order = strix::ds41::parse_host_pin_order(value); }
+            catch (const std::invalid_argument& e) { usage(e.what()); }
+        }
+        else if (a == "--host-commit-floor-gib") { o.host_commit_floor_gib = std::stod(next()); host_floor_given = true; }
+        else if (a == "--host-pin-wait-s") { o.host_pin_wait_s = std::stod(next()); host_wait_given = true; }
         else if (a == "--tiers") tiers = next();
         else if (a == "--slots") o.slots = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--chunk") o.chunk_rows = static_cast<std::uint32_t>(std::stoul(next()));
@@ -1472,6 +1529,20 @@ int main(int argc, char** argv) {
         else if (a == "--v2-timeout") c.v2_timeout = std::stoi(next());
         else usage(("unknown option " + a).c_str());
     }
+    // --host-gib-auto G: opportunistic pinned host expert tier capped at G GiB (admitted once per layer against free
+    // physical memory and commit, no waits; a layer that does not fit streams from the file with the same bits).
+    // Opt-in until coexistence with the other PRO services is qualified; omitted = file-only as before.
+    if (host_gib_auto_given && host_gib_given) usage("--host-gib-auto and --host-gib are exclusive");
+    if (host_gib_auto_given) {
+        if (o.pass_rows != 0U || !tiers.empty()) usage("--host-gib-auto is not available with --pass-rows or --tiers");
+        if (!(host_gib_auto >= 0.0 && host_gib_auto <= 1024.0)) usage("--host-gib-auto must be within 0..1024");
+        o.host_tier_implicit = true;
+        o.host_expert_gib = host_gib_auto;
+        if (!host_floor_given) o.host_commit_floor_gib = 20.0;
+        if (!host_wait_given) o.host_pin_wait_s = 90.0;
+    }
+    if (!strix::ds41::valid_host_pin_policy(o.host_commit_floor_gib, o.host_pin_wait_s))
+        usage("host floor/wait must be finite and nonnegative");
     if (!tiers.empty()) {
         o.tiers.assign(40, ExpertTier::file);
         for (std::size_t l = 0; l < tiers.size() && l < 40; ++l)
@@ -1486,6 +1557,8 @@ int main(int argc, char** argv) {
     // --pipeline queues several captured states for its handoff worker. Combining them needs a buffer per queued state
     // (not done yet), so the two are refused together.
     if (c.fast_export && c.pipeline) usage("--pipeline cannot be combined with --fast-export / --export-check (yet)");
+    o.service_host_buffers = true;
+    o.reserve_export_capture = c.fast_export;
     o.defer_idle_preload = c.fast_export;
     o.fast_dense = c.fast_dense;
     if (o.pass_rows) {

@@ -46,6 +46,7 @@ struct StreamerPlan {
     std::uint32_t host_pin_retry_ms = 1500;        // wait between tries; a layer that still fails streams from the file
     double host_commit_floor_gib = 0.0;            // > 0: commit-floor policy instead of the tries (see PrefillOptions)
     double host_pin_wait_s = 360.0;                // commit-floor policy: total wait for the whole host tier
+    bool host_tier_implicit = false;
     bool timing = false;                           // copy start / end events per streamed layer
 };
 
@@ -57,7 +58,7 @@ public:
     static std::unique_ptr<PinnedBytes> try_alloc(std::size_t n, std::uint32_t attempts, std::uint32_t retry_ms);
     // nullptr once `deadline` passed (or free physical memory is short) without room for n bytes above the commit floor
     static std::unique_ptr<PinnedBytes> try_alloc_floor(std::size_t n, double floor_gib, std::chrono::steady_clock::time_point deadline,
-                                                        std::uint32_t& waits);
+                                                        std::uint32_t& waits, bool implicit, bool allow_first, HostPinReason& reason);
     ~PinnedBytes();
     PinnedBytes(const PinnedBytes&) = delete;
     PinnedBytes& operator=(const PinnedBytes&) = delete;
@@ -105,6 +106,7 @@ public:
     [[nodiscard]] Stats stats() const;           // after the run's work finished
     [[nodiscard]] cudaEvent_t copy_origin() const;  // timing: the event the copy times are relative to
     [[nodiscard]] std::size_t device_bytes() const noexcept { return device_bytes_; }
+    [[nodiscard]] const HostPinStats& host_pin_stats() const { return host_pin_stats_; }
     [[nodiscard]] std::size_t pinned_bytes() const noexcept { return pinned_bytes_; }
     [[nodiscard]] std::uint32_t host_pin_failed_layers() const noexcept { return host_pin_failed_; }
     [[nodiscard]] double host_pin_seconds() const noexcept { return host_pin_s_; }
@@ -167,6 +169,7 @@ private:
     std::uint64_t bytes_streamed_ = 0;
     double io_seconds_ = 0.0, wait_seconds_ = 0.0;
     std::size_t device_bytes_ = 0, pinned_bytes_ = 0;
+    HostPinStats host_pin_stats_;
     std::uint32_t host_pin_failed_ = 0;   // host layers demoted to the file tier (pinned allocation failed)
     double host_pin_s_ = 0.0;             // time spent allocating the host tier (incl. retries)
     std::uint32_t host_pin_waits_ = 0;    // commit-floor policy: waits for the pagefile to grow

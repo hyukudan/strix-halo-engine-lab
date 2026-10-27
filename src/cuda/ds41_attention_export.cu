@@ -268,6 +268,7 @@ bool ExportCapture::sealed() const noexcept { return impl_->sealed; }
 std::uint32_t ExportCapture::position() const noexcept { return impl_->frame.position; }
 const deepseek41::AttentionFrame& ExportCapture::frame() const noexcept { return impl_->frame; }
 std::size_t ExportCapture::capacity() const noexcept { return impl_->host_cap; }
+std::size_t ExportCapture::pinned_bytes() const noexcept { return impl_->host_cap + (impl_->host_meta ? kMaxSegments * 4U : 0U); }
 const ExportCapture::Timing& ExportCapture::timing() const noexcept { return impl_->timing; }
 
 void ExportCapture::seal(unsigned threads, bool sha256) {
