@@ -713,7 +713,9 @@ the GPU read the weights where they sit.
 
 **What context length is supported?**
 Qwen's automatic profile is qualified at 8192 tokens; longer contexts run with `--unqualified-context` (the measured prefill
-sweep reaches 262,143 tokens that way). DeepSeek's long-context limits are in
+sweep reaches 262,143 tokens that way). A retrieval pilot with the default command found the needle in all 19
+cases from 8K to 262,143 tokens; that is a pilot, not a qualification
+([long-context checks](docs/reproduce.md#long-context-retrieval-and-reasoning-checks-qwen)). DeepSeek's long-context limits are in
 [docs/models/deepseek-v4.1/long-context.md](docs/models/deepseek-v4.1/long-context.md).
 
 **Where are the numbers from?**
