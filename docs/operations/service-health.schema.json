@@ -1,0 +1,619 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Strix service health revision 1",
+  "type": "object",
+  "properties": {
+    "format": {
+      "const": "strix-service-health"
+    },
+    "revision": {
+      "const": 1
+    },
+    "status": {
+      "enum": [
+        "ok",
+        "failed",
+        "draining"
+      ]
+    },
+    "model": {
+      "type": "string"
+    },
+    "ready": {
+      "type": "boolean"
+    },
+    "release": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "git_sha": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "build_info_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "build_info": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "format": {
+              "const": "strix-build"
+            },
+            "revision": {
+              "const": 1
+            },
+            "status": {
+              "enum": [
+                "available",
+                "unavailable",
+                null
+              ]
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[0-9.]{1,32}$"
+            },
+            "git_sha": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "flags_evidence": {
+              "enum": [
+                "configured",
+                "compiled",
+                null
+              ]
+            },
+            "dirty": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "compiler_id": {
+              "enum": [
+                "GNU",
+                "Clang",
+                "AppleClang",
+                "MSVC",
+                "AMDClang",
+                null
+              ]
+            },
+            "hip_compiler_id": {
+              "enum": [
+                "GNU",
+                "Clang",
+                "AppleClang",
+                "MSVC",
+                "AMDClang",
+                null
+              ]
+            },
+            "compiler_version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "hip_compiler_version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cmake_version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "target_isa": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "git_sha_source": {
+              "enum": [
+                "git",
+                "supplied",
+                null
+              ]
+            },
+            "options": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": {
+                "type": "boolean"
+              }
+            }
+          },
+          "required": [
+            "format",
+            "revision",
+            "status",
+            "version",
+            "git_sha",
+            "flags_evidence",
+            "dirty",
+            "compiler_id",
+            "hip_compiler_id",
+            "compiler_version",
+            "hip_compiler_version",
+            "cmake_version",
+            "target_isa",
+            "git_sha_source",
+            "options"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "version",
+        "git_sha",
+        "build_info_sha256",
+        "build_info"
+      ],
+      "additionalProperties": false
+    },
+    "identity": {
+      "type": "object",
+      "properties": {
+        "model_key": {
+          "type": "null"
+        },
+        "content_identity": {
+          "type": "null"
+        },
+        "assets": {
+          "type": "object",
+          "properties": {
+            "manifest_sha256": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "verification": {
+              "enum": [
+                "full",
+                null
+              ]
+            },
+            "coverage": {
+              "enum": [
+                "complete",
+                "unbound"
+              ]
+            },
+            "file_count": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "roles": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "target": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "target_shard": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "draft": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "vocabulary": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "tokenizer": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "profile": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "calibration": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "manifest_sha256",
+            "verification",
+            "coverage",
+            "file_count",
+            "roles"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "model_key",
+        "content_identity",
+        "assets"
+      ],
+      "additionalProperties": false
+    },
+    "capacity": {
+      "type": "object",
+      "properties": {
+        "context_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "slots": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      },
+      "required": [
+        "context_tokens",
+        "slots"
+      ],
+      "additionalProperties": false
+    },
+    "execution": {
+      "type": "object",
+      "properties": {
+        "decode_profile": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "prefill_profile": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "prefill_tile_rows": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "draft_profile": {
+          "enum": [
+            "base",
+            "distill-d",
+            "distill-g",
+            null
+          ]
+        }
+      },
+      "required": [
+        "decode_profile",
+        "prefill_profile",
+        "prefill_tile_rows",
+        "draft_profile"
+      ],
+      "additionalProperties": false
+    },
+    "storage": {
+      "type": "object",
+      "properties": {
+        "prefix": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "host_limit_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "disk_enabled": {
+              "type": "boolean"
+            },
+            "disk_limit_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          "required": [
+            "enabled",
+            "host_limit_bytes",
+            "disk_enabled",
+            "disk_limit_bytes"
+          ],
+          "additionalProperties": false
+        },
+        "sessions": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "const": false
+            }
+          },
+          "required": [
+            "enabled"
+          ],
+          "additionalProperties": false
+        },
+        "resident_pool": {
+          "type": "object",
+          "properties": {
+            "supported": {
+              "const": false
+            }
+          },
+          "required": [
+            "supported"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "prefix",
+        "sessions",
+        "resident_pool"
+      ],
+      "additionalProperties": false
+    },
+    "load": {
+      "type": "object",
+      "properties": {
+        "queued": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "running": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "sample_age_seconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        }
+      },
+      "required": [
+        "queued",
+        "running",
+        "sample_age_seconds"
+      ],
+      "additionalProperties": false
+    },
+    "backend": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "enum": [
+            "starting",
+            "responsive",
+            "probe_pending",
+            "unresponsive",
+            "failed",
+            "draining",
+            "unchecked"
+          ]
+        },
+        "proof": {
+          "enum": [
+            "control-only",
+            "work-completion",
+            "idle-scratch-event",
+            null
+          ]
+        },
+        "probe_age_seconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "last_completion_age_seconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "required_ranks": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "responsive_ranks": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      },
+      "required": [
+        "state",
+        "proof",
+        "probe_age_seconds",
+        "last_completion_age_seconds",
+        "required_ranks",
+        "responsive_ranks"
+      ],
+      "additionalProperties": false
+    },
+    "preflight": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "enum": [
+            "ok",
+            "advisory",
+            "warning",
+            "unavailable"
+          ]
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "advisories": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sample_age_seconds": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        }
+      },
+      "required": [
+        "state",
+        "warnings",
+        "advisories",
+        "sample_age_seconds"
+      ],
+      "additionalProperties": false
+    },
+    "capabilities_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "capabilities_url": {
+      "enum": [
+        "/v1/capabilities",
+        null
+      ]
+    }
+  },
+  "required": [
+    "format",
+    "revision",
+    "status",
+    "model",
+    "ready",
+    "release",
+    "identity",
+    "capacity",
+    "execution",
+    "storage",
+    "load",
+    "backend",
+    "preflight",
+    "capabilities_id",
+    "capabilities_url"
+  ],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "capabilities_id": {
+            "type": "null"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "capabilities_url": {
+            "type": "null"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "capabilities_url": {
+            "const": "/v1/capabilities"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -405,6 +405,7 @@ struct Options {
     std::string http_bind = "127.0.0.1";
     std::string http_model_id = "qwen3.8-flash-next";
     std::string http_api_key_file;
+    std::string release_manifest; // optional verified asset bundle, rooted beside the manifest
     bool http_responses = true, http_capabilities = true, http_stream_receipts = true;
     double http_sse_keepalive = 10.0;
     double http_sse_progress_interval = 1.0;
@@ -787,6 +788,35 @@ inline void validate_prefix_state_cache(const Options& o) {
         throw std::invalid_argument("--prefix-cache-then-prompt runs on the serial-decode tiled route only");
     if (o.prefix_cache_then_prompts.size() > 64U)
         throw std::invalid_argument("at most 64 --prefix-cache-then-prompt requests");
+}
+
+inline constexpr const char* release_manifest_mode_error =
+    "--release-manifest requires --http-serve without cohort, sample-repeat, "
+    "file-backed multi-input modes or offline compile provenance";
+
+// Reject before parsing any file-backed cohort tokens, regardless of option order.
+inline void validate_release_manifest_arguments(int argc, char** argv) {
+    bool release = false, http = false, extra = false;
+    for (int i = 2; i < argc; ++i) {
+        const std::string_view argument = argv[i];
+        const auto name = argument.substr(0, argument.find('='));
+        release = release || name == "--release-manifest";
+        http = http || name == "--http-serve";
+        for (const auto* option : {"--mtp-cohort-request", "--mtp-cohort-mode", "--mtp-sample-repeats",
+             "--serve-prefix-u32le", "--prefix-cache-then-prompt", "--offline-compile-provenance"})
+            extra = extra || name == option;
+    }
+    if (release && (!http || extra)) throw std::invalid_argument(release_manifest_mode_error);
+}
+
+// Release binding supports one HTTP startup calibration, not file-backed request collections.
+inline void validate_release_manifest(const Options& o) {
+    if (o.release_manifest.empty()) return;
+    if (!o.http_serve || !o.mtp.cohort.empty() || !o.mtp.cohort_mode.empty() ||
+        o.mtp.sample_repeats != 1 || o.supplied_options.contains("--mtp-sample-repeats") ||
+        !o.serving_prefix_files.empty() || !o.prefix_cache_then_prompts.empty() ||
+        !o.offline_compile_provenance_path.empty())
+        throw std::invalid_argument(release_manifest_mode_error);
 }
 
 // Resolve compatibility before route-dependent validation. A cap never enables missing prerequisites.
@@ -1259,6 +1289,7 @@ inline void validate_resolved_mtp_cli(const Options& o) {
 inline Options parse_options(
     int argc,
     char** argv, bool defer_qpf2k_defaults = false) {
+    validate_release_manifest_arguments(argc, argv);
     // The executable resolves injected schedule defaults after reading the manifest.
     const strix::qpf2k::ModelScope defaults_scope(defer_qpf2k_defaults || strix::qpf2k::gsq_model);
     if (argc < 2) {
@@ -1664,7 +1695,7 @@ inline Options parse_options(
         }
         if (argument == "--http-port" || argument == "--http-bind" || argument == "--http-model-id" ||
             argument == "--http-constraints" || argument == "--http-responses" || argument == "--http-capabilities" || argument == "--http-stream-receipts" ||
-            argument == "--http-sse-progress-interval" || argument == "--http-sse-keepalive" || argument == "--http-api-key-file" || argument == "--http-sampling" || argument == "--http-default-max-tokens" ||
+            argument == "--http-sse-progress-interval" || argument == "--http-sse-keepalive" || argument == "--release-manifest" || argument == "--http-api-key-file" || argument == "--http-sampling" || argument == "--http-default-max-tokens" ||
             argument == "--http-default-temperature" || argument == "--http-default-top-k" ||
             argument == "--http-default-top-p" || argument == "--http-default-min-p" ||
             argument == "--http-max-queue" || argument == "--http-max-connections" || argument == "--http-batch" ||
@@ -1695,6 +1726,7 @@ inline Options parse_options(
             } else if (argument == "--http-port") options.http_port = u32("HTTP port");
             else if (argument == "--http-bind") options.http_bind = value;
             else if (argument == "--http-model-id") options.http_model_id = value;
+            else if (argument == "--release-manifest") options.release_manifest = value;
             else if (argument == "--http-api-key-file") options.http_api_key_file = value;
             else if (argument == "--http-sampling") options.http_sampling = value;
             else if (argument == "--http-default-top-k") options.http_default_top_k = u32("HTTP default top_k");
@@ -2439,6 +2471,8 @@ inline Options parse_options(
             static_cast<std::uint32_t>(
                 token));
     }
+
+    validate_release_manifest(options);
 
     // Baseline keeps the same semantic validators as historical argv resolution.
     validate_model_copy_cli(options);

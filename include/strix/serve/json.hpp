@@ -82,8 +82,10 @@ public:
     using std::runtime_error::runtime_error;
 };
 
-// Strict RFC 8259 parser (UTF-8 input, surrogate pairs combined); depth limited to 128.
+// Serving parser retains legacy byte and surrogate handling; depth limited to 128.
 [[nodiscard]] Json parse_json(std::string_view text);
+// Asset parser also rejects duplicates, invalid UTF-8 and unpaired surrogates.
+[[nodiscard]] Json parse_json_unique(std::string_view text);
 void append_json_string(std::string& out, std::string_view value);
 
 }  // namespace strix::serve

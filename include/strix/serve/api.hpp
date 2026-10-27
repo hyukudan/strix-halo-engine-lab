@@ -5,6 +5,7 @@
 #include "strix/serve/engine.hpp"
 #include "strix/serve/http_server.hpp"
 #include "strix/serve/json.hpp"
+#include "strix/serve/health.hpp"
 
 #include <functional>
 #include <memory>
@@ -15,6 +16,8 @@
 namespace strix::serve {
 
 struct ApiConfig {
+    std::shared_ptr<const ServeHealthRecord> health_record;
+    HealthProvider health_provider;
     std::string model_id = "qwen3.8-flash-next";
     std::uint32_t default_max_tokens = 4096;
     std::uint32_t http_slots = 0; // resolved capacity; zero leaves engine-specific headers unset

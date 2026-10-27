@@ -4,11 +4,19 @@
 
 #include <filesystem>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace strix {
+
+class ModelContentChanged : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+enum class FileHashPolicy { cached, full };
 
 struct ModelContentFile {
     std::string logical_name;
@@ -17,6 +25,10 @@ struct ModelContentFile {
 
 [[nodiscard]] ModelContentIdentity sha256_file_content(
     const std::filesystem::path& path);
+
+// Explicit full reads bypass the persistent metadata cache without changing process settings.
+[[nodiscard]] ModelContentIdentity sha256_file_content(
+    const std::filesystem::path& path, FileHashPolicy policy);
 
 [[nodiscard]] ModelContentIdentity sha256_bytes(
     std::span<const std::byte> bytes);
@@ -51,6 +63,8 @@ struct SingleModelContentIdentity {
     std::uint64_t file_bytes=0;
 };
 [[nodiscard]] SingleModelContentIdentity hash_single_model_content_file(const ModelContentFile&);
+[[nodiscard]] SingleModelContentIdentity hash_single_model_content_file(
+    const ModelContentFile&, FileHashPolicy policy);
 [[nodiscard]] std::string model_content_identity_hex(
     const ModelContentIdentity& identity);
 

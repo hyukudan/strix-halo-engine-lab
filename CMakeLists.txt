@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.24)
 
 project(strix_engine_lab VERSION 0.1.0 LANGUAGES CXX)
 
+# Evaluate after all optional language/toolchain and STRIX option configuration.
+cmake_language(DEFER CALL include "${CMAKE_CURRENT_SOURCE_DIR}/cmake/StrixBuildInfo.cmake")
+
 # Optional evaluated-input export only. No manifest is self-generated or
 # admitted by configuration; explicit valid Ninja dependency export is required.
 option(STRIX_EXPORT_OFFLINE_TUNING_PROVENANCE "Export Ninja POSIX FileAPI inputs for offline compile provenance" OFF)
@@ -128,6 +131,7 @@ add_library(strix_core STATIC
     src/offline_compile_provenance.cpp
     src/uma_owner_inventory.cpp
     src/linux_uma_observation.cpp
+    src/preflight.cpp
     src/moe_fork_join_arena.cpp
     src/moe_token_cost_backend.cpp
     src/prepared_execution.cpp
@@ -338,10 +342,11 @@ add_library(strix_serve STATIC
     src/serve/http_server.cpp
     src/serve/engine.cpp
     src/serve/api.cpp
+    src/serve/health.cpp
 )
 target_include_directories(strix_serve PUBLIC include PRIVATE src/serve)
 target_compile_features(strix_serve PUBLIC cxx_std_20)
-target_link_libraries(strix_serve PUBLIC Threads::Threads)
+target_link_libraries(strix_serve PUBLIC Threads::Threads strix_core)
 strix_target_warnings(strix_serve)
 
 add_executable(strix-tokenize apps/tokenize_main.cpp)
@@ -352,10 +357,13 @@ add_executable(strix-mtp-manifest-audit apps/mtp_manifest_audit_main.cpp)
 target_link_libraries(strix-mtp-manifest-audit PRIVATE strix_core)
 strix_target_warnings(strix-mtp-manifest-audit)
 
+add_library(strix_assets STATIC src/asset_manifest.cpp src/serve/json.cpp)
+target_link_libraries(strix_assets PUBLIC strix_core)
+strix_target_warnings(strix_assets)
 add_executable(strix-model-manifest apps/model_manifest_main.cpp)
 add_executable(strix-gsq-content-identity lab/gsq/content_identity.cpp)
 target_link_libraries(strix-gsq-content-identity PRIVATE strix_core)
-target_link_libraries(strix-model-manifest PRIVATE strix_core)
+target_link_libraries(strix-model-manifest PRIVATE strix_assets)
 strix_target_warnings(strix-model-manifest)
 
 add_executable(strix-platform-probe apps/platform_probe_main.cpp)
@@ -404,6 +412,11 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING)
+    add_executable(strix-serve-health-tests tests/serve_health_test.cpp)
+    target_link_libraries(strix-serve-health-tests PRIVATE strix_serve strix_assets)
+    target_include_directories(strix-serve-health-tests PRIVATE apps)
+    strix_target_warnings(strix-serve-health-tests)
+    add_test(NAME strix-serve-health-tests COMMAND strix-serve-health-tests)
     add_executable(strix-serve-frontend-tests tests/serve_frontend_tests.cpp)
     target_link_libraries(strix-serve-frontend-tests PRIVATE strix_serve)
     strix_target_warnings(strix-serve-frontend-tests)
@@ -1038,6 +1051,34 @@ if(BUILD_TESTING)
     target_link_libraries(strix-linux-uma-observation-tests PRIVATE strix_core)
     strix_target_warnings(strix-linux-uma-observation-tests)
     add_test(NAME strix-linux-uma-observation-tests COMMAND strix-linux-uma-observation-tests)
+
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    option(STRIX_ASSET_CLI_TESTS "Require asset CLI qualification" ON)
+    if(STRIX_ASSET_CLI_TESTS)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME strix-asset-manifest-cli-tests COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/asset_manifest_cli_test.py $<TARGET_FILE:strix-model-manifest>)
+        else()
+            add_test(NAME strix-asset-manifest-cli-tests COMMAND ${CMAKE_COMMAND}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/asset_cli_requires_python.cmake)
+        endif()
+    endif()
+    add_executable(strix-asset-manifest-tests tests/asset_manifest_test.cpp src/asset_manifest.cpp src/serve/json.cpp)
+    target_link_libraries(strix-asset-manifest-tests PRIVATE strix_core)
+    target_compile_definitions(strix-asset-manifest-tests PRIVATE STRIX_ASSET_TEST_HOOKS=1)
+    target_compile_definitions(strix-asset-manifest-tests PRIVATE STRIX_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    strix_target_warnings(strix-asset-manifest-tests)
+    add_test(NAME strix-asset-manifest-tests COMMAND strix-asset-manifest-tests)
+
+    add_executable(strix-preflight-tests tests/preflight_test.cpp src/serve/json.cpp)
+    target_link_libraries(strix-preflight-tests PRIVATE strix_core)
+    strix_target_warnings(strix-preflight-tests)
+    add_test(NAME strix-preflight-tests COMMAND strix-preflight-tests)
+
+    add_executable(strix-build-info-tests tests/build_info_test.cpp src/serve/json.cpp)
+    target_link_libraries(strix-build-info-tests PRIVATE strix_core)
+    strix_target_warnings(strix-build-info-tests)
+    add_test(NAME strix-build-info-tests COMMAND strix-build-info-tests)
 
     add_executable(strix-distributed-stage-state-tests tests/distributed_stage_state_tests.cpp)
     target_link_libraries(strix-distributed-stage-state-tests PRIVATE strix_core)
@@ -1737,7 +1778,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     target_include_directories(strix-hip-decode-token PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_link_libraries(
         strix-hip-decode-token
-        PRIVATE strix_hip_runtime strix_serve
+        PRIVATE strix_hip_runtime strix_serve strix_assets
     )
     strix_target_warnings(
         strix-hip-decode-token
@@ -1757,7 +1798,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             STRIX_DECODE_ENTRY=strix_hip_decode_token_entry STRIX_MTP_MODEL_QUALIFICATION_RUNNER=1)
         target_include_directories(strix-hip-mtp-model-qualification PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
         target_link_libraries(strix-hip-mtp-model-qualification PRIVATE
-            strix_hip_runtime strix_mtp_projection_component_fixtures strix_serve)
+            strix_hip_runtime strix_mtp_projection_component_fixtures strix_serve strix_assets)
         # Large state snapshots are diagnostic-only. Prefer the system SHA-256
         # provider when available; the portable digest remains the fallback.
         find_package(OpenSSL QUIET COMPONENTS Crypto)
@@ -1770,7 +1811,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         strix_target_warnings(strix-hip-mtp-model-qualification)
         add_executable(strix-hip-mtp-qualification-reference-tests tests/hip_mtp_qualification_reference_tests.hip)
         target_link_libraries(strix-hip-mtp-qualification-reference-tests PRIVATE
-            strix_hip_runtime strix_mtp_projection_component_fixtures strix_serve)
+            strix_hip_runtime strix_mtp_projection_component_fixtures strix_serve strix_assets)
         set_target_properties(strix-hip-mtp-qualification-reference-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
         strix_target_warnings(strix-hip-mtp-qualification-reference-tests)

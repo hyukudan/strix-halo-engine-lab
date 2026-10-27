@@ -481,7 +481,7 @@ FileDigest hash_file_stable_uncached(
     if (error ||
         before != after ||
         bytes != before) {
-        throw std::runtime_error(
+        throw ModelContentChanged(
             "model content file changed while hashing");
     }
 
@@ -496,6 +496,10 @@ FileDigest hash_file_stable_uncached(
 ModelContentIdentity sha256_file_content(
     const std::filesystem::path& path) {
     return hash_file_stable(path).digest;
+}
+
+ModelContentIdentity sha256_file_content(const std::filesystem::path& path, FileHashPolicy policy) {
+    return policy == FileHashPolicy::full ? hash_file_stable_uncached(path).digest : sha256_file_content(path);
 }
 
 ModelContentIdentity sha256_bytes(std::span<const std::byte> bytes) {
@@ -710,8 +714,11 @@ ModelContentIdentity build_model_content_identity(
 }
 
 SingleModelContentIdentity hash_single_model_content_file(const ModelContentFile& file) {
+    return hash_single_model_content_file(file, FileHashPolicy::cached);
+}
+SingleModelContentIdentity hash_single_model_content_file(const ModelContentFile& file, FileHashPolicy policy) {
     if(file.logical_name.empty()) throw std::invalid_argument("model content logical file name must be non-empty");
-    const auto digest=hash_file_stable(file.path);
+    const auto digest=policy == FileHashPolicy::full ? hash_file_stable_uncached(file.path) : hash_file_stable(file.path);
     Sha256 aggregate;aggregate.update("STRIX-MODEL-CONTENT-V1");
     aggregate.update_u64(static_cast<std::uint64_t>(file.logical_name.size()));
     aggregate.update(file.logical_name);aggregate.update_u64(digest.bytes);

@@ -148,8 +148,9 @@ std::string Json::dump_spaced() const { std::string out; write(out, true); retur
 namespace {
 class Parser {
 public:
-    explicit Parser(std::string_view text) : text_(text) {}
+    explicit Parser(std::string_view text, bool unique = false) : unique_(unique), text_(text) {}
     Json document() {
+        if (unique_) validate_utf8();
         auto value = parse(0);
         skip();
         if (at_ != text_.size()) fail("trailing characters after the JSON value");
@@ -158,6 +159,24 @@ public:
 private:
     [[noreturn]] void fail(const char* what) const {
         throw JsonError(std::string("JSON parse error at byte ") + std::to_string(at_) + ": " + what);
+    }
+    void validate_utf8() const {
+        for (std::size_t i = 0; i < text_.size();) {
+            const auto c = static_cast<unsigned char>(text_[i++]);
+            if (c < 0x80U) continue;
+            unsigned count = 0, cp = 0, minimum = 0;
+            if (c >= 0xC2U && c <= 0xDFU) { count = 1; cp = c & 0x1FU; minimum = 0x80U; }
+            else if (c >= 0xE0U && c <= 0xEFU) { count = 2; cp = c & 0x0FU; minimum = 0x800U; }
+            else if (c >= 0xF0U && c <= 0xF4U) { count = 3; cp = c & 0x07U; minimum = 0x10000U; }
+            else fail("invalid UTF-8");
+            if (count > text_.size() - i) fail("truncated UTF-8");
+            while (count--) {
+                const auto next = static_cast<unsigned char>(text_[i++]);
+                if ((next & 0xC0U) != 0x80U) fail("invalid UTF-8 continuation");
+                cp = (cp << 6U) | (next & 0x3FU);
+            }
+            if (cp < minimum || cp > 0x10FFFFU || (cp >= 0xD800U && cp <= 0xDFFFU)) fail("invalid UTF-8 scalar");
+        }
     }
     void skip() {
         while (at_ < text_.size() && (text_[at_] == ' ' || text_[at_] == '\t' || text_[at_] == '\n' || text_[at_] == '\r')) ++at_;
@@ -186,7 +205,7 @@ private:
                 ++at_;
                 auto value = parse(depth + 1U);
                 bool replaced = false;
-                for (auto& member : members) if (member.first == key) { member.second = std::move(value); replaced = true; break; }
+                for (auto& member : members) if (member.first == key) { if (unique_) fail("duplicate object key"); member.second = std::move(value); replaced = true; break; }
                 if (!replaced) members.emplace_back(std::move(key), std::move(value));
                 skip();
                 if (at_ < text_.size() && text_[at_] == ',') { ++at_; continue; }
@@ -279,8 +298,8 @@ private:
                         const auto low = hex4();
                         if (low < 0xDC00U || low > 0xDFFFU) fail("invalid surrogate pair");
                         cp = 0x10000U + ((cp - 0xD800U) << 10U) + (low - 0xDC00U);
-                    } else cp = 0xFFFDU;
-                } else if (cp >= 0xDC00U && cp <= 0xDFFFU) cp = 0xFFFDU;
+                    } else { if (unique_) fail("unpaired surrogate"); cp = 0xFFFDU; }
+                } else if (cp >= 0xDC00U && cp <= 0xDFFFU) { if (unique_) fail("unpaired surrogate"); cp = 0xFFFDU; }
                 utf8(out, cp);
                 break;
             }
@@ -288,10 +307,13 @@ private:
             }
         }
     }
+    bool unique_;
     std::string_view text_;
     std::size_t at_ = 0;
 };
 }  // namespace
+
+Json parse_json_unique(std::string_view text) { return Parser(text, true).document(); }
 
 Json parse_json(std::string_view text) { return Parser(text).document(); }
 

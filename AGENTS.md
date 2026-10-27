@@ -28,6 +28,9 @@ are already defaults: they can force an explicit route and decline the automatic
 | MiniMax | `strix-minimax-rank MODEL_DIR R usb4-auto OUTPUT_DIR`, one rank per node; [27 defaults](src/minimax/engine/mm_defaults.cpp) | `--print-effective-config` | `STRIX_MM_BASELINE=1` |
 | GLM | `strix-glm5-rank MODEL_DIR --world 2 --rank R --transport usb4-auto --prompt PROMPT.u32 --decode 64`, one rank per node; [resolver](apps/glm_rank_defaults.hpp) | `--print-effective-config` | `--baseline` / `STRIX_GLM_BASELINE=1` |
 
+Qwen startup prints one `strix-build-info` and one `strix-startup-event` JSON line on stderr (read-only
+[preflight and build identity](docs/operations/startup-preflight.md); not in `--print-effective-config`
+runs; `STRIX_RELEASE_EVENTS=0` switches both off). Advisories in that record are not failures.
 Inspection exits before device work; preserve the engine's required assets and two-rank launch contract
 for execution. Check [all item guards, fallback notices and off switches](docs/optimizations.md) or
 the [JSON catalog](docs/optimizations.json). Qwen auto fast prefill currently excludes MTP and HTTP serving.

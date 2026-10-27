@@ -6,6 +6,7 @@
 #include "hip_mtp_decode_bridge.hpp"
 #include "rtx_state_import_routes.hpp"
 #include "strix/serve/api.hpp"
+#include "qwen_service_health.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/engine.hpp"
 #include "strix/serve/http_server.hpp"
@@ -133,8 +134,9 @@ inline std::string read_http_api_key(const std::string& path) {
 // Serves until SIGINT/SIGTERM or an engine failure (rethrown after the server stops).
 // rtx_import (--rtx-state-import): the /admin/rtx-import/* routes over these imports; null: no route.
 inline MtpDecodeServe make_http_serve(const Options& options, std::string engine_description,
-    std::shared_ptr<RtxStateImportRegistry> rtx_import = {}) {
-    return [&options, engine_description = std::move(engine_description), rtx_import](const MtpServeRunner& run) {
+    std::shared_ptr<RtxStateImportRegistry> rtx_import = {},
+    std::optional<StartupPreflight> startup = {}, serve::Json assets = {}) {
+    return [&options, engine_description = std::move(engine_description), rtx_import, startup, assets](const MtpServeRunner& run) {
         const auto tokenizer = serve::BpeTokenizer::load_gguf(options.model_path);
         serve::ApiConfig config;
         config.model_id = options.http_model_id;
@@ -166,6 +168,8 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
                 return handle_rtx_state_import_route(*rtx_import, request, response);
             };
 
+        if (serve::serve_health_record_enabled())
+            config.health_record = http_health_record(options, 1, startup, assets);
         MtpBridgeEngine engine(run, options.context_tokens, constraints, config.engine_constraints);
         serve::GenerationQueue queue(options.http_max_queue);
         serve::ApiService api(config, tokenizer, queue, options.context_tokens, false);
@@ -210,8 +214,9 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
 // and decodes every active request together; a request leaves when it ends, without stopping the others.
 // With --http-sampling sample, a request with temperature > 0 samples (sampling-v1) with its own policy
 // and seed.
-inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::string engine_description) {
-    return [&options, engine_description = std::move(engine_description)](MtpBatchRunner& runner) {
+inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::string engine_description,
+    std::optional<StartupPreflight> startup = {}, serve::Json assets = {}) {
+    return [&options, engine_description = std::move(engine_description), startup, assets](MtpBatchRunner& runner) {
         const auto tokenizer = serve::BpeTokenizer::load_gguf(options.model_path);
         serve::ApiConfig config;
         config.model_id = options.http_model_id;
@@ -239,6 +244,8 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         config.engine_constraints = runner.supports_constraints() && constraints.available(config.stop_tokens);
         if(config.engine_constraints) config.constraint_execution_routes=runner.constraint_execution_routes();
         const bool samples = options.http_sampling == "sample";
+        if (serve::serve_health_record_enabled())
+            config.health_record = http_health_record(options, runner.slots(), startup, assets);
         // Strict tool-call frame proposals (opt-in) need the template's frame tokens.
         if (const auto open = tokenizer->find("<tool_call>"), close = tokenizer->find("</tool_call>");
             open != UINT32_MAX && close != UINT32_MAX && open != close)

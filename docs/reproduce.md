@@ -147,6 +147,8 @@ to `vocab/`. RTX uses the same target/draft filenames, plus `ds41-draft-vocab/` 
 draft; its fetch recipe copies verified vocabulary there. RTX also requires the deployment
 receipt and state below. Qwen continues to use its separate `draft-vocab/` directory.
 
+For explicit CPU bundle integrity checks, see [release asset verification](operations/release-assets.md).
+
 Qwen additionally requires `mtp-Qwen3.8-Flash-Next-shared-distillG-Q8_0.gguf` and `draft-vocab/`.
 The fetcher explicitly does not supply the locally distilled sidecar; never rename base MTP
 as distill-g. Even `plain` precheck requires these assets. RTX additionally needs deployment

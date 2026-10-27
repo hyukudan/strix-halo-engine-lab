@@ -1,0 +1,12 @@
+{
+  "architecture": "qwen4exp",
+  "layout_identity": 7771573889040883603,
+  "total_tensor_bytes": 1024,
+  "file_backed_candidate_bytes": 0,
+  "bounded_cache_candidate_bytes": 0,
+  "unknown_tensor_count": 1,
+  "tensors": [
+    {"name":"blk.0.weight","role":"unknown","residency":"resident","placement":{"kind":"local","node":0},"layer":0,"ggml_type":1,"byte_size":1024,"absolute_offset":160,"dimensions":[16,32]}
+
+  ]
+}
