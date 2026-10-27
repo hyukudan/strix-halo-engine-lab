@@ -34,6 +34,10 @@ Serving runs on the tiled MTP route, so it takes the flags of a tiled MTP reques
 | `--http-responses on\|off` | `on` | the stateless `POST /v1/responses` route ([below](#responses-stateless)); `off`: 404 |
 | `--http-capabilities on\|off` | `on` | `GET /v1/capabilities` and its `capabilities_id` in `/health`, `/v1/models`, `/api/status`; `off`: 404, no id |
 | `--http-stream-receipts on\|off` | `on` | the applied-policy `strix` object at the start and end of every stream ([below](#applied-policy-and-keepalive)); `off` together with `--http-sse-keepalive 0 --http-sse-progress-interval 0`: the previous build's bytes |
+| `--http-anthropic-thinking-budget enforce\|note` | `note` | Messages `thinking.budget_tokens`: `note` accepts it and states in `strix.note` that it is not enforced (the request keeps speculative decoding); `enforce` applies `thinking-budget-v1` (serial decoding) |
+| `--http-thinking-budget on\|off` | `on` | makes the opt-in `thinking-budget-v1` policy available ([below](#thinking-budget)); `off`: explicit policy requests get 400 |
+| `--http-logprobs on\|off` | `on` | Qwen serial host logprobs; `off` refuses score requests |
+| `--http-logit-transforms on\|off` | `on` | Qwen opt-in logit transforms; `off` refuses non-neutral transforms |
 | `--http-constraints on\|off` | `on` | constrained JSON output ([below](#constrained-json-output)); `off`: such requests get 400 and capabilities say unavailable |
 | `--http-sse-progress-interval SECONDS` | `1` | coalesced completed prefill progress as SSE comments; `0`: none; request opt-out: `"strix":{"progress":false}` |
 | `--http-sse-keepalive SECONDS` | `10` | SSE comment `: keepalive` after this long without a write while a stream waits (queue, prefill, decode); `0`: none |
@@ -217,18 +221,62 @@ window stream shared by all slots. The calibration replay runs once.
 - Other fields: `max_tokens` / `max_completion_tokens`, `stop` (string or list), `stream`,
   `stream_options.include_usage`, `n` (only 1), `temperature`, `top_p`, `top_k`, `seed`.
 - Generation fields the server does not execute yet are refused with a 400 naming the field, on every route:
-  non-zero `presence_penalty` / `frequency_penalty`, `repetition_penalty` other than 1, a non-empty `logit_bias`,
-  `logprobs` / `top_logprobs`, `response_format` other than text / `json_object` / `json_schema` ([constrained output](#constrained-json-output)), `parallel_tool_calls: false`, `required` or named
+  `response_format` other than text / `json_object` / `json_schema` ([constrained output](#constrained-json-output)), `parallel_tool_calls: false`, `required` or named
   `tool_choice` (Anthropic: `any` / `tool`, `disable_parallel_tool_use: true`), `strict` tools, legacy `functions` /
-  `function_call`; on completions also `n` / `best_of` other than 1, a `suffix` and a numeric `logprobs`; on
+  `function_call`; on completions also `n` / `best_of` other than 1, a `suffix`; on
   messages `thinking.type` other than `enabled` / `disabled` and non-null `output_config` members. Neutral values are accepted.
-  `thinking.budget_tokens` is accepted (the format requires it) and stated in `strix.note` as not enforced.
-  `GET /v1/capabilities` lists these features as unavailable.
+  Enabled `thinking.budget_tokens` is accepted and stated in `strix.note` as not enforced, unless the server runs
+  with `--http-anthropic-thinking-budget enforce`, which maps it to `thinking-budget-v1` ([thinking budget](#thinking-budget)).
+  `GET /v1/capabilities` lists these features as unavailable. Logprobs and transforms are available only on executing Qwen routes ([below](#logprobs-and-logit-transforms)); other engines refuse them.
 
 Streaming sends `reasoning_content` and `content` deltas as they are decoded (holding back only
 bytes that may belong to a stop string, a `</think>` or `<tool_call>` marker, an incomplete UTF-8
 sequence or trailing whitespace), tool calls when they are complete, a final chunk with
 `finish_reason`, optionally a usage chunk, and `data: [DONE]`.
+
+### Thinking budget
+
+`thinking-budget-v1` is an explicit, token-changing selection policy. Chat and Responses requests opt in with:
+
+```json
+"strix": {
+  "thinking_policy": "thinking-budget-v1",
+  "max_thinking_tokens": 2048,
+  "answer_room_tokens": 1024
+}
+```
+
+Thinking must be enabled. With effective output budget `B`, answer reservation `R`, and closure length `C`,
+reasoning may commit at most `min(max_thinking_tokens, B - R - C)` tokens before forced closure starts.
+`max_thinking_tokens` must be a positive integer. Optional `answer_room_tokens` is a nonnegative integer;
+omitted, the answer gets what remains (`R = B - max_thinking_tokens - C`), and a budget that leaves no answer
+room (`max_thinking_tokens + C >= B`) returns 400. Explicit reservations with `R + C > B` return 400 before submission. A zero remaining reasoning allowance closes immediately.
+Unknown policies and unavailable execution return 400. Without these fields, generation is unchanged.
+
+The executing Qwen route uses the shared serial host selector, with no drafts for that request. It resolves
+`</think>` from the loaded tokenizer, then encodes the template's following two newlines. Forced IDs become
+the actual target frontier, pass through target execution, and consume output/context capacity. They carry
+`forced_control` provenance in selection; no model-selected probability is claimed. This policy requires
+effective greedy selection and rejects nonempty stop strings and active tools. It composes with JSON output:
+the answer constraint starts only after the entire forced closure. Natural closure before the limit needs no
+injection. EOS during reasoning remains incomplete with reason `reasoning_eos`.
+
+Every policy response includes `strix.thinking` with `policy`, requested `max_thinking_tokens`, resolved
+`answer_room_tokens`, `closure` (`natural` or `forced`), committed `reasoning_tokens`, and `forced_ids`.
+`status` and an optional `reason` distinguish incomplete output. Stream terminal metadata includes these fields
+even with `--http-stream-receipts off`. Reasoning and answer split on the committed end-thinking token ID.
+`GET /v1/capabilities` advertises `thinking_budget` and `thinking_budget_policy` only for an executing route.
+
+For `/v1/messages`, `thinking: {"type":"enabled","budget_tokens":2048}` selects the same policy and default
+answer reservation when the server runs with `--http-anthropic-thinking-budget enforce`; the response states the
+executed policy. By default (`note`) the budget is accepted, the request keeps speculative decoding and `strix.note`
+states that the budget is not enforced: clients send this field with every thinking request, and enforcing it moves
+the request to the slower serial route. `--http-thinking-budget off` disables explicit policy requests. Other engines retain that note
+until they integrate the executing selection adapter.
+
+CPU contract tests cover the production selection adapter and HTTP translation. Native GPU token/state,
+first-token/cache routes, mixed-slot isolation, and complete-workload qualification remain separate gates;
+compilation and CPU results do not establish those gates.
 
 ### Anthropic-compatible messages
 
@@ -262,6 +310,56 @@ and an increasing `sequence_number`): `response.created`, `response.in_progress`
 `response.content_part.added`, `response.reasoning_text.delta`/`.done`, `response.output_text.delta`/`.done`,
 `response.function_call_arguments.delta`/`.done`, `response.content_part.done`, `response.output_item.done`, and
 exactly one of `response.completed`, `response.incomplete`, `response.failed`. There is no `[DONE]`.
+
+### Logprobs and logit transforms
+
+Qwen chat, completions and Responses execute these greedy-only policies on the same
+`serial-host` route as constrained JSON and thinking budgets. Other slots retain their
+selected routes. Effective temperature greater than zero is refused with 400; the
+capabilities document advertises availability and execution. DeepSeek and MiniMax
+continue to refuse these requests. The two feature switches above default to on;
+disabling a feature refuses requests requiring it.
+
+Chat accepts `logprobs:true` and integer `top_logprobs` in [0,20]. Completions accepts
+integer `logprobs` in [0,5], including zero to request the chosen-token score only.
+Responses accepts `top_logprobs` in [0,20] and
+`include:["message.output_text.logprobs"]`. A positive `top_logprobs` also requests
+scores. Scores include the first selected token from the terminal prompt row and do
+not change selection. They are temperature-one log-softmax over the eligible final
+selection row, after transforms and any JSON mask. Top entries sort by descending
+logprob, then ascending token ID. `strix.scoring` reports
+`basis:"target-row-log-softmax"`, `transform` (`none` or `logit-transform-v1`) and
+`constrained`. These scores describe that row, not the unmasked model distribution.
+
+Chat emits `choices[].logprobs.content` records with `token`, `logprob`, `bytes` and
+`top_logprobs`. Token text uses lossy UTF-8; bytes preserve the model token bytes.
+Completions emits `tokens`, `token_logprobs`, `top_logprobs` and `text_offset`.
+Responses emits `output_text.logprobs` and `response.output_text.delta.logprobs`.
+Streams carry the same scores as non-stream replies. Thinking-budget forced control
+records have `logprob:null`, an empty top list and `forced_control:true`; no model
+likelihood is invented for them.
+
+Non-neutral transforms are explicit token-changing request opt-ins. The order is:
+
+1. For IDs seen in the prompt or committed reply, apply `repetition_penalty` rho to the raw logit:
+   positive logits become z/rho; zero and negative logits become z*rho.
+2. Subtract `presence_penalty` once for each ID seen in the committed reply.
+3. Subtract `frequency_penalty` times that ID's committed reply count.
+4. Add each `logit_bias` value, then apply any JSON mask and greedy selection.
+
+Presence and frequency accept [-2,2], repetition accepts [0.1,10], and bias accepts
+at most 1024 canonical decimal vocabulary token-ID string keys with values in [-100,100]. Reply counts
+include reasoning and forced controls and advance only when the selected token
+commits. Transform arithmetic is applied to the target float row. Responses label
+sampling `greedy-logit-transform-v1`, set `unconstrained_greedy_equal:false` and report `strix.transform` with `presence`,
+`frequency`, `repetition` and `bias_entries`. This identity does not claim exact
+untransformed greedy output. Neutral values (0, 0, 1, empty bias) without a scoring
+request retain the ordinary route. JSON constraints compose as transform, mask,
+greedy; scoring uses the resulting eligible row.
+
+CPU tests cover these contracts. Native GPU qualification still needs complete IDs,
+first-token route coverage, logits/state digests, mixed-slot isolation and workload
+cost measurements for the executing model/profile; a compile check is not that gate.
 
 ### Constrained JSON output
 
@@ -430,7 +528,7 @@ encode|plain|decode FILE` exposes the tokenizer on the command line.
 - The window controller switches (`STRIX_MTP_CONTROLLER=survival`, `STRIX_MTP_ACTIVE_ROWS=1`,
   `STRIX_MTP_DRAFT_VOCAB=2`, the window folds) apply to served requests as on the command line. The draft
   vocabulary is chosen per request from that request's prompt.
-- `n` > 1, logprobs, images and audio are not supported.
+- `n` > 1, images and audio are not supported. Logprobs use the serial host route described above.
 - Plain HTTP/1.1 (keep-alive, chunked responses); put a TLS proxy in front for remote access.
 
 ## Independent-session file route (`--serve-prefix-u32le`)

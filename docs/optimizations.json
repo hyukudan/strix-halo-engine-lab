@@ -1445,6 +1445,39 @@
     "doc_anchor": "docs/optimizations.md#qwen-serve-constraints"
   },
   {
+    "engine": "qwen",
+    "name": "SSE prefill progress",
+    "flag_or_env": "--http-sse-progress-interval",
+    "default": "1 second",
+    "exact": "Comments outside the data events; full token IDs and data events identical with progress on and off (GPU gate).",
+    "gain": "Usability: visible prefill progress on long prompts; no speed claim",
+    "preconditions": "Streamed request on an engine that reports progress (Qwen).",
+    "off_switch": "--http-sse-progress-interval 0 (per request: strix.progress false)",
+    "doc_anchor": "docs/optimizations.md#qwen-serve-progress"
+  },
+  {
+    "engine": "qwen",
+    "name": "Thinking budget policy",
+    "flag_or_env": "--http-thinking-budget; --http-anthropic-thinking-budget",
+    "default": "available (request opt-in); Messages budget_tokens noted, not enforced",
+    "exact": "Token-changing by design (declared policy, closure natural|forced). A budget that is never reached yields the same token IDs as ordinary speculative greedy decoding (GPU gate).",
+    "gain": "Usability: bounded reasoning with answer room; no speed claim (serial host route)",
+    "preconditions": "--http-serve; strix.thinking_policy or Messages budget_tokens with enforce; thinking on, greedy, no stop strings, no tools.",
+    "off_switch": "--http-thinking-budget off; --http-anthropic-thinking-budget note",
+    "doc_anchor": "docs/optimizations.md#qwen-serve-thinking-budget"
+  },
+  {
+    "engine": "qwen",
+    "name": "Logprobs and logit transforms",
+    "flag_or_env": "--http-logprobs; --http-logit-transforms",
+    "default": "available (request opt-in)",
+    "exact": "Logprobs never change selected tokens (IDs equal ordinary speculative greedy decoding, GPU gate); transforms change tokens by design and are labelled greedy-logit-transform-v1.",
+    "gain": "Usability: token scores and penalties/bias for greedy requests; no speed claim (serial host route)",
+    "preconditions": "--http-serve; greedy requests with logprobs/top_logprobs or non-neutral penalties/logit_bias.",
+    "off_switch": "--http-logprobs off; --http-logit-transforms off",
+    "doc_anchor": "docs/optimizations.md#qwen-serve-logprobs"
+  },
+  {
     "engine": "deepseek",
     "name": "Bounded serving observation",
     "flag_or_env": "STRIX_SERVE_OBSERVE_EXPIRY_S",

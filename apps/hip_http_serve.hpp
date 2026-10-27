@@ -51,8 +51,8 @@ private:
 class MtpBridgeEngine final : public serve::GenerationEngine {
 public:
     MtpBridgeEngine(const MtpServeRunner& run, std::uint64_t context_tokens,
-        HttpConstraintRequests& constraints, bool enabled)
-        : run_(run), context_(context_tokens), constraints_(constraints), constraints_enabled_(enabled) {}
+        HttpConstraintRequests& constraints, bool enabled, bool thinking_enabled)
+        : run_(run), context_(context_tokens), constraints_(constraints), constraints_enabled_(enabled), thinking_enabled_(thinking_enabled) {}
     serve::GenerationStats generate(serve::GenerationJob& job) override {
         if (failed_.load()) throw std::runtime_error("the engine failed during an earlier request; restart the server");
         if (job.prompt.empty() || job.prompt.size() >= context_) throw std::invalid_argument("prompt is empty or fills the context");
@@ -91,7 +91,7 @@ public:
         stats.decode_ms = result.decode_ms;
         stats.constraint = result.constraint;
         stats.finish = result.finish;
-        stats.sampling = "greedy";
+        stats.sampling = job.constraint && job.constraint->transform.active() ? "greedy-logit-transform-v1" : "greedy";
         if (!result.final_state_digest.empty()) {
             stats.engine_extra.push_back({"final_state_digest", "\"" + result.final_state_digest + "\""});
             stats.engine_extra.push_back({"final_state_position", std::to_string(result.final_state_position)});
@@ -104,6 +104,7 @@ public:
         return stats;
     }
     [[nodiscard]] std::uint64_t context_tokens() const override { return context_; }
+    [[nodiscard]] bool supports_thinking_budget() const override {return thinking_enabled_;}
     [[nodiscard]] bool supports_constraints() const override {return constraints_enabled_;}
     [[nodiscard]] std::vector<std::string> constraint_execution_routes() const override {return constraints_enabled_?std::vector<std::string>{"serial-host"}:std::vector<std::string>{};}
     [[nodiscard]] bool failed() const noexcept { return failed_.load(); }
@@ -112,6 +113,7 @@ private:
     std::uint64_t context_;
     HttpConstraintRequests& constraints_;
     bool constraints_enabled_;
+    bool thinking_enabled_;
     std::atomic<bool> failed_{false};
 };
 
@@ -161,7 +163,11 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         std::sort(config.stop_tokens.begin(), config.stop_tokens.end());
         config.stop_tokens.erase(std::unique(config.stop_tokens.begin(), config.stop_tokens.end()), config.stop_tokens.end());
         HttpConstraintRequests constraints(tokenizer);
+        config.engine_logprobs = options.http_logprobs;
+        config.engine_logit_transforms = options.http_logit_transforms;
         config.engine_constraints = options.http_constraints && constraints.available(config.stop_tokens);
+        config.engine_thinking_budget = options.http_thinking_budget && constraints.available(config.stop_tokens);
+        config.enforce_anthropic_thinking_budget = options.http_anthropic_thinking_budget_enforce;
         if(config.engine_constraints) config.constraint_execution_routes={"serial-host"};
         if (rtx_import)
             config.engine_routes = [rtx_import](const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
@@ -170,7 +176,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
 
         if (serve::serve_health_record_enabled())
             config.health_record = http_health_record(options, 1, startup, assets);
-        MtpBridgeEngine engine(run, options.context_tokens, constraints, config.engine_constraints);
+        MtpBridgeEngine engine(run, options.context_tokens, constraints, config.engine_constraints, config.engine_thinking_budget);
         serve::GenerationQueue queue(options.http_max_queue);
         serve::ApiService api(config, tokenizer, queue, options.context_tokens, false);
         serve::HttpServerConfig http;
@@ -241,7 +247,11 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         std::sort(config.stop_tokens.begin(), config.stop_tokens.end());
         config.stop_tokens.erase(std::unique(config.stop_tokens.begin(), config.stop_tokens.end()), config.stop_tokens.end());
         HttpConstraintRequests constraints(tokenizer);
+        config.engine_logprobs = options.http_logprobs;
+        config.engine_logit_transforms = options.http_logit_transforms;
         config.engine_constraints = runner.supports_constraints() && constraints.available(config.stop_tokens);
+        config.engine_thinking_budget = runner.supports_thinking_budget() && constraints.available(config.stop_tokens);
+        config.enforce_anthropic_thinking_budget = options.http_anthropic_thinking_budget_enforce;
         if(config.engine_constraints) config.constraint_execution_routes=runner.constraint_execution_routes();
         const bool samples = options.http_sampling == "sample";
         if (serve::serve_health_record_enabled())
@@ -301,7 +311,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
             request.draft_depth_max = job.draft_depth_max;
             request.tool_draft = job.tool_draft;
             request.ngram_peers = job.ngram_peers;
-            std::string sampling = "greedy";
+            std::string sampling = job.constraint && job.constraint->transform.active() ? "greedy-logit-transform-v1" : "greedy";
             if (samples && job.sampling.temperature > 0.0) {
                 TokenSamplingPolicy policy;
                 policy.temperature = static_cast<float>(job.sampling.temperature);

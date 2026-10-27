@@ -157,7 +157,7 @@ std::string render_chat_template(const ChatTemplateInput& input) {
             const auto* reasoning_value = message.find("reasoning_content");
             const auto reasoning = strip(is_string(reasoning_value) ? reasoning_value->as_string() : std::string{});
             if (!input.preserve_thinking || *input.preserve_thinking || i > last_query)
-                out += "<|im_start|>assistant\n<think>\n" + reasoning + "\n</think>\n\n" + content;
+                out += "<|im_start|>assistant\n<think>\n" + reasoning + "\n</think>" + std::string(thinking_answer_separator) + content;
             else out += "<|im_start|>assistant\n" + content;
             const auto* calls = message.find("tool_calls");
             if (calls && calls->is_array()) {
@@ -191,7 +191,7 @@ std::string render_chat_template(const ChatTemplateInput& input) {
     }
     if (input.add_generation_prompt) {
         out += "<|im_start|>assistant\n";
-        out += input.enable_thinking && !*input.enable_thinking ? "<think>\n\n</think>\n\n" : "<think>\n";
+        out += input.enable_thinking && !*input.enable_thinking ? "<think>\n\n</think>" + std::string(thinking_answer_separator) : "<think>\n";
     }
     return out;
 }

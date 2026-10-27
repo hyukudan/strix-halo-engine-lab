@@ -14,6 +14,9 @@ public:
     using std::invalid_argument::invalid_argument;
 };
 
+// Bytes following the end-thinking control in this template.
+inline constexpr const char* thinking_answer_separator = "\n\n";
+
 // Inputs of the model's chat template (the GGUF's Qwen3.8 template, rendered natively).
 struct ChatTemplateInput {
     Json messages;                     // [{role, content, reasoning_content?, tool_calls?}, ...]
