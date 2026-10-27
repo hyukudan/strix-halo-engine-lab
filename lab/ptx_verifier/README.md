@@ -1,192 +1,258 @@
 # Experimental PTX verification pilot
 
-**Status: development experiment; native execution and model qualification pending.**
+**Status: synthetic integration passed; verification of complete engine modules
+is blocked. Native, model and bitwise qualification remain pending.**
 
-This lab gives selected CUDA kernels a fixed, reviewable verification contract and
-invokes an explicitly supplied local verifier. Its purpose is to collect additional
-evidence about a candidate before native correctness and performance evaluation.
-The lab is independent of engine startup, serving, production defaults and the
-normal build. It does not download dependencies or ask a model to generate code.
+This lab gives selected CUDA kernels a fixed, reviewable verification contract,
+captures complete translation units with a local compiler and invokes an
+explicitly supplied local verifier. Its purpose is to collect additional evidence
+before native correctness and performance evaluation. It is independent of engine
+startup, serving, production defaults and the normal build. Its scripts do not
+download dependencies, ask a model to generate code or launch a CUDA kernel.
 
 The initial scope is one CTA, fixed dimensions, disjoint allocations and scalar
-parameters fixed by the selected case. The kernel entry point, argument order,
-array layout and output specification are part of the case. A result applies only
-to that PTX and that contract.
+parameters fixed by the selected case. The entry point, argument order, array
+layout and output specification are part of the contract. Results apply only to
+the submitted PTX and case.
+
+## Recorded pilot status
+
+The following results were recorded on 2026-10-27 with the pinned tool revision.
+
+| Evidence | Result | Scope |
+| --- | --- | --- |
+| CPU unit tests | 47 passed | Adapter, capture, integration and compatibility admission behavior, using controlled fixtures. |
+| Real verifier on synthetic PTX | 7/7 checks passed | Three positive cases, three numerical mutations and one missing-output mutation. |
+| Module-compatibility probes | Baseline accepted; two limitations reproduced | Independent minimal modules reproduce the two complete-module blockers. |
+| Complete engine translation units | 2 `CAPTURED` | Unchanged sources compiled to complete PTX modules with recorded provenance. |
+| Engine cases using those modules | 3 `ERROR`; none accepted | Both carry cases and HC expansion were blocked before a final verifier verdict. |
+
+The synthetic checks establish that the actual pinned executable can accept the
+small fixtures and detect their intended defects. They do not establish that
+compiler-emitted engine PTX is supported or correct. `CAPTURED` records successful
+compilation and source checks; it is not a verification verdict. No native,
+model-level, bitwise-correctness or performance claim follows from these results.
 
 ## Optional verifier and provenance
 
 The protocol is pinned to
 [`francois141/ptx_verifier@0c7e372f27e5599ee3ad28215f487115b1883585`](https://github.com/francois141/ptx_verifier/tree/0c7e372f27e5599ee3ad28215f487115b1883585).
-The upstream project is MIT licensed; its copyright and license remain with its
-separately built executable. No upstream implementation is vendored here. The
-[source ledger](../../docs/reference/sources-ledger.md#optional-development-tools)
-records this optional development dependency.
+This optional development tool is MIT licensed. No upstream implementation is
+vendored here; preserve its copyright and license with the separately built tool.
+The [source ledger](../../docs/reference/sources-ledger.md#optional-development-tools)
+records its provenance.
 
-Build the chosen revision separately using its own build instructions and supply
-its local executable explicitly. The verifier performs symbolic analysis on the
-CPU. Compiling production CUDA to PTX and checking its numerical behavior on the
-target device are separate operations.
+With the upstream Rust and native build prerequisites installed, build that
+revision in a separate checkout and record the resulting executable hash:
 
-A source revision identifies the intended protocol. Record the actual executable
-hash as well: a source revision alone does not identify a compiler, build flags,
-local modifications or the resulting binary.
+```sh
+git clone https://github.com/francois141/ptx_verifier.git ../ptx-verifier
+git -C ../ptx-verifier checkout --detach 0c7e372f27e5599ee3ad28215f487115b1883585
+cargo build --manifest-path ../ptx-verifier/Cargo.toml \
+  --locked --release -p volta_cli --bin volta
+sha256sum ../ptx-verifier/target/release/volta
+```
 
-## Use
+The verifier performs symbolic analysis on the CPU. Its source pin identifies the
+intended protocol, while its executable hash identifies the supplied artifact.
+Neither `--locked` nor a binary hash attests that a binary was reproducibly built
+from unchanged source. Retain compiler, flags and build provenance separately.
 
-Run commands from the repository root. Python 3.9 or newer and the standard library are
-sufficient for inspection and adapter tests:
+## Inspect and run synthetic integration
+
+Run commands from the repository root. Python 3.9 or newer and the standard
+library are sufficient for inspection and the CPU unit tests:
 
 ```sh
 python3 lab/ptx_verifier/runner.py list
 python3 -m unittest discover -s lab/ptx_verifier/tests -v
 ```
 
-`plan` reads a caller-supplied PTX file and prints the intended invocation and
-input identities without starting the verifier:
-
-```sh
-python3 lab/ptx_verifier/runner.py plan \
-  --case carry_even_row0 \
-  --ptx build/carry.ptx
-```
-
-Use `--kernel ACTUAL_PTX_ENTRY_SYMBOL` when the compiled entry has a different
-name, such as a mangled CUDA symbol. The supplied module must retain the selected
-kernel's actual body and interface. This pilot does not extract or generate PTX.
-Source, compiler, flags and target provenance remain separate evidence until a
-production build capture is completed.
-
-To run a check, first obtain and review the SHA-256 of the separately built
-verifier executable. Supply that exact hash:
+Supply the reviewed executable hash to run all seven checks against the real
+local verifier. The output directory must be new and its parent must exist outside
+the checkout:
 
 ```sh
 mkdir -p ../private-ptx-runs
 PTX_VERIFIER_SHA256='replace-with-the-reviewed-64-hex-digit-hash'
+python3 lab/ptx_verifier/integration.py \
+  --verifier ../ptx-verifier/target/release/volta \
+  --verifier-sha256 "$PTX_VERIFIER_SHA256" \
+  --output-dir ../private-ptx-runs/synthetic-01 \
+  --timeout-seconds 60
+```
+
+The project-owned [fixtures](fixtures/) are handwritten synthetic PTX. The three
+positive checks require aggregate `ACCEPT` with complete coverage. Wrong valid
+flag, stash-row offset and HC coefficient mutations require numerical refutations
+with aggregate `REJECT`. The missing-store mutation requires a `REJECT` explicitly
+identifying the unwritten `valid[0]`. An unrelated error, timeout or incomplete
+acceptance cannot satisfy a negative check. `summary.json` separates fixture
+results from every engine qualification flag.
+
+The separate module-compatibility diagnostic uses the same executable and hash:
+
+```sh
+python3 lab/ptx_verifier/compatibility.py \
+  --verifier ../ptx-verifier/target/release/volta \
+  --verifier-sha256 "$PTX_VERIFIER_SHA256" \
+  --output-dir ../private-ptx-runs/compatibility-01
+```
+
+It requires acceptance of a minimal baseline before testing an unselected entry
+containing `match.any.sync.b32` and an unreferenced external shared-memory
+declaration. Its diagnostic result is `LIMITATIONS_REPRODUCED`, not a qualification
+or a successful engine verification.
+
+## Capture complete engine PTX
+
+[capture.py](capture.py) supplies a Linux/GCC standalone compilation profile for
+`carry_restore_kernel` and `hc_expand_kernel`. Use a complete local CUDA toolkit
+with nvcc, CUDA runtime headers and CCCL/CUB. The recorded captures used CUDA
+12.8.1's nvcc 12.8.93 and GCC 13.3.0, producing PTX 8.7 for `sm_120`.
+
+The source root must be a Git checkout containing the catalog's immutable source
+revision. The translation unit, CMake file and every compiler-reported project
+header must match that revision byte for byte. Obtain and review the nvcc hash
+before supplying it:
+
+```sh
+NVCC_SHA256='replace-with-the-reviewed-64-hex-digit-hash'
+python3 lab/ptx_verifier/capture.py \
+  --source-root . \
+  --kernel carry_restore_kernel \
+  --nvcc ../cuda-toolkit/bin/nvcc \
+  --nvcc-sha256 "$NVCC_SHA256" \
+  --host-cxx /usr/bin/g++ \
+  --output-dir ../private-ptx-runs/carry-capture-01 \
+  --timeout-seconds 120
+```
+
+Use `--kernel hc_expand_kernel` and a different new output directory for HC.
+Capture directories must be outside Git worktrees, with an existing parent.
+The script compiles the complete `.cu` and preserves the full emitted module; it
+does not extract, rewrite or remove kernel bodies or module declarations.
+
+The fixed profile uses C++20, `compute_120`, 64-bit addressing, `-O3 -DNDEBUG`,
+`--fmad=false -prec-div=true -prec-sqrt=true -ftz=false` and
+`-Xcompiler=-ffp-contract=off,-Wall,-Wextra`, with the project `include` directory.
+The numeric flags follow the existing CUDA target declarations in
+[CMakeLists.txt](../../CMakeLists.txt). The optimization profile is explicit and
+standalone; it does not claim to reproduce a particular production build.
+
+`capture.json` records the command, controlled environment, compiler versions,
+source revision, input and toolchain hashes, full PTX hash and unique entry symbol.
+The pre-compilation dependency set must match the dependency set reported during
+compilation, and input hashes must remain unchanged. Injected compiler flags and
+include-path environment variables are rejected. A successful capture sets
+`source_files_match_declared_revision=true`, while retaining
+`production_build_equivalence="not_attested"` and qualification flags `false`.
+Toolchain hashes cover recorded files; they are not a complete build-environment
+attestation. Failures after capture starts retain their logs and error receipt.
+
+## Check a captured module
+
+Copy the exact `ptx.symbol` from the capture receipt. C++ entry names are mangled;
+the catalog's descriptive kernel name alone is insufficient for these modules.
+`plan` reads the supplied file and prints the invocation and input identities
+without starting the verifier:
+
+```sh
+PTX_ENTRY='replace-with-the-exact-symbol-from-capture.json'
+python3 lab/ptx_verifier/runner.py plan \
+  --case carry_even_row0 \
+  --ptx ../private-ptx-runs/carry-capture-01/module.ptx \
+  --kernel "$PTX_ENTRY"
 python3 lab/ptx_verifier/runner.py run \
   --case carry_even_row0 \
-  --ptx build/carry.ptx \
-  --verifier ../verifier-build/target/release/volta \
+  --ptx ../private-ptx-runs/carry-capture-01/module.ptx \
+  --kernel "$PTX_ENTRY" \
+  --verifier ../ptx-verifier/target/release/volta \
   --verifier-sha256 "$PTX_VERIFIER_SHA256" \
   --output ../private-ptx-runs/carry-even-row0.json \
   --timeout-seconds 60
 ```
 
-The supplied hash binds the run to an executable artifact; it is not a
-reproducible-build attestation that the binary came from the pinned source. Keep
-that build provenance separately. The runner does not install the optional tool
-or launch a CUDA kernel.
+The receipt directory must already exist and the output filename must be new.
+Input-validation errors before execution emit JSON on stdout and exit 3 without
+a receipt. Completed receipts include stdout and stderr, bounded to 1 MiB each;
+a timeout or truncated log cannot produce acceptance. Exit codes are 0 for
+`ACCEPT`, 1 for `REJECT`, 2 for `UNKNOWN`, and 3 for an adapter error or timeout.
+Retain the capture and verifier receipts together, matching their PTX hashes.
 
-The receipt directory must already exist and the output filename must be new;
-existing files are never overwritten. Input-validation failures before execution
-emit an error record on stdout and exit with code 3, without writing a receipt.
-Completed run receipts include stdout and stderr, bounded to 1 MiB each; a timeout
-or truncated log cannot produce acceptance. Run exit codes are 0 for `ACCEPT`, 1
-for `REJECT`, 2 for `UNKNOWN` and 3 for an adapter error or timeout.
+### Observed complete-module blockers
+
+Both carry cases encountered a parser error on `match.any.sync.b32` in another
+entry of the attention module. The selected carry entry was not the source of
+that instruction. HC encountered the dynamic-shared-memory configuration guard
+because its complete module declares external shared memory, although the
+selected HC entry does not reference it. The case requests zero dynamic shared
+memory. These failures preceded a final verdict and output-coverage record; all
+three runner results correctly remained `ERROR` and unaccepted.
+
+The attention module also declares external shared memory. Resolving its parser
+error might therefore expose the same configuration issue; this is a follow-up
+inference, not an additional observed result. Keep the captured modules intact
+while investigating compatibility. Removing unrelated entries or declarations
+would change the input whose provenance was recorded.
 
 ## Initial project-owned contracts
 
-The case catalog is [cases.json](cases.json); its output equations are in
-[specs](specs/). These contracts describe the engine's own computations.
+The catalog is [cases.json](cases.json), with output equations in [specs](specs/).
+The two candidate kernels are [carry restore](../../src/cuda/ds41_attention.cu)
+and [HC expansion](../../src/cuda/ds41_core_norm.cu).
 
-| Candidate | Engine source | Initial scope | What this exercise can establish |
-| --- | --- | --- | --- |
-| Carry restore | [`carry_restore_kernel`](../../src/cuda/ds41_attention.cu) | Fixed even position and stash row zero or one; one CTA | The selected state copy and valid flag, including the nonzero stash offset. |
-| HC expansion | [`hc_expand_kernel`](../../src/cuda/ds41_core_norm.cu) | One small row, fixed hidden width and stride, no optional carry output; one CTA | Output indexing and the declared four-stream algebraic expression. |
-
-| Case ID | Fixed shape | Expected output elements |
+| Case ID | Fixed scope | Expected output elements |
 | --- | --- | ---: |
-| `carry_even_row0` | Position zero, stash row zero, 256 threads | 1,025: 1,024 state values and one valid flag |
-| `carry_even_row1` | Position zero, stash row one, 256 threads | 1,025: 1,024 state values and one valid flag |
-| `hc_expand_rows1_h32` | One row, hidden width and stride 32 | 128: four output streams of 32 values |
+| `carry_even_row0` | Even position zero, stash row zero, one CTA of 256 threads | 1,025: 1,024 state values and one valid flag |
+| `carry_even_row1` | Even position zero, stash row one, one CTA of 256 threads | 1,025: same outputs, with a nonzero stash offset |
+| `hc_expand_rows1_h32` | One row, hidden width and stride 32, one CTA, no optional carry output | 128: four streams of 32 values |
 
-The odd-position carry branch is excluded from this catalog: proving preservation
-of unwritten state needs an unchanged-memory contract beyond the current output
-footprint check.
+Odd-position carry is excluded: proving preservation of unwritten state needs
+an unchanged-memory contract beyond the current written-output footprint.
+The HC case exercises indexing and the declared four-stream expression. Each
+additional shape, optional output and launch configuration needs its own case.
+HC also requires native checks of operation order and compiler contraction policy
+against the engine's numeric identity.
 
-The small HC shape exercises the contract; it does not qualify the production
-shape or a multi-CTA launch. Each additional shape, optional output and launch
-configuration requires its own case and native checks.
+## Interpretation and architecture limits
 
-The carry contract is useful for bringing up the adapter without floating-point
-arithmetic. The HC contract introduces symbolic floating-point data and several
-outputs per thread. HC acceptance still requires the native operation order and
-compiler contraction policy to be checked against the engine's numeric identity.
-
-## Interpretation of a result
-
-Keep process completion, expression equivalence, coverage and graph checks
-separate. An intermediate equivalence message is not a final acceptance result.
-A partial comparison, unknown result, unsupported instruction, timeout, missing
-output or contradictory process status must remain unaccepted.
-
-The runner forces `--sample 0`. Acceptance requires the final `ACCEPT` verdict,
-exit code zero and nonzero complete output coverage matching the selected case.
+An intermediate equivalence message is not final acceptance. The runner forces
+`--sample 0` and requires final `ACCEPT`, exit zero and complete nonzero output
+coverage matching the case. Partial coverage, unknown results, unsupported
+instructions, missing outputs and contradictory process status remain unaccepted.
 Receipts always retain `native_qualified=false`, `model_qualified=false` and
-`bitwise_verified=false`; a symbolic acceptance cannot promote those fields.
-The requested `--verify-numeric` check evaluates the symbolic expressions using
-the tool's numerical oracle; it is not an execution of the CUDA kernel.
+`bitwise_verified=false`. `--verify-numeric` evaluates symbolic expressions using
+the tool's numerical oracle; it does not execute the CUDA kernel.
 
-An accepted result means only that the selected tool accepted the submitted case
-under its model. The optional tool is experimental and does not provide a general
-soundness guarantee. It represents floating-point arithmetic over reals, which
-does not establish IEEE rounding, fused-operation behavior, subnormal handling or
-bitwise identity on the GPU.
+Acceptance means that the optional experimental tool accepted that case under
+its model; it provides no general soundness guarantee. Its real-valued treatment
+of floating-point expressions does not establish IEEE rounding, fused-operation
+behavior, subnormal handling or bitwise identity on a GPU. The existing
+[CUDA core tests](../../tests/cuda/ds41_core_tests.cu), state/model gates and
+complete-workload measurements remain independent requirements.
 
-The following evidence remains independent:
+The input is NVIDIA PTX. This lab does not analyze HIP, AMDGPU ISA, wave32/LDS or
+gfx1151 WMMA; a CUDA translation would not validate an AMD binary. `sm_120` also
+does not establish support for the datacenter `tcgen05`/TMEM path. Consult the
+[CUDA architecture table](https://developer.nvidia.com/cuda/gpus) and
+[NVIDIA instruction support guidance](https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/nvgpu/tcgen05/mma.py).
 
-| Evidence | Required interpretation |
-| --- | --- |
-| Adapter tests | The runner interprets representative outcomes conservatively and constructs the intended invocation. |
-| Symbolic result | The specified case was accepted, rejected or left unresolved under the recorded tool model. |
-| Native operator tests | The compiled kernel satisfies its own reference and declared numerical policy on the target device. |
-| State and model gates | The change preserves the required state, logits and token behavior for the selected engine identity. |
-| Complete-workload measurement | The accepted change improves the relevant workload with the same model, profile and resource conditions. |
-
-The existing [CUDA core tests](../../tests/cuda/ds41_core_tests.cu) and engine
-qualification gates continue to apply. Host-only adapter tests must never be
-reported as native verification or a model-level pass.
-
-## Architecture and analysis limits
-
-The input is NVIDIA PTX. This lab does not analyze HIP, AMDGPU ISA, wave32/LDS
-behavior or gfx1151 WMMA instructions. An AMD backend would need its own execution
-and arithmetic model; a CUDA translation would not validate the AMD binary.
-
-An architecture label in a PTX module also does not establish hardware support.
-In particular, the RTX PRO 6000 Blackwell target is `sm_120`; the datacenter
-`tcgen05`/TMEM path is a different target capability. Consult the
-[official CUDA architecture table](https://developer.nvidia.com/cuda/gpus) and
-[NVIDIA's instruction support guidance](https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/nvgpu/tcgen05/mma.py)
-when selecting instructions.
-
-Keep data-dependent addresses and branches, cross-CTA communication and host-side
-ordering outside the initial cases. The full CUDA Q8/MoE paths require a separate
-instruction and memory-access inventory. For example, support for an integer MMA
-does not establish support for programmatic launch dependencies in the same
-kernel. Removing synchronization to make a different PTX module analyzable does
-not validate the original module.
-
-Single-kernel analysis does not cover stream/event lifetimes, DMA completion,
-inter-device state transfer, USB4 transport or session continuation.
+Data-dependent addresses and branches, cross-CTA communication and host ordering
+are outside the initial cases. The full Q8/MoE paths need their own instruction
+and access inventory. Integer MMA support alone does not establish support for
+programmatic launch dependencies. Single-kernel analysis also does not cover
+stream/event lifetimes, DMA completion, inter-device state transfer, USB4 or
+session continuation.
 
 ## Qualification work to follow
 
-The checked-in adapter tests use controlled process results. The optional
-verifier and production kernels have not been executed as part of this pilot's
-initial implementation.
+Resolve the complete-module compatibility blockers while preserving source and
+capture provenance, then rerun the real engine cases and meaningful negative
+controls. Any candidate for adoption still needs native operator tests and the
+engine's state/model gates. Measure performance on the target device with the
+same model, profile and resources only after correctness requirements pass.
 
-1. Run each initial contract against the pinned local verifier, retaining the
-   executable, PTX, spec and case hashes with its complete outcome.
-2. Add deliberate index/output mutations of a local PTX candidate and establish
-   that the actual verifier rejects them under the selected contract.
-3. Capture PTX from the unchanged engine source with recorded compiler and target
-   flags, and bind each analyzed module to that source/build identity.
-4. Run the existing native operator and engine-specific state/model gates for any
-   candidate intended for adoption.
-5. Measure accepted candidates on the target device with an interleaved reference
-   and candidate comparison. Select further kernels from measured workload cost.
-
-Write run artifacts and raw verifier output outside the checkout. Public changes
-contain the contracts, implementation and test code; local receipts and external
-inspection material remain private. No speed or native-correctness claim follows
-from adding this lab.
+Keep generated PTX, build artifacts, raw output and local receipts outside Git.
+Public changes contain project-owned contracts, scripts, fixtures and tests;
+private run and external inspection material stays outside the checkout.

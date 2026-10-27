@@ -1,0 +1,21 @@
+// Independent handwritten module-selection probe, not engine compiler output.
+// The selected entry is identical to compatibility_baseline.ptx.
+.version 8.0
+.target sm_80
+.address_size 64
+
+.visible .entry pilot_selected_entry(.param .u64 output)
+{
+    .reg .b64 %ptr;
+    ld.param.u64 %ptr, [output];
+    st.global.u32 [%ptr], 1;
+    ret;
+}
+
+.visible .entry pilot_unselected_match()
+{
+    .reg .b32 %mask, %value;
+    mov.u32 %value, 0;
+    match.any.sync.b32 %mask, %value, -1;
+    ret;
+}

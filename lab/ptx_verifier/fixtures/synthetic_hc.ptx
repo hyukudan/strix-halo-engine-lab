@@ -1,0 +1,80 @@
+// Handwritten synthetic smoke fixture for the optional verifier adapter.
+// This file is NOT compiler output from an engine kernel. It establishes no
+// compiler, native-device, model, performance, or bitwise qualification.
+// Scope: one CTA, rows=1, hidden=32, sub_stride=32, null pre_carry.
+// mul/add f32 is checked under the verifier's real-arithmetic abstraction.
+.version 8.0
+.target sm_80
+.address_size 64
+
+.visible .entry pilot_hc_fixture(
+    .param .u64 sub,
+    .param .u32 sub_stride,
+    .param .u64 residual,
+    .param .u64 mixes,
+    .param .u32 rows,
+    .param .u32 hidden,
+    .param .u64 out,
+    .param .u64 pre_carry
+)
+{
+    .reg .pred %inactive, %again;
+    .reg .b32 %i, %h, %k;
+    .reg .b64 %sub_ptr, %res_ptr, %mix_ptr, %out_ptr;
+    .reg .b64 %offset, %stream_bytes, %address;
+    .reg .b64 %coefficient_ptr, %post_ptr, %result_ptr;
+    .reg .f32 %sv, %r0, %r1, %r2, %r3, %weight, %product, %sum, %result;
+
+    ld.param.u64 %sub_ptr, [sub];
+    ld.param.u64 %res_ptr, [residual];
+    ld.param.u64 %mix_ptr, [mixes];
+    ld.param.u64 %out_ptr, [out];
+    ld.param.u32 %h, [hidden];
+    mov.u32 %i, %tid.x;
+    setp.ge.u32 %inactive, %i, %h;
+    @%inactive bra DONE;
+
+    mul.wide.u32 %offset, %i, 4;
+    mul.wide.u32 %stream_bytes, %h, 4;
+    add.u64 %address, %sub_ptr, %offset;
+    ld.global.f32 %sv, [%address];
+    add.u64 %address, %res_ptr, %offset;
+    ld.global.f32 %r0, [%address];
+    add.u64 %address, %address, %stream_bytes;
+    ld.global.f32 %r1, [%address];
+    add.u64 %address, %address, %stream_bytes;
+    ld.global.f32 %r2, [%address];
+    add.u64 %address, %address, %stream_bytes;
+    ld.global.f32 %r3, [%address];
+
+    add.u64 %coefficient_ptr, %mix_ptr, 32;
+    add.u64 %post_ptr, %mix_ptr, 16;
+    add.u64 %result_ptr, %out_ptr, %offset;
+    mov.u32 %k, 0;
+STREAM:
+    mov.f32 %sum, 0f00000000;
+    ld.global.f32 %weight, [%coefficient_ptr];
+    mul.rn.f32 %product, %weight, %r0;
+    add.rn.f32 %sum, %sum, %product;
+    ld.global.f32 %weight, [%coefficient_ptr+16];
+    mul.rn.f32 %product, %weight, %r1;
+    add.rn.f32 %sum, %sum, %product;
+    ld.global.f32 %weight, [%coefficient_ptr+32];
+    mul.rn.f32 %product, %weight, %r2;
+    add.rn.f32 %sum, %sum, %product;
+    ld.global.f32 %weight, [%coefficient_ptr+48];
+    mul.rn.f32 %product, %weight, %r3;
+    add.rn.f32 %sum, %sum, %product;
+    ld.global.f32 %weight, [%post_ptr];
+    mul.rn.f32 %product, %weight, %sv;
+    add.rn.f32 %result, %product, %sum;
+    st.global.f32 [%result_ptr], %result;
+    add.u64 %coefficient_ptr, %coefficient_ptr, 4;
+    add.u64 %post_ptr, %post_ptr, 4;
+    add.u64 %result_ptr, %result_ptr, %stream_bytes;
+    add.u32 %k, %k, 1;
+    setp.lt.u32 %again, %k, 4;
+    @%again bra STREAM;
+DONE:
+    ret;
+}

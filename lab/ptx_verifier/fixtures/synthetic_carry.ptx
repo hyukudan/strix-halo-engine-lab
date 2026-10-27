@@ -1,0 +1,55 @@
+// Handwritten synthetic smoke fixture for the optional verifier adapter.
+// This file is NOT compiler output from an engine kernel. It establishes no
+// compiler, native-device, model, performance, or bitwise qualification.
+// Its two intended contracts fix p=0, row=0 or row=1, and one CTA of 256 threads.
+.version 8.0
+.target sm_80
+.address_size 64
+
+.visible .entry pilot_carry_fixture(
+    .param .u64 stash,
+    .param .u64 state,
+    .param .u64 valid,
+    .param .u64 pending_index,
+    .param .u32 stash_row
+)
+{
+    .reg .pred %odd, %again, %not_first;
+    .reg .b32 %tid, %threads, %i, %p, %row, %parity, %valid_value;
+    .reg .b64 %stash_ptr, %state_ptr, %valid_ptr, %position;
+    .reg .b64 %row_offset, %row_ptr, %offset, %src, %dst;
+    .reg .f32 %value;
+
+    ld.param.u64 %stash_ptr, [stash];
+    ld.param.u64 %state_ptr, [state];
+    ld.param.u64 %valid_ptr, [valid];
+    ld.param.u64 %position, [pending_index];
+    cvt.u32.u64 %p, %position;
+    ld.param.u32 %row, [stash_row];
+    mov.u32 %tid, %tid.x;
+    mov.u32 %threads, %ntid.x;
+    and.b32 %parity, %p, 1;
+    xor.b32 %valid_value, %parity, 1;
+    setp.ne.u32 %odd, %parity, 0;
+    @%odd bra WRITE_VALID;
+
+    mul.wide.u32 %row_offset, %row, 4096;
+    add.u64 %row_ptr, %stash_ptr, %row_offset;
+    mov.u32 %i, %tid;
+COPY:
+    mul.wide.u32 %offset, %i, 4;
+    add.u64 %src, %row_ptr, %offset;
+    add.u64 %dst, %state_ptr, %offset;
+    ld.global.f32 %value, [%src];
+    st.global.f32 [%dst], %value;
+    add.u32 %i, %i, %threads;
+    setp.lt.u32 %again, %i, 1024;
+    @%again bra COPY;
+
+WRITE_VALID:
+    setp.ne.u32 %not_first, %tid, 0;
+    @%not_first bra DONE;
+    st.global.u32 [%valid_ptr], %valid_value;
+DONE:
+    ret;
+}
