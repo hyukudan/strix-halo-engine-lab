@@ -57,6 +57,9 @@ missing reference data is not an exactness pass. Do not assume the planned kit i
 For A/B, change one off switch at a time, preserve model/profile/state/capacity, restart startup-cached
 readers and both ranks as needed, verify tokens/digests first, then compare medians from interleaved runs.
 Do not add individual gains from different workloads or call a changed numerical identity bit-identical.
+Qwen long-context answers are checked with `tools/qualification/longctx_fidelity/` (generator ground truth,
+CPU tests first; its README states what a pilot does and does not establish). Keep comparative-runtime
+reference results out of that public kit.
 Keep deployment endpoints, machine/account identifiers, private paths, prompts, receipts and unpublished
 benchmark/review material out of public changes. Use relative asset placeholders in commands and public
 implementation or qualification contracts for links.

@@ -526,6 +526,22 @@ SSH cleanup failure reports unverified teardown; the remote timeout still bounds
 The outer timeout includes setup/teardown plus forced-kill grace. Forced termination/network
 failure may prevent final report delivery; inspect retained evidence privately.
 
+## Long-context retrieval and reasoning checks (Qwen)
+
+`tools/qualification/longctx_fidelity/` builds deterministic prompts whose answers are computed by the
+generator itself: single-needle and multi-key retrieval, variable tracking, multi-hop chains and
+aggregation, at an exact consumed-token depth up to 262,143 with the evidence at a chosen fraction of the
+prompt. Construction uses the model tokenizer (`strix-tokenize`) and the server's non-thinking chat
+rendering; the plain CLI runs each case with a clean environment and the default resolution, and the
+scorer compares the answer (up to `<|im_end|>`) with the ground truth. Generation, planning and the tests
+run on a CPU (`python3 -m unittest discover -s tools/qualification/longctx_fidelity/tests`); only `run_cli`
+executes the model. Its README has the commands, the receipt format and the limits.
+
+A first pilot (single needle, one seed, 19 cases at 8K, 32K, 128K, 262,112 and 262,143 tokens, the last
+one answering with a single token) returned the exact value in every case, and a repeated case produced
+identical token IDs. One seed and one task family are a pilot, not a qualification: long context stays
+labelled unqualified until the full matrix, the reasoning families and continuation scoring pass.
+
 ## Known limitations
 
 - Standalone RTX Linux receipt admission is blocked regardless of CUDA prefill support.
@@ -539,7 +555,8 @@ failure may prevent final report delivery; inspect retained evidence privately.
 - README pipeline/RTX-plus-pair, CUDA offload, replicas/router, batched microbenchmarks,
   copy-window rewrites and unpublished campaigns are outside the kit. GLM defaults to r1b;
   README R1 needs explicit r1. GLM/MiniMax have no shipped expected rows.
-- Historical prompts differ; Qwen long context is explicitly unqualified. README RTX
+- Historical prompts differ; Qwen long context is explicitly unqualified (retrieval pilot only, see
+  [long-context checks](#long-context-retrieval-and-reasoning-checks-qwen)). README RTX
   load-to-load variance is about 10%. Calibration/CPU fixtures are not independent references.
 
 ## Report results
