@@ -417,9 +417,89 @@ Use scratch state and a NaN witness to guard a faster core; replay the pinned ex
 - **Measured gain:** No isolated measurement
 - **Implementation / evidence:** [Witness launcher](../src/hip_gdn_launcher.hip)
 
+<a id="qwen-qsa-score-rows"></a>
+
+### QSA scorer row batching
+
+**Engine:** `qwen`. **Control:** `STRIX_QPF2K_SCORE_ROWS`. **Default:** auto (32 rows above 4096 blocks, 16 otherwise).
+
+Stage-batch the QSA scorer over more rows, reusing the loaded keys.
+
+- **Preconditions:** Automatic decoder route (CLI), admitted tiled prefill; MTP/HTTP serving and cohorts keep it opt-in; not applied under GSQ.
+- **Automatic selection:** The decoder injects the value only when unset; explicit values win; `STRIX_QPF2K_DEFAULTS=0` or `--baseline` disables all five.
+- **Fallback notice:** `=0` disables only this item and keeps the tiled route; shapes outside the admission keep the previous kernel.
+- **Exactness evidence:** Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.
+- **Off switch:** STRIX_QPF2K_SCORE_ROWS=0 (16 rows)
+- **Measured gain:** ≈ −1.6 s at 262K together with PLE row batching (~−10 ms at 32K); combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)
+- **Implementation / evidence:** [defaults](../include/strix/qpf2k_defaults.hpp), [engine reference](getting-started/engine-reference.md)
+
+<a id="qwen-ple-batch"></a>
+
+### PLE row batching
+
+**Engine:** `qwen`. **Control:** `STRIX_PREFILL_PLE_BATCH`. **Default:** 1.
+
+Run the per-layer-embedding projection in 64-row groups; the wide lane recipe, layout and scratch admission still apply.
+
+- **Preconditions:** Automatic decoder route (CLI), admitted tiled prefill; MTP/HTTP serving and cohorts keep it opt-in; not applied under GSQ.
+- **Automatic selection:** The decoder injects the value only when unset; explicit values win; `STRIX_QPF2K_DEFAULTS=0` or `--baseline` disables all five.
+- **Fallback notice:** `=0` disables only this item and keeps the tiled route; shapes outside the admission keep the previous kernel.
+- **Exactness evidence:** Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.
+- **Off switch:** STRIX_PREFILL_PLE_BATCH=0
+- **Measured gain:** Included in the scorer figure above (−0.16 s raw kernel time at 262K); combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)
+- **Implementation / evidence:** [defaults](../include/strix/qpf2k_defaults.hpp), [engine reference](getting-started/engine-reference.md)
+
+<a id="qwen-shared-pre"></a>
+
+### Shared-expert operand preimage
+
+**Engine:** `qwen`. **Control:** `STRIX_QPF2K_SHARED_PRE`. **Default:** 1.
+
+Build the shared expert's FP16 operand once for gate/up and down; the existing tiled down admission and fallback apply.
+
+- **Preconditions:** Automatic decoder route (CLI), admitted tiled prefill; MTP/HTTP serving and cohorts keep it opt-in; not applied under GSQ.
+- **Automatic selection:** The decoder injects the value only when unset; explicit values win; `STRIX_QPF2K_DEFAULTS=0` or `--baseline` disables all five.
+- **Fallback notice:** `=0` disables only this item and keeps the tiled route; shapes outside the admission keep the previous kernel.
+- **Exactness evidence:** Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.
+- **Off switch:** STRIX_QPF2K_SHARED_PRE=0
+- **Measured gain:** ~−1 % TTFT at 32K; combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)
+- **Implementation / evidence:** [defaults](../include/strix/qpf2k_defaults.hpp), [engine reference](getting-started/engine-reference.md)
+
+<a id="qwen-moe-merge-commit"></a>
+
+### MoE ordered merge + BF16 commit
+
+**Engine:** `qwen`. **Control:** `STRIX_QPF2K_MOE_MC`. **Default:** 1 (mode 1; mode 2 needs an explicit value).
+
+Merge expert outputs in a fixed order and commit BF16 rows in the same pass, behind the existing DA16/ROUTE=14 certificate.
+
+- **Preconditions:** Automatic decoder route (CLI), admitted tiled prefill; MTP/HTTP serving and cohorts keep it opt-in; not applied under GSQ.
+- **Automatic selection:** The decoder injects the value only when unset; explicit values win; `STRIX_QPF2K_DEFAULTS=0` or `--baseline` disables all five.
+- **Fallback notice:** `=0` disables only this item and keeps the tiled route; shapes outside the admission keep the previous kernel.
+- **Exactness evidence:** Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.
+- **Off switch:** STRIX_QPF2K_MOE_MC=0
+- **Measured gain:** ~−0.10 s at 32K; combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)
+- **Implementation / evidence:** [defaults](../include/strix/qpf2k_defaults.hpp), [engine reference](getting-started/engine-reference.md)
+
+<a id="qwen-moe-header-reuse"></a>
+
+### MoE gate/up header reuse
+
+**Engine:** `qwen`. **Control:** `STRIX_QPF2K_MOE_HDR`. **Default:** 1.
+
+Reuse loaded superblock headers between gate and up within the DA16 tune 80/82 path.
+
+- **Preconditions:** Automatic decoder route (CLI), admitted tiled prefill; MTP/HTTP serving and cohorts keep it opt-in; not applied under GSQ.
+- **Automatic selection:** The decoder injects the value only when unset; explicit values win; `STRIX_QPF2K_DEFAULTS=0` or `--baseline` disables all five.
+- **Fallback notice:** `=0` disables only this item and keeps the tiled route; shapes outside the admission keep the previous kernel.
+- **Exactness evidence:** Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.
+- **Off switch:** STRIX_QPF2K_MOE_HDR=0
+- **Measured gain:** ~−0.07 s at 32K; combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)
+- **Implementation / evidence:** [defaults](../include/strix/qpf2k_defaults.hpp), [engine reference](getting-started/engine-reference.md)
+
 ### Exact options that remain opt-in
 
-MoE PK/MERGE, QSA_OUT16 and attend pairing are exact experiments with neutral or unmeasured complete-workload
+MoE PK/MERGE, QSA_OUT16, attend pairing and `STRIX_QPF2K_HC_LOWBAND` are exact experiments with neutral or unmeasured complete-workload
 gains. They are not part of the default set. Do not infer an environment spelling from these experiment names;
 use only controls exposed by the current source and require the corresponding device gates before promotion.
 

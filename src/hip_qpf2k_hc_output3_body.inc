@@ -1,12 +1,12 @@
     const auto* up_rows = static_cast<const unsigned char*>(up) + feature * kRowBytes;
     using ConstantFloat = const __attribute__((address_space(4))) float;
     using GlobalFloat = const __attribute__((address_space(1))) float;
-    auto* low_t = reinterpret_cast<ConstantFloat*>(reinterpret_cast<std::uintptr_t>(rows.low_t + row0));
-    auto* low_v = reinterpret_cast<GlobalFloat*>(reinterpret_cast<std::uintptr_t>(rows.low_t + row0));
+    auto* low_t = reinterpret_cast<ConstantFloat*>(reinterpret_cast<std::uintptr_t>(rows.low_t + low0));
+    auto* low_v = reinterpret_cast<GlobalFloat*>(reinterpret_cast<std::uintptr_t>(rows.low_t + low0));
     const std::uint32_t pitch = rows.low_t_pitch;
     // Q > 0: wave 0 of the block issues the bulk prefetch (the scalar cache is shared by the block's waves).
     const bool lead = __builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x)) < 32;
-    const std::uint64_t low_bytes = reinterpret_cast<std::uintptr_t>(rows.low_t + row0);
+    const std::uint64_t low_bytes = reinterpret_cast<std::uintptr_t>(rows.low_t + low0);
     unsigned sqc = 0U;
     float g[S * R];
 #pragma unroll

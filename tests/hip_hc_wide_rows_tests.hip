@@ -388,6 +388,100 @@ void compare_v3_bands(std::uint32_t rows, bool bf16, unsigned flavor, hipStream_
     }
 }
 
+// STRIX_QPF2K_HC_LOWBAND (projection 4 -> output 7 band 16, the engine's route) against mode 0 on the same inputs:
+//  - every valid destination byte (low values in the normalized rows, injection, output) is equal, while every destination is
+//    poisoned differently in the two arms (0xa5 / 0x5a), so a missing store cannot inherit the reference; padding bytes keep
+//    their own arm's poison (no stray store);
+//  - bit 0 (more than 512 padded rows): each low value sits at its banded index with the bits mode 0 stored at k * pitch + r
+//    (pitch = rows padded to 32), every other table slot still holds the poison; else the old layout, same check;
+//  - low16: equal to mode 0's for rows < count without bit 1, untouched (poison) with bit 1;
+//  - mode 0 again afterwards reproduces the reference (transition from a banded table), and an output-only seam call after a
+//    banded / low16-skipping projection is refused (the shared scratch holds another layout).
+void compare_lowband(std::uint32_t rows, bool bf16, unsigned flavor, hipStream_t stream) {
+    Fixture f(rows, bf16, flavor, 4321U + rows + flavor * 19U + (bf16 ? 1U : 0U));
+    const auto c = config(bf16);
+    auto v = f.views();
+    v.output3_band = 16U;
+    constexpr std::size_t kTable = std::size_t{kRank} * 8192U, kLow16 = std::size_t{kRank} * 8192U;
+    auto* table = const_cast<float*>(strix::testing::wide_hyper_rows_test_low_t());
+    auto* low16 = const_cast<void*>(strix::testing::wide_hyper_rows_test_low16());
+    const std::uint64_t out_bytes = kHidden * (bf16 ? 2U : 4U);
+    struct Result { std::vector<unsigned char> written; std::vector<std::uint32_t> table; std::vector<std::uint16_t> low16; };
+    const auto run = [&](unsigned mode, unsigned char poison) {
+        f.reset(poison);
+        check(hipMemsetAsync(table, poison, kTable * 4U, stream), "lowband poison table");
+        check(hipMemsetAsync(low16, poison, kLow16 * 2U, stream), "lowband poison low16");
+        v.low_band = mode;
+        strix::testing::enqueue_wide_hyper_rows_test(c, v, 4U, 7U, stream);
+        check(hipStreamSynchronize(stream), "lowband run");
+        Result r{f.written(), std::vector<std::uint32_t>(kTable), std::vector<std::uint16_t>(kLow16)};
+        check(hipMemcpy(r.table.data(), table, kTable * 4U, hipMemcpyDeviceToHost), "lowband table");
+        check(hipMemcpy(r.low16.data(), low16, kLow16 * 2U, hipMemcpyDeviceToHost), "lowband low16");
+        return r;
+    };
+    // Byte i of written(): normalized rows, then injection rows, then output rows. Valid = written by the step for row < rows.
+    const std::size_t n_norm = f.normalized.n, n_inj = f.injection.n;
+    const auto valid = [&](std::size_t i) {
+        if (i < n_norm) { const auto o = i % kNormalizedStride; return o < (kWidth + kRank) * 4U; }  // input (restored) + low values
+        i -= n_norm;
+        if (i < n_inj) return i % kInjectionStride < kStreams * 4U;
+        i -= n_inj;
+        return i % f.output_stride < out_bytes;
+    };
+    const Result ref = run(0U, 0xa5);
+    const std::uint32_t pitch = (rows + 31U) / 32U * 32U;
+    const std::uint32_t p5a = 0x5a5a5a5aU;
+    const std::uint16_t h5a = 0x5a5aU;
+    for (const unsigned mode : {1U, 2U, 3U, 0U}) {
+        const Result got = run(mode, 0x5a);
+        std::size_t differ = 0, first = 0, stray = 0;
+        for (std::size_t i = 0; i < ref.written.size(); ++i) {
+            if (valid(i)) { if (ref.written[i] != got.written[i]) { if (!differ) first = i; ++differ; } }
+            else stray += got.written[i] != 0x5aU;
+        }
+        const bool banded = (mode & 1U) && pitch > 512U;
+        std::vector<char> hit(kTable, 0);
+        std::size_t low_differ = 0, untouched_differ = 0, low16_differ = 0;
+        for (std::uint32_t r = 0; r < rows; ++r)
+            for (std::uint32_t k = 0; k < kRank; ++k) {
+                const std::size_t at = banded ? std::size_t{r / 512U} * kRank * 512U + std::size_t{k} * 512U + r % 512U : std::size_t{k} * pitch + r;
+                hit[at] = 1;
+                low_differ += got.table[at] != ref.table[std::size_t{k} * pitch + r];
+                const std::size_t h = std::size_t{r} * kRank + k;
+                low16_differ += (mode & 2U) ? got.low16[h] != h5a : got.low16[h] != ref.low16[h];
+            }
+        for (std::size_t i = 0; i < kTable; ++i) untouched_differ += !hit[i] && got.table[i] != p5a;
+        for (std::size_t h = std::size_t{rows} * kRank; h < kLow16; ++h) untouched_differ += got.low16[h] != h5a;
+        std::cout << "lowband " << mode << " vs 0 rows " << rows << (bf16 ? " bf16" : " fp32") << " flavor " << flavor << ": "
+                  << ref.written.size() << " bytes, differ " << differ << ", stray " << stray << "; low table " << (banded ? "banded" : "old")
+                  << ", differ " << low_differ << "; low16 " << ((mode & 2U) ? "skipped" : "written") << ", differ " << low16_differ
+                  << "; untouched differ " << untouched_differ << '\n';
+        if (differ) throw std::runtime_error("lowband differs from mode 0 at byte " + std::to_string(first));
+        if (stray || untouched_differ) throw std::runtime_error("lowband stored outside the destinations of mode 0");
+        if (low_differ) throw std::runtime_error("lowband low table is not a relocation of mode 0's");
+        if (low16_differ) throw std::runtime_error("lowband low16 differs from its expectation");
+    }
+    // Refusal of output-only seams after a banded (bit 0) or low16-skipping (bit 1) projection; accepted after mode 0.
+    for (const unsigned mode : {1U, 2U}) {
+        if (mode == 1U && pitch <= 512U) continue;
+        static_cast<void>(run(mode, 0x5a));
+        bool refused = false;
+        auto w = f.views();
+        w.output3_band = mode == 1U ? 16U : UINT32_MAX;
+        try { strix::testing::enqueue_wide_hyper_rows_test(c, w, 255U, mode == 1U ? 7U : 2U, stream); }
+        catch (const std::invalid_argument&) { refused = true; }
+        check(hipStreamSynchronize(stream), "lowband seam");
+        if (!refused) throw std::runtime_error("lowband: an output-only seam read low values of another layout");
+    }
+    static_cast<void>(run(0U, 0x5a));
+    {
+        auto w = f.views();
+        w.output3_band = 16U;
+        strix::testing::enqueue_wide_hyper_rows_test(c, w, 255U, 7U, stream);
+        check(hipStreamSynchronize(stream), "lowband seam after mode 0");
+    }
+}
+
 void bench(hipStream_t stream) {
     // STRIX_HC_WIDE_BENCH_ROWS: bench row count (default 2048; the engine's tiled prefill blocks are 8192 rows).
     const std::uint32_t n = [] { const char* v = std::getenv("STRIX_HC_WIDE_BENCH_ROWS"); return v ? static_cast<std::uint32_t>(std::atoi(v)) : 2048U; }();
@@ -400,13 +494,15 @@ void bench(hipStream_t stream) {
     check(hipMemset(half.p, 0, half.n), "half rows");
     check(hipDeviceSynchronize(), "init drain");
     const void* rows16 = nullptr;
-    const auto time = [&](unsigned projection, unsigned output, unsigned band = UINT32_MAX, bool zero_low_rank_stride = false) {
+    const auto time = [&](unsigned projection, unsigned output, unsigned band = UINT32_MAX, bool zero_low_rank_stride = false,
+                          unsigned low_band = UINT32_MAX) {
         std::vector<float> samples;
         auto v = f.views();
         v.normalized16 = rows16;
         v.normalized16_pitch = kWidth + 64U;
         v.output3_band = band;
         v.output3_zero_low_rank_stride = zero_low_rank_stride;
+        v.low_band = low_band;
         for (unsigned it = 0; it < 25U; ++it) {
             check(hipEventRecord(a, stream), "record");
             strix::testing::enqueue_wide_hyper_rows_test(c, v, projection, output, stream);
@@ -419,6 +515,21 @@ void bench(hipStream_t stream) {
         return samples[samples.size() / 2U];
     };
     const double flop = 2.0 * n * 10240.0 * 324.0, flop_out = 2.0 * n * 10240.0 * 320.0;
+    // STRIX_HC_WIDE_BENCH_LOWBAND=1: the engine's HC transaction (pack + qpf2k projection 4 -> output v3 band 16) with
+    // STRIX_QPF2K_HC_LOWBAND mode 0 vs modes 1 / 3: A/A, then three A B B A rounds per mode (median of 20 launches each).
+    if (std::getenv("STRIX_HC_WIDE_BENCH_LOWBAND")) {
+        const auto arm = [&](unsigned mode) { return time(4U, 7U, 16U, false, mode); };
+        static_cast<void>(arm(0U));
+        const float aa0 = arm(0U), aa1 = arm(0U);
+        std::cout << "bench lowband rows " << n << " A/A mode 0: " << aa0 << " " << aa1 << " us\n";
+        for (const unsigned mode : {1U, 3U, 2U})
+            for (unsigned round = 0; round < 3U; ++round) {
+                const float a0 = arm(0U), b0 = arm(mode), b1 = arm(mode), a1 = arm(0U);
+                std::cout << "bench lowband rows " << n << " mode " << mode << " round " << round << ": A " << a0 << " B " << b0 << " B " << b1
+                          << " A " << a1 << " us | B/A " << (b0 + b1) / (a0 + a1) << '\n';
+            }
+        return;
+    }
     {
         // STRIX_QPF2K_HC output v3 (seam kernels 7..10) against the lane-chain output 1 it replaces: A B A B A B A
         // (A = output 1, B = form 7, the engine's form), then the attribution forms 8 (no low prefetch),
@@ -536,6 +647,14 @@ void bench(hipStream_t stream) {
         std::cout << "bench rows " << n << " output " << output << ": " << us << " us (" << flop_out / us / 1e6 << " TFLOPS)\n";
     }
 }
+void fixtures_lowband(hipStream_t stream) {
+    for (const std::uint32_t rows : {8U, 32U, 480U, 511U, 512U, 513U, 544U, 1000U, 1032U, 4097U, 8191U, 8192U})
+        for (const unsigned flavor : {0U, 3U}) compare_lowband(rows, true, flavor, stream);
+    for (const std::uint32_t rows : {513U, 8192U})
+        for (const unsigned flavor : {1U, 2U}) compare_lowband(rows, true, flavor, stream);
+    for (const std::uint32_t rows : {40U, 1032U, 8192U}) compare_lowband(rows, false, 3U, stream);
+    std::cout << "qpf2k HC low band == mode 0: ok\n";
+}
 void fixtures_v3(hipStream_t stream) {
     for (const bool bf16 : {true, false})
         for (const std::uint32_t rows : {8U, 32U, 1032U, 8192U})
@@ -563,6 +682,13 @@ void fixtures_v3(hipStream_t stream) {
 int main() try {
     hipStream_t stream = nullptr;
     check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
+    // STRIX_HC_WIDE_LOWBAND_FIXTURES_ONLY=1: only the STRIX_QPF2K_HC_LOWBAND fixtures (then the bench if requested).
+    if (std::getenv("STRIX_HC_WIDE_LOWBAND_FIXTURES_ONLY")) {
+        fixtures_lowband(stream);
+        if (std::getenv("STRIX_HC_WIDE_BENCH")) bench(stream);
+        check(hipStreamDestroy(stream), "stream");
+        return 0;
+    }
     // STRIX_HC_WIDE_V3_FIXTURES_ONLY=1: only the output v3 fixtures (then the bench if requested).
     if (std::getenv("STRIX_HC_WIDE_V3_FIXTURES_ONLY")) {
         fixtures_v3(stream);
@@ -625,6 +751,7 @@ int main() try {
             if (differ) throw std::runtime_error("qpf2k packed coefficients differ from the output kernel's expression");
         }
         fixtures_v3(stream);
+        fixtures_lowband(stream);
         std::cout << "qpf2k HC kernels == reference forms: ok\n";
     }
     if (!std::getenv("STRIX_HC_WIDE_BENCH_ONLY")) {

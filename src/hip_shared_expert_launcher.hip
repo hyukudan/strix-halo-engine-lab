@@ -592,6 +592,41 @@ __global__ void __launch_bounds__(kThreads) rows_shared_activation_scalar_kernel
     if (threadIdx.x == 0) workspace[intermediate_size] = 1.0F / (1.0F + expf(-scratch[0]));
 }
 
+// Opt-in producer: retain the FP32 image and the scalar's 256-leaf tree; only the tiled prefix also writes FP16.
+__global__ void __launch_bounds__(kThreads) rows_shared_activation_scalar_pre_kernel(
+    std::uint64_t workspace_base, std::uint64_t workspace_stride, std::uint64_t input_base,
+    std::uint64_t input_stride, const void* scalar_weights, std::uint32_t intermediate_size,
+    std::uint32_t input_width, _Float16* a16, std::uint32_t pre_rows, unsigned* overflow) {
+    __shared__ float scratch[kThreads];
+    auto* workspace = reinterpret_cast<float*>(workspace_base + blockIdx.y * workspace_stride);
+    const auto index = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < intermediate_size) {
+        const float gate = workspace[index];
+        const float up = workspace[intermediate_size + index];
+        const float act = (gate / (1.0F + expf(-gate))) * up;
+        workspace[index] = act;
+        if (blockIdx.y < pre_rows) {
+            a16[blockIdx.y * q8_rows::tiled::scratch_pitch(intermediate_size) + index] = static_cast<_Float16>(act);
+            unsigned bad = isfinite(act) && !(fabsf(act) <= 65504.0F);
+            // One increment per aligned eight features, as the tiled FP32 staging (not per rounded infinity).
+            for (unsigned offset = 4U; offset; offset >>= 1U) bad |= __shfl_down(bad, offset, 8);
+            if ((threadIdx.x & 7U) == 0U && bad) atomicAdd(overflow, 1U);
+        }
+    }
+    if (blockIdx.x != 0) return;
+    const auto* input = reinterpret_cast<const std::uint16_t*>(input_base + blockIdx.y * input_stride);
+    float sum = 0.0F;
+    for (std::uint32_t feature = static_cast<std::uint32_t>(threadIdx.x); feature < input_width; feature += kThreads)
+        sum += load_activation(&input[feature]) * load_weight<WeightKind::f32>(scalar_weights, input_width, 0, feature);
+    scratch[threadIdx.x] = sum;
+    __syncthreads();
+    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
+        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) workspace[intermediate_size] = 1.0F / (1.0F + expf(-scratch[0]));
+}
+
 template <
     typename Output,
     WeightKind Kind>
@@ -2150,8 +2185,9 @@ KnownSharedR2Views known_shared_prefill_views(std::span<const ExecutionDispatchC
     }
     return views;
 }
-void known_shared_prefill_enqueue(std::span<const ExecutionDispatchContext> rows, const KnownSharedR2Views& views,
-    hipStream_t stream, const HipSharedExpertLauncherConfig& config, bool first_barrier = false) {
+bool known_shared_prefill_enqueue(std::span<const ExecutionDispatchContext> rows, const KnownSharedR2Views& views,
+    hipStream_t stream, const HipSharedExpertLauncherConfig& config, bool first_barrier = false,
+    int shared_pre_override = -1, const float* injected_gate_up = nullptr) {
     const auto& s = views.shape;
     const auto at = [&](std::uint64_t r) {
         auto v = views;
@@ -2170,10 +2206,63 @@ void known_shared_prefill_enqueue(std::span<const ExecutionDispatchContext> rows
     // q8_rows::tiled launch per projection, same bits; the 16/8-row remainder keeps its launches.
     const std::uint64_t tiled_rows = config.dense_f16_prefill && !config.dense_g64_prefill && rows.size() / 32U * 32U >= q8_rows::tiled::min_rows()
         ? rows.size() / 32U * 32U : 0U;
+    static const bool shared_pre_env = [] {
+        const char* v = std::getenv("STRIX_QPF2K_SHARED_PRE");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    SharedDownTiledSite pre_site{};
+    _Float16* pre_image = nullptr;
+    unsigned* pre_overflow = nullptr;
+    const auto pre_rows = static_cast<std::uint32_t>(tiled_rows);
+    if ((shared_pre_override < 0 ? shared_pre_env : shared_pre_override != 0) &&
+        !qpf2k::suppressed(qpf2k::Item::shared_pre) &&
+        !qpf2k::suppressed(qpf2k::Item::dense) && tiled_rows && q8_rows::tiled::site_enabled(32U) &&
+        tiled_rows >= q8_rows::tiled::min_rows(32U)) {
+        pre_site.segments = q8_rows::segments({{reinterpret_cast<const void*>(views.weights.down_q8.address), s.hidden}});
+        pre_site.width = s.intermediate; pre_site.outputs = s.hidden;
+        pre_site.input0 = reinterpret_cast<const unsigned char*>(views.workspace.address); pre_site.input_stride = s.workspace_stride_bytes;
+        pre_site.output0 = reinterpret_cast<unsigned char*>(views.output.address); pre_site.output_stride = s.output_stride_bytes;
+        if (q8_rows::tiled::supported(pre_site, pre_rows) && q8_rows::tiled::supported(pre_site, pre_rows, q8_rows::tiled::kPre)) {
+            try {
+                // A distinct per-stream pool: gate|up may itself use tiled::scratch and grow it after this admission.
+                struct Slot { void* p = nullptr; std::uint64_t bytes = 0; };
+                static std::mutex mutex;
+                static std::map<hipStream_t, Slot> slots;
+                const std::lock_guard lock(mutex);
+                auto& slot = slots[stream];
+                const auto bytes = (static_cast<std::uint64_t>(pre_rows) + 255U) / 256U * 256U *
+                    q8_rows::tiled::scratch_pitch(s.intermediate) * 2U;
+                if (slot.bytes < bytes) {
+                    if (slot.p) {
+                        check_hip(hipStreamSynchronize(stream), "shared pre scratch drain");
+                        check_hip(hipFree(slot.p), "shared pre scratch release");
+                        slot = {};
+                    }
+                    void* allocation = nullptr;
+                    if (hipMalloc(&allocation, bytes) == hipSuccess) { slot.p = allocation; slot.bytes = bytes; }
+                    else static_cast<void>(hipGetLastError());  // Consume this declined allocation's error before the default launches.
+                }
+                if (slot.bytes >= bytes) {
+                    pre_overflow = q8_rows::dense_f16_overflow_counter();
+                    const auto real_bytes = static_cast<std::uint64_t>(pre_rows) * q8_rows::tiled::scratch_pitch(s.intermediate) * 2U;
+                    // Real rows are overwritten by the producer; unclamped kPre loads also need initialized padded rows.
+                    if (bytes == real_bytes || hipMemsetAsync(static_cast<unsigned char*>(slot.p) + real_bytes, 0,
+                        bytes - real_bytes, stream) == hipSuccess) pre_image = static_cast<_Float16*>(slot.p);
+                    else static_cast<void>(hipGetLastError());
+                }
+            } catch (const std::exception&) {
+                static_cast<void>(hipGetLastError());
+                pre_image = nullptr;  // Admission failure keeps the complete default path.
+            }
+        }
+    }
     const auto tiled = [&](bool down) -> std::uint64_t {
         if (!tiled_rows || !q8_rows::tiled::site_enabled(down ? 32U : 16U) || tiled_rows < q8_rows::tiled::min_rows(down ? 32U : 16U)) return 0U;
         const auto n = static_cast<std::uint32_t>(tiled_rows);
-        if (down) {
+        if (down && pre_image) {
+            q8_rows::tiled::launch_projection<SharedDownTiledSite, q8_rows::tiled::kPre>(pre_site, pre_rows, stream, false,
+                q8_rows::tiled::form<SharedDownTiledSite>(q8_rows::tiled::kPre), q8_rows::tiled::raster(q8_rows::tiled::kPre), pre_image);
+        } else if (down) {
             SharedDownTiledSite site{};
             site.segments = q8_rows::segments({{reinterpret_cast<const void*>(views.weights.down_q8.address), s.hidden}});
             site.width = s.intermediate; site.outputs = s.hidden;
@@ -2209,15 +2298,49 @@ void known_shared_prefill_enqueue(std::span<const ExecutionDispatchContext> rows
         }
     };
     each_width(false);
-    hipLaunchKernelGGL(rows_shared_activation_scalar_kernel,
+    // Diagnostic injection is after the real gate|up transaction and before either activation producer.
+    if (injected_gate_up) check_hip(hipMemcpy2DAsync(reinterpret_cast<void*>(views.workspace.address), s.workspace_stride_bytes,
+        injected_gate_up, 2U * s.intermediate * sizeof(float), 2U * s.intermediate * sizeof(float), rows.size(),
+        hipMemcpyDeviceToDevice, stream), "shared pre diagnostic gate/up injection");
+    if (pre_image) {
+        static std::atomic<bool> witnessed{false};
+        if (!witnessed.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "qpf2k shared pre active (rows %u, stream %p)\n", pre_rows, static_cast<void*>(stream));
+        hipLaunchKernelGGL(rows_shared_activation_scalar_pre_kernel,
+            dim3((config.intermediate_size + kThreads - 1U) / kThreads, pre_rows),
+            dim3(kThreads), 0, stream, views.workspace.address, s.workspace_stride_bytes, views.input.address,
+            s.input_stride_bytes, reinterpret_cast<const void*>(views.weights.shared_gate_f32.address),
+            config.intermediate_size, config.hidden_size, pre_image, pre_rows, pre_overflow);
+        check_hip(hipGetLastError(), "known shared prefill activation/scalar pre launch");
+        if (pre_rows < rows.size()) {
+            const auto tail = at(pre_rows);
+            hipLaunchKernelGGL(rows_shared_activation_scalar_kernel,
+                dim3((config.intermediate_size + kThreads - 1U) / kThreads, static_cast<unsigned>(rows.size() - pre_rows)),
+                dim3(kThreads), 0, stream, tail.workspace.address, s.workspace_stride_bytes, tail.input.address,
+                s.input_stride_bytes, reinterpret_cast<const void*>(views.weights.shared_gate_f32.address),
+                config.intermediate_size, config.hidden_size);
+        }
+    } else hipLaunchKernelGGL(rows_shared_activation_scalar_kernel,
         dim3((config.intermediate_size + kThreads - 1U) / kThreads, static_cast<unsigned>(rows.size())),
         dim3(kThreads), 0, stream, views.workspace.address, s.workspace_stride_bytes, views.input.address,
         s.input_stride_bytes, reinterpret_cast<const void*>(views.weights.shared_gate_f32.address),
         config.intermediate_size, config.hidden_size);
     check_hip(hipGetLastError(), "known shared prefill activation/scalar launch");
     each_width(true);
+    return pre_image != nullptr;
 }
 } // namespace
+
+unsigned shared_expert_shared_pre_fixture_overflow_count() { return q8_rows::dense_f16_overflow_count(); }
+
+// Explicit fixture seam, independent of the immutable production environment parser; admission is still mandatory.
+bool shared_expert_shared_pre_fixture_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config, bool shared_pre, const float* injected_gate_up) {
+    const auto views = known_shared_prefill_views(rows, config);
+    const auto stream = known_shared_rows_stream();
+    check_hip(hipPeekAtLastError(), "shared pre fixture stale launch error");
+    return known_shared_prefill_enqueue(rows, views, stream, config, false, shared_pre ? 1 : 0, injected_gate_up);
+}
 
 void shared_expert_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipSharedExpertLauncherConfig& config) {

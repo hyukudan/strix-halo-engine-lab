@@ -906,6 +906,8 @@ __global__ __launch_bounds__(256) void lane_pack_rows_kernel(Site site, float* x
     const std::uint32_t width = site.width, chunks = width / 256U;
     const std::uint32_t t = blockIdx.x * 256U + threadIdx.x;
     if (t >= Site::rows * width) return;
+    if constexpr (requires { Site::grouped_rows; })
+        x += static_cast<std::uint64_t>(blockIdx.y) * Site::rows * width;
     const unsigned mm = t % 8U, r = t / 8U % 4U, h = t / 32U % 2U;
     const std::uint32_t k = t / 64U % chunks, q = t / (64U * chunks) % 16U, g = t / (1024U * chunks);
     const std::uint32_t f = bitrev4(q) + 16U * (8U * h + mm) + 256U * k;
@@ -959,6 +961,8 @@ __global__ __launch_bounds__(32U * W) void project_wide_rows_lane_kernel(Site si
         }
     };
     // Step s reads its rows' x values at xs + ((g * steps + s) * 2 + h) * 32 (scalar loads in the steps).
+    if constexpr (requires { Site::grouped_rows; })
+        xs += static_cast<std::uint64_t>(blockIdx.y) * Site::rows * site.width;
     const float* xw = xs + static_cast<std::uint64_t>((Exp & 1U) ? 0U : g) * steps * 64U;
     float acc[128];
     float stack[8][4], result[8];

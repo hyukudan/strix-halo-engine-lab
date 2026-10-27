@@ -20,6 +20,7 @@
 // on its skip paths instead (known_moe_prefill_merge_kernel_z: header[0] or the row status set, or an invalid route), where
 // the base merge returns without a store. A successful row is overwritten by the merge in both paths, so the view holds the
 // same bytes after the merge in every case (only when clear_words == hidden, i.e. exactly the words the merge covers).
+inline bool& prefill_certificate_flag(){static thread_local bool v=false;return v;}
 inline bool& prefill_clear_skipped_flag(){static thread_local bool v=false;return v;}
 inline int& prefill_route_override(){static int v=-1;return v;}
 // Per-call (this thread): bit 1 DA16, bit 2 ROUTE defaulted ON but off for this GSQ call (see enqueue_prefill).
@@ -152,6 +153,45 @@ __global__ __launch_bounds__(256) void f16_prefill_prologue_v2(PrefillRows v,uns
 #pragma unroll
     for(unsigned j=0;j<route_prologue_chunks;++j){const unsigned k=t+256U*j;if(k<n16)out[k]=f16_from_bf16(x[j],scale);}
 }
+// Certificate-only entry: base prologue above retains its exact source.
+__global__ __launch_bounds__(256) void f16_prefill_prologue_v2_certificate(PrefillRows v,unsigned hidden,unsigned top_k,unsigned experts,
+    unsigned clear_words,uint4* a16,unsigned clear16) {
+    if(blockIdx.x==0U&&threadIdx.x==0U)*v.unsafe=0U; // earlier launch than every OR
+    const unsigned r=blockIdx.x,t=threadIdx.x,n16=hidden/8U;
+    __shared__ float wave_max[8];
+    const auto* x16=reinterpret_cast<const uint4*>(at(v.input,r));
+    uint4 x[route_prologue_chunks];
+#pragma unroll
+    for(unsigned j=0;j<route_prologue_chunks;++j){const unsigned k=t+256U*j;x[j]=k<n16?x16[k]:uint4{0U,0U,0U,0U};}
+    float* clear=at(v.clear,r);
+    if(clear16){uint4* c4=reinterpret_cast<uint4*>(clear);for(unsigned i=t;i<clear_words/4U;i+=256U)c4[i]=uint4{0U,0U,0U,0U};}
+    else for(unsigned i=t;i<clear_words;i+=256U)clear[i]=0.0F;
+    unsigned route_bits=0U;
+    if(t<32U) {
+        const bool bad=t<top_k&&(at(v.routes,r)[t]>=experts||!isfinite(at(v.route_weights,r)[t]));
+        route_bits=__ballot(bad)?invalid_route:0U;
+    }
+    if(t<top_k)at(v.down_sums,r)[t]=0;
+    float m=0.0F;
+    const auto fold=[&](unsigned w){m=fmaxf(m,fabsf(__uint_as_float(w<<16U)));m=fmaxf(m,fabsf(__uint_as_float(w&0xffff0000U)));};
+#pragma unroll
+    for(unsigned j=0;j<route_prologue_chunks;++j){fold(x[j].x);fold(x[j].y);fold(x[j].z);fold(x[j].w);}
+    for(int stride=16;stride!=0;stride/=2)m=fmaxf(m,__shfl_xor(m,stride,32));
+    if((t&31U)==0U)wave_max[t/32U]=m;
+    __syncthreads();
+    m=wave_max[0];
+    for(unsigned w=1;w<8U;++w)m=fmaxf(m,wave_max[w]);
+    const int row_exponent=f16_exponent(m);
+    if(t==0U) {
+        at(v.sums,r)[0]=row_exponent;
+        *at(v.status,r)=route_bits;
+    }
+    if(!a16)return;
+    const float scale=ldexpf(1.0F,row_exponent);
+    uint4* out=a16+static_cast<std::size_t>(r)*(hidden/8U);
+#pragma unroll
+    for(unsigned j=0;j<route_prologue_chunks;++j){const unsigned k=t+256U*j;if(k<n16)out[k]=f16_from_bf16(x[j],scale);}
+}
 // Bit 4 (supersedes bit 1): the CSR in three multi-CTA kernels instead of one 1024-thread CTA (r1: the one-CTA builder runs
 // 0.32-0.57 ms per call against a data floor of a few us; one WGP of 20 works). Same words as build_prefill_csr_waves:
 //  count  : B CTAs, CTA k owns the assignments [k*S, (k+1)*S) (S = 32 waves x 64): per-expert counts -> blockcount[k][e],
@@ -189,6 +229,35 @@ __global__ __launch_bounds__(1024) void csr_mw_count(PrefillRows v,unsigned rows
             if(repeat)atomicAdd(scratch+2U+e,1U);
         }
     }
+    const unsigned per=(rows+gridDim.x-1U)/gridDim.x;
+    for(unsigned r=k*per+t;r<min(rows,(k+1U)*per);r+=1024U){const unsigned s=*at(v.status,r);if(s)atomicOr(&status,s);}
+    __syncthreads();
+    if(t==0U){if(failure)atomicOr(scratch,failure);if(status)atomicOr(scratch+1U,status);}
+    if(t<512U)scratch[csr_mw_head+k*512U+t]=n_of[t];
+}
+// Reuse the route validation load; one OR per failing wave, no public status change.
+__global__ __launch_bounds__(1024) void csr_mw_count_certificate(PrefillRows v,unsigned rows,unsigned experts,unsigned top_k,unsigned* scratch) {
+    const unsigned t=threadIdx.x,count=rows*top_k,k=blockIdx.x,first=k*csr_mw_span,last=min(count,first+csr_mw_span);
+    __shared__ unsigned n_of[512],failure,status;
+    if(t<512U)n_of[t]=0U;
+    if(t==0U){failure=0U;status=0U;}
+    __syncthreads();
+    bool unsafe=false;
+    for(unsigned a=first+t;a<last;a+=1024U) {
+        const unsigned r=a/top_k,s=a%top_k,e=at(v.routes,r)[s];
+        const float weight=at(v.route_weights,r)[s];
+        unsafe|=(__float_as_uint(weight)&0x7fffffffU)>0x3f800000U;
+        if(e>=experts||!isfinite(weight))atomicOr(&failure,invalid_route);
+        else {
+            atomicAdd(&n_of[e],1U);
+            const unsigned* const route=at(v.routes,r);
+            bool repeat=false;
+            for(unsigned q=0;q<s;++q)repeat|=route[q]==e;
+            if(repeat)atomicAdd(scratch+2U+e,1U);
+        }
+    }
+    const unsigned bad=static_cast<unsigned>(__ballot(unsafe));
+    if(bad&&(t&31U)==0U)atomicOr(v.unsafe,1U);
     const unsigned per=(rows+gridDim.x-1U)/gridDim.x;
     for(unsigned r=k*per+t;r<min(rows,(k+1U)*per);r+=1024U){const unsigned s=*at(v.status,r);if(s)atomicOr(&status,s);}
     __syncthreads();

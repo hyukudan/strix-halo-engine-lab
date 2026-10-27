@@ -120,6 +120,11 @@ void shared_expert_known_window_cohort_launch(std::span<const std::span<const Ex
     const HipSharedExpertLauncherConfig& config, void* stream, std::uintptr_t workspace, std::uint64_t workspace_bytes);
 void shared_expert_known_window_rows_launch_detached(std::span<const ExecutionDispatchContext> rows,
     const HipSharedExpertLauncherConfig& config, void* stream, std::uintptr_t workspace, std::uint64_t workspace_bytes);
+// Byte-identity fixture seam: force either producer, preserving all production admission checks. Optional device
+// gate/up rows (2 * intermediate floats, compact) replace the projection result before activation on the owned stream.
+unsigned shared_expert_shared_pre_fixture_overflow_count();
+bool shared_expert_shared_pre_fixture_launch(std::span<const ExecutionDispatchContext> rows,
+    const HipSharedExpertLauncherConfig& config, bool shared_pre, const float* injected_gate_up = nullptr);
 // Prefill: all T rows of a shared-expert step (8-row tiles of one strided view).
 void shared_expert_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipSharedExpertLauncherConfig& config);

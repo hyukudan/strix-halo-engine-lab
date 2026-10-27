@@ -87,6 +87,9 @@
     const unsigned cols[2]{32U*cg,32U*cg+16U};
     f32x8 acc[4][2]={};
     f16_pipeline<Tune,Regs>(steps,fetch,stage,[&](unsigned){f16_step_rows(sb[0],rbase,mb,cols,i,acc);});
+#ifdef STRIX_DA16_CERTIFICATE
+    bool unsafe=false; // starts after K: no accumulator live-range extension into the pipeline
+#endif
 #pragma unroll
     for(unsigned mi=0;mi<4U;++mi)if(mi<mb)
 #pragma unroll
@@ -95,5 +98,16 @@
         if(a>=count)continue;
         const float unscale=ldexpf(1.0F,-exp_of(a));
         float* out=at(view.rawdots,row_of(a))+slot_of(a)*hidden+tile*Columns+32U*cg+i;
+#ifdef STRIX_DA16_CERTIFICATE
+        const float d0=acc[mi][0][e]*unscale,d1=acc[mi][1][e]*unscale;
+        out[0]=d0;out[16]=d1;
+        unsafe|=(__float_as_uint(d0)&0x7fffffffU)>=0x7b800000U;
+        unsafe|=(__float_as_uint(d1)&0x7fffffffU)>=0x7b800000U;
+#else
         out[0]=acc[mi][0][e]*unscale;out[16]=acc[mi][1][e]*unscale;
+#endif
     }
+#ifdef STRIX_DA16_CERTIFICATE
+    const unsigned bad=static_cast<unsigned>(__ballot(unsafe));
+    if(bad&&lane==0U)atomicOr(view.unsafe,1U);
+#endif
