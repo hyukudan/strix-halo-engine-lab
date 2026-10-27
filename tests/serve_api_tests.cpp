@@ -2,12 +2,15 @@
 // SSE), tool calls, stop strings, Anthropic messages (plain and events), errors and API keys,
 // two concurrent clients through the FIFO queue, and cancellation when a client disconnects.
 #include "strix/serve/api.hpp"
+#include "strix/serve/deepseek_chat.hpp"
 #include "strix/serve/http_server.hpp"
 
 #include <arpa/inet.h>
 #include <atomic>
 #include <iostream>
 #include <netinet/in.h>
+#include <mutex>
+#include <set>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
@@ -47,7 +50,10 @@ class ScriptedEngine final : public GenerationEngine {
 public:
     explicit ScriptedEngine(std::shared_ptr<const BpeTokenizer> t) : tokenizer_(std::move(t)) {}
     GenerationStats generate(GenerationJob& job) override {
+        { const std::lock_guard lock(mutex_); prompts_.push_back({job.prompt, job.stable_prefix}); sampling_.push_back(job.sampling); }
         const auto prompt = tokenizer_->decode(job.prompt);
+        if (prompt.find("SLOW") != std::string::npos) std::this_thread::sleep_for(std::chrono::milliseconds(750));
+        if (prompt.find("ENGINE_ERROR") != std::string::npos) throw std::runtime_error("scripted failure");
         std::string script = "Let me think.\n</think>\n\nHello there, friend.<|im_end|>";
         if (prompt.find("TOOL") != std::string::npos)
             script = "Need weather.\n</think>\n\nChecking.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n"
@@ -62,10 +68,10 @@ public:
         while (at < ids.size()) {
             const auto n = std::min<std::size_t>(3U, ids.size() - at);
             std::vector<std::uint32_t> step(ids.begin() + static_cast<std::ptrdiff_t>(at), ids.begin() + static_cast<std::ptrdiff_t>(at + n));
-            bool stop = false;
+            if (stats.generated_tokens + step.size() >= job.max_tokens) { step.resize(job.max_tokens - stats.generated_tokens); }
+            bool stop = false;  // after the budget cut: a stop token beyond the budget is not generated
             for (std::size_t k = 0; k < step.size(); ++k)
                 if (std::find(job.stop_tokens.begin(), job.stop_tokens.end(), step[k]) != job.stop_tokens.end()) { step.resize(k + 1U); stop = true; break; }
-            if (stats.generated_tokens + step.size() >= job.max_tokens) { step.resize(job.max_tokens - stats.generated_tokens); }
             stats.generated_tokens += step.size();
             ++stats.cycles;
             calls.fetch_add(1);
@@ -80,7 +86,13 @@ public:
     }
     std::uint64_t context_tokens() const override { return 4096; }
     std::atomic<int> calls{0}, cancelled{0};
+    using Captured = std::pair<std::vector<std::uint32_t>, std::uint32_t>;
+    std::vector<SamplingParameters> sampling() { const std::lock_guard lock(mutex_); return sampling_; }
+    std::vector<Captured> prompts() { const std::lock_guard lock(mutex_); return prompts_; }
 private:
+    std::mutex mutex_;
+    std::vector<Captured> prompts_;
+    std::vector<SamplingParameters> sampling_;
     std::shared_ptr<const BpeTokenizer> tokenizer_;
 };
 
@@ -184,10 +196,37 @@ int main() try {
     config.model_id = "test-model";
     config.stop_tokens = {tokenizer->find("<|im_end|>"), tokenizer->find("<|endoftext|>")};
     config.api_key = "secret";
+    config.sse_keepalive_seconds = 0.3;
     ApiService api(config, tokenizer, queue, engine.context_tokens(), false);
+    auto off_config = config;
+    off_config.capabilities = false; off_config.responses = false;
+    ApiService off_api(off_config, tokenizer, queue, engine.context_tokens(), false);
+    auto legacy_config = config;
+    legacy_config.stream_receipts = false; legacy_config.sse_keepalive_seconds = 0;
+    ApiService legacy_api(legacy_config, tokenizer, queue, engine.context_tokens(), false);
+    auto quiet_config = config; quiet_config.sse_keepalive_seconds = 0;
+    ApiService quiet_api(quiet_config, tokenizer, queue, engine.context_tokens(), false);
+    auto sample_config = config; sample_config.sampling_policy = "sample";
+    sample_config.capabilities_extra = [](Json& doc) { doc.set("engine_feature", Json(true)); };
+    ApiService sample_api(sample_config, tokenizer, queue, engine.context_tokens(), true);
+    auto defaults_config = sample_config;
+    defaults_config.default_temperature = 0.7; defaults_config.default_top_k = 20;
+    defaults_config.default_top_p = 0.9; defaults_config.default_min_p = 0.1;
+    ApiService defaults_api(defaults_config, tokenizer, queue, engine.context_tokens(), true);
+    auto reject_config = config; reject_config.sampling_policy = "reject"; reject_config.responses = false;
+    ApiService reject_api(reject_config, tokenizer, queue, engine.context_tokens(), false);
     HttpServerConfig http_config;
     http_config.port = 0;
-    HttpServer server(http_config, [&](const HttpRequest& r, HttpResponseWriter& w) { api.handle(r, w); });
+    HttpServer server(http_config, [&](const HttpRequest& r, HttpResponseWriter& w) {
+        const auto mode = r.header("x-test-config");
+        if (mode == "off") off_api.handle(r, w);
+        else if (mode == "legacy") legacy_api.handle(r, w);
+        else if (mode == "quiet") quiet_api.handle(r, w);
+        else if (mode == "defaults") defaults_api.handle(r, w);
+        else if (mode == "sample") sample_api.handle(r, w);
+        else if (mode == "reject") reject_api.handle(r, w);
+        else api.handle(r, w);
+    });
     server.listen();
     const auto port = server.port();
     std::thread http_thread([&] { server.serve(); });
@@ -210,6 +249,506 @@ int main() try {
     };
 
     try {
+    {
+        const auto request = [&](const std::string& fields, const std::string& mode = "sample") {
+            return http(port, "POST", "/v1/chat/completions", "{\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}],\"max_tokens\":1" + fields + "}",
+                auth + "X-Test-Config: " + mode + "\r\n");
+        };
+        const auto filters_equal = [&](const Json& receipt, const std::string& source, double temperature, int top_k, double top_p, double min_p) {
+            const auto& filters = at(receipt, "filters");
+            for (const auto& [key, value] : std::vector<std::pair<std::string, double>>{{"temperature", temperature}, {"top_k", top_k}, {"top_p", top_p}, {"min_p", min_p}}) {
+                check(at(at(filters, key), "value").as_double() == value, key + " resolved value");
+                check(at(at(filters, key), "source").as_string() == source, key + " resolved source");
+            }
+        };
+        const auto builtin = parse_json(request("").body);
+        filters_equal(at(builtin, "strix"), "builtin", 0, 0, 1, 0);
+        check(!at(builtin, "strix").find("seed"), "greedy receipt has no seed");
+        const auto defaults = parse_json(request("", "defaults").body);
+        const auto& receipt = at(defaults, "strix");
+        filters_equal(receipt, "server", 0.7, 20, 0.9, 0.1);
+        const auto captured = engine.sampling().back();
+        check(captured.temperature == 0.7 && captured.top_k == 20 && captured.top_p == 0.9 && captured.min_p == 0.1, "engine receives server filters");
+        check(captured.seeded && captured.seed == static_cast<std::uint64_t>(at(receipt, "seed").as_int()), "API draws and echoes effective seed");
+        const auto explicit_values = parse_json(request(",\"temperature\":0.5,\"top_k\":5,\"top_p\":0.8,\"min_p\":0.2,\"seed\":42", "defaults").body);
+        filters_equal(at(explicit_values, "strix"), "request", 0.5, 5, 0.8, 0.2);
+        check(at(at(explicit_values, "strix"), "seed").as_int() == 42 && engine.sampling().back().seed == 42, "explicit seed echoed and submitted");
+        for (const auto* key : {"temperature", "top_k", "top_p", "min_p"}) {
+            const auto mixed = parse_json(request(std::string(",\"") + key + "\":null", "defaults").body);
+            filters_equal(at(mixed, "strix"), "server", 0.7, 20, 0.9, 0.1);
+        }
+        for (const auto& [key, value] : std::vector<std::pair<std::string, std::string>>{{"temperature", "0"}, {"top_k", "0"}, {"top_p", "1"}, {"min_p", "0"}}) {
+            for (const auto* mode : {"sample", "defaults"}) {
+                const auto mixed = parse_json(request(",\"" + key + "\":" + value, mode).body);
+                const auto& filters = at(at(mixed, "strix"), "filters");
+                for (const auto* field : {"temperature", "top_k", "top_p", "min_p"})
+                    check(at(at(filters, field), "source").as_string() == (key == field ? "request" : std::string(mode) == "defaults" ? "server" : "builtin"), "independent filter precedence");
+            }
+        }
+        const auto ignored = parse_json(request(",\"temperature\":0,\"top_k\":10").body);
+        check(at(at(ignored, "strix"), "note").as_string() == "filters ignored at temperature 0 (greedy)", "greedy filter note");
+        check(!at(ignored, "strix").find("seed"), "greedy filters do not create seed");
+        const auto downgraded = parse_json(request(",\"temperature\":1", "quiet").body);
+        check(at(at(downgraded, "strix"), "note").as_string() == "temperature ignored: this engine decodes greedy (exact)", "downgrade note unchanged");
+        for (const auto& [key, values] : std::vector<std::pair<std::string, std::vector<std::string>>>{
+                {"temperature", {"-1", "2.1", "1e999", "\"1\"", "true", "[]", "{}"}},
+                {"top_p", {"0", "-0.1", "1.1", "1e999", "\"1\"", "false", "[]", "{}"}},
+                {"min_p", {"-0.1", "1", "1e999", "\"0\"", "false", "[]", "{}"}},
+                {"top_k", {"1.5", "-1", "4294967296", "1e999", "\"1\"", "true", "[]", "{}"}},
+                {"seed", {"-1", "42.5", "9223372036854775808", "18446744073709551616", "\"1\"", "true", "[]", "{}"}}}) {
+            for (const auto& value : values) {
+                const auto before = engine.prompts().size();
+                const auto bad = request(",\"" + key + "\":" + value);
+                check(bad.status == 400 && at(at(parse_json(bad.body), "error"), "param").as_string() == key, key + " rejects " + value);
+                check(engine.prompts().size() == before, "invalid " + key + " never submitted");
+            }
+        }
+        // integral values in any spelling are integers
+        for (const auto* spelling : {"10.0", "1e1", "10"}) {
+            const auto ok = request(std::string(",\"temperature\":1,\"top_k\":") + spelling + ",\"seed\":" + spelling);
+            check(ok.status == 200 && engine.sampling().back().top_k == 10U && engine.sampling().back().seed == 10U, std::string("integral spelling ") + spelling);
+        }
+        check(request(",\"temperature\":1,\"top_k\":-0").status == 200 && engine.sampling().back().top_k == 0U, "top_k -0 is 0");
+        // integer spellings are read exactly (never through a double)
+        for (const auto& [spelling, expected] : std::vector<std::pair<std::string, std::uint64_t>>{
+                 {"9007199254740993.0", 9007199254740993ULL}, {"9007199254740994.0", 9007199254740994ULL},
+                 {"9.223372036854775807e18", 9223372036854775807ULL}, {"100e-2", 1ULL}, {"0.0e5", 0ULL}}) {
+            const auto ok = request(",\"temperature\":1,\"seed\":" + spelling);
+            check(ok.status == 200 && engine.sampling().back().seed == expected, "exact integer spelling " + spelling);
+        }
+        for (const char* spelling : {"9007199254740992.1", "9.223372036854775808e18", "1e-1", "100e-3", "-1e0"}) {
+            const auto bad = request(std::string(",\"temperature\":1,\"seed\":") + spelling);
+            check(bad.status == 400, std::string("non-integer or out-of-range seed refused ") + spelling);
+        }
+        check(request(",\"temperature\":1,\"top_k\":1.0000000000000001").status == 400, "top_k fraction below double precision refused");
+        // the engine samples with float parameters: values that narrow to an invalid float are refused up front
+        for (const auto& [extra, param] : std::vector<std::pair<std::string, std::string>>{
+                 {",\"temperature\":1e-50", "temperature"}, {",\"temperature\":1,\"top_p\":1e-50", "top_p"},
+                 {",\"temperature\":1,\"min_p\":0.99999999", "min_p"}}) {
+            const auto bad = request(extra);
+            check(bad.status == 400 && at(at(parse_json(bad.body), "error"), "param").as_string() == param, "float narrowing refused " + extra);
+        }
+        for (const auto* seed : {"0", "9223372036854775807"}) {
+            const auto accepted = parse_json(request(std::string(",\"temperature\":1,\"seed\":") + seed).body);
+            check(at(at(accepted, "strix"), "seed").number_source() == seed, "seed boundary accepted");
+        }
+        const auto caps = parse_json(http(port, "GET", "/v1/capabilities", "", auth + "X-Test-Config: defaults\r\n").body);
+        Json cap_receipt = Json::object(); cap_receipt.set("filters", at(at(caps, "sampling"), "defaults"));
+        filters_equal(cap_receipt, "server", 0.7, 20, 0.9, 0.1);
+        check(at(at(caps, "sampling"), "seed_echo").as_bool(), "capabilities seed echo");
+        for (const auto* route : {"/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses"}) {
+            std::string body = "{\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}],\"prompt\":\"Hi\",\"input\":\"Hi\",\"max_tokens\":1,\"max_output_tokens\":1,\"stream\":true}";
+            const auto events = sse_data(http(port, "POST", route, body, auth + "X-Test-Config: defaults\r\n").body);
+            std::vector<Json> receipts;
+            for (const auto& event : events) {
+                const Json* object = &event;
+                if (const auto* r = event.find("response")) object = r;
+                if (const auto* m = event.find("message")) object = m;
+                if (const auto* r = object->find("strix")) receipts.push_back(*r);
+            }
+            check(receipts.size() >= 2, std::string(route) + " stream end receipts");
+            if (receipts.size() >= 2) {
+                check(at(receipts.front(), "seed").as_int() == at(receipts.back(), "seed").as_int(), "stream seed is stable");
+                filters_equal(receipts.front(), "server", 0.7, 20, 0.9, 0.1);
+                filters_equal(receipts.back(), "server", 0.7, 20, 0.9, 0.1);
+            }
+            const auto plain = parse_json(body);
+            Json nonstream = Json::object();
+            for (const auto& [key, value] : plain.as_object()) if (key != "stream") nonstream.set(key, value);
+            const auto legacy = parse_json(http(port, "POST", route, nonstream.dump(), auth + "X-Test-Config: legacy\r\n").body);
+            check(!at(legacy, "strix").find("filters") && !at(legacy, "strix").find("seed"), "receipt off omits new policy fields");
+        }
+    }
+    {
+        const auto r = http(port, "GET", "/v1/capabilities", "", auth);
+        const auto doc = parse_json(r.body);
+        const auto id = at(doc, "capabilities_id").as_string();
+        check(r.status == 200 && at(doc, "object").as_string() == "strix.capabilities" && at(doc, "version").as_int() == 1, "capabilities default");
+        check(http(port, "GET", "/v1/capabilities", "").status == 401, "capabilities authenticated");
+        check(at(parse_json(http(port, "GET", "/v1/capabilities", "", auth).body), "capabilities_id").as_string() == id, "capabilities stable id");
+        Json canonical = Json::object();
+        for (const auto& [key, value] : doc.as_object()) if (key != "capabilities_id") canonical.set(key, value);
+        std::uint64_t hash = 14695981039346656037ULL;
+        for (const unsigned char c : canonical.dump()) { hash ^= c; hash *= 1099511628211ULL; }
+        char hex[17]; std::snprintf(hex, sizeof(hex), "%016llx", static_cast<unsigned long long>(hash));
+        check(id == hex, "capabilities FNV-1a canonical dump");
+        for (const char* path : {"/api/status", "/health"})
+            check(at(parse_json(http(port, "GET", path, "", auth).body), "capabilities_id").as_string() == id, "capabilities reference " + std::string(path));
+        const auto models = parse_json(http(port, "GET", "/v1/models", "", auth).body);
+        check(at(at(models, "data").as_array()[0], "capabilities_id").as_string() == id, "models capabilities reference");
+        for (const char* key : {"json_schema", "strict_tools", "penalties", "logit_bias", "logprobs", "retry", "thinking_budget", "prefill_progress"})
+            check(!at(doc, key).as_bool(), "unavailable capability " + std::string(key));
+        check(!at(at(doc, "sampling"), "sample").as_bool(), "greedy-only capability");
+        for (const auto* field : {"temperature", "top_k", "top_p", "min_p"}) {
+            const auto& entry = at(at(at(doc, "sampling"), "defaults"), field);
+            check(at(entry, "source").as_string() == "builtin", "capabilities builtin source");
+            check(at(entry, "value").as_double() == (std::string(field) == "top_p" ? 1.0 : 0.0), "capabilities builtin value");
+        }
+        check(ApiConfig{}.sse_keepalive_seconds == 10.0, "default keepalive interval");
+        const auto sampled = parse_json(http(port, "GET", "/v1/capabilities", "", auth + "X-Test-Config: sample\r\n").body);
+        check(at(at(sampled, "sampling"), "sample").as_bool() && at(sampled, "engine_feature").as_bool() && at(sampled, "capabilities_id").as_string() != id, "sampling capabilities and engine hook");
+        const auto rejected = parse_json(http(port, "GET", "/v1/capabilities", "", auth + "X-Test-Config: reject\r\n").body);
+        check(at(at(rejected, "sampling"), "positive_temperature").as_string() == "reject" && !at(at(rejected, "endpoints"), "responses").as_bool(), "reject policy and disabled endpoint capabilities");
+        const auto before = engine.prompts().size();
+        check(http(port, "POST", "/v1/chat/completions", R"({"messages":[{"role":"user","content":"Hi"}],"temperature":1})", auth + "X-Test-Config: reject\r\n").status == 400 && engine.prompts().size() == before, "sampling reject semantics unchanged");
+        const auto off = auth + "X-Test-Config: off\r\n";
+        check(http(port, "GET", "/v1/capabilities", "", off).status == 404, "capabilities off");
+        check(http(port, "POST", "/v1/responses", "{}", off).status == 404, "responses off");
+        for (const char* path : {"/health", "/api/status"})
+            check(!parse_json(http(port, "GET", path, "", off).body).find("capabilities_id"), "off omits id " + std::string(path));
+        const auto off_models = parse_json(http(port, "GET", "/v1/models", "", off).body);
+        check(!at(off_models, "data").as_array()[0].find("capabilities_id"), "off models omit id");
+    }
+    {
+        // The real routes submit the same complete prompt and stable prefix, including literal argument bytes.
+        std::vector<std::pair<Json, Json>> pairs;
+        const auto pair = [&](const char* chat, const char* responses) { pairs.emplace_back(parse_json(chat), parse_json(responses)); };
+        pair(R"({"messages":[{"role":"user","content":"Hi"}]})", R"({"input":"Hi"})");
+        pair(R"({"messages":[{"role":"system","content":"Rules"},{"role":"user","content":"Hi"}]})", R"({"instructions":"Rules","input":"Hi"})");
+        pair(R"({"messages":[{"role":"user","content":[{"type":"text","text":"  a\n"},{"type":"text","text":"\u03bb <think> <tool_call>  "}]}]})",
+             R"({"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"  a\n"},{"type":"output_text","text":"\u03bb <think> <tool_call>  "}]}]})");
+        pair(R"({"messages":[{"role":"developer","content":"Rules"},{"role":"user","content":"Hi"}]})", R"({"input":[{"role":"developer","content":"Rules"},{"role":"user","content":"Hi"}]})");
+        pair(R"({"messages":[{"role":"user","content":"Hi"}],"tools":[{"type":"function","function":{"description":"desc","name":"f","parameters":{"type":"object"},"strict":false}}],"tool_choice":"none"})",
+             R"({"input":"Hi","tools":[{"type":"function","description":"desc","name":"f","parameters":{"type":"object"},"strict":false}],"tool_choice":"none","n":1,"previous_response_id":null,"store":false,"background":false})");
+        pair(R"({"messages":[{"role":"user","content":"Hi"}],"tools":[{"type":"function","function":{"description":"desc","name":"f","parameters":{"type":"object"},"strict":false}}],"tool_choice":"auto"})",
+             R"({"input":"Hi","tools":[{"type":"function","description":"desc","name":"f","parameters":{"type":"object"},"strict":false}],"tool_choice":"auto"})");
+        pair(R"({"messages":[{"role":"user","content":"First"},{"role":"assistant","content":"Answer","reasoning_content":"Reason\n"},{"role":"user","content":"Next"}],"preserve_thinking":true})",
+             R"({"input":[{"role":"user","content":"First"},{"type":"reasoning","content":[{"type":"reasoning_text","text":"Reason\n"}]},{"role":"assistant","content":"Answer"},{"role":"user","content":"Next"}],"preserve_thinking":true})");
+        pair(R"({"messages":[{"role":"user","content":"First"},{"role":"assistant","content":"Answer","reasoning_content":"Summary"},{"role":"user","content":"Next"}]})",
+             R"({"input":[{"role":"user","content":"First"},{"type":"reasoning","summary":[{"type":"summary_text","text":"Summary"}]},{"role":"assistant","content":"Answer"},{"role":"user","content":"Next"}]})");
+        for (const char* effort : {"none", "low", "high"}) {
+            auto c = parse_json(R"({"messages":[{"role":"user","content":"Hi"}]})"); c.set("reasoning_effort", Json(effort));
+            auto r = parse_json(R"({"input":"Hi"})"); Json reasoning = Json::object(); reasoning.set("effort", Json(effort)); r.set("reasoning", std::move(reasoning));
+            pairs.emplace_back(std::move(c), std::move(r));
+        }
+        auto c = parse_json(R"({"messages":[{"role":"user","content":"Call"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":""}}]},{"role":"tool","tool_call_id":"c1","content":"result"}],"tools":[{"type":"function","function":{"name":"f","description":"function","parameters":{"type":"object","properties":{"s":{"type":"string"}}}}}]})");
+        auto r = parse_json(R"({"input":[{"role":"user","content":"Call"},{"type":"function_call","call_id":"c1","name":"f","arguments":""},{"type":"function_call_output","call_id":"c1","output":"result"}],"tools":[{"type":"function","name":"f","description":"function","parameters":{"type":"object","properties":{"s":{"type":"string"}}}}]})");
+        const std::string args = " {\n\"s\": \"quote \\\" backslash \\\\ newline \\n </tool_call> </parameter>\"\n} ";
+        auto call = parse_json(R"({"id":"c1","type":"function","function":{"name":"f"}})");
+        Json function = Json::object(); function.set("name", Json("f")); function.set("arguments", Json(args)); call.set("function", std::move(function));
+        auto& messages = c.as_object()[0].second.as_array(); Json calls = Json::array(); calls.push(std::move(call)); messages[1].set("tool_calls", std::move(calls));
+        r.as_object()[0].second.as_array()[1].set("arguments", Json(args));
+        pairs.emplace_back(std::move(c), std::move(r));
+        // an assistant message followed by two calls is one assistant turn with two tool calls
+        pair(R"({"messages":[{"role":"user","content":"Both"},{"role":"assistant","content":"Calling","tool_calls":[{"id":"a","type":"function","function":{"name":"f","arguments":"{\"s\":\"1\"}"}},{"id":"b","type":"function","function":{"name":"f","arguments":"{\"s\":\"2\"}"}}]},{"role":"tool","tool_call_id":"a","content":"one"},{"role":"tool","tool_call_id":"b","content":"two"}],"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]})",
+             R"({"input":[{"role":"user","content":"Both"},{"role":"assistant","content":"Calling"},{"type":"function_call","call_id":"a","name":"f","arguments":"{\"s\":\"1\"}"},{"type":"function_call","call_id":"b","name":"f","arguments":"{\"s\":\"2\"}"},{"type":"function_call_output","call_id":"a","output":"one"},{"type":"function_call_output","call_id":"b","output":"two"}],"tools":[{"type":"function","name":"f","parameters":{"type":"object"}}]})");
+        pair(R"({"messages":[{"role":"user","content":"Both"},{"role":"assistant","content":"","tool_calls":[{"id":"a","type":"function","function":{"name":"f","arguments":"{}"}},{"id":"b","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"a","content":"one"},{"role":"tool","tool_call_id":"b","content":"two"}],"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}]})",
+             R"({"input":[{"role":"user","content":"Both"},{"type":"function_call","call_id":"a","name":"f","arguments":"{}"},{"type":"function_call","call_id":"b","name":"f","arguments":"{}"},{"type":"function_call_output","call_id":"a","output":"one"},{"type":"function_call_output","call_id":"b","output":"two"}],"tools":[{"type":"function","name":"f","parameters":{"type":"object"}}]})");
+        for (std::size_t i = 0; i < pairs.size(); ++i) {
+            const auto before = engine.prompts().size();
+            const auto a = http(port, "POST", "/v1/chat/completions", pairs[i].first.dump(), auth);
+            const auto b = http(port, "POST", "/v1/responses", pairs[i].second.dump(), auth);
+            const auto captured = engine.prompts();
+            check(a.status == 200 && b.status == 200, "responses prompt pair accepted " + std::to_string(i) + " " + b.body);
+            check(captured.size() == before + 2U && captured[before] == captured[before + 1U], "responses_prompt_ids_equal_chat " + std::to_string(i));
+        }
+    }
+    {
+        const std::vector<std::pair<std::string, std::string>> invalid{
+            {R"({"previous_response_id":"resp_x"})", "previous_response_id"}, {R"({"store":true})", "store"},
+            {R"({"conversation":"conv_1"})", "conversation"}, {R"({"background":true})", "background"},
+            {R"({"input":[{"type":"unknown"}]})", "input[0].type"},
+            {R"({"input":[{"role":"user","content":[{"type":"input_image","image_url":"x"}]}]})", "input[0].content"},
+            {R"({"input":[{"role":"user","content":[{"type":"input_file","file_id":"x"}]}]})", "input[0].content"},
+            {R"({"tools":[{"type":"web_search"}]})", "tools[0].type"},
+            {R"({"input":[{"type":"reasoning","encrypted_content":"x"}]})", "input[0]"},
+            {R"({"input":[{"type":"reasoning","summary":[],"encrypted_content":"x"}]})", "input[0]"},
+            {R"({"input":[{"type":"function_call_output","call_id":"missing","output":"x"}]})", "input[0].call_id"},
+            {R"({"input":[{"type":"function_call","call_id":"c","name":"f","arguments":"{}"},{"type":"function_call","call_id":"c","name":"f","arguments":"{}"}]})", "input[1].call_id"},
+            {R"({"input":[{"type":"function_call","call_id":"c","name":"f","arguments":"{}"},{"type":"function_call_output","call_id":"c","output":"x"},{"type":"function_call_output","call_id":"c","output":"x"}]})", "input[2].call_id"},
+            {R"({"text":{"format":{"type":"json_schema"}}})", "text.format"}, {R"({"text":{"format":{"type":"json_object"}}})", "text.format"},
+            {R"({"text":{"format":{"type":"other"}}})", "text.format"},
+            {R"({"tools":[{"type":"function","name":"f","strict":true}]})", "tools[0].strict"},
+            {R"({"tool_choice":"required"})", "tool_choice"}, {R"({"tool_choice":{"type":"function","name":"f"}})", "tool_choice"},
+            {R"({"n":"1"})", "n"}, {R"({"n":2})", "n"}, {R"({"instructions":[]})", "instructions"}
+        };
+        const auto before = engine.prompts().size();
+        for (const auto& [body, param] : invalid) {
+            auto request = parse_json(body); if (!request.find("input")) request.set("input", Json("Hi"));
+            const auto reply = http(port, "POST", "/v1/responses", request.dump(), auth);
+            check(reply.status == 400 && at(at(parse_json(reply.body), "error"), "param").as_string() == param, "responses_validation " + param + " " + reply.body);
+        }
+        check(engine.prompts().size() == before, "responses_validation never invokes engine");
+    }
+    {
+        const auto plain = http(port, "POST", "/v1/responses", R"({"input":"Hi","temperature":1,"text":{"format":{"type":"text"}}})", auth);
+        const auto full = parse_json(plain.body);
+        check(plain.status == 200 && at(full, "object").as_string() == "response" && at(full, "status").as_string() == "completed", "responses non-stream shape");
+        check(at(full, "id").as_string().starts_with("resp_") && at(full, "created_at").is_number(), "responses id and time");
+        const auto& output = at(full, "output").as_array();
+        check(output.size() == 2U && at(output[0], "type").as_string() == "reasoning" && at(output[0], "summary").size() == 0U, "responses reasoning item");
+        check(at(output[1], "role").as_string() == "assistant" && at(output[1], "status").as_string() == "completed", "responses message item");
+        const auto expected_text = at(at(output[1], "content").as_array()[0], "text").as_string();
+        const auto expected_reasoning = at(at(output[0], "content").as_array()[0], "text").as_string();
+        check(at(at(output[1], "content").as_array()[0], "annotations").size() == 0U, "responses annotations");
+        const auto& usage = at(full, "usage");
+        check(at(usage, "input_tokens").as_int() + at(usage, "output_tokens").as_int() == at(usage, "total_tokens").as_int() &&
+            at(at(usage, "input_tokens_details"), "cached_tokens").as_int() == 0, "responses usage");
+        check(at(at(full, "strix"), "sampling_requested").as_string() == "sample" && at(at(full, "strix"), "sampling_effective").as_string() == "greedy" &&
+            !at(at(full, "strix"), "note").as_string().empty(), "responses downgrade receipt");
+        const auto incomplete = parse_json(http(port, "POST", "/v1/responses", R"({"input":"Hi","max_output_tokens":4})", auth).body);
+        check(at(incomplete, "status").as_string() == "incomplete" && at(at(incomplete, "incomplete_details"), "reason").as_string() == "max_output_tokens", "responses non-stream incomplete");
+        const auto status = parse_json(http(port, "GET", "/api/status", "").body);
+        check(at(at(status, "requests").as_array()[0], "route").as_string() == "responses", "responses recent request route");
+        for (const char* input : {"Hi", "TOOL", "ENGINE_ERROR", "length"}) {
+            Json request = Json::object(); request.set("input", Json(input)); request.set("stream", Json(true));
+            if (std::string(input) == "TOOL") request.set("tools", parse_json(R"([{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"days":{"type":"integer"}}}}])"));
+            if (std::string(input) == "length") request.set("max_output_tokens", Json(4));
+            const auto r = http(port, "POST", "/v1/responses", request.dump(), auth);
+            check(r.status == 200 && r.body.find("[DONE]") == std::string::npos, "responses SSE transport");
+            const auto events = sse_data(r.body);
+            check(at(events[0], "type").as_string() == "response.created" && at(events[1], "type").as_string() == "response.in_progress", "responses created/progress order");
+            check(at(events[0], "response").find("strix"), "responses first receipt");
+            std::set<std::int64_t> added, parts, texts_done, parts_done, items_done;
+            std::string text, reasoning, arguments;
+            std::int64_t sequence = 0;
+            int terminal = 0;
+            for (const auto& e : events) {
+                const auto type = at(e, "type").as_string();
+                check(at(e, "sequence_number").as_int() == sequence++, "responses sequence_number");
+                check(r.body.find("event: " + type + "\ndata: " + e.dump() + "\n\n") != std::string::npos, "responses event == data.type");
+                if (type == "response.output_item.added") added.insert(at(e, "output_index").as_int());
+                if (type == "response.content_part.added") {
+                    const auto i = at(e, "output_index").as_int(); check(added.count(i) && !items_done.count(i), "part follows item added"); parts.insert(i);
+                }
+                if (type.ends_with(".delta")) {
+                    const auto i = at(e, "output_index").as_int(); check(added.count(i) && !items_done.count(i) && !texts_done.count(i), "delta ordering");
+                    if (type == "response.output_text.delta") { check(parts.count(i), "text part added before delta"); text += at(e, "delta").as_string(); }
+                    if (type == "response.reasoning_text.delta") reasoning += at(e, "delta").as_string();
+                    if (type == "response.function_call_arguments.delta") arguments += at(e, "delta").as_string();
+                }
+                if (type == "response.output_text.done" || type == "response.reasoning_text.done" || type == "response.function_call_arguments.done") texts_done.insert(at(e, "output_index").as_int());
+                if (type == "response.content_part.done") {
+                    const auto i = at(e, "output_index").as_int(); check(texts_done.count(i), "part done after text done"); parts_done.insert(i);
+                }
+                if (type == "response.output_item.done") {
+                    const auto i = at(e, "output_index").as_int(); check(added.count(i) && texts_done.count(i) && (!parts.count(i) || parts_done.count(i)), "item done ordering"); items_done.insert(i);
+                }
+                if (type == "response.completed" || type == "response.incomplete" || type == "response.failed") {
+                    ++terminal; check(items_done == added && at(e, "response").find("strix"), "terminal complete output and receipt");
+                }
+            }
+            check(terminal == 1, "exactly one responses terminal");
+            if (std::string(input) == "Hi") check(text == expected_text && reasoning == expected_reasoning, "responses deltas equal non-stream text");
+            if (std::string(input) == "TOOL") {
+                const auto& result = at(events.back(), "response"); const auto& calls = at(result, "output").as_array();
+                check(at(calls.back(), "type").as_string() == "function_call" && !at(calls.back(), "call_id").as_string().empty() && at(calls.back(), "arguments").as_string() == arguments, "responses tool item and arguments");
+                request.set("stream", Json(false)); const auto nonstream = parse_json(http(port, "POST", "/v1/responses", request.dump(), auth).body);
+                check(at(at(nonstream, "output").as_array().back(), "arguments").as_string() == arguments, "responses tool arguments equal non-stream");
+            }
+            if (std::string(input) == "length") check(at(at(at(events.back(), "response"), "incomplete_details"), "reason").as_string() == "max_output_tokens", "responses incomplete reason");
+            if (std::string(input) == "ENGINE_ERROR") check(at(events.back(), "type").as_string() == "response.failed", "responses engine failure terminal");
+        }
+        check(http(port, "POST", "/v1/responses", R"({"input":"ENGINE_ERROR"})", auth).status == 500, "responses non-stream engine failure");
+    }
+    {
+        const auto body = R"({"messages":[{"role":"user","content":"Hi"}],"stream":true,"temperature":1,"max_tokens":1000})";
+        const auto events = sse_data(http(port, "POST", "/v1/chat/completions", body, auth).body);
+        const auto& receipt = at(events.front(), "strix");
+        check(at(receipt, "sampling_requested").as_string() == "sample" && at(receipt, "sampling_effective").as_string() == "greedy", "first chat receipt without usage");
+        check(at(receipt, "max_tokens_requested").as_int() == 1000 && at(receipt, "max_tokens_effective").as_int() == 1000 && receipt.find("note"), "first chat policy limit and note");
+        check(events.back().find("strix"), "final chat receipt without usage");
+        const auto old = sse_data(http(port, "POST", "/v1/chat/completions", body, auth + "X-Test-Config: legacy\r\n").body);
+        check(!old.front().find("strix") && !old.back().find("strix"), "receipts off");
+        // Build every old chunk with the original ordered fields, normalizing only the random id and timestamp.
+        const auto normalize = [](const Json& value) {
+            Json out = parse_json(value.dump()); out.set("id", Json("ID")); out.set("created", Json(0)); return out.dump();
+        };
+        for (const auto& e : old) {
+            Json golden = Json::object(); golden.set("id", Json("ID")); golden.set("object", Json("chat.completion.chunk")); golden.set("created", Json(0));
+            golden.set("model", Json("test-model")); golden.set("choices", at(e, "choices"));
+            check(normalize(e) == golden.dump(), "old chat chunk golden bytes");
+        }
+        check(events.size() == old.size(), "receipt does not add chat chunks");
+        for (std::size_t i = 0; i < events.size() && i < old.size(); ++i)
+            check(at(events[i], "choices").dump() == at(old[i], "choices").dump(), "receipt leaves chat deltas unchanged");
+    }
+    {
+        for (const char* route : {"/v1/chat/completions", "/v1/messages", "/v1/completions", "/v1/responses"}) {
+            auto request = parse_json(R"({"stream":true,"max_tokens":1000,"return_token_ids":true})");
+            const std::string path = route;
+            if (path == "/v1/responses") request.set("input", Json("SLOW"));
+            else if (path == "/v1/completions") request.set("prompt", Json("SLOW"));
+            else request.set("messages", parse_json(R"([{"role":"user","content":"SLOW"}])"));
+            const auto active = http(port, "POST", path, request.dump(), auth);
+            // the opening events (role chunk, message_start, response.created + in_progress) are written at once; the
+            // slow engine's first text comes after keepalive comments
+            const auto keepalive = active.body.find(": keepalive\n\n");
+            std::size_t opening = 0;
+            for (auto at_ = active.body.find("data: "); at_ < keepalive; at_ = active.body.find("data: ", at_ + 1)) ++opening;
+            const std::size_t expected = path == "/v1/responses" ? 2U : 1U;
+            check(keepalive != std::string::npos && opening == expected, "keepalive before the first generated text " + path);
+            const auto quiet = http(port, "POST", path, request.dump(), auth + "X-Test-Config: quiet\r\n");
+            request.set("strix", parse_json(R"({"keepalive":false})"));
+            const auto disabled = http(port, "POST", path, request.dump(), auth);
+            check(quiet.body.find(": keepalive") == std::string::npos && disabled.body.find(": keepalive") == std::string::npos, "keepalive off switches " + path);
+            const auto a = sse_data(active.body), b = sse_data(quiet.body), c = sse_data(disabled.body);
+            check(a.size() == b.size() && a.size() == c.size(), "keepalive event count unchanged " + path);
+            const auto ids = [&](const std::vector<Json>& values) {
+                const auto& last = values.back();
+                return at(path == "/v1/responses" ? at(at(last, "response"), "strix") : at(last, "strix"), "token_ids").dump();
+            };
+            check(ids(a) == ids(b) && ids(a) == ids(c), "keepalive generated ids identical " + path);
+            for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
+                if (path == "/v1/chat/completions" || path == "/v1/completions") check(at(a[i], "choices").dump() == at(b[i], "choices").dump(), "keepalive deltas unchanged " + path);
+                if (const auto* delta = a[i].find("delta")) check(delta->dump() == at(b[i], "delta").dump(), "keepalive delta unchanged " + path);
+            }
+            if (path == "/v1/messages") check(at(a.front(), "message").find("strix") && a.back().find("strix"), "messages first and final receipt");
+            if (path == "/v1/completions") check(a.front().find("strix") && a.back().find("strix"), "completions first and final receipt");
+        }
+    }
+    {
+        // A call is completed only when its frame closed: as the budget grows, every call status goes incomplete ->
+        // completed exactly once (streamed or not), even while the response itself is still incomplete.
+        const auto tools = R"([{"type":"function","name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}}}}])";
+        for (const bool stream : {false, true}) {
+            std::string history;  // per limit: '-' no call, 'i' incomplete call, 'c' completed call
+            bool completed_in_incomplete_response = false;
+            for (int limit = 20; limit <= 140; ++limit) {
+                auto request = parse_json(R"({"input":"TOOL"})"); request.set("tools", parse_json(tools));
+                request.set("max_output_tokens", Json(limit)); request.set("stream", Json(stream));
+                const auto r = http(port, "POST", "/v1/responses", request.dump(), auth);
+                const Json response = stream ? at(sse_data(r.body).back(), "response") : parse_json(r.body);
+                char state = '-';
+                for (const auto& item : at(response, "output").as_array())
+                    if (at(item, "type").as_string() == "function_call") state = at(item, "status").as_string() == "completed" ? 'c' : 'i';
+                if (state == 'c' && at(response, "status").as_string() == "incomplete") completed_in_incomplete_response = true;
+                history += state;
+            }
+            const auto first_i = history.find('i'), first_c = history.find('c');
+            check(first_i != std::string::npos && first_c != std::string::npos && first_i < first_c &&
+                  history.find('-', first_i) == std::string::npos && history.find('i', first_c) == std::string::npos,
+                  std::string("call status monotone in the budget ") + (stream ? "stream " : "") + history);
+            check(completed_in_incomplete_response, "a closed call stays completed when the budget then ends the response");
+        }
+        // A stop string inside the arguments cuts the frame: the call is incomplete although the response stopped.
+        for (const bool stream : {false, true}) {
+            auto request = parse_json(R"({"input":"TOOL","stop":["slo"]})"); request.set("tools", parse_json(tools)); request.set("stream", Json(stream));
+            const auto r = http(port, "POST", "/v1/responses", request.dump(), auth);
+            const Json response = stream ? at(sse_data(r.body).back(), "response") : parse_json(r.body);
+            int calls = 0;
+            for (const auto& item : at(response, "output").as_array())
+                if (at(item, "type").as_string() == "function_call") { ++calls; check(at(item, "status").as_string() == "incomplete", "stop-cut call incomplete"); }
+            check(calls == 1, "stop-cut call reported " + r.body.substr(0, 200));
+        }
+        const auto cut = parse_assistant_output("x</think>\n\n<tool_call>\n<function=f>\n<parameter=a>\nv", true, Json());
+        const auto closed = parse_assistant_output("<tool_call>\n<function=f>\n</function>\n</tool_call><tool_call>\n<function=g>", false, Json());
+        check(cut.call_complete == std::vector<bool>{false} && closed.call_complete == std::vector<bool>{true, false}, "parser call_complete");
+        check(parse_assistant_output("only reasoning", true, Json()).tool_calls.is_array(), "tool_calls array inside thinking");
+    }
+    {
+        // Generation-affecting fields the server does not execute are refused before the engine runs; neutral values pass.
+        const auto before = engine.prompts().size();
+        const std::vector<std::pair<std::string, std::string>> refused = {
+            {"presence_penalty", R"(0.5)"}, {"frequency_penalty", R"(-1)"}, {"repetition_penalty", R"(1.1)"},
+            {"logit_bias", R"({"5":-100})"}, {"logprobs", R"(true)"}, {"top_logprobs", R"(3)"},
+            {"response_format", R"({"type":"json_object"})"}, {"parallel_tool_calls", R"(false)"}, {"tool_choice", R"("required")"},
+            {"tool_choice", R"({"type":"function","function":{"name":"f"}})"},
+        };
+        for (const auto& [key, value] : refused)
+            for (const char* route : {"/v1/chat/completions", "/v1/responses"}) {
+                if (std::string(route) == "/v1/responses" && key == "tool_choice") continue;  // the Responses translation refuses it itself
+                auto request = parse_json(std::string(route) == "/v1/responses" ? R"({"input":"Hi"})" : R"({"messages":[{"role":"user","content":"Hi"}]})");
+                request.set(key, parse_json(value));
+                const auto r = http(port, "POST", route, request.dump(), auth);
+                check(r.status == 400 && at(at(parse_json(r.body), "error"), "param").as_string() == key, "refused " + key + " on " + route + ": " + r.body);
+            }
+        auto strict = parse_json(R"({"messages":[{"role":"user","content":"Hi"}],"tools":[{"type":"function","function":{"name":"f","strict":true,"parameters":{"type":"object"}}}]})");
+        check(http(port, "POST", "/v1/chat/completions", strict.dump(), auth).status == 400, "strict chat tool refused");
+        const auto any = http(port, "POST", "/v1/messages", R"({"max_tokens":8,"messages":[{"role":"user","content":"Hi"}],"tool_choice":{"type":"any"}})", auth);
+        check(any.status == 400, "messages forced tool_choice refused");
+        for (const char* body : {R"({"input":"Hi","include":["reasoning.encrypted_content"]})", R"({"input":"Hi","truncation":"auto"})", R"({"input":"Hi","max_tool_calls":2})"})
+            check(http(port, "POST", "/v1/responses", body, auth).status == 400, std::string("responses refuses ") + body);
+        check(engine.prompts().size() == before, "refused requests never reach the engine");
+        const auto neutral = http(port, "POST", "/v1/chat/completions", R"({"messages":[{"role":"user","content":"Hi"}],"presence_penalty":0,"frequency_penalty":0,"logit_bias":{},"logprobs":false,"top_logprobs":0,"response_format":{"type":"text"},"parallel_tool_calls":true,"tool_choice":"auto"})", auth);
+        check(neutral.status == 200, "neutral values pass " + neutral.body);
+        const auto neutral_messages = http(port, "POST", "/v1/messages", R"({"max_tokens":8,"messages":[{"role":"user","content":"Hi"}],"tool_choice":{"type":"auto"}})", auth);
+        check(neutral_messages.status == 200, "messages auto tool_choice passes " + neutral_messages.body);
+    }
+    {
+        // A tool-call header cut before any call parses: no call, but the response is incomplete (unfinished_tool_call).
+        const auto header = parse_assistant_output("<tool_call>\n<function=nex", false, Json());
+        check(header.tool_calls.size() == 0U && header.unfinished_call, "parser keeps the unfinished header");
+        for (const bool stream : {false, true}) {
+            auto request = parse_json(R"({"input":"TOOL","stop":["_weather"],"tools":[{"type":"function","name":"get_weather","parameters":{"type":"object"}}]})");
+            request.set("stream", Json(stream));
+            const auto r = http(port, "POST", "/v1/responses", request.dump(), auth);
+            const Json response = stream ? at(sse_data(r.body).back(), "response") : parse_json(r.body);
+            check(at(response, "status").as_string() == "incomplete" &&
+                  at(at(response, "incomplete_details"), "reason").as_string() == "unfinished_tool_call", "cut header => incomplete " + r.body.substr(0, 300));
+        }
+        // Without tools an unclosed marker is plain text: the reply stays completed.
+        for (const bool stream : {false, true}) {
+            auto request = parse_json(R"({"input":"TOOL","stop":["_weather"]})"); request.set("stream", Json(stream));
+            const auto r = http(port, "POST", "/v1/responses", request.dump(), auth);
+            const Json response = stream ? at(sse_data(r.body).back(), "response") : parse_json(r.body);
+            check(at(response, "status").as_string() == "completed", "literal marker without tools stays completed");
+        }
+        // DeepSeek: a calls block that never closed is an unfinished call; a closed malformed one is not.
+        const std::string dsml = "\xEF\xBD\x9C" "DSML\xEF\xBD\x9C";
+        const auto ds_cut = parse_deepseek_v41_output("Answer.\n\n<" + dsml + " calls>\n<" + dsml + " invoke name=\"f\">\n", false, Json());
+        check(ds_cut.unfinished_call && ds_cut.tool_calls.size() == 0U, "deepseek unfinished calls block");
+        check(!parse_deepseek_v41_output("Answer.", false, Json()).unfinished_call, "deepseek plain answer finished");
+        check(http(port, "POST", "/v1/messages", R"({"max_tokens":8,"messages":[{"role":"user","content":"Hi"}],"output_config":{"effort":null,"format":null}})", auth).status == 200,
+              "messages output_config null members pass");
+        // Anthropic: tool_choice none renders no tools; unexecuted constraints are refused; the budget is stated.
+        const auto before = engine.prompts().size();
+        const auto plain = http(port, "POST", "/v1/messages", R"({"max_tokens":8,"messages":[{"role":"user","content":"Hi"}]})", auth);
+        const auto none = http(port, "POST", "/v1/messages", R"({"max_tokens":8,"messages":[{"role":"user","content":"Hi"}],"tools":[{"name":"f","input_schema":{"type":"object"}}],"tool_choice":{"type":"none"}})", auth);
+        const auto prompts = engine.prompts();
+        check(plain.status == 200 && none.status == 200 && prompts.size() == before + 2U && prompts[before] == prompts[before + 1U], "messages tool_choice none renders no tools");
+        for (const char* body : {
+                 R"({"max_tokens":8,"messages":[{"role":"user","content":"Hi"}],"tool_choice":{"type":"auto","disable_parallel_tool_use":true}})",
+                 R"({"max_tokens":8,"messages":[{"role":"user","content":"Hi"}],"tools":[{"name":"f","strict":true,"input_schema":{"type":"object"}}]})",
+                 R"({"max_tokens":8,"messages":[{"role":"user","content":"Hi"}],"thinking":{"type":"adaptive"}})",
+                 R"({"max_tokens":8,"messages":[{"role":"user","content":"Hi"}],"output_config":{"effort":"low"}})"})
+            check(http(port, "POST", "/v1/messages", body, auth).status == 400, std::string("messages refuses ") + body);
+        const auto budget = http(port, "POST", "/v1/messages", R"({"max_tokens":8,"messages":[{"role":"user","content":"Hi"}],"thinking":{"type":"enabled","budget_tokens":1024}})", auth);
+        check(budget.status == 200 && budget.body.find("budget_tokens not enforced") != std::string::npos, "thinking budget stated as not enforced");
+        const auto budget_stream = http(port, "POST", "/v1/messages", R"({"max_tokens":8,"stream":true,"messages":[{"role":"user","content":"Hi"}],"thinking":{"type":"enabled","budget_tokens":1024}})",
+            auth + "X-Test-Config: legacy\r\n");
+        check(budget_stream.body.find("budget_tokens not enforced") != std::string::npos, "budget note kept in a stream without receipts");
+        check(http(port, "POST", "/v1/messages", R"({"max_tokens":8,"messages":[{"role":"user","content":"Hi"}],"tool_choice":{"type":"auto","disable_parallel_tool_use":false}})", auth).status == 200,
+              "disable_parallel_tool_use false passes");
+        // Completions: one candidate, no suffix, no scores; chat: no legacy functions.
+        for (const char* body : {R"({"prompt":"Hi","max_tokens":4,"n":2})", R"({"prompt":"Hi","max_tokens":4,"best_of":2})",
+                 R"({"prompt":"Hi","max_tokens":4,"suffix":"end"})", R"({"prompt":"Hi","max_tokens":4,"logprobs":0})"})
+            check(http(port, "POST", "/v1/completions", body, auth).status == 400, std::string("completions refuses ") + body);
+        check(http(port, "POST", "/v1/completions", R"({"prompt":"Hi","max_tokens":4,"n":1,"best_of":1,"suffix":null,"logprobs":null})", auth).status == 200, "completions neutral values pass");
+        for (const char* body : {R"({"messages":[{"role":"user","content":"Hi"}],"functions":[{"name":"f","parameters":{"type":"object"}}]})",
+                 R"({"messages":[{"role":"user","content":"Hi"}],"function_call":{"name":"f"}})"})
+            check(http(port, "POST", "/v1/chat/completions", body, auth).status == 400, std::string("chat refuses ") + body);
+        // Responses: null is absent; verbosity other than medium is refused.
+        const auto nulls = http(port, "POST", "/v1/responses", R"({"input":"Hi","conversation":null,"instructions":null,"reasoning":{"effort":null},"text":{"verbosity":null,"format":null},"tools":[{"type":"function","name":"f","strict":null,"parameters":{"type":"object"}}],"tool_choice":null,"previous_response_id":null})", auth);
+        check(nulls.status == 200, "responses nullable fields " + nulls.body.substr(0, 200));
+        check(http(port, "POST", "/v1/responses", R"({"input":"Hi","reasoning":null})", auth).status == 200, "responses reasoning null");
+        check(http(port, "POST", "/v1/responses", R"({"input":"Hi","text":{"verbosity":"low"}})", auth).status == 400, "responses refuses verbosity low");
+    }
+    {
+        // A failed stream: response.failed, and no item carries a failed status.
+        const auto r = http(port, "POST", "/v1/responses", R"({"input":"ENGINE_ERROR","stream":true})", auth);
+        const auto events = sse_data(r.body);
+        check(at(events.back(), "type").as_string() == "response.failed", "failed stream ends response.failed");
+        for (const auto& e : events)
+            if (const auto* item = e.find("item"); item && item->find("status"))
+                check(at(*item, "status").as_string() != "failed", "items never carry a failed status");
+        // Output text carries (empty) logprobs arrays while token scores are unavailable.
+        const auto ok = sse_data(http(port, "POST", "/v1/responses", R"({"input":"Hi","stream":true})", auth).body);
+        int text_events = 0;
+        for (const auto& e : ok) {
+            const auto& type = at(e, "type").as_string();
+            if (type == "response.output_text.delta" || type == "response.output_text.done") { ++text_events; check(at(e, "logprobs").is_array(), "text event logprobs " + type); }
+            if (type == "response.content_part.done" && at(at(e, "part"), "type").as_string() == "output_text") check(at(at(e, "part"), "logprobs").is_array(), "output_text part logprobs");
+        }
+        check(text_events >= 2, "output text events seen");
+        // Reasoning summaries are refused before the engine runs.
+        const auto before = engine.prompts().size();
+        for (const char* body : {R"({"input":"Hi","reasoning":{"summary":"detailed"}})", R"({"input":"Hi","reasoning":{"generate_summary":"auto"}})"}) {
+            const auto rejected = http(port, "POST", "/v1/responses", body, auth);
+            check(rejected.status == 400 && rejected.body.find("reasoning.") != std::string::npos, "reasoning summary refused");
+        }
+        check(engine.prompts().size() == before, "refused summaries never reach the engine");
+    }
     {
         const auto r = http(port, "GET", "/health", "");
         check(r.status == 200 && at(parse_json(r.body), "status").as_string() == "ok", "health");

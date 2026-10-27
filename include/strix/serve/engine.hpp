@@ -122,7 +122,8 @@ public:
     void cancel() noexcept { cancelled_.store(true); notify(); }
     [[nodiscard]] bool cancelled() const noexcept { return cancelled_.load(); }
     // Waits for new tokens or completion (or the timeout); returns the new tokens.
-    std::vector<std::uint32_t> wait(std::chrono::milliseconds timeout, bool& done);
+    // wake_on_cancel false: a cancellation does not end the wait (a caller that cancelled waits for the finish)
+    std::vector<std::uint32_t> wait(std::chrono::milliseconds timeout, bool& done, bool wake_on_cancel = true);
     [[nodiscard]] GenerationStats stats() const;
     [[nodiscard]] std::string error() const;
     // Engine side.

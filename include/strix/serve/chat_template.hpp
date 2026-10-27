@@ -34,6 +34,10 @@ struct AssistantOutput {
     std::string reasoning;   // text before </think> when thinking is on
     std::string content;     // text after it, before the first tool call
     Json tool_calls;         // [{name, arguments(object)}]
+    // per tool call: its frame was closed (a call cut by the budget, a stop string or EOS is parsed but not closed);
+    // empty: every call is closed (parsers that only return closed calls)
+    std::vector<bool> call_complete;
+    bool unfinished_call = false;  // a tool-call frame did not close (whether or not a call could be parsed from it)
     bool reasoning_complete = false;
 };
 // thinking: the prompt ended with "<think>\n" (generation starts inside the reasoning block).

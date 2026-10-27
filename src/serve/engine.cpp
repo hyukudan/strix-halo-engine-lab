@@ -92,9 +92,9 @@ void GenerationTicket::notify() {
     changed_.notify_all();
 }
 
-std::vector<std::uint32_t> GenerationTicket::wait(std::chrono::milliseconds timeout, bool& done) {
+std::vector<std::uint32_t> GenerationTicket::wait(std::chrono::milliseconds timeout, bool& done, bool wake_on_cancel) {
     std::unique_lock lock(mutex_);
-    changed_.wait_for(lock, timeout, [&] { return done_ || !pending_.empty() || cancelled_.load(); });
+    changed_.wait_for(lock, timeout, [&] { return done_ || !pending_.empty() || (wake_on_cancel && cancelled_.load()); });
     std::vector<std::uint32_t> out;
     out.swap(pending_);
     done = done_;

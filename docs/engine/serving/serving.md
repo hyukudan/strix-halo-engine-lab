@@ -24,9 +24,17 @@ Serving runs on the tiled MTP route, so it takes the flags of a tiled MTP reques
 | `--http-api-key-file FILE` | none | require `Authorization: Bearer KEY` or `x-api-key: KEY` on the API routes |
 | `--http-batch N` | `0` | `1`..`8`: batched decoding with N request slots ([below](#batched-decoding)); `0`: one request at a time |
 | `--http-sampling greedy\|reject\|sample` | `greedy` | requests with `temperature > 0`: run greedy and say so in the response, answer 400, or sample (sampling-v1, batched route only) |
+| `--http-default-temperature X` | `0` (built-in) | Qwen HTTP default in [0, 2]; positive values require `--http-sampling sample` |
+| `--http-default-top-k N` | `0` (built-in) | Qwen HTTP default non-negative integer, at most 4294967295 |
+| `--http-default-top-p X` | `1` (built-in) | Qwen HTTP default in (0, 1] |
+| `--http-default-min-p X` | `0` (built-in) | Qwen HTTP default in [0, 1) |
 | `--http-default-max-tokens N` | `4096` | generation budget when a request gives none |
 | `--http-max-queue N` | `64` | waiting requests before new ones get 503 |
 | `--http-max-connections N` | `64` | open connections before new ones get 503 |
+| `--http-responses on\|off` | `on` | the stateless `POST /v1/responses` route ([below](#responses-stateless)); `off`: 404 |
+| `--http-capabilities on\|off` | `on` | `GET /v1/capabilities` and its `capabilities_id` in `/health`, `/v1/models`, `/api/status`; `off`: 404, no id |
+| `--http-stream-receipts on\|off` | `on` | the applied-policy `strix` object at the start and end of every stream ([below](#applied-policy-and-keepalive)); `off` together with `--http-sse-keepalive 0`: the previous build's bytes |
+| `--http-sse-keepalive SECONDS` | `10` | SSE comment `: keepalive` after this long without a write while a stream waits (queue, prefill, decode); `0`: none |
 
 The token IDs on the command line are the **calibration prompt**: its first
 `--mtp-calibration-rows R` pairs are replayed against the golden (`--mtp-golden`) to qualify the
@@ -64,6 +72,20 @@ when it stops.
   `/health` answers 503 and the process stops with a non-zero exit status.
 - Decoding is greedy unless the batched route samples (below). A request with `temperature > 0` is decoded greedy
   and the response carries `strix.note`; with `--http-sampling reject` it gets a 400 instead.
+
+Each sampling filter resolves independently: a non-null request value, then the configured server default,
+then the built-in value (`temperature: 0`, `top_k: 0`, `top_p: 1`, `min_p: 0`). The four default-filter flags
+are available on the Qwen command; the DeepSeek command remains greedy with built-in defaults.
+Temperature, top-p and min-p must be finite numbers in their advertised ranges, even during greedy decoding.
+Top-k must be a non-negative integer in uint32 range. Seed must be an integer in [0, 2^63); strings,
+fractions and negative seeds are refused with a 400 naming the field before submission.
+At temperature 0, filters do not change greedy argmax; non-neutral filters are accepted with the note
+`filters ignored at temperature 0 (greedy)`. Positive temperature on a greedy-only engine retains the
+configured downgrade or rejection policy.
+
+A sampled request without a seed receives an API-generated 63-bit seed. The engine uses that seed and
+the policy receipt echoes it. Reusing it reproduces the run with the same model, numerical identity,
+sampler and position-keyed uniforms. Greedy receipts omit the seed.
 
 ## Batched decoding
 
@@ -107,7 +129,9 @@ window stream shared by all slots. The calibration replay runs once.
 | `POST /v1/chat/completions` | chat; `stream` with server-sent events |
 | `POST /v1/completions` | raw prompt (text or token IDs); `stream` supported |
 | `POST /v1/messages` | Anthropic-compatible messages; `stream` with typed events |
-| `GET /v1/models` | the served model |
+| `POST /v1/responses` | OpenAI Responses format, stateless; `stream` with typed events |
+| `GET /v1/models` | the served model (with `capabilities_id`) |
+| `GET /v1/capabilities` | what this server executes: endpoints, sampling policy and modes, stream features, unavailable features |
 | `POST /tokenize`, `POST /detokenize` | `{"text"}` ↔ `{"tokens"}` with the model tokenizer |
 | `GET /health`, `GET /v1/health` | `{"status":"ok"}`, or 503 `{"status":"failed"}` after an engine failure |
 | `GET /metrics` | Prometheus text: request counters, token counters, queue depth, busy time |
@@ -130,6 +154,14 @@ window stream shared by all slots. The calibration replay runs once.
 - `tool_choice: "none"` renders no tools.
 - Other fields: `max_tokens` / `max_completion_tokens`, `stop` (string or list), `stream`,
   `stream_options.include_usage`, `n` (only 1), `temperature`, `top_p`, `top_k`, `seed`.
+- Generation fields the server does not execute yet are refused with a 400 naming the field, on every route:
+  non-zero `presence_penalty` / `frequency_penalty`, `repetition_penalty` other than 1, a non-empty `logit_bias`,
+  `logprobs` / `top_logprobs`, `response_format` other than text, `parallel_tool_calls: false`, `required` or named
+  `tool_choice` (Anthropic: `any` / `tool`, `disable_parallel_tool_use: true`), `strict` tools, legacy `functions` /
+  `function_call`; on completions also `n` / `best_of` other than 1, a `suffix` and a numeric `logprobs`; on
+  messages `thinking.type` other than `enabled` / `disabled` and non-null `output_config` members. Neutral values are accepted.
+  `thinking.budget_tokens` is accepted (the format requires it) and stated in `strix.note` as not enforced.
+  `GET /v1/capabilities` lists these features as unavailable.
 
 Streaming sends `reasoning_content` and `content` deltas as they are decoded (holding back only
 bytes that may belong to a stop string, a `</think>` or `<tool_call>` marker, an incomplete UTF-8
@@ -144,6 +176,48 @@ with `input_schema`, `thinking` (`{"type":"enabled"}` or `{"type":"disabled"}`),
 `end_turn`, `max_tokens`, `stop_sequence` or `tool_use`. Streaming emits `message_start`,
 `content_block_start`, `content_block_delta` (`thinking_delta`, `text_delta`, `input_json_delta`),
 `content_block_stop`, `message_delta` and `message_stop`.
+
+### Responses (stateless)
+
+`POST /v1/responses` is translated onto the chat route: `instructions` becomes the leading system message, `input`
+(a string or items) becomes the messages, function tools and `tool_choice` `auto`/`none` map to their chat forms,
+`reasoning.effort` to `reasoning_effort`, `max_output_tokens` to `max_tokens`. Message items take `input_text` /
+`output_text` parts; `function_call` items (their `arguments` string kept as given) join the preceding assistant turn,
+`function_call_output` items become tool messages matched by `call_id`, and plaintext `reasoning` items are attached
+to the following assistant message. The prompt token IDs equal those of the equivalent chat request (tested), so a
+Responses request generates the same tokens as its chat form.
+
+The route keeps no state: `previous_response_id`, `store: true`, `conversation` and `background` are refused with
+400, as are features the server does not execute yet: `text.format` other than text, `text.verbosity` other than
+`medium`, `strict: true` tools, `required` or named `tool_choice`, non-function tools, image or file input,
+encrypted-only reasoning, reasoning summaries, `include`, `truncation` other than `disabled`, `max_tool_calls`,
+unknown or duplicate `call_id`s; the 400 names the field. A `null` member counts as absent. The reply is a response
+object with `reasoning`, `message` and `function_call` output items, `status` `completed` or `incomplete`
+(`max_output_tokens`, or `unfinished_tool_call` when a stop string or the end of generation cut a tool call; such a
+call has `status: incomplete`), usage and `strix`. As on the chat route, text from a `<tool_call>` marker on is
+treated as tool framing, also when the model writes the marker literally. Streaming sends typed events (`event:` line + JSON with the same `type`
+and an increasing `sequence_number`): `response.created`, `response.in_progress`, `response.output_item.added`,
+`response.content_part.added`, `response.reasoning_text.delta`/`.done`, `response.output_text.delta`/`.done`,
+`response.function_call_arguments.delta`/`.done`, `response.content_part.done`, `response.output_item.done`, and
+exactly one of `response.completed`, `response.incomplete`, `response.failed`. There is no `[DONE]`.
+
+### Applied policy and keepalive
+
+With `--http-stream-receipts on` (the default), every response's `strix` object states the policy that ran: `sampling_requested` and `sampling_effective`
+(`greedy` or `sample`, with `note` when a sampled request ran greedy), `filters` (each of `temperature`,
+`top_k`, `top_p`, `min_p` has a resolved `value` and `source`: `request`, `server` or `builtin`),
+`seed` for sampled runs, `max_tokens_requested` and
+`max_tokens_effective`, and the stream settings. A stream carries it in its first event (chat: the role chunk;
+messages: `message_start.message`; responses: `response.created`; completions: the first chunk) and its last,
+whether or not `stream_options.include_usage` is set. `GET /v1/capabilities` (`"object":"strix.capabilities"`,
+`"version":1`) lists what the server executes and marks every feature it does not as `false`; its
+`capabilities_id` is a hash of the document. `sampling.defaults` reports each effective server default
+with its `value` and `source` (`server` or `builtin`), and `sampling.seed_echo: true` advertises seed receipts.
+
+While a stream waits for tokens (queued, during a long prefill, between decode steps) and nothing was written for
+`--http-sse-keepalive` seconds, the server writes the SSE comment `: keepalive`, which clients ignore and proxies
+count as activity. A request turns it off with `"strix": {"keepalive": false}`. Neither the receipts nor the
+keepalive change scheduling or generated tokens (GPU-gated: token IDs equal with them on and off).
 
 ### Engine fields
 

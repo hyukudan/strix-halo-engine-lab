@@ -334,6 +334,7 @@ std::string render_deepseek_v41_chat(const ChatTemplateInput& input) {
 AssistantOutput parse_deepseek_v41_output(const std::string& text, bool thinking, const Json& tools) {
     (void)tools;
     AssistantOutput out;
+    out.tool_calls = Json::array();  // also when the reply ends inside the thinking block
     std::size_t at = 0;
     if (thinking) {
         const auto end = text.find(kThinkEnd);
@@ -348,7 +349,6 @@ AssistantOutput parse_deepseek_v41_output(const std::string& text, bool thinking
     const std::string calls_start = "\n\n<" + kDsml + kCallsBlock;
     const auto calls = text.find(calls_start, at);
     out.content = text.substr(at, calls == std::string::npos ? std::string::npos : calls - at);
-    out.tool_calls = Json::array();
     if (calls == std::string::npos) return out;
     // parse_tool_calls: a malformed block leaves the whole text as content
     const std::string block_end = "</" + kDsml + kCallsBlock + ">", call_start = "<" + kDsml + kInvoke, call_end = "</" + kDsml + kInvoke;
@@ -420,6 +420,8 @@ AssistantOutput parse_deepseek_v41_output(const std::string& text, bool thinking
     } catch (const ChatTemplateError&) {
         out.content = text.substr(at);
         out.tool_calls = Json::array();
+        // a calls block that never closed (cut by the budget, a stop string or EOS) is an unfinished call
+        if (text.find("</" + kDsml + kCallsBlock + ">", calls) == std::string::npos) out.unfinished_call = true;
     }
     return out;
 }
