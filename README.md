@@ -20,7 +20,8 @@ This is our own C++/HIP inference engine for **AMD Strix Halo** (Ryzen AI Max+ 3
   42-45 tok/s) and **91.3 tok/s** with the RTX PRO (2026-10-26); the 2026-10-26 pair build reaches **113.9 tok/s** aggregate (N8, calculated).
 - **MiniMax M3.1 Flash** on the pair has passed its eight-text quality gate; greedy decode takes
   **44.57 ms/token at 1K**; fresh 8K prefill takes **17.73 s**. **GLM-5.3 Flash** reaches
-  **22.1 tok/s** in the measured R1 identity on its latest measured build (2026-10-26; conditions below).
+  **22.1 tok/s** in the measured R1 identity on its latest measured build (2026-10-26), and with MTP
+  self-speculation, now on by default, **37.1 / 44.5 / 40.0 tok/s** on chat / code / JSON (2026-10-27; conditions below).
 - **DeepSeek on an RTX PRO 6000 (96 GB, Windows WDDM)** runs the target and DSpark draft on that GPU,
   with an exclusive VRAM + pinned-host cache: exact decode **82–95 tok/s** for code; same-load code / English /
   Spanish rates are **82.3 / 87.7 / 94.4 tok/s** (2026-10-25; conditions below).
@@ -109,7 +110,7 @@ The command produces a JSON receipt with token IDs and timing. Actual model file
 | DeepSeek V4.1 Flash + RTX PRO 6000 | RTX PRO (layers 0-21) + 2 nodes (22-39) | **Production** (D-064) | Pipeline split over 1 GbE, CUDA prefill service, hot-expert placement |
 | DeepSeek V4.1 Flash, standalone RTX | RTX PRO 6000 (96 GB, Windows WDDM) | **Production** | Q2 GGUF experts, Q8_0 dense; exclusive VRAM + pinned-host cache; on-GPU DSpark with warm controller selected as the speculative default |
 | MiniMax M3.1 Flash (EXL3, 3.06 bpw) | 2 nodes TP2 over USB4 | **Production** | Eight-text quality gate passed; exact prefill and decode; qualified prefill and exchange optimizations on by default |
-| GLM-5.3 Flash (EXL3, 4.05 bpw) | 2 nodes TP2 over USB4 | **Production** | R1b decode identity by default; exact R1 chunked prefill; `--identity r1` restores R1; R≥3 fix verified on the pair |
+| GLM-5.3 Flash (EXL3, 4.05 bpw) | 2 nodes TP2 over USB4 | **Production** | R1b decode identity by default; exact MTP self-speculation by default; exact R1 chunked prefill; `--identity r1` restores R1; R≥3 fix verified on the pair |
 
 The core knows no model: each family is a module with its own contract, plan, kernels and gates
 ([docs/models/model-families.md](docs/models/model-families.md)). The automatic profiles only admit the pinned model files listed in
@@ -422,7 +423,8 @@ qualification is conditional on those eight texts; it supersedes the earlier two
 
 ### GLM-5.3 Flash
 
-EXL3 4.05 bpw, two Strix Halo nodes TP2 over USB4. Production engine. R1b is the default decode identity; prompts use exact R1 chunked prefill.
+EXL3 4.05 bpw, two Strix Halo nodes TP2 over USB4. Production engine. R1b is the default decode identity; prompts use exact R1 chunked prefill;
+decode uses exact MTP self-speculation by default (`--mtp 0` = plain decode).
 `--identity r1` restores R1 throughout. The historical R1 measurements below keep their original identity.
 
 | Mode | Prompt / context | Measured | Date | Build / exactness |
@@ -431,6 +433,7 @@ EXL3 4.05 bpw, two Strix Halo nodes TP2 over USB4. Production engine. R1b is the
 | Batch decode, R1 | Eight independent rows, benchmark context unspecified | **122.0 ms/step = 65.5 tok/s aggregate** | 2026-10-26 | `1836c99c`; tokens equal the earlier real-pair reference |
 | Exact chunked prefill | 1K / 8K / 32K benchmark prompts, kind unspecified | TTFT **4.268 / 34.70 / 144.75 s** (240 / 236 / 226 tok/s) | 2026-10-26 | `875ca821`, integrated in `41d8cfdc`; both ranks' logits bitwise equal the previous exact prefill |
 | R1b-fast, now the default decode identity | Same chat benchmark, 96-token alternating comparison | **41.93–41.96 ms/token**, vs R1 47.33–47.48 (**−11.5 %**, **55 %** of 23.2 ms floor) | 2026-10-26 | `8877de1d`; stable within each identity, not bitwise to R1 |
+| MTP self-speculation (default) | Chat / code / JSON prompts, 64–128 generated tokens, rank 0 | **26.98 / 22.46 / 24.98 ms/token = 37.1 / 44.5 / 40.0 tok/s** (1.50× / 1.79× / 1.62× plain 40.3–40.6 ms/token); TTFT 8K **31.13 s** (+2.9 %), 32K **140.9 s** (+8.7 %: MTP cache fill of the extra layer) | 2026-10-27 | Full token vectors and prompt logits equal `--mtp 0` on 7 prompts, both ranks; plain TTFT unchanged |
 | R1b teacher-forced agreement | 32 prompts, 256 positions each; chat, code, JSON, math, reasoning, translation | **8,126/8,192 = 99.19 %** top-1; mean KL **~1.8e-3 nats** | 2026-10-26 | `4dad4c19`; free runs diverge on **28/32** prompts within 19–227 tokens |
 
 The R≥3 buffer fix is verified on the real pair. The latest integration uses direct exchange for plain
@@ -604,6 +607,7 @@ Full item lists, preconditions, notices and evidence: [optimization catalog](doc
 | MiniMax: decode/exchange | Wide MoE, concurrent index, fused boundaries | On (27-item resolver) | Boundary set: 48.56 → 44.40 ms/token | Built-in gates | `STRIX_MM_BASELINE=1` |
 | MiniMax: prefill/transport | v4 core, batching, pipeline, CRC overlap | On/auto | Prefill bundle: 8K TTFT −20% | Bitwise gates | Per-item off values; see catalog |
 | GLM: R1b decode | Faster FP32 summation identity | On | 41.93–41.96 vs R1 47.33–47.48 ms/token | Own identity; differs from R1 | `--identity r1` |
+| GLM: MTP self-speculation | Native MTP drafter + verify on the exchange, KDA verify tree 2, chunked MTP-fill prefill, adaptive K | On | Decode 1.50–1.79× (37.1–44.5 tok/s); TTFT +2.9 % at 8K, +8.7 % at 32K | Tokens equal plain decode | `--mtp 0`; [catalog](docs/optimizations.md#glm-mtp-spec) |
 | GLM: exact chunked prefill | R1 gemv identity, MoE/MLA/indexer kernels, two-layer pipeline with async exchange, 4096-row chunks | Auto (18 env items) | 8K: 30.1 s (273 tok/s); 32K: 128.4 s (255 tok/s) | R1 bitwise | `--prefill ref`; `--baseline` |
 | Qwen server: constrained JSON output | `json_object` / JSON-schema answers valid by construction (greedy, serial host route) | On (opt-in per request) | Usability (no speed claim) | Exact to its constrained target; other requests unchanged | `--http-constraints off`; [catalog](docs/optimizations.md#qwen-serve-constraints) |
 | Qwen/DeepSeek server: API surface | Stateless `/v1/responses`, `/v1/capabilities`, applied policy (filters, echoed seed) in every stream, SSE keepalive | On | Usability (no speed claim) | Same token IDs on/off | `--http-responses off` etc.; [catalog](docs/optimizations.md#qwen-serve-api) |

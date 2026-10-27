@@ -23,65 +23,6 @@ namespace {
 constexpr std::uint64_t kAlign = 4096;
 constexpr std::uint64_t kBounce = std::uint64_t{64} << 20;
 
-struct JsonParser {
-    const char* p;
-    const char* end;
-    void ws() { while (p < end && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) ++p; }
-    Json parse() {
-        ws();
-        if (p >= end) throw std::runtime_error("json: eof");
-        if (*p == '{') {
-            ++p;
-            JsonObj o;
-            ws();
-            if (*p == '}') { ++p; return {o}; }
-            for (;;) {
-                ws();
-                std::string k = string();
-                ws();
-                if (*p++ != ':') throw std::runtime_error("json: ':'");
-                o.emplace(std::move(k), parse());
-                ws();
-                if (*p == ',') { ++p; continue; }
-                if (*p++ != '}') throw std::runtime_error("json: '}'");
-                return {o};
-            }
-        }
-        if (*p == '[') {
-            ++p;
-            JsonArr a;
-            ws();
-            if (*p == ']') { ++p; return {a}; }
-            for (;;) {
-                a.push_back(parse());
-                ws();
-                if (*p == ',') { ++p; continue; }
-                if (*p++ != ']') throw std::runtime_error("json: ']'");
-                return {a};
-            }
-        }
-        if (*p == '"') return {string()};
-        if (std::strncmp(p, "null", 4) == 0) { p += 4; return {nullptr}; }
-        if (std::strncmp(p, "true", 4) == 0) { p += 4; return {1.0}; }
-        if (std::strncmp(p, "false", 5) == 0) { p += 5; return {0.0}; }
-        char* e = nullptr;
-        const double d = std::strtod(p, &e);
-        if (e == p) throw std::runtime_error("json: value");
-        p = e;
-        return {d};
-    }
-    std::string string() {
-        if (*p++ != '"') throw std::runtime_error("json: string");
-        std::string s;
-        while (*p != '"') {
-            if (*p == '\\') { ++p; s += *p == 'n' ? '\n' : *p; ++p; continue; }
-            s += *p++;
-        }
-        ++p;
-        return s;
-    }
-};
-
 std::string read_text(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("cannot open " + path);
@@ -122,11 +63,6 @@ float bf16f(std::uint16_t b) {
 }
 
 }  // namespace
-
-Json parse_json(const char* begin, const char* end) {
-    JsonParser jp{begin, end};
-    return jp.parse();
-}
 
 PackReader::PackReader(std::string dir) : dir_(std::move(dir)) {
     const std::string idx = read_text(dir_ + "/model.safetensors.index.json");

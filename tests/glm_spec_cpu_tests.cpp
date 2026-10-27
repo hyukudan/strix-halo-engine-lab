@@ -9,12 +9,18 @@
 // Plus: accept_greedy cases; MTP layer composition: one call over R rows == R single-row calls (bitwise), and rollback.
 // usage: glm_spec_cpu_tests [tokens=2300] [seed=7] [mutant=0]   (mutant 1..3 must FAIL: the checks are not vacuous)
 #include "glm/spec/glm_spec_host.hpp"
+#include "glm/spec/glm_spec_merge.hpp"
+
+#include <bit>
+#include <cmath>
+#include <stdexcept>
 
 #include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -661,11 +667,161 @@ void test_mtp_cycles(std::uint64_t seed, bool share_on, unsigned T) {
 
 }  // namespace
 
+void test_adaptive() {
+    auto table = seeded_cost_table();
+    check(valid_cost_table(table), "adaptive measured seed is valid");
+    float wire[11] = {};
+    store_cost_table(table, wire);
+    CostTable merged;
+    check(load_cost_table(wire, 17, merged) && merged.version == 17 && merged.catchup_ms == 3.1F,
+          "adaptive wire layout includes catch-up and version");
+    Calibration calibration;
+    check(calibration.probability(1, 0.5F) == 0.90F && calibration.probability(2, 0.5F) == 0.80F &&
+          calibration.probability(3, 0.5F) == 0.70F, "calibration virtual priors");
+    calibration.observe(1, 0.5F, false);
+    check(calibration.probability(1, 0.5F) < 0.9F && calibration.probability(1, 0.1F) == 0.9F,
+          "calibration updates only reached confidence bin");
+    check(Calibration{}.probability(1, 0.5F) == 0.9F, "calibration resets per prompt");
+    check(calibration.probability(2, -1) == calibration.probability(2, 0) &&
+          calibration.probability(2, 2) == calibration.probability(2, 1), "confidence bins clamp");
+    check(draft_limit(99, 100, 5, 100) == 7 && draft_limit(3, 1, 5, 100) == 0 &&
+          draft_limit(3, 0, 5, 100) == 0 && draft_limit(3, 10, 99, 100) == 0 &&
+          draft_limit(3, 10, 101, 100) == 0 && draft_limit(3, 3, 5, 100) == 2,
+          "adaptive launch limits clamp budget, capacity, K and underflow");
+    WindowEstimate w{1, 0.9F, 1.9F, table.verify_ms[2] + table.catchup_ms};
+    check(window_extend(table, w, 0.8F, 3), "adaptive extension uses current predicted throughput");
+    check(!window_extend(table, w, 0.0F, 3) && !window_extend(table, w, 1, 1), "adaptive closes at low survival or Kmax");
+    // Two deliberately unrelated local clocks/publishers; decisions consume only a returned rank-0 packet.
+    auto local0 = table, local1 = table;
+    bool identical = true;
+    for (unsigned i = 0; i < 32; ++i) {
+        observe_cost(local0, 2, 40 + i);
+        observe_cost(local1, 2, 4000 + 20 * i);
+        store_cost_table(local0, wire);
+        CostTable a, b;
+        identical = identical && load_cost_table(wire, local0.version, a) && load_cost_table(wire, local0.version, b);
+        identical = identical && window_extend(a, w, 0.8F, 3) == window_extend(b, w, 0.8F, 3);
+    }
+    check(identical && local0.verify_ms[2] != local1.verify_ms[2], "identical merged inputs ignore differing local timings");
+    {  // a window that only verifies R = 4 keeps R = 3 one slope below it (no stale-seed K lock-in)
+        auto t = seeded_cost_table();
+        for (unsigned i = 0; i < 64; ++i) observe_cost(t, 4, 60.0);
+        const float d = t.verify_ms[4] - t.verify_ms[3];
+        check(t.verify_ms[4] < 61.0F && d > 9.0F && d < 11.0F && t.verify_ms[1] < t.verify_ms[3],
+              "unsampled verify rows follow the sampled row by the seed slope");
+        for (unsigned i = 0; i < 64; ++i) observe_cost(t, 3, 52.0);
+        const float d2 = t.verify_ms[4] - t.verify_ms[3];
+        check(d2 > 7.0F && d2 < 9.0F && std::fabs((t.verify_ms[3] - t.verify_ms[2]) - d2) < 0.01F,
+              "two sampled rows set the slope for the unsampled ones");
+        // chat-like acceptance (n2 traces: survival to depth 3 ~0.61, conditional 0.63) closes at K2 under the
+        // measured table; code-like (0.85 / 0.86) extends to K3.
+        const auto m = seeded_cost_table();
+        const float c2 = m.verify_ms[3] + m.step_ms + m.catchup_ms;
+        check(!window_extend(m, WindowEstimate{2, 0.61F, 1.0F + 0.84F + 0.61F, c2}, 0.63F, 3) &&
+                  window_extend(m, WindowEstimate{2, 0.85F, 1.0F + 0.92F + 0.85F, c2}, 0.86F, 3),
+              "measured table: chat stops at K2, code extends to K3");
+    }
+    observe_cost(table, 2, 1000);
+    check(valid_cost_table(table) && table.verify_ms[8] >= table.verify_ms[2], "EMA publication enforces monotone verify costs");
+    store_cost_table(table, wire);
+    wire[9] = 0;
+    check(!load_cost_table(wire, 99, merged), "invalid merged table rejected for fixed-K fallback");
+    wire[9] = std::numeric_limits<float>::quiet_NaN();
+    check(!load_cost_table(wire, 99, merged), "NaN table rejected");
+    store_cost_table(table, wire);
+    wire[3] = wire[2] - 1;
+    check(!load_cost_table(wire, 99, merged), "nonmonotone merged table rejected");
+}
+
+
+// Retained CommExchange inline arithmetic: an independent oracle for the extracted helper.
+void old_inline_merge(std::span<MergeRow> rows, MergeCtl& ctl, std::span<const MergeRow> peer,
+                      const MergeCtl& pc, std::uint32_t rank) {
+    const MergeCtl& c0 = rank == 0 ? ctl : pc;
+    const MergeCtl& c1 = rank == 0 ? pc : ctl;
+    MergeCtl out = c0;
+    out.replay_flag = c0.replay_flag | c1.replay_flag;
+    out.mtp_max = std::max(c0.mtp_max, c1.mtp_max);
+    out.mtp_sum = c0.mtp_sum * std::exp(c0.mtp_max - out.mtp_max) + c1.mtp_sum * std::exp(c1.mtp_max - out.mtp_max);
+    ctl = out;
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        const MergeRow p = peer[r];
+        const MergeRow& a = rank == 0 ? rows[r] : p;
+        const MergeRow& b = rank == 0 ? p : rows[r];
+        MergeRow m = (b.value > a.value || (b.value == a.value && b.id < a.id)) ? b : a;
+        m.flag = a.flag | b.flag;
+        rows[r] = m;
+    }
+}
+
+void test_merge_rank_order() {
+    // All candidates are NaN-free; infinities are excluded here too (head checkpoint owns C5).
+    const std::array<MergeRow, 8> r0{{{1, 9, 1}, {2, 8, 2}, {3, 7, 4}, {0.0F, 5, 8},
+                                    {-0.0F, 6, 16}, {-4, 3, 32}, {0.0F, 2, 64}, {-0.0F, 1, 128}}};
+    const std::array<MergeRow, 8> r1{{{2, 10, 2}, {2, 7, 4}, {3, 8, 8}, {-0.0F, 5, 16},
+                                    {0.0F, 6, 32}, {-5, 2, 64}, {-0.0F, 1, 128}, {0.0F, 2, 256}}};
+    const std::array<unsigned, 8> ids{10, 7, 7, 5, 6, 3, 1, 1};
+    const std::array<float, 6> maxima{-0.0F, 0.0F, -100.25F, 13.125F, 0.0001F, 88.0F};
+    for (unsigned n = 1; n <= 8; ++n) for (float m0 : maxima) for (float m1 : maxima) {
+        MergeCtl c0{}, c1{};
+        c0.cycle = c1.cycle = 17;
+        c0.step = c1.step = 3;
+        c0.kind = c1.kind = 2;
+        c0.replay_flag = 2; c1.replay_flag = 8;
+        c0.table_version = 19; c1.table_version = 99;
+        for (unsigned j = 0; j < 11; ++j) { c0.table[j] = static_cast<float>(j + 1); c1.table[j] = -1; }
+        c0.mtp_max = m0; c1.mtp_max = m1;
+        c0.mtp_sum = 1.234567F; c1.mtp_sum = 17.76543F;
+        auto expected = r0;
+        auto ec = c0;
+        old_inline_merge({expected.data(), n}, ec, {r1.data(), n}, c1, 0);
+        for (std::uint32_t rank = 0; rank < 2; ++rank) {
+            auto mine = rank == 0 ? r0 : r1;
+            const auto& peer = rank == 0 ? r1 : r0;
+            auto ctl = rank == 0 ? c0 : c1;
+            const auto& pc = rank == 0 ? c1 : c0;
+            auto oracle = mine;
+            auto oc = ctl;
+            old_inline_merge({oracle.data(), n}, oc, {peer.data(), n}, pc, rank);
+            merge_rank_order({mine.data(), n}, ctl, {peer.data(), n}, pc, rank);
+            check(std::memcmp(mine.data(), oracle.data(), n * sizeof(MergeRow)) == 0, "merge row inline oracle");
+            check(std::memcmp(&ctl, &oc, sizeof(ctl)) == 0, "merge ctl inline oracle / sum bits");
+            check(std::memcmp(mine.data(), expected.data(), n * sizeof(MergeRow)) == 0, "merge both rank orientations");
+            check(std::memcmp(&ctl, &ec, sizeof(ctl)) == 0, "merge rank agreement / table ownership");
+            check(ctl.replay_flag == 10 && ctl.table_version == 19, "merge replay OR / rank-0 version");
+            for (unsigned j = 0; j < n; ++j) {
+                check(std::isfinite(mine[j].value), "merge NaN-free candidates");
+                check(mine[j].id == ids[j] && mine[j].flag == (r0[j].flag | r1[j].flag), "merge R18 / row OR");
+            }
+            if (n >= 5) {
+                check(std::bit_cast<std::uint32_t>(mine[3].value) == 0, "merge +0 rank-0 tie");
+                check(std::bit_cast<std::uint32_t>(mine[4].value) == 0x80000000U, "merge -0 rank-0 tie");
+            }
+            for (unsigned field = 0; field < 3; ++field) {
+                auto bad = pc;
+                if (field == 0) ++bad.cycle;
+                if (field == 1) ++bad.step;
+                if (field == 2) ++bad.kind;
+                auto untouched = mine;
+                auto before = ctl;
+                bool threw = false;
+                try { merge_rank_order({mine.data(), n}, ctl, {peer.data(), n}, bad, rank); }
+                catch (const std::runtime_error&) { threw = true; }
+                check(threw, "merge control mismatch throws");
+                check(std::memcmp(&before, &ctl, sizeof(ctl)) == 0 &&
+                      std::memcmp(mine.data(), untouched.data(), sizeof(mine)) == 0, "mismatch leaves output untouched");
+            }
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     const unsigned total = argc > 1 ? static_cast<unsigned>(std::stoul(argv[1])) : 2300;
     const std::uint64_t seed = argc > 2 ? std::stoull(argv[2]) : 7;
     g_mutant = argc > 3 ? std::stoi(argv[3]) : 0;
     try {
+        test_merge_rank_order();
+        test_adaptive();
         test_accept();
         test_equivalence(total, seed);
         test_mtp(seed + 1);

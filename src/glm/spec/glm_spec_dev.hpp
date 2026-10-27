@@ -15,12 +15,13 @@ namespace strix::glm::dev {
 //   In/out: S [heads][128][128] and conv_state [3C][3] are the COMMITTED state: on return they hold the state after the
 //   replay rows (stored once); the new rows run on registers and are never stored.
 //   Out: scr_new / beta_new (keep them: next call's replay inputs), o [n_new][heads][128] scratch, y [n_new][C].
+//   tree: 0 reads STRIX_GLM_SPEC_KDA_TREE once (only "2" opts in); 1/2 explicitly select a schedule for qualification.
 //   Non-finite: replay rows -> flag (committed checkpoint C2); new rows -> row_flag[r] (the caller aborts only if a
 //   committed row is flagged; rejected rows' flags are ignored). n_new = 0 is a flush.
 void kda_verify(const KdaDev& k, const float* qkv_rep, const float* scr_rep, const float* beta_rep, unsigned n_rep,
                 const float* qkv, const float* f, const float* gate, const float* b, unsigned n_new, float* S,
                 float* conv_state, float* scr_new, float* beta_new, float* o, float* y, unsigned* flag, unsigned* row_flag,
-                hipStream_t s);
+                hipStream_t s, unsigned tree = 0);
 
 // DSA append of R consecutive positions t0 .. t0+R-1 of ONE slot (R <= 8): stores every row (latent, key, gate), then
 // completes the pools closed inside the block (pure functions of their 4 stored tokens: equal to R sequential appends).

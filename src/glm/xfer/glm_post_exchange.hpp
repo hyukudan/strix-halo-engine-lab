@@ -16,10 +16,10 @@ namespace strix::glm::xfer {
 
 // `peer` == nullptr: the peer partial is view.payload and every block waits in-kernel for it (recv_view()).
 void post_expand(const float* X, const float* mix, const float* local, const float* peer, const RxView& view, unsigned rank,
-                 float* Xout, unsigned* flag, unsigned rows, hipStream_t s);
+                 float* Xout, unsigned* flag, unsigned rows, hipStream_t s, unsigned flag_stride = 0);
 void hc_bracket(const float* X, const float* mix, float* B, unsigned rows, hipStream_t s);
 void post_expand_bracket(const float* B, const float* mix, const float* local, const float* peer, const RxView& view,
-                         unsigned rank, float* Xout, unsigned* flag, unsigned rows, hipStream_t s);
+                         unsigned rank, float* Xout, unsigned* flag, unsigned rows, hipStream_t s, unsigned flag_stride = 0);
 
 // Tier A dev::hc_pre with the R6 mix (sigmoids, row softmax, 20 sinkhorn rounds) on 24 lanes of one wave instead of
 // lane 0: lane t < 16 owns comb element t, lanes 16..23 own pre / post; row and column sums are gathered with

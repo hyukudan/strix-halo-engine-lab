@@ -58,6 +58,11 @@ struct CostTable {
     float plain_ms = 0.0F;
     float verify_ms[9] = {};   // verify of R = 1..8 new rows (index R), replay averaged in by rank 0
     float step_ms = 0.0F;      // one MTP extension step
+    float catchup_ms = 0.0F;   // mean MTP catch-up (wire table[10])
+    // Publisher only (not on the wire): verify samples per R. Unsampled rows follow the sampled ones by the fitted
+    // per-row slope, so a window that only ever verifies R rows cannot leave R-1 at a stale seed (which made the
+    // marginal cost of the last draft look ~4 ms instead of ~10 ms and locked adaptive K at Kmax).
+    std::uint32_t verify_samples[9] = {};
 };
 // After draft step k (1-based) with cumulative merged survival estimate s_k (product of confidences so far): draft
 // step k+1 iff s_k * conf_next_estimate is worth its marginal cost. The rule used: extend iff
@@ -65,6 +70,26 @@ struct CostTable {
 // Gate (no draft at all this cycle, verify = plain row): draft iff conf_1 * plain_ms > verify_ms[2] - verify_ms[1].
 bool window_extend(const CostTable& t, float survival_k, unsigned k, unsigned kmax);
 bool window_gate_open(const CostTable& t, float conf1);
+
+// Adaptive state is replicated; only the publisher observes local wall times. Wire table[0] is plain,
+// [1..8] is verify R, [9] is extension, [10] is catch-up. Invalid packets select the runner's fixed-K fallback.
+// Extend when S_next * (C_k / E_k) exceeds 1.03 times the incremental verify + extension cost.
+struct WindowEstimate { unsigned k = 0; float survival = 1, expected = 1, cycle_ms = 0; };
+bool window_extend(const CostTable&, const WindowEstimate&, float p_next, unsigned kmax);
+bool valid_cost_table(const CostTable&);
+CostTable seeded_cost_table();
+void store_cost_table(const CostTable&, std::span<float, 11>);
+bool load_cost_table(std::span<const float, 11>, std::uint32_t version, CostTable&);
+void observe_cost(CostTable&, unsigned wire_index, double elapsed_ms);
+unsigned draft_limit(unsigned kmax, unsigned remaining, std::uint64_t p, std::uint64_t capacity);
+class Calibration {
+public:
+    float probability(unsigned depth, float confidence) const;
+    void observe(unsigned depth, float confidence, bool accepted);
+private:
+    static unsigned bin(float confidence);
+    std::uint32_t trials_[8][8] = {}, successes_[8][8] = {};
+};
 
 // ---- KDA rows of one slot with deferred replay (design notes section 3.2).
 // The committed state lags the committed text by the `pending` rows of the last verify (rows 0 .. m). The next verify
