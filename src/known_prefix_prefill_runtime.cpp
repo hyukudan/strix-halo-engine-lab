@@ -74,6 +74,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         require(rows>=16U&&rows%8U==0U&&rows<=plan.logical_rows&&plan.output_policy!=KnownWindowOutputPolicy::all_rows,
             "known prefill partial block needs 16..T rows in multiples of 8 and a terminal-row or state-only plan");
     require(hooks.preflight_scope&&hooks.complete&&hooks.quiesce_or_fail_stop,"known prefill requires scope/completion/fail-stop hooks");
+    require(!hooks.yield_point || (hooks.bundle_closed && !hooks.preflight_only),"prefill service requires native bundle closure outside admission");
     if(session.health!=SerialSessionHealth::ready) throw std::logic_error("known prefill requires a ready serial session");
     require(session.execution_identity==serial.execution_identity&&session.execution_identity,"known prefill source session identity differs");
     // Every row context binds these model objects: the launch's tensor lookups skip re-validating
@@ -297,7 +298,10 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             require(row<rows,"known prefill observer row is outside the block");return context(step,row);});
     };
     try {
+        bool completed_layer=false;
         for(std::size_t step=0;step<steps;++step) {
+            if(step && serial.execution.steps[step-1U].op==SerialOp::mlp_inject) completed_layer=true;
+            if(completed_layer && hooks.yield_point && hooks.bundle_closed()) {hooks.yield_point(step);completed_layer=false;}
             const auto& source=serial.execution.steps[step];
             if(!result.execution.state.contains(source.reads_state)) throw std::logic_error("known prefill persistent state disappeared after admission");
             const auto mode=plan.tile8.mode[step];const auto id=static_cast<std::uint32_t>(plan.tile8.r2_variant[step]);
@@ -403,6 +407,9 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         hooks.complete();lap("complete");materialize(context(steps-1U,rows-1U),post-1U);
         std::uint64_t final_position=0;std::memcpy(&final_position,reinterpret_cast<const void*>(position.address),sizeof(final_position));
         if(final_position!=post-1U) throw std::logic_error("known prefill final host position differs from completed row frontier");
+    } catch(const KnownPrefillCancelled&) {
+        if(resources.ple_lookup&&resources.ple_prefetch) cancel_ple_lookup_prefetch(*resources.ple_lookup,*resources.ple_prefetch);
+        session.health=SerialSessionHealth::poisoned;session.arithmetic_lineage.tainted=true;throw;
     } catch(...) {
         if(resources.ple_lookup&&resources.ple_prefetch) cancel_ple_lookup_prefetch(*resources.ple_lookup,*resources.ple_prefetch);
         session.health=SerialSessionHealth::poisoned;session.arithmetic_lineage.tainted=true;
@@ -422,6 +429,7 @@ std::vector<KnownWindowResult> execute_known_prefix_prefill_segments_eager(const
     const auto count=segments.size();
     require(count>=1U,"segmented prefill requires a segment");
     require(hooks.preflight_scope&&hooks.complete&&hooks.quiesce_or_fail_stop,"segmented prefill requires scope/completion/fail-stop hooks");
+    require(!hooks.yield_point || (hooks.bundle_closed && !hooks.preflight_only),"prefill service requires native bundle closure outside admission");
     require(!hooks.preflight_only&&!hooks.before_step&&!hooks.after_step&&!hooks.record_actual_window_lineage,
         "segmented prefill takes its observers through the segment hooks");
     require(plan.output_policy!=KnownWindowOutputPolicy::all_rows,"segmented prefill does not deliver every row's logits");
@@ -651,7 +659,10 @@ std::vector<KnownWindowResult> execute_known_prefix_prefill_segments_eager(const
         result.r2_variant_dispatches[id]+=tiles;
     };
     try {
+        bool completed_layer=false;
         for(std::size_t step=0;step<steps;++step) {
+            if(step && serial.execution.steps[step-1U].op==SerialOp::mlp_inject) completed_layer=true;
+            if(completed_layer && hooks.yield_point && hooks.bundle_closed()) {hooks.yield_point(step);completed_layer=false;}
             const auto& source=serial.execution.steps[step];
             for(std::size_t s=0;s<count;++s)
                 if(!results[s].execution.state.contains(source.reads_state)) throw std::logic_error("segmented prefill persistent state disappeared after admission");
@@ -729,6 +740,12 @@ std::vector<KnownWindowResult> execute_known_prefix_prefill_segments_eager(const
             std::uint64_t final_position=0;std::memcpy(&final_position,reinterpret_cast<const void*>(positions[s].address),sizeof(final_position));
             if(final_position!=post[s]-1U) throw std::logic_error("segmented prefill final host position differs from completed row frontier");
         }
+    } catch(const KnownPrefillCancelled&) {
+        for(std::size_t s=0;s<count;++s) {
+            if(resources[s].ple_lookup&&resources[s].ple_prefetch) cancel_ple_lookup_prefetch(*resources[s].ple_lookup,*resources[s].ple_prefetch);
+            segments[s].session->health=SerialSessionHealth::poisoned;segments[s].session->arithmetic_lineage.tainted=true;
+        }
+        throw;
     } catch(...) {
         for(std::size_t s=0;s<count;++s) {
             if(resources[s].ple_lookup&&resources[s].ple_prefetch) cancel_ple_lookup_prefetch(*resources[s].ple_lookup,*resources[s].ple_prefetch);

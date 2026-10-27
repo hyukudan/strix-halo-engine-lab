@@ -1,3 +1,4 @@
+#include "http_slot_capacity.hpp"
 #include "qwen_prefill_plan.hpp"
 #include "deferred_moe_receipt.hpp"
 #include "strix/lane_chain_hyper_output.hpp"
@@ -596,6 +597,16 @@ public:
                     reinterpret_cast<std::uintptr_t>(serial_status_), 8, serial_status_generation};
             }
         } catch (...) { release(); throw; }
+    }
+    // STRIX_BATCH_CANCEL_POINTS: preserve physical addresses/generations after a drained interruption.
+    void reset_cancelled_prefill() {
+        guard_->run([&] {
+            check_hip(hipMemsetAsync(arena_,0,static_cast<std::size_t>(scratch.arena_bytes),scope.stream),"reset cancelled prompt arena");
+            check_hip(hipMemsetAsync(status_,0,8,scope.stream),"reset cancelled prompt status");
+            if(union_) check_hip(hipMemsetAsync(union_,0,static_cast<std::size_t>(union_scratch.arena_bytes),scope.stream),"reset cancelled prompt union");
+            if(serial_status_) check_hip(hipMemsetAsync(serial_status_,0,8,scope.stream),"reset cancelled prompt serial status");
+            check_hip(hipStreamSynchronize(scope.stream),"complete cancelled prompt memory reset");
+        });
     }
     ~KnownPromptMemory() { release(); }
     KnownPromptMemory(const KnownPromptMemory&) = delete;
@@ -2763,7 +2774,7 @@ int STRIX_DECODE_ENTRY(
             // (about 286 MB per slot at T = 8192).
             const std::uint64_t extra_slots = !strix::decode_cli::mtp_tiled_prompt(options) ? 0U
                 : !options.mtp.cohort.empty() ? options.mtp.cohort.size()
-                : options.http_serve && options.http_batch ? options.http_batch - 1U : 0U;
+                : 0U; // HTTP capacity is measured after the primary stack
             for (std::uint64_t slot = 0; slot < extra_slots; ++slot) {
                 growth = add(growth, add(add(known_prefill_plan->host_metadata_payload_bytes, map_bytes), 8U));
                 for (const auto& tail : known_tail_plans) growth = add(growth, add(tail->host_metadata_payload_bytes, 8U));
@@ -2957,6 +2968,10 @@ int STRIX_DECODE_ENTRY(
                 check_hip(hipDeviceSynchronize(), "tiled MTP prompt reset fence");
                 strix::initialize_hip_fresh_runtime_memory(memory.scratch(), memory.state());
             };
+            tiled.reset_prefill_memory = [known_prefix_memory,known_tail_memories] {
+                known_prefix_memory->reset_cancelled_prefill();
+                for(const auto& arena:known_tail_memories) arena->reset_cancelled_prefill();
+            };
             tiled.fresh = session;
             tiled.group = known_group_backend.get();
             tiled.group_owner = known_group_owner;
@@ -3133,6 +3148,10 @@ int STRIX_DECODE_ENTRY(
                 check_hip(hipDeviceSynchronize(), "batched MTP slot reset fence");
                 strix::initialize_hip_fresh_runtime_memory(slot_memory->scratch(), slot_memory->state());
             };
+            tiled.reset_prefill_memory = [known_prefix_memory,known_tail_memories] {
+                known_prefix_memory->reset_cancelled_prefill();
+                for(const auto& arena:known_tail_memories) arena->reset_cancelled_prefill();
+            };
             tiled.fresh = stack.session;
         };
         const bool tiled_route = strix::decode_cli::mtp_tiled_prompt(options);
@@ -3154,19 +3173,151 @@ int STRIX_DECODE_ENTRY(
             return 0;
         }
         // Batched decoding: cohort requests on the tiled prompt (one slot per request) or --http-batch N.
-        const std::size_t batch_slots = tiled_route && !options.mtp.cohort.empty() ? 1U + options.mtp.cohort.size()
+        std::size_t batch_slots = tiled_route && !options.mtp.cohort.empty() ? 1U + options.mtp.cohort.size()
             : options.http_serve && options.http_batch ? options.http_batch : 0U;
         std::shared_ptr<const SharedWindowStream> batch_stream;
         std::vector<std::unique_ptr<CohortStack>> batch_stacks;
+        std::function<bool()> batch_memory_ok;
+        if (options.http_serve && options.http_batch) {
+            using namespace strix::decode_cli;
+            const auto add = [](std::uint64_t a, std::uint64_t b) {
+                if (b > UINT64_MAX - a) throw std::overflow_error("HTTP slot cost overflow");
+                return a + b;
+            };
+            const auto mul = [](std::uint64_t a, std::uint64_t b) {
+                if (b && a > UINT64_MAX / b) throw std::overflow_error("HTTP slot cost overflow");
+                return a * b;
+            };
+            const auto observe = [] {
+                PrefillCapabilities capabilities;
+                return observe_prefill_memory(capabilities);
+            };
+            const auto gtt_free = [](const PrefillMemory& observation) -> std::optional<std::uint64_t> {
+                if (!observation.gtt_limit || !observation.gtt_used || *observation.gtt_used > *observation.gtt_limit) return {};
+                return *observation.gtt_limit - *observation.gtt_used;
+            };
+            // These native owners are created later by the bridge, not by make_stack.
+            // Keep their declared budgets in the future commitment instead of treating
+            // an idle stack's observed delta as the complete runnable-slot cost.
+            // Window owners: what window_factory_for builds per slot (each row size's physical arena, D1 record and union
+            // scratch, four capture pools per owner at the capture budget), not the --mtp-window-total-bytes ceiling.
+            std::uint64_t windows = 0;
+            {
+                const auto row_set = options.mtp.window_rows_set.empty()
+                    ? std::vector<std::uint32_t>{options.mtp.window_rows} : options.mtp.window_rows_set;
+                for (const auto window_rows : row_set) {
+                    const auto plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
+                        {true, true, true, window_rows, options.mtp.window_expert_union, strix::KnownWindowOutputPolicy::all_rows,
+                         options.mtp.window_hyper_mix, options.mtp.window_qsa_rows, options.mtp.window_prefix, options.mtp.window_prefix,
+                         options.mtp.window_prefix, options.mtp.window_prefix || options.known_window_router_rows,
+                         options.mtp.window_prefix || options.known_window_router_rows});
+                    windows = add(windows, add(plan.arena.physical.total_bytes, 8U));
+                    if (options.mtp.window_expert_union)
+                        windows = add(windows, strix::q51_known_rows::required_scratch_bytes(window_rows,
+                            static_cast<std::uint32_t>(model.num_experts), static_cast<std::uint32_t>(model.num_experts_per_token)));
+                    windows = add(windows, mul(4U, options.mtp.window_capture_bytes));
+                }
+                windows = add(windows, UINT64_C(256) << 20U); // deferred GDN banks, PLE window auxiliaries, greedy rows
+                windows = std::min(windows, options.mtp.window_total_bytes);
+            }
+            auto active = add(options.mtp.runtime_bytes, windows);
+            active = add(active, options.mtp.target_capture_bytes);
+            const auto width = mul(mul(model.hidden_size, model.hc_count), 2U);
+            const char* pipe = std::getenv("STRIX_PREFILL_PIPE");
+            const auto pipe_copies = pipe && (std::strtoul(pipe, nullptr, 0) & 1U) ? 2U : 1U;
+            active = add(active, mul(mul(options.known_prefix_prefill_rows, width), pipe_copies));
+            active = add(active, width); // held row
+            // Full-vocabulary bound also covers subset heads, pinned IDs, seen rows,
+            // sixteen runner-up rows, and the fast chain's workspace/injection copies.
+            const bool subset = !options.mtp.draft_vocab.empty() || options.mtp.draft_context_vocab;
+            const auto row = subset ? mul(model.hidden_size / 32U, options.mtp.draft_q4 ? 18U : 34U) : 0U;
+            active = add(active, mul(model.vocab_size, add(row, 4U + 4U + 4U + 1U + 16U * 4U)));
+            active = add(active, add(mul((model.vocab_size + 255U) / 256U, 32U), 4096U));
+            active = add(active, 4U * (11U * 640U + 1U) + 2U * 4U * 10240U * 4U);
+            auto estimate = add(add(state_layout.device_total_bytes, state_layout.host_total_bytes), compiled.arena.total_bytes);
+            estimate = add(estimate, known_prefill_plan->host_metadata_payload_bytes);
+            for (const auto& tail : known_tail_plans) estimate = add(estimate, tail->host_metadata_payload_bytes);
+            auto headroom = options.known_prefill_headroom_explicit ? options.known_prefill_host_headroom : UINT64_C(4) << 30U;
+            // Shared bridge assets and the cache's future payload are not resident
+            // at this observation boundary. Reserve them once, never per slot.
+            headroom = add(headroom, std::max(options.mtp.sidecar_retained_bytes, options.mtp.sidecar_setup_bytes));
+            headroom = add(headroom, add(options.mtp.golden_max_bytes, options.mtp.replay_host_bytes));
+            headroom = add(headroom, options.prefix_cache_host_bytes);
+            const auto before = observe();
+            auto retained = estimate;
+            auto capacity = resolve_http_slot_capacity(estimate, active, before.available, gtt_free(before), headroom, options.http_batch_cap);
+            if (capacity.slots >= 2U) {
+                auto probe = make_stack();
+                add_tiled(*probe);
+                check_hip(hipDeviceSynchronize(), "HTTP slot measurement fence");
+                const auto after = observe();
+                const auto delta = [](std::optional<std::uint64_t> a, std::optional<std::uint64_t> b) {
+                    return a && b && *a > *b ? *a - *b : UINT64_C(0);
+                };
+                const auto measured = std::max({estimate, delta(before.available, after.available), delta(gtt_free(before), gtt_free(after))});
+                retained = measured;
+                capacity = resolve_http_slot_capacity(measured, active,
+                    after.available ? before.available : std::nullopt,
+                    gtt_free(after) ? gtt_free(before) : std::nullopt, headroom, options.http_batch_cap);
+                if (capacity.slots >= 2U) batch_stacks.push_back(std::move(probe));
+            }
+            batch_memory_ok = [observe, gtt_free, retained, active, headroom]() {
+                const auto pressure = observe();
+                return http_slot_memory_fits(retained, active, pressure.available, gtt_free(pressure), headroom);
+            };
+            options.http_slot_reason = "limited by " + capacity.limiting;
+            batch_slots = capacity.slots > 1U || (options.http_batch_explicit && options.http_batch_cap == 1U)
+                ? capacity.slots : 0U;
+            options.http_batch = static_cast<std::uint32_t>(batch_slots);
+            if (!batch_slots && options.http_sampling == "sample")
+                throw std::runtime_error("HTTP sampling requires memory for the batched route");
+        }
+        std::size_t eager_slots = batch_slots;
+        if (options.http_serve && batch_slots) {
+            const char* eager = std::getenv("STRIX_HTTP_EAGER_SLOTS");
+            std::uint32_t count = 4;
+            if (eager) {
+                const auto parsed = strix::decode_cli::parse_u64(eager, "STRIX_HTTP_EAGER_SLOTS");
+                if (parsed > UINT32_MAX) throw std::invalid_argument("STRIX_HTTP_EAGER_SLOTS exceeds uint32");
+                count = static_cast<std::uint32_t>(parsed);
+            }
+            eager_slots = strix::decode_cli::http_eager_slots(static_cast<std::uint32_t>(batch_slots), count);
+            // The measurement probe is retained only if it belongs to the eager part.
+            if (eager_slots == 1U) batch_stacks.clear();
+        }
+        if (options.http_serve) {
+            std::cerr << "http slots " << (batch_slots ? batch_slots : 1U) << " (";
+            if (options.http_batch_explicit && !options.http_batch_cap) std::cerr << "explicit single route";
+            else std::cerr << (options.http_batch_explicit ? "cap " + std::to_string(options.http_batch_cap) : "auto")
+                << ": " << options.http_slot_reason;
+            std::cerr << ") (" << (eager_slots ? eager_slots : 1U) << " built, "
+                << (batch_slots - eager_slots) << " on demand)\n";
+        }
         if (batch_slots) {
             batch_stream = std::make_shared<const SharedWindowStream>();
-            for (std::size_t slot = 1; slot < batch_slots; ++slot) {
+            const auto build_slot = [&, batch_stream]() -> strix::decode_cli::MtpBatchSlotSetup {
+                const auto slot = batch_stacks.size() + 1U;
+                const auto built = std::chrono::steady_clock::now();
                 auto stack = make_stack();
+                const auto stacked = std::chrono::steady_clock::now();
                 add_tiled(*stack);
+                batch_stacks.push_back(std::move(stack));
+                // STRIX_HTTP_SLOT_TIMING=1: setup time of every extra slot (stack, tiled owners).
+                static const bool timing = [] { const char* v = std::getenv("STRIX_HTTP_SLOT_TIMING"); return v && v[0] == '1'; }();
+                if (timing) std::fprintf(stderr, "http slot %zu built: stack %.0f ms tiled %.0f ms\n", slot,
+                    std::chrono::duration<double, std::milli>(stacked - built).count(),
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stacked).count());
+                const auto& stack_owner = batch_stacks.back();
+                return {stack_owner->parents, &stack_owner->session, &*stack_owner->dispatcher,
+                    window_factory_for(stack_owner->parents, batch_stream)};
+            };
+            for (const auto& stack : batch_stacks)
                 parents->batch_slots.push_back({stack->parents, &stack->session, &*stack->dispatcher,
                     window_factory_for(stack->parents, batch_stream)});
-                batch_stacks.push_back(std::move(stack));
-            }
+            while (batch_stacks.size() + 1U < eager_slots) parents->batch_slots.push_back(build_slot());
+            parents->batch_capacity = batch_slots;
+            parents->batch_memory_ok = batch_memory_ok;
+            parents->grow_batch_slot = build_slot;
             parents->serve_batch = options.http_serve
                 ? strix::decode_cli::make_http_batch_serve(options, "native MTP batched decode (" + std::to_string(batch_slots) +
                     " slots), profile " + std::string(optimization_profile.selected) + ", context " + std::to_string(options.context_tokens))

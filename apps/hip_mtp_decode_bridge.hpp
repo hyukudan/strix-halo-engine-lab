@@ -1,8 +1,12 @@
 #pragma once
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/batch_service_handoff.hpp"
+#include "strix/batch_nested_prefill.hpp"
+#include "strix/execution_telemetry.hpp"
 #include "strix/known_prefill_limits.hpp"
 #include "hip_decode_experiment.hpp"
 #include "hip_decode_options.hpp"
+#include "http_slot_capacity.hpp"
 #include "hip_decode_receipt_json.hpp"
 #include "mtp_window_memory_reservation.hpp"
 #include "hip_prefix_state_cache.hpp"
@@ -67,6 +71,9 @@ struct MtpServeRequest {
 struct MtpServeResult {
     std::optional<serve::ConstraintVerdict> constraint;
     std::string error;
+    BatchServiceStats service;
+    std::string prompt_state_digest,final_state_digest,final_state_components;
+    std::uint64_t final_state_position=0;
     std::uint64_t restored_tokens = 0, generated_tokens = 0, cycles = 0, proposed = 0, accepted = 0;
     std::uint64_t ngram_rows = 0, ngram_accepted = 0;
     // Context-source diagnostics (batched, opt-in sources): shadow proposals made / scored / leading rows right
@@ -78,6 +85,18 @@ struct MtpServeResult {
     // --rtx-state-import: the receipt of the imported state this request started from (JSON object), else empty.
     std::string rtx_import_json;
 };
+inline std::string batch_service_receipt(const BatchServiceStats& s) {
+    std::ostringstream out;
+    out<<"\"service_rounds\":"<<s.service_rounds<<",\"service_points\":"<<s.service_points
+       <<",\"service_ms_suspended\":"<<s.service_ms_suspended<<",\"max_bundle_gpu_ms\":"<<s.max_bundle_gpu_ms
+       <<",\"service_overshoot_ms_max\":"<<s.service_overshoot_ms_max<<",\"cancel_points_cancelled\":"<<s.cancel_points_cancelled;
+    out<<",\"nested_admits\":"<<s.nested_admits<<",\"nested_rows\":"<<s.nested_rows<<",\"nested_ms\":"<<s.nested_ms
+       <<",\"nest_rows_limit\":"<<s.nest_rows_limit<<",\"nest_skips\":"<<s.nest_skips<<",\"nest_skip_reasons\":{";
+    bool first=true;
+    for(const auto& [reason,count]:s.nest_skip_reasons) {if(!first) out<<',';first=false;out<<'"'<<reason<<"\":"<<count;}
+    out<<'}';
+    return out.str();
+}
 using MtpServeRunner = std::function<MtpServeResult(const MtpServeRequest&)>;
 using MtpDecodeServe = std::function<void(const MtpServeRunner&)>;
 class MtpBatchRunner;
@@ -130,6 +149,7 @@ struct MtpDecodeTargetParents final {
         std::shared_ptr<RtxStateImportRegistry> rtx_import;
         // Fresh target state and session, exactly as after setup (after the calibration replay).
         std::function<void()> reset_state;
+        std::function<void()> reset_prefill_memory;
         SerialSessionContext fresh;
         // Prompt groups (STRIX_PROMPT_BATCH): the owner the blocks of several requests run on, when it is not the
         // T-row block owner (STRIX_PROMPT_BATCH_ROWS above T). Null: the blocks backend and its owner.
@@ -144,6 +164,9 @@ struct MtpDecodeTargetParents final {
     // the further slots (their own parents, session and dispatcher, window owners on a shared stream).
     MtpDecodeBatchServe serve_batch;
     std::vector<MtpBatchSlotSetup> batch_slots;
+    std::size_t batch_capacity = 0;
+    std::function<MtpBatchSlotSetup()> grow_batch_slot;
+    std::function<bool()> batch_memory_ok;
     struct WindowSetupReceipt {
         std::uint64_t union_source_steps = 0;
         std::uint64_t union_reserved_bytes = 0;
@@ -281,6 +304,7 @@ public:
     TiledMtpPrompt& operator=(const TiledMtpPrompt&)=delete;
     [[nodiscard]] bool done() const noexcept {return phase_==Phase::done;}
     [[nodiscard]] std::uint64_t position() const noexcept {return pos_;}
+    [[nodiscard]] std::uint64_t remaining() const noexcept {return n_-pos_;}
     [[nodiscard]] std::uint64_t restored() const noexcept {return restored_;}
     // The prompt's next unit when it is a tiled block (a T-row block or a tail block): its backend, owner, rows,
     // whether it is a T block (prefix cache capture) and whether it ends the prompt. Null when the next unit is
@@ -293,7 +317,27 @@ public:
     };
     // Units of the largest tail size instead of whole T blocks from now on (on) or again T blocks (off).
     void set_small_blocks(bool on) noexcept {small_=on;}
+    void force_ladder() noexcept {forced_ladder_=true;}
+    [[nodiscard]] BatchNestedRecipe nested_recipe(std::uint64_t limit,bool qualified) const {
+        if(tiled_.blocks->output_policy()==KnownWindowOutputPolicy::all_rows) return BatchNestedRecipe{{},0,"route"};
+        std::vector<std::uint32_t> owners;
+        for(const auto& tail:tiled_.tails) {
+            if(!tail.backend || !tail.owner) return BatchNestedRecipe{{},0,"missing_owner"};
+            if(tail.backend->logical_rows()!=tail.rows || tail.owner->logical_rows()!=tail.rows ||
+               tail.backend->output_policy()==KnownWindowOutputPolicy::all_rows) return BatchNestedRecipe{{},0,"row_class"};
+            owners.push_back(tail.rows);
+        }
+        static const bool start=[]{const char* v=std::getenv("STRIX_MTP_TILED_START");return !v || v[0]!='0';}();
+        const bool heads=start && tiled_.blocks->output_policy()!=KnownWindowOutputPolicy::state_only;
+        for(const auto& tail:tiled_.tails) if(tail.backend &&
+            (start && tail.backend->output_policy()!=KnownWindowOutputPolicy::state_only)!=heads)
+            return BatchNestedRecipe{{},0,"row_class"};
+        // No explicit ladder: the tail owners are the ladder (as next_block runs them).
+        const auto& ladder=tiled_.ladder_tail_rows.empty()?owners:tiled_.ladder_tail_rows;
+        return batch_nested_recipe(remaining(),limit,tiled_.rows,ladder,owners,qualified,heads);
+    }
     [[nodiscard]] std::optional<Block> next_block() {
+        if(forced_ladder_ && phase_==Phase::blocks) phase_=Phase::tails;
         while(phase_==Phase::blocks || phase_==Phase::tails) {
             const bool blocks=phase_==Phase::blocks;
             if(!blocks && !tiled_.ladder_tail_rows.empty()) {
@@ -419,7 +463,9 @@ public:
                 next.push_back(tokens_[static_cast<std::size_t>(pos_+r+1U)]);}
             const auto stream=static_cast<hipStream_t>(runtime_.resources().stream());
             const auto* last=block_hidden_+static_cast<std::size_t>(rows-1U)*width_;
-            const auto submit=[this,stream,last,views=std::move(views),next=std::move(next)] {
+            int device=0;check(hipGetDevice(&device),"get priming device");
+            const auto submit=[this,device,stream,last,views=std::move(views),next=std::move(next)] {
+                check(hipSetDevice(device),"bind priming device");
                 const bool pending=runtime_.prime_hidden_rows_submit(qualified_,activated_,views,next);
                 check(hipMemcpyAsync(held_,last,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice,stream),"tiled MTP held copy");
                 if(!pending) check(hipStreamSynchronize(stream),"tiled MTP held copy");
@@ -541,6 +587,10 @@ private:
         runtime_.prime_hidden_rows_complete();   // the held copy follows the rows on the same stream
         report_progress();
     }
+public:
+    std::function<void(HipKnownPrefixWindow&,const std::function<void()>&)> execute_native;
+    void drain_for_handoff(){drain_priming();}
+private:
     void run_block(const Block& block) {
         auto& owner=*block.owner;
         // The tap observer reads the tap step only (STRIX_QPF2K_HC prefill folds stay on for the other steps).
@@ -548,12 +598,15 @@ private:
         const auto t0=std::chrono::steady_clock::now();
         try {
             std::vector<float> logits;
+            const auto launch=[&] {
             // STRIX_QPF2K_SCHED bit 4: a balanced block shorter than its backend's T runs as a partial block.
             if(block.rows!=block.backend->logical_rows()) {
                 if(block.final) logits=block.backend->execute_rows_partial(block_tokens(block),pos_);
                 else block.backend->execute_state_rows_partial(block_tokens(block),pos_,false);
             } else if(block.final) logits=block.backend->execute_rows(block_tokens(block),pos_);
             else block.backend->execute_state_rows(block_tokens(block),pos_);
+            };
+            if(execute_native) execute_native(owner,launch);else launch();
             owner.set_prefill_step_observer({});
             finish_block(block,logits);
         } catch(...) {owner.set_prefill_step_observer({});throw;}
@@ -661,6 +714,7 @@ private:
     std::uint64_t n_=0,width_=0,restored_=0,pos_=0,blocks_=0,tail_blocks_=0,serial_rows_=0,grouped_blocks_=0,window_rows_=0,
         pipe_async_blocks_=0,small_units_=0,grouped_tail_blocks_=0,cohort_window_rows_=0;
     double block_ms_=0.0,tail_ms_=0.0,serial_ms_=0.0;  // wall time of the T blocks, the tail blocks, the serial rows (not the windows)
+    bool forced_ladder_=false;
     bool small_=false;
     std::optional<ModelContentIdentity> final_logits_digest_;
     std::size_t tap_=SIZE_MAX,tail_=0;
@@ -737,6 +791,7 @@ struct MtpBatchRequest {
     std::function<bool(std::span<const std::uint32_t>)> on_tokens;
     std::function<void(serve::GenerationProgress)> on_progress;
     std::function<void(const MtpServeResult&)> on_finish;
+    std::function<bool()> cancelled;
 };
 struct MtpBatchSlotSetup {
     std::shared_ptr<MtpDecodeTargetParents> parents; // parents->tiled bound to this slot's state and session
@@ -745,6 +800,11 @@ struct MtpBatchSlotSetup {
     MtpDecodeWindowFactory make_window;
 };
 class MtpBatchRunner {
+    struct EngineCall {
+        bool& active;
+        explicit EngineCall(bool& a):active(a) {if(active) throw std::logic_error("batch callback re-entry");active=true;}
+        ~EngineCall(){active=false;}
+    };
 public:
     struct Slot {
         std::shared_ptr<MtpDecodeTargetParents> parents;
@@ -768,11 +828,14 @@ public:
         std::chrono::steady_clock::time_point decode_start;
         std::array<std::uint64_t, 9> chosen_rows{};
     };
-    struct Stats {
+    struct Stats : BatchServiceStats {
         std::uint64_t admitted = 0, finished = 0, steps = 0, cohort_steps = 0, solo_steps = 0, max_active = 0, prompt_steps = 0;
         // Prompt groups (STRIX_PROMPT_BATCH=1): segmented runs of several prompts' blocks, their blocks and rows.
         std::uint64_t prompt_groups = 0, grouped_blocks = 0, grouped_rows = 0;
         double prompt_group_ms = 0.0;
+        std::uint64_t lazy_slot_builds = 0;
+        double lazy_slot_ms = 0.0, lazy_slot_max_ms = 0.0;
+        bool lazy_slot_memory_declined = false;
         // Prompt window cohorts (STRIX_PROMPT_WINDOW_COHORT=1): steps that ran known-row windows, and their windows.
         std::uint64_t prompt_window_cohorts = 0, prompt_window_members = 0;
         HipMtpGreedyCohortStats cohort;
@@ -804,12 +867,47 @@ public:
         : options_(options), model_(model), compiled_(compiled), qualified_(qualified), activated_(activated),
           enable_draft_(std::move(enable_draft)), slots_(std::move(slots)), interleave_(interleave),
           serial_rows_per_step_(serial_rows_per_step ? serial_rows_per_step : 1U),joint_(slots_.size(),MtpBatchWindowController::rule_from_env()) {
+        stats_.nest_rows_limit=nest_rows_;
         if (slots_.empty()) throw std::invalid_argument("batched MTP decoding needs a slot");
+        if(service_ms_>0.0 || cancel_points_ || nest_rows_) {
+            check_service(hipGetDevice(&device_),"capture prefill worker device");
+            worker_=std::make_unique<BatchServiceHandoff>();
+            std::fprintf(stderr,"batch service ms %.3f lookahead %u cancel_points %u nest_rows %llu (native blocks only)\n",service_ms_,lookahead_,cancel_points_?1U:0U,static_cast<unsigned long long>(nest_rows_));
+        }
+
     }
     MtpBatchRunner(const MtpBatchRunner&) = delete;
     MtpBatchRunner& operator=(const MtpBatchRunner&) = delete;
     [[nodiscard]] bool supports_constraints() const noexcept {return options_.http_constraints;}
     [[nodiscard]] std::vector<std::string> constraint_execution_routes() const {return supports_constraints()?std::vector<std::string>{"serial-host"}:std::vector<std::string>{};}
+    std::function<std::unique_ptr<Slot>()> grow_factory;
+    std::function<bool()> growth_memory_ok;
+    // STRIX_HTTP_SPARE_SLOTS (default 1; 0 = grow only for queued work): keep one built slot free while capacity remains.
+    bool spare_slot_=[]{const char* v=std::getenv("STRIX_HTTP_SPARE_SLOTS");return !v || v[0]!='0';}();
+    std::size_t slots_capacity = 0;
+    // Called only by the engine loop, between steps and outside service callbacks.
+    bool add_slot(bool queued) {
+        EngineCall call(engine_call_);
+        if (stats_.lazy_slot_memory_declined || !grow_factory ||
+            !http_slot_should_grow(queued, active(), slots(), slots_capacity, true, spare_slot_)) return false;
+        if (paused_ || paused_owner_) throw std::logic_error("batch growth during service park");
+        for (auto& slot : slots_) if (slot->prefilling) slot->prefill->drain_for_handoff();
+        if (!growth_memory_ok || !growth_memory_ok()) {
+            stats_.lazy_slot_memory_declined = true;
+            std::fprintf(stderr,"http slot growth stopped: insufficient MemAvailable/GTT with headroom\n");
+            return false;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        auto slot = grow_factory();
+        if (!slot) throw std::logic_error("batch growth factory returned no slot");
+        joint_.resize_slots(slots_.size() + 1U);
+        slots_.push_back(std::move(slot));
+        const auto ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+        ++stats_.lazy_slot_builds;
+        stats_.lazy_slot_ms += ms;
+        stats_.lazy_slot_max_ms = std::max(stats_.lazy_slot_max_ms, ms);
+        return true;
+    }
     [[nodiscard]] std::size_t slots() const noexcept { return slots_.size(); }
     [[nodiscard]] std::size_t active() const noexcept {
         return static_cast<std::size_t>(std::count_if(slots_.begin(), slots_.end(), [](const auto& s) { return s->active; }));
@@ -823,9 +921,29 @@ public:
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
     [[nodiscard]] const Slot& slot(std::size_t index) const { return *slots_.at(index); }
 
-    // Runs the request's prompt in a free slot and emits its first token; the request then joins the
-    // next step (or finishes at once: stop token, budget of one, cancelled). Returns the slot.
+    // Engine-thread hook lifetime belongs to the HTTP loop; queued is a thread-safe read-only hint.
+    using AdmissionSink=std::function<void(MtpBatchRequest)>;
+    using AdmissionPump=std::function<void(const AdmissionSink&,const std::function<bool()>&)>;
+    void set_service_admission(std::function<bool()> queued,AdmissionPump pump) {
+        has_queued_work_=std::move(queued);admission_pump_=std::move(pump);
+    }
+    // Runs or prepares the prompt in a free slot, retaining the public callback re-entry guard.
     std::size_t admit(MtpBatchRequest request) {
+        EngineCall call(engine_call_);
+        const auto index=prepare_admission(std::move(request));
+        auto& s=*slots_[index];
+        if (!interleave_) {
+            try {
+                while (!s.prefill->done() && !cancel_requested(s)) s.prefill->step();
+                if(cancel_requested(s)) cancel_prefill(s,false);else complete_prompt(s);
+            } catch(const KnownPrefillCancelled&) {cancel_prefill(s,true);}
+            catch(const serve::ConstraintError& e) {constraint_failed(s,e);}
+        }
+        return index;
+    }
+private:
+    std::size_t prepare_admission(MtpBatchRequest request) {
+        if(!engine_call_ || (paused_owner_ && !service_mode_)) throw std::logic_error("invalid admission mode");
         const auto free = std::find_if(slots_.begin(), slots_.end(), [](const auto& s) { return !s->active; });
         if (free == slots_.end()) throw std::logic_error("batched MTP admission without a free slot");
         const auto vocabulary = model_.vocab_size;
@@ -838,7 +956,8 @@ public:
         const auto start = std::chrono::steady_clock::now();
         s.request = std::move(request);
         if (s.request.ngram_peers) any_peers_ = true;
-        s.result = {};
+        MtpServeResult fresh_result;
+        s.result=std::move(fresh_result);s.result.service.nest_rows_limit=nest_rows_;
         s.chosen_rows = {};
         joint_.reset(static_cast<std::uint32_t>(free-slots_.begin()));
         // STRIX_MTP_JOINT_RULE_FILE (measurement, in-process A/B): the joint plan rule is re-read from this file at
@@ -895,25 +1014,38 @@ public:
         s.active = true;
         s.prefilling = true;
         stats_.max_active = std::max<std::uint64_t>(stats_.max_active, active());
-        if (!interleave_) {
-            try {
-                while (!s.prefill->done()) s.prefill->step();
-                complete_prompt(s);
-            } catch(const serve::ConstraintError& e) {constraint_failed(s,e);}
-        }
-        return static_cast<std::size_t>(free - slots_.begin());
+        if(worker_) s.prefill->execute_native=[this,&s](HipKnownPrefixWindow& owner,const std::function<void()>& job){
+            if(service_mode_) {
+                if(!leaf_ || &s!=leaf_ || !paused_owner_ || paused_owner_->aliases_prefill_storage(owner) || current_hip_launch_context())
+                    throw std::logic_error("nested prefill lease violation");
+                owner.finish_pending_completion();
+                job();
+                if(current_hip_launch_context()) throw std::logic_error("nested prefill retained launch scope");
+            } else execute_prefill(owner,job,&s);
+        };
+        return static_cast<std::size_t>(free-slots_.begin());
     }
+public:
 
     // Interleaved admission: one unit of the oldest running prompt, when the decode cycles have had at least
     // `prompt_share` times the time of the previous units (STRIX_BATCH_PROMPT_SHARE, default 0: one unit per
     // step; always when nothing decodes). Then one decode cycle
     // of every request past its prompt: a cohort cycle with two or more, the ordinary cycle with one.
     void step() {
+        EngineCall call(engine_call_);
         using clock = std::chrono::steady_clock;
         Slot* prompt = nullptr;
         bool decoding = false;
+        // STRIX_BATCH_SHORT_FIRST_ROWS (default 2048; 0 = oldest prompt first): a prompt with at most that many rows left runs
+        // its units before longer prompts (oldest such prompt first), so a short request waits for the current unit of a
+        // long prompt, not for the rest of it. Exact: every prompt's units, rows and bits are its own whatever the order.
+        static const std::uint64_t short_rows=[]{const char* v=std::getenv("STRIX_BATCH_SHORT_FIRST_ROWS");return v?std::strtoull(v,nullptr,10):2048ULL;}();
+        const auto ahead=[&](const Slot& a,const Slot& b) {
+            const bool sa=short_rows && a.prefill->remaining()<=short_rows,sb=short_rows && b.prefill->remaining()<=short_rows;
+            return sa!=sb?sa:a.order<b.order;
+        };
         for (auto& s : slots_) {
-            if (s->prefilling && (!prompt || s->order < prompt->order)) prompt = s.get();
+            if (s->prefilling && (!prompt || ahead(*s, *prompt))) prompt = s.get();
             if (s->active && !s->prefilling) decoding = true;
         }
         if (!prompt) prompt_debt_ms_ = 0.0;
@@ -923,14 +1055,18 @@ public:
             // (exact either way: the prompt's rows and bits do not depend on the block sizes)
             static const bool small=[]{const char* v=std::getenv("STRIX_BATCH_PROMPT_SMALL");return v && v[0]=='1';}();
             if (small) for (auto& s : slots_) if (s->prefilling) s->prefill->set_small_blocks(decoding);
-            const auto t0 = clock::now();
-            if (!run_prompt_group(*prompt) && !run_prompt_windows(*prompt)) {
-                try {
+            const auto t0 = clock::now();const auto suspended_before=stats_.service_ms_suspended;
+            try {
+                if(cancel_requested(*prompt)) cancel_prefill(*prompt,false);
+                else if (!run_prompt_group(*prompt) && !run_prompt_windows(*prompt)) {
                     prompt->prefill->step(serial_rows_per_step_);
-                    if (prompt->prefill->done()) complete_prompt(*prompt);
-                } catch(const serve::ConstraintError& e) {constraint_failed(*prompt,e);}
-            }
-            prompt_debt_ms_ += prompt_share_ * std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+                    if(cancel_requested(*prompt)) cancel_prefill(*prompt,false);
+                    else if (prompt->prefill->done()) complete_prompt(*prompt);
+                }
+            } catch(const KnownPrefillCancelled&) {cancel_prefill(*prompt,true);}
+            catch(const serve::ConstraintError& e) {constraint_failed(*prompt,e);}
+
+            prompt_debt_ms_ += prompt_share_ * std::max(0.0,std::chrono::duration<double, std::milli>(clock::now() - t0).count()-(stats_.service_ms_suspended-suspended_before));
         }
         for(auto& owner:slots_) {
             auto& s=*owner;
@@ -950,9 +1086,27 @@ public:
             // remains to run the cohort timing scope below.
             prompt_debt_ms_-=std::chrono::duration<double,std::milli>(clock::now()-serial_start).count();
         }
+        run_decode_round();
+    }
+private:
+    bool run_decode_round() {
+        using clock=std::chrono::steady_clock;
+        last_decode_round_=clock::now();
         std::vector<Slot*> live;
-        for (auto& s : slots_) if (s->active && !s->prefilling && !s->request.constraint) live.push_back(s.get());
-        if (live.empty()) return;
+        for (auto& s : slots_) if (s->active && !s->prefilling && !s->request.constraint) {
+            if(s.get()==paused_ || (paused_ && (s->session==paused_->session || s->target==paused_->target || s->native==paused_->native)))
+                throw std::logic_error("paused prefill selected for decode");
+            // STRIX_BATCH_SERVICE_MS: cohort primaries come only from these live window owners.
+            if(paused_owner_) {
+                if(s->parents->resources.scratch && paused_owner_->aliases_prefill_storage(*s->parents->resources.scratch))
+                    throw std::logic_error("decode scratch aliases paused prefill lease");
+                if(s->window) for(const auto rows:{2U,4U,8U,16U,32U})
+                    if(const auto owner=s->window->owner_with_rows(rows);owner && paused_owner_->aliases_prefill_storage(*owner))
+                        throw std::logic_error("decode window primary aliases paused prefill lease");
+            }
+            live.push_back(s.get());
+        }
+        if (live.empty()) return false;
         if (context_peers || any_peers_) {
             std::vector<const HipMtpGreedyRuntime*> peers;
             for (auto* s : live) peers.push_back(s->greedy.get());
@@ -972,7 +1126,7 @@ public:
             auto& s = *live.front();
             ++stats_.solo_steps;
             apply(s, s.greedy->cycle(s.pending, m.candidate_depth, budget(s), s.request.stop_tokens));
-            return;
+            return true;
         }
         ++stats_.cohort_steps;
         std::vector<HipMtpGreedyCohortMember> members;
@@ -985,8 +1139,10 @@ public:
         static const bool joint=[] {const char* v=std::getenv("STRIX_MTP_BATCH_JOINT");return v && v[0]=='1';}();
         const auto results = hip_mtp_greedy_cohort_cycle(members, &stats_.cohort,joint?&joint_:nullptr);
         for (std::size_t k = 0; k < live.size(); ++k) apply(*live[k], results[k]);
+        return true;
     }
 
+public:
     // Snapshot committed frontiers on the engine thread before dropping any slot state.
     void fail_requests(const std::string& error) {
         for (auto& s : slots_) {
@@ -1015,6 +1171,202 @@ public:
     }
 
 private:
+    static void check_service(hipError_t e,const char* what) {
+        if(e!=hipSuccess) throw std::runtime_error(std::string(what)+": "+hipGetErrorString(e));
+    }
+    static bool cancel_requested(const Slot& s) {return s.request.cancelled && s.request.cancelled();}
+    void cancel_prefill(Slot& s,bool boundary) {
+        s.prefill->drain_for_handoff();
+        if(!service_mode_) s.parents->tiled.blocks->finish_deferred();
+        for(const auto& tail:s.parents->tiled.tails) {
+            if(service_mode_ && paused_owner_->aliases_prefill_storage(*tail.owner)) continue;
+            tail.backend->finish_deferred();
+        }
+        if(service_mode_ && boundary) throw std::logic_error("nested cancellation inside native unit");
+        if(boundary) {
+            s.parents->tiled.block_owner->reset_cancelled_prefill();
+            for(const auto& tail:s.parents->tiled.tails) tail.owner->reset_cancelled_prefill();
+            if(s.parents->tiled.reset_prefill_memory) s.parents->tiled.reset_prefill_memory();
+            ++stats_.cancel_points_cancelled;++s.result.service.cancel_points_cancelled;
+        }
+        s.prefill.reset();s.pending={};s.greedy.reset();
+        s.parents->tiled.reset_state();*s.session=s.parents->tiled.fresh;
+        if(s.window) s.window->begin_session();
+        s.runtime=std::make_shared<HipMtpRuntime>(s.native);
+        s.prefilling=false;s.active=false;s.result.finish="cancelled";
+        s.result.prompt_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-s.prompt_start).count();
+        ++stats_.finished;
+        if(s.request.constraint) s.result.constraint=s.request.constraint->verdict(s.result.finish);
+        if(s.request.on_finish) s.request.on_finish(s.result);
+        s.request={};
+    }
+    bool slot_disjoint(const Slot& s) const {
+        if(!paused_owner_ || &s==paused_ || (paused_ && (s.session==paused_->session || s.target==paused_->target || s.native==paused_->native))) return false;
+        if(s.parents->resources.scratch && paused_owner_->aliases_prefill_storage(*s.parents->resources.scratch)) return false;
+        if(s.window) for(const auto rows:{2U,4U,8U,16U,32U})
+            if(const auto owner=s.window->owner_with_rows(rows);owner && paused_owner_->aliases_prefill_storage(*owner)) return false;
+        return true;
+    }
+    const char* nested_decline(const Slot& s) const {
+        const auto pair=numerical_profile_pair(options_);
+        const bool qualified=numerical_profile_dense_a8(pair.prefill) && !numerical_profile_dense_trellis(pair.prefill) &&
+            !numerical_profile_dense_trellis(pair.decode) && pair.fast_components==0U;
+        const auto recipe=s.prefill->nested_recipe(nest_rows_,qualified && !s.parents->tiled.blocks->gsq_model());
+        if(!recipe) return recipe.decline;
+        if(!slot_disjoint(s)) return "alias";
+        for(const auto rows:recipe.units) {
+            const auto tail=std::find_if(s.parents->tiled.tails.begin(),s.parents->tiled.tails.end(),[&](const auto& t){return t.rows==rows;});
+            if(paused_owner_->aliases_prefill_storage(*tail->owner)) return "alias";
+        }
+        return nullptr;
+    }
+    void run_nested_prompt(BatchServiceStats& metrics) {
+        if(!nest_rows_ || !paused_) return;
+        const auto skip=[&](Slot* s,const char* reason) {
+            ++metrics.nest_skips;++metrics.nest_skip_reasons[reason];
+            if(s) {++s->result.service.nest_skips;++s->result.service.nest_skip_reasons[reason];}
+        };
+        // Retire earlier idle users before borrowing shared tail D1/union storage.
+        // The parked owner (and every physical alias of its lease) remains untouched.
+        for(auto& s:slots_) {
+            for(const auto& tail:s->parents->tiled.tails) if(!paused_owner_->aliases_prefill_storage(*tail.owner))
+                tail.backend->finish_deferred();
+            if(s->window) for(const auto rows:{2U,4U,8U,16U,32U})
+                if(const auto owner=s->window->owner_with_rows(rows);owner && !paused_owner_->aliases_prefill_storage(*owner))
+                    owner->finish_pending_completion();
+        }
+        // The pump supplies requests only; preparation never executes prompt work.
+        const auto can_prepare=[&] {
+            const auto free=std::find_if(slots_.begin(),slots_.end(),[](const auto& s){return !s->active;});
+            if(free==slots_.end()) return false;
+            if(!slot_disjoint(**free)) {skip(nullptr,"alias");return false;}
+            return true;
+        };
+        if(admission_pump_) admission_pump_([&](MtpBatchRequest request) {
+            if(!service_mode_ || !has_free_slot()) throw std::logic_error("invalid service admission");
+            const auto free=std::find_if(slots_.begin(),slots_.end(),[](const auto& s){return !s->active;});
+            if(!slot_disjoint(**free)) throw std::logic_error("service admission aliases parked slot");
+            prepare_admission(std::move(request));
+        },can_prepare);
+        Slot* candidate=nullptr;
+        for(auto& slot:slots_) {
+            auto& s=*slot;
+            if(!s.prefilling || &s==paused_) continue;
+            if(const auto reason=nested_decline(s)) {skip(&s,reason);continue;}
+            if(!candidate || s.order<candidate->order) candidate=&s;
+        }
+        if(!candidate) return;
+        auto& s=*candidate;
+        if(cancel_requested(s)) {cancel_prefill(s,false);return;}
+        const auto position=s.prefill->position();
+        const auto start=std::chrono::steady_clock::now();
+        ++metrics.nested_admits;++s.result.service.nested_admits;
+        s.prefill->force_ladder();leaf_=&s;
+        try {
+            // Decoding requests keep their service budget during a nested prompt: a decode round between its completed
+            // units (tail blocks / windows) once STRIX_BATCH_SERVICE_MS of nested wall time passed (units are whole, no
+            // native call is open on this thread; the round completes on the device before the next unit).
+            auto last_round=start;
+            while(!s.prefill->done() && !cancel_requested(s)) {
+                if(current_hip_launch_context()) throw std::logic_error("nested step has an active launch scope");
+                s.prefill->step(serial_rows_per_step_);
+                if(current_hip_launch_context()) throw std::logic_error("nested step retained launch scope");
+                if(service_ms_>0.0 && !s.prefill->done() &&
+                   std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-last_round).count()>=service_ms_) {
+                    s.prefill->drain_for_handoff();
+                    if(run_decode_round()) {++metrics.service_rounds;check_service(hipDeviceSynchronize(),"complete nested decode round");}
+                    last_round=std::chrono::steady_clock::now();
+                }
+            }
+            s.prefill->drain_for_handoff();
+            const auto ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+            const auto rows=s.prefill->position()-position;
+            metrics.nested_rows+=rows;s.result.service.nested_rows+=rows;
+            metrics.nested_ms+=ms;s.result.service.nested_ms+=ms;
+            if(cancel_requested(s)) cancel_prefill(s,false);else complete_prompt(s);
+        } catch(const serve::ConstraintError& e) {constraint_failed(s,e);}
+        catch(...) {leaf_=nullptr;throw;}
+        leaf_=nullptr;
+    }
+    void execute_prefill(HipKnownPrefixWindow& owner,const std::function<void()>& job,Slot* slot,std::span<Slot* const> group={}) {
+        BatchServiceStats metrics;
+        const auto account=[&]{stats_.add(metrics);if(slot) slot->result.service.add(metrics);else for(auto* member:group) member->result.service.add(metrics);};
+        BatchServiceLookahead lookahead(lookahead_);
+        auto* telemetry=current_execution_telemetry();const auto correlation=current_execution_correlation();
+        // STRIX_PREFILL_PIPE: retire every earlier submitter before another host owns native scratch.
+        for(auto& s:slots_) if(s->prefilling) s->prefill->drain_for_handoff();
+        struct Events {
+            std::vector<hipEvent_t> ring;
+            explicit Events(unsigned count):ring(count,nullptr) {
+                try {for(auto& e:ring) check_service(hipEventCreate(&e),"create prefill service event");}
+                catch(...) {for(auto e:ring) if(e) (void)hipEventDestroy(e);throw;}
+            }
+            ~Events(){for(auto e:ring) (void)hipEventDestroy(e);}
+        } events(lookahead_+3U);
+        std::uint64_t boundary=0,retired=0;double& completed_ms=service_completed_ms_;double last_bundle_ms=0.0;
+        std::exception_ptr service_error;
+        const auto event=[&](std::uint64_t n){return events.ring[static_cast<std::size_t>(n%events.ring.size())];};
+        const auto retire=[&](std::uint64_t end) {
+            if(end<=retired) return;
+            check_service(hipEventSynchronize(event(end)),"wait prefill lookahead");
+            while(retired<end) {
+                float ms=0.0F;check_service(hipEventElapsedTime(&ms,event(retired),event(retired+1U)),"measure completed prefill bundle");
+                completed_ms+=ms;last_bundle_ms=ms;metrics.max_bundle_gpu_ms=std::max(metrics.max_bundle_gpu_ms,static_cast<double>(ms));++retired;
+            }
+        };
+        paused_=slot;paused_owner_=&owner;
+        owner.set_prefill_service_point([&](hipStream_t stream,const std::function<void()>& prepare){
+            ++metrics.service_points;
+            static const bool log=[]{const char* v=std::getenv("STRIX_MTP_BATCH_LOG");return v && (v[0]=='2' || v[0]=='a');}();
+            if(log && !boundary && slot) std::fprintf(stderr,"batch prefill boundary rows=%u\n",owner.logical_rows());
+            const auto wait=lookahead.advance();boundary=lookahead.submitted();check_service(hipEventRecord(event(boundary),stream),"record prefill boundary");
+            retire(wait);
+            if(cancel_points_ && slot && cancel_requested(*slot)) {prepare();throw KnownPrefillCancelled{};}
+            const bool decoding=std::any_of(slots_.begin(),slots_.end(),[](const auto& s){return s->active&&!s->prefilling;});
+            // The bundles still in flight (lookahead) complete before the decode round can start: count them at the last
+            // completed bundle's time, so the round starts near the budget instead of `lookahead` bundles after it.
+            // Due on completed GPU prefill time (bundles in flight counted at the last one's time), or on wall time since the
+            // last decode round: the first bundles of a block have no completed time yet, and the gap is what decoders see.
+            const bool decode_due=service_ms_>0.0 && decoding && (completed_ms+static_cast<double>(boundary-retired)*last_bundle_ms>=service_ms_ ||
+                std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-last_decode_round_).count()>=service_ms_);
+            const bool nest_due=nest_rows_ && slot &&
+                (std::any_of(slots_.begin(),slots_.end(),[&](const auto& s){return s.get()!=slot && s->prefilling && !nested_decline(*s);}) ||
+                 (has_free_slot() && has_queued_work_ && has_queued_work_()));
+            if(!decode_due && !nest_due) return;
+            prepare();retire(boundary);
+            metrics.service_overshoot_ms_max=std::max(metrics.service_overshoot_ms_max,completed_ms-service_ms_);
+            const auto start=std::chrono::steady_clock::now();
+            worker_->park();
+            metrics.service_ms_suspended+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+            if(service_error) std::rethrow_exception(service_error);
+            if(cancel_points_ && slot && cancel_requested(*slot)) {prepare();throw KnownPrefillCancelled{};}
+            lookahead.reset();boundary=0;retired=0;completed_ms=0.0;
+            check_service(hipEventRecord(event(0),stream),"reanchor prefill service clock");
+        });
+        // STRIX_BATCH_SERVICE_MS: GPU timestamps exclude each parked interval by re-anchoring after resume.
+        try {
+            worker_->run([&]{
+                check_service(hipSetDevice(device_),"bind prefill worker device");
+                ExecutionTelemetryBinding binding(telemetry,correlation);
+                check_service(hipEventRecord(event(0),owner.prefill_stream()),"anchor prefill service clock");
+                job();
+                ++boundary;check_service(hipEventRecord(event(boundary),owner.prefill_stream()),"record completed prefill unit");
+                retire(boundary);
+            },[&]{
+                service_mode_=true;
+                try {
+                    run_nested_prompt(metrics);
+                    if(run_decode_round()) ++metrics.service_rounds;
+                } catch(...) {service_error=std::current_exception();}
+                service_mode_=false;
+                try {check_service(hipDeviceSynchronize(),"complete decode service streams");} catch(...) {service_error=std::current_exception();}
+            });
+        } catch(...) {
+            owner.set_prefill_service_point({});paused_=nullptr;paused_owner_=nullptr;account();
+            throw;
+        }
+        owner.set_prefill_service_point({});paused_=nullptr;paused_owner_=nullptr;account();
+    }
     // STRIX_PROMPT_BATCH (default on; =0 runs every prompt unit alone): the prompt unit of a step is a group. When the oldest running prompt's next unit is a
     // tiled block (a T-row or tail block), the next blocks of the other running prompts join it, oldest first,
     // while the rows fit the budget (the T-row block owner's arena, or STRIX_PROMPT_BATCH_ROWS if smaller). The
@@ -1061,12 +1413,16 @@ private:
         for (const auto& m : members)
             group_members.push_back({m.block.backend, m.slot->prefill->block_tokens(m.block), m.slot->prefill->position(), m.block.final,
                 m.slot->prefill->block_observer(m.block.rows)});
-        const auto logits = HipKnownPromptBackend::execute_group(group, group_members);
+        std::vector<std::vector<float>> logits;
+        const auto launch=[&]{logits=HipKnownPromptBackend::execute_group(group,group_members);};
+        std::vector<Slot*> group_slots;for(const auto& member:members) group_slots.push_back(member.slot);
+        if(worker_) execute_prefill(*(lead.group?lead.group_owner:lead.block_owner),launch,nullptr,group_slots);else launch();
         for (std::size_t k = 0; k < members.size(); ++k) {
             auto& s = *members[k].slot;
             try {
                 s.prefill->finish_block(members[k].block, logits[k], true);
-                if (s.prefill->done()) complete_prompt(s);
+                if(cancel_requested(s)) cancel_prefill(s,false);
+                else if (s.prefill->done()) complete_prompt(s);
             } catch(const serve::ConstraintError& e) {constraint_failed(s,e);}
         }
         ++stats_.prompt_groups;
@@ -1111,7 +1467,8 @@ private:
         for (std::size_t k = 0; k < members.size(); ++k) {
             auto& s = *members[k];
             s.prefill->finish_window(std::move(tickets[k]),members.size()>1U);
-            if (s.prefill->done()) complete_prompt(s);
+            if(cancel_requested(s)) cancel_prefill(s,false);
+            else if (s.prefill->done()) complete_prompt(s);
         }
         ++stats_.prompt_window_cohorts;
         stats_.prompt_window_members += members.size();
@@ -1121,6 +1478,9 @@ private:
     void complete_prompt(Slot& s) {
         const auto& m = options_.mtp;
         s.pending = s.prefill->finish(s.prompt_receipt);
+        static const bool state_digest=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");return v&&v[0]=='1';}();
+        if(state_digest && s.parents->tiled.cache)
+            s.result.prompt_state_digest=model_content_identity_hex(s.parents->tiled.cache->state_digest(s.session->next_position));
         s.result.restored_tokens = s.prefill->restored();
         s.prefill.reset();
         s.prefilling = false;
@@ -1183,6 +1543,15 @@ private:
                 s.result.frame_cycles = fd->frame_cycles; s.result.frame_shadow = fd->cycles;
             }
         }
+        static const bool state_digest=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");return v&&v[0]=='1';}();
+        if(state_digest && s.parents->tiled.cache) {
+            if(s.window) s.window->flush_pending_window();
+            check_service(hipDeviceSynchronize(),"complete final committed state digest");
+            s.result.final_state_position=s.session->next_position;
+            s.result.final_state_digest=model_content_identity_hex(s.parents->tiled.cache->state_digest(s.session->next_position));
+            static const bool components=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST_COMPONENTS");return v&&v[0]=='1';}();
+            if(components) s.result.final_state_components=s.parents->tiled.cache->component_digests(s.session->next_position);
+        }
         finish(s);
     }
     void constraint_failed(Slot& s,const serve::ConstraintError& e) {
@@ -1216,7 +1585,24 @@ private:
         const double x = v ? std::atof(v) : 0.0;
         return x >= 0.0 ? x : 0.0;
     }();
+    // STRIX_BATCH_SERVICE_MS=0 and STRIX_BATCH_CANCEL_POINTS=0 retain the synchronous native path.
+    double service_ms_=[] {const char* v=std::getenv("STRIX_BATCH_SERVICE_MS");return v?std::max(0.0,std::atof(v)):250.0;}();
+    unsigned lookahead_=[] {const char* v=std::getenv("STRIX_BATCH_SERVICE_LOOKAHEAD");return v?static_cast<unsigned>(std::clamp(std::atol(v),0L,64L)):2U;}();
+    bool cancel_points_=[] {const char* v=std::getenv("STRIX_BATCH_CANCEL_POINTS");return !v || v[0]!='0';}();
+    bool engine_call_=false;
+    int device_=0;
+    std::uint64_t nest_rows_=[] {const char* v=std::getenv("STRIX_BATCH_NEST_ROWS");return v?std::strtoull(v,nullptr,10):2048ULL;}();
+    bool service_mode_=false;
+    Slot* leaf_=nullptr;
+    std::function<bool()> has_queued_work_;
+    AdmissionPump admission_pump_;
+    Slot* paused_=nullptr;
+    HipKnownPrefixWindow* paused_owner_=nullptr;
+    double service_completed_ms_=0.0;
+    std::chrono::steady_clock::time_point last_decode_round_=std::chrono::steady_clock::now();
     Stats stats_;
+    // Destroy/join before the slot owners and all captures.
+    std::unique_ptr<BatchServiceHandoff> worker_;
     bool any_peers_ = false; // a request asked for cross-request lookup (the peers are refreshed every step from then on)
     MtpBatchWindowController joint_;
     std::uint64_t admitted_ = 0;
@@ -1522,6 +1908,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             // The predictor's durable rows and the held h_{P-1} travel with each checkpoint; the identity
             // gains everything that changes them (cache rows use the draft kernels when the draft chain
             // is not exact). Every slot of a batched run extends its own view identically.
+            const auto predictor_profile_identity=runtime->numerical_profile_identity();
             const auto extend_cache=[&](HipPrefixStateCacheSession& cache,const HipMtpResources& predictor,std::byte* held) {
                 const auto kv=predictor.view(HipMtpBuffer::kv),index=predictor.view(HipMtpBuffer::raw_index);
                 cache.add_rows(kv.address,mtp_cli_mul(mtp_cli_mul(model.kv_heads,model.head_dim),4U),1U,"mtp.kv");
@@ -1530,7 +1917,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 std::vector<std::byte> frame;
                 const auto u64=[&](std::uint64_t v){for(unsigned b=0;b<64;b+=8)frame.push_back(static_cast<std::byte>((v>>b)&255U));};
                 for(const auto byte:assets->shared_target().sidecar_model_content_identity.bytes)frame.push_back(static_cast<std::byte>(byte));
-                u64(assets->compiled().plan_identity);u64(runtime->numerical_profile_identity());
+                u64(assets->compiled().plan_identity);u64(predictor_profile_identity);
                 u64(m.draft_chain);u64(m.draft_exact);u64(m.draft_q4);
                 const char* q4_all=std::getenv("STRIX_MTP_DRAFT_Q4_ALL");u64(!q4_all || q4_all[0]!='0');
                 cache.extend_identity(sha256_bytes(frame));
@@ -1564,12 +1951,20 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 first->native=native;first->target=target;first->window=window;first->held=tiled_held;
                 parents->tiled.window=window.get();
                 slots.push_back(std::move(first));
-                for(const auto& setup:parents->batch_slots) {
+                const auto install_restore = [&](MtpBatchRunner::Slot& slot) {
+                    if(slot.parents->tiled.cache) {
+                        auto* s=&slot;
+                        slot.parents->tiled.cache->set_restore_hook([s,&qualified,&activated](std::uint64_t position){
+                            s->runtime->restore_cache_frontier(qualified,activated,position-1U);});
+                    }
+                };
+                const auto prepare_slot = [&](const MtpBatchSlotSetup& setup, std::size_t index) {
                     if(!setup.parents || !setup.session || !setup.dispatcher || !setup.parents->tiled.blocks || !setup.parents->tiled.reset_state ||
                        !tiled_profile_bound(setup.parents->tiled) || setup.parents->prompt.compiled ||
                        setup.parents->tiled.prefill_execution_identity!=parents->tiled.prefill_execution_identity)
                         throw std::invalid_argument("batched MTP slot lacks its parents, session, dispatcher or tiled prompt, "
                             "or its tiled blocks do not run the request's prefill profile");
+                    const auto slot_begin=std::chrono::steady_clock::now();
                     auto slot=std::make_unique<MtpBatchRunner::Slot>();
                     slot->parents=setup.parents;slot->session=setup.session;slot->dispatcher=setup.dispatcher;
                     const auto& own=*setup.parents->experiment;
@@ -1591,20 +1986,24 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         throw std::runtime_error("batched MTP held hidden allocation failed");
                     held_rows.push_back(held);slot->held=held;
                     if(setup.parents->tiled.cache) extend_cache(*setup.parents->tiled.cache,*slot->native,held);
-                    slots.push_back(std::move(slot));
-                }
-                for(auto& slot:slots)
-                    if(slot->parents->tiled.cache) {
-                        auto* s=slot.get();
-                        slot->parents->tiled.cache->set_restore_hook([s,&qualified,&activated](std::uint64_t position){
-                            s->runtime->restore_cache_frontier(qualified,activated,position-1U);});
-                    }
+                    install_restore(*slot);
+                    // STRIX_HTTP_SLOT_TIMING=1: MTP resources, target capture and window owners of every slot.
+                    static const bool slot_timing=[]{const char* v=std::getenv("STRIX_HTTP_SLOT_TIMING");return v && v[0]=='1';}();
+                    if(slot_timing) std::fprintf(stderr,"batched MTP slot %zu prepared in %.0f ms\n",index,
+                        std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-slot_begin).count());
+                    return slot;
+                };
+                install_restore(*slots.front());
+                for(const auto& setup:parents->batch_slots) slots.push_back(prepare_slot(setup, slots.size()));
                 pending={};
                 runtime.reset();
                 // STRIX_BATCH_INTERLEAVE: 1/0 forces block-interleaved admission on/off (default: on when serving).
                 const char* interleave_env=std::getenv("STRIX_BATCH_INTERLEAVE");
                 const bool interleave=interleave_env?interleave_env[0]=='1':options.http_serve;
                 MtpBatchRunner runner(options,model,compiled,qualified,activated,enable_draft_on,std::move(slots),interleave);
+                runner.slots_capacity=parents->batch_capacity?parents->batch_capacity:runner.slots();
+                runner.growth_memory_ok=parents->batch_memory_ok;
+                if(parents->grow_batch_slot) runner.grow_factory=[&] {return prepare_slot(parents->grow_batch_slot(), runner.slots());};
                 // Prompt lookup in batched decoding (opt-in, off by default): STRIX_BATCH_NGRAM=1 the n-gram extension
                 // (the single request's default source), =ctx the context drafter (--mtp-ngram-draft=ctx); a request's
                 // "ngram_draft" field forces it on/off. Solo cycles use it as a single request does; cohort cycles keep
@@ -1630,14 +2029,18 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 assets->validate_assets_unchanged();
                 if(!options.http_serve) return; // the cohort run wrote its own receipt
                 const auto& st=runner.stats();
-                output<<"{\"mode\":\"native-mtp-batch\",\"slots\":"<<runner.slots()<<",\"admitted\":"<<st.admitted
+                output<<"{\"mode\":\"native-mtp-batch\",\"slots\":"<<runner.slots()
+                    <<",\"slots_built\":"<<runner.slots()<<",\"slots_capacity\":"<<runner.slots_capacity
+                    <<",\"lazy_slot_builds\":"<<st.lazy_slot_builds<<",\"lazy_slot_ms\":{\"sum\":"<<st.lazy_slot_ms
+                    <<",\"max\":"<<st.lazy_slot_max_ms<<"},\"lazy_slot_memory_declined\":"<<(st.lazy_slot_memory_declined?"true":"false")
+                    <<",\"admitted\":"<<st.admitted
                     <<",\"finished\":"<<st.finished<<",\"steps\":"<<st.steps<<",\"cohort_steps\":"<<st.cohort_steps
                     <<",\"solo_steps\":"<<st.solo_steps<<",\"max_active\":"<<st.max_active<<",\"prompt_steps\":"<<st.prompt_steps
                     <<",\"interleaved_admission\":"<<(runner.interleaved()?"true":"false")
                     <<",\"cohort_windows\":"<<st.cohort.cohort_windows<<",\"cohort_window_sessions\":"<<st.cohort.cohort_sessions
                     <<",\"cohort_window_rows\":"<<st.cohort.cohort_rows<<",\"cohort_solo_windows\":"<<st.cohort.solo_windows<<",\"cohort_chunks\":"<<st.cohort.cohort_chunks
                     <<",\"prompt_groups\":"<<st.prompt_groups<<",\"prompt_window_cohorts\":"<<st.prompt_window_cohorts
-                    <<",\"prompt_window_members\":"<<st.prompt_window_members
+                    <<",\"prompt_window_members\":"<<st.prompt_window_members<<","<<batch_service_receipt(st)
                     <<",\"calibration_rows\":"<<calibration_rows<<",\"calibration_ms\":"<<calibration_ms<<"}\n";
                 return;
             }
@@ -1667,6 +2070,9 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         pending=run_tiled_mtp_prompt(q.prompt,model,compiled,parents->tiled,session,*target,*runtime,qualified,activated,
                             r,dispatcher,tiled_held,request_receipt,{},
                             q.constraint?HipMtpHostRowSelector{[state=q.constraint](auto row){return state->select(row);}}:HipMtpHostRowSelector{},q.on_progress);
+                        static const bool state_digest=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");return v&&v[0]=='1';}();
+                        if(state_digest && parents->tiled.cache)
+                            out.prompt_state_digest=model_content_identity_hex(parents->tiled.cache->state_digest(session.next_position));
                         if(q.constraint) q.constraint->commit();
                         if(parents->tiled.cache)out.restored_tokens=parents->tiled.cache->request().restored_position;
                         if(parents->tiled.cache && parents->tiled.cache->request().rtx_import)
@@ -1709,6 +2115,14 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         }
                         if(const auto* ng=greedy.ngram_stats()){out.ngram_rows=ng->extension_rows;out.ngram_accepted=ng->accepted_rows;}
                         if(const auto* cd=greedy.context_stats()){out.ngram_rows=cd->extension_rows;out.ngram_accepted=cd->accepted_rows;}
+                        if(state_digest && parents->tiled.cache) {
+                            if(window)window->flush_pending_window();
+                            if(hipDeviceSynchronize()!=hipSuccess) throw std::runtime_error("complete final committed state digest");
+                            out.final_state_position=session.next_position;
+                            out.final_state_digest=model_content_identity_hex(parents->tiled.cache->state_digest(session.next_position));
+                            static const bool components=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST_COMPONENTS");return v&&v[0]=='1';}();
+                            if(components) out.final_state_components=parents->tiled.cache->component_digests(session.next_position);
+                        }
                         pending={};
                         out.decode_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-decode_start).count();
                     } catch(const serve::ConstraintError& e) {

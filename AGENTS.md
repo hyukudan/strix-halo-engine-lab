@@ -39,6 +39,8 @@ exact to the constrained target, not to unconstrained greedy.
 Fast FP16 Qwen prefill is its own identity, not dense-A8 serial bit equality. GLM defaults to R1b decode
 with R1 prompt prefill; `--identity r1` restores R1. Exactness references must match that identity.
 
+Qwen HTTP serving: omitted `--http-batch` = as many slots as memory admits (startup line `http slots N (...)`, built on demand), `N` caps, `0` = one request at a time. In-block decode service, short-first, nested admission and boundary cancellation are on (`STRIX_BATCH_SERVICE_MS`, `STRIX_BATCH_SHORT_FIRST_ROWS`, `STRIX_BATCH_NEST_ROWS`, `STRIX_BATCH_CANCEL_POINTS`; `0` = off). Gates: `tests/batch_service_gpu_gate.py`, `tests/http_slots_gpu_gate.py` ([serving](docs/engine/serving/serving.md#scheduling-qualification)).
+
 Use each engine's built-in exactness gates and compare complete token IDs and logits/state digests.
 Qwen: profile-pair qualification and operator byte checks; DeepSeek pair: both-rank prefill/greedy/verify/batch
 and transport gates; RTX: replica canonical/pressure/plain-speculative chat gates; MiniMax: golden logits,

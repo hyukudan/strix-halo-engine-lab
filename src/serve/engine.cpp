@@ -141,7 +141,8 @@ std::shared_ptr<GenerationTicket> GenerationQueue::submit(GenerationJob job) {
     auto ticket = std::make_shared<GenerationTicket>();
     const std::lock_guard lock(mutex_);
     if (stopping_ || entries_.size() >= max_queued_) return nullptr;
-    ticket->queue_position_.store(entries_.size() + totals_.running);
+    ticket->submitted_queue_position_ = entries_.size();
+    ticket->queue_position_.store(entries_.size());
     ticket->progress_.total_tokens = job.prompt.size();
     job.on_progress = [ptr = ticket.get()](GenerationProgress progress) { ptr->report_progress(progress); };
     ticket->period_ = observe_period();  // one read: armed (odd) and the period still_observed() compares
@@ -162,10 +163,11 @@ void GenerationQueue::run(GenerationEngine& engine, const std::function<void(con
             if (entries_.empty()) return;
             entry = std::move(entries_.front());
             entries_.pop_front();
+            entry.ticket->queue_position_.store(0);
             --totals_.queued;
             ++totals_.running;
             std::uint64_t position = 0;
-            for (auto& waiting : entries_) waiting.ticket->queue_position_.store(++position);
+            for (auto& waiting : entries_) waiting.ticket->queue_position_.store(position++);
         }
         auto ticket = entry.ticket;
         GenerationStats stats;
@@ -218,10 +220,11 @@ std::optional<TakenJob> GenerationQueue::take(bool wait) {
             if (entries_.empty()) return std::nullopt;
             entry = std::move(entries_.front());
             entries_.pop_front();
+            entry.ticket->queue_position_.store(0);
             --totals_.queued;
             ++totals_.running;
             std::uint64_t position = 0;
-            for (auto& waiting : entries_) waiting.ticket->queue_position_.store(++position);
+            for (auto& waiting : entries_) waiting.ticket->queue_position_.store(position++);
         }
         TakenJob taken{std::move(entry.job), entry.ticket, entry.submitted, std::chrono::steady_clock::now()};
         if (taken.ticket->cancelled()) {
@@ -329,6 +332,11 @@ void GenerationQueue::shutdown() {
         stats.finish = "cancelled";
         entry.ticket->finish(stats, "server shutting down");
     }
+}
+
+bool GenerationQueue::has_queued_work() const {
+    std::lock_guard lock(mutex_);
+    return !stopping_ && !entries_.empty();
 }
 
 QueueSnapshot GenerationQueue::snapshot() const {

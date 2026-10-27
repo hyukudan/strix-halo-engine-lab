@@ -17,6 +17,7 @@ namespace strix::serve {
 struct ApiConfig {
     std::string model_id = "qwen3.8-flash-next";
     std::uint32_t default_max_tokens = 4096;
+    std::uint32_t http_slots = 0; // resolved capacity; zero leaves engine-specific headers unset
     bool default_thinking = true;            // the template's default (enable_thinking unset)
     std::string api_key;                     // empty: no authentication
     // Requests with temperature > 0 on an engine without sampling: "greedy" runs them greedy and

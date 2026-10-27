@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/compiled_speculative_verify.hpp"
+#include "strix/known_prefill_cancelled.hpp"
 #include "strix/execution_arena.hpp"
 #include "strix/execution_resources.hpp"
 #include "strix/execution_runtime.hpp"
@@ -24,6 +25,9 @@ struct CompiledLaunchPlan;
 // preflight_plan optionally adds owner policy. preflight_scope proves an owned eager stream and
 // deferred-status parity, and null graph-position arguments. complete drains/checks status before publication.
 struct KnownWindowExecutionHooks {
+    // Loop top after a completed layer; independent of observers and arithmetic skip/fold decisions.
+    std::function<bool()> bundle_closed;
+    std::function<void(std::size_t)> yield_point;
     // Tiled prefill only: a block whose logits are never read (more prompt follows) skips the
     // terminal head step entirely; the result then carries no logit rows.
     bool skip_head = false;

@@ -121,6 +121,15 @@ public:
     void attach_greedy_rows(ExecutionBufferAddress partials, HipGreedyRowsReply* replies);
     // Tiled prefill owners only: observer called after each step of every later block is enqueued
     // (see KnownWindowExecutionHooks::after_step). Set while idle; an empty function removes it.
+    // STRIX_BATCH_SERVICE_MS / STRIX_BATCH_CANCEL_POINTS: idle-only scheduling hook. prepare drains/checks
+    // current D1 and prior deferred completion without publishing this block.
+    using PrefillServicePoint = std::function<void(hipStream_t, const std::function<void()>&)>;
+    void set_prefill_service_point(PrefillServicePoint);
+    void reset_cancelled_prefill();
+    [[nodiscard]] hipStream_t prefill_stream() const noexcept;
+    [[nodiscard]] ExecutionMemoryBinding execution_scratch() const noexcept;
+    [[nodiscard]] bool aliases_prefill_storage(const ExecutionMemoryBinding&) const noexcept;
+    [[nodiscard]] bool aliases_prefill_storage(const HipKnownPrefixWindow&) const noexcept;
     using PrefillStepObserver = std::function<void(std::size_t, const std::function<ExecutionDispatchContext(std::uint32_t)>&)>;
     // observes (optional): the steps the observer reads (it must return at once for the others); empty = every step.
     // STRIX_QPF2K_HC prefill folds stay off for observed steps only.

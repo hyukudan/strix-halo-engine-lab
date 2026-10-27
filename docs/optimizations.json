@@ -1,6 +1,28 @@
 [
   {
     "engine": "qwen",
+    "name": "Automatic HTTP capacity, lazy slot growth and bounded joint groups",
+    "flag_or_env": "--http-batch; STRIX_HTTP_EAGER_SLOTS; --http-max-queue; --http-max-connections",
+    "default": "AUTO capacity; at most 4 eager slots; 65536 queued requests; 4096 connections",
+    "exact": "Contract: complete greedy IDs and prompt/final committed state match explicit single at the same profile and frontier. CPU growth-policy/controller tests and Release compile checks only; GPU lazy-growth capacity matrix pending.",
+    "gain": "Not measured.",
+    "preconditions": "Valid tiled MTP serving assets; prefix windows, draft chain and rows 2,4,8; no single-only feature. Measured stack delta plus future native budgets and active peaks, MemAvailable/GTT and headroom admit extra slots. Queued work with every built slot active appends one slot per engine-loop iteration outside steps and service parks, using the eager factories. Fresh memory observations with headroom can stop growth below capacity; shutdown receipts record built/capacity, lazy build counts/timings and memory decline. Joint groups and draft microbatches retain widths at most eight.",
+    "off_switch": "--http-batch 0 selects the single route; positive N caps capacity with the same eager limit. STRIX_HTTP_EAGER_SLOTS=0 builds all slots eagerly. Incompatible AUTO falls back with a reason; incompatible explicit caps fail. Explicit small staging limits retain 429/503 behavior.",
+    "doc_anchor": "docs/engine/serving/serving.md#batched-decoding"
+  },
+  {
+    "engine": "qwen",
+    "name": "In-block decode service, short-first, nested admission and cancellation points",
+    "flag_or_env": "STRIX_BATCH_SERVICE_MS; STRIX_BATCH_SERVICE_LOOKAHEAD; STRIX_BATCH_SHORT_FIRST_ROWS; STRIX_BATCH_NEST_ROWS; STRIX_BATCH_CANCEL_POINTS",
+    "default": "250 ms; 2 layers; 2048 rows; 2048 rows; 1",
+    "exact": "Generated token IDs and committed target state of every request bitwise equal to the request alone, with service at every layer, nesting and cancel-then-reuse (GPU gates); only MTP predictor rows follow draft batching, as before.",
+    "gain": "3 decoding streams + 32K prompt + 2 short arrivals, default command: decode gap p90 during the 32K prefill 14.3 s -> 0.54 s, short first token 42-52 s -> 2.3-3.8 s, 32K first token 53.1 -> 63.5 s; worst gap left = one on-demand slot build (5.6 s); with 6 slots built at startup worst gap 12.3 s -> 2.8 s.",
+    "preconditions": "Batched tiled MTP route. Nesting: T8192 with the 1024/256/64/16 tails and dense-A8 prefill; groups finish their unit before cancelling.",
+    "off_switch": "Each knob 0; all of service, cancel points and nesting 0 = previous synchronous path.",
+    "doc_anchor": "docs/engine/serving/serving.md#batched-decoding"
+  },
+  {
+    "engine": "qwen",
     "name": "Automatic tiled prefill, expert union and router rows",
     "flag_or_env": "--known-prefix-window; --known-prefix-full-rows; --known-prefix-prefill-rows; --known-prefix-expert-union; --known-window-router-rows; --prefill-numerical-profile",
     "default": "auto",

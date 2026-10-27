@@ -22,15 +22,15 @@ Serving runs on the tiled MTP route, so it takes the flags of a tiled MTP reques
 | `--http-port N` | `8080` | listen port (`0`: any free port, printed on stderr) |
 | `--http-model-id NAME` | `qwen3.8-flash-next` | model name reported by `/v1/models` and responses |
 | `--http-api-key-file FILE` | none | require `Authorization: Bearer KEY` or `x-api-key: KEY` on the API routes |
-| `--http-batch N` | `0` | `1`..`8`: batched decoding with N request slots ([below](#batched-decoding)); `0`: one request at a time |
+| `--http-batch N` | AUTO | omitted: as many request slots as memory admits ([below](#batched-decoding)); `N`: at most N; `0`: one request at a time |
 | `--http-sampling greedy\|reject\|sample` | `greedy` | requests with `temperature > 0`: run greedy and say so in the response, answer 400, or sample (sampling-v1, batched route only) |
 | `--http-default-temperature X` | `0` (built-in) | Qwen HTTP default in [0, 2]; positive values require `--http-sampling sample` |
 | `--http-default-top-k N` | `0` (built-in) | Qwen HTTP default non-negative integer, at most 4294967295 |
 | `--http-default-top-p X` | `1` (built-in) | Qwen HTTP default in (0, 1] |
 | `--http-default-min-p X` | `0` (built-in) | Qwen HTTP default in [0, 1) |
 | `--http-default-max-tokens N` | `4096` | generation budget when a request gives none |
-| `--http-max-queue N` | `64` | waiting requests before new ones get 503 |
-| `--http-max-connections N` | `64` | open connections before new ones get 503 |
+| `--http-max-queue N` | `65536` | waiting requests before new ones get 429; explicit small limits retain rejection |
+| `--http-max-connections N` | `4096` | open connections before new ones get 503; independent of execution slot occupancy |
 | `--http-responses on\|off` | `on` | the stateless `POST /v1/responses` route ([below](#responses-stateless)); `off`: 404 |
 | `--http-capabilities on\|off` | `on` | `GET /v1/capabilities` and its `capabilities_id` in `/health`, `/v1/models`, `/api/status`; `off`: 404, no id |
 | `--http-stream-receipts on\|off` | `on` | the applied-policy `strix` object at the start and end of every stream ([below](#applied-policy-and-keepalive)); `off` together with `--http-sse-keepalive 0 --http-sse-progress-interval 0`: the previous build's bytes |
@@ -91,7 +91,32 @@ sampler and position-keyed uniforms. Greedy receipts omit the seed.
 
 ## Batched decoding
 
-`--http-batch N` keeps N request slots. Each slot owns what a single request owns: target state and session, launch
+Without `--http-batch` the server is batched with as many request slots as memory admits (AUTO). The batched
+route needs prefix windows, the draft chain and window rows `{2,4,8}`; when they are missing, or a single-only
+feature is set (state import, copy windows), AUTO serves one request at a time and says why on startup.
+`--http-batch N` caps the slots at N (an explicit N with incompatible options is an error) and `--http-batch 0`
+selects the one-at-a-time route. AUTO never changes the numerical profile or adds MTP assets.
+
+- Sizing: before allocation the engine builds one extra slot, measures what it took (MemAvailable and GTT
+  deltas, at least the static estimate), adds what every request allocates while it runs (window owners from
+  their compiled plans, MTP runtime and target capture budgets, prompt taps, draft workspaces) and keeps a
+  headroom (`--known-prefix-host-headroom-bytes`, 4 GiB unless set). Shared prefill arenas, sidecar and cache
+  budgets count once. Startup prints `http slots N (auto: limited by ...)` or `(cap C: ...)`; there is no fixed
+  slot ceiling.
+- Startup builds `min(N, STRIX_HTTP_EAGER_SLOTS)` slots (default 4; `0` builds all N). The rest are built one at
+  a time between engine steps as soon as every built slot is busy (`STRIX_HTTP_SPARE_SLOTS=0`: only once work is
+  queued), so a request arriving during a long prompt finds a free slot, through the same code as the eager ones,
+  after re-checking memory (growth stops for the server, with a notice, when a slot no longer fits).
+  A build takes 1.4-2.9 s (measured) and delays that step: it is the longest decode gap of a server that grows;
+  `STRIX_HTTP_EAGER_SLOTS` trades startup time for fewer builds under load.
+- Requests beyond the built slots wait in the queue and are never rejected for busy slots: responses carry
+  `X-Strix-Http-Slots` (capacity) and `X-Strix-Queue-Position` (waiting jobs ahead at submission), the final
+  `strix` receipt `queue_ms`. The queue and connection limits default to 65536 / 4096.
+- Measured (one node, dense serving numerics, T8192, 2026-10-27): AUTO resolved 25 slots (limited by GTT),
+  started with 4 and grew to 12 under 16 clients; every response equalled the `--http-batch 0` response in
+  full token IDs and every committed target-state component.
+
+Each admitted slot owns what a single request owns: target state and session, launch
 plan, PLE backend and prefetch state, tiled prefill backends (the prefill arenas are shared; one prompt runs at a
 time), prefix state cache view (over the shared store), predictor, target producer and its 2/4/8 window owners on one
 window stream shared by all slots. The calibration replay runs once.
@@ -103,6 +128,36 @@ window stream shared by all slots. The calibration replay runs once.
   the other requests, so that a long prompt does not stop them: one prompt unit, then one decode cycle.
   `STRIX_BATCH_PROMPT_SHARE=X` gives the decode cycles at least X times the time of the prompt units (more decode
   progress while prompts wait, later full cohorts); `STRIX_BATCH_INTERLEAVE=0` runs each prompt whole at admission.
+- Long prompts do not stop the other requests inside a block either. Native T-row blocks (and prompt groups)
+  run on a prefill worker thread that can pause at a completed layer: then the engine thread runs one decode
+  round of the decoding requests (cohort cycle as usual) and the block continues with the same T, kernels and
+  rows. A round starts when `STRIX_BATCH_SERVICE_MS` (default 250, `0` = off) of completed GPU prefill time, or of
+  wall time since the last decode round, has passed; `STRIX_BATCH_SERVICE_LOOKAHEAD` (default 2) bounds how many layers the host
+  enqueues ahead of the GPU. The prefill stream is drained before the round and the decode streams before the
+  block resumes; nothing else (admission, prompt finishing, cache publication) runs inside a pause.
+- Short prompts first: between prompt units a prompt with at most `STRIX_BATCH_SHORT_FIRST_ROWS` (default 2048,
+  `0` = oldest first) rows left runs before longer ones.
+- Nested admission: at a pause, also on an otherwise idle server, a queued or waiting request with at most
+  `STRIX_BATCH_NEST_ROWS` (default 2048, `0` = off) uncached rows is prefilled completely on the engine thread
+  through its usual 1024/256/64/16 tail units, which use their own arenas (never the paused block's), with
+  decode rounds between its units; it then decodes with the others and the long block resumes. One nested
+  prompt per pause; T8192 with the default tails and the dense-A8 prefill only (other routes decline, counted
+  in `nest_skip_reasons`).
+- Cancellation (`STRIX_BATCH_CANCEL_POINTS`, default 1) is observed at those layer boundaries: the request's
+  partial block is discarded (nothing is published to the prefix cache), the shared prefill storage is reset
+  and the slot starts fresh. Groups and window cohorts finish their unit first.
+- `STRIX_BATCH_SERVICE_MS=0 STRIX_BATCH_CANCEL_POINTS=0 STRIX_BATCH_NEST_ROWS=0` runs the previous synchronous
+  path (no worker). Receipts (`batch_service`, per request and in the shutdown batch line): `service_rounds`,
+  `service_ms_suspended`, `max_bundle_gpu_ms`, `nested_admits`, `nested_rows`, `nested_ms`, `nest_skip_reasons`,
+  `cancel_points_cancelled`.
+- Exactness: every request's generated IDs and committed target state are bitwise those of the request alone,
+  with or without pauses, nesting and cancellation of other requests. Only the MTP predictor's own rows can
+  differ with concurrency (draft batching), as before; they never decide a token.
+- Measured (3 decoding streams, a 32K prompt, two 1192-token arrivals, default command without `--http-batch`,
+  2026-10-27): decode gap p90 during the 32K prefill 14.3 s -> 0.54 s, short-request first token 42-52 s -> 2.3-3.8 s
+  (both nested), 32K prompt first token 53.1 -> 63.5 s (the time given to the other requests), identical token IDs;
+  the longest gap left (5.6 s) is the spare slot build when the 32K prompt took the last built slot. With 6 slots
+  built at startup the longest gap was 2.8 s (12.3 s without these features).
 - A cycle decodes every request past its prompt: with two or more it is a cohort cycle (cohort windows, D-039: each
   request drafts up to 8 / requests rows, at least 2, and requests are packed into 4- and 8-row windows whose
   weight-reading steps run once for all rows), with one the ordinary cycle. With five to eight requests,
@@ -356,11 +411,13 @@ encode|plain|decode FILE` exposes the tokenizer on the command line.
 
 ## Limits
 
-- Without `--http-batch`: one request at a time, greedy only; concurrent requests wait in the queue.
-- `--http-batch`: at most eight slots; requests beyond them wait in the queue. Prompts run one at a time (block-
-  interleaved with the decode cycles, not batched with each other). With more than four decoding requests a cycle
-  forms two or more 8-row cohort windows (two rows per request), so the aggregate rate stays near that of four.
-- Every slot holds a full context of state memory and its own window owners; memory grows with N.
+- `--http-batch 0`: one request at a time, greedy only; concurrent requests wait in the queue.
+- Batched: prompt blocks of several requests may form a segmented group; one native prompt unit owns the shared
+  prefill arena at a time. With more than four decoding requests a cycle forms several 8-row cohort windows (two
+  rows per request); joint planning (`STRIX_MTP_BATCH_JOINT=1`) runs in groups of at most eight requests.
+- Every built slot holds a full context of state memory and its own window owners; memory grows with the built
+  slots. A nested prompt pauses the long prompt for its own prefill; boundary cancellation is not on the
+  one-at-a-time route.
 - Each request resets the adaptive min-p, depth or survival controller to its configured prior, retaining
   the slot's device owners. Previous requests' acceptance estimates and scheduler-dependent cycle costs
   do not set the new request's draft depth. `STRIX_MTP_REQUEST_RESET=0` retains the earlier policy history
@@ -460,3 +517,24 @@ back to its request owner. Disabled caches preserve the existing borrowed source
 Counters report actual hits/misses/inserts/evictions/invalidations and retained
 rows/bytes per backend, not measured I/O time savings. This cache is distinct
 from the shared full-state serving prefix pool.
+
+## Scheduling qualification
+
+CPU: `strix-batch-service-handoff-tests`, `strix-batch-nested-recipe-tests`, `strix-http-slot-capacity-tests`,
+`strix-mtp-window-controller-tests`, `strix-serve-api-tests`. GPU (pinned model and MTP arguments after `--`,
+output outside the checkout; `STRIX_PROMPT_STATE_DIGEST=1 STRIX_PREFIX_CACHE_DIGEST=1` and
+`STRIX_PREFIX_CACHE_DIGEST_COMPONENTS=1` add `prompt_state_digest`, `final_state_digest`, `final_state_position`
+and per-component `final_state_components` to the responses):
+
+```bash
+# alone vs service off / cancel only / service at every layer; then a short request nested into an idle long one
+python3 tests/batch_service_gpu_gate.py --short SHORT.ids --long LONG.ids --out "$OUT/service" --service-ms 1 -- CMD...
+python3 tests/batch_service_gpu_gate.py --scenario nest --reference "$OUT/service/alone.json" \
+  --short SHORT.ids --long LONG.ids --out "$OUT/nest" -- CMD...
+# --http-batch 0 references vs one AUTO server at 1/2/4/8/16 clients (lazy growth witnessed)
+python3 tests/http_slots_gpu_gate.py --prompt A.ids --prompt B.ids --out "$OUT/slots" --modes auto -- CMD...
+```
+
+The gates compare full token IDs, the final frontier and every committed target component (the prompt digest
+only within one route: the batched route takes it before its last prompt window is folded in) and require
+witnesses (`service_rounds`, `nested_admits`, `cancel_points_cancelled`, `lazy_slot_builds`).

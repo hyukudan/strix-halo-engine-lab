@@ -413,10 +413,13 @@ struct Options {
     std::string http_sampling = "greedy";  // temperature > 0: "greedy" (downgrade, noted), "reject" or "sample" (--http-batch)
     // 0: one request at a time (each from the single request state). 1..8: batched decoding with that many
     // request slots: requests are admitted between decode cycles and decoded together (cohort windows).
-    std::uint32_t http_batch = 0;
+    std::uint32_t http_batch = 0; // resolved route: zero selects the single adapter
+    bool http_batch_explicit = false;
+    std::uint32_t http_batch_cap = 0;
+    std::string http_slot_reason;
     std::uint32_t http_default_max_tokens = 4096;
-    std::uint32_t http_max_queue = 64;
-    std::uint32_t http_max_connections = 64;
+    std::uint32_t http_max_queue = 65536;
+    std::uint32_t http_max_connections = 4096;
     // --rtx-state-import: opt-in /admin/rtx-import/* routes; a request whose prompt starts with a parked imported
     // state starts from it (docs/rtx-state-import.md). Single-request serving only (not --http-batch).
     bool rtx_state_import = false;
@@ -786,7 +789,30 @@ inline void validate_prefix_state_cache(const Options& o) {
         throw std::invalid_argument("at most 64 --prefix-cache-then-prompt requests");
 }
 
-// HTTP serving runs the tiled MTP route: one calibration replay, then one request at a time.
+// Resolve compatibility before route-dependent validation. A cap never enables missing prerequisites.
+inline std::string http_batch_incompatibility(const Options& o) {
+    if (o.rtx_state_import) return "single-only state import";
+    if (!o.mtp.copy_wide_rows.empty()) return "single-only copy-wide";
+    if (!o.mtp.window_prefix || !o.mtp.draft_chain ||
+        o.mtp.window_rows_set != std::vector<std::uint32_t>{2U, 4U, 8U})
+        return "missing prefix windows, draft chain or rows 2,4,8";
+    return {};
+}
+inline void resolve_http_route(Options& o) {
+    if (!o.http_serve) return;
+    o.http_slot_reason = http_batch_incompatibility(o);
+    if (o.http_batch_explicit && !o.http_batch_cap) {
+        o.http_batch = 0;
+        o.http_slot_reason = "explicit single route";
+    } else if (!o.http_slot_reason.empty()) {
+        if (o.http_batch_explicit) throw std::invalid_argument("--http-batch: " + o.http_slot_reason);
+        o.http_batch = 0;
+    } else {
+        o.http_batch = o.http_batch_cap ? o.http_batch_cap : 1U;
+        o.http_slot_reason = "capacity pending measured startup";
+    }
+}
+// HTTP serving runs the tiled MTP route after one calibration replay.
 inline void validate_http_serve(const Options& o) {
     if (o.rtx_state_import && (!o.http_serve || o.http_batch))
         throw std::invalid_argument("--rtx-state-import requires --http-serve (the tiled MTP prompt) without --http-batch");
@@ -799,9 +825,9 @@ inline void validate_http_serve(const Options& o) {
             "--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T)");
     if (o.http_port > 65535U || o.http_bind.empty() || o.http_model_id.empty() || !o.http_default_max_tokens ||
         !std::isfinite(o.http_sse_progress_interval) || o.http_sse_progress_interval < 0.0 ||
-        !std::isfinite(o.http_sse_keepalive) || o.http_sse_keepalive < 0.0 || !o.http_max_queue || !o.http_max_connections || o.http_batch > 8U ||
+        !std::isfinite(o.http_sse_keepalive) || o.http_sse_keepalive < 0.0 || !o.http_max_queue || !o.http_max_connections ||
         (o.http_sampling != "greedy" && o.http_sampling != "reject" && o.http_sampling != "sample"))
-        throw std::invalid_argument("--http-* values: port <= 65535, non-empty bind/model id, positive limits, batch 0..8, "
+        throw std::invalid_argument("--http-* values: port <= 65535, non-empty bind/model id, positive limits, batch cap or 0, "
             "sampling greedy|reject|sample, keepalive/progress seconds >= 0");
     if (o.http_sampling == "sample" && !o.http_batch)
         throw std::invalid_argument("--http-sampling sample runs on the batched route (--http-batch N)");
@@ -1200,9 +1226,9 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
     if(!m.cohort.empty() && tiled) {
         // Tiled prompt: every request runs its prompt like a served request (calibration once, no golden).
         // A split prefill profile runs every slot's tiled blocks on the prefill profile (as a single request's).
-        if(m.cohort.size()>7U || o.http_serve || !m.window_prefix || !m.draft_chain ||
+        if(o.http_serve || !m.window_prefix || !m.draft_chain ||
            m.window_rows_set!=std::vector<std::uint32_t>{2U,4U,8U})
-            throw std::invalid_argument("MTP cohort requests on the tiled prompt (at most seven besides the positional prompt) "
+            throw std::invalid_argument("MTP cohort requests on the tiled prompt "
                 "require prefix windows over the row set 2,4,8 and the draft chain");
         for(const auto& request:m.cohort)
             if(request.tokens.empty() || ((resolved || o.context_explicit) && (request.tokens.size()>=o.context_tokens ||
@@ -1689,7 +1715,10 @@ inline Options parse_options(
                 }
             } else if (argument == "--http-default-max-tokens") options.http_default_max_tokens = u32("HTTP default max tokens");
             else if (argument == "--http-max-queue") options.http_max_queue = u32("HTTP queue");
-            else if (argument == "--http-batch") options.http_batch = u32("HTTP batch");
+            else if (argument == "--http-batch") {
+                options.http_batch = options.http_batch_cap = u32("HTTP batch");
+                options.http_batch_explicit = true;
+            }
             else if (argument == "--rtx-state-import-decode-threads") options.rtx_state_import_decode_threads = u32("rtx import decode threads");
             else options.http_max_connections = u32("HTTP connections");
             continue;
@@ -2567,6 +2596,7 @@ inline Options parse_options(
     if (!options.prefill_profile_deferred || options.route_owned || options.numerical_profile_explicit)
         validate_prefill_numerical_profile_cli(options);
     apply_mtp_draft_profile(options.mtp);
+    resolve_http_route(options);
     validate_mtp_cli(options);
     validate_prefix_state_cache(options);
     validate_http_serve(options);
