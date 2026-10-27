@@ -1,3 +1,4 @@
+#include "minimax/engine/route_identity.hpp"
 // minimax-m3 decode MoE and dense EXL3 linears (identity and launch structure: mmx_moe.hpp).
 #include "minimax/moe/mmx_moe.hpp"
 
@@ -1124,7 +1125,7 @@ int moe_wide() {
     }();
     return w;
 }
-bool wide_for(unsigned rows) { return moe_wide() == 1 || (moe_wide() == 2 && rows >= 2 && rows <= 4); }
+bool wide_for(unsigned rows) { return route::wide_for(rows, moe_wide()); }
 template <int MaxR, int Depth, int W, int DepthBig, bool SkipShared = false>
 void launch_experts4w(const Args& a, hipStream_t stream, hipEvent_t* marks) {
     if (W == 4 && wide_for(a.rows)) {
@@ -2401,15 +2402,7 @@ template <int Depth> void launch_linear_core(const LinPlan& p, hipStream_t strea
 //     12288 -> 6144 (down)     v10 at N1-2, v9 at N3-8 (v9/v10 0.87-0.90)
 //     6144 -> 8192 (q+k+v) v8 as the other q+k+v groups; 8192 -> 6144 (o) v10 as the other shapes
 int scheduled_linear_version(const LinearJob* jobs, unsigned count, unsigned rows) {
-    const Exl3& w = jobs[0].w;
-    if (w.output >= 65536) return 4;
-    if (w.input == 6144 && w.output == 12288) return rows <= 4 ? 8 : 10;
-    if (w.input == 12288 && w.output == 6144) return rows <= 2 ? 10 : 9;
-    if (count == 3 || (w.input == 6144 && w.output == 4096)) return 8;
-    if (w.output == 256) return rows <= 4 ? 4 : 8;
-    if (w.input == 4096 && w.output == 6144) return rows == 1 ? 10 : (rows == 2 ? 9 : (rows <= 4 ? 4 : 8));
-    if (w.input == 6144 && w.output == 6144) return rows <= 4 ? 10 : 8;
-    return w.output % 256 == 0 ? 10 : (rows == 1 || rows == 8 ? 4 : 8);
+    return route::scheduled_linear_version(jobs[0].w.input, jobs[0].w.output, count, rows);
 }
 
 namespace {

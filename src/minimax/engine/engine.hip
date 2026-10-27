@@ -1,3 +1,4 @@
+#include "minimax/engine/route_identity.hpp"
 // MiniMax M3.1 Flash engine, TP2 (see include/strix/minimax/engine.hpp and qualification notes).
 //
 // Layer flow (per call of n rows), identical to the G4 harness (tests/hip_minimax_g4.hip) so the teacher-forced gate is
@@ -654,7 +655,7 @@ struct Engine::Impl {
             if (pf_group < 2 || pf_group > 4) throw std::invalid_argument("STRIX_MM_PF_GROUP must be 2..4");
         }
         const char* pid = std::getenv("STRIX_MM_PREFILL_IDENTITY");
-        fp32_prefill = pid != nullptr && std::string(pid) == "fp32";
+        fp32_prefill = route::fp32_profile(pid);
         if (fp32_prefill && (!linears_loaded || !moe_opt)) throw std::invalid_argument("STRIX_MM_PREFILL_IDENTITY=fp32 needs STRIX_MM_LINEARS and STRIX_MM_MOE on");
     }
 
@@ -1339,7 +1340,7 @@ struct Engine::Impl {
                 if (tl) tl->mark("q-projection", false);
                 if (tl) tl->mark("k-projection", true);
                 const bool tile_override = !gemv && n > 8 && pf_kv_tile != -1 && kv_tile_available();
-                const int cfg = pf_kv_tile == -2 ? (n >= 2048 ? 1 : 7) : pf_kv_tile;
+                const int cfg = route::kv_tile_config(n, pf_kv_tile);
                 const bool receipt = tile_override && pf_kv_receipts.emplace(n, cfg).second;
                 int kt = -1, vt = -1;
                 // Each process-wide override covers only one K/V submission, including
@@ -1452,8 +1453,7 @@ struct Engine::Impl {
                 }
             } else if (attn_fused && step_seqs != 0) {  // all rows in two launches (one dense launch below 2048 positions)
                 std::uint16_t* const* tab = cache_tab_d + std::size_t{L} * 3 * kMaxStepRows;
-                bool dense = true;
-                for (std::size_t r = 0; r < n; ++r) dense &= rows[r].pos < msa::kTopK * msa::kBlock;
+                const bool dense = route::step_dense(rows, msa::kTopK * msa::kBlock);
                 mfused::DecodeView dv{};
                 dv.seqs = step_seqs;
                 dv.rows_per_seq = step_rows_per_seq;
@@ -1735,7 +1735,7 @@ struct Engine::Impl {
         const bool module = pf != nullptr && pf_on && !pf_force_comm;
         task.grouped = pf_interleave && (module || pf_comm_interleave) && !profiling && !(taps_on && tap_sink) && task.chunks >= 2;
         task.m = task.grouped ? std::min<std::size_t>(pf_group, task.chunks) : 1;  // the first unit (as prefill_resume sets it)
-        task.rows = std::min<std::size_t>(task.m * opt.max_rows, toks.size());
+        task.rows = route::unit_rows(task.m, opt.max_rows, toks.size());
         task.open = true;
         if (timeline) timeline->begin();
     }
@@ -1771,10 +1771,10 @@ struct Engine::Impl {
             while (task.c0 < toks.size()) {
                 if (task.layer == 0) {
                     task.m = task.grouped ? std::min<std::size_t>(pf_group, task.chunks - task.c) : 1;
-                    task.rows = std::min<std::size_t>(task.m * opt.max_rows, toks.size() - task.c0);
+                    task.rows = route::unit_rows(task.m, opt.max_rows, toks.size() - task.c0);
                 }
                 if (left == 0) break;
-                const unsigned L0 = task.layer, L1 = L0 + std::min<unsigned>(left, kLayers - L0);
+                const unsigned L0 = task.layer, L1 = route::layer_end(L0, left, kLayers);
                 left -= L1 - L0;
                 const std::size_t c0 = task.c0, rows = task.rows, m = task.m;
                 const bool last = c0 + rows == toks.size();
@@ -2053,14 +2053,9 @@ struct Engine::Impl {
             toks[r] = rows[r].token;
         }
         gemv = true;
-        bool distinct = true, one_slot = true;
-        for (std::size_t r = 0; r < n; ++r)
-            for (std::size_t s = 0; s < r; ++s) {
-                distinct &= rows[s].slot != rows[r].slot;
-                one_slot &= rows[s].slot == rows[r].slot;
-            }
-        step_seqs = distinct ? static_cast<std::uint32_t>(n) : one_slot ? 1U : 0U;
-        step_rows_per_seq = distinct ? 1U : one_slot ? static_cast<std::uint32_t>(n) : 0U;
+        const auto layout = route::step_layout(rows);
+        step_seqs = layout.seqs;
+        step_rows_per_seq = layout.rows_per_seq;
         if (attn_fused && step_seqs != 0) {  // per-step tables of the fused MSA view: cache pointers, RoPE rows, positions
             for (unsigned L = 0; L < kLayers; ++L)
                 for (std::size_t r = 0; r < step_seqs; ++r) {

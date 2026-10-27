@@ -1,5 +1,6 @@
 // minimax-m3 prefill MoE: grouped launches over all experts of a chunk (identity: mmx_prefill.hpp).
 #include "minimax/moe/mmx_prefill.hpp"
+#include "minimax/engine/route_identity.hpp"
 
 #include "minimax/moe/mmx_prefill_core.hpp"
 #include "minimax/moe/mmx_trellis_device.hpp"
@@ -13,53 +14,12 @@
 
 namespace strix::minimax::moe::opt {
 
-// ---------------------------------------------------------------- strix-trellis 0.3 policy (verbatim port)
-namespace {
-bool medium_prefill_candidate(unsigned input, unsigned output, unsigned bits, unsigned rows) {
-    if (rows < 32) return false;  // codebook is always mul1 here
-    if (rows >= 256) return (bits == 6 && input == 5120 && output == 1280) || (bits == 5 && input == 4096 && output == 1024);
-    if (bits == 6) return input == 5120 && output == 1280;
-    if (bits != 5) return false;
-    return (input == 1280 && output == 32768) || (input == 8192 && output == 5120) || (input == 5120 && output == 2304) ||
-           (input == 2304 && output == 5120) || (input == 4096 && output == 1024);
-}
-unsigned measured_vector_splits(unsigned input, unsigned output, unsigned bits, unsigned rows) {
-    if (bits == 5) {
-        if (input == 4096 && output == 1024 && (rows == 1 || rows == 4 || rows == 8)) return 16;
-        if (input == 5120 && output == 2304 && rows == 8) return 8;
-    }
-    return output <= 1024 ? 32U : (output <= 4096 && input >= 4096 ? 16U : 4U);
-}
-}  // namespace
-
+// Adopted strix-trellis 0.3 policy, shared with the host-only route census.
 unsigned gemm_tile_rows(unsigned input, unsigned output, unsigned bits, unsigned rows) {
-    return medium_prefill_candidate(input, output, bits, rows) || (rows >= 256 && output >= 2304) ||
-                   (rows >= 64 && output >= 32768 && bits == 5)
-               ? 64U
-               : 16U;
+    return route::gemm_tile_rows(input, output, bits, rows);
 }
-
 unsigned gemm_splits(unsigned input, unsigned output, unsigned bits, unsigned rows) {
-    std::size_t requested;
-    if (rows > 8) {
-        const std::size_t tile_m = gemm_tile_rows(input, output, bits, rows);
-        const std::size_t groups = ((rows + tile_m - 1) / tile_m) * ((output + 63U) / 64U);
-        if (medium_prefill_candidate(input, output, bits, rows)) {
-            if (output >= 32768) {
-                requested = rows < 64 ? 4 : 1;
-            } else {
-                const std::size_t target = rows > 64 && rows % 64 ? 512 : 256;
-                requested = 1;
-                while (groups * requested < target && requested < 16) requested *= 2;
-            }
-        } else {
-            requested = 1;
-            while (groups * requested < 160 && requested < 32) requested *= 2;
-        }
-    } else {
-        requested = measured_vector_splits(input, output, bits, rows);
-    }
-    return static_cast<unsigned>(std::min<std::size_t>(requested, input / 16));
+    return route::gemm_splits(input, output, bits, rows);
 }
 
 namespace {
@@ -504,13 +464,7 @@ Plan make_plan(const PrefillMoeView& v) {
         throw std::invalid_argument("minimax prefill moe: null pointer in view");
     const unsigned T = v.rows;
     Plan p;
-    std::vector<std::vector<std::uint32_t>> erows(kExperts);
-    for (unsigned t = 0; t < T; ++t)
-        for (unsigned k = 0; k < kTopE; ++k) {
-            const std::uint32_t e = v.ids[std::size_t{t} * kTopE + k];
-            if (e >= kExperts) throw std::invalid_argument("minimax prefill moe: expert id out of range");
-            erows[e].push_back(t);
-        }
+    const auto erows = route::expert_rows(std::span<const std::uint32_t>(v.ids, std::size_t{T} * kTopE), T, kExperts, kTopE);
     std::vector<std::uint32_t> group_of(kExperts, ~0U);
     auto add_group = [&](const ExpertSlices& w, const std::vector<std::uint32_t>& rows) {
         PGroup g{};
@@ -711,9 +665,9 @@ V2Items fill_items_v2(const Plan& p, unsigned char* ws, bool tiled, bool mtfit, 
                 }
             };
             if (tiled && mtfit) {
-                const unsigned main = g.n / 128, rem = g.n % 128;
-                if (main != 0) emit(7, 0, main);
-                if (rem != 0) emit((rem + 15) / 16 - 1, main * 128, 1);
+                const auto fit = route::mtfit(g.n);
+                if (fit.main != 0) emit(7, 0, fit.main);
+                if (fit.remainder != 0) emit(fit.tail_class, fit.main * 128, 1);
             } else {
                 emit(tiled ? pfk::mt_of_class(cls) - 1 : cls, 0, (g.n + tm - 1) / tm);
             }

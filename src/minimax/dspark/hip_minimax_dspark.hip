@@ -1,3 +1,4 @@
+#include "../engine/route_identity.hpp"
 // MiniMax DSpark drafter: gfx1151 kernels of "mm-dspark-v1" (see minimax_dspark.hpp for the declared orders) and the
 // DeviceDrafter. Build with -ffp-contract=off: every product and sum below is one FP32 operation, as in the host code.
 #include "hip_minimax_dspark.hpp"
@@ -945,7 +946,7 @@ void DeviceDrafter::append_now(std::uint32_t slot, const float* taps_rows, std::
     // Rows older than the window of the last one are never read: skip them.
     const std::size_t skip = n > window ? n - window : 0;
     for (std::size_t r0 = skip; r0 < n;) {
-        const std::size_t m = n - r0 >= 32 ? 32 : std::min<std::size_t>(8, n - r0);
+        const std::size_t m = route::append_rows(n - r0);
         const std::uint64_t p = pos0 + r0;
         linear(0, lin_fc, taps_rows + r0 * tap_width, m, ctx_fc_, st);
         rms_norm(ctx_fc_, dev_.hidden_norm, m, ctx_c_, st);

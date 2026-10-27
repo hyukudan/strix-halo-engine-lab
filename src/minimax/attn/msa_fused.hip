@@ -1,3 +1,4 @@
+#include "minimax/engine/route_identity.hpp"
 // minimax-m3 MSA decode, fused and batched (src/minimax/attn/msa_fused.hpp). Every arithmetic step is the one of
 // src/hip_minimax_msa.hip (K1-K4) in the same order, so the outputs are bit-identical; what changes is who computes
 // it (fewer launches, N sequences per launch) and how the caches are read (coalesced tiles through LDS).
@@ -1959,11 +1960,7 @@ void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarke
         const unsigned r0 = first * kMaxRows;
         PrefillView batch{prefill_offset(v, r0), p.rows - r0, p.pos0 + r0, p.scratch_windows, 0, p.index_tile, p.index_rows, p.msa_rework};
         if (batch.rows > nw * kMaxRows) batch.rows = nw * kMaxRows;
-        unsigned dense = 0;
-        for (; dense < nw; ++dense) {
-            const unsigned end = (dense + 1) * kMaxRows < batch.rows ? (dense + 1) * kMaxRows : batch.rows;
-            if (batch.pos0 + end - 1 >= kTopK * kBlock) break;
-        }
+        const unsigned dense = route::dense_windows(batch.pos0, batch.rows, nw, kMaxRows, kTopK * kBlock);
         const unsigned sparse = nw - dense;
         if (sparse != 0) {
             batch.first_window = dense;
