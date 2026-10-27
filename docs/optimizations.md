@@ -708,6 +708,23 @@ Discover a DSpark-MXFP4 GGUF and auto vocabulary beside the model/packs.
 - **Measured gain:** No isolated measurement
 - **Implementation / evidence:** [Resolver](../src/deepseek41_pair_defaults.cpp), [contract](models/deepseek-v4.1/production-defaults.md)
 
+<a id="ds-engram-tp"></a>
+
+### Engram projection split across ranks
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_ENGRAM_TP`. **Default:** on for single-row steps.
+
+The two ranks each compute half of the Engram projection's output rows (same per-row arithmetic) and exchange the
+halves, instead of both reading the whole ~160 MB weight.
+
+- **Preconditions:** Two ranks with the F8 Engram KV (STRIX_DS41_F16_AS_F8); otherwise each rank runs the full projection.
+- **Automatic selection:** On for every single-row DeviceForward / BatchForward step (decode or prompt row); `=1` also applies it up to 8 rows.
+- **Fallback notice:** Without two ranks or the F8 Engram KV, the full projection runs on each rank.
+- **Exactness evidence:** Bitwise: R1-R8 verify windows with rejects equal the archived full-projection digests on both ranks; batch N1/N2/N4/N8 in-process A/B (fed, argmax, gathered logits per row and final attention states) identical, also on the communicator fallbacks.
+- **Off switch:** STRIX_DS41_ENGRAM_TP=0
+- **Measured gain:** R1 decode −0.61 ms/step (−2.1 %); not significant at R6, so it stays off for multi-row steps by default
+- **Implementation / evidence:** [production defaults](models/deepseek-v4.1/production-defaults.md)
+
 <a id="ds-shared-grouped"></a>
 
 ### Grouped shared expert
