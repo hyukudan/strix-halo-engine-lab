@@ -6232,6 +6232,13 @@ std::uint64_t implementation_identity(
 
 }  // namespace
 
+bool qsa_prefill_bundle_closed() noexcept {
+    const auto& select=qpf2k_select_batch();const auto& index=qpf2k_index_batch();const auto& attend=qsa_fast_batch();
+    return !select.active && select.rows.empty() && select.traced.empty() && !index.active && index.groups.empty() &&
+        !attend.active && attend.groups.empty();
+}
+
+
 namespace {
 // Prefill: every 8-row tile is admitted like a window call. Input and output projections run
 // 64 rows per launch (R1-exact wide q8_rows); the attention part runs tile by tile in increasing

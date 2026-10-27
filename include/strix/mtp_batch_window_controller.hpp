@@ -46,6 +46,7 @@ public:
     // The last plan(): its expected tokens and ms (target estimate + draft estimate), and whether it was a probe.
     struct PlanInfo {double expected=0.0, ms=0.0; bool probe=false;};
     [[nodiscard]] const PlanInfo& last_plan() const noexcept {return last_;}
+    void resize_slots(std::size_t slots) {history_.resize(slots);}
     void reset(std::uint32_t slot) {history_.at(slot)={};}
     // Before paying for drafts: rows 0 means no draft; otherwise draft rows-1.
     [[nodiscard]] std::vector<std::uint32_t> plan(std::span<const Request>,std::uint32_t budget);

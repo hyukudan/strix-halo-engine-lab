@@ -884,6 +884,12 @@ struct ApiService::Impl {
         return ticket;
     }
 
+    void queue_headers(HttpResponseWriter& response, const GenerationTicket& ticket) const {
+        if (!config.http_slots) return;
+        response.add_response_header("X-Strix-Http-Slots", std::to_string(config.http_slots));
+        response.add_response_header("X-Strix-Queue-Position", std::to_string(ticket.submitted_queue_position()));
+    }
+
     static Json usage_json(const Outcome& o) {
         Json usage = Json::object();
         usage.set("prompt_tokens", Json(o.stats.prompt_tokens));
@@ -997,6 +1003,7 @@ struct ApiService::Impl {
         const auto limit = max_tokens(body, prompt.tokens.size());
         const auto initial_receipt = config.stream_receipts || spec ? receipt(nullptr, note, body, limit, sampling_params, spec) : Json();
         auto ticket = submit(prompt.tokens, limit, sampling_params, body, prompt.stable_prefix, spec);
+        queue_headers(response, *ticket);
         const auto id = random_id("chatcmpl-");
         const auto created = unix_now();
         RecentRequest entry{id, "chat.completions", "ok", created};
@@ -1465,6 +1472,7 @@ struct ApiService::Impl {
         const auto limit = max_tokens(body, prompt.size());
         const auto initial_receipt = config.stream_receipts ? receipt(nullptr, note, body, limit, sampling_params) : Json();
         auto ticket = submit(prompt, limit, sampling_params, body);
+        queue_headers(response, *ticket);
         const auto id = random_id("cmpl-");
         const auto created = unix_now();
         RecentRequest entry{id, "completions", "ok", created};
@@ -1607,6 +1615,7 @@ struct ApiService::Impl {
         const auto limit = max_tokens(body, prompt.tokens.size());
         const auto initial_receipt = config.stream_receipts ? receipt(nullptr, note, body, limit, sampling_params) : Json();
         auto ticket = submit(prompt.tokens, limit, sampling_params, body, prompt.stable_prefix);
+        queue_headers(response, *ticket);
         const auto id = random_id("msg_");
         RecentRequest entry{id, "messages", "ok", unix_now()};
         const auto stop_reason = [&](const Outcome& o, bool tools) {

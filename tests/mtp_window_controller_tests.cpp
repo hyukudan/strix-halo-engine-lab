@@ -1,3 +1,4 @@
+#include "strix/mtp_cohort_partition.hpp"
 #include "strix/mtp_window_controller.hpp"
 #include "strix/mtp_batch_window_controller.hpp"
 
@@ -65,6 +66,24 @@ double share(const Run& r,std::uint32_t rows) {
 } // namespace
 
 int main() {
+    for (const std::size_t count : {0U, 1U, 2U, 8U, 9U, 16U, 19U}) {
+        for (std::size_t round = 0; round < count + 2U; ++round) {
+            std::vector<unsigned> seen(count, 0U);
+            strix::MtpBatchWindowController controller(count);
+            for (const auto& group : strix::mtp_cohort_partition(count, round)) {
+                expect(!group.empty() && group.size() <= 8U, "bounded joint group");
+                std::vector<strix::MtpBatchWindowController::Request> requests;
+                for (const auto slot : group) {
+                    ++seen.at(slot);
+                    requests.push_back({static_cast<std::uint32_t>(slot), 2U, {}});
+                }
+                const auto plan = controller.plan(requests, 32U);
+                expect(plan.size() == group.size(), "controller accepts partition with stable global slot IDs");
+            }
+            expect(std::all_of(seen.begin(), seen.end(), [](unsigned n) { return n == 1U; }), "round covers every live slot once");
+        }
+    }
+
     {
         MtpWindowCostEstimate legacy(Model::legacy);
         legacy.add(100.0);legacy.add(300.0);
@@ -250,6 +269,19 @@ int main() {
         expect(c.restore_shared(),"restore after a snapshot");
         for(int k=0;k<40;++k) second.push_back(c.plan(q,16));
         expect(first==second,"a restored controller replays the same plans");
+    }
+    {
+        strix::MtpBatchWindowController growing(1), eager(5);
+        const std::vector<float> probabilities(7, 0.8F);
+        const std::vector<strix::MtpBatchWindowController::Request> initial{{0,8,probabilities}};
+        const std::array<std::uint32_t,1> rows{8}, accepted{5};
+        growing.observe(initial,rows,accepted,1.0,5.0,7);
+        eager.observe(initial,rows,accepted,1.0,5.0,7);
+        growing.resize_slots(5);
+        growing.reset(4);eager.reset(4);
+        const std::vector<strix::MtpBatchWindowController::Request> q{{0,8,probabilities},{4,8,probabilities}};
+        expect(growing.choose(q,16)==eager.choose(q,16),"growth preserves old history and initializes appended slots like eager slots");
+        expect(growing.plan(q,16)==eager.plan(q,16),"growth preserves shared planning state");
     }
     if(failures) {std::cerr<<failures<<" failure(s)\n";return 1;}
     std::cout<<"mtp window controller: legacy R2 share "<<share(stuck,2)<<", robust R8 share "<<share(fixed,8)

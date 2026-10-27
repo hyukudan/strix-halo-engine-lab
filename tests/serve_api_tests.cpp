@@ -214,19 +214,31 @@ std::vector<Json> sse_data(const std::string& body) {
 // The pull interface of batching engines: FIFO order, jobs cancelled while queued finished and skipped,
 // tokens published into the ticket, totals per finished job, nothing after shutdown.
 void test_batched_queue() {
+    GenerationQueue small(1);
+    check(small.submit({}) && !small.submit({}), "explicit small queue retains rejection");
     GenerationQueue queue(8);
+    check(!queue.has_queued_work(), "empty queue hint");
     const auto job = [](std::uint32_t token) { GenerationJob j; j.prompt = {token, token + 1U}; return j; };
     const auto t1 = queue.submit(job(1)), t2 = queue.submit(job(3)), t3 = queue.submit(job(5));
     check(t1 && t2 && t3, "batched queue submit");
+    check(queue.has_queued_work(), "queued work hint");
+    check(t1->queue_position() == 0U && t2->queue_position() == 1U && t3->queue_position() == 2U,
+        "initial position counts waiting jobs ahead");
     t2->cancel();
     auto a = queue.take(false);
     check(a && a->ticket == t1 && a->job.prompt.front() == 1U, "batched queue takes the oldest job");
+    check(t3->queue_position() == 1U && t3->submitted_queue_position() == 2U,
+        "updated position excludes running job and preserves submission snapshot");
+    const auto t4 = queue.submit(job(9));
+    check(t4->submitted_queue_position() == 2U, "submit excludes running job");
+    t4->cancel();
     auto b = queue.take(false);
     check(b && b->ticket == t3, "batched queue skips a job cancelled while queued");
     bool done = false;
     static_cast<void>(t2->wait(std::chrono::milliseconds(0), done));
     check(done && t2->stats().finish == "cancelled", "batched queue finishes the cancelled job");
     check(!queue.take(false), "batched queue is empty");
+    check(!queue.has_queued_work(), "running jobs do not count as queued work");
     const std::uint32_t tokens[] = {7, 8};
     check(a->job.on_tokens(tokens), "batched job publishes");
     done = false;
@@ -238,12 +250,13 @@ void test_batched_queue() {
     queue.finish(*a, stats);
     queue.finish(*b, {}, "engine failure");
     const auto snap = queue.snapshot();
-    check(snap.completed == 1U && snap.failed == 1U && snap.cancelled == 1U && snap.running == 0U && snap.queued == 0U &&
+    check(snap.completed == 1U && snap.failed == 1U && snap.cancelled == 2U && snap.running == 0U && snap.queued == 0U &&
           snap.generated_tokens == 2U, "batched queue totals");
     static_cast<void>(t1->wait(std::chrono::milliseconds(0), done));
     check(done && t1->stats().finish == "stop" && t3->error() == "engine failure", "batched tickets finished");
     queue.shutdown();
     check(!queue.take(true) && queue.stopping(), "batched queue after shutdown");
+    check(!queue.has_queued_work(), "shutdown queue hint");
 }
 
 // A fake target owns the predicted frontier, just like the HIP ticket. The
@@ -446,6 +459,7 @@ int main() try {
     GenerationQueue queue;
     ApiConfig config;
     config.model_id = "test-model";
+    config.http_slots = 9;
     config.stop_tokens = {tokenizer->find("<|im_end|>"), tokenizer->find("<|endoftext|>")};
     config.api_key = "secret";
     config.sse_keepalive_seconds = 0.3;
@@ -1226,6 +1240,8 @@ int main() try {
     }
     {
         const auto r = http(port, "POST", "/v1/chat/completions", R"({"model":"x","messages":[{"role":"user","content":"Hi"}]})", auth);
+        check(r.headers.find("X-Strix-Http-Slots: 9") != std::string::npos &&
+              r.headers.find("X-Strix-Queue-Position: 0") != std::string::npos, "capacity and submission headers");
         check(r.status == 200, "chat status " + std::to_string(r.status) + " " + r.body);
         const auto j = parse_json(r.body);
         const auto& message = at(first_choice(j), "message");
@@ -1317,6 +1333,8 @@ int main() try {
         std::thread tb([&] { b = http(port, "POST", "/v1/chat/completions", R"({"messages":[{"role":"user","content":"Hi"}],"stream":true})", auth); });
         ta.join(); tb.join();
         check(a.status == 200 && at(at(parse_json(a.body), "usage"), "completion_tokens").as_int() == 60, "concurrent client A");
+        check(b.headers.find("X-Strix-Http-Slots: 9") != std::string::npos &&
+              b.headers.find("X-Strix-Queue-Position:") != std::string::npos, "stream submission headers");
         check(b.status == 200 && stream_text(b.body, nullptr, nullptr, nullptr, nullptr) == "Hello there, friend.", "concurrent client B");
     }
     {

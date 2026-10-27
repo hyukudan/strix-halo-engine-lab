@@ -18,6 +18,8 @@
 
 namespace strix {
 
+// STRIX_BATCH_SERVICE_MS: diagnostic closure certificate after a complete launcher returns.
+[[nodiscard]] bool qsa_prefill_bundle_closed() noexcept;
 class HipQsaWindowPool;
 // One eager window owner's cache. The owner must invalidate it before replacing
 // its session's committed prefix (discard_deferred does this), and retain it

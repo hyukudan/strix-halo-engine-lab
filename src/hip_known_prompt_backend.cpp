@@ -256,6 +256,8 @@ struct HipKnownPromptBackend::Impl {
                 add_prompt_stat(next.r2_variant_dispatches[i], result.r2_variant_dispatches[i], next.saturated);
             observed = next;
             return logits;
+        } catch(const KnownPrefillCancelled&) {
+            throw;
         } catch (...) {
             failed = true;
             // STRIX_QPF2K_SCHED bit 2: a previous block of this owner still unchecked (any failure of this call, also
@@ -425,6 +427,8 @@ std::vector<std::vector<float>> HipKnownPromptBackend::execute_group(HipKnownPro
             self.observed = next;
         }
         return logits;
+    } catch(const KnownPrefillCancelled&) {
+        throw;
     } catch (...) {
         for (std::size_t m = 0; m < members.size(); ++m) {
             auto& self = *impls[m];

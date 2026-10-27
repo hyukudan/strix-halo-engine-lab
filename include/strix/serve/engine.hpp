@@ -171,6 +171,9 @@ public:
     void report_progress(GenerationProgress progress);
     bool publish(std::span<const std::uint32_t> tokens);
     void finish(GenerationStats stats, std::string error = {});
+    // Waiting jobs ahead; running jobs do not contribute. The immutable submission
+    // snapshot is safe to expose even if the engine takes the job before headers.
+    [[nodiscard]] std::uint64_t submitted_queue_position() const noexcept { return submitted_queue_position_; }
     [[nodiscard]] std::uint64_t queue_position() const noexcept { return queue_position_.load(); }
     // The job was submitted after the instrumentation armed (GenerationJob::observed; fixed before the job is queued) and
     // its armed period did not expire before it finished (the queue clears it then, before finishing the ticket).
@@ -187,6 +190,7 @@ private:
     bool done_ = false;
     std::atomic<bool> cancelled_{false};
     bool observed_ = false;
+    std::uint64_t submitted_queue_position_ = 0;
     std::uint64_t period_ = 0;  // observe_period() at submit
     friend class GenerationQueue;
 };
@@ -258,6 +262,7 @@ public:
     // run(): the oldest job that is not cancelled, waiting for one when `wait` (nullopt when none is
     // queued, or after shutdown). Jobs cancelled while queued are finished here.
     std::optional<TakenJob> take(bool wait);
+    [[nodiscard]] bool has_queued_work() const;
     // The end of a taken job: fills queue_ms, updates the totals and finishes its ticket.
     // Engines may call it inside their own timed regions (a batching runner that times a prompt unit and completes a
     // request in it). The observation it adds reads and writes only the queue's own counters, never an engine's

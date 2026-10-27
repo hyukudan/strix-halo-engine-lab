@@ -1,3 +1,4 @@
+#include "strix/mtp_cohort_partition.hpp"
 #include "strix/known_window_cohort.hpp"
 #include "strix/host_phase_timing.hpp"
 #include "strix/hip_mtp_greedy_runtime.hpp"
@@ -852,8 +853,12 @@ void cohort_drafts(std::span<const HipMtpGreedyCohortMember> members,std::vector
     }
     if(batch_this_cycle) {
         ++counters.cycles;
-        for(std::size_t m=0;m<members.size() && batch.size()<hip_mtp_draft_batch_rows;++m)
+        thread_local std::size_t start=0;
+        const auto first=members.empty()?0U:start++%members.size();
+        for(std::size_t i=0;i<members.size() && batch.size()<hip_mtp_draft_batch_rows;++i) {
+            const auto m=(first+i)%members.size();
             if(stepping[m]) if(auto* r=members[m].runtime->draft_batch_runtime()) {batch.push_back(m);runtimes.push_back(r);}
+        }
         if(batch.size()>=2U) shared=HipMtpRuntime::draft_batch_compatible(runtimes);
         if(!shared) {if(batch.size()>=2U) ++counters.declined;batch.clear();runtimes.clear();}
         else {
@@ -1032,7 +1037,18 @@ std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(std::span<const
     if(joint || (!known_window_cohort_ab() && log)) {
         const auto start=std::chrono::steady_clock::now();
         const auto before=stats?*stats:HipMtpGreedyCohortStats{};
-        auto out=joint?joint_cycle(members,stats,*joint):cohort_cycle(members,stats);
+        std::vector<HipMtpGreedyCycleResult> out;
+        if(joint) {
+            thread_local std::size_t group_start=0;
+            const auto groups=mtp_cohort_partition(members.size(),group_start++);
+            out.resize(members.size());
+            for(const auto& group:groups) {
+                std::vector<HipMtpGreedyCohortMember> part;
+                for(const auto index:group) part.push_back(members[index]);
+                auto results=joint_cycle(part,stats,*joint);
+                for(std::size_t k=0;k<group.size();++k) out[group[k]]=std::move(results[k]);
+            }
+        } else out=cohort_cycle(members,stats);
         if(log) {
             const auto end=std::chrono::steady_clock::now();
             std::uint32_t emitted=0;for(const auto& r:out) emitted+=static_cast<std::uint32_t>(r.emitted_tokens.size());

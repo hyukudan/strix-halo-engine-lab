@@ -507,7 +507,13 @@ inline std::vector<std::string> effective_prefill_argv(const Options& o) {
 inline std::string effective_config_json(const EffectiveConfig& config) {
     const auto& o = config.options;
     std::ostringstream out;
-    out << "{\"admitted\":" << (config.admitted ? "true" : "false") << ",\"reason\":\"" << config.reason
+    out << "{\"http_slots\":{";
+    out << "\"mode\":\"" << (o.http_batch_explicit ? (o.http_batch_cap ? "cap" : "single") : "auto")
+        << "\",\"cap\":" << o.http_batch_cap << ",\"slots\":";
+    if (o.http_serve && o.http_batch) out << "null"; else out << 1;
+    out << ",\"route\":\"" << (o.http_batch ? "batch" : "single")
+        << "\",\"reason\":\"" << o.http_slot_reason << "\"},";
+    out << "\"admitted\":" << (config.admitted ? "true" : "false") << ",\"reason\":\"" << config.reason
         << "\",\"tile_fallback\":\"" << config.tile_fallback
         << "\",\"error\":\"" << config.error
         << "\",\"ple_reclaim_credit_bytes\":" << config.ple_reclaim_credit

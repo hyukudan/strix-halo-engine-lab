@@ -236,6 +236,25 @@ public:
         for (const auto& fixed : fixed_) append(reinterpret_cast<const void*>(fixed.address), fixed.bytes, fixed.device);
         return sha256_bytes(frame);
     }
+    // STRIX_PREFIX_CACHE_DIGEST_COMPONENTS=1 (with STRIX_PREFIX_CACHE_DIGEST=1): state_digest's per-component hashes as a JSON object (component id -> SHA-256 of its
+    // committed rows below `position` or of the whole fixed allocation), to locate a digest difference.
+    [[nodiscard]] std::string component_digests(std::uint64_t position) {
+        check(hipDeviceSynchronize(), "prefix digest fence");
+        std::vector<std::byte> chunk;
+        std::string out = "{";
+        const auto append = [&](const std::string& id, const void* source, std::uint64_t bytes, bool device) {
+            chunk.resize(static_cast<std::size_t>(bytes));
+            if (device) check(hipMemcpy(chunk.data(), source, static_cast<std::size_t>(bytes), hipMemcpyDeviceToHost), "prefix digest copy");
+            else std::memcpy(chunk.data(), source, static_cast<std::size_t>(bytes));
+            out += (out.size() > 1U ? ",\"" : "\"") + id + "\":\"" + model_content_identity_hex(sha256_bytes(chunk)) + '"';
+        };
+        for (const auto& row : rows_) {
+            const auto count = position > row.shift ? position - row.shift : 0U;
+            if (count) append(row.id, reinterpret_cast<const void*>(row.address), count * row.bytes, true);
+        }
+        for (const auto& fixed : fixed_) append(fixed.id, reinterpret_cast<const void*>(fixed.address), fixed.bytes, fixed.device);
+        return out + '}';
+    }
     [[nodiscard]] std::uint64_t row_bytes() const noexcept { return row_bytes_; }
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept { return fixed_bytes_; }
     [[nodiscard]] const PrefixStateCacheRequestStats& request() const noexcept { return request_; }

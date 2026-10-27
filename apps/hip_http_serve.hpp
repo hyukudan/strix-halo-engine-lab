@@ -91,6 +91,13 @@ public:
         stats.constraint = result.constraint;
         stats.finish = result.finish;
         stats.sampling = "greedy";
+        if (!result.final_state_digest.empty()) {
+            stats.engine_extra.push_back({"final_state_digest", "\"" + result.final_state_digest + "\""});
+            stats.engine_extra.push_back({"final_state_position", std::to_string(result.final_state_position)});
+            if (!result.final_state_components.empty()) stats.engine_extra.push_back({"final_state_components", result.final_state_components});
+        }
+        if (!result.prompt_state_digest.empty())
+            stats.engine_extra.push_back({"prompt_state_digest", "\"" + result.prompt_state_digest + "\""});
         if (!result.rtx_import_json.empty()) stats.engine_extra.emplace_back("rtx_import", result.rtx_import_json);
         if(!result.error.empty()) throw serve::GenerationRequestError(std::move(stats),result.error);
         return stats;
@@ -131,6 +138,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         const auto tokenizer = serve::BpeTokenizer::load_gguf(options.model_path);
         serve::ApiConfig config;
         config.model_id = options.http_model_id;
+        config.http_slots = options.http_batch ? options.http_batch : 1U;
         config.default_max_tokens = options.http_default_max_tokens;
         config.api_key = read_http_api_key(options.http_api_key_file);
         config.sampling_policy = options.http_sampling;
@@ -207,6 +215,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         const auto tokenizer = serve::BpeTokenizer::load_gguf(options.model_path);
         serve::ApiConfig config;
         config.model_id = options.http_model_id;
+        config.http_slots = options.http_batch ? options.http_batch : 1U;
         config.default_max_tokens = options.http_default_max_tokens;
         config.api_key = read_http_api_key(options.http_api_key_file);
         config.sampling_policy = options.http_sampling;
@@ -266,7 +275,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         const auto release = [&](const std::shared_ptr<serve::TakenJob>& taken) {
             live.erase(std::remove(live.begin(), live.end(), taken), live.end());
         };
-        const auto admit = [&](serve::TakenJob taken_job) {
+        const auto admit = [&](serve::TakenJob taken_job,const MtpBatchRunner::AdmissionSink& submit) {
             auto taken = std::make_shared<serve::TakenJob>(std::move(taken_job));
             auto& job = taken->job;
             if (job.prompt.empty() || job.prompt.size() >= options.context_tokens) {
@@ -280,6 +289,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
             request.stop_tokens = job.stop_tokens;
             request.on_tokens = job.on_tokens;
             request.on_progress = job.on_progress;
+            request.cancelled = [ticket=taken->ticket] {return ticket->cancelled() || http_serve_stop_requested().load();};
             request.ngram_draft = job.ngram_draft;
             request.draft_depth_max = job.draft_depth_max;
             request.tool_draft = job.tool_draft;
@@ -322,22 +332,44 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                 stats.frame_cycles = result.frame_cycles;
                 stats.frame_shadow = result.frame_shadow;
                 stats.constraint = result.constraint;
+                stats.engine_extra.push_back({"batch_service","{"+batch_service_receipt(result.service)+"}"});
+                if(!result.final_state_digest.empty()) {
+                    stats.engine_extra.push_back({"final_state_digest","\""+result.final_state_digest+"\""});
+                    if(!result.final_state_components.empty()) stats.engine_extra.push_back({"final_state_components",result.final_state_components});
+                    stats.engine_extra.push_back({"final_state_position",std::to_string(result.final_state_position)});
+                }
+                if(!result.prompt_state_digest.empty()) stats.engine_extra.push_back({"prompt_state_digest","\""+result.prompt_state_digest+"\""});
                 stats.finish = result.finish;
                 stats.sampling = sampling;
                 queue.finish(*taken, std::move(stats), result.error);
                 release(taken);
             };
             live.push_back(taken);
-            runner.admit(std::move(request));
+            submit(std::move(request));
         };
+        runner.set_service_admission([&]{return queue.has_queued_work();},[&](const MtpBatchRunner::AdmissionSink& prepare,const std::function<bool()>& can_prepare) {
+            while(can_prepare()) {
+                auto job=queue.take(false);
+                if(!job) break;
+                admit(std::move(*job),prepare);
+            }
+        });
+        struct ClearAdmission {
+            MtpBatchRunner& runner;
+            ~ClearAdmission(){runner.set_service_admission({},{});}
+        } clear_admission{runner};
         std::string failure;
         try {
             for (;;) {
+                runner.add_slot(queue.snapshot().queued != 0U);
                 while (runner.has_free_slot()) {
                     auto job = queue.take(runner.active() == 0U);
                     if (!job) break;
-                    admit(std::move(*job));
+                    admit(std::move(*job),[&](MtpBatchRequest request){runner.admit(std::move(request));});
                 }
+                // The admitted prompt's first unit runs in this step: build the spare slot now so a request arriving
+                // during that unit finds a free slot (nested admission).
+                runner.add_slot(queue.snapshot().queued != 0U);
                 if (!runner.active()) {
                     if (queue.stopping()) break;
                     continue;

@@ -1,3 +1,4 @@
+#include "strix/batch_nested_prefill.hpp"
 #include "strix/hip_known_prefix_window.hpp"
 #include "strix/dispatch_fuse.hpp"
 #include "strix/qpf2k_defaults.hpp"
@@ -245,6 +246,7 @@ struct HipKnownPrefixWindow::Impl {
     };
     std::unique_ptr<SharedDetach> shared_detach;
     DeferredMoeFirstError completion_status{};
+    HipKnownPrefixWindow::PrefillServicePoint prefill_service;
     bool failed = false;
     std::uint32_t active_rows = 0; // execute_mtp_captured: rows in the expert union (0 = every row)
     HipKnownPrefixWindow::PrefillStepObserver prefill_observer,window_observer;
@@ -1210,6 +1212,25 @@ struct HipKnownPrefixWindow::Impl {
         pending_union_summary = deferred_slots[slot].summary; completion_status = deferred_slots[slot].status;
         check_completion(deferred_slots[slot].rows_done);
     }
+    // STRIX_BATCH_SERVICE_MS: the eager loop retains a layer end until every native fold has closed.
+    bool prefill_bundle_closed() const {
+        if(!prefill_folded.empty() || !folded_steps.empty() || fused_hc_step!=SIZE_MAX || prefill_join_due) return false;
+        if(shared_detach && std::any_of(shared_detach->pending.begin(),shared_detach->pending.end(),[](auto p){return p!=0U;})) return false;
+#ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
+        if(!qsa_prefill_bundle_closed()) throw std::logic_error("prefill service boundary has an open QSA batch");
+#endif
+        return true;
+    }
+    void service_boundary() {
+        prefill_service(scope.stream,[&] {
+            check(hipStreamSynchronize(scope.stream),"drain prefill service producer");
+            finish_deferred_completion();
+            if(config.deferred_moe_status) {
+                check(hipMemcpy(&completion_status,reinterpret_cast<const void*>(scope.deferred_moe_status.arena_base),sizeof(completion_status),hipMemcpyDeviceToHost),"read service D1");
+                check_deferred_moe_status(completion_status);
+            }
+        });
+    }
     void complete() {
         guard.require_original();
         const auto prefill_rows_done=full_prefill_union()?(prefill_union_rows?prefill_union_rows:prefill->logical_rows):0U;
@@ -2013,6 +2034,10 @@ struct HipKnownPrefixWindow::Impl {
             KnownWindowExecutionHooks hooks;
             hooks.preflight_scope = [&] { validate_scope(); };
             hooks.preflight_plan = [&] { validate_metadata(); };
+            if(prefill_service) {
+                hooks.bundle_closed=[this]{return prefill_bundle_closed();};
+                hooks.yield_point=[this](std::size_t){service_boundary();};
+            }
             hooks.complete = [&] { complete(); if(capture) capture->completed_before_publish(); if(before_publish) before_publish(); };
             hooks.quiesce_or_fail_stop = [&] {
                 failed = true;
@@ -2087,6 +2112,9 @@ struct HipKnownPrefixWindow::Impl {
                 last_union_observation=HipKnownPrefixUnionObservation{first_position+(prefill&&!full_prefill_union()?(prefill->logical_rows/8U-1U)*8U:0U),last_union_layer,pending_union_summary};
             lap("after");
             return result;
+        } catch(const KnownPrefillCancelled&) {
+            defer_current=false;partial_current=false;prefill_service={};prefill_observer={};prefill_observes={};
+            last_union_observation.reset();throw;
         } catch (...) {
             if(capture)capture->abort();
             if(actual_window_committed){session.health=SerialSessionHealth::poisoned;session.arithmetic_lineage.tainted=true;}
@@ -2172,6 +2200,10 @@ struct HipKnownPrefixWindow::Impl {
             KnownWindowExecutionHooks hooks;
             hooks.preflight_scope = [&] { validate_scope(); };
             hooks.preflight_plan = [&] { validate_metadata(); };
+            if(prefill_service) {
+                hooks.bundle_closed=[this]{return prefill_bundle_closed();};
+                hooks.yield_point=[this](std::size_t){service_boundary();};
+            }
             hooks.complete = [&] { complete(); };
             hooks.quiesce_or_fail_stop = [&] {
                 failed = true;
@@ -2192,6 +2224,9 @@ struct HipKnownPrefixWindow::Impl {
             committed = true;
             require_shared_joined();
             return results;
+        } catch(const KnownPrefillCancelled&) {
+            defer_current=false;partial_current=false;prefill_service={};
+            last_union_observation.reset();throw;
         } catch (...) {
             if (committed)
                 for (auto& g : segments) if (g.session) { g.session->health = SerialSessionHealth::poisoned; g.session->arithmetic_lineage.tainted = true; }
@@ -2280,6 +2315,36 @@ HipMtpTargetWindowExecution HipKnownPrefixWindow::execute_mtp_captured(SerialSes
         ~ActiveRows(){value=0;}
     } scoped(impl_->active_rows,active_rows==logical_rows()?0U:active_rows);
     HipMtpTargetWindowExecution out;out.execution=impl_->execute(session,tokens,before_publish,capture,&out.batch);return out;
+}
+ExecutionMemoryBinding HipKnownPrefixWindow::execution_scratch() const noexcept {return impl_->scratch;}
+bool HipKnownPrefixWindow::aliases_prefill_storage(const ExecutionMemoryBinding& other) const noexcept {
+    const auto overlap=[&](const ExecutionMemoryBinding& x) {return batch_storage_overlap(x,other);};
+    const auto& s=*impl_;
+    if(overlap(s.scratch) || overlap(s.scope.deferred_moe_status) || overlap(s.routed_workspace.memory) || overlap(s.prefill_routed_workspace.memory)) return true;
+    for(const auto& entry:s.prefill_union_workspace) if(overlap(entry.second.memory)) return true;
+    return false;
+}
+bool HipKnownPrefixWindow::aliases_prefill_storage(const HipKnownPrefixWindow& other) const noexcept {
+    const auto& s=*other.impl_;
+    if(aliases_prefill_storage(s.scratch) || aliases_prefill_storage(s.scope.deferred_moe_status) ||
+       aliases_prefill_storage(s.routed_workspace.memory) || aliases_prefill_storage(s.prefill_routed_workspace.memory)) return true;
+    for(const auto& entry:s.prefill_union_workspace) if(aliases_prefill_storage(entry.second.memory)) return true;
+    return false;
+}
+hipStream_t HipKnownPrefixWindow::prefill_stream() const noexcept {return impl_->scope.stream;}
+void HipKnownPrefixWindow::set_prefill_service_point(PrefillServicePoint point) {
+    if(impl_->executing) throw std::logic_error("prefill service hook requires an idle owner");
+    impl_->prefill_service=std::move(point);
+}
+void HipKnownPrefixWindow::reset_cancelled_prefill() {
+    auto& s=*impl_;
+    if(s.executing || s.failed || s.deferred_pending>=0) throw std::logic_error("cancelled prefill reset requires a drained healthy owner");
+    const auto clear=[&](const q51_known_rows::Workspace& w) {
+        if(w.owner) check(hipMemsetAsync(reinterpret_cast<void*>(w.memory.arena_base),0,static_cast<std::size_t>(w.memory.arena_bytes),s.scope.stream),"reset private prefill union");
+    };
+    clear(s.prefill_routed_workspace);for(const auto& entry:s.prefill_union_workspace) clear(entry.second);
+    check(hipStreamSynchronize(s.scope.stream),"complete cancelled prefill reset");
+    s.prefill_union_rows=0;s.last_union_observation.reset();s.pending_union_summary={};s.completion_status={};
 }
 void HipKnownPrefixWindow::set_window_step_observer(PrefillStepObserver observer) {
     impl_->window_observer=std::move(observer);
