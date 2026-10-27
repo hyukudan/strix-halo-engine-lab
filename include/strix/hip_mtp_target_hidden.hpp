@@ -124,7 +124,7 @@ public:
         const ExecutionRuntimeResources& decode_resources);
 private:
     [[nodiscard]] HipMtpTargetHiddenTicket execute_serial_unselected(
-        SerialSessionContext&,const ExecutionRuntimeResources&,DirectLaunchDispatcher&,std::uint32_t,const TokenDraft*);
+        SerialSessionContext&,const ExecutionRuntimeResources&,DirectLaunchDispatcher&,std::uint32_t,const TokenDraft*,bool host_selection);
     HipMtpTargetHidden();
     friend class HipMtpTargetHiddenTicket;
     friend struct HipMtpTargetHiddenTicket::Lease;

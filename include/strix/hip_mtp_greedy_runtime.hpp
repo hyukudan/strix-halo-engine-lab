@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/hip_mtp_runtime.hpp"
+#include "strix/mtp_selection_transaction.hpp"
 #include "strix/mtp_context_draft.hpp"
 #include "strix/mtp_ngram_draft.hpp"
 #include "strix/mtp_frame_draft.hpp"
@@ -9,6 +10,8 @@ class HipKnownPrefixWindow;
 struct HipMtpVerifiedTargetRows;
 struct HipMtpGreedyCycleResult {
     std::vector<std::uint32_t> emitted_tokens;
+    std::shared_ptr<MtpSelectionReceipt> selection_receipt;
+    std::optional<std::string> selection_failure;
     std::uint32_t proposed_candidates=0,accepted_candidates=0;
     std::uint64_t consumed_target_rows=0;
     bool eos=false,terminal_budget=false;
@@ -70,7 +73,7 @@ public:
     // pending. Continue with final_target without emitting that token twice.
     [[nodiscard]] HipMtpGreedyCycleResult cycle(const HipMtpTargetHiddenTicket& initial_target,
         std::uint32_t maximum_candidates,std::uint32_t token_budget,
-        std::span<const std::uint32_t> eos_tokens={});
+        std::span<const std::uint32_t> eos_tokens={},MtpSelectionTransaction* transaction=nullptr);
     [[nodiscard]] bool failed() const noexcept;
     [[nodiscard]] const HipMtpRuntime& native_runtime() const noexcept;
     // cycle() in two phases, for a caller that verifies the drafts of several sessions at once
@@ -159,10 +162,11 @@ struct HipMtpGreedyCohortMember {
     std::uint32_t maximum_candidates=0,budget=0;
     std::span<const std::uint32_t> eos;
     std::uint32_t slot=0;
+    MtpSelectionTransaction* transaction=nullptr;
 };
 struct HipMtpGreedyCohortStats {std::uint64_t cohort_windows=0,cohort_sessions=0,cohort_rows=0,solo_windows=0,cohort_chunks=0;};
 class MtpBatchWindowController;
 [[nodiscard]] std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(
     std::span<const HipMtpGreedyCohortMember> members,HipMtpGreedyCohortStats* stats=nullptr,
-    MtpBatchWindowController* joint=nullptr);
+    MtpBatchWindowController* joint=nullptr,MtpBatchWindowController* policy_joint=nullptr);
 } // namespace strix

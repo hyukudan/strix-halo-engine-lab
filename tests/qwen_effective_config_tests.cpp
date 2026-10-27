@@ -1,4 +1,5 @@
 #include "../apps/qwen_prompt_organization.hpp"
+#include "strix/mtp_selection_transaction.hpp"
 #include "qwen_prefill_contract.hpp"
 #include "qwen_serial_contract.hpp"
 #include "qwen_historical_resolver.hpp"
@@ -586,6 +587,14 @@ int main(int argc, char** arguments) {
         historical_equal(owned,absent);
         expect(!absent.environment.contains("STRIX_PREFILL_PIPE") && !absent.environment.contains("STRIX_LM_HEAD_COHORT_LEAN"),
             "declined serving/MTP/cohort injects no wrapper settings");
+        if(route==3) {
+            expect(!absent.environment.contains("STRIX_DISPATCH_FUSE") &&
+                !absent.environment.contains("STRIX_WINDOW_INJECT_NORM") &&
+                !absent.environment.contains("STRIX_WINDOW_COMMIT_COMBINE"),
+                "default HTTP route does not inject window-only folds");
+            const auto policy=resolve_mtp_selection_route(absent.options.http_selection_mtp,true,true);
+            expect(policy.mtp && !policy.fallback,"default HTTP policy uses an admitted serial-equivalent owner");
+        }
     }
     auto dense_baseline = baseline;
     dense_baseline.options.numerical_profile = dense_a8_profile;

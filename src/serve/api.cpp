@@ -387,6 +387,10 @@ struct ApiService::Impl {
         limits.set("trie_nodes", Json(static_cast<std::uint64_t>(bound.trie_nodes)));
         limits.set("alternative_expansions", Json(static_cast<std::uint64_t>(bound.alternative_expansions)));
         limits.set("mask_cache_bytes", Json(static_cast<std::uint64_t>(bound.mask_cache_bytes)));
+        Json selection_routes=Json::array();
+        if(config.engine_constraints || config.engine_thinking_budget || config.engine_logprobs || config.engine_logit_transforms)
+            for(const auto& route:config.constraint_execution_routes)selection_routes.push(Json(route));
+        out.set("selection_execution",std::move(selection_routes));
         constraints.set("identities", std::move(identities)); constraints.set("limits", std::move(limits));
         constraints.set("selection", Json("greedy")); constraints.set("sampling", Json(false));
         constraints.set("execution", std::move(routes)); out.set("constraints", std::move(constraints));
@@ -937,6 +941,8 @@ struct ApiService::Impl {
         return spec;
     }
     static void selection_json(Json& out, const ConstraintSpec& spec, const ConstraintVerdict& verdict) {
+        out.set("selection_execution",Json(verdict.execution));
+        out.set("selection_fallback",verdict.execution_fallback.empty()?Json():Json(verdict.execution_fallback));
         if (spec.transform.active()) {
             Json t = Json::object(); t.set("presence", Json(spec.transform.presence)); t.set("frequency", Json(spec.transform.frequency));
             t.set("repetition", Json(spec.transform.repetition)); t.set("bias_entries", Json(static_cast<std::uint64_t>(spec.transform.bias.size())));

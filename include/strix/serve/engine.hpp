@@ -65,6 +65,7 @@ struct ConstraintVerdict {
     std::string closure = "natural";
     std::uint32_t reasoning_tokens = 0;
     std::vector<std::uint32_t> forced_ids{};
+    std::string execution_fallback{};
 };
 
 // Armed instrumentation: one process-wide word, unarmed until a GET /metrics or GET /api/status?detail=1 arms it

@@ -499,6 +499,17 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::finish_cycle(const HipMtpTargetHidd
     out.proposed_candidates=static_cast<std::uint32_t>(i.candidates.size());
     try {
         host_phase_mark("8 verify tail");
+        // The request ends here. Its model owner committed a safe prefix or
+        // restored its checkpoint; admission resets both target and predictor.
+        // There is no next pending output to reconcile on a selection failure.
+        if(verified.selection_failure.has_value()) {
+            out.selection_failure=std::move(verified.selection_failure);
+            out.emitted_tokens=std::move(verified.emitted_tokens);
+            out.selection_receipt=std::move(verified.selection_receipt);
+            require(out.selection_receipt && out.selection_receipt->size()==out.emitted_tokens.size(),"MTP failure receipt length differs");
+            if(i.cohort_external){i.window->clear_external_rows();i.cohort_external=false;}
+            i.busy=false;return out;
+        }
         require(!verified.committed_rows.empty() && verified.committed_rows.size()==verified.emitted_tokens.size(),
             "MTP target verifier returned no actual aligned committed output rows");
         std::vector<HipMtpReplayRow> replay;replay.reserve(verified.committed_rows.size());
@@ -528,6 +539,10 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::finish_cycle(const HipMtpTargetHidd
         i.backend->reconcile_after_target(i.draft,*i.session,out.emitted_tokens);
         reconcile_draft_proposal_state(i.draft,*i.session);
         host_phase_mark("a reconcile");
+        if(verified.selection_receipt) {
+            require(verified.selection_receipt->size()==out.emitted_tokens.size(),"MTP reconciled receipt length differs");
+            out.selection_receipt=std::move(verified.selection_receipt);
+        }
         i.busy=false;return out;
     } catch(...) {fail_cycle();throw;}
 }
@@ -617,9 +632,11 @@ void HipMtpGreedyRuntime::abandon_wide_cycle(std::span<const std::uint32_t> trut
     } catch(...) {fail_cycle();throw;}
 }
 HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicket& initial,
-    std::uint32_t max_candidates,std::uint32_t budget,std::span<const std::uint32_t> eos) {
+    std::uint32_t max_candidates,std::uint32_t budget,std::span<const std::uint32_t> eos,MtpSelectionTransaction* transaction) {
     auto& i=*impl_;
     auto is_eos=[&](std::uint32_t t){return std::find(eos.begin(),eos.end(),t)!=eos.end();};
+    require(!transaction || (!i.target->token_sampler() && (!i.window || i.window->policy_selection_admitted())),
+        "MTP transaction requires serial-equivalent greedy target execution");
     const auto depth=begin_cycle_draft(initial,max_candidates,budget,eos,true);
     if(!i.busy){HipMtpGreedyCycleResult out;out.final_target=initial;out.eos=true;return out;}
     if(i.window) {
@@ -628,7 +645,7 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
             verified=i.window->verify(*i.session,*i.dispatcher,initial,i.candidates,budget,eos,
                 i.mtp->draft_head()?std::span<const float>(i.probabilities):std::span<const float>{},
                 i.target->token_sampler()?i.mtp->sampled_drafts():std::span<const TokenDraft>{},
-                i.mtp->draft_head()?std::span<const float>(i.runner_ups):std::span<const float>{});
+                i.mtp->draft_head()?std::span<const float>(i.runner_ups):std::span<const float>{},transaction);
         } catch(...) {fail_cycle();throw;}
         return finish_cycle(initial,std::move(verified),budget,eos);
     }
@@ -640,12 +657,19 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
     out.proposed_candidates=static_cast<std::uint32_t>(i.candidates.size());
     auto pending=initial.predicted_token();
     try {
+        if(transaction)transaction->reset();
         const auto& candidates=i.candidates;
         for(std::size_t index=0;;++index) {
             replay.push_back({out.final_target,pending});
             const auto drafts=i.target->token_sampler()?i.mtp->sampled_drafts():std::span<const TokenDraft>{};
             auto completed=i.target->execute_serial(*i.session,i.resources,*i.dispatcher,pending,
-                index<drafts.size()?&drafts[index]:nullptr);
+                index<drafts.size()?&drafts[index]:nullptr,
+                transaction?HipMtpHostRowSelector{[&](auto row){
+                    try{return transaction->select(row);}catch(const MtpSelectionError& e){out.selection_failure=e.what();return 0U;}
+                }}:HipMtpHostRowSelector{});
+            if(out.selection_failure.has_value()) {
+                out.selection_receipt=transaction->seal();i.busy=false;return out;
+            }
             ++out.consumed_target_rows;
             pending=completed.predicted_token();out.final_target=std::move(completed);
             out.emitted_tokens.push_back(pending);
@@ -663,8 +687,12 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
         i.backend->reconcile_after_target(i.draft,*i.session,out.emitted_tokens);
         reconcile_draft_proposal_state(i.draft,*i.session);
         host_phase_mark("a reconcile");
+        if(transaction) {out.accepted_candidates=static_cast<std::uint32_t>(out.emitted_tokens.size()-1U);
+            out.selection_receipt=transaction->seal();
+            require(out.selection_receipt->size()==out.emitted_tokens.size(),"MTP serial receipt length differs");}
         i.busy=false;return out;
     } catch(...) {
+        if(transaction)transaction->discard();
         // The target producer already poisons native execution failures. A
         // reconciliation/proposal failure disables this consumer and publishes
         // no speculative outputs; completed target history is never rolled back.
@@ -735,7 +763,7 @@ std::vector<HipMtpGreedyCycleResult> budget_cohorts(std::span<const HipMtpGreedy
         for(const auto& x:order) {
             const auto& c=members[x.member];auto& r=*c.runtime;total+=x.rows;
             requests.push_back({r.window_verifier(),&r.target_session(),c.initial,r.drafted_candidates(),
-                r.drafted_probabilities(),c.budget,c.eos,x.rows,r.drafted_distributions()});
+                r.drafted_probabilities(),c.budget,c.eos,x.rows,r.drafted_distributions(),c.transaction});
         }
         auto verified=HipMtpWindowVerifier::verify_cohort(requests,primaries,sizes);
         for(std::size_t k=0;k<order.size();++k) {
@@ -748,7 +776,7 @@ std::vector<HipMtpGreedyCycleResult> budget_cohorts(std::span<const HipMtpGreedy
     for(const auto& x:solo) {
         const auto& c=members[x.member];auto& r=*c.runtime;
         auto verified=r.window_verifier()->verify(r.target_session(),r.target_dispatcher(),*c.initial,r.drafted_candidates(),
-            c.budget,c.eos,r.drafted_probabilities(),r.drafted_distributions());
+            c.budget,c.eos,r.drafted_probabilities(),r.drafted_distributions(),{},c.transaction);
         out[x.member]=r.finish_cycle(*c.initial,std::move(verified),c.budget,c.eos);
         open[x.member]=false;
         if(stats)++stats->solo_windows;
@@ -1031,7 +1059,22 @@ struct CohortAbTiming {
 };
 }
 std::vector<HipMtpGreedyCycleResult> hip_mtp_greedy_cohort_cycle(std::span<const HipMtpGreedyCohortMember> members,
-    HipMtpGreedyCohortStats* stats,MtpBatchWindowController* joint) {
+    HipMtpGreedyCohortStats* stats,MtpBatchWindowController* joint,MtpBatchWindowController* policy_joint) {
+    for(const auto& c:members) if(c.transaction) require(c.runtime && c.runtime->window_verifier() &&
+        c.runtime->window_verifier()->policy_selection_admitted(),"MTP cohort transaction owner is not serial equivalent");
+    if(joint && std::any_of(members.begin(),members.end(),[](const auto& c){return c.transaction!=nullptr;})) {
+        // Policy history never trains the ordinary shared controller. The ordinary
+        // and policy groups still use their per-member transactions.
+        std::vector<HipMtpGreedyCycleResult> out(members.size());
+        for(bool policy:{false,true}) {
+            std::vector<HipMtpGreedyCohortMember> group;std::vector<std::size_t> indices;
+            for(std::size_t k=0;k<members.size();++k) if((members[k].transaction!=nullptr)==policy){group.push_back(members[k]);indices.push_back(k);}
+            if(group.empty())continue;
+            auto results=policy && policy_joint?joint_cycle(group,stats,*policy_joint):hip_mtp_greedy_cohort_cycle(group,stats,policy?nullptr:joint);
+            for(std::size_t k=0;k<indices.size();++k)out[indices[k]]=std::move(results[k]);
+        }
+        return out;
+    }
     ++known_window_cohort_cycle();
     static const bool log=[] {const char* v=std::getenv("STRIX_MTP_BATCH_LOG");return v && (v[0]=='1' || v[0]=='2');}();
     if(joint || (!known_window_cohort_ab() && log)) {
@@ -1170,7 +1213,7 @@ std::vector<HipMtpGreedyCycleResult> cohort_cycle(std::span<const HipMtpGreedyCo
             for(const auto& x:g) {
                 const auto& c=members[x.member];auto& r=*c.runtime;
                 requests.push_back({r.window_verifier(),&r.target_session(),c.initial,r.drafted_candidates(),
-                    r.drafted_probabilities(),c.budget,c.eos,x.rows,r.drafted_distributions()});
+                    r.drafted_probabilities(),c.budget,c.eos,x.rows,r.drafted_distributions(),c.transaction});
             }
             auto verified=HipMtpWindowVerifier::verify_cohort(requests,*primary);
             for(std::size_t k=0;k<g.size();++k) {
@@ -1183,7 +1226,7 @@ std::vector<HipMtpGreedyCycleResult> cohort_cycle(std::span<const HipMtpGreedyCo
         for(const auto& x:solo) {
             const auto& c=members[x.member];auto& r=*c.runtime;
             auto verified=r.window_verifier()->verify(r.target_session(),r.target_dispatcher(),*c.initial,r.drafted_candidates(),
-                c.budget,c.eos,r.drafted_probabilities(),r.drafted_distributions());
+                c.budget,c.eos,r.drafted_probabilities(),r.drafted_distributions(),{},c.transaction);
             out[x.member]=r.finish_cycle(*c.initial,std::move(verified),c.budget,c.eos);
             open[x.member]=false;
             if(stats)++stats->solo_windows;

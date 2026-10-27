@@ -1447,12 +1447,12 @@
   {
     "engine": "qwen",
     "name": "Constrained JSON output",
-    "flag_or_env": "--http-constraints",
+    "flag_or_env": "--http-constraints; --http-selection-mtp",
     "default": "on (requests opt in with response_format / text.format)",
-    "exact": "Exact relative to the declared constrained target (masked greedy, lowest id on ties), not to unconstrained greedy. Unconstrained requests, alone and sharing the batch with constrained ones, keep their token IDs and draft counters (GPU gate).",
-    "gain": "Usability: schema-valid JSON answers by construction; no speed claim (constrained requests decode serially)",
-    "preconditions": "--http-serve; json_object or strix-json-schema-v1 json_schema format, greedy, no stop strings, no tools.",
-    "off_switch": "--http-constraints off",
+    "exact": "Exact relative to the declared constrained target (masked greedy, lowest id on ties), not to unconstrained greedy. Unconstrained requests, alone and sharing the batch with constrained ones, keep their token IDs (GPU gate).",
+    "gain": "Usability: schema-valid JSON answers by construction; no speed claim",
+    "preconditions": "--http-serve; json_object or strix-json-schema-v1 json_schema format, greedy, no stop strings, no tools. Host selection uses admitted serial-equivalent mtp-host windows or serial-host fallback; receipt states route/reason. No MTP speed claim.",
+    "off_switch": "--http-constraints off; --http-selection-mtp off (serial host selection)",
     "doc_anchor": "docs/optimizations.md#qwen-serve-constraints"
   },
   {
@@ -1469,23 +1469,23 @@
   {
     "engine": "qwen",
     "name": "Thinking budget policy",
-    "flag_or_env": "--http-thinking-budget; --http-anthropic-thinking-budget",
+    "flag_or_env": "--http-thinking-budget; --http-anthropic-thinking-budget; --http-selection-mtp",
     "default": "available (request opt-in); Messages budget_tokens noted, not enforced",
     "exact": "Token-changing by design (declared policy, closure natural|forced). A budget that is never reached yields the same token IDs as ordinary speculative greedy decoding (GPU gate).",
-    "gain": "Usability: bounded reasoning with answer room; no speed claim (serial host route)",
-    "preconditions": "--http-serve; strix.thinking_policy or Messages budget_tokens with enforce; thinking on, greedy, no stop strings, no tools.",
-    "off_switch": "--http-thinking-budget off; --http-anthropic-thinking-budget note",
+    "gain": "Usability: bounded reasoning with answer room; no speed claim",
+    "preconditions": "--http-serve; strix.thinking_policy or Messages budget_tokens with enforce; thinking on, greedy, no stop strings, no tools. Host selection uses admitted serial-equivalent mtp-host windows or serial-host fallback; receipt states route/reason. No MTP speed claim.",
+    "off_switch": "--http-thinking-budget off; --http-anthropic-thinking-budget note; --http-selection-mtp off (serial host selection)",
     "doc_anchor": "docs/optimizations.md#qwen-serve-thinking-budget"
   },
   {
     "engine": "qwen",
     "name": "Logprobs and logit transforms",
-    "flag_or_env": "--http-logprobs; --http-logit-transforms",
+    "flag_or_env": "--http-logprobs; --http-logit-transforms; --http-selection-mtp",
     "default": "available (request opt-in)",
     "exact": "Logprobs never change selected tokens (IDs equal ordinary speculative greedy decoding, GPU gate); transforms change tokens by design and are labelled greedy-logit-transform-v1.",
-    "gain": "Usability: token scores and penalties/bias for greedy requests; no speed claim (serial host route)",
-    "preconditions": "--http-serve; greedy requests with logprobs/top_logprobs or non-neutral penalties/logit_bias.",
-    "off_switch": "--http-logprobs off; --http-logit-transforms off",
+    "gain": "Usability: token scores and penalties/bias for greedy requests; no speed claim",
+    "preconditions": "--http-serve; greedy requests with logprobs/top_logprobs or non-neutral penalties/logit_bias. Host selection uses admitted serial-equivalent mtp-host windows or serial-host fallback; receipt states route/reason. No MTP speed claim.",
+    "off_switch": "--http-logprobs off; --http-logit-transforms off; --http-selection-mtp off (serial host selection)",
     "doc_anchor": "docs/optimizations.md#qwen-serve-logprobs"
   },
   {

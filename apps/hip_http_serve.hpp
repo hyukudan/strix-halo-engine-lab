@@ -51,8 +51,8 @@ private:
 class MtpBridgeEngine final : public serve::GenerationEngine {
 public:
     MtpBridgeEngine(const MtpServeRunner& run, std::uint64_t context_tokens,
-        HttpConstraintRequests& constraints, bool enabled, bool thinking_enabled)
-        : run_(run), context_(context_tokens), constraints_(constraints), constraints_enabled_(enabled), thinking_enabled_(thinking_enabled) {}
+        HttpConstraintRequests& constraints, bool enabled, bool thinking_enabled,bool selection_mtp_available)
+        : run_(run), context_(context_tokens), constraints_(constraints), constraints_enabled_(enabled), thinking_enabled_(thinking_enabled),selection_mtp_available_(selection_mtp_available) {}
     serve::GenerationStats generate(serve::GenerationJob& job) override {
         if (failed_.load()) throw std::runtime_error("the engine failed during an earlier request; restart the server");
         if (job.prompt.empty() || job.prompt.size() >= context_) throw std::invalid_argument("prompt is empty or fills the context");
@@ -106,7 +106,7 @@ public:
     [[nodiscard]] std::uint64_t context_tokens() const override { return context_; }
     [[nodiscard]] bool supports_thinking_budget() const override {return thinking_enabled_;}
     [[nodiscard]] bool supports_constraints() const override {return constraints_enabled_;}
-    [[nodiscard]] std::vector<std::string> constraint_execution_routes() const override {return constraints_enabled_?std::vector<std::string>{"serial-host"}:std::vector<std::string>{};}
+    [[nodiscard]] std::vector<std::string> constraint_execution_routes() const override {return selection_mtp_available_?std::vector<std::string>{"mtp-host","serial-host"}:std::vector<std::string>{"serial-host"};}
     [[nodiscard]] bool failed() const noexcept { return failed_.load(); }
 private:
     const MtpServeRunner& run_;
@@ -114,6 +114,7 @@ private:
     HttpConstraintRequests& constraints_;
     bool constraints_enabled_;
     bool thinking_enabled_;
+    bool selection_mtp_available_;
     std::atomic<bool> failed_{false};
 };
 
@@ -138,7 +139,7 @@ inline std::string read_http_api_key(const std::string& path) {
 inline MtpDecodeServe make_http_serve(const Options& options, std::string engine_description,
     std::shared_ptr<RtxStateImportRegistry> rtx_import = {},
     std::optional<StartupPreflight> startup = {}, serve::Json assets = {}) {
-    return [&options, engine_description = std::move(engine_description), rtx_import, startup, assets](const MtpServeRunner& run) {
+    return [&options, engine_description = std::move(engine_description), rtx_import, startup, assets](const MtpServeRunner& run,bool selection_mtp_available) {
         const auto tokenizer = serve::BpeTokenizer::load_gguf(options.model_path);
         serve::ApiConfig config;
         config.model_id = options.http_model_id;
@@ -168,7 +169,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         config.engine_constraints = options.http_constraints && constraints.available(config.stop_tokens);
         config.engine_thinking_budget = options.http_thinking_budget && constraints.available(config.stop_tokens);
         config.enforce_anthropic_thinking_budget = options.http_anthropic_thinking_budget_enforce;
-        if(config.engine_constraints) config.constraint_execution_routes={"serial-host"};
+        config.constraint_execution_routes=selection_mtp_available?std::vector<std::string>{"mtp-host","serial-host"}:std::vector<std::string>{"serial-host"};
         if (rtx_import)
             config.engine_routes = [rtx_import](const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
                 return handle_rtx_state_import_route(*rtx_import, request, response);
@@ -176,7 +177,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
 
         if (serve::serve_health_record_enabled())
             config.health_record = http_health_record(options, 1, startup, assets);
-        MtpBridgeEngine engine(run, options.context_tokens, constraints, config.engine_constraints, config.engine_thinking_budget);
+        MtpBridgeEngine engine(run, options.context_tokens, constraints, config.engine_constraints, config.engine_thinking_budget,selection_mtp_available);
         serve::GenerationQueue queue(options.http_max_queue);
         serve::ApiService api(config, tokenizer, queue, options.context_tokens, false);
         serve::HttpServerConfig http;
@@ -252,7 +253,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         config.engine_constraints = runner.supports_constraints() && constraints.available(config.stop_tokens);
         config.engine_thinking_budget = runner.supports_thinking_budget() && constraints.available(config.stop_tokens);
         config.enforce_anthropic_thinking_budget = options.http_anthropic_thinking_budget_enforce;
-        if(config.engine_constraints) config.constraint_execution_routes=runner.constraint_execution_routes();
+        config.constraint_execution_routes=runner.constraint_execution_routes();
         const bool samples = options.http_sampling == "sample";
         if (serve::serve_health_record_enabled())
             config.health_record = http_health_record(options, runner.slots(), startup, assets);

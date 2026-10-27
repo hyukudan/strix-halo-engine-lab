@@ -255,7 +255,7 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial(
     SerialSessionContext& session,const ExecutionRuntimeResources& resources,
     DirectLaunchDispatcher& dispatcher,std::uint32_t token,const TokenDraft* draft,
     const HipMtpHostRowSelector& host_selector) {
-    auto ticket=execute_serial_unselected(session,resources,dispatcher,token,draft);
+    auto ticket=execute_serial_unselected(session,resources,dispatcher,token,draft,!!host_selector);
     if(host_selector) {
         auto& i=*impl_;
         try {
@@ -273,7 +273,7 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial(
 }
 HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial_unselected(
     SerialSessionContext& session,const ExecutionRuntimeResources& resources,
-    DirectLaunchDispatcher& dispatcher,std::uint32_t token,const TokenDraft* draft) {
+    DirectLaunchDispatcher& dispatcher,std::uint32_t token,const TokenDraft* draft,bool host_selection) {
     auto& i=*impl_;
     if(draft && !i.sampler) throw std::invalid_argument("MTP target draft decision requires a token sampler");
     // The prompt lane runs while the session is owned by the sibling prompt execution.
@@ -343,9 +343,10 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial_unselected(
             check(hipStreamSynchronize(i.stream),"MTP target execution completion");
             i.guard->require_original();
             if(i.deferred_status.arena_base)check_deferred_moe_status(status);
-            lease->predicted=i.selector->select(i.logits,static_cast<std::uint32_t>(i.model->vocab_size),
+            // Host policy validation belongs after the model execution commits.
+            // Its nonfinite-row refusal must not poison this execution transaction.
+            if(!host_selection)lease->predicted=i.selector->select(i.logits,static_cast<std::uint32_t>(i.model->vocab_size),
                 lease->position,++i.epoch);
-            // The first-max pass above still validates every logit as finite.
             if(i.sampler) {
                 const auto t0=std::chrono::steady_clock::now();
                 const auto vocabulary=static_cast<std::uint32_t>(i.model->vocab_size);

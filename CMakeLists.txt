@@ -239,6 +239,7 @@ add_library(strix_core STATIC
     src/mtp_forward_contract.cpp
     src/mtp_forward_golden_file.cpp
     src/mtp_target_window_policy.cpp
+    src/mtp_selection_transaction.cpp
     src/mtp_window_controller.cpp
     src/mtp_depth_window_controller.cpp
     src/mtp_sidecar_binding.cpp
@@ -431,6 +432,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-serve-api-tests PRIVATE strix_serve)
     strix_target_warnings(strix-serve-api-tests)
     add_test(NAME strix-serve-api-tests COMMAND strix-serve-api-tests)
+
+    add_executable(strix-mtp-selection-transaction-tests tests/mtp_selection_transaction_tests.cpp)
+    target_link_libraries(strix-mtp-selection-transaction-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-mtp-selection-transaction-tests)
+    add_test(NAME strix-mtp-selection-transaction-tests COMMAND strix-mtp-selection-transaction-tests)
 
     add_executable(strix-serve-json-constraint-tests tests/serve_json_constraint_tests.cpp)
     target_link_libraries(strix-serve-json-constraint-tests PRIVATE strix_serve)

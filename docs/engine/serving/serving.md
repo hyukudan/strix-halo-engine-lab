@@ -34,9 +34,10 @@ Serving runs on the tiled MTP route, so it takes the flags of a tiled MTP reques
 | `--http-responses on\|off` | `on` | the stateless `POST /v1/responses` route ([below](#responses-stateless)); `off`: 404 |
 | `--http-capabilities on\|off` | `on` | `GET /v1/capabilities` and its `capabilities_id` in `/health`, `/v1/models`, `/api/status`; `off`: 404, no id |
 | `--http-stream-receipts on\|off` | `on` | the applied-policy `strix` object at the start and end of every stream ([below](#applied-policy-and-keepalive)); `off` together with `--http-sse-keepalive 0 --http-sse-progress-interval 0`: the previous build's bytes |
-| `--http-anthropic-thinking-budget enforce\|note` | `note` | Messages `thinking.budget_tokens`: `note` accepts it and states in `strix.note` that it is not enforced (the request keeps speculative decoding); `enforce` applies `thinking-budget-v1` (serial decoding) |
+| `--http-anthropic-thinking-budget enforce\|note` | `note` | Messages `thinking.budget_tokens`: `note` accepts it and states in `strix.note` that it is not enforced (the request keeps speculative decoding); `enforce` applies `thinking-budget-v1` (resolved host selection route) |
 | `--http-thinking-budget on\|off` | `on` | makes the opt-in `thinking-budget-v1` policy available ([below](#thinking-budget)); `off`: explicit policy requests get 400 |
-| `--http-logprobs on\|off` | `on` | Qwen serial host logprobs; `off` refuses score requests |
+| `--http-selection-mtp on\|off` | `on` | policy selection uses admitted serial-equivalent MTP windows; `off` forces `serial-host` for JSON, budgets, scores and transforms |
+| `--http-logprobs on\|off` | `on` | Qwen host logprobs; `off` refuses score requests |
 | `--http-logit-transforms on\|off` | `on` | Qwen opt-in logit transforms; `off` refuses non-neutral transforms |
 | `--http-constraints on\|off` | `on` | constrained JSON output ([below](#constrained-json-output)); `off`: such requests get 400 and capabilities say unavailable |
 | `--http-sse-progress-interval SECONDS` | `1` | coalesced completed prefill progress as SSE comments; `0`: none; request opt-out: `"strix":{"progress":false}` |
@@ -253,7 +254,7 @@ omitted, the answer gets what remains (`R = B - max_thinking_tokens - C`), and a
 room (`max_thinking_tokens + C >= B`) returns 400. Explicit reservations with `R + C > B` return 400 before submission. A zero remaining reasoning allowance closes immediately.
 Unknown policies and unavailable execution return 400. Without these fields, generation is unchanged.
 
-The executing Qwen route uses the shared serial host selector, with no drafts for that request. It resolves
+The executing Qwen route uses the shared host selector on its resolved selection route. It resolves
 `</think>` from the loaded tokenizer, then encodes the template's following two newlines. Forced IDs become
 the actual target frontier, pass through target execution, and consume output/context capacity. They carry
 `forced_control` provenance in selection; no model-selected probability is claimed. This policy requires
@@ -270,8 +271,7 @@ even with `--http-stream-receipts off`. Reasoning and answer split on the commit
 For `/v1/messages`, `thinking: {"type":"enabled","budget_tokens":2048}` selects the same policy and default
 answer reservation when the server runs with `--http-anthropic-thinking-budget enforce`; the response states the
 executed policy. By default (`note`) the budget is accepted, the request keeps speculative decoding and `strix.note`
-states that the budget is not enforced: clients send this field with every thinking request, and enforcing it moves
-the request to the slower serial route. `--http-thinking-budget off` disables explicit policy requests. Other engines retain that note
+states that the budget is not enforced. Enforcing it uses the resolved host selection route. `--http-thinking-budget off` disables explicit policy requests. Other engines retain that note
 until they integrate the executing selection adapter.
 
 CPU contract tests cover the production selection adapter and HTTP translation. Native GPU token/state,
@@ -314,7 +314,7 @@ exactly one of `response.completed`, `response.incomplete`, `response.failed`. T
 ### Logprobs and logit transforms
 
 Qwen chat, completions and Responses execute these greedy-only policies on the same
-`serial-host` route as constrained JSON and thinking budgets. Other slots retain their
+resolved host selection route as constrained JSON and thinking budgets. Other slots retain their
 selected routes. Effective temperature greater than zero is refused with 400; the
 capabilities document advertises availability and execution. DeepSeek and MiniMax
 continue to refuse these requests. The two feature switches above default to on;
@@ -380,14 +380,47 @@ whitespace characters between tokens, no duplicate keys, integers without fracti
 their compact spelling). Compilation is bounded (schema size, nodes, depth, properties, enum values, work, memory);
 limits are listed in `GET /v1/capabilities` under `constraints`.
 
-Constraints run greedy only, on a serial host route (`execution: serial-host`): the request's target logits row is read
-back and selected on the host, and the request decodes without speculative drafts; other requests in the batch keep
-their normal speculative decoding. Constraints are refused with stop strings, with effective sampling
+Constraints run greedy only with host target selection on the resolved route described below. Constraints are refused with stop strings, with effective sampling
 (`temperature > 0` on a sampling server) and with a non-empty tool offering. Every constrained response carries
 `strix.constraint` (also with stream receipts off): `identity` (`json-object` or `strix-json-schema-v1`), `selection`,
 `execution`, `phase`, `status` (`complete`, `incomplete`, `failed`), `accepting` and `reason` (`max_output_tokens`,
 `context`, `reasoning_eos`, `cancelled`, `constraint_failure`, `execution_failure`). A reply cut by the budget is
 reported incomplete, never repaired; Responses then has `status: incomplete`.
+
+### Policy selection routes
+
+`--http-selection-mtp on` (default) admits `mtp-host` for closed R2/R4/R8
+serial-derived owners whose per-row arithmetic preserves the complete serial target
+FP32 logits and state. Both prefix commit and checkpoint/restore owners use this
+admission. Tiled owners, GSQ owners, the legacy all-Q8 staged GDN pair, unknown
+recipes and window-only inject/normalization or combine folds are excluded here.
+These conservative exclusions fall back before drafting. The existing prefix gate
+compares full-logit digests and committed state, including rejection depths and
+owner changes; matching argmax IDs alone is insufficient.
+
+Every policy response reports `strix.selection_execution` (`mtp-host` or
+`serial-host`) and `strix.selection_fallback` (null when admitted). Fallbacks are
+`selection-mtp-off`, `no-window-owner` and `window-arithmetic-not-serial`, in that
+order. The switch covers scoring-only and transform-only requests too. Feature
+disable switches still refuse requests. Capabilities list routes available on the
+loaded owners; the request receipt reports the resolved route.
+
+The first token retains its terminal-prompt transaction. Each later MTP cycle uses
+ordinary unconstrained proposals and selects only reachable target rows with the
+same host selector, masks, transforms, forced controls and CPU scoring as serial.
+Acceptance compares each draft with that policy-selected token. Prefix owners
+commit the decided rows only; checkpoint owners restore and replay serially unless
+the whole chunk matches without consuming EOS. Context/history/budget limits can
+also cause transaction-aware serial verification within an `mtp-host` cycle.
+Reconciliation completes before the retained state and every score publish, then
+IDs emit. Rejected suffix rows publish nothing. Policy requests have no context,
+frame, peer or wide-copy proposals and do not train ordinary shared calibration.
+
+Exactness is relative to the same declared policy and numerical identity: complete
+IDs, forced-control records and every chosen/top score must equal serial, with
+bit-identical reachable full-logit rows and committed model state. CPU tests and
+compilation do not establish GPU or complete-workload qualification. No MTP policy
+speed claim is made.
 
 ### Applied policy and keepalive
 
@@ -528,7 +561,7 @@ encode|plain|decode FILE` exposes the tokenizer on the command line.
 - The window controller switches (`STRIX_MTP_CONTROLLER=survival`, `STRIX_MTP_ACTIVE_ROWS=1`,
   `STRIX_MTP_DRAFT_VOCAB=2`, the window folds) apply to served requests as on the command line. The draft
   vocabulary is chosen per request from that request's prompt.
-- `n` > 1, images and audio are not supported. Logprobs use the serial host route described above.
+- `n` > 1, images and audio are not supported. Logprobs use the resolved host selection route described above.
 - Plain HTTP/1.1 (keep-alive, chunked responses); put a TLS proxy in front for remote access.
 
 ## Independent-session file route (`--serve-prefix-u32le`)

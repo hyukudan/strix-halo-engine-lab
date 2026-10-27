@@ -98,7 +98,7 @@ inline std::string batch_service_receipt(const BatchServiceStats& s) {
     return out.str();
 }
 using MtpServeRunner = std::function<MtpServeResult(const MtpServeRequest&)>;
-using MtpDecodeServe = std::function<void(const MtpServeRunner&)>;
+using MtpDecodeServe = std::function<void(const MtpServeRunner&,bool selection_mtp_available)>;
 class MtpBatchRunner;
 struct MtpBatchSlotSetup;
 // Batched decoding (--http-batch, cohort requests on the tiled prompt): after the calibration replay the
@@ -866,7 +866,7 @@ public:
         std::vector<std::unique_ptr<Slot>> slots, bool interleave = false, std::uint32_t serial_rows_per_step = 16)
         : options_(options), model_(model), compiled_(compiled), qualified_(qualified), activated_(activated),
           enable_draft_(std::move(enable_draft)), slots_(std::move(slots)), interleave_(interleave),
-          serial_rows_per_step_(serial_rows_per_step ? serial_rows_per_step : 1U),joint_(slots_.size(),MtpBatchWindowController::rule_from_env()) {
+          serial_rows_per_step_(serial_rows_per_step ? serial_rows_per_step : 1U),joint_(slots_.size(),MtpBatchWindowController::rule_from_env()),policy_joint_(slots_.size(),MtpBatchWindowController::rule_from_env()) {
         stats_.nest_rows_limit=nest_rows_;
         if (slots_.empty()) throw std::invalid_argument("batched MTP decoding needs a slot");
         if(service_ms_>0.0 || cancel_points_ || nest_rows_) {
@@ -880,7 +880,9 @@ public:
     MtpBatchRunner& operator=(const MtpBatchRunner&) = delete;
     [[nodiscard]] bool supports_thinking_budget() const noexcept {return options_.http_thinking_budget;}
     [[nodiscard]] bool supports_constraints() const noexcept {return options_.http_constraints;}
-    [[nodiscard]] std::vector<std::string> constraint_execution_routes() const {return supports_constraints()?std::vector<std::string>{"serial-host"}:std::vector<std::string>{};}
+    [[nodiscard]] std::vector<std::string> constraint_execution_routes() const {return options_.http_selection_mtp &&
+        std::any_of(slots_.begin(),slots_.end(),[](const auto& s){return s->window && s->window->policy_selection_admitted();})?
+        std::vector<std::string>{"mtp-host","serial-host"}:std::vector<std::string>{"serial-host"};}
     std::function<std::unique_ptr<Slot>()> grow_factory;
     std::function<bool()> growth_memory_ok;
     // STRIX_HTTP_SPARE_SLOTS (default 1; 0 = grow only for queued work): keep one built slot free while capacity remains.
@@ -901,7 +903,7 @@ public:
         const auto start = std::chrono::steady_clock::now();
         auto slot = grow_factory();
         if (!slot) throw std::logic_error("batch growth factory returned no slot");
-        joint_.resize_slots(slots_.size() + 1U);
+        joint_.resize_slots(slots_.size() + 1U);policy_joint_.resize_slots(slots_.size()+1U);
         slots_.push_back(std::move(slot));
         const auto ms = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
         ++stats_.lazy_slot_builds;
@@ -956,11 +958,13 @@ private:
         const auto& m = options_.mtp;
         const auto start = std::chrono::steady_clock::now();
         s.request = std::move(request);
+        if(s.request.constraint) {const auto route=resolve_mtp_selection_route(options_.http_selection_mtp,!!s.window,s.window && s.window->policy_selection_admitted());
+            s.request.constraint->set_execution(route.mtp?"mtp-host":"serial-host",route.fallback?route.fallback:"");}
         if (s.request.ngram_peers) any_peers_ = true;
         MtpServeResult fresh_result;
         s.result=std::move(fresh_result);s.result.service.nest_rows_limit=nest_rows_;
         s.chosen_rows = {};
-        joint_.reset(static_cast<std::uint32_t>(free-slots_.begin()));
+        joint_.reset(static_cast<std::uint32_t>(free-slots_.begin()));policy_joint_.reset(static_cast<std::uint32_t>(free-slots_.begin()));
         // STRIX_MTP_JOINT_RULE_FILE (measurement, in-process A/B): the joint plan rule is re-read from this file at
         // every admission (its text as STRIX_MTP_JOINT_PLAN; missing/empty file = the startup rule). The file's
         // "wave=N" token names the wave; on the first admission of a new wave, "snapshot" saves the controller's
@@ -975,6 +979,7 @@ private:
                 text.assign(buffer, n);
             }
             joint_.set_rule(text.empty() ? MtpBatchWindowController::rule_from_env() : MtpBatchWindowController::parse_rule(text));
+            policy_joint_.set_rule(joint_.rule());
             const auto at = text.find("wave=");
             const std::string wave = at == std::string::npos ? std::string{} : text.substr(at, text.find_first_of(" \n", at) - at);
             if (!wave.empty() && wave != rule_wave_) {
@@ -1071,7 +1076,7 @@ public:
         }
         for(auto& owner:slots_) {
             auto& s=*owner;
-            if(!s.active || s.prefilling || !s.request.constraint) continue;
+            if(!s.active || s.prefilling || !s.request.constraint || s.greedy) continue;
             const auto serial_start=clock::now();
             ++stats_.steps;++stats_.solo_steps;
             try {
@@ -1094,7 +1099,7 @@ private:
         using clock=std::chrono::steady_clock;
         last_decode_round_=clock::now();
         std::vector<Slot*> live;
-        for (auto& s : slots_) if (s->active && !s->prefilling && !s->request.constraint) {
+        for (auto& s : slots_) if (s->active && !s->prefilling && s->greedy) {
             if(s.get()==paused_ || (paused_ && (s->session==paused_->session || s->target==paused_->target || s->native==paused_->native)))
                 throw std::logic_error("paused prefill selected for decode");
             // STRIX_BATCH_SERVICE_MS: cohort primaries come only from these live window owners.
@@ -1110,9 +1115,9 @@ private:
         if (live.empty()) return false;
         if (context_peers || any_peers_) {
             std::vector<const HipMtpGreedyRuntime*> peers;
-            for (auto* s : live) peers.push_back(s->greedy.get());
+            for (auto* s : live) if(!s->request.constraint) peers.push_back(s->greedy.get());
             for (auto* s : live)
-                s->greedy->set_ngram_peers((s->request.ngram_peers ? *s->request.ngram_peers : context_peers)
+                s->greedy->set_ngram_peers(!s->request.constraint && (s->request.ngram_peers ? *s->request.ngram_peers : context_peers)
                     ? std::span<const HipMtpGreedyRuntime* const>(peers) : std::span<const HipMtpGreedyRuntime* const>{});
         }
         const auto cycle_start = clock::now();
@@ -1126,20 +1131,28 @@ private:
         if (live.size() == 1U) {
             auto& s = *live.front();
             ++stats_.solo_steps;
-            apply(s, s.greedy->cycle(s.pending, m.candidate_depth, budget(s), s.request.stop_tokens));
+            try {
+                auto transaction=s.request.constraint?s.request.constraint->window_transaction():nullptr;
+                apply(s, s.greedy->cycle(s.pending, m.candidate_depth, budget(s), s.request.stop_tokens,transaction.get()));
+            } catch(const serve::ConstraintError& e) {
+                if(s.session->health==SerialSessionHealth::poisoned || (s.window && s.window->failed()))throw;
+                constraint_failed(s,e);
+            }
             return true;
         }
         ++stats_.cohort_steps;
         std::vector<HipMtpGreedyCohortMember> members;
         members.reserve(live.size());
+        std::vector<std::unique_ptr<MtpSelectionTransaction>> transactions;transactions.reserve(live.size());
         for (auto* s : live) {
             const auto slot=std::find_if(slots_.begin(),slots_.end(),[&](const auto& p){return p.get()==s;})-slots_.begin();
+            transactions.push_back(s->request.constraint?s->request.constraint->window_transaction():nullptr);
             members.push_back({s->greedy.get(), &s->pending, m.candidate_depth, budget(*s), s->request.stop_tokens,
-                static_cast<std::uint32_t>(slot)});
+                static_cast<std::uint32_t>(slot),transactions.back().get()});
         }
         static const bool joint=[] {const char* v=std::getenv("STRIX_MTP_BATCH_JOINT");return v && v[0]=='1';}();
-        const auto results = hip_mtp_greedy_cohort_cycle(members, &stats_.cohort,joint?&joint_:nullptr);
-        for (std::size_t k = 0; k < live.size(); ++k) apply(*live[k], results[k]);
+        auto results = hip_mtp_greedy_cohort_cycle(members, &stats_.cohort,joint?&joint_:nullptr,joint?&policy_joint_:nullptr);
+        for (std::size_t k = 0; k < live.size(); ++k) apply(*live[k], std::move(results[k]));
         return true;
     }
 
@@ -1160,13 +1173,13 @@ public:
     // After an engine failure: every active request ends (the caller reports the failure).
     void abandon() noexcept {
         for (auto& s : slots_) {
-            if (!s->active) continue;
+            const bool was_active=s->active;
             s->active = false;
             s->prefilling = false;
             s->prefill.reset();
             s->greedy.reset();
             s->pending = {};
-            if (s->runtime) s->runtime->cancel();
+            if (was_active && s->runtime) s->runtime->cancel();
             s->request={};
         }
     }
@@ -1487,15 +1500,17 @@ private:
         s.prefilling = false;
         s.decode_start = std::chrono::steady_clock::now();
         s.result.prompt_ms = std::chrono::duration<double, std::milli>(s.decode_start - s.prompt_start).count();
-        if(s.request.constraint) s.request.constraint->commit();
-        else {
+        const auto route=resolve_mtp_selection_route(options_.http_selection_mtp,!!s.window,s.window && s.window->policy_selection_admitted());
+        if(s.request.constraint) {s.request.constraint->commit();
+            s.request.constraint->set_execution(route.mtp?"mtp-host":"serial-host",route.fallback?route.fallback:"");}
+        if(!s.request.constraint || route.mtp) {
             s.greedy = std::make_unique<HipMtpGreedyRuntime>(s.runtime, qualified_, activated_, s.target, *s.session,
                 s.parents->resources, *s.dispatcher, s.parents);
             if (s.window) s.greedy->use_window_verifier(s.window);
             if (m.draft_chain) s.greedy->set_draft_min_probability(mtp_draft_min_probability(m));
-            if (enable_context) enable_context(*s.greedy, s.request.prompt, s.request.sampler, s.request.ngram_draft);
+            if (!s.request.constraint && enable_context) enable_context(*s.greedy, s.request.prompt, s.request.sampler, s.request.ngram_draft);
             if (s.request.draft_depth_max) s.greedy->set_draft_depth_max(s.request.draft_depth_max);
-            if ((s.request.tool_draft ? *s.request.tool_draft : tool_draft_default) && frame_tokens[0] != frame_tokens[1] &&
+            if (!s.request.constraint && (s.request.tool_draft ? *s.request.tool_draft : tool_draft_default) && frame_tokens[0] != frame_tokens[1] &&
                 !s.request.sampler && s.window && !s.window->survival_controller() && m.draft_chain) {
                 MtpFrameDraftConfig frame;
                 frame.open = frame_tokens[0];
@@ -1511,8 +1526,14 @@ private:
         s.result.generated_tokens = 1;
         emitted(s, first);
     }
-    void apply(Slot& s, const HipMtpGreedyCycleResult& result) {
-        if (result.emitted_tokens.empty()) throw std::runtime_error("batched MTP generation made no completed target progress");
+    void apply(Slot& s, HipMtpGreedyCycleResult result) {
+        if (result.emitted_tokens.empty() && !result.selection_failure) throw std::runtime_error("batched MTP generation made no completed target progress");
+        if(result.selection_receipt){result.selection_receipt->publish();result.selection_receipt.reset();}
+        if(result.selection_failure.has_value()) {
+            s.result.generated_tokens+=result.emitted_tokens.size();
+            if(!result.emitted_tokens.empty())s.request.on_tokens(result.emitted_tokens);
+            constraint_failed(s,serve::ConstraintError(*result.selection_failure));return;
+        }
         s.pending = result.final_target;
         ++s.result.cycles;
         s.result.proposed += result.proposed_candidates;
@@ -1605,7 +1626,7 @@ private:
     // Destroy/join before the slot owners and all captures.
     std::unique_ptr<BatchServiceHandoff> worker_;
     bool any_peers_ = false; // a request asked for cross-request lookup (the peers are refreshed every step from then on)
-    MtpBatchWindowController joint_;
+    MtpBatchWindowController joint_,policy_joint_;
     std::uint64_t admitted_ = 0;
     std::string rule_wave_;
 };
@@ -2054,6 +2075,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                     for(const auto t:q.prompt)if(t>=vocabulary)throw std::invalid_argument("served prompt token outside the vocabulary");
                     for(const auto t:q.stop_tokens)if(t>=vocabulary)throw std::invalid_argument("served stop token outside the vocabulary");
                     MtpServeResult out;
+                    if(q.constraint) {const auto route=resolve_mtp_selection_route(options.http_selection_mtp,!!window,window && window->policy_selection_admitted());
+                        q.constraint->set_execution(route.mtp?"mtp-host":"serial-host",route.fallback?route.fallback:"");}
                     const auto request_start=std::chrono::steady_clock::now();
                     try {
                         // Every request starts exactly like the command-line request after calibration:
@@ -2081,7 +2104,9 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         const auto decode_start=std::chrono::steady_clock::now();
                         out.prompt_ms=std::chrono::duration<double,std::milli>(decode_start-request_start).count();
                         HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
-                        if(!q.constraint && window)greedy.use_window_verifier(window);
+                        const auto route=resolve_mtp_selection_route(options.http_selection_mtp,!!window,window && window->policy_selection_admitted());
+                        if(q.constraint)q.constraint->set_execution(route.mtp?"mtp-host":"serial-host",route.fallback?route.fallback:"");
+                        if((!q.constraint || route.mtp) && window)greedy.use_window_verifier(window);
                         if(m.draft_chain)greedy.set_draft_min_probability(mtp_draft_min_probability(m));
                         // n-gram extension per request (D-055): the request's "ngram_draft" (true = on where admissible,
                         // false = off), else the engine's mode.
@@ -2094,7 +2119,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         else if(is_stop(first[0]))out.finish="stop";
                         while(out.finish=="length" && out.generated_tokens<q.max_tokens) {
                             if(session.next_position>=options.context_tokens){out.finish="context";break;}
-                            if(q.constraint) {
+                            if(q.constraint && !route.mtp) {
                                 q.constraint->prepare();
                                 auto next=target->execute_serial(session,r,dispatcher,pending.predicted_token(),nullptr,
                                     [state=q.constraint](auto row){return state->select(row);});
@@ -2105,9 +2130,16 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                                 continue;
                             }
                             const auto budget=std::min<std::uint64_t>(q.max_tokens-out.generated_tokens,UINT32_MAX);
-                            auto wide=wide_copy?wide_copy->cycle(greedy,pending,static_cast<std::uint32_t>(budget),q.stop_tokens):std::nullopt;
-                            const auto result=wide?std::move(*wide):greedy.cycle(pending,m.candidate_depth,static_cast<std::uint32_t>(budget),q.stop_tokens);
-                            if(result.emitted_tokens.empty())throw std::runtime_error("MTP generation made no completed target progress");
+                            auto transaction=q.constraint?q.constraint->window_transaction():nullptr;
+                            auto wide=!q.constraint && wide_copy?wide_copy->cycle(greedy,pending,static_cast<std::uint32_t>(budget),q.stop_tokens):std::nullopt;
+                            auto result=wide?std::move(*wide):greedy.cycle(pending,m.candidate_depth,static_cast<std::uint32_t>(budget),q.stop_tokens,transaction.get());
+                            if(result.emitted_tokens.empty() && !result.selection_failure)throw std::runtime_error("MTP generation made no completed target progress");
+                            if(result.selection_receipt){result.selection_receipt->publish();result.selection_receipt.reset();}
+                            if(result.selection_failure.has_value()) {
+                                out.generated_tokens+=result.emitted_tokens.size();
+                                if(!result.emitted_tokens.empty())q.on_tokens(result.emitted_tokens);
+                                out.finish="constraint_failure";out.error=std::move(*result.selection_failure);break;
+                            }
                             pending=result.final_target;++out.cycles;
                             out.proposed+=result.proposed_candidates;out.accepted+=result.accepted_candidates;
                             out.generated_tokens+=result.emitted_tokens.size();
@@ -2127,12 +2159,13 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         pending={};
                         out.decode_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-decode_start).count();
                     } catch(const serve::ConstraintError& e) {
+                        if(session.health==SerialSessionHealth::poisoned || (window && window->failed()))throw;
                         out.finish="constraint_failure";out.error=e.what();pending={};
                     }
                     if(q.constraint) out.constraint=q.constraint->verdict(out.finish);
                     return out;
                 };
-                parents->serve(run_request);
+                parents->serve(run_request,options.http_selection_mtp && window && window->policy_selection_admitted());
                 assets->validate_assets_unchanged();
                 output<<"{\"mode\":\"native-mtp-http-serve\",\"served_requests\":"<<served
                     <<",\"calibration_rows\":"<<calibration_rows<<",\"calibration_ms\":"<<calibration_ms<<"}\n";
