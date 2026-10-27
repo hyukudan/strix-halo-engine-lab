@@ -2142,3 +2142,23 @@ Use the v2 exact prefill indexer kernel.
 - **Off switch:** STRIX_GLM_PF_IDX=1
 - **Measured gain:** indexer v2 -41 %
 - **Implementation / evidence:** [16-item resolver](../apps/glm_rank_defaults.hpp)
+
+## Platform (kernel)
+
+<a id="platform-perfopt"></a>
+
+### GPU IOMMU PerfOpt (optional)
+
+**Engine:** platform. **Control:** `amdgpu.iommu_perfopt` (kernel module parameter). **Default:** not used (optional kernel).
+
+The integrated GPU reaches system memory without IOMMU translation; the IOMMU stays on and every other device,
+including the USB4 controllers, keeps its translated domain. Trade-off: the GPU's own DMA is no longer contained
+by the IOMMU.
+
+- **Preconditions:** Kernel with AMD's PerfOpt patches (Linux 7.4 or the IOMMU tree) and the GPU in an identity domain; dedicated inference host without GPU unbind, VFIO, kexec/kdump or suspend.
+- **Automatic selection:** On by default in a kernel that carries the patches; nothing in the engine selects it.
+- **Fallback notice:** None at engine level; the kernel logs "PerfOpt armed" when active.
+- **Exactness evidence:** Same kernel build, PerfOpt on vs amdgpu.iommu_perfopt=0, interleaved boots: tokens identical in every arm; GPU identity domain, USB4 NHIs still DMA-FQ, iommu_dma_protection=1, no AMD-Vi fault lines after two-node traffic.
+- **Off switch:** `options amdgpu iommu_perfopt=0`, or boot the previous kernel
+- **Measured gain:** Qwen 32K prefill +2.9 % / +3.1 % (two repeats, one node, same power, equal or lower GPU clock); DeepSeek two-node decode within ±1 % with one node on PerfOpt, both-node run pending
+- **Implementation / evidence:** [driver repo: PerfOpt](https://github.com/hyukudan/strix-halo-usb4-driver/blob/main/docs/PERFOPT.md)
