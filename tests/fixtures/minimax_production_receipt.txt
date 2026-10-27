@@ -1,10 +1,10 @@
 # MiniMax M3.1 Flash TP2 production receipts for the defaults-on equivalence test (tests/minimax_defaults_tests.cpp).
 # The plain invocation (no option, no env) must resolve to exactly the configuration these processes ran with.
 #
-# rank: measured production invocation, re-run with the adopted defaults and
-#   the uncached prefill exchange enabled:
-#   STRIX_MM_PF_TX_UNCACHED=1. Env lines = every value those processes ran with: set by the app
-#   (hp transport, deferred CRC), code defaults (decode/prefill items), the adopted uncached exchange.
+# rank: measured production invocation, re-run with the adopted defaults, the uncached prefill
+#   exchange enabled (STRIX_MM_PF_TX_UNCACHED=1) and the DSpark Markov cand form (STRIX_MM_MARKOV=cand, C 4096,
+#   |H| 8192, top-C v2). Env lines = every value those processes ran with: set by the app
+#   (hp transport, deferred CRC), code defaults (decode/prefill items), the adopted items.
 # serve: measured production command (both ranks), same engine values.
 receipt rank
 argv $M 0 usb4-auto $OUT --slots 8 --capacity 8256 --max-rows 4096 --gate oracle-A --gate-layers 6 --decode-check prompts/p1k.u32:24 --decode-check prompts/chat-prose.u32:16 --session 1k:prompts/p1k.u32:64 --session 8k:prompts/p8k.u32:16 --batch prompts/p1k.u32:24:1,2,4,8 --session jtb:chat/json-table.u32:256 --session cpy:chat/code-py.u32:256 --session pen:chat/prose-en.u32:256 --dspark-exl3 minimax-drafts/dspark-exl3-K4fc --spec jtb:chat/json-table.u32:256:auto --spec cpy:chat/code-py.u32:256:auto --spec pen:chat/prose-en.u32:256:auto
@@ -19,6 +19,11 @@ env STRIX_MM_XB_POSTILP=2
 env STRIX_MM_XB_WARM=8
 env STRIX_MM_DSPARK_ATTN=2
 env STRIX_MM_DRAFT_LIN=opt
+env STRIX_MMX_LINEAR_V11=1
+env STRIX_MM_MARKOV=cand
+env STRIX_MM_MARKOV_C=4096
+env STRIX_MM_MARKOV_H=8192
+env STRIX_MM_MARKOV_TOPC=v2
 env STRIX_MMX_PREFILL_CORE=v4
 env STRIX_MM_PF_MSA_BATCH=1
 env STRIX_MM_PF_ATTEND4=1
@@ -45,6 +50,11 @@ env STRIX_MM_XB_POSTILP=2
 env STRIX_MM_XB_WARM=8
 env STRIX_MM_DSPARK_ATTN=2
 env STRIX_MM_DRAFT_LIN=opt
+env STRIX_MMX_LINEAR_V11=1
+env STRIX_MM_MARKOV=cand
+env STRIX_MM_MARKOV_C=4096
+env STRIX_MM_MARKOV_H=8192
+env STRIX_MM_MARKOV_TOPC=v2
 env STRIX_MMX_PREFILL_CORE=v4
 env STRIX_MM_PF_MSA_BATCH=1
 env STRIX_MM_PF_ATTEND4=1

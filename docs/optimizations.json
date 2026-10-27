@@ -793,6 +793,28 @@
   },
   {
     "engine": "minimax",
+    "name": "Draft-block linear core v11",
+    "flag_or_env": "STRIX_MMX_LINEAR_V11",
+    "default": "1",
+    "exact": "Same output bits as v10 (bitwise over every scheduled form and layer); speculative ids == greedy 36/36.",
+    "gain": "DSpark draft block -11.9 %",
+    "preconditions": "DSpark draft block at 7 rows through the scheduled linear path.",
+    "off_switch": "STRIX_MMX_LINEAR_V11=0",
+    "doc_anchor": "docs/optimizations.md#mm-linear-v11"
+  },
+  {
+    "engine": "minimax",
+    "name": "DSpark Markov candidate form",
+    "flag_or_env": "STRIX_MM_MARKOV; STRIX_MM_MARKOV_C; STRIX_MM_MARKOV_H; STRIX_MM_MARKOV_TOPC",
+    "default": "cand, C 4096, H 8192, top-C v2",
+    "exact": "Target verify unchanged: committed tokens equal plain greedy on every gated session; top-C v2 payloads == v1 == CPU.",
+    "gain": "~1.7 ms saved per draft; DSpark median tok/s +1.1 to +1.6 %, acceptance unchanged",
+    "preconditions": "Attached DSpark drafter on the pair.",
+    "off_switch": "STRIX_MM_MARKOV=full",
+    "doc_anchor": "docs/optimizations.md#mm-markov-cand"
+  },
+  {
+    "engine": "minimax",
     "name": "v4 MoE prefill core",
     "flag_or_env": "STRIX_MMX_PREFILL_CORE",
     "default": "v4",

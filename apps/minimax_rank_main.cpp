@@ -34,6 +34,10 @@
 //                                                     tokens compared with the --session of the same NAME (exactness)
 //   --dspark DIR                                     draft checkpoint (default MODEL_DIR/dspark)
 //   --dspark-exl3 DIR                                draft linears from an EXL3 requant (strix-trellis gemv), rest from --dspark
+//   --dspark-head DIR (repeatable)                   draft-only head: EXL3 requant of the lm_head (ref/quant_head.py); the target's
+//                                                    head stays for decode / verify (STRIX_MM_DRAFT_HEAD=lib|sched|sched:V;
+//                                                    STRIX_MM_DRAFT_HEAD_AB: per prompt the spec runs rotate target,
+//                                                    head 0, head 1, ...; otherwise the last one attached)
 //   --decode-check PROMPT.u32:K                      decode steps (true tokens) vs teacher-forced logits, last K rows
 //   --deadline SECONDS                               skip later parts once rank 0 has run this long
 //   --slots S --capacity C --max-rows R              engine sizes (defaults 8 / 8256 / 4096)
@@ -55,6 +59,7 @@
 #include "minimax/xfer/minimax_xfer.hpp"
 #include "minimax/pfx/pf_exchange.hpp"
 #include "hip_minimax_dspark.hpp"
+#include "markov_cand.hpp"
 #include "minimax_ngram.hpp"
 
 #include <arpa/inet.h>
@@ -443,12 +448,65 @@ std::vector<std::uint32_t> listen_session(mm::Engine& eng, int lfd, const std::s
 // fills the rest of the block with the continuation; once a copy is established (its whole window accepted) the next
 // cycle tries the copy first with >= 5 and skips the neural draft). Returns the generated ids
 // (first = the prefill's token), `steps` + 1 of them.
+// DSpark Markov chain form. STRIX_MM_MARKOV=cand (default; STRIX_MM_BASELINE=1 -> full): ds::CandMarkov, top-C per
+// half + |H| high-norm W2 rows, one payload exchange per draft, chain on device; X1: acceptance only, verify unchanged |
+// full (the former default: 7 x (half-vocabulary step + 8-byte exchange)) | ab (alternates full, cand, ... per spec session,
+// for ABA in one load). STRIX_MM_MARKOV_CHECK=0 skips the cross-rank chain hash.
+// STRIX_MM_MARKOV_TOPC=v2 (default; baseline v1) | v1: the cand form's top-C selection kernels (same canonical set, same picks).
+// STRIX_MM_MARKOV_C / STRIX_MM_MARKOV_H: candidate-set size of the cand form (default 4096 / 8192; larger sets agree with the
+// full chain more often, offline res/approx1-K3.json: C4096/H8192 0 acceptance changes on 1857 anchors).
+unsigned markov_cand_env(const char* name, unsigned dflt) {
+    const char* e = std::getenv(name);
+    if (e == nullptr || *e == '\0') return dflt;
+    char* end = nullptr;
+    const unsigned long v = std::strtoul(e, &end, 10);
+    if (*end != '\0' || v == 0 || v > (1UL << 20)) throw std::invalid_argument(std::string(name) + " must be a positive integer");
+    return static_cast<unsigned>(v);
+}
+// STRIX_MM_MARKOV_XCHG=device (default: one device-to-device payload exchange) | host (the original 64 KiB control-channel
+// chunks through host memory). Same payload bytes either way -> same picks.
+bool markov_xchg_device() {
+    static const bool dev = [] {
+        const char* e = std::getenv("STRIX_MM_MARKOV_XCHG");
+        const std::string m = e != nullptr && *e != '\0' ? e : "device";
+        if (m != "device" && m != "host") throw std::invalid_argument("STRIX_MM_MARKOV_XCHG must be device or host");
+        return m == "device";
+    }();
+    return dev;
+}
+// STRIX_MM_DSPARK_DESKEW=1 (diagnostic, only with STRIX_MM_DSPARK_PROFILE): an 8-byte peer rendezvous after the head lap so
+// arrival skew between the ranks is reported as 'rendezvous' instead of landing in the first Markov exchange (full and cand alike).
+bool dspark_deskew() {
+    static const bool on = std::getenv("STRIX_MM_DSPARK_DESKEW") != nullptr && std::getenv("STRIX_MM_DSPARK_DESKEW")[0] == '1';
+    return on;
+}
+// Defaults ON: the cand form at C 4096 / |H| 8192 with top-C v2 (measured: acceptance unchanged, verify exact).
+// STRIX_MM_MARKOV=full, or the master STRIX_MM_BASELINE=1 (an explicit STRIX_MM_MARKOV wins), restores the full chain.
+// The four STRIX_MM_MARKOV* items live in the mm_defaults table: print_or_apply() exports their resolved values (explicit
+// env > STRIX_MM_BASELINE > default) before any reader runs, so the fallbacks below only matter without apply().
+bool mm_baseline() { return strix::minimax::defaults::baseline([](const char* n) { return std::getenv(n); }); }
+bool markov_cand_session() {
+    static int n = 0;
+    const char* e = std::getenv("STRIX_MM_MARKOV");
+    const std::string m = e != nullptr && *e != '\0' ? e : (mm_baseline() ? "full" : "cand");
+    if (m != "full" && m != "cand" && m != "ab") throw std::invalid_argument("STRIX_MM_MARKOV must be full, cand or ab");
+    return m == "cand" || (m == "ab" && (n++ % 2) == 1);
+}
+std::unique_ptr<ds::CandMarkov> g_cand;
+
 struct SpecStats {
     std::size_t cycles = 0, drafted = 0, accepted = 0, emitted = 0, copy_cycles = 0, copy_accepted = 0, copy_drafted = 0;
+    std::size_t n_markov_fallback = 0;
     std::array<std::size_t, 8> hist{};
     std::array<std::size_t, 7> depth_try{}, depth_ok{};
     double t_draft = 0, t_verify = 0, t_append = 0, wall = 0;
     double t_fwd = 0, t_head = 0, t_markov = 0, t_conf = 0;  // STRIX_MM_DSPARK_PROFILE=1 (synchronised)
+    // markov detail (always; host clock reads at existing syncs only): cand chain-hash exchange; full path steps executed,
+    // their markov_step_host (step incl. its sync) and peer2 + combine (exchange) time
+    double t_hash = 0, t_fstep = 0, t_fx = 0;
+    double t_rdv = 0;  // STRIX_MM_DSPARK_DESKEW=1 (with PROFILE): rendezvous after the head lap, reported apart
+    std::uint64_t draft_fnv = 14695981039346656037ULL;  // every cycle's verify inputs (window size + drafted tokens)
+    std::size_t n_full_steps = 0, n_full_drafts = 0;
     std::size_t n_neural = 0;
     std::array<double, 9> t_rows{};
     std::array<std::size_t, 9> n_rows{};
@@ -457,17 +515,33 @@ struct SpecStats {
 std::vector<std::uint32_t> spec_session(mm::Engine& eng, ds::DeviceDrafter& dd, const std::string& name,
                                         const std::vector<std::uint32_t>& prompt, int steps, const std::string& policy,
                                         const std::string& out_dir) {
-    // auto = ds::SurvivalController window + ds::DraftGate (decides before drafting whether the cycle drafts at all; measurement:
+    const bool dump_y = std::getenv("STRIX_MM_DSPARK_DUMP_Y") != nullptr && eng.rank() == 0;
+    std::ofstream ydump;
+    if (dump_y) ydump.open(out_dir + "/y-" + name + "-" + std::to_string(steps) + ".f32", std::ios::binary | std::ios::app);
+    // auto = ds::SurvivalController window + ds::DraftGate (decides before drafting whether the cycle drafts at all; s7:
     // never slower beyond noise, prose-es +5.8 %); auto:nogate = the window controller alone
+    // probe = M12's stride-1 matched-continuation diagnostic: a full draft (7 Markov steps + confidences) at EVERY token
+    // position, verified with k = 0 (plain greedy decoding plus the draft's cost); afterwards each position's drafts are
+    // compared with the greedy continuation -> uncensored accepted length 0..7 per position (out_dir/probe-NAME.tsv), so
+    // any causal gate / window policy can be replayed offline at token positions
+    const bool probe = policy == "probe";
     const bool gated = policy == "auto", autop = gated || policy == "auto:nogate", ngram = policy.rfind("ngram:", 0) == 0,
                hybrid = policy.rfind("hybrid:", 0) == 0, chain = policy.rfind("chain:", 0) == 0;
-    const std::uint32_t fixed_k = autop ? 7U : static_cast<std::uint32_t>(std::stoul(policy.substr(policy.find(':') + 1)));
-    if ((!autop && !ngram && !hybrid && !chain && policy.rfind("fixed:", 0) != 0) || fixed_k > ds::block)
-        throw std::invalid_argument("spec policy: fixed:K | auto | auto:nogate | ngram:K | hybrid:K | chain:K (K <= 7)");
+    const std::uint32_t fixed_k =
+        autop || probe ? 7U : static_cast<std::uint32_t>(std::stoul(policy.substr(policy.find(':') + 1)));
+    if ((!autop && !probe && !ngram && !hybrid && !chain && policy.rfind("fixed:", 0) != 0) || fixed_k > ds::block)
+        throw std::invalid_argument("spec policy: fixed:K | auto | auto:nogate | probe | ngram:K | hybrid:K | chain:K (K <= 7)");
+    struct ProbeRow {
+        std::array<std::uint32_t, ds::block> d;
+        std::array<float, ds::block> conf;
+        double draft_ms;
+    };
+    std::vector<ProbeRow> probes;
     bool copy_established = false;
     ds::CopyDrafter copier(8);
     copier.append(prompt);
     eng.set_taps(true);
+    dd.drop_staged(0);  // rows staged by a previous sequence's paused cycles do not belong to this one
     eng.set_prefill_tap_sink([&](const float* taps, std::size_t n, std::uint32_t slot, std::uint64_t pos0) {
         dd.append(slot, taps, n, pos0, nullptr);
     });
@@ -477,26 +551,57 @@ std::vector<std::uint32_t> spec_session(mm::Engine& eng, ds::DeviceDrafter& dd, 
     eng.set_prefill_tap_sink({});
     const auto [v0, vn] = eng.vocab_range();
     SpecStats st;
+    const bool use_cand = markov_cand_session();
+    const bool markov_check = std::getenv("STRIX_MM_MARKOV_CHECK") == nullptr || std::getenv("STRIX_MM_MARKOV_CHECK")[0] != '0';
+    if (use_cand && !g_cand) {
+        const auto& w = dd.device_weights();
+        const unsigned C = markov_cand_env("STRIX_MM_MARKOV_C", 4096), nh = markov_cand_env("STRIX_MM_MARKOV_H", 8192);
+        g_cand = std::make_unique<ds::CandMarkov>(w.markov_w1, w.markov_w2, ds::vocab, v0, vn, C, nh);
+        std::printf("rank %u: markov cand ready (C %u, |H| %u, exchange %s, topc %s, %u candidates, payload %.1f KB)\n", eng.rank(), C, nh,
+                    markov_xchg_device() ? "device" : "host", g_cand->topc() == ds::CandMarkov::TopC::v2 ? "v2" : "v1",
+                    g_cand->candidates(), static_cast<double>(g_cand->payload_bytes()) / 1024.0);
+    }
+    const ds::CandMarkov::Stats cs0 = g_cand ? g_cand->stats() : ds::CandMarkov::Stats{};
     std::vector<double> cost(ds::block + 1, 0.0);  // cost[k] = draft (k > 0) + verify of k + 1 rows, measured online
     // auto: window by ds::SurvivalController on measured costs (verify EMA per row count; unmeasured row counts scaled from
     // the measured ones by 1 + 0.12 (R - 1), the measurement slope; draft EMA)
     ds::SurvivalController survival(16);
     const bool profile = std::getenv("STRIX_MM_DSPARK_PROFILE") != nullptr;
     const auto lin0 = dd.linear_seconds();  // per-session deltas (the drafter is shared by the sessions of a load)
-    ds::DraftGate gate;
+    const auto app0 = dd.append_linear_seconds();
+    // per-cycle trace on rank 0 (gate / controller design on real sequences)
+    // (STRIX_MM_DSPARK_TRACE=1; repeated sessions of one prompt and policy append, each starting with its header)
+    std::FILE* trace = eng.rank() == 0 && std::getenv("STRIX_MM_DSPARK_TRACE") != nullptr
+                           ? std::fopen((out_dir + "/trace-" + name + "-" + policy + ".tsv").c_str(), "a")
+                           : nullptr;
+    if (trace) std::fputs("cycle\tdrafted\tk\taccepted\temitted\tdraft_ms\tverify_ms\tappend_ms\tconf0\tconf1\tconf2\tconf3\tconf4\tconf5\tconf6\td1ok\n", trace);
+    ds::DraftGate gate(1.0, 12, true);  // agreed form: the pause is agreed once per drafting cycle with the window
     std::array<double, ds::block + 2> vcost{};
     double dcost = 0;
     std::array<float, ds::block> conf_now{};
+    // Unmeasured row counts: least-squares line a + b (R - 1) through the measured ones (perf review: the
+    // old 1 + 0.12 (R - 1) scaling priced R2 at ~83 ms on prose-es against 70 measured). One measured point: b = 0.267 a
+    // (s6-s11: ~14.7 ms per extra row on a 55 ms step); none: 55 + 14.7 (R - 1) ms.
     const auto verify_cost = [&](std::uint32_t R) {
         if (vcost[R] > 0) return vcost[R];
-        double base = 0;
-        int n = 0;
+        double n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
         for (std::uint32_t r = 1; r <= ds::block + 1; ++r)
             if (vcost[r] > 0) {
-                base += vcost[r] / (1.0 + 0.12 * (r - 1));
-                ++n;
+                const double x = r - 1.0;
+                n += 1;
+                sx += x;
+                sy += vcost[r];
+                sxx += x * x;
+                sxy += x * vcost[r];
             }
-        return (n ? base / n : 0.186) * (1.0 + 0.12 * (R - 1));
+        const double x = R - 1.0;
+        if (n == 0) return 0.055 + 0.0147 * x;
+        if (n == 1 || n * sxx - sx * sx <= 0) {
+            const double a = sy / n / (1.0 + 0.267 * sx / n);
+            return a * (1.0 + 0.267 * x);
+        }
+        const double b = (n * sxy - sx * sy) / (n * sxx - sx * sx), a = (sy - b * sx) / n;
+        return std::max(a + b * x, 0.5 * a);
     };
     std::uint64_t P = prompt.size();
     std::uint32_t anchor = gen[0];
@@ -507,7 +612,8 @@ std::vector<std::uint32_t> spec_session(mm::Engine& eng, ds::DeviceDrafter& dd, 
         std::array<std::uint32_t, ds::block> d{};
         auto a = Clock::now();
         bool via_copy = false;
-        if (gated && k > 0 && eng.agree(gate.draft() ? 1U : 0U) == 0) k = 0;  // timings differ per rank: rank 0 decides
+        if (gated && k > 0 && !gate.draft()) k = 0;  // local: the pause length was agreed when it was decided
+        std::uint32_t pause = 0;
         const bool drafted = k > 0;
         if (chain && copy_established && k > 0) {  // resumed copy: >= 5, the neural draft skipped
             const auto c = copier.continuation({}, k, 5);
@@ -537,15 +643,65 @@ std::vector<std::uint32_t> spec_session(mm::Engine& eng, ds::DeviceDrafter& dd, 
             dd.forward_block(0, eng.embed_row(anchor), eng.embed_row(ds::noise_token), P, nullptr);
             lap(st.t_fwd);
             const float* logits = eng.head_logits(dd.y(), ds::block);
+            if (dump_y) {  // STRIX_MM_DSPARK_DUMP_Y: the head's 7 input rows of every neural draft (rank 0; draft-only head calibration)
+                std::vector<float> y(static_cast<std::size_t>(ds::block) * ds::hidden);
+                if (hipMemcpy(y.data(), dd.y(), y.size() * sizeof(float), hipMemcpyDeviceToHost) != hipSuccess)
+                    throw std::runtime_error("dump y: hipMemcpy");
+                ydump.write(reinterpret_cast<const char*>(y.data()), static_cast<std::streamsize>(y.size() * sizeof(float)));
+            }
             lap(st.t_head);
+            if (profile && dspark_deskew()) {  // diagnostic: both ranks rendezvous after the head, Markov timer restarts after it
+                const auto r0 = Clock::now();
+                (void)eng.peer(0);
+                p0 = Clock::now();
+                st.t_rdv += secs(r0, p0);
+            }
             std::array<std::uint32_t, ds::block> prev{};
             std::uint32_t t = anchor;
-            const std::uint32_t n_steps = autop ? ds::block : k;  // auto needs every row's confidence
-            for (std::uint32_t i = 0; i < n_steps; ++i) {
+            const std::uint32_t n_steps = autop || probe ? ds::block : k;  // auto needs every row's confidence
+            bool cand_done = false;
+            if (use_cand && !chain) {  // chain:K keeps the per-step copy continuation of the full form
+                std::array<std::uint32_t, ds::block> ct{};
+                cand_done = markov_xchg_device()
+                                ? g_cand->draft(logits, anchor,
+                                                ds::CandMarkov::DeviceExchange([&](const void* o, void* in, std::size_t b, hipStream_t s) {
+                                                    eng.exchange_device(o, in, b, s);
+                                                }),
+                                                ct, nullptr)
+                                : g_cand->draft(logits, anchor,
+                                                ds::CandMarkov::Exchange([&](const void* o, void* in, std::size_t b) {
+                                                    eng.exchange_bytes(o, in, b);
+                                                }),
+                                                ct, nullptr);
+                if (cand_done && markov_check) {  // both ranks must hold the same chain (one 8-byte exchange)
+                    const std::uint64_t h = fnv(ct.data(), ct.size() * 4);
+                    const auto h0 = Clock::now();
+                    const auto th = eng.peer2(static_cast<std::uint32_t>(h), static_cast<std::uint32_t>(h >> 32U));
+                    st.t_hash += secs(h0, Clock::now());
+                    if (th[0] != static_cast<std::uint32_t>(h) || th[1] != static_cast<std::uint32_t>(h >> 32U))
+                        throw std::runtime_error("markov cand: ranks disagree on the draft chain");
+                }
+                if (cand_done) {
+                    for (std::uint32_t i = 0; i < n_steps; ++i) {
+                        prev[i] = t;
+                        t = ct[i];
+                        d[i] = t;
+                    }
+                } else {
+                    ++st.n_markov_fallback;
+                }
+            }
+            if (!cand_done) ++st.n_full_drafts;
+            for (std::uint32_t i = 0; i < n_steps && !cand_done; ++i) {
                 prev[i] = t;
+                const auto f0 = Clock::now();
                 const ds::Candidate mine = dd.markov_step_host(t, logits + static_cast<std::size_t>(i) * vn, v0, v0 + vn, nullptr);
+                const auto f1 = Clock::now();
                 const auto theirs = eng.peer2(__builtin_bit_cast(std::uint32_t, mine.value), mine.id);
                 t = ds::combine(mine, ds::Candidate{__builtin_bit_cast(float, theirs[0]), theirs[1]}).id;
+                st.t_fstep += secs(f0, f1);
+                st.t_fx += secs(f1, Clock::now());
+                ++st.n_full_steps;
                 d[i] = t;
                 if (chain && i + 1 < k) {  // copy inside the chain: fill the rest of the block on a >= 12 match
                     const auto c = copier.continuation(std::span<const std::uint32_t>(d.data(), i + 1), k - i - 1, 12);
@@ -560,22 +716,43 @@ std::vector<std::uint32_t> spec_session(mm::Engine& eng, ds::DeviceDrafter& dd, 
             if (autop) {
                 conf_now = dd.confidence_host(prev, nullptr);
                 std::vector<double> cst(k + 1);
-                for (std::uint32_t j = 0; j <= k; ++j) cst[j] = (j > 0 ? (dcost > 0 ? dcost : 0.025) : 0.0) + verify_cost(j + 1);
+                // the draft is already paid: every window, k = 0 included, carries it (this cycle's throughput)
+                for (std::uint32_t j = 0; j <= k; ++j) cst[j] = (dcost > 0 ? dcost : 0.017) + verify_cost(j + 1);
                 // both ranks hold the same confidences; costs are measured per rank, so rank 0's choice is agreed
-                k = eng.agree(survival.choose(std::span<const float>(conf_now.data(), k), cst));
+                // one agreement carries the window (bits 0-7) and the gate's pause after this cycle (bits 8+)
+                const std::uint32_t agreed =
+                    eng.agree(survival.choose(std::span<const float>(conf_now.data(), k), cst) | (gated ? gate.proposal() << 8 : 0U));
+                k = agreed & 0xFFU;
+                pause = agreed >> 8;
+            }
+            if (probe) {
+                conf_now = dd.confidence_host(prev, nullptr);
+                probes.push_back({d, conf_now, secs(a, Clock::now()) * 1e3});
+                k = 0;  // decode exactly as plain greedy
             }
             lap(st.t_conf);
         }
         const double td = secs(a, Clock::now());
         std::vector<mm::Row> rows{{0, anchor, P}};
         for (std::uint32_t i = 0; i < k; ++i) rows.push_back({0, d[i], P + 1 + i});
+        st.draft_fnv = fnv(&k, sizeof k, st.draft_fnv);  // verify inputs of this cycle: window size + drafted tokens
+        st.draft_fnv = fnv(d.data(), std::size_t{k} * 4, st.draft_fnv);
         a = Clock::now();
         const auto g = eng.step(rows);
         const double tv = secs(a, Clock::now());
         const ds::Verdict v = ds::verify_greedy(std::span<const std::uint32_t>(d.data(), k), g);
         a = Clock::now();
-        dd.append(0, eng.last_taps(), v.accepted + 1, P, nullptr);
+        if (gated && !drafted)
+            dd.append_deferred(0, eng.last_taps(), v.accepted + 1, P, nullptr);  // batched at the next draft
+        else
+            dd.append(0, eng.last_taps(), v.accepted + 1, P, nullptr);
         const double ta = secs(a, Clock::now());
+        if (trace) {
+            std::fprintf(trace, "%zu\t%d\t%u\t%u\t%zu\t%.3f\t%.3f\t%.3f", st.cycles, drafted ? 1 : 0, k, v.accepted, v.emitted.size(),
+                         td * 1e3, tv * 1e3, ta * 1e3);
+            for (const float c : conf_now) std::fprintf(trace, "\t%.4f", drafted ? c : -1.0F);
+            std::fprintf(trace, "\t%d\n", drafted ? (d[0] == g[0] ? 1 : 0) : -1);  // depth-1 outcome, also when k = 0
+        }
         for (auto t : v.emitted) gen.push_back(t);
         copier.append(v.emitted);
         copy_established = chain && via_copy && v.accepted == k;
@@ -601,17 +778,45 @@ std::vector<std::uint32_t> spec_session(mm::Engine& eng, ds::DeviceDrafter& dd, 
         st.t_append += ta;
         st.t_rows[k + 1] += tv;
         ++st.n_rows[k + 1];
+        // a transient stall (s11 prose-story: one verify of 702 ms) must not reprice windows or feed the gate
+        const bool stall = (vcost[k + 1] > 0 && tv > 3 * vcost[k + 1]) || (drafted && dcost > 0 && td > 3 * dcost);
         if (autop) {
-            survival.observe(std::span<const float>(conf_now.data(), k), k, v.accepted);
-            vcost[k + 1] = vcost[k + 1] <= 0 ? tv : 0.8 * vcost[k + 1] + 0.2 * tv;
-            if (td > 0) dcost = dcost <= 0 ? td : 0.8 * dcost + 0.2 * td;
+            if (drafted && k == 0)  // the draft was paid and verify gave the next token: depth 1 is observed anyway
+                survival.observe(std::span<const float>(conf_now.data(), 1), 1, d[0] == g[0] ? 1U : 0U);
+            else
+                survival.observe(std::span<const float>(conf_now.data(), k), k, v.accepted);
+            if (!stall) {
+                vcost[k + 1] = vcost[k + 1] <= 0 ? tv : 0.8 * vcost[k + 1] + 0.2 * tv;
+                if (drafted && !via_copy) dcost = dcost <= 0 ? td : 0.8 * dcost + 0.2 * td;  // neural drafts only
+            }
         }
-        if (gated) gate.observe(drafted, static_cast<std::uint32_t>(v.emitted.size()), td + tv + ta, verify_cost(1));
+        if (gated) {
+            if (!stall) gate.observe(drafted, static_cast<std::uint32_t>(v.emitted.size()), td + tv + ta, verify_cost(1));
+            gate.pause(pause);
+        }
         const double c_new = (k > 0 ? td : 0.0) + tv;
         cost[k] = cost[k] <= 0 ? c_new : 0.8 * cost[k] + 0.2 * c_new;
         if (k == 0) cost[0] = cost[0] <= 0 ? tv : 0.8 * cost[0] + 0.2 * tv;
     }
     st.wall = secs(t_loop, Clock::now());
+    if (trace) std::fclose(trace);
+    if (probe && eng.rank() == 0) {
+        // cycle i drafted from anchor gen[i]; its depth-j draft is right iff it equals gen[i + 1 + j] (k = 0: one token per cycle)
+        std::FILE* pf = std::fopen((out_dir + "/probe-" + name + ".tsv").c_str(), "w");
+        if (pf) {
+            std::fputs("pos\taccepted\tdraft_ms\tconf0\tconf1\tconf2\tconf3\tconf4\tconf5\tconf6\n", pf);
+            for (std::size_t i = 0; i < probes.size(); ++i) {
+                std::uint32_t acc = 0;
+                while (acc < ds::block && i + 1 + acc < gen.size() && probes[i].d[acc] == gen[i + 1 + acc]) ++acc;
+                // decided: all 7 matched, or a mismatch was seen inside the available continuation (probe 1)
+                const bool complete = acc == ds::block || i + 1 + acc < gen.size();
+                std::fprintf(pf, "%zu\t%d\t%.3f", i, complete ? static_cast<int>(acc) : -1, probes[i].draft_ms);
+                for (const float c : probes[i].conf) std::fprintf(pf, "\t%.9g", static_cast<double>(c));
+                std::fputc('\n', pf);
+            }
+            std::fclose(pf);
+        }
+    }
     gen.resize(static_cast<std::size_t>(steps) + 1);
     eng.set_taps(false);
     const double tau = static_cast<double>(st.emitted) / static_cast<double>(std::max<std::size_t>(1, st.cycles));
@@ -621,21 +826,42 @@ std::vector<std::uint32_t> spec_session(mm::Engine& eng, ds::DeviceDrafter& dd, 
                 st.accepted, 100.0 * static_cast<double>(st.accepted) / static_cast<double>(std::max<std::size_t>(1, st.drafted)),
                 st.t_draft / static_cast<double>(st.cycles) * 1e3, st.t_verify / static_cast<double>(st.cycles) * 1e3,
                 st.t_append / static_cast<double>(st.cycles) * 1e3);
+    std::printf("rank %u spec %s: drafts fnv %016llx (verify inputs of all %zu cycles)\n", eng.rank(), name.c_str(),
+                static_cast<unsigned long long>(st.draft_fnv), st.cycles);
+    if (st.n_neural > 0) {
+        const ds::CandMarkov::Stats cs1 = g_cand ? g_cand->stats() : ds::CandMarkov::Stats{};
+        const std::size_t cd = cs1.drafts - cs0.drafts, fd = std::max<std::size_t>(1, st.n_full_drafts);
+        const double cn = static_cast<double>(std::max<std::size_t>(1, cd)) / 1e3;
+        std::printf("rank %u spec %s: markov detail: cand drafts %zu (ms each) select %.3f exchange %.3f (%.2f chunks, payload %zu B) "
+                    "chain %.3f hash %.3f | full drafts %zu steps %.2f each, step %.3f exchange %.3f ms each draft\n",
+                    eng.rank(), name.c_str(), cd, (cs1.select - cs0.select) / cn, (cs1.exchange - cs0.exchange) / cn,
+                    static_cast<double>(cs1.exchanges - cs0.exchanges) / static_cast<double>(std::max<std::size_t>(1, cd)),
+                    g_cand ? g_cand->payload_bytes() : std::size_t{0}, (cs1.chain - cs0.chain) / cn, st.t_hash / cn, st.n_full_drafts,
+                    static_cast<double>(st.n_full_steps) / static_cast<double>(fd), st.t_fstep * 1e3 / static_cast<double>(fd),
+                    st.t_fx * 1e3 / static_cast<double>(fd));
+    }
     if (profile && st.n_neural > 0) {
         const double n = static_cast<double>(st.n_neural) / 1e3;
         std::printf("rank %u spec %s: draft attribution over %zu neural drafts (ms each): block %.2f head %.2f markov+exchange %.2f "
-                    "confidence+choose %.2f\n",
-                    eng.rank(), name.c_str(), st.n_neural, st.t_fwd / n, st.t_head / n, st.t_markov / n, st.t_conf / n);
+                    "confidence+choose %.2f rendezvous %.2f\n",
+                    eng.rank(), name.c_str(), st.n_neural, st.t_fwd / n, st.t_head / n, st.t_markov / n, st.t_conf / n,
+                    st.t_rdv / n);
         const auto& ls = dd.linear_seconds();
         double lin = 0;
         for (int i = 0; i < 7; ++i) lin += ls[i] - lin0[i];
         std::printf("rank %u spec %s: block linears %.2f ms each (q %.2f k %.2f v %.2f o %.2f gate %.2f up %.2f down %.2f), rest of "
-                    "the block %.2f; fc appends %.2f ms per cycle\n",
+                    "the block %.2f; context appends (fc + k/v linears) %.2f ms per cycle\n",
                     eng.rank(), name.c_str(), lin / n, (ls[0] - lin0[0]) / n, (ls[1] - lin0[1]) / n, (ls[2] - lin0[2]) / n,
                     (ls[3] - lin0[3]) / n, (ls[4] - lin0[4]) / n, (ls[5] - lin0[5]) / n, (ls[6] - lin0[6]) / n,
-                    st.t_fwd / n - lin / n, (ls[7] - lin0[7]) / static_cast<double>(st.cycles) * 1e3);
+                    st.t_fwd / n - lin / n, [&] {
+                        const auto& as = dd.append_linear_seconds();
+                        double s = 0;
+                        for (int i = 0; i < 8; ++i) s += as[i] - app0[i];
+                        return s / static_cast<double>(st.cycles) * 1e3;
+                    }());
     }
     if (gated) std::printf("rank %u spec %s: draft gate paused %u cycles\n", eng.rank(), name.c_str(), gate.paused_cycles());
+    std::printf("rank %u spec %s: markov %s (fallbacks %zu)\n", eng.rank(), name.c_str(), use_cand ? "cand" : "full", st.n_markov_fallback);
     std::printf("rank %u spec %s: copy-drafter cycles %zu (drafted %zu accepted %zu)\n", eng.rank(), name.c_str(), st.copy_cycles,
                 st.copy_drafted, st.copy_accepted);
     std::printf("rank %u spec %s: accepted histogram", eng.rank(), name.c_str());
@@ -1313,6 +1539,7 @@ int main(int argc, char** argv) {
         double deadline = 1e9;
         std::vector<std::string> sessions, batches, ab_runs, specs, dchecks, vtraces, offloads, offload_imports, offload_listens, xbchecks;
         std::string dspark_dir = std::string(argv[1]) + "/dspark", dspark_exl3;
+        std::vector<std::string> dspark_heads;
         for (int i = 5; i < argc; ++i) {
             const std::string a = argv[i];
             auto next = [&]() -> std::string {
@@ -1337,6 +1564,7 @@ int main(int argc, char** argv) {
             else if (a == "--spec") specs.push_back(next());
             else if (a == "--dspark") dspark_dir = next();
             else if (a == "--dspark-exl3") dspark_exl3 = next();
+            else if (a == "--dspark-head") dspark_heads.push_back(next());
             else if (a == "--deadline") deadline = std::stod(next());
             else if (a == "--slots") opt.slots = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--capacity") opt.capacity = std::stoull(next());
@@ -1561,6 +1789,7 @@ int main(int argc, char** argv) {
                 if (const char* e = std::getenv("STRIX_MM_DSPARK_ATTN")) dopt.attn_variant = static_cast<std::uint32_t>(std::atoi(e));
                 drafter = std::make_unique<ds::DeviceDrafter>(draft_file->weights(), dopt);
                 if (!dspark_exl3.empty()) eng.attach_draft_exl3(dspark_exl3, *drafter);
+                for (const std::string& h : dspark_heads) eng.attach_draft_head(h);
                 drafter->set_profile(std::getenv("STRIX_MM_DSPARK_PROFILE") != nullptr);
                 std::printf("rank %u: dspark %s loaded in %.1f s (%.2f GB device, ring %.0f MB)\n", opt.rank, dspark_dir.c_str(),
                             secs(t0, Clock::now()), static_cast<double>(drafter->weight_bytes()) / 1e9,
@@ -1579,6 +1808,12 @@ int main(int argc, char** argv) {
                 }
                 std::printf("rank %u: spec %s #%zu drafter %s\n", opt.rank, spec_name.c_str(), spec_index,
                             on ? "B (enqueue_linears_scheduled, attention B)" : "A (strix_gemv, attention A)");
+            }
+            if (std::getenv("STRIX_MM_DRAFT_HEAD_AB") != nullptr) {  // with H x --dspark-head: per prompt the spec runs rotate
+                const int h = static_cast<int>(spec_index % static_cast<std::size_t>(eng.draft_heads() + 1)) - 1;  // -1 = target
+                eng.set_draft_head(h);
+                std::printf("rank %u: spec %s #%zu head %d (%s)\n", opt.rank, spec_name.c_str(), spec_index, h,
+                            h < 0 ? "target" : dspark_heads[static_cast<std::size_t>(h)].c_str());
             }
             const auto c1 = sp.find(':'), c2 = sp.find(':', c1 + 1), c3 = sp.find(':', c2 + 1);
             const std::string name = sp.substr(0, c1);
@@ -1677,6 +1912,7 @@ int main(int argc, char** argv) {
                     secs(t_start, Clock::now()));
         xb_receipt("process totals", xb_start);
         if (g_exact_fail) std::printf("rank %u: EXACTNESS FAILURE across A/B arms (see the ab lines)\n", opt.rank);
+        g_cand.reset();  // device buffers go while the HIP runtime is still up (not in static teardown)
         return mine != other ? 3 : g_exact_fail ? 4 : 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strix-minimax-rank error: %s\n", e.what());

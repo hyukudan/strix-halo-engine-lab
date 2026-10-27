@@ -129,8 +129,11 @@ void test_survival() {
     check(all.choose(conf, cost) == 7, "survival controller: everything accepted -> full window");
     SurvivalController ex(4);
     int fulls = 0;
-    for (int i = 0; i < 8; ++i) fulls += ex.choose(conf, cost) == 7 ? 1 : 0;  // the prior alone picks k = 4 or 5 here
-    check(fulls == 3, "survival controller explores the first window and every 4th call");
+    std::vector<std::uint32_t> ks;
+    for (int i = 0; i < 8; ++i) ks.push_back(ex.choose(conf, cost));  // the prior alone picks k = 4 or 5 here
+    for (std::size_t i = 1; i < ks.size(); ++i) fulls += ks[i] > ks[1] ? 1 : 0;
+    check(ks[0] == 7 && ks[1] <= 5 && fulls == 2 && ks[3] == std::min<std::uint32_t>(7, ks[1] + 2),
+          "survival controller: first window full, every 4th call best + 2");
     // Censoring: windows of 3 always fully accepted (depths 3-6 never observed) must still open the full window, since
     // each cell borrows its bin's pooled rate (mmbench B json: the per-cell prior alone kept k < 7).
     SurvivalController cens(0);
@@ -151,8 +154,10 @@ void test_draft_gate() {
             pauses.push_back(run);
             run = 0;
         }
+        const std::uint32_t p = d ? lose.proposal() : 0;  // decided on a drafting cycle, applied after it
         // drafting: 1 token in 74 ms; no draft: 1 token in 55 ms
         lose.observe(d, 1, d ? 0.074 : 0.055, 0.057);
+        lose.pause(p);
     }
     check(pauses.size() >= 2 && pauses[0] == 8 && pauses[1] == 16, "draft gate: losing drafter pauses 8, then 16 cycles");
     DraftGate win;
@@ -160,7 +165,9 @@ void test_draft_gate() {
     for (int c = 0; c < 300; ++c) {
         const bool d = win.draft();
         paused = paused || !d;
+        const std::uint32_t p = d ? win.proposal() : 0;
         win.observe(d, (c % 3 == 0) ? 1U : 5U, 0.12, 0.057);  // mean 3.7 tokens per 120 ms vs 2.1 plain
+        win.pause(p);
     }
     check(!paused && win.paused_cycles() == 0, "draft gate: winning drafter never pauses");
 }

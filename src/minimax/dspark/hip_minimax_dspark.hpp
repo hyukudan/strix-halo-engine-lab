@@ -63,8 +63,10 @@ public:
     // hipDeviceSynchronize for callers without HIP headers (draft-cycle attribution).
     static void device_synchronize();
     // Attribution: every linear() synchronised and timed per kind (0..7) and the number of calls; off by default.
+    // linear_seconds = block passes only; append_linear_seconds = context appends (fc + k/v of every layer).
     void set_profile(bool on) { profile_ = on; }
     [[nodiscard]] const std::array<double, 8>& linear_seconds() const { return lin_s_; }
+    [[nodiscard]] const std::array<double, 8>& append_linear_seconds() const { return lin_app_s_; }
     [[nodiscard]] const std::array<std::size_t, 8>& linear_calls() const { return lin_n_; }
     ~DeviceDrafter();
     DeviceDrafter(const DeviceDrafter&) = delete;
@@ -72,6 +74,13 @@ public:
 
     // Context of n committed rows at positions pos0..pos0 + n - 1 (any n; rows below the window may be skipped).
     void append(std::uint32_t slot, const float* taps, std::size_t n, std::uint64_t pos0, hipStream_t stream);
+    // The same rows staged (device copy of the taps) and appended later in one batch: by the next append or block pass
+    // of the slot, or when 32 rows are staged. For cycles that do not draft (s10: a paused cycle's 1-row append cost
+    // ~1.5 ms of GPU time). Batching changes the rows' bits only through the linear path, never the output.
+    void append_deferred(std::uint32_t slot, const float* taps, std::size_t n, std::uint64_t pos0, hipStream_t stream);
+    void flush(std::uint32_t slot, hipStream_t stream);
+    // Forget staged rows (a new sequence starts in the slot).
+    void drop_staged(std::uint32_t slot) { staged_n_.at(slot) = 0; }
     // The block pass from the anchor at `position`; anchor_row / noise_row = the target's BF16 embedding rows.
     void forward_block(std::uint32_t slot, const std::uint16_t* anchor_row, const std::uint16_t* noise_row, std::uint64_t position,
                hipStream_t stream);
@@ -110,13 +119,18 @@ public:
 
 private:
     void linear(std::uint32_t layer, std::uint32_t kind, const float* x, std::size_t rows, float* out, hipStream_t stream) const;
+    void append_now(std::uint32_t slot, const float* taps, std::size_t n, std::uint64_t pos0, hipStream_t stream);
+    std::vector<float*> staged_;                    // per slot [32][tap_width]
+    std::vector<std::size_t> staged_n_;
+    std::vector<std::uint64_t> staged_pos_;
     // profile: a group's time goes to kinds[0] (one call); its other kinds count calls only.
     void linear_group(std::uint32_t layer, std::initializer_list<std::uint32_t> kinds, const float* x, std::size_t rows,
                       std::initializer_list<float*> outs, hipStream_t stream) const;
     LinearHook hook_;
     LinearGroupHook group_hook_;
     bool profile_ = false;
-    mutable std::array<double, 8> lin_s_{};
+    mutable std::array<double, 8> lin_s_{}, lin_app_s_{};
+    bool in_append_ = false;
     mutable std::array<std::size_t, 8> lin_n_{};
     void linear_impl(std::uint32_t layer, std::uint32_t kind, const float* x, std::size_t rows, float* out, hipStream_t stream) const;
     Options opt_;

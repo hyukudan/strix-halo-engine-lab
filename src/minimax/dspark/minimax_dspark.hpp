@@ -251,7 +251,9 @@ std::uint32_t choose_window(std::span<const float> confidence, std::span<const d
 // p = min(1, m + 0.5 sqrt(m (1 - m) / (tries + 4))) (without both, fully accepted text kept short windows: mmbench B json
 // auto -9 % vs fixed:7). choose() returns the k in [0, 7] maximizing expected emitted tokens per cost,
 // E[k] = 1 + sum_{i<=k} prod_{j<i} p(j, b_j), cost[k] = draft (k > 0) + verify of k + 1 rows (measured by the caller);
-// the first call and every `explore_every`-th call return the full window so the deep depths keep being observed.
+// the first call returns the full window; every `explore_every`-th call returns the best window + 2 (perf review of
+// measured: a full-window probe every 16 cycles was the largest single loss on prose, 5-12 tokens per 256), so the
+// next depths keep being observed and pooling covers the rest.
 class SurvivalController {
 public:
     explicit SurvivalController(std::uint32_t explore_every = 16) : explore_(explore_every) {}
@@ -271,18 +273,30 @@ private:
 // cycle's excess over plain decoding in the same time, x = emitted - seconds / t_plain, is accumulated since the gate was
 // made; drafting pauses for `backoff` cycles (8, doubling up to 128 while it keeps losing) when
 // mean(x) + z sd(x) / sqrt(n) < 0 with n >= min_cycles, and the backoff resets to 8 when mean(x) - z sd(x) / sqrt(n) > 0.
+// The sums decay by 0.97 per drafting cycle (effective window ~33 cycles) so a prose -> code switch is followed.
 // t_plain = EMA (0.8 / 0.2) of the cycles that did not draft; before the first one, the caller's estimate.
+// Across ranks only the decisions must agree: proposal() on a drafting cycle (agreed by the caller with its other
+// per-cycle agreement, rank 0's value wins) and pause() with the agreed value; draft() is then local on every rank, so
+// a paused cycle needs no exchange (s10: a per-cycle agree cost ~1 ms).
 class DraftGate {
 public:
-    explicit DraftGate(double z = 1.0, std::uint32_t min_cycles = 12) : z_(z), min_(min_cycles) {}
-    // Once per cycle, before drafting: false = decode this cycle without a draft.
+    // agreed = false (default): observe() starts a pause itself, sums without decay (the previous form, serve's).
+    // agreed = true: the decayed sums above, and pauses only through proposal() / pause() (decisions agreed by the caller).
+    explicit DraftGate(double z = 1.0, std::uint32_t min_cycles = 12, bool agreed = false)
+        : z_(z), min_(min_cycles), agreed_(agreed) {}
+    // Once per cycle, before drafting: false = decode this cycle without a draft (no exchange).
     [[nodiscard]] bool draft();
     void observe(bool drafted, std::uint32_t emitted, double seconds, double plain_estimate);
+    // On the evidence so far: cycles to pause after the current one (0 = keep drafting).
+    [[nodiscard]] std::uint32_t proposal();
+    // Start the agreed pause (0 = none).
+    void pause(std::uint32_t cycles);
     [[nodiscard]] std::uint32_t paused_cycles() const { return paused_; }
 
 private:
     double z_;
     std::uint32_t min_;
+    bool agreed_;
     double n_ = 0, sx_ = 0, sxx_ = 0, t_plain_ = 0;
     std::uint32_t backoff_ = 8, skip_ = 0, paused_ = 0;
 };
