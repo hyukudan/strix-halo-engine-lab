@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdexcept>
+#include <unordered_map>
 #include "strix/serve/engine.hpp"
 #include "strix/serve/json_constraint.hpp"
 
@@ -14,9 +15,12 @@ public:
         std::shared_ptr<Frontier> parent;
     };
     struct State {
+        std::unordered_map<std::uint32_t, std::uint64_t> reply_counts;
         bool reasoning;
         ConstraintCursor cursor;
         bool terminal = false;
+        std::uint32_t reasoning_tokens = 0;
+        std::vector<std::uint32_t> forced_ids{};
         std::shared_ptr<Frontier> frontier = std::make_shared<Frontier>();
     };
     struct Prepared {
@@ -26,6 +30,8 @@ public:
     struct Staged {
         std::uint32_t token;
         State state;
+        bool forced_control = false;
+        TokenScore score;
     };
     ConstraintSelection(std::shared_ptr<const ConstraintSpec>, std::shared_ptr<const TokenByteTrie>,
         std::shared_ptr<const BpeTokenizer>);

@@ -32,7 +32,12 @@ struct ApiConfig {
     bool responses = true;
     bool stream_receipts = true;
     // Resolved engine support: enable only after every constrained selection path executes it.
+    bool engine_logprobs = false, engine_logit_transforms = false;
     bool engine_constraints = false;
+    bool engine_thinking_budget = false;
+    // Anthropic thinking.budget_tokens: false (default) = accepted and stated as not enforced (the request keeps speculative
+    // decoding); true = enforced as thinking-budget-v1 (the request decodes on the serial host route).
+    bool enforce_anthropic_thinking_budget = false;
     // From GenerationEngine::constraint_execution_routes(); the first route handles new requests.
     std::vector<std::string> constraint_execution_routes;
     double sse_keepalive_seconds = 10.0;      // 0: no keepalive comments

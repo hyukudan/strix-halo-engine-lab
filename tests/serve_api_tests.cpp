@@ -5,6 +5,7 @@
 #include "strix/serve/constraint_selection.hpp"
 
 #include <limits>
+#include <cmath>
 #include "strix/serve/deepseek_chat.hpp"
 #include "strix/serve/http_server.hpp"
 
@@ -53,9 +54,12 @@ class ScriptedEngine final : public GenerationEngine {
 public:
     explicit ScriptedEngine(std::shared_ptr<const BpeTokenizer> t) : tokenizer_(std::move(t)), trie_(std::make_shared<TokenByteTrie>(*tokenizer_)) {}
     bool supports_constraints() const override { return true; }
+    bool supports_thinking_budget() const override { return true; }
     std::vector<std::string> constraint_execution_routes() const override { return {"serial-host"}; }
     GenerationStats generate(GenerationJob& job) override {
         { const std::lock_guard lock(mutex_); prompts_.push_back({job.prompt, job.stable_prefix}); sampling_.push_back(job.sampling); }
+        if (job.constraint && !job.constraint->program && !job.constraint->thinking) return scored(job);
+        if (job.constraint && job.constraint->thinking) return thinking_budget(job);
         if (job.constraint) return constrained(job);
         const auto prompt = tokenizer_->decode(job.prompt);
         const bool progress = prompt.find("PROGRESS") != std::string::npos;
@@ -105,6 +109,42 @@ public:
     std::vector<SamplingParameters> sampling() { const std::lock_guard lock(mutex_); return sampling_; }
     std::vector<Captured> prompts() { const std::lock_guard lock(mutex_); return prompts_; }
 private:
+    GenerationStats scored(GenerationJob& job) {
+        auto selection = std::make_shared<ConstraintSelection>(job.constraint, trie_, tokenizer_);
+        ConstraintRowSelection row(selection); GenerationStats stats; stats.prompt_tokens = job.prompt.size();
+        std::vector<float> logits(tokenizer_->vocab_size(), -100); logits['a'] = logits['b'] = 2; logits['c'] = -1;
+        while (stats.generated_tokens < job.max_tokens) {
+            row.prepare(); const auto id = row.select(logits); row.commit(); ++stats.generated_tokens;
+            if (!job.on_tokens(std::span<const std::uint32_t>(&id, 1))) { stats.finish = "cancelled"; break; }
+        }
+        stats.constraint = row.verdict(stats.finish); return stats;
+    }
+    GenerationStats thinking_budget(GenerationJob& job) {
+        auto selection = std::make_shared<ConstraintSelection>(job.constraint, trie_, tokenizer_);
+        ConstraintRowSelection row(selection);
+        GenerationStats stats; stats.prompt_tokens = job.prompt.size();
+        const auto prompt = tokenizer_->decode(job.prompt);
+        const auto answer = tokenizer_->encode("{\"a\":\"ok\"}", false);
+        std::size_t answer_at = 0;
+        while (stats.generated_tokens < job.max_tokens && !selection->state().terminal) {
+            const auto& state = selection->state();
+            std::uint32_t desired = job.constraint->eos_ids.front();
+            if (state.reasoning) {
+                desired = 'w';
+                if (prompt.find("NATURAL") != std::string::npos && state.reasoning_tokens == 2) desired = *job.constraint->end_thinking_id;
+                if (prompt.find("REASON_EOS") != std::string::npos) desired = job.constraint->eos_ids.front();
+            } else if (answer_at < answer.size()) desired = answer[answer_at++];
+            std::vector<float> logits(tokenizer_->vocab_size(), -100.0F); logits[desired] = 100;
+            row.prepare();
+            const auto id = row.select(logits);
+            row.commit();
+            ++stats.generated_tokens;
+            if (!job.on_tokens(std::span<const std::uint32_t>(&id, 1))) { stats.finish = "cancelled"; break; }
+        }
+        if (stats.finish != "cancelled") stats.finish = selection->state().terminal ? "stop" : "length";
+        stats.constraint = row.verdict(stats.finish);
+        return stats;
+    }
     GenerationStats constrained(GenerationJob& job) {
         ConstraintSelection selector(job.constraint, trie_, tokenizer_);
         GenerationStats stats; stats.prompt_tokens = job.prompt.size();
@@ -434,6 +474,91 @@ void test_constraint_selection(const std::shared_ptr<const BpeTokenizer>& tokeni
     check(budget.status == "incomplete" && budget.accepting && budget.reason == "max_output_tokens", "accepting budget boundary is still incomplete");
 }
 
+void test_thinking_frontier(const std::shared_ptr<const BpeTokenizer>& tokenizer) {
+    auto spec = std::make_shared<ConstraintSpec>();
+    spec->logprobs = true; spec->transform.presence = .1;
+    spec->starts_in_reasoning = true;
+    spec->end_thinking_id = tokenizer->find("</think>");
+    spec->eos_ids = {tokenizer->find("<|im_end|>")};
+    ThinkingPolicy policy; policy.max_thinking_tokens = 2; policy.reasoning_limit = 2;
+    policy.closure_ids = tokenizer->encode("</think>\n\n", true); spec->thinking = policy;
+    auto selection = std::make_shared<ConstraintSelection>(spec, std::make_shared<TokenByteTrie>(*tokenizer), tokenizer);
+    ConstraintRowSelection adapter(selection);
+    std::vector<float> logits(tokenizer->vocab_size(), -100); logits['x'] = 1;
+    for (int i = 0; i < 2; ++i) { adapter.prepare(); check(adapter.select(logits) == 'x', "reasoning frontier selected"); adapter.commit(); }
+    auto staged = selection->select(logits, selection->prepare());
+    check(staged.forced_control && staged.token == *spec->end_thinking_id && selection->state().forced_ids.empty(), "forced control is staged before target commit");
+    std::vector<std::uint32_t> consumed;
+    // A serial target consumes each selected pending frontier before the next row.
+    for (const auto expected : policy.closure_ids) {
+        adapter.prepare(); const auto pending = adapter.select(logits);
+        check(pending == expected, "target pending frontier is exact forced ID");
+        consumed.push_back(pending); adapter.commit();
+        check(!spec->scores->tokens.back().logprob && spec->scores->tokens.back().forced_control,
+            "forced control has null model score and explicit origin");
+    }
+    check(selection->state().reply_counts.at('x') == 2 && selection->state().reply_counts.at(*spec->end_thinking_id) == 1, "reasoning and forced controls enter committed counts");
+    check(consumed == policy.closure_ids && !selection->state().reasoning && selection->state().reasoning_tokens == 2,
+        "entire closure commits before answer phase");
+    adapter.prepare(); check(adapter.select(logits) == 'x', "ordinary answer greedy restored after closure"); adapter.commit();
+    check(selection->state().reasoning_tokens == 2, "answer does not increment reasoning count");
+}
+
+void test_scoring_transforms(const std::shared_ptr<const BpeTokenizer>& tokenizer) {
+    const auto trie = std::make_shared<TokenByteTrie>(*tokenizer);
+    auto spec = std::make_shared<ConstraintSpec>(); spec->logprobs = true; spec->top_logprobs = 20;
+    auto selection = std::make_shared<ConstraintSelection>(spec, trie, tokenizer);
+    ConstraintRowSelection adapter(selection);
+    std::vector<float> logits(tokenizer->vocab_size(), -100); logits['a'] = logits['b'] = 2; logits['c'] = -1;
+    double sum = 0; for (auto z : logits) sum += std::exp(static_cast<double>(z) - 2);
+    const double reference = -std::log(sum);
+    adapter.prepare(); check(adapter.select(logits) == 'a', "scores preserve lowest-ID greedy tie");
+    check(spec->scores->tokens.empty(), "scores not published before commit");
+    adapter.prepare(); check(adapter.select(logits) == 'a', "discarded row selects identically"); adapter.commit();
+    check(spec->scores->tokens.size() == 1 && spec->scores->tokens.front().logprob == reference, "first terminal prompt row exact reference log-softmax");
+    const auto& top = spec->scores->tokens.front().top;
+    check(top.size() == 20 && top[0].first == 'a' && top[1].first == 'b' && top[2].first == 'c' && top[3].first == 0, "top logprobs descending with ID ties");
+    auto masked_spec = std::make_shared<ConstraintSpec>(); masked_spec->logprobs = true;
+    masked_spec->program = std::make_shared<ConstraintProgram>(compile_json_object());
+    masked_spec->transform.bias = {{'a', 100}};
+    auto masked = std::make_shared<ConstraintSelection>(masked_spec, trie, tokenizer);
+    const auto prepared = masked->prepare();
+    std::vector<float> masked_row(logits.size(), -100); masked_row['{'] = 2; masked_row['a'] = 100;
+    auto staged = masked->select(masked_row, prepared);
+    double masked_sum = 0;
+    for (std::uint32_t i = 0; i < masked_row.size(); ++i) if (prepared.mask.contains(i)) masked_sum += std::exp(static_cast<double>(masked_row[i]) - 2);
+    check(staged.token == '{' && staged.score.logprob == -std::log(masked_sum), "JSON mask follows bias and defines log-softmax support");
+    masked->commit(staged);
+    const auto run = [&](LogitTransform transform, std::vector<std::uint32_t> prompt, std::vector<float> row) {
+        auto p = std::make_shared<ConstraintSpec>(); p->transform = transform; p->prompt_ids = prompt;
+        auto sel = std::make_shared<ConstraintSelection>(p, trie, tokenizer);
+        ConstraintRowSelection r(sel); r.prepare(); const auto first = r.select(row);
+        check(sel->state().reply_counts.empty(), "counts unchanged by uncommitted selection");
+        r.prepare(); check(r.select(row) == first, "discarded transform selection has no count effect"); r.commit();
+        check(sel->state().reply_counts.at(first) == 1, "only committed token counted");
+        r.prepare(); const auto second = r.select(row); r.commit();
+        r.prepare(); const auto third = r.select(row);
+        return std::vector<std::uint32_t>{first, second, third};
+    };
+    LogitTransform t; t.presence = 1;
+    logits['a'] = 2; logits['b'] = .5F;
+    check(run(t, {}, logits) == std::vector<std::uint32_t>{'a','a','a'}, "presence subtracts once regardless of count");
+    t.presence = 0; t.frequency = 1;
+    check(run(t, {}, logits) == std::vector<std::uint32_t>{'a','a','b'}, "frequency subtracts per committed reply occurrence");
+    t.frequency = 0; t.repetition = 2; logits['b'] = 1.5F;
+    check(run(t, {'a'}, logits).front() == 'b', "repetition divides positive prompt-seen logits");
+    logits.assign(logits.size(), -100); logits['a'] = -1; logits['b'] = -1.5F;
+    check(run(t, {'a'}, logits).front() == 'b', "repetition multiplies negative prompt-seen logits");
+    t.repetition = 1; t.bias = {{'b', 1}};
+    check(run(t, {}, logits).front() == 'b', "bias added after penalties");
+    t.presence = .25; t.frequency = .25; t.repetition = 2; t.bias = {{'a', 1.75}};
+    // Repetition first on the raw logit, then presence/frequency, then bias. After n committed a:
+    // -1 * 2 - .25 - .25 * n + 1.75 = -.5 - .25 n: -0.75, -1.0, -1.25 > b = -1.5 (b is never seen: unchanged).
+    check(run(t, {}, logits) == std::vector<std::uint32_t>{'a','a','a'}, "repetition presence frequency bias composition order");
+    t.bias = {{'a', 1.25}};  // after 2 committed a: -2 - .25 - .5 + 1.25 = -1.5 ties b; the lower id 'a' wins
+    check(run(t, {}, logits) == std::vector<std::uint32_t>{'a','a','a'}, "composition tie resolves to the lowest id");
+}
+
 int main() try {
     {
         GenerationTicket ticket;
@@ -451,7 +576,9 @@ int main() try {
     }
     test_batched_queue();
     const auto tokenizer = tiny_tokenizer();
+    test_scoring_transforms(tokenizer);
     test_constraint_selection(tokenizer);
+    test_thinking_frontier(tokenizer);
     test_constraint_row(tokenizer);
     test_constraint_request_failure();
     test_constraint_late_cancellation();
@@ -467,7 +594,10 @@ int main() try {
     config.sse_progress_seconds = 0.15;
     ApiService api(config, tokenizer, queue, engine.context_tokens(), false);
     auto constrained_config = config;
+    constrained_config.engine_logprobs = constrained_config.engine_logit_transforms = true;
     constrained_config.engine_constraints = engine.supports_constraints();
+    constrained_config.engine_thinking_budget = engine.supports_thinking_budget();
+    constrained_config.enforce_anthropic_thinking_budget = true;  // the operator opted in (default: stated, not enforced)
     constrained_config.constraint_execution_routes = engine.constraint_execution_routes();
     ApiService constrained_api(constrained_config, tokenizer, queue, engine.context_tokens(), true);
     ApiService constrained_greedy_api(constrained_config, tokenizer, queue, engine.context_tokens(), false);
@@ -530,6 +660,190 @@ int main() try {
     };
 
     try {
+    {
+        const auto mode = auth + "X-Test-Config: constraints\r\n";
+        const auto call = [&](const std::string& path, Json body, bool stream) {
+            body.set("stream", Json(stream)); return http(port, "POST", path, body.dump(), mode);
+        };
+        const auto base = parse_json(R"({"messages":[{"role":"user","content":"Hi"}],"enable_thinking":false,"max_tokens":3,"logprobs":true,"top_logprobs":3})");
+        auto reply = call("/v1/chat/completions", base, false);
+        check(reply.status == 200, "chat score request executes");
+        auto result = parse_json(reply.body);
+        const auto scores = at(at(first_choice(result), "logprobs"), "content");
+        check(scores.size() == 3 && at(scores.as_array()[0], "token").as_string() == "a", "chat first-token and every score emitted");
+        double sum = 0; for (std::size_t i = 0; i < tokenizer->vocab_size(); ++i) sum += std::exp((i == 'a' || i == 'b' ? 2.0 : i == 'c' ? -1.0 : -100.0) - 2);
+        check(at(scores.as_array()[0], "logprob").as_double() == -std::log(sum), "wire logprob exactly equals reference");
+        check(at(at(result, "strix"), "scoring").find("basis")->as_string() == "target-row-log-softmax", "score basis receipt");
+        Json streamed = Json::array();
+        for (const auto& e : sse_data(call("/v1/chat/completions", base, true).body)) {
+            const auto* choices = e.find("choices"); if (!choices || !choices->size()) continue;
+            const auto* lp = choices->as_array()[0].find("logprobs"); if (lp && lp->is_object())
+                for (const auto& score : at(*lp, "content").as_array()) streamed.push(score);
+        }
+        check(streamed.dump() == scores.dump(), "chat stream and nonstream scores identical");
+        auto completion = parse_json(R"({"prompt":"Hi","max_tokens":3,"logprobs":3})");
+        auto c = parse_json(call("/v1/completions", completion, false).body);
+        const auto lp = at(first_choice(c), "logprobs");
+        check(at(lp,"tokens").size() == 3 && at(lp,"text_offset").as_array()[2].as_int() == 2, "completions scores and offsets");
+        std::size_t count = 0;
+        for (const auto& e : sse_data(call("/v1/completions", completion, true).body)) {
+            const auto& v = at(first_choice(e), "logprobs"); if (v.is_object()) count += at(v,"tokens").size();
+        }
+        check(count == 3, "completion stream scores exactly once");
+        auto response_body = parse_json(R"({"input":"Hi","reasoning":{"effort":"none"},"max_output_tokens":3,"top_logprobs":3,"include":["message.output_text.logprobs"]})");
+        auto r = parse_json(call("/v1/responses", response_body, false).body);
+        const auto& part = at(at(r,"output").as_array()[0],"content").as_array()[0];
+        check(at(part,"logprobs").dump() == scores.dump(), "Responses output_text scores");
+        Json response_stream = Json::array();
+        for (const auto& e : sse_data(call("/v1/responses", response_body, true).body))
+            if (at(e,"type").as_string() == "response.output_text.delta") for (const auto& score : at(e,"logprobs").as_array()) response_stream.push(score);
+        check(response_stream.dump() == scores.dump(), "Responses delta scores match nonstream");
+        for (const auto n : {-1,21}) { auto b = parse_json(base.dump()); b.set("top_logprobs",Json(n)); check(call("/v1/chat/completions",b,false).status == 400,"top logprobs bounds"); }
+        for (const auto n : {-1,6}) { auto b = parse_json(completion.dump()); b.set("logprobs",Json(n)); check(call("/v1/completions",b,false).status == 400,"completion logprobs bounds"); }
+        for (const auto* field : {"presence_penalty","frequency_penalty","repetition_penalty"}) {
+            for (const auto value : {-3.0, 11.0}) { auto b = parse_json(base.dump()); b.set(field,Json(value)); check(call("/v1/chat/completions",b,false).status == 400,"transform bounds"); }
+        }
+        for (const auto* bad : {R"({"-1":0})",R"({"267":1})",R"({"97":101})",R"({"97":-101})",R"({"a":0})",R"({"1.0":0})",R"({"097":0})"}) {
+            auto b = parse_json(base.dump()); b.set("logit_bias",parse_json(bad)); check(call("/v1/chat/completions",b,false).status == 400,"bias ID and value validation");
+        }
+        auto oversized = parse_json(base.dump()); Json huge_bias = Json::object();
+        for (int i = 0; i < 1025; ++i) huge_bias.set(std::to_string(i),Json(0));
+        oversized.set("logit_bias",huge_bias); check(call("/v1/chat/completions",oversized,false).status == 400,"bias entry cap");
+        auto bad_top = parse_json(base.dump()); bad_top.set("top_logprobs",Json(.5));
+        check(call("/v1/chat/completions",bad_top,false).status == 400,"fractional top logprobs refused");
+        auto score_top = parse_json(base.dump()); score_top.set("logprobs",Json(false));
+        check(at(at(first_choice(parse_json(call("/v1/chat/completions",score_top,false).body)),"logprobs"),"content").size() == 3,"positive top logprobs independently routes");
+        auto bytes = parse_json(base.dump()); bytes.set("max_tokens",Json(1));
+        bytes.set("logit_bias",parse_json(R"({"97":-100,"98":-100,"99":-100,"195":100})"));
+        const auto byte_reply = parse_json(call("/v1/chat/completions",bytes,false).body);
+        const auto& byte_score = at(at(first_choice(byte_reply),"logprobs"),"content").as_array()[0];
+        check(at(byte_score,"bytes").as_array()[0].as_int() == 195 && at(byte_score,"token").as_string() == "\xEF\xBF\xBD", "token bytes preserve split UTF8 with lossy text");
+        auto transformed = parse_json(base.dump()); transformed.set("presence_penalty",Json(1)); transformed.set("frequency_penalty",Json(1));
+        auto tr = parse_json(call("/v1/chat/completions",transformed,false).body);
+        check(at(at(tr,"strix"),"sampling").as_string() == "greedy-logit-transform-v1", "transform identity distinct from exact greedy");
+        check(!at(at(tr,"strix"),"unconstrained_greedy_equal").as_bool(), "transform receipt denies untransformed greedy equality");
+        check(at(at(first_choice(tr),"message"),"content").as_string() == "aba", "reply counts affect committed selection");
+        auto transform_only = parse_json(R"({"messages":[{"role":"user","content":"Hi"}],"enable_thinking":false,"max_tokens":1,"logit_bias":{"98":1}})");
+        check(http(port,"POST","/v1/chat/completions",transform_only.dump(),auth).status == 400,"transform off separately refuses bias");
+        auto zero = parse_json(completion.dump()); zero.set("logprobs",Json(0));
+        check(at(at(first_choice(parse_json(call("/v1/completions",zero,false).body)),"logprobs"),"top_logprobs").as_array()[0].size() == 0,"completion zero requests chosen score with no alternatives");
+        auto sampled = parse_json(base.dump()); sampled.set("temperature",Json(.7));
+        check(call("/v1/chat/completions",sampled,false).status == 400,"sampled score policy refused");
+        check(http(port,"POST","/v1/chat/completions",base.dump(),auth).status == 400,"logprobs off refuses request");
+        check(http(port,"POST","/v1/chat/completions",transformed.dump(),auth).status == 400,"transforms off refuses request");
+        const auto caps = parse_json(http(port,"GET","/v1/capabilities","",mode).body);
+        check(at(caps,"logprobs").as_bool() && at(caps,"penalties").as_bool() && at(caps,"logit_bias").as_bool(),"executing capability switches");
+        auto neutral = parse_json(R"({"messages":[{"role":"user","content":"Hi"}],"enable_thinking":false,"max_tokens":3,"presence_penalty":0,"frequency_penalty":0,"repetition_penalty":1,"logit_bias":{},"logprobs":false})");
+        check(at(at(first_choice(parse_json(call("/v1/chat/completions",neutral,false).body)),"message"),"content").as_string() == "Pla", "neutral policy retains ordinary route");
+    }
+    {
+        const std::string mode = auth + "X-Test-Config: constraints\r\n";
+        const std::string quiet = auth + "X-Test-Config: constraints-quiet\r\n";
+        const auto request = [](const char* prompt, int n, int room, int budget) {
+            auto body = parse_json(R"({"messages":[{"role":"user","content":"FORCE"}],"max_tokens":64,"strix":{"thinking_policy":"thinking-budget-v1"}})");
+            Json messages = Json::array(), message = Json::object();
+            message.set("role", Json("user")); message.set("content", Json(prompt)); messages.push(std::move(message));
+            body.set("messages", std::move(messages));
+            body.set("max_tokens", Json(budget));
+            Json options = *body.find("strix");
+            options.set("max_thinking_tokens", Json(n)); options.set("answer_room_tokens", Json(room));
+            body.set("strix", std::move(options));
+            return body;
+        };
+        const auto run = [&](const Json& body, const std::string& headers = "") {
+            return http(port, "POST", "/v1/chat/completions", body.dump(), headers.empty() ? mode : headers);
+        };
+        for (const auto* name : {"NATURAL", "FORCE"}) {
+            auto body = request(name, 5, 20, 64);
+            auto result = run(body, quiet);
+            check(result.status == 200, "thinking request executes with receipts off");
+            auto out = parse_json(result.body);
+            const auto& t = at(at(out, "strix"), "thinking");
+            const bool forced = std::string(name) == "FORCE";
+            check(at(t, "closure").as_string() == (forced ? "forced" : "natural"), "closure provenance");
+            check(at(t, "reasoning_tokens").as_int() == (forced ? 5 : 2), "committed reasoning count");
+            const auto& message = at(first_choice(out), "message");
+            check(at(message, "content").as_string() == (forced ? "\n\n" : "") + std::string("{\"a\":\"ok\"}"), "answer follows exact closure");
+            if (forced) {
+                const auto& ids = at(t, "forced_ids").as_array();
+                auto closure = tokenizer->encode("</think>\n\n", true);
+                check(ids.size() == closure.size(), "forced suffix length from tokenizer");
+                for (std::size_t i = 0; i < ids.size(); ++i) check(ids[i].as_int() == closure[i], "exact forced closure id");
+            }
+            body.set("stream", Json(true));
+            auto streamed = run(body, quiet);
+            std::string streamed_reasoning;
+            check(stream_text(streamed.body, &streamed_reasoning, nullptr, nullptr, nullptr) == at(message, "content").as_string(), "policy stream answer bytes equal non-stream");
+            check(streamed_reasoning == std::string(forced ? 5U : 2U, 'w'), "policy stream splits committed thinking ID");
+            auto events = sse_data(streamed.body);
+            check(!events.empty() && at(at(events.back(), "strix"), "thinking").find("forced_ids"), "terminal stream thinking metadata with receipts off");
+        }
+        auto bounded = request("FORCE", 50, 20, 26);
+        auto bounded_out = parse_json(run(bounded).body);
+        const auto c = tokenizer->encode("</think>\n\n", true).size();
+        check(at(at(at(bounded_out, "strix"), "thinking"), "reasoning_tokens").as_int() == 26 - 20 - static_cast<int>(c), "answer room bound wins");
+        auto immediate = parse_json(run(request("FORCE", 5, 20, 20 + static_cast<int>(c))).body);
+        check(at(at(at(immediate, "strix"), "thinking"), "reasoning_tokens").as_int() == 0, "zero remaining reasoning allowance closes immediately");
+        auto combined = request("FORCE", 3, 20, 64);
+        combined.set("response_format", parse_json(R"({"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object","properties":{"a":{"const":"ok"}},"required":["a"],"additionalProperties":false}}})"));
+        combined.set("logprobs", Json(true)); combined.set("top_logprobs", Json(3));
+        combined.set("presence_penalty", Json(.25)); combined.set("frequency_penalty", Json(.5));
+        combined.set("repetition_penalty", Json(1.1)); combined.set("logit_bias", parse_json(R"({"97":-1})"));
+        const auto composed = parse_json(run(combined).body);
+        const auto& composed_scores = at(at(first_choice(composed), "logprobs"), "content");
+        bool forced_score = false;
+        for (const auto& value : composed_scores.as_array()) if (value.find("forced_control")) {
+            forced_score = true; check(at(value,"logprob").is_null(), "composed forced record has null logprob");
+        }
+        check(forced_score && at(at(at(composed,"strix"),"scoring"),"constrained").as_bool(), "JSON thinking transform scoring compose");
+        check(at(at(at(composed, "strix"), "constraint"), "status").as_string() == "complete", "JSON starts after forced suffix");
+        const auto answer = at(at(first_choice(composed), "message"), "content").as_string();
+        check(at(parse_json(answer), "a").as_string() == "ok", "composed answer validates");
+        auto eos = parse_json(run(request("REASON_EOS", 5, 20, 64)).body);
+        check(at(at(at(eos, "strix"), "thinking"), "reason").as_string() == "reasoning_eos", "reasoning EOS incomplete");
+        auto responses = request("FORCE", 4, 20, 64);
+        responses.set("input", Json("FORCE")); responses.set("max_output_tokens", Json(64));
+        auto rr = http(port, "POST", "/v1/responses", responses.dump(), mode);
+        check(rr.status == 200 && at(at(parse_json(rr.body), "strix"), "thinking").find("forced_ids"), "Responses executes policy");
+        const auto before = engine.prompts().size();
+        for (auto invalid : {request("FORCE", 0, 20, 64), request("FORCE", 5, 64, 64), request("FORCE", 5, 20, 1)})
+            check(run(invalid).status == 400, "impossible budget rejected");
+        auto omitted_room = request("FORCE", 5, 20, 64);
+        omitted_room.set("strix", parse_json(R"({"thinking_policy":"thinking-budget-v1","max_thinking_tokens":5})"));
+        const auto omitted = run(omitted_room);  // omitted room: the answer gets what remains after N and the closure
+        check(omitted.status == 200, "omitted answer room resolves to the remainder");
+        if (omitted.status == 200) {
+            const auto omitted_json = parse_json(omitted.body);
+            const auto& ot = at(at(omitted_json, "strix"), "thinking");
+            check(at(ot, "answer_room_tokens").as_int() == 64 - 5 - static_cast<std::int64_t>(at(ot, "forced_ids").size()), "remainder answer room");
+        }
+        auto no_room = request("FORCE", 5, 20, 64);
+        no_room.set("strix", parse_json(R"({"thinking_policy":"thinking-budget-v1","max_thinking_tokens":64})"));
+        check(run(no_room).status == 400, "a budget that leaves no answer room is refused");
+        auto disabled = request("FORCE", 5, 20, 64); disabled.set("enable_thinking", Json(false));
+        check(run(disabled).status == 400, "disabled thinking rejected");
+        auto unknown = request("FORCE", 5, 20, 64);
+        auto unknown_options = *unknown.find("strix"); unknown_options.set("thinking_policy", Json("unknown")); unknown.set("strix", std::move(unknown_options));
+        check(run(unknown).status == 400, "unknown policy rejected");
+        check(run(request("FORCE", 5, 20, 64), auth).status == 400, "unsupported engine rejects policy");
+        check(engine.prompts().size() == before + 1U, "invalid policies refused before submission (only the valid omitted-room request ran)");
+        auto anthropic = parse_json(R"({"messages":[{"role":"user","content":"FORCE"}],"max_tokens":1200,"thinking":{"type":"enabled","budget_tokens":4}})");
+        const auto ar = http(port, "POST", "/v1/messages", anthropic.dump(), quiet);
+        check(ar.status == 200, "Anthropic budget mapped");
+        check(!ApiConfig{}.enforce_anthropic_thinking_budget, "Anthropic budget enforcement is an operator opt-in");
+        const auto anthropic_out = parse_json(ar.body);
+        const auto& t = at(at(anthropic_out, "strix"), "thinking");
+        check(at(t, "answer_room_tokens").as_int() == 1200 - 4 - static_cast<std::int64_t>(at(t, "forced_ids").size()), "default answer room is the remainder");
+        check(at(t, "reasoning_tokens").as_int() == 4 && at(t, "closure").as_string() == "forced", "Anthropic budget enforced");
+        anthropic.set("stream", Json(true));
+        const auto as = http(port, "POST", "/v1/messages", anthropic.dump(), quiet);
+        check(as.body.find("forced_ids") != std::string::npos && as.body.find("not enforced") == std::string::npos, "Anthropic stream final policy");
+        for (const auto& headers : {auth, mode}) {
+            const auto caps = parse_json(http(port, "GET", "/v1/capabilities", "", headers).body);
+            check(at(caps, "thinking_budget").as_bool() == (headers == mode), "thinking capability matches execution");
+            check(headers == mode ? at(caps, "thinking_budget_policy").as_string() == "thinking-budget-v1" : at(caps, "thinking_budget_policy").is_null(), "capability policy name gated");
+        }
+    }
     {
         const std::string mode = auth + "X-Test-Config: constraints\r\n";
         const std::string quiet = auth + "X-Test-Config: constraints-quiet\r\n";

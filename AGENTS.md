@@ -38,7 +38,8 @@ HTTP servers (Qwen, DeepSeek) describe what they execute at `GET /v1/capabilitie
 states the applied policy (requested vs effective sampling). Generation fields the server does not execute are refused
 with a 400 naming the field ([list](docs/engine/serving/serving.md#chat-requests)). Qwen executes JSON-constrained
 answers (`response_format` / `text.format`, [constrained output](docs/engine/serving/serving.md#constrained-json-output)):
-exact to the constrained target, not to unconstrained greedy.
+exact to the constrained target, not to unconstrained greedy. Thinking budgets and logit transforms are declared
+token-changing request policies; logprobs and SSE progress never change tokens.
 Fast FP16 Qwen prefill is its own identity, not dense-A8 serial bit equality. GLM defaults to R1b decode
 with R1 prompt prefill and exact MTP self-speculation (`--mtp 0` = plain decode, same tokens); `--identity r1`
 restores R1. Exactness references must match that identity.

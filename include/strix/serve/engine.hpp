@@ -20,11 +20,38 @@
 namespace strix::serve {
 
 class ConstraintProgram;
+struct ThinkingPolicy {
+    std::uint32_t max_thinking_tokens = 0, answer_room_tokens = 0, reasoning_limit = 0;
+    std::vector<std::uint32_t> closure_ids;
+};
+struct LogitTransform {
+    double presence = 0, frequency = 0, repetition = 1;
+    std::vector<std::pair<std::uint32_t, double>> bias;
+    bool active() const { return presence != 0 || frequency != 0 || repetition != 1 || !bias.empty(); }
+};
+struct TokenScore {
+    std::uint32_t id = 0;
+    std::optional<double> logprob;
+    std::vector<std::pair<std::uint32_t, double>> top;
+    bool forced_control = false;
+};
+// Serial host commits publish scores before token IDs; HTTP readers copy under this lock.
+struct SelectionScores {
+    mutable std::mutex mutex;
+    std::vector<TokenScore> tokens;
+};
 struct ConstraintSpec {
+    LogitTransform transform;
+    bool logprobs = false;
+    std::uint32_t top_logprobs = 0;
+    std::vector<std::uint32_t> prompt_ids;
+    std::shared_ptr<SelectionScores> scores = std::make_shared<SelectionScores>();
+    // Null for a thinking-only policy: ordinary greedy selection in the answer.
     std::shared_ptr<const ConstraintProgram> program;
     std::vector<std::uint32_t> eos_ids;
     std::optional<std::uint32_t> end_thinking_id;
     bool starts_in_reasoning = false;
+    std::optional<ThinkingPolicy> thinking;
     std::string identity; // "json-object" or "strix-json-schema-v1"
 };
 
@@ -35,6 +62,9 @@ struct ConstraintVerdict {
     std::string phase = "answer";
     std::string reason;
     std::string execution;
+    std::string closure = "natural";
+    std::uint32_t reasoning_tokens = 0;
+    std::vector<std::uint32_t> forced_ids{};
 };
 
 // Armed instrumentation: one process-wide word, unarmed until a GET /metrics or GET /api/status?detail=1 arms it
@@ -81,7 +111,7 @@ struct GenerationProgress {
 // step with the newly verified tokens (stop tokens included); returning false stops generation.
 struct GenerationJob {
     std::function<void(GenerationProgress)> on_progress; // optional, host-only completed prefill units
-    std::shared_ptr<const ConstraintSpec> constraint; // null: existing unconstrained route
+    std::shared_ptr<const ConstraintSpec> constraint; // null: existing route; otherwise JSON and/or thinking selection
     std::vector<std::uint32_t> prompt;
     // chat requests: the prompt's first tokens that render the system prompt and the tools (a prefix every turn of the
     // conversation, and often other conversations, repeat: a prefix cache may snapshot there); 0: none known
@@ -152,6 +182,7 @@ public:
     // The sampling modes this engine executes; others are rejected or downgraded by the API.
     [[nodiscard]] virtual bool supports_sampling() const { return false; }
     [[nodiscard]] virtual bool supports_constraints() const { return false; }
+    [[nodiscard]] virtual bool supports_thinking_budget() const { return false; }
     [[nodiscard]] virtual std::vector<std::string> constraint_execution_routes() const { return {}; }
 };
 

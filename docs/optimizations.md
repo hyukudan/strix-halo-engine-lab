@@ -547,6 +547,56 @@ serial host route for the constrained request only.
   IDs and draft counters (GPU gate).
 - **Off switch:** `--http-constraints off`
 
+<a id="qwen-serve-progress"></a>
+
+### SSE prefill progress
+
+**Engine:** `qwen` (switch also on `strix-deepseek41-serve`). **Control:** `--http-sse-progress-interval`. **Default:** 1 second.
+
+Streamed requests receive `: progress {"phase","prefilled_tokens","cached_tokens","total_tokens"}` SSE comments while
+they prefill, from a host snapshot the engine updates after each completed prefill unit (no added device synchronization).
+
+- **Preconditions:** a streamed request on an engine that reports progress (Qwen).
+- **Automatic selection:** On; a request opts out with `"strix":{"progress":false}`.
+- **Fallback notice:** Engines without reports send no progress comments (keepalive comments still apply).
+- **Exactness evidence:** Comments are outside the data events: full token IDs and data events are identical with
+  progress on and off (GPU gate).
+- **Off switch:** `--http-sse-progress-interval 0`
+
+<a id="qwen-serve-thinking-budget"></a>
+
+### Thinking budget policy
+
+**Engine:** `qwen`. **Control:** `--http-thinking-budget`, `--http-anthropic-thinking-budget`. **Default:** available
+(requests opt in); Messages `budget_tokens` noted, not enforced.
+
+`thinking-budget-v1` closes reasoning no later than the request's budget by feeding the end-of-thinking token and the
+template separator through target execution, then lets the answer run (greedy or JSON-constrained).
+
+- **Preconditions:** `--http-serve`; a request with `strix.thinking_policy` (or Messages `budget_tokens` with
+  `--http-anthropic-thinking-budget enforce`), thinking on, greedy, no stop strings, no tools.
+- **Automatic selection:** Only requests that ask for it; they decode on the serial host route, other slots unchanged.
+- **Fallback notice:** Impossible budgets and unsupported combinations are refused with 400.
+- **Exactness evidence:** Changes tokens by design (declared policy, reported as `closure: natural|forced`). A budget that
+  is never reached yields the same token IDs as ordinary speculative greedy decoding (GPU gate).
+- **Off switch:** `--http-thinking-budget off`; Messages budgets are enforced only with `--http-anthropic-thinking-budget enforce`
+
+<a id="qwen-serve-logprobs"></a>
+
+### Logprobs and logit transforms
+
+**Engine:** `qwen`. **Control:** `--http-logprobs`, `--http-logit-transforms`. **Default:** available (requests opt in).
+
+`logprobs` / `top_logprobs` report the log-softmax of the exact row each token was selected from. `logit-transform-v1`
+applies repetition (on raw logits), presence and frequency penalties and `logit_bias` before greedy selection.
+
+- **Preconditions:** `--http-serve`; greedy requests (sampling with these is refused for now).
+- **Automatic selection:** Only requests that ask for them (non-neutral values); they decode on the serial host route.
+- **Fallback notice:** Neutral values (zero penalties, empty bias, `logprobs` false) keep the ordinary route.
+- **Exactness evidence:** Logprobs never change the selected tokens: IDs equal ordinary speculative greedy decoding
+  (GPU gate). Transforms change tokens by design and are labelled `greedy-logit-transform-v1`.
+- **Off switch:** `--http-logprobs off`, `--http-logit-transforms off`
+
 ## DeepSeek two-node
 
 ```sh

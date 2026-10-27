@@ -878,6 +878,7 @@ public:
     }
     MtpBatchRunner(const MtpBatchRunner&) = delete;
     MtpBatchRunner& operator=(const MtpBatchRunner&) = delete;
+    [[nodiscard]] bool supports_thinking_budget() const noexcept {return options_.http_thinking_budget;}
     [[nodiscard]] bool supports_constraints() const noexcept {return options_.http_constraints;}
     [[nodiscard]] std::vector<std::string> constraint_execution_routes() const {return supports_constraints()?std::vector<std::string>{"serial-host"}:std::vector<std::string>{};}
     std::function<std::unique_ptr<Slot>()> grow_factory;
