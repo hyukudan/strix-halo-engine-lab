@@ -20,12 +20,13 @@ inline std::atomic<std::uint32_t>& run_rows() {
 }
 inline void set_run_rows(std::uint32_t rows) { run_rows().store(rows, std::memory_order_relaxed); }
 
-// STRIX_DS41_PREFILL_TILES: on unless =0 (production default), for runs of at least
-// STRIX_DS41_PREFILL_TILES_MIN_ROWS rows (default 2048): below that the unsplit tiles leave too few CTAs per expert
-// (measured: 1K TTFT 2.251 s with the tiles vs 2.194 s without; faster from 2K up). Same bits either way.
+// STRIX_DS41_PREFILL_TILES=1 (opt-in; off by default): the unsplit prefill tiles, for runs of at least
+// STRIX_DS41_PREFILL_TILES_MIN_ROWS rows (default 2048; below that they leave too few CTAs per expert). Measured on the
+// current kernels, tiles on vs off: fresh-process TTFT 2K +1.0 %, 8K +3.4 %, 32K +1.9 % (order-balanced pair); same-process
+// A/B 4K +0.89 %, 8K +0.66 %, 16K +0.82 %: slower or equal, so the split-K kernels are the default. Same bits either way.
 inline bool tiles() {  // read on every call: tests switch it within one process
     const char* value = std::getenv("STRIX_DS41_PREFILL_TILES");
-    const bool on = !value || std::strcmp(value, "0") != 0;
+    const bool on = value && std::strcmp(value, "1") == 0;
     const char* min = std::getenv("STRIX_DS41_PREFILL_TILES_MIN_ROWS");
     const std::uint32_t min_rows = min && *min ? static_cast<std::uint32_t>(std::strtoul(min, nullptr, 10)) : 2048U;
     const auto rows = run_rows().load(std::memory_order_relaxed);

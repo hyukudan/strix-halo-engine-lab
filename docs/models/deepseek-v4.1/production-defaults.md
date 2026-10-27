@@ -35,7 +35,7 @@ full-workload gate; confirmed in a combined measurement.
 | `STRIX_DIST_CRC_PARALLEL`, `STRIX_DIST_HOST_CRC_OVERLAP` | on | hp: R6 -1.37 %, N8 -1.77 %, TTFT 2K/8K/32K -1.15/-1.24/-0.89 % |
 | `STRIX_DIST_HOST_CHUNK_BYTES` | 1048576 (`=0`: one piece) | part of hp |
 | `STRIX_DS41_ENGRAM_PAYLOAD_CACHE` | on (`_MIB` caps the budget) | TTFT -0.66/-1.17/-1.63 %, decode equal |
-| `STRIX_DS41_PREFILL_TILES` | on for prefill runs of >= `STRIX_DS41_PREFILL_TILES_MIN_ROWS` rows (default 2048) | TTFT 2K/8K/32K -0.37/-1.26/-1.13 %; at 1K the unsplit tiles were slower (2.251 vs 2.194 s without; few rows per expert leave the unsplit kernels with too few CTAs), so below 2048 rows the split-K kernels stay |
+| `STRIX_DS41_PREFILL_TILES` | off (`=1`: unsplit tiles for prefill runs of >= `STRIX_DS41_PREFILL_TILES_MIN_ROWS` rows, default 2048) | re-measured on the current kernels, tiles on vs off: fresh-process TTFT 2K/8K/32K +1.0/+3.4/+1.9 %, same-process A/B 4K/8K/16K +0.89/+0.66/+0.82 % (slower); the earlier -0.37/-1.26/-1.13 % predates the current split-K kernels. Same logits either way |
 | `STRIX_DIST_STAGED_READY_BYTES` | 262144 (`=0`: no readiness views) | needed by the two below |
 | `STRIX_DS41_READY_LEAN`, `STRIX_DS41_MOE_READY` | on | Lean ready releases, MoE half sum through ready views |
 | `STRIX_DS41_OB_READY_EPILOGUE`, `STRIX_DS41_READY_READS_ONLY` | follow `READY_LEAN` | without the lean form they are the slower previous epilogue |
