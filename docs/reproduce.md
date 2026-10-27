@@ -541,7 +541,8 @@ executes the model. Its README has the commands, the receipt format and the limi
 
 A first pilot (single needle, one seed, 19 cases at 8K, 32K, 128K, 262,112 and 262,143 tokens, the last
 one answering with a single token) returned the exact value in every case, and a repeated case produced
-identical token IDs. One seed and one task family are a pilot, not a qualification: long context stays
+identical token IDs. A second pilot of the reasoning and multi-key families at 8K and 32K (with short
+controls) is in the kit README. One or two seeds are a pilot, not a qualification: long context stays
 labelled unqualified until the full matrix, the reasoning families and continuation scoring pass.
 
 ## Known limitations

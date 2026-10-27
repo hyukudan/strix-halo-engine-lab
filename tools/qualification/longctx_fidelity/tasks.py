@@ -67,6 +67,20 @@ def aggregate(events, group, operation):
     raise ValueError("invalid aggregation")
 
 
+def reasoning_protocol(family, variant="normal"):
+    return variant != "symbol" and family.startswith(("vartrack", "multihop", "aggregate"))
+
+
+def default_generate(family, variant="normal"):
+    # Measured on hardware: the model reasons step by step even in non-thinking mode;
+    # 64-event vartrack and 8-key multikey need more than 1024/512 tokens, also short.
+    if reasoning_protocol(family, variant):
+        return 8192 if family == "vartrack256" else 4096 if family.startswith("vartrack") else 1024
+    if variant != "symbol" and family.startswith("multikey"):
+        return 8192 if family == "multikey32" else 2048
+    return 32
+
+
 def generate(family, depth, position, seed, variant="normal"):
     if family.split("_")[0] not in ("niah",) and family not in (
             *FAMILIES, "multikey32", "vartrack256", "multihop2", "multihop8", "aggregate128"):
@@ -105,7 +119,7 @@ def generate(family, depth, position, seed, variant="normal"):
         pairs = [[k, oracle[k]] for k in keys]
         answer = pairs
         rule = "For an exact catalog key, use the greatest numeric version, regardless of text order."
-        question = "Return ordered JSON pairs [key,value] for: " + ", ".join(keys)
+        question = "Return ordered JSON [[key,value],...] pairs for: " + ", ".join(keys)
         if variant == "symbol":
             chosen = rng.choice(keys)
             question, answer = "Value for exact catalog key " + chosen + "?", oracle[chosen]
@@ -152,7 +166,10 @@ def generate(family, depth, position, seed, variant="normal"):
         facts = ["\n".join(f"event group={g} flag={f} amount={v}." for g, f, v in events[i::8])
                  for i in range(8)]
         rule = "Each event counts once. Filter exact group and flag=keep. Empty sum/count/min is 0."
-        question = f"Integer {operation} of amount for group={group} with flag=keep?"
+        # Unambiguous wording: "Integer count of amount" was read as a sum on hardware.
+        question = {"sum": f"What is the sum of the amount values of the events with group={group} and flag=keep?",
+                    "count": f"How many events have group={group} and flag=keep? Count the events, not their amounts.",
+                    "min": f"What is the smallest amount value among the events with group={group} and flag=keep?"}[operation]
         data = {"events": events, "group": group, "operation": operation}
     else:
         raise ValueError("unknown family")
@@ -173,6 +190,8 @@ def generate(family, depth, position, seed, variant="normal"):
             answer = SYMBOLS[alternatives.index(str(base_answer))]
             question += " Use codebook " + "; ".join(f"{v}={s}" for v, s in zip(alternatives, SYMBOLS)) + "."
         question += " Return only one symbol."
+    elif reasoning_protocol(family, variant):
+        question += " You may reason briefly. End your reply with one final line: Answer: <value>"
     elif not isinstance(answer, list):
         question += " Return only the value."
     # Spread blocks across distinct bands, with the requested anchor included.

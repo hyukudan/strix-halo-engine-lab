@@ -1,0 +1,1 @@
+To determine the final value in register `r0`, we must execute the instructions in increasing order of their sequence number (`seq`). The initial values are pro
