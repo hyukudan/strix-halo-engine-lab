@@ -37,6 +37,19 @@ static std::string get(const fs::path& p) {
 }
 
 int main() {
+    CHECK(rs::eviction_error("scored", false) != nullptr);
+    CHECK(std::string(rs::eviction_error("scored", false)).find("no ts_dg_set_policy") != std::string::npos);
+    CHECK(rs::eviction_error("lru", false) == nullptr);
+    CHECK(rs::eviction_error("scored", true) == nullptr);
+    CHECK(rs::eviction_error("auto", true, true) == nullptr);
+    CHECK(rs::eviction_error("auto", true, false) != nullptr);
+    CHECK(rs::eviction_error("auto", false, true) != nullptr);
+    CHECK(std::string(rs::eviction_error("auto", true, false)).find("no ts_dg_end_rows") != std::string::npos);
+    CHECK(rs::eviction_error("bogus", true) != nullptr);
+    CHECK(!rejects({"--evict", "auto", "--no-census"}));
+    CHECK(!rejects({"--evict", "scored", "--no-census"}));
+    CHECK(!rejects({"--evict", "lru", "--census"}));
+    CHECK(rejects({"--evict"}));
     // option split
     CHECK(!rejects({"--phases", "exact0,chats0", "--chats", "0,1", "--json", "C:\\a b\\x.jsonl", "--chat-logits"}));
     CHECK(!rejects({"--controller-prior-alt", "--controller-learn", "--window", "fixed:3", "--env", "STRIX_DS41_CUDA_ENGRAM_CHECK=0"}));

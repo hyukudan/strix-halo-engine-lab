@@ -38,6 +38,7 @@ struct CudaDrafterOptions {
 };
 
 struct CudaDraftTimes {
+    std::uint64_t head_weight_bytes = 0;  // calculated active vocabulary weight payload (not physical transactions)
     float device_ms = 0.0F;  // first launch to the last op of the draft step (events)
     double wall_ms = 0.0;    // draft() including the token download
 };

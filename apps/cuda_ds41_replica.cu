@@ -71,6 +71,8 @@
 //                               schats0b0 for the record), the other phases as --window says
 // The trace covers probe, fixed-window and compared (spec) phases only, never a timed controller arm; the survival table
 // is saved after the phase's last window is credited (outside every timed cycle).
+#include "strix/ds41_replica_census.hpp"
+#include "strix/model_content_hash.hpp"
 #include "strix/cuda_ds41_dspark.hpp"
 #include "strix/cuda_ds41_attention.hpp"
 #include "strix/cuda_ds41_core.hpp"
@@ -93,6 +95,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -122,7 +125,7 @@ using namespace strix::ds41::cuda;
     state_file, ref_file, phases_arg, chats_arg, seqs_file, json_out, timeline_out, steps, chat_prompt, chat_steps, verify_n, warm, \
         chat_logits, pressure_free, pressure_recent, pf_layer, pf_token, window_arg, controller_scope, controller_prior, \
         controller_save, controller_prior_alt, controller_costs, controller_explore, controller_learn, probe_phase, draft_vocab, \
-        draft_trace, winpf_knobs, wb_alt, reset_cache, req_env, qual, wb_defer, flush_ready, controller_costs_given
+        draft_trace, winpf_knobs, wb_alt, reset_cache, req_env, qual, wb_defer, flush_ready, controller_costs_given, evict, census
 
 namespace {
 
@@ -174,6 +177,24 @@ std::string hex(std::uint64_t v) {
     std::snprintf(b, sizeof b, "%016llx", static_cast<unsigned long long>(v));
     return b;
 }
+std::uint64_t census_hash(const void* bytes, std::size_t n, std::uint64_t h = 14695981039346656037ULL) {
+    const auto* p = static_cast<const unsigned char*>(bytes);
+    for (std::size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 1099511628211ULL;
+    return h;
+}
+std::string census_file_hash(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot fingerprint census input");
+    std::vector<std::byte> buf(1U << 20);
+    strix::Sha256Fast hash;
+    while (in) {
+        in.read(reinterpret_cast<char*>(buf.data()), buf.size());
+        hash.update(std::span<const std::byte>(buf.data(), static_cast<std::size_t>(in.gcount())));
+    }
+    if (!in.eof()) throw std::runtime_error("failed to fingerprint census input");
+    return strix::model_content_identity_hex(hash.finalize());
+}
+
 double pct(std::vector<double> v, double q) {
     if (v.empty()) return 0.0;
     std::sort(v.begin(), v.end());
@@ -334,6 +355,11 @@ int main(int argc, char** argv) {
     // schats<K>[b<B>][f<N>]w); --winpf-prior FILE (tierstream/hint-prior-v1), knobs below; --wb-defer = dg_wb_defer
     std::string winpf_prior_file;
     TierWinpf winpf_knobs;
+    // auto (scored victims after verify windows) measured: DSpark -14 % misses/token, +6.4 % tok/s (7 chats), plain
+    // unchanged; a tierstream without the auto policy keeps lru (notice below)
+    std::string evict = TierSite::can_auto_evict() ? "auto" : "lru";
+    if (!TierSite::can_auto_evict()) std::fprintf(stderr, "eviction: auto needs a tierstream with ts_dg_end_rows; using lru\n");
+    bool census = false;  // --census: per-cycle census in the summaries (~15x the JSON of a request, measured)
     bool wb_defer = true;  // adopted default: deferred write-backs; --no-wb-defer = boundary write-backs
     std::string draft_file, draft_vocab = "auto", window_arg = "controller", controller_scope = "chat";
     std::string draft_keep_from;  // --draft-keep-from FILE: route_stats lines of an earlier run (summed)
@@ -381,6 +407,7 @@ int main(int argc, char** argv) {
         controller_prior = controller_costs = "none";
         controller_costs_given = false;
         wb_defer = false;
+        evict = "lru";
         controller_scope = "run";
         host_spares = 96;
         pressure_spares = 4;
@@ -500,6 +527,12 @@ int main(int argc, char** argv) {
         else if (a == "--winpf-prior-cap") winpf_knobs.prior_cap = u32();
         else if (a == "--winpf-prior-pmin") winpf_knobs.prior_pmin = std::stof(next());
         else if (a == "--winpf-revert") winpf_knobs.revert_unused = u32() != 0U;
+        else if (a == "--evict") {
+            evict = next();
+            if (const auto* error = rs::eviction_error(evict, TierSite::can_set_policy(), TierSite::can_auto_evict())) usage(error);
+        }
+        else if (a == "--no-census") census = false;
+        else if (a == "--census") census = true;
         else if (a == "--wb-defer") wb_defer = true;
         else if (a == "--no-wb-defer") wb_defer = false;  // persist: a request turns it off again
         else if (a == "--wb-alt") wb_alt = u32();           // write-back probe: spare target --spares / 0 every N tokens
@@ -647,7 +680,7 @@ int main(int argc, char** argv) {
             windows = windows || ph.rfind("wforce", 0) == 0 || ph.rfind("spec", 0) == 0 || ph.rfind("schats", 0) == 0 || ph.rfind("wsmoke", 0) == 0;
         max_rows = windows ? 6U : 1U;
     }
-    if (print_config) {
+    const auto effective_config = [&]() {
         // Resolve the same feature expansion as below, without calling any CUDA entry point.
         std::ostringstream j;
         j << std::boolalpha << "{";
@@ -694,6 +727,7 @@ int main(int argc, char** argv) {
         field("prefetch_layer", pf_layer); field("prefetch_token", pf_token);
         field("host_margin_gib", host_margin_gib); field("max_pinned_gib", max_pinned_gib);
         str("engram", o.engram); field("engram_cache_mb", o.engram_cache_mb);
+        str("evict", evict); field("census", census);
         field("wb_defer", wb_defer); field("wb_alt", wb_alt); field("flush_ready", flush_ready);
         str("warmup_graphs", warmup_graphs.empty() ? "none" : warmup_graphs);
         str("residency_seed", residency_seed.empty() ? "none" : (residency_auto ? "auto:" : "") + residency_seed);
@@ -720,7 +754,10 @@ int main(int argc, char** argv) {
         field("winpf_revert", winpf_knobs.revert_unused);
         field("serve", !serve_dir.empty()); field("serve_idle", serve_idle_s); field("serve_max", serve_max);
         j << "}";
-        std::puts(j.str().c_str());
+        return j.str();
+    };
+    if (print_config) {
+        std::puts(effective_config().c_str());
         return 0;
     }
     const bool launch_wb_defer = wb_defer, launch_flush_ready = flush_ready;  // a worker without ts_dg_set_sched keeps them
@@ -903,7 +940,9 @@ int main(int argc, char** argv) {
         if ((!json_out.empty() && !js) || (!timeline_out.empty() && !tl)) usage("cannot open --json / --timeline for writing");
     };
     open_outputs();
-    const auto emit = [&](const std::string& line) {
+    std::function<std::string(const std::string&)> census_summary;
+    const auto emit = [&](const std::string& input) {
+        const std::string line = census_summary ? census_summary(input) : input;
         flush_deferred();
         std::printf("%s\n", line.c_str());
         std::fflush(stdout);
@@ -1100,6 +1139,92 @@ int main(int argc, char** argv) {
                << ",\"dense_s\":" << dense_s << ",\"load_s\":" << load_s << "}";
             emit(os.str());
         }
+        std::uint64_t census_nonrouted = 0, census_embedding_row = 0, census_head = 0, census_draft_nonrouted = 0, census_draft_expert = 0;
+        if (census || serving) {
+            const auto manifest = strix::build_model_manifest(strix::gguf::read_file(model));
+            for (const auto& t : manifest.tensors) {
+                if (t.layer && *t.layer >= L) continue;
+                if (t.role == strix::TensorRole::embedding) {
+                    if (t.dimensions.size() > 1) census_embedding_row += t.byte_size / t.dimensions.back();
+                } else if (t.role == strix::TensorRole::output_head) census_head += t.byte_size;
+                else if (t.role != strix::TensorRole::moe_expert && t.role != strix::TensorRole::ngram_table && t.role != strix::TensorRole::mtp)
+                    census_nonrouted += t.byte_size;
+            }
+            if (!draft_file.empty()) {
+                const auto dm = strix::build_model_manifest(strix::gguf::read_file(draft_file));
+                for (const auto& t : dm.tensors) {
+                    if (t.name.find("_exps.weight") != std::string::npos) census_draft_expert += t.byte_size / 128;
+                    else if (t.name != "token_embd.weight" && t.name != "output.weight") census_draft_nonrouted += t.byte_size;
+                }
+            }
+        }
+        // the released drafter (pinned name and byte count): its pinned SHA-256, no 8 GB read per load; others are hashed
+        bool census_draft_pinned = false;
+        const std::string census_draft_hash = [&]() -> std::string {
+            if (!(census || serving) || draft_file.empty()) return {};
+            const auto& pin = strix::deepseek41::pinned_file(strix::deepseek41::PinnedFileKind::draft_mxfp4);
+            std::error_code ec;
+            const std::filesystem::path dp(draft_file);
+            if (dp.filename().string() == pin.file_name && std::filesystem::file_size(dp, ec) == pin.bytes && !ec) {
+                census_draft_pinned = true;
+                return std::string(pin.sha256_hex);
+            }
+            return census_file_hash(draft_file);
+        }();
+        const std::string census_binary_hash = (census || serving) ? census_file_hash(argv[0]) : std::string();
+        std::uint64_t census_request = 0;
+        std::size_t census_used = 0;
+        std::vector<ReplicaCensus> census_records;
+        std::vector<std::string> census_phases;
+        std::string census_phase;
+        std::chrono::steady_clock::time_point census_last_t0{};
+        const auto census_capture = [&](std::uint32_t pos, std::uint32_t R, const auto& layers, const TierTokenStats& st,
+                                        double device_ms, double boundary_ms, double engram_wait_ms) {
+            if (!census || !census_request) return std::size_t(-1);
+            if (census_used == census_records.size()) throw std::runtime_error("census preallocated capacity exceeded");
+            const auto id = census_used++;
+            auto& c = census_records[id];
+            c = ReplicaCensus{};
+            c.request_id = census_request; c.cycle_id = id; c.pos = pos; c.R = R;
+            c.cycle_ms = -1;
+            c.traffic = st; c.target_device_ms = device_ms; c.boundary_ms = boundary_ms; c.engram_wait_ms = engram_wait_ms;
+            c.expert_bytes = shape.expert_bytes();
+            c.target_nonrouted_bytes = census_nonrouted + census_embedding_row * R + (L == 40 ? census_head : 0);
+            census_cache_payload(c, strix::ds41::attn::released_plan(), L);
+            std::copy_n(layers.begin(), std::min<std::size_t>(40, layers.size()), c.layers.begin());
+            census_phases[id] = census_phase;
+            return id;
+        };
+        census_summary = [&](const std::string& line) {
+            if (!census || (line.find("\"event\":\"summary\"") == std::string::npos &&
+                            line.find("\"event\":\"spec_summary\"") == std::string::npos &&
+                            line.find("\"event\":\"gate\"") == std::string::npos)) return line;
+            const auto at = line.find("\"phase\":\"");
+            if (at == std::string::npos) return line;
+            const auto begin = at + 9, end = line.find('"', begin);
+            const auto phase = line.substr(begin, end - begin);
+            const bool gate = line.find("\"event\":\"gate\"") != std::string::npos;
+            if (census_used && census_records[census_used - 1].cycle_ms < 0 && census_last_t0 != std::chrono::steady_clock::time_point{})
+                census_records[census_used - 1].cycle_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - census_last_t0).count();
+            ReplicaCensusTotals totals;
+            std::ostringstream out;
+            out << line.substr(0, line.size() - 1) << ",\"census_cycles\":[";
+            bool first = true;
+            for (std::size_t i = 0; i < census_used; ++i) if (census_phases[i] == phase || (gate && census_phases[i] == census_phase)) {
+                totals.add(census_records[i]);
+                if (!first) out << ',';
+                first = false;
+                census_records[i].write(out, census_phases[i]);
+            }
+            out << "],\"census\":";
+            totals.write(out);
+            out << '}';
+            return out.str();
+        };
+        struct CensusSummaryLifetime {
+            std::function<std::string(const std::string&)>& fn;
+            ~CensusSummaryLifetime() { fn = {}; }
+        } census_summary_lifetime{census_summary};
         std::uint32_t spare_now = spares;  // the spare target the library applies at the next boundary (recorded per step)
         // pressure phases: the spare target and the library's pressure knob (tierstream keeps its timeline always)
         const auto set_pressure = [&](std::uint32_t spare_target, std::uint32_t free, std::uint32_t recent) {
@@ -1160,6 +1285,8 @@ int main(int argc, char** argv) {
             const auto t0 = std::chrono::steady_clock::now();
             // full loop: step start to the next step start (everything the host does per token, checks included)
             const double cycle = have_last ? std::chrono::duration<double, std::milli>(t0 - last_t0).count() : -1.0;
+            if (census && census_used && census_phases[census_used - 1] == phase) census_records[census_used - 1].cycle_ms = cycle;
+            census_last_t0 = t0;
             last_t0 = t0;
             have_last = true;
             tier->begin_token();
@@ -1167,11 +1294,22 @@ int main(int argc, char** argv) {
             engram_gate(s);
             if (!stream_out.empty()) last_stream_fnv = row_fnv(0);
             const auto t1 = std::chrono::steady_clock::now();
-            tier->end_token();  // ts_end only (service + boundary); throws when the library refused the token
+            tier->end_token(static_cast<std::uint32_t>(fed.size()));  // completed rows; service + boundary
             const auto t2 = std::chrono::steady_clock::now();
             // the token's stats and timeline, outside the timed boundary
             const std::vector<TierLayer> layers = tier->collect();
             const TierTokenStats st = tier->stats();
+            census_phase = phase;
+            const auto census_id = census_capture(pos, static_cast<std::uint32_t>(fed.size()), layers, st, s.device_ms,
+                std::chrono::duration<double, std::milli>(t2 - t1).count(), s.engram_wait_seconds * 1e3);
+            if (census) {
+                auto& c = census_records[census_id];
+                c.engram_wait_first_ms = s.engram_wait_first_seconds * 1e3;
+                c.engram_ms = s.engram_seconds * 1e3; c.engram_issue_ms = s.engram_issue_seconds * 1e3;
+                c.committed = static_cast<std::uint32_t>(fed.size());
+                c.counted = count && fed.size() == 1U;
+                if (census_id && census_phases[census_id - 1] == phase) census_records[census_id - 1].cycle_ms = cycle;
+            }
             ph_bank += st.ring;
             ph_res += st.resurrected;
             ph_mid += st.collected_mid;
@@ -1191,6 +1329,7 @@ int main(int argc, char** argv) {
                 ++compared;
                 matched += ok ? 1U : 0U;
             }
+            if (census && compare && !ok) { census_records[census_id].committed = 0; census_records[census_id].errors = 1; }
             // the record: everything it prints, by value (not the step's logits)
             struct StepRec {
                 std::uint32_t argmax, graph_captures, engram_checked, engram_check_mismatches;
@@ -1208,7 +1347,7 @@ int main(int argc, char** argv) {
             const std::uint64_t stream_fnv = last_stream_fnv;
             const bool has_stream = !stream_out.empty();
             const std::uint32_t spare_rec = spare_now, rows_fed = static_cast<std::uint32_t>(fed.size()), fed_last = fed.back();
-            deferred = [&, phase, k, pos, rows_fed, fed_last, wall, cycle, bnd, recall, st, layers, sr = std::move(sr), stream_fnv, has_stream, spare_rec, compare,
+            deferred = [&, census_id, phase, k, pos, rows_fed, fed_last, wall, cycle, bnd, recall, st, layers, sr = std::move(sr), stream_fnv, has_stream, spare_rec, compare,
                         ref_found, ok, ref_step]() {
                 std::ostringstream os;
                 os << "{\"event\":\"" << phase << "\",\"k\":" << k << ",\"pos\":" << pos << ",\"rows\":" << rows_fed << ",\"fed\":" << fed_last
@@ -1221,6 +1360,11 @@ int main(int argc, char** argv) {
                    << ",\"prefetched\":" << st.prefetched << ",\"predicted\":" << st.predicted << ",\"predicted_true\":" << st.predicted_true << ",\"recall\":" << recall
                    << ",\"resurrected\":" << st.resurrected << ",\"collected_mid\":" << st.collected_mid << ",\"bank\":" << st.ring << ",\"stalled\":" << st.stalled << ",\"evicted\":" << st.evicted
                    << ",\"writebacks_done\":" << st.writebacks_done << ",\"free_slots\":" << st.free_slots << ",\"spare_target\":" << spare_rec;
+                if (census && census_id != std::size_t(-1)) {
+                    os << ",\"census\":"; census_records[census_id].write(os, census_phases[census_id]);
+                    os << ",\"cycle_prev_id\":";
+                    if (census_id && cycle >= 0) os << census_id - 1; else os << "null";
+                }
                 if (has_stream) os << ",\"stream_fnv\":\"" << hex(stream_fnv) << "\"";
                 if (!sr.stream_hashes.empty()) {  // --stream-hashes: the last row's stream after each layer (driver FNV)
                     os << ",\"stream_hashes\":[";
@@ -1276,6 +1420,7 @@ int main(int argc, char** argv) {
             double step_ms = 0, finish_ms = 0, boundary_ms = 0;
             double copy_ms = -1;  // the least device time of a layer that fetched exactly one unit (copy + ready)
             TierTokenStats st;
+            std::size_t census_id = std::size_t(-1);
         };
         // winpf: rows of the next window already hinted (the bonus row right after a commit, the drafts after the draft)
         std::uint32_t hinted_rows = 0;
@@ -1286,13 +1431,17 @@ int main(int argc, char** argv) {
         };
         const auto run_window = [&](const std::vector<std::uint32_t>& rows, WindowTimes& wt) {
             const auto t0 = std::chrono::steady_clock::now();
+            const auto window_pos = static_cast<std::uint32_t>(p.position());
+            if (census && census_used && census_phases[census_used - 1] == census_phase && census_last_t0 != std::chrono::steady_clock::time_point{})
+                census_records[census_used - 1].cycle_ms = std::chrono::duration<double, std::milli>(t0 - census_last_t0).count();
+            census_last_t0 = t0;
             // winpf: the rows not hinted yet (all of them outside the speculative loop); no-op when off
             if (rows.size() > hinted_rows) hint_rows(rows.data() + hinted_rows, static_cast<std::uint32_t>(rows.size()) - hinted_rows);
             hinted_rows = 0;
             tier->begin_token();
             auto s = p.step(rows, io);
             const auto t1 = std::chrono::steady_clock::now();
-            tier->end_token();  // ts_end (service + boundary); throws when the library refused the window
+            tier->end_token(static_cast<std::uint32_t>(rows.size()));  // completed verify rows; service + boundary
             const auto t2 = std::chrono::steady_clock::now();
             const std::vector<TierLayer> layers = tier->collect();  // the window's stats, outside the timed boundary (as do_step)
             for (const auto& l : layers)
@@ -1301,6 +1450,13 @@ int main(int argc, char** argv) {
             wt.finish_ms = 0;
             wt.boundary_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
             wt.st = tier->stats();
+            wt.census_id = census_capture(window_pos, static_cast<std::uint32_t>(rows.size()), layers,
+                wt.st, s.device_ms, wt.boundary_ms, s.engram_wait_seconds * 1e3);
+            if (census && wt.census_id != std::size_t(-1)) {
+                auto& c = census_records[wt.census_id];
+                c.engram_wait_first_ms = s.engram_wait_first_seconds * 1e3;
+                c.engram_ms = s.engram_seconds * 1e3; c.engram_issue_ms = s.engram_issue_seconds * 1e3;
+            }
             ph_bank += wt.st.ring;
             ph_res += wt.st.resurrected;
             ph_mid += wt.st.collected_mid;
@@ -1324,6 +1480,7 @@ int main(int argc, char** argv) {
                 DeviceScope ds(ddev);
                 drafter->append_hidden_device(hidden_map.p, kept, nullptr);  // the step is complete: its stores are visible
             }
+            if (census && census_used) census_records[census_used - 1].append_hidden_bytes += std::uint64_t(kept) * 3U * shape.hidden * 4U;
         };
         // --qual: every row of a window: fed tokens, greedy tokens, logits FNV (when the step computed logits)
         const auto qual_rows = [&](const std::vector<std::uint32_t>& rows, const CudaStepResult& s) {
@@ -1338,6 +1495,7 @@ int main(int argc, char** argv) {
             return q.str();
         };
         const auto qual_prompt = [&](const std::string& name, std::uint32_t pos, const std::vector<std::uint32_t>& rows, const CudaStepResult& s) {
+            if (census && census_used) census_records[census_used - 1].counted = false;
             if (qual) emit("{\"event\":\"prompt_window\",\"phase\":\"" + name + "\",\"pos\":" + std::to_string(pos) + qual_rows(rows, s) + "}");
         };
         const auto qual_chat_end = [&](const std::string& key, const std::string& name, const std::vector<std::uint32_t>& v) {
@@ -1488,7 +1646,9 @@ int main(int argc, char** argv) {
             bool prev_drafted = false;
             std::uint32_t prev_rows = 0;
             bool aborted = false;
-            const auto credit = [&](double cycle) {  // the previous window's full cycle
+            std::size_t prev_census_id = std::size_t(-1);
+            const auto credit = [&](double cycle) {
+                if (census && prev_census_id != std::size_t(-1)) census_records[prev_census_id].cycle_ms = cycle;  // the previous window's full cycle
                 if (cycle > 0 && prev_rows > 0 && (!seeded || controller_learn)) {  // controller: verify[R] = the window's full cycle minus its draft step
                     ewma(costs.verify[prev_rows], costs.samples[prev_rows], std::max(0.0, cycle - prev_draft) * 1e-3);
                     controller.set_costs(costs);
@@ -1538,6 +1698,7 @@ int main(int argc, char** argv) {
                 for (std::uint32_t j = 1; j <= k; ++j) rows.push_back(d.tokens[j]);
                 hint_rows(rows.data() + 1, k);  // winpf: the drafts, right after the draft step
                 WindowTimes wt;
+                census_phase = phase;
                 const auto s = run_window(rows, wt);
                 std::uint32_t a = 0;
                 while (a < k && d.tokens[a + 1U] == s.tokens[a]) ++a;
@@ -1572,7 +1733,20 @@ int main(int argc, char** argv) {
                     for (std::uint32_t j = 0; j < kept; ++j) all_match = compare_row(pos + j, rows[j], s, j, os) && all_match;
                     os << "]";
                 }
-                if (!all_match) {  // stop at the first mismatch, before any commit / append / controller work
+                if (census) {
+                    auto& c = census_records[wt.census_id];
+                    c.cycle_ms = -1;  // completed at the next cycle start (terminal tail at drain)
+                    c.drafted = k; c.accepted = a; c.counted = pos - begin >= warm;
+                    c.draft_steps_executed = drafted ? 1U : 0U;
+                    c.draft_nonrouted_bytes = drafted ? census_draft_nonrouted : 0;
+                    c.draft_routed_lower_bytes = drafted ? census_draft_expert * strix::ds41::dspark::top_k : 0;
+                    c.draft_routed_upper_bytes = c.draft_routed_lower_bytes * strix::ds41::dspark::block_size;
+                    c.vocabulary_head_bytes = dtimes.head_weight_bytes;
+                    c.draft_device_ms = dtimes.device_ms; c.draft_wall_ms = dtimes.wall_ms;
+                }
+                if (!all_match) {
+                    if (census) census_records[wt.census_id].errors = 1;  // stop at the first mismatch, before any commit / append / controller work
+                    if (census) { os << ",\"census\":"; census_records[wt.census_id].write(os, census_phases[wt.census_id]); }
                     os << ",\"aborted\":true}";
                     emit(os.str());
                     aborted = true;
@@ -1580,6 +1754,7 @@ int main(int argc, char** argv) {
                     break;
                 }
                 p.commit_window(kept, after);
+                if (census && census_used) census_records[census_used - 1].committed = kept;
                 prefetch_row0(after);
                 if (p.position() < end) hint_rows(&after, 1);  // winpf: the next window's bonus row, before its draft
                 if (spec_out)
@@ -1617,6 +1792,14 @@ int main(int argc, char** argv) {
                     os << ",\"winpf\":{\"prior\":[" << wt.st.prior_issued << "," << wt.st.prior_used << "," << wt.st.prior_late << "," << wt.st.prior_reverted
                        << "],\"l1\":[" << wt.st.l1_issued << "," << wt.st.l1_used << "," << wt.st.l1_late << "," << wt.st.l1_reverted << "," << wt.st.l1_priced_out
                        << "," << wt.st.l1_skipped_ahead << "],\"budget_stops\":" << wt.st.prior_budget_stops << "}";
+                if (census) {
+                    census_records[wt.census_id].append_ms = append_ms;
+                    os << ",\"cycle_prev_id\":";
+                    if (prev_census_id != std::size_t(-1)) os << prev_census_id; else os << "null";
+                    os << ",\"census\":";
+                    census_records[wt.census_id].write(os, census_phases[wt.census_id]);
+                    prev_census_id = wt.census_id;
+                }
                 os << "}";
                 emit(os.str());
                 prev_rows = static_cast<std::uint32_t>(rows.size());
@@ -1645,6 +1828,7 @@ int main(int argc, char** argv) {
             {
                 const auto td = std::chrono::steady_clock::now();
                 STRIX_CUDA_CHECK(cudaDeviceSynchronize());  // and the expert copies / write-backs still queued (both arms)
+                if (census && prev_census_id != std::size_t(-1)) census_records[prev_census_id].cycle_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - prev_t0).count();
                 emit("{\"event\":\"terminal_drain\",\"phase\":\"" + phase + "\",\"drain_ms\":" +
                      std::to_string(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td).count()) + "}");
             }
@@ -1744,7 +1928,43 @@ int main(int argc, char** argv) {
             failures = 0;
         };
         const auto run_request = [&]() {
+        tier->set_policy(evict == "auto" ? 2U : evict == "scored" ? 1U : 0U);
+        ++census_request;
+        census_used = 0;
+        census_last_t0 = {};
+        if (census) {
+            std::uint64_t prompt_hash = 14695981039346656037ULL;
+            for (const auto v : imported.tokens)
+                for (unsigned b = 0; b < 4; ++b) { const unsigned char byte = (v >> (8 * b)) & 255; prompt_hash = census_hash(&byte, 1, prompt_hash); }
+            for (const auto& c : split(chats_arg, ',')) {
+                const auto i = std::stoul(c);
+                if (i >= seqs.size()) continue;
+                const auto& ids = seqs[i].second;
+                for (std::size_t j = 0; j < std::min<std::size_t>(chat_prompt, ids.size()); ++j) {
+                    const auto v = ids[j];
+                    for (unsigned b = 0; b < 4; ++b) { const unsigned char byte = (v >> (8 * b)) & 255; prompt_hash = census_hash(&byte, 1, prompt_hash); }
+                }
+            }
+            std::ostringstream meta;
+            meta << "{\"event\":\"census_request\",\"request_id\":" << census_request
+                 << ",\"effective_config\":" << effective_config()
+                 << ",\"binary_sha256\":\"" << census_binary_hash << "\",\"tierstream_archive_sha256\":\"" << STRIX_TIERSTREAM_SHA256
+                 << "\",\"target_admitted_sha256\":\"" << strix::deepseek41::pinned_file(strix::deepseek41::PinnedFileKind::target_q2).sha256_hex
+                 << "\",\"draft_identity\":\"" << (census_draft_pinned ? "pinned-name-bytes" : "content") << "\",\"draft_sha256\":\"" << census_draft_hash
+                 << "\",\"prompt_fnv1a64\":\"" << hex(prompt_hash)
+                 << "\",\"context_position\":" << imported.position << ",\"context_digest\":\"" << hex(imported.digest())
+                 << "\",\"allocations\":{\"target_arena_bytes\":" << tier->device_bytes() << ",\"target_driver_bytes\":" << p.device_bytes()
+                 << ",\"draft_resident_bytes\":" << (drafter ? drafter->device_bytes() : 0) << ",\"target_driver\":" << p.describe() << "}}";
+            emit(meta.str());
+            std::size_t capacity = 1;
+            for (const auto& seq : seqs) capacity += seq.second.size() + chat_steps + 32;
+            capacity = (capacity + steps + 32) * std::max<std::size_t>(1, phases.size());
+            census_records.resize(capacity);
+            census_phases.resize(capacity);
+            for (auto& phase : census_phases) phase.reserve(128);
+        }
         for (const auto& ph : phases) {
+            census_phase = ph;
             if (failures) break;  // a failed phase (e.g. a speculative chat that differs from its plain arm) ends the run
             const std::uint32_t occurrence = seen_phase[ph]++;  // repeated phases (bracketing) are summarised apart
             {  // window prefetch: on only in this phase if its name ends in 'w' (placement only: exact either way)
@@ -1847,6 +2067,7 @@ int main(int argc, char** argv) {
                             ++canary_checks;
                         }
                         p.commit_window(R, rows.back());
+                        if (census && census_used) census_records[census_used - 1].committed = R;
                         prefetch_ref_row0();
                         ++w;
                     }
@@ -1908,6 +2129,7 @@ int main(int argc, char** argv) {
                         }
                     }
                     p.commit_window(R, rows.back());
+                    if (census && census_used) census_records[census_used - 1].committed = R;
                     prefetch_ref_row0();
                     ++windows;
                 }
@@ -1955,7 +2177,8 @@ int main(int argc, char** argv) {
                     }
                     os << "],\"misses\":" << wt.st.misses << ",\"bank\":" << wt.st.ring << ",\"step_ms\":" << wt.step_ms << "}";
                     emit(os.str());
-                    p.commit_window(kept, rows[kept - 1U]);  // no head: the next row's token is the reference's
+                    p.commit_window(kept, rows[kept - 1U]);
+                    if (census && census_used) census_records[census_used - 1].committed = kept;  // no head: the next row's token is the reference's
                     prefetch_ref_row0();
                     ++windows;
                 }
@@ -2077,6 +2300,7 @@ int main(int argc, char** argv) {
                         if (!all) break;  // stop at the first mismatch (the gate fails on compared != steps)
                         next = s.tokens.at(kept - 1U);
                         p.commit_window(kept, next);
+                        if (census && census_used) census_records[census_used - 1].committed = kept;
                         prefetch_row0(next);
                         ++windows;
                     }
@@ -2142,6 +2366,7 @@ int main(int argc, char** argv) {
                     import_request_state();
                     const auto parts = split(sq.first, ':');
                     const std::string name = ph + "#" + std::to_string(occurrence) + "-" + c + "-" + (parts.size() > 1 ? parts[1] : std::string("x"));
+                    census_phase = name;
                     const std::uint32_t P = std::min<std::uint32_t>(chat_prompt, static_cast<std::uint32_t>(sq.second.size()));
                     {
                         DeviceScope ds(ddev);
@@ -2165,6 +2390,7 @@ int main(int argc, char** argv) {
                         qual_prompt(name, qpos, rows, s);
                         next = s.tokens.back();
                         p.commit_window(R, next);
+                        if (census && census_used) census_records[census_used - 1].committed = R;
                         append_committed(R);
                         at += R;
                     }
@@ -2212,6 +2438,7 @@ int main(int argc, char** argv) {
                     have_last = false;
                     const auto parts = split(sq.first, ':');
                     const std::string name = ph + "#" + std::to_string(occurrence) + "-" + c + "-" + (parts.size() > 1 ? parts[1] : std::string("x"));
+                    census_phase = name;
                     const std::uint32_t P = std::min<std::uint32_t>(chat_prompt, static_cast<std::uint32_t>(sq.second.size()));
                     std::uint32_t next = 0;
                     if (max_rows > 1U) {
@@ -2226,6 +2453,7 @@ int main(int argc, char** argv) {
                             qual_prompt(name, qpos, rows, s);
                             next = s.tokens.back();
                             p.commit_window(R, next);
+                            if (census && census_used) census_records[census_used - 1].committed = R;
                             at += R;
                         }
                         prefetch_row0(next);  // as the speculative chats (the first decode step uses it)
@@ -2251,10 +2479,12 @@ int main(int argc, char** argv) {
                         p.wait_io();  // the last step's Engram prefetch (both arms drain it before their last timestamp)
                         const auto td = std::chrono::steady_clock::now();
                         STRIX_CUDA_CHECK(cudaDeviceSynchronize());  // and the expert copies / write-backs still queued (both arms)
+                        if (census && census_used) census_records[census_used - 1].cycle_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - last_t0).count();
                         emit("{\"event\":\"terminal_drain\",\"phase\":\"" + name + "\",\"drain_ms\":" +
                              std::to_string(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td).count()) + "}");
                         const double tail_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - last_t0).count();
                         emit("{\"event\":\"cycle_tail\",\"phase\":\"" + name + "\",\"cycle_ms\":" + std::to_string(tail_ms) + "}");
+                        if (census && census_used) census_records[census_used - 1].cycle_ms = tail_ms;
                         if (prev_counted) agg[name].cycle.push_back(tail_ms);
                         prev_counted = false;  // the next phase / chat starts a new cycle chain
                     }

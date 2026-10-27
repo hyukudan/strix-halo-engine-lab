@@ -126,6 +126,7 @@ this defaults change is checked on CPU and does not establish new GPU results.
 | Residency | Reuse valid prior placement, save on worker exit | Auto | Step 0 332.6 to 156.0 ms; first 16 steps -20% | Bitwise | `--residency-seed none` / `--residency-save none` |
 | Lean state | Decode-only attention state: an allocation ledger and a split at the maximum decode position instead of full prefill buffers | ON | 32K state 2,486 to 59 MiB (+264 expert slots, plain decode +3.0 %); 128K now loads (state 195 MiB; without it the replica does not fit) | Bitwise: prefill states, greedy logits, DSpark windows, chat tokens, worker requests | `--no-lean-state` |
 | Arena sizing | Size the expert arena from free VRAM minus a headroom | Off (fixed arena by drafter) | More expert slots when VRAM is free | Same outputs | opt-in `--arena-gib auto [--arena-headroom-gib G]` |
+| Eviction | Public tierstream scored victims after verify windows; plain steps keep LRU | Auto | DSpark misses/token −14 %, median +6.4 % tok/s (7 chats); plain decode neutral | Bitwise (only residency changes) | `--evict lru` |
 
 `--baseline` restores all reference forms at that argument; later explicit
 flags override their own settings. `STRIX_DS41_RTX_BASELINE=1` applies the

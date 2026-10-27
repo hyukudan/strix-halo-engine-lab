@@ -1014,6 +1014,7 @@ Draft CudaDrafter::draft(std::uint32_t token, bool keep_logits, CudaDraftTimes* 
     }
     if (times) {
         STRIX_CUDA_CHECK(cudaEventElapsedTime(&times->device_ms, m.ev_start, m.ev_end));
+        times->head_weight_bytes = (std::uint64_t(m.core) + (m.extra_host.empty() ? 0 : m.extra_capacity)) * m.output_row_bytes;
         times->wall_ms = std::chrono::duration<double, std::milli>(clock::now() - start).count();
     }
     return out;

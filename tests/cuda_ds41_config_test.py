@@ -68,12 +68,20 @@ with tempfile.TemporaryDirectory(prefix='ds41-config-', dir=Path.cwd()) as tmp:
                        '--controller-prior', prior_arg, '--controller-costs', '14.8,18.7,26.6,28.9,33.2,37.3,1.6',
                        '--controller-explore', '0', '--wb-defer'])
     assert default == production, {k: (default[k], production[k]) for k in diff(default, production)}
+    assert default['census'] is False and default['evict'] == 'auto'
+    assert diff(default, call(['--census'])) == {'census'}
+    assert diff(default, call(['--evict', 'scored'])) == {'evict'}
+    assert call(['--evict', 'scored', '--baseline'])['evict'] == 'lru'
+    assert diff(default, call(['--evict', 'lru'])) == {'evict'}
+    assert call(['--evict', 'auto'])['evict'] == 'auto'
+    assert call(['--evict', 'auto', '--baseline'])['evict'] == 'lru'
+    call(['--evict', 'invalid'], ok=False)
     old = call(['--baseline'])
     expected = dict(dsrtxk=False, fuse=False, records_inline=True, router_form=0, qakv_s1=False,
                     q8_r1=False, q8_r1_pad=False, draft_keep=0, draft_keep_ids=[], controller_prior='none',
                     controller_costs='none', wb_defer=False, controller_scope='run', host_spares=96,
                     arena_gib=71.5, draft_vocab='full', warmup_graphs='none', residency_seed='none',
-                    residency_save='none', engram_cache_mb=0, load_serial=True, attn_warps=0, max_rows=1, pressure_spares=4, lean_state=False, arena_auto=False)
+                    residency_save='none', engram_cache_mb=0, load_serial=True, attn_warps=0, max_rows=1, pressure_spares=4, lean_state=False, arena_auto=False, evict='lru')
     for key, value in expected.items():
         assert old[key] == value, (key, old[key], value)
     for key in ('decode_fuse_hc', 'decode_fuse_shared', 'decode_router_v2', 'decode_ob_one',

@@ -114,6 +114,11 @@ struct TierSite::Impl {
         ss_options so;
         ts_options_defaults(&so);
         so.backend = SS_BACKEND_CUDA;
+#if defined(SS_DG_SET_POLICY) && defined(SS_DG_AUTO_EVICT)
+        so.policy = SS_POLICY_SCORED_AUTO;  // provision public score tables once; requests reset / select the policy
+#elif defined(SS_DG_SET_POLICY) && defined(SS_DG_SCORED)
+        so.policy = SS_POLICY_SCORED;
+#endif
         so.forward_mode = TS_FORWARD_DEVICE_GATED;
         so.pin_planned = 0;
         so.verify_hash = 0;
@@ -310,11 +315,16 @@ void TierSite::begin_token() {
     m.in_token = true;
 }
 
-void TierSite::end_token() {
+void TierSite::end_token(std::uint32_t rows) {
     auto& m = *impl_;
     if (!m.in_token) throw std::logic_error("ds41 tier site: no token open");
     m.in_token = false;
+#ifdef SS_DG_AUTO_EVICT
+    ts_check(ts_dg_end_rows(m.c, rows), "token not accepted");
+#else
+    (void)rows;
     ts_check(ts_end(m.c), "token not accepted");
+#endif
 }
 
 std::vector<TierLayer> TierSite::collect() {
@@ -351,6 +361,23 @@ std::vector<TierLayer> TierSite::collect() {
     t.l1_skipped_ahead = d(now.l1_skipped_ahead, m.before.l1_skipped_ahead);
     t.prior_budget_stops = d(now.prior_budget_stops, m.before.prior_budget_stops);
     t.wb_issued_bytes = now.wb_issued_bytes - m.before.wb_issued_bytes;
+    t.wb_outstanding_start_bytes = m.before.wb_outstanding_bytes;
+    t.wb_outstanding_bytes = now.wb_outstanding_bytes;
+    t.wb_completed_bytes = now.wb_completed_bytes - m.before.wb_completed_bytes;
+    t.wb_cancelled_bytes = now.wb_cancelled_bytes - m.before.wb_cancelled_bytes;
+    t.wb_boundary_flushed_bytes = now.wb_boundary_flushed_bytes - m.before.wb_boundary_flushed_bytes;
+    t.wb_forced_wait_ns = now.wb_forced_wait_ns - m.before.wb_forced_wait_ns;
+    t.wb_deferred = now.wb_deferred - m.before.wb_deferred;
+    t.wb_cancelled = now.wb_cancelled - m.before.wb_cancelled;
+    t.wb_forced = now.wb_forced - m.before.wb_forced;
+    t.wb_boundary_flushed = now.wb_boundary_flushed - m.before.wb_boundary_flushed;
+    t.device_timeouts = now.device_timeouts - m.before.device_timeouts;
+    ss_dg_boundary_timeline bt{};
+    ts_check(ts_dg_boundary_timeline_sized(m.c, &bt, sizeof bt), "boundary timeline");
+    t.boundary_sync_us = bt.sync_us;
+    t.boundary_select_us = bt.select_us;
+    t.boundary_upload_us = bt.upload_us;
+    t.boundary_issue_us = bt.issue_us;
     if (now.device_timeouts != m.before.device_timeouts) throw std::runtime_error("ds41 tier site: device wait timeout (token not accepted)");
     m.before = now;
     std::vector<TierLayer> layers(m.L);
@@ -371,6 +398,11 @@ std::vector<TierLayer> TierSite::collect() {
             o.prefetch_us = tl.prefetch_us;
             o.predicted_true = tl.predicted_true;
             o.dma_ms = tl.dma_ms;
+            o.covered_waits = tl.covered_waits;
+            o.gpu_demand_wait_us = tl.gpu_wait_us;
+            o.export_to_ready_us = tl.gpu_export_ready_us;
+            o.dma_first_ms = tl.dma_first_ms;
+            o.wb_left_ms = tl.wb_left_ms;
         }
     m.last = t;
     return layers;
@@ -399,6 +431,34 @@ bool TierSite::can_set_sched() noexcept {
     return true;
 #else
     return false;
+#endif
+}
+
+bool TierSite::can_set_policy() noexcept {
+#ifdef SS_DG_SET_POLICY
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool TierSite::can_auto_evict() noexcept {
+#if defined(SS_DG_AUTO_EVICT) && defined(SS_DG_SET_POLICY)
+    return true;
+#else
+    return false;
+#endif
+}
+
+void TierSite::set_policy(std::uint32_t policy) {
+    auto& m = *impl_;
+    if (m.in_token) throw std::logic_error("ds41 tier site: set_policy inside a token");
+#ifdef SS_DG_SET_POLICY
+    if (policy == 2 && !can_auto_evict())
+        throw std::runtime_error("--evict auto: this tierstream has no ts_dg_end_rows; rebuild against a supporting library");
+    ts_check(ts_dg_set_policy(m.c, static_cast<ss_policy>(policy)), "set_policy");
+#else
+    if (policy) throw std::runtime_error("--evict scored: this tierstream has no ts_dg_set_policy; rebuild against a supporting library");
 #endif
 }
 
