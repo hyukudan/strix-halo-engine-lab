@@ -13,6 +13,7 @@
 #include "strix/ds41_trellis.hpp"
 #include "strix/ds41_trellis_group.hpp"
 #include "strix/ds41_weight_overlay.hpp"
+#include "strix/ds41_engram_tp.hpp"
 #include "strix/hip_ds41_expert_tp.hpp"
 #include "strix/hip_ds41_formats.hpp"
 #include "strix/hip_ds41_layer.hpp"
@@ -153,6 +154,19 @@ __global__ void touch_kernel(const uint4* __restrict__ p, std::uint64_t n, std::
         acc ^= v.x ^ v.y ^ v.z ^ v.w;
     }
     if (acc == 0x9e3779b9U && n == 0U) never[0] = acc;  // never true: keeps the loads
+}
+
+// Engram output-row TP (ds41::engram_tp()): rows [first, first + half) of every token row of ekv ([rows][n]) packed
+// contiguous for the exchange, and the peer's half scattered back into its rows: plain copies, the same bits.
+__global__ void engram_pack(const float* __restrict__ ekv, float* __restrict__ tx, std::uint32_t rows, std::uint32_t n, std::uint32_t half,
+                            std::uint32_t first) {
+    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * half) tx[i] = ekv[std::size_t{i / half} * n + first + i % half];
+}
+__global__ void engram_scatter(const float* __restrict__ rx, float* __restrict__ ekv, std::uint32_t rows, std::uint32_t n, std::uint32_t half,
+                               std::uint32_t first) {
+    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * half) ekv[std::size_t{i / half} * n + first + i % half] = rx[i];
 }
 
 __global__ void add_halves(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, std::uint32_t n) {
@@ -367,7 +381,7 @@ struct DeviceForward::Impl {
     int cur = 0;
     bool identity_pre = true;  // pre_carry is the identity (before the first FFN site)
     std::array<float, ds41::hc_copies> pre_carry{};
-    Dev<float> x, qr, q, kv, o, o_low, y, shared, raw, low, high, h, logits, emb, ekv, scores, route_w;
+    Dev<float> x, qr, q, kv, o, o_low, y, shared, raw, low, high, h, logits, emb, ekv, ekv_tx, ekv_rx, scores, route_w;
     Dev<float> head_rows;  // STRIX_DS41_TRELLIS_HEADOUT (see headout)
     Dev<std::uint8_t> erows, image_row;  // erows: [engram layer of the range][row][column] x 264 B, uploaded once per step
     std::uint8_t* erows_pinned = nullptr;  // pinned staging of erows (the upload is asynchronous)
@@ -951,6 +965,10 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
     check(hipHostMalloc(reinterpret_cast<void**>(&m.erows_pinned), m.erows.n, hipHostMallocDefault), "engram staging");
     m.emb = Dev<float>(W * cols * 256U);
     m.ekv = Dev<float>(W * H * (hc + 1U));
+    if (options.world == 2U) {  // the exchanged halves of ds41::engram_tp()
+        m.ekv_tx = Dev<float>(std::min<std::size_t>(W, 8U) * H * (hc + 1U) / 2U);
+        m.ekv_rx = Dev<float>(std::min<std::size_t>(W, 8U) * H * (hc + 1U) / 2U);
+    }
     m.scores = Dev<float>(W * c.n_routed_experts);
     m.route_w = Dev<float>(W * K);
     m.ids = Dev<std::uint32_t>(W * K);
@@ -2035,7 +2053,25 @@ const std::vector<std::uint32_t>& DeviceForward::run_step(std::span<const std::u
             v.x_stride = v.width;
             v.out_stride = v.count;
             v.out = m.ekv.p;
-            ds41::enqueue_f16_rows(v, st);
+            // ds41::engram_tp(): this rank's half of the output rows (the same per-row arithmetic), the peer's by exchange
+            if (const std::uint32_t n = v.count, half = n / 2U;
+                m.distributed() && ds41::engram_tp(R) && v.weight_f8 && R <= 8U && n % 2U == 0U) {
+                v.first = m.options.rank * half;
+                v.count = half;
+                v.out = m.ekv.p + v.first;
+                v.out_stride = n;
+                ds41::enqueue_f16_rows(v, st);
+                const std::uint32_t total = R * half, blocks = (total + 255U) / 256U;
+                engram_pack<<<blocks, 256, 0, st>>>(m.ekv.p, m.ekv_tx.p, R, n, half, v.first);
+                check(hipGetLastError(), "engram_pack");
+                m.options.communicator->start(st, m.ekv_tx.p, std::size_t{total} * 4U,
+                                              dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), 0x10000U | static_cast<std::uint32_t>(layer), position});
+                m.options.communicator->finish(st, m.ekv_rx.p);
+                engram_scatter<<<blocks, 256, 0, st>>>(m.ekv_rx.p, m.ekv.p, R, n, half, (1U - m.options.rank) * half);
+                check(hipGetLastError(), "engram_scatter");
+            } else {
+                ds41::enqueue_f16_rows(v, st);
+            }
             ds41::enqueue_engram_inject(stream_now(), m.ekv.p, m.devf(p + "engram_q_norm.weight"), m.devf(p + "engram_k_norm.weight"), R, H,
                                         1e-20F, st);
             break;

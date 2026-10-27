@@ -1,6 +1,7 @@
 #include "strix/deepseek41_describe.hpp"
 #include "strix/deepseek41_device_forward.hpp"
 #include "strix/deepseek41_pair_defaults.hpp"
+#include "strix/ds41_engram_tp.hpp"
 #include "strix/ds41_pipeline_dspark.hpp"
 #include "strix/ds41_pipeline_front.hpp"
 #include "strix/ds41_spec_tail.hpp"
@@ -76,10 +77,10 @@
 // row "wc rank r pos p rows R kept k argmax t slice s fnv": the FNV of each vocabulary slice of the head this process
 // computes (world 1: both). With R = 1 it is the R1 reference: every pos must have the same argmax and slice FNVs.
 // --state-in FILE: start from a saved attention state (strix-deepseek41-longctx / --state-out) instead of position 0.
-// --aba N [--aba-flags filter,direct,seghpw,fold,f16,live]: the prompt + generation and the --window-rows windows 2N times in this
+// --aba N [--aba-flags filter,direct,seghpw,fold,f16,live,engtp]: the prompt + generation and the --window-rows windows 2N times in this
 // process from the same start (--state-in or position 0), the listed attention flags (STRIX_DS41_IDX_CAND_FILTER,
 // STRIX_DS41_IDX_DIRECT, STRIX_DS41_ATTN_SEG_HPW, STRIX_DS41_ATTN_WINDOW_FOLD,
-// STRIX_DS41_ATTN_TILE_F16, STRIX_DS41_ATTN_LIVE_CHUNKS) off in even arms and on in odd ones; per arm one "aba arm" line
+// STRIX_DS41_ATTN_TILE_F16, STRIX_DS41_ATTN_LIVE_CHUNKS, STRIX_DS41_ENGRAM_TP) off in even arms and on in odd ones; per arm one "aba arm" line
 // (R1 ms/token, window ms, fingerprints of the R1 tokens + local logits slice, the window tokens and the attention state)
 // and at the end "aba exact IDENTICAL|DIFFER" (every arm's fingerprints == arm 0's).
 //   Route recording: --routes-seqs FILE --routes OUT [--max-positions N] teacher-forces every sequence of FILE from a
@@ -1531,7 +1532,8 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
     std::vector<std::array<std::uint64_t, 3>> arm_prints;
     const bool aba_filter = a.aba_flags.find("filter") != std::string::npos, aba_direct = a.aba_flags.find("direct") != std::string::npos,
                aba_seghpw = a.aba_flags.find("seghpw") != std::string::npos, aba_fold = a.aba_flags.find("fold") != std::string::npos,
-               aba_f16 = a.aba_flags.find("f16") != std::string::npos, aba_live = a.aba_flags.find("live") != std::string::npos;
+               aba_f16 = a.aba_flags.find("f16") != std::string::npos, aba_live = a.aba_flags.find("live") != std::string::npos,
+               aba_engtp = a.aba_flags.find("engtp") != std::string::npos;
     const auto slice = strix::ds41::vocab_slice(129280U, single ? 1U : 2U, single ? 0U : rank);
     std::vector<float> slice_host(slice.count);
     for (std::uint32_t arm = 0; arm < arms; ++arm) {
@@ -1544,6 +1546,7 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
         ah::set_attention_window_fold(aba_fold ? on : -1);   // STRIX_DS41_ATTN_WINDOW_FOLD
         ah::set_attention_tile_f16(aba_f16 ? on : -1);     // STRIX_DS41_ATTN_TILE_F16
         ah::set_attention_live_chunks(aba_live ? on : -1);   // STRIX_DS41_ATTN_LIVE_CHUNKS
+        strix::ds41::set_engram_tp(aba_engtp ? on : -1);     // STRIX_DS41_ENGRAM_TP
         if (arm != 0U) {
             seq = prompt_seq;
             if (!a.state_in.empty()) fwd.import_state(start);

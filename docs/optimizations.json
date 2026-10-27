@@ -489,6 +489,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "Engram projection split across ranks",
+    "flag_or_env": "STRIX_DS41_ENGRAM_TP",
+    "default": "on for single-row steps",
+    "exact": "Bitwise: R1-R8 verify windows with rejects equal the archived full-projection digests on both ranks; batch N1/N2/N4/N8 in-process A/B (fed, argmax, gathered logits per row and final attention states) identical, also on the communicator fallbacks.",
+    "gain": "R1 decode −0.61 ms/step (−2.1 %); not significant at R6, so it stays off for multi-row steps by default",
+    "preconditions": "Two ranks with the F8 Engram KV (STRIX_DS41_F16_AS_F8); otherwise each rank runs the full projection.",
+    "off_switch": "STRIX_DS41_ENGRAM_TP=0",
+    "doc_anchor": "docs/optimizations.md#ds-engram-tp"
+  },
+  {
+    "engine": "deepseek",
     "name": "Grouped shared expert",
     "flag_or_env": "STRIX_DS41_SHARED_GROUPED",
     "default": "ON",

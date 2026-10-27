@@ -35,6 +35,7 @@ full-workload gate; confirmed in a combined measurement.
 | `STRIX_DIST_CRC_PARALLEL`, `STRIX_DIST_HOST_CRC_OVERLAP` | on | hp: R6 -1.37 %, N8 -1.77 %, TTFT 2K/8K/32K -1.15/-1.24/-0.89 % |
 | `STRIX_DIST_HOST_CHUNK_BYTES` | 1048576 (`=0`: one piece) | part of hp |
 | `STRIX_DS41_ENGRAM_PAYLOAD_CACHE` | on (`_MIB` caps the budget) | TTFT -0.66/-1.17/-1.63 %, decode equal |
+| `STRIX_DS41_ENGRAM_TP` | on for every single-row DeviceForward / BatchForward step (decode or prompt row; `=0` off, `=1` also up to 8 rows) | the two ranks split the Engram projection's output rows (same per-row arithmetic) and exchange the halves: R1 -0.61 ms/step (-2.1 %), same tokens/logits/state; at R6 not significant, so off there; needs two ranks and the F8 engram_kv (`STRIX_DS41_F16_AS_F8`), else the full projection on each rank |
 | `STRIX_DS41_PREFILL_TILES` | off (`=1`: unsplit tiles for prefill runs of >= `STRIX_DS41_PREFILL_TILES_MIN_ROWS` rows, default 2048) | re-measured on the current kernels, tiles on vs off: fresh-process TTFT 2K/8K/32K +1.0/+3.4/+1.9 %, same-process A/B 4K/8K/16K +0.89/+0.66/+0.82 % (slower); the earlier -0.37/-1.26/-1.13 % predates the current split-K kernels. Same logits either way |
 | `STRIX_DIST_STAGED_READY_BYTES` | 262144 (`=0`: no readiness views) | needed by the two below |
 | `STRIX_DS41_READY_LEAN`, `STRIX_DS41_MOE_READY` | on | Lean ready releases, MoE half sum through ready views |
