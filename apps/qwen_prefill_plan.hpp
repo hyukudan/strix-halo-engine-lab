@@ -53,7 +53,8 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
     result.serial_scratch = compiled.arena.total_bytes;
     result.device_base = add(state.device_total_bytes, result.serial_scratch);
     // The serial decode pool (qsa_decode_pool_route) is retained device state from the first decode step on.
-    const auto decode_pool = qsa_decode_pool_route(options, qpf2k::has_gsq_gate(manifest)) ? qsa_decode_pool_bytes(options, model) : 0U;
+    const auto gsq = qpf2k::has_gsq_gate(manifest);
+    const auto decode_pool = qsa_decode_pool_route(options, gsq) ? qsa_decode_pool_bytes(options, model, gsq) : 0U;
     result.state_d1 = add(result.state_d1, decode_pool);
     result.device_base = add(result.device_base, decode_pool);
     result.workspace = add(plan.arena.physical.total_bytes, 65552U);
@@ -75,7 +76,8 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
         {"serial_scratch_bytes",compiled.arena.total_bytes},
         {"prefill_arena_bytes",plan.arena.physical.total_bytes},
         {"prefill_metadata_bytes",plan.host_metadata_payload_bytes},
-        {"qsa_decode_pool_bytes",decode_pool}};
+        {"qsa_decode_pool_bytes",decode_pool},
+        {"qsa_decode_pool_key_bytes",qsa_decode_pool_key_bytes(options, gsq)}};
     return result;
 }
 } // namespace strix::decode_cli

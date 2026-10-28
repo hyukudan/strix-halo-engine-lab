@@ -297,6 +297,8 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
         auto unknown = request; unknown.environment["STRIX_QPF2K_SHADOW_MAX_TOKENS"] = "300000";
         expect(resolve(unknown,memory).error.find("YaRN execution environment not supported") != std::string::npos,
             "YaRN unbounded alternate launcher controls refuse");
+        for (const char* name : {"STRIX_QSA_DECODE_POOL", "STRIX_QSA_DECODE_POOL_CHECK", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_SELECT"})
+            expect(yarn_environment_refusal({{name, "0"}}, 2).empty(), "YaRN accepts the audited serial decode pool controls");
         expect(effective_prefill_argv(config.options)[2] == "--rope-yarn","YaRN receipt argv retains explicit opt-in");
     }
     auto overflow = memory;
@@ -963,12 +965,41 @@ int main(int argc, char** arguments) {
         expect(!route({}), "STRIX_QPF2K_DEFAULTS=0 disables the decode pool");
         ::unsetenv("STRIX_QPF2K_DEFAULTS");
         auto sized = parse({"decoder","target.gguf","1","2","3","--generate","4"});
-        sized.context_tokens = 262144U;
-        expect(qsa_decode_pool_bytes(sized, model) == UINT64_C(12) * 65536U * 128U * 4U + 16384U * 4U,
-            "decode pool bytes at 262144: 12 layers x 65536 blocks x 512 B + the maxima row");
-        sized.context_tokens = 1048576U;
-        expect(qsa_decode_pool_bytes(sized, model) == UINT64_C(12) * 262144U * 128U * 4U + 65536U * 4U,
-            "decode pool bytes at 1048576: 1.5 GiB + 256 KiB maxima");
+        const auto check_bytes = [&](const Options& options, bool gsq, std::uint64_t key_bytes) {
+            for (const auto context : {262144U, 524288U, 1048576U}) {
+                auto o = options; o.context_tokens = context;
+                const auto blocks = context / 4U;
+                const auto expected = UINT64_C(12) * blocks * 128U * key_bytes + (blocks / 4U) * 4U;
+                expect(qsa_decode_pool_key_bytes(o, gsq) == key_bytes, "decode pool key width follows the shared policy");
+                expect(qsa_decode_pool_bytes(o, model, gsq) == expected, "decode pool exact bytes at 262144/524288/1048576");
+            }
+        };
+        expect(qsa_decode_pool_bf16(sized, false), "BF16 decode pool default on");
+        check_bytes(sized, false, 2U);
+        // Literal totals also guard the model geometry and maxima row independently.
+        for (const auto& [context, bytes] : std::array<std::pair<std::uint64_t,std::uint64_t>,3>{{
+                {262144U,201392128U},{524288U,402784256U},{1048576U,805568512U}}}) {
+            sized.context_tokens = context;
+            expect(qsa_decode_pool_bytes(sized, model, false) == bytes, "BF16 decode pool literal total bytes");
+        }
+        auto baseline_pool = sized; baseline_pool.baseline = true;
+        check_bytes(baseline_pool, false, 4U);
+        check_bytes(sized, true, 4U);
+        qpf2k::baseline = true;
+        check_bytes(sized, false, 4U);
+        qpf2k::baseline = false;
+        for (const char* name : {"STRIX_QPF2K_DEFAULTS", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_POOL"}) {
+            ::setenv(name, "0", 1);
+            check_bytes(sized, false, 4U);
+            ::unsetenv(name);
+        }
+        ::setenv("STRIX_QSA_DECODE_POOL_BF16", "1", 1);
+        expect(requested_prefill_environment().at("STRIX_QSA_DECODE_POOL_BF16") == "1",
+            "requested environment includes the decode pool format switch");
+        check_bytes(sized, false, 2U);
+        check_bytes(baseline_pool, false, 4U);
+        check_bytes(sized, true, 4U);
+        ::unsetenv("STRIX_QSA_DECODE_POOL_BF16");
     }
     std::cout << "qwen effective config: " << failures << " failures\n";
     return failures ? 1 : 0;
