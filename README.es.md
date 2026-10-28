@@ -347,7 +347,7 @@ midió **22,03 s, 1.487 tok/s (48,3 % del techo del contrato de 3.078 tok/s)**.
 TTFT exacto a 32K **22,21 / 22,66 / 22,76 → 21,57 / 22,32 / 22,58 s** (tres pares, media **−0,39 s, −1,7 %**);
 en el build publicado, 32K en cuatro pares ABBA **−0,17 s** de media (todos los pares más rápidos) y 64K **46,76 → 46,01 s (−1,6 %)**;
 17.700 **12,54 → 12,46 s** (un par). Coinciden los tokens, los logits finales y los recibos de cualificación de código-1K / prosa-8K.
-`STRIX_QPF2K_QSA_MASK=0x57` restaura las etapas anteriores (default `0x257`).
+`STRIX_QPF2K_QSA_MASK=0x57` restaura las etapas anteriores (default `0x2257`; `0x257` mantiene todo salvo la variante de ocupación del attend).
 Estos tiempos son comparaciones separadas, no un nuevo barrido de todas las longitudes.
 
 La atención exacta del borrador MTP y los defaults del router están activados en la línea pública de Qwen.

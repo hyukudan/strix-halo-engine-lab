@@ -347,7 +347,7 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
         {"STRIX_QPF2K_HC_MASK","14"}, {"STRIX_QPF2K_HC_OUTPUT3","1"},
         {"STRIX_QPF2K_HC_OUTPUT3_BAND","16"}, {"STRIX_QPF2K_MOE_DA16","1"},
         {"STRIX_QPF2K_MOE_DEFAULTED","3"}, {"STRIX_QPF2K_MOE_ROUTE","14"},
-        {"STRIX_QPF2K_QSA","1"}, {"STRIX_QPF2K_QSA_MASK","0x257"},
+        {"STRIX_QPF2K_QSA","1"}, {"STRIX_QPF2K_QSA_MASK","0x2257"},
         {"STRIX_QPF2K_SCHED","12"}};
     expect(startup.environment == recorded_startup, "YaRN exact recorded startup environment");
     expect(resolve(startup,memory).admitted && !resolve(startup,memory).admission.empty(),

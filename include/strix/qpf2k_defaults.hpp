@@ -26,7 +26,7 @@ inline constexpr std::array defaults{
     Default{Item::gdn_gates_batch, "STRIX_QPF2K_GDN_GATES_BATCH", "1"},
     Default{Item::gdn_core16, "STRIX_QPF2K_GDN_CORE16", "1"},
     Default{Item::qsa, "STRIX_QPF2K_QSA", "1"},
-    Default{Item::qsa_mask, "STRIX_QPF2K_QSA_MASK", "0x257"},
+    Default{Item::qsa_mask, "STRIX_QPF2K_QSA_MASK", "0x2257"},
     Default{Item::hc, "STRIX_QPF2K_HC", "1"},
     Default{Item::hc_mask, "STRIX_QPF2K_HC_MASK", "14"},
     Default{Item::hc_output3, "STRIX_QPF2K_HC_OUTPUT3", "1"},

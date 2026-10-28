@@ -5145,6 +5145,9 @@ QsaKnownRows<Rows> prepare_qsa_known_rows(std::span<const ExecutionDispatchConte
 // Non-null only inside one external score-ring group, never retained after selection.
 thread_local float* qsa_exact_maxima = nullptr;
 thread_local std::uint32_t qsa_exact_maxima_stride = 0;
+// Bit 13 (0x2000, default ON on eligible routes, off with mask 0x257, with bit 6): the group-major attend under an
+// eight-waves-per-SIMD register budget (three resident workgroups per WGP instead of two); same statements, bitwise
+// the same outputs.
 constexpr std::uint32_t qpf2k_maxima_stride = 65536U / qsa_flash::kGroup; // groups of max_position / 4 blocks
 // Per pooled block magnitude ranges (qsa_flash::key_range_kernel), one buffer like the pool's (grown with a sync).
 // STRIX_QPF2K_QSA bit 4 (with bit 1, prefill calls whose union / attend is batched): the groups' selections are deferred
@@ -5618,6 +5621,16 @@ void qsa_fast_batch_flush(hipStream_t stream) {
         // (qsa_fast::attend_order_kernel): the resident workgroups cover few row groups, whose unions overlap, so the
         // gathered KV blocks stay in the last-level cache. Scheduling only: every workgroup runs the same (group, tile, y) body.
         const std::uint32_t ys = b.kv_heads * (b.heads / b.kv_heads / HG);
+        if (qpf2k_qsa_mask() & 0x2000U) {
+            // Bit 13: the same grid and body with an eight-waves-per-SIMD register budget (qsa_fast::attend_order_occ_kernel).
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_occ_kernel<64U, TR, G>), dim3(n * (64U / TR) * ys),
+                dim3((2U * G + 4U) * 32U), 0, stream, slot.views, b.kv, b.kv_heads, b.heads, b.union_at, ys);
+            static const bool witnessed = [] {
+                std::fprintf(stderr, "qpf2k qsa attend occ active mask 0x2000 waves_per_eu 8\n");
+                return true;
+            }();
+            (void)witnessed;
+        } else
         hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_kernel<64U, TR, G>), dim3(n * (64U / TR) * ys), dim3((2U * G + 4U) * 32U), 0,
             stream, slot.views, b.kv, b.kv_heads, b.heads, b.union_at, ys);
         qpf2k_launch_order.fetch_add(1U, std::memory_order_relaxed);
