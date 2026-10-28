@@ -120,8 +120,18 @@ restore_ms, verify_ms, sha_ok, manifest_sha256}`. `cached_tokens` counts the imp
 ## Producer for testing: `STRIX_RTX_EXPORT_STATE=<file>` (+ `STRIX_RTX_EXPORT_POSITION=<p>`)
 
 This works on the tiled MTP route, as a CLI run or a server. The env alone creates the registry; no flag is
-needed. After every prompt unit, a block or a serial row, whose end is position p, the engine writes the file. The
-default p is the end of every prompt.
+needed. After a prompt unit (block, serial row or prompt window) ends at the selected position p, the engine writes the
+file. The default p is the end of every prompt. On batched HTTP, accepted GDN window rows are materialized in
+live recurrent/conv state before this copy, including an explicitly selected intermediate window boundary.
+Prompt receipts and HTTP prompt digests likewise materialize before hashing when diagnostics are requested.
+Without an export at that boundary or a requested digest, the window stays deferred until its next consumer.
+The standalone commit uses the same ordered recurrence and BF16 history shifts as the next window and clears
+the shared pending rows, so continuation cannot apply them twice.
+
+The opt-in terminal-R4 batch-export -> single-import gate is `tests/http_slots_gpu_gate.py --export-roundtrip`;
+its docstring gives the exact command and required model/prompt setup. It compares saved component bytes,
+including recurrent/conv and predictor state, and then continuation IDs and every committed target component.
+Missing R4 or verified-import witnesses fail qualification.
 
 The file is `STRXRTX1`, a u64 LE header length, a header JSON, then the canonical payload. The header JSON holds the
 tokens, the position, the producer, the layout, the sha256 and the session counters.

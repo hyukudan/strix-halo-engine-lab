@@ -573,10 +573,12 @@ public:
         // STRIX_PREFIX_CACHE_DIGEST=1: the end-of-prompt state digest wherever the component registry exists (a prefix
         // store, --rtx-state-import, STRIX_RTX_EXPORT_STATE or STRIX_PROMPT_STATE_DIGEST).
         static const bool digest=[]{const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");return v && v[0]=='1';}();
+        if(digest && tiled_.cache) materialize_window();
         if(digest && tiled_.cache) out<<",\"state_digest\":\""<<model_content_identity_hex(tiled_.cache->state_digest(n_))<<'"';
         receipt=out.str();
-        // STRIX_PREFIX_CACHE_DIGEST=1: every prompt's receipt (digests, phase times) on stderr too (server gates)
-        static const bool log=[]{const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");return v && v[0]=='1';}();
+        // Final-only diagnostics log the execution witness without reading prompt state.
+        static const bool log=[]{const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");
+            const char* f=std::getenv("STRIX_FINAL_STATE_DIGEST");return (v && v[0]=='1') || (f && f[0]=='1');}();
         if(log) std::cerr<<"tiled prompt: {"<<receipt<<"}"<<std::endl;
         return std::move(pending_);
     }
@@ -679,21 +681,29 @@ public:
             hipMemcpyDeviceToDevice),"tiled MTP held window copy");
         pending_=std::move(tickets.back());pos_+=rows;window_rows_+=rows;
         window_pending_=true;
+        // after_unit copies physical state only at the selected export position.
+        const auto& export_request=rtx_state_export_request();
+        if(tiled_.cache && export_request && pos_==(export_request->position?export_request->position:n_))
+            materialize_window();
         if(tiled_.cache) tiled_.cache->after_unit(session_,tokens_,pos_);
         if(pos_>=n_)phase_=Phase::done;
         report_progress();
     }
 private:
+    void materialize_window() {
+        if(!window_pending_) return;
+        // Standalone commit replays the same ordered float recurrence and BF16
+        // history shifts as the next window, then clears its shared pending rows.
+        tiled_.window->flush_pending_window();window_pending_=false;
+    }
     void report_progress() const {
         if(progress_) progress_({serve::GenerationPhase::prefill,pos_-restored_,restored_,n_});
     }
     void run_serial_row() {
         drain_priming();
-        // Known-window GDN commits are deferred. The reserved terminal row must
-        // consume the completed prompt state on the serial target's own stream.
-        if(final_selector_ && window_pending_) {
-            tiled_.window->flush_pending_window();window_pending_=false;
-        }
+        // Every serial row consumes recurrent/conv state, including fallback
+        // after a refused window. Fold earlier rows before advancing it.
+        materialize_window();
         const auto t0=std::chrono::steady_clock::now();
         if(final_sampler_ && pos_+1U==n_) target_.replace_token_sampler(final_sampler_);
         auto ticket=target_.execute_serial(session_,resources_,dispatcher_,tokens_[static_cast<std::size_t>(pos_)],nullptr,
@@ -1521,6 +1531,7 @@ private:
         s.decode_start = std::chrono::steady_clock::now();
         s.result.prompt_ms = std::chrono::duration<double, std::milli>(s.decode_start - s.prompt_start).count();
         const auto route=resolve_mtp_selection_route(options_.http_selection_mtp,!!s.window,s.window && s.window->policy_selection_admitted());
+        if(s.request.constraint && !route.mtp && s.window) s.window->flush_pending_window();
         if(s.request.constraint) {s.request.constraint->commit();
             s.request.constraint->set_execution(route.mtp?"mtp-host":"serial-host",route.fallback?route.fallback:"");}
         if(!s.request.constraint || route.mtp) {
@@ -1586,7 +1597,8 @@ private:
             }
         }
         static const bool state_digest=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");return v&&v[0]=='1';}();
-        if(state_digest && s.parents->tiled.cache) {
+        static const bool final_digest=[] {const char* v=std::getenv("STRIX_FINAL_STATE_DIGEST");return v&&v[0]=='1';}();
+        if((state_digest || final_digest) && s.parents->tiled.cache) {
             if(s.window) s.window->flush_pending_window();
             check_service(hipDeviceSynchronize(),"complete final committed state digest");
             s.result.final_state_position=s.session->next_position;
@@ -2125,6 +2137,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         out.prompt_ms=std::chrono::duration<double,std::milli>(decode_start-request_start).count();
                         HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
                         const auto route=resolve_mtp_selection_route(options.http_selection_mtp,!!window,window && window->policy_selection_admitted());
+                        if(q.constraint && !route.mtp && window)window->flush_pending_window();
                         if(q.constraint)q.constraint->set_execution(route.mtp?"mtp-host":"serial-host",route.fallback?route.fallback:"");
                         if((!q.constraint || route.mtp) && window)greedy.use_window_verifier(window);
                         if(m.draft_chain)greedy.set_draft_min_probability(mtp_draft_min_probability(m));
@@ -2171,7 +2184,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         }
                         if(const auto* ng=greedy.ngram_stats()){out.ngram_rows=ng->extension_rows;out.ngram_accepted=ng->accepted_rows;}
                         if(const auto* cd=greedy.context_stats()){out.ngram_rows=cd->extension_rows;out.ngram_accepted=cd->accepted_rows;}
-                        if(state_digest && parents->tiled.cache) {
+                        static const bool final_digest=[] {const char* v=std::getenv("STRIX_FINAL_STATE_DIGEST");return v&&v[0]=='1';}();
+                        if((state_digest || final_digest) && parents->tiled.cache) {
                             if(window)window->flush_pending_window();
                             if(hipDeviceSynchronize()!=hipSuccess) throw std::runtime_error("complete final committed state digest");
                             out.final_state_position=session.next_position;
