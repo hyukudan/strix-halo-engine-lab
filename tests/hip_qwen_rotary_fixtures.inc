@@ -57,7 +57,9 @@ std::vector<float> run(Site site, const ModelContract& model, std::uint64_t posi
     else return Name<__VA_ARGS__, Source...>; }()
         if (pool) {
             const auto launch = [&]<bool Batch>() {
-                auto k = ROTARY_FIXTURE_KERNEL(block_pool_kernel, kind, Batch);
+                auto k = [&] {
+                    if constexpr (Frozen) return frozen_native::block_pool_kernel<kind, Batch>;
+                    else return block_pool_kernel<kind, Batch, false, Source...>; }();
                 // The frozen snapshot predates the packed-key output; a null packed_keys writes nothing extra.
                 if constexpr (Frozen)
                     hipLaunchKernelGGL(k, dim3(1), dim3(dim), 2U * dim * sizeof(float), hipStreamLegacy,
@@ -262,7 +264,7 @@ void rejection_probes(const ModelContract& model) {
             if(!std::memcmp(mixed_got.data()+r*256U,mixed.data()+r*256U,1024U))
                 throw std::runtime_error("valid row was skipped with a late invalid neighbor");
         reset();
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<SmallWeightKind::f32, false, QwenRotarySource>),
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<SmallWeightKind::f32, false, false, QwenRotarySource>),
             dim3(1), dim3(128), 1024U, hipStreamLegacy, static_cast<const std::uint16_t*>(nullptr), table.extent()/4U,
             128U, 4U, weights.p, 0.0F, 64U, model.rope_theta, values.as<float>(), static_cast<const uint2*>(nullptr), 0U,
             static_cast<std::uint16_t*>(nullptr), source);

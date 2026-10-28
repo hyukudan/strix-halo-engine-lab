@@ -77,6 +77,7 @@ struct HipLauncherCatalogConfig {
     std::uint32_t fast_prefill_components = 0;
     // HipIndexedAttentionLauncherConfig::decode_pool for the runtime's QSA launcher (plain append-only serial decode).
     bool qsa_decode_pool = false;
+    bool qsa_decode_pool_bf16 = false;
 };
 
 void register_complete_hip_kernel_catalog(

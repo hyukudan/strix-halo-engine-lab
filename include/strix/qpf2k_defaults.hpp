@@ -63,7 +63,7 @@ inline bool suppressed(Item item, bool gsq = gsq_model) noexcept {
     return baseline || (gsq && (defaulted_items & bit(item)) != 0U);
 }
 // Code-default exact long-context items (STRIX_QSA_UNION_MERGE, STRIX_QSA_SCORE_ROWS64, STRIX_QSA_DECODE_POOL,
-// STRIX_QSA_DECODE_SELECT): on unless their variable is "0", the baseline is requested, STRIX_QPF2K_DEFAULTS=0, or the
+// STRIX_QSA_DECODE_SELECT, STRIX_QSA_DECODE_POOL_BF16): on unless their variable is "0", the baseline is requested, STRIX_QPF2K_DEFAULTS=0, or the
 // model is a GSQ checkpoint (the same exclusions as the injected defaults above).
 inline bool long_context_item_enabled(const char* name, bool gsq = gsq_model) noexcept {
     if (baseline || gsq) return false;

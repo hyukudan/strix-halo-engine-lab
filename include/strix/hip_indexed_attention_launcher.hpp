@@ -26,8 +26,8 @@ class HipQsaWindowPool;
 // through stream drain. Rejected/window rows are invalidated from the next frontier.
 [[nodiscard]] std::shared_ptr<HipQsaWindowPool> make_hip_qsa_window_pool();
 // Serial decode pool (STRIX_QSA_DECODE_POOL): one entry per QSA layer, allocated per entry; a failed allocation leaves
-// that layer on block_score_kernel.
-[[nodiscard]] std::shared_ptr<HipQsaWindowPool> make_hip_qsa_decode_pool();
+// that layer on block_score_kernel. bf16_keys selects packed-only upper halves; the CLI supplies the admitted policy.
+[[nodiscard]] std::shared_ptr<HipQsaWindowPool> make_hip_qsa_decode_pool(bool bf16_keys = false);
 void invalidate_hip_qsa_window_pool(const std::shared_ptr<HipQsaWindowPool>&);
 
 struct HipIndexedAttentionLauncherConfig {

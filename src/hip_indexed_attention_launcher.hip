@@ -4329,39 +4329,7 @@ __global__ void attention_output_rows_dense_a8_kernel(QsaRowsAttentionViews<Rows
 // same partial sum under xor as under shfl_down, and one addition commutes), the same
 // division; the value chain is the same ascending-slot fma chain the window kernel's
 // contracted sum += score * value compiles to.
-template <unsigned D> __device__ __forceinline__ float qsa_lane_xor(float v) {
-    // Distance 16: permlanex16 with the identity selects swaps the two 16-lane rows (lane L ^ 16).
-    if constexpr (D == 16U) return __uint_as_float(__builtin_amdgcn_permlanex16(__float_as_uint(v), __float_as_uint(v),
-        0x76543210U, 0xfedcba98U, false, false));
-    else return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x160 | static_cast<int>(D), 0xf, 0xf, false));
-}
-// Reduce-scatter of P per-lane partial sums (P a power of two <= 16): lane step D (16, 8, ...)
-// halves the values a lane carries, the lower lane keeping the lower half. Every head's sum
-// is still the 16..1 lane tree of its partials (each step adds the partials of lanes L and
-// L ^ D; one addition commutes), at a fraction of the exchanges. Afterwards lane L holds
-// head qsa_scatter_head<P>(L) (all lanes of a pair hold the same value).
-template <unsigned P> __device__ __forceinline__ unsigned qsa_scatter_head(unsigned lane) {
-    unsigned head = 0;
-    unsigned weight = P / 2U;
-#pragma unroll
-    for (unsigned D = 16U; D > 0U && weight > 0U; D >>= 1U, weight >>= 1U) if (lane & D) head += weight;
-    return head;
-}
-template <unsigned P, unsigned Step = 0U> __device__ __forceinline__ void qsa_scatter(float (&v)[P], unsigned lane) {
-    if constexpr (Step < 5U) {
-        constexpr unsigned D = 16U >> Step, Count = (P >> Step) > 0U ? (P >> Step) : 1U;
-        if constexpr (Count > 1U) {
-            constexpr unsigned H = Count / 2U;
-            const bool upper = (lane & D) != 0U;
-#pragma unroll
-            for (unsigned j = 0; j < H; ++j) {
-                const float low = qsa_lane_xor<D>(v[j]), high = qsa_lane_xor<D>(v[j + H]);
-                v[j] = upper ? v[j + H] + high : v[j] + low;
-            }
-        } else v[0] += qsa_lane_xor<D>(v[0]);
-        qsa_scatter<P, Step + 1U>(v, lane);
-    }
-}
+#include "hip_qsa_scatter.inc"
 template <unsigned Rows, unsigned G, unsigned Slots, bool Scatter, bool Int8 = false>
 __global__ __launch_bounds__(256) void attention_score_rows_group_kernel(QsaRowsAttentionViews<Rows> views,
     const std::uint16_t* kv_state, std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
@@ -4967,63 +4935,7 @@ void launch_draft_attention_tail(DraftTailVariant variant, const float* q_gate, 
     check_hip(hipGetLastError(), "MTP draft attention tail enqueue");
 }
 
-// Prefill groups (Rows > 8): the pooled/normalised/rotated key of a complete block depends only
-// on its raw keys, so it is formed once per prefill call (block_pool_kernel: the statements of
-// block_score_rows_kernel's pooled part) and every row of every group scores it
-// (block_score_pooled_rows_kernel). Per (row, block, head) the score is the 128-feature LDS tree
-// of block_score_rows_kernel done in registers: lane l holds features l + 32j, so strides 64
-// and 32 are the in-lane pairs (j, j + 2) and then (0, 1), and 16..1 are the xor reduce-scatter
-// of attention_score_rows_group_kernel (each step adds the partials of lanes L and L ^ D). The
-// relu sum over the heads, in head order from 0, and the division are unchanged.
-// One wave scores RowsPerWave consecutive rows against 32 consecutive blocks (lane i keeps
-// block base + i); index head_dim 128, 4 index heads.
-template <unsigned Rows, unsigned RowsPerWave>
-__global__ __launch_bounds__(256) void block_score_pooled_rows_kernel(QsaRowsScoreViews<Rows> views, const float* pooled_keys,
-    std::uint32_t scored_blocks, std::uint32_t head_dim) {
-#pragma clang fp contract(off)
-    constexpr unsigned Heads = 4U, Dim = 128U; // head_dim == Dim (checked by the caller)
-    const auto lane = threadIdx.x % 32U;
-    const auto wave = blockIdx.x * 8U + threadIdx.x / 32U;
-    const auto chunks = (scored_blocks + 31U) / 32U;
-    const auto r0 = wave / chunks * RowsPerWave, base = wave % chunks * 32U;
-    if (r0 >= Rows) return;
-    float q[RowsPerWave][Heads][4];
-    std::uint32_t blocks[RowsPerWave];
-#pragma unroll
-    for (unsigned rr = 0; rr < RowsPerWave; ++rr) {
-        blocks[rr] = views.blocks[r0 + rr];
-#pragma unroll
-        for (unsigned h = 0; h < Heads; ++h)
-#pragma unroll
-            for (unsigned j = 0; j < 4U; ++j) q[rr][h][j] = views.index_query[r0 + rr][h * Dim + lane + 32U * j];
-    }
-    float result[RowsPerWave];
-#pragma unroll
-    for (unsigned rr = 0; rr < RowsPerWave; ++rr) result[rr] = 0.0F;
-    const auto last = min(32U, scored_blocks - base);
-    for (unsigned i = 0; i < last; ++i) {
-        const auto* key = pooled_keys + static_cast<std::uint64_t>(base + i) * Dim + lane;
-        const float k0 = key[0], k1 = key[32], k2 = key[64], k3 = key[96];
-#pragma unroll
-        for (unsigned rr = 0; rr < RowsPerWave; ++rr) {
-            float partial[Heads];
-#pragma unroll
-            for (unsigned h = 0; h < Heads; ++h) {
-                const float p0 = q[rr][h][0] * k0, p1 = q[rr][h][1] * k1, p2 = q[rr][h][2] * k2, p3 = q[rr][h][3] * k3;
-                partial[h] = (p0 + p2) + (p1 + p3);
-            }
-            qsa_scatter<Heads, 0U>(partial, lane);
-            // Lane 8h holds head h's sum.
-            float total = 0.0F;
-#pragma unroll
-            for (unsigned h = 0; h < Heads; ++h) total += fmaxf(__shfl(partial[0], static_cast<int>(8U * h), 32), 0.0F);
-            if (lane == i) result[rr] = total / sqrtf(static_cast<float>(head_dim));
-        }
-    }
-#pragma unroll
-    for (unsigned rr = 0; rr < RowsPerWave; ++rr)
-        if (lane < last && base + lane < blocks[rr]) views.block_scores[r0 + rr][base + lane] = result[rr];
-}
+#include "hip_qsa_pooled_score.inc"
 
 // Journal: per absolute layer, (ratio-1) partial-block tail cells then 8 row keys.
 std::uint64_t qsa_journal_layer_elements(const ModelContract& model) {
@@ -5706,6 +5618,7 @@ bool launch_qsa_fast_prefill(const QsaKnownRows<Rows>& prepared, const PreparedI
 
 // Pooled block keys of one prefill call (block_pool_kernel): blocks [0, valid) are formed from the
 // raw keys this call's groups and the earlier context left; keys has room for capacity blocks.
+// The serial decode owner instead uses packed alone when its admitted BF16 storage policy is enabled.
 struct QsaPrefillPool {
     float* keys = nullptr;
     // STRIX_QSA_POOL_PACKED=1 (prefill pool, opt-in; the baseline keeps it off): the same keys as BF16 bits, written by
@@ -5925,7 +5838,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             if (scored_blocks > pool->valid) {
                 dispatch_small_kind(tensors.index_k_norm.manifest->ggml_type, [&](auto kind) {
                     with_qwen_rotary(model, stream, [&](auto... rotary_source) {
-                        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<decltype(kind)::value, false, decltype(rotary_source)...>), dim3(scored_blocks - pool->valid),
+                        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<decltype(kind)::value, false, false, decltype(rotary_source)...>), dim3(scored_blocks - pool->valid),
                             dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream,
                             reinterpret_cast<const std::uint16_t*>(a.raw_state.address), pool->valid, a.index_dim, s0.ratio,
                             reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address), model.rms_norm_epsilon, rotary,
@@ -6939,6 +6852,7 @@ void indexed_attention_known_window_rows_preflight(std::span<const ExecutionDisp
 class HipQsaWindowPool {
     // false: per-entry allocations whose failure returns no pool (the serial decode pool).
     bool slab_allowed_ = true;
+    bool bf16_keys_ = false; // serial decode only; prefill allocation and slabs stay FP32
     struct Entry {
         std::uintptr_t raw = 0, norm = 0;
         std::uint64_t raw_generation = 0, norm_generation = 0;
@@ -6960,7 +6874,7 @@ class HipQsaWindowPool {
     static bool slab_enabled() { static const bool on = qsa_env_default_on("STRIX_QSA_POOL_SLAB"); return on; }
 public:
     HipQsaWindowPool() = default;
-    explicit HipQsaWindowPool(bool slab_allowed) : slab_allowed_(slab_allowed) {}
+    explicit HipQsaWindowPool(bool slab_allowed, bool bf16_keys) : slab_allowed_(slab_allowed), bf16_keys_(bf16_keys) {}
     ~HipQsaWindowPool() {
         if (maxima_) {
             if (hipStreamSynchronize(stream_) != hipSuccess || hipFree(maxima_) != hipSuccess) std::terminate();
@@ -6970,7 +6884,10 @@ public:
         // Every entry's last consumer is ordered on this one owner stream.
         if (hipStreamSynchronize(stream_) != hipSuccess) std::terminate();
         if (!slabs_.empty()) { for (auto& slab : slabs_) if (slab.base && hipFree(slab.base) != hipSuccess) std::terminate(); return; }
-        for (auto& entry : entries_) if (entry.pool.keys && hipFree(entry.pool.keys) != hipSuccess) std::terminate();
+        for (auto& entry : entries_) {
+            void* keys = bf16_keys_ ? static_cast<void*>(entry.pool.packed) : static_cast<void*>(entry.pool.keys);
+            if (keys && hipFree(keys) != hipSuccess) std::terminate();
+        }
     }
     void invalidate() noexcept { for (auto& entry : entries_) entry.pool.valid = 0U; }
     // The decode selection's maxima row (at least groups floats) on the owner's device/stream; null when it cannot be
@@ -7018,11 +6935,19 @@ public:
         entry.pool.capacity = blocks;
         if (!slab_allowed_) {
             void* keys = nullptr;
-            if (hipMalloc(&keys, static_cast<std::uint64_t>(blocks) * a.index_dim * sizeof(float)) != hipSuccess) {
+            const auto bytes = static_cast<std::uint64_t>(blocks) * a.index_dim * (bf16_keys_ ? sizeof(std::uint16_t) : sizeof(float));
+            if (hipMalloc(&keys, bytes) != hipSuccess) {
                 static_cast<void>(hipGetLastError()); // an allocation failure must not poison the next launch check
+                // Keep the keyless entry so later steps do not retry the allocation; that layer stays on block_score_kernel.
+                entries_.push_back(entry);
+                static std::atomic<bool> reported{false};
+                if (!reported.exchange(true))
+                    std::fprintf(stderr, "QSA decode pool: %llu-byte key allocation failed; that layer decodes with block_score_kernel\n",
+                        static_cast<unsigned long long>(bytes));
                 return nullptr;
             }
-            entry.pool.keys = static_cast<float*>(keys);
+            if (bf16_keys_) entry.pool.packed = static_cast<std::uint16_t*>(keys);
+            else entry.pool.keys = static_cast<float*>(keys);
             entries_.push_back(entry);
             return &entries_.back().pool;
         }
@@ -7048,7 +6973,7 @@ public:
     }
 };
 std::shared_ptr<HipQsaWindowPool> make_hip_qsa_window_pool() { return std::make_shared<HipQsaWindowPool>(); }
-std::shared_ptr<HipQsaWindowPool> make_hip_qsa_decode_pool() { return std::make_shared<HipQsaWindowPool>(false); }
+std::shared_ptr<HipQsaWindowPool> make_hip_qsa_decode_pool(bool bf16_keys) { return std::make_shared<HipQsaWindowPool>(false, bf16_keys); }
 
 // Serial decode from the persistent pool: the new complete blocks (at most one per step after the first) are formed by
 // block_pool_kernel (the statements of block_score_kernel's pooled part), then block_score_pooled_rows_kernel<1, 1> scores
@@ -7060,20 +6985,27 @@ bool qsa_decode_pool_scores(const PreparedIndexedLaunch& a, const HipIndexedAtte
     std::uint32_t complete_blocks, std::uint32_t ratio) {
     const auto& model = config.model;
     if (!config.decode_pool || a.index_dim != 128U || model.indexer_n_heads != 4U || !ratio || !complete_blocks) return false;
-    // The decode pool forms keys with the native rotary instance only; explicit YaRN keeps the
-    // table-backed block_score_kernel route (same selection inputs, no native coefficients).
-    if (model.qwen_rotary_table) return false;
     auto* pool = config.decode_pool->get(a, ratio, position);
-    if (!pool || !pool->keys || complete_blocks > pool->capacity) return false;
+    if (!pool || (!pool->keys && !pool->packed) || complete_blocks > pool->capacity) return false;
+    // Explicit YaRN forms the pooled keys from the model's rotary table, as the prefill pools do (bind_qwen_pool keeps
+    // one table per pool; with_qwen_rotary passes the same source block_score_kernel reads).
+    bind_qwen_pool(pool, model);
     const auto stream = hip_execution_stream();
     const auto rotary = checked_u32(model.rotary_dim(), "rotary_dim");
     const auto& norm = a.tensors.index_k_norm;
     if (complete_blocks > pool->valid) {
         dispatch_small_kind(norm.manifest->ggml_type, [&](auto kind) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<decltype(kind)::value>), dim3(complete_blocks - pool->valid),
-                dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream,
-                reinterpret_cast<const std::uint16_t*>(a.raw_state.address), pool->valid, a.index_dim, ratio,
-                reinterpret_cast<const void*>(norm.runtime->address), model.rms_norm_epsilon, rotary, model.rope_theta, pool->keys);
+            with_qwen_rotary(model, stream, [&](auto... rotary_source) {
+                const auto launch = [&]<bool PackedOnly>() {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<decltype(kind)::value, false, PackedOnly, decltype(rotary_source)...>),
+                        dim3(complete_blocks - pool->valid), dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream,
+                        reinterpret_cast<const std::uint16_t*>(a.raw_state.address), pool->valid, a.index_dim, ratio,
+                        reinterpret_cast<const void*>(norm.runtime->address), model.rms_norm_epsilon, rotary, model.rope_theta,
+                        pool->keys, static_cast<const uint2*>(nullptr), 0U, pool->packed, rotary_source...);
+                };
+                if (pool->packed) launch.template operator()<true>();
+                else launch.template operator()<false>();
+            });
         });
         check_hip(hipGetLastError(), "QSA decode block-pool launch");
         pool->valid = complete_blocks;
@@ -7083,8 +7015,13 @@ bool qsa_decode_pool_scores(const PreparedIndexedLaunch& a, const HipIndexedAtte
     views.block_scores[0] = a.workspace.block_scores;
     views.blocks[0] = complete_blocks;
     const auto waves = (complete_blocks + 31U) / 32U;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<1U, 1U>), dim3((waves + 7U) / 8U), dim3(kThreads), 0, stream,
-        views, static_cast<const float*>(pool->keys), complete_blocks, a.index_dim);
+    if (pool->packed) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<1U, 1U, std::uint16_t>), dim3((waves + 7U) / 8U), dim3(kThreads), 0, stream,
+            views, static_cast<const std::uint16_t*>(pool->packed), complete_blocks, a.index_dim);
+    } else {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<1U, 1U>), dim3((waves + 7U) / 8U), dim3(kThreads), 0, stream,
+            views, static_cast<const float*>(pool->keys), complete_blocks, a.index_dim);
+    }
     check_hip(hipGetLastError(), "QSA decode pooled block-score launch");
     static const bool check = [] { const char* v = std::getenv("STRIX_QSA_DECODE_POOL_CHECK"); return v && v[0] == '1'; }();
     if (check) {

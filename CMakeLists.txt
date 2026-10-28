@@ -2344,6 +2344,15 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_test(NAME strix-hip-known-window-hc-persistent-tests COMMAND strix-hip-known-window-tests --hc-rows)
         set_tests_properties(strix-hip-known-window-hc-persistent-tests PROPERTIES ENVIRONMENT "STRIX_HC_PERSISTENT=1;STRIX_HC_PERSISTENT_INJECT=1")
         add_test(NAME strix-hip-known-window-fold-tests COMMAND strix-hip-known-window-tests --window-folds)
+        add_executable(strix-hip-qsa-decode-pool-bf16-tests tests/qsa_decode_pool_bf16.hip)
+        set_target_properties(strix-hip-qsa-decode-pool-bf16-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-qsa-decode-pool-bf16-tests PRIVATE "${STRIX_HIP_RUNTIME_LIBRARY}")
+        target_compile_options(strix-hip-qsa-decode-pool-bf16-tests PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        strix_target_warnings(strix-hip-qsa-decode-pool-bf16-tests)
+        add_test(NAME strix-hip-qsa-decode-pool-bf16-tests COMMAND strix-hip-qsa-decode-pool-bf16-tests)
+        set_tests_properties(strix-hip-qsa-decode-pool-bf16-tests PROPERTIES SKIP_RETURN_CODE 77)
         add_executable(strix-hip-qsa-block-select-tests tests/hip_qsa_block_select_tests.hip)
         set_target_properties(strix-hip-qsa-block-select-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)

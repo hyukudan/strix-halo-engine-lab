@@ -214,7 +214,7 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
         const auto total_new = valid - pool->valid;
         dispatch_small_kind(tensors.index_k_norm.manifest->ggml_type, [&](auto kind) {
             with_qwen_rotary(model, stream, [&](auto... rotary_source) {
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<decltype(kind)::value, true, decltype(rotary_source)...>), dim3(total_new),
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<decltype(kind)::value, true, false, decltype(rotary_source)...>), dim3(total_new),
                     dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream,
                     reinterpret_cast<const std::uint16_t*>(a.raw_state.address), pool->valid, a.index_dim, ratio,
                     reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address), model.rms_norm_epsilon, rotary,
