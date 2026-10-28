@@ -1062,6 +1062,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-execution-arena-tests)
     add_test(NAME strix-execution-arena-tests COMMAND strix-execution-arena-tests)
 
+    add_executable(strix-qsa-score-scratch-tests tests/qsa_score_scratch_tests.cpp)
+    target_link_libraries(strix-qsa-score-scratch-tests PRIVATE strix_core)
+    strix_target_warnings(strix-qsa-score-scratch-tests)
+    add_test(NAME strix-qsa-score-scratch-tests COMMAND strix-qsa-score-scratch-tests)
+
     add_executable(strix-memory-plan-tests tests/memory_plan_tests.cpp)
     target_link_libraries(strix-memory-plan-tests PRIVATE strix_core)
     strix_target_warnings(strix-memory-plan-tests)

@@ -31,8 +31,53 @@ eight-row tile, reused only by ordered work on the same owned stream. Its latest
 summary describes the last eligible layer's last complete tile, not all T rows.
 
 The compiler requires explicit arena and host-arena-metadata payload limits.
-Full T row stripes are allocated, including logits capacity even when some heads
-are omitted. No alias of an omitted output is invented to bypass admission.
+Eligible terminal-row and state-only owners allocate headless row stripes plus
+one logits-capable stripe per owner. Only a produced terminal head resolves that
+stripe, including the actual terminal row of a partial block. The compiler
+validates every mixed extent, offset and row view before mutation. State-only
+owners reserve the stripe for complete native launcher construction but produce
+no logits. All-rows scoring, segmented/HTTP batch owners, MTP prompt capture,
+closed verify windows, graph inputs and complete-step dump diagnostics retain
+the uniform arena.
+
+Eligible QSA row prefill keeps selected token IDs in all original row workspaces,
+but scores and selection maxima live in a ring of two slots owned by each tiled
+owner. A slot holds G 64-row groups (rows per slot = 64 G). The default starts
+at 512 rows and halves while the two slots exceed 1 GiB at the owner's maximum
+positions: 512 / 512 / 256 rows per slot at 262,144 / 524,288 / 1,048,576
+(320 / 640 / 640 MiB per owner). `STRIX_QSA_SCORE_RING_ROWS=64|128|256|512|1024`
+overrides the geometry; it is fully charged and may exceed 1 GiB.
+
+A stage call publishes once for the whole call (RoPE table, norm/RoPE, raw/KV
+store, pool, key ranges), then scores and selects one slice of up to G groups
+per slot: one score launch with the call-wide rows-per-CTA policy, one batched
+selection, the slice's trace hashes, then the slot's consumer event. No deferred
+score reader survives reuse. In ring mode the stage batch is not limited to
+65,536 blocks (the maxima live in the bounded ring). The scorer and selection
+operations, ties, causal bounds, token-zero multiplicity and full-batch
+attention union/tile order are unchanged. The score-free, headless row size is
+324,352 bytes for the native model geometry; the terminal stripe adds 993,280
+bytes per owner. Ring geometry follows the workspace's maximum positions rather
+than the current prompt length.
+
+Admission charges every retained owner separately: the main owner and each
+retained tail owner carry their own ring and terminal stripe (at 262,144 with
+the default geometry about 341 MiB for a 64-row tail owner and 326 MiB for a
+16-row tail owner). Receipts report `qsa_score_ring_rows` and
+`qsa_score_ring_workspace_bytes`. Under explicit YaRN the owner inventory names the rings
+(`qsa_score_ring`) and terminal stripes (`terminal_logits_stripes`) once, split out of the
+primary and tail workspaces, and charges no embedded selection or stage-batch maxima for
+compact owners (their maxima live in the ring).
+
+Both memory policies default on for eligible routes and follow the qpf2k
+defaults policy: `--baseline`, `STRIX_BASELINE=1`, `STRIX_QPF2K_DEFAULTS=0` and
+GSQ checkpoints compile the legacy layout. `STRIX_QSA_SCORE_RING=0` and
+`STRIX_TERMINAL_LOGITS_ARENA=0` independently restore their legacy layouts;
+`STRIX_CTX_EXACT_MEMORY=0` disables both. With both off, physical plans,
+offsets, allocation sizes and printed byte receipts retain the legacy values.
+Admission and effective configuration use the compiler's arena and ring
+formula. GPU gates: the ring and stage split are byte-identical to the legacy
+layout in fixtures up to 262,144 blocks and in the 262,143-token QSA trace.
 The reported host payload covers arena vector elements; allocator overhead and
 the fixed closed-eight selection/catalog metadata are separate host margin.
 The allocation consumer must also admit actual retained model/state/repack/

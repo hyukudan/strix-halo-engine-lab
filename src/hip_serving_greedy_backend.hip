@@ -385,9 +385,9 @@ HipServingPrefillPlan HipServingGreedyBackend::prepare_prefill(const ModelContra
     HipServingPrefillPlan p;p.rows=rows;p.alignment=serial.arena.alignment;
     if(rows>=16U) {
         p.state_tiled=compile_known_prefix_prefill(model,serial,manifest,access,
-            {rows,true,true,true,false,KnownWindowOutputPolicy::state_only,workspace_budget,metadata_budget});
+            {rows,true,true,true,false,KnownWindowOutputPolicy::state_only,workspace_budget,metadata_budget,false,false,false,false,false,false,false});
         p.terminal_tiled=compile_known_prefix_prefill(model,serial,manifest,access,
-            {rows,true,true,true,false,KnownWindowOutputPolicy::terminal_row,workspace_budget,metadata_budget});
+            {rows,true,true,true,false,KnownWindowOutputPolicy::terminal_row,workspace_budget,metadata_budget,false,false,false,false,false,false,false});
         p.workspace_bytes=std::max(p.state_tiled->arena.physical.total_bytes,p.terminal_tiled->arena.physical.total_bytes);
         p.metadata_payload_bytes=serving_add(p.state_tiled->host_metadata_payload_bytes,p.terminal_tiled->host_metadata_payload_bytes);
     } else {

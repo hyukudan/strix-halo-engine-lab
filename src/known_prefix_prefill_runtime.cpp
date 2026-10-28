@@ -157,11 +157,25 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
             "known prefill full-T entry table is ambiguous or invalid");
         full_by_id[id]=&entry;
     }
+    if(plan.external_qsa_score_bytes) for(std::size_t step=0;step<steps;++step) {
+        if(serial.execution.steps[step].op!=SerialOp::indexed_attention) continue;
+        const auto id=static_cast<std::uint32_t>(plan.tile8.r2_variant[step]);
+        require(plan.tile8.mode[step]==KnownWindowStepMode::qsa_rows && full_by_id[id] &&
+            full_by_id[id]->binds_qsa_score_ring,
+            "compact QSA workspace requires a full-prefill entry with score ring binding");
+    }
     ExecutionRuntimeResources resources=serial_resources;resources.scratch=&memory;
+    require(!plan.external_qsa_score_bytes || rows%8U==0,"score-ring prefill requires complete eight-row tiles");
+    ExecutionArenaPlan terminal_view;
+    if(plan.terminal_logits_arena) terminal_view=plan.arena.row_view[rows-1U];
+    if(plan.terminal_logits_arena) for(auto& a:terminal_view.allocations) if(execution_use_is_logits(a.use)) {
+        const auto* capable=find_arena_allocation(plan.arena.row_view.back(),a.use);
+        require(capable && capable->bytes,"terminal arena has no head-capable row");a=*capable;
+    }
     const auto context=[&](std::size_t step,std::uint32_t row) {
         const auto& s=serial.execution.steps[step];const auto& io=serial.io.steps[step];const auto& binding=serial.bindings.bindings[step];
         ExecutionDispatchContext c;c.execution_identity=plan.prefill_execution_identity;c.step_id=s.id;c.op=s.op;c.layer=s.layer;
-        c.reads=io.reads;c.writes=io.writes;c.temporaries=io.temporaries;c.arena=&plan.arena.row_view[row];c.memory=&memory;
+        c.reads=io.reads;c.writes=io.writes;c.temporaries=io.temporaries;c.arena=plan.terminal_logits_arena && s.op==SerialOp::lm_head && row+1U==rows?&terminal_view:&plan.arena.row_view[row];c.memory=&memory;
         c.session_state_layout=resources.session_state_layout;c.session_state_memory=resources.session_state_memory;c.resources=&resources;
         c.reads_state=s.reads_state;c.writes_state=s.writes_state;c.position=session.next_position+row;c.input_token_id=tokens[row];
         if(!binding.host_or_runtime_step) c.kernel_id=std::string_view(*binding.kernel_id);
@@ -173,7 +187,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     validate_execution_runtime_resources(plan.prefill_execution_identity,plan.arena.physical,resources,session.next_position);
     lap("resources2");
     EagerExecutionRequest request;request.input_token_id=tokens[0];request.position=session.next_position;request.state=session.state;
-    validate_eager_execution_preflight(serial.execution,serial.bindings,serial.io,plan.arena.row_view[0],request,
+    validate_eager_execution_preflight(serial.execution,serial.bindings,serial.io,plan.terminal_logits_arena?terminal_view:plan.arena.row_view[0],request,
         resources.session_state_layout,resources.session_state_memory,&resources);
     // Topology/IO/state shape is identical for every R1 view. The immutable
     // compiled T arena validation above checks ALL row offsets, sizes and uses;
@@ -206,7 +220,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     result.omitted_lm_heads=rows-static_cast<std::uint32_t>(result.logit_row_indices.size());
     result.logical_row_steps=static_cast<std::uint32_t>(rows*steps)-result.omitted_lm_heads;
     result.execution.completion_order.reserve(rows*steps);
-    for(std::uint32_t row=0;row<rows&&!headless;++row) {
+    for(const auto row:result.logit_row_indices) {
         const auto c=context(steps-1U,row);require(c.writes.size()==1U,"known prefill head needs one output");
         const auto output=resolve_dispatch_write(c,0);
         require(serial.vocab_size<=UINT64_MAX/sizeof(float)&&output.bytes>=serial.vocab_size*sizeof(float),"known prefill logit row is undersized");
@@ -243,6 +257,12 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
         // each context before enqueueing, so an out-of-capacity block fails during launch (session
         // poisoned) instead of before it; capacity and positions are checked above for every block.
         if(preflight_known||(headless&&step>=headless_from)) continue;
+        if(plan.terminal_logits_arena && step+1U==steps) {
+            for(const auto row:result.logit_row_indices) {
+                const auto c=context(step,row);launch.steps[step].preflight(c,launch.steps[step].user_data);
+            }
+            continue;
+        }
         const auto step_begin=timing?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         const auto step_done=[&]{
             if(timing) mode_ms[static_cast<std::size_t>(mode)%mode_ms.size()]+=
@@ -433,6 +453,7 @@ std::vector<KnownWindowResult> execute_known_prefix_prefill_segments_eager(const
     require(!hooks.preflight_only&&!hooks.before_step&&!hooks.after_step&&!hooks.record_actual_window_lineage,
         "segmented prefill takes its observers through the segment hooks");
     require(plan.output_policy!=KnownWindowOutputPolicy::all_rows,"segmented prefill does not deliver every row's logits");
+    require(!plan.terminal_logits_arena && !plan.external_qsa_score_bytes,"segmented prefill requires its uniform owner layout");
     const void* preflight_key=&launch;
     const bool preflight_known=hooks.preflight_memo&&
         std::find(hooks.preflight_memo->begin(),hooks.preflight_memo->end(),preflight_key)!=hooks.preflight_memo->end();

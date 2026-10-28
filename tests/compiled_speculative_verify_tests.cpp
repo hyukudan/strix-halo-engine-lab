@@ -1,3 +1,4 @@
+#include "strix/qpf2k_defaults.hpp"
 #include "strix/compiled_speculative_verify.hpp"
 #include "strix/known_prefill_limits.hpp"
 
@@ -12,6 +13,8 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdlib>
+#include <optional>
 #include <functional>
 #include <limits>
 
@@ -513,9 +516,11 @@ void known_prefix_prefill_tests(const strix::ModelContract& model) {
     using P=strix::KnownWindowOutputPolicy;using V=strix::KnownWindowR2Variant;
     // Host flow/state oracle only. Native projection arithmetic is exercised
     // separately; these recording kernels deliberately use tiny state words.
-    for(bool mixed:{false,true}) for(auto rows:{16U,17U,32U}) for(auto policy:{P::all_rows,P::terminal_row,P::state_only}) {
+    for(bool mixed:{false,true}) for(auto rows:{16U,17U,32U}) for(auto policy:{P::all_rows,P::terminal_row,P::state_only})
+        for(bool partial:{false,true}) {
+        if(partial && (rows%8U || policy==P::all_rows)) continue;
         KnownRuntimeFixture f(model,true,mixed);
-        strix::KnownPrefillRequest request;request.logical_rows=rows;request.r2_shared_expert=true;request.r2_gdn=true;
+        strix::KnownPrefillRequest request;request.logical_rows=partial?rows+16U:rows;request.r2_shared_expert=true;request.r2_gdn=true;
         request.r2_gdn_f32_gates=mixed;request.output_policy=policy;
         request.workspace_budget_bytes=UINT64_MAX;request.host_metadata_payload_budget_bytes=UINT64_MAX;
         const auto prefill=strix::compile_known_prefix_prefill(model,f.source.serial,f.source.manifest,f.source.access,request);
@@ -535,15 +540,17 @@ void known_prefix_prefill_tests(const strix::ModelContract& model) {
         const std::array<strix::KnownWindowRowsEntry,2> wide{{
             {V::shared_q8_virtual256_r8_v1,&f.trace,&recording_rows_preflight,&recording_rows_launch},
             {V::gdn_q8_rows8_f32_gates_r1_v1,&f.trace,&recording_rows_preflight,&recording_rows_launch}}};
+        auto prefill_hooks=f.hooks();prefill_hooks.partial_rows=partial;
         const auto result=strix::execute_known_prefix_prefill_eager(prefill,f.source.serial,f.resources,f.window_memory,
-            f.session,tokens,launch,pairs,wide,f.hooks());
+            f.session,tokens,launch,pairs,wide,prefill_hooks);
         expect(f.session.next_position==rows&&f.session.committed_tokens==rows&&f.session.state.generations==expected_generations,
             "T prefill commits real T inputs and exactly serial state generations once");
         expect(f.state_words==expected_state,"T step-major prefill preserves all seven logical host state payloads");
         expect(result.shared_rows_dispatches==48U*(rows/8U)&&
             (mixed?result.gdn_rows_dispatches==36U*(rows/8U):result.r2_dispatches==36U*(rows/2U)),
             "T prefill uses real closed tiles at every source step and explicit row tails");
-        expect(f.trace.head_admissions.size()==rows,"every T head receives metadata preflight even when omitted");
+        expect(f.trace.head_admissions.size()==(prefill.terminal_logits_arena?prefill.logit_row_indices.size():rows),
+            "only logits-capable terminal rows receive head preflight in compact arenas");
         const auto outputs=policy==P::all_rows?rows:(policy==P::terminal_row?1U:0U);
         expect(result.logits.size()==outputs&&f.trace.head_positions.size()==outputs&&result.omitted_lm_heads==rows-outputs,
             "T output policy maps only actual selected terminal heads");
@@ -637,7 +644,7 @@ void known_prefix_prefill_segment_tests(const strix::ModelContract& model) {
     const std::vector<std::uint32_t> lead_in{0U,3U,5U};
     const auto request_for=[&](std::uint32_t rows,P policy) {
         strix::KnownPrefillRequest request;request.logical_rows=rows;request.r2_shared_expert=true;request.r2_gdn=true;
-        request.r2_gdn_f32_gates=true;request.output_policy=policy;
+        request.r2_gdn_f32_gates=true;request.output_policy=policy;request.exact_memory=false;
         request.workspace_budget_bytes=UINT64_MAX;request.host_metadata_payload_budget_bytes=UINT64_MAX;
         return request;
     };
@@ -1395,6 +1402,135 @@ void known_window_qsa_tests(const strix::ModelContract& model) {
     const auto reject=[&](auto&& operation,const char* message) {
         bool rejected=false;try{operation();}catch(const std::invalid_argument&){rejected=true;}expect(rejected,message);
     };
+    {
+        strix::KnownPrefillRequest request;request.logical_rows=64;request.r2_shared_expert=true;request.r2_gdn=true;
+        request.qsa_rows=true;request.full_qsa_score_ring_entry=true;request.output_policy=strix::KnownWindowOutputPolicy::terminal_row;
+        request.workspace_budget_bytes=UINT64_MAX;request.host_metadata_payload_budget_bytes=UINT64_MAX;
+        const auto plan=strix::compile_known_prefix_prefill(model,fixture.serial,fixture.manifest,fixture.access,request);
+        strix::validate_compiled_known_prefix_prefill(plan,fixture.serial);
+        expect(plan.external_qsa_score_bytes==262144U && plan.qsa_score_ring_rows==512U && plan.qsa_score_ring_workspace_bytes==335544320U,
+            "eligible prefill owns two bounded external score/maxima slots");
+        expect(plan.terminal_logits_arena,"terminal arena defaults on for eligible output policy");
+        for(unsigned fault=0;fault<4;++fault) {
+            auto malformed=plan;
+            if(fault==0) malformed.arena.row_view.front().allocations.back().bytes=993280U;
+            if(fault==1) ++malformed.arena.physical.allocations.back().offset;
+            if(fault==2) malformed.arena.row_stride.back()=993280U;
+            if(fault==3) malformed.arena.row_view.back().allocations.back().bytes=0;
+            reject([&]{strix::validate_compiled_known_prefix_prefill(malformed,fixture.serial);},"malformed mixed logits extent rejects");
+        }
+        auto bad=plan;++bad.external_qsa_score_bytes;
+        reject([&]{strix::validate_compiled_known_prefix_prefill(bad,fixture.serial);},"forged score-free geometry rejects");
+        request.exact_memory=false;
+        const auto off=strix::compile_known_prefix_prefill(model,fixture.serial,fixture.manifest,fixture.access,request);
+        expect(!off.external_qsa_score_bytes && !off.qsa_score_ring_workspace_bytes && off.arena.physical.total_bytes==998400ULL*64,
+            "score ring disabled retains the original arena byte receipt");
+        const auto set=[](const char* name,const char* value) {
+#ifdef _WIN32
+            _putenv_s(name,value?value:"");
+#else
+            if(value) setenv(name,value,1);else unsetenv(name);
+#endif
+        };
+        std::vector<std::pair<std::string,std::optional<std::string>>> saved;
+        for(const char* name:{"STRIX_CTX_EXACT_MEMORY","STRIX_QSA_SCORE_RING","STRIX_TERMINAL_LOGITS_ARENA","STRIX_PREFILL_FULL_QSA","STRIX_QSA_SCORE_RING_ROWS",
+                "STRIX_QPF2K_DEFAULTS","STRIX_BASELINE"}) {
+            const char* value=std::getenv(name);saved.emplace_back(name,value?std::optional<std::string>(value):std::nullopt);
+        }
+        request.exact_memory=true;
+        for(const char* rows : {"64","128","256","512","1024"}) {
+            set("STRIX_QSA_SCORE_RING_ROWS",rows);
+            const auto configured=strix::compile_known_prefix_prefill(model,fixture.serial,fixture.manifest,fixture.access,request);
+            strix::validate_compiled_known_prefix_prefill(configured,fixture.serial);
+            expect(configured.qsa_score_ring_rows==std::stoul(rows) &&
+                configured.qsa_score_ring_workspace_bytes==static_cast<std::uint64_t>(configured.qsa_score_ring_rows)*655360U,
+                "compiled owner receipt prices explicit score/maxima rows");
+            expect(configured.prefill_kernel_plan_identity==plan.prefill_kernel_plan_identity &&
+                ((configured.prefill_execution_identity==plan.prefill_execution_identity)==(configured.qsa_score_ring_rows==plan.qsa_score_ring_rows)),
+                "slot geometry changes execution identity and retains numerical identity");
+            auto forged=configured;forged.qsa_score_ring_rows=192U;
+            reject([&]{strix::validate_compiled_known_prefix_prefill(forged,fixture.serial);},"forged ring row geometry rejects");
+            forged=configured;++forged.qsa_score_ring_workspace_bytes;
+            reject([&]{strix::validate_compiled_known_prefix_prefill(forged,fixture.serial);},"forged ring byte charge rejects");
+        }
+        set("STRIX_QSA_SCORE_RING_ROWS","192");
+        reject([&]{(void)strix::compile_known_prefix_prefill(model,fixture.serial,fixture.manifest,fixture.access,request);},"bad ring row environment rejects at admission");
+        // Validation uses the admitted geometry, never the current environment.
+        strix::validate_compiled_known_prefix_prefill(plan,fixture.serial);
+        set("STRIX_QSA_SCORE_RING_ROWS",nullptr);
+        request.exact_memory=true;
+        set("STRIX_CTX_EXACT_MEMORY","1");set("STRIX_QSA_SCORE_RING","0");set("STRIX_TERMINAL_LOGITS_ARENA","0");
+        const auto switches_off=strix::compile_known_prefix_prefill(model,fixture.serial,fixture.manifest,fixture.access,request);
+        expect(switches_off.prefill_execution_identity==off.prefill_execution_identity &&
+            switches_off.arena.physical.total_bytes==off.arena.physical.total_bytes && switches_off.arena.row_stride==off.arena.row_stride,
+            "both off switches preserve byte-identical legacy compiled plans");
+        set("STRIX_CTX_EXACT_MEMORY","0");set("STRIX_QSA_SCORE_RING","1");set("STRIX_TERMINAL_LOGITS_ARENA","1");
+        const auto master_off=strix::compile_known_prefix_prefill(model,fixture.serial,fixture.manifest,fixture.access,request);
+        expect(master_off.prefill_execution_identity==off.prefill_execution_identity &&
+            master_off.prefill_kernel_plan_identity==plan.prefill_kernel_plan_identity,
+            "master off wins over individual on switches and preserves numerical identity");
+        set("STRIX_CTX_EXACT_MEMORY","1");set("STRIX_QSA_SCORE_RING","0");
+        const auto terminal_only=strix::compile_known_prefix_prefill(model,fixture.serial,fixture.manifest,fixture.access,request);
+        expect(terminal_only.terminal_logits_arena && !terminal_only.external_qsa_score_bytes,"terminal stripe can be enabled independently");
+        set("STRIX_QSA_SCORE_RING","1");set("STRIX_TERMINAL_LOGITS_ARENA","0");
+        const auto ring_only=strix::compile_known_prefix_prefill(model,fixture.serial,fixture.manifest,fixture.access,request);
+        expect(!ring_only.terminal_logits_arena && ring_only.external_qsa_score_bytes,"score ring can be enabled independently");
+        set("STRIX_PREFILL_FULL_QSA","0");
+        const auto full_off=strix::compile_known_prefix_prefill(model,fixture.serial,fixture.manifest,fixture.access,request);
+        expect(!full_off.external_qsa_score_bytes && !full_off.qsa_score_ring_workspace_bytes,
+            "FULL_QSA=0 selects embedded scores at compilation");
+        set("STRIX_PREFILL_FULL_QSA","1");
+        // The defaults policy (--baseline, STRIX_BASELINE=1, STRIX_QPF2K_DEFAULTS=0, GSQ) compiles the legacy layout.
+        // Both policies are on first, so each suppression below removes the score ring and the terminal stripe.
+        set("STRIX_TERMINAL_LOGITS_ARENA",nullptr);
+        const auto both_on=strix::compile_known_prefix_prefill(model,fixture.serial,fixture.manifest,fixture.access,request);
+        expect(both_on.terminal_logits_arena && both_on.external_qsa_score_bytes && both_on.qsa_score_ring_workspace_bytes,
+            "suppression matrix starts with both compact-memory policies enabled");
+        const auto legacy=[&](const char* what) {
+            const auto compiled=strix::compile_known_prefix_prefill(model,fixture.serial,fixture.manifest,fixture.access,request);
+            expect(!compiled.external_qsa_score_bytes && !compiled.qsa_score_ring_workspace_bytes && !compiled.terminal_logits_arena &&
+                compiled.prefill_execution_identity==off.prefill_execution_identity &&
+                compiled.arena.physical.total_bytes==off.arena.physical.total_bytes,what);
+        };
+        set("STRIX_QPF2K_DEFAULTS","0"); legacy("STRIX_QPF2K_DEFAULTS=0 compiles the legacy layout"); set("STRIX_QPF2K_DEFAULTS",nullptr);
+        set("STRIX_QPF2K_DEFAULTS","00"); legacy("STRIX_QPF2K_DEFAULTS=00 compiles the legacy layout"); set("STRIX_QPF2K_DEFAULTS",nullptr);
+        set("STRIX_BASELINE","1"); legacy("STRIX_BASELINE=1 compiles the legacy layout"); set("STRIX_BASELINE",nullptr);
+        strix::qpf2k::baseline=true; legacy("--baseline compiles the legacy layout"); strix::qpf2k::baseline=false;
+        { const strix::qpf2k::ModelScope gsq(true); legacy("GSQ checkpoints compile the legacy layout"); }
+        set("STRIX_TERMINAL_LOGITS_ARENA","0");
+        request.full_qsa_score_ring_entry=false;
+        const auto optional_entry=strix::compile_known_prefix_prefill(model,fixture.serial,fixture.manifest,fixture.access,request);
+        expect(!optional_entry.external_qsa_score_bytes && optional_entry.prefill_execution_identity==full_off.prefill_execution_identity,
+            "optional or missing full entry retains the same embedded byte layout and identity");
+        for(const auto& [name,value]:saved) set(name.c_str(),value?value->c_str():nullptr);
+    }
+    {
+        KnownRuntimeFixture f(model,true,true,8U,false,strix::KnownWindowOutputPolicy::terminal_row,false,true);
+        strix::KnownPrefillRequest request;request.logical_rows=16;request.r2_shared_expert=true;request.r2_gdn=true;
+        request.r2_gdn_f32_gates=true;request.qsa_rows=true;request.full_qsa_score_ring_entry=true;
+        request.output_policy=strix::KnownWindowOutputPolicy::terminal_row;
+        request.workspace_budget_bytes=UINT64_MAX;request.host_metadata_payload_budget_bytes=UINT64_MAX;
+        const auto plan=strix::compile_known_prefix_prefill(model,f.source.serial,f.source.manifest,f.source.access,request);
+        expect(plan.external_qsa_score_bytes!=0,"missing entry rejection fixture uses compact storage");
+        f.window_pool.resize(static_cast<std::size_t>((plan.arena.physical.total_bytes+7U)/8U));
+        f.window_memory={plan.prefill_execution_identity,reinterpret_cast<std::uintptr_t>(f.window_pool.data()),plan.arena.physical.total_bytes,11U};
+        auto source=f.source.serial;source.execution_identity=plan.prefill_execution_identity;source.arena=plan.arena.row_view.back();
+        const auto launch=strix::compile_launch_plan(source,f.registry);
+        const std::vector<std::uint32_t> tokens(16U,7U);
+        for(unsigned entry=0;entry<2;++entry) {
+            const std::array<strix::KnownWindowRowsEntry,1> full{{
+                {V::qsa_q8_rows8_r1_v1,&f.trace,&recording_rows_preflight,&recording_rows_launch}}};
+            const auto before=f.state_words;
+            bool binding_refusal=false;
+            try {(void)strix::execute_known_prefix_prefill_eager(plan,f.source.serial,f.resources,f.window_memory,
+                f.session,tokens,launch,{}, {},f.hooks(),entry?std::span<const strix::KnownWindowRowsEntry>(full):
+                std::span<const strix::KnownWindowRowsEntry>{});}
+            catch(const std::invalid_argument& e) {binding_refusal=std::string(e.what()).find("score ring binding")!=std::string::npos;}
+            expect(binding_refusal,"compact runtime refuses absent or unbound full entry with a clear binding error");
+            expect(f.state_words==before && f.session.next_position==0 && !f.trace.calls && !f.trace.admissions && !f.quiesces,
+                "compact entry refusal precedes callbacks, state mutation and device work");
+        }
+    }
     constexpr std::uint64_t layer_bytes=80ULL*34ULL*(12288ULL+512ULL+512ULL+512ULL+128ULL)+192ULL*34ULL*2560ULL;
     for(const std::uint32_t rows:{2U,4U,8U}) {
         strix::KnownWindowRequest request{true,true,true,rows};

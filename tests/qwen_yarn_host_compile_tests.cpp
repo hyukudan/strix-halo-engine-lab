@@ -1,4 +1,5 @@
 #include "../apps/qwen_prefill_plan.hpp"
+#include "strix/ctx_exact_memory.hpp"
 #include "strix/launch_dispatch.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/qwen_yarn_table.hpp"
@@ -208,8 +209,12 @@ void run(unsigned factor, unsigned capacity, unsigned count, const ModelManifest
         const auto plan = compile_known_prefix_prefill(model,prefill,manifest,access,
             {n,true,true,true,true,KnownWindowOutputPolicy::terminal_row,
              effective.options.known_prefill_workspace_budget,effective.options.known_prefill_metadata_budget/2U,
-             true,true,true,true,true,false});
+             true,true,true,true,true,false,true,true});
         validate_compiled_known_prefix_prefill(plan,prefill);
+        // The planner's compact layout: the score ring follows the YaRN effective positions.
+        const QsaScoreRingGeometry ring(model.effective_max_positions(),model.indexer_compress_ratio,plan.qsa_score_ring_rows);
+        require(plan.qsa_score_ring_workspace_bytes && plan.qsa_score_ring_workspace_bytes==ring.total_bytes() &&
+            model.effective_max_positions()>model.max_position_embeddings,"YaRN score ring follows the effective positions");
         validate_known_prefix_window_formats(plan.tile8,prefill,manifest,access);
         if (n==effective.options.known_prefix_prefill_rows)
             require(effective.host_compilation.at("prefill_execution_identity")==plan.prefill_execution_identity &&

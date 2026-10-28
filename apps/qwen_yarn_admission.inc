@@ -40,6 +40,10 @@ inline std::string yarn_environment_refusal(const Environment& environment, unsi
         // block_score_kernel from the same table; selection and key storage perform no rotation.
         if (name == "STRIX_QSA_DECODE_POOL" || name == "STRIX_QSA_DECODE_POOL_CHECK" ||
             name == "STRIX_QSA_DECODE_POOL_BF16" || name == "STRIX_QSA_DECODE_SELECT") continue;
+        // Compact tiled-prefill memory controls choose where scores, maxima and terminal logits live; the score ring and
+        // stage split reuse the same table-bound norm/RoPE, pool and scorer launches, so they add no rotary site.
+        if (name == "STRIX_CTX_EXACT_MEMORY" || name == "STRIX_QSA_SCORE_RING" || name == "STRIX_QSA_SCORE_RING_ROWS" ||
+            name == "STRIX_TERMINAL_LOGITS_ARENA") continue;
         if (name == "STRIX_QWEN_ROPE_YARN" && value == std::to_string(factor)) continue;
         return "YaRN execution environment not supported: " + name;
     }

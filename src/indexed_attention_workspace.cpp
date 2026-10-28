@@ -74,7 +74,7 @@ void append(
 IndexedAttentionWorkspaceLayout
 build_indexed_attention_workspace_layout(
     const ModelContract& model,
-    std::uint64_t alignment, bool hierarchical_selection, std::uint32_t gqa_heads_per_block) {
+    std::uint64_t alignment, bool hierarchical_selection, std::uint32_t gqa_heads_per_block, bool external_block_scores) {
     if (const auto error =
             model.validate();
         !error.empty()) {
@@ -138,7 +138,7 @@ build_indexed_attention_workspace_layout(
         layout.current_index_key_offset,
         layout.current_index_key_bytes);
 
-    append(
+    if (!external_block_scores) append(
         cursor,
         checked_mul(
             layout.maximum_blocks,

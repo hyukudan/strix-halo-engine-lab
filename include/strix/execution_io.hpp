@@ -66,6 +66,9 @@ struct SerialExecutionIoPlan {
     std::uint32_t router_workspace_slots = 0;
 };
 
+// The only output allowed to have a terminal-only extent in a tiled owner.
+[[nodiscard]] bool execution_use_is_logits(ExecutionBufferUse use) noexcept;
+
 [[nodiscard]] SerialExecutionIoPlan build_serial_execution_io_plan(
     const SerialExecutionPlan& execution_plan,
     bool parallel_moe_router = false);

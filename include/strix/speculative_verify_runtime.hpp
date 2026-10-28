@@ -106,6 +106,7 @@ struct KnownWindowRowsEntry {
     void (*preflight)(std::span<const ExecutionDispatchContext>, void*) = nullptr;
     void (*launch)(std::span<const ExecutionDispatchContext>, void*) = nullptr;
     std::uint64_t implementation_identity = 0;
+    bool binds_qsa_score_ring = false;
 };
 
 struct KnownWindowResult {
