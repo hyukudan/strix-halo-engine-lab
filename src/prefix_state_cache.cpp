@@ -994,5 +994,8 @@ void PrefixStateCache::record_certificate_decline(const std::string& reason) {
     for(std::size_t i=0;i<prefix_certificate_decline_names.size();++i)
         if(prefix_certificate_decline_names[i]==reason) {++stats_.certificate_declines[i];return;}
 }
+void PrefixStateCache::record_snapshot_preparation() {std::lock_guard lock(mutex_); ++stats_.snapshot_preparations;}
+void PrefixStateCache::record_tripwire_skip() {std::lock_guard lock(mutex_); ++stats_.capture_skips_tripwire;}
+void PrefixStateCache::record_batch_config_skip() {std::lock_guard lock(mutex_); ++stats_.capture_skips_batch_config;}
 void PrefixStateCache::record_cross_stream_skip() {std::lock_guard lock(mutex_); ++stats_.capture_skips_cross_stream;}
 }

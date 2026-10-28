@@ -4,9 +4,18 @@
 #include <cstdlib>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace strix {
+// Set once at bridge startup, before worker threads; CLI and environment share the resolved policy.
+void set_prefix_batch_certification_enabled(bool enabled) noexcept;
+[[nodiscard]] bool prefix_batch_certification_enabled() noexcept;
+// Value owned by the ticket, independent of the producer's scratch/lease lifetime.
+struct OutputLogitsSnapshot {
+    std::optional<ModelContentIdentity> digest;
+    void capture(const std::optional<ModelContentIdentity>& row) { digest=row; }
+};
 inline bool prompt_terminal_digest_enabled() {
     static const bool enabled=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");return v && v[0]=='1';}();
     return enabled;
@@ -15,6 +24,27 @@ inline std::optional<ModelContentIdentity> raw_fp32_logits_digest(std::span<cons
     if(row.empty()) return std::nullopt;
     return sha256_bytes(std::as_bytes(row));
 }
+// H0 = SHA256(empty), Hn = SHA256(Hn-1 || SHA256(raw FP32 vocabulary row n)).
+// A missing row is an error, never an apparently complete diagnostic.
+struct OutputLogitsChain {
+    ModelContentIdentity digest{};
+    std::uint64_t rows=0;
+    const char* error=nullptr;
+    void fail(const char* reason) noexcept { if(!error) error=reason; }
+    bool complete(std::uint64_t expected) {
+        if(rows!=expected) fail("request final incomplete output logits coverage");
+        return !error;
+    }
+    void append(const std::optional<ModelContentIdentity>& row) {
+        if(error) return;
+        if(!row) {fail("request final missing output logits row");return;}
+        std::vector<std::byte> frame;
+        const auto previous=rows?digest:sha256_bytes(std::span<const std::byte>{});
+        for(const auto byte:previous.bytes) frame.push_back(static_cast<std::byte>(byte));
+        for(const auto byte:row->bytes) frame.push_back(static_cast<std::byte>(byte));
+        digest=sha256_bytes(frame);++rows;
+    }
+};
 // Canonical LE values, never structure padding or allocation addresses. The frontier
 // and committed count are emitted separately beside this generations/lineage hash.
 inline ModelContentIdentity terminal_generations_lineage_digest(const SerialSessionContext& session) {

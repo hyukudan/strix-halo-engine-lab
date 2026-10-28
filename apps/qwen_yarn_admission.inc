@@ -28,6 +28,10 @@ inline std::string yarn_environment_refusal(const Environment& environment, unsi
         return "YaRN requires STRIX_QPF2K_SCHED=12; got " + it->second;
     for (const auto& [name, value] : environment) {
         if (storage_location_environment(name)) continue;
+        // Operational policy with no rotary work. The shared prefix parser
+        // validates the value and applies CLI precedence on both routes; the
+        // route guard separately refuses MTP, caching and HTTP.
+        if (name == "STRIX_PREFIX_BATCH_CERT") continue;
         const auto entry = std::find_if(qpf2k::defaults.begin(), qpf2k::defaults.end(),
             [&](const auto& item) { return name == item.name; });
         if (entry != qpf2k::defaults.end() &&

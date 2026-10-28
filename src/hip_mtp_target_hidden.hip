@@ -69,7 +69,7 @@ struct HipMtpTargetHiddenTicket::Lease {
     std::optional<std::uint64_t> block_begin;
     // STRIX_SERIAL_LOGITS_DIGEST=1 (diagnostic): SHA-256 of this serial row's FP32 logits.
     std::optional<ModelContentIdentity> logits_digest;
-    std::optional<ModelContentIdentity> terminal_digest;
+    OutputLogitsSnapshot terminal;
 };
 struct HipMtpTargetHidden::Impl {
     struct Slot {
@@ -163,7 +163,7 @@ const SerialSessionContext& HipMtpTargetHiddenTicket::committed_session() const 
 std::optional<ModelContentIdentity> HipMtpTargetHiddenTicket::serial_logits_digest() const {return lease_ ? lease_->logits_digest : std::nullopt;}
 std::optional<ModelContentIdentity> HipMtpTargetHiddenTicket::terminal_logits_digest() const {
     if(!lease_) return std::nullopt;
-    return lease_->batch ? lease_->batch->terminal_logits_digest(lease_->batch_row) : lease_->terminal_digest;
+    return lease_->terminal.digest;
 }
 ModelContentIdentity HipMtpTargetHiddenTicket::target_content_identity() const {if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");return lease_->content;}
 RotaryIdentity HipMtpTargetHiddenTicket::producer_rotary_identity() const {
@@ -390,7 +390,7 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial_unselected(
                 const auto bytes=std::as_bytes(std::span<const float>(row));
                 const auto digest=sha256_bytes(std::vector<std::byte>(bytes.begin(),bytes.end()));
                 if(logits_digest) lease->logits_digest=digest;
-                if(prompt_terminal_digest_enabled()) lease->terminal_digest=raw_fp32_logits_digest(row);
+                if(prompt_terminal_digest_enabled()) lease->terminal.capture(raw_fp32_logits_digest(row));
             }
             if(i.session_logits) {
                 std::vector<float> row;
@@ -451,6 +451,7 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::adopt_prefill_row(const SerialSessi
     lease->position=session.next_position-1U;lease->token=token;
     lease->content=i.weights->binding().model_content_identity;
     lease->producer=session.execution_identity;lease->block_begin=last->begin;
+    if(prefix_batch_certification_enabled() && prompt_terminal_digest_enabled()) lease->terminal.capture(raw_fp32_logits_digest(logits));
     lease->predicted=select_greedy_token(logits,i.model->vocab_size);
     // Sampled decoding: the block's last row selects through the sampler, as a final serial row would.
     if(i.sampler) lease->predicted=i.sampler->decide(logits,session.next_position,nullptr).token;
@@ -553,6 +554,7 @@ std::vector<HipMtpTargetHiddenTicket> HipMtpTargetHidden::accept_verified_window
     for(std::uint32_t row=0;row<rows;++row) {
         auto lease=std::make_shared<HipMtpTargetHiddenTicket::Lease>();
         lease->owner=shared_from_this();lease->batch=batch;lease->batch_row=row;
+        if(prompt_terminal_digest_enabled()) lease->terminal.capture(batch->terminal_logits_digest(row));
         lease->position=batch->source_position(row);lease->token=inputs[row];lease->predicted=predictions[row];
         lease->content=batch->target_content_identity();
         HipMtpTargetHiddenTicket ticket;ticket.lease_=std::move(lease);result.push_back(std::move(ticket));
@@ -581,6 +583,7 @@ std::vector<HipMtpTargetHiddenTicket> HipMtpTargetHidden::accept_verified_prefix
             throw std::invalid_argument("MTP prefix row was not an accepted draft");
         auto lease=std::make_shared<HipMtpTargetHiddenTicket::Lease>();
         lease->owner=shared_from_this();lease->batch=batch;lease->batch_row=row;
+        if(prompt_terminal_digest_enabled()) lease->terminal.capture(batch->terminal_logits_digest(row));
         lease->position=batch->source_position(row);lease->token=batch->input_token(row);
         lease->predicted=batch->predicted_token(row);lease->content=batch->target_content_identity();
         lease->prefix_committed=target; // every prefix row's chunk ends at the accepted frontier
@@ -606,6 +609,7 @@ std::vector<HipMtpTargetHiddenTicket> HipMtpTargetHidden::accept_known_rows(
             throw std::invalid_argument("MTP window source positions are not the actual contiguous chunk");
         auto lease=std::make_shared<HipMtpTargetHiddenTicket::Lease>();
         lease->owner=shared_from_this();lease->batch=batch;lease->batch_row=row;
+        if(prompt_terminal_digest_enabled()) lease->terminal.capture(batch->terminal_logits_digest(row));
         lease->position=batch->source_position(row);lease->token=batch->input_token(row);
         lease->predicted=batch->predicted_token(row);lease->content=batch->target_content_identity();
         lease->prefix_committed=target;

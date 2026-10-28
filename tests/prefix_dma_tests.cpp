@@ -60,6 +60,7 @@ extern "C" hipError_t hipStreamWaitEvent(hipStream_t stream,hipEvent_t p,unsigne
 extern "C" const char* hipGetErrorString(hipError_t) { return "injected HIP failure"; }
 
 void async_snapshot_tests();
+void batch_snapshot_tests();
 
 void prefix_dma_tests() {
     using namespace strix;
@@ -69,6 +70,29 @@ void prefix_dma_tests() {
         require(!raw_fp32_logits_digest({}),"missing terminal row fails closed");
         require(raw_fp32_logits_digest(row)==sha256_bytes(std::as_bytes(std::span(row))),
             "terminal digest hashes the full raw FP32 vocabulary row");
+        OutputLogitsChain chain;chain.append(raw_fp32_logits_digest(row));
+        const auto first=chain.digest;chain.append(raw_fp32_logits_digest(row));
+        require(chain.rows==2 && chain.digest!=first,"every output row extends the logits chain");
+        // Ticket snapshots must outlive owner reuse and terminal-stripe overwrite/reset.
+        auto owner_digest=raw_fp32_logits_digest(row);
+        OutputLogitsSnapshot ticket;ticket.capture(owner_digest);
+        const auto saved=ticket.digest;
+        auto stripe=row;stripe[0]=42.0F;
+        owner_digest=raw_fp32_logits_digest(stripe);
+        require(ticket.digest==saved && ticket.digest!=owner_digest,"ticket digest survives stripe reuse");
+        owner_digest.reset();
+        require(ticket.digest==saved,"ticket digest survives owner reset");
+        // A missing row poisons just this request, even if later rows exist.
+        chain.append({});chain.append(saved);
+        require(chain.error && !chain.complete(2) && chain.rows==2,"missing output row fails closed without throwing");
+        OutputLogitsChain other;other.append(ticket.digest);
+        require(other.complete(1),"another request completes after a diagnostic failure");
+        OutputLogitsChain short_chain;short_chain.append(saved);
+        require(!short_chain.complete(2),"missing bonus row fails coverage");
+        set_prefix_batch_certification_enabled(true);
+        require(prefix_batch_certification_enabled(),"resolved policy crosses translation units");
+        set_prefix_batch_certification_enabled(false);
+        require(!prefix_batch_certification_enabled(),"default policy remains off");
         auto changed=row;changed[1]=0.0F;
         require(raw_fp32_logits_digest(changed)!=raw_fp32_logits_digest(row),"terminal digest preserves signed zero bits");
         SerialSessionContext session;
@@ -106,6 +130,39 @@ void prefix_dma_tests() {
         require(prefix_state_cache_identity(in)!=original,"CLI baseline suppression changes the key");
         in.effective_execution=prefix_effective_execution_signature("effective-cli",false,true);
         require(prefix_state_cache_identity(in)!=original,"GSQ suppression changes the key");
+        {
+            SerialSessionStateLayout layout;layout.layout_identity=1;layout.context_tokens=8;
+            SessionStateMemoryBinding memory;memory.layout_identity=1;
+            QwenTiledPlanConfig plan;plan.rows=2;plan.block={2,QwenPlanOutput::terminal};
+            QwenBatchConfig batch;
+            const auto binding=[&](const ModelContentIdentity& sig) {
+                HipPrefixStateCacheSession adapter({},sig,2,2,ModelContract{},layout,memory);
+                adapter.set_plan(plan,8,true,2,batch);
+                return std::pair{adapter.active_identity(),adapter.execution_certificate(2)};
+            };
+            const auto base=binding(signature());
+            for(const char* name : {"STRIX_QSA_UNION_MERGE","STRIX_QSA_SCORE_ROWS64","STRIX_QSA_POOL_PACKED",
+                    "STRIX_QSA_DECODE_POOL","STRIX_QSA_DECODE_SELECT","STRIX_QSA_DECODE_POOL_BF16","STRIX_QSA_DECODE_POOL_CHECK",
+                    "STRIX_CTX_EXACT_MEMORY","STRIX_QSA_SCORE_RING","STRIX_QSA_SCORE_RING_ROWS","STRIX_TERMINAL_LOGITS_ARENA",
+                    "STRIX_QPF2K_DEFAULTS","STRIX_BASELINE","STRIX_QPF2K_QSA_MASK",
+                    "STRIX_PROMPT_BATCH_SHARED","STRIX_BATCH_SERVICE_MS","STRIX_BATCH_SERVICE_LOOKAHEAD",
+                    "STRIX_BATCH_PROMPT_SHARE","STRIX_BATCH_SHORT_FIRST_ROWS","STRIX_BATCH_INTERLEAVE"}) {
+                const char* old=std::getenv(name);
+                const std::optional<std::string> saved=old?std::optional<std::string>{old}:std::nullopt;
+                ::setenv(name,"0",1);const auto off=binding(signature());
+                ::setenv(name,"1",1);const auto on=binding(signature());
+                require(off.first!=on.first && off.second!=on.second,"canonical v4 control binds batch namespace and certificate");
+                if(saved) ::setenv(name,saved->c_str(),1);else ::unsetenv(name);
+            }
+            for(const auto sig : {prefix_effective_execution_signature("changed-cli",false,false),
+                    prefix_effective_execution_signature("effective-cli",true,false),
+                    prefix_effective_execution_signature("effective-cli",false,true),
+                    prefix_effective_execution_signature("effective-cli",false,false,
+                        RotaryIdentity(RotaryDescriptor::yarn(2),original))}) {
+                const auto changed=binding(sig);
+                require(changed.first!=base.first && changed.second!=base.second,"resolved execution and rotary bind batch proof");
+            }
+        }
         in.effective_execution={}; bool refused=false;
         try {(void)prefix_state_cache_identity(in);} catch(const std::invalid_argument&) {refused=true;}
         require(refused,"incomplete pre-v2 prefix identity refused");
@@ -397,6 +454,7 @@ void prefix_dma_tests() {
     }
 
     async_snapshot_tests();
+    batch_snapshot_tests();
 
 }
 
@@ -410,6 +468,7 @@ void async_snapshot_tests() {
     require(fixed_device==116400128U,"production BF16 device fixed geometry");
     require(fixed_device+29952U*2048U==177741824U && fixed_device+29952U*8192U-2304U==361764608U,
         "production selected capture staging bytes");
+    set_prefix_batch_certification_enabled(true);
     snapshot_shim=true;queued=false;drain_error=copy_error=hipSuccess;allocation_failure=false;
     const auto producer=reinterpret_cast<hipStream_t>(2), predictor=reinterpret_cast<hipStream_t>(3);
     const PrefixCaptureOrder ordered{producer,predictor,predictor};
@@ -439,6 +498,7 @@ void async_snapshot_tests() {
         const auto before_waits=waits;
         adapter->set_retention(false);
         require(!adapter->try_prepare_capture(session,tokens,producer,true,ordered) && operations.empty(),"no-store skips before any submission");
+        require(store->counters().snapshot_preparations==0,"no-store does not prepare a snapshot");
         adapter->set_retention(true);
         require(!adapter->try_prepare_capture(session,tokens,producer,false,ordered),"failed target validation skips");
         if(scenario==0) {
@@ -467,6 +527,7 @@ void async_snapshot_tests() {
         if(scenario==7) allocation_failure=true;
         auto d=adapter->try_prepare_capture(session,tokens,producer,true,ordered);
         allocation_failure=false;
+        require(store->counters().snapshot_preparations==1,"retained preparation counted even before failure or insertion");
         if(scenario>=6) {require(!d && store->counters().inserted==0,"pre-submit cap/allocation skip");continue;}
         require(bool(d),"snapshot prepared");
         require(!adapter->try_prepare_capture(session,tokens,producer,true,ordered),"global busy slot skips without wait");
@@ -493,6 +554,16 @@ void async_snapshot_tests() {
         if(scenario==5) {PrefixAsyncCapture::shutdown();require(waits==before_waits+1U,"shutdown explicitly drains");}
         else {pump(d->download);PrefixAsyncCapture::reap();}
         require(!PrefixAsyncCapture::slot,"completed descriptor reaped");
+        require(store->counters().staging_bytes==0 && store->counters().snapshot_preparations==1,"settled capture has no live staging and keeps preparation count");
+        adapter=std::make_unique<HipPrefixStateCacheSession>(store,id,2,2,ModelContract{},layout,memory);
+        adapter->add_rows(reinterpret_cast<std::uintptr_t>(target.data()),1,0);
+        adapter->add_rows(reinterpret_cast<std::uintptr_t>(mtp.data()),1,1);
+        adapter->add_fixed_device(reinterpret_cast<std::uintptr_t>(&fixed),1);
+        adapter->add_fixed_device(reinterpret_cast<std::uintptr_t>(&held),1,"mtp.held");
+        adapter->set_plan(config,8,true); adapter->set_retention(false);
+        require(!adapter->try_prepare_capture(session,tokens,producer,true,ordered) &&
+            store->counters().snapshot_preparations==1 && store->counters().staging_bytes==0,
+            "no-store after a retaining high-water mark starts no preparation");
         require(store->counters().inserted==(scenario<2?1U:0U),"only committed successful DMA published");
         require(waits==before_waits+(scenario==5?1U:0U),"snapshot request path added a wait");
         if(scenario<2) {
@@ -576,4 +647,116 @@ void async_snapshot_tests() {
         PrefixAsyncCapture::slot.reset();operations.clear();drain_error=copy_error=hipSuccess;
     }
     snapshot_shim=false;
+    set_prefix_batch_certification_enabled(false);
+}
+
+// Real adapter + deferred HIP shim: namespace, restore preflight, hook routing and no-wait tripwire.
+void batch_snapshot_tests() {
+    using namespace strix;
+    using namespace strix::decode_cli;
+    snapshot_shim=true;drain_error=copy_error=hipSuccess;allocation_failure=false;
+    const auto id=sha256_bytes(std::as_bytes(std::span("batch-dma",9)));
+    const auto producer=reinterpret_cast<hipStream_t>(2),predictor=reinterpret_cast<hipStream_t>(3),foreign=reinterpret_cast<hipStream_t>(4);
+    for(unsigned scenario=0;scenario<5;++scenario) {
+        operations.clear();
+        auto store=std::make_shared<PrefixStateCache>(PrefixStateCachePolicy{8192,{},0},[](std::uint64_t n) {
+            return PrefixCacheBuffer{std::shared_ptr<std::byte>(new std::byte[n?n:1]{},std::default_delete<std::byte[]>()),n};
+        });
+        SerialSessionStateLayout layout;layout.layout_identity=1;layout.context_tokens=8;
+        SessionStateMemoryBinding memory;memory.layout_identity=1;
+        std::array<std::byte,8> rows{};std::byte fixed{31};
+        HipPrefixStateCacheSession adapter(store,id,2,2,ModelContract{},layout,memory);
+        adapter.add_rows(reinterpret_cast<std::uintptr_t>(rows.data()),1,0);
+        adapter.add_fixed_device(reinterpret_cast<std::uintptr_t>(&fixed),1);
+        QwenTiledPlanConfig config;config.rows=2;config.block={2,QwenPlanOutput::terminal};
+        config.block.execution=1;config.block.kernel=2;
+        QwenBatchConfig batch;batch.groups=false;batch.cohort=false;
+        adapter.set_plan(config,8,true);
+        const auto single=adapter.active_identity();
+        adapter.set_plan(config,8,true,2,batch);
+        const auto identity=adapter.active_identity();
+        require(single!=identity,"batch and single namespaces differ");
+        auto changed=batch;changed.cancel=true;adapter.set_plan(config,8,true,2,changed);
+        require(identity!=adapter.active_identity(),"scheduler settings in batch namespace");
+        for(unsigned field=0;field<6;++field) {
+            auto scheduler=batch;
+            switch(field) {
+                case 0:scheduler.service_ms=5;break;
+                case 1:scheduler.lookahead++;break;
+                case 2:scheduler.prompt_share=0.5;break;
+                case 3:scheduler.short_rows++;break;
+                case 4:scheduler.interleave=!scheduler.interleave;break;
+                default:scheduler.shared="none";break;
+            }
+            adapter.set_plan(config,8,true,2,scheduler);
+            require(adapter.active_identity()!=identity,"resolved scheduler value binds batch namespace");
+        }
+        adapter.set_plan(config,8,true,2,batch);
+        std::uint64_t bridge_frontier=0,slot_frontier=0;
+        adapter.set_restore_hook([&](std::uint64_t p){bridge_frontier=p;});
+        SerialSessionContext session;session.state_layout_identity=1;
+        session.next_position=session.committed_tokens=2;
+        session.arithmetic_lineage=prepare_prefill_chunk_lineage(session.arithmetic_lineage,0,2,1,2,1);
+        const std::vector<std::uint32_t> tokens(8,1);
+        const int tag=0,other_tag=0;
+        adapter.set_retention(false);const auto no_store=store->counters().no_store_skips;
+        require(!adapter.try_prepare_capture(session,tokens,producer,true,{producer,predictor,predictor},7,{},{},&tag) && operations.empty(),"batch no-store prepares nothing");
+        require(store->counters().no_store_skips==no_store+1,"batch no-store counted");
+        adapter.set_retention(true);
+        auto d=adapter.try_prepare_capture(session,tokens,producer,true,{producer,predictor,predictor},7,{},{},&tag);
+        require(bool(d),"batch tagged snapshot prepared");
+        const auto before_waits=waits;
+        PrefixAsyncCapture::before_writer(&other_tag,foreign);
+        require(!d->poisoned,"another slot does not poison the snapshot");
+        if(scenario==0 || scenario==3 || scenario==4) {
+            PrefixAsyncCapture::before_writer(&tag,foreign);
+            // Execute a genuinely foreign overwrite before the target snapshot reads.
+            operations[foreign].push_back([&]{fixed=std::byte{99};return true;});pump(foreign);
+        } else if(scenario==1) PrefixAsyncCapture::before_writer(&tag,producer);
+        pump(producer);
+        if(scenario==2) PrefixAsyncCapture::before_writer(&tag,foreign);
+        d->submit_predictor(predictor);pump(predictor);pump(d->download);
+        d->commit(true);
+        if(scenario==3) d->commit(false);
+        if(scenario==4) {adapter.before_target_reset();d->cancelled=true;d->commit(true);}
+        PrefixAsyncCapture::reap();
+        const bool poisoned=scenario==0 || scenario==3 || scenario==4;
+        require(!PrefixAsyncCapture::slot && store->counters().inserted==(poisoned?0U:1U),"sticky tripwire prevents publication and retires");
+        require(store->counters().capture_skips_tripwire==(poisoned?1U:0U) && waits==before_waits,"tripwire is once-only and never waits");
+        require(store->counters().staging_bytes==0,"tripwire retirement releases staging accounting");
+        if(poisoned) {
+            const auto chain=d->row_chain.lock();
+            require(chain && chain->empty(),"poisoned snapshot cannot publish private row segments");
+            continue;
+        }
+        const auto digests=prefix_cache_block_digests(identity,tokens,2,1);
+        const auto checkpoint=store->find_longest(identity,tokens,2,2);
+        require(checkpoint && checkpoint->producer_certificate==adapter.execution_certificate(2),"batch certificate stored");
+        // Another slot has the same identity but different live storage and predictor runtime.
+        std::array<std::byte,8> other_rows{};std::byte other_fixed{};
+        HipPrefixStateCacheSession other(store,id,2,2,ModelContract{},layout,memory);
+        other.add_rows(reinterpret_cast<std::uintptr_t>(other_rows.data()),1,0);
+        other.add_fixed_device(reinterpret_cast<std::uintptr_t>(&other_fixed),1);
+        other.set_plan(config,8,true,2,batch);
+        other.set_restore_hook([&](std::uint64_t p){bridge_frontier=p;});
+        other.bind_restore_runtime([&](std::uint64_t p){slot_frontier=p;});
+        other.set_retention(false); // no conversation: batch no-store still permits a validated hit
+        SerialSessionContext fresh;fresh.state_layout_identity=1;
+        require(other.begin_request(fresh,tokens)==2 && slot_frontier==2 && bridge_frontier==0 && other_fixed==std::byte{31},"slot-0 runtime hook rebound; cross-slot reuse");
+        require(other.continuation()==qwen_full_t_continuation(config,8,2),"whole-prompt cold cursor installed");
+        // Restore is a zero-write miss during parked service admissions.
+        other.set_plan(config,8,true,2,batch,false);fresh={};fresh.state_layout_identity=1;other_fixed=std::byte{77};
+        const auto pending_ops=operations[reinterpret_cast<hipStream_t>(1)].size();
+        require(other.begin_request(fresh,tokens)==0 && fresh.next_position==0 && other_fixed==std::byte{77} &&
+            operations[reinterpret_cast<hipStream_t>(1)].size()==pending_ops,"service admission miss performs no writes");
+        other.set_plan(config,8,true);fresh={};fresh.state_layout_identity=1;
+        require(other.begin_request(fresh,tokens)==0 && !store->find_segment(prefix_cache_block_digests(single,tokens,2,1)[0]),"single route cannot share batch segments");
+        // Corrupt proof fails before any restore enqueue or mutation.
+        auto corrupt=std::const_pointer_cast<PrefixCacheCheckpoint>(checkpoint);corrupt->producer_certificate[4]^=1;
+        other.set_plan(config,8,true,2,batch);fresh={};fresh.state_layout_identity=1;
+        require(other.begin_request(fresh,tokens)==0 && other_fixed==std::byte{77},"batch corrupt proof is a zero-write miss");
+        require(digests[0]==checkpoint->digest,"cross-slot token namespace stable");
+    }
+    operations.clear();snapshot_shim=false;
+    set_prefix_batch_certification_enabled(false);
 }

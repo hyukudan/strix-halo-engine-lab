@@ -119,6 +119,70 @@ try {
         require(captures==0 && internal==n/t-1U,"default pipeline capture count");
         require(selected==(t==2048U?(n==8192U?2U:8U):(n==8192U?0U:3U)),"default cadence count");
     }
+    require(qwen_batch_staging_cap(0,27648,116380160,2304,20480,8192)==361767424,"staging includes future predictor and held state");
+    require(qwen_batch_staging_cap(123,UINT64_MAX,UINT64_MAX,1,1,8192)==123,"explicit staging cap controls peak");
+    bool overflow=false;
+    try {(void)qwen_batch_staging_cap(0,UINT64_MAX,0,1,0,8192);} catch(const std::overflow_error&) {overflow=true;}
+    require(overflow,"staging reservation fails closed on overflow");
+    // Batch certification never changes the incumbent planner; execution evidence is separate.
+    for(const auto t:{2048U,8192U}) {
+        QwenTiledPlanConfig batch_plan;batch_plan.rows=t;batch_plan.block={t,QwenPlanOutput::terminal};
+        batch_plan.schedule=12;batch_plan.tails={{1024,QwenPlanOutput::terminal},{256,QwenPlanOutput::terminal},
+            {64,QwenPlanOutput::terminal},{16,QwenPlanOutput::terminal}};
+        const std::uint64_t n=3U*t+1192U,p=2U*t;
+        const auto v1=qwen_full_t_certificate(batch_plan,n,p);
+        const auto v2=qwen_full_t_certificate_v2(batch_plan,n,p);
+        require(!v2.empty() && v1!=v2 && v2!=qwen_full_t_certificate_v2(batch_plan,n,p,1),"route/version separation");
+        std::vector<std::uint64_t> stripped{v1[0],v2[2],v2[3]};
+        std::size_t at=4;
+        for(unsigned k=0;k<2;++k,at+=8) {
+            stripped.insert(stripped.end(),v2.begin()+static_cast<std::ptrdiff_t>(at),v2.begin()+static_cast<std::ptrdiff_t>(at+7));
+            require(v2[at+7]==1,"per-unit execution certificate");
+        }
+        stripped.insert(stripped.end(),v2.begin()+static_cast<std::ptrdiff_t>(at),v2.end());
+        require(stripped==v1,"v2 preserves the v1 producer fields");
+        std::vector<QwenUnitExec> trace{{0,t,t,true,true},{t,p,t,true,true}};
+        require(qwen_producer_trace_ok(batch_plan,n,p,trace),"actual solo full-T trace");
+        for(unsigned bit=0;bit<7;++bit) {
+            auto bad=trace;
+            switch(bit) {case 0:bad[0].grouped=true;break;case 1:bad[0].small=true;break;
+                case 2:bad[0].forced=true;break;case 3:bad[0].adopted=true;break;
+                case 4:bad[0].own_owner=false;break;case 5:bad[0].end--;break;default:bad.erase(bad.begin());break;}
+            require(!qwen_producer_trace_ok(batch_plan,n,p,bad),"trace must be observed and complete");
+        }
+        QwenBatchConfig cfg;
+        auto owner=cfg;owner.group_owner=true;
+        for(const bool groups:{false,true}) {
+            owner.groups=groups;owner.group_rows=2U*t;
+            require(!owner.allowed(12) && std::string_view(owner.decline(12))=="group-owner:prompt-batch-rows",
+                "prompt-batch-rows owner declines even when grouping is off and names the input");
+        }
+        for(unsigned mask=0;mask<256;++mask) for(bool partial:{false,true}) for(bool nest:{false,true}) {
+            auto unit=trace.back();auto facts=cfg;
+            unit.grouped=mask&1;unit.small=mask&2;unit.forced=mask&4;unit.adopted=mask&8;
+            unit.own_owner=!(mask&16);facts.group_owner=mask&32;facts.small=mask&64;
+            const auto schedule=12U|((mask&128)?2U:0U);
+            require(qwen_batch_capture_eligible(facts,schedule,unit,t,true,true,partial?128U:t,nest)==
+                (!mask && (!partial || !nest)),"batch eligibility truth table");
+        }
+        require(!qwen_batch_capture_eligible(cfg,12,trace.back(),t,false,true,t,false),"unobserved prefix refused");
+        require(!qwen_batch_capture_eligible(cfg,12,trace.back(),t,true,false,128,false),"foreign next owner refused");
+        // Actual T=8192 nesting hazard; T=2048 has no nested row class.
+        require(qwen_batch_capture_eligible(cfg,12,trace.back(),t,true,true,128,t==8192)==(t!=8192),"partial-next nesting hazard");
+        for(std::uint64_t length=t+1U;length<2U*t+260U;++length)
+            for(bool groups:{false,true}) for(bool cohort:{false,true}) for(bool windows:{false,true}) {
+                cfg.groups=groups;cfg.cohort=cohort;cfg.windows=windows;
+                auto suffix_cursor=qwen_full_t_continuation(batch_plan,length,t);
+                bool expected=bool(suffix_cursor);auto pos=std::uint64_t(t);
+                if(suffix_cursor) while(const auto u=qwen_prompt_next(batch_plan,*suffix_cursor,pos,length,windows)) {
+                    if(u->kind==QwenPlanKind::tail_owner && groups) expected=false;
+                    if(u->kind==QwenPlanKind::window && cohort) expected=false;
+                    pos=u->end;
+                }
+                require(qwen_suffix_solo_class(batch_plan,length,t,cfg,false)==expected,"L0 exhaustive suffix classes");
+                require(!qwen_suffix_solo_class(batch_plan,length,t,cfg,true),"nesting excludes L0");
+            }
+    }
     std::cout<<"planner passed: "<<shapes<<" shapes, "<<units<<" units; certificates and capture eligibility passed\n";
     return 0;
 } catch(const std::exception& e) {std::cerr<<e.what()<<'\n';return 1;}

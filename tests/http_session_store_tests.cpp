@@ -47,6 +47,20 @@ int main(){
             check(stats.find("disk")->find("budget_bytes")->as_int()==5678,"prefix startup disk budget");
             check(stats.find("disk")->find("payload_bytes")->as_int()==7,"prefix startup disk occupancy");
         }
+        {
+            PrefixStateCache prefix({1234,{},0},heap);
+            prefix.record_snapshot_preparation(); prefix.record_snapshot_preparation();
+            prefix.record_staging(512,128,true);
+            set_prefix_batch_certification_enabled(true);
+            StateCacheStatsMirror stats; stats.publish(prefix_snapshot(prefix));
+            auto p=*serve::parse_json(stats.read()).find("engine")->find("state_cache")->find("prefix");
+            check(p.find("snapshot_preparations")->as_int()==2 && p.find("staging_bytes")->as_int()==128,"HTTP stats expose preparations and live staging");
+            prefix.record_staging(512,128,false); stats.publish(prefix_snapshot(prefix));
+            p=*serve::parse_json(stats.read()).find("engine")->find("state_cache")->find("prefix");
+            check(p.find("snapshot_preparations")->as_int()==2 && p.find("staging_bytes")->as_int()==0,"settled HTTP stats retain monotonic count and zero staging");
+            set_prefix_batch_certification_enabled(false);
+            check(!state_cache_json(prefix_snapshot(prefix)).find("prefix")->find("snapshot_preparations"),"default-off stats omit preparation counter");
+        }
         HttpSessionStore store(dir,1U<<20,2,heap,compat);
         StateCacheStatsMirror mirror;
         auto initial=serve::parse_json(store.command("stats","",""));

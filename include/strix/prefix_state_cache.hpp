@@ -130,6 +130,8 @@ struct PrefixStateCacheStats {
     std::uint64_t staging_budget_bytes=0, staging_bytes=0, staging_peak_bytes=0, capture_busy_skips=0, staging_cap_skips=0, row_prefetches=0;
     std::uint64_t capture_skips_cross_stream=0;
     std::array<std::uint64_t,prefix_certificate_decline_names.size()> certificate_declines{};
+    std::uint64_t capture_skips_tripwire=0,capture_skips_batch_config=0;
+    std::uint64_t snapshot_preparations=0;
     double disk_read_ms = 0.0, disk_write_ms = 0.0;
 };
 
@@ -191,10 +193,13 @@ public:
     [[nodiscard]] PrefixStateCacheStats counters();
     void record_no_store_skip();
     void record_capture_failure();
+    void record_snapshot_preparation();
     void record_staging(std::uint64_t cap, std::uint64_t bytes, bool active);
     void record_staging_skip(bool cap);
     void record_cross_stream_skip();
     void record_certificate_decline(const std::string& reason);
+    void record_tripwire_skip();
+    void record_batch_config_skip();
     void record_row_prefetch();
     // Advisory admission only. Use reserve() to hold credits across allocation.
     bool admit_capture(const PrefixCacheCheckpoint&);

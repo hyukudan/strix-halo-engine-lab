@@ -314,6 +314,8 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
             return value ? std::optional<std::string>{value} : std::nullopt;
         };
         const auto home = saved("HOME"), xdg = saved("XDG_CACHE_HOME");
+        const auto batch_cert = saved("STRIX_PREFIX_BATCH_CERT");
+        ::unsetenv("STRIX_PREFIX_BATCH_CERT");
         const auto signature = session_numerical_config("same execution");
         ::setenv("HOME", "storage/home", 1);
         ::setenv("XDG_CACHE_HOME", "storage/cache", 1);
@@ -324,6 +326,60 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
             collected.environment.at("XDG_CACHE_HOME") == "storage/cache", "real collector retains storage inputs");
         expect(resolve(collected,memory).admitted, "YaRN admits real collector with shell storage locations");
         expect(session_numerical_config("same execution") == signature, "storage paths do not change execution signature");
+        for (const auto* value : {"0", "off", "1"}) {
+            ::setenv("STRIX_PREFIX_BATCH_CERT",value,1);
+            collected.environment = requested_prefill_environment();
+            expect(collected.environment.at("STRIX_PREFIX_BATCH_CERT") == value,"real collector retains certification control");
+            expect(resolve(collected,memory).admitted,"YaRN admits operational certification control without cache route");
+            auto cli = collected;
+            cli.options = parse({"decoder","MODEL","1","--rope-yarn","2","--context","524288",
+                "--generate","32","--prefix-batch-cert",std::string_view(value)=="1"?"off":"l0"});
+            apply_prefix_cache_environment(cli.options,[&](const char* name)->std::optional<std::string_view> {
+                const auto it=cli.environment.find(name);
+                return it==cli.environment.end()?std::nullopt:std::optional<std::string_view>{it->second};
+            });
+            expect(cli.options.prefix_batch_cert==(std::string_view(value)=="1"?0U:1U),"CLI certification mode wins real collected environment");
+            expect(resolve(cli,memory).admitted,"YaRN CLI precedence remains admissible");
+            auto forbidden=cli; forbidden.options.mtp.enabled=true;
+            expect(resolve(forbidden,memory).error=="YaRN with MTP not yet qualified","cert control preserves named MTP refusal");
+            forbidden=cli; forbidden.options.http_serve=true;
+            expect(resolve(forbidden,memory).error=="YaRN on HTTP serving not supported","cert control preserves named HTTP refusal");
+            forbidden=cli; forbidden.options.prefix_cache_roundtrip=true;
+            expect(resolve(forbidden,memory).error=="YaRN requires plain serial CLI without cache, replay or recording","cert control preserves named cache refusal");
+        }
+        // A real collected malformed value is ignored only when CLI overrides it.
+        ::unsetenv("STRIX_PREFIX_BATCH_CERT");
+        auto native_options = parse({"decoder","MODEL","1","--generate","32"});
+        ::setenv("STRIX_PREFIX_BATCH_CERT","ON",1);
+        const auto malformed_environment = requested_prefill_environment();
+        expect(malformed_environment.at("STRIX_PREFIX_BATCH_CERT")=="ON","real collector retains malformed certification control");
+        for (const bool yarn : {false,true}) {
+            auto malformed = collected;
+            malformed.environment = malformed_environment;
+            malformed.options = yarn ? collected.options : native_options;
+            const auto run = [&](const RequestedOptions& r) {
+                return resolve_effective_config(r,yarn?model:ModelContract::qwen38_flash_next(),info,manifest,
+                    validated_model_content_identity,{true,true,true},memory);
+            };
+            bool rejected = false;
+            try { (void)run(malformed); }
+            catch (const std::invalid_argument& error) {
+                rejected = std::string_view(error.what())=="prefix batch certification requires 0|1|capture|l0|l1";
+            }
+            expect(rejected,"native and YaRN reject malformed env-only certification with shared parser error");
+            for (const auto* mode : {"off","l0","capture","l1"}) {
+                malformed.options = yarn
+                    ? parse({"decoder","MODEL","1","--rope-yarn","2","--context","524288",
+                        "--generate","32","--prefix-batch-cert",mode})
+                    : parse({"decoder","MODEL","1","--generate","32","--prefix-batch-cert",mode});
+                const auto resolved = run(malformed);
+                const auto expected = std::string_view(mode)=="off"?0U:std::string_view(mode)=="l0"?1U:
+                    std::string_view(mode)=="capture"?2U:3U;
+                expect(resolved.error.empty() && (!yarn || resolved.admitted) && resolved.options.prefix_batch_cert==expected,
+                    "native and YaRN CLI modes override malformed real collected certification environment");
+            }
+        }
+        if(batch_cert) ::setenv("STRIX_PREFIX_BATCH_CERT",batch_cert->c_str(),1); else ::unsetenv("STRIX_PREFIX_BATCH_CERT");
         collected.environment["STRIX_MOCK_UNCOVERED_ROTARY"] = "1";
         expect(resolve(collected,memory).error ==
             "YaRN execution environment not supported: STRIX_MOCK_UNCOVERED_ROTARY",
@@ -1169,9 +1225,9 @@ int main(int argc, char** arguments) {
         resolve_session_defaults(live,model,env,128*gib_bytes);
         expect(live.session_management_requested,"explicit live control qualification remains accessible");
         for (const auto* flag : {"--session-cache", "--session-disk", "--session-dir", "--session-ram-bytes",
-                "--session-disk-bytes", "--session-max-parked", "--session-capture-host-bytes"}) {
+                "--session-disk-bytes", "--session-max-parked", "--session-capture-host-bytes", "--prefix-batch-cert"}) {
             auto parsed=parse({"decoder","MODEL","1",flag,
-                std::string_view(flag)=="--session-cache" || std::string_view(flag)=="--session-disk" ? "off" : "42"});
+                std::string_view(flag)=="--prefix-batch-cert"?"1":std::string_view(flag)=="--session-cache" || std::string_view(flag)=="--session-disk" ? "off" : "42"});
             expect(!parsed.route_owned && !parsed.session_options_requested,"storage policy cannot change numerical route");
             auto incumbent=parse({"decoder","MODEL","1"});
             for (auto* candidate : {&parsed,&incumbent}) {
@@ -1510,6 +1566,71 @@ int main(int argc, char** arguments) {
     expect(effective_config_json(receipt).find("\"prefix_cache\"")==std::string::npos,"baseline receipt omits additive prefix object");
     receipt.options.baseline=false;
     expect(effective_config_json(receipt).find("\"prefix_cache\"")!=std::string::npos,"nonbaseline receipt includes additive prefix object");
+    for(const auto mode:{"0","1","capture","l0","l1"}) {
+        Options batch;
+        apply_prefix_cache_environment(batch,[&](const char* name)->std::optional<std::string_view> {
+            if(std::string_view(name)=="STRIX_PREFIX_BATCH_CERT") return mode;
+            return {};
+        });
+        expect(batch.prefix_batch_cert==(std::string_view(mode)=="0"?0U:std::string_view(mode)=="capture"?2U:std::string_view(mode)=="l1"?3U:1U),"batch certification env parser");
+        batch.baseline=true;
+        apply_prefix_cache_environment(batch,[](const char*)->std::optional<std::string_view>{return {};});
+        expect(!batch.prefix_batch_cert,"baseline suppresses batch certification");
+    }
+    for(const auto* mode:{"off","l0","capture","l1"}) {
+        const auto selected=parse({"decoder","MODEL","1","--prefix-batch-cert",mode});
+        for(const auto* route:{"batch","single","cli","yarn","cache-off","no-budget","live-control"}) {
+            auto caps_options=selected;
+            caps_options.http_serve=true; caps_options.http_batch=2;
+            caps_options.prefix_cache_host_bytes=4096;
+            const std::string_view r=route;
+            if(r=="single") caps_options.http_batch=0;
+            if(r=="cli" || r=="yarn") { caps_options.http_serve=false; caps_options.http_batch=0; }
+            if(r=="yarn") caps_options.rotary=validate_qwen_rotary_request(2,true,524288,false);
+            if(r=="cache-off") caps_options.prefix_cache=false;
+            if(r=="no-budget") caps_options.prefix_cache_host_bytes=0;
+            if(r=="live-control") caps_options.session_live_control=true;
+            auto caps=serve::Json::object(); caps.set("existing",serve::Json("unchanged"));
+            const auto original=caps.dump();
+            prefix_batch_cert_capabilities(caps,caps_options);
+            EffectiveConfig cert_receipt; cert_receipt.options=caps_options;
+            const auto effective=serve::parse_json(effective_config_json(cert_receipt));
+            const auto* prefix=effective.find("prefix_cache");
+            const auto* cert=caps.find("prefix_batch_certification");
+            const bool active=std::string_view(mode)!="off" && r=="batch";
+            if(!active) {
+                expect(caps.dump()==original,"inactive certification capability bytes unchanged");
+                expect(prefix && !prefix->find("batch_cert_mode") && !prefix->find("batch_l1_qualified"),
+                    "inactive routes omit effective certification fields");
+                auto disabled=cert_receipt; disabled.options.prefix_batch_cert=0;
+                expect(effective_config_json(cert_receipt)==effective_config_json(disabled),
+                    "inactive certification effective config bytes unchanged");
+            } else {
+                expect(cert && cert->find("mode")->as_string()==mode,"capabilities disclose canonical batch mode");
+                expect(prefix && prefix->find("batch_cert_mode") && prefix->find("batch_cert_mode")->as_string()==mode,
+                    "effective config and capabilities use identical canonical modes");
+                expect(cert->find("experimental")->as_bool() && !cert->find("l1_qualified")->as_bool() &&
+                    !cert->find("automatic_qualified")->as_bool(),"capabilities retain experimental qualification boundary");
+            }
+            caps_options.baseline=true; caps=serve::Json::object();caps.set("existing",serve::Json("unchanged"));
+            prefix_batch_cert_capabilities(caps,caps_options);
+            expect(caps.dump()==original,"baseline suppresses certification capabilities byte for byte");
+        }
+    }
+    expect(operational_session_option("--prefix-batch-cert"),"batch certification is operational");
+    auto batch_cli=parse({"decoder","MODEL","1","--prefix-batch-cert","l0"});
+    expect(batch_cli.prefix_batch_cert==1,"batch certification CLI parses");
+    const auto captured_env=requested_prefill_environment([](const char* name)->const char* {
+        return std::string_view(name)=="STRIX_PREFIX_BATCH_CERT"?"1":nullptr;
+    });
+    expect(captured_env.contains("STRIX_PREFIX_BATCH_CERT"),"resolver retains batch opt-in environment");
+    apply_prefix_cache_environment(batch_cli,[](const char* name)->std::optional<std::string_view> {
+        if(std::string_view(name)=="STRIX_PREFIX_BATCH_CERT") return "0";
+        return {};
+    });
+    expect(batch_cli.prefix_batch_cert==1,"batch certification CLI wins env");
+    expect(parse({"decoder","MODEL","1","--prefix-batch-cert","1","--baseline"}).prefix_batch_cert==0,"baseline wins batch CLI");
+    for(const auto& row:prefix_batch_cert_route_qualifications) expect(!row.gpu_qualified,"batch L1 remains unqualified");
     std::cout << "qwen effective config: " << failures << " failures\n";
     return failures ? 1 : 0;
 }
