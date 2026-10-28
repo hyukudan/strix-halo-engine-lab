@@ -6,6 +6,7 @@
 // order sum, Gemma norm, router top-4), so the residual is bit-identical on both ranks. Weights are loaded once and stay
 // resident (O_DIRECT reads through one pinned staging buffer).
 #include "strix/dist/communicator.hpp"
+#include "strix/minimax/prefill_types.hpp"
 
 #include <array>
 #include <cstddef>
@@ -42,12 +43,6 @@ struct LoadReport {
     bool direct_io = false;
 };
 
-// One decode row: a sequence slot, the token at `pos`, and its position.
-struct Row {
-    std::uint32_t slot = 0, token = 0;
-    std::uint64_t pos = 0;
-};
-
 // Per-phase times (seconds, synchronised) when STRIX_MM_PROFILE=1; zero otherwise.
 struct Profile {
     double embed = 0, attn_proj = 0, msa = 0, o_proj = 0, exchange = 0, ffn = 0, route_host = 0, head = 0;
@@ -71,6 +66,7 @@ struct StepTrace {
 
 class Engine {
 public:
+    using PrefillTapSink = std::function<void(const float* taps, std::size_t n, std::uint32_t slot, std::uint64_t pos0)>;
     Engine(Options options, dist::Communicator& comm);
     ~Engine();
     Engine(const Engine&) = delete;
@@ -84,14 +80,39 @@ public:
     // each row sees the rows before it, exactly as if they had been decoded one by one). Returns each row's greedy token.
     std::vector<std::uint32_t> step(std::span<const Row> rows);
     // Resumable prefill (serve scheduler, qualification notes): prefill()'s chunks / groups paused between two layers.
-    // begin opens it (one at a time); resume runs at most `layers` (>= 1) more layers and returns true with *next = the
+    // begin opens it (one active plus one explicitly parked parent); resume runs at most `layers` (>= 1) more layers and returns true with *next = the
     // greedy token once complete. The slot's caches and the token are bit-identical to prefill() (the same kernel calls,
     // rows and arguments); step() of OTHER slots may run between two resumes, on both ranks in the same order. cancel
     // abandons it (the slot's caches are then partial). While open: no prefill / gate / copy_slot / state rows / set_taps.
     void prefill_begin(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0);
     bool prefill_resume(unsigned layers, std::uint32_t* next);
     void prefill_cancel();
+    using PfTaskId = std::uint64_t;
+    using PfProgress = strix::minimax::engine::PfProgress;
+    struct PfResult {
+        PfTaskId id = 0;
+        std::uint64_t offset = 0, rows = 0;
+        std::uint32_t bank = 0, member = 0, next = 0;
+    };
+    [[nodiscard]] PfResult prefill_result() const;  // transient; invalidated by a bank switch
+    // Startup-only reservation, after the optional drafter. Returns the both-rank capacity.
+    bool reserve_nested(bool taps);
+    // Qualification-only read-only boundary digest of every live group activation and valid tap row.
+    std::uint64_t prefill_activation_fnv(PfTaskId id);
+    void set_prefill_check_outputs(bool on);
+    [[nodiscard]] std::uint64_t prefill_check_output_fnv() const;
+    [[nodiscard]] unsigned nested_rows() const;
+    [[nodiscard]] const char* nested_reason() const;
+    [[nodiscard]] PfProgress prefill_progress(bool parked = false) const;
+    void prefill_begin_task(PfTaskId id, PfTaskId parent, std::uint64_t generation,
+                            std::uint32_t slot, std::span<const std::uint32_t> tokens, PrefillTapSink sink);
+    void prefill_park(PfTaskId id);
+    void prefill_resume_parked(PfTaskId id);
+    void prefill_cancel(PfTaskId id);
+    [[nodiscard]] bool prefill_active() const;
+
     [[nodiscard]] bool prefill_open() const;
+    [[nodiscard]] const char* prefill_unlimited_reason() const;  // empty, profiling or fp32_prefill
     [[nodiscard]] unsigned prefill_layer() const;           // next layer of the open chunk / group (0: at a chunk boundary)
     [[nodiscard]] std::uint64_t prefill_unit_rows() const;  // rows of the open chunk / group (0: none open)
     [[nodiscard]] std::uint64_t prefill_rows_left() const;  // rows from the open chunk / group to the end (0: none open)
@@ -109,6 +130,7 @@ public:
     [[nodiscard]] std::vector<float> last_logits(std::size_t rows) const;
     // Control channel: `bytes` (1..65536) of host memory sent, the peer's `bytes` received (both ranks, same size).
     void exchange_bytes(const void* out, void* in, std::size_t bytes);
+    void abort(const std::string& reason);
     // Data channel for device buffers of any size (both ranks, same size): `local` (ordered after its producer on
     // `stream`) to the peer, the peer's bytes into `remote` (enqueued on `stream`). One control-tagged comm.exchange.
     void exchange_device(const void* local, void* remote, std::size_t bytes, void* stream);
@@ -132,7 +154,6 @@ public:
     // The taps of the last step() (device, valid until the next call).
     [[nodiscard]] const float* last_taps() const;
     // Called after every prefill chunk with its taps (device), slot and first position; empty = none.
-    using PrefillTapSink = std::function<void(const float* taps, std::size_t n, std::uint32_t slot, std::uint64_t pos0)>;
     void set_prefill_tap_sink(PrefillTapSink sink);
     // Device pointer of the replicated BF16 embedding row of `token`.
     [[nodiscard]] const std::uint16_t* embed_row(std::uint32_t token) const;

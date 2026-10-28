@@ -54,11 +54,18 @@ struct RequestExtra {
     std::uint64_t units = 0, cycles = 0, drafted = 0, accepted = 0;
     std::uint64_t ids_fnv = 0, prompt_fnv = 0;
     bool context = false;
+    std::string sched = "off", fallback_reason;
+    double service_ms = 0;
+    unsigned max_unit_layers = 0;
+    bool short_first = false;
+    bool nested = false;
+    std::uint64_t task_id = 0, parent_request = 0, nest_count = 0;
+    double park_wall_ms = 0, nest_service_ms = 0, nest_switch_ms = 0;
 };
 
 // The reply's "timings" object (non-stream reply and a stream's final chunk), keys in this order: queue_ms,
 // prefill_ms, decode_ms, decode_tok_s ((tokens - 1) / decode s), completion_tokens, ttft_ms, max_gap_ms, stall_ms,
-// prefill_units, cycles, drafted, accepted, ids_fnv, prompt_fnv (16 hex), sampling.
+// prefill_units, cycles, drafted, accepted, ids_fnv, prompt_fnv (16 hex), scheduler policy fields, sampling.
 [[nodiscard]] strix::serve::Json reply_timings(const strix::serve::GenerationStats& stats, const RequestExtra& extra);
 
 struct MinimaxApiOptions {

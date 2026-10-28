@@ -82,6 +82,19 @@ sv::Json reply_timings(const sv::GenerationStats& st, const RequestExtra& x) {
     timings.set("accepted", sv::Json(static_cast<std::int64_t>(x.accepted)));
     timings.set("ids_fnv", sv::Json(hex(x.ids_fnv)));
     timings.set("prompt_fnv", sv::Json(hex(x.prompt_fnv)));
+    timings.set("sched", sv::Json(x.sched));
+    timings.set("effective_sched", sv::Json(x.fallback_reason.empty() ? x.sched : x.fallback_reason == "sched_off" ? "off" : "unlimited"));
+    timings.set("service_ms", sv::Json(x.service_ms));
+    timings.set("max_unit_layers", sv::Json(static_cast<std::int64_t>(x.max_unit_layers)));
+    timings.set("task_id", sv::Json(static_cast<std::int64_t>(x.task_id)));
+    timings.set("nested", sv::Json(std::int64_t{x.nested ? 1 : 0}));
+    timings.set("parent_request", sv::Json(static_cast<std::int64_t>(x.parent_request)));
+    timings.set("nest_count", sv::Json(static_cast<std::int64_t>(x.nest_count)));
+    timings.set("nest_service_ms", sv::Json(x.nest_service_ms));
+    timings.set("nest_switch_ms", sv::Json(x.nest_switch_ms));
+    timings.set("park_wall_ms", sv::Json(x.park_wall_ms));
+    timings.set("short_first", sv::Json(x.short_first));
+    timings.set("fallback_reason", sv::Json(x.fallback_reason));
     timings.set("sampling", sv::Json("greedy"));
     return timings;
 }

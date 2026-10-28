@@ -490,6 +490,139 @@ same facts it already holds on the host; it adds no device synchronization.
 The MiniMax TP2 server (rank 0 serves HTTP; rank 1 replays the control blocks) has its own API module,
 `src/minimax/serve/minimax_api.*`, with the same routes plus:
 
+The resolver defaults to `STRIX_MM_SERVE_SCHED=interleave`, `STRIX_MM_SERVE_SERVICE_MS=250`
+and `STRIX_MM_SERVE_SHORT_FIRST=1`. GPU exactness and HTTP load measurements for this branch appear below
+`STRIX_MM_SERVE_SCHED=off` restores whole-prefill scheduling and FIFO admission;
+`STRIX_MM_BASELINE=1` also selects that path unless explicitly overridden.
+
+Serve preflight validates `STRIX_MM_SERVE_SCHED`, `STRIX_MM_SERVE_SERVICE_MS`,
+`STRIX_MM_SERVE_GAP_MS`, `STRIX_MM_SERVE_SHORT_FIRST` and `STRIX_MM_SERVE_NEST` on both ranks,
+before transport creation, device work or model loading, including inspection-only invocations.
+Scheduler values are `off`/`0` or `interleave`/`1`; short-first and nest accept only `0` or `1`.
+Service accepts finite milliseconds from 0 through UINT_MAX; gap accepts 1 through UINT_MAX.
+Invalid values exit with a named configuration error. `--print-effective-config` includes resolved
+`serve.sched`, `serve.service_ms`, `serve.gap_ms`, `serve.short_first` and `serve.nest` values;
+100-ms and 1500-ms deadlines have distinct configuration output. This validation is scoped to serve.
+
+Start both ranks with the same serve policy environment. A value rejected on one rank exits that rank
+before transport creation; the peer then fails after its transport timeout (default 300 s).
+
+Deadline-based admission and layer budgeting passed both-rank GPU exactness checks and were
+measured under HTTP load together with nested admission; results and open costs appear below.
+
+Before opening a selected fresh prompt, rank 0 checks elapsed time since the oldest decoder's last token plus
+predicted prefill, the next complete decode cycle including the candidate row, and a 20 ms control margin.
+The sum must fit the **minimum gap target over all live requests** (`STRIX_MM_SERVE_GAP_MS`, default 1500).
+Whole prefills can run consecutively only while this deadline permits them. Otherwise rank 0 decodes immediately;
+it never waits for more arrivals to enlarge a batch. A selected candidate is reserved until admission or cancellation;
+its queue timing includes that reservation. Long candidates that cannot fit even after a cycle open as bounded tasks.
+
+With decoders waiting, layer units spend their actual remaining gap budget, capped at 1300 ms, less elapsed wait,
+the next full cycle and the control margin. The service target does not cap these units or override a depleted gap.
+Predictions use the greater of the layer EMA and the last eight unit samples' layer-cost upper bound in the
+same row bucket (scaled up for more rows, never down), plus the fixed-cost estimate. Complete cycle safety estimates survive policy epochs; cycle samples
+include selection, drafting, verification, emission and the counter tail. Unmeasured cycle row counts use a scaled
+estimate. These are conservative predictions, not proven bounds on future GPU or transport costs.
+
+When idle, unit size uses the service target (250 ms by default) to inspect arrivals and cancellations at boundaries.
+Only a fresh idle prompt predicted within that target runs whole. Service 0 makes idle resumes unlimited; with
+waiting decoders it still subtracts elapsed time, the next cycle and margin from the gap. Zero layers means decode
+first. If one indivisible layer still cannot fit just after decoding, the scheduler explicitly forces one layer to
+make progress; idle units likewise force one layer if the service target is too small. Such overruns are unavoidable
+without changing the numerical unit. Gap values must be finite and at least 1; service values must be finite,
+nonnegative and nonoverflowing. Profiling and FP32 prefill retain forced whole-prefill resumes and report
+`profiling` or `fp32_prefill`; these modes cannot enforce decoder gaps.
+
+All prefill row counts, chunk/group sizes, GEMM/split identities and reductions remain unchanged. Only whole-layer
+pause boundaries and admission order change. Prefill cache pointer tables are reused for the same slot and immutable
+layout across decode cycles; decode uses a separate table. A slot change retains the existing table copy and host
+lifetime synchronization. Transport and CRC counters remain global across pauses and bank switches.
+
+`STRIX_MM_SERVE_TIMELINE=1` enables rank-0 JSON lines (`event=mmserve-timeline`), default off and read once at startup.
+Records cover `admit`, `unit`, `step`, `idle` and `heartbeat`, with monotonic operation ID, epoch, steady-clock
+`t_start_us`/`t_end_us` since scheduler start, rows, slot/request/position/token-index summaries, prefill chunk members,
+layer range, completion age/slack and `whole`/`defer`/`deadline` reason. Admission records describe prefill begin separately from
+unit completion; unit host-return time is not necessarily completed GPU time. `control_end_us` and `run_end_us`
+mark control/setup completion and runner return (both default to operation end when inapplicable). Step intervals cover selection through
+emission/counter tail. Records add no device synchronization and contain no prompt text. Up to 65536 records buffer
+until idle or shutdown, with excess counted by `mmserve-timeline-drops`; flushing is outside active operations.
+The disabled path constructs no records and performs no instrumentation clock reads or allocations.
+
+Short-first chooses the smallest remaining queued prompt, with arrival-order ties and at most eight later
+admissions overtaking any request. `STRIX_MM_SERVE_SHORT_FIRST=0` selects FIFO. `STRIX_MM_SERVE_NEST=1` (default ON) also permits one short prompt to nest at a returned long-prefill
+layer boundary. `STRIX_MM_SERVE_NEST=0` or the strict boolean `/admin/sched` field `nest=false` disables new children.
+Nested admission passed both-rank GPU exactness checks for bounded 512-token and whole 511-token children;
+the mixed-load measurements below include nested admission. No slot-capacity expansion is performed.
+A child keeps its original one-chunk shape, with 1..min(512,max_rows) rows and a different reserved slot.
+Its separate activation bank retains the long's entire original group in place; scratch is reused sequentially.
+Parking retires GPU work, restores any eight-row decode save into the parent bank and preserves its task/sink/timeline.
+Unparking retires child work, rebinds the cache table and parent metadata, then takes a fresh eight-row save.
+Transport sequences, CRC state and workspace ring cursors never roll back.
+
+Rank 0 admits a whole child only if predicted prefill plus park/check/unpark, elapsed decoder wait, the next full cycle
+including the child and at least 20 ms host margin fit the minimum live gap (capped at 1300 ms). Without decoders,
+child service still must fit that budget. The measured switch estimate includes CHECK, control/setup and
+first-token publication: elapsed nesting time minus child engine service counted exactly once. Cold estimates can defer admission. There is one nesting level, at most two
+children per parent (including cancellations), and a completed parent unit between children. Cumulative nested wall
+service is limited to two gap budgets. Queue aging still vetoes bypass of an ineligible aged request.
+**Parent units retain the deadline policy's gap-budget sizing; there is no additional 250 ms arrival polling cap.** An arrival can
+wait one long unit (predicted up to roughly 1.3 s), then its own service and control overhead. These are predictions,
+not hard latency bounds. Unlimited profiling/FP32 prefill and optional prefill exchange are excluded.
+
+Both ranks reserve the child bank before READY, after the optional drafter, with at least eight physical decode rows,
+independent timeline events and optional taps. Reservation requires 4 GiB device and OS available-memory headroom;
+a failure on either rank disables effective nesting with a reason. Banks stay reserved when policy is OFF.
+Startup policy and `/admin/sched` report requested/effective `nest`, reason, rows, bank/tap bytes, quota, active/parked
+IDs and a static runtime qualification label. Per-request timings and policy receipts identify nested requests and their parents.
+Structured `mmserve-req` receipts include `task_id`, `parent_task_id`, `nest_count`, `park_wall_ms`,
+`nest_service_ms` and `nest_switch_ms`, including partial parked totals when a parent is cancelled. IDs are assigned even with tracing OFF. The versioned control blocks
+carry explicit task IDs, parent IDs, slot generations and both task checkpoints. Rank 1 replays them verbatim; replies
+acknowledge prior completion, and CHECK precedes child publication. Either task can be cancelled by ID at a returned
+boundary, with GPU retirement before slot release. Global tap changes wait for both tasks to close.
+Cancellation cleanup in each queue take is limited to the entries present at its first selection; new arrivals
+participate in the next take. Cancelled entries take precedence within that batch.
+Cancelled interleaved decoders retire before a decode cycle. Rank 0 alone chooses admissions, budgets and cancellation;
+rank 1 replays its control blocks without local timing or selection decisions.
+
+Startup policy output, `/admin/sched` (with `--admin`) and reply `timings` include `sched`, `effective_sched`,
+`service_ms`, `short_first`, `max_unit_layers` and `fallback_reason`. `max_unit_layers` is the largest requested
+resume budget seen so far (per request in timings, since reset in policy); 4294967295 denotes unlimited,
+including a forced-unlimited numerical mode. Each request keeps its admission-time scheduling mode, service target
+and gap target through completion, including all open-prefill resumes. Its `short_first` records the admission
+selection policy. Runtime changes to these settings apply to later admissions; reply timings report the policy
+that request executed. DSpark controls remain runtime switchable. The runtime qualification label is static
+and does not encode the measurements below.
+
+`--resume-check PROMPT.u32:1/7/60 --resume-check-tokens 256 --check-only` runs on both ranks before serving.
+It requires at least three slots and capacity for the prompt plus the complete requested continuation.
+It compares complete token-ID vectors, final committed-state and continuation-logit digests, and prompt output rows,
+including idle bounded resumes and a two-prompt short-first reorder. With a drafter loaded, only the legacy
+long request with a prompt of at most 4096 tokens fills `Result::draft`; legacy background requests and
+reorder/nested arms compare zero-initialized draft arrays. Either rank's
+mismatch fails both. Run ordinary, grouped/tail and drafter variants with the same model and numerical settings.
+Only `--resume-check-nested` selects the extended gate. It additionally runs a long parked at every supplied
+layer in 1..59, a short child (whole by default), and the resumed long, beside an existing background decoder. For example, on both ranks:
+
+```sh
+strix-minimax-serve MODEL_DIR --rank R --slots 3 --capacity 8256 --resume-check LONG4608.u32:1/3/7/17/31/45/59 --resume-check-nested SHORT512.u32 --resume-check-tokens 128 --check-only
+```
+
+The entire explicit short fixture must contain complete u32 tokens, 1..min(512, max_rows) original rows,
+and leave capacity for the continuation. Missing, empty, partial-token and oversized fixtures fail; no input is truncated.
+Run boundary fixtures of 511 and 512 rows, and require a 513-row fixture to fail. Without the nested option,
+only the unchanged legacy cases run, including `:60`-only, small-row structural and unlimited fallback checks.
+Add `--resume-check-child-layers 7` (1..59) and at least 128 continuation tokens to exercise repeated bank-1
+save/restore with background decode between child units. Explicit unsupported nested requests fail. New independent
+standalone B1 oracles cover all three requests, all prompt output rows (including earlier groups), the first head
+logits, every continuation logit and the final committed K/V/index-key bytes via exact-byte digests. The nested arm
+uses real task-addressed control blocks for begin/park/nest/unit/CHECK/unpark, runs both with and without a background
+decode before parking, checks the entire frozen parent activation group and valid taps, and compares subsequent
+mixed decode layouts with the B1 oracles. Either rank's mismatch fails both; an unavailable bank or unlimited fallback
+fails rather than silently skipping nesting. The measured GPU cases below passed. Digests are compact byte-equality
+oracles, subject to hash collisions. Broader shape, cancellation/protocol adversarial, DSpark and memory/performance
+gates remain required beyond these measured cases. The gate itself does not establish HTTP arrival latency,
+cancellation latency or mixed-load performance; HTTP load measurements are reported separately below.
+
 - `GET /api/status[?detail=1]`: `"schema": "strix-serve-status-v1"`, `"engine": "strix-minimax-serve"`, state,
   queue, lifetime totals (from the engine queue: requests, prompt, cached, imported, computed and generated
   tokens, busy seconds), slots, the process `instance` (`id`: random 16 hex chosen once at start; `start_time` and
@@ -538,6 +671,64 @@ The MiniMax TP2 server (rank 0 serves HTTP; rank 1 replays the control blocks) h
   stream event order, engine errors, failed stream start, client disconnect, queue refusal, arming during a
   request, the scheduler's timings, extras, `mm_*` lines and `/admin/sched` hooks). `tools/minimax/serve_observe_check.py` checks a live server and writes the token-identity and
   overhead receipt across unarmed and armed sets.
+
+### Measured deadline-based and nested serving policy
+
+Measured on GPU with two Strix Halo nodes over 2x USB4 Gen3, PerfOpt kernel, MiniMax M3.1 Flash
+EXL3 3.06 bpw TP2, using binaries of this branch. All comparisons below are policy ON vs OFF.
+Two runs on this code, run 1 and run 2, show run-to-run spread; paired run values below are in that order.
+
+Every `--resume-check` arm compares complete fixed-length token IDs, committed state, a digest of
+all normalized prompt output rows (every chunk and grouped member), and logits of the first generated
+token and every continuation token, for every compared request on both ranks. Legacy idle and
+beside-decoder arms compare the long prompt and both background requests against the whole-prefill
+oracle. With a drafter loaded, only the legacy long request with a prompt of at most 4096 tokens fills
+`Result::draft`; legacy background requests and reorder/nested arms compare zero-initialized draft arrays.
+Short-first reorder compares both requests
+against FIFO standalone execution. Nested arms compare parent, child and background requests against
+standalone B1 execution, and check parked activation/checkpoint preservation. Either rank's mismatch
+fails both ranks. The legacy, reorder and nested arms use the same prompt-output/first-head capture.
+
+The recorded GPU runs below used complete 128-token continuations. The extended legacy/reorder
+output and first-head coverage requires GPU requalification after this change:
+
+| Cases | Result on both ranks |
+|---|---|
+| Legacy: 1K prompt at 1/7/60-layer units idle and beside decoders, short-first reorder, 4608-token prompt | 11/11 IDENTICAL |
+| Nested: 512-token short in 7-layer child units, 4608-token long parked at layers 7 and 31, beside a decoder | 10/10 IDENTICAL |
+| Nested: whole 511-token short, long parked at layer 17 | 6/6 IDENTICAL |
+
+Under HTTP load, every request's token IDs were identical with the policy ON and OFF.
+
+Distinct-prompt bursts used eight different questions, generating 64 tokens each:
+
+| Clients | Aggregate tok/s, ON (run 1 / run 2) | Aggregate tok/s, OFF (run 1 / run 2) | Change ON vs OFF |
+|---|---|---|---|
+| 4 | 28.1 / 29.2 | 30.0 / 31.1 | -6 % / -6 % |
+| 8 | 31.5 / 32.7 | 32.3 / 35.8 | -2.6 % / -8.7 % |
+
+Median TTFT was within 0.1 s of OFF. At 8 clients, the worst inter-token gap was
+1.19 / 1.11 s ON vs 7.49 / 6.79 s OFF. The OFF arm itself varied from 32.3 to 35.8 tok/s
+between runs at 8 clients.
+
+Mixed load started three decoding streams, then a 4539-token prompt, with short prompts arriving 1 s
+and 3 s later:
+
+| Metric | ON (run 1 / run 2) | OFF (run 1 / run 2) |
+|---|---|---|
+| First short prompt TTFT (s) | 1.19 / 1.03 | 14.2 / 13.4 |
+| Second short prompt TTFT (s) | 1.25 / 2.06 | 13.2 / 12.5 |
+| Long prompt TTFT (s) | 16.9 / 16.0 | 14.1 / 13.4 |
+| Decoders' p90 / max chunk gap (ms), run 1 | 65 / 1145 | 53 / 17248 |
+| Decoders' p90 / max chunk gap (ms), run 2 | 60 / 1240 | 51 / 16556 |
+
+The second short prompt is admitted as a nested prefill at a layer boundary of the long prompt.
+The open costs are burst aggregate throughput a few percent below OFF (up to 8.7 % in these runs)
+and the long prompt's TTFT about +20 % in mixed load (+20 % / +19 %). Optimization continues on
+decode MoE cost for diverse rows and long-prompt unit sizing, without promised numbers.
+
+Caveat: identical-prompt bursts overstate the OFF arm because identical lockstep rows share MoE experts.
+Use the distinct-prompt results above to assess burst performance.
 
 ## Tokenizer and chat template
 

@@ -142,7 +142,12 @@ constexpr std::uint32_t kImported = 8192, kResumed = 4096;
 
 void lead_like(sv::GenerationQueue& queue, const std::shared_ptr<const sv::BpeTokenizer>& tok) {
     const std::uint32_t im_end = tok->find("<|im_end|>");
-    while (auto taken = queue.take(true)) {
+    for (;;) {
+        auto taken = queue.take(true);
+        if (!taken) {
+            if (queue.stopping()) break;
+            continue;  // a cancellation-only batch returns control without shutting down
+        }
         const auto& prompt = taken->job.prompt;
         // the scenario: the first byte of the user content (the rendered prompt starts with the template's tokens)
         char kind = 'N';

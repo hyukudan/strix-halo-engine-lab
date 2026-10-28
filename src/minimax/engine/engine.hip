@@ -495,6 +495,7 @@ struct Engine::Impl {
     bool pf_attend4 = true;  // STRIX_MM_PF_ATTEND4 (default ON, exact measurement): prefill windows use v4, two heads per wave
     std::uint16_t** pf_tab_h = nullptr;  // prefill: [layer][3] cache pointers of the call's slot
     std::uint16_t** pf_tab_d = nullptr;
+    std::uint32_t pf_tab_slot = ~0U;  // immutable cache allocation/layout; decode has its own table
     bool linears_loaded = true;  // STRIX_MM_LINEARS (load time; default on; =off: no raw copies, =load: loaded but off)
     bool linears_opt = true;     // decode linears on enqueue_linears (runtime switch once loaded)
     void* lin_ws = nullptr;
@@ -535,6 +536,7 @@ struct Engine::Impl {
     ~Impl() {
         (void)hipDeviceSynchronize();
         moe::opt::cleanup_prefill_table_ring();
+        for (auto* ptr : {nest_bank.h, nest_bank.hn, nest_bank.taps}) if (ptr) (void)hipFree(ptr);
         for (auto* events : {&idx_fork, &idx_join, &pf_idx_fork, &pf_idx_join, &pf_idx_fork_device, &pf_idx_join_device, &tev})
             for (hipEvent_t ev : *events)
                 if (ev != nullptr) (void)hipEventDestroy(ev);
@@ -954,9 +956,9 @@ struct Engine::Impl {
     // Lib::mm's workspace for every distinct linear shape (outputs, inputs, bits) at every row count a call can have
     // (1..max_rows; the head up to G4's gather chunk), queried on the real activation buffers (review finding: the first
     // long prompt after start-up no longer synchronises the device to free / allocate a larger workspace).
-    void reserve_workspace() {
+    void reserve_workspace(unsigned bound_rows = 0) {
         const auto t0 = Clock::now();
-        const std::uint64_t T = opt.max_rows;
+        const std::uint64_t T = bound_rows == 0 ? opt.max_rows : bound_rows;
         const auto in_of = [&](std::uint64_t cols) -> float* {
             return cols == kHidden ? hn : cols == kQLocal ? attn : cols <= kDenseLocal ? big1 : nullptr;
         };
@@ -986,7 +988,9 @@ struct Engine::Impl {
             for (const Mlp& e : y.experts) add_mlp(e);
         }
         add(head, hn, logits, std::min<std::uint64_t>(T, std::max<std::size_t>(kGatherRows, kMaxStepRows)));
-        lib.reserve_workspace(most);
+        if (bound_rows != 0 && most > lib.workspace_bytes())
+            throw std::runtime_error("nested bank needs a larger matmul workspace");
+        lib.reserve_workspace(std::max(lib.workspace_bytes(), most));
         std::printf("rank %u: matmul workspace reserved %.1f MiB (%zu linear shapes x 1..%llu rows, %.0f ms)\n", opt.rank,
                     static_cast<double>(most) / 1048576.0, shapes, static_cast<unsigned long long>(T),
                     std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
@@ -1260,8 +1264,9 @@ struct Engine::Impl {
 
     // h (n rows) already holds the embeddings. `rows` describes each row's slot / position (decode), or is empty for a
     // contiguous chunk of `slot` at positions [pos0, pos0 + n).
-    // The slot's cache pointers for the fused prefill windows (one table per call).
+    // Cache the slot's pointers across resumes. Positions/rows do not affect this table.
     void prefill_table(std::uint32_t slot) {
+        if (pf_tab_slot == slot) return;
         for (unsigned L = 0; L < kLayers; ++L) {
             pf_tab_h[L * 3 + 0] = kc + cache_off(slot, L, kKVLocal);
             pf_tab_h[L * 3 + 1] = vc + cache_off(slot, L, kKVLocal);
@@ -1269,6 +1274,7 @@ struct Engine::Impl {
         }
         hip_ok(hipMemcpyAsync(pf_tab_d, pf_tab_h, std::size_t{kLayers} * 3 * sizeof(void*), hipMemcpyHostToDevice, nullptr), "prefill table");
         hip_ok(hipStreamSynchronize(nullptr), "prefill table");
+        pf_tab_slot = slot;
     }
 
     void layers_forward(std::size_t n, std::span<const Row> rows, std::uint32_t slot, std::uint64_t pos0, unsigned n_layers) {
@@ -1717,17 +1723,32 @@ struct Engine::Impl {
         std::uint64_t pos0 = 0;
         std::size_t c0 = 0, c = 0, chunks = 0, m = 1, rows = 0;  // next chunk's first row / index; the open unit's members, rows
         unsigned layer = 0;                                      // next layer of the open chunk / group (0: not started)
-    } task;
+        std::uint64_t output_fnv = 14695981039346656037ULL;
+        Engine::PfTaskId id = 0, parent = 0;
+        std::uint64_t generation = 0;
+    } task, parked;
+    struct ActivationBank { float *h = nullptr, *hn = nullptr, *taps = nullptr; } base_bank, nest_bank;
+    bool child_bank = false;
+    unsigned nest_rows = 0;
+    std::string nest_reason = "not_reserved";
+    Engine::PrefillTapSink parked_sink;
+    std::unique_ptr<PrefillTimeline> child_timeline;
+
+    bool check_prompt_outputs = false;
     float *sav_h = nullptr, *sav_hn = nullptr, *sav_taps = nullptr;  // rows [0, kMaxStepRows) of h, hn, taps
 
-    void no_task(const char* what) const {
-        if (task.open) throw std::logic_error(std::string(what) + ": a resumable prefill is open");
+    void no_task(const char* what) {
+        if (task.open || parked.open) throw std::logic_error(std::string(what) + ": a resumable prefill is open");
+        // A completed orphan child keeps its result bank until the next operation consumes that lifetime.
+        if (child_bank) { retire_prefill(); bind_bank(false); }
     }
 
     void prefill_begin(std::uint32_t slot, std::span<const std::uint32_t> toks, std::uint64_t pos0) {
-        no_task("prefill");
+        if (task.open) throw std::logic_error("prefill: active task");
         if (slot >= opt.slots || toks.empty() || pos0 + toks.size() > opt.capacity) throw std::invalid_argument("prefill: bad slot / range");
         task = PfTask{};
+        last_out = {};
+        last_result = {};
         task.slot = slot;
         task.toks.assign(toks.begin(), toks.end());
         task.pos0 = pos0;
@@ -1737,7 +1758,7 @@ struct Engine::Impl {
         task.m = task.grouped ? std::min<std::size_t>(pf_group, task.chunks) : 1;  // the first unit (as prefill_resume sets it)
         task.rows = route::unit_rows(task.m, opt.max_rows, toks.size());
         task.open = true;
-        if (timeline) timeline->begin();
+        if (auto* t = child_bank ? child_timeline.get() : timeline.get()) t->begin();
     }
 
     // Runs at most `layers` more layers of the open prefill (a chunk's tap sink and the head run in the unit of its last
@@ -1747,7 +1768,7 @@ struct Engine::Impl {
         if (budget == 0) throw std::invalid_argument("prefill_resume: 0 layers");
         if (profiling || fp32_prefill) budget = ~0U;  // synchronised laps / the FP32 job ring: one resume runs it all
         gemv = false;
-        tl = timeline.get();
+        tl = child_bank ? child_timeline.get() : timeline.get();
         // The prefill module carries this call's layer exchanges; it is drained before the head's argmax exchange
         // (communicator, same transport), at a pause and on every exit.
         struct Active {
@@ -1784,6 +1805,11 @@ struct Engine::Impl {
                         task.layer = L1;
                         continue;
                     }
+                    if (check_prompt_outputs) {
+                        for (std::size_t member = 0; member < m; ++member)
+                            check_output(member == 0 ? hn : grp_hn[member - 1],
+                                std::min<std::size_t>(opt.max_rows, rows - member * opt.max_rows));
+                    }
                     calls += m - 1;  // the head's tag is the last chunk's, as in the chunk-serial order
                     if (last) {
                         if (pf_active) pf->drain();
@@ -1800,6 +1826,7 @@ struct Engine::Impl {
                         task.layer = L1;
                         continue;
                     }
+                    if (check_prompt_outputs) check_output(hn, rows);
                     if (taps_on && tap_sink) tap_sink(taps_d, rows, task.slot, task.pos0 + c0);
                     if (last) {
                         if (pf_active) pf->drain();
@@ -1820,6 +1847,8 @@ struct Engine::Impl {
                 tl = nullptr;
                 ++prof.calls;
                 task.open = false;
+                last_result = {task.id, task.c0 - last_out.second, last_out.second,
+                               child_bank ? 1U : 0U, static_cast<std::uint32_t>(task.m - 1), task.next};
                 if (next != nullptr) *next = task.next;
                 return true;
             }
@@ -1829,6 +1858,7 @@ struct Engine::Impl {
             tl = nullptr;
             return false;
         } catch (...) {
+            comm.transport().abort("prefill failure");
             tl = nullptr;
             task.open = false;
             task.saved = false;
@@ -1837,9 +1867,64 @@ struct Engine::Impl {
     }
 
     void prefill_cancel() {
+        retire_prefill();
         tl = nullptr;
         task.open = false;
         task.saved = false;
+    }
+
+    // No scratch, route reader, side stream or final post may survive a switch.
+    // Transport counters and table-ring cursors deliberately remain global.
+    void retire_prefill() {
+        try {
+            if (pf_active) { pf->drain(); pf_active = false; }
+            if (pf != nullptr && pf_on) pf->drain();
+            hip_ok(hipDeviceSynchronize(), "prefill retire");
+            comm.check_exchanges();
+        } catch (...) {
+            comm.transport().abort("prefill retirement failure");
+            throw;
+        }
+    }
+    void bind_bank(bool child) {
+        const auto& b = child ? nest_bank : base_bank;
+        h = b.h; hn = b.hn; taps_d = b.taps;
+        child_bank = child;
+        pf_tab_slot = ~0U;
+        last_out = {};
+        last_result = {};
+        if (task.open && attn_prefill_fused) prefill_table(task.slot);
+    }
+    void park_task(Engine::PfTaskId id) {
+        if (!task.open || task.id != id || parked.open || child_bank)
+            throw std::logic_error("prefill park: task identity / nesting level");
+        retire_prefill();
+        if (task.saved) restore_rows();
+        hip_ok(hipDeviceSynchronize(), "prefill freeze");
+        base_bank = {h, hn, taps_d};
+        parked = std::move(task);
+        task = PfTask{};
+        parked_sink = std::move(tap_sink);
+    }
+    void resume_parked(Engine::PfTaskId id) {
+        if (task.open || !parked.open || parked.id != id)
+            throw std::logic_error("prefill unpark: task identity");
+        retire_prefill();
+        task = std::move(parked);
+        parked = PfTask{};
+        tap_sink = std::move(parked_sink);
+        bind_bank(false);
+        if (task.layer > 0) save_rows();
+    }
+    void cancel_task(Engine::PfTaskId id) {
+        if (task.open && task.id == id) {
+            prefill_cancel();
+            tap_sink = {};
+        } else if (parked.open && parked.id == id) {
+            retire_prefill();
+            parked = PfTask{};
+            parked_sink = {};
+        } else throw std::logic_error("prefill cancel: stale task ID");
     }
 
     // Rows [0, min(rows of the open chunk, kMaxStepRows)) of h and hn (a group's member 0 uses the base buffers) and taps.
@@ -1860,6 +1945,7 @@ struct Engine::Impl {
     }
 
     std::uint32_t prefill(std::uint32_t slot, std::span<const std::uint32_t> toks, std::uint64_t pos0) {
+        no_task("prefill");
         prefill_begin(slot, toks, pos0);
         std::uint32_t next = 0;
         (void)prefill_resume(~0U, &next);
@@ -2007,6 +2093,7 @@ struct Engine::Impl {
 
     // FNV-1a of the last prefill's final normed rows (the head's input; exactness checks).
     std::pair<const float*, std::size_t> last_out{nullptr, 0};
+    Engine::PfResult last_result;
     std::uint64_t prefill_out_fnv() {
         if (last_out.first == nullptr) return 0;
         hip_ok(hipDeviceSynchronize(), "out fnv");
@@ -2015,6 +2102,51 @@ struct Engine::Impl {
         std::uint64_t f = 14695981039346656037ULL;
         const auto* b = reinterpret_cast<const std::uint8_t*>(rows.data());
         for (std::size_t i = 0; i < rows.size() * 4; ++i) f = (f ^ b[i]) * 1099511628211ULL;
+        return f;
+    }
+
+    void check_output(const float* src, std::size_t rows) {
+        // Qualification only: retain a digest of ALL final normalized prompt rows, including earlier groups.
+        hip_ok(hipDeviceSynchronize(), "check prompt output");
+        std::vector<float> host(rows * kHidden);
+        hip_ok(hipMemcpy(host.data(), src, host.size() * sizeof(float), hipMemcpyDeviceToHost), "check prompt output copy");
+        const auto* b = reinterpret_cast<const unsigned char*>(host.data());
+        for (std::size_t i = 0; i < host.size() * sizeof(float); ++i)
+            task.output_fnv = (task.output_fnv ^ b[i]) * 1099511628211ULL;
+    }
+
+    std::uint64_t activation_fnv(Engine::PfTaskId id) {
+        const bool is_parked = parked.open && parked.id == id;
+        if (!is_parked && (!task.open || task.id != id)) throw std::logic_error("activation fnv: task ID");
+        retire_prefill();
+        const bool saved = !is_parked && task.saved;
+        if (saved) restore_rows();
+        hip_ok(hipDeviceSynchronize(), "activation fnv");
+        const auto& t = is_parked ? parked : task;
+        const float* h0 = is_parked ? base_bank.h : h;
+        const float* hn0 = is_parked ? base_bank.hn : hn;
+        const float* taps = is_parked ? base_bank.taps : taps_d;
+        std::uint64_t f = 14695981039346656037ULL;
+        const auto mix = [&](const float* src, std::size_t count) {
+            std::vector<float> host_values(count);
+            hip_ok(hipMemcpy(host_values.data(), src, count * sizeof(float), hipMemcpyDeviceToHost), "activation fnv copy");
+            const auto* b = reinterpret_cast<const unsigned char*>(host_values.data());
+            for (std::size_t i = 0; i < count * sizeof(float); ++i) f = (f ^ b[i]) * 1099511628211ULL;
+        };
+        if (t.layer > 0) {
+            for (std::size_t member = 0; member < t.m; ++member) {
+                const auto rows = std::min<std::size_t>(opt.max_rows, t.rows - member * opt.max_rows);
+                mix(member == 0 ? h0 : grp_h[member - 1], rows * kHidden);
+                mix(member == 0 ? hn0 : grp_hn[member - 1], rows * kHidden);
+            }
+            if (taps_on && !t.grouped) {
+                constexpr unsigned tap_layers[] = {3, 17, 31, 45, 59};
+                for (std::size_t row = 0; row < t.rows; ++row)
+                    for (unsigned tap = 0; tap < 5; ++tap)
+                        if (tap_layers[tap] < t.layer) mix(taps + (row * 5 + tap) * kHidden, kHidden);
+            }
+        }
+        if (saved) save_rows();
         return f;
     }
 
@@ -2037,12 +2169,13 @@ struct Engine::Impl {
     }
 
     std::vector<std::uint32_t> step(std::span<const Row> rows) {
+        if (parked.open && !child_bank) throw std::logic_error("step: parked bank must remain frozen");
         const std::size_t n = rows.size();
         if (n == 0 || n > kMaxStepRows) throw std::invalid_argument("step: 1..8 rows");
         std::vector<std::uint32_t> toks(n);
         for (std::size_t r = 0; r < n; ++r) {
             if (rows[r].slot >= opt.slots || rows[r].pos >= opt.capacity) throw std::invalid_argument("step: bad row");
-            if (task.open && rows[r].slot == task.slot) throw std::logic_error("step: the slot of the open prefill");
+            if ((task.open && rows[r].slot == task.slot) || (parked.open && rows[r].slot == parked.slot)) throw std::logic_error("step: the slot of the open prefill");
             // Rows of one slot: consecutive ascending positions (verify window). The per-row K1-K4 loop below writes row
             // r's KV before its attention and after the earlier rows', so each row sees exactly its causal prefix.
             for (std::size_t s = r; s-- > 0;)
@@ -2217,6 +2350,7 @@ struct Engine::Impl {
 
     void set_taps(bool on) {
         no_task("set_taps");
+        if (child_bank) bind_bank(false);
         if (on && taps_d == nullptr) taps_d = dalloc<float>(static_cast<std::size_t>(opt.max_rows) * 5 * kHidden);
         taps_on = on;
     }
@@ -2398,12 +2532,101 @@ void Engine::set_prefill_tap_sink(PrefillTapSink sink) {
     impl_->no_task("set_prefill_tap_sink");
     impl_->tap_sink = std::move(sink);
 }
+bool Engine::reserve_nested(bool taps) {
+    impl_->no_task("reserve_nested");
+    auto& m = *impl_;
+    if (m.nest_rows != 0) throw std::logic_error("reserve_nested: already reserved");
+    const unsigned rows = std::min(512U, m.opt.max_rows);
+    const std::size_t physical = std::max(rows, kMaxStepRows);
+    const std::size_t bytes = physical * kHidden * sizeof(float) * (taps ? 7 : 2);
+    std::size_t free = 0, total = 0;
+    hip_ok(hipMemGetInfo(&free, &total), "nested memory");
+    std::ifstream mem("/proc/meminfo");
+    std::string key, line;
+    std::uint64_t available = 0;
+    while (mem >> key) {
+        if (key == "MemAvailable:") { mem >> available; available *= 1024; break; }
+        std::getline(mem, line);
+    }
+    bool ready = m.opt.slots > 1 && !m.fp32_prefill && !m.profiling && !m.pf_on &&
+                 free >= bytes + (4ULL << 30) && available >= bytes + (4ULL << 30);
+    if (ready) {
+        try {
+            m.nest_bank.h = dalloc<float>(physical * kHidden);
+            m.nest_bank.hn = dalloc<float>(physical * kHidden);
+            if (taps) m.nest_bank.taps = dalloc<float>(physical * 5 * kHidden);
+            if (m.timeline) m.child_timeline = std::make_unique<PrefillTimeline>(rows, rows, kLayers, m.pf_msa_windows);
+            // Query the actual aligned child inputs before READY; scratch/output shapes stay unchanged.
+            float* original = m.hn;
+            m.hn = m.nest_bank.hn;
+            try { m.reserve_workspace(rows); }
+            catch (...) { m.hn = original; throw; }
+            m.hn = original;
+            // The resource margin also covers timeline events and any additional workspace.
+            hip_ok(hipMemGetInfo(&free, &total), "nested reserved memory");
+            std::ifstream after("/proc/meminfo");
+            available = 0;
+            while (after >> key) {
+                if (key == "MemAvailable:") { after >> available; available *= 1024; break; }
+                std::getline(after, line);
+            }
+            ready = free >= (4ULL << 30) && available >= (4ULL << 30);
+        } catch (...) { ready = false; }
+    }
+    ready = peer(ready ? 1U : 0U) != 0 && ready;
+    if (!ready) {
+        for (auto* ptr : {m.nest_bank.h, m.nest_bank.hn, m.nest_bank.taps}) if (ptr) (void)hipFree(ptr);
+        m.nest_bank = {};
+        m.child_timeline.reset();
+        m.nest_reason = "resources_or_mode";
+        return false;
+    }
+    m.base_bank = {m.h, m.hn, m.taps_d};
+    m.nest_rows = rows;
+    m.nest_reason.clear();
+    return true;
+}
+void Engine::set_prefill_check_outputs(bool on) { impl_->no_task("check outputs"); impl_->check_prompt_outputs = on; }
+std::uint64_t Engine::prefill_check_output_fnv() const { return impl_->task.output_fnv; }
+std::uint64_t Engine::prefill_activation_fnv(PfTaskId id) { return impl_->activation_fnv(id); }
+unsigned Engine::nested_rows() const { return impl_->nest_rows; }
+const char* Engine::nested_reason() const { return impl_->nest_reason.c_str(); }
+Engine::PfResult Engine::prefill_result() const { return impl_->last_result; }
+Engine::PfProgress Engine::prefill_progress(bool parked) const {
+    const auto& t = parked ? impl_->parked : impl_->task;
+    return {t.id, t.parent, t.generation, t.c0, t.c, t.rows, t.slot, parked ? 0U : impl_->child_bank ? 1U : 0U, t.layer, t.next, t.open};
+}
+void Engine::prefill_begin_task(PfTaskId id, PfTaskId parent, std::uint64_t generation,
+                               std::uint32_t slot, std::span<const std::uint32_t> tokens, PrefillTapSink sink) {
+    auto& m = *impl_;
+    if (id == 0 || m.task.open) throw std::logic_error("prefill begin: task identity");
+    if (parent != 0) {
+        if (!m.parked.open || m.parked.id != parent || id == parent || slot == m.parked.slot ||
+            tokens.empty() || tokens.size() > m.nest_rows || (m.taps_on && m.nest_bank.taps == nullptr))
+            throw std::logic_error("prefill nest: parent / shape / slot");
+        m.bind_bank(true);
+    } else {
+        m.no_task("prefill begin");
+        if (m.child_bank) m.bind_bank(false);
+    }
+    m.tap_sink = std::move(sink);
+    m.prefill_begin(slot, tokens, 0);
+    m.task.id = id; m.task.parent = parent; m.task.generation = generation;
+}
+void Engine::prefill_park(PfTaskId id) { impl_->park_task(id); }
+void Engine::prefill_resume_parked(PfTaskId id) { impl_->resume_parked(id); }
+void Engine::prefill_cancel(PfTaskId id) { impl_->cancel_task(id); }
+bool Engine::prefill_active() const { return impl_->task.open; }
 void Engine::prefill_begin(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
+    impl_->no_task("prefill");
     impl_->prefill_begin(slot, tokens, pos0);
 }
 bool Engine::prefill_resume(unsigned layers, std::uint32_t* next) { return impl_->prefill_resume(layers, next); }
 void Engine::prefill_cancel() { impl_->prefill_cancel(); }
-bool Engine::prefill_open() const { return impl_->task.open; }
+const char* Engine::prefill_unlimited_reason() const {
+    return impl_->profiling ? "profiling" : impl_->fp32_prefill ? "fp32_prefill" : "";
+}
+bool Engine::prefill_open() const { return impl_->task.open || impl_->parked.open; }
 unsigned Engine::prefill_layer() const { return impl_->task.layer; }
 std::uint64_t Engine::prefill_unit_rows() const { return impl_->task.open ? impl_->task.rows : 0; }
 std::uint64_t Engine::prefill_rows_left() const { return impl_->task.open ? impl_->task.toks.size() - impl_->task.c0 : 0; }
@@ -2441,6 +2664,7 @@ std::vector<float> Engine::last_logits(std::size_t rows) const {
     hip_ok(hipMemcpy(out.data(), impl_->logits, out.size() * 4, hipMemcpyDeviceToHost), "last logits");
     return out;
 }
+void Engine::abort(const std::string& reason) { impl_->comm.transport().abort(reason); }
 void Engine::exchange_bytes(const void* out, void* in, std::size_t bytes) { impl_->exchange_bytes(out, in, bytes); }
 void Engine::exchange_device(const void* local, void* remote, std::size_t bytes, void* stream) {
     impl_->exchange_device(local, remote, bytes, static_cast<hipStream_t>(stream));

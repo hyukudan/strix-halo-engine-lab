@@ -714,7 +714,12 @@ int main() try {
         std::atomic<bool> stop{false};
         std::atomic<std::uint64_t> finished{0}, observed_tickets{0};
         std::thread engine4([&] {
-            while (auto t = q.take(true)) {
+            for (;;) {
+                auto t = q.take(true);
+                if (!t) {
+                    if (q.stopping()) break;
+                    continue;  // a cancellation-only batch returns control without shutting down
+                }
                 GenerationStats st;
                 st.prompt_tokens = t->job.prompt.size();
                 st.cached_tokens = 2;

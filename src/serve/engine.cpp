@@ -225,24 +225,49 @@ void GenerationQueue::run(GenerationEngine& engine, const std::function<void(con
 }
 
 std::optional<TakenJob> GenerationQueue::take(bool wait, bool short_first) {
+    return take_selected(wait, short_first, false, false);
+}
+
+std::optional<TakenJob> GenerationQueue::take(bool wait, QueueSelection selection,
+    const std::function<bool(const GenerationJob&)>& eligible) {
+    return take_selected(wait, selection == QueueSelection::short_first, selection == QueueSelection::short_first, true, eligible);
+}
+
+std::optional<TakenJob> GenerationQueue::take_selected(bool wait, bool short_first, bool cancel_first, bool finite,
+    const std::function<bool(const GenerationJob&)>& eligible) {
+    std::size_t remaining = 0;
+    bool first = true;
     for (;;) {
         Entry entry;
         {
             std::unique_lock lock(mutex_);
-            if (wait) ready_.wait(lock, [&] { return stopping_ || !entries_.empty() || control_pending_; });
+            if ((!finite || first) && wait) ready_.wait(lock, [&] { return stopping_ || !entries_.empty() || control_pending_; });
             if (wait && entries_.empty() && control_pending_ && !stopping_) {
                 control_pending_ = false;
                 lock.unlock();
                 if (idle_control_) idle_control_();
                 return std::nullopt;
             }
-            if (entries_.empty()) return std::nullopt;
-            const auto pick = select_waiting(entries_, short_first,
-                [](const auto& e) { return e.job.prompt.size(); },
-                [](auto& e) -> std::uint32_t& { return e.overtakes; });
-            auto it = entries_.begin() + static_cast<std::ptrdiff_t>(pick);
+            if (first || !finite) remaining = entries_.size();
+            first = false;
+            remaining = std::min(remaining, entries_.size());
+            if (remaining == 0) return std::nullopt;
+            // Producers cannot extend the explicit MiniMax batch during cancellation cleanup.
+            const auto end = entries_.begin() + static_cast<std::ptrdiff_t>(remaining);
+            auto it = end;
+            if (cancel_first) it = std::find_if(entries_.begin(), end,
+                [](const Entry& e) { return e.ticket->cancelled(); });
+            if (it == end) {
+                const auto pick = select_waiting(entries_, short_first,
+                    [](const auto& e) { return e.job.prompt.size(); },
+                    [](auto& e) -> std::uint32_t& { return e.overtakes; }, remaining,
+                    [&](const Entry& e) { return !eligible || (!short_first && e.ticket->cancelled()) || eligible(e.job); });
+                if (pick == remaining) return std::nullopt;
+                it = entries_.begin() + static_cast<std::ptrdiff_t>(pick);
+            }
             entry = std::move(*it);
             entries_.erase(it);
+            --remaining;
             entry.ticket->queue_position_.store(0);
             --totals_.queued;
             ++totals_.running;
