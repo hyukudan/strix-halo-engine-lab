@@ -32,6 +32,8 @@ def main():
     ap.add_argument("--hessian", required=True)
     ap.add_argument("--K", type=float, nargs="+", required=True)
     ap.add_argument("--sigma-reg", type=float, default=0.025)
+    ap.add_argument("--no-scaled-hessian", action="store_true",
+                    help="turn off scaled_hessian (on by default: LDLQ uses the Hessian with the input-channel scales folded in)")
     ap.add_argument("--out-prefix", required=True, help="output dir = <prefix><K>")
     ap.add_argument("--rows", type=int, default=0, help="smoke test: only the first ROWS outputs (multiple of 128)")
     a = ap.parse_args()
@@ -51,7 +53,8 @@ def main():
         out.mkdir(parents=True, exist_ok=True)
         H_data = {"H": H.float().to(dev), "count": n, "finalized": False, "device": dev, "first_key": AltHead.NAME}
         qa = {"K": int(K) if float(K).is_integer() else K, "seed": 787, "sigma_reg": a.sigma_reg, "devices": [dev],
-              "mul1": True, "apply_out_scales": None}
+              "mul1": True, "apply_out_scales": None,
+              "scaled_hessian": not a.no_scaled_hessian}
         _, perr, packed = quantize_exl3(W.T.contiguous().to(dev), H_data, qa, return_weight_q=False)
         store = {f"{AltHead.NAME}.{k}": v.contiguous().cpu() for k, v in packed.items()}
         save_file(store, str(out / "model-head-exl3.safetensors"), metadata={"format": "pt"})
@@ -59,7 +62,8 @@ def main():
         (out / "proxy_err.tsv").write_text(f"{AltHead.NAME}\t{K}\t{float(perr):.6g}\n")
         (out / "config.json").write_text(json.dumps({"quantization_config": {
             "quant_method": "exl3", "codebook": "mul1", "K": K, "tensor": AltHead.NAME,
-            "source": "float64 reconstruction of the pack's K8 head", "hessian": Path(a.hessian).name, "rows": n}}, indent=1))
+            "source": "float64 reconstruction of the pack's K8 head", "hessian": Path(a.hessian).name, "rows": n,
+            "scaled_hessian": not a.no_scaled_hessian}}, indent=1))
         print(time.strftime("%H:%M:%S"), f"K{K} proxy_err {float(perr):.5g} -> {out}", flush=True)
         del packed, store
         torch.cuda.empty_cache()
