@@ -5,7 +5,7 @@
 //
 // usage: strix-minimax-serve MODEL_DIR --rank R --transport T [--port 8080] [--bind 127.0.0.1] [--slots 8]
 //        [--capacity 8256] [--max-rows 4096] [--model-id minimax-m3.1-flash] [--max-tokens 4096]
-//        [--dspark DIR [--dspark-exl3 DIR]] [--admin] [--resume-check P.u32[:k/k...][,...] [--check-only]]
+//        [--dspark DIR [--dspark-exl3 DIR]] [--admin] [--resume-check P.u32[:k/k...][,...] [--resume-check-nested SHORT.u32 [--resume-check-child-layers K]] [--resume-check-tokens 256] [--check-only]]
 //   TRANSPORT: usb4-auto | tcp-listen:PORT | tcp-connect:HOST:PORT
 // Routes (rank 0): POST /v1/chat/completions, POST /v1/completions (stream or not), GET /v1/models, GET /health,
 // GET /metrics (metrics text), GET /api/status[?detail=1] (strix-serve-status-v1), POST /tokenize; with --admin,
@@ -15,12 +15,14 @@
 // greedy (said in the reply).
 //
 // Scheduler (qualification notes), rank 0's decisions only (rank 1 runs the commands):
-//   STRIX_MM_SERVE_SCHED=off|interleave (default off until measured): off = an admitted prompt's whole prefill runs at
+//   STRIX_MM_SERVE_SCHED=off|interleave (default interleave; GPU qualification pending): off = an admitted prompt's whole prefill runs at
 //     once and the decoding requests wait for all of it (the first scheduler). interleave = the prefill runs as a
 //     resumable task in LAYER units (Engine::prefill_begin / prefill_resume: the same kernel calls and rows as one
 //     prefill, so the bits are those of the request alone; row units or batched prompts are not exact here: the prefill
-//     split-K policy follows the call's row count) between decode steps, when its predicted time exceeds the token-gap
-//     target STRIX_MM_SERVE_GAP_MS (default 1500); a unit's layers are chosen so that step + unit stays within the gap.
+//     split-K policy follows the call's row count). Idle units use STRIX_MM_SERVE_SERVICE_MS (250).
+//     With decoders, units use their remaining gap budget, recent layer-cost upper samples and a control margin.
+//     Whole fresh admissions include elapsed time and the next complete cycle with the candidate row; consecutive
+//     admissions proceed only while the minimum live gap target permits them. Rank 1 only replays these decisions.
 //   --dspark: DSpark windows inside the batch steps, sharing the step's 8 rows (n decoding rows + drafts <= 8: C1 up to 7
 //     drafts, C8 none). Requests admitted while <= STRIX_MM_SERVE_DSPARK_INFLIGHT (default 1: measurement C2 measured slower) are in flight keep a
 //     drafter context (prefill taps + every committed row); above it appends stop and those contexts are stale for good.
@@ -29,6 +31,8 @@
 //     OFF by default (measurement: C1 +8 % aggregate but prose -10 %, C2 -3 %): STRIX_MM_SERVE_DSPARK=1 (or /admin/sched) turns
 //     the loaded drafter on.
 #include "minimax/serve/minimax_api.hpp"
+#include "minimax/serve/minimax_sched.hpp"
+#include "minimax/serve/minimax_control.hpp"
 #include "minimax/serve/minimax_observe.hpp"
 #include "minimax/serve/minimax_tokenizer.hpp"
 #include "strix/minimax/engine.hpp"
@@ -134,35 +138,13 @@ private:
 //   s = slot s's committed rows (anchor + accepted drafts, from the step's tokens on each rank) are appended to its drafter
 //   context. draft: the 7-row DSpark block + 7 Markov steps of each of `dslots` slots from its anchor at its position.
 //   taps: the engine's draft taps on (pflags 1) / off (0), only with no prefill open (DSpark switched at runtime).
-enum class Command : std::uint32_t { heartbeat = 1, prefill = 2, step = 3, shutdown = 4, unit = 5, cancel = 6, draft = 7, taps = 8 };
-struct Control {
-    std::uint32_t magic = 0x43534d4dU;  // "MMSC"
-    std::uint32_t command = 0;
-    std::uint32_t rows = 0;             // step: rows used in row[]
-    std::uint32_t pslot = 0, plen = 0;  // prefill: slot and prompt length
-    std::uint32_t pflags = 0;
-    std::uint64_t round = 0;
-    mm::Row row[kStepRows]{};
-    std::uint32_t layers = 0;  // unit
-    std::uint32_t append = 0;  // step
-    std::uint32_t dslots = 0;  // draft
-    std::uint32_t dslot[kStepRows]{}, danchor[kStepRows]{};
-    std::uint64_t dpos[kStepRows]{};
-};
-static_assert(sizeof(Control) <= 512);
+using Command = ms::Command;
+using ms::Control;
+using ms::exchange;
 constexpr std::size_t kTokensPerMessage = 16384;  // 64 KiB per control exchange
 
-Control exchange(mm::Engine& eng, const Control& out) {
-    std::array<std::byte, 512> o{}, i{};
-    std::memcpy(o.data(), &out, sizeof(Control));
-    eng.exchange_bytes(o.data(), i.data(), o.size());
-    Control in;
-    std::memcpy(&in, i.data(), sizeof(Control));
-    if (in.magic != out.magic) throw std::runtime_error("control channel: bad magic from the peer");
-    return in;
-}
 // Prompt tokens of a prefill, rank 0 -> rank 1.
-void exchange_tokens(mm::Engine& eng, std::vector<std::uint32_t>& tokens, std::size_t n, bool sender) {
+void exchange_tokens(mm::Engine& eng, std::vector<std::uint32_t>& tokens, std::size_t n, bool sender) try {
     if (!sender) tokens.assign(n, 0);
     std::vector<std::uint32_t> in(kTokensPerMessage);
     for (std::size_t c0 = 0; c0 < n; c0 += kTokensPerMessage) {
@@ -172,6 +154,9 @@ void exchange_tokens(mm::Engine& eng, std::vector<std::uint32_t>& tokens, std::s
         eng.exchange_bytes(out.data(), in.data(), m * 4);
         if (!sender) std::copy_n(in.begin(), m, tokens.begin() + static_cast<long>(c0));
     }
+} catch (...) {
+    eng.abort("control channel: protocol failure");
+    throw;
 }
 
 // ---- the engine calls of every command, made identically by both ranks ----
@@ -184,23 +169,40 @@ struct Runner {
     ds::DeviceDrafter* dd = nullptr;  // DSpark drafter (both ranks), nullptr = none
     std::uint32_t v0 = 0, vn = 0;     // this rank's vocabulary half (drafter Markov steps)
 
-    void prefill_begin(std::uint32_t slot, std::span<const std::uint32_t> prompt, bool context) {
-        if (dd != nullptr) {
-            if (context)
-                eng.set_prefill_tap_sink([this](const float* taps, std::size_t n, std::uint32_t s, std::uint64_t pos0) { dd->append(s, taps, n, pos0, nullptr); });
-            else
-                eng.set_prefill_tap_sink({});
+    std::uint64_t local_id = 0, control_round = 0;
+    std::uint32_t last_next = 0;
+    void prefill_begin(std::uint32_t slot, std::span<const std::uint32_t> prompt, bool context,
+                       std::uint64_t id, std::uint64_t parent = 0, std::uint64_t generation = 0) {
+        mm::Engine::PrefillTapSink sink;
+        if (dd != nullptr && context)
+            sink = [this](const float* taps, std::size_t n, std::uint32_t s, std::uint64_t pos0) { dd->append(s, taps, n, pos0, nullptr); };
+        if (id == 0) throw std::runtime_error("prefill begin: missing task ID");
+        eng.prefill_begin_task(id, parent, generation, slot, prompt, std::move(sink));
+    }
+    void prefill_check(std::uint64_t id, std::uint32_t next) const {
+        const auto p = eng.prefill_progress();
+        const auto result = eng.prefill_result();
+        if (p.open || p.id != id || result.id != id || result.next != next || last_next != next) {
+            eng.abort("control channel: completion mismatch");
+            throw std::runtime_error("control channel: completion identity / token mismatch");
         }
-        eng.prefill_begin(slot, prompt, 0);
+    }
+    void require_active(std::uint64_t id, unsigned bank) const {
+        if (!eng.prefill_active() || eng.prefill_progress().id != id || eng.prefill_progress().bank != bank)
+            throw std::runtime_error("control channel: wrong active task");
     }
     bool prefill_unit(unsigned layers, std::uint32_t* next) {
-        const bool done = eng.prefill_resume(layers, next);
-        if (done && dd != nullptr) eng.set_prefill_tap_sink({});  // scoped to the request it was set for
+        const bool done = eng.prefill_resume(ms::resume_layers(layers), &last_next);
+        if (done && next) *next = last_next;
         return done;
     }
-    void prefill_cancel() {
-        eng.prefill_cancel();
-        if (dd != nullptr) eng.set_prefill_tap_sink({});
+    void prefill_cancel(std::uint64_t id) {
+        if (id == 0) throw std::runtime_error("prefill cancel: missing task ID");
+        eng.prefill_cancel(id);
+    }
+    void cancel_all() {
+        if (eng.prefill_active()) prefill_cancel(eng.prefill_progress().id);
+        if (eng.prefill_progress(true).open) prefill_cancel(eng.prefill_progress(true).id);
     }
     // DSpark block + Markov chain (one 8-byte candidate exchange per step) + confidences, as strix-minimax-rank --spec auto.
     Drafts draft(std::uint32_t slot, std::uint32_t anchor, std::uint64_t pos) {
@@ -242,10 +244,10 @@ struct Runner {
 };
 
 // ---- rank 0: scheduler policy (runtime switchable) and counters ----
-enum class Sched : std::uint32_t { off = 0, interleave = 1 };
-struct Policy {
-    Sched sched = Sched::off;
-    double gap_ms = 1500;         // token-gap target of the decoding requests (interleave)
+using Sched = ms::Sched;
+struct Policy : ms::RequestPolicy {
+    bool nest = true;
+    bool short_first = true;
     bool dspark = true;           // with a drafter loaded
     std::uint32_t inflight = 1;   // DSpark contexts kept while <= this many requests are in flight (measurement: C2 slower)
     std::uint32_t draft_slots = 8;  // at most this many slots draft in one cycle
@@ -253,6 +255,7 @@ struct Policy {
 };
 struct Counters {
     double step_s = 0, prefill_s = 0, draft_s = 0, idle_s = 0, stall_s = 0;
+    unsigned max_unit_layers = 0;
     std::uint64_t cancels = 0;  // open prefills abandoned (client gone)
     // DSpark coverage: cycles with >= 2 windows (k >= 1), of which with unequal k; windows with a rejected draft
     std::uint64_t multi_windows = 0, unequal_windows = 0, rejections = 0;
@@ -266,6 +269,10 @@ struct Shared {
     std::mutex m;
     Policy policy;
     Counters counters;
+    std::string unlimited_reason, nest_reason;
+    unsigned nest_rows = 0;
+    std::uint64_t active_id = 0, parked_id = 0;
+    bool nest_taps = false;
     std::unordered_map<const sv::GenerationTicket*, Extra> extras;
 };
 
@@ -276,7 +283,11 @@ struct Running {
     std::uint32_t last = 0;
     sv::GenerationStats stats;
     Extra x;
+    ms::RequestPolicy policy;  // admission-time scheduling targets, including every open-prefill resume
     Clock::time_point decode_start, last_emit;
+    std::uint64_t request_id = 0;  // stable across slot reuse, for the optional timeline
+    Clock::time_point prefill_start;
+    ms::NestQuota nest_quota;
     bool prefilling = false;
     bool context = false;  // DSpark: the drafter context of this slot is complete
     ds::SurvivalController survival{16};
@@ -312,38 +323,20 @@ struct Costs {
     }
 };
 
-// Prefill layer-time model of rank 0 (interleave): per rows bucket (log2), EMA of ms per layer from the measured units,
-// plus a fixed cost per unit (restore, cache table, drain). Prior 10 ms + 0.1 ms x rows per layer (measurement: chats ~25 ms,
-// 1K 108 ms, 3K 314 ms per layer).
-struct LayerModel {
-    std::array<double, 16> per_layer{};
-    double fixed_ms = 5.0;
-    static unsigned bucket(std::uint64_t rows) {
-        unsigned b = 0;
-        while ((std::uint64_t{1} << b) < rows && b < 15) ++b;
-        return b;
-    }
-    [[nodiscard]] double layer_ms(std::uint64_t rows) const {
-        const double v = per_layer[bucket(rows)];
-        return v > 0 ? v : 10.0 + 0.1 * static_cast<double>(rows);
-    }
-    void observe(std::uint64_t rows, unsigned layers, double ms) {
-        if (layers < 4) return;
-        const double x = std::max(0.0, ms - fixed_ms) / layers;
-        double& c = per_layer[bucket(rows)];
-        c = c <= 0 ? x : 0.7 * c + 0.3 * x;
-    }
-};
-
 void log_request(const Running& r, const char* finish) {
+    std::fprintf(stderr, "mmserve-policy sched=%s service_ms=%.1f max_unit_layers=%u short_first=%u fallback=%s nested=%u parent_request=%llu task_id=%llu\n",
+                 r.x.sched.c_str(), r.x.service_ms, r.x.max_unit_layers, r.x.short_first ? 1U : 0U, r.x.fallback_reason.c_str(), r.x.nested ? 1U : 0U,
+                 static_cast<unsigned long long>(r.x.parent_request), static_cast<unsigned long long>(r.request_id));
     std::fprintf(stderr,
                  "{\"event\":\"mmserve-req\",\"slot\":%u,\"prompt_tokens\":%llu,\"prompt_fnv\":\"%s\",\"tokens\":%llu,\"ids_fnv\":\"%s\","
                  "\"finish\":\"%s\",\"queue_ms\":%.1f,\"ttft_ms\":%.1f,\"prefill_ms\":%.1f,\"prefill_units\":%llu,\"decode_ms\":%.1f,"
-                 "\"max_gap_ms\":%.1f,\"stall_ms\":%.1f,\"cycles\":%llu,\"drafted\":%llu,\"accepted\":%llu,\"context\":%s}\n",
+                 "\"task_id\":%llu,\"parent_task_id\":%llu,\"nest_count\":%llu,\"park_wall_ms\":%.1f,\"nest_service_ms\":%.1f,\"nest_switch_ms\":%.1f,\"max_gap_ms\":%.1f,\"stall_ms\":%.1f,\"cycles\":%llu,\"drafted\":%llu,\"accepted\":%llu,\"context\":%s}\n",
                  r.slot, static_cast<unsigned long long>(r.stats.prompt_tokens), hex(r.x.prompt_fnv).c_str(),
                  static_cast<unsigned long long>(r.stats.generated_tokens), hex(r.x.ids_fnv).c_str(), finish,
                  std::chrono::duration<double, std::milli>(r.job.started - r.job.submitted).count(), r.x.ttft_ms, r.x.prefill_wall_ms,
-                 static_cast<unsigned long long>(r.x.units), r.stats.decode_ms, r.x.max_gap_ms, r.x.stall_ms,
+                 static_cast<unsigned long long>(r.x.units), r.stats.decode_ms,
+                 static_cast<unsigned long long>(r.request_id), static_cast<unsigned long long>(r.x.parent_request),
+                 static_cast<unsigned long long>(r.x.nest_count), r.x.park_wall_ms, r.x.nest_service_ms, r.x.nest_switch_ms, r.x.max_gap_ms, r.x.stall_ms,
                  static_cast<unsigned long long>(r.x.cycles), static_cast<unsigned long long>(r.x.drafted),
                  static_cast<unsigned long long>(r.x.accepted), r.x.context ? "true" : "false");
 }
@@ -353,76 +346,123 @@ class Lead {
 public:
     Lead(mm::Engine& eng, Runner& run, sv::GenerationQueue& queue, Shared& shared, std::uint64_t max_rows, bool taps)
         : eng_(eng), run_(run), queue_(queue), sh_(shared), slots_(eng.slots()), capacity_(eng.capacity()), max_rows_(max_rows),
-          run_slots_(slots_), taps_(taps) {}
+          run_slots_(slots_), taps_(taps) {
+        round_ = run.control_round;
+        const char* v = std::getenv("STRIX_MM_SERVE_TIMELINE");
+        timeline_on_ = v != nullptr && std::strcmp(v, "1") == 0;
+        if (timeline_on_) timeline_origin_ = Clock::now();
+    }
 
-    void loop() {
+    void loop() try {
         auto last_round = Clock::now();
         while (!g_stop.load() && !queue_.stopping()) {
             refresh_policy();
             sync_taps();
             bool worked = false;
             // a client gone while its prefill is open: the task is abandoned at this unit boundary (both ranks)
-            if (eng_.prefill_open() && run_slots_[prefill_slot_]->job.ticket->cancelled()) {
+            for (std::uint32_t slot = 0; slot < slots_; ++slot) {
+                auto& r = run_slots_[slot];
+                if (!r || !r->prefilling || !r->job.ticket->cancelled()) continue;
                 Control c;
                 c.command = static_cast<std::uint32_t>(Command::cancel);
+                c.task_id = r->request_id;
                 c.round = round_++;
                 (void)exchange(eng_, c);
-                run_.prefill_cancel();
-                auto& r = run_slots_[prefill_slot_];
+                const auto progress = eng_.prefill_progress(eng_.prefill_progress(true).id == c.task_id);
+                run_.prefill_cancel(c.task_id);
+                if (timeline_on_) timeline("cancel", Clock::now(), "ticket", slot, progress.layer, progress.layer, timeline_task(progress));
+                layer_.reset_pending();
                 r->decode_start = Clock::now();
-                r->stats.prefill_ms = ms_since(prefill_start_);
+                r->stats.prefill_ms = ms_since(r->prefill_start);
                 finish(r, "cancelled");
+                if (slot == parked_slot_) parked_slot_ = slots_;
                 add([](Counters& k) { ++k.cancels; });
             }
+            if (!eng_.prefill_active() && eng_.prefill_progress(true).open) unpark();
+            if (eng_.prefill_active() && !eng_.prefill_progress(true).open && pol_.nest) {
+                if (!admit(true) && nested_needs_decode_ && decoding_count() > 0) {
+                    cycle();
+                    (void)admit(true);  // re-evaluate real ages after the complete cycle
+                }
+            }
+            {
+                std::lock_guard<std::mutex> l(sh_.m);
+                sh_.active_id = eng_.prefill_active() ? eng_.prefill_progress().id : 0;
+                sh_.parked_id = eng_.prefill_progress(true).open ? eng_.prefill_progress(true).id : 0;
+            }
+            for (auto& r : run_slots_)
+                if (r && r->policy.sched == Sched::interleave && !r->prefilling && r->job.ticket->cancelled()) finish(r, "cancelled");
             // admission: one open prefill at a time
             if (!eng_.prefill_open()) worked |= admit();
             if (eng_.prefill_open()) {
-                const bool off = pol_.sched == Sched::off;
+                const auto& policy = run_slots_[prefill_slot_]->policy;
+                const bool off = policy.sched == Sched::off;
                 const bool fresh = run_slots_[prefill_slot_]->x.units == 0;  // a started task keeps interleaving
-                if (off || decoding_count() == 0 || (fresh && predicted_rest_ms() <= pol_.gap_ms)) {
+                // Whole admissions share a deadline; started tasks retain layer boundaries.
+                const auto n = decoding_count();
+                const bool whole = run_slots_[prefill_slot_]->x.nested || off || ms::runs_whole(fresh, predicted_rest_ms(), policy.service_ms, n > 0,
+                    live_gap_ms(policy.gap_ms), cycle_ms(std::min(n + 1, kStepRows)), longest_wait_ms(), ms::control_margin_ms);
+                if (off || whole) {
                     prefill_unit(~0U);
                     last_round = Clock::now();
-                    // off (today's order) or nothing decoding: the next admission comes before any step; interleave
-                    // with requests decoding: one decode step first, so successive whole prefills do not add up in one gap
-                    if (off || decoding_count() == 0) continue;
-                    worked = true;
+                    // Reconsider the next candidate against all last-emission deadlines. Never wait for arrivals.
+                    continue;
                 }
             }
-            if (decoding_count() > 0) {
+            if (decoding_count() > 0 && (!eng_.prefill_open() || !deadline_serviced_)) {
                 cycle();
                 worked = true;
             }
             if (eng_.prefill_open()) {
-                prefill_unit(unit_layers());
+                // A cycle just serviced every decoder. If a single layer still cannot fit, advance once;
+                // no schedule can meet that target without changing the numerical unit.
+                prefill_unit(std::max(1U, unit_layers()));
                 worked = true;
             }
             if (worked) {
                 last_round = Clock::now();
                 continue;
             }
-            const auto idle0 = Clock::now();
             if (std::chrono::duration<double>(Clock::now() - last_round).count() > 1.0) {  // keep rank 1 and the link alive
                 Control hb;
                 hb.command = static_cast<std::uint32_t>(Command::heartbeat);
                 hb.round = round_++;
+                const auto hb0 = timeline_on_ ? Clock::now() : Clock::time_point{};
                 (void)exchange(eng_, hb);
+                if (timeline_on_) timeline("heartbeat", hb0, "deadline");
                 last_round = Clock::now();
             }
+            const auto idle0 = Clock::now();
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             add([&](Counters& c) { c.idle_s += secs(idle0, Clock::now()); });
+            if (timeline_on_) timeline("idle", idle0, "defer");
+            flush_timeline();
         }
-        if (eng_.prefill_open()) {
+        for (const bool parked : {false, true}) {
+            const auto p = eng_.prefill_progress(parked);
+            if (!p.open) continue;
             Control c;
             c.command = static_cast<std::uint32_t>(Command::cancel);
+            c.task_id = p.id;
             c.round = round_++;
             (void)exchange(eng_, c);
-            run_.prefill_cancel();
+            run_.prefill_cancel(p.id);
         }
         for (auto& r : run_slots_)
             if (r) finish(r, "cancelled");
+        if (pending_) {
+            sv::GenerationStats stats;
+            stats.finish = "cancelled";
+            queue_.finish(*pending_, stats);
+        }
+        flush_timeline();
         Control bye;
         bye.command = static_cast<std::uint32_t>(Command::shutdown);
+        bye.round = round_++;
         (void)exchange(eng_, bye);
+    } catch (...) {
+        eng_.abort("control channel: protocol failure");
+        throw;
     }
 
 private:
@@ -445,9 +485,9 @@ private:
     }
     void refresh_policy() {
         std::lock_guard<std::mutex> l(sh_.m);
-        if (sh_.policy.epoch != pol_.epoch) {  // a new arm: the same initial state as a fresh load
+        if (sh_.policy.epoch != pol_.epoch) {  // reset optimization gates, retain deadline safety estimates
             costs_.reset();
-            layer_ = LayerModel{};
+            // Deadline safety samples survive policy/counter epochs.
             gates_.assign(kStepRows + 1, ds::DraftGate());
             explore_ = {};
         }
@@ -465,6 +505,12 @@ private:
     }
 
     void finish(std::optional<Running>& r, const std::string& why) {
+        if (r->slot == parked_slot_) {
+            r->x.park_wall_ms += ms_since(park_start_);
+            const double switch_ms = ms::nest_switch_ms(ms_since(nest_start_), nest_service_ms_);
+            r->x.nest_switch_ms += switch_ms;
+            nest_switch_upper_ms_ = std::max(nest_switch_upper_ms_, switch_ms);
+        }
         r->stats.finish = why;
         r->stats.decode_ms = ms_since(r->decode_start);
         r->stats.cycles = r->x.cycles;
@@ -509,7 +555,51 @@ private:
         return true;
     }
 
-    bool admit() {
+    bool nested_candidate(const sv::GenerationJob& job) {
+        if (!eng_.prefill_active()) return false;
+        const auto& parent = *run_slots_[prefill_slot_];
+        const auto n = decoding_count();
+        const double gap = live_gap_ms(pol_.gap_ms);
+        const double predicted = predicted_prompt_ms(job.prompt.size());
+        const auto fits = [&](double wait) {
+            return job.prompt.size() + 1 < capacity_ && ms::nest_fits(job.prompt.size(), eng_.nested_rows(), pol_.nest,
+                parent.policy.sched == Sched::interleave, pol_.sched == Sched::interleave,
+                *eng_.prefill_unlimited_reason() == 0 && parent.x.units > 0,
+                eng_.prefill_progress(true).open, inflight() < slots_, parent.nest_quota,
+                predicted, gap, wait, cycle_ms(std::min(n + 1, kStepRows)), nest_switch_upper_ms_, n > 0);
+        };
+        const bool ready = fits(longest_wait_ms());
+        if (!ready && fits(0)) nested_needs_decode_ = true;
+        return ready;
+    }
+    void unpark() {
+        const auto slot = parked_slot_;
+        if (slot >= slots_ || !run_slots_[slot]) throw std::runtime_error("nested parent reservation lost");
+        Control c;
+        c.command = static_cast<std::uint32_t>(Command::resume_parked);
+        c.round = round_++;
+        c.task_id = run_slots_[slot]->request_id;
+        const auto start = Clock::now();
+        (void)exchange(eng_, c);
+        eng_.prefill_resume_parked(c.task_id);
+        if (timeline_on_) timeline("unpark", start, "nested", slot, eng_.prefill_layer(), eng_.prefill_layer(),
+            timeline_task(eng_.prefill_progress()));
+        const double wall = ms_since(park_start_);
+        run_slots_[slot]->nest_quota.wall_ms += wall;
+        run_slots_[slot]->x.park_wall_ms += wall;
+        prefill_slot_ = slot;
+        parked_slot_ = slots_;
+        layer_.reset_pending();
+        // The child's first emission starts a real deadline; decode only if the next parent unit cannot fit.
+        deadline_serviced_ = unit_layers() > 0;
+        const double switch_ms = ms::nest_switch_ms(ms_since(nest_start_), nest_service_ms_);
+        run_slots_[slot]->x.nest_switch_ms += switch_ms;
+        nest_switch_upper_ms_ = std::max(nest_switch_upper_ms_, switch_ms);
+    }
+
+    bool admit(bool nested = false) {
+        nested_needs_decode_ = false;
+        const auto a0 = Clock::now();
         std::uint32_t free_slot = slots_;
         for (std::uint32_t s = 0; s < slots_; ++s)
             if (!run_slots_[s]) {
@@ -517,8 +607,36 @@ private:
                 break;
             }
         if (free_slot >= slots_) return false;
-        auto t = queue_.take(false);
-        if (!t) return false;
+        // Reserve one selected candidate without opening device state; it remains ahead of later arrivals.
+        if (!pending_) {
+            pending_short_first_ = pol_.sched == Sched::interleave && pol_.short_first;
+            pending_ = queue_.take(false, pending_short_first_ ? sv::QueueSelection::short_first : sv::QueueSelection::fifo,
+                nested ? std::function<bool(const sv::GenerationJob&)>([&](const sv::GenerationJob& j) { return nested_candidate(j); }) :
+                         std::function<bool(const sv::GenerationJob&)>{});
+        }
+        if (!pending_) return false;
+        // Nested take is an atomic eligibility-aware reservation. Consume it in this admission;
+        // never hold a rejected/oversized nested candidate ahead of later eligible queue entries.
+        if (pending_->ticket->cancelled()) {
+            queue_.finish(*pending_, {});
+            pending_.reset();
+            return true;
+        }
+        const auto& candidate = pending_->job.prompt;
+        const auto n = decoding_count();
+        if (!nested && pol_.sched == Sched::interleave && n > 0) {
+            const double gap = live_gap_ms(pol_.gap_ms), next = cycle_ms(std::min(n + 1, kStepRows));
+            const double predicted = predicted_prompt_ms(candidate.size());
+            const bool whole = ms::runs_whole(true, predicted, pol_.service_ms, true, gap, next,
+                                              longest_wait_ms(), ms::control_margin_ms);
+            if (!whole && !deadline_serviced_) {
+                step_reason_ = "defer";
+                return false;
+            }
+        }
+        auto t = std::move(pending_);
+        pending_.reset();
+        t->started = Clock::now();
         auto& prompt = t->job.prompt;
         if (prompt.empty() || prompt.size() + 1 >= capacity_) {
             queue_.finish(*t, {}, "prompt of " + std::to_string(prompt.size()) + " tokens does not fit the context (" +
@@ -526,6 +644,9 @@ private:
             return true;
         }
         Running r;
+        r.policy = pol_;
+        r.request_id = ++request_id_;
+        r.x.task_id = r.request_id;
         r.slot = free_slot;
         r.prefilling = true;
         r.stats.prompt_tokens = prompt.size();
@@ -536,20 +657,55 @@ private:
         r.context = run_.dd != nullptr && pol_.dspark && taps_ && inflight() + 1 <= pol_.inflight && prompt.size() <= max_rows_ &&
                     prompt.size() + ds::block + 1 < capacity_;
         r.x.context = r.context;
+        r.x.sched = pol_.sched == Sched::off ? "off" : "interleave";
+        r.x.service_ms = pol_.service_ms;
+        r.x.short_first = pending_short_first_;
+        r.x.fallback_reason = eng_.prefill_unlimited_reason();
+        if (pol_.sched == Sched::off) r.x.fallback_reason = "sched_off";
+        const bool admission_whole = timeline_on_ && (pol_.sched == Sched::off || ms::runs_whole(true, predicted_prompt_ms(prompt.size()),
+            pol_.service_ms, n > 0, live_gap_ms(pol_.gap_ms), cycle_ms(std::min(n + 1, kStepRows)), longest_wait_ms(), ms::control_margin_ms));
+        const auto parent_id = nested ? run_slots_[prefill_slot_]->request_id : 0;
+        if (nested) {
+            auto& parent = *run_slots_[prefill_slot_];
+            parent.nest_quota.admitted();
+            ++parent.x.nest_count;
+            parked_slot_ = prefill_slot_;
+            nest_start_ = a0;
+            nest_service_ms_ = 0;
+            park_start_ = Clock::now();
+            Control park;
+            park.command = static_cast<std::uint32_t>(Command::park);
+            park.round = round_++;
+            park.task_id = parent_id;
+            (void)exchange(eng_, park);
+            const auto progress = eng_.prefill_progress();
+            eng_.prefill_park(parent_id);
+            if (timeline_on_) timeline("park", park_start_, "nested", parent.slot, progress.layer, progress.layer,
+                timeline_task(progress, r.request_id));
+            r.x.nested = true;
+            r.x.parent_request = parent_id;
+        }
         Control c;
-        c.command = static_cast<std::uint32_t>(Command::prefill);
+        c.task_id = r.request_id;
+        c.parent_task_id = parent_id;
+        c.bank = nested ? 1U : 0U;
+        c.slot_generation = ++slot_generation_[free_slot];
+        c.command = static_cast<std::uint32_t>(nested ? Command::nest : Command::prefill);
         c.round = round_++;
         c.pslot = free_slot;
         c.plen = static_cast<std::uint32_t>(prompt.size());
         c.pflags = r.context ? 1U : 0U;
         (void)exchange(eng_, c);
         exchange_tokens(eng_, prompt, prompt.size(), true);
-        run_.prefill_begin(free_slot, prompt, r.context);
+        const auto begin0 = timeline_on_ ? Clock::now() : Clock::time_point{};
+        run_.prefill_begin(free_slot, prompt, r.context, c.task_id, parent_id, c.slot_generation);
+        layer_.reset_pending();
         r.job = std::move(*t);
-        prefill_start_ = Clock::now();
+        r.prefill_start = Clock::now();
         run_slots_[free_slot] = std::move(r);
         prefill_slot_ = free_slot;
         add([](Counters& k) { ++k.prefills; });
+        if (timeline_on_) timeline(nested ? "nest" : "admit", a0, admission_whole ? "whole" : "deadline", prefill_slot_, 0, 0, timeline_prefill(prefill_slot_, true) + "," + timeline_task(eng_.prefill_progress()), begin0);
         return true;
     }
 
@@ -557,39 +713,84 @@ private:
     // of up to two max_rows chunks, the engine's default pf_group)
     double predicted_rest_ms() const {
         const std::uint64_t unit = eng_.prefill_unit_rows();
-        double ms = layer_.fixed_ms + static_cast<double>(60 - eng_.prefill_layer()) * layer_.layer_ms(unit);
+        double ms = layer_.fixed_ms + static_cast<double>(60 - eng_.prefill_layer()) * layer_.upper_layer_ms(unit);
         for (std::uint64_t left = eng_.prefill_rows_left() - unit; left > 0;) {
             const std::uint64_t u = std::min<std::uint64_t>(left, 2 * max_rows_);
-            ms += layer_.fixed_ms + 60.0 * layer_.layer_ms(u);
+            ms += layer_.fixed_ms + 60.0 * layer_.upper_layer_ms(u);
             left -= u;
         }
         return ms;
     }
+    // decode cycle cost (ms) with n decoding requests: the measured complete cycle, else the step-cost estimate; 0 for none
+    double cycle_ms(std::uint32_t n) const {
+        if (n == 0) return 0;
+        double upper = costs_.at(0, n);
+        for (unsigned r = 1; r <= kStepRows; ++r)
+            upper = std::max(upper, cycle_cost_[r] * (1.0 + 0.12 * (n - 1)) / (1.0 + 0.12 * (r - 1)));
+        return 1e3 * upper;
+    }
+    // longest time a decoding request has waited since its last token (ms)
+    double longest_wait_ms() const {
+        double w = 0;
+        for (const auto& r : run_slots_)
+            if (r && !r->prefilling) w = std::max(w, ms_since(r->last_emit));
+        return w;
+    }
+    double live_gap_ms(double candidate) const {
+        for (const auto& r : run_slots_)
+            if (r) candidate = std::min(candidate, r->policy.gap_ms);
+        return candidate;
+    }
+    double predicted_prompt_ms(std::uint64_t rows) const {
+        double predicted = 0;
+        while (rows > 0) {
+            const auto u = std::min<std::uint64_t>(rows, 2 * max_rows_);
+            predicted += layer_.fixed_ms + 60 * layer_.upper_layer_ms(u);
+            rows -= u;
+        }
+        return predicted;
+    }
     unsigned unit_layers() const {
-        if (decoding_count() == 0) return ~0U;
-        const double step_ms = 1e3 * costs_.at(0, decoding_count());
-        const double budget = std::max(1.0, pol_.gap_ms - step_ms - layer_.fixed_ms);
-        const double per = layer_.layer_ms(std::max<std::uint64_t>(1, eng_.prefill_unit_rows()));
-        return std::max(1U, static_cast<unsigned>(budget / per));
+        const auto& policy = run_slots_[prefill_slot_]->policy;
+        if (policy.sched == Sched::off) return ~0U;
+        // Preserve the observed-gap goal rather than spending all of the default 1500 ms.
+        return ms::unit_layers(policy.service_ms, decoding_count() > 0, std::min(live_gap_ms(policy.gap_ms), 1300.0),
+            cycle_ms(decoding_count()), layer_.fixed_ms,
+            layer_.upper_layer_ms(std::max<std::uint64_t>(1, eng_.prefill_unit_rows())), longest_wait_ms(), ms::control_margin_ms);
     }
 
     void prefill_unit(unsigned layers) {
+        deadline_serviced_ = false;
+        const auto u0 = timeline_on_ ? Clock::now() : Clock::time_point{};
+        if (*eng_.prefill_unlimited_reason() != 0) layers = ~0U;
         Control c;
         c.command = static_cast<std::uint32_t>(Command::unit);
         c.round = round_++;
         c.layers = layers;
+        c.bank = eng_.prefill_progress().bank;
+        c.task_id = run_slots_[prefill_slot_]->request_id;
         (void)exchange(eng_, c);
         const std::uint64_t unit_rows = eng_.prefill_unit_rows(), left0 = eng_.prefill_rows_left();
         const unsigned layer0 = eng_.prefill_layer();
+        const auto summary = timeline_on_ ? timeline_prefill(prefill_slot_, layers == ~0U) : std::string{};
         const auto t0 = Clock::now();
         std::uint32_t next = 0;
         const bool done = run_.prefill_unit(layers, &next);
+        const auto returned = timeline_on_ ? Clock::now() : Clock::time_point{};
         const double ms = ms_since(t0);
+        if (parked_slot_ < slots_) {
+            run_slots_[parked_slot_]->x.nest_service_ms += ms;
+            nest_service_ms_ += ms;
+        }
         // layer time of units that stayed inside one chunk / group (or ended the last one)
         if (!done && eng_.prefill_rows_left() == left0 && eng_.prefill_layer() > layer0) layer_.observe(unit_rows, eng_.prefill_layer() - layer0, ms);
-        if (done && left0 == unit_rows) layer_.observe(unit_rows, 60 - layer0, ms);
+        else if (done && left0 == unit_rows) layer_.observe(unit_rows, 60 - layer0, ms);
+        else layer_.reset_pending();  // a resume spanning groups has no single-bucket sample
+        if (done) layer_.reset_pending();
         auto& r = run_slots_[prefill_slot_];
         ++r->x.units;
+        r->x.max_unit_layers = std::max(r->x.max_unit_layers,
+            layers == ~0U || *eng_.prefill_unlimited_reason() != 0 ? ~0U : layers);
         // the decoding requests stalled for this unit
         double stalled = 0;
         for (auto& o : run_slots_)
@@ -601,24 +802,49 @@ private:
             k.prefill_s += ms / 1e3;
             k.stall_s += stalled;
             ++k.units;
+            k.max_unit_layers = std::max(k.max_unit_layers, r->x.max_unit_layers);
         });
-        if (!done) return;
+        if (!r->x.nested) r->nest_quota.progressed = true;
+        if (!done) {
+            if (timeline_on_) timeline("unit", u0, layers == ~0U ? "whole" : "deadline", prefill_slot_, layer0, eng_.prefill_rows_left() != left0 ? 60 : eng_.prefill_layer(), summary, t0, returned);
+            return;
+        }
+        if (r->x.nested) {
+            Control check;
+            check.command = static_cast<std::uint32_t>(Command::check);
+            check.round = round_++;
+            check.task_id = r->request_id;
+            check.plen = next;
+            const auto checked = timeline_on_ ? Clock::now() : Clock::time_point{};
+            const auto reply = exchange(eng_, check);
+            if (timeline_on_) timeline("check", checked, "nested", prefill_slot_, 60, 60, timeline_task(eng_.prefill_progress()));
+            if (reply.plen != next) {
+                eng_.abort("nested completion token mismatch");
+                throw std::runtime_error("nested completion token mismatch");
+            }
+        }
         r->prefilling = false;
-        r->stats.prefill_ms = ms_since(prefill_start_);
+        r->stats.prefill_ms = ms_since(r->prefill_start);
         r->x.prefill_wall_ms = r->stats.prefill_ms;
         r->pos = r->stats.prompt_tokens;
         r->last = next;
         r->decode_start = Clock::now();
-        (void)emit(r, std::span(&next, 1));
+        if (!r->job.ticket->cancelled()) (void)emit(r, std::span(&next, 1));
+        else finish(r, "cancelled");
+        if (parked_slot_ < slots_) unpark();
+        if (timeline_on_) timeline("unit", u0, layers == ~0U ? "whole" : "deadline", prefill_slot_, layer0, 60, summary, t0, returned);
     }
 
     // One decode cycle over every decoding request: a plain batch step, or DSpark drafts + verify windows within 8 rows.
     void cycle() {
+        const auto op0 = Clock::now();
         std::vector<std::uint32_t> order;
         for (std::uint32_t s = 0; s < slots_; ++s)
             if (run_slots_[s] && !run_slots_[s]->prefilling) {
-                if (run_slots_[s]->pos + 1 >= capacity_) {
-                    finish(run_slots_[s], "context");
+                const auto action = ms::decode_action(run_slots_[s]->policy.sched == Sched::interleave && run_slots_[s]->job.ticket->cancelled(),
+                                                       run_slots_[s]->pos + 1 >= capacity_);
+                if (action != ms::DecodeAction::step) {
+                    finish(run_slots_[s], action == ms::DecodeAction::cancel ? "cancelled" : "context");
                     continue;
                 }
                 order.push_back(s);
@@ -714,8 +940,10 @@ private:
             for (std::uint32_t i = 0; i < ks; ++i) c.row[c.rows++] = mm::Row{s, drafts[s].tokens[i], r->pos + 1 + i};
             span_of.push_back({first, c.rows - first});
         }
+        const auto summary = timeline_on_ ? timeline_step(c) : std::string{};
         const auto t0 = Clock::now();
         (void)exchange(eng_, c);
+        const auto control_end = timeline_on_ ? Clock::now() : Clock::time_point{};
         const auto next = run_.step(std::span(c.row, c.rows), append);
         if (append != 0) ds::DeviceDrafter::device_synchronize();  // the context appends are part of this cycle's work
         const auto t_done = Clock::now();
@@ -754,6 +982,8 @@ private:
         // the gate on one boundary for both kinds of cycle: from the cycle's start (before any draft) to its completed
         // step + appends; plain cycles as seconds per token of the n rows
         const double t_cycle = secs(c0, t_done);
+        const double complete = secs(op0, Clock::now());
+        cycle_cost_[n] = std::max(complete, cycle_cost_[n] * 0.98);
         if (drafted) gates_[n].observe(true, emitted_total, t_cycle, costs_.at(0, n) / n);
         else if (!cand.empty() || budget > 0) gates_[n].observe(false, n, t_cycle / n, 0.0);
         add([&](Counters& k2) {
@@ -774,6 +1004,69 @@ private:
                 ++k2.plain_cycles;
             }
         });
+        deadline_serviced_ = true;
+        cycle_cost_[n] = std::max(cycle_cost_[n], secs(op0, Clock::now()));
+        if (timeline_on_) timeline("step", op0, step_reason_, 0, 0, 60, summary, control_end, t_done);
+        step_reason_ = "deadline";
+    }
+
+    // Only the enabled branch reads clocks or builds/queues records. No device synchronization.
+    std::string timeline_task(const mm::Engine::PfProgress& p, std::uint64_t child = 0) const {
+        return "\"task\":" + std::to_string(p.id) + ",\"parent_task\":" + std::to_string(p.parent) +
+            ",\"child_task\":" + std::to_string(child) + ",\"bank\":" + std::to_string(p.bank) +
+            ",\"slot_generation\":" + std::to_string(p.generation) + ",\"rows\":" + std::to_string(p.rows) +
+            ",\"checkpoint\":" + std::to_string(p.layer) + ",\"predicted_ms\":" + std::to_string(predicted_prompt_ms(p.rows));
+    }
+    std::string timeline_prefill(std::uint32_t slot, bool whole = false) const {
+        const auto& r = *run_slots_[slot];
+        auto left = whole ? eng_.prefill_rows_left() : eng_.prefill_unit_rows();
+        std::string out = "\"rows\":" + std::to_string(left) + ",\"members\":[";
+        for (bool first = true; left > 0; first = false) {
+            const auto rows = std::min(left, max_rows_);
+            if (!first) out += ",";
+            out += std::to_string(rows);
+            left -= rows;
+        }
+        out += "],\"slots\":[{\"slot\":" + std::to_string(slot) + ",\"request\":" + std::to_string(r.request_id) +
+               ",\"pos\":" + std::to_string(r.stats.prompt_tokens - eng_.prefill_rows_left()) + ",\"token_index\":0}]";
+        return out;
+    }
+    std::string timeline_step(const Control& c) const {
+        std::string out = "\"rows\":" + std::to_string(c.rows) + ",\"slots\":[";
+        for (unsigned i = 0; i < c.rows; ++i) {
+            const auto& r = *run_slots_[c.row[i].slot];
+            if (i > 0) out += ",";
+            out += "{\"slot\":" + std::to_string(c.row[i].slot) + ",\"request\":" + std::to_string(r.request_id) +
+                   ",\"pos\":" + std::to_string(c.row[i].pos) + ",\"token_index\":" + std::to_string(r.stats.generated_tokens + c.row[i].pos - r.pos) + "}";
+        }
+        return out + "]";
+    }
+    void timeline(const char* kind, Clock::time_point start, const char* reason, std::uint32_t slot = 0,
+                  unsigned layer0 = 0, unsigned layer1 = 0, const std::string& summary = {},
+                  Clock::time_point control_end = {}, Clock::time_point run_end = {}) {
+        if (!timeline_on_) return;
+        const auto end = Clock::now();
+        const auto op = timeline_op_++;
+        if (timeline_records_.size() == 65536) { ++timeline_dropped_; return; }
+        const auto us = [&](Clock::time_point t) { return std::chrono::duration_cast<std::chrono::microseconds>(t - timeline_origin_).count(); };
+        if (control_end == Clock::time_point{}) control_end = end;
+        if (run_end == Clock::time_point{}) run_end = end;
+        const bool prefill = std::strcmp(kind, "admit") == 0 || std::strcmp(kind, "unit") == 0;
+        std::string row = summary.empty() ? prefill ? timeline_prefill(slot) : "\"rows\":0,\"slots\":[]" : summary;
+        timeline_records_.push_back("{\"event\":\"mmserve-timeline\",\"op\":" + std::to_string(op) + ",\"epoch\":" + std::to_string(pol_.epoch) +
+            ",\"kind\":\"" + kind + "\",\"t_start_us\":" + std::to_string(us(start)) + ",\"t_end_us\":" + std::to_string(us(end)) +
+            ",\"control_end_us\":" + std::to_string(us(control_end)) + ",\"run_end_us\":" + std::to_string(us(run_end)) +
+            ",\"round\":" + std::to_string(round_ - 1) + ",\"layer0\":" + std::to_string(layer0) + ",\"layer1\":" + std::to_string(layer1) + ",\"reason\":\"" + reason + "\",\"age_ms\":" +
+            std::to_string(longest_wait_ms()) + ",\"slack_ms\":" + std::to_string(ms::remaining_ms(live_gap_ms(pol_.gap_ms), cycle_ms(decoding_count()), longest_wait_ms())) + "," + row + "}");
+    }
+    void flush_timeline() {
+        if (!timeline_on_) return;
+        for (const auto& record : timeline_records_) std::fprintf(stderr, "%s\n", record.c_str());
+        timeline_records_.clear();
+        if (timeline_dropped_ > 0) {
+            std::fprintf(stderr, "{\"event\":\"mmserve-timeline-drops\",\"count\":%llu}\n", static_cast<unsigned long long>(timeline_dropped_));
+            timeline_dropped_ = 0;
+        }
     }
 
     mm::Engine& eng_;
@@ -784,71 +1077,86 @@ private:
     const std::uint64_t capacity_;
     const std::uint64_t max_rows_;
     std::vector<std::optional<Running>> run_slots_;
+    std::optional<sv::TakenJob> pending_;
+    bool pending_short_first_ = false;
+    bool deadline_serviced_ = false;
+    const char* step_reason_ = "deadline";
+    bool timeline_on_ = false;
+    Clock::time_point timeline_origin_;
+    std::uint64_t timeline_op_ = 0, timeline_dropped_ = 0, request_id_ = 0;
+    std::vector<std::string> timeline_records_;
     std::uint64_t round_ = 0;
     std::uint32_t prefill_slot_ = 0;
-    Clock::time_point prefill_start_;
+    std::array<std::uint64_t, kStepRows> slot_generation_{};
+    std::uint32_t parked_slot_ = slots_;
+    Clock::time_point park_start_;
+    Clock::time_point nest_start_;
+    double nest_switch_upper_ms_ = 20, nest_service_ms_ = 0;
+    bool nested_needs_decode_ = false;
     Policy pol_;
     Costs costs_;
-    LayerModel layer_;
+    std::array<double, kStepRows + 1> cycle_cost_{};
+    ms::LayerModel layer_;
     bool taps_ = false;  // the engine's taps (set to the startup policy before READY, then sync_taps)
     std::vector<ds::DraftGate> gates_ = std::vector<ds::DraftGate>(kStepRows + 1);  // one per decoding count
     std::array<std::uint64_t, kStepRows + 1> explore_{};
 };
 
-void follow(mm::Engine& eng, Runner& run) {
+void follow(mm::Engine& eng, Runner& run) try {
+    std::uint64_t round = run.control_round;
     for (;;) {
         Control mine;
+        mine.ack_round = round == 0 ? ~std::uint64_t{0} : round - 1;
+        mine.plen = eng.prefill_progress().open ? 0 : run.last_next;
         const Control c = exchange(eng, mine);
-        switch (static_cast<Command>(c.command)) {
-        case Command::heartbeat:
-            break;
-        case Command::shutdown:
-            if (eng.prefill_open()) run.prefill_cancel();
-            return;
-        case Command::prefill: {
-            std::vector<std::uint32_t> prompt;
-            exchange_tokens(eng, prompt, c.plen, false);
-            run.prefill_begin(c.pslot, prompt, (c.pflags & 1U) != 0);
-            break;
+        if (c.round != round++) {
+            eng.abort("control channel: duplicate / stale round");
+            throw std::runtime_error("control channel: duplicate / stale round");
         }
-        case Command::unit: {
-            std::uint32_t next = 0;
-            (void)run.prefill_unit(c.layers, &next);
-            break;
-        }
-        case Command::cancel:
-            run.prefill_cancel();
-            break;
-        case Command::taps:
-            eng.set_taps((c.pflags & 1U) != 0);
-            break;
-        case Command::draft:
-            if (run.dd == nullptr) throw std::runtime_error("control channel: draft command without a drafter on rank 1");
-            for (std::uint32_t i = 0; i < c.dslots; ++i) (void)run.draft(c.dslot[i], c.danchor[i], c.dpos[i]);
-            break;
-        case Command::step:
-            (void)run.step(std::span(c.row, c.rows), c.append);
-            break;
-        default:
-            throw std::runtime_error("control channel: unknown command " + std::to_string(c.command));
-        }
+        if (!ms::replay_command(c, eng, run, [&](std::size_t n) {
+                std::vector<std::uint32_t> prompt;
+                exchange_tokens(eng, prompt, n, false);
+                return prompt;
+            })) return;
     }
+} catch (...) {
+    eng.abort("control channel: protocol failure");
+    throw;
 }
 
 // ---- both ranks, before READY: the resumable prefill vs prefill() with decode steps of other slots in between ----
-// For each prompt file: reference = slots 1, 2 prefilled with the prompt's first 64 tokens, then S decode steps on them,
-// then the prompt prefilled whole in slot 0; arm k = the same, but slot 0's prefill opened after the first step and
-// resumed k layers at a time between the steps. Compared: slot 0's state FNV (every layer's K / V / index-key rows), the
-// final rows' FNV, the next token, the decode tokens of slots 1 and 2, and (with a drafter) a draft from slot 0.
-int resume_check(mm::Engine& eng, Runner& run, const std::string& files) {
+// Each request has a complete, fixed-length continuation (stop IDs are retained). Compare all IDs, committed states,
+// prompt output rows and continuation logits. Include idle bounded resumes and two queued prompts in reversed order.
+int resume_check(mm::Engine& eng, Runner& run, const std::string& files, unsigned tokens, const std::string& nested_file, unsigned child_layers) try {
+    if (eng.slots() < 3 || tokens == 0) throw std::invalid_argument("resume-check: requires at least 3 slots and positive continuation length");
+    struct Result {
+        std::array<std::vector<std::uint32_t>, 3> ids;
+        std::array<std::uint64_t, 3> state{}, logits{}, out{};
+        std::array<std::uint32_t, ds::block> draft{};
+        bool operator==(const Result&) const = default;
+    };
+    const auto receipt = [&](const Result& a, const Result& ref) {
+        for (unsigned slot = 0; slot < 3; ++slot) {
+            if (ref.ids[slot].empty()) continue;
+            std::printf("rank %u resume-check slot=%u ids=%zu/%zu ids_fnv=%s/%s state=%s/%s out=%s/%s logits=%s/%s\n",
+                        eng.rank(), slot, a.ids[slot].size(), ref.ids[slot].size(),
+                        hex(fnv(a.ids[slot].data(), a.ids[slot].size() * 4)).c_str(),
+                        hex(fnv(ref.ids[slot].data(), ref.ids[slot].size() * 4)).c_str(),
+                        hex(a.state[slot]).c_str(), hex(ref.state[slot]).c_str(),
+                        hex(a.out[slot]).c_str(), hex(ref.out[slot]).c_str(),
+                        hex(a.logits[slot]).c_str(), hex(ref.logits[slot]).c_str());
+        }
+    };
+    eng.set_prefill_check_outputs(true);
     int bad = 0;
+    bool nested_ran = false;
     std::size_t at = 0;
     while (at <= files.size()) {
         const auto comma = files.find(',', at);
         std::string f = files.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
         at = comma == std::string::npos ? files.size() + 1 : comma + 1;
         if (f.empty()) continue;
-        std::vector<unsigned> ks{1, 7, 60};  // FILE[:k/k/...]
+        std::vector<unsigned> ks{1, 7, 60};
         if (const auto colon = f.rfind(':'); colon != std::string::npos) {
             ks.clear();
             for (std::size_t a = colon + 1; a < f.size();) {
@@ -861,79 +1169,256 @@ int resume_check(mm::Engine& eng, Runner& run, const std::string& files) {
         std::ifstream in(f, std::ios::binary);
         std::vector<std::uint32_t> p;
         for (std::uint32_t t; in.read(reinterpret_cast<char*>(&t), 4);) p.push_back(t);
-        if (p.size() < 80) throw std::invalid_argument("resume-check: " + f + " has fewer than 80 tokens");
+        if (p.size() < 80 || p.size() + tokens >= eng.capacity())
+            throw std::invalid_argument("resume-check: prompt needs >=80 tokens and room for the complete continuation");
         const std::vector<std::uint32_t> q(p.begin(), p.begin() + 64);
-        constexpr int kSteps = 24;
         const bool ctx = run.dd != nullptr && p.size() <= 4096;
-        struct Result {
-            std::uint64_t state = 0, out = 0;
-            std::uint32_t next = 0;
-            std::vector<std::uint32_t> dec;
-            std::array<std::uint32_t, ds::block> draft{};
-            double wall = 0;
-            unsigned units = 0;
+        auto hash_logits = [&](Result& r, unsigned slot, std::size_t rows, std::size_t row) {
+            const auto logits = eng.last_logits(rows);
+            const auto width = logits.size() / rows;
+            r.logits[slot] = fnv(logits.data() + row * width, width * sizeof(float),
+                                  r.logits[slot] == 0 ? 14695981039346656037ULL : r.logits[slot]);
         };
-        const auto arm = [&](unsigned k) {
+        // Capture before another prefill, decode or draft can replace the prompt output/head.
+        const auto completed = [&](Result& r, unsigned slot, std::uint32_t next) {
+            r.ids[slot].push_back(next);
+            r.out[slot] = eng.prefill_check_output_fnv();
+            hash_logits(r, slot, 1, 0);
+        };
+        const auto arm = [&](unsigned k, bool idle) {
             Result r;
-            std::array<std::uint32_t, 3> last{};
-            for (std::uint32_t s = 1; s <= 2; ++s) {
-                run.prefill_begin(s, q, false);
-                (void)run.prefill_unit(~0U, &last[s]);
-            }
-            std::array<std::uint64_t, 3> pos{0, q.size(), q.size()};
-            const auto step = [&] {
-                const std::array<mm::Row, 2> rows{mm::Row{1, last[1], pos[1]}, mm::Row{2, last[2], pos[2]}};
-                const auto g = run.step(rows, 0);
-                for (std::uint32_t s = 1; s <= 2; ++s) {
-                    last[s] = g[s - 1];
-                    ++pos[s];
-                    r.dec.push_back(g[s - 1]);
+            std::array<std::uint64_t, 3> pos{p.size(), q.size(), q.size()};
+            auto backgrounds = [&] {
+                for (unsigned slot = 1; slot <= 2; ++slot) {
+                    std::uint32_t next = 0;
+                    run.prefill_begin(slot, q, false, ++run.local_id);
+                    (void)run.prefill_unit(~0U, &next);
+                    completed(r, slot, next);
                 }
             };
-            const auto t0 = Clock::now();
-            if (k == 0) {
-                for (int i = 0; i < kSteps; ++i) step();
-                run.prefill_begin(0, p, ctx);
-                (void)run.prefill_unit(~0U, &r.next);
-                r.out = eng.prefill_out_fnv();  // before any later call overwrites the final rows (they alias hn)
-                r.units = 1;
-            } else {
-                step();
-                run.prefill_begin(0, p, ctx);
-                int steps = 1;
-                for (bool done = false; !done;) {
-                    done = run.prefill_unit(k, &r.next);
-                    if (done) r.out = eng.prefill_out_fnv();
-                    ++r.units;
-                    if (steps < kSteps) {
-                        step();
-                        ++steps;
-                    }
+            auto step = [&] {
+                const std::array<mm::Row, 2> rows{mm::Row{1, r.ids[1].back(), pos[1]}, mm::Row{2, r.ids[2].back(), pos[2]}};
+                const auto g = run.step(rows, 0);
+                for (unsigned slot = 1; slot <= 2; ++slot) {
+                    ++pos[slot];
+                    r.ids[slot].push_back(g[slot - 1]);
+                    hash_logits(r, slot, 2, slot - 1);
                 }
-                for (; steps < kSteps; ++steps) step();
+            };
+            if (!idle) backgrounds();
+            if (k != 0 && !idle && tokens > 1) step();
+            run.prefill_begin(0, p, ctx, ++run.local_id);
+            unsigned units = 0;
+            for (bool done = false; !done;) {
+                unsigned budget = k == 0 ? ~0U : k;
+                if (idle && k != 0) {
+                    const ms::LayerModel model;
+                    budget = ms::resume_layers(std::min(budget, ms::unit_layers(250, false, 1500, 0, model.fixed_ms,
+                        model.layer_ms(std::max<std::uint64_t>(1, eng.prefill_unit_rows())))));
+                }
+                std::uint32_t next = 0;
+                done = run.prefill_unit(budget, &next);
+                ++units;
+                if (done) completed(r, 0, next);
+                if (!idle && k != 0 && r.ids[1].size() < tokens) step();
             }
-            r.wall = secs(t0, Clock::now());
-            r.state = eng.state_fnv(0, p.size());
-            if (ctx) r.draft = run.draft(0, r.next, p.size()).tokens;
+            if (ctx) r.draft = run.draft(0, r.ids[0].back(), p.size()).tokens;
+            if (idle) backgrounds();
+            while (r.ids[1].size() < tokens) step();
+            for (unsigned i = 1; i < tokens; ++i) {
+                const mm::Row row{0, r.ids[0].back(), pos[0]++};
+                const auto g = run.step(std::span(&row, 1), 0);
+                r.ids[0].push_back(g[0]);
+                hash_logits(r, 0, 1, 0);
+            }
+            for (unsigned slot = 0; slot < 3; ++slot) r.state[slot] = eng.state_fnv(slot, pos[slot]);
+            if (idle && k != 0 && *eng.prefill_unlimited_reason() == 0 && units < 2) ++bad;
+            std::printf("rank %u resume-check prompt_tokens=%zu k=%u idle=%u units=%u fallback=%s\n",
+                        eng.rank(), p.size(), k, idle ? 1U : 0U, units, eng.prefill_unlimited_reason());
             return r;
         };
-        const Result ref = arm(0);
-        for (const unsigned k : ks) {
+        const Result ref = arm(0, false);
+        for (unsigned k : ks) {
             if (k == 0) throw std::invalid_argument("resume-check: k >= 1");
-            const Result a = arm(k);
-            const bool ok = a.state == ref.state && a.out == ref.out && a.next == ref.next && a.dec == ref.dec && a.draft == ref.draft;
-            bad += ok ? 0 : 1;
-            std::printf("rank %u resume-check %s (%zu tokens%s) k=%u units %u: state %016llx / %016llx out %016llx / %016llx next %u / %u "
-                        "decode %s draft %s wall %.2f / %.2f s -> %s\n",
-                        eng.rank(), f.c_str(), p.size(), ctx ? ", drafter context" : "", k, a.units, static_cast<unsigned long long>(a.state),
-                        static_cast<unsigned long long>(ref.state), static_cast<unsigned long long>(a.out),
-                        static_cast<unsigned long long>(ref.out), a.next, ref.next, a.dec == ref.dec ? "==" : "DIFFER",
-                        ctx ? (a.draft == ref.draft ? "==" : "DIFFER") : "-", a.wall, ref.wall, ok ? "IDENTICAL" : "MISMATCH");
-            std::fflush(stdout);
+            for (bool idle : {false, true}) {
+                const auto a = arm(k, idle);
+                const bool ok = a == ref;
+                receipt(a, ref);
+                bad += ok ? 0 : 1;
+                std::printf("rank %u resume-check k=%u idle=%u continuation=%u all IDs/state/prompt outputs/first+continuation logits/draft: %s\n",
+                            eng.rank(), k, idle ? 1U : 0U, tokens, ok ? "IDENTICAL" : "MISMATCH");
+            }
         }
+        // Two waiting prompts submitted together. Rank 0 selects; the follower receives only the selected slot.
+        const auto reorder = [&](bool short_first) {
+            Result r;
+            sv::GenerationQueue queue;
+            if (eng.rank() == 0) {
+                sv::GenerationJob long_job, short_job;
+                long_job.prompt = p; short_job.prompt = q;
+                (void)queue.submit(std::move(long_job)); (void)queue.submit(std::move(short_job));
+            }
+            for (unsigned i = 0; i < 2; ++i) {
+                std::optional<sv::TakenJob> job;
+                unsigned slot = 0;
+                if (eng.rank() == 0) {
+                    job = queue.take(false, short_first ? sv::QueueSelection::short_first : sv::QueueSelection::fifo);
+                    slot = job->job.prompt.size() == p.size() ? 0U : 1U;
+                }
+                slot = eng.agree(slot);
+                if (slot != (short_first ? 1 - i : i)) ++bad;
+                const auto& prompt = slot == 0 ? p : q;
+                run.prefill_begin(slot, prompt, false, ++run.local_id);
+                std::uint32_t next = 0;
+                (void)run.prefill_unit(~0U, &next);
+                completed(r, slot, next);
+                std::uint64_t pos = prompt.size();
+                for (unsigned j = 1; j < tokens; ++j) {
+                    const mm::Row row{slot, r.ids[slot].back(), pos++};
+                    r.ids[slot].push_back(run.step(std::span(&row, 1), 0)[0]);
+                    hash_logits(r, slot, 1, 0);
+                }
+                r.state[slot] = eng.state_fnv(slot, pos);
+                if (job) queue.finish(*job, {});
+            }
+            return r;
+        };
+        const auto fifo = reorder(false);
+        const auto shortest = reorder(true);
+        receipt(shortest, fifo);
+        const bool ordered = shortest == fifo;
+        bad += ordered ? 0 : 1;
+        std::printf("rank %u resume-check short-first complete continuations/state/prompt outputs/first+continuation logits: %s\n", eng.rank(), ordered ? "IDENTICAL" : "MISMATCH");
+        if (nested_file.empty()) continue;
+        nested_ran = true;
+        // Explicit nested qualification never truncates the original fixture.
+        std::ifstream short_in(nested_file, std::ios::binary);
+        if (!short_in) throw std::invalid_argument("resume-check nested: cannot open fixture");
+        const auto short_prompt = ms::nested_fixture(short_in, eng.nested_rows(), eng.capacity(), tokens);
+        if (*eng.prefill_unlimited_reason() != 0)
+            throw std::runtime_error("resume-check nested: requires bounded path (NOT a pass)");
+        const std::array<std::vector<std::uint32_t>, 3> prompts{p, short_prompt, q};
+        const auto nested_arm = [&](unsigned checkpoint, bool background_step) {
+            Result r;
+            std::array<std::uint64_t, 3> pos{p.size(), short_prompt.size(), q.size()};
+            auto& check_round = run.control_round;
+            const auto command = [&](Command op, std::uint64_t id, std::uint64_t parent = 0,
+                                     unsigned slot = 0, unsigned layers = 0) {
+                Control out;
+                out.ack_round = check_round == 0 ? ~std::uint64_t{0} : check_round - 1;
+                if (eng.rank() == 0) {
+                    out.command = static_cast<std::uint32_t>(op);
+                    out.round = check_round;
+                    out.task_id = id; out.parent_task_id = parent; out.slot_generation = 1;
+                    out.pslot = slot; out.layers = layers;
+                    out.bank = op == Command::nest ? 1U : eng.prefill_progress().bank;
+                    if (op == Command::check) out.plen = run.last_next;
+                    if (op == Command::prefill || op == Command::nest) out.plen = static_cast<std::uint32_t>(prompts[slot].size());
+                }
+                const auto peer = exchange(eng, out);
+                const auto& c = eng.rank() == 0 ? out : peer;
+                if (c.round != check_round++) {
+                    eng.abort("nested check replay round");
+                    throw std::runtime_error("nested check replay round");
+                }
+                (void)ms::replay_command(c, eng, run, [&](std::size_t n) {
+                    auto prompt = eng.rank() == 0 ? prompts[slot] : std::vector<std::uint32_t>{};
+                    exchange_tokens(eng, prompt, n, eng.rank() == 0);
+                    return prompt;
+                });
+            };
+            const auto unit = [&](std::uint64_t id, unsigned layers, std::uint32_t* next) {
+                command(Command::unit, id, 0, 0, layers);
+                *next = run.last_next;
+                return !eng.prefill_active();
+            };
+            const auto begin = [&](unsigned slot, std::uint64_t id, std::uint64_t parent) {
+                command(parent == 0 ? Command::prefill : Command::nest, id, parent, slot);
+            };
+            const auto checked_completion = [&](unsigned slot, std::uint32_t next) {
+                command(Command::check, 100 + slot);
+                completed(r, slot, next);
+            };
+            const auto advance = [&](unsigned slot) {
+                const mm::Row row{slot, r.ids[slot].back(), pos[slot]++};
+                r.ids[slot].push_back(run.step(std::span(&row, 1), 0)[0]);
+                hash_logits(r, slot, 1, 0);
+            };
+            const auto complete = [&](unsigned slot) {
+                while (r.ids[slot].size() < tokens) advance(slot);
+                r.state[slot] = eng.state_fnv(slot, pos[slot]);
+            };
+            std::uint32_t next = 0;
+            if (checkpoint == 0) {
+                for (unsigned slot = 0; slot < 3; ++slot) {
+                    begin(slot, 100 + slot, 0);
+                    (void)unit(100 + slot, ~0U, &next);
+                    checked_completion(slot, next);
+                    complete(slot);
+                }
+            } else {
+                begin(2, 102, 0);
+                (void)unit(102, ~0U, &next);
+                checked_completion(2, next);
+                begin(0, 100, 0);
+                if (unit(100, checkpoint, &next)) throw std::runtime_error("nested check did not park an incomplete long");
+                const auto before = eng.prefill_progress();
+                const auto live = eng.prefill_activation_fnv(100);
+                if (background_step && tokens > 1) advance(2); // overwrite the shared eight-row save's source
+                command(Command::park, 100);
+                const auto frozen = eng.prefill_activation_fnv(100);
+                if (live != frozen) ++bad;
+                begin(1, 101, 100);
+                unsigned child_units = 0;
+                while (!unit(101, child_layers, &next)) {
+                    ++child_units;
+                    if (background_step && r.ids[2].size() < tokens) advance(2);
+                    if (eng.prefill_activation_fnv(100) != frozen) ++bad;
+                }
+                if (child_layers < 60 && child_units == 0) ++bad;
+                checked_completion(1, next); // consume child output/head before rebinding
+                if (eng.prefill_activation_fnv(100) != frozen) ++bad;
+                command(Command::resume_parked, 100);
+                if (eng.prefill_progress() != before) throw std::runtime_error("nested checkpoint changed");
+                (void)unit(100, ~0U, &next);
+                checked_completion(0, next);
+                for (;;) {
+                    std::vector<mm::Row> rows;
+                    for (unsigned slot = 0; slot < 3; ++slot)
+                        if (r.ids[slot].size() < tokens) rows.push_back({slot, r.ids[slot].back(), pos[slot]++});
+                    if (rows.empty()) break;
+                    const auto g = run.step(rows, 0);
+                    for (std::size_t i = 0; i < rows.size(); ++i) {
+                        r.ids[rows[i].slot].push_back(g[i]);
+                        hash_logits(r, rows[i].slot, rows.size(), i);
+                    }
+                }
+                for (unsigned slot = 0; slot < 3; ++slot) complete(slot);
+            }
+            return r;
+        };
+        if (std::none_of(ks.begin(), ks.end(), [](unsigned k) { return k > 0 && k < 60; }))
+            throw std::invalid_argument("resume-check nested: supply at least one park layer in 1..59");
+        const auto standalone = nested_arm(0, false);
+        for (unsigned checkpoint : ks) {
+            if (checkpoint >= 60) continue; // existing k=60 is a unit size, not a valid first-group park layer
+            for (bool background_step : {false, true}) {
+                const auto nested = nested_arm(checkpoint, background_step);
+                receipt(nested, standalone);
+                const bool identical = nested == standalone;
+                bad += identical ? 0 : 1;
+                std::printf("rank %u resume-check nested parent_rows=%zu short_rows=%zu park_layer=%u background_step=%u standalone B1 IDs/state/output/first+continuation logits: %s\n",
+                    eng.rank(), p.size(), short_prompt.size(), checkpoint, background_step ? 1U : 0U, identical ? "IDENTICAL" : "MISMATCH");
+            }
+        }
+        std::fflush(stdout);
     }
-    // either rank's mismatch stops both (the peer's count over the control channel)
+    if (!nested_file.empty() && !nested_ran) throw std::invalid_argument("resume-check nested: no parent fixtures");
+    eng.set_prefill_check_outputs(false);
     return bad + static_cast<int>(eng.peer(static_cast<std::uint32_t>(bad)));
+} catch (...) {
+    eng.abort("control channel: protocol failure");
+    throw;
 }
 
 // ---- rank 0: the HTTP API's scheduler side (ms::MinimaxApi serves the routes) ----
@@ -943,6 +1428,24 @@ sv::Json policy_json(Shared& shared, bool drafter) {
     const Counters& c = shared.counters;
     sv::Json b = sv::Json::object();
     b.set("sched", sv::Json(p.sched == Sched::interleave ? "interleave" : "off"));
+    b.set("effective_sched", sv::Json(p.sched == Sched::off ? "off" : shared.unlimited_reason.empty() ? "interleave" : "unlimited"));
+    b.set("nest", sv::Json(p.nest));
+    b.set("effective_nest", sv::Json(p.nest && p.sched == Sched::interleave && shared.nest_rows > 0 && shared.unlimited_reason.empty()));
+    b.set("nest_reason", sv::Json(!p.nest ? "disabled" : p.sched == Sched::off ? "sched_off" :
+        !shared.unlimited_reason.empty() ? shared.unlimited_reason : shared.nest_reason));
+    b.set("nest_rows", sv::Json(static_cast<std::int64_t>(shared.nest_rows)));
+    b.set("nest_poll_ms", sv::Json(std::int64_t{0}));  // Phase A gap-budget units; no extra arrival cap
+    b.set("nest_max_per_parent", sv::Json(std::int64_t{2}));
+    b.set("nest_bank_bytes", sv::Json(static_cast<std::int64_t>((shared.nest_rows == 0 ? 0U : std::max(8U, shared.nest_rows)) * 6144ULL * 8)));
+    b.set("nest_tap_bytes", sv::Json(static_cast<std::int64_t>(shared.nest_taps && shared.nest_rows != 0 ? std::max(8U, shared.nest_rows) * 6144ULL * 20 : 0)));
+    b.set("active_task", sv::Json(static_cast<std::int64_t>(shared.active_id)));
+    b.set("parked_task", sv::Json(static_cast<std::int64_t>(shared.parked_id)));
+    b.set("nest_qualification", sv::Json("pending extended resume-check"));
+    b.set("service_ms", sv::Json(p.service_ms));
+    b.set("short_first", sv::Json(p.sched == Sched::interleave && p.short_first));
+    b.set("fallback_reason", sv::Json(p.sched == Sched::off ? "sched_off" : shared.unlimited_reason));
+    b.set("max_unit_layers", sv::Json(static_cast<std::int64_t>(c.max_unit_layers)));
+    b.set("qualification", sv::Json("pending"));
     b.set("gap_ms", sv::Json(p.gap_ms));
     b.set("dspark", sv::Json(p.dspark && drafter));
     b.set("dspark_inflight", sv::Json(static_cast<std::int64_t>(p.inflight)));
@@ -1003,18 +1506,25 @@ sv::Json admin_sched(const sv::HttpRequest& req, Shared& shared, bool drafter) {
     if (req.method == "POST") {
         const sv::Json body = sv::parse_json(req.body);
         std::lock_guard<std::mutex> l(shared.m);
-        Policy& p = shared.policy;
+        Policy p = shared.policy;
         if (const auto* v = body.find("sched"); v && v->is_string()) {
             if (v->as_string() == "off") p.sched = Sched::off;
             else if (v->as_string() == "interleave") p.sched = Sched::interleave;
             else throw std::invalid_argument("sched: off | interleave");
         }
-        if (const auto* v = body.find("gap_ms"); v && v->is_number()) p.gap_ms = std::max(1.0, v->as_double());
+        if (const auto* v = body.find("gap_ms"); v && v->is_number()) p.gap_ms = ms::gap_ms(v->dump().c_str());
+        if (const auto* v = body.find("service_ms"); v && v->is_number()) p.service_ms = ms::service_ms(v->dump().c_str());
+        if (const auto* v = body.find("nest")) {
+            if (!v->is_bool()) throw std::invalid_argument("nest: boolean required");
+            p.nest = v->as_bool();
+        }
+        if (const auto* v = body.find("short_first"); v && v->is_bool()) p.short_first = v->as_bool();
         if (const auto* v = body.find("dspark"); v && v->is_bool()) p.dspark = v->as_bool();
         if (const auto* v = body.find("dspark_inflight"); v && v->is_number()) p.inflight = static_cast<std::uint32_t>(std::max<std::int64_t>(0, v->as_int()));
         if (const auto* v = body.find("draft_slots"); v && v->is_number()) p.draft_slots = static_cast<std::uint32_t>(std::clamp<std::int64_t>(v->as_int(), 1, 8));
         if (body.find("reset_counters")) shared.counters = Counters{};
         ++p.epoch;
+        shared.policy = p;
     }
     return policy_json(shared, drafter);
 }
@@ -1022,8 +1532,13 @@ sv::Json admin_sched(const sv::HttpRequest& req, Shared& shared, bool drafter) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    // Defaults-on resolver before anything reads a switch; --print-effective-config prints the resolved configuration.
-    if (strix::minimax::defaults::print_or_apply("serve", argc, argv)) return 0;
+    // Defaults-on resolver and validation precede any device work, including inspection-only calls.
+    try {
+        if (strix::minimax::defaults::print_or_apply("serve", argc, argv)) return 0;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "minimax serve: %s\n", e.what());
+        return 2;
+    }
     if (argc < 2) {
         std::fprintf(stderr, "usage: %s MODEL_DIR --rank R --transport T [--port P] [--bind ADDR] [--slots S] [--capacity C] "
                              "[--max-rows R] [--model-id ID] [--max-tokens N] [--dspark DIR [--dspark-exl3 DIR]] [--admin] "
@@ -1045,9 +1560,9 @@ int main(int argc, char** argv) {
         mm::Options opt;
         opt.model_dir = argv[1];
         opt.slots = 8;
-        std::string transport_spec = "usb4-auto", bind = "127.0.0.1", model_id = "minimax-m3.1-flash", dspark_dir, dspark_exl3, check;
+        std::string transport_spec = "usb4-auto", bind = "127.0.0.1", model_id = "minimax-m3.1-flash", dspark_dir, dspark_exl3, check, check_nested;
         std::uint16_t port = 8080;
-        std::uint32_t max_tokens = 4096;
+        std::uint32_t max_tokens = 4096, check_tokens = 256, check_child_layers = ~0U;
         bool admin = false, check_only = false;
         for (int i = 2; i < argc; ++i) {
             const std::string a = argv[i];
@@ -1067,10 +1582,24 @@ int main(int argc, char** argv) {
             else if (a == "--dspark") dspark_dir = next();
             else if (a == "--dspark-exl3") dspark_exl3 = next();
             else if (a == "--admin") admin = true;
+            else if (a == "--resume-check-child-layers") check_child_layers = static_cast<unsigned>(std::stoul(next()));
+            else if (a == "--resume-check-nested") {
+                check_nested = next();
+                if (check_nested.empty()) throw std::invalid_argument("--resume-check-nested requires a fixture");
+            }
             else if (a == "--resume-check") check = next();
+            else if (a == "--resume-check-tokens") check_tokens = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--check-only") check_only = true;
             else throw std::invalid_argument("unknown option " + a);
         }
+        if (check_child_layers == 0 || (check_child_layers != ~0U && check_child_layers >= 60))
+            throw std::invalid_argument("--resume-check-child-layers: 1..59");
+        if ((!check_nested.empty() || check_child_layers != ~0U) && check.empty())
+            throw std::invalid_argument("nested qualification requires --resume-check");
+        if (check_child_layers != ~0U && check_nested.empty())
+            throw std::invalid_argument("bounded child requires --resume-check-nested");
+        if (check_child_layers != ~0U && check_tokens < 2 + 59 / check_child_layers)
+            throw std::invalid_argument("bounded child requires enough continuation tokens for every background step");
         if (opt.slots == 0 || opt.slots > 8) throw std::invalid_argument("--slots 1..8");
         if (!dspark_exl3.empty() && dspark_dir.empty()) dspark_dir = opt.model_dir + "/dspark";
         std::signal(SIGINT, on_signal);
@@ -1123,8 +1652,17 @@ int main(int argc, char** argv) {
                         static_cast<double>(drafter->weight_bytes()) / 1e9, static_cast<double>(drafter->ring_bytes()) / 1e6, opt.slots);
             std::fflush(stdout);
         }
+        (void)eng.reserve_nested(drafter != nullptr);
+        // A protocol/capacity handshake before any check or READY, independent of rank-1 environment policy.
+        const auto peer_capacity = eng.peer(eng.nested_rows());
+        if (peer_capacity != eng.nested_rows()) {
+            eng.abort("nested capacity mismatch");
+            throw std::runtime_error("nested capacity mismatch");
+        }
+        Control hello;
+        (void)exchange(eng, hello);
         if (!check.empty()) {
-            const int bad = resume_check(eng, run, check);
+            const int bad = resume_check(eng, run, check, check_tokens, check_nested, check_child_layers);
             std::printf("rank %u resume-check: %s\n", opt.rank, bad == 0 ? "ALL IDENTICAL" : "MISMATCH");
             std::fflush(stdout);
             if (bad != 0) return 4;
@@ -1143,11 +1681,15 @@ int main(int argc, char** argv) {
         }
         Shared shared;
         {
-            const char* s = std::getenv("STRIX_MM_SERVE_SCHED");
-            const std::string m = s ? s : "off";
-            if (m == "interleave" || m == "1") shared.policy.sched = Sched::interleave;
-            else if (m != "off" && m != "0") throw std::invalid_argument("STRIX_MM_SERVE_SCHED: off | interleave");
-            shared.policy.gap_ms = env_num("STRIX_MM_SERVE_GAP_MS", 1500);
+            shared.policy.nest = env_num("STRIX_MM_SERVE_NEST", 1) != 0;
+            shared.nest_rows = eng.nested_rows();
+            shared.nest_reason = eng.nested_reason();
+            shared.nest_taps = drafter != nullptr;
+            shared.policy.sched = ms::sched_mode(std::getenv("STRIX_MM_SERVE_SCHED"));
+            shared.policy.service_ms = ms::service_ms(std::getenv("STRIX_MM_SERVE_SERVICE_MS"));
+            shared.policy.short_first = env_num("STRIX_MM_SERVE_SHORT_FIRST", 1) != 0;
+            shared.unlimited_reason = eng.prefill_unlimited_reason();
+            shared.policy.gap_ms = ms::gap_ms(std::getenv("STRIX_MM_SERVE_GAP_MS"));
             shared.policy.dspark = dspark_on;
             shared.policy.inflight = static_cast<std::uint32_t>(env_num("STRIX_MM_SERVE_DSPARK_INFLIGHT", 1));
             shared.policy.draft_slots = static_cast<std::uint32_t>(std::clamp(env_num("STRIX_MM_SERVE_DRAFT_SLOTS", 8), 1.0, 8.0));
@@ -1188,6 +1730,7 @@ int main(int argc, char** argv) {
         sv::HttpServer http(hc, [&](const sv::HttpRequest& r, sv::HttpResponseWriter& w) { api.handle(r, w); });
         http.listen();
         std::thread http_thread([&] { http.serve(); });
+        std::printf("minimax serve policy: %s\n", policy_json(shared, drafter != nullptr).dump().c_str());
         std::printf("READY rank 0 http://%s:%u model %s slots %u context %llu sched %s gap %.0f ms dspark %s\n", bind.c_str(), http.port(),
                     model_id.c_str(), opt.slots, static_cast<unsigned long long>(opt.capacity),
                     shared.policy.sched == Sched::interleave ? "interleave" : "off", shared.policy.gap_ms, shared.policy.dspark ? "on" : "off");

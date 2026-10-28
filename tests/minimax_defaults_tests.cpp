@@ -10,6 +10,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -83,6 +84,7 @@ std::set<std::string> lines(const std::string& text) {
 
 // The value each item replaced (measurement evidence), written out independently of the table.
 const std::map<std::string, std::string> kFormer = {
+    {"STRIX_MM_SERVE_NEST", "0"}, {"STRIX_MM_SERVE_SCHED", "off"}, {"STRIX_MM_SERVE_SERVICE_MS", "0"}, {"STRIX_MM_SERVE_SHORT_FIRST", "0"},
     {"STRIX_MMX_MOE_WIDE", "0"},           {"STRIX_MM_INDEX_CONC", "0"},       {"STRIX_MMX_CRC", "1"},
     {"STRIX_MM_XB_WAIT", "0"},             {"STRIX_MM_XB_INPLACE", "0"},       {"STRIX_MM_XB_PUBLISH", "0"},
     {"STRIX_MM_XB_POSTILP", "0"},          {"STRIX_MM_XB_WARM", "0"},          {"STRIX_MM_DSPARK_ATTN", "0"},
@@ -172,6 +174,42 @@ void test_cli() {
     check(d.transport == "usb4-auto" && d.slots == 8, "serve cli defaults = receipt");
 }
 
+void test_serve_preflight() {
+    const auto cli = md::parse_cli("serve", {"M"});
+    const EnvMap none;
+    const auto defaults = lines(md::effective_config(cli, lookup(none)));
+    for (const char* line : {"serve.sched=interleave", "serve.service_ms=250", "serve.gap_ms=1500",
+                             "serve.short_first=1", "serve.nest=1"})
+        check(defaults.count(line) == 1, std::string("resolved policy: ") + line);
+    const EnvMap custom = {{"STRIX_MM_SERVE_SCHED", "0"}, {"STRIX_MM_SERVE_SERVICE_MS", "0"},
+                          {"STRIX_MM_SERVE_GAP_MS", "100"}, {"STRIX_MM_SERVE_SHORT_FIRST", "0"},
+                          {"STRIX_MM_SERVE_NEST", "0"}};
+    const auto printed = lines(md::effective_config(cli, lookup(custom)));
+    for (const char* line : {"serve.sched=off", "serve.service_ms=0", "serve.gap_ms=100",
+                             "serve.short_first=0", "serve.nest=0"})
+        check(printed.count(line) == 1, std::string("custom policy: ") + line);
+    check(printed.count("serve.gap_ms=1500") == 0, "different deadlines have different config identity");
+    const EnvMap base = {{md::kBaselineEnv, "1"}};
+    const auto baseline = lines(md::effective_config(cli, lookup(base)));
+    check(baseline.count("serve.sched=off") == 1 && baseline.count("serve.service_ms=0") == 1 &&
+          baseline.count("serve.short_first=0") == 1 && baseline.count("serve.nest=0") == 1 &&
+          baseline.count("serve.gap_ms=1500") == 1, "baseline policy resolves before export");
+    for (const char* name : {"STRIX_MM_SERVE_SCHED", "STRIX_MM_SERVE_SERVICE_MS", "STRIX_MM_SERVE_GAP_MS",
+                             "STRIX_MM_SERVE_SHORT_FIRST", "STRIX_MM_SERVE_NEST"}) {
+        std::vector<std::string> invalid = {"nan", "inf", "1e999", "4294967296", "-1", "invalid"};
+        if (std::strcmp(name, "STRIX_MM_SERVE_GAP_MS") == 0) invalid.push_back("0");
+        for (const auto& value : invalid) {
+            const EnvMap env = {{name, value}};
+            bool rejected = false;
+            try { (void)md::effective_config(cli, lookup(env)); }
+            catch (const std::invalid_argument& e) { rejected = std::string(e.what()).find(name) != std::string::npos; }
+            check(rejected, std::string("serve preflight rejects ") + name + "=" + value);
+            // Serving-only policy must not reject a standalone rank invocation.
+            (void)md::effective_config(md::Cli{}, lookup(env));
+        }
+    }
+}
+
 // Last: changes the process environment.
 void test_apply() {
     for (const md::Item& it : md::items()) (void)::unsetenv(it.env);
@@ -190,6 +228,27 @@ void test_apply() {
             check(md::from_defaults(it.env), std::string("from_defaults ") + it.env);
         }
     }
+    // Exercise the actual app entry with and without inspection, for both rank arguments.
+    for (const char* name : {"STRIX_MM_SERVE_SCHED", "STRIX_MM_SERVE_SERVICE_MS", "STRIX_MM_SERVE_GAP_MS",
+                             "STRIX_MM_SERVE_SHORT_FIRST", "STRIX_MM_SERVE_NEST"}) {
+        const char* old = std::getenv(name);
+        const std::string saved = old == nullptr ? "" : old;
+        const bool had = old != nullptr;
+        (void)::setenv(name, "nan", 1);
+        for (char rank : {'0', '1'}) {
+            char rank_value[] = {rank, 0};
+            char rank_flag[] = "--rank";
+            char* serve_argv[] = {app, m, rank_flag, rank_value, flag};
+            for (int count : {4, 5}) {
+                bool rejected = false;
+                try { (void)md::print_or_apply("serve", count, serve_argv); }
+                catch (const std::invalid_argument&) { rejected = true; }
+                check(rejected, std::string("app preflight rejects ") + name + " on rank " + rank);
+            }
+        }
+        if (had) (void)::setenv(name, saved.c_str(), 1);
+        else (void)::unsetenv(name);
+    }
     char* argv2[] = {app, m, r0, tr, out};
     check(!md::print_or_apply("rank", 5, argv2), "print_or_apply without the flag");
 }
@@ -207,6 +266,7 @@ int main(int argc, char** argv) {
         test_off_switches();
         test_baseline();
         test_cli();
+        test_serve_preflight();
         test_apply();
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << "\n";

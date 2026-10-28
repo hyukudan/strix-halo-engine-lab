@@ -1,5 +1,7 @@
 #pragma once
 
+#include "strix/serve/short_first.hpp"
+
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -286,7 +288,10 @@ struct QueueSnapshot {
     double busy_seconds = 0.0;
 };
 
-// FIFO of generation jobs executed one at a time on the thread that calls run().
+// FIFO is the default; MiniMax short-first also gives cancellation precedence.
+enum class QueueSelection { fifo, short_first };
+
+// Generation jobs executed on the thread that calls run() or take().
 class GenerationQueue {
 public:
     explicit GenerationQueue(std::size_t max_queued = 64) : max_queued_(max_queued) {}
@@ -298,10 +303,14 @@ public:
     // Runs jobs until shutdown(); `observe` (optional) sees every finished job's stats.
     void run(GenerationEngine& engine, const std::function<void(const GenerationStats&)>& observe = {});
     // Batching engines, which decode several jobs at once and take new ones between steps instead of
-    // run(): the oldest job that is not cancelled, waiting for one when `wait` (nullopt when none is
-    // queued, or after shutdown). Jobs cancelled while queued are finished here.
-    // short_first selects stable shortest prompts with at most eight overtakes of older work.
+    // run(): chooses a job with the requested policy (FIFO by default), waiting when `wait`.
+    // nullopt when none is queued; cancelled entries are finished here. Selection preserves
+    // submission times and updates arrival-order queue positions after removal.
     std::optional<TakenJob> take(bool wait, bool short_first = false);
+    std::optional<TakenJob> take(bool wait, QueueSelection selection,
+        const std::function<bool(const GenerationJob&)>& eligible = {});
+    // Explicit QueueSelection calls process only the initial batch; retry nullopt until stopping.
+    // The bool/default API retains upstream FIFO/DeepSeek cancellation and wait semantics.
     [[nodiscard]] bool has_queued_work() const;
     // The end of a taken job: fills queue_ms, updates the totals and finishes its ticket.
     // Engines may call it inside their own timed regions (a batching runner that times a prompt unit and completes a
@@ -316,6 +325,8 @@ public:
     [[nodiscard]] QueueSnapshot snapshot() const;
     [[nodiscard]] ObserveSnapshot observed() const;
 private:
+    std::optional<TakenJob> take_selected(bool wait, bool short_first, bool cancel_first, bool finite,
+        const std::function<bool(const GenerationJob&)>& eligible = {});
     static bool still_observed(GenerationTicket& ticket) noexcept;
     static ObserveDelta observe_delta(const GenerationStats& stats, const std::string& error) noexcept;
     void observe_locked(const ObserveDelta& d) noexcept;

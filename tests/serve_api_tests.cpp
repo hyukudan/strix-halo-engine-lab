@@ -5,6 +5,7 @@
 #include "strix/serve/api.hpp"
 #include "strix/serve/constraint_selection.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <cmath>
 #include "strix/serve/deepseek_chat.hpp"
@@ -257,6 +258,100 @@ std::vector<Json> sse_data(const std::string& body) {
 
 // The pull interface of batching engines: FIFO order, jobs cancelled while queued finished and skipped,
 // tokens published into the ticket, totals per finished job, nothing after shutdown.
+// Compare complete caller-visible traces against the pre-rebase selection rules.
+// The model deliberately does not call the shared selector under test.
+void test_queue_caller_orders() {
+    for (unsigned caller = 0; caller < 4; ++caller) {
+        for (unsigned seed = 0; seed < 81; ++seed) {
+            struct Model { unsigned id, rows, age; bool cancelled; };
+            std::vector<Model> model;
+            std::vector<std::shared_ptr<GenerationTicket>> tickets;
+            GenerationQueue queue;
+            unsigned cancellations = 0;
+            auto submit = [&](unsigned rows, bool cancelled) {
+                GenerationJob job;
+                job.prompt.resize(rows);
+                auto ticket = queue.submit(std::move(job));
+                check(ticket != nullptr, "trace submission");
+                if (cancelled) ticket->cancel();
+                model.push_back({static_cast<unsigned>(tickets.size()), rows, 0, cancelled});
+                tickets.push_back(ticket);
+            };
+            unsigned sizes = seed;
+            for (unsigned i = 0; i < 4; ++i) {
+                submit(1U + (sizes % 3U) * 20U, ((seed + i) % 5U) == 0);
+                sizes /= 3U;
+            }
+            for (unsigned step = 0; step < 40 && !model.empty(); ++step) {
+                if (step < 20) submit(1, step % 3U == 0);
+                unsigned expected = static_cast<unsigned>(tickets.size());
+                while (!model.empty()) {
+                    std::size_t pick = 0;
+                    const bool short_first = caller >= 2;
+                    bool cancelled_pick = false;
+                    if (caller == 3) {
+                        const auto it = std::find_if(model.begin(), model.end(), [](const Model& e) { return e.cancelled; });
+                        if (it != model.end()) {
+                            pick = static_cast<std::size_t>(it - model.begin());
+                            cancelled_pick = true;
+                        }
+                    }
+                    if (short_first && !cancelled_pick) {
+                        for (std::size_t i = 0; i < model.size(); ++i) {
+                            if (model[i].age >= 8U) { pick = i; break; }
+                            if (model[i].rows < model[pick].rows) pick = i;
+                        }
+                        for (std::size_t i = 0; i < pick; ++i) ++model[i].age;
+                    }
+                    const auto chosen = model[pick];
+                    model.erase(model.begin() + static_cast<std::ptrdiff_t>(pick));
+                    if (chosen.cancelled) { ++cancellations; continue; }
+                    expected = chosen.id;
+                    break;
+                }
+                auto taken = caller == 0 ? queue.take(false) : caller == 1 ? queue.take(false, false) :
+                    caller == 2 ? queue.take(false, true) : queue.take(false, QueueSelection::short_first);
+                check(static_cast<bool>(taken) == (expected < tickets.size()), "caller trace presence");
+                if (taken) {
+                    check(taken->ticket == tickets[expected], "caller trace matches original arrival/size/aging/cancellation order");
+                    check(taken->ticket->queue_position() == 0, "taken position resets");
+                    queue.finish(*taken, {});
+                }
+                check(queue.snapshot().cancelled == cancellations, "caller trace cancellation completion order");
+                check(queue.snapshot().queued == model.size() && queue.snapshot().running == 0, "caller trace accounting");
+                for (std::size_t i = 0; i < model.size(); ++i)
+                    check(tickets[model[i].id]->queue_position() == i, "caller trace waiting arrival positions");
+            }
+            check(model.empty(), "caller trace drained");
+        }
+        GenerationQueue idle;
+        unsigned controls = 0;
+        idle.set_idle_control([&] { ++controls; });
+        idle.wake_control();
+        auto empty = caller == 0 ? idle.take(true) : caller == 1 ? idle.take(true, false) :
+            caller == 2 ? idle.take(true, true) : idle.take(true, QueueSelection::short_first);
+        check(!empty && controls == 1, "all callers preserve idle control wake");
+        idle.shutdown();
+    }
+    // Switching APIs must share the same aging debt and the same bound.
+    GenerationQueue mixed;
+    GenerationJob long_job;
+    long_job.prompt.resize(100);
+    const auto owner = mixed.submit(std::move(long_job));
+    for (unsigned i = 0; i < 9; ++i) {
+        GenerationJob short_job;
+        short_job.prompt.resize(1);
+        const auto newcomer = mixed.submit(std::move(short_job));
+        auto taken = i % 2U == 0 ? mixed.take(false, true) : mixed.take(false, QueueSelection::short_first);
+        check(taken && taken->ticket == (i < 8 ? newcomer : owner), "both APIs share one overtake counter and bound");
+        if (taken) mixed.finish(*taken, {});
+    }
+    auto last = mixed.take(false);
+    check(last.has_value(), "mixed APIs retain unselected newcomer");
+    if (last) mixed.finish(*last, {});
+
+}
+
 void test_batched_queue() {
     GenerationQueue small(1);
     check(small.submit({}) && !small.submit({}), "explicit small queue retains rejection");
@@ -301,6 +396,74 @@ void test_batched_queue() {
     queue.shutdown();
     check(!queue.take(true) && queue.stopping(), "batched queue after shutdown");
     check(!queue.has_queued_work(), "shutdown queue hint");
+}
+
+// Destroying a cancelled job's token callback acts as a deterministic producer between
+// cleanup iterations. It stays armed until take returns, with a hard cap so regressions fail.
+void test_queue_cancel_replenishment() {
+    for (const auto selection : {QueueSelection::fifo, QueueSelection::short_first}) {
+        for (const bool wait : {false, true}) {
+            GenerationQueue queue;
+            GenerationJob live;
+            live.prompt.resize(100);
+            const auto aged = queue.submit(std::move(live));
+            for (unsigned i = 0; i < kMaxQueueOvertakes; ++i) {
+                GenerationJob shorter;
+                shorter.prompt.resize(1);
+                const auto ticket = queue.submit(std::move(shorter));
+                auto t = queue.take(false, QueueSelection::short_first);
+                check(t && t->ticket == ticket, "age the persistent live request");
+                if (t) queue.finish(*t, {});
+            }
+            unsigned produced = 0;
+            bool producing = true;
+            std::function<void()> replenish;
+            replenish = [&] {
+                if (!producing) return;
+                if (produced == 32) {
+                    producing = false;
+                    GenerationJob escape;
+                    escape.prompt.resize(1);
+                    check(queue.submit(std::move(escape)) != nullptr, "cap replenishment without blocking a waiting take");
+                    return;
+                }
+                ++produced;
+                GenerationJob cancelled;
+                cancelled.prompt.resize(1);
+                auto trigger = std::shared_ptr<void>(nullptr, [&](void*) { replenish(); });
+                cancelled.on_tokens = [trigger](std::span<const std::uint32_t>) { return false; };
+                const auto ticket = queue.submit(std::move(cancelled));
+                check(ticket != nullptr, "replenishing producer submitted");
+                if (ticket) ticket->cancel();
+            };
+            replenish();
+            replenish();
+            auto t = queue.take(wait, selection);
+            producing = false;
+            check(t && t->ticket == aged, "aged admission returns control under replenishing cancellations");
+            const bool short_first = selection == QueueSelection::short_first;
+            check(produced == (short_first ? 4U : 2U) && queue.snapshot().cancelled == (short_first ? 2U : 0U),
+                  "short-first cancellation precedence and FIFO arrival order are preserved within the batch");
+            if (t) queue.finish(*t, {});
+            check(!queue.take(false, selection) && queue.snapshot().queued == 0, "drain remaining cancellations");
+            produced = 0;
+            producing = true;
+            replenish();
+            const auto before = queue.snapshot().cancelled;
+            auto empty = queue.take(wait, selection);
+            producing = false;
+            check(!empty && produced == 2 && queue.snapshot().cancelled == before + 1 && queue.snapshot().queued == 1,
+                  "a cancellation-only batch returns control even when wait is true");
+            if (empty) queue.finish(*empty, {});
+            check(queue.has_queued_work(), "cancelled replenishment still needs cleanup after nullopt");
+            check(!queue.take(false, selection) && !queue.has_queued_work(),
+                  "retry drains the remaining cancellation without a queued-work spin");
+            // The lead can now decode, heartbeat or check shutdown before taking again.
+            queue.shutdown();
+            check(queue.stopping() && queue.snapshot().queued == 0 && queue.snapshot().running == 0,
+                  "scheduler regains control and can shut down");
+        }
+    }
 }
 
 // A fake target owns the predicted frontier, just like the HIP ticket. The
@@ -579,6 +742,8 @@ int main() try {
         check(silent.progress().phase == GenerationPhase::queued, "no fabricated engine report");
     }
     test_batched_queue();
+    test_queue_caller_orders();
+    test_queue_cancel_replenishment();
     const auto tokenizer = tiny_tokenizer();
     test_scoring_transforms(tokenizer);
     test_constraint_selection(tokenizer);

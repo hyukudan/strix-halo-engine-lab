@@ -25,7 +25,7 @@ are already defaults: they can force an explicit route and decline the automatic
 | Qwen | `strix-hip-decode-token MODEL.gguf $(cat prompt.ids) --generate 256`; [auto route](docs/getting-started/engine-reference.md#command-line) | `--print-effective-config` | `--baseline` / `STRIX_BASELINE=1` |
 | DeepSeek pair | `strix-deepseek41-serve MODEL.gguf --rank R --transport usb4auto`, one rank per node; [production defaults](docs/models/deepseek-v4.1/production-defaults.md) | `--print-effective-config` | `STRIX_DS41_BASELINE=1` |
 | DeepSeek RTX | Use the [standalone command and required receipt/state/reference assets](docs/models/deepseek-v4.1/rtx-standalone.md#run-and-persistent-worker) | `--print-config` | `--baseline` / `STRIX_DS41_RTX_BASELINE=1` |
-| MiniMax | `strix-minimax-rank MODEL_DIR R usb4-auto OUTPUT_DIR`, one rank per node; [29 defaults](src/minimax/engine/mm_defaults.cpp) | `--print-effective-config` | `STRIX_MM_BASELINE=1` |
+| MiniMax | `strix-minimax-rank MODEL_DIR R usb4-auto OUTPUT_DIR`, one rank per node; [resolver](src/minimax/engine/mm_defaults.cpp) | `--print-effective-config` | `STRIX_MM_BASELINE=1` |
 | GLM | `strix-glm5-rank MODEL_DIR --world 2 --rank R --transport usb4-auto --prompt PROMPT.u32 --decode 64`, one rank per node; [resolver](apps/glm_rank_defaults.hpp) | `--print-effective-config` | `--baseline` / `STRIX_GLM_BASELINE=1` |
 
 Qwen startup prints one `strix-build-info` and one `strix-startup-event` JSON line on stderr (read-only

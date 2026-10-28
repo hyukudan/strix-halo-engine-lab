@@ -189,6 +189,11 @@ void prefill_cuts() {
         }
         require(history.size() == 60 && history.front() == 0 && history.back() == 59, "resume layer history");
     }
+    // Nesting changes retained addresses/ownership, never the original prompt or expert-group shape.
+    for (unsigned rows : {1U, 8U, 183U, 512U})
+        require(route::unit_rows(1, 4096, rows) == rows, "nested original one-chunk shape");
+    compare_tuple("prefill-nest", {0,4096,443,183}, {1,4096,443,183});
+    gated_difference("prefill-nest", "activation/cache-table bank and slot binding; original row/group arithmetic retained");
     require(strix::minimax::rtxpf::tile_rows_for(95, 1) == 64 &&
             strix::minimax::rtxpf::tile_rows_for(96, 1) == 128, "FP32 tile policy");
     std::vector<strix::minimax::rtxpf::F32Job> jobs{{nullptr,nullptr,nullptr,6144,1536,4,129,0,0}}, tails;
@@ -212,7 +217,23 @@ void config_receipts() {
     std::ifstream receipt(fs::path(STRIX_ROUTE_SOURCE_DIR) / "tests/fixtures/minimax_production_receipt.txt");
     require(receipt.good(), "missing effective-config hardware receipt");
     std::map<std::string, std::string> values;
-    for (const auto& resolved : resolve(empty)) values.emplace(resolved.item->env, resolved.value);
+    // These host scheduling defaults have no hardware receipt yet. Check them independently;
+    // the recorded rank/serve receipts must still cover every measured engine setting.
+    const std::map<std::string, std::string> pending_policy = {
+        {"STRIX_MM_SERVE_SCHED", "interleave"}, {"STRIX_MM_SERVE_SERVICE_MS", "250"},
+        {"STRIX_MM_SERVE_SHORT_FIRST", "1"}, {"STRIX_MM_SERVE_NEST", "1"},
+    };
+    std::size_t pending_entries = 0;
+    for (const auto& resolved : resolve(empty)) {
+        const auto pending = pending_policy.find(resolved.item->env);
+        if (pending != pending_policy.end()) {
+            require(resolved.value == pending->second, "pending serving policy drift: " + pending->first);
+            require(std::string_view(resolved.item->receipt).find("pending") != std::string_view::npos,
+                    "serving policy needs qualification evidence: " + pending->first);
+            ++pending_entries;
+        } else values.emplace(resolved.item->env, resolved.value);
+    }
+    require(pending_entries == pending_policy.size(), "incomplete pending serving policy");
     unsigned receipts = 0, entries = 0;
     for (std::string line; std::getline(receipt, line);) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -225,7 +246,7 @@ void config_receipts() {
         require(found != values.end() && found->second == line.substr(equal + 1), "effective-config drift: " + key);
         ++entries;
     }
-    require(receipts == 2 && entries == 2 * items().size(), "incomplete rank/serve effective-config receipts");
+    require(receipts == 2 && entries == 2 * values.size(), "incomplete rank/serve effective-config receipts");
 }
 }  // namespace
 int main(int argc, char** argv) {

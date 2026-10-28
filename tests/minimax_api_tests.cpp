@@ -141,7 +141,12 @@ public:
 
 private:
     void run() {
-        while (auto t = q_.take(true)) {
+        for (;;) {
+            auto t = q_.take(true);
+            if (!t) {
+                if (q_.stopping()) break;
+                continue;  // a cancellation-only batch returns control without shutting down
+            }
             Script s;
             {
                 const std::lock_guard<std::mutex> l(m_);
@@ -196,6 +201,10 @@ private:
                     x.accepted = 3;
                     x.ids_fnv = 0xabcU;
                     x.prompt_fnv = 0x1234U;
+                    x.sched = "interleave";
+                    x.service_ms = 250;
+                    x.max_unit_layers = 7;
+                    x.short_first = true;
                     st.cycles = x.cycles;
                     st.proposed = x.drafted;
                     st.accepted = x.accepted;
@@ -649,7 +658,7 @@ void test_scheduler_side() {
     Rig rig(true);
     const std::vector<std::string> keys{"queue_ms", "prefill_ms", "decode_ms", "decode_tok_s", "completion_tokens", "ttft_ms",
                                         "max_gap_ms", "stall_ms", "prefill_units", "cycles", "drafted", "accepted", "ids_fnv",
-                                        "prompt_fnv", "sampling"};
+                                        "prompt_fnv", "sched", "effective_sched", "service_ms", "max_unit_layers", "task_id", "nested", "parent_request", "nest_count", "nest_service_ms", "nest_switch_ms", "park_wall_ms", "short_first", "fallback_reason", "sampling"};
     auto key_order = [](const Json& t) {
         std::vector<std::string> out;
         if (t.is_object())
@@ -668,10 +677,21 @@ void test_scheduler_side() {
     check(at(t, "ids_fnv").as_string() == "0000000000000abc" && at(t, "prompt_fnv").as_string() == "0000000000001234" &&
               at(t, "sampling").as_string() == "greedy",
           "non-stream timings: digests as 16 hex");
+    check(at(t, "sched").as_string() == "interleave" && at(t, "effective_sched").as_string() == "interleave" &&
+          at(t, "service_ms").as_double() == 250 && at(t, "max_unit_layers").as_int() == 7 &&
+          at(t, "short_first").as_bool() && at(t, "fallback_reason").as_string().empty(), "scheduler policy receipt");
+    mo::RequestExtra forced;
+    forced.sched = "interleave"; forced.fallback_reason = "fp32_prefill";
+    check(at(mo::reply_timings({}, forced), "effective_sched").as_string() == "unlimited", "forced-unlimited receipt");
     auto r = at(rig.status(), "requests").as_array()[0];
     check(at(r, "max_gap_ms").as_double() == 3.25, "ring max_gap_ms from the scheduler");
     check(at(at(r, "draft"), "proposed").as_int() == 6 && at(r, "mtp_accepted").as_int() == 3, "ring draft counts from the stats");
     check(rig.engine.extras_left() == 0U, "extras taken (non-stream)");
+    mo::RequestExtra nested;
+    nested.nested = true; nested.parent_request = 41;
+    const auto nested_timings = mo::reply_timings({}, nested);
+    check(at(nested_timings, "nested").as_int() == 1 && at(nested_timings, "parent_request").as_int() == 41,
+          "nested receipt retains parent identity");
     // stream: timings on the final chunk only
     rig.engine.next({{5, 6, kEos}});
     Writer b;

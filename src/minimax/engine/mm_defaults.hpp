@@ -57,11 +57,13 @@ struct Cli {
 };
 Cli parse_cli(const std::string& app, const std::vector<std::string>& args);  // args without argv[0]
 
-// Canonical text, one key=value per line: CLI shape, prefill/decode route switches, build switches, then every item.
+// Canonical text, one key=value per line: CLI shape, route/build switches, every item and resolved serve policy.
+// Serve configuration validates all five policy values, independently of process environment export.
 std::string effective_config(const Cli& cli, const Lookup& env);
 inline constexpr const char* kPrintFlag = "--print-effective-config";
 // App entry: when argv holds kPrintFlag, apply() and print effective_config() of the invocation (no model, no GPU)
-// and return true (the app exits 0); otherwise apply() and return false.
+// and return true (the app exits 0); otherwise apply() and return false. Serve policy is validated
+// on both paths before any transport/device/model work; rank invocations do not validate serve policy.
 bool print_or_apply(const std::string& app, int argc, char** argv);
 
 }  // namespace strix::minimax::defaults

@@ -1,10 +1,13 @@
 // MiniMax M3.1 defaults-on resolver: the table of default-ON items, the baseline master switch and the canonical
 // effective configuration (see mm_defaults.hpp).
 #include "minimax/engine/mm_defaults.hpp"
+#include "minimax/serve/minimax_sched.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
+#include <limits>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -19,6 +22,10 @@ namespace {
 
 // Measurement evidence for the adopted production defaults.
 constexpr Item kItems[] = {
+    {"serve_sched", "STRIX_MM_SERVE_SCHED", "interleave", "off", "Bounded serving policy; GPU qualification pending"},
+    {"serve_service", "STRIX_MM_SERVE_SERVICE_MS", "250", "0", "Soft service opportunity target; GPU qualification pending"},
+    {"serve_nest", "STRIX_MM_SERVE_NEST", "1", "0", "Nested short admission; extended resume-check GPU qualification pending"},
+    {"serve_short_first", "STRIX_MM_SERVE_SHORT_FIRST", "1", "0", "Stable shortest-first admission, at most eight overtakes; qualification pending"},
     // decode
     {"moe_wide", "STRIX_MMX_MOE_WIDE", "2", "0",
      "Measurement: rows == alone, wide expert kernels at N2-4, N2 -3.0..-3.5 %, N4 -4..-6 %"},
@@ -147,6 +154,35 @@ Cli parse_cli(const std::string& app, const std::vector<std::string>& args) {
     return c;
 }
 
+namespace {
+struct ServePolicy {
+    serve::Sched sched;
+    double service;
+    double gap;
+    bool short_first;
+    bool nest;
+};
+
+// Pure host preflight, including defaults/baseline before apply() exports them.
+ServePolicy serve_policy(const Lookup& env) {
+    const auto resolved = resolve(env);
+    const auto value = [&](const char* name) -> const char* {
+        for (const auto& r : resolved)
+            if (std::strcmp(r.item->env, name) == 0) return r.value.c_str();
+        return env(name);
+    };
+    const auto flag = [&](const char* name) {
+        const std::string v = value(name);
+        if (v != "0" && v != "1") throw std::invalid_argument(std::string(name) + ": 0 | 1");
+        return v == "1";
+    };
+    return {serve::sched_mode(value("STRIX_MM_SERVE_SCHED")),
+            serve::service_ms(value("STRIX_MM_SERVE_SERVICE_MS")),
+            serve::gap_ms(value("STRIX_MM_SERVE_GAP_MS")),
+            flag("STRIX_MM_SERVE_SHORT_FIRST"), flag("STRIX_MM_SERVE_NEST")};
+}
+}  // namespace
+
 std::string effective_config(const Cli& cli, const Lookup& env) {
     std::ostringstream o;
     o << "app=" << cli.app << "\n"
@@ -160,6 +196,15 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
     }
     o << "build.gu4_scalar=" << (STRIX_MM_GU4_SCALAR ? "on" : "off") << "\n";
     for (const Resolved& r : resolve(env)) o << r.item->env << "=" << r.value << "\n";
+    if (cli.app == "serve") {
+        const auto policy = serve_policy(env);
+        o << std::setprecision(std::numeric_limits<double>::max_digits10)
+          << "serve.sched=" << (policy.sched == serve::Sched::off ? "off" : "interleave") << "\n"
+          << "serve.service_ms=" << policy.service << "\n"
+          << "serve.gap_ms=" << policy.gap << "\n"
+          << "serve.short_first=" << (policy.short_first ? 1 : 0) << "\n"
+          << "serve.nest=" << (policy.nest ? 1 : 0) << "\n";
+    }
     return o.str();
 }
 
@@ -171,8 +216,18 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
         else args.emplace_back(argv[i]);
     }
     apply();
+    if (app == "serve") (void)serve_policy(process_env);
     if (!print) return false;
     std::fputs(effective_config(parse_cli(app, args), process_env).c_str(), stdout);
+    if (app == "serve") {
+        const bool off = serve_policy(process_env).sched == serve::Sched::off;
+        const char* profile = process_env("STRIX_MM_PROFILE");
+        const char* identity = process_env("STRIX_MM_PREFILL_IDENTITY");
+        const char* reason = off ? "sched_off" : profile != nullptr && std::atoi(profile) != 0 ? "profiling" :
+                             identity != nullptr && std::strcmp(identity, "fp32") == 0 ? "fp32_prefill" : "";
+        std::printf("serve.effective_sched=%s\nserve.fallback_reason=%s\nserve.max_unit_layers=dynamic\nserve.qualification=pending\n",
+                    off ? "off" : *reason == 0 ? "interleave" : "unlimited", reason);
+    }
     std::fflush(stdout);
     return true;
 }
