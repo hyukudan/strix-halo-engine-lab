@@ -150,6 +150,8 @@ public:
     [[nodiscard]] bool defers_state() const noexcept;
     [[nodiscard]] bool policy_selection_admitted() const noexcept;
     void commit_prefix(std::uint32_t n_keep);
+    // Host-only query of the deferred GDN record shared by this session's owners.
+    [[nodiscard]] bool deferred_pending() const noexcept;
     // Applies pending GDN rows before any ordinary serial token touches GDN state.
     void flush_deferred();
     // Drops pending GDN rows without applying them: the session state they belong to was

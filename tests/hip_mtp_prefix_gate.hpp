@@ -125,6 +125,9 @@ inline void run(decode_cli::MtpDecodeQualificationContext& c, const std::filesys
         // non-authoritative caches before replacing session storage, including
         // optional persistent QSA pools supplied by another specialization.
         for (const auto& owner : owners) owner->discard_deferred();
+        require(!c.window->pending_window(), "prefix gate reset retained pending GDN rows");
+        for (const auto& owner : owners)
+            require(!owner->deferred_pending(), "prefix gate reset retained shared pending GDN rows");
         state.restore(); c.session = base;
     };
     std::vector<std::uint32_t> tokens{c.initial.predicted_token()};
@@ -195,7 +198,13 @@ inline void run(decode_cli::MtpDecodeQualificationContext& c, const std::filesys
             "prefix gate did not execute the requested owner/rejection depth");
         if (owner) {
             require(verified.attempted_window && verified.accepted_window == (keep == rows), "prefix gate acceptance receipt differs");
+            require(c.window->pending_window(), "prefix gate committed window has no pending GDN rows");
+            for (const auto& shared : owners)
+                require(shared->deferred_pending(), "prefix gate owners disagree on pending GDN rows");
             owner->flush_deferred();
+            require(!c.window->pending_window(), "prefix gate flush retained pending GDN rows");
+            for (const auto& shared : owners)
+                require(!shared->deferred_pending(), "prefix gate flush retained shared pending GDN rows");
             require(taps == rows, "prefix gate did not capture every physical window logit row");
         } else {
             require(!verified.attempted_window, "prefix gate serial fallback attempted a window");

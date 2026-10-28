@@ -1531,7 +1531,7 @@ private:
         s.decode_start = std::chrono::steady_clock::now();
         s.result.prompt_ms = std::chrono::duration<double, std::milli>(s.decode_start - s.prompt_start).count();
         const auto route=resolve_mtp_selection_route(options_.http_selection_mtp,!!s.window,s.window && s.window->policy_selection_admitted());
-        if(s.request.constraint && !route.mtp && s.window) s.window->flush_pending_window();
+        if(s.request.constraint && !route.mtp && s.window && s.window->pending_window()) s.window->flush_pending_window();
         if(s.request.constraint) {s.request.constraint->commit();
             s.request.constraint->set_execution(route.mtp?"mtp-host":"serial-host",route.fallback?route.fallback:"");}
         if(!s.request.constraint || route.mtp) {
@@ -1599,7 +1599,7 @@ private:
         static const bool state_digest=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");return v&&v[0]=='1';}();
         static const bool final_digest=[] {const char* v=std::getenv("STRIX_FINAL_STATE_DIGEST");return v&&v[0]=='1';}();
         if((state_digest || final_digest) && s.parents->tiled.cache) {
-            if(s.window) s.window->flush_pending_window();
+            if(s.window && s.window->pending_window()) s.window->flush_pending_window();
             check_service(hipDeviceSynchronize(),"complete final committed state digest");
             s.result.final_state_position=s.session->next_position;
             s.result.final_state_digest=model_content_identity_hex(s.parents->tiled.cache->state_digest(s.session->next_position));
@@ -2137,7 +2137,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         out.prompt_ms=std::chrono::duration<double,std::milli>(decode_start-request_start).count();
                         HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
                         const auto route=resolve_mtp_selection_route(options.http_selection_mtp,!!window,window && window->policy_selection_admitted());
-                        if(q.constraint && !route.mtp && window)window->flush_pending_window();
+                        if(q.constraint && !route.mtp && window && window->pending_window())window->flush_pending_window();
                         if(q.constraint)q.constraint->set_execution(route.mtp?"mtp-host":"serial-host",route.fallback?route.fallback:"");
                         if((!q.constraint || route.mtp) && window)greedy.use_window_verifier(window);
                         if(m.draft_chain)greedy.set_draft_min_probability(mtp_draft_min_probability(m));
@@ -2186,7 +2186,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         if(const auto* cd=greedy.context_stats()){out.ngram_rows=cd->extension_rows;out.ngram_accepted=cd->accepted_rows;}
                         static const bool final_digest=[] {const char* v=std::getenv("STRIX_FINAL_STATE_DIGEST");return v&&v[0]=='1';}();
                         if((state_digest || final_digest) && parents->tiled.cache) {
-                            if(window)window->flush_pending_window();
+                            if(window && window->pending_window())window->flush_pending_window();
                             if(hipDeviceSynchronize()!=hipSuccess) throw std::runtime_error("complete final committed state digest");
                             out.final_state_position=session.next_position;
                             out.final_state_digest=model_content_identity_hex(parents->tiled.cache->state_digest(session.next_position));
