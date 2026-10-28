@@ -118,7 +118,7 @@ void test_apply_env_default() {
     }
     CHECK(set == merge(kHp, {{"HSA_DISABLE_FRAGMENT_ALLOCATOR", "1"}, {"STRIX_GLM_PF_PIPELINE", "2"},
                               {"STRIX_DIST_ASYNC_START", "1"}, {"STRIX_GLM_SPEC_KDA_TREE", "2"},
-                              {"STRIX_GLM_PF_EXACT_X", "auto"}}));
+                              {"STRIX_GLM_PF_EXACT_X", "auto"}, {"STRIX_GLM_PF_EXACTMOE_V", "auto"}}));
     // = the receipt's optimization env + the prefill overlap + the two-barrier KDA verify tree
     // an explicit value is never overwritten
     const auto expl = resolve(cat(kDeploy, kDecodeWork), {{"STRIX_DIST_CRC_PARALLEL", "0"}});
@@ -182,9 +182,9 @@ void test_baseline() {
                             {{"STRIX_GLM_PREFILL", "auto"}, {"STRIX_GLM_HC_PRE_V", "7"}});
     CHECK(bx.identity.value == "r1b" && bx.mtp.value == "0" && bx.decode_xch.value == "xfer" && bx.prefill == "gemv");
     CHECK(bx.env.at("STRIX_GLM_HC_PRE_V").value == "7" && bx.env.at("STRIX_GLM_POST").value == "ref");
-    // exact prefill X2 core (MoE stays v3): literal defaults and off values (not only item-derived)
+    // exact prefill X2 core + MoE auto: literal defaults and off values (not only item-derived)
     const auto d = resolve(plain, {});
-    CHECK(d.env.at("STRIX_GLM_PF_EXACT_X").value == "auto" && d.env.at("STRIX_GLM_PF_EXACTMOE_V").value == "3");
+    CHECK(d.env.at("STRIX_GLM_PF_EXACT_X").value == "auto" && d.env.at("STRIX_GLM_PF_EXACTMOE_V").value == "auto");
     const auto bb = resolve(cat(plain, {"--baseline"}), {});
     CHECK(bb.env.at("STRIX_GLM_PF_EXACT_X").value == "0" && bb.env.at("STRIX_GLM_PF_EXACTMOE_V").value == "1");
     const auto b3 = resolve(cat(plain, {"--baseline"}), {{"STRIX_GLM_PF_EXACTMOE_V", "3"}});

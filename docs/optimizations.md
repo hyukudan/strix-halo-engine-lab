@@ -2063,21 +2063,22 @@ Use raw-only expert storage and the bitwise FastMoe implementation so the TP2 mo
 - **Measured gain:** FastMoe matches DefaultMoe bitwise (real TP2 slices); raw-only experts (fits GTT)
 - **Implementation / evidence:** [16-item resolver](../apps/glm_rank_defaults.hpp)
 
+<a id="glm-pf-exact-moe-auto"></a>
 <a id="glm-pf-exact-moe-v3"></a>
 
-### Exact prefill MoE v3
+### Exact prefill MoE auto
 
-**Engine:** `glm`. **Control:** `STRIX_GLM_PF_EXACTMOE_V`. **Default:** 3.
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_EXACTMOE_V`. **Default:** auto.
 
-Group expert W2 work in exact chunked prefill.
+Grouped expert work in exact chunked prefill; large calls run routed and shared experts through the register-blocked X2 core (v7), smaller calls keep the W2 grouped path (v3).
 
-- **Preconditions:** Exact chunked prefill with supported grouped W2 expert work.
-- **Automatic selection:** Unset resolves to 3; the engine default provides it; the resolver reports it. Explicit values win.
-- **Fallback notice:** Outside supported geometry, keep the supported exact dispatch; invalid explicit combinations fail. No general per-item decline line.
-- **Exactness evidence:** Measurement: exact MoE v3 (W2 grouped experts) 1K/8K/32K 240/236/226 tok/s, logits bitwise; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
-- **Off switch:** STRIX_GLM_PF_EXACTMOE_V=1
-- **Measured gain:** exact MoE v3 (W2 grouped experts) 1K/8K/32K 240/236/226 tok/s, logits bitwise
-- **Implementation / evidence:** [16-item resolver](../apps/glm_rank_defaults.hpp)
+- **Preconditions:** Exact chunked prefill; auto takes v7 for MoE calls of at least 2048 rows (STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS) and v3 below. 7 forces v7, 3 restores the previous default.
+- **Automatic selection:** Unset resolves to auto; the app sets it; the resolver reports it in `--print-effective-config`. Explicit values win; `--baseline` sets 1.
+- **Fallback notice:** Below the row threshold v3 runs; invalid values fail. No silent numerical-identity substitution.
+- **Exactness evidence:** Bitwise for all outputs: v7 routes routed and shared experts through the X2 core with the v3 expert order, gather/scatter and fold; MoE outputs, FP16 down inputs and final rows equal v3 for row tails, 2047/2048/2049 and 4096-row calls, concentrated expert groups, signed zero, FP16 subnormals, +-Inf and NaN payloads; on the real pair decode anchors, speculative oracle and 1K/8K/32K prefill logits equal the v3 path. Internal FP32 gate/up workspace NaN payloads may differ in the FP16 overflow case (+Inf meeting -Inf inside a DOT2 chain; not reachable with finite activations); the payload is discarded at the FP16 down input.
+- **Off switch:** STRIX_GLM_PF_EXACTMOE_V=3 (previous default); 1 for the baseline
+- **Measured gain:** 8K TTFT 28.17 -> 26.85 s (-4.7 %) vs STRIX_GLM_PF_EXACTMOE_V=3 in the same run, 32K 113.7 s, 1K unchanged (3.74 vs 3.76 s, two pairs)
+- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [MoE](../src/glm/prefill/glm_pf_exact_moe.hip), [tests](../tests/hip_glm_pf_exact_moe_tests.hip)
 
 <a id="glm-pf-exact-x"></a>
 

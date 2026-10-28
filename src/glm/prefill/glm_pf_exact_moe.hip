@@ -442,6 +442,30 @@ const std::uint16_t* pair_gate_up_input(void* ws, unsigned rows, unsigned pair) 
 const float* pair_output(void* ws, unsigned rows, unsigned pair) {
     return reinterpret_cast<const float*>(static_cast<unsigned char*>(ws) + Layout(rows).output) + std::size_t{pair} * H;
 }
+unsigned x_auto_rows() {
+    // STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS overrides the auto threshold (rows per MoE call).
+    const char* p = std::getenv("STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS");
+    if (!p) return 2048;
+    char* end = nullptr;
+    const unsigned long n = std::strtoul(p, &end, 10);
+    if (!*p || *end || n == 0 || n > 65536) throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS must be 1..65536");
+    return static_cast<unsigned>(n);
+}
+unsigned selected_variant(unsigned rows) {
+    const char* variant = std::getenv("STRIX_GLM_PF_EXACTMOE_V");
+    // v3 is the measured default (real pair, 1K/8K/32K TTFT logits bitwise == v1 on both ranks, -10..-11 % ms/token);
+    // STRIX_GLM_PF_EXACTMOE_V=1 restores v1. auto: v7 for calls >= x_auto_rows() rows, v3 below (both exact;
+    // 32-row X tiles mostly pad the small expert groups of short calls).
+    if (!variant) return 3;
+    const std::string s(variant);
+    if (s == "1") return 1;
+    if (s == "2") return 2;
+    if (s == "3") return 3;
+    if (s == "6") return 6;
+    if (s == "7") return 7;
+    if (s == "auto") return rows >= x_auto_rows() ? 7 : 3;
+    throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_V must be 1, 2, 3, 6, 7 or auto");
+}
 void enqueue(const View& v, Plan& plan, void* ws, std::size_t bytes, hipStream_t stream, unsigned tm) {
     const Layout l(plan.capacity);
     if (!v.rows || v.rows > plan.capacity || !v.experts || !v.x || !v.ids || !v.weights || !v.out || !ws || bytes < l.bytes)
@@ -453,15 +477,8 @@ void enqueue(const View& v, Plan& plan, void* ws, std::size_t bytes, hipStream_t
         else throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_TM must be 16 or 32");
     }
     if (tm != 16 && tm != 32) throw std::invalid_argument("exact moe: TM must be 16 or 32");
-    const char* variant = std::getenv("STRIX_GLM_PF_EXACTMOE_V");
-    const bool v2 = variant && std::string(variant) == "2";
-    // v3 is the measured default (real pair, 1K/8K/32K TTFT logits bitwise == v1 on both ranks, -10..-11 % ms/token);
-    // STRIX_GLM_PF_EXACTMOE_V=1 restores v1.
-    const bool v3 = !variant || std::string(variant) == "3";
-    const bool v6 = variant && std::string(variant) == "6";
-    const bool v7 = variant && std::string(variant) == "7";
-    if (variant && std::string(variant) != "1" && !v2 && !v3 && !v6 && !v7)
-        throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_V must be 1, 2, 3, 6 or 7");
+    const unsigned selected = selected_variant(v.rows);
+    const bool v2 = selected == 2, v3 = selected == 3, v6 = selected == 6, v7 = selected == 7;
     for (unsigned e = 0; e <= E; ++e) {
         const auto& ex = e == E ? v.shared : v.experts[e];
         check_matrix(ex.gate, H, I, e == E);
