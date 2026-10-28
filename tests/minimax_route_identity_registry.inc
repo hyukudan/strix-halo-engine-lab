@@ -56,6 +56,8 @@
 {"transport", 'a', "wire tags+rank order+payload bytes", "xfer selftest (xfer-report); mm_defaults.cpp transport hp exact; pfx CRC/tag validation", ""},
 // src/minimax/rtxpf/fp32_identity.hpp:73
 {"rtx-tile", 'a', "F32 identity version+matrix+input order", "fp32_identity_device.inc f32_core_body; hip-mm-fp32id-tests; mm_fp32_identity_tests.cu", ""},
+// src/minimax/rtxpf/fp32_identity.hpp: resolve_core_version; cuda/fp32_identity.cu
+{"rtx-core", 'a', "FP32 identity+matrix+input order; v3/v3.1 decode", "mm_fp32_identity_tests.cu default/env/explicit and all 65536 mul1 states vs host; full-model gate at 1K/8K code prompts, both ranks", ""},
 // src/minimax/rtxpf/cuda/mm_rtx_prefill_main.cu:635
 {"io-cache", 'a', "model tensor content+dtype+rank slices", "weight loader sizes/format validation; actual dependency notices preserved", ""},
 // src/minimax/dspark/hip_minimax_dspark.hip:755

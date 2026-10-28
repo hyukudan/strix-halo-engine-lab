@@ -300,6 +300,15 @@ int main(int argc, char** argv) {
             open_gate |= selector.category == 'c' || std::string_view(selector.gate).find("UNCOVERED") != std::string_view::npos;
             require(selector.category != 'c' || std::string_view(selector.first_op).size() != 0, "failure lacks first operation");
         }
+        using strix::minimax::rtxpf::resolve_core_version;
+        require(strix::minimax::rtxpf::GroupedCall{}.core_version == 0, "FP32 automatic selection");
+        for (const char* env : {static_cast<const char*>(nullptr), "", "31", "invalid", "3x", "4"}) {
+            require(resolve_core_version(0, env) == 31, "FP32 default v3.1");
+            require(resolve_core_version(3, env) == 3, "FP32 explicit v3");
+            require(resolve_core_version(31, env) == 31, "FP32 explicit v3.1");
+        }
+        require(resolve_core_version(0, "3") == 3 && resolve_core_version(31, "3") == 31,
+                "FP32 env rollback and explicit override");
         decode_and_verify();
         prefill_cuts();
         config_receipts();

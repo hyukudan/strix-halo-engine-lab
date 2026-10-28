@@ -90,6 +90,9 @@ inline long long grouped_case(const char* name, R::Gen& g, std::vector<Matrix> m
     c.y = dy;
     c.y_stride = output;
     c.ymap = maps ? dym : nullptr;
+#ifdef FP32_TEST_CONFIGURE_CORE
+    FP32_TEST_CONFIGURE_CORE(c);
+#endif
     strix::minimax::rtxpf::enqueue_grouped(c, xt, raw, nullptr);
     GPU_SYNC();
     std::vector<float> y(static_cast<std::size_t>(ext.entries) * output);

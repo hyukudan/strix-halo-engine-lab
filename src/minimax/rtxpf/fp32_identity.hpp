@@ -42,7 +42,16 @@ struct GroupedCall {
     float* y = nullptr;
     std::uint32_t y_stride = 0;
     const std::uint32_t* ymap = nullptr;  // device, entries (nullptr: identity)
+    // CUDA: 0 = environment/default (v3.1), 3 = v3, 31 = v3.1 (exact dp4a decode).
+    // STRIX_MM_FP32_CORE=3 restores v3. Explicit selection overrides the environment. HIP ignores this field.
+    std::uint32_t core_version = 0;
 };
+
+// Pure CUDA selector, also checked without a device. Unrecognized values use v3.1.
+inline std::uint32_t resolve_core_version(std::uint32_t requested, const char* env) {
+    if (requested != 0) return requested == 3 ? 3U : 31U;
+    return env && env[0] == '3' && env[1] == 0 ? 3U : 31U;
+}
 
 struct Extent {
     std::uint32_t entries = 0, tiles = 0;

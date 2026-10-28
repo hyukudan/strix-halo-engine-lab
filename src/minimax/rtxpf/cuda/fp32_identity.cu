@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <stdexcept>
+#include <cstdlib>
 
 namespace strix::minimax::rtxpf {
 namespace dev {
@@ -45,7 +46,21 @@ __global__ __launch_bounds__(256) void transform_kernel(const F32Job* jobs, unsi
     const unsigned j = find_job(jobs, njobs, item / (input / 128), false);
     f32_transform_body(x, x_stride, xmap, jobs[j].suh, input, entries, xt, item, lane);
 }
-template <unsigned TR>
+__device__ __forceinline__ float mul1_v31(std::uint32_t state) {
+    const unsigned p = state * 0x83dcd12dU;
+    // Unsigned dot sums all four bytes exactly, including the 1024 bias.
+    const unsigned sum = __dp4a(p, 0x01010101U, 1024U);
+    return mmx_round_half(__fmaf_rn(static_cast<float>(sum), 0x1.bb8p-8F, -0x1.4c4p+3F));
+}
+template<unsigned Version>
+struct CoreDecode {
+    __device__ __forceinline__ float operator()(std::uint32_t state) const {
+        if constexpr (Version == 31) return mul1_v31(state);
+        else return f32_mul1(state);
+    }
+};
+// v3.1 preserves v3 geometry, next-tile prefetch, accumulator order and grid.
+template <unsigned TR, unsigned Version = 3>
 // TR 128: no register cap (1 CTA per SM; capping at 128 registers spilled and was 7-9 % slower, bench/core_bench.cu).
 // TR 64 fits 128 registers without spills: 2 CTAs per SM.
 __global__ __launch_bounds__(256, TR == 128 ? 1 : 2) void core_kernel(const F32Job* jobs, unsigned njobs, const float* xt, float* raw) {
@@ -55,7 +70,7 @@ __global__ __launch_bounds__(256, TR == 128 ? 1 : 2) void core_kernel(const F32J
     const unsigned j = find_job(jobs, njobs, blockIdx.x, true);
     const F32Job& jb = jobs[j];
     const unsigned local = blockIdx.x - jb.tile_begin, cols = jb.output / kF32TileCols;
-    f32_core_body<TR>(jb.trellis, jb.input, jb.output, static_cast<int>(jb.bits), xt + static_cast<std::size_t>(jb.row_begin) * jb.input,
+    f32_core_body<TR, CoreDecode<Version>>(jb.trellis, jb.input, jb.output, static_cast<int>(jb.bits), xt + static_cast<std::size_t>(jb.row_begin) * jb.input,
                       jb.rows, raw + static_cast<std::size_t>(jb.row_begin) * jb.output, local / cols, local % cols, as, ws, wsrc, threadIdx.x);
 }
 __global__ __launch_bounds__(256) void output_kernel(const F32Job* jobs, unsigned njobs, const float* raw, std::uint32_t output,
@@ -91,17 +106,27 @@ Extent layout_jobs(std::vector<F32Job>& jobs, std::uint32_t tile_rows) {
     return e;
 }
 
+// Shared by enqueue_grouped and the stage benchmark.
+template<unsigned Version>
+static void launch_core_version(const GroupedCall& c, float* xt, float* raw, cudaStream_t stream) {
+    const auto* jobs = reinterpret_cast<const dev::F32Job*>(c.jobs_d);
+    if (c.tile_rows == 128) {
+        if (c.tiles) dev::core_kernel<128, Version><<<c.tiles, 256, 0, stream>>>(jobs, c.jobs, xt, raw);
+        if (c.tail_tiles) dev::core_kernel<64, Version><<<c.tail_tiles, 256, 0, stream>>>(jobs + c.jobs, c.tail_jobs, xt, raw);
+    } else if (c.tiles) dev::core_kernel<64, Version><<<c.tiles, 256, 0, stream>>>(jobs, c.jobs, xt, raw);
+}
+static void launch_grouped_core(const GroupedCall& c, float* xt, float* raw, cudaStream_t stream) {
+    if (resolve_core_version(c.core_version, std::getenv("STRIX_MM_FP32_CORE")) == 3)
+        launch_core_version<3>(c, xt, raw, stream);
+    else launch_core_version<31>(c, xt, raw, stream);
+}
+
 void enqueue_grouped(const GroupedCall& c, float* xt, float* raw, void* stream_v) {
     const auto stream = static_cast<cudaStream_t>(stream_v);
     if (c.entries == 0) return;
     const unsigned ti = c.entries * (c.input / 128), to = c.entries * (c.output / 128);
     dev::transform_kernel<<<dim3((ti + 7) / 8), dim3(256), 0, stream>>>(reinterpret_cast<const dev::F32Job*>(c.jobs_d), c.jobs, c.x, c.x_stride, c.xmap, c.input, c.entries, xt);
-    if (c.tile_rows == 128) {
-        if (c.tiles) dev::core_kernel<128><<<dim3(c.tiles), dim3(256), 0, stream>>>(reinterpret_cast<const dev::F32Job*>(c.jobs_d), c.jobs, xt, raw);
-        if (c.tail_tiles)
-            dev::core_kernel<64><<<dim3(c.tail_tiles), dim3(256), 0, stream>>>(reinterpret_cast<const dev::F32Job*>(c.jobs_d) + c.jobs, c.tail_jobs, xt, raw);
-    } else
-        dev::core_kernel<64><<<dim3(c.tiles), dim3(256), 0, stream>>>(reinterpret_cast<const dev::F32Job*>(c.jobs_d), c.jobs, xt, raw);
+    launch_grouped_core(c, xt, raw, stream);
     dev::output_kernel<<<dim3((to + 7) / 8), dim3(256), 0, stream>>>(reinterpret_cast<const dev::F32Job*>(c.jobs_d), c.jobs, raw, c.output, c.entries, c.y, c.y_stride, c.ymap);
 }
 
