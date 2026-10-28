@@ -39,6 +39,8 @@ def main():
     ap.add_argument("--k-map", default="", help="per-kind override: q=5,k=6,v=6,o=5,gate=4,up=4,down=5,fc=6")
     ap.add_argument("--fc", action="store_true", help="also quantize fc (else BF16 as shipped)")
     ap.add_argument("--sigma-reg", type=float, default=0.025)
+    ap.add_argument("--no-scaled-hessian", action="store_true",
+                    help="turn off scaled_hessian (on by default: LDLQ uses the Hessian with the input-channel scales folded in)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     from exllamav3.modules.quant.exl3_lib.quantize import quantize_exl3
@@ -65,7 +67,8 @@ def main():
         H, n = hessian(site)
         H_data = {"H": H.float().to(dev), "count": n, "finalized": False, "device": dev, "first_key": name}
         qa = {"K": int(K) if float(K).is_integer() else K, "seed": 787, "sigma_reg": a.sigma_reg, "devices": [dev],
-              "mul1": True, "apply_out_scales": None}
+              "mul1": True, "apply_out_scales": None,
+              "scaled_hessian": not a.no_scaled_hessian}
         _, perr, packed = quantize_exl3(W_oi.T.contiguous().float().to(dev), H_data, qa, return_weight_q=False)
         for k, v in packed.items():
             store[f"{name}.{k}"] = v.contiguous().cpu()
@@ -91,7 +94,8 @@ def main():
     json.dump({"weight_map": {k: "model-dspark-exl3.safetensors" for k in store}}, open(out / "model.safetensors.index.json", "w"))
     cfg = json.loads((Path(a.draft) / "config.json").read_text())
     cfg["quantization_config"] = {"quant_method": "exl3", "codebook": "mul1", "K": a.K, "k_map": kmap, "fc": a.fc,
-                                  "source": "dequantized MXFP8 dspark", "hessians": os.path.basename(a.hessians)}
+                                  "source": "dequantized MXFP8 dspark", "hessians": os.path.basename(a.hessians),
+                                  "scaled_hessian": not a.no_scaled_hessian}
     (out / "config.json").write_text(json.dumps(cfg, indent=1))
     print(json.dumps({"out": str(out), "tensors": len(store), "seconds": round(time.time() - t0)}), flush=True)
 
