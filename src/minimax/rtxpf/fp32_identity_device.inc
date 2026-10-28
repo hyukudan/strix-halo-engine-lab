@@ -98,7 +98,11 @@ MMX_DEV void f32_transform_body(const float* x, std::uint32_t x_stride, const st
 // + TR / 16 - 1 x outputs 4 (t % 16) .. + 3 and 64 + 4 (t % 16) .. + 3 (the 16 lanes of a row group read consecutive
 // float4s of the weight tile: no shared-memory bank conflicts). Each output keeps ONE fmaf chain over k ascending (the identity); the tiling
 // only changes which thread runs which chain, so both tile heights give the same bits. raw is [rows][output] FP32.
-template <unsigned TR>
+// Decoder policy changes only the byte sum; the tile schedule stays fixed.
+struct F32Mul1 {
+    MMX_DEV float operator()(std::uint32_t state) const { return f32_mul1(state); }
+};
+template <unsigned TR, class Decode = F32Mul1>
 MMX_DEV void f32_core_body(const std::uint32_t* trellis, std::uint32_t input, std::uint32_t output, int bits,
                            const float* xt, std::uint32_t rows, float* raw, unsigned row_tile, unsigned col_block,
                            float (*as)[TR + 4], float (*ws)[kF32TileCols + 4], std::uint32_t (*wsrc)[64], unsigned t) {
@@ -138,7 +142,7 @@ MMX_DEV void f32_core_body(const std::uint32_t* trellis, std::uint32_t input, st
             for (int j = 0; j < 8; ++j) {
                 int k, n;
                 f32_pos_kn(static_cast<int>(lane), j, k, n);
-                ws[k][wave * 16U + static_cast<unsigned>(n)] = f32_mul1(f32_tile_state(wsrc[wave], bits, 8 * static_cast<int>(lane) + j));
+                ws[k][wave * 16U + static_cast<unsigned>(n)] = Decode{}(f32_tile_state(wsrc[wave], bits, 8 * static_cast<int>(lane) + j));
             }
         }
         mmx_sync();
