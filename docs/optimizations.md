@@ -2079,6 +2079,22 @@ Group expert W2 work in exact chunked prefill.
 - **Measured gain:** exact MoE v3 (W2 grouped experts) 1K/8K/32K 240/236/226 tok/s, logits bitwise
 - **Implementation / evidence:** [16-item resolver](../apps/glm_rank_defaults.hpp)
 
+<a id="glm-pf-exact-x"></a>
+
+### Exact prefill X2 linear core
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_EXACT_X`. **Default:** auto.
+
+Register-blocked exact prefill linear: LDS-decoded weights reused over 32 rows, 4x4 output x row blocks per lane, next-stage register prefetch (X2).
+
+- **Preconditions:** Exact chunked prefill linears; auto takes the X2 core for calls of at least 2048 rows (STRIX_GLM_PF_EXACT_X_MIN_ROWS) and the TM16 path below. 1 or 2 force X or X2 for every call.
+- **Automatic selection:** Unset resolves to auto; the app sets it; the resolver reports it in `--print-effective-config`. Explicit values win; `--baseline` sets 0.
+- **Fallback notice:** Below the row threshold the TM16 path runs; invalid values fail. No silent numerical-identity substitution.
+- **Exactness evidence:** Bitwise: X/X2 keep the TM path's DOT2 chains, fold and split order; dense outputs byte-equal TM for row tails 1..32, 2047/2048/2049 and 4096-row calls, signed zero, FP16 subnormals, +-Inf and NaN payloads; on the real pair decode anchors, speculative oracle and 1K/8K/32K prefill logits equal the X=0 path.
+- **Off switch:** STRIX_GLM_PF_EXACT_X=0
+- **Measured gain:** 8K TTFT 29.59 -> 27.93 s (-5.6 %) vs STRIX_GLM_PF_EXACT_X=0 in the same run, 32K 120.3 s, 1K unchanged (3.78 vs 3.84 s, two pairs); logits bitwise on both ranks
+- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [X core](../src/glm/prefill/glm_pf_exact_x.hpp), [tests](../tests/hip_glm_pf_exact_tests.hip)
+
 <a id="glm-pf-obar-v5"></a>
 
 ### Prefill MLA o-bar v5

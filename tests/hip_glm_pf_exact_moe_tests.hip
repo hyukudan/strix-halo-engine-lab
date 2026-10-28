@@ -18,7 +18,7 @@
 namespace M = strix::glm::moe;
 namespace X = strix::glm::pf::exact_moe;
 namespace {
-constexpr unsigned H = 4096, I = 1024, E = 288, Top = 8, MaxR = 2048;
+constexpr unsigned H = 4096, I = 1024, E = 288, Top = 8, MaxR = 4096;
 unsigned checks = 0, failures = 0;
 void ok(hipError_t e, const char* what) {
     if (e != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(e));
@@ -28,7 +28,7 @@ void check(bool pass, const std::string& name) {
     failures += pass ? 0U : 1U;
     std::printf("%s %s\n", pass ? "OK  " : "FAIL", name.c_str());
 }
-// enqueue reads this setting per call, so every fixture exercises all three paths.
+// enqueue reads this setting per call, so every fixture exercises all four paths.
 struct Variant {
     std::string saved;
     bool present;
@@ -97,13 +97,27 @@ Routes routes(unsigned R, unsigned mode, std::mt19937& rng) {
             ++expert;
         }
     }
+    if (mode == 4) {
+        // Disjoint assignments ensure no row exceeds Top while every group tail is present.
+        unsigned first = 0;
+        for (unsigned count = 1; count <= 33; ++count) {
+            for (unsigned r = first; r < first + count; ++r) rows[r].push_back(count - 1);
+            first += count;
+        }
+    }
+    if (mode >= 5) {
+        const unsigned count = 2047U + mode - 5U;
+        for (unsigned r = 0; r < count; ++r) rows[r].push_back(0);
+    }
     std::vector<double> popularity(E);
     std::normal_distribution<double> normal(0.0, 1.2);
     for (auto& p : popularity) p = std::exp(normal(rng));
     std::discrete_distribution<unsigned> lognormal(popularity.begin(), popularity.end());
     for (auto& row : rows) {
         while (row.size() < Top) {
-            const unsigned e = mode == 2 ? 7U + static_cast<unsigned>(rng() % (E - 7)) :
+            const unsigned e = mode == 4 ? 33U + static_cast<unsigned>(rng() % (E - 33)) :
+                               mode >= 5 ? 1U + static_cast<unsigned>(rng() % (E - 1)) :
+                               mode == 2 ? 7U + static_cast<unsigned>(rng() % (E - 7)) :
                                mode == 3 ? lognormal(rng) : static_cast<unsigned>(rng() % E);
             if (std::find(row.begin(), row.end(), e) == row.end()) row.push_back(e);
         }
@@ -221,7 +235,7 @@ struct Fixture {
             }
         }
     }
-    bool gate(unsigned R, const Routes& rt, const std::string& label, std::mt19937& rng) {
+    bool gate(unsigned R, const Routes& rt, const std::string& label, std::mt19937& rng, bool added = false) {
         upload(R, rt, rng);
         reference(R, 1, true);
         ok(hipStreamSynchronize(stream), "reference");
@@ -236,7 +250,9 @@ struct Fixture {
         std::vector<std::uint16_t> at(ar.size());
         bool pass = true;
         Variant variant;
-        for (const char* version : {"1", "2", "3"}) for (unsigned tm : {16U, 32U}) for (unsigned repeat = 0; repeat < 2; ++repeat) {
+        for (const char* version : {"1", "2", "3", "6", "7"}) for (unsigned tm : {16U, 32U}) for (unsigned repeat = 0; repeat < 2; ++repeat) {
+            // Existing checks retain every arm/repeat. Added large cases qualify v3/v6/v7 against the seam.
+            if (added && (std::strcmp(version, "1") == 0 || std::strcmp(version, "2") == 0 || tm != 16 || repeat != 0)) continue;
             Variant::set(version);
             ok(hipMemsetAsync(ws, 0xff, wsb, stream), "poison workspace");
             ok(hipMemsetAsync(out, 0xff, std::size_t{MaxR} * H * 4, stream), "poison output");
@@ -277,6 +293,111 @@ struct Fixture {
         }
         return pass;
     }
+    void exceptional(std::mt19937& rng) {
+        constexpr unsigned R = 33;
+        const auto rt = routes(R, 1, rng); // All eight routed groups and shared span a 32-row tile.
+        Variant variant;
+        for (const char* kind : {"signed-zero", "fp16-subnormal", "overflow", "nan-payload"}) {
+            upload(R, rt, rng);
+            std::vector<float> host(std::size_t{R} * H, 0.0F);
+            for (unsigned r = 0; r < R; ++r) {
+                if (std::strcmp(kind, "signed-zero") == 0) {
+                    for (unsigned c = 0; c < H; ++c) {
+                        const std::uint32_t u = (c + r) & 1U ? 0x80000000U : 0;
+                        std::memcpy(&host[std::size_t{r} * H + c], &u, 4);
+                    }
+                } else for (unsigned c : {2048U, 2112U}) { // Gate/up split boundary and mid-split.
+                    const bool negative = (r + c / 64U) & 1U;
+                    float v;
+                    if (std::strcmp(kind, "fp16-subnormal") == 0) v = negative ? -0x1p-18F : 0x1p-18F;
+                    else if (std::strcmp(kind, "overflow") == 0) v = negative ? -1.0e10F : 1.0e10F;
+                    else {
+                        const std::uint32_t u = (negative ? 0xffc00000U : 0x7fc00000U) | ((r * 2U + c / 64U + 1U) << 13U);
+                        std::memcpy(&v, &u, 4);
+                    }
+                    host[std::size_t{r} * H + c] = v;
+                }
+            }
+            ok(hipMemcpy(x, host.data(), host.size() * 4, hipMemcpyHostToDevice), "exception x");
+            // Zero effective weights carry both signs. Restore these private fixture scales below
+            // before subnormal/overflow/NaN cases and the existing gates use them again.
+            std::vector<M::Exl3> zero_weights;
+            std::vector<std::vector<std::uint16_t>> saved_scales;
+            if (std::strcmp(kind, "signed-zero") == 0) {
+                for (unsigned e : {0U, 1U, 2U, 3U, 4U, 5U, 6U, 287U, 288U}) {
+                    const auto& expert = e == E ? shared : experts[e];
+                    for (const auto& matrix : {expert.gate, expert.up, expert.down}) {
+                        zero_weights.push_back(matrix);
+                        saved_scales.emplace_back(matrix.output);
+                        auto& saved = saved_scales.back();
+                        ok(hipMemcpy(saved.data(), matrix.svh, saved.size() * 2, hipMemcpyDeviceToHost), "save exception weights");
+                        std::vector<std::uint16_t> zeros(matrix.output);
+                        for (unsigned c = 0; c < matrix.output; ++c) zeros[c] = c & 1U ? 0x8000U : 0U;
+                        ok(hipMemcpy(const_cast<std::uint16_t*>(matrix.svh), zeros.data(), zeros.size() * 2,
+                                     hipMemcpyHostToDevice), "signed-zero weights");
+                    }
+                }
+            }
+            std::vector<float> yr, gr, pr;
+            std::vector<std::uint16_t> ar;
+            for (const char* version : {"3", "6", "7"}) {
+                Variant::set(version);
+                ok(hipMemsetAsync(ws, 0xff, wsb, stream), "exception poison");
+                ok(hipMemsetAsync(out, 0xff, std::size_t{R} * H * 4, stream), "exception poison output");
+                X::enqueue(view(R, rt), plan, ws, wsb, stream, 16);
+                ok(hipStreamSynchronize(stream), "exception sync");
+                std::vector<float> y(std::size_t{R} * H), gu(std::size_t{R} * 9 * 2 * I), pairs(std::size_t{R} * 9 * H);
+                std::vector<std::uint16_t> at(std::size_t{R} * 9 * I), staged(std::size_t{R} * 9 * 2 * H);
+                ok(hipMemcpy(y.data(), out, y.size() * 4, hipMemcpyDeviceToHost), "exception out");
+                ok(hipMemcpy(gu.data(), X::pair_gate_up(ws, MaxR, 0), gu.size() * 4, hipMemcpyDeviceToHost), "exception gu");
+                ok(hipMemcpy(pairs.data(), X::pair_output(ws, MaxR, 0), pairs.size() * 4, hipMemcpyDeviceToHost), "exception pairs");
+                ok(hipMemcpy(at.data(), X::pair_down_input(ws, MaxR, 0), at.size() * 2, hipMemcpyDeviceToHost), "exception at");
+                ok(hipMemcpy(staged.data(), X::pair_gate_up_input(ws, MaxR, 0), staged.size() * 2, hipMemcpyDeviceToHost), "exception staged t");
+                const std::string label = std::string("exception ") + kind + " V=" + version;
+                if (std::strcmp(kind, "fp16-subnormal") == 0)
+                    check(std::any_of(staged.begin(), staged.end(), [](std::uint16_t h) {
+                        return (h & 0x7c00U) == 0 && (h & 0x03ffU) != 0;
+                    }), label + " staged t contains FP16 subnormals");
+                if (std::strcmp(kind, "overflow") == 0)
+                    check(std::find(staged.begin(), staged.end(), 0x7c00U) != staged.end() &&
+                          std::find(staged.begin(), staged.end(), 0xfc00U) != staged.end(), label + " staged t contains +/-Inf");
+                if (std::strcmp(kind, "nan-payload") == 0)
+                    check(std::any_of(staged.begin(), staged.end(), [](std::uint16_t h) {
+                        return (h & 0x7c00U) == 0x7c00U && (h & 0x03ffU) != 0;
+                    }), label + " staged t contains NaN");
+                if (std::strcmp(version, "3") == 0) {
+                    yr = y; gr = gu; pr = pairs; ar = at;
+                    if (std::strcmp(kind, "signed-zero") == 0)
+                        check(std::all_of(gu.begin(), gu.end(), [](float v) { return (bits(v) & 0x7fffffffU) == 0; }),
+                              label + " exact-zero linear sums");
+                } else {
+                    // Raw bytes deliberately include signed zero and all nonfinite payload bits.
+                    check(std::memcmp(yr.data(), y.data(), y.size() * 4) == 0, label + " v3 R16 bytes");
+                    const bool gu_same = std::memcmp(gr.data(), gu.data(), gu.size() * 4) == 0;
+                    check(gu_same, label + " v3 gate/up bytes");
+                    if (!gu_same) {
+                        // Classify differing words so a nonfinite-only difference is distinguishable from a value change.
+                        std::size_t nan_nan = 0, nan_inf = 0, other = 0, shown = 0;
+                        for (std::size_t i = 0; i < gu.size(); ++i) {
+                            const std::uint32_t a = bits(gr[i]), b = bits(gu[i]);
+                            if (a == b) continue;
+                            const bool an = std::isnan(gr[i]), bn = std::isnan(gu[i]);
+                            if (an && bn) ++nan_nan;
+                            else if ((an && std::isinf(gu[i])) || (bn && std::isinf(gr[i]))) ++nan_inf;
+                            else ++other;
+                            if (shown++ < 6) std::printf("DIFF gate/up word %zu v3 %08x got %08x\n", i, a, b);
+                        }
+                        std::printf("DIFF gate/up words: nan-vs-nan %zu, nan-vs-inf %zu, other %zu\n", nan_nan, nan_inf, other);
+                    }
+                    check(std::memcmp(pr.data(), pairs.data(), pairs.size() * 4) == 0, label + " v3 pair-output bytes");
+                    check(std::memcmp(ar.data(), at.data(), at.size() * 2) == 0, label + " v3 down-input FP16 bytes");
+                }
+            }
+            for (std::size_t i = 0; i < zero_weights.size(); ++i)
+                ok(hipMemcpy(const_cast<std::uint16_t*>(zero_weights[i].svh), saved_scales[i].data(),
+                             saved_scales[i].size() * 2, hipMemcpyHostToDevice), "restore exception weights");
+        }
+    }
     void timing(unsigned R, const Routes& rt, std::mt19937& rng) {
         upload(R, rt, rng);
         // Timed workload is qualified too before reporting any timing.
@@ -287,37 +408,39 @@ struct Fixture {
         Variant variant;
         const X::View v = view(R, rt);
         for (unsigned tm : {16U, 32U}) {
-            std::array<std::array<double, 3>, 4> times{};
-            for (const char* version : {"1", "2", "3"}) {
+            std::array<std::array<double, 3>, 6> times{};
+            for (const char* version : {"1", "2", "3", "6", "7"}) {
                 Variant::set(version);
                 X::enqueue(v, plan, ws, wsb, stream, tm);
             }
             reference(R, 8, false);
             ok(hipStreamSynchronize(stream), "warmup");
-            // Rotate all four arms, including host planning/upload/synchronization.
-            for (unsigned rep = 0; rep < 3; ++rep) for (unsigned order = 0; order < 4; ++order) {
-                const unsigned arm = (rep + order) % 4;
-                if (arm < 3) Variant::set(arm == 0 ? "1" : arm == 1 ? "2" : "3");
+            // Rotate all six arms, including host planning/upload/synchronization.
+            for (unsigned rep = 0; rep < 3; ++rep) for (unsigned order = 0; order < 6; ++order) {
+                const unsigned arm = (rep + order) % 6;
+                if (arm < 5) Variant::set(arm == 0 ? "1" : arm == 1 ? "2" : arm == 2 ? "3" : arm == 3 ? "6" : "7");
                 const auto start = std::chrono::steady_clock::now();
-                if (arm < 3) X::enqueue(v, plan, ws, wsb, stream, tm);
+                if (arm < 5) X::enqueue(v, plan, ws, wsb, stream, tm);
                 else reference(R, 8, false);
                 ok(hipStreamSynchronize(stream), "timed");
                 const auto stop = std::chrono::steady_clock::now();
                 times[arm][rep] = std::chrono::duration<double, std::milli>(stop - start).count();
-                ok(hipMemcpy(got.data(), arm < 3 ? out : ref_out, got.size() * 4, hipMemcpyDeviceToHost), "timed output");
+                ok(hipMemcpy(got.data(), arm < 5 ? out : ref_out, got.size() * 4, hipMemcpyDeviceToHost), "timed output");
                 if (!equal32(expected, got, "timed output R=" + std::to_string(R) + " arm=" + std::to_string(arm))) return;
             }
             for (auto& arm : times) std::sort(arm.begin(), arm.end());
-            const double a = times[0][1], b = times[1][1], c = times[2][1], seam = times[3][1];
+            const double a = times[0][1], b = times[1][1], c = times[2][1], xt = times[3][1], x2t = times[4][1], seam = times[5][1];
             // Useful GEMM FLOPs, including shared; excludes transforms, decoding and R15/R16.
             const double flops = static_cast<double>(R) * 9.0 * 6.0 * H * I;
             std::printf("TIME R=%u TM=%u rotated median whole-call: "
                         "v1 %.3f ms/chunk %.6f ms/row %.3f TFLOP/s; "
                         "v2 %.3f ms/chunk %.6f ms/row %.3f TFLOP/s; "
                         "v3 %.3f ms/chunk %.6f ms/row %.3f TFLOP/s; "
-                        "decode R8 %.3f ms/chunk; v2/v1 speedup %.3fx; v3/v1 speedup %.3fx; v3/seam speedup %.3fx\n",
+                        "v6 %.3f ms/chunk %.6f ms/row %.3f TFLOP/s; "
+                        "v7 %.3f ms/chunk %.6f ms/row %.3f TFLOP/s; "
+                        "decode R8 %.3f ms/chunk; v2/v1 speedup %.3fx; v3/v1 speedup %.3fx; v3/seam speedup %.3fx; v6/v3 speedup %.3fx; v7/v3 speedup %.3fx\n",
                         R, tm, a, a / R, flops / (a * 1e9), b, b / R, flops / (b * 1e9),
-                        c, c / R, flops / (c * 1e9), seam, a / b, a / c, seam / c);
+                        c, c / R, flops / (c * 1e9), xt, xt / R, flops / (xt * 1e9), x2t, x2t / R, flops / (x2t * 1e9), seam, a / b, a / c, seam / c, c / xt, c / x2t);
             if (tm == 16) check(a / c >= 1.6, "v3 >=1.6x v1 R=" + std::to_string(R));
         }
     }
@@ -333,6 +456,13 @@ int main(int argc, char** argv) {
         }
         if (!timing && timing_only) throw std::invalid_argument("conflicting timing options");
         std::mt19937 rng(0x5eed1234U);
+        for (unsigned variant : {6U, 7U}) for (bool shared : {false, true}) for (unsigned bits : {4U, 6U}) for (bool down : {false, true}) {
+            if (bits == 6 && !shared) continue;
+            const auto a = X::x_resources(bits, down, shared, variant);
+            const auto name = "v" + std::to_string(variant) + " K" + std::to_string(bits) + (shared ? " shared" : " routed") + (down ? " down" : " gate/up");
+            std::printf("RESOURCE %s private=%zu B/lane VGPR=%d LDS=%zu\n", name.c_str(), a.localSizeBytes, a.numRegs, a.sharedSizeBytes);
+            check(a.localSizeBytes == 0, "zero spills " + name);
+        }
         Fixture f(rng);
         std::printf("exact workspace: %zu bytes at Rmax=%u; random K4 x288 + shared K6\n", f.wsb, MaxR);
         if (!timing_only) {
@@ -345,6 +475,22 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                 }
+            }
+            f.exceptional(rng);
+            const auto tails = routes(1024, 4, rng);
+            bool all_tails = true;
+            for (unsigned e = 0; e < 33; ++e)
+                all_tails = all_tails && std::count(tails.ids.begin(), tails.ids.end(), e) == e + 1;
+            check(all_tails, "routing contains exact group sizes 1..33");
+            f.gate(1024, tails, "all group tails 1..33", rng, true);
+            for (unsigned mode : {0U, 1U, 5U, 6U, 7U}) {
+                const auto rt = routes(4096, mode, rng);
+                if (mode == 1) for (unsigned e : {0U, 1U, 2U, 3U, 4U, 5U, 6U, 287U})
+                    check(std::count(rt.ids.begin(), rt.ids.end(), e) == 4096, "concentrated group R=4096 expert=" + std::to_string(e));
+                if (mode >= 5)
+                    check(std::count(rt.ids.begin(), rt.ids.end(), 0U) == 2047U + mode - 5U,
+                          "expert 0 group=" + std::to_string(2047U + mode - 5U));
+                f.gate(4096, rt, "R=4096 routes=" + std::to_string(mode), rng, true);
             }
             // Shared K4 follows the same qualified code path and must also pass the gate.
             f.shared = f.experts[0];

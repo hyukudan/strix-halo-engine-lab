@@ -104,7 +104,7 @@ void test_plain_equals_receipt() {
 }
 
 void test_apply_env_default() {
-    CHECK(rd::env_items().size() == 20);
+    CHECK(rd::env_items().size() == 21);
     CHECK(resolve(cat(kDeploy, kDecodeWork), {}).env.at("STRIX_GLM_SPEC_XCH").value == "xfer");
     CHECK(resolve({"--baseline"}, {}).env.at("STRIX_GLM_SPEC_XCH").value == "comm");
     CHECK(resolve({}, {{"STRIX_GLM_SPEC_XCH", "comm"}}).env.at("STRIX_GLM_SPEC_XCH").source == "explicit");
@@ -117,7 +117,8 @@ void test_apply_env_default() {
         else CHECK(set.count(it.env) == 0);
     }
     CHECK(set == merge(kHp, {{"HSA_DISABLE_FRAGMENT_ALLOCATOR", "1"}, {"STRIX_GLM_PF_PIPELINE", "2"},
-                              {"STRIX_DIST_ASYNC_START", "1"}, {"STRIX_GLM_SPEC_KDA_TREE", "2"}}));
+                              {"STRIX_DIST_ASYNC_START", "1"}, {"STRIX_GLM_SPEC_KDA_TREE", "2"},
+                              {"STRIX_GLM_PF_EXACT_X", "auto"}}));
     // = the receipt's optimization env + the prefill overlap + the two-barrier KDA verify tree
     // an explicit value is never overwritten
     const auto expl = resolve(cat(kDeploy, kDecodeWork), {{"STRIX_DIST_CRC_PARALLEL", "0"}});
@@ -181,6 +182,16 @@ void test_baseline() {
                             {{"STRIX_GLM_PREFILL", "auto"}, {"STRIX_GLM_HC_PRE_V", "7"}});
     CHECK(bx.identity.value == "r1b" && bx.mtp.value == "0" && bx.decode_xch.value == "xfer" && bx.prefill == "gemv");
     CHECK(bx.env.at("STRIX_GLM_HC_PRE_V").value == "7" && bx.env.at("STRIX_GLM_POST").value == "ref");
+    // exact prefill X2 core (MoE stays v3): literal defaults and off values (not only item-derived)
+    const auto d = resolve(plain, {});
+    CHECK(d.env.at("STRIX_GLM_PF_EXACT_X").value == "auto" && d.env.at("STRIX_GLM_PF_EXACTMOE_V").value == "3");
+    const auto bb = resolve(cat(plain, {"--baseline"}), {});
+    CHECK(bb.env.at("STRIX_GLM_PF_EXACT_X").value == "0" && bb.env.at("STRIX_GLM_PF_EXACTMOE_V").value == "1");
+    const auto b3 = resolve(cat(plain, {"--baseline"}), {{"STRIX_GLM_PF_EXACTMOE_V", "3"}});
+    CHECK(b3.env.at("STRIX_GLM_PF_EXACTMOE_V").value == "3" && b3.env.at("STRIX_GLM_PF_EXACTMOE_V").source == "explicit");
+    CHECK(b3.env.at("STRIX_GLM_PF_EXACT_X").value == "0");
+    const auto p3 = resolve(plain, {{"STRIX_GLM_PF_EXACTMOE_V", "3"}, {"STRIX_GLM_PF_EXACT_X", "0"}});
+    CHECK(p3.env.at("STRIX_GLM_PF_EXACTMOE_V").value == "3" && p3.env.at("STRIX_GLM_PF_EXACT_X").value == "0");
 }
 
 void test_mtp_default() {

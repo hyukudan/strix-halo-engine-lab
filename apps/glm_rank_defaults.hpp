@@ -75,6 +75,8 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: FastMoe matches DefaultMoe bitwise (real TP2 slices); raw-only experts (fits GTT)"},
         {"pf-exact-moe-v3", "STRIX_GLM_PF_EXACTMOE_V", "3", "1", false, true,
          "Measurement: exact MoE v3 (W2 grouped experts) 1K/8K/32K 240/236/226 tok/s, logits bitwise"},
+        {"pf-exact-x", "STRIX_GLM_PF_EXACT_X", "auto", "0", true, true,
+         "Measurement: exact register-blocked X2 prefill linear core for calls >= 2048 rows (TM16 below), bitwise"},
         {"pf-obar-v5", "STRIX_GLM_PF_OBAR", "5", "2", false, true, "Measurement: MLA o-bar v5 exact, 2.9x"},
         {"pf-scores-v4", "STRIX_GLM_PF_SCORES", "4", "2", false, true, "Measurement: MLA scores v4 bitwise 75/0, -8..-17 % vs v3 (=3 restores v3)"},
         {"pf-indexer-v2", "STRIX_GLM_PF_IDX", "2", "1", false, true, "Measurement: indexer v2 -41 %"},
