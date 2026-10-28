@@ -1368,7 +1368,7 @@ Use wider expert kernels for N2–4.
 - **Exactness evidence:** Published same-identity qualification: Measurement: rows == alone, wide expert kernels at N2-4, N2 -3.0..-3.5 %, N4 -4..-6 %; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_MMX_MOE_WIDE=0
 - **Measured gain:** rows == alone, wide expert kernels at N2-4, N2 -3.0..-3.5 %, N4 -4..-6 %
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-index-conc"></a>
 
@@ -1384,7 +1384,7 @@ Overlap independent index work.
 - **Exactness evidence:** Published same-identity qualification: Measurement: ids identical, 17/18 in-process block pairs faster, ~-0.2 ms/token; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_MM_INDEX_CONC=0
 - **Measured gain:** ids identical, 17/18 in-process block pairs faster, ~-0.2 ms/token
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-xfer-crc-deferred"></a>
 
@@ -1400,7 +1400,7 @@ Check transport CRC through deferred exchange completion.
 - **Exactness evidence:** Published same-identity qualification: Measurement: tokens identical in 7 processes, each deferred arm below its inline neighbours by 0.04-0.12 ms/token; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_MMX_CRC=1
 - **Measured gain:** tokens identical in 7 processes, each deferred arm below its inline neighbours by 0.04-0.12 ms/token
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-xb-wait"></a>
 
@@ -1416,7 +1416,7 @@ Use fused boundary wait scheduling.
 - **Exactness evidence:** Published same-identity qualification: Exchange boundary measurement: exact, 1K 48.56 -> 44.40 ms/token; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_MM_XB_WAIT=0
 - **Measured gain:** Exchange boundary measurement: exact, 1K 48.56 -> 44.40 ms/token
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-xb-inplace"></a>
 
@@ -1432,7 +1432,7 @@ Consume exchange results in place.
 - **Exactness evidence:** Published same-identity qualification: Exchange boundary measurement: exact, 1K 48.56 -> 44.40 ms/token; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_MM_XB_INPLACE=0
 - **Measured gain:** Exchange boundary measurement: exact, 1K 48.56 -> 44.40 ms/token
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-xb-publish"></a>
 
@@ -1448,7 +1448,7 @@ Publish the exchange message from the producer.
 - **Exactness evidence:** Published same-identity qualification: Exchange boundary measurement: exact, 1K 48.56 -> 44.40 ms/token (falls back without the v4/overlap cores); repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_MM_XB_PUBLISH=0
 - **Measured gain:** Exchange boundary measurement: exact, 1K 48.56 -> 44.40 ms/token (falls back without the v4/overlap cores)
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-xb-postilp"></a>
 
@@ -1464,7 +1464,7 @@ Use LDS-staged mode-2 post-exchange partials.
 - **Exactness evidence:** Published same-identity qualification: Exchange boundary measurement: exact, 1K 48.56 -> 44.40 ms/token; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_MM_XB_POSTILP=0
 - **Measured gain:** Exchange boundary measurement: exact, 1K 48.56 -> 44.40 ms/token
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-xb-warm"></a>
 
@@ -1480,7 +1480,7 @@ Warm 8 MiB of boundary data.
 - **Exactness evidence:** Published same-identity qualification: Exchange boundary measurement: exact, 1K 48.56 -> 44.40 ms/token; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_MM_XB_WARM=0
 - **Measured gain:** Exchange boundary measurement: exact, 1K 48.56 -> 44.40 ms/token
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-dspark-attn"></a>
 
@@ -1496,7 +1496,7 @@ Use mode-2 drafter attention.
 - **Exactness evidence:** Published same-identity qualification: Drafter measurement: bitwise, drafter attention B/A 0.964-0.975 / 0.918-0.924 / 0.815-0.819 at ctx 300/1000/4095; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_MM_DSPARK_ATTN=0
 - **Measured gain:** Drafter measurement: bitwise, drafter attention B/A 0.964-0.975 / 0.918-0.924 / 0.815-0.819 at ctx 300/1000/4095
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-draft-lin"></a>
 
@@ -1512,7 +1512,7 @@ Group q/k/v and gate/up draft projections.
 - **Exactness evidence:** Published same-identity qualification: Optimized draft linears (measurement evidence); repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_MM_DRAFT_LIN=lib
 - **Measured gain:** Optimized draft linears (measurement evidence)
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-linear-v11"></a>
 
@@ -1528,7 +1528,7 @@ A linear core scheduled for the 7-row DSpark draft block (q+k+v, o and gate+up g
 - **Exactness evidence:** Same output bits as v10 (bitwise over every scheduled form and layer); speculative ids == greedy 36/36.
 - **Off switch:** STRIX_MMX_LINEAR_V11=0
 - **Measured gain:** DSpark draft block −11.9 %
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-markov-cand"></a>
 
@@ -1545,7 +1545,7 @@ per draft instead of a full-vocabulary scan and host exchange per step.
 - **Exactness evidence:** Target verify is unchanged, so committed tokens equal plain greedy (ids == greedy on every gated session); top-C v2 payloads == v1 == CPU, including ties, ±0 and NaN.
 - **Off switch:** STRIX_MM_MARKOV=full (C/H/TOPC: 1024/2048/v1)
 - **Measured gain:** ~1.7 ms saved per draft; DSpark median tok/s +1.1 to +1.6 % across json/code/English/Spanish prompts, acceptance unchanged
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-pf-core-v4"></a>
 
@@ -1561,7 +1561,7 @@ Use v4 register/layout scheduling.
 - **Exactness evidence:** Published same-identity qualification: Prefill core measurement: bitwise everywhere, whole call 0.34-0.58x lib; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_MMX_PREFILL_CORE=lib
 - **Measured gain:** Prefill core measurement: bitwise everywhere, whole call 0.34-0.58x lib
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-pf-msa-batch"></a>
 
@@ -1577,7 +1577,7 @@ Batch compatible MSA work across prompt rows.
 - **Exactness evidence:** Published same-identity qualification: Prefill measurement: exact, combined prefill TTFT 1K -17 %, 8K -20 %; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_MM_PF_MSA_BATCH=0
 - **Measured gain:** Prefill measurement: exact, combined prefill TTFT 1K -17 %, 8K -20 %
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-pf-attend4"></a>
 
@@ -1593,7 +1593,7 @@ Use the admitted four-way attend schedule.
 - **Exactness evidence:** Published same-identity qualification: Prefill measurement: exact, combined prefill TTFT 1K -17 %, 8K -20 %; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_MM_PF_ATTEND4=0
 - **Measured gain:** Prefill measurement: exact, combined prefill TTFT 1K -17 %, 8K -20 %
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-pf-router-batch"></a>
 
@@ -1609,7 +1609,7 @@ Compute compatible router rows together.
 - **Exactness evidence:** Published same-identity qualification: Prefill measurement: exact, combined prefill TTFT 1K -17 %, 8K -20 %; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_MM_PF_ROUTER_BATCH=0
 - **Measured gain:** Prefill measurement: exact, combined prefill TTFT 1K -17 %, 8K -20 %
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-pf-mtfit"></a>
 
@@ -1625,7 +1625,7 @@ Choose fitting prefill MoE tiles.
 - **Exactness evidence:** Published same-identity qualification: Prefill measurement: exact, combined prefill TTFT 1K -17 %, 8K -20 %; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_MMX_PREFILL_MTFIT=0
 - **Measured gain:** Prefill measurement: exact, combined prefill TTFT 1K -17 %, 8K -20 %
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-pf-msa-rework"></a>
 
@@ -1641,7 +1641,39 @@ Rework attention scheduling without changing the reference result.
 - **Exactness evidence:** Published same-identity qualification: Prefill attention measurement: exact, 8K B/A 0.963 / 0.957 / 0.972; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_MM_PF_MSA_REWORK=0
 - **Measured gain:** Prefill attention measurement: exact, 8K B/A 0.963 / 0.957 / 0.972
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+
+<a id="mm-pf-idx-tile"></a>
+
+### MSA prefill index query tiles
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_IDX_TILE`. **Default:** 1.
+
+Reuse each loaded index-key tile across consecutive prefill query windows when scoring MSA blocks; the score arithmetic is unchanged.
+
+- **Preconditions:** Prefill chunks larger than eight rows past the 2048-position dense prefix.
+- **Automatic selection:** Resolver supplies 1 only when unset; explicit values win. `STRIX_MM_PF_IDX_ROWS` (16, 32 or 64; default 64) sets the query tile; 64 runs the Q64 macrotile kernel (one key-tile load per 64 queries).
+- **Fallback notice:** Shorter chunks and the dense prefix keep the per-window index path; invalid explicit settings fail validation.
+- **Exactness evidence:** Published same-identity qualification: Prefill index measurement: exact (state/final rows identical), index scoring 8K -6.7 %, 32K -6.4 %; TTFT 8K -1.9 %, 32K -0.6 %, 1K neutral; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
+- **Off switch:** STRIX_MM_PF_IDX_TILE=0
+- **Measured gain:** Prefill index measurement: exact (state/final rows identical), index scoring 8K -6.7 %, 32K -6.4 %; TTFT 8K -1.9 %, 32K -0.6 %, 1K neutral
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+
+<a id="mm-pf-idx-rows"></a>
+
+### MSA prefill index Q64 macrotiles
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_IDX_ROWS`. **Default:** 64.
+
+Score 64 prefill queries per loaded index-key tile in four 16-query subtiles; every dot, reduction, maximum and selection step is unchanged.
+
+- **Preconditions:** Index query tiles on (`STRIX_MM_PF_IDX_TILE=1`, the default) and prefill chunks larger than eight rows past the 2048-position dense prefix.
+- **Automatic selection:** Resolver supplies 64 only when unset; explicit values win (16, 32 or 64).
+- **Fallback notice:** Invalid explicit settings fail validation.
+- **Exactness evidence:** Published same-identity qualification: Prefill index measurement: exact (state/final rows identical), Q64 vs Q32 index scoring 8K -35 %, 32K -28 %; TTFT 8K -1.5 %, 32K -1.8 %, 1K neutral; fused MSA unit tests byte-compare Q64 against the default and Q32 paths.
+- **Off switch:** STRIX_MM_PF_IDX_ROWS=32
+- **Measured gain:** Prefill index measurement: exact (state/final rows identical), Q64 vs Q32 index scoring 8K -35 %, 32K -28 %; TTFT 8K -1.5 %, 32K -1.8 %, 1K neutral
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-pf-moe-pipe"></a>
 
@@ -1657,7 +1689,7 @@ Pipeline compatible expert prefill work.
 - **Exactness evidence:** Published same-identity qualification: Prefill measurement: exact, 8K B/A 0.973 / 0.935 / 0.924; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_MMX_PREFILL_PIPE=0
 - **Measured gain:** Prefill measurement: exact, 8K B/A 0.973 / 0.935 / 0.924
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-pf-kv-tile"></a>
 
@@ -1673,7 +1705,7 @@ Choose the supported KV tile implementation.
 - **Exactness evidence:** Published same-identity qualification: Prefill measurement: exact, 8K B/A 0.960 / 0.949 / 1.017; needs the Trellis tile hook, else a logged no-op; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_MM_PF_KV_TILE=off
 - **Measured gain:** Prefill measurement: exact, 8K B/A 0.960 / 0.949 / 1.017; needs the Trellis tile hook, else a logged no-op
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-pf-tx-uncached"></a>
 
@@ -1689,7 +1721,7 @@ Avoid cache pollution in prefill exchange sends.
 - **Exactness evidence:** Published same-identity qualification: Prefill exchange measurement: exact, exchange-send 0.23 -> 0.002 s GPU, ~1.3 % (prefill module route); repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_MM_PF_TX_UNCACHED=0
 - **Measured gain:** Prefill exchange measurement: exact, exchange-send 0.23 -> 0.002 s GPU, ~1.3 % (prefill module route)
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-dist-crc-parallel"></a>
 
@@ -1705,7 +1737,7 @@ Compute host transport CRC on workers.
 - **Exactness evidence:** Published same-identity qualification: Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_DIST_CRC_PARALLEL=0
 - **Measured gain:** Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-dist-host-crc-overlap"></a>
 
@@ -1721,7 +1753,7 @@ Overlap host CRC and transport work.
 - **Exactness evidence:** Published same-identity qualification: Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_DIST_HOST_CRC_OVERLAP=0
 - **Measured gain:** Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-dist-host-chunk"></a>
 
@@ -1737,7 +1769,7 @@ Send host transport in 1 MiB pieces.
 - **Exactness evidence:** Published same-identity qualification: Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
 - **Off switch:** STRIX_DIST_HOST_CHUNK_BYTES=0
 - **Measured gain:** Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged
-- **Implementation / evidence:** [27-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
+- **Implementation / evidence:** [29-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-routes"></a>
 

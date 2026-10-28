@@ -170,14 +170,18 @@ is qualified by launch-count estimates.
   combine is its own launch), so no store-drain/fence protocol is needed yet; a ticket-based fused combine would have
   to drain its stores (`s_waitcnt vmcnt(0)` + release fence at agent scope) before the ticket.
 
-## Draft prefill index query tiles
+## Prefill index query tiles
 
-`STRIX_MM_PF_IDX_TILE=1` (default off), or `Engine::set_prefill_index_tile(true)`, enables
+`STRIX_MM_PF_IDX_TILE=1` (default on through the MiniMax defaults resolver; `STRIX_MM_PF_IDX_TILE=0` or `STRIX_MM_BASELINE=1` switches it off), or `Engine::set_prefill_index_tile(true)`, enables
 batched prefill for chunks larger than eight rows and reuses each loaded index-key tile across consecutive query windows.
-`STRIX_MM_PF_IDX_ROWS` is read once at engine startup: 16, 32 (default), or 64; other values fail closed.
-The effective cap is 32 rows: 32 KB of keys plus 32 KB of normalized FP32 index queries fill 64 KB of LDS.
-After all threads read their packed key into registers, the key LDS region holds the wave maxima.
-A barrier separates those reads from the maxima writes. Requested Q=64 therefore executes Q=32.
+`STRIX_MM_PF_IDX_ROWS` is read once at engine startup: 16, 32 or 64 (default 64 through the MiniMax defaults resolver;
+`STRIX_MM_PF_IDX_ROWS=32` restores the Q32 tile); other values fail closed.
+Q16/Q32 keep 32 KB of keys plus up to 32 KB of normalized FP32 index queries in LDS (64 KB at Q32); after all threads
+read their packed key into registers, the key LDS region holds the wave maxima, with a barrier between those reads and
+the maxima writes. Q64 is a macrotile: each CTA loads and unpacks a key tile once, keeps the packed keys in registers,
+and overlays the 32 KB key staging area with one normalized 16-query subtile (16 KB) plus its maxima, scoring four
+subtiles per key tile. Every dot, reduction, maximum and selection step is the Q16/Q32 one; the fused MSA tests
+byte-compare Q64 against the default and Q32 paths.
 
 Each output retains the same four-FMA lane chains, dot reduction, scale, shuffle-max tree and
 wave-max order. Per-row causal masks and the skip for wholly invisible blocks are preserved.
@@ -188,6 +192,7 @@ The prepared cache supplies the same packed index keys; score addresses remain i
 state and final-row hashes, and restores the prior switches afterward. It is excluded from `pfall`.
 The HIP tests compare score bytes (including untouched slots), selected IDs, counts, outputs and
 cache bytes at Q=16/32/64, including tied maxima, boundary positions, scratch reuse and 30K offsets.
-They print per-chunk sparse-index launch time for each arm, excluding prep and attention.
-This path is a draft pending compiler, native execution, model fidelity and complete-workload
-qualification on both ranks; no local GPU qualification or performance claim is made.
+Measured on the two-node TP2 route (state and final rows bitwise identical in every arm): tiles versus
+per-window scoring 8K TTFT -1.9 %, 32K -0.6 %; Q64 versus Q32 8K TTFT -1.5 %, 32K -1.8 % (index -28 %),
+1K neutral. The end-to-end hardware gate covers decode identity, batch rows equal to single requests and
+serving resume on both ranks. Use `--ab pfidx` for the per-arm prefill timing; the HIP tests check bytes only.

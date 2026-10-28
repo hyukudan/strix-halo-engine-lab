@@ -880,49 +880,59 @@ void prefill_batch_case(std::uint32_t pos0, std::uint32_t n, std::mt19937& rng, 
         std::printf("prefill complete pos0=%u n=%u scratch=%u pv_full=%u modes 0/1/2/3/4 %.3f/%.3f/%.3f/%.3f/%.3f ms; shared-selection scheduling %.3f ms (R16 membership included in producers)\n",
                     pos0, n, cap, pvf, complete_ms[0], complete_ms[1], complete_ms[2], complete_ms[3], complete_ms[4], selection_ms);
     }
-    // Every scratch batch is checked independently, including untouched causal slots.
-    // The preceding complete prefill left all cache rows prepared.
-    if (!quick) for (unsigned query_rows : {16U, 32U, 64U}) {
-        float index_ms[2] = {};
-        for (unsigned r0 = 0; r0 < n; r0 += scratch_windows * 16) {
-            const unsigned m = std::min(n - r0, scratch_windows * 16);
+    // Index gates also run in quick mode. Compare default, Q32 and real Q64 in
+    // each reused scratch batch, including causal holes and unused tail rows.
+    // The complete producer checks above left every cache row prepared.
+    // Small cases force one-window reuse; large cases reuse the bounded full
+    // scratch allocation without copying that entire allocation per 16 rows.
+    const std::vector<unsigned> index_caps = n > 129 ? std::vector<unsigned>{scratch_windows}
+        : n >= 65 ? std::vector<unsigned>{1U, 4U, scratch_windows} : std::vector<unsigned>{1U, scratch_windows};
+    for (unsigned cap : index_caps) {
+        for (unsigned r0 = 0; r0 < n; r0 += cap * 16) {
+            const unsigned m = std::min(n - r0, cap * 16);
             auto v = prefill_view(p, pos0 + r0, std::min(m, 16U));
-            v.scores = scores;
-            v.partial = partial;
-            v.idx = idx;
-            v.idx_count = cnt;
-            v.ticket = ticket;
-            std::vector<float> reference, output_ref;
-            std::vector<std::uint32_t> ids_ref, counts_ref;
-            for (unsigned arm = 0; arm < 2; ++arm) {
+            v.scores = scores; v.partial = partial; v.idx = idx; v.idx_count = cnt; v.ticket = ticket;
+            std::vector<float> reference, complete_scores_ref, partial_ref, output_ref;
+            std::vector<std::uint32_t> ids_ref, counts_ref, tickets_ref;
+            std::vector<std::uint16_t> k_ref, v_ref, ik_ref;
+            for (unsigned query_rows : {0U, 16U, 32U, 64U}) {
+                const mf::PrefillView batch{v, m, pos0 + r0, cap, 0, query_rows != 0,
+                                           query_rows == 0 ? 32U : query_rows};
                 hip_ok(hipMemset(scores, 0xa5, rows * 2 * p.max_blocks * sizeof(float)), "index sentinel");
-                mf::enqueue_prefill_index({v, m, pos0 + r0, scratch_windows, 0, arm != 0, query_rows}, nullptr);
+                mf::enqueue_prefill_index(batch, nullptr);
                 const auto result = host(scores, rows * 2 * p.max_blocks);
-                if (arm == 0) reference = result;
+                if (query_rows == 0) reference = result;
                 else check(same(reference, result), "prefill index scores/sentinel pos0=" + std::to_string(pos0 + r0) +
                            " n=" + std::to_string(m) + " Q=" + std::to_string(query_rows));
-                mf::PrefillView timed{v, m, pos0 + r0, scratch_windows, 0, arm != 0, query_rows};
-                const unsigned batch_windows = (m + 15) / 16;
-                while (timed.first_window < batch_windows &&
-                       timed.pos0 + std::min(m, (timed.first_window + 1) * 16) - 1 < msa::kTopK * msa::kBlock)
-                    ++timed.first_window;
-                if (timed.first_window < batch_windows) {
-                    hip_ok(hipEventRecord(begin, nullptr), "index begin");
-                    mf::enqueue_prefill_index(timed, nullptr);
-                    index_ms[arm] += elapsed();
-                }
+                // Fresh sentinels expose extra writes; buffers are reused for the
+                // next batch without reallocating (including a short final batch).
+                hip_ok(hipMemset(scores, 0xa5, rows * 2 * p.max_blocks * sizeof(float)), "complete index sentinel");
+                hip_ok(hipMemset(partial, 0xa5, rows * 32 * msa::kMaxChunks * 130 * sizeof(float)), "index partial sentinel");
                 hip_ok(hipMemset(idx, 0xa5, rows * 2 * msa::kTopK * sizeof(std::uint32_t)), "index batch ids");
                 hip_ok(hipMemset(cnt, 0xa5, rows * 2 * sizeof(std::uint32_t)), "index batch counts");
-                mf::enqueue_prefill({v, m, pos0 + r0, scratch_windows, 0, arm != 0, query_rows}, nullptr);
+                hip_ok(hipMemset(ticket, 0, rows * 2 * 4 * sizeof(std::uint32_t)), "index batch tickets");
+                hip_ok(hipMemset(p.o, 0xa5, p.q.size() * sizeof(float)), "index output sentinel");
+                mf::enqueue_prefill(batch, nullptr);
+                const auto sc = host(scores, rows * 2 * p.max_blocks);
+                const auto pt = host(partial, rows * 32 * msa::kMaxChunks * 130);
                 const auto ids = host(idx, rows * 2 * msa::kTopK), counts = host(cnt, rows * 2);
-                const auto output = host(v.o, std::size_t{m} * 32 * 128);
-                if (arm == 0) { ids_ref = ids; counts_ref = counts; output_ref = output; }
-                else check(same(ids_ref, ids) && same(counts_ref, counts) && same(output_ref, output),
-                           "prefill index batch ids/counts/output Q=" + std::to_string(query_rows));
+                const auto output = host(p.o, p.q.size());
+                const auto tickets = host(ticket, rows * 2 * 4);
+                if (query_rows == 0) {
+                    complete_scores_ref = sc; partial_ref = pt; output_ref = output;
+                    ids_ref = ids; counts_ref = counts; tickets_ref = tickets;
+                    k_ref = host(p.kc, nkv); v_ref = host(p.vc, nkv); ik_ref = host(p.ikc, nik);
+                } else check(same(complete_scores_ref, sc) && same(partial_ref, pt) &&
+                             same(ids_ref, ids) && same(counts_ref, counts) && same(output_ref, output) &&
+                             same(tickets_ref, tickets) && same(k_ref, host(p.kc, nkv)) &&
+                             same(v_ref, host(p.vc, nkv)) && same(ik_ref, host(p.ikc, nik)),
+                             "prefill index complete bytes pos0=" + std::to_string(pos0 + r0) +
+                             " n=" + std::to_string(m) + " scratch=" + std::to_string(cap) +
+                             " Q=" + std::to_string(query_rows) + " ties=" + std::to_string(ties));
+                check(std::all_of(tickets.begin(), tickets.end(), [](std::uint32_t x) { return x == 0; }),
+                      "prefill index zero tickets");
             }
         }
-        std::printf("prefill index chunk pos0=%u n=%u Q=%u effective=%u ties=%u off %.3f ms on %.3f ms\n",
-                    pos0, n, query_rows, std::min(query_rows, 32U), ties ? 1U : 0U, index_ms[0], index_ms[1]);
     }
     // Reject unsupported views before launching any work.
     auto invalid = mf::PrefillView{prefill_view(p, pos0, std::min(n, 16U)), 0, pos0, scratch_windows};
@@ -968,6 +978,7 @@ void prefill_batch_case(std::uint32_t pos0, std::uint32_t n, std::mt19937& rng, 
 }
 
 void prefill_batch_cases(std::mt19937& rng) {
+    for (std::uint32_t pos0 : {2047U, 2048U, 2049U}) prefill_batch_case(pos0, 65, rng, true);
     for (std::uint32_t pos0 : {0U, 1000U, 2040U, 4096U, 8190U, 30000U})
         for (std::uint32_t n : {1U, 15U, 16U, 17U, 63U, 64U, 65U, 100U, 127U, 128U, 129U, 1024U, 4096U}) prefill_batch_case(pos0, n, rng);
     for (std::uint32_t pos0 : {127U, 128U, 129U, 2047U, 2048U, 2049U, 4095U, 4096U, 4097U})
@@ -1458,7 +1469,7 @@ void bench_cell(std::uint64_t ctx, unsigned seqs, unsigned W, std::mt19937& rng)
 int main() {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);  // line-buffered: a killed process keeps its log
     std::mt19937 rng(20261024);
-    // Focused producer byte checks/timings; omit the unrelated decode/index suite
+    // Focused producer/index byte checks; omit the unrelated decode suite
     // and the exhaustive complete-prefill matrix. Optional list: pos0:n,pos0:n.
     if (const char* quick = std::getenv("STRIX_MSA_TEST_QUICK"); quick != nullptr && std::strcmp(quick, "1") == 0) {
         if (const char* list = std::getenv("STRIX_MSA_TEST_CASES")) {
@@ -1482,7 +1493,10 @@ int main() {
             for (unsigned pos0 : {127U, 128U, 129U, 2047U, 2048U, 2049U})
                 prefill_batch_case(pos0, 17, rng, true, true);
         }
-        std::printf("strix-mmattn-fused-tests: quick producer cases, %d failure(s)\n", g_fail);
+        // Mandatory real four-subtile Q64 + tail, even with a custom case list.
+        // Cross the dense boundary and exercise equal scores/ID tie-breaking.
+        for (unsigned pos0 : {2047U, 2048U, 2049U}) prefill_batch_case(pos0, 65, rng, true, true);
+        std::printf("strix-mmattn-fused-tests: quick producer/index cases, %d failure(s)\n", g_fail);
         return g_fail != 0 ? 1 : 0;
     }
     const char* only_bench = std::getenv("STRIX_MMATTN_BENCH_ONLY");

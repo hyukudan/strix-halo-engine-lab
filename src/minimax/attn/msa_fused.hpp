@@ -87,7 +87,7 @@ struct PrefillView {
     std::uint32_t scratch_windows;
     std::uint32_t first_window = 0;  // internal launch range, must be zero on entry
     bool index_tile = false;
-    std::uint32_t index_rows = 32;  // 16/32/64; 64 is capped to 32 for the 64 KB LDS limit
+    std::uint32_t index_rows = 32;  // 16/32/64; 64 reuses 32 KiB LDS across four 16-query subtiles
     std::uint32_t msa_rework = 0;  // 0 = original; 1 = shared selection/HPW2/separate combine; 2 = 16-key K/V tiles; 3 = direct sparse mapping + visible tiles; 4 = R16 shared K/V tiles
 };
 using PrefillStageMarker = void (*)(void* user, const char* category, bool before);

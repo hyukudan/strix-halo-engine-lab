@@ -1083,6 +1083,28 @@
   },
   {
     "engine": "minimax",
+    "name": "MSA prefill index query tiles",
+    "flag_or_env": "STRIX_MM_PF_IDX_TILE",
+    "default": "1",
+    "exact": "Published same-identity qualification: Prefill index measurement: exact (state/final rows identical), index scoring 8K -6.7 %, 32K -6.4 %; TTFT 8K -1.9 %, 32K -0.6 %, 1K neutral; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.",
+    "gain": "Prefill index measurement: exact (state/final rows identical), index scoring 8K -6.7 %, 32K -6.4 %; TTFT 8K -1.9 %, 32K -0.6 %, 1K neutral",
+    "preconditions": "Prefill chunks larger than eight rows past the 2048-position dense prefix.",
+    "off_switch": "STRIX_MM_PF_IDX_TILE=0",
+    "doc_anchor": "docs/optimizations.md#mm-pf-idx-tile"
+  },
+  {
+    "engine": "minimax",
+    "name": "MSA prefill index Q64 macrotiles",
+    "flag_or_env": "STRIX_MM_PF_IDX_ROWS",
+    "default": "64",
+    "exact": "Published same-identity qualification: Prefill index measurement: exact (state/final rows identical), Q64 vs Q32 index scoring 8K -35 %, 32K -28 %; TTFT 8K -1.5 %, 32K -1.8 %, 1K neutral; fused MSA unit tests byte-compare Q64 against the default and Q32 paths.",
+    "gain": "Prefill index measurement: exact (state/final rows identical), Q64 vs Q32 index scoring 8K -35 %, 32K -28 %; TTFT 8K -1.5 %, 32K -1.8 %, 1K neutral",
+    "preconditions": "Index query tiles on (STRIX_MM_PF_IDX_TILE=1) and prefill chunks larger than eight rows past the 2048-position dense prefix.",
+    "off_switch": "STRIX_MM_PF_IDX_ROWS=32",
+    "doc_anchor": "docs/optimizations.md#mm-pf-idx-rows"
+  },
+  {
+    "engine": "minimax",
     "name": "MoE prefill pipeline",
     "flag_or_env": "STRIX_MMX_PREFILL_PIPE",
     "default": "1",

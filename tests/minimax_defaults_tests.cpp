@@ -93,7 +93,8 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MM_PF_ATTEND4", "0"},          {"STRIX_MM_PF_ROUTER_BATCH", "0"},  {"STRIX_MMX_PREFILL_MTFIT", "0"},
     {"STRIX_MM_PF_MSA_REWORK", "0"},       {"STRIX_MMX_PREFILL_PIPE", "0"},    {"STRIX_MM_PF_KV_TILE", "off"},
     {"STRIX_MM_PF_TX_UNCACHED", "0"},      {"STRIX_DIST_CRC_PARALLEL", "0"},   {"STRIX_DIST_HOST_CRC_OVERLAP", "0"},
-    {"STRIX_DIST_HOST_CHUNK_BYTES", "0"},
+    {"STRIX_DIST_HOST_CHUNK_BYTES", "0"},  {"STRIX_MM_PF_IDX_TILE", "0"},
+    {"STRIX_MM_PF_IDX_ROWS", "32"},
 };
 
 void test_table() {
