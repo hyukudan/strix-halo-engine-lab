@@ -380,6 +380,89 @@ __global__ __launch_bounds__(kIdxThreads) void prefill_index_tile_kernel(Prefill
     }
 }
 
+// Q64 macrotile: one key load/read_row per 64 queries, four LDS subtiles.
+// Keep dot128_packed's per-dot widening and exact four-FMA/butterfly order.
+__global__ __launch_bounds__(kIdxThreads) void prefill_index_q64_kernel(PrefillView input) {
+    constexpr unsigned query_rows = 64;
+    static_assert(kMaxRows * 2 * kIdxDim * sizeof(float) +
+                  kMaxRows * 2 * (kIdxThreads / 32) * sizeof(float) <= kChunks16 * sizeof(uint4));
+    const unsigned r0 = input.first_window * kMaxRows + blockIdx.y * query_rows;
+    DecodeView v = kernel_view(input, blockIdx.y * (query_rows / kMaxRows));
+    v.rows_per_seq = input.rows - r0 < query_rows ? input.rows - r0 : query_rows;
+    extern __shared__ uint4 smem[];
+    uint4* tile = smem;                                          // kBlock x 16 pieces (32 KB)
+    // Once read_row has retired, packed keys live only in kw. Overlay the key
+    // staging area with one 16-query subtile (16 KiB) and its maxima (512 B).
+    // Two index heads are enforced by enqueue_prefill_index.
+    float* iqs = reinterpret_cast<float*>(smem);
+    float* wave_max = iqs + kMaxRows * 2 * kIdxDim;
+    const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U;
+    const unsigned W = v.rows_per_seq, H = v.idx_heads;
+    const unsigned local = (v.max_blocks + v.shard_count - 1 - v.shard_rank) / v.shard_count;
+    const unsigned items = v.seqs * local;
+    // Keep packed keys in registers across all query rows.
+    for (unsigned item = next_valid(v, blockIdx.x, items); item < items; item = next_valid(v, item + gridDim.x, items)) {
+        const Item it = item_of(v, item);
+        {
+            uint4 pre[kChunks16 / kIdxThreads];
+            load_tile(v, item, pre);
+#pragma unroll
+            for (unsigned i = 0; i < kChunks16 / kIdxThreads; ++i) {
+                const unsigned e = i * kIdxThreads + tid;
+                tile[swz(e >> 4U, e & 15U)] = pre[i];
+            }
+        }
+        __syncthreads();
+        std::uint32_t kw[64];  // packed: converted per dot (128 floats + hoisted q loads spill)
+        read_row(tile, tid, kw);
+        for (unsigned i = 0; i < 64; ++i) asm volatile("" : "+v"(kw[i]));
+        __syncthreads();  // all key reads precede the aliased wave maxima
+        const std::uint64_t t = it.b * kBlock + tid;
+#pragma unroll 1
+        for (unsigned q0 = 0; q0 < W; q0 += kMaxRows) {
+            const unsigned subrows = W - q0 < kMaxRows ? W - q0 : kMaxRows;
+            for (unsigned n = wave; n < subrows * H; n += kIdxThreads / 32) {
+                const unsigned r = q0 + n / H;
+                float x[kDimsPerLane];
+                load4(x, v.iq + (static_cast<std::size_t>(q0) * H + n) * kIdxDim, lane);
+                norm_rope_lane(x, v.iq_w, v.rope[r], lane);
+                *reinterpret_cast<float4*>(iqs + static_cast<std::size_t>(n) * kIdxDim + lane * kDimsPerLane) =
+                    make_float4(x[0], x[1], x[2], x[3]);
+            }
+            __syncthreads();  // all subtile queries precede dot reads
+#pragma unroll 1
+            for (unsigned rr = 0; rr < subrows; ++rr) {
+                const unsigned r = q0 + rr;
+                const std::uint64_t count = v.pos[r] + 1;
+                if (it.b * kBlock >= count) continue;  // uniform over the block
+#pragma unroll 1
+                for (unsigned h = 0; h < H; ++h) {
+                    float sc = -__builtin_inff();
+                    if (t < count) {
+                        // Opaque to the optimizer: the conversions stay inside the dot instead of being hoisted.
+                        for (unsigned i = 0; i < 64; ++i) asm volatile("" : "+v"(kw[i]));
+                        sc = dot128_packed(iqs + (static_cast<std::size_t>(rr) * H + h) * kIdxDim, kw) * kScale;
+                    }
+                    for (unsigned d = 16; d >= 1; d >>= 1U) sc = max_of(sc, __shfl_xor(sc, static_cast<int>(d), 32));
+                    if (lane == 0) wave_max[(rr * H + h) * (kIdxThreads / 32) + wave] = sc;
+                }
+            }
+            __syncthreads();
+            if (tid < subrows * H) {
+                const unsigned rr = tid / H, h = tid % H, r = q0 + rr;
+                if (it.b * kBlock < v.pos[r] + 1) {
+                    const float* wm = wave_max + tid * (kIdxThreads / 32);
+                    float m = wm[0];
+                    for (unsigned w = 1; w < kIdxThreads / 32; ++w) m = max_of(m, wm[w]);
+                    v.scores[(static_cast<std::size_t>(r) * H + h) * v.max_blocks + it.j] = m;
+                }
+            }
+            // Finish all maxima reads before the next subtile or key tile overwrites LDS.
+            __syncthreads();
+        }
+    }
+}
+
 // ---------------------------------------------------------------- attend launch (K3 + K4 + combine)
 
 __device__ __forceinline__ std::uint32_t order_key(float x) {
@@ -1917,12 +2000,18 @@ void enqueue_prefill_index(const PrefillView& p, hipStream_t stream) {
         p.rows > std::uint64_t{v.max_blocks} * kBlock - p.pos0 ||
         v.phase_index != nullptr || (p.index_rows != 16 && p.index_rows != 32 && p.index_rows != 64))
         throw std::invalid_argument("minimax prefill index: bad view");
-    const unsigned query_rows = p.index_rows == 64 ? 32U : p.index_rows;
+    const unsigned query_rows = p.index_rows;
     const unsigned sparse = windows - p.first_window;
     const unsigned grid = v.max_blocks < index_grid_cap() ? v.max_blocks : index_grid_cap();
     const unsigned rows = p.index_tile ? query_rows : kMaxRows;
-    const std::size_t lds = kChunks16 * sizeof(uint4) + std::size_t{rows} * v.idx_heads * kIdxDim * sizeof(float);
-    if (p.index_tile) {
+    // Q64 overlays queries/maxima on key staging; legacy modes retain their layout.
+    const std::size_t query_lds = p.index_tile && rows == 64 ? 0U
+        : std::size_t{rows} * v.idx_heads * kIdxDim * sizeof(float);
+    const std::size_t lds = kChunks16 * sizeof(uint4) + query_lds;
+    if (p.index_tile && rows == 64) {
+        const unsigned tiles = (sparse + 3U) / 4U;
+        hipLaunchKernelGGL(prefill_index_q64_kernel, dim3(grid, tiles), dim3(kIdxThreads), lds, stream, p);
+    } else if (p.index_tile) {
         const unsigned tiles = (sparse + rows / kMaxRows - 1) / (rows / kMaxRows);
         hipLaunchKernelGGL(prefill_index_tile_kernel, dim3(grid, tiles), dim3(kIdxThreads), lds, stream, p, rows);
     } else {
