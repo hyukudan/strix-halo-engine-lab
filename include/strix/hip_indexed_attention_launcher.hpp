@@ -21,6 +21,10 @@ namespace strix {
 // STRIX_BATCH_SERVICE_MS: diagnostic closure certificate after a complete launcher returns.
 [[nodiscard]] bool qsa_prefill_bundle_closed() noexcept;
 class HipQsaWindowPool;
+class HipQsaExactScoreOwner;
+// Allocate the complete admitted ring during setup, before prompt execution.
+[[nodiscard]] std::shared_ptr<HipQsaExactScoreOwner> make_hip_qsa_exact_score_owner(
+    std::uint64_t maximum, std::uint64_t admitted_bytes, void* stream, std::uint64_t generation, std::uint32_t rows);
 // One eager window owner's cache. The owner must invalidate it before replacing
 // its session's committed prefix (discard_deferred does this), and retain it
 // through stream drain. Rejected/window rows are invalidated from the next frontier.
@@ -61,6 +65,7 @@ struct HipIndexedAttentionLauncherConfig {
     // scores of block_score_kernel. The owner must not let another writer rewrite raw index keys below the position of a
     // later serial step (no windows, rollback, restore or slot reuse on this config).
     std::shared_ptr<HipQsaWindowPool> decode_pool;
+    std::shared_ptr<HipQsaExactScoreOwner> exact_score_owner;
 };
 
 enum class HipQsaInputProjectionMode {legacy256,virtual256,prefetch8};

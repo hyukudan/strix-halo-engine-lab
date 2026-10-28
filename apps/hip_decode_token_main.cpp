@@ -2722,7 +2722,7 @@ int STRIX_DECODE_ENTRY(
                  options.known_window_router_rows || options.known_prefix_full_rows,
                  options.known_window_router_rows || options.known_prefix_full_rows,
                  options.known_prefix_full_rows, options.known_prefix_full_rows, options.known_prefix_full_rows,
-                 options.teacher_forced_score}));
+                 options.teacher_forced_score, !options.mtp.enabled && !options.http_serve, true}));
             // --mtp-copy-wide-rows N[,M]: each listed size's tail owner also verifies wide copy cycles, so it computes
             // every row's head (all-rows policy; its prompt blocks that need no logits still run without heads).
             for (const auto tail_rows : options.known_prefix_tail_rows) {
@@ -2736,7 +2736,7 @@ int STRIX_DECODE_ENTRY(
                      options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U,
                      true, true, true, true, true,
                      // and its multi-row head (eight-row packs, the one-row head's leaf and reduction tree per row)
-                     wide_tail})));
+                     wide_tail, !options.mtp.enabled && !options.http_serve, true})));
             }
             if (compiled_prefill)
                 for (const auto wide_rows : options.mtp.copy_wide_rows)
@@ -2818,14 +2818,17 @@ int STRIX_DECODE_ENTRY(
                     multiply(multiply(known_prefill_plan->logical_rows, model.vocab_size), sizeof(float)));
             auto growth = add(known_prefill_plan->arena.physical.total_bytes, add(8U, union_bytes));
             growth = add(growth, add(known_prefill_plan->host_metadata_payload_bytes, map_bytes)); // native owner's second copy
+            growth = add(growth, known_prefill_plan->qsa_score_ring_workspace_bytes);
             growth = add(growth, options.known_prefill_host_headroom); // explicit allocator/driver/fixed-plan allowance
             for (const auto& tail : known_tail_plans) { // arena, completion record and metadata copy of each tail owner
                 growth = add(growth, add(tail->arena.physical.total_bytes, add(8U, union_bytes)));
                 growth = add(growth, tail->host_metadata_payload_bytes);
+                growth = add(growth, tail->qsa_score_ring_workspace_bytes);
             }
             for (const auto& wide : known_wide_plans) { // same for each decode-profile wide owner (split profile)
                 growth = add(growth, add(wide->arena.physical.total_bytes, add(8U, union_bytes)));
                 growth = add(growth, wide->host_metadata_payload_bytes);
+                growth = add(growth, wide->qsa_score_ring_workspace_bytes);
             }
             // Batched MTP slots (cohort requests on the tiled prompt, --http-batch N): each further slot's block
             // and tail owners share the arenas above but hold their own metadata copy and completion records
@@ -2925,7 +2928,7 @@ int STRIX_DECODE_ENTRY(
                 compiled_prefill ? *compiled_prefill : compiled, manifest, tensor_access,
                 {static_cast<std::uint32_t>(group_rows), true, true, true, options.known_prefix_expert_union,
                  options.known_prefix_output_policy, options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U,
-                 true, true, true, true, true, false}));
+                 true, true, true, true, true, false, false}));
             struct GroupRetained { std::shared_ptr<const void> original, ple, source, plan; };
             const auto retained = std::make_shared<GroupRetained>(GroupRetained{experiment_owner, prefill_ple_owner, retained_ple_source,
                 known_group_plan});
@@ -3983,9 +3986,18 @@ int STRIX_DECODE_ENTRY(
                 original_work_device);
         }
         std::function<void(std::uint32_t, std::uint64_t, std::span<const float>)> greedy_recording;
-        if (raw_recording) greedy_recording = [&](std::uint32_t token, std::uint64_t position,
+        const char* prefill_digest_env=std::getenv("STRIX_PREFILL_LOGITS_DIGEST");
+        const bool prefill_digest=prefill_digest_env && prefill_digest_env[0]=='1';
+        if (raw_recording || prefill_digest) greedy_recording = [&](std::uint32_t token, std::uint64_t position,
                                                    std::span<const float> values) {
-            raw_recording->record_token(token, position, values, session, raw_state_reader);
+            if(raw_recording) raw_recording->record_token(token, position, values, session, raw_state_reader);
+            // Include unpadded serial suffixes in the full-vocabulary prefill gate.
+            if(prefill_digest && position<options.tokens.size()) {
+                std::uint64_t hash=14695981039346656037ULL;
+                for(const auto byte:std::as_bytes(values)) {hash^=static_cast<unsigned char>(byte);hash*=1099511628211ULL;}
+                std::fprintf(stderr,"prefill terminal logits fnv64 %016llx position %llu\n",
+                    static_cast<unsigned long long>(hash),static_cast<unsigned long long>(position));
+            }
         };
         HipSerialGreedyStepBackend backend(
             compiled,
@@ -4437,6 +4449,8 @@ int STRIX_DECODE_ENTRY(
                     << "  \"known_prefix_tiled_prefill_qualification\":\"not_assessed\",\n"
                     << "  \"known_prefix_source_ledger_scope\":\"closed-eight-row-selection-not-per-T-execution\",\n"
                     << "  \"known_prefix_prefill_workspace_reserved_bytes\":" << known_prefill_plan->arena.physical.total_bytes << ",\n"
+                    << "  \"qsa_score_ring_rows\":" << known_prefill_plan->qsa_score_ring_rows << ",\n"
+                    << "  \"qsa_score_ring_workspace_bytes\":" << known_prefill_plan->qsa_score_ring_workspace_bytes << ",\n"
                     << "  \"known_prefix_prefill_metadata_payload_copies\":2,\n"
                     << "  \"known_prefix_prefill_metadata_payload_bytes\":" << known_prefill_plan->host_metadata_payload_bytes * 2U << ",\n"
                     << "  \"known_prefix_prefill_metadata_budget_bytes\":" << options.known_prefill_metadata_budget << ",\n"

@@ -1,4 +1,6 @@
 #include "strix/execution_arena.hpp"
+#include "strix/ctx_exact_memory.hpp"
+#include "strix/indexed_attention_workspace.hpp"
 
 #include "strix/model_contract.hpp"
 
@@ -6,6 +8,7 @@
 #include <limits>
 
 #include <iostream>
+#include <string_view>
 #include <stdexcept>
 
 namespace {
@@ -311,6 +314,90 @@ int main() {
         expect(persistent, "persistent arena lookup index matches the linear search");
     }
 
+    request.logical_rows=1;request.parallel_moe_router=true;
+    const auto fast_io=strix::build_serial_execution_io_plan(execution,true);
+    request.q4k_a8g32_gate_up=true;request.grouped_exact_q51_down=true;request.q51_slot_parallel_down=true;
+    request.a8_down_q51=true;request.a8_down_q80=true;request.q5k_a8g32_gate_up=true;request.dense_a8=true;
+    for(auto maximum:{262144ULL,524288ULL,1048576ULL}) {
+        auto geometry_model=model;geometry_model.max_position_embeddings=maximum;
+        const auto full=strix::build_indexed_attention_workspace_layout(geometry_model);
+        const auto compact=strix::build_indexed_attention_workspace_layout(geometry_model,256,false,1,true);
+        const auto source=strix::build_serial_execution_arena_plan(geometry_model,request,execution,fast_io,256);
+        expect(full.total_bytes-compact.total_bytes==full.block_scores_bytes,"score-free layout removes the score allocation");
+        for(auto rows:{16U,32U,64U,128U,256U,512U,1024U,2048U,4096U,8192U}) {
+            const auto old=strix::build_known_prefill_arena(source,256,rows);
+            const auto off=strix::build_known_prefill_arena(source,256,rows,0);
+            const auto ring=strix::build_known_prefill_arena(source,256,rows,full.block_scores_bytes);
+            expect(old.physical.total_bytes==off.physical.total_bytes && old.row_stride==off.row_stride,
+                "score ring off retains original bytes and strides");
+            expect(ring.physical.total_bytes==998400ULL*rows,"logits still bound score-free uniform arena at every maximum");
+            const auto terminal=strix::build_known_prefill_arena(source,256,rows,full.block_scores_bytes,true);
+            const auto legacy_terminal=strix::build_known_prefill_arena(source,256,rows,0,true);
+            expect(terminal.physical.total_bytes==324352ULL*rows+993280ULL,"score-free headless arena matches independent capacity port");
+            expect(terminal.row_stride.back()==0 && terminal.row_view.front().allocations.back().bytes==0 &&
+                terminal.row_view.back().allocations.back().bytes==993280U,"only the terminal row exposes the single logits stripe");
+            const auto lookup=strix::ArenaLookupIndex::uniform_views(terminal.row_view);
+            const strix::ArenaLookupScope scope(lookup);
+            for(const auto& view:terminal.row_view) {
+                const auto* row_logits=strix::find_arena_allocation(view,terminal.physical.allocations.back().use);
+                expect(row_logits && row_logits->bytes==view.allocations.back().bytes,"mixed extents retain correct indexed row lookup");
+            }
+            std::cout<<"I12 M="<<maximum<<" T="<<rows<<" arena="<<terminal.physical.total_bytes
+                <<" terminal_only="<<legacy_terminal.physical.total_bytes<<" stripe="<<993280U<<'\n';
+            std::cout<<"I1 M="<<maximum<<" T="<<rows<<" old="<<old.physical.total_bytes
+                <<" score_free="<<ring.physical.total_bytes<<" ring="<<strix::QsaScoreRingGeometry(maximum).total_bytes()<<'\n';
+        }
+    }
+    for(auto capacity:{64U,128U,256U,512U,1024U}) for(auto rows:{1U,16U,63U,64U,65U,128U,129U,8192U,16384U}) {
+        strix::QsaScoreRingLifetime ring;
+        std::array<bool,2> recorded{},completed{};
+        std::uint32_t group=0,waits=0;
+        for(std::uint32_t first=0;first<rows;first+=capacity,++group) {
+            const auto slot=ring.acquire([&](std::uint32_t i){
+                expect(recorded[i]&&!completed[i],"slot wait observes consumer event pending after enqueue return");
+                completed[i]=true;++waits;
+            });
+            expect(slot==group%2U && (!recorded[slot]||completed[slot]),"no reuse before consumer completion, including wraparound");
+            expect(std::min(capacity,rows-first)>0U,"last partial group has bounded live rows");
+            recorded[slot]=false;completed[slot]=false;
+            ring.consumed(slot,[&](std::uint32_t i){recorded[i]=true;});
+        }
+        expect(waits==(group>2U?group-2U:0U),"two slot ring waits exactly on wrapped consumers");
+    }
+    {
+        strix::QsaScoreRingLifetime ring;
+        const auto first=ring.acquire([](std::uint32_t){throw std::logic_error("unexpected wait");});
+        ring.consumed(first,[](std::uint32_t){});
+        const auto second=ring.acquire([](std::uint32_t){throw std::logic_error("unexpected wait");});
+        ring.consumed(second,[](std::uint32_t){});
+        bool refused=false;
+        try {(void)ring.acquire([](std::uint32_t){throw std::runtime_error("consumer event is not complete");});}
+        catch(const std::runtime_error&){refused=true;}
+        expect(refused,"enqueue return cannot release a pending slot");
+        const auto resumed=ring.acquire([&](std::uint32_t slot){expect(slot==first,"failed wait preserves the pending consumer lease");});
+        expect(resumed==first,"slot becomes reusable only after its consumer wait succeeds");
+        ring.consumed(resumed,[](std::uint32_t){});
+    }
+    for(auto item:{"STRIX_QSA_SCORE_RING","STRIX_TERMINAL_LOGITS_ARENA"}) {
+        expect(strix::ctx_exact_memory_enabled([](const char*)->const char*{return nullptr;},item),"exact memory defaults on");
+        expect(!strix::ctx_exact_memory_enabled([](const char*)->const char*{return "0";},item),"exact memory off switches restore legacy policy");
+        expect(!strix::ctx_exact_memory_enabled([](const char* name)->const char*{
+            return std::string_view(name)=="STRIX_CTX_EXACT_MEMORY"?"0":nullptr;},item),"master off disables both independent policies");
+        expect(!strix::ctx_exact_memory_enabled([&](const char* name)->const char*{
+            return std::string_view(name)==item?"0":nullptr;},item),"individual off switch disables its policy");
+        expect(!strix::ctx_exact_memory_enabled([](const char* name)->const char*{
+            return std::string_view(name)=="STRIX_QPF2K_DEFAULTS"?"0":nullptr;},item),"STRIX_QPF2K_DEFAULTS=0 disables compact memory");
+        expect(!strix::ctx_exact_memory_enabled([](const char* name)->const char*{
+            return std::string_view(name)=="STRIX_BASELINE"?"1":nullptr;},item),"STRIX_BASELINE=1 disables compact memory");
+        strix::qpf2k::baseline=true;
+        expect(!strix::ctx_exact_memory_enabled([](const char*)->const char*{return nullptr;},item),"--baseline disables compact memory");
+        strix::qpf2k::baseline=false;
+        {
+            const strix::qpf2k::ModelScope gsq(true);
+            expect(!strix::ctx_exact_memory_enabled([](const char*)->const char*{return nullptr;},item),"GSQ checkpoints keep the legacy layout");
+        }
+        expect(strix::ctx_exact_memory_enabled([](const char*)->const char*{return nullptr;},item),"policy restored after the suppressions");
+    }
     if (failures == 0) {
         std::cout << "execution arena tests passed\n";
     }

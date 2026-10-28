@@ -1,3 +1,4 @@
+#include "strix/qsa_prefill_stage_plan.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/hip_qwen_rotary_table.hpp"
 #include "strix/hip_qwen_rotary_diagnostic.hpp"
@@ -20,6 +21,9 @@
 #include "strix/prepared_tensor_views.hpp"
 #include "strix/indexed_attention_state.hpp"
 #include "strix/indexed_attention_workspace.hpp"
+#include "strix/ctx_exact_memory.hpp"
+#include "strix/qsa_score_scratch.hpp"
+#include "strix/hip_setup_quiescence.hpp"
 #include "strix/session_state_memory.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/graph_operator_control.hpp"
@@ -61,6 +65,70 @@
 #include <utility>
 
 namespace strix {
+namespace {
+struct HipQsaScratchBackend {
+    using Event=hipEvent_t;
+    static void check(hipError_t e) {
+        if(e!=hipSuccess) throw std::runtime_error(std::string("QSA scratch: ")+hipGetErrorString(e));
+    }
+    int device() const { int d=-1;check(hipGetDevice(&d));return d; }
+    void activate(int d) { check(hipSetDevice(d)); }
+    void* allocate(std::uint64_t bytes) { void* p=nullptr;check(hipMalloc(&p,bytes));return p; }
+    Event event() { Event e=nullptr;check(hipEventCreateWithFlags(&e,hipEventDisableTiming));return e; }
+    void wait(Event e) { check(hipEventSynchronize(e)); }
+    void record(Event e,std::uintptr_t stream) { check(hipEventRecord(e,reinterpret_cast<hipStream_t>(stream))); }
+    void drain(std::uintptr_t stream) { check(hipStreamSynchronize(reinterpret_cast<hipStream_t>(stream))); }
+    void destroy(Event e) { check(hipEventDestroy(e)); }
+    void free(void* p) { check(hipFree(p)); }
+};
+struct HipQsaSubmissionCache {
+    QsaScratchSerialGate gate;
+    QsaScratchHandoff handoff;
+    hipEvent_t done=nullptr;
+    int device=-1;
+    auto enter(int d) {
+        auto lock=gate.enter(d);
+        if(!done) { done=HipQsaScratchBackend{}.event();device=d; }
+        return lock;
+    }
+    ~HipQsaSubmissionCache() {
+        if(!done) return;
+        try {
+            HipQsaScratchBackend backend;
+            const auto prior=backend.device();backend.activate(device);
+            if(handoff.pending()) backend.wait(done);
+            backend.destroy(done);backend.activate(prior);
+        } catch(...) { std::terminate(); }
+    }
+};
+HipQsaSubmissionCache& qsa_scratch_gate() { static HipQsaSubmissionCache cache;return cache; }
+}
+class HipQsaExactScoreOwner {
+    HipSetupQuiescenceGuard guard_;
+    std::uint64_t generation_;
+public:
+    QsaScoreScratch<HipQsaScratchBackend> scratch;
+    HipQsaExactScoreOwner(std::uint64_t maximum,std::uint64_t bytes,void* stream,std::uint64_t generation,std::uint32_t rows)
+        :generation_(generation),scratch(HipQsaScratchBackend{}, {guard_.device_index(),reinterpret_cast<std::uintptr_t>(stream),generation,maximum},bytes,rows) {}
+    void validate_generation(std::uint64_t generation) const {
+        if(generation!=generation_) throw std::invalid_argument("QSA scratch arena generation differs from setup");
+    }
+    void validate(std::uint64_t maximum,std::uint64_t generation) const {
+        guard_.require_original();
+        scratch.validate({guard_.device_index(),reinterpret_cast<std::uintptr_t>(hip_execution_stream()),generation,maximum});
+    }
+};
+std::shared_ptr<HipQsaExactScoreOwner> make_hip_qsa_exact_score_owner(
+    std::uint64_t maximum,std::uint64_t bytes,void* stream,std::uint64_t generation,std::uint32_t rows) {
+    const auto native_stream=static_cast<hipStream_t>(stream);
+    if(!native_stream || native_stream==hipStreamLegacy || native_stream==hipStreamPerThread)
+        throw std::invalid_argument("QSA scratch setup requires an owned eager stream");
+    hipStreamCaptureStatus capture=hipStreamCaptureStatusNone;
+    HipQsaScratchBackend::check(hipStreamIsCapturing(native_stream,&capture));
+    if(capture!=hipStreamCaptureStatusNone) throw std::invalid_argument("QSA scratch setup cannot run during capture");
+    const auto lock=qsa_scratch_gate().enter(HipQsaScratchBackend{}.device());
+    return std::make_shared<HipQsaExactScoreOwner>(maximum,bytes,stream,generation,rows);
+}
 namespace {
 
 // An empty Source pack preserves the native kernel ABI and arithmetic. Only
@@ -3001,9 +3069,7 @@ WorkspacePointers workspace_pointers(
         reinterpret_cast<float*>(
             base +
             layout.current_index_key_offset),
-        reinterpret_cast<float*>(
-            base +
-            layout.block_scores_offset),
+        layout.block_scores_bytes ? reinterpret_cast<float*>(base + layout.block_scores_offset) : nullptr,
         reinterpret_cast<std::uint32_t*>(
             base +
             layout.selected_indices_offset),
@@ -3119,9 +3185,12 @@ PreparedIndexedLaunch prepare_indexed_attention_launch(
         resolve_dispatch_temporary(
             context, 0);
 
-    const auto workspace_layout =
-        build_indexed_attention_workspace_layout(
-            model, 256, config.qsa_hierarchical_selection, config.qsa_gqa_heads_per_block);
+    auto workspace_layout = build_indexed_attention_workspace_layout(
+        model, 256, config.qsa_hierarchical_selection, config.qsa_gqa_heads_per_block);
+    if (!config.qsa_hierarchical_selection && config.qsa_gqa_heads_per_block==1 && !config.enable_device_graph_inputs) {
+        const auto compact=build_indexed_attention_workspace_layout(model,256,false,1,true);
+        if(temporary.bytes==compact.total_bytes) workspace_layout=compact;
+    }
     if (temporary.bytes <
         workspace_layout.total_bytes) {
         throw std::invalid_argument(
@@ -3527,6 +3596,7 @@ std::uint64_t prepare_indexed_attention_score_grid(std::uint32_t attention_heads
 void preflight_indexed_attention(const ExecutionDispatchContext& context, void* user_data) {
     const auto prepared = prepare_indexed_attention_launch(context,
         static_cast<const HipIndexedAttentionLauncherConfig*>(user_data));
+    require_qsa_score_source(!prepared.workspace_layout.block_scores_bytes,prepared.workspace.block_scores!=nullptr);
     const auto& model = static_cast<const HipIndexedAttentionLauncherConfig*>(user_data)->model;
     // These guards otherwise occur in nested launch helpers after preceding
     // projections. Preflight evaluates metadata only; the normal launch keeps
@@ -3547,6 +3617,7 @@ void launch_qsa_dense_a8_output(const TensorPair& weights, const float* input, c
 void launch_indexed_attention(const ExecutionDispatchContext& context, void* user_data) {
     const auto prepared = prepare_indexed_attention_launch(context,
         static_cast<const HipIndexedAttentionLauncherConfig*>(user_data));
+    require_qsa_score_source(!prepared.workspace_layout.block_scores_bytes,prepared.workspace.block_scores!=nullptr);
     const auto& config = *static_cast<const HipIndexedAttentionLauncherConfig*>(user_data);
 #if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
     HipDenseTrellisScope arithmetic(config.dense_trellis_projections);
@@ -4958,7 +5029,7 @@ template <unsigned Rows> struct QsaKnownRows {
 struct QsaHeadRow { const ExecutionDispatchContext* context = nullptr; const PreparedIndexedLaunch* launch = nullptr; bool share = false; };
 template <unsigned Rows>
 QsaKnownRows<Rows> prepare_qsa_known_rows(std::span<const ExecutionDispatchContext> rows,
-    const HipIndexedAttentionLauncherConfig& config, HipQsaIndexJournal journal, QsaHeadRow head = {}) {
+    const HipIndexedAttentionLauncherConfig& config, HipQsaIndexJournal journal, QsaHeadRow head = {}, bool ring_entry = false) {
     static_assert(Rows == 2U || Rows == 4U || Rows == 8U);
     if (rows.size() != Rows) throw std::invalid_argument("QSA known-window row count differs");
     if (config.enable_device_graph_inputs || config.qsa_hierarchical_selection || config.qsa_gqa_heads_per_block != 1)
@@ -4985,6 +5056,11 @@ QsaKnownRows<Rows> prepare_qsa_known_rows(std::span<const ExecutionDispatchConte
         else if (r && head.share) result.row[r] = prepare_indexed_attention_launch_like(result.row[0], rows[0], context, config);
         else result.row[r] = prepare_indexed_attention_launch(context, &config);
         const auto& p = result.row[r];
+        require_qsa_score_source(!p.workspace_layout.block_scores_bytes,ring_entry && config.exact_score_owner!=nullptr);
+        if(!p.workspace_layout.block_scores_bytes) {
+            if(!context.memory) throw std::invalid_argument("QSA scratch requires an arena generation");
+            config.exact_score_owner->validate_generation(context.memory->allocation_generation);
+        }
         const auto& a = result.row[0];
         if (p.device_graph) throw std::invalid_argument("QSA known-window rows are eager only");
         if (context.execution_identity != first.execution_identity || context.step_id != first.step_id ||
@@ -5066,6 +5142,9 @@ QsaKnownRows<Rows> prepare_qsa_known_rows(std::span<const ExecutionDispatchConte
 // batched attend) the group-major order of the batched attend.
 // Bit 9 (0x200, default OFF, requires bits 0 and 1): exact per-64-row-group stage batching; see
 // hip_qsa_prefill_batch.inc for the all-or-nothing admission and descriptor lifetime rules.
+// Non-null only inside one external score-ring group, never retained after selection.
+thread_local float* qsa_exact_maxima = nullptr;
+thread_local std::uint32_t qsa_exact_maxima_stride = 0;
 constexpr std::uint32_t qpf2k_maxima_stride = 65536U / qsa_flash::kGroup; // groups of max_position / 4 blocks
 // Per pooled block magnitude ranges (qsa_flash::key_range_kernel), one buffer like the pool's (grown with a sync).
 // STRIX_QPF2K_QSA bit 4 (with bit 1, prefill calls whose union / attend is batched): the groups' selections are deferred
@@ -5655,6 +5734,8 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     unsigned parts = 7U, QsaPrefillPool* pool = nullptr, unsigned skip_inputs = 0U,
     const q8_rows::DenseA8Slot* cohort_slot = nullptr, unsigned cohort_row = 0U, unsigned subparts = 127U,
     const qsa_flash::ScoreGroup<Rows>* staged = nullptr) {
+    for(const auto& row:prepared.row)
+        require_qsa_score_source(!row.workspace_layout.block_scores_bytes,!(parts & 2U) || row.workspace.block_scores!=nullptr);
     if (staged) subparts &= ~7U; // norms, append and scores already completed in stream order
     const auto& model = config.model;
     bind_qwen_pool(pool, model);
@@ -5876,7 +5957,9 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                     float* maxima = nullptr;
                     std::uint32_t maxima_stride = qpf2k_maxima_stride;
                     auto& sb = qpf2k_select_batch();
-                    if (qpf2k_defer) {
+                    if (auto* external=qsa_selector_maxima(qpf2k_qsa_mask(),qsa_exact_maxima)) {
+                        maxima=external;maxima_stride=qsa_exact_maxima_stride;qpf2k_maxima=maxima;
+                    } else if (qpf2k_defer) {
                         // Deferred selection: this group's maxima in the arena, ceil(blocks / 4) floats per row.
                         maxima_stride = (scored_blocks + qsa_flash::kGroup - 1U) / qsa_flash::kGroup;
                         const std::uint64_t need = static_cast<std::uint64_t>(Rows) * maxima_stride;
@@ -5898,7 +5981,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                         maxima = sb.arena + sb.used;
                         sb.used += need;
                         qpf2k_maxima = maxima;
-                    } else if ((qpf2k_qsa_mask() & 2U) && scored_blocks <= qpf2k_maxima_stride * qsa_flash::kGroup) {
+                    } else if (qsa_maxima_selector_enabled(qpf2k_qsa_mask()) && scored_blocks <= qpf2k_maxima_stride * qsa_flash::kGroup) {
                         static float* buffer = [] {
                             void* p = nullptr;
                             check_hip(hipMalloc(&p, std::size_t{64U} * qpf2k_maxima_stride * sizeof(float)), "QSA prefill group-maxima allocation");
@@ -6408,7 +6491,11 @@ std::vector<QsaKnownRows<8U>> prepare_qsa_prefill_rows(std::span<const Execution
     static const bool shared = [] { const char* v = std::getenv("STRIX_QSA_PREFILL_SHARED_ADMISSION"); return !v || v[0] != '0'; }();
     for (std::size_t t = 0; t < rows.size() / 8U; ++t) {
         const QsaHeadRow head = !shared ? QsaHeadRow{} : t ? QsaHeadRow{&rows[0], &tiles.front().row[0], true} : QsaHeadRow{nullptr, nullptr, true};
-        tiles.push_back(prepare_qsa_known_rows<8U>(rows.subspan(t * 8U, 8U), config, journal, head));
+        tiles.push_back(prepare_qsa_known_rows<8U>(rows.subspan(t * 8U, 8U), config, journal, head, true));
+        if(t==0 && !tiles.back().row[0].workspace_layout.block_scores_bytes) {
+            if(config.model.indexer_compress_ratio!=4) throw std::invalid_argument("QSA scratch requires the admitted ratio-four geometry");
+            config.exact_score_owner->validate(config.model.effective_max_positions(),rows[t*8U].memory->allocation_generation);
+        }
         if (tiles.back().prefetch != tiles.front().prefetch || tiles.back().journal != tiles.front().journal)
             throw std::invalid_argument("QSA prefill tiles select different organizations");
     }
@@ -6616,6 +6703,14 @@ void qpf2k_select_flush(hipStream_t stream) {
     sb.traced.clear();
     sb.used = 0;
 }
+struct QsaExactScoreLease {
+    QsaScoreScratch<HipQsaScratchBackend>& ring;std::uint32_t slot;
+    explicit QsaExactScoreLease(QsaScoreScratch<HipQsaScratchBackend>& r):ring(r),slot(r.acquire()){}
+    ~QsaExactScoreLease() {
+        qsa_exact_maxima=nullptr;qsa_exact_maxima_stride=0;
+        ring.consumed(slot);
+    }
+};
 #include "hip_qsa_prefill_batch.inc"
 
 // Prefill attention: groups of up to 8 tiles (64 rows) in increasing order. A group stores the
@@ -6630,6 +6725,28 @@ void qpf2k_select_flush(hipStream_t stream) {
 // projections in between) and compares every row's attention output bitwise, throwing on a
 // difference; =2 compares the serial tiles with themselves (checks the harness).
 void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const HipIndexedAttentionLauncherConfig& config) {
+    const auto submission=qsa_scratch_gate().enter(HipQsaScratchBackend{}.device());
+    const auto submission_stream=hip_execution_stream();
+    auto& shared=qsa_scratch_gate();
+    shared.handoff.before(reinterpret_cast<std::uintptr_t>(submission_stream),[&] {
+        check_hip(hipEventSynchronize(shared.done),"QSA prefill cross-stream scratch wait");
+    });
+    const auto exceptions=std::uncaught_exceptions();
+    QsaPendingGuard pending([&] {
+        // An exceptional flush may have launched a consumer before recording its
+        // descriptor event. Drain before dropping descriptors or unlocking.
+        if(std::uncaught_exceptions()>exceptions) {
+            check_hip(hipDeviceSynchronize(),"QSA prefill exceptional shared scratch drain");
+            shared.handoff.drained();
+        } else {
+            if(hipEventRecord(shared.done,submission_stream)!=hipSuccess) {
+                check_hip(hipDeviceSynchronize(),"QSA prefill failed handoff drain");
+                shared.handoff.drained();
+            } else shared.handoff.recorded(reinterpret_cast<std::uintptr_t>(submission_stream));
+        }
+    }, [] {
+        clear_qsa_pending(qsa_fast_batch(),qpf2k_select_batch(),qpf2k_index_batch(),qsa_exact_maxima,qsa_exact_maxima_stride);
+    });
     static const unsigned mode = [] {
         if (const char* v = std::getenv("STRIX_QSA_PREFILL_SELFCHECK"); v && v[0] == '1') return 2U;
         if (const char* v = std::getenv("STRIX_QSA_PREFILL_SELFCHECK"); v && v[0] == '2') return 3U;
@@ -6728,6 +6845,65 @@ void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const 
         b.active = mode == 0U && qsa_attend_batch_enabled();
         auto& sb = qpf2k_select_batch();
         sb.active = b.active && (qpf2k_qsa_mask() & 16U) && (qpf2k_qsa_mask() & 3U) == 3U;
+        const bool compact=!tiles.front().row[0].workspace_layout.block_scores_bytes;
+        if(compact) {
+            auto& slabs=config.exact_score_owner->scratch;
+            const auto& geometry=slabs.geometry();
+            const auto stage_rows = checked_u32(tiles.size() * 8U, "QSA stage rows");
+            Qpf2kStageBatch stage;
+            const bool split = mode == 0U && qpf2k_stage_batch_launch(tiles, config, pool, stage, &geometry);
+            const QsaPrefillStagePlan plan(stage_rows,
+                qsa_flash::score_rows(split ? stage.max_blocks : 0U), split ? geometry.rows : 64U);
+            if (split && qpf2k_trace_enabled())
+                std::fprintf(stderr, "qpf2k qsa stage_split slices %u rows %u score_rows %u ring_rows %u ring_bytes %llu\n",
+                    plan.slices(), plan.rows, plan.score_rows, geometry.rows,
+                    static_cast<unsigned long long>(geometry.total_bytes()));
+            // Selection descriptors are flushed within each slice, including its
+            // post-selection traces. They never survive a lease's release.
+            // Non-stage/int8/tail fallbacks retain immediate per-group selection.
+            if (!split) sb.active = false;
+            for (std::uint32_t slice = 0; slice < plan.slices(); ++slice) {
+                QsaExactScoreLease lease(slabs);
+                const auto t = plan.first(slice) / 8U;
+                const auto count = plan.count(slice) / 8U;
+                std::vector<QsaKnownRows<8U>> group(tiles.begin()+t, tiles.begin()+t+count);
+                auto* scores=static_cast<float*>(slabs.data(lease.slot));
+                auto* maxima=scores+geometry.score_slot_bytes()/sizeof(float);
+                for(std::size_t k=0;k<count;++k) for(unsigned r=0;r<8U;++r)
+                    group[k].row[r].workspace.block_scores=scores+(k*8U+r)*geometry.blocks;
+                qsa_exact_maxima=maxima;qsa_exact_maxima_stride=static_cast<std::uint32_t>(geometry.maxima_stride);
+                if (split) {
+                    const auto first_group = plan.first(slice) / 64U;
+                    const auto groups = plan.count(slice) / 64U;
+                    if (!groups || first_group >= stage.groups || groups > stage.groups - first_group)
+                        throw std::invalid_argument("QSA ring slice outside prepared descriptors");
+                    for (std::uint32_t g=0;g<groups;++g) {
+                        auto& descriptor = stage.slot->scores[first_group+g];
+                        if (descriptor.blocks > geometry.blocks || descriptor.maxima_stride > geometry.maxima_stride)
+                            throw std::invalid_argument("QSA ring descriptor exceeds slot geometry");
+                        for (unsigned r=0;r<64U;++r)
+                            descriptor.views.block_scores[r] = group[g*8U+r/8U].row[r%8U].workspace.block_scores;
+                        // Retain the group's local stride within its disjoint reservation.
+                        descriptor.maxima = descriptor.blocks ? maxima + static_cast<std::uint64_t>(g)*64U*geometry.maxima_stride : nullptr;
+                    }
+                    qpf2k_stage_score_slice(stage, pool, group[0].row[0].index_dim, first_group, groups);
+                    for (std::uint32_t g=0;g<groups;++g)
+                        enqueue_qsa_prefill_projection<64U>(group,g*8U,config,2U,pool,0U,&stage.slot->scores[first_group+g]);
+                } else if(count==8U) enqueue_qsa_prefill_projection<64U>(group,0U,config,2U,pool);
+                else {
+                    std::size_t first=0;
+                    if(count>=4U) {enqueue_qsa_prefill_projection<32U>(group,first,config,2U,pool);first+=4U;}
+                    if(count-first>=2U) {enqueue_qsa_prefill_projection<16U>(group,first,config,2U,pool);first+=2U;}
+                    if(first<count) enqueue_qsa_known_rows<8U>(group[first],config,2U);
+                }
+                qpf2k_select_flush(hip_execution_stream());
+                // The lease event follows selection and post-selection hashes.
+                // Whole-call attend descriptors retain only selected lists/KV.
+            }
+            sb.active = false;
+            qsa_fast_batch_flush(hip_execution_stream());b.active=false;
+            return;
+        }
         Qpf2kStageBatch stages;
         const bool stage_batch = mode == 0U && qpf2k_stage_batch_launch(tiles, config, pool, stages);
         if (!stage_batch && (qpf2k_qsa_mask() & 0x200U) && qpf2k_trace_enabled())

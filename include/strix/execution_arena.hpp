@@ -39,8 +39,12 @@ struct KnownWindowArena {
 [[nodiscard]] KnownWindowArena build_known_window_arena(
     const ExecutionArenaPlan& serial, std::uint64_t alignment = 256, std::uint32_t logical_rows = 2);
 // Separate bounded prefill geometry. Does not widen the closed window API.
+// Terminal mode repacks headless rows and appends one logits stripe. Logits have
+// stride zero and zero payload in omitted row views; only the last row exposes
+// the stripe. materialize_views=false builds physical geometry for validation.
 [[nodiscard]] KnownWindowArena build_known_prefill_arena(
-    const ExecutionArenaPlan& serial, std::uint64_t alignment, std::uint32_t logical_rows);
+    const ExecutionArenaPlan& serial, std::uint64_t alignment, std::uint32_t logical_rows,
+    std::uint64_t external_qsa_score_bytes = 0, bool terminal_logits = false, bool materialize_views = true);
 
 [[nodiscard]] ExecutionArenaPlan build_serial_execution_arena_plan(
     const ModelContract& model,

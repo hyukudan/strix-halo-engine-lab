@@ -1,6 +1,7 @@
 #pragma once
 #include "hip_decode_options.hpp"
 #include "strix/known_prefix_prefill.hpp"
+#include "strix/ctx_exact_memory.hpp"
 #include "strix/linux_uma_observation.hpp"
 #include "strix/uma_owner_inventory.hpp"
 #include <map>
@@ -72,7 +73,8 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_RTX_EXPORT_STATE", "STRIX_QRTX_STEP_DUMP", "STRIX_PROMPT_BATCH_ROWS", "STRIX_PREFILL_LOGITS_DIGEST",
             "STRIX_MODEL_COPY_ALL", "STRIX_PLE_RECLAIM_DECODE_BYTES",
             "STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_QSA_POOL_PACKED", "STRIX_QSA_DECODE_POOL",
-            "STRIX_QSA_DECODE_SELECT", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_POOL_CHECK"})
+            "STRIX_QSA_DECODE_SELECT", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_POOL_CHECK",
+            "STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA"})
         if (!(qpf2k::pre_injected_moe_marker && std::string_view(name) == "STRIX_QPF2K_MOE_DEFAULTED"))
             if (const char* value = get(name)) env.emplace(name, value);
     return env;
@@ -255,6 +257,12 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
         return result;
     };
     if (baseline) return decline("baseline");
+    const auto exact_environment = [&](const char* name) -> const char* {
+        const auto it = request.environment.find(name);
+        return it == request.environment.end() ? nullptr : it->second.c_str();
+    };
+    if (ctx_exact_memory_enabled(exact_environment,"STRIX_QSA_SCORE_RING"))
+        (void)qsa_score_ring_rows_override(exact_environment("STRIX_QSA_SCORE_RING_ROWS"));
     if (o.route_owned || o.any_low_level_flag || o.known_prefix_window || o.prompt_lookup || o.http_serve ||
         o.prefix_cache_roundtrip || !o.serving_prefix_files.empty() || o.mtp.supplied || o.mtp.enabled || !o.mtp.cohort.empty() || o.teacher_forced_score ||
         !o.raw_recording_path.empty() || !o.validation_final_state_path.empty()) return decline("explicit-route");

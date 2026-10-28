@@ -111,6 +111,32 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
             !required.owners.contains("tail_64_ple_staging"),
             "YaRN primary CSR present, tail/merged owners absent for exact T prompt");
         const auto primary = required;
+        {
+            // Compact geometry: the ring and terminal stripes are split out of workspace/tails once, the embedded maxima
+            // owners drop to zero and the decode pool is named apart from the state shadow.
+            auto compact = PrefillRequirements{};
+            compact.model_backing = required.model_backing;
+            const auto decode = qsa_decode_pool_bytes(sized,model);
+            compact.state_d1 = required.state_d1 + decode;
+            compact.workspace = 1000000000U;
+            compact.tails = 200000000U;
+            const YarnPrefillOwnerGeometry geometry{true,671088640U,993280U,decode,672081920U};
+            append_yarn_owner_requirements(sized,model,state,compact.model_backing,compact,geometry);
+            expect(compact.owners.at("qsa_selection_maxima")==0 &&
+                compact.owners.at("qsa_batch_maxima_growth_peak")==0,
+                "compact YaRN removes embedded maxima owners");
+            expect(compact.owners.at("qsa_score_ring")+compact.owners.at("terminal_logits_stripes")+
+                compact.owners.at("prefill_workspace_and_status")+compact.owners.at("tail_workspaces_and_status") ==
+                compact.workspace+compact.tails,"compact ring and logits split workspace exactly once");
+            expect(compact.owners.at("qsa_decode_pool")==decode &&
+                compact.owners.at("state_alignment_and_d1_shadow")==primary.owners.at("state_alignment_and_d1_shadow"),
+                "decode pool is separate from state shadow and charged once");
+            auto over = compact; over.workspace = 1U; over.tails = 0U;
+            bool refused = false;
+            try { append_yarn_owner_requirements(sized,model,state,over.model_backing,over,geometry); }
+            catch (const std::invalid_argument&) { refused = true; }
+            expect(refused,"compact owners larger than the workspace reservation refuse");
+        }
         sized.tokens.resize(299000U,1U);
         sized.known_prefix_tail_rows = {64U,16U};
         sized.known_prefix_ladder_tail_rows = {1024U,256U,64U,16U};
@@ -299,6 +325,8 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
             "YaRN unbounded alternate launcher controls refuse");
         for (const char* name : {"STRIX_QSA_DECODE_POOL", "STRIX_QSA_DECODE_POOL_CHECK", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_SELECT"})
             expect(yarn_environment_refusal({{name, "0"}}, 2).empty(), "YaRN accepts the audited serial decode pool controls");
+        for (const char* name : {"STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA"})
+            expect(yarn_environment_refusal({{name, "0"}}, 2).empty(), "YaRN accepts the compact-memory controls");
         expect(effective_prefill_argv(config.options)[2] == "--rope-yarn","YaRN receipt argv retains explicit opt-in");
     }
     auto overflow = memory;
@@ -592,6 +620,24 @@ int main(int argc, char** arguments) {
     const auto resolve = [&](const RequestedOptions& value, const PrefillMemory& observation) {
         return resolve_effective_config(value,model,info,manifest,validated_model_content_identity,capabilities,observation);
     };
+    {
+        auto configured=request;
+        configured.environment=requested_prefill_environment([](const char* name) -> const char* {
+            return std::string_view(name)=="STRIX_QSA_SCORE_RING_ROWS"?"256":nullptr;
+        });
+        const auto resolved=resolve(configured,memory);
+        expect(resolved.environment.at("STRIX_QSA_SCORE_RING_ROWS")=="256" &&
+            effective_config_json(resolved).find("STRIX_QSA_SCORE_RING_ROWS")!=std::string::npos,
+            "ring row override is captured in effective configuration");
+        configured.environment["STRIX_QSA_SCORE_RING_ROWS"]="192";
+        bool rejected=false;
+        try { (void)resolve(configured,memory); } catch(const std::invalid_argument&) { rejected=true; }
+        expect(rejected,"invalid ring override cannot silently decline the automatic route");
+        for(const char* off : {"STRIX_CTX_EXACT_MEMORY","STRIX_QSA_SCORE_RING"}) {
+            auto disabled=configured;disabled.environment[off]="0";
+            expect(resolve(disabled,memory).admitted,"ring off switches ignore an inactive rows override");
+        }
+    }
     // Model the runtime TU's pre-main environment before exercising the same
     // capture/resolver and baseline cleanup used by decode-token.
     {

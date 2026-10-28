@@ -39,6 +39,6 @@ struct IndexedAttentionWorkspaceLayout {
 [[nodiscard]] IndexedAttentionWorkspaceLayout
 build_indexed_attention_workspace_layout(
     const ModelContract& model,
-    std::uint64_t alignment = 256, bool hierarchical_selection = false, std::uint32_t gqa_heads_per_block = 1);
+    std::uint64_t alignment = 256, bool hierarchical_selection = false, std::uint32_t gqa_heads_per_block = 1, bool external_block_scores = false);
 
 }  // namespace strix

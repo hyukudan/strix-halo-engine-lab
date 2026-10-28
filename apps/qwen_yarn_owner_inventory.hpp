@@ -3,10 +3,16 @@
 #include "strix/memory_plan.hpp"
 #include "strix/q51_known_rows.hpp"
 namespace strix::decode_cli {
+// Compact tiled-prefill owners and the serial decode pool, already inside the workspace/tail and state reservations.
+struct YarnPrefillOwnerGeometry {
+    bool compact_scores = false;
+    std::uint64_t ring_bytes = 0, terminal_logits_bytes = 0, decode_pool_bytes = 0, primary_compact_bytes = 0;
+};
 // Closed plain-CLI owner capacities. This is a conservative payload upper
 // bound, not RSS, GTT usage, or allocator metadata (the separate reserve).
 inline void append_yarn_owner_requirements(const Options& options, const ModelContract& model,
-    const SerialSessionStateLayout& state, std::uint64_t model_bytes, PrefillRequirements& result) {
+    const SerialSessionStateLayout& state, std::uint64_t model_bytes, PrefillRequirements& result,
+    YarnPrefillOwnerGeometry geometry = {}) {
     const auto add = prefill_checked_add;
     const auto mul = prefill_checked_mul;
     result.owners.clear();
@@ -15,11 +21,24 @@ inline void append_yarn_owner_requirements(const Options& options, const ModelCo
     std::uint64_t state_payload = 0;
     for (const auto& [name, bytes] : result.owners) { (void)name; state_payload = add(state_payload,bytes); }
     if (state_payload > result.state_d1) throw std::invalid_argument("YaRN state owner payload exceeds layout reservation");
-    result.owners["state_alignment_and_d1_shadow"] = result.state_d1 - state_payload;
+    if (geometry.decode_pool_bytes > result.state_d1 - state_payload)
+        throw std::invalid_argument("YaRN decode pool exceeds state reservation");
+    result.owners["state_alignment_and_d1_shadow"] = result.state_d1 - state_payload - geometry.decode_pool_bytes;
+    result.owners["qsa_decode_pool"] = geometry.decode_pool_bytes;
     result.owners["model_backing"] = result.model_backing;
     result.owners["serial_scratch"] = result.serial_scratch;
-    result.owners["prefill_workspace_and_status"] = result.workspace;
-    result.owners["tail_workspaces_and_status"] = result.tails;
+    if (geometry.ring_bytes > add(result.workspace,result.tails) ||
+        geometry.terminal_logits_bytes > add(result.workspace,result.tails) - geometry.ring_bytes)
+        throw std::invalid_argument("YaRN compact owners exceed workspace reservation");
+    // These are already included in workspace/tails: split them out once.
+    result.owners["qsa_score_ring"] = geometry.ring_bytes;
+    result.owners["terminal_logits_stripes"] = geometry.terminal_logits_bytes;
+    const auto split_bytes = add(geometry.ring_bytes,geometry.terminal_logits_bytes);
+    if (geometry.primary_compact_bytes > split_bytes || geometry.primary_compact_bytes > result.workspace ||
+        split_bytes - geometry.primary_compact_bytes > result.tails)
+        throw std::invalid_argument("YaRN primary/tail compact owners exceed workspace reservation");
+    result.owners["prefill_workspace_and_status"] = result.workspace - geometry.primary_compact_bytes;
+    result.owners["tail_workspaces_and_status"] = result.tails - (split_bytes - geometry.primary_compact_bytes);
     result.owners["plan_metadata"] = result.metadata;
     result.owners["runtime_payload"] = result.runtime_payload;
     const auto base_owners = result.owners;
@@ -32,7 +51,8 @@ inline void append_yarn_owner_requirements(const Options& options, const ModelCo
     // Group rotary rows, deferred maxima arena (at least 16M floats),
     // per-group maxima and key-range descriptors are launcher-owned globals.
     result.owners["qsa_group_rotary_rows"] = 5U*1024U*64U*8U;
-    result.owners["qsa_selection_maxima"] = add(mul(std::max(UINT64_C(16)<<20U,
+    // Compact score rings own the selection maxima (no deferred maxima arena).
+    result.owners["qsa_selection_maxima"] = geometry.compact_scores ? 0U : add(mul(std::max(UINT64_C(16)<<20U,
         mul(1024U,add(blocks,3U)/4U)),sizeof(float)),mul(3U*64U*16384U,sizeof(float)));
     result.owners["rotary_upload_host_staging"] = 256U*256U;
     result.owners["qsa_key_ranges"] = mul(blocks,sizeof(std::uint64_t));
@@ -43,11 +63,14 @@ inline void append_yarn_owner_requirements(const Options& options, const ModelCo
         add(mul(options.generate_tokens,sizeof(std::uint32_t)),add(model_bytes/4096U/8U,UINT64_C(1)<<20U)));
     const auto t = static_cast<std::uint64_t>(options.known_prefix_prefill_rows);
     const auto groups = (t+63U)/64U;
-    // Two persistent stage slots plus one replacement maxima allocation
-    // coexist during growth; tables have the launcher's fixed 128-group extent.
-    result.owners["qsa_batch_tables"] = 2U*128U*64U*64U*8U;
-    result.owners["qsa_batch_maxima_growth_peak"] = mul(mul(mul(3U,groups),64U),mul((blocks+3U)/4U,4U));
-    result.owners["qsa_batch_host_descriptors_bound"] = 2U*128U*20480U;
+    // Two persistent stage slots plus one replacement maxima allocation coexist during growth; embedded tables have the
+    // launcher's fixed 128-group extent. Compact stage slots cover all T groups but retain only tables/descriptors: their
+    // scores and maxima live in the admitted ring.
+    const auto stage_groups = geometry.compact_scores ? std::max(UINT64_C(128),groups) : UINT64_C(128);
+    result.owners["qsa_batch_tables"] = mul(2U*64U*64U*8U,stage_groups);
+    result.owners["qsa_batch_maxima_growth_peak"] = geometry.compact_scores ? 0U : mul(mul(mul(3U,groups),64U),mul((blocks+3U)/4U,4U));
+    // Two pinned slots plus whole-call temporary preparation descriptors.
+    result.owners["qsa_batch_host_descriptors_bound"] = mul(3U*20480U,stage_groups);
     // Each retained HipKnownPrefixWindow constructs an independent PLE owner.
     // share_deferred shares GDN state, never these mapped/device/host buffers.
     // CSR geometry is bounded by the production layout helper before arithmetic

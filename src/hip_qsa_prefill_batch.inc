@@ -1,3 +1,4 @@
+#include "hip_qsa_stage_score.inc"
 // STRIX_QPF2K_QSA_MASK bit 9 (0x200): stage-major submission of one layer-chunk.
 // Draft, default OFF. Bits 0/1 are required; bit 2 chooses the same wave/LDS norm
 // as the per-group path. Admission is completed before any workspace is changed.
@@ -11,12 +12,14 @@ struct Qpf2kStageSlot {
     std::uint64_t maxima_capacity = 0;
     hipEvent_t done = nullptr;
     bool pending = false;
+    std::size_t capacity = 0;
 };
 static_assert(sizeof(qsa_index::NormGroupViews<64U>) + sizeof(QsaRowsStoreViews<64U>) +
     sizeof(qsa_flash::ScoreGroup<64U>) + sizeof(uint2) <= 20480U,
     "YaRN admission descriptor bound must track stage slot payloads");
 struct Qpf2kStageBatch {
     Qpf2kStageSlot* slot = nullptr;
+    std::uint32_t max_blocks = 0, groups = 0;
     Qpf2kStageBatch() = default;
     Qpf2kStageBatch(const Qpf2kStageBatch&) = delete;
     Qpf2kStageBatch& operator=(const Qpf2kStageBatch&) = delete;
@@ -40,9 +43,32 @@ qsa_index::NormGroupViews<64U> prepare_qpf2k_norm_rows(
     }
     return n;
 }
+// Only descriptor addresses and grid.z differ between embedded and compact calls.
+// Dispatch and grid.x always use the original call's maximum, never a slice maximum.
+void qpf2k_stage_score_slice(const Qpf2kStageBatch& batch, QsaPrefillPool* pool,
+    std::uint32_t index_dim, std::uint32_t first, std::uint32_t count) {
+    if (!batch.slot || !count || first >= batch.groups || count > batch.groups - first)
+        throw std::invalid_argument("QSA stage score slice outside prepared descriptors");
+    auto& slot = *batch.slot;
+    const auto max_blocks = batch.max_blocks;
+    const auto stream = hip_execution_stream();
+    if (max_blocks) {
+        if (qsa_flash::score_rows(max_blocks) != 16U) {
+            static const bool witness = [] { std::fprintf(stderr, "qpf2k qsa score rows > 16 active\n"); return true; }();
+            (void)witness;
+        }
+        qpf2k_stage_score_launch(slot.scores, pool->packed ? static_cast<const void*>(pool->packed) : pool->keys,
+            pool->packed != nullptr, static_cast<const uint2*>(qpf2k_key_ranges(pool->capacity)), index_dim,
+            max_blocks, first, count, stream);
+        check_hip(hipGetLastError(), "QSA stage batch score launch");
+        qpf2k_launch_score.fetch_add(1U, std::memory_order_relaxed);
+    }
+}
 bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
-    const HipIndexedAttentionLauncherConfig& config, QsaPrefillPool* pool, Qpf2kStageBatch& batch) {
-    constexpr std::size_t MaxGroups = 128U;
+    const HipIndexedAttentionLauncherConfig& config, QsaPrefillPool* pool, Qpf2kStageBatch& batch, const QsaScoreRingGeometry* compact = nullptr) {
+    // Embedded admission remains capped at 128 groups. Compact descriptors and
+    // tables cover all T; only scores/maxima have bounded slot lifetimes.
+    const std::size_t MaxGroups = compact ? std::max<std::size_t>(128U, tiles.size() / 8U) : 128U;
     static std::array<Qpf2kStageSlot, 2> ring;
     static std::size_t next = 0;
     const auto decline = [] { return false; };
@@ -63,12 +89,12 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
             if (cached.maxima) check_hip(hipFree(cached.maxima), "QSA stage batch maxima free");
             cached.maxima = nullptr; cached.maxima_capacity = 0;
             if (cached.done) check_hip(hipEventDestroy(cached.done), "QSA stage batch event free");
-            cached.done = nullptr;
+            cached.done = nullptr; cached.capacity = 0;
         }
         return false;
     };
     if ((qpf2k_qsa_mask() & 0x203U) != 0x203U || !qsa_norm_group_enabled() ||
-        tiles.empty() || tiles.size() % 8U || tiles.size() / 8U > MaxGroups ||
+        tiles.empty() || tiles.size() % 8U || tiles.size() / 8U > MaxGroups || tiles.size() / 8U > UINT32_MAX ||
         config.model.attention_kv_storage != AttentionKvStorage::bf16 || !pool || !pool->keys)
         return decline();
     const auto& model = config.model;
@@ -144,7 +170,9 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
         // Earlier serial journal writes are overwritten before any consumer. Never
         // let parallel groups race to publish those same eight rows.
         st.journal = g + 1U == groups ? tiles.back().journal : nullptr;
-        if (sc.blocks > pool->capacity || sc.blocks > qpf2k_maxima_stride * qsa_flash::kGroup) return decline();
+        if (sc.blocks > pool->capacity ||
+            (!compact && sc.blocks > qpf2k_maxima_stride * qsa_flash::kGroup) ||
+            (compact && sc.blocks > compact->blocks)) return decline();
         const auto count = sc.blocks > valid ? sc.blocks - valid : 0U;
         bounds[g] = make_uint2(valid, count);
         valid = std::max(valid, sc.blocks);
@@ -152,12 +180,30 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
         sc.maxima_stride = (sc.blocks + qsa_flash::kGroup - 1U) / qsa_flash::kGroup;
         maxima_count += static_cast<std::uint64_t>(64U) * sc.maxima_stride;
     }
-    // Two pinned descriptor slots, with private tables/maxima. Event protection is
-    // after the last consumer, including selection when bit 4 defers it.
+    // Two pinned descriptor slots, with private tables and embedded-only maxima.
+    // Protect descriptors through the last score/selection consumer. Compact
+    // score/maxima storage has its own per-slice owner lease below the caller.
     auto& slot = ring[next];
     const auto stream = hip_execution_stream();
     if (slot.pending) check_hip(hipEventSynchronize(slot.done), "QSA stage batch slot wait");
     slot.pending = false;
+    if (compact) for (auto& cached : ring) if (cached.maxima) {
+        // A preceding embedded call may have populated either cache slot. Do
+        // not retain its T-sized maxima alongside the admitted bounded ring.
+        if (cached.pending) check_hip(hipEventSynchronize(cached.done), "QSA external stage maxima wait");
+        cached.pending = false;
+        check_hip(hipFree(cached.maxima), "QSA external stage maxima release");
+        cached.maxima = nullptr; cached.maxima_capacity = 0;
+    }
+    if (slot.capacity && slot.capacity < MaxGroups) {
+        // Already quiescent, and still before this call's first publication.
+        for (auto* p : {static_cast<void*>(slot.norms), static_cast<void*>(slot.stores),
+            static_cast<void*>(slot.scores), static_cast<void*>(slot.bounds)})
+            if (p) check_hip(hipHostFree(p), "QSA stage descriptors grow free");
+        slot.norms = nullptr; slot.stores = nullptr; slot.scores = nullptr; slot.bounds = nullptr;
+        if (slot.tables) check_hip(hipFree(slot.tables), "QSA stage tables grow free");
+        slot.tables = nullptr; slot.capacity = 0;
+    }
     if (!slot.done) {
         const auto status = hipEventCreateWithFlags(&slot.done, hipEventDisableTiming);
         if (status == hipErrorOutOfMemory) return unavailable();
@@ -173,7 +219,8 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
         if (hipMalloc(&p, MaxGroups * 64U * 64U * sizeof(float2)) != hipSuccess) return unavailable();
         slot.tables = static_cast<float2*>(p);
     }
-    if (maxima_count > slot.maxima_capacity) {
+    slot.capacity = std::max(slot.capacity, MaxGroups);
+    if (!compact && maxima_count > slot.maxima_capacity) {
         void* p = nullptr;
         if (hipMalloc(&p, maxima_count * sizeof(float)) != hipSuccess) return unavailable();
         if (slot.maxima) check_hip(hipFree(slot.maxima), "QSA stage batch maxima free");
@@ -184,10 +231,11 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
     std::uint64_t offset = 0;
     for (std::uint32_t g = 0; g < groups; ++g) {
         norms[g].table = slot.tables + static_cast<std::uint64_t>(g) * 64U * 64U;
-        scores[g].maxima = scores[g].blocks ? slot.maxima + offset : nullptr;
+        scores[g].maxima = scores[g].blocks && !compact ? slot.maxima + offset : nullptr;
         offset += static_cast<std::uint64_t>(64U) * scores[g].maxima_stride;
         slot.norms[g] = norms[g]; slot.stores[g] = stores[g]; slot.scores[g] = scores[g]; slot.bounds[g] = bounds[g];
     }
+    batch.max_blocks = max_blocks; batch.groups = groups;
     batch.slot = &slot; // arm lifetime protection before submitting any descriptor reader
     next = (next + 1U) % ring.size();
     with_qwen_rotary(model, stream, [&](auto... rotary_source) {
@@ -227,35 +275,10 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
             qpf2k_key_ranges(pool->capacity), slot.bounds, groups);
         check_hip(hipGetLastError(), "QSA stage batch range launch");
     }
-    if (max_blocks) {
-        constexpr unsigned W = qsa_flash::kScoreWaves;
-        const auto score = [&]<unsigned R>() {
-            if (pool->packed)
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<64U, R, W, false, false, true, 1U, true, true>),
-                    dim3(((max_blocks + 31U) / 32U + W - 1U) / W, 64U / R, groups), dim3(W * 32U), 0, stream,
-                    QsaRowsScoreViews<64U>{}, static_cast<const void*>(pool->packed), 0U, a.index_dim, nullptr, 0U,
-                    static_cast<const uint2*>(qpf2k_key_ranges(pool->capacity)), nullptr, slot.scores);
-            else
-                hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<64U, R, W, false, false, true, 1U, true>),
-                    dim3(((max_blocks + 31U) / 32U + W - 1U) / W, 64U / R, groups), dim3(W * 32U), 0, stream,
-                    QsaRowsScoreViews<64U>{}, static_cast<const float*>(pool->keys), 0U, a.index_dim, nullptr, 0U,
-                    static_cast<const uint2*>(qpf2k_key_ranges(pool->capacity)), nullptr, slot.scores);
-        };
-        if (qsa_flash::score_rows(max_blocks) != 16U) {
-            static const bool witness = [] { std::fprintf(stderr, "qpf2k qsa score rows > 16 active\n"); return true; }();
-            (void)witness;
-        }
-        switch (qsa_flash::score_rows(max_blocks)) {
-        case 32U: score.template operator()<32U>(); break;
-        case 64U: score.template operator()<64U>(); break;
-        default: score.template operator()<qsa_flash::kScoreRows>(); break;
-        }
-        check_hip(hipGetLastError(), "QSA stage batch score launch");
-        qpf2k_launch_score.fetch_add(1U, std::memory_order_relaxed);
-    }
+    if (!compact) qpf2k_stage_score_slice(batch, pool, a.index_dim, 0U, groups);
     if (wave_norm) qpf2k_launch_norm_wave.fetch_add(1U, std::memory_order_relaxed);
     pool->valid = valid;
-    if (qpf2k_trace_enabled())
+    if (!compact && qpf2k_trace_enabled())
         std::fprintf(stderr, "qpf2k qsa stage_batch groups %u pool %u range %u score %u rope 1 norm 1 store 1 fallback 0%s\n",
             groups, max_new ? 1U : 0U, max_new ? 1U : 0U, max_blocks ? 1U : 0U,
             !max_blocks || qsa_flash::score_rows(max_blocks) == 16U ? "" : qsa_flash::score_rows(max_blocks) == 32U ? " score_rows 32" : " score_rows 64");

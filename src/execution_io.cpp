@@ -128,6 +128,10 @@ std::size_t flat_index(
 
 }  // namespace
 
+bool execution_use_is_logits(ExecutionBufferUse use) noexcept {
+    return use.buffer.buffer_class==ExecutionBufferClass::logits;
+}
+
 SerialExecutionIoPlan build_serial_execution_io_plan(
     const SerialExecutionPlan& execution_plan, bool parallel_moe_router) {
     SerialExecutionIoPlan output;

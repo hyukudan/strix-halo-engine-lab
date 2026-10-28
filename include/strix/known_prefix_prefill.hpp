@@ -23,11 +23,19 @@ struct KnownPrefillRequest {
     // Multi-row LM head (packs of eight rows, the R1 head's leaf and reduction tree per row) for an
     // all-rows request whose every row's logits are read (teacher-forced scoring over the prefill).
     bool lm_head_rows=false;
+    // Segmented owners and replay/capture clients can retain the complete legacy layout.
+    bool exact_memory=true;
+    // Compile-time promise: the owner installs the full-T ring-binding QSA entry.
+    // Optional-entry clients retain embedded scores unless they make this promise.
+    bool full_qsa_score_ring_entry=false;
 };
 struct CompiledKnownPrefixPrefill {
     std::uint32_t logical_rows=0;
     std::uint64_t prefill_execution_identity=0,prefill_kernel_plan_identity=0;
     KnownWindowArena arena;
+    std::uint64_t external_qsa_score_bytes=0,qsa_score_ring_workspace_bytes=0;
+    std::uint32_t qsa_score_ring_rows=0;
+    bool terminal_logits_arena=false;
     // Closed selection/format contract only. Its row plans are never relabelled
     // as a T-row window or executed as complete eight-row forwards.
     CompiledKnownPrefixWindow tile8;

@@ -1,3 +1,4 @@
+#include "strix/qsa_prefill_stage_plan.hpp"
 // qpf2k/attn microbench + fixtures: production QSA prefill kernels copied verbatim from
 // src/hip_indexed_attention_launcher.hip (0998a0e5) and the qpf2k kernels (src/hip_qsa_prefill_flash.inc).
 // qpf2k/attn microbench (standalone; build: amdclang++ -O3 -std=gnu++20 --offload-arch=gfx1151 -Iinclude -x hip).

@@ -284,7 +284,9 @@ struct HipKnownPrefixWindow::Impl {
                 throw std::invalid_argument("known prefill owner selection tile differs");
             prefill_launcher_source=serial;
             prefill_launcher_source->execution_identity=prefill->prefill_execution_identity;
-            prefill_launcher_source->arena=prefill->arena.row_view[0];
+            // Launcher construction admits the complete R1 head against the one capable row.
+            // Live contexts still resolve every non-head row against its own view.
+            prefill_launcher_source->arena=prefill->terminal_logits_arena?prefill->arena.row_view.back():prefill->arena.row_view[0];
             prefill_launcher_source->whole_plan_graph_safe=false;
         }
         if (!resources.model_manifest || !resources.tensor_access)
@@ -793,6 +795,8 @@ struct HipKnownPrefixWindow::Impl {
                 }});
         // STRIX_PREFILL_FULL_QSA=0: keep QSA rows in 8-row tiles.
         static const bool qsa=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_QSA");return !v||v[0]!='0';}();
+        if(prefill->external_qsa_score_bytes && !qsa)
+            throw std::invalid_argument("compact QSA owner requires the full-prefill ring entry");
         if(qsa&&window.qsa_rows_steps)
             for(std::size_t i=0;i<window.mode.size();++i) {
                 if(window.mode[i]!=KnownWindowStepMode::qsa_rows) continue;
@@ -806,7 +810,7 @@ struct HipKnownPrefixWindow::Impl {
                     [](std::span<const ExecutionDispatchContext> rows,void* object) {
                         const auto& self=*static_cast<Impl*>(object);
                         indexed_attention_known_prefill_rows_launch(rows,self.qsa_for(rows));
-                    }});
+                    },0,true});
             }
         // STRIX_PREFILL_FULL_SHARED=0: keep the shared expert in 8-row tiles.
         static const bool shared=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_SHARED");return !v||v[0]!='0';}();
@@ -918,6 +922,10 @@ struct HipKnownPrefixWindow::Impl {
         if(!prefill) {
             const char* pool=std::getenv("STRIX_QKERN_QSA_PERSISTENT");
             if(pool && pool[0]=='1') qsa_config.window_pool=make_hip_qsa_window_pool();
+        }
+        if(prefill && prefill->external_qsa_score_bytes) {
+            qsa_config.exact_score_owner=make_hip_qsa_exact_score_owner(model.effective_max_positions(),
+                prefill->qsa_score_ring_workspace_bytes,scope.stream,scratch.allocation_generation,prefill->qsa_score_ring_rows);
         }
         qsa_fallback=qsa_config;
         qsa_fallback.prefetch_q8_input=false; qsa_fallback.prefetch_eligible_layers.clear();
