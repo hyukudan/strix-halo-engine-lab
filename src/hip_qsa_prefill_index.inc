@@ -200,20 +200,28 @@ template <unsigned Rows> struct NormGroupViews {
     std::uint64_t position[Rows];
     float2* table; // [Rows][rotary_dim / 2] (cosine, sine)
 };
-template <unsigned Rows, bool Batch = false>
-__global__ __launch_bounds__(64) void rope_table_kernel(NormGroupViews<Rows> single, std::uint32_t rotary_dim, float theta, const NormGroupViews<Rows>* groups = nullptr) {
+template <unsigned Rows, bool Batch = false, class... Source>
+__global__ __launch_bounds__(64) void rope_table_kernel(NormGroupViews<Rows> single, std::uint32_t rotary_dim, float theta, const NormGroupViews<Rows>* groups = nullptr, Source... rotary_source) {
     const auto& views = [&]() -> const NormGroupViews<Rows>& {
         if constexpr (Batch) return groups[blockIdx.y];
         else return single;
     }();
     const auto row = static_cast<std::uint32_t>(blockIdx.x), pair = static_cast<std::uint32_t>(threadIdx.x);
+    if (!(rotary_source.check(views.position[row]) && ...)) return;
     const auto half = rotary_dim / 2U;
     if (pair >= half) return;
-    const float exponent = 2.0F * static_cast<float>(pair) / static_cast<float>(rotary_dim);
-    const float angle = static_cast<float>(views.position[row]) * powf(theta, -exponent);
-    const float cosine = cosf(angle);
-    const float sine = sinf(angle);
-    views.table[static_cast<std::uint64_t>(row) * half + pair] = make_float2(cosine, sine);
+    if constexpr (sizeof...(Source) == 0) {
+        const float exponent = 2.0F * static_cast<float>(pair) / static_cast<float>(rotary_dim);
+        const float angle = static_cast<float>(views.position[row]) * powf(theta, -exponent);
+        const float cosine = cosf(angle);
+        const float sine = sinf(angle);
+        views.table[static_cast<std::uint64_t>(row) * half + pair] = make_float2(cosine, sine);
+    } else {
+        const float2 cs = (rotary_source.cs[views.position[row] * 32ULL + pair], ...);
+        const float cosine = cs.x;
+        const float sine = cs.y;
+        views.table[static_cast<std::uint64_t>(row) * half + pair] = make_float2(cosine, sine);
+    }
 }
 // grid (heads[0] + heads[1] + heads[2], Rows), block 256 (dim <= 256).
 template <SmallWeightKind Kind, unsigned Rows, bool Batch = false>

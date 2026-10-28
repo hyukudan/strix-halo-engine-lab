@@ -49,7 +49,8 @@ void register_hip_moe_experts_kernel_variant(
 [[nodiscard]] ExecutionLauncher
 make_hip_moe_experts_launcher(
     std::string kernel_id,
-    HipMoeExpertsLauncherConfig* config);
+    HipMoeExpertsLauncherConfig* config,
+    bool perform_device_setup = true);
 
 // Explicit retained known-prefix window R2/R4/R8 organization, not an R1
 // variant or automatic strategy. Requires the selected Q4K A8 / Q5_1
@@ -112,7 +113,8 @@ public:
 
     void register_for_compiled_execution(
         const CompiledSerialExecution& compiled,
-        ExecutionLauncherRegistry& registry);
+        ExecutionLauncherRegistry& registry,
+        bool perform_device_setup = true);
 
 private:
     HipMoeExpertsLauncherConfig config_;

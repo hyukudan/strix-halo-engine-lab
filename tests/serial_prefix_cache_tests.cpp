@@ -1,3 +1,4 @@
+#include "rotary_mock.hpp"
 #include "strix/serial_prefix_cache.hpp"
 #include "strix/known_prefix_prefill.hpp"
 
@@ -343,6 +344,9 @@ int main() {
             generations,
             transfer);
 
+    expect(cache.prefix().prefix_identity == 2190756156287795900ULL &&
+        cache.prefix().snapshot.plan_identity == 10795530635910758876ULL,
+        "native identity bytes retain the pinned pre-rotary golden");
     expect(
         cache.valid() &&
             cache.prefix().prefix_tokens ==
@@ -350,6 +354,49 @@ int main() {
             cache.memory().allocation_generation != 0,
         "prefix cache owns metadata and compact snapshot allocation");
 
+    for (auto factor : {2U, 4U}) {
+        auto other_model = model; other_model.qwen_rotary_table = mock_rotary(factor);
+        const auto other_layout = strix::build_serial_session_state_layout(other_model, layout_request);
+        auto other_session = session; other_session.state_layout_identity = other_layout.layout_identity;
+        const auto before = other_session;
+        expect(!cache.matches(prefix_tokens, session.execution_identity, session.runtime_compatibility_identity,
+            other_layout.layout_identity), "prefix key rejects a different rotary identity with identical tokens");
+        expect(!cache.try_restore(other_session, other_model, other_layout, state_memory, transfer, prefix_tokens) &&
+            other_session.next_position == before.next_position && other_session.health == before.health,
+            "rotary restore mismatch refuses before backend import or publication");
+    }
+
+    {
+        std::array<strix::SerialPrefixSnapshot,3> modes;
+        std::array<strix::ModelContract,3> models{model,model,model};
+        models[1].qwen_rotary_table=mock_rotary(2); models[2].qwen_rotary_table=mock_rotary(4);
+        for(unsigned i=0;i<3U;++i) {
+            const auto l=strix::build_serial_session_state_layout(models[i],layout_request);
+            strix::SerialSessionSnapshotRequest r;
+            r.compiled_execution_identity=strix::append_rotary_identity(session.execution_identity,models[i].rotary_identity());
+            r.runtime_compatibility_identity=session.runtime_compatibility_identity;
+            r.next_position=r.committed_tokens=prefix_tokens.size();r.state=session.state;
+            strix::ArithmeticLineage history;
+            for(std::uint64_t pos=0;pos<prefix_tokens.size();++pos)
+                history=strix::prepare_serial_row_lineage(history,pos,r.compiled_execution_identity,0x1234ULL);
+            modes[i]=strix::make_serial_prefix_snapshot(prefix_tokens,
+                strix::build_serial_session_snapshot_plan(models[i],l,r),history);
+        }
+        for(unsigned i=0;i<3U;++i) for(unsigned j=0;j<3U;++j) {
+            const auto& wanted=modes[j].snapshot;
+            expect(strix::serial_prefix_snapshot_matches(modes[i],prefix_tokens,wanted.compiled_execution_identity,
+                wanted.runtime_compatibility_identity,wanted.state_layout_identity)==(i==j),
+                "native/2/4 prefix keys distinguish every equal-shape/token pair");
+            if(i!=j) {
+                bool refused=false;
+                const auto l=strix::build_serial_session_state_layout(models[j],layout_request);
+                try { (void)strix::build_serial_prefix_restore_plan(models[j],l,wanted.compiled_execution_identity,
+                    wanted.runtime_compatibility_identity,prefix_tokens,modes[i]); }
+                catch(const std::invalid_argument&) { refused=true; }
+                expect(refused,"every mismatched restore refuses before an allocator/importer/publication is available");
+            }
+        }
+    }
     std::fill(
         device_state.begin(),
         device_state.end(),

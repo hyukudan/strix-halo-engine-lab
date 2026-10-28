@@ -91,7 +91,7 @@ build_indexed_attention_workspace_layout(
     layout.alignment =
         alignment;
     layout.maximum_blocks =
-        (model.max_position_embeddings +
+        checked_add(model.effective_max_positions(),
          model.indexer_compress_ratio - 1ULL) /
         model.indexer_compress_ratio;
     layout.maximum_selected_tokens =

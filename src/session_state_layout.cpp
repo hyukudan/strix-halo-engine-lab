@@ -107,6 +107,7 @@ std::uint64_t build_identity(
     const SerialSessionStateLayout& layout) noexcept {
     std::uint64_t hash = fnv_offset;
 
+    hash = append_rotary_identity(hash, model.rotary_identity());
     hash_u64(hash, model.vocab_size);
     hash_u64(hash, model.hidden_size);
     hash_u64(hash, model.max_position_embeddings);
@@ -191,7 +192,7 @@ build_serial_session_state_layout(
     }
     if (request.context_tokens == 0 ||
         request.context_tokens >
-            model.max_position_embeddings) {
+            model.effective_max_positions()) {
         throw std::invalid_argument(
             "serial session context is outside the model limit");
     }

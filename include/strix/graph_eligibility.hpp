@@ -41,6 +41,7 @@ struct GraphExecutionContract {
     std::uint64_t kernel_plan_identity = 0;
     std::uint32_t logical_rows = 1;
     bool whole_plan_graph_safe = false;
+    std::shared_ptr<const HipQwenRotaryTable> rotary_table = nullptr;
     friend bool operator==(const GraphExecutionContract&, const GraphExecutionContract&) = default;
 };
 

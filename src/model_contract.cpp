@@ -77,6 +77,14 @@ std::string ModelContract::validate() const {
         rope_theta <= 1.0F) {
         return "partial rotary geometry and theta must be valid";
     }
+    if (resolved_rotary.descriptor().mode() == RotaryMode::yarn &&
+        (max_position_embeddings != RotaryDescriptor::original_max ||
+         rotary_dim() != RotaryDescriptor::rotary_dim || rope_theta != RotaryDescriptor::theta ||
+         (qwen_rotary_table && resolved_rotary != qwen_rotary_table->identity())))
+        return "resolved rotary checkpoint/identity mismatch";
+    if (qwen_rotary_table && (rotary_dim() != RotaryDescriptor::rotary_dim ||
+        rope_theta != RotaryDescriptor::theta || max_position_embeddings > qwen_rotary_table->extent()))
+        return "resolved rotary table/model geometry mismatch";
     if (!std::isfinite(rms_norm_epsilon) ||
         rms_norm_epsilon <= 0.0F) {
         return "RMS normalization epsilon must be finite and positive";

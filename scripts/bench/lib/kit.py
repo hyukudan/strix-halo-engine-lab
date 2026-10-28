@@ -570,7 +570,9 @@ def parse_effective(text, explicit=()):
     if drops: raise ValueError('required production defaults dropped: '+'; '.join(drops))
     env={}; args=[]; settings={}; unsets=[]
     for line in lines:
-        if line.startswith('Qwen auto-prefill'): continue
+        # Informational Qwen resolver notices (auto-prefill, baseline YaRN suppression, active YaRN)
+        # carry '=' but are not settings; the structured JSON on stdout is the configuration.
+        if line.startswith(('Qwen auto-prefill', 'Qwen baseline:', 'Qwen experimental YaRN')): continue
         if line.startswith('env '):
             key,value=line[4:].split('=',1); env[key]=value
         elif line.startswith('effective env '):
@@ -657,6 +659,104 @@ def record_effective(out, label, local, peer, model, peer_model, binary, peer_bi
     dump(path,env)
 
 
+def qwen_rotary_reference(configs):
+    """Project the resolved numerical payload; native adds zero reference bytes."""
+    rotary = {}
+    required = ('rope_mode', 'factor', 'original_max', 'effective_max', 'rotary_dim',
+                'index_rotary_dim', 'theta', 'mrope_sections', 'mrope_interleaved',
+                'beta_fast', 'beta_slow', 'truncate', 'attention_factor', 'math_version',
+                'generator', 'table_sha256')
+    for label, config in configs.items():
+        settings = config['settings']
+        # A legacy payload omission is safe only without any non-native declaration.
+        factors = set()
+        argument_off = False
+        yarn_reason = False
+
+        def factor(value):
+            if isinstance(value, dict): value = value.get('value')
+            if str(value) == 'off': return 0
+            if str(value) not in ('2', '4'):
+                raise ValueError('invalid Qwen YaRN declaration')
+            return int(value)
+
+        def arguments(value):
+            nonlocal argument_off
+            if isinstance(value, str):
+                import shlex
+                value = shlex.split(value)
+            if isinstance(value, dict):
+                declarations(value)
+                return
+            if not isinstance(value, (list, tuple)): return
+            for i, arg in enumerate(value):
+                if not isinstance(arg, str): continue
+                if arg == '--rope-yarn':
+                    if i + 1 == len(value): raise ValueError('missing Qwen YaRN argument')
+                    f = factor(value[i + 1])
+                elif arg.startswith('--rope-yarn='): f = factor(arg.split('=', 1)[1])
+                else: continue
+                if f: factors.add(f)
+                else: argument_off = True
+
+        def declarations(obj):
+            nonlocal yarn_reason
+            if not isinstance(obj, dict): return
+            for key, value in obj.items():
+                if key in ('argv', 'arguments', 'args', 'requested_args', 'requested_arguments'):
+                    arguments(value)
+                elif key in ('environment', 'requested_environment') and isinstance(value, dict):
+                    if 'STRIX_QWEN_ROPE_YARN' in value:
+                        f = factor(value['STRIX_QWEN_ROPE_YARN'])
+                        if f: factors.add(f)
+                elif key in ('reason', 'resolver_reason') and isinstance(value, str) and 'yarn' in value.lower():
+                    yarn_reason = True
+                elif key in ('requested', 'request', 'requested_options', 'resolver'):
+                    if isinstance(value, (str, list, tuple)): arguments(value)
+                    else: declarations(value)
+                elif key in ('rope_yarn', '--rope-yarn', 'STRIX_QWEN_ROPE_YARN'):
+                    f = factor(value)
+                    if f: factors.add(f)
+                    else: argument_off = True
+        declarations(config)
+        declarations(settings)
+        non_native = bool(factors) or yarn_reason or settings.get('rope_mode', 'native') != 'native'
+        payloads = [settings[key] for key in ('rotary_identity', 'rotary') if key in settings]
+        if not payloads:
+            if non_native:
+                raise ValueError('incomplete Qwen rotary reference identity')
+            continue
+        if any(not isinstance(p, dict) or 'rope_mode' not in p for p in payloads):
+            raise ValueError('explicit Qwen rotary payload requires rope_mode')
+        payload = payloads[0]
+        if any(p != payload for p in payloads[1:]):
+            raise ValueError('conflicting Qwen rotary payloads')
+        mode = payload['rope_mode']
+        if 'rope_mode' in settings and settings['rope_mode'] != mode:
+            raise ValueError('conflicting Qwen rotary modes')
+        if mode == 'native':
+            if non_native:
+                raise ValueError('Qwen YaRN declaration requires non-native rotary payload')
+            native = dict(factor=0, original_max=262144, effective_max=262144,
+                          rotary_dim=64, index_rotary_dim=64, theta=10000000,
+                          mrope_sections=[11,11,10], mrope_interleaved=True,
+                          beta_fast=32, beta_slow=1, truncate=True, attention_factor=1,
+                          math_version='qwen-yarn-hf64-v1', generator='fp64-libm-to-f32-rne',
+                          table_sha256=None, table_bytes=0,
+                          descriptor_sha256=hashlib.sha256(b'').hexdigest())
+            if any(key in payload and payload[key] != value for key, value in native.items()):
+                raise ValueError('native Qwen rotary payload has non-native parameters')
+            continue
+        if mode != 'yarn' or any(key not in payload for key in required):
+            raise ValueError('incomplete Qwen rotary reference identity')
+        if argument_off or any(f != payload['factor'] for f in factors):
+            raise ValueError('conflicting Qwen YaRN declarations and rotary payload')
+        if not isinstance(payload['table_sha256'], str) or not re.fullmatch(r'[0-9a-f]{64}', payload['table_sha256']):
+            raise ValueError('non-native Qwen reference requires resolved table SHA256')
+        rotary[label] = {key: payload[key] for key in required}
+    return rotary
+
+
 def initialize(out):
     inv = read(out / 'local-inventory.json') if (out / 'local-inventory.json').exists() else inventory()
     peer_hardware = read(out / 'peer-inventory.json')['hardware'] if (out / 'peer-inventory.json').exists() else None
@@ -684,7 +784,11 @@ def initialize(out):
     reference_key = {'engine': ENGINE, 'profile': identity['profile'], 'environment': identity['environment'],
                      'prompt_set_sha256': prompt_set['sha256'],
                      'model_sha256s': sorted(f['sha256'] for f in inv['model_files'])}
-    if ENGINE=='qwen': reference_key['profile_pairs']=identity['profile_pairs']
+    if ENGINE=='qwen':
+        reference_key['profile_pairs']=identity['profile_pairs']
+        rotary = qwen_rotary_reference(configs)
+        if rotary:
+            reference_key['rotary_identity'] = rotary
     reference_sha = hashlib.sha256(json.dumps(reference_key, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     dump(out / 'identity.json', {'schema_version': 1, 'kit_version': VERSION, 'engine': ENGINE,
                                 'repo_commit': inv['repo_commit'], 'tracked_dirty': inv['tracked_dirty'],

@@ -1,3 +1,4 @@
+#include "rotary_mock.hpp"
 #include "strix/graph_eligibility.hpp"
 #include "strix/compiled_execution.hpp"
 #include "strix/compiled_speculative_verify.hpp"
@@ -81,6 +82,10 @@ int main() {
     budget.capture_peak_bytes = 8192;
     budget.budget_bytes = 24 * (1024 + 2048 + 64) + 8192;
     const auto capture = strix::prepare_graph_capture_plan(contract, arena, resources, args, budget);
+    expect(capture.capture_identity == 18230019989722437287ULL &&
+        capture.compatibility_identity == 134186296344517819ULL &&
+        capture.binding_identity == 14753978041200002398ULL,
+        "native identity bytes retain the pinned pre-rotary golden");
     expect(capture.instance_count == 24 && capture.charged_bytes == budget.budget_bytes,
         "all session/shape/eligibility instances charge workspace, executable, input and capture bytes");
     const auto original = strix::assess_graph_replay_eligibility(capture, contract, arena, resources, args, 0);
@@ -90,6 +95,28 @@ int main() {
         "absolute position can change only as explicit dynamic device data, not a capture scalar");
     expect(!strix::assess_graph_replay_eligibility(capture, contract, arena, resources, args, 32).candidate_eligible,
         "current allocation capacity remains a per-replay gate");
+
+    {
+        auto yarn_contract = contract;
+        yarn_contract.rotary_table = mock_rotary(2);
+        std::weak_ptr<const strix::HipQwenRotaryTable> weak = yarn_contract.rotary_table;
+        auto yarn_capture = strix::prepare_graph_capture_plan(yarn_contract, arena, resources, args, budget);
+        auto same = yarn_contract;
+        yarn_contract.rotary_table.reset();
+        expect(!weak.expired(), "capture retains allocation after external owner release");
+        expect(strix::assess_graph_replay_eligibility(yarn_capture, same, arena, resources, args, 0).candidate_eligible,
+            "captured table remains live for replay after caller release");
+        for (auto replacement : {std::shared_ptr<const strix::HipQwenRotaryTable>{}, mock_rotary(2), mock_rotary(4)}) {
+            auto changed = same; changed.rotary_table = replacement;
+            expect(!strix::assess_graph_replay_eligibility(yarn_capture, changed, arena, resources, args, 0).candidate_eligible,
+                "capture rejects native, replaced allocation and factor mismatch");
+        }
+        auto damaged = yarn_capture; damaged.execution.rotary_table.reset();
+        expect(!strix::assess_graph_replay_eligibility(damaged, same, arena, resources, args, 0).candidate_eligible,
+            "capture cannot replay after losing its table lease");
+        same.rotary_table.reset(); yarn_capture = {};
+        expect(weak.expired(), "last stream/graph reader releases the mock allocation");
+    }
 
     auto changed_args = args;
     ++changed_args.memory.allocation_generation;

@@ -1,5 +1,6 @@
 #include "strix/hip_serial_graph.hpp"
 #include "strix/hip_launch_context.hpp"
+#include "strix/hip_qwen_rotary_table.hpp"
 #include "strix/runtime_launchers.hpp"
 #include "strix/dispatch_resources.hpp"
 #include <hip/hip_runtime.h>
@@ -139,6 +140,10 @@ HipSerialGraph::HipSerialGraph(CompiledSerialExecution compiled, std::shared_ptr
         memory.sessions != 1 || memory.shapes_per_session != 1 || memory.eligibility_classes_per_shape != 1 ||
         memory.workspace_bytes_per_instance < 112)
         throw std::invalid_argument("whole graph requires explicit C1 graph catalog, owner and auxiliary admission");
+    const auto& model=p.catalog->gdn_config().model;
+    require_qwen_rotary_device_payload(model.rotary_identity(),model.qwen_rotary_table.get());
+    if(model.qwen_rotary_table != p.compiled.rotary_table)
+        throw std::invalid_argument("whole graph catalog and compiled rotary allocation differ");
     const auto& resources = p.owner->current();
     if (!resources.session_state_layout || !resources.session_state_memory || resources.ple_lookup ||
         resources.ple_prefetch || resources.ple_hash_contract)
@@ -181,6 +186,13 @@ HipSerialGraph::HipSerialGraph(CompiledSerialExecution compiled, std::shared_ptr
     for (std::size_t i = 0; i < writable.size(); ++i)
         for (std::size_t j = i + 1; j < writable.size(); ++j)
             if (overlaps(writable[i], writable[j])) throw std::invalid_argument("graph scratch and session state alias");
+    if (const auto& table = p.compiled.rotary_table) {
+        validate_qwen_rotary_reader(*table, nullptr);
+        const Range read_only{reinterpret_cast<std::uintptr_t>(table->data()), table->descriptor().table_bytes()};
+        device_binding(read_only);
+        for (const auto range : writable)
+            if (overlaps(read_only, range)) throw std::invalid_argument("graph rotary table aliases writable resources");
+    }
     for (const auto& tensor : resources.model_weights->tensors) {
         const Range read_only{tensor.address, tensor.bytes};
         device_binding(read_only);

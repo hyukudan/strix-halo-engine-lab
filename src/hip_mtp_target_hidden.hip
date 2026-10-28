@@ -1,4 +1,5 @@
 #include "strix/hip_mtp_target_hidden.hpp"
+#include "strix/hip_qwen_rotary_table.hpp"
 #include "strix/hip_mtp_target_window.hpp"
 #include "strix/mtp_target_window_policy.hpp"
 #include "strix/hip_launch_context.hpp"
@@ -158,6 +159,13 @@ std::uint32_t HipMtpTargetHiddenTicket::predicted_token() const {if(!lease_)thro
 const SerialSessionContext& HipMtpTargetHiddenTicket::committed_session() const {if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");return lease_->prefix_committed?*lease_->prefix_committed:lease_->batch?lease_->batch->committed_session():lease_->committed;}
 std::optional<ModelContentIdentity> HipMtpTargetHiddenTicket::serial_logits_digest() const {return lease_ ? lease_->logits_digest : std::nullopt;}
 ModelContentIdentity HipMtpTargetHiddenTicket::target_content_identity() const {if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");return lease_->content;}
+RotaryIdentity HipMtpTargetHiddenTicket::producer_rotary_identity() const {
+    if(!lease_ || !lease_->owner) throw std::invalid_argument("MTP target hidden ticket is empty");
+    return lease_->owner->model().rotary_identity();
+}
+void HipMtpTargetHiddenTicket::admit_rotary_reader(const RotaryIdentity& reader) const {
+    require_rotary_producer_identity(producer_rotary_identity(),reader);
+}
 std::uint64_t HipMtpTargetHiddenTicket::producer_execution_identity() const {
     if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");
     return lease_->batch || lease_->prefix_committed ? committed_session().execution_identity : lease_->producer;
@@ -178,6 +186,8 @@ std::shared_ptr<HipMtpTargetHidden> HipMtpTargetHidden::create(
     std::shared_ptr<const RuntimeExecutionMemoryOwner> memory,
     std::shared_ptr<const HipModelResidency> weights,
     std::shared_ptr<HipRuntimeAllocator> allocator,std::uint32_t rows,std::uint64_t budget,HipMtpTargetDeferredConfig deferred) {
+    require_rotary_producer_identity(c.rotary_table?c.rotary_table->identity():RotaryIdentity{},m.rotary_identity());
+    if(m.qwen_rotary_table) validate_qwen_rotary_reader(*m.qwen_rotary_table,nullptr);
     if(!m.validate().empty() || !memory || !weights || !allocator || !rows ||
        !c.execution_identity || m.vocab_size>std::numeric_limits<std::uint32_t>::max() || c.logical_rows!=1 || c.request_concurrency!=1 ||
        !weights->binding().model_content_identity.valid())
@@ -398,9 +408,10 @@ void HipMtpTargetHidden::replace_token_sampler(std::shared_ptr<TokenSampler> sam
 }
 std::shared_ptr<TokenSampler> HipMtpTargetHidden::token_sampler() const noexcept {return impl_->sampler;}
 HipMtpTargetHiddenTicket HipMtpTargetHidden::adopt_prefill_row(const SerialSessionContext& session,
-    std::uint32_t token,MtpDeviceView hidden,std::span<const float> logits,
+    std::uint32_t token,MtpDeviceView hidden,std::span<const float> logits,const RotaryIdentity& producer_rotary,
     const HipMtpHostRowSelector& host_selector) {
     auto& i=*impl_;
+    require_rotary_producer_identity(producer_rotary,i.model->rotary_identity());
     const auto& lineage=session.arithmetic_lineage;
     const auto* last=lineage.intervals.empty()?nullptr:&lineage.intervals.back();
     if(i.busy || i.failed || i.prompt || session.health!=SerialSessionHealth::ready ||
@@ -440,7 +451,9 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::adopt_prefill_row(const SerialSessi
     HipMtpTargetHiddenTicket ticket;ticket.lease_=std::move(lease);return ticket;
 }
 void HipMtpTargetHidden::set_prompt_execution(const CompiledSerialExecution& prompt) {
-    auto& i=*impl_;i.guard->require_original();i.memory->validate_inventory_ownership();
+    auto& i=*impl_;
+    require_rotary_producer_identity(prompt.rotary_table?prompt.rotary_table->identity():RotaryIdentity{},i.model->rotary_identity());
+    i.guard->require_original();i.memory->validate_inventory_ownership();
     if(i.prompt || i.started || i.busy || i.failed)
         throw std::invalid_argument("MTP prompt execution is set once, before any target row");
     if(prompt.execution.steps.size()!=i.compiled->execution.steps.size() ||

@@ -685,7 +685,9 @@ memoria unificada permite a la GPU leer los pesos donde están.
 El perfil automático de Qwen está cualificado a 8192 tokens; los contextos más largos funcionan con
 `--unqualified-context` (así llega el barrido medido de prefill a 262.143 tokens). Un piloto de recuperación con el comando
 por defecto encontró la aguja en los 19 casos de 8K a 262.143 tokens; es un piloto, no una cualificación
-([comprobaciones de contexto largo](docs/reproduce.md#long-context-retrieval-and-reasoning-checks-qwen)). Los límites de contexto largo de DeepSeek
+([comprobaciones de contexto largo](docs/reproduce.md#long-context-retrieval-and-reasoning-checks-qwen)). Por encima de 262.144 hay un
+modo experimental opcional de YaRN estático (`--rope-yarn 2|4` con `--context` explícito, solo CLI; cambia la salida en
+todas las posiciones y está desactivado por defecto): [modo YaRN](docs/reference/qwen-yarn-host-table.md). Los límites de contexto largo de DeepSeek
 están en [docs/models/deepseek-v4.1/long-context.md](docs/models/deepseek-v4.1/long-context.md).
 
 **¿De dónde salen los números?**

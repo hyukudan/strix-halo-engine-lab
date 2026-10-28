@@ -1,6 +1,9 @@
 #include "../apps/qwen_prompt_organization.hpp"
 #include "strix/mtp_selection_transaction.hpp"
 #include "qwen_prefill_contract.hpp"
+#include "rotary_mock.hpp"
+#include "strix/memory_plan.hpp"
+#include "../apps/qwen_yarn_owner_inventory.hpp"
 #include "qwen_serial_contract.hpp"
 #include "qwen_historical_resolver.hpp"
 #include <iostream>
@@ -35,7 +38,7 @@ std::vector<std::string> mtp_fixture(){
         "--mtp-runtime-bytes","16384","--mtp-target-capture-bytes","8192",
         "--mtp-policy-id","7","--mtp-candidate-depth","2"};
 }
-constexpr std::uint64_t gib = UINT64_C(1024) * 1024U * 1024U;
+constexpr std::uint64_t gib_bytes = UINT64_C(1024) * 1024U * 1024U;
 // The source command did not enable MTP or cohorts. Their inactive controls
 // and disabled experiments are excluded. The logits digest is diagnostic output,
 // not part of the prefill arithmetic/organization contract.
@@ -47,9 +50,263 @@ constexpr std::array excluded_inactive_env{
     "STRIX_MTP_BATCH_JOINT", "STRIX_COHORT_ROWS", "STRIX_COHORT_WIDE",
     "STRIX_PREFILL_LOGITS_DIGEST"};
 PrefillMemory ample_memory() {
-    return {128U*gib,128U*gib,0U,[](const Options&) {
-        return PrefillRequirements{70U*gib,8U*gib,gib,2U*gib,512U*1024U*1024U,128U*1024U*1024U,0U,9U*gib};
+    return {128U*gib_bytes,128U*gib_bytes,0U,[](const Options&) {
+        return PrefillRequirements{70U*gib_bytes,8U*gib_bytes,gib_bytes,2U*gib_bytes,512U*1024U*1024U,128U*1024U*1024U,0U,9U*gib_bytes};
     }};
+}
+void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manifest) {
+    for (const auto factor : {0U,2U,4U}) {
+        auto model = ModelContract::qwen38_flash_next();
+        if (factor) model.qwen_rotary_table = mock_rotary(factor);
+        for (const std::uint64_t capacity : {0U,262143U,262144U,262145U,524288U,524289U,1048576U,1048577U}) {
+            const bool fits = capacity && capacity <= model.effective_max_positions();
+            bool layout = true, memory = true;
+            try { SerialSessionStateLayoutRequest request; request.context_tokens = capacity;
+                const auto state = build_serial_session_state_layout(model,request);
+                expect(state.context_tokens == capacity,"YaRN layout preserves requested capacity");
+            } catch (const std::invalid_argument&) { layout = false; }
+            try { MemoryPlanRequest request; request.context_tokens = capacity;
+                (void)build_memory_plan(model,request);
+            } catch (const std::invalid_argument&) { memory = false; }
+            expect(layout == fits && memory == (!factor || fits),"native planning and YaRN execution cap matrix");
+        }
+    }
+    {
+        RequestedOptions off;
+        off.options = parse({"decoder","MODEL","1","--rope-yarn","off"});
+        off.environment["STRIX_QWEN_ROPE_YARN"] = "2";
+        const auto native = resolve_effective_config(off,ModelContract::qwen38_flash_next(),info,manifest,
+            validated_model_content_identity,{true,true,true},ample_memory());
+        expect(native.options.rotary.mode() == RotaryMode::native &&
+            native.environment.at("STRIX_QWEN_ROPE_YARN") == "off", "CLI off receipt reports effective native environment");
+    }
+    auto model = ModelContract::qwen38_flash_next(); model.qwen_rotary_table = mock_rotary(2);
+    RequestedOptions request;
+    request.options = parse({"decoder","MODEL","1","--rope-yarn","2","--context","300000","--generate","32"});
+    request.options.tokens.resize(8192U,1U);
+    auto memory = ample_memory(); memory.total = 124U*gib_bytes;
+    const auto resolve = [&](const RequestedOptions& r, const PrefillMemory& m) {
+        return resolve_effective_config(r,model,info,manifest,validated_model_content_identity,{true,true,true},m);
+    };
+    {
+        SerialSessionStateLayoutRequest state_request; state_request.context_tokens = 300000U;
+        const auto state = build_serial_session_state_layout(model,state_request);
+        auto sized = request.options; sized.known_prefix_prefill_rows = 8192U;
+        PrefillRequirements required;
+        required.state_d1 = prefill_checked_add(state.device_total_bytes,
+            prefill_checked_add(state.host_total_bytes,prefill_checked_add(state.host_total_bytes,state.host_alignment-1U)));
+        required.model_backing = 111334654400ULL;
+        append_yarn_owner_requirements(sized,model,state,required.model_backing,required);
+        expect(required.owners.at("target_kv") == 7372800000ULL && required.owners.at("target_raw_index") == 921600000ULL,
+            "YaRN exact target KV and raw index owners at C300000");
+        expect(required.owners.at("qsa_shared_prefill_pool") == 38400000U &&
+            required.owners.at("qsa_window_pool_and_slab_bound") == 0U,"YaRN one pool across twelve layers and absent window owners");
+        std::uint64_t state_sum = 0;
+        for (const auto* name : {"target_kv","target_raw_index","gdn_matrix","gdn_convolution","ple_convolution",
+                "ngram_history","position_history","state_alignment_and_d1_shadow"})
+            state_sum = prefill_checked_add(state_sum,required.owners.at(name));
+        expect(state_sum == required.state_d1,"YaRN state owner inventory reconciles aligned payload and shadow");
+        expect(required.owners.at("routed_csr") == 1315584U &&
+            required.owners.at("merged_routed_csr") == 0U &&
+            !required.owners.contains("tail_64_ple_staging"),
+            "YaRN primary CSR present, tail/merged owners absent for exact T prompt");
+        const auto primary = required;
+        sized.tokens.resize(299000U,1U);
+        sized.known_prefix_tail_rows = {64U,16U};
+        sized.known_prefix_ladder_tail_rows = {1024U,256U,64U,16U};
+        PrefillRequirements with_tails;
+        with_tails.state_d1 = primary.state_d1;
+        with_tails.model_backing = primary.model_backing;
+        with_tails.workspace = 1U;
+        append_yarn_owner_requirements(sized,model,state,with_tails.model_backing,with_tails);
+        std::uint64_t tail_ple = 0;
+        for (const auto rows : {64U,16U}) {
+            const auto prefix = "tail_" + std::to_string(rows) + "_";
+            for (const auto* owner : {"ple_staging","ple_projections_and_gates","ple_snapshot_and_hashes"})
+                tail_ple = prefill_checked_add(tail_ple,with_tails.owners.at(prefix+owner));
+            expect(with_tails.owners.at(prefix+"routed_csr") ==
+                q51_known_rows::prefill_scratch_bytes(rows,512U,10U),"YaRN each retained tail has independent CSR");
+        }
+        expect(tail_ple == 7111040U && with_tails.owners.at("merged_routed_csr") ==
+            q51_known_rows::prefill_scratch_bytes(3840U,512U,10U),
+            "YaRN tail PLE regression and once-retained merged primary CSR");
+        // Mock the same compiled owners present/absent. Every T trial uses the
+        // same fixture so fallback cannot conceal an envelope or GTT edge.
+        auto absent = with_tails;
+        std::uint64_t omitted = 0;
+        for (const auto& [name,bytes] : with_tails.owners) {
+            if ((name.starts_with("tail_") && name != "tail_workspaces_and_status") ||
+                name == "routed_csr" || name == "merged_routed_csr") {
+                omitted = prefill_checked_add(omitted,bytes);
+                absent.owners.erase(name);
+            }
+        }
+        absent.device_base -= omitted;
+        std::uint64_t gross = 8U*gib_bytes + request.options.rotary.table_bytes();
+        for (const auto& [name,bytes] : with_tails.owners) { (void)name; gross = prefill_checked_add(gross,bytes); }
+        auto edge = memory;
+        edge.verify_ple_credit = [](const Options&) { return 16U*gib_bytes; };
+        edge.total = gross-16U*gib_bytes-1U; // total-envelope edge after verified credit
+        edge.estimate = [=](const Options&) { return absent; };
+        expect(resolve(request,edge).admitted,"YaRN missing external owners would admit envelope edge");
+        edge.estimate = [=](const Options&) { return with_tails; };
+        auto refused = resolve(request,edge);
+        expect(!refused.admitted && refused.error.find("owner_tail_64_ple_staging_bytes=") != std::string::npos &&
+            refused.error.find("owner_merged_routed_csr_bytes=") != std::string::npos &&
+            effective_config_json(refused).find("owner_tail_16_routed_csr_bytes") != std::string::npos,
+            "YaRN complete owner refusal and effective-config list each external owner");
+        edge.total = 124U*gib_bytes;
+        edge.gtt_limit = with_tails.device_base + with_tails.workspace + request.options.rotary.table_bytes()-1U;
+        edge.estimate = [=](const Options&) { return absent; };
+        expect(resolve(request,edge).admitted,"YaRN missing external owners would admit device edge");
+        edge.estimate = [=](const Options&) { return with_tails; };
+        expect(!resolve(request,edge).admitted,"YaRN external owners count toward device growth independently");
+        auto invalid = model; invalid.num_experts = UINT64_MAX;
+        bool csr_guarded = false;
+        try { auto value = primary; append_yarn_owner_requirements(sized,invalid,state,value.model_backing,value); }
+        catch (const std::invalid_argument&) { csr_guarded = true; }
+        expect(csr_guarded,"YaRN CSR dimensions checked before narrowing or layout arithmetic");
+        auto bad = model; bad.gdn_key_heads = UINT64_MAX;
+        bool guarded = false;
+        try { append_yarn_owner_requirements(sized,bad,state,required.model_backing,required); }
+        catch (const std::overflow_error&) { guarded = true; }
+        expect(guarded,"YaRN owner width products checked before context multiplication");
+    }
+    // Reproduce the complete startup environment from the 8192-ID plain
+    // command, including the two-bit MoE marker that previously refused.
+    auto startup = request;
+    qpf2k::initialize([&](const char* name) -> const char* {
+        const auto it = startup.environment.find(name);
+        return it == startup.environment.end() ? nullptr : it->second.c_str();
+    }, [&](const char* name, const char* value) {
+        startup.environment.emplace(name,value); return true;
+    }, qpf2k::startup_items);
+    const Environment recorded_startup{
+        {"STRIX_PLE_RECLAIMABLE","auto"}, {"STRIX_QPF2K_DENSE","1"},
+        {"STRIX_QPF2K_GDN","1"}, {"STRIX_QPF2K_GDN_CORE16","1"},
+        {"STRIX_QPF2K_GDN_GATES_BATCH","1"}, {"STRIX_QPF2K_HC","1"},
+        {"STRIX_QPF2K_HC_MASK","14"}, {"STRIX_QPF2K_HC_OUTPUT3","1"},
+        {"STRIX_QPF2K_HC_OUTPUT3_BAND","16"}, {"STRIX_QPF2K_MOE_DA16","1"},
+        {"STRIX_QPF2K_MOE_DEFAULTED","3"}, {"STRIX_QPF2K_MOE_ROUTE","14"},
+        {"STRIX_QPF2K_QSA","1"}, {"STRIX_QPF2K_QSA_MASK","0x257"},
+        {"STRIX_QPF2K_SCHED","12"}};
+    expect(startup.environment == recorded_startup, "YaRN exact recorded startup environment");
+    expect(resolve(startup,memory).admitted && !resolve(startup,memory).admission.empty(),
+        "YaRN exact resolver startup environment reaches full admission");
+    for (const auto& item : qpf2k::defaults) {
+        expect(yarn_environment_path(item.item) != YarnEnvironmentPath::uncovered_rotary,
+            "every resolver item has an audited rotary classification");
+        for (const auto* value : {"0", "1", "0xffffffff"}) {
+            auto explicit_override = request;
+            explicit_override.environment[item.name] = value;
+            expect(yarn_environment_refusal(explicit_override.environment,2).empty() ==
+                (item.item != qpf2k::Item::sched),
+                "explicit overrides use the same rotary classification");
+        }
+    }
+    expect(yarn_environment_path(static_cast<qpf2k::Item>(999U)) == YarnEnvironmentPath::uncovered_rotary,
+        "new rotary items fail closed until audited");
+    auto uncovered = request;
+    uncovered.environment["STRIX_MOCK_UNCOVERED_ROTARY"] = "1";
+    unsigned callbacks = 0;
+    auto observed = memory;
+    observed.verify_ple_credit = [&](const Options&) { ++callbacks; return 0U; };
+    observed.estimate = [&](const Options&) { ++callbacks; return PrefillRequirements{}; };
+    for (const auto* schedule : {"0","8","13","16","12"}) {
+        auto scheduled = request;
+        scheduled.options.tokens.resize(299000U,1U);
+        scheduled.environment["STRIX_QPF2K_SCHED"] = schedule;
+        callbacks = 0;
+        const auto planned = resolve(scheduled,observed);
+        if (std::string_view(schedule) != "12")
+            expect(planned.error.find("STRIX_QPF2K_SCHED") != std::string::npos &&
+                callbacks == 0U && planned.admission.empty(), "YaRN schedule refuses before reclaim and estimation");
+        else {
+            const auto admitted = resolve(scheduled,memory);
+            expect(admitted.admitted && admitted.options.known_prefix_tail_rows ==
+                std::vector<std::uint32_t>{64U,16U}, "YaRN schedule 12 admits the cursor owner ladder");
+        }
+        auto native = scheduled;
+        native.options.rotary = RotaryDescriptor::native();
+        native.options.context_tokens = 8192U;
+        native.options.tokens.resize(4096U);
+        const auto native_plan = resolve_effective_config(native,ModelContract::qwen38_flash_next(),
+            info,manifest,validated_model_content_identity,{true,true,true},memory);
+        expect(native_plan.environment.at("STRIX_QPF2K_SCHED") == schedule &&
+            native_plan.error.find("YaRN") == std::string::npos, "native schedule remains unchanged");
+    }
+    callbacks = 0;
+    auto defaults_off = request;
+    defaults_off.environment["STRIX_QPF2K_DEFAULTS"] = "0";
+    expect(resolve(defaults_off,observed).error.find("STRIX_QPF2K_SCHED") != std::string::npos && callbacks == 0U,
+        "YaRN unset schedule with injection disabled refuses before callbacks");
+    const auto rejected = resolve(uncovered,observed);
+    expect(rejected.error == "YaRN execution environment not supported: STRIX_MOCK_UNCOVERED_ROTARY" &&
+        callbacks == 0U && rejected.admission.empty(), "uncovered rotary refuses by name before admission");
+    auto config = resolve(request,memory);
+    expect(config.admitted && config.options.context_tokens == 300000U && config.options.known_prefix_prefill_rows == 8192U,
+        "YaRN fits without shrinking context");
+    expect(config.admission.at("host_reserve_bytes") == 8U*gib_bytes && config.ple_reclaim_credit == 0U,
+        "YaRN reserve and zero unverified credit");
+    expect(effective_config_json(config).find("admission") != std::string::npos &&
+        effective_config_json(config).find("table_sha256") != std::string::npos,"YaRN inspection resolved identity and owners");
+    auto large = memory;
+    const auto estimate = memory.estimate;
+    large.estimate = [=](const Options& o) { auto value = estimate(o); value.model_backing = 110U*gib_bytes; return value; };
+    config = resolve(request,large);
+    expect(!config.admitted && config.error.find("owner_model_backing_bytes") != std::string::npos &&
+        config.error.find("verified_ple_credit_bytes=0") != std::string::npos &&
+        config.error.find("smallest_T_tried=2048") != std::string::npos,"YaRN refusal lists owners credit limits and smallest T");
+    expect(config.tile_fallback == "T8192:insufficient-memory,T4096:insufficient-memory,T2048:insufficient-memory",
+        "YaRN fallback order");
+    bool execution = false;
+    try { require_effective_prefill_execution(config); execution = true; } catch (const std::invalid_argument&) {}
+    expect(!execution,"YaRN refuses before any execution/allocation callback");
+    large.verify_ple_credit = [](const Options&) { return 16U*gib_bytes; };
+    expect(resolve(request,large).admitted,"YaRN verified PLE credit admits");
+    auto failed_drop = large;
+    unsigned estimates_after_drop_failure = 0;
+    failed_drop.verify_ple_credit = [](const Options&) -> std::uint64_t { throw std::runtime_error("required drop not verified"); };
+    failed_drop.estimate = [&](const Options&) { ++estimates_after_drop_failure; return PrefillRequirements{}; };
+    expect(resolve(request,failed_drop).error.find("required drop not verified") != std::string::npos && !estimates_after_drop_failure,
+        "YaRN required reclaim failure refuses before candidate growth or device setup");
+    large.available = gib_bytes;
+    expect(!resolve(request,large).admitted,"YaRN credit never inflates available headroom");
+    auto fallback = memory;
+    std::vector<std::uint32_t> trials;
+    fallback.estimate = [&](const Options& o) { trials.push_back(o.known_prefix_prefill_rows); auto value = estimate(o);
+        if (o.known_prefix_prefill_rows > 2048U) value.workspace = 9U*gib_bytes;
+        return value; };
+    config = resolve(request,fallback);
+    expect(config.admitted && trials == std::vector<std::uint32_t>{8192U,4096U,2048U} &&
+        config.options.prefill_numerical_profile == DecodeNumericalProfile::fast_prefill_f16wmma_v1,
+        "YaRN T fallback keeps numerical lineage");
+    auto reserve = memory;
+    reserve.estimate = [=](const Options& o) { auto value = estimate(o); value.model_backing = 103U*gib_bytes; return value; };
+    expect(!resolve(request,reserve).admitted,"YaRN eight GiB reserve honored");
+    for (unsigned route = 0; route < 4; ++route) {
+        auto bad = request;
+        const char* reason = nullptr;
+        if (route == 0) { bad.options.mtp.enabled = true; reason = "YaRN with MTP not yet qualified"; }
+        if (route == 1) { bad.options.http_serve = true; reason = "YaRN on HTTP serving not supported"; }
+        if (route == 2) { bad.options.teacher_forced_score = true; reason = "YaRN with teacher scoring not yet qualified"; }
+        if (route == 3) { bad.options.gdn_islands = true; reason = "YaRN graph capture path not yet qualified"; }
+        expect(resolve(bad,memory).error == reason,"YaRN named route refusal");
+    }
+    {
+        auto unknown = request; unknown.environment["STRIX_QPF2K_SHADOW_MAX_TOKENS"] = "300000";
+        expect(resolve(unknown,memory).error.find("YaRN execution environment not supported") != std::string::npos,
+            "YaRN unbounded alternate launcher controls refuse");
+        expect(effective_prefill_argv(config.options)[2] == "--rope-yarn","YaRN receipt argv retains explicit opt-in");
+    }
+    auto overflow = memory;
+    overflow.estimate = [=](const Options& o) { auto value = estimate(o); value.model_backing = UINT64_MAX; return value; };
+    expect(resolve(request,overflow).error.find("overflow") != std::string::npos,"YaRN checked owner sum");
+    bool multiplied = false;
+    try { (void)prefill_checked_mul(UINT64_MAX,2U); } catch (const std::overflow_error&) { multiplied = true; }
+    expect(multiplied,"YaRN checked width product");
+    auto boundary = request; boundary.options.tokens.resize(300000U,1U);
+    expect(resolve(boundary,memory).error.find("prompt + generation") != std::string::npos,"YaRN positions are below capacity");
 }
 void long_context_admission_tests(const RequestedOptions& original, const ModelContract& model,
     const gguf::FileInfo& info, ModelManifest manifest, const PrefillCapabilities& capabilities) {
@@ -60,25 +317,25 @@ void long_context_admission_tests(const RequestedOptions& original, const ModelC
     table.residency = ResidencyPolicy::file_backed_candidate;
     table.ggml_type = 20U;
     table.dimensions = {160U,contract.minimum_table_rows};
-    table.absolute_offset = 4U*gib + 32U;
+    table.absolute_offset = 4U*gib_bytes + 32U;
     table.byte_size = table.dimensions[1] * 90U;
     manifest.tensors.push_back(table);
     manifest.layout_identity = model_manifest_layout_identity(manifest);
     auto observed = ample_memory();
     observed.available = UINT64_C(127800000000);
-    observed.gtt_limit = 128U*gib;
-    observed.gtt_used = 2U*gib;
+    observed.gtt_limit = 128U*gib_bytes;
+    observed.gtt_used = 2U*gib_bytes;
     observed.ple_reclaim_page = 4096U;
     observed.estimate = [](const Options& options) {
         auto required = PrefillRequirements{};
-        required.model_backing = 96U*gib;
+        required.model_backing = 96U*gib_bytes;
         required.state_d1 = options.context_tokens * 120U*1024U;
-        required.serial_scratch = gib;
-        required.workspace = options.known_prefix_prefill_rows * (gib / 2048U);
-        required.metadata = gib / 2U;
-        required.runtime_payload = gib / 8U;
-        required.device_base = 40U*gib;
-        required.tails = static_cast<std::uint64_t>(options.known_prefix_tail_rows.size()) * (gib / 16U);
+        required.serial_scratch = gib_bytes;
+        required.workspace = options.known_prefix_prefill_rows * (gib_bytes / 2048U);
+        required.metadata = gib_bytes / 2U;
+        required.runtime_payload = gib_bytes / 8U;
+        required.device_base = 40U*gib_bytes;
+        required.tails = static_cast<std::uint64_t>(options.known_prefix_tail_rows.size()) * (gib_bytes / 16U);
         return required;
     };
     const auto resolve = [&](const RequestedOptions& request, const PrefillMemory& memory) {
@@ -136,7 +393,7 @@ void long_context_admission_tests(const RequestedOptions& original, const ModelC
         const auto config = resolve(request,observed);
         const auto expected_context = std::min(model.max_position_embeddings, static_cast<std::uint64_t>(n) + 512U);
         expect(config.admitted && config.options.known_prefix_prefill_rows == 8192U &&
-            config.options.context_tokens == expected_context && config.ple_reclaim_credit > 24U*gib,
+            config.options.context_tokens == expected_context && config.ple_reclaim_credit > 24U*gib_bytes,
             "long_context_l1_T8192: 128K/192K/262143 admit with observed memory and prompt-specific L1 credit");
         const auto text = effective_config_json(config);
         expect(text.find("\"ple_reclaim_credit_bytes\":" + std::to_string(config.ple_reclaim_credit)) != std::string::npos,
@@ -150,7 +407,7 @@ void long_context_admission_tests(const RequestedOptions& original, const ModelC
     const auto estimate = observed.estimate;
     for (const auto chosen : {4096U,2048U,0U}) {
         auto tight = observed;
-        tight.gtt_limit = 2U*gib + 40U*gib + (chosen == 4096U ? 3U*gib : chosen == 2048U ? 2U*gib : gib / 2U);
+        tight.gtt_limit = 2U*gib_bytes + 40U*gib_bytes + (chosen == 4096U ? 3U*gib_bytes : chosen == 2048U ? 2U*gib_bytes : gib_bytes / 2U);
         std::vector<std::uint32_t> attempts;
         tight.estimate = [&](const Options& candidate) {
             attempts.push_back(candidate.known_prefix_prefill_rows);
@@ -180,14 +437,14 @@ void long_context_admission_tests(const RequestedOptions& original, const ModelC
     }
     for (const auto chosen : {4096U,2048U}) {
         auto tight = observed;
-        tight.available = 100U*gib;
+        tight.available = 100U*gib_bytes;
         const auto total = *tight.available;
         const auto credit = prefill_reclaim_credit(resolve(request,observed).options,model,manifest,{},tight.ple_reclaim_page);
         tight.estimate = [&](const Options& candidate) {
             auto required = estimate(candidate);
             const auto other = required.state_d1 + required.serial_scratch + required.metadata + required.runtime_payload +
                 required.tails + candidate.known_prefill_host_headroom;
-            const auto allowed_workspace = chosen == 4096U ? 3U*gib : gib + gib / 2U;
+            const auto allowed_workspace = chosen == 4096U ? 3U*gib_bytes : gib_bytes + gib_bytes / 2U;
             required.model_backing = total + credit - other - allowed_workspace;
             return required;
         };
@@ -251,8 +508,8 @@ void long_context_admission_tests(const RequestedOptions& original, const ModelC
         expect(credit(admitted.options,{{"STRIX_PLE_RECLAIMABLE","1"}},manifest) == admitted.ple_reclaim_credit &&
             credit(admitted.options,{{"STRIX_PLE_RECLAIMABLE","auto"}},manifest) == admitted.ple_reclaim_credit,
             "long_context_reclaim_auto_required: auto and required use identical accounting");
-        const auto raised = credit(admitted.options,{{"STRIX_PLE_RECLAIM_DECODE_BYTES",std::to_string(gib)}},manifest);
-        expect(admitted.ple_reclaim_credit - raised == gib - (256U << 20U),
+        const auto raised = credit(admitted.options,{{"STRIX_PLE_RECLAIM_DECODE_BYTES",std::to_string(gib_bytes)}},manifest);
+        expect(admitted.ple_reclaim_credit - raised == gib_bytes - (256U << 20U),
             "long_context_reclaim_decode_allowance: explicit allowance only reduces credit");
         auto pinned = manifest;
         auto overlap = table;
@@ -310,6 +567,7 @@ int main(int argc, char** arguments) {
     manifest.tensors.back().name = "output_hc_up.weight";
     manifest.tensors.back().layer.reset();
     manifest.layout_identity = model_manifest_layout_identity(manifest);
+    yarn_admission_tests(info,manifest);
     const PrefillCapabilities capabilities{true,true,true};
     auto memory = ample_memory();
     const auto fixture_requirements = memory.estimate;
@@ -398,6 +656,8 @@ int main(int argc, char** arguments) {
     expect(automatic.options.known_prefix_tail_rows.empty() && automatic.options.known_prefix_ladder_tail_rows ==
         std::vector<std::uint32_t>({1024U,256U,64U,16U}), "SCHED=12 retains configured ladder and prunes unused owners");
     const auto json = effective_config_json(automatic);
+    expect(json.starts_with("{\"rotary\":{\"rope_mode\":\"native\",\"factor\":0,"),
+        "effective-config inspection golden deliberately includes native rotary status; numerical identity unchanged");
     if (argc == 2 && std::string_view(arguments[1]) == "--dump-fixture-config") { std::cout << json; return 0; }
     expect(json == effective_config_json(resolve(request,memory)) && json.find("MODEL") == std::string::npos &&
         json.find("\"source\":\"automatic\"") != std::string::npos && !automatic.host_compilation.empty(), "dry-run JSON is deterministic, path-free and reports provenance");
@@ -611,7 +871,7 @@ int main(int argc, char** arguments) {
     expect(rejected_baseline, "baseline has no exemption from historical dense-A8 submission prerequisites");
     auto missing = memory; missing.available.reset();
     expect(resolve(request,missing).reason == "memory-observation-unavailable", "missing memory observation cannot assume capacity");
-    auto small = memory; small.available = 16U*gib;
+    auto small = memory; small.available = 16U*gib_bytes;
     const auto declined = resolve(request,small);
     historical_equal(request,declined);
     const auto notice = effective_config_notice(declined);

@@ -76,12 +76,14 @@ public:
     // from next_source_position()); next_tokens[i] is the target input after hidden row i. No
     // ticket chain exists for these rows: the next cycle starts without a primed predecessor ticket.
     void prime_hidden_rows(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,
-        std::span<const MtpDeviceView> hidden,std::span<const std::uint32_t> next_tokens);
+        std::span<const MtpDeviceView> hidden,std::span<const std::uint32_t> next_tokens,
+    const RotaryIdentity& producer_rotary);
     // The same rows in two phases (prime_hidden_rows = submit + complete): submit enqueues every row on the
     // MTP stream and returns without waiting (false: no rows, nothing pending); until complete, the caller keeps
     // the hidden rows alive and unchanged and calls no other runtime operation (each requires an idle owner).
     [[nodiscard]] bool prime_hidden_rows_submit(const QualifiedMtpDraftPlan&,const ActivatedMtpDraftPlan&,
-        std::span<const MtpDeviceView> hidden,std::span<const std::uint32_t> next_tokens);
+        std::span<const MtpDeviceView> hidden,std::span<const std::uint32_t> next_tokens,
+    const RotaryIdentity& producer_rotary);
     void prime_hidden_rows_complete();
     [[nodiscard]] bool prime_hidden_rows_pending() const noexcept;
     // Prefix state cache: the caller wrote durable cache rows [0, source) back into this fresh idle

@@ -12,6 +12,9 @@ struct Qpf2kStageSlot {
     hipEvent_t done = nullptr;
     bool pending = false;
 };
+static_assert(sizeof(qsa_index::NormGroupViews<64U>) + sizeof(QsaRowsStoreViews<64U>) +
+    sizeof(qsa_flash::ScoreGroup<64U>) + sizeof(uint2) <= 20480U,
+    "YaRN admission descriptor bound must track stage slot payloads");
 struct Qpf2kStageBatch {
     Qpf2kStageSlot* slot = nullptr;
     Qpf2kStageBatch() = default;
@@ -26,6 +29,17 @@ struct Qpf2kStageBatch {
         }
     }
 };
+qsa_index::NormGroupViews<64U> prepare_qpf2k_norm_rows(
+    const std::vector<QsaKnownRows<8U>>& tiles, std::uint32_t group) {
+    qsa_index::NormGroupViews<64U> n{};
+    for (unsigned r=0;r<64U;++r) {
+        const auto& tile=tiles.at(static_cast<std::size_t>(group)*8U+r/8U);
+        const auto& w=tile.row[r%8U].workspace;
+        n.position[r]=tile.position[r%8U];
+        n.values[0][r]=w.index_query; n.values[1][r]=w.q_gate; n.values[2][r]=w.current_k;
+    }
+    return n;
+}
 bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
     const HipIndexedAttentionLauncherConfig& config, QsaPrefillPool* pool, Qpf2kStageBatch& batch) {
     constexpr std::size_t MaxGroups = 128U;
@@ -58,6 +72,7 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
         config.model.attention_kv_storage != AttentionKvStorage::bf16 || !pool || !pool->keys)
         return decline();
     const auto& model = config.model;
+    bind_qwen_pool(pool, model);
     const auto& a = tiles[0].row[0];
     const auto& tensors = a.tensors;
     const auto rotary = checked_u32(model.rotary_dim(), "rotary_dim");
@@ -65,8 +80,6 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
         rotary > a.index_dim || rotary > a.head_dim)
         return decline();
     const std::array<const TensorPair*, 3> norm_tensors{&tensors.index_q_norm, &tensors.q_norm, &tensors.k_norm};
-    const std::array<float* WorkspacePointers::*, 3> targets{&WorkspacePointers::index_query,
-        &WorkspacePointers::q_gate, &WorkspacePointers::current_k};
     const std::array<std::uint32_t, 3> dims{a.index_dim, a.head_dim, a.head_dim},
         strides{a.index_dim, 2U * a.head_dim, a.head_dim};
     const auto type = norm_tensors[0]->manifest->ggml_type;
@@ -92,6 +105,7 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
     if (!ratio) return decline();
     for (std::uint32_t g = 0; g < groups; ++g) {
         auto& n = norms[g]; auto& st = stores[g]; auto& sc = scores[g];
+        n = prepare_qpf2k_norm_rows(tiles,g);
         bool skip_query = qsa_skip_index_q_enabled();
         for (unsigned r = 0; r < 64U; ++r) {
             const auto& tile = tiles[static_cast<std::size_t>(g) * 8U + r / 8U];
@@ -113,8 +127,7 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
                 if ((row.tensors.*member).runtime != (tensors.*member).runtime ||
                     (row.tensors.*member).manifest != (tensors.*member).manifest) return decline();
             skip_query = skip_query && sel.complete_blocks <= sel.block_topk;
-            n.position[r] = st.position[r] = position;
-            for (unsigned s = 0; s < 3U; ++s) n.values[s][r] = row.workspace.*targets[s];
+            st.position[r] = position;
             st.index_key[r] = row.workspace.current_index_key;
             st.k[r] = row.workspace.current_k; st.v[r] = row.workspace.current_v;
             sc.views.index_query[r] = row.workspace.index_query;
@@ -177,8 +190,10 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
     }
     batch.slot = &slot; // arm lifetime protection before submitting any descriptor reader
     next = (next + 1U) % ring.size();
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rope_table_kernel<64U, true>), dim3(64U, groups), dim3(64), 0, stream,
-        qsa_index::NormGroupViews<64U>{}, rotary, model.rope_theta, slot.norms);
+    with_qwen_rotary(model, stream, [&](auto... rotary_source) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rope_table_kernel<64U, true, decltype(rotary_source)...>), dim3(64U, groups), dim3(64), 0, stream,
+            qsa_index::NormGroupViews<64U>{}, rotary, model.rope_theta, slot.norms, rotary_source...);
+    });
     dispatch_small_kind(type, [&](auto kind) {
         if (wave_norm)
             hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::norm_rope_wave_kernel<decltype(kind)::value, 64U, true>),
@@ -198,11 +213,13 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
     if (max_new) {
         const auto total_new = valid - pool->valid;
         dispatch_small_kind(tensors.index_k_norm.manifest->ggml_type, [&](auto kind) {
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<decltype(kind)::value, true>), dim3(total_new),
-                dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream,
-                reinterpret_cast<const std::uint16_t*>(a.raw_state.address), pool->valid, a.index_dim, ratio,
-                reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address), model.rms_norm_epsilon, rotary,
-                model.rope_theta, pool->keys, slot.bounds, groups, pool->packed);
+            with_qwen_rotary(model, stream, [&](auto... rotary_source) {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<decltype(kind)::value, true, decltype(rotary_source)...>), dim3(total_new),
+                    dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream,
+                    reinterpret_cast<const std::uint16_t*>(a.raw_state.address), pool->valid, a.index_dim, ratio,
+                    reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address), model.rms_norm_epsilon, rotary,
+                    model.rope_theta, pool->keys, slot.bounds, groups, pool->packed, rotary_source...);
+            });
         });
         check_hip(hipGetLastError(), "QSA stage batch pool launch");
         hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<true>), dim3((total_new + 255U) / 256U),

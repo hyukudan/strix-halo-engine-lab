@@ -71,7 +71,7 @@ public:
         const ModelContract&,const CompiledMtpDraftPlan&,
         const ModelManifest& sidecar_manifest,std::shared_ptr<const HipModelResidency> sidecar,
         const ModelManifest& target_manifest,std::shared_ptr<const HipModelResidency> target,
-        const MtpSharedTargetBinding&,HipMtpBudget,std::shared_ptr<HipRuntimeAllocator>);
+        const MtpSharedTargetBinding&,HipMtpBudget,std::shared_ptr<HipRuntimeAllocator>,const RotaryIdentity& target_rotary);
     ~HipMtpResources();
     HipMtpResources(const HipMtpResources&)=delete;
     HipMtpResources& operator=(const HipMtpResources&)=delete;

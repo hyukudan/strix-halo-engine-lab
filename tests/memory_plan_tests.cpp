@@ -46,6 +46,13 @@ int main() {
     expect(plan.mtp_draft_state == 61'440,
            "memory plan accounts one bounded MTP draft state per session");
 
+    for (const auto capacity : {0ULL,524288ULL}) {
+        auto historical = request; historical.context_tokens = capacity;
+        const auto estimate = strix::build_memory_plan(model,historical);
+        expect(estimate.base_kv == strix::base_kv_bytes_per_token(model)*capacity*request.sessions,
+            "native estimator retains zero and above-model sizing");
+    }
+
     auto without = request;
     without.include_mtp_draft_state = false;
     const auto no_draft_state =

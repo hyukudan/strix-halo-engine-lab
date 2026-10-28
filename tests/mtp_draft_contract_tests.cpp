@@ -1,4 +1,6 @@
+#include "rotary_mock.hpp"
 #include "strix/mtp_draft_contract.hpp"
+#include "strix/rotary_descriptor.hpp"
 
 #include <iostream>
 #include <stdexcept>
@@ -42,6 +44,25 @@ int main() {
             model,
             mtp_binding);
 
+    auto rotary_model = model;
+    auto previous = contract.contract_identity;
+    for (auto factor : {2U, 4U}) {
+        rotary_model.qwen_rotary_table = mock_rotary(factor);
+        const auto other = strix::build_mtp_draft_structural_contract(rotary_model, binding());
+        expect(other.contract_identity != previous && other.contract_identity != contract.contract_identity,
+            "same-shape native/2/4 MTP contract identities differ");
+        bool refused = false;
+        try { strix::validate_mtp_draft_structural_contract(rotary_model, binding(), contract); }
+        catch (const std::invalid_argument&) { refused = true; }
+        expect(refused, "target/draft rotary mismatch refuses in CPU preflight");
+        previous = other.contract_identity;
+    }
+
+    // Captured by running the unmodified identity function at 0d792e11.
+    expect(contract.contract_identity == 5973953797292022012ULL &&
+               strix::append_rotary_identity(contract.contract_identity, strix::RotaryDescriptor::native()) ==
+                   5973953797292022012ULL,
+           "native MTP identity retains its original eight bytes with no rotary payload");
     expect(contract.num_hidden_layers == 1 &&
                contract.full_attention_layers == 1,
            "MTP contract pins one full-attention predictor layer");

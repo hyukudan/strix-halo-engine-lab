@@ -18,6 +18,7 @@
 namespace strix {
 
 struct CompiledSerialExecution {
+    std::shared_ptr<const HipQwenRotaryTable> rotary_table = nullptr;
     SerialExecutionPlan execution;
     ExecutionBindingPlan bindings;
     SerialExecutionIoPlan io;

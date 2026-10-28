@@ -138,7 +138,16 @@ void export_mtp_target_inputs(const decode_cli::Options& o,const ModelContract& 
     std::uint32_t next_token=0;
     for(std::uint64_t row=0;row<rows;++row){
         const auto token=row<o.tokens.size()?o.tokens[static_cast<std::size_t>(row)]:next_token;
-        const auto ticket=target->execute_serial(session,resources,dispatcher,token);const auto view=ticket.view();
+        const auto ticket=target->execute_serial(session,resources,dispatcher,token);
+        for(unsigned factor:{0U,2U,4U}) {
+            ModelContentIdentity digest;digest.bytes.fill(0x51U);
+            const auto reader=factor?RotaryIdentity(RotaryDescriptor::yarn(factor),digest):RotaryIdentity{};
+            bool refused=false;
+            try {ticket.admit_rotary_reader(reader);}catch(const std::invalid_argument&){refused=true;}
+            require(refused==(reader!=ticket.producer_rotary_identity()),"real target ticket rotary admission cross-product");
+        }
+        ticket.admit_rotary_reader(model.rotary_identity());
+        const auto view=ticket.view();
         if(hipMemcpyAsync(hidden.data(),reinterpret_cast<const void*>(view.address),static_cast<std::size_t>(view.bytes),hipMemcpyDeviceToHost,stream)!=hipSuccess ||
            hipStreamSynchronize(stream)!=hipSuccess)throw std::runtime_error("target input snapshot readback failed");
         target->guard()->require_original();word(ticket.source_position(),8);word(ticket.input_token(),4);word(ticket.predicted_token(),4);

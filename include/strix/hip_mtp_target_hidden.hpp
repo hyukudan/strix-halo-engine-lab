@@ -29,6 +29,8 @@ public:
     [[nodiscard]] std::uint32_t predicted_token() const;
     [[nodiscard]] const SerialSessionContext& committed_session() const;
     [[nodiscard]] ModelContentIdentity target_content_identity() const;
+    [[nodiscard]] RotaryIdentity producer_rotary_identity() const;
+    void admit_rotary_reader(const RotaryIdentity&) const;
     // STRIX_SERIAL_LOGITS_DIGEST=1: the serial row's FP32 logits digest (else empty; window and block rows: empty).
     [[nodiscard]] std::optional<ModelContentIdentity> serial_logits_digest() const;
     // Execution identity of the serial execution that produced this row (a window ticket
@@ -117,7 +119,7 @@ public:
     // first-max rule. The caller guarantees both come from that completed block (the tiled
     // prefill computes every row exactly as a serial row of the same execution).
     [[nodiscard]] HipMtpTargetHiddenTicket adopt_prefill_row(const SerialSessionContext& session,
-        std::uint32_t input_token,MtpDeviceView hidden,std::span<const float> logits,
+        std::uint32_t input_token,MtpDeviceView hidden,std::span<const float> logits,const RotaryIdentity& producer_rotary,
         const HipMtpHostRowSelector& host_selector={});
     [[nodiscard]] HipMtpTargetHiddenTicket hand_off_prompt(SerialSessionContext&,
         const HipMtpTargetHiddenTicket& pending,const ExecutionRuntimeResources& prompt_resources,

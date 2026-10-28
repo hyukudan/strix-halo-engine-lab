@@ -68,7 +68,9 @@ readers and both ranks as needed, verify tokens/digests first, then compare medi
 Do not add individual gains from different workloads or call a changed numerical identity bit-identical.
 Qwen long-context answers are checked with `tools/qualification/longctx_fidelity/` (generator ground truth,
 CPU tests first; its README states what a pilot does and does not establish). Keep comparative-runtime
-reference results out of that public kit.
+reference results out of that public kit. Qwen YaRN (`--rope-yarn`) is an explicit experimental mode: never a
+default, never combined with exactness claims against native; new resolver defaults must be classified for rotary
+work in `apps/qwen_yarn_admission.inc` before YaRN accepts them.
 Kernel/IOMMU settings (including the optional GPU PerfOpt, `amdgpu.iommu_perfopt`) are host decisions made
 by the machine owner as root; record the running kernel and that parameter with any timing receipt, never
 disable the IOMMU to gain speed (USB4 controllers must stay translated), and compare PerfOpt only on vs off

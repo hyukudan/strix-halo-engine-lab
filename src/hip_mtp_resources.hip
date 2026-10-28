@@ -1,4 +1,5 @@
 #include "strix/hip_mtp_resources.hpp"
+#include "strix/hip_qwen_rotary_table.hpp"
 #include "strix/mtp_sidecar_binding.hpp"
 #include "strix/hip_generation_output.hpp"
 #include "strix/hip_launch_context.hpp"
@@ -104,7 +105,11 @@ HipMtpResources::~HipMtpResources()=default;
 std::shared_ptr<HipMtpResources> HipMtpResources::create(const ModelContract& model,const CompiledMtpDraftPlan& plan,
     const ModelManifest& sidecar_manifest,std::shared_ptr<const HipModelResidency> sidecar,
     const ModelManifest& target_manifest,std::shared_ptr<const HipModelResidency> target,
-    const MtpSharedTargetBinding& shared,HipMtpBudget budget,std::shared_ptr<HipRuntimeAllocator> allocator) {
+    const MtpSharedTargetBinding& shared,HipMtpBudget budget,std::shared_ptr<HipRuntimeAllocator> allocator,
+    const RotaryIdentity& target_rotary) {
+    require_rotary_producer_identity(target_rotary,model.rotary_identity());
+    require_qwen_rotary_device_payload(model.rotary_identity(),model.qwen_rotary_table.get());
+    if(model.qwen_rotary_table) validate_qwen_rotary_reader(*model.qwen_rotary_table,nullptr);
     require(!current_hip_launch_context(),"MTP setup cannot nest an active HIP scope");
     require(model.validate().empty() && model.mtp_full_attention_layers==1U,"MTP native owner requires one explicit sidecar attention layer");
     require(model.hidden_size<=4096U && model.hidden_size%32U==0U && (model.hc_count==2U || model.hc_count==4U) &&

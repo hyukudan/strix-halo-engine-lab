@@ -10,6 +10,30 @@
 #include "strix/lane_chain_hyper_output.hpp"
 
 namespace strix::decode_cli {
+// Shared CLI/admission tensor checks, before any device allocation.
+inline void validate_prompt_tensor_contract(const Options& options, const ModelManifest& manifest,
+    const CompiledSerialExecution& compiled, const ExecutionTensorAccessPlan& access_plan) {
+    if (numerical_profile_hc_splitk(options.numerical_profile)) {
+        const auto require_hc_tensor = [&](std::uint32_t step, std::uint32_t slot,
+            std::uint32_t type, std::vector<std::uint64_t> dimensions, std::uint64_t bytes) {
+            const auto* access = strix::find_execution_tensor_access(access_plan, step, slot);
+            if (!access || access->tensor_indices.size() != 1U || access->tensor_indices[0] >= manifest.tensors.size())
+                throw std::invalid_argument("HC numerical profile requires complete canonical tensor access before allocation");
+            const auto& tensor = manifest.tensors[access->tensor_indices[0]];
+            if (tensor.ggml_type != type || tensor.dimensions != dimensions || tensor.byte_size != bytes)
+                throw std::invalid_argument("HC numerical profile tensor format, shape or extent differs before allocation");
+        };
+        for (const auto& step : compiled.execution.steps) {
+            if (step.op != strix::SerialOp::attn_hyper_mix && step.op != strix::SerialOp::mlp_hyper_mix &&
+                step.op != strix::SerialOp::final_hyper_mix) continue;
+            require_hc_tensor(step.id, 0U, 0U, {10240U}, 40960U);
+            require_hc_tensor(step.id, 1U, 8U, {10240U,320U}, 3481600U);
+            require_hc_tensor(step.id, 2U, 8U, {320U,10240U}, 3481600U);
+            if (step.op != strix::SerialOp::final_hyper_mix)
+                require_hc_tensor(step.id, 3U, 0U, {10240U,4U}, 163840U);
+        }
+    }
+}
 struct PromptCompilerRequests {
     ExecutionBindingRequest binding;
     ExecutionBufferRequest buffers;

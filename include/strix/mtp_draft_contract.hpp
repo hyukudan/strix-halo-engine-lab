@@ -20,6 +20,7 @@ struct MtpDraftStructuralContract {
     std::uint64_t head_dim = 0;
     std::uint64_t rotary_dim = 0;
     float rope_theta = 0.0F;
+    RotaryIdentity rotary;
 
     bool uses_dedicated_embeddings = false;
     bool hidden_state_source_layer_explicit = false;

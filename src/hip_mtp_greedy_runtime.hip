@@ -78,6 +78,7 @@ struct HipMtpGreedyRuntime::Impl {
         require(mtp && target && owner,"MTP greedy consumer requires retained actual owners");
         require_qualified_mtp_draft_plan(plan);
         const auto& p=mtp->resources();
+        require_rotary_producer_identity(target->model().rotary_identity(),p.model().rotary_identity());
         require(plan.native_arithmetic_profile_identity==mtp->numerical_profile_identity() &&
             activation.native_arithmetic_profile_identity==mtp->numerical_profile_identity(),
             "MTP greedy qualification/activation does not bind actual native arithmetic profile");
@@ -192,6 +193,7 @@ std::uint32_t HipMtpGreedyRuntime::draft_begin(const HipMtpTargetHiddenTicket& i
     auto& i=*impl_;require(!i.busy && !failed() && budget,"MTP greedy cycle requires idle healthy owner and nonzero budget");
     require(initial.valid() && session_matches(initial.committed_session(),*i.session),
         "MTP greedy cycle requires exact current committed target ticket");
+    initial.admit_rotary_reader(i.target->model().rotary_identity());
     require(initial.target_content_identity()==i.mtp->resources().shared_target().target_model_content_identity,
         "MTP greedy cycle target content differs from bound target");
     require(i.resources.session_state_layout && i.target->retained_rows()>=3,
@@ -553,6 +555,7 @@ std::vector<std::uint32_t> HipMtpGreedyRuntime::propose_wide(const HipMtpTargetH
         "MTP wide cycle requires an idle healthy greedy owner with the window verifier");
     require(initial.valid() && session_matches(initial.committed_session(),*i.session),
         "MTP wide cycle requires exact current committed target ticket");
+    initial.admit_rotary_reader(i.target->model().rotary_identity());
     require(forced.empty() || forced.size()+1U==rows,"MTP forced wide proposal must fill the wide rows");
     const auto pending=initial.predicted_token();
     if(budget<rows || std::find(eos.begin(),eos.end(),pending)!=eos.end() || !i.resources.session_state_layout ||
@@ -581,6 +584,8 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::finish_wide_cycle(const HipMtpTarge
     std::vector<std::uint32_t> emitted,std::uint32_t verified,std::uint32_t rows,std::uint32_t budget,
     std::span<const std::uint32_t> eos) {
     auto& i=*impl_;require(i.busy && !i.failed && i.wide_open,"MTP wide cycle finish requires a proposed wide cycle");
+    initial.admit_rotary_reader(i.target->model().rotary_identity());
+    final_target.admit_rotary_reader(i.target->model().rotary_identity());
     HipMtpGreedyCycleResult out;
     try {
         const auto n=emitted.size();
@@ -593,7 +598,7 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::finish_wide_cycle(const HipMtpTarge
             "MTP wide cycle committed a row whose input is not the preceding target selection");
         // Teacher rows (h_{p-1}, pending), (h_p, x_1), ..., (h_{p+k-1}, x_k): the predictor cache reaches the new ticket.
         require(i.mtp->next_source_position()==initial.source_position(),"MTP wide cycle predictor frontier differs");
-        i.mtp->prime_hidden_rows(i.plan,i.activation,hidden,inputs);
+        i.mtp->prime_hidden_rows(i.plan,i.activation,hidden,inputs,i.target->model().rotary_identity());
         require(i.mtp->next_source_position()==final_target.source_position(),"MTP wide cycle did not reach the new frontier");
         // The draft vocabulary observes the pending token and the outputs, as begin_cycle and reconciliation do.
         if(i.mtp->draft_head()) {i.mtp->observe_draft_context(inputs.first(1));i.mtp->observe_draft_context(emitted);}

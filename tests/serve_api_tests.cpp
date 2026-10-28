@@ -1,3 +1,4 @@
+#include "../apps/qwen_rotary_capabilities.hpp"
 // HTTP API contract tests with a scripted engine (no GPU): OpenAI chat/completions (plain and
 // SSE), tool calls, stop strings, Anthropic messages (plain and events), errors and API keys,
 // two concurrent clients through the FIFO queue, and cancellation when a client disconnects.
@@ -617,7 +618,10 @@ int main() try {
     auto progress_off_config = config; progress_off_config.sse_progress_seconds = 0;
     ApiService progress_off_api(progress_off_config, tokenizer, queue, engine.context_tokens(), false);
     auto sample_config = config; sample_config.sampling_policy = "sample";
-    sample_config.capabilities_extra = [](Json& doc) { doc.set("engine_feature", Json(true)); };
+    sample_config.capabilities_extra = [](Json& doc) {
+        doc.set("engine_feature", Json(true));
+        strix::decode_cli::qwen_rotary_capabilities(doc);
+    };
     ApiService sample_api(sample_config, tokenizer, queue, engine.context_tokens(), true);
     auto defaults_config = sample_config;
     defaults_config.default_temperature = 0.7; defaults_config.default_top_k = 20;
@@ -1146,6 +1150,9 @@ int main() try {
         check(at(progress, "interval_seconds").as_double() == config.sse_progress_seconds && at(progress, "engine_reports").as_bool() && at(doc, "prefill_progress").as_bool(), "progress capability");
         const auto sampled = parse_json(http(port, "GET", "/v1/capabilities", "", auth + "X-Test-Config: sample\r\n").body);
         check(at(at(sampled, "sampling"), "sample").as_bool() && at(sampled, "engine_feature").as_bool() && at(sampled, "capabilities_id").as_string() != id, "sampling capabilities and engine hook");
+        check(at(sampled,"rotary").dump() ==
+            R"({"rope_mode":"native","scope":"server","yarn":{"supported":false,"scope":"CLI-only"}})",
+            "Qwen HTTP rotary capabilities declare native and CLI-only YaRN");
         const auto rejected = parse_json(http(port, "GET", "/v1/capabilities", "", auth + "X-Test-Config: reject\r\n").body);
         check(at(at(rejected, "sampling"), "positive_temperature").as_string() == "reject" && !at(at(rejected, "endpoints"), "responses").as_bool(), "reject policy and disabled endpoint capabilities");
         const auto before = engine.prompts().size();

@@ -1,4 +1,6 @@
 #pragma once
+#include "strix/rotary_descriptor.hpp"
+#include <iostream>
 #include "strix/decode_execution_options.hpp"
 #include "strix/known_prefill_limits.hpp"
 #include "strix/qpf2k_defaults.hpp"
@@ -232,7 +234,9 @@ inline bool mtp_sha256_text(std::string_view value) noexcept {
 }
 struct Options {
     bool baseline = false;
+    std::string suppressed_yarn_request;
     bool print_effective_config = false;
+    strix::RotaryDescriptor rotary = strix::RotaryDescriptor::native();
     bool automatic_prefill = false;
     bool route_owned = false;
     bool prefill_profile_automatic = false;
@@ -710,7 +714,7 @@ inline void validate_resolved_requested_logprobs(const Options& options, std::ui
         throw std::invalid_argument("requested logprobs require serial full-output generation without scalar, window, lookup, serving, cache, RAW or reference modes");
     if (!vocabulary || vocabulary > std::numeric_limits<std::uint32_t>::max())
         throw std::invalid_argument("requested logprobs require a uint32 vocabulary");
-    if (options.logprob_token_ids.size() > 64U || options.context_tokens > 262144U ||
+    if (options.logprob_token_ids.size() > 64U || options.context_tokens > options.rotary.effective_max() ||
         options.context_tokens > 1048576U / options.logprob_token_ids.size())
         throw std::invalid_argument("requested logprob receipt exceeds bounded row/value capacity");
     for (const auto id : options.logprob_token_ids)
@@ -734,7 +738,7 @@ inline void validate_teacher_forced_score(const Options& options) {
         (!teacher_forced_tiled(options) || options.known_prefix_output_policy != strix::KnownWindowOutputPolicy::all_rows))
         throw std::invalid_argument("teacher-forced score over a known prefix requires the tiled prefill "
             "(--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T) with the all-rows output policy");
-    if (options.generate_tokens != 1 || options.tokens.size() < 2 || options.tokens.size() > 262144U ||
+    if (options.generate_tokens != 1 || options.tokens.size() < 2 || options.tokens.size() > options.rotary.effective_max() ||
         options.execution.mode != DecodeExecutionMode::eager || options.execution.integer_head != DecodeIntegerHead::none ||
         !options.logprob_token_ids.empty() || options.gpu_greedy_token || options.mtp.enabled || options.mtp.supplied ||
         options.prompt_lookup || !options.serving_prefix_files.empty() || options.prefix_cache_roundtrip ||
@@ -1100,7 +1104,7 @@ inline void validate_resolved_qsa_gqa(const Options& options) {
     if (options.qsa_gqa_heads_per_block != 1 &&
         (!options.deferred_moe_status || options.execution.mode != strix::DecodeExecutionMode::eager ||
          options.execution.integer_head != strix::DecodeIntegerHead::none || options.prefix_cache_roundtrip ||
-         options.context_tokens > 262144))
+         options.context_tokens > options.rotary.effective_max()))
         throw std::invalid_argument("QSA grouped attention requires eager D1 without integer head or roundtrip and context<=262144");
 }
 
@@ -1309,6 +1313,23 @@ inline void validate_resolved_mtp_cli(const Options& o) {
         throw std::invalid_argument("MTP window expert union requires resolved A8, grouped Q5_1, slot-parallel down and D1");
 }
 
+inline std::string yarn_route_refusal(const Options& o) {
+    if (o.mtp.enabled || o.mtp.supplied || !o.mtp.cohort.empty()) return "YaRN with MTP not yet qualified";
+    if (o.http_serve || o.http_batch) return "YaRN on HTTP serving not supported";
+    if (o.teacher_forced_score) return "YaRN with teacher scoring not yet qualified";
+    if (o.execution.mode != DecodeExecutionMode::eager || o.gdn_islands || o.prepared_eager)
+        return "YaRN graph capture path not yet qualified";
+    if (o.attention_kv_storage != AttentionKvStorage::bf16) return "YaRN requires BF16 KV storage";
+    if (o.prompt_lookup || o.prefix_cache_roundtrip || !o.serving_prefix_files.empty() ||
+        !o.raw_recording_path.empty() || !o.validation_final_state_path.empty() || !o.reference_path.empty())
+        return "YaRN requires plain serial CLI without cache, replay or recording";
+    if (o.any_low_level_flag || o.route_owned || o.known_prefix_window || o.numerical_profile_explicit ||
+        o.prefill_numerical_profile || o.residency != HipModelResidencyMode::registered_file_mapping ||
+        o.execution.integer_head != DecodeIntegerHead::none || o.ple_cache_rows ||
+        !o.dense_q6p_pack_path.empty() || !o.dense_trellis_pack_path.empty())
+        return "YaRN explicit execution route not yet qualified";
+    return {};
+}
 inline Options parse_options(
     int argc,
     char** argv, bool defer_qpf2k_defaults = false) {
@@ -1333,6 +1354,9 @@ inline Options parse_options(
     }
 
     Options options;
+    std::optional<std::string> yarn_env, yarn_cli;
+    if (const char* value = std::getenv("STRIX_QWEN_ROPE_YARN"))
+        yarn_env = value;
     if (const char* value = std::getenv("STRIX_BASELINE")) options.baseline = std::string_view(value) == "1";
     options.model_path =
         argv[1];
@@ -1346,6 +1370,30 @@ inline Options parse_options(
             argv[index];
         if (argument.starts_with("--")) options.supplied_options.emplace(argument.substr(0, argument.find('=')));
         if (argument == "--baseline") { options.baseline = true; continue; }
+        if (argument == "--rope-yarn" || argument.starts_with("--rope-yarn=")) {
+            if (yarn_cli) throw std::invalid_argument("duplicate --rope-yarn");
+            const auto equal = argument.find('=');
+            const auto value = equal != std::string_view::npos ? argument.substr(equal + 1) :
+                (index + 1 < argc ? std::string_view(argv[++index]) : std::string_view{});
+            yarn_cli = value;
+            continue;
+        }
+        if (argument == "--prompt-ids") {
+            if (index + 1 >= argc || !options.tokens.empty())
+                throw std::invalid_argument("--prompt-ids requires one text file without positional token IDs");
+            std::ifstream input(argv[++index]);
+            if (!input) throw std::invalid_argument("--prompt-ids cannot read text file");
+            std::string token;
+            while (input >> token) {
+                if (options.tokens.size() == 1048576U || token.size() > 10U)
+                    throw std::invalid_argument("--prompt-ids exceeds bounded token capacity");
+                const auto value = parse_u64(token,"prompt token id");
+                if (value > UINT32_MAX) throw std::invalid_argument("prompt token id exceeds uint32");
+                options.tokens.push_back(static_cast<std::uint32_t>(value));
+            }
+            if (!input.eof() || options.tokens.empty()) throw std::invalid_argument("--prompt-ids invalid or empty text file");
+            continue;
+        }
         if (argument == "--print-effective-config") { options.print_effective_config = true; continue; }
         if (argument == "--known-prefix-window=0" || argument == "--known-prefix-full-rows=0" ||
             argument == "--known-prefix-expert-union=0" || argument == "--known-window-router-rows=0" ||
@@ -2600,6 +2648,30 @@ inline Options parse_options(
         throw std::invalid_argument("device queue trace requires --host-dispatch-telemetry");
     if (options.execution_telemetry_trace && !options.host_dispatch_telemetry)
         throw std::invalid_argument("execution telemetry trace requires host dispatch telemetry");
+    std::uint32_t yarn_factor = 0;
+    if (options.baseline) {
+        if (yarn_cli && *yarn_cli != "off") options.suppressed_yarn_request = "--rope-yarn=" + *yarn_cli;
+        if (yarn_env && *yarn_env != "off") {
+            if (!options.suppressed_yarn_request.empty()) options.suppressed_yarn_request += "; ";
+            options.suppressed_yarn_request += "STRIX_QWEN_ROPE_YARN=" + *yarn_env;
+        }
+    } else {
+        // Explicit CLI off overrides an inherited request, including its validation.
+        if (!yarn_cli || *yarn_cli != "off") {
+            const auto cli = yarn_cli ? strix::parse_qwen_rope_yarn(*yarn_cli) : 0U;
+            const auto env = yarn_env ? strix::parse_qwen_rope_yarn(*yarn_env) : 0U;
+            if (cli && env && cli != env)
+                throw std::invalid_argument("conflicting --rope-yarn and STRIX_QWEN_ROPE_YARN");
+            yarn_factor = yarn_cli ? cli : env;
+        }
+    }
+    options.rotary = strix::validate_qwen_rotary_request(yarn_factor,
+        options.context_explicit, options.context_tokens, options.baseline);
+    if (options.rotary.mode() == strix::RotaryMode::yarn) {
+        const auto reason = yarn_route_refusal(options);
+        if (!reason.empty()) throw std::invalid_argument(reason);
+        options.unqualified_context = true;
+    }
     if (options.context_tokens == 0) {
         throw std::invalid_argument(
             "context must be non-zero");

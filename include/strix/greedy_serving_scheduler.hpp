@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/rotary_descriptor.hpp"
 
 #include "strix/model_runtime_binding.hpp"
 #include "strix/serial_request.hpp"
@@ -19,6 +20,7 @@ struct ServingCompatibility {
     ModelContentIdentity model_content;
     std::uint64_t numerical_identity = 0;
     int device_ordinal = 0;
+    RotaryIdentity rotary{};
     friend bool operator==(const ServingCompatibility&, const ServingCompatibility&) = default;
 };
 struct GreedyServingPolicy {

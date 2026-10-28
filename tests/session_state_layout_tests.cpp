@@ -1,4 +1,6 @@
+#include "rotary_mock.hpp"
 #include "strix/session_state_layout.hpp"
+#include "strix/rotary_descriptor.hpp"
 
 #include "strix/memory_plan.hpp"
 
@@ -50,6 +52,26 @@ int main() {
         strix::build_serial_session_state_layout(
             model, request);
 
+    auto rotary_model = model;
+    auto previous = layout.layout_identity;
+    for (auto factor : {2U, 4U}) {
+        rotary_model.qwen_rotary_table = mock_rotary(factor);
+        const auto other = strix::build_serial_session_state_layout(rotary_model, request);
+        expect(other.layout_identity != previous && other.layout_identity != layout.layout_identity &&
+            other.device_total_bytes == layout.device_total_bytes,
+            "same capacity/bytes distinguish native/2/4 state envelopes");
+        bool refused = false;
+        try { strix::validate_serial_session_state_layout_identity(rotary_model, layout); }
+        catch (const std::invalid_argument&) { refused = true; }
+        expect(refused, "incompatible layout refuses without an allocator or importer");
+        previous = other.layout_identity;
+    }
+
+    // Captured by running the unmodified identity function at 0d792e11.
+    expect(layout.layout_identity == 16699253671626688724ULL &&
+               strix::append_rotary_identity(layout.layout_identity, strix::RotaryDescriptor::native()) ==
+                   16699253671626688724ULL,
+           "native session identity retains its original eight bytes with no rotary payload");
     expect(layout.layout_identity != 0,
            "session-state layout has a stable non-zero identity");
     expect(layout.allocations.size() == 7,

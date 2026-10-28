@@ -3995,7 +3995,7 @@ PreparedGdnLaunch prepare_gdn_launch(
         const auto* layout = context.resources && context.resources->session_state_layout
             ? context.resources->session_state_layout : context.session_state_layout;
         if (!layout || graph->context_tokens != layout->context_tokens ||
-            graph->context_tokens > config.model.max_position_embeddings) {
+            graph->context_tokens > config.model.effective_max_positions()) {
             throw std::invalid_argument("GDN graph context exceeds the model position limit");
         }
         GraphOperatorControlRequest request;
@@ -4633,7 +4633,7 @@ std::array<GdnKnownWindowRow, 2> prepare_gdn_known_window_rows(
             context.reads_state != states || context.writes_state != states)
             throw std::invalid_argument("GDN known-window R2 selected serial variant or state flags differ");
         if (context.position >= context.resources->session_state_layout->context_tokens ||
-            context.position >= model.max_position_embeddings)
+            context.position >= model.effective_max_positions())
             throw std::invalid_argument("GDN known-window R2 position exceeds capacity");
         // Validate whole supplied scratch views before workspace pointer arithmetic.
         if (context.reads.size() != 1U || context.writes.size() != 1U || context.temporaries.size() != 1U)
@@ -6930,6 +6930,7 @@ bool same_island_config(const HipGdnLauncherConfig& a, const HipGdnLauncherConfi
         a.model.indexer_kv_heads == b.model.indexer_kv_heads &&
         a.model.indexer_head_dim == b.model.indexer_head_dim &&
         a.model.indexer_budget == b.model.indexer_budget &&
+        same_rotary_model(a.model, b.model) &&
         a.model.indexer_compress_ratio == b.model.indexer_compress_ratio &&
         std::bit_cast<std::uint32_t>(a.model.partial_rotary_factor) == std::bit_cast<std::uint32_t>(b.model.partial_rotary_factor) &&
         std::bit_cast<std::uint32_t>(a.model.rope_theta) == std::bit_cast<std::uint32_t>(b.model.rope_theta) &&
@@ -7359,7 +7360,7 @@ void HipGdnIslands::launch_gdn_island(const ExecutionDispatchContext& context, v
 ExecutionLauncher
 make_hip_gdn_launcher(
     std::string kernel_id_value,
-    HipGdnLauncherConfig* config) {
+    HipGdnLauncherConfig* config, bool reserve_device_scratch) {
     if (kernel_id_value.empty() ||
         config == nullptr) {
         throw std::invalid_argument(
@@ -7369,7 +7370,7 @@ make_hip_gdn_launcher(
     if ((kernel_id_value.find(q8_projection_organization::dense_a8_marker) != std::string::npos) != config->dense_a8_projections)
         throw std::invalid_argument("HIP GDN launcher dense A8 identity differs from config");
     // The dense A8 scratch is allocated at setup, never on the first decode step.
-    if (config->dense_a8_projections) q8_rows::dense_a8_reserve();
+    if (reserve_device_scratch && config->dense_a8_projections) q8_rows::dense_a8_reserve();
     if (config->recurrent_storage != GdnRecurrentStorage::key_value || kernel_id_value.find(".state-vk-v1") != std::string::npos) {
         ExecutionBindingRequest request;
         if (kernel_id_value != kernel_id(request, *config))
@@ -7400,7 +7401,7 @@ make_hip_gdn_launcher(
 void HipGdnLauncherBundle::
 register_for_compiled_execution(
     const CompiledSerialExecution& compiled,
-    ExecutionLauncherRegistry& registry, HipGdnIslands* islands) {
+    ExecutionLauncherRegistry& registry, HipGdnIslands* islands, bool reserve_device_scratch) {
     if (compiled.execution_identity == 0 ||
         compiled.execution.steps.size() !=
             compiled.bindings.bindings.size()) {
@@ -7470,7 +7471,7 @@ register_for_compiled_execution(
                     &HipGdnIslands::launch_gdn_island, islands, &HipGdnIslands::preflight_gdn_island});
             } else {
                 registry.add_kernel_launcher(
-                    make_hip_gdn_launcher(registered_id, &config_));
+                    make_hip_gdn_launcher(registered_id, &config_, reserve_device_scratch));
             }
         } else if (registered_id !=
                    *binding.kernel_id) {

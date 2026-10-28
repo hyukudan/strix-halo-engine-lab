@@ -20,6 +20,7 @@ inline constexpr std::uint32_t invalid_selection = 16U;
 struct Shape {
     std::uint32_t query_heads = 24U, kv_heads = 2U, head_dim = 256U;
     std::uint32_t context_tokens = 0U;
+    std::uint32_t effective_max_positions = 262144U;
 };
 struct Span { std::uintptr_t address = 0; std::uint64_t bytes = 0; };
 struct Bindings { Span q_gate, kv_state, selected, position, status, scores, output; };
@@ -32,7 +33,7 @@ struct Launch {
 // The maximum is over EVERY occupied position up to capacity: a capacity exactly
 // divisible by four must still retain the preceding position's three tail slots.
 inline std::uint32_t maximum_selected_tokens(Shape shape) {
-    if (!shape.context_tokens || shape.context_tokens > 262144U)
+    if (!shape.context_tokens || shape.context_tokens > shape.effective_max_positions)
         throw std::invalid_argument("QSA GQA diagnostic context capacity is not admitted");
     return std::min(shape.context_tokens, block_topk * compression + compression - 1U);
 }
