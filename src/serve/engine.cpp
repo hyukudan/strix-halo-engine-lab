@@ -102,6 +102,16 @@ std::vector<std::uint32_t> GenerationTicket::wait(std::chrono::milliseconds time
     return out;
 }
 
+bool GenerationTicket::wait_admission(std::chrono::milliseconds timeout) {
+    std::unique_lock lock(mutex_);
+    return changed_.wait_for(lock, timeout, [&] { return admitted_ || done_ || !pending_.empty(); });
+}
+void GenerationTicket::admit() {
+    const std::lock_guard lock(mutex_);
+    admitted_ = true;
+    changed_.notify_all();
+}
+
 GenerationProgress GenerationTicket::progress() const {
     const std::lock_guard lock(mutex_);
     return progress_;
@@ -145,6 +155,7 @@ std::shared_ptr<GenerationTicket> GenerationQueue::submit(GenerationJob job) {
     ticket->submitted_queue_position_ = entries_.size();
     ticket->queue_position_.store(entries_.size());
     ticket->progress_.total_tokens = job.prompt.size();
+    job.on_admitted = [ptr = ticket.get()] { ptr->admit(); };
     job.on_progress = [ptr = ticket.get()](GenerationProgress progress) { ptr->report_progress(progress); };
     ticket->period_ = observe_period();  // one read: armed (odd) and the period still_observed() compares
     job.observed = ticket->observed_ = (ticket->period_ & 1U) != 0U;

@@ -33,6 +33,7 @@ public:
     void admit_rotary_reader(const RotaryIdentity&) const;
     // STRIX_SERIAL_LOGITS_DIGEST=1: the serial row's FP32 logits digest (else empty; window and block rows: empty).
     [[nodiscard]] std::optional<ModelContentIdentity> serial_logits_digest() const;
+    [[nodiscard]] std::optional<ModelContentIdentity> terminal_logits_digest() const;
     // Execution identity of the serial execution that produced this row (a window ticket
     // reports its committed session's executor).
     [[nodiscard]] std::uint64_t producer_execution_identity() const;
@@ -100,6 +101,8 @@ public:
         SerialSessionContext&,const ExecutionRuntimeResources&,
         DirectLaunchDispatcher&,std::uint32_t input_token,const TokenDraft* draft=nullptr,
         const HipMtpHostRowSelector& host_selector={});
+    // Opt-in raw completed-head observer for session qualification (serial and adopted tiled terminal rows).
+    void set_session_logits_observer(std::function<void(std::uint64_t, std::span<const float>)>);
     // Sampled decoding (temperature > 0): set once; later serial rows select by it.
     void set_token_sampler(std::shared_ptr<TokenSampler>);
     // Serving several requests on one producer: the sampler of the next request (null: first-max), on an idle

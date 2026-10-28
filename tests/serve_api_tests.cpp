@@ -9,6 +9,9 @@
 #include <limits>
 #include <cmath>
 #include "strix/serve/deepseek_chat.hpp"
+#include "../apps/state_cache_stats.hpp"
+#include "../apps/hip_session_store.hpp"
+#include "../apps/qwen_effective_config.hpp"
 #include "strix/serve/http_server.hpp"
 
 #include <arpa/inet.h>
@@ -55,14 +58,30 @@ std::shared_ptr<const BpeTokenizer> tiny_tokenizer() {
 class ScriptedEngine final : public GenerationEngine {
 public:
     explicit ScriptedEngine(std::shared_ptr<const BpeTokenizer> t) : tokenizer_(std::move(t)), trie_(std::make_shared<TokenByteTrie>(*tokenizer_)) {}
+    std::atomic<bool> budget_headers{false};
     bool supports_constraints() const override { return true; }
     bool supports_thinking_budget() const override { return true; }
     std::vector<std::string> constraint_execution_routes() const override { return {"serial-host"}; }
     GenerationStats generate(GenerationJob& job) override {
+        last_retention.store(job.cache_retention);
         { const std::lock_guard lock(mutex_); prompts_.push_back({job.prompt, job.stable_prefix}); sampling_.push_back(job.sampling); }
         if (job.constraint && !job.constraint->program && !job.constraint->thinking) return scored(job);
         if (job.constraint && job.constraint->thinking) return thinking_budget(job);
         if (job.constraint) return constrained(job);
+        if(job.session_id=="late_budget_refusal") {
+            job.on_admitted();
+            // The client acknowledges receipt of headers, so the late refusal is
+            // deterministic even if the HTTP thread is delayed by the scheduler.
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!budget_headers.load() && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if(job.session_id=="budget_refusal" || job.session_id=="late_budget_refusal") {
+            GenerationStats stats; stats.error_status=507; stats.error_code="session_budget";
+            stats.finish="admission_refused";
+            throw GenerationRequestError(std::move(stats),"session capture exceeds host peak budget");
+        }
+        if (job.on_admitted) job.on_admitted();
         const auto prompt = tokenizer_->decode(job.prompt);
         const bool progress = prompt.find("PROGRESS") != std::string::npos;
         if (progress) {
@@ -84,6 +103,7 @@ public:
         GenerationStats stats;
         stats.prompt_tokens = job.prompt.size();
         stats.sampling = "greedy";
+        if (!job.session_id.empty()) stats.engine_extra.emplace_back("session_echo", Json(job.session_id).dump());
         std::size_t at = 0;
         while (at < ids.size()) {
             const auto n = std::min<std::size_t>(3U, ids.size() - at);
@@ -106,6 +126,7 @@ public:
         return stats;
     }
     std::uint64_t context_tokens() const override { return 4096; }
+    std::atomic<CacheRetention> last_retention{CacheRetention::server_policy};
     std::atomic<int> calls{0}, cancelled{0};
     using Captured = std::pair<std::vector<std::uint32_t>, std::uint32_t>;
     std::vector<SamplingParameters> sampling() { const std::lock_guard lock(mutex_); return sampling_; }
@@ -208,7 +229,7 @@ const Json& at(const Json& json, std::string_view key) {
 struct Reply { int status = 0; std::string headers, body; };
 // Plain HTTP/1.1 client; decodes chunked bodies. `abort_after` closes the socket after that many body bytes.
 Reply http(std::uint16_t port, const std::string& method, const std::string& path, const std::string& body,
-    const std::string& extra = {}, std::size_t abort_after = 0) {
+    const std::string& extra = {}, std::size_t abort_after = 0, std::atomic<bool>* headers_seen = nullptr) {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -224,6 +245,7 @@ Reply http(std::uint16_t port, const std::string& method, const std::string& pat
         const auto n = ::recv(fd, buffer, sizeof(buffer), 0);
         if (n <= 0) break;
         raw.append(buffer, static_cast<std::size_t>(n));
+        if (headers_seen && raw.find("\r\n\r\n") != std::string::npos) headers_seen->store(true);
         if (abort_after && raw.size() > abort_after) break;
     }
     ::close(fd);
@@ -357,7 +379,7 @@ void test_batched_queue() {
     check(small.submit({}) && !small.submit({}), "explicit small queue retains rejection");
     GenerationQueue queue(8);
     check(!queue.has_queued_work(), "empty queue hint");
-    const auto job = [](std::uint32_t token) { GenerationJob j; j.prompt = {token, token + 1U}; return j; };
+    const auto job = [](std::uint32_t token) { GenerationJob j; j.prompt = {token, token + 1U}; j.cache_retention=CacheRetention::no_store; return j; };
     const auto t1 = queue.submit(job(1)), t2 = queue.submit(job(3)), t3 = queue.submit(job(5));
     check(t1 && t2 && t3, "batched queue submit");
     check(queue.has_queued_work(), "queued work hint");
@@ -371,6 +393,7 @@ void test_batched_queue() {
     const auto t4 = queue.submit(job(9));
     check(t4->submitted_queue_position() == 2U, "submit excludes running job");
     t4->cancel();
+    check(a->job.cache_retention==CacheRetention::no_store,"retention survives batch queue move");
     auto b = queue.take(false);
     check(b && b->ticket == t3, "batched queue skips a job cancelled while queued");
     bool done = false;
@@ -756,11 +779,21 @@ int main() try {
     ApiConfig config;
     config.model_id = "test-model";
     config.http_slots = 9;
+    config.capabilities_extra=[](Json& out) {
+        strix::decode_cli::Options modes;
+        modes.session_tiled_suffix_requested=true; modes.session_mtp_fixed_requested=true;
+        modes.session_modes_suppression="baseline";
+        out.set("session_numerical_modes",strix::decode_cli::session_modes_json(modes));
+    };
     config.stop_tokens = {tokenizer->find("<|im_end|>"), tokenizer->find("<|endoftext|>")};
     config.api_key = "secret";
     config.sse_keepalive_seconds = 0.3;
     config.engine_progress = true;
     config.sse_progress_seconds = 0.15;
+    auto mirror=std::make_shared<strix::decode_cli::StateCacheStatsMirror>();
+    strix::StateCacheSnapshotV1 snap; snap.prefix_enabled=true; snap.prefix.no_store_skips=7;
+    mirror->publish(snap);
+    config.state_cache_stats=[mirror] { return mirror->read(); };
     ApiService api(config, tokenizer, queue, engine.context_tokens(), false);
     auto constrained_config = config;
     constrained_config.engine_logprobs = constrained_config.engine_logit_transforms = true;
@@ -772,6 +805,18 @@ int main() try {
     ApiService constrained_greedy_api(constrained_config, tokenizer, queue, engine.context_tokens(), false);
     constrained_config.stream_receipts = false;
     ApiService constrained_quiet_api(constrained_config, tokenizer, queue, engine.context_tokens(), true);
+    auto session_config = config; session_config.sessions_enabled = true;
+    const auto allocator=[](std::uint64_t bytes) -> strix::PrefixCacheBuffer {
+        return {std::shared_ptr<std::byte>(new std::byte[static_cast<std::size_t>(bytes ? bytes : 1)],std::default_delete<std::byte[]>()),bytes};
+    };
+    strix::decode_cli::HttpSessionStore startup_store({},1U<<20,3,allocator,{},1234);
+    auto session_mirror=std::make_shared<strix::decode_cli::StateCacheStatsMirror>();
+    session_mirror->publish(startup_store.snapshot(),parse_json(startup_store.command("stats","","")));
+    session_config.state_cache_stats=[session_mirror] {return session_mirror->read();};
+    ApiService session_api(session_config, tokenizer, queue, engine.context_tokens(), false);
+    auto constrained_session_config = constrained_config; constrained_session_config.sessions_enabled = true;
+    constrained_session_config.stream_receipts = true;
+    ApiService constrained_session_api(constrained_session_config, tokenizer, queue, engine.context_tokens(), false);
     auto off_config = config;
     off_config.capabilities = false; off_config.responses = false;
     ApiService off_api(off_config, tokenizer, queue, engine.context_tokens(), false);
@@ -798,7 +843,9 @@ int main() try {
     http_config.port = 0;
     HttpServer server(http_config, [&](const HttpRequest& r, HttpResponseWriter& w) {
         const auto mode = r.header("x-test-config");
-        if (mode == "constraints") constrained_api.handle(r, w);
+        if (r.header("x-test-sessions") == "1" && mode == "constraints") constrained_session_api.handle(r, w);
+        else if (r.header("x-test-sessions") == "1") session_api.handle(r, w);
+        else if (mode == "constraints") constrained_api.handle(r, w);
         else if (mode == "constraints-greedy") constrained_greedy_api.handle(r, w);
         else if (mode == "constraints-quiet") constrained_quiet_api.handle(r, w);
         else if (mode == "off") off_api.handle(r, w);
@@ -1287,6 +1334,12 @@ int main() try {
     {
         const auto r = http(port, "GET", "/v1/capabilities", "", auth);
         const auto doc = parse_json(r.body);
+        for(const auto* name:{"tiled_suffix","mtp_fixed"}) {
+            const auto& mode=at(at(doc,"session_numerical_modes"),name);
+            check(at(mode,"requested").as_bool() && !at(mode,"effective").as_bool() &&
+                at(mode,"suppression").as_string()=="baseline" && at(mode,"bit_changing").as_bool(),
+                "capabilities disclose requested/effective numerical session modes");
+        }
         const auto id = at(doc, "capabilities_id").as_string();
         check(r.status == 200 && at(doc, "object").as_string() == "strix.capabilities" && at(doc, "version").as_int() == 1, "capabilities default");
         check(http(port, "GET", "/v1/capabilities", "").status == 401, "capabilities authenticated");
@@ -1733,6 +1786,45 @@ int main() try {
         check(engine.prompts().size() == before, "refused summaries never reach the engine");
     }
     {
+        // Prefix-only statistics are available even with sessions disabled.
+        const auto reply=http(port,"GET","/v1/cache/stats","",auth);
+        const auto stats=parse_json(reply.body);
+        const auto& state=at(at(stats,"engine"),"state_cache");
+        check(reply.status==200 && at(state,"schema").as_int()==1 && at(state,"prefix_enabled").as_bool() &&
+            !at(state,"session_enabled").as_bool() && !at(state,"pool_present").as_bool(),"cache snapshot schema and flags");
+        check(at(at(state,"prefix"),"no_store_skips").as_int()==7 && at(stats,"parked").as_int()==0,"cache snapshot counters");
+        const auto startup=http(port,"GET","/v1/cache/stats","",auth+"x-test-sessions: 1\r\n");
+        const auto session_stats=parse_json(startup.body);
+        const auto& session_engine=at(session_stats,"engine");
+        const auto& session_state=at(session_engine,"state_cache");
+        check(startup.status==200 && at(session_engine,"max_parked").as_int()==3 &&
+            at(session_engine,"tombstones").as_int()==0 && at(session_engine,"tombstone_bytes").as_int()==0 &&
+            !at(session_engine,"disk_fallback_disabled").as_bool() && at(session_engine,"evicted").as_int()==0,
+            "session startup endpoint preserves complete legacy fields");
+        check(at(session_state,"published").as_bool() && at(session_state,"sequence").as_int()==1 &&
+            at(at(session_state,"disk"),"budget_bytes").as_int()==1234,"session startup publication and disk budget");
+        for (const auto& path : {"/v1/completions","/v1/chat/completions","/v1/messages"}) {
+            const auto base=std::string(path)=="/v1/completions" ? R"({"prompt":"Hi","max_tokens":100})" :
+                R"({"messages":[{"role":"user","content":"Hi"}],"max_tokens":100})";
+            for (const auto& field : {"false","true","absent"}) {
+                auto body=parse_json(base);
+                if (std::string(field)!="absent") {
+                    Json policy=Json::object(); policy.set("retain",Json(std::string(field)=="true")); body.set("state_cache",std::move(policy));
+                }
+                const auto r=http(port,"POST",path,body.dump(),auth);
+                const auto expected=std::string(field)=="false" ? CacheRetention::no_store :
+                    std::string(field)=="true" ? CacheRetention::retain : CacheRetention::server_policy;
+                check(r.status==200 && engine.last_retention.load()==expected,"retention propagation "+std::string(path)+" "+field);
+            }
+            for (const auto& invalid : {"null","false","[]","{}",R"({"retain":0})",R"({"retain":"false"})",R"({"retain":null})"}) {
+                auto body=parse_json(base); body.set("state_cache",parse_json(invalid));
+                const auto r=http(port,"POST",path,body.dump(),auth);
+                check(r.status==400 && r.body.find("invalid_request_error")!=std::string::npos &&
+                    r.body.find("boolean retain")!=std::string::npos,"invalid retention shape "+std::string(path)+invalid);
+            }
+        }
+    }
+    {
         const auto r = http(port, "GET", "/health", "");
         check(r.status == 200 && at(parse_json(r.body), "status").as_string() == "ok", "health");
         check(http(port, "GET", "/v1/models", "").status == 401, "models needs the API key");
@@ -1819,6 +1911,174 @@ int main() try {
         for (const auto& block : at(tool, "content").as_array())
             if (at(block, "type").as_string() == "tool_use" && at(at(block, "input"), "days").as_int() == 2) used = true;
         check(used && at(tool, "stop_reason").as_string() == "tool_use", "anthropic tool_use " + tool.dump());
+    }
+    {
+        const std::string request = R"({"prompt":[1,2],"max_tokens":1,"session":"session_A"})";
+        // Default-off ignores every session value, including invalid names/types, as before.
+        // Compare serialized responses after removing only volatile IDs/timestamps/timings.
+        const auto stable = [](const std::string& text) {
+            auto response = parse_json(text);
+            response.set("id", Json("volatile")); response.set("created", Json(0));
+            auto extra = *response.find("strix");
+            for (const auto* key : {"queue_ms", "prefill_ms", "decode_ms", "decode_tokens_per_second"})
+                extra.set(key, Json(0));
+            // Main's host selection profile includes wall times; retain its deterministic counters.
+            if (const auto* verdict = extra.find("constraint")) {
+                auto constraint = *verdict;
+                if (const auto* measured = constraint.find("host_profile")) {
+                    auto profile = *measured;
+                    for (const auto* key : {"mask_ms", "select_ms", "window_row_ms"}) profile.set(key, Json(0));
+                    constraint.set("host_profile", std::move(profile));
+                }
+                extra.set("constraint", std::move(constraint));
+            }
+            response.set("strix", std::move(extra));
+            return response.dump();
+        };
+        const auto baseline = http(port, "POST", "/v1/completions", R"({"prompt":[1,2],"max_tokens":1})", auth);
+        for (const auto* value : {R"("session_A")", R"("../escape")", "17", "{}", "[]", "null"}) {
+            const auto ignored = http(port, "POST", "/v1/completions",
+                std::string(R"({"prompt":[1,2],"max_tokens":1,"session":)") + value + "}", auth);
+            check(ignored.status == baseline.status && stable(ignored.body) == stable(baseline.body),
+                "disabled session field changed response bytes");
+        }
+        // Unnamed streams keep the public-main wire: their code path is unchanged, and
+        // enabling session support must not change a single event (ids/timestamps aside).
+        // Event lines and [DONE] verbatim; each JSON payload without its per-request ids,
+        // timestamps and timing receipts, at any depth (message_start nests its message id).
+        const std::function<void(Json&)> strip_volatile = [&](Json& value) {
+            if (value.is_object()) {
+                std::erase_if(value.as_object(), [](const Json::Member& m) {
+                    return m.first == "id" || m.first == "created" || m.first == "strix";
+                });
+                for (auto& member : value.as_object()) strip_volatile(member.second);
+            } else if (value.is_array()) for (auto& item : value.as_array()) strip_volatile(item);
+        };
+        const auto stable_wire = [&](const std::string& wire) {
+            std::string out;
+            for (std::size_t at = 0; at < wire.size();) {
+                auto end = wire.find('\n', at);
+                if (end == std::string::npos) end = wire.size();
+                const auto line = wire.substr(at, end - at);
+                at = end + 1U;
+                if (line.starts_with("data: ") && line != "data: [DONE]") {
+                    auto event = parse_json(line.substr(6U));
+                    strip_volatile(event);
+                    out += "data: " + event.dump() + "\n";
+                } else out += line + "\n";
+            }
+            return out;
+        };
+        for (const auto* path : {"/v1/completions", "/v1/chat/completions", "/v1/messages"}) {
+            const bool messages = std::string_view(path) == "/v1/messages";
+            const bool chat = std::string_view(path) == "/v1/chat/completions";
+            for (const bool failure : {false,true}) {
+            std::string disabled_wire;
+            for (const bool enabled : {false,true}) {
+                const auto prompt = failure ? "ENGINE_ERROR" : "Hello";
+                auto body = parse_json(std::string_view(path) == "/v1/completions"
+                    ? R"({"prompt":"","stream":true,"max_tokens":16})"
+                    : R"({"messages":[{"role":"user","content":""}],"stream":true,"max_tokens":16})");
+                if (!messages && !chat) body.set("prompt",Json(prompt));
+                else {
+                    auto messages_body = *body.find("messages");
+                    messages_body.as_array()[0].set("content",Json(prompt));
+                    body.set("messages",std::move(messages_body));
+                }
+                const auto wire = http(port,"POST",path,body.dump(),auth + (enabled ? "X-Test-Sessions: 1\r\n" : ""));
+                check(wire.status == 200, "unnamed stream status");
+                if (!failure)
+                    check(stable_wire(wire.body).ends_with(messages ? "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+                                                                    : "data: [DONE]\n\n"), "unnamed stream success terminal");
+                if (!enabled) disabled_wire = stable_wire(wire.body);
+                else check(stable_wire(wire.body) == disabled_wire, "session support changes an unnamed stream");
+                int errors = 0;
+                for (const auto& event : sse_data(wire.body)) if (const auto* error = event.find("error")) {
+                    ++errors;
+                    check(error->dump() == R"({"message":"scripted failure","type":"server_error"})" &&
+                        !event.find("strix"), "unnamed chat error retains exact legacy payload");
+                }
+                check(errors == (failure && chat ? 1 : 0), "unnamed endpoint preserves legacy error event count");
+            }
+            }
+        }
+        const auto session_auth = auth + "X-Test-Sessions: 1\r\n";
+        const auto budget=http(port,"POST","/v1/completions",
+            R"({"prompt":[1,2],"max_tokens":1,"session":"budget_refusal"})",session_auth);
+        check(budget.status==507 && at(at(parse_json(budget.body),"error"),"code").as_string()=="session_budget",
+            "session budget refusal is a structured 507");
+        for (const auto* path : {"/v1/completions", "/v1/chat/completions", "/v1/messages"}) {
+            const bool messages = std::string_view(path) == "/v1/messages";
+            auto request_body = parse_json(std::string_view(path) == "/v1/completions"
+                ? R"({"prompt":[1,2],"max_tokens":16})"
+                : R"({"messages":[{"role":"user","content":"Hello"}],"max_tokens":16})");
+            request_body.set("session", Json("budget_refusal"));
+            const auto plain = http(port, "POST", path, request_body.dump(), session_auth);
+            request_body.set("stream", Json(true));
+            const auto early = http(port, "POST", path, request_body.dump(), session_auth);
+            check(plain.status == 507 && early.status == 507 && early.body == plain.body &&
+                early.headers.find("text/event-stream") == std::string::npos,
+                std::string(path) + " streaming preflight returns identical structured 507");
+            request_body.set("session", Json("session_A"));
+            check(http(port, "POST", path, request_body.dump(), session_auth).status == 200,
+                std::string(path) + " serves after preflight refusal");
+            request_body.set("session", Json("late_budget_refusal"));
+            engine.budget_headers.store(false);
+            const auto late = http(port, "POST", path, request_body.dump(), session_auth, 0, &engine.budget_headers);
+            int errors = 0;
+            for (const auto& event : sse_data(late.body)) {
+                if (const auto* error = event.find("error")) {
+                    ++errors;
+                    check(at(*error, "status").as_int() == 507 && at(*error, "code").as_string() == "session_budget" &&
+                        at(*error, "type").as_string() == (messages ? "api_error" : "server_error"),
+                        std::string(path) + " late refusal retains status/code/type");
+                    if (messages) check(at(event, "type").as_string() == "error", "messages error event type");
+                }
+                if (const auto* choices = event.find("choices")) for (const auto& choice : choices->as_array())
+                    check(at(choice, "finish_reason").is_null(), "no success finish reason after refusal");
+            }
+            check(late.status == 200 && errors == 1 && late.body.find("[DONE]") == std::string::npos &&
+                late.body.find("event: message_stop") == std::string::npos &&
+                late.body.find("event: message_delta") == std::string::npos &&
+                (!messages || late.body.find("event: error\n") != std::string::npos),
+                std::string(path) + " exactly one SSE error and no success terminal");
+            request_body.set("session", Json("session_A"));
+            check(http(port, "POST", path, request_body.dump(), session_auth).status == 200,
+                std::string(path) + " serves after late refusal");
+        }
+        const auto unnamed_on = http(port, "POST", "/v1/completions", R"({"prompt":[1,2],"max_tokens":1})", session_auth);
+        check(unnamed_on.status == baseline.status && stable(unnamed_on.body) == stable(baseline.body),
+            "defaults ON unnamed request differs from session cache OFF");
+        for (const auto* field : {"ngram_draft", "tool_draft", "ngram_peers", "draft_depth_max"}) {
+            const auto body = std::string(R"({"prompt":[1,2],"max_tokens":1,")") + field +
+                (std::string_view(field)=="draft_depth_max" ? "\":0}" : "\":true}");
+            const auto off = http(port, "POST", "/v1/completions", body, auth);
+            const auto on = http(port, "POST", "/v1/completions", body, session_auth);
+            check(on.status == 200 && off.status == on.status && stable(off.body) == stable(on.body),
+                "unnamed draft override changes when sessions enabled");
+        }
+        const auto named = http(port, "POST", "/v1/completions", request, session_auth);
+        check(named.status == 200 && at(at(parse_json(named.body), "strix"), "session_echo").as_string() == "session_A",
+            "named session reaches engine job");
+        check(http(port, "POST", "/v1/completions", R"({"prompt":[1,2],"session":"../escape"})", session_auth).status == 400,
+            "invalid session path rejected before queue admission");
+        check(http(port, "POST", "/v1/completions", R"({"prompt":[1,2],"session":17})", session_auth).status == 400,
+            "nonstring session rejected");
+        check(http(port, "POST", "/v1/completions", R"({"prompt":[1,2],"session":"A","ngram_draft":true})", session_auth).status == 400,
+            "session draft override rejected before queue admission");
+        const auto constraint_auth = auth + "X-Test-Config: constraints\r\n";
+        const std::string constrained_body = R"({"messages":[{"role":"user","content":"object"}],"max_tokens":32,"response_format":{"type":"json_object"}})";
+        const auto ordinary_constraint = http(port, "POST", "/v1/chat/completions", constrained_body, constraint_auth);
+        const auto unnamed_constraint = http(port, "POST", "/v1/chat/completions", constrained_body,
+            constraint_auth + "X-Test-Sessions: 1\r\n");
+        check(ordinary_constraint.status == 200 && unnamed_constraint.status == 200 &&
+            stable(ordinary_constraint.body) == stable(unnamed_constraint.body),
+            "unnamed constrained output changes when sessions enabled");
+        auto named_constraint_body = parse_json(constrained_body); named_constraint_body.set("session", Json("A"));
+        const auto named_constraint = http(port, "POST", "/v1/chat/completions", named_constraint_body.dump(),
+            constraint_auth + "X-Test-Sessions: 1\r\n");
+        check(named_constraint.status == 400 && at(at(parse_json(named_constraint.body), "error"), "param").as_string() == "session",
+            "named constrained output rejected before queue admission");
     }
     {
         const auto bad = http(port, "POST", "/v1/chat/completions", "{nope", auth);

@@ -9,6 +9,24 @@
 
 namespace strix {
 
+// Physical unit receipt; independent of storage and produced by the incumbent cursor.
+struct KnownPromptChunkUnit {
+    std::uint64_t begin=0,end=0;
+    std::uint32_t owner_rows=0;
+    bool t_owner=false,balanced=false,merged=false,deferred=false,headless=false,state_only=false;
+    bool operator==(const KnownPromptChunkUnit&) const = default;
+};
+inline bool known_prompt_full_t_prefix(std::span<const KnownPromptChunkUnit> trace,
+    std::uint64_t boundary,std::uint32_t rows) {
+    std::uint64_t pos=0;
+    for(const auto& u:trace) {
+        if(pos==boundary) return boundary!=0;
+        if(u.begin!=pos || u.end>boundary || !u.t_owner || u.owner_rows!=rows ||
+            u.end-u.begin!=rows || u.balanced || u.merged || u.deferred) return false;
+        pos=u.end;
+    }
+    return boundary && pos==boundary;
+}
 struct KnownPromptChunkRequest {
     // Borrowed immutable known inputs, including any literal interior EOS.
     // Both backends must retain and use the same actual target session/owners.
@@ -27,8 +45,8 @@ struct KnownPromptChunkRequest {
     // runs headless. The window backend delivers the non-terminal rows itself; the cursor still
     // keeps only the terminal frontier.
     bool all_row_heads = false;
-    // STRIX_QPF2K_SCHED bits 2/4 (deferred block completion, balanced blocks) apply only when set: the caller keeps no
-    // per-block observer of committed device state (e.g. a prefix state store capturing T-block boundaries).
+    // Enable the incumbent deferred/merged/balanced schedule. Observers must decline
+    // unsupported boundaries rather than change this numerical plan.
     bool schedule_extensions = false;
     // The configured tail ladder (descending) for the S3 eligibility check; empty: the set tail backends' sizes.
     std::vector<std::uint32_t> ladder_tail_rows{};
@@ -37,6 +55,7 @@ struct KnownPromptChunkRequest {
 struct KnownPromptChunkProgress {
     std::uint64_t next_position = 0;
     std::uint64_t consumed_prompt_tokens = 0;
+    std::uint64_t restored_prompt_tokens = 0;
     std::uint64_t consumed_generation_tokens = 0;
     std::uint64_t windows_executed = 0;
     std::uint64_t serial_tail_steps = 0;
@@ -100,6 +119,12 @@ public:
     // Same output policy, explicitly tiled, each smaller than T and than the previous tail. Called
     // once per tail size, in descending order, before the first advance.
     void set_tail_backend(KnownPromptWindowBackend& tail);
+    // Walk the identical whole-prompt planner without calling a backend or writing state.
+    [[nodiscard]] std::vector<KnownPromptChunkUnit> cold_plan() const;
+    [[nodiscard]] bool can_resume_at(std::uint64_t boundary) const;
+    // Only before execution, after all tail owners are installed; never replan a remainder.
+    void resume_at(std::uint64_t boundary);
+    [[nodiscard]] const KnownPromptChunkUnit& last_unit() const noexcept {return last_unit_;}
     void cancel() noexcept;
     // Explicit one-shot generation after complete prefill. Delegates the
     // existing greedy continuation's EOS/budget/capacity/bonus policy unchanged.
@@ -114,6 +139,8 @@ private:
     std::vector<KnownPromptWindowBackend*> tails_;
     SerialGreedyStepBackend& serial_;
     KnownPromptChunkProgress progress_;
+    bool planning_only_ = false;
+    KnownPromptChunkUnit last_unit_;
     bool deferred_ = false;
     int balanced_ = -1;     // STRIX_QPF2K_SCHED bit 4: -1 undecided, 0/1 eligibility of this prompt // STRIX_QPF2K_SCHED bit 2: the last block of windows_ awaits its completion checks
     std::vector<float> logits_;

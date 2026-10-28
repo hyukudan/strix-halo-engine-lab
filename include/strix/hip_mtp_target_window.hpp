@@ -5,6 +5,7 @@
 #include "strix/mtp_selection_transaction.hpp"
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 namespace strix {
 class HipKnownPrefixWindow;
@@ -27,6 +28,8 @@ public:
     [[nodiscard]] std::uint64_t source_position(std::uint32_t row) const;
     [[nodiscard]] std::uint32_t input_token(std::uint32_t row) const;
     [[nodiscard]] std::uint32_t predicted_token(std::uint32_t row) const;
+    // Diagnostic snapshot of the actual last head, retained before scratch reuse.
+    [[nodiscard]] std::optional<ModelContentIdentity> terminal_logits_digest(std::uint32_t row) const;
     [[nodiscard]] MtpDeviceView view(std::uint32_t row) const;
     [[nodiscard]] const SerialSessionContext& base_session() const;
     [[nodiscard]] const SerialSessionContext& committed_session() const;

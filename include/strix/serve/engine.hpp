@@ -116,9 +116,14 @@ struct GenerationProgress {
 
 // One generation on the engine. on_tokens runs on the engine thread after each completed decode
 // step with the newly verified tokens (stop tokens included); returning false stops generation.
+enum class CacheRetention : std::uint8_t { server_policy, retain, no_store };
+
 struct GenerationJob {
+    std::function<void()> on_admitted; // optional: session preflight passed, before execution
     std::function<void(GenerationProgress)> on_progress; // optional, host-only completed prefill units
     std::shared_ptr<const ConstraintSpec> constraint; // null: existing route; otherwise JSON and/or thinking selection
+    CacheRetention cache_retention = CacheRetention::server_policy;
+    std::string session_id;
     std::vector<std::uint32_t> prompt;
     // chat requests: the prompt's first tokens that render the system prompt and the tools (a prefix every turn of the
     // conversation, and often other conversations, repeat: a prefix cache may snapshot there); 0: none known
@@ -150,6 +155,8 @@ struct GenerationJob {
 };
 
 struct GenerationStats {
+    int error_status = 0; // request-local HTTP status; zero uses the execution-failure default
+    std::string error_code;
     std::optional<ConstraintVerdict> constraint;
     std::uint64_t prompt_tokens = 0, cached_tokens = 0, generated_tokens = 0;
     std::uint64_t cycles = 0, proposed = 0, accepted = 0;
@@ -202,6 +209,9 @@ public:
     // Waits for new tokens or completion (or the timeout); returns the new tokens.
     // wake_on_cancel false: a cancellation does not end the wait (a caller that cancelled waits for the finish)
     std::vector<std::uint32_t> wait(std::chrono::milliseconds timeout, bool& done, bool wake_on_cancel = true);
+    // Wait without consuming tokens until session admission or completion.
+    bool wait_admission(std::chrono::milliseconds timeout);
+    void admit();
     [[nodiscard]] GenerationProgress progress() const;
     [[nodiscard]] GenerationStats stats() const;
     [[nodiscard]] std::string error() const;
@@ -225,6 +235,7 @@ private:
     GenerationProgress progress_;
     GenerationStats stats_;
     std::string error_;
+    bool admitted_ = false;
     bool done_ = false;
     std::atomic<bool> cancelled_{false};
     bool observed_ = false;
