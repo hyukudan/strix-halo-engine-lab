@@ -153,6 +153,7 @@ public:
             if(proposal.size()+1U!=wide_rows || !verifier) throw std::logic_error("MTP wide proposal does not fill the wide owner");
             std::vector<std::uint32_t> inputs{initial.predicted_token()};
             inputs.insert(inputs.end(),proposal.begin(),proposal.end());
+            // External forwards need QSA invalidation even without pending GDN rows.
             verifier->flush_pending_window();
             owner.discard_deferred();
             check(hipDeviceSynchronize(),"MTP wide cycle start fence");
@@ -201,6 +202,7 @@ public:
                 restore();
                 session=base;
                 owner.discard_deferred();
+                // Restoring target bytes also requires unconditional QSA invalidation.
                 verifier->flush_pending_window();
                 verifier->skip_cycle_sample();
                 host_phase_mark("w4 abandon restore");

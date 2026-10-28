@@ -149,6 +149,8 @@ public:
     // Results in request order; a session that prompt_rows() would not admit gets no tickets (nothing ran for it).
     struct PromptRowsRequest {HipMtpWindowVerifier* verifier=nullptr;SerialSessionContext* session=nullptr;std::span<const std::uint32_t> tokens;};
     [[nodiscard]] static std::vector<std::vector<HipMtpTargetHiddenTicket>> prompt_rows_cohort(std::span<const PromptRowsRequest> requests);
+    // Host-only query: this session has deferred GDN rows to materialize.
+    [[nodiscard]] bool pending_window() const noexcept;
     // Wide copy verify (an external known forward over this session, apps/hip_mtp_wide_copy.hpp): before it, apply
     // the pending deferred GDN rows on the owner that executed them, complete its PLE commit stream and invalidate
     // every owner's persistent QSA pools; after it, skip_cycle_sample() keeps the external forward out of the next

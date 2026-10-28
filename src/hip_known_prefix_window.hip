@@ -2443,6 +2443,9 @@ bool HipKnownPrefixWindow::defers_state() const noexcept {
     return impl_->window.gdn_deferred_rows_steps || impl_->window.ple_rows_steps;
 }
 void HipKnownPrefixWindow::commit_prefix(std::uint32_t n_keep) { impl_->commit_prefix(n_keep); }
+bool HipKnownPrefixWindow::deferred_pending() const noexcept {
+    return impl_->gdn_deferred && impl_->gdn_deferred->pending;
+}
 void HipKnownPrefixWindow::flush_deferred() { impl_->flush_deferred(); }
 void HipKnownPrefixWindow::discard_deferred() { impl_->discard_deferred(); }
 void HipKnownPrefixWindow::share_deferred(const HipKnownPrefixWindow& primary) { impl_->share_deferred(*primary.impl_); }

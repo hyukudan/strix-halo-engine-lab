@@ -782,6 +782,10 @@ void HipMtpWindowVerifier::begin_session() {
         i.chain_steps=0;i.external_first=SIZE_MAX;i.external.clear();
     }
 }
+bool HipMtpWindowVerifier::pending_window() const noexcept {
+    const auto& i=*impl_;
+    return i.prefix && i.last && i.last->window->deferred_pending();
+}
 void HipMtpWindowVerifier::flush_pending_window() {
     auto& i=*impl_;
     require(!i.busy && !failed(),"MTP window verifier flushes only while idle and healthy");
