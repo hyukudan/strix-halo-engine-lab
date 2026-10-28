@@ -82,6 +82,25 @@ inline Sched sched_mode(const char* value) {
     throw std::invalid_argument("STRIX_MM_SERVE_SCHED: off | interleave");
 }
 
+// Strict comparisons: a same-time first emission does not protect a candidate.
+template<class Time> bool protects(Time submitted, Time first_emit, bool emitted) {
+    return emitted && first_emit < submitted;
+}
+// A waiting child predates both the parent submission and the start of its prefill.
+// This excludes burst-mates; later children need a pre-existing decoder instead.
+template<class Time> bool waiting_short(Time submitted, Time parent_submitted, Time parent_started) {
+    return submitted < parent_submitted && submitted < parent_started;
+}
+inline bool nest_timing(bool whole_admission, bool protected_decoder, bool waiting) {
+    return !whole_admission && (protected_decoder || waiting);
+}
+inline bool off_admission(Sched sched, bool protected_decoder, bool nesting) {
+    return sched == Sched::off || (!protected_decoder && !nesting);
+}
+inline bool reorder_prompts(Sched sched, bool enabled, bool head_protected) {
+    return sched == Sched::interleave && enabled && head_protected;
+}
+
 enum class Command : std::uint32_t { heartbeat = 1, prefill = 2, step = 3, shutdown = 4, unit = 5, cancel = 6, draft = 7, taps = 8, park = 9, nest = 10, resume_parked = 11, check = 12 };
 
 // A follower only replays the lead's payload. No policy, cancellation ticket or clock is consulted.
