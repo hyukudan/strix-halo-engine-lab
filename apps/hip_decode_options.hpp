@@ -774,11 +774,23 @@ inline void validate_resolved_teacher_forced_score(const Options& options, std::
 // only where one process appends to one session state allocation. Excluded: graph mode, MTP (windows/rollback), HTTP
 // serving, prompt lookup, prefix-cache roundtrip, the prefix state cache (resets and refills the same state allocation
 // for follow-up prompts), serving prefixes, teacher scoring and hierarchical selection.
+// Why the route is off (the policy suppression or the first excluded route), or null when it is on.
+[[nodiscard]] inline const char* qsa_decode_pool_route_suppression(const Options& o, bool gsq) noexcept {
+    if (const char* why = qpf2k::long_context_item_suppression("STRIX_QSA_DECODE_POOL", gsq)) return why;
+    if (o.baseline) return "baseline";
+    if (o.execution.mode == DecodeExecutionMode::graph) return "graph";
+    if (o.mtp.enabled || o.mtp.supplied || !o.mtp.cohort.empty()) return "mtp";
+    if (o.http_serve) return "http";
+    if (o.prompt_lookup) return "prompt-lookup";
+    if (o.prefix_cache_roundtrip) return "prefix-roundtrip";
+    if (prefix_state_cache_requested(o)) return "prefix-state-cache";
+    if (!o.serving_prefix_files.empty()) return "serving-prefix";
+    if (o.teacher_forced_score) return "teacher";
+    if (o.qsa_hierarchical_selection) return "hierarchical-selection";
+    return nullptr;
+}
 [[nodiscard]] inline bool qsa_decode_pool_route(const Options& o, bool gsq) noexcept {
-    return qpf2k::long_context_item_enabled("STRIX_QSA_DECODE_POOL", gsq) && !o.baseline &&
-        o.execution.mode != DecodeExecutionMode::graph && !o.mtp.enabled && !o.mtp.supplied && o.mtp.cohort.empty() &&
-        !o.http_serve && !o.prompt_lookup && !o.prefix_cache_roundtrip && !prefix_state_cache_requested(o) &&
-        o.serving_prefix_files.empty() && !o.teacher_forced_score && !o.qsa_hierarchical_selection;
+    return !qsa_decode_pool_route_suppression(o, gsq);
 }
 // One policy decision for admission and the launcher catalog; disabled routes retain the FP32 format.
 [[nodiscard]] inline bool qsa_decode_pool_bf16(const Options& o, bool gsq = qpf2k::gsq_model) noexcept {

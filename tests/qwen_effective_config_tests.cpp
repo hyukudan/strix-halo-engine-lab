@@ -1000,6 +1000,50 @@ int main(int argc, char** arguments) {
         check_bytes(baseline_pool, false, 4U);
         check_bytes(sized, true, 4U);
         ::unsetenv("STRIX_QSA_DECODE_POOL_BF16");
+        // --print-effective-config resolves each long-context item and names why it is off.
+        const auto items = [&](const Options& options, bool gsq) {
+            EffectiveConfig printed; printed.options = options; printed.gsq_owner = gsq;
+            return effective_config_json(printed);
+        };
+        const auto has = [](const std::string& text, const char* field) { return text.find(field) != std::string::npos; };
+        auto plain = items(sized, false);
+        expect(has(plain, "\"STRIX_QSA_UNION_MERGE\":{\"enabled\":true,\"suppression\":null}") &&
+            has(plain, "\"STRIX_QSA_SCORE_ROWS64\":{\"enabled\":true,\"suppression\":null}") &&
+            has(plain, "\"STRIX_QSA_DECODE_POOL\":{\"enabled\":true,\"suppression\":null}") &&
+            has(plain, "\"STRIX_QSA_DECODE_SELECT\":{\"enabled\":true,\"suppression\":null}") &&
+            has(plain, "\"STRIX_QSA_DECODE_POOL_BF16\":{\"enabled\":true,\"suppression\":null}") &&
+            has(plain, "\"qsa_decode_pool_key_bytes\":2}"), "effective config resolves the long-context items as on");
+        ::setenv("STRIX_QSA_DECODE_SELECT", "0", 1);
+        ::setenv("STRIX_QSA_DECODE_POOL_BF16", "0", 1);
+        plain = items(sized, false);
+        expect(has(plain, "\"STRIX_QSA_DECODE_SELECT\":{\"enabled\":false,\"suppression\":\"explicit-off\"}") &&
+            has(plain, "\"STRIX_QSA_DECODE_POOL_BF16\":{\"enabled\":false,\"suppression\":\"explicit-off\"}") &&
+            has(plain, "\"STRIX_QSA_DECODE_POOL\":{\"enabled\":true,\"suppression\":null}") &&
+            has(plain, "\"qsa_decode_pool_key_bytes\":4}") &&
+            has(requested_prefill_environment().at("STRIX_QSA_DECODE_SELECT"), "0"),
+            "explicit item switches resolve off while the request stays in the environment");
+        ::unsetenv("STRIX_QSA_DECODE_SELECT");
+        ::unsetenv("STRIX_QSA_DECODE_POOL_BF16");
+        ::setenv("STRIX_QPF2K_DEFAULTS", "0", 1);
+        expect(has(items(sized, false), "\"STRIX_QSA_UNION_MERGE\":{\"enabled\":false,\"suppression\":\"STRIX_QPF2K_DEFAULTS=0\"}"),
+            "STRIX_QPF2K_DEFAULTS=0 is the reported suppression");
+        ::unsetenv("STRIX_QPF2K_DEFAULTS");
+        const auto gsq_text = items(sized, true);
+        expect(has(gsq_text, "\"STRIX_QSA_SCORE_ROWS64\":{\"enabled\":false,\"suppression\":\"gsq\"}") &&
+            has(gsq_text, "\"STRIX_QSA_DECODE_SELECT\":{\"enabled\":false,\"suppression\":\"gsq\"}") &&
+            has(gsq_text, "\"qsa_decode_pool_key_bytes\":0}"), "GSQ owners report the gsq suppression");
+        qpf2k::baseline = true;
+        expect(has(items(sized, false), "\"STRIX_QSA_DECODE_POOL\":{\"enabled\":false,\"suppression\":\"baseline\"}"),
+            "--baseline is the reported suppression");
+        qpf2k::baseline = false;
+        auto mtp = sized; mtp.mtp.enabled = true;
+        const auto mtp_text = items(mtp, false);
+        expect(has(mtp_text, "\"STRIX_QSA_DECODE_POOL\":{\"enabled\":false,\"suppression\":\"mtp\"}") &&
+            has(mtp_text, "\"STRIX_QSA_DECODE_SELECT\":{\"enabled\":false,\"suppression\":\"mtp\"}") &&
+            has(mtp_text, "\"STRIX_QSA_UNION_MERGE\":{\"enabled\":true,\"suppression\":null}"),
+            "an excluded decode route names the route; prefill items stay on");
+        expect(std::string(qsa_decode_pool_route_suppression(cached, false)) == "prefix-state-cache",
+            "the prefix state cache is the reported route exclusion");
     }
     std::cout << "qwen effective config: " << failures << " failures\n";
     return failures ? 1 : 0;

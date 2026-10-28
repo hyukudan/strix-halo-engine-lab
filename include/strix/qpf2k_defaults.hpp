@@ -65,11 +65,16 @@ inline bool suppressed(Item item, bool gsq = gsq_model) noexcept {
 // Code-default exact long-context items (STRIX_QSA_UNION_MERGE, STRIX_QSA_SCORE_ROWS64, STRIX_QSA_DECODE_POOL,
 // STRIX_QSA_DECODE_SELECT, STRIX_QSA_DECODE_POOL_BF16): on unless their variable is "0", the baseline is requested, STRIX_QPF2K_DEFAULTS=0, or the
 // model is a GSQ checkpoint (the same exclusions as the injected defaults above).
+// Why such an item is off (reported by --print-effective-config), or null when it is on.
+inline const char* long_context_item_suppression(const char* name, bool gsq = gsq_model) noexcept {
+    if (baseline) return "baseline";
+    if (gsq) return "gsq";
+    if (const char* d = std::getenv("STRIX_QPF2K_DEFAULTS"); d && d[0] == '0') return "STRIX_QPF2K_DEFAULTS=0";
+    if (const char* v = std::getenv(name); v && v[0] == '0') return "explicit-off";
+    return nullptr;
+}
 inline bool long_context_item_enabled(const char* name, bool gsq = gsq_model) noexcept {
-    if (baseline || gsq) return false;
-    if (const char* d = std::getenv("STRIX_QPF2K_DEFAULTS"); d && d[0] == '0') return false;
-    const char* v = std::getenv(name);
-    return !(v && v[0] == '0');
+    return !long_context_item_suppression(name, gsq);
 }
 class ModelScope {
 public:

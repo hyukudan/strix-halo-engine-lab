@@ -506,7 +506,7 @@ Reuse loaded superblock headers between gate and up within the DA16 tune 80/82 p
 Build the attend union by merging per-row selections instead of the range form; same (block, mask) pairs, order and token counts.
 
 - **Preconditions:** Qwen QSA prefill from 49,152 blocks (about 196K tokens); below that the range form runs.
-- **Automatic selection:** On when unset; explicit values win; `--baseline`, `STRIX_QPF2K_DEFAULTS=0` and the GSQ profile turn these long-context items off; each appears in `--print-effective-config`.
+- **Automatic selection:** On when unset; explicit values win; `--baseline`, `STRIX_QPF2K_DEFAULTS=0` and the GSQ profile turn these long-context items off; `--print-effective-config` reports the requested value under `environment` and the resolved state under `long_context_items` (`enabled`, plus `suppression`: `baseline`, `gsq`, `STRIX_QPF2K_DEFAULTS=0`, `explicit-off`, or the excluded decode route such as `mtp`).
 - **Fallback notice:** Below its threshold or outside the plain route, the previous exact form runs.
 - **Exactness evidence:** Exact: union, score and decode fixtures byte-identical (score rows R16/R32/R64 to 262,144 blocks); at 262,143 tokens the 456-call QSA trace with these defaults is byte-identical to all levers off and the token matches; tokens identical at 32K/131K/262,080.
 - **Off switch:** STRIX_QSA_UNION_MERGE=0
@@ -541,7 +541,7 @@ is unchanged (51.38 vs 51.34 ms/step, same tokens): BF16 halves the pool's key m
 evidence below was measured with FP32 pools.
 
 - **Preconditions:** Plain append-only serial decode on the CLI route (not MTP, HTTP, prompt lookup, prefix round trip, the prefix state cache, serving prefixes or graphs). The pool's device memory is charged in admission and reported as `qsa_decode_pool_bytes`, with `qsa_decode_pool_key_bytes` (2 or 4). For B = floor(C / 4), the bytes are 12 x B x 128 x key_bytes + max(ceil(B / 4), 16384) x 4. Default BF16 totals at C = 262144 / 524288 / 1048576 are 201392128 / 402784256 / 805568512 bytes, including the maxima row.
-- **Automatic selection:** On when unset; explicit values win; `--baseline`, `STRIX_QPF2K_DEFAULTS=0` and the GSQ profile turn these long-context items off; each appears in `--print-effective-config`.
+- **Automatic selection:** On when unset; explicit values win; `--baseline`, `STRIX_QPF2K_DEFAULTS=0` and the GSQ profile turn these long-context items off; `--print-effective-config` reports the requested value under `environment` and the resolved state under `long_context_items` (`enabled`, plus `suppression`: `baseline`, `gsq`, `STRIX_QPF2K_DEFAULTS=0`, `explicit-off`, or the excluded decode route such as `mtp`).
 - **Fallback notice:** Below its threshold or outside the plain route, the previous exact form runs.
 - **Exactness evidence:** Exact: union, score and decode fixtures byte-identical (score rows R16/R32/R64 to 262,144 blocks); at 262,143 tokens the 456-call QSA trace with these defaults is byte-identical to all levers off and the token matches; tokens identical at 32K/131K/262,080.
 - **Off switch:** STRIX_QSA_DECODE_POOL=0
@@ -557,7 +557,7 @@ evidence below was measured with FP32 pools.
 Select decode blocks from precomputed 4-block maxima; same selected blocks.
 
 - **Preconditions:** Plain append-only serial decode on the CLI route (not MTP, HTTP, prompt lookup, prefix round trip, the prefix state cache, serving prefixes or graphs).
-- **Automatic selection:** On when unset; explicit values win; `--baseline`, `STRIX_QPF2K_DEFAULTS=0` and the GSQ profile turn these long-context items off; each appears in `--print-effective-config`.
+- **Automatic selection:** On when unset; explicit values win; `--baseline`, `STRIX_QPF2K_DEFAULTS=0` and the GSQ profile turn these long-context items off; `--print-effective-config` reports the requested value under `environment` and the resolved state under `long_context_items` (`enabled`, plus `suppression`: `baseline`, `gsq`, `STRIX_QPF2K_DEFAULTS=0`, `explicit-off`, or the excluded decode route such as `mtp`).
 - **Fallback notice:** Below its threshold or outside the plain route, the previous exact form runs.
 - **Exactness evidence:** Exact: union, score and decode fixtures byte-identical (score rows R16/R32/R64 to 262,144 blocks); at 262,143 tokens the 456-call QSA trace with these defaults is byte-identical to all levers off and the token matches; tokens identical at 32K/131K/262,080.
 - **Off switch:** STRIX_QSA_DECODE_SELECT=0
@@ -573,7 +573,7 @@ Select decode blocks from precomputed 4-block maxima; same selected blocks.
 Use 64-row scorer tiles at very long contexts (previously pinned to 16 rows above 262K).
 
 - **Preconditions:** Scorer from 65,536 blocks, i.e. beyond the native 262,144-token context: no effect on native runs today.
-- **Automatic selection:** On when unset; explicit values win; `--baseline`, `STRIX_QPF2K_DEFAULTS=0` and the GSQ profile turn these long-context items off; each appears in `--print-effective-config`.
+- **Automatic selection:** On when unset; explicit values win; `--baseline`, `STRIX_QPF2K_DEFAULTS=0` and the GSQ profile turn these long-context items off; `--print-effective-config` reports the requested value under `environment` and the resolved state under `long_context_items` (`enabled`, plus `suppression`: `baseline`, `gsq`, `STRIX_QPF2K_DEFAULTS=0`, `explicit-off`, or the excluded decode route such as `mtp`).
 - **Fallback notice:** Below its threshold or outside the plain route, the previous exact form runs.
 - **Exactness evidence:** Exact: union, score and decode fixtures byte-identical (score rows R16/R32/R64 to 262,144 blocks); at 262,143 tokens the 456-call QSA trace with these defaults is byte-identical to all levers off and the token matches; tokens identical at 32K/131K/262,080. R64 evidence is fixture-only: no native shape reaches 65,536 blocks.
 - **Off switch:** STRIX_QSA_SCORE_ROWS64=0
