@@ -3,6 +3,8 @@
 // request runner. The bridge thread executes the generation queue; HTTP connections run on their
 // own threads and only exchange tokens with it through tickets (docs/engine/serving/serving.md).
 #include "hip_decode_options.hpp"
+#include "http_session_completion.hpp"
+#include "qwen_effective_config.hpp"
 #include "hip_mtp_decode_bridge.hpp"
 #include "rtx_state_import_routes.hpp"
 #include "strix/serve/api.hpp"
@@ -65,6 +67,9 @@ public:
         MtpServeRequest request;
         request.backend_probe = probe_;
         request.constraint = constraints_.make(job.constraint);
+        request.on_admitted = job.on_admitted;
+        request.session_id = job.session_id;
+        request.cache_retention = job.cache_retention;
         request.prompt = job.prompt;
         request.max_tokens = job.max_tokens;
         request.stop_tokens = job.stop_tokens;
@@ -74,6 +79,11 @@ public:
         MtpServeResult result;
         try {
             result = run_(request);
+        } catch (const SessionApiError& e) {
+            serve::GenerationStats stats;
+            stats.prompt_tokens=job.prompt.size(); stats.finish="admission_refused";
+            stats.error_status=e.status; stats.error_code=e.code;
+            throw serve::GenerationRequestError(std::move(stats),e.what());
         } catch (...) {
             failed_.store(true);
             if (probe_) probe_->fail();
@@ -107,6 +117,8 @@ public:
         }
         if (!result.prompt_state_digest.empty())
             stats.engine_extra.push_back({"prompt_state_digest", "\"" + result.prompt_state_digest + "\""});
+        if (!result.cache_refusal.empty()) stats.engine_extra.emplace_back("state_cache_refusal", serve::Json(result.cache_refusal).dump());
+        if (!result.session_json.empty()) stats.engine_extra.emplace_back("session", result.session_json);
         if (!result.rtx_import_json.empty()) stats.engine_extra.emplace_back("rtx_import", result.rtx_import_json);
         if(!result.error.empty()) throw serve::GenerationRequestError(std::move(stats),result.error);
         return stats;
@@ -143,6 +155,49 @@ inline std::string read_http_api_key(const std::string& path) {
     return key;
 }
 
+inline bool handle_session_route(bool enabled, const MtpServeRunner& run,
+    const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
+    if (enabled && (request.path == "/v1/sessions" || request.path == "/v1/cache/stats" || request.path.starts_with("/v1/sessions/"))) {
+        try {
+            MtpServeRequest command;
+            if (request.method == "GET" && request.path == "/v1/sessions") command.session_operation = "list";
+            else if (request.method == "GET" && request.path == "/v1/cache/stats") command.session_operation = "stats";
+            else if (request.path.starts_with("/v1/sessions/")) {
+                const auto rest = request.path.substr(13);
+                const auto slash = rest.find('/');
+                command.session_id = rest.substr(0, slash);
+                validate_http_session_id(command.session_id);
+                if (request.method == "DELETE" && slash == std::string::npos) command.session_operation = "delete";
+                else if (request.method == "POST" && slash != std::string::npos) {
+                    command.session_operation = rest.substr(slash + 1U);
+                    if (command.session_operation != "checkpoint" && command.session_operation != "park" && command.session_operation != "resume")
+                        throw std::invalid_argument("unknown session operation");
+                    if (command.session_operation == "checkpoint") {
+                        const auto body = serve::parse_json(request.body);
+                        const auto* durability = body.find("durability");
+                        if (!durability || !durability->is_string()) throw std::invalid_argument("durability must be ram|disk");
+                        command.session_durability = durability->as_string();
+                    }
+                }
+            }
+            if (command.session_operation.empty()) { response.send(405, "application/json", "{}"); return true; }
+            response.send(200, "application/json", run(command).session_json);
+        } catch (const SessionApiError& error) {
+            response.send(error.status, "application/json", session_error_json(error).dump());
+        } catch (const std::invalid_argument& error) {
+            response.send(400, "application/json", session_error_json(SessionApiError(400, "invalid_request", error.what())).dump());
+        } catch (const std::exception& error) {
+            const bool incompatible = std::string_view(error.what()).find("compatibility mismatch") != std::string_view::npos;
+            SessionApiError classified(incompatible ? 409 : 422,
+                incompatible ? "session_incompatible" : "session_corrupt", error.what());
+            response.send(classified.status, "application/json", session_error_json(classified).dump());
+        }
+        return true;
+    }
+    return false;
+}
+
+
 // Serves until SIGINT/SIGTERM or an engine failure (rethrown after the server stops).
 // rtx_import (--rtx-state-import): the /admin/rtx-import/* routes over these imports; null: no route.
 inline MtpDecodeServe make_http_serve(const Options& options, std::string engine_description,
@@ -162,12 +217,22 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         config.default_min_p = options.http_default_min_p;
         config.responses = options.http_responses;
         config.capabilities = options.http_capabilities;
-        config.capabilities_extra = qwen_rotary_capabilities;
+        config.capabilities_extra = [modes=session_modes_json(options)](serve::Json& out) {
+            qwen_rotary_capabilities(out);
+            out.set("session_numerical_modes",modes);
+        };
         config.stream_receipts = options.http_stream_receipts;
         config.sse_keepalive_seconds = options.http_sse_keepalive;
         config.sse_progress_seconds = options.http_sse_progress_interval;
         config.engine_progress = true;
         config.engine_description = engine_description;
+        config.sessions_enabled = options.session_management_requested;
+        if (options.session_management_requested || options.prefix_cache_host_bytes) {
+            if (options.session_management_requested) {
+                MtpServeRequest stats; stats.session_operation="stats"; (void)run(stats);
+            }
+            config.state_cache_stats=[mirror=options.state_cache_stats] { return mirror->read(); };
+        }
         config.stop_tokens.push_back(tokenizer->eos_token());
         if (const auto end = tokenizer->find("<|endoftext|>"); end != UINT32_MAX) config.stop_tokens.push_back(end);
         if (options.eos_token) config.stop_tokens.push_back(*options.eos_token);
@@ -180,10 +245,10 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         config.engine_thinking_budget = options.http_thinking_budget && constraints.available(config.stop_tokens);
         config.enforce_anthropic_thinking_budget = options.http_anthropic_thinking_budget_enforce;
         config.constraint_execution_routes=selection_mtp_available?std::vector<std::string>{"mtp-host","serial-host"}:std::vector<std::string>{"serial-host"};
-        if (rtx_import)
-            config.engine_routes = [rtx_import](const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
-                return handle_rtx_state_import_route(*rtx_import, request, response);
-            };
+        config.engine_routes = [rtx_import, &run, enabled = options.session_management_requested](const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
+            if (handle_session_route(enabled, run, request, response)) return true;
+            return rtx_import && handle_rtx_state_import_route(*rtx_import, request, response);
+        };
 
         if (serve::serve_health_record_enabled())
             config.health_record = http_health_record(options, 1, startup, assets);
@@ -239,9 +304,11 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
 // With --http-sampling sample, a request with temperature > 0 samples (sampling-v1) with its own policy
 // and seed.
 inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::string engine_description,
-    std::optional<StartupPreflight> startup = {}, serve::Json assets = {}) {
-    return [&options, engine_description = std::move(engine_description), startup, assets](MtpBatchRunner& runner) {
-        const auto tokenizer = serve::BpeTokenizer::load_gguf(options.model_path);
+    std::optional<StartupPreflight> startup = {}, serve::Json assets = {},
+    std::shared_ptr<const serve::BpeTokenizer> supplied_tokenizer = {}) {
+    return [&options, engine_description = std::move(engine_description), startup, assets,
+        supplied_tokenizer = std::move(supplied_tokenizer)](MtpBatchRunner& runner) {
+        const auto tokenizer = supplied_tokenizer ? supplied_tokenizer : serve::BpeTokenizer::load_gguf(options.model_path);
         serve::ApiConfig config;
         config.model_id = options.http_model_id;
         config.http_slots = options.http_batch ? options.http_batch : 1U;
@@ -254,12 +321,25 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         config.default_min_p = options.http_default_min_p;
         config.responses = options.http_responses;
         config.capabilities = options.http_capabilities;
-        config.capabilities_extra = qwen_rotary_capabilities;
+        config.capabilities_extra = [modes=session_modes_json(options)](serve::Json& out) {
+            qwen_rotary_capabilities(out);
+            out.set("session_numerical_modes",modes);
+        };
         config.stream_receipts = options.http_stream_receipts;
         config.sse_keepalive_seconds = options.http_sse_keepalive;
         config.sse_progress_seconds = options.http_sse_progress_interval;
         config.engine_progress = true;
         config.engine_description = engine_description;
+        config.sessions_enabled = options.session_management_requested;
+        if (options.session_management_requested || options.prefix_cache_host_bytes) {
+            if (options.session_management_requested) {
+                MtpServeRequest stats; stats.session_operation="stats"; (void)runner.session_run(stats);
+            }
+            config.state_cache_stats=[mirror=options.state_cache_stats] { return mirror->read(); };
+        }
+        config.engine_routes = [&runner, enabled = options.session_management_requested](const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
+            return handle_session_route(enabled, runner.session_run, request, response);
+        };
         config.stop_tokens.push_back(tokenizer->eos_token());
         if (const auto end = tokenizer->find("<|endoftext|>"); end != UINT32_MAX) config.stop_tokens.push_back(end);
         if (options.eos_token) config.stop_tokens.push_back(*options.eos_token);
@@ -317,15 +397,28 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         const auto release = [&](const std::shared_ptr<serve::TakenJob>& taken) {
             live.erase(std::remove(live.begin(), live.end(), taken), live.end());
         };
+        std::unique_lock<std::mutex> batch_lock;
+        if (runner.session_mutex) batch_lock = std::unique_lock<std::mutex>(*runner.session_mutex, std::defer_lock);
         const auto admit = [&](serve::TakenJob taken_job,const MtpBatchRunner::AdmissionSink& submit) {
             auto taken = std::make_shared<serve::TakenJob>(std::move(taken_job));
+            live.push_back(taken);
             auto& job = taken->job;
             if (job.prompt.empty() || job.prompt.size() >= options.context_tokens) {
                 queue.finish(*taken, {}, "prompt is empty or fills the context");
+                release(taken);
+                return;
+            }
+            if (!job.session_id.empty()) {
+                if (!runner.session_run || runner.active()) throw std::logic_error("named session requires an idle session runner");
+                if (batch_lock.owns_lock()) batch_lock.unlock();
+                // Named sessions run the fixed session protocol: no constrained decoding on that path.
+                MtpBridgeEngine engine(runner.session_run, options.context_tokens, constraints, false, false, false, probing ? &probe : nullptr);
+                finish_http_session_job(queue, *taken, engine, [&] { release(taken); });
                 return;
             }
             MtpBatchRequest request;
             request.constraint = constraints.make(job.constraint);
+            request.cache_retention = job.cache_retention;
             request.prompt = job.prompt;
             request.max_tokens = job.max_tokens;
             request.stop_tokens = job.stop_tokens;
@@ -349,6 +442,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                     request.sampler = std::make_shared<TokenSampler>(policy);
                 } catch (const std::exception& e) {  // this request fails alone; the server keeps serving
                     queue.finish(*taken, {}, std::string("sampling policy refused: ") + e.what());
+                    release(taken);
                     return;
                 }
                 sampling = "sampling-v1";
@@ -374,6 +468,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                 stats.frame_cycles = result.frame_cycles;
                 stats.frame_shadow = result.frame_shadow;
                 stats.constraint = result.constraint;
+                if (!result.cache_refusal.empty()) stats.engine_extra.emplace_back("state_cache_refusal", serve::Json(result.cache_refusal).dump());
                 stats.engine_extra.push_back({"batch_service","{"+batch_service_receipt(result.service)+"}"});
                 if(!result.final_state_digest.empty()) {
                     stats.engine_extra.push_back({"final_state_digest","\""+result.final_state_digest+"\""});
@@ -386,13 +481,16 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                 queue.finish(*taken, std::move(stats), result.error);
                 release(taken);
             };
-            live.push_back(taken);
+            if (runner.session_mutex && !batch_lock.owns_lock()) batch_lock.lock();
             submit(std::move(request));
         };
-        runner.set_service_admission([&]{return queue.has_queued_work();},[&](const MtpBatchRunner::AdmissionSink& prepare,const std::function<bool()>& can_prepare) {
-            while(can_prepare()) {
+        std::optional<serve::TakenJob> deferred;
+        runner.set_service_admission([&]{return !deferred && queue.has_queued_work();},[&](const MtpBatchRunner::AdmissionSink& prepare,const std::function<bool()>& can_prepare) {
+            while(!deferred && can_prepare()) {
                 auto job=queue.take(false);
                 if(!job) break;
+                // A named turn must wait until every ordinary slot is idle, including nested work.
+                if (!job->job.session_id.empty()) { deferred = std::move(job); break; }
                 admit(std::move(*job),prepare);
             }
         });
@@ -405,8 +503,11 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
             for (;;) {
                 runner.add_slot(queue.snapshot().queued != 0U);
                 while (runner.has_free_slot()) {
-                    auto job = queue.take(runner.active() == 0U);
+                    if (deferred && runner.active()) break;
+                    auto job = deferred ? std::move(deferred) : queue.take(runner.active() == 0U);
+                    deferred.reset();
                     if (!job) break;
+                    if (!job->job.session_id.empty() && runner.active()) { deferred = std::move(job); break; }
                     admit(std::move(*job),[&](MtpBatchRequest request){runner.admit(std::move(request));});
                 }
                 // The admitted prompt's first unit runs in this step: build the spare slot now so a request arriving
@@ -421,9 +522,10 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                     const bool completed = runner.step<true>();
                     if (completed) probe.complete(generation, serve::BackendProof::work_completion);
                 } else runner.step();
+                if (!runner.active() && batch_lock.owns_lock()) batch_lock.unlock();
             }
         } catch (const std::exception& e) {
-            failure = e.what();
+            failure = e.what()[0] ? e.what() : "engine failure";
         } catch (...) {
             failure = "engine failure";
         }
@@ -434,8 +536,10 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
             runner.fail_requests(failure);
             for (auto& taken : std::vector<std::shared_ptr<serve::TakenJob>>(live)) queue.finish(*taken, {}, failure);
             live.clear();
+            if (deferred) { queue.finish(*deferred, {}, failure); deferred.reset(); }
             runner.abandon();
         }
+        if (batch_lock.owns_lock()) batch_lock.unlock();
         finished.store(true);
         watcher.join();
         http_thread.join();

@@ -2283,6 +2283,8 @@ KnownWindowResult HipKnownPrefixWindow::execute_without_head_deferred(SerialSess
     impl_->defer_current=true;
     return impl_->execute(session,tokens,{},{},nullptr,true);
 }
+std::shared_ptr<const void> HipKnownPrefixWindow::producer_lifetime() const noexcept {return impl_->actual_owner;}
+hipStream_t HipKnownPrefixWindow::producer_stream() const noexcept {return impl_->scope.stream;}
 bool HipKnownPrefixWindow::completion_pending() const noexcept {return impl_->deferred_pending>=0;}
 void HipKnownPrefixWindow::abandon_pending_completion() {
     if(impl_->deferred_pending<0) return;

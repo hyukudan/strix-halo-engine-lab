@@ -1,5 +1,4 @@
 #include "strix/prefix_state_cache.hpp"
-
 #include "strix/model_content_hash.hpp"
 
 #include <algorithm>
@@ -106,7 +105,7 @@ std::filesystem::path temporary_path(const std::filesystem::path& path) {
 }
 
 std::uint64_t checkpoint_host_bytes(const PrefixCacheCheckpoint& checkpoint) {
-    return checkpoint.fixed.bytes + checkpoint.metadata.size();
+    return checkpoint.fixed.bytes + checkpoint.metadata.size() + checkpoint.producer_certificate.size()*sizeof(std::uint64_t);
 }
 
 double elapsed_ms(std::chrono::steady_clock::time_point start) {
@@ -172,6 +171,7 @@ PrefixStateCache::PrefixStateCache(PrefixStateCachePolicy policy, PrefixCacheAll
         std::filesystem::create_directories(policy_.disk_directory);
         // Leftovers of interrupted writers (old enough not to belong to a live process).
         sweep_disk(std::chrono::minutes(10));
+        update_disk_gauge();
         writer_ = std::thread([this] { writer_loop(); });
     }
 }
@@ -187,11 +187,66 @@ PrefixStateCache::~PrefixStateCache() {
     }
 }
 
-PrefixCacheBuffer PrefixStateCache::allocate(std::uint64_t bytes) const {
-    auto buffer = allocate_(bytes);
-    if (bytes && (!buffer.data || buffer.bytes < bytes)) throw std::runtime_error("prefix cache allocation failed");
-    buffer.bytes = bytes;
+PrefixStateCache::Reservation::~Reservation() {
+    if (ledger_) { std::lock_guard lock(ledger_->mutex); ledger_->reserved -= bytes_; }
+}
+
+PrefixStateCache::Reservation PrefixStateCache::reserve(std::uint64_t bytes, const PrefixCacheCheckpoint* incoming) {
+    if (policy_.legacy) return {};
+    std::lock_guard lock(mutex_);
+    if (bytes <= policy_.host_byte_budget) {
+        evict_to_budget_locked(bytes, policy_.retention == PrefixCacheRetention::fair ? incoming : nullptr);
+        if ((!incoming || policy_.retention != PrefixCacheRetention::fair || entries_.size() < 256) &&
+            retained_bytes_locked() <= policy_.host_byte_budget - bytes) {
+            std::lock_guard ledger_lock(ledger_->mutex);
+            ledger_->reserved += bytes;
+            return Reservation(ledger_, bytes);
+        }
+    }
+    ++stats_.budget_skips;
+    return {};
+}
+
+PrefixCacheBuffer PrefixStateCache::allocate(std::uint64_t bytes, Reservation& reservation, bool segment) {
+    if (policy_.legacy) return allocate(bytes);
+    if (reservation.ledger_ != ledger_ || bytes > reservation.bytes_)
+        throw PrefixCacheAllocationFailure();
+    auto buffer = allocate(bytes);
+    std::lock_guard lock(mutex_);
+    auto receipt = receipts_.at(buffer.data.get()).lock();
+    std::lock_guard ledger_lock(ledger_->mutex);
+    ledger_->reserved -= bytes;
+    reservation.bytes_ -= bytes;
+    ledger_->bytes += bytes;
+    receipt->registered = true; receipt->segment = segment;
+    if (segment) ++ledger_->segments;
     return buffer;
+}
+
+PrefixCacheBuffer PrefixStateCache::allocate(std::uint64_t bytes) const {
+    if (policy_.legacy) {
+        auto buffer = allocate_(bytes);
+        if (bytes && (!buffer.data || buffer.bytes < bytes)) throw std::runtime_error("prefix cache allocation failed");
+        buffer.bytes = bytes; return buffer;
+    }
+    PrefixCacheBuffer buffer;
+    try { buffer = allocate_(bytes); }
+    catch (const PrefixCacheFatalError&) { throw; }
+    catch (const std::bad_alloc&) { throw PrefixCacheAllocationFailure(); }
+    if (bytes && (!buffer.data || buffer.bytes < bytes)) throw PrefixCacheAllocationFailure();
+    buffer.bytes = bytes;
+    auto receipt = std::make_shared<Receipt>();
+    receipt->ledger = ledger_; receipt->payload = buffer.data; receipt->bytes = bytes;
+    buffer.data = std::shared_ptr<std::byte>(receipt, buffer.data.get());
+    std::lock_guard lock(mutex_);
+    receipts_[buffer.data.get()] = receipt;
+    return buffer;
+}
+
+std::uint64_t PrefixStateCache::retained_bytes_locked() {
+    if (policy_.legacy) return host_bytes_locked();
+    std::lock_guard lock(ledger_->mutex);
+    return ledger_->bytes + ledger_->reserved + metadata_bytes_;
 }
 
 std::uint64_t PrefixStateCache::host_bytes_locked() {
@@ -204,7 +259,14 @@ std::uint64_t PrefixStateCache::host_bytes_locked() {
             it = segments_.erase(it);
         }
     }
-    for (const auto& [digest, entry] : entries_) total += checkpoint_host_bytes(*entry.checkpoint);
+    for (auto it = session_buffers_.begin(); it != session_buffers_.end();) {
+        if (it->second.first.expired()) it = session_buffers_.erase(it);
+        else { total += it->second.second; ++it; }
+    }
+    for (const auto& [digest, entry] : entries_) {
+        total += checkpoint_host_bytes(*entry.checkpoint);
+        if (session_buffers_.count(entry.checkpoint->fixed.data.get())) total -= entry.checkpoint->fixed.bytes;
+    }
     return total;
 }
 
@@ -215,47 +277,183 @@ std::uint64_t PrefixStateCache::incremental_bytes(const PrefixCacheCheckpoint& c
 
 std::uint64_t PrefixStateCache::incremental_bytes_locked(const PrefixCacheCheckpoint& checkpoint) {
     std::uint64_t total = checkpoint_host_bytes(checkpoint);
+    const auto registered = [&](const PrefixCacheBuffer& b) {
+        const auto it = receipts_.find(b.data.get());
+        const auto r = it == receipts_.end() ? nullptr : it->second.lock();
+        return r && r->registered;
+    };
+    if (!policy_.legacy && registered(checkpoint.fixed)) total -= checkpoint.fixed.bytes;
     for (const auto& segment : checkpoint.segments) {
         const auto found = segments_.find(segment->digest);
-        if (found == segments_.end() || found->second.expired()) total += segment->payload.bytes;
+        if (policy_.legacy ? (found == segments_.end() || found->second.expired()) : !registered(segment->payload))
+            total += segment->payload.bytes;
     }
     return total;
 }
 
-void PrefixStateCache::touch_locked(Entry& entry) {
+void PrefixStateCache::register_buffer_locked(const PrefixCacheBuffer& buffer, bool segment) {
+    const auto it = receipts_.find(buffer.data.get());
+    if (it == receipts_.end()) return; // external named envelopes use session_buffers_ accounting
+    if (auto r = it->second.lock(); r && !r->registered) {
+        r->registered = true; r->segment = segment;
+        std::lock_guard lock(ledger_->mutex);
+        ledger_->bytes += r->bytes;
+        if (segment) ++ledger_->segments;
+    }
+}
+void PrefixStateCache::add_locked(std::shared_ptr<const PrefixCacheCheckpoint> checkpoint) {
+    for (auto it = receipts_.begin(); it != receipts_.end();)
+        if (it->second.expired()) it = receipts_.erase(it); else ++it;
+    lru_.push_back(checkpoint->digest);
+    entries_.emplace(checkpoint->digest, Entry{checkpoint, std::prev(lru_.end()), ++epoch_, 0, {checkpoint->conversation.empty() ?
+        hex(checkpoint->segments.empty() ? checkpoint->digest : checkpoint->segments.front()->digest) : checkpoint->conversation}});
+    metadata_bytes_ += checkpoint->metadata.size() + checkpoint->producer_certificate.size()*sizeof(std::uint64_t);
+    register_buffer_locked(checkpoint->fixed, false);
+    for (const auto& segment : checkpoint->segments) {
+        segments_[segment->digest] = segment;
+        register_buffer_locked(segment->payload, true);
+    }
+}
+void PrefixStateCache::erase_locked(const ModelContentIdentity& digest) {
+    const auto it = entries_.find(digest);
+    if (it == entries_.end()) return;
+    metadata_bytes_ -= it->second.checkpoint->metadata.size() + it->second.checkpoint->producer_certificate.size()*sizeof(std::uint64_t);
+    lru_.erase(it->second.lru);
+    entries_.erase(it);
+}
+void PrefixStateCache::touch_locked(Entry& entry, bool reused) {
+    entry.epoch = ++epoch_;
+    if (reused) ++entry.reuse;
     lru_.splice(lru_.end(), lru_, entry.lru);
 }
 
-void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve) {
-    while (!lru_.empty() && host_bytes_locked() + reserve > policy_.host_byte_budget) {
-        const auto digest = lru_.front();
-        lru_.pop_front();
-        entries_.erase(digest);
+void PrefixStateCache::evict_to_budget_locked(std::uint64_t reserve, const PrefixCacheCheckpoint* incoming) {
+    // Directory/association work is bounded independently of the payload size.
+    while (!lru_.empty()) {
+        const bool pressure = retained_bytes_locked() + reserve > policy_.host_byte_budget;
+        const bool entry_pressure = policy_.retention == PrefixCacheRetention::fair && entries_.size() + (incoming ? 1U : 0U) > 256;
+        if (!pressure && !entry_pressure) break;
+        auto victim = entries_.find(lru_.front());
+        unsigned victim_rank = 0;
+        long double best = -1;
+        if (policy_.retention == PrefixCacheRetention::fair) {
+            struct Group {
+                long double bytes = 0;
+                std::uint64_t largest = 0;
+                std::map<ModelContentIdentity, long double, DigestLess> branches;
+                std::map<ModelContentIdentity, std::uint64_t, DigestLess> branch_largest;
+            };
+            std::map<std::string, Group> groups;
+            std::map<ModelContentIdentity, std::size_t, DigestLess> refs;
+            std::map<ModelContentIdentity, std::map<std::string, std::size_t>, DigestLess> owners;
+            // Include a would-be capture in fairness accounting before allocating its payload.
+            Entry estimate;
+            std::vector<std::pair<ModelContentIdentity, const Entry*>> ranking;
+            ranking.reserve(entries_.size() + (incoming ? 1U : 0U));
+            for (const auto& [d,e] : entries_) ranking.emplace_back(d, &e);
+            if (incoming) {
+                estimate.checkpoint = std::shared_ptr<const PrefixCacheCheckpoint>(incoming, [](const auto*) {});
+                estimate.conversations.insert(incoming->conversation.empty() ?
+                    hex(incoming->segments.empty() ? incoming->digest : incoming->segments.front()->digest) : incoming->conversation);
+                ranking.emplace_back(incoming->digest, &estimate);
+            }
+            for (const auto& item : ranking) {
+                const auto& e = *item.second;
+                for (const auto& seg : e.checkpoint->segments) {
+                    ++refs[seg->digest];
+                    for (const auto& key : e.conversations) ++owners[seg->digest][key];
+                }
+            }
+            std::map<ModelContentIdentity, std::map<std::string, ModelContentIdentity>, DigestLess> branches;
+            for (const auto& [d,ep] : ranking) {
+              const auto& e = *ep;
+              for (const auto& key : e.conversations) {
+                const auto& c = *e.checkpoint;
+                // Branch = first block after the deepest retained shared ancestor.
+                // An ancestor ending at this checkpoint uses its own terminal digest.
+                std::size_t shared = 0;
+                while (shared<c.segments.size() && owners.at(c.segments[shared]->digest).at(key)>1) ++shared;
+                const auto branch = c.segments.empty() ? d : c.segments[std::min(shared,c.segments.size()-1)]->digest;
+                branches[d][key] = branch;
+                auto full = checkpoint_host_bytes(c);
+                auto charge = static_cast<long double>(full)/e.conversations.size();
+                for (const auto& seg : c.segments) {
+                    full += seg->payload.bytes;
+                    charge += static_cast<long double>(seg->payload.bytes) / (owners[seg->digest].at(key) * owners[seg->digest].size());
+                }
+                auto& g = groups[key]; g.bytes += charge; g.largest = std::max(g.largest,full);
+                g.branches[branch] += charge;
+                g.branch_largest[branch] = std::max(g.branch_largest[branch],full);
+              }
+            }
+            for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+                if (it->second.checkpoint.use_count() != 1) continue;
+                const auto& c = *it->second.checkpoint;
+                unsigned rank = 0;
+                for (const auto& key : it->second.conversations) {
+                    const auto& g = groups.at(key);
+                    const auto cap = std::min(policy_.host_byte_budget, std::max(g.largest,policy_.host_byte_budget/3));
+                    const auto branch = branches.at(it->first).at(key);
+                    const auto branch_cap = std::min(cap,std::max(g.branch_largest.at(branch),cap/g.branches.size()));
+                    const bool borrowed = groups.size()>1 && g.bytes>cap;
+                    rank = std::max(rank, g.branches.at(branch)>branch_cap ? 3U : borrowed ? 2U : 0U);
+                }
+                const bool unleased = it->second.checkpoint.use_count()==1;
+                std::uint64_t marginal = unleased ? c.metadata.size() + c.producer_certificate.size()*sizeof(std::uint64_t) : 0;
+                if (unleased && c.fixed.data.use_count()==1) marginal += c.fixed.bytes;
+                for (const auto& seg : c.segments)
+                    if (unleased && refs[seg->digest] == 1 && seg.use_count()==1) marginal += seg->payload.bytes;
+                const auto score = static_cast<long double>(marginal) * (1 + epoch_ - it->second.epoch) / (1 + it->second.reuse);
+                if (rank > victim_rank || (rank == victim_rank && (score > best ||
+                    (score == best && (it->second.epoch < victim->second.epoch ||
+                        (it->second.epoch == victim->second.epoch && DigestLess{}(it->first,victim->first))))))) {
+                    victim = it; victim_rank = rank; best = score;
+                }
+            }
+        }
+        if (policy_.retention == PrefixCacheRetention::fair && best < 0) break;
+        const auto digest = victim->first;
+        erase_locked(digest);
         ++stats_.evicted;
+        if (victim_rank == 2) ++stats_.evictions_conversation_cap;
+        else if (victim_rank == 3) ++stats_.evictions_branch_cap;
+        else ++stats_.evictions_space;
     }
 }
 
-bool PrefixStateCache::insert(std::shared_ptr<const PrefixCacheCheckpoint> checkpoint) {
+bool PrefixStateCache::insert(std::shared_ptr<const PrefixCacheCheckpoint> checkpoint, Reservation* reservation) {
     require(checkpoint && checkpoint->block_rows && checkpoint->position == checkpoint->segments.size() * checkpoint->block_rows,
         "prefix cache checkpoint is malformed");
+    require(checkpoint->conversation.size()<=128,"prefix cache conversation key exceeds 128 bytes");
     {
         std::lock_guard lock(mutex_);
         if (const auto found = entries_.find(checkpoint->digest); found != entries_.end()) {
+            if (!checkpoint->conversation.empty() && checkpoint->conversation.size()<=128 && found->second.conversations.size()<16)
+                found->second.conversations.insert(checkpoint->conversation);
             touch_locked(found->second);
             return true;
         }
+        if (reservation && reservation->ledger_ == ledger_) {
+            std::lock_guard ledger_lock(ledger_->mutex);
+            ledger_->reserved -= reservation->bytes_; reservation->bytes_ = 0;
+        }
+        ++stats_.captures;
         const auto need = incremental_bytes_locked(*checkpoint);
         if (need > policy_.host_byte_budget) {
-            ++stats_.rejected_over_budget;
+            ++stats_.rejected_over_budget; ++stats_.budget_skips;
             return false;
         }
-        evict_to_budget_locked(need);
-        lru_.push_back(checkpoint->digest);
-        entries_.emplace(checkpoint->digest, Entry{checkpoint, std::prev(lru_.end())});
-        for (const auto& segment : checkpoint->segments) segments_[segment->digest] = segment;
+        if (!policy_.legacy) {
+            evict_to_budget_locked(need, policy_.retention == PrefixCacheRetention::fair ? checkpoint.get() : nullptr);
+            if ((policy_.retention == PrefixCacheRetention::fair && entries_.size() >= 256) ||
+                retained_bytes_locked() > policy_.host_byte_budget - need) {
+                ++stats_.budget_skips; ++stats_.rejected_over_budget; return false;
+            }
+        } else evict_to_budget_locked(need);
+        add_locked(checkpoint);
         ++stats_.inserted;
     }
-    if (writer_.joinable()) {
+    if (writer_.joinable() && checkpoint->producer_certificate.empty()) {
         {
             std::lock_guard lock(queue_mutex_);
             queue_.push_back(std::move(checkpoint));
@@ -282,13 +480,17 @@ std::shared_ptr<const PrefixCacheSegment> PrefixStateCache::find_segment(const M
 }
 
 std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::find_longest(const ModelContentIdentity& identity,
-    std::span<const std::uint32_t> tokens, std::uint32_t block_rows, std::uint64_t limit) {
+    std::span<const std::uint32_t> tokens, std::uint32_t block_rows, std::uint64_t limit, bool promote, std::string_view conversation,
+    const std::function<bool(const PrefixCacheCheckpoint&)>& eligible) {
     require(block_rows != 0, "prefix cache lookup needs a block size");
     const auto max_blocks = std::min<std::uint64_t>(limit, tokens.size()) / block_rows;
     const auto digests = prefix_cache_block_digests(identity, tokens, block_rows, max_blocks);
     {
         std::lock_guard lock(mutex_);
+        for (auto it=receipts_.begin(); it!=receipts_.end();)
+            if (it->second.expired()) it=receipts_.erase(it); else ++it;
         ++stats_.lookups;
+        stats_.lookup_tokens += std::min<std::uint64_t>(limit,tokens.size());
     }
     for (auto k = digests.size(); k > 0; --k) {
         const auto& digest = digests[k - 1];
@@ -297,45 +499,51 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::find_longest(cons
             std::lock_guard lock(mutex_);
             if (const auto it = entries_.find(digest); it != entries_.end()) {
                 found = it->second.checkpoint;
-                touch_locked(it->second);
             }
         }
         if (found) {
+            if (eligible && !eligible(*found)) {
+                std::lock_guard lock(mutex_); ++stats_.plan_misses; continue;
+            }
             const auto position = static_cast<std::uint64_t>(k) * block_rows;
             const auto stored = found->tokens();
             if (found->identity == identity && found->block_rows == block_rows && found->position == position &&
                 stored.size() == position && std::equal(stored.begin(), stored.end(), tokens.begin())) {
                 std::lock_guard lock(mutex_);
-                ++stats_.host_hits;
+                if (auto it=entries_.find(digest); it!=entries_.end()) {
+                    touch_locked(it->second,true);
+                    if (promote && !conversation.empty() && conversation.size()<=128 && it->second.conversations.size()<16)
+                        it->second.conversations.emplace(conversation);
+                }
+                ++stats_.host_hits; stats_.hit_tokens += position; stats_.restored_tokens += position;
                 return found;
             }
+            { std::lock_guard lock(mutex_); erase_locked(digest); ++stats_.evicted; ++stats_.evictions_invalid; }
             continue;  // digest collision or corrupt entry: never used
         }
-        if (policy_.disk_directory.empty()) continue;
+        if (eligible || policy_.disk_directory.empty()) continue;
         std::error_code error;
         if (!std::filesystem::exists(checkpoint_path(policy_.disk_directory, digest), error)) continue;
         try {
             if (auto loaded = load_from_disk(identity, digest, tokens.first(static_cast<std::size_t>(k * block_rows)), block_rows)) {
                 {
                     std::lock_guard lock(mutex_);
-                    ++stats_.disk_hits;
+                    ++stats_.disk_hits; stats_.hit_tokens += loaded->position; stats_.restored_tokens += loaded->position;
                 }
                 // Into the host tier without writing it back.
-                {
+                if (promote) {
                     std::lock_guard lock(mutex_);
-                    const auto need = checkpoint_host_bytes(*loaded) + [&] {
-                        std::uint64_t bytes = 0;
-                        for (const auto& segment : loaded->segments) {
-                            const auto it = segments_.find(segment->digest);
-                            if (it == segments_.end() || it->second.expired()) bytes += segment->payload.bytes;
-                        }
-                        return bytes;
-                    }();
+                    const auto need = incremental_bytes_locked(*loaded);
                     if (need <= policy_.host_byte_budget && !entries_.count(loaded->digest)) {
-                        evict_to_budget_locked(need);
-                        lru_.push_back(loaded->digest);
-                        entries_.emplace(loaded->digest, Entry{loaded, std::prev(lru_.end())});
-                        for (const auto& segment : loaded->segments) segments_[segment->digest] = segment;
+                        // The returned handle is the directory lease, including its fixed blob.
+                        auto promoted=std::const_pointer_cast<PrefixCacheCheckpoint>(loaded);
+                        if (conversation.size()<=128) promoted->conversation=conversation;
+                        evict_to_budget_locked(need, policy_.retention == PrefixCacheRetention::fair ? promoted.get() : nullptr);
+                        if ((policy_.retention != PrefixCacheRetention::fair || entries_.size()<256) &&
+                            (policy_.legacy || retained_bytes_locked() <= policy_.host_byte_budget - need)) {
+                            add_locked(promoted);
+                            entries_.at(promoted->digest).reuse=1;
+                        }
                     }
                 }
                 std::filesystem::last_write_time(checkpoint_path(policy_.disk_directory, digest),
@@ -353,7 +561,7 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::find_longest(cons
 }
 
 std::shared_ptr<const PrefixCacheSegment> PrefixStateCache::load_segment(const ModelContentIdentity& identity,
-    const ModelContentIdentity& digest, std::uint32_t block_rows) {
+    const ModelContentIdentity& digest, std::uint32_t block_rows, Reservation* reservation) {
     if (auto retained = find_segment(digest)) return retained;
     File file(segment_path(policy_.disk_directory, digest), "rb");
     if (!file.open()) throw std::runtime_error("prefix cache segment file is missing");
@@ -372,7 +580,7 @@ std::shared_ptr<const PrefixCacheSegment> PrefixStateCache::load_segment(const M
     file.read(segment->tokens.data(), static_cast<std::uint64_t>(block_rows) * sizeof(std::uint32_t));
     if (prefix_cache_block_digest(segment->parent, segment->tokens) != digest)
         throw std::runtime_error("prefix cache segment tokens do not match their digest");
-    segment->payload = allocate(header.payload_bytes);
+    segment->payload = reservation ? allocate(header.payload_bytes, *reservation, true) : allocate(header.payload_bytes);
     file.read(segment->payload.data.get(), header.payload_bytes);
     if (prefix_cache_checksum(segment->payload.span()) != header.payload_checksum)
         throw std::runtime_error("prefix cache segment payload checksum differs");
@@ -394,6 +602,24 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::load_from_disk(co
         throw std::runtime_error("prefix cache checkpoint header does not match");
     std::vector<std::uint8_t> segment_digests(static_cast<std::size_t>(header.segment_count * 32));
     file.read(segment_digests.data(), segment_digests.size());
+    // Inspect all payload sizes before the first pinned allocation. Conservative credits
+    // also cover segments another reader may release between inspection and loading.
+    std::uint64_t payload_bytes = header.fixed_bytes;
+    if (!policy_.legacy) {
+        for (std::uint64_t k = 0; k < header.segment_count; ++k) {
+            ModelContentIdentity sd;
+            std::memcpy(sd.bytes.data(), segment_digests.data() + k * 32, 32);
+            File segment_file(segment_path(policy_.disk_directory, sd), "rb");
+            if (!segment_file.open()) throw std::runtime_error("prefix cache segment file is missing");
+            SegmentHeader sh; segment_file.read(&sh, sizeof(sh));
+            if (sh.payload_bytes > policy_.host_byte_budget || payload_bytes > policy_.host_byte_budget - sh.payload_bytes) {
+                std::lock_guard lock(mutex_); ++stats_.budget_skips; return nullptr;
+            }
+            payload_bytes += sh.payload_bytes;
+        }
+    }
+    auto reservation = policy_.legacy ? Reservation{} : reserve(payload_bytes);
+    if (!policy_.legacy && !reservation) return nullptr;
     auto checkpoint = std::make_shared<PrefixCacheCheckpoint>();
     checkpoint->identity = identity;
     checkpoint->digest = digest;
@@ -403,7 +629,7 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::load_from_disk(co
     file.read(checkpoint->metadata.data(), header.metadata_bytes);
     if (prefix_cache_checksum(checkpoint->metadata) != header.metadata_checksum)
         throw std::runtime_error("prefix cache metadata checksum differs");
-    checkpoint->fixed = allocate(header.fixed_bytes);
+    checkpoint->fixed = policy_.legacy ? allocate(header.fixed_bytes) : allocate(header.fixed_bytes, reservation);
     file.read(checkpoint->fixed.data.get(), header.fixed_bytes);
     if (prefix_cache_checksum(checkpoint->fixed.span()) != header.fixed_checksum)
         throw std::runtime_error("prefix cache fixed-state checksum differs");
@@ -411,7 +637,7 @@ std::shared_ptr<const PrefixCacheCheckpoint> PrefixStateCache::load_from_disk(co
     for (std::uint64_t k = 0; k < header.segment_count; ++k) {
         ModelContentIdentity segment_digest;
         std::memcpy(segment_digest.bytes.data(), segment_digests.data() + k * 32, 32);
-        auto segment = load_segment(identity, segment_digest, block_rows);
+        auto segment = load_segment(identity, segment_digest, block_rows, policy_.legacy ? nullptr : &reservation);
         // The chain must be exactly the requested tokens.
         if (segment->block_index != k || segment->parent != previous ||
             !std::equal(segment->tokens.begin(), segment->tokens.end(),
@@ -485,6 +711,15 @@ void PrefixStateCache::write_to_disk(const PrefixCacheCheckpoint& checkpoint) {
     ++stats_.disk_writes;
     stats_.disk_write_bytes += written;
     stats_.disk_write_ms += elapsed_ms(start);
+}
+
+void PrefixStateCache::update_disk_gauge() {
+    std::uint64_t bytes=0;
+    std::error_code error;
+    for (const auto& entry : std::filesystem::directory_iterator(policy_.disk_directory,error)) {
+        if (entry.is_regular_file(error)) bytes+=entry.file_size(error);
+    }
+    std::lock_guard lock(mutex_); stats_.disk_bytes=bytes;
 }
 
 void PrefixStateCache::enforce_disk_budget() {
@@ -592,6 +827,7 @@ void PrefixStateCache::writer_loop() {
         try {
             write_to_disk(*next);
             enforce_disk_budget();
+            update_disk_gauge();
         } catch (const std::exception&) {
             std::lock_guard lock(mutex_);
             ++stats_.disk_write_failures;
@@ -610,7 +846,42 @@ void PrefixStateCache::flush() {
     idle_cv_.wait(lock, [&] { return queue_.empty() && !writer_busy_; });
 }
 
+bool PrefixStateCache::admit_capture(const PrefixCacheCheckpoint& checkpoint) {
+    std::lock_guard lock(mutex_);
+    const auto need = incremental_bytes_locked(checkpoint);
+    if (need <= policy_.host_byte_budget) {
+        evict_to_budget_locked(need, policy_.retention == PrefixCacheRetention::fair ? &checkpoint : nullptr);
+        const auto remaining = incremental_bytes_locked(checkpoint);
+        const bool directory_fits = policy_.retention == PrefixCacheRetention::lru || entries_.size() < 256;
+        if (directory_fits && remaining <= policy_.host_byte_budget &&
+            retained_bytes_locked() <= policy_.host_byte_budget - remaining) return true;
+    }
+    ++stats_.budget_skips;
+    return false;
+}
+void PrefixStateCache::record_capture_failure() {
+    std::lock_guard lock(mutex_);
+    ++stats_.capture_failures;
+}
+
+void PrefixStateCache::record_no_store_skip() {
+    std::lock_guard lock(mutex_); ++stats_.no_store_skips;
+}
+PrefixStateCacheStats PrefixStateCache::counters() {
+    std::lock_guard lock(mutex_);
+    auto out = stats_;
+    if (policy_.legacy) {
+        out.host_bytes = host_bytes_locked(); out.host_segments = segments_.size();
+    } else {
+        std::lock_guard ledger_lock(ledger_->mutex);
+        out.host_bytes = ledger_->bytes + metadata_bytes_;
+        out.host_segments = ledger_->segments;
+    }
+    out.host_checkpoints = entries_.size();
+    return out;
+}
 PrefixStateCacheStats PrefixStateCache::stats() {
+    if (!policy_.legacy) return counters();
     std::lock_guard lock(mutex_);
     auto out = stats_;
     out.host_bytes = host_bytes_locked();
@@ -619,4 +890,109 @@ PrefixStateCacheStats PrefixStateCache::stats() {
     return out;
 }
 
+
+bool PrefixStateCache::admit_session_working_bytes(std::uint64_t bytes) {
+    std::lock_guard lock(mutex_);
+    if (bytes > policy_.host_byte_budget) return false;
+    evict_to_budget_locked(bytes);
+    return retained_bytes_locked() <= policy_.host_byte_budget - bytes;
+}
+bool PrefixStateCache::park_session(const std::string& id, PrefixCacheBuffer envelope, std::uint64_t max_sessions) {
+    require(!id.empty() && id.size()<=128 && std::all_of(id.begin(),id.end(),[](unsigned char c) {
+        return (c>='a' && c<='z') || (c>='A' && c<='Z') || (c>='0' && c<='9') || c=='-' || c=='_';
+    }),"invalid session id");
+    require(envelope.data && envelope.bytes && max_sessions,"session parking requires a budget and envelope");
+    {
+        std::lock_guard receipt_lock(mutex_);
+        auto r = receipts_[envelope.data.get()].lock();
+        if (!r) {
+            r=std::make_shared<Receipt>(); r->ledger=ledger_; r->payload=envelope.data; r->bytes=envelope.bytes;
+            receipts_[envelope.data.get()]=r;
+        }
+        envelope.data=std::shared_ptr<std::byte>(r,envelope.data.get());
+    }
+    const auto digest=sha256_bytes_fast(envelope.span());
+    auto checkpoint=std::make_shared<PrefixCacheCheckpoint>();
+    checkpoint->conversation=id;
+    checkpoint->digest=digest; checkpoint->block_rows=1; checkpoint->fixed=std::move(envelope);
+    std::lock_guard lock(mutex_);
+    for(auto it=named_sessions_.begin();it!=named_sessions_.end();) {
+        if(!entries_.count(it->second)) it=named_sessions_.erase(it); else ++it;
+    }
+    const auto need=checkpoint_host_bytes(*checkpoint);
+    if(need>policy_.host_byte_budget) { ++stats_.rejected_over_budget; return false; }
+    if(auto old=named_sessions_.find(id);old!=named_sessions_.end()) {
+        if(auto e=entries_.find(old->second);e!=entries_.end()) { erase_locked(e->first); }
+        named_sessions_.erase(old);
+    }
+    // Different names must not alias the same mutable lifecycle. Bind name into storage key.
+    std::vector<std::byte> key;
+    for(const auto c:id) key.push_back(static_cast<std::byte>(c));
+    for(auto c:digest.bytes) key.push_back(static_cast<std::byte>(c));
+    checkpoint->digest=sha256_bytes(key);
+    while(named_sessions_.size()>=max_sessions) {
+        auto victim=lru_.begin();
+        while(victim!=lru_.end() && std::none_of(named_sessions_.begin(),named_sessions_.end(),
+            [&](const auto& n){return n.second==*victim;})) ++victim;
+        require(victim!=lru_.end(),"session LRU invariant failed");
+        const auto d=*victim; erase_locked(d);
+        for(auto it=named_sessions_.begin();it!=named_sessions_.end();) {
+            if(it->second==d) it=named_sessions_.erase(it); else ++it;
+        }
+        ++stats_.evicted;
+    }
+    evict_to_budget_locked(need);
+    for(auto it=named_sessions_.begin();it!=named_sessions_.end();) {
+        if(!entries_.count(it->second)) it=named_sessions_.erase(it); else ++it;
+    }
+    // Outstanding handles can retain pinned segments: do not claim admission if eviction did not free enough.
+    if(retained_bytes_locked()>policy_.host_byte_budget-need) { ++stats_.rejected_over_budget; return false; }
+    add_locked(checkpoint);
+    session_buffers_[checkpoint->fixed.data.get()] = {checkpoint->fixed.data, checkpoint->fixed.bytes};
+    named_sessions_[id]=checkpoint->digest; ++stats_.inserted; return true;
+}
+PrefixCacheBuffer PrefixStateCache::resume_session(const std::string& id) {
+    std::lock_guard lock(mutex_);
+    const auto n=named_sessions_.find(id); if(n==named_sessions_.end()) return {};
+    const auto e=entries_.find(n->second); if(e==entries_.end()) { named_sessions_.erase(n); return {}; }
+    touch_locked(e->second,true); return e->second.checkpoint->fixed;
+}
+std::vector<std::string> PrefixStateCache::list_sessions() {
+    std::lock_guard lock(mutex_); std::vector<std::string> out;
+    for(auto it=named_sessions_.begin();it!=named_sessions_.end();) {
+        if(!entries_.count(it->second)) it=named_sessions_.erase(it);
+        else { out.push_back(it->first); ++it; }
+    }
+    return out;
+}
+bool PrefixStateCache::delete_session(const std::string& id) {
+    std::lock_guard lock(mutex_); const auto n=named_sessions_.find(id); if(n==named_sessions_.end()) return false;
+    if(auto e=entries_.find(n->second);e!=entries_.end()) { erase_locked(e->first); }
+    named_sessions_.erase(n); ++stats_.evictions_explicit; return true;
+}
+
 }  // namespace strix
+
+namespace strix {
+void PrefixStateCache::record_staging(std::uint64_t cap,std::uint64_t bytes,bool active) {
+    std::lock_guard lock(mutex_);
+    if(cap) stats_.staging_budget_bytes=cap;
+    stats_.staging_bytes=active?bytes:0;
+    stats_.staging_peak_bytes=std::max(stats_.staging_peak_bytes,bytes);
+}
+void PrefixStateCache::record_staging_skip(bool cap) {
+    std::lock_guard lock(mutex_);
+    ++stats_.budget_skips;
+    if(cap) ++stats_.staging_cap_skips; else ++stats_.capture_busy_skips;
+}
+}
+
+namespace strix {
+void PrefixStateCache::record_row_prefetch() {std::lock_guard lock(mutex_); ++stats_.row_prefetches;}
+void PrefixStateCache::record_certificate_decline(const std::string& reason) {
+    std::lock_guard lock(mutex_);
+    for(std::size_t i=0;i<prefix_certificate_decline_names.size();++i)
+        if(prefix_certificate_decline_names[i]==reason) {++stats_.certificate_declines[i];return;}
+}
+void PrefixStateCache::record_cross_stream_skip() {std::lock_guard lock(mutex_); ++stats_.capture_skips_cross_stream;}
+}

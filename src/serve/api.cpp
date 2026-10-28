@@ -1065,11 +1065,30 @@ struct ApiService::Impl {
         const Json& body, std::uint32_t stable_prefix = 0, std::shared_ptr<const ConstraintSpec> spec = {}) {
         GenerationJob job;
         job.constraint = std::move(spec);
+        if (const auto* policy = body.find("state_cache")) {
+            const auto* retain = policy->is_object() ? policy->find("retain") : nullptr;
+            if (!retain || !retain->is_bool())
+                throw ApiError(400, "invalid_request_error", "state_cache must be an object with boolean retain", "state_cache");
+            job.cache_retention = retain->as_bool() ? CacheRetention::retain : CacheRetention::no_store;
+        }
         job.prompt = std::move(prompt);
         job.stable_prefix = stable_prefix;
         job.max_tokens = max_tokens;
         job.stop_tokens = config.stop_tokens;
         job.sampling = sampling;
+        if (const auto* session = body.find("session"); config.sessions_enabled && session && !session->is_null()) {
+            if (!session->is_string() || session->as_string().empty() || session->as_string().size() > 128)
+                throw ApiError(400, "invalid_request_error", "session requires a valid string id", "session");
+            job.session_id = session->as_string();
+            if (!std::all_of(job.session_id.begin(), job.session_id.end(), [](unsigned char c) {
+                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '-' || c == '_';
+            })) throw ApiError(400, "invalid_request_error", "invalid session id", "session");
+            if (sampling.temperature > 0.0)
+                throw ApiError(400, "invalid_request_error", "sessions require greedy sampling", "temperature");
+            if (job.constraint)
+                throw ApiError(400, "invalid_request_error", "sessions do not support constrained output", "session");
+        }
         if (const auto* ngram = body.find("ngram_draft"); ngram && !ngram->is_null()) {
             if (!ngram->is_bool()) throw ApiError(400, "invalid_request_error", "ngram_draft must be a boolean", "ngram_draft");
             job.ngram_draft = ngram->as_bool();
@@ -1087,6 +1106,9 @@ struct ApiService::Impl {
             if (!peers->is_bool()) throw ApiError(400, "invalid_request_error", "ngram_peers must be a boolean", "ngram_peers");
             job.ngram_peers = peers->as_bool();
         }
+        if (!job.session_id.empty() && (job.ngram_draft.value_or(false) || job.tool_draft.value_or(false) ||
+            job.ngram_peers.value_or(false) || job.draft_depth_max))
+            throw ApiError(400, "invalid_request_error", "session mode requires its fixed draft policy; request draft overrides are unsupported");
         auto ticket = queue.submit(std::move(job));
         if (!ticket) throw ApiError(429, "rate_limit_error", "the request queue is full");
         return ticket;
@@ -1196,6 +1218,37 @@ struct ApiService::Impl {
         return o.finish == "length" ? "incomplete" : "completed";
     }
 
+    // Named sessions perform their capture admission on the engine owner thread. Keep
+    // headers uncommitted until that check passes (or the request finishes in error).
+    void stream_admission(const std::shared_ptr<GenerationTicket>& ticket, const Json& body,
+        HttpResponseWriter& response, const char* type) {
+        const auto* session = body.find("session");
+        if (!config.sessions_enabled || !session || session->is_null()) return;
+        while (!ticket->wait_admission(std::chrono::milliseconds(100))) {
+            if (response.client_gone()) { ticket->cancel(); return; }
+        }
+        const auto error = ticket->error();
+        if (!error.empty()) {
+            const auto stats = ticket->stats();
+            throw ApiError(stats.error_status ? stats.error_status : 500, type, error, "", stats.error_code);
+        }
+    }
+    bool named_session(const Json& body) const {
+        const auto* session = body.find("session");
+        return config.sessions_enabled && session && session->is_string() && !session->as_string().empty();
+    }
+    static Json stream_error(const Outcome& outcome, bool messages = false) {
+        Json detail = Json::object();
+        detail.set("message", Json(outcome.error));
+        detail.set("type", Json(messages ? "api_error" : "server_error"));
+        detail.set("status", Json(outcome.stats.error_status ? outcome.stats.error_status : 500));
+        detail.set("code", outcome.stats.error_code.empty() ? Json() : Json(outcome.stats.error_code));
+        Json error = Json::object();
+        if (messages) error.set("type", Json("error"));
+        error.set("error", std::move(detail));
+        return error;
+    }
+
     void chat_completions(const HttpRequest&, HttpResponseWriter& response, const Json& body) {
         const auto prompt = chat_prompt(body);
         if (const auto* n = body.find("n"); n && n->is_number() && n->as_int() != 1)
@@ -1219,7 +1272,7 @@ struct ApiService::Impl {
         if (!stream) {
             auto outcome = drive(ticket, stops, {}, [&] { return !response.client_gone(); }, {}, spec);
             if (!outcome.error.empty()) {
-                ApiError error(500, "server_error", outcome.error);
+                ApiError error(outcome.stats.error_status ? outcome.stats.error_status : 500, "server_error", outcome.error, "", outcome.stats.error_code);
                 if (spec && outcome.stats.constraint) {
                     error.strix = Json::object();
                     selection_json(error.strix, *spec, *outcome.stats.constraint);
@@ -1250,6 +1303,7 @@ struct ApiService::Impl {
             finish_entry(entry, outcome);
             return;
         }
+        stream_admission(ticket, body, response, "server_error");
         if (!response.begin_stream(200, "text/event-stream")) { ticket->cancel(); return; }
         StreamWriter writer{response, interval, progress_interval};
         bool first_chunk = true;
@@ -1292,6 +1346,14 @@ struct ApiService::Impl {
         };
         auto outcome = drive(ticket, stops, [&](const std::string& text) { return send_deltas(splitter.push(text)); },
             [&] { return !response.client_gone(); }, [&] { return writer.idle(*ticket); }, spec, send_deltas, [&](const Json& score, bool) { pending_scores.push(score); });
+        if (named_session(body) && !outcome.error.empty()) {
+            auto error = stream_error(outcome);
+            if (config.stream_receipts || spec) error.set("strix", receipt(&outcome, note, body, limit, sampling_params, spec));
+            writer.write("data: " + error.dump() + "\n\n");
+            response.end_stream();
+            finish_entry(entry, outcome);
+            return;
+        }
         if (!spec || (!spec->program && !spec->thinking)) send_deltas(splitter.finish());
         std::string finish = outcome.finish == "cancelled" ? "stop" : outcome.finish;
         if (!outcome.error.empty()) {
@@ -1549,7 +1611,7 @@ struct ApiService::Impl {
         if (!stream) {
             auto o = drive(ticket, stops, {}, [&] { return !response.client_gone(); }, {}, spec);
             if (!o.error.empty()) {
-                ApiError error(500, "server_error", o.error);
+                ApiError error(o.stats.error_status ? o.stats.error_status : 500, "server_error", o.error, "", o.stats.error_code);
                 if (spec && o.stats.constraint) {
                     error.strix = Json::object();
                     selection_json(error.strix, *spec, *o.stats.constraint);
@@ -1710,17 +1772,26 @@ struct ApiService::Impl {
         };
         if (!stream) {
             auto outcome = drive(ticket, stops, {}, [&] { return !response.client_gone(); }, {}, spec);
-            if (!outcome.error.empty()) throw ApiError(500, "server_error", outcome.error);
+            if (!outcome.error.empty()) throw ApiError(outcome.stats.error_status ? outcome.stats.error_status : 500, "server_error", outcome.error, "", outcome.stats.error_code);
             response.send(200, "application/json", chunk(outcome.text, Json(outcome.finish == "cancelled" ? "stop" : outcome.finish), true, &outcome).dump());
             finish_entry(entry, outcome);
             return;
         }
+        stream_admission(ticket, body, response, "server_error");
         if (!response.begin_stream(200, "text/event-stream")) { ticket->cancel(); return; }
         StreamWriter writer{response, interval, progress_interval};
         // with receipts: an empty first chunk carries the policy right after the headers (keepalive comments follow it)
         if (config.stream_receipts || spec) writer.write("data: " + chunk("", Json(), false, nullptr).dump() + "\n\n");
         auto outcome = drive(ticket, stops, [&](const std::string& text) {
             return writer.write("data: " + chunk(text, Json(), false, nullptr).dump() + "\n\n"); }, [&] { return !response.client_gone(); }, [&] { return writer.idle(*ticket); }, spec, {}, [&](const Json& score, bool) { pending_scores.push(score); });
+        if (named_session(body) && !outcome.error.empty()) {
+            auto error = stream_error(outcome);
+            if (config.stream_receipts || spec) error.set("strix", receipt(&outcome, note, body, limit, sampling_params, spec));
+            writer.write("data: " + error.dump() + "\n\n");
+            response.end_stream();
+            finish_entry(entry, outcome);
+            return;
+        }
         writer.write("data: " + chunk("", Json(outcome.finish == "cancelled" ? "stop" : outcome.finish), true, &outcome).dump() + "\n\n");
         writer.write("data: [DONE]\n\n");
         response.end_stream();
@@ -1858,7 +1929,7 @@ struct ApiService::Impl {
         if (!stream) {
             auto outcome = drive(ticket, stops, {}, [&] { return !response.client_gone(); }, {}, spec);
             if (!outcome.error.empty()) {
-                ApiError error(500, "api_error", outcome.error);
+                ApiError error(outcome.stats.error_status ? outcome.stats.error_status : 500, "api_error", outcome.error, "", outcome.stats.error_code);
                 if (spec && outcome.stats.constraint) {
                     error.strix = Json::object(); selection_json(error.strix, *spec, *outcome.stats.constraint);
                 }
@@ -1890,6 +1961,7 @@ struct ApiService::Impl {
             finish_entry(entry, outcome);
             return;
         }
+        stream_admission(ticket, body, response, "api_error");
         if (!response.begin_stream(200, "text/event-stream")) { ticket->cancel(); return; }
         StreamWriter writer{response, interval, progress_interval};
         const auto event = [&](const char* name, const Json& data) {
@@ -1946,6 +2018,14 @@ struct ApiService::Impl {
         };
         auto outcome = drive(ticket, stops, [&](const std::string& text) { return send_deltas(splitter.push(text)); },
             [&] { return !response.client_gone(); }, [&] { return writer.idle(*ticket); }, spec, send_deltas);
+        if (named_session(body) && !outcome.error.empty()) {
+            auto error = stream_error(outcome, true);
+            if (config.stream_receipts || spec) error.set("strix", receipt(&outcome, note, body, limit, sampling_params, spec));
+            writer.write("event: error\ndata: " + error.dump() + "\n\n");
+            response.end_stream();
+            finish_entry(entry, outcome);
+            return;
+        }
         if (!spec || (!spec->program && !spec->thinking)) send_deltas(splitter.finish());
         bool tools = false;
         if (splitter.saw_tools()) {
@@ -2159,6 +2239,9 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
             return;
         }
         impl.authorize(request);
+        if (request.method == "GET" && request.path == "/v1/cache/stats" && impl.config.state_cache_stats) {
+            response.send(200,"application/json",impl.config.state_cache_stats()); return;
+        }
         if (impl.config.engine_routes && impl.config.engine_routes(request, response)) return;
         if (request.method == "POST" && request.path == "/admin/drain" && impl.config.on_drain) {
             impl.config.on_drain();

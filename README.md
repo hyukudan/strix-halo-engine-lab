@@ -686,6 +686,8 @@ The full record, with alternatives, evidence and the condition for reopening eac
 
 ## Roadmap
 
+- **Prefix cache with GDN state** *(landed, D-035)*: a request whose prompt starts with a cached prefix restores the complete model state at a tiled-prefill block boundary and reads only the rest, with bit-identical output (`--prefix-cache-host-bytes N`, optional `--prefix-cache-dir DIR`; see [docs/engine/serving/prefix-state-cache.md](docs/engine/serving/prefix-state-cache.md)). Timings follow the next benchmark campaign. The store keeps checkpoints fairly across conversations and branches (`--prefix-cache-retention fair`, default; `lru` and `--baseline` keep the previous policy), reserves memory before every pinned copy, and a request can read cached prefixes without storing new ones (`"state_cache": {"retain": false}`). `GET /v1/cache/stats` reports hits, restored tokens, captures, skips, evictions by reason and the bytes held. `--prefix-cache off` / `STRIX_PREFIX_CACHE=0` turns the cache off; an automatic serving budget is not enabled until its exactness gate passes. On the MTP serving route the cache no longer changes the cold prefill plan: checkpoints are copied asynchronously at block boundaries the plan already has (skipped when the next block runs on another stream), and a restore is accepted only when the rest of the prompt runs exactly as it would without the cache.
+
 In progress, without promised numbers:
 
 - **MiniMax M3.1 Flash (EXL3) on the pair:** publish the measured prefill/exchange defaults and resolve

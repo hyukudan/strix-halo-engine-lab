@@ -236,12 +236,17 @@ void ple_reclaim_tests() {
         [](auto& o, auto&, auto&) { o.serving_prefix_files.emplace_back("prefix"); },
         [](auto& o, auto&, auto&) { o.mtp.enabled = true; },
         [](auto& o, auto&, auto&) { o.planned_ple_io = true; },
+        [](auto& o, auto&, auto&) { o.session_load = "checkpoint"; },
+        [](auto& o, auto&, auto&) { o.session_live_control = true; },
+        [](auto& o, auto&, auto&) { o.session_then_prompt = "suffix.ids"; },
     };
     for (const auto& exclude : exclusions) {
         auto excluded = options;
         auto excluded_policy = policy;
         bool graph = false;
         exclude(excluded, excluded_policy, graph);
+        expect(!decode_cli::ple_reclaim_route_supported(excluded, excluded_policy, graph),
+            "unsupported route (including session load) cannot build an L1 prompt plan");
         for (const auto* value : std::array<const char*, 4>{nullptr, "auto", "0", "1"}) {
             flag.set(value);
             bool refused = false;

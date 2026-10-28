@@ -3,15 +3,124 @@
 #include "qwen_prefill_contract.hpp"
 #include "rotary_mock.hpp"
 #include "strix/memory_plan.hpp"
+#include "strix/session_state_cache.hpp"
 #include "../apps/qwen_yarn_owner_inventory.hpp"
 #include "qwen_serial_contract.hpp"
 #include "qwen_historical_resolver.hpp"
 #include <iostream>
 #include <limits>
+#include <set>
+#include "strix/q8_projection_organization.hpp"
 
 using namespace strix;
 using namespace strix::decode_cli;
 namespace {
+// Synthetic CPU kernel fixture: compares compiler identities without HIP launchers.
+strix::kernels::KernelVariant config_test_variant(
+    std::string id,
+    strix::kernels::OperatorFamily family,
+    const strix::kernels::ShapeClass& shape,
+    double measured_seconds) {
+    strix::kernels::KernelVariant variant;
+    variant.id = std::move(id);
+    variant.family = family;
+    variant.phase =
+        strix::kernels::ExecutionPhase::decode;
+    variant.shape = shape;
+    variant.wave =
+        strix::kernels::WaveSize::wave32;
+    variant.resources.workgroup_threads = 256;
+    variant.numerics.input_precision = "bf16";
+    variant.numerics.accumulator_precision = "fp32";
+    variant.numerics.output_precision = "bf16";
+    variant.numerics.row_invariant = true;
+    variant.numerics.deterministic = true;
+    variant.qualification =
+        strix::kernels::QualificationStatus::oracle_matched;
+    variant.graph_safe = true;
+    variant.input_layout = "test";
+    variant.output_layout = "test";
+    variant.compiler_identity = "test-compiler";
+    variant.measured_seconds = measured_seconds;
+    return variant;
+}
+
+strix::kernels::KernelRegistry config_test_registry(
+    const strix::ModelContract& model,
+    const strix::ExecutionBindingRequest& request,
+    double measured_seconds = 0.0,
+    std::string suffix = "") {
+    strix::kernels::KernelRegistry registry;
+    const auto execution =
+        strix::build_serial_decode_execution_plan(model);
+
+    std::set<std::string> added;
+    for (const auto& step : execution.steps) {
+        const auto family =
+            strix::operator_family_for(step.op);
+        if (!family.has_value()) {
+            continue;
+        }
+
+        const auto shape =
+            strix::execution_shape_for(
+                model, step.op, request);
+
+        const auto key =
+            std::to_string(
+                static_cast<unsigned>(*family)) +
+            "." +
+            std::to_string(shape.logical_rows) +
+            "." +
+            std::to_string(shape.request_concurrency) +
+            "." +
+            std::to_string(shape.hidden_size) +
+            "." +
+            std::to_string(shape.auxiliary_size);
+
+        if (!added.insert(key).second) {
+            continue;
+        }
+
+        auto variant = config_test_variant(
+                "test." + key + suffix +
+                    (step.op == strix::SerialOp::moe_route && request.staged_moe_router_logits ? ".staged_logits" : "") +
+                    (step.op == strix::SerialOp::moe_route && request.wave_moe_router_topk ? ".wave.parallel" :
+                     step.op == strix::SerialOp::moe_route && request.ranked_moe_router_topk ? ".ranked.parallel" :
+                     step.op == strix::SerialOp::moe_route && request.parallel_moe_router ? ".parallel" : "") +
+                    (step.op == strix::SerialOp::moe_experts && request.batched_moe_activation ? ".batched-slot-activation-v1" : "") +
+                    (step.op == strix::SerialOp::moe_experts && request.deferred_moe_status ? ".deferred-status-v1" : "") +
+                    (step.op == strix::SerialOp::moe_experts && request.q5k_a8g32_gate_up ? ".q5k-a8g32-gateup-v1" : "") +
+                    (step.op == strix::SerialOp::moe_experts && request.a8_down_q51 ? ".q51-a8g32-down-v1" : "") +
+                    (step.op == strix::SerialOp::moe_experts && request.a8_down_q80 ? ".q80-a8g32-down-v1" : "") +
+                    (step.op == strix::SerialOp::moe_experts && request.a8_down_q51 ? ".mixed-a8-down-v1" : "") +
+                    (step.op == strix::SerialOp::moe_experts && request.grouped_exact_q51_down && !request.a8_down_q51 ? ".grouped-exact-q51-down-v1" : "") +
+                    (step.op == strix::SerialOp::moe_experts && request.q4k_a8g32_gate_up ? ".q4k-a8g32-gateup-v2" : ""),
+                *family,
+                shape,
+                measured_seconds);
+        using namespace strix;
+        using namespace q8_projection_organization;
+        if (step.op==SerialOp::gated_delta_net) {
+            if(request.wave8_q8_gdn_input) variant.id+=gdn_wave8_marker;
+            if(request.wave8_q8_gdn_output) variant.id+=gdn_output_wave8_marker;
+        }
+        if(step.op==SerialOp::indexed_attention && request.wave8_q8_qsa_output) variant.id+=qsa_output_wave8_marker;
+        if(request.dense_a8 && (step.op==SerialOp::gated_delta_net || step.op==SerialOp::indexed_attention || step.op==SerialOp::shared_expert))
+            variant.id+=dense_a8_marker;
+        if(step.op==SerialOp::lm_head && request.prefetch_q8_lm_head)
+            variant.id+=request.wave8_q8_lm_head ? lm_wave8_marker : lm_prefetch_marker;
+        if(*family==kernels::OperatorFamily::hyper_mix && request.prefetch_hc_projection_next_tile) variant.id+=".prefetch-next-tile-v1";
+        registry.add(variant);
+        // Layer-scoped selection can require either terminal suffix for one family.
+        if(step.op==SerialOp::indexed_attention) {variant.id+=qsa_input_prefetch::kernel_suffix; registry.add(variant);}
+        if(step.op==SerialOp::shared_expert) {variant.id+=shared_expert_prefetch::kernel_suffix; registry.add(variant);}
+        if(*family==kernels::OperatorFamily::hyper_mix) {variant.id+=lane_chain_hyper_output_suffix; registry.add(variant);}
+    }
+
+    return registry;
+}
+
 int failures = 0;
 void expect(bool ok, const char* message) {
     if (!ok) { ++failures; std::cerr << message << '\n'; }
@@ -198,6 +307,30 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
         catch (const std::overflow_error&) { guarded = true; }
         expect(guarded,"YaRN owner width products checked before context multiplication");
     }
+    {
+        // Exercise the process collector, including ordinary shell storage paths.
+        const auto saved = [](const char* name) -> std::optional<std::string> {
+            const auto* value = std::getenv(name);
+            return value ? std::optional<std::string>{value} : std::nullopt;
+        };
+        const auto home = saved("HOME"), xdg = saved("XDG_CACHE_HOME");
+        const auto signature = session_numerical_config("same execution");
+        ::setenv("HOME", "storage/home", 1);
+        ::setenv("XDG_CACHE_HOME", "storage/cache", 1);
+        auto collected = request;
+        collected.options.context_tokens = 524288U;
+        collected.environment = requested_prefill_environment();
+        expect(collected.environment.at("HOME") == "storage/home" &&
+            collected.environment.at("XDG_CACHE_HOME") == "storage/cache", "real collector retains storage inputs");
+        expect(resolve(collected,memory).admitted, "YaRN admits real collector with shell storage locations");
+        expect(session_numerical_config("same execution") == signature, "storage paths do not change execution signature");
+        collected.environment["STRIX_MOCK_UNCOVERED_ROTARY"] = "1";
+        expect(resolve(collected,memory).error ==
+            "YaRN execution environment not supported: STRIX_MOCK_UNCOVERED_ROTARY",
+            "storage classification still refuses unknown execution controls");
+        if (home) ::setenv("HOME",home->c_str(),1); else ::unsetenv("HOME");
+        if (xdg) ::setenv("XDG_CACHE_HOME",xdg->c_str(),1); else ::unsetenv("XDG_CACHE_HOME");
+    }
     // Reproduce the complete startup environment from the 8192-ID plain
     // command, including the two-bit MoE marker that previously refused.
     auto startup = request;
@@ -310,13 +443,15 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
     auto reserve = memory;
     reserve.estimate = [=](const Options& o) { auto value = estimate(o); value.model_backing = 103U*gib_bytes; return value; };
     expect(!resolve(request,reserve).admitted,"YaRN eight GiB reserve honored");
-    for (unsigned route = 0; route < 4; ++route) {
+    for (unsigned route = 0; route < 6; ++route) {
         auto bad = request;
         const char* reason = nullptr;
         if (route == 0) { bad.options.mtp.enabled = true; reason = "YaRN with MTP not yet qualified"; }
         if (route == 1) { bad.options.http_serve = true; reason = "YaRN on HTTP serving not supported"; }
         if (route == 2) { bad.options.teacher_forced_score = true; reason = "YaRN with teacher scoring not yet qualified"; }
         if (route == 3) { bad.options.gdn_islands = true; reason = "YaRN graph capture path not yet qualified"; }
+        if (route == 4) { bad.options.session_save = "checkpoint"; reason = "YaRN with session save/restore not yet qualified"; }
+        if (route == 5) { bad.options.prefix_cache_host_bytes = 4096; reason = "YaRN with prefix state cache not yet qualified"; }
         expect(resolve(bad,memory).error == reason,"YaRN named route refusal");
     }
     {
@@ -516,7 +651,7 @@ void long_context_admission_tests(const RequestedOptions& original, const ModelC
         const auto credit = [&](const Options& options, const Environment& environment, const ModelManifest& layout) {
             return prefill_reclaim_credit(options,model,layout,environment,observed.ple_reclaim_page);
         };
-        for (unsigned excluded = 0; excluded < 10U; ++excluded) {
+        for (unsigned excluded = 0; excluded < 13U; ++excluded) {
             auto options = admitted.options;
             if (excluded == 0U) options.residency = HipModelResidencyMode::resident_copy;
             if (excluded == 1U) options.model_copy_tier = HipModelCopyTier::all;
@@ -528,6 +663,9 @@ void long_context_admission_tests(const RequestedOptions& original, const ModelC
             if (excluded == 7U) options.serving_prefix_files.push_back("unused");
             if (excluded == 8U) options.tokens.clear();
             if (excluded == 9U) options.mtp.cohort.push_back({});
+            if (excluded == 10U) options.session_load = "checkpoint";
+            if (excluded == 11U) options.session_live_control = true;
+            if (excluded == 12U) options.session_then_prompt = "suffix.ids";
             expect(credit(options,{},manifest) == 0U, "long_context_reclaim_exclusions: unsupported runtime route earns no credit");
         }
         for (const auto& environment : {Environment{{"STRIX_MODEL_COPY_ALL","1"}},
@@ -637,6 +775,37 @@ int main(int argc, char** arguments) {
             auto disabled=configured;disabled.environment[off]="0";
             expect(resolve(disabled,memory).admitted,"ring off switches ignore an inactive rows override");
         }
+        const auto base=resolve(request,memory);
+        const auto plan_ids=[&](const Options& options) {
+            std::vector<std::uint64_t> ids;
+            for (const auto profile : {options.numerical_profile,numerical_profile_pair(options).prefill}) {
+                auto req=prompt_compiler_requests(options,model,manifest);
+                if(profile!=options.numerical_profile) req.binding.prefill_arithmetic_identity=numerical_profile_pair_identity(numerical_profile_pair(options));
+                const auto registry=config_test_registry(model,req.binding);
+                const auto compiled=compile_serial_execution(model,registry,req.binding,req.buffers,256);
+                ids.push_back(compiled.execution_identity); ids.push_back(compiled.kernel_plan_identity);
+            }
+            return ids;
+        };
+        const auto base_ids=plan_ids(base.options);
+        const auto numerical=[](EffectiveConfig c) {
+            c.environment.erase("STRIX_PREFIX_CACHE"); c.environment.erase("STRIX_PREFIX_CACHE_RETENTION");
+            c.sources.erase("--prefix-cache"); c.sources.erase("--prefix-cache-retention");
+            c.options.prefix_cache=true; c.options.prefix_cache_retention="fair";
+            c.options.prefix_cache_reason="not-serving";
+            return effective_config_json(c);
+        };
+        for (const auto& suffix : std::vector<std::vector<std::string>>{{},{"--prefix-cache","off"},{"--prefix-cache-retention","lru"}}) {
+            std::vector<std::string> args{"decoder","MODEL"}; args.insert(args.end(),32768,"1");
+            args.insert(args.end(),{"--generate","32"}); args.insert(args.end(),suffix.begin(),suffix.end());
+            auto r=request; r.options=parse(args);
+            const auto got=resolve(r,memory);
+            expect(got.options.route_owned==base.options.route_owned && numerical(got)==numerical(base) && plan_ids(got.options)==base_ids,
+                "operational prefix options preserve full numerical effective config and plan identities");
+        }
+        auto r=request; r.environment["STRIX_PREFIX_CACHE"]="0";
+        const auto got=resolve(r,memory);
+        expect(got.options.route_owned==base.options.route_owned && numerical(got)==numerical(base) && plan_ids(got.options)==base_ids,"environment off numerical identity");
     }
     // Model the runtime TU's pre-main environment before exercising the same
     // capture/resolver and baseline cleanup used by decode-token.
@@ -966,6 +1135,230 @@ int main(int argc, char** arguments) {
     const auto absent_build = resolve_effective_config(request,model,info,manifest,validated_model_content_identity,
         {false,true,true},memory);
     expect(!absent_build.admitted, "missing A8 capability declines");
+    {
+        Options route;
+        route.http_serve=true;
+        route.mtp.enabled=true; route.mtp.draft_chain=true;
+        route.known_prefix_window=true; route.known_prefix_full_rows=true;
+        route.known_prefix_prefill_rows=1024; route.generate_tokens=32;
+        Environment env{{"HOME",std::filesystem::temp_directory_path().string()},{"STRIX_SESSION_DISK","0"}};
+        for (const bool mtp : {false,true}) for (const unsigned slots : {0U,1U,4U}) {
+            auto production=route; production.mtp.enabled=mtp; production.http_batch=slots;
+            resolve_session_defaults(production,model,env,128*gib_bytes);
+            EffectiveConfig c; c.options=production;
+            expect(!production.session_management_requested && !production.session_cache &&
+                effective_config_notice(c)=="session cache: off (route not yet GPU-qualified: " +
+                    std::string(session_serving_route(production)) + ")\nprefix cache: off (not-serving)\n", "unqualified serving routes fail closed");
+        }
+        expect(!session_route_gpu_qualified("cli-target") && !session_route_gpu_qualified("unknown"), "serving-only qualification table");
+        for (const auto& entry : session_route_qualifications)
+            expect(!entry.gpu_qualified, "no serving route qualified today");
+        auto explicit_cli=parse({"decoder","MODEL","1","--session-cache","on","--session-load","checkpoint"});
+        resolve_session_defaults(explicit_cli,model,env,128*gib_bytes);
+        EffectiveConfig cli_config; cli_config.options=explicit_cli;
+        const auto cli_json=serve::parse_json(effective_config_json(cli_config));
+        expect(!explicit_cli.session_cache && explicit_cli.session_load=="checkpoint" &&
+            explicit_cli.session_off_reason=="cli-save-load-explicit" &&
+            effective_config_notice(cli_config)=="session cache: off (cli-save-load-explicit)\n" &&
+            cli_json.find("session_cache")->find("policy")->as_string()=="qualified-serving-routes-only" &&
+            cli_json.find("session_cache")->find("cli_operations")->as_string()=="explicit-save-load",
+            "CLI cache switch does not enable automatic save/load");
+        route.supplied_options.insert("--session-mtp-fixed");
+        route.supplied_options.insert("--session-tiled-suffix");
+        auto live=route; live.session_live_control=true;
+        resolve_session_defaults(live,model,env,128*gib_bytes);
+        expect(live.session_management_requested,"explicit live control qualification remains accessible");
+        for (const auto* flag : {"--session-cache", "--session-disk", "--session-dir", "--session-ram-bytes",
+                "--session-disk-bytes", "--session-max-parked", "--session-capture-host-bytes"}) {
+            auto parsed=parse({"decoder","MODEL","1",flag,
+                std::string_view(flag)=="--session-cache" || std::string_view(flag)=="--session-disk" ? "off" : "42"});
+            expect(!parsed.route_owned && !parsed.session_options_requested,"storage policy cannot change numerical route");
+            auto incumbent=parse({"decoder","MODEL","1"});
+            for (auto* candidate : {&parsed,&incumbent}) {
+                candidate->tokens.resize(32768,1); candidate->known_prefix_window=true;
+                candidate->known_prefix_full_rows=true; candidate->known_prefix_prefill_explicit=true;
+                candidate->known_prefix_prefill_rows=8192;
+                apply_default_known_prefill_tails(*candidate,"8");
+            }
+            expect(parsed.known_prefix_tail_rows==incumbent.known_prefix_tail_rows &&
+                parsed.known_prefix_ladder_tail_rows==incumbent.known_prefix_ladder_tail_rows,
+                "storage policy cannot affect tail pruning");
+        }
+        for (const unsigned slots : {1U,4U}) for (const bool enabled : {false,true}) {
+            auto ordinary=route; ordinary.http_batch=slots; ordinary.session_management_requested=enabled;
+            ordinary.http_sampling="sample";
+            expect(ordinary_http_batch_slots(ordinary)==slots && ordinary.http_sampling=="sample",
+                "unnamed scheduling and sampling survive session admission including batch 1");
+        }
+        auto on=route; resolve_session_defaults(on,model,env,128*gib_bytes);
+        expect(on.session_cache && on.session_management_requested && !on.session_disk &&
+            on.session_ram_bytes==8*gib_bytes && on.session_max_parked==8 &&
+            on.session_dir==(std::filesystem::temp_directory_path()/".cache/strix-engine/sessions").string(),
+            "serving session defaults and RAM-only switch");
+        auto cli=parse({"decoder","MODEL","1","--session-cache","off","--session-disk","off","--session-disk-bytes","42"});
+        expect(!cli.session_cache && !cli.session_disk && cli.session_disk_bytes==42,"session CLI switches parse");
+        auto disabled=route; auto env_off=env; env_off["STRIX_SESSION_CACHE"]="0";
+        resolve_session_defaults(disabled,model,env_off,128*gib_bytes);
+        expect(!disabled.session_cache && !disabled.session_management_requested && disabled.session_off_reason=="disabled","environment cache off");
+        for (const bool baseline_cli : {false,true}) {
+            auto base_route=route; auto base_env=env;
+            if (baseline_cli) base_route.baseline=true; else base_env["STRIX_BASELINE"]="1";
+            resolve_session_defaults(base_route,model,base_env,128*gib_bytes);
+            expect(!base_route.session_cache && base_route.session_off_reason=="baseline","baseline disables sessions");
+        }
+        auto disk_cli=parse({"decoder","MODEL","1","--session-disk","off"});
+        auto disk_cli_route=route; disk_cli_route.session_disk=disk_cli.session_disk;
+        disk_cli_route.supplied_options.insert(disk_cli.supplied_options.begin(),disk_cli.supplied_options.end());
+        auto disk_cli_env=env; disk_cli_env["STRIX_SESSION_DISK"]="1";
+        resolve_session_defaults(disk_cli_route,model,disk_cli_env,128*gib_bytes);
+        expect(disk_cli_route.session_cache && !disk_cli_route.session_disk,"CLI disk off overrides env on");
+        auto cli_off_route=route; cli_off_route.session_cache=cli.session_cache;
+        cli_off_route.supplied_options=cli.supplied_options;
+        resolve_session_defaults(cli_off_route,model,env,128*gib_bytes);
+        expect(!cli_off_route.session_management_requested,"CLI cache off disables serving");
+        auto resolver_off=request; resolver_off.options.http_serve=true;
+        resolver_off.environment["STRIX_SESSION_CACHE"]="0";
+        const auto resolved_off=resolve(resolver_off,memory);
+        const auto off_json=serve::parse_json(effective_config_json(resolved_off));
+        expect(!off_json.find("session_cache")->find("enabled")->as_bool() &&
+            off_json.find("session_cache")->find("reason")->as_string()=="disabled", "full resolver JSON environment off");
+        auto legacy_prefix=route; legacy_prefix.prefix_cache_host_bytes=1U<<20;
+        resolve_session_defaults(legacy_prefix,model,env,128*gib_bytes);
+        expect(!legacy_prefix.session_cache,"existing prefix cache retains unnamed request behavior");
+        auto small_route=route; resolve_session_defaults(small_route,model,env,1);
+        expect(!small_route.session_cache && small_route.session_off_reason=="insufficient-memory","session memory guard");
+        auto unknown=route; resolve_session_defaults(unknown,model,env,{});
+        expect(!unknown.session_cache && unknown.session_off_reason=="memory-observation-unavailable","unknown session memory declines");
+        auto unqualified=route; unqualified.mtp.draft_chain=false;
+        resolve_session_defaults(unqualified,model,env,128*gib_bytes);
+        expect(!unqualified.session_cache && unqualified.session_off_reason=="route-not-qualified","unsupported HTTP route declines");
+        auto batch=route; batch.http_batch=4; resolve_session_defaults(batch,model,env,128*gib_bytes);
+        expect(!batch.session_management_requested && batch.http_batch==4 && batch.session_off_reason=="http-batch-requires-ordinary-scheduler","batch concurrency retained");
+        auto disk=route; auto disk_env=env; disk_env.erase("STRIX_SESSION_DISK");
+        disk.session_dir=(std::filesystem::temp_directory_path()/"qwen-session-defaults-test").string();
+        resolve_session_defaults(disk,model,disk_env,128*gib_bytes);
+        expect(disk.session_cache && disk.session_disk && disk.session_disk_bytes>0,"disk default cap and writable directory");
+        auto bad_disk=route; bad_disk.session_dir=__FILE__;
+        resolve_session_defaults(bad_disk,model,disk_env,128*gib_bytes);
+        expect(bad_disk.session_cache && !bad_disk.session_disk && !bad_disk.session_disk_off_reason.empty(),"disk failure preserves RAM");
+        EffectiveConfig config; config.options=on;
+        const auto session_json=serve::parse_json(effective_config_json(config));
+        const auto* fields=session_json.find("session_cache");
+        expect(fields && fields->find("enabled")->as_bool() && fields->find("ram_bytes") &&
+            fields->find("disk_bytes") && fields->find("dir") && fields->find("reason"),"effective JSON session fields");
+        config.options=batch;
+        expect(effective_config_notice(config)=="session cache: off (http-batch-requires-ordinary-scheduler)\nprefix cache: off (not-serving)\n","one decline notice per store");
+    }
+    {
+        Options route; route.http_serve=true; route.known_prefix_window=true; route.known_prefix_full_rows=true;
+        route.known_prefix_prefill_rows=1024; route.generate_tokens=10; route.context_tokens=8192;
+        const auto resolved=[&](Options o, Environment e={}, std::optional<std::uint64_t> a=128*gib_bytes) {
+            constexpr SessionRouteQualification test_only[]={{"http-target",true}};
+            resolve_prefix_defaults(o,model,e,a,test_only); return o;
+        };
+        for (const auto& entry : prefix_auto_route_qualifications) {
+            expect(!entry.gpu_qualified,"automatic prefix routes remain unqualified");
+            auto production=route; production.mtp.enabled=entry.route!="http-target";
+            production.http_batch=entry.route=="http-mtp-batch" ? 2 : 0;
+            resolve_prefix_defaults(production,model,{},128*gib_bytes);
+            expect(production.prefix_cache_host_bytes==0 && production.prefix_cache_source=="off" &&
+                production.prefix_cache_reason=="automatic budget not yet GPU-qualified: " + std::string(entry.route),"production auto budget gated");
+            EffectiveConfig prefix_notice; prefix_notice.options=production;
+            expect(effective_config_notice(prefix_notice).find("prefix cache: off ("+production.prefix_cache_reason+")\n")!=std::string::npos,"qualified route notice");
+        }
+        const auto auto_prefix=resolved(route);
+        expect(auto_prefix.prefix_cache_host_bytes==4*gib_bytes && auto_prefix.prefix_cache_source=="auto","prefix fitted default on");
+        expect(resolved(route,{},16*gib_bytes).prefix_cache_host_bytes==gib_bytes,"prefix MemAvailable fraction");
+        expect(resolved(route,{},{}).prefix_cache_reason=="memory-observation-unavailable","prefix unknown observation");
+        expect(resolved(route,{},1).prefix_cache_reason=="checkpoint-does-not-fit","prefix insufficient checkpoint fit");
+        auto wrong=route; wrong.known_prefix_full_rows=false;
+        expect(resolved(wrong).prefix_cache_reason=="route-not-accepted","prefix existing acceptance predicate");
+        auto nonhttp=route; nonhttp.http_serve=false;
+        expect(resolved(nonhttp).prefix_cache_host_bytes==0,"prefix non-HTTP unchanged");
+        auto sessions=route; sessions.session_management_requested=true; sessions.session_cache=true;
+        auto kept=resolved(sessions);
+        expect(kept.session_management_requested && kept.session_cache && kept.prefix_cache_host_bytes==0 &&
+            kept.prefix_cache_reason=="sessions-admitted","automatic prefix never disables sessions");
+        auto explicit_budget=route; explicit_budget.prefix_cache_host_bytes=12345;
+        explicit_budget.supplied_options.insert("--prefix-cache-host-bytes");
+        expect(resolved(explicit_budget,{},1).prefix_cache_host_bytes==12345,"explicit budget wins fitting");
+        expect(resolved(explicit_budget,{{"STRIX_PREFIX_CACHE","0"}}).prefix_cache_host_bytes==0,"prefix env off");
+        auto cli=route; cli.supplied_options.insert("--prefix-cache"); cli.prefix_cache=true;
+        cli.supplied_options.insert("--prefix-cache-retention"); cli.prefix_cache_retention="lru";
+        auto precedence=resolved(cli,{{"STRIX_PREFIX_CACHE","0"},{"STRIX_PREFIX_CACHE_RETENTION","fair"}});
+        expect(precedence.prefix_cache_host_bytes==4*gib_bytes && precedence.prefix_cache_retention=="lru","prefix CLI wins env");
+        auto prefix_baseline=resolved(cli,{{"STRIX_BASELINE","1"}});
+        EffectiveConfig baseline_notice; baseline_notice.options=prefix_baseline;
+        expect(effective_config_json(baseline_notice).find("\"prefix_cache\"")==std::string::npos,"environment baseline receipt omits prefix object");
+        expect(effective_config_notice(baseline_notice).find("prefix cache:")==std::string::npos,"baseline has no new prefix stderr line");
+        expect(!prefix_baseline.prefix_cache_host_bytes && prefix_baseline.prefix_cache_retention=="lru" && prefix_baseline.prefix_cache_reason=="baseline","baseline wins prefix policy");
+        auto staging_cli=parse({"decoder","MODEL","1","--prefix-cache-staging-bytes","123456"});
+        expect(staging_cli.prefix_cache_staging_bytes==123456 && operational_session_option("--prefix-cache-staging-bytes"),
+            "staging cap is an operational CLI option");
+        auto staging_env=resolved(route,{{"STRIX_PREFIX_CACHE_STAGING_BYTES","234567"}});
+        expect(staging_env.prefix_cache_staging_bytes==234567,"staging environment cap");
+        auto staging_input=route;staging_input.prefix_cache_staging_bytes=345678;
+        staging_input.supplied_options.insert("--prefix-cache-staging-bytes");
+        expect(resolved(staging_input,{{"STRIX_PREFIX_CACHE_STAGING_BYTES","234567"}}).prefix_cache_staging_bytes==345678,
+            "staging CLI wins environment");
+        auto parsed=parse({"decoder","MODEL","1","--prefix-cache","off","--prefix-cache-retention","lru"});
+        expect(!parsed.prefix_cache && parsed.prefix_cache_retention=="lru","prefix switches parse");
+        auto baseline_explicit=explicit_budget; baseline_explicit.baseline=true;
+        baseline_explicit.prefix_cache_dir="explicit-dir"; baseline_explicit.prefix_cache_every=4096;
+        baseline_explicit.prefix_cache_every_explicit=true;
+        baseline_explicit.prefix_cache_then_prompts={"prompt-file"};
+        for (const auto& e : {Environment{}, Environment{{"STRIX_BASELINE","1"}}}) {
+            auto input=baseline_explicit; input.baseline=e.empty();
+            const auto got=resolved(input,e);
+            expect(got.prefix_cache_host_bytes==12345 && got.prefix_cache_dir=="explicit-dir" &&
+                got.prefix_cache_every==4096 && got.prefix_cache_every_explicit &&
+                got.prefix_cache_then_prompts==input.prefix_cache_then_prompts && got.prefix_cache_retention=="lru",
+                "baseline preserves every explicit prefix option");
+        }
+        auto decline=route; decline.http_serve=false; decline.prefix_cache_dir="kept";
+        decline.prefix_cache_every_explicit=true; decline.prefix_cache_every=4096;
+        decline.prefix_cache_then_prompts={"kept-prompt"};
+        auto declined_prefix=resolved(decline);
+        expect(declined_prefix.prefix_cache_dir=="kept" && declined_prefix.prefix_cache_every_explicit &&
+            declined_prefix.prefix_cache_every==4096 && declined_prefix.prefix_cache_then_prompts==decline.prefix_cache_then_prompts,
+            "automatic decline preserves explicit options");
+        for (const auto& e : {Environment{{"STRIX_PREFIX_CACHE","invalid"}},
+                Environment{{"STRIX_PREFIX_CACHE_RETENTION","invalid"}}}) {
+            bool threw=false;
+            try { (void)resolved(route,e); } catch (const std::invalid_argument&) { threw=true; }
+            expect(threw,"strict shared environment parser rejects invalid policy");
+        }
+        Options standalone;
+        apply_prefix_cache_environment(standalone, [](const char* name) -> std::optional<std::string_view> {
+            if (std::string_view(name)=="STRIX_BASELINE") return "1";
+            if (std::string_view(name)=="STRIX_PREFIX_CACHE") return "on";
+            return std::nullopt;
+        });
+        expect(standalone.baseline && standalone.prefix_cache_retention=="lru", "non-resolver policy honours baseline env");
+        const auto baseline_cli=parse({"decoder","MODEL","1","--baseline","--generate","4",
+            "--known-prefix-window","--known-prefix-full-rows","--known-prefix-prefill-rows","1024",
+            "--known-prefix-workspace-budget-bytes","1048576","--known-prefix-host-metadata-budget-bytes","1048576",
+            "--known-prefix-uma-budget-bytes","1048576","--known-prefix-host-headroom-bytes","0",
+            "--deferred-moe-status","--virtual-q8-gdn-input","--prefetch-q8-gdn-input",
+            "--virtual-q8-gdn-output","--wave8-q8-gdn-input","--wave8-q8-gdn-output",
+            "--prefix-cache-host-bytes","12345","--prefix-cache-dir","explicit-dir",
+            "--prefix-cache-every","4096","--prefix-cache-then-prompt","next-prompt"});
+        expect(baseline_cli.prefix_cache_host_bytes==12345 && baseline_cli.prefix_cache_dir=="explicit-dir" &&
+            baseline_cli.prefix_cache_every_explicit && baseline_cli.prefix_cache_every==4096 &&
+            baseline_cli.prefix_cache_then_prompts==std::vector<std::string>{"next-prompt"} &&
+            baseline_cli.prefix_cache_retention=="lru", "CLI baseline preserves explicit prefix options before resolver");
+        auto off_cli=parse({"decoder","MODEL","1","--prefix-cache","off",
+            "--prefix-cache-host-bytes","12345","--prefix-cache-dir","explicit-dir",
+            "--prefix-cache-every","4096","--prefix-cache-then-prompt","next-prompt"});
+        expect(!prefix_state_cache_requested(off_cli),"explicit off clears explicit prefix settings before validation");
+        EffectiveConfig disabled; disabled.options=off_cli;
+        expect(effective_config_notice(disabled).find("prefix cache: off (disabled)\n")!=std::string::npos,
+            "explicit off prints the decline line outside HTTP too");
+        EffectiveConfig c; c.options=auto_prefix;
+        const auto j=serve::parse_json(effective_config_json(c));
+        expect(j.find("prefix_cache")->find("enabled")->as_bool() &&
+            j.find("prefix_cache")->find("source")->as_string()=="auto","effective prefix config JSON");
+    }
     auto gsq_manifest = manifest;
     ManifestTensor gsq_gate;
     gsq_gate.name = "blk.0.ffn_gate_exps.weight"; gsq_gate.ggml_type = gsq_a8::type_q2_0;
@@ -996,6 +1389,10 @@ int main(int argc, char** arguments) {
             return qsa_decode_pool_route(parse(args), false);
         };
         expect(route({}), "decode pool on for the plain CLI route");
+        for(const auto& flags : std::vector<std::vector<std::string>>{
+                {"--session-save","checkpoint"},{"--session-load","checkpoint"},
+                {"--session-live-control"},{"--session-save","checkpoint","--session-then-prompt","4,5"}})
+            expect(route(flags),"decode pool stays on for save/restore/park/continuation");
         expect(!qsa_decode_pool_route(parse({"decoder","target.gguf","1","2","3","--generate","4"}), true), "decode pool off for GSQ models");
         auto cached = parse({"decoder","target.gguf","1","2","3","--generate","4"});
         cached.prefix_cache_host_bytes = UINT64_C(1) << 30U;
@@ -1091,6 +1488,28 @@ int main(int argc, char** arguments) {
         expect(std::string(qsa_decode_pool_route_suppression(cached, false)) == "prefix-state-cache",
             "the prefix state cache is the reported route exclusion");
     }
+    for(int master=0;master<4;++master) {
+        Options modes; modes.session_tiled_suffix=true; modes.session_mtp_fixed=true;
+        modes.supplied_options.insert("--session-tiled-suffix"); modes.supplied_options.insert("--session-mtp-fixed");
+        Environment env;
+        if(master==1) modes.baseline=true;
+        if(master==2) env["STRIX_BASELINE"]="1";
+        if(master==3) env["STRIX_QPF2K_DEFAULTS"]="0";
+        resolve_session_defaults(modes,model,env,UINT64_C(8)<<30);
+        expect(modes.session_tiled_suffix_requested && modes.session_mtp_fixed_requested,"session mode requests retained");
+        expect(modes.session_tiled_suffix==(master==0) && modes.session_mtp_fixed==(master==0),"masters suppress both numerical modes");
+        auto modes_json=session_modes_json(modes);
+        for(const char* name:{"tiled_suffix","mtp_fixed"}) {
+            expect(modes_json.find(name)->find("requested")->as_bool(),"mode requested disclosed");
+            expect(modes_json.find(name)->find("effective")->as_bool()==(master==0),"mode effective disclosed");
+            expect(modes_json.find(name)->find("bit_changing")->as_bool(),"mode bit-changing disclosed");
+            expect(modes_json.find(name)->find("suppression")->as_string().empty()==(master==0),"suppression disclosed");
+        }
+    }
+    EffectiveConfig receipt; receipt.options.baseline=true;
+    expect(effective_config_json(receipt).find("\"prefix_cache\"")==std::string::npos,"baseline receipt omits additive prefix object");
+    receipt.options.baseline=false;
+    expect(effective_config_json(receipt).find("\"prefix_cache\"")!=std::string::npos,"nonbaseline receipt includes additive prefix object");
     std::cout << "qwen effective config: " << failures << " failures\n";
     return failures ? 1 : 0;
 }

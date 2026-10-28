@@ -83,6 +83,16 @@ when it stops.
   engine stops after the current cycle).
 - A failure inside the engine leaves the target state unknown: the failing request gets an error,
   `/health` answers 503 and the process stops with a non-zero exit status.
+  Opportunistic prefix capture is read-only: a checkpoint that cannot fit is a
+  `budget_skips` miss. Only a typed pinned-allocation failure (including allocator
+  `std::bad_alloc`) with a successful capture-stream drain drops partial buffers
+  and increments `capture_failures` without failing the request. Destinations stay
+  in a process-lifetime quarantine if completion or the drain returns an error.
+  Quarantined owners are never freed; one line records static count/byte totals
+  before the error propagates and the engine fail-stops. Successful drains release
+  partial buffers normally. Restore source leases use the same contract. Every HIP
+  fence, copy, completion or drain error propagates, including OOM. Baseline explicit-cache capture and explicit
+  session checkpoint operations retain their original failure contracts.
 - Decoding is greedy unless the batched route samples (below). A request with `temperature > 0` is decoded greedy
   and the response carries `strix.note`; with `--http-sampling reject` it gets a 400 instead.
 
@@ -235,6 +245,14 @@ Streaming sends `reasoning_content` and `content` deltas as they are decoded (ho
 bytes that may belong to a stop string, a `</think>` or `<tool_call>` marker, an incomplete UTF-8
 sequence or trailing whitespace), tool calls when they are complete, a final chunk with
 `finish_reason`, optionally a usage chunk, and `data: [DONE]`.
+Named-session capture admission runs before streaming headers: a refused budget
+returns the same HTTP 507 JSON error with code `session_budget` as a non-streaming
+request. If capture admission fails later, completions and chat send one
+`data: {"error":{"type":"server_error","message":"...","status":507,"code":"session_budget"}}`
+event and close without a final finish reason or `[DONE]`. Messages sends
+`event: error` with `{"type":"error","error":{"type":"api_error","message":"...","status":507,"code":"session_budget"}}`
+and closes without `message_delta` or `message_stop`. These errors affect only the
+request; the server continues serving.
 
 ### Thinking budget
 
@@ -778,7 +796,6 @@ encode|plain|decode FILE` exposes the tokenizer on the command line.
 
 A separate, older route serves a fixed list of token files in one process without HTTP.
 
-
 Source implementation only. No native equivalence, concurrent execution or
 throughput qualification is established by these interfaces.
 
@@ -1020,3 +1037,57 @@ at piece boundaries, followed by a miss, partial cache hit, whole cache hit and
 imported-state replacement. Compare every surviving request with its isolated
 complete-ID/logit/state reference. SSE text and this curl smoke scenario alone
 cannot establish exactness. Change one off switch per A/B arm and restart both ranks.
+## Request retention and cache statistics
+
+The [HTTP server](serving.md) accepts the same optional storage policy on
+`POST /v1/chat/completions`, `/v1/completions` and `/v1/messages`:
+
+```json
+{"state_cache":{"retain":false}}
+```
+
+Absent means server policy; `true` permits ordinary retention; `false` allows hits
+but prevents new prefix captures, host promotion of disk hits and publication of a
+named turn's new frontier. Existing parked/published parent bytes remain unchanged.
+The policy travels with queued single and batch jobs. It does not change token
+selection, numerical profiles or scheduler inputs. A present field must be an
+object containing boolean `retain`, otherwise the API returns HTTP 400 with
+`invalid_request_error` and a field-specific explanation.
+
+Authenticated `GET /v1/cache/stats` is available when prefix retention or named
+session management is enabled, including prefix-only configurations. Existing
+`ram_bytes`, `ram_budget`, `parked`, `disk_bytes`, `hits`, `misses`, `refusals` and
+existing `engine` members remain. The additive `engine.state_cache` object uses
+`StateCacheSnapshotV1` (`schema: 1`):
+
+- `published`, monotonic `sequence`, and `age_ms` computed by the HTTP reader;
+- `prefix_enabled`, `session_enabled`, `pool_present` flags;
+- lifetime `prefix` counters, including token credit, capture/skip and eviction reasons;
+- `named` hits, misses, refusals, parked count and no-store skips;
+- `resident`, `host`, `disk` tier byte/segment/checkpoint/budget gauges;
+- a reserved `pool` object whose fields are all zero with `pool_present: false`.
+
+Session counters are zero when that feature is off. Host physical payload gauges
+include registered buffers leased after directory eviction. Disk occupancy is
+sampled by storage operations, never scanned by HTTP readers. Published responses
+represent the last completed generation or management boundary; startup exposes
+zero counters and configured budgets until the first publication. HTTP readers
+load an immutable response without entering the generation runner, synchronizing
+HIP or traversing payloads. This endpoint adds no observation arming behavior and
+makes no changes to `/metrics` or `/api/status`.
+
+See [prefix retention policy](prefix-state-cache.md) for budget fitting, fair/LRU
+controls, exact boundary rules and the current qualification limit. The certified MTP
+prefix path consumes the incumbent cold plan and resumes its whole-prompt cursor.
+It skips async capture and unsupported batch plans; automatic qualification remains
+off. Refused RAM candidates add `plan_misses`, without accepted-hit token credit.
+
+The stats endpoint returns the last immutable sample without entering the runner
+or store. Startup seeds all legacy session fields and disk budget before listening.
+Every completed request (including unnamed turns and refused operations) and
+management operation publishes a sample. While generation is blocked, reads remain
+nonblocking with respect to the runner and `age_ms` increases; a read never refreshes
+`sequence`. These are last-sample gauges, not a synchronous live-store observation.
+Ledger byte and segment gauges are read together. Eviction reason counters have
+their own scope and do not sum to legacy `evicted`; explicit deletion leaves that
+legacy counter unchanged.

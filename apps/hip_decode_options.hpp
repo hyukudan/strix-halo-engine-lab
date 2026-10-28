@@ -1,6 +1,7 @@
 #pragma once
 #include "strix/rotary_descriptor.hpp"
 #include <iostream>
+#include "state_cache_stats.hpp"
 #include "strix/decode_execution_options.hpp"
 #include "strix/known_prefill_limits.hpp"
 #include "strix/qpf2k_defaults.hpp"
@@ -391,7 +392,25 @@ struct Options {
     bool serving_prefill_explicit = false, serving_prefill_workspace_explicit = false, serving_prefill_metadata_explicit = false;
     // Block-boundary prefix state cache on the tiled known-prefix prefill (docs/engine/serving/prefix-state-cache.md).
     // A positive host budget enables it; everything else is optional.
+    std::shared_ptr<StateCacheStatsMirror> state_cache_stats = std::make_shared<StateCacheStatsMirror>();
+    bool prefix_cache = true;
+    std::string prefix_cache_retention = "fair", prefix_cache_source = "off", prefix_cache_reason = "not-serving";
     std::uint64_t prefix_cache_host_bytes = 0;
+    std::uint64_t prefix_cache_staging_bytes = 0; // 0: one T-block of rows plus fixed registry
+
+    std::string session_save, session_load, session_then_prompt, session_logits;
+    bool session_tiled_suffix = false, session_mtp_fixed = false;
+    bool session_tiled_suffix_requested = false, session_mtp_fixed_requested = false;
+    std::string session_modes_suppression;
+    bool session_live_control = false, session_validate_only = false, session_options_requested = false;
+    std::uint64_t session_first_generate = 0, session_capture_host_bytes = 8ULL << 30;
+    std::string session_effective_cli;
+    std::string session_dir;
+    bool session_management_requested = false;
+    bool session_cache = true, session_disk = true;
+    std::uint64_t session_disk_bytes = 0;
+    std::string session_off_reason, session_disk_off_reason;
+    std::uint64_t session_ram_bytes = 0, session_max_parked = 0;
     std::string prefix_cache_dir;
     std::uint64_t prefix_cache_disk_bytes = 0;
     std::uint64_t prefix_cache_every = 0;  // 0: every max(T, 4096) tokens, rounded to a multiple of T
@@ -441,7 +460,9 @@ struct Options {
 // Shared by runtime setup and pre-HIP memory admission.
 [[nodiscard]] inline bool ple_reclaim_route_supported(const Options& options,
     const HipModelResidencyPolicy& residency_policy, bool graph_mode) noexcept {
-    return options.residency == HipModelResidencyMode::registered_file_mapping &&
+    // Continuations do not match the position-zero prompt hashes, prefetch plan or reclaim credit.
+    return options.session_load.empty() && !options.session_live_control && options.session_then_prompt.empty() &&
+        options.residency == HipModelResidencyMode::registered_file_mapping &&
         residency_policy.copy_tier == HipModelCopyTier::none && !residency_policy.promote_file_backed_candidates &&
         !graph_mode && options.known_prefix_prefill_rows && !options.tokens.empty() && !options.http_serve &&
         options.mtp.cohort.empty() && options.serving_prefix_files.empty() && !options.mtp.enabled &&
@@ -457,7 +478,7 @@ struct Options {
         if (mode == ple_reclaim::Mode::required)
             throw std::invalid_argument("STRIX_PLE_RECLAIMABLE=1 requires --residency register without model copies or graph mode, "
                 "a tiled known prefill (--known-prefix-prefill-rows) and a plain-route CLI prompt (no MTP route, no "
-                "--planned-ple-io, --http-serve or --serving-prefix-file)");
+                "--planned-ple-io, --http-serve, --serving-prefix-file or session continuations)");
         return ple_reclaim::Mode::off;
     }
 #if !defined(__linux__)
@@ -930,7 +951,10 @@ inline void apply_default_known_prefill_tails(Options& options, const char* sche
     // and no tails) is the same on the pf cursor and the tiled MTP prompt. Not with anything that can start the prompt
     // elsewhere or run other prompts (serving, cohorts, prefix caches / imports, wide copy cycles, lookup).
     if (const char* v = (schedule ? schedule : std::getenv("STRIX_QPF2K_SCHED")); !strix::qpf2k::suppressed(strix::qpf2k::Item::sched) && v && (std::strtoul(v, nullptr, 0) & 8UL) != 0UL &&
-        !options.tokens.empty() && !options.http_serve && options.mtp.cohort.empty() && options.serving_prefix_files.empty() &&
+        !options.tokens.empty() && !options.session_options_requested && options.session_save.empty() && options.session_load.empty() &&
+        options.session_then_prompt.empty() && options.session_logits.empty() && !options.session_live_control &&
+        !options.session_validate_only && !options.session_first_generate &&
+        !options.http_serve && options.mtp.cohort.empty() && options.serving_prefix_files.empty() &&
         options.mtp.copy_wide_rows.empty() && !options.prefix_cache_roundtrip && !options.prefix_cache_host_bytes &&
         options.prefix_cache_dir.empty() && !options.prefix_cache_block_rows && options.prefix_cache_then_prompts.empty() &&
         !options.rtx_state_import && !options.prompt_lookup && !std::getenv("STRIX_RTX_EXPORT_STATE") && !std::getenv("STRIX_MTP_TILED_START") && !std::getenv("STRIX_MTP_WIDE_COST")) {
@@ -1217,7 +1241,7 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
         throw std::invalid_argument("MTP requires its explicit raw eager target route without graph/prepared/overlap/islands/other controllers/recording");
     if(m.calibration_rows && !tiled)
         throw std::invalid_argument("MTP calibration rows require the tiled MTP prompt (--known-prefix-window with the tiled prefill)");
-    if(tiled && (mtp_calibration_rows(o)+1U>o.tokens.size() || m.metadata_only))
+    if(tiled && (((!o.session_mtp_fixed || o.http_serve) && mtp_calibration_rows(o)+1U>o.tokens.size()) || m.metadata_only))
         throw std::invalid_argument("tiled MTP prompt needs more prompt tokens than calibration rows");
     if(o.tokens.size()<3U || (!tiled && o.tokens.size()>4097U) || !o.generate_tokens || o.generate_tokens>UINT32_MAX ||
        ((resolved || o.context_explicit) && (o.tokens.size()>o.context_tokens ||
@@ -1333,6 +1357,9 @@ inline void validate_resolved_mtp_cli(const Options& o) {
 }
 
 inline std::string yarn_route_refusal(const Options& o) {
+    if (o.session_options_requested || !o.session_save.empty() || !o.session_load.empty())
+        return "YaRN with session save/restore not yet qualified";
+    if (prefix_state_cache_requested(o)) return "YaRN with prefix state cache not yet qualified";
     if (o.mtp.enabled || o.mtp.supplied || !o.mtp.cohort.empty()) return "YaRN with MTP not yet qualified";
     if (o.http_serve || o.http_batch) return "YaRN on HTTP serving not supported";
     if (o.teacher_forced_score) return "YaRN with teacher scoring not yet qualified";
@@ -1349,6 +1376,44 @@ inline std::string yarn_route_refusal(const Options& o) {
         return "YaRN explicit execution route not yet qualified";
     return {};
 }
+// Qualification live controls own their deliberate never-captured continuation only.
+inline std::uint64_t ordinary_http_batch_slots(const Options& options) {
+    return options.http_serve && !options.session_live_control ? options.http_batch : 0U;
+}
+// Cache controls own storage policy, never numerical routing or tail selection.
+inline bool operational_session_option(std::string_view flag) {
+    flag = flag.substr(0, flag.find('='));
+    return flag == "--prefix-cache-staging-bytes" || flag == "--prefix-cache" || flag == "--prefix-cache-retention" || flag == "--session-cache" || flag == "--session-disk" || flag == "--session-dir" ||
+        flag == "--session-ram-bytes" || flag == "--session-disk-bytes" ||
+        flag == "--session-max-parked" || flag == "--session-capture-host-bytes";
+}
+// One strict policy parser for CLI-only paths and effective-config resolution.
+template<class Lookup>
+inline void apply_prefix_cache_environment(Options& o, Lookup lookup) {
+    if (!o.supplied_options.contains("--prefix-cache")) {
+        if (const auto v = lookup("STRIX_PREFIX_CACHE")) {
+            if (*v != "0" && *v != "1" && *v != "on" && *v != "off")
+                throw std::invalid_argument("STRIX_PREFIX_CACHE requires 0|1|on|off");
+            o.prefix_cache = *v == "1" || *v == "on";
+        }
+    }
+    if (!o.supplied_options.contains("--prefix-cache-retention"))
+        if (const auto v = lookup("STRIX_PREFIX_CACHE_RETENTION")) o.prefix_cache_retention = *v;
+    if (!o.supplied_options.contains("--prefix-cache-staging-bytes"))
+        if (const auto v=lookup("STRIX_PREFIX_CACHE_STAGING_BYTES"))
+            o.prefix_cache_staging_bytes=parse_u64(*v,"prefix cache staging bytes");
+    if (o.prefix_cache_retention != "fair" && o.prefix_cache_retention != "lru")
+        throw std::invalid_argument("prefix cache retention requires fair|lru");
+    if (const auto v = lookup("STRIX_BASELINE"); v && *v == "1") o.baseline = true;
+    if (o.baseline) o.prefix_cache_retention = "lru";
+    if (!o.prefix_cache) {
+        o.prefix_cache_host_bytes = 0; o.prefix_cache_dir.clear(); o.prefix_cache_block_rows = 0;
+        o.prefix_cache_disk_bytes_explicit = false; o.prefix_cache_every_explicit = false;
+        o.prefix_cache_then_prompts.clear();
+        o.prefix_cache_source = "off"; o.prefix_cache_reason = "disabled";
+    }
+}
+
 inline Options parse_options(
     int argc,
     char** argv, bool defer_qpf2k_defaults = false) {
@@ -1366,7 +1431,7 @@ inline Options parse_options(
             "[--context N [--unqualified-context]] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert|experts --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
-            "[--prefix-cache-host-bytes N [--prefix-cache-dir DIR [--prefix-cache-disk-bytes N]] [--prefix-cache-every N] [--prefix-cache-then-prompt FILE ...]] "
+            "[--prefix-cache on|off] [--prefix-cache-retention fair|lru] [--prefix-cache-host-bytes N [--prefix-cache-dir DIR [--prefix-cache-disk-bytes N]] [--prefix-cache-every N] [--prefix-cache-then-prompt FILE ...]] "
             "[--parallel-moe-router] [--ranked-moe-router-topk | --wave-moe-router-topk] "
             "[--prefetch-q8-qsa-input] [--prefetch-q8-shared-expert] [--prefetch-q8-lm-head [--wave8-q8-lm-head]] [--wave8-q8-gdn-input] [--wave8-q8-gdn-output] [--wave8-q8-qsa-output] [--virtual-q8-lm-head] [--virtual-q8-gdn-input [--prefetch-q8-gdn-input]] [--q4k-a8g32-gate-up [--grouped-exact-q51-down]] [--deferred-moe-status] "
             "[--parallel-hyper-mix [--staged-hyper-projections [--fused-staged-hyper-mix [--typed-fused-hyper-projections [--prefetch-typed-hyper-rows] [--prefetch-q8-hyper-output [--lane-chain-hyper-output]]]]]]");
@@ -1432,7 +1497,7 @@ inline Options parse_options(
             argument != "--context" && !argument.starts_with("--context=") && argument != "--unqualified-context" &&
             !argument.starts_with("--optimization-profile") && !argument.starts_with("--numerical-profile") &&
             !argument.starts_with("--prefill-numerical-profile") && !argument.starts_with("--execution-mode") &&
-            !argument.starts_with("--residency")) options.route_owned = true;
+            !argument.starts_with("--residency") && !operational_session_option(argument)) options.route_owned = true;
 
         options.any_low_level_flag = options.any_low_level_flag ||
             is_low_level_optimization_option(argument);
@@ -1744,7 +1809,64 @@ inline Options parse_options(
             enabled = true;
             continue;
         }
-        if (argument == "--prefix-cache-host-bytes" || argument == "--prefix-cache-disk-bytes" ||
+        if (argument.starts_with("--session-") && !operational_session_option(argument)) options.session_options_requested = true;
+        if (argument == "--session-cache" || argument == "--session-disk") {
+            if (index + 1 >= argc) throw std::invalid_argument("session option requires a value");
+            const std::string_view value = argv[++index];
+            if (value != "on" && value != "off") throw std::invalid_argument("session switch expects on|off");
+            (argument == "--session-cache" ? options.session_cache : options.session_disk) = value == "on";
+            continue;
+        }
+        if (argument == "--session-disk-bytes") {
+            if (index + 1 >= argc) throw std::invalid_argument("session option requires a value");
+            options.session_disk_bytes = parse_u64(argv[++index], "session disk bytes");
+            continue;
+        }
+        if (argument == "--session-tiled-suffix" || argument == "--session-mtp-fixed") {
+            options.session_options_requested = true;
+            (argument == "--session-tiled-suffix" ? options.session_tiled_suffix : options.session_mtp_fixed) = true;
+            continue;
+        }
+        if (argument == "--session-live-control" || argument == "--session-validate-only") {
+            (argument == "--session-live-control" ? options.session_live_control : options.session_validate_only) = true;
+            continue;
+        }
+        if (argument == "--session-first-generate" || argument == "--session-capture-host-bytes") {
+            if (index + 1 >= argc) throw std::invalid_argument("session option requires a value");
+            const auto value = parse_u64(argv[++index], "session count/budget");
+            if (!value) throw std::invalid_argument("session count/budget must be positive");
+            (argument == "--session-first-generate" ? options.session_first_generate : options.session_capture_host_bytes) = value;
+            continue;
+        }
+        if (argument == "--session-dir" || argument == "--session-ram-bytes" || argument == "--session-max-parked") {
+            if (index + 1 >= argc) throw std::invalid_argument("session option requires a value");
+            const std::string_view value = argv[++index];
+            if (argument == "--session-dir") options.session_dir = value;
+            else if (argument == "--session-ram-bytes") options.session_ram_bytes = parse_u64(value, "session RAM bytes");
+            else options.session_max_parked = parse_u64(value, "session max parked");
+            continue;
+        }
+        if (argument == "--session-save" || argument == "--session-load" || argument == "--session-then-prompt" || argument == "--session-logits") {
+            if (index + 1 >= argc) throw std::invalid_argument("session option requires a value");
+            auto& target = argument == "--session-save" ? options.session_save : argument == "--session-load" ? options.session_load :
+                argument == "--session-then-prompt" ? options.session_then_prompt : options.session_logits;
+            if (!target.empty()) throw std::invalid_argument("duplicate session option");
+            target = argv[++index];
+            continue;
+        }
+        if (argument == "--prefix-cache" || argument == "--prefix-cache-retention") {
+            if (++index >= argc) throw std::invalid_argument("missing prefix cache option value");
+            const std::string value = argv[index];
+            if (argument == "--prefix-cache") {
+                if (value != "on" && value != "off") throw std::invalid_argument("--prefix-cache requires on|off");
+                options.prefix_cache = value == "on";
+            } else {
+                if (value != "fair" && value != "lru") throw std::invalid_argument("--prefix-cache-retention requires fair|lru");
+                options.prefix_cache_retention = value;
+            }
+            continue;
+        }
+        if (argument == "--prefix-cache-staging-bytes" || argument == "--prefix-cache-host-bytes" || argument == "--prefix-cache-disk-bytes" ||
             argument == "--prefix-cache-every" || argument == "--prefix-cache-dir" ||
             argument == "--prefix-cache-then-prompt" || argument == "--prefix-cache-block-rows") {
             if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
@@ -1758,6 +1880,8 @@ inline Options parse_options(
             } else if (argument == "--prefix-cache-block-rows") {
                 if (options.prefix_cache_block_rows) throw std::invalid_argument("duplicate --prefix-cache-block-rows");
                 options.prefix_cache_block_rows = parse_u64(value, "prefix cache block rows");
+            } else if (argument == "--prefix-cache-staging-bytes") {
+                options.prefix_cache_staging_bytes=parse_u64(value,"prefix cache staging bytes");
             } else if (argument == "--prefix-cache-host-bytes") {
                 if (options.prefix_cache_host_bytes) throw std::invalid_argument("duplicate --prefix-cache-host-bytes");
                 options.prefix_cache_host_bytes = parse_u64(value, "prefix cache host bytes");
@@ -2755,6 +2879,10 @@ inline Options parse_options(
     apply_mtp_draft_profile(options.mtp);
     resolve_http_route(options);
     validate_mtp_cli(options);
+    apply_prefix_cache_environment(options, [](const char* name) -> std::optional<std::string_view> {
+        if (const char* v = std::getenv(name)) return v;
+        return std::nullopt;
+    });
     validate_prefix_state_cache(options);
     validate_http_serve(options);
     return options;

@@ -15,6 +15,7 @@
 #include <chrono>
 #include "strix/serial_request.hpp"
 #include "strix/arithmetic_lineage.hpp"
+#include "strix/prompt_terminal_diagnostics.hpp"
 #include "strix/model_content_hash.hpp"
 #include <algorithm>
 #include <optional>
@@ -68,6 +69,7 @@ struct HipMtpTargetHiddenTicket::Lease {
     std::optional<std::uint64_t> block_begin;
     // STRIX_SERIAL_LOGITS_DIGEST=1 (diagnostic): SHA-256 of this serial row's FP32 logits.
     std::optional<ModelContentIdentity> logits_digest;
+    std::optional<ModelContentIdentity> terminal_digest;
 };
 struct HipMtpTargetHidden::Impl {
     struct Slot {
@@ -92,6 +94,7 @@ struct HipMtpTargetHidden::Impl {
     // Sampled selection (null: finite first-max) and its host copy of the logits row.
     std::shared_ptr<TokenSampler> sampler;
     std::vector<float> sampled_logits;
+    std::function<void(std::uint64_t, std::span<const float>)> session_logits;
     std::unique_ptr<HipTokenSamplerDevice> device_sampler; // sampling-v1 on the GPU (STRIX_SAMPLE_HOST=1: host)
     ExecutionMemoryBinding deferred_status;
     std::uint64_t status_lease=0;
@@ -158,6 +161,10 @@ std::uint32_t HipMtpTargetHiddenTicket::input_token() const {if(!lease_)throw st
 std::uint32_t HipMtpTargetHiddenTicket::predicted_token() const {if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");return lease_->predicted;}
 const SerialSessionContext& HipMtpTargetHiddenTicket::committed_session() const {if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");return lease_->prefix_committed?*lease_->prefix_committed:lease_->batch?lease_->batch->committed_session():lease_->committed;}
 std::optional<ModelContentIdentity> HipMtpTargetHiddenTicket::serial_logits_digest() const {return lease_ ? lease_->logits_digest : std::nullopt;}
+std::optional<ModelContentIdentity> HipMtpTargetHiddenTicket::terminal_logits_digest() const {
+    if(!lease_) return std::nullopt;
+    return lease_->batch ? lease_->batch->terminal_logits_digest(lease_->batch_row) : lease_->terminal_digest;
+}
 ModelContentIdentity HipMtpTargetHiddenTicket::target_content_identity() const {if(!lease_)throw std::invalid_argument("MTP target hidden ticket is empty");return lease_->content;}
 RotaryIdentity HipMtpTargetHiddenTicket::producer_rotary_identity() const {
     if(!lease_ || !lease_->owner) throw std::invalid_argument("MTP target hidden ticket is empty");
@@ -377,11 +384,18 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial_unselected(
             }
             // STRIX_SERIAL_LOGITS_DIGEST=1 (diagnostic, gates): the row's FP32 logits digest (prompt receipts report the terminal one).
             static const bool logits_digest=[]{const char* v=std::getenv("STRIX_SERIAL_LOGITS_DIGEST");return v && v[0]=='1';}();
-            if(logits_digest) {
+            if(logits_digest || prompt_terminal_digest_enabled()) {
                 std::vector<float> row;
                 read_hip_logits_row(i.logits,static_cast<std::uint32_t>(i.model->vocab_size),i.stream,row);
                 const auto bytes=std::as_bytes(std::span<const float>(row));
-                lease->logits_digest=sha256_bytes(std::vector<std::byte>(bytes.begin(),bytes.end()));
+                const auto digest=sha256_bytes(std::vector<std::byte>(bytes.begin(),bytes.end()));
+                if(logits_digest) lease->logits_digest=digest;
+                if(prompt_terminal_digest_enabled()) lease->terminal_digest=raw_fp32_logits_digest(row);
+            }
+            if(i.session_logits) {
+                std::vector<float> row;
+                read_hip_logits_row(i.logits,static_cast<std::uint32_t>(i.model->vocab_size),i.stream,row);
+                i.session_logits(lease->position,row);
             }
             if(i.shadow)i.shadow->publish();
         });
@@ -395,6 +409,11 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial_unselected(
         session.health=SerialSessionHealth::poisoned;session.arithmetic_lineage.tainted=true;
         throw;
     }
+}
+void HipMtpTargetHidden::set_session_logits_observer(std::function<void(std::uint64_t, std::span<const float>)> observer) {
+    // Clearing is also allowed during failure unwind, before captured callback locals expire.
+    if(observer && (impl_->busy || impl_->failed)) throw std::invalid_argument("session logits observer needs idle target");
+    impl_->session_logits=std::move(observer);
 }
 void HipMtpTargetHidden::set_token_sampler(std::shared_ptr<TokenSampler> sampler) {
     auto& i=*impl_;
@@ -446,6 +465,7 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::adopt_prefill_row(const SerialSessi
         check(hipStreamSynchronize(i.stream),"MTP prefill row capture completion");
         i.guard->require_original();
     } catch(...) {i.failed=true;i.busy=false;i.guard->recover_or_fail_stop();throw;}
+    if(i.session_logits) i.session_logits(lease->position,logits);
     lease->committed=session;
     slot->reader=lease;i.busy=false;i.started=true;
     HipMtpTargetHiddenTicket ticket;ticket.lease_=std::move(lease);return ticket;

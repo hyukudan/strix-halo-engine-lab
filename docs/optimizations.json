@@ -1,6 +1,28 @@
 [
   {
     "engine": "qwen",
+    "name": "Plan-neutral prefix cache on the MTP serving route",
+    "flag_or_env": "--prefix-cache; STRIX_PREFIX_CACHE; --prefix-cache-host-bytes; --prefix-cache-staging-bytes; STRIX_PREFIX_CACHE_STAGING_BYTES",
+    "default": "ON when a cache is configured on an eligible MTP route; automatic serving budget qualification-gated OFF",
+    "exact": "Host-only incumbent numerical planner; RAM-only restores require a complete plan certificate. Bounded producer-stream snapshots publish only after validation and D2H completion. CPU planner differential and deferred-DMA shim coverage; native equality and workload qualification pending.",
+    "gain": "No measured throughput claim.",
+    "preconditions": "Ordinary full-T single-request MTP boundaries with matching numerical plan, complete registered state and available host credits, descriptor and staging capacity. Session resume, RTX imports/exports, batch/group and uncertified producers decline certified capture.",
+    "off_switch": "--prefix-cache off / STRIX_PREFIX_CACHE=0 disables caching. --baseline / STRIX_BASELINE=1 retains the legacy cache plan and disables automatic budgeting. Explicit staging cap bounds snapshot bytes.",
+    "doc_anchor": "docs/engine/serving/prefix-state-cache.md#certified-mtp-subset"
+  },
+  {
+    "engine": "qwen",
+    "name": "Prefix cache retention, per-request no-store and cache statistics",
+    "flag_or_env": "--prefix-cache on|off; STRIX_PREFIX_CACHE; --prefix-cache-retention fair|lru; STRIX_PREFIX_CACHE_RETENTION; state_cache.retain; GET /v1/cache/stats",
+    "default": "ON when a cache is configured; fair retention; automatic serving budget qualification-gated OFF",
+    "exact": "Complete cached boundaries only; CPU retention, API, reservation and DMA failure contracts tested. Automatic production routes remain unqualified; native execution and model-fidelity gates are still required.",
+    "gain": "No measured throughput claim.",
+    "preconditions": "Explicit host budget and eligible tiled prefill route. No-store permits hits but suppresses capture, disk-hit promotion and new named-frontier publication. Statistics are immutable last-boundary samples.",
+    "off_switch": "--prefix-cache off / STRIX_PREFIX_CACHE=0 disables prefix caching; --prefix-cache-retention lru / STRIX_PREFIX_CACHE_RETENTION=lru selects legacy eviction. --baseline / STRIX_BASELINE=1 selects lru and disables automatic budgeting.",
+    "doc_anchor": "docs/engine/serving/prefix-state-cache.md#prefix-retention-policy"
+  },
+  {
+    "engine": "qwen",
     "name": "Automatic HTTP capacity, lazy slot growth and bounded joint groups",
     "flag_or_env": "--http-batch; STRIX_HTTP_EAGER_SLOTS; --http-max-queue; --http-max-connections",
     "default": "AUTO capacity; at most 4 eager slots; 65536 queued requests; 4096 connections",

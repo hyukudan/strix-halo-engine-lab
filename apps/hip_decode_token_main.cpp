@@ -1050,6 +1050,11 @@ int STRIX_DECODE_ENTRY(
             "  --lane-chain-hyper-output (requires --prefetch-q8-hyper-output)\n"
             "  --record-raw ABS_NEW_PRIVATE_DIRECTORY --record-max-bytes BYTES\n"
             "  --record-state-policy final|each --prefix-cache-roundtrip\n"
+            "  --session-cache on|off --session-disk on|off (HTTP defaults on when admitted)\n"
+            "  --session-ram-bytes N --session-max-parked N --session-dir DIR --session-disk-bytes N\n"
+            "  --session-save DIR | --session-load DIR | --session-live-control [--session-then-prompt FILE] [--session-logits FILE]\n"
+            "  --session-first-generate N (first turn only); --session-capture-host-bytes N (default 8 GiB); --session-validate-only (CPU preflight)\n"
+            "  --prefix-cache-staging-bytes N (0: one T-block plus fixed state; STRIX_PREFIX_CACHE_STAGING_BYTES)\n"
             "  --prefix-cache-host-bytes N [--prefix-cache-dir DIR [--prefix-cache-disk-bytes N]] [--prefix-cache-every N]\n"
             "      [--prefix-cache-then-prompt FILE ...] (block-boundary prefix state cache, tiled known-prefix prefill only)\n"
             "  --http-serve [--http-bind ADDR] [--http-port N] [--http-model-id NAME] [--http-api-key-file FILE]\n"
@@ -1076,6 +1081,23 @@ int STRIX_DECODE_ENTRY(
             argv, true);
     const auto startup_preflight = strix::emit_qwen_startup_diagnostics(options.print_effective_config);
     const auto release_assets = strix::decode_cli::verify_http_release_assets(options);
+    // Bind supplied numerical settings; operational paths, switches and budgets are excluded.
+    const std::set<std::string_view> session_io_options{"--session-save", "--session-load", "--session-then-prompt", "--session-logits",
+        "--session-cache", "--session-disk", "--session-disk-bytes", "--session-first-generate", "--session-capture-host-bytes", "--session-dir", "--session-ram-bytes", "--session-max-parked", "--http-port",
+        "--generate", "--tokens-file", "--record-raw", "--reference", "--teacher-logits-file"};
+    for (int i = 2; i < argc; ++i) {
+        const std::string_view arg = argv[i];
+        if (!arg.starts_with("--")) continue; // positional token IDs
+        if (arg == "--session-live-control" || arg == "--session-validate-only") continue;
+        if (session_io_options.count(arg)) { ++i; continue; }
+        options.session_effective_cli += std::to_string(arg.size()) + ":" + std::string(arg);
+        if (i + 1 < argc && !std::string_view(argv[i + 1]).starts_with("--")) {
+            const std::string_view value = argv[++i];
+            options.session_effective_cli += std::to_string(value.size()) + ":" + std::string(value);
+        }
+    }
+    bool session_cache_enabled = !options.session_save.empty() || !options.session_load.empty() || options.session_live_control;
+
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     const bool target_input_export = strix::tests::mtp_target_input_export_requested();
     if(target_input_export)strix::tests::validate_mtp_target_input_export(options,false);
@@ -1190,6 +1212,10 @@ int STRIX_DECODE_ENTRY(
     std::shared_ptr<const strix::MappedModelFile> mapped_owner = std::make_shared<strix::MappedModelFile>(
         strix::MappedModelFile::open_read_only(options.model_path, "model", generations));
     const auto& mapped = *mapped_owner;
+    // Bind the existing full digest to its file stamp before the long model upload.
+    const auto session_model_digest = session_cache_enabled
+        ? strix::session_cached_file_hash(options.model_path, mapped.file_sha256())
+        : strix::ModelContentIdentity{};
 
 #ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
     constexpr bool has_auto_a8_runtime = true;
@@ -1223,6 +1249,9 @@ int STRIX_DECODE_ENTRY(
     std::unique_ptr<strix::ple_reclaim::Prefetcher> yarn_preflight_reclaimer;
     strix::decode_cli::PrefillCapabilities prompt_capabilities;
     prompt_capabilities.a8_runtime = has_auto_a8_runtime;
+    // TODO(R3): automatic prefix budgets remain gated off. Qualifying them requires
+    // a post-weight-residency observation after lane plans, shared prefix/capture
+    // peak admission and reserved host headroom; this early observation is insufficient.
     auto prompt_memory = strix::decode_cli::observe_prefill_memory(prompt_capabilities);
     prompt_memory.estimate = [&](const strix::decode_cli::Options& candidate) {
         return strix::decode_cli::compile_prompt_requirements(candidate, model, manifest, mapped.bytes());
@@ -1268,6 +1297,43 @@ int STRIX_DECODE_ENTRY(
         {options, requested_environment, !target_input_export}, model, info, manifest,
         admitted_content, prompt_capabilities, prompt_memory);
     options = effective.options;
+    if (!options.session_modes_suppression.empty() &&
+        (options.session_tiled_suffix_requested || options.session_mtp_fixed_requested))
+        std::cerr << "session numerical modes suppressed: " << options.session_modes_suppression << '\n';
+    if (options.session_management_requested && (!options.http_serve || !options.session_mtp_fixed ||
+        !options.session_ram_bytes || !options.session_max_parked))
+        throw std::invalid_argument("HTTP sessions require --session-mtp-fixed, positive RAM/count budgets");
+    if (options.session_mtp_fixed && (!options.mtp.enabled || !options.mtp.draft_chain ||
+        !options.mtp.draft_vocab.empty() || options.mtp.draft_context_vocab || options.mtp.draft_q4 || options.mtp.sample_temperature > 0 ||
+        !options.mtp.cohort.empty() || !options.mtp.copy_wide_rows.empty() || options.mtp.ngram_draft ||
+        options.mtp.sample_repeats != 1 || options.mtp.metadata_only || !options.mtp.golden_dump.empty()))
+        throw std::invalid_argument("fixed MTP sessions require MTP draft chain, full draft vocabulary and greedy selection");
+    session_cache_enabled = !options.session_save.empty() || !options.session_load.empty() || options.session_live_control || options.session_management_requested;
+    if ((options.session_tiled_suffix || options.session_mtp_fixed) && !session_cache_enabled && !options.http_serve)
+        throw std::invalid_argument("session route options require save/load/live-control or HTTP management budgets");
+    if (session_cache_enabled || !options.session_then_prompt.empty() || !options.session_logits.empty() ||
+        options.session_first_generate || options.session_validate_only) {
+        if (options.session_live_control && (!options.session_save.empty() || !options.session_load.empty()))
+            throw std::invalid_argument("live control cannot save or load");
+        if (options.session_validate_only && options.session_load.empty())
+            throw std::invalid_argument("session validation requires --session-load");
+        if (options.session_first_generate && (!options.session_load.empty() || options.session_then_prompt.empty()))
+            throw std::invalid_argument("first-turn budget requires same-process suffix continuation");
+        if (!session_cache_enabled || ((options.mtp.enabled || options.mtp.supplied || options.http_serve) && !options.session_mtp_fixed) ||
+            !options.known_prefix_window || !options.known_prefix_full_rows || options.known_prefix_prefill_rows < 1024 ||
+            (options.prefix_cache_block_rows && options.prefix_cache_block_rows < 1024) || options.prompt_lookup ||
+            options.prefix_cache_roundtrip || options.gpu_greedy_token || options.teacher_forced_score || options.gdn_islands ||
+            !options.raw_recording_path.empty() || !options.validation_final_state_path.empty() || !options.prefix_cache_then_prompts.empty() ||
+            !options.generate_tokens || options.execution.mode != strix::DecodeExecutionMode::eager ||
+            options.execution.integer_head != strix::DecodeIntegerHead::none)
+            throw std::invalid_argument("session cache: requires greedy tiled full-row route with >=1024-row cache units; MTP/HTTP require --session-mtp-fixed; speculation/RAW unsupported");
+        if (!options.session_then_prompt.empty() && options.session_save.empty() && !options.session_live_control)
+            throw std::invalid_argument("--session-then-prompt requires --session-save or --session-live-control");
+        if (!options.session_logits.empty() && options.session_load.empty() && options.session_then_prompt.empty() &&
+            !(options.http_serve && options.session_mtp_fixed))
+            throw std::invalid_argument("--session-logits requires a loaded or same-process suffix continuation");
+    }
+
     model.attention_kv_storage = options.attention_kv_storage;
     std::cerr << strix::decode_cli::effective_config_notice(effective);
     if (options.print_effective_config) {
@@ -1287,6 +1353,14 @@ int STRIX_DECODE_ENTRY(
         const auto source = effective.sources.find(entry.name);
         if (source != effective.sources.end() && source->second == strix::decode_cli::OptionSource::automatic)
             strix::qpf2k::defaulted_items |= strix::qpf2k::bit(entry.item);
+    }
+    // Validate after the resolver injected its environment: the saved key was computed with it (CPU only, no upload).
+    if (options.session_validate_only) {
+        if (options.session_load.empty()) throw std::invalid_argument("session validation requires --session-load");
+        strix::preflight_session_checkpoint(options.session_load, strix::session_cached_file_hash("/proc/self/exe"),
+            strix::session_numerical_config(options.session_effective_cli,model.rotary_identity()), options.session_capture_host_bytes);
+        std::cerr << "session preflight PASS (CPU envelope/executable/supplied settings only; no model upload)\n";
+        return 0;
     }
     auto optimization_profile = effective.organization;
     const auto base_optimization_profile = optimization_profile.selected;
@@ -2943,15 +3017,22 @@ int STRIX_DECODE_ENTRY(
             known_group_backend = std::make_unique<strix::HipKnownPromptBackend>(known_group_owner, session,
                 known_group_memory->scratch, model.vocab_size, original_work_device);
         }
-        const bool rtx_state_registry = !strix::decode_cli::prefix_state_cache_requested(options) &&
-            strix::decode_cli::mtp_tiled_prompt(options) && (options.rtx_state_import || strix::decode_cli::rtx_state_export_request() ||
-            strix::decode_cli::prompt_state_digest_request());
+        // Sessions use the registry without legacy prefix lookup/capture in every arm.
+        const bool rtx_state_registry = session_cache_enabled || (!strix::decode_cli::prefix_state_cache_requested(options) &&
+            strix::decode_cli::mtp_tiled_prompt(options) &&
+                (options.rtx_state_import || strix::decode_cli::rtx_state_export_request() ||
+                    strix::decode_cli::prompt_state_digest_request()));
         if (strix::decode_cli::prefix_state_cache_requested(options) || rtx_state_registry) {
             if (!known_prefill_plan || !known_prefix_backend)
                 throw std::logic_error("prefix state cache reached a route other than the tiled known-prefix prefill");
             const auto pair = strix::decode_cli::numerical_profile_pair(options);
             strix::decode_cli::PrefixStateCacheIdentityInputs in;
             in.model_content = model_residency.binding().model_content_identity;
+            std::string execution_cli;
+            for(const auto& arg : strix::decode_cli::effective_prefill_argv(options))
+                execution_cli += std::to_string(arg.size())+":"+arg;
+            in.effective_execution = strix::decode_cli::prefix_effective_execution_signature(
+                execution_cli, options.baseline, strix::qpf2k::has_gsq_gate(manifest), model.rotary_identity());
             if (!options.prefix_cache_dir.empty()) in.engine_build = strix::decode_cli::prefix_state_cache_engine_build();
             in.state_layout_identity = state_layout.layout_identity;
             in.runtime_compatibility_identity = identities.compatibility_identity;
@@ -2976,11 +3057,14 @@ int STRIX_DECODE_ENTRY(
                 prefix_cache_every = options.prefix_cache_every ? options.prefix_cache_every
                     : std::max<std::uint64_t>(rows, (4096U + rows - 1U) / rows * rows);
                 prefix_store = std::make_shared<strix::PrefixStateCache>(strix::PrefixStateCachePolicy{
-                    options.prefix_cache_host_bytes, options.prefix_cache_dir, options.prefix_cache_disk_bytes},
-                    strix::decode_cli::hip_pinned_prefix_buffer);
+                    options.prefix_cache_host_bytes, options.prefix_cache_dir, options.prefix_cache_disk_bytes,
+                    options.prefix_cache_retention == "fair" ? strix::PrefixCacheRetention::fair : strix::PrefixCacheRetention::lru, options.baseline},
+                    options.baseline ? strix::decode_cli::hip_pinned_prefix_buffer : strix::decode_cli::hip_pinned_prefix_capture_buffer);
+                options.state_cache_stats->publish(strix::decode_cli::prefix_snapshot(*prefix_store));
                 prefix_state = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(prefix_store,
                     prefix_cache_identity, prefix_cache_unit(options), prefix_cache_every, model, state_layout,
                     memory.state());
+                prefix_state->set_staging_cap(options.prefix_cache_staging_bytes);
             }
         }
     }
@@ -3017,6 +3101,21 @@ int STRIX_DECODE_ENTRY(
             for (std::size_t w = 0; w < known_wide_owners.size(); ++w)
                 tiled.wide.push_back({nullptr, known_wide_owners[w], options.mtp.copy_wide_rows[w]});
             tiled.rows = options.known_prefix_prefill_rows;
+            tiled.numerical_plan.block.execution=known_prefill_plan->prefill_execution_identity;
+            tiled.numerical_plan.block.kernel=known_prefill_plan->prefill_kernel_plan_identity;
+            for(const auto& tail:known_tail_plans) {
+                strix::decode_cli::QwenPlanOwner owner;
+                owner.execution=tail->prefill_execution_identity;owner.kernel=tail->prefill_kernel_plan_identity;
+                tiled.numerical_plan.tails.push_back(owner);
+            }
+            tiled.numerical_plan.decode_execution=compiled.execution_identity;
+            tiled.numerical_plan.decode_kernel=compiled.kernel_plan_identity;
+            tiled.numerical_plan.prefill_execution=compiled_prefill?compiled_prefill->execution_identity:compiled.execution_identity;
+            tiled.numerical_plan.prefill_kernel=compiled_prefill?compiled_prefill->kernel_plan_identity:compiled.kernel_plan_identity;
+            const auto plan_profiles=strix::decode_cli::numerical_profile_pair(options);
+            tiled.numerical_plan.prefill_profile=strix::numerical_profile_identity(plan_profiles.prefill);
+            tiled.numerical_plan.decode_profile=strix::numerical_profile_identity(plan_profiles.decode);
+            tiled.numerical_plan.profile_pair=strix::numerical_profile_pair_identity(plan_profiles);
             // Split prefill profile: the block backends above hand the session to the prefill execution.
             tiled.prefill_execution_identity = compiled_prefill ? compiled_prefill->execution_identity : 0U;
             tiled.cache = prefix_state ? prefix_state.get() : rtx_state_session.get();
@@ -3044,7 +3143,7 @@ int STRIX_DECODE_ENTRY(
         // requests build their owners on one shared window stream.
         const auto window_factory_for = [&](std::shared_ptr<strix::decode_cli::MtpDecodeTargetParents> request_parents,
             std::shared_ptr<const SharedWindowStream> window_stream) -> strix::decode_cli::MtpDecodeWindowFactory {
-            if (!options.mtp.window_rows) return {};
+            if (!options.mtp.window_rows || (options.session_mtp_fixed && !options.http_serve)) return {};
             return [&, request_parents, window_stream](std::shared_ptr<strix::HipMtpTargetHidden> target) {
               const auto row_set = options.mtp.window_rows_set.empty()
                   ? std::vector<std::uint32_t>{options.mtp.window_rows} : options.mtp.window_rows_set;
@@ -3197,11 +3296,27 @@ int STRIX_DECODE_ENTRY(
             else if (rtx_state_session)   // STRIX_PROMPT_STATE_DIGEST without a prefix cache: each slot gets its own registry
                 stack.cache = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(nullptr, prefix_cache_identity,
                     options.known_prefix_prefill_rows, options.known_prefix_prefill_rows, model, state_layout, stack.memory->state());
+            if(stack.cache) stack.cache->set_staging_cap(options.prefix_cache_staging_bytes);
             auto& tiled = stack.parents->tiled;
             tiled.blocks = stack.blocks.get(); tiled.block_owner = stack.block_owner;
             for (std::size_t t = 0; t < stack.tails.size(); ++t)
                 tiled.tails.push_back({stack.tails[t].get(), stack.tail_owners[t], options.known_prefix_tail_rows[t]});
             tiled.rows = options.known_prefix_prefill_rows;
+            tiled.numerical_plan.block.execution=known_prefill_plan->prefill_execution_identity;
+            tiled.numerical_plan.block.kernel=known_prefill_plan->prefill_kernel_plan_identity;
+            for(const auto& tail:known_tail_plans) {
+                strix::decode_cli::QwenPlanOwner owner;
+                owner.execution=tail->prefill_execution_identity;owner.kernel=tail->prefill_kernel_plan_identity;
+                tiled.numerical_plan.tails.push_back(owner);
+            }
+            tiled.numerical_plan.decode_execution=compiled.execution_identity;
+            tiled.numerical_plan.decode_kernel=compiled.kernel_plan_identity;
+            tiled.numerical_plan.prefill_execution=compiled_prefill?compiled_prefill->execution_identity:compiled.execution_identity;
+            tiled.numerical_plan.prefill_kernel=compiled_prefill?compiled_prefill->kernel_plan_identity:compiled.kernel_plan_identity;
+            const auto plan_profiles=strix::decode_cli::numerical_profile_pair(options);
+            tiled.numerical_plan.prefill_profile=strix::numerical_profile_identity(plan_profiles.prefill);
+            tiled.numerical_plan.decode_profile=strix::numerical_profile_identity(plan_profiles.decode);
+            tiled.numerical_plan.profile_pair=strix::numerical_profile_pair_identity(plan_profiles);
             tiled.prefill_execution_identity = compiled_prefill ? compiled_prefill->execution_identity : 0U;
             tiled.cache = stack.cache.get();
             tiled.cache_tails = prefix_store && prefix_cache_unit(options) < options.known_prefix_prefill_rows;
@@ -3235,11 +3350,11 @@ int STRIX_DECODE_ENTRY(
         }
         // Batched decoding: cohort requests on the tiled prompt (one slot per request) or --http-batch N.
         std::size_t batch_slots = tiled_route && !options.mtp.cohort.empty() ? 1U + options.mtp.cohort.size()
-            : options.http_serve && options.http_batch ? options.http_batch : 0U;
+            : strix::decode_cli::ordinary_http_batch_slots(options);
         std::shared_ptr<const SharedWindowStream> batch_stream;
         std::vector<std::unique_ptr<CohortStack>> batch_stacks;
         std::function<bool()> batch_memory_ok;
-        if (options.http_serve && options.http_batch) {
+        if (strix::decode_cli::ordinary_http_batch_slots(options)) {
             using namespace strix::decode_cli;
             const auto add = [](std::uint64_t a, std::uint64_t b) {
                 if (b > UINT64_MAX - a) throw std::overflow_error("HTTP slot cost overflow");
@@ -4018,7 +4133,7 @@ int STRIX_DECODE_ENTRY(
         request.context_capacity =
             options.context_tokens;
         request.max_new_tokens =
-            options.generate_tokens;
+            options.session_first_generate ? options.session_first_generate : options.generate_tokens;
         request.eos_token_id =
             generation_eos;
 
@@ -4079,12 +4194,138 @@ int STRIX_DECODE_ENTRY(
                     strix::HipPromptLookupSnapshotPolicy{options.prompt_lookup_snapshot, options.prompt_lookup_snapshot_bytes});
         }
 
+        auto* session_registry = prefix_state ? prefix_state.get() : rtx_state_session.get();
+        strix::SessionCompatibility session_compatibility;
+        std::vector<std::uint32_t> session_history;
+        std::optional<std::uint32_t> session_pending;
+        std::uint64_t session_emitted = 0;
+        std::vector<std::pair<std::filesystem::path, strix::ModelContentIdentity>> session_files;
+        if (session_cache_enabled) {
+            if (!session_registry) throw std::logic_error("session component registry missing");
+            session_compatibility.model = strix::session_cached_file_hash(options.model_path);
+            if (session_compatibility.model != session_model_digest)
+                throw std::runtime_error("session model changed during model setup");
+            session_compatibility.executable = strix::session_cached_file_hash("/proc/self/exe");
+            session_files.emplace_back(options.model_path, session_compatibility.model);
+            std::cerr << "session model_hash=reused_mapped_full_digest\n";
+            session_files.emplace_back("/proc/self/exe", session_compatibility.executable);
+            std::string session_assets = "target=" + strix::model_content_identity_hex(session_compatibility.model);
+            for (const auto& path : {options.dense_q6p_pack_path, options.dense_trellis_pack_path,
+                    options.offline_tuning_cache_path, options.offline_compile_provenance_path})
+                if (!path.empty()) {
+                    const auto digest = strix::session_cached_file_hash(path);
+                    session_files.emplace_back(path, digest);
+                    session_assets += ";asset=" + path + ":" + strix::model_content_identity_hex(digest);
+                }
+            session_compatibility.model = strix::sha256_bytes(std::as_bytes(std::span(session_assets.data(), session_assets.size())));
+            hipDeviceProp_t properties{}; int runtime = 0, driver = 0;
+            check_hip(hipGetDeviceProperties(&properties, original_work_device->device_index()), "session device properties");
+            check_hip(hipRuntimeGetVersion(&runtime), "session runtime version");
+            check_hip(hipDriverGetVersion(&driver), "session driver version");
+            const std::string observed = ";gpu-arch=" + std::string(properties.gcnArchName) +
+                ";gpu-name=" + properties.name + ";runtime=" + std::to_string(runtime) + ";driver=" + std::to_string(driver);
+            session_compatibility.numerical_config = strix::session_numerical_config(options.session_effective_cli,model.rotary_identity()) + session_assets + observed +
+                ";compiled-prefix-identity=" + strix::model_content_identity_hex(prefix_cache_identity) + ";rank=0;world=1;bf16-kv";
+        }
+        // Diagnostic rows are raw native FP32 vocabulary rows, beginning at the suffix's terminal input.
+        class SessionLogitsBackend final : public strix::SerialGreedyStepBackend {
+        public:
+            strix::SerialGreedyStepBackend& inner_;
+            std::ofstream file;
+            bool recording = false;
+            std::uint64_t rows_written = 0;
+            explicit SessionLogitsBackend(strix::SerialGreedyStepBackend& b) : inner_(b) {}
+            std::vector<float> execute(std::uint32_t token, std::uint64_t position) override {
+                auto row = inner_.execute(token, position);
+                if (recording && file.is_open()) {
+                    file.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(row.size() * sizeof(float)));
+                    if (!file) throw std::runtime_error("session logits write failed");
+                    ++rows_written;
+                }
+                return row;
+            }
+        } session_logit_backend(*generation_backend);
+        if (session_cache_enabled && !options.session_logits.empty()) {
+            session_logit_backend.file.open(options.session_logits, std::ios::binary | std::ios::trunc);
+            if (!session_logit_backend.file) throw std::runtime_error("cannot open --session-logits");
+        }
+        const auto run_session_suffix = [&](std::span<const std::uint32_t> suffix) {
+            std::vector<std::uint32_t> inputs;
+            if (session_pending) inputs.push_back(*session_pending);
+            inputs.insert(inputs.end(), suffix.begin(), suffix.end());
+            if (inputs.empty()) throw std::invalid_argument("session continuation requires a nonempty suffix or pending input");
+            if (inputs.size() > options.context_tokens - session.next_position ||
+                options.generate_tokens > options.context_tokens - session.next_position - inputs.size())
+                throw std::invalid_argument("session suffix and generation exceed context");
+            for (const auto token : inputs) if (token >= model.vocab_size)
+                throw std::invalid_argument("session token exceeds vocabulary");
+            const auto start = std::chrono::steady_clock::now();
+            std::vector<float> logits;
+            std::size_t i = 0;
+            const auto rows = options.known_prefix_prefill_rows;
+            const auto suffix_plan = strix::plan_session_suffix(session.next_position, inputs.size(), rows,
+                options.session_tiled_suffix && static_cast<bool>(known_prefill_plan));
+            const bool tiled = suffix_plan.tiled;
+            const auto alignment = suffix_plan.serial_rows;
+            const auto serial = static_cast<std::size_t>(alignment);
+            for (; i < serial; ++i) {
+                session_logit_backend.recording = i + 1 == inputs.size();
+                logits = session_logit_backend.execute(inputs[i], session.next_position);
+            }
+            if (tiled) {
+                strix::KnownPromptChunkRequest paired;
+                paired.prompt_tokens = std::span<const std::uint32_t>(inputs).subspan(i);
+                paired.start_position = session.next_position;
+                paired.vocab_size = model.vocab_size; paired.context_capacity = options.context_tokens;
+                paired.max_new_tokens = options.generate_tokens; paired.eos_token_id = generation_eos;
+                paired.logical_rows = rows; paired.tiled_prefill = true;
+                paired.output_policy = options.known_prefix_output_policy;
+                paired.ladder_tail_rows = options.known_prefix_ladder_tail_rows;
+                // Same boundary cursor as prefix restore; no asynchronous scheduling across observations.
+                session_logit_backend.recording = false;
+                strix::KnownPromptChunkCursor chunks(paired, *known_prefix_backend, session_logit_backend);
+                for (auto& tail : known_tail_backends) chunks.set_tail_backend(*tail);
+                while (chunks.advance()) {}
+                const auto frontier = chunks.frontier();
+                if (!frontier.valid || frontier.logits.size() != model.vocab_size)
+                    throw std::logic_error("session tiled suffix lacks a completed terminal head");
+                logits.assign(frontier.logits.begin(), frontier.logits.end());
+                if (session_logit_backend.file.is_open()) {
+                    session_logit_backend.file.write(reinterpret_cast<const char*>(logits.data()),
+                        static_cast<std::streamsize>(logits.size() * sizeof(float)));
+                    if (!session_logit_backend.file) throw std::runtime_error("session tiled logits write failed");
+                    ++session_logit_backend.rows_written;
+                }
+                session_logit_backend.recording = true;
+            }
+            session_history.insert(session_history.end(), inputs.begin(), inputs.end());
+            std::cerr << "session suffix_route=" << (tiled ? "aligned-tiled" : "serial")
+                << " alignment_steps=" << (tiled ? alignment : 0U) << '\n';
+            std::cerr << "session suffix_ms=" << std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count() << '\n';
+            strix::SerialGreedyContinuationRequest continuation{logits, session.next_position, model.vocab_size,
+                options.context_tokens, options.generate_tokens, generation_eos};
+            const auto generation_start = std::chrono::steady_clock::now();
+            auto generated = strix::execute_serial_greedy_continuation(continuation, session_logit_backend);
+            std::cerr << "session generation_ms=" << std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - generation_start).count() << '\n';
+            return generated;
+        };
+        const auto remember_session_generation = [&](const strix::SerialGreedyRequestResult& generated) {
+            // Every emitted token except the last has been consumed by the ordinary greedy controller.
+            if (!generated.generated_tokens.empty()) {
+                session_history.insert(session_history.end(), generated.generated_tokens.begin(), generated.generated_tokens.end() - 1);
+                session_pending = generated.generated_tokens.back();
+            } else session_pending.reset();
+            session_emitted += generated.generated_tokens.size();
+            if (session_history.size() != session.next_position)
+                throw std::runtime_error("session capture refused: generation frontier is not represented exactly");
+        };
         // One tiled known-prefix request: restore the longest cached block-boundary prefix (prefix
         // state cache), prefill the rest in T-row blocks (capturing selected boundaries), generate.
         const auto run_known_prompt = [&](std::span<const std::uint32_t> prompt) -> strix::SerialGreedyRequestResult {
-            const std::uint64_t restored = prefix_state ? prefix_state->begin_request(session, prompt) : 0U;
             strix::KnownPromptChunkRequest paired;
-            paired.prompt_tokens = prompt.subspan(static_cast<std::size_t>(restored));
+            paired.prompt_tokens = prompt;
             paired.start_position = session.next_position;
             paired.vocab_size = request.vocab_size; paired.context_capacity = request.context_capacity;
             paired.max_new_tokens = request.max_new_tokens; paired.eos_token_id = request.eos_token_id;
@@ -4093,17 +4334,64 @@ int STRIX_DECODE_ENTRY(
             paired.output_policy = options.known_prefix_output_policy;
             // Teacher-forced: no headless block, and the serial suffix rows are scored like serial rows.
             paired.all_row_heads = options.teacher_forced_score;
-            paired.schedule_extensions = !prefix_state;
+            paired.schedule_extensions = true;
             paired.ladder_tail_rows = options.known_prefix_ladder_tail_rows;
             strix::KnownPromptChunkCursor chunks(paired, *known_prefix_backend,
                 options.teacher_forced_score ? *generation_backend : static_cast<strix::SerialGreedyStepBackend&>(backend));
             for (auto& tail : known_tail_backends) chunks.set_tail_backend(*tail);
+            if(prefix_state) {
+                strix::decode_cli::QwenTiledPlanConfig plan;
+                plan.rows=paired.logical_rows;
+                const char* sched=std::getenv("STRIX_QPF2K_SCHED");
+                plan.schedule=sched?static_cast<std::uint32_t>(std::strtoul(sched,nullptr,0)):0U;
+                plan.suppressed=strix::qpf2k::suppressed(strix::qpf2k::Item::sched,known_prefix_backend->gsq_model());
+                const auto policy=[](strix::KnownWindowOutputPolicy p) {
+                    return p==strix::KnownWindowOutputPolicy::state_only?strix::decode_cli::QwenPlanOutput::state_only:
+                        p==strix::KnownWindowOutputPolicy::all_rows?strix::decode_cli::QwenPlanOutput::all_rows:
+                        strix::decode_cli::QwenPlanOutput::terminal;
+                };
+                plan.block={plan.rows,policy(paired.output_policy),known_prefill_plan->prefill_execution_identity,
+                    known_prefill_plan->prefill_kernel_plan_identity};
+                for(std::size_t k=0;k<known_tail_plans.size();++k)
+                    plan.tails.push_back({known_tail_backends[k]->logical_rows(),policy(known_tail_backends[k]->output_policy()),
+                        known_tail_plans[k]->prefill_execution_identity,known_tail_plans[k]->prefill_kernel_plan_identity});
+                plan.ladder=paired.ladder_tail_rows;
+                plan.decode_execution=compiled.execution_identity;plan.decode_kernel=compiled.kernel_plan_identity;
+                plan.prefill_execution=compiled_prefill?compiled_prefill->execution_identity:compiled.execution_identity;
+                plan.prefill_kernel=compiled_prefill?compiled_prefill->kernel_plan_identity:compiled.kernel_plan_identity;
+                const auto profiles=strix::decode_cli::numerical_profile_pair(options);
+                plan.prefill_profile=strix::numerical_profile_identity(profiles.prefill);
+                plan.decode_profile=strix::numerical_profile_identity(profiles.decode);
+                plan.profile_pair=strix::numerical_profile_pair_identity(profiles);
+                plan.initial_generations=session.state.generations;
+                plan.valid_state=static_cast<std::uint32_t>(session.state.valid);
+                for(const auto& step:compiled.execution.steps) {
+                    const auto flags=static_cast<std::uint32_t>(step.writes_state);
+                    plan.valid_state|=flags;
+                    for(std::size_t f=0;f<plan.generations_per_row.size();++f)
+                        if(flags&(1U<<f)) ++plan.generations_per_row[f];
+                }
+                prefix_state->set_serial_plan(plan,prompt.size(),chunks.cold_plan(),
+                    [&](std::uint64_t p) {return chunks.can_resume_at(p);},!paired.all_row_heads);
+                const auto restored=prefix_state->begin_request(session,prompt);
+                if(restored) chunks.resume_at(restored);
+            }
             // One complete configured window or one unpadded serial suffix row per call.
-            while (chunks.advance()) if (prefix_state) prefix_state->after_block(session, prompt);
+            const auto prefill_start = std::chrono::steady_clock::now();
+            while (chunks.advance()) if (prefix_state) {
+                prefix_state->observe_serial_unit(chunks.last_unit());
+                prefix_state->after_block(session,prompt);
+            }
+            if (session_cache_enabled) std::cerr << "session initial_prefill_ms=" << std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - prefill_start).count() << '\n';
+            const auto initial_generation_start = std::chrono::steady_clock::now();
             const auto& generated = chunks.finish_greedy();
+            if (session_cache_enabled) std::cerr << "session initial_generation_ms=" << std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - initial_generation_start).count() << '\n';
             known_prefix_progress = chunks.progress();
             known_prefix_result.emplace();
-            known_prefix_result->consumed_prompt_tokens = known_prefix_progress->consumed_prompt_tokens;
+            known_prefix_result->consumed_prompt_tokens = known_prefix_progress->consumed_prompt_tokens -
+                known_prefix_progress->restored_prompt_tokens;
             known_prefix_result->windows_executed = known_prefix_progress->windows_executed;
             known_prefix_result->serial_prompt_steps = known_prefix_progress->serial_tail_steps;
             known_prefix_result->generation = generated;
@@ -4119,7 +4407,30 @@ int STRIX_DECODE_ENTRY(
         const auto generation_request_start = generation_request_timing_enabled
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
-        const auto result = [&]() -> strix::SerialGreedyRequestResult {
+        auto result = [&]() -> strix::SerialGreedyRequestResult {
+            if (session_cache_enabled && !options.session_load.empty()) {
+                const auto restore_start = std::chrono::steady_clock::now();
+                strix::SessionIoStats io;
+                strix::SessionCheckpoint checkpoint;
+                // Fresh availability includes retained model, prefill and live state backing.
+                const auto available = strix::observe_linux_uma_memory();
+                const auto host_limit = strix::session_checkpoint_envelope_limit(options.session_capture_host_bytes,
+                    available.memory.observation_identity ? available.memory.mem_available_bytes.value_or(0U) : 0U);
+                const auto maximum = std::min(host_limit, options.context_tokens *
+                    (session_registry->row_bytes() + 8U) + session_registry->fixed_bytes() + (16U << 20));
+                (void)strix::read_session_checkpoint(options.session_load, session_compatibility,
+                    strix::decode_cli::hip_pinned_prefix_buffer, maximum, &io, &checkpoint);
+                for (const auto token : checkpoint.frontier.tokens) if (token >= model.vocab_size)
+                    throw std::runtime_error("session restore token exceeds vocabulary");
+                if (checkpoint.frontier.pending && *checkpoint.frontier.pending >= model.vocab_size)
+                    throw std::runtime_error("session restore pending token exceeds vocabulary");
+                session_registry->restore_session(session, checkpoint);
+                session_history = checkpoint.frontier.tokens; session_pending = checkpoint.frontier.pending;
+                session_emitted = checkpoint.frontier.emitted;
+                std::cerr << "session restore_ms=" << std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - restore_start).count() << " bytes=" << io.bytes << '\n';
+                return run_session_suffix(options.tokens);
+            }
             if (lookup_runtime) {
                 // Keep ordinary inclusive-EOS / unconsumed-last-token semantics.
                 // Only the existing speculation planner chooses target/accepted
@@ -4192,6 +4503,53 @@ int STRIX_DECODE_ENTRY(
                 : strix::execute_serial_greedy_request(request, *generation_backend);
             return run_known_prompt(options.tokens);
         }();
+        if (session_cache_enabled) {
+            if (options.session_load.empty()) session_history = options.tokens;
+            remember_session_generation(result);
+            if (!options.session_save.empty()) {
+                for (const auto& [path, digest] : session_files)
+                    if (strix::session_cached_file_hash(path) != digest)
+                        throw std::runtime_error("session checkpoint refused: model/asset/executable changed during run");
+                // Conservative peak: captured sections + vector capacity (up to 2x) + final envelope,
+                // with 16 MiB metadata allowance per copy. Refuse before any host capture allocation.
+                const auto units = session_registry->row_bytes() + 8U;
+                const auto fixed = session_registry->fixed_bytes() + (16U << 20);
+                const auto available = strix::observe_linux_uma_memory();
+                const auto quarter_budget = strix::session_checkpoint_envelope_limit(options.session_capture_host_bytes,
+                    available.memory.observation_identity ? available.memory.mem_available_bytes.value_or(0U) : 0U);
+                if (fixed > quarter_budget || session.next_position > (quarter_budget - fixed) / units)
+                    throw std::runtime_error("session capture exceeds host peak budget");
+                std::cerr << "session capture_peak_bound_bytes=" << 4U * (fixed + session.next_position * units)
+                    << " host_budget_bytes=" << options.session_capture_host_bytes << '\n';
+                const auto start = std::chrono::steady_clock::now();
+                strix::SessionFrontier frontier;
+                frontier.consumed = session.next_position; frontier.accepted = session.next_position;
+                frontier.tokens = session_history; frontier.pending = session_pending; frontier.emitted = session_emitted;
+                auto checkpoint = session_registry->capture_session(session, session_compatibility, std::move(frontier));
+                auto envelope = strix::encode_session_checkpoint(checkpoint, strix::decode_cli::hip_pinned_prefix_buffer);
+                strix::SessionIoStats io;
+                strix::publish_session_checkpoint(options.session_save, envelope, &io);
+                std::cerr << "session save_stall_ms=" << std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - start).count() << " write_fsync_ms=" << io.write_fsync_ms << " bytes=" << io.bytes
+                    << " consumed=" << session.next_position << " pending="
+                    << (session_pending ? std::to_string(*session_pending) : "none") << '\n';
+            }
+            if (!options.session_then_prompt.empty()) {
+                const auto suffix = strix::decode_cli::read_prefix_cache_prompt(options.session_then_prompt);
+                result = run_session_suffix(suffix);
+                remember_session_generation(result);
+            }
+            if (session_logit_backend.file.is_open()) {
+                session_logit_backend.file.flush();
+                if (!session_logit_backend.file) throw std::runtime_error("session logits flush failed");
+                std::cerr << "session logits_rows=" << session_logit_backend.rows_written << " vocabulary=" << model.vocab_size << '\n';
+            }
+            strix::SessionFrontier final_frontier;
+            final_frontier.consumed = session.next_position; final_frontier.accepted = session.next_position;
+            final_frontier.tokens = session_history; final_frontier.pending = session_pending; final_frontier.emitted = session_emitted;
+            std::cerr << "session final_digest=" << strix::model_content_identity_hex(
+                session_registry->complete_session_digest(session, final_frontier)) << '\n';
+        }
         // The spool of a final tiled block (with its footer) completes before anything is reported.
         if (requested_logprobs) requested_logprobs->drain_block_spool();
         if (options.teacher_forced_score && (!requested_logprobs ||
@@ -4231,6 +4589,9 @@ int STRIX_DECODE_ENTRY(
                     << ",\"restored_bytes\":" << r.restored_bytes << ",\"captured_checkpoints\":" << r.captured_checkpoints
                     << ",\"captured_segment_bytes\":" << r.captured_segment_bytes
                     << ",\"captured_fixed_bytes\":" << r.captured_fixed_bytes << ",\"capture_ms\":" << r.capture_ms;
+                strix::serve::Json declines=strix::serve::Json::object();
+                for(const auto& [reason,count]:r.certificate_declines) declines.set(reason,strix::serve::Json(count));
+                out << ",\"cache_refusal\":\"" << r.refusal << "\",\"certificate_declines\":" << declines.dump();
                 return out.str();
             };
             const auto main_stats = prefix_state->request();

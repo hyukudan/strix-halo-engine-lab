@@ -27,6 +27,7 @@ inline std::string yarn_environment_refusal(const Environment& environment, unsi
         it != environment.end() && it->second != "12")
         return "YaRN requires STRIX_QPF2K_SCHED=12; got " + it->second;
     for (const auto& [name, value] : environment) {
+        if (storage_location_environment(name)) continue;
         const auto entry = std::find_if(qpf2k::defaults.begin(), qpf2k::defaults.end(),
             [&](const auto& item) { return name == item.name; });
         if (entry != qpf2k::defaults.end() &&

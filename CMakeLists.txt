@@ -307,6 +307,7 @@ add_library(strix_core STATIC
     src/ple_lookup.cpp
     src/ple_reclaim.cpp
     src/ple_workspace.cpp
+    src/session_state_cache.cpp
     src/prefix_state_cache.cpp
     src/rtx_state_import.cpp
     src/bp_codec.cpp
@@ -422,7 +423,7 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-batch-service-handoff-tests)
     add_test(NAME strix-batch-service-handoff-tests COMMAND strix-batch-service-handoff-tests)
     add_executable(strix-rotary-descriptor-tests tests/rotary_descriptor_tests.cpp)
-    target_link_libraries(strix-rotary-descriptor-tests PRIVATE strix_core)
+    target_link_libraries(strix-rotary-descriptor-tests PRIVATE strix_core strix_serve)
     strix_target_warnings(strix-rotary-descriptor-tests)
     add_test(NAME strix-rotary-descriptor-tests COMMAND strix-rotary-descriptor-tests)
     add_executable(strix-qwen-yarn-table-tests tests/qwen_yarn_table_tests.cpp)
@@ -449,7 +450,7 @@ if(BUILD_TESTING)
     add_test(NAME strix-serve-deepseek-chat-tests COMMAND strix-serve-deepseek-chat-tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/serve/deepseek_v41_chat_cases.json)
     add_executable(strix-serve-api-tests tests/serve_api_tests.cpp)
-    target_link_libraries(strix-serve-api-tests PRIVATE strix_serve)
+    target_link_libraries(strix-serve-api-tests PRIVATE strix_serve strix_core)
     strix_target_warnings(strix-serve-api-tests)
     add_test(NAME strix-serve-api-tests COMMAND strix-serve-api-tests)
 
@@ -536,7 +537,23 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-serving-cohort-tests)
     add_test(NAME strix-serving-cohort-tests COMMAND strix-serving-cohort-tests)
 
-    add_executable(strix-prefix-state-cache-tests tests/prefix_state_cache_tests.cpp)
+    add_executable(strix-http-session-store-tests tests/http_session_store_tests.cpp)
+    target_link_libraries(strix-http-session-store-tests PRIVATE strix_core strix_serve)
+    strix_target_warnings(strix-http-session-store-tests)
+    add_test(NAME strix-http-session-store-tests COMMAND strix-http-session-store-tests)
+
+    add_executable(strix-session-state-cache-tests tests/session_state_cache_tests.cpp)
+    target_link_libraries(strix-session-state-cache-tests PRIVATE strix_core)
+    strix_target_warnings(strix-session-state-cache-tests)
+    add_test(NAME strix-session-state-cache-tests COMMAND strix-session-state-cache-tests)
+
+    add_executable(strix-qwen-tiled-prompt-plan-tests tests/qwen_tiled_prompt_plan_tests.cpp)
+    target_link_libraries(strix-qwen-tiled-prompt-plan-tests PRIVATE strix_core)
+    strix_target_warnings(strix-qwen-tiled-prompt-plan-tests)
+    add_test(NAME strix-qwen-tiled-prompt-plan-tests COMMAND strix-qwen-tiled-prompt-plan-tests)
+
+    add_executable(strix-prefix-state-cache-tests tests/prefix_state_cache_tests.cpp tests/prefix_dma_tests.cpp)
+    target_include_directories(strix-prefix-state-cache-tests PRIVATE tests/prefix_dma_shim)
     target_link_libraries(strix-prefix-state-cache-tests PRIVATE strix_core)
     strix_target_warnings(strix-prefix-state-cache-tests)
     add_test(NAME strix-prefix-state-cache-tests COMMAND strix-prefix-state-cache-tests)
@@ -555,6 +572,12 @@ if(BUILD_TESTING)
     target_link_libraries(strix-known-prompt-chunks-tests PRIVATE strix_core)
     strix_target_warnings(strix-known-prompt-chunks-tests)
     add_test(NAME strix-known-prompt-chunks-tests COMMAND strix-known-prompt-chunks-tests)
+    add_executable(strix-serial-prompt-plan-tests tests/serial_prompt_plan_tests.cpp)
+    target_link_libraries(strix-serial-prompt-plan-tests PRIVATE strix_core)
+    strix_target_warnings(strix-serial-prompt-plan-tests)
+    foreach(schedule IN ITEMS 2 4 16 20)
+        add_test(NAME strix-serial-prompt-plan-sched-${schedule} COMMAND strix-serial-prompt-plan-tests ${schedule})
+    endforeach()
     add_executable(strix-http-slot-capacity-tests tests/http_slot_capacity_tests.cpp)
     target_link_libraries(strix-http-slot-capacity-tests PRIVATE strix_core)
     strix_target_warnings(strix-http-slot-capacity-tests)
@@ -570,7 +593,7 @@ if(BUILD_TESTING)
 
     add_executable(strix-qwen-effective-config-tests tests/qwen_effective_config_tests.cpp)
     target_compile_definitions(strix-qwen-effective-config-tests PRIVATE STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME=1)
-    target_link_libraries(strix-qwen-effective-config-tests PRIVATE strix_core)
+    target_link_libraries(strix-qwen-effective-config-tests PRIVATE strix_core strix_serve)
     strix_target_warnings(strix-qwen-effective-config-tests)
     add_test(NAME strix-qwen-effective-config-tests COMMAND strix-qwen-effective-config-tests)
     add_executable(strix-qpf2k-defaults-tests tests/qpf2k_defaults_tests.cpp)
@@ -1544,6 +1567,8 @@ if(BUILD_TESTING)
         add_test(NAME strix-qwen-yarn-python-check
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tools/oracles/qwen_yarn_table_check.py
                 --emitter $<TARGET_FILE:strix-qwen-yarn-table-tests>)
+        add_test(NAME strix-session-gate-tests
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/session_gate_tests.py)
         add_test(NAME strix-ctest-evidence-tests
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/ctest_evidence_tests.py)
         add_test(NAME strix-queue-trace-evidence-tests
@@ -2105,6 +2130,14 @@ if(STRIX_ENABLE_HIP_RUNTIME)
                  COMMAND strix-hip-hyper-mix-launcher-tests output-prefetch)
 
         if(STRIX_ENABLE_EXPERIMENTAL_Q4K_A8_RUNTIME)
+            if(UNIX)
+                add_executable(strix-http-batch-session-tests tests/hip_http_batch_session_tests.cpp)
+                target_compile_definitions(strix-http-batch-session-tests PRIVATE STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME=1)
+                target_link_libraries(strix-http-batch-session-tests PRIVATE strix_hip_runtime strix_serve)
+                strix_target_warnings(strix-http-batch-session-tests)
+                add_test(NAME strix-http-batch-session-tests COMMAND strix-http-batch-session-tests)
+                set_tests_properties(strix-http-batch-session-tests PROPERTIES LABELS "cpu" RUN_SERIAL TRUE TIMEOUT 30)
+            endif()
             add_executable(strix-qwen-yarn-host-compile-tests tests/qwen_yarn_host_compile_tests.cpp)
             target_compile_definitions(strix-qwen-yarn-host-compile-tests PRIVATE STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME=1)
             target_link_libraries(strix-qwen-yarn-host-compile-tests PRIVATE strix_hip_runtime)

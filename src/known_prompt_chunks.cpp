@@ -62,7 +62,7 @@ void KnownPromptChunkCursor::set_tail_backend(KnownPromptWindowBackend& tail) {
 bool KnownPromptChunkCursor::advance() {
     if(progress_.failed) throw std::logic_error("failed known-prompt cursor cannot resume");
     if(progress_.cancelled || progress_.prefill_complete) {
-        if(deferred_) {
+        if(!planning_only_ && deferred_) {
             deferred_=false;
             try {windows_.finish_deferred();} catch(...) {progress_.failed=true;has_logits_=false;selection_.reset();throw;}
         }
@@ -89,12 +89,12 @@ bool KnownPromptChunkCursor::advance() {
         std::vector<std::uint32_t> ladder=request_.ladder_tail_rows;
         if(ladder.empty()) for(auto* t:tails_) ladder.push_back(t->logical_rows());
         balanced_=balanced_env&&known_prefill_balanced_eligible(remaining,request_.logical_rows,ladder)?1:0;
-        if(balanced_env) std::fprintf(stderr,"qpf2k sched balanced %s for %zu rows\n",balanced_?"on":"off (ladder differs)",remaining);
+        if(balanced_env && !planning_only_) std::fprintf(stderr,"qpf2k sched balanced %s for %zu rows\n",balanced_?"on":"off (ladder differs)",remaining);
     }
     const bool balanced=balanced_==1&&request_.schedule_extensions&&request_.tiled_prefill&&!request_.all_row_heads&&!state_only&&
         windows_.supports_tiled_prefill()&&windows_.output_policy()!=KnownWindowOutputPolicy::all_rows&&
         known_prefill_balanced_rows(remaining,request_.logical_rows)!=0U;
-    bool partial=false;
+    bool partial=false,merged_unit=false;
     if(balanced) {
         const auto size=known_prefill_balanced_rows(remaining,request_.logical_rows);
         window=true;tail=false;backend=&windows_;block=static_cast<std::uint32_t>(size);partial=block!=request_.logical_rows;
@@ -105,7 +105,7 @@ bool KnownPromptChunkCursor::advance() {
         std::vector<std::uint32_t> ladder=request_.ladder_tail_rows;
         if(ladder.empty()) for(auto* t:tails_) ladder.push_back(t->logical_rows());
         if(const auto merged=known_prefill_merged_tail_rows(remaining,request_.logical_rows,ladder)) {
-            window=true;tail=false;backend=&windows_;block=static_cast<std::uint32_t>(merged);partial=true;
+            window=true;tail=false;backend=&windows_;block=static_cast<std::uint32_t>(merged);partial=true;merged_unit=true;
         }
     }
     if(!window) for(auto* candidate:tails_) if(remaining>=candidate->logical_rows()) {
@@ -125,55 +125,61 @@ bool KnownPromptChunkCursor::advance() {
     static const bool allow_headless=[]{const char* v=std::getenv("STRIX_PREFILL_HEADLESS");return !v||v[0]!='0';}();
     const bool headless=allow_headless&&!request_.all_row_heads&&request_.tiled_prefill&&!state_only&&window&&remaining>block;
     // A deferred block of windows_ is completed by the next block of windows_; anything else completes it first.
-    if(deferred_ && (!window || backend!=&windows_)) {
+    if(!planning_only_ && deferred_ && (!window || backend!=&windows_)) {
         deferred_=false;
         try {windows_.finish_deferred();} catch(...) {progress_.failed=true;has_logits_=false;selection_.reset();throw;}
     }
+    static const bool defer_env=[]{const char* v=std::getenv("STRIX_QPF2K_SCHED");return v&&(std::strtoul(v,nullptr,0)&2UL)!=0UL;}();
+    const bool defer=headless&&defer_env&&!defaults_off&&request_.schedule_extensions&&!tail&&backend==&windows_&&remaining-block>=(balanced?16U:request_.logical_rows);
+    const auto rows=window?block:1U;
+    const KnownPromptChunkUnit unit{progress_.next_position,progress_.next_position+rows,
+        window?backend->logical_rows():1U,window&&!tail,balanced,merged_unit,defer,headless,state_only};
     // deferred_ stays set until the next block of windows_ (which completes it) succeeded: a failure leaves the
     // cleanup (cancel / destructor) its responsibility.
     try {
-        if(headless) {
-            // STRIX_QPF2K_SCHED bit 2: when the next unit is another block of this same backend (it completes this one
-            // before publishing anything), this block ends without a host fence.
-            static const bool defer_env=[]{const char* v=std::getenv("STRIX_QPF2K_SCHED");return v&&(std::strtoul(v,nullptr,0)&2UL)!=0UL;}();
-            const bool defer=defer_env&&!defaults_off&&request_.schedule_extensions&&!tail&&backend==&windows_&&remaining-block>=(balanced?16U:request_.logical_rows);
-            if(partial) backend->execute_state_rows_partial(request_.prompt_tokens.subspan(consumed,block),progress_.next_position,defer);
-            else if(defer) backend->execute_state_rows_deferred(request_.prompt_tokens.subspan(consumed,block),progress_.next_position);
-            else backend->execute_state_rows(request_.prompt_tokens.subspan(consumed,block),progress_.next_position);
-            deferred_=defer;
-            has_logits_=false;selection_.reset();
-        } else if(state_only&&(no_output||window||remaining>1U)) {
-            if(window) {
-                windows_.execute_state_rows(request_.prompt_tokens.subspan(consumed,request_.logical_rows),progress_.next_position);deferred_=false;
-                ++progress_.state_only_windows;
-            } else serial_.execute_state(request_.prompt_tokens[consumed],progress_.next_position);
-            has_logits_=false;selection_.reset();
-        } else {
-            auto values=window ? (partial ? backend->execute_rows_partial(request_.prompt_tokens.subspan(consumed, block),progress_.next_position) :
-                    backend->execute_rows(request_.prompt_tokens.subspan(consumed, block),
-                    progress_.next_position)) : serial_.execute(request_.prompt_tokens[consumed],progress_.next_position);
-            if(window) deferred_=false;
-            validate_serial_decode_engine_logits(values,request_.vocab_size);
-            // STRIX_PREFILL_LOGITS_DIGEST=1: the terminal row's FP32 logits FNV-1a 64 also when the prompt ends in a serial
-            // suffix row (the tiled backend prints it for a block that ends the prompt).
-            static const bool digest=[]{const char* v=std::getenv("STRIX_PREFILL_LOGITS_DIGEST");return v&&v[0]=='1';}();
-            if(digest&&!window&&consumed+1U==request_.prompt_tokens.size()) {
-                std::uint64_t hash=14695981039346656037ULL;
-                for(const auto byte:std::as_bytes(std::span<const float>(values))){hash^=static_cast<unsigned char>(byte);hash*=1099511628211ULL;}
-                std::fprintf(stderr,"prefill terminal logits fnv64 %016llx position %llu\n",static_cast<unsigned long long>(hash),
-                    static_cast<unsigned long long>(progress_.next_position));
+        if(!planning_only_) {
+            if(headless) {
+                // STRIX_QPF2K_SCHED bit 2: when the next unit is another block of this same backend (it completes this one
+                // before publishing anything), this block ends without a host fence.
+                if(partial) backend->execute_state_rows_partial(request_.prompt_tokens.subspan(consumed,block),progress_.next_position,defer);
+                else if(defer) backend->execute_state_rows_deferred(request_.prompt_tokens.subspan(consumed,block),progress_.next_position);
+                else backend->execute_state_rows(request_.prompt_tokens.subspan(consumed,block),progress_.next_position);
+                deferred_=defer;
+                has_logits_=false;selection_.reset();
+            } else if(state_only&&(no_output||window||remaining>1U)) {
+                if(window) {
+                    windows_.execute_state_rows(request_.prompt_tokens.subspan(consumed,request_.logical_rows),progress_.next_position);deferred_=false;
+                    ++progress_.state_only_windows;
+                } else serial_.execute_state(request_.prompt_tokens[consumed],progress_.next_position);
+                has_logits_=false;selection_.reset();
+            } else {
+                auto values=window ? (partial ? backend->execute_rows_partial(request_.prompt_tokens.subspan(consumed, block),progress_.next_position) :
+                        backend->execute_rows(request_.prompt_tokens.subspan(consumed, block),
+                        progress_.next_position)) : serial_.execute(request_.prompt_tokens[consumed],progress_.next_position);
+                if(window) deferred_=false;
+                validate_serial_decode_engine_logits(values,request_.vocab_size);
+                // STRIX_PREFILL_LOGITS_DIGEST=1: the terminal row's FP32 logits FNV-1a 64 also when the prompt ends in a serial
+                // suffix row (the tiled backend prints it for a block that ends the prompt).
+                static const bool digest=[]{const char* v=std::getenv("STRIX_PREFILL_LOGITS_DIGEST");return v&&v[0]=='1';}();
+                if(digest&&!window&&consumed+1U==request_.prompt_tokens.size()) {
+                    std::uint64_t hash=14695981039346656037ULL;
+                    for(const auto byte:std::as_bytes(std::span<const float>(values))){hash^=static_cast<unsigned char>(byte);hash*=1099511628211ULL;}
+                    std::fprintf(stderr,"prefill terminal logits fnv64 %016llx position %llu\n",static_cast<unsigned long long>(hash),
+                        static_cast<unsigned long long>(progress_.next_position));
+                }
+                std::copy(values.begin(),values.end(),logits_.begin());
+                has_logits_=true;
             }
-            std::copy(values.begin(),values.end(),logits_.begin());
-            has_logits_=true;
         }
-        const auto rows=window?block:1U;
+        deferred_=defer;
+        last_unit_=unit;
         progress_.consumed_prompt_tokens+=rows;
         progress_.next_position+=rows;
         if(window) ++progress_.windows_executed;
         else ++progress_.serial_tail_steps;
         if(tail) ++progress_.tail_windows;
         progress_.prefill_complete=progress_.consumed_prompt_tokens==request_.prompt_tokens.size();
-        if(progress_.prefill_complete && has_logits_) selection_=select_greedy_token(logits_,request_.vocab_size);
+        if(!planning_only_ && progress_.prefill_complete && has_logits_) selection_=select_greedy_token(logits_,request_.vocab_size);
         return true;
     } catch(...) {
         progress_.failed=true;has_logits_=false;selection_.reset();
@@ -181,9 +187,32 @@ bool KnownPromptChunkCursor::advance() {
     }
 }
 
+std::vector<KnownPromptChunkUnit> KnownPromptChunkCursor::cold_plan() const {
+    KnownPromptChunkCursor probe(request_,windows_,serial_);
+    for(auto* tail:tails_) probe.set_tail_backend(*tail);
+    probe.planning_only_=true;
+    std::vector<KnownPromptChunkUnit> trace;
+    while(probe.advance()) trace.push_back(probe.last_unit());
+    return trace;
+}
+bool KnownPromptChunkCursor::can_resume_at(std::uint64_t boundary) const {
+    if(!request_.tiled_prefill || request_.start_position || progress_.consumed_prompt_tokens || progress_.failed ||
+        boundary>=request_.prompt_tokens.size()) return false;
+    return known_prompt_full_t_prefix(cold_plan(),boundary,request_.logical_rows);
+}
+void KnownPromptChunkCursor::resume_at(std::uint64_t boundary) {
+    if(!can_resume_at(boundary)) throw std::invalid_argument("serial-cursor-continuation-unsupported");
+    planning_only_=true;
+    while(progress_.next_position<boundary) (void)advance();
+    planning_only_=false;
+    deferred_=false;
+    progress_.restored_prompt_tokens=boundary;
+    progress_.windows_executed=progress_.serial_tail_steps=progress_.tail_windows=progress_.state_only_windows=0;
+}
+
 KnownPromptChunkCursor::~KnownPromptChunkCursor() {
     // Abandoned with a deferred block: check it (a failed check poisons the session in the backend).
-    if(deferred_) {deferred_=false;try{windows_.finish_deferred();}catch(...){}}
+    if(!planning_only_ && deferred_) {deferred_=false;try{windows_.finish_deferred();}catch(...){}}
 }
 
 void KnownPromptChunkCursor::cancel() noexcept {

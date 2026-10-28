@@ -1,6 +1,7 @@
 #include "strix/model_content_hash.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <array>
@@ -411,17 +412,26 @@ void hash_cache_write(const HashCacheKey& key, const FileDigest& digest) {
 #endif
 
 FileDigest hash_file_stable(const std::filesystem::path& path) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto report = [&](const char* status) {
+        if (const char* log = std::getenv("STRIX_HASH_LOG"); log && std::string_view(log) == "1")
+            std::fprintf(stderr, "session content_hash=%s ms=%.3f path=%s\n", status,
+                std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count(), path.string().c_str());
+    };
 #if defined(__linux__)
     const auto key = hash_cache_key(path);
     if (key)
-        if (auto cached = hash_cache_read(*key)) return *cached;
+        if (auto cached = hash_cache_read(*key)) { report("hit"); return *cached; }
     const auto digest = hash_file_stable_uncached(path);
     // Store only if the file still carries the stamp it had before hashing.
     if (key)
         if (const auto after = hash_cache_key(path); after && after->stamp == key->stamp) hash_cache_write(*key, digest);
+    report("miss");
     return digest;
 #else
-    return hash_file_stable_uncached(path);
+    auto digest = hash_file_stable_uncached(path);
+    report("miss");
+    return digest;
 #endif
 }
 

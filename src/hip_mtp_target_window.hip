@@ -3,6 +3,8 @@
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/hip_runtime_allocator.hpp"
 #include "strix/dispatch_resources.hpp"
+#include "strix/prompt_terminal_diagnostics.hpp"
+#include "strix/hip_token_sampling.hpp"
 #include <algorithm>
 #include <optional>
 #include <iterator>
@@ -33,6 +35,7 @@ struct HipMtpTargetWindowBatch::Lease {
     std::uint64_t epoch=0;
     std::optional<MtpSelectionPrefix> selection;
     bool completed=false,sealed=false;
+    std::optional<ModelContentIdentity> terminal_digest;
 };
 struct HipMtpTargetWindowCapture::Impl {
     std::shared_ptr<const void> actual_owner;
@@ -205,6 +208,11 @@ void HipMtpTargetWindowCapture::completed_before_publish(){
         i.row_selection(i.logit_views,i.active->predictions);
         for(const auto token:i.active->predictions) require(token<i.vocab,"MTP sampled window selection is outside the vocabulary");
     }
+    if(prompt_terminal_digest_enabled()) {
+        std::vector<float> row;
+        read_hip_logits_row(i.logit_views.back(),i.vocab,i.scope.stream,row);
+        i.active->terminal_digest=raw_fp32_logits_digest(row);
+    }
     i.active->completed=true;
 }
 void HipMtpTargetWindowCapture::set_row_selection(RowSelection selection) {impl_->row_selection=std::move(selection);}
@@ -232,6 +240,10 @@ std::uint64_t HipMtpTargetWindowBatch::chunk_end()const{require(valid(),"MTP tar
 std::uint64_t HipMtpTargetWindowBatch::source_position(std::uint32_t row)const{require(row<logical_rows(),"MTP batch row is out of bounds");return chunk_begin()+row;}
 std::uint32_t HipMtpTargetWindowBatch::input_token(std::uint32_t row)const{require(row<logical_rows(),"MTP batch row is out of bounds");return lease_->tokens[row];}
 std::uint32_t HipMtpTargetWindowBatch::predicted_token(std::uint32_t row)const{require(row<logical_rows() && (!lease_->selection || row<lease_->selection->decided_rows),"MTP batch row is undecided or out of bounds");return lease_->predictions[row];}
+std::optional<ModelContentIdentity> HipMtpTargetWindowBatch::terminal_logits_digest(std::uint32_t row)const {
+    require(row<logical_rows(),"MTP batch row is out of bounds");
+    return row+1U==logical_rows()?lease_->terminal_digest:std::nullopt;
+}
 MtpDeviceView HipMtpTargetWindowBatch::view(std::uint32_t row)const{require(row<logical_rows(),"MTP batch row is out of bounds");lease_->capture->impl_->require_pool();return lease_->capture->impl_->snapshots[row];}
 const SerialSessionContext& HipMtpTargetWindowBatch::base_session()const{require(valid(),"MTP target batch is invalid");return lease_->base;}
 const SerialSessionContext& HipMtpTargetWindowBatch::committed_session()const{require(valid(),"MTP target batch is invalid");return lease_->committed;}

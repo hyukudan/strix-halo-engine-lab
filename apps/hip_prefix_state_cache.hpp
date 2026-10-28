@@ -1,4 +1,6 @@
 #pragma once
+#include "qwen_tiled_prompt_plan.hpp"
+#include "qwen_serial_prompt_certificate.hpp"
 // Block-boundary prefix state cache on the tiled known-prefix prefill: session-state capture and
 // restore over strix::PrefixStateCache (docs/engine/serving/prefix-state-cache.md).
 #include "strix/arithmetic_lineage.hpp"
@@ -6,6 +8,8 @@
 #include "strix/model_contract.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/prefix_state_cache.hpp"
+#include "strix/session_state_cache.hpp"
+#include "strix/qpf2k_defaults.hpp"
 #include "strix/rtx_state_import.hpp"
 #include "strix/serial_session.hpp"
 #include "strix/session_state_layout.hpp"
@@ -35,8 +39,24 @@ namespace strix::decode_cli {
 // Everything that changes the state the tiled prefill produces for a token prefix. Fields that
 // cannot change it under one profile (the decode identities when T divides the prefix) are kept
 // anyway: a key must never be shared by two configurations whose outputs could differ.
+inline ModelContentIdentity prefix_effective_execution_signature(std::string_view cli, bool baseline, bool gsq, const RotaryIdentity& rotary = {}) {
+    // Length-framed, sorted runtime environment also covers launcher-only controls.
+    // Include post-resolver suppression separately: injected values can remain present
+    // while their readers suppress them for baseline or GSQ owners.
+    // Name every code-default long-context QSA control with its resolved state, so a changed
+    // default (not only a changed variable) also changes the namespace.
+    std::string long_context;
+    for(const char* name : {"STRIX_QSA_UNION_MERGE","STRIX_QSA_SCORE_ROWS64","STRIX_QSA_DECODE_POOL",
+            "STRIX_QSA_DECODE_SELECT","STRIX_QSA_DECODE_POOL_BF16"})
+        long_context+=std::string(";")+name+"="+(qpf2k::long_context_item_enabled(name,gsq)?"1":"0");
+    const auto canonical=session_numerical_config(std::string(cli)+";prefix-execution-v4;baseline="+
+        std::to_string(baseline || qpf2k::baseline)+";gsq="+std::to_string(gsq)+
+        ";defaulted="+std::to_string(qpf2k::defaulted_items)+long_context,rotary);
+    return sha256_bytes(std::as_bytes(std::span(canonical.data(),canonical.size())));
+}
 struct PrefixStateCacheIdentityInputs {
     ModelContentIdentity model_content;
+    ModelContentIdentity effective_execution; // canonical runtime controls and suppression
     ModelContentIdentity engine_build;  // digest of the running executable (zero: not bound)
     std::uint64_t state_layout_identity = 0, runtime_compatibility_identity = 0;
     std::uint64_t decode_execution_identity = 0, decode_kernel_plan_identity = 0;
@@ -49,7 +69,7 @@ struct PrefixStateCacheIdentityInputs {
 };
 
 inline ModelContentIdentity prefix_state_cache_identity(const PrefixStateCacheIdentityInputs& in) {
-    if (!in.model_content.valid() || !in.block_rows || !in.state_layout_identity || !in.runtime_compatibility_identity ||
+    if (!in.effective_execution.valid() || !in.model_content.valid() || !in.block_rows || !in.state_layout_identity || !in.runtime_compatibility_identity ||
         !in.decode_execution_identity || !in.prefill_execution_identity || !in.tiled_execution_identity)
         throw std::invalid_argument("prefix state cache identity is incomplete");
     std::vector<std::byte> frame;
@@ -59,9 +79,10 @@ inline ModelContentIdentity prefix_state_cache_identity(const PrefixStateCacheId
     const auto digest = [&](const ModelContentIdentity& value) {
         for (const auto byte : value.bytes) frame.push_back(static_cast<std::byte>(byte));
     };
-    u64(0x5354524958504331ULL);  // format: prefix state cache v1
+    u64(0x5354524958504332ULL);  // format: prefix state cache v2
     digest(in.model_content);
     digest(in.engine_build);
+    digest(in.effective_execution);
     for (const auto value : {in.state_layout_identity, in.runtime_compatibility_identity, in.decode_execution_identity,
              in.decode_kernel_plan_identity, in.prefill_execution_identity, in.prefill_kernel_plan_identity,
              in.tiled_execution_identity, in.tiled_kernel_plan_identity, in.prefill_profile_identity,
@@ -72,14 +93,33 @@ inline ModelContentIdentity prefix_state_cache_identity(const PrefixStateCacheId
     return sha256_bytes(frame);
 }
 
+class PrefixCaptureHipError : public PrefixCacheFatalError {
+public:
+    hipError_t error;
+    PrefixCaptureHipError(hipError_t code, const char* what)
+        : PrefixCacheFatalError(std::string(what) + ": " + hipGetErrorString(code)), error(code) {}
+};
+
 inline PrefixCacheBuffer hip_pinned_prefix_buffer(std::uint64_t bytes) {
     void* memory = nullptr;
     if (bytes && hipHostMalloc(&memory, static_cast<std::size_t>(bytes), hipHostMallocDefault) != hipSuccess)
         throw std::runtime_error("prefix state cache pinned host allocation failed");
     return {std::shared_ptr<std::byte>(static_cast<std::byte*>(memory), [](std::byte* p) { if (p) (void)hipHostFree(p); }), bytes};
 }
+// Opportunistic prefix capture alone uses the typed allocation failure seam.
+inline PrefixCacheBuffer hip_pinned_prefix_capture_buffer(std::uint64_t bytes) {
+    void* memory = nullptr;
+    if (bytes) {
+        const auto error = hipHostMalloc(&memory, static_cast<std::size_t>(bytes), hipHostMallocDefault);
+        if (error == hipErrorOutOfMemory) throw PrefixCacheAllocationFailure();
+        if (error != hipSuccess) throw PrefixCaptureHipError(error, "prefix state cache pinned host allocation failed");
+    }
+    return {std::shared_ptr<std::byte>(static_cast<std::byte*>(memory), [](std::byte* p) { if (p) (void)hipHostFree(p); }), bytes};
+}
 
 struct PrefixStateCacheRequestStats {
+    std::string refusal;
+    std::map<std::string,std::uint64_t> certificate_declines;
     std::uint64_t prompt_tokens = 0, restored_position = 0, captured_checkpoints = 0, captured_segment_bytes = 0;
     std::uint64_t captured_fixed_bytes = 0, restored_bytes = 0;
     double lookup_ms = 0.0, restore_ms = 0.0, capture_ms = 0.0;
@@ -122,6 +162,140 @@ struct RtxStateImportFacts {
     std::array<std::uint64_t, 6> generations_per_row{};  // steps of the serial plan writing flag f (bit f)
     PersistentState valid_union = PersistentState::none;  // union of every step's writes
     ModelContentIdentity model_content;
+};
+
+// A failed drain cannot prove DMA quiescence. Preallocate ownership before
+// submitting copies, then link it into an intentionally never-destroyed owner.
+struct PrefixDmaQuarantine {
+    std::shared_ptr<PrefixCacheCheckpoint> checkpoint;
+    std::vector<std::shared_ptr<PrefixCacheSegment>> pending;
+    std::shared_ptr<const RtxStateStaging> imported_source;
+    std::shared_ptr<void> snapshot_owner;
+    std::uint64_t staging_bytes = 0;
+    PrefixDmaQuarantine* next = nullptr;
+    inline static std::atomic<PrefixDmaQuarantine*> head{nullptr};
+    inline static std::atomic<std::uint64_t> count{0}, bytes{0};
+    static void retain(std::unique_ptr<PrefixDmaQuarantine>& owner) noexcept {
+        if (!owner) return;
+        std::uint64_t payload = owner->staging_bytes;
+        if (owner->checkpoint) {
+            payload += owner->checkpoint->fixed.data ? owner->checkpoint->fixed.bytes : 0;
+            for (const auto& segment : owner->checkpoint->segments)
+                if (segment->payload.data) payload += segment->payload.bytes;
+        }
+        if (owner->imported_source)
+            payload += owner->imported_source->layout().payload_bytes(owner->imported_source->position());
+        auto* node = owner.release();
+        node->next = head.load();
+        while (!head.compare_exchange_weak(node->next, node)) {}
+        const auto n = count.fetch_add(1) + 1;
+        const auto b = bytes.fetch_add(payload) + payload;
+        std::fprintf(stderr, "prefix DMA quarantine: count=%llu bytes=%llu; fail-stop required\n",
+            static_cast<unsigned long long>(n), static_cast<unsigned long long>(b));
+    }
+};
+
+// Positive runtime evidence for the next writers. Unknown ownership refuses capture.
+// Predictor sources must remain owned by this stream through snapshot submission;
+// any later host/default-stream writer must follow the incumbent priming completion.
+struct PrefixCaptureOrder {
+    std::optional<hipStream_t> next_target, predictor, next_predictor;
+};
+
+// One process-wide, nonblocking snapshot slot. Worker submission owns no session pointer.
+// Only service-thread methods touch the slot; submitted is the worker release/acquire handoff.
+struct PrefixAsyncCapture : std::enable_shared_from_this<PrefixAsyncCapture> {
+    struct Slice { const void* source; std::byte* destination; std::uint64_t offset, bytes; bool predictor; };
+    std::shared_ptr<PrefixStateCache> store;
+    std::shared_ptr<const void> target_owner, predictor_owner;
+    std::shared_ptr<PrefixCacheCheckpoint> checkpoint;
+    PrefixStateCache::Reservation reservation;
+    std::vector<Slice> slices;
+    void* staging = nullptr;
+    std::uint64_t bytes = 0, row_bytes = 0;
+    std::weak_ptr<PrefixStateCacheRequestStats> request;
+    std::chrono::steady_clock::time_point prepared=std::chrono::steady_clock::now();
+    hipStream_t download = nullptr;
+    hipEvent_t target_ready = nullptr, mtp_ready = nullptr, done = nullptr;
+    std::atomic<bool> submitted{false};
+    bool committed = false, cancelled = false, started = false, publish = true;
+    using RowChain=std::vector<std::shared_ptr<const PrefixCacheSegment>>;
+    std::weak_ptr<RowChain> row_chain;
+    std::unique_ptr<PrefixDmaQuarantine> quarantine = std::make_unique<PrefixDmaQuarantine>();
+    inline static std::shared_ptr<PrefixAsyncCapture> slot;
+    static void check(hipError_t e, const char* what) {
+        if(e!=hipSuccess) throw PrefixCaptureHipError(e,what);
+    }
+    ~PrefixAsyncCapture() {
+        if(done) (void)hipEventDestroy(done);
+        if(mtp_ready) (void)hipEventDestroy(mtp_ready);
+        if(target_ready) (void)hipEventDestroy(target_ready);
+        if(download) (void)hipStreamDestroy(download);
+        if(staging) (void)hipFree(staging);
+    }
+    // Checked retirement runs while a shared quarantine owner can still retain backing.
+    void retire() {
+        try {
+            for(auto* event:{&done,&mtp_ready,&target_ready}) if(*event) {
+                check(hipEventDestroy(*event),"prefix event retirement"); *event=nullptr;
+            }
+            if(download) {check(hipStreamDestroy(download),"prefix stream retirement");download=nullptr;}
+            if(staging) {check(hipFree(staging),"prefix staging retirement");staging=nullptr;}
+        } catch(...) {fatal();throw;}
+    }
+    void fatal() {
+        if(!quarantine) return;
+        quarantine->checkpoint=checkpoint;
+        quarantine->snapshot_owner=shared_from_this();
+        quarantine->staging_bytes=bytes;
+        PrefixDmaQuarantine::retain(quarantine);
+        store->record_capture_failure();
+    }
+    void snapshot(bool predictor, hipStream_t stream) {
+        for(const auto& s:slices) if(s.predictor==predictor)
+            check(hipMemcpyAsync(static_cast<std::byte*>(staging)+s.offset,s.source,
+                static_cast<std::size_t>(s.bytes),hipMemcpyDeviceToDevice,stream),"prefix snapshot D2D");
+        check(hipEventRecord(predictor?mtp_ready:target_ready,stream),"prefix snapshot ready");
+    }
+    void submit_predictor(hipStream_t stream) {
+        try {
+            snapshot(true,stream);
+            check(hipStreamWaitEvent(download,target_ready,0),"prefix target dependency");
+            check(hipStreamWaitEvent(download,mtp_ready,0),"prefix predictor dependency");
+            for(const auto& s:slices)
+                check(hipMemcpyAsync(s.destination,static_cast<std::byte*>(staging)+s.offset,
+                    static_cast<std::size_t>(s.bytes),hipMemcpyDeviceToHost,download),"prefix snapshot D2H");
+            check(hipEventRecord(done,download),"prefix snapshot completion event");
+            submitted.store(true,std::memory_order_release);
+        } catch(...) {fatal();throw;}
+    }
+    static void reap(bool shutdown=false) {
+        auto d=slot;
+        if(!d || !d->submitted.load(std::memory_order_acquire)) return;
+        const auto e=shutdown?hipEventSynchronize(d->done):hipEventQuery(d->done);
+        if(e==hipErrorNotReady && !shutdown) return;
+        if(e!=hipSuccess) {d->fatal();slot.reset();check(e,"prefix snapshot completion");}
+        if(!d->committed && !d->cancelled && !shutdown) return;
+        if(d->committed && !d->cancelled) {
+            if(auto chain=d->row_chain.lock()) *chain=d->checkpoint->segments;
+            bool inserted=false;
+            if(d->publish) inserted=d->store->insert(d->checkpoint,&d->reservation);
+            else d->store->record_row_prefetch();
+            if(auto stats=d->request.lock()) {
+                stats->captured_segment_bytes+=d->row_bytes;
+                stats->captured_fixed_bytes+=d->checkpoint->fixed.bytes;
+                if(inserted) ++stats->captured_checkpoints;
+                stats->capture_ms+=std::chrono::duration<double,std::milli>(
+                    std::chrono::steady_clock::now()-d->prepared).count();
+            }
+        }
+        d->retire();
+        d->store->record_staging(0,d->bytes,false);
+        slot.reset();
+    }
+    void commit(bool valid) noexcept {committed=valid;cancelled=!valid;}
+    // Called explicitly after serving returns, before runtime owners disappear.
+    static void shutdown() {reap(true);}
 };
 
 // One live session's view of the store. Capture copies the state after a completed tiled block;
@@ -255,9 +429,25 @@ public:
         for (const auto& fixed : fixed_) append(fixed.id, reinterpret_cast<const void*>(fixed.address), fixed.bytes, fixed.device);
         return out + '}';
     }
+    [[nodiscard]] ModelContentIdentity complete_session_digest(const SerialSessionContext& session,
+        const SessionFrontier& frontier) {
+        auto frame = encode_metadata(session);
+        const auto u64 = [&](std::uint64_t value) {
+            for (unsigned shift = 0; shift < 64; shift += 8)
+                frame.push_back(static_cast<std::byte>((value >> shift) & 255U));
+        };
+        const auto state = state_digest(session.next_position);
+        for (const auto byte : state.bytes) frame.push_back(static_cast<std::byte>(byte));
+        u64(frontier.consumed); u64(frontier.emitted); u64(frontier.accepted); u64(frontier.predictor);
+        u64(frontier.pending ? *frontier.pending : std::uint64_t{UINT32_MAX} + 1U);
+        u64(frontier.sampling.size());
+        for (const auto c : frontier.sampling) frame.push_back(static_cast<std::byte>(c));
+        u64(frontier.tokens.size()); for (const auto token : frontier.tokens) u64(token);
+        return sha256_bytes(frame);
+    }
     [[nodiscard]] std::uint64_t row_bytes() const noexcept { return row_bytes_; }
     [[nodiscard]] std::uint64_t fixed_bytes() const noexcept { return fixed_bytes_; }
-    [[nodiscard]] const PrefixStateCacheRequestStats& request() const noexcept { return request_; }
+    [[nodiscard]] const PrefixStateCacheRequestStats& request() const noexcept { return *request_; }
     [[nodiscard]] PrefixStateCache& store() noexcept { return *store_; }
     // False: the component registry of --rtx-state-import / STRIX_RTX_EXPORT_STATE alone (no capture, no lookup).
     [[nodiscard]] bool has_store() const noexcept { return store_ != nullptr; }
@@ -301,6 +491,7 @@ public:
     // this is the requested position (default: the end of the prompt). Rows [0, position - shift) of every row
     // component and the fixed state: exactly what an import restores.
     void after_unit(const SerialSessionContext& session, std::span<const std::uint32_t> prompt, std::uint64_t position) {
+        PrefixAsyncCapture::reap();
         const auto& request = rtx_state_export_request();
         if (!request || !position || position > prompt.size() || session.next_position != position ||
             (request->position ? request->position != position : position != prompt.size()))
@@ -351,25 +542,122 @@ public:
 
     // Restores the longest cached prefix of `prompt` that leaves at least one prompt token to run
     // into the fresh `session`. Returns the restored position (0: miss, nothing changed).
+    // Policy selection state and verify-owner equivalence are not in the prefix certificate.
+    void set_policy_selection(bool enabled) { policy_selection_ = enabled; }
+    void set_retention(bool retain, std::string conversation = {}) {
+        retain_ = retain;
+        conversation_ = std::move(conversation);
+    }
+    // Bind the safe full-T producer family independently of the legacy v1 namespace.
+    // Request-local certificates validate the whole cold prefix before any device write.
+    std::vector<std::uint64_t> execution_certificate(std::uint64_t position) const {
+        auto proof=serial_path_?qwen_serial_certificate(plan_,serial_cold_,plan_n_,position):
+            qwen_full_t_certificate(plan_,plan_n_,position);
+        if(proof.empty()) return {};
+        for(unsigned i=0;i<identity_.bytes.size();i+=8) {
+            std::uint64_t word=0;
+            for(unsigned j=0;j<8;++j) word|=std::uint64_t(identity_.bytes[i+j])<<(8*j);
+            proof.push_back(word);
+        }
+        return proof;
+    }
+    void set_plan(const QwenTiledPlanConfig& config, std::uint64_t n, bool enabled) {
+        serial_path_=false;
+        plan_=config; plan_n_=n; plan_enabled_=enabled; certified_path_=true;
+        std::vector<std::byte> frame;
+        for(const auto b:identity_.bytes) frame.push_back(static_cast<std::byte>(b));
+        const auto put=[&](std::uint64_t v) {for(unsigned k=0;k<8;++k) frame.push_back(static_cast<std::byte>((v>>(k*8U))&255U));};
+        put(0x514650554c4c5431ULL); put(config.rows); put(config.schedule); put(config.priming);
+        put(config.tiled_start); put(config.suppressed); put(config.force_sync_priming); put(static_cast<std::uint64_t>(config.block.policy));
+        put(config.block.execution);put(config.block.kernel);
+        put(config.decode_execution);put(config.decode_kernel);put(config.prefill_execution);put(config.prefill_kernel);
+        put(config.prefill_profile);put(config.decode_profile);put(config.profile_pair);
+        put(config.valid_state);
+        for(const auto g:config.initial_generations) put(g);
+        for(const auto g:config.generations_per_row) put(g);
+        put(config.tails.size());
+        for(const auto& t:config.tails) {put(t.rows);put(static_cast<std::uint64_t>(t.policy));put(t.execution);put(t.kernel);}
+        put(config.ladder.size()); for(const auto r:config.ladder) put(r);
+        plan_identity_=sha256_bytes(frame);
+    }
+    void set_serial_plan(const QwenTiledPlanConfig& config,std::uint64_t n,
+        std::vector<KnownPromptChunkUnit> trace,std::function<bool(std::uint64_t)> can_resume,bool enabled) {
+        set_plan(config,n,enabled);
+        serial_path_=true;serial_cold_=std::move(trace);serial_executed_.clear();
+        serial_can_resume_=std::move(can_resume);
+        std::vector<std::byte> frame;
+        for(const auto b:plan_identity_.bytes) frame.push_back(static_cast<std::byte>(b));
+        for(unsigned k=0;k<8;++k) frame.push_back(static_cast<std::byte>((qwen_serial_certificate_route>>(8*k))&255U));
+        plan_identity_=sha256_bytes(frame);
+    }
+    void observe_serial_unit(const KnownPromptChunkUnit& unit) {serial_executed_.push_back(unit);}
+    void certificate_decline(const char* reason) {
+        request_->refusal=reason;++request_->certificate_declines[reason];
+        if(store_) store_->record_certificate_decline(reason);
+    }
+    [[nodiscard]] const std::optional<QwenPlanCursor>& continuation() const {return continuation_;}
+    [[nodiscard]] const ModelContentIdentity& active_identity() const {return certified_path_?plan_identity_:identity_;}
     std::uint64_t begin_request(SerialSessionContext& session, std::span<const std::uint32_t> prompt) {
+        PrefixAsyncCapture::reap();
         used_ = true;
-        request_ = {};
-        request_.prompt_tokens = prompt.size();
+        request_ = std::make_shared<PrefixStateCacheRequestStats>();
+        continuation_.reset();
+        request_->prompt_tokens = prompt.size();
         segments_.clear();
+        row_chain_=std::make_shared<PrefixAsyncCapture::RowChain>();
         if (session.next_position || session.committed_tokens || session.health != SerialSessionHealth::ready ||
             !session.arithmetic_lineage.intervals.empty() || session.state_layout_identity != layout_.layout_identity)
             throw std::invalid_argument("prefix state cache restores only into a fresh ready session");
         imported_ = false;
+        if (policy_selection_) {
+            if (store_ || rtx_registry_) request_->refusal = "policy-selection-cache-unqualified";
+            return 0;
+        }
         if (rtx_registry_ && prompt.size() >= 2U)
-            if (auto state = rtx_registry_->take(prompt)) return restore_rtx_state(session, *state);
+            if (auto state = rtx_registry_->take(prompt)) return restore_rtx_state(session, std::move(state));
         if (!store_) return 0;
         // STRIX_PREFIX_CACHE_LOOKUP=0: capture only (diagnostic; every request prefills from position 0).
         static const bool lookup = [] { const char* v = std::getenv("STRIX_PREFIX_CACHE_LOOKUP"); return !v || v[0] != '0'; }();
-        if (prompt.size() < 2U || !lookup) return 0;
+        if(serial_path_ && (!plan_enabled_ || block_rows_!=plan_.rows)) {
+            certificate_decline("serial-plan-unsupported");return 0;
+        }
+        if (prompt.size() < 2U || !lookup) {
+            if(serial_path_) certificate_decline("serial-lookup-disabled-or-short");
+            return 0;
+        }
         const auto start = std::chrono::steady_clock::now();
-        const auto checkpoint = store_->find_longest(identity_, prompt, block_rows_, prompt.size() - 1U);
-        request_.lookup_ms = ms(start);
-        if (!checkpoint) return 0;
+        std::function<bool(const PrefixCacheCheckpoint&)> eligible;
+        if(certified_path_) eligible=[&](const PrefixCacheCheckpoint& c) {
+            if(serial_path_ && (!plan_enabled_ || block_rows_!=plan_.rows)) {certificate_decline("serial-plan-unsupported");return false;}
+            if(!plan_enabled_ || c.identity!=active_identity() || c.block_rows!=block_rows_ || c.position>=prompt.size() ||
+                c.producer_certificate.empty()) {
+                if(serial_path_) certificate_decline("serial-certificate-missing-or-incompatible");
+                return false;
+            }
+            const auto proof=execution_certificate(c.position);
+            if(proof.empty() || proof!=c.producer_certificate) {
+                if(serial_path_) certificate_decline("serial-producer-plan-mismatch");
+                return false;
+            }
+            if(serial_path_ && (!serial_can_resume_ || !serial_can_resume_(c.position))) {
+                certificate_decline("serial-cursor-continuation-unsupported");return false;
+            }
+            try { (void)preflight_checkpoint(session,c); }
+            catch(const std::runtime_error&) {if(serial_path_) certificate_decline("serial-checkpoint-preflight");return false;}
+            if(serial_path_) return true;
+            continuation_=qwen_full_t_continuation(plan_,plan_n_,c.position);
+            return continuation_.has_value();
+        };
+        const auto checkpoint = store_->find_longest(active_identity(), prompt, block_rows_, prompt.size() - 1U, retain_, conversation_,eligible);
+        request_->lookup_ms = ms(start);
+        if (!checkpoint) {
+            if(serial_path_ && request_->certificate_declines.empty()) certificate_decline("serial-no-certified-checkpoint");
+            return 0;
+        }
+        if(serial_path_) for(const auto& u:serial_cold_) {
+            if(u.end>checkpoint->position) break;
+            serial_executed_.push_back(u);
+        }
         const auto restore_start = std::chrono::steady_clock::now();
         const auto meta = restore_checkpoint(session, *checkpoint);
         session.next_position = meta.position;
@@ -380,11 +668,106 @@ public:
             session.health = SerialSessionHealth::poisoned;
             throw std::runtime_error("prefix state cache restored an invalid arithmetic lineage");
         }
-        segments_ = checkpoint->segments;
+        if (retain_) {segments_ = checkpoint->segments; *row_chain_=checkpoint->segments;}
         if (restore_hook_) restore_hook_(meta.position);
-        request_.restored_position = meta.position;
-        request_.restore_ms = ms(restore_start);
+        request_->restored_position = meta.position;
+        request_->restore_ms = ms(restore_start);
         return meta.position;
+    }
+
+    void set_staging_cap(std::uint64_t bytes) { staging_cap_=bytes; }
+    using Capture = std::shared_ptr<PrefixAsyncCapture>;
+    Capture try_prepare_capture(const SerialSessionContext& session, std::span<const std::uint32_t> prompt,
+        hipStream_t producer, bool target_valid, PrefixCaptureOrder order={}, std::uint64_t covered=UINT64_MAX,
+        std::shared_ptr<const void> target_owner={},std::shared_ptr<const void> predictor_owner={}) {
+        PrefixAsyncCapture::reap();
+        if(serial_path_) {certificate_decline("serial-async-capture-unsupported");return {};}
+        const auto p=session.next_position;
+        if(policy_selection_ || !store_ || store_->policy().legacy || !certified_path_ || !plan_enabled_ || imported_ ||
+            !p || p>=prompt.size() || p%block_rows_ || session.committed_tokens!=p ||
+            session.health!=SerialSessionHealth::ready || !target_valid ||
+            !certified_metadata(session.state,session.arithmetic_lineage,p) ||
+            !qwen_full_t_continuation(plan_,plan_n_,p)) return {};
+        const bool selected=p%every_==0 || p+block_rows_>std::min<std::uint64_t>(covered,prompt.size());
+        // Unselected boundaries may prefetch rows privately. They never publish checkpoints.
+        // This lets a one-block staging cap feed a checkpoint cadence larger than T.
+        if(!retain_) {store_->record_no_store_skip();return {};}
+        auto cursor=*qwen_full_t_continuation(plan_,plan_n_,p);
+        const auto next=qwen_prompt_next(plan_,cursor,p,plan_n_);
+        // Even a matching handle cannot authorize a different tail/window/serial owner.
+        // An incumbent partial block of this same T owner uses the same ordered stream.
+        if(!next || !next->t_owner || next->owner!=plan_.block ||
+            !order.next_target || *order.next_target!=producer || !order.predictor ||
+            !order.next_predictor || *order.predictor!=*order.next_predictor) {
+            store_->record_cross_stream_skip();return {};
+        }
+        if(PrefixAsyncCapture::slot) {store_->record_staging_skip(false);return {};}
+        Capture d;
+        try {
+            d=std::make_shared<PrefixAsyncCapture>(); d->store=store_;
+            d->publish=selected; d->row_chain=row_chain_; d->request=request_;
+            d->target_owner=std::move(target_owner);d->predictor_owner=std::move(predictor_owner);
+            const auto blocks=p/block_rows_;
+            const auto digests=prefix_cache_block_digests(active_identity(),prompt,block_rows_,blocks);
+            if(digests.size()!=blocks || store_->contains(digests.back())) return {};
+            auto c=std::make_shared<PrefixCacheCheckpoint>(); d->checkpoint=c;
+            c->identity=active_identity(); c->digest=digests.back(); c->position=p; c->block_rows=block_rows_;
+            c->conversation=conversation_; c->metadata=encode_metadata(session);
+            c->producer_certificate=execution_certificate(p); c->fixed.bytes=selected?fixed_bytes_:0;
+            std::vector<std::shared_ptr<PrefixCacheSegment>> missing;
+            for(std::uint64_t k=0;k<blocks;++k) {
+                auto retained=k<row_chain_->size()?(*row_chain_)[k]:store_->find_segment(digests[k]);
+                if(retained) {c->segments.push_back(std::move(retained));continue;}
+                auto segment=std::make_shared<PrefixCacheSegment>();
+                segment->identity=c->identity;segment->digest=digests[k];segment->parent=k?digests[k-1U]:c->identity;
+                segment->block_rows=block_rows_;segment->block_index=k;
+                segment->tokens.assign(prompt.begin()+static_cast<std::ptrdiff_t>(k*block_rows_),
+                    prompt.begin()+static_cast<std::ptrdiff_t>((k+1U)*block_rows_));
+                segment->payload.bytes=segment_bytes(k); d->bytes+=segment->payload.bytes; d->row_bytes+=segment->payload.bytes;
+                c->segments.push_back(segment);missing.push_back(std::move(segment));
+            }
+            if(selected) for(const auto& f:fixed_) if(f.device) d->bytes+=f.bytes;
+            const auto cap=staging_cap_?staging_cap_:row_bytes_*plan_.rows+fixed_bytes_;
+            store_->record_staging(cap,0,false);
+            if(d->bytes>cap) {store_->record_staging_skip(true);return {};}
+            d->reservation=store_->reserve(store_->incremental_bytes(*c),c.get());
+            if(!d->reservation) return {};
+            if(selected) c->fixed=store_->allocate(fixed_bytes_,d->reservation);
+            for(const auto& segment:missing) segment->payload=store_->allocate(segment->payload.bytes,d->reservation,true);
+            auto e=hipMalloc(&d->staging,static_cast<std::size_t>(d->bytes));
+            if(e==hipErrorOutOfMemory) {store_->record_staging_skip(true);return {};}
+            check(e,"prefix staging allocation");
+            check(hipStreamCreateWithFlags(&d->download,hipStreamNonBlocking),"prefix D2H stream");
+            for(auto* event:{&d->target_ready,&d->mtp_ready,&d->done})
+                check(hipEventCreateWithFlags(event,hipEventDisableTiming),"prefix capture event");
+            std::uint64_t offset=0;
+            for(const auto& segment:missing) {
+                std::uint64_t dest=0;
+                for(const auto& row:rows_) {
+                    const auto bytes=row.bytes*row_count(row,segment->block_index);
+                    if(bytes) d->slices.push_back({reinterpret_cast<const void*>(row.address+row_first(row,segment->block_index)*row.bytes),
+                        segment->payload.data.get()+dest,offset,bytes,row.shift!=0});
+                    offset+=bytes;dest+=bytes;
+                }
+            }
+            if(selected) for(const auto& f:fixed_) {
+                if(f.device) {
+                    d->slices.push_back({reinterpret_cast<const void*>(f.address),c->fixed.data.get()+f.offset,offset,f.bytes,
+                        f.id=="mtp.held"}); offset+=f.bytes;
+                } else std::memcpy(c->fixed.data.get()+f.offset,reinterpret_cast<const void*>(f.address),static_cast<std::size_t>(f.bytes));
+            }
+            // All allocations, host history and credits exist before the first submission.
+            PrefixAsyncCapture::slot=d;
+            store_->record_staging(cap,d->bytes,true);
+            d->started=true;
+            try {d->snapshot(false,producer);} catch(...) {d->fatal();throw;}
+            return d;
+        } catch(const PrefixCacheAllocationFailure&) {store_->record_capture_failure();return {};}
+          catch(const std::bad_alloc&) {if(d && d->started) {d->fatal();throw;} store_->record_capture_failure();return {};}
+          catch(const PrefixCaptureHipError& e) {
+              if(!d->started && e.error==hipErrorOutOfMemory) {store_->record_capture_failure();return {};}
+              throw;
+          }
     }
 
     // After a completed tiled block: the session is at a block boundary of `prompt` (absolute
@@ -394,76 +777,231 @@ public:
     void after_block(const SerialSessionContext& session, std::span<const std::uint32_t> prompt,
         std::uint64_t covered = UINT64_MAX) {
         // An imported state was produced elsewhere: nothing derived from it enters the store under this identity.
-        if (!store_ || imported_) return;
+        if (policy_selection_ || !store_ || imported_) return;
         const auto position = session.next_position;
         covered = std::min<std::uint64_t>(covered, prompt.size());
+        if(serial_path_ && (!position || position>=prompt.size() || position%block_rows_ ||
+            session.committed_tokens!=position || session.health!=SerialSessionHealth::ready)) {
+            certificate_decline("serial-capture-boundary-unsupported");return;
+        }
         if (!position || position % block_rows_ || position > prompt.size() || session.health != SerialSessionHealth::ready ||
-            session.arithmetic_lineage.tainted || session.committed_tokens != position)
+            session.arithmetic_lineage.tainted || session.committed_tokens != position) {
+            if(serial_path_) certificate_decline("serial-capture-metadata-mismatch");
             return;
+        }
+        if(serial_path_) {
+            if(!plan_enabled_ || block_rows_!=plan_.rows) {certificate_decline("serial-plan-unsupported");return;}
+            if(!known_prompt_full_t_prefix(serial_executed_,position,plan_.rows) ||
+                qwen_serial_certificate(plan_,serial_executed_,plan_n_,position)!=
+                qwen_serial_certificate(plan_,serial_cold_,plan_n_,position)) {
+                certificate_decline("serial-capture-unit-unsupported");return;
+            }
+        }
+        if(certified_path_ && (!plan_enabled_ || (!serial_path_ && !qwen_full_t_continuation(plan_,plan_n_,position)) ||
+            !qwen_capture_boundary(position,prompt.size(),block_rows_,
+                certified_metadata(session.state,session.arithmetic_lineage,position),false,true))) {
+            if(serial_path_) certificate_decline("serial-capture-metadata-mismatch");
+            return;
+        }
         const bool last = position + block_rows_ > covered;
         if (position % every_ && !last) return;
+        if (!retain_) { store_->record_no_store_skip(); return; }
         const auto blocks = position / block_rows_;
-        const auto digests = prefix_cache_block_digests(identity_, prompt, block_rows_, blocks);
-        if (digests.size() != blocks || store_->contains(digests.back())) return;
         const auto start = std::chrono::steady_clock::now();
-        check(hipDeviceSynchronize(), "prefix capture fence");
-        // Segments: retained from the restore or an earlier capture of this request, else from the
-        // store, else read now (rows never change once written).
-        for (auto k = static_cast<std::uint64_t>(segments_.size()); k < blocks; ++k) {
-            if (auto retained = store_->find_segment(digests[k])) {
-                segments_.push_back(std::move(retained));
-                continue;
+        // Own every destination until the capture stream has drained, including on failure.
+        auto dma_owner = std::make_unique<PrefixDmaQuarantine>();
+        auto& checkpoint = dma_owner->checkpoint;
+        auto& pending = dma_owner->pending;
+        auto reservation = PrefixStateCache::Reservation{};
+        const auto drain = [&] {
+            const auto error = hipStreamSynchronize(stream_);
+            if (error != hipSuccess) PrefixDmaQuarantine::retain(dma_owner);
+            check(error, "prefix capture failure drain");
+        };
+        const auto fail = [&] {
+            drain();
+            store_->record_capture_failure();
+        };
+        try {
+            const auto digests = prefix_cache_block_digests(active_identity(), prompt, block_rows_, blocks);
+            if (digests.size() != blocks || store_->contains(digests.back())) return;
+            checkpoint = std::make_shared<PrefixCacheCheckpoint>();
+            checkpoint->conversation = conversation_;
+            checkpoint->identity = active_identity();
+            if(certified_path_) checkpoint->producer_certificate=execution_certificate(position);
+            checkpoint->digest = digests.back();
+            checkpoint->position = position;
+            checkpoint->block_rows = block_rows_;
+            checkpoint->metadata = encode_metadata(session);
+            checkpoint->fixed.bytes = fixed_bytes_;
+            // Build the insertion estimate without allocating any pinned payload.
+            for (std::uint64_t k = 0; k < blocks; ++k) {
+                if (k < segments_.size()) { checkpoint->segments.push_back(segments_[k]); continue; }
+                if (auto retained = store_->find_segment(digests[k])) {
+                    checkpoint->segments.push_back(std::move(retained)); continue;
+                }
+                auto segment = std::make_shared<PrefixCacheSegment>();
+                segment->identity = active_identity(); segment->digest = digests[k];
+                segment->parent = k ? digests[k - 1U] : active_identity();
+                segment->block_index = k; segment->block_rows = block_rows_;
+                segment->tokens.assign(prompt.begin() + static_cast<std::ptrdiff_t>(k * block_rows_),
+                    prompt.begin() + static_cast<std::ptrdiff_t>((k + 1U) * block_rows_));
+                segment->payload.bytes = segment_bytes(k);
+                checkpoint->segments.push_back(segment);
+                pending.push_back(std::move(segment));
             }
-            auto segment = std::make_shared<PrefixCacheSegment>();
-            segment->identity = identity_;
-            segment->digest = digests[k];
-            segment->parent = k ? digests[k - 1U] : identity_;
-            segment->block_index = k;
-            segment->block_rows = block_rows_;
-            segment->tokens.assign(prompt.begin() + static_cast<std::ptrdiff_t>(k * block_rows_),
-                prompt.begin() + static_cast<std::ptrdiff_t>((k + 1U) * block_rows_));
-            segment->payload = store_->allocate(segment_bytes(k));
-            std::uint64_t offset = 0;
-            for (const auto& row : rows_) {
-                const auto bytes = row.bytes * row_count(row, k);
-                if (bytes)
-                    check(hipMemcpyAsync(segment->payload.data.get() + offset,
-                        reinterpret_cast<const void*>(row.address + row_first(row, k) * row.bytes), static_cast<std::size_t>(bytes),
-                        hipMemcpyDeviceToHost, stream_), "prefix capture rows");
-                offset += bytes;
+            if (!store_->policy().legacy) {
+                auto credits = store_->reserve(store_->incremental_bytes(*checkpoint), checkpoint.get());
+                if (!credits) return;
+                reservation = std::move(credits);
             }
-            request_.captured_segment_bytes += segment->payload.bytes;
-            segments_.push_back(std::move(segment));
+            check(hipDeviceSynchronize(), "prefix capture fence");
+            std::uint64_t captured_bytes = 0;
+            for (const auto& segment : pending) {
+                const auto k = segment->block_index;
+                segment->payload = store_->allocate(segment->payload.bytes, reservation, true);
+                std::uint64_t offset = 0;
+                for (const auto& row : rows_) {
+                    const auto bytes = row.bytes * row_count(row, k);
+                    if (bytes)
+                        check(hipMemcpyAsync(segment->payload.data.get() + offset,
+                            reinterpret_cast<const void*>(row.address + row_first(row, k) * row.bytes),
+                            static_cast<std::size_t>(bytes), hipMemcpyDeviceToHost, stream_), "prefix capture rows");
+                    offset += bytes;
+                }
+                captured_bytes += segment->payload.bytes;
+            }
+            checkpoint->fixed = store_->allocate(fixed_bytes_, reservation);
+            for (const auto& fixed : fixed_) {
+                if (fixed.device)
+                    check(hipMemcpyAsync(checkpoint->fixed.data.get() + fixed.offset,
+                        reinterpret_cast<const void*>(fixed.address), static_cast<std::size_t>(fixed.bytes),
+                        hipMemcpyDeviceToHost, stream_), "prefix capture fixed state");
+                else
+                    std::memcpy(checkpoint->fixed.data.get() + fixed.offset,
+                        reinterpret_cast<const void*>(fixed.address), static_cast<std::size_t>(fixed.bytes));
+            }
+            const auto completion = hipStreamSynchronize(stream_);
+            if (completion != hipSuccess) PrefixDmaQuarantine::retain(dma_owner);
+            check(completion, "prefix capture completion");
+            segments_ = checkpoint->segments;
+            request_->captured_segment_bytes += captured_bytes;
+            request_->captured_fixed_bytes += fixed_bytes_;
+            used_ = true;
+            if (store_->insert(std::move(checkpoint), &reservation)) ++request_->captured_checkpoints;
+            request_->capture_ms += ms(start);
+        } catch (const PrefixCacheAllocationFailure&) {
+            if (store_->policy().legacy) { drain(); throw; }
+            fail();
+        } catch (...) {
+            // Drain before stack-owned copy destinations are released; retain fatal error contracts.
+            drain();
+            throw;
         }
-        auto checkpoint = std::make_shared<PrefixCacheCheckpoint>();
-        checkpoint->identity = identity_;
-        checkpoint->digest = digests.back();
-        checkpoint->position = position;
-        checkpoint->block_rows = block_rows_;
-        checkpoint->segments.assign(segments_.begin(), segments_.begin() + static_cast<std::ptrdiff_t>(blocks));
-        checkpoint->fixed = store_->allocate(fixed_bytes_);
+    }
+
+    void enable_fixed_mtp_sessions() {
+        if (!identity_extension_) throw std::logic_error("MTP session registry lacks predictor state");
+        fixed_mtp_sessions_ = true;
+    }
+
+    // Complete live-state capture: no prefill, no producer substitution, no boundary rounding.
+    // Fixed MTP sessions normalize transient ticket/controller state at every committed turn.
+    SessionCheckpoint capture_session(const SerialSessionContext& session, const SessionCompatibility& compatibility,
+        SessionFrontier frontier) {
+        if (compatibility.mtp != fixed_mtp_sessions_ || (identity_extension_ && !fixed_mtp_sessions_))
+            throw std::runtime_error("session checkpoint refused: MTP session mode/registry mismatch");
+        if (session.health != SerialSessionHealth::ready || session.arithmetic_lineage.tainted || imported_ ||
+            !session.next_position || session.next_position >= layout_.context_tokens || session.next_position != session.committed_tokens ||
+            frontier.consumed != session.next_position || frontier.tokens.size() != session.next_position ||
+            frontier.predictor != (fixed_mtp_sessions_ ? session.next_position - 1U : 0U) ||
+            !arithmetic_lineage_valid(session.arithmetic_lineage, session.next_position))
+            throw std::runtime_error("session checkpoint refused: not an exact committed live frontier");
+        check(hipDeviceSynchronize(), "session capture fence");
+        SessionCheckpoint out{compatibility, std::move(frontier), {}};
+        const auto copy = [&](const std::string& name, std::uintptr_t address, std::uint64_t bytes, bool device) {
+            auto payload = hip_pinned_prefix_buffer(bytes);
+            if (bytes) {
+                if (device) check(hipMemcpy(payload.data.get(), reinterpret_cast<const void*>(address),
+                    static_cast<std::size_t>(bytes), hipMemcpyDeviceToHost), "session capture component");
+                else std::memcpy(payload.data.get(), reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes));
+            }
+            out.sections.push_back({name, std::move(payload)});
+        };
+        for (const auto& row : rows_) {
+            const auto count = session.next_position > row.shift ? session.next_position - row.shift : 0U;
+            copy(row.id, row.address, count * row.bytes, true);
+        }
+        for (const auto& fixed : fixed_) copy(fixed.id, fixed.address, fixed.bytes, fixed.device);
+        const auto metadata = encode_metadata(session);
+        copy("session.metadata", reinterpret_cast<std::uintptr_t>(metadata.data()), metadata.size(), false);
+        return out;
+    }
+    void restore_session(SerialSessionContext& session, const SessionCheckpoint& checkpoint, bool validate_only = false) {
+        if (checkpoint.compatibility.mtp != fixed_mtp_sessions_ || (identity_extension_ && !fixed_mtp_sessions_))
+            throw std::runtime_error("session restore refused: MTP controller serialization unsupported");
+        if (session.next_position || session.committed_tokens || session.health != SerialSessionHealth::ready)
+            throw std::runtime_error("session restore requires a fresh ready slot");
+        const auto p = checkpoint.frontier.consumed;
+        if (!p || p >= layout_.context_tokens || checkpoint.frontier.sampling != "greedy" ||
+            checkpoint.frontier.predictor != (fixed_mtp_sessions_ ? p - 1U : 0U) ||
+            checkpoint.frontier.tokens.size() != p ||
+            checkpoint.sections.size() != rows_.size() + fixed_.size() + 1)
+            throw std::runtime_error("session restore frontier or component count differs");
+        const auto& last = checkpoint.sections.back();
+        if (last.name != "session.metadata") throw std::runtime_error("session restore metadata missing");
+        const auto meta = decode_metadata(last.payload.span());
+        if (meta.position != p || meta.committed_tokens != p || meta.layout_identity != layout_.layout_identity ||
+            meta.row_bytes != row_bytes_ || meta.fixed_bytes != fixed_bytes_ ||
+            meta.execution_identity != session.execution_identity ||
+            meta.runtime_compatibility_identity != session.runtime_compatibility_identity ||
+            meta.lineage.tainted || !arithmetic_lineage_valid(meta.lineage, p))
+            throw std::runtime_error("session restore geometry or producer lineage differs");
+        std::size_t at = 0;
+        for (const auto& row : rows_) {
+            const auto count = p > row.shift ? p - row.shift : 0U;
+            const auto& s = checkpoint.sections[at++];
+            if (s.name != row.id || s.payload.bytes != count * row.bytes)
+                throw std::runtime_error("session restore row component differs");
+        }
         for (const auto& fixed : fixed_) {
-            if (fixed.device)
-                check(hipMemcpyAsync(checkpoint->fixed.data.get() + fixed.offset, reinterpret_cast<const void*>(fixed.address),
-                    static_cast<std::size_t>(fixed.bytes), hipMemcpyDeviceToHost, stream_), "prefix capture fixed state");
-            else
-                std::memcpy(checkpoint->fixed.data.get() + fixed.offset, reinterpret_cast<const void*>(fixed.address),
-                    static_cast<std::size_t>(fixed.bytes));
+            const auto& s = checkpoint.sections[at++];
+            if (s.name != fixed.id || s.payload.bytes != fixed.bytes)
+                throw std::runtime_error("session restore fixed component differs");
         }
-        check(hipStreamSynchronize(stream_), "prefix capture completion");
-        checkpoint->metadata = encode_metadata(session);
-        request_.captured_fixed_bytes += fixed_bytes_;
+        // Validation is complete before the first device or host-state write.
+        if (validate_only) return;
+        check(hipDeviceSynchronize(), "session restore fence");
+        try {
+            at = 0;
+            for (const auto& row : rows_) {
+                const auto& s = checkpoint.sections[at++];
+                if (s.payload.bytes) check(hipMemcpy(reinterpret_cast<void*>(row.address), s.payload.data.get(),
+                    static_cast<std::size_t>(s.payload.bytes), hipMemcpyHostToDevice), "session restore rows");
+            }
+            for (const auto& fixed : fixed_) {
+                const auto& s = checkpoint.sections[at++];
+                if (fixed.device) check(hipMemcpy(reinterpret_cast<void*>(fixed.address), s.payload.data.get(),
+                    static_cast<std::size_t>(fixed.bytes), hipMemcpyHostToDevice), "session restore fixed");
+                else std::memcpy(reinterpret_cast<void*>(fixed.address), s.payload.data.get(), static_cast<std::size_t>(fixed.bytes));
+            }
+            session.next_position = meta.position; session.committed_tokens = meta.committed_tokens;
+            session.state = meta.state; session.arithmetic_lineage = meta.lineage;
+        } catch (...) {
+            session.health = SerialSessionHealth::poisoned; session.arithmetic_lineage.tainted = true; throw;
+        }
         used_ = true;
-        if (store_->insert(std::move(checkpoint))) ++request_.captured_checkpoints;
-        request_.capture_ms += ms(start);
     }
 
 private:
+    bool retain_ = true, policy_selection_ = false;
+    std::string conversation_;
     // Restores a committed import at p = state.position() exactly like a checkpoint: rows [0, p - shift) of every
     // row component, the fixed blob, then the counters a run over p rows publishes (generation f advances once per
     // row and per serial-plan step writing f) and one honest prefill_chunk lineage interval [0, p) carrying the
     // producer's identities (cooperative local_rows q: the checkpoint of [0, q), then an interval [q, p)).
-    std::uint64_t restore_rtx_state(SerialSessionContext& session, const RtxStateStaging& state) {
+    std::uint64_t restore_rtx_state(SerialSessionContext& session, std::shared_ptr<const RtxStateStaging> state_owner) {
+        const auto& state = *state_owner;
         const auto start = std::chrono::steady_clock::now();
         const auto& l = state.layout();
         const auto p = state.position();
@@ -492,7 +1030,7 @@ private:
         std::uint64_t local_bytes = 0;
         if (q) {
             if (!store_) throw std::runtime_error("rtx state import with local_rows needs the prefix state cache (--prefix-cache-host-bytes)");
-            const auto checkpoint = store_->find_longest(identity_, state.request().tokens, block_rows_, q);
+            const auto checkpoint = store_->find_longest(identity_, state.request().tokens, block_rows_, q, retain_);
             if (!checkpoint || checkpoint->position != q)
                 throw std::runtime_error("rtx state import local_rows " + std::to_string(q) + ": this node holds no checkpoint of prompt[0, " +
                     std::to_string(q) + ")");
@@ -514,6 +1052,8 @@ private:
         }
         auto lineage = prepare_prefill_chunk_lineage(session.arithmetic_lineage, q, p, producer.numerical, producer.reduction,
             producer.state_update);
+        auto import_owner = std::make_unique<PrefixDmaQuarantine>();
+        import_owner->imported_source = std::move(state_owner);
         try {
             for (std::size_t c = 0; c < rows_.size(); ++c) {
                 const auto rows = state.component(c);
@@ -530,11 +1070,16 @@ private:
                 else
                     std::memcpy(reinterpret_cast<void*>(fixed.address), blob.data() + fixed.offset, static_cast<std::size_t>(fixed.bytes));
             }
-            check(hipStreamSynchronize(stream_), "rtx import completion");
+            const auto completion = hipStreamSynchronize(stream_);
+            if (completion != hipSuccess) PrefixDmaQuarantine::retain(import_owner);
+            check(completion, "rtx import completion");
         } catch (...) {
             // The device state may be partially overwritten: the session cannot be used.
             session.health = SerialSessionHealth::poisoned;
             session.arithmetic_lineage.tainted = true;
+            const auto drain_error = hipStreamSynchronize(stream_);
+            if (drain_error != hipSuccess) PrefixDmaQuarantine::retain(import_owner);
+            check(drain_error, "rtx import failure drain");
             throw;
         }
         session.next_position = p;
@@ -547,20 +1092,20 @@ private:
         }
         if (restore_hook_) restore_hook_(p);
         imported_ = true;
-        request_.restored_position = p;
-        request_.restored_bytes = state.payload_bytes();
-        request_.restore_ms = ms(start);
-        request_.rtx_import = true;
-        request_.rtx_sha_ok = state.committed();  // committed = coverage + per-chunk digests + manifest verified
-        request_.rtx_position = p;
-        request_.rtx_bytes = state.payload_bytes();
-        request_.rtx_local_rows = q;
-        request_.rtx_local_bytes = local_bytes;
-        request_.rtx_chunks = state.chunks();
-        request_.rtx_restore_ms = request_.restore_ms;
-        request_.rtx_verify_ms = state.commit_ms();
-        request_.rtx_id = state.id();
-        request_.rtx_manifest_sha256 = model_content_identity_hex(state.manifest_sha256());
+        request_->restored_position = p;
+        request_->restored_bytes = state.payload_bytes();
+        request_->restore_ms = ms(start);
+        request_->rtx_import = true;
+        request_->rtx_sha_ok = state.committed();  // committed = coverage + per-chunk digests + manifest verified
+        request_->rtx_position = p;
+        request_->rtx_bytes = state.payload_bytes();
+        request_->rtx_local_rows = q;
+        request_->rtx_local_bytes = local_bytes;
+        request_->rtx_chunks = state.chunks();
+        request_->rtx_restore_ms = request_->restore_ms;
+        request_->rtx_verify_ms = state.commit_ms();
+        request_->rtx_id = state.id();
+        request_->rtx_manifest_sha256 = model_content_identity_hex(state.manifest_sha256());
         return p;
     }
 
@@ -586,7 +1131,7 @@ private:
     static constexpr std::uint64_t metadata_magic = 0x31544d5043585054ULL;
 
     static void check(hipError_t error, const char* what) {
-        if (error != hipSuccess) throw std::runtime_error(std::string(what) + ": " + hipGetErrorString(error));
+        if (error != hipSuccess) throw PrefixCaptureHipError(error, what);
     }
     static double ms(std::chrono::steady_clock::time_point start) {
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -639,6 +1184,46 @@ private:
         return m;
     }
 
+    bool certified_metadata(const PersistentStateGenerations& state,const ArithmeticLineage& lineage,
+        std::uint64_t position) const {
+        if(!plan_.rows || !arithmetic_lineage_valid(lineage,position) ||
+            static_cast<std::uint32_t>(state.valid)!=plan_.valid_state || lineage.intervals.size()!=position/plan_.rows) return false;
+        for(std::size_t f=0;f<state.generations.size();++f) {
+            if(plan_.generations_per_row[f] && position>(UINT64_MAX-plan_.initial_generations[f])/plan_.generations_per_row[f]) return false;
+            if(state.generations[f]!=plan_.initial_generations[f]+position*plan_.generations_per_row[f]) return false;
+        }
+        for(std::size_t k=0;k<lineage.intervals.size();++k) {
+            const auto& i=lineage.intervals[k];
+            if(i.producer!=ArithmeticProducer::prefill_chunk || i.begin!=k*plan_.rows || i.end!=(k+1U)*plan_.rows ||
+                i.numerical_plan_identity!=plan_.block.execution || i.reduction_plan_identity!=plan_.block.kernel ||
+                i.state_update_identity!=plan_.block.execution) return false;
+        }
+        return true;
+    }
+
+    Metadata preflight_checkpoint(const SerialSessionContext& session,const PrefixCacheCheckpoint& c) const {
+        const auto m=decode_metadata(c.metadata);
+        if(c.position>layout_.context_tokens || m.position!=c.position || m.committed_tokens!=c.position || !certified_metadata(m.state,m.lineage,c.position) || m.lineage.tainted ||
+            !arithmetic_lineage_valid(m.lineage,c.position) || m.layout_identity!=layout_.layout_identity ||
+            m.row_bytes!=row_bytes_ || m.fixed_bytes!=fixed_bytes_ || c.fixed.bytes!=fixed_bytes_ ||
+            (c.fixed.bytes && !c.fixed.data) || m.execution_identity!=session.execution_identity ||
+            m.runtime_compatibility_identity!=session.runtime_compatibility_identity ||
+            c.segments.size()!=c.position/block_rows_)
+            throw std::runtime_error("prefix certified checkpoint metadata differs");
+        auto parent=c.identity;
+        for(std::size_t k=0;k<c.segments.size();++k) {
+            const auto& seg=c.segments[k];
+            if(!seg || seg->identity!=c.identity || seg->parent!=parent || seg->block_index!=k ||
+                seg->block_rows!=block_rows_ || seg->payload.bytes!=segment_bytes(k) ||
+                (seg->payload.bytes && !seg->payload.data) || seg->tokens.size()!=block_rows_ ||
+                seg->digest!=prefix_cache_block_digest(parent,seg->tokens))
+                throw std::runtime_error("prefix certified checkpoint section differs");
+            parent=seg->digest;
+        }
+        if(parent!=c.digest) throw std::runtime_error("prefix certified checkpoint chain differs");
+        return m;
+    }
+
     // Copies a store checkpoint's rows and fixed state into the session's device buffers (synchronized) after
     // checking it against the live geometry; the caller sets the session facts. Throws (poisoning the session
     // once a copy started) on a mismatch or a failed copy.
@@ -653,6 +1238,8 @@ private:
         for (const auto& segment : checkpoint->segments)
             if (segment->payload.bytes != segment_bytes(segment->block_index))
                 throw std::runtime_error("prefix state cache segment size differs");
+        auto restore_owner = std::make_unique<PrefixDmaQuarantine>();
+        restore_owner->checkpoint = std::make_shared<PrefixCacheCheckpoint>(checkpoint_ref);
         try {
             for (const auto& segment : checkpoint->segments) {
                 std::uint64_t offset = 0;
@@ -664,7 +1251,7 @@ private:
                             "prefix restore rows");
                     offset += bytes;
                 }
-                request_.restored_bytes += segment->payload.bytes;
+                request_->restored_bytes += segment->payload.bytes;
             }
             for (const auto& fixed : fixed_) {
                 if (fixed.device)
@@ -674,12 +1261,17 @@ private:
                     std::memcpy(reinterpret_cast<void*>(fixed.address), checkpoint->fixed.data.get() + fixed.offset,
                         static_cast<std::size_t>(fixed.bytes));
             }
-            request_.restored_bytes += checkpoint->fixed.bytes;
-            check(hipStreamSynchronize(stream_), "prefix restore completion");
+            request_->restored_bytes += checkpoint->fixed.bytes;
+            const auto completion = hipStreamSynchronize(stream_);
+            if (completion != hipSuccess) PrefixDmaQuarantine::retain(restore_owner);
+            check(completion, "prefix restore completion");
         } catch (...) {
             // The device state may be partially overwritten: the session cannot be used.
             session.health = SerialSessionHealth::poisoned;
             session.arithmetic_lineage.tainted = true;
+            const auto drain_error = hipStreamSynchronize(stream_);
+            if (drain_error != hipSuccess) PrefixDmaQuarantine::retain(restore_owner);
+            check(drain_error, "prefix restore failure drain");
             throw;
         }
         return meta;
@@ -687,21 +1279,31 @@ private:
 
     std::shared_ptr<PrefixStateCache> store_;
     ModelContentIdentity identity_;
+    ModelContentIdentity plan_identity_;
+    QwenTiledPlanConfig plan_;
+    std::optional<QwenPlanCursor> continuation_;
+    std::uint64_t plan_n_=0;
+    bool certified_path_=false,plan_enabled_=false,serial_path_=false;
+    std::vector<KnownPromptChunkUnit> serial_cold_,serial_executed_;
+    std::function<bool(std::uint64_t)> serial_can_resume_;
     std::uint32_t block_rows_ = 0;
     std::uint64_t every_ = 0;
+    bool fixed_mtp_sessions_ = false;
     const SerialSessionStateLayout& layout_;
     const SessionStateMemoryBinding& memory_;
     std::vector<Row> rows_;
     std::vector<Fixed> fixed_;
     std::uint64_t row_bytes_ = 0, fixed_bytes_ = 0;
     std::vector<std::shared_ptr<const PrefixCacheSegment>> segments_;
+    std::shared_ptr<PrefixAsyncCapture::RowChain> row_chain_=std::make_shared<PrefixAsyncCapture::RowChain>();
     std::function<void(std::uint64_t)> restore_hook_;
     bool used_ = false, imported_ = false;
     std::optional<ModelContentIdentity> identity_extension_;
     std::optional<RtxStateImportFacts> rtx_facts_;
     std::shared_ptr<RtxStateImportRegistry> rtx_registry_;
     std::uint64_t rtx_fresh_execution_ = 0, rtx_fresh_compatibility_ = 0;
-    PrefixStateCacheRequestStats request_;
+    std::shared_ptr<PrefixStateCacheRequestStats> request_=std::make_shared<PrefixStateCacheRequestStats>();
+    std::uint64_t staging_cap_ = 0;
     hipStream_t stream_ = nullptr;
 };
 

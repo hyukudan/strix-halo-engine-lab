@@ -62,6 +62,8 @@ struct ApiConfig {
     std::optional<double> observe_expiry_seconds;
     // Further engine routes (authenticated), tried before the built-in POST routes: true when the hook answered.
     // Unset: nothing changes.
+    bool sessions_enabled = false;
+    std::function<std::string()> state_cache_stats;
     std::function<bool(const HttpRequest&, HttpResponseWriter&)> engine_routes;
 };
 

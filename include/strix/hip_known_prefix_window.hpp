@@ -89,6 +89,8 @@ public:
     [[nodiscard]] KnownWindowResult execute_without_head_deferred(SerialSessionContext& session,
         std::span<const std::uint32_t> tokens);
     [[nodiscard]] bool completion_pending() const noexcept;
+    [[nodiscard]] hipStream_t producer_stream() const noexcept;
+    [[nodiscard]] std::shared_ptr<const void> producer_lifetime() const noexcept;
     // STRIX_QPF2K_SCHED bit 4: a block of the first tokens.size() rows of this tiled owner's T arena (16..T rows, a
     // multiple of 8): with its head (terminal row) or headless; `defer` as execute_without_head_deferred (headless only).
     [[nodiscard]] KnownWindowResult execute_partial(SerialSessionContext& session, std::span<const std::uint32_t> tokens,

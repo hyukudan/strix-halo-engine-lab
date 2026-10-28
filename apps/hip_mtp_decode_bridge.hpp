@@ -1,4 +1,7 @@
 #pragma once
+#include "strix/prompt_terminal_diagnostics.hpp"
+#include "qwen_tiled_prompt_plan.hpp"
+#include "strix/serve/engine.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/serve/health.hpp"
 #include "strix/batch_service_handoff.hpp"
@@ -23,11 +26,14 @@
 #include "strix/mtp_forward_golden_file.hpp"
 #include "strix/hip_mtp_greedy_runtime.hpp"
 #include "strix/mtp_batch_window_controller.hpp"
+#include "hip_session_store.hpp"
+#include <mutex>
 #include "strix/hip_mtp_window_verifier.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
 #include "strix/mtp_draft_activation.hpp"
 #include "strix/mtp_draft_qualification.hpp"
 #include "strix/model_content_hash.hpp"
+#include "strix/linux_uma_observation.hpp"
 #include "strix/ple_lookup.hpp"
 #include "strix/session_executor_handoff.hpp"
 #include <algorithm>
@@ -58,8 +64,11 @@ namespace strix::decode_cli {
 // cached block boundary matches) and decodes greedily with MTP verification.
 using MtpConstraintRow = serve::ConstraintRowSelection;
 struct MtpServeRequest {
+    std::function<void()> on_admitted;
     serve::BackendProbeSlot* backend_probe = nullptr;
     std::shared_ptr<MtpConstraintRow> constraint;
+    serve::CacheRetention cache_retention = serve::CacheRetention::server_policy;
+    std::string session_id, session_operation, session_durability;
     std::span<const std::uint32_t> prompt;
     std::uint64_t max_tokens = 0;
     std::span<const std::uint32_t> stop_tokens;
@@ -86,6 +95,7 @@ struct MtpServeResult {
     std::string finish = "length"; // stop|length|context|cancelled
     // --rtx-state-import: the receipt of the imported state this request started from (JSON object), else empty.
     std::string rtx_import_json;
+    std::string session_json, cache_refusal;
 };
 inline std::string batch_service_receipt(const BatchServiceStats& s) {
     std::ostringstream out;
@@ -141,6 +151,7 @@ struct MtpDecodeTargetParents final {
         // backend; the tails keep the prefill profile). Empty with one profile: the tails verify the wide cycles.
         std::vector<Tail> wide;
         std::uint32_t rows = 0;
+        QwenTiledPlanConfig numerical_plan; // actual owner/profile identities, independent of storage
         // Split prefill numerical profile: the sibling prefill execution every block and tail backend hands
         // the session to around its block (0: one profile). Calibration, serial and decode rows keep `compiled`.
         std::uint64_t prefill_execution_identity = 0;
@@ -273,7 +284,7 @@ public:
         MtpDecodeTargetParents::TiledPrompt& tiled,SerialSessionContext& session,HipMtpTargetHidden& target,HipMtpRuntime& runtime,
         const QualifiedMtpDraftPlan& qualified,const ActivatedMtpDraftPlan& activated,const ExecutionRuntimeResources& resources,
         DirectLaunchDispatcher& dispatcher,std::byte* held,std::shared_ptr<TokenSampler> final_sampler={},
-        HipMtpHostRowSelector final_selector={},std::function<void(serve::GenerationProgress)> progress={})
+        HipMtpHostRowSelector final_selector={},std::function<void(serve::GenerationProgress)> progress={}, bool session_resume=false, bool tiled_suffix=true, bool batch=false)
         :tokens_(tokens.begin(),tokens.end()),tiled_(tiled),session_(session),target_(target),runtime_(runtime),qualified_(qualified),
          activated_(activated),resources_(resources),dispatcher_(dispatcher),held_(held),final_sampler_(std::move(final_sampler)),final_selector_(std::move(final_selector)),progress_(std::move(progress)) {
         producer_rotary_=model.rotary_identity();
@@ -300,15 +311,67 @@ public:
         check(hipMalloc(reinterpret_cast<void**>(&block_hidden_),pipe_mtp()?2U*buffer:buffer),"tiled MTP hidden rows");
         hidden_allocation_=block_hidden_;
         if(pipe_mtp()) spare_hidden_=block_hidden_+buffer;
+        plan_config_=tiled_.numerical_plan;
+        plan_config_.rows=tiled_.rows;
+        const char* sched=std::getenv("STRIX_QPF2K_SCHED");
+        plan_config_.schedule=sched?static_cast<std::uint32_t>(std::strtoul(sched,nullptr,0)):0U;
+        const char* ts=std::getenv("STRIX_MTP_TILED_START");
+        plan_config_.tiled_start=!ts || ts[0]!='0';
+        plan_config_.suppressed=qpf2k::suppressed(qpf2k::Item::sched,tiled_.blocks->gsq_model());
+        plan_config_.initial_generations=session_.state.generations;
+        plan_config_.valid_state=static_cast<std::uint32_t>(session_.state.valid);
+        for(const auto& step:compiled.execution.steps) {
+            const auto flags=static_cast<std::uint32_t>(step.writes_state);
+            plan_config_.valid_state|=flags;
+            for(std::size_t f=0;f<plan_config_.generations_per_row.size();++f)
+                if(flags&(1U<<f)) ++plan_config_.generations_per_row[f];
+        }
+        plan_config_.priming=pipe_flags();
+        plan_config_.force_sync_priming=bool(rtx_state_export_request());
+        const auto policy=[](KnownWindowOutputPolicy p) {return p==KnownWindowOutputPolicy::state_only?
+            QwenPlanOutput::state_only:p==KnownWindowOutputPolicy::all_rows?QwenPlanOutput::all_rows:QwenPlanOutput::terminal;};
+        plan_config_.block.rows=tiled_.rows;plan_config_.block.policy=policy(tiled_.blocks->output_policy());
+        plan_config_.tails.resize(tiled_.tails.size());
+        for(std::size_t k=0;k<tiled_.tails.size();++k) {
+            plan_config_.tails[k].rows=tiled_.tails[k].rows;
+            plan_config_.tails[k].policy=policy(tiled_.tails[k].backend->output_policy());
+        }
+        plan_config_.ladder=tiled_.ladder_tail_rows;
+        certified_request_=!final_selector_ && !batch && !session_resume && !tiled_.rtx_import && !rtx_state_export_request();
+        if(tiled_.cache && !legacy_cache()) tiled_.cache->set_plan(plan_config_,n_,certified_request_);
+        if(tiled_.cache) tiled_.cache->set_policy_selection(!!final_selector_);
         start_=std::chrono::steady_clock::now();
-        if(tiled_.cache) restored_=tiled_.cache->begin_request(session_,tokens_);
+        if(session_resume) {
+            restored_=session_.next_position;
+            if(!restored_ || restored_>=n_ || runtime_.next_source_position()+1U!=restored_)
+                throw std::invalid_argument("MTP session suffix frontier differs");
+        } else if(tiled_.cache) restored_=tiled_.cache->begin_request(session_,tokens_);
         pos_=restored_;
+        if(restored_ && !session_resume && !tiled_.rtx_import && !legacy_cache()) {
+            const auto& cursor=tiled_.cache->continuation();
+            if(!cursor) throw std::logic_error("prefix restore lacks a preflighted cold continuation");
+            phase_=cursor->phase; tail_=cursor->tail; balanced_=cursor->balanced;
+        }
         if(restored_) report_progress();
+        if(session_resume) {
+            const auto plan=plan_session_suffix(pos_,n_-pos_,tiled_.rows,tiled_suffix);
+            if(!plan.tiled) phase_=Phase::serial;
+            else align_end_=pos_+plan.serial_rows;
+        }
     }
     ~TiledMtpPrompt(){
         // Pending priming still reads the tap rows and the held row.
-        if(submitter_.valid()) submitter_.wait();
-        if(runtime_.prime_hidden_rows_pending()) (void)hipStreamSynchronize(static_cast<hipStream_t>(runtime_.resources().stream()));
+        if(capture_) {
+            try {
+                if(submitter_.valid()) (void)submitter_.get();
+                if(runtime_.prime_hidden_rows_pending())
+                    check(hipStreamSynchronize(static_cast<hipStream_t>(runtime_.resources().stream())),"cancelled prefix producer drain");
+            } catch(...) {capture_->fatal();std::terminate();}
+        } else {
+            if(submitter_.valid()) submitter_.wait();
+            if(runtime_.prime_hidden_rows_pending()) (void)hipStreamSynchronize(static_cast<hipStream_t>(runtime_.resources().stream()));
+        }
+        if(capture_ && !capture_->committed) capture_->cancelled=true;
         if(hidden_allocation_)(void)hipFree(hidden_allocation_);
     }
     TiledMtpPrompt(const TiledMtpPrompt&)=delete;
@@ -349,6 +412,17 @@ public:
     }
     [[nodiscard]] std::optional<Block> next_block() {
         if(forced_ladder_ && phase_==Phase::blocks) phase_=Phase::tails;
+        if(final_selector_ || legacy_cache()) return legacy_next_block();
+        QwenPlanCursor cursor{phase_,tail_,balanced_};
+        const auto u=qwen_prompt_next(plan_config_,cursor,pos_,n_,false,small_,adopted_);
+        phase_=cursor.phase; tail_=cursor.tail; balanced_=cursor.balanced;
+        if(!u || u->kind==QwenPlanKind::serial || u->kind==QwenPlanKind::window) return std::nullopt;
+        if(u->t_owner) return Block{tiled_.blocks,tiled_.block_owner.get(),
+            static_cast<std::uint32_t>(u->end-u->begin),u->capture,u->final};
+        auto& tail=tiled_.tails[u->tail];
+        return Block{tail.backend,tail.owner.get(),static_cast<std::uint32_t>(u->end-u->begin),u->capture,u->final};
+    }
+    [[nodiscard]] std::optional<Block> legacy_next_block() {
         while(phase_==Phase::blocks || phase_==Phase::tails) {
             const bool blocks=phase_==Phase::blocks;
             if(!blocks && !tiled_.ladder_tail_rows.empty()) {
@@ -465,7 +539,7 @@ public:
         // STRIX_RTX_EXPORT_STATE keeps every block synchronous: its export (after_unit) must see this block's predictor
         // rows and held row, which the async path below completes only at the next unit's drain.
         // A registry without a store (STRIX_PROMPT_STATE_DIGEST / --rtx-state-import) captures nothing: those blocks stay async.
-        if(pipe_mtp() && !block.final && !((block.capture || tiled_.cache_tails) && tiled_.cache && tiled_.cache->has_store()) &&
+        if(pipe_mtp() && !block.final && !(legacy_cache() && (block.capture || tiled_.cache_tails)) &&
             !rtx_state_export_request()) {
             // Same rows, kernels and order as below; the wait moves to the next unit of the prompt.
             std::vector<MtpDeviceView> views;std::vector<std::uint32_t> next;
@@ -474,13 +548,19 @@ public:
                 next.push_back(tokens_[static_cast<std::size_t>(pos_+r+1U)]);}
             const auto stream=static_cast<hipStream_t>(runtime_.resources().stream());
             const auto* last=block_hidden_+static_cast<std::size_t>(rows-1U)*width_;
+            if((block.capture || tiled_.cache_tails) && tiled_.cache && !legacy_cache())
+                capture_=tiled_.cache->try_prepare_capture(session_,tokens_,block.owner->producer_stream(),
+                    !block.owner->completion_pending(),capture_order(block,grouped,stream),n_-1U,block.owner->producer_lifetime(),runtime_.resources().shared_from_this());
             int device=0;check(hipGetDevice(&device),"get priming device");
-            const auto submit=[this,device,stream,last,views=std::move(views),next=std::move(next)] {
-                check(hipSetDevice(device),"bind priming device");
-                const bool pending=runtime_.prime_hidden_rows_submit(qualified_,activated_,views,next,producer_rotary_);
-                check(hipMemcpyAsync(held_,last,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice,stream),"tiled MTP held copy");
-                if(!pending) check(hipStreamSynchronize(stream),"tiled MTP held copy");
-                return pending;
+            const auto submit=[this,device,stream,last,capture=capture_,views=std::move(views),next=std::move(next)] {
+                try {
+                    check(hipSetDevice(device),"bind priming device");
+                    const bool pending=runtime_.prime_hidden_rows_submit(qualified_,activated_,views,next,producer_rotary_);
+                    check(hipMemcpyAsync(held_,last,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice,stream),"tiled MTP held copy");
+                    if(capture) capture->submit_predictor(stream);
+                    if(!pending) check(hipStreamSynchronize(stream),"tiled MTP held copy");
+                    return pending;
+                } catch(...) {if(capture && capture->quarantine) capture->fatal();throw;}
             };
             // STRIX_PREFILL_PIPE bit 32: the rows are enqueued from a worker thread while this thread runs the next
             // block (the predictor, its stream, the held row and this block's tap buffer are the worker's until the drain).
@@ -502,7 +582,22 @@ public:
         check(hipMemcpy(held_,block_hidden_+static_cast<std::size_t>(rows-1U)*width_,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
             "tiled MTP held copy");
         pos_+=rows;
-        if((block.capture || tiled_.cache_tails) && tiled_.cache) tiled_.cache->after_block(session_,tokens_,n_-1U);
+        const bool complete=!block.owner->completion_pending() && !runtime_.prime_hidden_rows_pending() &&
+            runtime_.next_source_position()+1U==pos_;
+        if((block.capture || tiled_.cache_tails) && tiled_.cache) {
+            if(legacy_cache()) tiled_.cache->after_block(session_,tokens_,n_-1U);
+            else if(complete) {
+                const auto stream=static_cast<hipStream_t>(runtime_.resources().stream());
+                capture_=tiled_.cache->try_prepare_capture(session_,tokens_,block.owner->producer_stream(),true,capture_order(block,grouped,stream),n_-1U,
+                    block.owner->producer_lifetime(),runtime_.resources().shared_from_this());
+                if(capture_) {
+                    capture_->submit_predictor(stream);
+                    capture_->commit(true);
+                    PrefixAsyncCapture::reap();
+                    capture_.reset();
+                }
+            }
+        }
         if(tiled_.cache) tiled_.cache->after_unit(session_,tokens_,pos_);
         if(block.capture)++blocks_;else ++tail_blocks_;
         if(grouped)++grouped_blocks_;
@@ -512,6 +607,7 @@ public:
             if(digest) {
                 const auto bytes=std::as_bytes(std::span<const float>(logits));
                 final_logits_digest_=sha256_bytes(std::vector<std::byte>(bytes.begin(),bytes.end()));
+                terminal_logits_digest_=raw_fp32_logits_digest(logits);
             }
             if(final_sampler_) target_.replace_token_sampler(final_sampler_);
             pending_=target_.adopt_prefill_row(session_,tokens_[static_cast<std::size_t>(n_-1U)],view(held_),logits,producer_rotary_,final_selector_);
@@ -523,6 +619,7 @@ public:
     // Runs the next unit of the prompt.
     void step(std::uint32_t serial_rows_per_step=UINT32_MAX) {
         for(;;) {
+            if(pos_<align_end_) {run_serial_row();return;}
             if(phase_==Phase::blocks || phase_==Phase::tails) {
                 if(const auto block=next_block()) {run_block(*block);return;}
                 continue;
@@ -565,6 +662,7 @@ public:
         if(tiled_.cache && tiled_.cache->request().rtx_import) out<<",\"rtx_import\":"<<rtx_import_receipt(tiled_.cache->request());
         if(tiled_.cache && tiled_.cache->has_store()) {
             const auto& q=tiled_.cache->request();
+            if(!q.refusal.empty()) out<<",\"cache_refusal\":\""<<q.refusal<<'"';
             out<<",\"prefix_cache\":{\"lookup_ms\":"<<q.lookup_ms<<",\"restore_ms\":"<<q.restore_ms<<",\"restored_bytes\":"<<q.restored_bytes
                <<",\"captured_checkpoints\":"<<q.captured_checkpoints<<",\"captured_segment_bytes\":"<<q.captured_segment_bytes
                <<",\"captured_fixed_bytes\":"<<q.captured_fixed_bytes<<",\"capture_ms\":"<<q.capture_ms
@@ -573,7 +671,16 @@ public:
         // STRIX_PREFIX_CACHE_DIGEST=1: the end-of-prompt state digest wherever the component registry exists (a prefix
         // store, --rtx-state-import, STRIX_RTX_EXPORT_STATE or STRIX_PROMPT_STATE_DIGEST).
         static const bool digest=[]{const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");return v && v[0]=='1';}();
-        if(digest && tiled_.cache) materialize_window();
+        if(digest) materialize_window();
+        if(digest) {
+            const auto terminal=adopted_?terminal_logits_digest_:pending_.terminal_logits_digest();
+            out<<",\"terminal_logits_digest\":";
+            if(terminal) out<<'"'<<model_content_identity_hex(*terminal)<<'"';else out<<"null";
+            out<<",\"terminal_metadata\":{\"committed_tokens\":"<<session_.committed_tokens
+               <<",\"next_position\":"<<session_.next_position
+               <<",\"generations_lineage_digest\":\""<<model_content_identity_hex(terminal_generations_lineage_digest(session_))
+               <<"\",\"predictor_frontier\":"<<runtime_.next_source_position()<<'}';
+        }
         if(digest && tiled_.cache) out<<",\"state_digest\":\""<<model_content_identity_hex(tiled_.cache->state_digest(n_))<<'"';
         receipt=out.str();
         // Final-only diagnostics log the execution witness without reading prompt state.
@@ -583,7 +690,23 @@ public:
         return std::move(pending_);
     }
 private:
-    enum class Phase {blocks,tails,serial,done};
+    using Phase=QwenPlanPhase;
+    PrefixCaptureOrder capture_order(const Block& block,bool grouped,hipStream_t snapshot_predictor) const {
+        if(grouped || small_ || adopted_ || !certified_request_) return {};
+        QwenPlanCursor cursor{phase_,tail_,balanced_};
+        const auto next=qwen_prompt_next(plan_config_,cursor,session_.next_position,n_,false,small_,adopted_);
+        if(!next || !next->t_owner ||
+            block.owner!=tiled_.block_owner.get() || next->owner!=plan_config_.block) return {};
+        const auto mtp=static_cast<hipStream_t>(runtime_.resources().stream());
+        // The next target writes on this actual owner stream. Predictor rows and held_ are
+        // next written on mtp. The next target uses the spare tap buffer; drain_priming
+        // joins the worker and completes mtp (including its snapshot) before tap reuse or
+        // any synchronous/default-stream held copy. No dependency is added for capture.
+        return {tiled_.block_owner->producer_stream(),snapshot_predictor,mtp};
+    }
+    QwenTiledPlanConfig plan_config_;
+    bool certified_request_=false;
+    bool legacy_cache() const {return tiled_.cache && tiled_.cache->has_store() && tiled_.cache->store().policy().legacy;}
     static void check(hipError_t e,const char* what){if(e!=hipSuccess)throw std::runtime_error(std::string(what)+": "+hipGetErrorString(e));}
     [[nodiscard]] MtpDeviceView view(const std::byte* p) const {return MtpDeviceView{reinterpret_cast<std::uintptr_t>(p),width_,1U};}
     // STRIX_PREFILL_PIPE (bit mask, default 0): 1 = a T block's predictor rows build on the MTP stream while the next
@@ -594,10 +717,22 @@ private:
     bool pipe_tap_copy() const {return (pipe_flags()&2U)!=0U;}
     bool pipe_worker() const {return (pipe_flags()&32U)!=0U;}
     void drain_priming() {
-        if(!priming_) return;
+        if(!priming_) {PrefixAsyncCapture::reap();return;}
         priming_=false;
-        if(submitter_.valid() && !submitter_.get()) {report_progress();return;} // held copy already completed
-        runtime_.prime_hidden_rows_complete();   // the held copy follows the rows on the same stream
+        try {
+            const bool pending=!submitter_.valid() || submitter_.get();
+            if(pending) runtime_.prime_hidden_rows_complete(); // incumbent completion location
+            if(capture_) {
+                capture_->commit(!runtime_.prime_hidden_rows_pending() &&
+                    runtime_.next_source_position()+1U==capture_->checkpoint->position &&
+                    session_.health==SerialSessionHealth::ready);
+                capture_.reset();
+            }
+            PrefixAsyncCapture::reap();
+        } catch(...) {
+            if(capture_ && capture_->quarantine) capture_->fatal();
+            throw;
+        }
         report_progress();
     }
 public:
@@ -718,6 +853,7 @@ private:
         if(tiled_.cache) tiled_.cache->after_unit(session_,tokens_,pos_);
         serial_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
     }
+    std::uint64_t align_end_=0;
     std::vector<std::uint32_t> tokens_;
     MtpDecodeTargetParents::TiledPrompt& tiled_;
     SerialSessionContext& session_;
@@ -739,6 +875,7 @@ private:
     bool forced_ladder_=false;
     bool small_=false;
     std::optional<ModelContentIdentity> final_logits_digest_;
+    std::optional<ModelContentIdentity> terminal_logits_digest_;
     std::size_t tap_=SIZE_MAX,tail_=0;
     std::byte* block_hidden_=nullptr;
     std::byte* spare_hidden_=nullptr;
@@ -746,6 +883,7 @@ private:
     Phase phase_=Phase::blocks;
     bool adopted_=false,window_refused_=false,priming_=false;
     int balanced_=-1;
+    HipPrefixStateCacheSession::Capture capture_;
     std::future<bool> submitter_;
     HipMtpTargetHiddenTicket pending_;
     std::chrono::steady_clock::time_point start_;
@@ -799,6 +937,7 @@ inline HipMtpTargetHiddenTicket run_tiled_mtp_prompt(std::span<const std::uint32
 // (hip_mtp_greedy_cohort_cycle); with one, the ordinary cycle.
 struct MtpBatchRequest {
     std::shared_ptr<MtpConstraintRow> constraint;
+    serve::CacheRetention cache_retention = serve::CacheRetention::server_policy;
     std::vector<std::uint32_t> prompt;
     std::uint64_t max_tokens = 0;
     std::vector<std::uint32_t> stop_tokens;
@@ -828,6 +967,9 @@ class MtpBatchRunner {
         ~EngineCall(){active=false;}
     };
 public:
+    std::mutex* session_mutex = nullptr;
+    MtpServeRunner session_run; // Only invoked between ordinary batch jobs, on the bridge thread.
+    std::function<void()> publish_session_stats; // Bridge thread, under session_mutex.
     struct Slot {
         std::shared_ptr<MtpDecodeTargetParents> parents;
         SerialSessionContext* session = nullptr;
@@ -1032,10 +1174,11 @@ private:
         // Predictor priming and cache checkpoints use the configured draft identity for every prompt.
         enable_draft_(*s.runtime, s.request.prompt, s.request.sampler);
         s.prompt_start = start;
+        if (s.parents->tiled.cache) s.parents->tiled.cache->set_retention(s.request.cache_retention != serve::CacheRetention::no_store);
         s.prefill = std::make_unique<TiledMtpPrompt>(s.request.prompt, model_, compiled_, s.parents->tiled, *s.session, *s.target,
             *s.runtime, qualified_, activated_, s.parents->resources, *s.dispatcher, s.held, s.request.sampler,
             s.request.constraint?HipMtpHostRowSelector{[state=s.request.constraint](auto row){return state->select(row);}}:HipMtpHostRowSelector{},
-            s.request.on_progress);
+            s.request.on_progress,false,true,true);
         static_cast<void>(m);
         ++stats_.admitted;
         s.order = stats_.admitted;
@@ -1065,6 +1208,7 @@ public:
     auto step() {
         EngineCall call(engine_call_);
         [[maybe_unused]] bool serial_completed = false;
+        PrefixAsyncCapture::reap();
         using clock = std::chrono::steady_clock;
         Slot* prompt = nullptr;
         bool decoding = false;
@@ -1526,6 +1670,7 @@ private:
         if(state_digest && s.parents->tiled.cache)
             s.result.prompt_state_digest=model_content_identity_hex(s.parents->tiled.cache->state_digest(s.session->next_position));
         s.result.restored_tokens = s.prefill->restored();
+        if(s.parents->tiled.cache) s.result.cache_refusal=s.parents->tiled.cache->request().refusal;
         s.prefill.reset();
         s.prefilling = false;
         s.decode_start = std::chrono::steady_clock::now();
@@ -1619,6 +1764,8 @@ private:
         s.greedy.reset();
         s.pending = {};
         ++stats_.finished;
+        if (publish_session_stats) publish_session_stats();
+        else if (s.parents->tiled.cache && s.parents->tiled.cache->has_store()) options_.state_cache_stats->publish(prefix_snapshot(s.parents->tiled.cache->store()));
         if (s.request.on_finish) s.request.on_finish(s.result);
         s.request={};
     }
@@ -1673,6 +1820,12 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     MtpDecodeWindowFactory make_window={},std::function<std::string()> completion_receipt={},
     MtpDecodeQualification qualify={},MtpDecodeComponentDiagnostic component_diagnostic={},
     bool qualification_after_tiled_prompt=false) {
+
+    struct CaptureShutdown {
+        ~CaptureShutdown() noexcept {
+            try {PrefixAsyncCapture::shutdown();} catch(...) {std::terminate();}
+        }
+    } capture_shutdown;
     validate_resolved_mtp_cli(options);
     if(!options.mtp.enabled || !parents || session.next_position || session.committed_tokens ||
        session.health!=SerialSessionHealth::ready || session.execution_identity!=compiled.execution_identity)
@@ -1680,6 +1833,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     const auto& m=options.mtp;const auto& r=parents->resources;const auto& actual=*parents->experiment;
     const auto width=mtp_cli_mul(model.hidden_size,model.hc_count);
     HipMtpForwardGolden golden;
+    std::vector<std::uint32_t> session_calibration;
     const bool dump=!m.golden_dump.empty();
     if(((m.metadata_only || dump) && (qualify || component_diagnostic)) || (qualify && component_diagnostic))
         throw std::invalid_argument("MTP metadata, golden dump, full fixture and component diagnostic routes are mutually exclusive");
@@ -1736,9 +1890,21 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
        golden.rows.size()+1U!=options.tokens.size())
         throw std::invalid_argument(tiled_prompt ? "MTP golden of a tiled prompt must cover exactly its calibration rows" :
             "MTP golden must cover every prompt predictor pair, leaving only its final pending target row");
+    if(options.session_mtp_fixed && !options.http_serve) {
+        // The pinned replay payload, not a new request's suffix, supplies the independent
+        // calibration chain. All native replay comparisons and activation gates remain intact.
+        if(golden.rows.empty())throw std::invalid_argument("session MTP calibration is empty");
+        session_calibration.push_back(golden.rows.front().source_input_token);
+        for(const auto& row:golden.rows) {
+            if(row.source_input_token!=session_calibration.back() || row.source_input_token>=model.vocab_size ||
+               row.next_input_token>=model.vocab_size)throw std::invalid_argument("session MTP golden chain differs");
+            session_calibration.push_back(row.next_input_token);
+        }
+    }
+    const auto& calibration_tokens=session_calibration.empty()?options.tokens:session_calibration;
     for(std::size_t i=0;i<golden.rows.size();++i) {
         const auto& row=golden.rows[i];
-        if(row.source_position!=i || row.source_input_token!=options.tokens[i] || row.next_input_token!=options.tokens[i+1U] ||
+        if(row.source_position!=i || row.source_input_token!=calibration_tokens[i] || row.next_input_token!=calibration_tokens[i+1U] ||
            row.target_hidden_bf16.size()!=width || row.next_hidden_bf16.size()!=width || row.full_logits.size()!=model.vocab_size)
             throw std::invalid_argument("MTP independent golden prompt chain or full-row geometry differs before target execution");
     }
@@ -1815,7 +1981,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     const auto sampler=mtp_sampling(m) && !dump && !qualify ? std::make_shared<TokenSampler>(mtp_sampling_policy(m))
                                                            : std::shared_ptr<TokenSampler>{};
     std::shared_ptr<HipMtpWindowVerifier> window;
-    if(m.window_rows && !dump) {
+    if(m.window_rows && !dump && (!options.session_mtp_fixed || options.http_serve)) {
         if(!make_window)throw std::invalid_argument("MTP requested target window has no actual prepared native factory");
         window=make_window(target);
         if(!window || window->target_owner()!=target || window->logical_rows()!=m.window_rows)
@@ -1846,9 +2012,10 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         const auto calibration_start=std::chrono::steady_clock::now();
         for(std::size_t i=0;i<prompt_rows;++i) {
             if(sampler && !tiled_prompt && i+1U==options.tokens.size())target->set_token_sampler(sampler);
-            auto current=serial_split ? target->execute_serial(session,parents->prompt.resources,*parents->prompt.dispatcher,options.tokens[i])
-                               : target->execute_serial(session,r,dispatcher,options.tokens[i]);
-            if(pending.valid())replay_rows.push_back({pending,options.tokens[i]});
+            const auto input=session_calibration.empty()?options.tokens[i]:session_calibration[i];
+            auto current=serial_split ? target->execute_serial(session,parents->prompt.resources,*parents->prompt.dispatcher,input)
+                               : target->execute_serial(session,r,dispatcher,input);
+            if(pending.valid())replay_rows.push_back({pending,input});
             pending=std::move(current);
         }
         if(dump){
@@ -1995,7 +2162,122 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 }
             } else if(parents->tiled.rtx_import)
                 throw std::invalid_argument("--rtx-state-import needs the state component registry of the tiled MTP prompt");
-            if(parents->serve_batch) {
+
+            std::uint64_t served=0;
+                const MtpServeRunner ordinary_request=[&](const MtpServeRequest& q) {
+                    const auto stats_guard=std::shared_ptr<void>(nullptr,[&](void*) noexcept {
+                        if(parents->tiled.cache && parents->tiled.cache->has_store()) try {
+                            options.state_cache_stats->publish(prefix_snapshot(parents->tiled.cache->store()));
+                        } catch (...) {}
+                    });
+                    const auto vocabulary=model.vocab_size;
+                    if(q.prompt.empty() || q.prompt.size()>=options.context_tokens || !q.max_tokens || !q.on_tokens)
+                        throw std::invalid_argument("served request needs a prompt shorter than the context, a token budget and a sink");
+                    for(const auto t:q.prompt)if(t>=vocabulary)throw std::invalid_argument("served prompt token outside the vocabulary");
+                    for(const auto t:q.stop_tokens)if(t>=vocabulary)throw std::invalid_argument("served stop token outside the vocabulary");
+                    MtpServeResult out;
+                    if(q.constraint) {const auto route=resolve_mtp_selection_route(options.http_selection_mtp,!!window,window && window->policy_selection_admitted());
+                        q.constraint->set_execution(route.mtp?"mtp-host":"serial-host",route.fallback?route.fallback:"");}
+                    const auto request_start=std::chrono::steady_clock::now();
+                    try {
+                        // Every request starts exactly like the command-line request after calibration:
+                        // fresh target state and session, fresh predictor, no deferred window rows.
+                        pending={};
+                        ++served;
+                        runtime.reset();
+                        runtime=std::make_shared<HipMtpRuntime>(native);
+                        parents->tiled.reset_state();
+                        session=parents->tiled.fresh;
+                        if(window)window->begin_session();
+                        // Keep predictor priming/checkpoints identical under the shared cache identity.
+                        if(parents->tiled.cache) parents->tiled.cache->set_retention(q.cache_retention != serve::CacheRetention::no_store, q.session_id);
+                        enable_draft(q.prompt);
+                        std::string request_receipt;
+                        pending=run_tiled_mtp_prompt(q.prompt,model,compiled,parents->tiled,session,*target,*runtime,qualified,activated,
+                            r,dispatcher,tiled_held,request_receipt,{},
+                            q.constraint?HipMtpHostRowSelector{[state=q.constraint](auto row){return state->select(row);}}:HipMtpHostRowSelector{},q.on_progress);
+                        static const bool state_digest=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");return v&&v[0]=='1';}();
+                        if(state_digest && parents->tiled.cache)
+                            out.prompt_state_digest=model_content_identity_hex(parents->tiled.cache->state_digest(session.next_position));
+                        if(q.constraint) q.constraint->commit();
+                        if(parents->tiled.cache) {
+                            out.restored_tokens=parents->tiled.cache->request().restored_position;
+                            out.cache_refusal=parents->tiled.cache->request().refusal;
+                        }
+                        if(parents->tiled.cache && parents->tiled.cache->request().rtx_import)
+                            out.rtx_import_json=rtx_import_receipt(parents->tiled.cache->request());
+                        const auto decode_start=std::chrono::steady_clock::now();
+                        out.prompt_ms=std::chrono::duration<double,std::milli>(decode_start-request_start).count();
+                        HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
+                        const auto route=resolve_mtp_selection_route(options.http_selection_mtp,!!window,window && window->policy_selection_admitted());
+                        if(q.constraint && !route.mtp && window && window->pending_window())window->flush_pending_window();
+                        if(q.constraint)q.constraint->set_execution(route.mtp?"mtp-host":"serial-host",route.fallback?route.fallback:"");
+                        if((!q.constraint || route.mtp) && window)greedy.use_window_verifier(window);
+                        if(m.draft_chain)greedy.set_draft_min_probability(mtp_draft_min_probability(m));
+                        // n-gram extension per request (D-055): the request's "ngram_draft" (true = on where admissible,
+                        // false = off), else the engine's mode.
+                        if(!q.constraint && (q.ngram_draft ? *q.ngram_draft && ngram_wanted(false) : !m.ngram_off && ngram_wanted(m.ngram_draft)))
+                            enable_ngram(greedy,q.prompt);
+                        const auto is_stop=[&](std::uint32_t t){return std::find(q.stop_tokens.begin(),q.stop_tokens.end(),t)!=q.stop_tokens.end();};
+                        const std::array<std::uint32_t,1> first{pending.predicted_token()};
+                        out.generated_tokens=1;
+                        if(q.backend_probe) q.backend_probe->boundary(serve::BackendProof::work_completion);
+                        if(!q.on_tokens(first))out.finish="cancelled";
+                        else if(is_stop(first[0]))out.finish="stop";
+                        while(out.finish=="length" && out.generated_tokens<q.max_tokens) {
+                            PrefixAsyncCapture::reap();
+                            if(session.next_position>=options.context_tokens){out.finish="context";break;}
+                            if(q.constraint && !route.mtp) {
+                                q.constraint->prepare();
+                                auto next=target->execute_serial(session,r,dispatcher,pending.predicted_token(),nullptr,
+                                    [state=q.constraint](auto row){return state->select(row);});
+                                q.constraint->commit();pending=std::move(next);++out.cycles;++out.generated_tokens;
+                                const std::array<std::uint32_t,1> token{pending.predicted_token()};
+                                if(q.backend_probe) q.backend_probe->boundary(serve::BackendProof::work_completion);
+                                if(!q.on_tokens(token))out.finish="cancelled";
+                                else if(is_stop(token[0]))out.finish="stop";
+                                continue;
+                            }
+                            const auto budget=std::min<std::uint64_t>(q.max_tokens-out.generated_tokens,UINT32_MAX);
+                            auto transaction=q.constraint?q.constraint->window_transaction():nullptr;
+                            auto wide=!q.constraint && wide_copy?wide_copy->cycle(greedy,pending,static_cast<std::uint32_t>(budget),q.stop_tokens):std::nullopt;
+                            auto result=wide?std::move(*wide):greedy.cycle(pending,m.candidate_depth,static_cast<std::uint32_t>(budget),q.stop_tokens,transaction.get());
+                            if(result.emitted_tokens.empty() && !result.selection_failure)throw std::runtime_error("MTP generation made no completed target progress");
+                            if(result.selection_receipt){result.selection_receipt->publish();result.selection_receipt.reset();}
+                            if(result.selection_failure.has_value()) {
+                                out.generated_tokens+=result.emitted_tokens.size();
+                                if(!result.emitted_tokens.empty())q.on_tokens(result.emitted_tokens);
+                                out.finish="constraint_failure";out.error=std::move(*result.selection_failure);break;
+                            }
+                            pending=result.final_target;++out.cycles;
+                            out.proposed+=result.proposed_candidates;out.accepted+=result.accepted_candidates;
+                            out.generated_tokens+=result.emitted_tokens.size();
+                            if(q.backend_probe) q.backend_probe->boundary(serve::BackendProof::work_completion);
+                            if(!q.on_tokens(result.emitted_tokens)){out.finish="cancelled";break;}
+                            if(is_stop(result.emitted_tokens.back()))out.finish="stop";
+                        }
+                        if(const auto* ng=greedy.ngram_stats()){out.ngram_rows=ng->extension_rows;out.ngram_accepted=ng->accepted_rows;}
+                        if(const auto* cd=greedy.context_stats()){out.ngram_rows=cd->extension_rows;out.ngram_accepted=cd->accepted_rows;}
+                        static const bool final_digest=[] {const char* v=std::getenv("STRIX_FINAL_STATE_DIGEST");return v&&v[0]=='1';}();
+                        if((state_digest || final_digest) && parents->tiled.cache) {
+                            if(window && window->pending_window())window->flush_pending_window();
+                            if(hipDeviceSynchronize()!=hipSuccess) throw std::runtime_error("complete final committed state digest");
+                            out.final_state_position=session.next_position;
+                            out.final_state_digest=model_content_identity_hex(parents->tiled.cache->state_digest(session.next_position));
+                            static const bool components=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST_COMPONENTS");return v&&v[0]=='1';}();
+                            if(components) out.final_state_components=parents->tiled.cache->component_digests(session.next_position);
+                        }
+                        pending={};
+                        out.decode_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-decode_start).count();
+                    } catch(const serve::ConstraintError& e) {
+                        if(session.health==SerialSessionHealth::poisoned || (window && window->failed()))throw;
+                        out.finish="constraint_failure";out.error=e.what();pending={};
+                    }
+                    if(q.constraint) out.constraint=q.constraint->verdict(out.finish);
+                    return out;
+                };
+
+            const auto run_batch = [&](const MtpServeRunner& named_run, std::mutex* shared_mutex = nullptr, std::function<void()> publish_stats = {}) {
                 // Slot 0 is this request's state; every further slot gets the same objects over its own state.
                 std::vector<std::unique_ptr<MtpBatchRunner::Slot>> slots;
                 std::vector<std::byte*> held_rows;
@@ -2047,10 +2329,10 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-slot_begin).count());
                     return slot;
                 };
-                install_restore(*slots.front());
+                if (!named_run) install_restore(*slots.front());
                 for(const auto& setup:parents->batch_slots) slots.push_back(prepare_slot(setup, slots.size()));
                 pending={};
-                runtime.reset();
+                if (!named_run) runtime.reset();
                 // STRIX_BATCH_INTERLEAVE: 1/0 forces block-interleaved admission on/off (default: on when serving).
                 const char* interleave_env=std::getenv("STRIX_BATCH_INTERLEAVE");
                 const bool interleave=interleave_env?interleave_env[0]=='1':options.http_serve;
@@ -2078,6 +2360,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 }
                 runner.calibration={calibration_rows,calibration_ms,replay.observation.maximum_hidden_abs_error,
                     replay.observation.maximum_logit_abs_error};
+                runner.session_run = named_run; runner.session_mutex = shared_mutex;
+                runner.publish_session_stats=std::move(publish_stats);
                 try {parents->serve_batch(runner);}
                 catch(...) {runner.abandon();throw;}
                 assets->validate_assets_unchanged();
@@ -2097,112 +2381,306 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                     <<",\"prompt_window_members\":"<<st.prompt_window_members<<","<<batch_service_receipt(st)
                     <<",\"calibration_rows\":"<<calibration_rows<<",\"calibration_ms\":"<<calibration_ms<<"}\n";
                 return;
-            }
-            if(parents->serve) {
-                std::uint64_t served=0;
-                const MtpServeRunner run_request=[&](const MtpServeRequest& q) {
-                    const auto vocabulary=model.vocab_size;
-                    if(q.prompt.empty() || q.prompt.size()>=options.context_tokens || !q.max_tokens || !q.on_tokens)
-                        throw std::invalid_argument("served request needs a prompt shorter than the context, a token budget and a sink");
-                    for(const auto t:q.prompt)if(t>=vocabulary)throw std::invalid_argument("served prompt token outside the vocabulary");
-                    for(const auto t:q.stop_tokens)if(t>=vocabulary)throw std::invalid_argument("served stop token outside the vocabulary");
+            };
+
+            const bool serving = static_cast<bool>(parents->serve) || static_cast<bool>(parents->serve_batch);
+            if(options.session_mtp_fixed && (!serving || options.session_management_requested || options.session_live_control)) {
+                const auto session_check=[](hipError_t e,const char* what) {
+                    if(e!=hipSuccess)throw std::runtime_error(std::string(what)+": "+hipGetErrorString(e));
+                };
+                if(!parents->tiled.cache || parents->tiled.cache->has_store() || qualify || sampler ||
+                   !m.cohort.empty() || !m.copy_wide_rows.empty() || m.ngram_draft ||
+                   m.draft_context_vocab || !m.draft_vocab.empty())
+                    throw std::invalid_argument("fixed MTP sessions need a private complete registry, full draft vocabulary and no context/copy drafter");
+                auto& registry=*parents->tiled.cache;
+                registry.enable_fixed_mtp_sessions();
+                // The only session controller is fixed-depth, serial target verification. No timing or
+                // learned acceptance controller is read; each committed turn starts the same idle protocol.
+
+                SessionCompatibility compat; compat.mtp=true;
+                std::string roots;
+                std::vector<std::pair<std::string,ModelContentIdentity>> files;
+                for(const auto& path:{options.model_path,m.sidecar,m.golden,options.dense_q6p_pack_path,
+                        options.dense_trellis_pack_path,options.offline_tuning_cache_path,options.offline_compile_provenance_path}) {
+                    if(path.empty())continue;
+                    const auto hash=session_cached_file_hash(path);files.emplace_back(path,hash);
+                    roots+=std::to_string(path.size())+":"+path+model_content_identity_hex(hash);
+                }
+                compat.model=sha256_bytes(std::as_bytes(std::span(roots.data(),roots.size())));
+                compat.executable=session_cached_file_hash("/proc/self/exe");
+                hipDeviceProp_t props{};int rt=0,driver=0,device=0;
+                session_check(hipGetDevice(&device),"session current device");
+                session_check(hipGetDeviceProperties(&props,device),"session device");
+                session_check(hipRuntimeGetVersion(&rt),"session runtime");session_check(hipDriverGetVersion(&driver),"session driver");
+                compat.numerical_config=session_numerical_config(options.session_effective_cli,model.rotary_identity())+
+                    ";mtp-session-fixed-serial-v1;registry="+model_content_identity_hex(registry.identity())+
+                    ";arch="+props.gcnArchName+";name="+props.name+";runtime="+std::to_string(rt)+
+                    ";driver="+std::to_string(driver)+";rank=0;world=1";
+                std::unique_ptr<HttpSessionStore> store;
+                if(options.session_management_requested) store=std::make_unique<HttpSessionStore>(options.session_disk ? options.session_dir : std::string{},
+                    options.session_ram_bytes,options.session_max_parked,hip_pinned_prefix_buffer,compat,options.session_disk_bytes);
+                std::mutex session_mutex;
+                std::optional<SessionCheckpoint> cli_restore;
+                std::optional<std::chrono::steady_clock::time_point> disk_restore_started;
+                const auto max_envelope=options.context_tokens*(registry.row_bytes()+8U)+registry.fixed_bytes()+(16U<<20);
+                if(!options.session_load.empty()) {
+                    const auto t=std::chrono::steady_clock::now();disk_restore_started=t;
+                    SessionCheckpoint decoded;
+                    const auto available=observe_linux_uma_memory();
+                    const auto host_limit=session_checkpoint_envelope_limit(options.session_capture_host_bytes,
+                        available.memory.observation_identity ? available.memory.mem_available_bytes.value_or(0U) : 0U);
+                    (void)read_session_checkpoint(options.session_load,compat,hip_pinned_prefix_buffer,
+                        std::min(max_envelope,host_limit),nullptr,&decoded);
+                    cli_restore=std::move(decoded);
+                    std::cerr<<"session restore_read_verify_ms="<<std::chrono::duration<double,std::milli>(
+                        std::chrono::steady_clock::now()-t).count()<<'\n';
+                }
+                std::ofstream logit_file;
+                std::vector<std::uint32_t> last_history,last_generated;
+                SessionFrontier last_frontier;
+                bool record_cli=false, http_live_ready=false;
+                const auto admit_capture=[&](std::uint64_t rows) {
+                    const auto available=observe_linux_uma_memory();
+                    const auto bound=session_capture_peak_bound(registry.fixed_bytes()+(16U<<20),
+                        registry.row_bytes()+8U,rows,options.session_capture_host_bytes,
+                        available.memory.observation_identity ? available.memory.mem_available_bytes.value_or(0U) : 0U);
+                    if(store)store->admit(bound);
+                };
+                const auto capture=[&] {
+                    for(const auto& [path,hash]:files) if(session_cached_file_hash(path)!=hash)
+                        throw std::runtime_error("session asset changed during execution");
+                    if(session_cached_file_hash("/proc/self/exe")!=compat.executable)
+                        throw std::runtime_error("session executable changed during execution");
+                    admit_capture(session.next_position);
+                    std::cerr<<"session checkpoint_capture consumed="<<session.next_position<<'\n';
+                    return encode_session_checkpoint(registry.capture_session(session,compat,last_frontier),hip_pinned_prefix_buffer);
+                };
+                const MtpServeRunner session_run=[&](const MtpServeRequest& q) {
+                    std::lock_guard lock(session_mutex);
+                    // Publish on every exit, including unnamed turns and refused management calls.
+                    const auto stats_guard=std::shared_ptr<void>(nullptr,[&](void*) noexcept {
+                        if (store) try {
+                            options.state_cache_stats->publish(store->snapshot(),serve::parse_json(store->command("stats","","")));
+                        } catch (...) {} // Diagnostics must not mask the request's failure.
+                    });
+                    if (serving && q.session_id.empty() && q.session_operation.empty() && !options.session_live_control) return ordinary_request(q);
+                    if (q.constraint) throw std::invalid_argument("fixed sessions do not support constrained output");
+                    if(parents->tiled.cache) parents->tiled.cache->set_retention(q.cache_retention != serve::CacheRetention::no_store, q.session_id);
+                    target->replace_token_sampler({});
+                    const auto saved_window=parents->tiled.window;
+                    // An ordinary request may have left a deferred window on these owners.
+                    // Complete it before parking/management, then clear the pending guard exactly
+                    // as on request reset, before any checkpoint restore installs complete state.
+                    if(saved_window) {saved_window->flush_pending_window();saved_window->begin_session();}
+                    // Fixed sessions never execute windows: captures, digests and live resumes
+                    // below therefore observe fully materialized recurrent/conv state.
+                    parents->tiled.window=nullptr;
+                    const auto window_guard=std::shared_ptr<void>(nullptr,[&](void*){parents->tiled.window=saved_window;});
+                    if(session.health==SerialSessionHealth::poisoned)
+                        throw std::runtime_error("session lane is poisoned; restart required");
                     MtpServeResult out;
-                    if(q.constraint) {const auto route=resolve_mtp_selection_route(options.http_selection_mtp,!!window,window && window->policy_selection_admitted());
-                        q.constraint->set_execution(route.mtp?"mtp-host":"serial-host",route.fallback?route.fallback:"");}
-                    const auto request_start=std::chrono::steady_clock::now();
-                    try {
-                        // Every request starts exactly like the command-line request after calibration:
-                        // fresh target state and session, fresh predictor, no deferred window rows.
-                        pending={};
-                        ++served;
-                        runtime.reset();
-                        runtime=std::make_shared<HipMtpRuntime>(native);
-                        parents->tiled.reset_state();
-                        session=parents->tiled.fresh;
-                        if(window)window->begin_session();
-                        // Keep predictor priming/checkpoints identical under the shared cache identity.
-                        enable_draft(q.prompt);
-                        std::string request_receipt;
-                        pending=run_tiled_mtp_prompt(q.prompt,model,compiled,parents->tiled,session,*target,*runtime,qualified,activated,
-                            r,dispatcher,tiled_held,request_receipt,{},
-                            q.constraint?HipMtpHostRowSelector{[state=q.constraint](auto row){return state->select(row);}}:HipMtpHostRowSelector{},q.on_progress);
-                        static const bool state_digest=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");return v&&v[0]=='1';}();
-                        if(state_digest && parents->tiled.cache)
-                            out.prompt_state_digest=model_content_identity_hex(parents->tiled.cache->state_digest(session.next_position));
-                        if(q.constraint) q.constraint->commit();
-                        if(parents->tiled.cache)out.restored_tokens=parents->tiled.cache->request().restored_position;
-                        if(parents->tiled.cache && parents->tiled.cache->request().rtx_import)
-                            out.rtx_import_json=rtx_import_receipt(parents->tiled.cache->request());
-                        const auto decode_start=std::chrono::steady_clock::now();
-                        out.prompt_ms=std::chrono::duration<double,std::milli>(decode_start-request_start).count();
-                        HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
-                        const auto route=resolve_mtp_selection_route(options.http_selection_mtp,!!window,window && window->policy_selection_admitted());
-                        if(q.constraint && !route.mtp && window && window->pending_window())window->flush_pending_window();
-                        if(q.constraint)q.constraint->set_execution(route.mtp?"mtp-host":"serial-host",route.fallback?route.fallback:"");
-                        if((!q.constraint || route.mtp) && window)greedy.use_window_verifier(window);
-                        if(m.draft_chain)greedy.set_draft_min_probability(mtp_draft_min_probability(m));
-                        // n-gram extension per request (D-055): the request's "ngram_draft" (true = on where admissible,
-                        // false = off), else the engine's mode.
-                        if(!q.constraint && (q.ngram_draft ? *q.ngram_draft && ngram_wanted(false) : !m.ngram_off && ngram_wanted(m.ngram_draft)))
-                            enable_ngram(greedy,q.prompt);
-                        const auto is_stop=[&](std::uint32_t t){return std::find(q.stop_tokens.begin(),q.stop_tokens.end(),t)!=q.stop_tokens.end();};
-                        const std::array<std::uint32_t,1> first{pending.predicted_token()};
-                        out.generated_tokens=1;
-                        if(q.backend_probe) q.backend_probe->boundary(serve::BackendProof::work_completion);
-                        if(!q.on_tokens(first))out.finish="cancelled";
-                        else if(is_stop(first[0]))out.finish="stop";
-                        while(out.finish=="length" && out.generated_tokens<q.max_tokens) {
-                            if(session.next_position>=options.context_tokens){out.finish="context";break;}
-                            if(q.constraint && !route.mtp) {
-                                q.constraint->prepare();
-                                auto next=target->execute_serial(session,r,dispatcher,pending.predicted_token(),nullptr,
-                                    [state=q.constraint](auto row){return state->select(row);});
-                                q.constraint->commit();pending=std::move(next);++out.cycles;++out.generated_tokens;
-                                const std::array<std::uint32_t,1> token{pending.predicted_token()};
-                                if(q.backend_probe) q.backend_probe->boundary(serve::BackendProof::work_completion);
-                                if(!q.on_tokens(token))out.finish="cancelled";
-                                else if(is_stop(token[0]))out.finish="stop";
-                                continue;
-                            }
-                            const auto budget=std::min<std::uint64_t>(q.max_tokens-out.generated_tokens,UINT32_MAX);
-                            auto transaction=q.constraint?q.constraint->window_transaction():nullptr;
-                            auto wide=!q.constraint && wide_copy?wide_copy->cycle(greedy,pending,static_cast<std::uint32_t>(budget),q.stop_tokens):std::nullopt;
-                            auto result=wide?std::move(*wide):greedy.cycle(pending,m.candidate_depth,static_cast<std::uint32_t>(budget),q.stop_tokens,transaction.get());
-                            if(result.emitted_tokens.empty() && !result.selection_failure)throw std::runtime_error("MTP generation made no completed target progress");
-                            if(result.selection_receipt){result.selection_receipt->publish();result.selection_receipt.reset();}
-                            if(result.selection_failure.has_value()) {
-                                out.generated_tokens+=result.emitted_tokens.size();
-                                if(!result.emitted_tokens.empty())q.on_tokens(result.emitted_tokens);
-                                out.finish="constraint_failure";out.error=std::move(*result.selection_failure);break;
-                            }
+                    if(!q.session_operation.empty()) {
+                        http_live_ready=false;
+                        if(!store)throw std::invalid_argument("session management is disabled");
+                        if(q.session_operation=="resume") {
+                            auto envelope=store->get(q.session_id,true);
+                            if(!envelope.data)throw SessionApiError(404,"session_not_found","unknown or evicted session");
+                            auto restored=decode_session_checkpoint(envelope,compat);
+                            for(auto token:restored.frontier.tokens)if(token>=model.vocab_size)
+                                throw std::invalid_argument("session token outside vocabulary");
+                            if(restored.frontier.pending && *restored.frontier.pending>=model.vocab_size)
+                                throw std::invalid_argument("session pending token outside vocabulary");
+                            auto fresh=parents->tiled.fresh;registry.restore_session(fresh,restored,true);
+                            pending={};runtime.reset();runtime=std::make_shared<HipMtpRuntime>(native);
+                            parents->tiled.reset_state();session=parents->tiled.fresh;
+                            registry.restore_session(session,restored);enable_draft(restored.frontier.tokens);
+                            runtime->restore_cache_frontier(qualified,activated,restored.frontier.predictor);
+                        }
+                        out.session_json=store->command(q.session_operation,q.session_id,q.session_durability);
+                        return out;
+                    }
+                    if(!q.session_id.empty()) {
+                        if(!store)throw std::invalid_argument("session management is disabled");
+                        validate_http_session_id(q.session_id);
+                    }
+                    if(q.prompt.empty() || !q.max_tokens || !q.on_tokens || q.ngram_draft.value_or(false))
+                        throw std::invalid_argument("fixed session needs a nonempty greedy prompt/budget and no context drafter");
+                    for(const auto token:q.prompt)if(token>=model.vocab_size)throw std::invalid_argument("session token outside vocabulary");
+                    std::optional<SessionCheckpoint> checkpoint;
+                    std::vector<std::uint32_t> full(q.prompt.begin(),q.prompt.end());
+                    if(cli_restore) {
+                        checkpoint=std::move(cli_restore);cli_restore.reset();
+                        full=checkpoint->frontier.tokens;
+                        if(checkpoint->frontier.pending)full.push_back(*checkpoint->frontier.pending);
+                        full.insert(full.end(),q.prompt.begin(),q.prompt.end());
+                    } else if(store && !q.session_id.empty()) checkpoint=store->matching(q.session_id,full,q.cache_retention != serve::CacheRetention::no_store);
+                    else if(serving && options.session_live_control && http_live_ready &&
+                        session_prompt_extends(last_frontier,full)) {
+                        // Qualification control: continue the occupied lane directly. No capture,
+                        // envelope encoding/decoding or device restore has occurred for this turn.
+                        checkpoint=SessionCheckpoint{compat,last_frontier,{}};
+                    }
+                    http_live_ready=false;
+                    if(full.size()>=options.context_tokens || q.max_tokens>options.context_tokens-full.size())
+                        throw std::invalid_argument("session prompt plus output exceeds context");
+                    for(const auto token:full)if(token>=model.vocab_size)throw std::invalid_argument("restored token outside vocabulary");
+                    // Upper bound includes every possible consumed input of this turn. Check
+                    // before reset, prefill or generation; repeat at capture against fresh UMA.
+                    if(store || !options.session_save.empty()) admit_capture(full.size()+q.max_tokens);
+                    if(q.on_admitted) q.on_admitted();
+                    const auto started=std::chrono::steady_clock::now();
+                    const bool live_boundary=checkpoint && checkpoint->sections.empty();
+                    if(live_boundary && serving)
+                        std::cerr<<"session boundary_source=never-captured-live consumed="<<session.next_position<<'\n';
+                    if(checkpoint && !live_boundary) {
+                        auto fresh=parents->tiled.fresh;registry.restore_session(fresh,*checkpoint,true);
+                    }
+                    pending={};runtime.reset();runtime=std::make_shared<HipMtpRuntime>(native);
+                    if(!live_boundary){parents->tiled.reset_state();session=parents->tiled.fresh;}
+                    enable_draft(full);
+                    std::uint64_t emitted=0;
+                    if(checkpoint) {
+                        if(!live_boundary)registry.restore_session(session,*checkpoint);
+                        emitted=checkpoint->frontier.emitted;out.restored_tokens=session.next_position;
+                        runtime->restore_cache_frontier(qualified,activated,checkpoint->frontier.predictor);
+                        checkpoint.reset();
+                        if(disk_restore_started) {
+                            std::cerr<<"session restore_ms="<<std::chrono::duration<double,std::milli>(
+                                std::chrono::steady_clock::now()-*disk_restore_started).count()<<'\n';
+                            disk_restore_started.reset();
+                        }
+                    }
+                    // HTTP qualification exports one complete file per serialized request.
+                    if(serving && !options.session_logits.empty()) {
+                        logit_file.open(options.session_logits,std::ios::binary|std::ios::trunc);
+                        if(!logit_file)throw std::runtime_error("cannot open HTTP session logits");
+                    }
+                    std::vector<ModelContentIdentity> row_hashes;
+                    target->set_session_logits_observer([&](std::uint64_t position,std::span<const float> row) {
+                        if(position+1U<full.size())return;
+                        const auto bytes=std::as_bytes(row);row_hashes.push_back(sha256_bytes(bytes));
+                        if((record_cli || serving) && logit_file.is_open()) {
+                            logit_file.write(reinterpret_cast<const char*>(row.data()),static_cast<std::streamsize>(bytes.size()));
+                            if(!logit_file)throw std::runtime_error("session logits write failed");
+                        }
+                    });
+                    auto observer_guard=std::shared_ptr<void>(nullptr,[&](void*){target->set_session_logits_observer({});});
+                    std::string receipt;
+                    if(out.restored_tokens) {
+                        const auto plan=plan_session_suffix(session.next_position,full.size()-session.next_position,parents->tiled.rows,options.session_tiled_suffix);
+                        std::cerr<<"session suffix_route="<<(plan.tiled?"aligned-tiled":"serial")<<" alignment_steps="<<plan.serial_rows<<'\n';
+                    }
+                    {
+                    TiledMtpPrompt prompt(full,model,compiled,parents->tiled,session,*target,*runtime,qualified,activated,
+                        r,dispatcher,tiled_held,{},{},{},out.restored_tokens!=0,options.session_tiled_suffix);
+                    while(!prompt.done())prompt.step();
+                    pending=prompt.finish(receipt);
+                    }
+                    const auto decode_start=std::chrono::steady_clock::now();
+                    out.prompt_ms=std::chrono::duration<double,std::milli>(decode_start-started).count();
+                    std::vector<std::uint32_t> tokens{pending.predicted_token()};
+                    const auto is_stop=[&](std::uint32_t t){return std::find(q.stop_tokens.begin(),q.stop_tokens.end(),t)!=q.stop_tokens.end();};
+                    if(q.backend_probe) q.backend_probe->boundary(serve::BackendProof::work_completion);
+                    if(!q.on_tokens(tokens))out.finish="cancelled";else if(is_stop(tokens.back()))out.finish="stop";
+                    {
+                        HipMtpGreedyRuntime fixed(runtime,qualified,activated,target,session,r,dispatcher,parents);
+                        // No verifier/controller, ngram, subset vocabulary or adaptive min-p cut.
+                        while(out.finish=="length" && tokens.size()<q.max_tokens) {
+                            auto result=fixed.cycle(pending,m.candidate_depth,
+                                static_cast<std::uint32_t>(std::min<std::uint64_t>(q.max_tokens-tokens.size(),UINT32_MAX)),q.stop_tokens);
+                            if(result.emitted_tokens.empty())throw std::runtime_error("MTP session made no progress");
                             pending=result.final_target;++out.cycles;
                             out.proposed+=result.proposed_candidates;out.accepted+=result.accepted_candidates;
-                            out.generated_tokens+=result.emitted_tokens.size();
+                            tokens.insert(tokens.end(),result.emitted_tokens.begin(),result.emitted_tokens.end());
                             if(q.backend_probe) q.backend_probe->boundary(serve::BackendProof::work_completion);
-                            if(!q.on_tokens(result.emitted_tokens)){out.finish="cancelled";break;}
-                            if(is_stop(result.emitted_tokens.back()))out.finish="stop";
+                            if(!q.on_tokens(result.emitted_tokens))out.finish="cancelled";
+                            else if(is_stop(tokens.back()))out.finish="stop";
                         }
-                        if(const auto* ng=greedy.ngram_stats()){out.ngram_rows=ng->extension_rows;out.ngram_accepted=ng->accepted_rows;}
-                        if(const auto* cd=greedy.context_stats()){out.ngram_rows=cd->extension_rows;out.ngram_accepted=cd->accepted_rows;}
-                        static const bool final_digest=[] {const char* v=std::getenv("STRIX_FINAL_STATE_DIGEST");return v&&v[0]=='1';}();
-                        if((state_digest || final_digest) && parents->tiled.cache) {
-                            if(window && window->pending_window())window->flush_pending_window();
-                            if(hipDeviceSynchronize()!=hipSuccess) throw std::runtime_error("complete final committed state digest");
-                            out.final_state_position=session.next_position;
-                            out.final_state_digest=model_content_identity_hex(parents->tiled.cache->state_digest(session.next_position));
-                            static const bool components=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST_COMPONENTS");return v&&v[0]=='1';}();
-                            if(components) out.final_state_components=parents->tiled.cache->component_digests(session.next_position);
-                        }
-                        pending={};
-                        out.decode_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-decode_start).count();
-                    } catch(const serve::ConstraintError& e) {
-                        if(session.health==SerialSessionHealth::poisoned || (window && window->failed()))throw;
-                        out.finish="constraint_failure";out.error=e.what();pending={};
                     }
-                    if(q.constraint) out.constraint=q.constraint->verdict(out.finish);
+                    if(serving && logit_file.is_open()) {
+                        logit_file.flush();
+                        if(!logit_file)throw std::runtime_error("HTTP session logits flush failed");
+                        logit_file.close();
+                    }
+                    out.generated_tokens=tokens.size();
+                    out.decode_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-decode_start).count();
+                    last_history=full;last_history.insert(last_history.end(),tokens.begin(),tokens.end()-1);
+                    if(last_history.size()!=session.next_position || runtime->next_source_position()+1U!=session.next_position)
+                        throw std::runtime_error("MTP session committed frontier differs");
+                    session_check(hipMemcpy(tiled_held,reinterpret_cast<const void*>(pending.view().address),
+                        static_cast<std::size_t>(width*2U),hipMemcpyDeviceToDevice),"session final target hidden");
+                    // Canonical turn boundary: drop ephemeral tickets/proposal counters in ALL arms. No
+                    // device row is recomputed. Next turn starts with this held target row and p-1 caches.
+                    pending={};runtime.reset();runtime=std::make_shared<HipMtpRuntime>(native);enable_draft(last_history);
+                    runtime->restore_cache_frontier(qualified,activated,session.next_position-1U);
+                    last_frontier={};last_frontier.consumed=session.next_position;last_frontier.accepted=session.next_position;
+                    last_frontier.predictor=session.next_position-1U;last_frontier.tokens=last_history;
+                    last_frontier.pending=tokens.back();last_frontier.emitted=emitted+tokens.size();last_generated=tokens;
+                    if(store)admit_capture(session.next_position); // existing diagnostic digest scratch admission, independent of retention
+                    assets->validate_assets_unchanged();
+                    const auto digest=model_content_identity_hex(registry.complete_session_digest(session,last_frontier));
+                    serve::Json diagnostics=serve::Json::object(),ids=serve::Json::array(),hashes=serve::Json::array();
+                    for(const auto token:tokens)ids.push(serve::Json(static_cast<std::uint64_t>(token)));
+                    for(const auto& hash:row_hashes)hashes.push(serve::Json(model_content_identity_hex(hash)));
+                    if(row_hashes.size()!=tokens.size())throw std::runtime_error("MTP session did not observe every output head");
+                    diagnostics.set("tokens",std::move(ids));diagnostics.set("fp32_logits_sha256",std::move(hashes));
+                    diagnostics.set("final_digest",serve::Json(digest));diagnostics.set("accepted",serve::Json(out.accepted));
+                    diagnostics.set("proposed",serve::Json(out.proposed));out.session_json=diagnostics.dump();
+                    if(store && !q.session_id.empty() && q.cache_retention != serve::CacheRetention::no_store) {
+                        if(out.finish=="cancelled")store->invalidate_turn(q.session_id);
+                        else {auto envelope=capture();store->park(q.session_id,std::move(envelope));}
+                    }
+                    if(store) {
+                        if(!q.session_id.empty() && q.cache_retention == serve::CacheRetention::no_store) store->no_store_skip();
+                    }
+                    http_live_ready=serving && options.session_live_control && q.cache_retention != serve::CacheRetention::no_store && q.session_id.empty() && out.finish!="cancelled";
+                    std::cerr<<"session "<<(out.restored_tokens?"suffix_ms=":"initial_prefill_ms=")<<out.prompt_ms
+                        <<"\nsession "<<(out.restored_tokens?"generation_ms=":"initial_generation_ms=")<<out.decode_ms
+                        <<"\nsession final_digest="<<digest<<'\n';
                     return out;
                 };
-                parents->serve(run_request,options.http_selection_mtp && window && window->policy_selection_admitted());
+                if(parents->serve_batch) {run_batch(session_run, &session_mutex, [&] {
+                    if(store) options.state_cache_stats->publish(store->snapshot(),serve::parse_json(store->command("stats","","")));
+                }); return;}
+                if(serving) {parents->serve(session_run,options.http_selection_mtp && window && window->policy_selection_admitted());assets->validate_assets_unchanged();return;}
+                if(!options.session_logits.empty()) {
+                    logit_file.open(options.session_logits,std::ios::binary|std::ios::trunc);
+                    if(!logit_file)throw std::runtime_error("cannot open session logits");
+                }
+                const auto sink=[](std::span<const std::uint32_t>){return true;};
+                MtpServeRequest first;first.prompt=options.tokens;first.max_tokens=options.session_first_generate?
+                    options.session_first_generate:options.generate_tokens;first.stop_tokens=eos;first.on_tokens=sink;
+                record_cli=!options.session_load.empty();
+                auto result=session_run(first);
+                if(!options.session_save.empty()) {
+                    const auto t=std::chrono::steady_clock::now();auto envelope=capture();SessionIoStats io;
+                    publish_session_checkpoint(options.session_save,envelope,&io);
+                    std::cerr<<"session save_stall_ms="<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t).count()
+                        <<" write_fsync_ms="<<io.write_fsync_ms<<" bytes="<<io.bytes<<" consumed="<<session.next_position
+                        <<" pending="<<*last_frontier.pending<<'\n';
+                }
+                if(!options.session_then_prompt.empty()) {
+                    const auto suffix=read_prefix_cache_prompt(options.session_then_prompt);
+                    // Live continuation carries the exact same checkpoint semantics without capture in L.
+                    // Re-enter directly on occupied rows, rather than encode/decode a live state.
+                    cli_restore=SessionCheckpoint{compat,last_frontier,{}};
+                    // An empty section list marks an already-live boundary, handled below.
+                    MtpServeRequest next;next.prompt=suffix;next.max_tokens=options.generate_tokens;next.stop_tokens=eos;next.on_tokens=sink;
+                    record_cli=true;result=session_run(next);
+                }
+                if(logit_file.is_open()){
+                    logit_file.flush();if(!logit_file)throw std::runtime_error("session logits flush failed");
+                    std::cerr<<"session logits_rows="<<last_generated.size()<<" vocabulary="<<model.vocab_size<<'\n';
+                }
+                output<<"{\"mode\":\"session-mtp-fixed\",\"generated_tokens\":";
+                serve::Json ids=serve::Json::array();for(auto t:last_generated)ids.push(serve::Json(static_cast<std::uint64_t>(t)));
+                output<<ids.dump()<<",\"accepted\":"<<result.accepted<<",\"proposed\":"<<result.proposed
+                    <<",\"session\":"<<result.session_json<<"}\n";
+                return;
+            }
+            if(parents->serve_batch) { run_batch({}); return; }
+            if(parents->serve) {
+                parents->serve(ordinary_request,options.http_selection_mtp && window && window->policy_selection_admitted());
                 assets->validate_assets_unchanged();
                 output<<"{\"mode\":\"native-mtp-http-serve\",\"served_requests\":"<<served
                     <<",\"calibration_rows\":"<<calibration_rows<<",\"calibration_ms\":"<<calibration_ms<<"}\n";
@@ -2233,6 +2711,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         generated.push_back(pending.predicted_token());
         const auto start=std::chrono::steady_clock::now();
         while(generated.size()<options.generate_tokens && generated.back()!=eos.front()) {
+            PrefixAsyncCapture::reap();
             if(session.next_position>=options.context_tokens){stop="context-capacity";break;}
             const auto budget=static_cast<std::uint32_t>(options.generate_tokens-generated.size());
             auto wide=wide_copy?wide_copy->cycle(greedy,pending,budget,eos):std::nullopt;
