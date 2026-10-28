@@ -1,9 +1,14 @@
 // qpf2k/attn directed fixtures (standalone; build with the engine TU's flags: amdclang++ -O3 -std=gnu++20
 // --offload-arch=gfx1151 -Iinclude -x hip). Exit 0 only if every check passes and every path counter it requires is non-zero.
+// Full build (PowerShell, output in TEMP):
+// hipcc -O3 -std=gnu++20 --offload-arch=gfx1151 -Iinclude -x hip tests/qsa_flash_fixtures.hip -o "$env:TEMP/qsa_flash_fixtures.exe"
+// & "$env:TEMP/qsa_flash_fixtures.exe" --attend-occ-only
+// & "$env:TEMP/qsa_flash_fixtures.exe" --attend-occ-timing
 //  S: scorer cases (crafted BF16 queries and pooled keys) - qsa_flash::score_kernel<Rows, 16, 8> (both query feeds)
 //     vs the production kernel of that group size (block_score_parked_kernel<64, 4>; block_score_pooled_rows_kernel
 //     <Rows, 4> for 16 / 32 rows), every score bitwise; raw head dots (before relu) of the fused and the separate
 //     form vs the production lane tree, bitwise where the guard admits the fused form (NaNs compared as a class).
+//  O: native gfx1151 OCC vs production attend, complete bytes and guards (--attend-occ-only / --attend-occ-timing).
 //  G: guard boundary cases, counted per path.
 //  L: selector cases (crafted score rows; maxima from the scorer's own epilogue code) - qsa_flash::select_kernel vs
 //     select_rows_kernel, selected lists (canary-filled buffers, whole capacity) and post-selection scores bitwise.
@@ -714,19 +719,33 @@ static void run_stage_batch_cases(hipStream_t s) {
             }
 }
 
+// The full OCC matrix is explicit; default mode runs a cheap single-group smoke.
+#include "qsa_attend_occ_fixtures.inc"
+
 int main(int argc, char** argv) {
     const bool stage_only = argc == 2 && std::strcmp(argv[1], "--stage-batch-only") == 0;
-    if (argc != 1 && !stage_only) { std::fprintf(stderr, "usage: %s [--stage-batch-only]\n", argv[0]); return 2; }
+    const bool occ_only = argc == 2 && std::strcmp(argv[1], "--attend-occ-only") == 0;
+    const bool occ_timing = argc == 2 && std::strcmp(argv[1], "--attend-occ-timing") == 0;
+    if (argc != 1 && !stage_only && !occ_only && !occ_timing) {
+        std::fprintf(stderr, "usage: %s [--stage-batch-only|--attend-occ-only|--attend-occ-timing]\n", argv[0]); return 2;
+    }
     hipStream_t s; check(hipStreamCreate(&s), "stream");
     // qsa_flash_prod.inc also exposes this bench-only kernel; retain its symbol
     // when this fixture is built with the engine's unused-function diagnostics.
     static_cast<void>(&qsa_fast::kv_to_f16_kernel);
+    if (occ_only || occ_timing) {
+        const int result = run_occ_fixtures(s, occ_timing);
+        check(hipStreamDestroy(s), "stream destroy");
+        std::printf("attend occ fixtures: %s (%d failures)\n", result ? "FAIL" : "PASS", failures);
+        return result;
+    }
     run_stage_batch_cases(s);
     if (stage_only) {
         check(hipStreamDestroy(s), "stream destroy");
         std::printf("stage batch fixtures: %s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
         return failures ? 1 : 0;
     }
+    run_occ_smoke(s);
     std::map<std::string, std::uint64_t> paths;
     Rng rng{0x2545F4914F6CDD1DULL};
     const auto normal_q = [&](unsigned rows) { std::vector<float> q(static_cast<std::size_t>(rows) * kHeads * kDim); for (auto& x : q) x = bf(rng.normal()); return q; };

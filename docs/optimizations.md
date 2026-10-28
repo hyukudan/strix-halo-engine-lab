@@ -125,7 +125,7 @@ disables only stage batching; HC mask values select folds. Use explicit tiling t
 | `STRIX_QPF2K_GDN_GATES_BATCH` | `1` | `STRIX_QPF2K_GDN_GATES_BATCH=0` | [GDN recurrence, gates batching and core16](#qwen-gdn) |
 | `STRIX_QPF2K_GDN_CORE16` | `1` | `STRIX_QPF2K_GDN_CORE16=0` | [GDN recurrence, gates batching and core16](#qwen-gdn) |
 | `STRIX_QPF2K_QSA` | `1` | `STRIX_QPF2K_QSA=0` | [QSA stages and stage batching](#qwen-qsa) |
-| `STRIX_QPF2K_QSA_MASK` | `0x257` | `STRIX_QPF2K_QSA_MASK=0` | [QSA stages and stage batching](#qwen-qsa) |
+| `STRIX_QPF2K_QSA_MASK` | `0x2257` | `STRIX_QPF2K_QSA_MASK=0` | [QSA stages and stage batching](#qwen-qsa) |
 | `STRIX_QPF2K_HC` | `1` | `STRIX_QPF2K_HC=0` | [HC folds, output v3 and band 16](#qwen-hc) |
 | `STRIX_QPF2K_HC_MASK` | `14` | `STRIX_QPF2K_HC_MASK=0` | [HC folds, output v3 and band 16](#qwen-hc) |
 | `STRIX_QPF2K_HC_OUTPUT3` | `1` | `STRIX_QPF2K_HC_OUTPUT3=0` | [HC folds, output v3 and band 16](#qwen-hc) |
@@ -202,16 +202,16 @@ Folds admitted inject/norm work and changes the lane-chain output schedule; band
 
 ### QSA stages and stage batching
 
-**Engine:** `qwen`. **Control:** `STRIX_QPF2K_QSA=1; STRIX_QPF2K_QSA_MASK=0x257`. **Default:** auto.
+**Engine:** `qwen`. **Control:** `STRIX_QPF2K_QSA=1; STRIX_QPF2K_QSA_MASK=0x2257`. **Default:** auto.
 
 Uses admitted exact stage implementations and batches independent stages with bit 0x200.
 
 - **Preconditions:** Stage batching requires mask bits 0x3 as well as 0x200; normal eager prefill, 1..128 complete 64-row groups with no partial tiles, grouped norm enabled, BF16 KV and pooled-key storage. Index geometry is four heads of dimension 128, 16-byte aligned queries and prefixes bounded by pool capacity and 65536 blocks. The norm tensors share a weight format, have power-of-two dimensions 2..256, and admit the rotary geometry (half rotary dimension <=64). Rows need contiguous positions and common raw/KV owners, geometry, norm owners, journal, compression ratio and top-k. Private device tables/maxima and pinned descriptors must allocate before any launch/state write. Windows, cohorts, graphs, int8 KV, explicit tiled diagnostics and self-check modes keep their existing paths.
-- **Automatic selection:** The bundle supplies QSA=1 and mask 0x257; ineligible stage shapes keep their prior implementation.
+- **Automatic selection:** The bundle supplies QSA=1 and mask 0x2257 (bit 13 = attend occupancy, mask 0x257 turns only that off); ineligible stage shapes keep their prior implementation.
 - **Fallback notice:** Without tracing, stage-batch declines are silent and keep the per-group path. With STRIX_QPF2K_QSA_TRACE=1 and bit 0x200 requested, a decline prints qpf2k qsa stage_batch groups 0 pool 0 range 0 score 0 rope 0 norm 0 store 0 fallback 1. HIP execution errors propagate without retry after partial execution.
-- **Exactness evidence:** The qualification campaign compared 1K code and 8K prose receipts, terminal FP32 logits FNV and generated tokens against the unchanged reference. Repeat with the same prefill/decode identity; changing arithmetic profiles is a separate quality comparison. Stage-batching qualification additionally compared terminal logits and 1K code/8K prose receipts.
-- **Off switch:** STRIX_QPF2K_QSA=0 for the stages; STRIX_QPF2K_QSA_MASK=0x57 for stage batching alone
-- **Measured gain:** Stage batching: 32K mean -0.39 s (-1.7%); published-build ABBA -0.17 s; 64K -1.6%
+- **Exactness evidence:** The qualification campaign compared 1K code and 8K prose receipts, terminal FP32 logits FNV and generated tokens against the unchanged reference. Repeat with the same prefill/decode identity; changing arithmetic profiles is a separate quality comparison. Stage-batching qualification additionally compared terminal logits and 1K code/8K prose receipts. Attend occupancy (bit 13): its kernel copy is byte-compared with the production attend kernel in 460 fixture cases (single and multiple 64-row groups, causal/visible tails, padded union chunks); terminal logits FNV and tokens equal at 4K, 17.7K, 32K and 131K.
+- **Off switch:** STRIX_QPF2K_QSA=0 for the stages; STRIX_QPF2K_QSA_MASK=0x2057 for stage batching alone; 0x257 for attend occupancy alone (it requires bit 6 and attend batching)
+- **Measured gain:** Stage batching: 32K mean -0.39 s (-1.7%); published-build ABBA -0.17 s; 64K -1.6%; attend occupancy: 8192-row attend -8..-17 %, TTFT 32K 22.17 -> 22.03 s, 131K 95.40 -> 93.89 s (-1.5 %)
 - **Public evidence:** [Qwen results](performance.md#qwen-prefill-and-defaults), [stage implementation](../src/hip_indexed_attention_launcher.hip)
 
 <a id="qwen-moe"></a>

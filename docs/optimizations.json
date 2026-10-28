@@ -205,9 +205,9 @@
     "engine": "qwen",
     "name": "QPF2K_QSA_MASK",
     "flag_or_env": "STRIX_QPF2K_QSA_MASK",
-    "default": "0x257",
-    "exact": "The qualification campaign compared 1K code and 8K prose receipts, terminal FP32 logits FNV and generated tokens against the unchanged reference. Repeat with the same prefill/decode identity; changing arithmetic profiles is a separate quality comparison. Stage-batching qualification additionally compared terminal logits and 1K code/8K prose receipts.",
-    "gain": "Stage batching: 32K mean -0.39 s (-1.7%); published-build ABBA -0.17 s; 64K -1.6%",
+    "default": "0x2257",
+    "exact": "The qualification campaign compared 1K code and 8K prose receipts, terminal FP32 logits FNV and generated tokens against the unchanged reference. Repeat with the same prefill/decode identity; changing arithmetic profiles is a separate quality comparison. Stage-batching qualification additionally compared terminal logits and 1K code/8K prose receipts. Attend occupancy (bit 13): its kernel copy is byte-compared with the production attend kernel in 460 fixture cases (single and multiple 64-row groups, causal/visible tails, padded union chunks); terminal logits FNV and tokens equal at 4K, 17.7K, 32K and 131K.",
+    "gain": "Stage batching: 32K mean -0.39 s (-1.7%); published-build ABBA -0.17 s; 64K -1.6%; attend occupancy: 8192-row attend -8..-17 %, TTFT 32K 22.17 -> 22.03 s, 131K 95.40 -> 93.89 s (-1.5 %)",
     "preconditions": "Stage batching requires mask bits 0x3 as well as 0x200; normal eager prefill, 1..128 complete 64-row groups with no partial tiles, grouped norm enabled, BF16 KV and pooled-key storage. Index geometry is four heads of dimension 128, 16-byte aligned queries and prefixes bounded by pool capacity and 65536 blocks. The norm tensors share a weight format, have power-of-two dimensions 2..256, and admit the rotary geometry (half rotary dimension <=64). Rows need contiguous positions and common raw/KV owners, geometry, norm owners, journal, compression ratio and top-k. Private device tables/maxima and pinned descriptors must allocate before any launch/state write. Windows, cohorts, graphs, int8 KV, explicit tiled diagnostics and self-check modes keep their existing paths.",
     "off_switch": "STRIX_QPF2K_QSA_MASK=0",
     "doc_anchor": "docs/optimizations.md#qwen-qsa"
