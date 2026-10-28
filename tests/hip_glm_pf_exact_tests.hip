@@ -13,6 +13,7 @@
 #include <cstring>
 #include <fstream>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -194,12 +195,65 @@ std::vector<float> down(const float* p, std::size_t n) {
 
 namespace E = strix::glm::pf::exact;
 using Linear = strix::glm::engine::Linear;
+struct Env {
+    const char* name;
+    std::string saved;
+    bool present;
+    explicit Env(const char* n) : name(n), present(std::getenv(n) != nullptr) {
+        if (present) saved = std::getenv(n);
+    }
+    void set(const char* value) const {
+#ifdef _WIN32
+        if (_putenv_s(name, value ? value : "") != 0) die("set environment");
+#else
+        if ((value ? setenv(name, value, 1) : unsetenv(name)) != 0) die("set environment");
+#endif
+    }
+    ~Env() { set(present ? saved.c_str() : nullptr); }
+};
+void test_routes() {
+    Env x("STRIX_GLM_PF_EXACT_X"), threshold("STRIX_GLM_PF_EXACT_X_MIN_ROWS");
+    threshold.set(nullptr);
+    for (const char* value : {static_cast<const char*>(nullptr), "0", "1", "2", "auto"}) {
+        x.set(value);
+        for (unsigned rows : {2047U, 2048U, 2049U, 4096U}) {
+            const auto expected = !value || std::strcmp(value, "0") == 0 ? E::Route::tm :
+                std::strcmp(value, "1") == 0 ? E::Route::x :
+                std::strcmp(value, "2") == 0 || rows >= 2048 ? E::Route::x2 : E::Route::tm;
+            check(E::route(rows) == expected, std::string("route X=") + (value ? value : "unset") +
+                  " rows=" + std::to_string(rows));
+        }
+    }
+    x.set("auto"); threshold.set("100");
+    check(E::route(99) == E::Route::tm && E::route(100) == E::Route::x2, "route auto threshold=100 at 99/100");
+    for (const char* bad : {"0", "65537", "abc"}) {
+        threshold.set(bad);
+        bool threw = false;
+        try { (void)E::route(4096); } catch (const std::invalid_argument&) { threw = true; }
+        check(threw, std::string("route rejects threshold=") + bad);
+    }
+    threshold.set(nullptr);
+    for (const char* bad : {"-1", "3", "abc"}) {
+        x.set(bad);
+        bool threw = false;
+        try { (void)E::route(4096); } catch (const std::invalid_argument&) { threw = true; }
+        check(threw, std::string("route rejects X=") + bad);
+    }
+}
 void tm_env(unsigned tm) {
     const std::string v = std::to_string(tm);
 #ifdef _WIN32
     if (_putenv_s("STRIX_GLM_PF_EXACT_TM", v.c_str()) != 0) die("set TM");
 #else
     if (setenv("STRIX_GLM_PF_EXACT_TM", v.c_str(), 1) != 0) die("set TM");
+#endif
+}
+void x_env(unsigned variant) {  // 0 TM path, 1 X, 2 X2, 3 auto
+    const char* v = variant == 3 ? "auto" : variant == 2 ? "2" : variant == 1 ? "1" : "0";
+#ifdef _WIN32
+    if (_putenv_s("STRIX_GLM_PF_EXACT_X", v) != 0) die("set X");
+#else
+    if (setenv("STRIX_GLM_PF_EXACT_X", v, 1) != 0) die("set X");
 #endif
 }
 std::uint32_t bits(float x) {
@@ -239,10 +293,90 @@ Linear engine_linear(const Lin& l, bool raw) {
     }
     return e;
 }
+void exceptional(Ctx& cx) {
+    Env saved_x("STRIX_GLM_PF_EXACT_X"), saved_tm("STRIX_GLM_PF_EXACT_TM");
+    const Shape sh{"exceptional", "exceptional", 4, 4096, 128, 0, 0, 0};
+    const Lin l = prepare(cx, "", sh, true);
+    const Linear raw = engine_linear(l, true);
+    constexpr unsigned rows = 33;
+    Allocation x(std::size_t{rows} * l.I * 4), y(std::size_t{rows} * l.N * 4), ws(E::workspace_bytes(rows, l.I));
+    // Signed input scales/weights, with exact-zero sums for the zero case.
+    std::vector<std::uint16_t> suh(l.I), svh(l.N);
+    for (unsigned i = 0; i < l.I; ++i) suh[i] = i & 1U ? 0xbc00U : 0x3c00U;
+    for (unsigned i = 0; i < l.N; ++i) svh[i] = i & 1U ? 0xbc00U : 0x3c00U;
+    hok(hipMemcpy(const_cast<std::uint16_t*>(raw.raw.suh), suh.data(), suh.size() * 2, hipMemcpyHostToDevice), "exception suh");
+    hok(hipMemcpy(const_cast<std::uint16_t*>(raw.raw.svh), svh.data(), svh.size() * 2, hipMemcpyHostToDevice), "exception svh");
+    tm_env(16);
+    for (const char* kind : {"signed-zero", "fp16-subnormal", "overflow", "nan-payload"}) {
+        for (unsigned c = 0; c < l.N; ++c)
+            svh[c] = std::strcmp(kind, "signed-zero") == 0 ? (c & 1U ? 0x8000U : 0U) : (c & 1U ? 0xbc00U : 0x3c00U);
+        hok(hipMemcpy(const_cast<std::uint16_t*>(raw.raw.svh), svh.data(), svh.size() * 2, hipMemcpyHostToDevice), "exception weight signs");
+        std::vector<float> input(std::size_t{rows} * l.I, 0.0F), ref;
+        for (unsigned r = 0; r < rows; ++r) {
+            float* row = input.data() + std::size_t{r} * l.I;
+            if (std::strcmp(kind, "signed-zero") == 0) {
+                for (unsigned c = 0; c < l.I; ++c) row[c] = from_bits((c + r) & 1U ? 0x80000000U : 0U);
+            } else for (unsigned c : {2048U, 2112U}) { // K-split boundary and middle of that split
+                const bool negative = (r + c / 64U) & 1U;
+                row[c] = std::strcmp(kind, "fp16-subnormal") == 0 ? (negative ? -0x1p-18F : 0x1p-18F) :
+                    std::strcmp(kind, "overflow") == 0 ? (negative ? -1.0e10F : 1.0e10F) :
+                    from_bits((negative ? 0xffc00000U : 0x7fc00000U) | ((r * 2U + c / 64U + 1U) << 13U));
+            }
+        }
+        hok(hipMemcpyAsync(x.p, input.data(), input.size() * 4, hipMemcpyHostToDevice, cx.hs), "exception input");
+        for (unsigned variant : {0U, 1U, 2U}) {
+            x_env(variant);
+            hok(hipMemsetAsync(y.p, 0xff, std::size_t{rows} * l.N * 4, cx.hs), "exception poison output");
+            E::linear_rows(raw, x.f(), l.I, y.f(), l.N, rows, ws.p, E::workspace_bytes(rows, l.I), cx.hs);
+            auto got = down(y.f(), std::size_t{rows} * l.N);
+            const std::string label = std::string("exception ") + kind + " route=" + std::to_string(variant);
+            std::vector<std::uint16_t> staged(std::size_t{rows} * l.I);
+            hok(hipMemcpy(staged.data(), ws.p, staged.size() * 2, hipMemcpyDeviceToHost), "exception staged t");
+            if (std::strcmp(kind, "fp16-subnormal") == 0)
+                check(std::any_of(staged.begin(), staged.end(), [](std::uint16_t h) {
+                    return (h & 0x7c00U) == 0 && (h & 0x03ffU) != 0;
+                }), label + " staged t contains FP16 subnormals");
+            if (std::strcmp(kind, "overflow") == 0) {
+                const bool positive = std::find(staged.begin(), staged.end(), 0x7c00U) != staged.end();
+                const bool negative = std::find(staged.begin(), staged.end(), 0xfc00U) != staged.end();
+                check(positive && negative, label + " staged t contains +/-Inf");
+            }
+            if (std::strcmp(kind, "nan-payload") == 0)
+                check(std::any_of(staged.begin(), staged.end(), [](std::uint16_t h) {
+                    return (h & 0x7c00U) == 0x7c00U && (h & 0x03ffU) != 0;
+                }), label + " staged t contains NaN");
+            if (variant == 0) {
+                ref = got;
+                if (std::strcmp(kind, "signed-zero") == 0)
+                    check(std::all_of(ref.begin(), ref.end(), [](float v) { return (bits(v) & 0x7fffffffU) == 0; }),
+                          label + " exact-zero sums");
+            } else {
+                check(std::memcmp(ref.data(), got.data(), got.size() * 4) == 0, label + " TM output bytes");
+                // The same inputs across a row-call boundary must preserve exceptional bits too.
+                hok(hipMemsetAsync(y.p, 0xff, std::size_t{rows} * l.N * 4, cx.hs), "exception split poison");
+                for (unsigned r = 0; r < rows; r += 16) {
+                    const unsigned n = std::min(16U, rows - r);
+                    E::linear_rows(raw, x.f() + std::size_t{r} * l.I, l.I, y.f() + std::size_t{r} * l.N, l.N,
+                                   n, ws.p, E::workspace_bytes(rows, l.I), cx.hs);
+                }
+                got = down(y.f(), got.size());
+                check(std::memcmp(ref.data(), got.data(), got.size() * 4) == 0, label + " split-call TM output bytes");
+            }
+        }
+    }
+    sok(strix_weights_destroy(l.w), "exception destroy");
+}
 void test_shape(Ctx& cx, const std::string& dir, const Shape& sh, bool synthetic, bool timing) {
     const Lin l = prepare(cx, dir, sh, synthetic);
     const Linear prepared = engine_linear(l, false), raw = engine_linear(l, true);
-    constexpr unsigned Mmax = 2048, extra = 16;
+    // 4096 only for representative real expert/MLA/KDA and one H128-partition shape.
+    const bool full_chunk = !timing && ((!synthetic &&
+        (std::strcmp(sh.kind, "expert gate r0 K4") == 0 ||
+         std::strcmp(sh.kind, "MLA kv_a (replicated) K6") == 0 ||
+         std::strcmp(sh.kind, "KDA q r0 (file slice) K6") == 0)) ||
+        (synthetic && std::strcmp(sh.kind, "K5 split exception") == 0));
+    const unsigned Mmax = timing ? 2048U : full_chunk ? 4096U : 2049U;
+    constexpr unsigned extra = 16;
     const std::size_t xs = l.I + 19U, ys = l.N + 17U;
     Allocation xb((Mmax + extra) * xs * 4U), yb((Mmax + extra) * ys * 4U), rb(std::size_t{Mmax} * l.N * 4U);
     const std::string tag = std::string(synthetic ? "random " : "fixture ") + sh.kind + " " +
@@ -286,6 +420,13 @@ void test_shape(Ctx& cx, const std::string& dir, const Shape& sh, bool synthetic
             std::printf("RESOURCE %s TM=%u private=%zu B/lane\n", tag.c_str(), tm, scratch);
             check(scratch == 0, "zero spills TM=" + std::to_string(tm) + " " + tag);
         }
+        for (unsigned variant : {1U, 2U}) {
+            const auto xr = E::x_resources(prepared, variant);
+            const std::string name = variant == 1 ? "X" : "X2";
+            std::printf("RESOURCE %s %s private=%zu B/lane VGPR=%d LDS=%zu\n", tag.c_str(), name.c_str(),
+                        xr.localSizeBytes, xr.numRegs, xr.sharedSizeBytes);
+            check(xr.localSizeBytes == 0, "zero spills " + name + " " + tag);
+        }
         Linear bad = raw; bad.raw.codebook = 0;
         check(!E::supported(bad), "reject non-mul1 " + tag);
         bad = raw; --bad.raw.input;
@@ -295,7 +436,14 @@ void test_shape(Ctx& cx, const std::string& dir, const Shape& sh, bool synthetic
         const auto ref = down(rb.f(), std::size_t{Mmax} * l.N);
         const float poison = from_bits(0xffffffffU);
         std::vector<float> staged((Mmax + extra) * xs, poison);
-        for (unsigned m : {1U,2U,7U,8U,9U,15U,16U,17U,31U,32U,33U,63U,64U,65U,100U,1024U,2048U}) {
+        const std::vector<unsigned> original{1,2,7,8,9,15,16,17,31,32,33,63,64,65,100,1024,2048};
+        std::vector<unsigned> sizes = original;
+        for (unsigned m = 1; m <= 33; ++m)
+            if (std::find(sizes.begin(), sizes.end(), m) == sizes.end()) sizes.push_back(m);
+        sizes.insert(sizes.end(), {2047, 2049});
+        if (full_chunk) sizes.push_back(4096);
+        for (unsigned m : sizes) {
+            const bool added = std::find(original.begin(), original.end(), m) == original.end();
             const unsigned source = (m * 37U + 11U) % (Mmax - m + 1U);
             const unsigned xo = 1U + m % 11U, yo = 1U + m % 7U;
             std::fill(staged.begin(), staged.end(), poison);
@@ -303,10 +451,16 @@ void test_shape(Ctx& cx, const std::string& dir, const Shape& sh, bool synthetic
                 std::copy_n(input.data() + std::size_t{source + r} * l.I, l.I, staged.data() + (xo + r) * xs + 3U);
             hok(hipMemcpyAsync(xb.p, staged.data(), staged.size() * 4U, hipMemcpyHostToDevice, cx.hs), "padded input");
             for (bool raw_form : {false, true})
-                for (unsigned tm : {16U,32U,64U}) {
-                    tm_env(tm);
+                for (unsigned tm : {16U,32U,64U,0U,1U,2U}) {
+                    // Preserve all original arms; new sizes cover TM16/X/X2/auto on prepared weights.
+                    if (added && (raw_form || tm == 32 || tm == 64)) continue;
+                    x_env(tm <= 2 ? tm + 1U : 0U);
+                    tm_env(tm <= 2 ? 16U : tm);
                     hok(hipMemsetAsync(yb.p, 0xff, (Mmax + extra) * ys * 4U, cx.hs), "poison output");
                     hok(hipMemsetAsync(ew.p, 0xff, E::workspace_bytes(Mmax, l.I), cx.hs), "poison workspace");
+                    const auto expected_route = tm == 0 ? E::Route::x :
+                        tm == 1 || (tm == 2 && m >= E::x_auto_rows()) ? E::Route::x2 : E::Route::tm;
+                    const bool selected = E::route(m) == expected_route; // Same environment as the launch below.
                     E::linear_rows(raw_form ? raw : prepared, xb.f() + xo * xs + 3U, xs,
                                    yb.f() + yo * ys + 5U, ys, m, ew.p, E::workspace_bytes(Mmax, l.I), cx.hs);
                     const auto got = down(yb.f(), (Mmax + extra) * ys);
@@ -326,42 +480,71 @@ void test_shape(Ctx& cx, const std::string& dir, const Shape& sh, bool synthetic
                             }
                         } else if (bits(got[q]) != 0xffffffffU) guards = false;
                     }
-                    const std::string suffix = " M=" + std::to_string(m) + " TM=" + std::to_string(tm) +
+                    const std::string suffix = " M=" + std::to_string(m) + " TM=" + (tm <= 2 ? std::string(tm == 0 ? "X" : tm == 1 ? "X2" : "Xauto") : std::to_string(tm)) +
                         (raw_form ? " raw " : " prepared ") + tag;
                     if (!same) std::printf("MISMATCH first=%zu got=%08x ref=%08x max_ulp=%u\n", first, first_got, first_ref, maxulp);
-                    check(same && guards, "bitwise+guards" + suffix);
+                    check(same && guards && selected, "bitwise+guards+route" + suffix);
+                    if (m == 4096) {
+                        hok(hipMemsetAsync(yb.p, 0xff, (Mmax + extra) * ys * 4U, cx.hs), "split poison output");
+                        // Auto must reselect per call: 2047 uses TM, 2049 uses X2.
+                        bool split_routes = true;
+                        unsigned offset = 0;
+                        for (unsigned nr : {2047U, 2049U}) {
+                            const auto expected = tm == 0 ? E::Route::x :
+                                tm == 1 || (tm == 2 && nr >= E::x_auto_rows()) ? E::Route::x2 : E::Route::tm;
+                            split_routes = split_routes && E::route(nr) == expected;
+                            E::linear_rows(prepared, xb.f() + (xo + offset) * xs + 3U, xs,
+                                           yb.f() + (yo + offset) * ys + 5U, ys, nr,
+                                           ew.p, E::workspace_bytes(Mmax, l.I), cx.hs);
+                            offset += nr;
+                        }
+                        const auto split = down(yb.f(), got.size());
+                        check(split_routes && std::memcmp(got.data(), split.data(), got.size() * 4) == 0,
+                              "split 2047+2049 bytes+guards+route" + suffix);
+                    }
                 }
         }
     } else {
         hok(hipMemcpyAsync(xb.p, input.data(), input.size() * 4U, hipMemcpyHostToDevice, cx.hs), "input");
         hipEvent_t a{}, b{};
         hok(hipEventCreate(&a), "event"); hok(hipEventCreate(&b), "event");
-        for (unsigned tm : {16U,32U,64U}) {
-            tm_env(tm);
+        for (unsigned tm : {16U,32U,64U,0U,1U}) {
+            x_env(tm <= 1 ? tm + 1U : 0U);
+            tm_env(tm <= 1 ? 16U : tm);
             auto exact = [&] { E::linear_rows(prepared, xb.f(), l.I, yb.f(), l.N, Mmax,
                                              ew.p, E::workspace_bytes(Mmax, l.I), cx.hs); };
-            exact(); reference(xb.f(), yb.f(), Mmax, 8);
+            auto baseline = [&] {
+                if (tm > 1) reference(xb.f(), yb.f(), Mmax, 8);
+                else {
+                    x_env(false);
+                    E::linear_rows(prepared, xb.f(), l.I, yb.f(), l.N, Mmax,
+                                   ew.p, E::workspace_bytes(Mmax, l.I), cx.hs);
+                    x_env(tm + 1U);
+                }
+            };
+            exact(); baseline();
             float ms[2][3]{};
             for (unsigned rep = 0; rep < 3; ++rep)
                 for (unsigned arm = 0; arm < 2; ++arm) {
                     hok(hipEventRecord(a, cx.hs), "event");
-                    if (arm == 0) exact(); else reference(xb.f(), yb.f(), Mmax, 8);
+                    if (arm == 0) exact(); else baseline();
                     hok(hipEventRecord(b, cx.hs), "event"); hok(hipEventSynchronize(b), "event");
                     hok(hipEventElapsedTime(&ms[arm][rep], a, b), "event");
                 }
             for (unsigned arm = 0; arm < 2; ++arm) {
                 std::sort(ms[arm], ms[arm] + 3);
                 const double seconds = ms[arm][1] * 1e-3;
-                const unsigned reuse = arm == 0 ? tm : 8U;
+                const unsigned reuse = arm == 0 ? (tm <= 1 ? 32U : tm) : (tm <= 1 ? 16U : 8U);
                 const double weights = static_cast<double>(l.I) * l.N * l.bits / 8.0 * ((Mmax + reuse - 1U) / reuse);
                 const double flop = 2.0 * Mmax * l.I * l.N;
                 std::printf("TIME %s TM=%u %s M=2048 %.4f us/row weight-GB/s=%.3f dot2-TFLOP/s=%.3f\n",
-                            tag.c_str(), tm, arm == 0 ? "exact" : "gemv8", seconds * 1e6 / Mmax,
+                            tag.c_str(), tm <= 1 ? (arm == 0 ? 32U : 16U) : tm, arm == 0 ? (tm <= 1 ? (tm == 0 ? "X" : "X2") : "exact") : (tm <= 1 ? "TM16" : "gemv8"), seconds * 1e6 / Mmax,
                             weights / seconds / 1e9, flop / seconds / 1e12);
             }
         }
         hok(hipEventDestroy(a), "event"); hok(hipEventDestroy(b), "event");
     }
+    x_env(false);
     hok(hipStreamSynchronize(cx.hs), "finish");
     sok(strix_weights_destroy(l.w), "destroy");
 }
@@ -377,27 +560,38 @@ int main(int argc, char** argv) {
     }
     if (dir.empty()) if (const char* p = std::getenv("TRELLIS_REAL_DIR")) dir = p;
     try {
+        Env saved_x("STRIX_GLM_PF_EXACT_X"), saved_tm("STRIX_GLM_PF_EXACT_TM"),
+            saved_threshold("STRIX_GLM_PF_EXACT_X_MIN_ROWS");
+        test_routes();
+        saved_threshold.set(nullptr);
+        x_env(false);
         Ctx cx;
         strix_context_desc cd{};
         cd.struct_size = sizeof(cd); cd.abi_version = STRIX_TRELLIS_ABI_VERSION; cd.device_ordinal = 0;
         sok(strix_context_create(&cd, &cx.c), "context");
         hok(hipStreamCreate(&cx.hs), "stream");
         cx.st.struct_size = sizeof(cx.st); cx.st.abi_version = STRIX_TRELLIS_ABI_VERSION; cx.st.hip_stream = cx.hs;
+        exceptional(cx);
         for (const auto& sh : kShapes) test_shape(cx, dir, sh, true, false);
-        // Small generic cases exercise every decoder and splits that cut H128.
-        for (unsigned bits = 2; bits <= 8; ++bits) {
-            const Shape sh{"generic", "generic", bits, 384, 128, 0, 0, 0};
-            test_shape(cx, dir, sh, true, false);
-        }
-        // Original-input fusion's H128 partition differs from the staged K16 policy.
-        for (const Shape sh : {Shape{"fused", "fused input", 5, 5120, 2304, 0, 0, 0},
-                               Shape{"fused", "fused both", 5, 2304, 5120, 0, 0, 0},
-                               Shape{"policy", "K5 split exception", 5, 4096, 1024, 0, 0, 0},
-                               Shape{"fused", "fused K6", 6, 5120, 1280, 0, 0, 0},
-                               Shape{"fused", "fused wide", 5, 8192, 5120, 0, 0, 0},
-                               Shape{"pipeline", "K2 wide", 2, 8192, 5120, 0, 0, 0},
-                               Shape{"pipeline", "K2 head", 2, 1280, 32768, 0, 0, 0}})
-            test_shape(cx, dir, sh, true, false);
+        auto extra_shapes = [&](bool timed) {
+            // Small generic cases exercise every decoder and splits that cut H128.
+            for (unsigned bits = 2; bits <= 8; ++bits) {
+                for (unsigned input : {384U, 640U, 2816U}) {
+                    const Shape sh{"generic", "generic", bits, input, 128, 0, 0, 0};
+                    test_shape(cx, dir, sh, true, timed);
+                }
+            }
+            // Original-input fusion's H128 partition differs from the staged K16 policy.
+            for (const Shape sh : {Shape{"fused", "fused input", 5, 5120, 2304, 0, 0, 0},
+                                   Shape{"fused", "fused both", 5, 2304, 5120, 0, 0, 0},
+                                   Shape{"policy", "K5 split exception", 5, 4096, 1024, 0, 0, 0},
+                                   Shape{"fused", "fused K6", 6, 5120, 1280, 0, 0, 0},
+                                   Shape{"fused", "fused wide", 5, 8192, 5120, 0, 0, 0},
+                                   Shape{"pipeline", "K2 wide", 2, 8192, 5120, 0, 0, 0},
+                                   Shape{"pipeline", "K2 head", 2, 1280, 32768, 0, 0, 0}})
+                test_shape(cx, dir, sh, true, timed);
+        };
+        extra_shapes(false);
         if (!dir.empty()) for (const auto& sh : kShapes) test_shape(cx, dir, sh, false, false);
         else std::printf("SKIP real fixtures: set TRELLIS_REAL_DIR or pass its path\n");
         if (timing && failures == 0) {

@@ -2,6 +2,7 @@
 #include "glm/prefill/glm_pf_exact_moe.hpp"
 #include "glm/moe/glm_trellis_device.hpp"
 #include "glm/common/glm_math.hpp"
+#include "glm/prefill/glm_pf_exact_x.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdlib>
@@ -311,6 +312,48 @@ void launch_linear_v3(Args a, unsigned shared_bits, hipStream_t stream) {
         linear_kernel_v3<4, Down, true><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
     ok(hipGetLastError(), "v3 shared linear");
 }
+template<bool Down>
+struct XRows {
+    Args a;
+    Tile tile;
+    unsigned m;
+    __device__ const _Float16* input(unsigned r) const {
+        const unsigned pair = a.pairs[tile.first + r];
+        if constexpr (Down) return a.at + std::size_t{pair} * I;
+        else return a.input + (std::size_t{pair} * 2U + m) * H;
+    }
+    __device__ float* output(unsigned r) const {
+        const unsigned pair = a.pairs[tile.first + r];
+        if constexpr (Down) return a.output + std::size_t{pair} * H;
+        else return a.gu + (std::size_t{pair} * 2U + m) * I;
+    }
+};
+template<int Bits, bool Down, bool Shared, bool Prefetch = false>
+__global__ __launch_bounds__(256) void linear_kernel_x(Args a) {
+    __shared__ exact_x::Storage lds;
+    const unsigned expert = Shared ? E : blockIdx.y;
+    const Tile group = a.groups[expert];
+    if (group.count == 0) return;
+    const unsigned m = Down ? 2U : blockIdx.z;
+    const auto w = *d::uniform((&a.experts[expert].gate) + m);
+    const unsigned r0 = Shared ? blockIdx.y * kSharedRows : 0U;
+    const unsigned r1 = Shared ? (group.count < r0 + kSharedRows ? group.count : r0 + kSharedRows) : group.count;
+    for (unsigned r = r0; r < r1; r += 32U) {
+        const Tile tile{expert, group.first + r, r1 - r < 32U ? r1 - r : 32U};
+        exact_x::core<Bits, Prefetch>(w, XRows<Down>{a, tile, m}, tile.count, Down ? 4U : 32U, false, lds);
+    }
+}
+template<bool Down, bool Prefetch = false>
+void launch_linear_x(Args a, unsigned shared_bits, hipStream_t stream) {
+    constexpr unsigned N = Down ? H : I;
+    linear_kernel_x<4, Down, false, Prefetch><<<dim3(N / 128U, E, Down ? 1U : 2U), 256, 0, stream>>>(a);
+    ok(hipGetLastError(), "X routed linear");
+    if (shared_bits == 6U)
+        linear_kernel_x<6, Down, true, Prefetch><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
+    else
+        linear_kernel_x<4, Down, true, Prefetch><<<dim3(N / 128U, (a.rows + kSharedRows - 1U) / kSharedRows, Down ? 1U : 2U), 256, 0, stream>>>(a);
+    ok(hipGetLastError(), "X shared linear");
+}
 __global__ void activation_kernel(Args a) {
     const Tile tile = a.tiles[blockIdx.y];
     const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
@@ -362,6 +405,24 @@ void check_matrix(const moe::Exl3& w, unsigned input, unsigned output, bool shar
         throw std::invalid_argument("exact moe: invalid raw matrix");
 }
 } // namespace
+template<bool Prefetch>
+hipFuncAttributes query_x_resources(unsigned bits, bool down, bool shared) {
+    hipFuncAttributes a{};
+#define QUERY(B, D, S) ok(hipFuncGetAttributes(&a, reinterpret_cast<const void*>(&linear_kernel_x<B, D, S, Prefetch>)), "X resources")
+#define SELECT(B) if (down) { if (shared) { QUERY(B, true, true); } else { QUERY(B, true, false); } } \
+                  else { if (shared) { QUERY(B, false, true); } else { QUERY(B, false, false); } }
+    if (bits == 4) { SELECT(4); }
+    else if (bits == 6 && shared) { SELECT(6); }
+    else throw std::invalid_argument("exact moe: X resource bits/shared");
+#undef SELECT
+#undef QUERY
+    return a;
+}
+hipFuncAttributes x_resources(unsigned bits, bool down, bool shared, unsigned variant) {
+    if (variant == 6) return query_x_resources<false>(bits, down, shared);
+    if (variant == 7) return query_x_resources<true>(bits, down, shared);
+    throw std::invalid_argument("exact moe: X resources variant must be 6 or 7");
+}
 Plan::Plan(unsigned max_rows) : capacity(max_rows) {
     (void)Layout(max_rows);
     pairs.reserve(std::size_t{max_rows} * P);
@@ -373,6 +434,10 @@ const std::uint16_t* pair_down_input(void* ws, unsigned rows, unsigned pair) {
 }
 const float* pair_gate_up(void* ws, unsigned rows, unsigned pair) {
     return reinterpret_cast<const float*>(static_cast<unsigned char*>(ws) + Layout(rows).gu) + std::size_t{pair} * 2 * I;
+}
+const std::uint16_t* pair_gate_up_input(void* ws, unsigned rows, unsigned pair) {
+    return reinterpret_cast<const std::uint16_t*>(static_cast<unsigned char*>(ws) + Layout(rows).input) +
+        std::size_t{pair} * 2U * H;
 }
 const float* pair_output(void* ws, unsigned rows, unsigned pair) {
     return reinterpret_cast<const float*>(static_cast<unsigned char*>(ws) + Layout(rows).output) + std::size_t{pair} * H;
@@ -393,8 +458,10 @@ void enqueue(const View& v, Plan& plan, void* ws, std::size_t bytes, hipStream_t
     // v3 is the measured default (real pair, 1K/8K/32K TTFT logits bitwise == v1 on both ranks, -10..-11 % ms/token);
     // STRIX_GLM_PF_EXACTMOE_V=1 restores v1.
     const bool v3 = !variant || std::string(variant) == "3";
-    if (variant && std::string(variant) != "1" && !v2 && !v3)
-        throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_V must be 1, 2 or 3");
+    const bool v6 = variant && std::string(variant) == "6";
+    const bool v7 = variant && std::string(variant) == "7";
+    if (variant && std::string(variant) != "1" && !v2 && !v3 && !v6 && !v7)
+        throw std::invalid_argument("STRIX_GLM_PF_EXACTMOE_V must be 1, 2, 3, 6 or 7");
     for (unsigned e = 0; e <= E; ++e) {
         const auto& ex = e == E ? v.shared : v.experts[e];
         check_matrix(ex.gate, H, I, e == E);
@@ -437,20 +504,24 @@ void enqueue(const View& v, Plan& plan, void* ws, std::size_t bytes, hipStream_t
     ok(hipMemcpyAsync(table + E, &v.shared, sizeof(moe::ExpertSlices), hipMemcpyHostToDevice, stream), "shared expert");
     ok(hipMemcpyAsync(pairs, plan.pairs.data(), plan.pairs.size() * sizeof(unsigned), hipMemcpyHostToDevice, stream), "pairs");
     ok(hipMemcpyAsync(tiles, plan.tiles.data(), plan.tiles.size() * sizeof(Tile), hipMemcpyHostToDevice, stream), "tiles");
-    if (v3) ok(hipMemcpyAsync(device_groups, groups.data(), sizeof(groups), hipMemcpyHostToDevice, stream), "expert groups");
+    if (v3 || v6 || v7) ok(hipMemcpyAsync(device_groups, groups.data(), sizeof(groups), hipMemcpyHostToDevice, stream), "expert groups");
     // Owns host upload lifetimes even when callers immediately reuse their table or Plan.
     ok(hipStreamSynchronize(stream), "plan upload");
     Args a{v.rows, v.x, v.weights, v.out, table, v.shared, pairs, tiles, device_groups,
            reinterpret_cast<float*>(base + l.gu), reinterpret_cast<_Float16*>(base + l.at), reinterpret_cast<float*>(base + l.output),
            reinterpret_cast<_Float16*>(base + l.input)};
     const unsigned nt = static_cast<unsigned>(plan.tiles.size());
-    if (v3) {
+    if (v3 || v6 || v7) {
         input_kernel<<<dim3(H / 1024, nt, 2), 256, 0, stream>>>(a);
         ok(hipGetLastError(), "v3 gate/up input transform");
-        launch_linear_v3<false>(a, v.shared.gate.bits, stream);
+        if (v7) launch_linear_x<false, true>(a, v.shared.gate.bits, stream);
+        else if (v6) launch_linear_x<false>(a, v.shared.gate.bits, stream);
+        else launch_linear_v3<false>(a, v.shared.gate.bits, stream);
         activation_kernel<<<dim3(I / 128, nt), 256, 0, stream>>>(a);
         ok(hipGetLastError(), "v3 R15/down transform");
-        launch_linear_v3<true>(a, v.shared.down.bits, stream);
+        if (v7) launch_linear_x<true, true>(a, v.shared.down.bits, stream);
+        else if (v6) launch_linear_x<true>(a, v.shared.down.bits, stream);
+        else launch_linear_v3<true>(a, v.shared.down.bits, stream);
         combine_kernel<<<dim3(H / 256, a.rows), 256, 0, stream>>>(a);
         ok(hipGetLastError(), "v3 R16");
     } else if (v2) {

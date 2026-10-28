@@ -1347,6 +1347,17 @@
   },
   {
     "engine": "glm",
+    "name": "Exact prefill X2 linear core",
+    "flag_or_env": "STRIX_GLM_PF_EXACT_X",
+    "default": "auto",
+    "exact": "Bitwise: X/X2 keep the TM path's DOT2 chains, fold and split order; dense outputs byte-equal TM for row tails 1..32, 2047/2048/2049 and 4096-row calls, signed zero, FP16 subnormals, +-Inf and NaN payloads; on the real pair decode anchors, speculative oracle and 1K/8K/32K prefill logits equal the X=0 path.",
+    "gain": "8K TTFT 29.59 -> 27.93 s (-5.6 %) vs STRIX_GLM_PF_EXACT_X=0 in the same run, 32K 120.3 s, 1K unchanged (3.78 vs 3.84 s, two pairs); logits bitwise on both ranks",
+    "preconditions": "Exact chunked prefill linears; auto takes the X2 core for calls of at least 2048 rows (STRIX_GLM_PF_EXACT_X_MIN_ROWS) and the TM16 path below. 1 or 2 force X or X2 for every call.",
+    "off_switch": "STRIX_GLM_PF_EXACT_X=0",
+    "doc_anchor": "docs/optimizations.md#glm-pf-exact-x"
+  },
+  {
+    "engine": "glm",
     "name": "Prefill MLA o-bar v5",
     "flag_or_env": "STRIX_GLM_PF_OBAR",
     "default": "5",
