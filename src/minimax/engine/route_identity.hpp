@@ -70,6 +70,23 @@ inline MtFit mtfit(unsigned rows) {
     const unsigned remainder = rows % 128;
     return {rows / 128, remainder, remainder != 0 ? (remainder + 15) / 16 - 1 : 0U};
 }
+#if defined(__HIPCC__)
+#define STRIX_MM_ROUTE_HD __attribute__((host)) __attribute__((device))
+#else
+#define STRIX_MM_ROUTE_HD
+#endif
+// Physical decode selectors; arithmetic identity is unchanged (see route registry gates).
+STRIX_MM_ROUTE_HD inline constexpr bool moe_interleave(unsigned rows, bool enabled) { return enabled && rows == 8; }
+STRIX_MM_ROUTE_HD inline constexpr bool moe_single_slot(unsigned rows, unsigned count, unsigned singles,
+                                      bool shared, unsigned slot_rows) {
+    return rows == 8 && count >= 25 && singles >= 18 && !shared && slot_rows == 1;
+}
+STRIX_MM_ROUTE_HD inline constexpr bool moe_single_reader(bool enabled, unsigned rows, unsigned count, unsigned singles,
+                                        bool shared, unsigned slot_rows, unsigned bits, bool wide, unsigned waves, unsigned depth) {
+    return enabled && depth == 4 && !wide && waves == 4 && bits == 3 &&
+           moe_single_slot(rows, count, singles, shared, slot_rows);
+}
+#undef STRIX_MM_ROUTE_HD
 inline bool wide_for(unsigned rows, int mode) { return mode == 1 || (mode == 2 && rows >= 2 && rows <= 4); }
 inline int scheduled_linear_version(unsigned input, unsigned output, unsigned count, unsigned rows) {
     if (output >= 65536) return 4;

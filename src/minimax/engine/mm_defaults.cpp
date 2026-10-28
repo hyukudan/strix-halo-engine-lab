@@ -29,6 +29,10 @@ constexpr Item kItems[] = {
     // decode
     {"moe_wide", "STRIX_MMX_MOE_WIDE", "2", "0",
      "Measurement: rows == alone, wide expert kernels at N2-4, N2 -3.0..-3.5 %, N4 -4..-6 %"},
+    {"moe_gu_interleave", "STRIX_MMX_MOE_GU_INTERLEAVE", "1", "0",
+     "Decode MoE measurement: bitwise (610 N/U/S cases, every row == alone), B8 gate/up interleave diverse U8-32 -1.5..-3 %, B1/B4 unchanged"},
+    {"moe_single", "STRIX_MMX_MOE_SINGLE", "1", "0",
+     "Decode MoE measurement: bitwise (610 N/U/S cases, every row == alone), B8 U>=25 singleton reader -3 %, B1/B4 unchanged"},
     {"index_conc", "STRIX_MM_INDEX_CONC", "1", "0",
      "Measurement: ids identical, 17/18 in-process block pairs faster, ~-0.2 ms/token"},
     {"xfer_crc_deferred", "STRIX_MMX_CRC", "deferred", "1",

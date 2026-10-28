@@ -78,7 +78,39 @@ void compare_tuple(std::string_view id, const Tuple& alone, const Tuple& togethe
             "UNCOVERED route tuple difference");
 }
 struct Row { std::uint32_t slot; std::uint64_t pos; };
+void decode_moe_selectors() {
+    for (unsigned n : {7U, 8U})
+        for (unsigned u : {24U, 25U, 26U, 32U})
+            for (unsigned s = 0; s <= u; ++s) {
+                // U distinct experts: S degree-one, others degree>=2, total degree 4N.
+                // Reused experts can occupy at most N rows (top-four IDs distinct per row).
+                if (u > 4 * n || 2 * u - s > 4 * n || s + (u - s) * n < 4 * n) continue;
+                for (bool enabled : {false, true}) {
+                    require(route::moe_interleave(n, enabled) == (enabled && n == 8), "interleave N7/8");
+                    compare_tuple("decode-moe-interleave", {0,0,0,0},
+                                  {route::moe_interleave(n, enabled) ? 1U : 0U,0,0,0});
+                    for (bool shared : {false, true})
+                        for (unsigned slot_rows : {1U, 2U, n})
+                            for (unsigned bits : {3U, 5U})
+                                for (bool wide : {false, true})
+                                    for (unsigned waves : {4U, 8U})
+                                        for (unsigned depth : {4U, 8U, 12U}) {
+                                            const bool expected = enabled && n == 8 && u >= 25 && s >= 18 &&
+                                                !shared && slot_rows == 1 && bits == 3 && !wide && waves == 4 && depth == 4;
+                                            const bool got = route::moe_single_reader(enabled, n, u, s, shared,
+                                                                                     slot_rows, bits, wide, waves, depth);
+                                            require(got == expected, "singleton N/U/S/slot/K/wide/W/depth admission");
+                                            compare_tuple("decode-moe-singleton", {0,0,0,0}, {got ? 1U : 0U,0,0,0});
+                                        }
+                }
+            }
+    require(!route::moe_single_slot(8, 24, 16, false, 1) &&
+            route::moe_single_slot(8, 25, 18, false, 1) &&
+            !route::moe_single_slot(8, 25, 17, false, 1) &&
+            route::moe_single_slot(8, 26, 20, false, 1), "singleton feasible S and threshold boundaries");
+}
 void decode_and_verify() {
+    decode_moe_selectors();
     // Row zero is the same token at the same position in every companion set.
     for (unsigned n = 1; n <= 8; ++n) {
         std::vector<Row> rows;

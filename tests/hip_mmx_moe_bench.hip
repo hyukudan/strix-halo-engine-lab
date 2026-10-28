@@ -11,6 +11,11 @@
 //           batch invariance (a row's bits alone == inside N).
 //   --bench: per cell (site x N) the order A B A B A B A (ABA x3), each a mean over --iters calls on rotating cold
 //           weights; prints us per call, GB/s of weight bytes, and B/A per triplet.
+//   --diverse: decode-only production enqueue_moe v4 cell; --test exhausts N=1..8 and feasible U/S;
+//           --bench: B8 U=4,8,12,16,20,22,24,25,26,27,28,30,32; B4 U=4,8,12,16; B1 U=4.
+//   --diverse-fallback --test: separate wide/K5/W8/Depth8+12 negative-reader gate (not singleton qualification).
+//           --singletons min|max|COUNT controls singleton expert count. Stage probes follow total timing.
+#include "minimax/engine/route_identity.hpp"
 #include "minimax/moe/mmx_moe.hpp"
 #include "minimax/moe/mmx_prefill.hpp"
 #include "minimax/moe/mmx_prefill_core.hpp"
@@ -23,11 +28,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <numeric>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -508,7 +516,107 @@ struct Options {
     std::string routes, tests;
     bool no_load = false;
     unsigned syn_bits = 3;
+    bool diverse = false;
+    bool diverse_fallback = false;  // explicit negative-reader gate, never singleton qualification
+    std::string singletons = "min";  // --singletons min|max|COUNT; infeasible cells are skipped
 };
+
+// Per-call switches are restored after the gate, including combined --test --bench invocations.
+struct EnvMode {
+    const char* name;
+    bool had_value;
+    std::string saved;
+    explicit EnvMode(const char* key) : name(key), had_value(std::getenv(key) != nullptr),
+                                       saved(had_value ? std::getenv(key) : "") {}
+    void set(const char* value) const {
+#ifdef _WIN32
+        if (_putenv_s(name, value) != 0) throw std::runtime_error(std::string("set ") + name);
+#else
+        if (setenv(name, value, 1) != 0) throw std::runtime_error(std::string("set ") + name);
+#endif
+    }
+    ~EnvMode() {
+#ifdef _WIN32
+        (void)_putenv_s(name, had_value ? saved.c_str() : "");
+#else
+        if (had_value) (void)setenv(name, saved.c_str(), 1);
+        else (void)unsetenv(name);
+#endif
+    }
+};
+
+// Full workspace comparison, including inactive bytes and reset counters. Avoid multi-GB host snapshots during
+// the exhaustive gate: the reference remains a separate device allocation and only the mismatch bit comes back.
+__global__ void workspace_equal_kernel(const std::uint32_t* a, const std::uint32_t* b, std::size_t words, unsigned* bad) {
+    unsigned differs = 0;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < words;
+         i += static_cast<std::size_t>(gridDim.x) * blockDim.x)
+        differs |= a[i] != b[i] ? 1U : 0U;
+    if (differs != 0) atomicOr(bad, 1U);
+}
+
+struct WorkspaceCheck {
+    std::uint32_t* reference;
+    unsigned* bad;
+    const std::size_t bytes = opt::moe_workspace_bytes();
+    WorkspaceCheck() : reference(dalloc<std::uint32_t>(opt::moe_workspace_bytes() / sizeof(std::uint32_t))),
+                       bad(dalloc<unsigned>(1)) {
+        if (bytes % sizeof(std::uint32_t) != 0) throw std::runtime_error("workspace alignment");
+    }
+    void save(const void* ws) const {
+        hip_ok(hipMemcpy(reference, ws, bytes, hipMemcpyDeviceToDevice), "workspace snapshot");
+    }
+    bool equal(const void* ws) const {
+        hip_ok(hipMemset(bad, 0, sizeof(unsigned)), "workspace compare reset");
+        hipLaunchKernelGGL(workspace_equal_kernel, dim3(256), dim3(256), 0, nullptr,
+                           static_cast<const std::uint32_t*>(ws), reference, bytes / sizeof(std::uint32_t), bad);
+        hip_ok(hipGetLastError(), "workspace compare");
+        unsigned mismatch = 0;
+        hip_ok(hipMemcpy(&mismatch, bad, sizeof(mismatch), hipMemcpyDeviceToHost), "workspace compare result");
+        return mismatch == 0;
+    }
+    ~WorkspaceCheck() {
+        (void)hipFree(bad);
+        (void)hipFree(reference);
+    }
+};
+
+void require_diverse_path(bool fallback = false) {
+    if (fallback) return;
+    for (const auto& flag : {std::pair<const char*, const char*>{"STRIX_MMX_MOE_V", "4"}, {"STRIX_MMX_MOE_W", "4"}, {"STRIX_MMX_MOE_DEPTH3", "4"}}) {
+        const char* value = std::getenv(flag.first);
+        if (value != nullptr && std::string(value) != flag.second)
+            throw std::invalid_argument(std::string("diverse cell requires ") + flag.first + "=" + flag.second);
+    }
+}
+
+// Bipartite degree construction: four distinct experts per row, exactly U experts and S singleton experts.
+// Descending expert degrees, then the rows with the most capacity (Havel-Hakimi); independent of GPU routing.
+std::vector<std::uint32_t> diverse_ids(unsigned n, unsigned u, unsigned singles, unsigned step) {
+    if (n < 1 || n > 8 || u < 4 || u > 4 * n || singles > u) return {};
+    std::vector<unsigned> degree(u, 2U), capacity(n, 4U), used(n, 0U);
+    std::fill_n(degree.begin(), singles, 1U);
+    unsigned total = 2 * u - singles;
+    if (total > 4 * n) return {};
+    for (unsigned e = singles; e < u && total < 4 * n; ++e)
+        while (degree[e] < n && total < 4 * n) { ++degree[e]; ++total; }
+    if (total != 4 * n || *std::max_element(degree.begin(), degree.end()) > n) return {};
+    std::vector<unsigned> experts(u), rows(n);
+    std::iota(experts.begin(), experts.end(), 0U);
+    std::stable_sort(experts.begin(), experts.end(), [&](unsigned a, unsigned b) { return degree[a] > degree[b]; });
+    std::vector<std::uint32_t> ids(std::size_t{n} * 4);
+    for (unsigned e : experts) {
+        std::iota(rows.begin(), rows.end(), 0U);
+        std::stable_sort(rows.begin(), rows.end(), [&](unsigned a, unsigned b) { return capacity[a] > capacity[b]; });
+        for (unsigned j = 0; j < degree[e]; ++j) {
+            const unsigned r = rows[j];
+            if (capacity[r] == 0) return {};
+            ids[r * 4 + used[r]++] = (e * 37U + step * 17U) % opt::kExperts;
+            --capacity[r];
+        }
+    }
+    return ids;
+}
 
 // ---------------------------------------------------------------- A: the current MoE chain (G4), routes on the host
 struct Scratch {
@@ -679,6 +787,7 @@ struct Bench {
             {"xdown", b + "experts.0.w2", false, r * IR, IR, IR, H, 3, 32},
         };
         for (const auto& sp : specs) {
+            if (o.diverse) break;  // the decode-only cell needs no dense/head copies
             DenseSite ds;
             ds.name = sp.name;
             ds.input = sp.in;
@@ -713,13 +822,15 @@ struct Bench {
             opt::LinearJob j{ds.copies[0].dev, xin, ds.input, yB, ds.output};
             lin = std::max(lin, opt::linear_workspace_bytes(&j, 1));
         }
-        {
+        if (!o.diverse) {
             opt::LinearJob qkv[3] = {{dense[0].copies[0].dev, xin, H, yB, 4096}, {dense[1].copies[0].dev, xin, H, yB, 256},
                                      {dense[2].copies[0].dev, xin, H, yB, 256}};
             lin = std::max(lin, opt::linear_workspace_bytes(qkv, 3));
         }
-        hip_ok(hipMalloc(&lin_ws, lin), "lin ws");
-        hip_ok(hipMemset(lin_ws, 0, lin), "lin ws zero");
+        if (lin != 0) {
+            hip_ok(hipMalloc(&lin_ws, lin), "lin ws");
+            hip_ok(hipMemset(lin_ws, 0, lin), "lin ws zero");
+        }
         hip_ok(hipDeviceSynchronize(), "load");
         std::printf("weights: %s, layer %u rank %u, %.1f s\n", pack ? "real pack" : "synthetic", o.layer, o.rank,
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
@@ -847,6 +958,239 @@ struct Bench {
                 }
             }
         std::printf("moe tests: %u cases\n", cases);
+    }
+
+    opt::MoeView diverse_view(unsigned n, const std::uint32_t* route_ids, const float* route_weights) {
+        auto v = view_B(n);
+        v.controlled_ids = route_ids;
+        v.controlled_weights = route_weights;
+        return v;  // h == nullptr: production v4 route, no post-exchange in the timed cell
+    }
+    std::vector<unsigned> singleton_cases(unsigned n, unsigned u, bool exhaustive) const {
+        std::vector<unsigned> feasible;
+        for (unsigned s_count = 0; s_count <= u; ++s_count)
+            if (!diverse_ids(n, u, s_count, 0).empty()) feasible.push_back(s_count);
+        if (exhaustive || feasible.empty()) return feasible;
+        if (o.singletons == "min") return {feasible.front()};
+        if (o.singletons == "max") return {feasible.back()};
+        const auto requested = static_cast<unsigned>(std::stoul(o.singletons));
+        return std::find(feasible.begin(), feasible.end(), requested) != feasible.end() ? std::vector<unsigned>{requested}
+                                                                                     : std::vector<unsigned>{};
+    }
+    void test_diverse() {
+        require_diverse_path(o.diverse_fallback);
+        const auto env_int = [](const char* key, int fallback) {
+            const char* value = std::getenv(key);
+            return value != nullptr ? std::atoi(value) : fallback;
+        };
+        const int wide_mode = env_int("STRIX_MMX_MOE_WIDE", 2);
+        const unsigned waves = static_cast<unsigned>(env_int("STRIX_MMX_MOE_W", 4));
+        const int overlap = env_int("STRIX_MMX_MOE_OVERLAP", 1);
+        const unsigned depth = static_cast<unsigned>(env_int("STRIX_MMX_MOE_DEPTH3", 4));
+        const unsigned bits = L.gate[0].dev.bits;
+        for (unsigned e = 0; e < opt::kExperts; ++e)
+            if (L.gate[e].dev.bits != bits || L.up[e].dev.bits != bits || L.down[e].dev.bits != bits)
+                throw std::invalid_argument("diverse gate requires uniform routed bits");
+        const bool b8_fallback = strix::minimax::route::wide_for(8, wide_mode) || waves != 4 || bits != 3 || depth != 4;
+        if (b8_fallback != o.diverse_fallback)
+            throw std::invalid_argument("singleton qualification requires narrow B8/K3/W4/Depth4; use --diverse-fallback for wide/K5/W8/Depth8+12");
+        if (env_int("STRIX_MMX_MOE_V", 4) != 4)
+            throw std::invalid_argument("diverse gate requires v4");
+        opt::check_moe_single_resources();
+        const auto reader_counts = dupload(std::vector<std::uint32_t>(2, 0));
+        unsigned observed_cases = 0;
+        EnvMode mode("STRIX_MMX_MOE_SINGLE"), interleave("STRIX_MMX_MOE_GU_INTERLEAVE");
+        WorkspaceCheck workspace;
+        unsigned cases = 0;
+        const auto input = randn(8ULL * H, 0.5F);
+        hip_ok(hipMemcpy(y, input.data(), input.size() * sizeof(float), hipMemcpyHostToDevice), "diverse input");
+        std::vector<float> host_weights(32);
+        constexpr float weights[4] = {0.13F, 0.27F, 0.61F, 0.99F};
+        for (unsigned k = 0; k < 32; ++k) host_weights[k] = weights[k % 4];
+        const auto route_weights = dupload(host_weights);
+        for (unsigned n = 1; n <= 8; ++n)
+            for (unsigned u = 4; u <= 4 * n; ++u)
+                for (unsigned s_count : singleton_cases(n, u, true)) {
+                    const auto route_ids = dupload(diverse_ids(n, u, s_count, cases));
+                    const std::string label = "N=" + std::to_string(n) + " U=" + std::to_string(u) + " S=" + std::to_string(s_count);
+                    interleave.set("0");
+                    mode.set("0");
+                    hip_ok(hipMemset(moe_ws, 0, opt::moe_workspace_bytes()), "diverse ws zero");
+                    opt::enqueue_moe(diverse_view(n, route_ids, route_weights), nullptr);
+                    const auto batch = d2h(outB, std::size_t{n} * H);
+                    workspace.save(moe_ws);
+                    const auto expected_ids = d2h(route_ids, std::size_t{n} * 4);
+                    const auto expected_weights = d2h(route_weights, std::size_t{n} * 4);
+                    if (d2h(idsB, std::size_t{n} * 4) != expected_ids || !same_bits(d2h(wB, std::size_t{n} * 4), expected_weights))
+                        throw std::runtime_error("diverse controlled routes mismatch " + label);
+                    const auto dispatch = d2h(opt::moe_dispatch({moe_ws}), 1).front();
+                    if (dispatch.count != u || dispatch.single_count != s_count || dispatch.reuse_count != u - s_count)
+                        throw std::runtime_error("diverse bucket counts mismatch " + label);
+                    for (const char* grid : {"0", "1"}) {
+                        interleave.set(grid);
+                        for (const char* single : {"0", "1"}) {
+                            if (grid[0] == '0' && single[0] == '0') continue;  // captured reference
+                            mode.set(single);
+                            hip_ok(hipMemset(moe_ws, 0, opt::moe_workspace_bytes()), "diverse ws zero");
+                            hip_ok(hipMemset(reader_counts, 0, 2 * sizeof(std::uint32_t)), "reader counters zero");
+                            auto observed = diverse_view(n, route_ids, route_weights);
+                            observed.single_reader_counts = reader_counts;
+                            opt::enqueue_moe(observed, nullptr);
+                            const auto counts = d2h(reader_counts, 2);
+                            const bool eligible = strix::minimax::route::moe_single_reader(
+                                single[0] == '1', n, u, s_count, false, 1, bits,
+                                strix::minimax::route::wide_for(n, wide_mode), waves, depth);
+                            // One counter arrival per CTA: two GU matrices x 24 groups x 16 splits;
+                            // down has 96 groups x 4 splits. Shared/reused slots must contribute zero.
+                            const unsigned expected_gu = eligible ? s_count * 2U * 24U * 16U : 0U;
+                            const unsigned expected_dn = eligible ? s_count * 96U * 4U : 0U;
+                            if (counts[0] != expected_gu || counts[1] != expected_dn)
+                                throw std::runtime_error("singleton reader execution mismatch " + label);
+                            if (eligible) ++observed_cases;
+                            if (!same_bits(batch, d2h(outB, std::size_t{n} * H)) || !workspace.equal(moe_ws) ||
+                                d2h(idsB, std::size_t{n} * 4) != expected_ids || !same_bits(d2h(wB, std::size_t{n} * 4), expected_weights))
+                                throw std::runtime_error("diverse interleave/SINGLE output/workspace/routes mismatch " + label);
+                        }
+                    }
+                    for (unsigned r = 0; r < n; ++r) {
+                        auto v = diverse_view(1, route_ids + r * 4, route_weights + r * 4);
+                        v.y = y + std::size_t{r} * H;
+                        hip_ok(hipMemset(moe_ws, 0, opt::moe_workspace_bytes()), "alone ws zero");
+                        opt::enqueue_moe(v, nullptr);
+                        const auto one = d2h(outB, H);
+                        if (std::memcmp(one.data(), batch.data() + std::size_t{r} * H, H * sizeof(float)) != 0)
+                            throw std::runtime_error("diverse alone mismatch " + label + " row=" + std::to_string(r));
+                        workspace.save(moe_ws);
+                        interleave.set("0");
+                        mode.set("0");
+                        hip_ok(hipMemset(moe_ws, 0, opt::moe_workspace_bytes()), "alone ws zero");
+                        opt::enqueue_moe(v, nullptr);
+                        if (!same_bits(one, d2h(outB, H)) ||
+                            !workspace.equal(moe_ws))
+                            throw std::runtime_error("diverse alone SINGLE mismatch " + label + " row=" + std::to_string(r));
+                        interleave.set("1");
+                        mode.set("1");
+                    }
+                    hip_ok(hipFree(route_ids), "diverse ids free");
+                    ++cases;
+                }
+        hip_ok(hipFree(route_weights), "diverse weights free");
+        hip_ok(hipFree(reader_counts), "reader counters free");
+        if (!o.diverse_fallback && observed_cases == 0) throw std::runtime_error("singleton reader never ran");
+        std::printf("diverse fatal: mode=%s WIDE=%d bits=%u W=%u Depth=%u overlap=%d cases=%u reader_cases=%u "
+                    "N=1..8 every feasible U/S GU_INTERLEAVE=0/1 SINGLE=0/1 output/workspace/routes rows==alone: PASS\n",
+                    o.diverse_fallback ? "fallback" : "singleton", wide_mode, bits, waves, depth, overlap, cases, observed_cases);
+    }
+    void bench_diverse() {
+        require_diverse_path();
+        opt::check_moe_single_resources();
+        for (unsigned e = 0; e < opt::kExperts; ++e)
+            if (L.gate[e].dev.bits != 3 || L.up[e].dev.bits != 3 || L.down[e].dev.bits != 3)
+                throw std::invalid_argument("diverse byte floor requires K3 routed weights");
+        if (L.shared.gate.bits != 5 || L.shared.up.bits != 5 || L.shared.down.bits != 5)
+            throw std::invalid_argument("diverse byte floor requires K5 shared weights");
+        const char* single = std::getenv("STRIX_MMX_MOE_SINGLE");
+        const char* interleave = std::getenv("STRIX_MMX_MOE_GU_INTERLEAVE");
+        std::printf("diverse overlap SINGLE=%s GU_INTERLEAVE=%s, routed=10.616832 MB/expert shared=17.694720 MB floor=220 GB/s\n",
+                    single != nullptr ? single : "0", interleave != nullptr ? interleave : "0");
+        auto median = [](std::vector<double> values) {
+            std::sort(values.begin(), values.end());
+            const std::size_t mid = values.size() / 2;
+            return values.size() % 2 != 0 ? values[mid] : (values[mid - 1] + values[mid]) * 0.5;
+        };
+        const char* wide_env = std::getenv("STRIX_MMX_MOE_WIDE");
+        const int wide_mode = wide_env != nullptr ? std::atoi(wide_env) : 2;
+        const auto input = randn(8ULL * H, 0.5F);
+        hip_ok(hipMemcpy(y, input.data(), input.size() * sizeof(float), hipMemcpyHostToDevice), "diverse input");
+        const auto route_weights = dupload(std::vector<float>(32, 0.5F));
+        // Natural router histogram: real layer weights with explicitly synthetic activations, no route override.
+        if (!o.model.empty()) {
+            for (unsigned n : {1U, 4U, 8U}) {
+                unsigned histogram[33] = {};
+                std::printf("route steps B=%u (real weights, synthetic activations):", n);
+                for (unsigned step = 0; step < 8; ++step) {
+                    const auto x = randn(std::size_t{n} * H, 0.5F);
+                    hip_ok(hipMemcpy(y, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice), "route input");
+                    opt::enqueue_moe(view_B(n), nullptr);
+                    const auto dispatch = d2h(opt::moe_dispatch({moe_ws}), 1).front();
+                    ++histogram[dispatch.count];
+                    std::printf(" %u", dispatch.count);
+                }
+                std::printf("; histogram");
+                for (unsigned u = 4; u <= 4 * n; ++u) if (histogram[u] != 0) std::printf(" U%u:%u", u, histogram[u]);
+                std::printf("\n");
+            }
+            hip_ok(hipMemcpy(y, input.data(), input.size() * sizeof(float), hipMemcpyHostToDevice), "restore input");
+        }
+        unsigned cells = 0;
+        for (unsigned n : {1U, 4U, 8U})
+            for (unsigned u : n == 8 ? std::vector<unsigned>{4, 8, 12, 16, 20, 22, 24, 25, 26, 27, 28, 30, 32} :
+                              n == 4 ? std::vector<unsigned>{4, 8, 12, 16} : std::vector<unsigned>{4})
+                for (unsigned s_count : singleton_cases(n, u, false)) {
+                    std::vector<std::uint32_t> all_ids;
+                    constexpr unsigned rotation = 16;
+                    for (unsigned step = 0; step < rotation; ++step) {
+                        const auto ids = diverse_ids(n, u, s_count, step);
+                        all_ids.insert(all_ids.end(), ids.begin(), ids.end());
+                    }
+                    const auto route_ids = dupload(all_ids);
+                    auto run = [&](unsigned step) {
+                        opt::enqueue_moe(diverse_view(n, route_ids + (step % rotation) * n * 4, route_weights), nullptr);
+                    };
+                    for (unsigned step = 0; step < 4; ++step) run(step);
+                    hipEvent_t begin, end;
+                    hip_ok(hipEventCreate(&begin), "diverse event");
+                    hip_ok(hipEventCreate(&end), "diverse event");
+                    std::vector<double> samples;
+                    for (int rep = 0; rep < o.reps; ++rep)
+                        for (int it = 0; it < o.iters; ++it) {
+                            hip_ok(hipEventRecord(begin, nullptr), "diverse begin");
+                            run(static_cast<unsigned>(rep * o.iters + it));
+                            hip_ok(hipEventRecord(end, nullptr), "diverse end");
+                            hip_ok(hipEventSynchronize(end), "diverse sync");
+                            float ms = 0;
+                            hip_ok(hipEventElapsedTime(&ms, begin, end), "diverse elapsed");
+                            samples.push_back(1000.0 * ms);
+                        }
+                    const double us = median(samples);
+                    // Probe phases separately: extra event boundaries never enter the reported total median.
+                    hipEvent_t marks[2];
+                    for (auto& mark : marks) hip_ok(hipEventCreate(&mark), "diverse phase event");
+                    std::vector<double> router_times, gu_times, down_times;
+                    for (unsigned probe = 0; probe < 3; ++probe) {
+                        const auto v = diverse_view(n, route_ids + ((probe + 8U) % rotation) * n * 4, route_weights);
+                        hip_ok(hipEventRecord(begin, nullptr), "diverse probe begin");
+                        opt::enqueue_moe_profiled(v, nullptr, marks);
+                        hip_ok(hipEventRecord(end, nullptr), "diverse probe end");
+                        hip_ok(hipEventSynchronize(end), "diverse probe sync");
+                        float router_ms = 0, gu_ms = 0, down_ms = 0;
+                        hip_ok(hipEventElapsedTime(&router_ms, begin, marks[0]), "diverse router time");
+                        hip_ok(hipEventElapsedTime(&gu_ms, marks[0], marks[1]), "diverse gate/up time");
+                        hip_ok(hipEventElapsedTime(&down_ms, marks[1], end), "diverse down time");
+                        router_times.push_back(1000.0 * router_ms);
+                        gu_times.push_back(1000.0 * gu_ms);
+                        down_times.push_back(1000.0 * down_ms);
+                    }
+                    const bool wide = strix::minimax::route::wide_for(n, wide_mode);
+                    const unsigned gu_groups = IR / (wide ? 256U : 64U), dn_groups = H / (wide ? 256U : 64U);
+                    // Trellis-only lower bound: K3 routed and K5 shared, decimal bytes and GB/s. Scales/router excluded.
+                    const double bytes = (3.0 * H * IR * 3.0 / 8.0) * u + (3.0 * H * IR * 5.0 / 8.0);
+                    std::printf("diverse SINGLE=%s B=%u U=%u S=%u reuse=%u median_us=%.3f bytes=%.0f bytes/us=%.1f GB/s=%.2f "
+                                "floor220_us=%.3f floor_ratio=%.3f samples=%zu router_us=%.3f gu_us=%.3f down_us=%.3f "
+                                "gu_ctas=%u dn_ctas=%u gu_arrivals=%u dn_arrivals=%u\n",
+                                single != nullptr ? single : "0", n, u, s_count, u - s_count, us, bytes,
+                                bytes / us, bytes / us / 1000.0, bytes / 220000.0, us / (bytes / 220000.0), samples.size(),
+                                median(router_times), median(gu_times), median(down_times), gu_groups * 16U * 2U * u,
+                                dn_groups * 4U * (u + 1U), wide ? 32U : 64U, (u + 1U) * (wide ? 4U : 8U));
+                    for (auto mark : marks) hip_ok(hipEventDestroy(mark), "diverse phase event free");
+                    hip_ok(hipEventDestroy(begin), "diverse event free");
+                    hip_ok(hipEventDestroy(end), "diverse event free");
+                    hip_ok(hipFree(route_ids), "diverse ids free");
+                    ++cells;
+                    std::fflush(stdout);
+                }
+        hip_ok(hipFree(route_weights), "diverse weights free");
+        if (cells == 0) throw std::invalid_argument("no feasible diverse cells for --singletons");
     }
 
     void run_dense_A(const std::vector<std::pair<DenseSite*, Mat*>>& jobs, unsigned n, const float* x) {
@@ -2359,8 +2703,14 @@ int main(int argc, char** argv) {
             else if (a == "--tests") { o.tests = next(); o.test = true; }
             else if (a == "--no-load") o.no_load = true;
             else if (a == "--syn-bits") o.syn_bits = static_cast<unsigned>(std::stoul(next()));
+            else if (a == "--diverse") o.diverse = true;
+            else if (a == "--diverse-fallback") { o.diverse = true; o.diverse_fallback = true; }
+            else if (a == "--singletons") o.singletons = next();
             else throw std::invalid_argument("unknown option " + a);
         }
+        if (o.reps < 1 || o.iters < 1 || o.reps > 1000 || o.iters > 10000)
+            throw std::invalid_argument("reps/iters must be positive (maximum 1000/10000)");
+        if (o.rank > 1) throw std::invalid_argument("rank must be 0 or 1");
         if (!o.test && !o.bench) o.test = o.bench = true;
         hipDeviceProp_t prop{};
         hip_ok(hipGetDeviceProperties(&prop, 0), "props");
@@ -2372,6 +2722,12 @@ int main(int argc, char** argv) {
             return 0;
         }
         b.load();
+        if (o.diverse) {
+            // Fail immediately: never print benchmark results after a failed exactness gate.
+            if (o.test) b.test_diverse();
+            if (o.bench) b.bench_diverse();
+            return 0;
+        }
         // Each section runs on its own: a library error in one is reported and the next still runs.
         auto section = [&](const char* name, const std::function<void()>& fn) {
             try {
@@ -2388,6 +2744,7 @@ int main(int argc, char** argv) {
         if (o.test) {
             test_section("test_dense", [&] { b.test_dense(); });
             if (!o.no_moe) test_section("test_moe", [&] { b.test_moe(); });
+            if (!o.no_moe) test_section("test_diverse", [&] { b.test_diverse(); });
             if (!o.no_moe) test_section("test_router_rows", [&] { b.test_router_rows(); });
             if (!o.no_moe) test_section("test_prefill", [&] { b.test_prefill(); });
             if (!o.no_moe) test_section("test_prefill_v2", [&] { b.test_prefill_v2(); });

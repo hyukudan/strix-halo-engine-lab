@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -19,6 +20,7 @@ namespace strix::minimax::moe::opt {
 namespace {
 
 namespace d = dev;
+namespace route = strix::minimax::route;
 
 constexpr unsigned kOutBlocks = kHidden / 128;    // 48 down output blocks
 constexpr unsigned kInterBlocks = kInter / 128;   // 12 gate/up output blocks
@@ -62,6 +64,11 @@ struct Args {
     float* weights;
     unsigned char* ws;
     PublishTarget pub{};  // down4: publish `out` (STRIX_MM_XB_PUBLISH)
+    const std::uint32_t* controlled_ids = nullptr;
+    const float* controlled_weights = nullptr;
+    std::uint32_t* single_reader_counts = nullptr;
+    bool single_stream = false;
+    bool interleave_gu = true;
     __device__ Dispatch* disp() const { return reinterpret_cast<Dispatch*>(ws); }
     __device__ float* scores() const { return reinterpret_cast<float*>(ws + kOffScores); }
     __device__ float* choice() const { return reinterpret_cast<float*>(ws + kOffChoice); }
@@ -167,12 +174,14 @@ __device__ void route_tail(const Args& a) {
         for (unsigned k = 0; k < kTopE; ++k) sum = sum + s_sc[t][best[k]];
         for (unsigned k = 0; k < kTopE; ++k) {
             const float wk = (s_sc[t][best[k]] / (sum + kSumEps)) * kRouteScale;
-            s_id[t][k] = best[k];
-            s_w[t][k] = wk;
-            dp->ids[t][k] = best[k];
-            dp->weights[t][k] = wk;
-            if (a.ids != nullptr) a.ids[t * kTopE + k] = best[k];
-            if (a.weights != nullptr) a.weights[t * kTopE + k] = wk;
+            const unsigned id = a.controlled_ids != nullptr ? a.controlled_ids[t * kTopE + k] : best[k];
+            const float weight = a.controlled_weights != nullptr ? a.controlled_weights[t * kTopE + k] : wk;
+            s_id[t][k] = id;
+            s_w[t][k] = weight;
+            dp->ids[t][k] = id;
+            dp->weights[t][k] = weight;
+            if (a.ids != nullptr) a.ids[t * kTopE + k] = id;
+            if (a.weights != nullptr) a.weights[t * kTopE + k] = weight;
         }
     }
     __syncthreads();
@@ -210,6 +219,13 @@ __device__ void route_tail(const Args& a) {
             dp->first[q] = pairs;
             pairs += s_nrows[q];
         }
+        unsigned singles = 0, reuse = 0;
+        for (unsigned q = 0; q < count; ++q) {
+            if (s_nrows[q] == 1) dp->single_slot[singles++] = q;
+            else dp->reuse_slot[reuse++] = q;
+        }
+        dp->single_count = singles;
+        dp->reuse_count = reuse;
         s_first[kMaxSlots] = pairs;
         dp->first[kSharedSlot] = pairs;
         dp->nrows[kSharedSlot] = rows;
@@ -668,6 +684,53 @@ __device__ __forceinline__ bool map_slot(const Dispatch* dp, unsigned y, unsigne
     return true;
 }
 
+// CTA-uniform, device-only decision from this step's router. Keep the low-union reader and its launch count.
+// Engine-resolved default on; raw-library unset off. Only Depth-4 narrow K3 launches enable this reader.
+template <int Depth>
+__device__ __forceinline__ bool single_stream_for(const Args& a, const Dispatch* dp, unsigned slot) {
+    return Depth == 4 && a.single_stream && route::moe_single_slot(dp->rows, dp->count, dp->single_count,
+                                                        slot == kSharedSlot, dp->nrows[slot]);
+}
+
+// K3 singleton stream: each wave coalesces a complete 96-byte tile with one dword/lane, then shuffles the two
+// needed words to their decoder lanes. Four k-tiles in flight, one row's two fdot2 chains, no MaxR=8 arrays.
+// K3's third word cannot affect any of its eight states (the same identity used by LdsRingU).
+__device__ __forceinline__ void singleton3_core(const Exl3& w, unsigned output, unsigned col, unsigned split,
+                                               const _Float16* xs, unsigned lane, float* part) {
+    constexpr unsigned depth = 4, tiles = kSplitCh / 16;
+    const d::LaneGeom<3> geo(lane);
+    const auto* base = (d::GlobalU32*)(d::uniform(w.trellis)) +
+                       static_cast<std::size_t>(split * tiles) * (output / 16U) * 24U + col * 24U;
+    const std::size_t stride = static_cast<std::size_t>(output / 16U) * 24U;
+    std::uint32_t ring[depth] = {};
+    auto load = [&](unsigned k) { return lane < 24U ? base[static_cast<std::size_t>(k) * stride + lane] : 0U; };
+#pragma unroll
+    for (unsigned j = 0; j < depth; ++j) ring[j] = load(j);
+    const auto* xw = (d::LocalU32*)(reinterpret_cast<const std::uint32_t*>(xs)) + (lane & 3U);
+    float sums[1][2] = {{0.0F, 0.0F}};
+    for (unsigned kb = 0; kb < tiles; kb += depth) {
+#pragma unroll
+        for (unsigned j = 0; j < depth; ++j) {
+            const unsigned k = kb + j;
+            const std::uint32_t word = ring[j];
+            d::Slot<3, 1> cur;
+            cur.a = __shfl(word, static_cast<int>(geo.oa / 4U), 32);
+            cur.b = __shfl(word, static_cast<int>(geo.ob / 4U), 32);
+            cur.c = 0;
+            if (k + depth < tiles) ring[j] = load(k + depth);
+            cur.act[0][0] = __builtin_bit_cast(d::Half2, xw[k * 8U]);
+            cur.act[0][1] = __builtin_bit_cast(d::Half2, xw[k * 8U + 4U]);
+            d::compute_slot<3, 1>(cur, geo, 1, sums);
+        }
+    }
+    const float a0 = 0.0F + d::reduce4(sums[0][0]);
+    const float a1 = 0.0F + d::reduce4(sums[0][1]);
+    if ((lane & 3U) == 0) {
+        part[col * 16U + lane / 4U] = a0;
+        part[col * 16U + lane / 4U + 8U] = a1;
+    }
+}
+
 template <int Bits, int R, int Depth>
 __device__ __forceinline__ void split4_core(const Exl3& w, unsigned output, unsigned kt, unsigned splits, unsigned col, unsigned split,
                             const _Float16* xs, unsigned nrows, unsigned lane, float* part0, std::size_t part_stride) {
@@ -819,9 +882,10 @@ __device__ void split16_rows(const Exl3& w, unsigned output, unsigned kt, unsign
 
 // One gate/up CTA of slot `slot` (rows: the slot's call rows, or 0..nrows-1 for the shared expert).
 // Wide: cg indexes 16-column groups (2 output blocks per CTA) and the wide core runs (rowbuf: 4 x 8 x Bits uint4).
-template <int MaxR, int Depth, int W, int DepthBig, bool Wide = false>
+template <int MaxR, int Depth, int W, int DepthBig, bool Wide = false, bool Single = false>
 __device__ void gate_up4_body(const Args& a, const Dispatch* dp, const ExpertSlices& E, unsigned slot, unsigned nrows,
-                              unsigned first, unsigned cg, unsigned split, unsigned m, _Float16* xs, WideV4* rowbuf = nullptr) {
+                              unsigned first, unsigned cg, unsigned split, unsigned m, _Float16* xs, WideV4* rowbuf = nullptr,
+                              bool single = false) {
     const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
     const Exl3& w = m == 0 ? E.gate : E.up;
     for (unsigned job = wave; job < nrows * 3; job += W) {  // input transform of the split's 3 H128 blocks per row
@@ -870,24 +934,36 @@ __device__ void gate_up4_body(const Args& a, const Dispatch* dp, const ExpertSli
             if (last_arrival(a.gu4_counter(slot, cg * 2U + h), 2 * kGateSplits)) finish(cg * 2U + h);
     } else {
         const unsigned col = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(cg * static_cast<unsigned>(W) + wave)));
-        split4_rows<MaxR, Depth, DepthBig>(w, kInter, kHidden / 16, kGateSplits, col, split, xs, nrows, lane, a.part_gu(first, m, split),
-                                 std::size_t{2} * 16 * kInter);
+        if constexpr (Single) {
+            if (single && w.bits == 3) {
+                if (a.single_reader_counts != nullptr && threadIdx.x == 0) atomicAdd(a.single_reader_counts, 1U);
+                singleton3_core(w, kInter, col, split, xs, lane, a.part_gu(first, m, split));
+            }
+            else split4_rows<MaxR, Depth, DepthBig>(w, kInter, kHidden / 16, kGateSplits, col, split, xs, nrows, lane,
+                                                     a.part_gu(first, m, split), std::size_t{2} * 16 * kInter);
+        } else split4_rows<MaxR, Depth, DepthBig>(w, kInter, kHidden / 16, kGateSplits, col, split, xs, nrows, lane,
+                                                 a.part_gu(first, m, split), std::size_t{2} * 16 * kInter);
         const unsigned block = cg * W / 8;
         if (last_arrival(a.gu4_counter(slot, block), (8 / W) * 2 * kGateSplits)) finish(block);
     }
 }
 
-template <int MaxR, int Depth, int W, int DepthBig, bool SkipShared, bool Wide = false>
+template <int MaxR, int Depth, int W, int DepthBig, bool SkipShared, bool Wide = false, bool Single = false>
 __global__ __launch_bounds__(32 * W) void gate_up4_kernel(Args a) {
     __shared__ _Float16 xs[MaxR * kSplitCh];
     __shared__ WideV4 rowbuf[Wide ? 4 * 8 * 5 : 1];
     const Dispatch* dp = a.disp();
+    constexpr unsigned groups = Wide ? kInter / 256U : kInter / (16U * W);
+    // Former grid separated a slot's gate/up CTAs by an entire z plane spanning all slots. Pair the two
+    // matrices per tile to reduce partial/counter lifetime; CTA counts and split arithmetic stay unchanged.
+    const unsigned bx = a.interleave_gu ? blockIdx.x / 2U : blockIdx.x;
+    const unsigned m = a.interleave_gu ? blockIdx.x % 2U : blockIdx.z;
     unsigned slot;
     if (!map_slot(dp, blockIdx.y, slot)) return;
     if (SkipShared && slot == kSharedSlot) return;  // done by the router + shared launch
-    constexpr unsigned groups = Wide ? kInter / 256U : kInter / (16U * W);
-    gate_up4_body<MaxR, Depth, W, DepthBig, Wide>(a, dp, slot_slices(a, dp, slot), slot, dp->nrows[slot], dp->first[slot],
-                                                  blockIdx.x % groups, blockIdx.x / groups, blockIdx.z, xs, rowbuf);
+    gate_up4_body<MaxR, Depth, W, DepthBig, Wide, Single>(a, dp, slot_slices(a, dp, slot), slot, dp->nrows[slot], dp->first[slot],
+                                                       bx % groups, bx / groups, m, xs, rowbuf,
+                                                       Single && single_stream_for<Depth>(a, dp, slot));
 }
 
 // Router + shared expert in one launch (STRIX_MMX_MOE_OVERLAP=1): CTAs 0..127 are router CTAs (one expert each, its
@@ -947,7 +1023,7 @@ __global__ __launch_bounds__(128) void router_shared_kernel(Args a) {
                                                   bx / groups, m, xs, rowbuf);
 }
 
-template <int MaxR, int Depth, int W, int DepthBig, bool Wide = false>
+template <int MaxR, int Depth, int W, int DepthBig, bool Wide = false, bool Single = false>
 __global__ __launch_bounds__(32 * W) void down4_kernel(Args a) {
     __shared__ _Float16 xs[MaxR * kSplitCh];
     __shared__ WideV4 rowbuf[Wide ? 4 * 8 * 5 : 1];
@@ -1008,8 +1084,15 @@ __global__ __launch_bounds__(32 * W) void down4_kernel(Args a) {
             }
     } else {
         const unsigned col = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(cg * static_cast<unsigned>(W) + wave)));
-        split4_rows<MaxR, Depth, DepthBig>(w, kHidden, kInter / 16, kDownSplits, col, split, xs, nrows, lane, a.part_dn(first, split),
-                                 std::size_t{4} * kHidden);
+        if constexpr (Single) {
+            if (single_stream_for<Depth>(a, dp, slot) && w.bits == 3) {
+                if (a.single_reader_counts != nullptr && threadIdx.x == 0) atomicAdd(a.single_reader_counts + 1, 1U);
+                singleton3_core(w, kHidden, col, split, xs, lane, a.part_dn(first, split));
+            }
+            else split4_rows<MaxR, Depth, DepthBig>(w, kHidden, kInter / 16, kDownSplits, col, split, xs, nrows, lane,
+                                                     a.part_dn(first, split), std::size_t{4} * kHidden);
+        } else split4_rows<MaxR, Depth, DepthBig>(w, kHidden, kInter / 16, kDownSplits, col, split, xs, nrows, lane,
+                                                 a.part_dn(first, split), std::size_t{4} * kHidden);
         const unsigned block = cg * W / 8;
         if (last_arrival(a.dn4_counter(block), (dp->count + 1) * (8 / W) * kDownSplits)) {
             combine(block);
@@ -1029,9 +1112,18 @@ Args make_args(const MoeView& v) {
         throw std::invalid_argument("minimax moe: shared expert must be 6144 -> 1536 -> 6144 at K3 or K5");
     if (v.h != nullptr && (v.part0 == nullptr || v.part1 == nullptr || v.norm_w == nullptr))
         throw std::invalid_argument("minimax moe: fused post-exchange needs part0, part1 and norm_w");
+    if ((v.controlled_ids == nullptr) != (v.controlled_weights == nullptr))
+        throw std::invalid_argument("minimax moe: controlled ids and weights must be supplied together");
     Args a{v.rows, v.h, v.part0, v.part1, v.norm_w, v.y, v.router_w, v.bias, v.experts, v.shared, v.out, v.ids, v.weights,
            static_cast<unsigned char*>(v.ws.base)};
     a.pub = v.pub;
+    a.controlled_ids = v.controlled_ids;
+    a.controlled_weights = v.controlled_weights;
+    a.single_reader_counts = v.single_reader_counts;
+    const char* interleave = std::getenv("STRIX_MMX_MOE_GU_INTERLEAVE");
+    if (interleave != nullptr && std::string(interleave) != "0" && std::string(interleave) != "1")
+        throw std::invalid_argument("STRIX_MMX_MOE_GU_INTERLEAVE must be 0 or 1");
+    a.interleave_gu = route::moe_interleave(a.rows, interleave != nullptr && std::string(interleave) == "1");  // default 1 via mm_defaults
     a.pub.tiles = kHidden / 128U;  // down4 combine finishers: one per 128-output tile (both wide and narrow forms)
     return a;
 }
@@ -1126,23 +1218,47 @@ int moe_wide() {
     return w;
 }
 bool wide_for(unsigned rows) { return route::wide_for(rows, moe_wide()); }
-template <int MaxR, int Depth, int W, int DepthBig, bool SkipShared = false>
-void launch_experts4w(const Args& a, hipStream_t stream, hipEvent_t* marks) {
-    if (W == 4 && wide_for(a.rows)) {
-        hipLaunchKernelGGL((gate_up4_kernel<MaxR, Depth, 4, DepthBig, SkipShared, true>), dim3(kInter / 256 * kGateSplits, kMaxSlots + 1, 2),
-                           dim3(128), 0, stream, a);
-        launched("gate_up4 wide");
-        if (marks != nullptr) (void)hipEventRecord(marks[1], stream);
-        hipLaunchKernelGGL((down4_kernel<MaxR, Depth, 4, DepthBig, true>), dim3(kHidden / 256 * kDownSplits, kMaxSlots + 1), dim3(128), 0, stream, a);
-        launched("down4 wide");
-        return;
-    }
-    hipLaunchKernelGGL((gate_up4_kernel<MaxR, Depth, W, DepthBig, SkipShared>), dim3(kInter / (16 * W) * kGateSplits, kMaxSlots + 1, 2), dim3(32 * W), 0,
-                       stream, a);
+// Default 1 via mm_defaults (STRIX_MM_BASELINE=1 or =0 switches it off). Read on every call for in-process A/B.
+bool moe_single() {
+    const char* value = std::getenv("STRIX_MMX_MOE_SINGLE");
+    if (value == nullptr || std::string(value) == "0") return false;
+    if (std::string(value) == "1") return true;
+    throw std::invalid_argument("STRIX_MMX_MOE_SINGLE must be 0 or 1");
+}
+template <int MaxR, int Depth, int W, int DepthBig, bool SkipShared, bool Wide, bool Single = false>
+void launch_experts4_grid(const Args& input, hipStream_t stream, hipEvent_t* marks) {
+    static_assert(!Single || (MaxR == 8 && Depth == 4 && W == 4 && !Wide));
+    Args a = input;
+    a.single_stream = Single;
+    constexpr unsigned gu_groups = Wide ? kInter / 256U : kInter / (16U * W);
+    constexpr unsigned dn_groups = Wide ? kHidden / 256U : kHidden / (16U * W);
+    const dim3 gu_grid(gu_groups * kGateSplits * (a.interleave_gu ? 2U : 1U), kMaxSlots + 1,
+                       a.interleave_gu ? 1U : 2U);
+    hipLaunchKernelGGL((gate_up4_kernel<MaxR, Depth, W, DepthBig, SkipShared, Wide, Single>),
+                       gu_grid, dim3(32 * W), 0, stream, a);
     launched("gate_up4");
     if (marks != nullptr) (void)hipEventRecord(marks[1], stream);
-    hipLaunchKernelGGL((down4_kernel<MaxR, Depth, W, DepthBig>), dim3(kHidden / (16 * W) * kDownSplits, kMaxSlots + 1), dim3(32 * W), 0, stream, a);
+    hipLaunchKernelGGL((down4_kernel<MaxR, Depth, W, DepthBig, Wide, Single>),
+                       dim3(dn_groups * kDownSplits, kMaxSlots + 1), dim3(32 * W), 0, stream, a);
     launched("down4");
+}
+
+template <int MaxR, int Depth, int W, int DepthBig, bool SkipShared = false>
+void launch_experts4w(const Args& a, hipStream_t stream, hipEvent_t* marks) {
+    [[maybe_unused]] const bool single = moe_single();  // validate even when this shape uses the unchanged reader
+    if constexpr (W == 4) {
+        if (wide_for(a.rows)) {
+            launch_experts4_grid<MaxR, Depth, W, DepthBig, SkipShared, true>(a, stream, marks);
+            return;
+        }
+        if constexpr (MaxR == 8 && Depth == 4) {
+            if (single && a.rows == 8) {
+                launch_experts4_grid<MaxR, Depth, W, DepthBig, SkipShared, false, true>(a, stream, marks);
+                return;
+            }
+        }
+    }
+    launch_experts4_grid<MaxR, Depth, W, DepthBig, SkipShared, false>(a, stream, marks);
 }
 // STRIX_MMX_MOE_DEPTH8R: ring depth of the 8-row bucket's bodies (the shared expert at N >= 5): 0 = the common depth,
 // 2 = a shallower ring (lower register pressure for 8 rows; same bits).
@@ -1218,6 +1334,32 @@ template <int Depth> void launch_experts_rows(const Args& a, hipStream_t stream,
 }
 }  // namespace
 
+namespace {
+void check_single_resource(const void* kernel, const char* name, int depth, int big, bool skip) {
+    hipFuncAttributes attrs{};
+    const hipError_t status = hipFuncGetAttributes(&attrs, kernel);
+    if (status != hipSuccess) throw std::runtime_error(std::string("singleton resource query: ") + hipGetErrorString(status));
+    std::printf("singleton resource kernel=%s Depth=%d DepthBig=%d SkipShared=%d VGPR=%d scratch=%zu LDS=%zu\n",
+                name, depth, big, skip ? 1 : 0, attrs.numRegs, attrs.localSizeBytes, attrs.sharedSizeBytes);
+    if (attrs.localSizeBytes != 0) throw std::runtime_error("singleton kernel has scratch");
+}
+template <int Depth, int Big, bool Skip> void check_single_instances() {
+    check_single_resource(reinterpret_cast<const void*>(gate_up4_kernel<8, Depth, 4, Big, Skip, false, true>),
+                          "gate_up4", Depth, Big, Skip);
+    if constexpr (!Skip)
+        check_single_resource(reinterpret_cast<const void*>(down4_kernel<8, Depth, 4, Big, false, true>),
+                              "down4", Depth, Big, false);
+}
+template <int Depth> void check_single_depth() {
+    check_single_instances<Depth, Depth, true>();
+    check_single_instances<Depth, Depth, false>();
+    check_single_instances<Depth, 2, false>();
+}
+}  // namespace
+void check_moe_single_resources() {
+    check_single_depth<4>();
+}
+
 void enqueue_experts(const MoeView& v, hipStream_t stream, hipEvent_t* marks) {
     const Args a = make_args(v);
     if (moe_version() == 4) {
@@ -1248,28 +1390,30 @@ void enqueue_experts(const MoeView& v, hipStream_t stream, hipEvent_t* marks) {
     }
 }
 
-template <int Depth> void launch_overlap4_rows(const Args& a, hipStream_t stream) {
-    if (a.rows == 1) launch_overlap4<1, Depth>(a, stream, nullptr);
-    else if (a.rows == 2) launch_overlap4<2, Depth>(a, stream, nullptr);
-    else if (a.rows <= 4) launch_overlap4<4, Depth>(a, stream, nullptr);
-    else launch_overlap4<8, Depth>(a, stream, nullptr);
+template <int Depth> void launch_overlap4_rows(const Args& a, hipStream_t stream, hipEvent_t* marks) {
+    if (a.rows == 1) launch_overlap4<1, Depth>(a, stream, marks);
+    else if (a.rows == 2) launch_overlap4<2, Depth>(a, stream, marks);
+    else if (a.rows <= 4) launch_overlap4<4, Depth>(a, stream, marks);
+    else launch_overlap4<8, Depth>(a, stream, marks);
 }
 
-void enqueue_moe(const MoeView& v, hipStream_t stream) {
+void enqueue_moe_profiled(const MoeView& v, hipStream_t stream, hipEvent_t* marks) {
     if (v.pub.flag != nullptr && !(moe_overlap() == 1 && v.h == nullptr && moe_version() == 4 && moe_waves() == 4))
         throw std::logic_error("minimax moe: the publish epilogue needs the decode overlap form (v4, 4 waves)");
     if (moe_overlap() == 1 && v.h == nullptr && moe_version() == 4 && moe_waves() == 4) {
         const Args a = make_args(v);
         switch (moe_depth3()) {
-            case 8: launch_overlap4_rows<8>(a, stream); break;
-            case 12: launch_overlap4_rows<12>(a, stream); break;
-            default: launch_overlap4_rows<4>(a, stream); break;
+            case 8: launch_overlap4_rows<8>(a, stream, marks); break;
+            case 12: launch_overlap4_rows<12>(a, stream, marks); break;
+            default: launch_overlap4_rows<4>(a, stream, marks); break;
         }
         return;
     }
     enqueue_router(v, stream);
-    enqueue_experts(v, stream);
+    enqueue_experts(v, stream, marks);
 }
+
+void enqueue_moe(const MoeView& v, hipStream_t stream) { enqueue_moe_profiled(v, stream, nullptr); }
 
 // ================================================================ router for many rows
 namespace {

@@ -18,6 +18,15 @@
 //   2. routed gate/up: the library GEMV grid (CTA = 4 tile columns x 1 split) over all active slots, split input
 //      transform in LDS, raw split partials; the last CTA per block does H, svh, SwiGLU and the down transform;
 //   3. down, same grid; the last CTA per output block does H, svh and the fixed-order combine (+ shared).
+// Eight-row v4 gate/up tiles interleave gate and up with or without overlap; STRIX_MMX_MOE_GU_INTERLEAVE=0 restores the former z planes
+// for diagnosis (same CTA count, partials and counters). It is read per call, as is STRIX_MMX_MOE_SINGLE.
+// The engine resolver supplies 1 for both switches; raw-library unset is 0 for both.
+// STRIX_MMX_MOE_SINGLE=1 enables the coalesced singleton reader: device dispatch selects it
+// only at N=8, U>=25, S>=18, nrows=1, K3, narrow W=4, Depth=4. Other slots use the existing reader in the same launch.
+// Both settings keep three launches in the overlap form; N<8, Depth=8/12 and wide/W=8 use the same kernels at SINGLE=0/1.
+// Contract: 16 gate/up splits, 4 down splits, ascending k tiles, both fdot2 chains, reduce4
+// offsets 2 then 1, ascending split sum, H128/scales, SwiGLU rounding, ascending-expert fmaf, then shared add.
+// The fused residual remains h+(p0+p1). Native/model/complete-workload qualification is still required.
 // Flags (all paths bitwise): STRIX_MMX_MOE_WIDE unset = wide at N2-4 only (measurement), 1 = wide at every N (expert
 // gate/up/down: CTA = 16 columns, wave = 4 columns
 // streaming 16-byte k-row runs; 0 = 4-column CTAs), STRIX_MMX_MOE_V 4 (1/3 older forms), STRIX_MMX_MOE_DEPTH3 4 (8/12),
@@ -62,12 +71,17 @@ struct Dispatch {
     std::uint32_t row_expert[kMaxRows][kTopE];  // and their expert ids
     std::uint32_t ids[kMaxRows][kTopE];       // route_row output (choice order)
     float weights[kMaxRows][kTopE];
+    // Device-built execution buckets; entries are original ascending-id slots, preserving pair numbering/combine.
+    std::uint32_t single_count, reuse_count;
+    std::uint32_t single_slot[kMaxSlots], reuse_slot[kMaxSlots];
 };
 
 struct MoeWorkspace {  // one device allocation of moe_workspace_bytes(), zeroed once before first use
     void* base = nullptr;
 };
 std::size_t moe_workspace_bytes();
+// Bench diagnostic: print HIP VGPR/scratch/LDS for all Single=true instances; throw on scratch or query failure.
+void check_moe_single_resources();
 
 // decode (STRIX_MM_XB_PUBLISH): the producer kernel publishes its own exchange message (lean form): every lane releases
 // its stores at agent scope, each CTA counts on `counter` (agent scope), and only the last CTA of the grid resets the
@@ -98,9 +112,17 @@ struct MoeView {
     float* weights = nullptr;             // optional rows x 4
     MoeWorkspace ws{};
     PublishTarget pub{};                  // optional: the down/combine launch publishes `out` (STRIX_MM_XB_PUBLISH)
+    // Measurement only: device [rows][4], distinct ids <128 per row and finite weights. Overrides selection at
+    // route_tail after the real router executes; leaves the overlap/expert path intact. Both null in production.
+    const std::uint32_t* controlled_ids = nullptr;
+    const float* controlled_weights = nullptr;
+    // Optional diagnostic device counters [gate/up, down], caller-zeroed; count actual reader invocations.
+    std::uint32_t* single_reader_counts = nullptr;
 };
 // Throws std::invalid_argument on unsupported shapes (bits other than 3/5 for experts/shared, rows outside 1..8).
 void enqueue_moe(const MoeView& v, hipStream_t stream);
+// Profiling only: events after router/shared (or prepare), after routed gate/up. Same production launches.
+void enqueue_moe_profiled(const MoeView& v, hipStream_t stream, hipEvent_t* marks);
 // Pieces of enqueue_moe (for the microbenchmark and for a caller that overlaps them with other work).
 void enqueue_router(const MoeView& v, hipStream_t stream);
 // prepare + gate_up + down; marks (optional, 2 events): recorded after prepare and after gate_up (profiling).
