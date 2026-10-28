@@ -1,4 +1,5 @@
 #include "strix/batch_nested_prefill.hpp"
+#include "../apps/qwen_tiled_prompt_plan.hpp"
 
 #include <iostream>
 #include <stdexcept>
@@ -12,6 +13,14 @@ std::vector<unsigned> classes(std::span<const std::uint32_t> units,std::uint64_t
     return out;
 }
 void recipes() {
+    for(const auto t:{2048U,8192U}) for(std::uint64_t remaining=1;remaining<=8193;++remaining)
+        for(bool worker:{false,true}) for(const auto limit:{0U,2048U,16384U}) {
+            const bool bound=strix::decode_cli::qwen_batch_nest_possible(worker,limit,t,remaining);
+            require(bound==(worker && limit && t==8192 && remaining<t && remaining<=limit),"nest-possible row-class mapping");
+            const std::vector<std::uint32_t> standard{1024,256,64,16};
+            if(worker && strix::batch_nested_recipe(remaining,limit,t,standard,standard,true))
+                require(bound,"capture predicate must cover every qualified nesting recipe");
+        }
     const std::vector<std::uint32_t> ladder{1024,256,64,16};
     for(const bool heads:{false,true}) for(std::uint64_t n=1;n<=2048;++n) {
         const auto forced=strix::batch_nested_recipe(n,2048,8192,ladder,ladder,true,heads);

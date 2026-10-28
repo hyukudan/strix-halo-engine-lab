@@ -62,7 +62,11 @@ void run(bool streaming, unsigned failure_kind) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             require(headers_seen.load(),"post-admission headers");
         }
-        if(job.session_id=="local") { result.error="request-local execution refusal"; return result; }
+        if(job.session_id=="local") {
+            OutputLogitsChain chain;chain.append(std::nullopt);
+            require(!chain.complete(1),"missing row must fail the request");
+            result.finish="diagnostic_failure";result.error=chain.error;return result;
+        }
         if(job.session_id=="fatal") {
             if(failure_kind == 1U) throw 42;
             if(failure_kind == 2U) throw std::runtime_error("");
@@ -90,7 +94,7 @@ void run(bool streaming, unsigned failure_kind) {
     };
     headers_seen.store(false);
     const auto local=request(options.http_port,body("local"));
-    require(local.find("request-local execution refusal")!=std::string::npos,"local exception reaches client");
+    require(local.find("request final missing output logits row")!=std::string::npos,"local exception reaches client");
     require(request(options.http_port,body("healthy")).find("200 OK")!=std::string::npos,"following request succeeds");
     headers_seen.store(false);
     const auto fatal=request(options.http_port,body("fatal"));

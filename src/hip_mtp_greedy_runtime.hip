@@ -1,6 +1,7 @@
 #include "strix/mtp_cohort_partition.hpp"
 #include "strix/known_window_cohort.hpp"
 #include "strix/host_phase_timing.hpp"
+#include "strix/prompt_terminal_diagnostics.hpp"
 #include "strix/hip_mtp_greedy_runtime.hpp"
 #include "strix/mtp_sidecar_binding.hpp"
 #include "strix/hip_mtp_window_verifier.hpp"
@@ -516,6 +517,7 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::finish_cycle(const HipMtpTargetHidd
             "MTP target verifier returned no actual aligned committed output rows");
         std::vector<HipMtpReplayRow> replay;replay.reserve(verified.committed_rows.size());
         for(const auto& ticket:verified.committed_rows) {
+            if(prefix_batch_certification_enabled() && prompt_terminal_digest_enabled()) out.output_logits_digests.push_back(ticket.terminal_logits_digest());
             replay.push_back({out.final_target,ticket.input_token()});out.final_target=ticket;
         }
         out.emitted_tokens=std::move(verified.emitted_tokens);
@@ -676,6 +678,7 @@ HipMtpGreedyCycleResult HipMtpGreedyRuntime::cycle(const HipMtpTargetHiddenTicke
                 out.selection_receipt=transaction->seal();i.busy=false;return out;
             }
             ++out.consumed_target_rows;
+            if(prefix_batch_certification_enabled() && prompt_terminal_digest_enabled()) out.output_logits_digests.push_back(completed.terminal_logits_digest());
             pending=completed.predicted_token();out.final_target=std::move(completed);
             out.emitted_tokens.push_back(pending);
             const bool accepted=index<candidates.size() && candidates[index]==pending;

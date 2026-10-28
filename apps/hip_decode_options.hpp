@@ -393,6 +393,7 @@ struct Options {
     // Block-boundary prefix state cache on the tiled known-prefix prefill (docs/engine/serving/prefix-state-cache.md).
     // A positive host budget enables it; everything else is optional.
     std::shared_ptr<StateCacheStatsMirror> state_cache_stats = std::make_shared<StateCacheStatsMirror>();
+    unsigned prefix_batch_cert = 0; // 0 off, 1 strict L0, 2 capture-only, 3 unqualified L1 (capture only)
     bool prefix_cache = true;
     std::string prefix_cache_retention = "fair", prefix_cache_source = "off", prefix_cache_reason = "not-serving";
     std::uint64_t prefix_cache_host_bytes = 0;
@@ -1383,13 +1384,23 @@ inline std::uint64_t ordinary_http_batch_slots(const Options& options) {
 // Cache controls own storage policy, never numerical routing or tail selection.
 inline bool operational_session_option(std::string_view flag) {
     flag = flag.substr(0, flag.find('='));
-    return flag == "--prefix-cache-staging-bytes" || flag == "--prefix-cache" || flag == "--prefix-cache-retention" || flag == "--session-cache" || flag == "--session-disk" || flag == "--session-dir" ||
+    return flag == "--prefix-batch-cert" || flag == "--prefix-cache-staging-bytes" || flag == "--prefix-cache" || flag == "--prefix-cache-retention" || flag == "--session-cache" || flag == "--session-disk" || flag == "--session-dir" ||
         flag == "--session-ram-bytes" || flag == "--session-disk-bytes" ||
         flag == "--session-max-parked" || flag == "--session-capture-host-bytes";
 }
 // One strict policy parser for CLI-only paths and effective-config resolution.
 template<class Lookup>
 inline void apply_prefix_cache_environment(Options& o, Lookup lookup) {
+    const auto batch_mode=[](std::string_view v) -> unsigned {
+        if(v=="0" || v=="off") return 0;
+        if(v=="1" || v=="l0") return 1;
+        if(v=="capture") return 2;
+        if(v=="l1") return 3;
+        throw std::invalid_argument("prefix batch certification requires 0|1|capture|l0|l1");
+    };
+    if (!o.supplied_options.contains("--prefix-batch-cert"))
+        if(const auto v=lookup("STRIX_PREFIX_BATCH_CERT")) o.prefix_batch_cert=batch_mode(*v);
+    if(o.baseline) o.prefix_batch_cert=0;
     if (!o.supplied_options.contains("--prefix-cache")) {
         if (const auto v = lookup("STRIX_PREFIX_CACHE")) {
             if (*v != "0" && *v != "1" && *v != "on" && *v != "off")
@@ -1405,6 +1416,7 @@ inline void apply_prefix_cache_environment(Options& o, Lookup lookup) {
     if (o.prefix_cache_retention != "fair" && o.prefix_cache_retention != "lru")
         throw std::invalid_argument("prefix cache retention requires fair|lru");
     if (const auto v = lookup("STRIX_BASELINE"); v && *v == "1") o.baseline = true;
+    if(o.baseline) o.prefix_batch_cert=0;
     if (o.baseline) o.prefix_cache_retention = "lru";
     if (!o.prefix_cache) {
         o.prefix_cache_host_bytes = 0; o.prefix_cache_dir.clear(); o.prefix_cache_block_rows = 0;
@@ -1866,7 +1878,7 @@ inline Options parse_options(
             }
             continue;
         }
-        if (argument == "--prefix-cache-staging-bytes" || argument == "--prefix-cache-host-bytes" || argument == "--prefix-cache-disk-bytes" ||
+        if (argument == "--prefix-batch-cert" || argument == "--prefix-cache-staging-bytes" || argument == "--prefix-cache-host-bytes" || argument == "--prefix-cache-disk-bytes" ||
             argument == "--prefix-cache-every" || argument == "--prefix-cache-dir" ||
             argument == "--prefix-cache-then-prompt" || argument == "--prefix-cache-block-rows") {
             if (index + 1 >= argc || std::string_view(argv[index + 1]).starts_with("--"))
@@ -1880,6 +1892,12 @@ inline Options parse_options(
             } else if (argument == "--prefix-cache-block-rows") {
                 if (options.prefix_cache_block_rows) throw std::invalid_argument("duplicate --prefix-cache-block-rows");
                 options.prefix_cache_block_rows = parse_u64(value, "prefix cache block rows");
+            } else if (argument == "--prefix-batch-cert") {
+                if(value=="0" || value=="off") options.prefix_batch_cert=0;
+                else if(value=="1" || value=="l0") options.prefix_batch_cert=1;
+                else if(value=="capture") options.prefix_batch_cert=2;
+                else if(value=="l1") options.prefix_batch_cert=3;
+                else throw std::invalid_argument("--prefix-batch-cert requires 0|1|capture|l0|l1");
             } else if (argument == "--prefix-cache-staging-bytes") {
                 options.prefix_cache_staging_bytes=parse_u64(value,"prefix cache staging bytes");
             } else if (argument == "--prefix-cache-host-bytes") {

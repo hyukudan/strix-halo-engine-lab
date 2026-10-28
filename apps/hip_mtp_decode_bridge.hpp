@@ -278,13 +278,17 @@ inline std::string rtx_import_receipt(const PrefixStateCacheRequestStats& q) {
 // The tiled MTP prompt as resumable steps (one T-row block, one tail block or up to `serial_rows_per_step`
 // serial rows per step), so that a batched run can interleave a joining request's prompt with the decode cycles
 // of the others. The sequence of operations is run_tiled_mtp_prompt's, whatever the interleaving.
+struct BatchCertContext {
+    bool enabled=false,allow_restore=false,nesting_possible=false;
+    QwenBatchConfig config;
+};
 class TiledMtpPrompt {
 public:
     TiledMtpPrompt(std::span<const std::uint32_t> tokens,const ModelContract& model,const CompiledSerialExecution& compiled,
         MtpDecodeTargetParents::TiledPrompt& tiled,SerialSessionContext& session,HipMtpTargetHidden& target,HipMtpRuntime& runtime,
         const QualifiedMtpDraftPlan& qualified,const ActivatedMtpDraftPlan& activated,const ExecutionRuntimeResources& resources,
         DirectLaunchDispatcher& dispatcher,std::byte* held,std::shared_ptr<TokenSampler> final_sampler={},
-        HipMtpHostRowSelector final_selector={},std::function<void(serve::GenerationProgress)> progress={}, bool session_resume=false, bool tiled_suffix=true, bool batch=false)
+        HipMtpHostRowSelector final_selector={},std::function<void(serve::GenerationProgress)> progress={}, bool session_resume=false, bool tiled_suffix=true, bool batch=false, BatchCertContext batch_cert={})
         :tokens_(tokens.begin(),tokens.end()),tiled_(tiled),session_(session),target_(target),runtime_(runtime),qualified_(qualified),
          activated_(activated),resources_(resources),dispatcher_(dispatcher),held_(held),final_sampler_(std::move(final_sampler)),final_selector_(std::move(final_selector)),progress_(std::move(progress)) {
         producer_rotary_=model.rotary_identity();
@@ -337,8 +341,18 @@ public:
             plan_config_.tails[k].policy=policy(tiled_.tails[k].backend->output_policy());
         }
         plan_config_.ladder=tiled_.ladder_tail_rows;
-        certified_request_=!final_selector_ && !batch && !session_resume && !tiled_.rtx_import && !rtx_state_export_request();
-        if(tiled_.cache && !legacy_cache()) tiled_.cache->set_plan(plan_config_,n_,certified_request_);
+        batch_=batch;batch_cert_=batch_cert;
+        certified_request_=!final_selector_ && (!batch || (batch_cert.enabled && batch_cert.config.allowed(plan_config_.schedule))) &&
+            !session_resume && !tiled_.rtx_import && !rtx_state_export_request();
+        if(tiled_.cache && !legacy_cache()) {
+            if(batch && batch_cert.enabled && !certified_request_ && tiled_.cache->has_store())
+                tiled_.cache->store().record_batch_config_skip();
+            tiled_.cache->set_plan(plan_config_,n_,certified_request_,batch && batch_cert.enabled?2:1,
+                batch_cert.config,!batch || (certified_request_ && batch_cert.allow_restore),batch_cert.nesting_possible);
+            if(prefix_batch_certification_enabled()) tiled_.cache->bind_restore_runtime([&runtime,&qualified,&activated](std::uint64_t p) {
+                runtime.restore_cache_frontier(qualified,activated,p-1U);
+            });
+        }
         if(tiled_.cache) tiled_.cache->set_policy_selection(!!final_selector_);
         start_=std::chrono::steady_clock::now();
         if(session_resume) {
@@ -531,8 +545,11 @@ public:
     }
     // After the block ran (alone or in a group): the predictor rows, the held row, the prefix cache capture and,
     // for the final block, the adoption of its last row (logits: its terminal logits).
-    void finish_block(const Block& block,const std::vector<float>& logits,bool grouped=false) {
+    void finish_block(const Block& block,const std::vector<float>& logits,bool grouped=false,HipKnownPrefixWindow* executed_owner=nullptr) {
         const auto rows=block.rows;
+        if(batch_ && batch_cert_.enabled)
+            trace_.push_back({pos_,pos_+rows,rows,block.backend==tiled_.blocks,
+                (executed_owner?executed_owner:block.owner)==tiled_.block_owner.get(),grouped,small_,forced_ladder_,adopted_});
         drain_priming();
         if(block.capture && rows!=tiled_.rows)++small_units_;      // STRIX_BATCH_PROMPT_SMALL: a T block run as tail-size units
         if(grouped && !block.capture)++grouped_tail_blocks_;      // a tail-backend block run in a prompt group
@@ -550,7 +567,7 @@ public:
             const auto* last=block_hidden_+static_cast<std::size_t>(rows-1U)*width_;
             if((block.capture || tiled_.cache_tails) && tiled_.cache && !legacy_cache())
                 capture_=tiled_.cache->try_prepare_capture(session_,tokens_,block.owner->producer_stream(),
-                    !block.owner->completion_pending(),capture_order(block,grouped,stream),n_-1U,block.owner->producer_lifetime(),runtime_.resources().shared_from_this());
+                    !block.owner->completion_pending(),capture_order(block,grouped,stream),n_-1U,block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),batch_?this:nullptr);
             int device=0;check(hipGetDevice(&device),"get priming device");
             const auto submit=[this,device,stream,last,capture=capture_,views=std::move(views),next=std::move(next)] {
                 try {
@@ -589,7 +606,7 @@ public:
             else if(complete) {
                 const auto stream=static_cast<hipStream_t>(runtime_.resources().stream());
                 capture_=tiled_.cache->try_prepare_capture(session_,tokens_,block.owner->producer_stream(),true,capture_order(block,grouped,stream),n_-1U,
-                    block.owner->producer_lifetime(),runtime_.resources().shared_from_this());
+                    block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),batch_?this:nullptr);
                 if(capture_) {
                     capture_->submit_predictor(stream);
                     capture_->commit(true);
@@ -682,6 +699,38 @@ public:
                <<"\",\"predictor_frontier\":"<<runtime_.next_source_position()<<'}';
         }
         if(digest && tiled_.cache) out<<",\"state_digest\":\""<<model_content_identity_hex(tiled_.cache->state_digest(n_))<<'"';
+        if(digest && batch_ && batch_cert_.enabled) {
+            out<<",\"request_order\":"<<request_order_<<",\"omitted_full_t_units\":"<<(tiled_.rows?restored_/tiled_.rows:0);
+            out<<",\"batch_cert_decline\":\""<<(!batch_cert_.enabled?"disabled":
+                !batch_cert_.config.allowed(plan_config_.schedule)?batch_cert_.config.decline(plan_config_.schedule):
+                !certified_request_?(final_selector_?"policy-selection":"state-transfer"):"")<<'"';
+            if(tiled_.cache && tiled_.cache->has_store()) {
+                const auto counters=tiled_.cache->store().counters();
+                out<<",\"capture_counters_global\":{\"tripwire\":"<<counters.capture_skips_tripwire
+                   <<",\"batch_config\":"<<counters.capture_skips_batch_config<<",\"cross_stream\":"<<counters.capture_skips_cross_stream
+                   <<",\"staging_busy\":"<<counters.capture_busy_skips<<",\"staging_budget\":"<<counters.staging_cap_skips
+                   <<",\"snapshot_preparations\":"<<counters.snapshot_preparations
+                   <<",\"staging_bytes\":"<<counters.staging_bytes
+                   <<",\"no_store\":"<<counters.no_store_skips<<'}';
+            }
+            if(tiled_.cache && tiled_.cache->continuation()) {
+                const auto& cursor=*tiled_.cache->continuation();
+                out<<",\"continuation\":{\"phase\":"<<static_cast<unsigned>(cursor.phase)
+                   <<",\"tail\":"<<cursor.tail<<",\"balanced\":"<<cursor.balanced<<'}';
+            }
+            out<<",\"batch_cert_enabled\":"<<(batch_cert_.enabled?"true":"false")
+               <<",\"batch_cert_config_allowed\":"<<(batch_cert_.config.allowed(plan_config_.schedule)?"true":"false")
+               <<",\"batch_restore_allowed\":"<<(batch_cert_.allow_restore?"true":"false")
+               <<",\"execution_trace\":[";
+            for(std::size_t k=0;k<trace_.size();++k) {
+                const auto& u=trace_[k];
+                out<<(k?",":"")<<"{\"begin\":"<<u.begin<<",\"end\":"<<u.end<<",\"rows\":"<<u.rows
+                   <<",\"t_owner\":"<<u.t_owner<<",\"own_owner\":"<<u.own_owner<<",\"grouped\":"<<u.grouped
+                   <<",\"small\":"<<u.small<<",\"forced_ladder\":"<<u.forced<<",\"adopted\":"<<u.adopted
+                   <<",\"exec_class\":"<<u.exec_class()<<'}';
+            }
+            out<<']';
+        }
         receipt=out.str();
         // Final-only diagnostics log the execution witness without reading prompt state.
         static const bool log=[]{const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST");
@@ -692,11 +741,18 @@ public:
 private:
     using Phase=QwenPlanPhase;
     PrefixCaptureOrder capture_order(const Block& block,bool grouped,hipStream_t snapshot_predictor) const {
-        if(grouped || small_ || adopted_ || !certified_request_) return {};
+        if(grouped || small_ || (batch_ && forced_ladder_) || adopted_ || !certified_request_) return {};
         QwenPlanCursor cursor{phase_,tail_,balanced_};
         const auto next=qwen_prompt_next(plan_config_,cursor,session_.next_position,n_,false,small_,adopted_);
         if(!next || !next->t_owner ||
             block.owner!=tiled_.block_owner.get() || next->owner!=plan_config_.block) return {};
+        if(batch_) {
+            const auto p=session_.next_position;
+            const bool nest=qwen_batch_nest_possible(batch_cert_.nesting_possible,batch_cert_.config.nest_rows,tiled_.rows,n_-p);
+            if(trace_.empty() || !qwen_batch_capture_eligible(batch_cert_.config,plan_config_.schedule,
+                trace_.back(),tiled_.rows,qwen_producer_trace_ok(plan_config_,n_,p,trace_),
+                next->t_owner,static_cast<std::uint32_t>(next->end-next->begin),nest)) return {};
+        }
         const auto mtp=static_cast<hipStream_t>(runtime_.resources().stream());
         // The next target writes on this actual owner stream. Predictor rows and held_ are
         // next written on mtp. The next target uses the spare tap buffer; drain_priming
@@ -705,7 +761,10 @@ private:
         return {tiled_.block_owner->producer_stream(),snapshot_predictor,mtp};
     }
     QwenTiledPlanConfig plan_config_;
-    bool certified_request_=false;
+    bool certified_request_=false,batch_=false;
+    BatchCertContext batch_cert_;
+    std::vector<QwenUnitExec> trace_;
+    std::uint64_t request_order_=0;
     bool legacy_cache() const {return tiled_.cache && tiled_.cache->has_store() && tiled_.cache->store().policy().legacy;}
     static void check(hipError_t e,const char* what){if(e!=hipSuccess)throw std::runtime_error(std::string(what)+": "+hipGetErrorString(e));}
     [[nodiscard]] MtpDeviceView view(const std::byte* p) const {return MtpDeviceView{reinterpret_cast<std::uintptr_t>(p),width_,1U};}
@@ -738,9 +797,12 @@ private:
 public:
     std::function<void(HipKnownPrefixWindow&,const std::function<void()>&)> execute_native;
     void drain_for_handoff(){drain_priming();}
+    void set_request_order(std::uint64_t value) {request_order_=value;}
+    void before_writer(hipStream_t stream) const {if(batch_cert_.enabled) PrefixAsyncCapture::before_writer(this,stream);}
 private:
     void run_block(const Block& block) {
         auto& owner=*block.owner;
+        before_writer(owner.producer_stream());
         // The tap observer reads the tap step only (STRIX_QPF2K_HC prefill folds stay on for the other steps).
         owner.set_prefill_step_observer(block_observer(block.rows),[tap=tap_](std::size_t step){return step==tap;});
         const auto t0=std::chrono::steady_clock::now();
@@ -772,6 +834,7 @@ private:
     bool run_window_rows() {
         bool ran=false;
         for(std::uint32_t rows;(rows=window_unit())!=0U;) {
+            before_writer(nullptr); // unknown foreign stream is conservatively foreign
             auto tickets=tiled_.window->prompt_rows(session_,window_tokens(rows));
             if(tickets.empty()){window_refused_=true;break;}
             finish_window(std::move(tickets));ran=true;
@@ -805,6 +868,8 @@ public:
     // refused (nothing ran) and the suffix continues serially.
     void finish_window(std::vector<HipMtpTargetHiddenTicket> tickets,bool cohort=false) {
         if(tickets.empty()){window_refused_=true;return;}
+        if(batch_ && batch_cert_.enabled)
+            trace_.push_back({pos_,pos_+tickets.size(),static_cast<std::uint32_t>(tickets.size()),false,false,cohort,small_,forced_ladder_,adopted_});
         if(cohort)cohort_window_rows_+=tickets.size();
         drain_priming();   // STRIX_PREFILL_PIPE: the last block's predictor rows and held row precede the window's
         const auto rows=static_cast<std::uint32_t>(tickets.size());
@@ -829,12 +894,18 @@ private:
         if(!window_pending_) return;
         // Standalone commit replays the same ordered float recurrence and BF16
         // history shifts as the next window, then clears its shared pending rows.
-        tiled_.window->flush_pending_window();window_pending_=false;
+        // Certification off: the incumbent unconditional flush (owner sync + persistent-pool invalidation).
+        if(!batch_cert_.enabled) tiled_.window->flush_pending_window();
+        else if(tiled_.window->pending_window()) {before_writer(nullptr);tiled_.window->flush_pending_window();}
+        window_pending_=false;
     }
     void report_progress() const {
         if(progress_) progress_({serve::GenerationPhase::prefill,pos_-restored_,restored_,n_});
     }
     void run_serial_row() {
+        before_writer(nullptr);
+        if(batch_ && batch_cert_.enabled)
+            trace_.push_back({pos_,pos_+1U,1,false,false,false,small_,forced_ladder_,adopted_});
         drain_priming();
         // Every serial row consumes recurrent/conv state, including fallback
         // after a refused window. Fold earlier rows before advancing it.
@@ -981,6 +1052,7 @@ public:
         std::byte* held = nullptr; // h_{P-1} of the tiled prompt
         std::unique_ptr<HipMtpGreedyRuntime> greedy;
         HipMtpTargetHiddenTicket pending;
+        OutputLogitsChain output_chain;
         bool active = false;     // the slot holds a request (prefilling or decoding)
         bool prefilling = false; // its prompt is still running (interleaved admission)
         std::unique_ptr<TiledMtpPrompt> prefill;
@@ -1109,6 +1181,26 @@ public:
         return index;
     }
 private:
+    BatchCertContext batch_cert_context(const Slot& s) const {
+        BatchCertContext result;
+        result.enabled=options_.prefix_batch_cert && !options_.baseline;
+        if(!result.enabled) return result;
+        result.allow_restore=options_.prefix_batch_cert==1 && !service_mode_;
+        auto& c=result.config;
+        c.groups=prompt_batch_enabled();c.group_rows=prompt_batch_rows();
+        c.group_owner=bool(slots_.front()->parents->tiled.group);
+        const char* small=std::getenv("STRIX_BATCH_PROMPT_SMALL");c.small=small && small[0]=='1';
+        const char* windows=std::getenv("STRIX_PROMPT_WINDOW");c.windows=(!windows || windows[0]!='0') && bool(s.window);
+        c.cohort=prompt_window_cohort_enabled();c.service=service_ms_>0;c.cancel=cancel_points_;c.nest_rows=nest_rows_;
+        c.service_ms=service_ms_;c.lookahead=lookahead_;c.prompt_share=prompt_share_;c.interleave=interleave_;
+        const char* short_rows=std::getenv("STRIX_BATCH_SHORT_FIRST_ROWS");
+        c.short_rows=short_rows?std::strtoull(short_rows,nullptr,10):2048ULL;
+        const char* shared=std::getenv("STRIX_PROMPT_BATCH_SHARED");
+        c.shared=shared?shared:"hc,router,moe,elementwise";
+        // Conservative row-class bound: only the 8192-row family can be nested.
+        result.nesting_possible=qwen_batch_nest_possible(bool(worker_),nest_rows_,s.parents->tiled.rows,1);
+        return result;
+    }
     std::size_t prepare_admission(MtpBatchRequest request) {
         if(!engine_call_ || (paused_owner_ && !service_mode_)) throw std::logic_error("invalid admission mode");
         const auto free = std::find_if(slots_.begin(), slots_.end(), [](const auto& s) { return !s->active; });
@@ -1165,6 +1257,7 @@ private:
         // Exactly the single request's start: fresh target state and session, fresh predictor, no
         // deferred window rows, the request's sampler on the final prompt row and every later row.
         s.greedy.reset();
+        s.output_chain={};
         s.pending = {};
         s.runtime = std::make_shared<HipMtpRuntime>(s.native);
         s.parents->tiled.reset_state();
@@ -1178,10 +1271,11 @@ private:
         s.prefill = std::make_unique<TiledMtpPrompt>(s.request.prompt, model_, compiled_, s.parents->tiled, *s.session, *s.target,
             *s.runtime, qualified_, activated_, s.parents->resources, *s.dispatcher, s.held, s.request.sampler,
             s.request.constraint?HipMtpHostRowSelector{[state=s.request.constraint](auto row){return state->select(row);}}:HipMtpHostRowSelector{},
-            s.request.on_progress,false,true,true);
+            s.request.on_progress,false,true,true,batch_cert_context(s));
         static_cast<void>(m);
         ++stats_.admitted;
         s.order = stats_.admitted;
+        s.prefill->set_request_order(s.order);
         s.active = true;
         s.prefilling = true;
         stats_.max_active = std::max<std::uint64_t>(stats_.max_active, active());
@@ -1372,6 +1466,7 @@ private:
         }
         if(service_mode_ && boundary) throw std::logic_error("nested cancellation inside native unit");
         if(boundary) {
+            s.prefill->before_writer(nullptr);
             s.parents->tiled.block_owner->reset_cancelled_prefill();
             for(const auto& tail:s.parents->tiled.tails) tail.owner->reset_cancelled_prefill();
             if(s.parents->tiled.reset_prefill_memory) s.parents->tiled.reset_prefill_memory();
@@ -1602,13 +1697,15 @@ private:
             group_members.push_back({m.block.backend, m.slot->prefill->block_tokens(m.block), m.slot->prefill->position(), m.block.final,
                 m.slot->prefill->block_observer(m.block.rows)});
         std::vector<std::vector<float>> logits;
+        for(const auto& member:members)
+            member.slot->prefill->before_writer((lead.group?lead.group_owner:lead.block_owner)->producer_stream());
         const auto launch=[&]{logits=HipKnownPromptBackend::execute_group(group,group_members);};
         std::vector<Slot*> group_slots;for(const auto& member:members) group_slots.push_back(member.slot);
         if(worker_) execute_prefill(*(lead.group?lead.group_owner:lead.block_owner),launch,nullptr,group_slots);else launch();
         for (std::size_t k = 0; k < members.size(); ++k) {
             auto& s = *members[k].slot;
             try {
-                s.prefill->finish_block(members[k].block, logits[k], true);
+                s.prefill->finish_block(members[k].block, logits[k], true,(lead.group?lead.group_owner:lead.block_owner).get());
                 if(cancel_requested(s)) cancel_prefill(s,false);
                 else if (s.prefill->done()) complete_prompt(s);
             } catch(const serve::ConstraintError& e) {constraint_failed(s,e);}
@@ -1651,7 +1748,8 @@ private:
             members.push_back(s);
             requests.push_back({s->prefill->window_verifier(), &s->prefill->session(), s->prefill->window_tokens(rows)});
         }
-        auto tickets = HipMtpWindowVerifier::prompt_rows_cohort(requests);
+        for(auto* member:members) member->prefill->before_writer(nullptr);
+        auto tickets=HipMtpWindowVerifier::prompt_rows_cohort(requests);
         for (std::size_t k = 0; k < members.size(); ++k) {
             auto& s = *members[k];
             s.prefill->finish_window(std::move(tickets[k]),members.size()>1U);
@@ -1700,6 +1798,10 @@ private:
         }
         const std::array<std::uint32_t, 1> first{s.pending.predicted_token()};
         s.result.generated_tokens = 1;
+        if(options_.prefix_batch_cert && !s.request.constraint && prompt_terminal_digest_enabled()) {
+            s.output_chain.append(s.pending.terminal_logits_digest());
+            if(diagnostic_failed(s)) return;
+        }
         emitted(s, first);
     }
     void apply(Slot& s, HipMtpGreedyCycleResult result) {
@@ -1709,6 +1811,12 @@ private:
             s.result.generated_tokens+=result.emitted_tokens.size();
             if(!result.emitted_tokens.empty())s.request.on_tokens(result.emitted_tokens);
             constraint_failed(s,serve::ConstraintError(*result.selection_failure));return;
+        }
+        if(options_.prefix_batch_cert && !s.request.constraint && prompt_terminal_digest_enabled()) {
+            if(result.output_logits_digests.size()!=result.emitted_tokens.size())
+                s.output_chain.fail("request final incomplete output logits coverage");
+            for(const auto& row:result.output_logits_digests) s.output_chain.append(row);
+            if(diagnostic_failed(s)) return;
         }
         s.pending = result.final_target;
         ++s.result.cycles;
@@ -1747,11 +1855,43 @@ private:
             if(s.window && s.window->pending_window()) s.window->flush_pending_window();
             check_service(hipDeviceSynchronize(),"complete final committed state digest");
             s.result.final_state_position=s.session->next_position;
-            s.result.final_state_digest=model_content_identity_hex(s.parents->tiled.cache->state_digest(s.session->next_position));
+            s.result.final_state_digest=model_content_identity_hex((options_.prefix_batch_cert?s.parents->tiled.cache->state_digest(s.session->next_position,s.runtime->next_source_position()):
+                s.parents->tiled.cache->state_digest(s.session->next_position)));
             static const bool components=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST_COMPONENTS");return v&&v[0]=='1';}();
             if(components) s.result.final_state_components=s.parents->tiled.cache->component_digests(s.session->next_position);
         }
+        if(state_digest && options_.prefix_batch_cert && !s.request.constraint) {
+            s.output_chain.complete(s.result.generated_tokens);
+            if(!s.parents->tiled.cache) s.output_chain.fail("request final missing diagnostic state");
+            if(diagnostic_failed(s)) return;
+            const auto predictor=s.runtime->next_source_position();
+            const auto state=s.parents->tiled.cache->state_digest(s.session->next_position,predictor);
+            std::uint64_t fnv=14695981039346656037ULL;
+            for(const auto token:s.request.prompt) for(unsigned k=0;k<4;++k) {fnv^=(token>>(8U*k))&255U;fnv*=1099511628211ULL;}
+            std::ostringstream out;
+            out<<"request final: {\"request_order\":"<<s.order<<",\"prompt_tokens\":"<<s.request.prompt.size()
+               <<",\"prompt_fnv\":\""<<std::hex<<std::setw(16)<<std::setfill('0')<<fnv<<std::dec<<"\",\"generated_ids_count\":"<<s.result.generated_tokens
+               <<",\"output_logits_rows\":"<<s.output_chain.rows<<",\"output_logits_chain\":\""<<model_content_identity_hex(s.output_chain.digest)
+               <<"\",\"committed_tokens\":"<<s.session->committed_tokens<<",\"next_position\":"<<s.session->next_position
+               <<",\"predictor_frontier\":"<<predictor<<",\"pending_token\":"<<s.pending.predicted_token()
+               <<",\"generations_lineage_digest\":\""<<model_content_identity_hex(terminal_generations_lineage_digest(*s.session))
+               <<"\",\"state_digest\":\""<<model_content_identity_hex(state)<<"\"}";
+            std::cerr<<out.str()<<'\n';
+        }
         finish(s);
+    }
+    bool diagnostic_failed(Slot& s) {
+        if(!s.output_chain.error) return false;
+        // Diagnostic coverage is a request error, not an unhealthy model/engine.
+        // Never publish a partial chain as a successful qualification receipt.
+        s.result.finish="diagnostic_failure";
+        s.result.error=s.output_chain.error;
+        std::cerr<<"request final: {\"request_order\":"<<s.order
+                 <<",\"diagnostic_error\":\""<<s.output_chain.error
+                 <<"\",\"output_logits_rows\":"<<s.output_chain.rows
+                 <<",\"output_logits_chain\":null}\n";
+        finish(s);
+        return true;
     }
     void constraint_failed(Slot& s,const serve::ConstraintError& e) {
         s.result.finish="constraint_failure";s.result.error=e.what();
@@ -1762,8 +1902,10 @@ private:
         s.prefill.reset();s.prefilling=false;
         s.active = false;
         s.greedy.reset();
+        s.output_chain={};
         s.pending = {};
         ++stats_.finished;
+        if(options_.prefix_batch_cert && !options_.baseline) PrefixAsyncCapture::reap();
         if (publish_session_stats) publish_session_stats();
         else if (s.parents->tiled.cache && s.parents->tiled.cache->has_store()) options_.state_cache_stats->publish(prefix_snapshot(s.parents->tiled.cache->store()));
         if (s.request.on_finish) s.request.on_finish(s.result);
@@ -1826,6 +1968,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             try {PrefixAsyncCapture::shutdown();} catch(...) {std::terminate();}
         }
     } capture_shutdown;
+    set_prefix_batch_certification_enabled(options.prefix_batch_cert && !options.baseline);
     validate_resolved_mtp_cli(options);
     if(!options.mtp.enabled || !parents || session.next_position || session.committed_tokens ||
        session.health!=SerialSessionHealth::ready || session.execution_identity!=compiled.execution_identity)
@@ -2329,7 +2472,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-slot_begin).count());
                     return slot;
                 };
-                if (!named_run) install_restore(*slots.front());
+                if (!named_run || options.prefix_batch_cert) install_restore(*slots.front());
                 for(const auto& setup:parents->batch_slots) slots.push_back(prepare_slot(setup, slots.size()));
                 pending={};
                 if (!named_run) runtime.reset();
@@ -2379,7 +2522,14 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                     <<",\"cohort_window_rows\":"<<st.cohort.cohort_rows<<",\"cohort_solo_windows\":"<<st.cohort.solo_windows<<",\"cohort_chunks\":"<<st.cohort.cohort_chunks
                     <<",\"prompt_groups\":"<<st.prompt_groups<<",\"prompt_window_cohorts\":"<<st.prompt_window_cohorts
                     <<",\"prompt_window_members\":"<<st.prompt_window_members<<","<<batch_service_receipt(st)
-                    <<",\"calibration_rows\":"<<calibration_rows<<",\"calibration_ms\":"<<calibration_ms<<"}\n";
+                    <<",\"calibration_rows\":"<<calibration_rows<<",\"calibration_ms\":"<<calibration_ms;
+                if(options.prefix_batch_cert && !options.baseline && parents->tiled.cache && parents->tiled.cache->has_store()) {
+                    PrefixAsyncCapture::reap();
+                    const auto counters=parents->tiled.cache->store().counters();
+                    output<<",\"snapshot_preparations\":"<<counters.snapshot_preparations
+                          <<",\"staging_bytes\":"<<counters.staging_bytes;
+                }
+                output<<"}\n";
                 return;
             };
 
@@ -2683,7 +2833,14 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 parents->serve(ordinary_request,options.http_selection_mtp && window && window->policy_selection_admitted());
                 assets->validate_assets_unchanged();
                 output<<"{\"mode\":\"native-mtp-http-serve\",\"served_requests\":"<<served
-                    <<",\"calibration_rows\":"<<calibration_rows<<",\"calibration_ms\":"<<calibration_ms<<"}\n";
+                    <<",\"calibration_rows\":"<<calibration_rows<<",\"calibration_ms\":"<<calibration_ms;
+                if(options.prefix_batch_cert && !options.baseline && parents->tiled.cache && parents->tiled.cache->has_store()) {
+                    PrefixAsyncCapture::reap();
+                    const auto counters=parents->tiled.cache->store().counters();
+                    output<<",\"snapshot_preparations\":"<<counters.snapshot_preparations
+                          <<",\"staging_bytes\":"<<counters.staging_bytes;
+                }
+                output<<"}\n";
                 return;
             }
             pending=run_tiled_mtp_prompt(options.tokens,model,compiled,parents->tiled,session,*target,*runtime,qualified,activated,

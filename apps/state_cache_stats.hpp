@@ -1,6 +1,7 @@
 #pragma once
 #include "strix/state_cache_snapshot.hpp"
 #include "strix/serve/json.hpp"
+#include "strix/prompt_terminal_diagnostics.hpp"
 #include <atomic>
 #include <chrono>
 
@@ -27,6 +28,11 @@ inline serve::Json state_cache_json(const StateCacheSnapshotV1& s) {
     for(std::size_t i=0;i<prefix_certificate_decline_names.size();++i)
         declines.set(std::string(prefix_certificate_decline_names[i]),Json(s.prefix.certificate_declines[i]));
     prefix.set("certificate_declines",std::move(declines));
+    if(prefix_batch_certification_enabled()) {
+        STRIX_PREFIX(snapshot_preparations);
+        STRIX_PREFIX(capture_skips_tripwire);
+        STRIX_PREFIX(capture_skips_batch_config);
+    }
     STRIX_PREFIX(evicted); STRIX_PREFIX(rejected_over_budget);
     STRIX_PREFIX(evictions_space); STRIX_PREFIX(evictions_conversation_cap); STRIX_PREFIX(evictions_branch_cap);
     STRIX_PREFIX(evictions_explicit); STRIX_PREFIX(evictions_invalid);

@@ -321,9 +321,12 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         config.default_min_p = options.http_default_min_p;
         config.responses = options.http_responses;
         config.capabilities = options.http_capabilities;
-        config.capabilities_extra = [modes=session_modes_json(options)](serve::Json& out) {
+        auto cert=serve::Json::object();
+        prefix_batch_cert_capabilities(cert,options);
+        config.capabilities_extra = [modes=session_modes_json(options), cert=std::move(cert)](serve::Json& out) {
             qwen_rotary_capabilities(out);
             out.set("session_numerical_modes",modes);
+            for(const auto& [key,value]:cert.as_object()) out.set(key,value);
         };
         config.stream_receipts = options.http_stream_receipts;
         config.sse_keepalive_seconds = options.http_sse_keepalive;

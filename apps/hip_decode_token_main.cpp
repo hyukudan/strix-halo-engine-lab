@@ -1054,6 +1054,7 @@ int STRIX_DECODE_ENTRY(
             "  --session-ram-bytes N --session-max-parked N --session-dir DIR --session-disk-bytes N\n"
             "  --session-save DIR | --session-load DIR | --session-live-control [--session-then-prompt FILE] [--session-logits FILE]\n"
             "  --session-first-generate N (first turn only); --session-capture-host-bytes N (default 8 GiB); --session-validate-only (CPU preflight)\n"
+            "  --prefix-batch-cert 0|1|capture|l0|l1 (default 0; 1=l0; l1 capture-only until qualified)\n"
             "  --prefix-cache-staging-bytes N (0: one T-block plus fixed state; STRIX_PREFIX_CACHE_STAGING_BYTES)\n"
             "  --prefix-cache-host-bytes N [--prefix-cache-dir DIR [--prefix-cache-disk-bytes N]] [--prefix-cache-every N]\n"
             "      [--prefix-cache-then-prompt FILE ...] (block-boundary prefix state cache, tiled known-prefix prefill only)\n"
@@ -3021,7 +3022,7 @@ int STRIX_DECODE_ENTRY(
         const bool rtx_state_registry = session_cache_enabled || (!strix::decode_cli::prefix_state_cache_requested(options) &&
             strix::decode_cli::mtp_tiled_prompt(options) &&
                 (options.rtx_state_import || strix::decode_cli::rtx_state_export_request() ||
-                    strix::decode_cli::prompt_state_digest_request()));
+                    strix::decode_cli::prompt_state_digest_request(options.prefix_batch_cert)));
         if (strix::decode_cli::prefix_state_cache_requested(options) || rtx_state_registry) {
             if (!known_prefill_plan || !known_prefix_backend)
                 throw std::logic_error("prefix state cache reached a route other than the tiled known-prefix prefill");
@@ -3126,6 +3127,7 @@ int STRIX_DECODE_ENTRY(
                     options.rtx_state_import_decode_threads);
             tiled.reset_state = [&] {
                 check_hip(hipDeviceSynchronize(), "tiled MTP prompt reset fence");
+                if(prefix_state) prefix_state->before_target_reset();
                 strix::initialize_hip_fresh_runtime_memory(memory.scratch(), memory.state());
             };
             tiled.reset_prefill_memory = [known_prefix_memory,known_tail_memories] {
@@ -3320,8 +3322,9 @@ int STRIX_DECODE_ENTRY(
             tiled.prefill_execution_identity = compiled_prefill ? compiled_prefill->execution_identity : 0U;
             tiled.cache = stack.cache.get();
             tiled.cache_tails = prefix_store && prefix_cache_unit(options) < options.known_prefix_prefill_rows;
-            tiled.reset_state = [slot_memory = stack.memory] {
+            tiled.reset_state = [slot_memory = stack.memory,cache=stack.cache.get()] {
                 check_hip(hipDeviceSynchronize(), "batched MTP slot reset fence");
+                if(cache) cache->before_target_reset();
                 strix::initialize_hip_fresh_runtime_memory(slot_memory->scratch(), slot_memory->state());
             };
             tiled.reset_prefill_memory = [known_prefix_memory,known_tail_memories] {
@@ -3419,6 +3422,16 @@ int STRIX_DECODE_ENTRY(
             headroom = add(headroom, std::max(options.mtp.sidecar_retained_bytes, options.mtp.sidecar_setup_bytes));
             headroom = add(headroom, add(options.mtp.golden_max_bytes, options.mtp.replay_host_bytes));
             headroom = add(headroom, options.prefix_cache_host_bytes);
+            // UMA: K=1 device staging and pinned host payload share physical RAM.
+            // Reserve the peak once for initial sizing and the captured growth recheck.
+            if(options.prefix_batch_cert && prefix_state) {
+                // The bridge adds predictor rows and held hidden after this observation.
+                const auto predictor_row=add(mul(mul(model.kv_heads,model.head_dim),4U),mul(model.indexer_head_dim,2U));
+                const auto held=mul(mul(model.hidden_size,model.hc_count),2U);
+                const auto staging=strix::decode_cli::qwen_batch_staging_cap(options.prefix_cache_staging_bytes,
+                    prefix_state->row_bytes(),prefix_state->fixed_bytes(),predictor_row,held,options.known_prefix_prefill_rows);
+                headroom=add(headroom,staging);
+            }
             const auto before = observe();
             auto retained = estimate;
             auto capacity = resolve_http_slot_capacity(estimate, active, before.available, gtt_free(before), headroom, options.http_batch_cap);

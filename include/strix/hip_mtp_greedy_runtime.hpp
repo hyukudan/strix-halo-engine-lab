@@ -12,6 +12,7 @@ struct HipMtpGreedyCycleResult {
     std::vector<std::uint32_t> emitted_tokens;
     std::shared_ptr<MtpSelectionReceipt> selection_receipt;
     std::optional<std::string> selection_failure;
+    std::vector<std::optional<ModelContentIdentity>> output_logits_digests; // emitted rows, diagnostic only
     std::uint32_t proposed_candidates=0,accepted_candidates=0;
     std::uint64_t consumed_target_rows=0;
     bool eos=false,terminal_budget=false;

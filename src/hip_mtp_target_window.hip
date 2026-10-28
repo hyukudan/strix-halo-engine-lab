@@ -36,6 +36,7 @@ struct HipMtpTargetWindowBatch::Lease {
     std::optional<MtpSelectionPrefix> selection;
     bool completed=false,sealed=false;
     std::optional<ModelContentIdentity> terminal_digest;
+    std::vector<std::optional<ModelContentIdentity>> row_digests;
 };
 struct HipMtpTargetWindowCapture::Impl {
     std::shared_ptr<const void> actual_owner;
@@ -174,6 +175,14 @@ void HipMtpTargetWindowCapture::use_device_greedy(const HipGreedyRowsReply* repl
 void HipMtpTargetWindowCapture::completed_before_publish(){
     auto& i=*impl_;i.require_pool();require(i.active && std::all_of(i.active->recorded.begin(),i.active->recorded.end(),[](auto x){return x==1U;}),
         "MTP window completed without every wide snapshot");
+    // Snapshot every head before selection/promotion and any subsequent scratch reuse.
+    if(prefix_batch_certification_enabled() && prompt_terminal_digest_enabled()) {
+        std::vector<float> row;
+        for(const auto& view:i.logit_views) {
+            read_hip_logits_row(view,i.vocab,i.scope.stream,row);
+            i.active->row_digests.push_back(raw_fp32_logits_digest(row));
+        }
+    }
     if(i.transaction_selection) {
         require(!i.row_selection,"MTP selection callbacks are mutually exclusive");
         // The window stream already completed: the device replies are final (unvalidated here; a nonzero
@@ -208,7 +217,7 @@ void HipMtpTargetWindowCapture::completed_before_publish(){
         i.row_selection(i.logit_views,i.active->predictions);
         for(const auto token:i.active->predictions) require(token<i.vocab,"MTP sampled window selection is outside the vocabulary");
     }
-    if(prompt_terminal_digest_enabled()) {
+    if(!prefix_batch_certification_enabled() && prompt_terminal_digest_enabled()) {
         std::vector<float> row;
         read_hip_logits_row(i.logit_views.back(),i.vocab,i.scope.stream,row);
         i.active->terminal_digest=raw_fp32_logits_digest(row);
@@ -242,6 +251,7 @@ std::uint32_t HipMtpTargetWindowBatch::input_token(std::uint32_t row)const{requi
 std::uint32_t HipMtpTargetWindowBatch::predicted_token(std::uint32_t row)const{require(row<logical_rows() && (!lease_->selection || row<lease_->selection->decided_rows),"MTP batch row is undecided or out of bounds");return lease_->predictions[row];}
 std::optional<ModelContentIdentity> HipMtpTargetWindowBatch::terminal_logits_digest(std::uint32_t row)const {
     require(row<logical_rows(),"MTP batch row is out of bounds");
+    if(!lease_->row_digests.empty()) return row<lease_->row_digests.size()?lease_->row_digests[row]:std::nullopt;
     return row+1U==logical_rows()?lease_->terminal_digest:std::nullopt;
 }
 MtpDeviceView HipMtpTargetWindowBatch::view(std::uint32_t row)const{require(row<logical_rows(),"MTP batch row is out of bounds");lease_->capture->impl_->require_pool();return lease_->capture->impl_->snapshots[row];}

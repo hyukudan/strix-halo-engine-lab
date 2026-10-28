@@ -124,6 +124,7 @@ add_library(strix_core STATIC
     src/model_manifest.cpp
     src/model_runtime_binding.cpp
     src/model_content_hash.cpp
+    src/prompt_terminal_diagnostics.cpp
     src/model_family_registry.cpp
 )
 else()
@@ -234,6 +235,7 @@ add_library(strix_core STATIC
     src/memory_plan.cpp
     src/model_contract.cpp
     src/model_content_hash.cpp
+    src/prompt_terminal_diagnostics.cpp
     src/mtp_draft_binding.cpp
     src/mtp_draft_contract.cpp
     src/mtp_draft_qualification.cpp

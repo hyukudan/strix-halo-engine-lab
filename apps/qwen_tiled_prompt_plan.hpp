@@ -1,6 +1,8 @@
 #pragma once
 #include "strix/known_prefill_limits.hpp"
 #include <array>
+#include <bit>
+#include <string>
 #include <optional>
 #include <stdexcept>
 #include <vector>
@@ -187,5 +189,89 @@ inline std::vector<std::uint64_t> qwen_full_t_certificate(const QwenTiledPlanCon
 inline bool qwen_capture_boundary(std::uint64_t p,std::uint64_t n,std::uint32_t grid,
     bool complete,bool pending,bool certified) {
     return p && p<n && grid && p%grid==0 && complete && !pending && certified;
+}
+
+// Batch certificates describe executed units; a replay alone never authorizes capture.
+inline bool qwen_batch_nest_possible(bool worker,std::uint64_t limit,std::uint32_t t,std::uint64_t remaining) {
+    return worker && limit && t==8192 && remaining && remaining<t && remaining<=limit;
+}
+inline std::uint64_t qwen_batch_staging_cap(std::uint64_t explicit_cap,std::uint64_t target_row,
+    std::uint64_t target_fixed,std::uint64_t predictor_row,std::uint64_t held,std::uint64_t t) {
+    if(explicit_cap) return explicit_cap;
+    const auto add=[](std::uint64_t a,std::uint64_t b) {
+        if(b>UINT64_MAX-a) throw std::overflow_error("batch staging reservation overflow");
+        return a+b;
+    };
+    const auto row=add(target_row,predictor_row);
+    if(t && row>UINT64_MAX/t) throw std::overflow_error("batch staging reservation overflow");
+    return add(row*t,add(target_fixed,add(held,255U)&~std::uint64_t{255}));
+}
+struct QwenUnitExec {
+    std::uint64_t begin=0,end=0;
+    std::uint32_t rows=0;
+    bool t_owner=false,own_owner=false,grouped=false,small=false,forced=false,adopted=false;
+    std::uint64_t exec_class() const {return forced?5U:small?3U:grouped?2U:!t_owner?0U:!own_owner?4U:1U;}
+};
+struct QwenBatchConfig {
+    bool groups=true,group_owner=false,small=false,windows=true,cohort=true,service=false,cancel=false;
+    std::uint64_t group_rows=UINT32_MAX,nest_rows=0;
+    double service_ms=250.0,prompt_share=0.0;
+    std::uint64_t lookahead=2,short_rows=2048;
+    bool interleave=true;
+    std::string shared="hc,router,moe,elementwise";
+    const char* decline(std::uint32_t schedule) const {
+        return small?"small":group_owner?"group-owner:prompt-batch-rows":(schedule&2U)?"sched-bit-2":"";
+    }
+    bool allowed(std::uint32_t schedule) const {return !decline(schedule)[0];}
+    std::vector<std::uint64_t> frame() const {
+        std::vector<std::uint64_t> result{groups,group_rows,group_owner,small,windows,cohort,service,cancel,nest_rows,
+            std::bit_cast<std::uint64_t>(service_ms),lookahead,std::bit_cast<std::uint64_t>(prompt_share),short_rows,interleave,shared.size()};
+        for(const unsigned char c:shared) result.push_back(c);
+        return result;
+    }
+};
+inline bool qwen_batch_capture_eligible(const QwenBatchConfig& config,std::uint32_t schedule,
+    const QwenUnitExec& unit,std::uint32_t t,bool trace_ok,bool next_t,std::uint32_t next_rows,bool nest_possible) {
+    return config.allowed(schedule) && trace_ok && unit.t_owner && unit.own_owner && unit.rows==t &&
+        !unit.grouped && !unit.small && !unit.forced && !unit.adopted && next_t &&
+        next_rows>0 && next_rows<=t && (next_rows==t || !nest_possible);
+}
+inline bool qwen_producer_trace_ok(const QwenTiledPlanConfig& config,std::uint64_t n,std::uint64_t p,
+    const std::vector<QwenUnitExec>& trace) {
+    QwenPlanCursor cursor;std::uint64_t pos=0;
+    for(const auto& actual:trace) {
+        if(actual.begin>=p) break;
+        const auto expected=qwen_tiled_next(config,cursor,pos,n);
+        if(!expected || actual.begin!=pos || actual.end!=expected->end || actual.end>p ||
+            !actual.t_owner || !actual.own_owner || actual.rows!=config.rows || actual.exec_class()!=1 ||
+            actual.adopted || expected->balanced || expected->merged || expected->final) return false;
+        pos=actual.end;
+    }
+    return pos==p && qwen_full_t_continuation(config,n,p).has_value();
+}
+inline std::vector<std::uint64_t> qwen_full_t_certificate_v2(const QwenTiledPlanConfig& config,
+    std::uint64_t n,std::uint64_t p,std::uint64_t route=2,std::uint64_t exec_class=1) {
+    auto proof=qwen_full_t_certificate(config,n,p);
+    if(proof.empty() || exec_class!=1 || (route!=1 && route!=2)) return {};
+    std::vector<std::uint64_t> result{0x5146554c4c5432ULL,route,config.rows,config.priming}; // QFULLT2
+    std::size_t at=3;
+    for(std::uint64_t pos=0;pos<p;pos+=config.rows,at+=7) {
+        result.insert(result.end(),proof.begin()+static_cast<std::ptrdiff_t>(at),proof.begin()+static_cast<std::ptrdiff_t>(at+7));
+        result.push_back(exec_class);
+    }
+    result.insert(result.end(),proof.begin()+static_cast<std::ptrdiff_t>(at),proof.end());
+    return result;
+}
+inline bool qwen_suffix_solo_class(const QwenTiledPlanConfig& config,std::uint64_t n,std::uint64_t p,
+    const QwenBatchConfig& batch,bool nesting_possible) {
+    if(!batch.allowed(config.schedule) || nesting_possible) return false;
+    auto cursor=qwen_full_t_continuation(config,n,p);
+    if(!cursor) return false;
+    while(const auto unit=qwen_prompt_next(config,*cursor,p,n,batch.windows)) {
+        if((unit->kind==QwenPlanKind::tail_owner && batch.groups) ||
+            (unit->kind==QwenPlanKind::window && batch.cohort)) return false;
+        p=unit->end;
+    }
+    return p==n;
 }
 } // namespace strix::decode_cli

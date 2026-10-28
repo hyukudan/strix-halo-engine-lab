@@ -84,7 +84,7 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_QSA_DECODE_SELECT", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_POOL_CHECK",
             "STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA",
             "STRIX_SESSION_CACHE", "STRIX_SESSION_DISK", "XDG_CACHE_HOME", "HOME",
-            "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION"})
+            "STRIX_PREFIX_BATCH_CERT", "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION"})
         if (!(qpf2k::pre_injected_moe_marker && std::string_view(name) == "STRIX_QPF2K_MOE_DEFAULTED"))
             if (const char* value = get(name)) env.emplace(name, value);
     return env;
@@ -524,6 +524,26 @@ inline void resolve_session_defaults(Options& o, const ModelContract& model,
 inline constexpr SessionRouteQualification prefix_auto_route_qualifications[] = {
     {"http-target", false}, {"http-mtp-fixed", false}, {"http-mtp-batch", false}
 };
+inline const char* prefix_batch_cert_mode_name(const Options& o) {
+    return o.prefix_batch_cert==1?"l0":o.prefix_batch_cert==2?"capture":"l1";
+}
+inline bool prefix_batch_cert_active(const Options& o) {
+    return o.prefix_batch_cert && !o.baseline && ordinary_http_batch_slots(o) &&
+        o.prefix_cache && o.prefix_cache_host_bytes;
+}
+inline void prefix_batch_cert_capabilities(serve::Json& out, const Options& o) {
+    if (!prefix_batch_cert_active(o)) return;
+    serve::Json cert=serve::Json::object();
+    cert.set("mode",serve::Json(prefix_batch_cert_mode_name(o)));
+    cert.set("experimental",serve::Json(true));
+    cert.set("l1_qualified",serve::Json(false));
+    cert.set("automatic_qualified",serve::Json(false));
+    out.set("prefix_batch_certification",std::move(cert));
+}
+// Separate from cache-budget admission: Round 1 permits strict L0 restores only.
+inline constexpr SessionRouteQualification prefix_batch_cert_route_qualifications[] = {
+    {"http-mtp-batch-certified-l1", false}
+};
 inline void resolve_prefix_defaults(Options& o, const ModelContract& model,
     const Environment& env, std::optional<std::uint64_t> available,
     std::span<const SessionRouteQualification> qualifications = prefix_auto_route_qualifications) {
@@ -786,6 +806,10 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     prefix.set("reason",serve::Json(o.prefix_cache_reason));
     prefix.set("serial_certificate",serve::Json("full-t-v1; whole-prompt-cursor; synchronous-snapshot"));
     prefix.set("serial_declines",serve::Json("serial-async-capture-unsupported,serial-lookup-disabled-or-short,serial-certificate-missing-or-incompatible,serial-plan-unsupported,serial-no-certified-checkpoint,serial-producer-plan-mismatch,serial-cursor-continuation-unsupported,serial-checkpoint-preflight,serial-capture-unit-unsupported,serial-capture-boundary-unsupported,serial-capture-metadata-mismatch"));
+    if(prefix_batch_cert_active(o)) {
+        prefix.set("batch_cert_mode",serve::Json(prefix_batch_cert_mode_name(o)));
+        prefix.set("batch_l1_qualified",serve::Json(false));
+    }
     if (!o.baseline) out << "\"prefix_cache\":" << prefix.dump() << ",";
     out << "\"session_cache\":" << session.dump() << ",\"http_slots\":{";
     out << "\"mode\":\"" << (o.http_batch_explicit ? (o.http_batch_cap ? "cap" : "single") : "auto")

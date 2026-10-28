@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/dispatch_resources.hpp"
+#include "strix/prompt_terminal_diagnostics.hpp"
 #include "strix/hip_generation_output.hpp"
 #include "strix/hip_known_prefix_window.hpp"
 #include "strix/hip_launch_context.hpp"
@@ -181,12 +182,15 @@ public:
                     throw std::logic_error("MTP wide forward logit wide_rows differ from the all-wide_rows policy");
             const auto device_tokens=select_rows(result.logits,wide_rows);
             std::vector<std::uint32_t> emitted;
+            const bool digest=prefix_batch_certification_enabled() && prompt_terminal_digest_enabled();
+            std::vector<std::optional<ModelContentIdentity>> row_digests;
             for(std::uint32_t r=0;r<wide_rows;++r) {
                 // Host logits: the diagnostics sink, the non-finite fallback, and the adopted last row.
-                if(row_logits_ || !device_tokens || r+1U==wide_rows) {
+                if(digest || row_logits_ || !device_tokens || r+1U==wide_rows) {
                     check(hipMemcpy(logits_.data(),reinterpret_cast<const void*>(result.logits[r].address),
                         static_cast<std::size_t>(vocab_*sizeof(float)),hipMemcpyDeviceToHost),"MTP wide row logits");
                     if(row_logits_) row_logits_(r,logits_);
+                    if(digest) row_digests.push_back(raw_fp32_logits_digest(logits_));
                 }
                 if(device_tokens) {
                     if(row_logits_ && select_greedy_token(logits_,vocab_)!=(*device_tokens)[r])
@@ -219,6 +223,7 @@ public:
             verifier->skip_cycle_sample();
             auto out=greedy.finish_wide_cycle(initial,std::move(final_target),views,
                 std::span<const std::uint32_t>(inputs).first(n),std::move(emitted),wide_rows-1U,wide_rows,budget,eos);
+            out.output_logits_digests=std::move(row_digests);
             host_phase_mark("w5 predictor prime+finish");
             ++size_stats.cycles;size_stats.rows_accepted+=out.accepted_candidates;
             size_stats.ms_committed+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();

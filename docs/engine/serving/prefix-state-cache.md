@@ -168,7 +168,8 @@ keeps the existing poison/quarantine behavior.
 Capture requires an actual incumbent boundary, 0<P<n, P divisible by the
 segment grid, certified ready target metadata and successful target completion
 validation. It never creates a numerical unit or forces synchronous priming.
-Batch/group/SMALL, named-session suffixes and imported/exported state remain outside
+Batch certification is a separate experimental opt-in described below. Grouped/SMALL
+producer prefixes, named-session suffixes and imported/exported state remain outside
 the certified subset. Deferred target validations still pending at the boundary skip.
 
 A process-wide slot admits at most one asynchronous snapshot descriptor. Admission
@@ -387,10 +388,83 @@ The full prompt runs from position zero through the existing policy selector and
 admitted MTP verification route; cache certificates do not yet qualify that
 composition. Named sessions continue to refuse policy requests before submission.
 
-The canonical effective-execution signature is version 3. It binds resolved rotary mode,
+The canonical effective-execution signature is version 4. It binds resolved rotary mode,
 factor, original and effective maximum context, and the complete rotary identity (including
 mathematical descriptor and coefficient-table SHA-256). Prefix namespaces and producer
 certificates use this signature; session envelope compatibility uses the same versioned
 rotary frame. Cross-rotary prefix lookups miss and session loads refuse with
 `session compatibility mismatch`. YaRN with session save/restore or prefix state caching
 is currently refused by name; this binding does not qualify those combinations.
+
+### Experimental batch certification
+
+Batch prefix certification defaults off. `STRIX_PREFIX_BATCH_CERT=1` or
+`--prefix-batch-cert l0` enables strict diagnostic L0 capture/restore; `0` disables
+it. CLI wins over the environment, and `--baseline` disables it. `capture` collects
+certified checkpoints without restoring. `l1` currently also captures only: the
+separate batch L1 qualification row remains false. An explicit RAM budget is still
+required while automatic prefix-budget qualification is false.
+
+On the batch HTTP route with the prefix cache enabled and a resolved host budget,
+`GET /v1/capabilities` includes `prefix_batch_certification` only when this opt-in
+is enabled. Its `mode` is `l0`, `capture` or `l1`, matching effective config's
+`prefix_cache.batch_cert_mode`; `experimental` is true, and `l1_qualified` and
+`automatic_qualified` are false. Inactive routes omit these certification fields.
+
+Under the opt-in, `snapshot_preparations` counts snapshot preparations after the
+no-store check; it is monotonic, so a no-store request must not increase it.
+`GET /v1/cache/stats` exposes it in `prefix`, alongside the existing `staging_bytes`
+gauge for live snapshot staging. Prompt receipts with `STRIX_PREFIX_CACHE_DIGEST=1`
+include both fields in `capture_counters_global`; end-of-run cache receipts also
+include `snapshot_preparations` and `staging_bytes` under the certification opt-in.
+Stats are published snapshots: staging may still be in flight when observed.
+These diagnostic additions do not appear with certification off; the existing
+stats staging gauge remains available independently.
+
+The batch RAM namespace includes the route and prompt-group, SMALL, window/cohort,
+service duration/lookahead, prompt share, short-first threshold, interleave, shared
+families, cancellation, nesting and deferred-headless settings. Slot numbers and
+arrival order are excluded, allowing reuse across slots. `QFULLT2` certificates
+bind the canonical v4 effective-execution signature, scheduler namespace, route
+and each unit's execution class. Capture requires an observed,
+complete trace of solo full-T units on that slot's own T backend/owner, matching
+the whole-prompt replay. A restored request cannot publish a derived batch
+checkpoint in this round because its omitted producer units were not executed
+in that request. Single-route certificates and segments never mix with batch.
+
+A group owner created by `STRIX_PROMPT_BATCH_ROWS > T` declines even when
+`STRIX_PROMPT_BATCH=0`; the receipt names `group-owner:prompt-batch-rows`.
+SMALL, a separate group owner, schedule bit 2, state import/export and resumed
+sessions decline certification. The next writer must be the same T owner/stream:
+a full-T unit, or a partial T unit with nesting ruled out. The nesting check
+conservatively treats every active 8192-row nesting configuration as possible,
+including profiles/ladders that might themselves decline nesting. No producer
+wait is added. A foreign-stream writer observed before the target snapshot event
+completes permanently poisons that snapshot; `capture_skips_tripwire` counts these
+incidents. The qualification gate requires zero. Configuration declines increment
+`capture_skips_batch_config`.
+
+Restore is always a miss during service-mode admissions. L0 additionally refuses
+any suffix that could share tail units or windows under the active configuration,
+and refuses possible nesting. It installs the preflighted whole-prompt cold
+cursor. For broader diagnostic coverage, explicitly set `STRIX_PROMPT_BATCH=0
+STRIX_PROMPT_WINDOW_COHORT=0 STRIX_BATCH_NEST_ROWS=0` in both comparison arms.
+The cache does not alter these scheduler settings itself. Batch equivalence and
+native exactness remain unqualified; this opt-in is not a production contract.
+
+With batch certification enabled and `STRIX_PREFIX_CACHE_DIGEST=1`, prompt receipts include an execution trace,
+submission order, omitted full-T units, continuation cursor and configuration
+refusal reason. Window deferred rows are flushed before the prompt state hash.
+`request final:` reports `request_order`, `generated_ids_count`,
+`output_logits_rows`, `output_logits_chain`, `committed_tokens`, `next_position`,
+`predictor_frontier`, `pending_token`, `generations_lineage_digest` and
+`state_digest`, plus prompt length and FNV identity. The logits chain uses
+`H0=SHA256(empty)` and `Hn=SHA256(H(n-1) || SHA256(raw FP32 vocabulary row n))`
+over every emitted output row. Missing coverage fails closed. The final hash
+reads the actual predictor frontier without replay or normalization. Diagnostic
+readbacks/fences affect timing; performance runs must disable them.
+
+Slot-capacity sizing and lazy growth reserve the K=1 staging cap once, alongside
+the retained host budget. This is a peak reservation, not proof of aggregate UMA
+fit. Native per-request logits/state equality, race/lifetime and complete-workload
+gates remain required before any automatic enablement.
