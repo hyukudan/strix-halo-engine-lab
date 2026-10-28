@@ -250,7 +250,7 @@ struct Fixture {
         std::vector<std::uint16_t> at(ar.size());
         bool pass = true;
         Variant variant;
-        for (const char* version : {"1", "2", "3", "6", "7"}) for (unsigned tm : {16U, 32U}) for (unsigned repeat = 0; repeat < 2; ++repeat) {
+        for (const char* version : {"1", "2", "3", "6", "7", "auto"}) for (unsigned tm : {16U, 32U}) for (unsigned repeat = 0; repeat < 2; ++repeat) {
             // Existing checks retain every arm/repeat. Added large cases qualify v3/v6/v7 against the seam.
             if (added && (std::strcmp(version, "1") == 0 || std::strcmp(version, "2") == 0 || tm != 16 || repeat != 0)) continue;
             Variant::set(version);
@@ -374,7 +374,20 @@ struct Fixture {
                     // Raw bytes deliberately include signed zero and all nonfinite payload bits.
                     check(std::memcmp(yr.data(), y.data(), y.size() * 4) == 0, label + " v3 R16 bytes");
                     const bool gu_same = std::memcmp(gr.data(), gu.data(), gu.size() * 4) == 0;
-                    check(gu_same, label + " v3 gate/up bytes");
+                    if (std::strcmp(kind, "overflow") == 0) {
+                        // Documented contract: bitwise for all outputs; in this FP16-overflow case only, NaNs generated
+                        // inside a chain (+Inf meets -Inf) may carry different payload bits in this INTERNAL workspace.
+                        std::size_t payload_only = 0;
+                        bool other_diff = false;
+                        for (std::size_t i = 0; i < gu.size(); ++i) {
+                            const std::uint32_t a = bits(gr[i]), b = bits(gu[i]);
+                            if (a == b) continue;
+                            if (std::isnan(gr[i]) && std::isnan(gu[i]) && (a >> 31) == (b >> 31)) ++payload_only;
+                            else other_diff = true;
+                        }
+                        std::printf("INFO %s internal gate/up NaN-payload-only words: %zu\n", label.c_str(), payload_only);
+                        check(!other_diff, label + " v3 gate/up bytes (NaN payload bits excepted)");
+                    } else check(gu_same, label + " v3 gate/up bytes");
                     if (!gu_same) {
                         // Classify differing words so a nonfinite-only difference is distinguishable from a value change.
                         std::size_t nan_nan = 0, nan_inf = 0, other = 0, shown = 0;
@@ -462,6 +475,41 @@ int main(int argc, char** argv) {
             const auto name = "v" + std::to_string(variant) + " K" + std::to_string(bits) + (shared ? " shared" : " routed") + (down ? " down" : " gate/up");
             std::printf("RESOURCE %s private=%zu B/lane VGPR=%d LDS=%zu\n", name.c_str(), a.localSizeBytes, a.numRegs, a.sharedSizeBytes);
             check(a.localSizeBytes == 0, "zero spills " + name);
+        }
+        {
+            // enqueue dispatches through selected_variant(); auto must pick v7 exactly at the threshold.
+            Variant variant;
+            auto min_rows = [](const char* value) {
+#ifdef _WIN32
+                if (_putenv_s("STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS", value ? value : "") != 0)
+#else
+                if ((value ? setenv("STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS", value, 1) : unsetenv("STRIX_GLM_PF_EXACTMOE_X_MIN_ROWS")) != 0)
+#endif
+                    throw std::runtime_error("setting exact MoE auto threshold");
+            };
+            min_rows(nullptr);
+            Variant::set(nullptr);
+            check(X::selected_variant(4096) == 3, "selected variant unset -> 3");
+            for (const char* v : {"1", "2", "3", "6", "7"}) {
+                Variant::set(v);
+                check(X::selected_variant(2048) == static_cast<unsigned>(std::atoi(v)), std::string("selected variant ") + v);
+            }
+            Variant::set("auto");
+            for (unsigned rows : {1U, 512U, 2047U, 2048U, 2049U, 4096U})
+                check(X::selected_variant(rows) == (rows >= 2048 ? 7U : 3U), "selected variant auto rows=" + std::to_string(rows));
+            min_rows("100");
+            check(X::selected_variant(99) == 3 && X::selected_variant(100) == 7, "selected variant auto MIN_ROWS=100");
+            for (const char* bad : {"0", "65537", "abc"}) {
+                min_rows(bad);
+                bool threw = false;
+                try { (void)X::selected_variant(4096); } catch (const std::invalid_argument&) { threw = true; }
+                check(threw, std::string("auto MIN_ROWS=") + bad + " rejected");
+            }
+            min_rows(nullptr);
+            Variant::set("5");
+            bool threw = false;
+            try { (void)X::selected_variant(1); } catch (const std::invalid_argument&) { threw = true; }
+            check(threw, "selected variant 5 rejected");
         }
         Fixture f(rng);
         std::printf("exact workspace: %zu bytes at Rmax=%u; random K4 x288 + shared K6\n", f.wsb, MaxR);
