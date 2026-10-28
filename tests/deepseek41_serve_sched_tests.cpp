@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <map>
+#include "strix/serve/engine.hpp"
 #include <string>
 #include <vector>
 
@@ -20,6 +22,130 @@ void expect(bool ok, const std::string& what) {
         std::fprintf(stderr, "FAIL: %s\n", what.c_str());
         ++failures;
     }
+}
+
+void service_options() {
+    std::map<std::string, std::string> env;
+    const auto options = [&] { return sc::options_from(true, [&](const char* k) { return env[k]; }); };
+    auto o = options();
+    expect(sc::row_budget(o, true) == UINT32_MAX, "fine service keeps ordinary piece endpoints");
+    expect(sc::unit_budget(o, [](double ms) { return ms == 250.0 ? 2U : 0U; }) == 2U, "lead predicts default service units");
+    expect(sc::unit_budget(o, [](double) { return 0U; }) == 1U, "cold service makes progress");
+    expect(o.resumable() && o.target_ms() == 250.0 && o.short_first, "default fine service, including idle");
+    env["STRIX_DS41_SERVE_SERVICE_MS"] = "0";
+    o = options();
+    expect(!o.resumable() && sc::row_budget(o, true) == UINT32_MAX, "zero service restores idle whole pieces");
+    expect(sc::row_budget(o, false) == 256U, "zero service retains rows beside decoders");
+    env["STRIX_DS41_SERVE_SERVICE_MS"] = "250";
+    env["STRIX_DS41_SERVE_SCHED_UNIT_ROWS"] = "128";
+    expect(!options().resumable() && sc::row_budget(options(), true) == 128U, "explicit rows override idle shortcut and service");
+    env["STRIX_DS41_SERVE_SCHED_UNIT_BUDGET"] = "3";
+    expect(options().unit_budget == 3 && options().resumable(), "fixed budget overrides rows");
+    expect(sc::unit_budget(options(), [](double) { return 99U; }) == 3U, "fixed units bypass prediction");
+    env["STRIX_DS41_SERVE_SCHED_UNIT_MS"] = "12";
+    expect(options().target_ms() == 12.0 && options().unit_budget == 0, "legacy ms overrides fixed budget");
+    env["STRIX_DS41_SERVE_SCHED_UNIT_MS"] = "0";
+    expect(options().resumable() && options().unit_budget == 3U, "zero legacy ms preserves fixed budget");
+    expect(sc::unit_budget(options(), [](double) { return 99U; }) == 3U, "zero legacy ms uses fixed units");
+    env["STRIX_DS41_SERVE_SCHED_UNIT_BUDGET"] = "0";
+    expect(!options().resumable() && sc::row_budget(options(), true) == 128U, "zero legacy ms and budget use explicit rows");
+    for (const auto* v : {"nan", "inf", "-1", "1e999", "250x"}) {
+        env["STRIX_DS41_SERVE_SERVICE_MS"] = v;
+        bool rejected = false;
+        try { (void)options(); } catch (const std::exception&) { rejected = true; }
+        expect(rejected, "invalid service target rejected");
+    }
+}
+
+void short_first() {
+    struct Entry { unsigned rows, skips = 0; };
+    std::vector<Entry> pending{{100}, {20}, {20}};
+    const auto choose = [&](bool enabled) {
+        return strix::serve::select_waiting(pending, enabled, [](const auto& e) { return e.rows; },
+            [](auto& e) -> unsigned& { return e.skips; });
+    };
+    expect(choose(false) == 0, "FIFO off switch");
+    expect(choose(true) == 1, "shortest first and FIFO ties");
+    for (unsigned i = 1; i < 8; ++i) expect(choose(true) == 1, "short work can overtake");
+    expect(choose(true) == 0, "eight overtakes bound long request starvation");
+
+    strix::serve::GenerationQueue queue;
+    strix::serve::GenerationJob long_job, short_job;
+    long_job.prompt.resize(100); short_job.prompt.resize(10);
+    auto long_ticket = queue.submit(std::move(long_job));
+    auto short_ticket = queue.submit(std::move(short_job));
+    auto first = queue.take(false, true);
+    expect(first && first->ticket == short_ticket, "queue uses shortest admission");
+    expect(queue.snapshot().queued == 1 && queue.snapshot().running == 1, "reordered pool accounting");
+    queue.finish(*first, {});
+    auto second = queue.take(false, true);
+    expect(second && second->ticket == long_ticket, "older owner preserved");
+    queue.finish(*second, {});
+    strix::serve::GenerationJob older;
+    older.prompt.resize(100);
+    auto older_ticket = queue.submit(std::move(older));
+    for (unsigned i = 0; i < 9; ++i) {
+        strix::serve::GenerationJob newcomer;
+        newcomer.prompt.resize(10);
+        auto newcomer_ticket = queue.submit(std::move(newcomer));
+        auto picked = queue.take(false, true);
+        expect(picked && picked->ticket == (i < 8 ? newcomer_ticket : older_ticket), "queue bounded overtaking with continuous arrivals");
+        queue.finish(*picked, {});
+    }
+    auto last = queue.take(false, false);
+    expect(last.has_value(), "unselected arrival remains queued");
+    queue.finish(*last, {});
+    expect(queue.snapshot().queued == 0 && queue.snapshot().running == 0, "all reordered tickets finished once");
+}
+
+void control_trace() {
+    const sc::UnitCompletion boundary{false, 256U, 3U};
+    expect(boundary == sc::UnitCompletion{false, 256U, 3U}, "matching unit completion");
+    expect(!(boundary == sc::UnitCompletion{true, 256U, 3U}), "done mismatch rejected");
+    expect(!(boundary == sc::UnitCompletion{false, 512U, 3U}), "row mismatch rejected");
+    expect(!(boundary == sc::UnitCompletion{false, 256U, 4U}), "within-piece position mismatch rejected");
+    struct FakeTask {
+        unsigned units = 0, cancels = 0;
+        bool valid = true, owned = true;
+        std::vector<std::string> trace;
+        bool step(unsigned, unsigned budget) {
+            units += budget;
+            if (units >= 6) owned = false;
+            return !owned;
+        }
+        void cancel() { ++cancels; owned = false; valid = false; }
+        sc::UnitResult receive(unsigned budget, bool abort) {
+            trace.push_back(abort ? "abort" : "unit");
+            const auto result = sc::apply_unit(*this, 256, budget, abort);
+            if (!abort) trace.push_back("ack");
+            return result;
+        }
+    } lead, follower;
+    const auto tick = [&](unsigned budget, bool abort) {
+        const auto a = lead.receive(budget, abort);
+        const auto b = follower.receive(budget, abort);
+        expect(a == b && lead.units == follower.units && lead.valid == follower.valid, "both ranks obey identical control");
+        expect(lead.trace == follower.trace, "both ranks exchange identical unit and ack traces");
+    };
+    sc::Options service;
+    tick(sc::unit_budget(service, [](double) { return 1U; }), false);
+    // Idle prompt returns to the scheduler before completion; the arrival is visible now.
+    expect(lead.units == 1, "idle arrival polled before full piece");
+    tick(2, false);
+    tick(99, true);  // an abort must never execute the supplied budget
+    expect(lead.units == 3 && lead.cancels == 1 && !lead.valid && !lead.owned, "abort releases at boundary without settling");
+    expect(lead.trace == std::vector<std::string>{"unit", "ack", "unit", "ack", "abort"}, "idle and normal units ack once; abort has no ack");
+    lead = {}; follower = {};  // fresh task after slot reuse
+    tick(6, false);
+    expect(lead.units == 6 && follower.units == 6 && !lead.owned && !follower.owned, "completion agrees after reuse");
+    expect(lead.trace == std::vector<std::string>{"unit", "ack"}, "final unit acks once");
+    lead = {}; follower = {};
+    tick(99, true);
+    expect(lead.units == 0 && lead.cancels == 1, "immediate abort does not begin work");
+    expect(lead.trace == std::vector<std::string>{"abort"}, "immediate abort has no ack");
+    lead = {}; follower = {};  // whole-cache hit: begin completes without a unit command
+    lead.owned = false; follower.owned = false;
+    expect(lead.trace.empty() && follower.trace.empty(), "whole-cache hit exchanges no unit or ack on either rank");
 }
 
 void admission() {
@@ -96,6 +222,9 @@ void identities() {
 }
 
 int main() {
+    service_options();
+    short_first();
+    control_trace();
     admission();
     modes();
     identities();

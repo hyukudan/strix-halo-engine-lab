@@ -300,7 +300,8 @@ public:
     // Batching engines, which decode several jobs at once and take new ones between steps instead of
     // run(): the oldest job that is not cancelled, waiting for one when `wait` (nullopt when none is
     // queued, or after shutdown). Jobs cancelled while queued are finished here.
-    std::optional<TakenJob> take(bool wait);
+    // short_first selects stable shortest prompts with at most eight overtakes of older work.
+    std::optional<TakenJob> take(bool wait, bool short_first = false);
     [[nodiscard]] bool has_queued_work() const;
     // The end of a taken job: fills queue_ms, updates the totals and finishes its ticket.
     // Engines may call it inside their own timed regions (a batching runner that times a prompt unit and completes a
@@ -318,7 +319,7 @@ private:
     static bool still_observed(GenerationTicket& ticket) noexcept;
     static ObserveDelta observe_delta(const GenerationStats& stats, const std::string& error) noexcept;
     void observe_locked(const ObserveDelta& d) noexcept;
-    struct Entry { GenerationJob job; std::shared_ptr<GenerationTicket> ticket; std::chrono::steady_clock::time_point submitted; };
+    struct Entry { GenerationJob job; std::shared_ptr<GenerationTicket> ticket; std::chrono::steady_clock::time_point submitted; std::uint32_t overtakes = 0; };
     mutable std::mutex mutex_;
     std::condition_variable ready_;
     std::deque<Entry> entries_;

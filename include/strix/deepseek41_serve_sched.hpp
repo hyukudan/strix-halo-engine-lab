@@ -1,6 +1,9 @@
 #pragma once
 
+#include "strix/serve/short_first.hpp"
+
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <span>
@@ -10,7 +13,7 @@
 
 // Decode-priority scheduling of the two-rank serve (strix-deepseek41-serve, --prefill-path device), STRIX_DS41_SERVE_SCHED:
 //
-//   off (unset, default): an admitted prompt's device prefill runs at once and the decoding requests wait for all of it.
+//   off: an admitted prompt's device prefill runs at once and the decoding requests wait for all of it.
 //   defer: deferred admission. A request whose device prefill would stall decoding requests waits in an admission
 //     queue (no slot, no KV pool room) and is admitted when no request is decoding, or when it has waited
 //     STRIX_DS41_SERVE_SCHED_STARVE_MS (default 30000), or when the cost rule says so: admitting now costs the others
@@ -20,15 +23,12 @@
 //     (STRIX_DS41_SERVE_SCHED_TDEV="a,b", default the measured 0.17 s + 1.69 ms/token). A state imported for the request
 //     while it waits (POST /admin/import-state, e.g. the prompt prefilled on another device) is taken at once and the
 //     local prefill never runs.
-//   interleave: the prefill runs as a PrefillTask in bounded units between decode steps: every scheduler tick runs one
+//   interleave (device default): the prefill runs as a PrefillTask in bounded units between decode steps: every scheduler tick runs one
 //     batch step of the decoding requests, then one unit of the pending prefill, until it completes; then the request
-//     joins the batch. With no request decoding, units run back to back at full size (the prefill's default pieces).
-//     The unit today is one DevicePrefill run of at most STRIX_DS41_SERVE_SCHED_UNIT_ROWS rows (default 256, a multiple
-//     of 8; extend() gives the bits of one run of the whole prompt); a resumable DevicePrefill plugs a finer unit in
-//     through PrefillTask::step's budget: STRIX_DS41_SERVE_SCHED_UNIT_MS (rank 0 picks the number of resumable units
-//     predicted to fit, DevicePrefill PrefillTask::units_within) or STRIX_DS41_SERVE_SCHED_UNIT_BUDGET (fixed units per
-//     tick); then the pieces are the default ones and a unit is a layer part (STRIX_DS41_SERVE_SCHED_MOE_CHUNK rows per
-//     MoE chunk, default 2048).
+//     joins the batch. Idle prompts use the same bounded service. Default pieces stay unchanged;
+//     resumable finest units target STRIX_DS41_SERVE_SERVICE_MS (default 250). With no legacy controls, 0 restores
+//     whole default pieces while idle and row units beside decoders.
+//     Explicit legacy controls override SERVICE_MS; positive UNIT_MS > UNIT_BUDGET > UNIT_ROWS.
 //     Prompts shorter than STRIX_DS41_SERVE_SCHED_MIN_ROWS (default 64) take the direct path (whole prefill at once).
 //     Prompts resumed from a state imported while the task is pending abort the task and take the state.
 //
@@ -51,10 +51,17 @@ struct Options {
     // interleave with the resumable DevicePrefill (phase B): the units of a tick fit in unit_ms (rank 0's prediction,
     // DevicePrefill PrefillTask::units_within), else unit_budget units per tick; pieces stay the default ones.
     double unit_ms = 0.0;
+    double service_ms = 250.0;
+    bool legacy_units = false, short_first = true;
+    [[nodiscard]] double target_ms() const noexcept { return legacy_units ? unit_ms : service_ms; }
+    [[nodiscard]] const char* budget_source() const noexcept {
+        return legacy_units ? (unit_ms > 0.0 ? "legacy-ms" : unit_budget > 0U ? "fixed-units" : "row-units") :
+                              (service_ms > 0.0 ? "service-target" : "coarse");
+    }
     // the resumable task's MoE chunk (bounds a MoE unit; same on both ranks; 0: the prefill's own 4096). Smaller chunks
     // run on row views of the prefill's own MoE scratch (no extra memory); 2048 = DevicePrefill's pair-gated task default
     std::uint32_t moe_chunk_rows = 2048;
-    [[nodiscard]] bool resumable() const noexcept { return unit_ms > 0.0 || unit_budget > 0U; }
+    [[nodiscard]] bool resumable() const noexcept { return target_ms() > 0.0 || unit_budget > 0U; }
     bool log = false;                        // one stderr line per decision
 };
 
@@ -72,12 +79,9 @@ struct Options {
     return mode;
 }
 
-inline Options options_from_env(bool device_prefill) {
+template <class Env>
+inline Options options_from(bool device_prefill, Env env) {
     Options o;
-    const auto env = [](const char* k) -> std::string {
-        const char* v = std::getenv(k);
-        return v ? std::string(v) : std::string();
-    };
     // default interleave with the device prefill since P17.2 (decode stalls <= ~1 s while a long prompt prefills)
     o.mode = mode_for(env("STRIX_DS41_SERVE_SCHED"), device_prefill);
     if (const auto s = env("STRIX_DS41_SERVE_SCHED_STARVE_MS"); !s.empty()) o.starve_seconds = std::stod(s) / 1e3;
@@ -91,10 +95,44 @@ inline Options options_from_env(bool device_prefill) {
     if (const auto s = env("STRIX_DS41_SERVE_SCHED_MIN_ROWS"); !s.empty()) o.min_rows = static_cast<std::uint32_t>(std::stoul(s));
     if (o.unit_rows < 16U || o.unit_rows % 8U != 0U) throw std::invalid_argument("STRIX_DS41_SERVE_SCHED_UNIT_ROWS: a multiple of 8, at least 16");
     if (const auto s = env("STRIX_DS41_SERVE_SCHED_UNIT_BUDGET"); !s.empty()) o.unit_budget = static_cast<std::uint32_t>(std::stoul(s));
-    if (const auto v = env("STRIX_DS41_SERVE_SCHED_UNIT_MS"); !v.empty()) o.unit_ms = std::stod(v);
+    const auto milliseconds = [](const std::string& v) {
+        std::size_t used = 0;
+        const double ms = std::stod(v, &used);
+        if (used != v.size()) throw std::invalid_argument("serve milliseconds: trailing input");
+        return ms;
+    };
+    if (const auto v = env("STRIX_DS41_SERVE_SCHED_UNIT_MS"); !v.empty()) o.unit_ms = milliseconds(v);
+    if (const auto v = env("STRIX_DS41_SERVE_SERVICE_MS"); !v.empty()) o.service_ms = milliseconds(v);
+    if (!std::isfinite(o.service_ms) || o.service_ms < 0.0 || !std::isfinite(o.unit_ms) || o.unit_ms < 0.0)
+        throw std::invalid_argument("serve service/unit milliseconds must be finite and nonnegative");
+    const auto ms = env("STRIX_DS41_SERVE_SCHED_UNIT_MS");
+    const auto budget = env("STRIX_DS41_SERVE_SCHED_UNIT_BUDGET");
+    o.legacy_units = !ms.empty() || !budget.empty() || !env("STRIX_DS41_SERVE_SCHED_UNIT_ROWS").empty();
+    if (o.unit_ms > 0.0) o.unit_budget = 0U;
+    if (const auto v = env("STRIX_DS41_SERVE_SHORT_FIRST"); !v.empty()) {
+        if (v != "0" && v != "1") throw std::invalid_argument("STRIX_DS41_SERVE_SHORT_FIRST is 0 or 1");
+        o.short_first = v == "1";
+    }
     if (const auto v = env("STRIX_DS41_SERVE_SCHED_MOE_CHUNK"); !v.empty()) o.moe_chunk_rows = static_cast<std::uint32_t>(std::stoul(v));
     o.log = o.mode != Mode::off && env("STRIX_DS41_SERVE_SCHED_LOG") != "0";
     return o;
+}
+
+inline Options options_from_env(bool device_prefill) {
+    return options_from(device_prefill, [](const char* k) -> std::string {
+        const char* v = std::getenv(k);
+        return v ? std::string(v) : std::string();
+    });
+}
+
+// Disabled service without legacy units retains whole pieces while idle.
+[[nodiscard]] inline std::uint32_t row_budget(const Options& o, bool idle) noexcept {
+    return o.resumable() || (idle && !o.legacy_units) ? UINT32_MAX : o.unit_rows;
+}
+
+template <class Predict>
+[[nodiscard]] std::uint32_t unit_budget(const Options& o, Predict predict) {
+    return o.target_ms() > 0.0 ? std::max(1U, predict(o.target_ms())) : o.unit_budget;
 }
 
 // The numeric identity and the collective protocol both serve ranks must share, compared in the hello before READY:
@@ -159,6 +197,20 @@ enum class Admit : std::uint32_t { defer = 0, idle = 1, starved = 2, cost = 3, d
     if (d - end < min_rows) end = d >= min_rows ? (d - min_rows) / 8U * 8U : at;
     if (end <= at || end - at < min_rows) return d;
     return end;
+}
+
+struct UnitCompletion {
+    bool done;
+    std::uint32_t rows, units;
+    bool operator==(const UnitCompletion&) const = default;
+};
+
+// Both ranks apply the lead's control verbatim, including abort before any further step.
+enum class UnitResult { pending, complete, cancelled };
+template <class Task>
+UnitResult apply_unit(Task& task, std::uint32_t end, std::uint32_t budget, bool abort) {
+    if (abort) { task.cancel(); return UnitResult::cancelled; }
+    return task.step(end, budget) ? UnitResult::complete : UnitResult::pending;
 }
 
 // A request's prompt prefill as a sequence of bounded units (both ranks hold one, created by the same command and

@@ -153,3 +153,12 @@ K4 is the configuration of the trellis quality report (full set KL 0.0446, paire
 The earlier trellis mix-B (shexp + head sites, K4 dense / K5 head) passed its quality gate
 (full-set KL equal to the 6.5-bit format). Either trellis library (CMake `STRIX_DS41_TRELLIS_API` v12 or splitk04)
 gives the same bits. Serve: `--prefill-path device --dspark <DSpark.gguf> --dspark-vocab auto:<vocab>`.
+
+## HTTP service boundaries
+
+Device serving now defaults to a 250 ms soft service target and stable short-first
+admission/waiting-prefill selection. These additions still require both-rank GPU and
+mixed-load qualification; the P17.1 figures above do not qualify them. See the
+[server contract and legacy-budget precedence](../../engine/serving/serving.md#deepseek-v41-pair-scheduler).
+Use `STRIX_DS41_SERVE_SERVICE_MS=0` for coarse row budgeting and
+`STRIX_DS41_SERVE_SHORT_FIRST=0` for FIFO; restart both ranks when changing settings.
