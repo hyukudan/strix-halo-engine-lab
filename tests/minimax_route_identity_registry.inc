@@ -8,6 +8,10 @@
 {"index-fallback", 'a', "index projection FP32 chain", "mm_kernels.hpp dense_t16 contract; engine index fallback contract; index_proj_tests.hip", ""},
 // src/minimax/moe/mmx_moe.hip:1128
 {"decode-wide", 'a', "EXL3 vector shape+bits+S", "mm_defaults.cpp moe_wide; rows == alone hardware gate; mmx_moe.hip wide-column contract", ""},
+// src/minimax/moe/mmx_moe.hip: make_args / launch_experts4_grid
+{"decode-moe-interleave", 'a', "EXL3 matrix+fixed split/k/reduction chain; v4 N8 grid", "hip_mmx_moe_bench.hip --diverse --test four-switch output/workspace/routes and rows==alone gate", ""},
+// src/minimax/moe/mmx_moe.hip: single_stream_for / singleton3_core
+{"decode-moe-singleton", 'a', "EXL3 matrix+fixed split/k/reduction chain; N/U/S+slot occupancy+K3+narrow W4+Depth4", "hip_mmx_moe_bench.hip --diverse --test reader counters+resources; --diverse-fallback --test wide/K5/W8/Depth8+12", ""},
 // src/minimax/moe/mmx_moe.hip:1195
 {"decode-moe-core", 'a', "EXL3 vector shape+bits+S; router row", "hip-mmx-moe-bench exact-form gates; mmx_moe.hpp arithmetic contract; hip_minimax_g4.hip bitwise gate", ""},
 // src/minimax/moe/mmx_moe.hip:1071

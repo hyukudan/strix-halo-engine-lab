@@ -1127,6 +1127,28 @@
   },
   {
     "engine": "minimax",
+    "name": "Decode MoE gate/up interleave",
+    "flag_or_env": "STRIX_MMX_MOE_GU_INTERLEAVE",
+    "default": "1",
+    "exact": "Published same-identity qualification: Decode MoE measurement: bitwise (610 N/U/S cases, every row == alone), B8 gate/up interleave diverse U8-32 -1.5..-3 %, B1/B4 unchanged; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.",
+    "gain": "Decode MoE measurement: bitwise (610 N/U/S cases, every row == alone), B8 gate/up interleave diverse U8-32 -1.5..-3 %, B1/B4 unchanged",
+    "preconditions": "Eight-row decode steps on the overlap MoE path.",
+    "off_switch": "STRIX_MMX_MOE_GU_INTERLEAVE=0",
+    "doc_anchor": "docs/optimizations.md#mm-moe-gu-interleave"
+  },
+  {
+    "engine": "minimax",
+    "name": "Decode MoE singleton reader",
+    "flag_or_env": "STRIX_MMX_MOE_SINGLE",
+    "default": "1",
+    "exact": "Published same-identity qualification: Decode MoE measurement: bitwise (610 N/U/S cases, every row == alone), B8 U>=25 singleton reader -3 %, B1/B4 unchanged; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.",
+    "gain": "Decode MoE measurement: bitwise (610 N/U/S cases, every row == alone), B8 U>=25 singleton reader -3 %, B1/B4 unchanged",
+    "preconditions": "Eight-row v4 decode steps, Depth=4, narrow W=4, K3 routed matrices, with at least 25 distinct routed experts, 18 of them used by one row. Depth=8/12 use the legacy reader.",
+    "off_switch": "STRIX_MMX_MOE_SINGLE=0",
+    "doc_anchor": "docs/optimizations.md#mm-moe-single"
+  },
+  {
+    "engine": "minimax",
     "name": "MSA prefill index query tiles",
     "flag_or_env": "STRIX_MM_PF_IDX_TILE",
     "default": "1",
