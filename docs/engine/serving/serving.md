@@ -706,3 +706,126 @@ The `--window-state-arm digest-only`, `live-continuation`, and `history-exhausti
 digest materialization, live batch continuation, and R8 acceptance followed by refused R4/serial fallback.
 The last also compares against a live batch producer exporting at T+8 before the fallback.
 See the gate docstring for separate short commands; missing cold-window/import witnesses fail the gate.
+
+## DeepSeek V4.1 pair scheduler
+
+Launch one `strix-deepseek41-serve MODEL.gguf --rank R --transport usb4auto`
+per node with matching model, profile, context and assets. Resident slot capacity is
+unchanged. With device prefill, `STRIX_DS41_SERVE_SCHED=interleave` remains the
+default; `off` runs whole prefills and `defer` retains deferred admission.
+
+`STRIX_DS41_SERVE_SERVICE_MS=250` is the default soft target for the next completed
+service boundary, including when the long prompt has no decoder beside it. Rank 0
+predicts a positive number of finest resumable units and sends that budget to rank 1.
+The ordinary piece endpoints and cache snapshots stay unchanged. Arrivals, status
+and cancellation are inspected between resumes. One indivisible unit, decode sweep,
+state import or allocation can exceed the target; it is not a latency guarantee.
+With no explicit legacy unit controls, zero restores the previous coarse interleave:
+whole default pieces while idle, 256-row units beside decoders. It disables finest
+resumable service, not interleaving or short-first ordering. Negative, nonfinite and
+overflowing targets are rejected before device work.
+
+Any explicit legacy unit control overrides the service target, including zero.
+Positive `STRIX_DS41_SERVE_SCHED_UNIT_MS` predicts resumable units and takes precedence
+over `STRIX_DS41_SERVE_SCHED_UNIT_BUDGET`; zero milliseconds preserves a positive
+fixed budget. A positive fixed budget counts resumable units. Otherwise
+`STRIX_DS41_SERVE_SCHED_UNIT_ROWS` controls row units, including while idle, using
+the existing row partition rules (default 256). Short prompts below
+`STRIX_DS41_SERVE_SCHED_MIN_ROWS` (default 64) retain the direct whole-prefill path.
+
+`STRIX_DS41_SERVE_SHORT_FIRST=1` selects the shortest queued prompt at admission and
+the shortest waiting device prefill. Ties retain arrival order; each stage permits
+at most eight overtakes of older eligible work. Zero orders eligible work by submission
+time, which can differ from the old running order after deferral, pool waiting or
+imported-state replacement. Pool waiters retain their reservation retry order and parked states still match by prompt.
+There is one active device prefill: a later short prompt can be admitted at a service
+boundary, but waits for that task to finish or cancel. No nested prefill lane is enabled.
+
+An HTTP abort cancels the active resumable task at the completed boundary on both
+ranks without computing the remaining piece. The abandoned sequence cannot extend
+until a fresh run or a validated complete state import restores it. Import is refused
+while a task owns the instance. Rank 1 applies rank 0's budget and abort controls;
+it does not select them from its own clock. Both ranks exchange and compare completion,
+rows and within-piece unit position at each service boundary before further collectives;
+a mismatch poisons both ranks.
+
+`GET /v1/capabilities` includes `scheduler` with effective mode, service target,
+effective unit target, budget source, short-first and nesting availability.
+`GET /api/status` includes these under `prefill`, plus `max_unit_ms` (maximum measured
+indivisible device unit), `cancellations` (active task aborts, including imported-state
+replacement) and `fallback_reason`. Explicit legacy budgeting, disabled service and
+non-interleave modes have distinct fallback reasons. Direct short prompts and coarse
+row runs do not produce fine-unit timing. Cached, imported and computed prompt
+accounting remain disjoint.
+
+The new service, cancellation and ordering behavior has CPU contract coverage. On both ranks,
+with the scheduler on, prefill logits, decode windows, batch rows and greedy tokens equal the
+reference; resumable prefill task gates at unit budgets 1, 3, 32 and 250 equal whole prefills; served
+requests return identical ids with the scheduler on and off, including with the host prefix tier on
+(`--prefix-cache-mb`, partial and whole prefix hits), and cancel-then-reuse and whole-request repeats are
+equal. No mixed-load gain is claimed. The scheduler is on by
+default with off switches: `STRIX_DS41_SERVE_SERVICE_MS=0` disables fine
+service and its mid-piece cancellation boundaries, `STRIX_DS41_SERVE_SHORT_FIRST=0`
+disables short-first, and `STRIX_DS41_SERVE_SCHED=off` disables interleaving altogether.
+Qualification requires the both-rank resumable prefill GPU gate below and the
+both-rank HTTP serve exactness gates for cache miss, partial prefix hit, whole hit
+and cancel-then-reuse. Import and pending-task abort are covered by the CPU scheduler
+tests and the unchanged import validation; the HTTP import arm is pending a matched
+state/message fixture.
+Qualification must compare complete token IDs, logits and committed-state digests against isolated requests with
+the same numerical identity. Cover cache miss, partial/whole cache hits, imported-state
+replacement, cancellation followed by slot reuse, piece tails and supported transports.
+Measure long-alone/short-arrival, decode/long/short arrivals and saturated-slot
+cancel/refill loads. Record service overruns, cancellation release, per-class TTFT,
+long-request progress, throughput, memory and engine/SSE gap distributions separately.
+A short request arriving during an active prefill waits for the single lane; bounded
+polling does not establish preemption or short-prompt TTFT improvement.
+
+Run the existing resumable GPU gate on both nodes simultaneously, setting `R` to
+0 and 1 respectively and retaining the same qualified profile environment:
+
+```sh
+for K in 1 3 32; do
+  build/strix-deepseek41-prefill assets/model.gguf --rank "$R" --transport usb4-auto \
+    --prompt assets/prompt.ids --rows 8192 --task-rows 2048,2053,8192 \
+    --task-levels whole,layer,phase,finest --task-units "$K" --interleave 256
+done
+build/strix-deepseek41-prefill assets/model.gguf --rank "$R" --transport usb4-auto \
+  --prompt assets/prompt.ids --rows 8192 --task-levels finest --task-budget 250 --interleave 256
+```
+
+This gate checks its existing logits/state/background-ID contract, not HTTP
+cancellation or complete HTTP continuations. For the HTTP campaign, launch the
+server on both nodes, keep request JSON and outputs outside Git, and use a fresh
+server for the idle-arrival arm. The long request must exceed the direct-prefill
+threshold and last long enough for the first unit to be observed:
+
+```sh
+build/strix-deepseek41-serve assets/model.gguf --rank "$R" --transport usb4auto \
+  --context 16384 --http-port 8080
+```
+
+On the client, use `BASE` for the authorized HTTP origin and `OUT` for a private
+output directory. Request files specify greedy streaming generation with the same
+model and limits in every arm:
+
+```sh
+curl -fsSN "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
+  --data-binary @assets/long.request.json > "$OUT/long.sse" &
+LONG=$!
+# After /api/status reports prefill.max_unit_ms > 0, while the long prefill is active:
+curl -fsSN "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
+  --data-binary @assets/short.request.json > "$OUT/short.sse" &
+SHORT=$!
+kill "$LONG"  # disconnect the active long request at the next boundary
+wait "$LONG" || true
+wait "$SHORT"
+curl -fsS "$BASE/api/status" > "$OUT/status.json"
+```
+
+Repeat with decoding streams already active, then with all slots occupied and
+queued refill requests. Repeat cancellation before the first unit, mid-piece and
+at piece boundaries, followed by a miss, partial cache hit, whole cache hit and
+imported-state replacement. Compare every surviving request with its isolated
+complete-ID/logit/state reference. SSE text and this curl smoke scenario alone
+cannot establish exactness. Change one off switch per A/B arm and restart both ranks.

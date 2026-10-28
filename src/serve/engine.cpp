@@ -1,3 +1,4 @@
+#include "strix/serve/short_first.hpp"
 #include "strix/serve/engine.hpp"
 
 #include <algorithm>
@@ -223,7 +224,7 @@ void GenerationQueue::run(GenerationEngine& engine, const std::function<void(con
     }
 }
 
-std::optional<TakenJob> GenerationQueue::take(bool wait) {
+std::optional<TakenJob> GenerationQueue::take(bool wait, bool short_first) {
     for (;;) {
         Entry entry;
         {
@@ -236,8 +237,12 @@ std::optional<TakenJob> GenerationQueue::take(bool wait) {
                 return std::nullopt;
             }
             if (entries_.empty()) return std::nullopt;
-            entry = std::move(entries_.front());
-            entries_.pop_front();
+            const auto pick = select_waiting(entries_, short_first,
+                [](const auto& e) { return e.job.prompt.size(); },
+                [](auto& e) -> std::uint32_t& { return e.overtakes; });
+            auto it = entries_.begin() + static_cast<std::ptrdiff_t>(pick);
+            entry = std::move(*it);
+            entries_.erase(it);
             entry.ticket->queue_position_.store(0);
             --totals_.queued;
             ++totals_.running;

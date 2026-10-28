@@ -91,7 +91,7 @@
 // (default 1, the oldest goes first); a request that needs a slot while none is free takes a parked one's slot.
 // The import runs between batch steps (the decoding requests wait for it). Nothing changes when no state is imported.
 //
-// STRIX_DS41_SERVE_SCHED (device path; default off = the above): decode-priority scheduling, decided by rank 0 alone
+// STRIX_DS41_SERVE_SCHED (device path; default interleave): decode-priority scheduling, decided by rank 0 alone
 // (deepseek41_serve_sched.hpp). defer: a prompt whose device prefill would stall decoding requests waits in an admission
 // queue until nobody decodes, it waited STRIX_DS41_SERVE_SCHED_STARVE_MS, or N x T_dev(P) <= the decoders' remaining
 // time; a state imported for it meanwhile is taken without a prefill. interleave: the prefill runs as a task of units
@@ -334,7 +334,7 @@ struct Control {
     std::uint32_t commit[BatchForward::max_rows]{};
     // STRIX_DS41_SERVE_SCHED=interleave (pend, pbudget above): a prefill command with pflags bit 2 starts a PrefillTask;
     // prefill_unit runs its next unit up to row pend with budget pbudget (pflags bit 3: abort the task instead; bit 4:
-    // rank 0's unit completed the prefill, rank 1 checks it did too).
+    // completion in the boundary acknowledgement, with rows in presume and unit position in pbudget).
     // Extension only exchanged for steps with >8 rows; the original 512-byte block
     // and all of its field offsets are retained for smaller steps.
     BatchRow extra_rows[BatchForward::extended_max_rows - BatchForward::max_rows]{};
@@ -359,6 +359,18 @@ Control exchange(BatchForward& fwd, const Control& out) {
         fwd.exchange_host(std::as_bytes(std::span(out.extra_rows)), std::as_writable_bytes(std::span(in.extra_rows)));
     }
     return in;
+}
+
+// Both workers are drained here; agree before finish() or the next unit can enter collectives.
+void check_unit(BatchForward& fwd, std::uint32_t rank, strix::deepseek41::sched::UnitCompletion mine) {
+    Control ack;
+    ack.command = static_cast<std::uint32_t>(Command::prefill_unit);
+    ack.pflags = mine.done ? kPrefillDone : 0U;
+    ack.presume = mine.rows;
+    ack.pbudget = mine.units;
+    const auto peer = exchange(fwd, ack);
+    const strix::deepseek41::sched::UnitCompletion other{(peer.pflags & kPrefillDone) != 0U, peer.presume, peer.pbudget};
+    if (peer.command != ack.command || !(mine == other)) poisoned(rank, "prefill task: unit completion differs between ranks");
 }
 
 // The drafter's device bytes on a drafting rank (DeviceDrafter::footprint over a.slots contexts + the speculator's
@@ -707,6 +719,7 @@ public:
                 }
                 (void)ptask_->step(budget == 0U ? 0xFFFFFFFFU : budget);
                 for (const double w : ptask_->step_walls()) step_max_ms_ = std::max(step_max_ms_, w);
+                for (const auto& u : ptask_->unit_timings()) unit_max_ms_ = std::max(unit_max_ms_, u.device_ms);
                 if (!ptask_->done()) {
                     out_.prefill_seconds += std::chrono::duration<double>(Clock::now() - t1).count();
                     return false;
@@ -745,15 +758,16 @@ public:
         }
         [[nodiscard]] bool mid_piece() const noexcept override { return ptask_ != nullptr; }
         [[nodiscard]] std::uint32_t piece_end() const noexcept override { return ptask_ ? piece_end_ : at_; }
+        [[nodiscard]] std::uint32_t unit_position() const noexcept { return ptask_ ? ptask_->units_done() : 0U; }
         // rank 0: resumable units of the current piece predicted to fit in budget_ms (1 before the piece's task exists)
         [[nodiscard]] std::uint32_t units_within(double budget_ms) const { return ptask_ ? std::max(1U, ptask_->units_within(budget_ms)) : 1U; }
-        // the longest resumable step() wall so far (ms; the max non-interruptible unit of this prefill)
+        // The longest resumable step wall so far (ms); it may contain several indivisible units.
         [[nodiscard]] double step_max_ms() const noexcept { return step_max_ms_; }
-        // an abandoned task: a resumable piece in flight runs to its end on both ranks (the DevicePrefill sequence stays
-        // valid for the next prefill's import_state + extend)
-        void settle() {
+        [[nodiscard]] double unit_max_ms() const noexcept { return unit_max_ms_; }
+        // Abandon at the drained boundary. Only a fresh run or validated import restores the sequence.
+        void cancel() {
             if (ptask_) {
-                (void)ptask_->step(0xFFFFFFFFU);
+                ptask_->cancel();
                 ptask_.reset();
             }
         }
@@ -792,7 +806,7 @@ public:
         PrefillOutcome out_;
         std::unique_ptr<strix::deepseek41::PrefillTask> ptask_;  // phase B: the current piece's resumable task
         std::uint32_t piece_end_ = 0;
-        double step_max_ms_ = 0.0;
+        double step_max_ms_ = 0.0, unit_max_ms_ = 0.0;
     };
     std::unique_ptr<Task> begin(std::uint32_t slot, const std::vector<std::uint32_t>& prompt, const strix::deepseek41::PrefixLookup& hit, bool insert,
                                 std::uint32_t stable = 0) {
@@ -1096,14 +1110,15 @@ void follow(const Args& a, BatchForward& fwd, Watchdog& dog, SlotPrefill* prefil
             if (!task) throw std::runtime_error("control channel: prefill unit without a prefill task");
             if ((c.pflags & kPrefillAbort) != 0U) {
                 dog.pause(true);
-                task->settle();
+                (void)strix::deepseek41::sched::apply_unit(*task, 0U, 0U, true);
                 dog.pause(false);
                 task.reset();
                 continue;
             }
             dog.pause(true);
-            const bool done = task->step(c.pend, c.pbudget);
-            if (c.pbudget == 0U && done != ((c.pflags & kPrefillDone) != 0U)) poisoned(1U, "prefill task: rank 1's unit ended otherwise than rank 0's");
+            const bool done = strix::deepseek41::sched::apply_unit(*task, c.pend, c.pbudget, false) == strix::deepseek41::sched::UnitResult::complete;
+            dog.pause(false);
+            check_unit(fwd, 1U, {done, task->rows(), task->unit_position()});
             if (done) {
                 const auto o = task->finish();
                 prefill->on_prefill(task->slot(), task->prompt());
@@ -1111,7 +1126,6 @@ void follow(const Args& a, BatchForward& fwd, Watchdog& dog, SlotPrefill* prefil
                 log_outcome(task->slot(), task->total(), o);
                 task.reset();
             }
-            dog.pause(false);
             continue;
         }
         const bool is_prefill = c.command == static_cast<std::uint32_t>(Command::prefill);
@@ -1190,6 +1204,7 @@ struct Running {
     std::size_t published = 0;
     Clock::time_point start, first_token;
     bool has_first = false;
+    std::uint32_t prefill_overtakes = 0;
     bool device_prefill = false;  // the prompt goes through the device prefill before the next step
     // every request: prompt tokens resumed from the prefix cache / continued from an imported state (disjoint)
     strix::deepseek41::serve_observe::PromptAccount account;
@@ -1203,6 +1218,8 @@ struct ServeState {
     double step_seconds = 0.0;
     std::uint64_t prefills = 0, prefill_tokens = 0, cached_tokens = 0;
     double prefill_seconds = 0.0;
+    std::uint64_t prefill_cancellations = 0;
+    double scheduler_max_unit_ms = 0.0;
     strix::deepseek41::PrefixCacheStats cache;
     std::uint32_t busy = 0;
     std::atomic<bool> draining{false}, failed{false};
@@ -1228,6 +1245,8 @@ struct ServeState {
         double step_seconds = 0.0;
         std::uint64_t prefills = 0, prefill_tokens = 0, cached_tokens = 0;
         double prefill_seconds = 0.0;
+        std::uint64_t prefill_cancellations = 0;
+        double scheduler_max_unit_ms = 0.0;
         strix::deepseek41::PrefixCacheStats cache;
         strix::dist::CommunicatorStats comm;
         std::uint64_t pool_free = 0;
@@ -1243,7 +1262,7 @@ struct ServeState {
         }
         if (armed) spec_out = spec;
         return Copy{busy, steps, rows, decode_rows, prompt_rows, step_seconds, prefills, prefill_tokens, cached_tokens,
-                    prefill_seconds, cache, comm, pool_free, armed && spec_published};
+                    prefill_seconds, prefill_cancellations, scheduler_max_unit_ms, cache, comm, pool_free, armed && spec_published};
     }
 };
 
@@ -1431,9 +1450,11 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
     if (sched.mode != strix::deepseek41::sched::Mode::off) {
         if (!prefill) throw std::invalid_argument("STRIX_DS41_SERVE_SCHED needs --prefill-path device");
         std::fprintf(stderr, "sched: %s (starvation %.1f s, T_dev = %.3f + %.5f P s, unit %u rows, budget %u units / %.0f ms, MoE chunk %u, tasks from %u rows)\n", strix::deepseek41::sched::mode_name(sched.mode),
-                     sched.starve_seconds, sched.tdev_a, sched.tdev_b, sched.unit_rows, sched.unit_budget, sched.unit_ms, sched.moe_chunk_rows, sched.min_rows);
+                     sched.starve_seconds, sched.tdev_a, sched.tdev_b, sched.unit_rows, sched.unit_budget, sched.target_ms(), sched.moe_chunk_rows, sched.min_rows);
     }
 
+    std::fprintf(stderr, "sched: effective %s, service target %.1f ms, budget source %s, short-first %u, nesting disabled\n",
+                 strix::deepseek41::sched::mode_name(sched.mode), sched.service_ms, sched.budget_source(), sched.short_first ? 1U : 0U);
     const auto tokenizer = serve::BpeTokenizer::load_gguf(a.model);
     // the drafter is loaded before READY (requests may come as soon as READY is out)
     std::unique_ptr<strix::ds41::dspark::DeviceDrafter> drafter;
@@ -1474,6 +1495,18 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
     config.sse_progress_seconds = a.http_sse_progress_interval;
     config.engine_description = "deepseek41 engine group (2 ranks, EP experts" + std::string(a.tp ? " + TP attention" : "") + "), " +
                                 std::to_string(a.slots) + " slots, greedy, exact per request";
+    config.capabilities_extra = [sched](serve::Json& out) {
+        serve::Json policy = serve::Json::object();
+        policy.set("effective", serve::Json(strix::deepseek41::sched::mode_name(sched.mode)));
+        policy.set("service_target_ms", serve::Json(sched.service_ms));
+        policy.set("effective_unit_target_ms", serve::Json(sched.mode == strix::deepseek41::sched::Mode::interleave ? sched.target_ms() : 0.0));
+        policy.set("budget_source", serve::Json(sched.budget_source()));
+        policy.set("short_first", serve::Json(sched.short_first));
+        policy.set("nested_prefill", serve::Json(false));
+        policy.set("direct_prefill_below_rows", serve::Json(static_cast<std::uint64_t>(sched.min_rows)));
+        policy.set("qualification", serve::Json("pending-both-rank-gates"));
+        out.set("scheduler", std::move(policy));
+    };
     config.stop_tokens = {tokenizer->eos_token()};
     config.chat_renderer = [](const serve::ChatTemplateInput& in) { return serve::render_deepseek_v41_chat(in); };
     config.output_parser = [](const std::string& t, bool thinking, const serve::Json& tools) { return serve::parse_deepseek_v41_output(t, thinking, tools); };
@@ -1539,6 +1572,16 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
         batch.set("mean_step_ms", serve::Json(st.steps ? st.step_seconds * 1e3 / static_cast<double>(st.steps) : 0.0));
         out.set("batch", std::move(batch));
         serve::Json pf = serve::Json::object();
+        pf.set("scheduler", serve::Json(strix::deepseek41::sched::mode_name(sched.mode)));
+        pf.set("service_target_ms", serve::Json(sched.service_ms));
+        pf.set("effective_unit_target_ms", serve::Json(sched.mode == strix::deepseek41::sched::Mode::interleave ? sched.target_ms() : 0.0));
+        pf.set("budget_source", serve::Json(sched.budget_source()));
+        pf.set("short_first", serve::Json(sched.short_first));
+        pf.set("max_unit_ms", serve::Json(st.scheduler_max_unit_ms));
+        pf.set("cancellations", serve::Json(st.prefill_cancellations));
+        pf.set("direct_prefill_below_rows", serve::Json(static_cast<std::uint64_t>(sched.min_rows)));
+        pf.set("fallback_reason", serve::Json(sched.mode != strix::deepseek41::sched::Mode::interleave ? "scheduler-not-interleave" :
+            sched.legacy_units ? "explicit-legacy-budget" : sched.service_ms == 0.0 ? "service-disabled" : ""));
         pf.set("path", serve::Json(a.device_prefill ? "device" : "rows"));
         pf.set("prefills", serve::Json(st.prefills));
         pf.set("prefill_tokens", serve::Json(st.prefill_tokens));
@@ -2038,30 +2081,33 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
         prefill_done(r, o, hit, disk_failed, t0);
     };
     // interleave: the active task's next unit on both ranks (budget_rows 0: up to its next default piece end)
-    // (a resumable task stopped inside a piece continues that piece; budget 0 with nobody decoding: the piece at once)
+    // A resumable task stopped inside a piece continues that piece, including while idle.
     const auto run_unit = [&](std::uint32_t budget_rows) {
         auto& at = *active;
         const std::uint32_t end = at.task->mid_piece() ? at.task->piece_end()
                                                        : strix::deepseek41::sched::next_unit_end(at.task->rows(), at.task->default_ends(), budget_rows, kMinRows);
-        const std::uint32_t budget = budget_rows == 0U ? 0U
-                                     : sched.unit_ms > 0.0 ? at.task->units_within(sched.unit_ms)
-                                                           : sched.unit_budget;
+        const std::uint32_t budget = strix::deepseek41::sched::unit_budget(sched,
+            [&](double ms) { return at.task->units_within(ms); });
         Control c;
         c.command = static_cast<std::uint32_t>(Command::prefill_unit);
         take_commits(c);  // rank 1 applies commits at every control block
         c.pend = end;
         c.pbudget = budget;
-        c.pflags = end == at.task->total() && budget == 0U ? kPrefillDone : 0U;
         c.snaps = pending_snaps;
         pending_snaps = 0;
         const auto t0 = Clock::now();
         const std::uint32_t from = at.task->rows();
         (void)exchange(fwd, c);
         dog.pause(true);
-        const bool done = at.task->step(end, budget);
+        const bool done = strix::deepseek41::sched::apply_unit(*at.task, end, budget, false) == strix::deepseek41::sched::UnitResult::complete;
         dog.pause(false);
+        check_unit(fwd, 0U, {done, at.task->rows(), at.task->unit_position()});
         last_round = Clock::now();
         const double dt = std::chrono::duration<double>(last_round - t0).count();
+        {
+            const std::lock_guard lock(state.mutex);
+            state.scheduler_max_unit_ms = std::max(state.scheduler_max_unit_ms, at.task->unit_max_ms());
+        }
         ++at.units;
         at.unit_max = std::max(at.unit_max, dt);
         at.unit_sum += dt;
@@ -2079,9 +2125,13 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
         dog.progress();
         last_round = Clock::now();
         if (sched.log) std::fprintf(stderr, "sched: prefill task of slot %u aborted at row %u%s\n", active->r->seq.slot, active->task->rows(),
-                                    active->task->mid_piece() ? " (its resumable piece runs to its end)" : "");
+                                    active->task->mid_piece() ? " (cancelled at boundary)" : "");
         dog.pause(true);
-        active->task->settle();
+        (void)strix::deepseek41::sched::apply_unit(*active->task, 0U, 0U, true);
+        {
+            const std::lock_guard lock(state.mutex);
+            ++state.prefill_cancellations;
+        }
         dog.pause(false);
         active.reset();
     };
@@ -2404,7 +2454,7 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
                     taken = admit_ready.front().taken;
                     admit_ready.pop_front();
                 } else {
-                    job = queue.take(false);
+                    job = queue.take(false, sched.short_first);
                     from_queue = true;
                 }
                 if (!job) break;
@@ -2506,14 +2556,22 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
                                 swapped = true;
                             }
                 if (swapped) publish();
-                if (!active)  // the oldest waiting prefill becomes the task (one at a time)
+                if (!active) {
+                    std::vector<Running*> waiting;
                     for (auto& r : running)
-                        if (r->device_prefill) {
-                            // short prompts: the whole prefill at once (cheaper than the ticks a task adds to its TTFT)
-                            device_prefill(*r, r->seq.prompt.size() >= sched.min_rows);
-                            if (!active) publish();  // done at once (short, or the whole prompt was cached)
-                            break;
-                        }
+                        if (r->device_prefill) waiting.push_back(r.get());
+                    std::stable_sort(waiting.begin(), waiting.end(), [](const auto* a0, const auto* b0) {
+                        return a0->job.submitted < b0->job.submitted;
+                    });
+                    if (!waiting.empty()) {
+                        const auto pick = serve::select_waiting(waiting, sched.short_first,
+                            [](const auto* r) { return r->seq.prompt.size(); },
+                            [](auto* r) -> std::uint32_t& { return r->prefill_overtakes; });
+                        auto& r = *waiting[pick];
+                        device_prefill(r, r.seq.prompt.size() >= sched.min_rows);
+                        if (!active) publish();
+                    }
+                }
                 // one decode step of the requests that decode (or read their prompt in rows), then one unit of the prefill
                 std::vector<BatchSequence*> seqs;
                 for (auto& r : running)
@@ -2524,7 +2582,7 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
                 }
                 if (active) {
                     // phase B (resumable): the default pieces, a few units per tick; else pieces of unit_rows rows
-                    run_unit(seqs.empty() ? 0U : sched.resumable() ? 0xFFFFFFFFU : sched.unit_rows);
+                    run_unit(strix::deepseek41::sched::row_budget(sched, seqs.empty()));
                     if (!active) publish();  // its first token
                     continue;
                 }

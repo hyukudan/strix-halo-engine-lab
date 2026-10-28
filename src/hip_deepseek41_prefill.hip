@@ -392,7 +392,7 @@ struct DevicePrefill::Impl {
     // resumable runs (PrefillTask): the task whose run is in progress (its worker thread runs run_from and stops at the
     // unit boundaries), and a sequence left invalid by a cancelled task (extend refused until the next run)
     PrefillTask::State* task = nullptr;
-    bool broken = false;
+    bool broken = false, cancel_broken = false;
     // row_split all-gathers on the communication stream, overlapped with independent work (default;
     // STRIX_DS41_PREFILL_ASYNC_GATHER=0: synchronous exchanges on the main stream)
     bool async_gather = true;
@@ -1129,6 +1129,7 @@ struct PrefillTask::State {
             cv.wait(lock, [&] { return granted > 0U || cancel_req; });
             if (cancel_req) {
                 cancelled = finished = parked = true;
+                m->cancel_broken = true;  // even an unstarted abandoned task needs run/import before extend
                 m->task = nullptr;
                 cv.notify_all();
                 return;
@@ -1149,7 +1150,7 @@ struct PrefillTask::State {
             error = std::current_exception();
         }
         if (!ok) {
-            m->broken = true;  // the sequence's state is partial
+            m->cancel_broken = true;  // the sequence's state is partial
             try {
                 drain();
             } catch (...) {
@@ -1255,7 +1256,7 @@ std::unique_ptr<PrefillTask> DevicePrefill::begin_extend(std::span<const std::ui
 std::unique_ptr<PrefillTask> DevicePrefill::begin_from(std::span<const std::uint32_t> tokens, bool extend, const PrefillTaskOptions& task) {
     auto& m = *impl_;
     if (m.task != nullptr) throw std::logic_error("deepseek41 prefill: a task is in progress");
-    if (extend && m.broken) throw std::logic_error("deepseek41 prefill: the sequence was abandoned (cancelled task); run() first");
+    if (extend && (m.broken || m.cancel_broken)) throw std::logic_error("deepseek41 prefill: the sequence was abandoned (cancelled task); run() first");
     auto s = std::make_unique<PrefillTask::State>();
     s->owner = this;
     s->m = &m;
@@ -1308,7 +1309,7 @@ PrefillResult DevicePrefill::run(std::span<const std::uint32_t> tokens) {
 
 PrefillResult DevicePrefill::extend(std::span<const std::uint32_t> tokens) {
     if (impl_->task != nullptr) throw std::logic_error("deepseek41 prefill: a task is in progress");
-    if (impl_->broken) throw std::logic_error("deepseek41 prefill: the sequence was abandoned (cancelled task); run() first");
+    if (impl_->broken || impl_->cancel_broken) throw std::logic_error("deepseek41 prefill: the sequence was abandoned (cancelled task); run() first");
     return run_from(tokens, impl_->rows_done);
 }
 
@@ -1383,7 +1384,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     hipStream_t st = m.stream;
     PrefillResult result;
     result.layers.assign(m.options.layers, PrefillLayerTiming{});
-    if (P0 == 0U) m.broken = false;
+    if (P0 == 0U) m.broken = m.cancel_broken = false;
     // PrefillTask: a unit boundary (run() / extend(): none). Cut points only between enqueues with no exchange in
     // flight; loops whose count differs between the ranks are padded so both ranks see the same list of units.
     const auto cut = [&](PrefillUnitLevel level, std::int32_t next_layer, const char* kind) {
@@ -2714,22 +2715,34 @@ std::vector<std::pair<std::string, std::uint64_t>> DevicePrefill::state_hashes()
 
 void DevicePrefill::import_state(const AttentionState& s) {
     auto& m = *impl_;
+    if (m.task != nullptr) throw std::logic_error("deepseek41 prefill: import while a task owns the instance");
     namespace attn = ds41::attn;
     const auto fail = [](const std::string& what) { throw std::invalid_argument("deepseek41 prefill: import_state: " + what); };
     if (s.layers.size() != m.options.layers) fail("layer count differs");
     if (s.tokens.size() != s.position || s.position == 0U) fail("token history length != position, or an empty state");
     if (s.position % m.options.window_rows != 0U || s.position >= m.options.max_positions) fail("position not a multiple of window_rows or no room left");
+    for (std::uint32_t l = 0; l < m.options.layers; ++l) {
+        const auto& r = m.roles[l];
+        const auto& L = m.attn[l];
+        const auto& S = s.layers[l];
+        if (S.owns_kv != r.owns_kv || S.owns_index != r.owns_index || (r.owns_kv && S.ratio != r.ratio)) fail("roles of layer " + std::to_string(l));
+        if (S.ring.size() != L.ring.n) fail("ring size of layer " + std::to_string(l));
+        if (r.owns_kv) {
+            const std::size_t entries = s.position / r.ratio;
+            if (S.kv.size() != entries * attn::kKvEntryBytes || S.idx_keys.size() != entries * attn::kIdxEntryBytes) fail("caches of layer " + std::to_string(l));
+            if (r.ratio == 2U && S.carry_valid && S.carry.size() != L.carry[0].n) fail("carry of layer " + std::to_string(l));
+        }
+    }
+    for (const auto t : s.tokens)
+        if (t >= m.model.config.vocab_size) fail("token outside the vocabulary");
+    m.cancel_broken = true;
     hipStream_t st = m.stream;
     for (std::uint32_t l = 0; l < m.options.layers; ++l) {
         const auto& r = m.roles[l];
         auto& L = m.attn[l];
         const auto& S = s.layers[l];
-        if (S.owns_kv != r.owns_kv || S.owns_index != r.owns_index || (r.owns_kv && S.ratio != r.ratio)) fail("roles of layer " + std::to_string(l));
-        if (S.ring.size() != L.ring.n) fail("ring size of layer " + std::to_string(l));
         check(hipMemcpyAsync(L.ring.p, S.ring.data(), L.ring.n, hipMemcpyHostToDevice, st), "import ring");
         if (r.owns_kv) {
-            const std::size_t entries = s.position / r.ratio;
-            if (S.kv.size() != entries * attn::kKvEntryBytes || S.idx_keys.size() != entries * attn::kIdxEntryBytes) fail("caches of layer " + std::to_string(l));
             L.kv_cache.zero(st);
             L.idx_cache.zero(st);
             check(hipMemcpyAsync(L.kv_cache.p, S.kv.data(), S.kv.size(), hipMemcpyHostToDevice, st), "import kv");
@@ -2740,7 +2753,6 @@ void DevicePrefill::import_state(const AttentionState& s) {
             }
             L.carry_cur = 0;
             if (r.ratio == 2U && S.carry_valid) {
-                if (S.carry.size() != L.carry[0].n) fail("carry of layer " + std::to_string(l));
                 check(hipMemcpyAsync(L.carry[0].p, S.carry.data(), S.carry.size() * 4U, hipMemcpyHostToDevice, st), "import carry");
                 check(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(L.carry_valid[0].p), 1, 1, st), "import carry");
             }
@@ -2753,6 +2765,7 @@ void DevicePrefill::import_state(const AttentionState& s) {
     m.local_rows_done = 0;
     m.last_row_local = false;
     check(hipStreamSynchronize(st), "import state");
+    m.cancel_broken = false;
 }
 
 AttentionState DevicePrefill::export_state() const {

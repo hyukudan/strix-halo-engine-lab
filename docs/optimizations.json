@@ -566,6 +566,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "Bounded HTTP prefill service and short-first admission",
+    "flag_or_env": "STRIX_DS41_SERVE_SERVICE_MS; STRIX_DS41_SERVE_SHORT_FIRST",
+    "default": "250 ms soft target; short-first on",
+    "exact": "Both ranks, scheduler on: prefill 1K/8K logits, decode windows, batch rows and greedy tokens equal the reference; resumable prefill task gates at unit budgets 1, 3, 32 and 250 equal whole prefills (tokens and background state); served requests return identical ids with the scheduler on and off, also with partial and whole prefix-cache hits; cancellation followed by slot reuse and whole-request repeats are equal; the HTTP import arm is pending a matched state fixture. Ordinary piece endpoints retained.",
+    "gain": "No throughput claim: bounds how long a newly arrived prompt waits behind a long prefill (soft target, not a latency guarantee)",
+    "preconditions": "Pair HTTP device prefill with interleave; one active prefill lane; unchanged resident slots. Explicit legacy unit controls override the service target. Direct short prompts retain coarse execution.",
+    "off_switch": "STRIX_DS41_SERVE_SERVICE_MS=0; STRIX_DS41_SERVE_SHORT_FIRST=0; STRIX_DS41_SERVE_SCHED=off disables interleave",
+    "doc_anchor": "docs/engine/serving/serving.md#deepseek-v41-pair-scheduler"
+  },
+  {
+    "engine": "deepseek",
     "name": "Serving interleave and draft admission",
     "flag_or_env": "STRIX_DS41_SERVE_SCHED; --dspark-ranks; --dspark-max-inflight; --draft-ranks",
     "default": "auto",
