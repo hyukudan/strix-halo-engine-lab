@@ -645,7 +645,24 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     for (const auto& [name,value] : config.host_compilation) {
         out << (first_field ? "" : ",") << '"' << name << "\":" << value; first_field = false;
     }
-    out << "}}\n";
+    // Resolved code-default long-context items (the requested values stay in "environment"): enabled, and when off the
+    // suppression (baseline, gsq, STRIX_QPF2K_DEFAULTS=0, explicit-off, or the excluded decode route). The union merge
+    // and the 64-row scorer apply from 49,152 and 65,536 blocks.
+    const auto item = [&](const char* name, const char* why, bool comma) {
+        out << '"' << name << "\":{\"enabled\":" << (why ? "false" : "true") << ",\"suppression\":";
+        if (why) out << '"' << why << '"'; else out << "null";
+        out << '}' << (comma ? "," : "");
+    };
+    const auto pool_off = qsa_decode_pool_route_suppression(o, config.gsq_owner);
+    const auto select_off = pool_off ? pool_off : qpf2k::long_context_item_suppression("STRIX_QSA_DECODE_SELECT", config.gsq_owner);
+    const auto bf16_off = pool_off ? pool_off : qpf2k::long_context_item_suppression("STRIX_QSA_DECODE_POOL_BF16", config.gsq_owner);
+    out << "},\"long_context_items\":{";
+    item("STRIX_QSA_UNION_MERGE", qpf2k::long_context_item_suppression("STRIX_QSA_UNION_MERGE", config.gsq_owner), true);
+    item("STRIX_QSA_SCORE_ROWS64", qpf2k::long_context_item_suppression("STRIX_QSA_SCORE_ROWS64", config.gsq_owner), true);
+    item("STRIX_QSA_DECODE_POOL", pool_off, true);
+    item("STRIX_QSA_DECODE_SELECT", select_off, true);
+    item("STRIX_QSA_DECODE_POOL_BF16", bf16_off, false);
+    out << "},\"qsa_decode_pool_key_bytes\":" << (pool_off ? 0U : qsa_decode_pool_key_bytes(o, config.gsq_owner)) << "}\n";
     return out.str();
 }
 } // namespace strix::decode_cli
