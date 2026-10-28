@@ -250,6 +250,7 @@ struct TakenJob {
     GenerationJob job;
     std::shared_ptr<GenerationTicket> ticket;
     std::chrono::steady_clock::time_point submitted, started;
+    bool reordered = false;  // selection left older queue entries behind
 };
 
 // Fixed-bucket histogram (cumulative only when rendered): counts[i] = observations <= bounds[i] and > bounds[i - 1];
@@ -305,6 +306,11 @@ enum class QueueSelection { fifo, short_first };
 // Generation jobs executed on the thread that calls run() or take().
 class GenerationQueue {
 public:
+#ifdef STRIX_SERVE_QUEUE_TEST
+    inline static std::chrono::steady_clock::time_point (*test_now)() = std::chrono::steady_clock::now;
+    struct Work { unsigned take_locks = 0, cancel_visits = 0, selection_visits = 0, lookahead_locks = 0, lookahead_visits = 0; };
+    mutable Work work;
+#endif
     explicit GenerationQueue(std::size_t max_queued = 64) : max_queued_(max_queued) {}
     // Install before starting the owner. HTTP wakeups share the existing idle wait.
     void set_idle_control(std::function<void()> control) { idle_control_ = std::move(control); }
@@ -318,11 +324,17 @@ public:
     // nullopt when none is queued; cancelled entries are finished here. Selection preserves
     // submission times and updates arrival-order queue positions after removal.
     std::optional<TakenJob> take(bool wait, bool short_first = false);
+    // Under the queue lock, reorder may veto short-first using the FIFO head's submission time;
+    // timed_eligible sees original submission times. Callbacks must not re-enter the queue.
     std::optional<TakenJob> take(bool wait, QueueSelection selection,
-        const std::function<bool(const GenerationJob&)>& eligible = {});
+        const std::function<bool(const GenerationJob&)>& eligible = {},
+        const std::function<bool(std::chrono::steady_clock::time_point)>& reorder = {},
+        const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& timed_eligible = {},
+        const std::function<void()>& overtake_blocked = {});
     // Explicit QueueSelection calls process only the initial batch; retry nullopt until stopping.
     // The bool/default API retains upstream FIFO/DeepSeek cancellation and wait semantics.
     [[nodiscard]] bool has_queued_work() const;
+    [[nodiscard]] bool has_waiting(const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& eligible) const;
     // The end of a taken job: fills queue_ms, updates the totals and finishes its ticket.
     // Engines may call it inside their own timed regions (a batching runner that times a prompt unit and completes a
     // request in it). The observation it adds reads and writes only the queue's own counters, never an engine's
@@ -337,7 +349,10 @@ public:
     [[nodiscard]] ObserveSnapshot observed() const;
 private:
     std::optional<TakenJob> take_selected(bool wait, bool short_first, bool cancel_first, bool finite,
-        const std::function<bool(const GenerationJob&)>& eligible = {});
+        const std::function<bool(const GenerationJob&)>& eligible = {},
+        const std::function<bool(std::chrono::steady_clock::time_point)>& reorder = {},
+        const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& timed_eligible = {},
+        const std::function<void()>& overtake_blocked = {});
     static bool still_observed(GenerationTicket& ticket) noexcept;
     static ObserveDelta observe_delta(const GenerationStats& stats, const std::string& error) noexcept;
     void observe_locked(const ObserveDelta& d) noexcept;

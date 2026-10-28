@@ -2,6 +2,8 @@
 #include <iostream>
 #include <limits>
 #include <sstream>
+#include <tuple>
+#include "strix/serve/short_first.hpp"
 #include "minimax/serve/minimax_control.hpp"
 #ifndef _WIN32
 #include <future>
@@ -72,9 +74,32 @@ struct WireTrace : Trace {
     }
 };
 #endif
+
 int main() {
     int bad = 0;
     const auto check = [&](bool ok) { if (!ok) { ++bad; std::cerr << "scheduler check failed\n"; } };
+    check(!ms::protects(10, 10, true));
+    check(!ms::protects(10, 9, false));
+    check(ms::protects(10, 9, true));
+    check(!ms::protects(10, 11, true));
+    check(ms::off_admission(ms::Sched::off, true, true));
+    check(ms::off_admission(ms::Sched::interleave, false, false));
+    check(!ms::off_admission(ms::Sched::interleave, true, false));
+    check(!ms::off_admission(ms::Sched::interleave, false, true));
+    check(!ms::waiting_short(10, 10, 20));  // a burst-mate is not an older waiting child
+    check(!ms::waiting_short(21, 10, 20));
+    check(ms::waiting_short(9, 10, 20));
+    // A short submitted during the long prefill has a pre-existing decoder and may nest.
+    const bool protected_child = ms::protects(30, 5, true);
+    check(protected_child && !ms::waiting_short(30, 10, 20));
+    check(ms::nest_timing(false, protected_child, ms::waiting_short(30, 10, 20)));
+    check(ms::nest_timing(false, false, ms::waiting_short(9, 10, 20)));
+    check(!ms::nest_timing(true, true, true));
+    check(!ms::nest_timing(false, false, ms::waiting_short(10, 10, 20)));
+    check(ms::nest_fits(32, 512, true, true, true, true, false, true, {}, 100, 1500, 20, 50, 0, protected_child));
+    check(!ms::reorder_prompts(ms::Sched::interleave, true, false));
+    check(ms::reorder_prompts(ms::Sched::interleave, true, true));
+    check(!ms::reorder_prompts(ms::Sched::off, true, true));
     check(ms::sched_mode(nullptr) == ms::Sched::interleave);
     check(ms::sched_mode("interleave") == ms::Sched::interleave);
     check(ms::sched_mode("off") == ms::Sched::off);
@@ -449,6 +474,22 @@ int main() {
     queue.finish(*fifo, {});
     check(take() == second);
     check(queue.snapshot().running == 0 && queue.snapshot().queued == 0);
+    // Exercise the production queue's atomic timestamp gate, not just the policy harness.
+    auto unprotected_long = submit(1000);
+    auto unprotected_short = submit(10);
+    auto gated = queue.take(false, sv::QueueSelection::short_first, {},
+        [](auto) { return false; });
+    check(gated && gated->ticket == unprotected_long && !gated->reordered);
+    if (gated) queue.finish(*gated, {});
+    check(queue.has_waiting([](const auto& j, auto) { return j.prompt.size() == 10; }));
+    check(take() == unprotected_short);
+    auto protected_long = submit(1000);
+    auto protected_short = submit(10);
+    gated = queue.take(false, sv::QueueSelection::short_first, {}, [](auto) { return true; },
+        [](const auto& j, auto submitted) { return j.prompt.size() <= 512 && submitted.time_since_epoch().count() > 0; });
+    check(gated && gated->ticket == protected_short && gated->reordered);
+    if (gated) queue.finish(*gated, {});
+    check(take() == protected_long);
     auto aged_long = submit(1000);
     for (unsigned i = 0; i < sv::kMaxQueueOvertakes; ++i) {
         auto small = submit(10);

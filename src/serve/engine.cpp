@@ -160,7 +160,12 @@ std::shared_ptr<GenerationTicket> GenerationQueue::submit(GenerationJob job) {
     ticket->period_ = observe_period();  // one read: armed (odd) and the period still_observed() compares
     job.observed = ticket->observed_ = (ticket->period_ & 1U) != 0U;
     job.observed_period = ticket->period_;
-    entries_.push_back({std::move(job), ticket, std::chrono::steady_clock::now()});
+#ifdef STRIX_SERVE_QUEUE_TEST
+    const auto submitted = test_now();
+#else
+    const auto submitted = std::chrono::steady_clock::now();
+#endif
+    entries_.push_back({std::move(job), ticket, submitted});
     ++totals_.queued;
     ready_.notify_one();
     return ticket;
@@ -240,18 +245,28 @@ std::optional<TakenJob> GenerationQueue::take(bool wait, bool short_first) {
 }
 
 std::optional<TakenJob> GenerationQueue::take(bool wait, QueueSelection selection,
-    const std::function<bool(const GenerationJob&)>& eligible) {
-    return take_selected(wait, selection == QueueSelection::short_first, selection == QueueSelection::short_first, true, eligible);
+    const std::function<bool(const GenerationJob&)>& eligible,
+    const std::function<bool(std::chrono::steady_clock::time_point)>& reorder,
+    const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& timed_eligible,
+    const std::function<void()>& overtake_blocked) {
+    return take_selected(wait, selection == QueueSelection::short_first, selection == QueueSelection::short_first, true, eligible, reorder, timed_eligible, overtake_blocked);
 }
 
 std::optional<TakenJob> GenerationQueue::take_selected(bool wait, bool short_first, bool cancel_first, bool finite,
-    const std::function<bool(const GenerationJob&)>& eligible) {
+    const std::function<bool(const GenerationJob&)>& eligible,
+    const std::function<bool(std::chrono::steady_clock::time_point)>& reorder,
+    const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& timed_eligible,
+    const std::function<void()>& overtake_blocked) {
     std::size_t remaining = 0;
     bool first = true;
     for (;;) {
         Entry entry;
+        bool reordered = false;
         {
             std::unique_lock lock(mutex_);
+#ifdef STRIX_SERVE_QUEUE_TEST
+            ++work.take_locks;
+#endif
             if ((!finite || first) && wait) ready_.wait(lock, [&] { return stopping_ || !entries_.empty() || control_pending_; });
             if (wait && entries_.empty() && control_pending_ && !stopping_) {
                 control_pending_ = false;
@@ -266,16 +281,30 @@ std::optional<TakenJob> GenerationQueue::take_selected(bool wait, bool short_fir
             // Producers cannot extend the explicit MiniMax batch during cancellation cleanup.
             const auto end = entries_.begin() + static_cast<std::ptrdiff_t>(remaining);
             auto it = end;
-            if (cancel_first) it = std::find_if(entries_.begin(), end,
-                [](const Entry& e) { return e.ticket->cancelled(); });
+            const bool ordered = short_first && (!reorder || reorder(entries_.front().submitted));
+            if (cancel_first && ordered) it = std::find_if(entries_.begin(), end,
+                [&](const Entry& e) {
+#ifdef STRIX_SERVE_QUEUE_TEST
+                    ++work.cancel_visits;
+#endif
+                    return e.ticket->cancelled(); });
             if (it == end) {
-                const auto pick = select_waiting(entries_, short_first,
+                const auto pick = select_waiting(entries_, ordered,
                     [](const auto& e) { return e.job.prompt.size(); },
                     [](auto& e) -> std::uint32_t& { return e.overtakes; }, remaining,
-                    [&](const Entry& e) { return !eligible || (!short_first && e.ticket->cancelled()) || eligible(e.job); });
+                    [&](const Entry& e) {
+#ifdef STRIX_SERVE_QUEUE_TEST
+                        ++work.selection_visits;
+#endif
+                        const bool admitted = (!ordered && e.ticket->cancelled()) ||
+                            ((!eligible || eligible(e.job)) && (!timed_eligible || timed_eligible(e.job, e.submitted)));
+                        if (!admitted && ordered && e.overtakes >= kMaxQueueOvertakes && overtake_blocked) overtake_blocked();
+                        return admitted;
+                    });
                 if (pick == remaining) return std::nullopt;
                 it = entries_.begin() + static_cast<std::ptrdiff_t>(pick);
             }
+            reordered = it != entries_.begin();
             entry = std::move(*it);
             entries_.erase(it);
             --remaining;
@@ -285,7 +314,7 @@ std::optional<TakenJob> GenerationQueue::take_selected(bool wait, bool short_fir
             std::uint64_t position = 0;
             for (auto& waiting : entries_) waiting.ticket->queue_position_.store(position++);
         }
-        TakenJob taken{std::move(entry.job), entry.ticket, entry.submitted, std::chrono::steady_clock::now()};
+        TakenJob taken{std::move(entry.job), entry.ticket, entry.submitted, std::chrono::steady_clock::now(), reordered};
         if (taken.ticket->cancelled()) {
             GenerationStats stats;
             stats.finish = "cancelled";
@@ -391,6 +420,19 @@ void GenerationQueue::shutdown() {
         stats.finish = "cancelled";
         entry.ticket->finish(stats, "server shutting down");
     }
+}
+
+bool GenerationQueue::has_waiting(const std::function<bool(const GenerationJob&, std::chrono::steady_clock::time_point)>& eligible) const {
+    std::lock_guard lock(mutex_);
+#ifdef STRIX_SERVE_QUEUE_TEST
+    ++work.lookahead_locks;
+#endif
+    return std::any_of(entries_.begin(), entries_.end(), [&](const Entry& e) {
+#ifdef STRIX_SERVE_QUEUE_TEST
+        ++work.lookahead_visits;
+#endif
+        return !e.ticket->cancelled() && eligible(e.job, e.submitted);
+    });
 }
 
 bool GenerationQueue::has_queued_work() const {

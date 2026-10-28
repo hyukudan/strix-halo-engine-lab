@@ -509,7 +509,7 @@ The MiniMax TP2 server (rank 0 serves HTTP; rank 1 replays the control blocks) h
 `src/minimax/serve/minimax_api.*`, with the same routes plus:
 
 The resolver defaults to `STRIX_MM_SERVE_SCHED=interleave`, `STRIX_MM_SERVE_SERVICE_MS=250`
-and `STRIX_MM_SERVE_SHORT_FIRST=1`. GPU exactness and HTTP load measurements for this branch appear below
+and `STRIX_MM_SERVE_SHORT_FIRST=1`. GPU exactness and HTTP load measurements appear below.
 `STRIX_MM_SERVE_SCHED=off` restores whole-prefill scheduling and FIFO admission;
 `STRIX_MM_BASELINE=1` also selects that path unless explicitly overridden.
 
@@ -528,10 +528,48 @@ before transport creation; the peer then fails after its transport timeout (defa
 Deadline-based admission and layer budgeting passed both-rank GPU exactness checks and were
 measured under HTTP load together with nested admission; results and open costs appear below.
 
+Rank 0 protects a decoder for a candidate only when that decoder has emitted its first token
+strictly before the candidate's queue submission time. Equal timestamps do not qualify. Protection
+uses the first emission, never the most recent emission or admission time. With no protected decoder
+and no warranted nesting, admission follows exactly the OFF path: FIFO, one unlimited whole prefill,
+then another admission before any decode cycle. A pure burst therefore keeps OFF's operation sequence,
+row counts and batching, including when burst-mates have already emitted their first tokens.
+No new environment switch is introduced; existing off switches retain their meanings.
+
+Short-first may reorder only when the FIFO head has a protected decoder. Every later submission then
+has that same protected decoder; unprotected burst prompts retain FIFO order. A short is an older waiting
+child only if its submission strictly precedes both the parent's submission and the start of the parent's
+prefill. Requiring both excludes burst-mates from justifying a split. Otherwise a short needs its own
+protected decoder to nest, which permits shorts arriving during a long prefill beside pre-existing decoders.
+Nesting also requires the existing bank, size, quota and deadline checks; an older waiting child can
+warrant bounded admission only for a long prompt (over 512 rows). The effective request policy is retained
+across resumes and decoder cancellation/slot reuse;
+whole admissions retain OFF cancellation semantics. Cancelled tickets never grant protection, regardless
+of their admission policy. A whole admission never polls or parks midway through its prefill.
+
+`strix-minimax-lead-tests` runs the production rank-0 Lead loop with a fake clock and engine/control
+sink (no GPU). Submissions become visible only at their due times, including during fake prefill/step
+execution. It compares emitted control fields, checkpoints, slot generations, ordered rows and layer
+budgets against OFF for 1, 4 and 8 equal-time descending-size bursts, before-first-emission arrivals,
+cancellation before admission and during whole prefill, and cancelled-decoder slot retention with DSpark
+disabled/enabled. Test-only counters compare queue selection locks, cancellation scans and older-child
+lookahead work against OFF. Mixed traces check a short arriving during a bounded parent, a future short
+that cannot overtake a reserved long, cancelled/completed protectors and slot reuse. Runtime-policy
+traces apply the same shared policy/epoch transition as `/admin/sched`; they cover OFF-to-interleave
+with a cancelled old-policy decoder, interleave-to-OFF during a bounded parent and a pending
+reservation that stays ahead of a later short after switching OFF. A mixed trace also checks protector
+completion during an open parent and cancellation of a bounded prefill at its returned boundary.
+They do not exercise HTTP parsing, GPU arithmetic, native timing
+or both-rank replay.
+The GPU measurements below confirm the burst identity with OFF; host sequence equality alone does not
+establish a universal aggregate-throughput guarantee for mixed loads.
+
+With a protected decoder, the deadline policy below remains in force.
+
 Before opening a selected fresh prompt, rank 0 checks elapsed time since the oldest decoder's last token plus
 predicted prefill, the next complete decode cycle including the candidate row, and a 20 ms control margin.
 The sum must fit the **minimum gap target over all live requests** (`STRIX_MM_SERVE_GAP_MS`, default 1500).
-Whole prefills can run consecutively only while this deadline permits them. Otherwise rank 0 decodes immediately;
+Protected whole prefills can run consecutively only while this deadline permits them. Otherwise rank 0 decodes immediately;
 it never waits for more arrivals to enlarge a batch. A selected candidate is reserved until admission or cancellation;
 its queue timing includes that reservation. Long candidates that cannot fit even after a cycle open as bounded tasks.
 
@@ -542,12 +580,12 @@ same row bucket (scaled up for more rows, never down), plus the fixed-cost estim
 include selection, drafting, verification, emission and the counter tail. Unmeasured cycle row counts use a scaled
 estimate. These are conservative predictions, not proven bounds on future GPU or transport costs.
 
-When idle, unit size uses the service target (250 ms by default) to inspect arrivals and cancellations at boundaries.
-Only a fresh idle prompt predicted within that target runs whole. Service 0 makes idle resumes unlimited; with
-waiting decoders it still subtracts elapsed time, the next cycle and margin from the gap. Zero layers means decode
-first. If one indivisible layer still cannot fit just after decoding, the scheduler explicitly forces one layer to
-make progress; idle units likewise force one layer if the service target is too small. Such overruns are unavoidable
-without changing the numerical unit. Gap values must be finite and at least 1; service values must be finite,
+Unprotected admissions without warranted nesting run whole even when their prediction exceeds the
+idle service target. For bounded tasks without decoders, unit size uses the service target (250 ms by
+default); service 0 makes those resumes unlimited. With waiting decoders it still subtracts elapsed time,
+the next cycle and margin from the gap. Zero layers means decode first. If one indivisible layer still
+cannot fit just after decoding, the scheduler explicitly forces one layer to make progress. Such overruns
+are unavoidable without changing the numerical unit. Gap values must be finite and at least 1; service values must be finite,
 nonnegative and nonoverflowing. Profiling and FP32 prefill retain forced whole-prefill resumes and report
 `profiling` or `fp32_prefill`; these modes cannot enforce decoder gaps.
 
@@ -557,6 +595,9 @@ layout across decode cycles; decode uses a separate table. A slot change retains
 lifetime synchronization. Transport and CRC counters remain global across pauses and bank switches.
 
 `STRIX_MM_SERVE_TIMELINE=1` enables rank-0 JSON lines (`event=mmserve-timeline`), default off and read once at startup.
+Nested-candidate rejections emit `nest-reject` with reason `timing`, `no boundary`, `bank`, `quota`,
+`fit`, `overtake` or `decode-needed`; candidate rows accompany eligibility rejections. With the timeline
+off, rejection diagnostics read no clocks and allocate no records.
 Records cover `admit`, `unit`, `step`, `idle` and `heartbeat`, with monotonic operation ID, epoch, steady-clock
 `t_start_us`/`t_end_us` since scheduler start, rows, slot/request/position/token-index summaries, prefill chunk members,
 layer range, completion age/slack and `whole`/`defer`/`deadline` reason. Admission records describe prefill begin separately from
@@ -566,8 +607,8 @@ emission/counter tail. Records add no device synchronization and contain no prom
 until idle or shutdown, with excess counted by `mmserve-timeline-drops`; flushing is outside active operations.
 The disabled path constructs no records and performs no instrumentation clock reads or allocations.
 
-Short-first chooses the smallest remaining queued prompt, with arrival-order ties and at most eight later
-admissions overtaking any request. `STRIX_MM_SERVE_SHORT_FIRST=0` selects FIFO. `STRIX_MM_SERVE_NEST=1` (default ON) also permits one short prompt to nest at a returned long-prefill
+When the FIFO head has a protected decoder, short-first chooses the smallest remaining queued prompt,
+with arrival-order ties and at most eight later admissions overtaking any request. `STRIX_MM_SERVE_SHORT_FIRST=0` selects FIFO. `STRIX_MM_SERVE_NEST=1` (default ON) also permits one short prompt to nest at a returned long-prefill
 layer boundary. `STRIX_MM_SERVE_NEST=0` or the strict boolean `/admin/sched` field `nest=false` disables new children.
 Nested admission passed both-rank GPU exactness checks for bounded 512-token and whole 511-token children;
 the mixed-load measurements below include nested admission. No slot-capacity expansion is performed.
@@ -693,8 +734,10 @@ cancellation latency or mixed-load performance; HTTP load measurements are repor
 ### Measured deadline-based and nested serving policy
 
 Measured on GPU with two Strix Halo nodes over 2x USB4 Gen3, PerfOpt kernel, MiniMax M3.1 Flash
-EXL3 3.06 bpw TP2, using binaries of this branch. All comparisons below are policy ON vs OFF.
-Two runs on this code, run 1 and run 2, show run-to-run spread; paired run values below are in that order.
+EXL3 3.06 bpw TP2, with the protection rule above. One binary per comparison, built without a
+compiler cache in a fresh build directory; policy ON (the default, no `STRIX_MM_SERVE_*` variable set)
+and OFF (`STRIX_MM_SERVE_SCHED=off`) alternate inside each two-node turn, in both orders. All
+comparisons below are policy ON vs OFF of the same binary.
 
 Every `--resume-check` arm compares complete fixed-length token IDs, committed state, a digest of
 all normalized prompt output rows (every chunk and grouped member), and logits of the first generated
@@ -706,9 +749,7 @@ Short-first reorder compares both requests
 against FIFO standalone execution. Nested arms compare parent, child and background requests against
 standalone B1 execution, and check parked activation/checkpoint preservation. Either rank's mismatch
 fails both ranks. The legacy, reorder and nested arms use the same prompt-output/first-head capture.
-
-The recorded GPU runs below used complete 128-token continuations. The extended legacy/reorder
-output and first-head coverage requires GPU requalification after this change:
+All runs used complete 128-token continuations:
 
 | Cases | Result on both ranks |
 |---|---|
@@ -718,35 +759,38 @@ output and first-head coverage requires GPU requalification after this change:
 
 Under HTTP load, every request's token IDs were identical with the policy ON and OFF.
 
-Distinct-prompt bursts used eight different questions, generating 64 tokens each:
+Bursts (all requests submitted before any first token, 64 tokens each) take OFF's operation path:
+every request is one whole prefill and both policies run the same number of decode cycles. Aggregate
+tok/s, ON / OFF, two turns (ON first, then OFF first):
 
-| Clients | Aggregate tok/s, ON (run 1 / run 2) | Aggregate tok/s, OFF (run 1 / run 2) | Change ON vs OFF |
-|---|---|---|---|
-| 4 | 28.1 / 29.2 | 30.0 / 31.1 | -6 % / -6 % |
-| 8 | 31.5 / 32.7 | 32.3 / 35.8 | -2.6 % / -8.7 % |
-
-Median TTFT was within 0.1 s of OFF. At 8 clients, the worst inter-token gap was
-1.19 / 1.11 s ON vs 7.49 / 6.79 s OFF. The OFF arm itself varied from 32.3 to 35.8 tok/s
-between runs at 8 clients.
-
-Mixed load started three decoding streams, then a 4539-token prompt, with short prompts arriving 1 s
-and 3 s later:
-
-| Metric | ON (run 1 / run 2) | OFF (run 1 / run 2) |
+| Burst | Turn 1 ON / OFF | Turn 2 ON / OFF |
 |---|---|---|
-| First short prompt TTFT (s) | 1.19 / 1.03 | 14.2 / 13.4 |
-| Second short prompt TTFT (s) | 1.25 / 2.06 | 13.2 / 12.5 |
-| Long prompt TTFT (s) | 16.9 / 16.0 | 14.1 / 13.4 |
-| Decoders' p90 / max chunk gap (ms), run 1 | 65 / 1145 | 53 / 17248 |
-| Decoders' p90 / max chunk gap (ms), run 2 | 60 / 1240 | 51 / 16556 |
+| Distinct prompts, C1 | 17.42 / 17.36 | 17.38 / 17.38 |
+| Distinct prompts, C4 | 31.33 / 31.25 | 31.34 / 31.34 |
+| Distinct prompts, C8 | 36.28 / 36.10 | 36.48 / 36.61 |
+| Identical prompts, C4 | 36.65 / 36.40 | 36.59 / 36.58 |
+| Identical prompts, C8 | 43.74 / 43.78 | 43.81 / 42.79 |
 
-The second short prompt is admitted as a nested prefill at a layer boundary of the long prompt.
-The open costs are burst aggregate throughput a few percent below OFF (up to 8.7 % in these runs)
-and the long prompt's TTFT about +20 % in mixed load (+20 % / +19 %). Optimization continues on
-decode MoE cost for diverse rows and long-prompt unit sizing, without promised numbers.
+The total wall time of all burst sets differed by +0.05 % and -1.1 % (ON vs OFF). An earlier build of
+the same rule measured twelve alternating arms with a mean difference of 0.0 %. Within-arm
+differences are run-to-run noise: ON and OFF issue the same operations.
 
-Caveat: identical-prompt bursts overstate the OFF arm because identical lockstep rows share MoE experts.
-Use the distinct-prompt results above to assess burst performance.
+Mixed load started three decoding streams (384 tokens each), then a 4539-token prompt, with 183-token
+prompts arriving 1 s and 3 s later. Three turns, ON / OFF:
+
+| Metric | Turn 1 | Turn 2 | Turn 3 |
+|---|---|---|---|
+| Makespan, all six requests (s) | 36.70 / 36.60 | 35.69 / 35.67 | 35.74 / 35.61 |
+| First short prompt TTFT (s) | 1.13 / 12.69 | 1.22 / 12.24 | 1.24 / 12.19 |
+| Second short prompt TTFT (s) | 1.11 / 11.60 | 1.07 / 11.15 | 1.11 / 11.09 |
+| Long prompt TTFT (s) | 15.87 / 12.76 | 15.13 / 12.34 | 15.21 / 12.28 |
+| Decoders' p90 / max chunk gap (ms) | 52 / 2080 vs 52 / 15723 | 51 / 1929 vs 50 / 15290 | 51 / 1935 vs 50 / 15279 |
+
+Mixed aggregate throughput is within 0.4 % of OFF (makespan +0.27 %, +0.06 %, +0.36 %). The second
+short prompt is admitted as a nested prefill at a layer boundary of the long prompt. The long prompt's
+TTFT is 19-24 % above OFF because its layer units yield to the decoders; removing that cost needs
+decode steps that run concurrently with prefill units, which is work in progress. Use distinct
+prompts when re-measuring bursts so identical lockstep rows do not inflate expert reuse.
 
 ## Tokenizer and chat template
 

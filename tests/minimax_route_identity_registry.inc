@@ -72,7 +72,7 @@
 {"draft-model", 'b', "target model hash+draft asset hashes+dtype+head index", "DSpark reference and target acceptance verification; explicit --dspark-exl3/--dspark-head", ""},
 // apps/minimax_rank_main.cpp:488
 {"draft-markov", 'c', "BLOCKED draft-history identity until request fixes method+C+H+vocabulary+seed", "UNCOVERED candidate/full arithmetic-history equality; target greedy verification is a separate gate", "Markov candidate pruning before rank-dot correction/argmax (full vocabulary vs C/H subset)"},
-// apps/minimax_serve_main.cpp:614
+// src/minimax/serve/minimax_lead.hpp: admit / effective request policy
 {"draft-policy", 'a', "target prefix+per-row vector arithmetic", "speculative tokens == greedy tested chats; rows == alone hardware gate for 1..8 rows; not universal workload qualification", ""},
 // apps/minimax_rank_main.cpp:292
 {"import-plan", 'b', "target model+arithmetic profile+original chunk list+position/cut+payload digest", "rtxpf_state_compare.py / rank import comparisons; UNCOVERED cross-profile handoff, explicit blocked gate", ""},
@@ -94,5 +94,5 @@
 {"diagnostic-cores", 'c', "BLOCKED in production; diagnostic-only plan", "UNCOVERED for production by design; expected-wrong-output timing APIs", "first skipped A/weight load or attention compute in diagnostic producer"},
 // src/minimax/rtxpf/cuda/mm_rtx_kernels.cu:601
 {"rtx-attention", 'c', "BLOCKED handoff until MSA cache/output bytes match exact producer plan", "UNCOVERED full native/CUDA MSA model fidelity for all positions/cuts", "RTX MSA index score or attention QK/PV legacy vs shared (first op needs CUDA byte gate)"},
-// src/minimax/engine/engine.hip: park_task / resume_parked; apps/minimax_serve_main.cpp: nested_candidate
+// src/minimax/engine/engine.hip: park_task / resume_parked; src/minimax/serve/minimax_lead.hpp: nested_candidate
 {"prefill-nest", 'a', "model+profile+original ordered chunk/group rows+positions+slot generation; sequential bank ownership", "GPU covered on both ranks, check-only resume-check: 512-token child in 7-layer units with 4608-token parent parked at layers 7/31 beside a decoder, 10/10 IDENTICAL; whole 511-token child with parent parked at layer 17, 6/6 IDENTICAL; complete 128-token continuations, all prompt outputs, committed state, first/continuation logits, frozen groups and standalone B1/mixed decode; HTTP token IDs identical policy ON/OFF; timing evidence in serving documentation", ""},
