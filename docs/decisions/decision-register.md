@@ -1055,6 +1055,17 @@ At C2 and C4 every joint run is above every earlier run. 84/84 requests return t
 the gates compare 3,328 full FP32 logit rows and 217 committed state components with C1. Coding chat at C1 is too
 noisy (68.8-91.0 tok/s in the control arm) to attribute its median change to the switch.
 
+The joint rule now defaults to `calibrated-c3`: calibrated predictor acceptance
+for at least three members in the joint group at plan time, production for one
+or two. Explicit `STRIX_MTP_JOINT_PLAN=production` (or `0`) restores the old
+rule; baseline defaults to production and explicit rules win. The rule file
+supports the same names for in-process A/B. Calibrated versus production measured
+C4 +2.3–3.1 % median wall aggregate throughput, C2 −1.0 to −1.4 %, and C8 +0.55 %
+(16 bracketed code1k/prose1k pairs, 11/16 positive), with identical complete
+token IDs. The threshold preserves the C2 rule where six-row topology exclusion
+couples R4-to-R2 trims. No measured C3 gain or new logits/state digest claim.
+See the [rule contract and evidence limits](../engine/scheduling/joint-serving-windows.md#joint-plan-rule).
+
 ## D-059: persistent draft score, attention tail and draft cache (`STRIX_QPERSIST_*`)
 
 `STRIX_QPERSIST_DRAFT_SCORE=1`, `STRIX_QPERSIST_QSA_TAIL=1` and `STRIX_QPERSIST_MTP_CACHE=1` run the MTP QK score,

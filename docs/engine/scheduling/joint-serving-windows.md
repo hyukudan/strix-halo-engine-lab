@@ -1,4 +1,4 @@
-# Joint serving windows (experimental)
+# Joint serving windows (opt-in)
 
 `STRIX_MTP_BATCH_JOINT=1` enables joint window scheduling on the native HTTP
 batch route. It is off by default. A single decoding request continues to use
@@ -50,3 +50,41 @@ fixed state components are compared; unused cache tails and scratch are outside
 the committed-state contract. The final C3 exploration check pads R2+R2+R2 to
 R4+R2+R2 when admission allows it. Context/budget tails retain their smaller valid
 chunks when they cannot be padded.
+
+## Joint plan rule
+
+When joint windows are enabled, `STRIX_MTP_JOINT_PLAN` defaults to
+`calibrated-c3`: use the existing `calibrated` acceptance estimate for groups
+with at least three members, and the `production` estimate for one or two.
+The count is the number of members in the joint plan group at `plan()` time,
+latched before drafting for that plan's `choose()`. It is independent of server
+slot capacity, other active groups, physical row count and retained draft count.
+Selection is deterministic given the plan group, controller history and costs.
+The ordinary single-request route remains unchanged.
+
+Calibration changes only the post-draft predictor acceptance estimate: each
+probability bin uses the slot's observed acceptance, shrunk toward the
+controller-wide bin. Context rows, plan-time priors, exploration and target
+verification retain their existing rules. Explicit `calibrated` applies at all
+group sizes; `production` (or `0`) restores the previous rule at all sizes.
+Explicit `pooled`, `cap4` and `cap2` rules retain their existing meanings and
+can be combined with a calibrated rule. `--baseline` / `STRIX_BASELINE=1`
+defaults to production; an explicit plan rule overrides that default.
+
+In-process A/B can select `production`, `calibrated` or `calibrated-c3` through
+`STRIX_MTP_JOINT_RULE_FILE`. The file is read at each admission, using the same
+parser; missing/empty files use the startup environment/default rule. Existing
+`wave=N`, `snapshot` and `restore` controls retain controller snapshot/replay
+behavior. Admission logs include `cal_min_members` (3 for the gated rule).
+
+Measured calibrated versus production on the same public-main binary with
+in-process controller snapshot/restore: C4 median wall aggregate throughput
++2.3–3.1 % (prose1k/prose8k/code1k); C2 −1.0 to −1.4 %; C8 median +0.55 % over
+16 bracketed pairs (code1k and prose1k), 11/16 positive. Complete token IDs were
+identical in those measurements; no new logits/state digest claim is made.
+The C2 loss is consistent with coupled R4-to-R2 trims: the six-row R2+R4
+topology is excluded because it rereads weights. The gated default preserves
+the production rule there. These measurements support the threshold policy;
+they do not establish a speedup for every workload or a measured C3 gain.
+CPU controller tests cover parsing, baseline/explicit precedence and the switch
+at group sizes 1/2/3/4/8, including a return below the threshold.
