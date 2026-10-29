@@ -287,3 +287,25 @@ through interrupts (no polling).
   parallelism pays.
 - `strix-dist-tcp-probe` over the 1 GbE LAN between the two nodes: round trip 56 us at 64 B, 410 us at 20 KB,
   0.118 GB/s one way. TCP over this link is for bring-up only.
+
+## MiniMax grouped async start
+
+MiniMax grouped prefill enables `start_async` on its own communicator by default,
+without setting the global async environment switch. Each grouped call requires
+every member to have at least `STRIX_MM_PF_ASYNC_MIN_ROWS` rows (default 2048;
+0 = unconditional); rejected groups use ordinary start/finish with the same
+scheduling as `STRIX_MM_PF_ASYNC_START=0`. Admitted calls publish each member's
+receive destination at start and guards it with a startup-allocated last-reader
+event. The worker protects pinned receive staging before reuse. A source-free
+event guards the next producer; `STRIX_MM_PF_LATE_SRC_FENCE=0` instead waits
+immediately after successful start. `STRIX_MM_PF_ASYNC_START=0` restores ordinary
+start/finish. Unsupported routes fall back without recording caller events.
+Wire payloads, sequence/tags, framing and CRC are unchanged. Pipeline and ordinary
+host reuse timing have separate counters; pipeline worker time overlaps other work.
+`cancel_pending` poisons the communicator and joins host submission workers; callers
+must then drain GPU work before releasing their events or buffers.
+
+Two-node TP2 measurements have identical token IDs in every arm and show
+balanced 4096+3844 lone-prefill gains of -2.3 / -2.5 %. The neutral 4096+443
+regime is gated off by default. Full prompt-output/state/logit and complete-workload
+lifetime qualification remain pending. See the [engine contract and lifetime/qualification procedure](../../minimax-grouped-prefill.md).

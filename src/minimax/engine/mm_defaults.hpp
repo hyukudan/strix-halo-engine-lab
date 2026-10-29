@@ -9,6 +9,7 @@
 // environment, so the readers in the engine, the exchange modules and the dist layer see exactly what
 // --print-effective-config prints.
 #include <cstdint>
+#include <cstddef>
 #include <functional>
 #include <span>
 #include <string>
@@ -27,6 +28,15 @@ struct Item {
 inline constexpr const char* kBaselineEnv = "STRIX_MM_BASELINE";
 
 std::span<const Item> items();
+
+// Startup parameter, independent of the baseline switch (async start itself is
+// switched off by baseline). Zero restores unconditional grouped async start.
+std::size_t pf_async_min_rows(const char* value);
+inline bool pf_async_group(bool enabled, std::span<const std::size_t> rows, std::size_t minimum) {
+    if (!enabled || rows.empty()) return false;
+    for (const auto n : rows) if (n < minimum) return false;
+    return true;
+}
 
 enum class Source { on, baseline, env };
 struct Resolved {

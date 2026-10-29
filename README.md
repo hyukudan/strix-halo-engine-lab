@@ -395,6 +395,8 @@ GSQ auto reaches about 64 % (113.8 tok/s ceiling) and the quality recipe about 6
 
 All rows: EXL3 trellis weights at 3.06 bpw, two Strix Halo nodes TP2 over USB4, greedy reference.
 The engine is Production; the qualified optimization sets below are public and on by default.
+The [grouped host prefill scheduling changes](docs/minimax-grouped-prefill.md) default on;
+their native exactness qualification and measurements remain pending.
 
 | Mode | Prompt / context | Measured result | Date | Build / exactness |
 |---|---|---|---|---|

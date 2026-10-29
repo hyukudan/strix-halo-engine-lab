@@ -254,6 +254,7 @@ void config_receipts() {
     const std::map<std::string, std::string> pending_policy = {
         {"STRIX_MM_SERVE_SCHED", "interleave"}, {"STRIX_MM_SERVE_SERVICE_MS", "250"},
         {"STRIX_MM_SERVE_SHORT_FIRST", "1"}, {"STRIX_MM_SERVE_NEST", "1"},
+        {"STRIX_MM_PF_ASYNC_START", "1"}, {"STRIX_MM_PF_LATE_SRC_FENCE", "1"},
     };
     std::size_t pending_entries = 0;
     for (const auto& resolved : resolve(empty)) {

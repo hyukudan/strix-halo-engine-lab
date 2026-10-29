@@ -1680,7 +1680,7 @@ public:
     std::vector<hipEvent_t> ready;
     std::atomic<void*> destination{nullptr};
     bool async = false;
-    double stage = 0, wire = 0, check_seconds = 0;
+    double stage = 0, wire = 0, check_seconds = 0, reuse_wait = 0;
     std::unique_ptr<Worker> crc_send, crc_receive;
     std::atomic<std::size_t> prepared{0}, received{0};
     std::atomic<bool> failed{false};
@@ -2035,6 +2035,21 @@ std::string Communicator::transport_name() const {
     return direct_ ? direct_->name() + " + control " + transport_->name() + "; routes " + route_text() : transport_->name();
 }
 
+void Communicator::cancel_pending(const std::string& reason) noexcept {
+    if (terminal_.empty()) terminal_ = reason;
+    cancel_.store(true, std::memory_order_release);
+    if (pipeline_) pipeline_->fail();
+    transport_->abort(reason);
+    // Worker destruction joins even after a timeout/error. No host job may submit
+    // another HIP operation against caller-owned events after this returns.
+    progress_.reset();
+    if (pipeline_) {
+        pipeline_->crc_send.reset();
+        pipeline_->crc_receive.reset();
+    }
+    started_ = pipeline_started_ = false;
+}
+
 Communicator::~Communicator() {
     if (trace_pending_) try { flush_trace(); } catch (...) {}
     direct_.reset(); // waits for its in-flight exchange and releases its streams
@@ -2269,7 +2284,9 @@ void Communicator::start_pipeline(hipStream_t stream, const void* local, std::si
     current_ = History{sequence_, bytes, tag_.kind, tag_.layer, tag_.request, 0, 0, 'P'};
     set_phase(Phase::reuse_wait);
     const bool defer_reuse = remote && receive_pending_;
+    p.reuse_wait = 0;
     if (receive_pending_ && !remote) {
+        const auto reuse_begin = std::chrono::steady_clock::now();
         const auto deadline = entry + wait_timeout_;
         for (;;) {
             const auto e = hipEventQuery(receive_done_);
@@ -2278,6 +2295,7 @@ void Communicator::start_pipeline(hipStream_t stream, const void* local, std::si
             if (std::chrono::steady_clock::now() >= deadline) stop("pipeline receive-buffer reuse timeout");
             cpu_relax();
         }
+        p.reuse_wait = std::chrono::duration<double>(std::chrono::steady_clock::now() - reuse_begin).count();
     }
     receive_pending_ = false;
     p.async = remote != nullptr;
@@ -2399,6 +2417,7 @@ void Communicator::start_pipeline(hipStream_t stream, const void* local, std::si
         // receive staging. Guard reuse here, not on the submitting host thread.
         // This query precedes this job's new record of receive_done_.
         if (defer_reuse) {
+            const auto reuse_begin = std::chrono::steady_clock::now();
             const auto deadline = started_at_ + wait_timeout_;
             for (unsigned spin = 0;; ++spin) {
                 const auto e = hipEventQuery(receive_done_);
@@ -2409,6 +2428,7 @@ void Communicator::start_pipeline(hipStream_t stream, const void* local, std::si
                     throw std::runtime_error("pipeline receive-buffer reuse timeout");
                 cpu_relax();
             }
+            q.reuse_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - reuse_begin).count();
         }
         void* destination = nullptr;
         for (std::size_t at = 0, k = 0; at < bytes_; at += q.chunk, ++k) {
@@ -2467,6 +2487,7 @@ void Communicator::finish_pipeline(hipStream_t stream, void* remote) {
     ++stats_.exchanges;
     stats_.bytes_sent += bytes_;
     const auto end = std::chrono::steady_clock::now();
+    stats_.pipeline_reuse_wait += p.reuse_wait; // worker joined above: no concurrent stats access
     stats_.stage += p.stage;
     stats_.wire += p.wire;
     stats_.check += p.check_seconds;
@@ -2488,6 +2509,7 @@ void Communicator::start_host(hipStream_t stream, const void* local, std::size_t
     set_phase(Phase::reuse_wait);
     // The receive buffer is reused only after the CPU has seen the previous copy out of it complete.
     if (!staged_started_ && receive_pending_) {
+        const auto reuse_begin = std::chrono::steady_clock::now();
         const auto deadline = entry + wait_timeout_;
         for (hipError_t ready; (ready = hipEventQuery(receive_done_)) != hipSuccess;) {
             if (ready != hipErrorNotReady) check(ready, "previous receive copy");
@@ -2495,6 +2517,7 @@ void Communicator::start_host(hipStream_t stream, const void* local, std::size_t
                 stop("the previous exchange's copy out of the receive buffer did not complete within " + std::to_string(wait_timeout_.count()) + " ms");
             cpu_relax();
         }
+        stats_.host_reuse_wait += std::chrono::duration<double>(std::chrono::steady_clock::now() - reuse_begin).count();
     }
     if (!staged_started_) receive_pending_ = false;
     // The copy is ordered after the producer of `local` on the stream; the progress thread waits for it on

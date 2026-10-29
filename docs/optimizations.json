@@ -1773,5 +1773,27 @@
     "preconditions": "Rank 0 protects only decoders whose first emission strictly predates the candidate submission. Without protection or warranted nesting, use FIFO whole prefill and admit again before decoding, exactly as OFF. Short-first requires a protected FIFO head. An older waiting short strictly predates both parent submission and prefill start; later shorts need their own protected decoder. Existing nesting size, bank, quota and deadline guards apply. Rank 1 replays rank 0; CPU traces compare full operation order and rows for 1/4/8 equal-time bursts. GPU re-measurement pending.",
     "off_switch": "STRIX_MM_SERVE_SCHED=off restores whole-prefill FIFO; STRIX_MM_SERVE_SERVICE_MS=0 removes the idle unit cap; STRIX_MM_SERVE_SHORT_FIRST=0 restores FIFO; STRIX_MM_BASELINE=1",
     "doc_anchor": "docs/engine/serving/serving.md#minimax-serve-strix-minimax-serve"
+  },
+  {
+    "engine": "minimax",
+    "name": "Grouped prefill early destination",
+    "flag_or_env": "STRIX_MM_PF_ASYNC_START",
+    "default": "ON",
+    "exact": "Complete token IDs identical in every measured GPU arm. Scheduling-only contract: unchanged producer/post kernels, group rows, payload bytes, rank summation order, sequence/tags and chunk CRC. Full native cross-binary prompt-output/state/logit and complete-workload lifetime qualification pending.",
+    "gain": "Two-node TP2, ungated build, both changes together: balanced 7940-token lone prefill (4096+3844), scheduler off, ABBA 17.44/17.49 s vs off 18.00/17.82 s (-2.5 %); BAAB 17.25/17.42 vs 17.70/17.79 s (-2.3 %). 4539 (4096+443) lone prefill neutral, means 11.64 vs 11.55 s (8+8); mixed 3 decoders + long + 2 shorts default policy: long TTFT ABBA 16.00 vs 15.50 s, BAAB 15.29 vs 15.47 s, earlier AB/BA deltas +0.26/+0.84 s, unresolved neutral to slightly slower; gated off by default. No separate per-switch gain claim.",
+    "preconditions": "Early receive destination and worker-side pinned staging reuse; immediate source fence when the late-fence switch is off. Per grouped call, EVERY member must have at least STRIX_MM_PF_ASYNC_MIN_ROWS rows (default 2048; 0 removes the row gate). Otherwise ordinary comm.start, byte-identical scheduling to STRIX_MM_PF_ASYNC_START=0. Deterministic member-row decision on both ranks; global off always wins.",
+    "off_switch": "STRIX_MM_PF_ASYNC_START=0 (also STRIX_MM_BASELINE=1 unless explicitly overridden)",
+    "doc_anchor": "docs/minimax-grouped-prefill.md"
+  },
+  {
+    "engine": "minimax",
+    "name": "Grouped prefill late source fence",
+    "flag_or_env": "STRIX_MM_PF_LATE_SRC_FENCE",
+    "default": "ON",
+    "exact": "Complete token IDs identical in every measured GPU arm. Scheduling-only contract: unchanged producer/post kernels, group rows, payload bytes, rank summation order, sequence/tags and chunk CRC. Full native cross-binary prompt-output/state/logit and complete-workload lifetime qualification pending.",
+    "gain": "Two-node TP2, ungated build, both changes together: balanced 7940-token lone prefill (4096+3844), scheduler off, ABBA 17.44/17.49 s vs off 18.00/17.82 s (-2.5 %); BAAB 17.25/17.42 vs 17.70/17.79 s (-2.3 %). 4539 (4096+443) lone prefill neutral, means 11.64 vs 11.55 s (8+8); mixed 3 decoders + long + 2 shorts default policy: long TTFT ABBA 16.00 vs 15.50 s, BAAB 15.29 vs 15.47 s, earlier AB/BA deltas +0.26/+0.84 s, unresolved neutral to slightly slower; gated off by default. No separate per-switch gain claim.",
+    "preconditions": "Wait before the next producer overwrites its member partial; requires successful async start; compute scratch remains serialized. Per grouped call, EVERY member must have at least STRIX_MM_PF_ASYNC_MIN_ROWS rows (default 2048; 0 removes the row gate). Otherwise ordinary comm.start, byte-identical scheduling to STRIX_MM_PF_ASYNC_START=0. Deterministic member-row decision on both ranks; global off always wins.",
+    "off_switch": "STRIX_MM_PF_LATE_SRC_FENCE=0 (also STRIX_MM_BASELINE=1 unless explicitly overridden)",
+    "doc_anchor": "docs/minimax-grouped-prefill.md"
   }
 ]
