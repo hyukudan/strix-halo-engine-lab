@@ -1,3 +1,4 @@
+#include "strix/file_snapshot.hpp"
 #include "strix/mapped_model_file.hpp"
 
 #include "strix/model_content_hash.hpp"
@@ -133,6 +134,7 @@ MappedModelFile MappedModelFile::open_read_only(
         std::move(logical_name);
 
     try {
+        strix::LoaderCapture::record(path, fd);
         struct stat before {};
         if (::fstat(fd, &before) != 0 ||
             before.st_size <= 0) {

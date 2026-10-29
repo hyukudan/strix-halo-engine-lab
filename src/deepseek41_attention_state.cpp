@@ -242,6 +242,8 @@ AttentionState read_state(Source& f, const std::string& what) {
         L.topk_known = (flags & 8U) != 0U;
         L.ratio = f.template get<std::uint32_t>();
         L.ring = f.template get_vec<std::uint8_t>(big);
+        if (!L.ring.empty() && L.ring.size() != std::size_t{AttentionHost::ring_capacity} * ds41::attn::kWindowEntryBytes)
+            throw std::runtime_error("deepseek41 attention state: corrupt ring size");
         L.kv = f.template get_vec<std::uint8_t>(big);
         L.idx_keys = f.template get_vec<std::uint8_t>(big);
         L.carry = f.template get_vec<float>(big);

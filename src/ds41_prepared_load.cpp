@@ -1,3 +1,4 @@
+#include "strix/model_input.hpp"
 #include "strix/ds41_prepared_load.hpp"
 #include "strix/ds41_expert_tp.hpp"
 #include "strix/ds41_weight_overlay.hpp"
@@ -34,7 +35,7 @@ void valid_name(const std::string& name) {
 }
 std::string read_text(const std::filesystem::path& file) {
     require(std::filesystem::file_size(file) <= (4U << 20U), "manifest too large");
-    std::ifstream f(file, std::ios::binary);
+    strix::ModelInput f(file);
     require(bool(f), "cannot open manifest");
     return {std::istreambuf_iterator<char>(f), {}};
 }
@@ -48,6 +49,7 @@ struct Input {
         fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
         if (fd < 0) { direct = false; fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC); }
         require(fd >= 0, "cannot open artifact");
+        strix::LoaderCapture::record(path, fd);
     }
     ~Input() { if (fd >= 0) ::close(fd); }
     void read(std::uint64_t offset, std::span<std::uint8_t> out) {

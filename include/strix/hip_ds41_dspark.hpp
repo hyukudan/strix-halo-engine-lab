@@ -5,6 +5,7 @@
 // bitwise (tests/hip_ds41_dspark_tests.hip).
 
 #include "strix/ds41_dspark.hpp"
+#include "strix/ds41_dspark_context.hpp"
 #include "strix/ds41_dspark_driver.hpp"
 
 #include <cstdint>
@@ -90,6 +91,8 @@ public:
     void set_rank(std::uint32_t rank, std::uint32_t world, RankExchange exchange);
     // Forgets every appended row (new sequence).
     void reset();
+    [[nodiscard]] ContextSnapshot export_context() const;
+    void import_context(const ContextSnapshot&);
     // An empty context continues a sequence at `position` whose earlier rows it never saw (e.g. a prompt read by the
     // device prefill): appends and drafts start there and the attention reads only the rows appended since.
     void skip_to(std::uint64_t position);

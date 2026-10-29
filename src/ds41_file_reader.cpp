@@ -1,3 +1,4 @@
+#include "strix/file_snapshot.hpp"
 #include "strix/ds41_file_reader.hpp"
 
 #include <algorithm>
@@ -133,6 +134,7 @@ FileReader::FileReader(const std::filesystem::path& path, bool direct, unsigned 
         direct_ = false;
     }
     if (fd_ < 0) throw std::runtime_error("cannot open " + path.string());
+    strix::LoaderCapture::record(path, fd_);
     struct stat st {};
     if (::fstat(fd_, &st) != 0) throw std::runtime_error("cannot stat " + path.string());
     size_ = static_cast<std::uint64_t>(st.st_size);

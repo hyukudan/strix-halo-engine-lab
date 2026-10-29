@@ -1,3 +1,4 @@
+#include "strix/file_snapshot.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
 #include "strix/hip_ds41_dense_fp16.hpp"
 #include "strix/deepseek41_prefill.hpp"
@@ -149,6 +150,7 @@ public:
     explicit Mapped(const std::filesystem::path& path) {
         fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd_ < 0) throw std::runtime_error("deepseek41 prefill: cannot open " + path.string());
+        strix::LoaderCapture::record(path, fd_);
         struct stat st {};
         if (::fstat(fd_, &st) != 0) throw std::runtime_error("deepseek41 prefill: cannot stat the model");
         size_ = static_cast<std::uint64_t>(st.st_size);
@@ -180,6 +182,7 @@ public:
         fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
         if (fd_ < 0) fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd_ < 0) throw std::runtime_error("deepseek41 prefill: cannot open " + path.string());
+        strix::LoaderCapture::record(path, fd_);
         check(hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking), "loader stream");
         for (int k = 0; k < 2; ++k) {
             check(hipHostMalloc(reinterpret_cast<void**>(&buffer_[k]), chunk + 2U * align, hipHostMallocDefault), "staging buffer");

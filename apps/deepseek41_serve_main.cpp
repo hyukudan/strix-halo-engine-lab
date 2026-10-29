@@ -111,6 +111,8 @@
 #include "strix/hip_ds41_dspark.hpp"
 #include "strix/deepseek41_prefill.hpp"
 #include "strix/deepseek41_prefix_cache.hpp"
+#include "strix/deepseek41_session_cache.hpp"
+#include "strix/serve/session_api.hpp"
 #include "strix/deepseek41_describe.hpp"
 #include "strix/deepseek41_serve_observe.hpp"
 #include "strix/deepseek41_serve_sched.hpp"
@@ -146,6 +148,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <map>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -182,8 +185,13 @@ struct Args {
     std::uint64_t prefix_cache_mb = 0, prefix_reserve_mb = 4096;
     std::uint32_t prefix_block = 256;
     std::string prefix_dir;
+    std::string session_dir;
+    std::uint64_t session_ram_bytes = 0; // injected by pair_defaults after route/memory checks
+    std::uint64_t session_max_parked = 8, session_disk_bytes = 0;
+
     std::uint64_t prefix_disk_mb = 0;
     bool prefix_before_tail = false, prefix_session = false;
+    bool session_explicit = false;
     bool prefix_inrun = false;  // --prefix-inrun-snapshots: the cache's snapshot points inside the prefill runs (no extra runs)
     std::uint32_t prefix_inrun_reach = 512;  // --prefix-inrun-reach: farther points before a run's end split it (plan_prefill_runs)
     // --cache-profile off (default) | agent: the prefix cache settings not given explicitly (apply_cache_profile)
@@ -298,7 +306,9 @@ strix::deepseek41::BatchForwardOptions forward_options(const Args& a, strix::dis
 }
 
 // ---- the control channel: one fixed-size block per round, rank 0 -> rank 1 (rank 1 answers with its own) ----
-enum class Command : std::uint32_t { hello = 1, step = 2, heartbeat = 3, shutdown = 4, prefill = 5, import_state = 6, prefill_unit = 7, quiesce = 8 };
+enum class Command : std::uint32_t { hello = 1, step = 2, heartbeat = 3, shutdown = 4, prefill = 5, import_state = 6, prefill_unit = 7, quiesce = 8,
+    session = 9
+};
 struct Control {
     std::uint32_t magic = 0x43425344U;  // "DSBC"
     std::uint32_t command = 0;
@@ -424,9 +434,34 @@ Control hello(const Args& a) {
     // Always compared (not only with a disk tier): ranks with different weights content, decode identity or DSpark setup
     // exchange the same bytes and tags, which no CRC or framing check can tell apart.
     const auto ns = strix::deepseek41::prefix_namespace_from_env(strix::ds41::expert_tp::enabled_from_env()).text;
-    c.prefix_ns = fnv(strix::deepseek41::sched::serve_identity_text(ns, a.dspark.empty() ? 0U : std::filesystem::file_size(a.dspark), a.dspark_ranks,
-                                                                     a.dspark_window, a.dspark_vocab));
+    c.prefix_ns = fnv(strix::deepseek41::sched::serve_identity_text(
+        ns, a.dspark.empty() ? 0U : std::filesystem::file_size(a.dspark), a.dspark_ranks, a.dspark_window, a.dspark_vocab));
+    // Resource limits occupy previously zero hello fields. OFF keeps the original
+    // 512 bytes; defaults sampled on different hosts negotiate a common minimum.
+    c.pkey = a.session_ram_bytes;
+    if (c.pkey) {
+        c.plen = static_cast<std::uint32_t>(a.session_max_parked);
+        c.pflags = a.session_dir.empty() ? 0U : 1U;
+        c.pshared = static_cast<std::uint32_t>(a.session_disk_bytes);
+        c.presume = static_cast<std::uint32_t>(a.session_disk_bytes >> 32U);
+    }
     return c;
+}
+
+void agree_session_limits(Args& a, const Control& peer) {
+    const auto before = a.session_ram_bytes;
+    const bool had_disk = !a.session_dir.empty();
+    a.session_ram_bytes = std::min(a.session_ram_bytes, peer.pkey);
+    a.session_max_parked = std::min(a.session_max_parked, static_cast<std::uint64_t>(peer.plen));
+    if (!a.session_max_parked) a.session_ram_bytes = 0;
+    if (!a.session_ram_bytes || !peer.pflags) a.session_dir.clear();
+    const auto peer_disk = static_cast<std::uint64_t>(peer.pshared) | (static_cast<std::uint64_t>(peer.presume) << 32U);
+    a.session_disk_bytes = std::min(a.session_disk_bytes, peer_disk);
+    if (!a.session_disk_bytes) a.session_dir.clear();
+    if (before && !a.session_ram_bytes)
+        std::fprintf(stderr, "session cache: off (peer precondition or off switch)\n");
+    else if (had_disk && a.session_dir.empty())
+        std::fprintf(stderr, "session disk: off (peer precondition or off switch)\n");
 }
 
 std::string hello_mismatch(const Control& mine, const Control& peer) {
@@ -990,12 +1025,121 @@ std::string plans_since_ready() {
     return b;
 }
 
+using Sessions = strix::deepseek41::PrefixCache::Sessions;
+using SessionCheckpoint = strix::deepseek41::SessionCheckpoint;
+using SessionBytes = strix::deepseek41::SessionBytes;
+strix::deepseek41::SessionExchange session_exchange(BatchForward &fwd) {
+    return [&fwd](std::span<const std::uint8_t> b) {
+        return strix::deepseek41::session_peer_exchange(b, [&](auto out, auto in) { fwd.exchange_host(out, in); });
+    };
+}
+std::unique_ptr<Sessions> make_sessions(const Args &a, std::uint32_t rank) {
+    if (!a.session_ram_bytes)
+        return {};
+    return strix::deepseek41::admit_session_startup([&] {
+        std::map<std::string, std::string> cfg{{"world", "2"},
+                                            {"rank", std::to_string(rank)},
+                                            {"engine", "tp2-http-target"},
+                                            {"layers", std::to_string(a.layers)},
+                                            {"context", std::to_string(a.context)},
+                                            {"slots", std::to_string(a.slots)},
+                                            {"pool", std::to_string(a.pool)},
+                                            {"prompt-rows", std::to_string(a.prompt_rows)},
+                                            {"tp-attention", std::to_string(a.tp)},
+                                            {"engram-direct", std::to_string(a.engram_direct)},
+                                            {"prefill-device", std::to_string(a.device_prefill)},
+                                            {"prefill-rows", std::to_string(a.prefill_rows)},
+                                            {"prefill-min", std::to_string(a.prefill_min)},
+                                            {"prefix-block", std::to_string(a.prefix_block)},
+                                            {"prefix-inrun", std::to_string(a.prefix_inrun)},
+                                            {"prefix-before-tail", std::to_string(a.prefix_before_tail)},
+                                            {"prefix-session", std::to_string(a.prefix_session)},
+                                            {"prefix-inrun-reach", std::to_string(a.prefix_inrun_reach)},
+                                            {"dspark", "off"},
+                                            {"sampling", "greedy"},
+                                            {"layout", "fp8-ring136x528-kv288-idx68-fp32carry-v1"}};
+        const auto snapshot = strix::LoaderCapture::snapshot();
+        auto compat = strix::deepseek41::session_compat(std::move(cfg), {{"model", a.model}, {"draft", a.dspark}}, "/proc/self/exe", &snapshot);
+        return std::make_unique<Sessions>(std::move(compat), rank, a.session_ram_bytes, a.session_dir, a.session_max_parked, a.session_disk_bytes);
+    }, [](const char* reason) { std::fprintf(stderr, "session cache: off (%s)\n", reason); });
+}
+// A startup refusal on either rank must disable the API on both ranks.
+void agree_session_startup(Args& a, BatchForward& fwd, std::unique_ptr<Sessions>& sessions) {
+    if (!a.session_ram_bytes) return;
+    if (strix::deepseek41::session_startup_ready(bool(sessions), a.session_explicit,
+        [&](auto out, auto in) { fwd.exchange_host(out, in); })) return;
+    if (sessions) std::fprintf(stderr, "session cache: off (session setup failed on peer)\n");
+    sessions.reset();
+    a.session_ram_bytes = 0;
+    a.session_dir.clear();
+}
+// Every command runs only between committed target steps. Restore writes an unused slot,
+// then the import barrier makes it eligible for rank 0's scheduler.
+std::optional<SessionCheckpoint> session_operation(const Args &a, BatchForward &fwd, Sessions &cache, const serve::Json &message, std::uint32_t slot,
+                                                   std::uint32_t rank) {
+    (void)a;
+    const auto op = message.find("op")->as_string();
+    const auto id = message.find("id")->as_string();
+    const auto ex = session_exchange(fwd);
+    if (op == "capture") {
+        SessionCheckpoint c;
+        c.id = id;
+        c.generation = message.find("generation")->as_string();
+        c.rank = rank;
+        c.compat_record = cache.compat().record();
+        bool ok = true;
+        try {
+            c.attention = fwd.export_state(slot);
+        } catch (...) {
+            ok = false;
+        }
+        Sessions::agree(ok, ex, "device export");
+        c.attention.next_token = static_cast<std::uint32_t>(message.find("pending")->as_int());
+        for (const auto &t : message.find("history")->as_array())
+            c.attention.tokens.push_back(static_cast<std::uint32_t>(t.as_int()));
+        c.frontier.consumed = c.frontier.accepted = c.attention.position;
+        c.frontier.pending = c.attention.next_token;
+        c.frontier.emitted = static_cast<std::uint64_t>(message.find("emitted")->as_int());
+        cache.capture(c, ex);
+    } else if (op == "checkpoint")
+        cache.checkpoint(id, ex);
+    else if (op == "delete")
+        cache.erase(id, ex);
+    else if (op == "resume" || op == "restore" || op == "lookup" || op == "lookup_disk") {
+        const bool disk = op == "restore" || op == "lookup_disk";
+        auto c = cache.resume(id, disk, ex);
+        if (op == "lookup" || op == "lookup_disk") return c;
+        if (disk)
+            cache.capture(c, ex);
+        bool ok = true;
+        try {
+            fwd.import_state(slot, c.attention);
+        } catch (...) {
+            ok = false;
+        }
+        Sessions::agree(ok, ex, "staged device import");
+        return c;
+    } else if (op == "host_restore") {
+        cache.capture(cache.resume(id, true, ex), ex);
+    } else if (op == "park" || op == "ram_checkpoint") {
+        (void)cache.resume(id, false, ex);
+    } else
+        throw std::invalid_argument("unknown session operation");
+    return {};
+}
+
 // ---- rank 1: no API; runs what rank 0 sends ----
-void follow(const Args& a, BatchForward& fwd, Watchdog& dog, SlotPrefill* prefill, strix::ds41::hetero::Stage* stage) {
+void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, SlotPrefill* prefill, strix::ds41::hetero::Stage* stage) {
+    Args a = initial;
     const auto mine = hello(a);
     const auto first = exchange(fwd, mine);
     dog.progress();
     if (const auto why = hello_mismatch(mine, first); !why.empty()) poisoned(1U, why);
+    agree_session_limits(a, first);
+    dog.pause(true);
+    auto sessions = make_sessions(a, 1U);
+    agree_session_startup(a, fwd, sessions);
+    dog.pause(false);
     std::unique_ptr<strix::ds41::dspark::DeviceDrafter> drafter;
     std::unique_ptr<strix::deepseek41::BatchSpeculator> spec;
     std::uint64_t dspark_free_before = 0;  // device free memory before the drafter (0: no drafter on this rank)
@@ -1084,6 +1228,33 @@ void follow(const Args& a, BatchForward& fwd, Watchdog& dog, SlotPrefill* prefil
         if (c.command == static_cast<std::uint32_t>(Command::heartbeat)) continue;
         if (c.command == static_cast<std::uint32_t>(Command::quiesce)) {  // rank 0 went idle: no GPU receive left posted
             fwd.quiesce();
+            continue;
+        }
+        if (c.command == static_cast<std::uint32_t>(Command::session)) {
+            if (!sessions || c.pslot >= a.slots || c.prefix_bytes == 0 || c.prefix_bytes > (16U << 20U) || c.ops > std::size(c.op))
+                throw std::runtime_error("invalid session control command");
+            for (std::uint32_t i = 0; i < c.ops; ++i) {
+                const auto kind = c.op[i] >> 30U, slot = (c.op[i] >> 24U) & 63U, positions = c.op[i] & 0xFFFFFFU;
+                if (kind == kPoolRelease)
+                    fwd.release(slot);
+                else if (kind != kPoolReserve || !fwd.reserve(slot, positions))
+                    throw std::runtime_error("session pool operation failed");
+            }
+            std::vector<std::uint8_t> bytes(c.prefix_bytes);
+            transfer_state(fwd, {}, &bytes);
+            const auto message = serve::parse_json(std::string(bytes.begin(), bytes.end()));
+            dog.pause(true);
+            try {
+                const auto restored = session_operation(a, fwd, *sessions, message, c.pslot, 1U);
+                if (restored && prefill)
+                    prefill->on_prefill(c.pslot, restored->attention.tokens);
+                reply.pkey = 1;
+            } catch (const std::exception &e) {
+                std::fprintf(stderr, "session rank 1: %s\n", e.what());
+                reply.pkey = 0;
+            }
+            dog.pause(false);
+            dog.progress();
             continue;
         }
         if (c.command == static_cast<std::uint32_t>(Command::import_state)) {  // POST /admin/import-state on rank 0
@@ -1210,6 +1381,7 @@ struct Running {
     strix::deepseek41::serve_observe::PromptAccount account;
     // observed requests (submitted after the instrumentation armed): DSpark drafts proposed / accepted
     std::uint64_t proposed = 0, accepted = 0;
+    std::uint64_t session_emitted = 0;
 };
 
 struct ServeState {
@@ -1286,8 +1458,50 @@ struct ImportBox {
     std::mutex mutex;
     std::deque<std::shared_ptr<ImportJob>> jobs;
 };
+
+struct SessionJob {
+    serve::Json message;
+    std::promise<std::pair<int, std::string>> done;
+};
+struct SessionBox {
+    std::mutex mutex;
+    std::deque<std::shared_ptr<SessionJob>> jobs;
+};
+void handle_session(const Args &a, const serve::ApiConfig &config, SessionBox &box, const serve::HttpRequest &request, serve::HttpResponseWriter &response) {
+    const auto fail = [&](int status, const std::string &text) {
+        auto out = serve::Json::object();
+        out = serve::session_error(status == 401 ? "authentication_error" : "invalid_request", text);
+        response.send(status, "application/json", out.dump());
+    };
+    if (!a.session_ram_bytes)
+        return fail(404, "session cache is disabled");
+    if (!config.api_key.empty() && request.header("authorization") != "Bearer " + config.api_key && request.header("x-api-key") != config.api_key)
+        return fail(401, "invalid or missing API key");
+    try {
+        auto j = std::make_shared<SessionJob>();
+        j->message = serve::session_command(request.method, request.path, request.body);
+        auto future = j->done.get_future();
+        {
+            const std::lock_guard lock(box.mutex);
+            if (box.jobs.size() >= a.max_queue)
+                return fail(429, "session queue full");
+            box.jobs.push_back(j);
+        }
+        if (future.wait_for(std::chrono::seconds(300)) != std::future_status::ready)
+            return fail(503, "session operation timed out; query status before retrying");
+        const auto result = future.get();
+        response.send(result.first, "application/json", result.second);
+    } catch (const serve::SessionApiError &e) {
+        response.send(e.status, "application/json", serve::session_error(e.code, e.what()).dump());
+    } catch (const std::exception &e) {
+        fail(400, e.what());
+    }
+}
+
 // An imported state parked in a slot until a request whose prompt starts with its tokens takes it.
 struct Parked {
+    std::string session_id;
+    std::uint64_t session_emitted = 0;
     std::uint32_t slot = 0, position = 0, next_token = 0;
     std::vector<std::uint32_t> tokens;
     std::string sha256;
@@ -1440,11 +1654,17 @@ void frames_import_session(const Args& a, ServeState& state, ImportBox& box, str
     s.reply(0, std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(body.data()), body.size()));
 }
 
-void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Watchdog& dog, SlotPrefill* prefill, strix::ds41::hetero::Stage* stage) {
+void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& comm, Watchdog& dog, SlotPrefill* prefill, strix::ds41::hetero::Stage* stage) {
+    Args a = initial;
     const auto mine = hello(a);
     const auto peer = exchange(fwd, mine);
     dog.progress();
     if (const auto why = hello_mismatch(mine, peer); !why.empty()) poisoned(0U, why);
+    agree_session_limits(a, peer);
+    dog.pause(true);
+    auto sessions = make_sessions(a, 0U);
+    agree_session_startup(a, fwd, sessions);
+    dog.pause(false);
     if (prefill) prefill->reconcile(fwd, 0U);
     const auto sched = strix::deepseek41::sched::options_from_env(prefill != nullptr);  // STRIX_DS41_SERVE_SCHED (device: interleave unless =off)
     if (sched.mode != strix::deepseek41::sched::Mode::off) {
@@ -1493,6 +1713,7 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
     config.stream_receipts = a.http_stream_receipts;
     config.sse_keepalive_seconds = a.http_sse_keepalive;
     config.sse_progress_seconds = a.http_sse_progress_interval;
+    config.sessions_enabled = a.session_ram_bytes != 0;
     config.engine_description = "deepseek41 engine group (2 ranks, EP experts" + std::string(a.tp ? " + TP attention" : "") + "), " +
                                 std::to_string(a.slots) + " slots, greedy, exact per request";
     config.capabilities_extra = [sched](serve::Json& out) {
@@ -1725,7 +1946,10 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
     http.port = static_cast<std::uint16_t>(a.http_port);
     http.max_connections = a.max_connections;
     ImportBox imports;
+    SessionBox session_jobs;
     serve::HttpServer server(http, [&](const serve::HttpRequest& request, serve::HttpResponseWriter& response) {
+        if (strix::deepseek41::sched::session_admin_route(a.session_ram_bytes != 0, request.path))
+            return handle_session(a, config, session_jobs, request, response);
         if (request.path == "/admin/import-state") return handle_import(a, config, state, imports, request, response);
         api.handle(request, response);
     });
@@ -1816,6 +2040,43 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
     };
     std::deque<Parked> parked;  // imported states waiting for their request (oldest first)
     auto last_round = Clock::now();
+    // Local call and rank-1 command share the same transaction. Completion is acknowledged
+    // before a captured turn is reported complete or a restored slot becomes schedulable.
+    const auto session_call = [&](const serve::Json &message, std::uint32_t slot) -> std::optional<SessionCheckpoint> {
+        Control c;
+        c.command = static_cast<std::uint32_t>(Command::session);
+        c.pslot = slot;
+        take_commits(c);
+        c.snaps = pending_snaps;
+        pending_snaps = 0;
+        if (pool_ops.size() > std::size(c.op))
+            throw std::runtime_error("too many session pool operations");
+        c.ops = static_cast<std::uint32_t>(pool_ops.size());
+        std::copy(pool_ops.begin(), pool_ops.end(), c.op);
+        pool_ops.clear();
+        const auto text = message.dump();
+        SessionBytes bytes(text.begin(), text.end());
+        c.prefix_bytes = bytes.size();
+        (void)exchange(fwd, c);
+        transfer_state(fwd, bytes, nullptr);
+        std::optional<SessionCheckpoint> restored;
+        std::string error;
+        dog.pause(true);
+        try {
+            restored = session_operation(a, fwd, *sessions, message, slot, 0U);
+        } catch (const std::exception &e) {
+            error = e.what();
+        }
+        dog.pause(false);
+        Control ack;
+        ack.command = static_cast<std::uint32_t>(Command::heartbeat);
+        const auto peer_ack = exchange(fwd, ack);
+        dog.progress();
+        last_round = Clock::now();
+        if (!error.empty() || peer_ack.pkey != 1)
+            throw std::runtime_error(error.empty() ? "session operation refused on peer" : error);
+        return restored;
+    };
     const auto finish = [&](std::size_t i, const std::string& reason, const std::string& error) {
         auto& r = *running[i];
         serve::GenerationStats st;
@@ -1833,7 +2094,32 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
             st.accepted = r.accepted;
             if (r.has_first) st.first_token_ms = std::chrono::duration<double, std::milli>(r.first_token - r.job.submitted).count();
         }
-        queue.finish(r.job, st, error);
+        std::string session_error = error;
+        if (sessions && !r.job.job.session_id.empty() && error.empty() && reason != "cancelled" && !r.seq.generated.empty()) {
+            auto message = serve::Json::object();
+            message.set("op", serve::Json("capture"));
+            message.set("id", serve::Json(r.job.job.session_id));
+            message.set("generation", serve::Json(strix::deepseek41::session_generation()));
+            message.set("pending", serve::Json(static_cast<std::uint64_t>(r.seq.generated.back())));
+            message.set("emitted", serve::Json(r.session_emitted + r.seq.generated.size()));
+            auto history = r.seq.prompt;
+            history.insert(history.end(), r.seq.generated.begin(), r.seq.generated.end() - 1);
+            auto ids = serve::Json::array();
+            for (auto t : history)
+                ids.push(serve::Json(static_cast<std::uint64_t>(t)));
+            message.set("history", std::move(ids));
+            try {
+                session_call(message, r.seq.slot);
+            } catch (const std::exception &e) {
+                session_error = e.what();
+            }
+        }
+        if (!r.job.job.session_id.empty() && !session_error.empty()) {
+            const auto failure = serve::session_failure(session_error);
+            st.error_status = failure.status;
+            st.error_code = failure.code;
+        }
+        queue.finish(r.job, st, session_error);
         pool_release(r.seq.slot);
         free_slots.push_back(r.seq.slot);
         running.erase(running.begin() + static_cast<std::ptrdiff_t>(i));
@@ -1949,10 +2235,14 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
         j.done.set_value(res);
     };
     // the parked state a prompt continues (the longest one whose tokens begin the prompt and whose slot has room)
-    const auto match_parked = [&](const std::vector<std::uint32_t>& prompt, std::uint32_t max_tokens) -> std::ptrdiff_t {
+    const auto match_parked = [&](const std::vector<std::uint32_t>& prompt, std::uint32_t max_tokens, const std::string &session_id = {}) -> std::ptrdiff_t {
         std::ptrdiff_t best = -1;
         for (std::size_t i = 0; i < parked.size(); ++i) {
             const auto& p = parked[i];
+            if (p.session_id != session_id)
+                continue;
+            if (!session_id.empty() && (prompt.size() <= p.position || prompt[p.position] != p.next_token))
+                continue;
             if (prompt.size() < p.position || !std::equal(p.tokens.begin(), p.tokens.end(), prompt.begin())) continue;
             if (a.pool != 0U && fwd.capacity(p.slot) < std::min<std::uint64_t>(a.context, prompt.size() + std::uint64_t{max_tokens} + 1U)) continue;
             if (best < 0 || p.position > parked[static_cast<std::size_t>(best)].position) best = static_cast<std::ptrdiff_t>(i);
@@ -2143,6 +2433,7 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
         pool_release(r.seq.slot);
         free_slots.push_back(r.seq.slot);
         r.seq.slot = p.slot;
+        r.session_emitted = p.session_emitted;
         r.seq.position = p.position;
         r.seq.fed = p.position;
         r.device_prefill = false;
@@ -2385,9 +2676,107 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
                          decoding * strix::deepseek41::sched::tdev_seconds(sched, prompt.size()), W);
         return d;
     };
+    std::uint64_t session_hits = 0, session_misses = 0, session_refusals = 0;
     std::string failure;
     try {
         for (;;) {
+            if (sessions) {
+                std::deque<std::shared_ptr<SessionJob>> jobs;
+                {
+                    const std::lock_guard lock(session_jobs.mutex);
+                    jobs.swap(session_jobs.jobs);
+                }
+                for (auto &j : jobs) {
+                    auto out = serve::Json::object();
+                    const auto refused_before = sessions->stats().refused;
+                    int status = 200;
+                    try {
+                        const auto op = j->message.find("op")->as_string();
+                        if (op == "list") {
+                            std::map<std::string, serve::Json> rows;
+                            for (const auto &id : sessions->list()) {
+                                if (std::any_of(running.begin(), running.end(), [&](const auto& r) { return r->job.job.session_id == id; })) continue;
+                                const auto info = sessions->inspect(id);
+                                const auto &c = info.checkpoint;
+                                auto row = serve::Json::object();
+                                row.set("id", serve::Json(id));
+                                row.set("position", serve::Json(c.frontier.consumed));
+                                row.set("consumed", serve::Json(c.frontier.consumed));
+                                row.set("pending", c.frontier.pending_valid ? serve::Json(static_cast<std::uint64_t>(c.frontier.pending)) : serve::Json());
+                                row.set("bytes", serve::Json(info.bytes));
+                                row.set("emitted", serve::Json(c.frontier.emitted));
+                                row.set("state", serve::Json(info.ram ? "parked" : "disk"));
+                                row.set("durability", serve::Json(info.disk ? "disk" : "ram"));
+                                auto engine = serve::Json::object(); engine.set("generation", serve::Json(c.generation));
+                                row.set("engine", std::move(engine)); rows.insert_or_assign(id, std::move(row));
+                            }
+                            for (const auto& p : parked)
+                                serve::session_inventory_live(rows, p.session_id, p.position, p.next_token, p.session_emitted, false);
+                            for (const auto& r : running) {
+                                const auto position = active && active->r == r.get() ? active->task->rows() : r->seq.position;
+                                const auto pending = r->seq.generated.empty() ? std::optional<std::uint32_t>{} : r->seq.generated.back();
+                                serve::session_inventory_live(rows, r->job.job.session_id, position, pending,
+                                    r->session_emitted + r->seq.generated.size(), true);
+                            }
+                            auto ids = serve::Json::array();
+                            for (auto& [id, row] : rows) ids.push(std::move(row));
+                            out.set("sessions", std::move(ids));
+                        } else if (op != "stats") {
+                            const auto id = j->message.find("id")->as_string();
+                            if (std::any_of(running.begin(), running.end(), [&](const auto &r) { return r->job.job.session_id == id; }))
+                                throw std::runtime_error("session has an active turn");
+                            const auto names = sessions->list();
+                            if (std::find(names.begin(), names.end(), id) == names.end())
+                                throw std::runtime_error("session_not_found");
+                            const bool restore = op == "resume";
+                            auto command = j->message;
+                            if (restore) {
+                                // Explicit resume admits a validated host checkpoint. Device import
+                                // waits for the next named request, so parked sessions hold no
+                                // extra device-resident copy outside the RAM budget.
+                                command.set("op", serve::Json(sessions->inspect(id).ram ? "ram_checkpoint" : "host_restore"));
+                            } else if (op != "delete" && !sessions->inspect(id).ram) {
+                                auto load = serve::Json::object(); load.set("id", serve::Json(id));
+                                load.set("op", serve::Json("host_restore")); session_call(load, 0);
+                            }
+                            session_call(command, 0);
+                            if (restore) {
+                                const auto info = sessions->inspect(id);
+                                auto engine = serve::Json::object();
+                                engine.set("position", serve::Json(info.checkpoint.frontier.consumed));
+                                engine.set("generation", serve::Json(info.checkpoint.generation));
+                                out.set("engine", std::move(engine));
+                            }
+                            if (op == "park" || op == "delete") {
+                                for (auto it = parked.begin(); it != parked.end();) {
+                                    if (it->session_id == id) {
+                                        pool_release(it->slot);
+                                        free_slots.push_back(it->slot);
+                                        it = parked.erase(it);
+                                    } else
+                                        ++it;
+                                }
+                            }
+                            out.set("id", serve::Json(id));
+                            out.set(op == "delete" ? "deleted" : "parked", serve::Json(true));
+                        }
+                        if (op == "stats") {
+                            const auto st = sessions->stats();
+                            out.set("ram_bytes", serve::Json(st.bytes));
+                            out.set("ram_budget", serve::Json(a.session_ram_bytes));
+                            out.set("parked", serve::Json(st.entries));
+                            out.set("disk_bytes", serve::Json(sessions->disk_bytes()));
+                            out.set("hits", serve::Json(session_hits)); out.set("misses", serve::Json(session_misses));
+                            out.set("refusals", serve::Json(session_refusals + st.refused));
+                        }
+                    } catch (const std::exception &e) {
+                        if (sessions->stats().refused == refused_before) ++session_refusals;
+                        const auto error = serve::session_failure(e.what());
+                        status = error.status; out = serve::session_error(error.code, e.what());
+                    }
+                    j->done.set_value({status, out.dump()});
+                }
+            }
             {  // imported states, between steps
                 std::deque<std::shared_ptr<ImportJob>> jobs;
                 {
@@ -2430,7 +2819,7 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
                         it = deferred.erase(it);
                         continue;
                     }
-                    const bool imported = !parked.empty() && match_parked(job.prompt, job.max_tokens) >= 0;
+                    const bool imported = !parked.empty() && match_parked(job.prompt, job.max_tokens, job.session_id) >= 0;
                     if (imported && sched.log) std::fprintf(stderr, "sched: deferred request of %zu tokens continues an imported state\n", job.prompt.size());
                     if (imported || decide(job.prompt, std::chrono::duration<double>(Clock::now() - it->taken).count()) !=
                                         strix::deepseek41::sched::Admit::defer) {
@@ -2471,10 +2860,53 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
                     queue.finish(r->job, st, "prompt is empty or fills the context");
                     continue;
                 }
-                if (const auto m = parked.empty() ? -1 : match_parked(prompt, r->job.job.max_tokens); m >= 0) {  // continues an imported state
+                if (!r->job.job.session_id.empty()) {
+                    const auto &id = r->job.job.session_id;
+                    if (std::any_of(running.begin(), running.end(), [&](const auto &run) { return run->job.job.session_id == id; })) {
+                        serve::GenerationStats st; st.finish = "cancelled";
+                        st.error_status = 409; st.error_code = "session_incompatible";
+                        queue.finish(r->job, st, "session has an active turn"); continue;
+                    }
+                    if (match_parked(prompt, r->job.job.max_tokens, id) < 0) {
+                        // A changed transcript is a normal miss. Release stale staged slots.
+                        for (auto it = parked.begin(); it != parked.end();) {
+                            if (it->session_id == id) { pool_release(it->slot); free_slots.push_back(it->slot); it = parked.erase(it); }
+                            else ++it;
+                        }
+                        bool reserved = false;
+                        std::uint32_t slot = 0;
+                        try {
+                            const auto info = sessions->inspect(id);
+                            auto command = serve::Json::object(); command.set("id", serve::Json(id));
+                            command.set("op", serve::Json(info.ram ? "lookup" : "lookup_disk"));
+                            const auto c = session_call(command, 0);
+                            if (strix::deepseek41::session_prompt_extends(*c, prompt) && !free_slots.empty()) {
+                                slot = free_slots.back();
+                                if (a.pool && !fwd.reserve(slot, a.context)) throw std::runtime_error("session_budget");
+                                reserved = true;
+                                if (a.pool) pool_ops.push_back(kPoolReserve << 30U | slot << 24U | a.context);
+                                command.set("op", serve::Json(info.ram ? "resume" : "restore"));
+                                const auto restored = session_call(command, slot);
+                                free_slots.pop_back(); pending_resets &= ~(1U << slot);
+                                if (prefill) prefill->on_prefill(slot, restored->attention.tokens);
+                                Parked p; p.slot = slot; p.position = restored->attention.position;
+                                p.next_token = restored->attention.next_token; p.tokens = restored->attention.tokens;
+                                p.session_id = id; p.session_emitted = restored->frontier.emitted;
+                                parked.push_back(std::move(p)); reserved = false;
+                            }
+                        } catch (const std::exception &) {
+                            if (reserved) pool_release(slot);
+                            // Explicit resume reports validation errors; chat lookup falls back to prefill.
+                        }
+                    }
+                    if (match_parked(prompt, r->job.job.max_tokens, id) >= 0) ++session_hits;
+                    else ++session_misses;
+                }
+                if (const auto m = parked.empty() ? -1 : match_parked(prompt, r->job.job.max_tokens, r->job.job.session_id); m >= 0) {  // continues an imported state
                     const auto p = parked[static_cast<std::size_t>(m)];
                     parked.erase(parked.begin() + m);
                     r->seq.slot = p.slot;
+                    r->session_emitted = p.session_emitted;
                     r->seq.prompt = prompt;
                     r->seq.position = p.position;
                     r->seq.fed = p.position;
@@ -2485,6 +2917,7 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
                     }
                     std::fprintf(stderr, "import: request of %zu prompt tokens continues the state in slot %u (position %u)\n", prompt.size(), p.slot,
                                  p.position);
+                    if (!r->job.job.session_id.empty() && r->job.job.on_admitted) r->job.job.on_admitted();
                     running.push_back(std::move(r));
                     worked = true;
                     const std::lock_guard lock(state.mutex);
@@ -2519,6 +2952,7 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
                 r->device_prefill = device_path(prompt);
                 if (spec && !r->device_prefill) spec->start(r->seq.slot, prompt);  // device prefill: imported() after it
                 pending_resets |= 1U << r->seq.slot;
+                if (!r->job.job.session_id.empty() && r->job.job.on_admitted) r->job.job.on_admitted();
                 running.push_back(std::move(r));
                 worked = true;
                 const std::lock_guard lock(state.mutex);
@@ -2551,7 +2985,7 @@ void lead(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, Wat
                 if (!parked.empty())
                     for (auto& r : running)
                         if (r->device_prefill)
-                            if (const auto m = match_parked(r->seq.prompt, r->job.job.max_tokens); m >= 0) {
+                            if (const auto m = match_parked(r->seq.prompt, r->job.job.max_tokens, r->job.job.session_id); m >= 0) {
                                 take_parked(*r, static_cast<std::size_t>(m));
                                 swapped = true;
                             }
@@ -2814,12 +3248,16 @@ void describe(const Args& a) {
 }  // namespace
 
 int main(int argc, char** argv) try {
+    bool session_explicit = std::getenv("STRIX_SESSION_CACHE") && std::string_view(std::getenv("STRIX_SESSION_CACHE")) != "0";
+    for (int i = 1; i < argc; ++i)
+        if (std::string_view(argv[i]).starts_with("--session-")) session_explicit = true;
     const strix::deepseek41::pair_defaults::Effective production_defaults(strix::deepseek41::pair_defaults::App::serve, argc, argv, strix::deepseek41::pair_defaults::this_build());  // before any option or env read
     // The dist layer's own deadlines below the serve watchdog (120 s): a rare stall ends in the communicator's state
     // report (collective in flight, phase, per-stream bytes) instead of a bare POISONED. An explicit value wins.
     (void)::setenv("STRIX_DIST_USB4_TIMEOUT_MS", "60000", 0);
     (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "60000", 0);
     Args a;
+    a.session_explicit = session_explicit;
     bool tp_set = false;
     for (int i = 1; i < argc; ++i) {
         const std::string s = argv[i];
@@ -2893,6 +3331,13 @@ int main(int argc, char** argv) try {
         }
         else if (s == "--prefill-rows") a.prefill_rows = u32();
         else if (s == "--prefill-min") a.prefill_min = u32();
+        else if (s == "--session-cache-dir")
+            a.session_dir = next();
+        else if (s == "--session-cache-mb")
+            a.session_ram_bytes = std::stoull(next()) << 20U;
+        else if (s == "--session-ram-bytes") a.session_ram_bytes = std::stoull(next());
+        else if (s == "--session-max-parked") a.session_max_parked = std::stoull(next());
+        else if (s == "--session-disk-bytes") a.session_disk_bytes = std::stoull(next());
         else if (s == "--prefix-cache-mb") a.prefix_cache_mb = std::stoull(next()), a.set_cache_mb = true;
         else if (s == "--prefix-block") a.prefix_block = u32();
         else if (s == "--prefix-reserve-mb") a.prefix_reserve_mb = std::stoull(next());
@@ -2916,6 +3361,10 @@ int main(int argc, char** argv) try {
     (void)tp_set;
     if (a.model.empty()) throw std::invalid_argument("usage: strix-deepseek41-serve MODEL.gguf --rank R --transport T | --group-manifest FILE | --describe-json");
     if (!a.manifest.empty()) apply_manifest(a);
+    if (a.session_ram_bytes && a.session_ram_bytes < (16ULL << 20U) + std::uint64_t{a.context} * 2048ULL) {
+        a.session_ram_bytes = 0; a.session_dir.clear();
+        std::fprintf(stderr, "session cache: off (effective manifest context exceeds RAM budget)\n");
+    }
     // The device prefill runs the expert-TP identity too (d647d6d4) and the cache namespace records the decode identity
     // (prefix_namespace_from_env), so the agent profile applies with STRIX_DS41_EXPERT_TP=1 as well.
     apply_cache_profile(a);
@@ -2963,6 +3412,7 @@ int main(int argc, char** argv) try {
         describe(a);
         return 0;
     }
+    strix::LoaderCapture loader_capture(a.session_ram_bytes != 0);
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
     if (a.transport == "emulate") {  // both ranks in this process over the in-memory pair (one-node tests, few layers)

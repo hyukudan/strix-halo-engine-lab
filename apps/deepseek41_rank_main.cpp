@@ -1,7 +1,10 @@
+#include "strix/ds41_dspark_vocab.hpp"
+#include "strix/model_content_hash.hpp"
 #include "strix/deepseek41_describe.hpp"
 #include "strix/deepseek41_device_forward.hpp"
 #include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/ds41_engram_tp.hpp"
+#include "strix/deepseek41_session_cache.hpp"
 #include "strix/ds41_pipeline_dspark.hpp"
 #include "strix/ds41_pipeline_front.hpp"
 #include "strix/ds41_spec_tail.hpp"
@@ -107,6 +110,12 @@ struct Args {
     unsigned connect_timeout = 60;  // seconds for opening the transport (a dead USB4 link blocks open())
     bool describe = false;
     std::string role, stage_listen, stage_token_file, import_state, export_state;
+    std::string session_save, session_load, session_id = "gate", session_suffix;
+    std::uint64_t session_bytes = 0;
+    bool session_dspark = false;
+    std::uint32_t session_suffix_tokens = 64;
+    bool session_validate_only = false;
+    bool session_hash_only = false;
     std::uint32_t first_layer = 0;
     bool stage_once = false;
     unsigned stage_sessions = 0;   // --stage-sessions N: exit after N sessions (0: serve until killed; --stage-once = 1)
@@ -1374,6 +1383,259 @@ void record_route_sequences(const Args& a, strix::deepseek41::DeviceForward& fwd
     }
 }
 
+strix::deepseek41::SessionCompat rank_session_compat(const Args& a, std::uint32_t rank) {
+    namespace ds = strix::deepseek41;
+    std::map<std::string, std::string> cfg{{"world", "2"},
+                                        {"rank", std::to_string(rank)},
+                                        {"engine", "tp2-rank-target-r1"},
+                                        {"layers", std::to_string(a.layers)},
+                                        {"context", std::to_string(a.max_positions)},
+                                        {"tp-attention", std::to_string(a.tp)},
+                                        {"split-shared", std::to_string(a.split_shared)},
+                                        {"engram-direct", std::to_string(a.engram_direct)},
+                                        {"stream-experts", std::to_string(a.stream_experts)},
+                                        {"gather", std::to_string(a.gather)},
+                                        {"dspark", "off"},
+                                        {"sampling", "greedy"},
+                                        {"producer-plan", "target-r1-every-input-v1"},
+                                        {"layout", "fp8-ring136x528-kv288-idx68-fp32carry-v1"}};
+    if (a.session_dspark) {
+        cfg["engine"] = "tp2-rank-dspark-r2";
+        cfg["dspark"] = "on";
+        cfg["producer-plan"] = "dspark-target-r1-append-every-row-v2";
+        cfg["draft-schema"] = "strix/ds41-dspark-context-v2";
+        cfg["draft-vocab"] = a.stage_dspark_vocab;
+        cfg["draft-policy"] = a.stage_dspark_policy;
+        cfg["draft-placement"] = "split";
+        cfg["draft-cost-update"] = "frozen-prior-survival-adapts-v1";
+    }
+    std::map<std::string, std::filesystem::path> assets{{"model", a.model},
+        {"draft", a.session_dspark ? a.stage_dspark : ""}};
+    if (a.session_dspark) assets["draft-costs"] = a.stage_dspark_costs;
+    if (a.session_dspark) {
+        std::uint32_t i = 0;
+        for (const auto& path : strix::ds41::dspark::vocabulary_asset_files(a.stage_dspark_vocab))
+            assets["draft-vocab:" + std::to_string(i++)] = path;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const auto snapshot = strix::LoaderCapture::snapshot();
+    auto result = ds::session_compat(std::move(cfg), assets, "/proc/self/exe",
+        (a.session_hash_only || a.session_validate_only) ? nullptr : &snapshot);
+    const auto stats = strix::file_hash_cache_stats();
+    std::printf("session hashing rank %u seconds %.6f cache_hits %llu cache_misses %llu\n", rank,
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
+        static_cast<unsigned long long>(stats.hits), static_cast<unsigned long long>(stats.misses));
+    return result;
+}
+
+void run_session(const Args &a, strix::deepseek41::DeviceForward &fwd, std::uint32_t rank, strix::dist::Communicator* comm) {
+    namespace ds = strix::deepseek41;
+    using Sessions = ds::PrefixCache::Sessions;
+    const ds::SessionExchange ex = [&](std::span<const std::uint8_t> b) {
+        return ds::session_peer_exchange(b, [&](auto out, auto in) { fwd.exchange_host(out, in); });
+    };
+    const auto clock = [] { return std::chrono::steady_clock::now(); };
+    const auto elapsed = [&](auto t) { return std::chrono::duration<double>(clock() - t).count(); };
+    std::uint64_t emitted = 0;
+    namespace spark = strix::ds41::dspark;
+    std::unique_ptr<spark::SpecTailDrafter> drafter;
+    spark::WindowController controller;
+    ds::SessionDraftState draft_state;
+    if (a.session_dspark) {
+        const auto draft_load_start = clock();
+        drafter = std::make_unique<spark::SpecTailDrafter>(a.model, a.stage_dspark, a.stage_dspark_vocab);
+        drafter->set_split(rank, *comm);
+        std::printf("session drafter load rank %u seconds %.6f\n", rank, elapsed(draft_load_start));
+        spark::WindowController::Costs costs;
+        for (std::uint32_t r = 1; r <= spark::WindowController::max_rows; ++r) {
+            costs.verify[r] = 1.0F + 0.15F * static_cast<float>(r - 1U);
+            costs.samples[r] = 1;
+        }
+        if (!a.stage_dspark_costs.empty()) {
+            const auto table = strix::ds41::pipe::read_spec_cost_table(a.stage_dspark_costs);
+            for (std::uint32_t r = 1; r <= spark::WindowController::max_rows; ++r)
+                if (r < table.verify.size() && table.verify[r] > 0) costs.verify[r] = static_cast<float>(table.verify[r]);
+            costs.draft = static_cast<float>(table.draft); costs.extra = static_cast<float>(table.extra);
+        }
+        controller.set_costs(costs);
+    }
+    auto compat = rank_session_compat(a, rank);
+    Sessions cache(std::move(compat), rank, (a.session_bytes ? a.session_bytes : (512ULL << 20U)), a.session_load.empty() ? a.session_save : a.session_load);
+    std::optional<ds::SessionCheckpoint> loaded;
+    if (!a.session_load.empty()) {
+        const auto t = clock();
+        loaded = cache.resume(a.session_id, true, ex);
+        const auto device_start = clock();
+        bool ok = true;
+        try {
+            // resume() validated BOTH CPU sections before either device import.
+            if (drafter) {
+                if (!loaded->draft) throw std::runtime_error("missing DSpark state");
+                drafter->import_context(loaded->draft->context, loaded->draft->exchange_request);
+                controller.import_state(loaded->draft->controller);
+                draft_state = *loaded->draft;
+            }
+            fwd.import_state(loaded->attention);
+        } catch (...) {
+            ok = false;
+        }
+        Sessions::agree(ok, ex, "fresh-process target import");
+        emitted = loaded->frontier.emitted;
+        const auto device_seconds = elapsed(device_start);
+        const auto timing = cache.last_restore();
+        std::printf("session restore rank %u seconds %.6f read_seconds %.6f verify_seconds %.6f peer_seconds %.6f copy_agree_seconds %.6f bytes %llu\n",
+                    rank, elapsed(t), timing.read_seconds, timing.verify_seconds, timing.peer_seconds, device_seconds,
+                    static_cast<unsigned long long>(timing.payload_bytes));
+    }
+    const auto parse = [](const std::string &text) {
+        std::vector<std::uint32_t> out;
+        std::stringstream ss(text);
+        for (std::string t; std::getline(ss, t, ',');)
+            if (!t.empty() && t != "-")
+                out.push_back(static_cast<std::uint32_t>(std::stoul(t)));
+        return out;
+    };
+    if (drafter && !loaded) {
+        const auto initial = parse(a.prompt);
+        if (initial.empty()) throw std::invalid_argument("DSpark session needs a prompt");
+        (void)drafter->begin(initial, initial.front());
+    }
+    const auto step = [&](std::uint32_t token) {
+        auto row = fwd.step(token);
+        if (drafter) {
+            drafter->stage(fwd.captured_streams(), 1U, fwd.stream());
+            drafter->add_vocabulary(std::span(&token, 1));
+        }
+        return row;
+    };
+    std::ofstream logits;
+    if (!a.logits_path.empty())
+        logits.open(a.logits_path + "-r" + std::to_string(rank) + ".f32", std::ios::binary);
+    if (!a.logits_path.empty() && !logits)
+        throw std::runtime_error("cannot open session logits dump");
+    const auto turn = [&](std::vector<std::uint32_t> input, std::uint32_t count, bool dump) {
+        if (input.empty() || count == 0)
+            throw std::invalid_argument("session turn requires input and positive generated-token count");
+        if (std::uint64_t{fwd.next_position()} + input.size() + count >= a.max_positions)
+            throw std::invalid_argument("session turn exceeds context");
+        const auto t = clock();
+        std::vector<float> row;
+        for (auto token : input)
+            row = step(token);
+        const auto input_seconds = elapsed(t);
+        const auto emit = [&](std::uint32_t i) {
+            const auto token = fwd.next_token();
+            if (dump) {
+                std::printf("session token rank %u index %u id %u\n", rank, i, token);
+                if (logits)
+                    logits.write(reinterpret_cast<const char *>(row.data()), static_cast<std::streamsize>(row.size() * sizeof(float)));
+            }
+            ++emitted;
+        };
+        if (!drafter) {
+            for (std::uint32_t i = 0; i < count; ++i) {
+                emit(i);
+                if (i + 1 < count) row = step(fwd.next_token());
+            }
+        } else {
+            std::uint32_t i = 0;
+            emit(i++);
+            while (i < count) {
+                const bool use = a.stage_dspark_policy != "controller" || controller.draft_next();
+                spark::Draft draft;
+                std::uint32_t k = 0, verified = 0, accepted = 0;
+                if (use) {
+                    draft = drafter->draft(fwd.next_token(), fwd.stream());
+                    k = a.stage_dspark_policy == "controller" ? controller.choose(draft) :
+                        static_cast<std::uint32_t>(std::stoul(a.stage_dspark_policy.substr(6)));
+                    k = std::min(k, count - i);
+                    ++draft_state.windows;
+                }
+                // R1 verification: a rejected draft is never fed. The target remains the exact R1 producer.
+                for (std::uint32_t j = 0;; ++j) {
+                    row = step(fwd.next_token());
+                    emit(i++);
+                    if (use && j < k) {
+                        ++verified;
+                        if (fwd.next_token() == draft.tokens[j + 1U]) ++accepted;
+                        else break;
+                    }
+                    if (i == count || j >= k) break;
+                }
+                if (use) controller.observe(draft, verified, accepted);
+                draft_state.verified += verified; draft_state.accepted += accepted;
+            }
+            // Also done on the never-saved arm: capture has no hidden-row flush side effect.
+            drafter->flush(fwd.stream());
+            if (drafter->next_position() != fwd.next_position()) throw std::logic_error("DSpark turn frontier");
+        }
+        if (logits) {
+            logits.flush();
+            if (!logits)
+                throw std::runtime_error("session logits write failed");
+        }
+        std::printf("session turn rank %u seconds %.6f input_seconds %.6f input %zu generated %u\n", rank, elapsed(t), input_seconds, input.size(), count);
+    };
+    auto prompt = parse(a.prompt);
+    if (loaded)
+        prompt.insert(prompt.begin(), loaded->frontier.pending);
+    turn(std::move(prompt), a.generate, a.session_suffix.empty());
+    if (!a.session_save.empty()) {
+        const auto t = clock();
+        ds::SessionCheckpoint c;
+        c.id = a.session_id;
+        c.rank = rank;
+        c.compat_record = cache.compat().record();
+        std::string gen = rank == 0 ? ds::session_generation() : std::string{};
+        const auto other = ex(ds::SessionBytes(gen.begin(), gen.end()));
+        if (rank == 1)
+            gen.assign(other.begin(), other.end());
+        c.generation = gen;
+        c.attention = fwd.export_state();
+        c.frontier.consumed = c.frontier.accepted = c.attention.position;
+        c.frontier.pending = c.attention.next_token;
+        c.frontier.emitted = emitted;
+        if (drafter) {
+            draft_state.context = drafter->export_context();
+            draft_state.controller = controller.export_state();
+            draft_state.exchange_request = drafter->exchange_request();
+            c.draft = draft_state;
+            c.frontier.drafter = draft_state.context.next;
+            c.frontier.lineage = "ds41-dspark-r1-committed-turn-v2";
+        }
+        cache.capture(c, ex);
+        const auto captured = elapsed(t);
+        const auto disk_start = clock();
+        cache.checkpoint(c.id, ex);
+        const auto saved_bytes = std::filesystem::file_size(std::filesystem::path(a.session_save) /
+            (c.id + "." + c.generation + ".rank" + std::to_string(rank) + ".state"));
+        std::printf("session checkpoint rank %u capture_seconds %.6f write_fsync_seconds %.6f bytes %llu generation %s\n", rank, captured, elapsed(disk_start),
+                    static_cast<unsigned long long>(saved_bytes), gen.c_str());
+    }
+    if (!a.session_suffix.empty()) {
+        auto suffix = parse(a.session_suffix);
+        suffix.insert(suffix.begin(), fwd.next_token());
+        turn(std::move(suffix), a.session_suffix_tokens, true);
+    }
+    const auto state = fwd.export_state();
+    ds::SessionCheckpoint final;
+    final.attention = state;
+    if (drafter) {
+        draft_state.context = drafter->export_context();
+        draft_state.controller = controller.export_state();
+        draft_state.exchange_request = drafter->exchange_request();
+        final.draft = draft_state;
+        std::printf("session acceptance rank %u windows %llu verified %llu accepted %llu\n", rank,
+            static_cast<unsigned long long>(draft_state.windows), static_cast<unsigned long long>(draft_state.verified),
+            static_cast<unsigned long long>(draft_state.accepted));
+    }
+    std::printf("session final rank %u canonical_sha256 %s\n", rank, ds::session_state_sha256(final).c_str());
+    if (!a.state_path.empty())
+        ds::save_attention_state(a.state_path + "-r" + std::to_string(rank) + ".state", state);
+    if (rank == 0 && !a.export_state.empty())
+        ds::save_attention_state(a.export_state, state);
+}
+
 void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport, bool print) {
     const auto t0 = std::chrono::steady_clock::now();
     // no transport: one node alone (world 1; with --stream-experts the experts are read from the file per layer)
@@ -1402,7 +1664,32 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
     o.record_routes = !a.routes_path.empty();
     o.first_layer = a.first_layer;
     o.head = a.role != "pipeline-record";
-    o.capture_main_hidden = a.role == "pipeline-stage" && !a.stage_dspark.empty() && (rank == 0U || a.stage_dspark_placement == "split");  // the drafter input
+    o.capture_main_hidden = a.session_dspark || (a.role == "pipeline-stage" && !a.stage_dspark.empty() && (rank == 0U || a.stage_dspark_placement == "split"));  // the drafter input
+    if (a.session_validate_only) {
+        namespace ds = strix::deepseek41;
+        using Sessions = ds::PrefixCache::Sessions;
+        // Host validation and peer agreement only: no DeviceForward or drafter upload.
+        const ds::SessionExchange ex = [&](std::span<const std::uint8_t> b) {
+            return ds::session_peer_exchange(b, [&](auto out, auto in) {
+                for (std::size_t at = 0; at < out.size(); at += 65536U) {
+                    const auto n = std::min<std::size_t>(65536U, out.size() - at);
+                    comm_owner->exchange_host(out.subspan(at, n), in.subspan(at, n),
+                        strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 0xC1U, at});
+                }
+            });
+        };
+        Sessions cache(rank_session_compat(a, rank), rank, (a.session_bytes ? a.session_bytes : (512ULL << 20U)), a.session_load);
+        const auto io_start = std::chrono::steady_clock::now();
+        const auto report_io = [&] {
+            std::printf("session checkpoint io rank %u seconds %.6f\n", rank,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - io_start).count());
+        };
+        try { (void)cache.resume(a.session_id, true, ex); }
+        catch (...) { report_io(); throw; }
+        report_io();
+        std::printf("session validation rank %u passed before model upload\n", rank);
+        return;
+    }
     strix::deepseek41::DeviceForward fwd(a.model, o);
     if (a.role == "pipeline-record") {
         record_front(a, fwd, rank, single ? 1U : 2U, print);
@@ -1417,6 +1704,11 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
         kComm = comm_owner.get();
         if (rank == 0U) serve_stage(a, fwd, single ? 1U : 2U, comm_owner.get());
         else follow_stage(a, fwd, comm_owner.get());
+        return;
+    }
+    if (a.session_bytes || !a.session_save.empty() || !a.session_load.empty()) {
+        std::printf("session model load rank %u seconds %.6f\n", rank, fwd.load_seconds());
+        run_session(a, fwd, rank, comm_owner.get());
         return;
     }
     const auto save_state = [&] {
@@ -1866,6 +2158,23 @@ int main(int argc, char** argv) try {
         else if (s == "--stage-dspark-costs") a.stage_dspark_costs = next();
         else if (s == "--stage-dspark-placement") a.stage_dspark_placement = next();
         else if (s == "--stage-fault-drop-accept") a.stage_fault_drop_accept = static_cast<std::uint32_t>(std::stoul(next()));
+        else if (s == "--session-dspark") a.session_dspark = true;
+        else if (s == "--session-save")
+            a.session_save = next();
+        else if (s == "--session-load")
+            a.session_load = next();
+        else if (s == "--session-id")
+            a.session_id = next();
+        else if (s == "--session-hash-only") a.session_hash_only = true;
+        else if (s == "--session-validate-only")
+            a.session_validate_only = true;
+        else if (s == "--session-cache-mb")
+            a.session_bytes = std::stoull(next()) << 20U;
+        else if (s == "--session-ram-bytes") a.session_bytes = std::stoull(next());
+        else if (s == "--session-suffix-ids")
+            a.session_suffix = next();
+        else if (s == "--session-suffix-tokens")
+            a.session_suffix_tokens = static_cast<std::uint32_t>(std::stoul(next()));
         else if (s == "--import-state") a.import_state = next();
         else if (s == "--export-state") a.export_state = next();
         else if (s == "--window-check") {
@@ -1892,6 +2201,37 @@ int main(int argc, char** argv) try {
         if (a.model.empty()) throw std::invalid_argument("usage: strix-deepseek41-rank MODEL.gguf --describe-json");
         std::printf("%s\n", describe(a).c_str());
         return 0;
+    }
+    if (a.session_hash_only) {
+        if (a.model.empty()) throw std::invalid_argument("hash-only requires MODEL");
+        (void)rank_session_compat(a, a.rank);
+        return 0;  // CPU only: before transport, DeviceForward and drafter construction.
+    }
+    strix::LoaderCapture loader_capture(a.session_bytes || !a.session_save.empty() || !a.session_load.empty());
+    if (a.session_validate_only && a.session_load.empty())
+        throw std::invalid_argument("--session-validate-only requires --session-load");
+    if (a.session_dspark && !a.session_bytes && a.session_save.empty() && a.session_load.empty())
+        throw std::invalid_argument("--session-dspark requires --session-cache-mb, --session-save or --session-load");
+    if (a.session_bytes || !a.session_save.empty() || !a.session_load.empty()) {
+        if (a.transport == "single" || a.role == "pipeline-stage" || a.role == "pipeline-record")
+            throw std::invalid_argument("session cache requires whole TP2 ranks");
+        if ((!a.stage_dspark.empty()) != a.session_dspark)
+            throw std::invalid_argument("session DSpark requires --session-dspark and --stage-dspark FILE together");
+        if (a.session_dspark && (a.layers != 40U || a.stage_dspark_placement != "split" ||
+            (a.stage_dspark_policy != "controller" && a.stage_dspark_policy.rfind("fixed:", 0) != 0)))
+            throw std::invalid_argument("session DSpark requires 40 layers, split placement, controller or fixed:0..5");
+        if (a.session_dspark && a.stage_dspark_policy != "controller" && std::stoul(a.stage_dspark_policy.substr(6)) > 5U)
+            throw std::invalid_argument("session DSpark fixed drafts must be 0..5");
+        if (!a.session_save.empty() && !a.session_load.empty())
+            throw std::invalid_argument("choose --session-save or --session-load");
+        if (!a.session_load.empty() && !a.session_suffix.empty())
+            throw std::invalid_argument("restore suffix goes in --prompt-ids");
+        if (!a.import_state.empty() || !a.state_in.empty() || a.aba || a.fill || !a.window_rows.empty() || !a.window_check.empty() ||
+            !a.forced_windows.empty() || !a.gather)
+            throw std::invalid_argument("session CLI needs greedy R1, gathered logits and no other state/benchmark modes");
+        if (a.generate == 0 || a.session_bytes > (std::uint64_t{1} << 40U))
+            throw std::invalid_argument("invalid session generated count or RAM budget");
+        strix::deepseek41::validate_session_id(a.session_id);
     }
     if (!a.role.empty() && a.role != "pipeline-stage" && a.role != "whole" && a.role != "pipeline-record")
         throw std::invalid_argument("--role is whole, pipeline-stage or pipeline-record");

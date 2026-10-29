@@ -74,12 +74,21 @@ inline constexpr const char* fp8_swiglu_identity = "e4m3-b32x32-a8-int-swiglu-cl
 // Comma-separated classes ("all" = every class) to the set; throws on an unknown class.
 [[nodiscard]] std::vector<std::string> parse_fp8_site_classes(const std::string& list);
 
+// Shared loader resolution. Index filenames may be hidden, absolute, outside dir or symlinks.
+struct SafetensorsResolution {
+    std::map<std::string, std::string> shard_of;
+    std::map<std::string, std::filesystem::path> files;
+    std::vector<std::filesystem::path> unindexed_shards;  // preserve loader scan order
+    bool indexed = false;
+};
+[[nodiscard]] SafetensorsResolution resolve_safetensors_checkpoint(const std::filesystem::path& dir);
+
 // Read-only view of a safetensors checkpoint directory: model.safetensors.index.json (or, without it, every
 // *.safetensors file) and the shard headers it names. Reads tensor bytes with plain positioned reads and drops them
 // from the page cache afterwards (Linux), so loading does not leave a cached copy next to the resident weights.
 class SafetensorsCheckpoint {
 public:
-    explicit SafetensorsCheckpoint(const std::filesystem::path& dir);
+    explicit SafetensorsCheckpoint(const std::filesystem::path& dir, bool reject_duplicate_names = false);
     struct Tensor {
         std::filesystem::path file;
         std::string dtype;
@@ -93,6 +102,7 @@ public:
 
 private:
     void load_header(const std::filesystem::path& file);
+    bool reject_duplicate_names_ = false;
     std::filesystem::path dir_;
     std::map<std::string, std::string> shard_of_;  // tensor name -> shard file name
     std::map<std::string, bool> loaded_;           // shard file name -> header parsed

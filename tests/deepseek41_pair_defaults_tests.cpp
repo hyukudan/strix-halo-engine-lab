@@ -104,9 +104,12 @@ struct World {
     std::set<std::string> files = {MODEL, DRAFT, PACKS + "/c-u6.gguf", PACKS + "/vocab/core48k.bin", PACKS + "/vocab/core32k.bin"};
     std::set<std::string> dirs = {MD, PACKS, PACKS + "/ours-K4", PACKS + "/ours-K5", PACKS + "/vocab"};
     pd::Build build{true};
+    std::uint64_t memory = 64ULL << 30U, free_disk = 512ULL << 30U;
 
     pd::Resolved run(pd::App app, const std::vector<std::string>& args) const {
         pd::Probe p;
+        p.available_memory = [this] { return memory; };
+        p.writable_space = [this](const std::string&) { return free_disk; };
         p.file = [this](const std::string& f) { return files.count(f) != 0; };
         p.dir = [this](const std::string& d) { return dirs.count(d) != 0; };
         p.list = [this](const std::string& d) {
@@ -131,12 +134,17 @@ std::map<std::string, std::string> env_of(const std::string& assignments) {
 bool has_arg(const pd::Resolved& r, const std::string& a) { return std::find(r.args.begin(), r.args.end(), a) != r.args.end(); }
 std::vector<std::string> plain(const Receipt& rc) { return {MODEL, "--rank", "0", "--transport", rc.transport}; }
 
+void check_notices(pd::App app, const pd::Resolved& r, std::vector<std::string> expected, const std::string& reason,
+                   const std::string& message) {
+    if (app == pd::App::serve) expected.push_back("session cache: off (" + reason + ")");
+    check(r.notices == expected, message + "\n" + pd::describe(app, r));
+}
 void test_equivalence() {
     const World w;
     for (const auto& rc : receipts) {
         const auto name = std::string(pd::app_name(rc.app));
         const auto r = w.run(rc.app, plain(rc));
-        check(r.notices.empty(), name + ": plain invocation has no fallback notice");
+        check_notices(rc.app, r, {}, "route not yet GPU-qualified: tp2-http-batch-dspark", name + ": plain invocation notices");
         check(r.unset_env.empty(), name + ": nothing unset");
         check(env_of(r) == env_of(rc.env), name + ": environment == receipt EXTRA_ENV\n" + pd::describe(rc.app, r));
         auto want = flags(words(MODEL + " --rank 0 --transport " + rc.transport + " --connect-timeout 60 " + rc.args));
@@ -159,7 +167,7 @@ void test_off_switches() {
             const auto r = w.run(rc.app, plain(rc));
             check(r.args == plain(rc), name + ": BASELINE=1 leaves the arguments as given");
             check(r.set_env == pd::baseline_off_items(), name + ": BASELINE=1 sets exactly the adopted items =0");
-            check(r.notices.empty(), name + ": BASELINE=1 has no notice");
+            check_notices(rc.app, r, {}, "baseline switch", name + ": baseline notices");
             w.env["STRIX_DS41_SERVE_WARM"] = "1";  // an explicit value still wins
             check(env_of(w.run(rc.app, plain(rc))).count("STRIX_DS41_SERVE_WARM") == 0, name + ": BASELINE keeps explicit values");
         }
@@ -237,7 +245,7 @@ void test_fallbacks() {
         const auto r = w.run(pd::App::rank, plain(receipts[0]));
         const auto e = env_of(r);
         check(e.count("STRIX_DS41_OVERLAY") && !e.count("STRIX_DS41_TRELLIS"), "rank: no dense_r1: overlay only");
-        check(r.notices.size() == 1U && r.notices[0].find("dense_r1") != std::string::npos, "rank: no dense_r1: notice");
+        check_notices(pd::App::rank, r, {"deepseek41 defaults: trellis packs off (this build has no dense_r1 trellis library: CMake STRIX_DS41_TRELLIS_API=dense_r1)"}, "", "rank: no dense_r1: notice");
     }
     {
         World w;  // STRIX_DS41_PACKS points elsewhere
@@ -255,9 +263,13 @@ void test_fallbacks() {
         World w;
         w.env["STRIX_DS41_BATCH_ROWS16"] = "1";
         const auto r = w.run(pd::App::serve, plain(receipts[3]));
-        check(!has_arg(r, "--dspark") && r.notices.size() == 1U, "serve: ROWS16: DSpark off with a notice");
+        check(!has_arg(r, "--dspark"), "serve: ROWS16: DSpark off");
+        check_notices(pd::App::serve, r, {"deepseek41 defaults: serve DSpark off (not qualified with STRIX_DS41_BATCH_ROWS16=1)"},
+                      "route not yet GPU-qualified: tp2-http-target", "serve: ROWS16 notices");
         const auto p = World().run(pd::App::serve, {MODEL, "--rank", "0", "--transport", "usb4auto", "--prefix-session-snapshots"});
-        check(!has_arg(p, "--dspark") && p.notices.size() == 1U, "serve: session snapshots: DSpark off with a notice");
+        check(!has_arg(p, "--dspark"), "serve: session snapshots: DSpark off");
+        check_notices(pd::App::serve, p, {"deepseek41 defaults: serve DSpark off (--prefix-session-snapshots is not exact with --dspark)"},
+                      "route not yet GPU-qualified: tp2-http-target", "serve: snapshot notices");
     }
     {
         const World w;
@@ -270,12 +282,129 @@ void test_fallbacks() {
     }
 }
 
+void test_session_defaults() {
+    World w; w.env["HOME"] = "cache-home";
+    const std::vector<std::string> args{MODEL, "--transport", "usb4auto", "--no-dspark"};
+    auto r = w.run(pd::App::serve, args);
+    check(!r.session.enabled && !r.session.disk, "unqualified target serving defaults OFF");
+    check(r.session.ram_bytes == w.memory / 10 && r.session.max_parked == 8, "RAM defaults");
+    check(r.session.disk_bytes == 0 && r.session.directory == "cache-home/.cache/strix-engine/sessions", "disk defaults");
+    const std::string session_lines = "session cache off\nsession ram_bytes 6871947673\nsession max_parked 8\n"
+        "session disk off\nsession disk_bytes 0\nsession directory cache-home/.cache/strix-engine/sessions\n"
+        "session reason route not yet GPU-qualified: tp2-http-target\n"
+        "notice session cache: off (route not yet GPU-qualified: tp2-http-target)\n";
+    check(pd::describe(pd::App::serve,r).ends_with(session_lines), "exact effective session lines");
+    check(r.session.reason == "route not yet GPU-qualified: tp2-http-target", "target GPU admission gate");
+    check(std::count(r.notices.begin(), r.notices.end(), "session cache: off (route not yet GPU-qualified: tp2-http-target)") == 1, "one qualification notice");
+    auto force_on = args; force_on.insert(force_on.end(), {"--session-cache", "on"});
+    check(!w.run(pd::App::serve, force_on).session.enabled, "on does not bypass qualification");
+    const auto explicit_gate = w.run(pd::App::rank, {MODEL, "--session-save", "/tmp/gate", "--session-dspark", "--session-validate-only"});
+    check(has_arg(explicit_gate, "--session-save") && has_arg(explicit_gate, "--session-dspark") && has_arg(explicit_gate, "--session-validate-only"), "explicit qualification phases preserved");
+    auto off = args; off.insert(off.end(), {"--session-cache", "off"});
+    check(!w.run(pd::App::serve, off).session.enabled, "CLI off switch");
+    w.env["STRIX_SESSION_CACHE"] = "0";
+    check(!w.run(pd::App::serve, args).session.enabled, "environment off switch");
+    w.env.erase("STRIX_SESSION_CACHE");
+    w.env["STRIX_DS41_BASELINE"] = "1";
+    auto force = args; force.insert(force.end(), {"--session-cache", "on"});
+    check(!w.run(pd::App::serve, force).session.enabled, "baseline forces sessions off");
+    w.env.erase("STRIX_DS41_BASELINE");
+    off = args; off.insert(off.end(), {"--session-disk", "off"});
+    r = w.run(pd::App::serve, off);
+    check(!r.session.enabled && !r.session.disk, "disk-only CLI off");
+    w.env["STRIX_SESSION_DISK"] = "0";
+    check(!w.run(pd::App::serve,args).session.disk, "disk-only env off");
+    w.env.erase("STRIX_SESSION_DISK");
+    auto zero_disk = args; zero_disk.insert(zero_disk.end(), {"--session-disk-bytes", "0"});
+    check(!w.run(pd::App::serve,zero_disk).session.disk, "zero disk quota disables disk");
+    const auto rank_off = w.run(pd::App::rank, {MODEL,"--session-save","/tmp/explicit","--session-dspark","--session-cache","off"});
+    check(rank_off.args == std::vector<std::string>({MODEL,"--engram-direct"}), "rank off switch removes explicit session commands");
+    const auto hash_off = w.run(pd::App::rank, {MODEL,"--session-hash-only","--session-dspark","--session-cache","off"});
+    check(hash_off.args == std::vector<std::string>({MODEL,"--engram-direct"}), "rank off consumes value-free hash-only control");
+    w.free_disk = 0; r = w.run(pd::App::serve,args);
+    check(!r.session.enabled && !r.session.disk, "unqualified route stays off with unwritable disk");
+    w.free_disk = 512ULL << 30U;
+    w.memory = 1; r = w.run(pd::App::serve,args);
+    check(!r.session.enabled && r.notices.size() == 1, "low memory is one-line fallback");
+    w.memory = 64ULL << 30U;
+    r = w.run(pd::App::serve,plain(receipts[3]));
+    check(!r.session.enabled && r.session.reason.find("route not yet GPU-qualified: tp2-http-batch-dspark") != std::string::npos, "production batch DSpark unchanged");
+    auto custom = args; custom.insert(custom.end(), {"--session-ram-bytes", "67108864", "--session-max-parked", "3",
+        "--session-dir", "cache/sessions", "--session-disk-bytes", "268435456"});
+    r = w.run(pd::App::serve,custom);
+    check(!r.session.enabled && !r.session.disk && r.session.ram_bytes == 67108864 && r.session.max_parked == 3 &&
+        r.session.disk_bytes == 268435456 && r.session.directory == "cache/sessions", "explicit budgets and directory");
+    auto reordered = args; reordered.insert(reordered.end(), {"--dspark", DRAFT});
+    check(!w.run(pd::App::serve,reordered).session.enabled, "DSpark after no-dspark stays fail closed");
+    reordered.insert(reordered.end(), {"--no-dspark"});
+    check(!w.run(pd::App::serve,reordered).session.enabled, "last no-dspark still requires target GPU qualification");
+    w.env["XDG_CACHE_HOME"] = "/xdg";
+    check(w.run(pd::App::serve,args).session.directory == "/xdg/strix-engine/sessions", "XDG directory");
+    check(!w.run(pd::App::rank,plain(receipts[0])).session.enabled, "one-shot defaults never select session producer");
+}
+
+void test_session_off_settings() {
+    for (const auto& rc : receipts) {
+        World w;
+        w.env["HOME"] = "cache-home";
+        const auto args = plain(rc);
+        const auto original = w.run(rc.app, args);
+        const std::string reason = rc.app == pd::App::serve ? "route not yet GPU-qualified: tp2-http-batch-dspark" : "one-shot commands remain explicit";
+        const std::string lines = "session cache off\nsession ram_bytes 6871947673\nsession max_parked 8\n"
+            "session disk off\nsession disk_bytes 0\nsession directory cache-home/.cache/strix-engine/sessions\n"
+            "session reason " + reason + "\n";
+        const std::string notice = rc.app == pd::App::serve ? "notice session cache: off (" + reason + ")\n" : "";
+        check(pd::describe(rc.app, original).ends_with(lines + notice), "exact default session inspection lines");
+        for (const auto* value : {"0", "1", "false", "true", "on", "off", "other"}) {
+            w.env["STRIX_BASELINE"] = value;
+            check(pd::describe(rc.app, w.run(rc.app, args)) == pd::describe(rc.app, original), "generic baseline environment leaves resolution unchanged");
+        }
+        w.env.erase("STRIX_BASELINE");
+        auto cli = args;
+        cli.push_back("--baseline");
+        const auto generic_cli = w.run(rc.app, cli);
+        auto expected_args = original.args;
+        expected_args.push_back("--baseline");
+        check(generic_cli.args == expected_args && generic_cli.set_env == original.set_env && generic_cli.session.reason == original.session.reason,
+              "generic baseline argument retains its original parser semantics");
+
+        for (const auto* value : {"0", "1", "false", "true", "on", "off", "other"}) {
+            w.env["STRIX_SESSION_CACHE"] = value;
+            w.env["STRIX_SESSION_DISK"] = value;
+            w.env["STRIX_SESSION_RAM_BYTES"] = "invalid";
+            w.env["STRIX_SESSION_MAX_PARKED"] = "-1";
+            w.env["STRIX_SESSION_DISK_BYTES"] = "999999999999999999999999999999";
+            auto print_args = args;
+            print_args.push_back("--print-effective-config");
+            const auto off = w.run(rc.app, print_args);
+            check(off.print_only && off.args == original.args && off.set_env == original.set_env && !off.session.enabled,
+                  "off-path settings preserve execution and inspection");
+            w.env["STRIX_DS41_BASELINE"] = "1";
+            const auto baseline = w.run(rc.app, print_args);
+            const std::string baseline_lines = "session cache off\nsession ram_bytes 6871947673\nsession max_parked 8\n"
+                "session disk off\nsession disk_bytes 0\nsession directory cache-home/.cache/strix-engine/sessions\n"
+                "session reason baseline switch\n";
+            const std::string baseline_notice = rc.app == pd::App::serve ? "notice session cache: off (baseline switch)\n" : "";
+            check(baseline.print_only && pd::describe(rc.app, baseline).ends_with(baseline_lines + baseline_notice), "exact baseline session inspection lines");
+            check_notices(rc.app, baseline, {}, "baseline switch", "exact baseline session notice");
+            w.env.erase("STRIX_DS41_BASELINE");
+        }
+        w.env["STRIX_DS41_BASELINE"] = "1";
+        auto invalid_cli = args;
+        invalid_cli.insert(invalid_cli.end(), {"--session-cache", "true", "--session-disk", "false", "--session-cache-mb", "999999999999999999999999",
+            "--session-ram-bytes", "invalid", "--session-max-parked", "invalid", "--session-disk-bytes", "invalid"});
+        check(!w.run(rc.app, invalid_cli).session.enabled, "baseline ignores malformed session CLI budgets");
+    }
+}
+
 }  // namespace
 
 int main() {
     test_equivalence();
     test_off_switches();
     test_fallbacks();
+    test_session_defaults();
+    test_session_off_settings();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

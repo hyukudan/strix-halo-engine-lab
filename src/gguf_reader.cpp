@@ -1,3 +1,4 @@
+#include "strix/model_input.hpp"
 #include "strix/gguf_reader.hpp"
 
 #include <algorithm>
@@ -471,7 +472,7 @@ FileInfo read(std::istream& input, std::uint64_t file_size, const Limits& limits
 
 FileInfo read_file(const std::filesystem::path& path, const Limits& limits) {
     const auto size = std::filesystem::file_size(path);
-    std::ifstream input(path, std::ios::binary);
+    strix::ModelInput input(path);
     if (!input) {
         throw std::runtime_error("cannot open GGUF file");
     }

@@ -161,6 +161,8 @@ public:
     // Bytes the cache would take for one snapshot at `position` of a prompt sharing nothing (the budget unit).
     [[nodiscard]] static std::uint64_t snapshot_bytes(const AttentionState& s);
 
+    // Complete generated conversations use the same attention-state adapter, in a separate versioned namespace.
+    class Sessions;
     struct Node;
     struct DiskEntry;
     struct Writer;

@@ -1,3 +1,4 @@
+#include "strix/model_input.hpp"
 #include "strix/ds41_dspark_driver.hpp"
 #include "strix/ds41_dspark_vocab.hpp"
 
@@ -376,7 +377,7 @@ WindowController::Table builtin_survival_table(std::uint32_t cap) {
 }
 
 WindowController::Table read_survival_table(const std::string& path, std::uint32_t cap) {
-    std::ifstream in(path);
+    strix::ModelInput in(path);
     if (!in) throw std::runtime_error("survival table: cannot read " + path);
     return parse_survival_table(in, path, cap);
 }

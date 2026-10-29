@@ -9,6 +9,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // Decode-priority scheduling of the two-rank serve (strix-deepseek41-serve, --prefill-path device), STRIX_DS41_SERVE_SCHED:
@@ -138,6 +139,13 @@ template <class Predict>
 // The numeric identity and the collective protocol both serve ranks must share, compared in the hello before READY:
 // the weights' content identity (prefix_namespace_from_env: overlay, CB4, trellis packs / mix / sites, SHEXP_TP, EP map,
 // the decode identity EP / expert TP) and the DSpark configuration (drafter, its ranks, window policy, vocabulary).
+// Preserve the pre-session hello bytes whenever the feature is disabled.
+[[nodiscard]] inline std::string session_serve_identity_text(const std::string& base, std::uint64_t ram_mb, bool disk) {
+    return ram_mb ? std::to_string(ram_mb) + ":" + std::to_string(disk) + ":" + base : base;
+}
+[[nodiscard]] inline bool session_admin_route(bool enabled, std::string_view path) {
+    return enabled && (path == "/v1/sessions" || path == "/v1/cache/stats" || path.starts_with("/v1/sessions/"));
+}
 [[nodiscard]] inline std::string serve_identity_text(const std::string& namespace_text, std::uint64_t dspark_bytes, std::uint32_t dspark_ranks,
                                                      const std::string& dspark_window, const std::string& dspark_vocab) {
     std::string t = namespace_text + "dspark=";

@@ -1,3 +1,4 @@
+#include "strix/model_input.hpp"
 #include "strix/ds41_dspark_files.hpp"
 
 #include "strix/gguf_reader.hpp"
@@ -11,7 +12,7 @@ namespace strix::ds41::dspark {
 namespace {
 
 std::vector<std::uint8_t> read_range(const std::string& path, std::uint64_t offset, std::uint64_t bytes) {
-    std::ifstream file(path, std::ios::binary);
+    strix::ModelInput file(path);
     if (!file) throw std::runtime_error("cannot open " + path);
     file.seekg(static_cast<std::streamoff>(offset));
     std::vector<std::uint8_t> out(bytes);

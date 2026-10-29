@@ -112,7 +112,26 @@ serve C1 43.58 -> 48.00 tok/s; every run exact):
 `<packs>` is `STRIX_DS41_PACKS` when set, else `<model dir>/packs`, else the model's directory (`STRIX_DS41_PACKS=0`:
 no packs). An argument on the command line wins over the default, a variable already in the environment is never changed,
 and a missing precondition drops its item with one `deepseek41 defaults:` line on stderr. `--print-effective-config`
-prints the resolved environment and arguments and exits before any device work.
+prints the resolved environment, arguments and these seven session lines before any device work:
+
+```text
+session cache off
+session ram_bytes RAM_BYTES
+session max_parked MAX_PARKED
+session disk off
+session disk_bytes DISK_BYTES
+session directory CACHE_DIRECTORY
+session reason OFF_REASON
+```
+
+All four apps print these session lines, including under `STRIX_DS41_BASELINE=1`.
+Serve also reports `session cache: off (OFF_REASON)` on stderr when sessions are
+not admitted, including a plain invocation. With the current empty qualification
+table, the reason is `route not yet GPU-qualified: tp2-http-target` or
+`route not yet GPU-qualified: tp2-http-batch-dspark`, according to the resolved
+producer. Inspection includes the same message as a `notice session cache: off
+(OFF_REASON)` line. Under the DeepSeek baseline the reason is `baseline switch`;
+an explicit cache off switch reports `off switch`.
 
 Master switch `STRIX_DS41_BASELINE=1`: nothing above is added, and the code defaults adopted on 2026-10-25/26 are set
 to `=0` (`STRIX_DS41_SHARED_GROUPED`, `SHARED_DOWN_FUSED`, `MOE_PREFILL`, `DENSE_SELECT`, `ATTN_WINDOW_FOLD`,
@@ -162,3 +181,9 @@ mixed-load qualification; the P17.1 figures above do not qualify them. See the
 [server contract and legacy-budget precedence](../../engine/serving/serving.md#deepseek-v41-pair-scheduler).
 Use `STRIX_DS41_SERVE_SERVICE_MS=0` for coarse row budgeting and
 `STRIX_DS41_SERVE_SHORT_FIRST=0` for FIFO; restart both ranks when changing settings.
+
+Conversation checkpoint/park/resume is a production [session-cache feature](session-cache.md).
+Automatic admission requires a GPU-qualified route; the qualification table is
+currently empty. Explicit rank commands run the qualification gate. Sessions
+honour only `STRIX_DS41_BASELINE`; generic baseline settings retain their existing
+DeepSeek behavior.
