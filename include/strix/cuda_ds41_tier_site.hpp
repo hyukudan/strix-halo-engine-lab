@@ -19,6 +19,7 @@
 
 #include "strix/cuda_ds41_moe.hpp"
 #include "strix/ds41_tier_stats.hpp"
+#include "strix/ds41_weight_read_options.hpp"
 
 #include <cuda_runtime.h>
 
@@ -43,6 +44,7 @@ struct TierWinpf {
 };
 
 struct TierSiteOptions {
+    WeightReadOptions weight_read;
     std::string model;                     // the GGUF the library reads the experts from
     std::uint32_t layers = 40;
     std::uint32_t slots = 0;               // persistent device slots, spares included

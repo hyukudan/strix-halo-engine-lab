@@ -19,6 +19,7 @@
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/ds41_host_pin_plan.hpp"
 #include "strix/ds41_host_pin_admission.hpp"
+#include "strix/ds41_weight_read_options.hpp"
 
 #include <array>
 #include <cstdint>
@@ -117,6 +118,7 @@ struct CudaPrefillOptions {
     // Engram rows: "file" (the model file's tables), "zero" (no rows read: timing only, NOT the model's bits).
     std::string engram = "file";
     bool engram_direct = true;                      // unbuffered reads of the Engram rows / file-tier experts
+    WeightReadOptions weight_read;
     unsigned io_threads = 8;                        // expert file reads (8 MB pieces)
     unsigned engram_threads = 64;                   // Engram row reads (queue depth of the random 4 KiB reads)
     std::uint32_t engram_cache_mb = 0;              // decode steps: Engram records kept in RAM by file offset (0 = off)
@@ -536,6 +538,9 @@ public:
     [[nodiscard]] std::shared_ptr<attn::ExportCapture> export_capture() const noexcept;
     [[nodiscard]] const HostPinStats& host_pin_stats() const noexcept;
     [[nodiscard]] std::size_t pinned_bytes() const noexcept;   // pinned host memory held
+    [[nodiscard]] std::string weight_io_json() const;
+    // Empty when no multi-location reader is active; otherwise a comma-prefixed JSON member.
+    [[nodiscard]] std::string weight_io_fields() const;
     [[nodiscard]] std::string describe() const;                // tiers, budgets, sizes (one line of JSON)
     // Device copy of a model tensor's GGUF bytes (uploaded on first use and kept by this object; e.g. a drafter on the
     // same device reads token_embd.weight / output.weight from here instead of holding its own copies).

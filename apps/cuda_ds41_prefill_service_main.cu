@@ -1280,6 +1280,8 @@ private:
         pre.set("host_layers", std::move(host_layers));
         pre.set("engram_s", Json(res.engram_seconds));
         pre.set("expert_io_s", Json(res.expert_io_seconds));
+        const auto weight_io = p_.weight_io_json();
+        if (weight_io != "null") pre.set("weight_io", strix::serve::parse_json(weight_io));
         pre.set("expert_gb_streamed", Json(double(res.expert_bytes_streamed) / 1e9));
         pre.set("row_layers", Json(res.row_layers));
         pre.set("expert_copy_busy_s", Json(res.expert_copy_busy_s));
@@ -1432,6 +1434,7 @@ void handle(Sock s, Service& svc, const Config& c, std::uint32_t max_positions, 
 
 [[noreturn]] void usage(const char* why) {
     std::fprintf(stderr, "strix-cuda-ds41-prefill-service: %s\n", why);
+    std::fprintf(stderr, "  --weight-dirs LIST (; separated; empty disables) --drive-readers N (4) --weight-verify cached|always (cached)\n  Environment when absent: STRIX_WEIGHT_DIRS, STRIX_WEIGHT_VERIFY\n");
     std::exit(2);
 }
 
@@ -1441,6 +1444,7 @@ int main(int argc, char** argv) {
     if (argc < 2) usage("MODEL.gguf [options]");
     const std::string model = argv[1];
     CudaPrefillOptions o;
+    bool weight_dirs_given = false, weight_verify_given = false;
     o.max_positions = 8192;
     o.expert_residency = true;
     o.auto_budget = true;
@@ -1493,6 +1497,12 @@ int main(int argc, char** argv) {
         else if (a == "--window") o.window_rows = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--io-threads") o.io_threads = static_cast<unsigned>(std::stoul(next()));
         else if (a == "--engram-threads") o.engram_threads = static_cast<unsigned>(std::stoul(next()));
+        else if (a == "--weight-dirs") { o.weight_read.weight_dirs = next(); weight_dirs_given = true; }
+        else if (a == "--drive-readers") {
+            try { o.weight_read.set_drive_readers(next()); }
+            catch (const std::exception& e) { usage(e.what()); }
+        }
+        else if (a == "--weight-verify") { o.weight_read.weight_verify = next(); weight_verify_given = true; }
         else if (a == "--buffered") o.engram_direct = false;
         else if (a == "--device") o.device = std::stoi(next());
         else if (a == "--layers") o.end_layer = static_cast<std::uint32_t>(std::stoul(next()));
@@ -1529,6 +1539,11 @@ int main(int argc, char** argv) {
         else if (a == "--v2-timeout") c.v2_timeout = std::stoi(next());
         else usage(("unknown option " + a).c_str());
     }
+    try {
+        o.weight_read.environment(weight_dirs_given, weight_verify_given, model);
+        o.weight_read.require_supported(model);
+    } catch (const std::exception& e) { usage(e.what()); }
+
     // --host-gib-auto G: opportunistic pinned host expert tier capped at G GiB (admitted once per layer against free
     // physical memory and commit, no waits; a layer that does not fit streams from the file with the same bits).
     // Opt-in until coexistence with the other PRO services is qualified; omitted = file-only as before.
@@ -1654,9 +1669,9 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         Service svc(p, o, c);
         std::printf("{\"event\":\"READY\",\"http\":\"%s:%d\",\"max_positions\":%u,\"fast_dense\":%s,\"fast_moe\":%s,\"fast_attention_min_rows\":%u,"
-                    "\"timing\":%s,\"pipeline\":%s,\"handoff_queue\":%zu}\n",
+                    "\"timing\":%s,\"pipeline\":%s,\"handoff_queue\":%zu%s}\n",
                     c.host.c_str(), c.port, o.max_positions, c.fast_dense ? "true" : "false", c.fast_moe ? "true" : "false",
-                    o.fast_attention ? c.fast_attention_min_rows : 0U, c.timing ? "true" : "false", c.pipeline ? "true" : "false", c.handoff_queue);
+                    o.fast_attention ? c.fast_attention_min_rows : 0U, c.timing ? "true" : "false", c.pipeline ? "true" : "false", c.handoff_queue, p.weight_io_fields().c_str());
         std::fflush(stdout);
         std::vector<std::thread> conns;
         std::atomic<int> live{0};

@@ -4,7 +4,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <cstdio>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -69,7 +71,51 @@ std::size_t read_at(HANDLE h, std::uint64_t offset, void* dst, std::size_t bytes
 
 }  // namespace
 
-FileReader::FileReader(const std::filesystem::path& path, bool direct, unsigned threads) : path_(path), direct_(direct) {
+FileReader::FileReader(const std::filesystem::path& path, bool direct, unsigned threads)
+    : FileReader(path, direct, threads, WeightReadOptions{}) {}
+
+FileReader::FileReader(const std::filesystem::path& path, bool direct, unsigned threads, const WeightReadOptions& options)
+    : path_(path), direct_(direct) {
+    options.require_supported(path);
+#ifdef STRIX_HAVE_TIERSTREAM_MFILE
+    if (options.has_secondary(path)) {
+        if (options.drive_readers == 0 || options.drive_readers > 32)
+            throw std::invalid_argument("--drive-readers must be an integer in 1..32");
+        if (options.weight_verify != "cached" && options.weight_verify != "always")
+            throw std::invalid_argument("weight verification must be cached or always");
+        ss_mfile_options opt;
+        ss_mfile_options_defaults(&opt);
+        opt.direct_io = direct ? 1 : 0;
+        opt.drive_readers = options.drive_readers;
+        opt.verify_mode = options.weight_verify == "always" ? SS_MFILE_VERIFY_ALWAYS : SS_MFILE_VERIFY_CACHED;
+        opt.primary_sha256 = options.primary_sha256.empty() ? nullptr : options.primary_sha256.c_str();
+        const auto utf8 = path.u8string();
+        if (ss_mfile_open(reinterpret_cast<const char*>(utf8.c_str()), options.weight_dirs.c_str(), &opt, &mfile_) != SS_OK)
+            throw std::runtime_error(std::string("multi-location open: ") + ss_last_error());
+        if (ss_mfile_alignment(mfile_) != alignment) {
+            ss_mfile_close(mfile_);
+            mfile_ = nullptr;
+            throw std::runtime_error("multi-location file alignment must be 4096");
+        }
+        if (const char* report = ss_mfile_open_report(mfile_); report && *report)
+            std::fprintf(stderr, "weight streaming: %s\n", report);
+        if (ss_mfile_multi(mfile_)) {
+            size_ = ss_mfile_size(mfile_);
+            try {
+                for (unsigned i = 0; i < std::max(1U, threads); ++i) threads_.emplace_back([this] { worker(); });
+            } catch (...) {
+                { std::lock_guard<std::mutex> lock(mutex_); stop_ = true; }
+                wake_.notify_all();
+                for (auto& t : threads_) t.join();
+                ss_mfile_close(mfile_);
+                throw;
+            }
+            return;
+        }
+        ss_mfile_close(mfile_);
+        mfile_ = nullptr;
+    }
+#endif
 #ifdef _WIN32
     // overlapped handle: synchronous handles serialize every read on the file object, so the pool's threads would
     // run at queue depth 1; each read waits on its own event instead
@@ -102,6 +148,12 @@ FileReader::~FileReader() {
     wake_.notify_all();
     for (auto& t : threads_) t.join();
     if (cache_mem_ != nullptr) AlignedPage free_cache(cache_mem_);
+#ifdef STRIX_HAVE_TIERSTREAM_MFILE
+    if (bounce_ != nullptr) AlignedPage free_bounce(bounce_);
+#endif
+#ifdef STRIX_HAVE_TIERSTREAM_MFILE
+    if (mfile_ != nullptr) ss_mfile_close(mfile_);
+#endif
 #ifdef _WIN32
     if (handle_ != nullptr) CloseHandle(static_cast<HANDLE>(handle_));
 #else
@@ -111,7 +163,54 @@ FileReader::~FileReader() {
 
 FileReader::Stats FileReader::stats() const { return stats_; }
 
+bool FileReader::multi() const noexcept {
+#ifdef STRIX_HAVE_TIERSTREAM_MFILE
+    return mfile_ != nullptr;
+#else
+    return false;
+#endif
+}
+
+#ifdef STRIX_HAVE_TIERSTREAM_MFILE
+ss_mfile_counters FileReader::multi_counters() const {
+    ss_mfile_counters c{};
+    c.struct_size = sizeof(c);
+    if (mfile_ && ss_mfile_get_counters(mfile_, &c) != SS_OK)
+        throw std::runtime_error(std::string("multi-location counters: ") + ss_last_error());
+    return c;
+}
+#endif
+
+std::string FileReader::multi_stats_json() const {
+    if (!multi()) return "null";
+#ifdef STRIX_HAVE_TIERSTREAM_MFILE
+    const auto c = multi_counters();
+    std::ostringstream j;
+    j << "{\"locations\":[";
+    for (unsigned i = 0; i < c.locations; ++i)
+        j << (i ? "," : "") << "{\"bytes\":" << c.bytes[i] << ",\"reads\":" << c.reads[i]
+          << ",\"busy_seconds\":" << double(c.busy_ns[i]) / 1e9 << "}";
+    j << "],\"fallback_bytes\":" << c.fallback_bytes << ",\"demoted_chunks\":" << c.demoted_chunks
+      << ",\"verify_fail\":" << c.verify_fail << ",\"read_errors\":" << c.read_errors
+      << ",\"verified_bytes\":" << c.verified_bytes << ",\"verify_seconds\":" << double(c.verify_ns) / 1e9
+      << ",\"disabled_mask\":" << c.disabled_mask << ",\"direct_mask\":" << c.direct_mask
+      << ",\"verify_mode\":\"" << (c.verify_mode == SS_MFILE_VERIFY_ALWAYS ? "always" :
+                                    c.verify_mode == SS_MFILE_VERIFY_OFF ? "off" : "cached") << "\"}";
+    return j.str();
+#else
+    return "null";
+#endif
+}
+
 void FileReader::pread_exact(std::uint64_t offset, std::size_t bytes, void* dst) {
+#ifdef STRIX_HAVE_TIERSTREAM_MFILE
+    if (mfile_) {
+        std::uint64_t got = 0;
+        if (ss_mfile_pread(mfile_, dst, bytes, offset, &got) != SS_OK || got != bytes)
+            throw std::runtime_error(std::string("multi-location read: ") + ss_last_error());
+        return;
+    }
+#endif
     auto* out = static_cast<std::uint8_t*>(dst);
     while (bytes > 0) {
         const std::size_t want = std::min<std::size_t>(bytes, std::size_t{1} << 30);
@@ -133,6 +232,14 @@ void FileReader::pread_exact(std::uint64_t offset, std::size_t bytes, void* dst)
 // read of a whole page at the end of the file returns the bytes that exist).
 void FileReader::pread_page(std::uint64_t offset, std::size_t bytes, std::uint8_t* dst) {
     const std::uint64_t want = std::min<std::uint64_t>(bytes, size_ - offset);
+#ifdef STRIX_HAVE_TIERSTREAM_MFILE
+    if (mfile_) {
+        std::uint64_t got = 0;
+        if (ss_mfile_pread(mfile_, dst, bytes, offset, &got) != SS_OK || got < want)
+            throw std::runtime_error(std::string("multi-location page read: ") + ss_last_error());
+        return;
+    }
+#endif
     std::uint64_t done = 0;
     while (done < want) {
 #ifdef _WIN32
@@ -192,22 +299,33 @@ void FileReader::run_parallel(std::size_t jobs, const std::function<void(std::si
 
 void FileReader::read_range(std::uint64_t offset, std::size_t bytes, void* dst, std::size_t piece) {
     if (bytes == 0) return;
+    if (multi() && (offset > size_ || bytes > size_ - offset)) throw std::runtime_error("multi-location range beyond EOF");
     if (offset + bytes > size_) throw std::runtime_error("read beyond the end of " + path_.string());
     const auto t0 = std::chrono::steady_clock::now();
     auto* out = static_cast<std::uint8_t*>(dst);
+#ifdef STRIX_HAVE_TIERSTREAM_MFILE
+    if (mfile_) {
+        read_range_multi(offset, bytes, out);
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats_.bytes += bytes;
+        stats_.reads += 1;
+        stats_.seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        return;
+    }
+#endif
     piece = std::max<std::size_t>(alignment, piece / alignment * alignment);
     // aligned middle [a0, a1) read straight into dst when dst is aligned the same way; the rest through pages
     const bool aligned_dst = (reinterpret_cast<std::uintptr_t>(out) % alignment) == (offset % alignment);
     std::uint64_t a0 = offset, a1 = offset + bytes;
-    if (direct_) {
+    if (direct_ || multi()) {
         a0 = (offset + alignment - 1U) / alignment * alignment;
         a1 = (offset + bytes) / alignment * alignment;
         if (!aligned_dst || a1 <= a0) a0 = a1 = offset;  // everything through the bounce pages
     }
-    const std::size_t middle = static_cast<std::size_t>(a1 - a0), pieces = (middle + piece - 1U) / piece;
+    const std::size_t middle = static_cast<std::size_t>(a1 - a0), pieces = multi() ? (middle ? 1U : 0U) : (middle + piece - 1U) / piece;
     // unaligned bytes: [offset, a0) and [a1, offset + bytes), page by page
     std::vector<std::uint64_t> pages;
-    if (direct_) {
+    if (direct_ || multi()) {
         for (std::uint64_t p = offset / alignment * alignment; p < a0; p += alignment) pages.push_back(p);
         for (std::uint64_t p = a1 / alignment * alignment; p < offset + bytes; p += alignment)
             if (pages.empty() || pages.back() != p) pages.push_back(p);
@@ -215,18 +333,18 @@ void FileReader::read_range(std::uint64_t offset, std::size_t bytes, void* dst, 
     const std::function<void(std::size_t, std::uint8_t*)> body = [&](std::size_t job, std::uint8_t* page) {
         if (job < pieces) {
             const std::uint64_t at = a0 + std::uint64_t{job} * piece;
-            const std::size_t n = std::min<std::size_t>(piece, static_cast<std::size_t>(a1 - at));
+            const std::size_t n = multi() ? middle : std::min<std::size_t>(piece, static_cast<std::size_t>(a1 - at));
             pread_exact(at, n, out + (at - offset));
             return;
         }
-        if (!direct_) return;
+        if (!direct_ && !multi()) return;
         const std::uint64_t p = pages[job - pieces];
         pread_page(p, alignment, page);
         const std::uint64_t lo = std::max(p, offset), hi = std::min(p + alignment, offset + bytes);
         for (std::uint64_t b = lo; b < hi; ++b)
             if (b < a0 || b >= a1) out[b - offset] = page[b - p];
     };
-    if (!direct_) {
+    if (!direct_ && !multi()) {
         // buffered: plain pieces over the whole range
         const std::size_t all = (bytes + piece - 1U) / piece;
         const std::function<void(std::size_t, std::uint8_t*)> plain = [&](std::size_t job, std::uint8_t*) {
@@ -235,13 +353,58 @@ void FileReader::read_range(std::uint64_t offset, std::size_t bytes, void* dst, 
         };
         run_parallel(all, plain);
     } else {
-        run_parallel(pieces + pages.size(), body);
+        if (multi()) {
+            AlignedPage page = aligned_alloc_bytes(alignment);
+            for (std::size_t job = 0; job < pieces + pages.size(); ++job) body(job, page.get());
+        } else {
+            run_parallel(pieces + pages.size(), body);
+        }
     }
     std::lock_guard<std::mutex> lock(mutex_);
     stats_.bytes += bytes;
     stats_.reads += pieces + pages.size();
     stats_.seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
+
+#ifdef STRIX_HAVE_TIERSTREAM_MFILE
+// One request to the session for the whole range (it splits per drive and keeps every drive busy): the aligned middle
+// straight into dst plus the head / tail pages, all in flight at once, or, when dst is not aligned like the offset, the
+// covering aligned range into the bounce buffer and copied out.
+void FileReader::read_range_multi(std::uint64_t offset, std::size_t bytes, std::uint8_t* out) {
+    const std::uint64_t c0 = offset / alignment * alignment, c1 = (offset + bytes + alignment - 1U) / alignment * alignment;
+    const bool aligned_dst = (reinterpret_cast<std::uintptr_t>(out) % alignment) == (offset % alignment);
+    const std::uint64_t a0 = (offset + alignment - 1U) / alignment * alignment, a1 = (offset + bytes) / alignment * alignment;
+    if (aligned_dst && a1 > a0) {
+        std::uint8_t* pages = bounce(2U * alignment);
+        ss_mfile_io io[3];
+        std::uint32_t n = 0;
+        io[n++] = ss_mfile_io{out + (a0 - offset), a0, a1 - a0};
+        const bool head = c0 < a0, tail = a1 < c1;
+        if (head) io[n++] = ss_mfile_io{pages, c0, alignment};
+        if (tail) io[n++] = ss_mfile_io{pages + alignment, a1, alignment};
+        if (ss_mfile_preadv(mfile_, io, n) != SS_OK) throw std::runtime_error(std::string("multi-location read: ") + ss_last_error());
+        if (head) std::memcpy(out, pages + (offset - c0), static_cast<std::size_t>(a0 - offset));
+        if (tail) std::memcpy(out + (a1 - offset), pages + alignment, static_cast<std::size_t>(offset + bytes - a1));
+        return;
+    }
+    std::uint8_t* cover = bounce(static_cast<std::size_t>(c1 - c0));
+    std::uint64_t got = 0;
+    if (ss_mfile_pread(mfile_, cover, c1 - c0, c0, &got) != SS_OK || got < offset + bytes - c0)
+        throw std::runtime_error(std::string("multi-location read: ") + ss_last_error());
+    std::memcpy(out, cover + (offset - c0), bytes);
+}
+
+std::uint8_t* FileReader::bounce(std::size_t bytes) {
+    if (bytes > bounce_bytes_) {
+        if (bounce_ != nullptr) AlignedPage old(bounce_);
+        bounce_ = nullptr;
+        bounce_bytes_ = 0;
+        bounce_ = aligned_alloc_bytes(bytes).release();
+        bounce_bytes_ = bytes;
+    }
+    return bounce_;
+}
+#endif
 
 struct FileReader::PageIndex {
     std::unordered_map<std::uint64_t, std::uint32_t> slot;  // page offset -> cache slot
@@ -275,6 +438,11 @@ void FileReader::set_page_cache(std::size_t bytes) {
 
 void FileReader::read_records(std::span<const std::uint64_t> offsets, std::size_t record, std::uint8_t* out, std::size_t per_job) {
     if (offsets.empty()) return;
+    if (multi()) {
+        if (record == 0 || record > alignment) throw std::invalid_argument("read_records: invalid record size");
+        for (const auto off : offsets)
+            if (off > size_ || record > size_ - off) throw std::runtime_error("multi-location record beyond EOF");
+    }
     const auto t0 = std::chrono::steady_clock::now();
     if (record > alignment) throw std::invalid_argument("read_records: records larger than a page");
     // every distinct record once (repeated n-grams read the same rows), in file order, then copied to its requests
@@ -303,7 +471,7 @@ void FileReader::read_records(std::span<const std::uint64_t> offsets, std::size_
                 const std::uint64_t p = off / alignment * alignment;
                 const bool two = static_cast<std::size_t>(off + record - p) > alignment;
                 if (p != have || two) {
-                    if (direct_) pread_page(p, two ? 2U * alignment : alignment, page);
+                    if (direct_ || multi()) pread_page(p, two ? 2U * alignment : alignment, page);
                     else pread_exact(p, static_cast<std::size_t>(std::min<std::uint64_t>(two ? 2U * alignment : alignment, size_ - p)), page);
                     pages_read += two ? 2U : 1U;
                     have = two ? ~std::uint64_t{0} : p;
@@ -390,7 +558,7 @@ void FileReader::read_records(std::span<const std::uint64_t> offsets, std::size_
             const std::size_t end = std::min(to_read.size(), (job + 1U) * per_job);
             for (std::size_t q = job * per_job; q < end; ++q) {
                 const std::uint32_t k = to_read[q];
-                if (direct_) pread_page(pages[k], alignment, where[k]);
+                if (direct_ || multi()) pread_page(pages[k], alignment, where[k]);
                 else pread_exact(pages[k], static_cast<std::size_t>(std::min<std::uint64_t>(alignment, size_ - pages[k])), where[k]);
             }
         };
@@ -420,6 +588,33 @@ void FileReader::read_records(std::span<const std::uint64_t> offsets, std::size_
 
 void FileReader::read_records_queued(std::span<const std::uint64_t> offsets, std::size_t record, std::uint8_t* out) {
     if (offsets.empty()) return;
+#ifdef STRIX_HAVE_TIERSTREAM_MFILE
+    if (mfile_) {
+        if (record == 0 || record > alignment) throw std::invalid_argument("read_records_queued: invalid record size");
+        const auto t0 = std::chrono::steady_clock::now();
+        if (offsets.size() > UINT32_MAX) throw std::invalid_argument("too many queued records");
+        if (offsets.size() > SIZE_MAX / (2U * alignment)) throw std::invalid_argument("queued records too large");
+        auto* pages = bounce(offsets.size() * 2U * alignment);
+        auto& ios = queued_ios_;
+        ios.clear();
+        ios.reserve(offsets.size());
+        for (std::size_t i = 0; i < offsets.size(); ++i) {
+            const auto off = offsets[i];
+            if (off > size_ || record > size_ - off) throw std::runtime_error("record beyond the end of " + path_.string());
+            const auto base = off / alignment * alignment;
+            ios.push_back({pages + i * 2U * alignment, base, off + record - base > alignment ? 2U * alignment : alignment});
+        }
+        if (ss_mfile_preadv(mfile_, ios.data(), static_cast<std::uint32_t>(ios.size())) != SS_OK)
+            throw std::runtime_error(std::string("multi-location queued read: ") + ss_last_error());
+        for (std::size_t i = 0; i < offsets.size(); ++i)
+            std::memcpy(out + i * record, pages + i * 2U * alignment + offsets[i] % alignment, record);
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats_.bytes += offsets.size() * record;
+        stats_.reads += offsets.size();
+        stats_.seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        return;
+    }
+#endif
 #ifdef _WIN32
     // every record's page(s) as one overlapped read issued from this thread (queue depth = records, no pool wake-ups),
     // then all waited for

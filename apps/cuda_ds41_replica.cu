@@ -136,6 +136,7 @@ bool g_serving = false;
 [[noreturn]] void usage(const char* why) {
     if (g_serving) throw rs::RequestReject(why);
     std::fprintf(stderr, "strix-cuda-ds41-replica: %s\n", why);
+    std::fprintf(stderr, "  --weight-dirs LIST (; separated; empty disables) --drive-readers N (4) --weight-verify cached|always (cached)\n  Environment when absent: STRIX_WEIGHT_DIRS, STRIX_WEIGHT_VERIFY\n");
     std::exit(2);
 }
 
@@ -380,6 +381,7 @@ int main(int argc, char** argv) {
     constexpr std::uint32_t kQualifySteps = 64;  // an exact phase qualifies only with at least this many compared steps
     bool timing = false;
     CudaPrefillOptions o;
+    bool weight_dirs_given = false, weight_verify_given = false;
     o.engram_cache_mb = 512;  // decode Engram rows from RAM after their first read (the same bytes; storage stalls hit once)
     // --serve (design notes): the persistent worker; a request = the launch args + its runtime args
     std::string serve_dir, reset_cache = "warm";
@@ -485,6 +487,12 @@ int main(int argc, char** argv) {
         else if (a == "--verify") verify_n = u32();
         else if (a == "--warm") warm = u32();
         else if (a == "--host-margin-gib") host_margin_gib = std::stod(next());
+        else if (a == "--weight-dirs") { o.weight_read.weight_dirs = next(); weight_dirs_given = true; }
+        else if (a == "--drive-readers") {
+            try { o.weight_read.set_drive_readers(next()); }
+            catch (const std::exception& e) { usage(e.what()); }
+        }
+        else if (a == "--weight-verify") { o.weight_read.weight_verify = next(); weight_verify_given = true; }
         else if (a == "--engram") o.engram = next();
         else if (a == "--layers") layers_arg = u32();
         else if (a == "--max-pinned-gib") max_pinned_gib = std::stod(next());
@@ -580,6 +588,11 @@ int main(int argc, char** argv) {
         else if (a == "--env") req_env.push_back(next());             // persist: a request variable NAME=VALUE
         else usage(("unknown option " + a).c_str());
     }
+    try {
+        o.weight_read.environment(weight_dirs_given, weight_verify_given, model);
+        o.weight_read.require_supported(model);
+    } catch (const std::exception& e) { usage(e.what()); }
+
     };
     const std::vector<std::string> launch_args(argv + 2, argv + argc);
     parse_args(launch_args);
@@ -918,6 +931,7 @@ int main(int argc, char** argv) {
     if (layers_arg == 40U) {
         if (receipt.empty()) usage("the full model needs --receipt (admitted SHA-256 of this file)");
         check_receipt(model, receipt);
+        o.weight_read.primary_sha256 = strix::deepseek41::pinned_file(strix::deepseek41::PinnedFileKind::target_q2).sha256_hex;
     }
     std::ofstream js, tl;
     // a step's record (JSON line + timeline lines) is formatted and written while the next step runs (CudaStepIo::
@@ -1077,6 +1091,7 @@ int main(int argc, char** argv) {
         {
             TierSiteOptions to;
             to.model = model;
+            to.weight_read = o.weight_read;
             to.layers = L;
             to.slots = slots;
             to.spare_slots = std::max(spares, pressure_spares);  // slots - spare_slots experts start resident
@@ -1965,7 +1980,11 @@ int main(int argc, char** argv) {
         }
         for (const auto& ph : phases) {
             census_phase = ph;
-            if (failures) break;  // a failed phase (e.g. a speculative chat that differs from its plain arm) ends the run
+            if (failures) break;  // a failed phase ends the run
+            // weight IO so far (cumulative), before each phase and after the last: phase deltas show any fallback or
+            // demotion that happened while measuring
+            if (const auto io = p.weight_io_fields(); !io.empty())
+                emit("{\"event\":\"weight_io\",\"before_phase\":" + rs::json_str(ph) + io + "}");
             const std::uint32_t occurrence = seen_phase[ph]++;  // repeated phases (bracketing) are summarised apart
             {  // window prefetch: on only in this phase if its name ends in 'w' (placement only: exact either way)
                 TierWinpf w = winpf_knobs;
@@ -2492,6 +2511,9 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        // and after the last phase: before/after pairs bound every measured phase
+        if (const auto io = p.weight_io_fields(); !io.empty())
+            emit("{\"event\":\"weight_io\",\"after_phases\":true" + io + "}");
         // speculative chats equal the plain chats token for token (both greedy from the same state and prompt)
         // (each schats occurrence against the chats occurrence of the same K and index; both hold chat_steps + 1 outputs)
         // every speculative arm AND every plain arm of a chat against the chat's canonical greedy vector, full length
@@ -2585,6 +2607,7 @@ int main(int argc, char** argv) {
 #else
                    << 0
 #endif
+                   << p.weight_io_fields()
                    << ",\"dense_s\":" << dense_s << ",\"draft_load_s\":" << draft_load_s << ",\"load_s\":" << load_s
                    << ",\"max_positions\":" << o.max_positions << ",\"max_rows\":" << max_rows << ",\"drafter\":" << (drafter ? "true" : "false")
                    << ",\"test_hooks\":" << (tier_test_hooks ? "true" : "false") << ",\"max_predict\":" << std::max(predict, 8U)
@@ -2707,7 +2730,8 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (!error.empty()) emit("{\"event\":\"error\",\"what\":" + rs::json_str(error) + "}");
-                    emit("{\"event\":\"request_end\",\"name\":" + rs::json_str(*name) + ",\"rc\":" + std::to_string(rc) + "}");
+                    emit("{\"event\":\"request_end\",\"name\":" + rs::json_str(*name) + ",\"rc\":" + std::to_string(rc) +
+                         p.weight_io_fields() + "}");
                     ++served;
                 }
                 const double wall_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_req).count();

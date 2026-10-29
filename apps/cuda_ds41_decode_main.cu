@@ -4,7 +4,7 @@
 //       [--layers END] [--steps N] [--rows R] [--ref PAIR_LOG] [--check-run] [--hashes] [--split K]
 //       [--tiers DHF.. | --device-gib G] [--slots S] [--eager | --graphs-ab] [--graph-warmup N] [--bucket B]
 //       [--timing | --timing-layers] [--stops K1,K2,..] [--stop-steps N] [--no-spin] [--no-lean-state] [--engram file|zero] [--json OUT]
-//       [--expert-tp] [--overlay OVERLAY.gguf]
+//       [--expert-tp] [--overlay OVERLAY.gguf] [--weight-dirs LIST] [--drive-readers N] [--weight-verify cached|always]
 // --fuse-hc / --fuse-shared: opt-in exact decode launch fusions (default off).
 // --expert-tp + --overlay c-u6.gguf: the pair's P15 target identity (ds41-expert-tp2-i1152-v1 on the c-u6 dense weights).
 //
@@ -59,6 +59,8 @@ std::uint64_t fnv(const float* v, std::size_t n) {
 
 [[noreturn]] void usage(const char* why) {
     std::fprintf(stderr, "strix-cuda-ds41-decode: %s\n", why);
+    std::fprintf(stderr, "usage: strix-cuda-ds41-decode MODEL.gguf (--prompt-ids FILE | --import-state FILE) [options]\n"
+                         "  --weight-dirs LIST --drive-readers N (1..32) --weight-verify cached|always\n");
     std::exit(2);
 }
 
@@ -297,68 +299,76 @@ int main(int argc, char** argv) {
     bool from_zero = false;  // --from-zero: reset_sequence() + the prompt as decode windows of --rows rows
     std::uint32_t dump_layers = 0;
     bool check_run = false, graphs_ab = false, io_bench = false, graph_sections = false, ref_feed = false;
-    for (int i = 2; i < argc; ++i) {
-        const std::string a = argv[i];
-        const auto next = [&]() -> std::string {
-            if (i + 1 >= argc) usage(("missing value of " + a).c_str());
-            return argv[++i];
-        };
-        if (a == "--prompt-ids") ids_file = next();
-        else if (a == "--tokens") n_tokens = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--import-state") state_file = next();
-        else if (a == "--positions") o.max_positions = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--layers") o.end_layer = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--steps") steps = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--rows") rows = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--ref") ref_file = next();
-        else if (a == "--check-run") check_run = true;
-        else if (a == "--io-bench") io_bench = true;
-        else if (a == "--graph-sections") graph_sections = true;  // the step copies the cut's sections itself (io.sections_cut)
-        else if (a == "--hashes") o.stream_hashes = true;
-        else if (a == "--split") split = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--dump-boundary") dump_file = next();
-        else if (a == "--tail-from") tail_file = next();
-        else if (a == "--first") o.first_layer = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--tiers") tiers = next();
-        else if (a == "--device-gib") o.device_expert_gib = std::stod(next());
-        else if (a == "--slots") o.slots = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--eager") o.decode_graphs = false;
-        else if (a == "--graphs-ab") graphs_ab = true;
-        else if (a == "--graph-warmup") o.decode_graph_warmup = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--bucket") o.decode_bucket = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--timing") o.timing = true;
-        else if (a == "--timing-layers") { o.timing = true; o.timing_ops = false; }
-        else if (a == "--stops") stops_arg = next();
-        else if (a == "--stop-steps") stop_steps = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--no-lean-state") o.lean_state = false;
-        else if (a == "--no-spin") o.decode_spin = false;
-        else if (a == "--engram") o.engram = next();
-        else if (a == "--buffered") o.engram_direct = false;
-        else if (a == "--no-engram-prefetch") o.engram_prefetch = false;
-        else if (a == "--force-every") force_every = static_cast<std::uint32_t>(std::stoul(next()));  // R1: every N-th step feeds argmax + 1
-        else if (a == "--engram-threads") o.engram_threads = static_cast<unsigned>(std::stoul(next()));
-        else if (a == "--chunk") o.chunk_rows = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--moe-chunk") o.moe_chunk_rows = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--json") json_out = next();
-        else if (a == "--fuse-hc") o.decode_fuse_hc = true;
-        else if (a == "--fuse-shared") o.decode_fuse_shared = true;
-        else if (a == "--expert-tp") o.expert_tp = true;
-        else if (a == "--ref-feed") ref_feed = true;  // R1: feed the reference's fed token of each position (teacher forcing)  // the P15 target identity's routed-expert sum order (decode steps)
-        else if (a == "--overlay") o.weights_overlay = next();
-        else if (a == "--commit-test") commit_test = next();
-        else if (a == "--from-zero") from_zero = true;
-        else if (a == "--commit-cont") commit_cont = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--commit-skip") commit_skip = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--trellis-shexp") o.trellis_shexp = next();
-        else usage(("unknown option " + a).c_str());
-    }
+    bool weight_dirs_given = false, weight_verify_given = false;
+    try {
+        for (int i = 2; i < argc; ++i) {
+            const std::string a = argv[i];
+            const auto next = [&]() -> std::string {
+                if (i + 1 >= argc) usage(("missing value of " + a).c_str());
+                return argv[++i];
+            };
+            if (a == "--prompt-ids") ids_file = next();
+            else if (a == "--tokens") n_tokens = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--import-state") state_file = next();
+            else if (a == "--positions") o.max_positions = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--layers") o.end_layer = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--steps") steps = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--rows") rows = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--ref") ref_file = next();
+            else if (a == "--check-run") check_run = true;
+            else if (a == "--io-bench") io_bench = true;
+            else if (a == "--graph-sections") graph_sections = true;  // the step copies the cut's sections itself (io.sections_cut)
+            else if (a == "--hashes") o.stream_hashes = true;
+            else if (a == "--split") split = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--dump-boundary") dump_file = next();
+            else if (a == "--tail-from") tail_file = next();
+            else if (a == "--first") o.first_layer = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--tiers") tiers = next();
+            else if (a == "--device-gib") o.device_expert_gib = std::stod(next());
+            else if (a == "--slots") o.slots = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--eager") o.decode_graphs = false;
+            else if (a == "--graphs-ab") graphs_ab = true;
+            else if (a == "--graph-warmup") o.decode_graph_warmup = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--bucket") o.decode_bucket = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--timing") o.timing = true;
+            else if (a == "--timing-layers") { o.timing = true; o.timing_ops = false; }
+            else if (a == "--stops") stops_arg = next();
+            else if (a == "--stop-steps") stop_steps = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--no-lean-state") o.lean_state = false;
+            else if (a == "--no-spin") o.decode_spin = false;
+            else if (a == "--engram") o.engram = next();
+            else if (a == "--buffered") o.engram_direct = false;
+            else if (a == "--no-engram-prefetch") o.engram_prefetch = false;
+            else if (a == "--force-every") force_every = static_cast<std::uint32_t>(std::stoul(next()));  // R1: every N-th step feeds argmax + 1
+            else if (a == "--engram-threads") o.engram_threads = static_cast<unsigned>(std::stoul(next()));
+            else if (a == "--chunk") o.chunk_rows = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--moe-chunk") o.moe_chunk_rows = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--json") json_out = next();
+            else if (a == "--fuse-hc") o.decode_fuse_hc = true;
+            else if (a == "--fuse-shared") o.decode_fuse_shared = true;
+            else if (a == "--expert-tp") o.expert_tp = true;
+            else if (a == "--ref-feed") ref_feed = true;  // R1: feed the reference's fed token of each position (teacher forcing)  // the P15 target identity's routed-expert sum order (decode steps)
+            else if (a == "--overlay") o.weights_overlay = next();
+            else if (a == "--weight-dirs") { o.weight_read.weight_dirs = next(); weight_dirs_given = true; }
+            else if (a == "--drive-readers") o.weight_read.set_drive_readers(next());
+            else if (a == "--weight-verify") { o.weight_read.weight_verify = next(); weight_verify_given = true; }
+            else if (a == "--commit-test") commit_test = next();
+            else if (a == "--from-zero") from_zero = true;
+            else if (a == "--commit-cont") commit_cont = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--commit-skip") commit_skip = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--trellis-shexp") o.trellis_shexp = next();
+            else usage(("unknown option " + a).c_str());
+        }
+        o.weight_read.environment(weight_dirs_given, weight_verify_given, model);
+        o.weight_read.require_supported(model);
+    } catch (const std::exception& e) { usage(e.what()); }
     if (io_bench) {
         // random 264-byte records in the second half of the file (the Engram tables): latency of one decode step's reads
         for (const bool direct : {true, false})
             for (const unsigned threads : {1U, 8U, 64U})
                 for (const std::size_t per_job : {std::size_t{0}, std::size_t{1}, std::size_t{32}})
                     for (const std::size_t n : {std::size_t{24}, std::size_t{48}, std::size_t{192}}) {
-                        strix::ds41::FileReader fr(model, direct, threads);
+                        strix::ds41::FileReader fr(model, direct, threads, o.weight_read);
                         std::uint64_t x = 0x9E3779B97F4A7C15ULL ^ (n * 131U + threads);
                         std::vector<double> t;
                         std::vector<std::uint8_t> out(n * 264U);
@@ -373,8 +383,8 @@ int main(int argc, char** argv) {
                             else fr.read_records(off, 264U, out.data(), per_job);
                             t.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() * 1e3);
                         }
-                        std::printf("{\"event\":\"io_bench\",\"direct\":%s,\"threads\":%u,\"per_job\":%zu,\"records\":%zu,\"median_ms\":%.4f}\n",
-                                    direct ? "true" : "false", threads, per_job, n, median(t));
+                        std::printf("{\"event\":\"io_bench\",\"direct\":%s,\"threads\":%u,\"per_job\":%zu,\"records\":%zu,\"median_ms\":%.4f%s}\n",
+                                    direct ? "true" : "false", threads, per_job, n, median(t), (fr.multi() ? ",\"weight_io\":" + fr.multi_stats_json() : std::string()).c_str());
                         std::fflush(stdout);
                     }
         return 0;
@@ -436,7 +446,8 @@ int main(int argc, char** argv) {
         std::unique_ptr<CudaPrefill> tail;
         if (split) tail = std::make_unique<CudaPrefill>(model, to);
         emit("{\"event\":\"loaded\",\"describe\":" + p.describe() + (tail ? ",\"tail\":" + tail->describe() : std::string()) +
-             ",\"load_s\":" + std::to_string(std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load).count()) + "}");
+             ",\"load_s\":" + std::to_string(std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load).count()) +
+             p.weight_io_fields() + "}");
 
         // ---- --from-zero: the prompt as decode windows from position 0
         if (from_zero) {
@@ -711,7 +722,8 @@ int main(int argc, char** argv) {
         {
             std::ostringstream os;
             os << "{\"event\":\"summary\",\"steps\":" << steps << ",\"rows\":" << rows << ",\"median_ms\":" << median(ms) << ",\"median_device_ms\":" << median(dev_ms)
-               << ",\"tok_s\":" << (median(ms) > 0 ? 1e3 * rows / median(ms) : 0.0) << ",\"compared\":" << compared << ",\"matched\":" << matched << "}";
+               << ",\"tok_s\":" << (median(ms) > 0 ? 1e3 * rows / median(ms) : 0.0) << ",\"compared\":" << compared << ",\"matched\":" << matched
+               << p.weight_io_fields() << "}";
             emit(os.str());
         }
 

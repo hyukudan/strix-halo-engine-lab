@@ -116,3 +116,5 @@ It does not qualify native execution, memory coexistence or numerical fidelity.
 Status (2026-10-27): opt-in. Measured exact, 1K -3.8..-3.9 s (-24..-30 %), 8K -28 %, 30K -12 %; the service
 default stays file-only until batch formation, slots/subsets and coexistence with the Qwen/MiniMax PRO services are
 qualified. Deployments set the budget (e.g. the hyperloom preset) with `--host-gib-auto 32`.
+
+The FILE tier can be served by two drives at once: [rtx-two-drives.md](rtx-two-drives.md).
