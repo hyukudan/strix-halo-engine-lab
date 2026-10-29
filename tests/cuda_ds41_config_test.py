@@ -69,6 +69,14 @@ with tempfile.TemporaryDirectory(prefix='ds41-config-', dir=Path.cwd()) as tmp:
                        '--controller-explore', '0', '--wb-defer'])
     assert default == production, {k: (default[k], production[k]) for k in diff(default, production)}
     assert default['census'] is False and default['evict'] == 'auto'
+    assert default['ce_pacing'] is True
+    assert diff(default, call(['--no-ce-pacing'])) == {'ce_pacing'}
+    assert call(extra={'STRIX_DS41_CE_PACING': '0'})['ce_pacing'] is False
+    assert call(['--ce-pacing'], extra={'STRIX_DS41_CE_PACING': '0'})['ce_pacing'] is True
+    assert call(['--no-ce-pacing'], extra={'STRIX_DS41_CE_PACING': '1'})['ce_pacing'] is False
+    assert call(extra={'STRIX_DS41_RTX_BASELINE': '1'})['ce_pacing'] is False
+    assert call(['--ce-pacing', '--baseline'])['ce_pacing'] is False
+    assert call(['--baseline', '--ce-pacing'])['ce_pacing'] is True
     assert diff(default, call(['--census'])) == {'census'}
     assert diff(default, call(['--evict', 'scored'])) == {'evict'}
     assert call(['--evict', 'scored', '--baseline'])['evict'] == 'lru'
@@ -81,7 +89,7 @@ with tempfile.TemporaryDirectory(prefix='ds41-config-', dir=Path.cwd()) as tmp:
                     q8_r1=False, q8_r1_pad=False, draft_keep=0, draft_keep_ids=[], controller_prior='none',
                     controller_costs='none', wb_defer=False, controller_scope='run', host_spares=96,
                     arena_gib=71.5, draft_vocab='full', warmup_graphs='none', residency_seed='none',
-                    residency_save='none', engram_cache_mb=0, load_serial=True, attn_warps=0, max_rows=1, pressure_spares=4, lean_state=False, arena_auto=False, evict='lru')
+                    residency_save='none', engram_cache_mb=0, load_serial=True, attn_warps=0, max_rows=1, pressure_spares=4, lean_state=False, arena_auto=False, evict='lru', ce_pacing=False)
     for key, value in expected.items():
         assert old[key] == value, (key, old[key], value)
     for key in ('decode_fuse_hc', 'decode_fuse_shared', 'decode_router_v2', 'decode_ob_one',
