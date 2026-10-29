@@ -1688,6 +1688,17 @@
   },
   {
     "engine": "qwen",
+    "name": "Parallel cold PLE table populate",
+    "flag_or_env": "STRIX_PLE_WARM_PARALLEL",
+    "default": "ON",
+    "exact": "Load path only: advisory reads of the same file bytes; generated text, tokens and finish reasons identical with and without it (5 requests).",
+    "gain": "Cold start: listening 137.8 to 83.8 s, first response 139.3 to 91.9 s, PLE warm 94.1 to 6.4 s; restart with a partly cached table: listening 23.3 to 7.9 s. Decode unchanged.",
+    "preconditions": "Linux; file-backed PLE table; STRIX_PLE_WARM enabled; not with STRIX_MODEL_COPY_ALL or an admitted PLE reclaim. Best effort (prefault only).",
+    "off_switch": "STRIX_PLE_WARM_PARALLEL=0 keeps the single random-access pass",
+    "doc_anchor": "docs/optimizations.md#qwen-ple-warm-parallel"
+  },
+  {
+    "engine": "qwen",
     "name": "Tool-call frame drafts",
     "flag_or_env": "STRIX_BATCH_TOOL_DRAFT; tool_draft request field; STRIX_TOOL_DRAFT_PREFIX_GATE",
     "default": "ON (batched decoding)",

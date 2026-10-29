@@ -130,6 +130,20 @@ void warm_file_backed_tensors(const strix::MappedModelFile& mapped, const strix:
     const auto page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
     const auto t0 = std::chrono::steady_clock::now();
     std::uint64_t bytes = 0;
+    // Cold page cache (another model's turn evicted the table): one random-access populate reads 4 KiB per fault,
+    // 0.2 GB/s for the 28.8 GB table. First read the table from several threads with normal readahead; the
+    // random-access pass below then normally finds the pages resident. Same bytes, same state.
+    // STRIX_PLE_WARM_PARALLEL=0 keeps the single random-access pass.
+    const char* parallel_env = std::getenv("STRIX_PLE_WARM_PARALLEL");
+    if (!strix::hip_model_copy_all_mode() && !(parallel_env && parallel_env[0] == '0')) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        for (const auto& tensor : manifest.tensors)
+            if (tensor.residency == strix::ResidencyPolicy::file_backed_candidate && tensor.byte_size)
+                ranges.emplace_back(tensor.absolute_offset, tensor.byte_size);
+        const auto populated = mapped.prefault_parallel(ranges);
+        std::fprintf(stderr, "file-backed tensors: parallel prefault of %zu 64 MiB chunks in %.1f s\n", populated,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
     for (const auto& tensor : manifest.tensors) {
         if (tensor.residency != strix::ResidencyPolicy::file_backed_candidate || !tensor.byte_size) continue;
         if (tensor.absolute_offset > mapped.bytes() || tensor.byte_size > mapped.bytes() - tensor.absolute_offset) continue;

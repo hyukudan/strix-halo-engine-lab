@@ -4,11 +4,14 @@
 #include "strix/model_content_hash.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
+#include <vector>
 
 #if defined(__linux__)
 #include <fcntl.h>
@@ -228,6 +231,52 @@ void MappedModelFile::advise_dontneed(std::uint64_t byte_offset, std::uint64_t b
             POSIX_FADV_DONTNEED);
 #else
     (void)byte_offset; (void)bytes;
+#endif
+}
+
+std::size_t MappedModelFile::prefault_parallel(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const noexcept {
+#if defined(__linux__)
+    const auto page_size = ::sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return 0;
+    const auto page = static_cast<std::uint64_t>(page_size);
+    constexpr std::uint64_t chunk = std::uint64_t{64} << 20;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> chunks;
+    try {
+        for (const auto& [offset, length] : ranges) {
+            if (!length || offset >= bytes_) continue;
+            const auto begin = offset / page * page;
+            const auto end = offset + std::min(length, bytes_ - offset);
+            // Normal advice for the pass: an earlier MADV_RANDOM on the range would disable readahead.
+            (void)::madvise(reinterpret_cast<void*>(mapping_base_ + begin), static_cast<std::size_t>(end - begin), MADV_NORMAL);
+            for (auto at = begin; at < end; at += chunk) chunks.emplace_back(at, std::min(chunk, end - at));
+        }
+    } catch (...) {
+        return 0;
+    }
+    // Workers only issue madvise calls and touch atomics: nothing below throws once the chunk list exists.
+    std::atomic<std::size_t> next{0}, done{0};
+    auto worker = [&]() noexcept {
+        for (std::size_t c; (c = next.fetch_add(1)) < chunks.size();) {
+            auto* address = reinterpret_cast<void*>(mapping_base_ + chunks[c].first);
+            const auto length = static_cast<std::size_t>(chunks[c].second);
+#if defined(MADV_POPULATE_READ)
+            if (::madvise(address, length, MADV_POPULATE_READ) == 0) { done.fetch_add(1); continue; }
+#endif
+            (void)::madvise(address, length, MADV_WILLNEED);
+        }
+    };
+    const auto workers = std::min<std::size_t>(chunks.size(), std::min(16U, std::max(1U, std::thread::hardware_concurrency())));
+    std::vector<std::thread> threads;
+    try {
+        threads.reserve(workers);
+        for (std::size_t w = 1; w < workers; ++w) threads.emplace_back(worker);
+    } catch (...) {}  // fewer threads: the chunks left are taken by the threads already running and this one
+    if (workers) worker();
+    for (auto& t : threads) t.join();
+    return done.load();
+#else
+    (void)ranges;
+    return 0;
 #endif
 }
 

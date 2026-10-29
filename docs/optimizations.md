@@ -725,6 +725,20 @@ Inside a tool-call frame, the MTP draft chain proposes the continuation of an ea
 - **Measured gain:** Tool-call traces: one case +3.3 to +3.5 %, all others within -0.08 to +0.9 %.
 - **Implementation / evidence:** [frame drafts](../include/strix/mtp_frame_draft.hpp)
 
+<a id="qwen-ple-warm-parallel"></a>
+
+### Parallel cold PLE table populate
+
+**Engine:** `qwen`. **Control:** `STRIX_PLE_WARM_PARALLEL=0`. **Default:** ON.
+
+When the file-backed PLE table is not in the page cache (another model evicted it), its non-resident 64 MiB chunks are first read from up to 16 threads; the existing random-access warm then only maps resident pages.
+
+- **Preconditions:** Linux; file-backed PLE table; `STRIX_PLE_WARM` enabled; not with `STRIX_MODEL_COPY_ALL` or an admitted PLE reclaim. Best effort (prefault only).
+- **Exactness evidence:** Load path only: advisory reads of the same file bytes; generated text, tokens and finish reasons identical with and without it (5 requests).
+- **Off switch:** `STRIX_PLE_WARM_PARALLEL=0` keeps the single random-access pass
+- **Measured gain:** Cold start: listening 137.8 to 83.8 s, first response 139.3 to 91.9 s, PLE warm 94.1 to 6.4 s; restart with a partly cached table: listening 23.3 to 7.9 s. Decode unchanged.
+- **Implementation / evidence:** [implementation status](reference/implementation-status.md)
+
 ## DeepSeek two-node
 
 ```sh

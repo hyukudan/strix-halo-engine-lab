@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <span>
 #include <string>
+#include <utility>
 
 namespace strix {
 
@@ -79,6 +80,11 @@ public:
     // Same drop, but reports failure: 0 on success, else an errno value (EBADF without an open descriptor,
     // EINVAL for a range outside the file, or posix_fadvise's own error). Used by STRIX_PLE_RECLAIMABLE.
     [[nodiscard]] int drop_page_cache(std::uint64_t byte_offset, std::uint64_t bytes) const noexcept;
+    // Best-effort read of the given [byte_offset, byte_offset + bytes) ranges of the mapping into the page cache from up
+    // to 16 threads, in 64 MiB chunks with normal readahead advice (MADV_POPULATE_READ; MADV_WILLNEED where that
+    // fails). A cold page cache otherwise faults the file in from one thread. Resident pages are only mapped. The bytes
+    // are unchanged; residency afterwards is not guaranteed. Returns the chunks populated synchronously.
+    std::size_t prefault_parallel(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const noexcept;
 
 private:
     void release() noexcept;
