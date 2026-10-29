@@ -1,6 +1,17 @@
 [
   {
     "engine": "qwen",
+    "name": "Cohort-gated calibrated joint plan rule",
+    "flag_or_env": "STRIX_MTP_JOINT_PLAN; STRIX_MTP_JOINT_RULE_FILE",
+    "default": "calibrated-c3 when STRIX_MTP_BATCH_JOINT=1: calibrated at >=3 members, production at 1-2",
+    "exact": "Schedule-only predictor acceptance estimate; existing target verification unchanged. Complete token IDs identical in measured in-process A/B; no additional logits/state digest claim. CPU parsing, precedence and cohort threshold tests.",
+    "gain": "Calibrated versus production, median wall aggregate throughput: C4 +2.3–3.1% (prose1k/prose8k/code1k), C2 -1.0 to -1.4%, C8 +0.55% (16 bracketed code1k/prose1k pairs, 11/16 positive). Gated default retains production at C2; no measured C3 gain claim.",
+    "preconditions": "Joint native HTTP batch windows enabled. Count members in the joint plan group at plan time, before drafting; independent of slot capacity and physical rows. In-process A/B uses identical controller snapshot/restore state. Explicit rules override defaults, including baseline.",
+    "off_switch": "STRIX_MTP_JOINT_PLAN=production or =0 restores the previous rule. --baseline / STRIX_BASELINE=1 defaults to production. Explicit calibrated applies at every group size; STRIX_MTP_BATCH_JOINT=0 disables joint windows.",
+    "doc_anchor": "docs/engine/scheduling/joint-serving-windows.md#joint-plan-rule"
+  },
+  {
+    "engine": "qwen",
     "name": "Plan-neutral prefix cache on the MTP serving route",
     "flag_or_env": "--prefix-cache; STRIX_PREFIX_CACHE; --prefix-cache-host-bytes; --prefix-cache-staging-bytes; STRIX_PREFIX_CACHE_STAGING_BYTES",
     "default": "ON when a cache is configured on an eligible MTP route; automatic serving budget qualification-gated OFF",

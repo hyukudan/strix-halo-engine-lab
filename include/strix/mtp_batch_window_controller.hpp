@@ -14,7 +14,8 @@ namespace strix {
 // calibrated: after drafting, a predictor draft's acceptance is its probability calibrated by observed outcome
 // per probability bin (the slot's bins, shrunk to the controller-wide bins), instead of the probability blended
 // with the slot's per-depth history (which, once seen, barely depends on the draft's own confidence).
-struct MtpBatchPlanRule {bool pooled=false; bool calibrated=false; std::uint32_t cap=8;};
+// calibrated_min_members gates calibration by the joint group's member count at plan time.
+struct MtpBatchPlanRule {bool pooled=false; bool calibrated=false; std::uint32_t cap=8; std::size_t calibrated_min_members=0;};
 // Joint scheduling only: all selections still come from each request's target.
 // A non-drafting request normally uses R2, commits one row and discards padding.
 class MtpBatchWindowController {
@@ -26,9 +27,9 @@ public:
         std::size_t external_first=SIZE_MAX;
     };
     using Rule=MtpBatchPlanRule;
-    // STRIX_MTP_JOINT_PLAN: unset/0 production; "pooled", "cap4", "cap2", "pooled,cap4".
-    [[nodiscard]] static Rule rule_from_env();
-    // STRIX_MTP_JOINT_PLAN text: "pooled", "calibrated", "cap4", "cap2" in any combination; anything else = production.
+    // Unset: calibrated-c3, or production under baseline. Explicit rules win over that default.
+    [[nodiscard]] static Rule rule_from_env(bool baseline=false);
+    // "calibrated-c3", "calibrated", "pooled", "cap4", "cap2"; production/0/unknown = production.
     [[nodiscard]] static Rule parse_rule(std::string_view text);
     // Measurement: the rule may change between admissions (in-process A/B); histories and costs are kept.
     void set_rule(Rule rule) noexcept {rule_=rule;}
@@ -68,6 +69,7 @@ private:
         std::array<std::uint64_t,9> plans{};std::array<double,10> tested{},accepted{};bool valid=false;
     } saved_;
     Rule rule_;
+    std::size_t plan_members_=0; // latched before drafting; not server capacity or verify row count
     PlanInfo last_;
     [[nodiscard]] double expected(const Request&,std::uint32_t rows,bool prior) const;
     [[nodiscard]] double cost(std::span<const std::uint32_t>) const;

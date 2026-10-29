@@ -1102,7 +1102,7 @@ public:
         std::vector<std::unique_ptr<Slot>> slots, bool interleave = false, std::uint32_t serial_rows_per_step = 16)
         : options_(options), model_(model), compiled_(compiled), qualified_(qualified), activated_(activated),
           enable_draft_(std::move(enable_draft)), slots_(std::move(slots)), interleave_(interleave),
-          serial_rows_per_step_(serial_rows_per_step ? serial_rows_per_step : 1U),joint_(slots_.size(),MtpBatchWindowController::rule_from_env()),policy_joint_(slots_.size(),MtpBatchWindowController::rule_from_env()) {
+          serial_rows_per_step_(serial_rows_per_step ? serial_rows_per_step : 1U),joint_(slots_.size(),MtpBatchWindowController::rule_from_env(options.baseline)),policy_joint_(slots_.size(),MtpBatchWindowController::rule_from_env(options.baseline)) {
         stats_.nest_rows_limit=nest_rows_;
         if (slots_.empty()) throw std::invalid_argument("batched MTP decoding needs a slot");
         if(service_ms_>0.0 || cancel_points_ || nest_rows_) {
@@ -1234,7 +1234,7 @@ private:
                 std::fclose(f);
                 text.assign(buffer, n);
             }
-            joint_.set_rule(text.empty() ? MtpBatchWindowController::rule_from_env() : MtpBatchWindowController::parse_rule(text));
+            joint_.set_rule(text.empty() ? MtpBatchWindowController::rule_from_env(options_.baseline) : MtpBatchWindowController::parse_rule(text));
             policy_joint_.set_rule(joint_.rule());
             const auto at = text.find("wave=");
             const std::string wave = at == std::string::npos ? std::string{} : text.substr(at, text.find_first_of(" \n", at) - at);
@@ -1248,12 +1248,12 @@ private:
         // slot's planner history (request identity, applied rule, controller state event).
         static const bool admit_log = [] { const char* v = std::getenv("STRIX_MTP_BATCH_LOG"); return v && (v[0] == '2' || v[0] == 'a'); }();
         if (admit_log)
-            std::fprintf(stderr, "joint admit rule=%d%d%u state=%.*s slot=%td request=%llu prompt_tokens=%zu wall_ms=%lld\n", joint_.rule().pooled ? 1 : 0,
+            std::fprintf(stderr, "joint admit rule=%d%d%u state=%.*s slot=%td request=%llu prompt_tokens=%zu wall_ms=%lld cal_min_members=%zu\n", joint_.rule().pooled ? 1 : 0,
                 joint_.rule().calibrated ? 1 : 0, joint_.rule().cap, static_cast<int>(restored.size()), restored.data(),
                 free - slots_.begin(),
                 static_cast<unsigned long long>(++admitted_), s.request.prompt.size(),
                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count()));
+                    std::chrono::system_clock::now().time_since_epoch()).count()), joint_.rule().calibrated_min_members);
         // Exactly the single request's start: fresh target state and session, fresh predictor, no
         // deferred window rows, the request's sampler on the final prompt row and every later row.
         s.greedy.reset();

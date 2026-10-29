@@ -144,14 +144,15 @@ std::array<std::uint32_t,3> batch_key(std::span<const std::uint32_t> rows) {
     return key;
 }
 }
-MtpBatchWindowController::Rule MtpBatchWindowController::rule_from_env() {
+MtpBatchWindowController::Rule MtpBatchWindowController::rule_from_env(bool baseline) {
     const char* v=std::getenv("STRIX_MTP_JOINT_PLAN");
-    return v?parse_rule(v):Rule{};
+    return v?parse_rule(v):parse_rule(baseline?"production":"calibrated-c3");
 }
 MtpBatchWindowController::Rule MtpBatchWindowController::parse_rule(std::string_view text) {
     Rule rule;
     if(text.find("pooled")!=std::string_view::npos) rule.pooled=true;
     if(text.find("calibrated")!=std::string_view::npos) rule.calibrated=true;
+    if(text.find("calibrated-c3")!=std::string_view::npos) rule.calibrated_min_members=3;
     if(text.find("cap4")!=std::string_view::npos) rule.cap=4;
     if(text.find("cap2")!=std::string_view::npos) rule.cap=2;
     return rule;
@@ -170,7 +171,7 @@ double MtpBatchWindowController::expected(const Request& q,std::uint32_t rows,bo
     for(std::uint32_t d=0;d+1U<rows;++d) {
         if(!prior && d>=q.probabilities.size()) break;
         const double p=prior?base:std::clamp(static_cast<double>(q.probabilities[d]),0.0,1.0);
-        if(!prior && rule_.calibrated && d<q.external_first) {
+        if(!prior && rule_.calibrated && plan_members_>=rule_.calibrated_min_members && d<q.external_first) {
             const auto b=calibration_bin(p);
             const double global=(accepted_[b]+2.0*p)/(tested_[b]+2.0);
             s*=(h.accepted[b]+4.0*global)/(h.tested[b]+4.0);
@@ -241,6 +242,7 @@ MtpBatchWindowController::PlanInfo MtpBatchWindowController::estimate(std::span<
     return {e,cost(rows)+(prior?(draft_.samples()?draft_.value():1.2)*drafts:0.0),false};
 }
 std::vector<std::uint32_t> MtpBatchWindowController::plan(std::span<const Request> q,std::uint32_t budget) {
+    plan_members_=q.size();
     auto out=search(q,budget,true,&last_);
     probe_.clear();
     auto& plans=plans_.at(q.size());

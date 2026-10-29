@@ -6,8 +6,10 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <map>
+#include <string>
 #include <vector>
 
 namespace {
@@ -256,6 +258,60 @@ int main() {
         std::vector<strix::MtpBatchWindowController::Request> ctx{{0,8,sure},{1,8,sure}};
         ctx[0].external_first=0;ctx[1].external_first=0;
         expect(c.choose(ctx,16)==blended,"context rows keep the production estimate under the calibrated rule");
+    }
+    {
+        using Controller=strix::MtpBatchWindowController;
+        const char* previous=std::getenv("STRIX_MTP_JOINT_PLAN");
+        const bool had_previous=previous!=nullptr;
+        const std::string saved=previous?previous:"";
+        const auto set_env=[](const char* value) {
+#ifdef _WIN32
+            _putenv_s("STRIX_MTP_JOINT_PLAN",value?value:"");
+#else
+            if(value) setenv("STRIX_MTP_JOINT_PLAN",value,1);
+            else unsetenv("STRIX_MTP_JOINT_PLAN");
+#endif
+        };
+        set_env(nullptr);
+        const auto automatic=Controller::rule_from_env();
+        expect(automatic.calibrated && automatic.calibrated_min_members==3U,"unset env defaults to calibrated-c3");
+        expect(!Controller::rule_from_env(true).calibrated,"baseline defaults to production");
+        for(const auto* text:{"production","0","calibrated","calibrated-c3"}) {
+            set_env(text);
+            const auto rule=Controller::rule_from_env(true);
+            const auto parsed=Controller::parse_rule(text);
+            expect(rule.calibrated==parsed.calibrated && rule.calibrated_min_members==parsed.calibrated_min_members,
+                "explicit env rule wins over baseline and uses the rule-file parser");
+        }
+        set_env(had_previous?saved.c_str():nullptr);
+        const auto combined=Controller::parse_rule("calibrated-c3,cap4 wave=3 restore");
+        expect(combined.calibrated && combined.calibrated_min_members==3U && combined.cap==4U,
+            "gated rule parses with cap and rule-file wave metadata");
+        for(const auto* text:{"production","0"})
+            expect(!Controller::parse_rule(text).calibrated,"production and 0 restore the old rule");
+
+        // Identical trained histories make production and calibrated choose different owners.
+        // Exercise group sizes on one controller, including a return below the threshold.
+        Controller c(8,automatic);
+        const std::vector<float> half(7,0.5F),sure(7,0.95F);
+        std::vector<Controller::Request> q,h;
+        for(std::uint32_t slot=0;slot<8U;++slot) {q.push_back({slot,8,sure});h.push_back({slot,8,half});}
+        const std::vector<std::uint32_t> r8(8,8),deep(8,6),zero(8,0);
+        for(int n=0;n<60;++n) c.observe(h,r8,deep,1.0,60.0,56U);
+        for(int n=0;n<40;++n) c.observe(q,r8,zero,1.0,60.0,56U);
+        for(const std::size_t count:{1U,2U,3U,4U,8U,2U}) {
+            const auto group=std::span<const Controller::Request>(q).first(count);
+            // Leave initial/periodic probes before checking acceptance-based choose.
+            do {static_cast<void>(c.plan(group,64));} while(c.last_plan().probe);
+            c.set_rule(Controller::parse_rule("production"));
+            const auto production=c.choose(group,64);
+            c.set_rule(Controller::parse_rule("calibrated"));
+            const auto calibrated=c.choose(group,64);
+            expect(production!=calibrated,"fixture distinguishes production and calibrated");
+            c.set_rule(automatic);
+            expect(c.choose(group,64)==(count>=3U?calibrated:production),"calibrated-c3 switches at three plan members");
+            expect(c.choose(group,64)==c.choose(group,64),"choose repeats deterministically within the plan");
+        }
     }
     {
         // Shared-state snapshot: plans after a restore repeat the plans after the save (costs, counters, bins).
