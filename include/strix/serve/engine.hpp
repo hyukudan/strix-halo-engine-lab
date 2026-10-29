@@ -138,7 +138,7 @@ struct GenerationJob {
     // cycle for this request (0/absent = the engine's setting). Drafts only: never the request's output.
     std::uint32_t draft_depth_max = 0;
     // Request field "tool_draft" (batched decoding): strict tool-call frame proposals on/off for this request;
-    // unset = the engine's setting (STRIX_BATCH_TOOL_DRAFT, off by default). Drafts only.
+    // unset = the engine's setting (on by default; STRIX_BATCH_TOOL_DRAFT=0 turns it off). Drafts only.
     std::optional<bool> tool_draft;
     // Request field "ngram_peers" (batched decoding): cross-request lookup on/off for this request's n-gram
     // extension; unset = the engine's setting (STRIX_BATCH_NGRAM_PEERS, off by default). Drafts only.
@@ -162,7 +162,7 @@ struct GenerationStats {
     std::uint64_t cycles = 0, proposed = 0, accepted = 0;
     // Context n-gram extension rows proposed / accepted (0 when it did not run or never opened).
     std::uint64_t ngram_rows = 0, ngram_accepted = 0;
-    std::uint64_t tool_rows = 0, tool_accepted = 0; // strict tool-call frame rows (batched decoding, opt-in)
+    std::uint64_t tool_rows = 0, tool_accepted = 0; // strict tool-call frame rows (batched decoding, default on)
     std::uint64_t source_shadow = 0, source_scored = 0, source_right = 0, frame_cycles = 0, frame_shadow = 0; // diagnostics
     double queue_ms = 0.0, prefill_ms = 0.0, decode_ms = 0.0;
     // first_token_ms, set by engines for observed requests (GenerationJob::observed): submit to the first published

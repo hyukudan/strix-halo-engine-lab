@@ -711,6 +711,20 @@ cannot overlap later compute, is a large one. Rows stay chronological; only bloc
 - **Measured gain:** TTFT -12.7 % at 1K, -7.9 % at 8K, -5.0 % at 32K against the original order.
 - **Implementation / evidence:** [CUDA Qwen prefill scheduling](engine/serving/qwen-cuda-prefill.md)
 
+<a id="qwen-tool-draft"></a>
+
+### Tool-call frame drafts
+
+**Engine:** `qwen`. **Control:** `STRIX_BATCH_TOOL_DRAFT`, request field `tool_draft`, `STRIX_TOOL_DRAFT_PREFIX_GATE`. **Default:** ON (batched decoding).
+
+Inside a tool-call frame, the MTP draft chain proposes the continuation of an earlier closed frame once the open frame's first 16 committed tokens match that frame. The target verifies every proposed row.
+
+- **Preconditions:** Batched MTP decoding with a chat template that defines tool-call frame tokens.
+- **Exactness evidence:** Drafts only: the target verifies every row, so committed tokens are unchanged; 9 tool-call cases 54/54 exact, 24/24 on repeated waves, and 18/18 default against off in one process.
+- **Off switch:** `STRIX_BATCH_TOOL_DRAFT=0` (or `"tool_draft":false` per request); `STRIX_TOOL_DRAFT_PREFIX_GATE=0` restores the ungated drafter
+- **Measured gain:** Tool-call traces: one case +3.3 to +3.5 %, all others within -0.08 to +0.9 %.
+- **Implementation / evidence:** [frame drafts](../include/strix/mtp_frame_draft.hpp)
+
 ## DeepSeek two-node
 
 ```sh

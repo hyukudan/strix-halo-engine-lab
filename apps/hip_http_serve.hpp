@@ -358,7 +358,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         const bool samples = options.http_sampling == "sample";
         if (serve::serve_health_record_enabled())
             config.health_record = http_health_record(options, runner.slots(), startup, assets);
-        // Strict tool-call frame proposals (opt-in) need the template's frame tokens.
+        // Strict tool-call frame proposals (batch default on, STRIX_BATCH_TOOL_DRAFT=0 off) need the template's frame tokens.
         if (const auto open = tokenizer->find("<tool_call>"), close = tokenizer->find("</tool_call>");
             open != UINT32_MAX && close != UINT32_MAX && open != close)
             runner.frame_tokens = {open, close};

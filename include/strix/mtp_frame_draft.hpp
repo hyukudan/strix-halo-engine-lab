@@ -1,5 +1,5 @@
 #pragma once
-// Strict tool-call frame proposals for the MTP draft chain (host only, opt-in).
+// Strict tool-call frame proposals for the MTP draft chain (host only; batch runner default on).
 //
 // Inside a tool call (after the open token, before its close token) the output follows the chat template's frame:
 // "<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n...</function>\n</tool_call>". The frames
@@ -22,12 +22,21 @@ struct MtpFrameDraftConfig {
     std::uint32_t max_anchor = 16;     // longest frame suffix used as the anchor
     std::uint32_t max_rows = 7;
     double prior = 0.8, prior_weight = 2.0;  // frames confirmed by 2+ earlier frames: a grammar, optimistic prior
-    // Prior of a continuation seen in a single earlier frame (e.g. that call's arguments). Measured (ABA x3): 0.8 gave
-    // tp-smith-0 +3.4 % (its accepted rows were single-frame ones) and tp-smith-2 -0.09 % (9 rows rejected); 0.4
-    // removed both. Default 0.8; the batch runner reads STRIX_TOOL_DRAFT_SINGLE_PRIOR.
+    // Prior of a continuation seen in a single earlier frame (e.g. that call's arguments): optimistic, so that a
+    // call's own arguments can be reused; learned per request from there. The batch runner reads
+    // STRIX_TOOL_DRAFT_SINGLE_PRIOR.
     double single_prior = 0.8;
     double floor = 0.5;
+    // Committed-prefix gate (0: off): propose inside a frame only once its first `prefix_gate` committed tokens
+    // (from the open token on; unverified drafts do not count) equal the first `prefix_gate` tokens of an earlier
+    // closed frame, so a call that starts like no earlier call proposes nothing. The batch runner sets
+    // kMtpFrameDraftPrefixGate unless STRIX_TOOL_DRAFT_PREFIX_GATE holds a valid value (parse_frame_draft_prefix_gate).
+    std::uint32_t prefix_gate = 0;
 };
+
+inline constexpr std::uint32_t kMtpFrameDraftPrefixGate = 16;
+// A complete decimal value in [0, 4096] (0: gate off); anything else (empty, sign, junk, overflow) keeps the default.
+std::uint32_t parse_frame_draft_prefix_gate(const char* text, std::uint32_t fallback = kMtpFrameDraftPrefixGate) noexcept;
 
 struct MtpFrameDraftStats {
     std::uint64_t frame_cycles = 0;     // cycles that started inside a tool-call frame
@@ -35,6 +44,7 @@ struct MtpFrameDraftStats {
     std::uint64_t scored_cycles = 0, shadow_right_rows = 0;
     std::uint64_t extended_cycles = 0, extension_rows = 0, accepted_rows = 0;
     std::uint64_t ambiguous = 0;        // an anchor whose earlier frames disagree on the next token
+    std::uint64_t gated_cycles = 0;     // frame cycles held back by the committed-prefix gate
 };
 
 class MtpFrameDraft {
@@ -60,6 +70,7 @@ private:
     std::vector<std::uint32_t> context_;
     std::vector<std::pair<std::size_t, std::size_t>> frames_;  // closed frames [open, close] in context_
     std::size_t open_at_ = SIZE_MAX;                            // the open frame's open token, SIZE_MAX: none
+    bool gate_open_ = false;  // the open frame's committed prefix matched an earlier frame (always with prefix_gate 0)
     std::vector<double> right_, tried_;
     bool started_ = false;
     struct Shadow {
