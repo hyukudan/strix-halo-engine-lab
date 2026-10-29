@@ -28,6 +28,16 @@ def digest(path):
         return value.hexdigest()
 
 
+def logits_reference(path):
+    """A reference case's signature.json stands for its discarded logits file."""
+    if path.name == "signature.json":
+        value = json.loads(path.read_text()).get("logits_sha256")
+        if not isinstance(value, str) or len(value) != 64:
+            raise ValueError("NO-REFERENCE: signature has no logits digest")
+        return value
+    return digest(path)
+
+
 def session_signature(path):
     """Public-main-compatible live-state path; exclude versioned identity metadata.
 
@@ -138,6 +148,8 @@ def main():
     # engine's teacher-spool bound (about 32 GB at 32K). The committed state then carries the evidence.
     parser.add_argument("--logits-command", type=Path)
     parser.add_argument("--state-command", type=Path, required=True)
+    # A 4k full-vocabulary logits file is about 4 GB; keeping one per case fills the disk.
+    parser.add_argument("--keep-logits", action="store_true", help="keep each case's raw logits after hashing")
     args = parser.parse_args()
     commands = {"state": json.loads(args.state_command.read_text())}
     if args.logits_command:
@@ -156,7 +168,7 @@ def main():
     checkout = Path(__file__).resolve().parents[1]
     if args.output.resolve().is_relative_to(checkout):
         parser.error("qualification outputs must stay outside the checkout")
-    reference_logits = None if args.capture_only or not args.reference_logits else digest(args.reference_logits)
+    reference_logits = None if args.capture_only or not args.reference_logits else logits_reference(args.reference_logits)
     reference_state = None if args.capture_only else state_signature(args.reference_state)
     args.output.mkdir(parents=False, exist_ok=False)
     env = os.environ.copy()
@@ -206,6 +218,8 @@ def main():
                     raise ValueError("ON receipt did not report HC output WMMA")
             actual = {"logits_sha256": digest(logits) if "logits" in commands else None, "state": state_signature(state / ("session.bin" if args.state_format == "session" else "manifest.json"))}
             (directory / "signature.json").write_text(json.dumps(actual, indent=2) + "\n")
+            if "logits" in commands and not args.keep_logits:
+                logits.unlink()
             if not args.capture_only and (actual["logits_sha256"] != reference_logits or actual["state"] != reference_state):
                 raise ValueError(args.arm + " logits/state differ from reference: " + directory.name)
             print(directory.name + (": CAPTURED (no equality verdict)" if args.capture_only else ": EXACT"))

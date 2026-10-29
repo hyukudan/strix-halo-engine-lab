@@ -75,6 +75,18 @@ class CommandValidationTests(unittest.TestCase):
                         signature.assert_not_called()
                     self.assertFalse((root / "output").exists())
 
+    def test_signature_stands_for_discarded_logits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "logits.bin").write_bytes(b"logits")
+            expected = gate.digest(root / "logits.bin")
+            (root / "signature.json").write_text(json.dumps({"logits_sha256": expected, "state": None}))
+            self.assertEqual(gate.logits_reference(root / "signature.json"), expected)
+            self.assertEqual(gate.logits_reference(root / "logits.bin"), expected)
+            (root / "signature.json").write_text(json.dumps({"logits_sha256": None, "state": None}))
+            with self.assertRaises(ValueError):
+                gate.logits_reference(root / "signature.json")
+
     def test_artifact_destinations_rejected(self):
         for kind in ("logits", "state"):
             for option in ("--validation-final-state", "--teacher-logits-file"):

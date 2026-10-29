@@ -15,8 +15,8 @@ for n in 4k 32k; do
     if [ "$n" = 4k ]; then
       public_logits=(--logits-command "$PINS/public-main/$n/$scope/logits.json")
       candidate_logits=(--logits-command "$PINS/candidate/$n/$scope/logits.json")
-      off_reference=(--reference-logits "$ref/public-main-legacy1/logits.bin")
-      on_reference=(--reference-logits "$on/on-legacy1/logits.bin")
+      off_reference=(--reference-logits "$ref/public-main-legacy1/signature.json")
+      on_reference=(--reference-logits "$on/on-legacy1/signature.json")
     fi
     python3 tests/qwen_prefill_public_controls_gate.py --arm public-main --capture-only --state-format session \
       "${public_logits[@]}" \
@@ -48,7 +48,7 @@ for n in 4k 32k; do
       candidate_logits=(); full_reference=()
       if [ "$n" = 4k ]; then
         candidate_logits=(--logits-command "$PINS/candidate/$n/$scope/logits.json")
-        full_reference=(--reference-logits "$ref/$case_name/logits.bin")
+        full_reference=(--reference-logits "$ref/$case_name/signature.json")
       fi
       python3 tests/qwen_prefill_public_controls_gate.py --arm "$arm" --capture-only \
         "${candidate_logits[@]}" \

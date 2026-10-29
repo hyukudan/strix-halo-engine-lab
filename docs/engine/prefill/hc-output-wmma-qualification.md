@@ -16,7 +16,10 @@ The logits command pins `--teacher-forced-score --generate 1` with all-row tiled
 output; it runs at 4k only, because full-vocabulary teacher logits of every 32k row
 exceed the engine's 16 GiB teacher-spool bound. At 32k the gate omits
 `--logits-command` and compares the committed state, which covers every KV/index
-row, the fixed components and the token history. The state command pins eager greedy generation, terminal-row output,
+row, the fixed components and the token history. The gate hashes each case's 4k
+logits (about 4 GB) and then deletes the file unless `--keep-logits` is given; a
+reference case's `signature.json` holds that digest, so at most one logits file is on
+disk at a time. The state command pins eager greedy generation, terminal-row output,
 full-row tiled prefill and positive generation, leaving capacity for generation.
 State-session runs need a >=1024-row cache unit and sufficient
 `--session-capture-host-bytes`; do not enable session suffix or fixed MTP modes.
@@ -56,7 +59,7 @@ for n in 4k 32k; do
     python3 tests/qwen_prefill_public_controls_gate.py --arm off --state-format session \
       --logits-command "$PINS/candidate/$n/$scope/logits.json" \
       --state-command "$PINS/candidate/$n/$scope/state.json" \
-      --reference-logits "$ref/public-main-legacy1/logits.bin" \
+      --reference-logits "$ref/public-main-legacy1/signature.json" \
       --reference-state "$ref/public-main-legacy1/state/session.bin" --output "$EVIDENCE/$n-$scope-off"
     witness=""
     if [ "$scope" = fast ]; then witness=--require-hc-witness; fi
@@ -67,7 +70,7 @@ for n in 4k 32k; do
     python3 tests/qwen_prefill_public_controls_gate.py --arm on --state-format session $witness \
       --logits-command "$PINS/candidate/$n/$scope/logits.json" \
       --state-command "$PINS/candidate/$n/$scope/state.json" \
-      --reference-logits "$on/on-legacy1/logits.bin" \
+      --reference-logits "$on/on-legacy1/signature.json" \
       --reference-state "$on/on-legacy1/state/session.bin" --output "$on-repeat"
   done
 done
@@ -97,7 +100,7 @@ for n in 4k 32k; do
       python3 tests/qwen_prefill_public_controls_gate.py --arm "$arm" \
         --logits-command "$PINS/candidate/$n/$scope/logits.json" \
         --state-command "$PINS/candidate/$n/$scope/state.json" \
-        --reference-logits "$ref/$case_name/logits.bin" \
+        --reference-logits "$ref/$case_name/signature.json" \
         --reference-state "$ref/$case_name/state/manifest.json" --output "$ref-repeat"
     done
   done
