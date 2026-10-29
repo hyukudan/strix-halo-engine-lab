@@ -71,7 +71,7 @@ CPU tests first; its README states what a pilot does and does not establish). Ke
 reference results out of that public kit. Qwen YaRN (`--rope-yarn`) is an explicit experimental mode: never a
 default, never combined with exactness claims against native; new resolver defaults must be classified for rotary
 work in `apps/qwen_yarn_admission.inc` before YaRN accepts them.
-Kernel/IOMMU settings (including the optional GPU PerfOpt, `amdgpu.iommu_perfopt`) are host decisions made
+Kernel/IOMMU settings (including the GPU PerfOpt, `amdgpu.iommu_perfopt`, the lab nodes' default boot) are host decisions made
 by the machine owner as root; record the running kernel and that parameter with any timing receipt, never
 disable the IOMMU to gain speed (USB4 controllers must stay translated), and compare PerfOpt only on vs off
 on the same kernel.

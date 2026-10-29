@@ -2247,9 +2247,9 @@ Use the v2 exact prefill indexer kernel.
 
 <a id="platform-perfopt"></a>
 
-### GPU IOMMU PerfOpt (optional)
+### GPU IOMMU PerfOpt
 
-**Engine:** platform. **Control:** `amdgpu.iommu_perfopt` (kernel module parameter). **Default:** not used (optional kernel).
+**Engine:** platform. **Control:** `amdgpu.iommu_perfopt` (kernel module parameter). **Default:** on: the lab nodes boot the PerfOpt kernel by default (permanent GRUB default on both nodes; `iommu_perfopt=-1`, the kernel logs "PerfOpt armed").
 
 The integrated GPU reaches system memory without IOMMU translation; the IOMMU stays on and every other device,
 including the USB4 controllers, keeps its translated domain. Trade-off: the GPU's own DMA is no longer contained

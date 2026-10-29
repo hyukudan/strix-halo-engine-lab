@@ -33,7 +33,7 @@ be adopted without measurement.
 AMD's IOMMU PerfOpt (`amdgpu.iommu_perfopt`, Linux 7.4 / IOMMU tree) is the measured middle ground: the
 integrated GPU skips IOMMU translation while the IOMMU stays on and the USB4 controllers stay translated.
 Same kernel, on vs off, measured on one node: Qwen 32K prefill +2.9..3.1 %, identical tokens. It removes the GPU's own DMA
-containment, so it is optional and not the default kernel; see
+containment; the lab nodes boot it by default (off: `amdgpu.iommu_perfopt=0` or the previous kernel); see
 [PerfOpt: what, trade-off, enable, verify, roll back](https://github.com/hyukudan/strix-halo-usb4-driver/blob/main/docs/PERFOPT.md).
 
 ## Categories the admission controller must compute
