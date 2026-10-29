@@ -902,6 +902,32 @@ void CudaDrafter::reset(std::uint64_t position) {
     impl_->next = position;
     impl_->start = position;
 }
+
+CudaDrafterState CudaDrafter::export_state() const {
+    auto& m=*impl_; STRIX_CUDA_CHECK(cudaStreamSynchronize(m.st));
+    CudaDrafterState s; s.start=m.start; s.next=m.next; s.vocabulary=vocabulary();
+    for (const auto& stage:m.stage) s.rings.push_back(stage.ring.download());
+    return s;
+}
+void CudaDrafter::import_state(const CudaDrafterState& s) {
+    auto& m=*impl_;
+    if(s.start>s.next || s.rings.size()!=stages || s.vocabulary.core>vocab || s.vocabulary.size()==0)
+        throw std::invalid_argument("ds41 cuda drafter state geometry");
+    std::vector<bool> seen(vocab);
+    for(auto id:s.vocabulary.extra) {
+        if(id<s.vocabulary.core || id>=vocab || seen[id]) throw std::invalid_argument("ds41 cuda drafter vocabulary");
+        seen[id]=true;
+    }
+    for(unsigned i=0;i<stages;++i)
+        if(s.rings[i].size()!=m.stage[i].ring.size()) throw std::invalid_argument("ds41 cuda drafter ring bytes");
+    STRIX_CUDA_CHECK(cudaStreamSynchronize(m.st));
+    set_vocabulary(s.vocabulary);
+    for(unsigned i=0;i<stages;++i)
+        STRIX_CUDA_CHECK(cudaMemcpyAsync(m.stage[i].ring.get(),s.rings[i].data(),s.rings[i].size(),cudaMemcpyHostToDevice,m.st));
+    STRIX_CUDA_CHECK(cudaStreamSynchronize(m.st));
+    m.start=s.start; m.next=s.next;
+}
+
 std::vector<std::uint8_t> CudaDrafter::ring(std::uint32_t s) const {
     STRIX_CUDA_CHECK(cudaStreamSynchronize(impl_->st));
     return impl_->stage[s].ring.download();

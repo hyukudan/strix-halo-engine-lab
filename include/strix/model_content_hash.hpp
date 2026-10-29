@@ -4,6 +4,7 @@
 #include "strix/model_runtime_binding.hpp"
 
 #include <filesystem>
+#include <functional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -21,6 +22,8 @@ enum class FileHashPolicy { cached, full };
 struct FileHashCacheStats { std::uint64_t hits = 0, misses = 0; };
 [[nodiscard]] FileHashCacheStats file_hash_cache_stats() noexcept;
 
+struct FileContentHashStats { bool cache_hit=false; };
+
 struct ModelContentFile {
     std::string logical_name;
     std::filesystem::path path;
@@ -33,6 +36,14 @@ struct ModelContentFile {
 [[nodiscard]] ModelContentIdentity sha256_file_content(
     const std::filesystem::path& path, FileHashPolicy policy);
 [[nodiscard]] ModelContentIdentity sha256_file_content(const std::filesystem::path&, const FileIdentity&);
+
+// Completed bytes during uncached file hashing; a cache hit reports completion.
+using FileHashProgress=std::function<void(std::uint64_t,std::uint64_t)>;
+[[nodiscard]] ModelContentIdentity sha256_file_content(
+    const std::filesystem::path& path, FileContentHashStats* stats);
+[[nodiscard]] ModelContentIdentity sha256_file_content(
+    const std::filesystem::path& path, FileContentHashStats* stats,
+    const FileHashProgress& progress);
 
 [[nodiscard]] ModelContentIdentity sha256_bytes(
     std::span<const std::byte> bytes);

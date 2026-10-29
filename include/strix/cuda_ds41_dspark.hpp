@@ -43,6 +43,12 @@ struct CudaDraftTimes {
     double wall_ms = 0.0;    // draft() including the token download
 };
 
+struct CudaDrafterState {
+    std::uint64_t start=0, next=0;
+    dspark::Vocab vocabulary;
+    std::vector<std::vector<std::uint8_t>> rings;
+};
+
 class CudaDrafter {
 public:
     CudaDrafter(const dspark::Weights& weights, const CudaDrafterOptions& options = {});
@@ -70,6 +76,9 @@ public:
     // Forgets every appended row (new sequence); the next row is at `position` (a sequence continued from an imported
     // state starts with an empty ring there: draft steps attend only to the rows appended since).
     void reset(std::uint64_t position = 0);
+    // Quiescent committed boundary only. Restore validates all shapes before device writes.
+    [[nodiscard]] CudaDrafterState export_state() const;
+    void import_state(const CudaDrafterState& state);
     // Diagnostics (pruned-drafter study): counts of the routed experts each draft step selects, per stage
     // ([stage][expert], every row of the block x top_k); off by default, part of the draft graph when on.
     void set_route_stats(bool on);

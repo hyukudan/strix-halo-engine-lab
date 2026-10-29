@@ -1,11 +1,20 @@
 #include "strix/model_content_hash.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <iterator>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -33,6 +42,104 @@ void write_file(
             "failed to write hash fixture");
     }
 }
+
+#ifdef _WIN32
+class ScopedEnvironment {
+public:
+    ScopedEnvironment(const wchar_t* name, const std::wstring& value) : name_(name) {
+        if (const auto* old = _wgetenv(name)) { existed_ = true; old_ = old; }
+        if (_wputenv_s(name, value.c_str()) != 0) throw std::runtime_error("cannot set test environment");
+    }
+    ~ScopedEnvironment() { _wputenv_s(name_.c_str(), existed_ ? old_.c_str() : L""); }
+private:
+    std::wstring name_, old_;
+    bool existed_ = false;
+};
+
+void windows_cache_tests(const std::filesystem::path& root) {
+    const auto cache = root / L"cache-\u00e9";
+    ScopedEnvironment setting(L"STRIX_HASH_CACHE", cache.wstring());
+    const auto file = root / "windows-cache.bin";
+    write_file(file, "abc");
+    strix::FileContentHashStats stats;
+    const auto digest = strix::sha256_file_content(file, &stats);
+    expect(!stats.cache_hit, "Windows first hash misses");
+    expect(strix::sha256_file_content(file, &stats) == digest && stats.cache_hit,
+           "Windows unchanged file hits persistent cache");
+    expect(std::distance(std::filesystem::directory_iterator(cache), std::filesystem::directory_iterator{}) == 1,
+           "Windows cache publishes one record and leaves no temporary files");
+
+    const auto before_stats = strix::file_hash_cache_stats();
+    std::vector<std::uint64_t> progress;
+    expect(strix::sha256_file_content(file, &stats, [&](auto done, auto total) {
+        expect(done == total && total == 3, "cache hit reports complete file progress");
+        progress.push_back(done);
+    }) == digest && stats.cache_hit && progress.size() == 1,
+           "per-call stats and progress agree on the cached digest");
+    const auto after_stats = strix::file_hash_cache_stats();
+    expect(after_stats.hits == before_stats.hits + 1 && after_stats.misses == before_stats.misses,
+           "process cache counters retain the shared API alongside RTX progress");
+    expect(strix::sha256_file_content(file, strix::FileHashPolicy::full) == digest,
+           "explicit full hashing preserves the shared policy API");
+    expect(strix::hash_single_model_content_file({"model", file}, strix::FileHashPolicy::full).file_sha256 == digest,
+           "explicit full single-model identity preserves the shared policy API");
+
+    const auto stamp = std::filesystem::last_write_time(file);
+    std::filesystem::last_write_time(file, stamp + std::chrono::seconds(2));
+    expect(strix::sha256_file_content(file, &stats) == digest && !stats.cache_hit,
+           "Windows touching unchanged content invalidates cache");
+    expect(strix::sha256_file_content(file, &stats) == digest && stats.cache_hit,
+           "Windows refreshed cache replaces the previous record");
+    // A metadata-only NTFS event (adding/removing another hard link moves ChangeTime) keeps the record.
+    const auto link = root / "windows-cache-link.bin";
+    std::filesystem::create_hard_link(file, link);
+    std::filesystem::remove(link);
+    expect(strix::sha256_file_content(file, &stats) == digest && stats.cache_hit,
+           "Windows hard-link removal (ChangeTime only) keeps the cached digest");
+    write_file(file, "abcd");
+    const auto changed = strix::sha256_file_content(file, &stats);
+    expect(changed != digest && !stats.cache_hit,
+           "Windows rewritten content (new size and write time) invalidates cache");
+    expect(strix::sha256_file_content(file, &stats) == changed && stats.cache_hit,
+           "Windows changed file gets a reusable digest");
+
+    HANDLE handle = CreateFileW(file.c_str(), FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open creation-time fixture");
+    FILETIME creation{};
+    const bool read = GetFileTime(handle, &creation, nullptr, nullptr) != 0;
+    creation.dwLowDateTime ^= 0x10000U;
+    const bool set = read && SetFileTime(handle, &creation, nullptr, nullptr) != 0;
+    CloseHandle(handle);
+    expect(set, "Windows creation-time fixture updated");
+    expect(strix::sha256_file_content(file, &stats) == changed && !stats.cache_hit,
+           "Windows creation-time change invalidates cache");
+    {
+        ScopedEnvironment disabled(L"STRIX_HASH_CACHE", L"0");
+        expect(strix::sha256_file_content(file, &stats) == changed && !stats.cache_hit,
+               "Windows disabled cache ignores existing record");
+        const auto fresh = root / "disabled.bin";
+        write_file(fresh, "abc");
+        expect(strix::sha256_file_content(fresh, &stats) == digest && !stats.cache_hit,
+               "Windows disabled cache hashes fresh files");
+        expect(strix::sha256_file_content(fresh, &stats) == digest && !stats.cache_hit,
+               "Windows disabled cache never produces a hit");
+    }
+    {
+        ScopedEnvironment default_setting(L"STRIX_HASH_CACHE", L"");
+        ScopedEnvironment local(L"LOCALAPPDATA", (root / "local").wstring());
+        ScopedEnvironment home(L"HOME", (root / "wrong-home").wstring());
+        ScopedEnvironment xdg(L"XDG_CACHE_HOME", (root / "wrong-xdg").wstring());
+        expect(strix::sha256_file_content(file, &stats) == changed && !stats.cache_hit,
+               "Windows default cache starts empty");
+        expect(strix::sha256_file_content(file, &stats) == changed && stats.cache_hit,
+               "Windows LOCALAPPDATA cache hits");
+        expect(std::filesystem::is_directory(root / "local/strix-engine/file-sha256") &&
+               !std::filesystem::exists(root / "wrong-home") && !std::filesystem::exists(root / "wrong-xdg"),
+               "Windows default cache uses LOCALAPPDATA even when HOME and XDG are set");
+    }
+}
+#endif
 
 }  // namespace
 
@@ -81,6 +188,10 @@ int main() {
         error);
     std::filesystem::create_directories(
         root);
+
+#ifdef _WIN32
+    windows_cache_tests(root);
+#endif
 
     const auto empty_path =
         root / "empty.bin";

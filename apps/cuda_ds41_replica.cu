@@ -87,6 +87,7 @@
 #include "strix/ds41_dspark_vocab.hpp"
 
 #include "cuda_ds41_replica_serve.hpp"
+#include "cuda_ds41_session_draft.hpp"
 
 #include "strix/cuda_ds41_moe_v2.hpp"
 
@@ -122,7 +123,7 @@ using namespace strix::ds41::cuda;
 
 // --serve: the options a request may change (rs::runtime_options), restored to their launch values before each request
 #define PERSIST_RUNTIME_VARS \
-    state_file, ref_file, phases_arg, chats_arg, seqs_file, json_out, timeline_out, steps, chat_prompt, chat_steps, verify_n, warm, \
+    qual_dump, state_file, ref_file, phases_arg, chats_arg, seqs_file, json_out, timeline_out, steps, chat_prompt, chat_steps, verify_n, warm, \
         chat_logits, pressure_free, pressure_recent, pf_layer, pf_token, window_arg, controller_scope, controller_prior, \
         controller_save, controller_prior_alt, controller_costs, controller_explore, controller_learn, probe_phase, draft_vocab, \
         draft_trace, winpf_knobs, wb_alt, reset_cache, req_env, qual, wb_defer, flush_ready, controller_costs_given, evict, census
@@ -388,16 +389,19 @@ int main(int argc, char** argv) {
     // --serve (design notes): the persistent worker; a request = the launch args + its runtime args
     std::string serve_dir, reset_cache = "warm";
     double serve_idle_s = 300.0;
-    std::uint32_t serve_max = 0, max_positions_arg = 0;
+    std::uint32_t serve_max = 0, max_positions_arg = 0, serve_session_mib = 0;
     bool test_hooks_arg = false, serve_keep_on_fail = false;
     std::string residency_save = "auto", residency_seed = "auto";  // the residency at shutdown / the next load's seed
     std::string warmup_graphs = "auto";                   // K list; every (K, rows, logits, capture) graph before ready
+    std::string qual_dump;
+    strix::ds41::session::Config session_config;
     bool qual = false;  // --qual: qualification records (every window row's token + logits FNV, prompt windows, chat token
                         // vectors and end states, draft confidences as bits); off = today's lines byte for byte
     std::vector<std::string> req_env;  // --env NAME=VALUE (request variables, applied at the request's start)
     bool print_config = false, baseline_arena = false, residency_auto = false;
     bool q8_r1 = true, q8_r1_pad = false, router_pf_explicit = false, hc_cluster = false;
     const auto baseline = [&]() {
+        session_config.off("baseline");
         dsrtxk_on = fuse_on = false;
         o.decode_fuse_hc = o.decode_fuse_shared = false;
         o.decode_router_v2 = o.decode_ob_one = o.decode_shared_fork = o.decode_attn_fork = false;
@@ -452,9 +456,18 @@ int main(int argc, char** argv) {
         };
         bool known = true;  // two chains: one else-if chain this long nests too deeply for MSVC inside a lambda
         if (a == "--baseline") baseline();
-        else if (a == "--print-config") print_config = true;
+        else if (a == "--print-config" || a == "--print-effective-config") print_config = true;
         else if (a == "--ce-pacing") ce_pacing = true;
         else if (a == "--no-ce-pacing") ce_pacing = false;
+        else if (a == "--session-cache" || a == "--session-disk") {
+            const auto v=next();if(v!="on"&&v!="off")usage("session switch expects on|off");
+            if(a=="--session-cache"){session_config.enabled=v=="on";session_config.explicit_opt_in=v=="on";session_config.reason=v=="off"?"switch":"";}
+            else session_config.disk=v=="on";
+        }
+        else if (a == "--session-ram-bytes") session_config.ram=strix::ds41::session::unsigned_value(next());
+        else if (a == "--session-max-parked") session_config.max_parked=strix::ds41::session::unsigned_value(next());
+        else if (a == "--session-dir") session_config.dir=next();
+        else if (a == "--session-disk-bytes") {session_config.disk_bytes=strix::ds41::session::unsigned_value(next());session_config.disk_explicit=true;}
         else if (a == "--q8-r1") q8_r1 = true;
         else if (a == "--q8-r1-off") q8_r1 = false;
         else if (a == "--q8-r1-pad") q8_r1_pad = true;
@@ -487,6 +500,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-lean-state") o.lean_state = false;
         else if (a == "--lean-state") o.lean_state = true;
         else if (a == "--timing") timing = true;
+        else if (a == "--qual-dump") qual_dump = next();
         else if (a == "--json") json_out = next();
         else if (a == "--timeline") timeline_out = next();
         else if (a == "--verify") verify_n = u32();
@@ -579,6 +593,10 @@ int main(int argc, char** argv) {
         else if (a == "--dsrtxk-off") dsrtxk_on = false;              // the nine dsrtxk options below off (baseline arm)
         else if (a == "--fuse-off") fuse_on = false;                  // --fuse-hc / --fuse-shared off
         else if (a == "--records-inline") records_inline = true;      // each step's record written before the next step (A/B)
+        else if (a == "--serve-session-mib") {
+            serve_session_mib = u32();session_config.ram=std::uint64_t{serve_session_mib}*1024*1024;
+            session_config.enabled=serve_session_mib!=0;session_config.explicit_opt_in=serve_session_mib!=0;session_config.reason=serve_session_mib?"":"legacy zero budget";
+        }
         else if (a == "--serve") serve_dir = next();                  // persist: the worker's spool directory
         else if (a == "--serve-idle") serve_idle_s = std::stod(next());  // persist: exit after S s without a request
         else if (a == "--serve-max") serve_max = u32();               // persist: exit after N requests (0: no limit)
@@ -698,7 +716,7 @@ int main(int argc, char** argv) {
             windows = windows || ph.rfind("wforce", 0) == 0 || ph.rfind("spec", 0) == 0 || ph.rfind("schats", 0) == 0 || ph.rfind("wsmoke", 0) == 0;
         max_rows = windows ? 6U : 1U;
     }
-    const auto effective_config = [&]() {
+    const auto effective_config = [&](bool session_policy = false) {
         // Resolve the same feature expansion as below, without calling any CUDA entry point.
         std::ostringstream j;
         j << std::boolalpha << "{";
@@ -772,11 +790,24 @@ int main(int argc, char** argv) {
         field("winpf_prior_cap", winpf_knobs.prior_cap); field("winpf_prior_pmin", winpf_knobs.prior_pmin);
         field("winpf_revert", winpf_knobs.revert_unused);
         field("serve", !serve_dir.empty()); field("serve_idle", serve_idle_s); field("serve_max", serve_max);
+        if (session_policy) {
+        field("session_cache",session_config.enabled);field("session_disk",session_config.enabled&&session_config.disk);
+        field("session_ram_bytes",session_config.ram==UINT64_MAX?0:session_config.ram);field("session_max_parked",session_config.max_parked);
+        field("session_explicit_opt_in",session_config.explicit_opt_in);str("session_route","rtx-tp1-decode-rows");
+        field("session_disk_bytes",session_config.disk_bytes);str("session_dir",session_config.dir.string());
+        str("session_off_reason",session_config.reason);
+        }
         j << "}";
         return j.str();
     };
+    if(serve_dir.empty())session_config.off("not serving");
+    else if(layers_arg!=40)session_config.off("requires 40 layers");
+    else if(!session_config.ram||!session_config.max_parked)session_config.off("zero RAM budget or parked limit");
+    strix::ds41::session::qualify(session_config,"rtx-tp1-decode-rows");
+    if(!session_config.enabled&&session_config.reason.empty())session_config.reason="environment";
     if (print_config) {
-        std::puts(effective_config().c_str());
+        session_config.resolve_ram();session_config.resolve_directory();
+        std::puts(effective_config(true).c_str());
         return 0;
     }
     const bool launch_wb_defer = wb_defer, launch_flush_ready = flush_ready;  // a worker without ts_dg_set_sched keeps them
@@ -805,6 +836,7 @@ int main(int argc, char** argv) {
     if (!std::isfinite(arena_headroom_gib) || arena_headroom_gib < 0.0 || arena_headroom_gib > 1024.0)
         usage("--arena-headroom-gib must be finite in 0..1024");
     const bool serving = !serve_dir.empty();
+    if (serve_session_mib && !serving) usage("--serve-session-mib requires --serve");
     if (serving && max_positions_arg == 0) usage("--serve needs --max-positions N (the absolute capacity every request and its fresh reference share)");
     if (serving && max_rows == 0) usage("--serve needs --max-rows R");
     // Default ON: every option is bitwise; full-model qualification measured
@@ -838,6 +870,8 @@ int main(int argc, char** argv) {
     bool any_exact = false, any_chats = false, any_window = false, any_draft = false;
     // the imported state (re-read when a request names another --import-state; capacity checked against the load's)
     auto imported0 = strix::deepseek41::load_attention_state(state_file);
+    strix::ds41::session::LaunchSeed<decltype(imported0)> session_seed_holder(session_config.enabled,state_file,
+        [](const std::filesystem::path& p){return strix::deepseek41::load_attention_state(p);});
     std::string imported_path = state_file;
     std::map<std::uint32_t, RefStep> ref;
     std::vector<std::pair<std::string, std::vector<std::uint32_t>>> seqs;
@@ -886,7 +920,9 @@ int main(int argc, char** argv) {
     if (any_chats && (chats_arg.empty() || seqs_file.empty())) usage("chats phases need --chats and --seqs-file");
     // fixtures before any load: the reference covers every compared position, the chats exist
     if (g_serving || state_file != imported_path) {  // the worker re-reads it for every request (content, not path)
+        session_seed_holder.before_replace(imported0,session_config.enabled,state_file);
         imported0 = strix::deepseek41::load_attention_state(state_file);
+        session_seed_holder.after_replace(state_file);
         imported_path = state_file;
     }
     ref = ref_file.empty() ? std::map<std::uint32_t, RefStep>{} : read_ref(ref_file);
@@ -1302,6 +1338,17 @@ int main(int argc, char** argv) {
             if (engram_check_on && (s.engram_check_mismatches != 0 || (s.engram_checked == 0 && o.engram == "file")))
                 throw std::runtime_error("Engram re-read check: " + std::to_string(s.engram_check_mismatches) + " mismatches of " + std::to_string(s.engram_checked));
         };
+        // Optional qualification observer; empty in production requests.
+        std::ofstream ordinary_logits,ordinary_tokens,ordinary_greedy;
+        const auto ordinary_rows=[&](const std::vector<std::uint32_t>& rows,const CudaStepResult& result) {
+            if(!ordinary_logits.is_open())return;
+            if(result.logits.size()!=rows.size()*129280 || result.tokens.size()!=rows.size())
+                throw std::runtime_error("qualification dump needs full raw logits");
+            ordinary_logits.write(reinterpret_cast<const char*>(result.logits.data()),static_cast<std::streamsize>(result.logits.size()*sizeof(float)));
+            ordinary_tokens.write(reinterpret_cast<const char*>(rows.data()),static_cast<std::streamsize>(rows.size()*sizeof(std::uint32_t)));
+            ordinary_greedy.write(reinterpret_cast<const char*>(result.tokens.data()),static_cast<std::streamsize>(result.tokens.size()*sizeof(std::uint32_t)));
+            if(!ordinary_logits||!ordinary_tokens||!ordinary_greedy)throw std::runtime_error("qualification dump write failed");
+        };
         const auto do_step = [&](const std::vector<std::uint32_t>& fed, const std::string& phase, std::uint32_t k, bool count, bool compare) {
             const std::uint32_t pos = p.position();
             const auto t0 = std::chrono::steady_clock::now();
@@ -1313,6 +1360,7 @@ int main(int argc, char** argv) {
             have_last = true;
             tier->begin_token();
             const auto s = p.step(fed, io);
+            ordinary_rows(fed,s);
             engram_gate(s);
             if (!stream_out.empty()) last_stream_fnv = row_fnv(0);
             const auto t1 = std::chrono::steady_clock::now();
@@ -1462,6 +1510,7 @@ int main(int argc, char** argv) {
             hinted_rows = 0;
             tier->begin_token();
             auto s = p.step(rows, io);
+            ordinary_rows(rows,s);
             const auto t1 = std::chrono::steady_clock::now();
             tier->end_token(static_cast<std::uint32_t>(rows.size()));  // completed verify rows; service + boundary
             const auto t2 = std::chrono::steady_clock::now();
@@ -1519,6 +1568,31 @@ int main(int argc, char** argv) {
         const auto qual_prompt = [&](const std::string& name, std::uint32_t pos, const std::vector<std::uint32_t>& rows, const CudaStepResult& s) {
             if (census && census_used) census_records[census_used - 1].counted = false;
             if (qual) emit("{\"event\":\"prompt_window\",\"phase\":\"" + name + "\",\"pos\":" + std::to_string(pos) + qual_rows(rows, s) + "}");
+        };
+        // Session create/suffix/control follow the ordinary chat prompt producer.
+        // This replica is decode_only: max_rows is the widest admitted window
+        // (six with a drafter). The standalone prefill driver has different
+        // buffers/kernels and cannot promise byte-identical imported state.
+        const auto ingest_prompt = [&](const std::vector<std::uint32_t>& tokens, std::uint32_t count,
+                                       bool draft, const std::string& phase, auto&& progress) {
+            std::uint32_t next = 0, windows = 0;
+            progress(0U, count, windows);
+            for (std::uint32_t at = 0; at < count;) {
+                const auto n = std::min(max_rows, count - at);
+                const std::vector<std::uint32_t> rows(tokens.begin()+at, tokens.begin()+at+n);
+                WindowTimes wt;
+                const auto pos = p.position();
+                const auto result = run_window(rows, wt);
+                qual_prompt(phase, pos, rows, result);
+                next = result.tokens.back();
+                p.commit_window(n, next);
+                if (census && census_used) census_records[census_used - 1].committed = n;
+                if (draft) append_committed(n);
+                at += n;
+                progress(at, count, ++windows);
+            }
+            if (count) prefetch_row0(next);
+            return next;
         };
         const auto qual_chat_end = [&](const std::string& key, const std::string& name, const std::vector<std::uint32_t>& v) {
             if (!qual) return;
@@ -1984,6 +2058,13 @@ int main(int argc, char** argv) {
             census_records.resize(capacity);
             census_phases.resize(capacity);
             for (auto& phase : census_phases) phase.reserve(128);
+        }
+        if(!qual_dump.empty()) {
+            if(!qual||!chat_logits)throw std::runtime_error("--qual-dump requires --qual --chat-logits");
+            ordinary_logits.open(qual_dump+".logits.f32",std::ios::binary|std::ios::trunc);
+            ordinary_tokens.open(qual_dump+".tokens.u32",std::ios::binary|std::ios::trunc);
+            ordinary_greedy.open(qual_dump+".greedy.u32",std::ios::binary|std::ios::trunc);
+            if(!ordinary_logits||!ordinary_tokens||!ordinary_greedy)throw std::runtime_error("cannot open qualification dump");
         }
         for (const auto& ph : phases) {
             census_phase = ph;
@@ -2569,6 +2650,22 @@ int main(int argc, char** argv) {
                << ",\"recall\":" << mean(g.recall) << ",\"bank\":" << mean(g.ring) << ",\"evicted\":" << mean(g.evicted) << "}";
             emit(os.str());
         }
+        if(!qual_dump.empty()) {
+            p.wait_io();STRIX_CUDA_CHECK(cudaDeviceSynchronize());
+            namespace qs=strix::ds41::session;
+            qs::write_file(qual_dump+".attention.bin",strix::deepseek41::serialize_attention_state(p.export_state()));
+            qs::Bytes draft_bytes;
+            if(drafter && std::any_of(phases.begin(),phases.end(),[](const auto& ph){return ph.rfind("schats",0)==0;})) {
+                DeviceScope ds(ddev);const auto state=drafter->export_state();
+                qs::DraftState d;d.start=state.start;d.next=state.next;d.core=state.vocabulary.core;d.extra=state.vocabulary.extra;
+                for(unsigned i=0;i<3;++i)d.rings[i]=state.rings.at(i);
+                draft_bytes=d.encode();
+            }
+            qs::write_file(qual_dump+".drafter.bin",draft_bytes);
+            ordinary_logits.flush();ordinary_tokens.flush();ordinary_greedy.flush();
+            qs::require(bool(ordinary_logits)&&bool(ordinary_tokens)&&bool(ordinary_greedy),"qualification dump flush failed");
+            ordinary_logits.close();ordinary_tokens.close();ordinary_greedy.close();
+        }
         };  // run_request
         if (!warmup_graphs.empty()) {  // every common graph captured + instantiated + launched once now
             const auto tw = std::chrono::steady_clock::now();
@@ -2597,6 +2694,48 @@ int main(int argc, char** argv) {
             emit("{\"event\":\"warmup\",\"steps\":" + std::to_string(wsteps) + ",\"graph_captures\":" + std::to_string(wcaptures) + ",\"ms\":" +
                  std::to_string(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count()) + "}");
         }
+
+        namespace sc = strix::ds41::session;
+        const bool session_supported=serving&&layers_arg==40&&session_config.max_parked>0;
+        const std::uint64_t session_bound=session_supported ? p.capture_bound()+3*128*528+2*1024*1024 : 0;
+        std::uint64_t session_total_budget=0;
+        const std::uint64_t session_reserve=session_supported ? 8*session_bound+16*1024*1024 : 0;
+        bool session_operational=false,session_admission_checked=false;
+        if(serving&&!session_config.enabled)std::cerr<<"session cache: off ("<<session_config.reason<<")\n";
+        struct SessionResources : sc::Resources {
+            using sc::Resources::Resources;
+            std::unique_ptr<attn::ExportCapture> capture[2];unsigned capture_slot=0;
+        };
+        std::unique_ptr<SessionResources> session_resources;
+        std::uint64_t session_hits=0,session_misses=0,session_refusals=0;
+        const auto session_draft_capture=[&]() {
+            DeviceScope ds(ddev);const auto s=drafter->export_state();
+            sc::DraftState out;out.start=s.start;out.next=s.next;out.core=s.vocabulary.core;out.extra=s.vocabulary.extra;
+            for(unsigned i=0;i<3;++i)out.rings[i]=s.rings.at(i);
+            return out.encode();
+        };
+        const auto session_capture_now=[&](sc::Frontier frontier) {
+            p.wait_io();STRIX_CUDA_CHECK(cudaDeviceSynchronize());
+            auto& c=*session_resources->capture[session_resources->capture_slot++%2];
+            p.capture_state(c);c.seal();
+            sc::Snapshot s;s.compat=session_resources->compat;s.frontier=frontier;
+            const auto b=c.bytes();s.attention.assign(b.begin(),b.end());
+            if(frontier.dspark)s.drafter=session_draft_capture();
+            return s;
+        };
+        const auto session_validate=[&](const sc::Snapshot& s) {
+            sc::require(s.compat==session_resources->compat,"session compatibility mismatch");
+            (void)sc::validate_attention(s,session_seed_holder.materialize(imported0),o.max_positions);
+            if(s.frontier.dspark) {
+                sc::require(bool(drafter) && ddev==target_device && max_rows>=s.frontier.fixed+1,
+                            "checkpoint requires same-device drafter and sufficient max-rows");
+                auto d=sc::DraftState::decode(s.drafter);
+                sc::require(d.next==s.frontier.draft,"drafter frontier mismatch");
+                sc::require(d.core==129280 && d.extra.empty() && draft_vocab=="full",
+                            "session producer requires full draft vocabulary");
+            } else sc::require(s.drafter.empty(),"unexpected drafter section");
+        };
+
         if (!serving) {
             configure_request();
             run_request();
@@ -2605,6 +2744,62 @@ int main(int argc, char** argv) {
             rs::Spool spool(serve_dir);
             spool.open();
             const auto launch_runtime = std::make_tuple(PERSIST_RUNTIME_VARS);  // every request starts from the launch values
+            const auto session_initialize=[&](const sc::Progress& progress) {
+                if(!session_resources)session_resources=std::make_unique<SessionResources>(
+                    session_config,session_total_budget-session_reserve,session_bound);
+                if(!session_resources->compat.empty())return;
+                std::tie(PERSIST_RUNTIME_VARS)=launch_runtime;
+                apply_env();
+#ifdef _WIN32
+                const auto environment=sc::compat_environment_record();
+#endif
+                for(auto& c:session_resources->capture){c=std::make_unique<attn::ExportCapture>();c->reserve(p.capture_bound());progress("capture-reserved",0,0);}
+                sc::Bytes record;sc::text(record,"strix-rtx-session-v2;attention-v1;dspark-v1;tp=1/rank=0;fp8-physical;greedy;decode-rows");
+                // Per-component digests go to the log, so two workers' identities can be diffed when a resume is refused.
+                std::string parts;std::size_t mark=record.size();
+                const auto part=[&](const char* label) {
+                    parts+=std::string(parts.empty()?"":" ")+label+"="+
+                           sc::sha(std::span<const std::uint8_t>(record.data()+mark,record.size()-mark)).substr(0,16);
+                    mark=record.size();
+                };
+                sc::text(record,session_resources->hashes.full(model,progress));part("model");
+                sc::text(record,draft_file.empty()?"no-drafter":session_resources->hashes.full(draft_file,progress));part("draft");
+#ifdef _WIN32
+                std::vector<wchar_t> exe(32768);
+                auto n=GetModuleFileNameW(nullptr,exe.data(),static_cast<DWORD>(exe.size()));
+                sc::require(n>0&&n<exe.size(),"cannot identify executable");
+                sc::text(record,session_resources->hashes.full(std::filesystem::path(std::wstring(exe.data(),n)),progress));
+#else
+                sc::text(record,session_resources->hashes.full("/proc/self/exe",progress));
+#endif
+                part("exe");
+                // Include all unknown options; exclude only transport, fixtures and
+                // output destinations. The executable hash binds compiled defaults.
+                // Resolve the selected device through CUDA, independently of index/UUID spelling.
+                const auto hardware=[&](int device) {
+                    cudaDeviceProp prop{};int driver=0,runtime=0;
+                    STRIX_CUDA_CHECK(cudaGetDeviceProperties(&prop,device));
+                    STRIX_CUDA_CHECK(cudaDriverGetVersion(&driver));
+                    STRIX_CUDA_CHECK(cudaRuntimeGetVersion(&runtime));
+                    sc::compat_hardware(record,std::span(reinterpret_cast<const std::uint8_t*>(prop.uuid.bytes),16),
+                                        prop.major,prop.minor,driver,runtime);
+                };
+                hardware(target_device);
+                if(drafter)hardware(ddev);
+                part("hardware");
+                sc::compat_arguments(record,launch_args,[&](const auto& path){return session_resources->hashes.full(path);});
+                part("args");
+#ifdef _WIN32
+                record.insert(record.end(),environment.begin(),environment.end());
+                part("env");
+#else
+                // The RTX worker is Windows-specific. Refuse an incomplete environment
+                // identity on another platform rather than silently weakening compat.
+                throw std::runtime_error("RTX session environment identity requires Windows");
+#endif
+                session_resources->compat=sc::sha(record);
+                std::cerr<<"session_compat "<<session_resources->compat<<" "<<parts<<"\n";
+            };
             const std::uint64_t load_id = static_cast<std::uint64_t>(std::chrono::system_clock::now().time_since_epoch().count());
             {
                 std::ostringstream os;
@@ -2618,6 +2813,9 @@ int main(int argc, char** argv) {
                    << ",\"dense_s\":" << dense_s << ",\"draft_load_s\":" << draft_load_s << ",\"load_s\":" << load_s
                    << ",\"max_positions\":" << o.max_positions << ",\"max_rows\":" << max_rows << ",\"drafter\":" << (drafter ? "true" : "false")
                    << ",\"test_hooks\":" << (tier_test_hooks ? "true" : "false") << ",\"max_predict\":" << std::max(predict, 8U)
+                   << ",\"session_config\":{\"session_cache\":" << (session_config.enabled?"true":"false")
+                   << ",\"session_explicit_opt_in\":" << (session_config.explicit_opt_in?"true":"false")
+                   << ",\"session_route\":\"rtx-tp1-decode-rows\",\"session_off_reason\":" << rs::json_str(session_config.reason) << "}"
                    << ",\"arena_slots\":" << slots << ",\"spares\":" << spares << ",\"pressure_spares\":" << pressure_spares
                    << ",\"host_spares\":" << host_spares << ",\"wb_defer\":" << (wb_defer ? "true" : "false") << ",\"flush_ready\":" << (flush_ready ? "true" : "false")
                    << ",\"winpf_prior\":" << rs::json_str(winpf_prior_file) << ",\"draft_keep\":" << draft_keep << ",\"env\":{";
@@ -2625,7 +2823,7 @@ int main(int argc, char** argv) {
                     bool first = true;
                     for (const char* n : {"STRIX_DS41_CUDA_ENGRAM_CHECK", "STRIX_DS41_REPLICA_WINDOW_ENGRAM_PREFETCH", "STRIX_DS41_REPLICA_MAPPED_HIDDEN",
                                           "STRIX_DS41_CUDA_DSPARK_GRAPH", "STRIX_DS41_CUDA_COMMIT_NEGATIVE_CONTROL", "CUDA_VISIBLE_DEVICES",
-                                          "CUDA_DEVICE_ORDER", "CUDA_MODULE_LOADING"}) {
+                                          "CUDA_DEVICE_ORDER", "CUDA_MODULE_LOADING", "STRIX_SESSION_CACHE"}) {
                         const char* v = std::getenv(n);
                         os << (first ? "" : ",") << rs::json_str(n) << ":" << (v ? rs::json_str(v) : std::string("null"));
                         first = false;
@@ -2655,13 +2853,390 @@ int main(int argc, char** argv) {
                 bool fatal = false, quit = false, ping = false;
                 std::string error;
                 std::vector<std::string> args;
+
+                struct SessionRequest {
+                    sc::Command session_command;
+                    std::optional<sc::Lru::Pending> session_input;
+                    std::optional<strix::deepseek41::AttentionState> session_attention;
+                    std::optional<sc::DraftState> session_draft;
+                    std::vector<std::uint32_t> session_tokens,session_prefix,session_output;
+                    std::vector<std::uint32_t> full_history;
+                    bool automatic=false,history_hit=false,recompute=false;
+                    std::optional<std::decay_t<decltype(launch_runtime)>> runtime;
+                    std::string session_result="null";
+                    std::ofstream session_logits,session_token_dump;
+                };
+                std::optional<SessionRequest> session_request;
+                std::optional<sc::Error> session_error;
+                bool session_used=false,session_keep_live=false,session_path_managed=false;
+                bool session_device_touched=false,session_attempt=false;
+                double session_read_verify_ms=0,session_copy_ms=0,session_capture_ms=0,session_disk_ms=0;
+                const auto session_progress=[&](const std::string& stage, std::uint64_t done=0, std::uint64_t total=0) {
+                    emit("{\"event\":\"session_progress\",\"request\":"+rs::json_str(*name)+
+                         ",\"session\":"+rs::json_str(session_request->session_command.id)+",\"stage\":"+rs::json_str(stage)+
+                         ",\"done\":"+std::to_string(done)+",\"total\":"+std::to_string(total)+
+                         ",\"elapsed_s\":"+std::to_string(std::chrono::duration<double>(std::chrono::steady_clock::now()-t_req).count())+"}");
+                };
+                const auto session_preflight=[&]() {
+                    const auto tr=std::chrono::steady_clock::now();
+                    auto& c=session_request->session_command;
+                    session_progress("preflight");
+                    if(!session_admission_checked) {
+                        session_config.resolve_ram();session_total_budget=session_config.ram;
+                        session_operational=session_supported&&session_bound<=session_total_budget&&
+                            session_reserve<=session_total_budget-session_bound&&
+                            session_reserve+session_bound<=sc::host_memory(true);
+                        session_admission_checked=true;
+                        if(!session_operational)session_config.off("insufficient host memory for configured context");
+                    }
+                    sc::require(session_operational,"session host budget or geometry unavailable");
+                    const auto& session_seed=session_seed_holder.materialize(imported0);
+                    if(!c.path.empty()) {
+                        session_config.resolve_directory();
+                        const auto route=sc::route_explicit_path(c.path,session_config.dir,c.id);
+                        c.path=route.path.string();session_path_managed=route.managed;
+                    }
+                    if(!session_resources)session_resources=std::make_unique<SessionResources>(
+                        session_config,session_total_budget-session_reserve,session_bound);
+                    // External immutable paths are independent of managed-tier ownership.
+                    // Refuse busy managed operations before changing RAM, device or dumps.
+                    sc::prepare_ram_command(c,session_resources->ram,session_resources->names,session_request->automatic);
+                    const bool needs_tier=session_path_managed || c.op=="list" || c.op=="stats" || c.op=="delete" ||
+                        (c.path.empty()&&(c.op=="restore"||(c.op=="checkpoint"&&c.durability=="disk")));
+                    if(needs_tier)session_resources->disk.ensure_open();
+                    if(session_path_managed||(session_config.disk&&(c.op=="list"||c.op=="delete"))||
+                       (c.path.empty()&&(c.op=="restore"||(c.op=="checkpoint"&&c.durability=="disk"))))
+                        session_resources->disk.require_available();
+                    try{session_initialize(session_progress);session_progress("initialized");}catch(const std::exception& e){
+                        for(auto& capture:session_resources->capture)capture.reset();
+                        session_config.off(e.what());
+                        std::cerr<<"session cache: off ("<<session_config.reason<<")\n";
+                        throw;
+                    }
+                    // Explicit owner-managed save/load paths are independent of the automatic disk tier.
+                    if(session_path_managed) {
+                        sc::require(session_resources->disk.enabled(),"session disk budget unavailable");
+                        c.path=session_resources->disk.path(c.id).string();
+                    }
+                    if(c.path.empty()&&(c.op=="restore"||(c.op=="checkpoint"&&c.durability=="disk")))sc::require(session_resources->disk.enabled(),"session disk budget unavailable");
+                    if(c.path.empty()&&(c.op=="restore"||(c.op=="checkpoint"&&c.durability=="disk"))) {
+                        c.path=session_resources->disk.path(c.id).string();session_path_managed=true;
+                    }
+                    if(c.op=="list"||c.op=="stats"||c.op=="delete")return;
+                    if(c.op=="restore") {
+                        if(session_resources->ram.contains(c.id))throw sc::Error("session_conflict",409,"restore would replace an existing session (delete first)");
+                        session_request->session_input=sc::Lru::Pending{sc::restore(c.path,session_resources->compat,session_resources->ram.budget(),session_progress,session_path_managed)};
+                    } else if(c.op=="create") {
+                        if(session_resources->ram.contains(c.id))throw sc::Error("session_conflict",409,"session already exists");
+                        sc::require(!c.dspark || (drafter && ddev==target_device && max_rows>=c.fixed+1),
+                                    "DSpark session requires same-device drafter and sufficient max-rows");
+                        // The drafter section stores the full vocabulary only; a subset ('auto:<dir>') worker
+                        // cannot produce a restorable DSpark session, so refuse before any work.
+                        if(c.dspark&&draft_vocab!="full")
+                            throw sc::Error("session_unsupported",422,"DSpark sessions require a worker launched with --draft-vocab full (this worker: "+draft_vocab+")");
+                        sc::Snapshot s;s.compat=session_resources->compat;
+                        s.attention=strix::deepseek41::serialize_attention_state(session_seed);
+                        s.frontier.consumed=s.frontier.accepted=session_seed.position;s.frontier.pending=session_seed.next_token;
+                        s.frontier.dspark=c.dspark;s.frontier.fixed=c.fixed;
+                        s.frontier.draft=c.dspark?session_seed.position:0;
+                        if(c.dspark) {
+                            sc::DraftState d;d.start=d.next=session_seed.position;
+                            for(auto& ring:d.rings)ring.resize(128*528);
+                            s.drafter=d.encode();
+                        }
+                        session_request->session_input=sc::Lru::Pending{std::move(s)};
+                    } else if(!session_request->session_input)session_request->session_input=session_resources->ram.stage(c.id);
+                    sc::require(session_request->session_input->snapshot.frontier.encode()==sc::Frontier::decode(session_request->session_input->snapshot.frontier.encode()).encode(),"invalid session frontier");
+                    if(session_request->automatic||!c.history.empty()) {
+                        auto history=session_request->full_history;
+                        if(!session_request->automatic) {
+                            std::ifstream in(c.history);sc::require(bool(in),"cannot read session history");
+                            history=sc::read_tokens(in,o.max_positions);
+                        }
+                        auto saved=strix::deepseek41::deserialize_attention_state(session_request->session_input->snapshot.attention);
+                        session_request->history_hit=c.op!="create"&&sc::history_prefix(saved.tokens,history)&&
+                            c.dspark==session_request->session_input->snapshot.frontier.dspark&&c.fixed==session_request->session_input->snapshot.frontier.fixed;
+                        if(!session_request->history_hit) {
+                            session_request->recompute=session_request->automatic;
+                            session_request->session_input->generation=0;
+                            sc::require(history.size()>=session_seed.tokens.size()&&std::equal(session_seed.tokens.begin(),session_seed.tokens.end(),history.begin()),"history does not extend launch seed");
+                            session_request->session_input->snapshot.attention=strix::deepseek41::serialize_attention_state(session_seed);
+                            auto& f=session_request->session_input->snapshot.frontier;f={};f.consumed=f.accepted=session_seed.position;f.pending=session_seed.next_token;
+                            f.dspark=c.dspark;f.fixed=c.fixed;f.draft=c.dspark?f.consumed:0;
+                            session_request->session_input->snapshot.drafter.clear();
+                            session_request->session_input->snapshot.lineage=sc::Snapshot::new_lineage();
+                            session_request->session_input->snapshot.committed_generation=0;
+                            if(c.dspark){sc::DraftState d;d.start=d.next=session_seed.position;for(auto& r:d.rings)r.resize(128*528);session_request->session_input->snapshot.drafter=d.encode();}
+                            saved=session_seed;
+                        }
+                        session_request->session_tokens.assign(history.begin()+saved.tokens.size(),history.end());
+                        if(session_request->history_hit)++session_hits;else ++session_misses;
+                    } else if(c.op=="turn") {
+                        ++session_hits;
+                    }
+                    session_validate(session_request->session_input->snapshot);
+                    session_read_verify_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tr).count();
+                    if(c.op=="restore" || c.op=="checkpoint")return;
+                    session_request->session_attention=strix::deepseek41::deserialize_attention_state(session_request->session_input->snapshot.attention);
+                    if(session_request->session_input->snapshot.frontier.dspark)session_request->session_draft=sc::DraftState::decode(session_request->session_input->snapshot.drafter);
+                    if(c.op=="turn"||c.op=="create") {
+                        sc::require(c.dspark==session_request->session_input->snapshot.frontier.dspark&&c.fixed==session_request->session_input->snapshot.frontier.fixed,
+                                    "session mode/fixed-window change refused");
+                        if(!c.tokens.empty()) {
+                            std::ifstream in(c.tokens);sc::require(bool(in),"cannot read session token file");
+                            session_request->session_tokens=sc::read_tokens(in,o.max_positions);
+                        }
+                        if(!c.control_prefix.empty()) {
+                            sc::require(qual,"control prefix requires --qual");
+                            std::ifstream in(c.control_prefix);sc::require(bool(in),"cannot read control prefix");
+                            session_request->session_prefix=sc::read_tokens(in,o.max_positions);
+                        }
+                        sc::require(session_request->session_input->snapshot.frontier.consumed+session_request->session_prefix.size()+session_request->session_tokens.size()+std::uint64_t(c.steps)<o.max_positions,
+                                    "session turn exceeds context capacity");
+                        sc::require(session_bound<=session_resources->ram.budget(),"session capture exceeds host budget");
+                        if(!c.dump.empty()&&!session_request->recompute) {
+                            session_request->session_logits.open(c.dump+".logits.f32",std::ios::binary|std::ios::trunc);
+                            session_request->session_token_dump.open(c.dump+".tokens.u32",std::ios::binary|std::ios::trunc);
+                            sc::require(bool(session_request->session_logits)&&bool(session_request->session_token_dump),"cannot open session dumps");
+                        }
+                    }
+                };
+                const auto session_execute=[&]() {
+                    const auto t0=std::chrono::steady_clock::now();
+                    const auto& c=session_request->session_command;
+                    session_progress("execute");
+                    if(session_request->recompute) {
+                        // A full-prompt miss executes the ordinary producer from its launch seed.
+                        session_device_touched=true;
+                        std::tie(PERSIST_RUNTIME_VARS)=*session_request->runtime;apply_env();configure_request();
+                        session_resources->ram.clear_active();reset_request_state();run_request();
+                        sc::require(failures==0,"ordinary named prompt failed");
+                        sc::Frontier f;f.dspark=c.dspark;f.fixed=c.fixed;f.consumed=f.accepted=p.position();
+                        f.emitted=c.steps;f.turns=1;f.draft=c.dspark?p.position():0;
+                        auto snapshot=session_capture_now(f);
+                        const auto state=strix::deepseek41::deserialize_attention_state(snapshot.attention);
+                        f.pending=state.next_token;
+                        session_request->session_output.assign(state.tokens.end()-c.steps,state.tokens.end());
+                        snapshot.frontier=f;snapshot.committed_generation=1;session_validate(snapshot);
+                        if(!c.dump.empty())sc::write_file(c.dump+".frontier.bin",f.encode());
+                        session_resources->ram.put(c.id,std::move(snapshot));session_resources->ram.activate(c.id);
+                        session_resources->names.admitted(c.id);
+                        // Use the common result builder after this completed ordinary execution.
+                    } else {
+                    if(session_request->session_input) {
+                        session_keep_live=session_resources->ram.keep_live(c.id,*session_request->session_input);
+                        if(c.op=="restore"&&session_path_managed)session_resources->disk.touch(c.id);
+                        // New/loaded/history-reset snapshots need a fresh generation.
+                        // Keep the CPU input for device import and checkpoint output.
+                        session_resources->ram.admit(c.id,*session_request->session_input);
+                        session_resources->names.admitted(c.id);
+                    }
+                    if(c.op=="list") {
+                        std::ostringstream out;out<<"{\"sessions\":[";bool first=true;
+                        for(auto& id:session_resources->ram.list()){
+                            const auto& v=session_resources->ram.get(id);
+                            bool durable=false;
+                            if(session_resources->disk.contains(id)) {
+                                const auto checkpoint=sc::read_pointer(session_resources->disk.path(id));
+                                durable=checkpoint.lineage==v.lineage&&checkpoint.generation==v.committed_generation;
+                            }
+                            out<<(first?"":",")<<"{\"id\":"<<rs::json_str(id)
+                                <<",\"position\":"<<v.frontier.consumed<<",\"consumed\":"<<v.frontier.consumed
+                                <<",\"pending\":"<<v.frontier.pending<<",\"bytes\":"<<v.size()
+                                <<",\"state\":"<<rs::json_str(session_resources->ram.active()==id?"active":"parked")
+                                <<",\"durability\":"<<rs::json_str(durable?"disk":"ram")<<"}";first=false;
+                        }
+                        for(auto& id:session_resources->disk.list())if(!session_resources->ram.contains(id)){
+                            const auto checkpoint=sc::read_pointer(session_resources->disk.path(id));
+                            out<<(first?"":",")<<"{\"id\":"<<rs::json_str(id)
+                               <<",\"generation\":"<<checkpoint.generation<<",\"lineage\":"<<rs::json_str(checkpoint.lineage)
+                               <<",\"state\":\"disk\",\"durability\":\"disk\"}";first=false;
+                        }
+                        out<<"]}";session_request->session_result=out.str();return;
+                    }
+                    if(c.op=="stats") {
+                        session_request->session_result="{\"ram_bytes\":"+std::to_string(session_resources->ram.used())+",\"ram_budget\":"+std::to_string(session_resources->ram.budget())+
+                            ",\"parked\":"+std::to_string(session_resources->ram.list().size())+",\"disk_bytes\":"+std::to_string(session_resources->disk.used())+
+                            ",\"hits\":"+std::to_string(session_hits)+",\"misses\":"+std::to_string(session_misses)+",\"refusals\":"+std::to_string(session_refusals)+
+                            ",\"host_bytes\":"+std::to_string(session_resources->ram.used())+",\"host_budget\":"+std::to_string(session_resources->ram.budget())+
+                            ",\"evicted\":"+std::to_string(session_resources->ram.evicted())+",\"active\":"+rs::json_str(session_resources->ram.active())+
+                            ",\"total_budget\":"+std::to_string(session_total_budget)+",\"capture_scratch_reserve\":"+std::to_string(session_reserve)+
+                        ",\"pinned_capture_bytes\":"+std::to_string(2*p.capture_bound())+",\"background_dma\":false}";return;
+                    }
+                    if(c.op=="delete") {
+                        const bool ram_deleted=session_resources->ram.erase(c.id),disk_deleted=session_resources->disk.erase(c.id);
+                        sc::require(ram_deleted||disk_deleted||session_resources->names.known(c.id),"session_not_found");
+                        session_resources->names.deleted(c.id);
+                        session_request->session_result=std::string("{\"deleted\":true,\"disk_deleted\":")+(disk_deleted?"true}":"false}");return;
+                    }
+                    if(c.op=="restore") {
+                        // Admission above deliberately leaves the live identity invalid.
+                    } else if(c.op=="checkpoint") {
+                        if(c.durability=="disk") {
+                            session_progress("save");
+                            const auto td=std::chrono::steady_clock::now();
+                            if(session_path_managed)session_resources->disk.put(c.id,session_request->session_input->snapshot);
+                            else sc::publish(c.path,session_request->session_input->snapshot);
+                            session_disk_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-td).count();
+                        }
+                    } else if(c.op=="park") {
+                        if(session_resources->ram.active()==c.id) {
+                            session_device_touched=true;p.wait_io();STRIX_CUDA_CHECK(cudaDeviceSynchronize());
+                            p.reset_sequence();session_resources->ram.clear_active();
+                        }
+                    } else {
+                        // All schema, digest, mode and shape validation precedes this point.
+                        session_device_touched=true;
+                        if(session_request->runtime)std::tie(PERSIST_RUNTIME_VARS)=*session_request->runtime;
+                        else std::tie(PERSIST_RUNTIME_VARS)=launch_runtime;
+                        apply_env();configure_request();reset_request_state();
+                        p.wait_io();STRIX_CUDA_CHECK(cudaDeviceSynchronize());
+                        const auto tc=std::chrono::steady_clock::now();
+                        const bool keep_live=session_keep_live && c.op=="turn";
+                        if(!keep_live)p.import_state(*session_request->session_attention);
+                        if(session_request->session_draft && !keep_live) {
+                            DeviceScope ds(ddev);CudaDrafterState d;d.start=session_request->session_draft->start;d.next=session_request->session_draft->next;
+                            d.vocabulary={session_request->session_draft->core,session_request->session_draft->extra};
+                            for(auto& ring:session_request->session_draft->rings)d.rings.push_back(ring);
+                            drafter->import_state(d);
+                        }
+                        session_copy_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tc).count();
+                        session_progress("imported");
+                        session_resources->ram.activate(c.id);
+                        if(c.op!="resume") {
+                            io.logits=chat_logits;io.draft_hidden=c.dspark?hidden_cap:nullptr;
+                            // Match ordinary chats0/schats0: no speculative expert
+                            // prefetch budget or diagnostic Engram rereads in prompts.
+                            set_predict(0);tier->set_budgets(spares,0,pf_token);
+                            engram_check_on=false;p.set_engram_check(false);
+                            auto f=session_request->session_input->snapshot.frontier;
+                            auto next=static_cast<std::uint32_t>(f.pending);
+                            const auto save_rows=[&](const std::vector<std::uint32_t>& rows,const CudaStepResult& result,std::uint32_t kept,bool generated) {
+                                if(!session_request->session_logits.is_open()||!generated)return;
+                                sc::require(result.logits.size()%result.tokens.size()==0,"missing session raw logits");
+                                const auto width=result.logits.size()/result.tokens.size();
+                                session_request->session_logits.write(reinterpret_cast<const char*>(result.logits.data()),
+                                    static_cast<std::streamsize>(kept*width*sizeof(float)));
+                                session_request->session_token_dump.write(reinterpret_cast<const char*>(rows.data()),
+                                    static_cast<std::streamsize>(kept*sizeof(std::uint32_t)));
+                                sc::require(bool(session_request->session_logits)&&bool(session_request->session_token_dump),"session dump write failed");
+                            };
+                            const auto consume=[&](const std::vector<std::uint32_t>& tokens) {
+                                sc::ProgressCadence cadence;
+                                const auto pending=ingest_prompt(tokens, static_cast<std::uint32_t>(tokens.size()), c.dspark,
+                                    "session-prompt", [&](auto done, auto total, auto windows) {
+                                        if(cadence.ready(windows,done==total))session_progress("prompt",done,total);
+                                    });
+                                if(!tokens.empty())next=pending;
+                            };
+                            if(!c.control_prefix.empty()) {
+                                consume(session_request->session_prefix);++f.turns;
+                                // L reaches P here: no capture, checkpoint, import or reset.
+                            }
+                            consume(session_request->session_tokens);
+                            io.logits=session_request->session_logits.is_open() || chat_logits;
+                            sc::ProgressCadence decode_progress;std::uint32_t decode_windows=0;
+                            for(std::uint32_t at=0;at<c.steps;) {
+                                std::vector<std::uint32_t> rows{next};
+                                std::uint32_t k=0;
+                                if(c.dspark&&c.steps-at>1) {
+                                    DeviceScope ds(ddev);const auto d=drafter->draft(next);
+                                    k=std::min(c.fixed,c.steps-at-1);
+                                    for(std::uint32_t j=1;j<=k;++j)rows.push_back(d.tokens[j]);
+                                }
+                                WindowTimes wt;const auto result=run_window(rows,wt);
+                                std::uint32_t accepted=0;
+                                while(accepted<k&&rows[accepted+1]==result.tokens[accepted])++accepted;
+                                const auto kept=accepted+1;next=result.tokens[accepted];
+                                session_request->session_output.insert(session_request->session_output.end(),rows.begin(),rows.begin()+kept);
+                                save_rows(rows,result,kept,true);p.commit_window(kept,next);
+                                if(c.dspark)append_committed(kept);at+=kept;f.emitted+=kept;
+                                if(decode_progress.ready(++decode_windows,at==c.steps))session_progress("decode",at,c.steps);
+                            }
+                            f.consumed=f.accepted=p.position();f.pending=next;
+                            f.draft=c.dspark?p.position():0;++f.turns;
+                            if(session_request->automatic){f.emitted=c.steps;f.turns=1;}
+                            const auto ts=std::chrono::steady_clock::now();
+                            session_progress("capture");
+                            auto snapshot=session_capture_now(f);
+                            snapshot.lineage=session_request->session_input->snapshot.lineage;
+                            sc::require(session_request->session_input->snapshot.committed_generation<UINT64_MAX,"session generation exhausted");
+                            snapshot.committed_generation=session_request->session_input->snapshot.committed_generation+1;
+                            session_progress("captured");
+                            session_capture_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-ts).count();
+                            session_validate(snapshot);
+                            if(!c.dump.empty()) {
+                                session_request->session_logits.flush();session_request->session_token_dump.flush();
+                                sc::require(bool(session_request->session_logits)&&bool(session_request->session_token_dump),"session dump flush failed");
+                                sc::write_file(c.dump+".attention.bin",snapshot.attention);
+                                sc::write_file(c.dump+".drafter.bin",snapshot.drafter);
+                                sc::write_file(c.dump+".frontier.bin",snapshot.frontier.encode());
+                            }
+                            session_resources->ram.put(c.id,std::move(snapshot));
+                            session_resources->ram.activate(c.id);
+                        }
+                    }
+                    }
+                    session_progress("complete");
+                    const auto& saved=session_resources->ram.get(c.id);
+                    std::ostringstream output_ids;output_ids<<"[";
+                    for(std::size_t j=0;j<session_request->session_output.size();++j)output_ids<<(j?",":"")<<session_request->session_output[j];
+                    output_ids<<"]";
+                    session_request->session_result="{\"tokens\":"+output_ids.str()+",\"session\":"+rs::json_str(c.id)+",\"operation\":"+rs::json_str(c.op=="restore"?"resume":c.op)+
+                        ",\"history_hit\":"+(session_request->history_hit?"true":"false")+
+                        ",\"recomputed\":"+(session_request->recompute?"true":"false")+
+                        ",\"durability\":"+rs::json_str(c.op=="checkpoint"?c.durability:"ram")+
+                        ",\"bytes\":"+std::to_string(saved.size())+",\"consumed\":"+std::to_string(saved.frontier.consumed)+
+                        ",\"emitted\":"+std::to_string(saved.frontier.emitted)+",\"pending\":"+std::to_string(saved.frontier.pending)+
+                        ",\"compat\":"+rs::json_str(session_resources->compat)+",\"attention_sha256\":"+rs::json_str(sc::sha(saved.attention))+
+                        ",\"lineage\":"+rs::json_str(saved.lineage)+",\"generation\":"+std::to_string(saved.committed_generation)+
+                        ",\"drafter_sha256\":"+rs::json_str(sc::sha(saved.drafter))+",\"frontier_sha256\":"+rs::json_str(sc::sha(saved.frontier.encode()))+
+                        ",\"read_verify_ms\":"+std::to_string(session_read_verify_ms)+",\"restore_copy_ms\":"+std::to_string(session_copy_ms)+
+                        ",\"capture_ms\":"+std::to_string(session_capture_ms)+",\"write_fsync_ms\":"+std::to_string(session_disk_ms)+
+                        ",\"wall_ms\":"+std::to_string(std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count())+"}";
+                };
+
                 // 1. the request's configuration: nothing on the device is touched, any error is the request's (rc 2)
                 try {
                     args = rs::read_args_file(spool.running(*name));
+                    if(!session_config.enabled&&!sc::explicit_request(args))sc::ignore_name(args);
+                    session_attempt=std::any_of(args.begin(),args.end(),[](const auto& a){return a.rfind("--session",0)==0;});
                     if (args.size() == 1U && (args[0] == "--quit" || args[0] == "--ping")) {
                         quit = args[0] == "--quit";
                         ping = !quit;
-                    } else {
+                    } else if (session_attempt) {
+                        session_request.emplace();
+                        session_used=true;
+                        // Validate against the launch configuration, not an earlier ordinary request's values.
+                        std::tie(PERSIST_RUNTIME_VARS)=launch_runtime;
+                        apply_env();
+                        if(!sc::explicit_request(args)) {
+                            auto& r=*session_request;r.automatic=true;
+                            r.session_command.id=sc::automatic_name(args);
+                            rs::check_request_args(args);parse_args(args);prepare_request();
+                            sc::require(phases.size()==1&&chats_arg.find(',')==std::string::npos,"named prompt requires one phase and chat");
+                            auto& c=r.session_command;c.used=true;c.op="turn";c.steps=chat_steps;c.dump=qual_dump;
+                            if(phases[0]=="chats0")c.dspark=false;
+                            else {
+                                sc::require(phases[0].rfind("schats0f",0)==0&&phases[0].size()==9&&phases[0].back()>='1'&&phases[0].back()<='5',"named prompt requires chats0 or schats0f1..5");
+                                c.dspark=true;c.fixed=static_cast<std::uint32_t>(phases[0].back()-'0');
+                            }
+                            const auto& prompt=seqs.at(std::stoul(chats_arg)).second;
+                            r.full_history=session_seed_holder.materialize(imported0).tokens;
+                            r.full_history.insert(r.full_history.end(),prompt.begin(),prompt.begin()+std::min<std::size_t>(chat_prompt,prompt.size()));
+                            open_outputs();configure_request();
+                            r.runtime=std::make_tuple(PERSIST_RUNTIME_VARS);
+                        } else session_request->session_command=sc::parse(args);
+                        try{session_preflight();}
+                        catch(...) {
+                            // A name-only request whose automatic admission failed runs as the ordinary
+                            // request it names: the full prompt from scratch, the same as without sessions.
+                            if(!(session_request->automatic&&session_admission_checked&&!session_operational))throw;
+                            std::cerr<<"session cache: off for this request ("<<session_config.reason<<"); running it without a session\n";
+                            session_request.reset();session_attempt=false;session_used=false;sc::ignore_name(args);
+                        }
+                    }
+                    if (!session_attempt && !quit && !ping) {
                         rs::check_request_args(args);
                         std::tie(PERSIST_RUNTIME_VARS) = launch_runtime;  // req_env = the launch --env list
                         parse_args(args);                                    // + the request's
@@ -2685,6 +3260,8 @@ int main(int argc, char** argv) {
                         configure_request();
                     }
                 } catch (const std::exception& e) {
+                    if(session_attempt)++session_refusals;
+                    if(const auto* failure=dynamic_cast<const sc::Error*>(&e))session_error=*failure;
                     rc = 2;
                     error = e.what();
                 }
@@ -2693,15 +3270,15 @@ int main(int argc, char** argv) {
                 if (rc == 0 && !quit && !ping) {
                     try {
                         emit("{\"event\":\"request_start\",\"name\":" + rs::json_str(*name) + ",\"seq\":" + std::to_string(served) + "}");
-                        if (reset_cache == "open") {  // the expert cache back to the open state
+                        if (!session_used && reset_cache == "open") {  // the expert cache back to the open state (quiescent: drained above)
                             drain_request_state();
                             const auto tr = std::chrono::steady_clock::now();
                             tier->reset_cache();
                             emit("{\"event\":\"reset_cache\",\"mode\":\"open\",\"ms\":" +
                                  std::to_string(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tr).count()) + "}");
                         }
-                        reset_request_state();
-                        run_request();
+                        if(session_used) {failures=0;chat_plain.clear();session_execute();}
+                        else {if(session_resources)session_resources->ram.clear_active();reset_request_state();run_request();}
                         flush_deferred();  // the last step's record (and its compare) before the verdict
                         // this request's plain arms against the earlier requests' (then kept for the next requests)
                         for (const auto& [k, v] : chat_plain) {
@@ -2724,7 +3301,8 @@ int main(int argc, char** argv) {
                     } catch (const std::exception& e) {
                         rc = 1;
                         error = e.what();
-                        fatal = true;  // also a usage error after the run started: the state is partly changed
+                        if(const auto* failure=dynamic_cast<const sc::Error*>(&e))session_error=*failure;
+                        fatal = !session_used || session_device_touched; // CPU control failures leave the device intact
                     }
                     if (!fatal) {
                         try {  // quiescent before the answer: Engram reads and every queued copy / write-back retired
@@ -2744,8 +3322,13 @@ int main(int argc, char** argv) {
                 const double wall_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_req).count();
                 std::ostringstream os;
                 os << "{\"name\":" << rs::json_str(*name) << ",\"rc\":" << rc << ",\"load_id\":" << load_id << ",\"served\":" << served
-                   << ",\"wall_s\":" << wall_s << ",\"failures\":" << failures << ",\"fatal\":" << (fatal ? "true" : "false")
-                   << ",\"quit\":" << (quit ? "true" : "false") << ",\"json\":" << rs::json_str(json_out) << ",\"error\":" << rs::json_str(error) << "}";
+                   << (session_used ? ",\"session_result\":"+session_request->session_result : std::string{}) << ",\"wall_s\":" << wall_s << ",\"failures\":" << failures << ",\"fatal\":" << (fatal ? "true" : "false")
+                   << ",\"quit\":" << (quit ? "true" : "false") << ",\"json\":" << rs::json_str(json_out);
+                if(session_attempt&&!error.empty()) {
+                    const auto failure=session_used?session_error.value_or(sc::protocol_error(error)):sc::Error("invalid_request",400,error);
+                    os<<",\"error\":{\"code\":"<<rs::json_str(failure.code)
+                      <<",\"message\":"<<rs::json_str(error)<<"},\"status\":"<<failure.status<<"}";
+                } else os<<",\"error\":"<<rs::json_str(error)<<"}";
                 if (js.is_open()) js.flush();
                 if (tl.is_open()) tl.flush();
                 if (trace_out.is_open()) trace_out.flush();
