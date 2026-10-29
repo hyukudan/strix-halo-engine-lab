@@ -6,6 +6,9 @@
 #include <type_traits>
 
 namespace strix::glm::spec {
+inline constexpr std::uint32_t kEligibilityMerge = 0x53504543U;
+inline constexpr std::uint32_t kConfigurationMismatchMerge = 0x53504544U;
+
 
 struct MergeRow {
     float value = 0;

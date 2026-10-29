@@ -1424,6 +1424,17 @@
   },
   {
     "engine": "glm",
+    "name": "Memory-admitted prefill chunk rows",
+    "flag_or_env": "--max-rows; STRIX_GLM_MAX_ROWS_AUTO",
+    "default": "8192 for two-rank decode prompt prefill when both ranks fit, otherwise 4096; reference prefill and no-handshake harnesses keep 4096",
+    "exact": "Measured 8192-row chunks produce the same logits and tokens as 4096 on the exact prefill route; chunk size preserves its arithmetic.",
+    "gain": "Chunked-prefill route at 8192 rows: 8K TTFT -4 %; 32K 116.3 -> 109.9 s (-5.5 %); about 7.3 GiB additional GPU memory per node; --pf-ttft requires explicit --max-rows 8192 to measure this",
+    "preconditions": "Omitted --max-rows outside baseline. The 8192 default applies to prompt prefill in two-rank decode runs, including production decode with MTP self-speculation and plain chunked prefill inside --decode runs, when memory allows. Reference prefill (--prefill ref, automatic prefill under r1b-all or --idcheck with decode) keeps 4096 with source auto-4096-ref, without auto admission or a row-count agreement exchange. The calibrated load admission terms (physical plan, forward reserve, pinned staging, whole-tensor reads and bounce), RAM headroom after free CMA and CMA file pages, GTT headroom and margins, prefill path/workspace/install, communication growth and device-free guard must admit 8192. Retain the largest RAM margin of 8 GiB, load and prefill; otherwise choose 4096. Normal two-rank Comm decode reuses the existing eligibility exchange and OR vote: spare config bit for auto, negative row value for rank minimum; mixed auto/fixed refuses on both ranks. Fixed payload bytes, message count and tags are unchanged. After communication growth, a fresh admission check uses one auto-only minimum vote and shrinks both pools on a 4096 fallback. No common configuration exchange exists for prefill-only, reference gates or batch-only runs: Comm auto uses 4096 with source auto-4096-no-handshake, resolved independently from local flags before inspection or engine construction without a control exchange; --pf-ttft and gate harnesses keep 4096 unless --max-rows 8192 is explicit; fixed max_rows equality cannot be checked there without changing the protocol. External Xfer auto uses 4096 without any agreement exchange. Auto communication buffers start at 4096 and grow only after agreement on 8192, so fallback has off-switch capacity. Existing allocation guards protect against changing memory pressure. Inspection is host-independent; stderr reports headroom and final source.",
+    "off_switch": "STRIX_GLM_MAX_ROWS_AUTO=0 restores fixed 4096; --max-rows N keeps N; --baseline keeps 1024 unless explicitly overridden",
+    "doc_anchor": "docs/optimizations.md#glm-max-rows-auto"
+  },
+  {
+    "engine": "glm",
     "name": "Exact prefill MoE auto",
     "flag_or_env": "STRIX_GLM_PF_EXACTMOE_V",
     "default": "auto",
@@ -1481,7 +1492,7 @@
     "engine": "glm",
     "name": "Prefill chunk rows 4096",
     "flag_or_env": "--max-rows",
-    "default": "4096",
+    "default": "4096 fallback when the automatic 8192-row budget does not fit; STRIX_GLM_MAX_ROWS_AUTO=0 fixes 4096",
     "exact": "Logits equal to the reference prefill on both ranks at 1K/8K/32K.",
     "gain": "8K 32.1 s at 2048 to 30.1-30.8 s at 4096; 32K 136.7 to 128.4 s",
     "preconditions": "Exact chunked prefill.",
@@ -1572,7 +1583,7 @@
     "default": "fast path",
     "exact": "Identity-specific gates required; a baseline that changes arithmetic is not bitwise A/B.",
     "gain": "Workload-specific; see item evidence",
-    "preconditions": "R1/reference prefill/MTP/comm and 15 env off values; fast MoE retained; explicit wins.",
+    "preconditions": "R1/reference prefill/MTP/comm and 21 env off values; fast MoE retained; explicit wins.",
     "off_switch": "--baseline / STRIX_GLM_BASELINE=1",
     "doc_anchor": "docs/optimizations.md#glm-identity"
   },

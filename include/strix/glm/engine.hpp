@@ -18,6 +18,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -31,6 +32,7 @@ class Communicator;
 }
 
 namespace strix::glm::engine {
+namespace mem { struct LoadAdmission; }
 
 // ---------------------------------------------------------------- weights handed to the seams (device memory)
 // EXL3 linear in two forms: a prepared strix-trellis handle (for strix_gemv / strix_gemm, the Tier B reference) and
@@ -260,6 +262,8 @@ struct Options {
     std::uint32_t rank = 0, world = 2;   // world 1 = one node (all heads / full I / full vocab)
     std::uint32_t slots = 1;
     std::uint64_t capacity = 8192;       // positions per slot (multiple of 4)
+    bool auto_rows = false;             // recheck admission after communication growth, before weights
+    unsigned exchange_rows = 0;         // 0 uses max_rows; startup may grow Comm buffers after selection
     std::uint32_t max_rows = 1024;       // rows per forward call (prefill chunk)
     std::uint32_t layers = 45;           // first `layers` main layers only (G3 uses 6); the head needs all 45
     bool mtp = true;                     // load layer 45 (MTP) + its DSA state
@@ -294,7 +298,10 @@ public:
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
 
-    LoadReport load();
+    // Optional startup selector runs after calibration/planning, before load admission or weight/row allocation.
+    // Receives the calibrated load terms and headroom; may reduce max_rows, causing a fresh plan.
+    // The caller must coordinate the result across ranks. Comm row buffers grow only after selection.
+    LoadReport load(const std::function<unsigned(const mem::LoadAdmission&)>& select_max_rows = {});
     // Positions [pos0, pos0 + n) of `slot`; returns the greedy next token after the last row (both ranks).
     // Default kR1b runs all prompt forwards in R1, restoring R1b on return or exception.
     // kR1bAll requires the reference path and runs prompts in R1b; kR1 uses R1 throughout.

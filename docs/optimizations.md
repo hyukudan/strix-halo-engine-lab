@@ -20,7 +20,7 @@ qualification; a host-only publication build cannot establish new device exactne
 | DeepSeek pair | `STRIX_DS41_BASELINE=1` | `--print-effective-config` | Stop production pack/draft/argv injection and switch the nine recent code defaults off unless explicitly set; older kernel defaults remain |
 | DeepSeek RTX | `--baseline` / `STRIX_DS41_RTX_BASELINE=1` | `--print-config` | CLI baseline applies at its argument position; later flags win; env baseline applies before argv |
 | MiniMax | `STRIX_MM_BASELINE=1` | `--print-effective-config` | All 22 resolver items use their off values; explicit environment wins; older built-in routes remain |
-| GLM | `--baseline` / `STRIX_GLM_BASELINE=1` | `--print-effective-config` | R1, reference prefill, MTP loaded, comm decode exchange and 15 env off values; explicit overrides win; fast MoE retained for capacity |
+| GLM | `--baseline` / `STRIX_GLM_BASELINE=1` | `--print-effective-config` | R1, reference prefill, MTP loaded, comm decode exchange and 21 env off values; explicit overrides win; fast MoE retained for capacity |
 
 Use a fresh process for startup-cached settings, and the same settings on both ranks where the protocol requires it.
 For A/B, change one off switch at a time, first compare complete token IDs and logits/state digests, then compare
@@ -1950,7 +1950,7 @@ Compute host transport CRC using parallel workers while retaining integrity chec
 - **Exactness evidence:** Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_DIST_CRC_PARALLEL=0
 - **Measured gain:** hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16
-- **Implementation / evidence:** [16-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [22-item resolver](../apps/glm_rank_defaults.hpp)
 
 <a id="glm-hp-crc-overlap"></a>
 
@@ -1966,7 +1966,7 @@ Overlap host CRC work with exchange transfers.
 - **Exactness evidence:** Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_DIST_HOST_CRC_OVERLAP=0
 - **Measured gain:** hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16
-- **Implementation / evidence:** [16-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [22-item resolver](../apps/glm_rank_defaults.hpp)
 
 <a id="glm-hp-chunk-bytes"></a>
 
@@ -1982,7 +1982,7 @@ Split host exchange payloads into 1 MiB chunks.
 - **Exactness evidence:** Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_DIST_HOST_CHUNK_BYTES=0
 - **Measured gain:** hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16
-- **Implementation / evidence:** [16-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [22-item resolver](../apps/glm_rank_defaults.hpp)
 
 <a id="glm-hsa-no-fragment-allocator"></a>
 
@@ -1998,7 +1998,7 @@ Disable the HSA fragment allocator so production allocation granules fit GTT.
 - **Exactness evidence:** Measurement: production decode and prefill configuration; allocator granules fit GTT; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** HSA_DISABLE_FRAGMENT_ALLOCATOR=0
 - **Measured gain:** production decode and prefill configuration; allocator granules fit GTT
-- **Implementation / evidence:** [16-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [22-item resolver](../apps/glm_rank_defaults.hpp)
 
 <a id="glm-r1b-dense-auto"></a>
 
@@ -2014,7 +2014,7 @@ Select dense variant 7 within the R1b generation identity.
 - **Exactness evidence:** Measurement: R1b-fast kernels -7.8 % R1 / -5.4 % R8, same tokens; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_R1B_DENSE=2
 - **Measured gain:** R1b-fast kernels -7.8 % R1 / -5.4 % R8, same tokens
-- **Implementation / evidence:** [16-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [22-item resolver](../apps/glm_rank_defaults.hpp)
 
 <a id="glm-r1b-hc-v4"></a>
 
@@ -2030,7 +2030,7 @@ Use HC variant 4 within the R1b generation identity.
 - **Exactness evidence:** Measurement: with r1b-dense-auto, R1b-fast kernels -7.8 % R1 / -5.4 % R8, same tokens; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_R1B_HC=1
 - **Measured gain:** with r1b-dense-auto, R1b-fast kernels -7.8 % R1 / -5.4 % R8, same tokens
-- **Implementation / evidence:** [16-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [22-item resolver](../apps/glm_rank_defaults.hpp)
 
 <a id="glm-hc-pre-v7"></a>
 
@@ -2046,7 +2046,7 @@ Use the qualified v7 pre-HC reduction/normalization schedule.
 - **Exactness evidence:** Measurement: hc_pre 77.4-77.9 vs 102.1-102.8 us, gates 0-7 bitwise; tokens match reference; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_HC_PRE_V=4
 - **Measured gain:** hc_pre 77.4-77.9 vs 102.1-102.8 us, gates 0-7 bitwise; tokens match reference
-- **Implementation / evidence:** [16-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [22-item resolver](../apps/glm_rank_defaults.hpp)
 
 <a id="glm-post-exchange-fast"></a>
 
@@ -2062,7 +2062,7 @@ Consume post-exchange values through fused fast kernels rather than separate ref
 - **Exactness evidence:** Measurement: fast post-exchange consumers match STRIX_GLM_POST=ref and reference (real model, 6 layers); compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_POST=ref
 - **Measured gain:** fast post-exchange consumers match STRIX_GLM_POST=ref and reference (real model, 6 layers)
-- **Implementation / evidence:** [16-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [22-item resolver](../apps/glm_rank_defaults.hpp)
 
 <a id="glm-attn-fast"></a>
 
@@ -2078,7 +2078,7 @@ Install FastAttn at the attention seam, preserving the selected identity and sta
 - **Exactness evidence:** Measurement: FastAttn matches STRIX_GLM_ATTN=ref (G3), Tier A 12-40x; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_ATTN=ref
 - **Measured gain:** FastAttn matches STRIX_GLM_ATTN=ref (G3), Tier A 12-40x
-- **Implementation / evidence:** [16-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [22-item resolver](../apps/glm_rank_defaults.hpp)
 
 <a id="glm-attn-tierb-fused"></a>
 
@@ -2094,7 +2094,7 @@ Use fused Tier-B attention projections from raw weights instead of prepared libr
 - **Exactness evidence:** Measurement: fused Tier B -2.46 ms/token vs strix_gemv, tokens match reference; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_TIERB=lib
 - **Measured gain:** fused Tier B -2.46 ms/token vs strix_gemv, tokens match reference
-- **Implementation / evidence:** [16-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [22-item resolver](../apps/glm_rank_defaults.hpp)
 
 <a id="glm-xfer-boundary-fused"></a>
 
@@ -2110,7 +2110,7 @@ Fuse exchange reduction and its dependent boundary work.
 - **Exactness evidence:** Measurement: Xfer reduce +1.41 -> fused boundary ~+1.10 ms/token over local, bitwise; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_BOUNDARY=0
 - **Measured gain:** Xfer reduce +1.41 -> fused boundary ~+1.10 ms/token over local, bitwise
-- **Implementation / evidence:** [16-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [22-item resolver](../apps/glm_rank_defaults.hpp)
 
 <a id="glm-moe-fast"></a>
 
@@ -2126,7 +2126,48 @@ Use raw-only expert storage and the bitwise FastMoe implementation so the TP2 mo
 - **Exactness evidence:** Measurement: FastMoe matches DefaultMoe bitwise (real TP2 slices); raw-only experts (fits GTT); compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_MOE=ref (excluded from master baseline for capacity)
 - **Measured gain:** FastMoe matches DefaultMoe bitwise (real TP2 slices); raw-only experts (fits GTT)
-- **Implementation / evidence:** [16-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [22-item resolver](../apps/glm_rank_defaults.hpp)
+
+<a id="glm-max-rows-auto"></a>
+### Memory-admitted prefill chunk rows
+
+**Engine:** `glm`. **Control:** `--max-rows`, `STRIX_GLM_MAX_ROWS_AUTO`. **Default:** automatic 8192 or 4096.
+
+- **Routes:** The 8192 default, when both ranks admit it, applies to prompt prefill in two-rank decode
+  runs: production decode with MTP self-speculation and plain chunked prefill inside `--decode` runs.
+  `--pf-ttft` and gate harnesses keep 4096 unless `--max-rows 8192` is given explicitly.
+  Reference prefill (`--prefill ref`, automatic prefill under `r1b-all` or `--idcheck` with decode)
+  uses fixed 4096 with source `auto-4096-ref`, without auto admission or a row-count agreement exchange.
+- **Automatic selection:** After load planning and allocator calibration, before weight and row-buffer allocation,
+  the app checks the same physical load, first-forward reserve, pinned staging, whole-tensor read and bounce
+  terms as load admission. Headroom subtracts free CMA and file pages in CMA; the GTT limit and its margin
+  also apply. Prefill path, workspace, install owners and communication growth are included, along with the
+  device-free guard. RAM headroom retains the largest of 8 GiB, the load margin and the prefill margin.
+  Missing telemetry or a refused 8192 candidate selects 4096 before rank agreement.
+- **Rank agreement:** Normal two-rank Comm decode reuses the existing eligibility exchange and mismatch vote.
+  A spare configuration bit carries auto mode; only auto row values are negated so the merge selects the
+  minimum proposed count. Both auto ranks use 8192 only if both admit it. Mixed auto/fixed modes refuse on
+  both ranks before any forward. Fixed modes preserve the existing payload bytes, message count and tags. After communication growth,
+  a fresh admission check uses one auto-only minimum vote; a refusal at 8192 selects 4096 on both ranks.
+- **Protocol limitation:** Prefill-only, reference gates and batch-only runs have no common startup configuration
+  exchange. Two-rank Comm auto uses 4096 with source `auto-4096-no-handshake`, resolved independently
+  from local flags before engine construction, without a control exchange. Explicit `--max-rows` must match on both ranks.
+  Fixed-mode row mismatches in these runs cannot be checked at startup without changing their wire protocol;
+  only normal decode has the existing equality check. External `--xch xfer` auto resolves to 4096 with source
+  `auto-4096-xfer` and performs no row-count or host configuration exchange.
+- **Communication memory:** Auto constructs the Communicator and CommExchange with 4096-row capacity and grows
+  them only after agreement on 8192. A 4096 fallback shrinks both pools to exactly the off-switch communication capacity.
+- **Preconditions:** Omitted `--max-rows`, outside baseline, with `STRIX_GLM_MAX_ROWS_AUTO` unset or enabled.
+  Explicit row counts retain their value; baseline retains 1024 unless explicitly overridden. Existing load and
+  prefill allocation guards still apply, including protection against memory pressure changing during load.
+- **Inspection:** `--print-effective-config` reports the host-independent candidate and startup policy,
+  without host measurements. Startup stderr logs admission headroom and the final `max-rows` value and source:
+  `auto-8192`, `auto-4096-memory`, `auto-4096-no-handshake`, `auto-4096-ref`, `auto-4096-xfer`, `explicit` or `baseline`.
+- **Exactness evidence:** Measured 8192-row chunks produce the same logits and tokens as 4096 on the exact
+  prefill route; chunk size preserves its arithmetic.
+- **Off switch:** `STRIX_GLM_MAX_ROWS_AUTO=0` restores fixed 4096; `--max-rows N` fixes an explicit size.
+- **Measured gain:** Chunked-prefill route at 8192 rows: TTFT -4 % at 8K; 32K 116.3 to 109.9 s (-5.5 %);
+  about 7.3 GiB additional GPU memory per node. Measuring this with `--pf-ttft` requires explicit `--max-rows 8192`.
 
 <a id="glm-pf-exact-moe-auto"></a>
 <a id="glm-pf-exact-moe-v3"></a>
@@ -2175,7 +2216,7 @@ Use the v5 exact MLA output projection schedule.
 - **Exactness evidence:** Measurement: MLA o-bar v5 exact, 2.9x; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_PF_OBAR=2
 - **Measured gain:** MLA o-bar v5 exact, 2.9x
-- **Implementation / evidence:** [16-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [22-item resolver](../apps/glm_rank_defaults.hpp)
 
 <a id="glm-pf-scores-v3"></a>
 
@@ -2210,12 +2251,13 @@ Overlap two whole layers of the chunked prefill, and start the host exchange asy
 
 ### Prefill chunk rows 4096
 
-**Engine:** `glm`. **Control:** `--max-rows`. **Default:** 4096 (baseline 1024).
+**Engine:** `glm`. **Control:** `--max-rows`. **Default:** 4096 fallback when the automatic 8192-row budget does not fit (baseline 1024).
 
 Process prefill in 4096-row chunks.
 
 - **Preconditions:** Exact chunked prefill.
-- **Automatic selection:** Default 4096; --max-rows wins; --baseline uses 1024.
+- **Automatic selection:** See [memory-admitted chunk rows](#glm-max-rows-auto); `--max-rows 4096` or
+  `STRIX_GLM_MAX_ROWS_AUTO=0` fixes this size; `--baseline` uses 1024.
 - **Fallback notice:** None.
 - **Exactness evidence:** Logits equal to the reference prefill on both ranks at 1K/8K/32K.
 - **Off switch:** --max-rows 2048 / 1024, or --baseline
@@ -2255,7 +2297,7 @@ Use the v2 exact prefill indexer kernel.
 - **Exactness evidence:** Measurement: indexer v2 -41 %; compare complete same-identity tokens plus logits/state digests. R1b items are not a claim of R1 equality.
 - **Off switch:** STRIX_GLM_PF_IDX=1
 - **Measured gain:** indexer v2 -41 %
-- **Implementation / evidence:** [16-item resolver](../apps/glm_rank_defaults.hpp)
+- **Implementation / evidence:** [22-item resolver](../apps/glm_rank_defaults.hpp)
 
 ## Platform (kernel)
 

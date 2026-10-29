@@ -40,6 +40,13 @@ struct Snapshot {
     std::uint64_t rss = 0, rss_anon = 0, rss_file = 0, rss_shmem = 0, hwm = 0;
     bool gpu = false;
     std::uint64_t gtt_total = 0, gtt_used = 0, vram_total = 0, vram_used = 0;
+    // Startup GPU budget on UMA: free CMA cannot back GTT pages. Missing CMA telemetry uses the conservative
+    // zone total; without either source the measurement is unavailable (0). The load guard below is stricter.
+    std::uint64_t usable_gpu_memory() const {
+        if (!meminfo_ok || (!cma_free_ok && !zoneinfo_ok)) return 0;
+        const auto cfree = cma_free_ok ? cma_free : cma_total;
+        return mem_available > cfree ? mem_available - cfree : 0;
+    }
     // RAM that can still back unmovable pages (TTM / GTT pool pages are never __GFP_MOVABLE): MemAvailable minus the free
     // CMA pageblocks, minus the reclaimable file pages that may sit inside CMA pageblocks (reclaiming them frees CMA only;
     // without the zone layout all file pages are assumed to sit there). 0 without /proc/meminfo.
@@ -49,8 +56,8 @@ struct Snapshot {
         if (!meminfo_ok || (!cma_free_ok && !zoneinfo_ok)) return 0;  // free CMA unknowable: nothing is trusted
         const std::uint64_t cfree = cma_free_ok ? cma_free : zoneinfo_ok ? cma_total : 0;
         const std::uint64_t cma_used = !zoneinfo_ok ? file_lru : cma_total > cfree ? cma_total - cfree : 0;
-        const std::uint64_t off = cfree + std::min(cma_used, file_lru);
-        return mem_available > off ? mem_available - off : 0;
+        const std::uint64_t usable = usable_gpu_memory(), off = std::min(cma_used, file_lru);
+        return usable > off ? usable - off : 0;
     }
     std::uint64_t gtt_headroom() const { return gtt_total > gtt_used ? gtt_total - gtt_used : 0; }
     // Device memory in use as the GPU driver counts it: GTT + the VRAM carve-out (hipMalloc may land in either; the
@@ -99,6 +106,23 @@ struct Margins {
 void admit(const std::string& what, const std::vector<Term>& terms, const Snapshot& s, const Margins& m);
 std::string describe(const Snapshot& s);
 
+// Same inequalities as admit, using subtraction so an oversized term cannot wrap into a fit.
+inline bool fits(const std::vector<Term>& terms, const Snapshot& s, const Margins& m,
+                 std::uint64_t device_free = std::numeric_limits<std::uint64_t>::max()) {
+    if (!s.meminfo_ok) return false;
+    auto ram = s.ram_headroom(), gtt = s.gtt_headroom();
+    auto take = [](std::uint64_t& left, std::uint64_t n) {
+        if (n > left) return false;
+        left -= n;
+        return true;
+    };
+    if (!take(ram, m.ram) || !take(device_free, m.ram) || (s.gpu && !take(gtt, m.gtt))) return false;
+    for (const auto& t : terms)
+        if (!take(ram, t.gtt) || !take(ram, t.host) || !take(device_free, t.gtt) ||
+            (s.gpu && !take(gtt, t.gtt))) return false;
+    return true;
+}
+
 // Physical cost of one device allocation: round_up(bytes, granule), or bytes * ratio when no granule explains the
 // calibration (then rounded to 4 KiB).
 struct AllocModel {
@@ -108,6 +132,17 @@ struct AllocModel {
     std::uint64_t physical(std::uint64_t bytes) const;
     std::string str() const;
 };
+// One calibrated candidate, shared by the startup selector and the load guard.
+struct LoadAdmission {
+    std::vector<Term> terms;
+    Snapshot snapshot;
+    Margins margins;
+    std::uint64_t prefill_install = 0;
+    std::uint64_t device_free = 0;
+    bool recheck = false;
+    AllocModel model;
+};
+
 // From a calibration: `measured` bytes per allocation of `size` (delta of gtt_used over K touched allocations / K).
 // Picks the smallest granule in {4 KiB, 64 KiB, 2 MiB} whose rounding covers `measured` (0.5 % noise allowed); above
 // the 2 MiB rounding it switches to a ratio model; below 0.9 x size the measurement is not trusted (2 MiB granule).

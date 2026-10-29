@@ -1706,7 +1706,8 @@ public:
         }
         if (failed.load(std::memory_order_acquire)) throw std::runtime_error("dist pipeline: a stage failed");
     }
-    Pipeline(std::size_t capacity, std::size_t size, bool minimax_compat) : chunk(size) {
+    bool legacy = false;
+    Pipeline(std::size_t capacity, std::size_t size, bool compatible) : chunk(size), legacy(compatible) {
         const auto count = (capacity - 1U) / chunk + 1U;
         const auto allocation = capacity + count * sizeof(Trailer);
         try {
@@ -1718,7 +1719,7 @@ public:
             check(hipEventCreateWithFlags(&consumer, hipEventDisableTiming), "pipeline consumer");
             ready.resize(count, nullptr);
             for (auto& e : ready) check(hipEventCreateWithFlags(&e, hipEventDisableTiming), "pipeline ready");
-            if (const char* v = std::getenv("STRIX_DIST_HOST_CRC_OVERLAP"); minimax_compat ? (v && std::string(v) == "1") : (!v || std::string(v) != "0")) {  // default on
+            if (const char* v = std::getenv("STRIX_DIST_HOST_CRC_OVERLAP"); compatible ? (v && std::string(v) == "1") : (!v || std::string(v) != "0")) {  // default on
                 crc_send = std::make_unique<Worker>(); crc_receive = std::make_unique<Worker>();
                 crc_send->name("u4-crctx"); crc_receive->name("u4-crcrx");
             }
@@ -1847,6 +1848,31 @@ Communicator::Communicator(Group group, std::unique_ptr<Transport> transport, st
     direct_ = std::move(direct);
     if (direct_) configure_routes();
     if (direct_ && trace_) direct_->set_trace(trace_);
+}
+
+void Communicator::resize_bytes(std::size_t bytes) {
+    if (bytes == max_bytes_) return;
+    if (bytes < staged_ready_bytes_) throw std::invalid_argument("dist resize below staged readiness capacity");
+    if (started_ || direct_started_ || staged_prepared_ || staged_receive_held_)
+        throw std::logic_error("dist reserve while an exchange is in flight");
+    drain_tail();
+    check(hipDeviceSynchronize(), "reserve sync");
+    const auto old_bytes = max_bytes_;
+    const auto chunk = pipeline_ ? pipeline_->chunk : 0;
+    const bool legacy = pipeline_ && pipeline_->legacy;
+    pipeline_.reset();
+    check(hipHostFree(send_host_), "release send capacity");
+    send_host_ = nullptr;
+    check(hipHostFree(receive_host_), "release receive capacity");
+    receive_host_ = nullptr;
+    send_device_alias_ = nullptr;
+    const unsigned flags = fused_ ? hipHostMallocCoherent : hipHostMallocDefault;
+    check(hipHostMalloc(reinterpret_cast<void**>(&send_host_), bytes + sizeof(Trailer), flags), "grow pinned send buffer");
+    check(hipHostMalloc(reinterpret_cast<void**>(&receive_host_), bytes + sizeof(Trailer), flags), "grow pinned receive buffer");
+    if (d2h_kernel_bytes_) check(hipHostGetDevicePointer(&send_device_alias_, send_host_, 0), "grow send alias");
+    if (chunk) pipeline_ = std::make_unique<Pipeline>(bytes, chunk, legacy);
+    max_bytes_ = bytes;
+    for (auto& r : routes_) if (!r.direct && r.up_to == old_bytes) r.up_to = bytes;
 }
 
 const Route& Communicator::route(std::size_t bytes) const {
