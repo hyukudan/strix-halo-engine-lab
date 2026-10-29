@@ -1444,8 +1444,8 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
     if (o.cone) o.cone = o.first_layer == 0U && o.end_layer == c.num_hidden_layers;
     validate_bounded_replay(o.replay_rows, o.cone, o.first_layer, o.end_layer,
                             o.head_rows, o.draft_rows, o.fast_dense, o.fast_moe);
-    m.reader = std::make_unique<FileReader>(gguf, o.engram_direct, o.io_threads);
-    m.engram_reader = std::make_unique<FileReader>(gguf, o.engram_direct, o.engram_threads);
+    m.reader = std::make_unique<FileReader>(gguf, o.engram_direct, o.io_threads, o.weight_read);
+    m.engram_reader = std::make_unique<FileReader>(gguf, o.engram_direct, o.engram_threads, o.weight_read);
     m.model = std::make_unique<deepseek41::TargetModel>(deepseek41::validate_target(m.file->info()));
     m.plan = ds41::attn::plan_from_contract(m.model->layers);
     m.split = c.n_routed_experts / 2U;
@@ -1906,6 +1906,25 @@ std::string CudaPrefill::decode_residency_report() const { return impl_->last_re
 const std::uint8_t* CudaPrefill::device_tensor(const std::string& name) { return impl_->file->device(name); }
 Q8Tiled CudaPrefill::head_tiled() const noexcept { return impl_->core ? impl_->core->head_tiled() : Q8Tiled{}; }
 
+std::string CudaPrefill::weight_io_json() const {
+    const auto& m = *impl_;
+    // The expert and Engram openers share options and a session. Decode always opens direct: --buffered gives it
+    // a separate session whose counters must also be reported, without counting shared sessions twice.
+    const auto* reader = m.reader->multi() ? m.reader.get() : m.engram_reader->multi() ? m.engram_reader.get() : nullptr;
+    const auto* decode = m.dec && m.dec->reader && m.dec->reader->multi() ? m.dec->reader.get() : nullptr;
+    if (!reader && !decode) return "null";
+    std::string json = "{\"requested_verify_mode\":\"" + m.o.weight_read.weight_verify + "\",\"session\":" +
+                       (reader ? reader : decode)->multi_stats_json();
+    if (reader && decode && reader->direct() != decode->direct())
+        json += ",\"decode_session\":" + decode->multi_stats_json();
+    return json + "}";
+}
+
+std::string CudaPrefill::weight_io_fields() const {
+    const auto json = weight_io_json();
+    return json == "null" ? std::string() : ",\"weight_io\":" + json;
+}
+
 std::string CudaPrefill::describe() const {
     const auto& m = *impl_;
     std::ostringstream s;
@@ -1997,6 +2016,7 @@ std::string CudaPrefill::describe() const {
       << ",\"dense_gib\":" << m.dense_gib << ",\"used_before_experts_gib\":" << m.used_before_experts_gib << ",\"free_at_plan_gib\":" << m.free_at_plan_gib
       << ",\"device_expert_gib\":" << m.expert_budget_gib << ",\"host_expert_gib\":" << m.o.host_expert_gib << "}";
     s << ",\"engram_upload\":\"" << m.o.engram_upload << "\",\"engram_cache_mib\":" << m.o.engram_cache_mib;
+    s << weight_io_fields();
     s << ",\"gpu\":" << to_json(m.gpu) << ",\"code\":\"sm_" << m.dev.binary_version << "\",\"load_s\":" << m.load_seconds << "}";
     return s.str();
 }
@@ -4321,7 +4341,7 @@ CudaStepResult CudaPrefill::step(std::span<const std::uint32_t> tokens, const Cu
                 std::uint64_t lb = 0;
                 for (const auto& e : m.extents) lb = std::max(lb, e.total());
                 D.slot = std::make_unique<DeviceBuffer<std::uint8_t>>(lb);
-                D.reader = std::make_unique<FileReader>(m.file_path, true, 8);
+                D.reader = std::make_unique<FileReader>(m.file_path, true, 8, o.weight_read);
                 D.staging = std::make_unique<PinnedBuffer>((std::size_t{8} << 20) + 2U * FileReader::alignment);
             }
             route_ids_host.resize(std::size_t{R} * K);

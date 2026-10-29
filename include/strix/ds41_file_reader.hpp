@@ -14,6 +14,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "strix/ds41_weight_read_options.hpp"
+#ifdef STRIX_HAVE_TIERSTREAM_MFILE
+#include "strix_stream/ss.h"
+#endif
 
 namespace strix::ds41 {
 
@@ -23,6 +27,7 @@ public:
     // direct: unbuffered reads (offsets, sizes and destinations aligned to `alignment`; read_range handles unaligned
     // requests through a bounce page).
     explicit FileReader(const std::filesystem::path& path, bool direct = true, unsigned threads = 8);
+    FileReader(const std::filesystem::path& path, bool direct, unsigned threads, const WeightReadOptions& options);
     ~FileReader();
     FileReader(const FileReader&) = delete;
     FileReader& operator=(const FileReader&) = delete;
@@ -32,7 +37,8 @@ public:
     static constexpr std::size_t alignment = 4096;
 
     // Bytes [offset, offset + bytes) into dst, split into pieces of `piece` bytes read by the pool in parallel; blocks
-    // until every piece is in. Unaligned head / tail pieces go through a bounce page when direct.
+    // until every piece is in. Multi mode sends the aligned middle in one call for the session to split by drive.
+    // Unaligned head / tail pieces go through a bounce page when direct or multi.
     void read_range(std::uint64_t offset, std::size_t bytes, void* dst, std::size_t piece = std::size_t{8} << 20);
 
     // Gather of `count` records of `record` bytes at file offsets offsets[i] into out + i * record (records do not
@@ -55,6 +61,11 @@ public:
         std::uint64_t records = 0, pages = 0, page_hits = 0;  // read_records: distinct records, distinct pages, cached
     };
     [[nodiscard]] Stats stats() const;
+    [[nodiscard]] bool multi() const noexcept;
+    [[nodiscard]] std::string multi_stats_json() const;
+#ifdef STRIX_HAVE_TIERSTREAM_MFILE
+    [[nodiscard]] ss_mfile_counters multi_counters() const;
+#endif
 
 private:
     void run_parallel(std::size_t jobs, const std::function<void(std::size_t job, std::uint8_t* page)>& body);
@@ -65,6 +76,15 @@ private:
     std::filesystem::path path_;
     bool direct_ = true;
     std::uint64_t size_ = 0;
+#ifdef STRIX_HAVE_TIERSTREAM_MFILE
+    ss_mfile* mfile_ = nullptr;
+    // multi mode: the covering read of a range whose destination is not aligned like its offset (grow-only)
+    std::uint8_t* bounce_ = nullptr;
+    std::size_t bounce_bytes_ = 0;
+    std::vector<ss_mfile_io> queued_ios_;
+    void read_range_multi(std::uint64_t offset, std::size_t bytes, std::uint8_t* out);
+    std::uint8_t* bounce(std::size_t bytes);
+#endif
 #ifdef _WIN32
     void* handle_ = nullptr;
 #else

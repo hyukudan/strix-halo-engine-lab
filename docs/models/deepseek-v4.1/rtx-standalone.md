@@ -103,6 +103,9 @@ options before applying their overrides. `--reset-cache warm` is the default;
 Model, arena, drafter pruning and decode kernel choices require a new worker.
 A request containing only `--quit` stops it. This is a file-queue worker.
 
+The model can also be read from two NVMe drives at once (a verified partial stripe on the second drive):
+[rtx-two-drives.md](rtx-two-drives.md).
+
 ## Optimizations (default ON) and off switches
 
 These options change scheduling, placement or draft proposals. Committed

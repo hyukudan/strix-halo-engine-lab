@@ -113,6 +113,15 @@ struct TierSite::Impl {
         ts_check(ts_plan_from_tiers(desc, &b, tiers.data(), tiers.size(), &plan), "plan");
         ss_options so;
         ts_options_defaults(&so);
+#ifdef STRIX_HAVE_TIERSTREAM_MFILE
+        if (o.weight_read.has_secondary(o.model)) {
+            so.weight_dirs = o.weight_read.weight_dirs.c_str();
+            so.drive_readers = o.weight_read.drive_readers;
+            so.weight_verify = o.weight_read.weight_verify == "always" ? SS_MFILE_VERIFY_ALWAYS : SS_MFILE_VERIFY_CACHED;
+        }
+#else
+        o.weight_read.require_supported(o.model);
+#endif
         so.backend = SS_BACKEND_CUDA;
 #if defined(SS_DG_SET_POLICY) && defined(SS_DG_AUTO_EVICT)
         so.policy = SS_POLICY_SCORED_AUTO;  // provision public score tables once; requests reset / select the policy
