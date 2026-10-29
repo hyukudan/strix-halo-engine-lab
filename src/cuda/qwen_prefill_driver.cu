@@ -348,6 +348,8 @@ void Prefill::Impl::allocate() {
 Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
     auto& m = *impl_;
     m.cfg = config;
+    validate_blocks(config.block_schedule);
+    (void)plan_blocks(1, config.block_schedule, config.tail_large, config.final_block_rows);
     ck(cudaSetDevice(config.device), "set device");
     ck(cudaStreamCreateWithFlags(&m.stream, cudaStreamNonBlocking), "stream");
     if (config.release_by_layer) {
@@ -531,10 +533,39 @@ void Prefill::Impl::run_block(const std::vector<std::uint32_t>& tokens, std::uin
     ck(cudaGetLastError(), "block launches");
 }
 
-Timing Prefill::run(const std::vector<std::uint32_t>& tokens, std::uint64_t position, const Sink& sink) {
+Timing Prefill::run(const std::vector<std::uint32_t>& tokens, std::uint64_t position, const Sink& sink, const RunOptions& options) {
     auto& m = *impl_;
     if (position > tokens.size() || position == 0) throw std::invalid_argument("prefill position out of range");
     if (position > m.cfg.max_positions) throw std::invalid_argument("prompt longer than max_positions");
+    const auto plan = plan_blocks(position, m.cfg.block_schedule,
+        options.tail_large.value_or(m.cfg.tail_large),
+        options.final_block_rows.value_or(m.cfg.final_block_rows));
+    auto* trace = options.trace;
+    // Stream callbacks timestamp observed completion without host synchronization or CUDA API calls.
+    // They exist only for traced requests and finish before run returns.
+    const auto mark_stream = [&](cudaStream_t stream, const char* stage, std::uint64_t id,
+                                 const std::string& name, std::uint64_t first, std::uint64_t rows, std::uint64_t bytes) {
+        if (!trace) return;
+        struct Mark { qwen_prefill_trace::Trace* trace; std::string stage, name; std::uint64_t id, first, rows, bytes; };
+        auto* mark = new Mark{trace, stage, name, id, first, rows, bytes};
+        const auto status = cudaLaunchHostFunc(stream, [](void* data) {
+            std::unique_ptr<Mark> p(static_cast<Mark*>(data));
+            try { p->trace->mark(p->stage, p->id, p->name, p->first, p->rows, p->bytes); }
+            catch (...) { p->trace->drop(); }
+        }, mark);
+        if (status != cudaSuccess) { delete mark; ck(status, "trace callback"); }
+    };
+    struct TraceDrain {
+        Impl& m; bool active;
+        ~TraceDrain() { if (active) { cudaStreamSynchronize(m.stream); if (m.copy_stream) cudaStreamSynchronize(m.copy_stream); } }
+    } drain{m, trace != nullptr};
+    const auto emit = [&](const Piece& p) {
+        if (!trace) { sink(p); return; }
+        trace->mark("piece", static_cast<std::uint64_t>(p.data-m.host)+1, p.component, p.first, p.count, p.bytes);
+        Piece copy = p;
+        copy.trace_id = static_cast<std::uint64_t>(p.data-m.host)+1;
+        sink(copy);
+    };
     const auto t0 = Clock::now();
     Timing timing;
     // fresh state
@@ -551,10 +582,21 @@ Timing Prefill::run(const std::vector<std::uint32_t>& tokens, std::uint64_t posi
     const std::uint8_t* held = nullptr;
     m.ngram[0] = m.ngram[1] = 0;
     while (p0 < position) {
-        const auto want = m.cfg.block_schedule[std::min(k, m.cfg.block_schedule.size() - 1)];
-        const auto rows = static_cast<std::uint32_t>(std::min<std::uint64_t>(want, position - p0));
+        const auto rows = plan[k];
+        mark_stream(m.stream, "block_start", k, {}, p0, rows, 0);
         const auto tb = Clock::now();
-        struct Pending { std::string name; std::uint64_t first, count; std::uint8_t* data; std::uint64_t bytes; bool fixed = false; };
+        const auto compute = [&] {
+            mark_stream(m.stream, "compute_start", k, {}, p0, rows, 0);
+            m.run_block(tokens, p0, rows);
+            mark_stream(m.stream, "compute_end", k, {}, p0, rows, 0);
+            if (m.mtp && p0+rows == position) {
+                const auto pairs = position-1-p0;
+                const auto row_bytes = m.cfg.release_by_layer ? 0 : std::uint64_t{rows}*27648;
+                const auto held_id = static_cast<std::uint64_t>(out-m.host)+row_bytes+pairs*2304+1;
+                mark_stream(m.stream, "gpu_ready", held_id, "mtp.held", 0, 0, kWide*2);
+            }
+        };
+        struct Pending { std::string name; std::uint64_t first, count; std::uint8_t* data; std::uint64_t bytes; bool fixed = false; const void* dev = nullptr; };
         std::vector<Pending> pend;
         const bool last_block = p0 + rows == position;
         if (m.cfg.release_by_layer) {
@@ -564,12 +606,9 @@ Timing Prefill::run(const std::vector<std::uint32_t>& tokens, std::uint64_t posi
             std::vector<std::vector<Pending>> per(kLayers);
             std::atomic<int> launched{-1};
             m.after_layer = [&](std::uint32_t l) {
-                ck(cudaEventRecord(m.layer_done[l], m.stream), "layer done");
-                ck(cudaStreamWaitEvent(m.copy_stream, m.layer_done[l], 0), "copy wait");
                 const auto copy = [&](const std::string& name, bool fixed_piece, std::uint64_t first, std::uint64_t count,
                                       const void* src, std::uint64_t bytes) {
-                    ck(cudaMemcpyAsync(out, src, bytes, cudaMemcpyDeviceToHost, m.copy_stream), "layer d2h");
-                    per[l].push_back({name, first, count, out, bytes, fixed_piece});
+                    per[l].push_back({name, first, count, out, bytes, fixed_piece, src});
                     out += bytes;
                 };
                 if (is_qsa(l)) {
@@ -584,6 +623,16 @@ Timing Prefill::run(const std::vector<std::uint32_t>& tokens, std::uint64_t posi
                     copy("gdn_convolution", true, g * cb, 0, m.gdn_conv + std::uint64_t{g} * gdn::kConvStateHalfs, cb);
                 }
                 if (l == 1 && last_block) copy("ple_convolution", true, 0, 0, m.ple_conv, 10240ULL * 9 * 2);
+                for (const auto& p : per[l])
+                    mark_stream(m.stream, "gpu_ready", static_cast<std::uint64_t>(p.data-m.host)+1,
+                        p.name, p.first, p.count, p.bytes);
+                ck(cudaEventRecord(m.layer_done[l], m.stream), "layer done");
+                ck(cudaStreamWaitEvent(m.copy_stream, m.layer_done[l], 0), "copy wait");
+                for (const auto& p : per[l]) {
+                    ck(cudaMemcpyAsync(p.data, p.dev, p.bytes, cudaMemcpyDeviceToHost, m.copy_stream), "layer d2h");
+                    mark_stream(m.copy_stream, "d2h_done", static_cast<std::uint64_t>(p.data-m.host)+1,
+                        p.name, p.first, p.count, p.bytes);
+                }
                 ck(cudaEventRecord(m.copy_done[l], m.copy_stream), "copy done");
                 launched.store(static_cast<int>(l), std::memory_order_release);
             };
@@ -594,12 +643,12 @@ Timing Prefill::run(const std::vector<std::uint32_t>& tokens, std::uint64_t posi
                         while (launched.load(std::memory_order_acquire) < static_cast<int>(l)) std::this_thread::yield();
                         if (launched.load(std::memory_order_acquire) >= static_cast<int>(kLayers)) return;  // aborted
                         ck(cudaEventSynchronize(m.copy_done[l]), "layer copy");
-                        for (const auto& p : per[l]) sink(Piece{p.fixed, p.name, p.first, p.count, p.data, p.bytes});
+                        for (const auto& p : per[l]) emit(Piece{p.fixed, p.name, p.first, p.count, p.data, p.bytes});
                     }
                 } catch (...) { emit_error = std::current_exception(); }
             });
             try {
-                m.run_block(tokens, p0, rows);
+                compute();
             } catch (...) {
                 launched.store(static_cast<int>(kLayers), std::memory_order_release);
                 emitter.join();
@@ -610,12 +659,26 @@ Timing Prefill::run(const std::vector<std::uint32_t>& tokens, std::uint64_t posi
             m.after_layer = nullptr;
             if (emit_error) std::rethrow_exception(emit_error);
         } else {
-        m.run_block(tokens, p0, rows);
+        compute();
         // the block's rows of every row component, D2H into the staging, then to the sink
+        if (trace) {
+            auto* dest = out;
+            for (std::uint32_t o = 0; o < 12; ++o) {
+                mark_stream(m.stream, "gpu_ready", static_cast<std::uint64_t>(dest-m.host)+1,
+                    "kv.L"+std::to_string(4*o+3), p0, rows, std::uint64_t{rows}*2048);
+                dest += std::uint64_t{rows}*2048;
+            }
+            for (std::uint32_t o = 0; o < 12; ++o) {
+                mark_stream(m.stream, "gpu_ready", static_cast<std::uint64_t>(dest-m.host)+1,
+                    "index.L"+std::to_string(4*o+3), p0, rows, std::uint64_t{rows}*256);
+                dest += std::uint64_t{rows}*256;
+            }
+        }
         for (std::uint32_t o = 0; o < 12; ++o) {
             const auto layer = std::to_string(4 * o + 3);
             const auto kb = std::uint64_t{rows} * 2048;
             ck(cudaMemcpyAsync(out, m.kv[o] + p0 * 1024, kb, cudaMemcpyDeviceToHost, m.stream), "kv d2h");
+            mark_stream(m.stream, "d2h_done", static_cast<std::uint64_t>(out-m.host)+1, {}, 0, 0, 0);
             pend.push_back({"kv.L" + layer, p0, rows, out, kb});
             out += kb;
         }
@@ -623,6 +686,7 @@ Timing Prefill::run(const std::vector<std::uint32_t>& tokens, std::uint64_t posi
             const auto layer = std::to_string(4 * o + 3);
             const auto ib = std::uint64_t{rows} * 256;
             ck(cudaMemcpyAsync(out, m.raw_index[o] + p0 * 128, ib, cudaMemcpyDeviceToHost, m.stream), "index d2h");
+            mark_stream(m.stream, "d2h_done", static_cast<std::uint64_t>(out-m.host)+1, {}, 0, 0, 0);
             pend.push_back({"index.L" + layer, p0, rows, out, ib});
             out += ib;
         }
@@ -648,36 +712,51 @@ Timing Prefill::run(const std::vector<std::uint32_t>& tokens, std::uint64_t posi
                 mwts.k_norm = static_cast<const float*>(m.mw.get("blk.48.attn_k_norm.weight"));
                 mwts.rope_cs = reinterpret_cast<const float*>(m.rope);
                 mwts.rope_positions = m.cfg.max_positions;
+                mark_stream(m.stream, "mtp_compute_start", k, {}, p0, n, 0);
                 pm::launch_mtp_cache_rows(mwts, pm::MtpRounding{}, m.tap, m.mtp_next, n, p0, m.mtp_kv, m.mtp_index, m.mtp_ws,
                                           m.mtp_status, m.tables, m.stream);
+                mark_stream(m.stream, "mtp_compute_end", k, {}, p0, n, 0);
                 const auto kb = std::uint64_t{n} * 2048, ib = std::uint64_t{n} * 256;
+                mark_stream(m.stream, "gpu_ready", static_cast<std::uint64_t>(out-m.host)+1, "mtp.kv", p0, n, kb);
+                mark_stream(m.stream, "gpu_ready", static_cast<std::uint64_t>(out-m.host)+kb+1, "mtp.index", p0, n, ib);
                 ck(cudaMemcpyAsync(out, m.mtp_kv + p0 * 1024, kb, cudaMemcpyDeviceToHost, m.stream), "mtp kv d2h");
+                mark_stream(m.stream, "d2h_done", static_cast<std::uint64_t>(out-m.host)+1, {}, 0, 0, 0);
                 pend.push_back({"mtp.kv", p0, n, out, kb});
                 out += kb;
                 ck(cudaMemcpyAsync(out, m.mtp_index + p0 * 128, ib, cudaMemcpyDeviceToHost, m.stream), "mtp index d2h");
+                mark_stream(m.stream, "d2h_done", static_cast<std::uint64_t>(out-m.host)+1, {}, 0, 0, 0);
                 pend.push_back({"mtp.index", p0, n, out, ib});
                 out += ib;
             }
             if (p0 + rows == position) {  // held row h_{p-1}: the tap of the last row
                 ck(cudaMemcpyAsync(out, m.tap + std::uint64_t{rows - 1} * kWide, kWide * 2, cudaMemcpyDeviceToHost, m.stream), "held");
+                mark_stream(m.stream, "d2h_done", static_cast<std::uint64_t>(out-m.host)+1, {}, 0, 0, 0);
                 held = out;
                 out += kWide * 2;
             }
         }
+        mark_stream(m.stream, "block_end", k, {}, p0, rows, 0);
         ck(cudaStreamSynchronize(m.stream), "block");
         const double bs = std::chrono::duration<double>(Clock::now() - tb).count();
         timing.block_s.push_back(bs);
         if (k == 0) timing.first_block_s = bs;
-        for (const auto& p : pend) sink(Piece{false, p.name, p.first, p.count, p.data, p.bytes});
+        for (const auto& p : pend) emit(Piece{false, p.name, p.first, p.count, p.data, p.bytes});
         p0 += rows;
         ++k;
     }
     // fixed blob pieces (offsets inside each component)
     const auto fixed = [&](const char* name, const void* dev, std::uint64_t bytes, bool device = true) {
-        if (device) ck(cudaMemcpyAsync(out, dev, bytes, cudaMemcpyDeviceToHost, m.stream), "fixed d2h");
-        else std::memcpy(out, dev, bytes);
+        if (device) {
+            mark_stream(m.stream, "gpu_ready", static_cast<std::uint64_t>(out-m.host)+1, name, 0, 0, bytes);
+            ck(cudaMemcpyAsync(out, dev, bytes, cudaMemcpyDeviceToHost, m.stream), "fixed d2h");
+            mark_stream(m.stream, "d2h_done", static_cast<std::uint64_t>(out-m.host)+1, name, 0, 0, bytes);
+        } else {
+            if (trace) trace->mark("gpu_ready", static_cast<std::uint64_t>(out-m.host)+1, name, 0, 0, bytes);
+            std::memcpy(out, dev, bytes);
+            if (trace) trace->mark("d2h_done", static_cast<std::uint64_t>(out-m.host)+1, name, 0, 0, bytes);
+        }
         ck(cudaStreamSynchronize(m.stream), "fixed");
-        sink(Piece{true, name, 0, 0, out, bytes});
+        emit(Piece{true, name, 0, 0, out, bytes});
         out += bytes;
     };
     if (!m.cfg.release_by_layer) {  // else sent per layer with the last block (release_by_layer)
@@ -689,7 +768,7 @@ Timing Prefill::run(const std::vector<std::uint32_t>& tokens, std::uint64_t posi
     // the session's position word holds the last processed position (node exports: 63 after 64 rows, 1030 after 1031)
     const std::uint64_t last_position = position - 1;
     fixed("position_history", &last_position, 8, false);
-    if (held) sink(Piece{true, "mtp.held", 0, 0, held, kWide * 2});
+    if (held) emit(Piece{true, "mtp.held", 0, 0, held, kWide * 2});
     timing.rows = position;
     timing.total_s = std::chrono::duration<double>(Clock::now() - t0).count();
     return timing;

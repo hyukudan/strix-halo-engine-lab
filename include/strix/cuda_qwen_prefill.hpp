@@ -9,9 +9,13 @@
 // blocking (verified on the node: T = 1024 and T = 256 give identical state), so the blocks here are free.
 #pragma once
 
+#include "strix/qwen_prefill_trace.hpp"
+#include "strix/qwen_prefill_schedule.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -24,6 +28,8 @@ struct Config {
     std::string rope_table;            // cs[position][32] float2 from the node (rope_cs_262144.bin)
     std::uint32_t max_positions = 32768;
     std::vector<std::uint32_t> block_schedule{1024, 2048, 4096, 8192};  // rows per block; the last entry repeats
+    bool tail_large = true;           // rotate final remainder to front; same count and capacity (--block-schedule default = off)
+    std::uint32_t final_block_rows = 0; // optional tail reservation within loaded max block
     int device = 0;
     bool ple_host_pinned = true;       // per_layer_token_embd (28.8 GB) in pinned host memory, gathered on the host
     // Release per layer: every block's KV/index rows of layer l, and in the last block each GDN layer's recurrent/conv
@@ -42,6 +48,13 @@ struct Piece {
     std::uint64_t count = 0;           // rows (row component), 0 for fixed
     const std::uint8_t* data = nullptr;
     std::uint64_t bytes = 0;
+    std::uint64_t trace_id = 0;
+};
+struct RunOptions {
+    // Omitted fields inherit configured defaults; overrides do not resize workspaces.
+    std::optional<bool> tail_large;
+    std::optional<std::uint32_t> final_block_rows;
+    qwen_prefill_trace::Trace* trace = nullptr;
 };
 using Sink = std::function<void(const Piece&)>;
 
@@ -60,7 +73,7 @@ public:
 
     // Computes rows [0, position) of `tokens` (position <= tokens.size()). Pieces go to `sink` in block order; the
     // fixed pieces come last. Returns after every piece was handed over.
-    Timing run(const std::vector<std::uint32_t>& tokens, std::uint64_t position, const Sink& sink);
+    Timing run(const std::vector<std::uint32_t>& tokens, std::uint64_t position, const Sink& sink, const RunOptions& options = {});
 
     // Diagnostics for the bitwise gates: the wide residual rows after layer 47 of the last run (BF16 [rows][10240]).
     [[nodiscard]] std::string describe() const;

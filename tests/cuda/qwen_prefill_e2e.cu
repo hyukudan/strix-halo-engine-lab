@@ -62,6 +62,8 @@ int main(int argc, char** argv) {
         c.block_schedule.clear();
         for (const auto& x : split(b, ',')) c.block_schedule.push_back(static_cast<std::uint32_t>(std::atoi(x.c_str())));
     }
+    if (const char* v = std::getenv("STRIX_QWEN_TAIL_LARGE")) c.tail_large = v[0] == '1';
+    if (const char* v = std::getenv("STRIX_QWEN_FINAL_BLOCK_ROWS")) c.final_block_rows = static_cast<std::uint32_t>(std::stoul(v));
     if (const char* v = std::getenv("STRIX_QWEN_BY_LAYER")) c.release_by_layer = v[0] == '1';
     std::printf("loading...\n");
     std::fflush(stdout);
@@ -116,6 +118,64 @@ int main(int argc, char** argv) {
                 while (i < len && v[i] == payload[at + off + i]) ++i;
                 if (i < len) { std::printf("  %s: FIRST DIFF at byte %llu of %llu\n", name.c_str(), static_cast<unsigned long long>(i), static_cast<unsigned long long>(len)); ++bad; }
                 else std::printf("  %s: %llu bytes identical\n", name.c_str(), static_cast<unsigned long long>(len));
+            }
+            std::fflush(stdout);
+            continue;
+        }
+        if (kind == "xsched") {
+            // xsched:TOKENS:N[:R] - the same prompt under the original block order, tail-large and
+            // (if R > 0) a final-block reservation of R rows; every exported component must be
+            // byte-identical across the schedules (no node capture needed).
+            std::string rest = job.substr(colon + 1);
+            const std::size_t from = (rest.size() > 2 && rest[1] == ':') ? 2 : 0;
+            const auto k1 = rest.find(':', from);
+            const std::string tfile = rest.substr(0, k1);
+            rest = rest.substr(k1 + 1);
+            const auto k2 = rest.find(':');
+            const std::uint64_t n = std::strtoull(rest.substr(0, k2).c_str(), nullptr, 10);
+            const std::uint32_t reserve = k2 == std::string::npos ? 0U : static_cast<std::uint32_t>(std::strtoul(rest.substr(k2 + 1).c_str(), nullptr, 10));
+            const auto tokens = tokens_of(tfile);
+            if (tokens.size() < n) { std::printf("%s: only %zu tokens\n", job.c_str(), tokens.size()); ++bad; continue; }
+            struct Arm { const char* name; qp::RunOptions options; };
+            std::vector<Arm> arms;
+            arms.push_back({"default", {}});
+            arms.back().options.tail_large = false;
+            arms.back().options.final_block_rows = 0;
+            arms.push_back({"tail-large", {}});
+            arms.back().options.tail_large = true;
+            arms.back().options.final_block_rows = 0;
+            if (reserve) {
+                arms.push_back({"final-block-rows", {}});
+                arms.back().options.tail_large = false;
+                arms.back().options.final_block_rows = reserve;
+            }
+            std::vector<std::map<std::string, std::vector<std::uint8_t>>> states;
+            for (const auto& arm : arms) {
+                std::map<std::string, std::vector<std::uint8_t>> got;
+                const auto t = p.run(tokens, n, [&](const qp::Piece& piece) {
+                    auto& v = got[piece.component];
+                    // place rows/bytes at their absolute offset so arrival order cannot matter
+                    const std::uint64_t at = piece.fixed ? piece.first : piece.first * (piece.count ? piece.bytes / piece.count : 0);
+                    if (v.size() < at + piece.bytes) v.resize(at + piece.bytes);
+                    std::memcpy(v.data() + at, piece.data, piece.bytes);
+                }, arm.options);
+                std::printf("xsched %llu rows %s: %.3f s, blocks", static_cast<unsigned long long>(n), arm.name, t.total_s);
+                for (double b : t.block_s) std::printf(" %.3f", b);
+                std::printf("\n");
+                states.push_back(std::move(got));
+            }
+            for (std::size_t s = 1; s < states.size(); ++s) {
+                if (states[s].size() != states[0].size()) { std::printf("  %s: %zu components vs %zu\n", arms[s].name, states[s].size(), states[0].size()); ++bad; continue; }
+                std::uint64_t total = 0;
+                for (const auto& [name, ref] : states[0]) {
+                    const auto it = states[s].find(name);
+                    if (it == states[s].end() || it->second != ref) {
+                        std::printf("  %s vs default: %s DIFFERS\n", arms[s].name, name.c_str());
+                        ++bad;
+                    }
+                    total += ref.size();
+                }
+                std::printf("  %s vs default: %zu components, %llu bytes compared\n", arms[s].name, states[0].size(), static_cast<unsigned long long>(total));
             }
             std::fflush(stdout);
             continue;

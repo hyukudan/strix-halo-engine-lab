@@ -2,6 +2,13 @@ cmake_minimum_required(VERSION 3.24)
 
 project(strix_engine_lab VERSION 0.1.0 LANGUAGES CXX)
 
+# Standalone CUDA Qwen prefill and host-only scheduling/codec checks.
+option(STRIX_CUDA_QWEN_ONLY "Build only the CUDA Qwen prefill service and gates" OFF)
+if(STRIX_CUDA_QWEN_ONLY)
+    include(cmake/QwenCuda.cmake)
+    return()
+endif()
+
 if(WIN32)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()

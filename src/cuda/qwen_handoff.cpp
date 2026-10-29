@@ -277,7 +277,10 @@ void Sender::enqueue(const Piece& in) {
     {
         std::lock_guard<std::mutex> lock(impl_->m);
         if (impl_->failed) throw std::runtime_error("rtx-import sender failed: " + impl_->error);
-        for (const auto& p : parts) impl_->queue.push_back(p);
+        for (const auto& p : parts) {
+            if (impl_->opts.trace) impl_->opts.trace->mark("enqueue", p.trace_id, {}, p.first, p.count, p.bytes);
+            impl_->queue.push_back(p);
+        }
         impl_->in_flight += parts.size();
     }
     impl_->cv.notify_all();
@@ -311,6 +314,12 @@ void Sender::pack() {
         }
         if (!failed) {
             try {
+                wire.seq = s.seq++;
+                if (s.opts.trace) {
+                    for (const auto& p : batch) s.opts.trace->mark("chunk_piece", p.trace_id,
+                        std::to_string(wire.seq), p.first, p.count, p.bytes);
+                    s.opts.trace->mark("encode_start", wire.seq);
+                }
                 const auto t0 = Clock::now();
                 std::vector<std::uint32_t> widths;
                 widths.reserve(batch.size());
@@ -324,7 +333,7 @@ void Sender::pack() {
                 s.manifest.update(std::as_bytes(std::span<const std::uint8_t>(digest.bytes)));
                 const double took = secs(t0);
                 const std::lock_guard<std::mutex> lock(s.m);
-                wire.seq = s.seq++;
+                if (s.opts.trace) s.opts.trace->mark("encode_end", wire.seq);
                 timing_.encode_s += took;
             } catch (const std::exception& e) {
                 s.fail(e.what());
@@ -374,7 +383,9 @@ void Sender::post(unsigned /*connection*/) {
                 hdr.emplace_back("X-Chunk-Sha256", wire.digest_hex);
                 hdr.emplace_back("X-Chunk-Seq", std::to_string(wire.seq));
                 if (encoded) hdr.emplace_back("X-Chunk-Encoding", std::string(bp_codec::codec_name));
+                if (s.opts.trace) s.opts.trace->mark("post_start", wire.seq);
                 auto [status, reply] = client->post(s.base_path + "/chunks?id=" + id, hdr, wire.body);
+                if (s.opts.trace) s.opts.trace->mark("post_ack", wire.seq);
                 if (status != 200) throw std::runtime_error("rtx-import chunks: HTTP " + std::to_string(status) + " " + reply);
                 const std::lock_guard<std::mutex> lock(s.m);
                 ++timing_.chunks;
@@ -394,12 +405,14 @@ void Sender::post(unsigned /*connection*/) {
 }
 
 std::string Sender::commit() {
+    if (impl_->opts.trace) impl_->opts.trace->mark("commit_wait_start");
     {
         std::unique_lock<std::mutex> lock(impl_->m);
         impl_->cv.wait(lock, [&] { return impl_->in_flight == 0 || impl_->failed; });
         if (impl_->failed) throw std::runtime_error("rtx-import sender failed: " + impl_->error);
     }
     const auto t0 = Clock::now();
+    if (impl_->opts.trace) impl_->opts.trace->mark("commit_start");
     const auto manifest = impl_->manifest.finalize();
     const std::string body = "{\"chunks\":" + std::to_string(timing_.chunks) + ",\"bytes\":" + std::to_string(timing_.bytes) +
                              ",\"manifest_sha256\":\"" + hex(manifest) + "\"}";
@@ -409,6 +422,7 @@ std::string Sender::commit() {
         std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(body.data()), body.size()));
     timing_.commit_s = secs(t0);
     if (status != 200) throw std::runtime_error("rtx-import commit: HTTP " + std::to_string(status) + " " + reply);
+    if (impl_->opts.trace) impl_->opts.trace->mark("commit_end");
     return reply;
 }
 
