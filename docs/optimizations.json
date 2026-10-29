@@ -1676,6 +1676,17 @@
     "doc_anchor": "docs/optimizations.md#qwen-serve-logprobs"
   },
   {
+    "engine": "qwen",
+    "name": "RTX prefill tail-large block schedule",
+    "flag_or_env": "--block-schedule default|tail-large; STRIX_QWEN_TAIL_LARGE",
+    "default": "tail-large",
+    "exact": "Every exported state component byte-identical between original order and tail-large at 1100, 8191 and 32767 rows (MTP on/off, release-by-layer on/off, final-block reservation); greedy IDs equal node-only prefill.",
+    "gain": "TTFT -12.7 % at 1K, -7.9 % at 8K, -5.0 % at 32K against the original order",
+    "preconditions": "CUDA Qwen prefill service on the RTX PRO with node import; only prompts whose final block is smaller than its predecessor change schedule.",
+    "off_switch": "--block-schedule default (or block_schedule=default per request); STRIX_QWEN_TAIL_LARGE=0 in the gate harness",
+    "doc_anchor": "docs/optimizations.md#qwen-rtx-tail-large"
+  },
+  {
     "engine": "deepseek",
     "name": "Bounded serving observation",
     "flag_or_env": "STRIX_SERVE_OBSERVE_EXPIRY_S",

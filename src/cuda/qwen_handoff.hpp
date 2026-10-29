@@ -9,6 +9,7 @@
 #pragma once
 
 #include "strix/bp_codec.hpp"
+#include "strix/qwen_prefill_trace.hpp"
 
 #include <cstdint>
 #include <span>
@@ -35,6 +36,7 @@ struct Piece {
     std::uint64_t count = 0;   // rows (row component) or 0 for fixed
     const std::uint8_t* data = nullptr;
     std::uint64_t bytes = 0;
+    std::uint64_t trace_id = 0;
 };
 
 struct Options {
@@ -45,6 +47,7 @@ struct Options {
     unsigned encode_threads = 4;  // codec workers besides the packer thread
     unsigned connections = 1;     // chunk POSTs in flight, one keep-alive connection each
     std::uint64_t chunk_bytes = std::uint64_t{32} << 20;  // target plain body size of one chunks POST
+    qwen_prefill_trace::Trace* trace = nullptr; // must outlive sender
 };
 
 struct Timing {

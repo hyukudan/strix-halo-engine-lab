@@ -696,6 +696,21 @@ Host selection defaults to admitted serial-equivalent MTP windows (`mtp-host`), 
   (GPU gate). Transforms change tokens by design and are labelled `greedy-logit-transform-v1`.
 - **Off switch:** `--http-logprobs off`, `--http-logit-transforms off`; `--http-selection-mtp off` keeps policy selection serial
 
+<a id="qwen-rtx-tail-large"></a>
+
+### RTX prefill tail-large block schedule
+
+**Engine:** `qwen`. **Control:** `--block-schedule default|tail-large`, `STRIX_QWEN_TAIL_LARGE=0`. **Default:** `tail-large`.
+
+The CUDA prefill service moves a short final remainder block to the front so the last block, whose transfer
+cannot overlap later compute, is a large one. Rows stay chronological; only block sizes move.
+
+- **Preconditions:** CUDA Qwen prefill service on the RTX PRO with node import; prompts whose final block is smaller than its predecessor.
+- **Exactness evidence:** Every exported state component is byte-identical between the original order and tail-large at 1100, 8191 and 32767 rows (with and without MTP, release-by-layer on and off, plus an explicit final-block reservation); greedy IDs equal node-only prefill.
+- **Off switch:** `--block-schedule default` (or `"block_schedule":"default"` per request); `STRIX_QWEN_TAIL_LARGE=0` for the gate harness.
+- **Measured gain:** TTFT -12.7 % at 1K, -7.9 % at 8K, -5.0 % at 32K against the original order.
+- **Implementation / evidence:** [CUDA Qwen prefill scheduling](engine/serving/qwen-cuda-prefill.md)
+
 ## DeepSeek two-node
 
 ```sh

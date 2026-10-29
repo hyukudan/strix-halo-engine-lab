@@ -4,6 +4,7 @@
 //   GET  /health      {"status":"ok"|"failed","busy":bool,"queued":n,"model":"qwen3.8-flash-next","max_positions":n,...}
 //   POST /v1/prefill  {"tokens":[u32...], "handoff":"http://<node>:<port>/admin/rtx-import", "session"?:any,
 //                      "reserve_tokens"?:n, "handoff_codec"?:"bp-v1"|"identity"}
+//     Optional block_schedule: "default"|"tail-large", final_block_rows: N, trace: true (trace returned in reply).
 //     computes rows [0, P-1) of the P prompt tokens and streams the node state to the node's --rtx-state-import routes
 //     while it computes (begin, multi-segment chunks per finished block, the fixed blob, commit). The node then runs the
 //     last prompt row itself. Reply: {"session","position","tokens","manifest_sha256","seconds":{queue,prefill,transfer,
@@ -32,8 +33,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <future>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -59,10 +62,43 @@ constexpr std::uint64_t kNumerical = fnv("strix-cuda-qwen-prefill:a8-single-prof
 constexpr std::uint64_t kReduction = fnv("strix-cuda-qwen-prefill:hip-gfx1151-order-v1");
 constexpr std::uint64_t kStateUpdate = fnv("strix-cuda-qwen-prefill:state-v1");
 
+Json trace_json(const strix::qwen_prefill_trace::Trace& trace) {
+    Json events = Json::array();
+    std::map<std::uint64_t, double> starts, compute_starts, mtp_starts, compute_ms;
+    Json blocks = Json::array();
+    auto recorded = trace.snapshot();
+    std::stable_sort(recorded.begin(), recorded.end(), [](const auto& a, const auto& b) { return a.ms < b.ms; });
+    for (const auto& e : recorded) {
+        Json v = Json::object();
+        v.set("stage", Json(e.stage)); v.set("id", Json(e.id)); v.set("ms", Json(e.ms));
+        if (!e.component.empty() && e.stage != "chunk_piece") v.set("component", Json(e.component));
+        v.set("first", Json(e.first)); v.set("rows", Json(e.rows)); v.set("bytes", Json(e.bytes));
+        if (e.stage == "chunk_piece") v.set("chunk", Json(static_cast<std::uint64_t>(std::stoull(e.component))));
+        if (e.stage == "block_start") starts[e.id] = e.ms;
+        if (e.stage == "compute_start") compute_starts[e.id] = e.ms;
+        if (e.stage == "compute_end" && compute_starts.count(e.id)) compute_ms[e.id] += e.ms-compute_starts.at(e.id);
+        if (e.stage == "mtp_compute_start") mtp_starts[e.id] = e.ms;
+        if (e.stage == "mtp_compute_end" && mtp_starts.count(e.id)) compute_ms[e.id] += e.ms-mtp_starts.at(e.id);
+        if (e.stage == "block_end") {
+            if (starts.count(e.id)) v.set("elapsed_ms", Json(e.ms-starts.at(e.id)));
+            v.set("compute_ms", Json(compute_ms[e.id]));
+            blocks.as_array().push_back(v);
+        }
+        events.push(v);
+    }
+    Json t = Json::object(); t.set("clock", Json("steady_clock"));
+    t.set("unit", Json("ms")); t.set("events", events); t.set("blocks", blocks);
+    t.set("dropped_events", Json(trace.dropped()));
+    return t;
+}
+
 struct Job {
     std::vector<std::uint32_t> tokens;
     std::string handoff, api_key, codec;
     bool has_codec = false;
+    bool trace = false, tail_large = false, has_schedule = false;
+    std::uint32_t final_rows = 0;
+    bool has_final_rows = false;
     std::uint64_t local_rows = 0;
     std::string node_completions;
     Json session;
@@ -72,8 +108,8 @@ struct Job {
 
 class Service {
 public:
-    Service(qp::Prefill& p, std::uint32_t max_positions, std::string handoff_key, qh::Options handoff)
-        : p_(p), max_positions_(max_positions), handoff_key_(std::move(handoff_key)), handoff_(std::move(handoff)) {
+    Service(qp::Prefill& p, const qp::Config& config, std::string handoff_key, qh::Options handoff)
+        : p_(p), config_(config), max_positions_(config.max_positions), handoff_key_(std::move(handoff_key)), handoff_(std::move(handoff)) {
         worker_ = std::thread([this] { loop(); });
     }
     ~Service() {
@@ -90,6 +126,9 @@ public:
         j.set("model", Json("qwen3.8-flash-next"));
         j.set("max_positions", Json(static_cast<std::uint64_t>(max_positions_)));
         j.set("served", Json(served_));
+        j.set("block_schedule", Json(config_.tail_large ? "tail-large" : "default"));
+        j.set("final_block_rows", Json(static_cast<std::uint64_t>(config_.final_block_rows)));
+        j.set("block_capacity", Json(static_cast<std::uint64_t>(*std::max_element(config_.block_schedule.begin(), config_.block_schedule.end()))));
         j.set("describe", Json(p_.describe()));
         return j.dump();
     }
@@ -127,9 +166,19 @@ private:
     std::pair<int, std::string> run(Job& job) {
         const auto t_start = Clock::now();
         const std::uint64_t position = job.tokens.size() - 1;
+        std::unique_ptr<strix::qwen_prefill_trace::Trace> trace;
         try {
+            if (job.trace) trace = std::make_unique<strix::qwen_prefill_trace::Trace>();
+            qp::RunOptions run_options;
+            run_options.trace = trace.get();
+            if (job.has_schedule) run_options.tail_large = job.tail_large;
+            if (job.has_final_rows) run_options.final_block_rows = job.final_rows;
             qh::Options options = handoff_;
+            options.trace = trace.get();
             if (job.has_codec) options.codec = job.codec;
+            (void)qp::plan_blocks(position, config_.block_schedule,
+                job.has_schedule ? job.tail_large : config_.tail_large,
+                job.has_final_rows ? job.final_rows : config_.final_block_rows);
             qh::Sender sender(job.handoff, job.api_key.empty() ? handoff_key_ : job.api_key, 600, options);
             const auto& layout = sender.layout();
             if (layout.max_context && job.tokens.size() + 1 > layout.max_context)
@@ -171,8 +220,9 @@ private:
                 out.count = piece.count;
                 out.data = piece.data;
                 out.bytes = piece.bytes;
+                out.trace_id = piece.trace_id;
                 sender.enqueue(out);
-            });
+            }, run_options);
             const auto t_computed = Clock::now();
             const std::string node = sender.commit();
             if (node_prefix.valid()) {
@@ -196,6 +246,9 @@ private:
             s.set("total", Json(secs(job.queued_at, t_done)));
             if (job.local_rows) s.set("node_prefix", Json(node_prefix_s));
             reply.set("seconds", s);
+            if (trace) {
+                reply.set("trace", trace_json(*trace));
+            }
             reply.set("state_bytes", Json(sender.timing().bytes));
             reply.set("chunks", Json(sender.timing().chunks));
             reply.set("wire_bytes", Json(sender.timing().wire_bytes));
@@ -206,6 +259,7 @@ private:
         } catch (const std::exception& e) {
             Json err = Json::object();
             err.set("error", Json(std::string(e.what())));
+            if (trace) err.set("trace", trace_json(*trace));
             const std::string what = e.what();
             // a device error leaves the GPU state unknown: refuse further work
             if (what.find("cuda") != std::string::npos || what.find("CUDA") != std::string::npos) {
@@ -213,11 +267,13 @@ private:
                 failed_ = true;
                 return {503, err.dump()};
             }
+            if (dynamic_cast<const std::invalid_argument*>(&e)) return {400, err.dump()};
             return {502, err.dump()};
         }
     }
 
     qp::Prefill& p_;
+    qp::Config config_;
     std::uint32_t max_positions_;
     std::string handoff_key_;
     qh::Options handoff_;
@@ -253,6 +309,17 @@ void handle(Service& svc, http::Sock s, std::uint32_t max_positions, const std::
         if (const auto* x = j.find("handoff_api_key")) job->api_key = x->as_string();
         if (const auto* x = j.find("handoff_codec")) { job->codec = x->as_string(); job->has_codec = true; }
         if (const auto* x = j.find("local_rows")) job->local_rows = static_cast<std::uint64_t>(x->as_int());
+        if (const auto* x = j.find("trace")) job->trace = x->as_bool();
+        if (const auto* x = j.find("block_schedule")) {
+            const auto schedule = x->as_string();
+            if (schedule != "default" && schedule != "tail-large") throw std::invalid_argument("block_schedule");
+            job->has_schedule = true; job->tail_large = schedule == "tail-large";
+        }
+        if (const auto* x = j.find("final_block_rows")) {
+            auto n = x->as_int();
+            if (n < 0 || n > qp::kMaxBlockRows) throw std::invalid_argument("final_block_rows");
+            job->has_final_rows = true; job->final_rows = static_cast<std::uint32_t>(n);
+        }
         if (const auto* x = j.find("node_completions")) job->node_completions = x->as_string();
     } catch (const std::exception& e) {
         http::respond(s, 400, R"({"error":"bad request body"})");
@@ -286,6 +353,18 @@ int main(int argc, char** argv) {
         else if (a == "--tables") c.tables_dir = next();
         else if (a == "--rope-table") c.rope_table = next();
         else if (a == "--max-positions") c.max_positions = static_cast<std::uint32_t>(std::atoi(next().c_str()));
+        else if (a == "--block-schedule") {
+            const auto v = next();
+            if (v != "default" && v != "tail-large") { std::fprintf(stderr, "invalid block schedule\n"); return 1; }
+            c.tail_large = v == "tail-large";
+        }
+        else if (a == "--final-block-rows") {
+            const auto v = next();
+            long long n = -1;
+            try { std::size_t used = 0; n = std::stoll(v, &used); if (used != v.size()) n = -1; } catch (const std::exception&) { n = -1; }
+            if (n < 0 || n > qp::kMaxBlockRows) { std::fprintf(stderr, "invalid final block rows\n"); return 1; }
+            c.final_block_rows = static_cast<std::uint32_t>(n);
+        }
         else if (a == "--blocks") {
             c.block_schedule.clear();
             std::string v = next();
@@ -308,6 +387,11 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "unknown flag %s\n", a.c_str()); return 1; }
     }
     if (c.tables_dir.empty() || c.rope_table.empty()) { std::fprintf(stderr, "--tables and --rope-table are required\n"); return 1; }
+    if (c.block_schedule.empty() ||
+        c.final_block_rows > *std::max_element(c.block_schedule.begin(), c.block_schedule.end())) {
+        std::fprintf(stderr, "invalid final block rows\n");
+        return 1;
+    }
     http::startup();
     // Bind before loading so a busy port fails fast.
     addrinfo hints{};
@@ -326,9 +410,12 @@ int main(int argc, char** argv) {
     freeaddrinfo(res);
     std::printf("{\"event\":\"loading\"}\n");
     std::fflush(stdout);
-    qp::Prefill p(c);
+    std::unique_ptr<qp::Prefill> loaded;
+    try { loaded = std::make_unique<qp::Prefill>(c); }
+    catch (const std::exception& e) { std::fprintf(stderr, "invalid configuration: %s\n", e.what()); return 1; }
+    qp::Prefill& p = *loaded;
     std::printf("{\"event\":\"loaded\",\"describe\":%s}\n", p.describe().c_str());
-    Service svc(p, c.max_positions, handoff_key, handoff);
+    Service svc(p, c, handoff_key, handoff);
     std::printf("{\"event\":\"READY\",\"bind\":\"%s\",\"port\":%s}\n", bind.c_str(), port.c_str());
     std::fflush(stdout);
     for (;;) {
