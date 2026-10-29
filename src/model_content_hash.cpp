@@ -16,6 +16,12 @@
 #include <stdexcept>
 #include <system_error>
 #include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #if defined(__linux__)
 #include <sys/stat.h>
 #endif
@@ -344,23 +350,63 @@ private:
     std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> context_;
     std::uint64_t total_bytes_ = 0;
 };
+#elif defined(_WIN32)
+class FileSha256 {
+    Sha256Fast hash_;
+public:
+    void update(const std::uint8_t* data,std::size_t size) {
+        hash_.update(std::as_bytes(std::span(data,size)));
+    }
+    ModelContentIdentity finalize(){return hash_.finalize();}
+};
 #else
 using FileSha256 = Sha256;
 #endif
 
-[[maybe_unused]] FileDigest hash_file_stable_uncached(const std::filesystem::path& path);
+[[maybe_unused]] FileDigest hash_file_stable_uncached(const std::filesystem::path& path, const FileHashProgress& progress={});
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
 // Verified-identity cache, like git's index: a full-file SHA-256 of a ~60 GB model costs ~48 s of one
 // core on every start. The digest is reused only while the file keeps its device, inode, size, mtime
-// and ctime (ctime cannot be set from user space; any write or metadata change moves it), so a changed
+// and ctime on Linux; Windows v3 uses volume/file id, size, write and creation times.
+// Windows excludes ChangeTime because metadata-only hard-link operations move it. A changed
 // file is always re-hashed. STRIX_HASH_CACHE=0 disables it; STRIX_HASH_CACHE=DIR picks the directory
 // (default $XDG_CACHE_HOME/strix-engine/file-sha256, else ~/.cache/strix-engine/file-sha256).
 struct HashCacheKey {
+#ifdef _WIN32
+    std::filesystem::path file;
+#else
     std::string file;
+#endif
     std::string stamp;
 };
-std::optional<HashCacheKey> hash_cache_key(const std::filesystem::path& path, const FileIdentity* expected = nullptr) {
+std::optional<HashCacheKey> hash_cache_key(const std::filesystem::path& path, [[maybe_unused]] const FileIdentity* expected = nullptr) {
+#ifdef _WIN32
+    const wchar_t* setting = _wgetenv(L"STRIX_HASH_CACHE");
+    if (setting && std::wstring_view(setting) == L"0") return std::nullopt;
+    std::filesystem::path dir;
+    if (setting && setting[0]) dir = setting;
+    else if (const wchar_t* local = _wgetenv(L"LOCALAPPDATA"); local && local[0])
+        dir = std::filesystem::path(local) / "strix-engine/file-sha256";
+    else return std::nullopt;
+    HANDLE handle = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return std::nullopt;
+    BY_HANDLE_FILE_INFORMATION info{};
+    const bool ok = GetFileInformationByHandle(handle, &info) != 0;
+    CloseHandle(handle);
+    if (!ok || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) return std::nullopt;
+    const auto u64 = [](DWORD high, DWORD low) { return (std::uint64_t(high) << 32U) | low; };
+    const auto size = u64(info.nFileSizeHigh, info.nFileSizeLow);
+    const auto name = std::to_string(info.dwVolumeSerialNumber) + "-" +
+        std::to_string(u64(info.nFileIndexHigh, info.nFileIndexLow));
+    // Version and availability marker prevent reuse across different stamp schemas.
+    const auto stamp = "v3 " + std::to_string(size) + " " +
+        std::to_string(u64(info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime)) + " " +
+        std::to_string(u64(info.ftCreationTime.dwHighDateTime, info.ftCreationTime.dwLowDateTime));
+    return HashCacheKey{dir / name, stamp};
+#else
     const char* setting = std::getenv("STRIX_HASH_CACHE");
     if (setting && setting[0] == '0' && setting[1] == '\0') return std::nullopt;
     std::filesystem::path dir;
@@ -381,6 +427,7 @@ std::optional<HashCacheKey> hash_cache_key(const std::filesystem::path& path, co
         static_cast<long long>(st.st_mtim.tv_sec), st.st_mtim.tv_nsec, static_cast<long long>(st.st_ctim.tv_sec),
         st.st_ctim.tv_nsec);
     return HashCacheKey{(dir / name).string(), stamp};
+#endif
 }
 std::optional<FileDigest> hash_cache_read(const HashCacheKey& key) {
     std::ifstream in(key.file);
@@ -402,6 +449,23 @@ std::optional<FileDigest> hash_cache_read(const HashCacheKey& key) {
 void hash_cache_write(const HashCacheKey& key, const FileDigest& digest) {
     std::error_code error;
     std::filesystem::create_directories(std::filesystem::path(key.file).parent_path(), error);
+#ifdef _WIN32
+    // Each writer owns its temporary file; concurrent workers never truncate one another.
+    static std::atomic<unsigned long long> sequence{0};
+    auto temporary = key.file;
+    temporary += L".tmp-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(sequence++);
+    HANDLE out = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (out == INVALID_HANDLE_VALUE) return;
+    const auto contents = key.stamp + "\n" + model_content_identity_hex(digest.digest) + "\n";
+    DWORD written = 0;
+    const bool complete = WriteFile(out, contents.data(), static_cast<DWORD>(contents.size()), &written, nullptr) != 0 &&
+        written == contents.size() && FlushFileBuffers(out) != 0;
+    const bool closed = CloseHandle(out) != 0;
+    if (!complete || !closed || !MoveFileExW(temporary.c_str(), key.file.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        DeleteFileW(temporary.c_str());
+#else
     const auto temporary = key.file + ".tmp";
     {
         std::ofstream out(temporary, std::ios::trunc);
@@ -416,36 +480,61 @@ void hash_cache_write(const HashCacheKey& key, const FileDigest& digest) {
         if (!out) return;
     }
     std::filesystem::rename(temporary, key.file, error);
+#endif
 }
 #endif
 
-FileDigest hash_file_stable(const std::filesystem::path& path) {
+FileDigest hash_file_stable(const std::filesystem::path& path, FileContentHashStats* stats=nullptr, const FileHashProgress& progress={}) {
+    if(stats)stats->cache_hit=false;
     const auto start = std::chrono::steady_clock::now();
     const auto report = [&](const char* status) {
         if (const char* log = std::getenv("STRIX_HASH_LOG"); log && std::string_view(log) == "1")
             std::fprintf(stderr, "session content_hash=%s ms=%.3f path=%s\n", status,
                 std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count(), path.string().c_str());
     };
-#if defined(__linux__)
+
+#if defined(__linux__) || defined(_WIN32)
     const auto key = hash_cache_key(path);
     if (key)
-        if (auto cached = hash_cache_read(*key)) { ++cache_hits; report("hit"); return *cached; }
+        if (auto cached = hash_cache_read(*key)) {
+#ifdef _WIN32
+            const auto after = hash_cache_key(path);
+            if (after && after->file == key->file && after->stamp == key->stamp) {
+#endif
+                ++cache_hits; report("hit");
+                if (stats) stats->cache_hit = true;
+                if (progress) progress(cached->bytes, cached->bytes);
+                return *cached;
+#ifdef _WIN32
+            }
+#endif
+        }
     ++cache_misses;
-    const auto digest = hash_file_stable_uncached(path);
+    const auto digest = hash_file_stable_uncached(path,progress);
     // Store only if the file still carries the stamp it had before hashing.
     if (key)
+#ifdef _WIN32
+    {
+        const auto after = hash_cache_key(path);
+        if (!after || after->file != key->file || after->stamp != key->stamp)
+            throw std::runtime_error("model content file changed while hashing");
+        hash_cache_write(*key, digest);
+    }
+#else
         if (const auto after = hash_cache_key(path); after && after->stamp == key->stamp) hash_cache_write(*key, digest);
+#endif
     report("miss");
     return digest;
 #else
-    auto digest = hash_file_stable_uncached(path);
+    ++cache_misses;
+    auto digest = hash_file_stable_uncached(path,progress);
     report("miss");
     return digest;
 #endif
 }
 
 [[maybe_unused]] FileDigest hash_file_stable_uncached(
-    const std::filesystem::path& path) {
+    const std::filesystem::path& path, const FileHashProgress& progress) {
     std::error_code error;
     const auto before =
         std::filesystem::file_size(
@@ -469,6 +558,7 @@ FileDigest hash_file_stable(const std::filesystem::path& path) {
         1024U * 1024U);
     std::uint64_t bytes = 0;
 
+    if(progress)progress(0,before);
     while (input) {
         input.read(
             buffer.data(),
@@ -486,6 +576,7 @@ FileDigest hash_file_stable(const std::filesystem::path& path) {
             bytes +=
                 static_cast<std::uint64_t>(
                     count);
+            if(progress)progress(bytes,before);
         }
     }
     if (!input.eof()) {
@@ -517,6 +608,16 @@ FileHashCacheStats file_hash_cache_stats() noexcept { return {cache_hits.load(),
 ModelContentIdentity sha256_file_content(
     const std::filesystem::path& path) {
     return hash_file_stable(path).digest;
+}
+
+ModelContentIdentity sha256_file_content(
+    const std::filesystem::path& path, FileContentHashStats* stats) {
+    return hash_file_stable(path,stats).digest;
+}
+ModelContentIdentity sha256_file_content(
+    const std::filesystem::path& path, FileContentHashStats* stats,
+    const FileHashProgress& progress) {
+    return hash_file_stable(path,stats,progress).digest;
 }
 
 ModelContentIdentity sha256_file_content(const std::filesystem::path& path, FileHashPolicy policy) {

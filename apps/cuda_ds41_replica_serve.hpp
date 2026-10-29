@@ -47,7 +47,7 @@ inline const char* eviction_error(const std::string& policy, bool supported, boo
 inline const std::set<std::string>& runtime_options() {
     static const std::set<std::string> s{
         "--phases", "--steps", "--ref", "--chats", "--chat-prompt", "--chat-steps", "--seqs-file", "--json", "--timeline",
-        "--draft-trace", "--verify", "--warm", "--chat-logits", "--pressure-free", "--pressure-recent", "--prefetch-layer",
+        "--qual-dump", "--draft-trace", "--verify", "--warm", "--chat-logits", "--pressure-free", "--pressure-recent", "--prefetch-layer",
         "--prefetch-token", "--window", "--controller-scope", "--controller-prior", "--controller-save",
         "--controller-prior-alt", "--controller-costs", "--controller-explore", "--controller-learn", "--probe-phase",
         "--draft-vocab", "--winpf-l1-cap", "--winpf-pmin", "--winpf-prior-cap", "--winpf-prior-pmin", "--winpf-revert",

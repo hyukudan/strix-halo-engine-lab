@@ -1090,7 +1090,7 @@ bool PrefixCache::insert_disk(const AttentionState& s, std::uint64_t logits_fnv,
     }
     const std::uint64_t seq = ++clock_;
     for (std::uint32_t k = have; k < blocks; ++k) {
-        auto file = std::make_shared<std::vector<std::uint8_t>>(kHeaderBytes, 0U);
+        auto file = std::make_shared<std::vector<std::uint8_t>>(kHeaderBytes, std::uint8_t{0});
         file->reserve(block_file);
         put_raw(*file, table.data(), table.size());
         put_raw(*file, tokens.data() + std::size_t{k} * B, std::size_t{B} * 4U);
@@ -1124,7 +1124,7 @@ bool PrefixCache::insert_disk(const AttentionState& s, std::uint64_t logits_fnv,
         writer_->push({block_path(keys[k]), std::move(file)});
     }
     DiskEntry& leaf = *disk_.at(keys[blocks - 1U]);
-    auto file = std::make_shared<std::vector<std::uint8_t>>(kHeaderBytes, 0U);
+    auto file = std::make_shared<std::vector<std::uint8_t>>(kHeaderBytes, std::uint8_t{0});
     file->reserve(snap_file);
     put_raw(*file, table.data(), table.size());
     put<std::uint32_t>(*file, s.next_token);

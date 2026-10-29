@@ -207,3 +207,28 @@ The same published record reports full loading **108.7 → 61.8 s**, persistent
 worker requests **8–18 s/request** without reloading, and fresh-load cache reset
 **3.4 s**. Loading and persistent-worker work are marked **in development**;
 these are workload-specific measurements, separate from decode throughput.
+
+## Conversation sessions
+
+Named sessions with RAM parking are on by default for the qualified
+`rtx-tp1-decode-rows` route. RAM eviction drops the session and returns
+`session_not_found`/404 on its next suffix-only turn. Implicit continuation and
+full-history matching use only this worker's RAM; a full-history miss recomputes.
+Checkpoints are explicit save points. Durable reads require explicit
+restore/resume with `--session-durability disk` by name or an explicit
+`--session-path`, and return exactly that checkpoint even if RAM had advanced. One worker exclusively owns
+each managed tier; competing workers receive `session_tier_busy`/409.
+`--session-disk off` / `STRIX_SESSION_DISK=0` disables the managed tier.
+Disable automatic sessions with
+`--session-cache off`, `STRIX_SESSION_CACHE=0`, or `--baseline`
+(`STRIX_DS41_RTX_BASELINE=1`). DSpark sessions require `--draft-vocab full`;
+other vocabulary routes return `session_unsupported`/422 for DSpark sessions.
+Target-only sessions accept any launch vocabulary.
+
+The eight explicit-checkpoint qualification phases passed with 8,192-token P
+and 64 generated rows: tokens, all logits and complete attention/drafter/frontier
+state matched across live, parked and restarted continuations. The public-port
+run measured save **210.32 / 255.52 s** and restore **110.42 / 115.18 s** for
+target-only / DSpark. The new default-route eviction/restore phases require a
+separate run against the rebuilt candidate. See [RTX session cache](rtx-session-cache.md)
+for flags, spool operations, format, qualification scope and measured results.
