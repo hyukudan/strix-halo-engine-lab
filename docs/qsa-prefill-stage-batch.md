@@ -11,7 +11,8 @@ Admission is all-or-nothing for one layer-chunk. The per-group path runs when
 any of these conditions fails:
 
 - Normal eager prefill mode (`STRIX_QSA_PREFILL_TILES` and prefill self-check
-  disabled), with 1 through 128 complete 64-row groups and no remaining tiles.
+  disabled), with 1 through 256 complete 64-row groups within the configured
+  setup reservation and no remaining tiles.
 - `STRIX_QSA_NORM_GROUP=1`, BF16 KV storage, and an available pooled-key buffer.
 - Index geometry: four heads of dimension 128; every query pointer aligned to
   16 bytes; every scored prefix within both the pool capacity and 65536 blocks.
@@ -21,8 +22,11 @@ any of these conditions fails:
   norm conditions. The existing wave-norm conditions still determine wave/LDS.
 - Rows have contiguous positions, common raw/KV owners and extents, common
   geometry, common norm owners, journal, compression ratio and selection top-k.
-- Private table/maxima device buffers and pinned descriptor buffers can be
-  allocated. Allocation rejection occurs before any stage launch or state write.
+- Private table/maxima device buffers and pinned descriptor buffers were reserved
+  at window setup for the maximum T/context on the owning device. Execution only
+  checks capacity. A smaller call retains the group-capacity high-water mark.
+  Setup allocation pressure or a later capacity/compact-policy mismatch declines
+  to the per-group path before any descriptor reader or stage launch.
 
 Windows, cohorts, graph execution, partial row groups and int8 KV retain their
 existing paths. HIP execution errors still propagate; they are not retried after

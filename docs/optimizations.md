@@ -39,7 +39,7 @@ and [qualification](engine/serving/ds41-prefix-cache-qualification.md).
 
 | Engine | Master baseline | Inspect before device work | Scope / precedence |
 |---|---|---|---|
-| Qwen | `--baseline` / `STRIX_BASELINE=1` | `--print-effective-config` | Historical organization/arithmetic; controlled defaults suppressed, implicit context 8192; explicit route options retain historical validation |
+| Qwen | `--baseline` / `STRIX_BASELINE=1` | `--print-effective-config` | Historical organization/arithmetic; controlled defaults suppressed, implicit context 8192; explicit tiled routes still require priced native-pool headroom |
 | DeepSeek pair | `STRIX_DS41_BASELINE=1` | `--print-effective-config` | Stop production pack/draft/argv injection and switch the nine recent code defaults off unless explicitly set; older kernel defaults remain |
 | DeepSeek RTX | `--baseline` / `STRIX_DS41_RTX_BASELINE=1` | `--print-config` | CLI baseline applies at its argument position; later flags win; env baseline applies before argv |
 | MiniMax | `STRIX_MM_BASELINE=1` | `--print-effective-config` | All 22 resolver items use their off values; explicit environment wins; older built-in routes remain |
@@ -59,17 +59,72 @@ Once the bench kit lands, run `bash scripts/bench/bench.sh list`, then
 `bash scripts/bench/bench.sh run --engine E --only exactness --suite quick --json`.
 Verdicts are `EXACT`, `MISMATCH` and `NO-REFERENCE`; the last is not a pass. The kit is not assumed present today.
 
+### Early tiled-prefill geometry setup
+
+**Default ON.** OFF: `STRIX_QPF2K_EARLY_SETUP=0`, `--no-early-setup`, or
+config `qpf2k_early_setup = false`. CLI, config and environment restrictions combine;
+`true` cannot undo another OFF. These controls preserve automatic route selection.
+Eligible fresh plain CLI generation prepares immutable full-block plan validation
+and prompt-independent static launcher admission before the request timer, using
+a session copy and a separate static memo. Live token, position, PLE and QSA admission
+still happens in the live block. MTP, HTTP, restored sessions, prefix-cache requests,
+RTX state sessions and partial blocks retain their existing admission order.
+This moves work out of request TTFT into startup; it does not remove work or reduce
+process wall time by itself. Native local CI found 32K last-row logits bitwise
+equal with early setup OFF; three-round interleaved medians were 20.09 s default
+and 20.48 s OFF, a measured request-time gain. Effective config reports
+`early_setup`; eligibility still determines whether the policy executes.
+
+### Eager code-object loading
+
+**Default ON.** OFF: `STRIX_EAGER_CODE_LOAD=0`, `--no-eager-code-load`, or config
+`eager_code_load = false`. Before the first HIP runtime call the engine sets
+`HIP_ENABLE_DEFERRED_LOADING=0` only when that variable is absent. Any user-supplied
+value, including an empty value, wins. OFF leaves HIP's own default or user value
+untouched. Inspection predicts this policy without initializing HIP or setting it.
+Effective config reports `eager_code_load` and `hip_enable_deferred_loading` (null
+when left to HIP). This moves first-launch code-object loading stalls out of request
+time; startup grows accordingly. Native local CI found 32K last-row logits
+bitwise equal with loading OFF. Three-round interleaved medians were 20.09 s
+default and 20.07 s OFF, neutral within noise; no speed gain claimed.
+
+### Automatic T16384 prefill
+
+**Default ON at >=32,768 prompt tokens**, on the existing qualified automatic route.
+`STRIX_QPF2K_T16K=0` restores the T8192-first ladder. Exact value `1` tries T16384
+from 16,384 tokens; other explicit values retain the T8192 ladder. T16384 charges
+workspace, metadata, native pools and mapped aliases under UMA and GTT admission.
+When it does not fit, try T8192, then T4096 and T2048, preserving the fallback reason.
+The tile change keeps per-output arithmetic. Native local CI found 32K last-row
+logits bitwise equal with T16384 OFF. Three-round interleaved medians were
+20.09 s default and 20.34 s OFF, a measured gain. T16384 at 262K and its
+memory-pressure fallback remain open, nonblocking gates. Compare
+full tokens, logits and committed state locally before timing. No numerical identity
+tag is added. See [scratch ownership](engine/prefill/tiled-prefill.md#process-scratch-ownership).
+
+### Exact indexer projection batching
+
+**Default ON** for eligible ordinary prefill, with `STRIX_QPF2K_INDEX_BATCH=0` as
+the OFF switch. Baseline, GSQ and `STRIX_QPF2K_DEFAULTS=0` suppress the independent
+default. Explicit index rows OFF, shape and side-stream selections suppress automatic batching. Group views
+are collected until their first consumer and run with the same ordered FP32 chains
+and BF16 rounding; unsupported shapes use the existing exact path. This is separate
+from candidate `index_proj_wmma`; disabling that numerical option keeps exact
+batching. Effective config reports `index_batch`. Native local CI passed the
+index-batch fixture and found 32K last-row logits bitwise equal with batching OFF.
+
 ## Bit-changing prefill options
 
 Qwen's registry is [prefill_identity.hpp](../include/strix/prefill_identity.hpp). Each option is
 **on by default once READY**, with an individual off switch and a master exact-FP16 switch.
-The registry contains only `hc_output_wmma` (its bit in `kPrefillOptionsReady`). With every option on, the default prefill identity is
+The READY mask contains `hc_output_wmma`. The implemented candidate `index_proj_wmma` stays outside READY and is default OFF pending qualification. The default prefill identity remains
 `fp16-v1+hcout16` (`prefill_identity_hash` ee2cd64684149069); `--prefill-exact-fp16` gives the plain
 `fp16-v1` identity (a0094634843e16ee).
 
 | Option | What it does | Gain | Changes bits vs FP16 identity | Measured quality | Switch off (CLI / config / API / env) |
 |---|---|---|---|---|---|
 | `hc_output_wmma` (on) | HC output: FP16 low values and Q8 coefficients, WMMA accumulation in ascending K16 order, same sigmoid and stream mix | Passed a pre-declared confirmation holdout | yes | `hc_output_wmma` passed a pre-declared confirmation holdout; its NLL endpoint is measured against a rounding-equivalent control whose per-case movement is capped at +-0.02 nats/token (a bounded control allowance, not an unbiased estimate of the uncapped difference); the absolute NLL change vs the exact reference also passed (-0.37 % NLL/token, upper bound +0.38 %). The off switch restores the exact output path. | `--prefill-disable hc_output_wmma` / `prefill_disable = ["hc_output_wmma"]` / server-level only / `STRIX_PREFILL_HC_OUTPUT_WMMA=0` |
+| `index_proj_wmma` (off; candidate, outside READY) | BF16 indexer q/k WMMA with independent K16 panels and ordered FP32 panel addition; tag `idxproj16` | Pending local qualification | yes | Compiler, native execution, model fidelity and complete-workload gates pending | Opt in: `STRIX_PREFILL_INDEX_PROJ_WMMA=1`; off: `STRIX_PREFILL_INDEX_PROJ_WMMA=0`, `--prefill-disable index_proj_wmma`, config `prefill_disable = ["index_proj_wmma"]`; master exact switch also disables |
 
 The prefill identity hash is FNV-1a 64 of the identity name. The enabled-set tag is not
 executed-path evidence: OUT16 requires the fast HC component, the qualified wide shape
@@ -79,13 +134,13 @@ non-fast profiles can retain `hcout16` without executing OUT16. The once-per-pro
 stderr witness does not establish execution for every request.
 
 Use `--prefill-exact-fp16`, `prefill_exact_fp16 = true`, or `STRIX_PREFILL_EXACT_FP16=1`
-to switch it off. `--prefill-disable` accepts comma-separated names and can be repeated;
+to switch all arithmetic options off. `--prefill-disable` accepts comma-separated names and can be repeated;
 unknown or empty names are rejected. CLI/config restrictions combine with environment restrictions;
 a config `false` or empty array does not re-enable an environment-disabled option.
 These arithmetic controls preserve automatic route selection.
 
 The decode-token app and its `--http-serve` mode share these startup controls.
-`--config FILE` reads the two keys above as `key = value` assignments,
+`--config FILE` reads the arithmetic keys above and the exact startup booleans `qpf2k_early_setup` and `eager_code_load` as `key = value` assignments,
 one per line, with lowercase booleans, single-line arrays of double-quoted names and `#` comments.
 Unknown/duplicate keys and malformed values are rejected. For example:
 
@@ -146,7 +201,7 @@ Automatic HTTP budgets and batch L1 qualification remain off.
 The plain generation command resolves to the measured production organization with dense-A8 decode and fast-prefill-f16wmma-v1 prefill.
 
 - **Preconditions:** Pinned verified checkpoint, qualified gfx1151 target, A8 runtime, >=16 prompt tokens, positive generation, eligible eager registered mapping, unambiguous UMA/GTT observations and sufficient backing capacity.
-- **Automatic selection:** Largest prompt-fitting T in 8192/4096/2048/1024/256/64/16. Context rounds prompt + max(generation,512) up to 512, minimum 8192, clamped to the model maximum (262,144); T falls back 8192 -> 4096 -> 2048 before declining (insufficient-memory when no tile fits the budget; prompt-exceeds-model-context above the maximum); --unqualified-context is automatic above 8192. Explicit context is preserved. Full budgets: 8 GiB workspace / 1 GiB metadata / 120 GiB UMA / 4 GiB headroom, scaled down with available memory (at least 1 GiB headroom). Routed expert union and router rows are on. Tail owners follow the admitted ladder.
+- **Automatic selection:** Largest prompt-fitting T in 16384/8192/4096/2048/1024/256/64/16; automatic T16384 starts at 32,768 prompt tokens. Context rounds prompt + max(generation,512) up to 512, minimum 8192, clamped to the model maximum (262,144); T falls back from T16384 (when eligible) through 8192 -> 4096 -> 2048 before declining (insufficient-memory when no tile fits the budget; prompt-exceeds-model-context above the maximum); --unqualified-context is automatic above 8192. Explicit context is preserved. Full budgets: 8 GiB workspace / 1 GiB metadata / 120 GiB UMA / 4 GiB headroom, scaled down with available memory (headroom starts at at least 1 GiB). Native pools are priced at every T under UMA/GTT limits and can raise required headroom or lower the admitted tile. Under this pricing, 131,072 and 262,143 real-text tokens admit automatic T16384, and T8192 as before with `STRIX_QPF2K_T16K=0`, with no fallback. Routed expert union and router rows are on. Tail owners follow the admitted ladder.
 - **Fallback notice:** One admitted line reports T/context. Refusal prints `Qwen auto-prefill declined: <reason>; using serial prefill`. Explicit MTP/cohorts, serving prefix files, lookup, known-prefix/low-level flags and target-input export retain their explicit route without this notice. The diagnostic/execution-control variables STRIX_PREFILL_LOGITS_DIGEST, STRIX_RTX_EXPORT_STATE, STRIX_QRTX_STEP_DUMP and STRIX_PROMPT_BATCH_ROWS (non-empty, not 0) decline with the line above and fall back to the historical resolution, including its 8192-token default context: a longer prompt is then refused before any work (pass an explicit --context for a slow serial run). GSQ declines the new auto route. MTP decode and the HTTP server do not get fast prefill automatically yet. FP16 operand/plan refusal can retain dense-A8 tiling with an arithmetic-fallback reason. HTTP serving resolves its own automatic T8192 ([HTTP serving prefill](#qwen-serve-prefill)).
 - **Exactness evidence:** Tokens and terminal FP32 logits digests match the reference for the selected profile pair, including 32K/64K/128K/262K. Fast FP16 prefill is exact relative to its own reference, not bit-identical to dense-A8 serial prefill; longer-context fidelity remains outside the 8192 qualification.
 - **Off switch:** --baseline / STRIX_BASELINE=1 restores historical resolution; STRIX_PREFILL_F16=0 or --known-prefix-window=0 declines automatic tiling. --prefill-numerical-profile dense-a8 retains tiling with dense-A8 arithmetic. Controlled feature =0 or STRIX_QPF2K_DEFAULTS=0 also declines auto selection; exact operator A/B needs an explicit route with the same profile pair.
@@ -250,6 +305,21 @@ unchanged; its leased gather finds the pages cached.
   [fixture](../tests/hip_ple_window_warm_tests.hip)
 
 <a id="qwen-defaults"></a>
+
+### Exact compact QSA attention output
+
+**Engine:** `qwen`. **Control:** `STRIX_QPF2K_COMPACT_IMAGES`. **Default:** ON for eligible full-T score-ring owners.
+
+The already BF16-rounded attention output uses half-size BF16 storage, with exact
+FP32 widening at projection and diagnostic readers. Raw GDN/QSA images and shared
+decode/MTP layouts remain FP32. `STRIX_QPF2K_COMPACT_IMAGES=0` independently restores
+FP32 output containers after restart. Calculated memory saving: 96 MiB per T8192 owner.
+Native local CI passed host/HIP fixtures and the 32K last-row bitwise logit check.
+Interleaved A/B was neutral within noise (OFF 19.95 s, n=2, versus default 20.09 s);
+no speed gain claimed. Numerical identity is unchanged; physical execution identity
+and workspace pricing change. The seven-state-payload comparison remains open
+and nonblocking. See the
+[reader audit and native gate](engine/prefill/compact-stage-images.md). No measured gain is claimed.
 
 ### Combined QPF2K and wrapper defaults
 
@@ -361,7 +431,7 @@ Folds admitted inject/norm work and changes the lane-chain output schedule; band
 
 Uses admitted exact stage implementations and batches independent stages with bit 0x200.
 
-- **Preconditions:** Stage batching requires mask bits 0x3 as well as 0x200; normal eager prefill, 1..128 complete 64-row groups with no partial tiles, grouped norm enabled, BF16 KV and pooled-key storage. Index geometry is four heads of dimension 128, 16-byte aligned queries and prefixes bounded by pool capacity and 65536 blocks. The norm tensors share a weight format, have power-of-two dimensions 2..256, and admit the rotary geometry (half rotary dimension <=64). Rows need contiguous positions and common raw/KV owners, geometry, norm owners, journal, compression ratio and top-k. Private device tables/maxima and pinned descriptors must allocate before any launch/state write. Windows, cohorts, graphs, int8 KV, explicit tiled diagnostics and self-check modes keep their existing paths.
+- **Preconditions:** Stage batching requires mask bits 0x3 as well as 0x200; normal eager prefill, 1..256 complete 64-row groups with no partial tiles, grouped norm enabled, BF16 KV and pooled-key storage. Index geometry is four heads of dimension 128, 16-byte aligned queries and prefixes bounded by pool capacity and 65536 blocks. The norm tensors share a weight format, have power-of-two dimensions 2..256, and admit the rotary geometry (half rotary dimension <=64). Rows need contiguous positions and common raw/KV owners, geometry, norm owners, journal, compression ratio and top-k. Private device tables/maxima and pinned descriptors must allocate before any launch/state write. Windows, cohorts, graphs, int8 KV, explicit tiled diagnostics and self-check modes keep their existing paths.
 - **Automatic selection:** The bundle supplies QSA=1 and mask 0x2257 (bit 13 = attend occupancy, mask 0x257 turns only that off); ineligible stage shapes keep their prior implementation.
 - **Fallback notice:** Without tracing, stage-batch declines are silent and keep the per-group path. With STRIX_QPF2K_QSA_TRACE=1 and bit 0x200 requested, a decline prints qpf2k qsa stage_batch groups 0 pool 0 range 0 score 0 rope 0 norm 0 store 0 fallback 1. HIP execution errors propagate without retry after partial execution.
 - **Exactness evidence:** The qualification campaign compared 1K code and 8K prose receipts, terminal FP32 logits FNV and generated tokens against the unchanged reference. Repeat with the same prefill/decode identity; changing arithmetic profiles is a separate quality comparison. Stage-batching qualification additionally compared terminal logits and 1K code/8K prose receipts. Attend occupancy (bit 13): its kernel copy is byte-compared with the production attend kernel in 460 fixture cases (single and multiple 64-row groups, causal/visible tails, padded union chunks); terminal logits FNV and tokens equal at 4K, 17.7K, 32K and 131K.
@@ -2752,3 +2822,86 @@ by the IOMMU.
 - **Off switch:** `options amdgpu iommu_perfopt=0`, or boot the previous kernel
 - **Measured gain:** Qwen 32K prefill +2.9 % / +3.1 % (two repeats, one node, same power, equal or lower GPU clock); DeepSeek two-node decode within +/-1 % with one node on PerfOpt, both-node run pending
 - **Implementation / evidence:** [driver repo: PerfOpt](https://github.com/hyukudan/strix-halo-usb4-driver/blob/main/docs/PERFOPT.md)
+
+## HC low-band layout
+
+**Default ON (mode 3)** through decoder qpf2k defaults.
+OFF: `STRIX_QPF2K_HC_LOWBAND=0`; restart. Baseline/defaults-off and injected
+GSQ suppression follow the defaults table. Banded transposed low_t changes only
+addresses; projection stage/WMMA/injection order and the shared output rank chains
+are unchanged. Mode 3 also omits low16 stores only when no consumer reads them.
+The route guard admits projection form 4 and FP32 output v3 band 16; output WMMA,
+check mode, normalized16, inverse and other output/projection routes retain mode 0.
+At at most 512 padded rows only the unused-store omission applies. Numerical,
+kernel-plan and cache identities are unchanged. Native local CI passed 132/132
+cases with no stray stores, including eight T8224 cases with 512-row pool rounding.
+At 32K, last-row logits match mode 0 bitwise with `hc_output_wmma` OFF. Exact,
+bitwise-checked; no timing claim. Low-band is inactive on the default route.
+
+## PLE staged-gather acceptance fix
+
+Unconditional correctness fix; no OFF switch. Successful independent row-0
+consumption permits acceptance of the complete ordered deferred tail. Every row
+and head ID still matches, including row 0. Failed staging and invalid IDs retain
+the inline copy work list. Receipt staged_rows counts the full accepted block.
+Copy semantics, numerical identities, worker-error fallback and slot events are
+unchanged. CPU acceptance/fallback regression coverage is provided by
+`strix-ple-staged-gather-tests`; native local CI passed the PLE launcher and staged-gather
+fixtures. The staged versus `STRIX_PLE_STAGE_PREFETCH=0` gathered-byte comparison
+remains open and nonblocking; the fixtures do not establish that comparison.
+
+## Exact bundle control and reservation contract
+
+Baseline (`--baseline` or `STRIX_BASELINE=1`) and `STRIX_QPF2K_DEFAULTS=0`
+suppress early setup, eager loading, automatic T16384, compact images and
+index batching. Baseline also suppresses low-band layout. An existing
+`HIP_ENABLE_DEFERRED_LOADING` value remains under user control. The exact-FP16
+master controls arithmetic options; it does not disable exact organization items.
+Low-band mode 3 is live only on the exact-FP16 output route with
+`hc_output_wmma` OFF, not on the default output WMMA route.
+
+Pool capacities round up to 512 rows, preserving the historical 8192-row floor.
+Explicit T above 8192 must be a multiple of 32; T8224 is supported. All automatic
+T routes price the simultaneous native pools in UMA and GTT admission, including
+optional HC normalized16 (about 161 MiB at T8192), MoE A16/DA16 (140 MiB),
+HC packs, QSA descriptors/tables/maxima, and pinned aliases. Explicit tiled routes
+must supply `--known-prefix-host-headroom-bytes` covering the reported native
+host and device bytes. Zero or otherwise insufficient headroom is refused, including
+under `--baseline`: baseline does not restore the old explicit-route acceptance
+because these pools are reserved regardless of bundle switches. These conservative
+reservations can lower the admitted T even below the T16384 prompt threshold.
+At 131,072 and 262,143 real-text tokens the default admits automatic T16384, and
+with `STRIX_QPF2K_T16K=0` it admits T8192 as before, with no fallback.
+Setup growth drains old scratch readers before replacement; admission prices
+one additional largest-pool allocation for the replacement peak. Larger MTP
+group owners are included in explicit-route pool sizing. Execution never resizes these pools. Optional QSA
+stage allocation failure, compact-policy or capacity mismatch declines to the
+per-group path before any stage reader is submitted. Tail owners retain the
+shared high-water strides.
+
+Eager loading can increase resident code-object memory; the amount depends on
+the runtime and loaded kernels and is not a fixed workspace saving. Record it
+with process startup memory and wall time. Early setup adds no image allocation.
+
+Automatic index batching yields to explicit index rows OFF, index shape and
+side-stream mask selection. With batching OFF, historical mask-bit scheduling
+and shape controls apply. Zero-leading values consistently disable exact boolean
+switches. T16384 and index batching are excluded from session numerical identity,
+as are the other exact items; physical arena identities still describe storage.
+
+`/v1/capabilities` and HTTP generation statistics report `prefill_exact_items`
+separately from arithmetic identity: early setup, automatic T16384 and compact
+images are excluded on HTTP; index batching and low-band report their policy
+and route guard, eager loading reports the applied HIP policy, and the
+unconditional PLE acceptance fix is disclosed. `--print-effective-config` also
+reports `hc_lowband_policy` and `hc_lowband_route: "exact-fp16-output-only"`;
+the resolved policy can be nonzero while inactive on the default output WMMA
+route. It is not a kernel-launch witness.
+`index_proj_wmma` stays opt-in outside READY and is excluded from MTP and nested
+scheduling whenever its fast QSA component is selected.
+
+The PLE fix accepts the ordered deferred tail after independent row-0
+consumption. The previous path re-gathered the tail inline; both copy the same
+bytes. Every staged row ID, including row 0, remains checked before acceptance.
+Final-tree native local-CI results and open, nonblocking gates are listed
+in [bundle qualification](engine/prefill/hc-output-wmma-qualification.md#bundle-local-ci-evidence).

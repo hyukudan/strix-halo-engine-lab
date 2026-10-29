@@ -86,7 +86,7 @@ readers and both ranks as needed, verify tokens/digests first, then compare medi
 Do not add individual gains from different workloads or call a changed numerical identity bit-identical.
 Qwen long-context answers are checked with `tools/qualification/longctx_fidelity/` (generator ground truth,
 CPU tests first; its README states what a pilot does and does not establish). Keep comparative-runtime
-reference results out of that public kit. Qwen YaRN (`--rope-yarn`) is an explicit experimental mode: never a
+reference results out of that public kit. Qwen YaRN (`--rope-yarn`) is an explicit opt-in mode: never a
 default, never combined with exactness claims against native; new resolver defaults must be classified for rotary
 work in `apps/qwen_yarn_admission.inc` before YaRN accepts them.
 Kernel/IOMMU settings (including the GPU PerfOpt, `amdgpu.iommu_perfopt`, the lab nodes' default boot) are host decisions made
@@ -120,3 +120,60 @@ master `STRIX_PREFILL_EXACT_FP16=1`, `--prefill-exact-fp16`, or config
 Fast HC with this option is excluded from MTP and nested admission pending qualification;
 ordinary MTP/HTTP profiles retain their existing arithmetic. OFF restoration compares logits
 and seven state payloads to public main; compiled, lineage and cache identity bytes may differ.
+
+## Exact Qwen bundle controls and candidate indexer
+
+Exact defaults are ON: early static admission (`STRIX_QPF2K_EARLY_SETUP=0`,
+`--no-early-setup`, config `qpf2k_early_setup = false`); eager HIP code loading
+(`STRIX_EAGER_CODE_LOAD=0`, `--no-eager-code-load`, config `eager_code_load = false`);
+automatic T16384 from 32,768 prompt tokens (`STRIX_QPF2K_T16K=0`); exact indexer
+batching (`STRIX_QPF2K_INDEX_BATCH=0`). These are outside the bit-changing registry.
+Eager loading never overrides a user-set `HIP_ENABLE_DEFERRED_LOADING`. Setup and
+code loading move work into startup, without establishing reduced process wall time.
+T16384 must fall back to T8192 when its full UMA/GTT reservation does not fit.
+
+`index_proj_wmma` is implemented but outside `kPrefillOptionsReady`: default OFF,
+opt in with `STRIX_PREFILL_INDEX_PROJ_WMMA=1`. It uses tag `idxproj16` and the standard
+individual/master OFF controls. This explicit draft exception stays OFF until compiler,
+native execution, model fidelity and complete-workload gates pass. Existing
+`hc_output_wmma` behavior and the default/exact prefill hashes remain unchanged.
+See the [native bundle gates](docs/engine/prefill/hc-output-wmma-qualification.md#bundle-native-gates).
+
+HC low-band layout defaults to mode 3 through decoder qpf2k defaults;
+`STRIX_QPF2K_HC_LOWBAND=0` restores the old layout. It is live only with `hc_output_wmma` OFF (the exact-FP16 output route),
+not with the default output WMMA identity. Only the qpf2k projection
+form 4 to FP32 output v3 band 16 uses it. HC output WMMA, check mode, normalized16,
+inverse and other routes retain their old layout. Arithmetic and numerical identities
+are unchanged; restart for this cached control. Native local CI passed 132/132 cases
+without stray stores, including eight T8224 cases with 512-row pool rounding, and
+32K last-row logits matched mode 0 bitwise with `hc_output_wmma` OFF. Exact,
+bitwise-checked; no timing claim because low-band is inactive on the default route.
+See [local CI](docs/engine/prefill/hc-output-wmma-qualification.md#bundle-local-ci-evidence).
+
+Exact [compact QSA output images](docs/engine/prefill/compact-stage-images.md)
+default ON for eligible full-T score-ring owners;
+`STRIX_QPF2K_COMPACT_IMAGES=0` restores FP32 containers after restart.
+Calculated memory saving is 96 MiB per T8192 owner. Native local CI passed the
+host/HIP fixtures and 32K last-row bitwise logit comparison. Interleaved 32K A/B
+was neutral within noise (OFF 19.95 s, n=2, versus default 20.09 s); no speed
+gain claimed. Already rounded BF16 bits widen identically. Numerical,
+rotary, kernel-plan and saved-state/cache numerical identities are unchanged.
+The physical execution identity must change because it hashes the smaller arena
+sizes, offsets and strides; it is not a numerical identity. Effective config
+reports the requested policy; compiled organization reports admitted savings.
+
+PLE staged-gather acceptance now tracks successful independent row-0 consumption
+and accepts the complete ordered deferred tail only after comparing every staged
+row ID, including row 0. This bug fix is unconditional, with no switch; copy
+semantics, staging guards, worker-error fallback, slot events and identities stay
+unchanged. Native local CI passed all 11 device/host fixtures, including the PLE
+launcher and staged-gather tests. Baseline and `STRIX_QPF2K_DEFAULTS=0` each turn
+every controlled bundle item off. At 32K, last-row logits match bitwise between
+default and each OFF arm (early setup, eager loading, T16384, index batching, compact
+images). Three-round interleaved medians were 20.09 s default, 20.48 s early setup
+OFF, 20.34 s T16384 OFF and 20.07 s eager loading OFF. Early setup and T16384 show
+measured gains; eager loading is neutral within noise. These gains are not additive.
+At 131,072 and 262,143 real-text tokens the default admits automatic T16384, and with
+`STRIX_QPF2K_T16K=0` it admits T8192 as before, with no fallback. Open, nonblocking gates
+are the seven state payloads, T16384 at 262K and pressure fallback, and staged versus
+unstaged PLE gathered bytes; see [local CI](docs/engine/prefill/hc-output-wmma-qualification.md#bundle-local-ci-evidence).
