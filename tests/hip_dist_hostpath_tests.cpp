@@ -35,7 +35,7 @@ struct Mutate final : strix::dist::Transport {
         }
     }
 };
-void run(int fault, bool async = false) {
+void run(int fault, bool async = false, bool local_enable = false) {
     constexpr std::size_t capacity = 21U << 20U;
     std::vector<int> fds[2];
     for (unsigned k = 0; k < 4; ++k) {
@@ -54,6 +54,7 @@ void run(int fault, bool async = false) {
             auto t = strix::dist::usb4_host_descriptors(fds[r], {"a", "b", "c", "d"}, {3, 3, 2, 2}, 4096,
                                                        std::chrono::milliseconds(2000));
             strix::dist::Communicator c({r, 2, 17, 29}, std::make_unique<Mutate>(std::move(t), fault), capacity);
+            if (local_enable) c.enable_async_start();
             hipStream_t stream{};
             check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
             void *local = nullptr, *remote = nullptr;
@@ -111,9 +112,9 @@ void run(int fault, bool async = false) {
 
 // Alternate device regions without a caller-side receive synchronization. The
 // snapshot is the destination's last reader, just as sum2 is in the GLM schedule.
-void async_ordering() {
+void async_ordering(bool late) {
     constexpr std::size_t bytes = (2U << 20U) + 17U;
-    constexpr unsigned rounds = 8;
+    constexpr unsigned rounds = 16;
     auto pair = strix::dist::memory_pair();
     std::exception_ptr errors[2];
     const auto rank = [&](unsigned r, std::unique_ptr<strix::dist::Transport> transport) {
@@ -121,28 +122,40 @@ void async_ordering() {
             strix::dist::Communicator c({r, 2, 17, 29}, std::move(transport), bytes);
             hipStream_t stream{};
             check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
-            void *local[2]{}, *remote[2]{}, *snapshot[rounds]{};
-            hipEvent_t last_use[2]{}, source_free[2]{};
-            for (unsigned h = 0; h < 2; ++h) {
+            c.enable_async_start(); // no process-wide opt-in
+            void *local[4]{}, *remote[4]{}, *snapshot[rounds]{};
+            hipEvent_t last_use[4]{}, source_free[4]{};
+            bool has_source[4]{};
+            for (unsigned h = 0; h < 4; ++h) {
                 check(hipMalloc(&local[h], bytes)); check(hipMalloc(&remote[h], bytes));
                 check(hipEventCreateWithFlags(&last_use[h], hipEventDisableTiming));
                 check(hipEventCreateWithFlags(&source_free[h], hipEventDisableTiming));
                 check(hipEventRecord(last_use[h], stream));
             }
             for (auto& p : snapshot) check(hipMalloc(&p, bytes));
+            const auto retire = [&] {
+                for (unsigned h = 0; h < 4; ++h)
+                    if (has_source[h]) check(hipStreamWaitEvent(stream, source_free[h], 0));
+                check(hipStreamSynchronize(stream));
+            };
             for (unsigned k = 0; k < rounds; ++k) {
-                const unsigned h = k % 2;
-                if (k >= 2) check(hipStreamWaitEvent(stream, source_free[h], 0));
+                // Two members per bank. Retire at a pause before borrowing the
+                // other bank, then return to/reuse the original event generations.
+                if (k == 4 || k == 8 || k == 12) retire();
+                const unsigned h = (k / 4 % 2) * 2 + k % 2;
+                if (has_source[h]) check(hipStreamWaitEvent(stream, source_free[h], 0));
                 check(hipMemsetAsync(local[h], static_cast<int>(r * 32 + k + 1), bytes, stream));
                 if (!c.start_async(stream, local[h], remote[h], bytes, {7, 3, k}, last_use[h], source_free[h]))
                     throw std::runtime_error("async start did not select host pipeline");
+                has_source[h] = true;
+                if (!late) check(hipStreamWaitEvent(stream, source_free[h], 0));
                 // Unrelated work between start and finish must not delay RX H2D.
                 check(hipMemsetAsync(snapshot[k], 0, bytes, stream));
                 c.finish(stream, remote[h]);
                 check(hipMemcpyAsync(snapshot[k], remote[h], bytes, hipMemcpyDeviceToDevice, stream));
                 check(hipEventRecord(last_use[h], stream));
             }
-            check(hipStreamSynchronize(stream));
+            retire();
             std::vector<std::byte> got(bytes);
             for (unsigned k = 0; k < rounds; ++k) {
                 check(hipMemcpy(got.data(), snapshot[k], bytes, hipMemcpyDeviceToHost));
@@ -151,7 +164,7 @@ void async_ordering() {
                     throw std::runtime_error("async region/source reuse bytes differ");
                 check(hipFree(snapshot[k]));
             }
-            for (unsigned h = 0; h < 2; ++h) {
+            for (unsigned h = 0; h < 4; ++h) {
                 check(hipEventDestroy(last_use[h])); check(hipEventDestroy(source_free[h]));
                 check(hipFree(local[h])); check(hipFree(remote[h]));
             }
@@ -165,7 +178,7 @@ void async_ordering() {
 
 // A failed transport must wake a CRC worker sleeping on its publication counter;
 // destruction without finish must also cancel those waits before freeing memory.
-void stalled(bool abandon) {
+void stalled(bool abandon, bool async = false) {
     int pair[2];
     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, pair)) throw std::runtime_error("socketpair");
     int size = 4096;
@@ -176,12 +189,33 @@ void stalled(bool abandon) {
     constexpr std::size_t bytes = 2U << 20U;
     check(hipMalloc(&local, bytes)); check(hipMalloc(&remote, bytes));
     check(hipMemsetAsync(local, 91, bytes, stream));
+    hipEvent_t last_use{}, source_free{};
+    if (async) {
+        check(hipEventCreateWithFlags(&last_use, hipEventDisableTiming));
+        check(hipEventCreateWithFlags(&source_free, hipEventDisableTiming));
+        check(hipEventRecord(last_use, stream));
+    }
     ::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "1000", 1);
     const auto begin = std::chrono::steady_clock::now();
     {
         auto t = strix::dist::usb4_host_descriptors({pair[0]}, {"silent"}, {1}, 0, std::chrono::milliseconds(150));
         strix::dist::Communicator c({0, 2, 17, 29}, std::move(t), bytes);
-        c.start(stream, local, bytes, {7, 3, 1});
+        if (async) {
+            c.enable_async_start();
+            if (!c.start_async(stream, local, remote, bytes, {7, 3, 1}, last_use, source_free))
+                throw std::runtime_error("instance opt-in failed");
+        } else c.start(stream, local, bytes, {7, 3, 1});
+        if (async && abandon) {
+            c.cancel_pending("test cancellation");
+            check(hipDeviceSynchronize());
+            // Destroy caller fences while the poisoned communicator still lives.
+            check(hipEventDestroy(last_use)); check(hipEventDestroy(source_free));
+            last_use = source_free = nullptr;
+            try { c.start(stream, local, bytes, {}); throw std::runtime_error("cancel poison not retained"); }
+            catch (const std::exception& later) {
+                if (std::string(later.what()).find("stopped earlier") == std::string::npos) throw;
+            }
+        }
         if (!abandon) {
             bool failed = false;
             try { c.finish(stream, remote); }
@@ -193,6 +227,8 @@ void stalled(bool abandon) {
     if (std::chrono::steady_clock::now() - begin > std::chrono::seconds(3))
         throw std::runtime_error("pipeline cancellation exceeded bound");
     check(hipStreamSynchronize(stream));
+    if (last_use) check(hipEventDestroy(last_use));
+    if (source_free) check(hipEventDestroy(source_free));
     check(hipFree(local)); check(hipFree(remote)); check(hipStreamDestroy(stream));
     ::close(pair[1]);
 }
@@ -208,11 +244,15 @@ int main() try {
     ::setenv("STRIX_DIST_HOST_CRC_OVERLAP", "1", 1);
     run(0); run(1); run(2);
     stalled(false); stalled(true);
+    stalled(false, true); stalled(true, true);
+    // MiniMax-style per-instance enable must work with global mode still OFF.
+    run(0, true, true); run(1, true, true); run(2, true, true);
+    async_ordering(false); async_ordering(true);
     ::setenv("STRIX_DIST_ASYNC_START", "1", 1);
     for (const char* overlap : {"0", "1"}) {
         ::setenv("STRIX_DIST_HOST_CRC_OVERLAP", overlap, 1);
         run(0, true); run(1, true); run(2, true);
-        async_ordering();
+        async_ordering(false); async_ordering(true);
     }
     std::cout << "hostpath bytes, async regions, source lifetime, reuse, CRC/offset corruption and poison PASS\n";
     return 0;

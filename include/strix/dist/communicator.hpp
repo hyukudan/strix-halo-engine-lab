@@ -210,6 +210,8 @@ struct CommunicatorStats {
     double wire = 0.0;     // transport exchange, including the wait for the peer
     double check = 0.0;    // trailer and CRC checks, and the host to device copy being enqueued
     double overlap = 0.0;  // between start() returning and finish() being called (work enqueued meanwhile)
+    double host_reuse_wait = 0.0; // ordinary pinned receive staging, caller wait
+    double pipeline_reuse_wait = 0.0; // chunked receive staging, caller or worker wait
     double finish_wait = 0.0; // inside finish(), waiting for the progress thread
     std::chrono::steady_clock::time_point last_entry{};
     std::chrono::steady_clock::time_point last_staged{};   // payload staged, sending starts
@@ -267,7 +269,12 @@ public:
     // same as exchange()'s, so a peer may use either call for the same collective. The calling thread does the transfer;
     // not between start() and finish().
     void exchange_host(std::span<const std::byte> local, std::span<std::byte> remote, const Tag& tag);
-    // STRIX_DIST_ASYNC_START=1: full-host chunked path only. Publish remote at start;
+    // Per-communicator opt-in, without changing other engines/process environment.
+    void enable_async_start() { async_start_ = true; }
+    // Fatal teardown: stop and join host submission before caller events/buffers
+    // can be retired. The communicator remains poisoned; caller must drain GPU work.
+    void cancel_pending(const std::string& reason) noexcept;
+    // STRIX_DIST_ASYNC_START=1 or enable_async_start(): full-host chunked path only. Publish remote at start;
     // destination_last_use must already be recorded after its last reader. Records
     // source_free after all off-stream D2H: wait on it before overwriting local.
     // finish only joins validation/copy submission and waits on the final H2D event.

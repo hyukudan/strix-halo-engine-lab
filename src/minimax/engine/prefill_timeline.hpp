@@ -35,6 +35,7 @@ struct PrefillTimeline {
     unsigned layer = 0;
     bool full = false, received = false;
     Clock::time_point start{};
+    double pipeline_reuse_wait = 0, host_reuse_wait = 0;
 
     static void check(hipError_t e) {
         if (e != hipSuccess) throw std::runtime_error("prefill timeline HIP event failure");
@@ -62,6 +63,7 @@ struct PrefillTimeline {
     }
     void begin() {
         used = host_used = 0;
+        pipeline_reuse_wait = host_reuse_wait = 0;
         full = received = false;
         start = Clock::now();
     }
@@ -136,6 +138,8 @@ struct PrefillTimeline {
             std::printf("pftimeline rank %u: %s %.6f s count %zu\n", rank, t.category, t.seconds, t.count);
         std::printf("pftimeline rank %u: exposed-exchange-wait %.6f s | host recv-wait %.6f s | host send %.6f s%s\n",
                     rank, exposed, recv_host, send_host, full ? " | POOL EXHAUSTED: recording stopped (partial totals)" : "");
+        std::printf("pftimeline rank %u: pipeline reuse-wait %.6f s | ordinary host reuse-wait %.6f s (grouped units only; worker time may overlap compute)\n",
+                    rank, pipeline_reuse_wait, host_reuse_wait);
         std::fflush(stdout);
     }
 };

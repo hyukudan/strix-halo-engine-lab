@@ -4,6 +4,7 @@
 #include "minimax/engine/mm_defaults.hpp"
 
 #include <cstdlib>
+#include <array>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -94,6 +95,7 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MM_MARKOV_TOPC", "v1"},
     {"STRIX_MM_PF_ATTEND4", "0"},          {"STRIX_MM_PF_ROUTER_BATCH", "0"},  {"STRIX_MMX_PREFILL_MTFIT", "0"},
     {"STRIX_MM_PF_MSA_REWORK", "0"},       {"STRIX_MMX_PREFILL_PIPE", "0"},    {"STRIX_MM_PF_KV_TILE", "off"},
+    {"STRIX_MM_PF_ASYNC_START", "0"}, {"STRIX_MM_PF_LATE_SRC_FENCE", "0"},
     {"STRIX_MM_PF_TX_UNCACHED", "0"},      {"STRIX_DIST_CRC_PARALLEL", "0"},   {"STRIX_DIST_HOST_CRC_OVERLAP", "0"},
     {"STRIX_DIST_HOST_CHUNK_BYTES", "0"},  {"STRIX_MM_PF_IDX_TILE", "0"},
     {"STRIX_MM_PF_IDX_ROWS", "32"},        {"STRIX_MMX_MOE_GU_INTERLEAVE", "0"}, {"STRIX_MMX_MOE_SINGLE", "0"},
@@ -110,6 +112,7 @@ void test_table() {
         check(f != kFormer.end() && f->second == it.off, std::string("off value is the former path for ") + it.env);
     }
     check(envs.size() == kFormer.size(), "every former value has an item");
+    check(envs.count("STRIX_DIST_ASYNC_START") == 0, "MiniMax must not export a global async default");
 }
 
 void test_receipts(const char* path) {
@@ -163,6 +166,36 @@ void test_baseline() {
     const EnvMap mixed = {{md::kBaselineEnv, "1"}, {first.env, first.on}};
     for (const md::Resolved& x : md::resolve(lookup(mixed)))
         check(x.item == &first ? x.value == first.on : x.value == x.item->off, std::string("baseline + explicit ") + x.item->env);
+}
+
+void test_async_group() {
+    const auto minimum = md::pf_async_min_rows(nullptr);
+    check(minimum == 2048, "async minimum defaults to 2048");
+    for (const auto& rows : {std::array<std::size_t, 2>{4096, 3844}, {2048, 2048}, {4096, 2048}}) {
+        check(md::pf_async_group(true, rows, minimum), "every member meets inclusive threshold");
+        check(!md::pf_async_group(false, rows, minimum), "global off overrides qualifying group");
+    }
+    for (const auto& rows : {std::array<std::size_t, 2>{4096, 443}, {443, 4096}, {4096, 2047}, {2047, 4096}}) {
+        check(!md::pf_async_group(true, rows, minimum), "any small member rejects entire group");
+        check(md::pf_async_group(true, rows, md::pf_async_min_rows("0")), "zero restores unconditional async");
+        check(!md::pf_async_group(false, rows, 0), "global off overrides zero threshold");
+    }
+    const std::array<std::size_t, 4> four{4096, 3844, 4096, 443};
+    check(!md::pf_async_group(true, four, minimum), "four-member group checks final member");
+    check(md::pf_async_group(true, std::span(four).first(3), minimum), "only active members count");
+    check(!md::pf_async_group(true, {}, 0), "empty group is not async work");
+    check(!md::pf_async_group(true, std::span(four).first(1), md::pf_async_min_rows("4097")), "custom threshold");
+    for (const char* value : {"", "-1", "+1", "1x", " 2048", "184467440737095516160"}) {
+        bool rejected = false;
+        try { (void)md::pf_async_min_rows(value); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected, std::string("invalid async minimum: ") + value);
+    }
+    const EnvMap none, custom{{"STRIX_MM_PF_ASYNC_MIN_ROWS", "0"}};
+    check(lines(md::effective_config(md::Cli{}, lookup(none))).count("STRIX_MM_PF_ASYNC_MIN_ROWS=2048") == 1,
+          "inspection reports default threshold");
+    check(lines(md::effective_config(md::Cli{}, lookup(custom))).count("STRIX_MM_PF_ASYNC_MIN_ROWS=0") == 1,
+          "inspection reports custom threshold");
 }
 
 void test_cli() {
@@ -266,6 +299,7 @@ int main(int argc, char** argv) {
         test_off_switches();
         test_baseline();
         test_cli();
+        test_async_group();
         test_serve_preflight();
         test_apply();
     } catch (const std::exception& e) {

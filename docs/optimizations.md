@@ -1909,6 +1909,21 @@ Use the scalar gu4 MoE expert-address reader.
 - **Off switch:** STRIX_MINIMAX_GU4_SCALAR=OFF at CMake configure time
 - **Measured gain:** No isolated measurement
 
+<a id="minimax-grouped-prefill-async"></a>
+
+### Grouped prefill early destination and late source fence
+
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_ASYNC_START`, `STRIX_MM_PF_LATE_SRC_FENCE`, `STRIX_MM_PF_ASYNC_MIN_ROWS`. **Default:** ON for grouped calls whose every member has at least 2048 rows.
+
+A grouped prefill call publishes its receive destination early and fences each member's source only before the next
+producer overwrites it, so the copies overlap compute. Compute and scratch stay serialized; only copy timing changes.
+
+- **Preconditions:** Two-rank grouped prefill; every member of the grouped call has at least `STRIX_MM_PF_ASYNC_MIN_ROWS` rows (default 2048; `0` removes the gate). Smaller groups take the ordinary path with byte-identical scheduling. The decision uses only the ordered member row counts and is identical on both ranks.
+- **Exactness evidence:** Scheduling only: unchanged producer/post kernels, group rows, payload bytes, rank summation order, sequence/tags and chunk CRC. Complete token IDs identical in every measured arm, including resume, nested-512, nested-511 and a 7936-token grouped prompt on the async path (both ranks).
+- **Off switch:** `STRIX_MM_PF_ASYNC_START=0` (global); `STRIX_MM_PF_LATE_SRC_FENCE=0` for the late fence; `STRIX_MM_BASELINE=1` unless explicitly overridden.
+- **Measured gain:** Balanced 7940-token prefill (4096+3844): -2.3 to -2.6 % in both measurement orders. Unbalanced shapes (4096+443) measured neutral and take the ordinary path through the row gate.
+- **Implementation / evidence:** [grouped prefill](minimax-grouped-prefill.md)
+
 ## GLM
 
 ```sh

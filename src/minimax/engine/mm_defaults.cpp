@@ -4,6 +4,7 @@
 #include "minimax/serve/minimax_sched.hpp"
 
 #include <cstdio>
+#include <charconv>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
@@ -73,6 +74,10 @@ constexpr Item kItems[] = {
      "Prefill measurement: exact, 8K B/A 0.960 / 0.949 / 1.017; needs the Trellis tile hook, else a logged no-op"},
     {"pf_tx_uncached", "STRIX_MM_PF_TX_UNCACHED", "1", "0",
      "Prefill exchange measurement: exact, exchange-send 0.23 -> 0.002 s GPU, ~1.3 % (prefill module route)"},
+    {"pf_async_start", "STRIX_MM_PF_ASYNC_START", "1", "0",
+     "Grouped all-member >=2048-row gate (configurable); TP2 4096+3844 IDs identical, -2.3/-2.5 % with late fence; full state/workload qualification pending"},
+    {"pf_late_src_fence", "STRIX_MM_PF_LATE_SRC_FENCE", "1", "0",
+     "Admitted grouped async source lifetime; TP2 IDs identical, combined -2.3/-2.5 %; full state/workload qualification pending"},
     // transport (host path, bits unchanged)
     {"dist_crc_parallel", "STRIX_DIST_CRC_PARALLEL", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
     {"dist_host_crc_overlap", "STRIX_DIST_HOST_CRC_OVERLAP", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
@@ -91,6 +96,16 @@ const char* process_env(const char* name) { return std::getenv(name); }
 }  // namespace
 
 std::span<const Item> items() { return kItems; }
+
+std::size_t pf_async_min_rows(const char* value) {
+    if (value == nullptr) return 2048;
+    std::size_t rows = 0;
+    const char* end = value + std::strlen(value);
+    const auto parsed = std::from_chars(value, end, rows);
+    if (parsed.ec != std::errc{} || parsed.ptr != end)
+        throw std::invalid_argument("STRIX_MM_PF_ASYNC_MIN_ROWS: nonnegative row count required");
+    return rows;
+}
 
 bool baseline(const Lookup& env) {
     const char* v = env(kBaselineEnv);
@@ -200,6 +215,7 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
     }
     o << "build.gu4_scalar=" << (STRIX_MM_GU4_SCALAR ? "on" : "off") << "\n";
     for (const Resolved& r : resolve(env)) o << r.item->env << "=" << r.value << "\n";
+    o << "STRIX_MM_PF_ASYNC_MIN_ROWS=" << pf_async_min_rows(env("STRIX_MM_PF_ASYNC_MIN_ROWS")) << "\n";
     if (cli.app == "serve") {
         const auto policy = serve_policy(env);
         o << std::setprecision(std::numeric_limits<double>::max_digits10)
@@ -220,6 +236,7 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
         else args.emplace_back(argv[i]);
     }
     apply();
+    (void)pf_async_min_rows(process_env("STRIX_MM_PF_ASYNC_MIN_ROWS"));
     if (app == "serve") (void)serve_policy(process_env);
     if (!print) return false;
     std::fputs(effective_config(parse_cli(app, args), process_env).c_str(), stdout);

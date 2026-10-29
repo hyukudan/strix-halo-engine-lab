@@ -512,6 +512,17 @@ struct Engine::Impl {
     unsigned pf_router_rows = 8;                // STRIX_MM_PF_ROUTER_ROWS: 4 or 8
     bool pf_tx_uncached = false;              // STRIX_MM_PF_TX_UNCACHED: prefill producers write uncached TX
     bool pf_inplace = false;                   // STRIX_MM_PFX_INPLACE: o_proj / FFN outputs written straight into the TX slot
+    bool pf_async_start = true, pf_late_src_fence = true;
+    std::size_t pf_async_min_rows = 2048;
+    // Persistent per-member/per-activation-bank fences. Children currently fit
+    // one chunk, but must never alias the parked parent's event generations.
+    struct PfFences {
+        std::array<hipEvent_t, 4> last_r_use{}, p_free{};
+        std::array<bool, 4> destination_untracked{};
+        std::array<bool, 4> source_pending{};
+    };
+    std::array<PfFences, 2> pf_fences{};
+    bool pf_comm_inflight = false;
     unsigned pf_group = 2;                     // STRIX_MM_PF_GROUP: chunks interleaved together (2..4)
     std::vector<float*> grp_h, grp_hn;         // residual / normed rows of group members 1.. (member 0 uses h / hn)
     std::vector<float*> grp_part, grp_remote;  // communicator backend: each member's local / peer partials (member 0: part / remote)
@@ -534,7 +545,12 @@ struct Engine::Impl {
     // The events and streams created once per Engine (decode 13:52: ~154 runtime signals left at exit otherwise; one
     // Engine per process made it harmless, re-created Engines would leak). Device buffers stay with the process.
     ~Impl() {
+        if (pf_comm_inflight) comm.cancel_pending("MiniMax destroyed during grouped prefill");
         (void)hipDeviceSynchronize();
+        for (auto& bank : pf_fences) {
+            for (auto ev : bank.last_r_use) if (ev) (void)hipEventDestroy(ev);
+            for (auto ev : bank.p_free) if (ev) (void)hipEventDestroy(ev);
+        }
         moe::opt::cleanup_prefill_table_ring();
         for (auto* ptr : {nest_bank.h, nest_bank.hn, nest_bank.taps}) if (ptr) (void)hipFree(ptr);
         for (auto* events : {&idx_fork, &idx_join, &pf_idx_fork, &pf_idx_join, &pf_idx_fork_device, &pf_idx_join_device, &tev})
@@ -635,6 +651,10 @@ struct Engine::Impl {
         linears_opt = lin == nullptr || std::string(lin) == "opt" || std::string(lin) == "on";  // =load: loaded, switched off
         const char* moe = std::getenv("STRIX_MM_MOE");
         moe_opt = moe == nullptr || std::string(moe) != "off";  // default ON (measurement: bitwise, decode -15.5 %, TTFT -10.5 %); =off
+        if (const char* async_mode = std::getenv("STRIX_MM_PF_ASYNC_START")) pf_async_start = std::string(async_mode) != "0";
+        if (const char* late_fence = std::getenv("STRIX_MM_PF_LATE_SRC_FENCE")) pf_late_src_fence = std::string(late_fence) != "0";
+        pf_async_min_rows = defaults::pf_async_min_rows(std::getenv("STRIX_MM_PF_ASYNC_MIN_ROWS"));
+        if (pf_async_start) comm.enable_async_start();
         // STRIX_MM_PF_INTERLEAVE: unset / 1 / on = chunk interleave over the module when it is on, else over the
         // communicator (default; measurement: tokens + K/V/IK state + final rows identical, 8K TTFT 40.0 -> 35.4 s, 1K inert);
         // comm = the communicator even with the module loaded; 0 / off = chunk-serial.
@@ -905,6 +925,13 @@ struct Engine::Impl {
                     grp_part.push_back(dalloc<float>(T * kHidden));
                     grp_remote.push_back(dalloc<float>(T * kHidden));
                 }
+            }
+        }
+        for (auto& bank : pf_fences) {
+            for (unsigned c = 0; c < pf_group; ++c) {
+                hip_ok(hipEventCreateWithFlags(&bank.last_r_use[c], hipEventDisableTiming), "prefill destination event");
+                hip_ok(hipEventCreateWithFlags(&bank.p_free[c], hipEventDisableTiming), "prefill source event");
+                hip_ok(hipEventRecord(bank.last_r_use[c], nullptr), "prefill initial destination lifetime");
             }
         }
         kc = dalloc<std::uint16_t>(S * kLayers * C * kKVLocal);
@@ -1858,7 +1885,9 @@ struct Engine::Impl {
             tl = nullptr;
             return false;
         } catch (...) {
-            comm.transport().abort("prefill failure");
+            comm.cancel_pending("prefill failure");
+            pf_comm_inflight = false;
+            (void)hipDeviceSynchronize(); // joins above close host submission before device retirement
             tl = nullptr;
             task.open = false;
             task.saved = false;
@@ -1967,6 +1996,9 @@ struct Engine::Impl {
         float* const hn0 = hn;
         std::array<float*, 4> H{}, HN{}, P{}, R{};
         std::array<std::size_t, 4> N{};
+        auto& fences = pf_fences[child_bank ? 1U : 0U];
+        const double pipeline_reuse_before = comm.stats().pipeline_reuse_wait;
+        const double host_reuse_before = comm.stats().host_reuse_wait;
         const bool via_comm = !pf_active;  // STRIX_MM_PF_INTERLEAVE=comm (pf_active is off then)
         for (std::size_t c = 0; c < m; ++c) {
             H[c] = c == 0 ? h0 : grp_h[c - 1];
@@ -1974,6 +2006,17 @@ struct Engine::Impl {
             P[c] = !via_comm ? part : c == 0 ? part : grp_part[c - 1];  // the module copies `part` into its TX slot at once
             R[c] = !via_comm ? nullptr : c == 0 ? remote : grp_remote[c - 1];
             N[c] = std::min<std::size_t>(opt.max_rows, toks.size() - c * opt.max_rows);
+        }
+        // One deterministic decision for the whole unit, identical on both ranks.
+        // Rejected groups take exactly the ordinary off-switch scheduling path.
+        const bool async_group = defaults::pf_async_group(pf_async_start, {N.data(), m}, pf_async_min_rows);
+        // A rejected unit records no events. If this bank later returns to async,
+        // capture its intervening ordinary posts before publishing destinations.
+        for (std::size_t c = 0; via_comm && async_group && c < m; ++c) {
+            if (fences.destination_untracked[c]) {
+                hip_ok(hipEventRecord(fences.last_r_use[c], nullptr), "prefill destination route transition");
+                fences.destination_untracked[c] = false;
+            }
         }
         const auto use = [&](std::size_t c) {
             h = H[c];
@@ -2005,13 +2048,26 @@ struct Engine::Impl {
             Pending& e = fifo[(f_tail - 1) % fifo.size()];
             const auto ht = tl ? tl->host_begin("recv", task.c + e.c) : 0;
             comm.finish(nullptr, R[e.c]);
+            pf_comm_inflight = false;
             if (tl) tl->host_end(ht, true);
             e.done = true;
             inflight = false;
         };
         // Where chunk c's next partial is produced: its own buffer (communicator), `part` (module, copied at once), or the
         // module's next TX slot (in place).
-        const auto out_of = [&](std::size_t c) { return !via_comm && (pf_inplace || (pf_tx_uncached && N[c] > kMaxStepRows)) ? static_cast<float*>(pf->tx()) : P[c]; };
+        const auto wait_source = [&](std::size_t c) {
+            if (via_comm && fences.source_pending[c]) {
+                hip_ok(hipStreamWaitEvent(nullptr, fences.p_free[c], 0), "prefill source lifetime");
+                fences.source_pending[c] = false;
+            }
+        };
+        const auto last_read = [&](std::size_t c) {
+            if (via_comm && async_group)
+                hip_ok(hipEventRecord(fences.last_r_use[c], nullptr), "prefill destination last reader");
+            else if (via_comm) fences.destination_untracked[c] = true;
+        };
+        // All compute and shared scratch remain on main. Only copies overlap.
+        const auto out_of = [&](std::size_t c) { wait_source(c); return !via_comm && (pf_inplace || (pf_tx_uncached && N[c] > kMaxStepRows)) ? static_cast<float*>(pf->tx()) : P[c]; };
         const auto send = [&](std::size_t c, std::uint32_t which, unsigned L, const float* produced) {
             const std::size_t bytes = N[c] * kHidden * sizeof(float);
             if (!via_comm) {
@@ -2030,7 +2086,12 @@ struct Engine::Impl {
             tag.layer = L;
             tag.request = (calls + c) * 2 + which;
             const auto ht = tl ? tl->host_begin("send") : 0;
-            comm.start(nullptr, P[c], bytes, tag);
+            pf_comm_inflight = true; // also cover a partially submitted start throwing
+            if (async_group) {
+                fences.source_pending[c] = comm.start_async(nullptr, P[c], R[c], bytes, tag,
+                                                            fences.last_r_use[c], fences.p_free[c]);
+                if (!pf_late_src_fence) wait_source(c); // Fix A alone retains the all-D2H main fence
+            } else comm.start(nullptr, P[c], bytes, tag);
             if (tl) tl->host_end(ht, false);
             fifo[f_tail++ % fifo.size()] = Pending{c, false};
             inflight = true;
@@ -2064,6 +2125,7 @@ struct Engine::Impl {
                     const auto view = recv(c);
                     if (tl) tl->mark("ffn-post", true);
                     post_view(N[c], view, layers[L - 1].w_next, nullptr, nullptr);
+                    last_read(c);
                     if (tl) tl->mark("ffn-post", false);
                 }  // L0 > 0: done at the pause
                 float* o = out_of(c);
@@ -2075,6 +2137,7 @@ struct Engine::Impl {
                 const auto view = recv(c);
                 if (tl) tl->mark("attention-post-router", true);
                 post_view(N[c], view, y.w_post, y.wr, y.wb);
+                last_read(c);
                 if (tl) tl->mark("attention-post-router", false);
                 float* o = out_of(c);
                 stage_ffn(L, N[c], o);
@@ -2086,7 +2149,15 @@ struct Engine::Impl {
             const auto view = recv(c);
             if (tl) tl->mark("ffn-post", true);
             post_view(N[c], view, layers[L1 - 1].w_next, nullptr, nullptr);
+            last_read(c);
             if (tl) tl->mark("ffn-post", false);
+        }
+        // A unit may pause, run decode on part/remote, park, or start an
+        // ungrouped tail next. Close every outstanding source read on main.
+        for (std::size_t c = 0; c < m; ++c) wait_source(c);
+        if (tl) {
+            tl->pipeline_reuse_wait += comm.stats().pipeline_reuse_wait - pipeline_reuse_before;
+            tl->host_reuse_wait += comm.stats().host_reuse_wait - host_reuse_before;
         }
         return L1 == kLayers ? HN[m - 1] : nullptr;
     }
