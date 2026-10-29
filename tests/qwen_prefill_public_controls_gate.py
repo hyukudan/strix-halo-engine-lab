@@ -134,11 +134,14 @@ def main():
     parser.add_argument("--reference-logits", type=Path)
     parser.add_argument("--reference-state", type=Path)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--logits-command", type=Path, required=True)
+    # Omit --logits-command for long prompts: full-vocabulary teacher logits of every row exceed the
+    # engine's teacher-spool bound (about 32 GB at 32K). The committed state then carries the evidence.
+    parser.add_argument("--logits-command", type=Path)
     parser.add_argument("--state-command", type=Path, required=True)
     args = parser.parse_args()
-    commands = {"logits": json.loads(args.logits_command.read_text()),
-                "state": json.loads(args.state_command.read_text())}
+    commands = {"state": json.loads(args.state_command.read_text())}
+    if args.logits_command:
+        commands = {"logits": json.loads(args.logits_command.read_text()), **commands}
     for kind, command in commands.items():
         if not isinstance(command, list) or not command or not all(isinstance(value, str) for value in command):
             parser.error("command files must contain nonempty JSON argv arrays")
@@ -148,12 +151,12 @@ def main():
                                  "--teacher-logits-file", "--session-save"))
                or value.split("=", 1)[0] == "--validation-final-state" for value in command):
             parser.error("base commands must leave controls and artifact destinations to the gate")
-    if not args.capture_only and (not args.reference_logits or not args.reference_state):
-        parser.error("comparison requires both logits and seven-component state references")
+    if not args.capture_only and (not args.reference_state or bool(args.reference_logits) != bool(args.logits_command)):
+        parser.error("comparison requires the seven-component state reference, plus a logits reference exactly when logits are captured")
     checkout = Path(__file__).resolve().parents[1]
     if args.output.resolve().is_relative_to(checkout):
         parser.error("qualification outputs must stay outside the checkout")
-    reference_logits = None if args.capture_only else digest(args.reference_logits)
+    reference_logits = None if args.capture_only or not args.reference_logits else digest(args.reference_logits)
     reference_state = None if args.capture_only else state_signature(args.reference_state)
     args.output.mkdir(parents=False, exist_ok=False)
     env = os.environ.copy()
@@ -195,10 +198,13 @@ def main():
                     raise ValueError("OFF receipt did not report plain FP16")
                 if args.arm != "public-main" and kind == "logits" and not receipt.get("teacher_forced_tiled_input_rows", 0):
                     raise ValueError("run did not exercise tiled prefill")
+                if args.arm != "public-main" and kind == "state" and "logits" not in commands and \
+                        not receipt.get("known_prefix_tiled_prefill"):
+                    raise ValueError("state-only run did not exercise tiled prefill")
                 if args.arm == "on" and (receipt.get("prefill_identity") != "fp16-v1+hcout16" or
                         receipt.get("prefill_options_active") != ["hc_output_wmma"]):
                     raise ValueError("ON receipt did not report HC output WMMA")
-            actual = {"logits_sha256": digest(logits), "state": state_signature(state / ("session.bin" if args.state_format == "session" else "manifest.json"))}
+            actual = {"logits_sha256": digest(logits) if "logits" in commands else None, "state": state_signature(state / ("session.bin" if args.state_format == "session" else "manifest.json"))}
             (directory / "signature.json").write_text(json.dumps(actual, indent=2) + "\n")
             if not args.capture_only and (actual["logits_sha256"] != reference_logits or actual["state"] != reference_state):
                 raise ValueError(args.arm + " logits/state differ from reference: " + directory.name)

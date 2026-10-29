@@ -5,27 +5,36 @@ set -euo pipefail
 : "${EVIDENCE:?set EVIDENCE to a fresh private directory outside Git}"
 mkdir -p "$EVIDENCE"
 set -eu
+# Full-vocabulary teacher logits of every 32K row exceed the engine's teacher-spool bound, so 32K
+# compares the committed state only (all KV/index rows, fixed components, token history).
 for n in 4k 32k; do
   for scope in fast gsq baseline; do
     ref="$EVIDENCE/$n-$scope-public"
+    on="$EVIDENCE/$n-$scope-on"
+    public_logits=(); candidate_logits=(); off_reference=(); on_reference=()
+    if [ "$n" = 4k ]; then
+      public_logits=(--logits-command "$PINS/public-main/$n/$scope/logits.json")
+      candidate_logits=(--logits-command "$PINS/candidate/$n/$scope/logits.json")
+      off_reference=(--reference-logits "$ref/public-main-legacy1/logits.bin")
+      on_reference=(--reference-logits "$on/on-legacy1/logits.bin")
+    fi
     python3 tests/qwen_prefill_public_controls_gate.py --arm public-main --capture-only --state-format session \
-      --logits-command "$PINS/public-main/$n/$scope/logits.json" \
+      "${public_logits[@]}" \
       --state-command "$PINS/public-main/$n/$scope/state.json" --output "$ref"
     python3 tests/qwen_prefill_public_controls_gate.py --arm off --state-format session \
-      --logits-command "$PINS/candidate/$n/$scope/logits.json" \
+      "${candidate_logits[@]}" \
       --state-command "$PINS/candidate/$n/$scope/state.json" \
-      --reference-logits "$ref/public-main-legacy1/logits.bin" \
+      "${off_reference[@]}" \
       --reference-state "$ref/public-main-legacy1/state/session.bin" --output "$EVIDENCE/$n-$scope-off"
     witness=""
     if [ "$scope" = fast ]; then witness=--require-hc-witness; fi
-    on="$EVIDENCE/$n-$scope-on"
     python3 tests/qwen_prefill_public_controls_gate.py --arm on --capture-only --state-format session $witness \
-      --logits-command "$PINS/candidate/$n/$scope/logits.json" \
+      "${candidate_logits[@]}" \
       --state-command "$PINS/candidate/$n/$scope/state.json" --output "$on"
     python3 tests/qwen_prefill_public_controls_gate.py --arm on --state-format session $witness \
-      --logits-command "$PINS/candidate/$n/$scope/logits.json" \
+      "${candidate_logits[@]}" \
       --state-command "$PINS/candidate/$n/$scope/state.json" \
-      --reference-logits "$on/on-legacy1/logits.bin" \
+      "${on_reference[@]}" \
       --reference-state "$on/on-legacy1/state/session.bin" --output "$on-repeat"
   done
 done
@@ -34,15 +43,20 @@ for n in 4k 32k; do
   for scope in fast gsq baseline; do
     for arm in off on; do
       ref="$EVIDENCE/$n-$scope-$arm-full"
-      python3 tests/qwen_prefill_public_controls_gate.py --arm "$arm" --capture-only \
-        --logits-command "$PINS/candidate/$n/$scope/logits.json" \
-        --state-command "$PINS/candidate/$n/$scope/state.json" --output "$ref"
       case_name=on-legacy1
       if [ "$arm" = off ]; then case_name=cli-individual-legacy1; fi
+      candidate_logits=(); full_reference=()
+      if [ "$n" = 4k ]; then
+        candidate_logits=(--logits-command "$PINS/candidate/$n/$scope/logits.json")
+        full_reference=(--reference-logits "$ref/$case_name/logits.bin")
+      fi
+      python3 tests/qwen_prefill_public_controls_gate.py --arm "$arm" --capture-only \
+        "${candidate_logits[@]}" \
+        --state-command "$PINS/candidate/$n/$scope/state.json" --output "$ref"
       python3 tests/qwen_prefill_public_controls_gate.py --arm "$arm" \
-        --logits-command "$PINS/candidate/$n/$scope/logits.json" \
+        "${candidate_logits[@]}" \
         --state-command "$PINS/candidate/$n/$scope/state.json" \
-        --reference-logits "$ref/$case_name/logits.bin" \
+        "${full_reference[@]}" \
         --reference-state "$ref/$case_name/state/manifest.json" --output "$ref-repeat"
     done
   done

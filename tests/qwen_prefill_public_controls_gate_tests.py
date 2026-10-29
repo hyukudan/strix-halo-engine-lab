@@ -52,6 +52,29 @@ class CommandValidationTests(unittest.TestCase):
             with self.subTest(flags=flags):
                 self.check_command(flags, accepted=True)
 
+    def test_state_only_long_prompt(self):
+        # Long prompts omit teacher logits; a logits reference then makes no sense.
+        for with_logits_reference, accepted in ((False, True), (True, False)):
+            with self.subTest(with_logits_reference=with_logits_reference), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "state.json").write_text(json.dumps(["decoder", "model.gguf", "1"]))
+                argv = ["gate", "--reference-state", str(root / "manifest.json"),
+                        "--output", str(root / "output"), "--state-command", str(root / "state.json")]
+                if with_logits_reference:
+                    argv += ["--reference-logits", str(root / "reference.bin")]
+                with patch("sys.argv", argv), patch.object(
+                        gate, "state_signature", side_effect=ReferenceReached) as signature:
+                    if accepted:
+                        with self.assertRaises(ReferenceReached):
+                            gate.main()
+                        signature.assert_called_once_with(root / "manifest.json")
+                    else:
+                        with patch("sys.stderr"), self.assertRaises(SystemExit) as error:
+                            gate.main()
+                        self.assertEqual(error.exception.code, 2)
+                        signature.assert_not_called()
+                    self.assertFalse((root / "output").exists())
+
     def test_artifact_destinations_rejected(self):
         for kind in ("logits", "state"):
             for option in ("--validation-final-state", "--teacher-logits-file"):

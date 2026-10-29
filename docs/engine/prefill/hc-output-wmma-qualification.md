@@ -13,7 +13,10 @@ profile pair, T, tails, output policy, state layout and workspace budgets identi
 between builds. Only argv[0] changes. Command files contain no prefill controls or
 artifact destinations. For 4k and 32k use exactly 4096 and 32768 prompt tokens.
 The logits command pins `--teacher-forced-score --generate 1` with all-row tiled
-output. The state command pins eager greedy generation, terminal-row output,
+output; it runs at 4k only, because full-vocabulary teacher logits of every 32k row
+exceed the engine's 16 GiB teacher-spool bound. At 32k the gate omits
+`--logits-command` and compares the committed state, which covers every KV/index
+row, the fixed components and the token history. The state command pins eager greedy generation, terminal-row output,
 full-row tiled prefill and positive generation, leaving capacity for generation.
 State-session runs need a >=1024-row cache unit and sufficient
 `--session-capture-host-bytes`; do not enable session suffix or fixed MTP modes.
