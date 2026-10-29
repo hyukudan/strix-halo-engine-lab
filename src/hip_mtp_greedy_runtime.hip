@@ -55,7 +55,7 @@ struct HipMtpGreedyRuntime::Impl {
         std::chrono::steady_clock::time_point start{};
     } ds;
     std::unique_ptr<MtpNgramDraft> ngram;
-    std::unique_ptr<MtpFrameDraft> frame; // opt-in strict tool-call frames (before the n-gram extension)
+    std::unique_ptr<MtpFrameDraft> frame; // strict tool-call frames (batch runner default on; before the n-gram extension)
     std::unique_ptr<MtpContextDraft> context; // opt-in replacement of `ngram`, or beside it when context_observe
     bool context_observe=false; // the context drafter only learns and proposes wide cycles
     double mtp_accepted_ema=-1.0; // accepted candidates per drafted (not copy-first) cycle, for copy-first
@@ -311,7 +311,7 @@ void HipMtpGreedyRuntime::draft_end() {
             (void)i.context->begin_cycle(pending,i.candidates,confident,depth,unused,i.min_probability,kept_expected);
             i.context->discard_selection();
         }
-        // Strict tool-call frames (opt-in) take precedence over the n-gram extension in a cycle they propose for;
+        // Strict tool-call frames take precedence over the n-gram extension in a cycle they propose for;
         // both are computed on the predictor's drafts so that each one's shadow learns as usual.
         std::vector<std::uint32_t> frame_extension;std::vector<double> frame_acceptance;std::size_t frame_confident=0;
         if(i.frame && cost_model && !survival && !full_chain && i.window && i.probabilities.size()==i.candidates.size() &&

@@ -1687,6 +1687,17 @@
     "doc_anchor": "docs/optimizations.md#qwen-rtx-tail-large"
   },
   {
+    "engine": "qwen",
+    "name": "Tool-call frame drafts",
+    "flag_or_env": "STRIX_BATCH_TOOL_DRAFT; tool_draft request field; STRIX_TOOL_DRAFT_PREFIX_GATE",
+    "default": "ON (batched decoding)",
+    "exact": "Drafts only: the target verifies every row, so committed tokens are unchanged; 9 tool-call cases 54/54 exact, 24/24 on repeated waves, and 18/18 default against off in one process.",
+    "gain": "Tool-call traces: one case +3.3 to +3.5 %, all others within -0.08 to +0.9 %.",
+    "preconditions": "Batched MTP decoding with a chat template that defines tool-call frame tokens.",
+    "off_switch": "STRIX_BATCH_TOOL_DRAFT=0 (or \"tool_draft\":false per request); STRIX_TOOL_DRAFT_PREFIX_GATE=0 restores the ungated drafter",
+    "doc_anchor": "docs/optimizations.md#qwen-tool-draft"
+  },
+  {
     "engine": "deepseek",
     "name": "Bounded serving observation",
     "flag_or_env": "STRIX_SERVE_OBSERVE_EXPIRY_S",

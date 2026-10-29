@@ -90,7 +90,7 @@ struct MtpServeResult {
     // Context-source diagnostics (batched, opt-in sources): shadow proposals made / scored / leading rows right
     // (n-gram or context drafter), and the frame drafter's cycles inside a frame / its shadow proposals.
     std::uint64_t source_shadow = 0, source_scored = 0, source_right = 0, frame_cycles = 0, frame_shadow = 0;
-    std::uint64_t tool_rows = 0, tool_accepted = 0; // strict tool-call frame rows proposed / accepted (batched, opt-in)
+    std::uint64_t tool_rows = 0, tool_accepted = 0; // strict tool-call frame rows proposed / accepted (batched, default on)
     double prompt_ms = 0.0, decode_ms = 0.0;
     std::string finish = "length"; // stop|length|context|cancelled
     // --rtx-state-import: the receipt of the imported state this request started from (JSON object), else empty.
@@ -1091,9 +1091,11 @@ public:
     // contexts of the other decoding requests (joint speculation across concurrent conversations).
     bool context_peers = [] { const char* v = std::getenv("STRIX_BATCH_NGRAM_PEERS"); return v && v[0] == '1'; }();
     // Strict tool-call frame proposals (strix/mtp_frame_draft.hpp): the template's <tool_call> / </tool_call> token
-    // ids (set by the server from its tokenizer; {0, 0}: unavailable) and the engine default STRIX_BATCH_TOOL_DRAFT=1.
+    // ids (set by the server from its tokenizer; {0, 0}: unavailable) and the engine default: on (exact, the target
+    // verifies every row; not slower on the tool-call traces with the committed-prefix gate), STRIX_BATCH_TOOL_DRAFT=0
+    // turns it off.
     std::array<std::uint32_t, 2> frame_tokens{};
-    bool tool_draft_default = [] { const char* v = std::getenv("STRIX_BATCH_TOOL_DRAFT"); return v && v[0] == '1'; }();
+    bool tool_draft_default = [] { const char* v = std::getenv("STRIX_BATCH_TOOL_DRAFT"); return !(v && v[0] == '0'); }();
     // interleave: a joining request's prompt advances one unit (a tiled block, a tail block or
     // `serial_rows_per_step` serial rows) per step, between the decode cycles of the others; otherwise
     // admit() runs the whole prompt.
@@ -1793,6 +1795,8 @@ private:
                     const double p = std::atof(v);
                     if (p > 0.0 && p < 1.0) frame.single_prior = p;
                 }
+                // Committed-prefix gate (default 16 tokens; STRIX_TOOL_DRAFT_PREFIX_GATE=0 turns it off, invalid values keep 16).
+                frame.prefix_gate = parse_frame_draft_prefix_gate(std::getenv("STRIX_TOOL_DRAFT_PREFIX_GATE"));
                 s.greedy->enable_frame_draft(s.request.prompt, frame);
             }
         }

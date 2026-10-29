@@ -20,6 +20,7 @@ void MtpFrameDraft::reset(std::span<const std::uint32_t> prompt) {
     context_.clear();
     frames_.clear();
     open_at_ = SIZE_MAX;
+    gate_open_ = false;
     // cells [0, kRowCells): single earlier frame; [kRowCells, 2 kRowCells): confirmed by two or more
     right_.assign(2 * kRowCells, config_.prior * config_.prior_weight);
     for (std::size_t c = 0; c < kRowCells; ++c) right_[c] = config_.single_prior * config_.prior_weight;
@@ -34,8 +35,31 @@ void MtpFrameDraft::reset(std::span<const std::uint32_t> prompt) {
 void MtpFrameDraft::push(std::uint32_t token) {
     context_.push_back(token);
     const auto at = context_.size() - 1;
-    if (token == config_.open) open_at_ = at;
-    else if (token == config_.close && open_at_ != SIZE_MAX) { frames_.push_back({open_at_, at}); open_at_ = SIZE_MAX; }
+    if (token == config_.open) { open_at_ = at; gate_open_ = config_.prefix_gate == 0; }
+    else if (token == config_.close && open_at_ != SIZE_MAX) {
+        frames_.push_back({open_at_, at});
+        open_at_ = SIZE_MAX;
+        return;
+    }
+    // After the opener as well, so that a one-token gate is decided on the open token itself.
+    if (open_at_ != SIZE_MAX && !gate_open_ && at + 1 - open_at_ == config_.prefix_gate) {
+        const std::size_t n = config_.prefix_gate;
+        gate_open_ = std::any_of(frames_.begin(), frames_.end(), [&](const auto& f) {
+            return f.second - f.first + 1 > n && std::equal(context_.begin() + f.first, context_.begin() + f.first + n,
+                                                         context_.begin() + open_at_);
+        });
+    }
+}
+
+std::uint32_t parse_frame_draft_prefix_gate(const char* text, std::uint32_t fallback) noexcept {
+    if (!text || !*text) return fallback;
+    std::uint32_t value = 0;
+    for (const char* c = text; *c; ++c) {
+        if (*c < '0' || *c > '9') return fallback;
+        value = value * 10 + static_cast<std::uint32_t>(*c - '0');
+        if (value > 4096) return fallback;
+    }
+    return value;
 }
 
 double MtpFrameDraft::acceptance(std::size_t row) const {
@@ -93,9 +117,15 @@ std::vector<std::uint32_t> MtpFrameDraft::begin_cycle(std::uint32_t pending, std
     if (!started_) { push(pending); started_ = true; }
     shadow_ = {};
     if (open_at_ != SIZE_MAX) ++stats_.frame_cycles;
+    if (open_at_ != SIZE_MAX && !gate_open_) { ++stats_.gated_cycles; return {}; }
     confident = std::min(confident, drafts.size());
     if (confident >= room) return {};
     const auto prefix = drafts.first(confident);
+    // A frame opened inside the unverified drafts has no committed prefix yet.
+    if (config_.prefix_gate && std::find(prefix.begin(), prefix.end(), config_.open) != prefix.end()) {
+        ++stats_.gated_cycles;
+        return {};
+    }
     bool ambiguous = false;
     std::size_t support = 0;
     auto tokens = lookup(prefix, std::min<std::size_t>(config_.max_rows, room - confident), ambiguous, support);
