@@ -1,9 +1,13 @@
 #include "strix/serial_request.hpp"
+#include "../apps/bitcalc_measurement.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <span>
@@ -569,6 +573,82 @@ void prepared_target_cursor_tests() {
 }  // namespace
 
 int main() {
+    {
+        const auto set_environment=[](const char* name,const char* value) {
+#if defined(_WIN32)
+            _putenv_s(name,value?value:"");
+#else
+            if(value) setenv(name,value,1);else unsetenv(name);
+#endif
+        };
+        const auto saved_environment=[](const char* name)->std::optional<std::string> {
+            if(const char* value=std::getenv(name)) return std::string(value);
+            return std::nullopt;
+        };
+        const auto out=saved_environment("STRIX_BITCALC_LOGITS_OUT");
+        const auto force=saved_environment("STRIX_BITCALC_FORCE_TOKENS");
+        set_environment("STRIX_BITCALC_LOGITS_OUT",nullptr);
+        set_environment("STRIX_BITCALC_FORCE_TOKENS",nullptr);
+        strix::decode_cli::BitcalcMeasurement disabled;
+        expect(!disabled.enabled() && !disabled.hook(),"no environment leaves measurement disabled");
+        const char* capture="bitcalc-measurement-test.bin";
+        const char* tokens="bitcalc-measurement-test.tokens";
+        {std::ofstream file(tokens);file<<"2, 0\n";}
+        set_environment("STRIX_BITCALC_LOGITS_OUT",capture);
+        set_environment("STRIX_BITCALC_FORCE_TOKENS",tokens);
+        {
+            strix::decode_cli::BitcalcMeasurement measured;
+            measured.prepare(4,16,3);
+            expect(measured.force_tokens_sha256()==strix::model_content_identity_hex(strix::sha256_bytes(
+                std::as_bytes(std::span<const char>("2, 0\n",5U)))),"forcing receipt hashes the exact input bytes");
+            const auto hook=measured.hook();
+            const std::array<float,4> values{0.0F,5.0F,5.0F,-0.0F};
+            expect(hook(0,15,1,values)==2 && hook(1,16,1,values)==0 && hook(2,17,1,values)==1 &&
+                measured.forced_steps()==2,"forcing uses only supplied steps and retains unforced argmax");
+            measured.finish();
+            std::ifstream file(capture,std::ios::binary);
+            std::array<std::uint32_t,6> header{};
+            file.read(reinterpret_cast<char*>(header.data()),sizeof(header));
+            std::array<float,4> copied{};
+            file.read(reinterpret_cast<char*>(copied.data()),sizeof(copied));
+            expect(header==std::array<std::uint32_t,6>{0x42434C47U,0,15,1,2,4} &&
+                std::bit_cast<std::array<std::uint32_t,4>>(copied)==std::bit_cast<std::array<std::uint32_t,4>>(values) &&
+                std::filesystem::file_size(capture)==3U*(24U+16U),
+                "finalized binary records preserve exact logits bits and metadata");
+        }
+        {std::ofstream file(tokens);file<<"4294967296";}
+        bool rejected=false;
+        try {strix::decode_cli::BitcalcMeasurement bad;bad.prepare(4,16,3);} catch(const std::invalid_argument&) {rejected=true;}
+        expect(rejected,"forcing rejects overflowing token IDs");
+        {std::ofstream file(tokens);file<<"4";}
+        rejected=false;
+        try {strix::decode_cli::BitcalcMeasurement bad;bad.prepare(4,16,3);}
+        catch(const std::invalid_argument&) {rejected=true;}
+        expect(rejected,"forcing validates tokens against vocabulary before execution");
+        std::filesystem::remove(capture);std::filesystem::remove(tokens);
+        set_environment("STRIX_BITCALC_LOGITS_OUT",out?out->c_str():nullptr);
+        set_environment("STRIX_BITCALC_FORCE_TOKENS",force?force->c_str():nullptr);
+    }
+    {
+        ScriptedBackend backend;
+        backend.outputs = {{1.0F, 4.0F, 4.0F, 0.0F}, {0.0F, 0.0F, 9.0F, 0.0F}};
+        const std::array<std::uint32_t, 1> prefix{0};
+        strix::SerialGreedyRequest request{prefix, 4, 8, 3, 3};
+        unsigned selections = 0;
+        request.emission_hook = [&](std::uint64_t step, std::uint64_t position,
+                                    std::uint32_t argmax, std::span<const float> values) {
+            expect(step == selections && position == step, "emission observes each actual logits row");
+            expect(argmax == (step ? 2U : 1U) && std::equal(values.begin(), values.end(), backend.outputs[step].begin()),
+                "emission retains engine firstmax ties and exact selection logits");
+            ++selections;
+            return step ? 3U : 0U;
+        };
+        const auto result = strix::execute_serial_greedy_request(request, backend);
+        expect(result.generated_tokens == std::vector<std::uint32_t>({0, 3}) && selections == 2 &&
+            backend.calls == std::vector<std::pair<std::uint32_t, std::uint64_t>>({{0, 0}, {0, 1}}) &&
+            result.stop_reason == strix::SerialRequestStopReason::eos,
+            "emitted tokens drive decode inputs, receipt and inclusive EOS instead of argmax");
+    }
     prefix_cursor_tests();
     prepared_target_cursor_tests();
     {

@@ -862,6 +862,47 @@ int main(int argc, char** arguments) {
         auto r=request; r.environment["STRIX_PREFIX_CACHE"]="0";
         const auto got=resolve(r,memory);
         expect(got.options.route_owned==base.options.route_owned && numerical(got)==numerical(base) && plan_ids(got.options)==base_ids,"environment off numerical identity");
+        const auto set_measurement=[](const char* name,const char* value) {
+#if defined(_WIN32)
+            _putenv_s(name,value?value:"");
+#else
+            if(value) ::setenv(name,value,1); else ::unsetenv(name);
+#endif
+        };
+        const auto saved=[](const char* name)->std::optional<std::string> {
+            if(const char* value=std::getenv(name)) return std::string(value);
+            return {};
+        };
+        const auto saved_out=saved("STRIX_BITCALC_LOGITS_OUT");
+        const auto saved_force=saved("STRIX_BITCALC_FORCE_TOKENS");
+        set_measurement("STRIX_BITCALC_LOGITS_OUT",nullptr);
+        set_measurement("STRIX_BITCALC_FORCE_TOKENS",nullptr);
+        auto measured=request;
+        measured.environment=requested_prefill_environment();
+        const auto plain=resolve(measured,memory);
+        set_measurement("STRIX_BITCALC_LOGITS_OUT","capture.bin");
+        set_measurement("STRIX_BITCALC_FORCE_TOKENS","tokens.txt");
+        measured.environment=requested_prefill_environment();
+        const auto hooked=resolve(measured,memory);
+        const auto plain_json=serve::parse_json(effective_config_json(plain));
+        const auto hooked_json=serve::parse_json(effective_config_json(hooked));
+        expect(!plain_json.find("measurement")->find("logits_capture")->as_bool() &&
+            !plain_json.find("measurement")->find("forced_tokens")->as_bool() &&
+            hooked_json.find("measurement")->find("logits_capture")->as_bool() &&
+            hooked_json.find("measurement")->find("forced_tokens")->as_bool(),
+            "real environment collector discloses both measurement controls");
+        expect(effective_config_json(hooked).find("capture.bin")==std::string::npos &&
+            effective_config_json(hooked).find("tokens.txt")==std::string::npos,
+            "measurement inspection omits paths and file contents");
+        auto normalized=hooked;
+        normalized.environment.erase("STRIX_BITCALC_LOGITS_OUT");
+        normalized.environment.erase("STRIX_BITCALC_FORCE_TOKENS");
+        expect(effective_config_json(plain)==effective_config_json(normalized) &&
+            plain.options.route_owned==hooked.options.route_owned &&
+            plan_ids(plain.options)==plan_ids(hooked.options),
+            "real collector measurement controls preserve every numerical route and arithmetic field and plan identity");
+        set_measurement("STRIX_BITCALC_LOGITS_OUT",saved_out?saved_out->c_str():nullptr);
+        set_measurement("STRIX_BITCALC_FORCE_TOKENS",saved_force?saved_force->c_str():nullptr);
     }
     // Model the runtime TU's pre-main environment before exercising the same
     // capture/resolver and baseline cleanup used by decode-token.
@@ -1561,6 +1602,31 @@ int main(int argc, char** arguments) {
             expect(modes_json.find(name)->find("bit_changing")->as_bool(),"mode bit-changing disclosed");
             expect(modes_json.find(name)->find("suppression")->as_string().empty()==(master==0),"suppression disclosed");
         }
+    }
+    for (unsigned protocol=0;protocol<11U;++protocol) {
+        Options session;
+        const char* name="";
+        switch(protocol) {
+        case 0: session.session_save="state"; name="--session-save"; break;
+        case 1: session.session_load="state"; name="--session-load"; break;
+        case 2: session.session_live_control=true; name="--session-live-control"; break;
+        case 3: session.session_management_requested=true; name="session management"; break;
+        case 4: session.session_then_prompt="prompt"; name="--session-then-prompt"; break;
+        case 5: session.session_logits="logits"; name="--session-logits"; break;
+        case 6: session.session_first_generate=1; name="--session-first-generate"; break;
+        case 7: session.session_validate_only=true; name="--session-validate-only"; break;
+        case 8: session.session_tiled_suffix=true; name="--session-tiled-suffix"; break;
+        case 9: session.session_mtp_fixed=true; name="--session-mtp-fixed"; break;
+        default: session.supplied_options.insert("--session-first-generate"); name="--session-first-generate"; break;
+        }
+        bool rejected=false;
+        try { require_bitcalc_session_route(session,true); }
+        catch(const std::invalid_argument& error) {
+            const std::string message=error.what();
+            rejected=message.find("STRIX_BITCALC")!=std::string::npos && message.find(name)!=std::string::npos;
+        }
+        expect(rejected,"measurement session refusal names the hook and protocol");
+        require_bitcalc_session_route(session,false);
     }
     EffectiveConfig receipt; receipt.options.baseline=true;
     expect(effective_config_json(receipt).find("\"prefix_cache\"")==std::string::npos,"baseline receipt omits additive prefix object");

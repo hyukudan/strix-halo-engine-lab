@@ -85,6 +85,47 @@ public:
 };
 } // namespace
 int main() {
+    {
+        Rows backend;
+        backend.width=16;backend.tiled=true;backend.policy=strix::KnownWindowOutputPolicy::terminal_row;
+        const std::vector<std::uint32_t> prompt(32,1U);
+        strix::KnownPromptChunkRequest request{prompt,0,16,64,3,15};
+        request.logical_rows=16;request.tiled_prefill=true;
+        request.output_policy=strix::KnownWindowOutputPolicy::terminal_row;
+        unsigned selections=0;
+        request.emission_hook=[&](std::uint64_t step,std::uint64_t position,std::uint32_t argmax,std::span<const float> values) {
+            expect(step==selections && position==31U+step && argmax==(step?5U:2U) && values[argmax]==1.0F,
+                "hook sees terminal prefill and each decode row without intermediate prompt rows");
+            ++selections;return step?15U:4U;
+        };
+        strix::KnownPromptChunkCursor cursor(request,backend,backend);
+        while(cursor.advance()) {}
+        const auto& result=cursor.finish_greedy();
+        expect(result.generated_tokens==std::vector<std::uint32_t>({4,15}) && selections==2 &&
+            backend.windows==2 && backend.serials==1 && backend.inputs.back()==std::pair<std::uint64_t,std::uint32_t>{32,4},
+            "forcing preserves tiled prefill and consumes the emitted decode token");
+    }
+    {
+        Rows backend;
+        backend.width=16;backend.tiled=true;backend.policy=strix::KnownWindowOutputPolicy::terminal_row;
+        const std::vector<std::uint32_t> prompt(32,1U);
+        strix::KnownPromptChunkRequest request{prompt,0,16,64,3,15};
+        request.logical_rows=16;request.tiled_prefill=true;
+        request.output_policy=strix::KnownWindowOutputPolicy::terminal_row;
+        unsigned selections=0;
+        request.emission_hook=[&](std::uint64_t,std::uint64_t,std::uint32_t,std::span<const float>)->std::uint32_t {
+            ++selections;
+            throw std::runtime_error("capture write failed");
+        };
+        bool rejected=false;
+        try {
+            strix::KnownPromptChunkCursor cursor(request,backend,backend);
+            while(cursor.advance()) {}
+            (void)cursor.finish_greedy();
+        } catch(const std::runtime_error&) { rejected=true; }
+        expect(rejected && selections==1U && backend.serials==0U,
+            "measurement failure propagates from terminal prefill before decode consumes a token");
+    }
     // Same canonical pair/tail and existing generation policy, with no prompt
     // recomputation when the new cursor yields between chunks.
     for(const std::uint64_t start:{0U,2U}) for(const std::size_t count:{1U,2U,3U,4U,5U}) {

@@ -67,6 +67,7 @@
 #include "strix/moe_q4k_a8_contract.hpp"
 #include "hip_decode_experiment.hpp"
 #include "hip_decode_options.hpp"
+#include "bitcalc_measurement.hpp"
 #include "hip_mtp_decode_bridge.hpp"
 #include "hip_http_serve.hpp"
 #include "hip_prefix_state_cache.hpp"
@@ -1099,6 +1100,7 @@ int STRIX_DECODE_ENTRY(
     }
     bool session_cache_enabled = !options.session_save.empty() || !options.session_load.empty() || options.session_live_control;
 
+    strix::decode_cli::BitcalcMeasurement bitcalc;
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     const bool target_input_export = strix::tests::mtp_target_input_export_requested();
     if(target_input_export)strix::tests::validate_mtp_target_input_export(options,false);
@@ -1298,6 +1300,14 @@ int STRIX_DECODE_ENTRY(
         {options, requested_environment, !target_input_export}, model, info, manifest,
         admitted_content, prompt_capabilities, prompt_memory);
     options = effective.options;
+    session_cache_enabled = !options.session_save.empty() || !options.session_load.empty() || options.session_live_control || options.session_management_requested;
+    strix::decode_cli::require_bitcalc_session_route(options, bitcalc.enabled());
+    if (bitcalc.enabled() && (options.mtp.enabled || options.mtp.supplied || options.prompt_lookup ||
+        options.http_serve || !options.serving_prefix_files.empty() || options.prefix_cache_roundtrip ||
+        strix::decode_cli::prefix_state_cache_requested(options) || options.teacher_forced_score ||
+        options.gpu_greedy_token || !options.generate_tokens))
+        throw std::invalid_argument("STRIX_BITCALC hooks require one single-request full-logits greedy generation; "
+            "omit --mtp, prompt lookup, serving, prefix cache, teacher scoring and --gpu-greedy-token");
     if (!options.session_modes_suppression.empty() &&
         (options.session_tiled_suffix_requested || options.session_mtp_fixed_requested))
         std::cerr << "session numerical modes suppressed: " << options.session_modes_suppression << '\n';
@@ -1309,7 +1319,6 @@ int STRIX_DECODE_ENTRY(
         !options.mtp.cohort.empty() || !options.mtp.copy_wide_rows.empty() || options.mtp.ngram_draft ||
         options.mtp.sample_repeats != 1 || options.mtp.metadata_only || !options.mtp.golden_dump.empty()))
         throw std::invalid_argument("fixed MTP sessions require MTP draft chain, full draft vocabulary and greedy selection");
-    session_cache_enabled = !options.session_save.empty() || !options.session_load.empty() || options.session_live_control || options.session_management_requested;
     if ((options.session_tiled_suffix || options.session_mtp_fixed) && !session_cache_enabled && !options.http_serve)
         throw std::invalid_argument("session route options require save/load/live-control or HTTP management budgets");
     if (session_cache_enabled || !options.session_then_prompt.empty() || !options.session_logits.empty() ||
@@ -4149,6 +4158,8 @@ int STRIX_DECODE_ENTRY(
             options.session_first_generate ? options.session_first_generate : options.generate_tokens;
         request.eos_token_id =
             generation_eos;
+        bitcalc.prepare(model.vocab_size, options.tokens.size(), options.generate_tokens);
+        request.emission_hook = bitcalc.hook();
 
         std::unique_ptr<RequestedLogprobBackend> requested_logprobs;
         if (!options.logprob_token_ids.empty() || options.teacher_forced_score)
@@ -4349,6 +4360,7 @@ int STRIX_DECODE_ENTRY(
             paired.all_row_heads = options.teacher_forced_score;
             paired.schedule_extensions = true;
             paired.ladder_tail_rows = options.known_prefix_ladder_tail_rows;
+            paired.emission_hook = request.emission_hook;
             strix::KnownPromptChunkCursor chunks(paired, *known_prefix_backend,
                 options.teacher_forced_score ? *generation_backend : static_cast<strix::SerialGreedyStepBackend&>(backend));
             for (auto& tail : known_tail_backends) chunks.set_tail_backend(*tail);
@@ -4689,6 +4701,7 @@ int STRIX_DECODE_ENTRY(
                     raw_require_identity();
                 });
         }
+        bitcalc.finish();
         std::cout << "{\n" << optimization_profile_receipt << dense_trellis_completed_receipt() << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt << model_copy_receipt;
         if (token_cost_backend) {
             const auto observed = token_cost_backend->stats();
@@ -5016,8 +5029,13 @@ int STRIX_DECODE_ENTRY(
                 << result.generated_tokens[index];
         }
 
+        std::cout << "],\n";
+        if (bitcalc.enabled()) {
+            std::cout << "  \"bitcalc_forced_steps\": " << bitcalc.forced_steps() << ",\n";
+            if (!bitcalc.force_tokens_sha256().empty())
+                std::cout << "  \"bitcalc_force_tokens_sha256\": \"" << bitcalc.force_tokens_sha256() << "\",\n";
+        }
         std::cout
-            << "],\n"
             << "  \"stop_reason\": \""
             << stop_reason_name(
                    result.stop_reason)

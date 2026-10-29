@@ -73,6 +73,7 @@ SerialGreedyRequestResult execute_serial_greedy_continuation(
             "serial greedy continuation logits do not match vocabulary size");
     }
     if (request.context_capacity == 0 ||
+        (request.emission_hook && request.start_position == 0) ||
         request.start_position >
             request.context_capacity) {
         throw std::invalid_argument(
@@ -109,10 +110,15 @@ SerialGreedyRequestResult execute_serial_greedy_continuation(
         request.start_position;
     while (result.generated_tokens.size() <
            request.max_new_tokens) {
-        const auto next =
+        const auto argmax =
             select_greedy_token(
                 logits,
                 request.vocab_size);
+        const auto next = request.emission_hook
+            ? request.emission_hook(result.generated_tokens.size(), position - 1U, argmax, logits)
+            : argmax;
+        if (next >= request.vocab_size)
+            throw std::invalid_argument("greedy emission token is outside vocabulary");
         result.generated_tokens.push_back(
             next);
 
@@ -230,6 +236,7 @@ SerialGreedyRequestResult execute_serial_greedy_request(
         request.max_new_tokens;
     continuation.eos_token_id =
         request.eos_token_id;
+    continuation.emission_hook = request.emission_hook;
 
     auto generated =
         execute_serial_greedy_continuation(

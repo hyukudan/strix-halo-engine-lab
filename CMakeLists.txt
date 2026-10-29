@@ -1260,6 +1260,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-session-executor-handoff-tests)
     add_test(NAME strix-session-executor-handoff-tests COMMAND strix-session-executor-handoff-tests)
 
+    add_executable(strix-bitcalc-measurement-tests tests/bitcalc_measurement_tests.cpp)
+    target_link_libraries(strix-bitcalc-measurement-tests PRIVATE strix_core)
+    strix_target_warnings(strix-bitcalc-measurement-tests)
+    add_test(NAME strix-bitcalc-measurement-tests COMMAND strix-bitcalc-measurement-tests)
+
     add_executable(strix-serial-request-tests tests/serial_request_tests.cpp)
     target_link_libraries(strix-serial-request-tests PRIVATE strix_core)
     strix_target_warnings(strix-serial-request-tests)

@@ -61,6 +61,23 @@ struct EffectiveConfig {
     std::map<std::string, std::uint64_t> admission;
     RotaryIdentity rotary_identity;
 };
+inline void require_bitcalc_session_route(const Options& options, bool enabled) {
+    if (enabled) {
+        const auto refuse = [](bool active, const char* protocol) {
+            if (active) throw std::invalid_argument(std::string("STRIX_BITCALC hooks refuse ") + protocol);
+        };
+        refuse(!options.session_save.empty(), "--session-save");
+        refuse(!options.session_load.empty(), "--session-load");
+        refuse(options.session_live_control, "--session-live-control");
+        refuse(options.session_management_requested, "session management (--session-cache / STRIX_SESSION_CACHE / STRIX_SESSION_DISK)");
+        refuse(!options.session_then_prompt.empty(), "--session-then-prompt");
+        refuse(!options.session_logits.empty(), "--session-logits");
+        refuse(options.session_first_generate != 0 || options.supplied_options.contains("--session-first-generate"), "--session-first-generate");
+        refuse(options.session_validate_only, "--session-validate-only");
+        refuse(options.session_tiled_suffix, "--session-tiled-suffix");
+        refuse(options.session_mtp_fixed, "--session-mtp-fixed");
+    }
+}
 inline bool env_is(const Environment& env, const char* name, std::string_view value) {
     const auto it = env.find(name);
     return it != env.end() && it->second == value;
@@ -87,6 +104,8 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_PREFIX_BATCH_CERT", "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION"})
         if (!(qpf2k::pre_injected_moe_marker && std::string_view(name) == "STRIX_QPF2K_MOE_DEFAULTED"))
             if (const char* value = get(name)) env.emplace(name, value);
+    for (const char* name : {"STRIX_BITCALC_LOGITS_OUT", "STRIX_BITCALC_FORCE_TOKENS"})
+        if (get(name)) env.emplace(name, "1");
     return env;
 }
 inline Environment requested_prefill_environment() {
@@ -786,6 +805,10 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         }
         out << "},";
     }
+    out << "\"measurement\":{\"logits_capture\":"
+        << (config.environment.contains("STRIX_BITCALC_LOGITS_OUT") ? "true" : "false")
+        << ",\"forced_tokens\":"
+        << (config.environment.contains("STRIX_BITCALC_FORCE_TOKENS") ? "true" : "false") << "},";
     serve::Json session=serve::Json::object();
     session.set("numerical_modes",session_modes_json(o));
     session.set("policy",serve::Json("qualified-serving-routes-only"));
@@ -832,6 +855,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         << o.known_prefill_uma_budget << ',' << o.known_prefill_host_headroom << "],\"environment\":{";
     bool first = true;
     for (const auto& [name,value] : config.environment) {
+        if (name == "STRIX_BITCALC_LOGITS_OUT" || name == "STRIX_BITCALC_FORCE_TOKENS") continue;
         // Values are externally supplied strings, so quote every control byte.
         const auto quote = [](std::string_view text) {
             std::ostringstream escaped;

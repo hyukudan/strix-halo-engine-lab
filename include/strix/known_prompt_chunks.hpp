@@ -50,6 +50,7 @@ struct KnownPromptChunkRequest {
     bool schedule_extensions = false;
     // The configured tail ladder (descending) for the S3 eligibility check; empty: the set tail backends' sizes.
     std::vector<std::uint32_t> ladder_tail_rows{};
+    GreedyEmissionHook emission_hook{};
     // Set by the cursor at the first unit: S3 balanced blocks apply to this prompt (bitwise equal to the ladder).
 };
 struct KnownPromptChunkProgress {
