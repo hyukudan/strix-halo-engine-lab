@@ -1,6 +1,7 @@
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/dispatch_fuse.hpp"
 #include "strix/known_prompt_chunks.hpp"
+#include "strix/q51_known_rows.hpp"
 #include "hip_decode_options.hpp"
 
 #include <cstdlib>
@@ -30,8 +31,8 @@ void policy_tests() {
     expect(automatic.at("STRIX_QPF2K_MOE_DEFAULTED") == "3", "MoE provenance is preserved");
     expect(automatic.at("STRIX_QPF2K_SCORE_ROWS") == "auto" && automatic.at("STRIX_PREFILL_PLE_BATCH") == "1" &&
         automatic.at("STRIX_QPF2K_SHARED_PRE") == "1" && automatic.at("STRIX_QPF2K_MOE_MC") == "1" &&
-        automatic.at("STRIX_QPF2K_MOE_HDR") == "1" && automatic.at("STRIX_QPF2K_MOE_XOR64") == "1" && !automatic.contains("STRIX_QPF2K_HC_LOWBAND"),
-        "exact prefill defaults use auto scoring and MC mode 1; LOWBAND stays opt-in");
+        automatic.at("STRIX_QPF2K_MOE_HDR") == "1" && automatic.at("STRIX_QPF2K_MOE_XOR64") == "1" && automatic.at("STRIX_QPF2K_HC_LOWBAND") == "3",
+        "exact prefill defaults use auto scoring and MC mode 1; LOWBAND uses exact layout mode 3");
     expect(automatic.at("STRIX_QPF2K_QSA_MASK")=="0x2257",
         "attend occupancy bit 13 stays enabled in the production mask");
     Environment historical_mask{{"STRIX_QPF2K_QSA_MASK","0x257"}};
@@ -114,13 +115,77 @@ private:
     std::uint32_t width_;
     bool gsq_;
 };
+class RowClasses final : public KnownPromptWindowBackend, public SerialGreedyStepBackend {
+public:
+    RowClasses(unsigned rows, std::vector<unsigned>& classes) : width(rows), row_class(classes) {}
+    unsigned width;
+    std::vector<unsigned>& row_class;
+    bool supports_tiled_prefill() const noexcept override { return true; }
+    unsigned logical_rows() const noexcept override { return width; }
+    KnownWindowOutputPolicy output_policy() const noexcept override { return KnownWindowOutputPolicy::terminal_row; }
+    std::vector<float> execute(std::uint32_t, std::uint64_t position) override {
+        row_class.at(static_cast<std::size_t>(position)) = 1U; return std::vector<float>(16U, 0.0F);
+    }
+    std::vector<float> execute_window(std::array<std::uint32_t,2>, std::uint64_t) override { throw std::logic_error("unexpected pair"); }
+    std::vector<float> execute_rows_partial(std::span<const std::uint32_t> tokens, std::uint64_t position) override {
+        const auto count = static_cast<unsigned>(tokens.size());
+        const auto kind = count % 128U == 0U ? 128U : count;
+        for (unsigned r = 0; r < count; ++r) row_class.at(static_cast<std::size_t>(position + r)) = kind;
+        return std::vector<float>(16U, 0.0F);
+    }
+    std::vector<float> execute_rows(std::span<const std::uint32_t> tokens, std::uint64_t position) override {
+        return execute_rows_partial(tokens, position);
+    }
+    void execute_state_rows(std::span<const std::uint32_t> tokens, std::uint64_t position) override {
+        static_cast<void>(execute_rows_partial(tokens, position));
+    }
+    void execute_state_rows_partial(std::span<const std::uint32_t> tokens, std::uint64_t position, bool) override {
+        execute_state_rows(tokens, position);
+    }
+};
 void schedule_tests() {
+    expect(known_prefill_max_rows == 16384U, "known prefill caps stop at T16384");
+    for (const auto rows : {16U,1024U,8192U,8193U,16384U}) {
+        expect(known_prefill_pool_rows(rows) == (rows <= 8192U ? 8192U : (rows + 511U) / 512U * 512U) &&
+            known_prefill_stage_groups(rows) == (known_prefill_pool_rows(rows) / 64U),
+            "native pools and stage tables retain historical capacities until a larger call");
+    }
+    const auto csr = q51_known_rows::scratch_layout(16384U,512U,10U,true);
+    expect(csr.slots - csr.rows == UINT64_C(16384) * 10U * 4U && csr.bytes > csr.batch_begins,
+        "T16384 CSR reserves all 163840 row/slot assignments");
+    bool rejected = false;
+    try { (void)q51_known_rows::scratch_layout(32768U,512U,10U,true); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "T32768 remains outside the capacity contract");
 #ifdef _WIN32
     expect(_putenv_s("STRIX_QPF2K_SCHED", "12") == 0, "set schedule fixture");
 #else
     expect(::setenv("STRIX_QPF2K_SCHED", "12", 1) == 0, "set schedule fixture");
 #endif
     const auto all = qpf2k::defaulted_items;
+    for (const auto count : {16383U,16384U,16385U,32767U,32768U,32895U,32896U,131072U,262143U}) {
+        std::vector<unsigned> old(count), widened(count);
+        for (const auto t : {8192U,16384U}) {
+            auto& classes = t == 8192U ? old : widened;
+            decode_cli::Options options;
+            options.known_prefix_window = options.known_prefix_prefill_explicit = options.known_prefix_full_rows = true;
+            options.known_prefix_prefill_rows = t;
+            options.known_prefix_output_policy = KnownWindowOutputPolicy::terminal_row;
+            options.tokens.assign(count,1U);
+            decode_cli::apply_default_known_prefill_tails(options,"12");
+            RowClasses main(t,classes), tail1024(1024U,classes), tail256(256U,classes), tail64(64U,classes), tail16(16U,classes);
+            KnownPromptChunkRequest request{options.tokens,0U,16U,count,0U,15U,t,KnownWindowOutputPolicy::terminal_row,true};
+            request.schedule_extensions = true;
+            KnownPromptChunkCursor cursor(request,main,main);
+            for (auto* tail : {&tail1024,&tail256,&tail64,&tail16}) cursor.set_tail_backend(*tail);
+            while (cursor.advance()) {}
+        }
+        expect(old == widened && std::find(old.begin(),old.end(),0U) == old.end(),
+            "T16384 retains every absolute 128/64/16/serial row class through merged tails and context suffix");
+        if (count == 262143U)
+            expect(old[262016U] == 64U && old[262080U] == 16U && old.back() == 1U,
+                "maximum prompt reaches the identical 64+16+16+16+15 serial suffix at 262016");
+    }
     // Exercise the real cursor and CLI tail planner, alternating models after their
     // environment caches have initialized. A 1536-row tail merges only for Q4K or explicit SCHED.
     for (const bool gsq : {true, false, true}) for (const bool explicit_sched : {false, true}) {
@@ -344,7 +409,7 @@ int main(int argc, char** argv) {
         expect(strix_hc_inject_fusion_enabled(), "explicit fusion survives GSQ filtering");
         return 0;
     }
-    expect(qpf2k::defaults.size() == 29U, "all scoped prompt defaults are part of the injected-item contract");
+    expect(qpf2k::defaults.size() == 30U, "all scoped prompt defaults are part of the injected-item contract");
     qpf2k::baseline = true;
     std::map<std::string,std::string> baseline_env;
     expect(initialize(baseline_env) == 0U && baseline_env.empty(), "baseline injects no defaults");

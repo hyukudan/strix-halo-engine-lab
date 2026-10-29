@@ -62,14 +62,14 @@ inline void validate_views(std::uint32_t width, std::uint32_t outputs,
 // Separate byte contract for internal FP32 activations and BF16 output.
 // The BF16-input/FP32-output contract above remains unchanged.
 inline void validate_fp32_bf16_views(std::uint32_t width, std::uint32_t outputs,
-                                     View input, View weights, View output) {
+                                     View input, View weights, View output, bool compact_bf16_input = false) {
     validate_geometry(width, outputs);
     const auto check = [](View view, std::uint64_t required) {
         if (!view.address || view.address % 16U || view.bytes < required ||
             view.bytes > std::numeric_limits<std::uintptr_t>::max() - view.address)
             throw std::invalid_argument("Q8 FP32 output projection view has invalid alignment or extent");
     };
-    check(input, static_cast<std::uint64_t>(width) * 4U);
+    check(input, static_cast<std::uint64_t>(width) * (compact_bf16_input ? 2U : 4U));
     check(weights, static_cast<std::uint64_t>(width / 32U) * 34U * outputs);
     check(output, static_cast<std::uint64_t>(outputs) * 2U);
     const auto overlap = [](View a, View b) {

@@ -126,6 +126,8 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
         collect_geometry(tail);
         result.tails = add(result.tails, add(add(tail.arena.physical.total_bytes, 65552U),tail.qsa_score_ring_workspace_bytes));
         result.metadata = add(result.metadata, add(tail.host_metadata_payload_bytes, tail.host_metadata_payload_bytes));
+        if (options.known_prefix_prefill_rows == 16384U)
+            result.metadata = add(result.metadata, static_cast<std::uint64_t>(tail.logit_row_indices.size()) * 2U * sizeof(std::uint32_t));
     }
     if (full_owners)
         append_yarn_owner_requirements(options,model,state,model_bytes,result,geometry);
@@ -178,6 +180,7 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
         {"prefill_metadata_bytes",plan.host_metadata_payload_bytes},
         {"qsa_decode_pool_bytes",decode_pool},
         {"qsa_decode_pool_key_bytes",qsa_decode_pool_key_bytes(options, gsq)}});
+    if(plan.compact_qsa_output_savings) result.organization.emplace("compact_qsa_output_savings_per_row",plan.compact_qsa_output_savings);
     if(plan.terminal_logits_arena) result.organization.emplace("terminal_logits_arena",1U);
     if(plan.qsa_score_ring_workspace_bytes) {
         result.organization.emplace("qsa_score_ring_workspace_bytes",plan.qsa_score_ring_workspace_bytes);

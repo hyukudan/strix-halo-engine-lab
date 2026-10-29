@@ -1,5 +1,6 @@
 #include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/prefill_identity.hpp"
+#include "hip_prefill_pool.hpp"
 #include "strix/dispatch_fuse.hpp"
 #include "strix/hip_lane_chain_hyper_output_tests.hpp"
 #include "strix/hip_hc_wide_rows_tests.hpp"
@@ -5238,15 +5239,12 @@ bool wide_hyper_rows(const PreparedHyperRows& prepared, const HipHyperMixLaunche
 
 constexpr unsigned kSkipKernel = 255U;  // test seam: launch only the other kernel
 // Transposed low values for the wide2 output kernel: 320 x up to kWide2LowRows rows (prefill steps).
-constexpr std::uint32_t kWide2LowRows = 8192U;
-float* wide2_low_scratch() {
-    static float* const pool = [] {
-        void* p = nullptr;
-        if (hipMalloc(&p, std::uint64_t{320U} * kWide2LowRows * sizeof(float)) != hipSuccess)
-            throw std::runtime_error("HC wide rows: transposed low scratch allocation failed");
-        return static_cast<float*>(p);
-    }();
-    return pool;
+constexpr std::uint32_t kWide2LowRows = known_prefill_max_rows;
+float* wide2_low_scratch(std::uint32_t rows = 8192U, bool setup = false) {
+    static HipPrefillPool pool;
+    const auto capacity = hc_prefill_pool_owner().rows((rows + kWide2OutputRows - 1U) / kWide2OutputRows * kWide2OutputRows);
+    return static_cast<float*>(pool.get(std::uint64_t{320U} * capacity * sizeof(float),
+        "HC wide rows: transposed low scratch",setup));
 }
 // Projection and output kernels of the wide prefill rows. projection_kernel 0: the 4-output lane-tree
 // kernel (STRIX_HC_WIDE_PROJECTION_ROWS 8|16 / _WAVES 4|8 block shape, default by row count), 1: the
@@ -5286,7 +5284,7 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
     if (qpf2k_projection) projection_kernel = 2U;
     if (!out16 && output_kernel == 1U && (projection_kernel == 1U || projection_kernel == 2U || projection_kernel == kSkipKernel) &&
         (wide.count + kWide2OutputRows - 1U) / kWide2OutputRows * kWide2OutputRows <= kWide2LowRows) {
-        wide.low_t = wide2_low_scratch();
+        wide.low_t = wide2_low_scratch(wide.count);
         wide.low_t_pitch = (wide.count + kWide2OutputRows - 1U) / kWide2OutputRows * kWide2OutputRows;
     } else if (!out16 && output_kernel == 1U) {
         if (qpf2k_output || qpf2k_output3) throw std::invalid_argument("qpf2k HC output test needs the transposed low values");
@@ -5339,7 +5337,7 @@ void launch_wide_hyper_kernels(const HyperWideRows& wide_in, const void* down, c
     if (projection_kernel == 2U || output_kernel == 2U || out16) {
         if (wide.count > kHcwLowRows || config.hc_count != 4U)
             throw std::invalid_argument("HC WMMA rows: row count or stream count unsupported");
-        const auto scratch = hcw_scratch();
+        const auto scratch = hcw_scratch(wide.count);
         if (projection_kernel == 2U) {
             hipLaunchKernelGGL(hcw_pack_down_kernel, dim3((kHcwRank * kHcwStages + 255U) / 256U), dim3(256U), 0, stream,
                 static_cast<const unsigned char*>(down), scratch.down, scratch.overflow);
@@ -5650,7 +5648,7 @@ bool hcw_normfree_rows(const PreparedHyperRows& prepared, const HyperTileRows& t
     if (in0 % 16U || stride % 16U || stride < 10240U * 2U || p.norm_runtime->address % 16U || (in0 < out1 && out0 < in1)) return false;
     rows.input = tile_rows.input[0];
     rows.input_stride = stride;
-    rows.inverse = hcw_inverse_scratch();
+    rows.inverse = hcw_inverse_scratch(wide.count);
     rows.norm_weight = reinterpret_cast<const float*>(p.norm_runtime->address);
     return true;
 }
@@ -5668,7 +5666,7 @@ void launch_wide_hyper_rows(const PreparedHyperRows& prepared, const HyperTileRo
     HyperWideRows rows = wide;
     const bool norm16 = norm && config.fast_prefill_wmma && (norm16_env == 1U || norm16_env == 2U) && wide.count <= kHcwLowRows;
     const bool only16 = norm16 && norm16_env == 2U && fast_output_kernel() == 1U;
-    if (norm16) { rows.normalized16 = hcw_normalized16_scratch(); rows.normalized16_pitch = kHcwNorm16Pitch; rows.normalized16_only = only16; }
+    if (norm16) { rows.normalized16 = hcw_normalized16_scratch(wide.count); rows.normalized16_pitch = kHcwNorm16Pitch; rows.normalized16_only = only16; }
     static const bool normfree_env = [] { const char* v = std::getenv("STRIX_HCW_NORMFREE"); return v && v[0] == '1'; }();
     const bool normfree = norm && !norm_launched && !norm16 && normfree_env && allow_normfree && hcw_normfree_rows(prepared, tile_rows, wide, config, rows);
     if (norm_launched && norm16) throw std::logic_error("qpf2k HC fold with STRIX_HCW_NORM16");
@@ -5676,13 +5674,13 @@ void launch_wide_hyper_rows(const PreparedHyperRows& prepared, const HyperTileRo
         if (norm_launched) {
         } else if (normfree) {
             hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_prepare_hyper_inverse_kernel<Storage>), dim3(config.hc_count, kWindowRows, tiles),
-                dim3(kThreads), 0, hip_execution_stream(), tile_rows, config.hidden_size, config.rms_epsilon, hcw_inverse_scratch());
+                dim3(kThreads), 0, hip_execution_stream(), tile_rows, config.hidden_size, config.rms_epsilon, hcw_inverse_scratch(wide.count));
             check_hip(hipGetLastError(), "prefill HC wide rows inverse launch");
         } else if (norm16) {
             const auto kernel = only16 ? rows_prepare_hyper_norm16_kernel<Storage, false> : rows_prepare_hyper_norm16_kernel<Storage, true>;
             hipLaunchKernelGGL(kernel, dim3(config.hc_count, kWindowRows, tiles),
                 dim3(kThreads), 0, hip_execution_stream(), tile_rows, reinterpret_cast<const void*>(p.norm_runtime->address),
-                p.norm_manifest->ggml_type, config.hidden_size, config.rms_epsilon, hcw_normalized16_scratch());
+                p.norm_manifest->ggml_type, config.hidden_size, config.rms_epsilon, hcw_normalized16_scratch(wide.count));
             check_hip(hipGetLastError(), "prefill HC wide rows FP16 normalization launch");
         } else if (norm) {
             hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_prepare_hyper_norm_kernel<Storage, HyperTileRows>), dim3(config.hc_count, kWindowRows, tiles),
@@ -5724,14 +5722,25 @@ std::vector<unsigned char> snapshot_wide_hyper_rows(const HyperWideRows& wide, c
 }
 }  // namespace
 
+void reserve_hyper_mix_prefill_pools(std::uint32_t rows) {
+    hc_prefill_pool_owner().setup(rows, [=] {
+        (void)wide2_low_scratch(rows, true); (void)hcw_scratch(rows, true);
+        (void)hcw_inverse_scratch(rows, true); (void)hcw_normalized16_scratch(rows, true);
+    });
+}
+
 void hyper_mix_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipHyperMixLauncherConfig& config) {
+    if (rows.size() > hc_prefill_pool_owner().rows())
+        throw std::runtime_error("HC prefill call exceeds setup capacity");
     std::uint32_t tiles = 0;
     (void)prepare_hyper_prefill_rows(rows, config, tiles);
 }
 
 void hyper_mix_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipHyperMixLauncherConfig& config) {
+    if (rows.size() > hc_prefill_pool_owner().rows())
+        throw std::runtime_error("HC prefill call exceeds setup capacity");
     std::uint32_t tiles = 0;
     const auto prepared = prepare_hyper_prefill_rows(rows, config, tiles);
     HyperTileRows tile_rows;

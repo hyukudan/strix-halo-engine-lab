@@ -185,6 +185,130 @@ __global__ __launch_bounds__(W * 32U) void rows_batch_kernel(const QsaRowsInputV
     constexpr unsigned per = Rows / RB;
     rows_body<Rows, RB, OW, W>(groups[blockIdx.y / per], width, (blockIdx.y % per) * RB);
 }
+// Candidate (outside READY) numerical identity: native BF16 WMMA with C=+0 per K16,
+// then ascending K16 FP32 additions starting from +0 (no native C feedback).
+// 64x64 outputs, four wave32 quadrants; no split-K or atomic updates.
+// Match project_rows_dense_f16_wmma_kernel / dense_f16_pair exactly:
+// A lane l reads row l%16, B reads column l%16, both with all 16 K values
+// replicated in lanes l and l+16. D[e] = (row 2*e+l/16, column l%16).
+#if defined(__gfx1151__)
+using index_bf16x16 = unsigned short __attribute__((ext_vector_type(16)));
+__device__ __forceinline__ index_bf16x16 index_wmma_fragment(const std::uint16_t* row) {
+    // Use the verified two-uint4 load convention. The 80-byte LDS row pitch
+    // guarantees 16-byte alignment, not the natural alignment of a 32-byte vector.
+    index_bf16x16 fragment;
+    const uint4 lo = reinterpret_cast<const uint4*>(row)[0], hi = reinterpret_cast<const uint4*>(row)[1];
+    __builtin_memcpy(&fragment, &lo, 16U);
+    __builtin_memcpy(reinterpret_cast<char*>(&fragment) + 16, &hi, 16U);
+    return fragment; // Raw BF16 bits; no numeric conversion to FP16 or integer.
+}
+#endif
+// Trace is instantiated only by the same-TU fixture. Capture the actual operand
+// vectors, including both replicated half-waves, before issuing WMMA. No trace
+// branch, storage or feedback accumulator exists in the production instantiation.
+// FeedbackControl retains the old uninstrumented identity for the fixture only.
+template <bool Trace = false, bool FeedbackControl = false>
+__device__ __forceinline__ void rows_wmma_body(
+    const QsaRowsInputViews<64U>* groups, std::uint32_t width,
+    std::uint16_t* operands = nullptr, float* steps = nullptr,
+    unsigned trace_row = 0U, unsigned trace_column = 4U) {
+#if defined(__gfx1151__)
+    using f32x8 = float __attribute__((ext_vector_type(8)));
+    // Two raw BF16 K32 slabs per operand, padded to a 40-element row.
+    __shared__ __align__(32) std::uint16_t a[2][64][40];
+    __shared__ __align__(32) std::uint16_t b[2][64][40];
+    const auto& v = groups[blockIdx.y];
+    const unsigned t = threadIdx.x, lane = t % 32U, wave = t / 32U;
+    const unsigned wm = (wave / 2U) * 32U, wn = (wave % 2U) * 32U;
+    std::uint32_t column = blockIdx.x * 64U;
+    const unsigned matrix = qsa_rows_matrix(v, column, column);
+    const auto* weights = static_cast<const std::uint16_t*>(v.weights[matrix]);
+    const auto stage = [&](unsigned slot, unsigned k) {
+        for (unsigned z = t; z < 64U * 32U; z += 128U) {
+            const unsigned row = z / 32U, feature = z % 32U;
+            a[slot][row][feature] = v.input[row][k + feature];
+            b[slot][row][feature] = weights[static_cast<std::uint64_t>(column + row) * width + k + feature];
+        }
+    };
+    f32x8 acc[2][2] = {};
+    f32x8 feedback[2][2] = {}; // discarded at compile time unless Trace
+    stage(0U, 0U);
+    __syncthreads();
+    for (unsigned k = 0U; k < width; k += 32U) {
+        const unsigned slot = (k / 32U) & 1U;
+        // Prefetch into the other LDS slab while retaining the current one.
+        if (k + 32U < width) stage(slot ^ 1U, k + 32U);
+#pragma unroll
+        for (unsigned kk = 0U; kk < 2U; ++kk) {
+            index_bf16x16 av[2];
+#pragma unroll
+            for (unsigned i = 0U; i < 2U; ++i)
+                av[i] = index_wmma_fragment(&a[slot][wm + i * 16U + lane % 16U][kk * 16U]);
+            if constexpr (Trace) {
+                if (blockIdx.y == 0U && blockIdx.x == trace_column / 64U &&
+                    wm == trace_row / 32U * 32U && wn == trace_column % 64U / 32U * 32U &&
+                    lane % 16U == trace_row % 16U)
+                    for (unsigned f = 0U; f < 16U; ++f)
+                        operands[(lane / 16U * 2U) * width + k + kk * 16U + f] =
+                            av[trace_row % 32U / 16U][f];
+            }
+#pragma unroll
+            for (unsigned j = 0U; j < 2U; ++j) {
+                const index_bf16x16 bv = index_wmma_fragment(&b[slot][wn + j * 16U + lane % 16U][kk * 16U]);
+                if constexpr (Trace) {
+                    if (blockIdx.y == 0U && blockIdx.x == trace_column / 64U &&
+                        wm == trace_row / 32U * 32U && wn == trace_column % 64U / 32U * 32U &&
+                        j == trace_column % 32U / 16U && lane % 16U == trace_column % 16U)
+                        for (unsigned f = 0U; f < 16U; ++f)
+                            operands[(lane / 16U * 2U + 1U) * width + k + kk * 16U + f] = bv[f];
+                }
+#pragma unroll
+                for (unsigned i = 0U; i < 2U; ++i) {
+                    if constexpr (FeedbackControl) {
+                        acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(av[i], bv, acc[i][j]);
+                    } else {
+                        // Keep cross-panel cancellation in ordinary FP32 addition.
+                        // Feeding the running sum back through native BF16 WMMA is
+                        // a different arithmetic identity; do not hide its residuals
+                        // with a tolerance or a near-zero clamp in the fixture.
+                        const f32x8 panel = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(av[i], bv, f32x8{});
+                        acc[i][j] += panel;
+                        if constexpr (Trace) {
+                            feedback[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(av[i], bv, feedback[i][j]);
+                            if (blockIdx.y == 0U && blockIdx.x == trace_column / 64U &&
+                                wm + i * 16U == trace_row / 16U * 16U &&
+                                wn + j * 16U == trace_column % 64U / 16U * 16U &&
+                                lane == trace_row % 2U * 16U + trace_column % 16U) {
+                                const unsigned at = (k / 16U + kk) * 3U, e = trace_row % 16U / 2U;
+                                steps[at] = panel[e]; steps[at + 1U] = acc[i][j][e];
+                                steps[at + 2U] = feedback[i][j][e];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (unsigned i = 0U; i < 2U; ++i)
+#pragma unroll
+        for (unsigned j = 0U; j < 2U; ++j)
+#pragma unroll
+            for (unsigned e = 0U; e < 8U; ++e)
+                v.output[matrix][wm + i * 16U + 2U * e + lane / 16U]
+                    [column + wn + j * 16U + lane % 16U] = round_bf16(acc[i][j][e]);
+#else
+    // Host/device builds for other architectures retain the exact launcher.
+    (void)groups;
+    (void)width;
+    (void)operands; (void)steps; (void)trace_row; (void)trace_column;
+#endif
+}
+__global__ __launch_bounds__(128) void rows_wmma_kernel(
+    const QsaRowsInputViews<64U>* groups, std::uint32_t width) {
+    rows_wmma_body(groups, width);
+}
 } // namespace qsa_index
 
 // q / k / index-query norm + partial RoPE of a prefill group in one launch (norm_rope_rows_kernel runs one launch

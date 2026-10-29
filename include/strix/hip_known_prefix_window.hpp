@@ -57,7 +57,7 @@ public:
         ExecutionMemoryBinding window_scratch, HipLaunchContext scope,
         std::shared_ptr<const void> actual_owner,
         q51_known_rows::Workspace routed_union_workspace = {});
-    // Explicit T16..8192 (known_prefill_max_rows) step-major owner. Closed window construction above
+    // Explicit T16..16384 (known_prefill_max_rows) step-major owner. Closed window construction above
     // retains its original guards and identities. Every projection tile still
     // uses a closed native 8/2 entry; this is not a general GEMM backend.
     HipKnownPrefixWindow(CompiledKnownPrefixPrefill prefill,
@@ -80,6 +80,9 @@ public:
     // the generation loop; later plans of this owner (MTP capture copies) then re-check only
     // the steps whose launcher differs.
     void preflight_admission(const SerialSessionContext& session, std::span<const std::uint32_t> tokens);
+    // Tiled setup only: no prompt reads, launches, PLE lookup or session/state mutation.
+    // The owner retains static admission; live token/position checks remain in execute().
+    void prepare_prefill_geometry(const SerialSessionContext& session);
     // Tiled prefill block whose logits are not needed: runs every step but the terminal head.
     [[nodiscard]] KnownWindowResult execute_without_head(SerialSessionContext& session,
         std::span<const std::uint32_t> tokens);

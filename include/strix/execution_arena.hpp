@@ -44,7 +44,8 @@ struct KnownWindowArena {
 // the stripe. materialize_views=false builds physical geometry for validation.
 [[nodiscard]] KnownWindowArena build_known_prefill_arena(
     const ExecutionArenaPlan& serial, std::uint64_t alignment, std::uint32_t logical_rows,
-    std::uint64_t external_qsa_score_bytes = 0, bool terminal_logits = false, bool materialize_views = true);
+    std::uint64_t external_qsa_score_bytes = 0, bool terminal_logits = false, bool materialize_views = true,
+    std::uint64_t compact_qsa_output_savings = 0);
 
 [[nodiscard]] ExecutionArenaPlan build_serial_execution_arena_plan(
     const ModelContract& model,

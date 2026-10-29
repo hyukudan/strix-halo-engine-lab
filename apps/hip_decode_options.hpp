@@ -242,6 +242,8 @@ inline bool mtp_sha256_text(std::string_view value) noexcept {
 struct Options {
     std::string mtp_bundle_path;
     std::string yarn_decode_source = "explicit";
+    bool early_setup = true;
+    bool eager_code_load = true;
     bool baseline = false;
     std::string suppressed_yarn_request;
     bool print_effective_config = false;
@@ -800,6 +802,8 @@ inline void validate_prefill_numerical_profile_cli(const Options& options) {
     if (options.mtp.enabled && (pair.fast_components & strix::kFastPrefillHc) &&
         (option_mask & strix::prefill_option_bit(strix::PrefillOption::hc_output_wmma)))
         throw std::invalid_argument("MTP fast HC output WMMA is unqualified; use --prefill-disable hc_output_wmma");
+    if (options.mtp.enabled && strix::index_wmma_unqualified_route(option_mask, pair.fast_components))
+        throw std::invalid_argument("MTP index projection WMMA is unqualified; use --prefill-disable index_proj_wmma");
     const bool tiled = options.known_prefix_window && options.known_prefix_prefill_rows && options.known_prefix_full_rows;
     if (!tiled && !options.mtp.enabled)
         throw std::invalid_argument("prefill numerical profile requires a prefill route: the tiled known-prefix "
@@ -1201,6 +1205,8 @@ inline void apply_default_known_prefill_tails(Options& options, const char* sche
 }
 
 inline void validate_known_prefill_options(const Options& options) {
+    if (options.known_prefix_prefill_rows > 8192U && options.known_prefix_prefill_rows % 32U)
+        throw std::invalid_argument("--known-prefix-prefill-rows above 8192 must be a multiple of 32");
     const bool any = options.known_prefix_prefill_explicit || options.known_prefix_prefill_rows || !options.known_prefix_tail_rows.empty() ||
         options.known_prefill_workspace_explicit || options.known_prefill_metadata_explicit ||
         options.known_prefill_uma_explicit || options.known_prefill_headroom_explicit;
@@ -1211,7 +1217,7 @@ inline void validate_known_prefill_options(const Options& options) {
         (!options.automatic_prefill && (!options.known_prefill_workspace_explicit || !options.known_prefill_metadata_explicit ||
         !options.known_prefill_uma_explicit || !options.known_prefill_headroom_explicit)) ||
         !options.known_prefill_workspace_budget || options.known_prefill_metadata_budget < 2U || !options.known_prefill_uma_budget)
-        throw std::invalid_argument("known prefill requires explicit T16..8192, window, all budgets/headroom and no small-row or lookup selector");
+        throw std::invalid_argument("known prefill requires explicit T16..16384, window, all budgets/headroom and no small-row or lookup selector");
     if (options.known_prefix_output_policy == strix::KnownWindowOutputPolicy::state_only && options.generate_tokens)
         throw std::invalid_argument("tiled state-only prefill cannot generate without a terminal output frontier");
     // STRIX_QPF2K_SCHED bits 4/16 (merged / balanced blocks) are bitwise only where a dense row's form does not depend on its
@@ -1782,7 +1788,7 @@ inline Options parse_options(
             "[--optimization-profile auto|manual] [--baseline] [--print-effective-config] [--prefill-exact-fp16] [--prefill-disable NAME[,NAME...]] [--config FILE] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1] [--prefill-numerical-profile NAME] "
             "[--teacher-forced-score --generate 1 [--teacher-logits-file PATH]] [--dense-q6p-pack PATH] [--dense-trellis-pack PATH] "
-            "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--attention-kv-storage bf16|kv-int8-tok-v1] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-window-router-rows] [--known-prefix-prefill-rows 16..8192 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
+            "[--gpu-greedy-token] [--logprob-token ID ...] [--offline-tuning-cache FILE [--offline-compile-provenance FILE]] [--gdn-recurrent-layout baseline|stride32|stride33|transposed] [--gdn-recurrent-storage key-value|value-key] [--attention-kv-storage bf16|kv-int8-tok-v1] [--known-prefix-window --known-prefix-rows 2|4|8 --known-prefix-expert-union] [--known-window-router-rows] [--known-prefix-prefill-rows 16..16384 --known-prefix-workspace-budget-bytes N --known-prefix-host-metadata-budget-bytes N --known-prefix-uma-budget-bytes N --known-prefix-host-headroom-bytes N] [--prompt-lookup [--prompt-lookup-depth 0|1|2 | --prompt-lookup-adaptive] [--prompt-lookup-snapshot occupied-kv-v1 --prompt-lookup-snapshot-bytes N]] [--serve-prefix-u32le FILE ... --serve-concurrency 1|2|4 [--serve-tensor-cohort-rows 2|4 | --serve-prefill-rows 2|4|8|16..2048 --serve-prefill-workspace-budget-bytes N --serve-prefill-host-metadata-budget-bytes N] --serve-memory-budget-bytes N --serve-request-budget-bytes N --serve-headroom-bytes N] [--gdn-islands] [--qsa-hierarchical-selection] [--qsa-gqa-heads-per-block 1|2|4] [--prepared-eager] [--moe-shared-overlap [--moe-token-cost-policy]] [--moe-overlap-arena-budget-bytes N] [--batched-moe-activation] [--validation-final-state DIR] [--validation-final-state-max-bytes N] [--reference FILE] [--max-logit-error X] "
             "[--context N [--unqualified-context]] [--residency register|copy] [--coalesce-gap BYTES] [--model-copy-tier none|normalization|hot_nonexpert|experts --model-copy-payload-bytes N --model-retained-budget N --model-setup-peak-budget N] "
             "[--planned-ple-io] [--ple-cpu-helper-threads 1..8] [--ple-cache-rows N --ple-cache-budget-bytes N] [--ple-max-rows-per-io N] [--ple-max-inflight-ios N] "
             "[--generate N] [--eos-token TOKEN_ID] [--prefix-cache-roundtrip] "
@@ -1814,6 +1820,8 @@ inline Options parse_options(
         if (argument.starts_with("--")) options.supplied_options.emplace(argument.substr(0, argument.find('=')));
         // These switches alter arithmetic only; they must not claim an explicit
         // organization route or prevent automatic prefill admission.
+        if (argument == "--no-early-setup") { options.early_setup = false; continue; }
+        if (argument == "--no-eager-code-load") { options.eager_code_load = false; continue; }
         if (argument == "--prefill-exact-fp16") { options.prefill_exact_fp16 = true; continue; }
         if (argument == "--prefill-disable" || argument.starts_with("--prefill-disable=") ||
             argument == "--config" || argument.starts_with("--config=")) {
@@ -1822,7 +1830,7 @@ inline Options parse_options(
             const auto value = equal != std::string_view::npos ? argument.substr(equal + 1U) :
                 (index + 1 < argc ? std::string_view(argv[++index]) : std::string_view{});
             if (value.empty() || value.starts_with("--")) throw std::invalid_argument(std::string(key) + " requires a value");
-            if (key == "--config") load_prefill_config(std::string(value), options.prefill_exact_fp16, options.prefill_disabled);
+            if (key == "--config") load_prefill_config(std::string(value), options.prefill_exact_fp16, options.prefill_disabled, &options.early_setup, &options.eager_code_load);
             else options.prefill_disabled |= strix::parse_prefill_option_list(value);
             continue;
         }

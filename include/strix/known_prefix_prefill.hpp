@@ -30,6 +30,8 @@ struct KnownPrefillRequest {
     bool full_qsa_score_ring_entry=false;
     // Zero retains the environment/default contract for existing callers.
     std::uint32_t qsa_score_ring_rows=0;
+    // Owner may preserve the complete legacy stage-image ABI.
+    bool compact_stage_images=true;
 };
 struct CompiledKnownPrefixPrefill {
     std::uint32_t logical_rows=0;
@@ -38,6 +40,7 @@ struct CompiledKnownPrefixPrefill {
     std::uint64_t external_qsa_score_bytes=0,qsa_score_ring_workspace_bytes=0;
     std::uint32_t qsa_score_ring_rows=0;
     bool terminal_logits_arena=false;
+    std::uint64_t compact_qsa_output_savings=0;
     // Closed selection/format contract only. Its row plans are never relabelled
     // as a T-row window or executed as complete eight-row forwards.
     CompiledKnownPrefixWindow tile8;

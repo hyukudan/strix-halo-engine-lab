@@ -1,4 +1,7 @@
 #include "strix/qsa_prefill_stage_plan.hpp"
+#include "strix/prefill_identity.hpp"
+#include "strix/known_prefill_limits.hpp"
+#include "hip_prefill_pool.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/qsa_committed_pool.hpp"
 #include "strix/hip_qwen_rotary_table.hpp"
@@ -12,6 +15,8 @@
 #include "strix/hip_indexed_attention_launcher.hpp"
 #include "hip_q8_rows_gemv.hpp"
 #include "hip_dense_f16_tiled.hpp"
+#include "hip_rounded_stage_image.hpp"
+#include "strix/hip_compact_qsa_diagnostic.hpp"
 #include "strix/hip_mtp_attention.hpp"
 #include "strix/qpersist.hpp"
 #include "strix/hip_qpersist_diagnostic.hpp"
@@ -330,6 +335,7 @@ struct WorkspacePointers {
     qsa_selection_diagnostic::Item* selection_pong = nullptr;
     std::uint32_t* selection_status = nullptr;
     std::uint64_t* attention_position = nullptr;
+    bool compact_attention_output = false;
 };
 
 void hash_u64(
@@ -2257,7 +2263,7 @@ __device__ __forceinline__ void attention_output_body(
     std::uint32_t attention_heads,
     std::uint32_t kv_heads,
     std::uint32_t head_dim,
-    float* output, GraphSelectionArguments dynamic) {
+    RoundedStageImage output, GraphSelectionArguments dynamic) {
     if (!graph_selected_count(dynamic, selected_count)) return;
     const auto head =
         static_cast<std::uint32_t>(
@@ -2346,7 +2352,7 @@ template <bool Int8 = false, bool Dense = false>
 __device__ __forceinline__ void attention_tail_body(const float* q_gate, const std::uint16_t* kv_state,
     const std::uint32_t* selected, float* scores, std::uint32_t selected_count,
     std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads,
-    std::uint32_t head_dim, float* output, GraphSelectionArguments dynamic,
+    std::uint32_t head_dim, RoundedStageImage output, GraphSelectionArguments dynamic,
     std::int8_t* codes = nullptr, float* deltas = nullptr, std::uint32_t row = 0U) {
     attention_softmax_body(scores, selected_count, maximum_selected, dynamic);
     __syncthreads();
@@ -3093,6 +3099,7 @@ WorkspacePointers workspace_pointers(
         layout.selection_pong_bytes ? reinterpret_cast<qsa_selection_diagnostic::Item*>(base + layout.selection_pong_offset) : nullptr,
         layout.selection_status_bytes ? reinterpret_cast<std::uint32_t*>(base + layout.selection_status_offset) : nullptr,
         layout.attention_position_bytes ? reinterpret_cast<std::uint64_t*>(base + layout.attention_position_offset) : nullptr,
+        layout.compact_attention_output,
     };
 }
 
@@ -3247,6 +3254,8 @@ PreparedIndexedLaunch prepare_indexed_attention_launch(
     if (!config.qsa_hierarchical_selection && config.qsa_gqa_heads_per_block==1 && !config.enable_device_graph_inputs) {
         const auto compact=build_indexed_attention_workspace_layout(model,256,false,1,true);
         if(temporary.bytes==compact.total_bytes) workspace_layout=compact;
+        const auto images=build_indexed_attention_workspace_layout(model,256,false,1,true,true);
+        if(images.total_bytes<compact.total_bytes && temporary.bytes==images.total_bytes) workspace_layout=images;
     }
     if (temporary.bytes <
         workspace_layout.total_bytes) {
@@ -3418,9 +3427,9 @@ PreparedIndexedLaunch prepare_indexed_attention_launch(
             throw std::invalid_argument("wave8 QSA output requires aligned Q8_0 weights");
         q8_projection_organization::validate_fp32_bf16_views(attention_width, hidden,
             {reinterpret_cast<std::uintptr_t>(workspace.attention_output),
-             static_cast<std::uint64_t>(attention_width) * sizeof(float)},
+             static_cast<std::uint64_t>(attention_width) * (workspace.compact_attention_output ? 2U : 4U)},
             {tensors.out.runtime->address, tensors.out.runtime->bytes},
-            {output.address, output.bytes});
+            {output.address, output.bytes}, workspace.compact_attention_output);
     }
     if(config.prefetch_q8_input){
         if(!qsa_input_prefetch::selected(true,config.prefetch_eligible_layers,context.layer))throw std::invalid_argument("QSA prefetch launch layer differs from admitted plan");
@@ -3556,9 +3565,9 @@ PreparedIndexedLaunch prepare_indexed_attention_launch_like(const PreparedIndexe
             q8_rows::dense_a8_type(tensors.out.manifest->ggml_type)))
         q8_projection_organization::validate_fp32_bf16_views(p.attention_width, p.hidden,
             {reinterpret_cast<std::uintptr_t>(p.workspace.attention_output),
-             static_cast<std::uint64_t>(p.attention_width) * sizeof(float)},
+             static_cast<std::uint64_t>(p.attention_width) * (p.workspace.compact_attention_output ? 2U : 4U)},
             {tensors.out.runtime->address, tensors.out.runtime->bytes},
-            {p.output.address, p.output.bytes});
+            {p.output.address, p.output.bytes}, p.workspace.compact_attention_output);
     if (config.prefetch_q8_input) {
         if (p.input.address % 2U != 0 || p.output.address % 2U != 0 || p.temporary.address % 4U != 0)
             throw std::invalid_argument("QSA prefetch owner alignment invalid");
@@ -4074,8 +4083,8 @@ template <unsigned Rows> struct QsaInputRowsSite {
         output[m][r][row] = round_bf16(value);
     }
 };
-template <unsigned Rows> struct QsaOutputRowsSite {
-    using Input = float;
+template <unsigned Rows, class InputType = float> struct QsaOutputRowsSite {
+    using Input = InputType;
     static constexpr unsigned rows = Rows;
     static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)
     static constexpr bool tree_upper_src0 = true;  // add(lower, upper) reads upper as src0 (lane VOPD tree)
@@ -4104,8 +4113,8 @@ struct QsaInputTiledSite {
         reinterpret_cast<float*>(output0[m] + r * output_stride)[row] = round_bf16(value);
     }
 };
-struct QsaOutputTiledSite {
-    using Input = float;
+template <class InputType = float> struct QsaOutputTiledSite {
+    using Input = InputType;
     const unsigned char* input0;
     std::uint64_t input_stride;
     q8_rows::Segments segments;
@@ -4201,6 +4210,7 @@ __global__ void linear_to_float_rows_kernel(QsaRowsInputViews<Rows> views, std::
 template <unsigned Rows> struct QsaRowsOutputViews {
     const float* input[Rows];
     std::uint16_t* output[Rows];
+    bool compact = false;
 };
 
 template <WeightKind Kind, unsigned Rows>
@@ -4213,7 +4223,7 @@ __global__ void linear_float_to_bf16_rows_kernel(QsaRowsOutputViews<Rows> views,
     for (std::uint32_t feature = threadIdx.x; feature < input_width; feature += kThreads) {
         const float weight = load_weight<Kind>(weights, input_width, out, feature);
 #pragma unroll
-        for (unsigned r = 0; r < Rows; ++r) sum[r] += views.input[r][feature] * weight;
+        for (unsigned r = 0; r < Rows; ++r) sum[r] += (views.compact ? bf16_to_float(reinterpret_cast<const std::uint16_t*>(views.input[r])[feature]) : views.input[r][feature]) * weight;
     }
 #pragma unroll
     for (unsigned r = 0; r < Rows; ++r) scratch[r][threadIdx.x] = sum[r];
@@ -4361,6 +4371,8 @@ template <unsigned Rows> struct QsaRowsAttentionViews {
     float* scores[Rows];
     float* output[Rows];
     std::uint32_t count[Rows];
+    bool compact_output = false;
+    __device__ __forceinline__ RoundedStageImage image(unsigned r) const { return {output[r], compact_output}; }
 };
 template <unsigned Rows, bool Int8 = false>
 __global__ void attention_score_rows_kernel(QsaRowsAttentionViews<Rows> views, const std::uint16_t* kv_state,
@@ -4433,7 +4445,7 @@ __global__ void attention_output_rows_kernel(QsaRowsAttentionViews<Rows> views, 
     std::uint32_t maximum_selected, std::uint32_t attention_heads, std::uint32_t kv_heads, std::uint32_t head_dim) {
     const auto r = blockIdx.y;
     attention_output_body<Int8>(views.q_gate[r], kv_state, views.selected[r], views.scores[r], views.count[r],
-        maximum_selected, attention_heads, kv_heads, head_dim, views.output[r], GraphSelectionArguments{});
+        maximum_selected, attention_heads, kv_heads, head_dim, views.image(r), GraphSelectionArguments{});
 }
 template <unsigned Rows, bool Int8 = false, bool Dense = false>
 __global__ __launch_bounds__(kThreads) void attention_tail_rows_kernel(QsaRowsAttentionViews<Rows> views,
@@ -4441,7 +4453,7 @@ __global__ __launch_bounds__(kThreads) void attention_tail_rows_kernel(QsaRowsAt
     std::uint32_t kv_heads, std::uint32_t head_dim, std::int8_t* codes, float* deltas) {
     const auto r = static_cast<std::uint32_t>(blockIdx.y);
     attention_tail_body<Int8, Dense>(views.q_gate[r], kv_state, views.selected[r], views.scores[r],
-        views.count[r], maximum_selected, attention_heads, kv_heads, head_dim, views.output[r],
+        views.count[r], maximum_selected, attention_heads, kv_heads, head_dim, views.image(r),
         GraphSelectionArguments{}, codes, deltas, r);
 }
 // Dense A8 (block = one head, thread = feature, every lane present): attention_output_rows_kernel
@@ -4453,9 +4465,9 @@ __global__ void attention_output_rows_dense_a8_kernel(QsaRowsAttentionViews<Rows
     std::int8_t* a8_codes, float* a8_deltas) {
     const auto r = blockIdx.y;
     attention_output_body<Int8>(views.q_gate[r], kv_state, views.selected[r], views.scores[r], views.count[r],
-        maximum_selected, attention_heads, kv_heads, head_dim, views.output[r], GraphSelectionArguments{});
+        maximum_selected, attention_heads, kv_heads, head_dim, views.image(r), GraphSelectionArguments{});
     const auto index = static_cast<std::uint64_t>(blockIdx.x) * head_dim + threadIdx.x;
-    q8_rows::dense_a8_quantize_lane(views.output[r][index], a8_codes + r * static_cast<std::uint64_t>(attention_heads) * head_dim + index,
+    q8_rows::dense_a8_quantize_lane(views.image(r)[index], a8_codes + r * static_cast<std::uint64_t>(attention_heads) * head_dim + index,
         a8_deltas + (index / 32U) * q8_rows::kDenseA8Rows + r);
 }
 
@@ -4648,7 +4660,7 @@ __global__ __launch_bounds__(256) void attention_output_rows_group_kernel(QsaRow
         const auto head = head0 + h;
         const float attn = round_bf16(sum[h]);
         const float gate = round_bf16(1.0F / (1.0F + expf(-views.q_gate[r][static_cast<std::uint64_t>(head) * head_dim * 2ULL + head_dim + feature])));
-        views.output[r][static_cast<std::uint64_t>(head) * head_dim + feature] = round_bf16(attn * gate);
+        views.image(r)[static_cast<std::uint64_t>(head) * head_dim + feature] = round_bf16(attn * gate);
     }
 }
 
@@ -4715,7 +4727,7 @@ __global__ __launch_bounds__(256) void attention_output_rows_group_prefetch_kern
         const auto head = head0 + h;
         const float attn = round_bf16(sum[h]);
         const float gate = round_bf16(1.0F / (1.0F + expf(-views.q_gate[r][static_cast<std::uint64_t>(head) * head_dim * 2ULL + head_dim + feature])));
-        views.output[r][static_cast<std::uint64_t>(head) * head_dim + feature] = round_bf16(attn * gate);
+        views.image(r)[static_cast<std::uint64_t>(head) * head_dim + feature] = round_bf16(attn * gate);
     }
 }
 
@@ -5282,13 +5294,57 @@ std::atomic<std::uint64_t> qpf2k_launch_index_batch{0}, qpf2k_index_batch_groups
 // (qsa_index::rows_kernel<64, 4, 2, 16>) are collected and run as one qsa_index::rows_batch_kernel launch at the end of
 // part 1 (before part 2, their only consumer). Each output is the same rows_body of the same group views; groups with
 // other matrices (e.g. STRIX_QSA_SKIP_INDEX_Q) flush the batch first, so every launch has one matrix set.
+// Exact decoder default; does not require STRIX_QSA_INDEX_ROWS or a QSA mask.
+// Startup-cached like the other prefill switches; restart between engine A/B arms.
+bool qpf2k_index_batch_enabled() {
+    return qpf2k::index_batch_enabled();
+}
+// Bit-changing indexer arithmetic is governed by the shared public prefill controls.
+bool qpf2k_index_wmma_enabled() {
+    if (!prefill_option_enabled(PrefillOption::index_proj_wmma) ||
+        qpf2k::suppressed(qpf2k::Item::index_rows)) return false;
+    int device = 0;
+    hipDeviceProp_t properties{};
+    check_hip(hipGetDevice(&device), "QSA index WMMA device");
+    check_hip(hipGetDeviceProperties(&properties, device), "QSA index WMMA architecture");
+    const std::string_view arch(properties.gcnArchName);
+    return (arch == "gfx1151" || arch.starts_with("gfx1151:")) && properties.warpSize == 32;
+}
+std::atomic<std::uint64_t> qpf2k_launch_index_wmma{0};
+bool qpf2k_index_wmma_layout(const QsaRowsInputViews<64U>& v, std::uint32_t hidden) {
+    if (hidden != 2560U || v.first[0] != 0U) return false;
+    // Only the indexer q/k contract (including its skipped-query prefix).
+    // Other BF16 projection groups keep exact arithmetic.
+    if (!((v.count == 1U && v.first[1] == 128U) ||
+          (v.count == 2U && v.first[1] == 512U && v.first[2] == 640U))) return false;
+    for (unsigned m = 0U; m < v.count; ++m)
+        if (reinterpret_cast<std::uintptr_t>(v.weights[m]) % 2U != 0U) return false;
+    return true;
+}
 struct Qpf2kIndexBatch {
     bool active = false;
+    bool wmma = false; // policy captured for this part-1 scope; false = exact batch
     std::uint32_t hidden = 0;
     std::uint64_t deferred = 0; // groups ever deferred (a caller compares it around a launch call)
     std::vector<QsaRowsInputViews<64U>> groups;
 };
 Qpf2kIndexBatch& qpf2k_index_batch() { static Qpf2kIndexBatch b; return b; }
+unsigned qpf2k_qsa_mask();
+// Own the production part-1 policy and clear pending views on normal or exceptional exit.
+struct Qpf2kIndexScope {
+    explicit Qpf2kIndexScope(unsigned mode, bool fast_qsa = true) {
+        auto& ib = qpf2k_index_batch();
+        ib.groups.clear();
+        ib.wmma = mode == 0U && fast_qsa && qpf2k_index_wmma_enabled();
+        ib.active = mode == 0U && (ib.wmma || qpf2k_index_batch_enabled() || (qpf2k_qsa_mask() & 0x80U));
+    }
+    ~Qpf2kIndexScope() {
+        auto& ib = qpf2k_index_batch();
+        ib.active = false; ib.wmma = false; ib.groups.clear();
+    }
+    Qpf2kIndexScope(const Qpf2kIndexScope&) = delete;
+    Qpf2kIndexScope& operator=(const Qpf2kIndexScope&) = delete;
+};
 bool qpf2k_same_matrices(const QsaRowsInputViews<64U>& x, const QsaRowsInputViews<64U>& y) {
     if (x.count != y.count) return false;
     for (unsigned m = 0; m < x.count; ++m) if (x.weights[m] != y.weights[m]) return false;
@@ -5325,7 +5381,14 @@ void qpf2k_index_flush(hipStream_t stream) {
         hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rows_batch_kernel<64U, RB, OW, W>), grid, dim3(W * 32U), lds, stream,
             static_cast<const QsaRowsInputViews<64U>*>(slot.views), ib.hidden);
     };
-    if (shape == 1U) launch.template operator()<4U, 16U>();
+    if (ib.wmma && qpf2k_index_wmma_layout(v0, ib.hidden)) {
+        hipLaunchKernelGGL(qsa_index::rows_wmma_kernel,
+            dim3(v0.first[v0.count] / 64U, static_cast<unsigned>(ib.groups.size())), dim3(128), 0, stream,
+            static_cast<const QsaRowsInputViews<64U>*>(slot.views), ib.hidden);
+        qpf2k_launch_index_wmma.fetch_add(1U, std::memory_order_relaxed);
+    }
+    else if (qpf2k_index_batch_enabled() || ib.wmma) launch.template operator()<2U, 16U>();
+    else if (shape == 1U) launch.template operator()<4U, 16U>();
     else if (shape == 2U) launch.template operator()<4U, 8U>();
     else if (shape == 3U) launch.template operator()<2U, 8U>();
     else launch.template operator()<2U, 16U>();
@@ -5368,9 +5431,9 @@ Qpf2kTrace& qpf2k_trace() {
     return t;
 }
 template <unsigned Rows, class Data, class Count>
-void qpf2k_trace_rows(unsigned kind, const std::array<std::uint64_t, Rows>& position, Data data, Count count, hipStream_t stream) {
+void qpf2k_trace_rows(unsigned kind, const std::array<std::uint64_t, Rows>& position, Data data, Count count, hipStream_t stream, bool compact = false) {
     qsa_flash::TraceViews<Rows> v{};
-    for (unsigned r = 0; r < Rows; ++r) { v.data[r] = reinterpret_cast<const std::uint32_t*>(data(r)); v.count[r] = count(r); v.position[r] = position[r]; }
+    for (unsigned r = 0; r < Rows; ++r) { v.data[r] = reinterpret_cast<const std::uint32_t*>(data(r)); v.count[r] = count(r); v.position[r] = position[r]; v.compact[r] = compact; }
     auto& t = qpf2k_trace();
     hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::trace_kernel<Rows>), dim3(Rows), dim3(256), 0, stream, v, kind, t.call, t.acc);
     check_hip(hipGetLastError(), "QSA trace launch");
@@ -5421,11 +5484,11 @@ void launch_qsa_rows_input(bool prefetch, bool a8, const QsaRowsInputViews<Rows>
         return;
     }
     if constexpr (Rows > 8U) if (Kind != WeightKind::q8_0 || !(prefetch || a8)) {
-        if constexpr (Kind == WeightKind::bf16 && Rows >= 64U && Rows % 16U == 0U) if (qsa_index_rows_enabled() && hidden % 256U == 0U && hidden <= 4096U) {
+        if constexpr (Kind == WeightKind::bf16 && Rows >= 64U && Rows % 16U == 0U) if ((qsa_index_rows_enabled() || (qpf2k_index_batch().active && (qpf2k_index_batch_enabled() || qpf2k_index_batch().wmma))) && hidden % 256U == 0U && hidden <= 4096U) {
             bool aligned = true;
             for (unsigned r = 0; r < Rows; ++r) aligned = aligned && reinterpret_cast<std::uintptr_t>(views.input[r]) % 16U == 0U;
             // STRIX_QPF2K_QSA bit 3: 16 rows per workgroup (qsa_flash::index_rows_kernel, the same chains and tree).
-            if (aligned && (qpf2k_qsa_mask() & 8U) && hidden % 512U == 0U) {
+            if (aligned && !(qpf2k_index_batch().active && (qpf2k_index_batch_enabled() || qpf2k_index_batch().wmma)) && (qpf2k_qsa_mask() & 8U) && hidden % 512U == 0U) {
                 constexpr unsigned RB = 16U, W = 16U;
                 const dim3 grid((views.first[views.count] + W - 1U) / W, Rows / RB);
                 if (any_order)
@@ -5508,11 +5571,11 @@ void launch_qsa_rows_input(bool prefetch, bool a8, const QsaRowsInputViews<Rows>
     else hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_to_float_rows_kernel<Kind, Rows>), dim3(views.first[views.count]), dim3(kThreads), 0,
         stream, views, hidden);
 }
-template <WeightKind Kind, unsigned Rows>
-void launch_qsa_rows_output(bool wave8, bool a8, const QsaRowsOutputViews<Rows>& views, const void* weights,
+template <WeightKind Kind, unsigned Rows, class InputType = float>
+void launch_qsa_rows_output_storage(bool wave8, bool a8, const QsaRowsOutputViews<Rows>& views, const void* weights,
     std::uint32_t width, std::uint32_t hidden, hipStream_t stream, bool f16 = false, bool g64 = false) {
     if constexpr (Kind != WeightKind::q8_0 && Rows <= 8U) if (a8 && q8_rows::dense_a8_type(kind_ggml_type(Kind))) {
-        QsaOutputRowsSite<Rows> site{};
+        QsaOutputRowsSite<Rows, InputType> site{};
         site.segments = q8_rows::segments({{weights, hidden}});
         site.segments.types[0] = kind_ggml_type(Kind);
         for (unsigned r = 0; r < Rows; ++r) { site.input[r] = views.input[r]; site.output[r] = views.output[r]; }
@@ -5523,13 +5586,14 @@ void launch_qsa_rows_output(bool wave8, bool a8, const QsaRowsOutputViews<Rows>&
     if constexpr (Rows > 8U) if (Kind != WeightKind::q8_0 || !(wave8 || a8)) {
         for (unsigned first = 0; first < Rows; first += 8U) {
             QsaRowsOutputViews<8U> slice{};
+            slice.compact = views.compact;
             for (unsigned r = 0; r < 8U; ++r) { slice.input[r] = views.input[first + r]; slice.output[r] = views.output[first + r]; }
-            launch_qsa_rows_output<Kind, 8U>(wave8, a8, slice, weights, width, hidden, stream);
+            launch_qsa_rows_output_storage<Kind, 8U, InputType>(wave8, a8, slice, weights, width, hidden, stream);
         }
         return;
     }
     if constexpr (Kind == WeightKind::q8_0) if (wave8 || a8) {
-        QsaOutputRowsSite<Rows> site{};
+        QsaOutputRowsSite<Rows, InputType> site{};
         site.segments = q8_rows::segments({{weights, hidden}});
         for (unsigned r = 0; r < Rows; ++r) { site.input[r] = views.input[r]; site.output[r] = views.output[r]; }
         site.width = width; site.outputs = hidden;
@@ -5539,6 +5603,13 @@ void launch_qsa_rows_output(bool wave8, bool a8, const QsaRowsOutputViews<Rows>&
     hipLaunchKernelGGL(HIP_KERNEL_NAME(linear_float_to_bf16_rows_kernel<Kind, Rows>), dim3(hidden), dim3(kThreads), 0,
         stream, views, weights, width, hidden);
 }
+template <WeightKind Kind, unsigned Rows>
+void launch_qsa_rows_output(bool wave8, bool a8, const QsaRowsOutputViews<Rows>& views, const void* weights,
+    std::uint32_t width, std::uint32_t hidden, hipStream_t stream, bool f16 = false, bool g64 = false) {
+    if (views.compact) launch_qsa_rows_output_storage<Kind, Rows, std::uint16_t>(wave8,a8,views,weights,width,hidden,stream,f16,g64);
+    else launch_qsa_rows_output_storage<Kind, Rows, float>(wave8,a8,views,weights,width,hidden,stream,f16,g64);
+}
+
 template <class Launch>
 void dispatch_weight_kind(std::uint32_t type, Launch&& launch) {
     switch (weight_kind(type)) {
@@ -5727,7 +5798,7 @@ bool launch_qsa_fast_prefill(const QsaKnownRows<Rows>& prepared, const PreparedI
     for (unsigned r = 0; r < Rows; ++r) {
         const auto& w = prepared.row[r].workspace;
         views.q_gate[r] = w.q_gate; views.selected[r] = w.selected_indices; views.scratch[r] = w.attention_scores;
-        views.output[r] = w.attention_output;
+        views.output[r] = w.attention_output; views.compact_output = w.compact_attention_output;
         views.count[r] = prepared.selection[r].selected_count; views.visible[r] = prepared.selection[r].visible;
         if (!views.count[r] || views.visible[r] > (1U << 30U)) { need_selections(); return false; }
     }
@@ -6257,7 +6328,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     for (unsigned r = 0; r < Rows; ++r) {
         const auto& w = prepared.row[r].workspace;
         attention.q_gate[r] = w.q_gate; attention.selected[r] = w.selected_indices;
-        attention.scores[r] = w.attention_scores; attention.output[r] = w.attention_output;
+        attention.scores[r] = w.attention_scores; attention.output[r] = w.attention_output; attention.compact_output = w.compact_attention_output;
         attention.count[r] = prepared.selection[r].selected_count;
         maximum_count = std::max(maximum_count, attention.count[r]);
     }
@@ -6427,6 +6498,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         output_slot = *cohort_slot;
 
     QsaRowsOutputViews<Rows> out{};
+    out.compact = a.workspace.compact_attention_output;
     for (unsigned r = 0; r < Rows; ++r) {
         out.input[r] = prepared.row[r].workspace.attention_output;
         out.output[r] = reinterpret_cast<std::uint16_t*>(prepared.row[r].output.address);
@@ -6713,7 +6785,8 @@ std::uint32_t enqueue_qsa_prefill_tiled_inputs(const std::vector<QsaKnownRows<8U
 }
 // STRIX_QPF2K_DENSE=1, part 4: the output projection of the rows projections(4) gives to its >= 32-row groups (FP16 when
 // the out matrix is Q8_0, wave8 or dense A8, dense_f16_prefill and not g64) in one tiled launch. Returns the rows done.
-std::uint32_t enqueue_qsa_prefill_tiled_output(const std::vector<QsaKnownRows<8U>>& tiles, const HipIndexedAttentionLauncherConfig& config) {
+template <class InputType>
+std::uint32_t enqueue_qsa_prefill_tiled_output_storage(const std::vector<QsaKnownRows<8U>>& tiles, const HipIndexedAttentionLauncherConfig& config) {
     if (!q8_rows::tiled::site_enabled(8U) || !(config.wave8_q8_output || config.dense_a8_projections) || !config.dense_f16_prefill ||
         config.dense_g64_prefill)
         return 0U;
@@ -6725,7 +6798,7 @@ std::uint32_t enqueue_qsa_prefill_tiled_output(const std::vector<QsaKnownRows<8U
     if (!qsa_prefill_uniform(tiles, rows, [](const auto& row) { return static_cast<const void*>(row.workspace.attention_output); }, si) ||
         !qsa_prefill_uniform(tiles, rows, [](const auto& row) { return reinterpret_cast<const void*>(row.output.address); }, so))
         return 0U;
-    QsaOutputTiledSite site{};
+    QsaOutputTiledSite<InputType> site{};
     site.segments = q8_rows::segments({{reinterpret_cast<const void*>(a.tensors.out.runtime->address), a.hidden}});
     site.width = a.attention_width; site.outputs = a.hidden;
     site.input_stride = si; site.output_stride = so;
@@ -6735,7 +6808,7 @@ std::uint32_t enqueue_qsa_prefill_tiled_output(const std::vector<QsaKnownRows<8U
     // 64-row launches). A row's value does not depend on the chunk it lands in.
     const auto* const in0 = reinterpret_cast<const unsigned char*>(a.workspace.attention_output);
     auto* const out0 = reinterpret_cast<unsigned char*>(a.output.address);
-    const std::uint64_t row_bytes = static_cast<std::uint64_t>(a.attention_width) * sizeof(float);
+    const std::uint64_t row_bytes = static_cast<std::uint64_t>(a.attention_width) * sizeof(InputType);
     if (row_bytes >= (1ULL << 32U)) return 0U;
     std::uint64_t chunk = ((1ULL << 32U) - 1U - row_bytes) / si + 1U;  // rows n with (n - 1) * si + row_bytes < 2^32
     if (chunk < rows) chunk = chunk / 256U * 256U;
@@ -6758,6 +6831,11 @@ std::uint32_t enqueue_qsa_prefill_tiled_output(const std::vector<QsaKnownRows<8U
     }
     return rows;
 }
+std::uint32_t enqueue_qsa_prefill_tiled_output(const std::vector<QsaKnownRows<8U>>& tiles, const HipIndexedAttentionLauncherConfig& config) {
+    return tiles[0].row[0].workspace.compact_attention_output ?
+        enqueue_qsa_prefill_tiled_output_storage<std::uint16_t>(tiles,config) :
+        enqueue_qsa_prefill_tiled_output_storage<float>(tiles,config);
+}
 // Attention outputs of every prefill row (self-check).
 std::vector<std::uint8_t> qsa_prefill_attention_outputs(const std::vector<QsaKnownRows<8U>>& tiles) {
     check_hip(hipStreamSynchronize(hip_execution_stream()), "QSA prefill self-check sync");
@@ -6767,7 +6845,14 @@ std::vector<std::uint8_t> qsa_prefill_attention_outputs(const std::vector<QsaKno
             const auto size = static_cast<std::size_t>(row.attention_width) * sizeof(float);
             const auto at = bytes.size();
             bytes.resize(at + size);
-            check_hip(hipMemcpy(bytes.data() + at, row.workspace.attention_output, size, hipMemcpyDeviceToHost), "QSA prefill self-check copy");
+            if (row.workspace.compact_attention_output) {
+                std::vector<std::uint16_t> compact(row.attention_width);
+                check_hip(hipMemcpy(compact.data(), row.workspace.attention_output, compact.size()*2U, hipMemcpyDeviceToHost), "QSA compact self-check copy");
+                for (std::size_t i=0;i<compact.size();++i) {
+                    const auto bits=widen_compact_bits(compact[i]);
+                    std::memcpy(bytes.data()+at+i*4U,&bits,4U);
+                }
+            } else check_hip(hipMemcpy(bytes.data() + at, row.workspace.attention_output, size, hipMemcpyDeviceToHost), "QSA prefill self-check copy");
         }
     return bytes;
 }
@@ -6926,11 +7011,9 @@ void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const 
     };
     {
         // The batch is active only inside this block; the guard resets it on any exit (an exception drops unlaunched views).
-        struct Guard { ~Guard() { auto& b = qpf2k_index_batch(); b.active = false; b.groups.clear(); } } guard;
+        Qpf2kIndexScope guard(mode, config.qsa_fast_prefill);
         auto& ib = qpf2k_index_batch();
-        ib.groups.clear();
-        ib.active = mode == 0U && (qpf2k_qsa_mask() & 0x80U);
-        const bool side = ib.active && (qpf2k_qsa_mask() & 0x100U);
+        const bool side = ib.active && !qpf2k_index_batch_enabled() && !ib.wmma && (qpf2k_qsa_mask() & 0x100U);
         const auto main_stream = hip_execution_stream();
         if (side) check_hip(hipEventRecord(qpf2k_index_side().fork, main_stream), "QSA index side fork");
         projections(1U);
@@ -7074,13 +7157,13 @@ void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const 
             std::array<std::uint64_t, 64U> position{};
             for (unsigned r = 0; r < 64U; ++r) position[r] = tiles[t + r / 8U].position[r % 8U];
             qpf2k_trace_rows<64U>(3U, position, [&](unsigned r) { return tiles[t + r / 8U].row[r % 8U].workspace.attention_output; },
-                [&](unsigned r) { return tiles[t + r / 8U].row[r % 8U].attention_width; }, stream);
+                [&](unsigned r) { return tiles[t + r / 8U].row[r % 8U].attention_width; }, stream, tiles[0].row[0].workspace.compact_attention_output);
         }
         for (std::size_t t = tiles.size() / 8U * 8U; t < tiles.size(); ++t) {
             std::array<std::uint64_t, 8U> position{};
             for (unsigned r = 0; r < 8U; ++r) position[r] = tiles[t].position[r];
             qpf2k_trace_rows<8U>(3U, position, [&](unsigned r) { return tiles[t].row[r].workspace.attention_output; },
-                [&](unsigned r) { return tiles[t].row[r].attention_width; }, stream);
+                [&](unsigned r) { return tiles[t].row[r].attention_width; }, stream, tiles[0].row[0].workspace.compact_attention_output);
         }
     }
     projections(4U);
@@ -7091,7 +7174,7 @@ void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const 
         check_hip(hipMemcpy(acc.data(), t.acc, sizeof(acc), hipMemcpyDeviceToHost), "QSA trace copy");
         std::fprintf(stderr, "qpf2k qsa trace call %u rows %llu scores %016llx selected %016llx post %016llx attn %016llx\n", t.call,
             static_cast<unsigned long long>(t.rows), acc[0], acc[1], acc[2], acc[3]);
-        std::fprintf(stderr, "qpf2k qsa launches score %llu select %llu production score %llu select %llu index16 %llu norm_wave %llu select_batch %llu batch_rows %llu early_flush %llu groups %llu %llu %llu %llu shadow %llu shadow_skipped %llu shadow_peak_mib %llu order %llu index_batch %llu index_batch_groups %llu index_side %llu\n",
+        std::fprintf(stderr, "qpf2k qsa launches score %llu select %llu production score %llu select %llu index16 %llu norm_wave %llu select_batch %llu batch_rows %llu early_flush %llu groups %llu %llu %llu %llu shadow %llu shadow_skipped %llu shadow_peak_mib %llu order %llu index_batch %llu index_batch_groups %llu index_side %llu index_wmma %llu\n",
             static_cast<unsigned long long>(qpf2k_launch_score.load()), static_cast<unsigned long long>(qpf2k_launch_select.load()),
             static_cast<unsigned long long>(qpf2k_launch_prod_score.load()), static_cast<unsigned long long>(qpf2k_launch_prod_select.load()),
             static_cast<unsigned long long>(qpf2k_launch_index16.load()), static_cast<unsigned long long>(qpf2k_launch_norm_wave.load()),
@@ -7103,11 +7186,17 @@ void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const 
             static_cast<unsigned long long>(qpf2k_shadow_peak_bytes.load() >> 20U),
             static_cast<unsigned long long>(qpf2k_launch_order.load()),
             static_cast<unsigned long long>(qpf2k_launch_index_batch.load()), static_cast<unsigned long long>(qpf2k_index_batch_groups.load()),
-            static_cast<unsigned long long>(qpf2k_launch_index_side.load()));
+            static_cast<unsigned long long>(qpf2k_launch_index_side.load()),
+            static_cast<unsigned long long>(qpf2k_launch_index_wmma.load()));
         ++t.call;
     }
 }
 }  // namespace
+
+void reserve_indexed_attention_prefill_pools(std::uint32_t rows, std::uint64_t context_tokens,
+    std::uint32_t ratio, bool compact_scores) {
+    qpf2k_stage_setup(rows, context_tokens, ratio, compact_scores);
+}
 
 void indexed_attention_known_prefill_rows_preflight(std::span<const ExecutionDispatchContext> rows,
     const HipIndexedAttentionLauncherConfig& config, HipQsaIndexJournal journal) {
@@ -7800,6 +7889,117 @@ void launch_hip_qsa_block_select_probe(bool reference, std::span<const HipQsaBlo
 #endif
 
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
+__global__ void compact_qsa_status_probe(QsaRowsAttentionViews<8U> v, const std::uint16_t* kv,
+    unsigned maximum_selected, std::uint32_t* status) {
+    GraphSelectionArguments dynamic{};
+    dynamic.position.status = status;
+    attention_output_body(v.q_gate[blockIdx.y], kv, v.selected[blockIdx.y], v.scores[blockIdx.y],
+        v.count[blockIdx.y], maximum_selected, 24U, 2U, 256U, v.image(blockIdx.y), dynamic);
+}
+__global__ void compact_qsa_quantizer_probe(q8_rows::DenseA8Slot slot, unsigned char* out) {
+    const unsigned i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<8U*6144U) out[i]=reinterpret_cast<const unsigned char*>(slot.codes)[i];
+    if(i<192U*8U) reinterpret_cast<float*>(out+8U*6144U)[i]=slot.deltas[(i/8U)*q8_rows::kDenseA8Rows+i%8U];
+}
+void launch_hip_compact_qsa_probe(const HipCompactQsaProbe& p, void* opaque_stream) {
+    const auto stream = static_cast<hipStream_t>(opaque_stream);
+    if (!stream || !p.rows || p.rows % 8U || p.mode > 12U || !p.query || !p.kv || !p.selected ||
+        !p.scores || !p.image || !p.weights || !p.projected || !p.status || !p.quantized || p.maximum_selected != 2052U || p.count > 32U)
+        throw std::invalid_argument("compact QSA fixture views or geometry invalid");
+    constexpr unsigned heads=24U, kv_heads=2U, dim=256U, width=heads*dim, hidden=2560U;
+    const auto padded=(p.rows+63U)/64U*64U;
+    const auto output_at=[&](unsigned r) { return reinterpret_cast<float*>(static_cast<unsigned char*>(p.image)+
+        static_cast<std::uint64_t>(r)*width*(p.compact?2U:4U)); };
+    if (p.mode <= 4U || p.mode==10U) {
+        for (unsigned first=0;first<padded;first+=64U) {
+            qsa_fast::Views<64U> v{};
+            v.compact_output=p.compact;
+            for(unsigned r=0;r<64U;++r) {
+                const auto row=first+r;
+                v.q_gate[r]=p.query+static_cast<std::uint64_t>(row)*width*2U;
+                v.selected[r]=p.selected+static_cast<std::uint64_t>(row)*p.maximum_selected;
+                v.scratch[r]=p.scores+static_cast<std::uint64_t>(row)*heads*p.maximum_selected;
+                v.output[r]=output_at(row);v.count[r]=p.count;v.visible[r]=32U;
+            }
+            const unsigned splits=p.mode==4U?2U:1U, union_at=splits*heads*qsa_fast::kPartial;
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::union_kernel<64U,4U>),dim3(16),dim3(256),0,stream,v,union_at);
+            if (p.mode==1U || p.mode==2U || p.mode==3U) {
+                qsa_fast::Views<64U>* device=nullptr;
+                check_hip(hipMallocAsync(reinterpret_cast<void**>(&device),sizeof(v),stream),"compact fixture views");
+                // Host descriptor lives until its asynchronous copy has consumed it.
+                check_hip(hipMemcpyAsync(device,&v,sizeof(v),hipMemcpyHostToDevice,stream),"compact fixture views copy");
+                if(p.mode==1U) hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_kernel<64U,4U,3U>),
+                    dim3(32),dim3(320),0,stream,device,p.kv,kv_heads,heads,union_at,2U);
+                else if(p.mode==2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_order_occ_kernel<64U,4U,3U>),
+                    dim3(32),dim3(320),0,stream,device,p.kv,kv_heads,heads,union_at,2U);
+                else {
+                    std::uint16_t* shadow=nullptr;
+                    check_hip(hipMallocAsync(reinterpret_cast<void**>(&shadow),32U*kv_heads*dim*4U,stream),"compact fixture shadow");
+                    const auto words=32ULL*kv_heads*dim;
+                    hipLaunchKernelGGL(qsa_fast::kv_to_f16_kernel,dim3(17),dim3(256),0,stream,
+                        reinterpret_cast<const unsigned*>(p.kv),reinterpret_cast<unsigned*>(shadow),0ULL,words);
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_shadow_multi_kernel<64U,4U,3U>),
+                        dim3(16,2),dim3(320),0,stream,device,shadow,kv_heads,heads,union_at);
+                    check_hip(hipFreeAsync(shadow,stream),"compact fixture shadow free");
+                }
+                check_hip(hipFreeAsync(device,stream),"compact fixture views free");
+                check_hip(hipStreamSynchronize(stream),"compact fixture descriptor lifetime");
+            } else {
+                if(p.mode==10U) hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_kernel<64U,4U,3U,3U,true>),dim3(16,2,splits),dim3(320),0,stream,
+                    v,p.kv,kv_heads,heads,union_at,splits,0U);
+                else hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::attend_kernel<64U,4U,3U>),dim3(16,2,splits),dim3(320),0,stream,
+                    v,p.kv,kv_heads,heads,union_at,splits,0U);
+                if(splits>1U) hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_fast::combine_kernel<64U>),dim3(heads,64),dim3(dim),0,stream,v,heads,splits);
+            }
+        }
+    } else {
+        for(unsigned first=0;first<p.rows;first+=8U) {
+            QsaRowsAttentionViews<8U> v{};v.compact_output=p.compact;
+            for(unsigned r=0;r<8U;++r) {
+                const auto row=first+r;
+                v.q_gate[r]=p.query+static_cast<std::uint64_t>(row)*width*2U;
+                v.selected[r]=p.selected+static_cast<std::uint64_t>(row)*p.maximum_selected;
+                v.scores[r]=p.scores+static_cast<std::uint64_t>(row)*heads*p.maximum_selected;
+                v.output[r]=output_at(row);v.count[r]=p.count;
+            }
+            if(p.mode==11U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_kernel<8U,true>),dim3(heads,8),dim3(dim),0,stream,
+                v,p.kv,p.maximum_selected,heads,kv_heads,dim);
+            else if(p.mode==12U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_group_prefetch_kernel<8U,12U,true>),dim3(2,8),dim3(dim),0,stream,
+                v,p.kv,p.maximum_selected,heads,kv_heads,dim);
+            else if(p.mode==5U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_kernel<8U>),dim3(heads,8),dim3(dim),0,stream,
+                v,p.kv,p.maximum_selected,heads,kv_heads,dim);
+            else if(p.mode==6U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_group_kernel<8U,12U>),dim3(2,8),dim3(dim),0,stream,
+                v,p.kv,p.maximum_selected,heads,kv_heads,dim);
+            else if(p.mode==7U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_output_rows_group_prefetch_kernel<8U,12U>),dim3(2,8),dim3(dim),0,stream,
+                v,p.kv,p.maximum_selected,heads,kv_heads,dim);
+            else if(p.mode==8U) {
+                // Exercise the in-place read after the compact store, including quantizer diagnostics.
+                auto slot=q8_rows::dense_a8_slot(0U);
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_tail_rows_kernel<8U,false,true>),dim3(heads,8),dim3(dim),0,stream,
+                    v,p.kv,p.maximum_selected,heads,kv_heads,dim,slot.codes,slot.deltas);
+                hipLaunchKernelGGL(compact_qsa_quantizer_probe,dim3(192),dim3(256),0,stream,slot,static_cast<unsigned char*>(p.quantized));
+            } else hipLaunchKernelGGL(compact_qsa_status_probe,dim3(heads,8),dim3(dim),0,stream,v,p.kv,p.maximum_selected,p.status);
+        }
+    }
+    check_hip(hipMemsetAsync(q8_rows::dense_f16_overflow_counter(),0,sizeof(unsigned),stream),"compact fixture range reset");
+    if(p.tiled_projection) {
+        const auto project=[&]<class Input>() {
+            QsaOutputTiledSite<Input> site{};
+            site.segments=q8_rows::segments({{p.weights,hidden}});site.width=width;site.outputs=hidden;
+            site.input0=static_cast<const unsigned char*>(p.image);site.input_stride=width*sizeof(Input);
+            site.output0=reinterpret_cast<unsigned char*>(p.projected);site.output_stride=hidden*2U;
+            q8_rows::tiled::launch(site,p.rows,stream);
+        };
+        if(p.compact) project.template operator()<std::uint16_t>();else project.template operator()<float>();
+    } else for(unsigned first=0;first<p.rows;first+=8U) {
+        QsaRowsOutputViews<8U> v{};v.compact=p.compact;
+        for(unsigned r=0;r<8U;++r) {v.input[r]=output_at(first+r);v.output[r]=p.projected+(first+r)*hidden;}
+        if(p.scalar_projection) launch_qsa_rows_output<WeightKind::f32,8U>(false,false,v,p.weights,width,hidden,stream);
+        else launch_qsa_rows_output<WeightKind::q8_0,8U>(true,p.dense_a8_projection,v,p.weights,width,hidden,stream,p.fast_f16_projection);
+    }
+    check_hip(hipMemcpyAsync(p.status+1U,q8_rows::dense_f16_overflow_counter(),sizeof(unsigned),hipMemcpyDeviceToDevice,stream),"compact fixture range receipt");
+    check_hip(hipGetLastError(),"compact QSA fixture launch");
+}
 void launch_hip_attention_kv_int8_probe(const HipKvInt8Probe& p, void* stream) {
     const auto owned = static_cast<hipStream_t>(stream);
     if (!owned || owned == hipStreamPerThread || owned == hipStreamLegacy || p.head_dim != kThreads || !p.kv_heads ||

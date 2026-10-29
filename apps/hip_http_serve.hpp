@@ -38,13 +38,13 @@ inline void append_mtp_pool_receipt(serve::GenerationStats& stats, const MtpServ
 }
 
 inline void add_prefill_capabilities(serve::Json& out) {
-    const auto fields = serve::parse_json("{" + prefill_identity_fields(prefill_options_active()) + "}");
+    const auto fields = serve::parse_json("{" + prefill_identity_fields(prefill_options_active()) + "," + http_exact_prefill_fields() + "}");
     for (const auto& [key, value] : fields.as_object()) out.set(key, value);
     out.set("prefill_override_scope", serve::Json("server-level only"));
 }
 
 inline void add_prefill_stats(serve::GenerationStats& stats) {
-    const auto fields = serve::parse_json("{" + prefill_identity_fields(prefill_options_active()) + "}");
+    const auto fields = serve::parse_json("{" + prefill_identity_fields(prefill_options_active()) + "," + http_exact_prefill_fields() + "}");
     for (const auto& [key, value] : fields.as_object()) stats.engine_extra.emplace_back(key, value.dump());
 }
 

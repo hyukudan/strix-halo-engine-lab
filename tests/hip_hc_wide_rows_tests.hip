@@ -407,7 +407,9 @@ void compare_lowband(std::uint32_t rows, bool bf16, unsigned flavor, hipStream_t
     const auto c = config(bf16);
     auto v = f.views();
     v.output3_band = 16U;
-    constexpr std::size_t kTable = std::size_t{kRank} * 8192U, kLow16 = std::size_t{kRank} * 8192U;
+    // Pools hold whole 512-row blocks; a banded table of rows > 8192 (8224) reaches past 8192 rows.
+    const std::size_t table_rows = std::max<std::size_t>(8192U, (std::size_t{rows} + 511U) / 512U * 512U);
+    const std::size_t kTable = std::size_t{kRank} * table_rows, kLow16 = std::size_t{kRank} * table_rows;
     auto* table = const_cast<float*>(strix::testing::wide_hyper_rows_test_low_t());
     auto* low16 = const_cast<void*>(strix::testing::wide_hyper_rows_test_low16());
     const std::uint64_t out_bytes = kHidden * (bf16 ? 2U : 4U);
@@ -788,7 +790,7 @@ void bench_out16(hipStream_t stream) {
 }
 
 void fixtures_lowband(hipStream_t stream) {
-    for (const std::uint32_t rows : {8U, 32U, 480U, 511U, 512U, 513U, 544U, 1000U, 1032U, 4097U, 8191U, 8192U})
+    for (const std::uint32_t rows : {8U, 32U, 480U, 511U, 512U, 513U, 544U, 1000U, 1032U, 4097U, 8191U, 8192U, 8224U})
         for (const unsigned flavor : {0U, 3U}) compare_lowband(rows, true, flavor, stream);
     for (const std::uint32_t rows : {513U, 8192U})
         for (const unsigned flavor : {1U, 2U}) compare_lowband(rows, true, flavor, stream);
@@ -820,6 +822,9 @@ void fixtures_v3(hipStream_t stream) {
 }  // namespace
 
 int main() try {
+    const char* configured_rows = std::getenv("STRIX_HC_WIDE_BENCH_ROWS");
+    const auto pool_rows = configured_rows ? static_cast<std::uint32_t>(std::stoul(configured_rows)) : 8192U;
+    strix::reserve_hyper_mix_prefill_pools(std::max(8224U, pool_rows));
     hipStream_t stream = nullptr;
     check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
     if (std::getenv("STRIX_HC_OUT16_FIXTURES_ONLY")) {

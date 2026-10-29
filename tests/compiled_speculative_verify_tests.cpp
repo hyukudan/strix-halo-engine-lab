@@ -1,3 +1,4 @@
+#include "strix/compact_stage_images.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/compiled_speculative_verify.hpp"
 #include "strix/known_prefill_limits.hpp"
@@ -606,7 +607,7 @@ void known_prefix_prefill_tests(const strix::ModelContract& model) {
     // Host flow/state oracle only. Native projection arithmetic is exercised
     // separately; these recording kernels deliberately use tiny state words.
     for(bool mixed:{false,true}) for(auto rows:{16U,17U,32U}) for(auto policy:{P::all_rows,P::terminal_row,P::state_only})
-        for(bool partial:{false,true}) {
+        for(bool partial:{false,true}) for(bool early:{false,true}) {
         if(partial && (rows%8U || policy==P::all_rows)) continue;
         KnownRuntimeFixture f(model,true,mixed);
         strix::KnownPrefillRequest request;request.logical_rows=partial?rows+16U:rows;request.r2_shared_expert=true;request.r2_gdn=true;
@@ -630,6 +631,33 @@ void known_prefix_prefill_tests(const strix::ModelContract& model) {
             {V::shared_q8_virtual256_r8_v1,&f.trace,&recording_rows_preflight,&recording_rows_launch},
             {V::gdn_q8_rows8_f32_gates_r1_v1,&f.trace,&recording_rows_preflight,&recording_rows_launch}}};
         auto prefill_hooks=f.hooks();prefill_hooks.partial_rows=partial;
+        std::vector<const void*> static_memo, live_memo;
+        prefill_hooks.static_preflight_memo=&static_memo;
+        prefill_hooks.preflight_memo=&live_memo;
+        if(early) {
+            auto setup=prefill_hooks;setup.partial_rows=false;
+            setup.preflight_only=true;setup.static_preflight_only=true;
+            setup.complete=[] {throw std::logic_error("setup must never complete");};
+            const auto initial_state=f.state_words, initial_arena=f.window_pool;
+            const auto initial_session=f.session;
+            (void)strix::execute_known_prefix_prefill_eager(prefill,f.source.serial,f.resources,f.window_memory,
+                f.session,{},launch,pairs,wide,setup);
+            expect(f.trace.calls==0 && f.state_words==initial_state && f.window_pool==initial_arena &&
+                f.session.next_position==initial_session.next_position &&
+                f.session.committed_tokens==initial_session.committed_tokens &&
+                f.session.state.generations==initial_session.state.generations &&
+                f.session.arithmetic_lineage.history_identity==initial_session.arithmetic_lineage.history_identity,
+                "static setup without a prompt never launches, completes or mutates state/session/arena");
+            expect(static_memo.size()==1 && live_memo.empty(),"setup seals only static admission");
+            auto invalid=tokens;invalid.back()=static_cast<std::uint32_t>(model.vocab_size);
+            bool refused=false;
+            try {(void)strix::execute_known_prefix_prefill_eager(prefill,f.source.serial,f.resources,f.window_memory,
+                f.session,invalid,launch,pairs,wide,prefill_hooks);} catch(const std::invalid_argument&) {refused=true;}
+            expect(refused && f.trace.calls==0 && live_memo.empty() && f.state_words==initial_state,
+                "static admission never admits a bad live prompt or publishes a live memo");
+            // Clear recording-only head admissions: partial blocks still admit their own live geometry.
+            if(partial) f.trace.head_admissions.clear();
+        }
         const auto result=strix::execute_known_prefix_prefill_eager(prefill,f.source.serial,f.resources,f.window_memory,
             f.session,tokens,launch,pairs,wide,prefill_hooks);
         expect(f.session.next_position==rows&&f.session.committed_tokens==rows&&f.session.state.generations==expected_generations,
@@ -670,7 +698,7 @@ void known_prefix_prefill_tests(const strix::ModelContract& model) {
             bool rejected=false;try {strix::validate_compiled_known_prefix_prefill(bad,f.source.serial);} catch(const std::exception&) {rejected=true;}
             expect(rejected,"T prefill forged geometry/arena/map/budget rejected with unchanged identities");
         }
-        for(auto rows:{15U,strix::known_prefill_max_rows+1U}) {
+        for(auto rows:{15U,strix::known_prefill_max_rows+1U,32768U}) {
             auto bad=request;bad.logical_rows=rows;bool rejected=false;
             try {(void)strix::compile_known_prefix_prefill(model,f.source.serial,f.source.manifest,f.source.access,bad);} catch(const std::invalid_argument&) {rejected=true;}
             expect(rejected,"T prefill closed range rejects out-of-bounds geometry");
@@ -686,6 +714,8 @@ void known_prefix_prefill_tests(const strix::ModelContract& model) {
         const auto maximum_plan=strix::compile_known_prefix_prefill(model,f.source.serial,f.source.manifest,f.source.access,maximum);
         strix::validate_compiled_known_prefix_prefill(maximum_plan,f.source.serial);
         expect(maximum_plan.arena.row_view.size()==strix::known_prefill_max_rows,"maximum T owns bounded row metadata without T topology clones");
+        expect(maximum.logical_rows==16384U&&maximum_plan.logit_row_indices.size()==16384U,
+            "T16384 compiles the complete output map without narrowing its row count");
         for(unsigned fault=0;fault<4;++fault) {
             f.reset();std::vector<std::uint32_t> tokens(16U,7U);
             f.window_pool.resize(static_cast<std::size_t>((good.arena.physical.total_bytes+7U)/8U));
@@ -1500,6 +1530,24 @@ void known_window_qsa_tests(const strix::ModelContract& model) {
         expect(plan.external_qsa_score_bytes==262144U && plan.qsa_score_ring_rows==512U && plan.qsa_score_ring_workspace_bytes==335544320U,
             "eligible prefill owns two bounded external score/maxima slots");
         expect(plan.terminal_logits_arena,"terminal arena defaults on for eligible output policy");
+        request.compact_stage_images=false;
+        const auto fp32_images=strix::compile_known_prefix_prefill(model,fixture.serial,fixture.manifest,fixture.access,request);
+        request.compact_stage_images=true;
+        expect(plan.compact_qsa_output_savings==(strix::compact_stage_images_enabled()?12288U:0U),"compact output follows its startup switch");
+        expect(plan.prefill_kernel_plan_identity==fp32_images.prefill_kernel_plan_identity,
+            "compact storage does not change numerical identity");
+        expect((plan.prefill_execution_identity!=fp32_images.prefill_execution_identity)==(plan.compact_qsa_output_savings!=0U),
+            "only the physical execution identity changes with compact storage");
+        const auto qsa_extent=[](const auto& p) {
+            for(const auto& a:p.arena.row_view[0].allocations)
+                if(a.use.buffer.buffer_class==strix::ExecutionBufferClass::indexed_attention_workspace) return a.bytes;
+            throw std::runtime_error("missing QSA allocation");
+        };
+        expect(qsa_extent(fp32_images)-qsa_extent(plan)==plan.compact_qsa_output_savings,
+            "compiled row extents remove exactly the compact output savings");
+        auto bad_image=plan;bad_image.compact_qsa_output_savings+=256U;
+        reject([&]{strix::validate_compiled_known_prefix_prefill(bad_image,fixture.serial);},"forged compact image geometry rejects");
+
         for(unsigned fault=0;fault<4;++fault) {
             auto malformed=plan;
             if(fault==0) malformed.arena.row_view.front().allocations.back().bytes=993280U;

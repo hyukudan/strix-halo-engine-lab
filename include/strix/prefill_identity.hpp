@@ -1,7 +1,7 @@
 #pragma once
 
 // Prefill arithmetic options that change bits relative to the FP16 prefill identity (fast-prefill-f16wmma-v1 with
-// the exact HC output chains, the token-serial GDN recurrence and the ordered FP32 indexer chains). Every option is ON by
+// the exact HC output chains, the token-serial GDN recurrence and the ordered FP32 indexer chains). Every READY option is ON by
 // default and individually switchable off; one master switch restores the plain FP16 identity at once.
 //   environment: STRIX_PREFILL_EXACT_FP16=1 (all off), STRIX_PREFILL_<NAME>=0 (one off), e.g. STRIX_PREFILL_HC_OUTPUT_WMMA=0
 //   command line: --prefill-exact-fp16, --prefill-disable <name>[,<name>...] (names as below, lower case)
@@ -21,6 +21,7 @@ namespace strix {
 
 enum class PrefillOption : unsigned {
     hc_output_wmma,     // HC output: FP16 low values and coefficients, WMMA accumulation (was ordered FP32 chains)
+    index_proj_wmma,    // Candidate BF16 indexer projections; explicit opt-in until qualified
     count
 };
 
@@ -32,11 +33,21 @@ struct PrefillOptionInfo {
 
 inline constexpr std::array<PrefillOptionInfo, static_cast<unsigned>(PrefillOption::count)> kPrefillOptions{{
     {"hc_output_wmma", "STRIX_PREFILL_HC_OUTPUT_WMMA", "hcout16"},
+    {"index_proj_wmma", "STRIX_PREFILL_INDEX_PROJ_WMMA", "idxproj16"},
 }};
 
 // Options whose implementation is built in and enabled by default. An option joins this mask only when it is READY;
-// until then it stays off whatever the switches say (so the default identity never names unfinished work).
+// Unqualified candidates stay default OFF and require an explicit environment opt-in.
 inline constexpr unsigned kPrefillOptionsReady = 1U << static_cast<unsigned>(PrefillOption::hc_output_wmma);
+
+// Implemented candidates may be exercised explicitly without promotion to READY.
+inline constexpr unsigned kPrefillOptionsCandidates = 1U << static_cast<unsigned>(PrefillOption::index_proj_wmma);
+
+// Candidate index arithmetic is not qualified for MTP or nested scheduling.
+inline constexpr bool index_wmma_unqualified_route(unsigned mask, unsigned fast_components) {
+    return (fast_components & kFastPrefillQsa) &&
+        (mask & (1U << static_cast<unsigned>(PrefillOption::index_proj_wmma)));
+}
 
 namespace detail {
 struct PrefillIdentityOverride {
@@ -83,7 +94,9 @@ inline unsigned resolve_prefill_options(Get get, bool exact = false, unsigned di
     unsigned mask = kPrefillOptionsReady & ~disabled;
     for (unsigned i = 0; i < kPrefillOptions.size(); ++i) {
         const char* value = get(kPrefillOptions[i].env.data());
-        if (value && value[0] == '0') mask &= ~(1U << i);
+        const auto bit = 1U << i;
+        if (value && std::string_view(value) == "1" && (kPrefillOptionsCandidates & bit) && !(disabled & bit)) mask |= bit;
+        if (value && value[0] == '0') mask &= ~bit;
     }
     return mask;
 }
@@ -93,7 +106,7 @@ inline unsigned prefill_options_active() {
     unsigned mask = resolve_prefill_options([](const char* name) { return std::getenv(name); });
     const auto& o = detail::prefill_identity_override();
     if (o.set) mask = o.exact ? 0U : mask & ~o.disabled;
-    return mask & kPrefillOptionsReady;
+    return mask & (kPrefillOptionsReady | kPrefillOptionsCandidates);
 }
 inline bool prefill_option_enabled(PrefillOption option) { return (prefill_options_active() & prefill_option_bit(option)) != 0U; }
 

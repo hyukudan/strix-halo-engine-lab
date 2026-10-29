@@ -37,22 +37,20 @@ inline bool prefill_da16() {
     return o<0?env:o==1;
 }
 // FP16 image of every (row, slot) h in CSR order: prefill_max_rows x max_top_k assignments x max_rows (intermediate) halves.
-inline uint4* da16_image() {
-    static uint4* const pool=[]{void* p=nullptr;
-        check(hipMalloc(&p,static_cast<std::size_t>(q51_known_rows::prefill_max_rows)*max_top_k*max_rows*2U),"DA16 image allocation");
-        return static_cast<uint4*>(p);}();
-    return pool;
+HipPrefillPool& da16_image_pool(){static HipPrefillPool pool;return pool;}
+inline uint4* da16_image(bool setup = false) {
+    auto& pool = da16_image_pool();
+    return static_cast<uint4*>(pool.get(static_cast<std::size_t>(prefill_pool_rows())*max_top_k*max_rows*2U,
+        "DA16 image allocation",setup));
 }
 // Test hook state: the last enqueue_prefill of this thread took the DA16 path.
 inline bool& prefill_da16_flag(){static thread_local bool v=false;return v;}
 // Per-batch arrival counters (cleared by one hipMemsetAsync per call); sized as the P1 pool for the largest batch bound.
-inline unsigned da16_counter_words(){return static_cast<unsigned>(q51_known_rows::prefill_max_rows*10U/64U+1024U);}
-inline unsigned* da16_counters() {
-    static unsigned* const pool=[]{void* p=nullptr;
-        check(hipMalloc(&p,static_cast<std::size_t>(da16_counter_words())*sizeof(unsigned)),"DA16 counters");
-        check(hipMemset(p,0,static_cast<std::size_t>(da16_counter_words())*sizeof(unsigned)),"DA16 counters init");
-        return static_cast<unsigned*>(p);}();
-    return pool;
+inline unsigned da16_counter_words(){return static_cast<unsigned>(prefill_pool_rows()*10U/64U+1024U);}
+inline unsigned* da16_counters(bool setup = false) {
+    static HipPrefillPool pool;
+    return static_cast<unsigned*>(pool.get(static_cast<std::size_t>(da16_counter_words())*sizeof(unsigned),
+        "DA16 counters",setup,true));
 }
 // Gate/up: the base body (project_f16x_body, the same source the base kernel includes, Core 0) for (blockIdx.y, blockIdx.x),
 // then the arrival count; the last arriving tile of the batch writes the batch's FP16 image.

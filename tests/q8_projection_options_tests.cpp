@@ -156,9 +156,17 @@ int main() {
         "--known-prefix-uma-budget-bytes", "8192", "--known-prefix-host-headroom-bytes", "0"});
     expect(tiled.known_prefix_prefill_rows == 17 && tiled.known_prefix_rows == 2 && !tiled.known_prefix_rows_explicit,
         "explicit T supports odd tails without relabelling the small-row selector");
-    for (const auto rows : {0U, 15U, 8193U}) {
+    for (const auto rows : {0U, 15U, known_prefill_max_rows + 1U}) {
         auto bad = tiled; bad.known_prefix_prefill_rows = rows;
         rejects([&] { validate_known_prefill_options(bad); }, "prefill closes T bounds");
+    }
+    for (const auto rows : {8224U, known_prefill_max_rows}) {
+        auto admitted = tiled; admitted.known_prefix_prefill_rows = rows;
+        validate_known_prefill_options(admitted);
+    }
+    for (const auto rows : {8193U, 8200U, 16383U}) {
+        auto bad = tiled; bad.known_prefix_prefill_rows = rows;
+        rejects([&] { validate_known_prefill_options(bad); }, "wide T must be 32 aligned before setup");
     }
     for (unsigned missing = 0; missing < 4; ++missing) {
         auto bad = tiled;
@@ -239,6 +247,10 @@ int main() {
     expect(token_cost.moe_token_cost_policy && token_cost.moe_shared_overlap,
         "observed token policy overlays the already requested overlap owner");
     expect(!defaults.moe_token_cost_policy, "online observed policy is default off");
+    for (const auto rows : {8193U, 8200U, 16383U}) {
+        auto bad = tiled; bad.known_prefix_prefill_rows = rows;
+        rejects([&] { validate_known_prefill_options(bad); }, "wide T must be 32 aligned before setup");
+    }
     for (unsigned missing = 0; missing < 3U; ++missing) {
         auto bad = token_cost;
         if (!missing) bad.generate_tokens = 0;

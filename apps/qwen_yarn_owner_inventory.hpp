@@ -68,7 +68,7 @@ inline void append_yarn_owner_requirements(const Options& options, const ModelCo
     result.owners["ple_prompt_and_token_ids"] = add(mul(options.tokens.size(),
         add(mul(model.ple_head_count(),sizeof(std::uint32_t)),4U*sizeof(std::uint32_t))),
         add(mul(options.generate_tokens,sizeof(std::uint32_t)),add(model_bytes/4096U/8U,UINT64_C(1)<<20U)));
-    const auto t = static_cast<std::uint64_t>(options.known_prefix_prefill_rows);
+    const auto t = static_cast<std::uint64_t>(known_prefill_pool_rows(options.known_prefix_prefill_rows));
     const auto groups = (t+63U)/64U;
     // Two persistent stage slots plus one replacement maxima allocation coexist during growth; embedded tables have the
     // launcher's fixed 128-group extent. Compact stage slots cover all T groups but retain only tables/descriptors: their
@@ -125,14 +125,21 @@ inline void append_yarn_owner_requirements(const Options& options, const ModelCo
     // Header-inline dense pools are single program owners across all sites.
     result.owners["dense_a8_slots"] = (64U+256U)*8192U*9U;
     result.owners["dense_f16_slots_and_counter"] = 256U*8192U*2U*2U*4U+1024U*8192U*4U+256U;
-    result.owners["dense_tiled_f16"] = mul(t,8256U*2U);
+    result.owners["dense_tiled_f16"] = mul(t,2U*(10240U+64U)*2U);
     result.owners["hc_wide_pack_low_and_up"] = 80U*40U*(32U*32U+4U*8U*4U)+320U*8192U*4U+320U*2560U*16U+4U*2560U*320U*4U;
     result.owners["hc_persistent_barrier"] = 256U+8U*4U*16U*4U+40U*24U*8U+16U*8U+8U*(10240U+320U)*4U;
     result.owners["hc_fold_workspaces"] = mul(mul(t,10240U+320U),8U); // folded and qpf2k owners
     result.owners["hc_f16_weights_low_norm_inverse"] = add((320U*10240U+4U*2560U*320U+8192U*320U)*2U+256U,
-        8192U*(10304U*2U+4U*4U));
-    // Routed-expert images are fixed maximum-T owners even after a T fallback.
-    result.owners["moe_f16_input_and_da16"] = UINT64_C(8192)*(2560U+10U*640U)*2U;
+        mul(t,10304U*2U+4U*4U));
+    // Static setup can replace a normalized pool while its old allocation remains live.
+    result.owners["native_setup_growth_peak"] = mul(t,(10240U+64U)*2U);
+    result.owners["shared_pre_f16"] = mul(t,(640U+64U)*2U);
+    std::uint64_t ple_rows = options.known_prefix_prefill_rows;
+    for (const auto rows : options.known_prefix_tail_rows) ple_rows = add(ple_rows,rows);
+    // Each owner retains a packed PLE slab; one replacement may coexist.
+    result.owners["ple_packed_growth_peak"] = mul(add(ple_rows,options.known_prefix_prefill_rows),mul(model.ple_embed_dim,4U));
+    // Retain the upstream fixed-8192 bound after smaller-T fallbacks.
+    result.owners["moe_f16_input_and_da16"] = std::max(UINT64_C(8192),t)*(2560U+10U*640U)*2U;
     result.owners["moe_counters_and_route"] = ((8192U*10U/64U+1024U)*2U+(8192U*16U+64U)+514U+40U*512U)*4U;
     std::uint64_t extra = 0;
     for (const auto& [name,bytes] : result.owners)

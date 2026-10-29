@@ -113,6 +113,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <functional>
 #include <future>
 #include <iostream>
@@ -1107,9 +1108,10 @@ static int run_decode_entry(
             "  --prefill-numerical-profile dense-a8|fast-prefill-f16wmma-v1 (automatic tiled default: FP16)\n"
             "  --prefill-exact-fp16 / STRIX_PREFILL_EXACT_FP16=1 (plain FP16 prefill identity)\n"
             "  --prefill-disable NAME[,NAME...] (disable bit-changing options; server-level only)\n"
+            "  --no-early-setup --no-eager-code-load (exact startup policies; default on)\n"
             "  --config FILE (prefill_exact_fp16 = true; prefill_disable = [\"hc_output_wmma\"])\n"
             "  STRIX_PREFILL_F16=0 restores historical resolution of the same argv\n"
-            "  --known-prefix-prefill-rows 16..8192; route/full-rows/union/router/prefill-rows accept =0\n"
+            "  --known-prefix-prefill-rows 16..16384; route/full-rows/union/router/prefill-rows accept =0\n"
             "  --host-dispatch-telemetry (host API/commit counters on stderr; profiling only)\n"
             "  --execution-telemetry-trace (bounded 256-event correlated trace; profiling only)\n"
             "  --execution-inventory (include selected host launcher and declared variant metadata)\n"
@@ -1172,6 +1174,26 @@ static int run_decode_entry(
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     options.mtp_cli_phase_retirement=false;
 #endif
+    // Before any device/runtime observation. Respect even an empty user value.
+    // Inspection predicts this policy without changing the process environment.
+    // A value set here is already too late for this image, so restart it once with the value in its
+    // environment; the restarted image finds the value set and continues without restarting again.
+    if (!options.print_effective_config &&
+        strix::decode_cli::apply_eager_code_loading(options.eager_code_load && !options.baseline &&
+            !(std::getenv("STRIX_QPF2K_DEFAULTS") && std::getenv("STRIX_QPF2K_DEFAULTS")[0] == '0'),
+            [](const char* name) { return std::getenv(name); },
+            [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; })) {
+        std::fflush(nullptr);
+        std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
+        const auto original = strix::decode_cli::split_process_arguments(
+            std::string((std::istreambuf_iterator<char>(cmdline)), std::istreambuf_iterator<char>()));
+        std::vector<char*> restart;
+        for (const auto& argument : original) restart.push_back(const_cast<char*>(argument.c_str()));
+        restart.push_back(nullptr);
+        ::execv("/proc/self/exe", original.empty() ? argv : restart.data());
+        std::fprintf(stderr, "eager code loading: restart failed (%s); continuing with deferred loading\n",
+            std::strerror(errno));
+    }
     strix::set_prefill_identity_override(options.prefill_exact_fp16, options.prefill_disabled);
     const auto startup_preflight = strix::emit_qwen_startup_diagnostics(
         options.print_effective_config || options.print_cache_family || strix::decode_cli::yarn_bundle_serial_retry);
@@ -1184,6 +1206,7 @@ static int run_decode_entry(
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (!arg.starts_with("--")) continue; // positional token IDs
+        if (arg == "--no-early-setup" || arg == "--no-eager-code-load") continue;
         if (arg == "--session-live-control" || arg == "--session-validate-only") continue;
         if (session_io_options.count(arg)) { ++i; continue; }
         options.session_effective_cli += std::to_string(arg.size()) + ":" + std::string(arg);
@@ -5107,6 +5130,25 @@ static int run_decode_entry(
         };
         const bool generation_request_timing_enabled =
             !raw_recording && !final_state_metadata && !options.teacher_forced_score;
+        // Plans, streams, arenas, prepared tensor maps and pool reservations above already
+        // precede this timer. Move only the remaining immutable first-block admission here;
+        // this is startup work, not removed work. No prompt is read or kernel launched.
+        if (options.early_setup && known_prefill_plan && known_prefix_owner &&
+            !options.mtp.enabled && !options.http_serve && !session_cache_enabled && !prefix_state &&
+            !rtx_state_session && options.tokens.size()>=known_prefill_plan->logical_rows &&
+            session.next_position==0 && generation_request_timing_enabled) {
+            const auto setup_start=std::chrono::steady_clock::now();
+            // Use the existing sibling handoff on a copy; the live decode session and
+            // persistent state stay at their original frontier until the real block.
+            auto setup_session=session;
+            if(compiled_prefill)
+                strix::hand_off_serial_session(setup_session,{&compiled,&resources},{&*compiled_prefill,&prefill_resources});
+            known_prefix_owner->prepare_prefill_geometry(setup_session);
+            const char* timing=std::getenv("STRIX_PREFILL_TIMING");
+            if(timing && timing[0]=='1')
+                std::fprintf(stderr,"prefill startup static-setup %.2f ms (outside generation request)\n",
+                    std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-setup_start).count());
+        }
         const auto generation_request_start = generation_request_timing_enabled
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};

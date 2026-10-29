@@ -10,16 +10,78 @@ struct Qpf2kStageSlot {
     float2* tables = nullptr;
     float* maxima = nullptr;
     std::uint64_t maxima_capacity = 0;
+    std::uint32_t group_capacity = 0;
     hipEvent_t done = nullptr;
     bool pending = false;
-    std::size_t capacity = 0;
 };
 static_assert(sizeof(qsa_index::NormGroupViews<64U>) + sizeof(QsaRowsStoreViews<64U>) +
     sizeof(qsa_flash::ScoreGroup<64U>) + sizeof(uint2) <= 20480U,
     "YaRN admission descriptor bound must track stage slot payloads");
-auto& qpf2k_stage_slots() { static std::array<Qpf2kStageSlot,2> slots;return slots; }
+struct Qpf2kStagePool {
+    std::mutex mutex;
+    std::array<Qpf2kStageSlot, 2> ring;
+    std::size_t next = 0;
+    std::uint32_t rows = 0;
+    std::uint64_t context_tokens = 0;
+    std::uint32_t ratio = 0;
+    int device = -1;
+    bool compact = false;
+};
+Qpf2kStagePool& qpf2k_stage_pool() { static Qpf2kStagePool pool; return pool; }
+void qpf2k_stage_setup(std::uint32_t rows, std::uint64_t context_tokens, std::uint32_t ratio, bool compact) {
+    auto& pool = qpf2k_stage_pool();
+    const std::lock_guard lock(pool.mutex);
+    if (!rows || rows > known_prefill_max_rows || !context_tokens || !ratio)
+        throw std::invalid_argument("QSA stage setup: invalid capacity");
+    const auto capacity = known_prefill_pool_rows(rows);
+    const auto device = hip_prefill_device();
+    if (pool.rows && !PrefillStageReservation{pool.rows, pool.context_tokens, pool.ratio, pool.device, pool.compact}.fits(
+        {capacity, context_tokens, ratio, device, compact}))
+        return; // Optional ring mismatch: the per-group path remains available.
+    if (pool.rows) return;
+    const auto commit = [&] {
+        pool.rows = capacity; pool.context_tokens = context_tokens; pool.ratio = ratio; pool.device = device; pool.compact = compact;
+    };
+    if ((qpf2k_qsa_mask() & 0x203U) != 0x203U || !qsa_norm_group_enabled()) { commit(); return; }
+    const auto groups = known_prefill_stage_groups(capacity);
+    const auto maxima = static_cast<std::uint64_t>(capacity) * ((context_tokens / ratio + qsa_flash::kGroup - 1U) / qsa_flash::kGroup);
+    std::array<Qpf2kStageSlot, 2> reserved{};
+    try {
+        for (auto& slot : reserved) {
+            const auto host_alloc = [&]<class T>(T*& p) {
+                check_hip(hipHostMalloc(reinterpret_cast<void**>(&p), groups * sizeof(T), hipHostMallocDefault),
+                    "QSA stage setup descriptors");
+            };
+            host_alloc(slot.norms); host_alloc(slot.stores); host_alloc(slot.scores); host_alloc(slot.bounds);
+            check_hip(hipMalloc(reinterpret_cast<void**>(&slot.tables),
+                static_cast<std::uint64_t>(groups) * 64U * 64U * sizeof(float2)), "QSA stage setup tables");
+            // Even an empty scored prefix gets a valid private allocation. No execution-time replacement.
+            if (!compact) check_hip(hipMalloc(reinterpret_cast<void**>(&slot.maxima), std::max(UINT64_C(1), maxima) * sizeof(float)),
+                "QSA stage setup maxima");
+            check_hip(hipEventCreateWithFlags(&slot.done, hipEventDisableTiming), "QSA stage setup event");
+            slot.group_capacity = std::max(slot.group_capacity, groups);
+            slot.maxima_capacity = compact ? 0U : maxima;
+        }
+    } catch (...) {
+        // Setup has submitted no readers. Release only these unexposed partial reservations.
+        for (auto& slot : reserved) {
+            if (slot.norms) (void)hipHostFree(slot.norms);
+            if (slot.stores) (void)hipHostFree(slot.stores);
+            if (slot.scores) (void)hipHostFree(slot.scores);
+            if (slot.bounds) (void)hipHostFree(slot.bounds);
+            if (slot.tables) (void)hipFree(slot.tables);
+            if (slot.maxima) (void)hipFree(slot.maxima);
+            if (slot.done) (void)hipEventDestroy(slot.done);
+        }
+        return; // Allocation pressure declines batching before any reader is submitted.
+    }
+    pool.ring = reserved;
+    commit();
+}
 void release_qpf2k_stage_slots() {
-    for(auto& slot:qpf2k_stage_slots()) {
+    auto& pool = qpf2k_stage_pool();
+    const std::lock_guard lock(pool.mutex);
+    for(auto& slot:pool.ring) {
         if(slot.pending) check_hip(hipEventSynchronize(slot.done),"QSA stage retirement consumer wait");
         for(auto* p:{static_cast<void*>(slot.norms),static_cast<void*>(slot.stores),
                     static_cast<void*>(slot.scores),static_cast<void*>(slot.bounds)})
@@ -29,8 +91,10 @@ void release_qpf2k_stage_slots() {
         if(slot.done) check_hip(hipEventDestroy(slot.done),"QSA stage retirement event free");
         slot={};
     }
+    pool.next = 0; pool.rows = 0; pool.context_tokens = 0; pool.ratio = 0; pool.device = -1; pool.compact = false;
 }
 struct Qpf2kStageBatch {
+    std::unique_lock<std::mutex> submission_lock;
     Qpf2kStageSlot* slot = nullptr;
     std::uint32_t max_blocks = 0, groups = 0;
     Qpf2kStageBatch() = default;
@@ -79,36 +143,19 @@ void qpf2k_stage_score_slice(const Qpf2kStageBatch& batch, QsaPrefillPool* pool,
 }
 bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
     const HipIndexedAttentionLauncherConfig& config, QsaPrefillPool* pool, Qpf2kStageBatch& batch, const QsaScoreRingGeometry* compact = nullptr) {
-    // Embedded admission remains capped at 128 groups. Compact descriptors and
-    // tables cover all T; only scores/maxima have bounded slot lifetimes.
-    const std::size_t MaxGroups = compact ? std::max<std::size_t>(128U, tiles.size() / 8U) : 128U;
-    auto& ring=qpf2k_stage_slots();
-    static std::size_t next = 0;
+    constexpr std::size_t MaxGroups = known_prefill_max_rows / 64U;
+    auto& state = qpf2k_stage_pool();
+    batch.submission_lock = std::unique_lock(state.mutex);
+    auto& ring = state.ring;
+    auto& next = state.next;
     const auto decline = [] { return false; };
-    const auto unavailable = [&] {
-        static_cast<void>(hipGetLastError()); // allocation failure must not poison the fallback's launch check
-        // Neither ring slot is needed by the per-group path. Drain prior consumers
-        // before releasing partial allocations and cached scratch on preparation failure.
-        for (auto& cached : ring) {
-            if (cached.pending) check_hip(hipEventSynchronize(cached.done), "QSA stage batch release wait");
-            cached.pending = false;
-            const auto host_free = []<class T>(T*& p) {
-                if (p) check_hip(hipHostFree(p), "QSA stage batch descriptor free");
-                p = nullptr;
-            };
-            host_free(cached.norms); host_free(cached.stores); host_free(cached.scores); host_free(cached.bounds);
-            if (cached.tables) check_hip(hipFree(cached.tables), "QSA stage batch tables free");
-            cached.tables = nullptr;
-            if (cached.maxima) check_hip(hipFree(cached.maxima), "QSA stage batch maxima free");
-            cached.maxima = nullptr; cached.maxima_capacity = 0;
-            if (cached.done) check_hip(hipEventDestroy(cached.done), "QSA stage batch event free");
-            cached.done = nullptr; cached.capacity = 0;
-        }
-        return false;
-    };
     if ((qpf2k_qsa_mask() & 0x203U) != 0x203U || !qsa_norm_group_enabled() ||
         tiles.empty() || tiles.size() % 8U || tiles.size() / 8U > MaxGroups || tiles.size() / 8U > UINT32_MAX ||
         config.model.attention_kv_storage != AttentionKvStorage::bf16 || !pool || !pool->keys)
+        return decline();
+    if (!PrefillStageReservation{state.rows, state.context_tokens, state.ratio, state.device, state.compact}.fits(
+        {static_cast<std::uint32_t>(tiles.size() * 8U), state.context_tokens,
+            static_cast<std::uint32_t>(config.model.indexer_compress_ratio), hip_prefill_device(), compact != nullptr}))
         return decline();
     const auto& model = config.model;
     bind_qwen_pool(pool, model);
@@ -136,12 +183,14 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
     try {
         norms.resize(groups); stores.resize(groups); scores.resize(groups); bounds.resize(groups);
     } catch (const std::bad_alloc&) {
-        return unavailable();
+        return decline();
     }
     std::uint32_t valid = pool->valid, max_new = 0, max_blocks = 0, max_heads = 0;
     std::uint64_t maxima_count = 0;
     const auto ratio = tiles[0].selection[0].ratio, topk = tiles[0].selection[0].block_topk;
     if (!ratio) return decline();
+    if (ratio != state.ratio)
+        throw std::runtime_error("QSA stage batch differs from the configured compression ratio");
     for (std::uint32_t g = 0; g < groups; ++g) {
         auto& n = norms[g]; auto& st = stores[g]; auto& sc = scores[g];
         n = prepare_qpf2k_norm_rows(tiles,g);
@@ -200,47 +249,11 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
     const auto stream = hip_execution_stream();
     if (slot.pending) check_hip(hipEventSynchronize(slot.done), "QSA stage batch slot wait");
     slot.pending = false;
-    if (compact) for (auto& cached : ring) if (cached.maxima) {
-        // A preceding embedded call may have populated either cache slot. Do
-        // not retain its T-sized maxima alongside the admitted bounded ring.
-        if (cached.pending) check_hip(hipEventSynchronize(cached.done), "QSA external stage maxima wait");
-        cached.pending = false;
-        check_hip(hipFree(cached.maxima), "QSA external stage maxima release");
-        cached.maxima = nullptr; cached.maxima_capacity = 0;
-    }
-    if (slot.capacity && slot.capacity < MaxGroups) {
-        // Already quiescent, and still before this call's first publication.
-        for (auto* p : {static_cast<void*>(slot.norms), static_cast<void*>(slot.stores),
-            static_cast<void*>(slot.scores), static_cast<void*>(slot.bounds)})
-            if (p) check_hip(hipHostFree(p), "QSA stage descriptors grow free");
-        slot.norms = nullptr; slot.stores = nullptr; slot.scores = nullptr; slot.bounds = nullptr;
-        if (slot.tables) check_hip(hipFree(slot.tables), "QSA stage tables grow free");
-        slot.tables = nullptr; slot.capacity = 0;
-    }
-    if (!slot.done) {
-        const auto status = hipEventCreateWithFlags(&slot.done, hipEventDisableTiming);
-        if (status == hipErrorOutOfMemory) return unavailable();
-        check_hip(status, "QSA stage batch event");
-    }
-    const auto host_alloc = [&]<class T>(T*& p) {
-        return p || hipHostMalloc(reinterpret_cast<void**>(&p), MaxGroups * sizeof(T), hipHostMallocDefault) == hipSuccess;
-    };
-    if (!host_alloc(slot.norms) || !host_alloc(slot.stores) || !host_alloc(slot.scores) || !host_alloc(slot.bounds)) return unavailable();
-    // Allocation failure is an eligibility failure, before any launch or state write.
-    if (!slot.tables) {
-        void* p = nullptr;
-        if (hipMalloc(&p, MaxGroups * 64U * 64U * sizeof(float2)) != hipSuccess) return unavailable();
-        slot.tables = static_cast<float2*>(p);
-    }
-    slot.capacity = std::max(slot.capacity, MaxGroups);
-    if (!compact && maxima_count > slot.maxima_capacity) {
-        void* p = nullptr;
-        if (hipMalloc(&p, maxima_count * sizeof(float)) != hipSuccess) return unavailable();
-        if (slot.maxima) check_hip(hipFree(slot.maxima), "QSA stage batch maxima free");
-        slot.maxima = static_cast<float*>(p); slot.maxima_capacity = maxima_count;
-    }
+    if (!state.rows || hip_prefill_device() != state.device || groups * 64U > state.rows ||
+        !slot.done || groups > slot.group_capacity || (!compact && maxima_count > slot.maxima_capacity))
+        return decline();
     // The range and score launch arguments below must only reuse this reservation.
-    if ((max_new || max_blocks) && !qpf2k_key_ranges(pool->capacity, true)) return unavailable();
+    if ((max_new || max_blocks) && !qpf2k_key_ranges(pool->capacity, true)) return decline();
     std::uint64_t offset = 0;
     for (std::uint32_t g = 0; g < groups; ++g) {
         norms[g].table = slot.tables + static_cast<std::uint64_t>(g) * 64U * 64U;

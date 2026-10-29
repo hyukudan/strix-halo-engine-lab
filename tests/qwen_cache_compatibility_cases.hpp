@@ -44,7 +44,9 @@ inline std::string without_prefix_reuse_policy(std::string text) {
 
 // Remove only additive reports; retain the frozen bytes of every incumbent field.
 inline std::string without_added_prefill_reports(std::string text) {
-    for (const char* key : {"prefill_identity", "prefill_identity_hash", "prefill_options_active"}) {
+    for (const char* key : {"prefill_identity", "prefill_identity_hash", "prefill_options_active",
+            "compact_stage_images_requested", "hc_lowband_policy", "hc_lowband_route", "index_batch",
+            "early_setup", "eager_code_load", "hip_enable_deferred_loading", "t16k_policy"}) {
         const auto needle = std::string("\"") + key + "\":";
         const auto start = text.find(needle);
         if (start == std::string::npos) continue;

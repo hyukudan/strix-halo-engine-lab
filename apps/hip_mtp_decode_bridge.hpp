@@ -1609,6 +1609,8 @@ private:
         // Fast HC output has no nested scheduling qualification yet.
         if ((pair.fast_components & kFastPrefillHc) && prefill_option_enabled(PrefillOption::hc_output_wmma))
             return "hc-output-wmma-unqualified";
+        if (index_wmma_unqualified_route(prefill_options_active(), pair.fast_components))
+            return "index-proj-wmma-unqualified";
         const bool qualified=numerical_profile_dense_a8(pair.prefill) && !numerical_profile_dense_trellis(pair.prefill) &&
             !numerical_profile_dense_trellis(pair.decode) && pair.fast_components==0U;
         const auto recipe=s.prefill->nested_recipe(nest_rows_,qualified && !s.parents->tiled.blocks->gsq_model());

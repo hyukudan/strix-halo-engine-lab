@@ -98,6 +98,10 @@ static std::string numerical_config(std::string_view cli, const RotaryIdentity& 
     for(;p && *p;++p) {
         const std::string_view value(*p);
         // Operational, per-process values: the GPU-turn wrapper's ids and the hash-cache directory.
+        if (value.starts_with("STRIX_QPF2K_T16K=") || value.starts_with("STRIX_QPF2K_INDEX_BATCH=") ||
+            value.starts_with("STRIX_EAGER_CODE_LOAD=") || value.starts_with("HIP_ENABLE_DEFERRED_LOADING=") ||
+            value.starts_with("STRIX_QPF2K_EARLY_SETUP=") || value.starts_with("STRIX_QPF2K_HC_LOWBAND=") ||
+            value.starts_with("STRIX_QPF2K_COMPACT_IMAGES=")) continue;
         if (value.starts_with("GPU_TURN_") || value.starts_with("GPU_WINDOW=") || value.starts_with("STRIX_HASH_CACHE=")) continue;
         // This observer does not alter the single tiled-MTP execution/flush order.
         // PROMPT_STATE, PREFIX_CACHE, SERIAL_LOGITS and FINAL_STATE remain in the match:

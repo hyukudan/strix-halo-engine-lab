@@ -14,6 +14,9 @@
 
 namespace strix {
 
+// Process scratch: reserve the largest compiled T on the owning device before launches.
+void reserve_hyper_mix_prefill_pools(std::uint32_t rows);
+
 inline constexpr std::string_view hc_projection_next_tile_suffix = ".prefetch-next-tile-v1";
 
 inline constexpr std::string_view splitk_hc_fp32_numerical_identity =

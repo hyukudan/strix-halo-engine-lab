@@ -21,10 +21,10 @@ constexpr unsigned kHcwPitch = 40U;  // halves per staged LDS row of 32 K values
 constexpr unsigned kHcwOutRows = 256U, kHcwOutFeatures = 16U, kHcwK16 = kHcwRank / 16U;
 constexpr std::uint64_t kHcwDownPackHalves = std::uint64_t{kHcwRank} * kHcwWidth;
 constexpr std::uint64_t kHcwUpPackHalves = std::uint64_t{4U} * 2560U * kHcwRank;
-constexpr std::uint32_t kHcwLowRows = 8192U;
+constexpr std::uint32_t kHcwLowRows = known_prefill_max_rows;
 // Row pitch (halves) of the FP16 normalized rows: 128 bytes of padding keep the rows of one load instruction off
 // one memory channel (an unpadded 20480-byte pitch made the projection 2.5x slower).
-constexpr std::uint32_t kHcwNorm16Pitch = kHcwWidth + 64U;  // rows per call (tiled prefill blocks of up to 8192 rows)
+constexpr std::uint32_t kHcwNorm16Pitch = kHcwWidth + 64U;  // padded feature pitch
 
 __device__ __forceinline__ hcw_v8f hcw_wmma(const hcw_v16h& a, const hcw_v16h& b, const hcw_v8f& c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
@@ -453,26 +453,20 @@ __global__ __launch_bounds__(256) void hcw_output_kernel(HyperWideRows rows, con
         }
 }
 
+HipPrefillPoolOwner& hc_prefill_pool_owner(){static HipPrefillPoolOwner owner;return owner;}
+
 // Stream inverses of the STRIX_HCW_NORMFREE norm (kHcwLowRows x 4 floats).
-float* hcw_inverse_scratch() {
-    static float* const pool = [] {
-        void* p = nullptr;
-        if (hipMalloc(&p, std::uint64_t{kHcwLowRows} * 4U * sizeof(float)) != hipSuccess)
-            throw std::runtime_error("HC WMMA rows: inverse scratch allocation failed");
-        return static_cast<float*>(p);
-    }();
-    return pool;
+float* hcw_inverse_scratch(std::uint32_t rows = 8192U, bool setup = false) {
+    static HipPrefillPool pool;
+    return static_cast<float*>(pool.get(std::uint64_t{hc_prefill_pool_owner().rows(rows)} * 4U * sizeof(float),
+        "HC WMMA rows: inverse scratch",setup));
 }
 
 // FP16 copy of the normalized rows (kHcwLowRows x kHcwNorm16Pitch halves), written by the fast-profile HC norm.
-_Float16* hcw_normalized16_scratch() {
-    static _Float16* const pool = [] {
-        void* p = nullptr;
-        if (hipMalloc(&p, std::uint64_t{kHcwLowRows} * kHcwNorm16Pitch * 2U) != hipSuccess)
-            throw std::runtime_error("HC WMMA rows: FP16 normalized-row scratch allocation failed");
-        return static_cast<_Float16*>(p);
-    }();
-    return pool;
+_Float16* hcw_normalized16_scratch(std::uint32_t rows = 8192U, bool setup = false) {
+    static HipPrefillPool pool;
+    return static_cast<_Float16*>(pool.get(std::uint64_t{hc_prefill_pool_owner().rows(rows)} * kHcwNorm16Pitch * 2U,
+        "HC WMMA rows: FP16 normalized-row scratch",setup));
 }
 
 struct HcwScratch {
@@ -481,19 +475,15 @@ struct HcwScratch {
     _Float16* low16 = nullptr;
     unsigned* overflow = nullptr;
 };
-HcwScratch hcw_scratch() {
-    static const HcwScratch scratch = [] {
-        HcwScratch s;
-        void* p = nullptr;
-        const std::uint64_t bytes = (kHcwDownPackHalves + kHcwUpPackHalves + std::uint64_t{kHcwLowRows} * kHcwRank) * 2U + 256U;
-        if (hipMalloc(&p, bytes) != hipSuccess) throw std::runtime_error("HC WMMA rows: scratch allocation failed");
-        auto* base = static_cast<_Float16*>(p);
-        s.down = base;
-        s.up = base + kHcwDownPackHalves;
-        s.low16 = s.up + kHcwUpPackHalves;
-        s.overflow = reinterpret_cast<unsigned*>(s.low16 + std::uint64_t{kHcwLowRows} * kHcwRank);
-        if (hipMemset(s.overflow, 0, 256U) != hipSuccess) throw std::runtime_error("HC WMMA rows: scratch initialization failed");
-        return s;
-    }();
-    return scratch;
+HcwScratch hcw_scratch(std::uint32_t rows = 8192U, bool setup = false) {
+    static HipPrefillPool pool;
+    const auto capacity = hc_prefill_pool_owner().rows(rows);
+    const std::uint64_t bytes = (kHcwDownPackHalves + kHcwUpPackHalves + std::uint64_t{capacity} * kHcwRank) * 2U + 256U;
+    auto* base = static_cast<_Float16*>(pool.get(bytes, "HC WMMA rows: scratch", setup));
+    HcwScratch s;
+    s.down = base; s.up = base + kHcwDownPackHalves; s.low16 = s.up + kHcwUpPackHalves;
+    s.overflow = reinterpret_cast<unsigned*>(s.low16 + std::uint64_t{capacity} * kHcwRank);
+    if (setup && hipMemset(s.overflow, 0, 256U) != hipSuccess)
+        throw std::runtime_error("HC WMMA rows: scratch initialization failed");
+    return s;
 }

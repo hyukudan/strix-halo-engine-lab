@@ -811,6 +811,12 @@ void bench(const Case& c, int reps) {
 int main(int argc, char** argv) {
     try {
         const std::string mode = argc > 1 ? argv[1] : "test";
+        unsigned pool_rows = mode == "pool16k" ? 16384U : 8192U;
+        if ((mode == "bench1" || mode == "bench2") && argc > 3)
+            pool_rows = static_cast<unsigned>(std::stoul(argv[3]));
+        if ((mode == "hdrbench" || mode == "hdrmc" || mode == "mcbench") && argc > 4)
+            pool_rows = static_cast<unsigned>(std::stoul(argv[4]));
+        kr::reserve_prefill_pools(pool_rows);
         if (mode == "schedule") {
             unsigned cases = 0;
             for (unsigned g : {12U, 13U}) for (unsigned d : {7U, 8U})
@@ -836,7 +842,7 @@ int main(int argc, char** argv) {
             std::printf("FP16 schedules: %u byte-identical cases PASS\n", cases);
             return 0;
         }
-        if (mode == "core2" || mode == "bench2" || mode == "g3" || mode == "p1" || mode == "p1da16" || mode == "route" || mode == "da16" || mode == "small") {
+        if (mode == "core2" || mode == "bench2" || mode == "g3" || mode == "p1" || mode == "p1da16" || mode == "route" || mode == "da16" || mode == "small" || mode == "pool16k") {
             // qpf2k/moe. Real-layer specs: "<gguf>:<gate_at>:<up_at>:<down_at>:<gate type>:<down type>" (absolute offsets).
             struct Spec { std::string path; std::uint64_t g, u, d; unsigned gt, dt; };
             const auto parse = [](const std::string& x) {
@@ -871,9 +877,12 @@ int main(int argc, char** argv) {
                 { static const int small_rows[4]{0, 32, 64, 128}; kr::set_prefill_small(small_rows[(route >> 3) & 3]); } // bits 3-4: SMALL
                 for (const auto* b : f.written()) b->poison(f.stream);
                 f.csr.poison(f.stream);
-                if (csr_bytes) kr::prefill_test_poison_a16(f.stream); // route mode: the prologue's FP16 image must be rewritten
-                if (route & 4) kr::prefill_test_poison_da16(f.stream); // da16 mode: the DA16 image must be rewritten
+                if (csr_bytes) kr::prefill_test_poison_a16(f.stream, rows); // route mode: the prologue's FP16 image must be rewritten
+                if (route & 4) kr::prefill_test_poison_da16(f.stream, rows); // da16 mode: the DA16 image must be rewritten
+                const auto poisoned_generations = kr::prefill_test_image_generations();
                 f.enqueue(3, rows);
+                if (kr::prefill_test_image_generations() != poisoned_generations)
+                    throw std::runtime_error("poisoned prefill allocation changed through submission");
                 if ((route & 4) && !kr::prefill_da16_ran()) ++da16_missing; // the DA16 path must actually run
                 if ((route & 24) && !(route & 4) && !kr::prefill_small_ran()) ++da16_missing; // SMALL must actually run
                 if (pre_merge || csr_bytes) {
@@ -885,6 +894,18 @@ int main(int argc, char** argv) {
                 check(hipStreamSynchronize(f.stream), "core2 run");
                 return digests(f);
             };
+            if (mode == "pool16k") {
+                Fixture f({"immutable T16K poisoned images", 512U, 16384U, 12U, 7U, 4U, false, true, false, 0U, 1.5});
+                for (const unsigned rows : {16384U, 8192U, 16384U, 1320U}) {
+                    unsigned pre_base = 0, pre_got = 0;
+                    std::vector<unsigned char> csr_base, csr_got;
+                    const auto base = run_digest(f, 0, rows, &pre_base, 0, &csr_base);
+                    const auto got = run_digest(f, 0, rows, &pre_got, 7, &csr_got);
+                    if (got != base || pre_got != pre_base || csr_got != csr_base || da16_missing)
+                        throw std::runtime_error("T16K poisoned A16/DA16 bytes or executed path differ");
+                }
+                return 0;
+            }
             if (mode == "bench2") {
                 // bench2 <reps> <T> <gate type> <down type> <power (0 = uniform)> <flavor> [layer spec]; BENCH_CORES = list.
                 if (argc < 8) throw std::invalid_argument("bench2 <reps> <T> <g> <d> <power> <flavor> [spec]");
