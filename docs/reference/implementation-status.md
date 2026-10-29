@@ -50,7 +50,10 @@ Speculative MTP decode path. Details: [README.md](../../README.md) and
   - robust window cost model plus Q4_0 draft copies by default: 47.9 tok/s;
   - file-backed PLE n-gram table populated after model registration with
     `MADV_RANDOM` + `MADV_POPULATE_READ` (`STRIX_PLE_WARM=0` skips), so decode
-    does not read from disk after another process evicted the pages;
+    normally finds it resident even after another process evicted the pages
+    (later memory pressure can still evict it); the table is first prefaulted
+    from up to 16 threads (cold: 94 s -> 6-10 s for 28.8 GB;
+    `STRIX_PLE_WARM_PARALLEL=0` keeps the single pass);
   - GDN rows use a fused FMA (neutral).
 - **Several requests** (`--mtp-cohort-request`, CLI benchmark mode, D-039): up to four
   independent requests, each with its own state, MTP runtime and golden replay, verified in

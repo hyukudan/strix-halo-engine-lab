@@ -349,6 +349,7 @@ protocols. Compare completed captures with `tools/bitcalc_cmp.py`.
 | `STRIX_MTP_DRAFT_Q4_ALL=0` | Disable Q4_0 copies of the MTP draft projections. |
 | `STRIX_ANYORDER=0` | Disable any-order launches of independent kernels. |
 | `STRIX_PLE_WARM=0` | Skip prefetching the file-backed PLE table after registration. |
+| `STRIX_PLE_WARM_PARALLEL=0` | Skip the parallel prefault of the PLE table that runs before the random-access warm (default: up to 16 threads read it in 64 MiB chunks; best effort, not with `STRIX_PLE_WARM=0`, `STRIX_MODEL_COPY_ALL` or an admitted PLE reclaim). Measured on a cold page cache: 137.8 s to listening without it, 87.5 s with it. |
 | `STRIX_MTP_GREEDY_ROWS=0` | Use per-row selectors instead of on-stream argmax of all window rows. |
 | `STRIX_CYCLE_TIMING=1` | Print host phase timings per MTP cycle. |
 | `STRIX_CYCLE_LOG=1` | Print each MTP cycle's window rows and wall time (with the survival controller also the draft chain's wall time and steps). |
