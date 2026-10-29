@@ -929,6 +929,17 @@
   },
   {
     "engine": "deepseek-rtx",
+    "name": "Copy-engine write-back pacing",
+    "flag_or_env": "--ce-pacing / --no-ce-pacing, STRIX_DS41_CE_PACING=0|1",
+    "default": "ON",
+    "exact": "Only copy timing changes: chat token vectors identical across 4 alternating loads (base/on/base/on) and the exact, forced-window and pressure gates.",
+    "gain": "Neutral to small: adjacent loads DSpark +2.7 %, plain -0.5 %, full request wall -1.1 %; bracketed comparison within noise.",
+    "preconditions": "Standalone RTX replica; load-time option (no per-request switch).",
+    "off_switch": "--no-ce-pacing (or STRIX_DS41_CE_PACING=0; --baseline turns it off)",
+    "doc_anchor": "docs/optimizations.md#rtx-ce-pacing"
+  },
+  {
+    "engine": "deepseek-rtx",
     "name": "Prefill pinned host expert tier (opt-in)",
     "flag_or_env": "--host-gib-auto G; --overlay OVERLAY.gguf; --host-pin-order layer|deadline|early",
     "default": "off (file-only streaming)",

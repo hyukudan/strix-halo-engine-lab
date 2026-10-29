@@ -362,6 +362,8 @@ int main(int argc, char** argv) {
     if (!TierSite::can_auto_evict()) std::fprintf(stderr, "eviction: auto needs a tierstream with ts_dg_end_rows; using lru\n");
     bool census = false;  // --census: per-cycle census in the summaries (~15x the JSON of a request, measured)
     bool wb_defer = true;  // adopted default: deferred write-backs; --no-wb-defer = boundary write-backs
+    const char* ce_env = std::getenv("STRIX_DS41_CE_PACING");
+    bool ce_pacing = !(ce_env && std::string(ce_env) == "0");  // default ON (PRO A/B: exact, not slower)
     std::string draft_file, draft_vocab = "auto", window_arg = "controller", controller_scope = "chat";
     std::string draft_keep_from;  // --draft-keep-from FILE: route_stats lines of an earlier run (summed)
     std::uint32_t draft_keep = 64;  // --draft-keep N: the N most routed experts per drafter stage stay (0: all); adopted default 64
@@ -409,6 +411,7 @@ int main(int argc, char** argv) {
         controller_prior = controller_costs = "none";
         controller_costs_given = false;
         wb_defer = false;
+        ce_pacing = false;
         evict = "lru";
         controller_scope = "run";
         host_spares = 96;
@@ -450,6 +453,8 @@ int main(int argc, char** argv) {
         bool known = true;  // two chains: one else-if chain this long nests too deeply for MSVC inside a lambda
         if (a == "--baseline") baseline();
         else if (a == "--print-config") print_config = true;
+        else if (a == "--ce-pacing") ce_pacing = true;
+        else if (a == "--no-ce-pacing") ce_pacing = false;
         else if (a == "--q8-r1") q8_r1 = true;
         else if (a == "--q8-r1-off") q8_r1 = false;
         else if (a == "--q8-r1-pad") q8_r1_pad = true;
@@ -742,6 +747,7 @@ int main(int argc, char** argv) {
         str("engram", o.engram); field("engram_cache_mb", o.engram_cache_mb);
         str("evict", evict); field("census", census);
         field("wb_defer", wb_defer); field("wb_alt", wb_alt); field("flush_ready", flush_ready);
+        field("ce_pacing", ce_pacing);
         str("warmup_graphs", warmup_graphs.empty() ? "none" : warmup_graphs);
         str("residency_seed", residency_seed.empty() ? "none" : (residency_auto ? "auto:" : "") + residency_seed);
         str("residency_save", residency_save.empty() ? "none" : residency_save);
@@ -1118,6 +1124,7 @@ int main(int argc, char** argv) {
             to.prefetch_per_layer = pf_layer;
             to.prefetch_per_token = pf_token;
             to.wb_defer = wb_defer;
+            to.ce_pacing = ce_pacing;
             if (!winpf_prior_file.empty()) {
                 std::ifstream pf(winpf_prior_file, std::ios::binary);
                 if (!pf) usage("cannot read --winpf-prior");

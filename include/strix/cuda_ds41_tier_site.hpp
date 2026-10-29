@@ -65,6 +65,7 @@ struct TierSiteOptions {
     bool moe_v1b3 = false;                 // routed experts: v1b gate/up from 2 rows + v3 down (cuda_ds41_moe_v2.hpp; same bits)
     std::vector<std::uint8_t> prior;       // tierstream/hint-prior-v1 bytes for window prefetch (empty = none)
     bool wb_defer = false;                 // tierstream dg_wb_defer (deferred write-back scheduling)
+    bool ce_pacing = false;                // one-expert background CE debt (the replica turns it on by default)
 };
 
 class TierSite {

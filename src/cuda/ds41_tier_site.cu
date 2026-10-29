@@ -3,6 +3,7 @@
 #include "strix/cuda_ds41_hot_residency.hpp"
 #include "strix/cuda_ds41_moe_v2.hpp"
 #include "strix/cuda_ds41_parts_host.hpp"
+#include "strix/ds41_rtx_schedule.hpp"
 
 #include "tierstream/ts.h"
 
@@ -144,6 +145,11 @@ struct TierSite::Impl {
         so.dg_prior = o.prior.empty() ? nullptr : o.prior.data();  // read during ts_open only
         so.dg_prior_len = o.prior.size();
         so.dg_wb_defer = o.wb_defer ? 1U : 0U;
+        if (o.ce_pacing) {
+            const auto p = rtx::ce_pacing(static_cast<std::uint32_t>(s.gate_expert_bytes()), static_cast<std::uint32_t>(s.down_expert_bytes()));
+            so.dg_wb_layer_bytes = p.layer_bytes;
+            so.dg_wb_max_outstanding = p.outstanding_threshold;
+        }
         ts_check(ts_open(desc, &b, plan, &so, &c), "open");
         ts_check(ts_dg_get_device_view(c, &v), "device view");
         if (v.struct_size < sizeof(ss_dg_device_view) || !v.absent_err) throw std::runtime_error("ds41 tier site: the library's view has no absent_err (needs rev 3.4)");

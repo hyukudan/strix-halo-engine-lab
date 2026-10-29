@@ -1323,6 +1323,20 @@ After a DSpark verify window, evict experts by the tierstream's learned score; a
 - **Measured gain:** DSpark misses/token 10.55 → 9.08 (−14 %), median +6.4 % tok/s (7 chats); plain decode neutral
 - **Implementation / evidence:** [Standalone defaults and gates](models/deepseek-v4.1/rtx-standalone.md#optimizations-default-on-and-off-switches)
 
+<a id="rtx-ce-pacing"></a>
+
+### Copy-engine write-back pacing
+
+**Engine:** `deepseek-rtx`. **Control:** `--ce-pacing` / `--no-ce-pacing`, `STRIX_DS41_CE_PACING=0|1`. **Default:** ON.
+
+Bound the background write-back bytes queued on the single WDDM copy engine to about one expert, so a demand fetch for the next layer never waits behind a long write-back queue. Demand and speculative fetches keep priority; unissued victims can still be cancelled.
+
+- **Preconditions:** Standalone RTX replica; load-time option (no per-request switch).
+- **Exactness evidence:** Only copy timing changes: chat token vectors identical across 4 alternating loads (base/on/base/on) and the exact, forced-window and pressure gates.
+- **Off switch:** --no-ce-pacing (or STRIX_DS41_CE_PACING=0; --baseline turns it off)
+- **Measured gain:** Neutral to small: adjacent loads DSpark +2.7 %, plain -0.5 %, full request wall -1.1 %; bracketed comparison within noise.
+- **Implementation / evidence:** [Standalone defaults and gates](models/deepseek-v4.1/rtx-standalone.md#optimizations-default-on-and-off-switches)
+
 <a id="rtx-prefill-host-tier"></a>
 
 ### Prefill pinned host expert tier (opt-in)
