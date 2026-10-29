@@ -19,12 +19,18 @@ enum class SerialRequestStopReason {
     context_capacity,
 };
 
+// Optional emission hook after firstmax selection. Position names the logits row;
+// the returned token controls output, EOS and the next input, without recomputing logits.
+using GreedyEmissionHook = std::function<std::uint32_t(
+    std::uint64_t, std::uint64_t, std::uint32_t, std::span<const float>)>;
+
 struct SerialGreedyRequest {
     std::span<const std::uint32_t> prefix_tokens;
     std::uint64_t vocab_size = 0;
     std::uint64_t context_capacity = 0;
     std::uint64_t max_new_tokens = 0;
     std::uint32_t eos_token_id = 0;
+    GreedyEmissionHook emission_hook{};
 };
 
 struct SerialGreedyRequestResult {
@@ -45,6 +51,7 @@ struct SerialGreedyContinuationRequest {
     std::uint64_t context_capacity = 0;
     std::uint64_t max_new_tokens = 0;
     std::uint32_t eos_token_id = 0;
+    GreedyEmissionHook emission_hook{};
 };
 
 struct GreedyPrefixRestore {

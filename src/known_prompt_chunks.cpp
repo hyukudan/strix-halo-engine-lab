@@ -233,7 +233,7 @@ const SerialGreedyRequestResult& KnownPromptChunkCursor::finish_greedy() {
         return *generation_;
     }
     const SerialGreedyContinuationRequest continuation{logits_,progress_.next_position,request_.vocab_size,
-        request_.context_capacity,request_.max_new_tokens,request_.eos_token_id};
+        request_.context_capacity,request_.max_new_tokens,request_.eos_token_id,request_.emission_hook};
     try {
         auto result=execute_serial_greedy_continuation(continuation,serial_);
         progress_.consumed_generation_tokens=result.steps_executed;

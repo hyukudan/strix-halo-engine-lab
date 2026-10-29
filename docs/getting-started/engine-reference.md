@@ -326,6 +326,18 @@ describes how the shipped lists were built.
 
 Defaults are the measured configuration.
 
+Measurement only, default off: `STRIX_BITCALC_LOGITS_OUT=PATH` writes each token
+selection's FP32 logits to a fresh file, created exclusively as `PATH.partial` and
+renamed to `PATH` on success. Each little-endian binary record contains six uint32
+fields (`0x42434C47`, step, position, argmax, emitted token, vocab), followed by
+`vocab` float32 values: `(24 + 4*vocab)` bytes per selection, bounded by the
+requested generation count. Both `PATH` and `PATH.partial` must be absent.
+`STRIX_BITCALC_FORCE_TOKENS=PATH` reads comma/whitespace-separated uint32 IDs,
+at most one per generated token, and resumes greedy selection when exhausted.
+These controls support single-request full-logits CLI generation only, excluding
+serving, batching, MTP, prompt lookup, prefix cache, teacher scoring and all session
+protocols. Compare completed captures with `tools/bitcalc_cmp.py`.
+
 | Variable | Effect |
 |---|---|
 | `STRIX_HASH_CACHE=0` / `=DIR` | Disable, or relocate, the verified SHA-256 cache of model files (default `~/.cache/strix-engine/file-sha256`). A cached digest is reused only while the file keeps its device, inode, size, mtime and ctime, and it is still checked against the expected SHA-256. |
