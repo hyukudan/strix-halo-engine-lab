@@ -1,3 +1,4 @@
+#include "strix/file_snapshot.hpp"
 #include "strix/deepseek41_device_forward.hpp"
 
 #include "strix/deepseek41_attention_host.hpp"
@@ -103,6 +104,7 @@ public:
     explicit Mapped(const std::filesystem::path& path) {
         fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd_ < 0) throw std::runtime_error("deepseek41 device forward: cannot open " + path.string());
+        strix::LoaderCapture::record(path, fd_);
         struct stat st {};
         if (::fstat(fd_, &st) != 0) throw std::runtime_error("deepseek41 device forward: cannot stat the model");
         size_ = static_cast<std::uint64_t>(st.st_size);
@@ -250,6 +252,7 @@ public:
         fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
         if (fd_ < 0) fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd_ < 0) throw std::runtime_error("deepseek41 device forward: cannot open " + path.string());
+        strix::LoaderCapture::record(path, fd_);
         check(hipHostMalloc(reinterpret_cast<void**>(&buffer_), chunk + 2U * align, hipHostMallocDefault), "staging buffer");
     }
     ~DirectLoader() {

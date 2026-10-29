@@ -1,3 +1,4 @@
+#include "strix/file_snapshot.hpp"
 #include "strix/hip_ds41_expert_backend.hpp"
 
 #include "strix/ds41_formats.hpp"
@@ -79,6 +80,7 @@ public:
         fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
         if (fd_ < 0) fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd_ < 0) throw std::runtime_error("hip expert backend: cannot open " + path);
+        strix::LoaderCapture::record(path, fd_);
         buffer_ = Pinned<std::uint8_t>(chunk + 2U * align);
     }
     ~Loader() {

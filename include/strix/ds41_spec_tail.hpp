@@ -3,6 +3,7 @@
 // committed rows' inputs of the target's last three layers (DeviceForward::captured_streams with capture_main_hidden).
 
 #include "strix/ds41_dspark.hpp"
+#include "strix/ds41_dspark_context.hpp"
 
 #include <array>
 #include <cstdint>
@@ -30,6 +31,9 @@ public:
     void set_split(std::uint32_t rank, strix::dist::Communicator& comm);
     // A new sequence: rings cleared, nothing staged.
     void reset();
+    [[nodiscard]] ContextSnapshot export_context() const;
+    void import_context(const ContextSnapshot&, std::uint64_t request);
+    [[nodiscard]] std::uint64_t exchange_request() const noexcept;
     // The first `rows` rows of the last step (committed) into the staging buffer (device to device on `stream`, flushed
     // to the drafter every 128 rows and before a draft).
     void stage(const std::array<const float*, 3>& captures, std::uint32_t rows, void* stream);

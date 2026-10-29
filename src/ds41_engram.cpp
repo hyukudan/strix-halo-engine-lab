@@ -1,3 +1,4 @@
+#include "strix/file_snapshot.hpp"
 #include "strix/ds41_engram.hpp"
 
 #include "strix/ds41_formats.hpp"
@@ -255,6 +256,7 @@ EngramRowReader::EngramRowReader(const std::filesystem::path& file, std::vector<
     }
     if (fd_ < 0) fd_ = ::open(file.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd_ < 0) throw std::runtime_error("Engram reader cannot open the model file: " + std::string(std::strerror(errno)));
+    strix::LoaderCapture::record(file, fd_);
     struct stat st{};
     if (::fstat(fd_, &st) != 0) { close_fd(fd_); throw std::runtime_error("Engram reader cannot stat the model file"); }
 #endif

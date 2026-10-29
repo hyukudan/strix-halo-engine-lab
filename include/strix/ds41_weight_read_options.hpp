@@ -70,7 +70,11 @@ struct WeightReadOptions {
             const auto end = weight_dirs.find(';', begin);
             const auto part = weight_dirs.substr(begin, end == std::string::npos ? end : end - begin);
             if (!part.empty()) {
+#if defined(__cpp_char8_t)
+                const auto dir = std::filesystem::path(std::u8string(part.begin(), part.end()));
+#else
                 const auto dir = std::filesystem::u8path(part);
+#endif
                 std::error_code ec;
                 const bool accessible = std::filesystem::is_directory(dir, ec);
                 if (ec) warn();

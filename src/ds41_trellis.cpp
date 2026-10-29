@@ -1,3 +1,4 @@
+#include "strix/model_input.hpp"
 #include "strix/ds41_trellis.hpp"
 
 #include "strix/ds41_native_fp8.hpp"
@@ -119,7 +120,7 @@ std::string trellis_env_spec() {
     if (mix == nullptr || *mix == 0) return has_one ? std::string(one) : std::string();
     std::string spec = mix;
     if (spec.find('=') == std::string::npos) {  // a manifest file: one class=dir per line
-        std::ifstream in(spec);
+        strix::ModelInput in(spec);
         if (!in) fail("STRIX_DS41_TRELLIS_MIX: no manifest " + spec);
         spec.clear();
         for (std::string line; std::getline(in, line);) {
@@ -134,6 +135,34 @@ std::string trellis_env_spec() {
     return spec;
 }
 
+std::vector<std::pair<std::string, std::string>> parse_trellis_pack_spec(const std::string& spec) {
+    if (spec.find('=') == std::string::npos) return {{"default", spec}};
+    static const std::array<const char*, 8> classes{"q_a", "kv", "q_b", "o_a", "o_b", "shexp_w13", "shexp_w2", "head"};
+    std::vector<std::pair<std::string, std::string>> out;
+    std::set<std::string> seen;
+    std::stringstream in(spec);
+    for (std::string item; std::getline(in, item, ',');) {
+        if (item.empty()) continue;
+        const auto eq = item.find('=');
+        if (eq == std::string::npos || eq == 0U || eq + 1U == item.size()) fail("mix item '" + item + "' is not class=dir");
+        const std::string cls = item.substr(0, eq), dir = item.substr(eq + 1U);
+        if (cls == "default") {
+            out.emplace_back(cls, dir);
+            continue;
+        }
+        std::vector<std::string> targets;
+        if (cls == "shexp") targets = {"shexp_w13", "shexp_w2"};
+        else if (std::find_if(classes.begin(), classes.end(), [&](const char* c) { return cls == c; }) != classes.end()) targets = {cls};
+        else fail("unknown mix class '" + cls + "' (q_a, kv, q_b, o_a, o_b, shexp, shexp_w13, shexp_w2, head, default)");
+        for (const auto& t : targets) {
+            if (!seen.insert(t).second) fail("mix class " + t + " given twice");
+            out.emplace_back(t, dir);
+        }
+    }
+    if (out.empty()) fail("empty mix spec");
+    return out;
+}
+
 TrellisPack::TrellisPack(const std::filesystem::path& spec_path) : dir_(spec_path) {
     const std::string spec = spec_path.string();
     if (spec.find('=') == std::string::npos) {  // one pack for every class
@@ -143,7 +172,6 @@ TrellisPack::TrellisPack(const std::filesystem::path& spec_path) : dir_(spec_pat
         default_dir_ = spec_path;
         return;
     }
-    static const std::array<const char*, 8> classes{"q_a", "kv", "q_b", "o_a", "o_b", "shexp_w13", "shexp_w2", "head"};
     std::map<std::string, std::shared_ptr<SafetensorsCheckpoint>> by_dir;
     const auto open = [&](const std::string& dir) {
         auto& c = by_dir[dir];
@@ -155,27 +183,9 @@ TrellisPack::TrellisPack(const std::filesystem::path& spec_path) : dir_(spec_pat
     };
     std::map<std::string, std::string> dirs;
     std::string default_dir;
-    std::stringstream in(spec);
-    for (std::string item; std::getline(in, item, ',');) {
-        if (item.empty()) continue;
-        const auto eq = item.find('=');
-        if (eq == std::string::npos || eq == 0U || eq + 1U == item.size()) fail("mix item '" + item + "' is not class=dir");
-        const std::string cls = item.substr(0, eq), dir = item.substr(eq + 1U);
-        if (cls == "default") {
-            default_dir = dir;
-            checkpoint_ = open(dir);
-            continue;
-        }
-        std::vector<std::string> targets;
-        if (cls == "shexp") targets = {"shexp_w13", "shexp_w2"};
-        else if (std::find_if(classes.begin(), classes.end(), [&](const char* c) { return cls == c; }) != classes.end()) targets = {cls};
-        else fail("unknown mix class '" + cls + "' (q_a, kv, q_b, o_a, o_b, shexp, shexp_w13, shexp_w2, head, default)");
-        for (const auto& t : targets) {
-            if (dirs.contains(t)) fail("mix class " + t + " given twice");
-            dirs[t] = dir;
-            dirs_[t] = dir;
-            by_class_[t] = open(dir);
-        }
+    for (const auto& [cls, dir] : parse_trellis_pack_spec(spec)) {
+        if (cls == "default") { default_dir = dir; checkpoint_ = open(dir); }
+        else { dirs[cls] = dir; dirs_[cls] = dir; by_class_[cls] = open(dir); }
     }
     if (by_class_.empty() && !checkpoint_) fail("empty mix spec");
     default_dir_ = default_dir;

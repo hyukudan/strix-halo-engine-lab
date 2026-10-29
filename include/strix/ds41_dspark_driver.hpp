@@ -17,10 +17,12 @@
 //                                       costs c_k (time of a k + 1 row window plus the draft step)
 
 #include "strix/ds41_dspark.hpp"
+#include "strix/ds41_dspark_context.hpp"
 
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <span>
 #include <string>
 #include <vector>
@@ -97,11 +99,15 @@ private:
 class WindowController {
 public:
     static constexpr std::uint32_t bins = 8, max_rows = block_size + 1U, explore_every = 16;
-    struct Costs {
-        std::array<float, max_rows + 1U> verify{};  // [R], 0 = not measured
-        std::array<std::uint32_t, max_rows + 1U> samples{};
-        float draft = 0.0F, extra = 0.0F;
-    };
+    static_assert(bins == 8 && block_size == 5 && max_rows + 1U == 7);
+    using Costs = ControllerSnapshot::Costs;
+    using Snapshot = ControllerSnapshot;
+    [[nodiscard]] Snapshot export_state() const { return {costs_, seen_, hits_, decisions_, sweep_, explore_}; }
+    void import_state(const Snapshot& s) {
+        s.validate();
+        costs_ = s.costs; seen_ = s.seen; hits_ = s.hits;
+        decisions_ = s.decisions; sweep_ = s.sweep; explore_ = s.explore;
+    }
     void set_costs(const Costs& costs) { costs_ = costs; }
     [[nodiscard]] const Costs& costs() const noexcept { return costs_; }
     [[nodiscard]] bool draft_next();

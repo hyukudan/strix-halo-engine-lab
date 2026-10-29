@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <utility>
@@ -31,6 +32,9 @@
 // (=0, unless set explicitly): the plain invocation runs as it did before, without those items.
 // A precondition that does not hold (a pack, the draft or the vocabulary not found, a build without the dense_r1
 // trellis library, one rank) drops that item with one notice line on stderr; it never fails the run.
+// Automatic serving sessions require a GPU-qualified route and memory/disk admission. The qualification
+// allowlist is empty. STRIX_SESSION_CACHE=0, --session-cache off and STRIX_DS41_BASELINE disable sessions.
+// One-shot rank commands remain explicit.
 // --print-effective-config prints the resolved environment and arguments and exits before any device work.
 namespace strix::deepseek41::pair_defaults {
 
@@ -51,10 +55,20 @@ inline Build this_build() {
 // Filesystem questions of the resolver (a fake in the unit test).
 struct Probe {
     std::function<bool(const std::string&)> file, dir;
+    std::function<std::uint64_t()> available_memory;
+    // Creates/probes a private cache directory; zero means unavailable.
+    std::function<std::uint64_t(const std::string&)> writable_space;
     std::function<std::vector<std::string>(const std::string&)> list;  // file names in a directory
 };
 
+struct SessionDefaults {
+    bool enabled = false, disk = false;
+    std::uint64_t ram_bytes = 0, disk_bytes = 0, max_parked = 8;
+    std::string directory, reason;
+};
+
 struct Resolved {
+    SessionDefaults session;
     std::vector<std::string> args;                            // argv[1..] after the defaults
     std::vector<std::pair<std::string, std::string>> set_env;  // set (they were unset)
     std::vector<std::string> unset_env;                        // a path variable given as =0: removed

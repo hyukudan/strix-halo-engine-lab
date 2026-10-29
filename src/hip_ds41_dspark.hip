@@ -1063,6 +1063,27 @@ void DeviceDrafter::set_rank(std::uint32_t rank, std::uint32_t world, RankExchan
     impl_->exchange = std::move(exchange);
 }
 Vocab DeviceDrafter::vocabulary() const { return Vocab{impl_->core, impl_->extra_host}; }
+ContextSnapshot DeviceDrafter::export_context() const {
+    if (sequences() != 1U) throw std::logic_error("DSpark export requires a single context");
+    const auto& m = *impl_;
+    check(hipStreamSynchronize(m.stream), "export context");
+    ContextSnapshot out;
+    out.start = m.start; out.next = m.next; out.core = m.core; out.extra = m.extra_host;
+    for (std::uint32_t i = 0; i < stages; ++i) out.rings[i] = m.stage[i].ring.download(m.stream);
+    out.validate();
+    return out;
+}
+void DeviceDrafter::import_context(const ContextSnapshot& in) {
+    in.validate(); // CPU validation before any device mutation
+    if (sequences() != 1U) throw std::logic_error("DSpark import requires a single context");
+    auto& m = *impl_;
+    check(hipStreamSynchronize(m.stream), "import context");
+    set_vocabulary(Vocab{in.core, in.extra}); // reconstruct membership, ids and gathered head rows
+    for (std::uint32_t i = 0; i < stages; ++i)
+        m.stage[i].ring.upload(in.rings[i].data(), in.rings[i].size(), m.stream);
+    check(hipStreamSynchronize(m.stream), "import rings");
+    m.start = in.start; m.next = in.next;
+}
 void DeviceDrafter::reset() {
     for (auto& s : impl_->stage) check(hipMemsetAsync(s.ring.data, 0, s.ring.count, impl_->stream), "clear ring");
     check(hipStreamSynchronize(impl_->stream), "reset");

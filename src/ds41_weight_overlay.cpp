@@ -1,3 +1,4 @@
+#include "strix/file_snapshot.hpp"
 #include "strix/ds41_weight_overlay.hpp"
 
 #include "strix/gguf_reader.hpp"
@@ -53,6 +54,7 @@ WeightOverlay::WeightOverlay(const std::filesystem::path& path, const ModelManif
 #else
     fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd_ < 0) throw std::runtime_error("ds41 weight overlay: cannot open " + path.string());
+    strix::LoaderCapture::record(path, fd_);
     struct stat st {};
     if (::fstat(fd_, &st) != 0) throw std::runtime_error("ds41 weight overlay: cannot stat " + path.string());
     size_ = static_cast<std::uint64_t>(st.st_size);

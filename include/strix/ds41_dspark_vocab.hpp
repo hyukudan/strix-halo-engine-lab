@@ -24,6 +24,10 @@ namespace strix::ds41::dspark {
 
 [[nodiscard]] std::vector<std::uint32_t> read_vocabulary_file(const std::string& path);
 
+// Session inventory for fixed file lists. Prompt-dependent auto selection is
+// deliberately refused for sessions; the ordinary vocabulary loader is unchanged.
+[[nodiscard]] std::vector<std::string> vocabulary_asset_files(const std::string& spec);
+
 struct VocabularyChoice {
     Vocab vocabulary;
     std::string label;

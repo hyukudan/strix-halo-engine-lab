@@ -1,3 +1,4 @@
+#include "strix/model_input.hpp"
 #include "strix/ds41_pipeline_dspark.hpp"
 
 #include <algorithm>
@@ -205,7 +206,7 @@ SpecDecisionLog::Kind SpecDecisionLog::classify(std::uint64_t request) const noe
 }
 
 SpecCostTable read_spec_cost_table(const std::string& path) {
-    std::ifstream f(path);
+    strix::ModelInput f(path);
     if (!f) throw std::invalid_argument("cannot read the cost table " + path);
     std::stringstream ss;
     ss << f.rdbuf();

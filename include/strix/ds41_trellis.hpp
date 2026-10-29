@@ -27,6 +27,8 @@
 namespace strix::ds41 {
 
 class SafetensorsCheckpoint;
+// Ordered, expanded class=directory entries; preserves every directory opened by the loader.
+[[nodiscard]] std::vector<std::pair<std::string, std::string>> parse_trellis_pack_spec(const std::string& spec);
 
 // The name of the single-pack K5 identity (docs/models/deepseek-v4.1/trellis-k5-v1.md). Engines announce the identity of the packs they
 // prepared (trellis_step_identity / trellis_config_identity below), never this constant alone.

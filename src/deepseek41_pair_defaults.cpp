@@ -1,10 +1,22 @@
 #include "strix/deepseek41_pair_defaults.hpp"
 
 #include <algorithm>
+#include <array>
+#include <string_view>
+#include <chrono>
+#include <stdexcept>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <fstream>
+#include <limits>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <sstream>
 #include <system_error>
 
@@ -36,6 +48,118 @@ std::string model_path(const std::vector<std::string>& args) {
 std::string parent_dir(const std::string& path) {
     const auto p = std::filesystem::path(path).parent_path().generic_string();
     return p.empty() ? std::string(".") : p;
+}
+
+// Sole admission allowlist: add a route only after its complete native GPU gate passes.
+// Empty deliberately: CPU evidence does not qualify any TP2 session route.
+constexpr std::array<std::string_view, 0> gpu_qualified_session_routes{};
+
+// Resolve serving optimizations after the production route is known. One-shot rank
+// save/load remains explicit; enabling this cache never selects a different producer.
+void resolve_sessions(App app, Resolved& r, const Getenv& env, const Probe& probe, bool baseline) {
+    auto& c = r.session;
+    const auto value = [&](const char* flag, const char* variable, const std::string& fallback) {
+        const auto cli = last_value(r.args, flag);
+        if (!cli.empty()) return cli;
+        const char* e = env(variable);
+        return set(e) ? std::string(e) : fallback;
+    };
+    bool invalid_budget = false;
+    const auto number = [&](const std::string& v, std::uint64_t fallback = 0) -> std::uint64_t {
+        try {
+            if (!v.empty() && v.find_first_not_of("0123456789") == std::string::npos)
+                return std::stoull(v);
+        } catch (const std::exception&) {}
+        invalid_budget = true;
+        return fallback;
+    };
+    const auto toggle = [](const std::string& v) {
+        return v != "0" && v != "off" && v != "false";
+    };
+    const bool requested = toggle(value("--session-cache", "STRIX_SESSION_CACHE", "on"));
+    const bool want_disk = toggle(value("--session-disk", "STRIX_SESSION_DISK", "on"));
+    const auto available = [&]() -> std::uint64_t {
+        try { return probe.available_memory ? probe.available_memory() : 0; }
+        catch (const std::exception&) { return 0; }
+    }();
+    const auto default_ram = std::min<std::uint64_t>(8ULL << 30U, available / 10U);
+    c.ram_bytes = number(value("--session-ram-bytes", "STRIX_SESSION_RAM_BYTES",
+        std::to_string(default_ram)), default_ram);
+    const auto legacy_mb = last_value(r.args, "--session-cache-mb");
+    if (!legacy_mb.empty() && last_value(r.args, "--session-ram-bytes").empty()) {
+        const auto mb = number(legacy_mb);
+        if (mb > (1ULL << 20U)) invalid_budget = true;
+        else c.ram_bytes = mb << 20U;
+    }
+    c.max_parked = number(value("--session-max-parked", "STRIX_SESSION_MAX_PARKED", "8"), 8);
+    std::string base;
+    if (set(env("XDG_CACHE_HOME"))) base = env("XDG_CACHE_HOME");
+    else if (set(env("HOME"))) base = std::string(env("HOME")) + "/.cache";
+    else if (set(env("USERPROFILE"))) base = std::string(env("USERPROFILE")) + "/.cache";
+    c.directory = value("--session-dir", "STRIX_SESSION_DIR", base.empty() ? "" : base + "/strix-engine/sessions");
+    if (!last_value(r.args, "--session-cache-dir").empty() && last_value(r.args, "--session-dir").empty())
+        c.directory = last_value(r.args, "--session-cache-dir");
+    const auto disk_budget = value("--session-disk-bytes", "STRIX_SESSION_DISK_BYTES", "");
+    c.disk_bytes = disk_budget.empty() ? 0 : number(disk_budget);
+    std::string effective_draft;
+    for (std::size_t i = 0; i < r.args.size(); ++i) {
+        if (r.args[i] == "--no-dspark") effective_draft.clear();
+        else if (r.args[i] == "--dspark" && i + 1 < r.args.size()) effective_draft = r.args[++i];
+    }
+    const std::string route = !effective_draft.empty() ? "tp2-http-batch-dspark" : "tp2-http-target";
+    const bool qualified = std::find(gpu_qualified_session_routes.begin(), gpu_qualified_session_routes.end(), route) != gpu_qualified_session_routes.end();
+    if (baseline) c.reason = "baseline switch";
+    else if (!requested) c.reason = "off switch";
+    else if (app != App::serve) c.reason = "one-shot commands remain explicit";
+    else if (!qualified) c.reason = "route not yet GPU-qualified: " + route;
+    else if (!effective_draft.empty())
+        c.reason = "batch DSpark has no qualified session adapter; sequential R1 rank sessions only";
+    else if (!last_value(r.args, "--hetero-listen").empty() || last_value(r.args, "--transport") == "single" ||
+             (!last_value(r.args, "--layers").empty() && last_value(r.args, "--layers") != "40"))
+        c.reason = "requires whole TP2 ranks";
+    else if (invalid_budget) c.reason = "invalid session budget";
+    else {
+        const auto context = last_value(r.args, "--context");
+        const auto n = context.empty() ? 4096ULL : number(context);
+        // Conservative per-rank envelope plus export/validation and slot-state headroom.
+        const auto one = n > (1ULL << 32U) ? std::numeric_limits<std::uint64_t>::max() : (16ULL << 20U) + n * 2048ULL;
+        if (invalid_budget || !c.max_parked || c.max_parked > std::numeric_limits<std::uint32_t>::max() || c.ram_bytes < one || available < one || c.ram_bytes > available / 2U)
+            c.reason = "insufficient available memory or parked-session budget";
+        else {
+            c.enabled = true;
+            if (want_disk) {
+                const auto free = [&]() -> std::uint64_t {
+                    try { return !c.directory.empty() && probe.writable_space ? probe.writable_space(c.directory) : 0; }
+                    catch (const std::exception&) { return 0; }
+                }();
+                if (disk_budget.empty()) c.disk_bytes = std::min<std::uint64_t>(64ULL << 30U, free / 4U);
+                c.disk = free >= 2U * one && c.disk_bytes >= 2U * one;
+                if (!c.disk) r.notices.emplace_back("session disk: off (directory unavailable or insufficient space)");
+            }
+        }
+    }
+    // Consume common controls here so every app accepts the off switches.
+    std::vector<std::string> kept;
+    for (std::size_t i = 0; i < r.args.size(); ++i) {
+        const auto& a = r.args[i];
+        const bool common = a == "--session-cache" || a == "--session-disk" || (a == "--session-ram-bytes" && app != App::rank) ||
+            a == "--session-max-parked" || a == "--session-dir" || a == "--session-disk-bytes";
+        const bool legacy = app == App::serve && (a == "--session-cache-mb" || a == "--session-cache-dir");
+        const bool rank_off = app == App::rank && (baseline || !requested) && a.starts_with("--session-");
+        if (rank_off && (a == "--session-dspark" || a == "--session-validate-only" || a == "--session-hash-only")) continue;
+        if (common || legacy || rank_off) {
+            if (++i >= r.args.size()) throw std::invalid_argument(a + " needs a value");
+        } else kept.push_back(a);
+    }
+    r.args = std::move(kept);
+    if (app == App::serve) {
+        if (c.enabled) {
+            r.args.insert(r.args.end(), {"--session-ram-bytes", std::to_string(c.ram_bytes),
+                "--session-max-parked", std::to_string(c.max_parked),
+                "--session-disk-bytes", std::to_string(c.disk ? c.disk_bytes : 0)});
+            if (c.disk) r.args.insert(r.args.end(), {"--session-cache-dir", c.directory});
+        } else r.notices.push_back("session cache: off (" + c.reason + ")");
+    }
 }
 
 }  // namespace
@@ -74,9 +198,11 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& env,
     };
     const auto notice = [&](const std::string& s) { r.notices.push_back(std::string("deepseek41 defaults: ") + s); };
 
-    if (const char* b = env("STRIX_DS41_BASELINE"); set(b) && !zero(b)) {
+    const bool baseline = set(env("STRIX_DS41_BASELINE")) && !zero(env("STRIX_DS41_BASELINE"));
+    if (baseline) {
         for (const auto& [name, value] : baseline_off_items()) put(name.c_str(), value);
         r.args = std::move(user);
+        resolve_sessions(app, r, env, probe, true);
         return r;
     }
 
@@ -178,6 +304,7 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& env,
         r.args = def;
         r.args.insert(r.args.end(), user.begin(), user.end());
     }
+    resolve_sessions(app, r, env, probe, false);
     return r;
 }
 
@@ -187,6 +314,13 @@ std::string describe(App app, const Resolved& r) {
     for (const auto& [k, v] : r.set_env) o << "env " << k << '=' << v << '\n';
     for (const auto& k : r.unset_env) o << "unset " << k << '\n';
     for (const auto& a : r.args) o << "arg " << a << '\n';
+    o << "session cache " << (r.session.enabled ? "on" : "off") << "\n"
+      << "session ram_bytes " << r.session.ram_bytes << "\n"
+      << "session max_parked " << r.session.max_parked << "\n"
+      << "session disk " << (r.session.disk ? "on" : "off") << "\n"
+      << "session disk_bytes " << r.session.disk_bytes << "\n"
+      << "session directory " << r.session.directory << "\n"
+      << "session reason " << r.session.reason << "\n";
     for (const auto& n : r.notices) o << "notice " << n << '\n';
     return o.str();
 }
@@ -194,6 +328,38 @@ std::string describe(App app, const Resolved& r) {
 Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
     std::vector<std::string> in(argv + 1, argv + argc);
     Probe probe;
+    probe.available_memory = []() -> std::uint64_t {
+#ifdef _WIN32
+        MEMORYSTATUSEX status{};
+        status.dwLength = sizeof(status);
+        return GlobalMemoryStatusEx(&status) ? status.ullAvailPhys : 0;
+#else
+        std::ifstream meminfo("/proc/meminfo");
+        for (std::string key, unit; meminfo >> key;) {
+            std::uint64_t kb = 0;
+            meminfo >> kb; std::getline(meminfo, unit);
+            if (key == "MemAvailable:") return kb * 1024U;
+        }
+        return 0;
+#endif
+    };
+    probe.writable_space = [](const std::string& p) -> std::uint64_t {
+        std::error_code ec;
+        std::filesystem::create_directories(p, ec);
+        if (ec) return 0;
+        // Unique probe: never truncate an existing cache or another process's probe.
+        const auto test = std::filesystem::path(p) / (".probe-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+        if (!std::filesystem::create_directory(test, ec) || ec) return 0;
+        std::ofstream out(test / "write", std::ios::binary);
+        out.put('x'); out.close();
+        const bool ok = static_cast<bool>(out);
+        std::filesystem::remove(test / "write", ec);
+        std::filesystem::remove(test, ec);
+        if (!ok || ec) return 0;
+        const auto space = std::filesystem::space(p, ec);
+        return ec ? 0 : space.available;
+    };
     probe.file = [](const std::string& p) { std::error_code ec; return std::filesystem::is_regular_file(p, ec); };
     probe.dir = [](const std::string& p) { std::error_code ec; return std::filesystem::is_directory(p, ec); };
     probe.list = [](const std::string& d) {

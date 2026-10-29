@@ -1,3 +1,5 @@
+#include <memory>
+#include <atomic>
 #include "strix/model_content_hash.hpp"
 
 #include <algorithm>
@@ -35,6 +37,8 @@
 
 namespace strix {
 namespace {
+std::atomic<std::uint64_t> cache_hits{0}, cache_misses{0};
+
 
 constexpr std::array<std::uint32_t, 64> k{
     0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U,
@@ -344,7 +348,7 @@ private:
 using FileSha256 = Sha256;
 #endif
 
-FileDigest hash_file_stable_uncached(const std::filesystem::path& path);
+[[maybe_unused]] FileDigest hash_file_stable_uncached(const std::filesystem::path& path);
 
 #if defined(__linux__)
 // Verified-identity cache, like git's index: a full-file SHA-256 of a ~60 GB model costs ~48 s of one
@@ -356,7 +360,7 @@ struct HashCacheKey {
     std::string file;
     std::string stamp;
 };
-std::optional<HashCacheKey> hash_cache_key(const std::filesystem::path& path) {
+std::optional<HashCacheKey> hash_cache_key(const std::filesystem::path& path, const FileIdentity* expected = nullptr) {
     const char* setting = std::getenv("STRIX_HASH_CACHE");
     if (setting && setting[0] == '0' && setting[1] == '\0') return std::nullopt;
     std::filesystem::path dir;
@@ -365,7 +369,11 @@ std::optional<HashCacheKey> hash_cache_key(const std::filesystem::path& path) {
     else if (const char* home = std::getenv("HOME"); home && home[0]) dir = std::filesystem::path(home) / ".cache/strix-engine/file-sha256";
     else return std::nullopt;
     struct stat st {};
-    if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return std::nullopt;
+    if (expected) {
+        st.st_dev = expected->dev; st.st_ino = expected->ino; st.st_size = expected->size;
+        st.st_mtim = {expected->mtime_sec, expected->mtime_ns};
+        st.st_ctim = {expected->ctime_sec, expected->ctime_ns};
+    } else if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return std::nullopt;
     char name[64], stamp[160];
     std::snprintf(name, sizeof(name), "%llx-%llx", static_cast<unsigned long long>(st.st_dev),
         static_cast<unsigned long long>(st.st_ino));
@@ -421,7 +429,8 @@ FileDigest hash_file_stable(const std::filesystem::path& path) {
 #if defined(__linux__)
     const auto key = hash_cache_key(path);
     if (key)
-        if (auto cached = hash_cache_read(*key)) { report("hit"); return *cached; }
+        if (auto cached = hash_cache_read(*key)) { ++cache_hits; report("hit"); return *cached; }
+    ++cache_misses;
     const auto digest = hash_file_stable_uncached(path);
     // Store only if the file still carries the stamp it had before hashing.
     if (key)
@@ -435,7 +444,7 @@ FileDigest hash_file_stable(const std::filesystem::path& path) {
 #endif
 }
 
-FileDigest hash_file_stable_uncached(
+[[maybe_unused]] FileDigest hash_file_stable_uncached(
     const std::filesystem::path& path) {
     std::error_code error;
     const auto before =
@@ -503,6 +512,8 @@ FileDigest hash_file_stable_uncached(
 
 }  // namespace
 
+FileHashCacheStats file_hash_cache_stats() noexcept { return {cache_hits.load(), cache_misses.load()}; }
+
 ModelContentIdentity sha256_file_content(
     const std::filesystem::path& path) {
     return hash_file_stable(path).digest;
@@ -510,6 +521,36 @@ ModelContentIdentity sha256_file_content(
 
 ModelContentIdentity sha256_file_content(const std::filesystem::path& path, FileHashPolicy policy) {
     return policy == FileHashPolicy::full ? hash_file_stable_uncached(path).digest : sha256_file_content(path);
+}
+
+ModelContentIdentity sha256_file_content(const std::filesystem::path& path, const FileIdentity& expected) {
+#if defined(__linux__)
+    const auto key = hash_cache_key(path, &expected);
+    if (key)
+        if (auto cached = hash_cache_read(*key)) { ++cache_hits; return cached->digest; }
+    ++cache_misses;
+    const auto changed = [] { throw std::runtime_error("model files changed during startup"); };
+    const auto close_file = [](FILE* file) { std::fclose(file); };
+    std::unique_ptr<FILE, decltype(close_file)> input(std::fopen(path.c_str(), "rb"), close_file);
+    if (!input || fd_identity(::fileno(input.get())) != expected) changed();
+    FileSha256 hash;
+    std::vector<std::uint8_t> buffer(1024U * 1024U);
+    std::uint64_t bytes = 0;
+    for (;;) {
+        const auto count = std::fread(buffer.data(), 1, buffer.size(), input.get());
+        hash.update(buffer.data(), count);
+        bytes += count;
+        if (count < buffer.size()) break;
+    }
+    if (std::ferror(input.get()) || bytes != expected.size ||
+        fd_identity(::fileno(input.get())) != expected) changed();
+    const FileDigest digest{hash.finalize(), bytes};
+    if (key) hash_cache_write(*key, digest);
+    return digest.digest;
+#else
+    (void)path; (void)expected;
+    throw std::runtime_error("loader-bound hashing requires Linux");
+#endif
 }
 
 ModelContentIdentity sha256_bytes(std::span<const std::byte> bytes) {

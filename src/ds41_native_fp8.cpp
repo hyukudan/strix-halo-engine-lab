@@ -1,3 +1,5 @@
+#include "strix/file_snapshot.hpp"
+#include "strix/model_input.hpp"
 #include "strix/ds41_native_fp8.hpp"
 
 #include "strix/serve/json.hpp"
@@ -30,7 +32,7 @@ float butterfly(std::array<float, product_lanes> lanes) noexcept {
 }
 
 std::string read_bytes(const std::filesystem::path& file, std::uint64_t offset, std::uint64_t bytes) {
-    std::ifstream in(file, std::ios::binary);
+    strix::ModelInput in(file);
     if (!in) throw std::runtime_error("ds41 native fp8: cannot open " + file.string());
     in.seekg(static_cast<std::streamoff>(offset));
     std::string out(static_cast<std::size_t>(bytes), '\0');
@@ -125,18 +127,38 @@ std::vector<std::string> parse_fp8_site_classes(const std::string& list) {
     return out;
 }
 
-SafetensorsCheckpoint::SafetensorsCheckpoint(const std::filesystem::path& dir) : dir_(dir) {
+SafetensorsResolution resolve_safetensors_checkpoint(const std::filesystem::path& dir) {
+    SafetensorsResolution out;
     const auto index = dir / "model.safetensors.index.json";
-    if (std::filesystem::exists(index)) {
-        const auto text = read_bytes(index, 0, std::filesystem::file_size(index));
-        const auto root = serve::parse_json(text);
+    out.indexed = std::filesystem::exists(index);
+    if (out.indexed) {
+        out.files.emplace("model.safetensors.index.json", index);
+        const auto root = serve::parse_json(read_bytes(index, 0, std::filesystem::file_size(index)));
         const auto* map = root.find("weight_map");
         if (map == nullptr || !map->is_object()) throw std::runtime_error("ds41 native fp8: no weight_map in " + index.string());
-        for (const auto& [name, file] : map->as_object()) shard_of_.emplace(name, file.as_string());
+        for (const auto& [name, file] : map->as_object()) {
+            out.shard_of.emplace(name, file.as_string());
+            out.files.emplace(file.as_string(), dir / file.as_string());
+        }
     } else {
         for (const auto& e : std::filesystem::directory_iterator(dir))
-            if (e.path().extension() == ".safetensors") load_header(e.path());
+            if (e.path().extension() == ".safetensors") {
+                out.files.emplace(e.path().filename().string(), e.path());
+                out.unindexed_shards.push_back(e.path());
+            }
     }
+    return out;
+}
+
+SafetensorsCheckpoint::SafetensorsCheckpoint(const std::filesystem::path& dir, bool reject_duplicate_names)
+    : reject_duplicate_names_(reject_duplicate_names), dir_(dir) {
+    auto resolved = resolve_safetensors_checkpoint(dir);
+    shard_of_ = std::move(resolved.shard_of);
+    if (!resolved.indexed)
+        for (const auto& file : resolved.unindexed_shards) load_header(file);
+    if (reject_duplicate_names_ && resolved.indexed)
+        for (const auto& [name, file] : resolved.files)
+            if (name != "model.safetensors.index.json") load_header(file);
     if (shard_of_.empty() && tensors_.empty()) throw std::runtime_error("ds41 native fp8: no tensors in " + dir.string());
 }
 
@@ -163,6 +185,8 @@ void SafetensorsCheckpoint::load_header(const std::filesystem::path& file) {
         if (b < a || 8U + n + b > size) throw std::runtime_error("ds41 native fp8: " + name + " outside " + file.string());
         t.offset = 8U + n + a;
         t.bytes = b - a;
+        if (reject_duplicate_names_ && tensors_.contains(name))
+            throw std::runtime_error("session cache: duplicate tensor name '" + name + "' across consumed shards");
         tensors_[name] = std::move(t);
         shard_of_.emplace(name, file.filename().string());
     }
@@ -189,6 +213,7 @@ void SafetensorsCheckpoint::read(const Tensor& t, std::uint8_t* out) const {
 #else
     const int fd = ::open(t.file.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) throw std::runtime_error("ds41 native fp8: cannot open " + t.file.string());
+    strix::LoaderCapture::record(t.file, fd);
     std::uint64_t done = 0;
     while (done < t.bytes) {
         const auto n = ::pread(fd, out + done, static_cast<std::size_t>(std::min<std::uint64_t>(t.bytes - done, 1ULL << 30U)),

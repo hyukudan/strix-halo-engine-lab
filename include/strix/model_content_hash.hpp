@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/file_snapshot.hpp"
 
 #include "strix/model_runtime_binding.hpp"
 
@@ -17,6 +18,8 @@ public:
 };
 
 enum class FileHashPolicy { cached, full };
+struct FileHashCacheStats { std::uint64_t hits = 0, misses = 0; };
+[[nodiscard]] FileHashCacheStats file_hash_cache_stats() noexcept;
 
 struct ModelContentFile {
     std::string logical_name;
@@ -29,6 +32,7 @@ struct ModelContentFile {
 // Explicit full reads bypass the persistent metadata cache without changing process settings.
 [[nodiscard]] ModelContentIdentity sha256_file_content(
     const std::filesystem::path& path, FileHashPolicy policy);
+[[nodiscard]] ModelContentIdentity sha256_file_content(const std::filesystem::path&, const FileIdentity&);
 
 [[nodiscard]] ModelContentIdentity sha256_bytes(
     std::span<const std::byte> bytes);

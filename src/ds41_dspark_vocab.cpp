@@ -1,3 +1,4 @@
+#include "strix/model_input.hpp"
 #include "strix/ds41_dspark_vocab.hpp"
 
 #include <algorithm>
@@ -20,8 +21,20 @@ Vocab from_ids(const std::vector<std::uint32_t>& ids) {
 
 } // namespace
 
+std::vector<std::string> vocabulary_asset_files(const std::string& spec) {
+    std::vector<std::string> out;
+    if (spec.starts_with("auto:"))
+        throw std::runtime_error("session cache: auto vocabulary selection is not supported; use files: or full");
+    if (spec.starts_with("files:")) {
+        std::stringstream paths(spec.substr(6));
+        for (std::string path; std::getline(paths, path, ',');) out.push_back(path);
+    }
+    return out;
+}
+
 std::vector<std::uint32_t> read_vocabulary_file(const std::string& path) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    strix::ModelInput file(path);
+    file.seekg(0, std::ios::end);
     if (!file) throw std::runtime_error("cannot open draft vocabulary " + path);
     const auto bytes = static_cast<std::size_t>(file.tellg());
     if (bytes % 4U != 0U) throw std::runtime_error("draft vocabulary " + path + " is not a list of uint32 ids");
@@ -58,8 +71,7 @@ VocabularyChoice choose_vocabulary(const std::string& spec, std::span<const std:
     }
     if (spec.rfind("files:", 0) == 0) {
         std::vector<std::uint32_t> ids;
-        std::stringstream ss(spec.substr(6));
-        for (std::string path; std::getline(ss, path, ',');) {
+        for (const auto& path : vocabulary_asset_files(spec)) {
             const auto part = read_vocabulary_file(path);
             ids.insert(ids.end(), part.begin(), part.end());
         }

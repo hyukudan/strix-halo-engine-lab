@@ -3,6 +3,7 @@
 // greedy decoding for every window policy.
 
 #include "strix/ds41_dspark.hpp"
+#include "strix/ds41_dspark_vocab.hpp"
 #include "ds41_dspark_model.hpp"
 #include "strix/ds41_dspark_driver.hpp"
 
@@ -13,6 +14,8 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -619,6 +622,35 @@ void run_real_host(const std::string& q2, const std::string& dspark, const std::
 } // namespace
 
 int main() {
+    {
+        using namespace strix::ds41::dspark;
+        expect(vocabulary_asset_files("files:a.bin,b.bin") == std::vector<std::string>{"a.bin", "b.bin"}, "fixed vocabulary inventory");
+        expect(vocabulary_asset_files("full").empty(), "full vocabulary has no files");
+        for (const auto* spec : {"auto:/missing", "auto:/irrelevant-loop"}) {
+            bool refused = false;
+            try { (void)vocabulary_asset_files(spec); }
+            catch (const std::exception& e) { refused = std::string(e.what()).find("session cache: auto vocabulary") != std::string::npos; }
+            expect(refused, "auto session vocabulary must refuse without traversing directory");
+        }
+        const auto dir = std::filesystem::temp_directory_path() / ("ds41-auto-session-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directory(dir);
+        const std::uint32_t id = 7;
+        std::ofstream(dir / "core48k.bin", std::ios::binary).write(reinterpret_cast<const char*>(&id), sizeof(id));
+        const auto spec = "auto:" + dir.string();
+        const auto before = choose_vocabulary(spec, {}).vocabulary.extra;
+        std::ofstream(dir / "README") << "irrelevant";
+#ifndef _WIN32
+        std::filesystem::create_symlink("loop", dir / "loop");
+#endif
+        expect(choose_vocabulary(spec, {}).vocabulary.extra == before, "ordinary auto ignores README and irrelevant symlink loop");
+        bool refused = false;
+        try { (void)vocabulary_asset_files(spec); }
+        catch (const std::exception& e) { refused = std::string(e.what()).find("session cache: auto vocabulary") != std::string::npos; }
+        expect(refused, "session auto refuses before directory inventory");
+        std::filesystem::remove_all(dir);
+        expect(choose_vocabulary("full", {}).label == "full", "ordinary vocabulary selection unchanged");
+    }
+
     test_f16();
     test_e4m3();
     test_wave_sum();
