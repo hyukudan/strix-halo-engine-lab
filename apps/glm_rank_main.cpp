@@ -46,6 +46,7 @@
 // named); STRIX_GLM_MEMTRACE=FILE writes one memory line per second; the watchdog (STRIX_GLM_WATCHDOG=0 off) aborts the
 // rank with exit code 86 near the OOM line.
 #include "glm_rank_defaults.hpp"
+#include "glm_rank_startup.hpp"
 
 #include "strix/dist/communicator.hpp"
 #include "strix/dist/gpu_direct.hpp"
@@ -248,14 +249,17 @@ int main(int argc, char** argv) {
         if (mtp_prefill != "ref" && mtp_prefill != "chunked")
             throw std::invalid_argument("--mtp-prefill must be ref or chunked");
         namespace rd = strix::glm::rank_defaults;
-        const auto eff = rd::resolve(rd::scan(std::vector<std::string>(argv + 2, argv + argc)), rd::process_env(), rd::probe_model_mtp(argv[1]));
+        const auto request = rd::scan(std::vector<std::string>(argv + 2, argv + argc));
+        auto eff = rd::resolve(request, rd::process_env(), rd::probe_model_mtp(argv[1]));
+        rd::fallback_without_handshake(eff, request, rd::process_env());
         if (print_config) {  // dry run: no environment change, no GPU, no peer
             std::fputs(rd::print(eff).c_str(), stdout);
             return 0;
         }
         rd::apply_env(eff, [](const char* k, const char* v) { (void)::setenv(k, v, 0); });
         opt.mtp = eff.mtp.value == "1";
-        if (eff.max_rows.source != "explicit") opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
+        opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
+        opt.auto_rows = rd::max_rows_auto(eff);
         opt.spec = eff.spec.value == "1";
         bool mtp_spec_on = eff.mtp_spec.value == "1";
         if (!mtp_prefill_gate.empty() && (!opt.spec || !opt.mtp))
@@ -299,63 +303,6 @@ int main(int argc, char** argv) {
                     frag ? frag : "(unset)", trace ? trace : "off");
         if (opt.max_rows == 0 || opt.max_rows > 65536) throw std::invalid_argument("--max-rows must be 1..65536");
 
-        std::unique_ptr<strix::dist::Communicator> comm;
-        std::shared_ptr<strix::glm::xfer::XferExchange> xfer_exchange;
-        const char* lt = std::getenv("STRIX_GLM_LOAD_TEST");
-        if (opt.world == 2 && !(lt != nullptr && std::string(lt) == "1")) {
-            if (transport_spec.empty()) throw std::invalid_argument("--world 2 needs --transport");
-            (void)::setenv("STRIX_DIST_USB4_TIMEOUT_MS", "600000", 0);
-            // the DS/MiniMax 'hp' host path (STRIX_DIST_CRC_PARALLEL / HOST_CRC_OVERLAP / HOST_CHUNK_BYTES) is set by rank_defaults
-            (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "600000", 0);
-            std::string receipt;
-            auto transport = open_transport(transport_spec, opt.rank, receipt);
-            if (!receipt.empty()) std::printf("transport: %s\n", receipt.c_str());
-            if (xch_kind == "xfer") {  // the module owns the transport; no Communicator (Options::external_exchange)
-                if (opt.spec) throw std::invalid_argument("--xch xfer has no speculative merge yet: use --xch comm with --spec 1");
-                xfer_exchange = std::make_shared<strix::glm::xfer::XferExchange>(std::move(transport), opt.rank, 8U);
-                opt.external_exchange = true;
-                std::printf("connected: rank %u exchange xfer %.1f s\n", opt.rank, secs(t_start, Clock::now()));
-            } else {
-            strix::dist::Group group;
-            group.rank = opt.rank;
-            group.world = 2;
-            group.plan = 0x474c4d35ULL;  // "GLM5"
-            // one exchange carries up to max(8, max_rows) rows of 4096 floats (a chunked prefill exchanges whole chunks)
-            const std::size_t max_bytes = std::size_t{std::max(8U, opt.max_rows)} * 4096 * sizeof(float) + 4096;
-            comm = gpu_direct ? std::make_unique<strix::dist::Communicator>(group, std::move(transport), std::move(gpu_direct), max_bytes)
-                              : std::make_unique<strix::dist::Communicator>(group, std::move(transport), max_bytes);
-            std::printf("connected: rank %u transport %s %.1f s\n", opt.rank, comm->transport_name().c_str(), secs(t_start, Clock::now()));
-            }
-        }
-        if (pf_swap_moe && (opt.world != 2 || pf_gate.empty())) throw std::invalid_argument("--pf-swap-moe needs --world 2 and --pf-gate");
-        ge::Engine eng(opt, comm.get());
-        if (xfer_exchange) eng.set_exchange(xfer_exchange);
-        if (pf_before_load) {
-            namespace pf = strix::glm::pf;
-            eng.set_prefill(pf::make_prefill_path(64 / opt.world, 64 / opt.world, opt.capacity, opt.max_rows,
-                                                  prefill_mode == "gemv" ? pf::TierB::gemv : pf::TierB::wmma));
-            std::printf("rank %u prefill %s set before load\n", opt.rank, prefill_mode.c_str());
-        }
-        const auto lr = eng.load();
-        const auto load_identity = eng.identity_mode();
-        std::printf("rank %u: load %.1f s, %.1f GiB read, device %.1f GiB (layers %u, mtp %d) identity %s decode-xch %s%s%s%s%s", opt.rank, lr.seconds,
-                    lr.gib_read, lr.device_gib, opt.layers, opt.mtp ? 1 : 0, ge::identity_mode_name(load_identity),
-                    xfer_exchange ? "xfer (external)" : opt.world == 1 ? "local" : eng.decode_xfer_enabled() ? "xfer" : "comm",
-                    std::getenv("STRIX_GLM_HC_NORM") ? " hc-norm=" : "",
-                    std::getenv("STRIX_GLM_HC_NORM") ? std::getenv("STRIX_GLM_HC_NORM") : "",
-                    std::getenv("STRIX_GLM_MOE_PIPE") ? " moe-pipe=" : "",
-                    std::getenv("STRIX_GLM_MOE_PIPE") ? std::getenv("STRIX_GLM_MOE_PIPE") : "");
-        if (load_identity != ge::IdentityMode::kR1) {
-            const char* hc = std::getenv("STRIX_GLM_R1B_HC");
-            std::printf(" r1b-dense %d r1b-hc %d", strix::glm::r1b::dense_variant(), hc ? std::atoi(hc) : 4);
-        }
-        std::printf("\n");
-        std::fflush(stdout);
-        if (mem_plan) {
-            std::printf("rank %u prefill %s (requested %s), pipeline %u\n", opt.rank, prefill_mode.c_str(), prefill_requested.c_str(), eng.prefill_pipeline());
-            std::printf("rank %u: mem-plan ADMITTED (nothing loaded)\n", opt.rank);
-            return 0;
-        }
         // Cache exactly the truncated token lists consumed by normal decode, including their order.
         std::vector<std::vector<std::uint32_t>> decode_prompts;
         std::uint32_t prompt_hash = 2166136261U;
@@ -378,59 +325,124 @@ int main(int argc, char** argv) {
             for (unsigned byte = 0; byte < 4; ++byte)
                 prompt_hash = (prompt_hash ^ ((static_cast<std::uint32_t>(decode_prompts.size()) >> (8 * byte)) & 255U)) * 16777619U;
         }
-        // External Xfer never resolves mtp-spec and must not be initialized by this handshake.
-        if (xch_kind == "xfer" && mtp_spec_on)
-            throw std::logic_error("external Xfer must not resolve mtp-spec");
-        if (xch_kind == "comm" && opt.world == 2 && decode_n > 0 && !reference_gate) {
-            // Admission (eng.load) precedes agreement: a one-node admission failure is an error, not a fallback.
-            // Use the fallback CommExchange, including ranks that locally resolved plain decode.
+        std::unique_ptr<strix::dist::Communicator> comm;
+        std::shared_ptr<strix::glm::xfer::XferExchange> xfer_exchange;
+        const char* lt = std::getenv("STRIX_GLM_LOAD_TEST");
+        if (opt.world == 2 && !(lt != nullptr && std::string(lt) == "1")) {
+            if (transport_spec.empty()) throw std::invalid_argument("--world 2 needs --transport");
+            (void)::setenv("STRIX_DIST_USB4_TIMEOUT_MS", "600000", 0);
+            // the DS/MiniMax 'hp' host path (STRIX_DIST_CRC_PARALLEL / HOST_CRC_OVERLAP / HOST_CHUNK_BYTES) is set by rank_defaults
+            (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "600000", 0);
+            std::string receipt;
+            auto transport = open_transport(transport_spec, opt.rank, receipt);
+            if (!receipt.empty()) std::printf("transport: %s\n", receipt.c_str());
+            if (xch_kind == "xfer") {  // the module owns the transport; no Communicator (Options::external_exchange)
+                if (opt.spec) throw std::invalid_argument("--xch xfer has no speculative merge yet: use --xch comm with --spec 1");
+                xfer_exchange = std::make_shared<strix::glm::xfer::XferExchange>(std::move(transport), opt.rank, 8U);
+                opt.external_exchange = true;
+                std::printf("connected: rank %u exchange xfer %.1f s\n", opt.rank, secs(t_start, Clock::now()));
+            } else {
+            strix::dist::Group group;
+            group.rank = opt.rank;
+            group.world = 2;
+            group.plan = 0x474c4d35ULL;  // "GLM5"
+            // one exchange carries up to max(8, max_rows) rows of 4096 floats (a chunked prefill exchanges whole chunks)
+            opt.exchange_rows = rd::max_rows_auto(eff) ? rd::kFallbackMaxRows : opt.max_rows;
+            const std::size_t max_bytes = std::size_t{std::max(8U, opt.exchange_rows)} * 4096 * sizeof(float) + 4096;
+            comm = gpu_direct ? std::make_unique<strix::dist::Communicator>(group, std::move(transport), std::move(gpu_direct), max_bytes)
+                              : std::make_unique<strix::dist::Communicator>(group, std::move(transport), max_bytes);
+            std::printf("connected: rank %u transport %s %.1f s\n", opt.rank, comm->transport_name().c_str(), secs(t_start, Clock::now()));
+            }
+        }
+        if (pf_swap_moe && (opt.world != 2 || pf_gate.empty())) throw std::invalid_argument("--pf-swap-moe needs --world 2 and --pf-gate");
+        const bool startup_handshake = rd::has_startup_handshake(opt.world, xch_kind, decode_n > 0, reference_gate);
+        ge::Engine eng(opt, comm.get());
+        if (xfer_exchange) eng.set_exchange(xfer_exchange);
+        bool startup_agreed = false;
+        auto startup_agree = [&]() {
+            startup_agreed = true;
+            // External Xfer must never bind its stream through a host control merge.
+            if (!startup_handshake) return;
             const bool eligible = mtp_spec_on && opt.mtp && opt.spec && opt.layers == 45 &&
                                   (prefill_mode == "ref" || prefill_mode == "gemv");
-            // bits: kmax[0:3], adaptive[4], prefill[5:6], identity[7:8], spec-xch[9], decode-xfer[10].
             const std::uint32_t packed = eff.kmax | (eff.adaptive ? 1U << 4 : 0U) |
                 ((prefill_mode == "ref" ? 1U : prefill_mode == "gemv" ? 2U : 3U) << 5) |
-                (static_cast<std::uint32_t>(load_identity) << 7) |
+                (static_cast<std::uint32_t>(eng.identity_mode()) << 7) |
                 (eff.env.at("STRIX_GLM_SPEC_XCH").value == "xfer" ? 1U << 9 : 0U) |
                 (eng.decode_xfer_enabled() ? 1U << 10 : 0U);
-            const std::uint32_t fields[] = {
-                eligible ? 1U : 0U, packed, opt.max_rows, decode_n,
-                static_cast<std::uint32_t>(opt.capacity), static_cast<std::uint32_t>(opt.capacity >> 32),
-                opt.slots, prompt_hash};
-            const char* names[] = {"eligible", "config", "max_rows", "decode_n", "capacity-lo", "capacity-hi", "slots", "prompt-fnv1a"};
-            constexpr unsigned field_count = sizeof(fields) / sizeof(fields[0]);
-            static_assert(field_count <= 8);
-            ge::Exchange::MergeRow rows[field_count];
-            for (unsigned i = 0; i < field_count; ++i) {
-                rows[i].value = static_cast<float>(fields[i]);
-                rows[i].id = fields[i];
-                rows[i].flag = eligible ? 0U : 1U;
-            }
-            ge::Exchange::MergeCtl ctl;
-            ctl.kind = strix::glm::spec::kEligibilityMerge;
-            // Engine exposes no stream accessor. nullptr is safe only for this Comm fallback:
-            // CommExchange::merge synchronizes with hipMemcpy/hipStreamSynchronize; rows are host data.
-            eng.exchange()->merge(rows, field_count, ctl, nullptr);
-            bool mismatch = false;
-            std::string local_fields;
-            for (unsigned i = 0; i < field_count; ++i) {
-                // field 0 (eligibility) may differ: that is the coordinated plain fallback, not a mismatch
-                mismatch = mismatch || (i != 0 && rows[i].id != fields[i]);
-                if (i != 0) local_fields += ", ";
-                local_fields += std::string(names[i]) + "=" + std::to_string(fields[i]);
-            }
-            // R18 picks the maximum value (ties: lower id); only the losing rank may see a difference.
-            // OR that observation in a second round so both ranks reject before any forward.
-            ge::Exchange::MergeRow vote;
-            vote.flag = mismatch ? 1U : 0U;
-            ge::Exchange::MergeCtl vote_ctl;
-            vote_ctl.kind = strix::glm::spec::kConfigurationMismatchMerge;
-            eng.exchange()->merge(&vote, 1, vote_ctl, nullptr);
-            if (vote.flag != 0)
-                throw std::runtime_error("TP2 ranks resolved different decode configurations: " + local_fields);
-            mtp_spec_on = rows[0].flag == 0;
+            const auto result = rd::startup_agreement(
+                {eligible ? 1U : 0U, packed, opt.max_rows, decode_n,
+                 static_cast<std::uint32_t>(opt.capacity), static_cast<std::uint32_t>(opt.capacity >> 32), opt.slots, prompt_hash},
+                rd::max_rows_auto(eff), startup_handshake, [&](auto* rows, unsigned n, auto& ctl) { eng.exchange()->merge(rows, n, ctl, nullptr); });
+            rd::agree_max_rows(eff, result.rows);
+            opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
+            mtp_spec_on = result.eligible;
             if (!mtp_spec_on)
                 std::printf("rank %u mtp-spec: unavailable on at least one rank (head or precondition); using plain decode\n", opt.rank);
+        };
+        const auto lr = eng.load([&](const ge::mem::LoadAdmission& admission) {
+            namespace pf = strix::glm::pf;
+            namespace mem = strix::glm::engine::mem;
+            if (rd::max_rows_auto(eff)) {
+                const auto b = pf::prefill_budget(64 / opt.world, 64 / opt.world, opt.capacity, rd::kAutoMaxRows, opt.mtp);
+                auto terms = admission.terms;
+                // Account for all later owners, including the full grown communication pools. This is conservative:
+                // the current 4096 pools are already charged to the snapshot; growth frees them first.
+                const auto comm_bytes = comm && !admission.recheck ? std::uint64_t{rd::kAutoMaxRows} * (3 * 4096 * 4 + 16) + 16384 : 0;
+                terms.push_back({"communication growth and chunk staging", 3 * comm_bytes, 0});
+                if (prefill_mode != "ref") {
+                    // Bound per-allocation physical rounding too; the path checks its allocation-count bound.
+                    const auto quantum = admission.model.physical(1);
+                    const auto path = admission.model.physical(b.path) + pf::kPrefillAllocationBound * quantum;
+                    const auto workspace = admission.model.physical(b.workspace) + 4 * quantum;
+                    const auto install = admission.model.physical(admission.prefill_install) + 256 * quantum;
+                    terms.push_back({"prefill path (physical bound)", path, 0});
+                    terms.push_back({"prefill workspace and install", workspace + install, 0});
+                }
+                auto margins = admission.margins;
+                margins.ram = std::max({margins.ram, rd::kMaxRowsSafetyBytes, pf::admission_margin_bytes()});
+                rd::select_max_rows(eff, [&] { return mem::fits(terms, admission.snapshot, margins, admission.device_free); });
+                opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
+                std::fprintf(stderr, "rank %u max-rows admission: %s; candidate %u, path %.2f GiB, workspace %.2f GiB, install %.2f GiB\n",
+                             opt.rank, mem::describe(admission.snapshot).c_str(), opt.max_rows,
+                             mem::gib(b.path), mem::gib(b.workspace), mem::gib(admission.prefill_install));
+                if (!admission.recheck) startup_agree();
+                else {
+                    const auto rows = rd::recheck_rows(opt.max_rows, comm != nullptr,
+                        [&](auto* proposal, unsigned n, auto& ctl) { eng.exchange()->merge(proposal, n, ctl, nullptr); });
+                    rd::agree_max_rows(eff, rows);
+                    opt.max_rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
+                }
+                if (comm) comm->resize_bytes(std::size_t{opt.max_rows} * 4096 * sizeof(float) + 4096);
+            }
+            std::fprintf(stderr, "rank %u max-rows=%u (%s)\n", opt.rank, opt.max_rows, eff.max_rows.source.c_str());
+            if (pf_before_load && (!opt.auto_rows || admission.recheck)) {
+                eng.set_prefill(pf::make_prefill_path(64 / opt.world, 64 / opt.world, opt.capacity, opt.max_rows,
+                                                      prefill_mode == "gemv" ? pf::TierB::gemv : pf::TierB::wmma));
+                std::printf("rank %u prefill %s set before load\n", opt.rank, prefill_mode.c_str());
+            }
+            return opt.max_rows;
+        });
+        const auto load_identity = eng.identity_mode();
+        std::printf("rank %u: load %.1f s, %.1f GiB read, device %.1f GiB (layers %u, mtp %d) identity %s decode-xch %s%s%s%s%s", opt.rank, lr.seconds,
+                    lr.gib_read, lr.device_gib, opt.layers, opt.mtp ? 1 : 0, ge::identity_mode_name(load_identity),
+                    xfer_exchange ? "xfer (external)" : opt.world == 1 ? "local" : eng.decode_xfer_enabled() ? "xfer" : "comm",
+                    std::getenv("STRIX_GLM_HC_NORM") ? " hc-norm=" : "",
+                    std::getenv("STRIX_GLM_HC_NORM") ? std::getenv("STRIX_GLM_HC_NORM") : "",
+                    std::getenv("STRIX_GLM_MOE_PIPE") ? " moe-pipe=" : "",
+                    std::getenv("STRIX_GLM_MOE_PIPE") ? std::getenv("STRIX_GLM_MOE_PIPE") : "");
+        if (load_identity != ge::IdentityMode::kR1) {
+            const char* hc = std::getenv("STRIX_GLM_R1B_HC");
+            std::printf(" r1b-dense %d r1b-hc %d", strix::glm::r1b::dense_variant(), hc ? std::atoi(hc) : 4);
         }
+        std::printf("\n");
+        std::fflush(stdout);
+        if (mem_plan) {
+            std::printf("rank %u prefill %s (requested %s), pipeline %u\n", opt.rank, prefill_mode.c_str(), prefill_requested.c_str(), eng.prefill_pipeline());
+            std::printf("rank %u: mem-plan ADMITTED (nothing loaded)\n", opt.rank);
+            return 0;
+        }
+        if (!startup_agreed) startup_agree();
         if (mtp_spec_on && profile)
             std::printf("rank %u mtp-spec: --profile covers plain steps only; skipping decode profile\n", opt.rank);
         if (prefill_mode != "ref" && !pf_before_load) {  // chunked prefill, installed after the load so its admission check sees real free memory

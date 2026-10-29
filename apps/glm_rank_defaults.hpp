@@ -81,6 +81,8 @@ inline const std::vector<EnvItem>& env_items() {
         {"pf-obar-v5", "STRIX_GLM_PF_OBAR", "5", "2", false, true, "Measurement: MLA o-bar v5 exact, 2.9x"},
         {"pf-scores-v4", "STRIX_GLM_PF_SCORES", "4", "2", false, true, "Measurement: MLA scores v4 bitwise 75/0, -8..-17 % vs v3 (=3 restores v3)"},
         {"pf-indexer-v2", "STRIX_GLM_PF_IDX", "2", "1", false, true, "Measurement: indexer v2 -41 %"},
+        {"max-rows-auto", "STRIX_GLM_MAX_ROWS_AUTO", "1", "0", false, true,
+         "Measurement: exact 8192 vs 4096 rows, 8K TTFT -4 %, 32K 116.3 -> 109.9 s (-5.5 %); +7.3 GiB per rank"},
     };
     return items;
 }
@@ -176,7 +178,7 @@ inline std::string resolve_prefill_auto(bool mtp, bool spec, bool g3_only, bool 
 
 struct Value {
     std::string value;
-    std::string source;  // default | explicit | baseline
+    std::string source;  // default | explicit | baseline | auto-8192 | auto-4096-memory
 };
 
 struct Effective {
@@ -227,22 +229,43 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
     else if (r.decode_xch) e.decode_xch = {*r.decode_xch, "explicit"};
     else e.decode_xch = {e.baseline ? "comm" : "xfer", src_b};
     e.xch = r.xch;
-    // prefill chunk rows: 4096 (measured with pipeline 2 + async: 8K 30.5-30.8 s vs 32.1-32.2 at 2048 and 35.1 at 1024,
-    // 32K 128.6 vs 136.7 s; logits bitwise in every arm); baseline 1024
-    if (r.max_rows) e.max_rows = {std::to_string(*r.max_rows), "explicit"};
-    else e.max_rows = {e.baseline ? "1024" : "4096", src_b};
     const bool g3_only = r.g3 && !r.decode_or_batch && r.idcheck == 0;
     const bool smoke_head = env_is(env, "STRIX_GLM_SMOKE_HEAD", "1");
     e.prefill = e.prefill_requested.value != "auto"
                     ? e.prefill_requested.value
                     : resolve_prefill_auto(e.mtp.value == "1", r.spec, g3_only, smoke_head, r.mem_plan,
                                            e.identity.value == "r1b-all", r.idcheck, r.reference_gate, enabled);
+    // Reference prefill does not use chunk rows. Otherwise startup admits the host-independent
+    // 8192 candidate only when both ranks have enough usable memory.
+    if (r.max_rows) e.max_rows = {std::to_string(*r.max_rows), "explicit"};
+    else if (e.baseline) e.max_rows = {"1024", "baseline"};
+    else if (env_is(env, "STRIX_GLM_MAX_ROWS_AUTO", "0")) e.max_rows = {"4096", "explicit"};
+    else if (r.xch == "xfer") e.max_rows = {"4096", "auto-4096-xfer"};
+    else if (e.prefill == "ref") e.max_rows = {"4096", "auto-4096-ref"};
+    else e.max_rows = {"8192", "auto-8192"};
     for (const auto& it : env_items()) {
         if (const char* v = env(it.env)) e.env[it.env] = {v, "explicit"};
         else if (e.baseline && it.in_baseline) e.env[it.env] = {it.off, "baseline"};
         else e.env[it.env] = {it.on, "default"};
     }
     return e;
+}
+
+inline constexpr unsigned kAutoMaxRows = 8192, kFallbackMaxRows = 4096;
+inline constexpr std::uint64_t kMaxRowsSafetyBytes = std::uint64_t{8} << 30;
+inline bool max_rows_auto(const Effective& e) {
+    return e.max_rows.source == "auto-8192" || e.max_rows.source == "auto-4096-memory";
+}
+
+// The predicate dry-runs the load and prefill admissions, including their current margins.
+template<class Fits>
+inline void select_max_rows(Effective& e, Fits&& fits) {
+    if (!max_rows_auto(e) || e.max_rows.value == "4096") return;
+    e.max_rows = fits() ? Value{"8192", "auto-8192"} : Value{"4096", "auto-4096-memory"};
+}
+
+inline void agree_max_rows(Effective& e, unsigned rank_min) {
+    if (max_rows_auto(e) && rank_min < kAutoMaxRows) e.max_rows = {"4096", "auto-4096-memory"};
 }
 
 // Process environment for the resolved items (setenv if unset: an explicit value always wins). Default: the app-set
@@ -269,6 +292,7 @@ inline std::string print(const Effective& e) {
     s += "effective prefill=" + e.prefill + " (requested " + e.prefill_requested.value + ", " + e.prefill_requested.source + ")\n";
     line("decode-xch", e.decode_xch);
     line("max-rows", e.max_rows);
+    if (max_rows_auto(e)) s += "effective max-rows-admission=startup-admission-and-rank-min (8192 candidate, 4096 fallback)\n";
     s += "effective xch=" + e.xch + "\n";
     for (const auto& it : env_items()) {
         const Value& v = e.env.at(it.env);

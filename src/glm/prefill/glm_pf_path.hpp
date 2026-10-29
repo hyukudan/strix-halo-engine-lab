@@ -35,9 +35,11 @@ enum class TierB { wmma, gemv };
 //         Includes two H-wide final hidden buffers and, when mtp, nine H-wide MTP scratch equivalents.
 //         pf_mem_budget mirrors must include (2 + (mtp ? 9 : 0)) * RC * H * 4 bytes: 352 MiB at RC=2048 with MTP.
 //         Decode-only logits/argmax and other fixed-size scratch are outside this row-scaled subtotal.
+inline constexpr unsigned kPrefillAllocationBound = 64;
 struct PrefillBudget {
     std::uint64_t path = 0, workspace = 0, engine_rows = 0;
 };
+std::uint64_t admission_margin_bytes();
 PrefillBudget prefill_budget(unsigned kda_heads, unsigned mla_heads, std::uint64_t capacity, unsigned max_rows, bool mtp = true);
 
 // heads: rank KDA / MLA heads; capacity: DSA positions per slot; max_rows: largest chunk.

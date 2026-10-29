@@ -4,12 +4,19 @@
 //   measured decode configuration: decode 64 + R8 batch, qualification passed
 //   measured prefill configuration: hp host path, exact TTFT 1K/8K
 #include "glm_rank_defaults.hpp"
+#include "glm_rank_startup.hpp"
+#include "glm/spec/glm_spec_merge.hpp"
+#include "glm/engine/glm_mem.hpp"
 
 #include <cstdio>
+#include <barrier>
+#include <cstring>
+#include <thread>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -96,15 +103,15 @@ void test_plain_equals_receipt() {
     if (!why.empty()) std::fprintf(stderr, "  ttft receipt diff: %s\n", why.c_str());
     // the old code's default (--mtp 1) sent the plain decode command to the row-by-row reference prefill
     CHECK(resolve(cat(cat(kDeploy, kDecodeWork), {"--mtp", "1", "--mtp-spec", "0"}), {}).prefill == "ref");
-    // prefill chunk rows: default 4096; baseline 1024 (the old app default); explicit wins
-    CHECK(plain.max_rows.value == "4096" && plain.max_rows.source == "default");
+    // Host-independent candidate; startup memory admission and the rank minimum may reduce it.
+    CHECK(plain.max_rows.value == "8192" && plain.max_rows.source == "auto-8192");
     CHECK(resolve(cat(kDeploy, kTtftWork), {}).max_rows.source == "explicit");
     CHECK(resolve(cat(cat(kDeploy, kDecodeWork), {"--max-rows", "1024"}), {}).max_rows.value == "1024");
     CHECK(resolve(cat(cat(kDeploy, kDecodeWork), {"--baseline"}), {}).max_rows.value == "1024");
 }
 
 void test_apply_env_default() {
-    CHECK(rd::env_items().size() == 21);
+    CHECK(rd::env_items().size() == 22);
     CHECK(resolve(cat(kDeploy, kDecodeWork), {}).env.at("STRIX_GLM_SPEC_XCH").value == "xfer");
     CHECK(resolve({"--baseline"}, {}).env.at("STRIX_GLM_SPEC_XCH").value == "comm");
     CHECK(resolve({}, {{"STRIX_GLM_SPEC_XCH", "comm"}}).env.at("STRIX_GLM_SPEC_XCH").source == "explicit");
@@ -333,6 +340,300 @@ void test_scan_and_print() {
     CHECK(s.find("effective env STRIX_DIST_CRC_PARALLEL=1 (default, item hp-crc-parallel)\n") != std::string::npos);
 }
 
+void test_max_rows_memory() {
+    namespace mem = strix::glm::engine::mem;
+    constexpr auto gib = mem::kGiB;
+    const std::vector<mem::Term> terms = {{"physical plan", 80 * gib, 0}, {"first-forward reserve", gib, 0},
+        {"pinned staging", gib, 0}, {"whole-tensor reads", 0, gib}, {"bounce", 0, gib},
+        {"prefill path", 12 * gib, 0}, {"workspace and install", gib, 0}};
+    mem::Snapshot snapshot;
+    snapshot.meminfo_ok = snapshot.cma_free_ok = snapshot.zoneinfo_ok = snapshot.gpu = true;
+    snapshot.cma_free = snapshot.cma_total = 13 * gib;
+    snapshot.mem_available = 118 * gib;  // 105 GiB headroom = 97 GiB terms + 8 GiB margin
+    snapshot.gtt_total = 200 * gib;
+    mem::Margins margins;
+    auto choose = [&](const Args& args, const Env& env, const mem::Snapshot& snap) {
+        auto e = resolve(args, env);
+        rd::select_max_rows(e, [&] { return mem::fits(terms, snap, margins); });
+        return e;
+    };
+    const auto fits = choose({}, {}, snapshot);
+    CHECK(fits.max_rows.value == "8192" && fits.max_rows.source == "auto-8192");
+    mem::admit("candidate", terms, snapshot, margins);
+    auto small_snapshot = snapshot;
+    --small_snapshot.mem_available;
+    const auto small = choose({}, {}, small_snapshot);
+    CHECK(small.max_rows.value == "4096" && small.max_rows.source == "auto-4096-memory");
+    // The old MemAvailable - CmaFree selector would accept these; the load admission refuses.
+    for (unsigned failure = 0; failure < 5; ++failure) {
+        auto snap = snapshot;
+        auto costs = terms;
+        if (failure == 0) { snap.cma_total += gib; snap.file_lru = gib; }  // file pages in CMA
+        if (failure == 1) { snap.gtt_total = 96 * gib; }                  // GTT margin
+        if (failure == 2) { costs[1].gtt += 1; }                        // forward reserve
+        if (failure == 3) { costs[2].gtt += 1; }                        // staging
+        if (failure == 4) { costs[4].host += 1; }                       // bounce
+        auto e = resolve({}, {});
+        rd::select_max_rows(e, [&] { return mem::fits(costs, snap, margins); });
+        CHECK(e.max_rows.value == "4096");
+        bool refused = false;
+        try { mem::admit("candidate", costs, snap, margins); } catch (const mem::BudgetError&) { refused = true; }
+        CHECK(refused);
+        costs[0].gtt -= 8 * gib;  // the smaller row plan is admitted instead of failing startup
+        CHECK(mem::fits(costs, snap, margins));
+        mem::admit("fallback", costs, snap, margins);
+    }
+    CHECK(!mem::fits(terms, snapshot, margins, 102 * gib));  // later device-free guard
+    auto missing = snapshot;
+    missing.meminfo_ok = false;
+    CHECK(choose({}, {}, missing).max_rows.value == "4096");
+    missing = snapshot;
+    missing.cma_free_ok = missing.zoneinfo_ok = false;
+    CHECK(choose({}, {}, missing).max_rows.value == "4096");
+    CHECK(!mem::fits({{"overflow", std::numeric_limits<std::uint64_t>::max(), 1}}, snapshot, margins));
+    for (const auto& snap : {snapshot, small_snapshot, missing}) {
+        CHECK(choose({"--max-rows", "1234"}, {}, snap).max_rows.value == "1234");
+        CHECK(choose({"--baseline"}, {}, snap).max_rows.value == "1024");
+        CHECK(choose({}, {{"STRIX_GLM_MAX_ROWS_AUTO", "0"}}, snap).max_rows.value == "4096");
+    }
+    const auto printed = rd::print(resolve({}, {}));
+    CHECK(printed.find("effective max-rows=8192 (auto-8192)\n") != std::string::npos);
+    CHECK(printed.find("startup-admission-and-rank-min") != std::string::npos);
+    CHECK(printed.find("MemAvailable") == std::string::npos && printed.find("CmaFree") == std::string::npos);
+}
+
+void test_startup_agreement() {
+    namespace spec = strix::glm::spec;
+    using Fields = std::array<std::uint32_t, 8>;
+    const Fields common = {1, 123, 4096, 64, 8192, 0, 1, 2166136261U};
+    struct Frame { std::vector<unsigned char> bytes; unsigned kind; };
+    auto frame = [](const spec::MergeRow* rows, unsigned n, const spec::MergeCtl& ctl) {
+        Frame out{{}, ctl.kind};
+        out.bytes.resize(sizeof(ctl) + n * sizeof(*rows));
+        std::memcpy(out.bytes.data(), &ctl, sizeof(ctl));
+        std::memcpy(out.bytes.data() + sizeof(ctl), rows, n * sizeof(*rows));
+        return out;
+    };
+    // Fake Comm: real rank-order merge, two synchronous peers, captures every payload in sequence.
+    auto pair = [&](const Fields& a, const Fields& b, bool auto0, bool auto1, bool expect_refusal, unsigned late0 = 0, unsigned late1 = 0) {
+        std::barrier barrier(2);
+        spec::MergeRow payload[2][8];
+        spec::MergeCtl control[2];
+        std::vector<Frame> wire[2];
+        rd::StartupResult result[2]{};
+        std::string error[2];
+        const Fields fields[] = {a, b};
+        const bool automatic[] = {auto0, auto1};
+        const unsigned late[] = {late0, late1};
+        auto rank = [&](unsigned r) {
+            try {
+                auto merge = [&](auto* rows, unsigned n, auto& ctl) {
+                    wire[r].push_back(frame(rows, n, ctl));
+                    std::copy_n(rows, n, payload[r]);
+                    control[r] = ctl;
+                    barrier.arrive_and_wait();
+                    spec::merge_rank_order({rows, n}, ctl, {payload[1-r], n}, control[1-r], r);
+                    barrier.arrive_and_wait();
+                };
+                result[r] = rd::startup_agreement(fields[r], automatic[r], true, merge);
+                if (automatic[r]) result[r].rows = rd::recheck_rows(late[r] ? late[r] : result[r].rows, true, merge);
+            } catch (const std::exception& e) { error[r] = e.what(); }
+        };
+        std::thread peer(rank, 1);
+        rank(0);
+        peer.join();
+        for (unsigned r = 0; r < 2; ++r) {
+            CHECK(wire[r].size() == (auto0 && auto1 && !expect_refusal ? 3U : 2U));  // fixed tags never shift
+            CHECK(!error[r].empty() == expect_refusal);
+            if (expect_refusal) CHECK(error[r].find("configurations or max-rows modes") != std::string::npos);
+        }
+        if (!expect_refusal) {
+            CHECK(result[0].rows == result[1].rows);
+            CHECK(result[0].rows == (auto0 ? std::min({a[2], b[2], late0 ? late0 : a[2], late1 ? late1 : b[2]}) : a[2]));
+            CHECK(result[0].eligible == result[1].eligible);
+        }
+        return wire[0];
+    };
+    for (const auto& e : {resolve({}, {{"STRIX_GLM_MAX_ROWS_AUTO", "0"}}), resolve({"--max-rows", "8192"}, {}),
+                          resolve({"--baseline"}, {}), resolve({"--decode", "64", "--prefill", "ref"}, {}),
+                          resolve({"--decode", "64", "--identity", "r1b-all"}, {}), resolve({"--decode", "64", "--idcheck", "4"}, {})}) {
+        auto fields = common;
+        fields[2] = static_cast<unsigned>(std::stoul(e.max_rows.value));
+        const auto wire = pair(fields, fields, rd::max_rows_auto(e), rd::max_rows_auto(e), false);
+        // Literal encoding of the original eight-field eligibility message and its OR vote.
+        spec::MergeRow legacy[8];
+        for (unsigned i = 0; i < 8; ++i) legacy[i] = {static_cast<float>(fields[i]), fields[i], 0};
+        spec::MergeCtl ctl;
+        ctl.kind = spec::kEligibilityMerge;
+        CHECK(wire[0].bytes == frame(legacy, 8, ctl).bytes);
+        CHECK(wire[0].kind == spec::kEligibilityMerge);
+        spec::MergeRow vote;
+        ctl.kind = spec::kConfigurationMismatchMerge;
+        CHECK(wire[1].bytes == frame(&vote, 1, ctl).bytes);
+        auto different = fields;
+        different[2] = fields[2] == 8192 ? 4096 : 8192;
+        pair(fields, different, false, false, true);
+    }
+    for (unsigned a : {4096U, 8192U}) for (unsigned b : {4096U, 8192U}) {
+        auto left = common, right = common;
+        left[2] = a; right[2] = b;
+        pair(left, right, true, true, false);
+        pair(left, right, true, false, true);
+        pair(left, right, false, true, true);
+    }
+    auto large = common;
+    large[2] = 8192;
+    pair(large, large, true, true, false, 4096, 0);  // later admission refuses on either rank
+    pair(large, large, true, true, false, 0, 4096);
+    auto ineligible = common;
+    ineligible[0] = 0;
+    pair(common, ineligible, false, false, false);
+    // External Xfer, including fixed and baseline modes, never enters this host handshake.
+    for (const auto& extra : {Args{}, Args{"--baseline"}, Args{"--max-rows", "8192"}}) {
+        auto e = resolve(cat({"--xch", "xfer"}, extra), {});
+        unsigned exchanges = 0;
+        rd::select_max_rows(e, [&] { ++exchanges; return true; });
+        const bool enabled = rd::has_startup_handshake(2, "xfer", true, false);
+        rd::startup_agreement(common, rd::max_rows_auto(e), enabled, [&](auto*, unsigned, auto&) { ++exchanges; });
+        CHECK(exchanges == 0);
+        if (extra.empty()) CHECK(e.max_rows.value == "4096" && e.max_rows.source == "auto-4096-xfer");
+    }
+    for (const auto& args : {Args{}, Args{"--baseline"}, Args{"--max-rows", "8192"}}) {
+        const auto e = resolve(cat({"--xch", "xfer"}, args), {{"STRIX_GLM_MAX_ROWS_AUTO", "0"}});
+        CHECK(!rd::max_rows_auto(e));
+        unsigned calls = 0;
+        rd::startup_agreement(common, false, false, [&](auto*, unsigned, auto&) { ++calls; });
+        CHECK(calls == 0);
+    }
+    auto fallen = resolve({}, {});
+    rd::select_max_rows(fallen, [] { return false; });
+    rd::select_max_rows(fallen, [] { return true; });
+    CHECK(fallen.max_rows.value == "4096");  // no promotion during the final admission recheck
+    unsigned exchanges = 0;
+    CHECK(rd::recheck_rows(4096, false, [&](auto*, unsigned, auto&) { ++exchanges; }) == 4096);
+    CHECK(exchanges == 0);
+    CHECK(!rd::has_startup_handshake(2, "comm", false, false));
+    CHECK(!rd::has_startup_handshake(2, "comm", true, true));
+}
+
+void test_no_handshake_fallback() {
+    const std::vector<Args> modes = {
+        {}, {"--pf-ttft", "prompt.u32"}, {"--pf-gate", "prompt.u32"}, {"--pf-null-study", "prompt.u32"},
+        {"--batch", "8"}, {"--g3", "prompt.u32"}, {"--idcheck", "4"},
+        {"--ab", "1"}, {"--aba", "1"}, {"--g3-sweep"}, {"--aba-attn3", "1"}, {"--aba-xch", "1"},
+        {"--g4", "8"}, {"--tf", "prompt.u32"}, {"--spec-oracle", "7"}, {"--spec-run", "7"},
+        {"--state-in", "state.bin"}, {"--state-out", "state.bin"}, {"--mtp-prefill-gate", "prompt.u32"}
+    };
+    for (const auto& mode : modes) for (bool decode : {false, true}) {
+        auto args = cat({"--world", "2"}, mode);
+        if (decode) args = cat(args, {"--decode", "64"});
+        const auto request = rd::scan(args);
+        const bool handshake = rd::has_startup_handshake(request.world, request.xch, request.decode, request.reference_gate);
+        for (unsigned rank : {0U, 1U}) {
+            auto e = resolve(cat(args, {"--rank", std::to_string(rank)}), {});
+            rd::fallback_without_handshake(e, true, handshake);
+            if (handshake) {
+                if (e.prefill == "ref") {
+                    CHECK(e.max_rows.value == "4096" && e.max_rows.source == "auto-4096-ref");
+                    CHECK(!rd::max_rows_auto(e));
+                } else {
+                    CHECK(e.max_rows.value == "8192" && e.max_rows.source == "auto-8192");
+                    CHECK(rd::max_rows_auto(e));
+                }
+                continue;
+            }
+            CHECK(e.max_rows.value == "4096" && e.max_rows.source == "auto-4096-no-handshake");
+            CHECK(!rd::max_rows_auto(e));  // Engine::Options::auto_rows disables admission/recheck rounds
+            CHECK(rd::print(e).find("effective max-rows=4096 (auto-4096-no-handshake)") != std::string::npos);
+            unsigned calls = 0;
+            rd::select_max_rows(e, [&] { ++calls; return true; });
+            rd::agree_max_rows(e, 8192);
+            const auto rows = static_cast<unsigned>(std::stoul(e.max_rows.value));
+            const auto result = rd::startup_agreement({0, 0, rows, 0, 0, 0, 0, 0}, rd::max_rows_auto(e), handshake,
+                [&](auto*, unsigned, auto&) { ++calls; });
+            CHECK(result.rows == 4096);
+            CHECK(rd::recheck_rows(rows, rd::max_rows_auto(e), [&](auto*, unsigned, auto&) { ++calls; }) == 4096);
+            CHECK(calls == 0);  // neither a memory probe nor a configuration exchange
+            CHECK(e.max_rows.source == "auto-4096-no-handshake");
+        }
+    }
+    for (const auto& e : {resolve({}, {{"STRIX_GLM_MAX_ROWS_AUTO", "0"}}), resolve({"--max-rows", "8192"}, {}),
+                          resolve({"--baseline"}, {}), resolve({"--xch", "xfer"}, {})}) {
+        auto kept = e;
+        rd::fallback_without_handshake(kept, true, false);
+        CHECK(rd::print(kept) == rd::print(e));
+    }
+    auto local = resolve({}, {});
+    rd::fallback_without_handshake(local, false, false);  // single rank or load-only: no Comm
+    CHECK(local.max_rows.value == "8192" && rd::max_rows_auto(local));
+}
+
+void test_effective_config_rows() {
+    auto inspect = [](const Args& args, const Env& env = Env{}) {
+        const auto request = rd::scan(cat(args, {"--print-effective-config"}));
+        auto e = rd::resolve(request, getter(env));
+        rd::fallback_without_handshake(e, request, getter(env));
+        return rd::print(e);
+    };
+    for (const auto& args : {Args{"--pf-ttft", "prompt.u32"}, Args{"--pf-ttft", "prompt.u32", "--decode", "64"},
+                             Args{"--batch", "8"}, Args{"--pf-gate", "prompt.u32"}}) {
+        const auto printed = inspect(cat(kDeploy, args));
+        CHECK(printed.find("effective max-rows=4096 (auto-4096-no-handshake)\n") != std::string::npos);
+        CHECK(printed.find("max-rows-admission=") == std::string::npos);
+        CHECK(inspect(cat(cat(kDeploy, args), {"--max-rows", "8192"})).find(
+            "effective max-rows=8192 (explicit)\n") != std::string::npos);
+    }
+    // No Communicator exists in these inspection/execution routes. Use chunked prefill to
+    // distinguish the no-handshake decision from the independent reference-prefill fallback.
+    const Args chunked = {"--pf-ttft", "prompt.u32", "--prefill", "gemv"};
+    for (const auto& printed : {inspect(cat({"--world", "1"}, chunked)),
+                               inspect(cat({"--mem-plan"}, chunked)),
+                               inspect(chunked, {{"STRIX_GLM_LOAD_TEST", "1"}})}) {
+        CHECK(printed.find("effective max-rows=8192 (auto-8192)\n") != std::string::npos);
+        CHECK(printed.find("max-rows-admission=startup-admission-and-rank-min") != std::string::npos);
+    }
+    CHECK(inspect({"--xch", "xfer"}).find("effective max-rows=4096 (auto-4096-xfer)\n") != std::string::npos);
+}
+
+void test_reference_prefill_rows() {
+    rd::ModelFacts facts;
+    facts.mtp_complete = true;
+    const std::vector<std::pair<Args, Env>> routes = {
+        {{"--prefill", "ref"}, {}}, {{}, {{"STRIX_GLM_PREFILL", "ref"}}},
+        {{"--identity", "r1b-all"}, {}}, {{}, {{"STRIX_GLM_IDENTITY", "r1b-all"}}},
+        {{"--idcheck", "4"}, {}}
+    };
+    for (const auto& [extra, env] : routes) for (bool complete : {false, true}) {
+        const auto args = cat({"--decode", "64"}, extra);
+        auto resolve_route = [&](const Args& more, const Env& overrides = Env{}) {
+            return rd::resolve(rd::scan(cat(args, more)), getter(merge(env, overrides)),
+                               complete ? facts : rd::ModelFacts{});
+        };
+        auto e = resolve_route({});
+        CHECK(e.prefill == "ref");
+        CHECK(e.max_rows.value == "4096" && e.max_rows.source == "auto-4096-ref");
+        CHECK(!rd::max_rows_auto(e));
+        rd::fallback_without_handshake(e, true, true);
+        unsigned calls = 0;
+        rd::select_max_rows(e, [&] { ++calls; return true; });
+        rd::agree_max_rows(e, 8192);
+        CHECK(rd::recheck_rows(4096, rd::max_rows_auto(e), [&](auto*, unsigned, auto&) { ++calls; }) == 4096);
+        CHECK(calls == 0);  // no auto admission probe or additional row-count exchange
+        const auto printed = rd::print(e);
+        CHECK(printed.find("effective max-rows=4096 (auto-4096-ref)\n") != std::string::npos);
+        CHECK(printed.find("max-rows-admission=") == std::string::npos);
+        CHECK(resolve_route({"--max-rows", "8192"}).max_rows.source == "explicit");
+        CHECK(resolve_route({"--max-rows", "8192"}).max_rows.value == "8192");
+        CHECK(resolve_route({"--baseline"}).max_rows.value == "1024");
+        CHECK(resolve_route({}, {{"STRIX_GLM_MAX_ROWS_AUTO", "0"}}).max_rows.source == "explicit");
+        CHECK(resolve_route({"--xch", "xfer"}).max_rows.source == "auto-4096-xfer");
+    }
+    for (const auto& extra : {Args{}, Args{"--mtp-spec", "0"}}) {
+        const auto e = rd::resolve(rd::scan(cat({"--decode", "64"}, extra)), getter({}), facts);
+        CHECK(e.prefill == "gemv" && e.max_rows.value == "8192" && rd::max_rows_auto(e));
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -342,6 +643,11 @@ int main() {
     test_item_off_switches();
     test_baseline();
     test_scan_and_print();
+    test_max_rows_memory();
+    test_startup_agreement();
+    test_no_handshake_fallback();
+    test_effective_config_rows();
+    test_reference_prefill_rows();
     std::printf("glm rank defaults cpu tests: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

@@ -235,7 +235,7 @@ public:
 class CommExchange final : public Exchange {
 public:
     CommExchange(dist::Communicator& comm, std::uint32_t rank, unsigned max_rows)
-        : comm_(comm), rank_(rank), remote_(dalloc<float>(static_cast<std::size_t>(max_rows) * kHidden)),
+        : comm_(comm), rank_(rank), capacity_(max_rows), remote_(dalloc<float>(static_cast<std::size_t>(max_rows) * kHidden)),
           am_l_(dalloc<std::uint64_t>(max_rows)), am_r_(dalloc<std::uint64_t>(max_rows)),
           merge_l_(dalloc<std::uint8_t>(kMergeBytes)), merge_r_(dalloc<std::uint8_t>(kMergeBytes)) {}
     ~CommExchange() override {
@@ -246,6 +246,18 @@ public:
         (void)hipFree(am_r_);
         (void)hipFree(merge_l_);
         (void)hipFree(merge_r_);
+    }
+    void resize_rows(unsigned rows) {
+        if (rows == capacity_) return;
+        hip_ok(hipDeviceSynchronize(), "exchange resize sync");
+        (void)hipFree(remote_);
+        (void)hipFree(am_l_);
+        (void)hipFree(am_r_);
+        remote_ = nullptr; am_l_ = am_r_ = nullptr;
+        remote_ = dalloc<float>(static_cast<std::size_t>(rows) * kHidden);
+        am_l_ = dalloc<std::uint64_t>(rows);
+        am_r_ = dalloc<std::uint64_t>(rows);
+        capacity_ = rows;
     }
     void reduce(float* p, unsigned rows, hipStream_t s) override {
         dist::Tag tag;
@@ -360,6 +372,7 @@ public:
 private:
     dist::Communicator& comm_;
     std::uint32_t rank_;
+    unsigned capacity_;
     float* remote_;
     static_assert(sizeof(MergeRow) == 12);
     static_assert(sizeof(MergeCtl) == 72);
@@ -549,7 +562,7 @@ struct Engine::Impl {
         moe = moe_fast ? fast_moe() : std::make_shared<DefaultMoe>(scr);
         xch = opt.world == 1 || load_test ? local_exchange()
               : opt.external_exchange   ? std::shared_ptr<Exchange>(std::make_shared<MissingExchange>())
-                                        : std::shared_ptr<Exchange>(std::make_shared<CommExchange>(*comm, opt.rank, std::max(8U, opt.max_rows)));  // decode / verify calls carry up to 8 rows
+                                        : std::shared_ptr<Exchange>(std::make_shared<CommExchange>(*comm, opt.rank, std::max(8U, opt.exchange_rows ? opt.exchange_rows : opt.max_rows)));  // decode / verify calls carry up to 8 rows
         fallback_xch = xch;
         if (const char* v = std::getenv("STRIX_GLM_DECODE_XCH"); v != nullptr) {
             const std::string kind(v);
@@ -799,9 +812,9 @@ struct Engine::Impl {
         }
     }
 
-    LoadReport load() {
+    LoadReport load(const std::function<unsigned(const mem::LoadAdmission&)>& select_max_rows) {
         try {
-            return load_checked();
+            return load_checked(select_max_rows);
         } catch (const std::exception& e) {  // printed before the unwinding (HIP teardown can stall)
             std::fprintf(stderr, "load: rank %u FAILED: %s\n", opt.rank, e.what());
             if (monitor) monitor->phase("failed");
@@ -809,7 +822,7 @@ struct Engine::Impl {
         }
     }
 
-    LoadReport load_checked() {
+    LoadReport load_checked(const std::function<unsigned(const mem::LoadAdmission&)>& select_max_rows) {
         load_identity = identity;
         const auto t0 = Clock::now();
         start_monitor();
@@ -827,15 +840,56 @@ struct Engine::Impl {
 
         // 1. Plan: the exact list of device allocations, staging and file bytes, before the first byte is allocated.
         margins = mem::Margins::from_env();
-        lib.set_plan(&plan);
-        load_steps(want_head, [&](const std::string& n) { plan.step(n); });
-        alloc();
-        plan.step("buffers");
-        lib.set_plan(nullptr);
-        layers.clear();
+        std::uint64_t prefill_install = 0;
+        auto make_plan = [&]() {
+            plan = {};
+            lib.set_plan(&plan);
+            load_steps(want_head, [&](const std::string& n) { plan.step(n); });
+            alloc();
+            plan.step("buffers");
+            lib.set_plan(nullptr);
+            // Conservative install bound: planned handles are null even for already-prepared linears.
+            prefill_install = 0;
+            std::uint64_t staging = 0;
+            for (const auto& w : layers) {
+                if (!w.moe) continue;
+                prefill_install += moe->warm_bytes(w.moew);
+                for (const Linear* l : {&w.moew.shared.gate, &w.moew.shared.up, &w.moew.shared.down}) {
+                    const auto parts = Lib::raw_trellis_bytes(l->raw) + std::uint64_t{l->raw.input} * 2 + std::uint64_t{l->raw.output} * 2;
+                    prefill_install += mem::round_up(parts + 3 * 256, 2 * mem::kMiB);
+                    staging = std::max(staging, parts);
+                }
+            }
+            prefill_install += staging;
+            layers.clear();
+        };
+        make_plan();
         // 2. Physical cost of the dominant allocation, 3. admission: fail closed before loading anything.
         monitor->phase("calibrate");
         calibrate();
+        auto load_terms = [&]() -> std::vector<mem::Term> {
+            return {{"device plan (physical)", plan.physical(amodel), 0},
+                    {"first-forward reserve (strix workspace, runtime)", fwd_reserve(), 0},
+                    {"pinned staging", mem::round_up(std::max<std::uint64_t>(plan.stage_max, 1), 2 * mem::kMiB), 0},
+                    {"pageable whole-tensor reads", 0, plan.whole_max}, {"O_DIRECT bounce", 0, plan.bounce}};
+        };
+        auto select_rows = [&](bool recheck) {
+            std::size_t dev_free = 0, dev_total = 0;
+            hip_ok(hipMemGetInfo(&dev_free, &dev_total), "row admission mem info");
+            const unsigned rows = select_max_rows({load_terms(), probe.read(), margins, prefill_install, dev_free, recheck, amodel});
+            if (rows == 0 || rows > opt.max_rows) throw std::invalid_argument("load row selector must reduce max_rows within 1..max_rows");
+            if (rows != opt.max_rows) {
+                opt.max_rows = rows;
+                make_plan();
+            }
+            if (auto* cx = dynamic_cast<CommExchange*>(fallback_xch.get())) cx->resize_rows(std::max(8U, rows));
+        };
+        if (select_max_rows) {
+            select_rows(false);
+            // Only negotiated auto peers enter this second round. It sees actual communication allocations,
+            // so an admission refusal at the larger size becomes a shared fallback before the first weight.
+            if (opt.auto_rows) select_rows(true);
+        }
         const std::uint64_t stage = mem::round_up(std::max<std::uint64_t>(plan.stage_max, 1), 2 * mem::kMiB);
         lib.set_stage_bytes(stage);
         const std::uint64_t phys = plan.physical(amodel);
@@ -845,11 +899,7 @@ struct Engine::Impl {
             std::fprintf(stderr, "mem: WARNING admission check disabled (STRIX_GLM_MEM_ADMIT=0); the watchdog stays on\n");
         } else {
             mem::admit("rank " + std::to_string(opt.rank) + " load (" + std::to_string(opt.layers) + " layers)",
-                       {{"device plan (physical)", phys, 0},
-                        {"first-forward reserve (strix workspace, runtime)", fwd_reserve(), 0},
-                        {"pinned staging", stage, 0},
-                        {"pageable whole-tensor reads", 0, plan.whole_max},
-                        {"O_DIRECT bounce", 0, plan.bounce}},
+                       load_terms(),
                        s0, margins);
         }
         if (const char* e = std::getenv("STRIX_GLM_MEM_PLAN_ONLY"); e != nullptr && std::string(e) == "1") {  // --mem-plan
@@ -1740,7 +1790,7 @@ struct Engine::Impl {
 
 Engine::Engine(Options options, dist::Communicator* comm) : impl_(std::make_unique<Impl>(std::move(options), comm)) {}
 Engine::~Engine() = default;
-LoadReport Engine::load() { return impl_->load(); }
+LoadReport Engine::load(const std::function<unsigned(const mem::LoadAdmission&)>& select_max_rows) { return impl_->load(select_max_rows); }
 std::uint32_t Engine::prefill(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
     // Cover every forward issued by either path, including prompt-time MTP work.
     struct PromptIdentityScope {

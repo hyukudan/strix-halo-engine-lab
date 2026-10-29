@@ -429,6 +429,30 @@ EXL3 4.05 bpw, two Strix Halo nodes TP2 over USB4. Production engine. R1b is the
 decode uses exact MTP self-speculation by default (`--mtp 0` = plain decode).
 `--identity r1` restores R1 throughout. The historical R1 measurements below keep their original identity.
 
+Prompt prefill in two-rank decode runs defaults to 8192 rows when both ranks admit the calibrated load
+and all prefill owners; otherwise both use 4096. This applies to production decode with MTP
+self-speculation and plain chunked prefill inside `--decode` runs. Selection uses the load admission's RAM
+and GTT headroom, staging, reserves, whole-tensor reads and bounce buffer, plus prefill and communication
+growth and the device-free guard.
+The largest of the load margin, prefill margin and 8 GiB is retained. Normal two-rank Comm decode reuses
+its existing configuration exchange and mismatch vote for mode agreement and the minimum proposed rows.
+Fixed modes preserve their payload bytes and tag order; mixed auto/fixed modes refuse on both ranks.
+Auto communication pools start at 4096 and grow only after agreement on 8192. A fresh admission
+check after growth uses one auto-only minimum vote and shrinks both pools on a 4096 fallback.
+Two-rank Comm runs without that handshake (prefill-only, reference gates and batch-only) use 4096 in auto
+mode, with source `auto-4096-no-handshake`, without a control exchange. Explicit row counts must match.
+`--pf-ttft` and gate harnesses keep 4096 unless `--max-rows 8192` is given explicitly.
+Fixed row mismatches there cannot be checked at startup without
+changing the existing protocol. External `--xch xfer` auto uses 4096 without an agreement exchange.
+Reference prefill (`--prefill ref`, automatic prefill under `r1b-all` or `--idcheck` with decode) uses
+4096 in auto mode (`auto-4096-ref`) without a row-count agreement exchange.
+The exact prefill route preserves its arithmetic across chunk sizes; measured TTFT on the chunked-prefill
+route at 8192 rows improves 4 % at 8K and 116.3 to 109.9 s (5.5 %) at 32K, using about 7.3 GiB more
+GPU memory per node.
+`STRIX_GLM_MAX_ROWS_AUTO=0` restores fixed 4096; `--baseline` keeps 1024, and explicit `--max-rows` keeps its value.
+`--print-effective-config` reports the host-independent candidate and startup policy; stderr reports
+admission headroom and the final value with its source. See the [catalog](docs/optimizations.md#glm-max-rows-auto).
+
 | Mode | Prompt / context | Measured | Date | Build / exactness |
 |---|---|---:|---|---|
 | Greedy decode, R1 | 31-token chat prompt + 64 generated tokens | **45.29 ms/token = 22.1 tok/s**; **51 %** of calculated 23.2 ms floor | 2026-10-26 | `1836c99c`; tokens equal the reference |
@@ -615,7 +639,7 @@ Full item lists, preconditions, notices and evidence: [optimization catalog](doc
 | MiniMax: nested admission | Short prefill in a separate activation bank, long preserved in place | On; GPU measured | ON vs OFF, run 1 / run 2: mixed second-short TTFT 1.25/2.06 vs 13.2/12.5 s; open costs: burst throughput a few percent below OFF, long TTFT about +20 %; optimization continues on decode MoE cost for diverse rows and long-prompt unit sizing | Both-rank nested 512-token/7-layer child 10/10 and whole 511-token child 6/6 IDENTICAL; gate compares parent/child/background complete IDs, committed state, digests of all normalized prompt rows across every chunk/group member, first-token and every continuation logit against standalone B1 on both ranks, plus parked activations/checkpoints; either rank mismatch fails both | `STRIX_MM_SERVE_NEST=0`; `/admin/sched` `nest=false`; [GPU setup, run spread and identical-prompt caveat](docs/engine/serving/serving.md#measured-deadline-based-and-nested-serving-policy) |
 | GLM: R1b decode | Faster FP32 summation identity | On | 41.93–41.96 vs R1 47.33–47.48 ms/token | Own identity; differs from R1 | `--identity r1` |
 | GLM: MTP self-speculation | Native MTP drafter + verify on the exchange, KDA verify tree 2, chunked MTP-fill prefill, adaptive K | On | Decode 1.50–1.79× (37.1–44.5 tok/s); TTFT +2.9 % at 8K, +8.7 % at 32K | Tokens equal plain decode | `--mtp 0`; [catalog](docs/optimizations.md#glm-mtp-spec) |
-| GLM: exact chunked prefill | R1 gemv identity, MoE/MLA/indexer kernels, two-layer pipeline with async exchange, 4096-row chunks, register-blocked X2 linear core and MoE for large calls | Auto (resolver defaults) | 8K: 26.9 s (305 tok/s); 32K: 113.7 s (288 tok/s) | R1 bitwise | `--prefill ref`; `--baseline`; `STRIX_GLM_PF_EXACT_X=0`; `STRIX_GLM_PF_EXACTMOE_V=3` |
+| GLM: exact chunked prefill | R1 gemv identity, MoE/MLA/indexer kernels, two-layer pipeline with async exchange, 8192-row chunks when both ranks fit (4096 otherwise), register-blocked X2 linear core and MoE for large calls | Auto (resolver defaults) | At 4096 rows: 8K 26.9 s (305 tok/s), 32K 113.7 s (288 tok/s); separate 8192-row comparison: 8K TTFT -4 %, 32K -5.5 % | R1 bitwise | `--prefill ref`; `--baseline`; `STRIX_GLM_MAX_ROWS_AUTO=0`; `STRIX_GLM_PF_EXACT_X=0`; `STRIX_GLM_PF_EXACTMOE_V=3` |
 | Qwen server: thinking budget, logprobs, logit transforms | Opt-in per request on resolved MTP/serial host routes; SSE prefill progress comments | On (opt-in per request; progress on) | Usability (no speed claim) | Logprobs/progress: same tokens; budget/transforms: declared token-changing policies | `--http-selection-mtp off`, `--http-thinking-budget off`, `--http-logprobs off`, `--http-logit-transforms off`, `--http-sse-progress-interval 0`; [catalog](docs/optimizations.md#qwen-serve-thinking-budget) |
 | Qwen server: constrained JSON output | `json_object` / JSON-schema answers valid by construction (greedy, admitted MTP/serial host route) | On (opt-in per request) | Usability (no speed claim) | Exact to its constrained target; other requests unchanged | `--http-selection-mtp off`, `--http-constraints off`; [catalog](docs/optimizations.md#qwen-serve-constraints) |
 | Qwen/DeepSeek server: API surface | Stateless `/v1/responses`, `/v1/capabilities`, applied policy (filters, echoed seed) in every stream, SSE keepalive | On | Usability (no speed claim) | Same token IDs on/off | `--http-responses off` etc.; [catalog](docs/optimizations.md#qwen-serve-api) |

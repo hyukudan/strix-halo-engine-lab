@@ -5,8 +5,6 @@
 #include <array>
 
 namespace strix::glm::spec {
-inline constexpr std::uint32_t kEligibilityMerge = 0x53504543U;
-inline constexpr std::uint32_t kConfigurationMismatchMerge = 0x53504544U;
 enum class BootstrapPolicy { Reference, Chunked };
 struct Seed {
     std::uint32_t y0 = 0, draft = 0;

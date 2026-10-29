@@ -240,6 +240,9 @@ public:
     Communicator(const Communicator&) = delete;
     Communicator& operator=(const Communicator&) = delete;
 
+    // Resize host capacity between collectives; preserves sequence numbers and the route table.
+    void resize_bytes(std::size_t bytes);
+
     // Sends `bytes` of device buffer `local` to the peer and writes the peer's `bytes` into device buffer
     // `remote`. The copy of `local` is ordered after its producer on `stream` and the CPU waits for it
     // before sending; the copy into `remote` is enqueued on `stream` (later work on the stream sees it),

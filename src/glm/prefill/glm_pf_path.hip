@@ -170,7 +170,7 @@ public:
             pe_rows_ = own_.alloc<std::uint32_t>(pe_cap_);
             pe_dst_ = own_.alloc<std::uint32_t>(pe_cap_);
         }
-        if (own_.bytes != device_bytes(Hk_, Hm_, cap_, Rmax_))
+        if (own_.bytes != device_bytes(Hk_, Hm_, cap_, Rmax_) || own_.ptrs.size() > kPrefillAllocationBound)
             throw std::logic_error("glm pf path: allocation tally differs from prefill_budget (update both)");
     }
     // Exact bytes the constructor allocates (checked there against its own tally).
@@ -537,7 +537,8 @@ std::uint64_t mem_available_bytes() {  // /proc/meminfo MemAvailable; refuses wh
         if (key == "MemAvailable:" && unit == "kB") return kb * 1024;
     throw std::runtime_error("glm pf path: cannot read MemAvailable from /proc/meminfo (refusing to allocate unchecked)");
 }
-std::uint64_t margin_bytes() {  // STRIX_GLM_PF_MARGIN_GIB: finite, 0 .. 1024 GiB; default 8
+}  // namespace
+std::uint64_t admission_margin_bytes() {  // STRIX_GLM_PF_MARGIN_GIB: finite, 0 .. 1024 GiB; default 8
     const char* m = std::getenv("STRIX_GLM_PF_MARGIN_GIB");
     if (m == nullptr) return std::uint64_t{8} << 30;
     char* end = nullptr;
@@ -546,13 +547,12 @@ std::uint64_t margin_bytes() {  // STRIX_GLM_PF_MARGIN_GIB: finite, 0 .. 1024 Gi
         throw std::invalid_argument("STRIX_GLM_PF_MARGIN_GIB must be a number of GiB in [0, 1024]");
     return static_cast<std::uint64_t>(g * static_cast<double>(std::uint64_t{1} << 30));
 }
-}  // namespace
 
 std::shared_ptr<engine::PrefillPath> make_prefill_path(unsigned kda_heads, unsigned mla_heads, std::uint64_t capacity, unsigned max_rows,
                                                        TierB tierb) {
     const PrefillBudget b = prefill_budget(kda_heads, mla_heads, capacity, max_rows);  // validates the geometry
     const std::uint64_t need = b.path + (tierb == TierB::wmma ? b.workspace : 0);
-    const std::uint64_t margin = margin_bytes();
+    const std::uint64_t margin = admission_margin_bytes();
     std::size_t dev_free = 0, dev_total = 0;
     ok(hipMemGetInfo(&dev_free, &dev_total), "mem info");
     const std::uint64_t host_avail = mem_available_bytes();
