@@ -16,7 +16,7 @@ baseline_exe = os.environ.get("STRIX_DS41_CONFIG_BASELINE_EXE")
 baseline_comparisons = 0
 env = os.environ.copy()
 env["CUDA_VISIBLE_DEVICES"] = "-1"
-for key in ('STRIX_DS41_RTX_BASELINE', 'DG_LOAD_SERIAL', 'STRIX_SESSION_CACHE', 'STRIX_SESSION_DISK'):
+for key in ('STRIX_DS41_RTX_BASELINE', 'DG_LOAD_SERIAL', 'STRIX_SESSION_CACHE', 'STRIX_SESSION_DISK', 'STRIX_DS41_CE_PACING', 'STRIX_DS41_WB_STREAM'):
     env.pop(key, None)
 
 
@@ -87,6 +87,16 @@ with tempfile.TemporaryDirectory(prefix='ds41-config-', dir=Path.cwd()) as tmp:
     assert call(extra={'STRIX_DS41_RTX_BASELINE': '1'})['ce_pacing'] is False
     assert call(['--ce-pacing', '--baseline'])['ce_pacing'] is False
     assert call(['--baseline', '--ce-pacing'])['ce_pacing'] is True
+    assert default['wb_stream'] is True
+    assert diff(default, call(['--no-wb-stream'])) == {'wb_stream'}
+    assert call(extra={'STRIX_DS41_WB_STREAM': '0'})['wb_stream'] is False
+    assert call(extra={'STRIX_DS41_WB_STREAM': '1'})['wb_stream'] is True
+    assert call(['--wb-stream'], extra={'STRIX_DS41_WB_STREAM': '0'})['wb_stream'] is True
+    assert call(['--no-wb-stream'], extra={'STRIX_DS41_WB_STREAM': '1'})['wb_stream'] is False
+    assert call(extra={'STRIX_DS41_RTX_BASELINE': '1'})['wb_stream'] is False
+    assert call(['--wb-stream', '--baseline'])['wb_stream'] is False
+    assert call(['--baseline', '--wb-stream'])['wb_stream'] is True
+    assert diff(call(['--no-ce-pacing']), call(['--no-ce-pacing', '--no-wb-stream'])) == {'wb_stream'}
     assert diff(default, call(['--census'])) == {'census'}
     for policy, hook in [('scored', 'ts_dg_set_policy'), ('auto', 'ts_dg_end_rows')]:
         probe = subprocess.run([exe, 'MODEL', '--print-config', '--evict', policy], env=env, capture_output=True, text=True)
@@ -104,7 +114,7 @@ with tempfile.TemporaryDirectory(prefix='ds41-config-', dir=Path.cwd()) as tmp:
                     q8_r1=False, q8_r1_pad=False, draft_keep=0, draft_keep_ids=[], controller_prior='none',
                     controller_costs='none', wb_defer=False, controller_scope='run', host_spares=96,
                     arena_gib=71.5, draft_vocab='full', warmup_graphs='none', residency_seed='none',
-                    residency_save='none', engram_cache_mb=0, load_serial=True, attn_warps=0, max_rows=1, pressure_spares=4, lean_state=False, arena_auto=False, evict='lru', ce_pacing=False)
+                    residency_save='none', engram_cache_mb=0, load_serial=True, attn_warps=0, max_rows=1, pressure_spares=4, lean_state=False, arena_auto=False, evict='lru', ce_pacing=False, wb_stream=False)
     for key, value in expected.items():
         assert old[key] == value, (key, old[key], value)
     for key in ('decode_fuse_hc', 'decode_fuse_shared', 'decode_router_v2', 'decode_ob_one',

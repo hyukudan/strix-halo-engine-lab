@@ -995,6 +995,17 @@
   },
   {
     "engine": "deepseek-rtx",
+    "name": "Write-back stream",
+    "flag_or_env": "--wb-stream / --no-wb-stream, STRIX_DS41_WB_STREAM=0|1",
+    "default": "ON",
+    "exact": "Transport only (same copies, order and destinations): chat token vectors identical across 4 alternating loads.",
+    "gain": "DSpark per commit: plain -2.0 %, controller -6.4 %; copy bench duplex 43.3 to 44.8 GB/s.",
+    "preconditions": "Standalone RTX replica with a tierstream that has dg_wb_stream; load-time option.",
+    "off_switch": "--no-wb-stream (or STRIX_DS41_WB_STREAM=0; --baseline turns it off)",
+    "doc_anchor": "docs/optimizations.md#rtx-wb-stream"
+  },
+  {
+    "engine": "deepseek-rtx",
     "name": "Prefill pinned host expert tier (opt-in)",
     "flag_or_env": "--host-gib-auto G; --overlay OVERLAY.gguf; --host-pin-order layer|deadline|early",
     "default": "off (file-only streaming)",

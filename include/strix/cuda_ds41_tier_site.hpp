@@ -66,6 +66,10 @@ struct TierSiteOptions {
     std::vector<std::uint8_t> prior;       // tierstream/hint-prior-v1 bytes for window prefetch (empty = none)
     bool wb_defer = false;                 // tierstream dg_wb_defer (deferred write-back scheduling)
     bool ce_pacing = false;                // one-expert background CE debt (the replica turns it on by default)
+    // tierstream dg_wb_stream: deferred write-backs on the library's own D2H stream behind the layer's ready (true; the
+    // replica's default) or on the demand stream (false: queued ahead of the next layer's demand copies). Transport
+    // only: the same parts, bytes, destinations, pacing and completion events.
+    bool wb_stream = false;
 };
 
 class TierSite {

@@ -1463,6 +1463,20 @@ After a DSpark verify window, evict experts by the tierstream's learned score; a
 - **Measured gain:** DSpark misses/token 10.55 -> 9.08 (-14 %), median +6.4 % tok/s (7 chats); plain decode neutral
 - **Implementation / evidence:** [Standalone defaults and gates](models/deepseek-v4.1/rtx-standalone.md#optimizations-default-on-and-off-switches)
 
+<a id="rtx-wb-stream"></a>
+
+### Write-back stream
+
+**Engine:** `deepseek-rtx`. **Control:** `--wb-stream` / `--no-wb-stream`, `STRIX_DS41_WB_STREAM=0|1`. **Default:** ON.
+
+Deferred expert write-backs go out on tierstream's dedicated D2H stream (`dg_wb_stream`) instead of the demand stream, so they overlap the next layer's demand H2D copies. Same copies, same order, same destinations.
+
+- **Preconditions:** Standalone RTX replica with a tierstream that has `dg_wb_stream`; load-time option.
+- **Exactness evidence:** Transport only: chat token vectors identical across 4 alternating loads (off/on/on/off).
+- **Off switch:** `--no-wb-stream` (or `STRIX_DS41_WB_STREAM=0`; `--baseline` turns it off)
+- **Measured gain:** DSpark per commit: plain 14.37 to 14.07 ms (-2.0 %), controller 12.24 to 11.45 ms (-6.4 %); copy bench duplex 43.3 to 44.8 GB/s.
+- **Implementation / evidence:** [Standalone defaults and gates](models/deepseek-v4.1/rtx-standalone.md#optimizations-default-on-and-off-switches)
+
 <a id="rtx-ce-pacing"></a>
 
 ### Copy-engine write-back pacing

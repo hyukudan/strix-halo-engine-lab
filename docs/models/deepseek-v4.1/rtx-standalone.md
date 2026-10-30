@@ -131,6 +131,7 @@ this defaults change is checked on CPU and does not establish new GPU results.
 | Arena sizing | Size the expert arena from free VRAM minus a headroom | Off (fixed arena by drafter) | More expert slots when VRAM is free | Same outputs | opt-in `--arena-gib auto [--arena-headroom-gib G]` |
 | Eviction | Public tierstream scored victims after verify windows; plain steps keep LRU | Auto | DSpark misses/token −14 %, median +6.4 % tok/s (7 chats); plain decode neutral | Bitwise (only residency changes) | `--evict lru` |
 | CE pacing | Cap background write-back debt on the single copy engine at about one expert (demand and speculation stay first) | ON | 4 alternating loads: DSpark +2.7 % / plain -0.5 % / wall -1.1 % adjacent, neutral bracketed | Bitwise (only copy timing changes) | `--no-ce-pacing` / `STRIX_DS41_CE_PACING=0` |
+| Write-back stream | Deferred write-backs go out on their own D2H stream (tierstream `dg_wb_stream`) so they overlap the next layer's demand H2D | ON | 4 alternating loads: DSpark plain -2.0 %, controller -6.4 % per commit; copy bench duplex 43.3 to 44.8 GB/s | Bitwise (same copies, order and destinations; only the stream changes) | `--no-wb-stream` / `STRIX_DS41_WB_STREAM=0` |
 
 `--baseline` restores all reference forms at that argument; later explicit
 flags override their own settings. `STRIX_DS41_RTX_BASELINE=1` applies the
