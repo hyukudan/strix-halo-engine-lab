@@ -1,5 +1,6 @@
 #include "http_slot_capacity.hpp"
 #include "qwen_prefill_plan.hpp"
+#include "qwen_http_memory.hpp"
 #include "strix/preflight.hpp"
 #include "deferred_moe_receipt.hpp"
 #include "strix/lane_chain_hyper_output.hpp"
@@ -1273,6 +1274,55 @@ int STRIX_DECODE_ENTRY(
     prompt_memory.estimate = [&](const strix::decode_cli::Options& candidate) {
         return strix::decode_cli::compile_prompt_requirements(candidate, model, manifest, mapped.bytes());
     };
+    // Hash/map the sidecar and calibration once, before any HIP allocation.
+    // Keep witnesses alive and revalidate at every candidate and runtime check.
+    std::optional<strix::MappedModelFile> serving_sidecar, serving_golden;
+    std::optional<strix::HipModelResidencyReservation> serving_sidecar_reservation;
+    prompt_memory.serving = [&](const strix::decode_cli::Options& candidate) {
+        using namespace strix;
+        using namespace strix::decode_cli;
+        if (!candidate.mtp.enabled) return HttpServingMemory{};
+        const auto& m=candidate.mtp;
+        if (!serving_sidecar || !serving_golden || !serving_sidecar_reservation) {
+            serving_sidecar.emplace(MappedModelFile::open_read_only(m.sidecar,m.sidecar_logical_name,generations));
+            serving_golden.emplace(MappedModelFile::open_read_only(m.golden,"calibration",generations));
+            verify_mtp_serving_assets(m,serving_sidecar->file_sha256(),serving_sidecar->bytes(),
+                serving_golden->file_sha256(),serving_golden->bytes());
+            MtpSidecarAssetEvidence evidence;
+            evidence.repository=m.repository; evidence.revision=m.revision; evidence.relative_path=m.source_path;
+            evidence.declared_file_sha256=mtp_cli_digest(m.sidecar_sha256); evidence.declared_file_bytes=m.sidecar_bytes;
+            evidence.verified_file_sha256=serving_sidecar->file_sha256();
+            evidence.verified_model_content_identity=serving_sidecar->content_identity();
+            evidence.conversion=MtpSidecarConversionProfile::effective_norm_gain_embedding_first_packed_v1;
+            evidence.converter_reference_sha256=mtp_cli_digest(m.converter_sha256);
+            evidence.norm_converter_reference_sha256=mtp_cli_digest(m.norm_converter_sha256);
+            evidence.converter_reference_revision=m.converter_revision;
+            const auto sidecar_manifest=build_mtp_sidecar_manifest(model,gguf::read_file(m.sidecar),evidence);
+            HipModelResidencyPolicy policy;
+            policy.mode=m.sidecar_residency=="copy"?HipModelResidencyMode::resident_copy:HipModelResidencyMode::registered_file_mapping;
+            policy.reservation_limits={m.sidecar_retained_bytes,m.sidecar_setup_bytes};
+            if (hip_model_copy_all_mode() && policy.mode==HipModelResidencyMode::registered_file_mapping) {
+                policy.copy_tier=HipModelCopyTier::all;
+                policy.copy_payload_bytes=selective_copy_payload_bytes(sidecar_manifest,HipModelCopyTier::all);
+            }
+            serving_sidecar_reservation=plan_hip_model_residency_reservation(*serving_sidecar,sidecar_manifest,policy);
+        }
+        serving_sidecar->validate_unchanged(); serving_golden->validate_unchanged();
+        if (!serving_sidecar_reservation) throw std::invalid_argument("one-slot:asset verification unavailable");
+        const auto golden=read_mtp_forward_golden_file(m.golden,mtp_cli_digest(m.golden_sha256),m.golden_max_bytes);
+        if (golden.rows.size()!=mtp_calibration_rows(candidate))
+            throw std::invalid_argument("one-slot:calibration row geometry differs");
+        const auto requests=prompt_compiler_requests(candidate,model,manifest);
+        kernels::KernelRegistry registry;
+        register_complete_hip_kernel_catalog(model,requests.binding,requests.catalog,registry);
+        const auto serial=compile_serial_execution(model,registry,requests.binding,requests.buffers,256);
+        const auto index=build_model_tensor_index(manifest);
+        const auto access=compile_execution_tensor_access_plan(serial.execution,manifest,index,
+            build_serial_execution_tensor_requirements(serial.execution));
+        const auto& reservation=*serving_sidecar_reservation;
+        return http_mtp_memory(candidate,model,serial,manifest,access,reservation.setup_peak_reserved_bytes,
+            prefill_checked_add(reservation.registered_alias_bytes,reservation.copied_reserved_bytes),serving_golden->bytes());
+    };
     if (yarn) prompt_memory.verify_ple_credit = [&](const strix::decode_cli::Options& candidate) -> std::uint64_t {
         const auto environment = strix::decode_cli::requested_prefill_environment();
         auto config = strix::decode_cli::prefill_reclaim_config(candidate,model,manifest,environment,prompt_memory.ple_reclaim_page);
@@ -1359,12 +1409,14 @@ int STRIX_DECODE_ENTRY(
     }
 
     model.attention_kv_storage = options.attention_kv_storage;
-    std::cerr << strix::decode_cli::effective_config_notice(effective);
+    std::cerr << effective.serve_prefill_notice << strix::decode_cli::effective_config_notice(effective);
+    if (options.http_serve || !options.print_effective_config)
+        strix::decode_cli::validate_effective_startup(effective);
+    strix::decode_cli::validate_http_serving_memory(options,prompt_memory);
     if (options.print_effective_config) {
         std::cout << strix::decode_cli::effective_config_json(effective);
         return 0;
     }
-    strix::decode_cli::require_effective_prefill_execution(effective);
     yarn_preflight_reclaimer.reset(); // runtime owns a fresh verified drop after registration
     strix::qpf2k::undo_pre_injected([](const char* name) { ::unsetenv(name); });
     strix::qpf2k::baseline = options.baseline;
@@ -2917,6 +2969,8 @@ int STRIX_DECODE_ENTRY(
             auto growth = add(known_prefill_plan->arena.physical.total_bytes, add(8U, union_bytes));
             growth = add(growth, add(known_prefill_plan->host_metadata_payload_bytes, map_bytes)); // native owner's second copy
             growth = add(growth, known_prefill_plan->qsa_score_ring_workspace_bytes);
+            if (options.http_serve && options.rotary.mode() == strix::RotaryMode::native)
+                growth = add(growth, strix::decode_cli::qwen_prefill_external_memory(options,model).host);
             growth = add(growth, options.known_prefill_host_headroom); // explicit allocator/driver/fixed-plan allowance
             for (const auto& tail : known_tail_plans) { // arena, completion record and metadata copy of each tail owner
                 growth = add(growth, add(tail->arena.physical.total_bytes, add(8U, union_bytes)));
@@ -3380,15 +3434,11 @@ int STRIX_DECODE_ENTRY(
         std::shared_ptr<const SharedWindowStream> batch_stream;
         std::vector<std::unique_ptr<CohortStack>> batch_stacks;
         std::function<bool()> batch_memory_ok;
-        if (strix::decode_cli::ordinary_http_batch_slots(options)) {
+        if (options.http_serve && tiled_route) {
             using namespace strix::decode_cli;
             const auto add = [](std::uint64_t a, std::uint64_t b) {
                 if (b > UINT64_MAX - a) throw std::overflow_error("HTTP slot cost overflow");
                 return a + b;
-            };
-            const auto mul = [](std::uint64_t a, std::uint64_t b) {
-                if (b && a > UINT64_MAX / b) throw std::overflow_error("HTTP slot cost overflow");
-                return a * b;
             };
             const auto observe = [] {
                 PrefillCapabilities capabilities;
@@ -3398,66 +3448,28 @@ int STRIX_DECODE_ENTRY(
                 if (!observation.gtt_limit || !observation.gtt_used || *observation.gtt_used > *observation.gtt_limit) return {};
                 return *observation.gtt_limit - *observation.gtt_used;
             };
-            // These native owners are created later by the bridge, not by make_stack.
-            // Keep their declared budgets in the future commitment instead of treating
-            // an idle stack's observed delta as the complete runnable-slot cost.
-            // Window owners: what window_factory_for builds per slot (each row size's physical arena, D1 record and union
-            // scratch, four capture pools per owner at the capture budget), not the --mtp-window-total-bytes ceiling.
-            std::uint64_t windows = 0;
-            {
-                const auto row_set = options.mtp.window_rows_set.empty()
-                    ? std::vector<std::uint32_t>{options.mtp.window_rows} : options.mtp.window_rows_set;
-                for (const auto window_rows : row_set) {
-                    const auto plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
-                        {true, true, true, window_rows, options.mtp.window_expert_union, strix::KnownWindowOutputPolicy::all_rows,
-                         options.mtp.window_hyper_mix, options.mtp.window_qsa_rows, options.mtp.window_prefix, options.mtp.window_prefix,
-                         options.mtp.window_prefix, options.mtp.window_prefix || options.known_window_router_rows,
-                         options.mtp.window_prefix || options.known_window_router_rows});
-                    windows = add(windows, add(plan.arena.physical.total_bytes, 8U));
-                    if (options.mtp.window_expert_union)
-                        windows = add(windows, strix::q51_known_rows::required_scratch_bytes(window_rows,
-                            static_cast<std::uint32_t>(model.num_experts), static_cast<std::uint32_t>(model.num_experts_per_token)));
-                    windows = add(windows, mul(4U, options.mtp.window_capture_bytes));
-                }
-                windows = add(windows, UINT64_C(256) << 20U); // deferred GDN banks, PLE window auxiliaries, greedy rows
-                windows = std::min(windows, options.mtp.window_total_bytes);
-            }
-            auto active = add(options.mtp.runtime_bytes, windows);
-            active = add(active, options.mtp.target_capture_bytes);
-            const auto width = mul(mul(model.hidden_size, model.hc_count), 2U);
-            const char* pipe = std::getenv("STRIX_PREFILL_PIPE");
-            const auto pipe_copies = pipe && (std::strtoul(pipe, nullptr, 0) & 1U) ? 2U : 1U;
-            active = add(active, mul(mul(options.known_prefix_prefill_rows, width), pipe_copies));
-            active = add(active, width); // held row
-            // Full-vocabulary bound also covers subset heads, pinned IDs, seen rows,
-            // sixteen runner-up rows, and the fast chain's workspace/injection copies.
-            const bool subset = !options.mtp.draft_vocab.empty() || options.mtp.draft_context_vocab;
-            const auto row = subset ? mul(model.hidden_size / 32U, options.mtp.draft_q4 ? 18U : 34U) : 0U;
-            active = add(active, mul(model.vocab_size, add(row, 4U + 4U + 4U + 1U + 16U * 4U)));
-            active = add(active, add(mul((model.vocab_size + 255U) / 256U, 32U), 4096U));
-            active = add(active, 4U * (11U * 640U + 1U) + 2U * 4U * 10240U * 4U);
+            const auto serving = prompt_memory.serving(options);
+            // Future commitments exclude the already resident primary stack and tiled arenas.
             auto estimate = add(add(state_layout.device_total_bytes, state_layout.host_total_bytes), compiled.arena.total_bytes);
             estimate = add(estimate, known_prefill_plan->host_metadata_payload_bytes);
             for (const auto& tail : known_tail_plans) estimate = add(estimate, tail->host_metadata_payload_bytes);
-            auto headroom = options.known_prefill_headroom_explicit ? options.known_prefill_host_headroom : UINT64_C(4) << 30U;
+            // Per-slot owner buffers are independent even though arenas are shared.
+            const auto external=qwen_prefill_external_memory(options,model);
+            estimate=add(estimate,std::max(external.host,external.device));
+            const auto fixed_headroom = options.known_prefill_headroom_explicit ? options.known_prefill_host_headroom : UINT64_C(4) << 30U;
             // Shared bridge assets and the cache's future payload are not resident
             // at this observation boundary. Reserve them once, never per slot.
-            headroom = add(headroom, std::max(options.mtp.sidecar_retained_bytes, options.mtp.sidecar_setup_bytes));
-            headroom = add(headroom, add(options.mtp.golden_max_bytes, options.mtp.replay_host_bytes));
-            headroom = add(headroom, options.prefix_cache_host_bytes);
+            auto headroom = add(fixed_headroom, options.prefix_cache_host_bytes);
             // UMA: K=1 device staging and pinned host payload share physical RAM.
-            // Reserve the peak once for initial sizing and the captured growth recheck.
-            if(options.prefix_batch_cert && prefix_state) {
-                // The bridge adds predictor rows and held hidden after this observation.
-                const auto predictor_row=add(mul(mul(model.kv_heads,model.head_dim),4U),mul(model.indexer_head_dim,2U));
-                const auto held=mul(mul(model.hidden_size,model.hc_count),2U);
-                const auto staging=strix::decode_cli::qwen_batch_staging_cap(options.prefix_cache_staging_bytes,
-                    prefix_state->row_bytes(),prefix_state->fixed_bytes(),predictor_row,held,options.known_prefix_prefill_rows);
-                headroom=add(headroom,staging);
-            }
+            // Initial sizing reserves the peak; growth reserves only its outstanding fraction.
+            const auto staging_reserve=qwen_http_batch_staging_reserve(options,model,state_layout);
+            headroom=add(headroom,staging_reserve);
             const auto before = observe();
             auto retained = estimate;
-            auto capacity = resolve_http_slot_capacity(estimate, active, before.available, gtt_free(before), headroom, options.http_batch_cap);
+            auto capacity = resolve_http_bridge_capacity(estimate, serving, before.available, gtt_free(before), headroom, headroom, options.http_batch_cap);
+            if (!capacity.slots) throw std::runtime_error("HTTP first slot does not fit: " + capacity.limiting);
+            const bool single_route=!ordinary_http_batch_slots(options);
+            if (single_route) capacity.slots=1;
             if (capacity.slots >= 2U) {
                 auto probe = make_stack();
                 add_tiled(*probe);
@@ -3468,17 +3480,22 @@ int STRIX_DECODE_ENTRY(
                 };
                 const auto measured = std::max({estimate, delta(before.available, after.available), delta(gtt_free(before), gtt_free(after))});
                 retained = measured;
-                capacity = resolve_http_slot_capacity(measured, active,
+                capacity = resolve_http_bridge_capacity(measured, serving,
                     after.available ? before.available : std::nullopt,
-                    gtt_free(after) ? gtt_free(before) : std::nullopt, headroom, options.http_batch_cap);
+                    gtt_free(after) ? gtt_free(before) : std::nullopt, headroom, headroom, options.http_batch_cap);
                 if (capacity.slots >= 2U) batch_stacks.push_back(std::move(probe));
             }
-            batch_memory_ok = [observe, gtt_free, retained, active, headroom]() {
-                const auto pressure = observe();
-                return http_slot_memory_fits(retained, active, pressure.available, gtt_free(pressure), headroom);
-            };
+            if (!capacity.slots) throw std::runtime_error("HTTP first slot does not fit after probe: " + capacity.limiting);
+            batch_memory_ok = make_http_bridge_growth_check(retained,serving,fixed_headroom,
+                options.prefix_cache_host_bytes,staging_reserve,[observe,gtt_free,prefix_store] {
+                    // Allocated payload includes in-flight capture, not unallocated credits.
+                    const auto stats=prefix_store ? prefix_store->stats() : strix::PrefixStateCacheStats{};
+                    const auto pressure=observe();
+                    return HttpBridgeGrowthObservation{pressure.available,gtt_free(pressure),
+                        stats.host_bytes,stats.staging_bytes};
+                });
             options.http_slot_reason = "limited by " + capacity.limiting;
-            batch_slots = capacity.slots > 1U || (options.http_batch_explicit && options.http_batch_cap == 1U)
+            batch_slots = !single_route && (capacity.slots > 1U || (options.http_batch_explicit && options.http_batch_cap == 1U))
                 ? capacity.slots : 0U;
             options.http_batch = static_cast<std::uint32_t>(batch_slots);
             if (!batch_slots && options.http_sampling == "sample")

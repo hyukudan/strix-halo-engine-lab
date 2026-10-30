@@ -66,6 +66,10 @@ struct HipModelResidencyReservation {
 struct CopyResidencyRange {
     std::uint64_t begin = 0, end = 0;
 };
+// Page-aligned, coalesced registration extents, before optional chunking.
+// Shared by native registration and CPU committed-memory admission.
+[[nodiscard]] std::vector<CopyResidencyRange> build_registered_residency_ranges(
+    const ModelManifest&, const HipModelResidencyPolicy&, std::uint64_t file_bytes, std::uint64_t page);
 // Pure layout shared by allocation and pre-allocation kernel eligibility.
 [[nodiscard]] std::vector<CopyResidencyRange> build_copy_residency_ranges(
     const ModelManifest&, const HipModelResidencyPolicy&);

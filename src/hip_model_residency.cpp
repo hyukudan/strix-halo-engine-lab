@@ -309,88 +309,9 @@ std::vector<HostRange> build_registration_ranges(
     const HipModelResidencyPolicy& policy) {
     const auto page =
         page_size();
-    std::vector<HostRange> ranges;
-
-    for (const auto& tensor :
-         manifest.tensors) {
-        if (!should_register(
-                tensor,
-                policy)) {
-            continue;
-        }
-        if (tensor.absolute_offset >
-                mapped.bytes() ||
-            tensor.byte_size >
-                mapped.bytes() -
-                    tensor.absolute_offset) {
-            throw std::invalid_argument(
-                "manifest tensor exceeds mapped model file");
-        }
-
-        const auto begin =
-            align_down(
-                tensor.absolute_offset,
-                page);
-        const auto tensor_end =
-            checked_add(
-                tensor.absolute_offset,
-                tensor.byte_size);
-        const auto end =
-            std::min(
-                align_up(
-                    tensor_end,
-                    page),
-                align_up(
-                    mapped.bytes(),
-                    page));
-        if (end <= begin) {
-            throw std::logic_error(
-                "registered tensor range is empty");
-        }
-        ranges.push_back(
-            HostRange{
-                begin,
-                end,
-            });
-    }
-
-    std::sort(
-        ranges.begin(),
-        ranges.end(),
-        [](const auto& left,
-           const auto& right) {
-            if (left.begin != right.begin) {
-                return left.begin <
-                       right.begin;
-            }
-            return left.end <
-                   right.end;
-        });
-
     std::vector<HostRange> merged;
-    for (const auto range :
-         ranges) {
-        if (merged.empty()) {
-            merged.push_back(range);
-            continue;
-        }
-
-        auto& last =
-            merged.back();
-        const auto maximum_gap_end =
-            checked_add(
-                last.end,
-                policy.coalesce_gap_bytes);
-        if (range.begin <=
-            maximum_gap_end) {
-            last.end =
-                std::max(
-                    last.end,
-                    range.end);
-        } else {
-            merged.push_back(range);
-        }
-    }
+    for (const auto range : build_registered_residency_ranges(manifest,policy,mapped.bytes(),page))
+        merged.push_back({range.begin,range.end});
     // STRIX_MODEL_REGISTER_CHUNK_BYTES=N (default 268435456 = 256 MiB; 0 = one registration per merged range): register each merged range as page-aligned
     // pieces of at most N bytes. An invalidated page of a userptr registration makes the driver revalidate the
     // whole registration while every queue of the process is evicted; smaller pieces bound that stall. A tensor

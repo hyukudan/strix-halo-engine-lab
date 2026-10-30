@@ -46,12 +46,27 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
     const auto mul = prefill_checked_mul;
     SerialSessionStateLayoutRequest state_request;
     state_request.context_tokens = options.context_tokens;
+    state_request.recurrent_storage = options.gdn_recurrent_storage;
     const auto state = build_serial_session_state_layout(model, state_request);
     PrefillRequirements result;
     result.model_backing = model_bytes;
     result.state_d1 = add(state.device_total_bytes, add(state.host_total_bytes, add(state.host_total_bytes, state.host_alignment - 1U)));
     result.serial_scratch = compiled.arena.total_bytes;
     result.device_base = add(state.device_total_bytes, result.serial_scratch);
+    // Only automatic native HTTP uses committed target backing. Ordinary mmap
+    // file cache (notably the CPU-read PLE table) is reclaimable, not a pinned
+    // UMA allocation. Registration aliases count once in UMA and also consume
+    // GTT. Use the allocator's exact page/coalescing layout, never tensor sums.
+    if (options.automatic_prefill && options.http_serve && options.rotary.mode()==RotaryMode::native) {
+#ifdef __linux__
+        const auto page=::sysconf(_SC_PAGESIZE);
+        if (page<=0) throw std::runtime_error("target registration page size unavailable");
+#else
+        throw std::runtime_error("target registration page size unavailable");
+        const std::uint64_t page=0;
+#endif
+        account_http_registered_target(result,options,manifest,model_bytes,static_cast<std::uint64_t>(page));
+    }
     // The serial decode pool (qsa_decode_pool_route) is retained device state from the first decode step on.
     const auto gsq = qpf2k::has_gsq_gate(manifest);
     const auto decode_pool = qsa_decode_pool_route(options, gsq) ? qsa_decode_pool_bytes(options, model, gsq) : 0U;
@@ -83,7 +98,12 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
     }
     if (options.rotary.mode() == RotaryMode::yarn)
         append_yarn_owner_requirements(options,model,state,model_bytes,result,geometry);
-    result.organization = {{"serial_execution_identity",compiled.execution_identity},
+    if (options.http_serve && options.rotary.mode() == RotaryMode::native) {
+        const auto external=qwen_prefill_external_memory(options,model);
+        result.external_host=external.host;
+        result.external_device=external.device;
+    }
+    result.organization.merge(std::map<std::string,std::uint64_t>{{"serial_execution_identity",compiled.execution_identity},
         {"serial_kernel_plan_identity",compiled.kernel_plan_identity},
         {"prefill_execution_identity",plan.prefill_execution_identity},
         {"prefill_kernel_plan_identity",plan.prefill_kernel_plan_identity},
@@ -91,7 +111,7 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
         {"prefill_arena_bytes",plan.arena.physical.total_bytes},
         {"prefill_metadata_bytes",plan.host_metadata_payload_bytes},
         {"qsa_decode_pool_bytes",decode_pool},
-        {"qsa_decode_pool_key_bytes",qsa_decode_pool_key_bytes(options, gsq)}};
+        {"qsa_decode_pool_key_bytes",qsa_decode_pool_key_bytes(options, gsq)}});
     if(plan.terminal_logits_arena) result.organization.emplace("terminal_logits_arena",1U);
     if(plan.qsa_score_ring_workspace_bytes) {
         result.organization.emplace("qsa_score_ring_workspace_bytes",plan.qsa_score_ring_workspace_bytes);

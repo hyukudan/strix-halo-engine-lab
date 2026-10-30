@@ -1,5 +1,7 @@
 #pragma once
 #include "hip_decode_options.hpp"
+#include "http_slot_capacity.hpp"
+#include "qwen_prefill_external_memory.hpp"
 #include "strix/known_prefix_prefill.hpp"
 #include "strix/ctx_exact_memory.hpp"
 #include "strix/linux_uma_observation.hpp"
@@ -34,16 +36,26 @@ struct PrefillRequirements {
     std::uint64_t device_base = 0;
     std::map<std::string, std::uint64_t> owners{};
     std::map<std::string, std::uint64_t> organization{};
+    std::uint64_t external_host = 0, external_device = 0;
 };
+// Future bridge commitments, excluding the already charged primary stack/prefill.
 struct PrefillMemory {
     std::optional<std::uint64_t> available, gtt_limit, gtt_used;
     std::function<PrefillRequirements(const Options&)> estimate;
+    std::function<HttpServingMemory(const Options&)> serving;
     // Present only for Linux reclaim support; host tests can supply the observation.
     std::optional<std::uint64_t> ple_reclaim_page{};
     std::optional<std::uint64_t> total{};
     // Must drop and verify with mincore. A predicted page union is never credit.
     std::function<std::uint64_t(const Options&)> verify_ple_credit{};
 };
+// Both inspection and execution validate explicit-T assets before the inspection exit.
+inline void validate_http_serving_memory(const Options& o,const PrefillMemory& memory) {
+    if(o.http_serve && o.mtp.enabled && o.known_prefix_prefill_rows) {
+        if(!memory.serving) throw std::invalid_argument("one-slot:asset verification unavailable");
+        (void)memory.serving(o);
+    }
+}
 struct EffectiveConfig {
     Options options;
     OptimizationProfileResolution organization;
@@ -52,6 +64,7 @@ struct EffectiveConfig {
     std::string reason = "not-requested";
     std::string arithmetic_fallback;
     std::string tile_fallback;
+    std::string serve_prefill_notice;
     std::string error;
     std::uint64_t ple_reclaim_credit = 0;
     std::vector<std::string> suppressed;
@@ -101,7 +114,8 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_QSA_DECODE_SELECT", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_POOL_CHECK",
             "STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA",
             "STRIX_SESSION_CACHE", "STRIX_SESSION_DISK", "XDG_CACHE_HOME", "HOME",
-            "STRIX_PREFIX_BATCH_CERT", "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION"})
+            "STRIX_PREFIX_BATCH_CERT", "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION",
+            "STRIX_SERVE_PREFILL", "STRIX_BATCH_PROMPT_SMALL"})
         if (!(qpf2k::pre_injected_moe_marker && std::string_view(name) == "STRIX_QPF2K_MOE_DEFAULTED"))
             if (const char* value = get(name)) env.emplace(name, value);
     for (const char* name : {"STRIX_BITCALC_LOGITS_OUT", "STRIX_BITCALC_FORCE_TOKENS"})
@@ -125,6 +139,24 @@ inline constexpr DecodeNumericalProfile dense_a8_profile =
 inline std::uint64_t prefill_checked_add(std::uint64_t a, std::uint64_t b) {
     if (b > UINT64_MAX - a) throw std::overflow_error("prefill reservation overflow");
     return a + b;
+}
+// Automatic native HTTP: use the same page/coalescing geometry as registration.
+// The source mmap's unregistered file cache remains reclaimable. Registered
+// aliases consume UMA once and GTT once; no RSS-plus-GTT sum is meaningful.
+inline void account_http_registered_target(PrefillRequirements& result,const Options& o,
+    const ModelManifest& manifest,std::uint64_t file_bytes,std::uint64_t page) {
+    if (o.residency!=HipModelResidencyMode::registered_file_mapping ||
+        o.model_copy_tier!=HipModelCopyTier::none || hip_model_copy_all_mode())
+        throw std::invalid_argument("automatic HTTP committed backing requires registered target");
+    HipModelResidencyPolicy policy;
+    policy.coalesce_gap_bytes=o.coalesce_gap_bytes;
+    std::uint64_t committed=0;
+    for (const auto range:build_registered_residency_ranges(manifest,policy,file_bytes,page))
+        committed=prefill_checked_add(committed,range.end-range.begin);
+    result.model_backing=committed;
+    result.device_base=prefill_checked_add(result.device_base,committed);
+    result.organization["target_mapped_file_bytes"]=file_bytes;
+    result.organization["target_registered_backing_bytes"]=committed;
 }
 // Predict only the route's reclaim credit. Runtime still verifies the drop and
 // admits allocations against the actual credit, including zero on setup failure.
@@ -187,6 +219,13 @@ inline std::uint64_t prefill_reclaim_credit(const Options& options, const ModelC
 }
 inline void require_effective_prefill_execution(const EffectiveConfig& config) {
     if (!config.error.empty()) throw std::invalid_argument(config.error);
+}
+// Shared CPU preflight for execution and HTTP --print-effective-config. Capacity
+// requiring actual device allocations is resolved later and remains provisional.
+inline void validate_effective_startup(const EffectiveConfig& config) {
+    require_effective_prefill_execution(config);
+    validate_http_serve(config.options);
+    validate_prefix_state_cache(config.options);
 }
 inline void validate_effective_options(const Options& o, const ModelContract& model) {
     validate_resolved_mtp_cli(o);
@@ -276,7 +315,7 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
             capabilities.a8_runtime, request.permit_generation_defaults);
         auto validation_organization = result.organization;
         apply_numerical_profile(o, model, manifest, verified_content, capabilities.a8_runtime, validation_organization);
-        validate_effective_options(o, model);
+        if (!http_prefill_pending(o)) validate_effective_options(o, model);
         if (result.reason == "prompt-exceeds-model-context")
             result.error = "Qwen auto-prefill declined: prompt-exceeds-model-context (prompt + generation exceeds " +
                 std::to_string(model.max_position_embeddings) + ")";
@@ -609,12 +648,141 @@ inline void resolve_prefix_defaults(Options& o, const ModelContract& model,
     } catch (const std::exception&) { return off("memory-estimate-failed"); }
     o.prefix_cache_host_bytes=budget; o.prefix_cache_source="auto"; o.prefix_cache_reason="fitted-host-budget";
 }
+// HTTP prompts arrive after startup. Size a shared tiled owner against context,
+// preserving the already resolved arithmetic and every explicit organization.
+inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& model,
+    std::string_view content, const PrefillCapabilities& capabilities, const PrefillMemory& memory) {
+    auto& o = result.options;
+    if (!o.http_serve) return;
+    const auto notice = [&](std::string reason) {
+        result.serve_prefill_notice = "Qwen serve-prefill: " + std::move(reason) + "\n";
+    };
+    if (o.known_prefix_prefill_explicit || o.known_prefix_prefill_rows) return notice("explicit T" + std::to_string(o.known_prefix_prefill_rows));
+    if (o.baseline || env_is(result.environment,"STRIX_SERVE_PREFILL","0") ||
+        !o.disabled_prefill_features.empty()) return notice("off; explicit tiled configuration required");
+    for (const char* name : {"STRIX_KNOWN_PREFIX_WINDOW", "STRIX_KNOWN_PREFIX_FULL_ROWS",
+            "STRIX_KNOWN_PREFIX_EXPERT_UNION", "STRIX_KNOWN_WINDOW_ROUTER_ROWS", "STRIX_KNOWN_PREFIX_PREFILL_ROWS"})
+        if (env_is(result.environment,name,"0")) return notice("off; explicit tiled configuration required");
+    if (content != validated_model_content_identity || !capabilities.target_qualified || !capabilities.a8_runtime ||
+        (numerical_profile_pair(o).fast_components & kFastPrefillDense8) ||
+        o.rotary.mode() != RotaryMode::native || o.prompt_lookup || o.known_prefix_rows_explicit ||
+        o.teacher_forced_score || o.execution.mode != DecodeExecutionMode::eager ||
+        (o.known_prefix_output_policy_explicit && o.known_prefix_output_policy != KnownWindowOutputPolicy::terminal_row))
+        return notice("route not admitted; explicit tiled configuration required");
+    const auto copy_all = result.environment.find("STRIX_MODEL_COPY_ALL");
+    if (o.residency != HipModelResidencyMode::registered_file_mapping ||
+        o.model_copy_tier != HipModelCopyTier::none ||
+        (copy_all != result.environment.end() && !copy_all->second.empty() && copy_all->second.front() != '0'))
+        return notice("automatic T declined for target residency copy, selective copy or copy-all; explicit tiled configuration required");
+    if (!memory.available || !memory.gtt_limit || !memory.gtt_used || !memory.estimate)
+        return notice("memory observation unavailable; explicit tiled configuration required");
+    constexpr std::uint64_t gib = UINT64_C(1) << 30U;
+    std::string attempts;
+    for (const auto rows : {8192U,4096U,2048U,1024U,256U,64U,16U}) {
+        if (rows > o.context_tokens || rows > model.max_position_embeddings) {
+            attempts += "T" + std::to_string(rows) + ":context; "; continue;
+        }
+        auto candidate = o;
+        candidate.automatic_prefill = true;
+        candidate.known_prefix_window = true;
+        candidate.known_prefix_full_rows = true;
+        candidate.known_prefix_expert_union = true;
+        candidate.known_window_router_rows = true;
+        candidate.known_prefix_prefill_rows = rows;
+        candidate.known_prefix_output_policy = KnownWindowOutputPolicy::terminal_row;
+        // Required row-invariant organizations of the tiled known-prefix route.
+        candidate.q51_slot_parallel_down = true;
+        candidate.wave8_q8_gdn_input = true;
+        candidate.wave8_q8_gdn_output = true;
+        if (!candidate.known_prefill_metadata_explicit) candidate.known_prefill_metadata_budget = gib;
+        if (!candidate.known_prefill_uma_explicit) candidate.known_prefill_uma_budget = std::min(120*gib,*memory.available);
+        // Serving retains uniform logits storage and all tail owners. The CLI's
+        // compact/pruned 8 GiB ceiling must not force a spurious T8192 fallback.
+        if (!candidate.known_prefill_workspace_explicit)
+            candidate.known_prefill_workspace_budget = candidate.known_prefill_uma_budget;
+        if (!candidate.known_prefill_headroom_explicit) candidate.known_prefill_host_headroom = 4*gib;
+        try {
+            apply_default_known_prefill_tails(candidate);
+            validate_known_prefill_options(candidate);
+            validate_effective_options(candidate,model);
+            // A larger group creates an independent arena/native owner at startup,
+            // even when SMALL would not schedule it. Automatic sizing does not
+            // support that organization; retry only candidates without this owner.
+            if (const auto group=result.environment.find("STRIX_PROMPT_BATCH_ROWS");
+                group!=result.environment.end() && !group->second.empty()) {
+                const auto group_rows=parse_u64(group->second,"STRIX_PROMPT_BATCH_ROWS");
+                if (group_rows > rows)
+                    throw std::runtime_error("STRIX_PROMPT_BATCH_ROWS creates an unsupported extra group owner; "
+                        "unset it or use an explicit tiled configuration with group workspace/metadata budgets");
+            }
+            const auto required = memory.estimate(candidate);
+            const auto add = prefill_checked_add;
+            const auto scratch = add(required.workspace,required.tails);
+            if (!candidate.known_prefill_workspace_explicit) candidate.known_prefill_workspace_budget = scratch;
+            // The same owner calculation admits the future bridge at runtime.
+            // Missing asset evidence cannot establish even one runnable slot.
+            if (candidate.mtp.enabled && !memory.serving)
+                throw std::runtime_error("one-slot:verified MTP owner estimate unavailable");
+            const auto serving = memory.serving ? memory.serving(candidate) : HttpServingMemory{};
+            SerialSessionStateLayoutRequest state_request;
+            state_request.context_tokens=candidate.context_tokens;
+            state_request.recurrent_storage=candidate.gdn_recurrent_storage;
+            const auto staging=qwen_http_batch_staging_reserve(candidate,model,
+                build_serial_session_state_layout(model,state_request));
+            const auto future_host = add(staging,add(serving.shared_host,serving.slot_host));
+            const auto future_device = add(staging,add(serving.shared_device,serving.slot_device));
+            const auto growth = add(scratch,add(required.metadata,add(required.runtime_payload,
+                add(future_host,add(candidate.prefix_cache_host_bytes,candidate.known_prefill_host_headroom)))));
+            const auto total = add(required.model_backing,add(required.state_d1,add(required.serial_scratch,add(required.external_host,growth))));
+            const auto fit = [](const char* resource, std::uint64_t need, std::uint64_t limit) {
+                if (need > limit) throw std::runtime_error(std::string("memory:") + resource +
+                    " needs " + std::to_string(need) + " bytes, limit " + std::to_string(limit));
+            };
+            if (!required.workspace || !required.metadata)
+                throw std::runtime_error("plan:empty workspace or metadata estimate");
+            fit("workspace",scratch,candidate.known_prefill_workspace_budget);
+            fit("metadata",required.metadata,candidate.known_prefill_metadata_budget);
+            fit("host-available",total,*memory.available);
+            fit("UMA",total,candidate.known_prefill_uma_budget);
+            fit("GTT-used",*memory.gtt_used,*memory.gtt_limit);
+            fit("GTT-free",add(required.device_base,add(required.external_device,add(scratch,add(future_device,add(candidate.prefix_cache_host_bytes,candidate.known_prefill_host_headroom))))),*memory.gtt_limit - *memory.gtt_used);
+            o = std::move(candidate);
+            result.host_compilation = required.organization;
+            result.host_compilation["serve_committed_host_peak_bytes"]=total;
+            result.host_compilation["serve_prefill_external_host_bytes"]=required.external_host;
+            result.host_compilation["serve_prefill_external_device_bytes"]=required.external_device;
+            result.host_compilation["serve_batch_staging_bytes"]=staging;
+            result.host_compilation["serve_shared_host_peak_bytes"]=serving.shared_host;
+            result.host_compilation["serve_shared_device_peak_bytes"]=serving.shared_device;
+            result.host_compilation["serve_one_slot_host_peak_bytes"]=serving.slot_host;
+            result.host_compilation["serve_one_slot_device_peak_bytes"]=serving.slot_device;
+            for (const char* flag : {"--known-prefix-prefill-rows", "--known-prefix-window", "--known-prefix-full-rows",
+                    "--known-prefix-expert-union", "--known-window-router-rows", "--known-prefix-output-policy",
+                    "--known-prefix-workspace-budget-bytes", "--known-prefix-host-metadata-budget-bytes",
+                    "--known-prefix-uma-budget-bytes", "--known-prefix-host-headroom-bytes",
+                    "--q51-slot-parallel-down", "--wave8-q8-gdn-input", "--wave8-q8-gdn-output"})
+                if (!o.supplied_options.contains(flag)) result.sources[flag] = OptionSource::automatic;
+            return notice("automatic T" + std::to_string(rows) + "; " + attempts + "arithmetic preserved");
+        } catch (const std::exception& error) {
+            attempts += "T" + std::to_string(rows) + ":" + error.what() + "; ";
+        }
+    }
+    notice(attempts + "explicit tiled configuration required");
+}
 inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     const ModelContract& model, const gguf::FileInfo& info, const ModelManifest& manifest,
     std::string_view content, const PrefillCapabilities& capabilities, const PrefillMemory& memory) {
     auto result=resolve_prefill_effective_config(request,model,info,manifest,content,capabilities,memory);
+    resolve_serve_prefill(result,model,content,capabilities,memory);
     resolve_session_defaults(result.options,model,request.environment,memory.available);
     resolve_prefix_defaults(result.options,model,request.environment,memory.available);
+    auto& o = result.options;
+    if (o.http_serve && !o.baseline && o.prefix_cache && o.prefix_cache_host_bytes &&
+        !o.prefix_cache_block_rows_explicit && o.known_prefix_prefill_rows >= 1024 &&
+        o.known_prefix_prefill_rows % 1024 == 0) {
+        o.prefix_cache_block_rows = 1024;
+        result.sources["--prefix-cache-block-rows"] = OptionSource::automatic;
+    }
     return result;
 }
 // Read sysfs only when one unambiguously selected KFD GPU is visible. Ambiguous
@@ -840,6 +1008,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     if (o.http_serve && o.http_batch) out << "null"; else out << 1;
     out << ",\"route\":\"" << (o.http_batch ? "batch" : "single")
         << "\",\"reason\":\"" << o.http_slot_reason << "\"},";
+    if (o.http_serve) out << "\"serve_prefill_notice\":" << serve::Json(config.serve_prefill_notice).dump() << ',';
     out << "\"admitted\":" << (config.admitted ? "true" : "false") << ",\"reason\":\"" << config.reason
         << "\",\"tile_fallback\":\"" << config.tile_fallback
         << "\",\"error\":\"" << (o.rotary.mode() == RotaryMode::yarn ? yarn_json_error(config.error) : config.error)
@@ -847,6 +1016,10 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         << ",\"arithmetic_fallback\":\"" << config.arithmetic_fallback
         << "\",\"longer_context_qualified\":" << (o.context_tokens > 8192U ? "false" : "null")
         << ",\"context\":" << o.context_tokens << ",\"T\":" << o.known_prefix_prefill_rows
+        << ",\"serve_automatic_prefill\":" << (o.http_serve && o.automatic_prefill ? "true" : "false")
+        << ",\"prefix_cache_block_rows\":" << o.prefix_cache_block_rows
+        << ",\"batch_prompt_small\":" << ((config.environment.contains("STRIX_BATCH_PROMPT_SMALL") &&
+            config.environment.at("STRIX_BATCH_PROMPT_SMALL").starts_with('1')) ? "true" : "false")
         << ",\"decode_profile\":\"" << numerical_profile_name(o.numerical_profile)
         << "\",\"prefill_profile\":\"" << numerical_profile_name(numerical_profile_pair(o).prefill) << "\",\"numerical_profile_pair_identity\":" << numerical_profile_pair_identity(numerical_profile_pair(o))
         << ",\"tails\":[";
