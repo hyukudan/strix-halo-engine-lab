@@ -16,8 +16,8 @@ inline YarnEnvironmentPath yarn_environment_path(qpf2k::Item item) {
     case rows_lean: case dispatch_fuse:
     // Audited at the 86e169e1 merge: score_rows re-tiles the stage-batch scorer over
     // already-rotated pooled keys (hip_qsa_prefill_flash.inc:25-43); ple_batch, shared_pre,
-    // moe_mc and moe_hdr are PLE, shared-expert and MoE projections. None adds rotary work.
-    case score_rows: case ple_batch: case shared_pre: case moe_mc: case moe_hdr:
+    // moe_mc, moe_hdr and moe_xor64 are PLE, shared-expert and MoE projections. None adds rotary work.
+    case score_rows: case ple_batch: case shared_pre: case moe_mc: case moe_hdr: case moe_xor64:
         return YarnEnvironmentPath::no_rotary;
     }
     return YarnEnvironmentPath::uncovered_rotary;

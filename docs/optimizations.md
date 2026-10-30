@@ -537,6 +537,22 @@ Reuse loaded superblock headers between gate and up within the DA16 tune 80/82 p
 - **Measured gain:** ~-0.07 s at 32K; combined five-item set -0.71 s (-3.2 %) at 32K vs all five off (interleaved, same build)
 - **Implementation / evidence:** [defaults](../include/strix/qpf2k_defaults.hpp), [engine reference](getting-started/engine-reference.md)
 
+<a id="qwen-moe-xor-rows"></a>
+
+### MoE XOR LDS rows (64-assignment tune)
+
+**Engine:** `qwen`. **Control:** `STRIX_QPF2K_MOE_XOR64`. **Default:** 1.
+
+When a chunk averages fewer than 96 assignments per expert (fewer than 4,915 rows for the shipped 512-expert, top-10 checkpoint) the routed experts use 64-assignment batches (tune 80) whose padded LDS stage (46 KB) fits two CTAs per WGP. With the item on, such chunks of at least 3,072 rows stage the same operands in XOR-permuted rows without padding (40 KB, three CTAs per WGP); operands, WMMAs and the K order of every output are unchanged.
+
+- **Preconditions:** Automatic decoder route (CLI), admitted tiled prefill, DA16 chain, automatic MoE tune (no `STRIX_INTPREFILL_MOE_TUNE`), 64-assignment batches with at least 3,072 rows (3,072 to 4,914 rows for 512 experts, top-10); MTP/HTTP serving and cohorts keep it opt-in; not applied under GSQ.
+- **Automatic selection:** The decoder injects the value only when unset; explicit values win; `STRIX_QPF2K_DEFAULTS=0` or `--baseline` disables it.
+- **Fallback notice:** `=0` disables only this item and keeps the tiled route; below 3,072 rows (where the third CTA does not pay) and with 128-assignment batches the previous kernels run.
+- **Exactness evidence:** Bitwise: routed-expert fixture (every written view, the CSR words and the certificate word, HDR on and off, certificate off, armed and unproven, non-finite inputs) identical with the item on and off on synthetic and real layers; 4K/32K terminal FP32 digests and plain-command tokens identical.
+- **Off switch:** STRIX_QPF2K_MOE_XOR64=0
+- **Measured gain:** routed call −2.6 % to −8.2 % at 3,072 to 4,864 rows (512 experts, top-10, real layers, ABBA); +1 % to +5 % at 1,024 to 2,048 rows (hence the threshold); no change at 8,192-row chunks.
+- **Implementation / evidence:** [defaults](../include/strix/qpf2k_defaults.hpp), [engine reference](getting-started/engine-reference.md)
+
 <a id="qwen-qsa-union-merge"></a>
 
 ### QSA attend-union merge

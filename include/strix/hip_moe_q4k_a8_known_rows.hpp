@@ -128,6 +128,10 @@ void set_prefill_route(int bits);
 void set_prefill_da16(int on);
 // MoE header reuse test hook: overrides STRIX_QPF2K_MOE_HDR (1 = gate/up header reuse kernel; -1 = environment).
 void set_prefill_hdr(int on);
+// MoE XOR rows test hook: overrides STRIX_QPF2K_MOE_XOR64 (1 = 64-assignment DA16 tune with XOR LDS rows from 3072 rows; -1 = environment).
+void set_prefill_xor64(int on);
+// Test hook: the FP16 tune of the last enqueue_prefill of this thread.
+unsigned prefill_last_tune();
 // qpf2k/moe-mi test hooks: whether the last enqueue_prefill of this thread took the DA16 path; fill the DA16 image with 0xa5.
 bool prefill_da16_ran();
 // True when the last enqueue_prefill of this thread left the accumulation view unzeroed (STRIX_QPF2K_MOE_ROUTE bit 8): the

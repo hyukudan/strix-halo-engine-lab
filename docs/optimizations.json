@@ -478,6 +478,17 @@
   },
   {
     "engine": "qwen",
+    "name": "MoE XOR LDS rows (64-assignment tune)",
+    "flag_or_env": "STRIX_QPF2K_MOE_XOR64",
+    "default": "1",
+    "exact": "Bitwise: routed-expert fixture (every written view, the CSR words and the certificate word, HDR on and off, certificate off, armed and unproven, non-finite inputs) identical with the item on and off on synthetic and real layers; 4K/32K terminal FP32 digests and plain-command tokens identical.",
+    "gain": "routed call -2.6 % to -8.2 % at 3,072 to 4,864 rows per chunk (512 experts, top-10; 4K prompts); no change at 8,192-row chunks (16K/32K)",
+    "preconditions": "Automatic decoder route (CLI), admitted tiled prefill, DA16 chain, automatic MoE tune, 64-assignment batches with at least 3,072 rows (3,072 to 4,914 rows for 512 experts, top-10); MTP/HTTP serving and cohorts keep it opt-in; not applied under GSQ.",
+    "off_switch": "STRIX_QPF2K_MOE_XOR64=0",
+    "doc_anchor": "docs/optimizations.md#qwen-moe-xor-rows"
+  },
+  {
+    "engine": "qwen",
     "name": "QSA attend-union merge",
     "flag_or_env": "STRIX_QSA_UNION_MERGE",
     "default": "1 (from 49,152 blocks; range form below)",
