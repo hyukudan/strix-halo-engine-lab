@@ -1007,13 +1007,17 @@ int main() {
         attention(5000, 8, a::kTopK, false);
         segments();
         g::set_attention_lds_swizzle(1);
-        attention(5, 1, 0, false);
-        attention(20, 2, 37, false);
-        attention(8191, 8, a::kTopK, false);
-        attention(32767, 8, a::kTopK, false);
-        attention(8191, 1, a::kTopK, false);
-        attention(32767, 1, a::kTopK, false);
-        segments();
+        for (const int bf : {0, 1}) {   // the swizzle with either tile choice (it permutes the f32 tiles only)
+            g::set_attention_tile_f16(bf);
+            attention(5, 1, 0, false);
+            attention(20, 2, 37, false);
+            attention(8191, 8, a::kTopK, false);
+            attention(32767, 8, a::kTopK, false);
+            attention(8191, 1, a::kTopK, false);
+            attention(32767, 1, a::kTopK, false);
+            segments();
+        }
+        g::set_attention_tile_f16(-1);
         g::set_attention_lds_swizzle(-1);
         for (const int bf : {0, 1}) {     // STRIX_DS41_ATTN_WINDOW_FOLD, f32 and f16 tiles
             g::set_attention_tile_f16(bf);

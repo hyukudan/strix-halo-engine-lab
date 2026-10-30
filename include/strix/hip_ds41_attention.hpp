@@ -129,7 +129,7 @@ inline constexpr unsigned kAttnGroupCount = 8;   // at most 8 head groups per ro
 // variant 0: STRIX_DS41_BF16_ATTN_VARIANT (default 1, the first kernel); 2: QK split over the waves, 16-byte key stores
 void enqueue_attention_bf16_prefill(const AttentionView&, hipStream_t stream, int variant = 0);
 void enqueue_attention(const AttentionView& v, hipStream_t stream);
-// STRIX_DS41_ATTN_LDS_SWIZZLE=1 (default off): permute 16-byte LDS vectors only.
+// STRIX_DS41_ATTN_LDS_SWIZZLE (default on, =0 off): permute the f32 tile's 16-byte LDS vectors only (the tile choice is unchanged).
 // Test override: 0 off, 1 on, -1 environment. Arithmetic and reduction order are unchanged.
 void set_attention_lds_swizzle(int mode);
 // STRIX_DS41_ATTN_TILE_F16 (default on, =0 off): the attention tile in LDS as f16 (every dequantised key value is exact in
