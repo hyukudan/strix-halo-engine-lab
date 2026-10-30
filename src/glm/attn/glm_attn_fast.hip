@@ -1579,6 +1579,10 @@ bool kda_lanes_valid(unsigned q) {
         if (q == w) return true;
     return false;
 }
+bool kda_tree() {
+    static const bool on = [] { const char* e = std::getenv("STRIX_GLM_KDA_TREE"); return !(e != nullptr && e[0] == '0'); }();
+    return on;
+}
 unsigned kda_lanes() {
     unsigned v = g_kda_lanes.load(std::memory_order_relaxed);
     if (v == 0) {
@@ -1613,7 +1617,9 @@ void kda_launch(dim3 grid, hipStream_t s, const dev::KdaDev& k, const float* qkv
     // Auto update (attention measurement, node 1 00:45, gate 114/114 bitwise): kda.step us q2 / 2c / cqs: R1 36.1-37.1 / 34.4 / 37.1,
     // R2 73.9-74.8 / 64.9 / 62.8-63.0, R4 123.9-125.2 / 132.1 / 109.3-109.5, R8 218.8-219.8 / 237.0 / 207.8-207.9.
     // -> 2c at one row, cqs (column-quad split, shared prep) at 2..8 rows; kSeq unmeasured for these -> 2.
-    if (lanes == 1U) lanes = kSeq ? 2U : (grid.y < 2 ? 128U : 200U);
+    // auto: the 2-barrier-tree column-quad forms (2ct at one row, cqst at 2..8 rows; same bits as 2c / cqs, kda.step
+    // -0.5..-1.8 %); STRIX_GLM_KDA_TREE=0 keeps 2c / cqs
+    if (lanes == 1U) lanes = kSeq ? 2U : (grid.y < 2 ? (kda_tree() ? 160U : 128U) : (kda_tree() ? 232U : 200U));
     if (lanes == 194U || lanes == 196U || lanes == 200U || lanes == 232U) {
         const std::size_t needed = static_cast<std::size_t>(std::max(grid.y, npos)) * k.heads * (4 * kKdaDim + 1);
         if (needed > g_kda_prep_capacity) {

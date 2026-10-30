@@ -2010,6 +2010,21 @@ Use the production Xfer decode exchange.
 - **Off switch:** --decode-xch comm (unset overriding environment)
 - **Measured gain:** Boundary bundle reduces exchange overhead; no isolated measurement
 
+<a id="glm-kda-tree"></a>
+
+### KDA two-barrier-tree column-quad forms
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_KDA_TREE; STRIX_GLM_KDA_LANES`. **Default:** on.
+
+The automatic KDA lane form uses the two-barrier-tree column-quad kernels: 2ct at one row, cqst at 2..8 rows (same bits as 2c / cqs).
+
+- **Preconditions:** Decode KDA steps of 1..8 independent rows; kSeq keeps 2 lanes.
+- **Automatic selection:** Automatic unless STRIX_GLM_KDA_LANES names a form.
+- **Fallback notice:** None; STRIX_GLM_KDA_TREE=0 restores 2c / cqs.
+- **Exactness evidence:** KDA kernel gate 57/0 bitwise (2ct / cqst vs 2c / cqs); real GLM-5.3-Flash TP2 on the pair, default (2ct / cqst) and STRIX_GLM_KDA_TREE=0 arms alternating: R1b decode 64 tokens fnv 8256e1e0 on both ranks and R8 batch fnv 99838248 in every arm, spec SP1a PASS on both ranks.
+- **Off switch:** STRIX_GLM_KDA_TREE=0
+- **Measured gain:** kda.step us 2c -> 2ct / cqs -> cqst: R1 34.4 -> 33.9, R2 63.3 -> 62.8, R4 111.1 -> 109.1, R8 209.1 -> 208.0 (-0.5..-1.8 %); model decode A/B (fresh processes A B B A A B): R1 40.12 vs 40.13 ms/token, R8 112.85 vs 112.95 ms/step (not slower)
+
 <a id="glm-hp-crc-parallel"></a>
 
 ### Parallel host CRC
