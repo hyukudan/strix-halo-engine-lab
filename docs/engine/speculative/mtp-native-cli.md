@@ -148,14 +148,17 @@ An explicit `--rope-yarn 2 --context C --mtp` admits the table-backed CLI
 qualification route at positive C <= 524288. Above that band, use factor 4
 with C <= 1048576. Supply the existing pinned sidecar, golden and budgets;
 `--mtp-golden-dump` captures a fresh version-3 file with the same rotary table,
-actual C and profile pair. MTP is never automatically selected by a bare YaRN
-command. HTTP, session/cache restore, cohorts, wide copy and sampling remain
+actual C and profile pair. A bare YaRN command discovers
+`<model>.mtp-bundle.json` beside the GGUF and selects MTP after verifying its
+sidecar through the persistent content-hash cache. Without a bundle it uses serial
+decode with one notice. `STRIX_QWEN_YARN_MTP=0` selects serial; `=1` requires a
+bundle (missing bundles refuse). Explicit `--mtp` remains available. HTTP, session/cache restore, cohorts, wide copy and sampling remain
 closed. Structurally non-serial verifier arithmetic refuses before mutation.
 Host admission and compilation do not establish GPU exactness or model fidelity.
 
 Both `STRIX_QSA_MTP_POOL` and `STRIX_PLE_ROLLING` default on for admitted MTP
 CLI at factor 2 through 524288 and factor 4 through 1048576. Either `=0` still
-turns that feature off; MTP remains explicitly requested. The 1M factor-4 prose
+turns that feature off; the selected MTP route remains active. The 1M factor-4 prose
 qualification matched all 256 generated tokens, every committed full-vocabulary
 logit digest, prompt/final target state and predictor state against serial YaRN
 and pool-off MTP. This is equality within the same YaRN identity.
@@ -196,3 +199,34 @@ the same ordered target components and occupied ranges, consumed token history
 and pending selection. MTP predictor extensions and opaque lineage remain in
 the separate complete-session diagnostics. Missing or incomplete evidence is
 NO-REFERENCE; compare complete tokens, ledgers and target state before timing.
+
+### YaRN MTP bundles
+
+Use `--mtp-bundle FILE` or place the JSON at `<model>.mtp-bundle.json`. Bundle
+and explicit MTP flags are mutually exclusive. The version-1 object contains
+`version: 1` and `options`, a mapping from existing `--mtp-*` flag names to
+strings/numbers (or `true` for switches). All entries in the shipped recipe
+are required; unknown entries refuse. The same CLI parser validates all pins,
+provenance, policy thresholds, budgets and window settings. Sidecar and draft
+vocabulary paths are relative to the JSON. Golden paths/pins and draft profiles
+are excluded: the bundle carries the expanded pins itself.
+
+Copy [the distill-g recipe](../../../recipes/qwen-distill-g-yarn.mtp-bundle.json)
+beside the model, with its matching sidecar and `draft-vocab/` directory. It
+preserves the explicit 1M factor-4 MTP asset, policy and budget recipe; the
+requested context and YaRN factor still come from the command. This is a
+reproduction recipe, not new compiler, GPU, fidelity or workload qualification.
+
+The golden identity hashes the complete bundle, resolved rotary identity,
+capacity, numerical profile pair and prompt token chain. If
+`<bundle-dir>/goldens/<identity>.golden` exists it is read. Otherwise the engine
+uses `$XDG_CACHE_HOME/strix-engine/goldens` (or
+`~/.cache/strix-engine/goldens`). A cache miss runs the existing self-generated
+v3 calibration dump in process, publishes via a temporary file and atomic rename,
+and logs the path once. A new C/factor or calibration identity pays that one-time
+cost; it reuses the same prompt pass, so at 131,072 prompt positions the first run
+and a cache-hit repeat differed only by run-to-run noise. The bundle/model directory
+is never written. Dump or cache write failure
+restarts a fresh serial YaRN session with a notice. Calibration is draft-side
+self-generated evidence, not an independent target reference; it changes no target
+arithmetic or output tokens. Native commands retain their existing routes.

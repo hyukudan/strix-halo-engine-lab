@@ -1821,12 +1821,12 @@
   {
     "engine": "qwen",
     "name": "YaRN long-context MTP CLI",
-    "flag_or_env": "--rope-yarn; --mtp; STRIX_QWEN_YARN_MTP; STRIX_QSA_MTP_POOL; STRIX_PLE_ROLLING",
+    "flag_or_env": "--rope-yarn; --mtp; --mtp-bundle; STRIX_QWEN_YARN_MTP; STRIX_QSA_MTP_POOL; STRIX_PLE_ROLLING",
     "default": "table-backed QSA MTP pool and rolling PLE for factor 2 through 524,288 and factor 4 through 1,048,576 positions when admitted",
     "exact": "Against serial YaRN at 1,048,576 positions (factor 4, real prose prompt): all 256 generated tokens, every committed step's full-vocabulary logits, prompt/final target state and predictor state identical between MTP with the pool, plain serial YaRN and MTP with the pool off; 262K full scope and 524K target scope identical.",
     "gain": "MTP speculative decode on YaRN contexts through 1,048,576 positions on one node; serial YaRN is the comparator",
     "preconditions": "CLI only (HTTP refuses YaRN); explicit --context; pinned sidecar and version-3 golden; memory admission with a 4 GiB physical margin. Memory-only storage ladder: defaults, H1024/cap268435456/ring256/PIPE-default, then H256/cap33554432/ring64/PIPE0. Explicit environment values pin each knob; inspection and run receipts expose storage_ladder_step and yarn_mtp_storage sizes.",
-    "off_switch": "omit --mtp for serial YaRN; STRIX_QSA_MTP_POOL=0 and STRIX_PLE_ROLLING=0 restore the previous pool and PLE paths",
+    "off_switch": "STRIX_QWEN_YARN_MTP=0 (or no verified bundle and no --mtp) keeps serial YaRN; a bare --rope-yarn selects MTP when <model>.mtp-bundle.json or --mtp-bundle verifies; STRIX_QSA_MTP_POOL=0 and STRIX_PLE_ROLLING=0 restore the previous pool and PLE paths",
     "doc_anchor": "docs/optimizations.md#qwen-yarn-mtp"
   },
   {

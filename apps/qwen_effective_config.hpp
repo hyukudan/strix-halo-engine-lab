@@ -299,6 +299,27 @@ inline void validate_effective_options(const Options& o, const ModelContract& mo
     validate_resolved_requested_logprobs(o, model.vocab_size);
     validate_resolved_teacher_forced_score(o, model.vocab_size);
 }
+// Cache identity includes the resolved geometry, profiles and calibration chain.
+inline std::string mtp_bundle_golden_identity(const Options& options, const ModelContract& model) {
+    std::ifstream bundle_input(options.mtp_bundle_path,std::ios::binary);
+    if (!bundle_input) throw std::runtime_error("cannot reread MTP bundle");
+    std::string identity_text((std::istreambuf_iterator<char>(bundle_input)),{});
+    identity_text += model.rotary_identity().json()+std::to_string(options.context_tokens)+":"+
+        std::to_string(numerical_profile_identity(options.numerical_profile))+":"+
+        std::to_string(numerical_profile_identity(numerical_profile_pair(options).prefill));
+    const auto calibration_tokens=mtp_tiled_prompt(options)
+        ? mtp_calibration_rows(options)+1U : options.tokens.size();
+    for (std::size_t i=0;i<calibration_tokens;++i) identity_text += ":"+std::to_string(options.tokens[i]);
+    return model_content_identity_hex(sha256_bytes(
+        std::as_bytes(std::span<const char>(identity_text.data(),identity_text.size()))));
+}
+inline void select_mtp_bundle_golden(Options& options, const ModelContract& model) {
+    if (options.mtp_bundle_path.empty() || !options.mtp.enabled) return;
+    const auto identity=mtp_bundle_golden_identity(options,model);
+    const auto shipped=std::filesystem::path(options.mtp_bundle_path).parent_path()/"goldens"/(identity+".golden");
+    const auto cached=std::filesystem::is_regular_file(shipped)?shipped:mtp_golden_cache_dir()/(identity+".golden");
+    options.mtp.golden=std::filesystem::is_regular_file(cached)?cached.string():std::string{};
+}
 #include "qwen_yarn_admission.inc"
 
 inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& request,
@@ -1053,13 +1074,13 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     if (o.rotary.mode() == RotaryMode::yarn) {
         out << "\"yarn_decode_route\":{\"requested\":\"" << (o.mtp.enabled?"mtp":"serial")
             << "\",\"effective\":\"" << (config.admitted?(o.mtp.enabled?"mtp":"serial"):"refused")
-            << "\",\"source\":\"" << (env_is(config.environment,"STRIX_QWEN_YARN_MTP","0")?
-                "STRIX_QWEN_YARN_MTP=0":o.mtp.enabled?"explicit--mtp":"serial-default-no-bundle-resolver")
-            << "\",\"gpu_qualified\":false,\"contract_version\":1,\"capacity\":" << o.context_tokens
+            << "\",\"source\":" << serve::Json(o.yarn_decode_source).dump()
+            << ",\"gpu_qualified\":false,\"contract_version\":1,\"capacity\":" << o.context_tokens
             << ",\"verifier_requires_serial_rows\":true,\"predictor_position\":\"hidden-source\"},";
         if(o.mtp.enabled) out << "\"yarn_mtp_assets\":{\"target_content\":\"" << o.mtp.target_content
             << "\",\"sidecar_sha256\":\"" << o.mtp.sidecar_sha256 << "\",\"golden_sha256\":\"" << o.mtp.golden_sha256
-            << "\",\"draft_chain\":" << (o.mtp.draft_chain?"true":"false") << ",\"draft_q4\":" << (o.mtp.draft_q4?"true":"false") << "},";
+            << "\",\"golden\":" << serve::Json(!o.mtp_bundle_path.empty() && o.mtp.golden.empty()?"pending-self-generation":o.mtp.golden).dump()
+            << ",\"draft_chain\":" << (o.mtp.draft_chain?"true":"false") << ",\"draft_q4\":" << (o.mtp.draft_q4?"true":"false") << "},";
         out << "\"admission\":{";
         bool first = true;
         for (const auto& [name, bytes] : config.admission) {
@@ -1108,7 +1129,8 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     if (o.http_serve && o.http_batch) out << "null"; else out << 1;
     out << ",\"route\":\"" << (o.http_batch ? "batch" : "single")
         << "\",\"reason\":\"" << o.http_slot_reason << "\"},";
-    if (config.ple_rolling_cap) out << "\"ple_rolling_cap_bytes\":" << config.ple_rolling_cap << ',';
+    // The rolling block above already carries the cap while rolling is active.
+    if (config.ple_rolling_cap && !config.ple_rolling_h) out << "\"ple_rolling_cap_bytes\":" << config.ple_rolling_cap << ',';
     if (o.http_serve) out << "\"serve_prefill_notice\":" << serve::Json(config.serve_prefill_notice).dump() << ',';
     out << "\"admitted\":" << (config.admitted ? "true" : "false") << ",\"reason\":\"" << config.reason
         << "\",\"tile_fallback\":\"" << config.tile_fallback

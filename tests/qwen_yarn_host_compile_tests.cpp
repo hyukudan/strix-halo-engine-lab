@@ -308,6 +308,18 @@ void native_resident_golden_contract(const ModelManifest& manifest) {
             },[&]{warmed=true;});
         require(!source && warmed && m.enabled,"native legacy fallback completes and retains MTP");
     }
+    auto yarn_model=model;ModelContentIdentity table;table.bytes[0]=1;
+    o.rotary=RotaryDescriptor::yarn(2);yarn_model.resolved_rotary=RotaryIdentity(o.rotary,table);
+    o.mtp_bundle_path=(root/"bundle.json").string();m.golden.clear();
+    const auto pending=compile_prompt_requirements(o,yarn_model,manifest,UINT64_C(1)<<30U);
+    require(pending.owners.at("mtp_golden_host")>0,"pending self-generation still charges golden ownership");
+    // A hit must retain the geometry check: legacy geometry is refused, not skipped.
+    m.golden=(root/"native-v2.bin").string();
+    bool refused=false;
+    try {(void)compile_prompt_requirements(o,yarn_model,manifest,UINT64_C(1)<<30U);}
+    catch(const std::exception& e) {refused=std::string(e.what()).find("YaRN requires golden v3 geometry")!=std::string::npos;}
+    require(refused,"bundle cache hit validates geometry");
+
 }
 // Storage eligibility is a shared admission/runtime contract, independent of arithmetic.
 void compact_mtp_route_contract() {
