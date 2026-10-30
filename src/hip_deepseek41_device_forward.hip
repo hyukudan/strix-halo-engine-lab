@@ -653,7 +653,7 @@ DeviceForward::DeviceForward(const std::filesystem::path& gguf, const DeviceForw
             const auto count = m.expert_tp ? ds41::expert_tp::part_bytes(bytes, cfg.n_routed_experts, down, cfg.hidden_size)
                                          : bytes / cfg.n_routed_experts * (m.expert_end - m.expert_first);
             // Allocation is also needed by the fallback; avoid allocating this speculative destination
-            // unless an artifact was requested (the adapter stays inert otherwise).
+            // unless a validated artifact is available (explicit or discovered).
             if (prepared.active()) {
                 Dev<std::uint8_t> d(count);
                 if (prepared.load(n, count, d.p, m.stream)) {

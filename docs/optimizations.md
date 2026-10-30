@@ -825,6 +825,20 @@ warm-up and calibration. Older kernel/transport defaults remain; disable them in
 The combined qualified build measured 1K/8K TTFT 2.098 -> 1.954 s / 11.090 -> 9.757 s, R1 -1.9%,
 R6 -2.4%, N8 -2.2%, and warmed C1 43.58 -> 48.00 tok/s. These are build gains, not item attribution.
 
+<a id="ds-prepared-load"></a>
+
+### Prepared rank-local expert loading
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_PREPARED_LOAD; STRIX_DS41_PREPARED_ROOT`. **Default:** auto discovery.
+
+- **Preconditions:** An offline-prepared local EP/TP pack whose manifest exactly matches the model, overlay, trellis/environment, rank/world, EP/TP and down layout. Serve with expert TP and device prefill uses TP dup; the measured packs were TP packed.
+- **Automatic selection:** Immediate children of STRIX_DS41_PREPARED_ROOT, else XDG_CACHE_HOME/strix/ds41-prepared, else HOME/.cache/strix/ds41-prepared; lexical first valid match. Manifest validation and payload size checks only at discovery; chunks verified before upload. Runtime never writes packs.
+- **Fallback notice:** One concise no-match line and original loader for automatic misses; explicit directory rejections retain their reason and original loader fallback.
+- **Exactness evidence:** R1 tokens (63 position records) identical in every arm on two Strix Halo nodes, production identity, fresh process per arm, ABBA x2, for both the explicit-directory and the default-discovery A/B; TP packed packs accepted on both ranks (72 GiB/node).
+- **Off switch:** STRIX_DS41_PREPARED_LOAD=0. An explicit directory bypasses discovery.
+- **Measured gain:** Default discovery vs STRIX_DS41_PREPARED_LOAD=0, fresh process per arm, ABBA x2: whole-run wall -22.1 s mean (66.0 -> 43.8 s; discovery 43.78-43.86 s, original loader 59.6-81.8 s, its first visit with a cold page cache). Explicit-directory A/B: -20.6 s (63.7 -> 43.0 s).
+- **Implementation / evidence:** [Prepared-load contract and one-time preparation](models/deepseek-v4.1/prepared-load.md), [loader](../src/hip_ds41_prepared_load.hpp).
+
 <a id="ds-packs"></a>
 
 ### Production dense overlay
