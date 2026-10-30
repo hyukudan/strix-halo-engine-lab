@@ -798,6 +798,16 @@ retains its pinned-asset contract. `STRIX_QWEN_YARN_MTP=0` selects serial YaRN.
 
 Full 262K/1M and target-scope 524K MTP equality checks are published; these are relative to serial
 YaRN, not native rotary, and do not qualify general 1M model fidelity or complete workloads.
+Measured on one Strix Halo node, default route (code `a199c8e0` plus the bundle selection of #137), diverse
+real prose (50 public-domain books in six languages), greedy decoding, automatic storage ladder (no storage
+overrides). TTFT runs from process launch to the first token and includes model load.
+
+| Context (YaRN factor) | Exact gate (MTP == serial == pool off) | TTFT serial / MTP | Prefill, serial | Decode serial / MTP | MTP acceptance |
+|---|---|---|---|---|---|
+| 262,400 (2) | Full scope | 219 s / 224 s | 1,254 tok/s | 19.9 / **56.0 tok/s** (2.8x) | 75 % |
+| 524,288 (2) | Target scope | 470 s / 508 s | 1,215 tok/s | 19.7 / **60.6 tok/s** (3.1x) | 85 % |
+| 1,048,576 (4) | Full scope, plus the default-path receipt | 1,005 s / 1,096 s | 1,081 tok/s (MTP route about 970) | 18.7 / **55.9 tok/s** (3.0x) | 83 % |
+
 See [YaRN MTP and bundles](docs/engine/speculative/mtp-native-cli.md#explicit-yarn-mtp-cli),
 [pool/PLE route matrix](docs/engine/qsa-committed-pool.md) and
 [long-context fidelity checks](tools/qualification/longctx_fidelity/README.md).

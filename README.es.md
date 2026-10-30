@@ -830,6 +830,16 @@ conserva su contrato de assets fijados. `STRIX_QWEN_YARN_MTP=0` selecciona YaRN 
 
 Se publican comprobaciones de igualdad MTP completas a 262K/1M y de alcance objetivo a 524K; son relativas a YaRN
 serial, no a la rotatoria nativa, y no cualifican la fidelidad general del modelo a 1M ni cargas de trabajo completas.
+Medido en un nodo Strix Halo, ruta por defecto (código `a199c8e0` más la selección de bundle de #137), prosa real
+diversa (50 libros de dominio público en seis idiomas), decodificación greedy y escalera de almacenamiento automática (sin
+ajustes manuales de almacenamiento). El TTFT va desde el arranque del proceso hasta el primer token e incluye la carga del modelo.
+
+| Contexto (factor YaRN) | Gate exacto (MTP == serial == pool desactivado) | TTFT serial / MTP | Prefill, serial | Decode serial / MTP | Aceptación MTP |
+|---|---|---|---|---|---|
+| 262,400 (2) | Alcance completo | 219 s / 224 s | 1,254 tok/s | 19.9 / **56.0 tok/s** (2.8x) | 75 % |
+| 524,288 (2) | Alcance objetivo | 470 s / 508 s | 1,215 tok/s | 19.7 / **60.6 tok/s** (3.1x) | 85 % |
+| 1,048,576 (4) | Alcance completo, más el recibo de la ruta por defecto | 1,005 s / 1,096 s | 1,081 tok/s (ruta MTP unos 970) | 18.7 / **55.9 tok/s** (3.0x) | 83 % |
+
 Véanse [MTP con YaRN y bundles](docs/engine/speculative/mtp-native-cli.md#explicit-yarn-mtp-cli),
 la [matriz de rutas de pool/PLE](docs/engine/qsa-committed-pool.md) y
 las [comprobaciones de fidelidad en contexto largo](tools/qualification/longctx_fidelity/README.md).
