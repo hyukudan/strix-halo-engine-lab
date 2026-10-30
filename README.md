@@ -5,57 +5,59 @@ discrete GPU when there is one.**
 
 [English](README.md) · [Español](README.es.md)
 
-<!-- SCREENSHOT: monitor panel of the engine goes here once the panel ships, e.g.
-<p align="center"><img alt="Engine monitor panel" src="docs/media/monitor.png" width="860"></p>
--->
+This C++/HIP inference engine targets **AMD Strix Halo** (Ryzen AI Max+ 395, Radeon 8060S
+`gfx1151`, 128 GB unified memory) under Linux with ROCm. All five public engines are
+**Production**, with exact execution and fast defaults: Qwen on one node, DeepSeek on a USB4
+pair or standalone RTX, and MiniMax and GLM on the pair. DeepSeek also supports RTX + pair execution.
 
-This is our own C++/HIP inference engine for **AMD Strix Halo** (Ryzen AI Max+ 395, Radeon 8060S `gfx1151`,
-128 GB of unified memory) under Linux with ROCm. It runs large mixture-of-experts models:
+Published measurements include:
 
-- **Qwen3.8-Flash-Next** on one node, or as two replicas on two nodes. One coding-chat request decodes at
-  **90.7 tok/s** (prose about 55 tok/s); eight concurrent coding chats sum to **255 tok/s** of decode. With an
-  RTX PRO 6000 reading the prompt, a 32K-token prompt gets its first token in **9.0 s**.
-- **DeepSeek V4.1 Flash** split across **two nodes over USB4** (expert tensor parallel), optionally with an
-  **RTX PRO 6000** taking the first 22 layers. Code prompts decode at **70.6 tok/s** on the pair (prose about
-  42-45 tok/s) and **91.3 tok/s** with the RTX PRO (2026-10-26); the 2026-10-26 pair build reaches **113.9 tok/s** aggregate (N8, calculated).
-- **MiniMax M3.1 Flash** on the pair has passed its eight-text quality gate; greedy decode takes
-  **44.57 ms/token at 1K**; fresh 8K prefill takes **17.73 s**. **GLM-5.3 Flash** reaches
-  **22.1 tok/s** in the measured R1 identity on its latest measured build (2026-10-26), and with MTP
-  self-speculation, now on by default, **37.1 / 44.5 / 40.0 tok/s** on chat / code / JSON (2026-10-27; conditions below).
-- **DeepSeek on an RTX PRO 6000 (96 GB, Windows WDDM)** runs the target and DSpark draft on that GPU,
-  with an exclusive VRAM + pinned-host cache: exact decode **82–95 tok/s** for code; same-load code / English /
-  Spanish rates are **82.3 / 87.7 / 94.4 tok/s** (2026-10-25; conditions below).
+- **Qwen3.8-Flash-Next:** 59.59 / 54.00 tok/s on 1K / 8K code prompts with MTP;
+  two replicas reach 158.1 tok/s wall throughput at eight concurrent coding chats.
+- **DeepSeek V4.1 Flash pair:** 70.6 tok/s on code with DSpark; eight plain decode rows
+  reach 113.9 tok/s aggregate (calculated from measured step time).
+- **DeepSeek standalone RTX PRO 6000:** same-load code / English / Spanish decode
+  at 82.3 / 87.7 / 94.4 tok/s with the target and draft on the GPU.
+- **MiniMax M3.1 Flash:** 44.57 ms/token at 1K with plain decode; DSpark reaches
+  54.4 / 34.1 / 24.1 tok/s on JSON / Python / prose.
+- **GLM-5.3 Flash:** default exact MTP self-speculation reaches
+  37.1 / 44.5 / 40.0 tok/s on chat / code / JSON.
 
-Every kernel, memory layout and scheduling choice is written for this chip and these models. The speed comes from
-exact speculative decoding (the full model checks every drafted token), batching and replicas, never from changing
-the answer: speculative output equals plain greedy decoding wherever we claim it, and every such claim is checked
-by a gate.
+These are workload-specific results, not speed guarantees. [How fast](#how-fast) preserves the
+hardware, profiles, concurrency and measurement limits; [published performance](docs/performance.md)
+contains the supporting records.
 
-> **Status: production engines for all models listed below.** It works end to end and every number below is measured. Each model ships a
-> command-line tool that prints a JSON receipt and an OpenAI (chat, completions, stateless Responses)/Anthropic-compatible HTTP server
-> (`strix-hip-decode-token --http-serve` for Qwen, `strix-deepseek41-serve` for DeepSeek). The lab also hosts
-> model-specific optimization work; see [Models](#models).
+**Exactness means token-identical to the declared reference path.** Speculation and concurrency
+preserve that contract; changing weights, rotary semantics, numerical identity or request policy
+changes the reference. See [Exactness](#exactness).
+
+Each family ships command-line execution and qualification tools. Qwen and DeepSeek pair expose
+chat, completions and stateless Responses HTTP routes; MiniMax ships `strix-minimax-serve`.
+Standalone RTX uses a persistent file-queue worker. See [Run](#run) for each engine's launch contract.
 
 ## At a glance
 
-**Who is this for?** Developers experimenting with **native, AMD-first LLM inference** on Ryzen AI Max / Strix Halo—not a general-purpose drop-in inference framework.
+**Who is this for?** Developers deploying or studying native, model-specific LLM inference on Ryzen AI Max / Strix Halo.
 
 | Question | Short answer |
 |---|---|
 | What is it? | An independent C++/HIP inference engine, with model-specific execution paths, kernels, verification gates and HTTP serving. |
 | Which hardware? | One Strix Halo Linux node, two nodes linked by USB4, and optional RTX PRO assistance for selected profiles. |
 | Which models? | Qwen, DeepSeek (pair, standalone RTX and RTX + pair), MiniMax and GLM are Production. See [Models](#models). |
-| Does it change model outputs? | Qualified speculative paths check generated tokens against normal greedy decode; other configurations must pass their own exactness gates. |
+| Does it change model outputs? | Exact by default relative to a declared profile and reference; speculative and concurrent execution preserve that sequence. See [Exactness](#exactness). |
 | How do I verify release assets? | Use the CPU [release asset manifest](docs/operations/release-assets.md) tool for full hashes and explicit role closure. |
 | What startup diagnostics are available? | Qwen has default-on [read-only preflight and configured build identity](docs/operations/startup-preflight.md), with explicit off switches. |
 | Where do I begin? | Read [requirements](#what-you-need), [build](#build), then [run](#run). |
 | Where are reproducible results? | [Performance methodology and results](docs/performance.md), with test conditions and verification; headline throughput is not a universal guarantee. |
 
-**Project boundaries:** [TensorMeld](https://github.com/hyukudan/tensormeld) handles planning and routing; [Hyperloom](https://github.com/hyukudan/hyperloom) integrates deployment and control; the [USB4 driver](https://github.com/hyukudan/strix-halo-usb4-driver) handles the Linux interconnect. This repository owns **inference execution**, not cluster management.
+**Project boundaries:** [TensorMeld](https://github.com/hyukudan/tensormeld) handles planning and routing; the [USB4 driver](https://github.com/hyukudan/strix-halo-usb4-driver) handles the Linux interconnect. This repository owns **inference execution**, not cluster management.
 
 For detailed implementation internals, use [How it works](#how-it-works) and the documents linked throughout the model sections. The model weights and their licences are separate from the engine code.
 
 ## Quick start: build and run one model
+
+For other engines, jump to [DeepSeek pair](#deepseek-pair), [standalone RTX](#deepseek-standalone-rtx),
+[MiniMax](#minimax-pair) or [GLM](#glm-pair).
 
 This minimal example is for **one Linux Strix Halo node** with the required ROCm toolchain, model GGUF and a tokenizer-produced `prompt.ids` file. It runs **Qwen generation with the production defaults**, including automatic fast prefill for eligible prompts.
 
@@ -80,7 +82,7 @@ With the matching Qwen model and token IDs available in your working directory:
 ./build/strix-hip-decode-token Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf $(cat prompt.ids) --generate 256
 ```
 
-Add `--print-effective-config` to see what it resolves to before HIP initialization. `--baseline` (or `STRIX_BASELINE=1`) restores the previous minimal resolution.
+Add `--print-effective-config` to inspect before HIP initialization. See [Defaults and off switches](#defaults-and-off-switches) for baseline scope.
 
 The command produces a JSON receipt with token IDs and timing. Actual model files and prompt tokens are **not included**. For model assets, optional MTP/DSpark acceleration, serving and two-node transport, continue with [requirements](#what-you-need), [build](#build), [run](#run), and the [full engine reference](docs/getting-started/engine-reference.md). Some CTest cases require the GPU and model assets.
 
@@ -90,11 +92,13 @@ The command produces a JSON receipt with token IDs and timing. Actual model file
 [Hardware](#hardware) ·
 [How fast](#how-fast) ·
 [How exact, how good](#how-exact-how-good) ·
+[Exactness](#exactness) ·
 [Why it is different](#why-it-is-different) ·
 [Languages](#beyond-english) ·
 [What you need](#what-you-need) ·
 [Build](#build) ·
 [Run](#run) ·
+[Defaults and off switches](#defaults-and-off-switches) ·
 [Optimizations](#optimizations) ·
 [How it works](#how-it-works) ·
 [Design decisions](#design-decisions) ·
@@ -107,15 +111,15 @@ The command produces a JSON receipt with token IDs and timing. Actual model file
 
 | Model | Runs on | Status | Highlights |
 |---|---|---|---|
-| **Qwen3.8-Flash-Next** (UD-Q4_K_XL, 111 GB) | 1 node; 2 replicas behind a router | **Production** | MTP speculative decoding with a distilled draft head, bit-identical to serial greedy; server with as many request slots as memory admits (built on demand); decode keeps streaming during long prompts and short requests are admitted inside them; prefix state cache; [opt-in GSQ profile](#gsq-opt-in-speed-over-quality-profile) |
-| **DeepSeek V4.1 Flash** (1017; 2-bit experts, 6.5-bit + trellis dense) | 2 nodes over USB4 | **Production** (two-node defaults D-061) | Expert tensor parallel decode, expert parallel device prefill, DSpark speculative decode, batched decode, server; bitwise gates |
+| **Qwen3.8-Flash-Next** (UD-Q4_K_XL, 111 GB) | 1 node; 2 replicas behind a router | **Production** | Exact MTP with a distilled draft head; native context through 262K and explicit YaRN through 1M; automatic HTTP tiled prefill; server with as many request slots as memory admits (built on demand); decode keeps streaming during long prompts and short requests are admitted inside them; prefix state cache; [opt-in GSQ profile](#gsq-opt-in-speed-over-quality-profile) |
+| **DeepSeek V4.1 Flash** (1017; 2-bit experts, 6.5-bit + trellis dense) | 2 nodes over USB4 | **Production** | Expert tensor parallel decode, expert parallel device prefill, DSpark speculative decode, batched decode, server; prepared expert discovery and bounded prefix retention; bitwise gates |
 | DeepSeek V4.1 Flash + RTX PRO 6000 | RTX PRO (layers 0-21) + 2 nodes (22-39) | **Production** (D-064) | Pipeline split over 1 GbE, CUDA prefill service, hot-expert placement |
 | DeepSeek V4.1 Flash, standalone RTX | RTX PRO 6000 (96 GB, Windows WDDM) | **Production** | Q2 GGUF experts, Q8_0 dense; exclusive VRAM + pinned-host cache; on-GPU DSpark with warm controller selected as the speculative default |
-| MiniMax M3.1 Flash (EXL3, 3.06 bpw) | 2 nodes TP2 over USB4 | **Production** | Eight-text quality gate passed; exact prefill and decode; qualified prefill and exchange optimizations on by default |
+| MiniMax M3.1 Flash (EXL3, 3.06 bpw) | 2 nodes TP2 over USB4 | **Production** | Eight-text quality gate passed; exact prefill/decode; DSpark serving auto admission and MSA mode 5; prefill/exchange defaults on |
 | GLM-5.3 Flash (EXL3, 4.05 bpw) | 2 nodes TP2 over USB4 | **Production** | R1b decode identity by default; exact MTP self-speculation by default; exact R1 chunked prefill; `--identity r1` restores R1; R≥3 fix verified on the pair |
 
 The core knows no model: each family is a module with its own contract, plan, kernels and gates
-([docs/models/model-families.md](docs/models/model-families.md)). The automatic profiles only admit the pinned model files listed in
+([docs/models/model-families.md](docs/models/model-families.md)). Automatic routes admit model assets under their documented contracts; provenance and licenses are recorded in
 [docs/reference/sources-ledger.md](docs/reference/sources-ledger.md).
 
 ## Hardware
@@ -144,34 +148,37 @@ How to read the tables:
 - **tok/s** is decode speed after the prompt has been read, for one request unless the concurrency says
   otherwise. **TTFT** is time to first token.
 - **Build** identifies the measured code revision; results apply to that build and configuration.
-- Medians of 3 or more runs unless stated otherwise. The latest 2026-10-25/26 rows give repetition counts
-  where recorded; unspecified counts must not be assumed to be medians. Older dates remain for modes not re-measured.
+  Calendar metadata and complete provenance remain in the linked performance records.
+- Repetition counts are stated where recorded. Unspecified counts must not be assumed to be medians;
+  single runs and separate campaigns remain labeled.
 
 Hardware: **1 node** = one Strix Halo (128 GB). **2 nodes** = two Strix Halo joined by two USB4 cables.
 **RTX PRO** = an RTX PRO 6000 Blackwell (96 GB) in a PC on 1 GbE.
 
 ### DeepSeek V4.1 Flash
 
+Sources: [published performance](docs/performance.md) and [current pair defaults](docs/models/deepseek-v4.1/production-defaults.md).
+
 Pair-only rows: DeepSeek V4.1 Flash (1017 checkpoint), routed experts in the published 2-bit (Q2) GGUF, dense weights in
 a 6.5-bit overlay with trellis-coded attention, shared-expert and head weights. 2 nodes, expert tensor parallel
 (TP2) over USB4.
 
-| Mode | Hardware | Prompt / context | Concurrency | Best | Typical | Date | Build |
-|---|---|---|---:|---:|---:|---|---|
-| Greedy decode | 2 nodes | short decode benchmark, R1 | 1 | **28.333 ms/token** (35.3 tok/s; 59.5 % of calculated ceiling, 16.87 ms floor) | 2 interleaved pairs; tokens identical | 2026-10-26 | `6a5604bf` |
-| DSpark speculative decode | 2 nodes | 8 prompts per type, 256 tokens each | 1 | **70.6 tok/s** (code) | 41.9 (English) / 45.3 (Spanish); 50.0 over all 24 | 2026-10-24 | `cab238d6` |
-| Batched decode, no drafting | 2 nodes | N8 decode benchmark, all rows equal the reference | 8 | **70.24 ms/step** (113.9 tok/s aggregate, calculated; 66.2 % of calculated ceiling, 46.48 ms floor) | | 2026-10-26 | `6a5604bf` |
-| Device prefill (expert parallel) | 2 nodes | 1K benchmark prompt, kind unspecified | 1 | TTFT **1.954 s** | median of 4; logits bit-identical on both ranks | 2026-10-26 | `6a5604bf` |
-| Device prefill | 2 nodes | 8K benchmark prompt, kind unspecified | 1 | TTFT **9.757 s** | median of 3; logits bit-identical on both ranks | 2026-10-26 | `6a5604bf` |
-| Device prefill | 2 nodes | 16K | 1 | TTFT **20.40 s** (803 tok/s) | | 2026-10-24 | `f9332f3e` |
-| Device prefill | 2 nodes | 32K | 1 | TTFT **39.6 s** (828 tok/s), 2 runs | | 2026-10-23 | `43086d05` + prefill defaults |
-| Server, one client, chat | 2 nodes | chat prompt | 1 | **66.9 tok/s** (code) | 34.9 tok/s (prose) | 2026-10-22 | release |
-| Server, 8 chats × 128 tokens | 2 nodes | chat prompts | 1 / 2 / 4 / 8 | **41.4 / 54.0 / 59.7 / 67.9 tok/s** aggregate | | 2026-10-22 | release |
-| Server, 8-category short set | 2 nodes | 36-303-token prompts | 1 / 2 / 4 / 8 | | **39.88 / 61.66 / 66.53 / 74.25 tok/s** aggregate | 2026-10-24 | `cab238d6` |
-| Warmed server, 8-category short set | 2 nodes | same short set as above | 1 / 2 / 4 / 8 | **48.00 / 63.97 / 69.20 / 77.00 tok/s** aggregate | 64/64 IDs equal; C8 clean run (see below) | 2026-10-26 | `6a5604bf` |
-| Server TTFT | 2 nodes | 8K, warm server idle | 1 | **11.80 s** | **26.40 s** while 4 other streams decode; fresh-server first request 12.72 s | 2026-10-24 | `cab238d6` |
+| Mode | Hardware | Prompt / context | Concurrency | Best | Typical | Build |
+|---|---|---|---:|---:|---:|---|
+| Greedy decode | 2 nodes | short decode benchmark, R1 | 1 | **28.333 ms/token** (35.3 tok/s; 59.5 % of calculated ceiling, 16.87 ms floor) | 2 interleaved pairs; tokens identical | `6a5604bf` |
+| DSpark speculative decode | 2 nodes | 8 prompts per type, 256 tokens each | 1 | **70.6 tok/s** (code) | 41.9 (English) / 45.3 (Spanish); 50.0 over all 24 | `cab238d6` |
+| Batched decode, no drafting | 2 nodes | N8 decode benchmark, all rows equal the reference | 8 | **70.24 ms/step** (113.9 tok/s aggregate, calculated; 66.2 % of calculated ceiling, 46.48 ms floor) | | `6a5604bf` |
+| Device prefill (expert parallel) | 2 nodes | 1K benchmark prompt, kind unspecified | 1 | TTFT **1.954 s** | median of 4; logits bit-identical on both ranks | `6a5604bf` |
+| Device prefill | 2 nodes | 8K benchmark prompt, kind unspecified | 1 | TTFT **9.757 s** | median of 3; logits bit-identical on both ranks | `6a5604bf` |
+| Device prefill | 2 nodes | 16K | 1 | TTFT **20.40 s** (803 tok/s) | | `f9332f3e` |
+| Device prefill | 2 nodes | 32K | 1 | TTFT **39.6 s** (828 tok/s), 2 runs | | `43086d05` + prefill defaults |
+| Server, one client, chat | 2 nodes | chat prompt | 1 | **66.9 tok/s** (code) | 34.9 tok/s (prose) | release |
+| Server, 8 chats × 128 tokens | 2 nodes | chat prompts | 1 / 2 / 4 / 8 | **41.4 / 54.0 / 59.7 / 67.9 tok/s** aggregate | | release |
+| Server, 8-category short set | 2 nodes | 36-303-token prompts | 1 / 2 / 4 / 8 | | **39.88 / 61.66 / 66.53 / 74.25 tok/s** aggregate | `cab238d6` |
+| Warmed server, 8-category short set | 2 nodes | same short set as above | 1 / 2 / 4 / 8 | **48.00 / 63.97 / 69.20 / 77.00 tok/s** aggregate | 64/64 IDs equal; C8 clean run (see below) | `6a5604bf` |
+| Server TTFT | 2 nodes | 8K, warm server idle | 1 | **11.80 s** | **26.40 s** while 4 other streams decode; fresh-server first request 12.72 s | `cab238d6` |
 
-**On by default since 2026-10-26** in the pair build (`6a5604bf`): shared-down fusion
+**On by default** in the pair build (`6a5604bf`): shared-down fusion
 (`STRIX_DS41_SHARED_DOWN_FUSED=0` to disable), split gate/up MoE prefill kernel "form 7"
 (`STRIX_DS41_MOE_PREFILL=0`), exact per-site dense prefill selector (`STRIX_DS41_DENSE_SELECT=0`;
 FP16 forms stay off), attention window fold / live chunks / f16 tile
@@ -193,39 +200,36 @@ and two Strix Halo nodes using expert tensor parallel over USB4:
 Prefill uses benchmark prompts of unspecified kind; logits are bit-identical to the archived reference
 on every run on both ranks. Prompt kind/context are unspecified for the short decode benchmarks.
 Server: two runs per arm in both orders; one of the two new-build runs had a single prefill unit stall
-of 3.8 s (cause under investigation), so C8 uses the clean run. The 2026-10-26 pair build supersedes
+of 3.8 s (cause under investigation), so C8 uses the clean run. The measured pair build supersedes
 the earlier single-client serving regression: it serves faster than `69c6bdab`.
 
 **DeepSeek with the RTX PRO, pipeline split** (same model files; the RTX runs layers 0-21 with CUDA, the two nodes run
 layers 22-39 and the head):
 
-| Mode | Hardware | Prompt / context | Concurrency | Best | Typical | Date | Build |
-|---|---|---|---:|---:|---:|---|---|
-| DSpark speculative decode | RTX PRO + 2 nodes | 8 prompts per type, 256 tokens each | 1 | **91.3 tok/s** (code) | 56.0 (English) / 61.5 (Spanish); 69.6 over all 24 (was 61.8, +12.6 %); tokens 24/24 identical to the 2026-10-22 run; exact identity without trellis shared expert: 90.0 / 54.9 / 59.6, 68.2 over all 24 (was 61.7) | 2026-10-26 | pair `6a5604bf`; RTX front = PR #52 code + decode-option wiring (pending publication) |
-| Greedy decode | RTX PRO + 2 nodes | same 24 prompts, 256 tokens each | 1 | **43.2 tok/s** (was 38.3, +12.8 %) | same; tokens 24/24 identical, reference-gated | 2026-10-26 | pair `6a5604bf`; RTX front = PR #52 code + decode-option wiring (pending publication) |
-| Server TTFT | RTX PRO + 2 nodes | 1K / 8K, warm | 1 | **2.14 / 10.92 s** | pair-only on the same pair build 2.11 / 10.74 s (the split adds 23 / 181 ms); token IDs equal | 2026-10-26 | pair `6a5604bf`; RTX front = PR #52 code + decode-option wiring (pending publication) |
-| Batched decode, no drafting | RTX PRO + 2 nodes | 8 benchmark prompts, 48 tokens; 2 groups in flight | 2 / 4 / 8 | **60.1 / 97.5 / 137.2 tok/s** aggregate | bitwise equal to pair-only reference | 2026-10-24 | pair `6525d5e8`, CUDA `463c08ec` line |
-| Batched DSpark decode | RTX PRO + 2 nodes | same benchmark, controller windows | 1 / 2 / 4 | **52.4 / 91.3 / 156.8 tok/s** wall aggregate | bitwise reference gates | 2026-10-24 | same line |
-| Server, 8-category short set | RTX PRO + 2 nodes | short prompts, DSpark; 2 groups in flight | 1 / 2 / 4 / 8 | **43.2 / 65.8 / 77.9 / 91.7 tok/s** aggregate | token IDs equal pair-only in 32/32 requests | 2026-10-25 | pair `6525d5e8`, CUDA `463c08ec` |
-| Prompt reading on the RTX PRO (exact profile) | RTX PRO | 2K / 8K / 32K | 1 | TTFT **3.64 / 4.39 / 12.20 s** | | 2026-10-22 | release |
+| Mode | Hardware | Prompt / context | Concurrency | Best | Typical | Build |
+|---|---|---|---:|---:|---:|---|
+| Batched decode, no drafting | RTX PRO + 2 nodes | 8 benchmark prompts, 48 tokens; 2 groups in flight | 2 / 4 / 8 | **60.1 / 97.5 / 137.2 tok/s** aggregate | bitwise equal to pair-only reference | pair `6525d5e8`, CUDA `463c08ec` line |
+| Batched DSpark decode | RTX PRO + 2 nodes | same benchmark, controller windows | 1 / 2 / 4 | **52.4 / 91.3 / 156.8 tok/s** wall aggregate | bitwise reference gates | same line |
+| Server, 8-category short set | RTX PRO + 2 nodes | short prompts, DSpark; 2 groups in flight | 1 / 2 / 4 / 8 | **43.2 / 65.8 / 77.9 / 91.7 tok/s** aggregate | token IDs equal pair-only in 32/32 requests | pair `6525d5e8`, CUDA `463c08ec` |
+| Prompt reading on the RTX PRO (exact profile) | RTX PRO | 2K / 8K / 32K | 1 | TTFT **3.64 / 4.39 / 12.20 s** | | release |
 
 The batch/serving pipeline overlaps two groups of requests: the RTX processes one while the pair processes
 the other (one group for a single request). These batch/serving rows use Q2 experts, the 6.5-bit dense overlay and the separately gated expert-TP
 identity; they do not use the single-request trellis-composed profile.
 
-The pair-only single-request DSpark run on the same build gives 46.4 tok/s over the 24 prompts (×1.33 with the RTX PRO). The single-request RTX
-split is bitwise equal to the pair without the trellis sites; with them (the single-request rows) it is a declared composed
+The single-request RTX
+split is bitwise equal to the pair without the trellis sites; with trellis sites it is a declared composed
 identity, checked against the pair (KL 1.7e-3), not bitwise. RTX TTFT: warm resident service, model load
 excluded, up to the exported attention state handed to the import endpoint. A faster CUDA prefill profile fails
 the quality gate on long prompts and is not quoted.
 
-**Standalone RTX DeepSeek — Production (2026-10-25).** Full DeepSeek V4.1 Flash target on an
+**Standalone RTX DeepSeek — Production.** Full DeepSeek V4.1 Flash target on an
 RTX PRO 6000 (96 GB, Windows WDDM): Q2 GGUF routed gate/up **IQ2_XXS**, routed down **Q2_K**, dense **Q8_0**.
 Experts use an exclusive VRAM + pinned-host cache; the target and DSpark draft share the GPU. The draft keeps
 the 64 most-used experts per stage. Deferred/bounded write-backs, the CUDA-graph instantiation fix and the
 warm controller default are adopted; keep-64 pruning measured **+16 %** on code with a four-row window.
 
-| Mode (2026-10-25) | Code | English | Spanish | Calculated ceiling share |
+| Mode | Code | English | Spanish | Calculated ceiling share |
 |---|---:|---:|---:|---|
 | Exact DSpark decode, warm controller + deferred write-backs, same load | **82.3 tok/s** | **87.7 tok/s** | **94.4 tok/s** | **51–58 %** of the 6.18 ms/token all-hit floor |
 | Exact DSpark decode, best runs across loads | **94–95 tok/s** | **97 tok/s** | **100–101 tok/s** | **58–63 %** of the same ceiling |
@@ -234,13 +238,13 @@ Quote code throughput as **82–95 tok/s**: loads vary by up to **~10 %**, so co
 Exact gates pass for this RTX profile; equality against the pair's trellis profile is not claimed.
 Prompt lengths and generated-token counts are unspecified for these latest decode measurements.
 
-| Loading / serving work (2026-10-25) | Measured result | Status |
+| Loading / serving work | Measured result | Status |
 |---|---|---|
 | Pipelined expert loading | Full load **108.7 → 61.8 s**; expert fill **83.1 → 38.0 s**, **2.25 → 6.73 GB/s**, disk-bound | **Published, on by default** ([PR #52](https://github.com/hyukudan/strix-halo-engine-lab/pull/52)); bitwise-identical placement and outputs |
 | Persistent loaded worker | **8–18 s per request** on test workloads without reload; fresh-load cache reset **3.4 s** | **Published** (`--serve`, PR #52); each request bitwise identical to a fresh process |
 | Window prefetch | No repeatable gain in matched warm comparisons | Exact; default off |
 
-**Cold start, same standalone RTX profile (2026-10-26).** Persistent worker,
+**Cold start, same standalone RTX profile.** Persistent worker,
 tested binary `1569bce5`; runtime write-back/flush switches preserve fresh-process tokens, logits and state
 (6/6 offline comparisons). These are step timings, not chat throughput or TTFT:
 
@@ -253,7 +257,7 @@ tested binary `1569bce5`; runtime write-back/flush switches preserve fresh-proce
 
 Graph pre-capture adds **1.5 s before readiness**. Prompt kind/length are unspecified for this exact-phase
 benchmark. The worker, residency seed and graph pre-capture are published with
-[PR #52](https://github.com/hyukudan/strix-halo-engine-lab/pull/52) (2026-10-26): the adopted exact settings (keep-64, deferred
+[PR #52](https://github.com/hyukudan/strix-halo-engine-lab/pull/52): the adopted exact settings (keep-64, deferred
 write-backs, warm controller, decode kernel bundle and fusions) are on by default with off switches, and a no-flag run
 matched the explicit configuration (all gates 64/64, identical speculation traces, 21/21 chat tokens) on a reduced
 pinned cache, so that gate does not give speed numbers. The measured **82–95 tok/s** code range remains the quoted result.
@@ -261,19 +265,21 @@ Build, run and defaults: [docs/models/deepseek-v4.1/rtx-standalone.md](docs/mode
 
 ### Qwen3.8-Flash-Next
 
+Sources: [prefill/default measurements](docs/performance.md#qwen-prefill-and-defaults) and [decode/serving results](docs/performance.md).
+
 All rows: Qwen3.8-Flash-Next, UD-Q4_K_XL GGUF (111 GB) plus a distilled Q8_0 MTP draft head (2.8 GB), MTP
 speculative decoding with windows 2/4/8, dense A8 profile, thinking off, 256 generated tokens unless stated.
 
-| Mode | Hardware | Prompt / context | Concurrency | Best | Typical | Date | Build |
-|---|---|---|---:|---:|---:|---|---|
-| MTP decode | 1 node | 1K, code, auto windows | 1 | **59.59 tok/s** (69 % of 86.8 tok/s byte ceiling) | prose: 55.7 tok/s (`0117a140`, 2026-10-24) | 2026-10-25 | `702bc074` |
-| MTP decode | 1 node | 8K | 1 | **54.00 tok/s** (code, auto windows) | prose: 49.58 tok/s (`226bb691`, exact draft attention) | 2026-10-25 | code `702bc074`; prose `226bb691` |
-| MTP decode | 1 node | 32K | 1 | **47.9 tok/s** (code; observed range 44.5–52.6) | median of 4 | 2026-10-24 | `0117a140` |
-| MTP + copy windows (opt-in), long copy-edit | 1 node | Markdown document (~10 KB) to fix, 2,047-token answer | 1 | **183.5 tok/s** | | 2026-10-24 | `e1b115a2` |
-| MTP + copy windows (opt-in), long copy-edit | 1 node | Python file + diff to apply, 1,417-token answer | 1 | **163.9 tok/s** | | 2026-10-24 | `e1b115a2` |
-| MTP + copy windows (opt-in), long copy-edit | 1 node | C++ file to rewrite with renames, 1,711-token answer | 1 | **155.1 tok/s** | | 2026-10-24 | `e1b115a2` |
-| MTP + copy windows (opt-in), 7 copy-edit tasks | 1 node | 5-10 KB inputs, 1,114-2,047-token answers | 1 | | **125.2 tok/s** (90.2 without copy windows) | 2026-10-24 | `dd65dbd5` |
-| MTP + copy windows (opt-in), agent sessions | 1 node | 6 coding-agent sessions | 1 | | 59.9 tok/s (unchanged by copy windows) | 2026-10-24 | `dd65dbd5` |
+| Mode | Hardware | Prompt / context | Concurrency | Best | Typical | Build |
+|---|---|---|---:|---:|---:|---|
+| MTP decode | 1 node | 1K, code, auto windows | 1 | **59.59 tok/s** (69 % of 86.8 tok/s byte ceiling) | prose: 55.7 tok/s (`0117a140`) | `702bc074` |
+| MTP decode | 1 node | 8K | 1 | **54.00 tok/s** (code, auto windows) | prose: 49.58 tok/s (`226bb691`, exact draft attention) | code `702bc074`; prose `226bb691` |
+| MTP decode | 1 node | 32K | 1 | **47.9 tok/s** (code; observed range 44.5–52.6) | median of 4 | `0117a140` |
+| MTP + copy windows (opt-in), long copy-edit | 1 node | Markdown document (~10 KB) to fix, 2,047-token answer | 1 | **183.5 tok/s** | | `e1b115a2` |
+| MTP + copy windows (opt-in), long copy-edit | 1 node | Python file + diff to apply, 1,417-token answer | 1 | **163.9 tok/s** | | `e1b115a2` |
+| MTP + copy windows (opt-in), long copy-edit | 1 node | C++ file to rewrite with renames, 1,711-token answer | 1 | **155.1 tok/s** | | `e1b115a2` |
+| MTP + copy windows (opt-in), 7 copy-edit tasks | 1 node | 5-10 KB inputs, 1,114-2,047-token answers | 1 | | **125.2 tok/s** (90.2 without copy windows) | `dd65dbd5` |
+| MTP + copy windows (opt-in), agent sessions | 1 node | 6 coding-agent sessions | 1 | | 59.9 tok/s (unchanged by copy windows) | `dd65dbd5` |
 
 Copy windows (`--mtp-ngram-draft=wide --mtp-copy-wide-rows 32`) verify up to 32 rows when the answer copies text
 from the prompt; tokens are identical to the default in every run. They help when the answer re-emits long spans
@@ -285,38 +291,38 @@ of 3 rounds, no warm-up; token ids equal the single-node run in 570/570 response
 rates use build `0117a140`, fresh servers with one excluded warm-up request, 3 ABBAAB rounds; 90/90
 responses equal the single-node reference:
 
-| Mode | Hardware | Prompt / context | Concurrency | Best: coding chat | Typical: 8-category short set | Date | Build |
-|---|---|---|---:|---:|---:|---|---|
-| Server, two replicas | 2 nodes | ~70-token chat / 36-303-token prompts | 1 | **68.2 tok/s** wall | 42.8 tok/s wall, TTFT p50 0.89 s | 2026-10-24 coding; 2026-10-22 short set | `0117a140` coding; release short set |
-| Server, two replicas | 2 nodes | same | 2 | **136.4 tok/s** wall | 85.8 wall, TTFT p50 0.85 s | 2026-10-24 coding; 2026-10-22 short set | `0117a140` coding; release short set |
-| Server, two replicas | 2 nodes | same | 4 | **146.8 tok/s** wall | 102.9 wall, TTFT p50 1.32 s | 2026-10-24 coding; 2026-10-22 short set | `0117a140` coding; release short set |
-| Server, two replicas | 2 nodes | same | 8 | **158.1 tok/s** wall | 120.4 wall, TTFT p50 2.55 s | 2026-10-24 coding; 2026-10-22 short set | `0117a140` coding; release short set |
+| Mode | Hardware | Prompt / context | Concurrency | Best: coding chat | Typical: 8-category short set | Build |
+|---|---|---|---:|---:|---:|---|
+| Server, two replicas | 2 nodes | ~70-token chat / 36-303-token prompts | 1 | **68.2 tok/s** wall | 42.8 tok/s wall, TTFT p50 0.89 s | `0117a140` coding; release short set |
+| Server, two replicas | 2 nodes | same | 2 | **136.4 tok/s** wall | 85.8 wall, TTFT p50 0.85 s | `0117a140` coding; release short set |
+| Server, two replicas | 2 nodes | same | 4 | **146.8 tok/s** wall | 102.9 wall, TTFT p50 1.32 s | `0117a140` coding; release short set |
+| Server, two replicas | 2 nodes | same | 8 | **158.1 tok/s** wall | 120.4 wall, TTFT p50 2.55 s | `0117a140` coding; release short set |
 
 *Wall* is all completion tokens over wall time including the first token and queueing. The earlier
-2026-10-22 coding-chat campaign measured **90.7 / 181.5 / 201.6 / 255.0 tok/s** summed per-request decode
+coding-chat campaign measured **90.7 / 181.5 / 201.6 / 255.0 tok/s** summed per-request decode
 at concurrency 1 / 2 / 4 / 8; summed decode excludes each request's prompt and queueing time.
 
 **Prompt reading, one node** (profiles and conditions below) and **with the RTX PRO** (exact CUDA
 prefill on the RTX, attention and recurrent state streamed to the node over 1 GbE as each layer finishes, then the
 node decodes; 64 generated tokens identical to the node-only run at every length; one run per length):
 
-| Mode | Hardware | 1K | 4K | 8K | 16K | 32K | Date | Build |
-|---|---|---:|---:|---:|---:|---:|---|---|
-| Prefill, TTFT | 1 node | **1.12 s** | **3.02 s** | | **14.64 s** | **22.95 s** | 2026-10-24 (1K/16K); 2026-10-25 (4K/32K) | `0117a140` (1K/16K); combined profile below (default on) |
-| Prefill offload, TTFT | RTX PRO + 1 node | **1.36 s** | **1.92 s** | **2.94 s** | **4.95 s** | **8.99 s** | 2026-10-24 | `70b93af3` |
-| Same server without the RTX, TTFT | 1 node | 1.80 s | 5.20 s | 10.46 s | 21.43 s | 44.02 s | 2026-10-24 | same server build |
+| Mode | Hardware | 1K | 4K | 8K | 16K | 32K | Build |
+|---|---|---:|---:|---:|---:|---:|---|
+| Prefill, TTFT | 1 node | **1.12 s** | **3.02 s** | | **14.64 s** | **22.95 s** | `0117a140` (1K/16K); combined profile below (default on) |
+| Prefill offload, TTFT | RTX PRO + 1 node | **1.36 s** | **1.92 s** | **2.94 s** | **4.95 s** | **8.99 s** | `70b93af3` |
+| Same server without the RTX, TTFT | 1 node | 1.80 s | 5.20 s | 10.46 s | 21.43 s | 44.02 s | same server build |
 
 The offload compares against the same production server it forwards to (2,048-row prompt tiles), which reads
 prompts more slowly than the one-node prefill row above (8,192-row tiles). At 32K the RTX path is 4.9× faster than
 that server. With the offload enabled, the router sends prompts of 1K tokens or more to the RTX PRO; shorter ones
 are read on the node.
 
-**Build `0117a140`** ( measured against the release build in the same session, interleaved runs,
+**Build `0117a140`** (measured against the release build in the same session, interleaved runs,
 every run exact): TTFT 2.3 % (1K), 3.4 % (4K) and 5.1 % (16K, 32K) lower; decode equal or up to 0.4 % faster;
 two replicas at concurrency 4 and 8: 3.9 % and 3.6 % more wall throughput, and a 6.9 % lower TTFT at
 concurrency 4. Details in [docs/performance.md](docs/performance.md#qwen38-flash-next-1).
 
-**Exact combined prefill (2026-10-26).** One Strix Halo node, Qwen3.8-Flash-Next UD-Q4_K_XL,
+**Exact combined prefill.** One Strix Halo node, Qwen3.8-Flash-Next UD-Q4_K_XL,
 dense-A8 decode with a separate fast FP16 prefill identity; build `8b99cf58`, defaults without environment overrides. Same-node comparisons
 against `4a44683b`, except the maximum-context same-build off comparison. Terminal FP32 logits and tokens
 match the reference at every length; code-1K and prose-8K qualification receipts match the archived baseline.
@@ -343,7 +349,7 @@ measured **22.03 s, 1,487 tok/s (48.3 % of the 3,078 tok/s contract ceiling)**.
 `STRIX_QPF2K_DEFAULTS=0` suppresses the prefill default set and declines automatic tiling; HC-specific off switches are
 `STRIX_QPF2K_HC_OUTPUT3=0` / `STRIX_QPF2K_HC_OUTPUT3_BAND=0`.
 
-**QSA stage batching — on by default (2026-10-26, [PR #51](https://github.com/hyukudan/strix-halo-engine-lab/pull/51)).**
+**QSA stage batching — on by default, [PR #51](https://github.com/hyukudan/strix-halo-engine-lab/pull/51).**
 Exact 32K TTFT **22.21 / 22.66 / 22.76 → 21.57 / 22.32 / 22.58 s** (three pairs, mean **−0.39 s, −1.7 %**);
 on the published build, 32K in four ABBA pairs **−0.17 s** on average (every pair faster) and 64K **46.76 → 46.01 s (−1.6 %)**;
 17,700 **12.54 → 12.46 s** (one pair). Tokens, terminal logits and the code-1K / prose-8K qualification receipts match.
@@ -354,9 +360,7 @@ The plain CLI now resolves to the measured production route. On one Strix Halo n
 prefill identity measured **22.03 s / 1,487 tok/s at 32K**, **100.3 s at 131,072 tokens**, and
 **202.8 s / 1,293 tok/s at 262,143 tokens** (T8192 at the long lengths, PLE page reclaim admitted).
 Digests match that identity's reference at 32K/64K/128K/262K; this is not dense-A8 serial bit equality
-or a new long-context model-fidelity qualification. The previous documented default was reported at
-about 119 tok/s prefill, versus about 822 with expert union and router rows; that external observation
-is separate from the local measurements. See the [catalog](docs/optimizations.md#qwen-tiled).
+or a new long-context model-fidelity qualification. See the [catalog](docs/optimizations.md#qwen-tiled).
 
 Exact MTP draft attention and the router defaults are enabled in the public Qwen line.
 Batched MTP drafting remains opt-in. The HTTP server sizes its request slots from memory (`--http-batch N` caps, `0` = one at a time), serves decoding requests at layer boundaries inside long prompt blocks (`STRIX_BATCH_SERVICE_MS=250`), runs short prompts first and nests them into a paused long prompt (`STRIX_BATCH_NEST_ROWS=2048`), and cancels at those boundaries; every request keeps the token IDs and committed state it has alone. With a 32K prompt arriving among three decoding streams (default command) the p90 decode gap went from 14.3 s to 0.54 s and a short request's first token from 42-52 s to 2.3-3.8 s ([serving](docs/engine/serving/serving.md#batched-decoding)).
@@ -369,7 +373,7 @@ In weight-file scoring on the locked 64-prompt quality set (23,552 scored positi
 Q8_0 reference is **76.6 %**, versus **88.1 %** for UD-Q4_K_XL: an **11.5 percentage-point** loss. This profile
 does not pass the quality recipe's acceptance criterion. These quality scores do not rescore the engine's FP16 prefill path.
 
-Measured 2026-10-25, one Strix Halo node, Qwen3.8-Flash-Next, single request, 256 generated tokens,
+Measured on one Strix Halo node, Qwen3.8-Flash-Next, single request, 256 generated tokens,
 `702bc074`; decode time excludes the prompt. Each run matches its own recipe's golden tokens.
 The two recipes have different weights and can produce different answers.
 
@@ -393,19 +397,22 @@ GSQ auto reaches about 64 % (113.8 tok/s ceiling) and the quality recipe about 6
 
 ### MiniMax M3.1 Flash
 
+Sources: [performance records](docs/performance.md) and [current optimization evidence](docs/optimizations.md#minimax).
+
 All rows: EXL3 trellis weights at 3.06 bpw, two Strix Halo nodes TP2 over USB4, greedy reference.
 The engine is Production; the qualified optimization sets below are public and on by default.
-The [grouped host prefill scheduling changes](docs/minimax-grouped-prefill.md) default on;
-their native exactness qualification and measurements remain pending.
+The [grouped host prefill scheduling changes](docs/minimax-grouped-prefill.md) default on for
+grouped calls whose every member has at least 2048 rows. Balanced 7940-token prompts measured
+2.3–2.6% lower prefill time with identical complete token IDs; unbalanced small tails use the ordinary path.
 
-| Mode | Prompt / context | Measured result | Date | Build / exactness |
-|---|---|---|---|---|
-| Greedy decode | 1K / 8K benchmark prompts, 256 tokens | **44.57 / 46.10 ms/token** (22.44 / 21.69 tok/s) | 2026-10-26 | `8cc30ac0`; ranks agree, reference IDs equal |
-| Fresh combined prefill | 8K benchmark prompt | **17.731 s**, 462 tok/s; baseline 21.874 s (**−19 %**); **36–39 %** of the calculated 6.3–7.0 s kernel floor | 2026-10-26 | `e0bad3d1`; both ranks' state/final logits equal archived production |
-| Fresh combined prefill | 32K benchmark prompt | **91.508 s**, 358 tok/s; **28–32 %** of the calculated 26–29 s kernel floor | 2026-10-26 | `e0bad3d1`; new reference, not an archived-reference exactness comparison |
-| Combined prefill, same process | 1K / 8K, three alternating pairs | **2.73–2.77 / 20.3–20.8 s**, **0.848–0.853× / 0.783–0.797×** baseline time | 2026-10-26 | `561de319`; state/final-row checks and tokens equal on both ranks |
-| Batch, fresh process per arm | N=1 / N=8, 1K benchmark | **43.92 / 130.24 ms/step** (N8: **61.4 tok/s aggregate**, calculated) | 2026-10-26 | `8cc30ac0`; each row equals running alone; batch invariance passes |
-| DSpark | JSON / Python / prose, 256 tokens | **54.4 / 34.1 / 24.1 tok/s** | 2026-10-26 | `8cc30ac0`; IDs equal greedy |
+| Mode | Prompt / context | Measured result | Build / exactness |
+|---|---|---|---|
+| Greedy decode | 1K / 8K benchmark prompts, 256 tokens | **44.57 / 46.10 ms/token** (22.44 / 21.69 tok/s) | `8cc30ac0`; ranks agree, reference IDs equal |
+| Fresh combined prefill | 8K benchmark prompt | **17.731 s**, 462 tok/s; baseline 21.874 s (**−19 %**); **36–39 %** of the calculated 6.3–7.0 s kernel floor | `e0bad3d1`; both ranks' state/final logits equal archived production |
+| Fresh combined prefill | 32K benchmark prompt | **91.508 s**, 358 tok/s; **28–32 %** of the calculated 26–29 s kernel floor | `e0bad3d1`; new reference, not an archived-reference exactness comparison |
+| Combined prefill, same process | 1K / 8K, three alternating pairs | **2.73–2.77 / 20.3–20.8 s**, **0.848–0.853× / 0.783–0.797×** baseline time | `561de319`; state/final-row checks and tokens equal on both ranks |
+| Batch, fresh process per arm | N=1 / N=8, 1K benchmark | **43.92 / 130.24 ms/step** (N8: **61.4 tok/s aggregate**, calculated) | `8cc30ac0`; each row equals running alone; batch invariance passes |
+| DSpark | JSON / Python / prose, 256 tokens | **54.4 / 34.1 / 24.1 tok/s** | `8cc30ac0`; IDs equal greedy |
 
 Prompt kinds are unspecified for the prefill and batch benchmarks. Fresh-prefill rows are single runs;
 the 1K first-use result was **3.509 s**. The combined run later hit its time limit in another arm; only completed
@@ -417,15 +424,17 @@ replays save **4.20 / 2.82 / 3.09 ms/token**. In fresh-process batch A/B, N1/N8 
 to **43.92 / 130.24 ms/step**; the earlier N8 slowdown was traced to GPU thermal/power throttling under
 sustained load (about 96 °C, shader clock −20 % within ~100 s), not to the engine. The rows above are
 cold-start numbers from fresh processes; under sustained serving, measured decode is about 5 % and prefill
-about 15 % slower on this cooling (29 sequential requests: 44.9 → 47.2 ms/step). This does not justify a general serving speed claim. Further MoE/attention variants remain off.
+about 15 % slower on this cooling (29 sequential requests: 44.9 → 47.2 ms/step). This does not justify a general serving speed claim. Later selective MoE/attention defaults are listed in the [catalog](docs/optimizations.md#minimax).
 
-**Quality gate (2026-10-25): passed** the pre-registered eight-text evaluation, including two independent,
+**Quality gate : passed** the pre-registered eight-text evaluation, including two independent,
 byte-identical TP2 runs and all prompt/regime checks. Mean KL to the exact reference is **0.1449** versus
 **0.1425** for the production CPU arithmetic. Top-1 agreement is **0.47 percentage points lower** than the CPU
 reference, within the pre-registered 2-point margin; next-token accuracy differs by **+0.01 point**. This
 qualification is conditional on those eight texts; it supersedes the earlier two-prompt failure.
 
 ### GLM-5.3 Flash
+
+Sources: [performance records](docs/performance.md) and [current GLM defaults/evidence](docs/optimizations.md#glm).
 
 EXL3 4.05 bpw, two Strix Halo nodes TP2 over USB4. Production engine. R1b is the default decode identity; prompts use exact R1 chunked prefill;
 decode uses exact MTP self-speculation by default (`--mtp 0` = plain decode).
@@ -455,16 +464,16 @@ GPU memory per node.
 `--print-effective-config` reports the host-independent candidate and startup policy; stderr reports
 admission headroom and the final value with its source. See the [catalog](docs/optimizations.md#glm-max-rows-auto).
 
-| Mode | Prompt / context | Measured | Date | Build / exactness |
-|---|---|---:|---|---|
-| Greedy decode, R1 | 31-token chat prompt + 64 generated tokens | **45.29 ms/token = 22.1 tok/s**; **51 %** of calculated 23.2 ms floor | 2026-10-26 | `1836c99c`; tokens equal the reference |
-| Batch decode, R1 | Eight independent rows, benchmark context unspecified | **122.0 ms/step = 65.5 tok/s aggregate** | 2026-10-26 | `1836c99c`; tokens equal the earlier real-pair reference |
-| Exact chunked prefill | 1K / 8K / 32K benchmark prompts, kind unspecified | TTFT **4.268 / 34.70 / 144.75 s** (240 / 236 / 226 tok/s) | 2026-10-26 | `875ca821`, integrated in `41d8cfdc`; both ranks' logits bitwise equal the previous exact prefill |
-| R1b-fast, now the default decode identity | Same chat benchmark, 96-token alternating comparison | **41.93–41.96 ms/token**, vs R1 47.33–47.48 (**−11.5 %**, **55 %** of 23.2 ms floor) | 2026-10-26 | `8877de1d`; stable within each identity, not bitwise to R1 |
-| MTP self-speculation (default) | Chat / code / JSON prompts, 64–128 generated tokens, rank 0 | **26.98 / 22.46 / 24.98 ms/token = 37.1 / 44.5 / 40.0 tok/s** (1.50× / 1.79× / 1.62× plain 40.3–40.6 ms/token); TTFT 8K **31.13 s** (+2.9 %), 32K **140.9 s** (+8.7 %: MTP cache fill of the extra layer) | 2026-10-27 | Full token vectors and prompt logits equal `--mtp 0` on 7 prompts, both ranks; plain TTFT unchanged |
-| Exact chunked prefill, X2 linear core (default) | 1K / 8K / 32K benchmark prompts | TTFT **3.78 / 27.93 / 120.26 s** (271 / 293 / 272 tok/s); same run with `STRIX_GLM_PF_EXACT_X=0`: 1K 3.84 s, 8K 29.59 s (**−5.6 %** at 8K) | | logits bitwise equal the X=0 path on both ranks; decode anchors and speculative oracle unchanged |
-| Exact chunked prefill, X2 linear core + MoE auto (default) | 1K / 8K / 32K benchmark prompts | TTFT **3.74 / 26.85 / 113.73 s** (274 / 305 / 288 tok/s); same run with `STRIX_GLM_PF_EXACTMOE_V=3`: 1K 3.76 s, 8K 28.17 s (**−4.7 %** at 8K) | | outputs bitwise equal the v3 path on both ranks (internal FP32 NaN payloads may differ only in the FP16 overflow case); decode anchors and speculative oracle unchanged |
-| R1b teacher-forced agreement | 32 prompts, 256 positions each; chat, code, JSON, math, reasoning, translation | **8,126/8,192 = 99.19 %** top-1; mean KL **~1.8e-3 nats** | 2026-10-26 | `4dad4c19`; free runs diverge on **28/32** prompts within 19–227 tokens |
+| Mode | Prompt / context | Measured | Build / exactness |
+|---|---|---:|---|
+| Greedy decode, R1 | 31-token chat prompt + 64 generated tokens | **45.29 ms/token = 22.1 tok/s**; **51 %** of calculated 23.2 ms floor | `1836c99c`; tokens equal the reference |
+| Batch decode, R1 | Eight independent rows, benchmark context unspecified | **122.0 ms/step = 65.5 tok/s aggregate** | `1836c99c`; tokens equal the earlier real-pair reference |
+| Exact chunked prefill | 1K / 8K / 32K benchmark prompts, kind unspecified | TTFT **4.268 / 34.70 / 144.75 s** (240 / 236 / 226 tok/s) | `875ca821`, integrated in `41d8cfdc`; both ranks' logits bitwise equal the previous exact prefill |
+| R1b-fast, now the default decode identity | Same chat benchmark, 96-token alternating comparison | **41.93–41.96 ms/token**, vs R1 47.33–47.48 (**−11.5 %**, **55 %** of 23.2 ms floor) | `8877de1d`; stable within each identity, not bitwise to R1 |
+| MTP self-speculation (default) | Chat / code / JSON prompts, 64–128 generated tokens, rank 0 | **26.98 / 22.46 / 24.98 ms/token = 37.1 / 44.5 / 40.0 tok/s** (1.50× / 1.79× / 1.62× plain 40.3–40.6 ms/token); TTFT 8K **31.13 s** (+2.9 %), 32K **140.9 s** (+8.7 %: MTP cache fill of the extra layer) | Full token vectors and prompt logits equal `--mtp 0` on 7 prompts, both ranks; plain TTFT unchanged |
+| Exact chunked prefill, X2 linear core (default) | 1K / 8K / 32K benchmark prompts | TTFT **3.78 / 27.93 / 120.26 s** (271 / 293 / 272 tok/s); same run with `STRIX_GLM_PF_EXACT_X=0`: 1K 3.84 s, 8K 29.59 s (**−5.6 %** at 8K) | logits bitwise equal the X=0 path on both ranks; decode anchors and speculative oracle unchanged |
+| Exact chunked prefill, X2 linear core + MoE auto (default) | 1K / 8K / 32K benchmark prompts | TTFT **3.74 / 26.85 / 113.73 s** (274 / 305 / 288 tok/s); same run with `STRIX_GLM_PF_EXACTMOE_V=3`: 1K 3.76 s, 8K 28.17 s (**−4.7 %** at 8K) | outputs bitwise equal the v3 path on both ranks (internal FP32 NaN payloads may differ only in the FP16 overflow case); decode anchors and speculative oracle unchanged |
+| R1b teacher-forced agreement | 32 prompts, 256 positions each; chat, code, JSON, math, reasoning, translation | **8,126/8,192 = 99.19 %** top-1; mean KL **~1.8e-3 nats** | `4dad4c19`; free runs diverge on **28/32** prompts within 19–227 tokens |
 
 The R≥3 buffer fix is verified on the real pair. The latest integration uses direct exchange for plain
 forwards and exact MoE v3 for prefill; the speculative oracle also passes with drained exchange switching.
@@ -475,17 +484,75 @@ unresolved. HIP graphs are **not implemented**: the latest profile (`41d8cfdc`) 
 and a calculated recoverable gap of **≤1.8 ms** (a bound, not a measured speedup). Host progress across
 exchange boundaries requires segmented capture; device kernels and rank skew take priority.
 
+### Shipped changes beyond the historical campaigns
+
+The detailed campaigns above retain their measured build identities. Main also ships the following
+changes; these measurements do not form a new combined performance sweep:
+
+| Shipped default | Published measurement and scope | Evidence |
+|---|---|---|
+| Qwen HTTP automatic tiled prefill | T8192 vs explicit T2048: cold 17K TTFT 21.95 vs 22.93 s; two 8.5K prompts 11.08/11.11 vs 11.53/11.58 s. Same binary, interleaved arms, identical IDs. Memory tradeoff: 29 vs 55 slots in this configuration. | [Serving prefill](docs/optimizations.md#qwen-serve-prefill) |
+| Qwen MoE XOR rows | Routed-call time −2.6% to −8.2% at 3072–4864 rows on real layers, ABBA; no change at T8192. Default only for admitted automatic CLI shapes. | [XOR rows](docs/optimizations.md#qwen-moe-xor-rows) |
+| Qwen vector merge+commit | 3.81 vs 3.99 ms per admitted T8192 merge call; about −0.02 s at 32K. Byte-equal fixture outputs and equal 4K/32K generated tokens. | [Vector merge](docs/optimizations.md#vector-moe-mergecommit-in-tiled-prefill) |
+| DeepSeek prepared expert discovery | Fresh-process ABBA ×2: whole-run wall mean 66.0 → 43.8 s; includes a cold page-cache visit in the original-loader arm. R1 position records equal on both ranks. This is loading, not decode throughput. | [Prepared loading](docs/optimizations.md#ds-prepared-load) |
+| DeepSeek bounded agent prefix retention | Cached 2K prefix in an 8K prompt: −3.63 s (−24%) mean; fresh-process ABBA ×2, identical text and IDs. | [Prefix qualification](docs/engine/serving/ds41-prefix-cache-qualification.md) |
+| DeepSeek F16 Engram projection prefetch | Isolated 1024-row projection 88.1 → 75.8 ms; aligned F16 views only, byte-equal output. End-to-end TTFT not separately measured. | [Engram prefetch](docs/optimizations.md#engram-prefill-projection-tile-with-prefetch) |
+| DeepSeek attention LDS swizzle | R6 decode −0.20%, R1 neutral; N8 median −0.04%. Both-rank exact gates; no broad throughput gain claimed. | [Pair operator defaults](docs/models/deepseek-v4.1/production-defaults.md) |
+| RTX write-back stream / copy-engine pacing | Stream: DSpark plain/controller per-commit time −2.0%/−6.4% over four alternating loads, identical chat tokens. Pacing: bracketed comparison within noise. | [Stream](docs/optimizations.md#write-back-stream), [pacing](docs/optimizations.md#rtx-ce-pacing) |
+| MiniMax DSpark serving auto | Same-load, per-request qualification: JSON −34.6%, code −17.5% wall time; tested prose stays plain and is not slower; identical IDs in every class. | [Automatic admission](docs/optimizations.md#dspark-automatic-admission) |
+| MiniMax MSA mode 5 | Mode 5 vs 3: 8K/1K TTFT −0.129/−0.109 s, n=6 each; intervals include zero. Both-rank tokens/state/final-row digests identical. | [MSA mode 5](docs/optimizations.md#msa-prefill-mode-5) |
+| RTX multi-disk expert streaming | Exact prefill service, one/two/one drive: 8K 13.27/13.12 → 10.64 s; 32K 19.39/18.98 → 17.44 s. State hash, logits and next token equal. Decode throughput was not measured. | [Two-drive measurements](docs/models/deepseek-v4.1/rtx-two-drives.md#measurements) |
+
+Qwen dense form-4 WMMA register-bank pinning also ships default-on: it keeps operand banks distinct
+without changing instructions or values. Each build can be checked with
+[`tools/check_wmma_banks.py`](tools/check_wmma_banks.py); the
+[catalog](docs/optimizations.md#register-blocked-dense-projections) does not publish a complete-workload speed gain.
+
 ## How exact, how good
 
-**Exact where we say so.** These outputs are checked token for token (or byte for byte) against a reference:
+### Exactness
+
+All engines are exact by default **to their declared reference path**: identical token IDs for the
+same model assets, numerical profile pair, prompt/state and selection policy. Exactness is independent
+of speculative decoding and concurrency. Drafting changes how work is proposed; batching, nesting,
+prefix restore and replicas change when it runs. Their gates must preserve each request's complete
+sequence and committed state relative to its reference.
+
+An optimization's off switch restores its previous execution path. A baseline or identity switch
+can also change arithmetic: preserve the model, profile, capacity and state when testing equality.
+FP16 Qwen prefill has its own reference; GLM R1b has its own decode identity; YaRN has its own rotary
+identity. None implies equality to a different identity or full-precision weights.
+
+These outputs are checked token for token (or byte for byte) against a matching reference:
 
 - Qwen MTP speculative decoding equals serial greedy decode with the same numerical profile, bit for bit
   (golden replay error 0 on every timed run; replicas 570/570 equal to one node).
-- Qwen tiled prefill and teacher-forced scoring produce the same bytes as the serial route within a profile.
+- Qwen tiled prefill and teacher-forced scoring preserve their declared profile reference; the automatic
+  fast FP16 prefill path is not dense-A8 serial bit equality.
 - DeepSeek on the pair: greedy and DSpark windows equal the stored references on both ranks; batch tokens and
   64/64 server responses equal the campaign references.
 - DeepSeek split with the RTX PRO: bitwise equal to the pair without the trellis sites (24/24 prompts). With them
   it is a declared composed identity (KL 1.7e-3 against the pair), not bitwise.
+
+- MiniMax gates compare golden logits, decode/verify and exchange; GLM uses G3/G4, identity,
+  prefill-logit and speculative-oracle gates on both ranks. GLM MTP matches `--mtp 0`.
+- Qwen YaRN MTP has full 262K and 1M equality evidence and target-scope 524K evidence against
+  serial YaRN; these results do not establish native-rotary equality or general long-context quality.
+  [Qualification scope](docs/optimizations.md#qwen-yarn-mtp).
+
+The [benchmark kit](docs/reproduce.md) is present. On the execution hardware, inspect availability and
+run the exactness suite with an engine key reported by `list`:
+
+```sh
+bash scripts/bench/bench.sh list
+bash scripts/bench/bench.sh check --engine E --only exactness --suite quick --json
+bash scripts/bench/bench.sh run --engine E --only exactness --suite quick --json
+```
+
+`EXACT`, `MISMATCH` and `NO-REFERENCE` are distinct verdicts. Missing reference data is not a pass.
+CPU tests and config inspection do not qualify native execution.
+
+### Model fidelity
 
 **Quality is measured, not assumed.** A teacher-forced harness compares the engine's full output distribution with
 a reference at every position (KL divergence and top-1 agreement), per category and language.
@@ -517,9 +584,9 @@ Methodology: [docs/engine/prefill/teacher-forced-tiled-prefill.md](docs/engine/p
   the prompt.
 - **Named numerical profiles with measured quality.** Rounding is a named, versioned choice. The prompt can be read
   with one profile and the answer written with another (D-033).
-- **Opt-in until proven.** Every optimization starts disabled and becomes a default only after it is shown exact
-  (or of measured quality) and faster on the complete workload, in an interleaved timing campaign. Ideas that failed
-  are recorded with their numbers.
+- **Fast defaults with explicit evidence.** Production optimizations are on when their admission guards pass;
+  use off switches for A/B. The catalog distinguishes operator tests, native exactness and complete-workload
+  measurements. Draft proposals and isolated kernel wins do not establish a new production speed claim.
 - **AMD-first and independent.** The kernels, scheduling, speculative decoding, GGUF reader, memory planner and the
   two-node communicator are our own code; the engine does not wrap another inference runtime. ROCm/HIP, Linux, the
   GGUF format and the usual build tools remain dependencies. The engine stays fully usable on a single Strix Halo;
@@ -546,6 +613,16 @@ Methodology: [docs/engine/prefill/teacher-forced-tiled-prefill.md](docs/engine/p
 | **Model files** | UD-Q4_K_XL GGUF (~111 GB) + Q8_0 MTP sidecar | the 2-bit expert GGUF, the 6.5-bit dense overlay, the trellis packs and the DSpark drafter ([docs/models/deepseek-v4.1/production-defaults.md](docs/models/deepseek-v4.1/production-defaults.md#production-identity-environment-of-both-ranks)) |
 | **Build tools** | CMake >= 3.24, Ninja, a C++20 compiler, optionally OpenSSL for fast hashing | same |
 
+MiniMax needs its admitted EXL3 3.06-bpw directory and compatible local draft assets for DSpark;
+GLM needs its EXL3 4.05-bpw directory and native MTP assets. Both use two Linux Strix Halo ranks
+with the USB4 driver and trellis library. Standalone RTX needs Windows WDDM, CUDA, the admitted
+Q2/Q8 model and receipt/state/reference assets. Model manifests, conversion provenance and required
+notices are listed in [models and provenance](docs/reproduce.md#models-and-provenance).
+
+Kernel/IOMMU settings belong to the machine owner. Keep USB4 controllers translated; never disable
+IOMMU for speed. Record the running kernel and `amdgpu.iommu_perfopt` in timing receipts and compare
+PerfOpt on/off only on the same kernel.
+
 The command-line tools take token IDs; the HTTP servers carry the models' own tokenizers and chat templates.
 
 ## Build
@@ -565,6 +642,21 @@ ninja -C build strix-hip-decode-token                         # Qwen
 ninja -C build strix-deepseek41-rank strix-deepseek41-serve   # DeepSeek (family module, STRIX_FAMILY_DEEPSEEK41=ON by default)
 ```
 
+MiniMax and GLM also need the adopted trellis headers and archive. After the common HIP configuration,
+use a relative `TRELLIS` checkout containing `include/strix_trellis.h` and
+`build-qualification-v03/libstrix_trellis.a`:
+
+```sh
+cmake -S . -B build -DSTRIX_FAMILY_MINIMAX=ON -DSTRIX_MINIMAX_TRELLIS_DIR=TRELLIS
+ninja -C build strix-minimax-rank strix-minimax-serve
+cmake -S . -B build -DSTRIX_FAMILY_GLM5=ON -DSTRIX_GLM5_TRELLIS_DIR=TRELLIS
+ninja -C build strix-glm5-rank
+```
+
+DeepSeek production trellis API/library settings and the complete per-engine build instructions are in
+[Build each engine](docs/reproduce.md#build-each-engine). Configure and build both ranks identically.
+MiniMax and GLM family targets require these build options even though their execution defaults are fast.
+
 The CUDA parts for the RTX PRO build separately with `-DSTRIX_ENABLE_CUDA_DS41=ON`. `ctest --test-dir build` runs
 the host and device tests (many device tests need the GPU and the model files). All CMake options are listed in
 [docs/getting-started/engine-reference.md](docs/getting-started/engine-reference.md#build-options).
@@ -573,19 +665,24 @@ the host and device tests (many device tests need the GPU and the model files). 
 
 <a id="qwen-recommended-command"></a>
 
-**Qwen, recommended run:** the plain command selects the production defaults, 256 tokens.
+### Qwen
+
+Recommended run: the plain command selects the production defaults, 256 tokens.
 
 ```sh
 ./build/strix-hip-decode-token Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf $(cat prompt.ids) --generate 256
 ```
 
-Add `--print-effective-config` to see what it resolves to before HIP initialization. `--baseline` (or `STRIX_BASELINE=1`) restores the previous minimal resolution.
+Add `--print-effective-config` to inspect before HIP initialization. See [Defaults and off switches](#defaults-and-off-switches) for baseline scope.
 
 Eligible plain CLI prompts automatically select known-prefix tiled prefill (T8192 for long prompts,
 T4096 at 4K), expert union, router rows and `fast-prefill-f16wmma-v1`. Context is sized automatically;
 beyond 8192 the resolver adds `--unqualified-context`. Registered residency (`--residency register`)
 is the default on UMA. FP16 prefill has its own exact reference and is not bit-identical to dense-A8 serial prefill.
-MTP decode and the HTTP server **do not get fast prefill automatically yet**. See the
+Plain native MTP retains its asset-dependent prefill contract. HTTP serving now automatically admits
+T8192 (falling back through smaller tiles under memory pressure), with its existing arithmetic and
+1024-row checkpoints for a configured prefix cache. This is separate from CLI FP16 auto prefill.
+See [HTTP prefill](docs/engine/serving/serving.md#default-prompt-prefill). See the
 [auto route and off switches](docs/getting-started/engine-reference.md#command-line).
 
 `prompt.ids` holds the prompt as token IDs from the model's tokenizer; the engine prints a JSON receipt with
@@ -596,14 +693,125 @@ prefix cache are in [docs/engine/serving/serving.md](docs/engine/serving/serving
 [docs/engine/scheduling/multi-request-cohort.md](docs/engine/scheduling/multi-request-cohort.md); sampling in
 [docs/engine/decode/sampled-decoding.md](docs/engine/decode/sampled-decoding.md).
 
-**DeepSeek on the pair:** one rank per node, the same environment on both ranks (the production identity),
-`--transport usb4gpu`; the server takes `--prefill-path device --dspark <DSpark.gguf> --dspark-vocab auto:<vocab>`.
-The environment, defaults and opt-outs are in [docs/models/deepseek-v4.1/production-defaults.md](docs/models/deepseek-v4.1/production-defaults.md);
-the RTX split command lines in [docs/models/deepseek-v4.1/pipeline-stages.md](docs/models/deepseek-v4.1/pipeline-stages.md); hot-expert placement in
-[docs/models/deepseek-v4.1/hot-placement.md](docs/models/deepseek-v4.1/hot-placement.md); long contexts in
-[docs/models/deepseek-v4.1/long-context.md](docs/models/deepseek-v4.1/long-context.md).
+Qwen's [prefix-state cache](docs/engine/serving/prefix-state-cache.md) restores complete attention/GDN
+state at admitted boundaries and reads only the suffix. Configure `--prefix-cache-host-bytes N` and
+optionally `--prefix-cache-dir DIR`; fair retention is default (`--prefix-cache-retention lru` restores
+LRU). Captures reserve memory before pinned copies. `"state_cache":{"retain":false}` permits reads
+without storing new prefixes; `GET /v1/cache/stats` reports retention and eviction reasons.
+`--prefix-cache off` / `STRIX_PREFIX_CACHE=0` disables it. Automatic HTTP tiling does not itself
+supply a cache budget. MTP restore accepts only suffix plans equivalent to the uncached execution;
+checkpoint copies follow existing block boundaries.
+
+### DeepSeek pair
+
+Run one rank on each node with matching assets and environment; set `R` to 0 or 1 locally:
+
+```sh
+./build/strix-deepseek41-serve MODEL.gguf --rank R --transport usb4auto
+```
+
+The resolver discovers production packs and the drafter, enables TP attention and device prefill,
+and discovers matching offline-prepared expert packs. A missing prepared pack uses the original loader
+with a notice; execution never prepares packs itself. Bounded agent prefix retention is on by default.
+See [production defaults](docs/models/deepseek-v4.1/production-defaults.md),
+[one-time expert preparation](docs/models/deepseek-v4.1/prepared-load.md),
+[prefix caching](docs/engine/serving/prefix-state-cache.md#deepseek-pair-agent-prefix-cache),
+[long contexts](docs/models/deepseek-v4.1/long-context.md) and
+[hot-expert placement](docs/models/deepseek-v4.1/hot-placement.md).
+
+**RTX + pair:** use the [pipeline stage launch contract](docs/models/deepseek-v4.1/pipeline-stages.md).
+The RTX runs layers 0–21; the pair runs layers 22–39 and the head. Preserve the declared composed
+identity and its assets when comparing references.
+
+### DeepSeek standalone RTX
+
+This is an imported-state runner on Windows WDDM. The model receipt, exported attention state,
+matching greedy reference, drafter and tokenized chat file are required external assets:
+
+```powershell
+.\build-rtx\strix-cuda-ds41-replica.exe MODEL.gguf `
+  --receipt MODEL.receipt.json --import-state STATE.bin --ref GREEDY.log `
+  --draft DRAFTER.gguf --draft-device 0 `
+  --phases exact0,pressure,exact8,wforce0,spec0,exact0,chats0,schats0,chats0 `
+  --steps 64 --max-rows 6 --max-positions 4096 `
+  --seqs-file CHATS.tsv --chats 0 --chat-prompt 96 --chat-steps 128 `
+  --qual --json RESULTS.jsonl
+```
+
+The plain options use the fast resolver, including an automatically sized arena. Imported position,
+requested work and safety allowance must fit capacity. Add `--print-config` to inspect without CUDA.
+For persistent `--serve SPOOL` execution and required asset preparation, follow the
+[standalone command](docs/models/deepseek-v4.1/rtx-standalone.md#run-and-persistent-worker).
+Exact conversation sessions are documented in [RTX session cache](docs/models/deepseek-v4.1/rtx-session-cache.md).
+
+Tierstream supports verified partial stripes across multiple disks through `--weight-dirs`;
+without a secondary directory it retains the model-file route. Stripe failure falls back to the model
+file. Preparation, verification, read eligibility and startup hashing costs are in
+[two-drive streaming](docs/models/deepseek-v4.1/rtx-two-drives.md). This is storage configuration,
+not a different numerical profile.
+
+### MiniMax pair
+
+Run once per node with `R` set to 0 or 1 and matching EXL3 assets:
+
+```sh
+./build/strix-minimax-rank MODEL_DIR R usb4-auto OUTPUT_DIR
+```
+
+The [resolver](src/minimax/engine/mm_defaults.cpp) enables the production decode/prefill/exchange set,
+including MSA prefill mode 5. `strix-minimax-serve` uses structural DSpark auto admission with compatible
+local assets; eligible uncontended requests may draft, while competing/grouped or unsupported requests
+stay plain. See [admission and qualification](docs/engine/serving/dspark-auto-qualification.md).
+
+### GLM pair
+
+Run once per node with `R` set to 0 or 1 and the same tokenized prompt on both:
+
+```sh
+./build/strix-glm5-rank MODEL_DIR --world 2 --rank R --transport usb4-auto --prompt PROMPT.u32 --decode 64
+```
+
+Default R1b decode uses exact MTP self-speculation and R1 prompt prefill; `--mtp 0` runs plain decode
+with the same tokens. `--identity r1` selects a different reference identity. Prefill automatically uses
+8192 rows if both ranks admit them, otherwise 4096. See the [resolver](apps/glm_rank_defaults.hpp),
+[model families](docs/models/model-families.md) and [qualification/performance](docs/performance.md).
+
+### Qwen long context
+
+Native capacity is 262,144 positions; prompt plus generation must fit. The resolver automatically
+marks native contexts above the 8192-token fidelity qualification as unqualified. A capacity or
+exactness pass does not establish task accuracy at that length.
+
+YaRN is an opt-in rotary identity, CLI only. With the verified
+[distill-g bundle recipe](recipes/qwen-distill-g-yarn.mtp-bundle.json) and matching sidecar/vocabulary
+beside the model, a bare YaRN command selects exact MTP automatically:
+
+```sh
+./build/strix-hip-decode-token MODEL.gguf --prompt-ids prompt.ids --rope-yarn 2 --context 524288 --generate 256
+```
+
+Use factor 4 with `--context 1048576` for 1M capacity. `--prompt-ids` avoids shell argument limits.
+The QSA committed MTP pool and rolling PLE are default-on on admitted routes. Memory admission tries
+the storage ladder before smaller prompt tiles and reports `storage_ladder_step` and `yarn_mtp_storage`.
+A missing/invalid bundle before mutation falls back to serial YaRN with a notice; explicit `--mtp`
+retains its pinned-asset contract. `STRIX_QWEN_YARN_MTP=0` selects serial YaRN.
+
+Full 262K/1M and target-scope 524K MTP equality checks are published; these are relative to serial
+YaRN, not native rotary, and do not qualify general 1M model fidelity or complete workloads.
+See [YaRN MTP and bundles](docs/engine/speculative/mtp-native-cli.md#explicit-yarn-mtp-cli),
+[pool/PLE route matrix](docs/engine/qsa-committed-pool.md) and
+[long-context fidelity checks](tools/qualification/longctx_fidelity/README.md).
 
 ### Exposing the servers
+
+Qwen and DeepSeek publish executed features at `GET /v1/capabilities`; each response's `strix` object
+states requested versus effective sampling policy. Unsupported generation fields return 400 naming
+the field. Qwen supports constrained JSON exact to its constrained target, thinking budgets, logprobs,
+logit transforms and SSE progress. Budgets/transforms are declared token-changing policies;
+logprobs/progress preserve tokens. Policy selection uses admitted serial-equivalent MTP windows or
+serial fallback; `--http-selection-mtp off` forces the latter. See
+[chat request contracts](docs/engine/serving/serving.md#chat-requests) and
+[constrained output](docs/engine/serving/serving.md#constrained-json-output).
 
 The HTTP servers (`strix-hip-decode-token --http-serve` and `strix-deepseek41-serve`) listen on loopback unless
 `--http-bind` says otherwise. They have no TLS of their own. Authentication is one optional shared key:
@@ -614,8 +822,33 @@ needs `Authorization: Bearer <key>` or `x-api-key: <key>`; without it the server
 remote clients behind an authenticating front end such as the [TensorMeld](https://github.com/hyukudan/tensormeld)
 router or its control channel; the two-node DeepSeek ranks exchange tensors over the USB4 link, and the RTX split
 (pipeline stage TCP port) and the expert servers talk plain TCP: none of these carry authentication, so they must
-stay on a direct cable or a private network. Per-user keys, TLS and a secure configuration interface are
-work items, not features.
+stay on a direct cable or a private network.
+
+## Defaults and off switches
+
+Start with the plain command for the selected engine. Production optimizations are **ON by default**
+when their model, shape, resource and reference guards pass. Legacy opt-in organization flags can take
+over route selection and decline the automatic path. Required assets, rank arguments and explicit
+numerical policies remain part of the launch contract.
+
+| Engine | Inspect before device work | Master baseline |
+|---|---|---|
+| Qwen | `--print-effective-config` | `--baseline` / `STRIX_BASELINE=1` |
+| DeepSeek pair | `--print-effective-config` | `STRIX_DS41_BASELINE=1` |
+| DeepSeek RTX | `--print-config` | `--baseline` / `STRIX_DS41_RTX_BASELINE=1` |
+| MiniMax | `--print-effective-config` | `STRIX_MM_BASELINE=1` |
+| GLM | `--print-effective-config` | `--baseline` / `STRIX_GLM_BASELINE=1` |
+
+Add inspection to the engine's normal command, retaining required assets and rank arguments.
+Inspection exits before device execution. Qwen execution also emits one `strix-build-info` and one
+`strix-startup-event` JSON record on stderr; advisory fields are not failures. `STRIX_RELEASE_EVENTS=0`
+disables both. [Startup preflight and build identity](docs/operations/startup-preflight.md).
+
+Use one item's off switch at a time for A/B. Restart startup-cached readers and both ranks as needed,
+compare complete tokens and logits/state digests first, then interleaved timing medians. Master
+baselines have engine-specific scope and may change arithmetic; they are not a universal way to hold
+the reference fixed. See [precedence, guards and fallbacks](docs/optimizations.md#baselines-inspection-and-exactness)
+and the [JSON catalog](docs/optimizations.json).
 
 ## Optimizations
 
@@ -629,7 +862,15 @@ Full item lists, preconditions, notices and evidence: [optimization catalog](doc
 | Qwen: tiled prefill | Auto tile/context, expert union, router rows | Auto | 32K: 22.03 s, 1,487 tok/s | Own FP16 reference; differs from dense A8 | `STRIX_PREFILL_F16=0` |
 | Qwen: QPF2K + wrapper kernels | Dense/GDN/QSA/HC/MoE, dispatch and head work | On when admitted | Combined 32K 25.95 → 23.49 s | Within profile | `STRIX_QPF2K_DEFAULTS=0` |
 | Qwen: fused exact prefill | QSA scorer rows, PLE row groups, shared-expert preimage, MoE merge+commit and header reuse | On (automatic route) | 32K −0.71 s (−3.2 %) vs the five off | Bitwise (logits/digests equal) | Per item `=0`; [catalog](docs/optimizations.md#qwen-qsa-score-rows) |
-| Qwen: long-context QSA | Attend-union merge, persistent pooled decode keys, decode selection from maxima, R64 scorer above 65,536 blocks | On (by context length; decode items on the plain serial CLI route only) | Plain serial CLI decode at 262K −30 % (75.7 → 53.0 ms/step), 131K −14.7 %; the default MTP/HTTP route does not use them yet | Bitwise (QSA trace and tokens equal) | Per item `=0`; [catalog](docs/optimizations.md#qwen-qsa-union-merge) |
+| Qwen: long-context QSA | Attend-union merge, persistent pooled decode keys, decode selection from maxima, R64 scorer above 65,536 blocks | On (by context length; decode items on the plain serial CLI route only) | Plain serial CLI decode at 262K −30 % (75.7 → 53.0 ms/step), 131K −14.7 %; MTP has its separate committed-pool service; HTTP keeps its own guards | Bitwise (QSA trace and tokens equal) | Per item `=0`; [catalog](docs/optimizations.md#qwen-qsa-union-merge) |
+| Qwen: HTTP prefill/checkpoints | Admit largest fitting tile, T8192 first; configured cache checkpoints at 1024 rows | Auto | See recent measurements above | Existing HTTP arithmetic | `STRIX_SERVE_PREFILL=0` with explicit tiling; `--prefix-cache-block-rows 0` |
+| Qwen: YaRN MTP storage | Verified bundle selection, QSA committed pool, rolling PLE, storage ladder | On within explicit YaRN CLI | Capacity/equality through 1M; no broad fidelity claim | Serial YaRN reference | `STRIX_QWEN_YARN_MTP=0`; `STRIX_QSA_MTP_POOL=0`; `STRIX_PLE_ROLLING=0` |
+| Qwen: MoE XOR rows / vector merge | Same operands and per-output reduction order; guarded shapes | On when admitted | Operator measurements above | Byte/token gates | `STRIX_QPF2K_MOE_XOR64=0`; `STRIX_PREFILL_MOE_MERGE_VEC=0` |
+| Qwen: WMMA bank pin | Register assignment at dense form 4 | On independently of resolver | No complete-workload claim | Same instructions/values | `STRIX_QPF2K_WMMA_PIN=0` (restart process) |
+| DeepSeek pair: prepared load / prefix retention | Discover prepared packs; bounded agent prefix cache | Auto / on | Loading and cache measurements above | Both-rank gates | `STRIX_DS41_PREPARED_LOAD=0`; `--cache-profile off` (keeps explicit options); `--no-prefix-cache` (hard veto) |
+| DeepSeek pair: F16 Engram / attention swizzle | Aligned projection prefetch; f32 LDS vector permutation composed with F16 tiles | On when eligible | Operator measurements above | Byte/both-rank gates | `STRIX_DS41_ENGRAM_F16_PF=0`; `STRIX_DS41_ATTN_LDS_SWIZZLE=0` |
+| DeepSeek RTX: write-back stream / pacing | Dedicated D2H stream, bounded copy-engine queue | On | Per-commit measurements above | Same transfers, identical chat IDs | `--no-wb-stream`; `--no-ce-pacing` |
+| MiniMax: DSpark auto / MSA 5 | Structural serving admission; packed attention evaluation | Auto / 5 | Scoped measurements above | Target-greedy / both-rank state | `--dspark-mode off`; `STRIX_MM_PF_MSA_REWORK=3` (previous) or `0` (original) |
 | Qwen: PLE reclaim | Drop and prefetch file pages for long tiled prompts | Auto | Enables T8192 at 128K/262K | Same bytes | `STRIX_PLE_RECLAIMABLE=0` |
 | DeepSeek pair: production resolver | Discover packs/draft, TP attention, device prefill | Auto | Build: 8K TTFT −12.0% | Within pack identity | `STRIX_DS41_BASELINE=1` |
 | DeepSeek pair: operators/transport | Dense, MoE, attention, shared down, CRC and overlap | On/auto | R1 −1.9%, N8 −2.2% (build) | Bitwise gates | Per-item `=0`; see catalog |
@@ -637,8 +878,8 @@ Full item lists, preconditions, notices and evidence: [optimization catalog](doc
 | DeepSeek RTX: drafter/controller | Keep-64, warm controller, auto vocabulary | On/auto | Keep-64: code +16% at four rows | Target-greedy | `--draft-keep 0`; `--controller-prior none` |
 | MiniMax: decode/exchange | Wide MoE, concurrent index, fused boundaries | On (resolver) | Boundary set: 48.56 → 44.40 ms/token | Built-in gates | `STRIX_MM_BASELINE=1` |
 | MiniMax: prefill/transport | v4 core, batching, pipeline, CRC overlap | On/auto | Prefill bundle: 8K TTFT −20% | Bitwise gates | Per-item off values; see catalog |
-| MiniMax: serving | Deadline-based layer resumes, short-first admission | On; GPU measured | ON vs OFF, run 1 / run 2: C4 28.1/29.2 vs 30.0/31.1 tok/s; C8 31.5/32.7 vs 32.3/35.8 tok/s; C8 worst gap 1.19/1.11 vs 7.49/6.79 s; mixed first-short TTFT 1.19/1.03 vs 14.2/13.4 s, long +20 %/+19 % | Both-rank legacy resume-check 11/11 IDENTICAL; gate compares every request's complete IDs, committed state, digests of all normalized prompt rows across every chunk/group member, first-token and every continuation logit against whole-prefill (idle/beside-decoder) or FIFO standalone (reorder) oracles on both ranks; with a drafter loaded, only the legacy long request with a prompt <=4096 tokens fills Result::draft; legacy background requests and reorder/nested arms compare zero-initialized draft arrays; either rank mismatch fails both; extended legacy/reorder coverage awaits GPU requalification; HTTP IDs identical ON/OFF | `STRIX_MM_SERVE_SCHED=off`; `STRIX_MM_SERVE_SERVICE_MS=0`; `STRIX_MM_SERVE_SHORT_FIRST=0`; [measurements and open costs](docs/engine/serving/serving.md#measured-deadline-based-and-nested-serving-policy) |
-| MiniMax: nested admission | Short prefill in a separate activation bank, long preserved in place | On; GPU measured | ON vs OFF, run 1 / run 2: mixed second-short TTFT 1.25/2.06 vs 13.2/12.5 s; open costs: burst throughput a few percent below OFF, long TTFT about +20 %; optimization continues on decode MoE cost for diverse rows and long-prompt unit sizing | Both-rank nested 512-token/7-layer child 10/10 and whole 511-token child 6/6 IDENTICAL; gate compares parent/child/background complete IDs, committed state, digests of all normalized prompt rows across every chunk/group member, first-token and every continuation logit against standalone B1 on both ranks, plus parked activations/checkpoints; either rank mismatch fails both | `STRIX_MM_SERVE_NEST=0`; `/admin/sched` `nest=false`; [GPU setup, run spread and identical-prompt caveat](docs/engine/serving/serving.md#measured-deadline-based-and-nested-serving-policy) |
+| MiniMax: serving | Deadline resumes and short-first admission | On | Mixed first-short TTFT 1.19/1.03 vs 14.2/13.4 s; long TTFT +20%/+19%; burst throughput lower in these runs | Both-rank resume 11/11 identical; extended coverage remains scoped | `STRIX_MM_SERVE_SCHED=off`; `STRIX_MM_SERVE_SERVICE_MS=0`; `STRIX_MM_SERVE_SHORT_FIRST=0` |
+| MiniMax: nested admission | Child activation bank preserves paused parent | On | Second-short TTFT 1.25/2.06 vs 13.2/12.5 s; long TTFT about +20% | Both-rank nested 512-token child 10/10 and whole 511-token child 6/6 identical | `STRIX_MM_SERVE_NEST=0`; `/admin/sched` `nest=false` |
 | GLM: R1b decode | Faster FP32 summation identity | On | 41.93–41.96 vs R1 47.33–47.48 ms/token | Own identity; differs from R1 | `--identity r1` |
 | GLM: MTP self-speculation | Native MTP drafter + verify on the exchange, KDA verify tree 2, chunked MTP-fill prefill, adaptive K | On | Decode 1.50–1.79× (37.1–44.5 tok/s); TTFT +2.9 % at 8K, +8.7 % at 32K | Tokens equal plain decode | `--mtp 0`; [catalog](docs/optimizations.md#glm-mtp-spec) |
 | GLM: exact chunked prefill | R1 gemv identity, MoE/MLA/indexer kernels, two-layer pipeline with async exchange, 8192-row chunks when both ranks fit (4096 otherwise), register-blocked X2 linear core and MoE for large calls | Auto (resolver defaults) | At 4096 rows: 8K 26.9 s (305 tok/s), 32K 113.7 s (288 tok/s); separate 8192-row comparison: 8K TTFT -4 %, 32K -5.5 % | R1 bitwise | `--prefill ref`; `--baseline`; `STRIX_GLM_MAX_ROWS_AUTO=0`; `STRIX_GLM_PF_EXACT_X=0`; `STRIX_GLM_PF_EXACTMOE_V=3` |
@@ -646,11 +887,16 @@ Full item lists, preconditions, notices and evidence: [optimization catalog](doc
 | Qwen server: constrained JSON output | `json_object` / JSON-schema answers valid by construction (greedy, admitted MTP/serial host route) | On (opt-in per request) | Usability (no speed claim) | Exact to its constrained target; other requests unchanged | `--http-selection-mtp off`, `--http-constraints off`; [catalog](docs/optimizations.md#qwen-serve-constraints) |
 | Qwen/DeepSeek server: API surface | Stateless `/v1/responses`, `/v1/capabilities`, applied policy (filters, echoed seed) in every stream, SSE keepalive | On | Usability (no speed claim) | Same token IDs on/off | `--http-responses off` etc.; [catalog](docs/optimizations.md#qwen-serve-api) |
 
-Master baselines: Qwen `--baseline` / `STRIX_BASELINE=1`; DeepSeek pair `STRIX_DS41_BASELINE=1`;
-RTX `--baseline` / `STRIX_DS41_RTX_BASELINE=1`; MiniMax `STRIX_MM_BASELINE=1`;
-GLM `--baseline` / `STRIX_GLM_BASELINE=1`. Each restores its resolver's preceding configuration;
-see the catalog for scope and explicit-override precedence. Inspect the resolution with
-`--print-effective-config` (RTX: `--print-config`) before running. Avoid legacy opt-in flags on the plain path.
+MiniMax serving measurements are paired runs, not a throughput improvement claim. C4 throughput was
+28.1/29.2 vs 30.0/31.1 tok/s off; C8 31.5/32.7 vs 32.3/35.8. C8 worst decode gaps fell to
+1.19/1.11 from 7.49/6.79 s. The gates compare complete IDs, committed state, all normalized prompt-row
+digests and first/continuation logits on both ranks, plus parked parent/child state for nesting;
+either rank's mismatch fails both. Reference choice depends on whole-prefill, FIFO or standalone-B1
+execution. Draft-array coverage remains limited to the documented legacy route; extended
+legacy/reorder coverage awaits GPU requalification. See
+[measured policy, oracle scopes and open costs](docs/engine/serving/serving.md#measured-deadline-based-and-nested-serving-policy).
+
+For master switches and inspection, see [Defaults and off switches](#defaults-and-off-switches).
 
 ## How it works
 
@@ -686,9 +932,9 @@ flowchart LR
     R["Optional RTX PRO:<br/>layers 0-21 or the prompt"] -. "1 GbE: one hidden state per step" .-> N0
 ```
 
-**Reading a long prompt (Qwen tiled prefill).** The prompt is cut into blocks of up to 2048 rows; inside a block each
+**Reading a long prompt (Qwen tiled prefill).** The prompt is cut into admitted tiles (up to 8192 rows on the automatic route); inside a block each
 weight is read once for all rows, and the recurrent (GDN) layers still update rows in order, so the result is
-bit-identical to reading the prompt one token at a time with the same profile.
+exact to the declared prefill reference. CLI fast FP16 and HTTP prefill retain separate arithmetic contracts.
 
 Every document is listed in the [documentation index](docs/README.md). The architecture guide is [docs/architecture/README.md](docs/architecture/README.md) (multi-node and USB4:
 [docs/architecture/12-multi-node-and-usb4.md](docs/architecture/12-multi-node-and-usb4.md)); the engine reference
@@ -712,17 +958,16 @@ The full record, with alternatives, evidence and the condition for reopening eac
 
 ## Roadmap
 
-- **Prefix cache with GDN state** *(landed, D-035)*: a request whose prompt starts with a cached prefix restores the complete model state at a tiled-prefill block boundary and reads only the rest, with bit-identical output (`--prefix-cache-host-bytes N`, optional `--prefix-cache-dir DIR`; see [docs/engine/serving/prefix-state-cache.md](docs/engine/serving/prefix-state-cache.md)). Timings follow the next benchmark campaign. The store keeps checkpoints fairly across conversations and branches (`--prefix-cache-retention fair`, default; `lru` and `--baseline` keep the previous policy), reserves memory before every pinned copy, and a request can read cached prefixes without storing new ones (`"state_cache": {"retain": false}`). `GET /v1/cache/stats` reports hits, restored tokens, captures, skips, evictions by reason and the bytes held. `--prefix-cache off` / `STRIX_PREFIX_CACHE=0` turns the cache off; an automatic serving budget is not enabled until its exactness gate passes. On the MTP serving route the cache no longer changes the cold prefill plan: checkpoints are copied asynchronously at block boundaries the plan already has (skipped when the next block runs on another stream), and a restore is accepted only when the rest of the prompt runs exactly as it would without the cache.
+Production execution is shipped for every engine in [Models](#models). Automatic HTTP tiled prefill,
+prefix checkpoints, DeepSeek prepared loading and agent prefix retention, MiniMax DSpark auto admission
+and GLM exact MTP are implemented; they are not future promises.
 
-In progress, without promised numbers:
-
-- **MiniMax M3.1 Flash (EXL3) on the pair:** publish the measured prefill/exchange defaults and resolve
-  order-dependent serving slowdown; the eight-text quality gate has passed.
-- **GLM-5.3 Flash:** publish measured R1 decode/prefill changes, reduce rank skew and qualify R1b more widely.
-- **DeepSeek:** a lower-latency ready path for the USB4 exchange and a closed defaults campaign for the newest
-  opt-in flags; end-to-end time to first token of the exact CUDA prefill through the pair's server.
-- **Qwen:** continue combined prefill and decode-router qualification; GSQ remains an opt-in speed-over-quality profile.
-- **Monitor panel**, per-user keys and TLS through the product layer.
+Remaining qualification and engineering work is recorded with its scope in the
+[implementation status](docs/reference/implementation-status.md),
+[optimization catalog](docs/optimizations.md) and [decision register](docs/decisions/decision-register.md).
+This includes broader long-context model fidelity, additional MiniMax grouped/nested serving coverage,
+GLM numerical-identity evaluation and complete-workload measurements for isolated kernel changes.
+Compiler success, memory estimates and theoretical throughput do not close those gates.
 
 ## Related repositories
 
@@ -732,16 +977,20 @@ In progress, without promised numbers:
   used for DeepSeek's dense weights and MiniMax inference.
 - [TensorMeld](https://github.com/hyukudan/tensormeld): placement and routing across nodes and GPUs; its router
   serves the Qwen replicas.
+- [tierstream](https://github.com/hyukudan/tierstream): tiered expert streaming across VRAM, pinned host memory
+  and NVMe used by the standalone DeepSeek RTX route.
+
 
 ## FAQ
 
-**Does speculative decoding change the answer?**
-No, where we claim exactness (see [How exact](#how-exact-how-good)). Every emitted token is checked by the full
-model with the same arithmetic as a one-token step. The one documented exception is the RTX split with trellis
-sites, which is a declared composed identity.
+**Does speculative decoding or concurrency change the answer?**
+No. Both preserve the token sequence of the declared reference path. A composed RTX profile, a
+rotary mode or a numerical identity defines which reference is used; it is not an exception to
+speculative verification. Compare the same assets, profile pair and request policy. See [Exactness](#exactness).
 
 **Which Qwen profile should I use?**
-Dense A8 is the recommended default; use the exact profile when you need the FP32-dense arithmetic. The two can
+Start with the plain command: dense-A8 decode and eligible fast FP16 CLI prefill. FP16 prefill is a
+separate reference identity. Use the FP32-dense profile when you need that arithmetic. The two can
 pick different tokens where two candidates are nearly tied (2.8 % of positions); each is deterministic and exact
 with respect to itself.
 
@@ -754,26 +1003,27 @@ The Qwen 4-bit file alone is about 111 GB; DeepSeek's experts are split across t
 the GPU read the weights where they sit.
 
 **What context length is supported?**
-Qwen's automatic profile is qualified at 8192 tokens; longer contexts run with `--unqualified-context` (the measured prefill
-sweep reaches 262,143 tokens that way). A retrieval pilot with the default command found the needle in all 19
-cases from 8K to 262,143 tokens; that is a pilot, not a qualification
-([long-context checks](docs/reproduce.md#long-context-retrieval-and-reasoning-checks-qwen)). Beyond 262,144 there is an
-opt-in static YaRN mode (`--rope-yarn 2|4` with an explicit `--context`, CLI only; it changes outputs
-at every position and is off by default). Within YaRN, `--mtp` speculative decode is exact against serial YaRN
-(factor 2 through 524,288 positions and factor 4 through 1,048,576, with the QSA MTP pool and rolling PLE on by
-default - `STRIX_QSA_MTP_POOL=0` / `STRIX_PLE_ROLLING=0` turn each off). A bare `--rope-yarn` selects MTP when a
-verified MTP bundle is found (`<model>.mtp-bundle.json` beside the model, or `--mtp-bundle FILE`); `--mtp` selects it
-explicitly; `STRIX_QWEN_YARN_MTP=0` keeps serial YaRN: [YaRN mode](docs/reference/qwen-yarn-host-table.md). DeepSeek's long-context limits are in
-[docs/models/deepseek-v4.1/long-context.md](docs/models/deepseek-v4.1/long-context.md).
+Qwen native capacity is 262,144 positions. Native fidelity qualification remains 8192; the published
+8K–262K retrieval pilot is not a general accuracy qualification. Explicit CLI YaRN supports admitted
+factor-2 capacity through 524,288 and factor-4 through 1,048,576, with exact MTP relative to serial
+YaRN and default-on QSA MTP pool/rolling PLE. YaRN changes native outputs and is opt-in.
+Use the [long-context commands and evidence](#qwen-long-context), not just a larger capacity flag.
+DeepSeek limits are in [long context](docs/models/deepseek-v4.1/long-context.md).
+
+**Do I need flags to enable the fast path?**
+No. Use the model's [plain launch command](#run) with its required assets. Inspect with
+`--print-effective-config` (RTX: `--print-config`); use exact off switches for controlled A/B.
+MTP/DSpark asset requirements and explicit numerical modes still apply.
 
 **Where are the numbers from?**
-From our own runs on our own machines, with date, configuration and exactness check per row in
+From project measurements, with build, configuration, repetition count where recorded and exactness evidence in
 [docs/performance.md](docs/performance.md). Nothing here is an estimate presented as a result.
 
 ## License
 
-The engine source is licensed under the **[Apache License 2.0](LICENSE)**, except the experimental Linux kernel
+The engine source is licensed under the **[Apache License 2.0](LICENSE)**, except the Linux kernel
 module under `lab/direct_gpu_stream/kernel/`, which is **GPL-2.0-only** as Linux kernel code must be (its license
 texts are kept in that directory). Code adopted from other projects keeps its original license and notices. Model
-weights are distributed under their own licenses. Third-party references used for formats and model semantics are
+weights are distributed under their own licenses. **Built with MiniMax M3.1-Flash**; its model license
+is non-commercial by default. Preserve model and conversion notices and review the applicable terms. Third-party references used for formats and model semantics are
 listed with their licenses in [docs/reference/sources-ledger.md](docs/reference/sources-ledger.md).
