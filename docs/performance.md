@@ -216,6 +216,21 @@ uses MTP speculative decoding, greedy (temperature 0), thinking off, dense A8 nu
 
 These are historical 2026-10-22 rows; the overnight snapshot gives the newer exact-prefill measurements.
 
+### Long context (YaRN, one node)
+
+Measured on one Strix Halo node, default route (code `a199c8e0` plus the bundle selection of #137), diverse
+real prose (50 public-domain books in six languages), greedy decoding, automatic storage ladder (no storage
+overrides). TTFT runs from process launch to the first token and includes model load.
+
+| Context (YaRN factor) | Exact gate (MTP == serial == pool off) | TTFT serial / MTP | Prefill, serial | Decode serial / MTP | MTP acceptance |
+|---|---|---|---|---|---|
+| 262,400 (2) | Full scope | 219 s / 224 s | 1,254 tok/s | 19.9 / **56.0 tok/s** (2.8x) | 75 % |
+| 524,288 (2) | Target scope | 470 s / 508 s | 1,215 tok/s | 19.7 / **60.6 tok/s** (3.1x) | 85 % |
+| 1,048,576 (4) | Full scope, plus the default-path receipt | 1,005 s / 1,096 s | 1,081 tok/s (MTP route about 970) | 18.7 / **55.9 tok/s** (3.0x) | 83 % |
+
+These are exactness checks against serial YaRN, not native rotary; they do not establish general model
+fidelity at these lengths. See the [README long-context section](../README.md#qwen-long-context).
+
 ### Two replicas (one complete model per node, behind the router)
 
 Setup: the [TensorMeld](https://github.com/hyukudan/tensormeld) router balancing active decodes; servers with
