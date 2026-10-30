@@ -1253,9 +1253,10 @@ __global__ __launch_bounds__(256) void prefill_combine_kernel(PrefillView p) {
     }
 }
 
-template <unsigned HPW, bool DENSE, class View = DecodeView, bool SEPARATE = false, bool STREAM = false, bool COMPACT = SEPARATE>
+template <unsigned HPW, bool DENSE, class View = DecodeView, bool SEPARATE = false, bool STREAM = false, bool COMPACT = SEPARATE, bool PACKED = false>
 __global__ __launch_bounds__(kGroup / HPW * 32) void attend4_kernel(View input, int select) {
     constexpr bool REPAIR = repaired_prefill<View>;
+    static_assert(!PACKED || (HPW == 2 && REPAIR && SEPARATE && STREAM && COMPACT));
     unsigned window = blockIdx.z, row_group = blockIdx.x, chunk = blockIdx.y;
     if constexpr (COMPACT) {
         // Invert the prefix to launch exactly the valid (row, group, chunk) items.
@@ -1481,9 +1482,28 @@ __global__ __launch_bounds__(kGroup / HPW * 32) void attend4_kernel(View input, 
                 const float corr = t == 0 ? 0.0F : exp_f(m[h] - mn);
                 l[h] = l[h] * corr;
                 for (unsigned i = 0; i < kDimsPerLane; ++i) acc[h][i] = acc[h][i] * corr;
-                p0[h] = exp_f(sa - mn);
-                p1[h] = exp_f(sb - mn);
+                if constexpr (!PACKED) {
+                    p0[h] = exp_f(sa - mn);
+                    p1[h] = exp_f(sb - mn);
+                }
                 m[h] = mn;
+            }
+            if constexpr (PACKED) {
+                // Preserve canonical score bits, including NaN payloads:
+                // bit-mode AND 0x1c broadcasts lane (lane & ~3U) in each quad.
+                // Head 0 occupies even lanes, head 1 odd lanes, in both halves.
+                const float mn = (lane & 1U) != 0U ? m[1] : m[0];
+#pragma unroll
+                for (unsigned half = 0; half < 2; ++half) {
+                    const float s0 = u2f(static_cast<std::uint32_t>(__builtin_amdgcn_ds_swizzle(
+                        static_cast<int>(f2u(sv[0][half])), 0x1c)));
+                    const float s1 = u2f(static_cast<std::uint32_t>(__builtin_amdgcn_ds_swizzle(
+                        static_cast<int>(f2u(sv[1][half])), 0x1c)));
+                    const float score = (lane & 1U) != 0U ? s1 : s0;
+                    const float probability = exp_f(score - mn);
+                    if (half == 0) p0[0] = probability;
+                    else p1[0] = probability;
+                }
             }
             uint2 vrow[kTile];  // full tile: the 16 V rows read before the chain (see version 3)
             if constexpr (NTC != 0) {
@@ -1498,7 +1518,11 @@ __global__ __launch_bounds__(kGroup / HPW * 32) void attend4_kernel(View input, 
                     const float v0 = lo_bf16(raw.x), v1 = hi_bf16(raw.x), v2 = lo_bf16(raw.y), v3 = hi_bf16(raw.y);
 #pragma unroll
                     for (unsigned h = 0; h < HPW; ++h) {
-                        const float pj = rl(j < 8 ? p0[h] : p1[h], key_lane(j % 8));
+                        float pj;
+                        if constexpr (PACKED)
+                            pj = rl(j < 8 ? p0[0] : p1[0], key_lane(j % 8) + static_cast<int>(h));
+                        else
+                            pj = rl(j < 8 ? p0[h] : p1[h], key_lane(j % 8));
                         l[h] = l[h] + pj;
                         acc[h][0] = __builtin_fmaf(pj, v0, acc[h][0]);
                         acc[h][1] = __builtin_fmaf(pj, v1, acc[h][1]);
@@ -1869,6 +1893,11 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
             const unsigned blocks = static_cast<unsigned>(block_count(p.pos0 + scheduled.rows));
             hipLaunchKernelGGL((prefill_r16_kernel<DENSE>), dim3(blocks, v.kv_heads, windows), dim3(1024),
                                4 * kTile * kHeadDim * sizeof(std::uint16_t), stream, scheduled);
+        } else if (p.msa_rework == 5) {
+            const RepairedPrefillView repaired{scheduled};
+            hipLaunchKernelGGL((attend4_kernel<2, DENSE, RepairedPrefillView, true, true, true, true>),
+                               dim3(static_cast<unsigned>(chunks * v.kv_heads)), dim3(256),
+                               4 * kTile * kHeadDim * sizeof(std::uint16_t), stream, repaired, 0);
         } else if (p.msa_rework == 3) {
             const RepairedPrefillView repaired{scheduled};
             hipLaunchKernelGGL((attend4_kernel<2, DENSE, RepairedPrefillView, true, true>),
@@ -1923,6 +1952,11 @@ template <bool DENSE> void launch_prefill_partials(const PrefillView& p, unsigne
         const unsigned blocks = static_cast<unsigned>(block_count(p.pos0 + p.rows));
         hipLaunchKernelGGL((prefill_r16_kernel<DENSE>), dim3(blocks, v.kv_heads, windows), dim3(1024),
                            4 * kTile * kHeadDim * sizeof(std::uint16_t), stream, p);
+    } else if (p.msa_rework == 5) {
+        const RepairedPrefillView repaired{p};
+        hipLaunchKernelGGL((attend4_kernel<2, DENSE, RepairedPrefillView, true, true, true, true>),
+                           dim3(static_cast<unsigned>(chunks * v.kv_heads)), dim3(256),
+                           4 * kTile * kHeadDim * sizeof(std::uint16_t), stream, repaired, 0);
     } else if (p.msa_rework == 3) {
         const RepairedPrefillView repaired{p};
         hipLaunchKernelGGL((attend4_kernel<2, DENSE, RepairedPrefillView, true, true>),
@@ -1941,7 +1975,7 @@ namespace {
 void validate_prefill_diagnostic(const PrefillView& p) {
     const DecodeView& v = p.window;
     const unsigned windows = p.rows == 0 ? 0 : (p.rows - 1) / kMaxRows + 1;
-    if (p.msa_rework > 4 || windows == 0 || windows > 65535U || p.first_window != 0 ||
+    if (p.msa_rework > 5 || windows == 0 || windows > 65535U || p.first_window != 0 ||
         p.scratch_windows == 0 || windows > p.scratch_windows ||
         v.rows_per_seq != (p.rows < kMaxRows ? p.rows : kMaxRows) || v.seqs != 1 ||
         v.q_heads != 32 || v.kv_heads != 2 || v.max_blocks == 0 || v.max_blocks > kMaxBlocks ||
@@ -2025,7 +2059,7 @@ void enqueue_prefill_index(const PrefillView& p, hipStream_t stream) {
 
 void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarker marker, void* user) {
     const DecodeView& v = p.window;
-    if (p.msa_rework > 4 || (p.index_rows != 16 && p.index_rows != 32 && p.index_rows != 64) ||
+    if (p.msa_rework > 5 || (p.index_rows != 16 && p.index_rows != 32 && p.index_rows != 64) ||
         p.rows == 0 || p.scratch_windows == 0 || p.first_window != 0 || v.seqs != 1 ||
         v.q_heads != 32 || v.kv_heads != 2 || v.idx_heads != 2 || v.shard_count != 1 || v.shard_rank != 0 ||
         v.max_blocks == 0 || v.max_blocks > kMaxBlocks || (attend_version(v) != 3 && attend_version(v) != 4) ||

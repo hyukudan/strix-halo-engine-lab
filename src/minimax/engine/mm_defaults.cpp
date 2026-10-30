@@ -75,7 +75,7 @@ constexpr Item kItems[] = {
     {"pf_attend4", "STRIX_MM_PF_ATTEND4", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
     {"pf_router_batch", "STRIX_MM_PF_ROUTER_BATCH", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
     {"pf_mtfit", "STRIX_MMX_PREFILL_MTFIT", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
-    {"pf_msa_rework", "STRIX_MM_PF_MSA_REWORK", "3", "0", "Prefill attention measurement: exact, 8K B/A 0.963 / 0.957 / 0.972"},
+    {"pf_msa_rework", "STRIX_MM_PF_MSA_REWORK", "5", "0", "Prefill attention measurement: exact, 8K B/A 0.963 / 0.957 / 0.972"},
     {"pf_idx_tile", "STRIX_MM_PF_IDX_TILE", "1", "0",
      "Prefill index measurement: exact (state/final rows identical), index scoring 8K -6.7 %, 32K -6.4 %; TTFT 8K -1.9 %, 32K -0.6 %, 1K neutral"},
     {"pf_idx_rows", "STRIX_MM_PF_IDX_ROWS", "64", "32",

@@ -1779,18 +1779,18 @@ Choose fitting prefill MoE tiles.
 
 <a id="mm-pf-msa-rework"></a>
 
-### MSA prefill mode 3
+### MSA prefill mode 5
 
-**Engine:** `minimax`. **Control:** `STRIX_MM_PF_MSA_REWORK`. **Default:** 3.
+**Engine:** `minimax`. **Control:** `STRIX_MM_PF_MSA_REWORK`. **Default:** 5.
 
 Rework attention scheduling without changing the reference result.
 
 - **Preconditions:** Supported MSA prefill shapes and row buffers.
-- **Automatic selection:** Resolver supplies 3 only when unset; explicit values win. Shape/core dispatch determines actual use.
+- **Automatic selection:** Resolver supplies 5 only when unset; explicit values win. Shape/core dispatch determines actual use.
 - **Fallback notice:** Unsupported operator geometry keeps its supported dispatch without a universal decline notice; invalid explicit settings fail validation.
-- **Exactness evidence:** Published same-identity qualification: Prefill attention measurement: exact, 8K B/A 0.963 / 0.957 / 0.972; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
-- **Off switch:** STRIX_MM_PF_MSA_REWORK=0
-- **Measured gain:** Prefill attention measurement: exact, 8K B/A 0.963 / 0.957 / 0.972
+- **Exactness evidence:** Mode 5 vs 3: prefill tokens, attention state fnv and final-row fnv identical across all arms on both ranks; kernel tests bitwise for every rework mode. Mode 3: published same-identity qualification (8K B/A 0.963 / 0.957 / 0.972).
+- **Off switch:** STRIX_MM_PF_MSA_REWORK=3 (previous default), =0 (original)
+- **Measured gain:** Mode 5 (= mode 3 with packed two-head probability evaluation) vs mode 3, GPU, two Strix Halo nodes over 2x USB4 Gen3, PerfOpt kernel, one binary, rank --ab pfmsarework (A=3, B=5; A B A B A B A prefills) in two processes: 8K TTFT B - bracketing A mean -0.129 s, 1K -0.109 s (n=6 each, intervals include 0, not slower); producers -2.9 %, attention -1 % in the kernel bench. Mode 3 vs the original: 8K B/A 0.963 / 0.957 / 0.972
 - **Implementation / evidence:** [38-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-moe-gu-interleave"></a>
