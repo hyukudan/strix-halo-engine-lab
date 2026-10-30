@@ -40,7 +40,7 @@ void enqueue_compress(const CompressView& v, hipStream_t stream);
 // STRIX_DS41_COMPRESS_AHEAD=1 (default off): the index key weights of each thread are read three 64-weight steps ahead,
 // the first ones before the latent barrier; the same chains, the same bytes. Tests: 0 off, 1 on, -1 the environment.
 void set_compress_ahead(int mode);
-// STRIX_DS41_COMPRESS_FAST=1 (default off): the same kernel in fewer instructions (hardware F16 conversion of finite
+// STRIX_DS41_COMPRESS_FAST (default on, =0 off; =0 with STRIX_DS41_COMPRESS_AHEAD=1 selects the ahead form): the same kernel in fewer instructions (hardware F16 conversion of finite
 // weights, 16-byte latent reads, the next weight step requested ahead, branch-free exp range tests); the same chains,
 // the same bytes. Tests: 0 off, 1 on, -1 the environment.
 void set_compress_fast(int mode);

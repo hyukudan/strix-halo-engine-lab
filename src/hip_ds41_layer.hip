@@ -1,5 +1,6 @@
 #include "strix/ds41_prefill_tuning.hpp"
 #include "strix/hip_ds41_layer.hpp"
+#include "strix/ds41_exact_flags.hpp"
 #include "strix/dist/staged_ready.hpp"
 #include "strix/hip_ds41_f16_rows.hpp"
 #include "strix/hip_ds41_rn_table.hpp"
@@ -271,7 +272,7 @@ __global__ __launch_bounds__(1024) void norm_kernel(NormView v) {
         if (k < k_count) norm_emit(v, v.out, v.codes, v.deltas, v.sums, r, c0 + k * wave + l, c0 / 32U + k, y[k], rr);
 }
 
-// STRIX_DS41_NORM_ILP=1 (default off): norm_kernel's values, sums (same order) and stores, with the loads
+// STRIX_DS41_NORM_ILP (default on, =0 off): norm_kernel's values, sums (same order) and stores, with the loads
 // gathered: every x value of the lane's chunk is read before the first add and every weight before the first store (in
 // place, x == out, the compiler may not move a weight load past a store). One row at q_lora_rank 1280 is two waves
 // (chunk 640) and norm_kernel waited on its 20 x loads and 20 weight loads one by one: ~18 us a launch for 5 KB
@@ -311,8 +312,7 @@ __global__ __launch_bounds__(1024) void norm_ilp_kernel(NormView v) {
         if (k < k_count) norm_emit_weight(v, v.out, v.codes, v.deltas, v.sums, r, c0 + k * wave + l, c0 / 32U + k, y[k], rr, w[k]);
 }
 bool norm_ilp_enabled() {
-    static const bool on = [] { const char* e = std::getenv("STRIX_DS41_NORM_ILP"); return e && *e == '1'; }();
-    return on;
+    return norm_ilp();  // default on, STRIX_DS41_NORM_ILP=0 off (ds41_exact_flags.hpp)
 }
 
 // Few rows, out not overlapping the input: block (c, r) recomputes the row's sum of squares exactly as

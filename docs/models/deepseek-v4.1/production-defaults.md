@@ -22,8 +22,7 @@ deployment's environment (pack paths), listed below.
 
 Unchanged (off unless set): `STRIX_DS41_PREPARED_LOAD`, the tpserve prefill
 (`STRIX_DS41_PREFILL_EXPERT_TP`, slower than the EP prefill), `STRIX_DS41_BATCH_ROWS16`, serve `--cache-profile`
-(opt-in for agent loops: prompts shorter than a 256-token block are never cached), `STRIX_DS41_COMPRESS_FAST`,
-`STRIX_DS41_EXPERT_ROWS`.
+(opt-in for agent loops: prompts shorter than a 256-token block are never cached), `STRIX_DS41_EXPERT_ROWS`.
 
 ## Additional qualified two-node code defaults (unset = on, `=0` = off)
 
@@ -47,6 +46,20 @@ full-workload gate; confirmed in a combined measurement.
 | `STRIX_DS41_IDX_DIRECT`, `STRIX_DS41_IDX_CAND_FILTER`, `STRIX_DS41_ATTN_SEG_HPW` | on | indexer skipped when the count is <= 512, candidate-only scoring for pool layers above 16K entries, shared heads-per-wave for N8 segments; short R1/R6/N8 -2.0/-2.7/-1.0 %, 128K -0.8/-1.9/-3.3 %, same bits |
 | `STRIX_DS41_BATCH_SHARED` | `overlap` (`off`/`0`: before the routed experts; `split` unchanged) | BatchForward shared expert inside the half-sum exchange, N1/N2/N4/N8 -2.8/-3.2/-5.1/-5.2 % in qualification, same bits |
 
+Exact decode launch and staging options (unset = on, `=0` = off each), in-process ABA on both ranks, every arm bitwise
+(R1 tokens + logits slices, verify-window tokens, attention states; batch rows and states):
+
+| setting | effect |
+|---|---|
+| `STRIX_DS41_TOUCH_BATCH` | a prefetch window's read-ahead touches in one launch (up to 16 spans) instead of one per span |
+| `STRIX_DS41_TRELLIS_ROW_VIEWS` | multi-row steps pass strided rows straight to the dense-r1 trellis plan (no staging copy) |
+| `STRIX_DS41_NORM_ILP` | norm_kernel gathers its loads before the first add / store |
+| `STRIX_DS41_R1FUSE_ROUTES` | the router's top-k writes the expert routes (no separate build-routes launch) |
+| `STRIX_DS41_COMPRESS_FAST` | compressor kernel in fewer instructions (same chains) |
+
+All five together vs all off: R1 -0.95 % (26.94 -> 26.68 ms/token, 4/4 pairs faster), R6 -0.68 %, batch N8 decode -0.40 % / wall -1.16 %.
+Alone vs off, R1: TOUCH_BATCH -0.31 %, TRELLIS_ROW_VIEWS -0.08 %, NORM_ILP -0.35 %, COMPRESS_FAST -0.34 % (R6 -0.59 %), R1FUSE_ROUTES -0.11 %; R6 not slower for any.
+
 Attention-core qualification (in-process ABA x3 per cell, every arm bitwise on both
 ranks: tokens, logits slices, attention states; prefill 32K / 400 rows logits + state digest equal):
 
@@ -56,8 +69,7 @@ ranks: tokens, logits slices, attention states; prefill 32K / 400 rows logits + 
 | `STRIX_DS41_IDX_CAND_FILTER` | on (`=0` off) | candidate users read and select only candidate blocks (> 16K entries). 128K R1 -0.8 %, R6 -1.9 % |
 | `STRIX_DS41_ATTN_SEG_HPW` | on (`=0` off) | N8 segments share one heads-per-wave form (Hpw 4 instead of 1). With the above: N8 8K -1.1 %, 32K -1.4 %, 128K -3.3 % |
 
-Still off (measured slower or neutral): `STRIX_DS41_PREFILL_SLABS` (8K +0.76 %), `STRIX_DS41_R1FUSE_QNORM_A8`,
-`STRIX_DS41_R1FUSE_ROUTES` (now on the fast builder, exact, in the noise), `STRIX_DS41_NORM_ILP` (exact, in the noise), `STRIX_DS41_GRAPHS` (only 0.21 ms/step of GPU idle waits for the host), `STRIX_DS41_ATTN_LDS_SWIZZLE`, CMake `STRIX_EXPERIMENTAL_MALL_Q2_DOWN_NT`.
+Still off (measured slower or neutral): `STRIX_DS41_PREFILL_SLABS` (8K +0.76 %), `STRIX_DS41_R1FUSE_QNORM_A8`, `STRIX_DS41_GRAPHS` (only 0.21 ms/step of GPU idle waits for the host), `STRIX_DS41_ATTN_LDS_SWIZZLE`, CMake `STRIX_EXPERIMENTAL_MALL_Q2_DOWN_NT`.
 With the trellis o_b site (below) the o_b product is the trellis plan, so the Q8 o_b ready epilogue does not run there;
 the MoE half-sum ready path does.
 The read-ahead skips trellis sites (their own pack) and runs only in the Q8 o_b exchange windows, so with the trellis

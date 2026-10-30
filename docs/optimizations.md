@@ -999,6 +999,22 @@ Skips redundant indexing, scores only candidates and shares eligible segment lau
 - **Measured gain:** Short R1/R6/N8 -2.0/-2.7/-1.0%; 128K -0.8/-1.9/-3.3% (combined)
 - **Public evidence:** [Two-node defaults](models/deepseek-v4.1/production-defaults.md)
 
+<a id="ds-exact-decode-launches"></a>
+
+### Exact decode launch and staging options
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_TOUCH_BATCH; STRIX_DS41_TRELLIS_ROW_VIEWS; STRIX_DS41_NORM_ILP; STRIX_DS41_R1FUSE_ROUTES; STRIX_DS41_COMPRESS_FAST`. **Default:** on.
+
+Five changes to launches, loads and staging only, never to the arithmetic: a prefetch window's read-ahead touches in one launch (up to 16 spans), strided rows passed straight to the dense-r1 trellis plan instead of a staging copy, the norm kernel's loads gathered before its first add, the router's top-k writing the expert routes directly, and the compressor kernel in fewer instructions (hardware F16 conversion of finite weights, 16-byte latent reads, the next weight step requested ahead).
+
+- **Preconditions:** Two-node decode; TRELLIS_ROW_VIEWS needs the dense_r1 trellis API and applies to multi-row steps.
+- **Automatic selection:** All five are on; nothing to select.
+- **Fallback notice:** None; `=0` restores the previous form.
+- **Exactness evidence:** In-process ABA on both ranks: R1 tokens + logits slice, verify-window tokens and the attention state of every arm equal arm 0's; batch N8 every row's fed/argmax/logits hash and final attention states equal.
+- **Off switch:** `=0` on each variable, separately
+- **Measured gain:** GPU, two Strix Halo nodes over 2x USB4 Gen3, PerfOpt kernel, production packs; one binary, all five off vs all five on in the same process (rank app --aba 5, batch app --aba 3, first pair discarded): R1 26.94 -> 26.68 ms/token (-0.95 %, paired 95 % interval -0.28..-0.24 ms, 4/4 pairs faster); R6 verify window 51.43 -> 51.08 ms (-0.68 %, 4/4 pairs faster); batch N8 decode 71.19 -> 70.91 ms/step (-0.40 %), wall -1.16 % (2/2 pairs faster); Per option, alone vs off (in-process ABA x4, 3 warm pairs, every arm bitwise on both ranks): TOUCH_BATCH R1 -0.31 % (95 % interval -0.14..-0.03 ms), TRELLIS_ROW_VIEWS R1 -0.08 % (-0.034..-0.009 ms), NORM_ILP R1 -0.35 % (-0.18..-0.01 ms), COMPRESS_FAST R1 -0.34 % and R6 -0.59 % (both intervals below zero), R1FUSE_ROUTES R1 -0.11 % (3/3 pairs faster, interval -0.066..+0.005 ms); R6 not slower for any of them
+- **Public evidence:** [Two-node defaults](models/deepseek-v4.1/production-defaults.md)
+
 <a id="ds-trellis"></a>
 
 ### Grouped trellis o_a and q_a/KV pair
