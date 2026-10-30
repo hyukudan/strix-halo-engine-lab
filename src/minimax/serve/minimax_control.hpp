@@ -25,6 +25,9 @@ struct Control {
 };
 static_assert(sizeof(Control) <= 512);
 
+// Hello reuses pflags; zero retains the ordinary version-2 wire encoding.
+inline constexpr std::uint32_t kHelloSessionVote = 1U;
+
 template<class Engine>
 Control exchange(Engine& eng, const Control& out) try {
     std::array<std::byte, 512> o{}, i{};
@@ -52,5 +55,13 @@ Control exchange(Engine& eng, const Control& out) try {
 } catch (...) {
     eng.abort("control channel: protocol failure");
     throw;
+}
+
+template<class Engine>
+bool session_hello(Engine& eng, bool requested) {
+    Control hello;
+    hello.pflags = requested ? kHelloSessionVote : 0U;
+    const auto peer = exchange(eng, hello);
+    return ((hello.pflags | peer.pflags) & kHelloSessionVote) != 0;
 }
 }  // namespace strix::minimax::serve

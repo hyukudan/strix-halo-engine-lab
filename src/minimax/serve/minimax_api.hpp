@@ -70,6 +70,7 @@ struct RequestExtra {
 [[nodiscard]] strix::serve::Json reply_timings(const strix::serve::GenerationStats& stats, const RequestExtra& extra);
 
 struct MinimaxApiOptions {
+    bool session_enabled = false;
     std::string model_id = "minimax-m3.1-flash";
     std::uint32_t default_max_tokens = 4096;
     std::uint64_t context_tokens = 0;

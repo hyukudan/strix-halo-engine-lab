@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/file_snapshot.hpp"
 
 // MiniMax M3.1 Flash DSpark drafter: host reference of the draft model in the declared arithmetic of the device
 // kernels (hip_minimax_dspark.hpp), so host and device drafts are bitwise comparable, plus the greedy verify protocol.
@@ -169,6 +170,7 @@ public:
     // callers that supply them through DeviceDrafter::set_linear_hook (measurement: 1.66 GB less to read and upload).
     static std::unique_ptr<DraftFile> open(const std::filesystem::path& dir, bool block_linears = true);
     ~DraftFile();
+    const LoaderSnapshot& loader_snapshot() const { return snapshot_; }
     [[nodiscard]] const Weights& weights() const noexcept { return weights_; }
     [[nodiscard]] std::uint64_t bytes() const noexcept { return bytes_; }
     // Raw bytes of one tensor by its checkpoint name (for device upload); throws if absent.
@@ -176,6 +178,7 @@ public:
 
 private:
     DraftFile() = default;
+    LoaderSnapshot snapshot_;
     struct Blob;
     std::vector<std::unique_ptr<Blob>> blobs_;
     Weights weights_;

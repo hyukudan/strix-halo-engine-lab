@@ -1,4 +1,5 @@
 #include "minimax/serve/minimax_api.hpp"
+#include "strix/serve/session_api.hpp"
 
 #include "minimax/serve/minimax_chat.hpp"
 #include "minimax/serve/minimax_tokenizer.hpp"
@@ -122,8 +123,16 @@ void MinimaxApi::generate(const sv::HttpRequest&, sv::HttpResponseWriter& w, std
     if (inbound_id.empty()) w.add_response_header("X-Request-Id", id);
     sv::GenerationJob job;
     job.prompt = std::move(prompt);
+    if (options_.session_enabled) if (const auto* v = body.find("session")) {
+        if (!v->is_string()) { w.send(400,"application/json",sv::session_error("invalid_request","session must be a string").dump()); return; }
+        const auto& session_id = v->as_string();
+        try { (void)sv::session_command("POST", "/v1/sessions/" + session_id + "/park", ""); }
+        catch (const sv::SessionApiError&) { w.send(400,"application/json",sv::session_error("invalid_request","invalid session id").dump()); return; }
+        job.session = session_id;
+    }
     job.max_tokens = max_tokens;
     job.stop_tokens = {tok_.eos_id};
+    const bool named_session = !job.session.empty();
     const std::size_t prompt_tokens = job.prompt.size();
     auto ticket = queue_.submit(std::move(job));
     // Armed instrumentation is decided once per request, by the queue at submission (GenerationTicket::observed: the
@@ -258,7 +267,8 @@ void MinimaxApi::generate(const sv::HttpRequest&, sv::HttpResponseWriter& w, std
             e.set("type", sv::Json("server_error"));
             sv::Json b = sv::Json::object();
             b.set("error", std::move(e));
-            write(event(b));
+            if (named_session) { const auto failure = sv::session_failure(err); write(event(sv::session_error(failure.code,err))); }
+            else write(event(b));
         }
         auto last = chunk("", finish_reason(st));
         last.set("timings", reply_timings(st, x.value_or(RequestExtra{})));
@@ -289,7 +299,8 @@ void MinimaxApi::generate(const sv::HttpRequest&, sv::HttpResponseWriter& w, std
     const std::string err = ticket->error();
     const auto x = take_extra();
     if (!err.empty()) {
-        send_error(w, 400, err);
+        if (named_session) { const auto failure = sv::session_failure(err); w.send(failure.status,"application/json",sv::session_error(failure.code,err).dump()); }
+        else send_error(w, 400, err);
         finish_record(st, err, x);
         return;
     }

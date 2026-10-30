@@ -1,5 +1,6 @@
 // MiniMax engine: safetensors pack index and O_DIRECT reads (see mm_common.hpp).
 #include "mm_common.hpp"
+#include "strix/minimax/model_assets.hpp"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -9,9 +10,6 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
-#include <set>
-#include <sstream>
 
 namespace strix::minimax::engine::detail {
 
@@ -79,14 +77,6 @@ struct JsonParser {
     }
 };
 
-std::string read_text(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open " + path);
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
-}
-
 void pread_all(int fd, void* dst, std::uint64_t n, std::uint64_t off, const std::string& what) {
     auto* d = static_cast<std::uint8_t*>(dst);
     while (n > 0) {
@@ -114,23 +104,20 @@ Json parse_json(const char* begin, const char* end) {
 }
 
 PackReader::PackReader(std::string dir) : dir_(std::move(dir)) {
-    const std::string idx = read_text(dir_ + "/model.safetensors.index.json");
-    const Json j = parse_json(idx.data(), idx.data() + idx.size());
-    std::map<std::string, std::uint32_t> file_ids;
-    std::vector<std::string> files;
-    for (const auto& [k, v] : j.obj().at("weight_map").obj())
-        if (file_ids.emplace(v.str(), static_cast<std::uint32_t>(files.size())).second) files.push_back(v.str());
+    const auto files = assets::pack_files(dir_, &snapshot_);
     const bool want_direct = std::getenv("STRIX_MM_LOAD_DIRECT") == nullptr || std::atoi(std::getenv("STRIX_MM_LOAD_DIRECT")) != 0;
     for (std::uint32_t f = 0; f < files.size(); ++f) {
-        const std::string path = dir_ + "/" + files[f];
+        const std::string path = files[f].string();
         int fd = want_direct ? ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT) : -1;
         direct_.push_back(fd >= 0 ? 1 : 0);
         if (fd < 0) fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd < 0) throw std::runtime_error("open " + path);
         fds_.push_back(fd);
+        snapshot_.push_back(loaded_file(path, fd, true));
         // Header: 8-byte length + JSON, read through the aligned bounce once it exists; a plain read is simpler here.
         const int hfd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (hfd < 0) throw std::runtime_error("open " + path);
+        snapshot_.push_back(loaded_file(path, hfd));
         std::uint64_t hb = 0;
         pread_all(hfd, &hb, 8, 0, path);
         std::string head(hb, '\0');

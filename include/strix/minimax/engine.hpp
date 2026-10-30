@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/file_snapshot.hpp"
 // MiniMax M3.1 Flash engine, TP2 over the pair (fork of the DeepSeek V4.1 TP2 engine; see qualification notes).
 // Rank r holds q heads 32r..32r+31, KV / index-q heads {2r, 2r+1}, half of every MLP intermediate (dense, shared, all 128
 // experts), and its vocabulary half of the head; router, index key and embedding are replicated. Per layer two exchanges
@@ -295,6 +296,8 @@ public:
 
     [[nodiscard]] const dist::CommunicatorStats& comm_stats() const;
     [[nodiscard]] const Profile& profile() const;
+    [[nodiscard]] LoaderSnapshot loader_snapshot() const;
+    [[nodiscard]] LoaderSnapshot draft_loader_snapshot() const;
     [[nodiscard]] std::uint32_t rank() const;
 
 private:

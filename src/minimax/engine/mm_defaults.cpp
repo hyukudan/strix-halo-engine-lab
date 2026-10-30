@@ -1,9 +1,13 @@
+#ifdef _MSC_VER
+#define _CRT_SECURE_NO_WARNINGS
+#endif
 // MiniMax M3.1 defaults-on resolver: the table of default-ON items, the baseline master switch and the canonical
 // effective configuration (see mm_defaults.hpp).
 #include "minimax/engine/mm_defaults.hpp"
 #include "minimax/serve/minimax_sched.hpp"
 #include "minimax/dspark/minimax_auto.hpp"
 
+#include <array>
 #include <cstdio>
 #include <charconv>
 #include <cstdlib>
@@ -11,6 +15,14 @@
 #include <iomanip>
 #include <limits>
 #include <mutex>
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -102,6 +114,14 @@ std::mutex g_mutex;
 bool g_applied = false;
 std::set<std::string> g_exported;
 
+int export_env(const char* name, const char* value, int overwrite) {
+#ifdef _WIN32
+    if (!overwrite && std::getenv(name)) return 0;
+    return ::_putenv_s(name, value);
+#else
+    return ::setenv(name, value, overwrite);
+#endif
+}
 const char* process_env(const char* name) { return std::getenv(name); }
 
 }  // namespace
@@ -149,7 +169,7 @@ void apply() {
     const Lookup env = process_env;
     for (const Resolved& r : resolve(env)) {
         if (r.source == Source::env) continue;
-        (void)::setenv(r.item->env, r.value.c_str(), 0);
+        (void)export_env(r.item->env, r.value.c_str(), 0);
         g_exported.insert(r.item->env);
     }
     if (baseline(env))
@@ -217,7 +237,81 @@ ServePolicy serve_policy(const Lookup& env) {
             serve::gap_ms(value("STRIX_MM_SERVE_GAP_MS")),
             flag("STRIX_MM_SERVE_SHORT_FIRST"), flag("STRIX_MM_SERVE_NEST")};
 }
-}  // namespace
+} // namespace
+// Pure policy only: inspection must not query memory, storage or home paths.
+SessionConfig session_policy(const Cli& cli, const Lookup& env, bool explicit_cli) {
+    SessionConfig c;
+    const auto value = [&](const char* key) { const char* v = env(key); return std::string(v ? v : ""); };
+    const auto mode = value("STRIX_SESSION_CACHE");
+    c.route = cli.app + "/" + cli.transport + "/fixed-width-one-session-v1";
+    // Add routes only after native execution, fidelity and complete-workload qualification.
+    static constexpr std::array<const char*, 0> gpu_qualified_session_routes{};
+    const bool qualified = std::find(gpu_qualified_session_routes.begin(),
+                                    gpu_qualified_session_routes.end(), c.route) != gpu_qualified_session_routes.end();
+    if (env("STRIX_SESSION_MAX_PARKED")) c.max_parked = std::stoull(value("STRIX_SESSION_MAX_PARKED"));
+    if (!explicit_cli && (baseline(env) || (env("STRIX_BASELINE") && value("STRIX_BASELINE") != "0" && value("STRIX_BASELINE") != "off"))) c.reason = "baseline";
+    else if (!explicit_cli && (mode == "0" || mode == "off")) c.reason = "switch";
+    else if (cli.slots < 2) c.reason = "at least two slots required";
+    else if (c.max_parked == 0) c.reason = "max parked is zero";
+    else if (!explicit_cli && !qualified && mode != "1" && mode != "on")
+        c.reason = "route not yet GPU-qualified: " + c.route;
+    c.enabled = c.reason.empty();
+    return c;
+}
+SessionConfig session_config(const Cli& cli, const Lookup& env, std::uint64_t available,
+                             bool explicit_cli, const std::string& explicit_directory) {
+    auto c = session_policy(cli, env, explicit_cli);
+    auto value = [&](const char* key, const char* fallback) { const char* v = env(key); return std::string(v ? v : fallback); };
+    auto off = [&](const char* key) { auto v = value(key, "1"); return v == "0" || v == "off"; };
+    if (available == UINT64_MAX) {
+        available = 0;
+#ifdef _WIN32
+        MEMORYSTATUSEX m{}; m.dwLength = sizeof(m);
+        if (GlobalMemoryStatusEx(&m)) available = m.ullAvailPhys;
+#else
+        std::ifstream mem("/proc/meminfo"); std::string line;
+        while (std::getline(mem, line)) if (line.starts_with("MemAvailable:")) {
+            std::istringstream in(line.substr(13)); in >> available; available *= 1024; break;
+        }
+#endif
+    }
+    c.ram_bytes = std::min<std::uint64_t>(8ULL << 30, available / 10);
+    if (env("STRIX_SESSION_RAM_BYTES")) c.ram_bytes = std::stoull(value("STRIX_SESSION_RAM_BYTES", "0"));
+    auto xdg = value("XDG_CACHE_HOME", "");
+    auto home = value("HOME", "");
+    if (home.empty()) home = value("USERPROFILE", "");
+    const auto default_dir = (xdg.empty() ? home + "/.cache" : xdg) + "/strix-engine/sessions";
+    c.directory = value("STRIX_SESSION_DIR", default_dir.c_str());
+    if (explicit_cli && !explicit_directory.empty()) c.directory = explicit_directory;
+    if (c.reason.empty()) {
+        const auto limit = (std::numeric_limits<std::uint64_t>::max() - (64ULL << 20)) / 76804;
+        const auto payload = cli.capacity > limit ? std::numeric_limits<std::uint64_t>::max() : cli.capacity * 76804 + (64ULL << 20);
+        if (payload > c.ram_bytes / 6 || available < (256ULL << 20) || payload > (available - (256ULL << 20)) / 6)
+            c.reason = "budget/MemAvailable below one session capture peak";
+    }
+    c.enabled = c.reason.empty();
+    c.disk = c.enabled && (explicit_cli || !off("STRIX_SESSION_DISK"));
+    if (c.disk && explicit_directory.empty() && xdg.empty() && home.empty() && !env("STRIX_SESSION_DIR")) { c.disk = false; c.disk_reason = "home directory unavailable"; }
+    if (c.disk) {
+        std::error_code ec;
+        auto ancestor = std::filesystem::absolute(c.directory, ec);
+        while (!ancestor.empty() && !std::filesystem::exists(ancestor, ec)) ancestor = ancestor.parent_path();
+        const auto space = std::filesystem::space(ancestor, ec);
+        c.disk_bytes = ec ? 0 : std::min<std::uint64_t>(64ULL << 30, space.available / 4);
+        if (env("STRIX_SESSION_DISK_BYTES")) c.disk_bytes = std::stoull(value("STRIX_SESSION_DISK_BYTES", "0"));
+        const auto payload = cli.capacity <= (1ULL << 40) ? cli.capacity * 76804 + (64ULL << 20) : UINT64_MAX;
+        if (ec || payload > c.disk_bytes / 2 || payload > space.available / 2) { c.disk = false; c.disk_reason = "disk space below two checkpoints"; }
+        if (c.disk) {
+            const auto probe = std::filesystem::path(c.directory) / (".probe-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+            std::filesystem::create_directories(c.directory, ec);
+            bool writable = !ec;
+            if (writable) { std::ofstream file(probe); file << "probe"; file.flush(); writable = bool(file); }
+            std::filesystem::remove(probe, ec);
+            if (!writable || ec) { c.disk = false; c.disk_reason = "directory not creatable/writable"; }
+        }
+    }
+    return c;
+}
 
 std::string effective_config(const Cli& cli, const Lookup& env) {
     std::ostringstream o;
@@ -254,6 +348,11 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
           << "serve.short_first=" << (policy.short_first ? 1 : 0) << "\n"
           << "serve.nest=" << (policy.nest ? 1 : 0) << "\n";
     }
+    const auto session = session_policy(cli, env, false);
+    const char* requested = env("STRIX_SESSION_CACHE");
+    o << "session_requested=" << (requested ? requested : "auto") << "\n"
+      << "session_cache=" << (session.enabled ? "pending" : "off") << "\n"
+      << "session_reason=" << (session.enabled ? "runtime admission required" : session.reason) << "\n";
     return o.str();
 }
 
@@ -263,6 +362,19 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], kPrintFlag) == 0) print = true;
         else args.emplace_back(argv[i]);
+    }
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--baseline") { (void)export_env(kBaselineEnv, "1", 1); (void)export_env("STRIX_SESSION_CACHE", "0", 1); }
+        const std::pair<const char*, const char*> flags[] = {
+            {"--session-host-budget", "STRIX_SESSION_RAM_BYTES"}, {"--session-cache-dir", "STRIX_SESSION_DIR"},
+            {"--session-cache", "STRIX_SESSION_CACHE"}, {"--session-disk", "STRIX_SESSION_DISK"},
+            {"--session-ram-bytes", "STRIX_SESSION_RAM_BYTES"}, {"--session-max-parked", "STRIX_SESSION_MAX_PARKED"},
+            {"--session-dir", "STRIX_SESSION_DIR"}, {"--session-disk-bytes", "STRIX_SESSION_DISK_BYTES"}};
+        for (const auto& flag : flags) if (a == flag.first) {
+            if (i + 1 >= argc) throw std::invalid_argument("missing value for " + a);
+            (void)export_env(flag.second, argv[++i], 1); break;
+        }
     }
     apply();
     (void)pf_async_min_rows(process_env("STRIX_MM_PF_ASYNC_MIN_ROWS"));

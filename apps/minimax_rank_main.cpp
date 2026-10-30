@@ -55,6 +55,7 @@
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/minimax/engine.hpp"
 #include "minimax/engine/mm_defaults.hpp"
+#include "strix/dist/communicator.hpp"
 #include "strix/bp_codec.hpp"
 #include "minimax/moe/mmx_prefill.hpp"
 #include "minimax/xfer/minimax_xfer.hpp"
@@ -63,6 +64,8 @@
 #include "minimax/dspark/minimax_auto.hpp"
 #include "minimax/serve/minimax_tokenizer.hpp"
 #include "markov_cand.hpp"
+#include "minimax/session/runtime.hpp"
+#include "strix/minimax/session_startup.hpp"
 #include "minimax_ngram.hpp"
 
 #include <arpa/inet.h>
@@ -1557,6 +1560,7 @@ int main(int argc, char** argv) {
     }
     try {
         const auto t_start = Clock::now();
+        strix::minimax::session::RunOptions session_options;
         mm::Options opt;
         opt.model_dir = argv[1];
         g_auto_model = opt.model_dir;
@@ -1567,9 +1571,10 @@ int main(int argc, char** argv) {
         const std::string out_dir = argv[4];
         std::string gate_dir, gold_dir, tf_dir;
         unsigned gate_layers = 6;
-        bool tf_write = false;
+        bool tf_write = false, session_hash_only = false;
         double deadline = 1e9;
         std::vector<std::string> sessions, batches, ab_runs, specs, dchecks, vtraces, offloads, offload_imports, offload_listens, xbchecks;
+        std::vector<std::string> session_hash_files;
         std::string dspark_dir = std::string(argv[1]) + "/dspark", dspark_exl3;
         std::vector<std::string> dspark_heads;
         for (int i = 5; i < argc; ++i) {
@@ -1595,6 +1600,8 @@ int main(int argc, char** argv) {
             else if (a == "--decode-check") dchecks.push_back(next());
             else if (a == "--xb-check") xbchecks.push_back(next());
             else if (a == "--spec") specs.push_back(next());
+            else if (a == "--session-hash-file") session_hash_files.push_back(next());
+            else if (a == "--session-hash-only") session_hash_only = true;
             else if (a == "--dspark") dspark_dir = next();
             else if (a == "--dspark-exl3") dspark_exl3 = next();
             else if (a == "--dspark-head") dspark_heads.push_back(next());
@@ -1602,7 +1609,18 @@ int main(int argc, char** argv) {
             else if (a == "--slots") opt.slots = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--capacity") opt.capacity = std::stoull(next());
             else if (a == "--max-rows") opt.max_rows = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (strix::minimax::session::parse_option(session_options,a,next)) {}
             else throw std::invalid_argument("unknown option " + a);
+        }
+        if(!session_options.save.empty() && !session_options.load.empty()) throw std::invalid_argument("choose session save or load");
+        if (session_hash_only) {
+            // CPU only: no transport, HIP runtime query, engine or drafter.
+            const auto warm = strix::minimax::session::prewarm(opt.model_dir,
+                session_options.draft ? dspark_dir : "", dspark_exl3, "/proc/self/exe", session_hash_files);
+            std::printf("session prewarm rank %u wall_s %.6f second_s %.6f cache_hits %llu cache_misses 0 all_hits=1\n",
+                opt.rank, warm.wall_seconds, warm.second_seconds,
+                static_cast<unsigned long long>(warm.hits));
+            return 0;
         }
         std::string receipt;
         // The ranks load at different speeds (measurement: 44 s vs 166 s under page-cache pressure): the first collective after
@@ -1670,6 +1688,39 @@ int main(int argc, char** argv) {
         std::printf("rank %u: load %.1f s, %.1f GiB read (%s), device used %.1f GiB\n", opt.rank, lr.seconds, lr.gib_read,
                     lr.direct_io ? "O_DIRECT" : "buffered", lr.device_gib);
         std::fflush(stdout);
+        const bool session_cli = !session_options.prompt.empty() || !session_options.load.empty();
+        if(session_cli) {
+            strix::minimax::defaults::Cli cli; cli.slots=opt.slots; cli.capacity=opt.capacity; cli.max_rows=opt.max_rows;
+            strix::minimax::defaults::SessionConfig config;
+            try {
+                config = strix::minimax::defaults::session_config(cli, [](const char* key) { return std::getenv(key); }, UINT64_MAX, true,
+                    !session_options.save.empty() ? session_options.save : !session_options.load.empty() ? session_options.load : session_options.directory);
+                if ((!session_options.save.empty() || !session_options.load.empty()) && !config.disk) {
+                    config.enabled = false; config.reason = config.disk_reason;
+                }
+            } catch (const std::exception& e) { config.enabled = false; config.reason = e.what(); }
+            if (!session_options.budget) session_options.budget=config.ram_bytes;
+            session_options.directory=config.directory;
+            session_options.max_parked=config.max_parked;
+            session_options.disk_budget=config.disk_bytes;
+            session_options.disk_enabled=config.disk;
+            std::unique_ptr<ds::DraftFile> sf; std::unique_ptr<ds::DeviceDrafter> sd;
+            auto runtime = strix::minimax::session::admit_runtime_pair({config.enabled, true, config.reason}, eng.rank(),
+                [&](const strix::minimax::session::StartupVote& vote) { return strix::minimax::session::exchange_startup(eng, vote); }, [&] {
+                std::fprintf(stderr, "session cache admission: ram_bytes=%llu disk_bytes=%llu disk=%s\n",
+                    static_cast<unsigned long long>(session_options.budget), static_cast<unsigned long long>(session_options.disk_budget),
+                    session_options.disk_enabled ? "on" : "off");
+                if (session_options.draft) {
+                    sf = ds::DraftFile::open(dspark_dir, dspark_exl3.empty());
+                    ds::DeviceDrafter::Options so;
+                    so.slots = opt.slots; so.capacity = opt.capacity;
+                    sd = std::make_unique<ds::DeviceDrafter>(sf->weights(), so);
+                    if (!dspark_exl3.empty()) eng.attach_draft_exl3(dspark_exl3, *sd);
+                }
+                return std::make_unique<strix::minimax::session::Runtime>(eng,sd.get(),opt,"/proc/self/exe",session_options,dspark_dir,dspark_exl3,sf ? sf->loader_snapshot() : strix::LoaderSnapshot{});
+            }, [](const std::string& line) { std::fprintf(stderr, "%s\n", line.c_str()); });
+            strix::minimax::session::run_cli(*runtime,session_options); return 0;
+        }
         std::uint64_t hs = 14695981039346656037ULL;
         auto in_time = [&]() { return eng.agree(secs(t_start, Clock::now()) < deadline ? 1U : 0U) != 0; };
 

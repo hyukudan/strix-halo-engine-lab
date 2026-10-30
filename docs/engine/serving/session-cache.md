@@ -260,7 +260,7 @@ inputs, numerical environment and output directory. Run phases 1–3 in separate
 turns; never loop them in one allocation. Phase 4 is CPU-only and launches no model.
 Each phase requires COMPLETE receipts and nonempty artifacts from all earlier phases;
 phase 1 requires a fresh empty output directory outside Git. A failed attempt requires a
-new run directory. GPU_TURN_* / GPU_WINDOW and STRIX_HASH_CACHE are operational and may change.
+new run directory. `STRIX_HASH_CACHE` is operational and may change.
 
 | Phase | CLI target or fixed MTP | HTTP fixed MTP |
 | --- | --- | --- |

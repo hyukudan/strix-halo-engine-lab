@@ -44,12 +44,16 @@
 #include "minimax/engine/mm_defaults.hpp"
 #include "minimax/serve/minimax_dspark_policy.hpp"
 #include <filesystem>
+#include "strix/dist/communicator.hpp"
 #include "minimax/xfer/minimax_xfer.hpp"
 #include "hip_minimax_dspark.hpp"
+#include "minimax/session/runtime.hpp"
+#include "strix/minimax/session_startup.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/engine.hpp"
 #include "strix/serve/http_server.hpp"
 #include "strix/serve/json.hpp"
+#include "strix/serve/session_api.hpp"
 
 #include <algorithm>
 #include <array>
@@ -264,7 +268,9 @@ using ms::lead::Extra;
 using ms::lead::Sched;
 using ms::lead::Lead;
 
-void follow(mm::Engine& eng, Runner& run) try {
+void follow(mm::Engine& eng, Runner& run, strix::minimax::session::Runtime* session = nullptr) try {
+    ms::SessionCounts counts;
+    bool taps = run.dd != nullptr && env_num("STRIX_MM_SERVE_DSPARK", 0) != 0;
     std::uint64_t round = run.control_round;
     for (;;) {
         Control mine;
@@ -275,6 +281,14 @@ void follow(mm::Engine& eng, Runner& run) try {
             eng.abort("control channel: duplicate / stale round");
             throw std::runtime_error("control channel: duplicate / stale round");
         }
+        if (static_cast<Command>(c.command) == Command::session) {
+            const auto body = ms::session_wire(eng, {}, c.plen);
+            const auto available = eng.peer(session ? 1U : 0U);
+            if (session && available) (void)ms::session_execute(eng, *session, body, counts);
+            eng.set_taps(taps);
+            continue;
+        }
+        if (static_cast<Command>(c.command) == Command::taps) taps = (c.pflags & 1U) != 0;
         if (!ms::replay_command(c, eng, run, [&](std::size_t n) {
                 std::vector<std::uint32_t> prompt;
                 exchange_tokens(eng, prompt, n, false);
@@ -731,6 +745,7 @@ int main(int argc, char** argv) {
         // sessions, tokens identical, each deferred arm below its two inline neighbours by 0.04-0.12 ms/token).
         // STRIX_MMX_CRC: 0 = off, 1 = inline, deferred = deferred check.
         (void)::setenv("STRIX_MMX_CRC", "deferred", 0);
+        strix::minimax::session::RunOptions session_options;
         mm::Options opt;
         opt.model_dir = argv[1];
         opt.slots = 8;
@@ -768,6 +783,7 @@ int main(int argc, char** argv) {
             else if (a == "--resume-check") check = next();
             else if (a == "--resume-check-tokens") check_tokens = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--check-only") check_only = true;
+            else if (strix::minimax::session::parse_option(session_options,a,next)) {}
             else throw std::invalid_argument("unknown option " + a);
         }
         const auto dspark_prior = ds::parse_prior(dspark_prior_value.empty() ? std::getenv("STRIX_MM_DSPARK_PRIOR") : dspark_prior_value.c_str());
@@ -780,6 +796,7 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("bounded child requires --resume-check-nested");
         if (check_child_layers != ~0U && check_tokens < 2 + 59 / check_child_layers)
             throw std::invalid_argument("bounded child requires enough continuation tokens for every background step");
+        if(!session_options.save.empty() && !session_options.load.empty()) throw std::invalid_argument("choose session save or load");
         if (opt.slots == 0 || opt.slots > 8) throw std::invalid_argument("--slots 1..8");
         if (!dspark_exl3.empty() && dspark_dir.empty()) dspark_dir = opt.model_dir + "/dspark";
         if (dspark_dir.empty() && dspark_mode != ds::Mode::off && std::filesystem::is_directory(opt.model_dir + "/dspark"))
@@ -788,6 +805,9 @@ int main(int argc, char** argv) {
                     dspark_dir = opt.model_dir + "/dspark";
                     break;
                 }
+        const strix::minimax::defaults::Lookup lookup = [](const char* key) { return std::getenv(key); };
+        strix::minimax::defaults::Cli cli; cli.app = "serve"; cli.transport = transport_spec; cli.slots = opt.slots; cli.capacity = opt.capacity; cli.max_rows = opt.max_rows;
+        strix::minimax::defaults::SessionConfig session_config;
         std::signal(SIGINT, on_signal);
         std::signal(SIGTERM, on_signal);
         std::string receipt;
@@ -851,8 +871,50 @@ int main(int argc, char** argv) {
             eng.abort("nested capacity mismatch");
             throw std::runtime_error("nested capacity mismatch");
         }
-        Control hello;
-        (void)exchange(eng, hello);
+        std::unique_ptr<strix::minimax::session::Runtime> session_runtime;
+        const bool session_cli = !session_options.prompt.empty() || !session_options.load.empty();
+        try { session_config = strix::minimax::defaults::session_policy(cli, lookup, session_cli); }
+        catch (const std::exception& e) { session_config.enabled = false; session_config.reason = e.what(); }
+        const char* session_switch = std::getenv("STRIX_SESSION_CACHE");
+        const bool session_explicit = session_cli || (session_switch &&
+            (std::string(session_switch) == "1" || std::string(session_switch) == "on"));
+        const bool session_vote = ms::session_hello(eng, session_config.reason != "baseline" &&
+            (session_config.enabled || session_explicit));
+        if (session_vote) {
+            try {
+                if (session_cli) {
+                    session_config = strix::minimax::defaults::session_config(cli, lookup, UINT64_MAX, true,
+                        !session_options.save.empty() ? session_options.save : !session_options.load.empty() ? session_options.load : session_options.directory);
+                    if ((!session_options.save.empty() || !session_options.load.empty()) && !session_config.disk) {
+                        session_config.enabled = false; session_config.reason = session_config.disk_reason;
+                    }
+                } else session_config = strix::minimax::defaults::session_config(cli, lookup);
+            } catch (const std::exception& e) { session_config.enabled = false; session_config.reason = e.what(); }
+            if (!session_options.budget) session_options.budget = session_config.ram_bytes;
+            if (session_cli || session_options.directory.empty()) session_options.directory = session_config.directory;
+            session_options.max_parked = session_config.max_parked;
+            session_options.disk_budget = session_config.disk_bytes;
+            session_options.disk_enabled = session_config.disk;
+            const bool session_on = session_config.enabled;
+
+            if (!session_cli) session_options.draft = drafter != nullptr;
+            session_runtime = strix::minimax::session::admit_runtime_pair(
+                {session_on, session_explicit, session_config.reason}, eng.rank(),
+                [&](const strix::minimax::session::StartupVote& vote) { return strix::minimax::session::exchange_startup(eng, vote); }, [&] {
+                    std::fprintf(stderr, "session cache admission: ram_bytes=%llu disk_bytes=%llu disk=%s\n",
+                        static_cast<unsigned long long>(session_options.budget), static_cast<unsigned long long>(session_options.disk_budget),
+                        session_options.disk_enabled ? "on" : "off");
+                    return std::make_unique<strix::minimax::session::Runtime>(eng,drafter.get(),opt,"/proc/self/exe",session_options,dspark_dir,dspark_exl3,draft_file ? draft_file->loader_snapshot() : strix::LoaderSnapshot{});
+                }, [](const std::string& line) {
+                    std::fprintf(stderr, "%s\n", line.c_str());
+                });
+        } else {
+            std::fprintf(stderr, "session cache: off (%s)\n", session_config.reason.c_str());
+        }
+        if (session_runtime && session_cli) {
+            strix::minimax::session::run_cli(*session_runtime,session_options); return 0;
+        }
+
         if (!check.empty()) {
             const int bad = resume_check(eng, run, check, check_tokens, check_nested, check_child_layers);
             std::printf("rank %u resume-check: %s\n", opt.rank, bad == 0 ? "ALL IDENTICAL" : "MISMATCH");
@@ -867,7 +929,7 @@ int main(int argc, char** argv) {
         const bool dspark_on = drafter != nullptr && dspark_mode == ds::Mode::on;
         if (drafter != nullptr) eng.set_taps(dspark_on);
         if (opt.rank != 0) {
-            follow(eng, run);
+            follow(eng, run, session_runtime.get());
             std::printf("rank 1: STOPPED\n");
             return 0;
         }
@@ -888,6 +950,26 @@ int main(int argc, char** argv) {
             shared.policy.draft_slots = static_cast<std::uint32_t>(std::clamp(env_num("STRIX_MM_SERVE_DRAFT_SLOTS", 8), 1.0, 8.0));
         }
         sv::GenerationQueue queue(64);
+        ms::SessionService session_service;
+        ms::SessionCounts session_counts;
+        auto refresh_session_metadata = [&] {
+            try {
+                session_service.tasks.publish_metadata(ms::session_metadata(*session_runtime, session_counts, true),
+                                                       ms::session_metadata(*session_runtime, session_counts, false));
+            } catch (const std::exception& e) {
+                auto error = sv::session_error("unavailable", std::string(e.what()) + "; retry after 1 second", 503);
+                session_service.tasks.publish_metadata(error, error);
+            }
+        };
+        if (session_runtime) {
+            refresh_session_metadata();
+            session_service.execute = [&](const std::string& body, const ms::SessionService::Publish& publish) {
+                auto reply = ms::session_execute(eng, *session_runtime, body, session_counts, publish);
+                refresh_session_metadata();
+                return reply;
+            };
+        }
+        auto& session_tasks = session_service.tasks;
         ms::ObserverInfo oi;
         oi.model = model_id;
         oi.context_tokens = opt.capacity;
@@ -898,6 +980,7 @@ int main(int argc, char** argv) {
         oi.draft = drafter != nullptr;
         ms::Observer observer(std::move(oi));
         ms::MinimaxApiOptions ao;
+        ao.session_enabled = session_runtime != nullptr;
         ao.model_id = model_id;
         ao.default_max_tokens = max_tokens;
         ao.context_tokens = opt.capacity;
@@ -921,7 +1004,25 @@ int main(int argc, char** argv) {
         sv::HttpServerConfig hc;
         hc.bind_address = bind;
         hc.port = port;
-        sv::HttpServer http(hc, [&](const sv::HttpRequest& r, sv::HttpResponseWriter& w) { api.handle(r, w); });
+        sv::HttpServer http(hc, [&](const sv::HttpRequest& r, sv::HttpResponseWriter& w) {
+            if (session_runtime && (r.path.starts_with("/v1/sessions") || r.path == "/v1/cache/stats")) {
+                try {
+                    const auto command = sv::session_command(r.method,r.path,r.body);
+                    auto reply = session_tasks.submit(command);
+                    int status = 200;
+                    if (const auto* v = reply.find("_status")) status = static_cast<int>(v->as_int());
+                    if (const auto* error = reply.find("error")) {
+                        if (status == 200 || status == 503) w.add_response_header("Retry-After", "1");
+                        w.send(status == 200 ? 503 : status,"application/json",sv::session_error(error->find("code")->as_string(),error->find("message")->as_string()).dump());
+                    } else w.send(status,"application/json",reply.dump());
+                } catch (const sv::SessionApiError& e) {
+                    if (e.status == 503) w.add_response_header("Retry-After", "1");
+                    w.send(e.status,"application/json",sv::session_error(e.code,e.what()).dump()); }
+                catch (const std::exception& e) { w.send(400,"application/json",sv::session_error("invalid_request",e.what()).dump()); }
+                return;
+            }
+            api.handle(r,w);
+        });
         http.listen();
         std::thread http_thread([&] { http.serve(); });
         std::printf("minimax serve policy: %s\n", policy_json(shared, drafter != nullptr).dump().c_str());
@@ -930,8 +1031,10 @@ int main(int argc, char** argv) {
                     shared.policy.sched == Sched::interleave ? "interleave" : "off", shared.policy.gap_ms, ds::mode_name(shared.policy.dspark_mode));
         std::fflush(stdout);
         Lead lead(eng, run, queue, shared, opt.max_rows, dspark_on, g_stop,
-                  [tokenizer](const std::vector<std::uint32_t>& ids) { return tokenizer->decode(ids, true); });
-        lead.loop();
+                  [tokenizer](const std::vector<std::uint32_t>& ids) { return tokenizer->decode(ids, true); },
+                  session_runtime ? &session_service : nullptr);
+        try { lead.loop(); } catch (...) { session_tasks.close(); queue.shutdown(); http.stop(); http_thread.join(); throw; }
+        session_tasks.close();
         queue.shutdown();
         http.stop();
         http_thread.join();
