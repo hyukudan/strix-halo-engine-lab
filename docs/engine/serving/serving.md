@@ -68,6 +68,121 @@ The process prints `strix serve: listening on ADDR:PORT` on stderr once it accep
 one-line JSON receipt (`"mode":"native-mtp-http-serve"`, the number of served requests) on stdout
 when it stops.
 
+## Default prompt prefill
+
+On the qualified native Qwen checkpoint and target, HTTP serving now resolves a known-prefix
+T8192 owner before requests arrive. Keep the required MTP calibration prompt, golden, sidecar,
+pins and window budgets; tiled-prefill organization flags and budgets can be omitted. Unlike
+single-request auto prefill, the server cannot choose T from an incoming prompt at startup.
+It preserves the resolved decode/prefill numerical profiles and explicit context capacity;
+this does not enable automatic FP16 arithmetic. Request prompts must still fit that capacity.
+
+Automatic candidates that would create an extra `STRIX_PROMPT_BATCH_ROWS` owner decline
+with an actionable notice before allocation in both startup and inspection. Unset that
+variable or supply explicit T and the existing group workspace/metadata budgets.
+A value at or below the selected T creates no extra group owner.
+
+The resolver compiles and sizes the primary arena and all configured tail owners, metadata,
+model backing, state, serial scratch, runtime payload and at least one runnable MTP slot.
+For automatic native serving, target backing means the page-aligned registered extents,
+including coalesced gaps, using the same range planner as native registration. These
+aliases consume physical UMA once and GTT once. Unregistered mapped file cache (the
+CPU-read PLE table) is reclaimable and does not constitute a committed UMA allocation;
+its native row staging and snapshots remain charged. This changes admission accounting,
+not the mapping, warming policy or arithmetic. Inspection reports `target_mapped_file_bytes`,
+`target_registered_backing_bytes` and `serve_committed_host_peak_bytes`. The generic
+model residency reservation still describes the conservative full mapped backing.
+The shared startup/inspection/runtime calculation uses verified sidecar/calibration asset sizes,
+the sidecar residency planner (including copied backing and setup peak), native predictor pool,
+target capture, target-window arenas/captures, deferred banks, selector and calibration payloads.
+Native primary/tail PLE staging, projections, gates, snapshots, hashes and deferred GDN banks
+are reserved separately from the arenas. Routed CSR uses the production layout for
+fixed primary/tail allocations and conservatively bounds every retained partial row
+count from 16 through T in steps of 8, per owner. Runtime retains distinct workspaces
+for those counts; this bound does not assume which merged/grouped units execute.
+Batch-certificate staging is a shared reserve derived from the target registry and predictor/held state; an explicit staging cap takes precedence.
+MTP budget ceilings are limits, not simultaneous allocations; their sum is never charged.
+Automatic T declines target `--residency copy`, selective `--model-copy-tier` and
+`STRIX_MODEL_COPY_ALL` with a notice; preserve those requests and supply an explicit tiled route.
+The default workspace budget is the compiled primary-plus-tail requirement: serving retains uniform
+logits storage and all tail owners, so the CLI's compact/pruned 8 GiB limit does not apply. Default limits
+are 1 GiB metadata, at most 120 GiB UMA bounded by observed available memory, and 4 GiB host
+headroom. Explicit budgets win. Both available host memory and
+free GTT must fit. Context or memory/plan rejection tries T4096, T2048, T1024, T256, T64 and T16;
+the `Qwen serve-prefill:` startup line records each trial's exception text (or the failed memory
+bound with required/limit bytes) and the selected T. Missing memory
+observations decline automatic allocation. If no tiled owner is admitted, the server reports
+the decline and requires an explicit valid tiled route before device work. Explicit T is never
+resized. Keep `--http-serve` and the same MTP arguments when adding `--print-effective-config`:
+the dry run uses the same CPU prefill admission and HTTP/cache route validation, reports
+`serve_prefill_notice` in JSON, and exits nonzero on a route rejection. Omitting `--http-serve`
+inspects a CLI route. No device work occurs during inspection, so it cannot predict allocation
+failures or the final HTTP slot count (`http_slots.slots` remains null for a batched route).
+Later HTTP slot admission refuses zero capacity, including explicit `--http-batch 0`, measures stack costs, reserves active peaks and
+headroom, and rechecks available memory before lazy growth; a larger shared prefill arena can
+reduce admitted slot capacity. The default context remains 8192; longer contexts require the
+existing explicit context contract and do not acquire a new qualification claim.
+
+For a configured prefix cache, omitted `--prefix-cache-block-rows` selects 1024 when it divides T.
+This changes checkpoint granularity, not automatic cache-budget qualification (which remains
+off). `--prefix-cache-block-rows 0` restores T-sized checkpoints; another valid explicit divisor
+wins. `STRIX_BATCH_PROMPT_SMALL=1` (tail-size prompt units between decode cycles)
+remains opt-in for HTTP batch runners and CLI cohorts: with several long prompts queued it
+delayed first tokens (TTFT p50 +37 % at 4 and +60 % at 8 concurrent 8.5K prompts) and is not
+part of this default.
+
+`STRIX_SERVE_PREFILL=0` disables automatic T selection; supply the previous explicit tiled
+configuration to serve with it. `--known-prefix-prefill-rows T` and its explicit budgets always
+win, including with that environment switch set. `--baseline` / `STRIX_BASELINE=1` suppresses
+the automatic T and the 1024-row checkpoint default. Inspect `--print-effective-config` for T,
+`serve_automatic_prefill` and `prefix_cache_block_rows`.
+
+GPU service, nesting and slots gates reported EXACT against sequential explicit T2048: complete
+IDs and committed target state matched; service/nesting also checked prompt state, and slots
+covered 1/2/4/8 clients. Every default startup selected automatic T8192. These gates do not
+compare logits. Same binary, interleaved arms (ABBAAB), identical token IDs, automatic T8192
+versus `STRIX_SERVE_PREFILL=0` with explicit T2048, one request at a time, three rounds per
+arm: cold TTFT 21.95 versus 22.93 s at 17K (-4.3 %) and 11.08/11.11 versus 11.53/11.58 s for
+two 8.5K prompts (-3.9 %, -4.0 %); every automatic arm was faster than every explicit arm.
+With eight staggered 8.5K prompts queued: TTFT p50 65.3/65.4 versus 66.4/71.7 s, p95
+100.0/99.8 versus 101.4/106.3 s, wave wall 103.8/103.6 versus 105.2/110.2 s; at four, TTFT p50
+35.3/35.5 versus 34.4/34.7 s (within run-to-run spread). T8192 consumes capacity: admitted
+slots were 29 versus 55 with the explicit T2048 configuration, a queueing tradeoff only above 29
+concurrent requests. Pressure paths are covered by CPU tests. Keep receipts outside Git.
+The exactness contract remains complete IDs/state at the same numerical identity, context
+and frontier; FP16 prefill does not claim dense-A8 equality. Missing state diagnostics are not a pass.
+
+For a cross-T reference, use the service gate's persisted sequential reference. Here `CMD` is
+the executable, `PINNED_ARGS` is a shell array containing the same model, calibration IDs,
+MTP assets/window budgets, numerical profile, context and optional cache host budget for every
+run, with no HTTP or tiled-prefill flags. `OUT` must be outside the checkout. Use a long prompt
+with multiple T8192 blocks plus a tail, and a distinct short prompt:
+
+```bash
+REF_PREFILL=(--known-prefix-window --known-prefix-full-rows --known-prefix-expert-union
+  --known-window-router-rows --known-prefix-prefill-rows 2048
+  --known-prefix-workspace-budget-bytes 8589934592
+  --known-prefix-host-metadata-budget-bytes 1073741824
+  --known-prefix-uma-budget-bytes 128849018880
+  --known-prefix-host-headroom-bytes 4294967296)
+python3 tests/batch_service_gpu_gate.py --arms alone \
+  --short SHORT.ids --long LONG.ids --out "$OUT/t2048" -- \
+  "$CMD" "${PINNED_ARGS[@]}" "${REF_PREFILL[@]}"
+python3 tests/batch_service_gpu_gate.py --reference "$OUT/t2048/alone.json" \
+  --short SHORT.ids --long LONG.ids --out "$OUT/default-service" --service-ms 1 -- \
+  "$CMD" "${PINNED_ARGS[@]}"
+python3 tests/batch_service_gpu_gate.py --scenario nest --reference "$OUT/t2048/alone.json" \
+  --short SHORT.ids --long LONG.ids --out "$OUT/default-nest" -- \
+  "$CMD" "${PINNED_ARGS[@]}"
+python3 tests/http_slots_gpu_gate.py --prompt SHORT.ids --prompt LONG.ids \
+  --out "$OUT/default-slots" --modes auto -- "$CMD" "${PINNED_ARGS[@]}"
+```
+
+Require startup to report automatic T8192 for the default arms; a smaller admitted tile is
+fallback coverage, not a T8192 witness. Use enough
+memory for the slots gate's mandatory lazy-growth witness. No logits equality claim follows
+from these commands.
+
 ## Execution model
 
 - One engine thread (the decoder's thread) runs requests one at a time in arrival order. HTTP
@@ -118,12 +233,19 @@ feature is set (state import, copy windows), AUTO serves one request at a time a
 `--http-batch N` caps the slots at N (an explicit N with incompatible options is an error) and `--http-batch 0`
 selects the one-at-a-time route. AUTO never changes the numerical profile or adds MTP assets.
 
-- Sizing: before allocation the engine builds one extra slot, measures what it took (MemAvailable and GTT
-  deltas, at least the static estimate), adds what every request allocates while it runs (window owners from
-  their compiled plans, MTP runtime and target capture budgets, prompt taps, draft workspaces) and keeps a
-  headroom (`--known-prefix-host-headroom-bytes`, 4 GiB unless set). Shared prefill arenas, sidecar and cache
-  budgets count once. Startup prints `http slots N (auto: limited by ...)` or `(cap C: ...)`; there is no fixed
-  slot ceiling.
+- Sizing: every automatic T candidate reserves the compiled primary/tail arenas once, plus each native
+  owner's separate PLE staging, projections, gates, convolution snapshot, hashes, deferred GDN banks
+  and fixed/retained-variant routed CSR payloads.
+  Host, GTT and UMA checks include one runnable bridge's geometry, verified assets, cache budget and shared
+  batch-certificate staging (an explicit staging cap takes precedence), while retaining headroom
+  (`--known-prefix-host-headroom-bytes`, 4 GiB unless set). A failed minimum retries a smaller T before
+  allocation. Runtime uses the same staging policy and reserves independent prefill-owner buffers for
+  additional slots over the shared arenas. Lazy growth uses fresh observations after shared
+  bridge residency, reserving fixed headroom and only outstanding cache/staging payloads;
+  it does not charge the shared setup peak again. It probes one extra slot when at least two fit and uses the
+  larger of the static estimate and observed MemAvailable/GTT deltas. MTP budget ceilings remain bounds,
+  not simultaneous allocations. Startup prints `http slots N (auto: limited by ...)` or `(cap C: ...)`;
+  there is no fixed slot ceiling.
 - Startup builds `min(N, STRIX_HTTP_EAGER_SLOTS)` slots (default 4; `0` builds all N). The rest are built one at
   a time between engine steps as soon as every built slot is busy (`STRIX_HTTP_SPARE_SLOTS=0`: only once work is
   queued), so a request arriving during a long prompt finds a free slot, through the same code as the eager ones,

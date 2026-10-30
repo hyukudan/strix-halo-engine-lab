@@ -418,6 +418,7 @@ struct Options {
     // --prefix-cache-block-rows N (0: T): the cache's segment and checkpoint unit. N < T (dividing T): checkpoints also
     // at the tail blocks' boundaries that are multiples of N, so large prefill blocks keep a fine resume granularity.
     std::uint64_t prefix_cache_block_rows = 0;
+    bool prefix_cache_block_rows_explicit = false;
     std::vector<std::string> prefix_cache_then_prompts;
     bool prefix_cache_disk_bytes_explicit = false, prefix_cache_every_explicit = false;
     // HTTP serving (docs/engine/serving/serving.md): after the MTP calibration replay the process serves
@@ -783,6 +784,10 @@ inline void validate_resolved_teacher_forced_score(const Options& options, std::
 [[nodiscard]] inline bool mtp_tiled_prompt(const Options& o) noexcept {
     return o.mtp.enabled && o.known_prefix_window && o.known_prefix_full_rows && o.known_prefix_prefill_rows;
 }
+[[nodiscard]] inline bool http_prefill_pending(const Options& o) noexcept {
+    return o.http_serve && !o.known_prefix_prefill_rows && !o.known_prefix_prefill_explicit &&
+        !o.known_prefix_rows_explicit;
+}
 [[nodiscard]] inline std::uint32_t mtp_calibration_rows(const Options& o) noexcept {
     return o.mtp.calibration_rows ? o.mtp.calibration_rows : 8U;
 }
@@ -911,14 +916,14 @@ inline void resolve_http_route(Options& o) {
     }
 }
 // HTTP serving runs the tiled MTP route after one calibration replay.
-inline void validate_http_serve(const Options& o) {
+inline void validate_http_serve(const Options& o, bool defer_prefill = false) {
     if (o.rtx_state_import && (!o.http_serve || o.http_batch))
         throw std::invalid_argument("--rtx-state-import requires --http-serve (the tiled MTP prompt) without --http-batch");
     if (o.rtx_state_import_decode_threads > 64U) throw std::invalid_argument("--rtx-state-import-decode-threads is 0..64");
     if (o.http_default_temperature.value_or(0.0) > 0.0 && o.http_sampling != "sample")
         throw std::invalid_argument("--http-default-temperature > 0 requires --http-sampling sample");
     if (!o.http_serve) return;
-    if (!mtp_tiled_prompt(o) || !o.mtp.golden_dump.empty() || o.mtp.metadata_only)
+    if ((!defer_prefill && !mtp_tiled_prompt(o)) || !o.mtp.enabled || !o.mtp.golden_dump.empty() || o.mtp.metadata_only)
         throw std::invalid_argument("--http-serve requires the tiled MTP route (--mtp with a calibration golden, "
             "--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T)");
     if (o.http_port > 65535U || o.http_bind.empty() || o.http_model_id.empty() || !o.http_default_max_tokens ||
@@ -1232,7 +1237,10 @@ inline void validate_resolved_gdn_islands(const Options& options) {
 
 inline void validate_mtp_cli(const Options& o,bool resolved=false) {
     const auto& m=o.mtp;
-    const bool tiled=mtp_tiled_prompt(o);
+    // HTTP can supply its tiled owner after host memory admission. Validate the
+    // calibration/asset contract here; validate_http_serve requires the owner
+    // again after resolution and before device work.
+    const bool tiled=mtp_tiled_prompt(o) || http_prefill_pending(o);
     if(!m.enabled){if(m.supplied)throw std::invalid_argument("MTP parameters require --mtp");return;}
     if(o.execution.mode!=DecodeExecutionMode::eager || o.execution.integer_head!=DecodeIntegerHead::none ||
        o.prepared_eager || o.moe_shared_overlap || o.moe_token_cost_policy || o.gdn_islands || o.gpu_greedy_token ||
@@ -1380,6 +1388,12 @@ inline std::string yarn_route_refusal(const Options& o) {
 // Qualification live controls own their deliberate never-captured continuation only.
 inline std::uint64_t ordinary_http_batch_slots(const Options& options) {
     return options.http_serve && !options.session_live_control ? options.http_batch : 0U;
+}
+// STRIX_BATCH_PROMPT_SMALL=1 opts in (HTTP batch runners and CLI cohorts). Default off: under several queued long
+// prompts tail-size units delayed first tokens (TTFT p50 +37 % at 4, +60 % at 8 concurrent 8.5K prompts).
+inline bool batch_prompt_small(const Options&) {
+    const char* value = std::getenv("STRIX_BATCH_PROMPT_SMALL");
+    return value && value[0] == '1';
 }
 // Cache controls own storage policy, never numerical routing or tail selection.
 inline bool operational_session_option(std::string_view flag) {
@@ -1890,7 +1904,8 @@ inline Options parse_options(
             } else if (argument == "--prefix-cache-then-prompt") {
                 options.prefix_cache_then_prompts.emplace_back(value);
             } else if (argument == "--prefix-cache-block-rows") {
-                if (options.prefix_cache_block_rows) throw std::invalid_argument("duplicate --prefix-cache-block-rows");
+                if (options.prefix_cache_block_rows_explicit) throw std::invalid_argument("duplicate --prefix-cache-block-rows");
+                options.prefix_cache_block_rows_explicit = true;
                 options.prefix_cache_block_rows = parse_u64(value, "prefix cache block rows");
             } else if (argument == "--prefix-batch-cert") {
                 if(value=="0" || value=="off") options.prefix_batch_cert=0;
@@ -2790,14 +2805,14 @@ inline Options parse_options(
     validate_prompt_lookup_snapshot_options(options);
     if (!defer_qpf2k_defaults)
         apply_default_known_prefill_tails(options);
-    validate_known_prefill_options(options);
+    if (!http_prefill_pending(options)) validate_known_prefill_options(options);
     validate_serving_prefix_cache_limits(options);
     if (options.serving_prefix_files.empty() && (options.serving_tensor_cohort_explicit || options.serving_concurrency_explicit || options.serving_memory_explicit ||
         options.serving_request_explicit || options.serving_headroom_explicit))
         throw std::invalid_argument("serving controls require --serve-prefix-u32le");
-    if (options.known_prefix_output_policy_explicit && !options.known_prefix_window)
+    if (options.known_prefix_output_policy_explicit && !options.known_prefix_window && !http_prefill_pending(options))
         throw std::invalid_argument("known-prefix output policy requires --known-prefix-window");
-    if (options.known_prefix_expert_union && !options.known_prefix_window)
+    if (options.known_prefix_expert_union && !options.known_prefix_window && !http_prefill_pending(options))
         throw std::invalid_argument("known-prefix expert union requires --known-prefix-window");
     if (options.known_prefix_rows_explicit && !options.known_prefix_window)
         throw std::invalid_argument("known-prefix rows require --known-prefix-window");
@@ -2901,8 +2916,9 @@ inline Options parse_options(
         if (const char* v = std::getenv(name)) return v;
         return std::nullopt;
     });
-    validate_prefix_state_cache(options);
-    validate_http_serve(options);
+    const bool defer_serve_prefill = http_prefill_pending(options);
+    if (!defer_serve_prefill) validate_prefix_state_cache(options);
+    validate_http_serve(options, defer_serve_prefill);
     return options;
 }
 

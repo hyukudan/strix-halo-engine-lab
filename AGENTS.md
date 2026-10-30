@@ -33,7 +33,8 @@ Qwen startup prints one `strix-build-info` and one `strix-startup-event` JSON li
 runs; `STRIX_RELEASE_EVENTS=0` switches both off). Advisories in that record are not failures.
 Inspection exits before device work; preserve the engine's required assets and two-rank launch contract
 for execution. Check [all item guards, fallback notices and off switches](docs/optimizations.md) or
-the [JSON catalog](docs/optimizations.json). Qwen auto fast prefill currently excludes MTP and HTTP serving.
+the [JSON catalog](docs/optimizations.json). Qwen automatic FP16 prefill excludes MTP and HTTP serving;
+HTTP resolves T8192 with its existing arithmetic ([defaults](docs/engine/serving/serving.md#default-prompt-prefill)).
 HTTP servers (Qwen, DeepSeek) describe what they execute at `GET /v1/capabilities`; the `strix` object of each response
 states the applied policy (requested vs effective sampling). Generation fields the server does not execute are refused
 with a 400 naming the field ([list](docs/engine/serving/serving.md#chat-requests)). Qwen executes JSON-constrained

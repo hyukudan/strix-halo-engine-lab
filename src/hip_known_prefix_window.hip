@@ -855,8 +855,10 @@ struct HipKnownPrefixWindow::Impl {
         // STRIX_PREFILL_FULL_GDN=0 / STRIX_PREFILL_FULL_MOE=0: keep that step in 8-row tiles.
         static const bool gdn=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_GDN");return !v||v[0]!='0';}();
         static const bool moe=[]{const char* v=std::getenv("STRIX_PREFILL_FULL_MOE");return !v||v[0]!='0';}();
-        if(moe && window.routed_expert_union_steps && (config.a8_down_q51 || config.a8_down_q80) && prefill->logical_rows%8U==0U) {
-            const auto bytes=q51_known_rows::prefill_scratch_bytes(prefill->logical_rows,u32(model.num_experts),u32(model.num_experts_per_token));
+        if(q51_known_rows::prefill_csr_enabled(moe,window.routed_expert_union_steps,
+            config.a8_down_q51,config.a8_down_q80,prefill->logical_rows)) {
+            const auto bytes=q51_known_rows::prefill_csr_inventory(prefill->logical_rows,
+                u32(model.num_experts),u32(model.num_experts_per_token)).fixed;
             void* memory=nullptr;
             guard.run([&] { check(hipMalloc(&memory,bytes),"allocate known prefill routed CSR"); });
             std::shared_ptr<void> owner(memory,[](void* p){ if(p) (void)hipFree(p); });

@@ -5,6 +5,39 @@
 #include <limits>
 #include <stdexcept>
 namespace strix {
+std::vector<CopyResidencyRange> build_registered_residency_ranges(const ModelManifest& manifest,
+    const HipModelResidencyPolicy& policy, std::uint64_t file_bytes, std::uint64_t page) {
+    if (!page || (page & (page-1U)) || !file_bytes)
+        throw std::invalid_argument("registration requires file bytes and power-of-two page");
+    const auto add=[](std::uint64_t a,std::uint64_t b) {
+        if (b>UINT64_MAX-a) throw std::overflow_error("registration range overflow");
+        return a+b;
+    };
+    const auto up=[&](std::uint64_t n) { return add(n,(page-n%page)%page); };
+    std::vector<CopyResidencyRange> ranges;
+    for (const auto& tensor:manifest.tensors) {
+        if (tensor.placement.kind==PlacementKind::remote ||
+            (tensor.residency==ResidencyPolicy::file_backed_candidate && !policy.promote_file_backed_candidates) ||
+            ((policy.copy_tier==HipModelCopyTier::experts || policy.copy_tier==HipModelCopyTier::all) &&
+                selective_copy_eligible(tensor,policy.copy_tier))) continue;
+        if (tensor.absolute_offset>file_bytes || tensor.byte_size>file_bytes-tensor.absolute_offset)
+            throw std::invalid_argument("manifest tensor exceeds mapped model file");
+        const auto begin=tensor.absolute_offset-tensor.absolute_offset%page;
+        const auto end=std::min(up(add(tensor.absolute_offset,tensor.byte_size)),up(file_bytes));
+        if (end<=begin) throw std::logic_error("registered tensor range is empty");
+        ranges.push_back({begin,end});
+    }
+    std::sort(ranges.begin(),ranges.end(),[](const auto& a,const auto& b) {
+        return a.begin!=b.begin ? a.begin<b.begin : a.end<b.end;
+    });
+    std::vector<CopyResidencyRange> merged;
+    for (const auto range:ranges) {
+        if (!merged.empty() && range.begin<=add(merged.back().end,policy.coalesce_gap_bytes))
+            merged.back().end=std::max(merged.back().end,range.end);
+        else merged.push_back(range);
+    }
+    return merged;
+}
 std::vector<CopyResidencyRange> build_copy_residency_ranges(const ModelManifest& manifest,const HipModelResidencyPolicy& policy) {
     const auto add=[](std::uint64_t a,std::uint64_t b){if(b>std::numeric_limits<std::uint64_t>::max()-a)throw std::overflow_error("HIP model residency range overflow");return a+b;};
     std::vector<CopyResidencyRange> ranges;

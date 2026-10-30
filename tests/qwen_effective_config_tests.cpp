@@ -1,4 +1,6 @@
 #include "../apps/qwen_prompt_organization.hpp"
+#include "../apps/qwen_http_memory.hpp"
+#include "../apps/mtp_asset_verification.hpp"
 #include "strix/mtp_selection_transaction.hpp"
 #include "qwen_prefill_contract.hpp"
 #include "rotary_mock.hpp"
@@ -161,8 +163,425 @@ constexpr std::array excluded_inactive_env{
 PrefillMemory ample_memory() {
     return {128U*gib_bytes,128U*gib_bytes,0U,[](const Options&) {
         return PrefillRequirements{70U*gib_bytes,8U*gib_bytes,gib_bytes,2U*gib_bytes,512U*1024U*1024U,128U*1024U*1024U,0U,9U*gib_bytes};
-    }};
+    },[](const Options&) { return HttpServingMemory{}; }};
 }
+// CPU regression: production organizations/window ceilings with synthetic tokens,
+// asset pins and backing requirements. No model, golden, HIP or external files.
+void serve_prefill_admission_tests(const ModelContract& model, const ModelManifest& manifest) {
+    auto args=mtp_fixture();
+    args.insert(args.begin()+5,13,"1");
+    const auto set = [&](const char* flag, const char* value) {
+        const auto it=std::find(args.begin(),args.end(),flag);
+        if(it==args.end()) args.insert(args.end(),{flag,value}); else *(it+1)=value;
+    };
+    for(std::size_t i=0;i<qwen_contract::argv.size();++i) {
+        const auto flag=qwen_contract::argv[i];
+        // Reuse the production serial organizations, without tiled opt-ins or
+        // split prefill arithmetic. The serving resolver preserves dense A8.
+        if(flag.starts_with("--known-") || flag=="--prefill-numerical-profile") {
+            if(i+1<qwen_contract::argv.size() && !qwen_contract::argv[i+1].starts_with("--")) ++i;
+            continue;
+        }
+        if(flag=="--context" || flag=="--generate") { ++i; continue; }
+        args.emplace_back(flag);
+    }
+    args.insert(args.end(),{"--context","24576","--http-serve","--http-batch","2",
+        "--prefix-cache-block-rows","0","--mtp-window-expert-union","--mtp-window-prefix",
+        "--mtp-window-hyper-mix","--mtp-window-qsa-rows","--mtp-draft-chain","--mtp-draft-q4"});
+    for(const auto& [flag,value] : std::vector<std::pair<const char*,const char*>>{
+        {"--mtp-normalized-rounding","bf16-rne"},{"--mtp-sidecar-retained-bytes","3221225472"},
+        {"--mtp-sidecar-setup-bytes","4294967296"},{"--mtp-golden-max-bytes","6442450944"},
+        {"--mtp-replay-host-bytes","6442450944"},{"--mtp-runtime-bytes","134217728"},
+        {"--mtp-target-capture-bytes","268435456"},{"--mtp-candidate-depth","7"},
+        {"--mtp-target-window-rows","8"},{"--mtp-window-arena-bytes","2147483648"},
+        {"--mtp-window-capture-bytes","67108864"},{"--mtp-window-checkpoint-bytes","8589934592"},
+        {"--mtp-window-total-bytes","17179869184"},{"--mtp-window-history-intervals","8192"},
+        {"--mtp-window-expert-union-bytes","65536"},{"--mtp-target-window-rows-set","2,4,8"},
+        {"--mtp-draft-vocab","auto:assets/draft-vocab"},{"--mtp-draft-context-vocab","4096"},
+        {"--mtp-spec-min-p","0.7"}}) set(flag,value);
+    RequestedOptions request{parse(args),{{"STRIX_BATCH_PROMPT_SMALL","0"}}};
+    PrefillMemory memory;
+    memory.available=131766833152ULL; memory.gtt_limit=125829120000ULL; memory.gtt_used=23539712U;
+    memory.estimate=[](const Options& o) {
+        return PrefillRequirements{100*gib_bytes,gib_bytes,gib_bytes,
+            o.known_prefix_prefill_rows*(gib_bytes/1024),gib_bytes/2,gib_bytes/8,gib_bytes,2*gib_bytes};
+    };
+    const auto resolve=[&](const RequestedOptions& r,const PrefillMemory& m) {
+        return resolve_effective_config(r,model,{},manifest,validated_model_content_identity,{true,true,true},m);
+    };
+    // Native dense-A8 serving geometry at C24576. File-only backing must not
+    // crowd out T8192; registration is charged to both UMA and GTT. Represent
+    // the aggregate extents with synthetic tensors, without model assets.
+    {
+        constexpr std::uint64_t file_bytes=111334654400ULL, registered=82523500544ULL;
+        ModelManifest layout;
+        ManifestTensor pinned,cache;
+        pinned.byte_size=registered;
+        cache.absolute_offset=registered; cache.byte_size=file_bytes-registered;
+        cache.residency=ResidencyPolicy::file_backed_candidate;
+        layout.tensors={pinned,cache};
+        auto production=request;
+        production.options.http_batch_cap=0;
+        production.options.generate_tokens=1;
+        auto observed=memory;
+        observed.total=134161678336ULL;
+        observed.estimate=[&](const Options& o) {
+            const bool large=o.known_prefix_prefill_rows==8192;
+            PrefillRequirements r{file_bytes,795857215U,998400U,
+                large?8178958352ULL:4089511952ULL,large?666918440U:381115944U,
+                large?16338988U:9162796U,1358086208U,796855296U};
+            account_http_registered_target(r,o,layout,file_bytes,4096);
+            const auto external=qwen_prefill_external_memory(o,model);
+            r.external_host=external.host; r.external_device=external.device;
+            return r;
+        };
+        observed.serving=[](const Options& o) {
+            const auto slot=o.known_prefix_prefill_rows==8192?919596612U:751824452U;
+            return HttpServingMemory{2819704288ULL,2775625728ULL,slot,slot};
+        };
+        for (bool inspect:{false,true}) for (auto available:{130374098944ULL,131955068928ULL,132000509952ULL}) {
+            production.options.print_effective_config=inspect;
+            observed.available=available;
+            const auto admitted=resolve(production,observed);
+            validate_effective_startup(admitted);
+            expect(admitted.options.known_prefix_prefill_rows==8192 &&
+                admitted.host_compilation.at("target_registered_backing_bytes")==registered &&
+                admitted.host_compilation.at("serve_committed_host_peak_bytes")==103224760751ULL,
+                "native serving committed target backing admits T8192 in startup and inspection");
+            const auto& o=admitted.options;
+            const auto r=observed.estimate(o); const auto m=observed.serving(o);
+            const auto primary=r.model_backing+r.state_d1+r.serial_scratch+r.workspace+r.tails+
+                r.metadata+r.runtime_payload+r.external_host;
+            const auto capacity=resolve_http_bridge_capacity(gib_bytes,m,available-primary,
+                *observed.gtt_limit-*observed.gtt_used-r.device_base-r.workspace-r.tails-r.external_device,
+                o.known_prefill_host_headroom,o.known_prefill_host_headroom);
+            expect(capacity.slots>=1,"T8192 reserves at least one runnable slot after the primary");
+            auto tighter=observed; tighter.available=100000000000ULL;
+            expect(resolve(production,tighter).options.known_prefix_prefill_rows==4096,
+                "native serving still falls back under host pressure");
+            tighter=observed; tighter.gtt_limit=100000000000ULL;
+            expect(resolve(production,tighter).options.known_prefix_prefill_rows==4096,
+                "registered target also consumes GTT and still falls back under GTT pressure");
+        }
+    }
+    // Synthetic verified-asset/owner evidence, deliberately far below ceilings.
+    memory.serving=[](const Options&) { return HttpServingMemory{gib_bytes,gib_bytes,gib_bytes,gib_bytes}; };
+    const auto startup=resolve(request,memory);
+    expect(startup.options.known_prefix_prefill_rows==8192 && startup.options.automatic_prefill,
+        "serve_prefill_production_mtp_ceilings: budget ceilings cannot reject the shared tiled owner");
+    validate_effective_startup(startup);
+    expect(startup.options.known_prefix_window && startup.options.known_prefix_full_rows &&
+        startup.options.known_prefix_expert_union && startup.options.known_window_router_rows &&
+        startup.options.known_prefix_tail_rows==std::vector<std::uint32_t>({1024,256,64,16}) &&
+        startup.options.prefix_cache_block_rows==0 &&
+        numerical_profile_pair(startup.options).prefill==dense_a8_profile,
+        "serve_prefill_production_mtp_ceilings: preserve explicit route organizations, tails, cache and arithmetic");
+    auto inspect_args=args; inspect_args.emplace_back("--print-effective-config");
+    RequestedOptions inspection{parse(inspect_args),request.environment};
+    const auto dry=resolve(inspection,memory);
+    validate_effective_startup(dry);
+    auto execution_view=dry;
+    execution_view.sources.erase("--print-effective-config");
+    expect(dry.options.http_serve && dry.options.http_batch==startup.options.http_batch &&
+        effective_config_json(startup)==effective_config_json(execution_view) && startup.serve_prefill_notice==dry.serve_prefill_notice,
+        "serve_prefill_inspection_parity: identical startup and dry-run admission");
+    auto rejected=memory;
+    rejected.estimate=[](const Options&) -> PrefillRequirements {
+        throw std::invalid_argument("plan failure: \"test\"\nreason");
+    };
+    const auto failure=resolve(inspection,rejected);
+    for(const auto rows : {8192,4096,2048,1024,256,64,16})
+        expect(failure.serve_prefill_notice.find("T"+std::to_string(rows)+":plan failure:")!=std::string::npos,
+            "serve_prefill_rejection_details: retain exception text for every candidate");
+    const auto receipt=serve::parse_json(effective_config_json(failure));
+    expect(receipt.find("serve_prefill_notice")->as_string()==failure.serve_prefill_notice,
+        "serve_prefill_rejection_details: dry-run JSON escapes complete exception text");
+    bool refused=false;
+    try { validate_effective_startup(failure); } catch(const std::invalid_argument&) {refused=true;}
+    expect(refused,"serve_prefill_inspection_parity: failed admission also fails HTTP preflight");
+    rejected=memory; rejected.available=1;
+    expect(resolve(request,rejected).serve_prefill_notice.find("host-available needs")!=std::string::npos,
+        "serve_prefill_rejection_details: name failed memory bound and byte counts");
+    for (const char* name : {"STRIX_SERVE_PREFILL","STRIX_KNOWN_PREFIX_WINDOW","STRIX_KNOWN_PREFIX_FULL_ROWS",
+            "STRIX_KNOWN_PREFIX_EXPERT_UNION","STRIX_KNOWN_WINDOW_ROUTER_ROWS","STRIX_KNOWN_PREFIX_PREFILL_ROWS"}) {
+        auto off=request; off.environment[name]="0";
+        expect(!resolve(off,memory).options.known_prefix_prefill_rows,
+            "serve_prefill_production_guards: every off switch wins");
+    }
+    auto baseline=request; baseline.options.baseline=true;
+    expect(!resolve(baseline,memory).options.known_prefix_prefill_rows,
+        "serve_prefill_production_guards: baseline suppresses automatic admission");
+    auto explicit_args=args;
+    explicit_args.insert(explicit_args.end(),{"--known-prefix-window","--known-prefix-full-rows",
+        "--known-prefix-expert-union","--known-window-router-rows","--known-prefix-prefill-rows","2048",
+        "--known-prefix-workspace-budget-bytes","8589934592","--known-prefix-host-metadata-budget-bytes","1073741824",
+        "--known-prefix-uma-budget-bytes","128849018880","--known-prefix-host-headroom-bytes","4294967296",
+        "--known-prefix-output-policy","terminal-row","--known-prefix-tail-rows","1024,256,64,16"});
+    const auto explicit_config=resolve({parse(explicit_args),request.environment},memory);
+    validate_effective_startup(explicit_config);
+    expect(explicit_config.options.known_prefix_prefill_rows==2048 &&
+        explicit_config.options.known_prefill_workspace_budget==8*gib_bytes &&
+        explicit_config.options.known_prefill_metadata_budget==startup.options.known_prefill_metadata_budget &&
+        explicit_config.options.known_prefill_uma_budget==startup.options.known_prefill_uma_budget &&
+        explicit_config.options.known_prefill_host_headroom==startup.options.known_prefill_host_headroom &&
+        explicit_config.options.known_prefix_tail_rows==startup.options.known_prefix_tail_rows &&
+        numerical_profile_pair(explicit_config.options)==numerical_profile_pair(startup.options),
+        "serve_prefill_production_guards: explicit T/budgets win and automatic organizations preserve arithmetic");
+    // Prefill alone fits at every tile; adding the verified first slot forces
+    // a retry under either host-only or GTT-only pressure, including batch 0.
+    for (const bool inspect : {false,true}) for (const bool single : {false,true}) {
+        auto r=request; r.options.print_effective_config=inspect;
+        if (single) { r.options.http_batch_explicit=true; r.options.http_batch_cap=0; r.options.http_batch=0; }
+        auto pressure=memory;
+        pressure.estimate=[](const Options& o) {
+            PrefillRequirements need;
+            need.model_backing=2*gib_bytes; need.device_base=gib_bytes;
+            need.workspace=o.known_prefix_prefill_rows*(gib_bytes/1024);
+            need.metadata=1;
+            return need;
+        };
+        pressure.serving=[](const Options&) { return HttpServingMemory{gib_bytes,gib_bytes,2*gib_bytes,2*gib_bytes}; };
+        pressure.available=128*gib_bytes; pressure.gtt_used=0; pressure.gtt_limit=13*gib_bytes;
+        auto prefill_only=pressure;
+        prefill_only.serving=[](const Options&) { return HttpServingMemory{}; };
+        expect(resolve(r,prefill_only).options.known_prefix_prefill_rows==8192,
+            "GTT pressure fixture admits prefill alone");
+        const auto gtt=resolve(r,pressure);
+        expect(gtt.options.known_prefix_prefill_rows==4096 && gtt.serve_prefill_notice.find("GTT-free")!=std::string::npos,
+            "first slot GTT pressure retries T even on explicit single/inspection");
+        pressure.gtt_limit=128*gib_bytes; pressure.available=15*gib_bytes;
+        const auto host=resolve(r,pressure);
+        expect(host.options.known_prefix_prefill_rows==4096 && host.serve_prefill_notice.find("host-available")!=std::string::npos,
+            "first slot host pressure retries T even on explicit single/inspection");
+        r.options.known_prefill_headroom_explicit=true; r.options.known_prefill_host_headroom=0;
+        pressure.available=11*gib_bytes;
+        prefill_only=pressure; prefill_only.serving=[](const Options&) { return HttpServingMemory{}; };
+        expect(resolve(r,prefill_only).options.known_prefix_prefill_rows==8192 &&
+            resolve(r,pressure).options.known_prefix_prefill_rows==4096,
+            "zero headroom still reserves one actual runnable slot under host pressure");
+        pressure.serving=[](const Options&) { return HttpServingMemory{128*gib_bytes,0,0,0}; };
+        const auto no_slot=resolve(r,pressure);
+        expect(!no_slot.options.known_prefix_prefill_rows,"no first slot declines every automatic T");
+        bool invalid=false; try { validate_effective_startup(no_slot); } catch(const std::invalid_argument&) { invalid=true; }
+        expect(invalid,"no first slot refuses startup and inspection before allocation");
+        pressure.serving={};
+        expect(!resolve(r,pressure).options.known_prefix_prefill_rows,"missing verified assets declines");
+        for (const auto mode : {0,1,2}) {
+            auto copied=r;
+            if (mode==0) copied.options.residency=HipModelResidencyMode::resident_copy;
+            if (mode==1) copied.options.model_copy_tier=HipModelCopyTier::normalization;
+            if (mode==2) copied.environment["STRIX_MODEL_COPY_ALL"]="1";
+            copied.options.numerical_profile=Options{}.numerical_profile;
+            copied.options.prefill_numerical_profile.reset();
+            copied.options.model_copy_payload_bytes=mode==1?std::optional<std::uint64_t>(1):std::nullopt;
+            copied.options.model_retained_budget=128*gib_bytes;
+            copied.options.model_setup_peak_budget=128*gib_bytes;
+            const auto declined=resolve(copied,memory);
+            expect(!declined.options.known_prefix_prefill_rows && declined.serve_prefill_notice.find("copy-all")!=std::string::npos,
+                "copy/selective/copy-all declines automatic serving prefill in startup and inspection");
+            expect(declined.options.residency==copied.options.residency && declined.options.model_copy_tier==copied.options.model_copy_tier,
+                "declining automatic T preserves explicit residency");
+        }
+    }
+    // Grouped automatic candidates decline before inspection or execution can
+    // commit an unmodeled owner. Explicit T and workspace budgets keep precedence.
+    for (bool inspect : {false,true}) for (bool context_fallback : {false,true})
+        for (bool explicit_workspace : {false,true}) {
+            auto grouped=request; grouped.options.print_effective_config=inspect;
+            grouped.environment["STRIX_PROMPT_BATCH_ROWS"]="8192";
+            if(context_fallback) grouped.options.context_tokens=4096;
+            grouped.options.known_prefill_workspace_explicit=explicit_workspace;
+            grouped.options.known_prefill_workspace_budget=128*gib_bytes;
+            auto limited=memory;
+            if(!context_fallback) limited.estimate=[](const Options& o) {
+                if(o.known_prefix_prefill_rows==8192) throw std::runtime_error("memory:fixture");
+                PrefillRequirements need; need.workspace=4096; need.metadata=4096; return need;
+            };
+            const auto declined=resolve(grouped,limited);
+            expect(!declined.options.known_prefix_prefill_rows &&
+                declined.serve_prefill_notice.find("STRIX_PROMPT_BATCH_ROWS")!=std::string::npos &&
+                declined.serve_prefill_notice.find("explicit tiled configuration")!=std::string::npos,
+                "context/memory fallback with extra group declines in inspection and execution");
+            bool group_refused=false; try { validate_effective_startup(declined); }
+            catch(const std::invalid_argument&) { group_refused=true; }
+            expect(group_refused,"unsupported automatic group refuses startup before allocations");
+            expect(declined.options.known_prefill_workspace_budget==grouped.options.known_prefill_workspace_budget,
+                "decline never rewrites workspace limits");
+            grouped.options=startup.options; // a valid, fully organized explicit route
+            grouped.options.print_effective_config=inspect;
+            grouped.options.known_prefix_prefill_explicit=true;
+            grouped.options.known_prefix_prefill_rows=2048;
+            grouped.options.known_prefill_workspace_explicit=explicit_workspace;
+            grouped.options.known_prefill_workspace_budget=128*gib_bytes;
+            const auto explicit_group=resolve(grouped,limited);
+            expect(explicit_group.options.known_prefix_prefill_rows==2048 &&
+                explicit_group.options.known_prefill_workspace_budget==grouped.options.known_prefill_workspace_budget,
+                "explicit T/group route and budgets preserved");
+        }
+    for (const auto value : {"8192","4096","0"}) {
+        auto no_extra=request; no_extra.environment["STRIX_PROMPT_BATCH_ROWS"]=value;
+        const auto admitted=resolve(no_extra,memory);
+        expect(admitted.options.known_prefix_prefill_rows==8192,
+            "group value equal to or below selected T creates no extra owner");
+    }
+    auto geometric=startup.options; geometric.mtp.window_rows=0;
+    geometric.mtp.runtime_bytes=geometric.mtp.target_capture_bytes=128*gib_bytes;
+    const auto mapped=http_mtp_memory(geometric,model,{},manifest,{},gib_bytes,gib_bytes,4096);
+    const auto copied_sidecar=http_mtp_memory(geometric,model,{},manifest,{},2*gib_bytes,gib_bytes,4096);
+    expect(copied_sidecar.shared_host==mapped.shared_host+gib_bytes && copied_sidecar.slot_host==mapped.slot_host,
+        "sidecar residency setup peak is shared once, independent of per-slot geometry");
+    const auto calibration=http_mtp_memory(geometric,model,{},manifest,{},gib_bytes,gib_bytes,8192);
+    expect(calibration.shared_host==mapped.shared_host+4U*4096U && calibration.shared_device==mapped.shared_device,
+        "verified calibration size changes host peak, not GTT sidecar backing");
+    geometric.context_tokens+=1024;
+    expect(http_mtp_memory(geometric,model,{},manifest,{},gib_bytes,gib_bytes,4096).slot_host>mapped.slot_host,
+        "native predictor pool follows context geometry");
+    // Real native owner geometry, independent of the synthetic arena sizes.
+    auto owners=startup.options;
+    owners.known_prefix_tail_rows.clear();
+    const auto primary=qwen_prefill_external_memory(owners,model);
+    expect(primary.staging==268435456U && primary.projections==419430400U && primary.gates==131072U,
+        "T8192 PLE payloads match native constructor geometry");
+    expect(primary.device==primary.staging+primary.projections+primary.gates+primary.snapshots+primary.gdn+primary.csr_fixed+primary.csr_variants &&
+        primary.host==primary.device+primary.hashes && primary.gdn>8U,
+        "mapped staging, device payloads, hashes and deferred banks counted once");
+    owners.known_prefix_tail_rows={1024,256,64,16};
+    const auto with_tails=qwen_prefill_external_memory(owners,model);
+    expect(with_tails.host>primary.host && with_tails.gdn==primary.gdn*5U,
+        "all five primary/tail owners have independent banks and buffers");
+    expect(primary.csr_fixed==1315584U && with_tails.csr_fixed==1552896U,
+        "native T8192 and primary/default-tail fixed CSR payloads use production layout");
+    std::uint64_t all_variants=0;
+    for (const auto t : {8192U,1024U,256U,64U,16U}) {
+        for (std::uint32_t n=16;n<t;n+=8U) {
+            const auto layout=q51_known_rows::scratch_layout(n,512,10,true);
+            expect(layout.bytes>=layout.batch_begins+4U*(n*10U+1U),
+                "partial native CSR layout covers final batch-begin payload");
+            all_variants+=layout.bytes;
+        }
+    }
+    expect(with_tails.csr_variants==all_variants,
+        "inventory bounds all retained partial merged/grouped row-count branches");
+    for (bool moe : {false,true}) for (bool expert_union : {false,true})
+        for (bool q51 : {false,true}) for (bool q80 : {false,true}) {
+            expect(q51_known_rows::prefill_csr_enabled(moe,expert_union,q51,q80,8192)==
+                (moe && expert_union && (q51 || q80)),"native CSR branch guards shared with inventory");
+        }
+    auto no_union=owners; no_union.known_prefix_expert_union=false;
+    const auto no_csr=qwen_prefill_external_memory(no_union,model);
+    expect(!no_csr.csr_fixed && !no_csr.csr_variants,"non-union owner has no CSR allocation");
+    auto small_owners=owners; small_owners.known_prefix_prefill_rows=4096;
+    expect(qwen_prefill_external_memory(small_owners,model).host<with_tails.host,
+        "smaller T reduces actual owner storage");
+    SerialSessionStateLayoutRequest layout_request; layout_request.context_tokens=owners.context_tokens;
+    const auto layout=build_serial_session_state_layout(model,layout_request);
+    auto cert=owners; cert.prefix_batch_cert=2; cert.prefix_cache=true; cert.prefix_cache_host_bytes=gib_bytes;
+    cert.prefix_cache_staging_bytes=0;
+    std::uint64_t registry_row=0,registry_fixed=0;
+    for(const auto& a:layout.allocations) {
+        if(a.component==SessionStateComponent::attention_kv || a.component==SessionStateComponent::sparse_index)
+            registry_row+=a.bytes/layout.context_tokens;
+        else registry_fixed+=(a.bytes+255U)&~UINT64_C(255);
+    }
+    const auto staging=qwen_http_batch_staging_reserve(cert,model,layout);
+    expect(staging==qwen_batch_staging_cap(0,registry_row,registry_fixed,
+        model.kv_heads*model.head_dim*4U+model.indexer_head_dim*2U,
+        model.hidden_size*model.hc_count*2U,8192),"pre-device target registry matches runtime capture geometry");
+    cert.known_prefix_prefill_rows=4096;
+    expect(qwen_http_batch_staging_reserve(cert,model,layout)<staging,"default staging follows T");
+    cert.prefix_cache_staging_bytes=3*gib_bytes;
+    expect(qwen_http_batch_staging_reserve(cert,model,layout)==3*gib_bytes,"explicit staging cap wins");
+    for(unsigned guard=0;guard<7;++guard) {
+        auto off=cert;
+        if(guard==0) off.baseline=true;
+        if(guard==1) off.prefix_batch_cert=0;
+        if(guard==2) off.prefix_cache=false;
+        if(guard==3) off.prefix_cache_host_bytes=0;
+        if(guard==4) off.http_serve=false;
+        if(guard==5) off.session_management_requested=true;
+        if(guard==6) off.http_batch=0;
+        expect(!qwen_http_batch_staging_reserve(off,model,layout),"staging mode/route guard");
+    }
+    auto real_memory=memory;
+    real_memory.serving=[](const Options&) { return HttpServingMemory{}; };
+    real_memory.estimate=[&](const Options& o) {
+        PrefillRequirements r{gib_bytes,gib_bytes,gib_bytes,gib_bytes,4096,4096,0,2*gib_bytes};
+        const auto external=qwen_prefill_external_memory(o,model);
+        r.external_host=external.host; r.external_device=external.device;
+        return r;
+    };
+    for(bool inspect:{false,true}) for(unsigned stage_mode:{0U,1U,2U}) for(bool gtt:{false,true}) {
+        auto r=inspect?inspection:request;
+        r.options.prefix_batch_cert=stage_mode?2:0;
+        r.options.prefix_cache_host_bytes=stage_mode?gib_bytes:0;
+        r.options.prefix_cache_staging_bytes=stage_mode==2?3*gib_bytes:0;
+        const auto need=[&](std::uint32_t t,bool device) {
+            auto o=owners; o.known_prefix_prefill_rows=t;
+            o.prefix_batch_cert=r.options.prefix_batch_cert;
+            o.prefix_cache_host_bytes=r.options.prefix_cache_host_bytes;
+            o.prefix_cache_staging_bytes=r.options.prefix_cache_staging_bytes;
+            const auto e=qwen_prefill_external_memory(o,model);
+            return (device?7*gib_bytes:8*gib_bytes+8192U)+(device?e.device:e.host)+
+                o.prefix_cache_host_bytes+qwen_http_batch_staging_reserve(o,model,layout);
+        };
+        const auto boundary=need(4096,gtt)+(need(8192,gtt)-need(4096,gtt))/2U;
+        real_memory.available=gtt?128*gib_bytes:boundary;
+        real_memory.gtt_limit=gtt?boundary:128*gib_bytes; real_memory.gtt_used=0;
+        const auto fit=resolve(r,real_memory);
+        expect(fit.options.known_prefix_prefill_rows==4096,"real owner/staging pressure falls back before allocation in inspection and execution");
+        validate_effective_startup(fit);
+        expect(fit.host_compilation.at("serve_batch_staging_bytes")==
+            qwen_http_batch_staging_reserve(fit.options,model,layout),"inspection records the runtime shared staging reserve");
+        real_memory.available=1;
+        const auto fail=resolve(r,real_memory);
+        bool refused_all=false;
+        try { validate_effective_startup(fail); } catch(const std::exception&) { refused_all=true; }
+        expect(!fail.options.known_prefix_prefill_rows && refused_all,"complete minimum failure refuses all candidates");
+    }
+    // Hash real bytes; exercise the production verifier through the same startup
+    // hook for automatic/explicit T and inspection/execution, in both pin fields.
+    const std::array<std::byte,3> asset{std::byte{1},std::byte{2},std::byte{3}};
+    const auto digest=sha256_bytes(asset);
+    const auto lower=model_content_identity_hex(digest);
+    for(bool inspect:{false,true}) for(bool explicit_t:{false,true}) for(unsigned casing:{0U,1U,2U}) {
+        auto r=inspect?inspection:request;
+        if(explicit_t) {
+            r.options=startup.options;
+            r.options.known_prefix_prefill_explicit=true;
+            r.options.print_effective_config=inspect;
+        }
+        auto pin=lower;
+        for(std::size_t i=0;i<pin.size();++i)
+            if(casing==1 || (casing==2 && i%2))
+                if(pin[i]>='a' && pin[i]<='f') pin[i]=static_cast<char>(pin[i]-'a'+'A');
+        r.options.mtp.sidecar_sha256=pin; r.options.mtp.golden_sha256=pin;
+        r.options.mtp.sidecar_bytes=3; r.options.mtp.golden_max_bytes=3;
+        auto pinned=memory;
+        pinned.serving=[&](const Options& o) {
+            verify_mtp_serving_assets(o.mtp,digest,3,digest,3);
+            return HttpServingMemory{};
+        };
+        const auto valid=resolve(r,pinned);
+        validate_effective_startup(valid);
+        validate_http_serving_memory(valid.options,pinned);
+        expect(valid.options.known_prefix_prefill_rows==(explicit_t?startup.options.known_prefix_prefill_rows:8192),
+            "valid case-insensitive pins preserve automatic and explicit T");
+        for(bool golden:{false,true}) {
+            auto bad=valid.options;
+            auto& wrong=golden?bad.mtp.golden_sha256:bad.mtp.sidecar_sha256;
+            wrong[0]=wrong[0]=='0'?'1':'0';
+            bool rejected_pin=false;
+            try { validate_http_serving_memory(bad,pinned); } catch(const std::invalid_argument&) { rejected_pin=true; }
+            expect(rejected_pin,"real digest mismatch rejected for either asset before inspection exit");
+            if(!explicit_t) {
+                auto bad_request=r; bad_request.options.mtp=bad.mtp;
+                expect(!resolve(bad_request,pinned).options.known_prefix_prefill_rows,"mismatch refuses every automatic candidate");
+            }
+        }
+    }
+    std::cout << "serve prefill admission: " << failures << " failures\n";
+}
+
 void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manifest) {
     for (const auto factor : {0U,2U,4U}) {
         auto model = ModelContract::qwen38_flash_next();
@@ -791,6 +1210,10 @@ int main(int argc, char** arguments) {
     manifest.tensors.back().name = "output_hc_up.weight";
     manifest.tensors.back().layer.reset();
     manifest.layout_identity = model_manifest_layout_identity(manifest);
+    if (argc==2 && std::string_view(arguments[1])=="--serve-prefill-admission") {
+        serve_prefill_admission_tests(model,manifest);
+        return failures ? 1 : 0;
+    }
     yarn_admission_tests(info,manifest);
     const PrefillCapabilities capabilities{true,true,true};
     auto memory = ample_memory();
@@ -814,6 +1237,93 @@ int main(int argc, char** arguments) {
     const auto resolve = [&](const RequestedOptions& value, const PrefillMemory& observation) {
         return resolve_effective_config(value,model,info,manifest,validated_model_content_identity,capabilities,observation);
     };
+    {
+        auto argv=mtp_fixture(); argv.insert(argv.begin()+5,13,"1");
+        argv.insert(argv.end(),{"--http-serve","--http-batch","0"});
+        auto served=RequestedOptions{parse(argv),{}};
+        const auto resolved=resolve(served,memory);
+        expect(mtp_tiled_prompt(resolved.options) && resolved.options.known_prefix_prefill_rows==8192,
+            "real MTP HTTP argv defers tiled prefill until capacity resolution");
+        validate_http_serve(resolved.options);
+        argv.insert(argv.end(),{"--prefix-cache-block-rows","0","--prefix-cache-block-rows","0"});
+        bool duplicate=false;
+        try {(void)parse(argv);} catch(const std::invalid_argument&) {duplicate=true;}
+        expect(duplicate,"duplicate zero checkpoint options are rejected");
+        auto budget_argv=mtp_fixture(); budget_argv.insert(budget_argv.begin()+5,13,"1");
+        budget_argv.insert(budget_argv.end(),{"--http-serve","--http-batch","0",
+            "--known-prefix-window","--known-prefix-workspace-budget-bytes","4294967296",
+            "--known-prefix-host-headroom-bytes","1073741824","--mtp-calibration-rows","4"});
+        const auto budgeted=resolve(RequestedOptions{parse(budget_argv),{}},memory);
+        expect(budgeted.options.known_prefix_prefill_rows==8192 &&
+            budgeted.options.known_prefill_workspace_budget==4*gib_bytes &&
+            budgeted.options.known_prefill_host_headroom==gib_bytes && budgeted.options.mtp.calibration_rows==4,
+            "HTTP preserves partial explicit budgets, organization and calibration before admission");
+        auto http=request; http.options.http_serve=true; http.options.route_owned=true;
+        http.options.context_tokens=32768; http.options.context_explicit=true; http.options.unqualified_context=true;
+        http.options.tokens.clear();
+        const auto fast=resolve(http,memory);
+        expect(fast.options.known_prefix_prefill_rows==8192 && fast.options.automatic_prefill,
+            "HTTP allocates automatic T8192 before prompts arrive");
+        expect(fast.options.context_tokens==32768 && !fast.options.prefill_numerical_profile &&
+            fast.options.numerical_profile==resolve_prefill_effective_config(http,model,info,manifest,
+                validated_model_content_identity,capabilities,memory).options.numerical_profile,
+            "HTTP preserves context and numerical identity");
+        expect(fast.options.known_prefix_tail_rows==std::vector<std::uint32_t>({1024,256,64,16}),
+            "HTTP keeps all tail owners for future requests");
+        auto context=http; context.options.context_tokens=4096;
+        const auto smaller=resolve(context,memory);
+        expect(smaller.options.known_prefix_prefill_rows==4096 && smaller.serve_prefill_notice.find("T8192:context")!=std::string::npos,
+            "HTTP context fallback is logged");
+        context.options.context_tokens=8;
+        expect(!resolve(context,memory).options.known_prefix_prefill_rows,"HTTP context below T16 declines");
+        auto pressure=memory;
+        pressure.estimate=[&](const Options& o) {
+            auto r=memory.estimate(o); r.workspace=12*gib_bytes; return r;
+        };
+        const auto uniform=resolve(http,pressure);
+        expect(uniform.options.known_prefix_prefill_rows==8192 && uniform.options.known_prefill_workspace_budget==12*gib_bytes,
+            "HTTP uniform logits workspace above the compact CLI ceiling still admits T8192");
+        pressure.estimate=[&](const Options& o) {
+            auto r=memory.estimate(o); if(o.known_prefix_prefill_rows==8192) r.workspace=128*gib_bytes; return r;
+        };
+        const auto fitted=resolve(http,pressure);
+        expect(fitted.options.known_prefix_prefill_rows==4096 && fitted.serve_prefill_notice.find("T8192:memory")!=std::string::npos,
+            "HTTP retries a smaller tile on memory pressure");
+        pressure.available=1;
+        const auto declined=resolve(http,pressure);
+        expect(!declined.options.known_prefix_prefill_rows && declined.serve_prefill_notice.find("explicit tiled configuration required")!=std::string::npos,
+            "HTTP insufficient memory requires an explicit tiled route");
+        pressure=memory; pressure.gtt_limit.reset();
+        expect(!resolve(http,pressure).options.known_prefix_prefill_rows,"HTTP unknown GTT declines");
+        auto off=http; off.environment["STRIX_SERVE_PREFILL"]="0";
+        expect(!resolve(off,memory).options.known_prefix_prefill_rows,"HTTP T automatic off switch");
+        off=http; off.options.baseline=true;
+        expect(!resolve(off,memory).options.known_prefix_prefill_rows,"HTTP baseline leaves T alone");
+        auto explicit_t=http; explicit_t.options=fast.options;
+        explicit_t.options.known_prefix_prefill_explicit=true; explicit_t.options.known_prefix_prefill_rows=2048;
+        explicit_t.options.known_prefix_tail_rows.clear();
+        explicit_t.options.prefix_cache_host_bytes=gib_bytes;
+        const auto cached=resolve(explicit_t,memory);
+        expect(cached.options.known_prefix_prefill_rows==2048 && cached.options.prefix_cache_block_rows==1024,
+            "explicit T wins and configured cache defaults to 1024 checkpoints");
+        explicit_t.options.prefix_cache_block_rows_explicit=true;
+        explicit_t.options.prefix_cache_block_rows=0;
+        expect(resolve(explicit_t,memory).options.prefix_cache_block_rows==0,"explicit zero restores T checkpoints");
+        explicit_t.options.prefix_cache_block_rows=256;
+        expect(resolve(explicit_t,memory).options.prefix_cache_block_rows==256,"explicit cache checkpoint size wins");
+        auto no_cache=http; no_cache.environment["STRIX_PREFIX_CACHE"]="0";
+        expect(resolve(no_cache,memory).options.prefix_cache_block_rows==0,"disabled cache gets no checkpoint default");
+        auto cli=fast.options; cli.http_serve=false;
+        const char* prior_small=std::getenv("STRIX_BATCH_PROMPT_SMALL");
+        const auto saved=prior_small ? std::optional<std::string>(prior_small) : std::nullopt;
+        unsetenv("STRIX_BATCH_PROMPT_SMALL");
+        expect(!batch_prompt_small(fast.options) && !batch_prompt_small(cli),"SMALL is opt-in for HTTP and CLI");
+        setenv("STRIX_BATCH_PROMPT_SMALL","0",1);
+        expect(!batch_prompt_small(fast.options),"SMALL explicit off");
+        setenv("STRIX_BATCH_PROMPT_SMALL","1",1);
+        expect(batch_prompt_small(fast.options) && batch_prompt_small(cli),"SMALL opt-in for HTTP and CLI");
+        if(saved) setenv("STRIX_BATCH_PROMPT_SMALL",saved->c_str(),1); else unsetenv("STRIX_BATCH_PROMPT_SMALL");
+    }
     {
         auto configured=request;
         configured.environment=requested_prefill_environment([](const char* name) -> const char* {

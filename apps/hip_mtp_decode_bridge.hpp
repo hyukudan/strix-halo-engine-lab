@@ -1,4 +1,5 @@
 #pragma once
+#include "mtp_asset_verification.hpp"
 #include "strix/prompt_terminal_diagnostics.hpp"
 #include "qwen_tiled_prompt_plan.hpp"
 #include "strix/serve/engine.hpp"
@@ -211,15 +212,6 @@ inline void write_mtp_union_observation(std::ostream& output,
     output << "],\"batch_size_histogram\":[";
     for (unsigned i = 0; i < 8U; ++i) output << (i ? "," : "") << group.batch_size_histogram[i];
     output << "]}";
-}
-inline ModelContentIdentity mtp_cli_digest(std::string_view text) {
-    if(!mtp_sha256_text(text))throw std::invalid_argument("MTP SHA256 pin is invalid");
-    const auto digit=[](char ch)->unsigned {if(ch>='0'&&ch<='9')return static_cast<unsigned>(ch-'0');
-        if(ch>='a'&&ch<='f')return static_cast<unsigned>(ch-'a')+10U;
-        return static_cast<unsigned>(ch-'A')+10U;};
-    ModelContentIdentity out;
-    for(std::size_t i=0;i<out.bytes.size();++i)out.bytes[i]=static_cast<std::uint8_t>((digit(text[i*2U])<<4U)|digit(text[i*2U+1U]));
-    return out;
 }
 inline std::uint64_t mtp_cli_add(std::uint64_t a,std::uint64_t b) {
     if(b>UINT64_MAX-a)throw std::overflow_error("MTP CLI payload budget overflow");
@@ -1191,7 +1183,7 @@ private:
         auto& c=result.config;
         c.groups=prompt_batch_enabled();c.group_rows=prompt_batch_rows();
         c.group_owner=bool(slots_.front()->parents->tiled.group);
-        const char* small=std::getenv("STRIX_BATCH_PROMPT_SMALL");c.small=small && small[0]=='1';
+        c.small=batch_prompt_small(options_);
         const char* windows=std::getenv("STRIX_PROMPT_WINDOW");c.windows=(!windows || windows[0]!='0') && bool(s.window);
         c.cohort=prompt_window_cohort_enabled();c.service=service_ms_>0;c.cancel=cancel_points_;c.nest_rows=nest_rows_;
         c.service_ms=service_ms_;c.lookahead=lookahead_;c.prompt_share=prompt_share_;c.interleave=interleave_;
@@ -1325,7 +1317,7 @@ public:
             ++stats_.prompt_steps;
             // STRIX_BATCH_PROMPT_SMALL=1: T blocks only while nobody decodes; tail-size units in between decode cycles
             // (exact either way: the prompt's rows and bits do not depend on the block sizes)
-            static const bool small=[]{const char* v=std::getenv("STRIX_BATCH_PROMPT_SMALL");return v && v[0]=='1';}();
+            const bool small=batch_prompt_small(options_);
             if (small) for (auto& s : slots_) if (s->prefilling) s->prefill->set_small_blocks(decoding);
             const auto t0 = clock::now();const auto suspended_before=stats_.service_ms_suspended;
             try {

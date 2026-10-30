@@ -57,6 +57,22 @@ inline constexpr std::uint32_t prefill_max_rows = known_prefill_max_rows;
     std::uint32_t experts, std::uint32_t top_k) {
     return scratch_layout(rows, experts, top_k, true).bytes;
 }
+// Native full-prefill allocation predicate and retained inventory. The runtime
+// keeps one independent workspace for every partial row count encountered.
+// Bound all accepted CSR row counts (16..T, step 8), without assuming a workload
+// or scheduler policy. Rows below 16 cannot pass scratch_layout validation.
+inline bool prefill_csr_enabled(bool full_moe, bool expert_union, bool a8_q51,
+    bool a8_q80, std::uint32_t rows) {
+    return full_moe && expert_union && (a8_q51 || a8_q80) && rows%8U==0U;
+}
+struct PrefillCsrInventory { std::uint64_t fixed=0, variants=0; };
+inline PrefillCsrInventory prefill_csr_inventory(std::uint32_t rows,
+    std::uint32_t experts, std::uint32_t top_k) {
+    PrefillCsrInventory out{prefill_scratch_bytes(rows,experts,top_k),0};
+    for (std::uint32_t n=16;n<rows;n+=8U)
+        out.variants+=prefill_scratch_bytes(n,experts,top_k);
+    return out;
+}
 // An exclusive allocation, never a slice of window scratch/state/weights/D1.
 // The actual native window owner creates and leases this allocation. This
 // strong owner retains it; its independent generation identifies rebinding.

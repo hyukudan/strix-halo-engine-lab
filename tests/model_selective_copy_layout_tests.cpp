@@ -149,6 +149,29 @@ void expert_selection_contract() {
 }
 
 int main() try {
+    {
+        using namespace strix;
+        ModelManifest manifest;
+        manifest.tensors={tensor(TensorRole::embedding,4103,17),
+            tensor(TensorRole::ngram_table,8192,16384),
+            tensor(TensorRole::normalization,24579,31),
+            tensor(TensorRole::dense_projection,32769,31)};
+        manifest.tensors[1].residency=ResidencyPolicy::file_backed_candidate;
+        manifest.tensors[3].placement.kind=PlacementKind::remote;
+        HipModelResidencyPolicy p;
+        const auto ranges=build_registered_residency_ranges(manifest,p,65536,4096);
+        expect(ranges.size()==2 && ranges[0].begin==4096 && ranges[0].end==8192 &&
+            ranges[1].begin==24576 && ranges[1].end==28672);
+        // Coalescing can commit otherwise reclaimable pages; charge the gap.
+        p.coalesce_gap_bytes=16384;
+        const auto coalesced=build_registered_residency_ranges(manifest,p,65536,4096);
+        expect(coalesced.size()==1 && coalesced[0].begin==4096 && coalesced[0].end==28672);
+        p.coalesce_gap_bytes=0; p.promote_file_backed_candidates=true;
+        const auto promoted=build_registered_residency_ranges(manifest,p,65536,4096);
+        expect(promoted.size()==1 && promoted[0].begin==4096 && promoted[0].end==28672);
+        rejects([&] { (void)build_registered_residency_ranges(manifest,p,4096,4096); });
+        rejects([&] { (void)build_registered_residency_ranges(manifest,p,65536,3); });
+    }
     using namespace strix;
     ModelManifest manifest;
     manifest.tensors = {tensor(TensorRole::normalization, 4103, 33),

@@ -12,6 +12,17 @@
   },
   {
     "engine": "qwen",
+    "name": "HTTP default T8192 prefill and 1024-row cache checkpoints",
+    "flag_or_env": "--known-prefix-prefill-rows; STRIX_SERVE_PREFILL; --prefix-cache-block-rows",
+    "default": "ON: admitted T8192; configured prefix-cache checkpoints 1024 when dividing T; STRIX_BATCH_PROMPT_SMALL stays opt-in",
+    "exact": "Contract: identical complete token IDs and committed target state at the same numerical identity and frontier. Supplied GPU service/nest/slots gates EXACT versus sequential explicit T2048, slots at 1/2/4/8 clients. CPU pressure tests cover corrected admission. Existing serving gates compare IDs/state, not logits; the general slots gate excludes cross-route prompt digest.",
+    "gain": "Same-binary interleaved arms, identical token IDs, versus explicit T2048: cold TTFT 17K -4.3 %, two 8.5K prompts -3.9 %/-4.0 %; eight queued 8.5K prompts TTFT p50 65.3 vs 66.4-71.7 s, wave wall 103.7 vs 105.2-110.2 s. T8192 consumes capacity (29 vs 55 admitted slots); no claim above 29 concurrent requests. STRIX_BATCH_PROMPT_SMALL is not part of the default: with queued long prompts it delayed first tokens (TTFT p50 +37 % at 4, +60 % at 8).",
+    "preconditions": "Qualified native Qwen checkpoint/target, existing MTP assets and calibration contract, row-count-independent arithmetic. Compiled primary/tail arenas, metadata, state/committed model backing, scratch, runtime and one MTP slot must fit observed host/GTT and headroom. Shared startup/inspection/runtime geometry includes verified sidecar residency/setup peak, predictor, target/window captures, calibration payloads, native primary/tail external PLE/GDN owners and fixed/all retained partial-row CSR payloads and shared batch-certificate staging (explicit cap takes precedence), never the sum of budget ceilings. Candidates inducing a separate STRIX_PROMPT_BATCH_ROWS owner decline before commitment; unset the variable or use explicit T and group budgets. Equal/below-T values add no owner. Lazy growth reserves only outstanding cache/staging payload and fixed headroom after shared setup is resident. Target registration uses the native page/coalescing range planner: registered aliases count once in UMA and once in GTT; unregistered reclaimable file cache is excluded from committed backing, while native row staging remains charged. Target copy/selective-copy/copy-all explicitly decline automatic T with a notice. Explicit single route also refuses an infeasible first slot. Context/memory rejection tries smaller T through 16 and logs each fallback. Explicit T is preserved. Automatic prefix-cache budgets remain qualification-gated OFF. Later measured slot-capacity and lazy-growth checks remain in force.",
+    "off_switch": "STRIX_SERVE_PREFILL=0 with an explicit tiled configuration; --prefix-cache-block-rows 0 for T-sized checkpoints; explicit --known-prefix-prefill-rows wins; --baseline suppresses",
+    "doc_anchor": "docs/engine/serving/serving.md#default-prompt-prefill"
+  },
+  {
+    "engine": "qwen",
     "name": "Plan-neutral prefix cache on the MTP serving route",
     "flag_or_env": "--prefix-cache; STRIX_PREFIX_CACHE; --prefix-cache-host-bytes; --prefix-cache-staging-bytes; STRIX_PREFIX_CACHE_STAGING_BYTES",
     "default": "ON when a cache is configured on an eligible MTP route; automatic serving budget qualification-gated OFF",
