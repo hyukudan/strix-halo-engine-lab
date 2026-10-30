@@ -181,6 +181,17 @@
   },
   {
     "engine": "qwen",
+    "name": "QPF2K_WMMA_PIN",
+    "flag_or_env": "STRIX_QPF2K_WMMA_PIN",
+    "default": "1",
+    "exact": "Register assignment only (same WMMA instructions and operands); strix-hip-dense-f16-tiled-tests checked 120/120 bitwise cases with it on and off; also use the whole-engine receipt/logit/token comparison.",
+    "gain": "-",
+    "preconditions": "Form-4 (two blocks per WGP) dense tiled projections: GDN input, QSA q|k|v, GDN output (core16). Independent process-cached switch (not a QPF2K resolver default); =0 keeps route selection and restores the compiler's register assignment. Each build is checked with tools/check_wmma_banks.py.",
+    "off_switch": "STRIX_QPF2K_WMMA_PIN=0",
+    "doc_anchor": "docs/optimizations.md#qwen-dense"
+  },
+  {
+    "engine": "qwen",
     "name": "QPF2K_GDN",
     "flag_or_env": "STRIX_QPF2K_GDN",
     "default": "1",
