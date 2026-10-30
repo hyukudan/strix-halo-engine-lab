@@ -969,6 +969,42 @@ void qsa_rows_family(bool prefetch, bool wave8, bool bf16_indexer) {
     QsaFixture f(prefetch, wave8, bf16_indexer, 2304U);
     f.config.window_pool = make_hip_qsa_window_pool();
     const std::uint64_t prefetched = bf16_indexer ? 3U : 5U; // BF16 indexer stays on the legacy256 tree
+    const char* skip_env = std::getenv("STRIX_QSA_SKIP_INDEX_Q");
+    const bool skip_index_q = !skip_env || skip_env[0] != '0';
+    const auto qsa_layout = build_indexed_attention_workspace_layout(f.model);
+    // STRIX_QSA_SKIP_INDEX_Q (default ON): a step whose complete blocks fit block_topk never projects the index
+    // query: a serial row when its own selection takes every visible token, the rows launch only when every row's
+    // does. In a window straddling the top-k boundary the rows launch therefore writes the index-query slot of a
+    // row whose serial call leaves it untouched. That row computes no block scores, so the slot is dead scratch:
+    // only those slots are excluded from the serial/rows arena comparison, every other byte stays bit equal.
+    const auto row_skips_of = [&](std::uint32_t count, std::uint64_t position) {
+        std::array<bool, 8> skips{};
+        for (std::uint32_t r = 0; r < count; ++r) {
+            const auto visible = position + r + 1U;
+            skips[r] = skip_index_q &&
+                visible / f.model.indexer_compress_ratio <= f.model.indexer_budget / f.model.indexer_compress_ratio;
+        }
+        return skips;
+    };
+    const auto live_arena = [&](std::vector<unsigned char> arena, std::uint32_t count, std::uint64_t position) {
+        const auto skips = row_skips_of(count, position);
+        const auto skipped = static_cast<std::uint32_t>(std::count(skips.begin(), skips.begin() + count, true));
+        if (skipped != 0U && skipped != count)
+            for (std::uint32_t r = 0; r < count; ++r) {
+                if (!skips[r]) continue;
+                const auto slot = resolve_dispatch_temporary(f.rows[r], 0).address - f.scratch.address + qsa_layout.index_query_offset;
+                std::fill_n(arena.begin() + static_cast<std::ptrdiff_t>(slot), qsa_layout.index_query_bytes, static_cast<unsigned char>(0U));
+            }
+        return arena;
+    };
+    const auto report_arena = [&](const char* what, const std::vector<unsigned char>& a, const std::vector<unsigned char>& b,
+                                  std::uint32_t count, std::uint64_t position) {
+        if (a == b) return;
+        std::size_t first = a.size(), last = 0, diff = 0;
+        for (std::size_t i = 0; i < a.size(); ++i) if (a[i] != b[i]) { first = std::min(first, i); last = i; ++diff; }
+        std::cerr << "  " << what << " arena mismatch: prefetch=" << prefetch << " bf16_indexer=" << bf16_indexer << " rows=" << count
+            << " position=" << position << " diff_bytes=" << diff << " first=" << first << " last=" << last << "\n";
+    };
     unsigned compared = 0;
     // Positions cover p=0, partial-block tails, the full-visible/top-k boundary
     // (visible 2048..2053 straddles 512 complete blocks) and a pure top-k window.
@@ -978,9 +1014,21 @@ void qsa_rows_family(bool prefetch, bool wave8, bool bf16_indexer) {
             const auto reference = f.run(count, position, false);
             const auto middle = prefetch ? f.config.prefetch_stats->dispatched_projections.load() : 0U;
             const auto candidate = f.run(count, position, true);
-            if (prefetch) require(middle - before == prefetched * count && f.config.prefetch_stats->dispatched_projections.load() - middle == prefetched,
+            // The prefetch counters see the index-query skip only for the prefetched Q8_0 indexer.
+            const auto row_skips = row_skips_of(count, position);
+            const auto skipped_rows = static_cast<std::uint32_t>(std::count(row_skips.begin(), row_skips.begin() + count, true));
+            const auto prefetch_skipped_rows = bf16_indexer ? 0U : skipped_rows;
+            const auto serial_expected = prefetched * count - prefetch_skipped_rows;
+            const auto rows_expected = prefetched - (!bf16_indexer && skipped_rows == count ? 1U : 0U);
+            if (prefetch && !(middle - before == serial_expected && f.config.prefetch_stats->dispatched_projections.load() - middle == rows_expected))
+                std::cerr << "  QSA rows prefetch count: rows=" << count << " position=" << position << " serial " << middle - before
+                    << " (expected " << serial_expected << ") rows " << f.config.prefetch_stats->dispatched_projections.load() - middle
+                    << " (expected " << rows_expected << ")\n";
+            if (prefetch) require(middle - before == serial_expected && f.config.prefetch_stats->dispatched_projections.load() - middle == rows_expected,
                 "QSA rows prefetch submission count differs");
-            require(candidate.arena == reference.arena, "QSA rows output/workspace bytes differ from ascending serial calls");
+            const auto candidate_arena = live_arena(candidate.arena, count, position), reference_arena = live_arena(reference.arena, count, position);
+            report_arena("QSA rows", candidate_arena, reference_arena, count, position);
+            require(candidate_arena == reference_arena, "QSA rows output/workspace bytes differ from ascending serial calls");
             require(candidate.state == reference.state, "QSA rows KV/raw-index state differs from ascending serial calls");
             std::vector<std::vector<unsigned char>> outputs;
             for (std::uint32_t r = 0; r < count; ++r) {
@@ -1050,7 +1098,13 @@ void qsa_rows_family(bool prefetch, bool wave8, bool bf16_indexer) {
                 write(f.scratch, f.seed); write(f.state, actual);
                 { const HipLaunchScope active(f.scope()); f.serial_rows(8U); }
                 f.owner.finish();
-                require(read(f.scratch) == next_arena && read(f.state) == next_state,
+                const auto serial_arena = read(f.scratch), serial_state = read(f.state);
+                const auto live_next = live_arena(next_arena, 8U, position + keep), live_serial = live_arena(serial_arena, 8U, position + keep);
+                report_arena("QSA pool reuse", live_next, live_serial, 8U, position + keep);
+                if (serial_state != next_state || live_next != live_serial)
+                    std::cerr << "  QSA pool reuse: rows=" << count << " keep=" << keep << " next position=" << position + keep
+                        << " state_equal=" << (serial_state == next_state) << " raw_arena_equal=" << (serial_arena == next_arena) << "\n";
+                require(live_serial == live_next && serial_state == next_state,
                     "QSA persistent pool reused a rejected/tail block");
                 ++commits;
             }
@@ -1177,6 +1231,9 @@ void qsa_pool_idle_owner() {
 // cohort launch against each session's own rows launch from the same state and inputs.
 void qsa_cohort_family(bool dense, bool bf16_indexer) {
     QsaFixture f(!dense, true, bf16_indexer, 2304U, dense);
+    const char* skip_env = std::getenv("STRIX_QSA_SKIP_INDEX_Q");
+    const bool skip_index_q = !skip_env || skip_env[0] != '0';
+    const auto qsa_layout = build_indexed_attention_workspace_layout(f.model);
     // Each session: its own window arena (the fixture's layout and inputs), state and resources.
     struct Session {
         Span state, scratch; std::vector<unsigned char> host, initial; SessionStateMemoryBinding memory;
@@ -1239,8 +1296,39 @@ void qsa_cohort_family(bool dense, bool bf16_indexer) {
         {2047U, 1U, 2201U, 3U, 2042U, 0U, 6U, 1500U}, {2201U, 2042U, 3U, 0U, 1000U, 6U, 2047U, 1U}};
     for (const auto& sizes : shapes)
         for (const auto& positions : placements) {
-            const auto reference = run(sizes, positions, false);
-            const auto candidate = run(sizes, positions, true);
+            const auto reference_bytes = run(sizes, positions, false);
+            const auto candidate_bytes = run(sizes, positions, true);
+            // STRIX_QSA_SKIP_INDEX_Q (default ON): a rows launch skips the index-query projection only when every
+            // one of its rows takes every visible token. The cohort projects the union of its segments, so a
+            // session whose own window skips can get its index-query slots written by the cohort. Those rows
+            // compute no block scores, so the slots are dead scratch: only they are excluded from the comparison.
+            const auto skips = [&](std::uint64_t position, std::uint32_t count) {
+                for (std::uint32_t r = 0; r < count; ++r)
+                    if (!(skip_index_q && (position + r + 1U) / f.model.indexer_compress_ratio <=
+                            f.model.indexer_budget / f.model.indexer_compress_ratio)) return false;
+                return true;
+            };
+            bool union_skips = true;
+            for (std::size_t k = 0; k < sizes.size(); ++k) union_skips = union_skips && skips(positions[k], sizes[k]);
+            auto reference = reference_bytes, candidate = candidate_bytes;
+            for (std::size_t k = 0; k < sizes.size() && !union_skips; ++k) {
+                if (!skips(positions[k], sizes[k])) continue;
+                for (std::uint32_t r = 0; r < sizes[k]; ++r) {
+                    const auto slot = resolve_dispatch_temporary(sessions[k].rows[r], 0).address - sessions[k].scratch.address +
+                        qsa_layout.index_query_offset;
+                    for (auto* bytes : {&reference[2U * k], &candidate[2U * k]})
+                        std::fill_n(bytes->begin() + static_cast<std::ptrdiff_t>(slot), qsa_layout.index_query_bytes, static_cast<unsigned char>(0U));
+                }
+            }
+            for (std::size_t k = 0; k < candidate.size(); ++k)
+                if (candidate[k] != reference[k]) {
+                    std::size_t first = candidate[k].size(), last = 0, diff = 0;
+                    for (std::size_t i = 0; i < candidate[k].size(); ++i)
+                        if (candidate[k][i] != reference[k][i]) { first = std::min(first, i); last = i; ++diff; }
+                    std::cerr << "  QSA cohort mismatch: dense=" << dense << " bf16_indexer=" << bf16_indexer << " session=" << k / 2U
+                        << (k % 2U ? " state" : " arena") << " size=" << sizes[k / 2U] << " position=" << positions[k / 2U]
+                        << " union_skips=" << union_skips << " diff_bytes=" << diff << " first=" << first << " last=" << last << "\n";
+                }
             for (std::size_t k = 0; k < candidate.size(); ++k)
                 require(candidate[k] == reference[k], k % 2U ? "QSA cohort KV/raw-index state differs from the session's own window" :
                     "QSA cohort output/workspace bytes differ from each session's own window");

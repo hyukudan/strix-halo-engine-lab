@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -983,6 +984,14 @@ int main() try {
             check(hipMemcpy(arguments,packet.data(),16,hipMemcpyHostToDevice),"set QSA comparison position");
             check(hipMemcpy(status,&zero,4,hipMemcpyHostToDevice),"clear QSA comparison status");
         };
+        // STRIX_QSA_SKIP_INDEX_Q (default ON since the exact prefill schedule candidates): an eager
+        // step whose selection takes every visible token (here: position 0) never projects the index
+        // query, so the eager ON path dispatches one prefetch projection fewer than the graph and the
+        // index-query workspace slot keeps its poison. Output, KV and raw-index state stay bit equal.
+        const char* skip_env=std::getenv("STRIX_QSA_SKIP_INDEX_Q");
+        const bool skip_index_q=!skip_env || skip_env[0]!='0';
+        const auto workspace_layout=strix::build_indexed_attention_workspace_layout(config.model,256,
+            config.qsa_hierarchical_selection,config.qsa_gqa_heads_per_block);
         for(unsigned mixed=0;mixed<2;++mixed){
             for(const auto index:projection_indices){
                 auto& tensor=manifest.tensors[index];
@@ -1039,13 +1048,14 @@ int main() try {
                 check(hipGraphInstantiate(&executables[mode],graphs[mode],nullptr,nullptr,0),"instantiate QSA comparison");
             }
             for(unsigned replay=0;replay<3;++replay){
-                std::vector<std::byte> expected_replay_output,expected_state,expected_workspace;
+                std::vector<std::byte> expected_replay_output,expected_state,expected_workspace,expected_mode_workspace;
                 for(unsigned path=0;path<4;++path){
                     reset(replay);scope.graph_capture=false;context.position=0;
                     if(path<2){auto& candidate=path?on_launch:off_launch;
                         const auto before=on_config.prefetch_stats->dispatched_projections.load();
                         {const strix::HipLaunchScope owned(scope);candidate.function(context,candidate.user_data);}
-                        expect(on_config.prefetch_stats->dispatched_projections.load()-before==(path?5U-mixed:0U),
+                        expect(on_config.prefetch_stats->dispatched_projections.load()-before==
+                                   (path?5U-mixed-(skip_index_q?1U:0U):0U),
                                "full QSA eager counter matches eligible projections");
                     }else{const auto before=on_config.prefetch_stats->dispatched_projections.load();
                         check(hipGraphLaunch(executables[path-2],stream),"replay QSA comparison");
@@ -1063,9 +1073,31 @@ int main() try {
                     const auto actual_output=read_bytes(output.address,output.bytes);
                     const auto actual_state=read_bytes(state_memory.device_base,state_memory.device_bytes);
                     const auto actual_workspace=read_bytes(temporary.address,temporary.bytes);
+                    if(path==0||path==2)expected_mode_workspace=actual_workspace;
                     if(path==0){expected_replay_output=actual_output;expected_state=actual_state;expected_workspace=actual_workspace;}
-                    else expect(actual_output==expected_replay_output && actual_state==expected_state &&
-                        actual_workspace==expected_workspace,"full QSA ON/OFF eager/graph output/KV/raw/workspace bit equality");
+                    else{
+                        // Eager steps skip the index-query projection (see skip_index_q above), so across
+                        // eager/graph the index-query workspace slot is excluded; within one dispatch mode
+                        // (prefetch ON vs OFF) the whole workspace must still be bit equal.
+                        const bool cross_mode=path>=2 && skip_index_q;
+                        auto lhs=actual_workspace,rhs=expected_workspace;
+                        if(cross_mode)for(auto* bytes:{&lhs,&rhs})std::fill_n(bytes->begin()+
+                            static_cast<std::ptrdiff_t>(workspace_layout.index_query_offset),
+                            workspace_layout.index_query_bytes,std::byte{0});
+                        const bool equal=actual_output==expected_replay_output && actual_state==expected_state &&
+                            lhs==rhs && actual_workspace==expected_mode_workspace;
+                        if(!equal){
+                            std::size_t first=actual_workspace.size(),last=0,count=0;
+                            for(std::size_t b=0;b<actual_workspace.size();++b)if(lhs[b]!=rhs[b]){
+                                first=std::min(first,b);last=b;++count;}
+                            std::cerr<<"  QSA ON/OFF mismatch mixed="<<mixed<<" replay="<<replay<<" path="<<path
+                                <<" output="<<(actual_output==expected_replay_output)<<" state="<<(actual_state==expected_state)
+                                <<" mode_workspace="<<(actual_workspace==expected_mode_workspace)
+                                <<" workspace_diff_bytes="<<count<<" first="<<first<<" last="<<last
+                                <<" index_query=["<<workspace_layout.index_query_offset<<",+"<<workspace_layout.index_query_bytes<<")\n";
+                        }
+                        expect(equal,"full QSA ON/OFF eager/graph output/KV/raw/workspace bit equality");
+                    }
                 }
             }
             // Admission failures must enqueue nothing and leave every owner byte intact.
