@@ -10,9 +10,11 @@
 #include "strix/session_state_memory.hpp"
 
 #include <cstdint>
+#include <memory>
 
 namespace strix {
 class DistributedStageResourcePlan;
+class HipQsaCommittedPool;
 
 struct ExecutionRuntimeResources {
     const ExecutionMemoryBinding* scratch = nullptr;
@@ -26,6 +28,9 @@ struct ExecutionRuntimeResources {
     PleLookupPrefetchState* ple_prefetch = nullptr;
     // Explicit capacity-only materialization scope; ordinary execution rejects it.
     const DistributedStageResourcePlan* distributed_stage = nullptr;
+    // Request-owned derived state; excluded from canonical serialization/identity.
+    std::shared_ptr<HipQsaCommittedPool> qsa_committed_pool = {};
+    bool qsa_pool_speculative = false;
 };
 
 struct RuntimeExecutionIdentities {

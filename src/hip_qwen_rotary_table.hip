@@ -1,3 +1,4 @@
+#include "strix/startup_markers.hpp"
 #include "strix/hip_qwen_rotary_table.hpp"
 #include "strix/model_content_hash.hpp"
 #include <hip/hip_runtime.h>
@@ -89,7 +90,8 @@ HipQwenRotaryTable::HipQwenRotaryTable(const RotaryDescriptor& descriptor) : des
     check(hipGetDevice(&device_));
     (void)retirements();
     void* data = nullptr;
-    check(hipMalloc(&data, descriptor.table_bytes()));
+    { startup::Phase marker("rotary_malloc");
+      check(hipMalloc(&data, descriptor.table_bytes())); }
     // Publish only after generation/upload/hash finishes. Arm allocation cleanup
     // first so a shared_ptr control-block failure cannot double-free the buffer.
     allocation_ = std::shared_ptr<const void>(data, [device = device_](const void* pointer) {
@@ -99,6 +101,7 @@ HipQwenRotaryTable::HipQwenRotaryTable(const RotaryDescriptor& descriptor) : des
     generate_qwen_yarn_rows(descriptor, 0, extent(), [&](auto first, auto rows) {
         const auto bytes = std::as_bytes(rows);
         hash.update(bytes);
+        startup::Phase marker("rotary_upload", first);
         check(hipMemcpy(static_cast<std::byte*>(data) + static_cast<std::size_t>(first) * sizeof(YarnRow),
             bytes.data(), bytes.size(), hipMemcpyHostToDevice));
     });

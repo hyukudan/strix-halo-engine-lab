@@ -158,6 +158,17 @@ ModelManifest build_mtp_sidecar_manifest(const ModelContract& m,const gguf::File
     number("qwen4exp.hyper_connection.count",m.hc_count);number("qwen4exp.hyper_connection.low_rank",m.hc_lowrank);
     number("qwen4exp.attention.indexer.head_count",m.indexer_n_heads);number("qwen4exp.attention.indexer.key_length",m.indexer_head_dim);
     number("qwen4exp.attention.indexer.top_k",m.indexer_budget);
+    if(m.rotary_identity().descriptor().mode()==RotaryMode::yarn) {
+        number("qwen4exp.rope.dimension_count",m.rotary_dim());
+        const auto* theta=info.find_metadata("qwen4exp.rope.freq_base");
+        const auto* sections=info.find_metadata("qwen4exp.rope.dimension_sections");
+        // GGUF writers store the M-RoPE sections as INT32 arrays (the shipped target and sidecar both do); accept
+        // either integer signedness, never a different value.
+        require(theta && theta->floating_value && *theta->floating_value==m.rope_theta && sections &&
+            (sections->unsigned_array==std::vector<std::uint64_t>{11,11,10,0} ||
+             sections->signed_array==std::vector<std::int64_t>{11,11,10,0}),
+            "YaRN MTP sidecar rotary theta/sections differ from shared target contract");
+    }
     auto result=build_model_manifest(info);
     std::vector<std::pair<std::uint64_t,std::uint64_t>> ranges;
     for(std::size_t i=0;i<result.tensors.size();++i) {

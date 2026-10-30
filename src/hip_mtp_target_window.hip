@@ -1,10 +1,16 @@
 #include "strix/hip_mtp_target_window.hpp"
+#include "strix/mtp_payload_geometry.hpp"
 #include "strix/hip_generation_output.hpp"
+#include "strix/hip_token_sampling.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/hip_runtime_allocator.hpp"
 #include "strix/dispatch_resources.hpp"
 #include "strix/prompt_terminal_diagnostics.hpp"
 #include "strix/hip_token_sampling.hpp"
+#include "strix/model_content_hash.hpp"
+#include "strix/mtp_step_logits_digest.hpp"
+#include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <optional>
 #include <iterator>
@@ -15,7 +21,6 @@ namespace strix {
 namespace {
 void require(bool v,const char* m){if(!v)throw std::invalid_argument(m);}
 void check(hipError_t e){if(e!=hipSuccess)throw std::runtime_error(hipGetErrorString(e));}
-std::uint64_t sum(std::uint64_t a,std::uint64_t b){if(b>UINT64_MAX-a)throw std::overflow_error("MTP target window payload overflow");return a+b;}
 std::uint64_t mul(std::uint64_t a,std::uint64_t b){if(b && a>UINT64_MAX/b)throw std::overflow_error("MTP target window payload overflow");return a*b;}
 bool same(ExecutionMemoryBinding a,ExecutionMemoryBinding b){return a.execution_identity==b.execution_identity && a.arena_base==b.arena_base && a.arena_bytes==b.arena_bytes && a.allocation_generation==b.allocation_generation;}
 void copy_session(SerialSessionContext& to,const SerialSessionContext& from){
@@ -27,17 +32,6 @@ void copy_session(SerialSessionContext& to,const SerialSessionContext& from){
     to.arithmetic_lineage.history_identity=from.arithmetic_lineage.history_identity;to.arithmetic_lineage.tainted=from.arithmetic_lineage.tainted;
 }
 }
-struct HipMtpTargetWindowBatch::Lease {
-    std::shared_ptr<HipMtpTargetWindowCapture> capture;
-    SerialSessionContext base,committed;
-    std::vector<std::uint32_t> tokens,predictions;
-    std::vector<unsigned char> recorded;
-    std::uint64_t epoch=0;
-    std::optional<MtpSelectionPrefix> selection;
-    bool completed=false,sealed=false;
-    std::optional<ModelContentIdentity> terminal_digest;
-    std::vector<std::optional<ModelContentIdentity>> row_digests;
-};
 struct HipMtpTargetWindowCapture::Impl {
     std::shared_ptr<const void> actual_owner;
     std::shared_ptr<HipRuntimeAllocator> allocator;
@@ -90,7 +84,7 @@ std::shared_ptr<HipMtpTargetWindowCapture> HipMtpTargetWindowCapture::create(con
     const CompiledSerialExecution& serial,const CompiledKnownPrefixWindow& window,const ExecutionRuntimeResources& resources,
     ExecutionMemoryBinding scratch,HipLaunchContext scope,std::shared_ptr<const void> actual_owner,HipMtpTargetWindowCapturePolicy policy){
     require(!current_hip_launch_context() && source_owner && actual_owner && policy.retained_byte_budget && policy.maximum_history_intervals &&
-        policy.maximum_history_intervals<=model.max_position_embeddings && window.output_policy==KnownWindowOutputPolicy::all_rows &&
+        policy.maximum_history_intervals<=model.effective_max_positions() && window.output_policy==KnownWindowOutputPolicy::all_rows &&
         resources.scratch && resources.model_weights && resources.session_state_memory && resources.session_state_layout &&
         !resources.session_state_memory->stage_mapping && resources.model_weights->model_content_identity.valid() &&
         model.vocab_size && model.vocab_size<=UINT32_MAX,"MTP window capture needs bounded actual all-head closed-window resources");
@@ -105,12 +99,9 @@ std::shared_ptr<HipMtpTargetWindowCapture> HipMtpTargetWindowCapture::create(con
         tapio.writes[0].buffer.buffer_class==ExecutionBufferClass::expanded_hidden &&
         std::find(headio.reads.begin(),headio.reads.end(),tapio.writes[0])!=headio.reads.end(),"MTP window tap is not the actual pre-final-mix wide residual");
     const auto bytes=mul(mul(model.hidden_size,model.hc_count),2U);const auto rows=window.logical_rows;
-    const auto pool=mul(bytes,rows);const auto selector=HipGreedyOutput::required_scratch_bytes(static_cast<std::uint32_t>(model.vocab_size));
-    auto payload=sum(sum(pool,255U),mul(rows,selector));
-    payload=sum(payload,mul(policy.maximum_history_intervals,2U*sizeof(ArithmeticRowInterval)));
-    payload=sum(payload,mul(rows,2U*sizeof(std::uint32_t)+sizeof(unsigned char)+2U*sizeof(ExecutionBufferAddress)+sizeof(MtpDeviceView)));
-    payload=sum(payload,sizeof(HipMtpTargetWindowBatch::Lease));
-    payload=sum(payload,mul(resources.model_weights->tensors.size(),sizeof(RuntimeTensorBinding)));
+    const auto pool=mul(bytes,rows);
+    static_assert(sizeof(MtpDeviceView)==24U);
+    const auto payload=mtp_payload::window_capture(model,rows,policy.maximum_history_intervals,resources.model_weights->tensors.size());
     require(payload<=policy.retained_byte_budget,"MTP window slots/selectors/history exceed upfront retained payload budget");
     auto out=std::shared_ptr<HipMtpTargetWindowCapture>(new HipMtpTargetWindowCapture);auto& i=*out->impl_;
     i.actual_owner=std::move(actual_owner);i.allocator=std::make_shared<HipRuntimeAllocator>();i.guard=std::make_shared<HipSetupQuiescenceGuard>();
@@ -119,7 +110,7 @@ std::shared_ptr<HipMtpTargetWindowCapture> HipMtpTargetWindowCapture::create(con
     i.content=resources.model_weights->model_content_identity;i.payload=payload;i.row_bytes=bytes;i.pool_bytes=pool;i.rows=rows;
     i.window_id=window.window_execution_identity;i.kernel_id=window.window_kernel_plan_identity;i.serial_id=serial.execution_identity;
     i.step=tap.id;i.layer=*tap.layer;i.use=tapio.writes[0];i.vocab=static_cast<std::uint32_t>(model.vocab_size);
-    i.capacity=std::min(resources.session_state_layout->context_tokens,model.max_position_embeddings);
+    i.capacity=std::min(resources.session_state_layout->context_tokens,model.effective_max_positions());
     i.source_views.reserve(rows);i.logit_views.reserve(rows);i.snapshots.resize(rows);i.selectors.reserve(rows);
     for(std::uint32_t row=0;row<rows;++row){
         auto view=resolve_execution_buffer(i.window_id,window.arena.row_view[row],scratch,i.use);require(view.bytes==bytes,"MTP capture wide row is not exact BF16");i.source_views.push_back(view);
@@ -183,6 +174,23 @@ void HipMtpTargetWindowCapture::completed_before_publish(){
             i.active->row_digests.push_back(raw_fp32_logits_digest(row));
         }
     }
+    const char* digest=std::getenv("STRIX_MTP_LOGITS_DIGEST");
+    if((digest && digest[0]=='1') || mtp_step_logits_digest_enabled()) {
+        i.active->logit_digests.reserve(i.rows);
+        for(std::uint32_t row=0;row<i.rows;++row) {
+            std::vector<float> logits;
+            read_hip_logits_row(i.logit_views[row],i.vocab,i.scope.stream,logits);
+            const auto bytes=std::as_bytes(std::span<const float>(logits));
+            const auto sha=sha256_bytes(bytes);i.active->logit_digests.push_back(sha);
+            if(mtp_step_logits_digest_enabled())
+                std::fprintf(stderr,"mtp-step-logits physical capture=%p position=%llu epoch=%llu row=%u rows=%u vocab=%u sha256=%s\n",
+                    static_cast<void*>(this),static_cast<unsigned long long>(i.active->base.next_position+row),
+                    static_cast<unsigned long long>(i.active->epoch),row,i.rows,i.vocab,model_content_identity_hex(sha).c_str());
+            if(digest && digest[0]=='1') std::fprintf(stderr,"mtp-logits physical position=%llu epoch=%llu row=%u sha256=%s\n",
+                static_cast<unsigned long long>(i.active->base.next_position+row),
+                static_cast<unsigned long long>(i.active->epoch),row,model_content_identity_hex(sha).c_str());
+        }
+    }
     if(i.transaction_selection) {
         require(!i.row_selection,"MTP selection callbacks are mutually exclusive");
         // The window stream already completed: the device replies are final (unvalidated here; a nonzero
@@ -242,6 +250,10 @@ HipMtpTargetWindowBatch HipMtpTargetWindowCapture::seal(const SerialSessionConte
     HipMtpTargetWindowBatch out;out.lease_=std::move(lease);return out;
 }
 void HipMtpTargetWindowCapture::abort()noexcept{auto& i=*impl_;if(i.active){i.failed=true;i.active.reset();}}
+std::optional<ModelContentIdentity> HipMtpTargetWindowBatch::logits_digest(std::uint32_t row) const {
+    require(row<logical_rows(),"MTP logit digest row is out of bounds");
+    return lease_->logit_digests.empty()?std::nullopt:std::optional<ModelContentIdentity>{lease_->logit_digests[row]};
+}
 bool HipMtpTargetWindowBatch::valid()const noexcept{return lease_ && lease_->sealed && lease_->completed && lease_->capture;}
 std::uint32_t HipMtpTargetWindowBatch::logical_rows()const{require(valid(),"MTP target batch is invalid");return lease_->capture->impl_->rows;}
 std::uint64_t HipMtpTargetWindowBatch::chunk_begin()const{require(valid(),"MTP target batch is invalid");return lease_->base.next_position;}
@@ -251,8 +263,7 @@ std::uint32_t HipMtpTargetWindowBatch::input_token(std::uint32_t row)const{requi
 std::uint32_t HipMtpTargetWindowBatch::predicted_token(std::uint32_t row)const{require(row<logical_rows() && (!lease_->selection || row<lease_->selection->decided_rows),"MTP batch row is undecided or out of bounds");return lease_->predictions[row];}
 std::optional<ModelContentIdentity> HipMtpTargetWindowBatch::terminal_logits_digest(std::uint32_t row)const {
     require(row<logical_rows(),"MTP batch row is out of bounds");
-    if(!lease_->row_digests.empty()) return row<lease_->row_digests.size()?lease_->row_digests[row]:std::nullopt;
-    return row+1U==logical_rows()?lease_->terminal_digest:std::nullopt;
+    return lease_->terminal_logits_digest(row);
 }
 MtpDeviceView HipMtpTargetWindowBatch::view(std::uint32_t row)const{require(row<logical_rows(),"MTP batch row is out of bounds");lease_->capture->impl_->require_pool();return lease_->capture->impl_->snapshots[row];}
 const SerialSessionContext& HipMtpTargetWindowBatch::base_session()const{require(valid(),"MTP target batch is invalid");return lease_->base;}

@@ -6,7 +6,7 @@ namespace strix::decode_cli {
 // Compact tiled-prefill owners and the serial decode pool, already inside the workspace/tail and state reservations.
 struct YarnPrefillOwnerGeometry {
     bool compact_scores = false;
-    std::uint64_t ring_bytes = 0, terminal_logits_bytes = 0, decode_pool_bytes = 0, primary_compact_bytes = 0;
+    std::uint64_t ring_bytes = 0, terminal_logits_bytes = 0, decode_pool_bytes = 0, primary_compact_bytes = 0, mtp_pool_bytes = 0;
 };
 // Closed plain-CLI owner capacities. This is a conservative payload upper
 // bound, not RSS, GTT usage, or allocator metadata (the separate reserve).
@@ -23,7 +23,14 @@ inline void append_yarn_owner_requirements(const Options& options, const ModelCo
     if (state_payload > result.state_d1) throw std::invalid_argument("YaRN state owner payload exceeds layout reservation");
     if (geometry.decode_pool_bytes > result.state_d1 - state_payload)
         throw std::invalid_argument("YaRN decode pool exceeds state reservation");
-    result.owners["state_alignment_and_d1_shadow"] = result.state_d1 - state_payload - geometry.decode_pool_bytes;
+    if(geometry.mtp_pool_bytes>result.state_d1-state_payload-geometry.decode_pool_bytes)
+        throw std::invalid_argument("YaRN MTP pool exceeds state reservation");
+    result.owners["state_alignment_and_d1_shadow"] = result.state_d1 - state_payload - geometry.decode_pool_bytes - geometry.mtp_pool_bytes;
+    if(geometry.mtp_pool_bytes) {
+        const auto pool=mtp_qsa_pool_plan(options.context_tokens);
+        result.owners["mtp_m1_keys"]=pool.key_bytes;
+        result.owners["mtp_m1_scratch_metadata"]=pool.reserved_bytes-pool.key_bytes;
+    }
     result.owners["qsa_decode_pool"] = geometry.decode_pool_bytes;
     result.owners["model_backing"] = result.model_backing;
     result.owners["serial_scratch"] = result.serial_scratch;

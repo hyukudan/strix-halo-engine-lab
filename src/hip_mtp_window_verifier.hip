@@ -1,5 +1,6 @@
 #include "strix/host_phase_timing.hpp"
 #include "strix/hip_mtp_window_verifier.hpp"
+#include "strix/mtp_payload_geometry.hpp"
 #include "strix/mtp_target_window_policy.hpp"
 #include "strix/mtp_window_controller.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
@@ -203,6 +204,11 @@ struct HipMtpWindowVerifier::Impl {
                 "MTP window verifier requires actual closed all-row target owners");
             require(owners.empty() || (owners.back().rows<candidate->logical_rows() && candidate->defers_state() &&
                 owners.front().window->defers_state()),"MTP window owners must have distinct rows and prefix acceptance");
+            if(target->model().rotary_identity().descriptor().mode()==RotaryMode::yarn)
+                require(candidate->policy_selection_admitted(),
+                    "YaRN MTP verifier arithmetic is not serial equivalent; refused before mutation");
+            if(target->model().rotary_identity().descriptor().mode()==RotaryMode::yarn)
+                std::fprintf(stderr,"mtp-window-arms %s\n",candidate->arithmetic_witness().c_str());
             owners.push_back({candidate,{},candidate->logical_rows(),{},{},false});
         }
         window=owners.back().window;
@@ -254,9 +260,11 @@ struct HipMtpWindowVerifier::Impl {
         }
         const auto reservation=bounded?plan_hip_mtp_target_window_rollback(target->model(),*resources.session_state_layout,0,window->logical_rows(),true).reservation:
             plan_hip_mtp_target_checkpoint(target->model(),*resources.session_state_layout,policy.snapshot_policy);
-        const auto upper=mtp_native::sum(reservation.retained_bytes,
-            mtp_native::product(policy.capture.retained_byte_budget,4U*owners.size()));
-        require(policy.total_retained_byte_budget && reservation.retained_bytes<=policy.checkpoint_retained_byte_budget &&
+        const auto checkpoint_payload=prefix?0U:reservation.retained_bytes;
+        auto upper=checkpoint_payload;
+        for(const auto& o:owners) upper=mtp_native::sum(upper,mtp_native::product(4U,
+            mtp_payload::window_capture(target->model(),o.rows,policy.capture.maximum_history_intervals,resources.model_weights->tensors.size())));
+        require(policy.total_retained_byte_budget && checkpoint_payload<=policy.checkpoint_retained_byte_budget &&
             upper<=policy.total_retained_byte_budget,"MTP window verification exceeds upfront combined retained reservation");
         // Every row's argmax runs on the window stream right after its head rows and lands in
         // host-mapped memory: one completion per window instead of a selector round trip per
@@ -290,7 +298,7 @@ struct HipMtpWindowVerifier::Impl {
         checkpoint=std::make_unique<HipMtpTargetCheckpoint>(target->model(),target->compiled(),*resources.session_state_layout,
             target->memory_owner(),target->weights_owner(),target->allocator(),static_cast<hipStream_t>(checkpoint_stream),
             checkpoint_stream_owner,target->guard(),policy.snapshot_policy,policy.checkpoint_retained_byte_budget,generations,
-            bounded?captures.front():std::shared_ptr<const HipMtpTargetWindowCapture>{});
+            bounded?captures.front():std::shared_ptr<const HipMtpTargetWindowCapture>{},resources.qsa_committed_pool);
         retained=mtp_native::sum(retained,checkpoint->reserved_bytes());
         require(retained<=policy.total_retained_byte_budget,"MTP actual verification pools exceed admitted reservation");
     }
@@ -403,7 +411,7 @@ struct HipMtpWindowVerifier::Impl {
     void skip_sample() {last_end=std::chrono::steady_clock::now();}
     Owner* owner_of(std::uint32_t rows) {for(auto& o:owners) if(o.rows==rows) return &o;return nullptr;}
     bool fits(const SerialSessionContext& session,const Owner& o,std::size_t candidates,std::uint32_t budget) const {
-        const auto capacity=std::min(resources.session_state_layout->context_tokens,target->model().max_position_embeddings);
+        const auto capacity=std::min(resources.session_state_layout->context_tokens,target->model().effective_max_positions());
         if(session.next_position>=capacity) return false;
         const bool pad=prefix && min_probability>0.0F;
         // Capture::begin needs a valid lineage: a window never starts an empty session.
@@ -451,7 +459,7 @@ void HipMtpWindowVerifier::prepare_admission(const SerialSessionContext& session
     static const bool enabled=[]{const char* v=std::getenv("STRIX_WINDOW_SETUP_PREFLIGHT");return !v || v[0]!='0';}();
     auto& i=*impl_;
     if(!enabled || i.busy || failed()) return;
-    const auto capacity=std::min(i.resources.session_state_layout->context_tokens,i.target->model().max_position_embeddings);
+    const auto capacity=std::min(i.resources.session_state_layout->context_tokens,i.target->model().effective_max_positions());
     for(auto& o:i.owners) {
         if(session.next_position+o.rows>capacity) continue;
         const std::vector<std::uint32_t> tokens(o.rows,0U);
@@ -586,6 +594,7 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
             const auto committed=std::max(1U,n_keep);
             if(q.transaction)result.selection_failure=provisional->selection_prefix()->selection_failure;
             p.owner->window->commit_prefix(committed);i.last=p.owner;
+            if(i.resources.qsa_committed_pool) i.resources.qsa_committed_pool->commit(false,p.previous.next_position+committed);
             if(committed<rows) {
                 const auto dropped=rows-committed;
                 session.next_position-=dropped;session.committed_tokens-=dropped;
@@ -612,6 +621,7 @@ std::vector<HipMtpVerifiedTargetRows> HipMtpWindowVerifier::verify_cohort(std::s
     } catch(...) {
         for(std::size_t a=0;a<requests.size();++a) {
             auto& i=*prepared[a].impl;i.failed=true;i.busy=false;
+        if(i.resources.qsa_committed_pool) i.resources.qsa_committed_pool->cancel();
             auto& session=*requests[a].session;
             if(attempted || session.health==SerialSessionHealth::poisoned){
                 session.health=SerialSessionHealth::poisoned;session.arithmetic_lineage.tainted=true;
@@ -645,6 +655,7 @@ std::vector<HipMtpTargetHiddenTicket> HipMtpWindowVerifier::prompt_rows(SerialSe
         attempted=true;
         auto provisional=std::make_shared<const HipMtpTargetWindowBatch>(std::move(native.batch));
         owner->window->commit_prefix(rows);i.last=owner;
+        if(i.resources.qsa_committed_pool) i.resources.qsa_committed_pool->commit(false,session.next_position);
         auto tickets=i.target->accept_known_rows(provisional,session);
         // Prompt rows are no decode cycle: keep them out of the next cycle's measured time.
         i.skip_sample();
@@ -654,6 +665,7 @@ std::vector<HipMtpTargetHiddenTicket> HipMtpWindowVerifier::prompt_rows(SerialSe
         i.busy=false;return tickets;
     } catch(...) {
         i.failed=true;i.busy=false;
+        if(i.resources.qsa_committed_pool) i.resources.qsa_committed_pool->cancel();
         if(attempted || session.health==SerialSessionHealth::poisoned){
             session.health=SerialSessionHealth::poisoned;session.arithmetic_lineage.tainted=true;
             i.target->guard()->recover_or_fail_stop();
@@ -740,6 +752,7 @@ std::vector<std::vector<HipMtpTargetHiddenTicket>> HipMtpWindowVerifier::prompt_
             auto& x=items[order[m]];auto& i=*x.impl;const auto& q=requests[x.request];
             auto provisional=std::make_shared<const HipMtpTargetWindowBatch>(std::move(natives[m].batch));
             x.owner->window->commit_prefix(x.rows);i.last=x.owner;
+            if(i.resources.qsa_committed_pool) i.resources.qsa_committed_pool->commit(false,q.session->next_position);
             out[x.request]=i.target->accept_known_rows(provisional,*q.session);
             i.skip_sample();
             provisional.reset();natives[m]={};
@@ -750,6 +763,7 @@ std::vector<std::vector<HipMtpTargetHiddenTicket>> HipMtpWindowVerifier::prompt_
     } catch(...) {
         for(auto& x:items) {
             auto& i=*x.impl;i.failed=true;i.busy=false;
+        if(i.resources.qsa_committed_pool) i.resources.qsa_committed_pool->cancel();
             auto& session=*requests[x.request].session;
             if(attempted || session.health==SerialSessionHealth::poisoned) {
                 session.health=SerialSessionHealth::poisoned;session.arithmetic_lineage.tainted=true;
@@ -876,7 +890,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
     auto pending=initial.predicted_token();
     HipMtpVerifiedTargetRows out;out.committed_rows.reserve(candidates.size()+1);out.emitted_tokens.reserve(candidates.size()+1);
     if(is_eos(pending))return out;
-    const auto capacity=std::min(i.resources.session_state_layout->context_tokens,i.target->model().max_position_embeddings);
+    const auto capacity=std::min(i.resources.session_state_layout->context_tokens,i.target->model().effective_max_positions());
     require(session.next_position<capacity,"MTP verifier target context is full");
     // Capture::begin needs room for one actual known-window chunk. Capacity
     // exhaustion is an ordinary serial fallback, before pool/checkpoint work.
@@ -967,6 +981,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             const auto committed=std::max(1U,n_keep);
             if(transaction)out.selection_failure=provisional->selection_prefix()->selection_failure;
             owner->window->commit_prefix(committed);i.last=owner;
+            if(i.resources.qsa_committed_pool) i.resources.qsa_committed_pool->commit(false,previous.next_position+committed);
             host_phase_mark("7b commit prefix");
             if(committed<rows) {
                 const auto dropped=rows-committed;
@@ -1012,6 +1027,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
                 std::none_of(inputs.begin(),inputs.end(),is_eos)):
                 assess_mtp_target_window(inputs,selected,pending,budget,eos,vocabulary).accepts_complete_chunk();
             if(complete) {
+                if(i.resources.qsa_committed_pool) i.resources.qsa_committed_pool->commit(false,session.next_position);
                 out.committed_rows=i.target->accept_verified_window(provisional,initial,session,eos,budget);
                 out.emitted_tokens=std::move(selected);out.accepted_candidates=rows-1;out.accepted_window=true;
                 i.checkpoint->discard();i.observe(owner,rows);seal();i.busy=false;return out;
@@ -1050,6 +1066,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
     } catch(...) {
         if(transaction)transaction->discard();
         i.failed=true;i.busy=false;
+        if(i.resources.qsa_committed_pool) i.resources.qsa_committed_pool->cancel();
         // Producers/checkpoint own cleanup for their submitted operations.
         // Do not synchronize or poison a purely rejected predispatch scope.
         // A failure after any successful target consumption still cannot

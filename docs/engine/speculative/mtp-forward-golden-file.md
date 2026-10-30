@@ -57,3 +57,20 @@ a new file (never overwriting) and returns its full-file SHA256 pin. The
 developer `--mtp-golden-dump` route uses it with the explicit self-generated
 source marker `mtp_self_generated_golden_source()` /
 `mtp_self_generated_golden_reference`; see [native CLI](mtp-native-cli.md).
+
+Version 3 is the explicit YaRN MTP CLI format. It retains the version-2
+fields and rows, sets header bytes to 288, and appends these fields at offset 184:
+uint64 factor; 32-byte descriptor SHA256; 32-byte retained table SHA256; uint64
+actual context capacity; uint64 calibration begin; uint64 calibration end; uint64
+actual prompt prefill profile identity. Target and predictor share the recorded
+rotary identity; the structural predictor plan also binds it. Calibration starts
+at zero, ends at the row count (at most 4096), and leaves a valid seed below C.
+The earlier target prefill field describes calibration arithmetic, which is the
+decode profile on tiled prompts. The new prompt field describes the full prompt.
+
+The replay payload frame binds every version-3 field, including the calibration,
+prompt and decode profiles. Capacity, descriptor, table and profiles are checked
+before mutation. Native version-1/version-2 bytes and payload identities retain
+their historical interpretation; they cannot serve as YaRN evidence. Capturing
+version 3 retains the explicit self-generated marker and establishes no independent
+predictor fidelity or complete-workload qualification.

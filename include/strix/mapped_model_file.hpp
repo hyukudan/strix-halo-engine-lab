@@ -58,6 +58,10 @@ public:
     // Actual raw digest from the SAME full-file pass/FD used to establish the
     // framed content identity at open; invalid on empty/moved-from owners.
     [[nodiscard]] const ModelContentIdentity& file_sha256() const noexcept {return file_sha256_;}
+    // Stable in-process eviction key for the actual backing, including aliases.
+    [[nodiscard]] std::array<std::uint64_t,2> file_backing_identity() const noexcept {
+        return {file_state_[0], file_state_[1]};
+    }
     // Setup-only FD/stat witness against the original hash+map observation.
     // No rehash and no claim of protection against arbitrary privileged writers.
     void validate_unchanged() const;
@@ -69,6 +73,10 @@ public:
     [[nodiscard]] ModelRuntimeBinding
     build_runtime_binding(
         const ModelManifest& manifest) const;
+
+    // Reopen the actual mapped inode as an owned O_DIRECT descriptor. Throws
+    // before rolling admission on unsupported filesystems; never buffered.
+    [[nodiscard]] int open_direct_read_only() const;
 
     void read_at(
         std::uint64_t byte_offset,

@@ -1,5 +1,6 @@
 #include "../apps/hip_prefix_state_cache.hpp"
 #include "strix/prompt_terminal_diagnostics.hpp"
+#include "strix/mtp_target_window_payload.hpp"
 #include <stdexcept>
 #include <deque>
 #include <map>
@@ -77,6 +78,20 @@ void prefix_dma_tests() {
         auto owner_digest=raw_fp32_logits_digest(row);
         OutputLogitsSnapshot ticket;ticket.capture(owner_digest);
         const auto saved=ticket.digest;
+        // The window lease moved into the shared payload header. Keep both
+        // independent diagnostic channels when tickets outlive scratch reuse.
+        MtpTargetWindowLease window;window.tokens.resize(2);window.terminal_digest=saved;
+        require(!window.terminal_logits_digest(0) && window.terminal_logits_digest(1)==saved,
+            "uncertified window preserves terminal-only diagnostics");
+        auto different=row;different[0]=7.0F;const auto second=raw_fp32_logits_digest(different);
+        window.row_digests={saved,second};window.logit_digests={*saved,*second};
+        require(window.terminal_logits_digest(0)==saved && window.terminal_logits_digest(1)==second &&
+            !window.terminal_logits_digest(2),"certified moved lease resolves each row separately");
+        OutputLogitsSnapshot accepted;accepted.capture(window.terminal_logits_digest(0));
+        const auto committed_step=window.logit_digests[0];
+        window.row_digests.clear();window.logit_digests.clear();window.terminal_digest.reset();
+        require(accepted.digest==saved && committed_step==*saved,
+            "moved lease preserves per-row terminal snapshots and committed-step hashes");
         auto stripe=row;stripe[0]=42.0F;
         owner_digest=raw_fp32_logits_digest(stripe);
         require(ticket.digest==saved && ticket.digest!=owner_digest,"ticket digest survives stripe reuse");
@@ -738,12 +753,26 @@ void batch_snapshot_tests() {
         other.add_rows(reinterpret_cast<std::uintptr_t>(other_rows.data()),1,0);
         other.add_fixed_device(reinterpret_cast<std::uintptr_t>(&other_fixed),1);
         other.set_plan(config,8,true,2,batch);
+        unsigned invalidations=0;bool target_m1_valid=true,predictor_m1_valid=true;
+        other.set_before_restore_hook([&]{++invalidations;target_m1_valid=predictor_m1_valid=false;});
         other.set_restore_hook([&](std::uint64_t p){bridge_frontier=p;});
-        other.bind_restore_runtime([&](std::uint64_t p){slot_frontier=p;});
+        other.bind_restore_runtime([&](std::uint64_t p){
+            require(!target_m1_valid && !predictor_m1_valid,"M1 invalidates before rebound runtime frontier restore");
+            slot_frontier=p;
+        });
         other.set_retention(false); // no conversation: batch no-store still permits a validated hit
         SerialSessionContext fresh;fresh.state_layout_identity=1;
         require(other.begin_request(fresh,tokens)==2 && slot_frontier==2 && bridge_frontier==0 && other_fixed==std::byte{31},"slot-0 runtime hook rebound; cross-slot reuse");
         require(other.continuation()==qwen_full_t_continuation(config,8,2),"whole-prompt cold cursor installed");
+        require(invalidations==1,"M1 pre-restore hook survives first runtime rebind");
+        target_m1_valid=predictor_m1_valid=true;slot_frontier=0;
+        other.bind_restore_runtime([&](std::uint64_t p){
+            require(!target_m1_valid && !predictor_m1_valid,"M1 invalidation survives repeated named/slot runtime rebind");
+            slot_frontier=p+1;
+        });
+        fresh={};fresh.state_layout_identity=1;
+        require(other.begin_request(fresh,tokens)==2 && invalidations==2 && slot_frontier==3 && !bridge_frontier,
+            "rebound restore retains independent M1 invalidation hook");
         // Restore is a zero-write miss during parked service admissions.
         other.set_plan(config,8,true,2,batch,false);fresh={};fresh.state_layout_identity=1;other_fixed=std::byte{77};
         const auto pending_ops=operations[reinterpret_cast<hipStream_t>(1)].size();

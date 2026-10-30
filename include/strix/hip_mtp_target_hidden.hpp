@@ -16,6 +16,9 @@ class HipMtpTargetHiddenTicket {
 public:
     HipMtpTargetHiddenTicket()=default;
     [[nodiscard]] bool valid() const noexcept;
+    // Request-scoped diagnostics; seed is the real terminal prompt head, never a rerun.
+    void begin_step_logits_digest() const;
+    void print_step_logits_summary(std::uint64_t committed_end) const;
     [[nodiscard]] bool same_producer(const HipMtpTargetHiddenTicket&) const noexcept;
     [[nodiscard]] bool same_commit(const HipMtpTargetHiddenTicket&) const noexcept;
     [[nodiscard]] bool is_window() const noexcept;
@@ -31,7 +34,8 @@ public:
     [[nodiscard]] ModelContentIdentity target_content_identity() const;
     [[nodiscard]] RotaryIdentity producer_rotary_identity() const;
     void admit_rotary_reader(const RotaryIdentity&) const;
-    // STRIX_SERIAL_LOGITS_DIGEST=1: the serial row's FP32 logits digest (else empty; window and block rows: empty).
+    // STRIX_SERIAL_LOGITS_DIGEST=1: serial FP32 logits; STRIX_MTP_LOGITS_DIGEST=1 also captures verified rows.
+    // STRIX_MTP_STEP_LOGITS_DIGEST=1 additionally retains the tiled terminal head.
     [[nodiscard]] std::optional<ModelContentIdentity> serial_logits_digest() const;
     [[nodiscard]] std::optional<ModelContentIdentity> terminal_logits_digest() const;
     // Execution identity of the serial execution that produced this row (a window ticket

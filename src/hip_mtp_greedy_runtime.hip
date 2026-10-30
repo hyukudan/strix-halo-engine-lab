@@ -161,7 +161,7 @@ HipMtpTargetHiddenTicket HipMtpGreedyRuntime::prefill_prompt(std::span<const std
         i.resources.session_state_layout && i.target->retained_rows()>=3,
         "MTP prompt ingestion requires fresh actual target/predictor owners");
     const auto capacity=std::min(i.resources.session_state_layout->context_tokens,
-        i.mtp->resources().model().max_position_embeddings);
+        i.mtp->resources().model().effective_max_positions());
     require(tokens.size()<=capacity && tokens.size()<=i.mtp->resources().context_capacity(),
         "MTP prompt exceeds retained target/predictor capacity");
     for(auto token:tokens) require(token<i.mtp->resources().model().vocab_size,
@@ -200,7 +200,7 @@ std::uint32_t HipMtpGreedyRuntime::draft_begin(const HipMtpTargetHiddenTicket& i
     require(i.resources.session_state_layout && i.target->retained_rows()>=3,
         "MTP greedy cycle requires bounded target context and at least three retained target rows");
     const auto capacity=std::min(i.resources.session_state_layout->context_tokens,
-        i.mtp->resources().model().max_position_embeddings);
+        i.mtp->resources().model().effective_max_positions());
     require(i.session->next_position<capacity &&
         initial.source_position()<i.mtp->resources().context_capacity(),
         "MTP greedy cycle has no remaining target/predictor capacity");
@@ -562,7 +562,7 @@ std::vector<std::uint32_t> HipMtpGreedyRuntime::propose_wide(const HipMtpTargetH
     const auto pending=initial.predicted_token();
     if(budget<rows || std::find(eos.begin(),eos.end(),pending)!=eos.end() || !i.resources.session_state_layout ||
        i.session->next_position<=i.wide_resume) return {};
-    const auto capacity=std::min(i.resources.session_state_layout->context_tokens,i.mtp->resources().model().max_position_embeddings);
+    const auto capacity=std::min(i.resources.session_state_layout->context_tokens,i.mtp->resources().model().effective_max_positions());
     if(i.session->next_position+rows>capacity || i.mtp->next_source_position()!=initial.source_position() ||
        initial.source_position()+rows>=i.mtp->resources().context_capacity()) return {};
     for(const auto t:forced) require(t<i.mtp->resources().model().vocab_size,"MTP forced wide proposal is outside the vocabulary");

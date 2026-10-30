@@ -1,9 +1,11 @@
 #pragma once
 #include "strix/hip_mtp_resources.hpp"
+#include "strix/mtp_target_window_payload.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/speculative_verify_runtime.hpp"
 #include "strix/mtp_selection_transaction.hpp"
 #include <functional>
+#include <optional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -31,6 +33,7 @@ public:
     // Diagnostic snapshot of the actual last head, retained before scratch reuse.
     [[nodiscard]] std::optional<ModelContentIdentity> terminal_logits_digest(std::uint32_t row) const;
     [[nodiscard]] MtpDeviceView view(std::uint32_t row) const;
+    [[nodiscard]] std::optional<ModelContentIdentity> logits_digest(std::uint32_t row) const;
     [[nodiscard]] const SerialSessionContext& base_session() const;
     [[nodiscard]] const SerialSessionContext& committed_session() const;
     [[nodiscard]] ModelContentIdentity target_content_identity() const;
@@ -44,7 +47,7 @@ public:
     [[nodiscard]] void* source_stream() const;
 private:
     friend class HipMtpTargetWindowCapture;
-    struct Lease;
+    using Lease = MtpTargetWindowLease;
     std::shared_ptr<const Lease> lease_;
 };
 struct HipMtpTargetWindowExecution {

@@ -1,5 +1,8 @@
+#include "strix/startup_markers.hpp"
 #include "http_slot_capacity.hpp"
+#include "strix/hip_mtp_native_validation.hpp"
 #include "qwen_prefill_plan.hpp"
+#include "ple_resident_fallback.hpp"
 #include "qwen_http_memory.hpp"
 #include "strix/preflight.hpp"
 #include "deferred_moe_receipt.hpp"
@@ -72,6 +75,7 @@
 #include "hip_mtp_decode_bridge.hpp"
 #include "hip_http_serve.hpp"
 #include "hip_prefix_state_cache.hpp"
+#include "strix/mtp_step_logits_digest.hpp"
 #include "hip_mtp_cohort_bridge.hpp"
 #include "hip_mtp_cohort_tiled.hpp"
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
@@ -91,6 +95,8 @@
 #include "strix/serial_session.hpp"
 #include "strix/session_state_layout.hpp"
 #include "strix/ple_reclaim.hpp"
+#include "known_prefill_reservation.hpp"
+#include "ple_reclaim_mapping.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -503,9 +509,13 @@ public:
         if (track_logit_hashes_) logit_hashes_.push_back(strix::model_content_identity_hex(
             strix::sha256_bytes(std::as_bytes(std::span<const float>(logits)))));
         if (recording_) recording_(input_token, position, logits);
+        if (logits_observer_) logits_observer_(position,logits);
         return logits;
     }
 
+    void set_logits_observer(std::function<void(std::uint64_t,std::span<const float>)> observer) {
+        logits_observer_=std::move(observer);
+    }
     [[nodiscard]] const std::vector<double>&
     elapsed_ms() const noexcept {
         return elapsed_ms_;
@@ -529,6 +539,7 @@ private:
     std::vector<double> prefix_state_elapsed_ms_;
     std::vector<std::string> logit_hashes_;
     std::function<void(std::uint32_t, std::uint64_t, std::span<const float>)> recording_;
+    std::function<void(std::uint64_t,std::span<const float>)> logits_observer_;
     std::function<void()> recording_binding_;
     std::function<void()> recording_drain_;
     std::function<void(std::uint32_t)> execute_override_;
@@ -1096,6 +1107,9 @@ int STRIX_DECODE_ENTRY(
         parse_options(
             argc,
             argv, true);
+#if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
+    options.mtp_cli_phase_retirement=false;
+#endif
     const auto startup_preflight = strix::emit_qwen_startup_diagnostics(options.print_effective_config);
     const auto release_assets = strix::decode_cli::verify_http_release_assets(options);
     // Bind supplied numerical settings; operational paths, switches and budgets are excluded.
@@ -1323,26 +1337,32 @@ int STRIX_DECODE_ENTRY(
         return http_mtp_memory(candidate,model,serial,manifest,access,reservation.setup_peak_reserved_bytes,
             prefill_checked_add(reservation.registered_alias_bytes,reservation.copied_reserved_bytes),serving_golden->bytes());
     };
-    if (yarn) prompt_memory.verify_ple_credit = [&](const strix::decode_cli::Options& candidate) -> std::uint64_t {
-        const auto environment = strix::decode_cli::requested_prefill_environment();
+    if (yarn && options.mtp.enabled) prompt_memory.estimate_with_score_ring = [&](const strix::decode_cli::Options& candidate, std::uint32_t ring_rows) {
+        return strix::decode_cli::compile_prompt_requirements(candidate, model, manifest, mapped.bytes(), nullptr, false, ring_rows);
+    };
+    if (yarn && !options.print_effective_config) prompt_memory.verify_ple_credit = [&](const strix::decode_cli::Options& candidate,
+        const strix::decode_cli::Environment& environment) -> std::uint64_t {
+        return strix::decode_cli::verify_fresh_ple_preflight(yarn_preflight_reclaimer,[&]() -> std::uint64_t {
         auto config = strix::decode_cli::prefill_reclaim_config(candidate,model,manifest,environment,prompt_memory.ple_reclaim_page);
         if (!config) {
             if (strix::decode_cli::env_is(environment,"STRIX_PLE_RECLAIMABLE","1"))
                 throw std::invalid_argument("YaRN required PLE reclaim route unavailable before device setup");
             return 0;
         }
-        config->mapping_base = mapped.base_address();
-        config->mapping_bytes = mapped.bytes();
-        config->ahead_rows = 0; // no speculative prefetch during pre-device admission
-        config->drop_page_cache = [&mapped](auto offset, auto bytes) { return mapped.drop_page_cache(offset,bytes); };
+        strix::decode_cli::bind_ple_reclaim_mapping(*config,mapped_owner);
+        config->credit_only = true; // probes and verified credit only; runtime activates prompt work
         try {
             yarn_preflight_reclaimer = std::make_unique<strix::ple_reclaim::Prefetcher>(*config,
                 strix::build_ple_hash_contract(model),candidate.tokens,true);
             return yarn_preflight_reclaimer->credit_bytes();
-        } catch (const std::exception&) {
-            if (strix::decode_cli::env_is(environment,"STRIX_PLE_RECLAIMABLE","1")) throw;
+        } catch (const std::exception& error) {
+            yarn_preflight_reclaimer.reset();
+            const bool required = strix::decode_cli::env_is(environment,"STRIX_PLE_RECLAIMABLE","1");
+            if (required) throw std::runtime_error(std::string("YaRN required PLE preflight refused: ") + error.what());
+            std::fprintf(stderr,"ple-rolling: YaRN preflight failed (%s); zero-credit resident admission required\n",error.what());
             return 0; // an automatic unverified drop earns no credit
         }
+        });
     };
     if (target_input_export) options.route_owned = true;
     auto requested_environment = strix::decode_cli::requested_prefill_environment();
@@ -1417,7 +1437,12 @@ int STRIX_DECODE_ENTRY(
         std::cout << strix::decode_cli::effective_config_json(effective);
         return 0;
     }
-    yarn_preflight_reclaimer.reset(); // runtime owns a fresh verified drop after registration
+    strix::decode_cli::require_effective_prefill_execution(effective);
+    std::unique_ptr<strix::decode_cli::YarnMemoryWatchdog> yarn_watchdog;
+    if (yarn) yarn_watchdog = std::make_unique<strix::decode_cli::YarnMemoryWatchdog>();
+    strix::decode_cli::YarnMemoryWatchdogScope yarn_watchdog_scope(yarn_watchdog.get());
+    { strix::startup::Phase marker("preflight_reset");
+      yarn_preflight_reclaimer.reset(); } // runtime owns a fresh verified drop after registration
     strix::qpf2k::undo_pre_injected([](const char* name) { ::unsetenv(name); });
     strix::qpf2k::baseline = options.baseline;
     for (const auto& [name, value] : effective.environment) {
@@ -1520,6 +1545,7 @@ int STRIX_DECODE_ENTRY(
         "  \"optimization_profile_automatic_applied\": " +
         (optimization_profile.automatic_applied ? "true" : "false") + ",\n" + ple_cpu_helper_receipt;
     if (yarn) optimization_profile_receipt += "  \"rotary\":" + model.rotary_identity().json() + ",\n";
+    optimization_profile_receipt += strix::decode_cli::yarn_mtp_storage_receipt(effective);
     if (options.ple_cache_rows)
         optimization_profile_receipt += "  \"ple_row_cache_requested_rows\":" + std::to_string(options.ple_cache_rows) + ",\n" +
             "  \"ple_row_cache_payload_budget_bytes\":" + std::to_string(options.ple_cache_budget_bytes) + ",\n" +
@@ -1767,7 +1793,9 @@ int STRIX_DECODE_ENTRY(
     const std::string deferred_moe_mode_receipt = "  \"deferred_moe_status\": " +
         std::string(options.deferred_moe_status ? "true" : "false") + ",\n";
     const strix::decode_detail::SharedPrefetchDispatchReceipt shared_dispatch_receipt(shared_prefetch_stats);
+    strix::startup::Phase first_hip_marker("first_hip_guard");
     const auto original_work_device = std::make_shared<strix::HipSetupQuiescenceGuard>();
+    first_hip_marker.end();
     if (yarn) {
         model.qwen_rotary_table = std::make_shared<const strix::HipQwenRotaryTable>(options.rotary);
         if (model.qwen_rotary_table->identity() != model.resolved_rotary)
@@ -1908,6 +1936,7 @@ int STRIX_DECODE_ENTRY(
     buffer_request.mlp_intermediate_element_bytes =
         4;
 
+    strix::startup::Phase compilation_marker("plan_compilation");
     auto compiled =
         strix::compile_serial_execution(
             model,
@@ -2116,6 +2145,7 @@ int STRIX_DECODE_ENTRY(
     const auto hc_next_tile_plan = strix::hc_projection_prefetch::build_plan(
         model, manifest, compiled, tensor_access, options.prefetch_hc_projection_next_tile);
 
+    compilation_marker.end();
     strix::SerialSessionStateLayoutRequest
         state_request;
     state_request.context_tokens =
@@ -2205,6 +2235,18 @@ int STRIX_DECODE_ENTRY(
     // Admitted runs retain =1's data path, credit, diagnostics and receipt (src/ple_reclaim.cpp).
     const auto ple_reclaim_mode = strix::decode_cli::ple_reclaim_mode(options, residency_policy, graph_mode);
     const bool ple_reclaim_requested = ple_reclaim_mode != strix::ple_reclaim::Mode::off;
+    if (!ple_reclaim_requested && strix::ple_reclaim::requested() != strix::ple_reclaim::Mode::off) {
+        const char* rolling = std::getenv("STRIX_PLE_ROLLING"), *exact = std::getenv("STRIX_CTX_EXACT_MEMORY");
+        if ((!rolling || rolling[0] != '0') && (!exact || exact[0] != '0')) {
+            const auto witness = strix::decode_cli::ple_reclaim_inactive_witness(options, residency_policy, graph_mode);
+            std::fputs(witness.c_str(), stderr);
+        }
+    }
+    // The leased MTP route completes sidecar hashing and registration before
+    // setup drop/credit, then reuses these actual immutable owners for repeats.
+    auto ple_mtp_assets = ple_reclaim_requested && options.mtp.enabled
+        ? strix::decode_cli::load_mtp_cli_assets(options.mtp, model, mapped_owner, manifest, model_owner, generations)
+        : std::shared_ptr<const strix::HipMtpAssets>{};
     // After registration: pinning the model may evict anything populated before it.
     if (!ple_reclaim_requested) warm_file_backed_tensors(mapped, manifest);
     if (load_balloon) { (void)hipFree(load_balloon); load_balloon = nullptr; std::cerr << "load balloon: released\n"; }
@@ -2213,9 +2255,13 @@ int STRIX_DECODE_ENTRY(
     std::optional<strix::UmaOwnerInventory> model_owner_inventory;
     if (options.execution_inventory || options.known_prefix_prefill_rows)
         model_owner_inventory.emplace(model_residency.owner_inventory(model_owner, mapped_owner));
-    std::unique_ptr<strix::ple_reclaim::Prefetcher> ple_reclaimer;
+    std::shared_ptr<strix::ple_reclaim::Prefetcher> ple_reclaimer;
     if (ple_reclaim_requested) {
-        try {
+        const auto rolling_h = strix::decode_cli::ple_rolling_prompt_supported(options) && strix::ctx_exact_memory_enabled("STRIX_PLE_ROLLING") ? strix::ple_reclaim::rolling_positions(std::getenv("STRIX_PLE_ROLLING"),
+            std::getenv("STRIX_CTX_EXACT_MEMORY"), std::getenv("STRIX_PLE_ROLLING_POSITIONS")) : 0U;
+        const auto cap = rolling_h
+            ? strix::ple_reclaim::rolling_cap_bytes(std::getenv("STRIX_PLE_ROLLING_CAP_BYTES")) : 0U;
+        ple_reclaimer = strix::decode_cli::setup_ple_or_resident(ple_reclaim_mode, [&] {
             const strix::ManifestTensor* table = nullptr;
             for (const auto& tensor : manifest.tensors) {
                 if (tensor.residency != strix::ResidencyPolicy::file_backed_candidate) continue;
@@ -2244,29 +2290,53 @@ int STRIX_DECODE_ENTRY(
             if (config.stored_row_bytes * config.table_rows != table->byte_size)
                 throw std::invalid_argument("STRIX_PLE_RECLAIMABLE=1: n-gram table extent does not match its rows");
             config.reclaim = strix::ple_reclaim::reclaim_intervals(table->absolute_offset, table->byte_size, page, std::move(registered));
+            config.rolling_positions = rolling_h;
+            config.rolling_cap_bytes = cap;
+            // A mapper covering any interior PLE page retains the old contract.
+            std::uint64_t reclaim_bytes = 0;
+            for (const auto& r : config.reclaim) reclaim_bytes += r.end - r.begin;
+            const auto interior = (table->absolute_offset + table->byte_size) / page * page -
+                (table->absolute_offset + page - 1U) / page * page;
+            if (config.rolling_positions && reclaim_bytes != interior) {
+                if (options.mtp.enabled) throw std::runtime_error("PLE MTP rolling refuses mapper-protected interior pages");
+                config.rolling_positions = 0;
+                std::fprintf(stderr, "ple-rolling: prompt-wide mode retained: mapper protects interior PLE pages\n");
+            }
             const auto contract = strix::build_ple_hash_contract(model);
-            // Decode lookups after the prompt: (G + 1) tokens x heads rows x 2 pages, times (candidate depth + 1) on the
-            // MTP route (every draft and rejected draft looks up its rows; depth 8 if unset), at least 256 MiB;
-            // STRIX_PLE_RECLAIM_DECODE_BYTES can only raise it.
+            config.bounded_turns = options.mtp.enabled;
+            strix::decode_cli::bind_ple_reclaim_mapping(config,mapped_owner);
+            // The leased route charges a fixed replaceable source cache. Target
+            // replay/verification reads the table; the predictor has no PLE op.
+            // The historical route retains its G-dependent allowance.
             const std::uint64_t lookups_per_token = options.mtp.enabled
                 ? (options.mtp.candidate_depth ? options.mtp.candidate_depth + 1ULL : 9ULL) : 1ULL;
             const char* decode_bytes = std::getenv("STRIX_PLE_RECLAIM_DECODE_BYTES");
-            config.decode_allowance_bytes = strix::ple_reclaim::decode_allowance(options.generate_tokens, lookups_per_token,
+            config.decode_allowance_bytes = strix::ple_reclaim::decode_allowance(config.rolling_positions ? 0U : options.generate_tokens, config.rolling_positions ? 1U : lookups_per_token,
                 contract.head_count, page, decode_bytes ? std::strtoull(decode_bytes, nullptr, 10) : 0U);
             config.ahead_rows = 2U * options.known_prefix_prefill_rows;
+            if (config.rolling_positions)
+                config.critical_rows = options.known_prefix_prefill_rows;
             if (const char* v = std::getenv("STRIX_PLE_RECLAIM_AHEAD_ROWS"); v && std::strtoull(v, nullptr, 10))
                 config.ahead_rows = std::strtoull(v, nullptr, 10);
             if (const char* v = std::getenv("STRIX_PLE_RECLAIM_STRICT")) config.strict = v[0] != '0';   // default strict
             if (const char* v = std::getenv("STRIX_PLE_STAGE_PREFETCH")) config.stage_prefetch = v[0] != '0';
-            config.drop_page_cache = [&mapped](std::uint64_t offset, std::uint64_t bytes) { return mapped.drop_page_cache(offset, bytes); };
-            ple_reclaimer = std::make_unique<strix::ple_reclaim::Prefetcher>(std::move(config), contract,
+            return std::make_shared<strix::ple_reclaim::Prefetcher>(config, contract,
                 std::span<const std::uint32_t>(options.tokens.data(), options.tokens.size()),
                 ple_reclaim_mode == strix::ple_reclaim::Mode::automatic);
-        } catch (const std::exception&) {
-            if (ple_reclaim_mode == strix::ple_reclaim::Mode::required) throw;
-            // A partial drop earns no credit. Restore the original warm path before any consumer allocations.
-            warm_file_backed_tensors(mapped, manifest);
-        }
+        }, [&] {
+            strix::ple_reclaim::set_active(nullptr);
+            ple_reclaimer.reset();
+            yarn_preflight_reclaimer.reset();
+            effective.ple_reclaim_credit=0;
+            effective.ple_rolling_h=effective.ple_rolling_bound=effective.ple_rolling_cap=0;
+            effective.environment["STRIX_PLE_RECLAIMABLE"]="0";
+        }, [&] {
+            auto caps=prompt_capabilities;
+            const auto fresh=strix::decode_cli::observe_prefill_memory(caps);
+            const auto required=strix::decode_cli::compile_prompt_requirements(options,model,manifest,mapped.bytes(),nullptr,true);
+            const auto admitted=strix::decode_cli::resident_prefill_admission(options,required,fresh);
+            for(const auto& [name,bytes]:admitted) effective.admission[name]=bytes;
+        }, [&] { warm_file_backed_tensors(mapped, manifest); });
         if (ple_reclaimer) strix::ple_reclaim::set_active(ple_reclaimer.get());
     }
     if (yarn) {
@@ -2274,8 +2344,10 @@ int STRIX_DECODE_ENTRY(
             throw std::runtime_error("YaRN verified PLE credit lost after model registration; refusing state allocation");
         yarn_preflight_reclaimer.reset();
         const auto observed = strix::observe_linux_uma_memory();
-        if (!observed.memory.mem_available_bytes ||
-            *observed.memory.mem_available_bytes < effective.admission.at("incremental_bytes") - options.rotary.table_bytes())
+        if (!observed.memory.mem_total_bytes || !observed.memory.mem_available_bytes ||
+            !strix::decode_cli::prefill_physical_margin_fits(*observed.memory.mem_total_bytes,
+                *observed.memory.mem_available_bytes,effective.admission.at("required_bytes"),
+                effective.admission.at("incremental_bytes") - options.rotary.table_bytes()))
             throw std::runtime_error("YaRN available headroom lost after model registration; refusing state allocation");
         auto post_capabilities = prompt_capabilities;
         const auto post = strix::decode_cli::observe_prefill_memory(post_capabilities);
@@ -2606,6 +2678,8 @@ int STRIX_DECODE_ENTRY(
     // Only the explicit MTP request needs an independently retained PLE parent.
     auto mtp_mapped_ple_owner = options.mtp.enabled
         ? std::make_shared<strix::FileMappedPleLookupBackend>() : std::shared_ptr<strix::FileMappedPleLookupBackend>{};
+    auto ple_turn = ple_reclaimer && options.mtp.enabled ? ple_reclaimer->begin_turn() : nullptr;
+    if (mtp_mapped_ple_owner) mtp_mapped_ple_owner->bind_residency(ple_turn);
     MappedModelIoSource
         mapped_model_io(
             mapped);
@@ -2872,7 +2946,7 @@ int STRIX_DECODE_ENTRY(
                  options.known_window_router_rows || options.known_prefix_full_rows,
                  options.known_window_router_rows || options.known_prefix_full_rows,
                  options.known_prefix_full_rows, options.known_prefix_full_rows, options.known_prefix_full_rows,
-                 options.teacher_forced_score, !options.mtp.enabled && !options.http_serve, true}));
+                 options.teacher_forced_score, strix::decode_cli::compact_prompt_memory(options), true}));
             // --mtp-copy-wide-rows N[,M]: each listed size's tail owner also verifies wide copy cycles, so it computes
             // every row's head (all-rows policy; its prompt blocks that need no logits still run without heads).
             for (const auto tail_rows : options.known_prefix_tail_rows) {
@@ -2886,7 +2960,7 @@ int STRIX_DECODE_ENTRY(
                      options.known_prefill_workspace_budget, options.known_prefill_metadata_budget / 2U,
                      true, true, true, true, true,
                      // and its multi-row head (eight-row packs, the one-row head's leaf and reduction tree per row)
-                     wide_tail, !options.mtp.enabled && !options.http_serve, true})));
+                     wide_tail, strix::decode_cli::compact_prompt_memory(options), true})));
             }
             if (compiled_prefill)
                 for (const auto wide_rows : options.mtp.copy_wide_rows)
@@ -2992,10 +3066,76 @@ int STRIX_DECODE_ENTRY(
                 growth = add(growth, add(add(known_prefill_plan->host_metadata_payload_bytes, map_bytes), 8U));
                 for (const auto& tail : known_tail_plans) growth = add(growth, add(tail->host_metadata_payload_bytes, 8U));
             }
-            known_prefill_reservation = strix::plan_uma_reservation_growth(
-                strix::build_uma_owner_inventory(views), growth, known_prefill_runtime_payload,
+            auto rolling_metadata = ple_reclaimer && ple_reclaimer->rolling() ? ple_reclaimer->owner_bytes() : 0U;
+            strix::decode_cli::PrefillReservationGrowth mtp_growth;
+            if (ple_turn) {
+                const auto& m = options.mtp;
+                mtp_growth = strix::decode_cli::mtp_prefill_reservation({m.sidecar_retained_bytes, m.runtime_bytes,
+                    m.target_capture_bytes, m.replay_host_bytes, m.golden_max_bytes, m.window_arena_bytes,
+                    m.window_capture_bytes, m.window_checkpoint_bytes, m.window_total_bytes,
+                    m.window_rows ? static_cast<std::uint32_t>(m.window_rows_set.empty() ? 1U : m.window_rows_set.size()) : 0U,
+                    m.window_prefix});
+            }
+            if(yarn && options.mtp.enabled) {
+                // Same closed owner plan as inspection/pre-device admission.
+                // No credit or source-cache quota is appended here a second time.
+                const auto requirement=strix::decode_cli::compile_prompt_requirements(options,model,manifest,mapped.bytes());
+                // Sidecar setup is complete; post-setup phases take their maximum,
+                // with each shared M1 owner counted once in this growth estimate.
+                mtp_growth={requirement.mtp_post_setup_peak,0};
+                for(const auto* name:{"mtp_m1_keys","mtp_m1_scratch_metadata"})
+                    if(requirement.owners.contains(name)) mtp_growth.retained=add(mtp_growth.retained,requirement.owners.at(name));
+            }
+            const auto prefill_live = strix::build_uma_owner_inventory(views);
+            if(strix::decode_cli::mtp_prompt_phase_separation(options)) {
+                const auto requirement=strix::decode_cli::compile_prompt_requirements(options,model,manifest,mapped.bytes());
+                if(!requirement.owner_error.empty()) throw std::invalid_argument(requirement.owner_error);
+                auto owners=requirement.owners;owners["rotary_table"]=options.rotary.table_bytes();
+                if(rolling_metadata) owners["ple_rolling_owner"]=rolling_metadata;
+                const auto peaks=strix::decode_cli::prefill_owner_phase_peaks(owners,requirement.owner_phases,
+                    options.known_prefill_host_headroom);
+                // Setup is complete. The live inventory pins actual current backing;
+                // its future commitment is the common calibration/prompt/decode max.
+                const auto peak=*std::max_element(peaks.begin()+1,peaks.end());
+                if(prefill_live.reservation_upper_bound_bytes>peak)
+                    throw std::runtime_error("MTP actual live inventory exceeds phased owner envelope");
+                growth=peak-prefill_live.reservation_upper_bound_bytes;
+                known_prefill_runtime_payload=0;mtp_growth={}; // already in the phase maximum
+                rolling_metadata=0; // already in the same phase envelope used by inspection
+            }
+            if (ple_turn) std::fprintf(stderr,
+                "ple-rolling MTP admission: live=%llu growth=%llu metadata=%llu mtp-retained=%llu "
+                "temporary=%llu verified-credit=%llu retained-budget=%llu setup-budget=%llu B\n",
+                static_cast<unsigned long long>(prefill_live.reservation_upper_bound_bytes),
+                static_cast<unsigned long long>(growth), static_cast<unsigned long long>(rolling_metadata),
+                static_cast<unsigned long long>(mtp_growth.retained),
+                static_cast<unsigned long long>(add(known_prefill_runtime_payload, mtp_growth.temporary)),
+                static_cast<unsigned long long>(ple_reclaimer->credit_bytes()),
+                static_cast<unsigned long long>(options.known_prefill_uma_budget),
+                static_cast<unsigned long long>(options.known_prefill_uma_budget));
+            known_prefill_reservation = strix::decode_cli::plan_known_prefill_reservation(
+                prefill_live, growth, known_prefill_runtime_payload,
                 {options.known_prefill_uma_budget, options.known_prefill_uma_budget},
-                ple_reclaimer ? ple_reclaimer->credit_bytes() : 0U);
+                ple_reclaimer ? ple_reclaimer->credit_bytes() : 0U, rolling_metadata, mtp_growth);
+            // Physical checks charge only positive growth; never add reclaim to
+            // MemAvailable or deduct it from the independent GTT observation.
+            growth = add(growth, add(rolling_metadata, mtp_growth.retained));
+            const auto setup_growth = add(known_prefill_runtime_payload, mtp_growth.temporary);
+            if (ple_turn || yarn) {
+                // Credit reduces the gross model envelope once. MemAvailable
+                // already includes reclaimable cache and never receives credit.
+                const auto observed = strix::observe_linux_uma_memory().memory;
+                if (!observed.mem_total_bytes || !observed.mem_available_bytes ||
+                    !strix::decode_cli::prefill_physical_margin_fits(*observed.mem_total_bytes,*observed.mem_available_bytes,
+                        known_prefill_reservation->setup_peak_reserved_bytes,add(growth,setup_growth)))
+                    throw std::runtime_error("prefill physical admission: total/incremental envelope must retain 4 GiB margin");
+                strix::decode_cli::PrefillCapabilities caps;
+                const auto device = strix::decode_cli::observe_prefill_memory(caps);
+                // PLE is not registered: no credit is subtracted from GTT.
+                if (!device.gtt_limit || !device.gtt_used || *device.gtt_used > *device.gtt_limit ||
+                    add(growth, setup_growth) > *device.gtt_limit - *device.gtt_used)
+                    throw std::runtime_error("prefill physical admission: GTT observation unavailable or growth exceeds remaining capacity");
+            }
             struct PrefillRetained {
                 std::shared_ptr<const void> original, d1, ple, source, plan;
             };
@@ -3097,9 +3237,9 @@ int STRIX_DECODE_ENTRY(
         }
         // Sessions use the registry without legacy prefix lookup/capture in every arm.
         const bool rtx_state_registry = session_cache_enabled || (!strix::decode_cli::prefix_state_cache_requested(options) &&
-            strix::decode_cli::mtp_tiled_prompt(options) &&
+            (options.known_prefix_prefill_rows && options.known_prefix_window) &&
                 (options.rtx_state_import || strix::decode_cli::rtx_state_export_request() ||
-                    strix::decode_cli::prompt_state_digest_request(options.prefix_batch_cert)));
+                    strix::decode_cli::prompt_state_digest_request(options.prefix_batch_cert) || std::getenv("STRIX_FINAL_STATE_DIGEST")));
         if (strix::decode_cli::prefix_state_cache_requested(options) || rtx_state_registry) {
             if (!known_prefill_plan || !known_prefix_backend)
                 throw std::logic_error("prefix state cache reached a route other than the tiled known-prefix prefill");
@@ -3161,6 +3301,7 @@ int STRIX_DECODE_ENTRY(
             : std::static_pointer_cast<strix::PleLookupBackend>(mtp_mapped_ple_owner);
         auto parents = std::make_shared<strix::decode_cli::MtpDecodeTargetParents>(
             experiment_owner, launcher_catalog, std::move(owned_ple), ple_hash_contract);
+        parents->assets = ple_mtp_assets;
         if (compiled_prefill && !strix::decode_cli::mtp_tiled_prompt(options)) {
             if (!prefill_dispatcher || !prefill_scratch) throw std::logic_error("MTP split prefill lacks its prompt launchers");
             parents->prompt.compiled = &*compiled_prefill;
@@ -3220,6 +3361,52 @@ int STRIX_DECODE_ENTRY(
         // A row set builds one owner per size; owners share one deferred
         // GDN record and the arena/total budgets cover all of them. Cohort
         // requests build their owners on one shared window stream.
+        const auto prepare_mtp_pool = [&](strix::decode_cli::MtpDecodeTargetParents* request_parents) -> std::uint64_t {
+              const auto row_set = options.mtp.window_rows_set.empty()
+                  ? std::vector<std::uint32_t>{options.mtp.window_rows} : options.mtp.window_rows_set;
+              std::uint64_t pool_reservation=0;
+              if(request_parents->resources.qsa_committed_pool)
+                  return strix::mtp_qsa_pool_plan(options.context_tokens).reserved_bytes;
+              if (strix::decode_cli::qsa_mtp_pool_bytes(options,model,strix::qpf2k::has_gsq_gate(manifest))) {
+                  const auto pool_plan=strix::mtp_qsa_pool_plan(options.context_tokens);
+                  // Preserve the existing independent budgets and physical headroom. The service
+                  // is charged once outside the R2/R4/R8 loop, including the predictor entry.
+                  std::uint64_t window_bytes=0;
+                  for(const auto wr:row_set) {
+                      const auto wp=strix::compile_known_prefix_window(model,compiled,manifest,tensor_access,
+                          {true,true,true,wr,options.mtp.window_expert_union,strix::KnownWindowOutputPolicy::all_rows,
+                           options.mtp.window_hyper_mix,options.mtp.window_qsa_rows,options.mtp.window_prefix,options.mtp.window_prefix,
+                           options.mtp.window_prefix,options.mtp.window_prefix || options.known_window_router_rows,
+                           options.mtp.window_prefix || options.known_window_router_rows,
+                           options.rotary.mode()==strix::RotaryMode::yarn});
+                      const auto ub=options.mtp.window_expert_union?strix::q51_known_rows::required_scratch_bytes(wr,
+                          static_cast<std::uint32_t>(model.num_experts),static_cast<std::uint32_t>(model.num_experts_per_token)):0U;
+                      window_bytes=strix::mtp_native::sum(window_bytes,strix::mtp_native::sum(wp.arena.physical.total_bytes,8U+ub));
+                  }
+                  std::uint64_t captures=0;
+                  for(const auto wr:row_set) captures=strix::mtp_native::sum(captures,strix::mtp_native::product(4U,
+                      strix::mtp_payload::window_capture(model,wr,options.mtp.window_history_intervals,manifest.tensors.size())));
+                  const auto checkpoint=options.mtp.window_prefix?0U:strix::plan_hip_mtp_target_window_rollback(model,*request_parents->resources.session_state_layout,
+                      0,options.mtp.window_rows,true).reservation.retained_bytes;
+                  const bool fits=strix::mtp_qsa_pool_fits(pool_plan,options.mtp.window_total_bytes,window_bytes,captures,checkpoint);
+                  if (fits) {
+                      request_parents->resources.qsa_committed_pool=strix::HipQsaCommittedPool::create(pool_plan);
+                      if(request_parents->resources.qsa_committed_pool) {
+                          request_parents->resources.qsa_committed_pool->bind_domain(false,
+                              request_parents->resources.model_weights->model_content_identity,compiled.execution_identity);
+                          pool_reservation=pool_plan.reserved_bytes;
+                      }
+                  }
+                  if (!pool_reservation && yarn)
+                      throw std::runtime_error("YaRN MTP M1 admission/allocation refused; historical owners require a separate run with STRIX_QSA_MTP_POOL=0");
+                  if (!pool_reservation) std::cerr << "qsa-mtp-pool requested=1 enabled=0 reason=admission-or-allocation\n";
+              } else if(options.mtp.enabled) {
+                  const char* reason=strix::decode_cli::qsa_mtp_pool_decline(options,strix::qpf2k::has_gsq_gate(manifest));
+                  if(reason && std::string_view(reason)!="disabled")
+                      std::cerr << "qsa-mtp-pool requested=1 enabled=0 reason=" << reason << '\n';
+              }
+              return pool_reservation;
+        };
         const auto window_factory_for = [&](std::shared_ptr<strix::decode_cli::MtpDecodeTargetParents> request_parents,
             std::shared_ptr<const SharedWindowStream> window_stream) -> strix::decode_cli::MtpDecodeWindowFactory {
             if (!options.mtp.window_rows || (options.session_mtp_fixed && !options.http_serve)) return {};
@@ -3227,13 +3414,15 @@ int STRIX_DECODE_ENTRY(
               const auto row_set = options.mtp.window_rows_set.empty()
                   ? std::vector<std::uint32_t>{options.mtp.window_rows} : options.mtp.window_rows_set;
               std::vector<std::shared_ptr<strix::HipKnownPrefixWindow>> owners;
-              std::uint64_t retained_total = 0, union_total = 0, union_steps = 0, union_generation = 0;
+              const auto pool_reservation=prepare_mtp_pool(request_parents.get());
+              std::uint64_t retained_total = pool_reservation, union_total = 0, union_steps = 0, union_generation = 0;
               for (const auto window_rows : row_set) {
                 const auto plan = strix::compile_known_prefix_window(model, compiled, manifest, tensor_access,
                     {true, true, true, window_rows, options.mtp.window_expert_union, strix::KnownWindowOutputPolicy::all_rows,
                      options.mtp.window_hyper_mix, options.mtp.window_qsa_rows, options.mtp.window_prefix, options.mtp.window_prefix,
                      options.mtp.window_prefix, options.mtp.window_prefix || options.known_window_router_rows,
-                     options.mtp.window_prefix || options.known_window_router_rows});
+                     options.mtp.window_prefix || options.known_window_router_rows,
+                     options.rotary.mode()==strix::RotaryMode::yarn});
                 if (!strix::known_window_has_promoted_steps(plan) ||
                     (options.mtp.window_expert_union && !plan.routed_expert_union_steps) ||
                     (options.mtp.window_hyper_mix && !plan.hyper_mix_rows_steps) ||
@@ -3252,7 +3441,7 @@ int STRIX_DECODE_ENTRY(
                     if (!union_bytes) throw std::logic_error("MTP expert union has no required scratch");
                 }
                 const auto reservation = strix::decode_cli::reserve_mtp_window_memory(plan.arena.physical.total_bytes,
-                    options.mtp.window_arena_bytes - std::min(retained_total, options.mtp.window_arena_bytes),
+                    options.mtp.window_arena_bytes - std::min(retained_total-pool_reservation, options.mtp.window_arena_bytes),
                     options.mtp.window_total_bytes - std::min(retained_total, options.mtp.window_total_bytes),
                     union_bytes, options.mtp.window_expert_union_bytes - std::min(union_total, options.mtp.window_expert_union_bytes));
                 auto window_memory = std::make_shared<KnownPromptMemory>(plan, generations.next(), generations.next(),
@@ -3553,6 +3742,20 @@ int STRIX_DECODE_ENTRY(
                     startup_preflight, release_assets)
                 : strix::decode_cli::make_cohort_tiled_run(options, model, std::cout);
         }
+        if(strix::decode_cli::mtp_prompt_phase_separation(options)) {
+            parents->prepare_prompt_pool = [&, p=parents.get()] { (void)prepare_mtp_pool(p); };
+            parents->retire_prompt = [&, p=parents.get()] {
+                // run_tiled_mtp_prompt has destroyed its tap pipeline and completed
+                // priming/adoption. Clear every caller/parent pin, then the globals.
+                p->tiled.reset_prefill_memory={};
+                p->tiled.blocks=nullptr;p->tiled.block_owner.reset();p->tiled.tails.clear();
+                known_prefix_backend.reset();known_tail_backends.clear();
+                known_prefix_owner.reset();known_tail_owners.clear();
+                known_prefix_memory.reset();known_tail_memories.clear();
+                known_prefill_plan.reset();known_tail_plans.clear();known_prefix_plan.reset();
+                strix::release_hip_qsa_prefill_storage();
+            };
+        }
         auto make_window = window_factory_for(parents, batch_stream);
         if (options.http_serve && !batch_slots)
             parents->serve = strix::decode_cli::make_http_serve(options, "native MTP greedy decode, profile " +
@@ -3565,13 +3768,18 @@ int STRIX_DECODE_ENTRY(
         auto request_options = options;
         for (std::uint32_t repeat = 0; repeat < options.mtp.sample_repeats; ++repeat) {
             if (repeat) {
+                if (ple_reclaimer) {
+                    ple_turn = ple_reclaimer->begin_turn();
+                    mtp_mapped_ple_owner->bind_residency(ple_turn);
+                }
                 strix::initialize_hip_fresh_runtime_memory(memory.scratch(), memory.state());
                 session = fresh_session;
             }
             request_options.mtp.sample_seed = options.mtp.sample_seed + repeat;
             strix::decode_cli::run_mtp_decode_bridge(request_options, model, compiled, parents, session, direct_dispatcher,
                 generations, catalog_config.deferred_moe_status, optimization_profile.selected, std::cout, make_window,
-                [&] { return execution_inventory_receipt + ple_cache_completed_receipt() + dense_trellis_configuration_receipt + dense_trellis_completed_receipt(); }
+                [&] { return execution_inventory_receipt + ple_cache_completed_receipt() + dense_trellis_configuration_receipt + dense_trellis_completed_receipt() +
+                    (ple_turn ? "  \"ple_reclaim\":" + ple_reclaimer->receipt_json() + ",\n" : std::string{}); }
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
                 , strix::tests::mtp_component_diagnostic_requested()
                     ? strix::decode_cli::MtpDecodeQualification{} : strix::decode_cli::MtpDecodeQualification{strix::tests::run_mtp_model_qualification}
@@ -3581,8 +3789,11 @@ int STRIX_DECODE_ENTRY(
                 , strix::tests::mtp_prefix_gate_requested()
 #endif
                 );
+            if (ple_turn) ple_turn->finish();
             std::cout.flush();
         }
+        if (yarn_watchdog) yarn_watchdog->complete();
+        if (ple_reclaimer) ple_reclaimer->finish();
         if (prefix_store) prefix_store->flush();
         return 0;
     }
@@ -3666,6 +3877,7 @@ int STRIX_DECODE_ENTRY(
     auto moe_token_schedule = strix::MoeTokenSchedule::fork_join;
     std::uint64_t input_access_epoch = 1;
     const std::function<void(std::uint32_t)> execute_native_token = [&](std::uint32_t token) {
+        strix::decode_cli::check_yarn_memory();
         auto correlation = strix::current_execution_correlation();
         correlation.position = session.next_position;
         correlation.execution_identity = compiled.execution_identity;
@@ -3714,6 +3926,7 @@ int STRIX_DECODE_ENTRY(
             check_hip(hipDeviceSynchronize(), "native token original-device completion");
             original_work_device->require_original();
         }
+        strix::decode_cli::check_yarn_memory();
     };
 
     std::unique_ptr<strix::RawBaselineRecording> raw_recording;
@@ -4178,6 +4391,9 @@ int STRIX_DECODE_ENTRY(
             std::move(greedy_recording), raw_require_identity, raw_drain_or_fail,
             execute_native_token, false, options.deferred_moe_status, greedy_output.get(), output_dispatcher.get());
 
+        strix::SerialStepLogitsDiagnostic serial_step_ledger(options.tokens.size()-1U,model.vocab_size);
+        if(strix::mtp_step_logits_digest_enabled()) backend.set_logits_observer(
+            [&](std::uint64_t p,std::span<const float> values){serial_step_ledger.row(p,values);});
         strix::SerialGreedyRequest request;
         request.prefix_tokens =
             options.tokens;
@@ -4434,13 +4650,27 @@ int STRIX_DECODE_ENTRY(
             }
             // One complete configured window or one unpadded serial suffix row per call.
             const auto prefill_start = std::chrono::steady_clock::now();
-            while (chunks.advance()) if (prefix_state) {
-                prefix_state->observe_serial_unit(chunks.last_unit());
-                prefix_state->after_block(session,prompt);
+            for (;;) {
+                strix::decode_cli::check_yarn_memory();
+                if (!chunks.advance()) break;
+                strix::decode_cli::check_yarn_memory();
+                if (prefix_state) {
+                    prefix_state->observe_serial_unit(chunks.last_unit());
+                    prefix_state->after_block(session,prompt);
+                }
             }
             if (session_cache_enabled) std::cerr << "session initial_prefill_ms=" << std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - prefill_start).count() << '\n';
             const auto initial_generation_start = std::chrono::steady_clock::now();
+            if(strix::mtp_step_logits_digest_enabled() && serial_step_ledger.empty())
+                serial_step_ledger.row(session.next_position-1U,chunks.frontier().logits);
+            if(session_registry && strix::decode_cli::prompt_state_digest_request()) {
+                const auto frontier=chunks.frontier();
+                const auto pending=strix::select_greedy_token(frontier.logits,model.vocab_size);
+                std::fprintf(stderr,"qwen-target-state phase=prompt position=%llu sha256=%s\n",
+                    static_cast<unsigned long long>(session.next_position),
+                    strix::model_content_identity_hex(session_registry->target_state_digest(session.next_position,prompt,pending)).c_str());
+            }
             const auto& generated = chunks.finish_greedy();
             if (session_cache_enabled) std::cerr << "session initial_generation_ms=" << std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - initial_generation_start).count() << '\n';
@@ -4559,6 +4789,16 @@ int STRIX_DECODE_ENTRY(
                 : strix::execute_serial_greedy_request(request, *generation_backend);
             return run_known_prompt(options.tokens);
         }();
+        serial_step_ledger.finish(session.next_position);
+        if(session_registry && strix::decode_cli::prompt_state_digest_request()) {
+            auto consumed=options.tokens;
+            if(!result.generated_tokens.empty()) consumed.insert(consumed.end(),result.generated_tokens.begin(),result.generated_tokens.end()-1);
+            std::optional<std::uint32_t> pending;
+            if(!result.generated_tokens.empty()) pending.emplace(result.generated_tokens.back());
+            std::fprintf(stderr,"qwen-target-state phase=final position=%llu sha256=%s\n",
+                static_cast<unsigned long long>(session.next_position),
+                strix::model_content_identity_hex(session_registry->target_state_digest(session.next_position,consumed,pending)).c_str());
+        }
         if (session_cache_enabled) {
             if (options.session_load.empty()) session_history = options.tokens;
             remember_session_generation(result);
@@ -4733,7 +4973,8 @@ int STRIX_DECODE_ENTRY(
                 });
         }
         bitcalc.finish();
-        std::cout << "{\n" << optimization_profile_receipt << dense_trellis_completed_receipt() << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt << model_copy_receipt;
+        const auto yarn_memory_completed_receipt = strix::decode_cli::yarn_memory_receipt(true);
+        std::cout << "{\n" << yarn_memory_completed_receipt << optimization_profile_receipt << dense_trellis_completed_receipt() << eager_submission_receipt << overlap_receipt() << execution_inventory_receipt << gdn_output_mode_receipt() << wave_router_mode_receipt << deferred_moe_mode_receipt << model_copy_receipt;
         if (token_cost_backend) {
             const auto observed = token_cost_backend->stats();
             const strix::ObservedMoeTokenCostPolicy policy{};
@@ -5397,6 +5638,14 @@ int STRIX_DECODE_ENTRY(
                    !replay_assessment->passes_declared_policy
                ? 2
                : 0;
+} catch (const strix::decode_cli::YarnMemoryPressure& error) {
+    std::cerr << "strix-hip-decode-token: " << error.what() << '\n';
+    std::cout << "{\"stop_reason\":\"yarn-memory-watchdog\"," << error.receipt() << "}\n";
+    return 1;
+} catch (const strix::ple_reclaim::DirectError& error) {
+    std::cerr << "strix-hip-decode-token: PLE runtime read failed after source admission; canonical state may be mutated; "
+        "resident restart requires a fresh invocation: " << error.what() << '\n';
+    return 1;
 } catch (const std::exception& error) {
     std::cerr
         << "strix-hip-decode-token: "

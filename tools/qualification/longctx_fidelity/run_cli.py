@@ -22,6 +22,27 @@ except ImportError:
     from plan import predicted
 
 
+def validate_mtp_timing_receipt(config, result):
+    """Require actual MTP work before labelling a completed receipt as MTP timing."""
+    if config.get("yarn_decode_route", {}).get("effective") != "mtp":
+        raise ValueError("MTP timing requires effective MTP route")
+    for name in ("mtp_accepted_candidates", "mtp_proposed_candidates", "mtp_paid_drafts"):
+        value = result.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("MTP timing missing valid " + name)
+    rows = result.get("mtp_chosen_window_rows_histogram")
+    if not isinstance(rows, dict) or not rows or any(isinstance(x, bool) or not isinstance(x, int) or x < 0 for x in rows.values()):
+        raise ValueError("MTP timing missing valid window histogram")
+    if result["mtp_paid_drafts"] == 0 or result["mtp_proposed_candidates"] == 0:
+        raise ValueError("MTP timing has no paid/proposed draft coverage")
+    tokens = result.get("generated_tokens")
+    if not isinstance(tokens, list) or not tokens or result.get("emitted_tokens") != len(tokens):
+        raise ValueError("MTP timing missing complete emitted token count")
+    elapsed = result.get("generation_ms")
+    if isinstance(elapsed, bool) or not isinstance(elapsed, (float, int)) or not (0 < elapsed < float("inf")):
+        raise ValueError("MTP timing missing finite positive generation_ms")
+
+
 def clean_env(allowed=()):
     env = {k: os.environ[k] for k in ("PATH", "LD_LIBRARY_PATH", "HOME") if k in os.environ}
     for item in allowed:
@@ -203,6 +224,8 @@ def run_cases(binary, model, model_receipt, turn_list, out, allowed=(), soft=500
                         parsed = parse_output(result.stdout.decode("utf-8"))
                         if parsed.get("prefix_tokens") != ids:
                             raise ValueError("CLI echoed prompt IDs differ")
+                        if case.get("expected_decode_route") == "mtp":
+                            validate_mtp_timing_receipt(receipt["resolved"], parsed)
                         receipt["generated_tokens"] = parsed["generated_tokens"]
                         receipt["stop_reason"] = parsed["stop_reason"]
                         if parsed["stop_reason"] == "eos" and parsed["generated_tokens"][-1:] != [NATIVE_EOS_ID]:

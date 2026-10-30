@@ -1,5 +1,7 @@
+#include "strix/ctx_exact_memory.hpp"
 #pragma once
 #include "strix/rotary_descriptor.hpp"
+#include "strix/qsa_committed_pool.hpp"
 #include <iostream>
 #include "state_cache_stats.hpp"
 #include "strix/decode_execution_options.hpp"
@@ -240,6 +242,10 @@ struct Options {
     strix::RotaryDescriptor rotary = strix::RotaryDescriptor::native();
     bool automatic_prefill = false;
     bool route_owned = false;
+    bool yarn_mtp_draft_top2=false,yarn_mtp_q4_all=true,yarn_mtp_greedy_rows=true,yarn_mtp_pipeline=true;
+    bool yarn_mtp_pool_off = false;
+    bool ple_rolling_explicit_opt_in = false, qsa_mtp_pool_explicit_opt_in = false;
+    bool mtp_cli_phase_retirement = true;
     bool prefill_profile_automatic = false;
     bool prefill_profile_deferred = false;
     std::set<std::string> disabled_prefill_features;
@@ -459,33 +465,95 @@ struct Options {
     std::uint32_t rtx_state_import_decode_threads = 4;
 };
 
-// Shared by runtime setup and pre-HIP memory admission.
-[[nodiscard]] inline bool ple_reclaim_route_supported(const Options& options,
-    const HipModelResidencyPolicy& residency_policy, bool graph_mode) noexcept {
-    // Continuations do not match the position-zero prompt hashes, prefetch plan or reclaim credit.
-    return options.session_load.empty() && !options.session_live_control && options.session_then_prompt.empty() &&
-        options.residency == HipModelResidencyMode::registered_file_mapping &&
-        residency_policy.copy_tier == HipModelCopyTier::none && !residency_policy.promote_file_backed_candidates &&
-        !graph_mode && options.known_prefix_prefill_rows && !options.tokens.empty() && !options.http_serve &&
-        options.mtp.cohort.empty() && options.serving_prefix_files.empty() && !options.mtp.enabled &&
-        !options.planned_ple_io;
+// Prefix-cache requests may restore or replace the original prompt in this process.
+// Keep their public prompt-wide PLE path until rolling owners are rebuilt per prompt.
+[[nodiscard]] inline bool ple_rolling_default_qualified(const Options& options) noexcept {
+    return !options.mtp.enabled || options.rotary.mode()!=RotaryMode::yarn ||
+        ((options.rotary.factor()==2U && options.context_tokens<=524288U) ||
+         (options.rotary.factor()==4U && options.context_tokens<=1048576U));
+}
+[[nodiscard]] inline bool ple_rolling_prompt_supported(const Options& options) noexcept {
+    const char* explicit_on=std::getenv("STRIX_PLE_ROLLING");
+    if (!ple_rolling_default_qualified(options) && !options.ple_rolling_explicit_opt_in &&
+        !(explicit_on && std::string_view(explicit_on)=="1")) return false;
+    return !options.prefix_cache_host_bytes && options.prefix_cache_dir.empty() &&
+        options.prefix_cache_then_prompts.empty() && !options.rtx_state_import;
 }
 
-// Auto and explicit =1 share the original route gate; only =1 refuses an unsupported route.
+// Shared by runtime setup, pre-HIP admission and the inactive witness.
+[[nodiscard]] inline std::string_view ple_mtp_lease_inactive_reason() noexcept {
+    const auto disabled = [](const char* value) { return value && value[0] == '0'; };
+    if (disabled(std::getenv("STRIX_PLE_ROLLING"))) return "rolling-disabled";
+    if (!ctx_exact_memory_enabled("STRIX_PLE_ROLLING")) return "exact-memory-disabled";
+    const char* controller = std::getenv("STRIX_MTP_CONTROLLER");
+    if (controller && std::string_view(controller) == "depth") return "mtp-depth-controller";
+    if (controller && std::string_view(controller) == "survival") return "mtp-survival-controller";
+    return {};
+}
+
+[[nodiscard]] inline std::string_view ple_reclaim_inactive_reason(const Options& options,
+    const HipModelResidencyPolicy& policy, bool graph_mode, bool leased_mtp = false) noexcept {
+    if (!options.session_load.empty() || options.session_live_control || !options.session_then_prompt.empty())
+        return "session-continuation";
+    if (options.residency != HipModelResidencyMode::registered_file_mapping) return "residency-not-register";
+    if (policy.copy_tier != HipModelCopyTier::none) return "model-copy-tier";
+    if (policy.promote_file_backed_candidates) return "model-promotion";
+    if (graph_mode) return "graph-mode";
+    if (!options.known_prefix_prefill_rows) return "untiled-prompt";
+    if (options.tokens.empty()) return "empty-prompt";
+    if (options.http_serve) return "http-serving";
+    if (!options.mtp.cohort.empty()) return "mtp-cohort";
+    if (!options.serving_prefix_files.empty()) return "serving-prefix-files";
+    if (options.mtp.enabled) {
+        if (options.session_mtp_fixed) return "session-fixed-mtp";
+        if (options.mtp.metadata_only) return "mtp-metadata-only";
+        if (!options.mtp.golden_dump.empty() && options.rotary.mode()!=RotaryMode::yarn) return "mtp-golden-dump";
+        if (options.mtp.sample_timing_schedule) return "mtp-sample-timing-schedule";
+        if (!options.mtp.copy_wide_rows.empty()) return "mtp-copy-wide-rows";
+        if (options.prefix_cache_host_bytes || !options.prefix_cache_dir.empty()) return "prefix-cache-restore";
+        if (options.rtx_state_import) return "rtx-state-import";
+        if (!ple_rolling_prompt_supported(options)) return "unqualified-route-requires-STRIX_PLE_ROLLING=1";
+        if (!options.raw_recording_path.empty()) return "raw-recording";
+        if (!options.validation_final_state_path.empty()) return "validation-final-state";
+        if (!leased_mtp) {
+            const auto reason = ple_mtp_lease_inactive_reason();
+            return reason.empty() ? "mtp-leases-required" : reason;
+        }
+    }
+    if (options.planned_ple_io) return "planned-ple-io";
+    return {};
+}
+
+[[nodiscard]] inline std::string ple_reclaim_inactive_witness(const Options& options,
+    const HipModelResidencyPolicy& policy, bool graph_mode) {
+    const auto reason = ple_reclaim_inactive_reason(options, policy, graph_mode, ple_mtp_lease_inactive_reason().empty());
+    return "ple-rolling: inactive; " + std::string(reason.empty() ? "platform-unsupported" : reason) + "\n";
+}
+
+[[nodiscard]] inline bool ple_reclaim_route_supported(const Options& options,
+    const HipModelResidencyPolicy& policy, bool graph_mode, bool leased_mtp = false) noexcept {
+    return ple_reclaim_inactive_reason(options, policy, graph_mode, leased_mtp).empty();
+}
+
+// Auto skips unsupported routes; explicit =1 refuses with the same reason.
 [[nodiscard]] inline ple_reclaim::Mode ple_reclaim_mode(const Options& options,
     const HipModelResidencyPolicy& residency_policy, bool graph_mode) {
     const auto mode = ple_reclaim::requested();
     if (mode == ple_reclaim::Mode::off) return mode;
-    if (!ple_reclaim_route_supported(options, residency_policy, graph_mode)) {
+    const bool leased_mtp = ple_mtp_lease_inactive_reason().empty();
+    const auto reason = ple_reclaim_inactive_reason(options, residency_policy, graph_mode, leased_mtp);
+    if (!reason.empty()) {
         if (mode == ple_reclaim::Mode::required)
-            throw std::invalid_argument("STRIX_PLE_RECLAIMABLE=1 requires --residency register without model copies or graph mode, "
-                "a tiled known prefill (--known-prefix-prefill-rows) and a plain-route CLI prompt (no MTP route, no "
-                "--planned-ple-io, --http-serve, --serving-prefix-file or session continuations)");
+            throw std::invalid_argument("STRIX_PLE_RECLAIMABLE=1 requires an admitted eager tiled CLI route; inactive: " +
+                std::string(reason));
         return ple_reclaim::Mode::off;
     }
 #if !defined(__linux__)
     if (mode == ple_reclaim::Mode::automatic) return ple_reclaim::Mode::off;
 #endif
+    if (options.mtp.enabled && (options.tokens.size() > options.context_tokens ||
+        options.generate_tokens > options.context_tokens - options.tokens.size()))
+        throw std::invalid_argument("MTP rolling admission requires prompt + reserved generation <= allocated context");
     return mode;
 }
 
@@ -784,6 +852,22 @@ inline void validate_resolved_teacher_forced_score(const Options& options, std::
 [[nodiscard]] inline bool mtp_tiled_prompt(const Options& o) noexcept {
     return o.mtp.enabled && o.known_prefix_window && o.known_prefix_full_rows && o.known_prefix_prefill_rows;
 }
+// One closed CLI prompt. Replayed, segmented and reusable owners keep their legacy layout/lifetime.
+[[nodiscard]] inline bool mtp_single_prompt_cli(const Options& o) noexcept {
+    return mtp_tiled_prompt(o) && !o.http_serve && o.mtp.cohort.empty() && o.mtp.copy_wide_rows.empty() &&
+        o.mtp.sample_repeats == 1U && !o.session_management_requested && !o.session_mtp_fixed &&
+        !o.rtx_state_import && !o.prefix_cache_roundtrip && !o.prefix_cache_host_bytes &&
+        o.prefix_cache_dir.empty() && o.prefix_cache_then_prompts.empty() && !o.prompt_lookup &&
+        !o.teacher_forced_score && o.execution.mode == DecodeExecutionMode::eager &&
+        o.known_prefix_output_policy == KnownWindowOutputPolicy::terminal_row;
+}
+[[nodiscard]] inline bool mtp_prompt_phase_separation(const Options& o) noexcept {
+    return o.mtp_cli_phase_retirement && mtp_single_prompt_cli(o) && o.rotary.mode()==RotaryMode::yarn &&
+        !o.mtp.metadata_only && o.mtp.golden_dump.empty() && !o.tokens.empty() && o.tokens.size()%128U==0U;
+}
+[[nodiscard]] inline bool compact_prompt_memory(const Options& o) noexcept {
+    return !o.http_serve && (!o.mtp.enabled || mtp_single_prompt_cli(o));
+}
 [[nodiscard]] inline bool http_prefill_pending(const Options& o) noexcept {
     return o.http_serve && !o.known_prefix_prefill_rows && !o.known_prefix_prefill_explicit &&
         !o.known_prefix_rows_explicit;
@@ -832,6 +916,42 @@ inline void validate_resolved_teacher_forced_score(const Options& options, std::
     const auto blocks = o.context_tokens / model.indexer_compress_ratio;
     const auto groups = std::max<std::uint64_t>((blocks + 3U) / 4U, 16384U);
     return model.full_attention_layers * blocks * model.indexer_head_dim * qsa_decode_pool_key_bytes(o, gsq) + groups * sizeof(float);
+}
+
+// Separate admission from the append-only serial route. All consumers of this route
+// borrow one request owner; wide/cohort/graph and explicit FP32 remain historical.
+[[nodiscard]] inline const char* qsa_mtp_pool_decline(const Options& o,bool gsq=false) noexcept {
+    if (!o.mtp.enabled) return "not-mtp";
+    if (o.yarn_mtp_pool_off) return "disabled";
+    if (!qpf2k::long_context_item_enabled("STRIX_QSA_MTP_POOL",gsq) || o.baseline) return "disabled";
+    const bool qualified_cli=!o.http_serve && o.session_load.empty() && o.session_save.empty() &&
+        !o.session_live_control && o.session_then_prompt.empty() && !o.session_mtp_fixed &&
+        !o.session_management_requested && !o.prefix_cache_host_bytes && o.prefix_cache_dir.empty() &&
+        o.prefix_cache_then_prompts.empty() && o.serving_prefix_files.empty() && !o.rtx_state_import && !o.prefix_cache_roundtrip &&
+        o.mtp.sample_repeats==1U &&
+        (o.rotary.mode()!=RotaryMode::yarn ||
+         (o.rotary.factor()==2U && o.context_tokens<=524288U) ||
+         (o.rotary.factor()==4U && o.context_tokens<=1048576U));
+    const char* explicit_on=std::getenv("STRIX_QSA_MTP_POOL");
+    if (!qualified_cli && !o.qsa_mtp_pool_explicit_opt_in && !(explicit_on && std::string_view(explicit_on)=="1"))
+        return "unqualified-route-requires-STRIX_QSA_MTP_POOL=1";
+    if (!qpf2k::long_context_item_enabled("STRIX_QSA_DECODE_POOL_BF16",gsq)) return "bf16-disabled";
+    if (o.execution.mode==DecodeExecutionMode::graph || o.qsa_hierarchical_selection) return "unsupported-control";
+    if (!o.mtp.cohort.empty() || !o.mtp.copy_wide_rows.empty()) return "unconverted-writer-span";
+    if (o.rotary.mode()==RotaryMode::yarn &&
+        (!o.context_tokens || o.context_tokens>o.rotary.effective_max() ||
+         o.rotary.factor()!=(o.context_tokens<=524288U?2U:4U))) return "unqualified-rotary";
+    if (!o.mtp.window_rows || o.mtp.window_rows>8 || !o.mtp.window_qsa_rows || o.mtp.candidate_depth>8 ||
+        o.mtp.metadata_only || !o.mtp.golden_dump.empty()) return "unconverted-route";
+    return nullptr;
+}
+[[nodiscard]] inline bool qsa_mtp_pool_route(const Options& o,bool gsq=false) noexcept {
+    return qsa_mtp_pool_decline(o,gsq)==nullptr;
+}
+[[nodiscard]] inline std::uint64_t qsa_mtp_pool_bytes(const Options& o,const ModelContract& model,bool gsq=false) {
+    if (!qsa_mtp_pool_route(o,gsq) || model.full_attention_layers!=12 || model.indexer_head_dim!=128 ||
+        model.indexer_n_heads!=4 || model.indexer_compress_ratio!=4) return 0;
+    return mtp_qsa_pool_plan(o.context_tokens).reserved_bytes;
 }
 
 // The prefix state cache restores and captures whole tiled blocks: it runs only on the tiled
@@ -1369,7 +1489,36 @@ inline std::string yarn_route_refusal(const Options& o) {
     if (o.session_options_requested || !o.session_save.empty() || !o.session_load.empty())
         return "YaRN with session save/restore not yet qualified";
     if (prefix_state_cache_requested(o)) return "YaRN with prefix state cache not yet qualified";
-    if (o.mtp.enabled || o.mtp.supplied || !o.mtp.cohort.empty()) return "YaRN with MTP not yet qualified";
+    if (o.mtp.enabled) {
+        if(o.rotary.factor()!=(o.context_tokens<=524288U?2U:4U))
+            return "YaRN MTP requires f2 at C<=524288 and f4 at C<=1048576";
+        if(!o.mtp.cohort.empty() || !o.mtp.copy_wide_rows.empty() || o.mtp.sample_options ||
+            o.mtp.metadata_only || o.mtp.ngram_copy_edit)
+            return "YaRN MTP cohort/wide/sampling/metadata routes are not supported";
+        // Explicit qualification assets remain mandatory. Only this target organization is admitted.
+        for(const auto& flag:o.supplied_options) {
+            if(flag.starts_with("--mtp") || flag=="--prefix-batch-cert" || flag=="--rope-yarn" || flag=="--context" || flag=="--generate" ||
+               flag=="--unqualified-context" || flag=="--print-effective-config" || flag=="--prompt-ids" ||
+               flag=="--optimization-profile" || flag=="--known-prefix-window" || flag=="--known-prefix-full-rows" ||
+               flag=="--known-prefix-expert-union" || flag=="--known-window-router-rows" ||
+               flag=="--known-prefix-prefill-rows" || flag=="--known-prefix-tail-rows" ||
+               flag=="--known-prefill-workspace-budget" || flag=="--known-prefill-metadata-budget" ||
+               flag=="--known-prefill-uma-budget" || flag=="--known-prefill-host-headroom" ||
+               flag=="--known-prefix-workspace-budget-bytes" || flag=="--known-prefix-host-metadata-budget-bytes" ||
+               flag=="--known-prefix-uma-budget-bytes" || flag=="--known-prefix-host-headroom-bytes") continue;
+            const std::array canonical_flags{
+                "--parallel-hyper-mix","--staged-hyper-projections","--fused-staged-hyper-mix",
+                "--typed-fused-hyper-projections","--prefetch-typed-hyper-rows","--prefetch-q8-hyper-output",
+                "--lane-chain-hyper-output","--prefetch-q8-qsa-input","--parallel-moe-router","--wave-moe-router-topk",
+                "--virtual-q8-gdn-input","--prefetch-q8-gdn-input","--virtual-q8-gdn-output","--deferred-moe-status",
+                "--prefetch-q8-shared-expert","--q4k-a8g32-gate-up","--grouped-exact-q51-down","--virtual-q8-lm-head",
+                "--q51-slot-parallel-down","--batched-moe-activation","--wave8-q8-gdn-input","--wave8-q8-gdn-output",
+                "--prefetch-q8-lm-head","--wave8-q8-lm-head","--wave8-q8-qsa-output","--execution-mode","--residency",
+                "--numerical-profile","--prefill-numerical-profile","--known-prefix-output-policy"};
+            if(std::find(canonical_flags.begin(),canonical_flags.end(),flag)!=canonical_flags.end()) continue;
+            return "YaRN MTP explicit target override not supported: "+flag;
+        }
+    } else if(o.mtp.supplied) return "YaRN MTP parameters require --mtp";
     if (o.http_serve || o.http_batch) return "YaRN on HTTP serving not supported";
     if (o.teacher_forced_score) return "YaRN with teacher scoring not yet qualified";
     if (o.execution.mode != DecodeExecutionMode::eager || o.gdn_islands || o.prepared_eager)
@@ -1378,8 +1527,12 @@ inline std::string yarn_route_refusal(const Options& o) {
     if (o.prompt_lookup || o.prefix_cache_roundtrip || !o.serving_prefix_files.empty() ||
         !o.raw_recording_path.empty() || !o.validation_final_state_path.empty() || !o.reference_path.empty())
         return "YaRN requires plain serial CLI without cache, replay or recording";
-    if (o.any_low_level_flag || o.route_owned || o.known_prefix_window || o.numerical_profile_explicit ||
-        o.prefill_numerical_profile || o.residency != HipModelResidencyMode::registered_file_mapping ||
+    if(o.mtp.enabled && ((o.numerical_profile_explicit && o.numerical_profile!=DecodeNumericalProfile::hc_splitk_f32_q51_q80_a8_down_q5k_a8_gateup_dense_a8_v1) ||
+        (o.prefill_numerical_profile && *o.prefill_numerical_profile!=DecodeNumericalProfile::fast_prefill_f16wmma_v1) ||
+        (o.supplied_options.contains("--known-prefix-output-policy") && o.known_prefix_output_policy!=KnownWindowOutputPolicy::terminal_row)))
+        return "YaRN MTP explicit target profile/output policy differs from the closed organization";
+    if ((!o.mtp.enabled && (o.any_low_level_flag || o.route_owned || o.known_prefix_window || o.numerical_profile_explicit ||
+        o.prefill_numerical_profile)) || o.residency != HipModelResidencyMode::registered_file_mapping ||
         o.execution.integer_head != DecodeIntegerHead::none || o.ple_cache_rows ||
         !o.dense_q6p_pack_path.empty() || !o.dense_trellis_pack_path.empty())
         return "YaRN explicit execution route not yet qualified";
@@ -2847,6 +3000,10 @@ inline Options parse_options(
         const auto reason = yarn_route_refusal(options);
         if (!reason.empty()) throw std::invalid_argument(reason);
         options.unqualified_context = true;
+        if(options.mtp.enabled) {
+            options.known_prefix_window=options.known_prefix_full_rows=true;
+            if(!options.known_prefix_prefill_rows) options.known_prefix_prefill_rows=8192U;
+        }
     }
     if (options.context_tokens == 0) {
         throw std::invalid_argument(

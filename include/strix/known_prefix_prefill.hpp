@@ -28,6 +28,8 @@ struct KnownPrefillRequest {
     // Compile-time promise: the owner installs the full-T ring-binding QSA entry.
     // Optional-entry clients retain embedded scores unless they make this promise.
     bool full_qsa_score_ring_entry=false;
+    // Zero retains the environment/default contract for existing callers.
+    std::uint32_t qsa_score_ring_rows=0;
 };
 struct CompiledKnownPrefixPrefill {
     std::uint32_t logical_rows=0;

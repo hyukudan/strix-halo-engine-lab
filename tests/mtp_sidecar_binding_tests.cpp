@@ -1,4 +1,5 @@
 #include "strix/mtp_sidecar_binding.hpp"
+#include "rotary_mock.hpp"
 #include "strix/mtp_output_contract.hpp"
 #include "strix/compiled_mtp_draft_plan.hpp"
 #include <iostream>
@@ -170,5 +171,26 @@ int main() {
     auto stale=shared;stale.actual_target_owner.reset();
     rejects([&]{strix::validate_mtp_shared_target_binding(fixture.model,fixture.sidecar,fixture.sidecar_runtime,
         fixture.target,fixture.target_runtime,id(4),stale);},"sharing retains both actual model owners");
+    for(const auto factor:{2U,4U}) {
+        auto model=fixture.model;model.qwen_rotary_table=mock_rotary(factor);
+        auto info=fixture.info;
+        rejects([&]{(void)strix::build_mtp_sidecar_manifest(model,info,fixture.evidence);},"YaRN requires explicit rotary metadata");
+        strix::gguf::MetadataEntry dim;dim.key="qwen4exp.rope.dimension_count";dim.type=strix::gguf::ValueType::uint32;dim.unsigned_value=64;
+        info.metadata.push_back(dim);
+        strix::gguf::MetadataEntry theta;theta.key="qwen4exp.rope.freq_base";theta.type=strix::gguf::ValueType::float32;theta.floating_value=10000000;
+        info.metadata.push_back(theta);
+        strix::gguf::MetadataEntry sections;sections.key="qwen4exp.rope.dimension_sections";sections.type=strix::gguf::ValueType::array;
+        sections.array_element_type=strix::gguf::ValueType::uint32;sections.array_length=4;sections.unsigned_array={11,11,10,0};
+        info.metadata.push_back(sections);
+        (void)strix::build_mtp_sidecar_manifest(model,info,fixture.evidence);
+        info.metadata.back().unsigned_array[0]++;
+        rejects([&]{(void)strix::build_mtp_sidecar_manifest(model,info,fixture.evidence);},"YaRN sidecar section mismatch");
+        // The shipped GGUFs store the sections as an INT32 array.
+        info.metadata.back().array_element_type=strix::gguf::ValueType::int32;
+        info.metadata.back().unsigned_array.clear();info.metadata.back().signed_array={11,11,10,0};
+        (void)strix::build_mtp_sidecar_manifest(model,info,fixture.evidence);
+        info.metadata.back().signed_array[2]--;
+        rejects([&]{(void)strix::build_mtp_sidecar_manifest(model,info,fixture.evidence);},"YaRN sidecar signed section mismatch");
+    }
     return failures?1:0;
 }

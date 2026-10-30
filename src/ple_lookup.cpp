@@ -1,5 +1,6 @@
 #include "strix/ple_lookup.hpp"
 #include "strix/iq4_nl.hpp"
+#include "strix/ple_reclaim.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -8,6 +9,7 @@
 #include <vector>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace strix {
@@ -254,6 +256,35 @@ PleHashResult hash_ple_token(
     }
 
     return result;
+}
+
+void hash_ple_tokens(const PleHashContract& contract, std::span<const std::uint32_t> tokens,
+    std::span<const std::uint32_t> previous, std::span<PleHashResult> out) {
+    if (contract.ngram_size < 2 || contract.ngram_size > PleHashContract::maximum_ngram ||
+        previous.size() != contract.ngram_size - 1U || out.size() != tokens.size())
+        throw std::invalid_argument("PLE parallel hash geometry mismatch");
+    const auto workers = std::min<std::size_t>(8U, tokens.size());
+    std::vector<std::exception_ptr> errors(workers);
+    const auto hash = [&](std::size_t worker) {
+        try {
+            const auto first = tokens.size() * worker / workers, last = tokens.size() * (worker + 1U) / workers;
+            std::array<std::uint32_t, PleHashContract::maximum_ngram - 1U> context{};
+            for (std::size_t i = 0; i < previous.size(); ++i)
+                context[i] = first + i < previous.size() ? previous[first + i] : tokens[first + i - previous.size()];
+            for (auto r = first; r < last; ++r) {
+                out[r] = hash_ple_token(contract, tokens[r], std::span<const std::uint32_t>(context.data(), previous.size()));
+                std::copy_n(out[r].next_context.begin(), previous.size(), context.begin());
+            }
+        } catch (...) { errors[worker] = std::current_exception(); }
+    };
+    // The guard also joins partial construction if thread creation refuses (no std::jthread: node libstdc++ lacks its
+    // stop-token waits).
+    std::vector<std::thread> threads;
+    struct JoinAll { std::vector<std::thread>& t; ~JoinAll() { for (auto& x : t) if (x.joinable()) x.join(); } } join_all{threads};
+    for (std::size_t t = 1; t < workers; ++t) threads.emplace_back(hash, t);
+    if (workers) hash(0);
+    for (auto& thread : threads) thread.join();
+    for (const auto& error : errors) if (error) std::rethrow_exception(error);
 }
 
 std::uint64_t ple_hash_contract_identity(
@@ -574,6 +605,11 @@ FileMappedPleLookupBackend::start(
         request.row_ids.begin(),
         request.row_ids.end(),
         pending_.row_ids.begin());
+    pending_.mapping_generation = runtime.allocation_generation;
+    pending_.residency = residency_;
+    const auto* rolling_source = ple_reclaim::active();
+    pending_.rolling_source = rolling_source && rolling_source->rolling() ? reinterpret_cast<std::uintptr_t>(rolling_source) : 0U;
+    pending_.residency_epoch = residency_ ? residency_->epoch() : 0U;
     pending_.active = true;
     return pending_.handle;
 }
@@ -598,10 +634,22 @@ void FileMappedPleLookupBackend::finish(
             "PLE lookup destination is undersized");
     }
 
-    const auto* table =
-        reinterpret_cast<
-            const std::byte*>(
-                pending_.table_address);
+    auto* const row_source = ple_reclaim::active();
+    if (pending_.rolling_source && pending_.rolling_source != reinterpret_cast<std::uintptr_t>(row_source))
+        throw std::runtime_error("PLE O_DIRECT: lookup outlived its rolling source binding");
+    if (row_source && row_source->rolling() && pending_.residency && !pending_.residency->owned_sources())
+        throw std::runtime_error("PLE O_DIRECT: unowned turn cannot bypass the rolling source");
+    if (prompt_view_) {
+        const bool valid = pending_.residency
+            ? pending_.residency->owns_prompt_view(*prompt_view_, pending_.table_address,
+                pending_.mapping_generation, pending_.residency_epoch, prompt_offset_)
+            : row_source && row_source->rolling() && pending_.rolling_source &&
+                row_source->owns_prompt_source(*prompt_view_, prompt_table_, prompt_offset_);
+        if (!valid || pending_.table_address != prompt_table_)
+            throw std::runtime_error("PLE O_DIRECT: prompt view does not match its active source");
+    }
+    const bool owned = pending_.residency ? pending_.residency->owned_sources() : (row_source && row_source->rolling());
+    const auto copy = [&] {
     for (std::uint32_t index = 0;
          index < pending_.row_count;
          ++index) {
@@ -619,7 +667,17 @@ void FileMappedPleLookupBackend::finish(
         }
         auto* output = destination.data() + static_cast<std::size_t>(
             checked_mul_lookup(index, pending_.row_bytes));
-        const auto* input = table + static_cast<std::size_t>(offset);
+        thread_local std::vector<std::byte> stored;
+        const std::byte* input;
+        if (owned) {
+            stored.resize(static_cast<std::size_t>(pending_.stored_row_bytes));
+            if (prompt_view_) prompt_view_->copy(prompt_offset_ + offset, stored);
+            else if (pending_.residency) pending_.residency->read_row(pending_.row_ids[index], stored);
+            else row_source->read_row(pending_.table_address, pending_.row_ids[index], stored);
+            input = stored.data();
+        } else {
+            input = reinterpret_cast<const std::byte*>(pending_.table_address) + static_cast<std::size_t>(offset);
+        }
         if (pending_.ggml_type == 30) {
             std::memcpy(output, input, static_cast<std::size_t>(pending_.row_bytes));
             continue;
@@ -652,6 +710,15 @@ void FileMappedPleLookupBackend::finish(
         std::memcpy(final_output, decoded.data(), static_cast<std::size_t>(pending_.row_bytes));
     }
 
+    };
+    if (prompt_view_) copy();
+    else if (pending_.residency)
+        pending_.residency->source(pending_.table_address, pending_.mapping_generation,
+            std::span<const std::uint64_t>(pending_.row_ids.data(), pending_.row_count), copy, pending_.residency_epoch);
+    else if (auto* reclaim = ple_reclaim::active(); reclaim && reclaim->rolling())
+        reclaim->source_copy(pending_.table_address,
+            std::span<const std::uint64_t>(pending_.row_ids.data(), pending_.row_count), copy);
+    else copy();
     pending_ = {};
 }
 

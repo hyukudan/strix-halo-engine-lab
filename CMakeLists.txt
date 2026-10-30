@@ -298,6 +298,8 @@ add_library(strix_core STATIC
     src/session_snapshot.cpp
     src/session_snapshot_memory.cpp
     src/session_snapshot_transfer.cpp
+    src/mtp_target_checkpoint_plan.cpp
+    src/mtp_draft_vocabulary.cpp
     src/session_restore.cpp
     src/sparse_lookup.cpp
     src/sparse_lookup_executor.cpp
@@ -319,6 +321,8 @@ add_library(strix_core STATIC
     src/projection_reduction.cpp
     src/ple_lookup.cpp
     src/ple_reclaim.cpp
+    src/ple_direct.cpp
+    src/ple_rolling.cpp
     src/ple_workspace.cpp
     src/session_state_cache.cpp
     src/prefix_state_cache.cpp
@@ -492,6 +496,12 @@ if(BUILD_TESTING)
     target_link_libraries(strix-qwen-yarn-table-tests PRIVATE strix_core)
     strix_target_warnings(strix-qwen-yarn-table-tests)
     add_test(NAME strix-qwen-yarn-table-tests COMMAND strix-qwen-yarn-table-tests)
+    add_executable(strix-qwen-yarn-memory-tests tests/qwen_yarn_memory_tests.cpp)
+    target_compile_features(strix-qwen-yarn-memory-tests PRIVATE cxx_std_20)
+    target_link_libraries(strix-qwen-yarn-memory-tests PRIVATE Threads::Threads)
+    strix_target_warnings(strix-qwen-yarn-memory-tests)
+    add_test(NAME strix-qwen-yarn-memory-tests COMMAND strix-qwen-yarn-memory-tests)
+    set_tests_properties(strix-qwen-yarn-memory-tests PROPERTIES LABELS "cpu" TIMEOUT 10)
 endif()
 
 if(BUILD_TESTING)
@@ -678,6 +688,12 @@ if(BUILD_TESTING)
     target_link_libraries(strix-offline-tuning-cache-tests PRIVATE strix_core)
     strix_target_warnings(strix-offline-tuning-cache-tests)
     add_test(NAME strix-offline-tuning-cache-tests COMMAND strix-offline-tuning-cache-tests)
+    if(UNIX)
+        add_executable(strix-startup-markers-tests tests/startup_markers_tests.cpp)
+        target_link_libraries(strix-startup-markers-tests PRIVATE strix_core)
+        strix_target_warnings(strix-startup-markers-tests)
+        add_test(NAME strix-startup-markers-tests COMMAND strix-startup-markers-tests)
+    endif()
     add_executable(strix-generation-output-tests tests/generation_output_tests.cpp)
     target_link_libraries(strix-generation-output-tests PRIVATE strix_core)
     strix_target_warnings(strix-generation-output-tests)
@@ -1085,6 +1101,18 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-ple-lookup-tests)
     add_test(NAME strix-ple-lookup-tests COMMAND strix-ple-lookup-tests)
 
+    add_executable(strix-ple-direct-tests tests/ple_direct_tests.cpp)
+    target_link_libraries(strix-ple-direct-tests PRIVATE strix_core)
+    strix_target_warnings(strix-ple-direct-tests)
+    add_test(NAME strix-ple-direct-tests COMMAND strix-ple-direct-tests)
+    set_tests_properties(strix-ple-direct-tests PROPERTIES TIMEOUT 120)
+
+    add_executable(strix-ple-rolling-tests tests/ple_rolling_tests.cpp)
+    target_link_libraries(strix-ple-rolling-tests PRIVATE strix_core)
+    strix_target_warnings(strix-ple-rolling-tests)
+    add_test(NAME strix-ple-rolling-tests COMMAND strix-ple-rolling-tests)
+    set_tests_properties(strix-ple-rolling-tests PROPERTIES TIMEOUT 120)
+
     add_executable(strix-ple-iq4-nl-tests tests/ple_iq4_nl_tests.cpp)
     target_link_libraries(strix-ple-iq4-nl-tests PRIVATE strix_core)
     strix_target_warnings(strix-ple-iq4-nl-tests)
@@ -1444,6 +1472,20 @@ if(BUILD_TESTING)
     target_link_libraries(strix-prompt-lookup-draft-tests PRIVATE strix_core)
     strix_target_warnings(strix-prompt-lookup-draft-tests)
     add_test(NAME strix-prompt-lookup-draft-tests COMMAND strix-prompt-lookup-draft-tests)
+
+    add_executable(strix-qsa-committed-pool-lease-tests tests/qsa_committed_pool_lease_tests.cpp)
+    target_link_libraries(strix-qsa-committed-pool-lease-tests PRIVATE strix_core)
+    strix_target_warnings(strix-qsa-committed-pool-lease-tests)
+    add_test(NAME strix-qsa-committed-pool-lease-tests COMMAND strix-qsa-committed-pool-lease-tests)
+
+    add_executable(strix-mtp-step-logits-digest-tests tests/mtp_step_logits_digest_tests.cpp)
+    target_link_libraries(strix-mtp-step-logits-digest-tests PRIVATE strix_core)
+    strix_target_warnings(strix-mtp-step-logits-digest-tests)
+    add_test(NAME strix-mtp-step-logits-digest-tests COMMAND strix-mtp-step-logits-digest-tests)
+    add_executable(strix-qsa-committed-pool-tests tests/qsa_committed_pool_tests.cpp)
+    target_link_libraries(strix-qsa-committed-pool-tests PRIVATE strix_core)
+    strix_target_warnings(strix-qsa-committed-pool-tests)
+    add_test(NAME strix-qsa-committed-pool-tests COMMAND strix-qsa-committed-pool-tests)
 
     add_executable(strix-qsa-selection-plan-tests tests/qsa_selection_plan_tests.cpp)
     target_link_libraries(strix-qsa-selection-plan-tests PRIVATE strix_core)
@@ -2212,7 +2254,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
             endif()
             add_executable(strix-qwen-yarn-host-compile-tests tests/qwen_yarn_host_compile_tests.cpp)
             target_compile_definitions(strix-qwen-yarn-host-compile-tests PRIVATE STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME=1)
-            target_link_libraries(strix-qwen-yarn-host-compile-tests PRIVATE strix_hip_runtime)
+            target_link_libraries(strix-qwen-yarn-host-compile-tests PRIVATE strix_hip_runtime strix_serve)
             strix_target_warnings(strix-qwen-yarn-host-compile-tests)
             add_test(NAME strix-qwen-yarn-host-compile-tests COMMAND strix-qwen-yarn-host-compile-tests)
             set_tests_properties(strix-qwen-yarn-host-compile-tests PROPERTIES LABELS "cpu" RUN_SERIAL TRUE TIMEOUT 180)
@@ -2454,6 +2496,21 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_test(NAME strix-hip-known-window-hc-persistent-tests COMMAND strix-hip-known-window-tests --hc-rows)
         set_tests_properties(strix-hip-known-window-hc-persistent-tests PROPERTIES ENVIRONMENT "STRIX_HC_PERSISTENT=1;STRIX_HC_PERSISTENT_INJECT=1")
         add_test(NAME strix-hip-known-window-fold-tests COMMAND strix-hip-known-window-tests --window-folds)
+        add_executable(strix-hip-qsa-committed-pool-tests tests/hip_qsa_committed_pool_tests.hip)
+        set_target_properties(strix-hip-qsa-committed-pool-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)
+        target_link_libraries(strix-hip-qsa-committed-pool-tests PRIVATE strix_hip_runtime)
+        target_compile_definitions(strix-hip-qsa-committed-pool-tests PRIVATE STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC=1)
+        target_compile_options(strix-hip-qsa-committed-pool-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off)
+        strix_target_warnings(strix-hip-qsa-committed-pool-tests)
+        add_test(NAME strix-hip-qsa-committed-pool-tests COMMAND strix-hip-qsa-committed-pool-tests)
+        foreach(yarn_factor 2 4)
+            add_test(NAME strix-hip-qsa-committed-pool-yarn${yarn_factor}-tests
+                COMMAND strix-hip-qsa-committed-pool-tests --yarn-factor ${yarn_factor})
+            set_tests_properties(strix-hip-qsa-committed-pool-yarn${yarn_factor}-tests
+                PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
+        endforeach()
+        set_tests_properties(strix-hip-qsa-committed-pool-tests PROPERTIES SKIP_RETURN_CODE 77)
         add_executable(strix-hip-qsa-decode-pool-bf16-tests tests/qsa_decode_pool_bf16.hip)
         set_target_properties(strix-hip-qsa-decode-pool-bf16-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES gfx1151)

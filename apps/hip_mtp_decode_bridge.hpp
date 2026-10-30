@@ -1,12 +1,16 @@
+#include "strix/startup_markers.hpp"
 #pragma once
+#include "qwen_yarn_memory.hpp"
 #include "mtp_asset_verification.hpp"
 #include "strix/prompt_terminal_diagnostics.hpp"
 #include "qwen_tiled_prompt_plan.hpp"
 #include "strix/serve/engine.hpp"
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/hip_indexed_attention_launcher.hpp"
 #include "strix/serve/health.hpp"
 #include "strix/batch_service_handoff.hpp"
 #include "strix/batch_nested_prefill.hpp"
+#include "mtp_prompt_phase.hpp"
 #include "strix/execution_telemetry.hpp"
 #include "strix/known_prefill_limits.hpp"
 #include "hip_decode_experiment.hpp"
@@ -14,6 +18,7 @@
 #include "http_slot_capacity.hpp"
 #include "hip_decode_receipt_json.hpp"
 #include "mtp_window_memory_reservation.hpp"
+#include "strix/mtp_payload_geometry.hpp"
 #include "hip_prefix_state_cache.hpp"
 #include "hip_mtp_wide_copy.hpp"
 #include "strix/moe_q4k_a8_runtime.hpp"
@@ -87,6 +92,9 @@ struct MtpServeResult {
     std::string prompt_state_digest,final_state_digest,final_state_components;
     std::uint64_t final_state_position=0;
     std::uint64_t restored_tokens = 0, generated_tokens = 0, cycles = 0, proposed = 0, accepted = 0;
+    std::uint64_t paid_drafts = 0;
+    bool qsa_mtp_pool_active = false; // actual request owner, not the requested default
+    std::array<std::uint64_t,9> chosen_window_rows{};
     std::uint64_t ngram_rows = 0, ngram_accepted = 0;
     // Context-source diagnostics (batched, opt-in sources): shadow proposals made / scored / leading rows right
     // (n-gram or context drafter), and the frame drafter's cycles inside a frame / its shadow proposals.
@@ -124,6 +132,7 @@ struct MtpDecodeTargetParents final {
     std::shared_ptr<HipDecodeExperimentResources> experiment;
     std::shared_ptr<HipLauncherCatalog> catalog;
     std::shared_ptr<PleLookupBackend> ple;
+    std::shared_ptr<const HipMtpAssets> assets; // final sidecar registrations precede credited table drop
     PleHashContract hash;
     PleLookupPrefetchState prefetch;
     ExecutionRuntimeResources resources;
@@ -181,6 +190,9 @@ struct MtpDecodeTargetParents final {
     std::size_t batch_capacity = 0;
     std::function<MtpBatchSlotSetup()> grow_batch_slot;
     std::function<bool()> batch_memory_ok;
+    // Closed CLI only: M1 remains live while the prompt primes predictor rows.
+    std::function<void()> prepare_prompt_pool;
+    std::function<void()> retire_prompt;
     struct WindowSetupReceipt {
         std::uint64_t union_source_steps = 0;
         std::uint64_t union_reserved_bytes = 0;
@@ -197,6 +209,26 @@ struct MtpDecodeTargetParents final {
     MtpDecodeTargetParents(const MtpDecodeTargetParents&)=delete;
     MtpDecodeTargetParents& operator=(const MtpDecodeTargetParents&)=delete;
 };
+// Private diagnostic evidence only. Every copied view is an actual completed,
+// retained producer output. This does not run a reference forward or alter state.
+inline void mtp_pool_finish_diagnostics(const MtpDecodeTargetParents& parents,const HipMtpRuntime& runtime,
+    const SerialSessionContext& session,const HipMtpTargetHiddenTicket& pending) {
+    if(pending.valid())pending.print_step_logits_summary(session.next_position);
+    if(parents.resources.qsa_committed_pool) parents.resources.qsa_committed_pool->print_stats();
+    const char* digest=std::getenv("STRIX_MTP_LOGITS_DIGEST");
+    if(!digest || digest[0]!='1' || !pending.valid())return;
+    if(const auto sha=pending.serial_logits_digest())
+        std::fprintf(stderr,"mtp-logits terminal position=%llu sha256=%s\n",static_cast<unsigned long long>(pending.source_position()),
+            model_content_identity_hex(*sha).c_str());
+    else std::fprintf(stderr,"mtp-logits terminal NO-REFERENCE position=%llu\n",static_cast<unsigned long long>(pending.source_position()));
+    const auto view=pending.view();std::vector<std::byte> held(static_cast<std::size_t>(view.bytes));
+    const auto stream=static_cast<hipStream_t>(runtime.resources().stream());
+    if(hipMemcpyAsync(held.data(),reinterpret_cast<const void*>(view.address),held.size(),hipMemcpyDeviceToHost,stream)!=hipSuccess ||
+        hipStreamSynchronize(stream)!=hipSuccess)throw std::runtime_error("MTP final actual hidden diagnostic copy");
+    std::fprintf(stderr,"mtp-final-hidden position=%llu predictor_end=%llu lineage=%llu sha256=%s\n",
+        static_cast<unsigned long long>(session.next_position),static_cast<unsigned long long>(runtime.next_source_position()),
+        static_cast<unsigned long long>(session.arithmetic_lineage.history_identity),model_content_identity_hex(sha256_bytes(held)).c_str());
+}
 inline void write_mtp_union_observation(std::ostream& output,
     const std::optional<HipKnownPrefixUnionObservation>& observed) {
     if (!observed) { output << "null"; return; }
@@ -543,6 +575,7 @@ public:
             trace_.push_back({pos_,pos_+rows,rows,block.backend==tiled_.blocks,
                 (executed_owner?executed_owner:block.owner)==tiled_.block_owner.get(),grouped,small_,forced_ladder_,adopted_});
         drain_priming();
+        check_yarn_memory();
         if(block.capture && rows!=tiled_.rows)++small_units_;      // STRIX_BATCH_PROMPT_SMALL: a T block run as tail-size units
         if(grouped && !block.capture)++grouped_tail_blocks_;      // a tail-backend block run in a prompt group
         // STRIX_RTX_EXPORT_STATE keeps every block synchronous: its export (after_unit) must see this block's predictor
@@ -646,6 +679,7 @@ public:
     }
     HipMtpTargetHiddenTicket finish(std::string& receipt) {
         drain_priming();
+        check_yarn_memory();
         if(!done())throw std::logic_error("tiled MTP prompt finished before its last row");
         if(runtime_.next_source_position()+1U!=n_ || session_.next_position!=n_)
             throw std::logic_error("tiled MTP prompt did not reach the final prompt frontier");
@@ -793,6 +827,7 @@ public:
     void before_writer(hipStream_t stream) const {if(batch_cert_.enabled) PrefixAsyncCapture::before_writer(this,stream);}
 private:
     void run_block(const Block& block) {
+        check_yarn_memory();
         auto& owner=*block.owner;
         before_writer(owner.producer_stream());
         // The tap observer reads the tap step only (STRIX_QPF2K_HC prefill folds stay on for the other steps).
@@ -810,6 +845,7 @@ private:
             };
             if(execute_native) execute_native(owner,launch);else launch();
             owner.set_prefill_step_observer({});
+            check_yarn_memory();
             finish_block(block,logits);
         } catch(...) {owner.set_prefill_step_observer({});throw;}
         (block.capture?block_ms_:tail_ms_)+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
@@ -824,10 +860,13 @@ private:
         return on;
     }
     bool run_window_rows() {
+        check_yarn_memory();
         bool ran=false;
         for(std::uint32_t rows;(rows=window_unit())!=0U;) {
             before_writer(nullptr); // unknown foreign stream is conservatively foreign
+            check_yarn_memory();
             auto tickets=tiled_.window->prompt_rows(session_,window_tokens(rows));
+            check_yarn_memory();
             if(tickets.empty()){window_refused_=true;break;}
             finish_window(std::move(tickets));ran=true;
         }
@@ -898,6 +937,7 @@ private:
         before_writer(nullptr);
         if(batch_ && batch_cert_.enabled)
             trace_.push_back({pos_,pos_+1U,1,false,false,false,small_,forced_ladder_,adopted_});
+        check_yarn_memory();
         drain_priming();
         // Every serial row consumes recurrent/conv state, including fallback
         // after a refused window. Fold earlier rows before advancing it.
@@ -912,6 +952,7 @@ private:
         }
         check(hipMemcpy(held_,reinterpret_cast<const void*>(ticket.view().address),static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
             "tiled MTP held ticket copy");
+        check_yarn_memory();
         pending_=std::move(ticket);++pos_;++serial_rows_;
         if(tiled_.cache) tiled_.cache->after_unit(session_,tokens_,pos_);
         serial_ms_+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
@@ -1055,6 +1096,7 @@ public:
         std::string prompt_receipt;
         std::chrono::steady_clock::time_point decode_start;
         std::array<std::uint64_t, 9> chosen_rows{};
+        std::uint64_t draft_rows_begin=0;
     };
     struct Stats : BatchServiceStats {
         std::uint64_t admitted = 0, finished = 0, steps = 0, cohort_steps = 0, solo_steps = 0, max_active = 0, prompt_steps = 0;
@@ -1254,6 +1296,7 @@ private:
         s.output_chain={};
         s.pending = {};
         s.runtime = std::make_shared<HipMtpRuntime>(s.native);
+        if(s.parents->resources.qsa_committed_pool) s.parents->resources.qsa_committed_pool->begin_epoch();
         s.parents->tiled.reset_state();
         *s.session = s.parents->tiled.fresh;
         if (s.window) s.window->begin_session();
@@ -1344,7 +1387,7 @@ public:
                 auto next=s.target->execute_serial(*s.session,s.parents->resources,*s.dispatcher,s.pending.predicted_token(),nullptr,
                     [state=s.request.constraint](auto row){return state->select(row);});
                 s.request.constraint->commit();
-                s.pending=std::move(next);++s.result.cycles;++s.result.generated_tokens;
+                s.pending=std::move(next);++s.result.cycles;++s.result.generated_tokens;++s.chosen_rows[1];
                 const std::array<std::uint32_t,1> token{s.pending.predicted_token()};
                 emitted(s,token);
             } catch(const serve::ConstraintError& e) {constraint_failed(s,e);}
@@ -1452,6 +1495,7 @@ private:
     }
     static bool cancel_requested(const Slot& s) {return s.request.cancelled && s.request.cancelled();}
     void cancel_prefill(Slot& s,bool boundary) {
+        if(s.parents->resources.qsa_committed_pool) s.parents->resources.qsa_committed_pool->cancel();
         s.prefill->drain_for_handoff();
         if(!service_mode_) s.parents->tiled.blocks->finish_deferred();
         for(const auto& tail:s.parents->tiled.tails) {
@@ -1467,6 +1511,7 @@ private:
             ++stats_.cancel_points_cancelled;++s.result.service.cancel_points_cancelled;
         }
         s.prefill.reset();s.pending={};s.greedy.reset();
+        if(s.parents->resources.qsa_committed_pool) s.parents->resources.qsa_committed_pool->begin_epoch();
         s.parents->tiled.reset_state();*s.session=s.parents->tiled.fresh;
         if(s.window) s.window->begin_session();
         s.runtime=std::make_shared<HipMtpRuntime>(s.native);
@@ -1793,6 +1838,8 @@ private:
             }
         }
         const std::array<std::uint32_t, 1> first{s.pending.predicted_token()};
+        s.draft_rows_begin=s.runtime->execution_stats().full_forward_rows;
+        s.pending.begin_step_logits_digest();
         s.result.generated_tokens = 1;
         if(options_.prefix_batch_cert && !s.request.constraint && prompt_terminal_digest_enabled()) {
             s.output_chain.append(s.pending.terminal_logits_digest());
@@ -1819,7 +1866,7 @@ private:
         s.result.proposed += result.proposed_candidates;
         s.result.accepted += result.accepted_candidates;
         s.result.generated_tokens += result.emitted_tokens.size();
-        ++s.chosen_rows[std::min<std::uint32_t>(result.target_window_rows, 8U)];
+        ++s.chosen_rows[std::clamp<std::uint32_t>(result.target_window_rows, 1U, 8U)];
         emitted(s, result.emitted_tokens);
     }
     // Publishes tokens and ends the request at a stop token, its budget, the context, or a cancel.
@@ -1874,6 +1921,10 @@ private:
                <<"\",\"state_digest\":\""<<model_content_identity_hex(state)<<"\"}";
             std::cerr<<out.str()<<'\n';
         }
+        s.result.paid_drafts=s.runtime->execution_stats().full_forward_rows-s.draft_rows_begin;
+        s.result.qsa_mtp_pool_active=static_cast<bool>(s.parents->resources.qsa_committed_pool);
+        s.result.chosen_window_rows=s.chosen_rows;
+        mtp_pool_finish_diagnostics(*s.parents,*s.runtime,*s.session,s.pending);
         finish(s);
     }
     bool diagnostic_failed(Slot& s) {
@@ -2017,7 +2068,11 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     const auto golden_prefill_identity=tiled_prompt ? decode_profile_identity : prefill_profile_identity;
     const auto golden_prefill_profile=tiled_prompt ? pair.decode : pair.prefill;
     if(!m.metadata_only && !dump){
-    golden=read_mtp_forward_golden_file(m.golden,mtp_cli_digest(m.golden_sha256),m.golden_max_bytes);
+    const auto golden_limit=options.rotary.mode()==RotaryMode::yarn?
+        std::min(m.golden_max_bytes,mtp_payload::golden_file(calibration_rows,width,model.vocab_size,288U)):m.golden_max_bytes;
+    golden=read_mtp_forward_golden_file(m.golden,mtp_cli_digest(m.golden_sha256),golden_limit);
+    validate_mtp_forward_golden_rotary(golden,model.rotary_identity(),options.context_tokens,
+        prefill_profile_identity,golden_prefill_identity,decode_profile_identity);
     // A golden records the target prefill/decode pair whose prefill produced its prompt rows. A
     // version-1 golden records none and is admitted only for a single-profile run, as before.
     if(golden.target_decode_profile_identity ?
@@ -2048,17 +2103,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             throw std::invalid_argument("MTP independent golden prompt chain or full-row geometry differs before target execution");
     }
     }
-    HipMtpAssetLoadRequest load;load.sidecar_path=m.sidecar;load.sidecar_logical_name=m.sidecar_logical_name;
-    load.expected_target_file_sha256=mtp_cli_digest(m.target_sha256);load.expected_target_content=mtp_cli_digest(m.target_content);
-    auto& evidence=load.expected_sidecar;evidence.repository=m.repository;evidence.revision=m.revision;evidence.relative_path=m.source_path;
-    evidence.declared_file_sha256=mtp_cli_digest(m.sidecar_sha256);evidence.declared_file_bytes=m.sidecar_bytes;
-    evidence.conversion=MtpSidecarConversionProfile::effective_norm_gain_embedding_first_packed_v1;
-    evidence.converter_reference_sha256=mtp_cli_digest(m.converter_sha256);
-    evidence.norm_converter_reference_sha256=mtp_cli_digest(m.norm_converter_sha256);evidence.converter_reference_revision=m.converter_revision;
-    load.metadata_read_budget_bytes=m.header_bytes;
-    load.residency.mode=m.sidecar_residency=="copy"?HipModelResidencyMode::resident_copy:HipModelResidencyMode::registered_file_mapping;
-    load.residency.reservation_limits={m.sidecar_retained_bytes,m.sidecar_setup_bytes};
-    const auto assets=HipMtpAssets::load(model,load,actual.mapped,actual.manifest,actual.model,generations);
+    const auto assets=parents->assets ? parents->assets : load_mtp_cli_assets(m,model,actual.mapped,actual.manifest,actual.model,generations);
     HipMtpBudget native_budget;native_budget.retained_bytes=m.runtime_bytes;native_budget.context_capacity=options.context_tokens;
     native_budget.maximum_candidate_depth=m.candidate_depth;
     native_budget.normalized_rounding=m.normalized_rounding=="fp32"?HipMtpInputRounding::fp32:HipMtpInputRounding::bf16_rne;
@@ -2098,12 +2143,10 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     }
     // Same complete known payload bound as the replay consumer; admit it before
     // the target prompt is mutated, rather than waiting until replay entry.
-    auto replay_payload=mtp_cli_add(mtp_cli_mul(width,4U),mtp_cli_mul(model.vocab_size,4U));
-    replay_payload=mtp_cli_add(replay_payload,mtp_cli_mul(golden.rows.size(),sizeof(HipMtpForwardReplayRowReceipt)+2U*sizeof(std::uint32_t)));
-    replay_payload=mtp_cli_add(replay_payload,mtp_cli_mul(golden.rows.size(),mtp_cli_add(mtp_cli_mul(width,4U),mtp_cli_mul(model.vocab_size,4U))));
-    replay_payload=mtp_cli_add(replay_payload,mtp_cli_mul(golden.rows.size()+1U,192U));
+    const auto replay_payload=mtp_payload::replay_host(golden.rows.size(),width,model.vocab_size);
     if(!dump && replay_payload>m.replay_host_bytes)throw std::invalid_argument("MTP complete independent replay exceeds host payload budget before target mutation");
-    HipMtpForwardReplayRequest replay_request{policy,hip_mtp_forward_golden_payload_identity(golden),golden.rows.size(),m.replay_host_bytes};
+    HipMtpForwardReplayRequest replay_request{policy,hip_mtp_forward_golden_payload_identity(golden),golden.rows.size(),m.replay_host_bytes,
+        golden_prefill_identity,decode_profile_identity,prefill_profile_identity};
     // Tiled prompt: only the calibration rows and the serial remainder take capture slots.
     const auto retained_rows=static_cast<std::uint32_t>(tiled_prompt
         ? std::max<std::size_t>({calibration_rows+1U,static_cast<std::size_t>(options.known_prefix_tail_capture_rows?options.known_prefix_tail_capture_rows:
@@ -2119,13 +2162,21 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     // earlier prompt rows keep first-max selection (their predictions are never emitted).
     const auto sampler=mtp_sampling(m) && !dump && !qualify ? std::make_shared<TokenSampler>(mtp_sampling_policy(m))
                                                            : std::shared_ptr<TokenSampler>{};
+    const bool separated_prompt=mtp_prompt_phase_separation(options);
+    if(separated_prompt && (qualify || component_diagnostic || !parents->retire_prompt || !parents->prepare_prompt_pool))
+        throw std::invalid_argument("MTP phased prompt lacks its closed CLI retirement contract");
+    if(separated_prompt) parents->prepare_prompt_pool();
     std::shared_ptr<HipMtpWindowVerifier> window;
+    const auto allocate_window=[&] {
     if(m.window_rows && !dump && (!options.session_mtp_fixed || options.http_serve)) {
         if(!make_window)throw std::invalid_argument("MTP requested target window has no actual prepared native factory");
         window=make_window(target);
         if(!window || window->target_owner()!=target || window->logical_rows()!=m.window_rows)
             throw std::invalid_argument("MTP target window factory returned incompatible actual owner");
     }
+    };
+    if(!separated_prompt) allocate_window();
+    if(parents->resources.qsa_committed_pool) native->attach_qsa_pool(parents->resources.qsa_committed_pool);
     assets->validate_assets_unchanged();
     std::vector<HipMtpReplayRow> replay_rows;replay_rows.reserve(golden.rows.size());
     std::vector<std::uint32_t> generated;generated.reserve(static_cast<std::size_t>(options.generate_tokens));
@@ -2150,10 +2201,12 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         const auto prompt_rows=tiled_prompt ? calibration_rows+1U : options.tokens.size();
         const auto calibration_start=std::chrono::steady_clock::now();
         for(std::size_t i=0;i<prompt_rows;++i) {
+            check_yarn_memory();
             if(sampler && !tiled_prompt && i+1U==options.tokens.size())target->set_token_sampler(sampler);
             const auto input=session_calibration.empty()?options.tokens[i]:session_calibration[i];
             auto current=serial_split ? target->execute_serial(session,parents->prompt.resources,*parents->prompt.dispatcher,input)
                                : target->execute_serial(session,r,dispatcher,input);
+            check_yarn_memory();
             if(pending.valid())replay_rows.push_back({pending,input});
             pending=std::move(current);
         }
@@ -2161,12 +2214,17 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             // Same native forward as replay, recorded instead of compared. The
             // explicit self-generated pins keep it distinguishable from an
             // independent reference; nothing is qualified or generated here.
-            golden=capture_hip_mtp_forward_golden(*runtime,replay_rows,mtp_self_generated_golden_source(),mtp_self_generated_golden_reference);
+            golden=capture_hip_mtp_forward_golden(*runtime,replay_rows,mtp_self_generated_golden_source(),mtp_self_generated_golden_reference,
+                options.rotary.mode()==RotaryMode::yarn ? std::function<void()>{check_yarn_memory} : std::function<void()>{});
             golden.target_prefill_profile_identity=golden_prefill_identity;
             golden.target_decode_profile_identity=decode_profile_identity;
-            const auto sha=write_mtp_forward_golden_file(m.golden_dump,golden,m.golden_max_bytes);
+            if(golden.rotary_factor) golden.prompt_prefill_profile_identity=prefill_profile_identity;
+            ModelContentIdentity sha;
+            publish_yarn_output([&] { sha=write_mtp_forward_golden_file(m.golden_dump,golden,m.golden_max_bytes); });
             assets->validate_assets_unchanged();
-            output<<"{\"mode\":\"mtp-self-generated-golden-dump\",\"mtp_reference_independence\":\"self-generated-native-forward-not-independent\","
+            const auto memory_receipt=yarn_memory_receipt();
+            publish_yarn_output([&] {
+            output<<"{"<<memory_receipt<<"\"mode\":\"mtp-self-generated-golden-dump\",\"mtp_reference_independence\":\"self-generated-native-forward-not-independent\","
                 <<"\"mtp_golden_path\":\""<<decode_receipt::escape_json_string(m.golden_dump)<<"\",\"mtp_golden_sha256\":\""<<model_content_identity_hex(sha)
                 <<"\",\"mtp_golden_rows\":"<<golden.rows.size()<<",\"mtp_golden_payload_sha256\":\""<<model_content_identity_hex(hip_mtp_forward_golden_payload_identity(golden))
                 <<"\",\"mtp_independent_source_content\":\""<<model_content_identity_hex(golden.independent_source_content)
@@ -2176,12 +2234,20 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 <<",\"mtp_golden_target_prefill_numerical_profile\":\""<<numerical_profile_name(golden_prefill_profile)
                 <<"\",\"mtp_golden_target_decode_numerical_profile\":\""<<numerical_profile_name(pair.decode)
                 <<"\",\"mtp_golden_target_prefill_profile_identity\":"<<golden.target_prefill_profile_identity
-                <<",\"mtp_golden_target_decode_profile_identity\":"<<golden.target_decode_profile_identity<<"}\n";
+                <<",\"mtp_golden_target_decode_profile_identity\":"<<golden.target_decode_profile_identity;
+            if(golden.rotary_factor) output<<",\"mtp_golden_version\":3,\"mtp_golden_capacity\":"<<golden.context_capacity
+                <<",\"mtp_golden_calibration_begin\":"<<golden.calibration_begin<<",\"mtp_golden_calibration_end\":"<<golden.calibration_end
+                <<",\"mtp_golden_prompt_prefill_profile_identity\":"<<golden.prompt_prefill_profile_identity
+                <<",\"mtp_golden_rotary\":"<<model.rotary_identity().json();
+            output<<"}\n";
+            });
             return;
         }
         // This call executes all eleven native stages for every independent
         // reference pair. The resulting real observation is the sole evidence.
+        if(options.rotary.mode()==RotaryMode::yarn) replay_request.safe_boundary=check_yarn_memory;
         replay=replay_hip_mtp_forward(*runtime,replay_rows,golden,replay_request);
+        check_yarn_memory();
         if(!replay.assessment.passes_declared_policy){
             std::ostringstream error;error<<std::setprecision(17)
                 <<"MTP actual full-hidden/full-vocabulary replay failed its declared policy; generation is not admitted"
@@ -2205,6 +2271,11 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         if(runtime->next_source_position()+1U!=session.next_position)
             throw std::logic_error("MTP replay did not prime the actual final prompt frontier");
         replay_rows.clear(); // release prompt snapshots before bounded cycles
+        if(options.rotary.mode()==RotaryMode::yarn) {
+            // Qualification retains its receipts/pins; calibration values are no
+            // longer read. Release their storage before prompt/chain owners grow.
+            std::vector<HipMtpForwardGoldenRow>().swap(golden.rows);
+        }
         // Context n-gram draft extension (D-047, default auto since D-055): `forced` = explicitly required (the
         // runtime rejects it where it cannot run); otherwise it runs where admissible, and not under the survival
         // controller. STRIX_MTP_NGRAM_FLOOR / STRIX_MTP_NGRAM_PRIOR tune its gate (defaults 0.5 / 0.2).
@@ -2262,6 +2333,12 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             pending={};
             runtime.reset();
             runtime=std::make_shared<HipMtpRuntime>(native);
+            if (auto* lookup = dynamic_cast<FileMappedPleLookupBackend*>(parents->ple.get()))
+                if (auto turn = lookup->residency()) {
+                    cancel_ple_lookup_prefetch(*parents->ple, parents->prefetch);
+                    turn->phase(true);
+                }
+            if(parents->resources.qsa_committed_pool) parents->resources.qsa_committed_pool->begin_epoch();
             parents->tiled.reset_state();
             session=parents->tiled.fresh;
             enable_draft(options.tokens);
@@ -2270,6 +2347,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             // is not exact). Every slot of a batched run extends its own view identically.
             const auto predictor_profile_identity=runtime->numerical_profile_identity();
             const auto extend_cache=[&](HipPrefixStateCacheSession& cache,const HipMtpResources& predictor,std::byte* held) {
+                const auto pool=predictor.qsa_pool();
+                if(pool) cache.set_before_restore_hook([pool] {pool->invalidate(false,0);pool->invalidate(true,0);});
                 const auto kv=predictor.view(HipMtpBuffer::kv),index=predictor.view(HipMtpBuffer::raw_index);
                 cache.add_rows(kv.address,mtp_cli_mul(mtp_cli_mul(model.kv_heads,model.head_dim),4U),1U,"mtp.kv");
                 cache.add_rows(index.address,mtp_cli_mul(model.indexer_head_dim,2U),1U,"mtp.index");
@@ -2315,6 +2394,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                     for(const auto t:q.prompt)if(t>=vocabulary)throw std::invalid_argument("served prompt token outside the vocabulary");
                     for(const auto t:q.stop_tokens)if(t>=vocabulary)throw std::invalid_argument("served stop token outside the vocabulary");
                     MtpServeResult out;
+                    out.qsa_mtp_pool_active=static_cast<bool>(parents->resources.qsa_committed_pool);
                     if(q.constraint) {const auto route=resolve_mtp_selection_route(options.http_selection_mtp,!!window,window && window->policy_selection_admitted());
                         q.constraint->set_execution(route.mtp?"mtp-host":"serial-host",route.fallback?route.fallback:"");}
                     const auto request_start=std::chrono::steady_clock::now();
@@ -2325,6 +2405,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         ++served;
                         runtime.reset();
                         runtime=std::make_shared<HipMtpRuntime>(native);
+                        if(parents->resources.qsa_committed_pool) parents->resources.qsa_committed_pool->begin_epoch();
                         parents->tiled.reset_state();
                         session=parents->tiled.fresh;
                         if(window)window->begin_session();
@@ -2347,7 +2428,13 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                             out.rtx_import_json=rtx_import_receipt(parents->tiled.cache->request());
                         const auto decode_start=std::chrono::steady_clock::now();
                         out.prompt_ms=std::chrono::duration<double,std::milli>(decode_start-request_start).count();
-                        HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
+                        if(parents->tiled.cache && prompt_state_digest_request()) {
+            if(window)window->flush_pending_window();
+            std::fprintf(stderr,"qwen-target-state phase=prompt position=%llu sha256=%s\n",
+                static_cast<unsigned long long>(session.next_position),
+                model_content_identity_hex(parents->tiled.cache->target_state_digest(session.next_position,options.tokens,pending.predicted_token())).c_str());
+        }
+        HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
                         const auto route=resolve_mtp_selection_route(options.http_selection_mtp,!!window,window && window->policy_selection_admitted());
                         if(q.constraint && !route.mtp && window && window->pending_window())window->flush_pending_window();
                         if(q.constraint)q.constraint->set_execution(route.mtp?"mtp-host":"serial-host",route.fallback?route.fallback:"");
@@ -2359,6 +2446,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                             enable_ngram(greedy,q.prompt);
                         const auto is_stop=[&](std::uint32_t t){return std::find(q.stop_tokens.begin(),q.stop_tokens.end(),t)!=q.stop_tokens.end();};
                         const std::array<std::uint32_t,1> first{pending.predicted_token()};
+                        const auto draft_rows_begin=runtime->execution_stats().full_forward_rows;
+                        pending.begin_step_logits_digest();
                         out.generated_tokens=1;
                         if(q.backend_probe) q.backend_probe->boundary(serve::BackendProof::work_completion);
                         if(!q.on_tokens(first))out.finish="cancelled";
@@ -2370,7 +2459,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                                 q.constraint->prepare();
                                 auto next=target->execute_serial(session,r,dispatcher,pending.predicted_token(),nullptr,
                                     [state=q.constraint](auto row){return state->select(row);});
-                                q.constraint->commit();pending=std::move(next);++out.cycles;++out.generated_tokens;
+                                q.constraint->commit();pending=std::move(next);++out.cycles;++out.generated_tokens;++out.chosen_window_rows[1];
                                 const std::array<std::uint32_t,1> token{pending.predicted_token()};
                                 if(q.backend_probe) q.backend_probe->boundary(serve::BackendProof::work_completion);
                                 if(!q.on_tokens(token))out.finish="cancelled";
@@ -2390,6 +2479,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                             }
                             pending=result.final_target;++out.cycles;
                             out.proposed+=result.proposed_candidates;out.accepted+=result.accepted_candidates;
+                            if(!wide)++out.chosen_window_rows[std::clamp<std::uint32_t>(result.target_window_rows,1U,8U)];
                             out.generated_tokens+=result.emitted_tokens.size();
                             if(q.backend_probe) q.backend_probe->boundary(serve::BackendProof::work_completion);
                             if(!q.on_tokens(result.emitted_tokens)){out.finish="cancelled";break;}
@@ -2406,6 +2496,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                             static const bool components=[] {const char* v=std::getenv("STRIX_PREFIX_CACHE_DIGEST_COMPONENTS");return v&&v[0]=='1';}();
                             if(components) out.final_state_components=parents->tiled.cache->component_digests(session.next_position);
                         }
+                        out.paid_drafts=runtime->execution_stats().full_forward_rows-draft_rows_begin;
+                        mtp_pool_finish_diagnostics(*parents,*runtime,session,pending);
                         pending={};
                         out.decode_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-decode_start).count();
                     } catch(const serve::ConstraintError& e) {
@@ -2455,6 +2547,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         if(!slot->window || slot->window->target_owner()!=slot->target || slot->window->logical_rows()!=m.window_rows)
                             throw std::invalid_argument("batched MTP slot window factory returned an incompatible owner");
                     }
+                    if(setup.parents->resources.qsa_committed_pool) slot->native->attach_qsa_pool(setup.parents->resources.qsa_committed_pool);
                     setup.parents->tiled.window=slot->window.get();
                     std::byte* held=nullptr;
                     if(hipMalloc(reinterpret_cast<void**>(&held),static_cast<std::size_t>(width*2U))!=hipSuccess)
@@ -2618,6 +2711,9 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                     // Complete it before parking/management, then clear the pending guard exactly
                     // as on request reset, before any checkpoint restore installs complete state.
                     if(saved_window) {saved_window->flush_pending_window();saved_window->begin_session();}
+                    // Session registry restores bypass HipPrefixStateCache's restore hook.
+                    // Retire both key domains before importing or continuing a fixed session.
+                    if(parents->resources.qsa_committed_pool) parents->resources.qsa_committed_pool->begin_epoch();
                     // Fixed sessions never execute windows: captures, digests and live resumes
                     // below therefore observe fully materialized recurrent/conv state.
                     parents->tiled.window=nullptr;
@@ -2625,6 +2721,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                     if(session.health==SerialSessionHealth::poisoned)
                         throw std::runtime_error("session lane is poisoned; restart required");
                     MtpServeResult out;
+                    out.qsa_mtp_pool_active=static_cast<bool>(parents->resources.qsa_committed_pool);
                     if(!q.session_operation.empty()) {
                         http_live_ready=false;
                         if(!store)throw std::invalid_argument("session management is disabled");
@@ -2849,6 +2946,24 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             if(serial_split)pending=target->hand_off_prompt(session,pending,parents->prompt.resources,r);
             enable_draft(options.tokens);
         }
+        if (auto* lookup = dynamic_cast<FileMappedPleLookupBackend*>(parents->ple.get()))
+            if (auto turn = lookup->residency()) {
+                cancel_ple_lookup_prefetch(*parents->ple, parents->prefetch);
+                turn->phase(false);
+            }
+        if(parents->tiled.cache && prompt_state_digest_request()) {
+            if(window)window->flush_pending_window();
+            std::fprintf(stderr,"qwen-target-state phase=prompt position=%llu sha256=%s\n",
+                static_cast<unsigned long long>(session.next_position),
+                model_content_identity_hex(parents->tiled.cache->target_state_digest(session.next_position,options.tokens,pending.predicted_token())).c_str());
+        }
+        if(separated_prompt) complete_mtp_prompt_phase(
+            [&] {
+                // Includes the target owner's detached work, ring consumers, terminal
+                // head adoption and the predictor stream's final tap/held-row reads.
+                if(hipDeviceSynchronize()!=hipSuccess) throw std::runtime_error("MTP prompt retirement drain failed");
+                if(runtime->prime_hidden_rows_pending()) throw std::logic_error("MTP prompt priming still pending");
+            },parents->retire_prompt,allocate_window);
         HipMtpGreedyRuntime greedy(runtime,qualified,activated,target,session,r,dispatcher,parents);
         if(window && !qualify)greedy.use_window_verifier(window);
         if(m.draft_chain)greedy.set_draft_min_probability(mtp_draft_min_probability(m));
@@ -2861,23 +2976,51 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         }
         // The final prompt target already selected this unconsumed pending
         // token. Emit it once, then each cycle returns only subsequent outputs.
-        generated.push_back(pending.predicted_token());
+        const auto draft_rows_begin=runtime->execution_stats().full_forward_rows;
+        pending.begin_step_logits_digest();
+        publish_yarn_output([&] { strix::startup::first_token(); generated.push_back(pending.predicted_token()); });
         const auto start=std::chrono::steady_clock::now();
         while(generated.size()<options.generate_tokens && generated.back()!=eos.front()) {
+            check_yarn_memory();
             PrefixAsyncCapture::reap();
             if(session.next_position>=options.context_tokens){stop="context-capacity";break;}
             const auto budget=static_cast<std::uint32_t>(options.generate_tokens-generated.size());
             auto wide=wide_copy?wide_copy->cycle(greedy,pending,budget,eos):std::nullopt;
             const auto result=wide?std::move(*wide):greedy.cycle(pending,sampler && !m.sample_speculation?0U:m.candidate_depth,budget,eos);
             if(result.emitted_tokens.empty())throw std::runtime_error("MTP generation made no completed target progress");
-            generated.insert(generated.end(),result.emitted_tokens.begin(),result.emitted_tokens.end());
+            publish_yarn_output([&] { generated.insert(generated.end(),result.emitted_tokens.begin(),result.emitted_tokens.end()); });
             pending=result.final_target;++cycles;proposed+=result.proposed_candidates;accepted+=result.accepted_candidates;
             target_rows+=result.consumed_target_rows;window_attempts+=result.attempted_target_window;window_accepts+=result.accepted_target_window;
             window_restores+=result.target_checkpoint_restored;r2_dispatches+=result.target_r2_dispatches;
-            if(!wide)++chosen_rows[std::min<std::uint32_t>(result.target_window_rows,8U)]; // wide cycles: mtp_ngram_draft
+            if(!wide)++chosen_rows[std::clamp<std::uint32_t>(result.target_window_rows,1U,8U)]; // wide cycles: mtp_ngram_draft
         }
         const auto elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
         if(generated.back()==eos.front())stop="eos";
+        if (auto* lookup = dynamic_cast<FileMappedPleLookupBackend*>(parents->ple.get()))
+            if (auto turn = lookup->residency()) {
+                cancel_ple_lookup_prefetch(*parents->ple, parents->prefetch);
+                turn->finish();
+            }
+        mtp_pool_finish_diagnostics(*parents,*runtime,session,pending);
+        const char* final_digest=std::getenv("STRIX_FINAL_STATE_DIGEST");
+        const char* prefix_digest=std::getenv("STRIX_PREFIX_CACHE_DIGEST");
+        if(((final_digest && final_digest[0]=='1') || (prefix_digest && prefix_digest[0]=='1')) && parents->tiled.cache) {
+            if(window)window->flush_pending_window();
+            if(hipDeviceSynchronize()!=hipSuccess)throw std::runtime_error("MTP CLI final state diagnostic completion");
+            std::fprintf(stderr,"mtp-final-state position=%llu predictor_end=%llu lineage=%llu sha256=%s\n",
+                static_cast<unsigned long long>(session.next_position),static_cast<unsigned long long>(runtime->next_source_position()),
+                static_cast<unsigned long long>(session.arithmetic_lineage.history_identity),
+                model_content_identity_hex(parents->tiled.cache->state_digest(session.next_position)).c_str());
+        }
+        if(parents->tiled.cache && prompt_state_digest_request()) {
+            if(window)window->flush_pending_window();
+            auto consumed=options.tokens;
+            if(!generated.empty()) consumed.insert(consumed.end(),generated.begin(),generated.end()-1);
+            std::fprintf(stderr,"qwen-target-state phase=final position=%llu sha256=%s\n",
+                static_cast<unsigned long long>(session.next_position),
+                model_content_identity_hex(parents->tiled.cache->target_state_digest(session.next_position,consumed,
+                    generated.empty()?std::optional<std::uint32_t>{}:std::optional{generated.back()})).c_str());
+        }
         assets->validate_assets_unchanged();
         const auto native_stats=runtime->execution_stats();
         const auto draft_stats=runtime->draft_head()?runtime->draft_head()->stats():HipMtpDraftHeadStats{};
@@ -2896,14 +3039,23 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             << ",\n  \"mtp_window_arena_completion_union_retained_bytes\":" << parents->window_setup.retained_window_bytes
             << ",\n  \"mtp_window_expert_union_latest_observation\":";
         write_mtp_union_observation(union_receipt, union_observation);
-        union_receipt << ",\n";
+        union_receipt << ",\n  \"mtp_window_arms\":[";
+        if(window) {
+            bool comma=false;
+            for(const auto& owner:window->window_owners()) {
+                union_receipt << (comma?",":"") << owner->arithmetic_witness(); comma=true;
+            }
+        }
+        union_receipt << "],\n";
         const auto mtp_d1_inventory=options.execution_inventory
             ? std::string("  \"mtp_target_d1_inventory\":{\"boundary\":\"after-mtp-target-setup-and-request-completion\",\"present\":")+
                 (deferred_status?"true":"false")+",\"storage\":\""+(deferred_status?"unaccounted":"absent")+
                 "\",\"included_in_base_runtime_backing_inventory\":false,\"physical_fit\":null,"
                 "\"scope\":\"actual-target-private-D1-record-and-host-shadow-presence-not-allocation-census\"},\n"
             : std::string{};
-        output<<"{\n"<<(completion_receipt?completion_receipt():std::string{})<<mtp_d1_inventory<<union_receipt.str()<<"  \"mode\":\"native-mtp-independent-replay-then-target-verified-greedy\",\n"
+        const auto completed_receipt=yarn_memory_receipt()+(completion_receipt?completion_receipt():std::string{});
+        publish_yarn_output([&] {
+        output<<"{\n"<<completed_receipt<<mtp_d1_inventory<<union_receipt.str()<<"  \"mode\":\"native-mtp-independent-replay-then-target-verified-greedy\",\n"
             <<"  \"mtp_native_hardware_qualified\":false,\n  \"mtp_performance_qualified\":false,\n"
             <<"  \"optimization_profile_selected\":\""<<decode_receipt::escape_json_string(resolved_profile)<<"\",\n"
             <<"  \"mtp_target_verification\":\""<<mtp_target_verification_name(window_attempts)<<"\",\n"
@@ -2923,8 +3075,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"  \"mtp_source_repository\":\""<<decode_receipt::escape_json_string(m.repository)<<"\",\n"
             <<"  \"mtp_source_revision\":\""<<decode_receipt::escape_json_string(m.revision)<<"\",\n"
             <<"  \"mtp_source_path\":\""<<decode_receipt::escape_json_string(m.source_path)<<"\",\n"
-            <<"  \"mtp_converter_reference_sha256\":\""<<model_content_identity_hex(evidence.converter_reference_sha256)<<"\",\n"
-            <<"  \"mtp_norm_converter_reference_sha256\":\""<<model_content_identity_hex(evidence.norm_converter_reference_sha256)<<"\",\n"
+            <<"  \"mtp_converter_reference_sha256\":\""<<model_content_identity_hex(mtp_cli_digest(m.converter_sha256))<<"\",\n"
+            <<"  \"mtp_norm_converter_reference_sha256\":\""<<model_content_identity_hex(mtp_cli_digest(m.norm_converter_sha256))<<"\",\n"
             <<"  \"target_prefill_numerical_profile\":\""<<numerical_profile_name(pair.prefill)<<"\",\n"
             <<"  \"target_decode_numerical_profile\":\""<<numerical_profile_name(pair.decode)<<"\",\n"
             <<"  \"target_prefill_execution_identity\":"<<(serial_split?parents->prompt.compiled->execution_identity:
@@ -3039,6 +3191,10 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"  \"mtp_draft_head_rows\":"<<draft_stats.rows<<",\n  \"mtp_draft_base_rows\":"<<draft_stats.base_rows<<",\n"
             <<"  \"mtp_draft_context_rows\":"<<draft_stats.context_rows<<",\n  \"mtp_draft_context_dropped\":"<<draft_stats.context_dropped<<",\n"
             <<"  \"sampling\":"<<mtp_sampling_receipt(m,sampler.get())<<",\n"
+            <<"  \"mtp_paid_drafts\":"<<(native_stats.full_forward_rows-draft_rows_begin)<<",\n"
+            <<"  \"mtp_paid_drafts_scope\":\"completed-predictor-full-forward-rows-during-generation-excludes-prompt-and-calibration\",\n"
+            <<"  \"emitted_tokens\":"<<generated.size()<<",\n"
+            <<"  \"generation_ms\":"<<elapsed<<",\n"
             <<"  \"mtp_generation_cycle_elapsed_ms\":"<<elapsed<<",\n"
             <<"  \"mtp_timing_scope\":\"post-prompt-and-independent-replay-cycles-only-host-completed-wall-not-GPU-kernel-time\",\n"
             <<(tiled_prompt ? "  \"mtp_tiled_prompt\":{"+tiled_receipt+",\"block_numerical_profile\":\""+
@@ -3049,6 +3205,15 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             <<"  \"stop_reason\":\""<<stop<<"\",\n  \"generated_tokens\":[";
         for(std::size_t i=0;i<generated.size();++i){if(i)output<<',';output<<generated[i];}
         output<<"]\n}\n";
-    } catch(...) {if(runtime)runtime->cancel();throw;}
+        });
+    } catch(...) {
+        if(runtime)runtime->cancel();
+        if (auto* lookup = dynamic_cast<FileMappedPleLookupBackend*>(parents->ple.get()))
+            if (auto turn = lookup->residency()) {
+                cancel_ple_lookup_prefetch(*parents->ple, parents->prefetch);
+                turn->cancel();
+            }
+        throw;
+    }
 }
 } // namespace strix::decode_cli

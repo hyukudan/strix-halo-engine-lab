@@ -164,6 +164,45 @@ int main() {
         expect(back2.target_prefill_profile_identity==7 && back2.target_decode_profile_identity==9 && pin2!=pin,
                "writer->reader round trip of a version-2 golden keeps the pair and changes the file pin");
         std::filesystem::remove(dumped,ignored);
+        for(const auto factor:{2U,4U}) {
+            auto v3=pair_self;
+            const auto descriptor=RotaryDescriptor::yarn(factor);
+            ModelContentIdentity table;table.bytes[0]=static_cast<std::uint8_t>(factor);
+            v3.rotary_factor=factor;v3.rotary_descriptor_sha256=descriptor.sha256();v3.rotary_table_sha256=table;
+            v3.context_capacity=factor==2?32768U:1048576U;v3.calibration_end=v3.rows.size();
+            v3.prompt_prefill_profile_identity=15;
+            const auto bytes3=encode_mtp_forward_golden_file(v3,4096);
+            expect(bytes3.size()==manual.size()+120U,"v3 exact header extent");
+            file.write(bytes3);
+            require_mtp_forward_golden_geometry(file.path,v3.rows.size(),v3.rows.front().target_hidden_bf16.size(),
+                v3.rows.front().full_logits.size(),v3.context_capacity);
+            for(unsigned fault=0;fault<4U;++fault) {
+                rejects([&]{require_mtp_forward_golden_geometry(file.path,v3.rows.size()+(fault==0U),
+                    v3.rows.front().target_hidden_bf16.size()+(fault==1U),v3.rows.front().full_logits.size()+(fault==2U),
+                    v3.context_capacity+(fault==3U));},"bounded header preflight refuses mismatched payload geometry before decoding");
+            }
+            auto oversized=bytes3;oversized.push_back(std::byte{0});file.write(oversized);
+            rejects([&]{require_mtp_forward_golden_geometry(file.path,v3.rows.size(),v3.rows.front().target_hidden_bf16.size(),
+                v3.rows.front().full_logits.size(),v3.context_capacity);},"extra encoded storage is refused before allocating file payload");
+            file.write(bytes3);
+            const auto back3=read_mtp_forward_golden_file(file.path,sha256_bytes(bytes3),4096);
+            expect(encode_mtp_forward_golden_file(back3,4096)==bytes3,"v3 bitwise roundtrip");
+            const RotaryIdentity rotary(descriptor,table);
+            validate_mtp_forward_golden_rotary(back3,rotary,v3.context_capacity,15,7,9);
+            rejects([&]{validate_mtp_forward_golden_rotary(golden,rotary,v3.context_capacity);},"legacy golden is not YaRN evidence");
+            rejects([&]{validate_mtp_forward_golden_rotary(back3,RotaryIdentity{},v3.context_capacity);},"YaRN cannot replay as native");
+            rejects([&]{validate_mtp_forward_golden_rotary(back3,rotary,v3.context_capacity-1U);},"actual C pinned");
+            rejects([&]{validate_mtp_forward_golden_rotary(back3,rotary,v3.context_capacity,16,7,9);},"prompt profile pinned");
+            rejects([&]{validate_mtp_forward_golden_rotary(back3,rotary,v3.context_capacity,15,8,9);},"calibration profile pinned");
+            rejects([&]{validate_mtp_forward_golden_rotary(back3,rotary,v3.context_capacity,15,7,10);},"decode profile pinned");
+            auto changed=table;changed.bytes[1]=1;
+            rejects([&]{validate_mtp_forward_golden_rotary(back3,RotaryIdentity(descriptor,changed),v3.context_capacity);},"table content pinned");
+            auto invalid=v3;invalid.calibration_end++;
+            rejects([&]{(void)encode_mtp_forward_golden_file(invalid,4096);},"calibration extent pinned");
+            invalid=v3;invalid.rotary_descriptor_sha256.bytes[0]^=1;
+            rejects([&]{(void)encode_mtp_forward_golden_file(invalid,4096);},"descriptor pinned");
+            expect(back3.independent_source_content==mtp_self_generated_golden_source(),"v3 capture remains self-generated");
+        }
         return failures?1:0;
     } catch(const std::exception& error) { std::cerr<<error.what()<<'\n'; return 1; }
 }

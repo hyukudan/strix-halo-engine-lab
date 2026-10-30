@@ -141,3 +141,58 @@ again until the committed frontier passes the rejected row. The receipt adds `wi
 size and, with a second size, one full and one abandoned cycle of it (the pre-cycle state exactly, the cooldown of
 every size) and the ordinary cycles after them against a 176-row serial oracle (tokens, full logits of every wide
 row, committed state).
+
+### Explicit YaRN MTP CLI
+
+An explicit `--rope-yarn 2 --context C --mtp` admits the table-backed CLI
+qualification route at positive C <= 524288. Above that band, use factor 4
+with C <= 1048576. Supply the existing pinned sidecar, golden and budgets;
+`--mtp-golden-dump` captures a fresh version-3 file with the same rotary table,
+actual C and profile pair. MTP is never automatically selected by a bare YaRN
+command. HTTP, session/cache restore, cohorts, wide copy and sampling remain
+closed. Structurally non-serial verifier arithmetic refuses before mutation.
+Host admission and compilation do not establish GPU exactness or model fidelity.
+
+Both `STRIX_QSA_MTP_POOL` and `STRIX_PLE_ROLLING` default on for admitted MTP
+CLI at factor 2 through 524288 and factor 4 through 1048576. Either `=0` still
+turns that feature off; MTP remains explicitly requested. The 1M factor-4 prose
+qualification matched all 256 generated tokens, every committed full-vocabulary
+logit digest, prompt/final target state and predictor state against serial YaRN
+and pool-off MTP. This is equality within the same YaRN identity.
+
+Memory admission tries these storage sets in order at T8192 before reducing
+the tile to T4096 and then T2048:
+
+| `storage_ladder_step` | Rolling positions | PLE cap bytes | Score ring rows | PIPE |
+|---|---:|---:|---:|---|
+| 0 | Existing defaults | Existing default | Existing default | Existing default |
+| 1 | 1024 | 268435456 | 256 | Existing default |
+| 2 | 256 | 33554432 | 64 | 0 |
+
+Only a memory refusal advances the ladder. Each candidate must fit setup,
+calibration, prompt, decode and drain, including the 4 GiB physical margin and
+independent UMA/GTT/workspace/metadata limits. An explicit environment value
+pins its knob in every step, including PIPE; the ladder never enables an off
+switch or overrides a user size. Inspection and run receipts report
+`storage_ladder_step` and `yarn_mtp_storage` (chosen positions, cap, ring and
+PIPE); admission also lists those fields and the phase peaks. File credit is
+verified again when trying another storage candidate; predicted credit is
+never admission credit. Serial YaRN and native plans do not use the ladder.
+
+`STRIX_QWEN_YARN_MTP=0` with a plain YaRN command selects the serial comparator;
+an explicit `--mtp` conflicts with that control and refuses. Keep the same prompt,
+C, descriptor/table, prefill schedule and target profiles. Independently,
+`STRIX_QSA_MTP_POOL=0` retains genuine MTP with historical key consumers and its
+separately admitted memory envelope. Inspection reports the requested/effective
+route, source, identities and named owners. M1 keys are charged once, alongside
+predictor KV/raw storage (2304*C), sidecar/Q4 copies, captures, windows and taps.
+
+`STRIX_MTP_STEP_LOGITS_DIGEST=1` emits the same ordered `mtp-step-logits`
+generation ledger on plain serial and MTP CLI routes. It starts with the actual
+terminal prompt logits, covers only committed consumed positions, and retains
+full-vocabulary byte SHA256 values. `STRIX_PROMPT_STATE_DIGEST=1` builds the
+read-only registry and emits `qwen-target-state phase=prompt|final` digests over
+the same ordered target components and occupied ranges, consumed token history
+and pending selection. MTP predictor extensions and opaque lineage remain in
+the separate complete-session diagnostics. Missing or incomplete evidence is
+NO-REFERENCE; compare complete tokens, ledgers and target state before timing.

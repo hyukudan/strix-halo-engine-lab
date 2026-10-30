@@ -1,4 +1,5 @@
 #include "strix/hip_mtp_target_checkpoint.hpp"
+#include "rotary_mock.hpp"
 #include "strix/indexed_attention_state.hpp"
 #include <algorithm>
 #include <array>
@@ -68,6 +69,19 @@ int main() {
     using namespace strix;
     try {
         independent_rollback_payload_fixture();
+        for(const auto capacity:{32768U,131072U,262144U,393216U,524288U,1048576U,32771U,3U}) {
+            auto extended=ModelContract::qwen38_flash_next();extended.qwen_rotary_table=mock_rotary(capacity<=524288U?2U:4U);
+            const auto state=build_serial_session_state_layout(extended,{capacity,256,64,true});
+            for(const auto room:{0U,1U,2U,4U,8U}) for(const auto rows:{2U,4U,8U}) {
+                if(room>capacity)continue;
+                bool refused=false;
+                try{const auto p=plan_hip_mtp_target_window_rollback(extended,state,capacity-room,rows,true);
+                    if(p.first_position+p.logical_rows>capacity)throw std::logic_error("rollback crossed actual C");}
+                catch(const std::invalid_argument&){refused=true;}
+                if(refused!=(rows>room))throw std::logic_error("effective/actual capacity rollback room mismatch");
+            }
+            if(extended.max_position_embeddings!=262144U)throw std::logic_error("checkpoint metadata changed");
+        }
         const auto model=ModelContract::qwen38_flash_next();
         const auto layout=build_serial_session_state_layout(model,{2048,256,64,true});
         const auto full=plan_hip_mtp_target_checkpoint(model,layout,SessionSnapshotPolicy::full_components);

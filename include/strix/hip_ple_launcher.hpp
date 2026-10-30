@@ -83,7 +83,7 @@ public:
     // prefill: up to known_prefill_max_rows (8192) rows that are always all kept; launch() publishes the last row's
     // history itself and keeps no convolution snapshots (commit() is not used).
     HipPleKnownWindow(const ModelContract& model, HipActivationStorage activation, std::uint32_t max_rows,
-        bool prefill = false);
+        bool prefill = false, const ExecutionRuntimeResources* prime_resources = nullptr);
     ~HipPleKnownWindow();
     HipPleKnownWindow(const HipPleKnownWindow&) = delete;
     HipPleKnownWindow& operator=(const HipPleKnownWindow&) = delete;

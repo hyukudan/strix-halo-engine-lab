@@ -36,9 +36,11 @@ one logits-capable stripe per owner. Only a produced terminal head resolves that
 stripe, including the actual terminal row of a partial block. The compiler
 validates every mixed extent, offset and row view before mutation. State-only
 owners reserve the stripe for complete native launcher construction but produce
-no logits. All-rows scoring, segmented/HTTP batch owners, MTP prompt capture,
-closed verify windows, graph inputs and complete-step dump diagnostics retain
-the uniform arena.
+no logits. Closed single-request MTP CLI prompts also use these stripes: hidden
+taps retain their original row views, and terminal adoption consumes the completed
+full-vocabulary head before retiring its arena. All-rows scoring, segmented/HTTP
+batch owners, MTP cohort/wide/repeated/session routes, closed verify windows,
+graph inputs and complete-step dump diagnostics retain the uniform arena.
 
 Eligible QSA row prefill keeps selected token IDs in all original row workspaces,
 but scores and selection maxima live in a ring of two slots owned by each tiled
@@ -68,6 +70,18 @@ the default geometry about 341 MiB for a 64-row tail owner and 326 MiB for a
 (`qsa_score_ring`) and terminal stripes (`terminal_logits_stripes`) once, split out of the
 primary and tail workspaces, and charges no embedded selection or stage-batch maxima for
 compact owners (their maxima live in the ring).
+
+Closed single-request YaRN MTP prompts covered entirely by schedule 12's tiled
+units retire their prompt owners before allocating decode verifier windows.
+The target/predictor streams and detached prompt work drain first; the tap
+pipeline, prompt backends, native owners, arenas, rings, PLE/CSR/deferred-row
+buffers, plan copies, prefill pool and stage tables are then released. Suffix
+prompts retain their verifier during prefill. Admission uses the maximum of the
+actual phase totals, including all persistent state in every applicable phase.
+Predictor KV/raw, retained sidecar, Q4 copies, draft head, M1, GDN/PLE state,
+rotary table and held hidden remain live through prompt and decode. Shared
+launcher scratch and descriptor caches remain charged. This lifetime change
+does not establish a one-node capacity fit or new device qualification.
 
 Both memory policies default on for eligible routes and follow the qpf2k
 defaults policy: `--baseline`, `STRIX_BASELINE=1`, `STRIX_QPF2K_DEFAULTS=0` and

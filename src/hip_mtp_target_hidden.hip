@@ -1,4 +1,6 @@
 #include "strix/hip_mtp_target_hidden.hpp"
+#include "strix/mtp_payload_geometry.hpp"
+#include "strix/hip_indexed_attention_launcher.hpp"
 #include "strix/hip_qwen_rotary_table.hpp"
 #include "strix/hip_mtp_target_window.hpp"
 #include "strix/mtp_target_window_policy.hpp"
@@ -17,6 +19,7 @@
 #include "strix/arithmetic_lineage.hpp"
 #include "strix/prompt_terminal_diagnostics.hpp"
 #include "strix/model_content_hash.hpp"
+#include "strix/mtp_step_logits_digest.hpp"
 #include <algorithm>
 #include <optional>
 #include <stdexcept>
@@ -67,7 +70,7 @@ struct HipMtpTargetHiddenTicket::Lease {
     std::optional<SerialSessionContext> prefix_committed;
     // Set for a row adopted from a tiled prefill block: the block's first position.
     std::optional<std::uint64_t> block_begin;
-    // STRIX_SERIAL_LOGITS_DIGEST=1 (diagnostic): SHA-256 of this serial row's FP32 logits.
+    // Retained actual FP32 row hash for serial, MTP and committed-step diagnostics.
     std::optional<ModelContentIdentity> logits_digest;
     OutputLogitsSnapshot terminal;
 };
@@ -107,6 +110,14 @@ struct HipMtpTargetHidden::Impl {
     };
     std::optional<Handoff> handoff;
     bool started=false;
+    std::unique_ptr<MtpStepLogitsDigest> step_digest;
+    void record_step(std::uint64_t position,const std::optional<ModelContentIdentity>& digest) {
+        if(!step_digest)return;
+        step_digest->commit(position,digest);
+        std::fprintf(stderr,"mtp-step-logits committed stream=%p position=%llu vocab=%llu sha256=%s\n",
+            static_cast<void*>(this),static_cast<unsigned long long>(position),
+            static_cast<unsigned long long>(model->vocab_size),digest?model_content_identity_hex(*digest).c_str():"NO-REFERENCE");
+    }
     ~Impl() {
         if(guard) guard->recover_or_fail_stop();
         if(stream) (void)hipStreamDestroy(stream);
@@ -118,6 +129,27 @@ struct HipMtpTargetHidden::Impl {
 };
 HipMtpTargetHidden::HipMtpTargetHidden():impl_(std::make_unique<Impl>()){}
 HipMtpTargetHidden::~HipMtpTargetHidden()=default;
+void HipMtpTargetHiddenTicket::begin_step_logits_digest() const {
+    if(!mtp_step_logits_digest_enabled())return;
+    if(!valid())throw std::invalid_argument("MTP step digest needs actual pending target");
+    auto& i=*lease_->owner->impl_;
+    i.step_digest=std::make_unique<MtpStepLogitsDigest>(source_position());
+    std::fprintf(stderr,"mtp-step-logits begin stream=%p begin=%llu vocab=%llu\n",static_cast<void*>(&i),
+        static_cast<unsigned long long>(source_position()),static_cast<unsigned long long>(i.model->vocab_size));
+    i.record_step(source_position(),lease_->logits_digest);
+}
+void HipMtpTargetHiddenTicket::print_step_logits_summary(std::uint64_t end) const {
+    if(!mtp_step_logits_digest_enabled())return;
+    if(!valid())throw std::invalid_argument("MTP step summary needs actual pending target");
+    auto& i=*lease_->owner->impl_;
+    if(!i.step_digest)return;
+    const auto& d=*i.step_digest;
+    std::fprintf(stderr,"mtp-step-logits summary stream=%p begin=%llu end=%llu count=%llu vocab=%llu coverage=%s sha256=%s\n",
+        static_cast<void*>(&i),static_cast<unsigned long long>(d.begin()),static_cast<unsigned long long>(end),
+        static_cast<unsigned long long>(d.count()),static_cast<unsigned long long>(i.model->vocab_size),
+        d.complete(end)?"COMPLETE":"NO-REFERENCE",model_content_identity_hex(d.chain()).c_str());
+    i.step_digest.reset();
+}
 std::uint32_t HipMtpTargetHidden::retained_rows() const noexcept {return static_cast<std::uint32_t>(impl_->slots.size());}
 const ModelContract& HipMtpTargetHidden::model() const noexcept {return *impl_->model;}
 const CompiledSerialExecution& HipMtpTargetHidden::compiled() const noexcept {return *impl_->compiled;}
@@ -206,17 +238,13 @@ std::shared_ptr<HipMtpTargetHidden> HipMtpTargetHidden::create(
     memory->validate_inventory_ownership();
     if(!!deferred.state_layout!=!!deferred.generations)
         throw std::invalid_argument("MTP target D1 requires actual state layout and generation issuer together");
-    std::uint64_t extra=0;
     if(deferred.state_layout) {
         validate_session_state_memory_binding(*deferred.state_layout,memory->state());
         if(!deferred.state_layout->host_total_bytes || !deferred.state_layout->host_alignment)
             throw std::invalid_argument("MTP target D1 requires bounded transactional host history");
-        extra=mtp_native::sum(263,mtp_native::sum(deferred.state_layout->host_total_bytes,deferred.state_layout->host_alignment-1));
     }
     const auto bytes=mtp_native::product(mtp_native::product(m.hidden_size,m.hc_count),2);
-    const auto selector_bytes=HipGreedyOutput::required_scratch_bytes(static_cast<std::uint32_t>(m.vocab_size));
-    const auto required=mtp_native::sum(extra,mtp_native::sum(selector_bytes,
-        mtp_native::product(rows,mtp_native::sum(bytes,255))));
+    const auto required=mtp_payload::target_capture(m,rows,deferred.state_layout);
     if(required>budget)
         throw std::invalid_argument("MTP target capture exceeds upfront retained budget");
     auto result=std::shared_ptr<HipMtpTargetHidden>(new HipMtpTargetHidden);
@@ -384,12 +412,13 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial_unselected(
             }
             // STRIX_SERIAL_LOGITS_DIGEST=1 (diagnostic, gates): the row's FP32 logits digest (prompt receipts report the terminal one).
             static const bool logits_digest=[]{const char* v=std::getenv("STRIX_SERIAL_LOGITS_DIGEST");return v && v[0]=='1';}();
-            if(logits_digest || prompt_terminal_digest_enabled()) {
+            const char* mtp_digest=std::getenv("STRIX_MTP_LOGITS_DIGEST");
+            const MtpSerialLogitsDigestPolicy digest_policy{
+                logits_digest,mtp_digest && mtp_digest[0]=='1',mtp_step_logits_digest_enabled()};
+            if(digest_policy.enabled() || prompt_terminal_digest_enabled()) {
                 std::vector<float> row;
                 read_hip_logits_row(i.logits,static_cast<std::uint32_t>(i.model->vocab_size),i.stream,row);
-                const auto bytes=std::as_bytes(std::span<const float>(row));
-                const auto digest=sha256_bytes(std::vector<std::byte>(bytes.begin(),bytes.end()));
-                if(logits_digest) lease->logits_digest=digest;
+                lease->logits_digest=digest_policy.capture(row);
                 if(prompt_terminal_digest_enabled()) lease->terminal.capture(raw_fp32_logits_digest(row));
             }
             if(i.session_logits) {
@@ -399,12 +428,18 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::execute_serial_unselected(
             }
             if(i.shadow)i.shadow->publish();
         });
+        if(resources.qsa_committed_pool) resources.qsa_committed_pool->commit(false,session.next_position);
         lease->committed=session;
+        i.record_step(lease->position,lease->logits_digest);
+        if(const char* d=std::getenv("STRIX_MTP_LOGITS_DIGEST");d && d[0]=='1' && lease->logits_digest)
+            std::fprintf(stderr,"mtp-logits committed position=%llu sha256=%s\n",static_cast<unsigned long long>(lease->position),
+                model_content_identity_hex(*lease->logits_digest).c_str());
         if(session.next_position!=lease->position+1 || session.health!=SerialSessionHealth::ready)
             throw std::runtime_error("MTP target capture lacks committed target row");
         slot->reader=lease; i.busy=false;
         HipMtpTargetHiddenTicket ticket;ticket.lease_=std::move(lease);return ticket;
     } catch(...) {
+        if(resources.qsa_committed_pool) resources.qsa_committed_pool->cancel();
         i.failed=true;i.guard->recover_or_fail_stop();if(i.shadow)i.shadow->cancel();i.busy=false;
         session.health=SerialSessionHealth::poisoned;session.arithmetic_lineage.tainted=true;
         throw;
@@ -452,6 +487,7 @@ HipMtpTargetHiddenTicket HipMtpTargetHidden::adopt_prefill_row(const SerialSessi
     lease->content=i.weights->binding().model_content_identity;
     lease->producer=session.execution_identity;lease->block_begin=last->begin;
     if(prefix_batch_certification_enabled() && prompt_terminal_digest_enabled()) lease->terminal.capture(raw_fp32_logits_digest(logits));
+    if(mtp_step_logits_digest_enabled())lease->logits_digest=sha256_bytes(std::as_bytes(logits));
     lease->predicted=select_greedy_token(logits,i.model->vocab_size);
     // Sampled decoding: the block's last row selects through the sampler, as a final serial row would.
     if(i.sampler) lease->predicted=i.sampler->decide(logits,session.next_position,nullptr).token;
@@ -555,6 +591,10 @@ std::vector<HipMtpTargetHiddenTicket> HipMtpTargetHidden::accept_verified_window
         auto lease=std::make_shared<HipMtpTargetHiddenTicket::Lease>();
         lease->owner=shared_from_this();lease->batch=batch;lease->batch_row=row;
         if(prompt_terminal_digest_enabled()) lease->terminal.capture(batch->terminal_logits_digest(row));
+        lease->logits_digest=batch->logits_digest(row);
+        i.record_step(batch->source_position(row),lease->logits_digest);
+        if(lease->logits_digest) std::fprintf(stderr,"mtp-logits committed position=%llu sha256=%s\n",
+            static_cast<unsigned long long>(batch->source_position(row)),model_content_identity_hex(*lease->logits_digest).c_str());
         lease->position=batch->source_position(row);lease->token=inputs[row];lease->predicted=predictions[row];
         lease->content=batch->target_content_identity();
         HipMtpTargetHiddenTicket ticket;ticket.lease_=std::move(lease);result.push_back(std::move(ticket));
@@ -584,6 +624,10 @@ std::vector<HipMtpTargetHiddenTicket> HipMtpTargetHidden::accept_verified_prefix
         auto lease=std::make_shared<HipMtpTargetHiddenTicket::Lease>();
         lease->owner=shared_from_this();lease->batch=batch;lease->batch_row=row;
         if(prompt_terminal_digest_enabled()) lease->terminal.capture(batch->terminal_logits_digest(row));
+        lease->logits_digest=batch->logits_digest(row);
+        i.record_step(batch->source_position(row),lease->logits_digest);
+        if(lease->logits_digest) std::fprintf(stderr,"mtp-logits committed position=%llu sha256=%s\n",
+            static_cast<unsigned long long>(batch->source_position(row)),model_content_identity_hex(*lease->logits_digest).c_str());
         lease->position=batch->source_position(row);lease->token=batch->input_token(row);
         lease->predicted=batch->predicted_token(row);lease->content=batch->target_content_identity();
         lease->prefix_committed=target; // every prefix row's chunk ends at the accepted frontier
@@ -610,6 +654,10 @@ std::vector<HipMtpTargetHiddenTicket> HipMtpTargetHidden::accept_known_rows(
         auto lease=std::make_shared<HipMtpTargetHiddenTicket::Lease>();
         lease->owner=shared_from_this();lease->batch=batch;lease->batch_row=row;
         if(prompt_terminal_digest_enabled()) lease->terminal.capture(batch->terminal_logits_digest(row));
+        lease->logits_digest=batch->logits_digest(row);
+        i.record_step(batch->source_position(row),lease->logits_digest);
+        if(lease->logits_digest) std::fprintf(stderr,"mtp-logits committed position=%llu sha256=%s\n",
+            static_cast<unsigned long long>(batch->source_position(row)),model_content_identity_hex(*lease->logits_digest).c_str());
         lease->position=batch->source_position(row);lease->token=batch->input_token(row);
         lease->predicted=batch->predicted_token(row);lease->content=batch->target_content_identity();
         lease->prefix_committed=target;

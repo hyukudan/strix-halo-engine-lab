@@ -1,10 +1,14 @@
 #pragma once
 #include "qwen_prompt_organization.hpp"
 #include "qwen_yarn_owner_inventory.hpp"
+#include "qwen_mtp_owner_plan.hpp"
+#include "strix/compiled_speculative_verify.hpp"
 namespace strix::decode_cli {
 // Compile and size the admitted prompt before HIP setup or state mutation.
 inline PrefillRequirements compile_prompt_requirements(const Options& options,
-    const ModelContract& model, const ModelManifest& manifest, std::uint64_t model_bytes) {
+    const ModelContract& model, const ModelManifest& manifest, std::uint64_t model_bytes,
+    const gguf::FileInfo* supplied_sidecar_info=nullptr, bool resident_fallback_inventory=false,
+    std::uint32_t score_ring_rows=0) {
     auto requests = prompt_compiler_requests(options, model, manifest);
     auto& binding_request = requests.binding;
     auto& buffer_request = requests.buffers;
@@ -19,6 +23,25 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
             buffer_request,
             256);
 
+    YarnMtpGeometry mtp_geometry;
+    mtp_geometry.target_tensor_count=manifest.tensors.size();
+    const bool full_owners=options.rotary.mode()==RotaryMode::yarn || resident_fallback_inventory;
+    if(full_owners && options.mtp.enabled && options.mtp.window_rows && options.mtp.golden_dump.empty()) {
+        const auto access=compile_execution_tensor_access_plan(compiled.execution,manifest,build_model_tensor_index(manifest),
+            build_serial_execution_tensor_requirements(compiled.execution));
+        const auto rows=options.mtp.window_rows_set.empty()?std::vector<std::uint32_t>{options.mtp.window_rows}:options.mtp.window_rows_set;
+        for(const auto r:rows) {
+            const auto plan=compile_known_prefix_window(model,compiled,manifest,access,
+                {true,true,true,r,options.mtp.window_expert_union,KnownWindowOutputPolicy::all_rows,
+                 options.mtp.window_hyper_mix,options.mtp.window_qsa_rows,options.mtp.window_prefix,options.mtp.window_prefix,
+                 options.mtp.window_prefix,options.mtp.window_prefix || options.known_window_router_rows,
+                 options.mtp.window_prefix || options.known_window_router_rows,
+                 options.rotary.mode()==strix::RotaryMode::yarn});
+            mtp_geometry.window_arenas.emplace_back(r,plan.arena.physical.total_bytes);
+            if(options.rotary.mode()==RotaryMode::yarn && !known_window_policy_serial_rows(plan))
+                throw std::invalid_argument("YaRN MTP verifier recipe is not serial equivalent");
+        }
+    }
     const auto pair = numerical_profile_pair(options);
     if (pair.split()) {
         binding_request.prefill_arithmetic_identity = numerical_profile_pair_identity(pair);
@@ -39,7 +62,7 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
             {rows,true,true,true,true,KnownWindowOutputPolicy::terminal_row,
              options.rotary.mode() == RotaryMode::yarn ? UINT64_MAX : options.known_prefill_workspace_budget,
              options.rotary.mode() == RotaryMode::yarn ? UINT64_MAX : options.known_prefill_metadata_budget / 2U,
-             true,true,true,true,true,false,!options.mtp.enabled && !options.http_serve,true});
+             true,true,true,true,true,false,compact_prompt_memory(options),true,score_ring_rows});
     };
     const auto plan = make_plan(options.known_prefix_prefill_rows);
     const auto add = prefill_checked_add;
@@ -70,6 +93,9 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
     // The serial decode pool (qsa_decode_pool_route) is retained device state from the first decode step on.
     const auto gsq = qpf2k::has_gsq_gate(manifest);
     const auto decode_pool = qsa_decode_pool_route(options, gsq) ? qsa_decode_pool_bytes(options, model, gsq) : 0U;
+    const auto mtp_pool=qsa_mtp_pool_bytes(options,model,gsq);
+    result.state_d1 = add(result.state_d1, mtp_pool);
+    result.device_base = add(result.device_base, mtp_pool?mtp_pool-mtp_qsa_pool_plan(options.context_tokens).metadata_bytes:0U);
     result.state_d1 = add(result.state_d1, decode_pool);
     result.device_base = add(result.device_base, decode_pool);
     result.workspace = add(add(plan.arena.physical.total_bytes, 65552U),plan.qsa_score_ring_workspace_bytes);
@@ -80,6 +106,7 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
     YarnPrefillOwnerGeometry geometry;
     geometry.compact_scores = plan.qsa_score_ring_workspace_bytes != 0;
     geometry.decode_pool_bytes = decode_pool;
+    geometry.mtp_pool_bytes = mtp_pool;
     const auto collect_geometry = [&](const CompiledKnownPrefixPrefill& item) {
         geometry.ring_bytes = add(geometry.ring_bytes,item.qsa_score_ring_workspace_bytes);
         if (item.terminal_logits_arena)
@@ -96,8 +123,42 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
         result.tails = add(result.tails, add(add(tail.arena.physical.total_bytes, 65552U),tail.qsa_score_ring_workspace_bytes));
         result.metadata = add(result.metadata, add(tail.host_metadata_payload_bytes, tail.host_metadata_payload_bytes));
     }
-    if (options.rotary.mode() == RotaryMode::yarn)
+    if (full_owners)
         append_yarn_owner_requirements(options,model,state,model_bytes,result,geometry);
+    if(full_owners && options.mtp.enabled) {
+        // Header census, not a budget-derived guess of Q4 payload. Asset loader
+        // independently verifies the pinned file/content before any execution.
+        gguf::Limits limits;limits.max_metadata_entries=256;limits.max_tensors=64;
+        const auto info=supplied_sidecar_info?*supplied_sidecar_info:gguf::read_file(options.mtp.sidecar,limits);
+        if(info.file_size!=options.mtp.sidecar_bytes) throw std::invalid_argument("YaRN MTP sidecar size changed before admission");
+        mtp_geometry.sidecar=info;
+#ifdef __linux__
+        const auto page=::sysconf(_SC_PAGESIZE);
+        if(page<=0) throw std::invalid_argument("YaRN MTP page size unavailable");
+        mtp_geometry.page_bytes=static_cast<std::uint64_t>(page);
+#endif
+        if(options.rotary.mode()==RotaryMode::yarn && !supplied_sidecar_info && options.mtp.golden_dump.empty())
+            require_mtp_forward_golden_geometry(options.mtp.golden,mtp_calibration_rows(options),
+                mul(model.hidden_size,model.hc_count),model.vocab_size,options.context_tokens);
+        const auto mtp=yarn_mtp_owners(options,model,mtp_geometry);
+        result.owner_phases["mtp_m1_keys"]=result.owner_phases["mtp_m1_scratch_metadata"]=mtp_all^mtp_setup;
+        result.owner_caps=mtp.caps;result.owner_actuals=mtp.actuals;result.owner_phases.insert(mtp.phases.begin(),mtp.phases.end());
+        result.mtp_post_setup_peak=mtp.post_setup_peak;result.owner_error=mtp.refusal;
+        for(const auto& [name,bytes]:mtp.bytes) result.owners.emplace(name,bytes);
+        result.device_base=add(result.device_base,mtp.device);
+    }
+    if(mtp_prompt_phase_separation(options)) {
+        for(const auto& [name,bytes]:result.owners) {
+            (void)bytes;
+            if(name=="prefill_workspace_and_status" || name=="tail_workspaces_and_status" ||
+               name=="qsa_score_ring" || name=="terminal_logits_stripes" || name=="plan_metadata" ||
+               name=="runtime_payload" || name=="qsa_shared_prefill_pool" || name=="qsa_batch_tables" ||
+               name=="gdn_retained_rows_and_controls" || name=="merged_routed_csr" ||
+               name=="routed_csr" || name=="ple_staging" || name=="ple_projections_and_gates" ||
+               name=="ple_snapshot_and_hashes" || name.starts_with("tail_"))
+                result.owner_phases[name]=mtp_setup|mtp_calibration|mtp_prompt;
+        }
+    }
     if (options.http_serve && options.rotary.mode() == RotaryMode::native) {
         const auto external=qwen_prefill_external_memory(options,model);
         result.external_host=external.host;
@@ -117,6 +178,8 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
         result.organization.emplace("qsa_score_ring_workspace_bytes",plan.qsa_score_ring_workspace_bytes);
         result.organization.emplace("qsa_score_ring_rows",plan.qsa_score_ring_rows);
     }
+    if(mtp_prompt_phase_separation(options)) result.organization.emplace("mtp_prompt_phase_separation",1U);
+    if(mtp_pool) result.organization.emplace("qsa_mtp_pool_bytes",mtp_pool);
     return result;
 }
 } // namespace strix::decode_cli

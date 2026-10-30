@@ -1,24 +1,15 @@
 #pragma once
 #include "strix/hip_mtp_runtime.hpp"
+#include "strix/mtp_forward_payload.hpp"
 #include "strix/mtp_forward_replay.hpp"
 #include <span>
+#include <functional>
 #include <vector>
 namespace strix {
-struct HipMtpForwardGoldenRow {
-    std::uint64_t source_position=0;
-    std::uint32_t source_input_token=0,next_input_token=0,selected_token=0;
-    std::vector<std::uint16_t> target_hidden_bf16,next_hidden_bf16;
-    std::vector<float> full_logits;
-};
-struct HipMtpForwardGolden {
-    ModelContentIdentity independent_source_content,target_content,sidecar_content;
-    std::uint64_t independent_reference_identity=0,structural_plan_identity=0,semantic_identity=0,numerical_profile_identity=0;
-    // Target arithmetic that produced the prompt rows (numerical_profile_identity above is the
-    // MTP head's own cast profile): the prefill and decode profile identities. Both zero in a
-    // version-1 file, which predates the split and records neither.
-    std::uint64_t target_prefill_profile_identity=0,target_decode_profile_identity=0;
-    std::vector<HipMtpForwardGoldenRow> rows;
-};
+// Checks the v3 contract before any target/predictor mutation. Legacy files are native only.
+void validate_mtp_forward_golden_rotary(const HipMtpForwardGolden&,const RotaryIdentity&,
+    std::uint64_t capacity,std::uint64_t prompt_prefill=0,std::uint64_t calibration_profile=0,
+    std::uint64_t decode_profile=0);
 // Framed SHA256 of supplied metadata and ALL source/next hidden/logit bytes.
 // This binds payloads, not the truth/independence of a supplied reference source.
 [[nodiscard]] ModelContentIdentity hip_mtp_forward_golden_payload_identity(const HipMtpForwardGolden&);
@@ -26,11 +17,9 @@ struct HipMtpForwardReplayRequest {
     MtpForwardReplayPolicy policy;
     ModelContentIdentity expected_golden_payload;
     std::uint64_t maximum_rows=0,host_payload_budget_bytes=0;
-};
-struct HipMtpForwardReplayRowReceipt {
-    std::uint64_t source_position=0,seed_position=0;
-    std::uint32_t selected_token=0,completed_steps=0;
-    ModelContentIdentity actual_hidden,actual_logits;
+    std::uint64_t target_prefill_profile_identity=0,target_decode_profile_identity=0,prompt_prefill_profile_identity=0;
+    // Optional host cancellation between completed calibration rows.
+    std::function<void()> safe_boundary = {};
 };
 struct HipMtpNativeForwardReplayResult {
     MtpForwardReplayObservation observation;
@@ -59,5 +48,5 @@ struct HipMtpNativeForwardReplayResult {
 // result admits only drafting (acceptance), never target output.
 [[nodiscard]] HipMtpForwardGolden capture_hip_mtp_forward_golden(
     HipMtpRuntime&,std::span<const HipMtpReplayRow>,const ModelContentIdentity& self_source_content,
-    std::uint64_t self_reference_identity);
+    std::uint64_t self_reference_identity, std::function<void()> safe_boundary = {});
 } // namespace strix

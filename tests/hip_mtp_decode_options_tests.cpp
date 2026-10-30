@@ -345,6 +345,12 @@ void campaign_defaults_contract(){
 }
 
 int main(){try{
+    {
+        auto args=request();args.insert(args.begin()+5,{"4","5","6","7","8","9","10"});args.insert(args.end(),{"--rope-yarn","2","--context","32768"});
+        const auto ym=parse(args);require(ym.mtp.enabled && ym.rotary.factor()==2,"explicit YMTP parser admission");
+        args[args.size()-3]="4";
+        reject_as(args,"YaRN MTP requires f2 at C<=524288 and f4 at C<=1048576", "small capacity uses f2 MTP band");
+    }
     const auto no_speculation = parse({"decoder","m","1","--generate","1","--known-prefix-window=0"});
     require(!no_speculation.mtp.enabled && !no_speculation.known_prefix_window,
         "automatic prefill off never infers MTP from environment-only tuning");

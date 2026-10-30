@@ -1,4 +1,5 @@
 #include "strix/hip_mtp_target_checkpoint.hpp"
+#include "strix/hip_indexed_attention_launcher.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_session_snapshot_transfer.hpp"
 #include "strix/hip_mtp_target_window.hpp"
@@ -11,15 +12,6 @@
 namespace strix {
 namespace {
 constexpr std::uint64_t alignment=256;
-std::uint64_t add(std::uint64_t a,std::uint64_t b) {
-    if(b>std::numeric_limits<std::uint64_t>::max()-a)
-        throw std::overflow_error("MTP target checkpoint reservation overflow");
-    return a+b;
-}
-std::uint64_t aligned(std::uint64_t n) {
-    const auto remainder=n%alignment;
-    return remainder?add(n,alignment-remainder):n;
-}
 void check(hipError_t result) {
     if(result!=hipSuccess) throw std::runtime_error("MTP target checkpoint HIP operation failed");
 }
@@ -52,78 +44,6 @@ bool same(const ModelRuntimeBinding& a,const ModelRuntimeBinding& b) {
 }
 } // namespace
 
-HipMtpTargetCheckpointReservation plan_hip_mtp_target_checkpoint(
-    const ModelContract& model,const SerialSessionStateLayout& layout,SessionSnapshotPolicy policy) {
-    validate_session_snapshot_policy(policy);
-    validate_serial_session_state_layout_identity(model,layout);
-    HipMtpTargetCheckpointReservation result;
-    // Sum every component irrespective of any current valid-state mask. Compact
-    // KV has one aligned range per layer, so include its worst-case padding.
-    for(const auto& allocation:layout.allocations) {
-        if(!allocation.bytes) continue;
-        auto& total=allocation.storage==SessionStateStorage::device?
-            result.device_payload_bytes:result.host_payload_bytes;
-        total=add(aligned(total),allocation.bytes);
-        if(policy==SessionSnapshotPolicy::occupied_kv_v1 &&
-           allocation.component==SessionStateComponent::attention_kv && model.full_attention_layers>1) {
-            for(std::uint64_t i=1;i<model.full_attention_layers;++i) total=add(total,alignment-1);
-        }
-    }
-    // Serial snapshot plans align the END of each section as well as each
-    // range start. Reserve that actual format extent before allocator padding.
-    result.device_payload_bytes=aligned(result.device_payload_bytes);
-    result.host_payload_bytes=aligned(result.host_payload_bytes);
-    result.retained_bytes=add(result.device_payload_bytes,result.host_payload_bytes);
-    if(result.device_payload_bytes) result.retained_bytes=add(result.retained_bytes,alignment-1);
-    if(result.host_payload_bytes) result.retained_bytes=add(result.retained_bytes,alignment-1);
-    return result;
-}
-
-HipMtpTargetRollbackPlan plan_hip_mtp_target_window_rollback(const ModelContract& model,
-    const SerialSessionStateLayout& layout,std::uint64_t position,std::uint32_t rows,bool status) {
-    validate_serial_session_state_layout_identity(model,layout);
-    const auto canonical=build_serial_session_state_layout(model,
-        {layout.context_tokens,layout.device_alignment,layout.host_alignment,true,layout.recurrent_storage});
-    if(canonical.layout_identity!=layout.layout_identity || layout.allocations.size()!=7 ||
-       (rows!=2 && rows!=4 && rows!=8) || position>layout.context_tokens || rows>layout.context_tokens-position ||
-       position>model.max_position_embeddings || rows>model.max_position_embeddings-position)
-        throw std::invalid_argument("MTP bounded rollback requires a canonical complete layout and closed in-capacity producer");
-    HipMtpTargetRollbackPlan plan;plan.first_position=position;plan.logical_rows=rows;
-    const auto attention=build_indexed_attention_state_layout(model);
-    const auto append=[&](const SessionStateAllocation& allocation,std::uint64_t offset,std::uint64_t bytes) {
-        if(offset<allocation.offset || offset-allocation.offset>allocation.bytes || bytes>allocation.bytes-(offset-allocation.offset))
-            throw std::invalid_argument("MTP rollback slice exceeds the actual component");
-        auto& total=allocation.storage==SessionStateStorage::device?plan.reservation.device_payload_bytes:plan.reservation.host_payload_bytes;
-        const auto destination=aligned(total);total=add(destination,bytes);
-        plan.ranges.push_back({allocation.component,allocation.storage,offset,destination,bytes,false});
-    };
-    for(const auto& allocation:layout.allocations) {
-        if(allocation.component==SessionStateComponent::attention_kv || allocation.component==SessionStateComponent::sparse_index) {
-            const auto row=allocation.component==SessionStateComponent::attention_kv?attention.kv_row_bytes:attention.raw_index_row_bytes;
-            if(!row || layout.context_tokens>UINT64_MAX/row || model.full_attention_layers>UINT64_MAX/(layout.context_tokens*row))
-                throw std::overflow_error("MTP rollback layer stride overflow");
-            const auto stride=layout.context_tokens*row;
-            if(allocation.storage!=SessionStateStorage::device || allocation.bytes!=stride*model.full_attention_layers)
-                throw std::invalid_argument("MTP rollback append-row geometry differs from actual canonical QSA storage");
-            for(std::uint64_t layer=0;layer<model.full_attention_layers;++layer)
-                append(allocation,add(allocation.offset,add(layer*stride,position*row)),rows*row);
-        } else {
-            // Mutable recurrent matrix, BOTH convolutions and BOTH host words
-            // are not append-only: preserve their complete declared extents.
-            append(allocation,allocation.offset,allocation.bytes);
-        }
-    }
-    if(status) {
-        auto& total=plan.reservation.device_payload_bytes;
-        const auto offset=aligned(total);total=add(offset,8);
-        plan.ranges.push_back({SessionStateComponent::position_history,SessionStateStorage::device,0,offset,8,true});
-    }
-    plan.reservation.retained_bytes=add(plan.reservation.device_payload_bytes,plan.reservation.host_payload_bytes);
-    if(plan.reservation.device_payload_bytes) plan.reservation.retained_bytes=add(plan.reservation.retained_bytes,alignment-1);
-    if(plan.reservation.host_payload_bytes) plan.reservation.retained_bytes=add(plan.reservation.retained_bytes,alignment-1);
-    return plan;
-}
-
 struct HipMtpTargetCheckpoint::Impl {
     ModelContract model;
     CompiledSerialExecution compiled;
@@ -147,6 +67,7 @@ struct HipMtpTargetCheckpoint::Impl {
     std::uint64_t compatibility=0;
     bool broken=false;
     std::shared_ptr<const HipMtpTargetWindowCapture> producer;
+    std::shared_ptr<HipQsaCommittedPool> qsa_pool;
     std::optional<HipMtpTargetRollbackPlan> rollback;
     ExecutionMemoryBinding deferred;
     void require_producer() const {
@@ -233,7 +154,7 @@ HipMtpTargetCheckpoint::HipMtpTargetCheckpoint(const ModelContract& model,
     hipStream_t stream,std::shared_ptr<const void> stream_owner,
     std::shared_ptr<const HipSetupQuiescenceGuard> guard,SessionSnapshotPolicy policy,
     std::uint64_t budget,AllocationGenerationSource& generations,
-    std::shared_ptr<const HipMtpTargetWindowCapture> producer):impl_(std::make_unique<Impl>()) {
+    std::shared_ptr<const HipMtpTargetWindowCapture> producer,std::shared_ptr<HipQsaCommittedPool> qsa_pool):impl_(std::make_unique<Impl>()) {
     if(!memory || !weights || !allocator || !stream_owner || !guard || !stream ||
        stream==hipStreamLegacy || stream==hipStreamPerThread || !budget || !compiled.execution_identity ||
        compiled.logical_rows!=1 || compiled.request_concurrency!=1 || memory->state().stage_mapping ||
@@ -246,7 +167,7 @@ HipMtpTargetCheckpoint::HipMtpTargetCheckpoint(const ModelContract& model,
     p.memory=std::move(memory); p.weights=std::move(weights); p.allocator=std::move(allocator);
     p.stream=stream; p.stream_owner=std::move(stream_owner); p.guard=std::move(guard); p.policy=policy;
     validate_session_snapshot_policy(policy);
-    p.producer=std::move(producer);
+    p.producer=std::move(producer);p.qsa_pool=std::move(qsa_pool);
     if(p.producer) p.deferred=p.producer->deferred_status_binding();
     const bool status=p.deferred.arena_base || p.deferred.arena_bytes || p.deferred.execution_identity || p.deferred.allocation_generation;
     if(status && (!p.producer || p.deferred.execution_identity!=p.producer->window_execution_identity() ||
@@ -321,6 +242,7 @@ void HipMtpTargetCheckpoint::restore(SerialSessionContext& session) {
     HipSessionSnapshotTransferBackend transfer(p.stream,p.guard);
     try {
         p.complete_owned_stream();
+        if(p.qsa_pool) p.qsa_pool->invalidate(false,0);
         restore_serial_session_snapshot_payload(restore,p.layout,p.memory->state(),view,transfer,&p.model);
         p.guard->require_original();
     } catch(...) {
@@ -367,7 +289,8 @@ void HipMtpTargetCheckpoint::restore_window(SerialSessionContext& session,const 
     auto recorded=*p.saved;
     const auto transfers=p.rollback_transfers(*p.rollback,true);
     HipSessionSnapshotTransferBackend transfer(p.stream,p.guard);
-    try {p.complete_owned_stream();transfer.restore_batch(transfers);p.guard->require_original();}
+    try {p.complete_owned_stream();if(p.qsa_pool) p.qsa_pool->invalidate(false,p.saved->next_position>3?p.saved->next_position-3:0);
+        transfer.restore_batch(transfers);p.guard->require_original();}
     catch(...) {
         p.broken=true;session.health=SerialSessionHealth::poisoned;session.arithmetic_lineage={};session.arithmetic_lineage.tainted=true;
         p.guard->recover_or_fail_stop();throw;

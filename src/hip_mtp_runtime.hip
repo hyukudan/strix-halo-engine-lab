@@ -1,6 +1,7 @@
 #include "strix/host_phase_timing.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/hip_mtp_runtime.hpp"
+#include "strix/hip_indexed_attention_launcher.hpp"
 #include "strix/hip_token_sampling.hpp"
 #include "strix/hip_token_sampling_device.hpp"
 #include <chrono>
@@ -233,6 +234,7 @@ struct HipMtpRuntime::Impl {
             static_cast<std::size_t>(source.bytes),hipMemcpyDeviceToDevice,static_cast<hipStream_t>(owner->stream())),"MTP owned copy enqueue failed");
     }
     void failure() noexcept {
+        if(owner->qsa_pool()) owner->qsa_pool()->cancel();
         if(batch_stream) {(void)hipStreamSynchronize(batch_stream);batch_stream=nullptr;}
         broken=true;active=false;cache_only_active=false;first_cache_reusable=false;primed_rows=0;owner->fail();validation.reset();
     }
@@ -324,6 +326,7 @@ struct HipMtpRuntime::Impl {
         start(input,&ticket);
         try {
             const auto selected=run_current();last_target=ticket;last_teacher_next_input=token;
+            if(owner->qsa_pool()) owner->qsa_pool()->commit(true,next_source);
             return {input.hidden_source_position,input.seed_position,profile,selected,static_cast<std::uint32_t>(native_steps.size()),
                 owner->view(HipMtpBuffer::wide_current),owner->view(HipMtpBuffer::logits),true};
         } catch(...) {failure();throw;}
@@ -351,6 +354,7 @@ struct HipMtpRuntime::Impl {
             launch_hip_mtp_cache_rows(c,stream);
             owner->complete();
             active=false;cache_only_active=false;++next_source;++stats.cache_only_rows;validation.reset();
+            if(owner->qsa_pool()) owner->qsa_pool()->commit(true,next_source);
             last_target=ticket;last_teacher_next_input=token;
         } catch(...) {failure();throw;}
     }
@@ -371,6 +375,7 @@ struct HipMtpRuntime::Impl {
         owner->require_idle();
         require(stats.cache_reused_rows!=UINT64_MAX,"MTP reused cache row counter exhausted");
         ++next_source;++stats.cache_reused_rows;
+        if(owner->qsa_pool()) owner->qsa_pool()->commit(true,next_source);
         last_target=row.hidden;last_teacher_next_input=row.next_input_token;
     }
     // Batched teacher cache rows: same per-row launches as teacher_cache, one
@@ -407,6 +412,7 @@ struct HipMtpRuntime::Impl {
             }
             owner->complete();
             active=false;cache_only_active=false;next_source+=rows.size();stats.cache_only_rows+=rows.size();validation.reset();
+            if(owner->qsa_pool()) owner->qsa_pool()->commit(true,next_source);
             last_target=rows.back().hidden;last_teacher_next_input=rows.back().next_input_token;
         } catch(...) {failure();throw;}
     }
@@ -682,6 +688,7 @@ void HipMtpRuntime::prime_hidden_rows_complete() {
     try {
         p.owner->complete();
         p.active=false;p.cache_only_active=false;p.next_source+=rows;p.stats.cache_only_rows+=rows;p.validation.reset();
+        if(p.owner->qsa_pool()) p.owner->qsa_pool()->commit(true,p.next_source);
         p.last_target.reset();p.last_teacher_next_input.reset();p.first_cache_reusable=false;p.ticketless_frontier=p.next_source;
     } catch(...) {p.failure();throw;}
 }
@@ -690,6 +697,10 @@ void HipMtpRuntime::restore_cache_frontier(const QualifiedMtpDraftPlan& plan,con
     require(!p.cycle && !p.active && !p.validation && !p.broken && p.next_source==0U && !p.last_target &&
         source<p.owner->context_capacity(),"MTP cache frontier restore requires a fresh idle owner within capacity");
     p.owner->require_idle();
+    if(p.owner->qsa_pool()) {
+        p.owner->qsa_pool()->invalidate(false,0);p.owner->qsa_pool()->invalidate(true,0);
+        p.owner->qsa_pool()->commit(false,source+1);p.owner->qsa_pool()->commit(true,source);
+    }
     p.next_source=source;p.ticketless_frontier=source;p.first_cache_reusable=false;
 }
 void HipMtpRuntime::begin_cycle(std::uint32_t token,const HipMtpTargetHiddenTicket& ticket) {
@@ -742,7 +753,11 @@ void HipMtpRuntime::enable_draft_chain(HipMtpDraftHeadConfig config,bool exact) 
                     &t.expert_down,&t.shared_gate,&t.shared_up,&t.shared_down}) {
                 require(v->manifest && v->runtime && v->manifest->ggml_type==8U && v->runtime->bytes%34U==0U,
                     "MTP draft Q4 copies require Q8_0 sidecar projections");
-                register_hip_mtp_draft_q4(reinterpret_cast<const void*>(v->runtime->address),v->runtime->bytes/34U*32U,p.owner->stream());
+                if(m.rotary_identity().descriptor().mode()==RotaryMode::yarn)
+                    register_hip_mtp_draft_q4(reinterpret_cast<const void*>(v->runtime->address),v->runtime->bytes/34U*32U,p.owner->stream(),
+                        p.owner->shared_target().actual_sidecar_owner,v->runtime->allocation_generation,
+                        p.owner->shared_target().sidecar_model_content_identity);
+                else register_hip_mtp_draft_q4(reinterpret_cast<const void*>(v->runtime->address),v->runtime->bytes/34U*32U,p.owner->stream());
             }
         }
         check(hipStreamSynchronize(static_cast<hipStream_t>(p.owner->stream())),"MTP draft HC injection copies");
@@ -914,6 +929,7 @@ std::string draft_batch_verify_coverage() {
 // Scratch both executions start from: the step buffers (except the wide input), the fast-MoE workspace, the head
 // logits and device slots, the proposal cache rows the chain may write and a guard window past them, all 0xFF.
 void HipMtpRuntime::Impl::batch_verify_poison(std::uint64_t first,std::uint64_t rows,std::uint64_t guard) {
+    if(owner->qsa_pool()) owner->qsa_pool()->invalidate(true,first);
     const auto stream=static_cast<hipStream_t>(owner->stream());
     const auto capacity=owner->context_capacity();
     const auto kv=owner->view(HipMtpBuffer::kv);const auto ix=owner->view(HipMtpBuffer::raw_index);
@@ -1207,6 +1223,7 @@ void HipMtpRuntime::reconcile_after_target(const QualifiedMtpDraftPlan& plan,con
     }
     host_phase_mark("9b reconcile preflight");
     try {
+        if(p.owner->qsa_pool()) p.owner->qsa_pool()->invalidate(true,p.base_source);
         p.next_source=p.base_source;
         // Earlier occupied rows were never overwritten. The whole proposal
         // suffix is now logically invalid until actual teacher pairs overwrite

@@ -163,6 +163,8 @@ struct HipKnownPrefixWindow::Impl {
     std::optional<CompiledSerialExecution> prefill_launcher_source;
     CompiledSerialExecution serial;
     ModelContract model;
+    const bool serial_rows_required;
+    const KnownWindowFolds allowed_folds;
     HipLauncherCatalogConfig config;
     ExecutionRuntimeResources resources;
     ExecutionMemoryBinding scratch;
@@ -261,13 +263,17 @@ struct HipKnownPrefixWindow::Impl {
         HipLaunchContext native_scope, std::shared_ptr<const void> owner,
         q51_known_rows::Workspace union_workspace,std::optional<CompiledKnownPrefixPrefill> tiled = std::nullopt)
         : actual_owner(std::move(owner)), window(std::move(source)), serial(std::move(serial_source)),
-          model(std::move(model_source)), config(std::move(config_source)), resources(serial_resources),
+          model(std::move(model_source)),
+          serial_rows_required(!tiled && model.rotary_identity().descriptor().mode()==RotaryMode::yarn),
+          allowed_folds(known_window_folds_for_route(serial_rows_required,{true,true,true})),
+          config(std::move(config_source)), resources(serial_resources),
           scratch(memory), scope(native_scope), routed_workspace(std::move(union_workspace)) {
         require_qwen_rotary_device_payload(model.rotary_identity(),model.qwen_rotary_table.get());
         if(model.qwen_rotary_table) validate_qwen_rotary_reader(*model.qwen_rotary_table,scope.stream);
         scope.gsq_model = resources.model_manifest && qpf2k::has_gsq_gate(*resources.model_manifest);
         const qpf2k::ModelScope defaults_scope(scope.gsq_model);
         prefill=std::move(tiled);
+        resources.qsa_pool_speculative=resources.qsa_committed_pool && !prefill;
         if (!actual_owner) throw std::invalid_argument("known-window native owner requires retained actual owners");
         if (const auto error = model.validate(); !error.empty()) throw std::invalid_argument(error);
         if (config.gdn_recurrent_storage != GdnRecurrentStorage::key_value ||
@@ -277,6 +283,8 @@ struct HipKnownPrefixWindow::Impl {
             serial.request_concurrency != 1U || config.activation != HipActivationStorage::bf16)
             throw std::invalid_argument("known-window native owner supports eager BF16 C1 plans only");
         validate_compiled_known_prefix_window(window, serial);
+        if(serial_rows_required && !known_window_policy_selection_admitted(window,false,scope.gsq_model,{}))
+            throw std::invalid_argument("YaRN verify window has no serial-row implementation; refused during setup");
         if(prefill) {
             validate_compiled_known_prefix_prefill(*prefill,serial);
             if(prefill->tile8.window_execution_identity!=window.window_execution_identity||
@@ -588,9 +596,12 @@ struct HipKnownPrefixWindow::Impl {
     //   output; STRIX_WINDOW_COMBINE_INJECT=1: a MoE-combine rows step, the MLP inject and the next HC rows step
     //   run as combine+inject+norm, split-K, output. The folded steps are recorded as completed without a launch.
     static bool env_on(const char* name) { const char* v = std::getenv(name); return v && v[0] == '1'; }
-    static bool inject_norm_enabled() { return strix_window_inject_norm_enabled(); }
-    static bool combine_inject_enabled() { static const bool on = env_on("STRIX_WINDOW_COMBINE_INJECT"); return on; }
-    static bool commit_combine_enabled() { return strix_window_commit_combine_enabled(); }
+    bool inject_norm_enabled() const { return allowed_folds.inject_norm && strix_window_inject_norm_enabled(); }
+    bool combine_inject_enabled() const {
+        if(!allowed_folds.combine_inject) return false;
+        static const bool on = env_on("STRIX_WINDOW_COMBINE_INJECT"); return on;
+    }
+    bool commit_combine_enabled() const { return allowed_folds.commit_combine && strix_window_commit_combine_enabled(); }
     std::vector<std::size_t> folded_steps;
     bool hc_rows_step(std::size_t i) const {
         const auto op = serial.execution.steps[i].op;
@@ -922,8 +933,9 @@ struct HipKnownPrefixWindow::Impl {
         qsa_config.dense_g64_prefill=(config.fast_prefill_components & kFastPrefillDense8) != 0U;
         qsa_config.qsa_fast_prefill=(config.fast_prefill_components & kFastPrefillQsa) != 0U;
         if(!prefill) {
+            qsa_config.committed_pool=resources.qsa_committed_pool;
             const char* pool=std::getenv("STRIX_QKERN_QSA_PERSISTENT");
-            if(pool && pool[0]=='1') qsa_config.window_pool=make_hip_qsa_window_pool();
+            if(!qsa_config.committed_pool && pool && pool[0]=='1') qsa_config.window_pool=make_hip_qsa_window_pool();
         }
         if(prefill && prefill->external_qsa_score_bytes) {
             qsa_config.exact_score_owner=make_hip_qsa_exact_score_owner(model.effective_max_positions(),
@@ -1063,7 +1075,7 @@ struct HipKnownPrefixWindow::Impl {
                 }});
         }
         if(window.ple_rows_steps) {
-            ple_window=prefill ? std::make_unique<HipPleKnownWindow>(model,config.activation,prefill->logical_rows,true) :
+            ple_window=prefill ? std::make_unique<HipPleKnownWindow>(model,config.activation,prefill->logical_rows,true,&resources) :
                 std::make_unique<HipPleKnownWindow>(model,config.activation,window.logical_rows);
             rows_entries.push_back({KnownWindowR2Variant::ple_rows_host_staged_v1,this,
                 [](std::span<const ExecutionDispatchContext> rows,void* object) {
@@ -2446,10 +2458,16 @@ KnownWindowOutputPolicy HipKnownPrefixWindow::output_policy() const noexcept { r
 std::optional<HipKnownPrefixUnionObservation> HipKnownPrefixWindow::latest_routed_union_observation() const noexcept {
     return impl_->failed?std::nullopt:impl_->last_union_observation;
 }
+std::string HipKnownPrefixWindow::arithmetic_witness() const {
+    const auto& i=*impl_;
+    return known_window_arithmetic_witness(i.window,i.serial_rows_required,!!i.prefill,i.scope.gsq_model,
+        {i.inject_norm_enabled(),i.combine_inject_enabled(),i.commit_combine_enabled()});
+}
 bool HipKnownPrefixWindow::policy_selection_admitted() const noexcept {
     const auto& i=*impl_;
+    // Preserve native lazy-reader ordering as well as its selected arithmetic.
     if(i.prefill || i.scope.gsq_model || i.inject_norm_enabled() || i.combine_inject_enabled() || i.commit_combine_enabled()) return false;
-    return known_window_policy_serial_rows(i.window);
+    return known_window_policy_selection_admitted(i.window,false,false,{});
 }
 bool HipKnownPrefixWindow::defers_state() const noexcept {
     return impl_->window.gdn_deferred_rows_steps || impl_->window.ple_rows_steps;

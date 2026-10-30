@@ -122,14 +122,17 @@ Register the mmap-backed GGUF without a second full model allocation.
 
 **Engine:** `qwen`. **Control:** `STRIX_PLE_RECLAIMABLE=auto`. **Default:** auto.
 
-Reclaim file-backed L1 PLE pages and prefetch the required pages, allowing the measured T8192 route at 128K/262K.
+Reclaim file-backed L1 PLE pages and gather immutable rows through bounded owned O_DIRECT buffers.
 
-- **Preconditions:** Linux, nonempty plain CLI prompt, tiled known prefill, registered file mapping, no model copies or graph promotion, no MTP/cohort/serving/planned PLE IO. Exactly one file-backed IQ4_NL/BF16 n-gram table, valid extents and unregistered interior pages, valid prompt hashes, and a verified page drop within the existing residual bound.
-- **Automatic selection:** Auto tries the existing page-drop/prefetch admission. Admitted auto uses the same credit, checks and receipt text as explicit =1. Defaulted auto is suppressed for GSQ owners and by STRIX_QPF2K_DEFAULTS=0; explicit settings retain their checks. Prefetch scheduling is unchanged.
-- **Fallback notice:** Unsupported routes or failed auto setup silently keep the original warm path, without credit or PLE reclaim receipt fields. Explicit =1 still refuses failed admission.
-- **Exactness evidence:** Page contents are unchanged; long-context token/logit digest evidence applies to the admitted non-GSQ identity. GSQ page-drop behavior is not qualified by these results.
+- **Preconditions:** Linux, nonempty plain CLI prompt, tiled known prefill, registered file mapping, no model copies or graph promotion, no cohort/serving/planned PLE IO. The MTP CLI extension requires one eager tiled request, R2/R4/R8 verifier owners (including adaptive row sets and min-p speculation), and no wide-copy verifier, depth/survival controller, golden dump, metadata-only diagnostic, recording or sampled timing schedule. Exactly one file-backed IQ4_NL/BF16 n-gram table, valid extents and unregistered interior pages, valid prompt hashes, and a verified page drop within the existing residual bound.
+- **Automatic selection:** Auto tries verified page-drop admission. Rolling opens the actual mapped inode a second time with O_DIRECT and probes aligned reads before setup drop or credit. Raw Linux io_uring syscalls use a 512-request queue and a dedicated submission/completion thread, without liburing. Sorted, deduplicated 4 KiB pages coalesce into runs of at most 128 KiB. Unsupported setup/opcode detection (ENOSYS, EPERM or EINVAL) retains the checked O_DIRECT descriptor and selects the existing 32-thread pread pool; the activation witness names the backend and fallback errno. Short aligned completions continue, EINTR/EAGAIN retry within a fixed limit, and other errors invalidate source credit after draining I/O. The setup helper submits the next GPU block first and waits for its complete read wave before issuing later-block lookahead. Small caps split that wave in position order. Queued shared runs are promoted on critical demand, and lookahead dispatch pauses while a critical request remains pending, including beyond device queue depth. Rows, including page straddles, are copied exclusively from an owned aligned arena; the rolling reader has no model-mapping pointer. The primary plain-CLI prefill owner starts block-0 staging during runtime setup, overlapping the already active bounded direct-read lookahead and subsequent setup. A single claim prevents tail owners from duplicating that prime. The c1 worker starts the next GPU block's copy before the current block's PLE GPU launches, using the idle staging slot in H=1024 source chunks, while lookahead targets two GPU blocks ahead. Each completed source chunk supplies an immutable pinned page-to-buffer view to the joined copy workers; these helpers avoid per-row ledger/cache locks while using the same row conversion and destination offsets. Plain rolling hashes independent position ranges in parallel with the same preceding token history and EOS rules. Decode retains its existing source leases and lookup paths. Plain CLI reservations protect current, future and in-flight pages; consumed pages remain cached until capacity pressure requires replacement. Smaller caps split source windows and shrink or throttle lookahead. Both plain CLI and MTP decode use a fixed replaceable 256 MiB source LRU by default, independent of generation length. MTP retains explicit turn/epoch bindings, calibration draining and fresh repeated-sample turns. After calibration drains, its prompt phase starts the same critical-first capped lookahead pipeline; preflight primes block-0 staging and c1 fills the next block at the original offsets. Joined helpers validate immutable source views against the turn, phase, mapping and file offset. Tail-owner copies share one source permit, and phase changes/cancellation drain registered staging tasks before retiring prompt pages. The prompt pipeline retires before adaptive decode reuses the source arena. Adaptive R2/R4/R8 verify gathers lease their complete physical row horizon, including min-p padding, against the same fixed decode quota until CPU staging completes. Serial fallback and rejection replay retain or re-fetch identical owned rows; speculative absolute positions never advance the prompt cursor. Min-p may select owners using measured costs: enabling residency does not freeze that schedule or establish native token/logit/state equality. The predictor receives no PLE credit. Source failures invalidate credit, and cleanup drains readers and I/O. After the one-time setup drop, rolling performs no madvise, fadvise or mincore during source gathers or decode. One table-wide mincore observes the mapping at each drained request end (and final retirement); shared boundary pages and the setup residual may remain. HTTP, cohorts, graph, copied-model, cache restore and planned-I/O routes retain their exclusions. Mapper-protected PLE interiors retain the previous plain prompt-wide path. Defaulted auto remains suppressed for GSQ owners and STRIX_QPF2K_DEFAULTS=0.
+- **MTP admission and status:** Inspection predicts the envelope but always reports verified credit as zero. Runtime credit is available only after setup drop/mincore verification and is subtracted once from model backing. Plain and MTP prefill share one reservation function: verified credit already includes the cap, decode quota and margin, which are never added again. Reader/turn metadata stays separately charged. Sidecar setup has retired before this check; only its retained cap remains. The MTP window charge is bounded by its shared arena cap plus four capture caps per configured owner and the checkpoint cap only when full rollback allocates it, also bounded by the native combined total cap. Golden/replay caps are setup payload. All native limits stay enforced, with conservative total/incremental/GTT checks and a 4 GiB physical margin. Credit never augments MemAvailable or remaining GTT. Automatic MTP setup failure refuses before warming because a zero-credit fallback envelope has not been admitted. CPU source-byte/lifecycle tests do not qualify native MTP tokens, terminal logits or canonical state; GPU ON/OFF qualification remains required. No extended-context or serving qualification follows from this memory policy.
+- **Rolling controls:** `STRIX_PLE_ROLLING=0` or `STRIX_CTX_EXACT_MEMORY=0` restores the previous prompt-wide mmap planner, credit and staging path on plain CLI, and whole-table warm residency with zero credit on MTP. Both switches ignore rolling tuning. `STRIX_PLE_ROLLING_POSITIONS` accepts powers of two from 256 through 65536. `STRIX_PLE_ROLLING_CAP_BYTES` selects the owned prefill cap for both rolling routes; the default is 3221225472 bytes. It must be page aligned and hold two worst-case positions; MTP additionally requires space for its H-sized wave. The aligned arena reserves cap plus decode allowance as process memory. Admission and inspection use the same cap plus decode plus 64 MiB plus cap/64 formula; metadata has a separate conservative owner reservation (512 bytes per possible arena page plus 2 MiB for reader/ledger/queue metadata, in addition to prompt IDs and turn metadata). File-cache contribution of direct source reads is zero. `STRIX_PLE_ROLLING_STATS=1` reports reads issued, bytes read, cache hits, background/demand read-wait time, owned arena and used-page peaks, and end-of-request mapping resident pages. Plain rolling also emits one stderr line per consumed block with its block index, first position, rows, bytes-read, read-wait-ms, copy-ms, hash-ms and join-wait-ms, plus critical-bytes, critical-read-ms, critical-iops, critical-MB-s and lookahead-bytes. Critical bytes and operations count newly issued reads assigned to source windows overlapping the consumed block, including setup and independent lookahead reads that prepared it. Critical read time spans their first submission through last completion; IOPS includes retry/short-read completions and MB/s uses decimal megabytes. These are application I/O rates, not device counters. Shared completed cache hits contribute zero new bytes. Lookahead bytes count completed read waves assigned beyond this block at the observation. Cap-split waves retain their original source-window attribution; overlapping partial launches can therefore include the same wave and must not be summed as independent I/O. Bytes count new reads assigned to that block's staging/demand issuer (including its setup prime); shared pending reads are counted only by their issuer, and independent lookahead remains in the summary. Read wait is caller time joining owned-page completion, copy is joined conversion/copy wall time, hash includes launcher validation, and join wait is exposed launch-thread time. Copy/read times may be hidden by setup or GPU work and must not be added to join wait. All block fields are STATS-only and never enter stdout or numerical digests. Existing gather hidden/exposed time, horizon, throttle and split-window diagnostics remain. Background read wait includes lookahead and c1 demand; it measures CPU waiting, not proof of GPU overlap. Inspection reports zero verified credit because it exits before setup.
+- **Session and prefix ownership:** Session load, live continuation and a follow-up session prompt retain the public warm route; fixed MTP sessions do not acquire rolling turn leases. A plain save of the initial request may finish its current lease after synchronous capture. Prefix-cache restore/import and follow-up prompt routes retain the public prompt-wide PLE planner: their restored numerical state does not carry an owned rolling source window, and a finished owner is never reused as a new rolling prompt. Native qualification of rolling restore ownership remains pending.
+  - **Fallback notice:** Automatic setup errors, including unsupported O_DIRECT opens and direct probe failures, tear down rolling readers and drop all credit. A fresh complete resident admission must pass before warming or prompt mutation; failure clearly refuses and never disables MTP. Required reclaim refuses without substitution. Post-admission read errors fail closed with a nonzero exit: mutated target/predictor state has no pristine transactional replay checkpoint, even before token publication. A fresh invocation is required. No rolling route silently substitutes buffered reads. Unsupported-route witnesses name the first applicable exclusion (for example `mtp-copy-wide-rows`, `mtp-golden-dump`, `mtp-sample-timing-schedule`, `mtp-metadata-only` or `raw-recording`). The [shipped qualification table](engine/qsa-committed-pool.md) specifies defaults and explicit opt-ins.
+- **Exactness evidence:** Hashing, stored rows, IQ4_NL decoding, BF16 conversion, destination offsets and GPU arithmetic are unchanged. CPU tests cover aligned/coalesced direct reads, EOF/EINTR/read failures, queue draining, in-flight deduplication, adversarial cap and decode-LRU pressure, and literal byte equality across 200,000-position plain and MTP prefill/decode streams with the model mapping protected against reads. These tests do not establish native GPU state/logit/token identity or throughput. Native capacity, fidelity and complete-workload qualification remain required.
 - **Off switch:** STRIX_PLE_RECLAIMABLE=0
-- **Measured gain:** Capacity admission for T8192 at 128K/262K; no isolated speed attribution
+- **Measured gain:** Historical prompt-wide admission supports T8192 at 128K/262K; rolling native qualification is pending. No isolated speed attribution.
 - **Implementation / evidence:** [Admission](../include/strix/ple_reclaim.hpp), [implementation](../src/ple_reclaim.cpp)
 
 <a id="qwen-defaults"></a>
@@ -145,7 +148,7 @@ Supply unset per-item values; retain explicit overrides. The 13 QPF2K items and 
 - **Fallback notice:** No general initializer notice. Operators retain guards; GSQ no longer requires disabling defaults just to run. Explicit unqualified GSQ controls still fail validation.
 - **Exactness evidence:** Tokens and terminal FP32 logits digests match the reference for the selected profile pair, including 32K/64K/128K/262K. Fast FP16 prefill is exact relative to its own reference, not bit-identical to dense-A8 serial prefill; longer-context fidelity remains outside the 8192 qualification.
 - **Off switch:** STRIX_QPF2K_DEFAULTS=0 in a fresh process with individual overrides unset; --baseline / STRIX_BASELINE=1 additionally suppresses controlled explicit environment items and restores historical policy.
-- **Measured gain:** Combined 32K 25.95 → 23.49 s (−9.5%); later 22.03 s is a separate measurement
+- **Measured gain:** Combined 32K 25.95 -> 23.49 s (-9.5%); later 22.03 s is a separate measurement
 - **Implementation / evidence:** [Default table](../include/strix/qpf2k_defaults.hpp)
 
 #### The 13 QPF2K defaults
@@ -383,7 +386,7 @@ Batch compatible index projection rows.
 
 **Engine:** `qwen`. **Control:** `STRIX_LM_HEAD_COHORT_LEAN`. **Default:** 1.
 
-For an explicitly active multi-session head, split compatible 9–32-row cohorts into eight-row pieces using the lean head. The admitted plain CLI receipt includes this setting but has no active cohort.
+For an explicitly active multi-session head, split compatible 9-32-row cohorts into eight-row pieces using the lean head. The admitted plain CLI receipt includes this setting but has no active cohort.
 
 - **Preconditions:** Admitted decoder environment; this injection does not enable active multi-session serving heads.
 - **Automatic selection:** Unspecified value becomes 1 only after decoder admission; explicit values win.
@@ -467,7 +470,7 @@ Stage-batch the QSA scorer over more rows, reusing the loaded keys.
 - **Fallback notice:** `=0` disables only this item and keeps the tiled route; shapes outside the admission keep the previous kernel.
 - **Exactness evidence:** Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.
 - **Off switch:** STRIX_QPF2K_SCORE_ROWS=0 (16 rows)
-- **Measured gain:** ≈ −1.6 s at 262K together with PLE row batching (~−10 ms at 32K); combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)
+- **Measured gain:** ~ -1.6 s at 262K together with PLE row batching (~-10 ms at 32K); combined five-item set -0.71 s (-3.2 %) at 32K vs all five off (interleaved, same build)
 - **Implementation / evidence:** [defaults](../include/strix/qpf2k_defaults.hpp), [engine reference](getting-started/engine-reference.md)
 
 <a id="qwen-ple-batch"></a>
@@ -483,7 +486,7 @@ Run the per-layer-embedding projection in 64-row groups; the wide lane recipe, l
 - **Fallback notice:** `=0` disables only this item and keeps the tiled route; shapes outside the admission keep the previous kernel.
 - **Exactness evidence:** Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.
 - **Off switch:** STRIX_PREFILL_PLE_BATCH=0
-- **Measured gain:** Included in the scorer figure above (−0.16 s raw kernel time at 262K); combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)
+- **Measured gain:** Included in the scorer figure above (-0.16 s raw kernel time at 262K); combined five-item set -0.71 s (-3.2 %) at 32K vs all five off (interleaved, same build)
 - **Implementation / evidence:** [defaults](../include/strix/qpf2k_defaults.hpp), [engine reference](getting-started/engine-reference.md)
 
 <a id="qwen-shared-pre"></a>
@@ -499,7 +502,7 @@ Build the shared expert's FP16 operand once for gate/up and down; the existing t
 - **Fallback notice:** `=0` disables only this item and keeps the tiled route; shapes outside the admission keep the previous kernel.
 - **Exactness evidence:** Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.
 - **Off switch:** STRIX_QPF2K_SHARED_PRE=0
-- **Measured gain:** ~−1 % TTFT at 32K; combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)
+- **Measured gain:** ~-1 % TTFT at 32K; combined five-item set -0.71 s (-3.2 %) at 32K vs all five off (interleaved, same build)
 - **Implementation / evidence:** [defaults](../include/strix/qpf2k_defaults.hpp), [engine reference](getting-started/engine-reference.md)
 
 <a id="qwen-moe-merge-commit"></a>
@@ -515,7 +518,7 @@ Merge expert outputs in a fixed order and commit BF16 rows in the same pass, beh
 - **Fallback notice:** `=0` disables only this item and keeps the tiled route; shapes outside the admission keep the previous kernel.
 - **Exactness evidence:** Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.
 - **Off switch:** STRIX_QPF2K_MOE_MC=0
-- **Measured gain:** ~−0.10 s at 32K; combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)
+- **Measured gain:** ~-0.10 s at 32K; combined five-item set -0.71 s (-3.2 %) at 32K vs all five off (interleaved, same build)
 - **Implementation / evidence:** [defaults](../include/strix/qpf2k_defaults.hpp), [engine reference](getting-started/engine-reference.md)
 
 <a id="qwen-moe-header-reuse"></a>
@@ -531,7 +534,7 @@ Reuse loaded superblock headers between gate and up within the DA16 tune 80/82 p
 - **Fallback notice:** `=0` disables only this item and keeps the tiled route; shapes outside the admission keep the previous kernel.
 - **Exactness evidence:** Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.
 - **Off switch:** STRIX_QPF2K_MOE_HDR=0
-- **Measured gain:** ~−0.07 s at 32K; combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)
+- **Measured gain:** ~-0.07 s at 32K; combined five-item set -0.71 s (-3.2 %) at 32K vs all five off (interleaved, same build)
 - **Implementation / evidence:** [defaults](../include/strix/qpf2k_defaults.hpp), [engine reference](getting-started/engine-reference.md)
 
 <a id="qwen-qsa-union-merge"></a>
@@ -547,7 +550,7 @@ Build the attend union by merging per-row selections instead of the range form; 
 - **Fallback notice:** Below its threshold or outside the plain route, the previous exact form runs.
 - **Exactness evidence:** Exact: union, score and decode fixtures byte-identical (score rows R16/R32/R64 to 262,144 blocks); at 262,143 tokens the 456-call QSA trace with these defaults is byte-identical to all levers off and the token matches; tokens identical at 32K/131K/262,080.
 - **Off switch:** STRIX_QSA_UNION_MERGE=0
-- **Measured gain:** union kernel −46 % at 75K blocks, −73 % at 262K blocks
+- **Measured gain:** union kernel -46 % at 75K blocks, -73 % at 262K blocks
 - **Implementation / evidence:** [QSA launcher](../src/hip_indexed_attention_launcher.hip)
 
 <a id="qwen-qsa-decode-pool"></a>
@@ -582,8 +585,20 @@ evidence below was measured with FP32 pools.
 - **Fallback notice:** Below its threshold or outside the plain route, the previous exact form runs.
 - **Exactness evidence:** Exact: union, score and decode fixtures byte-identical (score rows R16/R32/R64 to 262,144 blocks); at 262,143 tokens the 456-call QSA trace with these defaults is byte-identical to all levers off and the token matches; tokens identical at 32K/131K/262,080.
 - **Off switch:** STRIX_QSA_DECODE_POOL=0
-- **Measured gain:** plain serial CLI decode at 262K 75.7 → 53.0 ms/step (−30 %), at 131K −14.7 % (measured with decode selection also on; the default MTP/HTTP route does not use the pool yet)
+- **Measured gain:** plain serial CLI decode at 262K 75.7 to 53.0 ms/step (-30 %), at 131K -14.7 % (measured with decode selection also on; the separate MTP shared service has no measured gain)
 - **Implementation / evidence:** [QSA launcher](../src/hip_indexed_attention_launcher.hip)
+
+<a id="qwen-qsa-mtp-pool"></a>
+
+### QSA MTP committed BF16 key service
+
+The separate [MTP committed key service](engine/qsa-committed-pool.md) uses
+`STRIX_QSA_MTP_POOL` and one thirteen-entry owner per session. Its native
+logits/state and workload qualification remain pending; the YaRN CLI scope
+includes the full 1M factor-4 prose gate described below. The seven-row
+[route table](engine/qsa-committed-pool.md) enables rolling PLE and the MTP pool
+by default for factor 2 through 524288 and factor 4 through 1048576; both `=0`
+off switches remain authoritative.
 
 <a id="qwen-qsa-decode-select"></a>
 
@@ -614,7 +629,7 @@ Use 64-row scorer tiles at very long contexts (previously pinned to 16 rows abov
 - **Fallback notice:** Below its threshold or outside the plain route, the previous exact form runs.
 - **Exactness evidence:** Exact: union, score and decode fixtures byte-identical (score rows R16/R32/R64 to 262,144 blocks); at 262,143 tokens the 456-call QSA trace with these defaults is byte-identical to all levers off and the token matches; tokens identical at 32K/131K/262,080. R64 evidence is fixture-only: no native shape reaches 65,536 blocks.
 - **Off switch:** STRIX_QSA_SCORE_ROWS64=0
-- **Measured gain:** scorer at 1M tokens R16 → R64 −42 %
+- **Measured gain:** scorer at 1M tokens R16 -> R64 -42 %
 - **Implementation / evidence:** [QSA launcher](../src/hip_indexed_attention_launcher.hip)
 
 `STRIX_QSA_POOL_PACKED=1` (packed BF16 pooled keys) is included as an exact opt-in; it is not a default.
@@ -748,6 +763,21 @@ cannot overlap later compute, is a large one. Rows stay chronological; only bloc
 - **Measured gain:** TTFT -12.7 % at 1K, -7.9 % at 8K, -5.0 % at 32K against the original order.
 - **Implementation / evidence:** [CUDA Qwen prefill scheduling](engine/serving/qwen-cuda-prefill.md)
 
+<a id="qwen-yarn-mtp"></a>
+
+### YaRN long-context MTP CLI
+
+**Engine:** `qwen`. **Control:** `--rope-yarn 2|4 --context C --mtp`, `STRIX_QWEN_YARN_MTP=0`, `STRIX_QSA_MTP_POOL`, `STRIX_PLE_ROLLING`. **Default:** table-backed QSA MTP pool and rolling PLE for factor 2 through 524,288 and factor 4 through 1,048,576 positions when admitted.
+
+Speculative MTP decode on the static YaRN CLI route, with the committed QSA MTP pool and rolling PLE reads so that a
+1,048,576-position context fits one node. YaRN itself stays opt-in because it changes outputs against native rotary.
+
+- **Preconditions:** CLI only (HTTP refuses YaRN); explicit `--context`; pinned sidecar and version-3 golden; memory admission with a 4 GiB physical margin. The [storage admission ladder](engine/speculative/mtp-native-cli.md#explicit-yarn-mtp-cli) tries defaults, H1024/cap268435456/ring256/PIPE-default, then H256/cap33554432/ring64/PIPE0. Only memory refusal advances it; explicit environment values pin each knob. `storage_ladder_step` and chosen sizes appear in inspection and run receipts.
+- **Exactness evidence:** Against serial YaRN at 1,048,576 positions (factor 4, real prose prompt): all 256 generated tokens, every committed step's full-vocabulary logits, prompt and final target state and predictor state are identical between MTP with the pool, plain serial YaRN and MTP with the pool off. 262K (full scope) and 524K (target scope) are identical as well.
+- **Off switch:** omit `--mtp` for serial YaRN; `STRIX_QSA_MTP_POOL=0` and `STRIX_PLE_ROLLING=0` restore the previous pool and PLE paths.
+- **Measured gain:** MTP speculative decode on YaRN contexts through 1,048,576 positions on one node; serial YaRN is the comparator.
+- **Implementation / evidence:** [YaRN MTP CLI](engine/speculative/mtp-native-cli.md#explicit-yarn-mtp-cli)
+
 <a id="qwen-tool-draft"></a>
 
 ### Tool-call frame drafts
@@ -792,8 +822,8 @@ then the model's `packs` directory, then the model directory. Missing prerequisi
 `STRIX_DS41_BASELINE=1` stops pack/draft/argv injection and sets the nine recent defaults off unless explicitly
 overridden: grouped shared work, shared down, MoE prefill, dense selector, three attention settings, serving
 warm-up and calibration. Older kernel/transport defaults remain; disable them individually for an older reference.
-The combined qualified build measured 1K/8K TTFT 2.098 → 1.954 s / 11.090 → 9.757 s, R1 −1.9%,
-R6 −2.4%, N8 −2.2%, and warmed C1 43.58 → 48.00 tok/s. These are build gains, not item attribution.
+The combined qualified build measured 1K/8K TTFT 2.098 -> 1.954 s / 11.090 -> 9.757 s, R1 -1.9%,
+R6 -2.4%, N8 -2.2%, and warmed C1 43.58 -> 48.00 tok/s. These are build gains, not item attribution.
 
 <a id="ds-packs"></a>
 
@@ -889,7 +919,7 @@ halves, instead of both reading the whole ~160 MB weight.
 - **Fallback notice:** Without two ranks or the F8 Engram KV, the full projection runs on each rank.
 - **Exactness evidence:** Bitwise: R1-R8 verify windows with rejects equal the archived full-projection digests on both ranks; batch N1/N2/N4/N8 in-process A/B (fed, argmax, gathered logits per row and final attention states) identical, also on the communicator fallbacks.
 - **Off switch:** STRIX_DS41_ENGRAM_TP=0 (off), =r1 (single-row steps only)
-- **Measured gain:** R1 decode −0.61 ms/step (−2.1 %); verify windows (rank app, in-process ABA x4, every arm bitwise on both ranks, steps of up to 8 rows vs off): R1 −2.1 %, R2 −1.5 %, R4 −1.0 %, R6 −1.0 % (95 % intervals below zero), R8 −0.6 % (3/3 pairs faster)
+- **Measured gain:** R1 decode -0.61 ms/step (-2.1 %); verify windows (rank app, in-process ABA x4, every arm bitwise on both ranks, steps of up to 8 rows vs off): R1 -2.1 %, R2 -1.5 %, R4 -1.0 %, R6 -1.0 % (95 % intervals below zero), R8 -0.6 % (3/3 pairs faster)
 - **Implementation / evidence:** [production defaults](models/deepseek-v4.1/production-defaults.md)
 
 <a id="ds-shared-grouped"></a>
@@ -1192,7 +1222,7 @@ Router, projection/fork, MoE, attention and norm decode kernels.
 - **Fallback notice:** Supported shapes use optimized forms; incompatible explicit requests retain validation.
 - **Exactness evidence:** Replica gate pass, complete target-greedy token vectors and canonical state/position digests equal within the standalone Q2/Q8 identity; pressure and forced-window gates cover committed-prefix state.
 - **Off switch:** --dsrtxk-off
-- **Measured gain:** All-hit 12.62 → 10.50 ms/token; full loop 5.8–10.8%
+- **Measured gain:** All-hit 12.62 -> 10.50 ms/token; full loop 5.8-10.8%
 - **Implementation / evidence:** [Standalone defaults and gates](models/deepseek-v4.1/rtx-standalone.md#optimizations-default-on-and-off-switches)
 
 <a id="rtx-fusions"></a>
@@ -1235,12 +1265,12 @@ Move step records off the critical path.
 
 Use form 2 router.
 
-- **Preconditions:** Supported router rows 1–8.
+- **Preconditions:** Supported router rows 1-8.
 - **Automatic selection:** Default form 2 in decode configuration.
 - **Fallback notice:** Shape dispatch keeps a supported exact form; no general decline notice.
 - **Exactness evidence:** Replica gate pass, complete target-greedy token vectors and canonical state/position digests equal within the standalone Q2/Q8 identity; pressure and forced-window gates cover committed-prefix state.
 - **Off switch:** --router-pf0
-- **Measured gain:** R1 17.3 → 15.4 us; eight-layer device time −0.5%
+- **Measured gain:** R1 17.3 -> 15.4 us; eight-layer device time -0.5%
 - **Implementation / evidence:** [Standalone defaults and gates](models/deepseek-v4.1/rtx-standalone.md#optimizations-default-on-and-off-switches)
 
 <a id="rtx-qakv"></a>
@@ -1256,7 +1286,7 @@ Use split-1 query/KV scheduling.
 - **Fallback notice:** Supported exact dispatch retained outside specialized geometry.
 - **Exactness evidence:** Replica gate pass, complete target-greedy token vectors and canonical state/position digests equal within the standalone Q2/Q8 identity; pressure and forced-window gates cover committed-prefix state.
 - **Off switch:** --qakv-auto
-- **Measured gain:** Eight-layer device time −1.54 to −1.94%
+- **Measured gain:** Eight-layer device time -1.54 to -1.94%
 - **Implementation / evidence:** [Standalone defaults and gates](models/deepseek-v4.1/rtx-standalone.md#optimizations-default-on-and-off-switches)
 
 <a id="rtx-q8"></a>
@@ -1272,7 +1302,7 @@ Use compact single-row kernel without padding.
 - **Fallback notice:** One-time notice for shapes requiring the generic exact Q8 kernel.
 - **Exactness evidence:** Replica gate pass, complete target-greedy token vectors and canonical state/position digests equal within the standalone Q2/Q8 identity; pressure and forced-window gates cover committed-prefix state.
 - **Off switch:** --q8-r1-off; --q8-r1-pad selects padded form
-- **Measured gain:** Eight-layer device time −0.80 / −0.53%
+- **Measured gain:** Eight-layer device time -0.80 / -0.53%
 - **Implementation / evidence:** [Standalone defaults and gates](models/deepseek-v4.1/rtx-standalone.md#optimizations-default-on-and-off-switches)
 
 <a id="rtx-pruning"></a>
@@ -1352,7 +1382,7 @@ Use tierstream cold-load pipeline.
 - **Fallback notice:** Loader errors propagate; no generic retry promise.
 - **Exactness evidence:** Replica gate pass, complete target-greedy token vectors and canonical state/position digests equal within the standalone Q2/Q8 identity; pressure and forced-window gates cover committed-prefix state.
 - **Off switch:** DG_LOAD_SERIAL=1
-- **Measured gain:** Full loading 108.7 → 61.8 s in the published workload
+- **Measured gain:** Full loading 108.7 -> 61.8 s in the published workload
 - **Implementation / evidence:** [Standalone defaults and gates](models/deepseek-v4.1/rtx-standalone.md#optimizations-default-on-and-off-switches)
 
 <a id="rtx-warmup"></a>
@@ -1368,7 +1398,7 @@ Capture common graphs before readiness.
 - **Fallback notice:** Unsupported graph/config requests retain validation; no general refusal notice.
 - **Exactness evidence:** Replica gate pass, complete target-greedy token vectors and canonical state/position digests equal within the standalone Q2/Q8 identity; pressure and forced-window gates cover committed-prefix state.
 - **Off switch:** --warmup-graphs none
-- **Measured gain:** First 16 steps 56.05 → 33.99 ms/step
+- **Measured gain:** First 16 steps 56.05 -> 33.99 ms/step
 - **Implementation / evidence:** [Standalone defaults and gates](models/deepseek-v4.1/rtx-standalone.md#optimizations-default-on-and-off-switches)
 
 <a id="rtx-residency"></a>
@@ -1384,7 +1414,7 @@ Reuse valid placement and save on worker exit.
 - **Fallback notice:** Missing auto seed quietly uses route order; invalid auto seed gives one notice and falls back. Explicit seed errors are strict. Save uses temporary file + rename.
 - **Exactness evidence:** Replica gate pass, complete target-greedy token vectors and canonical state/position digests equal within the standalone Q2/Q8 identity; pressure and forced-window gates cover committed-prefix state.
 - **Off switch:** --residency-seed none; --residency-save none
-- **Measured gain:** Step 0 332.6 → 156.0 ms; first 16 steps −20%
+- **Measured gain:** Step 0 332.6 -> 156.0 ms; first 16 steps -20%
 - **Implementation / evidence:** [Standalone defaults and gates](models/deepseek-v4.1/rtx-standalone.md#optimizations-default-on-and-off-switches)
 
 <a id="rtx-vocab"></a>
@@ -1416,7 +1446,7 @@ After a DSpark verify window, evict experts by the tierstream's learned score; a
 - **Fallback notice:** Older tierstream: one notice, lru.
 - **Exactness evidence:** Only residency changes: chat token vectors identical across all 8 arms (lru/auto, forced-window and pressure gates).
 - **Off switch:** --evict lru
-- **Measured gain:** DSpark misses/token 10.55 → 9.08 (−14 %), median +6.4 % tok/s (7 chats); plain decode neutral
+- **Measured gain:** DSpark misses/token 10.55 -> 9.08 (-14 %), median +6.4 % tok/s (7 chats); plain decode neutral
 - **Implementation / evidence:** [Standalone defaults and gates](models/deepseek-v4.1/rtx-standalone.md#optimizations-default-on-and-off-switches)
 
 <a id="rtx-ce-pacing"></a>
@@ -1446,7 +1476,7 @@ Keep up to G GiB of prefill experts in pinned host memory when it is available, 
 - **Fallback notice:** Layers that do not get a pinned slot stream from file; `/health` reports host-tier accounting.
 - **Exactness evidence:** Exact: prefill state sha256, logits FNV and next token identical to file-only streaming on every exercised path (implicit and explicit tier, export modes, pipeline, whole-layer provider, forced demotion).
 - **Off switch:** omit `--host-gib-auto`
-- **Measured gain:** TTFT 1K −24..−30 % (16.2 → 12.4 s interleaved), 8K −28 %, 30K −12 %
+- **Measured gain:** TTFT 1K -24..-30 % (16.2 -> 12.4 s interleaved), 8K -28 %, 30K -12 %
 - **Implementation / evidence:** [host tier](models/deepseek-v4.1/rtx-prefill-host-tier.md)
 
 ### Lean decode state
@@ -1489,9 +1519,9 @@ token IDs to plain sessions. Use transport corruption checks as well as model ga
 
 **Engine:** `minimax`. **Control:** `STRIX_MMX_MOE_WIDE`. **Default:** 2.
 
-Use wider expert kernels for N2–4.
+Use wider expert kernels for N2-4.
 
-- **Preconditions:** Supported MoE widths, quantization and N2–4 rows.
+- **Preconditions:** Supported MoE widths, quantization and N2-4 rows.
 - **Automatic selection:** Resolver supplies 2 only when unset; explicit values win. Shape/core dispatch determines actual use.
 - **Fallback notice:** Unsupported operator geometry keeps its supported dispatch without a universal decline notice; invalid explicit settings fail validation.
 - **Exactness evidence:** Published same-identity qualification: Measurement: rows == alone, wide expert kernels at N2-4, N2 -3.0..-3.5 %, N4 -4..-6 %; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.
@@ -1677,7 +1707,7 @@ A linear core scheduled for the 7-row DSpark draft block (q+k+v, o and gate+up g
 - **Fallback notice:** Shapes outside the schedule keep the previous core.
 - **Exactness evidence:** Same output bits as v10 (bitwise over every scheduled form and layer); speculative ids == greedy 36/36.
 - **Off switch:** STRIX_MMX_LINEAR_V11=0
-- **Measured gain:** DSpark draft block −11.9 %
+- **Measured gain:** DSpark draft block -11.9 %
 - **Implementation / evidence:** [38-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
 
 <a id="mm-markov-cand"></a>
@@ -1692,7 +1722,7 @@ per draft instead of a full-vocabulary scan and host exchange per step.
 - **Preconditions:** Attached DSpark drafter on the pair.
 - **Automatic selection:** Resolver supplies the four values only when unset; explicit values win.
 - **Fallback notice:** A draft whose candidate set cannot cover the chain falls back to the full chain for that draft.
-- **Exactness evidence:** Target verify is unchanged, so committed tokens equal plain greedy (ids == greedy on every gated session); top-C v2 payloads == v1 == CPU, including ties, ±0 and NaN.
+- **Exactness evidence:** Target verify is unchanged, so committed tokens equal plain greedy (ids == greedy on every gated session); top-C v2 payloads == v1 == CPU, including ties, +/-0 and NaN.
 - **Off switch:** STRIX_MM_MARKOV=full (C/H/TOPC: 1024/2048/v1)
 - **Measured gain:** ~1.7 ms saved per draft; DSpark median tok/s +1.1 to +1.6 % across json/code/English/Spanish prompts, acceptance unchanged
 - **Implementation / evidence:** [38-item resolver](../src/minimax/engine/mm_defaults.cpp), [rank gates](../apps/minimax_rank_main.cpp)
@@ -2014,7 +2044,7 @@ Use the host-path decode exchange module, load the prefill exchange module, and 
 - **Fallback notice:** GPU-direct keeps its communicator route; startup prints the module/route selection. Invalid route values fail validation.
 - **Exactness evidence:** Same token IDs, K/V/index state and terminal rows in prefill qualification; retain protocol integrity gates.
 - **Off switch:** STRIX_MM_XFER=off; STRIX_MM_PFX=off; STRIX_MM_PF_INTERLEAVE=off (one at a time)
-- **Measured gain:** Interleaving: 8K TTFT 40.0 → 35.4 s; 1K inert
+- **Measured gain:** Interleaving: 8K TTFT 40.0 -> 35.4 s; 1K inert
 
 <a id="mm-gu4"></a>
 
@@ -2060,9 +2090,9 @@ the resolution before GPU/peer work. Defaults: `--identity r1b`, `--mtp 0`, `--p
 
 R1b changes FP32 summation order and is **not bit-identical to R1**. Own-identity runs are stable, but the
 32-prompt/8192-position comparison found 99.19% top-1 agreement and mean KL about 1.8e-3 nats; free runs
-diverged on 28/32 prompts within 19–227 tokens. Measured R1b 41.93–41.96 versus R1 47.33–47.48 ms/token
+diverged on 28/32 prompts within 19-227 tokens. Measured R1b 41.93-41.96 versus R1 47.33-47.48 ms/token
 is an identity comparison, not an exact R1 optimization. The faster R1b kernels separately measured R1/R8
-−7.8/−5.4% with the same tokens within R1b. See [identity implementation](../src/glm/engine/glm_r1b.hip).
+-7.8/-5.4% with the same tokens within R1b. See [identity implementation](../src/glm/engine/glm_r1b.hip).
 
 `--baseline` / `STRIX_GLM_BASELINE=1` restores R1, reference prefill, MTP loaded, comm decode exchange and
 the listed off values unless explicitly overridden. `STRIX_GLM_MOE=fast` remains on: prepared reference
@@ -2099,7 +2129,7 @@ Use R1 prompt arithmetic and the R1b generation identity.
 - **Fallback notice:** No automatic substitution between identities; explicit unsupported settings retain validation.
 - **Exactness evidence:** Stable within R1b; not bit-identical to R1. Teacher-forced top-1 agreement 8126/8192; mean KL ~1.8e-3 nats; free runs diverge on 28/32 prompts.
 - **Off switch:** --identity r1 (unset STRIX_GLM_IDENTITY, which otherwise wins)
-- **Measured gain:** 41.93–41.96 vs R1 47.33–47.48 ms/token (−11.5%)
+- **Measured gain:** 41.93-41.96 vs R1 47.33-47.48 ms/token (-11.5%)
 
 <a id="glm-xfer"></a>
 
@@ -2511,5 +2541,5 @@ by the IOMMU.
 - **Fallback notice:** None at engine level; the kernel logs "PerfOpt armed" when active.
 - **Exactness evidence:** Same kernel build, PerfOpt on vs amdgpu.iommu_perfopt=0, interleaved boots: tokens identical in every arm; GPU identity domain, USB4 NHIs still DMA-FQ, iommu_dma_protection=1, no AMD-Vi fault lines after two-node traffic.
 - **Off switch:** `options amdgpu iommu_perfopt=0`, or boot the previous kernel
-- **Measured gain:** Qwen 32K prefill +2.9 % / +3.1 % (two repeats, one node, same power, equal or lower GPU clock); DeepSeek two-node decode within ±1 % with one node on PerfOpt, both-node run pending
+- **Measured gain:** Qwen 32K prefill +2.9 % / +3.1 % (two repeats, one node, same power, equal or lower GPU clock); DeepSeek two-node decode within +/-1 % with one node on PerfOpt, both-node run pending
 - **Implementation / evidence:** [driver repo: PerfOpt](https://github.com/hyukudan/strix-halo-usb4-driver/blob/main/docs/PERFOPT.md)

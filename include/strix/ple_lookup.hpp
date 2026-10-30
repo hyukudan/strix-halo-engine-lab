@@ -1,6 +1,8 @@
 #pragma once
 
 #include "strix/model_contract.hpp"
+#include "strix/ple_rolling.hpp"
+#include "strix/ple_direct.hpp"
 #include "strix/model_manifest.hpp"
 #include "strix/model_runtime_binding.hpp"
 #include "strix/execution_tensor_access.hpp"
@@ -13,6 +15,7 @@
 #include <future>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace strix {
@@ -48,6 +51,9 @@ struct PleHashResult {
     std::uint32_t token_id,
     std::span<const std::uint32_t> previous_context);
 
+void hash_ple_tokens(const PleHashContract& contract, std::span<const std::uint32_t> tokens,
+    std::span<const std::uint32_t> previous, std::span<PleHashResult> out);
+
 using PleLookupHandle = std::uint64_t;
 
 struct PleLookupRequest {
@@ -77,6 +83,16 @@ public:
 class FileMappedPleLookupBackend final
     : public PleLookupBackend {
 public:
+    void bind_residency(std::shared_ptr<ple_reclaim::ResidencyManager::Turn> turn) {
+        if (pending_.active) throw std::logic_error("PLE binding requires cancelled/drained lookup");
+        residency_ = std::move(turn);
+    }
+    [[nodiscard]] auto residency() const { return residency_; }
+    void bind_prompt_source(std::shared_ptr<const ple_reclaim::DirectPageCache::View> view,
+        std::uintptr_t table, std::uint64_t offset) {
+        if (pending_.active) throw std::logic_error("PLE prompt view requires an idle helper");
+        prompt_view_ = std::move(view); prompt_table_ = table; prompt_offset_ = offset;
+    }
     [[nodiscard]] std::uint64_t implementation_identity() const noexcept override;
 
     [[nodiscard]] PleLookupHandle start(
@@ -100,10 +116,17 @@ private:
         std::array<std::uint64_t, PleHashContract::maximum_heads> row_ids{};
         std::uint32_t row_count = 0;
         bool active = false;
+        std::uint64_t mapping_generation = 0, residency_epoch = 0;
+        std::uintptr_t rolling_source = 0;
+        std::shared_ptr<ple_reclaim::ResidencyManager::Turn> residency;
     };
 
     PleLookupHandle next_handle_ = 1;
     Pending pending_;
+    std::shared_ptr<ple_reclaim::ResidencyManager::Turn> residency_;
+    std::shared_ptr<const ple_reclaim::DirectPageCache::View> prompt_view_;
+    std::uintptr_t prompt_table_ = 0;
+    std::uint64_t prompt_offset_ = 0;
 };
 
 struct PlannedPleLookupPolicy {

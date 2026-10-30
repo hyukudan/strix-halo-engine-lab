@@ -1,4 +1,5 @@
 #include "strix/hip_generation_output.hpp"
+#include "strix/mtp_payload_geometry.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #if defined(STRIX_BUILD_GREEDY_OUTPUT_DIAGNOSTIC)
 #include "strix/hip_generation_output_diagnostic.hpp"
@@ -308,12 +309,7 @@ struct HipGreedyOutput::Impl {
     }
 };
 std::uint64_t HipGreedyOutput::required_scratch_bytes(std::uint32_t vocabulary) {
-    require(vocabulary != 0, "GPU greedy reservation requires nonzero vocabulary");
-    const auto count=(static_cast<std::uint64_t>(vocabulary)-1U)/threads+1U;
-    constexpr auto replies=2U*sizeof(Reply);
-    if(count>(std::numeric_limits<std::uint64_t>::max()-replies)/sizeof(Partial))
-        throw std::overflow_error("GPU greedy reservation overflow");
-    return count*sizeof(Partial)+replies;
+    return mtp_payload::selector(vocabulary);
 }
 HipGreedyOutput::HipGreedyOutput(std::uint32_t vocab, ExecutionMemoryBinding scratch,
     std::shared_ptr<const void> owner, std::shared_ptr<const HipSetupQuiescenceGuard> guard)

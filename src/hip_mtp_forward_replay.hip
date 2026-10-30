@@ -1,5 +1,7 @@
 #include "strix/hip_mtp_forward_replay.hpp"
+#include "strix/mtp_payload_geometry.hpp"
 #include "strix/model_content_hash.hpp"
+#include "strix/mtp_forward_golden_file.hpp"
 #include "strix/hip_launch_context.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -38,6 +40,13 @@ ModelContentIdentity hip_mtp_forward_golden_payload_identity(const HipMtpForward
     std::vector<std::byte> frame;frame.reserve(static_cast<std::size_t>(mul(add(g.rows.size(),1U),192U)));
     append(frame,0x4d54505245504c31ULL);append(frame,g.independent_source_content);append(frame,g.target_content);append(frame,g.sidecar_content);
     append(frame,g.independent_reference_identity);append(frame,g.structural_plan_identity);append(frame,g.semantic_identity);append(frame,g.numerical_profile_identity);append(frame,g.rows.size());
+    if(g.rotary_factor) {
+        append(frame,UINT64_C(0x594d5450474f4c33));
+        append(frame,g.rotary_factor);append(frame,g.rotary_descriptor_sha256);append(frame,g.rotary_table_sha256);
+        append(frame,g.context_capacity);append(frame,g.calibration_begin);append(frame,g.calibration_end);
+        append(frame,g.target_prefill_profile_identity);append(frame,g.target_decode_profile_identity);
+        append(frame,g.prompt_prefill_profile_identity);
+    }
     for(const auto& row:g.rows){append(frame,row.source_position);append(frame,row.source_input_token);append(frame,row.next_input_token);append(frame,row.selected_token);
         append(frame,row.target_hidden_bf16.size());append(frame,digest(row.target_hidden_bf16));append(frame,row.next_hidden_bf16.size());append(frame,digest(row.next_hidden_bf16));
         append(frame,row.full_logits.size());append(frame,digest(row.full_logits));}
@@ -59,16 +68,16 @@ HipMtpNativeForwardReplayResult replay_hip_mtp_forward(HipMtpRuntime& runtime,st
         g.sidecar_content==owner.shared_target().sidecar_model_content_identity && g.structural_plan_identity==owner.plan().plan_identity &&
         g.semantic_identity==owner.plan().forward_semantics.contract_identity &&
         g.numerical_profile_identity==runtime.numerical_profile_identity(),"MTP independent golden source/model/plan/profile binding mismatch");
+    if(g.rotary_factor) require(request.target_prefill_profile_identity && request.target_decode_profile_identity &&
+        request.prompt_prefill_profile_identity,"YaRN MTP replay requires the actual target profile pair");
+    validate_mtp_forward_golden_rotary(g,owner.model().rotary_identity(),owner.context_capacity(),
+        request.prompt_prefill_profile_identity,request.target_prefill_profile_identity,request.target_decode_profile_identity);
     // Validate the declared policy before any device copy, not after mutation.
     (void)assess_mtp_forward_replay(request.policy,{});
     const auto width=mul(owner.model().hidden_size,owner.model().hc_count),vocabulary=owner.model().vocab_size;
     require(width && width<=SIZE_MAX/2U && vocabulary && vocabulary<=UINT32_MAX && vocabulary<=SIZE_MAX/4U,
         "MTP replay canonical capture geometry is invalid");
-    std::uint64_t budget=add(mul(width,4U),mul(vocabulary,4U));
-    budget=add(budget,mul(inputs.size(),sizeof(HipMtpForwardReplayRowReceipt)+2U*sizeof(std::uint32_t)));
-    // Include externally retained complete goldens and framing payload too.
-    budget=add(budget,mul(inputs.size(),add(mul(width,4U),mul(vocabulary,4U))));
-    budget=add(budget,mul(add(inputs.size(),1U),192U));
+    const auto budget=mtp_payload::replay_host(inputs.size(),width,vocabulary);
     require(request.host_payload_budget_bytes && budget<=request.host_payload_budget_bytes,"MTP replay exceeds explicit host payload budget");
     for(std::size_t i=0;i<inputs.size();++i){const auto& row=g.rows[i];const auto& input=inputs[i];
         require(input.hidden.valid() && input.hidden.same_producer(inputs[0].hidden) && input.hidden.source_position()==i &&
@@ -97,7 +106,9 @@ HipMtpNativeForwardReplayResult replay_hip_mtp_forward(HipMtpRuntime& runtime,st
         // predictor input is consumed; target hidden is never a self-oracle.
         for(std::size_t i=0;i<inputs.size();++i){read(inputs[i].hidden.view(),target_hidden.data(),mul(width,2U),stream);check(hipStreamSynchronize(stream));
             require(target_hidden==g.rows[i].target_hidden_bf16,"actual completed target hidden differs from independent input golden");}
-        for(std::size_t i=0;i<inputs.size();++i){const auto actual=runtime.execute_diagnostic(inputs[i].hidden,inputs[i].next_input_token);
+        for(std::size_t i=0;i<inputs.size();++i){
+            if(request.safe_boundary) request.safe_boundary();
+            const auto actual=runtime.execute_diagnostic(inputs[i].hidden,inputs[i].next_input_token);
             require(actual.device_completed && actual.completed_steps==owner.plan().steps.size() && actual.source_position==i &&
                 actual.seed_position==i+1U && actual.numerical_profile_identity==g.numerical_profile_identity &&
                 actual.wide_state==owner.view(HipMtpBuffer::wide_current) && actual.logits==owner.view(HipMtpBuffer::logits),
@@ -116,7 +127,7 @@ HipMtpNativeForwardReplayResult replay_hip_mtp_forward(HipMtpRuntime& runtime,st
     }catch(...){const_cast<HipMtpResources&>(owner).fail();throw;}
 }
 HipMtpForwardGolden capture_hip_mtp_forward_golden(HipMtpRuntime& runtime,std::span<const HipMtpReplayRow> inputs,
-    const ModelContentIdentity& source,std::uint64_t reference){
+    const ModelContentIdentity& source,std::uint64_t reference,std::function<void()> safe_boundary){
     const auto& owner=runtime.resources();owner.validate();owner.require_idle();
     require(current_hip_launch_context()==nullptr,"MTP golden capture must not borrow an active launch scope");
     require(!runtime.failed() && runtime.next_source_position()==0U,"MTP golden capture requires a fresh native predictor");
@@ -128,6 +139,12 @@ HipMtpForwardGolden capture_hip_mtp_forward_golden(HipMtpRuntime& runtime,std::s
     g.target_content=owner.shared_target().target_model_content_identity;g.sidecar_content=owner.shared_target().sidecar_model_content_identity;
     g.structural_plan_identity=owner.plan().plan_identity;g.semantic_identity=owner.plan().forward_semantics.contract_identity;
     g.numerical_profile_identity=runtime.numerical_profile_identity();g.rows.resize(inputs.size());
+    if(owner.model().rotary_identity().descriptor().mode()==RotaryMode::yarn) {
+        const auto rotary=owner.model().rotary_identity();
+        g.rotary_factor=rotary.descriptor().factor();g.rotary_descriptor_sha256=rotary.descriptor().sha256();
+        g.rotary_table_sha256=rotary.table_sha256();g.context_capacity=owner.context_capacity();
+        g.calibration_end=inputs.size();
+    }
     for(std::size_t i=0;i<inputs.size();++i){const auto& input=inputs[i];
         require(input.hidden.valid() && input.hidden.same_producer(inputs[0].hidden) && input.hidden.source_position()==i &&
             input.hidden.input_token()<vocabulary && input.next_input_token<vocabulary && i+1U<owner.context_capacity() &&
@@ -140,6 +157,7 @@ HipMtpForwardGolden capture_hip_mtp_forward_golden(HipMtpRuntime& runtime,std::s
             read(inputs[i].hidden.view(),row.target_hidden_bf16.data(),mul(width,2U),stream);}
         check(hipStreamSynchronize(stream));
         for(std::size_t i=0;i<inputs.size();++i){auto& row=g.rows[i];
+            if(safe_boundary) safe_boundary();
             const auto actual=runtime.execute_diagnostic(inputs[i].hidden,inputs[i].next_input_token);
             require(actual.device_completed && actual.completed_steps==owner.plan().steps.size() && actual.source_position==i &&
                 actual.seed_position==i+1U && actual.numerical_profile_identity==g.numerical_profile_identity,

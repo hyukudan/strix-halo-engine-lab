@@ -1,3 +1,4 @@
+#include "strix/startup_markers.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/known_prefix_prefill.hpp"
 #include "strix/dispatch_resources.hpp"
@@ -303,6 +304,7 @@ KnownWindowResult execute_known_prefix_prefill_eager(const CompiledKnownPrefixPr
     if(hooks.preflight_plan) hooks.preflight_plan();
     lap("metadata");
     if(hooks.preflight_memo&&!preflight_known) hooks.preflight_memo->push_back(preflight_key);
+    startup::first_prefill_tile();
     DirectLaunchDispatcher dispatcher(launch);
     const auto ple=std::find_if(serial.execution.steps.begin(),serial.execution.steps.end(),[](const auto& s){return s.op==SerialOp::ple;});
     if(resources.ple_lookup&&resources.ple_hash_contract&&resources.ple_prefetch) {
@@ -660,6 +662,7 @@ std::vector<KnownWindowResult> execute_known_prefix_prefill_segments_eager(const
     hooks.preflight_scope();
     if(hooks.preflight_plan) hooks.preflight_plan();
     if(hooks.preflight_memo&&!preflight_known) hooks.preflight_memo->push_back(preflight_key);
+    startup::first_prefill_tile();
     DirectLaunchDispatcher dispatcher(launch);
     const auto observe=[&](std::size_t step,std::size_t s) {
         if(!segment_hooks.after_step) return;

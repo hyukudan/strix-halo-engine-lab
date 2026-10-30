@@ -7,6 +7,9 @@
 #include "strix/memory_plan.hpp"
 #include "strix/session_state_cache.hpp"
 #include "../apps/qwen_yarn_owner_inventory.hpp"
+#include "../apps/qwen_mtp_owner_plan.hpp"
+#include "../apps/known_prefill_reservation.hpp"
+#include "../apps/ple_resident_fallback.hpp"
 #include "qwen_serial_contract.hpp"
 #include "qwen_historical_resolver.hpp"
 #include <iostream>
@@ -150,6 +153,44 @@ std::vector<std::string> mtp_fixture(){
         "--mtp-policy-id","7","--mtp-candidate-depth","2"};
 }
 constexpr std::uint64_t gib_bytes = UINT64_C(1024) * 1024U * 1024U;
+void resident_fallback_tests() {
+    Options options; options.mtp.enabled=true;
+    options.known_prefill_uma_budget=120U*gib_bytes;
+    options.known_prefill_workspace_budget=8U*gib_bytes;
+    options.known_prefill_metadata_budget=gib_bytes;
+    PrefillRequirements required;
+    required.model_backing=90U*gib_bytes; required.workspace=2U*gib_bytes; required.metadata=gib_bytes/4U;
+    required.device_base=4U*gib_bytes;
+    required.owners={{"model_backing",required.model_backing},{"state",4U*gib_bytes},
+        {"workspace",required.workspace},{"metadata",required.metadata}};
+    PrefillMemory memory; memory.total=128U*gib_bytes; memory.available=20U*gib_bytes;
+    memory.gtt_limit=120U*gib_bytes; memory.gtt_used=90U*gib_bytes;
+    const auto admitted=resident_prefill_admission(options,required,memory);
+    expect(admitted.at("verified_ple_credit_bytes")==0 && admitted.at("required_bytes")==admitted.at("gross_required_bytes"),
+        "fresh resident admission never retains rolling credit");
+    for(const bool yarn:{false,true}) for(const bool reserve:{false,true}) {
+        auto route=options;if(yarn) route.rotary=RotaryDescriptor::yarn(2);
+        route.known_prefill_host_headroom=reserve?yarn_legacy_host_reserve:0;
+        auto edge=memory;
+        const auto baseline=resident_prefill_admission(route,required,edge);
+        edge.available=baseline.at("incremental_bytes")+prefill_physical_margin;
+        expect(resident_prefill_admission(route,required,edge).at("resident_fallback")==1,"resident exact physical margin admits");
+        --*edge.available;bool refused=false;
+        try {(void)resident_prefill_admission(route,required,edge);}catch(const std::runtime_error&){refused=true;}
+        expect(refused,"native/YaRN resident MemAvailable minus 4 GiB short by one byte refuses in both reserve modes");
+    }
+    for(unsigned fault=0;fault<4;++fault) {
+        auto observed=memory; auto owners=required;
+        if(fault==0) owners.owners["model_backing"]=121U*gib_bytes;
+        if(fault==1) observed.available=gib_bytes;
+        if(fault==2) observed.gtt_used=119U*gib_bytes;
+        if(fault==3) observed.total.reset();
+        bool refused=false;
+        try { (void)resident_prefill_admission(options,owners,observed); }
+        catch(const std::runtime_error& error) { refused=std::string(error.what()).find("before prompt mutation")!=std::string::npos; }
+        expect(refused,"resident fallback refuses unavailable/insufficient capacity before warming");
+    }
+}
 // The source command did not enable MTP or cohorts. Their inactive controls
 // and disabled experiments are excluded. The logits digest is diagnostic output,
 // not part of the prefill arithmetic/organization contract.
@@ -696,11 +737,11 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
             }
         }
         absent.device_base -= omitted;
-        std::uint64_t gross = 8U*gib_bytes + request.options.rotary.table_bytes();
+        std::uint64_t gross = request.options.rotary.table_bytes();
         for (const auto& [name,bytes] : with_tails.owners) { (void)name; gross = prefill_checked_add(gross,bytes); }
         auto edge = memory;
-        edge.verify_ple_credit = [](const Options&) { return 16U*gib_bytes; };
-        edge.total = gross-16U*gib_bytes-1U; // total-envelope edge after verified credit
+        edge.verify_ple_credit = [](const Options&, const Environment&) { return 16U*gib_bytes; };
+        edge.total = gross-16U*gib_bytes+prefill_physical_margin-1U; // physical total edge after verified credit
         edge.estimate = [=](const Options&) { return absent; };
         expect(resolve(request,edge).admitted,"YaRN missing external owners would admit envelope edge");
         edge.estimate = [=](const Options&) { return with_tails; };
@@ -759,8 +800,9 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
             });
             expect(cli.options.prefix_batch_cert==(std::string_view(value)=="1"?0U:1U),"CLI certification mode wins real collected environment");
             expect(resolve(cli,memory).admitted,"YaRN CLI precedence remains admissible");
-            auto forbidden=cli; forbidden.options.mtp.enabled=true;
-            expect(resolve(forbidden,memory).error=="YaRN with MTP not yet qualified","cert control preserves named MTP refusal");
+            auto forbidden=cli; forbidden.options.mtp.enabled=true;forbidden.options.mtp.sample_options=true;
+            expect(resolve(forbidden,memory).error=="YaRN MTP cohort/wide/sampling/metadata routes are not supported",
+                "cert control preserves the bounded explicit MTP route refusal");
             forbidden=cli; forbidden.options.http_serve=true;
             expect(resolve(forbidden,memory).error=="YaRN on HTTP serving not supported","cert control preserves named HTTP refusal");
             forbidden=cli; forbidden.options.prefix_cache_roundtrip=true;
@@ -840,11 +882,27 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
     }
     expect(yarn_environment_path(static_cast<qpf2k::Item>(999U)) == YarnEnvironmentPath::uncovered_rotary,
         "new rotary items fail closed until audited");
+    for (const auto* off : {"STRIX_PLE_ROLLING","STRIX_CTX_EXACT_MEMORY"}) {
+        auto disabled=request.environment;
+        disabled[off]="0";
+        disabled["STRIX_PLE_ROLLING_POSITIONS"]="disabled-tuning";
+        disabled["STRIX_PLE_ROLLING_CAP_BYTES"]="disabled-tuning";
+        expect(yarn_environment_refusal(disabled,2).empty(),"YaRN rolling off ignores disabled tuning");
+    }
+    for (const auto* knob : {"STRIX_PLE_ROLLING_POSITIONS","STRIX_PLE_ROLLING_CAP_BYTES",
+            "STRIX_PLE_RECLAIM_DECODE_BYTES","STRIX_PLE_RECLAIM_AHEAD_ROWS",
+            "STRIX_PLE_RECLAIM_STRICT","STRIX_PLE_STAGE_PREFETCH","STRIX_PLE_ROLLING_STATS",
+            "STRIX_PLE_DIRECT_IO","STRIX_PLE_DIRECT_IO_STATS"}) {
+        auto controls=request.environment; controls[knob]="1";
+        expect(yarn_environment_refusal(controls,2).empty(),"YaRN classifies documented PLE controls as no rotary");
+        controls[knob]="bad";
+        expect(!yarn_environment_refusal(controls,2).empty(),"YaRN active PLE controls reject malformed values");
+    }
     auto uncovered = request;
     uncovered.environment["STRIX_MOCK_UNCOVERED_ROTARY"] = "1";
     unsigned callbacks = 0;
     auto observed = memory;
-    observed.verify_ple_credit = [&](const Options&) { ++callbacks; return 0U; };
+    observed.verify_ple_credit = [&](const Options&, const Environment&) { ++callbacks; return 0U; };
     observed.estimate = [&](const Options&) { ++callbacks; return PrefillRequirements{}; };
     for (const auto* schedule : {"0","8","13","16","12"}) {
         auto scheduled = request;
@@ -880,7 +938,7 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
     auto config = resolve(request,memory);
     expect(config.admitted && config.options.context_tokens == 300000U && config.options.known_prefix_prefill_rows == 8192U,
         "YaRN fits without shrinking context");
-    expect(config.admission.at("host_reserve_bytes") == 8U*gib_bytes && config.ple_reclaim_credit == 0U,
+    expect(config.admission.at("host_reserve_bytes") == 0U && config.ple_reclaim_credit == 0U,
         "YaRN reserve and zero unverified credit");
     expect(effective_config_json(config).find("admission") != std::string::npos &&
         effective_config_json(config).find("table_sha256") != std::string::npos,"YaRN inspection resolved identity and owners");
@@ -896,11 +954,11 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
     bool execution = false;
     try { require_effective_prefill_execution(config); execution = true; } catch (const std::invalid_argument&) {}
     expect(!execution,"YaRN refuses before any execution/allocation callback");
-    large.verify_ple_credit = [](const Options&) { return 16U*gib_bytes; };
+    large.verify_ple_credit = [](const Options&, const Environment&) { return 16U*gib_bytes; };
     expect(resolve(request,large).admitted,"YaRN verified PLE credit admits");
     auto failed_drop = large;
     unsigned estimates_after_drop_failure = 0;
-    failed_drop.verify_ple_credit = [](const Options&) -> std::uint64_t { throw std::runtime_error("required drop not verified"); };
+    failed_drop.verify_ple_credit = [](const Options&, const Environment&) -> std::uint64_t { throw std::runtime_error("required drop not verified"); };
     failed_drop.estimate = [&](const Options&) { ++estimates_after_drop_failure; return PrefillRequirements{}; };
     expect(resolve(request,failed_drop).error.find("required drop not verified") != std::string::npos && !estimates_after_drop_failure,
         "YaRN required reclaim failure refuses before candidate growth or device setup");
@@ -917,11 +975,57 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
         "YaRN T fallback keeps numerical lineage");
     auto reserve = memory;
     reserve.estimate = [=](const Options& o) { auto value = estimate(o); value.model_backing = 103U*gib_bytes; return value; };
-    expect(!resolve(request,reserve).admitted,"YaRN eight GiB reserve honored");
+    auto legacy_reserve = request;
+    legacy_reserve.environment["STRIX_QWEN_YARN_HOST_RESERVE"] = "1";
+    expect(!resolve(legacy_reserve,reserve).admitted,"YaRN eight GiB reserve honored when restored");
+    const auto legacy = resolve(legacy_reserve,memory);
+    const auto current = resolve(request,memory);
+    expect(legacy.admitted && current.admitted && legacy.options.known_prefill_host_headroom == yarn_legacy_host_reserve &&
+        current.options.known_prefill_host_headroom == 0U && legacy.host_compilation == current.host_compilation,
+        "serial YaRN reserve changes admission without changing kernel plans");
+    for (const auto* phase : {"setup","calibration","prompt","decode","drain"}) {
+        const auto key = std::string("phase_")+phase+"_gross_bytes";
+        expect(legacy.admission.at(key) == current.admission.at(key)+yarn_legacy_host_reserve,
+            "legacy reserve restored byte-for-byte in every serial phase");
+    }
+    for(const bool reserve_on:{false,true}) {
+        auto route=request;route.environment["STRIX_QWEN_YARN_HOST_RESERVE"]=reserve_on?"1":"0";
+        auto edge=memory;const auto admitted=resolve(route,edge);
+        expect(admitted.admitted,"serial margin fixture starts admitted");
+        // Freeze the owner geometry so a smaller T cannot hide a one-byte deficit.
+        const auto fixed=estimate(admitted.options);edge.estimate=[fixed](const Options&){return fixed;};
+        edge.available=admitted.admission.at("incremental_bytes")+prefill_physical_margin;
+        expect(resolve(route,edge).admitted,"serial YaRN exact 4 GiB margin admits");
+        --*edge.available;
+        const auto short_by_one=resolve(route,edge);
+        expect(!short_by_one.admitted && short_by_one.error.find("4 GiB margin")!=std::string::npos,
+            "serial YaRN MemAvailable minus 4 GiB short by one byte refuses in both reserve modes");
+        edge=memory;edge.estimate=[fixed](const Options&){return fixed;};
+        edge.total=admitted.admission.at("required_bytes")+prefill_physical_margin;
+        expect(resolve(route,edge).admitted,"serial YaRN exact MemTotal margin admits");
+        --*edge.total;expect(!resolve(route,edge).admitted,"serial YaRN total margin short by one byte refuses");
+    }
+    auto invalid_reserve = request;
+    invalid_reserve.environment["STRIX_QWEN_YARN_HOST_RESERVE"] = "8";
+    expect(resolve(invalid_reserve,memory).error.find("host reserve switch must be 0 or 1") != std::string::npos,
+        "reserve switch values fail closed");
+    auto native_reserve = request;
+    native_reserve.options.rotary = RotaryDescriptor::native();
+    native_reserve.options.context_tokens = 32768U;
+    native_reserve.environment["STRIX_QWEN_YARN_HOST_RESERVE"] = "0";
+    const auto native_zero = resolve_effective_config(native_reserve,ModelContract::qwen38_flash_next(),info,manifest,
+        validated_model_content_identity,{true,true,true},memory);
+    native_reserve.environment["STRIX_QWEN_YARN_HOST_RESERVE"] = "1";
+    const auto native_one = resolve_effective_config(native_reserve,ModelContract::qwen38_flash_next(),info,manifest,
+        validated_model_content_identity,{true,true,true},memory);
+    expect(native_zero.admitted && native_one.admitted && native_zero.admission == native_one.admission &&
+        native_zero.host_compilation == native_one.host_compilation &&
+        native_zero.options.known_prefill_host_headroom == native_one.options.known_prefill_host_headroom,
+        "native admission and plans ignore YaRN reserve switch");
     for (unsigned route = 0; route < 6; ++route) {
         auto bad = request;
         const char* reason = nullptr;
-        if (route == 0) { bad.options.mtp.enabled = true; reason = "YaRN with MTP not yet qualified"; }
+        if (route == 0) { bad.options.mtp.enabled = true; bad.options.mtp.sample_options=true; reason = "YaRN MTP cohort/wide/sampling/metadata routes are not supported"; }
         if (route == 1) { bad.options.http_serve = true; reason = "YaRN on HTTP serving not supported"; }
         if (route == 2) { bad.options.teacher_forced_score = true; reason = "YaRN with teacher scoring not yet qualified"; }
         if (route == 3) { bad.options.gdn_islands = true; reason = "YaRN graph capture path not yet qualified"; }
@@ -939,6 +1043,88 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
             expect(yarn_environment_refusal({{name, "0"}}, 2).empty(), "YaRN accepts the compact-memory controls");
         expect(effective_prefill_argv(config.options)[2] == "--rope-yarn","YaRN receipt argv retains explicit opt-in");
     }
+    // Explicit YMTP shares target organization, with independent serial and pool controls.
+    auto mtp=request;
+    auto& mo=mtp.options;auto& mm=mo.mtp;
+    mm.enabled=true;mm.sidecar="sidecar.gguf";mm.sidecar_logical_name="fixture";
+    mm.sidecar_sha256=mm.target_sha256=mm.target_content=mm.golden_sha256=mm.converter_sha256=mm.norm_converter_sha256=std::string(64,'1');
+    mm.golden="golden.bin";mm.repository="fixture";mm.revision="revision";mm.source_path="sidecar.gguf";mm.converter_revision="revision";
+    mm.conversion="effective-norm-embedding-first-v1";mm.normalized_rounding="fp32";mm.projection_rounding="bf16-rne";mm.sidecar_residency="register";
+    mm.sidecar_bytes=mm.header_bytes=mm.sidecar_retained_bytes=mm.sidecar_setup_bytes=4096;
+    mm.golden_max_bytes=mm.replay_host_bytes=mm.target_capture_bytes=4096;mm.runtime_bytes=UINT64_C(2)<<30U;
+    mm.policy_identity=7;mm.candidate_depth=7;mm.window_rows=8;mm.window_rows_set={2,4,8};mm.window_prefix=true;mm.window_qsa_rows=true;
+    mm.window_arena_bytes=mm.window_capture_bytes=mm.window_checkpoint_bytes=4096;mm.window_total_bytes=UINT64_C(2)<<30U;mm.window_history_intervals=4096;
+    mm.draft_chain=true;mo.known_prefix_window=mo.known_prefix_full_rows=true;mo.known_prefix_prefill_rows=8192;
+    const auto ym=resolve(mtp,memory);
+    expect(ym.admitted && ym.admission.at("mtp_enabled")==1,"explicit YaRN MTP admitted after resolved target organization");
+    for(const auto c:{32768U,131072U,262144U,393216U,524288U}) {
+        auto f2=mtp;f2.options.context_tokens=c;
+        const auto unchanged=resolve(f2,memory);
+        expect(unchanged.admitted && unchanged.admission.at("storage_ladder_step")==0U &&
+            !unchanged.environment.contains("STRIX_PLE_ROLLING_POSITIONS") &&
+            !unchanged.environment.contains("STRIX_PLE_ROLLING_CAP_BYTES") &&
+            !unchanged.environment.contains("STRIX_QSA_SCORE_RING_ROWS"),
+            "f2 through 524288 keeps step-zero storage defaults");
+    }
+    expect(!config.admission.contains("storage_ladder_step") &&
+        yarn_mtp_storage_receipt(config).empty(),
+        "serial YaRN retains original plan and receipt contract");
+    for(const bool cli:{false,true}) {
+        auto cert=mtp;cert.environment["STRIX_PREFIX_BATCH_CERT"]="1";
+        if(cli) {cert.options.supplied_options.insert("--prefix-batch-cert");cert.options.prefix_batch_cert=2;}
+        const auto admitted=resolve(cert,memory);
+        expect(admitted.admitted && admitted.options.prefix_batch_cert==(cli?2U:1U) &&
+            admitted.host_compilation==ym.host_compilation && numerical_profile_pair(admitted.options)==numerical_profile_pair(ym.options),
+            "operational certification control preserves bounded YaRN MTP admission and numerical organization");
+    }
+    const auto serial=resolve(request,memory);
+    expect(numerical_profile_pair(ym.options)==numerical_profile_pair(serial.options) &&
+        ym.options.known_prefix_prefill_rows==serial.options.known_prefix_prefill_rows &&
+        ym.options.known_prefix_tail_rows==serial.options.known_prefix_tail_rows,"serial comparator uses same target profile pair and schedule");
+    auto disabled=mtp;disabled.environment["STRIX_QWEN_YARN_MTP"]="0";
+    expect(resolve(disabled,memory).error.find("conflicts")!=std::string::npos,"explicit MTP/off conflict refuses before allocation");
+    auto m1off=mtp;m1off.environment["STRIX_QSA_MTP_POOL"]="0";
+    const auto historical=resolve(m1off,memory);
+    expect(historical.admitted && historical.options.mtp.enabled && !qsa_mtp_pool_route(historical.options),"M1 OFF remains genuine admitted MTP");
+    YarnMtpGeometry fixture;fixture.sidecar.file_size=mm.sidecar_bytes;fixture.sidecar.data_offset=1024;
+    gguf::TensorInfo qt;qt.name="blk.48.attn_q.weight";qt.ggml_type=8;qt.byte_size=2745937920ULL;fixture.sidecar.tensors.push_back(qt);
+    fixture.window_arenas={{2,1024},{4,2048},{8,4096}};fixture.target_tensor_count=1024;
+    const auto offowners=yarn_mtp_owners(historical.options,model,fixture);
+    expect(offowners.bytes.at("mtp_historical_window_pools")==3U*16U*(historical.options.context_tokens/4U)*128U*4U,
+        "historical OFF counts every window slab");
+    auto comparator=request;comparator.environment["STRIX_QWEN_YARN_MTP"]="0";
+    expect(resolve(comparator,memory).admitted && !resolve(comparator,memory).options.mtp.enabled,"off is plain serial YaRN");
+    expect(yarn_environment_refusal({{"STRIX_MTP_CONTROLLER","survival"}},2).size()>0,"unbounded lease controller refused");
+    expect(yarn_environment_refusal({{"STRIX_QWEN_YARN_MTP","bad"}},2).size()>0,"unknown switch value refused");
+    for(const auto c:{32768U,131072U,262144U,393216U,524288U,1048576U,32771U,3U}) {
+        auto sized=ym.options;sized.context_tokens=c;sized.rotary=RotaryDescriptor::yarn(c<=524288?2:4);
+        sized.qsa_mtp_pool_explicit_opt_in=true; // explicit capacity census, including qualified f4
+        sized.mtp.window_total_bytes=UINT64_C(4)<<30U;
+        auto sized_model=model;sized_model.qwen_rotary_table=mock_rotary(c<=524288?2:4);
+        sized.mtp.runtime_bytes=mtp_payload::runtime(sized_model,c).retained;
+        const auto extras=yarn_mtp_owners(sized,sized_model,fixture);
+        expect(extras.bytes.at("mtp_predictor_kv_raw")==static_cast<std::uint64_t>(c)*2304U,"actual C predictor cache exactly once");
+        expect(extras.bytes.at("mtp_predictor_workspace_alignment")==mtp_payload::runtime(sized_model,c).retained-static_cast<std::uint64_t>(c)*2304U,"actual runtime workspace without cap padding");
+        expect(extras.bytes.at("mtp_window_arenas_captures_checkpoints")+qsa_mtp_pool_bytes(sized,model)<sized.mtp.window_total_bytes,
+            "window payload excludes unused cap and charges shared M1 once");
+        expect(extras.bytes.at("mtp_q4_shared_weights")==1453731840U,"manifest Q4 retained once");
+        expect(extras.bytes.at("mtp_historical_window_pools")==0U && qsa_mtp_pool_route(sized),"table-backed M1 uses shared owner");
+        auto insufficient=sized;insufficient.mtp.runtime_bytes--;
+        expect(!yarn_mtp_owners(insufficient,sized_model,fixture).refusal.empty(),"runtime cap below actual payload refused");
+    }
+    {
+        gguf::FileInfo q4;gguf::TensorInfo t;t.name="blk.48.attn_q.weight";t.ggml_type=8;t.byte_size=34U*128U;q4.tensors.push_back(t);
+        expect(mtp_q4_manifest_bytes(q4)==18U*128U,"Q4 payload derives from actual Q8 manifest blocks");
+        auto source=std::make_shared<int>(1);ModelContentIdentity content;content.bytes[0]=1;
+        const MtpQ4SourceIdentity old{source,4,128,content};
+        require_same_mtp_q4_source(old,old);
+        for(unsigned fault=0;fault<3;++fault) {
+            auto changed=old;if(!fault)++changed.generation;if(fault==1)changed.content.bytes[1]=1;
+            if(fault==2)changed.owner=std::make_shared<int>(1);
+            bool refused=false;try{require_same_mtp_q4_source(old,changed);}catch(const std::invalid_argument&){refused=true;}
+            expect(refused,"stale Q4 address/new generation/content/owner refused");
+        }
+    }
     auto overflow = memory;
     overflow.estimate = [=](const Options& o) { auto value = estimate(o); value.model_backing = UINT64_MAX; return value; };
     expect(resolve(request,overflow).error.find("overflow") != std::string::npos,"YaRN checked owner sum");
@@ -947,6 +1133,69 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
     expect(multiplied,"YaRN checked width product");
     auto boundary = request; boundary.options.tokens.resize(300000U,1U);
     expect(resolve(boundary,memory).error.find("prompt + generation") != std::string::npos,"YaRN positions are below capacity");
+}
+void mtp_reservation_arithmetic_tests() {
+    constexpr std::uint64_t budget = 128849018880ULL, headroom = 4294967296ULL;
+    constexpr std::uint64_t credit = 25193033728ULL, bound = 3607104512ULL;
+    constexpr std::uint64_t metadata = 768ULL << 20U; // conservative synthetic live metadata
+    constexpr std::uint64_t temporary = 128ULL << 20U;
+    const auto limits = UmaReservationLimits{budget,budget};
+    // The supplied setup credit already reserves C + D + margin and table edges.
+    expect(28800138240ULL - credit == bound, "MTP source bound/decode quota counted once in net credit");
+    MtpPrefillReservation m{3221225472ULL,134217728ULL,16ULL<<20U,64ULL<<20U,64ULL<<20U,
+        2ULL*gib_bytes,64ULL<<20U,8ULL*gib_bytes,16ULL*gib_bytes,3,true};
+    const auto extra = mtp_prefill_reservation(m);
+    expect(extra.retained == 3U*gib_bytes + (128U<<20U) + (16U<<20U) + 2U*gib_bytes + (768U<<20U) &&
+        extra.temporary == (128U<<20U), "prefix windows charge shared arena and all twelve capture caps, no checkpoint");
+    // Remainder of the inventory is synthetic: no model or native receipt was supplied.
+    // Keep the reported context, UMA, headroom, sidecar and runtime quantities exact.
+    UmaOwnerInventory live;
+    live.known_file_mapping_bytes = 96U*gib_bytes;
+    live.reservation_upper_bound_bytes = 96U*gib_bytes + 33536ULL*(120U<<10U) + gib_bytes;
+    const auto growth = 8U*gib_bytes + headroom;
+    const auto normal = plan_known_prefill_reservation(live,growth,temporary,limits,credit,metadata,extra);
+    expect(normal.retained_reserved_bytes == live.reservation_upper_bound_bytes + growth + metadata + extra.retained - credit &&
+        normal.setup_peak_reserved_bytes == normal.retained_reserved_bytes + temporary + extra.temporary &&
+        normal.reclaimable_file_mapping_credit_bytes == credit, "shared MTP retained/setup equations use verified credit exactly once");
+    const auto plain = plan_known_prefill_reservation(live,growth,temporary,limits,credit,metadata);
+    const auto original = plan_uma_reservation_growth(live,growth+metadata,temporary,limits,credit);
+    expect(plain.retained_reserved_bytes == original.retained_reserved_bytes &&
+        plain.setup_peak_reserved_bytes == original.setup_peak_reserved_bytes, "plain admission remains byte-for-byte arithmetic equivalent");
+    // A loose aggregate window limit cannot become a phantom retained owner.
+    // This reproduces the former MTP-only cap-summing refusal while OFF fits.
+    m.window_total = 64U*gib_bytes;
+    const auto capped = mtp_prefill_reservation(m);
+    expect(capped.retained == extra.retained, "unused total-window cap does not enlarge retained ownership");
+    bool old_refused = false;
+    try { (void)plan_uma_reservation_growth(live,growth+metadata+4U*gib_bytes+m.runtime+m.target_capture+m.replay+m.window_total,
+        temporary,limits,credit); } catch (const std::invalid_argument&) { old_refused = true; }
+    expect(old_refused, "old rolling MTP cap sum rejects the regression envelope");
+    (void)plan_known_prefill_reservation(live,growth,temporary,limits,credit,metadata,capped);
+    (void)plan_known_prefill_reservation(live,growth,temporary,limits,0,0);
+    // At 262144, identical synthetic state/profile/capacity and MTP owners:
+    // OFF admits T2048 but refuses T8192; verified rolling admits T8192.
+    live.reservation_upper_bound_bytes = 76U*gib_bytes + 262144ULL*(120U<<10U) + gib_bytes;
+    const auto admit = [&](std::uint64_t rows, bool rolling) {
+        try {
+            (void)plan_known_prefill_reservation(live,rows*(gib_bytes/2048U)+headroom+gib_bytes/2U,
+                temporary,limits,rolling?credit:0,rolling?metadata:0,extra);
+            return true;
+        } catch (const std::invalid_argument&) { return false; }
+    };
+    expect(admit(2048,false) && !admit(8192,false) && admit(8192,true), "long-context MTP rolling admits larger T with fixed owners");
+    m.prefix = false;
+    expect(mtp_prefill_reservation(m).retained == extra.retained + 8U*gib_bytes, "nonprefix rollback checkpoint remains charged");
+    m.window_total = gib_bytes;
+    expect(mtp_prefill_reservation(m).retained == 3U*gib_bytes + (128U<<20U) + (16U<<20U) + gib_bytes,
+        "combined native verifier cap remains an independent upper bound");
+    bool invalid_credit = false;
+    try { (void)plan_known_prefill_reservation(live,0,0,limits,live.known_file_mapping_bytes+1U,0); }
+    catch (const std::invalid_argument&) { invalid_credit = true; }
+    expect(invalid_credit, "credit cannot exceed known mapped backing");
+    bool overflow = false;
+    try { (void)plan_known_prefill_reservation(live,UINT64_MAX,0,{},credit,1U); }
+    catch (const std::overflow_error&) { overflow = true; }
+    expect(overflow, "shared reservation additions reject overflow");
 }
 void long_context_admission_tests(const RequestedOptions& original, const ModelContract& model,
     const gguf::FileInfo& info, ModelManifest manifest, const PrefillCapabilities& capabilities) {
@@ -1033,8 +1282,8 @@ void long_context_admission_tests(const RequestedOptions& original, const ModelC
         const auto config = resolve(request,observed);
         const auto expected_context = std::min(model.max_position_embeddings, static_cast<std::uint64_t>(n) + 512U);
         expect(config.admitted && config.options.known_prefix_prefill_rows == 8192U &&
-            config.options.context_tokens == expected_context && config.ple_reclaim_credit > 24U*gib_bytes,
-            "long_context_l1_T8192: 128K/192K/262143 admit with observed memory and prompt-specific L1 credit");
+            config.options.context_tokens == expected_context && config.ple_reclaim_credit > 23U*gib_bytes && config.ple_rolling_cap == 3U*gib_bytes,
+            "long_context_l1_T8192: 128K/192K/262143 admit with observed memory and capped L1 credit");
         const auto text = effective_config_json(config);
         expect(text.find("\"ple_reclaim_credit_bytes\":" + std::to_string(config.ple_reclaim_credit)) != std::string::npos,
             "long_context_l1_receipt: JSON reports the predicted reclaim credit");
@@ -1093,6 +1342,28 @@ void long_context_admission_tests(const RequestedOptions& original, const ModelC
             "long_context_uma_fallback: retained host backing includes headroom and runtime payload, credit applied once");
     }
     auto compiler_failure = observed;
+    {
+        auto edge=observed;
+        edge.available=100U*gib_bytes;
+        const auto selected=resolve(request,observed).options;
+        const auto owner=prefill_rolling_owner_bytes(selected,model,manifest,{},edge.ple_reclaim_page);
+        const auto credit=prefill_reclaim_credit(selected,model,manifest,{},edge.ple_reclaim_page);
+        expect(owner>400U*(1U<<20U),"rolling owner charges reader metadata beyond the cap/decode credit withholding");
+        edge.estimate=[&](const Options& candidate) {
+            auto required=estimate(candidate);
+            const auto other=required.state_d1+required.serial_scratch+required.workspace+required.metadata+
+                required.runtime_payload+required.tails+candidate.known_prefill_host_headroom;
+            // T8192 fits by one byte without owner metadata; the full equation
+            // must reject it and select T4096, which has ample workspace slack.
+            const auto primary_workspace=estimate(selected).workspace;
+            required.model_backing=*edge.available+credit-other-1U-
+                (primary_workspace-required.workspace);
+            return required;
+        };
+        const auto config=resolve(request,edge);
+        expect(config.admitted && config.options.known_prefix_prefill_rows==4096U &&
+            config.tile_fallback=="T8192:insufficient-memory","rolling owner boundary selects the runtime-admissible smaller tile");
+    }
     for (const auto* message : {"known prefill workspace exceeds its explicit arena budget",
             "known prefill host metadata payload exceeds its budget: T = 8192 needs 1073741825 bytes"}) {
         compiler_failure.estimate = [&](const Options& candidate) {
@@ -1126,6 +1397,96 @@ void long_context_admission_tests(const RequestedOptions& original, const ModelC
         const auto credit = [&](const Options& options, const Environment& environment, const ModelManifest& layout) {
             return prefill_reclaim_credit(options,model,layout,environment,observed.ple_reclaim_page);
         };
+        expect(admitted.ple_rolling_h == 1024U && admitted.ple_rolling_bound > 600000000U &&
+            effective_config_json(admitted).find("\"ple_verified_credit_bytes\":0") != std::string::npos,
+            "rolling inspection exposes H/bound and never claims setup verification");
+        auto off_request = request;
+        off_request.environment["STRIX_PLE_ROLLING"] = "0";
+        const auto off = resolve(off_request,observed);
+        expect(off.admitted && !off.ple_rolling_h && credit(off.options,{{"STRIX_PLE_ROLLING","0"}},manifest) ==
+            credit(off.options,{{"STRIX_CTX_EXACT_MEMORY","0"}},manifest), "both memory switches restore prompt-wide credit");
+        auto historical_print = off;
+        historical_print.environment.erase("STRIX_PLE_ROLLING");
+        expect(effective_config_json(off) == effective_config_json(historical_print),
+            "rolling off preserves historical printed config byte for byte");
+        for (unsigned route = 0; route < 4; ++route) {
+            auto reused = admitted.options;
+            if (route == 0) reused.prefix_cache_host_bytes = gib_bytes;
+            if (route == 1) reused.prefix_cache_dir = "cache";
+            if (route == 2) reused.prefix_cache_then_prompts.push_back("suffix.ids");
+            if (route == 3) reused.rtx_state_import = true;
+            std::uint64_t reuse_h = 999;
+            const auto reused_credit = prefill_reclaim_credit(reused,model,manifest,{},observed.ple_reclaim_page,&reuse_h);
+            expect(!reuse_h && reused_credit == credit(reused,{{"STRIX_PLE_ROLLING","0"}},manifest),
+                "prefix restore and follow-up prompts retain public prompt-wide PLE credit");
+        }
+        auto fixed = admitted.options;
+        fixed.mtp.enabled = true; fixed.session_mtp_fixed = true;
+        expect(!credit(fixed,{},manifest), "fixed MTP sessions never inherit a rolling turn lease");
+        std::uint64_t h = 0, bound = 0;
+        (void)prefill_reclaim_credit(admitted.options,model,manifest,{{"STRIX_PLE_ROLLING_POSITIONS","256"}},
+            observed.ple_reclaim_page,&h,&bound);
+        expect(h == 256U && bound == admitted.ple_rolling_bound, "H tuning leaves the hard cap admission unchanged");
+
+        std::uint64_t cap = 0;
+        (void)prefill_reclaim_credit(admitted.options,model,manifest,{{"STRIX_PLE_ROLLING_CAP_BYTES","1073741824"}},
+            observed.ple_reclaim_page,&h,&bound,&cap);
+        expect(cap == (1ULL<<30U) && bound < admitted.ple_rolling_bound &&
+            effective_config_json(admitted).find("\"ple_rolling_cap_bytes\":3221225472") != std::string::npos,
+            "cap tuning and inspection use the shared budget");
+        off_request.environment["STRIX_PLE_ROLLING_CAP_BYTES"] = "invalid-but-disabled";
+        expect(effective_config_json(resolve(off_request,observed)) == effective_config_json(historical_print),
+            "off route ignores cap tuning and preserves printed bytes");
+        auto master_request = request;
+        master_request.environment["STRIX_CTX_EXACT_MEMORY"] = "0";
+        master_request.environment["STRIX_PLE_ROLLING_CAP_BYTES"] = "invalid-but-disabled";
+        master_request.environment["STRIX_PLE_ROLLING_POSITIONS"] = "invalid-but-disabled";
+        const auto master_off = resolve(master_request,observed);
+        auto master_historical = master_off;
+        master_historical.environment.erase("STRIX_PLE_ROLLING_CAP_BYTES");
+        master_historical.environment.erase("STRIX_PLE_ROLLING_POSITIONS");
+        expect(!master_off.ple_rolling_h && effective_config_json(master_off)==effective_config_json(master_historical),
+            "master off preserves printed bytes and ignores rolling tuning");
+        auto mtp = admitted.options;
+        mtp.mtp.enabled = true;
+        std::uint64_t mtp_h=0, mtp_bound=0;
+        const auto mtp_credit=prefill_reclaim_credit(mtp,model,manifest,{},observed.ple_reclaim_page,&mtp_h,&mtp_bound);
+        expect(mtp_credit>0 && mtp_h==1024 && mtp_bound>600000000U, "fixed-policy tiled MTP has predicted credit only");
+        expect(prefill_reclaim_credit(mtp,model,manifest,{{"STRIX_PLE_ROLLING_CAP_BYTES","ignored"}},
+            observed.ple_reclaim_page)==0, "invalid explicit owned cap refuses MTP credit");
+        expect(prefill_reclaim_credit(mtp,model,manifest,{{"STRIX_PLE_ROLLING_CAP_BYTES","1073741824"}},
+            observed.ple_reclaim_page)>mtp_credit, "MTP allocation and prediction honor the same owned cap");
+        mtp.generate_tokens=mtp.context_tokens-mtp.tokens.size();
+        expect(credit(mtp,{},manifest)==mtp_credit,"MTP bounded decode allowance independent of G");
+        for (const auto& off_env : {Environment{{"STRIX_PLE_ROLLING","0"}}, Environment{{"STRIX_CTX_EXACT_MEMORY","0"}}}) {
+            h=123; bound=123;
+            expect(prefill_reclaim_credit(mtp,model,manifest,off_env,observed.ple_reclaim_page,&h,&bound)==0 && !h && !bound,
+                "MTP off switches preserve whole-table warm plan and zero credit");
+        }
+        auto over_capacity=mtp; ++over_capacity.generate_tokens;
+        expect(credit(over_capacity,{},manifest)==0,"MTP prompt plus G capacity overflow gets no credit");
+        auto adaptive=mtp;
+        adaptive.mtp.spec_min_p=0.85; adaptive.mtp.draft_chain=true;
+        adaptive.mtp.window_prefix=true; adaptive.mtp.window_rows=8; adaptive.mtp.window_rows_set={2,4,8};
+        const Environment campaign{{"STRIX_MTP_CONTROLLER","minp"},{"STRIX_COHORT_ROWS","32"},
+            {"STRIX_COHORT_WIDE","all"},{"STRIX_LM_HEAD_COHORT_LEAN","1"}};
+        expect(credit(adaptive,campaign,manifest)==mtp_credit,"adaptive min-p shares fixed-window source allowance and bound");
+        for (const auto* key : {"STRIX_PLE_ROLLING","STRIX_CTX_EXACT_MEMORY"}) {
+            auto disabled=campaign; disabled[key]="0";
+            disabled["STRIX_PLE_ROLLING_POSITIONS"]="invalid-but-disabled";
+            disabled["STRIX_PLE_ROLLING_CAP_BYTES"]="invalid-but-disabled";
+            expect(credit(adaptive,disabled,manifest)==0,"default MTP switches restore historical warm zero-credit plan");
+        }
+        for (const auto& environment : {Environment{{"STRIX_MTP_CONTROLLER","depth"}},Environment{{"STRIX_MTP_CONTROLLER","survival"}}})
+            expect(credit(mtp,environment,manifest)==0,"timing adaptive controllers remain gated");
+        auto legacy_mtp=off;
+        legacy_mtp.options.mtp=mtp.mtp;
+        legacy_mtp.admitted=false; legacy_mtp.reason="explicit-route"; legacy_mtp.ple_reclaim_credit=0;
+        auto off_print=legacy_mtp;
+        off_print.environment["STRIX_PLE_ROLLING"]="0";
+        auto historical=legacy_mtp;
+        historical.environment.erase("STRIX_PLE_ROLLING");
+        expect(effective_config_json(off_print)==effective_config_json(historical),"MTP rolling off printed config byte identity");
         for (unsigned excluded = 0; excluded < 13U; ++excluded) {
             auto options = admitted.options;
             if (excluded == 0U) options.residency = HipModelResidencyMode::resident_copy;
@@ -1133,7 +1494,7 @@ void long_context_admission_tests(const RequestedOptions& original, const ModelC
             if (excluded == 2U) options.execution.mode = DecodeExecutionMode::graph;
             if (excluded == 3U) options.known_prefix_prefill_rows = 0U;
             if (excluded == 4U) options.http_serve = true;
-            if (excluded == 5U) options.mtp.enabled = true;
+            if (excluded == 5U) { options.mtp.enabled = true; options.mtp.sample_timing_schedule = true; }
             if (excluded == 6U) options.planned_ple_io = true;
             if (excluded == 7U) options.serving_prefix_files.push_back("unused");
             if (excluded == 8U) options.tokens.clear();
@@ -1181,6 +1542,8 @@ void long_context_admission_tests(const RequestedOptions& original, const ModelC
 
 }
 int main(int argc, char** arguments) {
+    resident_fallback_tests();
+    mtp_reservation_arithmetic_tests();
     const auto model = ModelContract::qwen38_flash_next();
     gguf::FileInfo info;
     ModelManifest manifest;
@@ -1989,6 +2352,57 @@ int main(int argc, char** arguments) {
         !baseline_absent.options.prefill_numerical_profile && baseline_absent.options.context_tokens == request.options.context_tokens,
         "baseline never forces dense-A8 or grows context when model/build admission fails");
     {
+        Options mtp_pool;mtp_pool.mtp.enabled=true;mtp_pool.mtp.window_rows=8;
+        mtp_pool.mtp.window_rows_set={2,4,8};mtp_pool.mtp.window_qsa_rows=true;mtp_pool.mtp.candidate_depth=8;
+        mtp_pool.context_tokens=262144;
+        expect(qsa_mtp_pool_route(mtp_pool),"MTP shared pool defaults ON on converted route");
+        expect(qsa_mtp_pool_bytes(mtp_pool,ModelContract::qwen38_flash_next())==218644480,"one thirteen-role pool plus shared K1 scratch");
+        expect(!qsa_mtp_pool_route(mtp_pool,true),"GSQ suppresses MTP shared pool");
+        for(const char* name:{"STRIX_QSA_MTP_POOL","STRIX_QSA_DECODE_POOL_BF16","STRIX_QPF2K_DEFAULTS"}) {
+            ::setenv(name,"0",1);expect(!qsa_mtp_pool_route(mtp_pool),"off switches keep historical MTP route");::unsetenv(name);
+        }
+        const auto before_digest_argv=effective_prefill_argv(mtp_pool);
+        ::setenv("STRIX_MTP_STEP_LOGITS_DIGEST","1",1);
+        expect(qsa_mtp_pool_route(mtp_pool) && effective_prefill_argv(mtp_pool)==before_digest_argv,
+            "step logits diagnostics preserve resolved MTP route and argv");
+        expect(requested_prefill_environment().at("STRIX_MTP_STEP_LOGITS_DIGEST")=="1",
+            "step logits diagnostic request is visible in inspection");
+        ::unsetenv("STRIX_MTP_STEP_LOGITS_DIGEST");
+        const auto prior_image=requested_prefill_environment();
+        ::setenv("STRIX_QSA_MTP_POOL","0",1);
+        expect(requested_prefill_environment()==prior_image,"MTP OFF preserves historical printed environment bytes");
+        expect(qsa_mtp_pool_bytes(mtp_pool,ModelContract::qwen38_flash_next())==0,"MTP OFF has no extra admission bytes");
+        ::unsetenv("STRIX_QSA_MTP_POOL");
+        for(unsigned route=0;route<9U;++route) {
+            auto draft=mtp_pool;
+            if(route==0) draft.http_serve=true;
+            if(route==1) { draft.http_serve=true;draft.http_batch=8; }
+            if(route==2) draft.session_load="STATE";
+            if(route==3) draft.session_live_control=true;
+            if(route==4) draft.session_then_prompt={1};
+            if(route==5) draft.prefix_cache_host_bytes=1;
+            if(route==6) draft.rtx_state_import=true;
+            if(route==7) { draft.rotary=RotaryDescriptor::yarn(4);draft.context_tokens=1048576; }
+            if(route==8) draft.serving_prefix_files={"PREFIX"};
+            expect(qsa_mtp_pool_route(draft)==(route==7),"YaRN f4 CLI defaults on; multi-request M1 routes stay opt-in");
+            ::setenv("STRIX_QSA_MTP_POOL","1",1);
+            expect(qsa_mtp_pool_route(draft),"explicit env enables unqualified M1 route when supported");
+            ::setenv("STRIX_QPF2K_DEFAULTS","0",1);
+            expect(!qsa_mtp_pool_route(draft),"opt-in cannot bypass defaults suppression");
+            ::unsetenv("STRIX_QPF2K_DEFAULTS");::unsetenv("STRIX_QSA_MTP_POOL");
+        }
+        for(const auto c:{32768U,131072U,262144U,524288U}) {
+            auto qualified=mtp_pool;qualified.rotary=RotaryDescriptor::yarn(2);qualified.context_tokens=c;
+            expect(qsa_mtp_pool_route(qualified) && ple_rolling_prompt_supported(qualified),"YaRN f2 qualified CLI defaults on through 524K");
+        }
+        auto f4=mtp_pool;f4.rotary=RotaryDescriptor::yarn(4);f4.context_tokens=1048576;
+        expect(ple_rolling_prompt_supported(f4) && qsa_mtp_pool_route(f4),"qualified f4 MTP CLI rolling and pool default on");
+        ::setenv("STRIX_PLE_ROLLING","1",1);
+        expect(ple_rolling_prompt_supported(f4),"explicit env enables f4 rolling qualification");
+        ::unsetenv("STRIX_PLE_ROLLING");
+        mtp_pool.http_serve=true;mtp_pool.qsa_mtp_pool_explicit_opt_in=true;
+        mtp_pool.mtp.copy_wide_rows={32};expect(!qsa_mtp_pool_route(mtp_pool),"wide writers decline before allocation");
+        mtp_pool.mtp.copy_wide_rows.clear();mtp_pool.baseline=true;expect(!qsa_mtp_pool_route(mtp_pool),"baseline retains historical MTP");
         // Serial decode pool route: plain append-only CLI only; every multi-request or rewriting route is excluded.
         const auto route = [&](std::vector<std::string> extra) {
             std::vector<std::string> args{"decoder","target.gguf","1","2","3","--generate","4"};

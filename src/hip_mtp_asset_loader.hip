@@ -70,7 +70,7 @@ std::shared_ptr<const HipMtpAssets> HipMtpAssets::load(const ModelContract& mode
     evidence.verified_model_content_identity=s.sidecar_map->content_identity();
     HeaderBuffer buffer(*s.sidecar_map,request.metadata_read_budget_bytes);std::istream input(&buffer);
     gguf::Limits limits;limits.max_metadata_entries=256;limits.max_tensors=64;
-    limits.max_string_bytes=request.metadata_read_budget_bytes;limits.max_total_array_elements=1000000;limits.max_array_depth=2;
+    limits.max_string_bytes=request.metadata_read_budget_bytes;limits.max_total_array_elements=1000000;limits.max_array_depth=2;limits.max_retained_array_elements=4;
     const auto info=gguf::read(input,s.sidecar_map->bytes(),limits);
     s.sidecar_map->validate_unchanged();s.target_map->validate_unchanged();
     s.sidecar_manifest=build_mtp_sidecar_manifest(model,info,evidence);

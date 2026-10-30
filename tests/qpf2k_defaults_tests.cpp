@@ -32,6 +32,12 @@ void policy_tests() {
         automatic.at("STRIX_QPF2K_SHARED_PRE") == "1" && automatic.at("STRIX_QPF2K_MOE_MC") == "1" &&
         automatic.at("STRIX_QPF2K_MOE_HDR") == "1" && !automatic.contains("STRIX_QPF2K_HC_LOWBAND"),
         "exact prefill defaults use auto scoring and MC mode 1; LOWBAND stays opt-in");
+    expect(automatic.at("STRIX_QPF2K_QSA_MASK")=="0x2257",
+        "attend occupancy bit 13 stays enabled in the production mask");
+    Environment historical_mask{{"STRIX_QPF2K_QSA_MASK","0x257"}};
+    initialize(historical_mask);
+    expect(historical_mask.at("STRIX_QPF2K_QSA_MASK")=="0x257",
+        "explicit historical mask keeps the occupancy off switch");
     Environment startup;
     expect(initialize(startup, qpf2k::startup_items) == qpf2k::startup_items &&
         !(qpf2k::startup_items & qpf2k::exact_prefill_items), "exact prefill defaults wait for decoder admission");
@@ -223,6 +229,61 @@ void ple_reclaim_tests() {
     expect(decode_cli::ple_reclaim_mode(options, policy, false) == Mode::off, "DEFAULTS=0 skips L1 on the supported route");
     defaults.set(nullptr);
 
+    {
+        const EnvSetting rolling("STRIX_PLE_ROLLING"), exact("STRIX_CTX_EXACT_MEMORY"), controller("STRIX_MTP_CONTROLLER");
+        rolling.set(nullptr); exact.set(nullptr); controller.set(nullptr); flag.set("auto");
+        auto mtp = options; mtp.mtp.enabled = true;
+        expect(decode_cli::ple_reclaim_mode(mtp,policy,false) == automatic,"single fixed eager MTP route is admitted");
+        mtp.mtp.window_rows_set = {2,4,8}; mtp.mtp.window_rows = 8;
+        mtp.mtp.window_prefix = true; mtp.mtp.draft_chain = true; mtp.mtp.spec_min_p = 0.7;
+        const EnvSetting cohort_rows("STRIX_COHORT_ROWS"), cohort_wide("STRIX_COHORT_WIDE"), lean("STRIX_LM_HEAD_COHORT_LEAN");
+        cohort_rows.set("32"); cohort_wide.set("all"); lean.set("1"); controller.set("minp");
+        expect(decode_cli::ple_reclaim_mode(mtp,policy,false) == automatic,"default adaptive min-p CLI admits leased rolling");
+        expect(decode_cli::ple_reclaim_inactive_reason(mtp,policy,false,true).empty(),"adaptive row sets and min-p are supported");
+        mtp.mtp.spec_min_p = -1.0;
+        expect(decode_cli::mtp_draft_min_probability(mtp.mtp)>0.0F &&
+            decode_cli::ple_reclaim_mode(mtp,policy,false)==automatic,"implicit adaptive min-p admits the same route");
+
+        rolling.set("0");
+        expect(decode_cli::ple_reclaim_mode(mtp,policy,false) == Mode::off,"MTP rolling off keeps warm zero-credit route");
+        rolling.set(nullptr); exact.set("0");
+        expect(decode_cli::ple_reclaim_mode(mtp,policy,false) == Mode::off,"MTP exact-memory off keeps warm zero-credit route");
+        exact.set(nullptr); controller.set("depth");
+        expect(decode_cli::ple_reclaim_mode(mtp,policy,false) == Mode::off,"timed controller stays warm");
+        expect(decode_cli::ple_reclaim_inactive_reason(mtp,policy,false)=="mtp-depth-controller","depth inactive reason");
+        controller.set("survival");
+        expect(decode_cli::ple_reclaim_mode(mtp,policy,false)==Mode::off &&
+            decode_cli::ple_reclaim_inactive_reason(mtp,policy,false)=="mtp-survival-controller","survival inactive reason");
+        controller.set("minp");
+        using MtpExclude = std::function<void(decode_cli::Options&)>;
+        const std::vector<std::pair<MtpExclude,std::string_view>> cases{
+            {[](auto& o) {o.mtp.copy_wide_rows={16};}, "mtp-copy-wide-rows"},
+            {[](auto& o) {o.mtp.golden_dump="golden";}, "mtp-golden-dump"},
+            {[](auto& o) {o.mtp.sample_timing_schedule=true;}, "mtp-sample-timing-schedule"},
+            {[](auto& o) {o.mtp.metadata_only=true;}, "mtp-metadata-only"},
+            {[](auto& o) {o.raw_recording_path="record";}, "raw-recording"},
+            {[](auto& o) {o.validation_final_state_path="state";}, "validation-final-state"},
+            {[](auto& o) {o.prefix_cache_host_bytes=1;}, "prefix-cache-restore"},
+            {[](auto& o) {o.prefix_cache_dir="cache";}, "prefix-cache-restore"},
+            {[](auto& o) {o.rtx_state_import=true;}, "rtx-state-import"},
+        };
+        for (const auto& [exclude, reason] : cases) {
+            auto excluded=mtp; exclude(excluded); flag.set("auto");
+            expect(decode_cli::ple_reclaim_mode(excluded,policy,false)==Mode::off,"unsafe MTP policy remains warm");
+            expect(decode_cli::ple_reclaim_inactive_reason(excluded,policy,false,true)==reason,"specific inactive witness reason");
+            expect(decode_cli::ple_reclaim_inactive_witness(excluded,policy,false)==
+                "ple-rolling: inactive; "+std::string(reason)+"\n","exact runtime inactive witness bytes");
+            flag.set("1"); bool refused=false;
+            try {(void)decode_cli::ple_reclaim_mode(excluded,policy,false);}
+            catch (const std::invalid_argument& error) {
+                refused=true;
+                expect(std::string(error.what()).ends_with(reason),"strict refusal names the same inactive reason");
+            }
+            expect(refused,"required unsafe MTP policy refuses");
+        }
+        flag.set("auto");
+
+    }
     using Exclude = std::function<void(decode_cli::Options&, HipModelResidencyPolicy&, bool&)>;
     const std::vector<Exclude> exclusions{
         [](auto& o, auto&, auto&) { o.residency = HipModelResidencyMode::resident_copy; },
@@ -234,7 +295,7 @@ void ple_reclaim_tests() {
         [](auto& o, auto&, auto&) { o.http_serve = true; },
         [](auto& o, auto&, auto&) { o.mtp.cohort.emplace_back(); },
         [](auto& o, auto&, auto&) { o.serving_prefix_files.emplace_back("prefix"); },
-        [](auto& o, auto&, auto&) { o.mtp.enabled = true; },
+        [](auto& o, auto&, auto&) { o.mtp.enabled = true; o.mtp.sample_timing_schedule = true; },
         [](auto& o, auto&, auto&) { o.planned_ple_io = true; },
         [](auto& o, auto&, auto&) { o.session_load = "checkpoint"; },
         [](auto& o, auto&, auto&) { o.session_live_control = true; },

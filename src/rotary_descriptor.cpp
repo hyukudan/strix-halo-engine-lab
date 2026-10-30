@@ -95,8 +95,8 @@ RotaryDescriptor validate_qwen_rotary_request(std::uint32_t factor,
     }
     const auto descriptor = RotaryDescriptor::yarn(factor);
     if (!explicit_context) throw std::invalid_argument("YaRN requires explicit --context");
-    if (context <= RotaryDescriptor::original_max || context > descriptor.effective_max())
-        throw std::invalid_argument("YaRN requires 262144 < context <= 262144 * factor");
+    if (!context || context > descriptor.effective_max())
+        throw std::invalid_argument("YaRN requires 0 < context <= 262144 * factor");
     return descriptor;
 }
 } // namespace strix

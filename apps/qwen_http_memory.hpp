@@ -42,6 +42,7 @@ inline HttpServingMemory http_mtp_memory(const Options& o, const ModelContract& 
         add(263U,add(state.host_total_bytes,state.host_alignment-1U)));
     if (capture > o.mtp.target_capture_bytes) throw std::runtime_error("one-slot:target capture exceeds budget");
     auto slot=add(pool,capture);
+    slot=add(slot,qsa_mtp_pool_bytes(o,model,qpf2k::has_gsq_gate(manifest)));
     // Prompt tap may be double buffered. Charge both independently of the
     // environment so inspection and startup have the same safe bound.
     slot=add(slot,add(mul(mul(2U,o.known_prefix_prefill_rows),width),width));

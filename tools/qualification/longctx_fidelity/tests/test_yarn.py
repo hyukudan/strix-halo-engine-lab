@@ -11,12 +11,29 @@ from unittest.mock import patch
 from tools.qualification.longctx_fidelity.build import build_case, write_case
 from tools.qualification.longctx_fidelity.common import canonical, file_sha, mode_budget
 from tools.qualification.longctx_fidelity.plan import matrix, predicted
-from tools.qualification.longctx_fidelity.run_cli import run_cases, validate_case
+from tools.qualification.longctx_fidelity.run_cli import run_cases, validate_case, validate_mtp_timing_receipt
 from tools.qualification.longctx_fidelity.tok import FakeTokenizer
 from tools.qualification.longctx_fidelity.turn import make_script
 
 
 class YarnTests(unittest.TestCase):
+    def test_mtp_timing_requires_work_and_route(self):
+        config = {"yarn_decode_route": {"effective": "mtp"}}
+        result = {"mtp_accepted_candidates": 0, "mtp_proposed_candidates": 7, "mtp_paid_drafts": 8,
+                  "mtp_chosen_window_rows_histogram": {"2": 1}, "generated_tokens": [1, 2],
+                  "emitted_tokens": 2, "generation_ms": 10.0}
+        validate_mtp_timing_receipt(config, result)
+        with self.assertRaisesRegex(ValueError, "effective MTP"):
+            validate_mtp_timing_receipt({"yarn_decode_route": {"effective": "serial"}}, result)
+        for name in ("mtp_accepted_candidates", "mtp_proposed_candidates", "mtp_paid_drafts",
+                     "mtp_chosen_window_rows_histogram", "generation_ms", "emitted_tokens"):
+            missing = dict(result)
+            del missing[name]
+            with self.assertRaises(ValueError):
+                validate_mtp_timing_receipt(config, missing)
+        with self.assertRaisesRegex(ValueError, "coverage"):
+            validate_mtp_timing_receipt(config, dict(result, mtp_paid_drafts=0))
+
     def test_native_default_unchanged(self):
         args = ("niah_single", 2048, .5, 42, FakeTokenizer())
         default = build_case(*args)
