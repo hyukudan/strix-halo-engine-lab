@@ -852,6 +852,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "Attention LDS swizzle",
+    "flag_or_env": "STRIX_DS41_ATTN_LDS_SWIZZLE",
+    "default": "on",
+    "exact": "Bitwise: involutive LDS permutation on stores and reads of the f32 tiles; HIP attention device tests with the swizzle and the f16 tile off and on; two-node in-process ABA identical on both ranks (rank R1/R6 and batch N8).",
+    "gain": "Two-node in-process ABA, swizzle with the f16 tile vs the f16 tile alone: R6 -0.20 % (3/4 pairs faster), R1 neutral, batch N8 decode -0.04 % / -0.40 % in two turns.",
+    "preconditions": "Packed-attention HIP kernels without the window fold; the f16 tile choice is unchanged.",
+    "off_switch": "STRIX_DS41_ATTN_LDS_SWIZZLE=0",
+    "doc_anchor": "docs/optimizations.md#ds-attn-swizzle"
+  },
+  {
+    "engine": "deepseek",
     "name": "Server warm-up and DSpark calibration",
     "flag_or_env": "STRIX_DS41_SERVE_WARM; STRIX_DS41_DSPARK_CALIB",
     "default": "auto",

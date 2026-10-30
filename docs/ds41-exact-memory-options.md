@@ -1,7 +1,7 @@
-# Exact memory options (experimental)
+# Exact memory options
 
-Both options below are disabled by default. They preserve stored values and the arithmetic
-order. A default change requires complete-workload qualification and interleaved timings.
+Both options below are on by default (`=0` turns each off). They preserve stored values and the
+arithmetic order; each was qualified exact and not slower on the two-node workload.
 
 * `STRIX_DS41_ATTN_LDS_SWIZZLE` (default on, `=0` off): the HIP packed-attention kernels permute 16-byte LDS
   vectors with `slot ^ ((slot >> 3) & 1)`. This map is its own inverse. Stores and reads use
@@ -9,7 +9,7 @@ order. A default change requires complete-workload qualification and interleaved
   their original order. This also applies to segmented launches. It permutes the f32 tiles only
   (the 4-heads-per-wave tile and the f16 kernels' f32 fallback tiles); `STRIX_DS41_ATTN_TILE_F16`
   still selects the tile form, and the window fold keeps the unpermuted kernels.
-* `STRIX_DS41_ENGRAM_PAYLOAD_CACHE=1`: the Linux host row reader keeps 264-byte Engram
+* `STRIX_DS41_ENGRAM_PAYLOAD_CACHE` (default on, `=0` off): the Linux host row reader keeps 264-byte Engram
   payloads in a per-reader CLOCK cache and deduplicates absolute offsets within each batch.
   The open descriptor owns file identity; model bytes must remain immutable for the reader's
   lifetime, as for resident weights. The cache never spans readers or model files.

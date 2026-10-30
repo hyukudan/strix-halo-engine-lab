@@ -1227,6 +1227,22 @@ Folds window state work, schedules live chunks and stores eligible attention til
 - **Measured gain:** -
 - **Public evidence:** [Two-node defaults](models/deepseek-v4.1/production-defaults.md)
 
+<a id="ds-attn-swizzle"></a>
+
+### Attention LDS swizzle
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_ATTN_LDS_SWIZZLE`. **Default:** on.
+
+The f32 attention tiles (the 4-heads-per-wave tile and the f16 kernels' f32 fallback tiles) permute their 16-byte LDS vectors with an involutive map applied to stores and reads; the f16 tile choice is unchanged.
+
+- **Preconditions:** Packed-attention HIP kernels without the window fold (the fold keeps the unpermuted kernels).
+- **Automatic selection:** On for every eligible launch, single and segmented.
+- **Fallback notice:** Folded launches use the unpermuted kernels silently.
+- **Exactness evidence:** Bitwise: same values, dot products, softmax, reductions and chunk combination order; HIP attention device tests with the swizzle and the f16 tile off and on; two-node in-process ABA identical on both ranks (R1 tokens + logits slice, window tokens, attention state; batch N8 fed / argmax / logits per row, final attention states).
+- **Off switch:** STRIX_DS41_ATTN_LDS_SWIZZLE=0
+- **Measured gain:** Two-node in-process ABA, swizzle with the f16 tile vs the f16 tile alone: R6 -0.20 % (3/4 pairs faster), R1 neutral, batch N8 decode -0.04 % / -0.40 % in two turns.
+- **Public evidence:** [Exact memory options](ds41-exact-memory-options.md), [two-node defaults](models/deepseek-v4.1/production-defaults.md)
+
 <a id="ds-warm"></a>
 
 ### Server warm-up and DSpark calibration
