@@ -1182,13 +1182,13 @@
   },
   {
     "engine": "minimax",
-    "name": "MSA prefill mode 3",
+    "name": "MSA prefill mode 5",
     "flag_or_env": "STRIX_MM_PF_MSA_REWORK",
-    "default": "3",
-    "exact": "Published same-identity qualification: Prefill attention measurement: exact, 8K B/A 0.963 / 0.957 / 0.972; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.",
-    "gain": "Prefill attention measurement: exact, 8K B/A 0.963 / 0.957 / 0.972",
+    "default": "5",
+    "exact": "Mode 5 vs 3: prefill tokens, attention state fnv and final-row fnv identical across all arms on both ranks; kernel tests bitwise for every rework mode. Mode 3: published same-identity qualification (8K B/A 0.963 / 0.957 / 0.972).",
+    "gain": "Mode 5 (= mode 3 with packed two-head probability evaluation) vs mode 3, GPU, two Strix Halo nodes over 2x USB4 Gen3, PerfOpt kernel, one binary, rank --ab pfmsarework (A=3, B=5; A B A B A B A prefills) in two processes: 8K TTFT B - bracketing A mean -0.129 s, 1K -0.109 s (n=6 each, intervals include 0, not slower); producers -2.9 %, attention -1 % in the kernel bench. Mode 3 vs the original: 8K B/A 0.963 / 0.957 / 0.972",
     "preconditions": "Supported MSA prefill shapes and row buffers.",
-    "off_switch": "STRIX_MM_PF_MSA_REWORK=0",
+    "off_switch": "STRIX_MM_PF_MSA_REWORK=3 (previous default), =0 (original)",
     "doc_anchor": "docs/optimizations.md#mm-pf-msa-rework"
   },
   {

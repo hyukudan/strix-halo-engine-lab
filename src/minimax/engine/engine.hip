@@ -485,13 +485,13 @@ struct Engine::Impl {
     bool attn_prefill_fused = true;  // STRIX_MM_ATTN_PREFILL (runtime; default fused, =off: K1-K4): prefill MSA in fused 16-row windows
     bool pf_idx_tile = false;
     unsigned pf_idx_rows = 32;
-    unsigned pf_msa_rework = 3;  // STRIX_MM_PF_MSA_REWORK: prefill only, default 3 (measurement: exact, 8K B/A 0.963/0.957/0.972); =0 original
+    unsigned pf_msa_rework = 5;  // STRIX_MM_PF_MSA_REWORK: prefill only, default 5 (= 3 with packed two-head probabilities, exact); =3 the previous default, =0 original
     bool pf_msa_batch = true;  // STRIX_MM_PF_MSA_BATCH (default ON, exact measurement): independent scratch per prefill window
     unsigned pf_msa_windows = 0;
     float *pf_scores = nullptr, *pf_partial = nullptr;
     std::uint32_t *pf_idx = nullptr, *pf_cnt = nullptr, *pf_ticket = nullptr;
     void set_prefill_msa_rework(unsigned mode) {
-        if (mode > 4) throw std::invalid_argument("prefill MSA rework must be 0, 1, 2, 3 or 4");
+        if (mode > 5) throw std::invalid_argument("prefill MSA rework must be 0, 1, 2, 3, 4 or 5");
         pf_msa_rework = mode;
     }
     bool pf_attend4 = true;  // STRIX_MM_PF_ATTEND4 (default ON, exact measurement): prefill windows use v4, two heads per wave
@@ -629,9 +629,9 @@ struct Engine::Impl {
         attn_prefill_fused = apf == nullptr || std::string(apf) != "off";  // ON by default (measurement: bitwise, TTFT -5.5 %); =off
         if (const char* rework = std::getenv("STRIX_MM_PF_MSA_REWORK")) {
             const std::string mode = rework;
-            if (mode != "0" && mode != "1" && mode != "2" && mode != "3" && mode != "4")
-                throw std::invalid_argument("STRIX_MM_PF_MSA_REWORK must be 0, 1, 2, 3 or 4");
-            set_prefill_msa_rework(mode == "4" ? 4U : mode == "3" ? 3U : mode == "2" ? 2U : mode == "1" ? 1U : 0U);
+            if (mode != "0" && mode != "1" && mode != "2" && mode != "3" && mode != "4" && mode != "5")
+                throw std::invalid_argument("STRIX_MM_PF_MSA_REWORK must be 0, 1, 2, 3, 4 or 5");
+            set_prefill_msa_rework(mode == "5" ? 5U : mode == "4" ? 4U : mode == "3" ? 3U : mode == "2" ? 2U : mode == "1" ? 1U : 0U);
         }
         pf_attend4 = env_flag("STRIX_MM_PF_ATTEND4", true);
         pf_msa_batch = env_flag("STRIX_MM_PF_MSA_BATCH", true);
