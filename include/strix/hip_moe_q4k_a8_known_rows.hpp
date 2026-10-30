@@ -79,6 +79,7 @@ struct PrefillRows {
     StridedRows<signed char> down_codes; StridedRows<float> down_deltas; StridedRows<int> down_sums;
     StridedRows<float> rawdots;
     CsrRows csr; // q51_known_rows::scratch_layout(T, experts, top_k, true) in an exclusive allocation
+    bool route_bf16 = false; // Candidate: DA16 certificate writer and matching ordered merge only.
     unsigned* unsafe = nullptr; // Private admission sidecar, stream-owned; null selects base producers.
 };
 // T CTAs: each row's clear, route checks and quantizer exactly as the window prologue.

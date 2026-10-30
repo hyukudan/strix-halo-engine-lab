@@ -434,3 +434,13 @@ TX/RX pools, completion accounting and health state. Striping or splitting traff
 only after simultaneous measurements show the links are independent. See
 [architecture/16-direct-gpu-transport.md](../architecture/16-direct-gpu-transport.md) and
 [architecture/12-multi-node-and-usb4.md](../architecture/12-multi-node-and-usb4.md).
+
+### Candidate MoE route storage
+
+`--prefill-moe-route-bf16 on|off` (environment
+`STRIX_QPF2K_MOE_ROUTE_BF16`, effective config key `prefill_moe_route_bf16`)
+selects the [BF16 route storage candidate](../optimizations.md#qwen-moe-route-bf16).
+It is bit-changing, opt-in, default OFF and outside READY. Effective-config inspection
+reports its storage identity/hash, component mask and decline/suppression reason.
+It requires the known-prefix DA16 certificate/MC=1 route and excludes serving and MTP.
+Native qualification is pending; no speed claim is established.

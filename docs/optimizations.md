@@ -2490,3 +2490,42 @@ by the IOMMU.
 - **Off switch:** `options amdgpu iommu_perfopt=0`, or boot the previous kernel
 - **Measured gain:** Qwen 32K prefill +2.9 % / +3.1 % (two repeats, one node, same power, equal or lower GPU clock); DeepSeek two-node decode within ±1 % with one node on PerfOpt, both-node run pending
 - **Implementation / evidence:** [driver repo: PerfOpt](https://github.com/hyukudan/strix-halo-usb4-driver/blob/main/docs/PERFOPT.md)
+
+<a id="qwen-moe-route-bf16"></a>
+
+### MoE route output BF16 storage candidate
+
+**Engine:** `qwen`. **Control:** `STRIX_QPF2K_MOE_ROUTE_BF16=1` or
+`--prefill-moe-route-bf16 on`. **Config key:** `prefill_moe_route_bf16`.
+**Default:** OFF. **Status:** candidate; bit-changing; outside READY; needs qualification.
+
+Rounds each DA16 FP32 route dot to BF16 with round-to-nearest-even, preserving NaNs
+and infinities. The ordered merge widens each dot exactly to FP32 and retains the
+existing slot-order FMA chain, nonfinite status checks, commit and output format.
+Weights, activations and route weights retain their existing arithmetic.
+
+- **Covered route:** full-row known-prefix fast FP16 MoE prefill, Q4_K/Q5_K gate/up,
+  Q5_1/Q8_0 DA16 certificate down, effective tunes 80/82, ROUTE=14 and MC=1.
+  Both the admitted merge/commit and its device-side merge-zero/finish fallback read BF16.
+- **Declines:** other tunes, core/G3/P1, SMALL, non-DA16 F16X, GSQ, plain/decode and
+  known-rows organizations, MTP, nested/serving, cache/session routes and CUDA.
+  Unsupported geometry or weight formats are refused before execution. The ordinary
+  serial suffix and subsequent decode retain their decode profile and FP32 route scratch.
+- **Identity and inspection:** adds component bit 64 outside the default component set;
+  the profile-pair hash changes. The storage descriptor is `fp16-v1+moeroute16`;
+  OFF retains `fp16-v1` (`a0094634843e16ee`). `--print-effective-config` reports the
+  requested environment, effective boolean, storage descriptor/hash and decline or
+  suppression reason. HTTP capabilities explicitly report this candidate unsupported.
+- **Memory:** logical route-dot row size and slot pitch halve. The arena allocation
+  remains FP32-sized with its original per-row arena pitch; admission is unchanged.
+- **Off switch:** `STRIX_QPF2K_MOE_ROUTE_BF16=0` (any value beginning with `0`),
+  `--prefill-moe-route-bf16 off`, `--baseline`, `STRIX_BASELINE=1`, or
+  `STRIX_QPF2K_DEFAULTS=0`. CLI selection overrides the candidate environment value;
+  baseline and the master off switch suppress both.
+- **Qualification:** CPU option/identity/suppression tests and a native HIP fixture are
+  provided. Native compiler, execution, model fidelity and complete-workload gates remain
+  required; compare complete token IDs and logits/state digests against references for
+  this candidate identity. No speed claim is established.
+- **Native fixture:** `ctest -R strix-hip-moe-route-bf16-tests --output-on-failure`
+  covers both down formats and tunes, top-k ten, padded tails, RNE ties, subnormals,
+  infinities, NaNs, OFF byte equality and both merge/commit branches.

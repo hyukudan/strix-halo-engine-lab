@@ -36,6 +36,7 @@ struct HipMoeExpertsLauncherConfig {
     // fast-prefill-f16wmma-v1: known-prompt prefill blocks (T rows) run the routed MoE as FP16
     // WMMA (known_rows::enqueue_prefill form 3). Serial and window rows are unaffected.
     bool prefill_f16wmma = false;
+    bool prefill_moe_route_bf16 = false;
 };
 
 void register_hip_moe_experts_kernel_variant(

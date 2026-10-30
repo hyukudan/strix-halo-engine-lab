@@ -112,6 +112,23 @@ __global__ __launch_bounds__(F16Tile<Tune>::Threads) void down_prefill_f16x_da16
 template<bool Q51,unsigned Tune>
 __global__ __launch_bounds__(F16Tile<Tune>::Threads) void down_prefill_f16x_da16_certificate(const unsigned char* weights,PrefillRows view,
     unsigned hidden,unsigned width,const uint4* image) {
+    constexpr bool RouteBF16=false;
+#define STRIX_DA16_BATCH_TILE const unsigned batch=blockIdx.y,tile=blockIdx.x;
+#define STRIX_DA16_GUARD if(csr.summary[0]||batch>=csr.summary[2])return;
+#define STRIX_DA16_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;
+#define STRIX_DA16_CERTIFICATE
+#include "hip_moe_da16_down_body.inc"
+#undef STRIX_DA16_CERTIFICATE
+#undef STRIX_DA16_BATCH_TILE
+#undef STRIX_DA16_GUARD
+#undef STRIX_DA16_LDS
+}
+
+// Candidate-only entry; the incumbent certificate kernel retains its name and specialization.
+template<bool Q51,unsigned Tune>
+__global__ __launch_bounds__(F16Tile<Tune>::Threads) void down_prefill_f16x_da16_certificate_bf16(const unsigned char* weights,PrefillRows view,
+    unsigned hidden,unsigned width,const uint4* image) {
+    constexpr bool RouteBF16=true;
 #define STRIX_DA16_BATCH_TILE const unsigned batch=blockIdx.y,tile=blockIdx.x;
 #define STRIX_DA16_GUARD if(csr.summary[0]||batch>=csr.summary[2])return;
 #define STRIX_DA16_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;

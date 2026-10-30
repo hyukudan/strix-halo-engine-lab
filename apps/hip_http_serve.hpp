@@ -10,6 +10,7 @@
 #include "strix/serve/api.hpp"
 #include "qwen_service_health.hpp"
 #include "qwen_rotary_capabilities.hpp"
+#include "qwen_moe_route_bf16.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/engine.hpp"
 #include "strix/serve/http_server.hpp"
@@ -219,6 +220,7 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
         config.capabilities = options.http_capabilities;
         config.capabilities_extra = [modes=session_modes_json(options)](serve::Json& out) {
             qwen_rotary_capabilities(out);
+            moe_route_bf16_capabilities(out);
             out.set("session_numerical_modes",modes);
         };
         config.stream_receipts = options.http_stream_receipts;
@@ -325,6 +327,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         prefix_batch_cert_capabilities(cert,options);
         config.capabilities_extra = [modes=session_modes_json(options), cert=std::move(cert)](serve::Json& out) {
             qwen_rotary_capabilities(out);
+            moe_route_bf16_capabilities(out);
             out.set("session_numerical_modes",modes);
             for(const auto& [key,value]:cert.as_object()) out.set(key,value);
         };

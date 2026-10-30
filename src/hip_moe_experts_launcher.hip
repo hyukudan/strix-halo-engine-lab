@@ -1,3 +1,4 @@
+#include "strix/moe_route_bf16.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_mtp_projection.hpp"
 #include "strix/hip_launch_context.hpp"
@@ -2730,6 +2731,7 @@ __global__ void known_moe_prefill_merge_kernel(KnownMoePrefillDevice view, std::
 // qpf2k/moe-mi (STRIX_QPF2K_MOE_ROUTE bit 8): known_moe_prefill_merge_kernel when the routed prologue did not zero the
 // accumulation view: the same kernel, plus a zero store on each path where the base returns without a store (the zero the
 // prologue would have left there; the prologue clears exactly hidden words per row). Successful rows: identical.
+#include "hip_moe_route_bf16.inc"
 #include "hip_moe_prefill_commit.inc"
 __global__ void known_moe_prefill_merge_kernel_z(KnownMoePrefillDevice view, std::uint32_t* header,
     std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k) {
@@ -2747,6 +2749,11 @@ template <bool Acc>
 __global__ void known_moe_prefill_merge_commit_kernel(KnownMoePrefillDevice view, std::uint32_t* header,
     std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k, const unsigned* unsafe) {
     moe_prefill_merge_z_body<true, Acc>(view, header, hidden_size, experts, top_k,
+        [](auto v, unsigned r) { return known_moe_prefill_row(v, r); }, unsafe);
+}
+__global__ void known_moe_prefill_merge_commit_bf16_kernel(KnownMoePrefillDevice view, std::uint32_t* header,
+    std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k, const unsigned* unsafe) {
+    moe_prefill_merge_z_body<true, false, true>(view, header, hidden_size, experts, top_k,
         [](auto v, unsigned r) { return known_moe_prefill_row(v, r); }, unsafe);
 }
 template <unsigned CTAs>
@@ -2984,6 +2991,9 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
     check_hip(hipPeekAtLastError(), "known prefill routed rows stale error");
     bool committed = false;
     auto rows = p.rows;
+    rows.route_bf16 = config.prefill_moe_route_bf16;
+    if (rows.route_bf16 && (!config.prefill_f16wmma || gsq || prefill_merge_commit(gsq)!=1U))
+        throw std::invalid_argument("MoE route BF16 requires fast DA16 prefill and MC=1");
     if (prefill_merge_commit(gsq)) rows.unsafe = prefill_admission_word(stream);
     moe_q4k_a8::known_rows::enqueue_prefill(p.request, rows, count, p.clear_words, p.gate, p.up, p.down_type, p.down, stream,
         config.prefill_f16wmma ? 3 : -1);
@@ -3002,7 +3012,10 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
         (void)witness;
         // The fallback choice is device-side and per call. No host fallback count/witness can observe it
         // without a readback; do not add synchronization or claim a host-observed fallback.
-        if (mc == 2U)
+        if (rows.route_bf16)
+            hipLaunchKernelGGL(known_moe_prefill_merge_commit_bf16_kernel, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0,
+                stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe);
+        else if (mc == 2U)
             hipLaunchKernelGGL(known_moe_prefill_merge_commit_kernel<true>, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0,
                 stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe);
         else

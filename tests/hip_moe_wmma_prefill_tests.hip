@@ -5,9 +5,11 @@
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
 #include "strix/deferred_moe_status.hpp"
+#include "strix/moe_route_bf16.hpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <cmath>
 #include <chrono>
@@ -386,6 +388,7 @@ __global__ void reference_commit_kernel(kr::PrefillRows v, unsigned* header, uns
 using strix::DeferredMoeFirstError;
 using strix::DeferredMoeDomain;
 using strix::merge_deferred_moe_first_error;
+#include "../src/hip_moe_route_bf16.inc"
 #include "../src/hip_moe_prefill_commit.inc"
 // Adapter to the engine's shared merge_z / logical-commit bodies.
 struct FixtureTailView {
@@ -398,10 +401,10 @@ struct FixtureTailView {
 __device__ FixtureTailView fixture_tail_view(kr::PrefillRows v, kr::StridedRows<std::uint16_t> output) {
     return {v.routes, v.route_weights, v.status, v.rawdots, v.clear, output};
 }
-template <bool Acc>
+template <bool Acc, bool RouteBF16 = false>
 __global__ void candidate_merge_commit_kernel(kr::PrefillRows v, unsigned* header, unsigned hidden, unsigned experts, unsigned top_k,
     kr::StridedRows<std::uint16_t> out16) {
-    moe_prefill_merge_z_body<true, Acc>(fixture_tail_view(v, out16), header, hidden, experts, top_k,
+    moe_prefill_merge_z_body<true, Acc, RouteBF16>(fixture_tail_view(v, out16), header, hidden, experts, top_k,
         [](auto v, unsigned r) { return fixture_row(v, r); }, v.unsafe);
 }
 __global__ void candidate_finish_kernel(kr::PrefillRows v, unsigned* header, unsigned row_count, unsigned hidden,
@@ -791,11 +794,13 @@ void bench(const Case& c, int reps) {
     }
     (void)hipEventDestroy(start); (void)hipEventDestroy(stop);
 }
+#include "hip_moe_route_bf16_fixture.inc"
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         const std::string mode = argc > 1 ? argv[1] : "test";
+        if (mode == "route-bf16") { route_bf16_tests(); return 0; }
         if (mode == "schedule") {
             unsigned cases = 0;
             for (unsigned g : {12U, 13U}) for (unsigned d : {7U, 8U})

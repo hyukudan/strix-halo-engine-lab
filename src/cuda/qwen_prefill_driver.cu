@@ -12,6 +12,8 @@
 // padded row counts (the MoE needs >= 16 rows, a multiple of 8); steps that carry state across rows (GDN, QSA, PLE)
 // run on the exact rows of the block.
 #include "strix/cuda_qwen_prefill.hpp"
+#include <cstdlib>
+#include "strix/moe_route_bf16.hpp"
 
 #include "strix/cuda_qwen_dense.hpp"
 #include "strix/cuda_qwen_gdn.hpp"
@@ -346,6 +348,9 @@ void Prefill::Impl::allocate() {
 }
 
 Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
+    if (strix::moe_route_bf16_environment_requested(std::getenv("STRIX_QPF2K_MOE_ROUTE_BF16"),
+        std::getenv("STRIX_BASELINE"), std::getenv("STRIX_QPF2K_DEFAULTS")))
+        throw std::invalid_argument("MoE route BF16 candidate declined: CUDA writer/reader unsupported");
     auto& m = *impl_;
     m.cfg = config;
     validate_blocks(config.block_schedule);
