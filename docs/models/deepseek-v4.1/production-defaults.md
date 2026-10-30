@@ -84,7 +84,7 @@ ranks: tokens, logits slices, attention states; prefill 32K / 400 rows logits + 
 | `STRIX_DS41_IDX_CAND_FILTER` | on (`=0` off) | candidate users read and select only candidate blocks (> 16K entries). 128K R1 -0.8 %, R6 -1.9 % |
 | `STRIX_DS41_ATTN_SEG_HPW` | on (`=0` off) | N8 segments share one heads-per-wave form (Hpw 4 instead of 1). With the above: N8 8K -1.1 %, 32K -1.4 %, 128K -3.3 % |
 
-Still off (measured slower or neutral): `STRIX_DS41_PREFILL_SLABS` (8K +0.76 %), `STRIX_DS41_R1FUSE_QNORM_A8`, `STRIX_DS41_GRAPHS` (only 0.21 ms/step of GPU idle waits for the host), `STRIX_DS41_ATTN_LDS_SWIZZLE`, CMake `STRIX_EXPERIMENTAL_MALL_Q2_DOWN_NT`.
+Still off (measured slower or neutral): `STRIX_DS41_PREFILL_SLABS` (8K +0.76 %), `STRIX_DS41_R1FUSE_QNORM_A8`, `STRIX_DS41_GRAPHS` (only 0.21 ms/step of GPU idle waits for the host), CMake `STRIX_EXPERIMENTAL_MALL_Q2_DOWN_NT`.
 With the trellis o_b site (below) the o_b product is the trellis plan, so the Q8 o_b ready epilogue does not run there;
 the MoE half-sum ready path does.
 The read-ahead skips trellis sites (their own pack) and runs only in the Q8 o_b exchange windows, so with the trellis
@@ -99,6 +99,7 @@ this publication merge does not establish a new device qualification.
 |---|---|---|
 | `STRIX_DS41_DENSE_SELECT` | on: exact per-site dense prefill selector | `=0` restores the configured dense forms |
 | `STRIX_DS41_ATTN_WINDOW_FOLD`, `STRIX_DS41_ATTN_LIVE_CHUNKS`, `STRIX_DS41_ATTN_TILE_F16` | on: exact attention window folding, live chunk scheduling and half-precision tiles | `=0` disables each independently |
+| `STRIX_DS41_ATTN_LDS_SWIZZLE` | on: the f32 attention tiles (4 heads per wave, f16 fallback tiles) permute their 16-byte LDS vectors; the tile choice is unchanged | `=0` off; rank ABA R6 n=5 exact (tokens, logits slice, window tokens, attention state, both ranks) -0.20 % (3/4 faster), R1 neutral; batch ABA N8 n=5 exact, decode median -0.04 % |
 | `STRIX_DS41_MOE_PREFILL` | split MoE prefill form 7 | `=0` disables it |
 | `STRIX_DS41_SERVE_WARM` | warm the serving paths before READY | `=0` disables it; the default logs and skips decode warm-up if the KV pool cannot hold the dummy slots; explicit `=1` still fails when they do not fit; split decode skips it |
 | `STRIX_DS41_DSPARK_CALIB` | on with the warm-up setting outside split decode | explicit `=0` / `=1` overrides it |

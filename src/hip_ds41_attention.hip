@@ -1549,7 +1549,7 @@ static unsigned attention_hpw(const AttentionView& v) {
 int attention_lds_swizzle_mode = -1;
 void set_attention_lds_swizzle(int mode) { attention_lds_swizzle_mode = mode; }
 static bool attention_lds_swizzle() {
-    static const bool env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_LDS_SWIZZLE"); return e && e[0] == '1' && e[1] == 0; }();
+    static const bool env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_LDS_SWIZZLE"); return !(e && e[0] == '0' && e[1] == 0); }();  // default on, =0 off
     return attention_lds_swizzle_mode < 0 ? env : attention_lds_swizzle_mode != 0;
 }
 int attention_live_chunks_mode = -1;
@@ -1598,7 +1598,10 @@ void enqueue_attention_bf16_prefill(const AttentionView& v, hipStream_t stream, 
 void enqueue_attention(const AttentionView& v, hipStream_t stream) {
     check_fold(v);
     const bool fold = v.kv != nullptr;
-    if (attention_lds_swizzle() && !fold) launch_attention<true, false, false>(v, stream);
+    // The swizzle permutes the f32 tile's LDS vectors (the 4-heads-per-wave tile and the f16 kernels' f32 fallback tiles) and
+    // leaves the tile choice alone: with the f16 tile on, its f16 tiles are unchanged.
+    if (attention_lds_swizzle() && !fold)
+        attention_tile_f16() ? launch_attention<true, true, false>(v, stream) : launch_attention<true, false, false>(v, stream);
     else if (attention_tile_f16()) fold ? launch_attention<false, true, true>(v, stream) : launch_attention<false, true, false>(v, stream);
     else fold ? launch_attention<false, false, true>(v, stream) : launch_attention<false, false, false>(v, stream);
 }
@@ -1705,7 +1708,8 @@ void enqueue_attention_segments(std::span<const AttentionView> views, hipStream_
         check_fold(v);
         if ((v.kv != nullptr) != fold) throw std::invalid_argument("ds41 attention segments: window fold on some segments only");
     }
-    if (attention_lds_swizzle() && !fold) launch_attention_segments<true, false, false>(views, stream);
+    if (attention_lds_swizzle() && !fold)  // as enqueue_attention: the f32 tiles only, the tile choice unchanged
+        attention_tile_f16() ? launch_attention_segments<true, true, false>(views, stream) : launch_attention_segments<true, false, false>(views, stream);
     else if (attention_tile_f16()) fold ? launch_attention_segments<false, true, true>(views, stream) : launch_attention_segments<false, true, false>(views, stream);
     else fold ? launch_attention_segments<false, false, true>(views, stream) : launch_attention_segments<false, false, false>(views, stream);
 }
