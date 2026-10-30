@@ -3873,9 +3873,15 @@ static int run_decode_entry(
                 if (b > UINT64_MAX - a) throw std::overflow_error("HTTP slot cost overflow");
                 return a + b;
             };
-            const auto observe = [] {
+            // Resident unlocked registered model pages count as reclaimable in MemAvailable,
+            // but reclaiming them evicts every GPU queue of this process: not available to slots.
+            const auto unlocked_registered = model_residency.registered_bytes() - model_residency.registered_locked_bytes();
+            const auto observe = [unlocked_registered] {
                 PrefillCapabilities capabilities;
-                return observe_prefill_memory(capabilities);
+                auto observation = observe_prefill_memory(capabilities);
+                if (observation.available)
+                    observation.available = *observation.available - std::min(*observation.available, unlocked_registered);
+                return observation;
             };
             const auto gtt_free = [](const PrefillMemory& observation) -> std::optional<std::uint64_t> {
                 if (!observation.gtt_limit || !observation.gtt_used || *observation.gtt_used > *observation.gtt_limit) return {};

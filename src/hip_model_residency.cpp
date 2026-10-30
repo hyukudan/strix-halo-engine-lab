@@ -25,6 +25,7 @@
 
 #if defined(__linux__)
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #endif
 
@@ -433,6 +434,7 @@ HipModelResidency::HipModelResidency(
       arena_ranges_(std::move(other.arena_ranges_)), selective_guard_(std::move(other.selective_guard_)),
       registered_bytes_(
           other.registered_bytes_),
+      registered_locked_bytes_(std::exchange(other.registered_locked_bytes_, 0)),
       copied_bytes_(
           other.copied_bytes_),
       generation_(other.generation_),
@@ -472,6 +474,7 @@ HipModelResidency::operator=(
         selective_guard_ = std::move(other.selective_guard_);
         registered_bytes_ =
             other.registered_bytes_;
+        registered_locked_bytes_ = std::exchange(other.registered_locked_bytes_, 0);
         copied_bytes_ =
             other.copied_bytes_;
         generation_ = other.generation_;
@@ -671,6 +674,24 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                 manifest,
                 policy);
 
+#if defined(__linux__) && defined(MLOCK_ONFAULT)
+        // Registered pages are kept off the reclaim LRU by default. A reclaimed or migrated page invalidates its
+        // userptr registration and the driver evicts every queue of the process until the whole registration is
+        // revalidated; under startup memory pressure that restore can stall indefinitely. Needs RLIMIT_MEMLOCK >=
+        // the registered bytes, otherwise the pages stay unlocked (previous behaviour). Off: STRIX_MODEL_REGISTER_MLOCK=0.
+        bool lock = [] { const char* v = std::getenv("STRIX_MODEL_REGISTER_MLOCK"); return !(v && v[0] == '0'); }();
+        if (lock) {
+            std::uint64_t planned = 0;
+            for (const auto range : ranges) planned = checked_add(planned, range.end - range.begin);
+            rlimit limit{};
+            if (getrlimit(RLIMIT_MEMLOCK, &limit) != 0 ||
+                (limit.rlim_cur != RLIM_INFINITY && static_cast<std::uint64_t>(limit.rlim_cur) < planned)) {
+                std::fprintf(stderr, "model residency: RLIMIT_MEMLOCK below %llu registered bytes; registered pages stay "
+                    "unlocked (reclaim can evict GPU queues)\n", static_cast<unsigned long long>(planned));
+                lock = false;
+            }
+        }
+#endif
         try {
             result.registered_ranges_.
                 reserve(
@@ -712,14 +733,17 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                         result.registered_bytes_,
                         bytes);
 #if defined(__linux__) && defined(MLOCK_ONFAULT)
-                // STRIX_MODEL_REGISTER_MLOCK=1 (opt-in): keep registered pages off the reclaim LRU. A reclaimed or
-                // migrated page invalidates its userptr registration and the driver evicts every queue of the process
-                // until the whole registration is revalidated. Needs RLIMIT_MEMLOCK >= the registered bytes; with
-                // vm.compact_unevictable_allowed=0 compaction does not migrate them either. Failure only warns.
-                static const bool lock = [] { const char* v = std::getenv("STRIX_MODEL_REGISTER_MLOCK"); return v && v[0] == '1'; }();
-                if (lock && mlock2(reinterpret_cast<const void*>(host), static_cast<std::size_t>(bytes), MLOCK_ONFAULT) != 0)
-                    std::fprintf(stderr, "model residency: mlock of %llu registered bytes failed (%s); continuing unlocked\n",
-                        static_cast<unsigned long long>(bytes), std::strerror(errno));
+                // With vm.compact_unevictable_allowed=0 compaction does not migrate locked pages either.
+                if (lock) {
+                    if (mlock2(reinterpret_cast<const void*>(host), static_cast<std::size_t>(bytes), MLOCK_ONFAULT) == 0) {
+                        result.registered_ranges_.back().locked = true;
+                        result.registered_locked_bytes_ = checked_add(result.registered_locked_bytes_, bytes);
+                    } else {
+                        std::fprintf(stderr, "model residency: mlock of %llu registered bytes failed (%s); continuing unlocked\n",
+                            static_cast<unsigned long long>(bytes), std::strerror(errno));
+                        lock = false;
+                    }
+                }
 #endif
             }
 
@@ -1037,6 +1061,10 @@ void HipModelResidency::release() noexcept {
          registered_ranges_) {
         const auto error = copy_tier_ != HipModelCopyTier::none ?
             selective_unregister(reinterpret_cast<void*>(range.host_base)) : hipHostUnregister(reinterpret_cast<void*>(range.host_base));
+#if defined(__linux__) && defined(MLOCK_ONFAULT)
+        if (error == hipSuccess && range.locked)
+            (void)munlock(reinterpret_cast<const void*>(range.host_base), static_cast<std::size_t>(range.bytes));
+#endif
         if (error != hipSuccess) {
             unregister_failed = true;
 #if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
@@ -1062,6 +1090,7 @@ void HipModelResidency::release() noexcept {
         }
     }
     registered_ranges_.clear();
+    registered_locked_bytes_ = 0;
 
     for (const auto& range :
          copied_ranges_) {
