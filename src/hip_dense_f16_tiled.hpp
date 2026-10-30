@@ -151,7 +151,22 @@ template <unsigned BN> struct TileShape {
 // waves per SIMD (<= 192 VGPRs); the others request 1, below the minimum their work-group size implies, which the
 // backend ignores (the same as __launch_bounds__(threads) alone). The body stays in the kernel: passing the kernel's
 // site argument to a function makes a private copy whose loads are divergent.
-template <class Site, unsigned AMode, unsigned ProbeIn = 0U, unsigned BN = 128U, bool Lean = false>
+// STRIX_QPF2K_WMMA_PIN (default on, =0 off; form 4): the Lean WMMAs as inline asm with A in v[183:190] (VGPR bank 3) and the
+// two live B fragments in v[166:173] / v[158:165] (bank 2), the accumulators left to the allocator (gfx1151 WMMA issue:
+// 34 -> 32 cycles when A, B and C start in different banks, LLVM #204254). The accumulator bank is NOT constrained: the
+// current allocator puts it in bank 1, and tools/check_wmma_banks.py verifies distinct banks, C == D, D disjoint from A/B,
+// zero scratch and <= 192 VGPRs on each built code object. "+&v": the WMMA's tied, early-clobber D (as LLVM's builtin), so
+// D never shares registers with A/B. Same instruction on the same values: only the register assignment changes.
+inline bool wmma_pin() {
+    static const bool on = [] { const char* v = std::getenv("STRIX_QPF2K_WMMA_PIN"); return !v || v[0] != '0'; }();
+    return on;
+}
+template <unsigned BSlot> __device__ __forceinline__ f8 wmma_pinned(Frag a, Frag b, f8 c) {
+    if constexpr (BSlot == 0U) asm("v_wmma_f32_16x16x16_f16 %0, %1, %2, %0" : "+&v"(c) : "{v[183:190]}"(a), "{v[166:173]}"(b));
+    else asm("v_wmma_f32_16x16x16_f16 %0, %1, %2, %0" : "+&v"(c) : "{v[183:190]}"(a), "{v[158:165]}"(b));
+    return c;
+}
+template <class Site, unsigned AMode, unsigned ProbeIn = 0U, unsigned BN = 128U, bool Lean = false, bool Pin = false>
 __global__ __attribute__((amdgpu_flat_work_group_size(1, TileShape<BN>::threads), amdgpu_waves_per_eu(Lean ? 8U : 1U))) void project_kernel(Site site,
     std::uint32_t rows, const _Float16* __restrict__ a16, std::uint32_t raster_m, unsigned* __restrict__ overflow) {
     static_assert(!Lean || BN == 256U);
@@ -308,6 +323,7 @@ __global__ __attribute__((amdgpu_flat_work_group_size(1, TileShape<BN>::threads)
             // Two B fragments per group, a scheduling fence after each group: without it the scheduler hoists the
             // fragment reads of later groups and spills accumulators at 192 VGPRs.
             constexpr unsigned NB = 2U;
+            static_assert(!Pin || NB == 2U, "wmma_pinned holds two B fragments");
 #pragma unroll
             for (unsigned kt = 0; kt < 2U; ++kt)
 #pragma unroll
@@ -321,6 +337,7 @@ __global__ __attribute__((amdgpu_flat_work_group_size(1, TileShape<BN>::threads)
 #pragma unroll
                         for (unsigned v = 0; v < NB; ++v) {
                             if constexpr (Probe == 2U) acc[t][up + v][0] += __builtin_bit_cast(float, a[0] ^ b[v][1]);
+                            else if constexpr (Pin) acc[t][up + v] = v == 0U ? wmma_pinned<0U>(a, b[v], acc[t][up + v]) : wmma_pinned<1U>(a, b[v], acc[t][up + v]);
                             else acc[t][up + v] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(__builtin_bit_cast(h16, a), __builtin_bit_cast(h16, b[v]), acc[t][up + v]);
                         }
                     }
@@ -669,7 +686,12 @@ void launch_projection(const Site& site, std::uint32_t rows, hipStream_t stream,
     if (form_id == 1U) go(project2_kernel<Site, Mode, 512U, 32U, 2U, Probe>, 512U);
     else if (form_id == 2U) go(project2_kernel<Site, Mode, 512U, 32U, 1U, Probe>, 512U);
     else if (form_id == 3U) go(project_kernel<Site, Mode, Probe, 256U>, 512U);
-    else if (form_id == 4U) { if constexpr (Mode != kF32) go(project_kernel<Site, Mode, Probe, 256U, true>, 512U); }
+    else if (form_id == 4U) {
+        if constexpr (Mode != kF32) {
+            if (wmma_pin()) go(project_kernel<Site, Mode, Probe, 256U, true, true>, 512U);
+            else go(project_kernel<Site, Mode, Probe, 256U, true>, 512U);
+        }
+    }
     else go(project_kernel<Site, Mode, Probe>, kThreadsT);
 }
 // One launch over all rows (plus the convert launch in kPre mode). The site supplies Input (std::uint16_t BF16 or
