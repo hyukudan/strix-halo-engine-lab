@@ -18,6 +18,17 @@ inline bool prefill_hdr_reuse(bool gsq) {
     const int o=prefill_hdr_override();
     return !qpf2k::suppressed(qpf2k::Item::moe_hdr,gsq)&&(o<0?env:o!=0);
 }
+// MoE XOR rows (STRIX_QPF2K_MOE_XOR64): the 64-assignment DA16 tune (80) stages its LDS rows XOR-permuted (tune 88,
+// F16Stage pitch 64 without padding: 40 KB, three 8-wave CTAs per WGP instead of two) from 3072 prompt rows; operands, WMMAs and
+// the K order of every output are tune 80's, so the bytes are identical. Below 3072 rows the third CTA does not pay (measured).
+// Same bits; unset 0, decoder injects 1.
+inline int& prefill_xor64_override(){static int v=-1;return v;}
+inline constexpr unsigned prefill_xor64_min_rows=3072U;
+inline bool prefill_xor64(bool gsq) {
+    static const bool env=[]{const char* v=std::getenv("STRIX_QPF2K_MOE_XOR64");return v&&v[0]=='1'&&v[1]=='\0';}();
+    const int o=prefill_xor64_override();
+    return !qpf2k::suppressed(qpf2k::Item::moe_xor64,gsq)&&(o<0?env:o!=0);
+}
 inline int& prefill_da16_override(){static int v=-1;return v;}
 inline bool prefill_da16() {
     if(prefill_moe_gsq_off()&1U)return false;

@@ -166,7 +166,7 @@ Off switches:
 - `STRIX_PREFILL_F16=0`: decline automatic tiling and retain historical resolution.
 - `--prefill-numerical-profile dense-a8`: retain automatic tiling with the dense-A8 prefill identity.
 - `STRIX_QPF2K_DEFAULTS=0` (any value starting with `0`): stop default injection and decline automatic tiling; explicit environment values remain.
-- Individual controlled feature values `=0` also decline automatic tiling, except the five exact prefill
+- Individual controlled feature values `=0` also decline automatic tiling, except the six exact prefill
   alternatives below, whose `=0` disables only that item and keeps the route. To measure a single operator inside
   the same tiled identity, use an explicit tiled route with the same T, budgets and profile pair.
 - `STRIX_PLE_RECLAIMABLE=0`: keep the original warm PLE pages; `auto` has its own route/setup admission.
@@ -181,7 +181,7 @@ route; declined MTP/serving/cohort/diagnostic/model/memory routes keep historica
 Pre-main initialization retains the historical tiled settings and route-gated PLE reclaim for other clients.
 See the [full catalog](../optimizations.md#qwen-defaults) for every value and guard.
 
-The same decoder admission also defaults five exact prefill alternatives when unset (bitwise identical results;
+The same decoder admission also defaults six exact prefill alternatives when unset (bitwise identical results;
 deferred at startup, so MTP/HTTP serving, cohorts and other binaries keep their opt-ins; filtered per GSQ owner):
 
 | Default | Operation and retained gate | Off switch |
@@ -191,6 +191,7 @@ deferred at startup, so MTP/HTTP serving, cohorts and other binaries keep their 
 | `STRIX_QPF2K_SHARED_PRE=1` | Shared-expert FP16 operand preimage; existing tiled down admission and fallback apply. | `STRIX_QPF2K_SHARED_PRE=0` |
 | `STRIX_QPF2K_MOE_MC=1` | Ordered MoE merge + BF16 commit (mode 1) behind the existing DA16/ROUTE=14 certificate. | `STRIX_QPF2K_MOE_MC=0` |
 | `STRIX_QPF2K_MOE_HDR=1` | Gate/up superblock header reuse within the DA16 tune 80/82 path. | `STRIX_QPF2K_MOE_HDR=0` |
+| `STRIX_QPF2K_MOE_XOR64=1` | MoE 64-assignment DA16 tune (automatic tune only) with XOR-permuted LDS rows (three CTAs per WGP) from 3,072 rows; 128-assignment batches (from 4,915 rows for 512 experts, top-10) are unchanged. | `STRIX_QPF2K_MOE_XOR64=0` |
 
 `STRIX_QPF2K_HC_LOWBAND` remains opt-in; MC mode 2 requires an explicit value.
 

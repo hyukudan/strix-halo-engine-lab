@@ -2208,9 +2208,11 @@ PrefillKernelForm prefill_kernel_form(const Request& request,unsigned down_type,
     return (!q20||gsq_q20)&&wmma_shape&&(a8_form>=0?a8_form>=1:wmma_env>=0?wmma_env==1:true)?PrefillKernelForm::iu8_wmma:
         PrefillKernelForm::dot4;
 }
+inline unsigned& prefill_last_tune_value(){static thread_local unsigned v=0U;return v;}
 unsigned prefill_effective_tune(const Request& request,unsigned count,unsigned down_type,int form) {
     static const unsigned tune_env=[]{const char* v=std::getenv("STRIX_INTPREFILL_MOE_TUNE");
         const int n=v?std::atoi(v):82;return n>=0&&n<=65535?static_cast<unsigned>(n):0U;}();
+    static const bool tune_automatic=std::getenv("STRIX_INTPREFILL_MOE_TUNE")==nullptr;
     // Forms 4..34 = tunes 1..31, forms 35..66 = tunes 64..95 (bit 6).
     // Bit 1 takes 128-assignment batches only when the prompt averages >= 96 assignments per expert: below that the
     // 64-assignment batches already hold most experts' rows (one dequantization either way) and half of the 16 waves
@@ -2220,8 +2222,17 @@ unsigned prefill_effective_tune(const Request& request,unsigned count,unsigned d
     // qpf2k core2 bit 3 (STRIX_QPF2K_MOE 9/11/13/15): keep the 128-assignment batches of bit 1 at every T (same bits:
     // results do not depend on the batch composition). Never for GSQ experts (their kernels ignore STRIX_QPF2K_MOE).
     const bool q20=gsq_a8::gate_type(request.gate_type);
-    return (tune_req&2U)&&static_cast<unsigned long long>(count)*request.shape.top_k<96ULL*request.shape.experts&&
+    const unsigned tune=(tune_req&2U)&&static_cast<unsigned long long>(count)*request.shape.top_k<96ULL*request.shape.experts&&
         !(!q20&&tune_req==82U&&(prefill_core2()&8U))?tune_req&~2U:tune_req;
+    // MoE XOR rows (hip_moe_prefill_da16.inc): the automatic tune's 64-assignment form from 3072 rows, only where the DA16
+    // chain runs (the dispatch predicate of enqueue_prefill); explicit tunes and forms are never rewritten.
+    if(tune==80U&&tune_req==82U&&tune_automatic&&form<4&&!q20&&count>=prefill_xor64_min_rows&&prefill_da16()&&
+       prefill_route()==14U&&prefill_core2()==0U&&prefill_small()==0U&&request.shape.rows<=max_rows&&request.shape.rows%64U==0U&&
+       request.shape.hidden/64U>=5U&&request.shape.rows/64U>=5U&&prefill_xor64(qpf2k::gsq_model)) {
+        static const bool witness=[]{std::fprintf(stderr,"qpf2k moe xor64 rows active\n");return true;}();(void)witness;
+        return 88U;
+    }
+    return tune;
 }
 void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned count,unsigned clear_words,
     const unsigned char* gate,const unsigned char* up,unsigned down_type,const unsigned char* down_weights,hipStream_t stream,int form) {
@@ -2251,8 +2262,9 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
     const PrefillKernelForm kernel_form=prefill_kernel_form(request,down_type,form);
     const bool f16=kernel_form==PrefillKernelForm::f16_wmma;
     const unsigned tune=prefill_effective_tune(request,count,down_type,form);
+    prefill_last_tune_value()=tune;
     // Binding requests certification; the launcher supplies it only with MC on. Fail closed on every other recipe.
-    const bool certificate=rows.unsafe&&form==3&&!q20&&f16&&(tune==82U||tune==80U)&&prefill_route()==14U&&
+    const bool certificate=rows.unsafe&&form==3&&!q20&&f16&&(tune==82U||tune==80U||tune==88U)&&prefill_route()==14U&&
         prefill_da16()&&prefill_core2()==0U&&prefill_small()==0U&&clear_words==request.shape.hidden&&
         request.shape.hidden/64U>=5U&&request.shape.rows/64U>=5U&&
         reinterpret_cast<std::uintptr_t>(rows.input.base)%16U==0U&&rows.input.stride%16U==0U;
@@ -2513,7 +2525,7 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                 }
                 // qpf2k/moe-mi DA16 (STRIX_QPF2K_MOE_DA16=1, hip_moe_prefill_da16.inc): the last gate/up tile of a batch writes the
                 // batch's FP16 down operand image once; the down stages it as a copy. Same bits.
-                if constexpr(Tune==80U||Tune==82U) if(prefill_da16()&&request.shape.rows<=max_rows&&request.shape.rows%64U==0U&&
+                if constexpr(Tune==80U||Tune==82U||Tune==88U) if(prefill_da16()&&request.shape.rows<=max_rows&&request.shape.rows%64U==0U&&
                     request.shape.hidden/64U>=5U&&request.shape.rows/64U>=5U) {
                     prefill_da16_flag()=true;
                     static const bool witness=[]{std::fprintf(stderr,"qpf2k-moe-mi da16 active\n");return true;}();(void)witness;
@@ -2534,7 +2546,7 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                         gate,up,rows,request.shape.hidden,request.shape.rows,a16,arrive,image);
                     check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (DA16)");
                     const dim3 down_grid(request.shape.hidden/Tile::Columns,batches);
-                    if constexpr(Tune==82U||Tune==80U) if(certificate) {  // 80 = 82 below 96 assignments per expert
+                    if constexpr(Tune==82U||Tune==80U||Tune==88U) if(certificate) {  // 80 = 82 below 96 assignments per expert; 88 = 80 with XOR rows
                         if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate<true,Tune>),down_grid,dim3(Threads),0,
                             stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
                         else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate<false,Tune>),down_grid,dim3(Threads),0,
@@ -2676,6 +2688,8 @@ void set_prefill_core2(int core){prefill_core2_override()=core;}
 void set_prefill_route(int bits){prefill_route_override()=bits;}
 void set_prefill_da16(int on){prefill_da16_override()=on;}
 void set_prefill_hdr(int on){prefill_hdr_override()=on;}
+void set_prefill_xor64(int on){prefill_xor64_override()=on;}
+unsigned prefill_last_tune(){return prefill_last_tune_value();}
 void set_prefill_small(int rows){prefill_small_override()=rows;}
 bool prefill_small_ran(){return prefill_small_flag();}
 bool prefill_da16_ran(){return prefill_da16_flag();}

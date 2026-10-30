@@ -13,6 +13,7 @@ enum class Item : unsigned {
     sched, dense, gdn, gdn_gates_batch, gdn_core16, qsa, qsa_mask,
     hc, hc_mask, hc_output3, hc_output3_band, moe_da16, moe_route, ple_reclaim, dense_rows, pipe, attend_batch, score_park,
     norm_group, index_rows, cohort_lean, rows_lean, dispatch_fuse, score_rows, ple_batch, shared_pre, moe_mc, moe_hdr,
+    moe_xor64,
 };
 struct Default {
     Item item;
@@ -48,6 +49,7 @@ inline constexpr std::array defaults{
     Default{Item::shared_pre, "STRIX_QPF2K_SHARED_PRE", "1"},
     Default{Item::moe_mc, "STRIX_QPF2K_MOE_MC", "1"},
     Default{Item::moe_hdr, "STRIX_QPF2K_MOE_HDR", "1"},
+    Default{Item::moe_xor64, "STRIX_QPF2K_MOE_XOR64", "1"},
 };
 static_assert(defaults.size() < 32U);
 constexpr unsigned bit(Item item) noexcept { return 1U << static_cast<unsigned>(item); }
@@ -119,14 +121,14 @@ unsigned initialize(Get get, Put put, unsigned allowed = ~0U) {
 inline constexpr unsigned historical_items = bit(Item::moe_route) * 2U - 1U;
 // Exact prefill alternatives keep admission when explicitly disabled one at a time.
 inline constexpr unsigned exact_prefill_items = bit(Item::score_rows) | bit(Item::ple_batch) |
-    bit(Item::shared_pre) | bit(Item::moe_mc) | bit(Item::moe_hdr);
+    bit(Item::shared_pre) | bit(Item::moe_mc) | bit(Item::moe_hdr) | bit(Item::moe_xor64);
 // L1 has its own registered-mapping, single-session tiled admission (including
 // serving/MTP/cohort exclusions). Other new wrapper items are decoder-only:
 // PIPE also affects MTP priming; COHORT_LEAN affects active serving heads;
 // DISPATCH_FUSE affects verification windows. Do not inject those at startup.
 // DENSE_ROWS, ATTEND_BATCH, SCORE_PARK, NORM_GROUP, INDEX_ROWS and ROWS_LEAN
 // are also deferred to decoder admission so non-decoder clients keep old defaults.
-// SCORE_ROWS, PLE_BATCH, SHARED_PRE, MOE_MC and MOE_HDR share those prefill
+// SCORE_ROWS, PLE_BATCH, SHARED_PRE, MOE_MC, MOE_HDR and MOE_XOR64 share those prefill
 // launchers (including serving/MTP priming); defer them too, preserving fixture defaults.
 inline constexpr unsigned startup_items = historical_items | bit(Item::ple_reclaim);
 template<class Get, class Put>
