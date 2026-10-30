@@ -948,10 +948,191 @@ void slab_attention(unsigned rows, unsigned heads, bool fused) {
     std::printf("slab rows=%u heads=%u fused=%u bytes=%zu equal=%u\n",rows,heads,fused,ref.size(),ref==got);
 }
 
+// Prefill-shaped attention windows (the prefill's calls: `rows` consecutive positions per call, `heads` heads, one
+// call per window spread over 4 streams with per-stream partials and tickets). mode 0: ring entries cover every E4M3
+// code x every E8M0 scale byte and compressed entries every E2M1 code x every E4M3 scale byte (NaN, infinities,
+// subnormal products); mode 1: the normal scales of real caches.
+struct PrefillWindows {
+    static constexpr unsigned kLanes = 4, kCache = 4096;
+    unsigned rows, heads, nwin, cap;
+    std::vector<std::uint64_t> pos;
+    std::unique_ptr<Dev<std::uint8_t>> ring, kv;
+    std::unique_ptr<Dev<float>> q, sink, out, part;
+    std::unique_ptr<Dev<std::uint64_t>> dpos;
+    std::unique_ptr<Dev<a::RopeRow>> rope;
+    std::unique_ptr<Dev<std::uint32_t>> idx, cnt, tick;
+    std::unique_ptr<Dev<std::int8_t>> codes;
+    std::unique_ptr<Dev<float>> deltas;
+    std::unique_ptr<Dev<std::int32_t>> sums;
+    hipStream_t st[kLanes]{};
+    bool window_only = false, a8 = false;
+    // count of row at position p: every compressed position up to p / ratio (ratio 0: window-only layer), at most top-k
+    PrefillWindows(int mode, unsigned rows_, unsigned heads_, unsigned nwin_, std::uint64_t p0, unsigned ratio, bool a8_)
+        : rows(rows_), heads(heads_), nwin(nwin_), cap(a::kWindow + rows_ * nwin_ + 8U), window_only(ratio == 0U), a8(a8_) {
+        std::vector<std::uint8_t> hr(std::size_t{cap} * a::kWindowEntryBytes), hk(std::size_t{kCache} * a::kKvEntryBytes);
+        unsigned code = 0, scale = 0;
+        for (std::size_t e = 0; e < cap; ++e) {
+            for (unsigned d = 0; d < 512; ++d) hr[e * 528 + d] = static_cast<std::uint8_t>(mode == 0 ? (code++ & 255U) : (rng() & 0x7EU));
+            for (unsigned c = 0; c < 16; ++c) hr[e * 528 + 512 + c] = static_cast<std::uint8_t>(mode == 0 ? (scale++ & 255U) : 116U + rng() % 6U);
+        }
+        for (std::size_t t = 0; t < kCache; ++t) {
+            for (unsigned i = 0; i < 256; ++i) hk[t * 288 + i] = static_cast<std::uint8_t>(mode == 0 ? (code++ & 255U) : rng());
+            for (unsigned c = 0; c < 32; ++c) hk[t * 288 + 256 + c] = static_cast<std::uint8_t>(mode == 0 ? (scale++ & 255U) : 0x30U + rng() % 16U);
+        }
+        const unsigned n = rows * nwin;
+        pos.resize(n);
+        for (unsigned r = 0; r < n; ++r) pos[r] = p0 + r;
+        std::vector<std::uint32_t> hidx(std::size_t{n} * a::kTopK), hcnt(n);
+        for (unsigned r = 0; r < n; ++r) {
+            const auto c = static_cast<std::ptrdiff_t>(ratio == 0U ? 0U : std::min<std::uint64_t>((pos[r] + 1U) / ratio, a::kTopK));
+            hcnt[r] = static_cast<std::uint32_t>(c);
+            std::vector<std::uint32_t> pick(kCache);
+            for (std::uint32_t i = 0; i < kCache; ++i) pick[i] = i;
+            std::shuffle(pick.begin(), pick.end(), rng);
+            std::sort(pick.begin(), pick.begin() + c);
+            std::copy(pick.begin(), pick.begin() + c, &hidx[std::size_t{r} * a::kTopK]);
+        }
+        ring = std::make_unique<Dev<std::uint8_t>>(hr);
+        kv = std::make_unique<Dev<std::uint8_t>>(hk);
+        q = std::make_unique<Dev<float>>(random_f(std::size_t{n} * heads * 512, -0.5F, 0.5F));
+        sink = std::make_unique<Dev<float>>(random_f(heads, -2, 2));
+        out = std::make_unique<Dev<float>>(std::size_t{n} * heads * 512);
+        part = std::make_unique<Dev<float>>(std::size_t{kLanes} * rows * heads * a::kMaxChunks * 514);
+        dpos = std::make_unique<Dev<std::uint64_t>>(pos);
+        rope = std::make_unique<Dev<a::RopeRow>>(ropes(a::RopeKind::compressed, pos));
+        idx = std::make_unique<Dev<std::uint32_t>>(hidx);
+        cnt = std::make_unique<Dev<std::uint32_t>>(hcnt);
+        tick = std::make_unique<Dev<std::uint32_t>>(std::size_t{kLanes} * rows * g::kAttnGroupCount);
+        codes = std::make_unique<Dev<std::int8_t>>(std::size_t{n} * heads * 512);
+        deltas = std::make_unique<Dev<float>>(std::size_t{n} * heads * 16);
+        sums = std::make_unique<Dev<std::int32_t>>(std::size_t{n} * heads * 16);
+        for (auto& s : st) check(hipStreamCreateWithFlags(&s, hipStreamNonBlocking));
+    }
+    ~PrefillWindows() { for (auto s : st) (void)hipStreamDestroy(s); }
+    PrefillWindows(const PrefillWindows&) = delete;
+    PrefillWindows& operator=(const PrefillWindows&) = delete;
+    g::AttentionView view(unsigned w) const {
+        const std::size_t r0 = std::size_t{w} * rows;
+        const unsigned lane = w % kLanes;
+        g::AttentionView v{rows, cap, a::kTopK, q->p + r0 * heads * 512, sink->p, rope->p + r0, dpos->p + r0, ring->p,
+                           window_only ? nullptr : kv->p, idx->p + r0 * a::kTopK, window_only ? nullptr : cnt->p + r0,
+                           part->p + std::size_t{lane} * rows * heads * a::kMaxChunks * 514, out->p + r0 * heads * 512,
+                           tick->p + std::size_t{lane} * rows * g::kAttnGroupCount};
+        v.heads = heads;
+        if (a8) { v.codes = codes->p + r0 * heads * 512; v.deltas = deltas->p + r0 * heads * 16; v.sums = sums->p + r0 * heads * 16; }
+        return v;
+    }
+    void run() const {
+        for (unsigned w = 0; w < nwin; ++w) g::enqueue_attention(view(w), st[w % kLanes]);
+        check(hipDeviceSynchronize());
+    }
+    std::vector<std::uint8_t> bytes() const {
+        std::vector<std::uint8_t> b = bytes_of(out->get());
+        if (a8) { const auto c = bytes_of(codes->get()), d = bytes_of(deltas->get()), s = bytes_of(sums->get()); b.insert(b.end(), c.begin(), c.end()); b.insert(b.end(), d.begin(), d.end()); b.insert(b.end(), s.begin(), s.end()); }
+        const auto t = bytes_of(tick->get());
+        b.insert(b.end(), t.begin(), t.end());
+        return b;
+    }
+    void clear() const { check(hipMemset(out->p, 0xA5, out->n * 4)); check(hipMemset(codes->p, 0x5A, codes->n)); check(hipDeviceSynchronize()); }
+};
+
+// STRIX_DS41_ATTN_LEAN against the previous kernel form, device against device on prefill-shaped calls (outputs, NaN
+// payloads included, A8 codes and the tickets must match byte for byte), at every tile choice the call can take.
+void lean_equal(int mode, unsigned rows, unsigned heads, unsigned nwin, std::uint64_t p0, unsigned ratio, bool a8) {
+    const PrefillWindows pw(mode, rows, heads, nwin, p0, ratio, a8);
+    for (const int swz : {0, 1}) for (const int f16 : {0, 1}) {
+        g::set_attention_lds_swizzle(swz);
+        g::set_attention_tile_f16(f16);
+        std::vector<std::uint8_t> ref;
+        for (const int lean : {0, 1, 2}) {
+            g::set_attention_lean(lean);
+            pw.clear();
+            pw.run();
+            if (lean == 0) ref = pw.bytes();
+            else expect(pw.bytes() == ref, "lean " + std::to_string(lean) + " == previous form, mode " + std::to_string(mode) + " rows " + std::to_string(rows) + " heads " +
+                        std::to_string(heads) + " windows " + std::to_string(nwin) + " p0 " + std::to_string(p0) + " ratio " + std::to_string(ratio) +
+                        " a8 " + std::to_string(a8) + " swizzle " + std::to_string(swz) + " f16 " + std::to_string(f16));
+        }
+    }
+    g::set_attention_lean(-1);
+    g::set_attention_tile_f16(-1);
+    g::set_attention_lds_swizzle(-1);
+    std::printf("lean == previous form: mode %d, %u windows x %u rows from position %llu, %u heads, ratio %u%s\n", mode, nwin, rows,
+                static_cast<unsigned long long>(p0), heads, ratio, a8 ? ", A8" : "");
+}
+
+// Prefill attention bench: `nwin` windows over 4 streams, the forms alternated (0 1 2 0 1 2 ...), median wall time per window.
+void prefill_bench(unsigned rows, unsigned heads, unsigned nwin, std::uint64_t p0, unsigned ratio, unsigned reps) {
+    const PrefillWindows pw(1, rows, heads, nwin, p0, ratio, true);
+    hipEvent_t e0, e1;
+    check(hipEventCreate(&e0)); check(hipEventCreate(&e1));
+    std::vector<float> t[3];
+    for (unsigned k = 0; k < 3 * reps + 3; ++k) {
+        const int lean = static_cast<int>(k % 3U);
+        g::set_attention_lean(lean);
+        pw.run();   // warm
+        check(hipEventRecord(e0));
+        for (unsigned w = 0; w < pw.nwin; ++w) g::enqueue_attention(pw.view(w), pw.st[w % PrefillWindows::kLanes]);
+        for (auto s : pw.st) { hipEvent_t d; check(hipEventCreateWithFlags(&d, hipEventDisableTiming)); check(hipEventRecord(d, s)); check(hipStreamWaitEvent(nullptr, d, 0)); check(hipEventDestroy(d)); }
+        check(hipEventRecord(e1));
+        check(hipEventSynchronize(e1));
+        float ms; check(hipEventElapsedTime(&ms, e0, e1));
+        if (k >= 3) t[lean].push_back(ms * 1e3F * 8.0F / static_cast<float>(nwin * rows));   // us per 8 rows
+    }
+    g::set_attention_lean(-1);
+    for (auto& v : t) std::sort(v.begin(), v.end());
+    float tb[2] = {0.0F, 0.0F};   // reference only: the approximate BF16 hi/lo prefill attention (other bits), variants 1 and 2
+    if (heads % 16U == 0U && ratio != 0U) {
+        for (const int variant : {1, 2}) {
+            std::vector<float> tv;
+            for (unsigned k = 0; k <= reps; ++k) {
+                check(hipEventRecord(e0));
+                for (unsigned w = 0; w < pw.nwin; ++w) g::enqueue_attention_bf16_prefill(pw.view(w), pw.st[w % PrefillWindows::kLanes], variant);
+                for (auto s : pw.st) { hipEvent_t d; check(hipEventCreateWithFlags(&d, hipEventDisableTiming)); check(hipEventRecord(d, s)); check(hipStreamWaitEvent(nullptr, d, 0)); check(hipEventDestroy(d)); }
+                check(hipEventRecord(e1));
+                check(hipEventSynchronize(e1));
+                float ms; check(hipEventElapsedTime(&ms, e0, e1));
+                if (k > 0) tv.push_back(ms * 1e3F * 8.0F / static_cast<float>(nwin * rows));
+            }
+            std::sort(tv.begin(), tv.end());
+            tb[variant - 1] = tv[tv.size() / 2];
+        }
+    }
+    std::printf("  prefill bench %u windows x %u rows, %u heads, positions %llu.., ratio %u: us per 8 rows, previous %.1f, lean 1 %.1f (%+.1f %%),"
+                " lean 2 %.1f (%+.1f %%) [min %.1f / %.1f / %.1f]\n", nwin, rows, heads, static_cast<unsigned long long>(p0), ratio, t[0][reps / 2],
+                t[1][reps / 2], 100.0 * (t[1][reps / 2] / t[0][reps / 2] - 1.0), t[2][reps / 2], 100.0 * (t[2][reps / 2] / t[0][reps / 2] - 1.0),
+                t[0][0], t[1][0], t[2][0]);
+    if (tb[0] > 0.0F) std::printf("    (approximate BF16 hi/lo prefill attention, not this identity: variant 1 %.1f us, variant 2 %.1f us per 8 rows; the combine kernel launch included)\n", tb[0], tb[1]);
+    check(hipEventDestroy(e0)); check(hipEventDestroy(e1));
+}
+
 }  // namespace
 
 int main() {
     try {
+        if (std::getenv("STRIX_DS41_PF_ATTN_BENCH")) {   // prefill-shaped attention: lean equality + bench only
+            for (const unsigned heads : {32U, 64U}) {
+                lean_equal(0, 8, heads, 8, 5000, 4, true);
+                lean_equal(1, 8, heads, 8, 0, 4, false);       // the first rows: windows < 128, counts < 512
+                lean_equal(1, 8, heads, 8, 60, 2, true);       // across the 64-key chunk boundary, ratio 2
+                lean_equal(1, 8, heads, 4, 120, 1, false);     // window 121..128 keys, ratio 1 counts 121..
+                lean_equal(1, 8, heads, 6, 8000, 128, true);   // ratio 128 (62 compressed keys)
+                lean_equal(1, 8, heads, 6, 8000, 0, false);    // window-only layer
+                lean_equal(1, 8, heads, 8, 9000, 4, true);     // full top-k
+                lean_equal(1, 1, heads, 4, 9000, 4, false);    // one row per call (other heads-per-wave forms)
+                lean_equal(1, 3, heads, 4, 333, 2, true);
+            }
+            const unsigned reps = 7;
+            for (const unsigned heads : {32U, 64U}) {
+                prefill_bench(8, heads, 64, 9000, 4, reps);
+                prefill_bench(8, heads, 64, 9000, 128, reps);
+                prefill_bench(8, heads, 64, 9000, 0, reps);
+                prefill_bench(8, heads, 64, 1000, 4, reps);
+                prefill_bench(64, heads, 8, 9000, 4, reps);   // STRIX_DS41_PREFILL_WINDOW=64: the same rows in 64-row calls
+            }
+            std::puts(failures == 0 ? "prefill attention lean checks pass" : "FAILED");
+            return failures ? 1 : 0;
+        }
         if (std::getenv("STRIX_DS41_SLAB_TESTS_ONLY")) {
             for (unsigned rows : {65U, 128U, 256U})
                 for (unsigned heads : {32U, 64U})
@@ -1050,6 +1231,14 @@ int main() {
         fold_live = false;
         for (const unsigned rows : {1U, 6U, 8U})
             for (const unsigned heads : {32U, 64U}) { tile_f16_sweep(0, rows, heads); tile_f16_sweep(1, rows, heads); }
+        for (const unsigned heads : {32U, 64U}) {   // STRIX_DS41_ATTN_LEAN == the previous form on prefill-shaped calls
+            lean_equal(0, 8, heads, 4, 5000, 4, true);
+            lean_equal(1, 8, heads, 4, 0, 4, false);
+            lean_equal(1, 8, heads, 4, 60, 2, true);
+            lean_equal(1, 8, heads, 4, 8000, 128, true);
+            lean_equal(1, 8, heads, 4, 8000, 0, false);
+            lean_equal(1, 1, heads, 4, 9000, 4, false);
+        }
         g::set_attention_tile_f16(1);   // STRIX_DS41_ATTN_TILE_F16: the same host references
         attention(5, 1, 0, false);
         attention(1000, 3, 0, false);

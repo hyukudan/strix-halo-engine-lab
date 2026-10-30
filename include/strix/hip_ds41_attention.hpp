@@ -145,6 +145,11 @@ void set_attention_live_chunks(int mode);
 // write. Test override: 0 off, 1 on, -1 environment.
 void set_attention_window_fold(int mode);
 [[nodiscard]] bool attention_window_fold();
+// STRIX_DS41_ATTN_LEAN (default 2, =0 off): the chunk kernels in fewer instructions, the same values in the same order
+// (same bits): 1 = the softmax and PV steps, 2 = also the key dequantisation into the tile. Test override: 0, 1, 2, or -1
+// environment.
+void set_attention_lean(int mode);
+[[nodiscard]] int attention_lean();
 
 // Segment launches (several requests of a batch step per launch, STRIX_DS41_BATCH_SEGMENTS): one view per request
 // segment, each exactly the call above (its checks, its grid, every block's work), at most kMaxSegments per launch.

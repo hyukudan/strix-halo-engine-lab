@@ -846,6 +846,59 @@ __device__ __forceinline__ void store_key(float4* row, unsigned part, const KeyR
         }
     }
 }
+// STRIX_DS41_ATTN_LEAN: store_key's values through f16 bit patterns. An E4M3 code's bits (c & 0x7F) << 7 | sign << 15 read
+// as f16 are exactly e4m3(c) x 2^-8 (normal and subnormal codes alike), an E2M1 code's (n & 7) << 9 | sign << 15 exactly
+// e2m1(n) x 2^-14; one fma_mix(f16, S, -0) with S = the scale x 2^8 (resp. x 2^14), exact for an E8M0 byte <= 246 (resp. a
+// non-NaN E4M3 scale), rounds the same real product once, as e4m3(c) * s does (-0 addend: zero signs kept). A part with a
+// NaN code or another scale takes store_key's own code.
+__device__ __forceinline__ float f16_scaled(std::uint32_t bits16, float s) {
+    return __builtin_fmaf(static_cast<float>(__builtin_bit_cast(_Float16, static_cast<std::uint16_t>(bits16))), s, -0.0F);
+}
+template <bool Swizzle>
+__device__ __forceinline__ void store_key_lean(float4* row, unsigned part, const KeyRaw& k, bool win, bool valid) {
+    const std::uint32_t cw[8] = {k.c0.x, k.c0.y, k.c0.z, k.c0.w, k.c1.x, k.c1.y, k.c1.z, k.c1.w};
+    if (valid && win) {
+        const std::uint32_t b = k.sc & 0xFFU;
+        std::uint32_t nan = 0;
+#pragma unroll
+        for (unsigned i = 0; i < 8; ++i) nan |= ((cw[i] & 0x7F7F7F7FU) + 0x01010101U) & 0x80808080U;
+        if (b <= 246U && nan == 0U) {
+            const float sv = __builtin_bit_cast(float, (b + 8U) << 23U);   // 2^(b - 127) x 2^8
+#pragma unroll
+            for (unsigned i = 0; i < 8; ++i) {
+                const std::uint32_t w = cw[i];
+                std::uint32_t h[2];
+#pragma unroll
+                for (unsigned t = 0; t < 2; ++t) {   // bytes 2t, 2t + 1 -> f16 halves
+                    const std::uint32_t pz = __builtin_amdgcn_perm(0U, w, t == 0U ? 0x0C010C00U : 0x0C030C02U);
+                    h[t] = ((pz & 0x007F007FU) << 7U) | ((pz & 0x00800080U) << 8U);
+                }
+                row[lds_key_slot<Swizzle>(key_slot(part, i))] = make_float4(f16_scaled(h[0], sv), f16_scaled(h[0] >> 16U, sv),
+                                                                            f16_scaled(h[1], sv), f16_scaled(h[1] >> 16U, sv));
+            }
+            return;
+        }
+    } else if (valid && ((k.sc & 0x7FU) != 0x7FU) && (((k.sc >> 8U) & 0x7FU) != 0x7FU)) {
+        float sv[2];
+#pragma unroll
+        for (unsigned g = 0; g < 2; ++g) sv[g] = e4m3_value(static_cast<std::uint8_t>(k.sc >> (8U * g))) * 16384.0F;   // exact
+#pragma unroll
+        for (unsigned i = 0; i < 8; ++i) {
+            const std::uint32_t w = cw[i / 2] >> (16U * (i % 2));
+            std::uint32_t h[2];
+#pragma unroll
+            for (unsigned t = 0; t < 2; ++t) {   // byte t of the 16 bits: its low nibble -> low half, high nibble -> high half
+                const std::uint32_t by = (w >> (8U * t)) & 0xFFU, pz = (by | (by << 12U)) & 0x000F000FU;
+                h[t] = ((pz & 0x00070007U) << 9U) | ((pz & 0x00080008U) << 12U);
+            }
+            const float s = sv[i / 4];
+            row[lds_key_slot<Swizzle>(key_slot(part, i))] = make_float4(f16_scaled(h[0], s), f16_scaled(h[0] >> 16U, s),
+                                                                        f16_scaled(h[1], s), f16_scaled(h[1] >> 16U, s));
+        }
+        return;
+    }
+    store_key<Swizzle>(row, part, k, win, valid);
+}
 __device__ __forceinline__ float lane_value(float x, unsigned src) {
     return __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, x), static_cast<int>(src)));
 }
@@ -875,7 +928,11 @@ __device__ __forceinline__ void tile_key(const void* tile, unsigned j, unsigned 
 }
 // One tile's online-softmax step for the wave's Hpw heads over its first cnt keys (loops over keys kept rolled: the
 // kernel is instruction-fetch bound when fully unrolled).
-template <unsigned kAttnHpw, bool Swizzle, bool Half = false, bool Narrow = Half>
+// Lean (STRIX_DS41_ATTN_LEAN, default 2, =0 off; 2 also stores the tile through store_key_lean): the same operations in fewer instructions: exp_f's range tests as
+// selects over the same polynomial (exp_f_sel), the running sum l[h] = l[h] + p_j taken in the PV loop (same j order,
+// after the same l[h] * sc) instead of a second loop over the tile's keys, and the PV loop split at key 8 so p_j is
+// read from pr[h][0] / pr[h][1] without a per-key select.
+template <unsigned kAttnHpw, bool Swizzle, bool Half = false, bool Narrow = Half, unsigned Lean = 0>
 __device__ __forceinline__ void attention_tile(const void* tile, unsigned cnt, unsigned lane,
     const float (&q)[kAttnHpw][16], float (&m)[kAttnHpw], float (&l)[kAttnHpw], float (&acc)[kAttnHpw][16], [[maybe_unused]] bool mark = false) {
     if (mark) DS41_CMARK(0U);   // timing build: the first tile's phases (QK + butterfly, softmax, PV)
@@ -926,6 +983,50 @@ __device__ __forceinline__ void attention_tile(const void* tile, unsigned cnt, u
     }
     if (mark) DS41_CMARK(1U);
     float pr[kAttnHpw][2];
+    if constexpr (Lean) {
+#pragma unroll
+        for (unsigned h = 0; h < kAttnHpw; ++h) {
+            float tm = fmaxf(s[h][0], s[h][1]);
+            tm = fmaxf(tm, xor_lane<4>(tm));
+            tm = fmaxf(tm, xor_lane<8>(tm));
+            tm = fmaxf(tm, xor_lane<16>(tm));
+            const float mn = fmaxf(m[h], tm), sc = exp_f_sel(m[h] - mn);
+            pr[h][0] = exp_f_sel(s[h][0] - mn);
+            pr[h][1] = exp_f_sel(s[h][1] - mn);
+            l[h] = l[h] * sc;
+#pragma unroll
+            for (unsigned i = 0; i < 16; ++i) acc[h][i] = acc[h][i] * sc;
+            m[h] = mn;
+        }
+        if (mark) DS41_CMARK(2U);
+        const unsigned c0 = cnt < 8U ? cnt : 8U;
+#pragma unroll 1
+        for (unsigned j = 0; j < c0; ++j) {
+            float k[16];
+            tile_key<Swizzle, Half>(tile, j, lane, k);
+#pragma unroll
+            for (unsigned h = 0; h < kAttnHpw; ++h) {
+                const float pj = lane_value(pr[h][0], 4U * j);
+                l[h] = l[h] + pj;
+#pragma unroll
+                for (unsigned i = 0; i < 16; ++i) acc[h][i] = fmaf(pj, k[i], acc[h][i]);
+            }
+        }
+#pragma unroll 1
+        for (unsigned j = 8; j < cnt; ++j) {
+            float k[16];
+            tile_key<Swizzle, Half>(tile, j, lane, k);
+#pragma unroll
+            for (unsigned h = 0; h < kAttnHpw; ++h) {
+                const float pj = lane_value(pr[h][1], 4U * (j - 8U));
+                l[h] = l[h] + pj;
+#pragma unroll
+                for (unsigned i = 0; i < 16; ++i) acc[h][i] = fmaf(pj, k[i], acc[h][i]);
+            }
+        }
+        if (mark) DS41_CMARK(3U);
+        return;
+    }
 #pragma unroll
     for (unsigned h = 0; h < kAttnHpw; ++h) {
         float tm = fmaxf(s[h][0], s[h][1]);   // max is exact: any order gives the tile max
@@ -1023,7 +1124,7 @@ __device__ __forceinline__ unsigned visible_keys(const AttentionView& v, unsigne
     nw = p + 1U < kWindow ? static_cast<unsigned>(p + 1U) : kWindow;
     return nw + (v.idx_count != nullptr ? v.idx_count[r] : 0U);
 }
-template <unsigned kAttnHpw, bool Swizzle, bool Half = false, bool Fold = false>
+template <unsigned kAttnHpw, bool Swizzle, bool Half = false, bool Fold = false, unsigned Lean = 0>
 __device__ __forceinline__ void attention_chunk_body(const AttentionView& v, const uint3 bid) {
     DS41_TIMED(5U);
     __shared__ float4 ks[kTile][kHeadDim / 4];   // the f32 tile, or (STRIX_DS41_ATTN_TILE_F16) the f16 tile in its first half
@@ -1108,17 +1209,17 @@ __device__ __forceinline__ void attention_chunk_body(const AttentionView& v, con
         if constexpr (Half) {
             f32_tile = __syncthreads_or(store_key_f16(kb[tk], part, raw, t0 + tk < nw, tk < cnt) ? 0 : 1) != 0;
             if (f32_tile) {   // uniform: some value of the tile is not exact in f16: today's f32 tile over the same LDS
-                store_key<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt);
+                if constexpr (Lean >= 2U) store_key_lean<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt); else store_key<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt);
                 __syncthreads();
             }
         } else {
-            store_key<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt);
+            if constexpr (Lean >= 2U) store_key_lean<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt); else store_key<Swizzle>(ks[tk], part, raw, t0 + tk < nw, tk < cnt);
             __syncthreads();
         }
         DS41_MARK(2U + 2U * ((t0 - j0) / kTile));
         if (t0 + kTile < end) load(t0 + kTile, raw);
-        if (!Half || f32_tile) attention_tile<kAttnHpw, Swizzle, false, Half>(ks, cnt, lane, q, m, l, acc, t0 == j0);
-        else attention_tile<kAttnHpw, Swizzle, true>(kb, cnt, lane, q, m, l, acc, t0 == j0);
+        if (!Half || f32_tile) attention_tile<kAttnHpw, Swizzle, false, Half, Lean>(ks, cnt, lane, q, m, l, acc, t0 == j0);
+        else attention_tile<kAttnHpw, Swizzle, true, true, Lean>(kb, cnt, lane, q, m, l, acc, t0 == j0);
         __syncthreads();
         DS41_MARK(3U + 2U * ((t0 - j0) / kTile));
     }
@@ -1382,13 +1483,13 @@ __global__ __launch_bounds__(256) void select_direct_seg_kernel(SegmentLaunch<Se
     const uint3 b = segment_block(s, k);
     select_direct_body(s.v[k], b);
 }
-template <unsigned kAttnHpw, bool Swizzle, bool Half, bool Fold>
-__global__ __launch_bounds__(kAttnThreads) void attention_chunk_kernel(AttentionView v) { attention_chunk_body<kAttnHpw, Swizzle, Half, Fold>(v, own_block()); }
-template <unsigned kAttnHpw, bool Swizzle, bool Half, bool Fold>
+template <unsigned kAttnHpw, bool Swizzle, bool Half, bool Fold, unsigned Lean>
+__global__ __launch_bounds__(kAttnThreads) void attention_chunk_kernel(AttentionView v) { attention_chunk_body<kAttnHpw, Swizzle, Half, Fold, Lean>(v, own_block()); }
+template <unsigned kAttnHpw, bool Swizzle, bool Half, bool Fold, unsigned Lean>
 __global__ __launch_bounds__(kAttnThreads) void attention_chunk_seg_kernel(SegmentLaunch<AttentionView> s) {
     unsigned k;
     const uint3 b = segment_block(s, k);
-    attention_chunk_body<kAttnHpw, Swizzle, Half, Fold>(s.v[k], b);
+    attention_chunk_body<kAttnHpw, Swizzle, Half, Fold, Lean>(s.v[k], b);
 }
 __global__ __launch_bounds__(32) void attention_combine_kernel(AttentionView v) { attention_combine_body(v, own_block()); }
 __global__ __launch_bounds__(32) void attention_combine_seg_kernel(SegmentLaunch<AttentionView> s) {
@@ -1570,18 +1671,26 @@ static bool attention_tile_f16() {
     static const bool env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_TILE_F16"); return !(e && e[0] == '0' && e[1] == 0); }();  // default on, =0 off
     return attention_tile_f16_mode < 0 ? env : attention_tile_f16_mode != 0;
 }
+int attention_lean_mode = -1;
+void set_attention_lean(int mode) { attention_lean_mode = mode; }
+int attention_lean() {
+    // default 2 (softmax/PV + dequant), 1 softmax/PV only, 0 off
+    static const int env = [] { const char* e = std::getenv("STRIX_DS41_ATTN_LEAN"); return e == nullptr || e[0] == 0 ? 2 : e[0] == '0' ? 0 : e[0] == '1' ? 1 : 2; }();
+    const int m = attention_lean_mode < 0 ? env : attention_lean_mode;
+    return m > 2 ? 2 : m;
+}
 static void check_fold(const AttentionView& v) {
     if ((v.kv == nullptr) != (v.ring_out == nullptr) || (v.kv != nullptr && (v.kv_norm == nullptr || v.ring_out != v.ring || v.rows > kMaxRows)))
         throw std::invalid_argument("ds41 attention: window fold needs kv, kv_norm and ring_out == ring together, at most kMaxRows rows");
 }
-template <bool Swizzle, bool Half, bool Fold>
+template <bool Swizzle, bool Half, bool Fold, unsigned Lean>
 static void launch_attention(const AttentionView& v, hipStream_t stream) {
     const unsigned hpw = attention_hpw(v);
     const dim3 grid(attention_chunks(v), v.heads / (kAttnMinBlockHeads * hpw), v.rows);
     // the f16 tile at 1 and 2 heads per wave only (at 4 its two tile forms exceed the register file)
-    if (hpw == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<4, Swizzle, false, Fold>), grid, dim3(kAttnThreads), 0, stream, v);
-    else if (hpw == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<2, Swizzle, Half, Fold>), grid, dim3(kAttnThreads), 0, stream, v);
-    else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<1, Swizzle, Half, Fold>), grid, dim3(kAttnThreads), 0, stream, v);
+    if (hpw == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<4, Swizzle, false, Fold, Lean>), grid, dim3(kAttnThreads), 0, stream, v);
+    else if (hpw == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<2, Swizzle, Half, Fold, Lean>), grid, dim3(kAttnThreads), 0, stream, v);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_kernel<1, Swizzle, Half, Fold, Lean>), grid, dim3(kAttnThreads), 0, stream, v);
     if (v.tickets == nullptr) hipLaunchKernelGGL(attention_combine_kernel, dim3(v.heads, v.rows), dim3(32), 0, stream, v);
     check(hipGetLastError(), "ds41 attention");
 }
@@ -1595,15 +1704,20 @@ void enqueue_attention_bf16_prefill(const AttentionView& v, hipStream_t stream, 
     hipLaunchKernelGGL(attention_combine_kernel,dim3(v.heads,v.rows),dim3(32),0,stream,v);
     check(hipGetLastError(),"BF16 hi/lo prefill attention");
 }
-void enqueue_attention(const AttentionView& v, hipStream_t stream) {
-    check_fold(v);
-    const bool fold = v.kv != nullptr;
+template <unsigned Lean>
+static void enqueue_attention_form(const AttentionView& v, bool fold, hipStream_t stream) {
     // The swizzle permutes the f32 tile's LDS vectors (the 4-heads-per-wave tile and the f16 kernels' f32 fallback tiles) and
     // leaves the tile choice alone: with the f16 tile on, its f16 tiles are unchanged.
     if (attention_lds_swizzle() && !fold)
-        attention_tile_f16() ? launch_attention<true, true, false>(v, stream) : launch_attention<true, false, false>(v, stream);
-    else if (attention_tile_f16()) fold ? launch_attention<false, true, true>(v, stream) : launch_attention<false, true, false>(v, stream);
-    else fold ? launch_attention<false, false, true>(v, stream) : launch_attention<false, false, false>(v, stream);
+        attention_tile_f16() ? launch_attention<true, true, false, Lean>(v, stream) : launch_attention<true, false, false, Lean>(v, stream);
+    else if (attention_tile_f16()) fold ? launch_attention<false, true, true, Lean>(v, stream) : launch_attention<false, true, false, Lean>(v, stream);
+    else fold ? launch_attention<false, false, true, Lean>(v, stream) : launch_attention<false, false, false, Lean>(v, stream);
+}
+void enqueue_attention(const AttentionView& v, hipStream_t stream) {
+    check_fold(v);
+    const bool fold = v.kv != nullptr;
+    const int lean = attention_lean();
+    lean == 2 ? enqueue_attention_form<2>(v, fold, stream) : lean == 1 ? enqueue_attention_form<1>(v, fold, stream) : enqueue_attention_form<0>(v, fold, stream);
 }
 
 // ---- several requests' segments per launch (BatchForward): the per-call checks and grids, flushed at kMaxSegments ----
@@ -1682,7 +1796,7 @@ static unsigned shared_segment_hpw(std::span<const AttentionView> views) {
     }
     return 1U;
 }
-template <bool Swizzle, bool Half, bool Fold>
+template <bool Swizzle, bool Half, bool Fold, unsigned Lean>
 static void launch_attention_segments(std::span<const AttentionView> views, hipStream_t stream) {
     for (const auto& v : views) (void)attention_hpw(v);  // the per-call checks
     const unsigned shared = shared_segment_hpw(views);
@@ -1691,15 +1805,22 @@ static void launch_attention_segments(std::span<const AttentionView> views, hipS
             return (shared != 0U ? shared : attention_hpw(v)) == hpw ? dim3(attention_chunks(v), v.heads / (kAttnMinBlockHeads * hpw), v.rows) : dim3(0);
         };
         for_segments(views, [&](const SegmentBatch<AttentionView>& b) {
-            if (hpw == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_seg_kernel<4, Swizzle, false, Fold>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
-            else if (hpw == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_seg_kernel<2, Swizzle, Half, Fold>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
-            else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_seg_kernel<1, Swizzle, Half, Fold>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
+            if (hpw == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_seg_kernel<4, Swizzle, false, Fold, Lean>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
+            else if (hpw == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_seg_kernel<2, Swizzle, Half, Fold, Lean>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
+            else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_seg_kernel<1, Swizzle, Half, Fold, Lean>), dim3(b.blocks()), dim3(kAttnThreads), 0, stream, b.s);
         }, grid);
     }
     for_segments(views, [&](const SegmentBatch<AttentionView>& b) {
         hipLaunchKernelGGL(attention_combine_seg_kernel, dim3(b.blocks()), dim3(32), 0, stream, b.s);
     }, [](const AttentionView& v) { return v.tickets == nullptr ? dim3(v.heads, v.rows) : dim3(0); });
     check(hipGetLastError(), "ds41 attention (segments)");
+}
+template <unsigned Lean>
+static void enqueue_attention_segments_form(std::span<const AttentionView> views, bool fold, hipStream_t stream) {
+    if (attention_lds_swizzle() && !fold)  // as enqueue_attention: the f32 tiles only, the tile choice unchanged
+        attention_tile_f16() ? launch_attention_segments<true, true, false, Lean>(views, stream) : launch_attention_segments<true, false, false, Lean>(views, stream);
+    else if (attention_tile_f16()) fold ? launch_attention_segments<false, true, true, Lean>(views, stream) : launch_attention_segments<false, true, false, Lean>(views, stream);
+    else fold ? launch_attention_segments<false, false, true, Lean>(views, stream) : launch_attention_segments<false, false, false, Lean>(views, stream);
 }
 void enqueue_attention_segments(std::span<const AttentionView> views, hipStream_t stream) {
     if (views.empty()) return;
@@ -1708,10 +1829,9 @@ void enqueue_attention_segments(std::span<const AttentionView> views, hipStream_
         check_fold(v);
         if ((v.kv != nullptr) != fold) throw std::invalid_argument("ds41 attention segments: window fold on some segments only");
     }
-    if (attention_lds_swizzle() && !fold)  // as enqueue_attention: the f32 tiles only, the tile choice unchanged
-        attention_tile_f16() ? launch_attention_segments<true, true, false>(views, stream) : launch_attention_segments<true, false, false>(views, stream);
-    else if (attention_tile_f16()) fold ? launch_attention_segments<false, true, true>(views, stream) : launch_attention_segments<false, true, false>(views, stream);
-    else fold ? launch_attention_segments<false, false, true>(views, stream) : launch_attention_segments<false, false, false>(views, stream);
+    const int lean = attention_lean();
+    lean == 2 ? enqueue_attention_segments_form<2>(views, fold, stream) : lean == 1 ? enqueue_attention_segments_form<1>(views, fold, stream)
+              : enqueue_attention_segments_form<0>(views, fold, stream);
 }
 
 }  // namespace strix::ds41::attn::hip
