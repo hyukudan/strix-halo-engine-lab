@@ -1182,6 +1182,39 @@
   },
   {
     "engine": "minimax",
+    "name": "Decode MoE down partials and ordered finish",
+    "flag_or_env": "STRIX_MMX_MOE_DOWN_SPLIT",
+    "default": "1",
+    "exact": "hip_mmx_moe_bench --diverse --test: 610 N/U/S cases, IL/SINGLE x DOWN 0/1/2 output/workspace/routes bitwise, repeated calls, every row == alone; same partial scratch, ascending split sum, H128/scales, ascending-expert fmaf, shared add; repeat golden-logit/token/state gates for the chosen workload.",
+    "gain": "Decode MoE measurement (five fresh processes OFF/ON/OFF/ON/OFF, 16 samples/cell) B/A at B4: U4/S0 0.986/0.986, U8/S0 0.993/0.989, U12/S8 0.991/0.997, U16/S16 0.986/1.000; B1 1.001/1.004 and B8 mixed stay off",
+    "preconditions": "Four-row v4 decode steps on the wide W=4 Depth=4 path (the resolver default WIDE=2).",
+    "off_switch": "STRIX_MMX_MOE_DOWN_SPLIT=0",
+    "doc_anchor": "docs/optimizations.md#mm-moe-down-split"
+  },
+  {
+    "engine": "minimax",
+    "name": "Decode attention 32 KB LDS footprint",
+    "flag_or_env": "STRIX_MM_ATTEND_DIET",
+    "default": "1",
+    "exact": "msa_fused_tests run_case: v2/v3 lds_diet at every head split bitwise vs the current kernels (attention, caches, selection, partials); allocation-only change.",
+    "gain": "Same binary/process bench on current main kernels (msa_fused_tests, STRIX_MMATTN_BENCH_DIET=1, graph, cache rotation; v3-full / v3 32 KB diet / v4 one head per wave): sparse N2/W1 8K 74.4 / 69.9 / 71.0, 32K 133.5 / 130.7 / 131.4, 128K 343.1 / 342.1 / 342.6 us/layer; the diet is chosen first. Controls: 8K N4 v3-full 122.8 vs diet 129.3 (stays v3). Earlier t9: 8K 83.9 -> 76.2 us",
+    "preconditions": "Decode steps with two sequences of one row each, both past 8191 positions (sparse), and a selection scratch that fits the 32 KB tile.",
+    "off_switch": "STRIX_MM_ATTEND_DIET=0",
+    "doc_anchor": "docs/optimizations.md#mm-attend-diet"
+  },
+  {
+    "engine": "minimax",
+    "name": "Decode attention v4, one head per wave",
+    "flag_or_env": "STRIX_MM_ATTEND4_DECODE",
+    "default": "1",
+    "exact": "msa_fused_tests run_case: v4 heads_per_wave 1/2/4 bitwise vs the current kernels (attention, caches, selection, partials) on every decode case.",
+    "gain": "Used on the same grids only when STRIX_MM_ATTEND_DIET=0 (the diet is faster there): same-binary bench v3-full / v4 one head per wave 8K 74.4 / 71.0, 32K 133.5 / 131.4, 128K 343.1 / 342.6 us/layer; earlier t12 8K 78.6 -> 75.2 us",
+    "preconditions": "Decode steps with two sequences of one row each, both past 8191 positions (sparse).",
+    "off_switch": "STRIX_MM_ATTEND4_DECODE=0",
+    "doc_anchor": "docs/optimizations.md#mm-attend4-decode"
+  },
+  {
+    "engine": "minimax",
     "name": "MSA prefill index query tiles",
     "flag_or_env": "STRIX_MM_PF_IDX_TILE",
     "default": "1",

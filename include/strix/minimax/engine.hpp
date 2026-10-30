@@ -220,6 +220,12 @@ public:
     [[nodiscard]] int prefill_kv_tile() const;
     // STRIX_MM_INDEX_CONC=1: decode index projection concurrent with q/k/v (same kernels, same bits).
     void set_index_concurrent(bool on);
+    // STRIX_MM_ATTEND_DIET (default ON): decode attend v3 at its 32 KB LDS on two single-row sparse sequences >= 8K.
+    void set_attend_diet(bool on);
+    [[nodiscard]] bool attend_diet() const;
+    // STRIX_MM_ATTEND4_DECODE (default ON): decode attend v4, one head per wave, on the same grids (before the diet).
+    void set_attend4_decode(bool on);
+    [[nodiscard]] bool attend4_decode() const;
     [[nodiscard]] bool index_concurrent() const;
     // decode fused exchange boundary (decode module path, same bits; qualification notes):
     // STRIX_MM_XB_WAIT=1: post_exchange waits for the peer's partial in-kernel; STRIX_MM_XB_INPLACE=1: the producers

@@ -1818,7 +1818,10 @@ template <bool DENSE> void launch_attend(const DecodeView& v, bool select, hipSt
     // versions 2/3: dynamic LDS = the 32 KB tile or the selection scratch, whichever is larger (dense: the tile)
     const std::size_t sel_need = DENSE ? 0 : sel_bytes(v.max_blocks, hw * 32);
     std::size_t lds = sel_need > kChunks16 * sizeof(uint4) ? sel_need : kChunks16 * sizeof(uint4);
-    if (g_attend_lds_min > lds) lds = g_attend_lds_min;  // bench only: emulate a larger footprint (occupancy A/B)
+    // The floor keeps the measured 42 KB footprint except where the 32 KB diet won (t9: sparse N2/W1 8K/32K/128K) and
+    // the selection scratch fits the tile; only the allocation (occupancy) changes.
+    const bool diet = v.lds_diet && !DENSE && sel_need <= kChunks16 * sizeof(uint4);
+    if (!diet && g_attend_lds_min > lds) lds = g_attend_lds_min;
     if (ver < 1 || ver > 3) throw std::invalid_argument("minimax fused attend: attend_version must be 1, 2, 3 or 4");
     switch (hw * 10 + ver) {
     case 161: hipLaunchKernelGGL((attend_kernel<16, DENSE>), grid, dim3(16 * 32), 0, stream, v, sel); break;

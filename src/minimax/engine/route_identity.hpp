@@ -86,7 +86,19 @@ STRIX_MM_ROUTE_HD inline constexpr bool moe_single_reader(bool enabled, unsigned
     return enabled && depth == 4 && !wide && waves == 4 && bits == 3 &&
            moe_single_slot(rows, count, singles, shared, slot_rows);
 }
+// Decode MoE down partials + one stream-ordered 48-CTA finish (STRIX_MMX_MOE_DOWN_SPLIT): mode 1 = the measured
+// winning regime only (N=4 wide W4 Depth4; host-known, no sync to read U/S), 2 = every v4 down, 0 = off.
+STRIX_MM_ROUTE_HD inline constexpr bool moe_down_split(unsigned mode, unsigned rows, bool wide, unsigned waves,
+                                                       unsigned depth) {
+    return mode == 2 || (mode == 1 && rows == 4 && wide && waves == 4 && depth == 4);
+}
 #undef STRIX_MM_ROUTE_HD
+// Decode attention grids where the measured alternatives won (t9 LDS diet, t12 v4 one head per wave; the diet is tried
+// first, STRIX_MM_ATTEND_DIET, then v4, STRIX_MM_ATTEND4_DECODE): two single-row
+// sparse sequences, both at >= 8K positions. Dense, N1, N4/N8 and verify windows keep v3 at the 42 KB footprint.
+inline bool attend_n2_sparse(unsigned seqs, unsigned rows_per_seq, bool dense, std::uint64_t min_pos) {
+    return !dense && seqs == 2 && rows_per_seq == 1 && min_pos + 1 >= 8192;
+}
 inline bool wide_for(unsigned rows, int mode) { return mode == 1 || (mode == 2 && rows >= 2 && rows <= 4); }
 inline int scheduled_linear_version(unsigned input, unsigned output, unsigned count, unsigned rows) {
     if (output >= 65536) return 4;

@@ -34,8 +34,17 @@ constexpr Item kItems[] = {
      "Decode MoE measurement: bitwise (610 N/U/S cases, every row == alone), B8 gate/up interleave diverse U8-32 -1.5..-3 %, B1/B4 unchanged"},
     {"moe_single", "STRIX_MMX_MOE_SINGLE", "1", "0",
      "Decode MoE measurement: bitwise (610 N/U/S cases, every row == alone), B8 U>=25 singleton reader -3 %, B1/B4 unchanged"},
+    {"moe_down_split", "STRIX_MMX_MOE_DOWN_SPLIT", "1", "0",
+     "Decode MoE measurement: bitwise (610 N/U/S cases, every row == alone), B4 down partials + ordered finish, fresh-process "
+     "OFF/ON/OFF/ON/OFF B/A U4 0.986/0.986, U8 0.993/0.989, U12 0.991/0.997, U16 0.986/1.000; B4 wide W4 Depth4 only"},
     {"index_conc", "STRIX_MM_INDEX_CONC", "1", "0",
      "Measurement: ids identical, 17/18 in-process block pairs faster, ~-0.2 ms/token"},
+    {"attend_diet", "STRIX_MM_ATTEND_DIET", "1", "0",
+     "Attention measurement t9: bitwise, v3 32 KB LDS vs 42 KB at sparse N2/W1 8K 83.9 -> 76.2, 32K 139.0 -> 131.6, "
+     "128K 350.2 -> 340.8 us; only on those grids (1K N8, W8, 8K N4 slower stay at 42 KB)"},
+    {"attend4_decode", "STRIX_MM_ATTEND4_DECODE", "1", "0",
+     "Attention measurement t12: bitwise, v4 one head per wave vs v3-full at sparse N2/W1 8K 78.6 -> 75.2, 32K 132.2 -> "
+     "128.3, 128K 346.4 -> 340.6 us; only on those grids (1K N1/N8, 8K N4 slower keep v3)"},
     {"xfer_crc_deferred", "STRIX_MMX_CRC", "deferred", "1",
      "Measurement: tokens identical in 7 processes, each deferred arm below its inline neighbours by 0.04-0.12 ms/token"},
     {"xb_wait", "STRIX_MM_XB_WAIT", "1", "0", "Exchange boundary measurement: exact, 1K 48.56 -> 44.40 ms/token"},

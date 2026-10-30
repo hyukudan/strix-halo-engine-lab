@@ -11,10 +11,12 @@
 //           batch invariance (a row's bits alone == inside N).
 //   --bench: per cell (site x N) the order A B A B A B A (ABA x3), each a mean over --iters calls on rotating cold
 //           weights; prints us per call, GB/s of weight bytes, and B/A per triplet.
-//   --diverse: decode-only production enqueue_moe v4 cell; --test exhausts N=1..8 and feasible U/S;
+//   --diverse: decode-only production enqueue_moe v4 cell; --test exhausts N=1..8 and feasible U/S,
+//           IL/SINGLE=0/1 x DOWN_SPLIT=0/1/2 and every row vs standalone (DOWN 0/2);
 //           --bench: B8 U=4,8,12,16,20,22,24,25,26,27,28,30,32; B4 U=4,8,12,16; B1 U=4.
 //   --diverse-fallback --test: separate wide/K5/W8/Depth8+12 negative-reader gate (not singleton qualification).
 //           --singletons min|max|COUNT controls singleton expert count. Stage probes follow total timing.
+//           --ab-down adds, per cell, one-process DOWN_SPLIT=0 (A) vs 1 (B) brackets A B B A (x reps, iters each).
 #include "minimax/engine/route_identity.hpp"
 #include "minimax/moe/mmx_moe.hpp"
 #include "minimax/moe/mmx_prefill.hpp"
@@ -519,6 +521,7 @@ struct Options {
     bool diverse = false;
     bool diverse_fallback = false;  // explicit negative-reader gate, never singleton qualification
     std::string singletons = "min";  // --singletons min|max|COUNT; infeasible cells are skipped
+    bool ab_down = false;  // --ab-down: in-process DOWN_SPLIT=0 (A) vs 1 (B) per diverse cell, ABBA brackets
 };
 
 // Per-call switches are restored after the gate, including combined --test --bench invocations.
@@ -998,8 +1001,9 @@ struct Bench {
             throw std::invalid_argument("diverse gate requires v4");
         opt::check_moe_single_resources();
         const auto reader_counts = dupload(std::vector<std::uint32_t>(2, 0));
-        unsigned observed_cases = 0;
-        EnvMode mode("STRIX_MMX_MOE_SINGLE"), interleave("STRIX_MMX_MOE_GU_INTERLEAVE");
+        unsigned observed_cases = 0, split_arms = 0;
+        EnvMode mode("STRIX_MMX_MOE_SINGLE"), interleave("STRIX_MMX_MOE_GU_INTERLEAVE"),
+            down("STRIX_MMX_MOE_DOWN_SPLIT");
         WorkspaceCheck workspace;
         unsigned cases = 0;
         const auto input = randn(8ULL * H, 0.5F);
@@ -1015,6 +1019,7 @@ struct Bench {
                     const std::string label = "N=" + std::to_string(n) + " U=" + std::to_string(u) + " S=" + std::to_string(s_count);
                     interleave.set("0");
                     mode.set("0");
+                    down.set("0");
                     hip_ok(hipMemset(moe_ws, 0, opt::moe_workspace_bytes()), "diverse ws zero");
                     opt::enqueue_moe(diverse_view(n, route_ids, route_weights), nullptr);
                     const auto batch = d2h(outB, std::size_t{n} * H);
@@ -1029,47 +1034,70 @@ struct Bench {
                     for (const char* grid : {"0", "1"}) {
                         interleave.set(grid);
                         for (const char* single : {"0", "1"}) {
-                            if (grid[0] == '0' && single[0] == '0') continue;  // captured reference
                             mode.set(single);
-                            hip_ok(hipMemset(moe_ws, 0, opt::moe_workspace_bytes()), "diverse ws zero");
-                            hip_ok(hipMemset(reader_counts, 0, 2 * sizeof(std::uint32_t)), "reader counters zero");
-                            auto observed = diverse_view(n, route_ids, route_weights);
-                            observed.single_reader_counts = reader_counts;
-                            opt::enqueue_moe(observed, nullptr);
-                            const auto counts = d2h(reader_counts, 2);
-                            const bool eligible = strix::minimax::route::moe_single_reader(
-                                single[0] == '1', n, u, s_count, false, 1, bits,
-                                strix::minimax::route::wide_for(n, wide_mode), waves, depth);
-                            // One counter arrival per CTA: two GU matrices x 24 groups x 16 splits;
-                            // down has 96 groups x 4 splits. Shared/reused slots must contribute zero.
-                            const unsigned expected_gu = eligible ? s_count * 2U * 24U * 16U : 0U;
-                            const unsigned expected_dn = eligible ? s_count * 96U * 4U : 0U;
-                            if (counts[0] != expected_gu || counts[1] != expected_dn)
-                                throw std::runtime_error("singleton reader execution mismatch " + label);
-                            if (eligible) ++observed_cases;
-                            if (!same_bits(batch, d2h(outB, std::size_t{n} * H)) || !workspace.equal(moe_ws) ||
-                                d2h(idsB, std::size_t{n} * 4) != expected_ids || !same_bits(d2h(wB, std::size_t{n} * 4), expected_weights))
-                                throw std::runtime_error("diverse interleave/SINGLE output/workspace/routes mismatch " + label);
+                            // DOWN_SPLIT 0 = fused finish, 1 = measured regime only, 2 = every v4 down.
+                            for (const char* split : {"0", "1", "2"}) {
+                                down.set(split);
+                                const std::string arm = label + " IL=" + grid + " SINGLE=" + single + " DOWN=" + split;
+                                hip_ok(hipMemset(moe_ws, 0, opt::moe_workspace_bytes()), "diverse ws zero");
+                                hip_ok(hipMemset(reader_counts, 0, 2 * sizeof(std::uint32_t)), "reader counters zero");
+                                auto observed = diverse_view(n, route_ids, route_weights);
+                                observed.single_reader_counts = reader_counts;
+                                opt::enqueue_moe(observed, nullptr);
+                                const auto counts = d2h(reader_counts, 2);
+                                const bool eligible = strix::minimax::route::moe_single_reader(
+                                    single[0] == '1', n, u, s_count, false, 1, bits,
+                                    strix::minimax::route::wide_for(n, wide_mode), waves, depth);
+                                // One counter arrival per CTA: two GU matrices x 24 groups x 16 splits;
+                                // down has 96 groups x 4 splits. Shared/reused slots must contribute zero.
+                                const unsigned expected_gu = eligible ? s_count * 2U * 24U * 16U : 0U;
+                                const unsigned expected_dn = eligible ? s_count * 96U * 4U : 0U;
+                                if (counts[0] != expected_gu || counts[1] != expected_dn)
+                                    throw std::runtime_error("singleton reader execution mismatch " + arm);
+                                if (eligible && split[0] == '0') ++observed_cases;
+                                if (strix::minimax::route::moe_down_split(static_cast<unsigned>(split[0] - '0'), n,
+                                                                          strix::minimax::route::wide_for(n, wide_mode),
+                                                                          waves, depth))
+                                    ++split_arms;
+                                if (!same_bits(batch, d2h(outB, std::size_t{n} * H)) || !workspace.equal(moe_ws) ||
+                                    d2h(idsB, std::size_t{n} * 4) != expected_ids ||
+                                    !same_bits(d2h(wB, std::size_t{n} * 4), expected_weights))
+                                    throw std::runtime_error("diverse output/workspace/routes mismatch " + arm);
+                                if (split[0] == '0') continue;
+                                // Repeat without a reset: counters must remain reusable across calls, too.
+                                opt::enqueue_moe(diverse_view(n, route_ids, route_weights), nullptr);
+                                if (!same_bits(batch, d2h(outB, std::size_t{n} * H)) || !workspace.equal(moe_ws))
+                                    throw std::runtime_error("diverse repeated output/workspace mismatch " + arm);
+                            }
                         }
                     }
+                    // All eight batch arms equal `batch`; compare every row against all eight standalone arms.
                     for (unsigned r = 0; r < n; ++r) {
                         auto v = diverse_view(1, route_ids + r * 4, route_weights + r * 4);
                         v.y = y + std::size_t{r} * H;
-                        hip_ok(hipMemset(moe_ws, 0, opt::moe_workspace_bytes()), "alone ws zero");
-                        opt::enqueue_moe(v, nullptr);
-                        const auto one = d2h(outB, H);
-                        if (std::memcmp(one.data(), batch.data() + std::size_t{r} * H, H * sizeof(float)) != 0)
-                            throw std::runtime_error("diverse alone mismatch " + label + " row=" + std::to_string(r));
-                        workspace.save(moe_ws);
-                        interleave.set("0");
-                        mode.set("0");
-                        hip_ok(hipMemset(moe_ws, 0, opt::moe_workspace_bytes()), "alone ws zero");
-                        opt::enqueue_moe(v, nullptr);
-                        if (!same_bits(one, d2h(outB, H)) ||
-                            !workspace.equal(moe_ws))
-                            throw std::runtime_error("diverse alone SINGLE mismatch " + label + " row=" + std::to_string(r));
-                        interleave.set("1");
-                        mode.set("1");
+                        for (const char* grid : {"0", "1"}) {
+                            interleave.set(grid);
+                            for (const char* single : {"0", "1"}) {
+                                mode.set(single);
+                                for (const char* split : {"0", "2"}) {
+                                    down.set(split);
+                                    const std::string arm = label + " row=" + std::to_string(r) +
+                                        " IL=" + grid + " SINGLE=" + single + " DOWN=" + split;
+                                    hip_ok(hipMemset(moe_ws, 0, opt::moe_workspace_bytes()), "alone ws zero");
+                                    opt::enqueue_moe(v, nullptr);
+                                    const auto one = d2h(outB, H);
+                                    if (std::memcmp(one.data(), batch.data() + std::size_t{r} * H, H * sizeof(float)) != 0 ||
+                                        d2h(idsB, 4) != std::vector<std::uint32_t>(expected_ids.begin() + r * 4,
+                                                                                 expected_ids.begin() + (r + 1) * 4) ||
+                                        !same_bits(d2h(wB, 4), std::vector<float>(expected_weights.begin() + r * 4,
+                                                                                expected_weights.begin() + (r + 1) * 4)))
+                                        throw std::runtime_error("diverse alone output/routes mismatch " + arm);
+                                    if (grid[0] == '0' && single[0] == '0' && split[0] == '0') workspace.save(moe_ws);
+                                    else if (!workspace.equal(moe_ws))
+                                        throw std::runtime_error("diverse alone workspace mismatch " + arm);
+                                }
+                            }
+                        }
                     }
                     hip_ok(hipFree(route_ids), "diverse ids free");
                     ++cases;
@@ -1077,9 +1105,11 @@ struct Bench {
         hip_ok(hipFree(route_weights), "diverse weights free");
         hip_ok(hipFree(reader_counts), "reader counters free");
         if (!o.diverse_fallback && observed_cases == 0) throw std::runtime_error("singleton reader never ran");
-        std::printf("diverse fatal: mode=%s WIDE=%d bits=%u W=%u Depth=%u overlap=%d cases=%u reader_cases=%u "
-                    "N=1..8 every feasible U/S GU_INTERLEAVE=0/1 SINGLE=0/1 output/workspace/routes rows==alone: PASS\n",
-                    o.diverse_fallback ? "fallback" : "singleton", wide_mode, bits, waves, depth, overlap, cases, observed_cases);
+        if (split_arms == 0) throw std::runtime_error("down split never ran");
+        std::printf("diverse fatal: mode=%s WIDE=%d bits=%u W=%u Depth=%u overlap=%d cases=%u reader_cases=%u split_arms=%u "
+                    "N=1..8 every feasible U/S GU_INTERLEAVE=0/1 SINGLE=0/1 DOWN_SPLIT=0/1/2 output/workspace/routes rows==alone: PASS\n",
+                    o.diverse_fallback ? "fallback" : "singleton", wide_mode, bits, waves, depth, overlap, cases, observed_cases,
+                    split_arms);
     }
     void bench_diverse() {
         require_diverse_path();
@@ -1091,8 +1121,10 @@ struct Bench {
             throw std::invalid_argument("diverse byte floor requires K5 shared weights");
         const char* single = std::getenv("STRIX_MMX_MOE_SINGLE");
         const char* interleave = std::getenv("STRIX_MMX_MOE_GU_INTERLEAVE");
-        std::printf("diverse overlap SINGLE=%s GU_INTERLEAVE=%s, routed=10.616832 MB/expert shared=17.694720 MB floor=220 GB/s\n",
-                    single != nullptr ? single : "0", interleave != nullptr ? interleave : "0");
+        const char* down = std::getenv("STRIX_MMX_MOE_DOWN_SPLIT");
+        const unsigned down_mode = down != nullptr ? static_cast<unsigned>(std::atoi(down)) : 0U;
+        std::printf("diverse overlap SINGLE=%s GU_INTERLEAVE=%s DOWN=%u, routed=10.616832 MB/expert shared=17.694720 MB floor=220 GB/s\n",
+                    single != nullptr ? single : "0", interleave != nullptr ? interleave : "0", down_mode);
         auto median = [](std::vector<double> values) {
             std::sort(values.begin(), values.end());
             const std::size_t mid = values.size() / 2;
@@ -1153,35 +1185,71 @@ struct Bench {
                             samples.push_back(1000.0 * ms);
                         }
                     const double us = median(samples);
-                    // Probe phases separately: extra event boundaries never enter the reported total median.
-                    hipEvent_t marks[2];
+                    if (o.ab_down) {  // same process, same routes/rotation: A = fused finish, B = the resolver default
+                        EnvMode down_env("STRIX_MMX_MOE_DOWN_SPLIT");
+                        std::vector<double> arm_samples[2];
+                        std::string brackets;
+                        for (int rep = 0; rep < o.reps; ++rep) {
+                            double bracket[2] = {0.0, 0.0};
+                            for (unsigned k = 0; k < 4; ++k) {
+                                const unsigned arm = (k == 0 || k == 3) ? 0U : 1U;  // A B B A
+                                down_env.set(arm == 0 ? "0" : "1");
+                                for (int it = 0; it < o.iters; ++it) {
+                                    hip_ok(hipEventRecord(begin, nullptr), "ab begin");
+                                    run(static_cast<unsigned>((rep * 4 + static_cast<int>(k)) * o.iters + it));
+                                    hip_ok(hipEventRecord(end, nullptr), "ab end");
+                                    hip_ok(hipEventSynchronize(end), "ab sync");
+                                    float ms = 0;
+                                    hip_ok(hipEventElapsedTime(&ms, begin, end), "ab elapsed");
+                                    arm_samples[arm].push_back(1000.0 * ms);
+                                    bracket[arm] += 1000.0 * ms;
+                                }
+                            }
+                            char cell[32];
+                            std::snprintf(cell, sizeof cell, " %.3f", bracket[1] / bracket[0]);
+                            brackets += cell;
+                        }
+                        const double a_us = median(arm_samples[0]), b_us = median(arm_samples[1]);
+                        std::printf("diverse-ab DOWN B=%u U=%u S=%u A_us=%.3f B_us=%.3f B/A=%.4f bracket_B/A:%s split_at_B=%u\n", n, u,
+                                    s_count, a_us, b_us, b_us / a_us, brackets.c_str(),
+                                    strix::minimax::route::moe_down_split(1U, n, strix::minimax::route::wide_for(n, wide_mode), 4, 4)
+                                        ? 1U : 0U);
+                    }
+                    const bool down_split = strix::minimax::route::moe_down_split(
+                        down_mode, n, strix::minimax::route::wide_for(n, wide_mode), 4, 4);
+                    // Probe phases separately: event boundaries never enter the total median. DOWN=0 includes
+                    // combine in down_us; combine_us=0 means fused, not a measured zero-cost combine. DOWN=1 splits B4 only.
+                    hipEvent_t marks[3];
                     for (auto& mark : marks) hip_ok(hipEventCreate(&mark), "diverse phase event");
-                    std::vector<double> router_times, gu_times, down_times;
+                    std::vector<double> router_times, gu_times, down_times, combine_times;
                     for (unsigned probe = 0; probe < 3; ++probe) {
                         const auto v = diverse_view(n, route_ids + ((probe + 8U) % rotation) * n * 4, route_weights);
                         hip_ok(hipEventRecord(begin, nullptr), "diverse probe begin");
-                        opt::enqueue_moe_profiled(v, nullptr, marks);
+                        opt::enqueue_moe_profiled(v, nullptr, marks, marks[2]);
                         hip_ok(hipEventRecord(end, nullptr), "diverse probe end");
                         hip_ok(hipEventSynchronize(end), "diverse probe sync");
-                        float router_ms = 0, gu_ms = 0, down_ms = 0;
+                        float router_ms = 0, gu_ms = 0, down_ms = 0, combine_ms = 0;
                         hip_ok(hipEventElapsedTime(&router_ms, begin, marks[0]), "diverse router time");
                         hip_ok(hipEventElapsedTime(&gu_ms, marks[0], marks[1]), "diverse gate/up time");
-                        hip_ok(hipEventElapsedTime(&down_ms, marks[1], end), "diverse down time");
+                        hip_ok(hipEventElapsedTime(&down_ms, marks[1], marks[2]), "diverse down time");
+                        if (down_split) hip_ok(hipEventElapsedTime(&combine_ms, marks[2], end), "diverse combine time");
                         router_times.push_back(1000.0 * router_ms);
                         gu_times.push_back(1000.0 * gu_ms);
                         down_times.push_back(1000.0 * down_ms);
+                        combine_times.push_back(1000.0 * combine_ms);
                     }
                     const bool wide = strix::minimax::route::wide_for(n, wide_mode);
                     const unsigned gu_groups = IR / (wide ? 256U : 64U), dn_groups = H / (wide ? 256U : 64U);
                     // Trellis-only lower bound: K3 routed and K5 shared, decimal bytes and GB/s. Scales/router excluded.
                     const double bytes = (3.0 * H * IR * 3.0 / 8.0) * u + (3.0 * H * IR * 5.0 / 8.0);
                     std::printf("diverse SINGLE=%s B=%u U=%u S=%u reuse=%u median_us=%.3f bytes=%.0f bytes/us=%.1f GB/s=%.2f "
-                                "floor220_us=%.3f floor_ratio=%.3f samples=%zu router_us=%.3f gu_us=%.3f down_us=%.3f "
-                                "gu_ctas=%u dn_ctas=%u gu_arrivals=%u dn_arrivals=%u\n",
+                                "floor220_us=%.3f floor_ratio=%.3f samples=%zu router_us=%.3f gu_us=%.3f down_us=%.3f combine_us=%.3f "
+                                "gu_ctas=%u dn_ctas=%u gu_arrivals=%u dn_arrivals=%u combine_ctas=%u DOWN=%u down_includes_combine=%u\n",
                                 single != nullptr ? single : "0", n, u, s_count, u - s_count, us, bytes,
                                 bytes / us, bytes / us / 1000.0, bytes / 220000.0, us / (bytes / 220000.0), samples.size(),
-                                median(router_times), median(gu_times), median(down_times), gu_groups * 16U * 2U * u,
-                                dn_groups * 4U * (u + 1U), wide ? 32U : 64U, (u + 1U) * (wide ? 4U : 8U));
+                                median(router_times), median(gu_times), median(down_times), median(combine_times), gu_groups * 16U * 2U * u,
+                                dn_groups * 4U * (u + 1U), wide ? 32U : 64U, down_split ? 0U : (u + 1U) * (wide ? 4U : 8U),
+                                down_split ? H / 128U : 0U, down_split ? 1U : 0U, down_split ? 0U : 1U);
                     for (auto mark : marks) hip_ok(hipEventDestroy(mark), "diverse phase event free");
                     hip_ok(hipEventDestroy(begin), "diverse event free");
                     hip_ok(hipEventDestroy(end), "diverse event free");
@@ -2706,6 +2774,7 @@ int main(int argc, char** argv) {
             else if (a == "--diverse") o.diverse = true;
             else if (a == "--diverse-fallback") { o.diverse = true; o.diverse_fallback = true; }
             else if (a == "--singletons") o.singletons = next();
+            else if (a == "--ab-down") { o.diverse = true; o.ab_down = true; }
             else throw std::invalid_argument("unknown option " + a);
         }
         if (o.reps < 1 || o.iters < 1 || o.reps > 1000 || o.iters > 10000)

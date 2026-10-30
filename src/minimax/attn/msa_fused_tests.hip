@@ -403,6 +403,12 @@ void run_case(const Case& c, std::mt19937& rng) {
             mf::enqueue_decode(v, nullptr);
             hip_ok(hipDeviceSynchronize(), "sync hw");
             same_out(d, a, read_out(d, x), ("fused v" + std::to_string(ver) + " heads/block " + std::to_string(hw)).c_str());
+            if (ver == 1) continue;  // version 1 has static LDS
+            reset_caches(d, x);
+            v.lds_diet = true;  // actual dynamic LDS instead of the 43008-byte floor: allocation only
+            mf::enqueue_decode(v, nullptr);
+            hip_ok(hipDeviceSynchronize(), "sync diet");
+            same_out(d, a, read_out(d, x), ("fused v" + std::to_string(ver) + " lds_diet heads/block " + std::to_string(hw)).c_str());
         }
     // Dense single launch (every row below 2048 positions): caches and output (no scores / selection written).
     if (std::all_of(d.pos.begin(), d.pos.end(), [](std::uint64_t p) { return p < msa::kTopK * msa::kBlock; }))
@@ -1207,7 +1213,11 @@ void bench_cell(std::uint64_t ctx, unsigned seqs, unsigned W, std::mt19937& rng)
     // (experiment mode: v3-16 with the selection precomputed).
     // Arms: 0 current, 1 v3-16 (default), 2 v4 2 heads/wave, 3 v4 4 heads/wave, 4 dense v3 (<= 2K) else v4 1 head/wave,
     // 5 dense v4 2 heads/wave (<= 2K) else v3-8. Experiment mode keeps its own meaning for arm 4 (v3 presel).
-    const unsigned arm_hw[6] = {0, 16, 16, 16, 16, 8}, arm_ver[6] = {0, 3, 3, 4, dense_ok ? 3U : 4U, dense_ok ? 4U : 3U};
+    // STRIX_MMATTN_BENCH_DIET=1 (sparse cells): arm 5 = v3-16 with lds_diet instead of v3-8, so v3 42 KB (arm 2),
+    // v3 32 KB (5), v4-h1 (4) and v4-h2 (3) share one process, cache rotation and bracket order.
+    const char* diet_env = std::getenv("STRIX_MMATTN_BENCH_DIET");
+    const bool diet_arm = !g_exp && !dense_ok && diet_env != nullptr && std::string(diet_env) == "1";
+    const unsigned arm_hw[6] = {0, 16, 16, 16, 16, diet_arm ? 16U : 8U}, arm_ver[6] = {0, 3, 3, 4, dense_ok ? 3U : 4U, dense_ok ? 4U : 3U};
     const unsigned arm_hpw[6] = {0, 0, 0, 2, dense_ok ? 0U : 1U, dense_ok ? 2U : 0U};
     // Experiment mode: arm 3 = v2-16 again (repeatability), arm 4 = v2-16 with the selection precomputed (index launch
     // + attend select=false; idx from the previous select runs).
@@ -1218,6 +1228,7 @@ void bench_cell(std::uint64_t ctx, unsigned seqs, unsigned W, std::mt19937& rng)
         v.heads_per_wave = arm_hpw[arm];
         v.dense = (arm == 4 || arm == 5) && !g_exp && dense_ok;
         v.pv_full_tiles = arm == 1 ? 0U : 1U;  // arm 1 = version 3 as measured (predicated PV only)
+        v.lds_diet = diet_arm && arm == 5;
         return v;
     };
     auto enqueue_arm = [&](int arm) {
@@ -1268,7 +1279,7 @@ void bench_cell(std::uint64_t ctx, unsigned seqs, unsigned W, std::mt19937& rng)
         return 1000.0 * ms / (double(reps) * L);
     };
     const char* names[6] = {"A(current)", "v3-pred", "v3-full", "v4-h2", g_exp ? "v3-presel" : dense_ok ? "D3(dense)" : "v4-h1",
-                            dense_ok ? "D4-h2(dense)" : "v3-8"};
+                            dense_ok ? "D4-h2(dense)" : diet_arm ? "v3-diet" : "v3-8"};
     for (int gm = 0; gm < 2; ++gm) {
         std::vector<double> t[6];
         std::string rounds;
@@ -1526,10 +1537,16 @@ int main() {
             {4, 2, 32, 2, 2, {300, 5000, 16383, 16384}, true, "n4w2-ties"},
             {2, 8, 32, 2, 2, {8200, 65000}, false, "n2w8"},
         };
-        prefill_batch_cases(rng);
-        prefill_attend4_cases(rng);
+        // STRIX_MSA_TEST_DECODE_ONLY=1: the decode cases only (the prefill matrices take several minutes)
+        const char* decode_only = std::getenv("STRIX_MSA_TEST_DECODE_ONLY");
+        const bool prefill = decode_only == nullptr || std::strcmp(decode_only, "1") != 0;
+        if (prefill) {
+            prefill_batch_cases(rng);
+            prefill_attend4_cases(rng);
+        }
         for (const Case& c : cases) run_case(c, rng);
-        for (std::uint64_t T : {300ULL, 3000ULL}) prefill_case(T, rng, false);
+        if (prefill)
+            for (std::uint64_t T : {300ULL, 3000ULL}) prefill_case(T, rng, false);
         if (g_fail != 0) {
             std::fprintf(stderr, "%d failure(s)\n", g_fail);
             return 1;

@@ -69,6 +69,8 @@ struct Args {
     std::uint32_t* single_reader_counts = nullptr;
     bool single_stream = false;
     bool interleave_gu = true;
+    unsigned down_split = 0;  // STRIX_MMX_MOE_DOWN_SPLIT mode; route::moe_down_split decides per launch
+    hipEvent_t down_done = nullptr;  // host enqueue boundary only; never read on device
     __device__ Dispatch* disp() const { return reinterpret_cast<Dispatch*>(ws); }
     __device__ float* scores() const { return reinterpret_cast<float*>(ws + kOffScores); }
     __device__ float* choice() const { return reinterpret_cast<float*>(ws + kOffChoice); }
@@ -1023,27 +1025,13 @@ __global__ __launch_bounds__(128) void router_shared_kernel(Args a) {
                                                   bx / groups, m, xs, rowbuf);
 }
 
-template <int MaxR, int Depth, int W, int DepthBig, bool Wide = false, bool Single = false>
-__global__ __launch_bounds__(32 * W) void down4_kernel(Args a) {
-    __shared__ _Float16 xs[MaxR * kSplitCh];
-    __shared__ WideV4 rowbuf[Wide ? 4 * 8 * 5 : 1];
-    const Dispatch* dp = a.disp();
-    unsigned slot;
-    if (!map_slot(dp, blockIdx.y, slot)) return;
-    constexpr unsigned groups = Wide ? kHidden / 256U : kHidden / (16U * W);
-    const unsigned cg = blockIdx.x % groups, split = blockIdx.x / groups;
+// Shared by the last-arrival path and the stream-ordered finish launch: identical four-split sum,
+// H128/scales, ascending-expert fmaf and shared add. Each wave owns complete rows of one output tile.
+template <int W>
+__device__ __forceinline__ void down4_combine(const Args& a, const Dispatch* dp, unsigned block) {
     const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    const Exl3& w = slot_slices(a, dp, slot).down;
-    const unsigned nrows = dp->nrows[slot], first = dp->first[slot];
-    for (unsigned q = threadIdx.x; q < nrows * (kSplitCh / 2); q += 32U * W) {  // the split's transformed channels
-        const unsigned lr = q / (kSplitCh / 2), c = q % (kSplitCh / 2);
-        reinterpret_cast<std::uint32_t*>(xs)[lr * (kSplitCh / 2) + c] =
-            reinterpret_cast<const std::uint32_t*>(a.at(first + lr) + split * kSplitCh)[c];
-    }
-    __syncthreads();
     // Finish every slot's block, then the G4 combine per row: acc = 0; fmaf over its experts in ascending id; + shared.
     const unsigned rows = dp->rows;
-    auto combine = [&](unsigned block) {
     auto finish = [&](unsigned pair, const std::uint16_t* svh, float (&v)[4]) {
 #pragma unroll
         for (int j = 0; j < 4; ++j) v[j] = 0.0F;
@@ -1071,17 +1059,43 @@ __global__ __launch_bounds__(32 * W) void down4_kernel(Args a) {
         for (int j = 0; j < 4; ++j)
             a.out[static_cast<std::size_t>(r) * kHidden + block * 128 + lane + 32U * static_cast<unsigned>(j)] = acc[j] + v[j];
     }
-    };
+}
+
+__global__ __launch_bounds__(128) void down4_combine_kernel(Args a) {
+    down4_combine<4>(a, a.disp(), blockIdx.x);
+    lean_publish(a.pub, a.pub.tiles);  // exactly one publisher per completed 128-output tile
+}
+
+template <int MaxR, int Depth, int W, int DepthBig, bool Wide = false, bool Single = false, bool PartialOnly = false>
+__global__ __launch_bounds__(32 * W) void down4_kernel(Args a) {
+    __shared__ _Float16 xs[MaxR * kSplitCh];
+    __shared__ WideV4 rowbuf[Wide ? 4 * 8 * 5 : 1];
+    const Dispatch* dp = a.disp();
+    unsigned slot;
+    if (!map_slot(dp, blockIdx.y, slot)) return;
+    constexpr unsigned groups = Wide ? kHidden / 256U : kHidden / (16U * W);
+    const unsigned cg = blockIdx.x % groups, split = blockIdx.x / groups;
+    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
+    const Exl3& w = slot_slices(a, dp, slot).down;
+    const unsigned nrows = dp->nrows[slot], first = dp->first[slot];
+    for (unsigned q = threadIdx.x; q < nrows * (kSplitCh / 2); q += 32U * W) {  // the split's transformed channels
+        const unsigned lr = q / (kSplitCh / 2), c = q % (kSplitCh / 2);
+        reinterpret_cast<std::uint32_t*>(xs)[lr * (kSplitCh / 2) + c] =
+            reinterpret_cast<const std::uint32_t*>(a.at(first + lr) + split * kSplitCh)[c];
+    }
+    __syncthreads();
     if constexpr (Wide) {
         const unsigned col0 = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(cg * 16U + wave * 4U)));
         split16_rows<MaxR>(w, kHidden, kInter / 16, kDownSplits, col0, split, xs, nrows, wave, lane, rowbuf,
                            a.part_dn(first, split), std::size_t{4} * kHidden);
+        if constexpr (!PartialOnly) {
 #pragma unroll
-        for (unsigned h = 0; h < 2; ++h)
-            if (last_arrival(a.dn4_counter(cg * 2U + h), (dp->count + 1) * kDownSplits)) {
-                combine(cg * 2U + h);
-                lean_publish(a.pub, a.pub.tiles);  // one arrival per finished 128-output tile (STRIX_MM_XB_PUBLISH)
-            }
+            for (unsigned h = 0; h < 2; ++h)
+                if (last_arrival(a.dn4_counter(cg * 2U + h), (dp->count + 1) * kDownSplits)) {
+                    down4_combine<W>(a, dp, cg * 2U + h);
+                    lean_publish(a.pub, a.pub.tiles);
+                }
+        }
     } else {
         const unsigned col = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(cg * static_cast<unsigned>(W) + wave)));
         if constexpr (Single) {
@@ -1093,10 +1107,12 @@ __global__ __launch_bounds__(32 * W) void down4_kernel(Args a) {
                                                      a.part_dn(first, split), std::size_t{4} * kHidden);
         } else split4_rows<MaxR, Depth, DepthBig>(w, kHidden, kInter / 16, kDownSplits, col, split, xs, nrows, lane,
                                                  a.part_dn(first, split), std::size_t{4} * kHidden);
-        const unsigned block = cg * W / 8;
-        if (last_arrival(a.dn4_counter(block), (dp->count + 1) * (8 / W) * kDownSplits)) {
-            combine(block);
-            lean_publish(a.pub, a.pub.tiles);  // one arrival per finished 128-output tile (STRIX_MM_XB_PUBLISH)
+        if constexpr (!PartialOnly) {
+            const unsigned block = cg * W / 8;
+            if (last_arrival(a.dn4_counter(block), (dp->count + 1) * (8 / W) * kDownSplits)) {
+                down4_combine<W>(a, dp, block);
+                lean_publish(a.pub, a.pub.tiles);
+            }
         }
     }
 }
@@ -1124,6 +1140,11 @@ Args make_args(const MoeView& v) {
     if (interleave != nullptr && std::string(interleave) != "0" && std::string(interleave) != "1")
         throw std::invalid_argument("STRIX_MMX_MOE_GU_INTERLEAVE must be 0 or 1");
     a.interleave_gu = route::moe_interleave(a.rows, interleave != nullptr && std::string(interleave) == "1");  // default 1 via mm_defaults
+    const char* down = std::getenv("STRIX_MMX_MOE_DOWN_SPLIT");
+    if (down != nullptr && std::string(down) != "0" && std::string(down) != "1" && std::string(down) != "2")
+        throw std::invalid_argument("STRIX_MMX_MOE_DOWN_SPLIT must be 0, 1 or 2");
+    // default 1 via mm_defaults (measured regime only, see route::moe_down_split); read per call
+    a.down_split = down == nullptr ? 0U : static_cast<unsigned>(down[0] - '0');
     a.pub.tiles = kHidden / 128U;  // down4 combine finishers: one per 128-output tile (both wide and narrow forms)
     return a;
 }
@@ -1179,6 +1200,7 @@ template <int MaxR, int Depth> void launch_experts(const Args& a, hipStream_t st
     if (marks != nullptr) (void)hipEventRecord(marks[1], stream);
     hipLaunchKernelGGL((down_kernel<MaxR, Depth>), dim3(kOutBlocks, kMaxSlots + 1), dim3(256), 0, stream, a);
     launched("down");
+    if (a.down_done != nullptr) (void)hipEventRecord(a.down_done, stream);
 }
 template <int MaxR, int Depth> void launch_experts3(const Args& a, hipStream_t stream, hipEvent_t* marks) {
     hipLaunchKernelGGL((gate_up3_kernel<MaxR, Depth>), dim3(kInterBlocks, kMaxSlots + 1, 2), dim3(256), 0, stream, a);
@@ -1186,6 +1208,7 @@ template <int MaxR, int Depth> void launch_experts3(const Args& a, hipStream_t s
     if (marks != nullptr) (void)hipEventRecord(marks[1], stream);
     hipLaunchKernelGGL((down3_kernel<MaxR, Depth>), dim3(kOutBlocks, kMaxSlots + 1), dim3(256), 0, stream, a);
     launched("down3");
+    if (a.down_done != nullptr) (void)hipEventRecord(a.down_done, stream);
 }
 template <int Depth> void launch_experts3_rows(const Args& a, hipStream_t stream, hipEvent_t* marks) {
     if (a.rows == 1) launch_experts3<1, Depth>(a, stream, marks);
@@ -1238,9 +1261,21 @@ void launch_experts4_grid(const Args& input, hipStream_t stream, hipEvent_t* mar
                        gu_grid, dim3(32 * W), 0, stream, a);
     launched("gate_up4");
     if (marks != nullptr) (void)hipEventRecord(marks[1], stream);
-    hipLaunchKernelGGL((down4_kernel<MaxR, Depth, W, DepthBig, Wide, Single>),
-                       dim3(dn_groups * kDownSplits, kMaxSlots + 1), dim3(32 * W), 0, stream, a);
-    launched("down4");
+    if (route::moe_down_split(a.down_split, a.rows, Wide, W, Depth)) {
+        // Same producers and scratch addresses, without any U-wide arrival counters or finish epilogue.
+        hipLaunchKernelGGL((down4_kernel<MaxR, Depth, W, DepthBig, Wide, Single, true>),
+                           dim3(dn_groups * kDownSplits, kMaxSlots + 1), dim3(32 * W), 0, stream, a);
+        launched("down4 partials");
+        if (a.down_done != nullptr) (void)hipEventRecord(a.down_done, stream);
+        // Stream ordering makes all partial stores visible; no spin, fences or producer counters needed.
+        hipLaunchKernelGGL(down4_combine_kernel, dim3(kOutBlocks), dim3(128), 0, stream, a);
+        launched("down4 combine");
+    } else {
+        hipLaunchKernelGGL((down4_kernel<MaxR, Depth, W, DepthBig, Wide, Single>),
+                           dim3(dn_groups * kDownSplits, kMaxSlots + 1), dim3(32 * W), 0, stream, a);
+        launched("down4");
+        if (a.down_done != nullptr) (void)hipEventRecord(a.down_done, stream);
+    }
 }
 
 template <int MaxR, int Depth, int W, int DepthBig, bool SkipShared = false>
@@ -1360,8 +1395,9 @@ void check_moe_single_resources() {
     check_single_depth<4>();
 }
 
-void enqueue_experts(const MoeView& v, hipStream_t stream, hipEvent_t* marks) {
-    const Args a = make_args(v);
+void enqueue_experts(const MoeView& v, hipStream_t stream, hipEvent_t* marks, hipEvent_t down_done) {
+    Args a = make_args(v);
+    a.down_done = down_done;
     if (moe_version() == 4) {
         if (marks != nullptr) (void)hipEventRecord(marks[0], stream);
         switch (moe_depth3()) {
@@ -1397,11 +1433,12 @@ template <int Depth> void launch_overlap4_rows(const Args& a, hipStream_t stream
     else launch_overlap4<8, Depth>(a, stream, marks);
 }
 
-void enqueue_moe_profiled(const MoeView& v, hipStream_t stream, hipEvent_t* marks) {
+void enqueue_moe_profiled(const MoeView& v, hipStream_t stream, hipEvent_t* marks, hipEvent_t down_done) {
     if (v.pub.flag != nullptr && !(moe_overlap() == 1 && v.h == nullptr && moe_version() == 4 && moe_waves() == 4))
         throw std::logic_error("minimax moe: the publish epilogue needs the decode overlap form (v4, 4 waves)");
     if (moe_overlap() == 1 && v.h == nullptr && moe_version() == 4 && moe_waves() == 4) {
-        const Args a = make_args(v);
+        Args a = make_args(v);
+        a.down_done = down_done;
         switch (moe_depth3()) {
             case 8: launch_overlap4_rows<8>(a, stream, marks); break;
             case 12: launch_overlap4_rows<12>(a, stream, marks); break;
@@ -1410,7 +1447,7 @@ void enqueue_moe_profiled(const MoeView& v, hipStream_t stream, hipEvent_t* mark
         return;
     }
     enqueue_router(v, stream);
-    enqueue_experts(v, stream, marks);
+    enqueue_experts(v, stream, marks, down_done);
 }
 
 void enqueue_moe(const MoeView& v, hipStream_t stream) { enqueue_moe_profiled(v, stream, nullptr); }

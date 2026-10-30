@@ -23,7 +23,12 @@
 // The engine resolver supplies 1 for both switches; raw-library unset is 0 for both.
 // STRIX_MMX_MOE_SINGLE=1 enables the coalesced singleton reader: device dispatch selects it
 // only at N=8, U>=25, S>=18, nrows=1, K3, narrow W=4, Depth=4. Other slots use the existing reader in the same launch.
-// Both settings keep three launches in the overlap form; N<8, Depth=8/12 and wide/W=8 use the same kernels at SINGLE=0/1.
+// STRIX_MMX_MOE_DOWN_SPLIT (read per call; resolver default 1, raw-library unset 0) makes v4 down partial-only and runs
+// one stream-ordered finish/combine launch (48 CTAs), removing (U+1)*8 narrow / (U+1)*4 wide arrivals per output tile.
+// 1 = only the measured winning regime (route::moe_down_split: N=4, wide, W=4, Depth=4), 2 = every v4 down (diagnostic,
+// the B8 remeasure), 0 = off. It reuses the same scratch and ordered finish; only the combine launch publishes.
+// Without the split, both reader settings keep three overlap launches; N<8, Depth=8/12 and wide/W=8 use the same
+// kernels at SINGLE=0/1.
 // Contract: 16 gate/up splits, 4 down splits, ascending k tiles, both fdot2 chains, reduce4
 // offsets 2 then 1, ascending split sum, H128/scales, SwiGLU rounding, ascending-expert fmaf, then shared add.
 // The fused residual remains h+(p0+p1). Native/model/complete-workload qualification is still required.
@@ -121,12 +126,15 @@ struct MoeView {
 };
 // Throws std::invalid_argument on unsupported shapes (bits other than 3/5 for experts/shared, rows outside 1..8).
 void enqueue_moe(const MoeView& v, hipStream_t stream);
-// Profiling only: events after router/shared (or prepare), after routed gate/up. Same production launches.
-void enqueue_moe_profiled(const MoeView& v, hipStream_t stream, hipEvent_t* marks);
+// Profiling only: marks[0..1] after router/shared (or prepare), after routed gate/up. Optional down_done after
+// partial production (before the separate combine when DOWN_SPLIT=1; after fused down+combine otherwise).
+// Same production launches; a fused path has no independently measurable combine stage.
+void enqueue_moe_profiled(const MoeView& v, hipStream_t stream, hipEvent_t* marks, hipEvent_t down_done = nullptr);
 // Pieces of enqueue_moe (for the microbenchmark and for a caller that overlaps them with other work).
 void enqueue_router(const MoeView& v, hipStream_t stream);
-// prepare + gate_up + down; marks (optional, 2 events): recorded after prepare and after gate_up (profiling).
-void enqueue_experts(const MoeView& v, hipStream_t stream, hipEvent_t* marks = nullptr);
+// prepare + gate_up + down (+ combine when split); marks (optional, 2 events): after prepare and gate_up.
+// Optional down_done has the same boundary as enqueue_moe_profiled.
+void enqueue_experts(const MoeView& v, hipStream_t stream, hipEvent_t* marks = nullptr, hipEvent_t down_done = nullptr);
 const Dispatch* moe_dispatch(const MoeWorkspace& ws);        // device pointer
 
 // ---------------------------------------------------------------- router for many rows (prefill chunks)
