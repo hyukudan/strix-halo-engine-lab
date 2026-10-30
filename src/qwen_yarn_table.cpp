@@ -1,3 +1,4 @@
+#include "strix/startup_markers.hpp"
 #include "strix/qwen_yarn_table.hpp"
 #include "strix/model_content_hash.hpp"
 #include <algorithm>
@@ -94,7 +95,8 @@ void generate_qwen_yarn_rows(const RotaryDescriptor& d, std::uint32_t first,
     std::vector<YarnRow> rows(std::min<std::size_t>(chunk_rows, end - first));
     while (first < end) {
         const auto count = static_cast<std::uint32_t>(std::min<std::size_t>(rows.size(), end - first));
-        for (std::uint32_t i = 0; i < count; ++i) rows[i] = row(d, frequencies, first + i);
+        { startup::Phase marker("rotary_generate", first);
+          for (std::uint32_t i = 0; i < count; ++i) rows[i] = row(d, frequencies, first + i); }
         consume(first, std::span<const YarnRow>(rows.data(), count));
         first += count;
     }

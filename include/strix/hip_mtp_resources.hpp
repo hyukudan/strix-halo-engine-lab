@@ -11,6 +11,7 @@
 
 namespace strix {
 class HipSetupQuiescenceGuard;
+class HipQsaCommittedPool;
 struct MtpSharedTargetBinding;
 struct MtpDeviceView {
     std::uintptr_t address=0;
@@ -94,6 +95,8 @@ public:
     [[nodiscard]] void* stream() const noexcept;
     // Full source census/binding admission at each native entry boundary.
     void validate() const;
+    void attach_qsa_pool(std::shared_ptr<HipQsaCommittedPool>);
+    [[nodiscard]] const std::shared_ptr<HipQsaCommittedPool>& qsa_pool() const noexcept;
     class NativeValidationScope {
     public:
         ~NativeValidationScope();

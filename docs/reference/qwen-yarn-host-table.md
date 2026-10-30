@@ -1,6 +1,6 @@
-# Qwen host YaRN table contract (experimental)
+# Qwen host YaRN table contract (opt-in)
 
-The plain serial CLI accepts experimental static YaRN with explicit
+The plain serial CLI accepts opt-in static YaRN with explicit
 `--rope-yarn 2|4` (or `STRIX_QWEN_ROPE_YARN=2|4`) and explicit `--context C`,
 where `262144 < C <= 262144*factor`. Equal CLI/environment values agree;
 conflicting non-off factors refuse. CLI `--rope-yarn off` overrides the environment.
@@ -22,7 +22,7 @@ Measured single-needle retrieval with the plain command (synthetic filler, one s
 
 A single-needle pass is a capability check, not an accuracy rate. Model-fidelity and complete-workload qualification are
 not done; 1,048,576 tokens is not demonstrated: prefill time grows faster than linearly
-(476 s at 520,000 tokens), and a 1M prompt needs resumable, segmented prefill, which this mode does not provide. Admission depends on the PLE pages
+(476 s at 520,000 tokens). These retrieval checks do not qualify a complete 1M workload. Admission depends on the PLE pages
 a prompt touches: the measured runs used synthetic filler, and diverse text at
 the same length touches more pages and can be refused.
 
@@ -41,7 +41,8 @@ empty and unchanged. Qwen HTTP `/v1/capabilities` declares native rotary at
 server scope and YaRN unsupported (`CLI-only`). Both HTTP factories publish
 that same contract. The table is uploaded once and retained by all launcher readers.
 
-Only the eager plain serial route is admitted. MTP, HTTP, teacher scoring,
+The eager plain serial route and explicitly pinned MTP route are
+admitted subject to their separate resource/asset gates. HTTP, teacher scoring,
 graph capture, alternative KV storage, unaudited execution environment controls,
 cache/replay/recording and explicit
 low-level execution routes refuse with named reasons. No request field may
@@ -52,6 +53,74 @@ continues to enforce `C<=262144` before resolver or inspection, including with
 historical zero-context and above-model sizing behavior (for example,
 `strix-memory-plan --tokens 524288` returns JSON). Its capacity bound applies
 only when an explicit YaRN descriptor/table is present.
+
+The explicit MTP route is a capacity-bound opt-in. The following
+1M f4 candidate changes storage scheduling only: H1024, 256 MiB source cap,
+256 score-ring rows, production PIPE255 (unset), Q4 retained and M1 enabled.
+It preserves the pinned profile pair, T8192/tails, depth 7, calibration 16,
+R2/R4/R8 windows and all immutable asset/policy pins. It is a CPU-admitted
+candidate; compiler success and modeled spare do not establish device exactness,
+physical pressure, model fidelity or complete-workload qualification.
+
+Use relative assets (`MODEL=assets/MODEL.gguf`, `SIDECAR=assets/SIDECAR.gguf`,
+`GOLDEN=assets/C1048576-f4.golden`, `DRAFT_VOCAB=assets/draft-vocab.u32`,
+`PROMPT_1048320_IDS=assets/prompt-1048320.ids`). Fill the remaining provenance,
+policy and error-bound variables from the independently verified asset bundle;
+the v3 golden must match capacity, rotary table and profile identities.
+
+```bash
+unset STRIX_QWEN_YARN_HOST_RESERVE STRIX_PREFILL_PIPE # production PIPE defaults to 255
+STRIX_PLE_RECLAIMABLE=1 STRIX_PLE_ROLLING=1 \
+STRIX_PLE_ROLLING_POSITIONS=1024 STRIX_PLE_ROLLING_CAP_BYTES=268435456 \
+STRIX_QSA_SCORE_RING_ROWS=256 STRIX_QSA_MTP_POOL=1 \
+STRIX_MTP_DRAFT_Q4_ALL=1 \
+strix-hip-decode-token "$MODEL" --prompt-ids "$PROMPT_1048320_IDS" \
+  --rope-yarn 4 --context 1048576 --generate 256 --mtp \
+  --mtp-sidecar "$SIDECAR" --mtp-sidecar-logical-name "$SIDECAR_LOGICAL_NAME" \
+  --mtp-sidecar-sha256 "$SIDECAR_SHA256" --mtp-target-sha256 "$TARGET_SHA256" \
+  --mtp-target-content "$TARGET_CONTENT" \
+  --mtp-source-repository "$SOURCE_REPOSITORY" --mtp-source-revision "$SOURCE_REVISION" \
+  --mtp-source-path "$SOURCE_PATH" --mtp-converter-sha256 "$CONVERTER_SHA256" \
+  --mtp-norm-converter-sha256 "$NORM_CONVERTER_SHA256" --mtp-converter-revision "$CONVERTER_REVISION" \
+  --mtp-conversion effective-norm-embedding-first-v1 \
+  --mtp-normalized-rounding bf16-rne --mtp-projection-rounding bf16-rne \
+  --mtp-sidecar-residency register --mtp-sidecar-bytes 2786568256 \
+  --mtp-header-bytes 33554432 --mtp-sidecar-retained-bytes 3221225472 \
+  --mtp-sidecar-setup-bytes 4294967296 --mtp-golden "$GOLDEN" --mtp-golden-sha256 "$GOLDEN_SHA256" \
+  --mtp-golden-max-bytes 6442450944 --mtp-replay-host-bytes 6442450944 \
+  --mtp-runtime-bytes 2418528231 --mtp-target-capture-bytes 16777216 \
+  --mtp-policy-id "$POLICY_ID" --mtp-max-hidden-error "$MAX_HIDDEN_ERROR" \
+  --mtp-max-logit-error "$MAX_LOGIT_ERROR" --mtp-spec-min-p "$SPEC_MIN_P" \
+  --mtp-calibration-rows 16 --mtp-draft-chain --mtp-draft-vocab "$DRAFT_VOCAB" \
+  --mtp-draft-context-vocab 4096 --mtp-draft-q4 --mtp-candidate-depth 7 \
+  --mtp-target-window-rows 8 --mtp-target-window-rows-set 2,4,8 \
+  --mtp-window-prefix --mtp-window-hyper-mix --mtp-window-qsa-rows \
+  --mtp-window-expert-union --mtp-window-expert-union-bytes 65536 \
+  --mtp-window-arena-bytes 2147483648 --mtp-window-capture-bytes 67108864 \
+  --mtp-window-checkpoint-bytes 8589934592 --mtp-window-total-bytes 17179869184 \
+  --mtp-window-history-intervals 8192
+```
+
+The production estimator's synthetic metadata fixture uses target backing
+111334654400 B, sidecar 2786568256 B, Q8-convertible payload 2745937920 B,
+32768 draft IDs plus 4096 context IDs, and P1048320/C1048576/G256. The complete
+rolling owner is charged in every applicable phase; verified credit is counted
+once. Against the conservative usable ceiling 127473287168 B, the spare is:
+
+| Phase | Spare B | Spare decimal GB |
+|---|---:|---:|
+| Setup | 5689874725 | 5.689875 |
+| Calibration | 2362357721 | 2.362358 |
+| Prompt | 552951069 | 0.552951 |
+| Decode | 5546445949 | 5.546446 |
+| Drain | 5546445949 | 5.546446 |
+
+The CPU fixture asserts admission at T8192 and at least 500000000 B spare per
+phase. It injects success-verified credit for sizing; runtime must verify the
+actual backing, fresh drop and physical/GTT/owner observations. MemAvailable
+is never increased by credit. Required full-token/logit/state and MTP cache/held
+hidden comparisons precede timing claims. Serial retains its independently
+resolved storage defaults. This candidate does not make YaRN or f4 MTP automatic.
 
 Environment classification applies equally to automatic defaults and explicit
 values, including off switches and masks. It classifies the complete resolved
@@ -75,8 +144,9 @@ subject to their normal kernel/shape/resource checks.
 | `STRIX_QPF2K_MOE_ROUTE` | No | Expert routing |
 | `STRIX_QPF2K_MOE_DEFAULTED` | No | Two-bit MoE provenance mask; both defaults produce `3` |
 | `STRIX_PLE_RECLAIMABLE` | No | Page reclaim |
+| `STRIX_STARTUP_MARKERS` | No | Optional monotonic startup diagnostics (`0`/`1`) |
 | `STRIX_INTPREFILL_DENSE_ROWS` | No | Projection row grouping |
-| `STRIX_PREFILL_PIPE` | No | Pipeline scheduling, row dispatch and embedding copies; MTP remains excluded |
+| `STRIX_PREFILL_PIPE` | No | Pipeline scheduling, row dispatch and embedding copies |
 | `STRIX_QSA_ATTEND_BATCH` | No | Selection/attention on already rotated inputs |
 | `STRIX_QSA_SCORE_PARK` | No | Scoring already rotated pooled keys |
 | `STRIX_QSA_INDEX_ROWS` | No | Index projection batching |
@@ -117,6 +187,25 @@ Other schedule values, including unset with default injection disabled, refuse
 by name; native scheduling is unchanged. The
 inventory covers merged primary CSR and the pruned tail owners for schedule 12.
 
+`STRIX_STARTUP_MARKERS=1` emits stderr lines of the form
+`strix-startup-marker phase=PHASE event=EVENT monotonic_ms=MS chunk=N`.
+The monotonic origin is initialized before main; paired `begin`/`end` events
+cover preflight reset, first HIP guard, rotary allocation/generation/upload,
+plan compilation, registration, PLE hash/drop and credit verification.
+Generation/upload are measured separately per bounded rotary chunk (`N` is
+its first row); registration uses the file byte offset. `first_prefill_tile`
+uses `submit`, and `first_token` uses `ready`, each once per process. Marker
+output is serialized, contains no paths or tokens, and does not synchronize
+HIP. Unset/`0` emits no marker bytes. Diagnostic timings are host call spans,
+not device kernel durations or a claim of recovered startup time.
+
+Pre-device PLE setup verifies authority, direct-reader probes and the page drop
+without starting reader workers, prompt hints, a rolling pipeline or staging.
+The preflight owner is released before HIP setup. Runtime performs a fresh
+post-registration drop/credit verification before activating prompt work;
+failed verification still earns no credit and follows the existing refusal or
+zero-credit admission policy.
+
 Execution order is environment classification, host admission, table upload,
 then execution. `--print-effective-config` stops after host admission and emits
 its complete owner/limit block, including a memory refusal when applicable;
@@ -126,12 +215,25 @@ memory admission or establish model fidelity.
 Admission compiles T=8192,4096,2048 in one numerical lineage. It reports target
 KV/raw index, recurrent and convolution state, host state/shadow/alignment,
 model backing, rotary table, shared and slab pool bounds, launcher scratch,
-compiled workspace/tails, metadata, PLE staging and runtime payload. It reserves
-an additional 8 GiB for host/allocator/driver peaks. The shared prefill pool is counted once across layers; window/slab routes
+compiled workspace/tails, metadata, PLE staging and runtime payload. The additional
+internal host reserve defaults to zero; `STRIX_QWEN_YARN_HOST_RESERVE=1` restores
+the previous 8 GiB charge in both admission and runtime (only `0` and `1` are accepted).
+The independent 4 GiB physical margin remains binding. Both reserve modes run
+a host MemAvailable watchdog, sampling `/proc/meminfo` every 100 ms. Below 2 GiB
+(strictly), or if the observation becomes unreadable, it latches a stop. The next
+completed tile, calibration row or decode cycle boundary raises an error; no
+further generated output is published. In-flight work drains during owner cleanup.
+The process exits nonzero with `stop_reason: yarn-memory-watchdog` and a
+`yarn_memory_watchdog` receipt containing the threshold, minimum, trip observation,
+sample count and accumulated read time. Successful execution includes the same
+receipt with `tripped: false`; inspection does not start a watchdog. Polling cannot
+guarantee survival of an abrupt allocation or another process exhausting memory
+between observations. The shared prefill pool is counted once across layers; window/slab routes
 are excluded. Launcher and staging owners use conservative payload bounds. Required bytes must fit the observed total UMA
 ceiling, incremental MemAvailable and GTT headroom; MemAvailable is never
 increased by PLE credit. Only a successful page drop verified with mincore
-earns credit. Inspection may perform that CPU-only drop. After registration,
+earns credit. Inspection can report a provisional zero-credit refusal; it does
+not run the pre-device verification callback. After registration,
 credit and available headroom are checked again before state allocation.
 A refusal lists owners, verified credit, limits and the smallest T tried.
 There is no context shrink, KV8 substitution or native fallback.

@@ -1,8 +1,23 @@
 #pragma once
 #include <cstdint>
 #include <span>
+#include <memory>
+#include <stdexcept>
+#include "strix/model_runtime_binding.hpp"
 
 namespace strix {
+struct MtpQ4SourceIdentity {
+    std::shared_ptr<const void> owner;
+    std::uint64_t generation=0,elements=0;
+    ModelContentIdentity content;
+};
+inline void require_same_mtp_q4_source(const MtpQ4SourceIdentity& retained,const MtpQ4SourceIdentity& requested) {
+    if(!requested.owner || !requested.generation || !requested.content.valid() ||
+       retained.owner.get()!=requested.owner.get() || retained.generation!=requested.generation ||
+       retained.elements!=requested.elements || retained.content!=requested.content)
+        throw std::invalid_argument("MTP Q4 source generation/content/owner changed");
+}
+
 // Draft-only MTP MoE for the canonical Q8_0 sidecar (hidden 2560, intermediate
 // 640, 512 experts, top-10 plus shared expert). Two launches replace the
 // per-slot generic kernels: (1) gate+up+SiLU for the 10 routed slots and the
@@ -49,7 +64,8 @@ void launch_hip_mtp_fast_moe_rows(std::span<const HipMtpFastMoeViews> views,void
 // Draft-only Q4_0 copy of a Q8_0 tensor (elements % 32 == 0), converted on `stream` with the
 // draft head's rule and kept for the process. The draft GEMV, fast MoE and fused input
 // projection read the copy whenever every tensor they need has one.
-void register_hip_mtp_draft_q4(const void* q8,std::uint64_t elements,void* stream);
+void register_hip_mtp_draft_q4(const void* q8,std::uint64_t elements,void* stream,
+    std::shared_ptr<const void> source_owner={},std::uint64_t generation=0,ModelContentIdentity content={});
 const void* hip_mtp_draft_q4(const void* q8) noexcept;
 // Raw MTP HC mix (hidden 2560, 4 streams, rank 320, Q8 down/up, F32 norm): exact
 // staged path (inject Q8 [4][10240]) or draft split-K/lane-chain path (inject F32

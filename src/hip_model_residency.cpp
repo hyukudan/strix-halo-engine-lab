@@ -1,3 +1,4 @@
+#include "strix/startup_markers.hpp"
 #include "strix/hip_model_residency.hpp"
 #include "strix/hip_setup_quiescence.hpp"
 #include "strix/hip_launch_context.hpp"
@@ -686,6 +687,7 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                         std::uintptr_t>(
                             range.begin);
 
+                startup::Phase registration_marker("registration_chunk", range.begin);
                 check_hip(
                     selective_enabled ? selective_register(reinterpret_cast<void*>(host), static_cast<std::size_t>(bytes)) :
                     hipHostRegister(reinterpret_cast<void*>(host), static_cast<std::size_t>(bytes), model_register_flags()),

@@ -1,4 +1,6 @@
 #include "strix/hip_mtp_resources.hpp"
+#include "strix/mtp_payload_geometry.hpp"
+#include "strix/hip_indexed_attention_launcher.hpp"
 #include "strix/hip_qwen_rotary_table.hpp"
 #include "strix/mtp_sidecar_binding.hpp"
 #include "strix/hip_generation_output.hpp"
@@ -20,13 +22,9 @@ namespace {
 constexpr std::size_t buffer_count=static_cast<std::size_t>(HipMtpBuffer::count);
 void require(bool ok,const char* message) {if(!ok) throw std::invalid_argument(message);}
 void check(hipError_t e,const char* message) {if(e!=hipSuccess) throw std::runtime_error(message);}
-std::uint64_t add(std::uint64_t a,std::uint64_t b) {
-    if(b>UINT64_MAX-a) throw std::overflow_error("MTP allocation sum overflows");return a+b;
-}
 std::uint64_t mul(std::uint64_t a,std::uint64_t b) {
     if(a && b>UINT64_MAX/a) throw std::overflow_error("MTP allocation product overflows");return a*b;
 }
-std::uint64_t align256(std::uint64_t n) {return add(n,255U)&~std::uint64_t{255U};}
 bool same(const RuntimeTensorBinding& a,const RuntimeTensorBinding& b) {
     return a.tensor_index==b.tensor_index && a.storage==b.storage && a.address==b.address &&
         a.bytes==b.bytes && a.allocation_generation==b.allocation_generation && a.owner_node==b.owner_node;
@@ -53,6 +51,7 @@ struct HipMtpResources::Impl {
     std::optional<const MtpNativeTensorViews> tensors;
     std::optional<const HipMtpBudget> budget;
     HipMtpReservation reservation;
+    std::shared_ptr<HipQsaCommittedPool> qsa_pool;
     IndexedAttentionWorkspaceLayout attention;
     std::array<MtpDeviceView,buffer_count> views{};
     MtpDraftStateMemoryBinding state;
@@ -102,6 +101,12 @@ struct HipMtpResources::Impl {
 };
 HipMtpResources::HipMtpResources():impl_(std::make_unique<Impl>()) {}
 HipMtpResources::~HipMtpResources()=default;
+void HipMtpResources::attach_qsa_pool(std::shared_ptr<HipQsaCommittedPool> pool) {
+    require_idle();require(!impl_->qsa_pool,"MTP QSA pool attaches once before execution");
+    if(pool) pool->bind_domain(true,impl_->shared.sidecar_model_content_identity,impl_->plan->plan_identity);
+    impl_->qsa_pool=std::move(pool);
+}
+const std::shared_ptr<HipQsaCommittedPool>& HipMtpResources::qsa_pool() const noexcept {return impl_->qsa_pool;}
 std::shared_ptr<HipMtpResources> HipMtpResources::create(const ModelContract& model,const CompiledMtpDraftPlan& plan,
     const ModelManifest& sidecar_manifest,std::shared_ptr<const HipModelResidency> sidecar,
     const ModelManifest& target_manifest,std::shared_ptr<const HipModelResidency> target,
@@ -114,7 +119,7 @@ std::shared_ptr<HipMtpResources> HipMtpResources::create(const ModelContract& mo
     require(model.validate().empty() && model.mtp_full_attention_layers==1U,"MTP native owner requires one explicit sidecar attention layer");
     require(model.hidden_size<=4096U && model.hidden_size%32U==0U && (model.hc_count==2U || model.hc_count==4U) &&
         model.vocab_size<=UINT32_MAX,"MTP native owner geometry exceeds its explicit native profile");
-    require(budget.retained_bytes && budget.context_capacity && budget.context_capacity<=model.max_position_embeddings &&
+    require(budget.retained_bytes && budget.context_capacity && budget.context_capacity<=model.effective_max_positions() &&
         budget.context_capacity<=UINT32_MAX && budget.maximum_candidate_depth && budget.maximum_candidate_depth<=8U,"MTP native owner requires explicit bounded capacity/depth/budget");
     const auto rounding=[](HipMtpInputRounding r) {return r==HipMtpInputRounding::fp32 || r==HipMtpInputRounding::bf16_rne;};
     require(rounding(budget.normalized_rounding) && rounding(budget.projection_rounding),"MTP native owner requires explicit cast boundaries");
@@ -142,25 +147,11 @@ std::shared_ptr<HipMtpResources> HipMtpResources::create(const ModelContract& mo
         require(tensor && runtime_tensor_gpu_visible(tensor->storage) && target->covers_device_range(tensor->address,tensor->bytes),
             "MTP shared target tensor is outside its actual retained GPU backing");
     }
-    const auto buffers=build_serial_execution_buffer_plan(model,{});
     const auto attention=build_indexed_attention_workspace_layout(model);
-    // The MTP head's own KV cache stays BF16 whatever the target's KV storage.
-    auto mtp_model=model;mtp_model.attention_kv_storage=AttentionKvStorage::bf16;
-    const auto state_layout=build_indexed_attention_state_layout(mtp_model);
-    const auto wide=mul(mul(model.hidden_size,model.hc_count),2U);
-    const auto input_scratch=hip_mtp_input_fusion_scratch_bytes(static_cast<std::uint32_t>(model.hidden_size),static_cast<std::uint32_t>(model.hc_count));
-    const std::array<std::uint64_t,buffer_count> sizes{wide,wide,0U,mul(model.hidden_size,2U),input_scratch,input_scratch,
-        wide,wide,buffers.hidden_bytes,buffers.hidden_bytes,buffers.hidden_bytes,buffers.injection_weight_bytes,buffers.route_index_bytes,buffers.route_weight_bytes,
-        buffers.hyper_workspace_bytes,attention.total_bytes,buffers.mlp_intermediate_bytes,mul(model.num_experts,4U),buffers.logits_bytes,
-        mul(budget.context_capacity,state_layout.kv_row_bytes),mul(budget.context_capacity,state_layout.raw_index_row_bytes),
-        0U,0U,8U};
-    std::array<std::uint64_t,buffer_count> offsets{};std::uint64_t bytes=0;
-    for(std::size_t i=0;i<buffer_count;++i) {
-        if(!sizes[i])continue; // retired checkpoint roles consume no padding/storage
-        bytes=align256(bytes);offsets[i]=bytes;bytes=add(bytes,sizes[i]);
-    }
-    const auto selector=HipGreedyOutput::required_scratch_bytes(static_cast<std::uint32_t>(model.vocab_size));
-    const auto retained=add(add(bytes,255U),selector);
+    const auto payload=mtp_payload::runtime(model,budget.context_capacity);
+    static_assert(buffer_count==std::tuple_size_v<decltype(payload.sizes)>);
+    const auto& sizes=payload.sizes;const auto& offsets=payload.offsets;
+    const auto bytes=payload.pool,selector=payload.reader,retained=payload.retained;
     require(retained<=budget.retained_bytes,"MTP actual pool plus finite-reader payload exceeds explicit budget");
     auto result=std::shared_ptr<HipMtpResources>(new HipMtpResources);auto& p=*result->impl_;
     p.guard=std::make_shared<HipSetupQuiescenceGuard>();p.allocator=std::move(allocator);p.sidecar=std::move(sidecar);p.target=std::move(target);

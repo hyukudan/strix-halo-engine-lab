@@ -758,8 +758,11 @@ Qwen's automatic profile is qualified at 8192 tokens; longer contexts run with `
 sweep reaches 262,143 tokens that way). A retrieval pilot with the default command found the needle in all 19
 cases from 8K to 262,143 tokens; that is a pilot, not a qualification
 ([long-context checks](docs/reproduce.md#long-context-retrieval-and-reasoning-checks-qwen)). Beyond 262,144 there is an
-experimental opt-in static YaRN mode (`--rope-yarn 2|4` with an explicit `--context`, plain CLI only; it changes outputs
-at every position and is off by default): [YaRN mode](docs/reference/qwen-yarn-host-table.md). DeepSeek's long-context limits are in
+opt-in static YaRN mode (`--rope-yarn 2|4` with an explicit `--context`, CLI only; it changes outputs
+at every position and is off by default). Within YaRN, `--mtp` speculative decode is exact against serial YaRN
+(explicit `--mtp`; factor 2 through 524,288 positions and factor 4 through 1,048,576, where the QSA MTP pool and
+rolling PLE are on by default - `STRIX_QSA_MTP_POOL=0` / `STRIX_PLE_ROLLING=0` turn each off; without `--mtp` YaRN
+stays serial): [YaRN mode](docs/reference/qwen-yarn-host-table.md). DeepSeek's long-context limits are in
 [docs/models/deepseek-v4.1/long-context.md](docs/models/deepseek-v4.1/long-context.md).
 
 **Where are the numbers from?**

@@ -54,9 +54,9 @@ int main() {
     for (const auto value : {"0", "1", "3", "NaN", "-2", "2.0", "2.5", "", "02"})
         rejects({"decoder", "model.gguf", "1", "--rope-yarn", value}, "must be off, 2 or 4");
     rejects({"decoder", "model.gguf", "1", "--rope-yarn", "2"}, "requires explicit --context");
-    for (const auto context : {"1", "262144", "524289"})
-        rejects({"decoder", "model.gguf", "1", "--rope-yarn", "2", "--context", context}, "262144 < context");
-    rejects({"decoder", "model.gguf", "1", "--rope-yarn", "4", "--context", "1048577"}, "262144 < context");
+    for (const auto context : {"524289"})
+        rejects({"decoder", "model.gguf", "1", "--rope-yarn", "2", "--context", context}, "0 < context");
+    rejects({"decoder", "model.gguf", "1", "--rope-yarn", "4", "--context", "1048577"}, "0 < context");
     rejects({"decoder", "model.gguf", "1", "--context", "262145", "--unqualified-context"}, "native rotary context");
     rejects({"decoder", "model.gguf", "1", "--rope-yarn", "2", "--context", "524288", "--baseline"}, "native rotary context");
     require(parse({"decoder","model.gguf","1","--rope-yarn","2","--context","8192","--baseline"}).rotary == native,
@@ -85,8 +85,9 @@ int main() {
         Env env("STRIX_QWEN_ROPE_YARN", "NaN");
         rejects({"decoder", "model.gguf", "1"}, "must be off, 2 or 4");
     }
-    rejects({"decoder","model.gguf","1","--rope-yarn","2","--context","300000","--mtp"},
-        "YaRN with MTP not yet qualified");
+    for(const auto c:{1U,32768U,131072U,262144U,262145U,524288U})
+        require(validate_qwen_rotary_request(2,true,c,false)==two,"explicit short/cross-native f2 geometry");
+    require(validate_qwen_rotary_request(4,true,1048576,false)==four,"f4 final extent");
     rejects({"decoder","model.gguf","1","--rope-yarn","2","--context","300000","--http-serve"},
         "YaRN on HTTP serving not supported");
     rejects({"decoder","model.gguf","1","2","--rope-yarn","2","--context","300000","--teacher-forced-score","--generate","1"},

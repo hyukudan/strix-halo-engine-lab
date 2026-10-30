@@ -84,7 +84,8 @@ CompiledKnownPrefixPrefill compile_known_prefix_prefill(const ModelContract& mod
         plan.external_qsa_score_bytes=build_indexed_attention_workspace_layout(model).block_scores_bytes;
         // Effective positions (YaRN extends them), as the block-score layout and the serial validation use.
         const QsaScoreRingGeometry geometry(model.effective_max_positions(),model.indexer_compress_ratio,
-            qsa_score_ring_rows_override(std::getenv("STRIX_QSA_SCORE_RING_ROWS")));
+            request.qsa_score_ring_rows ? request.qsa_score_ring_rows :
+                qsa_score_ring_rows_override(std::getenv("STRIX_QSA_SCORE_RING_ROWS")));
         plan.qsa_score_ring_rows=geometry.rows;
         plan.qsa_score_ring_workspace_bytes=geometry.total_bytes();
     }

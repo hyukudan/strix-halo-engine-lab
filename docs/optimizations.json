@@ -5,7 +5,7 @@
     "flag_or_env": "STRIX_MTP_JOINT_PLAN; STRIX_MTP_JOINT_RULE_FILE",
     "default": "calibrated-c3 when STRIX_MTP_BATCH_JOINT=1: calibrated at >=3 members, production at 1-2",
     "exact": "Schedule-only predictor acceptance estimate; existing target verification unchanged. Complete token IDs identical in measured in-process A/B; no additional logits/state digest claim. CPU parsing, precedence and cohort threshold tests.",
-    "gain": "Calibrated versus production, median wall aggregate throughput: C4 +2.3–3.1% (prose1k/prose8k/code1k), C2 -1.0 to -1.4%, C8 +0.55% (16 bracketed code1k/prose1k pairs, 11/16 positive). Gated default retains production at C2; no measured C3 gain claim.",
+    "gain": "Calibrated versus production, median wall aggregate throughput: C4 +2.3\u20133.1% (prose1k/prose8k/code1k), C2 -1.0 to -1.4%, C8 +0.55% (16 bracketed code1k/prose1k pairs, 11/16 positive). Gated default retains production at C2; no measured C3 gain claim.",
     "preconditions": "Joint native HTTP batch windows enabled. Count members in the joint plan group at plan time, before drafting; independent of slot capacity and physical rows. In-process A/B uses identical controller snapshot/restore state. Explicit rules override defaults, including baseline.",
     "off_switch": "STRIX_MTP_JOINT_PLAN=production or =0 restores the previous rule. --baseline / STRIX_BASELINE=1 defaults to production. Explicit calibrated applies at every group size; STRIX_MTP_BATCH_JOINT=0 disables joint windows.",
     "doc_anchor": "docs/engine/scheduling/joint-serving-windows.md#joint-plan-rule"
@@ -140,10 +140,10 @@
     "name": "PLE page reclaim and prefetch admission",
     "flag_or_env": "STRIX_PLE_RECLAIMABLE=auto",
     "default": "auto",
-    "exact": "Page contents are unchanged; long-context token/logit digest evidence applies to the admitted non-GSQ identity. GSQ page-drop behavior is not qualified by these results.",
+    "exact": "Stored rows, IQ4_NL decoding, BF16 conversion and staging offsets are unchanged. CPU byte equality covers 200,000-position plain and MTP prefill/decode streams with the source mapping protected against reads. Native GPU token/logit/state and complete-workload qualification remain required for O_DIRECT rolling; GSQ page-drop behavior is not qualified.",
     "gain": "Capacity admission for T8192 at 128K/262K; no isolated speed attribution",
-    "preconditions": "Linux, nonempty plain CLI prompt, tiled known prefill, registered file mapping, no model copies or graph promotion, no MTP/cohort/serving/planned PLE IO. Exactly one file-backed IQ4_NL/BF16 n-gram table, valid extents and unregistered interior pages, valid prompt hashes, and a verified page drop within the existing residual bound.",
-    "off_switch": "STRIX_PLE_RECLAIMABLE=0",
+    "preconditions": "Linux, nonempty plain CLI prompt, tiled known prefill, registered file mapping, one valid IQ4_NL/BF16 PLE table with unregistered interior pages, verified setup drop and supported O_DIRECT reads. No model copy/promotion, graph, cohort, HTTP/serving, session load/live/follow-up, fixed MTP session or planned PLE IO. Plain prefix-cache restore/import and follow-up prompt routes retain the public prompt-wide planner; numerical snapshots never retain rolling source leases. Eager MTP retains required assets, explicit turn leases and phase-owned critical-first asynchronous prompt lookahead/c1 staging, with original offsets and turn/epoch/offset-validated pinned views. Calibration and decode drain the prompt pipeline, including pending staging tasks. Adaptive R2/R4/R8 row sets and min-p are covered by complete physical-window source leases including padding within the fixed decode quota; rejection/replay reuses or re-fetches owned bytes. Depth/survival controllers, copy-wide rows, golden dump, metadata-only, recording and sampled timing schedules remain excluded with specific inactive reasons. Cost-adaptive min-p schedules remain unchanged and require native token/logit/state qualification. Rolling uses owned aligned buffers with a shared 3 GiB default STRIX_PLE_ROLLING_CAP_BYTES cap plus fixed 256 MiB decode LRU and margin; allocation and inspection share admission arithmetic and separately charge metadata. Raw Linux io_uring uses 512 outstanding reads, a dedicated submission/completion thread and at most 128 KiB coalesced runs, without liburing. Unsupported setup/opcode detection (ENOSYS/EPERM/EINVAL) selects the checked O_DIRECT 32-thread pread fallback and reports its errno/backend. The setup helper completes each next-block read wave before later lookahead; critical demand promotes shared queued runs and pauses lookahead dispatch until critical completion. Small caps split ordered waves. STATS includes per-block critical bytes, completion-span application IOPS/MB/s and completed lookahead bytes. Plain c1/lookahead retains its original chunks and offsets, splitting/throttling under cap pressure. No rolling hot-path madvise/fadvise/mincore; table-wide residency is observed only at setup and drained request ends. Automatic setup failures tear down provisional owners, remove all credit and require fresh zero-credit resident admission before warming, retaining the MTP policy. Required mode refuses. Runtime read failures poison the source and exit nonzero; resident restart requires a fresh invocation.",
+    "off_switch": "STRIX_PLE_RECLAIMABLE=0 disables reclaim. STRIX_PLE_ROLLING=0 or STRIX_CTX_EXACT_MEMORY=0 restores the previous plain prompt-wide mmap path and MTP warm path, ignoring rolling tuning.",
     "doc_anchor": "docs/optimizations.md#qwen-l1"
   },
   {
@@ -152,7 +152,7 @@
     "flag_or_env": "STRIX_QPF2K_DEFAULTS",
     "default": "ON",
     "exact": "Tokens and terminal FP32 logits digests match the reference for the selected profile pair, including 32K/64K/128K/262K. Fast FP16 prefill is exact relative to its own reference, not bit-identical to dense-A8 serial prefill; longer-context fidelity remains outside the 8192 qualification.",
-    "gain": "Combined 32K 25.95 → 23.49 s (−9.5%); later 22.03 s is a separate measurement",
+    "gain": "Combined 32K 25.95 \u2192 23.49 s (\u22129.5%); later 22.03 s is a separate measurement",
     "preconditions": "Eligible tiled operators and selected numerical identity; the decoder resolver admits wrappers only for the single-session automatic route.",
     "off_switch": "STRIX_QPF2K_DEFAULTS=0 in a fresh process with individual overrides unset; --baseline / STRIX_BASELINE=1 additionally suppresses controlled explicit environment items and restores historical policy.",
     "doc_anchor": "docs/optimizations.md#qwen-defaults"
@@ -427,7 +427,7 @@
     "flag_or_env": "STRIX_QPF2K_SCORE_ROWS",
     "default": "auto (32 rows above 4096 blocks, 16 otherwise)",
     "exact": "Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.",
-    "gain": "≈ −1.6 s at 262K together with PLE row batching (~−10 ms at 32K); combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)",
+    "gain": "\u2248 \u22121.6 s at 262K together with PLE row batching (~\u221210 ms at 32K); combined five-item set \u22120.71 s (\u22123.2 %) at 32K vs all five off (interleaved, same build)",
     "preconditions": "Automatic decoder route (CLI), admitted tiled prefill; MTP/HTTP serving and cohorts keep it opt-in; not applied under GSQ.",
     "off_switch": "STRIX_QPF2K_SCORE_ROWS=0 (16 rows)",
     "doc_anchor": "docs/optimizations.md#qwen-qsa-score-rows"
@@ -438,7 +438,7 @@
     "flag_or_env": "STRIX_PREFILL_PLE_BATCH",
     "default": "1",
     "exact": "Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.",
-    "gain": "Included in the scorer figure above (−0.16 s raw kernel time at 262K); combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)",
+    "gain": "Included in the scorer figure above (\u22120.16 s raw kernel time at 262K); combined five-item set \u22120.71 s (\u22123.2 %) at 32K vs all five off (interleaved, same build)",
     "preconditions": "Automatic decoder route (CLI), admitted tiled prefill; MTP/HTTP serving and cohorts keep it opt-in; not applied under GSQ.",
     "off_switch": "STRIX_PREFILL_PLE_BATCH=0",
     "doc_anchor": "docs/optimizations.md#qwen-ple-batch"
@@ -449,7 +449,7 @@
     "flag_or_env": "STRIX_QPF2K_SHARED_PRE",
     "default": "1",
     "exact": "Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.",
-    "gain": "~−1 % TTFT at 32K; combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)",
+    "gain": "~\u22121 % TTFT at 32K; combined five-item set \u22120.71 s (\u22123.2 %) at 32K vs all five off (interleaved, same build)",
     "preconditions": "Automatic decoder route (CLI), admitted tiled prefill; MTP/HTTP serving and cohorts keep it opt-in; not applied under GSQ.",
     "off_switch": "STRIX_QPF2K_SHARED_PRE=0",
     "doc_anchor": "docs/optimizations.md#qwen-shared-pre"
@@ -460,7 +460,7 @@
     "flag_or_env": "STRIX_QPF2K_MOE_MC",
     "default": "1 (mode 1; mode 2 needs an explicit value)",
     "exact": "Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.",
-    "gain": "~−0.10 s at 32K; combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)",
+    "gain": "~\u22120.10 s at 32K; combined five-item set \u22120.71 s (\u22123.2 %) at 32K vs all five off (interleaved, same build)",
     "preconditions": "Automatic decoder route (CLI), admitted tiled prefill; MTP/HTTP serving and cohorts keep it opt-in; not applied under GSQ.",
     "off_switch": "STRIX_QPF2K_MOE_MC=0",
     "doc_anchor": "docs/optimizations.md#qwen-moe-merge-commit"
@@ -471,7 +471,7 @@
     "flag_or_env": "STRIX_QPF2K_MOE_HDR",
     "default": "1",
     "exact": "Bitwise: 32K terminal FP32 logits and 4K digests identical with the item on and off; golden-code and prose gates equal the archived base.",
-    "gain": "~−0.07 s at 32K; combined five-item set −0.71 s (−3.2 %) at 32K vs all five off (interleaved, same build)",
+    "gain": "~\u22120.07 s at 32K; combined five-item set \u22120.71 s (\u22123.2 %) at 32K vs all five off (interleaved, same build)",
     "preconditions": "Automatic decoder route (CLI), admitted tiled prefill; MTP/HTTP serving and cohorts keep it opt-in; not applied under GSQ.",
     "off_switch": "STRIX_QPF2K_MOE_HDR=0",
     "doc_anchor": "docs/optimizations.md#qwen-moe-header-reuse"
@@ -482,7 +482,7 @@
     "flag_or_env": "STRIX_QSA_UNION_MERGE",
     "default": "1 (from 49,152 blocks; range form below)",
     "exact": "Exact: union, score and decode fixtures byte-identical (score rows R16/R32/R64 to 262,144 blocks); at 262,143 tokens the 456-call QSA trace with these defaults is byte-identical to all levers off and the token matches; tokens identical at 32K/131K/262,080.",
-    "gain": "union kernel −46 % at 75K blocks, −73 % at 262K blocks",
+    "gain": "union kernel \u221246 % at 75K blocks, \u221273 % at 262K blocks",
     "preconditions": "Qwen QSA prefill from 49,152 blocks (about 196K tokens); below that the range form runs.",
     "off_switch": "STRIX_QSA_UNION_MERGE=0",
     "doc_anchor": "docs/optimizations.md#qwen-qsa-union-merge"
@@ -493,7 +493,7 @@
     "flag_or_env": "STRIX_QSA_DECODE_POOL",
     "default": "1 (plain append-only serial decode)",
     "exact": "FP32-pool qualification before the BF16 storage change: union, score and decode fixtures byte-identical (score rows R16/R32/R64 to 262,144 blocks); at 262,143 tokens the 456-call QSA trace with these defaults is byte-identical to all levers off and the token matches; tokens identical at 32K/131K/262,080.",
-    "gain": "With FP32 pools: plain serial CLI decode at 262K 75.7 → 53.0 ms/step (−30 %), at 131K −14.7 % (measured with decode selection also on; the default MTP/HTTP route does not use the pool yet)",
+    "gain": "With FP32 pools: plain serial CLI decode at 262K 75.7 to 53.0 ms/step (-30 %), at 131K -14.7 % (measured with decode selection also on; the separate MTP shared service has no measured gain)",
     "preconditions": "Plain append-only serial decode on the CLI route (not MTP, HTTP, prompt lookup, prefix round trip, the prefix state cache, serving prefixes or graphs). The pool's device memory is charged in admission and reported as `qsa_decode_pool_bytes`, with `qsa_decode_pool_key_bytes` (2 or 4). For B = floor(C / 4), the bytes are 12 x B x 128 x key_bytes + max(ceil(B / 4), 16384) x 4. Default BF16 totals at C = 262144 / 524288 / 1048576 are 201392128 / 402784256 / 805568512 bytes, including the maxima row.",
     "off_switch": "STRIX_QSA_DECODE_POOL=0",
     "doc_anchor": "docs/optimizations.md#qwen-qsa-decode-pool"
@@ -508,6 +508,17 @@
     "preconditions": "Same serial route as STRIX_QSA_DECODE_POOL; off under baseline, GSQ or STRIX_QPF2K_DEFAULTS=0. For B = floor(C / 4), bytes = 12 x B x 128 x 2 + max(ceil(B / 4), 16384) x 4. Receipts report qsa_decode_pool_bytes and qsa_decode_pool_key_bytes.",
     "off_switch": "STRIX_QSA_DECODE_POOL_BF16=0 (restore FP32 pool keys)",
     "doc_anchor": "docs/optimizations.md#qwen-qsa-decode-pool"
+  },
+  {
+    "engine": "qwen",
+    "name": "QSA MTP committed BF16 key service",
+    "flag_or_env": "STRIX_QSA_MTP_POOL",
+    "default": "1 (eligible native MTP CLI and YaRN f2 MTP CLI through 524288 and f4 through 1048576 positions; see seven-row route table)",
+    "exact": "Host frontier, admission and production lease tests; lossless BF16 word storage. Native device scorer and complete-workload qualification pending. YaRN 1M f4 prose matched all 256 tokens, every committed full-vocabulary logit digest, prompt/final target state and predictor state against serial YaRN and pool-off MTP. STRIX_QSA_MTP_POOL_CHECK=1 fails on pooled/raw score or selection differences.",
+    "gain": "No native latency or complete-workload gain claimed.",
+    "preconditions": "One thirteen-entry owner per session, shared by target R2/R4/R8 windows, serial fallback and predictor. Automatic scope is eligible native MTP CLI and explicit YaRN f2 MTP CLI through 524288 and f4 through 1048576 positions. Supported native HTTP/slots/nested/session/prefix-reuse M1 routes require STRIX_QSA_MTP_POOL=1. Both pool and rolling PLE default on in the admitted f2/f4 CLI bands; explicit =0 remains authoritative. Serial YaRN and eager CLI rolling defaults follow the seven-row table in docs/engine/qsa-committed-pool.md. Separate checked key/scratch/metadata reservation per HTTP slot. Baseline, GSQ, defaults-off, BF16=0, graph, hierarchical, wide and explicit cohort routes retain historical paths. Explicit YaRN CLI requires the shared retained table; YaRN HTTP remains closed.",
+    "off_switch": "STRIX_QSA_MTP_POOL=0 (historical MTP key paths, bytes and inspection)",
+    "doc_anchor": "docs/optimizations.md#qwen-qsa-mtp-pool"
   },
   {
     "engine": "qwen",
@@ -526,7 +537,7 @@
     "flag_or_env": "STRIX_QSA_SCORE_ROWS64",
     "default": "1 (from 65,536 blocks; per-group 64-row scoring follows the policy)",
     "exact": "Exact: union, score and decode fixtures byte-identical (score rows R16/R32/R64 to 262,144 blocks); at 262,143 tokens the 456-call QSA trace with these defaults is byte-identical to all levers off and the token matches; tokens identical at 32K/131K/262,080. R64 evidence is fixture-only: no native shape reaches 65,536 blocks.",
-    "gain": "scorer at 1M tokens R16 → R64 −42 %",
+    "gain": "scorer at 1M tokens R16 \u2192 R64 \u221242 %",
     "preconditions": "Scorer from 65,536 blocks, i.e. beyond the native 262,144-token context: no effect on native runs today.",
     "off_switch": "STRIX_QSA_SCORE_ROWS64=0",
     "doc_anchor": "docs/optimizations.md#qwen-qsa-score-rows64"
@@ -603,7 +614,7 @@
     "flag_or_env": "STRIX_DS41_ENGRAM_TP",
     "default": "on for steps of up to 8 rows",
     "exact": "Bitwise: R1-R8 verify windows with rejects equal the archived full-projection digests on both ranks; batch N1/N2/N4/N8 in-process A/B (fed, argmax, gathered logits per row and final attention states) identical, also on the communicator fallbacks.",
-    "gain": "R1 decode −0.61 ms/step (−2.1 %); verify windows (rank app, in-process ABA x4, every arm bitwise on both ranks, steps of up to 8 rows vs off): R1 −2.1 %, R2 −1.5 %, R4 −1.0 %, R6 −1.0 % (95 % intervals below zero), R8 −0.6 % (3/3 pairs faster)",
+    "gain": "R1 decode \u22120.61 ms/step (\u22122.1 %); verify windows (rank app, in-process ABA x4, every arm bitwise on both ranks, steps of up to 8 rows vs off): R1 \u22122.1 %, R2 \u22121.5 %, R4 \u22121.0 %, R6 \u22121.0 % (95 % intervals below zero), R8 \u22120.6 % (3/3 pairs faster)",
     "preconditions": "Two ranks with the F8 Engram KV (STRIX_DS41_F16_AS_F8); otherwise each rank runs the full projection.",
     "off_switch": "STRIX_DS41_ENGRAM_TP=0 (off), =r1 (single-row steps only)",
     "doc_anchor": "docs/optimizations.md#ds-engram-tp"
@@ -801,7 +812,7 @@
     "flag_or_env": "--dsrtxk",
     "default": "ON",
     "exact": "Replica gate pass, complete target-greedy token vectors and canonical state/position digests equal within the standalone Q2/Q8 identity; pressure and forced-window gates cover committed-prefix state.",
-    "gain": "All-hit 12.62 → 10.50 ms/token; full loop 5.8–10.8%",
+    "gain": "All-hit 12.62 \u2192 10.50 ms/token; full loop 5.8\u201310.8%",
     "preconditions": "Admitted Q2/Q8 standalone model and supported CUDA shapes.",
     "off_switch": "--dsrtxk-off",
     "doc_anchor": "docs/optimizations.md#rtx-kernels"
@@ -834,8 +845,8 @@
     "flag_or_env": "--router-pf",
     "default": "ON",
     "exact": "Replica gate pass, complete target-greedy token vectors and canonical state/position digests equal within the standalone Q2/Q8 identity; pressure and forced-window gates cover committed-prefix state.",
-    "gain": "R1 17.3 → 15.4 us; eight-layer device time −0.5%",
-    "preconditions": "Supported router rows 1–8.",
+    "gain": "R1 17.3 \u2192 15.4 us; eight-layer device time \u22120.5%",
+    "preconditions": "Supported router rows 1\u20138.",
     "off_switch": "--router-pf0",
     "doc_anchor": "docs/optimizations.md#rtx-router"
   },
@@ -845,7 +856,7 @@
     "flag_or_env": "--qakv-s1",
     "default": "ON",
     "exact": "Replica gate pass, complete target-greedy token vectors and canonical state/position digests equal within the standalone Q2/Q8 identity; pressure and forced-window gates cover committed-prefix state.",
-    "gain": "Eight-layer device time −1.54 to −1.94%",
+    "gain": "Eight-layer device time \u22121.54 to \u22121.94%",
     "preconditions": "Supported query/KV geometry.",
     "off_switch": "--qakv-auto",
     "doc_anchor": "docs/optimizations.md#rtx-qakv"
@@ -856,7 +867,7 @@
     "flag_or_env": "--q8-r1",
     "default": "ON",
     "exact": "Replica gate pass, complete target-greedy token vectors and canonical state/position digests equal within the standalone Q2/Q8 identity; pressure and forced-window gates cover committed-prefix state.",
-    "gain": "Eight-layer device time −0.80 / −0.53%",
+    "gain": "Eight-layer device time \u22120.80 / \u22120.53%",
     "preconditions": "Supported Q8 single-row shapes.",
     "off_switch": "--q8-r1-off; --q8-r1-pad selects padded form",
     "doc_anchor": "docs/optimizations.md#rtx-q8"
@@ -911,7 +922,7 @@
     "flag_or_env": "DG_LOAD_SERIAL",
     "default": "ON (unset)",
     "exact": "Replica gate pass, complete target-greedy token vectors and canonical state/position digests equal within the standalone Q2/Q8 identity; pressure and forced-window gates cover committed-prefix state.",
-    "gain": "Full loading 108.7 → 61.8 s in the published workload",
+    "gain": "Full loading 108.7 \u2192 61.8 s in the published workload",
     "preconditions": "Supported tierstream loader and model storage.",
     "off_switch": "DG_LOAD_SERIAL=1",
     "doc_anchor": "docs/optimizations.md#rtx-load"
@@ -922,7 +933,7 @@
     "flag_or_env": "--warmup-graphs",
     "default": "auto (0,8 in serve)",
     "exact": "Replica gate pass, complete target-greedy token vectors and canonical state/position digests equal within the standalone Q2/Q8 identity; pressure and forced-window gates cover committed-prefix state.",
-    "gain": "First 16 steps 56.05 → 33.99 ms/step",
+    "gain": "First 16 steps 56.05 \u2192 33.99 ms/step",
     "preconditions": "Persistent serve worker and supported graph sizes.",
     "off_switch": "--warmup-graphs none",
     "doc_anchor": "docs/optimizations.md#rtx-warmup"
@@ -933,7 +944,7 @@
     "flag_or_env": "--residency-seed; --residency-save",
     "default": "auto",
     "exact": "Replica gate pass, complete target-greedy token vectors and canonical state/position digests equal within the standalone Q2/Q8 identity; pressure and forced-window gates cover committed-prefix state.",
-    "gain": "Step 0 332.6 → 156.0 ms; first 16 steps −20%",
+    "gain": "Step 0 332.6 \u2192 156.0 ms; first 16 steps \u221220%",
     "preconditions": "Serve mode, compatible seed identity and writable destination for saves.",
     "off_switch": "--residency-seed none; --residency-save none",
     "doc_anchor": "docs/optimizations.md#rtx-residency"
@@ -955,7 +966,7 @@
     "flag_or_env": "--evict lru|scored|auto",
     "default": "auto",
     "exact": "Only residency changes: chat token vectors identical across all 8 arms (lru/auto, forced-window and pressure gates).",
-    "gain": "DSpark misses/token 10.55 → 9.08 (−14 %), median +6.4 % tok/s (7 chats); plain decode neutral",
+    "gain": "DSpark misses/token 10.55 \u2192 9.08 (\u221214 %), median +6.4 % tok/s (7 chats); plain decode neutral",
     "preconditions": "Standalone RTX replica with a tierstream that provides the auto policy (SS_DG_AUTO_EVICT); an older tierstream keeps lru with a notice.",
     "off_switch": "--evict lru",
     "doc_anchor": "docs/optimizations.md#rtx-evict-auto"
@@ -977,7 +988,7 @@
     "flag_or_env": "--host-gib-auto G; --overlay OVERLAY.gguf; --host-pin-order layer|deadline|early",
     "default": "off (file-only streaming)",
     "exact": "Exact: prefill state sha256, logits FNV and next token identical to file-only streaming on every exercised path (implicit and explicit tier, export modes, pipeline, whole-layer provider, forced demotion).",
-    "gain": "TTFT 1K −24..−30 % (16.2 → 12.4 s interleaved), 8K −28 %, 30K −12 %",
+    "gain": "TTFT 1K \u221224..\u221230 % (16.2 \u2192 12.4 s interleaved), 8K \u221228 %, 30K \u221212 %",
     "preconditions": "DeepSeek CUDA prefill service on the RTX PRO with free pinned host memory; mandatory allocations are made first, each layer gets one non-waiting admission, demoted layers stream from file with the same bits.",
     "off_switch": "omit --host-gib-auto",
     "doc_anchor": "docs/optimizations.md#rtx-prefill-host-tier"
@@ -989,7 +1000,7 @@
     "default": "2",
     "exact": "Published same-identity qualification: Measurement: rows == alone, wide expert kernels at N2-4, N2 -3.0..-3.5 %, N4 -4..-6 %; repeat golden-logit/token/state and relevant exchange gates for the chosen workload.",
     "gain": "rows == alone, wide expert kernels at N2-4, N2 -3.0..-3.5 %, N4 -4..-6 %",
-    "preconditions": "Supported MoE widths, quantization and N2–4 rows.",
+    "preconditions": "Supported MoE widths, quantization and N2\u20134 rows.",
     "off_switch": "STRIX_MMX_MOE_WIDE=0",
     "doc_anchor": "docs/optimizations.md#mm-moe-wide"
   },
@@ -1351,7 +1362,7 @@
     "flag_or_env": "--identity r1b",
     "default": "ON",
     "exact": "Stable within R1b; not bit-identical to R1. Teacher-forced top-1 agreement 8126/8192; mean KL ~1.8e-3 nats; free runs diverge on 28/32 prompts.",
-    "gain": "41.93–41.96 vs R1 47.33–47.48 ms/token (−11.5%)",
+    "gain": "41.93\u201341.96 vs R1 47.33\u201347.48 ms/token (\u221211.5%)",
     "preconditions": "Admitted GLM model, R1b kernels and identity-specific reference.",
     "off_switch": "--identity r1 (unset STRIX_GLM_IDENTITY, which otherwise wins)",
     "doc_anchor": "docs/optimizations.md#glm-identity"
@@ -1776,6 +1787,17 @@
   },
   {
     "engine": "qwen",
+    "name": "YaRN long-context MTP CLI",
+    "flag_or_env": "--rope-yarn; --mtp; STRIX_QWEN_YARN_MTP; STRIX_QSA_MTP_POOL; STRIX_PLE_ROLLING",
+    "default": "table-backed QSA MTP pool and rolling PLE for factor 2 through 524,288 and factor 4 through 1,048,576 positions when admitted",
+    "exact": "Against serial YaRN at 1,048,576 positions (factor 4, real prose prompt): all 256 generated tokens, every committed step's full-vocabulary logits, prompt/final target state and predictor state identical between MTP with the pool, plain serial YaRN and MTP with the pool off; 262K full scope and 524K target scope identical.",
+    "gain": "MTP speculative decode on YaRN contexts through 1,048,576 positions on one node; serial YaRN is the comparator",
+    "preconditions": "CLI only (HTTP refuses YaRN); explicit --context; pinned sidecar and version-3 golden; memory admission with a 4 GiB physical margin. Memory-only storage ladder: defaults, H1024/cap268435456/ring256/PIPE-default, then H256/cap33554432/ring64/PIPE0. Explicit environment values pin each knob; inspection and run receipts expose storage_ladder_step and yarn_mtp_storage sizes.",
+    "off_switch": "omit --mtp for serial YaRN; STRIX_QSA_MTP_POOL=0 and STRIX_PLE_ROLLING=0 restore the previous pool and PLE paths",
+    "doc_anchor": "docs/optimizations.md#qwen-yarn-mtp"
+  },
+  {
+    "engine": "qwen",
     "name": "Parallel cold PLE table populate",
     "flag_or_env": "STRIX_PLE_WARM_PARALLEL",
     "default": "ON",
@@ -1813,7 +1835,7 @@
     "flag_or_env": "STRIX_MM_XFER; STRIX_MM_PFX; STRIX_MM_PF_INTERLEAVE",
     "default": "XFER on, PFX loaded, interleave on",
     "exact": "Same token IDs, K/V/index state and terminal rows in prefill qualification; retain protocol integrity gates.",
-    "gain": "Interleaving: 8K TTFT 40.0 → 35.4 s; 1K inert",
+    "gain": "Interleaving: 8K TTFT 40.0 \u2192 35.4 s; 1K inert",
     "preconditions": "Two compatible ranks on a host exchange route; module loads are skipped with GPU-direct transport.",
     "off_switch": "STRIX_MM_XFER=off; STRIX_MM_PFX=off; STRIX_MM_PF_INTERLEAVE=off (one at a time)",
     "doc_anchor": "docs/optimizations.md#mm-routes"
@@ -1835,7 +1857,7 @@
     "flag_or_env": "amdgpu.iommu_perfopt (kernel module parameter)",
     "default": "on: the lab nodes boot the PerfOpt kernel by default (permanent GRUB default on both nodes; iommu_perfopt=-1, the kernel logs \"PerfOpt armed\")",
     "exact": "Same kernel build, PerfOpt on vs amdgpu.iommu_perfopt=0, interleaved boots: tokens identical in every arm; GPU identity domain, USB4 NHIs still DMA-FQ, iommu_dma_protection=1, no AMD-Vi fault lines after two-node traffic.",
-    "gain": "Qwen 32K prefill +2.9 % / +3.1 % (two repeats, one node, same power, equal or lower GPU clock); DeepSeek two-node decode within ±1 % with one node on PerfOpt, both-node run pending",
+    "gain": "Qwen 32K prefill +2.9 % / +3.1 % (two repeats, one node, same power, equal or lower GPU clock); DeepSeek two-node decode within \u00b11 % with one node on PerfOpt, both-node run pending",
     "preconditions": "Kernel with AMD's PerfOpt patches (Linux 7.4 or the IOMMU tree) and the GPU in an identity domain; dedicated inference host without GPU unbind, VFIO, kexec/kdump or suspend.",
     "off_switch": "options amdgpu iommu_perfopt=0, or boot the previous kernel",
     "doc_anchor": "docs/optimizations.md#platform-perfopt"

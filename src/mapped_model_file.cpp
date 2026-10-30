@@ -2,6 +2,7 @@
 #include "strix/mapped_model_file.hpp"
 
 #include "strix/model_content_hash.hpp"
+#include "strix/ple_direct.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -288,6 +289,28 @@ int MappedModelFile::drop_page_cache(std::uint64_t byte_offset, std::uint64_t by
 #else
     (void)byte_offset; (void)bytes;
     return ENOSYS;
+#endif
+}
+
+int MappedModelFile::open_direct_read_only() const {
+#if defined(__linux__)
+    try { validate_unchanged(); }
+    catch (const std::exception& error) { throw ple_reclaim::DirectError(error.what()); }
+    const auto path = "/proc/self/fd/" + std::to_string(fd_);
+    const int direct = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+    if (direct < 0) {
+        const auto message = "PLE O_DIRECT: reopen unsupported/failed; rolling refused (errno " + std::to_string(errno) + ")";
+        if (errno == EINVAL || errno == EOPNOTSUPP) throw ple_reclaim::DirectUnsupported(message);
+        throw ple_reclaim::DirectError(message);
+    }
+    struct stat state{};
+    if (::fstat(direct, &state) || file_state(state) != file_state_) {
+        ::close(direct);
+        throw ple_reclaim::DirectError("PLE O_DIRECT: reopened backing changed; rolling refused");
+    }
+    return direct;
+#else
+    throw ple_reclaim::DirectUnsupported("PLE O_DIRECT requires Linux; rolling refused");
 #endif
 }
 

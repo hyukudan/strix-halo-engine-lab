@@ -10,6 +10,35 @@ using namespace strix;
 using namespace strix::decode_cli;
 namespace {
 void require(bool ok, const char* what) { if (!ok) throw std::runtime_error(what); }
+void receipt_compatibility() {
+    auto tokenizer=serve::BpeTokenizer::from_parts({"a","b","<|endoftext|>"},{1,1,3},{},"qwen35");
+    HttpConstraintRequests constraints(tokenizer,false);
+    MtpServeResult result;
+    result.paid_drafts=7; result.chosen_window_rows[4]=3;
+    result.final_state_digest="final"; result.final_state_position=8;
+    result.prompt_state_digest="prompt"; result.session_json="{}";
+    const MtpServeRunner run=[&](const MtpServeRequest&) { return result; };
+    MtpBridgeEngine engine(run,64,constraints,false,false,false);
+    serve::GenerationJob job; job.prompt={0}; job.max_tokens=1;
+    const auto bytes=[](const serve::GenerationStats& stats) {
+        auto json=serve::Json::object();
+        for(const auto& [key,value]:stats.engine_extra) json.set(key,serve::parse_json(value));
+        return json.dump();
+    };
+    const auto off=bytes(engine.generate(job));
+    // Literal historical receipt payload/order, including following fields.
+    require(off==R"({"final_state_digest":"final","final_state_position":8,"prompt_state_digest":"prompt","session":{}})",
+        "M1 off single HTTP receipt retains historical bytes");
+    serve::GenerationStats batch; batch.engine_extra.emplace_back("sentinel","1");
+    const auto before=bytes(batch); append_mtp_pool_receipt(batch,result);
+    require(bytes(batch)==before,"M1 off batch receipt appends zero bytes");
+    result.qsa_mtp_pool_active=true;
+    require(bytes(engine.generate(job)).find("\"mtp_paid_drafts\":7")!=std::string::npos,
+        "M1 active owner emits receipt fields");
+    append_mtp_pool_receipt(batch,result);
+    require(bytes(batch).find("\"mtp_chosen_window_rows_histogram\":{\"1\":0,\"2\":0,\"3\":0,\"4\":3")!=std::string::npos,
+        "M1 active batch owner emits histogram");
+}
 std::atomic<bool> headers_seen{false};
 std::string request(unsigned port, const std::string& body) {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -106,6 +135,7 @@ void run(bool streaming, unsigned failure_kind) {
 }
 }
 int main() try {
+    receipt_compatibility();
     // Explicitly disable every constructor option that can query a device.
     ::setenv("STRIX_BATCH_SERVICE_MS","0",1);
     ::setenv("STRIX_BATCH_CANCEL_POINTS","0",1);

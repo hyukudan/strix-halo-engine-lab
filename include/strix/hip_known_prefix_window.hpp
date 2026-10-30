@@ -151,6 +151,7 @@ public:
     // [0, n_keep) are committed; the caller rewinds its session frontier to match.
     [[nodiscard]] bool defers_state() const noexcept;
     [[nodiscard]] bool policy_selection_admitted() const noexcept;
+    [[nodiscard]] std::string arithmetic_witness() const;
     void commit_prefix(std::uint32_t n_keep);
     // Host-only query of the deferred GDN record shared by this session's owners.
     [[nodiscard]] bool deferred_pending() const noexcept;

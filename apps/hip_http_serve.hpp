@@ -28,6 +28,15 @@
 
 namespace strix::decode_cli {
 
+inline void append_mtp_pool_receipt(serve::GenerationStats& stats, const MtpServeResult& result) {
+    if (!result.qsa_mtp_pool_active) return;
+    stats.engine_extra.emplace_back("mtp_paid_drafts",std::to_string(result.paid_drafts));
+    std::string rows="{";
+    for(std::size_t r=1;r<result.chosen_window_rows.size();++r)
+        rows+=(r>1?",":"")+std::string("\"")+std::to_string(r)+"\":"+std::to_string(result.chosen_window_rows[r]);
+    stats.engine_extra.emplace_back("mtp_chosen_window_rows_histogram",rows+"}");
+}
+
 // Used only on the bridge thread. The tokenizer-wide trie is built lazily once
 // per server; mutable selection frontiers are created afresh for each request.
 class HttpConstraintRequests {
@@ -103,6 +112,7 @@ public:
         stats.cycles = result.cycles;
         stats.proposed = result.proposed;
         stats.accepted = result.accepted;
+        append_mtp_pool_receipt(stats,result);
         stats.ngram_rows = result.ngram_rows;
         stats.ngram_accepted = result.ngram_accepted;
         stats.prefill_ms = result.prompt_ms;
@@ -459,6 +469,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
                 stats.cycles = result.cycles;
                 stats.proposed = result.proposed;
                 stats.accepted = result.accepted;
+                append_mtp_pool_receipt(stats,result);
                 stats.prefill_ms = result.prompt_ms;
                 stats.decode_ms = result.decode_ms;
                 stats.ngram_rows = result.ngram_rows;

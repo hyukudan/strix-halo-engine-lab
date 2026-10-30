@@ -25,6 +25,57 @@ class HipQsaExactScoreOwner;
 // Allocate the complete admitted ring during setup, before prompt execution.
 [[nodiscard]] std::shared_ptr<HipQsaExactScoreOwner> make_hip_qsa_exact_score_owner(
     std::uint64_t maximum, std::uint64_t admitted_bytes, void* stream, std::uint64_t generation, std::uint32_t rows);
+struct MtpQsaPoolPlan;
+class HipQsaCommittedPool;
+struct HipQsaKeyDescriptor {
+    const std::uint16_t* packed=nullptr;
+    std::uint64_t epoch=0;
+    std::uint32_t role=0, dim=128, complete_capacity=0;
+    void* producer_event=nullptr;
+};
+// K1 consumes these views while the access lease is retained. Selection stays legacy in M1.
+struct HipQsaPoolRowDescriptor {
+    const float* query=nullptr; float* scores=nullptr; std::uint32_t* selected=nullptr;
+    std::uint32_t visible=0, complete_blocks=0, topk=0, maxima_stride=0;
+    std::uint32_t* status=nullptr;
+};
+class HipQsaCommittedAccess {
+public:
+    struct Impl;
+    explicit HipQsaCommittedAccess(std::unique_ptr<Impl>);
+    ~HipQsaCommittedAccess();
+    HipQsaCommittedAccess(const HipQsaCommittedAccess&)=delete;
+    HipQsaCommittedAccess& operator=(const HipQsaCommittedAccess&)=delete;
+    [[nodiscard]] void* storage() const noexcept;
+    // Records the current producer fence. K1 queues consumers on this lease's stream and retains the lease through enqueue.
+    [[nodiscard]] HipQsaKeyDescriptor key() const;
+    [[nodiscard]] float* scratch() const noexcept;
+private:
+    std::unique_ptr<Impl> impl_;
+};
+class HipQsaCommittedPool : public std::enable_shared_from_this<HipQsaCommittedPool> {
+public:
+    struct Impl;
+    static std::shared_ptr<HipQsaCommittedPool> create(const MtpQsaPoolPlan&);
+    ~HipQsaCommittedPool();
+    [[nodiscard]] std::unique_ptr<HipQsaCommittedAccess> before_rewrite(bool predictor,
+        std::uintptr_t raw,std::uint64_t raw_bytes,std::uint64_t raw_generation,
+        const RuntimeTensorBinding& norm,std::uint32_t norm_type,const ModelContract&,
+        std::uint64_t first,std::uint32_t rows,void* stream,bool certified_prefix);
+    // scratch lease serializes K1 only, not unrelated key entries; no K1 dispatch here.
+    [[nodiscard]] std::unique_ptr<HipQsaCommittedAccess> selector_lease(void* stream);
+    void bind_domain(bool predictor,const ModelContentIdentity& content,std::uint64_t profile);
+    void commit(bool predictor,std::uint64_t end);
+    void invalidate(bool predictor,std::uint64_t first);
+    void begin_epoch();
+    void cancel() noexcept;
+    void checked(std::uint64_t scores,std::uint64_t differing,std::uint32_t role=13U);
+    void print_stats() const;
+    [[nodiscard]] std::uint64_t reserved_bytes() const noexcept;
+private:
+    HipQsaCommittedPool();
+    std::unique_ptr<Impl> impl_;
+};
 // One eager window owner's cache. The owner must invalidate it before replacing
 // its session's committed prefix (discard_deferred does this), and retain it
 // through stream drain. Rejected/window rows are invalidated from the next frontier.
@@ -60,6 +111,7 @@ struct HipIndexedAttentionLauncherConfig {
     // fast-prefill-f16wmma-v1, qsa component: prefill groups run the fused union attention (hip_qsa_fast_prefill.inc).
     bool qsa_fast_prefill = false;
     std::shared_ptr<HipQsaWindowPool> window_pool;
+    std::shared_ptr<HipQsaCommittedPool> committed_pool;
     // Eager serial decode of an append-only session (the plain CLI route; set through HipLauncherCatalogConfig::
     // qsa_decode_pool): complete blocks are pooled once and scored by block_score_pooled_rows_kernel, bitwise the
     // scores of block_score_kernel. The owner must not let another writer rewrite raw index keys below the position of a
@@ -84,6 +136,9 @@ void launch_hip_qsa_input_projection_probe(HipQsaInputProjectionMode,
 // device position: its graph-input form, sizes read on the device), 2/4/8 rows
 // = the known-window rows kernel. Without a device position a row with
 // visible/ratio <= block_topk takes the full-visible fill. Scores are consumed.
+void launch_hip_qsa_committed_pool_probe(bool pooled,bool predictor,const std::shared_ptr<HipQsaCommittedPool>&,
+    const ModelContract&,std::uintptr_t raw,std::uint64_t capacity,const RuntimeTensorBinding& norm,
+    std::uint64_t first,std::uint32_t writer_rows,std::span<const HipQsaPoolRowDescriptor>,void* stream);
 struct HipQsaBlockSelectRow { float* scores = nullptr; std::uint32_t* selected = nullptr; std::uint32_t visible = 0; };
 void launch_hip_qsa_block_select_probe(bool reference, std::span<const HipQsaBlockSelectRow> rows, std::uint32_t ratio,
     std::uint32_t block_topk, const std::uint64_t* device_position, std::uint64_t context_tokens, std::uint32_t* device_status,
@@ -247,5 +302,9 @@ private:
     HipIndexedAttentionLauncherConfig config_;
     HipIndexedAttentionLauncherConfig fallback_config_;
 };
+
+// Requires an exclusive, drained single-request prompt handoff. Shared decode
+// pools, state, rotary tables and diagnostics are retained.
+void release_hip_qsa_prefill_storage();
 
 }  // namespace strix

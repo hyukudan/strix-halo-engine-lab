@@ -17,6 +17,19 @@ struct Qpf2kStageSlot {
 static_assert(sizeof(qsa_index::NormGroupViews<64U>) + sizeof(QsaRowsStoreViews<64U>) +
     sizeof(qsa_flash::ScoreGroup<64U>) + sizeof(uint2) <= 20480U,
     "YaRN admission descriptor bound must track stage slot payloads");
+auto& qpf2k_stage_slots() { static std::array<Qpf2kStageSlot,2> slots;return slots; }
+void release_qpf2k_stage_slots() {
+    for(auto& slot:qpf2k_stage_slots()) {
+        if(slot.pending) check_hip(hipEventSynchronize(slot.done),"QSA stage retirement consumer wait");
+        for(auto* p:{static_cast<void*>(slot.norms),static_cast<void*>(slot.stores),
+                    static_cast<void*>(slot.scores),static_cast<void*>(slot.bounds)})
+            if(p) check_hip(hipHostFree(p),"QSA stage retirement descriptor free");
+        if(slot.tables) check_hip(hipFree(slot.tables),"QSA stage retirement table free");
+        if(slot.maxima) check_hip(hipFree(slot.maxima),"QSA stage retirement maxima free");
+        if(slot.done) check_hip(hipEventDestroy(slot.done),"QSA stage retirement event free");
+        slot={};
+    }
+}
 struct Qpf2kStageBatch {
     Qpf2kStageSlot* slot = nullptr;
     std::uint32_t max_blocks = 0, groups = 0;
@@ -69,7 +82,7 @@ bool qpf2k_stage_batch_launch(const std::vector<QsaKnownRows<8U>>& tiles,
     // Embedded admission remains capped at 128 groups. Compact descriptors and
     // tables cover all T; only scores/maxima have bounded slot lifetimes.
     const std::size_t MaxGroups = compact ? std::max<std::size_t>(128U, tiles.size() / 8U) : 128U;
-    static std::array<Qpf2kStageSlot, 2> ring;
+    auto& ring=qpf2k_stage_slots();
     static std::size_t next = 0;
     const auto decline = [] { return false; };
     const auto unavailable = [&] {

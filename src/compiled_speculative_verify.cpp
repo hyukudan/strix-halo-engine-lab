@@ -1,5 +1,6 @@
 #include "strix/lane_chain_hyper_output.hpp"
 #include "strix/compiled_speculative_verify.hpp"
+#include <sstream>
 #include "strix/qsa_input_prefetch.hpp"
 #include "strix/q8_projection_organization.hpp"
 #include "strix/shared_expert_prefetch.hpp"
@@ -953,6 +954,8 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
     output.r2_variant.assign(serial.execution.steps.size(), KnownWindowR2Variant::none);
     for (std::size_t i = 0; i < output.mode.size(); ++i) {
         const auto& step = serial.execution.steps[i]; const auto& binding = serial.bindings.bindings[i];
+        const auto avoided_before=output.logical_projection_weight_bytes_avoided;
+        const auto launches_before=output.projection_launches_saved;
         if (request.r2_shared_expert && step.op == SerialOp::shared_expert && binding.kernel_id &&
             known_shared_id(*binding.kernel_id) && window_shared_types(manifest, tensor_access, step)) {
             output.mode[i] = output.logical_rows==2U ? KnownWindowStepMode::r2_shared_q8 : KnownWindowStepMode::shared_rows;
@@ -1048,6 +1051,15 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
                     KnownWindowR2Variant::moe_combine_rows_v1;
             }
         }
+        // Select before counters, identities, row clones or any native owner setup.
+        // In particular the five-Q8 paired GDN gate projection is not R1 math;
+        // mixed gates and deferred prefix rows already have admitted entries.
+        const auto selected=known_window_select_serial_rows(request.require_serial_rows,output.mode[i],output.r2_variant[i]);
+        if(selected.mode!=output.mode[i] || selected.variant!=output.r2_variant[i]) {
+            output.mode[i]=selected.mode; output.r2_variant[i]=selected.variant;
+            output.logical_projection_weight_bytes_avoided=avoided_before;
+            output.projection_launches_saved=launches_before;
+        }
         if (binding.kernel_id) {
             const auto adjustment = trellis_window_adjustment(*binding.kernel_id, output.mode[i], output.logical_rows);
             output.logical_projection_weight_bytes_avoided -= adjustment.first;
@@ -1068,6 +1080,8 @@ CompiledKnownPrefixWindow compile_known_prefix_window(
             ++output.combine_inject_rows_steps;
         else ++output.r2_steps;
     }
+    window_require(!request.require_serial_rows || known_window_policy_serial_rows(output),
+        "known window has no serial-row recipe for this size");
     const auto identities = known_window_identities(output, serial);
     output.window_execution_identity = identities.first; output.window_kernel_plan_identity = identities.second;
     output.row_plan.assign(output.logical_rows,serial);
@@ -1145,6 +1159,66 @@ void validate_known_prefix_window_formats(
                 "known window GDN variant differs from the selected tensor formats");
         }
     }
+}
+
+std::string known_window_arithmetic_witness(const CompiledKnownPrefixWindow& window,
+    bool serial_rows_required, bool prefill, bool gsq, KnownWindowFolds folds) {
+    static constexpr std::array<const char*, known_window_r2_variant_slots> names{
+        "none",
+        "shared_q8_virtual256_r2_v1",
+        "gdn_q8_virtual256_r2_v1",
+        "gdn_q8_rows2_f32_gates_r1_v1",
+        "shared_q8_virtual256_r4_v1",
+        "shared_q8_virtual256_r8_v1",
+        "gdn_q8_rows4_f32_gates_r1_v1",
+        "gdn_q8_rows8_f32_gates_r1_v1",
+        "routed_q51_union_rows2_v1",
+        "routed_q51_union_rows4_v1",
+        "routed_q51_union_rows8_v1",
+        "hyper_mix_rows2_v1",
+        "hyper_mix_rows4_v1",
+        "hyper_mix_rows8_v1",
+        "qsa_q8_rows2_r1_v1",
+        "qsa_q8_rows4_r1_v1",
+        "qsa_q8_rows8_r1_v1",
+        "gdn_deferred_rows2_v1",
+        "gdn_deferred_rows4_v1",
+        "gdn_deferred_rows8_v1",
+        "ple_rows_host_staged_v1",
+        "qsa_q8_bf16idx_rows2_r1_v1",
+        "qsa_q8_bf16idx_rows4_r1_v1",
+        "qsa_q8_bf16idx_rows8_r1_v1",
+        "lm_head_q8_prefetch8_rows2_v1",
+        "lm_head_q8_prefetch8_rows4_v1",
+        "lm_head_q8_prefetch8_rows8_v1",
+        "moe_route_rows_v1",
+        "moe_combine_rows_v1",
+        "inject_rows_v1",
+        "routed_a8_union_rows2_v1",
+        "routed_a8_union_rows4_v1",
+        "routed_a8_union_rows8_v1",
+    };
+    std::array<std::uint32_t, known_window_r2_variant_slots> counts{};
+    std::uint32_t unknown=0;
+    for(const auto v:window.r2_variant) {
+        const auto index=static_cast<std::uint32_t>(v);
+        if(index<counts.size()) ++counts[index]; else ++unknown;
+    }
+    std::ostringstream out;
+    out << "{\"rows\":" << window.logical_rows
+        << ",\"serial_rows_required\":" << (serial_rows_required?"true":"false")
+        << ",\"policy_selection_admitted\":" << (known_window_policy_selection_admitted(window,prefill,gsq,folds)?"true":"false")
+        << ",\"execution_identity\":" << window.window_execution_identity
+        << ",\"kernel_plan_identity\":" << window.window_kernel_plan_identity
+        << ",\"folds\":{\"inject_norm\":" << (folds.inject_norm?"true":"false")
+        << ",\"combine_inject\":" << (folds.combine_inject?"true":"false")
+        << ",\"commit_combine\":" << (folds.commit_combine?"true":"false") << "},\"variants\":{";
+    bool comma=false;
+    for(std::size_t i=0;i<counts.size();++i) if(counts[i]) {
+        out << (comma?",":"") << '"' << names[i] << "\":" << counts[i]; comma=true;
+    }
+    out << "},\"unknown_variants\":" << unknown << '}';
+    return out.str();
 }
 
 }  // namespace strix

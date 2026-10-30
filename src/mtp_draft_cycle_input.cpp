@@ -48,7 +48,7 @@ void validate_mtp_draft_cycle_input(
             "MTP seed token is outside model vocabulary");
     }
     if (input.seed_position >=
-            model.max_position_embeddings ||
+            model.effective_max_positions() ||
         input.seed_position <
             target_session.next_position) {
         throw std::out_of_range(

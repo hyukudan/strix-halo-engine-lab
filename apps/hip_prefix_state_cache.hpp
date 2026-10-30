@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/qwen_target_state_digest.hpp"
 #include "qwen_tiled_prompt_plan.hpp"
 #include "qwen_serial_prompt_certificate.hpp"
 // Block-boundary prefix state cache on the tiled known-prefix prefill: session-state capture and
@@ -361,6 +362,7 @@ public:
                     return f.address == resolve_session_state(layout_, memory_, allocation.component).address; });
             if (!known) throw std::invalid_argument("prefix state cache does not cover every session state component");
         }
+        target_rows_=rows_.size();target_fixed_=fixed_.size();
         if (hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking) != hipSuccess)
             throw std::runtime_error("prefix state cache stream creation failed");
     }
@@ -395,9 +397,11 @@ public:
         identity_ = sha256_bytes(frame);
         identity_extension_ = extra;
     }
+    void set_before_restore_hook(std::function<void()> hook) { require_unused(); before_restore_hook_ = std::move(hook); }
     void set_restore_hook(std::function<void(std::uint64_t)> hook) { require_unused(); restore_hook_ = std::move(hook); }
     // Only the serialized request runner may rebind this before begin_request.
     // Slot 0 alternates between a batch runtime and the idle named-session runtime.
+    // Keep before_restore_hook_ separate: rebinding must retain M1 invalidation.
     void bind_restore_runtime(std::function<void(std::uint64_t)> hook) {restore_hook_=std::move(hook);}
     [[nodiscard]] const ModelContentIdentity& identity() const noexcept { return identity_; }
     // Bytes of one segment (block k): every row component's rows of that block.
@@ -426,6 +430,31 @@ public:
         }
         for (const auto& fixed : fixed_) append(reinterpret_cast<const void*>(fixed.address), fixed.bytes, fixed.device);
         return sha256_bytes(frame);
+    }
+    // Cross-route numerical digest: frozen target registry, occupied ranges,
+    // ordered consumed token history and the unconsumed pending selection.
+    // Opaque executor/window lineage remains in complete_session_digest.
+    [[nodiscard]] ModelContentIdentity target_state_digest(std::uint64_t position,
+        std::span<const std::uint32_t> history,std::optional<std::uint32_t> pending) {
+        if(history.size()!=position) throw std::invalid_argument("target digest history/frontier differs");
+        check(hipDeviceSynchronize(),"target digest fence");
+        QwenTargetStateDigestFrame frame(position,target_rows_,target_fixed_);
+        std::vector<std::byte> chunk;
+        const auto range=[&](const std::string& id,std::uintptr_t address,std::uint64_t bytes,bool device) {
+            chunk.resize(static_cast<std::size_t>(bytes));
+            if(bytes) {
+                if(device) check(hipMemcpy(chunk.data(),reinterpret_cast<const void*>(address),chunk.size(),hipMemcpyDeviceToHost),"target digest copy");
+                else std::memcpy(chunk.data(),reinterpret_cast<const void*>(address),chunk.size());
+            }
+            frame.component(id,bytes,sha256_bytes(chunk));
+        };
+        for(std::size_t j=0;j<target_rows_;++j) {
+            const auto& r=rows_[j];range(r.id,r.address,(position>r.shift?position-r.shift:0U)*r.bytes,true);
+        }
+        for(std::size_t j=0;j<target_fixed_;++j) {
+            const auto& f=fixed_[j];range(f.id,f.address,f.bytes,f.device);
+        }
+        return frame.finish(history,pending);
     }
     // STRIX_PREFIX_CACHE_DIGEST_COMPONENTS=1 (with STRIX_PREFIX_CACHE_DIGEST=1): state_digest's per-component hashes as a JSON object (component id -> SHA-256 of its
     // committed rows below `position` or of the whole fixed allocation), to locate a digest difference.
@@ -638,6 +667,7 @@ public:
             if (store_ || rtx_registry_) request_->refusal = "policy-selection-cache-unqualified";
             return 0;
         }
+        if (before_restore_hook_) before_restore_hook_();
         if (rtx_registry_ && prompt.size() >= 2U)
             if (auto state = rtx_registry_->take(prompt)) return restore_rtx_state(session, std::move(state));
         if (!store_) return 0;
@@ -1329,12 +1359,14 @@ private:
     bool fixed_mtp_sessions_ = false;
     const SerialSessionStateLayout& layout_;
     const SessionStateMemoryBinding& memory_;
+    std::size_t target_rows_=0,target_fixed_=0;
     std::vector<Row> rows_;
     std::vector<Fixed> fixed_;
     std::uint64_t row_bytes_ = 0, fixed_bytes_ = 0;
     std::vector<std::shared_ptr<const PrefixCacheSegment>> segments_;
     std::shared_ptr<PrefixAsyncCapture::RowChain> row_chain_=std::make_shared<PrefixAsyncCapture::RowChain>();
     std::function<void(std::uint64_t)> restore_hook_;
+    std::function<void()> before_restore_hook_;
     bool used_ = false, imported_ = false;
     std::optional<ModelContentIdentity> identity_extension_;
     std::optional<RtxStateImportFacts> rtx_facts_;

@@ -512,6 +512,95 @@ struct KnownRuntimeFixture {
     }
 };
 
+void yarn_serial_window_selection_tests(const strix::ModelContract& native_model) {
+    using namespace strix;
+    using V=KnownWindowR2Variant; using M=KnownWindowStepMode;
+    // Captured before this change, from the unchanged native compiler.
+    constexpr std::array<std::array<std::uint64_t,5>,12> native_pins{{
+        {13083362910635310691ULL,4863534667393275108ULL,1996800ULL,3831541760ULL,638ULL},
+        {15918103719367961873ULL,14460702830281900315ULL,3993600ULL,9279283200ULL,1638ULL},
+        {15789861501899281442ULL,15169130105291753025ULL,7987200ULL,20174766080ULL,3638ULL},
+        {15654963642845729118ULL,1949998428958718756ULL,1996800ULL,4497571840ULL,567ULL},
+        {1569738126787255186ULL,11974845279599050728ULL,3993600ULL,13492715520ULL,1605ULL},
+        {16108088439835032299ULL,8544296000465250752ULL,7987200ULL,31483002880ULL,3681ULL},
+        {11923134548858325583ULL,8305500008284324988ULL,1996800ULL,3822141440ULL,566ULL},
+        {16888714372931873527ULL,14975567280879251392ULL,3993600ULL,11466424320ULL,1602ULL},
+        {2018404911890620875ULL,6135181892703517445ULL,7987200ULL,26754990080ULL,3674ULL},
+        {15654963642845729118ULL,1949998428958718756ULL,1996800ULL,4497571840ULL,567ULL},
+        {1569738126787255186ULL,11974845279599050728ULL,3993600ULL,13492715520ULL,1605ULL},
+        {16108088439835032299ULL,8544296000465250752ULL,7987200ULL,31483002880ULL,3681ULL},
+    }};
+    for(auto variant:{V::gdn_q8_virtual256_r2_v1,static_cast<V>(known_window_r2_variant_slots),static_cast<V>(UINT32_MAX)}) {
+        const auto repaired=known_window_select_serial_rows(true,M::r2_gdn_staged,variant);
+        expect(repaired.mode==M::r1_row_loop && repaired.variant==V::none,
+            "nonserial and future unknown window arms fall back to the complete serial source");
+        const auto native=known_window_select_serial_rows(false,M::r2_gdn_staged,variant);
+        expect(native.mode==M::r2_gdn_staged && native.variant==variant,"native arm selection is unchanged");
+    }
+    std::size_t pin=0;
+    for(auto gate:{8U,0U}) for(bool prefix:{false,true}) for(auto rows:{2U,4U,8U}) {
+        const auto f=make_known_fixture(native_model,gate,true,true,true,30U,8U);
+        KnownWindowRequest req{true,true,true,rows,true,KnownWindowOutputPolicy::all_rows,
+            true,true,prefix,prefix,prefix,true,true};
+        const auto w=compile_known_prefix_window(native_model,f.serial,f.manifest,f.access,req);
+        const std::array<std::uint64_t,5> actual{w.window_execution_identity,w.window_kernel_plan_identity,
+            w.arena.physical.total_bytes,w.logical_projection_weight_bytes_avoided,w.projection_launches_saved};
+        expect(actual==native_pins[pin++],"native R2/R4/R8 plan content hashes, arena and savings stay unchanged");
+    }
+    for(auto factor:{2U,4U}) for(auto gate:{8U,0U}) for(bool prefix:{false,true}) for(auto rows:{2U,4U,8U}) for(auto profile:{0U,2U}) {
+        auto model=native_model;ModelContentIdentity hash;hash.bytes[0]=1;
+        model.resolved_rotary=RotaryIdentity(RotaryDescriptor::yarn(factor),hash);
+        routed_fixture_profile=profile;
+        auto f=make_known_fixture(model,gate,true,true,true,30U,8U);
+        f.serial.max_position_embeddings=model.effective_max_positions();
+        for(std::size_t i=0;i<f.serial.execution.steps.size();++i) {
+            const auto op=f.serial.execution.steps[i].op;
+            auto& id=f.serial.bindings.bindings[i].kernel_id;
+            if(op==SerialOp::moe_route) id="hip.moe_route.bf16.h2560.e512.k10.r1.c1.staged_logits.wave.parallel";
+            else if(op==SerialOp::attn_inject || op==SerialOp::mlp_inject) id="hip.inject.bf16.h2560.hc4.r1.c1";
+            else if(op==SerialOp::moe_combine) id="hip.moe_combine.bf16.h2560.hc4.r1.c1";
+        }
+        KnownWindowRequest req{true,true,true,rows,true,KnownWindowOutputPolicy::all_rows,
+            true,true,prefix,prefix,prefix,true,true,true};
+        const auto w=compile_known_prefix_window(model,f.serial,f.manifest,f.access,req);
+        validate_compiled_known_prefix_window(w,f.serial);
+        validate_known_prefix_window_formats(w,f.serial,f.manifest,f.access);
+        expect(known_window_policy_serial_rows(w),"every YaRN selected variant is a serial-row arm");
+        expect(w.routed_expert_union_steps==48 && w.hyper_mix_rows_steps==97 && w.qsa_rows_steps==12 &&
+            w.shared_rows_steps+(rows==2?w.r2_steps:0)>=48 && w.router_rows_steps==48 &&
+            w.combine_inject_rows_steps>0,"YaRN retains serial-row union, HC, QSA, shared and elementwise promotions");
+        if(prefix) expect(w.gdn_deferred_rows_steps==36 && w.ple_rows_steps>0,"YaRN retains deferred GDN and PLE prefix acceptance");
+        for(std::size_t i=0;i<w.mode.size();++i) if(f.serial.execution.steps[i].op==SerialOp::gated_delta_net) {
+            if(!prefix && gate==8U) expect(w.mode[i]==M::r1_row_loop && w.r2_variant[i]==V::none,
+                "all-Q8 nonserial paired GDN falls back to its original serial row launcher");
+            if(!prefix && gate!=8U) expect(w.r2_variant[i]==(rows==2U?V::gdn_q8_rows2_f32_gates_r1_v1:
+                rows==4U?V::gdn_q8_rows4_f32_gates_r1_v1:V::gdn_q8_rows8_f32_gates_r1_v1),
+                "mixed gates retain the serial-equivalent GDN rows variant");
+        }
+        for(unsigned bits=0;bits<8;++bits) {
+            const KnownWindowFolds requested{(bits&1)!=0,(bits&2)!=0,(bits&4)!=0};
+            const auto folds=known_window_folds_for_route(true,requested);
+            expect(known_window_policy_selection_admitted(w,false,false,folds),"YaRN owner admits R2/R4/R8 for every process fold combination");
+            const auto native=known_window_folds_for_route(false,requested);
+            expect(native.inject_norm==requested.inject_norm && native.combine_inject==requested.combine_inject &&
+                native.commit_combine==requested.commit_combine,"native owner preserves all process fold choices");
+        }
+        expect(!known_window_policy_selection_admitted(w,true,false,{}) &&
+            !known_window_policy_selection_admitted(w,false,true,{}),"prefill and GSQ remain excluded from policy admission");
+        auto bad=w;bad.r2_variant[0]=V::gdn_q8_virtual256_r2_v1;
+        expect(!known_window_policy_selection_admitted(bad,false,false,{}),"nonserial GDN remains excluded after repair");
+        bad.r2_variant[0]=static_cast<V>(known_window_r2_variant_slots);
+        expect(!known_window_policy_selection_admitted(bad,false,false,{}),"unclassified future variant remains excluded");
+        const auto witness=known_window_arithmetic_witness(w,true,false,false,{});
+        expect(witness.find("\"policy_selection_admitted\":true")!=std::string::npos &&
+            witness.find("\"folds\":{\"inject_norm\":false,\"combine_inject\":false,\"commit_combine\":false}")!=std::string::npos &&
+            witness.find("gdn_q8_virtual256_r2_v1")==std::string::npos &&
+            witness.find(profile?"routed_a8_union_rows":"routed_q51_union_rows")!=std::string::npos,
+            "witness records selected variants and disabled folds");
+    }
+    routed_fixture_profile=0U;
+}
+
 void known_prefix_prefill_tests(const strix::ModelContract& model) {
     using P=strix::KnownWindowOutputPolicy;using V=strix::KnownWindowR2Variant;
     // Host flow/state oracle only. Native projection arithmetic is exercised
@@ -2397,6 +2486,7 @@ int main() {
     catch(const std::invalid_argument&){deferred_rejected=true;}
     expect(deferred_rejected,"deferred MoE explicitly rejects speculative verification");
 
+    yarn_serial_window_selection_tests(model);
     known_window_routed_union_compiler_tests(model);
     known_window_routed_a8_union_compiler_tests(model);
     known_window_router_rows_compiler_tests(model);

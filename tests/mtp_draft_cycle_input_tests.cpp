@@ -1,4 +1,5 @@
 #include "strix/mtp_draft_cycle_input.hpp"
+#include "rotary_mock.hpp"
 
 #include <iostream>
 #include <stdexcept>
@@ -168,6 +169,18 @@ int main() {
     expect(future_rejected,
            "MTP hidden source cannot come from a future position");
 
+    for(const auto factor:{2U,4U}) {
+        auto extended=model;extended.qwen_rotary_table=mock_rotary(factor);
+        const auto contract=strix::build_mtp_draft_state_contract(extended);
+        for(const std::uint64_t pos:{UINT64_C(262143),UINT64_C(262144),extended.effective_max_positions()-1U,extended.effective_max_positions()}) {
+            auto row=input;row.seed_position=pos;row.hidden_source_position=pos-1U;
+            bool rejected=false;
+            try {strix::validate_mtp_draft_cycle_input(extended,activation,contract,session,row);}
+            catch(const std::out_of_range&) {rejected=true;}
+            expect(rejected==(pos==extended.effective_max_positions()),"effective end is exclusive; predictor source remains seed-1");
+        }
+        expect(extended.max_position_embeddings==262144,"original checkpoint capacity unchanged");
+    }
     if (failures == 0) {
         std::cout << "MTP draft cycle input tests passed\n";
     }

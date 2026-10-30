@@ -1,5 +1,7 @@
 #pragma once
+#include "qwen_yarn_memory.hpp"
 #include "hip_decode_options.hpp"
+#include "known_prefill_reservation.hpp"
 #include "http_slot_capacity.hpp"
 #include "qwen_prefill_external_memory.hpp"
 #include "strix/known_prefix_prefill.hpp"
@@ -34,7 +36,10 @@ struct PrefillRequirements {
     std::uint64_t model_backing = 0, state_d1 = 0, serial_scratch = 0;
     std::uint64_t workspace = 0, metadata = 0, runtime_payload = 0, tails = 0;
     std::uint64_t device_base = 0;
-    std::map<std::string, std::uint64_t> owners{};
+    std::map<std::string, std::uint64_t> owners{},owner_caps{},owner_actuals{};
+    std::map<std::string,unsigned> owner_phases{};
+    std::uint64_t mtp_post_setup_peak=0;
+    std::string owner_error{};
     std::map<std::string, std::uint64_t> organization{};
     std::uint64_t external_host = 0, external_device = 0;
 };
@@ -47,7 +52,9 @@ struct PrefillMemory {
     std::optional<std::uint64_t> ple_reclaim_page{};
     std::optional<std::uint64_t> total{};
     // Must drop and verify with mincore. A predicted page union is never credit.
-    std::function<std::uint64_t(const Options&)> verify_ple_credit{};
+    std::function<std::uint64_t(const Options&, const Environment&)> verify_ple_credit{};
+    // Optional explicit storage sizing for YaRN MTP, without mutating Options or process env.
+    std::function<PrefillRequirements(const Options&, std::uint32_t)> estimate_with_score_ring{};
 };
 // Both inspection and execution validate explicit-T assets before the inspection exit.
 inline void validate_http_serving_memory(const Options& o,const PrefillMemory& memory) {
@@ -67,6 +74,7 @@ struct EffectiveConfig {
     std::string serve_prefill_notice;
     std::string error;
     std::uint64_t ple_reclaim_credit = 0;
+    std::uint64_t ple_rolling_h = 0, ple_rolling_bound = 0, ple_rolling_cap = 0;
     std::vector<std::string> suppressed;
     bool admitted = false;
     bool gsq_owner = false;
@@ -114,12 +122,15 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_QSA_DECODE_SELECT", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_POOL_CHECK",
             "STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA",
             "STRIX_SESSION_CACHE", "STRIX_SESSION_DISK", "XDG_CACHE_HOME", "HOME",
-            "STRIX_PREFIX_BATCH_CERT", "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION",
+            "STRIX_PREFIX_BATCH_CERT", "STRIX_QWEN_YARN_MTP", "STRIX_QWEN_YARN_HOST_RESERVE", "STRIX_PLE_ROLLING_CAP_BYTES", "STRIX_PLE_ROLLING", "STRIX_PLE_ROLLING_POSITIONS", "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION",
             "STRIX_SERVE_PREFILL", "STRIX_BATCH_PROMPT_SMALL"})
         if (!(qpf2k::pre_injected_moe_marker && std::string_view(name) == "STRIX_QPF2K_MOE_DEFAULTED"))
             if (const char* value = get(name)) env.emplace(name, value);
     for (const char* name : {"STRIX_BITCALC_LOGITS_OUT", "STRIX_BITCALC_FORCE_TOKENS"})
         if (get(name)) env.emplace(name, "1");
+    // OFF keeps the complete historical inspection image, including its environment map.
+    for(const char* name:{"STRIX_QSA_MTP_POOL","STRIX_QSA_MTP_POOL_CHECK","STRIX_MTP_LOGITS_DIGEST","STRIX_MTP_STEP_LOGITS_DIGEST"})
+        if(const char* value=get(name); value && value[0]!='0') env.emplace(name,value);
     return env;
 }
 inline Environment requested_prefill_environment() {
@@ -171,7 +182,18 @@ inline std::optional<ple_reclaim::Config> prefill_reclaim_config(const Options& 
     policy.copy_tier = options.model_copy_tier;
     const bool graph = options.execution.mode != DecodeExecutionMode::eager;
     policy.promote_file_backed_candidates = graph;
-    if (!ple_reclaim_route_supported(options, policy, graph)) return {};
+    const auto get = [&](const char* name) -> const char* {
+        const auto it = environment.find(name);
+        return it == environment.end() ? nullptr : it->second.c_str();
+    };
+    const char* controller = get("STRIX_MTP_CONTROLLER");
+    const bool leased_mtp = ctx_exact_memory_enabled(get,"STRIX_PLE_ROLLING") &&
+        (!controller || (std::string_view(controller) != "depth" && std::string_view(controller) != "survival"));
+    auto route_options=options;
+    route_options.ple_rolling_explicit_opt_in=env_is(environment,"STRIX_PLE_ROLLING","1");
+    if (!ple_reclaim_route_supported(route_options, policy, graph, leased_mtp)) return {};
+    if (options.mtp.enabled && (options.tokens.size() > options.context_tokens ||
+        options.generate_tokens > options.context_tokens - options.tokens.size())) return {};
     try {
         const ManifestTensor* table = nullptr;
         std::vector<ple_reclaim::Interval> registered;
@@ -203,22 +225,50 @@ inline std::optional<ple_reclaim::Config> prefill_reclaim_config(const Options& 
             config.stored_row_bytes * config.table_rows != table->byte_size) return {};
         config.mapping_bytes = prefill_checked_add(config.table_offset, table->byte_size);
         config.reclaim = ple_reclaim::reclaim_intervals(config.table_offset, table->byte_size, *page, std::move(merged));
+        config.rolling_positions = ple_rolling_prompt_supported(route_options) && ctx_exact_memory_enabled(get,"STRIX_PLE_ROLLING") ? ple_reclaim::rolling_positions(get("STRIX_PLE_ROLLING"), get("STRIX_CTX_EXACT_MEMORY"),
+            get("STRIX_PLE_ROLLING_POSITIONS")) : 0U;
+        std::uint64_t reclaim_bytes = 0;
+        for (const auto& r : config.reclaim) reclaim_bytes += r.end - r.begin;
+        const auto interior = (config.table_offset + table->byte_size) / *page * *page -
+            (config.table_offset + *page - 1U) / *page * *page;
+        if (reclaim_bytes != interior) config.rolling_positions = 0;
+        if (options.mtp.enabled && !config.rolling_positions) return {};
         const auto contract = build_ple_hash_contract(model);
         const auto allowance = environment.find("STRIX_PLE_RECLAIM_DECODE_BYTES");
-        config.decode_allowance_bytes = ple_reclaim::decode_allowance(options.generate_tokens, 1U, contract.head_count, *page,
+        config.decode_allowance_bytes = ple_reclaim::decode_allowance(config.rolling_positions ? 0U : options.generate_tokens, 1U, contract.head_count, *page,
             allowance == environment.end() ? 0U : std::strtoull(allowance->second.c_str(), nullptr, 10));
+        config.bounded_turns = options.mtp.enabled;
+        if (config.rolling_positions)
+            config.rolling_cap_bytes = ple_reclaim::rolling_cap_bytes(get("STRIX_PLE_ROLLING_CAP_BYTES"));
         return config;
     } catch (const std::exception&) { return {}; }
 }
 inline std::uint64_t prefill_reclaim_credit(const Options& options, const ModelContract& model,
-    const ModelManifest& manifest, const Environment& environment, std::optional<std::uint64_t> page) {
+    const ModelManifest& manifest, const Environment& environment, std::optional<std::uint64_t> page,
+    std::uint64_t* rolling_h = nullptr, std::uint64_t* rolling_bound = nullptr, std::uint64_t* rolling_cap = nullptr) {
+    if (rolling_cap) *rolling_cap = 0;
+    if (rolling_h) *rolling_h = 0;
+    if (rolling_bound) *rolling_bound = 0;
     try {
         const auto config = prefill_reclaim_config(options,model,manifest,environment,page);
-        return config ? ple_reclaim::plan_prompt(*config,build_ple_hash_contract(model),options.tokens).stats.credit_bytes : 0;
+        if (!config) return 0;
+        const auto stats = ple_reclaim::plan_prompt(*config,build_ple_hash_contract(model),options.tokens).stats;
+        if (rolling_cap && config->rolling_positions)
+            *rolling_cap = ple_reclaim::rolling_budget(*config, build_ple_hash_contract(model).head_count).cap;
+        if (rolling_h) *rolling_h = config->rolling_positions;
+        if (rolling_bound && config->rolling_positions)
+            *rolling_bound = prefill_checked_add(stats.admitted_bytes, config->stored_row_bytes * config->table_rows - stats.reclaimable_bytes);
+        return stats.credit_bytes;
     } catch (const std::exception&) { return 0; }
 }
 inline void require_effective_prefill_execution(const EffectiveConfig& config) {
     if (!config.error.empty()) throw std::invalid_argument(config.error);
+}
+inline std::uint64_t prefill_rolling_owner_bytes(const Options& options, const ModelContract& model,
+    const ModelManifest& manifest, const Environment& environment, std::optional<std::uint64_t> page) {
+    const auto config = prefill_reclaim_config(options,model,manifest,environment,page);
+    return config && config->rolling_positions ? ple_reclaim::planned_owner_bytes(*config,
+        build_ple_hash_contract(model).head_count,options.tokens.size()) : 0U;
 }
 // Shared CPU preflight for execution and HTTP --print-effective-config. Capacity
 // requiring actual device allocations is resolved later and remains provisional.
@@ -259,6 +309,8 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
         return resolve_yarn_config(request, model, info, manifest, verified_content, capabilities, memory);
     EffectiveConfig result;
     result.options = request.options;
+    result.options.ple_rolling_explicit_opt_in=env_is(request.environment,"STRIX_PLE_ROLLING","1");
+    result.options.qsa_mtp_pool_explicit_opt_in=env_is(request.environment,"STRIX_QSA_MTP_POOL","1");
     result.gsq_owner = qpf2k::has_gsq_gate(manifest);
     result.environment = request.environment;
     for (const auto& name : request.options.supplied_options) result.sources[name] = OptionSource::explicit_value;
@@ -322,6 +374,9 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
         else if (!o.known_prefix_window && o.tokens.size() > o.context_tokens)
             result.error = "Qwen auto-prefill declined: " + result.reason + "; prompt has " + std::to_string(o.tokens.size()) +
                 " tokens, exceeding serial prefill context " + std::to_string(o.context_tokens) + "; cannot use serial prefill";
+        if (o.mtp.enabled)
+            result.ple_reclaim_credit = prefill_reclaim_credit(o, model, manifest, result.environment,
+                memory.ple_reclaim_page, &result.ple_rolling_h, &result.ple_rolling_bound, &result.ple_rolling_cap);
         return result;
     };
     if (baseline) return decline("baseline");
@@ -399,7 +454,9 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
         const auto primary_rows = candidate.known_prefix_prefill_rows;
         const auto primary = candidate;
         const auto arithmetic_fallback = result.arithmetic_fallback;
-        const auto credit = prefill_reclaim_credit(candidate, model, manifest, request.environment, memory.ple_reclaim_page);
+        std::uint64_t rolling_h = 0, rolling_bound = 0, rolling_cap = 0;
+        const auto credit = prefill_reclaim_credit(candidate, model, manifest, request.environment, memory.ple_reclaim_page,
+            &rolling_h, &rolling_bound, &rolling_cap);
         std::vector<std::uint32_t> trials{primary_rows};
         for (const auto rows : {4096U,2048U}) if (rows < primary_rows) trials.push_back(rows);
         std::string failed_reason = "insufficient-memory";
@@ -436,7 +493,10 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
                 auto live = UmaOwnerInventory{};
                 live.reservation_upper_bound_bytes = add(required.model_backing - std::min(required.model_backing, credit),
                     add(required.state_d1, required.serial_scratch));
-                const auto growth = add(required.workspace, add(required.metadata, add(required.tails, candidate.known_prefill_host_headroom)));
+                const auto rolling_owner = prefill_rolling_owner_bytes(candidate,model,manifest,
+                    request.environment,memory.ple_reclaim_page);
+                const auto growth = add(rolling_owner, add(required.workspace,
+                    add(required.metadata, add(required.tails, candidate.known_prefill_host_headroom))));
                 if (!required.workspace || !required.metadata || add(required.workspace, required.tails) > candidate.known_prefill_workspace_budget ||
                     required.metadata > candidate.known_prefill_metadata_budget || *memory.gtt_used > *memory.gtt_limit ||
                     add(required.device_base, add(required.workspace, required.tails)) > *memory.gtt_limit - *memory.gtt_used)
@@ -445,6 +505,9 @@ inline EffectiveConfig resolve_prefill_effective_config(const RequestedOptions& 
                     throw std::runtime_error("insufficient-memory");
                 (void)plan_uma_reservation_growth(live, growth, required.runtime_payload, {uma, uma});
                 result.ple_reclaim_credit = credit;
+                result.ple_rolling_h = rolling_h;
+                result.ple_rolling_bound = rolling_bound;
+                result.ple_rolling_cap = rolling_cap;
                 result.host_compilation = required.organization;
                 for (const char* name : {"--known-prefix-window", "--known-prefix-full-rows", "--known-prefix-expert-union",
                         "--known-window-router-rows", "--known-prefix-prefill-rows", "--known-prefix-output-policy",
@@ -954,6 +1017,19 @@ inline serve::Json session_modes_json(const Options& o) {
     }
     return modes;
 }
+inline std::string yarn_mtp_storage_receipt(const EffectiveConfig& config) {
+    if (config.options.rotary.mode() != RotaryMode::yarn || !config.options.mtp.enabled ||
+        !config.admission.contains("storage_ladder_step")) return {};
+    std::string out = "\"yarn_mtp_storage\":{\n";
+    bool first = true;
+    for (const char* name : {"storage_ladder_step", "ple_rolling_positions", "ple_rolling_cap_bytes",
+            "qsa_score_ring_rows", "prefill_pipe"})
+    {
+        out += (first ? "" : ",") + std::string("\"") + name + "\":" + std::to_string(config.admission.at(name));
+        first = false;
+    }
+    return out + "},\n\"storage_ladder_step\":" + std::to_string(config.admission.at("storage_ladder_step")) + ",\n";
+}
 inline std::string effective_config_json(const EffectiveConfig& config) {
     const auto& o = config.options;
     std::ostringstream out;
@@ -964,7 +1040,26 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     else out << "{\"rotary\":" << o.rotary.json() << ',';
     if (!o.suppressed_yarn_request.empty())
         out << "\"suppressed_yarn_request\":\"" << yarn_json_error(o.suppressed_yarn_request) << "\",";
+    // YaRN preflight can verify a drop before device setup. Native inspection
+    // retains its historical predicted-only serialization.
+    out << yarn_mtp_storage_receipt(config);
+    if (config.ple_rolling_h) {
+        out << "\"ple_mode\":\"rolling\",\"ple_rolling_positions\":" << config.ple_rolling_h
+            << ",\"ple_rolling_bound_bytes\":" << config.ple_rolling_bound
+            << ",\"ple_rolling_cap_bytes\":" << config.ple_rolling_cap
+            << ",\"ple_verified_credit_bytes\":" << (o.rotary.mode()==RotaryMode::yarn?config.ple_reclaim_credit:0U)
+            << ",\"ple_credit_verification\":\"" << (o.rotary.mode()==RotaryMode::yarn && config.ple_reclaim_credit?"verified-pre-device-drop":"runtime-setup-required") << "\",";
+    }
     if (o.rotary.mode() == RotaryMode::yarn) {
+        out << "\"yarn_decode_route\":{\"requested\":\"" << (o.mtp.enabled?"mtp":"serial")
+            << "\",\"effective\":\"" << (config.admitted?(o.mtp.enabled?"mtp":"serial"):"refused")
+            << "\",\"source\":\"" << (env_is(config.environment,"STRIX_QWEN_YARN_MTP","0")?
+                "STRIX_QWEN_YARN_MTP=0":o.mtp.enabled?"explicit--mtp":"serial-default-no-bundle-resolver")
+            << "\",\"gpu_qualified\":false,\"contract_version\":1,\"capacity\":" << o.context_tokens
+            << ",\"verifier_requires_serial_rows\":true,\"predictor_position\":\"hidden-source\"},";
+        if(o.mtp.enabled) out << "\"yarn_mtp_assets\":{\"target_content\":\"" << o.mtp.target_content
+            << "\",\"sidecar_sha256\":\"" << o.mtp.sidecar_sha256 << "\",\"golden_sha256\":\"" << o.mtp.golden_sha256
+            << "\",\"draft_chain\":" << (o.mtp.draft_chain?"true":"false") << ",\"draft_q4\":" << (o.mtp.draft_q4?"true":"false") << "},";
         out << "\"admission\":{";
         bool first = true;
         for (const auto& [name, bytes] : config.admission) {
@@ -977,6 +1072,11 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         << (config.environment.contains("STRIX_BITCALC_LOGITS_OUT") ? "true" : "false")
         << ",\"forced_tokens\":"
         << (config.environment.contains("STRIX_BITCALC_FORCE_TOKENS") ? "true" : "false") << "},";
+    if(qsa_mtp_pool_route(o,config.gsq_owner)) {
+        const auto plan=mtp_qsa_pool_plan(o.context_tokens);
+        out << "\"qsa_mtp_pool\":{\"requested\":true,\"effective\":\"runtime-admission-required\",\"format\":\"bf16\",\"entries\":13,\"key_bytes\":"
+            << plan.key_bytes << ",\"scratch_bytes\":" << plan.scratch_bytes << ",\"metadata_bytes\":" << plan.metadata_bytes << ",\"reserved_bytes\":" << plan.reserved_bytes << "},";
+    }
     serve::Json session=serve::Json::object();
     session.set("numerical_modes",session_modes_json(o));
     session.set("policy",serve::Json("qualified-serving-routes-only"));
@@ -1008,6 +1108,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     if (o.http_serve && o.http_batch) out << "null"; else out << 1;
     out << ",\"route\":\"" << (o.http_batch ? "batch" : "single")
         << "\",\"reason\":\"" << o.http_slot_reason << "\"},";
+    if (config.ple_rolling_cap) out << "\"ple_rolling_cap_bytes\":" << config.ple_rolling_cap << ',';
     if (o.http_serve) out << "\"serve_prefill_notice\":" << serve::Json(config.serve_prefill_notice).dump() << ',';
     out << "\"admitted\":" << (config.admitted ? "true" : "false") << ",\"reason\":\"" << config.reason
         << "\",\"tile_fallback\":\"" << config.tile_fallback
@@ -1029,6 +1130,9 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     bool first = true;
     for (const auto& [name,value] : config.environment) {
         if (name == "STRIX_BITCALC_LOGITS_OUT" || name == "STRIX_BITCALC_FORCE_TOKENS") continue;
+        if (!config.ple_rolling_cap && name == "STRIX_PLE_ROLLING_CAP_BYTES") continue;
+        if (!config.ple_rolling_h && (name == "STRIX_PLE_ROLLING" ||
+            name == "STRIX_PLE_ROLLING_POSITIONS" || name == "STRIX_PLE_ROLLING_CAP_BYTES")) continue;
         // Values are externally supplied strings, so quote every control byte.
         const auto quote = [](std::string_view text) {
             std::ostringstream escaped;

@@ -16,6 +16,7 @@
 #include <array>
 #include <cstdint>
 #include <vector>
+#include <string>
 
 namespace strix {
 
@@ -108,6 +109,8 @@ struct KnownWindowRequest {
     // MoE combine and attn/mlp inject for all rows in one launch each. The
     // last-layer MLP inject stays a row loop: MTP target capture observes it.
     bool combine_inject_rows = false;
+    // Verify against the serial target; unmatched promotions retain serial rows.
+    bool require_serial_rows = false;
 };
 
 struct CompiledKnownPrefixWindow {
@@ -158,14 +161,44 @@ struct CompiledKnownPrefixWindow {
 // Closed serial-derived rows only. Actual native owner admission also checks
 // runtime folds/model family. Recipe identities describe the executed window;
 // they are not relabelled as serial identities to claim equivalence.
+[[nodiscard]] inline bool known_window_variant_serial_rows(KnownWindowR2Variant v) noexcept {
+    return v!=KnownWindowR2Variant::gdn_q8_virtual256_r2_v1 &&
+        static_cast<std::uint32_t>(v)<=static_cast<std::uint32_t>(KnownWindowR2Variant::routed_a8_union_rows8_v1);
+}
+struct KnownWindowStepSelection {
+    KnownWindowStepMode mode;
+    KnownWindowR2Variant variant;
+};
+// Every complete serial source already supplies the fallback launcher. Unknown
+// window variants can never acquire admission by inheriting a future enum value.
+[[nodiscard]] inline KnownWindowStepSelection known_window_select_serial_rows(
+    bool required, KnownWindowStepMode mode, KnownWindowR2Variant variant) noexcept {
+    return required && !known_window_variant_serial_rows(variant)
+        ? KnownWindowStepSelection{KnownWindowStepMode::r1_row_loop,KnownWindowR2Variant::none}
+        : KnownWindowStepSelection{mode,variant};
+}
 [[nodiscard]] inline bool known_window_policy_serial_rows(const CompiledKnownPrefixWindow& window) noexcept {
     if(window.output_policy!=KnownWindowOutputPolicy::all_rows ||
        (window.logical_rows!=2U && window.logical_rows!=4U && window.logical_rows!=8U))return false;
     for(const auto v:window.r2_variant)
-        if(v==KnownWindowR2Variant::gdn_q8_virtual256_r2_v1 ||
-           static_cast<std::uint32_t>(v)>static_cast<std::uint32_t>(KnownWindowR2Variant::routed_a8_union_rows8_v1))return false;
+        if(!known_window_variant_serial_rows(v))return false;
     return true;
 }
+// Runtime folds belong to the window owner, independently of process defaults.
+struct KnownWindowFolds {
+    bool inject_norm = false, combine_inject = false, commit_combine = false;
+};
+[[nodiscard]] inline KnownWindowFolds known_window_folds_for_route(bool serial_rows, KnownWindowFolds requested) noexcept {
+    return serial_rows ? KnownWindowFolds{} : requested;
+}
+[[nodiscard]] inline bool known_window_policy_selection_admitted(const CompiledKnownPrefixWindow& window,
+    bool prefill, bool gsq, KnownWindowFolds folds) noexcept {
+    return !prefill && !gsq && !folds.inject_norm && !folds.combine_inject && !folds.commit_combine &&
+        known_window_policy_serial_rows(window);
+}
+// Setup witness of the selected entries (not numerical qualification).
+[[nodiscard]] std::string known_window_arithmetic_witness(const CompiledKnownPrefixWindow& window,
+    bool serial_rows_required, bool prefill, bool gsq, KnownWindowFolds folds);
 // Modes dispatched through one KnownWindowRowsEntry covering every row.
 [[nodiscard]] inline bool known_window_rows_mode(KnownWindowStepMode mode) noexcept {
     return mode == KnownWindowStepMode::shared_rows || mode == KnownWindowStepMode::gdn_rows ||

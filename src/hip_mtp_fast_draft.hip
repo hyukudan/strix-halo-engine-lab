@@ -238,7 +238,11 @@ __global__ void mtp_q8_to_q4(const unsigned char* q8,std::uint64_t blocks,unsign
         target[2+j]=static_cast<unsigned char>(lo|(hi<<4U));
     }
 }
-struct Q4Copies {std::mutex lock;std::vector<std::pair<const void*,void*>> copies;};
+struct Q4Copy {
+    const void* first;void* second;std::uint64_t elements,generation;
+    ModelContentIdentity content;std::shared_ptr<const void> source_owner;
+};
+struct Q4Copies {std::mutex lock;std::vector<Q4Copy> copies;};
 Q4Copies& q4_copies() {static Q4Copies c;return c;}
 __global__ void mtp_dequantize_q8(const unsigned char* q8,std::uint64_t elements,float* output) {
     const auto i=static_cast<std::uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x;if(i>=elements) return;
@@ -258,16 +262,27 @@ void launch_hip_mtp_dequantize_q8(const void* q8,std::uint64_t elements,float* o
         static_cast<const unsigned char*>(q8),elements,output);
     check(hipGetLastError(),"MTP Q8 dequantize launch");
 }
-void register_hip_mtp_draft_q4(const void* q8,std::uint64_t elements,void* stream) {
+void register_hip_mtp_draft_q4(const void* q8,std::uint64_t elements,void* stream,
+    std::shared_ptr<const void> source_owner,std::uint64_t generation,ModelContentIdentity content) {
+    if(source_owner && (!generation || !content.valid())) throw std::invalid_argument("MTP Q4 retained source requires generation/content pins");
     if(!q8 || !elements || elements%32U || !stream) throw std::invalid_argument("MTP draft Q4 copy views are invalid");
     auto& c=q4_copies();const std::lock_guard guard(c.lock);
-    for(const auto& known:c.copies) if(known.first==q8) return;
+    // The table-backed CLI admits one pinned sidecar source per process. Retain
+    // it with the converted images so recycled source addresses cannot match.
+    if(source_owner) for(const auto& known:c.copies) if(known.source_owner &&
+        (known.source_owner.get()!=source_owner.get() || known.content!=content))
+        throw std::invalid_argument("YaRN MTP Q4 registry already owns another sidecar");
+    for(const auto& known:c.copies) if(known.first==q8) {
+        if(source_owner) require_same_mtp_q4_source({known.source_owner,known.generation,known.elements,known.content},
+            {source_owner,generation,elements,content});
+        return;
+    }
     const auto blocks=elements/32U;void* q4=nullptr;
     check(hipMalloc(&q4,blocks*18U),"MTP draft Q4 copy");
     hipLaunchKernelGGL(mtp_q8_to_q4,dim3(static_cast<unsigned>((blocks+255U)/256U)),dim3(256),0,static_cast<hipStream_t>(stream),
         static_cast<const unsigned char*>(q8),blocks,static_cast<unsigned char*>(q4));
     check(hipGetLastError(),"MTP draft Q4 conversion launch");
-    c.copies.emplace_back(q8,q4);
+    c.copies.push_back({q8,q4,elements,generation,content,std::move(source_owner)});
 }
 const void* hip_mtp_draft_q4(const void* q8) noexcept {
     auto& c=q4_copies();const std::lock_guard guard(c.lock);

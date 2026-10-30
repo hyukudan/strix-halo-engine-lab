@@ -1,5 +1,6 @@
 #include "strix/qsa_prefill_stage_plan.hpp"
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/qsa_committed_pool.hpp"
 #include "strix/hip_qwen_rotary_table.hpp"
 #include "strix/hip_qwen_rotary_diagnostic.hpp"
 #if defined(STRIX_BUILD_QWEN_ROTARY_DIAGNOSTIC)
@@ -3096,6 +3097,61 @@ WorkspacePointers workspace_pointers(
 }
 
 // Complete metadata-only preparation. GPU input values are never read here.
+struct QsaPrefillPool {
+    std::uint32_t mtp_role=13U;
+    float* keys = nullptr;
+    // STRIX_QSA_POOL_PACKED=1 (prefill pool, opt-in; the baseline keeps it off): the same keys as BF16 bits, written by
+    // the pool kernels together with keys and read by qsa_flash::score_kernel instead of them (half the key reads, same
+    // bits). Off by default: with 32/64 rows per CTA the scorer is arithmetic-bound and the widening costs more than the
+    // reads save (tests/qsa_score_rows.hip: +3-4 % at <= 32768 blocks, -3 % at 129024 / 262144 vs 32 rows, +5 % vs 64).
+    std::uint16_t* packed = nullptr;
+    std::uint32_t capacity = 0, valid = 0;
+    std::shared_ptr<const HipQwenRotaryTable> rotary_table;
+};
+std::mutex& qsa_prefill_pool_mutex() { static std::mutex mutex;return mutex; }
+QsaPrefillPool& qsa_prefill_pool_storage() { static QsaPrefillPool pool;return pool; }
+} // namespace
+#include "hip_qsa_committed_pool.inc"
+namespace {
+
+// Diagnostic replay uses captured score bytes already checked against raw keys.
+// It restores both score mutations and selected IDs before any downstream consumer.
+class MtpPoolSelectionCheck {
+    std::shared_ptr<HipQsaCommittedPool> owner_;
+    HipQsaPoolRowDescriptor row_{};
+    hipStream_t stream_=nullptr;
+    std::vector<float> before_;
+public:
+    MtpPoolSelectionCheck(std::shared_ptr<HipQsaCommittedPool> owner,HipQsaPoolRowDescriptor row,hipStream_t stream)
+        :owner_(std::move(owner)),row_(row),stream_(stream) {
+        const char* v=std::getenv("STRIX_QSA_MTP_POOL_CHECK");
+        if (!owner_ || !v || v[0]!='1' || row.complete_blocks<=row.topk) {owner_.reset();return;}
+        before_.resize(row.complete_blocks);
+        check_hip(hipMemcpyAsync(before_.data(),row.scores,before_.size()*sizeof(float),hipMemcpyDeviceToHost,stream_),"MTP selection check before");
+        check_hip(hipStreamSynchronize(stream_),"MTP selection check before completion");
+    }
+    void finish() {
+        if (!owner_) return;
+        const auto count=std::min(row_.complete_blocks,row_.topk)*4U+row_.visible%4U;
+        std::vector<float> after(before_.size()),reference(before_.size());
+        std::vector<std::uint32_t> selected(count),ref_selected(count);
+        const auto pull=[&](auto& scores,auto& ids) {
+            check_hip(hipMemcpyAsync(scores.data(),row_.scores,scores.size()*sizeof(float),hipMemcpyDeviceToHost,stream_),"MTP selection check scores");
+            check_hip(hipMemcpyAsync(ids.data(),row_.selected,ids.size()*sizeof(std::uint32_t),hipMemcpyDeviceToHost,stream_),"MTP selection check indices");
+            check_hip(hipStreamSynchronize(stream_),"MTP selection check result completion");
+        };
+        pull(after,selected);
+        check_hip(hipMemcpyAsync(row_.scores,before_.data(),before_.size()*sizeof(float),hipMemcpyHostToDevice,stream_),"MTP selection check input restore");
+        hipLaunchKernelGGL(select_blocks_kernel,dim3(1),dim3(kSelectThreads),0,stream_,row_.scores,row_.complete_blocks,row_.topk,4U,
+            row_.visible,row_.selected,GraphSelectionArguments{});
+        check_hip(hipGetLastError(),"MTP selection check reference launch");pull(reference,ref_selected);
+        const bool equal=selected==ref_selected && std::memcmp(after.data(),reference.data(),after.size()*sizeof(float))==0;
+        check_hip(hipMemcpyAsync(row_.scores,after.data(),after.size()*sizeof(float),hipMemcpyHostToDevice,stream_),"MTP selection check output restore");
+        check_hip(hipMemcpyAsync(row_.selected,selected.data(),selected.size()*sizeof(std::uint32_t),hipMemcpyHostToDevice,stream_),"MTP selection check indices restore");
+        check_hip(hipStreamSynchronize(stream_),"MTP selection check restore completion");
+        owner_->checked(count+before_.size(),equal?0U:1U);
+    }
+};
 struct PreparedIndexedLaunch {
     ExecutionBufferAddress input, output, temporary;
     IndexedAttentionWorkspaceLayout workspace_layout;
@@ -3115,7 +3171,8 @@ struct PreparedIndexedSelection {
 // Eager serial step with HipIndexedAttentionLauncherConfig::decode_pool: block scores from the persistent pooled keys
 // (defined after HipQsaWindowPool). False when the pool cannot serve this step; the caller then runs block_score_kernel.
 bool qsa_decode_pool_scores(const PreparedIndexedLaunch& a, const HipIndexedAttentionLauncherConfig& config, std::uint64_t position,
-    std::uint32_t complete_blocks, std::uint32_t ratio);
+    std::uint32_t complete_blocks, std::uint32_t ratio, QsaPrefillPool* borrowed = nullptr,
+    const std::shared_ptr<HipQsaCommittedPool>& committed_owner = {});
 // After qsa_decode_pool_scores: the selection from the scores' 4-block group maxima (qsa_flash::select_row_body, the
 // selected set, order and -inf writes of select_blocks_kernel). False when not enabled or no maxima scratch.
 bool qsa_decode_pool_select(const PreparedIndexedLaunch& a, const HipIndexedAttentionLauncherConfig& config,
@@ -3619,6 +3676,13 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
         static_cast<const HipIndexedAttentionLauncherConfig*>(user_data));
     require_qsa_score_source(!prepared.workspace_layout.block_scores_bytes,prepared.workspace.block_scores!=nullptr);
     const auto& config = *static_cast<const HipIndexedAttentionLauncherConfig*>(user_data);
+    const auto& committed_pool=(context.resources && context.resources->qsa_committed_pool)
+        ? context.resources->qsa_committed_pool : config.committed_pool;
+    std::unique_ptr<HipQsaCommittedAccess> committed_access;
+    if (committed_pool) committed_access=committed_pool->before_rewrite(false,
+        prepared.raw_state.address,prepared.raw_state.bytes,prepared.raw_state.allocation_generation,
+        *prepared.tensors.index_k_norm.runtime,prepared.tensors.index_k_norm.manifest->ggml_type,config.model,
+        context.position,1U,hip_execution_stream(),!(context.resources && context.resources->qsa_pool_speculative));
 #if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
     HipDenseTrellisScope arithmetic(config.dense_trellis_projections);
 #endif
@@ -3735,8 +3799,9 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
                 "HIP hierarchical QSA local status reset");
             score_selection.position.status = workspace.selection_status;
         }
-        const bool decode_pooled = !device_graph && !config.qsa_hierarchical_selection && config.decode_pool &&
-            qsa_decode_pool_scores(prepared, config, context.position, complete_blocks, ratio);
+        const bool decode_pooled = !device_graph && !config.qsa_hierarchical_selection && (config.decode_pool || committed_access) &&
+            qsa_decode_pool_scores(prepared, config, context.position, complete_blocks, ratio,
+                committed_access ? static_cast<QsaPrefillPool*>(committed_access->storage()) : nullptr,committed_pool);
         if (!decode_pooled)
         launch_block_scores(
             workspace,
@@ -3744,6 +3809,8 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
             tensors.index_k_norm,
             model,
             std::max(complete_blocks, 1U), score_selection);
+        MtpPoolSelectionCheck selection_check(committed_pool,{workspace.index_query,workspace.block_scores,workspace.selected_indices,
+            visible,complete_blocks,block_topk,0U,nullptr},hip_execution_stream());
         if (config.qsa_hierarchical_selection) {
             using namespace qsa_selection_diagnostic;
             const Shape shape{complete_blocks, visible - complete_blocks * ratio};
@@ -3775,6 +3842,7 @@ void launch_indexed_attention(const ExecutionDispatchContext& context, void* use
             hipGetLastError(),
             "HIP indexed-attention top-k block selection");
         }
+        selection_check.finish();
     }
 
     // Main Q/K/V projections.
@@ -5711,16 +5779,7 @@ bool launch_qsa_fast_prefill(const QsaKnownRows<Rows>& prepared, const PreparedI
 // Pooled block keys of one prefill call (block_pool_kernel): blocks [0, valid) are formed from the
 // raw keys this call's groups and the earlier context left; keys has room for capacity blocks.
 // The serial decode owner instead uses packed alone when its admitted BF16 storage policy is enabled.
-struct QsaPrefillPool {
-    float* keys = nullptr;
-    // STRIX_QSA_POOL_PACKED=1 (prefill pool, opt-in; the baseline keeps it off): the same keys as BF16 bits, written by
-    // the pool kernels together with keys and read by qsa_flash::score_kernel instead of them (half the key reads, same
-    // bits). Off by default: with 32/64 rows per CTA the scorer is arithmetic-bound and the widening costs more than the
-    // reads save (tests/qsa_score_rows.hip: +3-4 % at <= 32768 blocks, -3 % at 129024 / 262144 vs 32 rows, +5 % vs 64).
-    std::uint16_t* packed = nullptr;
-    std::uint32_t capacity = 0, valid = 0;
-    std::shared_ptr<const HipQwenRotaryTable> rotary_table;
-};
+
 void bind_qwen_pool(QsaPrefillPool* pool, const ModelContract& model) {
     if (!pool) return;
     if (pool->valid && pool->rotary_table != model.qwen_rotary_table)
@@ -5926,17 +5985,21 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         model.attention_kv_storage == AttentionKvStorage::bf16;
     // Prefill groups (Rows > 8) and, with STRIX_QSA_WINDOW_POOLED=1, verify windows of 2/4/8 rows
     // (indexed_attention_known_window_rows_launch passes a pool then).
-    const bool pooled = pool && pool->keys && scored_blocks <= pool->capacity && a.index_dim == 128U && index_heads == 4U;
+    const bool pooled = pool && (pool->keys || pool->packed) && scored_blocks <= pool->capacity && a.index_dim == 128U && index_heads == 4U;
     if ((subparts & 4U) && scored_blocks && pooled) {
         {
             if (scored_blocks > pool->valid) {
                 dispatch_small_kind(tensors.index_k_norm.manifest->ggml_type, [&](auto kind) {
                     with_qwen_rotary(model, stream, [&](auto... rotary_source) {
-                        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<decltype(kind)::value, false, false, decltype(rotary_source)...>), dim3(scored_blocks - pool->valid),
-                            dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream,
-                            reinterpret_cast<const std::uint16_t*>(a.raw_state.address), pool->valid, a.index_dim, s0.ratio,
-                            reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address), model.rms_norm_epsilon, rotary,
-                            model.rope_theta, pool->keys, static_cast<const uint2*>(nullptr), 0U, pool->packed, rotary_source...);
+                        const auto build=[&]<bool PackedOnly>() {
+                            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<decltype(kind)::value, false, PackedOnly, decltype(rotary_source)...>), dim3(scored_blocks - pool->valid),
+                                dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream,
+                                reinterpret_cast<const std::uint16_t*>(a.raw_state.address), pool->valid, a.index_dim, s0.ratio,
+                                reinterpret_cast<const void*>(tensors.index_k_norm.runtime->address), model.rms_norm_epsilon, rotary,
+                                model.rope_theta, pool->keys, static_cast<const uint2*>(nullptr), 0U, pool->packed, rotary_source...);
+                        };
+                        if (!pool->keys && pool->packed) build.template operator()<true>();
+                        else build.template operator()<false>();
                     });
                 });
                 check_hip(hipGetLastError(), "QSA prefill block-pool launch");
@@ -6033,8 +6096,18 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                         dim3(kThreads), 0, stream, scores, static_cast<const float*>(pool->keys), scored_blocks, a.index_dim);
                     return;
                 }
+                if constexpr (Rows<=8U) {
+                    if (!pool->keys && pool->packed) {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<Rows, R, std::uint16_t>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)),
+                        dim3(kThreads), 0, stream, scores, static_cast<const std::uint16_t*>(pool->packed), scored_blocks, a.index_dim);
+                } else {
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<Rows, R>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)),
                     dim3(kThreads), 0, stream, scores, static_cast<const float*>(pool->keys), scored_blocks, a.index_dim);
+                    }
+                } else {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<Rows, R>), dim3(static_cast<std::uint32_t>((waves + 7U) / 8U)),
+                        dim3(kThreads), 0, stream, scores, static_cast<const float*>(pool->keys), scored_blocks, a.index_dim);
+                }
             };
             if (rows_per_wave == 1U) score.template operator()<1U>();
             else if (rows_per_wave == 2U) score.template operator()<2U>();
@@ -6043,7 +6116,8 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
             check_hip(hipGetLastError(), "QSA prefill pooled block-score launch");
             // STRIX_QSA_POOLED_CHECK=1: compare every row's block scores with block_score_rows_kernel's.
             static const bool check = [] { const char* v = std::getenv("STRIX_QSA_POOLED_CHECK"); return v && v[0] == '1'; }();
-            if (check) {
+            const bool mtp_check=config.committed_pool && std::getenv("STRIX_QSA_MTP_POOL_CHECK") && std::getenv("STRIX_QSA_MTP_POOL_CHECK")[0]=='1';
+            if (check || mtp_check) {
                 const auto copy = [&] {
                     check_hip(hipStreamSynchronize(stream), "QSA pooled check sync");
                     std::vector<float> all;
@@ -6067,6 +6141,16 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                 const auto reference = copy();
                 std::size_t differing = 0;
                 for (std::size_t i = 0; i < fast.size(); ++i) differing += std::memcmp(&fast[i], &reference[i], sizeof(float)) != 0;
+                if (mtp_check) {
+                    std::size_t at=0;
+                    for (unsigned r=0;r<Rows;++r) {
+                        if (scores.blocks[r]) check_hip(hipMemcpyAsync(scores.block_scores[r],fast.data()+at,scores.blocks[r]*sizeof(float),
+                            hipMemcpyHostToDevice,stream),"MTP window check restore scores");
+                        at+=scores.blocks[r];
+                    }
+                    check_hip(hipStreamSynchronize(stream),"MTP window check restore completion");
+                    config.committed_pool->checked(fast.size(),differing,pool->mtp_role);
+                }
                 static std::atomic<std::uint64_t> groups{0}, compared{0}, total_differing{0};
                 const auto g = groups.fetch_add(1U) + 1U;
                 const auto c = compared.fetch_add(fast.size()) + fast.size();
@@ -6093,6 +6177,13 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     const bool qpf2k_trace_group = Rows >= 16U && !cohort_slot && qpf2k_trace_enabled() && (subparts & 8U);
     if (qpf2k_trace_group && scored_blocks)
         qpf2k_trace_rows<Rows>(0U, prepared.position, [&](unsigned r) { return scores.block_scores[r]; }, [&](unsigned r) { return scores.blocks[r]; }, stream);
+    std::vector<std::unique_ptr<MtpPoolSelectionCheck>> mtp_selection_checks;
+    if(config.committed_pool && (subparts & 8U) && std::getenv("STRIX_QSA_MTP_POOL_CHECK") &&
+        std::getenv("STRIX_QSA_MTP_POOL_CHECK")[0]=='1') for(unsigned r=0;r<Rows;++r) {
+        const auto& w=prepared.row[r].workspace;const auto& sr=prepared.selection[r];
+        mtp_selection_checks.push_back(std::make_unique<MtpPoolSelectionCheck>(config.committed_pool,
+            HipQsaPoolRowDescriptor{w.index_query,w.block_scores,w.selected_indices,sr.visible,sr.complete_blocks,sr.block_topk,0U,nullptr},stream));
+    }
     bool qpf2k_deferred = false;
     if ((subparts & 8U) && qpf2k_maxima && qpf2k_defer) {
         auto& sb = qpf2k_select_batch();
@@ -6111,6 +6202,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         hipLaunchKernelGGL(HIP_KERNEL_NAME(select_rows_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, stream, select, s0.ratio, s0.block_topk);
     }
     check_hip(hipGetLastError(), "QSA known-window selection launch");
+    for(auto& check:mtp_selection_checks) check->finish();
     if (qpf2k_trace_group && qpf2k_deferred) {
         Qpf2kSelectGroup g{};
         g.rows = Rows;
@@ -6769,8 +6861,8 @@ void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const 
     // Pooled block keys (STRIX_QSA_PREFILL_POOLED=0 keeps block_score_rows_kernel): one device
     // buffer for the context's blocks, reused by every layer's call on the execution stream.
     static const bool pooled = [] { const char* v = std::getenv("STRIX_QSA_PREFILL_POOLED"); return !v || v[0] != '0'; }();
-    static std::mutex pool_mutex;
-    static QsaPrefillPool pool_storage;
+    auto& pool_mutex=qsa_prefill_pool_mutex();
+    auto& pool_storage=qsa_prefill_pool_storage();
     std::unique_lock<std::mutex> pool_lock(pool_mutex, std::defer_lock);
     QsaPrefillPool* pool = nullptr;
     if (pooled) {
@@ -7171,10 +7263,11 @@ std::shared_ptr<HipQsaWindowPool> make_hip_qsa_decode_pool(bool bf16_keys) { ret
 // step). The selection that follows is unchanged. get() drops every block at or after floor(position / ratio).
 namespace {
 bool qsa_decode_pool_scores(const PreparedIndexedLaunch& a, const HipIndexedAttentionLauncherConfig& config, std::uint64_t position,
-    std::uint32_t complete_blocks, std::uint32_t ratio) {
+    std::uint32_t complete_blocks, std::uint32_t ratio, QsaPrefillPool* borrowed,
+    const std::shared_ptr<HipQsaCommittedPool>& committed_owner) {
     const auto& model = config.model;
-    if (!config.decode_pool || a.index_dim != 128U || model.indexer_n_heads != 4U || !ratio || !complete_blocks) return false;
-    auto* pool = config.decode_pool->get(a, ratio, position);
+    if ((!config.decode_pool && !borrowed) || a.index_dim != 128U || model.indexer_n_heads != 4U || !ratio || !complete_blocks) return false;
+    auto* pool = borrowed ? borrowed : config.decode_pool->get(a, ratio, position);
     if (!pool || (!pool->keys && !pool->packed) || complete_blocks > pool->capacity) return false;
     // Explicit YaRN forms the pooled keys from the model's rotary table, as the prefill pools do (bind_qwen_pool keeps
     // one table per pool; with_qwen_rotary passes the same source block_score_kernel reads).
@@ -7213,7 +7306,8 @@ bool qsa_decode_pool_scores(const PreparedIndexedLaunch& a, const HipIndexedAtte
     }
     check_hip(hipGetLastError(), "QSA decode pooled block-score launch");
     static const bool check = [] { const char* v = std::getenv("STRIX_QSA_DECODE_POOL_CHECK"); return v && v[0] == '1'; }();
-    if (check) {
+    const bool mtp_check=committed_owner && std::getenv("STRIX_QSA_MTP_POOL_CHECK") && std::getenv("STRIX_QSA_MTP_POOL_CHECK")[0]=='1';
+    if (check || mtp_check) {
         std::vector<float> pooled(complete_blocks), reference(complete_blocks);
         check_hip(hipMemcpyAsync(pooled.data(), a.workspace.block_scores, complete_blocks * sizeof(float), hipMemcpyDeviceToHost, stream),
             "QSA decode pool check copy");
@@ -7224,6 +7318,11 @@ bool qsa_decode_pool_scores(const PreparedIndexedLaunch& a, const HipIndexedAtte
         check_hip(hipStreamSynchronize(stream), "QSA decode pool check sync");
         std::size_t differing = 0;
         for (std::uint32_t i = 0; i < complete_blocks; ++i) differing += std::memcmp(&pooled[i], &reference[i], sizeof(float)) != 0;
+        if (mtp_check) {
+            check_hip(hipMemcpyAsync(a.workspace.block_scores,pooled.data(),complete_blocks*sizeof(float),hipMemcpyHostToDevice,stream),"MTP pool check restore scores");
+            check_hip(hipStreamSynchronize(stream),"MTP pool check restore completion");
+            committed_owner->checked(complete_blocks,differing,pool->mtp_role);
+        }
         static std::atomic<std::uint64_t> steps{0}, compared{0}, total_differing{0};
         const auto s = steps.fetch_add(1U) + 1U;
         const auto c = compared.fetch_add(complete_blocks) + complete_blocks;
@@ -7319,14 +7418,22 @@ template <unsigned Rows>
 void enqueue_qsa_window_rows(std::span<const ExecutionDispatchContext> rows, const HipIndexedAttentionLauncherConfig& config,
     HipQsaIndexJournal journal) {
     const auto prepared = prepare_qsa_known_rows<Rows>(rows, config, journal);
-    auto* pool = qsa_window_pool(prepared.row[0], prepared.selection[0].ratio, config, prepared.position[0]);
+    std::unique_ptr<HipQsaCommittedAccess> access;
+    if (config.committed_pool) {
+        const auto& a=prepared.row[0];
+        access=config.committed_pool->before_rewrite(false,a.raw_state.address,a.raw_state.bytes,a.raw_state.allocation_generation,
+            *a.tensors.index_k_norm.runtime,a.tensors.index_k_norm.manifest->ggml_type,config.model,
+            prepared.position[0],Rows,hip_execution_stream(),true);
+    }
+    auto* pool=access?static_cast<QsaPrefillPool*>(access->storage()):
+        qsa_window_pool(prepared.row[0], prepared.selection[0].ratio, config, prepared.position[0]);
     enqueue_qsa_known_rows<Rows>(prepared, config, 7U, pool);
     // This owner may be idle while serial steps or other owners overwrite its
     // rejected rows. A later frontier could already be past the stale blocks,
     // so clamping only on the next call cannot detect them. Retain only blocks
     // known committed BEFORE this window; rebuild its newly formed blocks
     // (at most three for the canonical R8 / compress-ratio-four path).
-    if (pool && config.window_pool)
+    if (pool && config.window_pool && !access)
         pool->valid = std::min(pool->valid, static_cast<std::uint32_t>(prepared.position[0] / prepared.selection[0].ratio));
 }
 } // namespace
@@ -7476,12 +7583,22 @@ void indexed_attention_known_window_cohort_launch(std::span<const HipQsaCohortSe
     // (STRIX_QKERN_QSA_PERSISTENT=1) take part: the process-wide fallback pool is formed per call and
     // would be shared between the sessions of this window.
     std::vector<QsaPrefillPool*> pools(prepared.segments.size(), nullptr);
-    if (qsa_cohort_pool_enabled())
-        for (std::size_t s = 0; s < prepared.segments.size(); ++s)
-            if (segments[s].config->window_pool)
-                pools[s] = std::visit([&](const auto& p) {
-                    return qsa_window_pool(p.row[0], p.selection[0].ratio, *segments[s].config, p.position[0]);
-                }, prepared.segments[s]);
+    std::vector<std::unique_ptr<HipQsaCommittedAccess>> accesses;
+    if(std::any_of(segments.begin(),segments.end(),[](const auto& segment){return static_cast<bool>(segment.config->committed_pool);}))
+        accesses.resize(prepared.segments.size());
+    for(std::size_t s=0;s<prepared.segments.size();++s) {
+        const auto& c=*segments[s].config;
+        if(c.committed_pool) std::visit([&](const auto& p) {
+            const auto& a=p.row[0];
+            accesses[s]=c.committed_pool->before_rewrite(false,a.raw_state.address,a.raw_state.bytes,a.raw_state.allocation_generation,
+                *a.tensors.index_k_norm.runtime,a.tensors.index_k_norm.manifest->ggml_type,c.model,p.position[0],
+                static_cast<std::uint32_t>(segments[s].rows.size()),hip_execution_stream(),true);
+            pools[s]=static_cast<QsaPrefillPool*>(accesses[s]->storage());
+        },prepared.segments[s]);
+        else if(qsa_cohort_pool_enabled() && c.window_pool) pools[s]=std::visit([&](const auto& p) {
+            return qsa_window_pool(p.row[0],p.selection[0].ratio,c,p.position[0]);
+        },prepared.segments[s]);
+    }
     const auto per_session = [&](unsigned subparts) {
         for (std::size_t s = 0; s < prepared.segments.size(); ++s)
             std::visit([&](const auto& p) {
@@ -7500,12 +7617,73 @@ void indexed_attention_known_window_cohort_launch(std::span<const HipQsaCohortSe
     } else per_session(127U);
     // As enqueue_qsa_window_rows: keep only the blocks committed before this window (its rows may be rejected).
     for (std::size_t s = 0; s < prepared.segments.size(); ++s)
-        if (pools[s])
+        if (pools[s] && (accesses.empty() || !accesses[s]))
             std::visit([&](const auto& p) {
                 pools[s]->valid = std::min(pools[s]->valid, static_cast<std::uint32_t>(p.position[0] / p.selection[0].ratio));
             }, prepared.segments[s]);
     merged(4U);
 }
+
+
+#ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
+namespace {
+template<unsigned Rows> void qsa_committed_pool_probe(bool pooled,bool predictor,const std::shared_ptr<HipQsaCommittedPool>& owner,
+    const ModelContract& model,std::uintptr_t raw,std::uint64_t capacity,const RuntimeTensorBinding& norm,
+    std::uint64_t first,std::uint32_t writer_rows,std::span<const HipQsaPoolRowDescriptor> rows,hipStream_t stream) {
+    std::unique_ptr<HipQsaCommittedAccess> access;
+    if(pooled) access=owner->before_rewrite(predictor,raw,capacity*256U,1,norm,0,model,first,writer_rows,stream,true);
+    QsaRowsScoreViews<Rows> score{};QsaRowsSelectViews<Rows> select{};std::uint32_t blocks=0;
+    for(unsigned r=0;r<Rows;++r) {
+        score.index_query[r]=rows[r].query;score.block_scores[r]=rows[r].scores;score.blocks[r]=rows[r].complete_blocks;
+        blocks=std::max(blocks,score.blocks[r]);select.block_scores[r]=rows[r].scores;
+        select.selected[r]=rows[r].selected;select.visible[r]=rows[r].visible;
+    }
+    if(access && blocks) {
+        auto& pool=*static_cast<QsaPrefillPool*>(access->storage());bind_qwen_pool(&pool,model);
+        if(blocks>pool.valid) with_qwen_rotary(model,stream,[&](auto... source) {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<SmallWeightKind::f32,false,true,decltype(source)...>),
+                dim3(blocks-pool.valid),dim3(128),1024,stream,reinterpret_cast<const std::uint16_t*>(raw),pool.valid,128U,4U,
+                reinterpret_cast<const void*>(norm.address),model.rms_norm_epsilon,checked_u32(model.rotary_dim(),"probe rotary"),
+                model.rope_theta,nullptr,nullptr,0U,pool.packed,source...);
+        });
+        pool.valid=blocks;
+        constexpr unsigned Reuse=Rows<4?Rows:4;
+        const auto waves=(Rows/Reuse)*((blocks+31U)/32U);
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<Rows,Reuse,std::uint16_t>),dim3((waves+7U)/8U),dim3(256),0,stream,
+            score,static_cast<const std::uint16_t*>(pool.packed),blocks,128U);
+    } else if(blocks) with_qwen_rotary(model,stream,[&](auto... source) {
+        if constexpr (Rows==1) {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_kernel<SmallWeightKind::f32,decltype(source)...>),dim3(blocks),dim3(128),1024,stream,
+                rows[0].query,reinterpret_cast<const std::uint16_t*>(raw),4U,128U,4U,reinterpret_cast<const void*>(norm.address),
+                model.rms_norm_epsilon,checked_u32(model.rotary_dim(),"probe rotary"),model.rope_theta,rows[0].scores,GraphSelectionArguments{},source...);
+        } else {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_rows_kernel<SmallWeightKind::f32,Rows,decltype(source)...>),dim3(blocks),dim3(128),1024,stream,
+                score,reinterpret_cast<const std::uint16_t*>(raw),4U,128U,4U,reinterpret_cast<const void*>(norm.address),
+                model.rms_norm_epsilon,checked_u32(model.rotary_dim(),"probe rotary"),model.rope_theta,source...);
+        }
+    });
+    // topk==UINT32_MAX requests preselection scores only.
+    if(rows[0].topk!=UINT32_MAX) {
+        if constexpr (Rows==1) {
+            hipLaunchKernelGGL(select_blocks_kernel,dim3(1),dim3(kSelectThreads),0,stream,rows[0].scores,rows[0].complete_blocks,
+                rows[0].topk,4U,rows[0].visible,rows[0].selected,GraphSelectionArguments{});
+        } else {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(select_rows_kernel<Rows>),dim3(Rows),dim3(kSelectThreads),0,stream,select,4U,rows[0].topk);
+        }
+    }
+    check_hip(hipGetLastError(),"MTP QSA production fixture launch");
+}
+}
+void launch_hip_qsa_committed_pool_probe(bool pooled,bool predictor,const std::shared_ptr<HipQsaCommittedPool>& owner,
+    const ModelContract& model,std::uintptr_t raw,std::uint64_t capacity,const RuntimeTensorBinding& norm,
+    std::uint64_t first,std::uint32_t writer_rows,std::span<const HipQsaPoolRowDescriptor> rows,void* stream) {
+    if(!owner || !stream || rows.empty()) throw std::invalid_argument("MTP QSA fixture requires retained owner/views/stream");
+    const auto run=[&]<unsigned Rows>() {qsa_committed_pool_probe<Rows>(pooled,predictor,owner,model,raw,capacity,norm,first,writer_rows,rows,static_cast<hipStream_t>(stream));};
+    if(rows.size()==1)run.template operator()<1>();else if(rows.size()==2)run.template operator()<2>();
+    else if(rows.size()==4)run.template operator()<4>();else if(rows.size()==8)run.template operator()<8>();
+    else throw std::invalid_argument("MTP QSA fixture row count");
+}
+#endif
 
 std::uint64_t qsa_index_journal_bytes(const ModelContract& model) {
     if (const auto error = model.validate(); !error.empty()) throw std::invalid_argument(error);
@@ -8371,6 +8549,23 @@ void enqueue_scores(Shape shape, const Bindings& bindings, Mode mode, hipStream_
 }
 } // namespace qsa_gqa_reuse_diagnostic
 
+// Closed single-request CLI handoff only. The caller has completed all prompt
+// producers; the gate excludes submissions and its event covers the last score,
+// selection and attend consumer before descriptor/pool destruction.
+void release_hip_qsa_prefill_storage() {
+    auto& shared=qsa_scratch_gate();
+    const auto lock=shared.enter(HipQsaScratchBackend{}.device());
+    if(shared.handoff.pending()) check_hip(hipEventSynchronize(shared.done),"QSA prefill retirement handoff wait");
+    check_hip(hipDeviceSynchronize(),"QSA prefill retirement drain");
+    shared.handoff.drained();
+    release_qpf2k_stage_slots();
+    std::lock_guard<std::mutex> pool_lock(qsa_prefill_pool_mutex());
+    auto& pool=qsa_prefill_pool_storage();
+    if(pool.keys) check_hip(hipFree(pool.keys),"QSA prefill retirement keys free");
+    if(pool.packed) check_hip(hipFree(pool.packed),"QSA prefill retirement packed free");
+    pool={};
+}
+
 }  // namespace strix
 
 namespace strix {
@@ -8536,12 +8731,61 @@ void mtp_attention_finite(const MtpAttentionPrepared& p,const float* values,std:
         reinterpret_cast<std::uint32_t*>(p.status.address));
     check_hip(hipGetLastError(),"MTP attention finite validation enqueue");
 }
+
+std::unique_ptr<HipQsaCommittedAccess> mtp_pool_access(const MtpNativeContext& c,const MtpAttentionPrepared& p,
+    hipStream_t stream,bool committed) {
+    const auto& owner=c.resources->qsa_pool();
+    if (!owner) return {};
+    return owner->before_rewrite(true,p.index.address,p.index.bytes,p.index.allocation_generation,
+        *p.tensors.index_k_norm.runtime,p.tensors.index_k_norm.manifest->ggml_type,*c.model,c.position,1,stream,committed);
+}
+void mtp_pool_scores(const MtpNativeContext& c,const MtpAttentionPrepared& p,HipQsaCommittedAccess& access,hipStream_t stream) {
+    auto& pool=*static_cast<QsaPrefillPool*>(access.storage());const auto& m=*c.model;
+    bind_qwen_pool(&pool,m);
+    if (p.blocks>pool.capacity) throw std::invalid_argument("MTP predictor pool score exceeds capacity");
+    if (p.blocks>pool.valid) {
+        with_qwen_rotary(m,stream,[&](auto... rotary_source) {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_pool_kernel<SmallWeightKind::f32,false,true,decltype(rotary_source)...>),
+                dim3(p.blocks-pool.valid),dim3(p.index_dim),2ULL*p.index_dim*sizeof(float),stream,
+                reinterpret_cast<const std::uint16_t*>(p.index.address),pool.valid,p.index_dim,p.ratio,
+                reinterpret_cast<const void*>(p.tensors.index_k_norm.runtime->address),m.rms_norm_epsilon,
+                checked_u32(m.rotary_dim(),"MTP pool rotary"),m.rope_theta,nullptr,nullptr,0U,pool.packed,rotary_source...);
+        });
+        check_hip(hipGetLastError(),"MTP predictor packed pool build");pool.valid=p.blocks;
+    }
+    QsaRowsScoreViews<1> views{};views.index_query[0]=p.workspace.index_query;
+    views.block_scores[0]=p.workspace.block_scores;views.blocks[0]=p.blocks;
+    const auto waves=(p.blocks+31U)/32U;
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_pooled_rows_kernel<1,1,std::uint16_t>),dim3((waves+7U)/8U),dim3(kThreads),0,stream,
+        views,static_cast<const std::uint16_t*>(pool.packed),p.blocks,p.index_dim);
+    check_hip(hipGetLastError(),"MTP predictor packed pool score");
+    const char* check=std::getenv("STRIX_QSA_MTP_POOL_CHECK");
+    if (check && check[0]=='1') {
+        std::vector<float> pooled(p.blocks),reference(p.blocks);
+        check_hip(hipMemcpyAsync(pooled.data(),p.workspace.block_scores,p.blocks*sizeof(float),hipMemcpyDeviceToHost,stream),"MTP pool check copy");
+        check_hip(hipStreamSynchronize(stream),"MTP pool check copy completion");
+        with_qwen_rotary(m,stream,[&](auto... rotary_source) {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_kernel<SmallWeightKind::f32,decltype(rotary_source)...>),dim3(p.blocks),dim3(p.index_dim),
+                2ULL*p.index_dim*sizeof(float),stream,p.workspace.index_query,reinterpret_cast<const std::uint16_t*>(p.index.address),
+                checked_u32(m.indexer_n_heads,"MTP pool heads"),p.index_dim,p.ratio,reinterpret_cast<const void*>(p.tensors.index_k_norm.runtime->address),
+                m.rms_norm_epsilon,checked_u32(m.rotary_dim(),"MTP pool rotary"),m.rope_theta,p.workspace.block_scores,GraphSelectionArguments{},rotary_source...);
+        });
+        check_hip(hipMemcpyAsync(reference.data(),p.workspace.block_scores,p.blocks*sizeof(float),hipMemcpyDeviceToHost,stream),"MTP pool reference copy");
+        check_hip(hipStreamSynchronize(stream),"MTP pool reference completion");
+        std::uint64_t diff=0;
+        for (std::size_t i=0;i<pooled.size();++i) diff+=std::memcmp(&pooled[i],&reference[i],sizeof(float))!=0;
+        check_hip(hipMemcpyAsync(p.workspace.block_scores,pooled.data(),p.blocks*sizeof(float),hipMemcpyHostToDevice,stream),"MTP pool restore pooled scores");
+        check_hip(hipStreamSynchronize(stream),"MTP pool restore completion");
+        c.resources->qsa_pool()->checked(p.blocks,diff,12U);
+    }
+}
 }
 void preflight_hip_mtp_attention(const MtpNativeContext& c) {(void)prepare_mtp_attention(c);}
 void preflight_hip_mtp_cache_rows(const MtpNativeContext& c) {(void)prepare_mtp_attention(c);}
 void launch_hip_mtp_cache_rows(const MtpNativeContext& c,void* raw_stream,bool fast_cache) {
     const auto p=prepare_mtp_attention(c);require_mtp_attention_stream(c,raw_stream);
     const auto stream=static_cast<hipStream_t>(raw_stream);const auto& m=*c.model;const auto& w=p.workspace;
+    auto pool_access=mtp_pool_access(c,p,stream,true);
     // The original indexer stores the unnormalised BF16-rounded key. Pooled
     // index-key norm/RoPE is applied later by block_score_kernel, never here.
     mtp_project<WeightKind::bf16>(p.input,p.tensors.index_k,p.hidden,p.index_dim,w.current_index_key,stream);
@@ -8578,6 +8822,7 @@ void launch_hip_mtp_cache_rows(const MtpNativeContext& c,void* raw_stream,bool f
 void launch_hip_mtp_indexer(const MtpNativeContext& c,void* raw_stream) {
     const auto p=prepare_mtp_attention(c);require_mtp_attention_stream(c,raw_stream);
     const auto stream=static_cast<hipStream_t>(raw_stream);const auto& m=*c.model;const auto& w=p.workspace;
+    auto pool_access=mtp_pool_access(c,p,stream,false);
     // STRIX_QSA_SKIP_INDEX_Q=1: with every visible token selected (blocks <= topk) the index query,
     // its norm and its finite check feed nothing; the index key is still projected and stored.
     const bool skip_index_q=qsa_skip_index_q_enabled() && p.blocks<=p.topk;
@@ -8610,7 +8855,8 @@ void launch_hip_mtp_indexer(const MtpNativeContext& c,void* raw_stream) {
         hipLaunchKernelGGL(fill_visible_indices_kernel,dim3((p.visible+kThreads-1U)/kThreads),dim3(kThreads),0,stream,w.selected_indices,p.visible);
         check_hip(hipGetLastError(),"MTP full-visible index enqueue");
     } else {
-        with_qwen_rotary(m, stream, [&](auto... rotary_source) {
+        if (pool_access) mtp_pool_scores(c,p,*pool_access,stream);
+        else with_qwen_rotary(m, stream, [&](auto... rotary_source) {
             hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_kernel<SmallWeightKind::f32, decltype(rotary_source)...>),dim3(p.blocks),dim3(p.index_dim),
                 2ULL*p.index_dim*sizeof(float),stream,w.index_query,reinterpret_cast<const std::uint16_t*>(p.index.address),
                 checked_u32(m.indexer_n_heads,"MTP index heads"),p.index_dim,p.ratio,reinterpret_cast<const void*>(p.tensors.index_k_norm.runtime->address),
@@ -8618,8 +8864,11 @@ void launch_hip_mtp_indexer(const MtpNativeContext& c,void* raw_stream) {
         });
         check_hip(hipGetLastError(),"MTP compressed index score enqueue");
         mtp_attention_finite(p,w.block_scores,p.blocks,stream);
+        MtpPoolSelectionCheck selection_check(c.resources->qsa_pool(),{w.index_query,w.block_scores,w.selected_indices,
+            p.visible,p.blocks,p.topk,0U,nullptr},stream);
         hipLaunchKernelGGL(select_blocks_kernel,dim3(1),dim3(kSelectThreads),0,stream,w.block_scores,p.blocks,p.topk,p.ratio,p.visible,w.selected_indices,selection);
         check_hip(hipGetLastError(),"MTP compressed selection enqueue");
+        selection_check.finish();
     }
 }
 void enqueue_hip_mtp_attention_q8_linear(const std::uint16_t* input,const void* q8,std::uint32_t width,
@@ -8992,6 +9241,12 @@ void launch_hip_mtp_indexer_rows(std::span<const MtpNativeContext> contexts, voi
     const auto rows = mtp_batch_prepare(contexts);
     if (!raw_stream) throw std::invalid_argument("MTP indexer batch needs a stream");
     const auto stream = static_cast<hipStream_t>(raw_stream);const auto& m = *contexts.front().model;const auto& a = rows.front();
+    std::vector<std::unique_ptr<HipQsaCommittedAccess>> pool_access;
+    const bool any_pool=std::any_of(contexts.begin(),contexts.end(),[](const auto& c){return static_cast<bool>(c.resources->qsa_pool());});
+    if(any_pool) {
+        pool_access.reserve(rows.size());
+        for (std::size_t r=0;r<rows.size();++r) pool_access.push_back(mtp_pool_access(contexts[r],rows[r],stream,false));
+    }
     std::vector<std::uint32_t> all, need_q, fill, select;
     for (std::uint32_t r = 0; r < rows.size(); ++r) {
         const auto& p = rows[r];
@@ -9035,7 +9290,18 @@ void launch_hip_mtp_indexer_rows(std::span<const MtpNativeContext> contexts, voi
             b.block_scores[i] = p.workspace.block_scores; b.selected[i] = p.workspace.selected_indices;
             b.visible[i] = p.visible; b.blocks[i] = p.blocks; blocks = std::max(blocks, p.blocks);
         }
-        with_qwen_rotary(m, stream, [&](auto... rotary_source) {
+        if (any_pool) {
+            for (const auto r:select) {
+                const auto& p=rows[r];
+                if (pool_access[r]) mtp_pool_scores(contexts[r],p,*pool_access[r],stream);
+                else with_qwen_rotary(m,stream,[&](auto... rotary_source) {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_kernel<SmallWeightKind::f32,decltype(rotary_source)...>),dim3(p.blocks),dim3(p.index_dim),
+                        2ULL*p.index_dim*sizeof(float),stream,p.workspace.index_query,reinterpret_cast<const std::uint16_t*>(p.index.address),
+                        checked_u32(m.indexer_n_heads,"MTP index heads"),p.index_dim,p.ratio,reinterpret_cast<const void*>(p.tensors.index_k_norm.runtime->address),
+                        m.rms_norm_epsilon,checked_u32(m.rotary_dim(),"MTP rotary dimension"),m.rope_theta,p.workspace.block_scores,selection,rotary_source...);
+                });
+            }
+        } else with_qwen_rotary(m, stream, [&](auto... rotary_source) {
             hipLaunchKernelGGL(HIP_KERNEL_NAME(block_score_rows_kernel<SmallWeightKind::f32, decltype(rotary_source)...>), dim3(blocks, static_cast<unsigned>(select.size())),
                 dim3(a.index_dim), 2ULL * a.index_dim * sizeof(float), stream, b, checked_u32(m.indexer_n_heads, "MTP index heads"), a.index_dim,
                 a.ratio, reinterpret_cast<const void*>(a.tensors.index_k_norm.runtime->address), m.rms_norm_epsilon,
@@ -9049,9 +9315,16 @@ void launch_hip_mtp_indexer_rows(std::span<const MtpNativeContext> contexts, voi
             hipLaunchKernelGGL(validate_indexed_graph_values_rows, dim3(1), dim3(kThreads), 0, stream, f, p.blocks);
             check_hip(hipGetLastError(), "MTP batch block score validation enqueue");
         }
+        std::vector<std::unique_ptr<MtpPoolSelectionCheck>> selection_checks;
+        if(any_pool && std::getenv("STRIX_QSA_MTP_POOL_CHECK") && std::getenv("STRIX_QSA_MTP_POOL_CHECK")[0]=='1') for(const auto r:select) {
+            const auto& p=rows[r];const auto& w=p.workspace;
+            selection_checks.push_back(std::make_unique<MtpPoolSelectionCheck>(contexts[r].resources->qsa_pool(),
+                HipQsaPoolRowDescriptor{w.index_query,w.block_scores,w.selected_indices,p.visible,p.blocks,p.topk,0U,nullptr},stream));
+        }
         hipLaunchKernelGGL(select_blocks_rows_kernel, dim3(static_cast<unsigned>(select.size())), dim3(kSelectThreads), 0, stream, b,
             a.topk, a.ratio, selection);
         check_hip(hipGetLastError(), "MTP batch compressed selection enqueue");
+        for(auto& check:selection_checks) check->finish();
     }
 }
 void launch_hip_mtp_sparse_attention_draft_rows(std::span<const MtpNativeContext> contexts, void* raw_stream) {
