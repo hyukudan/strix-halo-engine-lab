@@ -58,7 +58,7 @@ int main() {
         try { (void)ms::exchange(peer, c); } catch (const std::runtime_error&) { rejected = true; }
         check(rejected == (corrupt != 0) && (corrupt == 0 || peer.aborts > 0), "control version/magic/checkpoint/ack validation");
     }
-    ds::AutoAdmission a{ds::Mode::automatic, true, 0, false, 100, 4096, 256, true};
+    ds::AutoAdmission a{ds::Mode::automatic, true, 0, false, 100, 4096, 256, true, ds::Prior::structural_v1, {}};
     const auto reason = [&](const char* expected) {
         ds::AutoRequest r; r.admit(a);
         check(r.state == ds::AutoRequest::State::plain_final && std::string_view(r.reason) == expected, expected);
