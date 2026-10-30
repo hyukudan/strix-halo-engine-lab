@@ -177,6 +177,9 @@ if constexpr(BWords>=4U)
         const float unscale=ldexpf(1.0F,-exp_of(live?a:0U));
         const float g=acc[mi][0][e]*unscale,u=acc[mi][1][e]*unscale;
         const float hv=(g/(1.0F+expf(-g)))*u;
+#ifdef STRIX_F16X_TEST_CAPTURE
+        STRIX_F16X_TEST_CAPTURE
+#endif
         const bool bad=!isfinite(g)||!isfinite(u)||!isfinite(hv);
         if(live) {
             if constexpr((Core&4U)!=0U)f16_store_global(at(view.output,r)+slot*2U*outputs+out,hv);
