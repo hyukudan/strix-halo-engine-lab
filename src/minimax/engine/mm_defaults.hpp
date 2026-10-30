@@ -3,7 +3,8 @@
 // switched OFF, never the other way round). Host only, no HIP: the apps and the engine call apply() before they read
 // any switch, and the CPU tests diff its output against the measured production receipt.
 //
-// Every item below measured faster and exact (or faster, transport only) and is ON unless its env names the off value.
+// Optimizations and admission policies resolve ON unless their env names the off value.
+// Unqualified admission cells select plain; the item receipt distinguishes policy from measured kernels.
 // STRIX_MM_BASELINE=1 is the master switch: every item resolves to its off value (the path before the item); an
 // explicit per-item value still wins in both modes. apply() exports each unset item's resolved value into the process
 // environment, so the readers in the engine, the exchange modules and the dist layer see exactly what
@@ -60,6 +61,8 @@ bool from_defaults(const char* env);
 // The engine-shape options of the plain invocation (other options do not change the configuration).
 struct Cli {
     std::string app = "rank";  // rank | serve
+    std::string dspark_prior;  // explicit --dspark-prior, both apps
+    std::string dspark_mode;  // explicit serve CLI, empty = resolver
     std::string transport = "usb4-auto";
     std::uint32_t slots = 8;
     std::uint64_t capacity = 8256;
@@ -68,7 +71,7 @@ struct Cli {
 Cli parse_cli(const std::string& app, const std::vector<std::string>& args);  // args without argv[0]
 
 // Canonical text, one key=value per line: CLI shape, route/build switches, every item and resolved serve policy.
-// Serve configuration validates all five policy values, independently of process environment export.
+// Serve configuration validates scheduler and DSpark policy, independently of process environment export.
 std::string effective_config(const Cli& cli, const Lookup& env);
 inline constexpr const char* kPrintFlag = "--print-effective-config";
 // App entry: when argv holds kPrintFlag, apply() and print effective_config() of the invocation (no model, no GPU)

@@ -21,6 +21,7 @@ struct FakeEngine {
     mm::PfProgress active{}, parked{};
     std::vector<ms::Control> controls;
     unsigned syncs = 0;
+    bool taps = false;
     double parent_speed = 1;  // cold estimate may exceed actual service, as on native warm runs
     unsigned slots() const { return 8; }
     unsigned capacity() const { return 16384; }
@@ -33,9 +34,10 @@ struct FakeEngine {
     std::uint64_t prefill_unit_rows() const { return active.rows; }
     std::uint64_t prefill_rows_left() const { return active.rows; }
     void abort(const char* why) { throw std::runtime_error(why); }
-    void set_taps(bool) {}
+    void set_taps(bool value) { if (prefill_open()) throw std::runtime_error("open-task taps"); taps = value; }
     void send_prompt(std::vector<unsigned>&) {}
     void synchronize() { ++syncs; }
+    void retire_contexts(unsigned) {}
     void exchange_bytes(const void* out, void* in, std::size_t bytes) {
         if (bytes != 512) throw std::runtime_error("control size");
         ms::Control c;
@@ -94,6 +96,7 @@ struct Scenario {
     std::atomic<bool> stop{false};
     std::vector<Event> events;
     std::map<unsigned, std::shared_ptr<sv::GenerationTicket>> tickets;
+    std::string prompt_text;
     double now = 0;
     std::size_t next = 0;
     explicit Scenario(ms::Sched mode) {
@@ -127,7 +130,8 @@ struct Scenario {
         events.push_back({end, [&] { stop.store(true); }});
         std::stable_sort(events.begin(), events.end(), [](const auto& a, const auto& b) { return a.at < b.at; });
         advance(0);
-        ml::Lead<FakeEngine, FakeEngine, FakeClock> lead(engine, engine, queue, shared, 4096, engine.dd != nullptr, stop);
+        ml::Lead<FakeEngine, FakeEngine, FakeClock> lead(engine, engine, queue, shared, 4096, engine.taps, stop,
+            [&](const std::vector<std::uint32_t>&) { return prompt_text; });
         lead.loop();
         return {engine.controls, queue.work};
     }
@@ -167,7 +171,7 @@ int main() {
     };
     const auto compare = [&](const char* name, const std::function<void(Scenario&)>& script, bool dspark = false) {
         const auto run = [&](ms::Sched mode) {
-            Scenario s(mode); if (dspark) { s.engine.dd = &s.engine; s.shared.policy.inflight = 8; }
+            Scenario s(mode); if (dspark) { s.engine.dd = &s.engine; s.engine.taps = true; s.shared.policy.dspark_mode = ml::ds::Mode::on; s.shared.policy.inflight = 8; }
             script(s); return s.run();
         };
         const auto off = run(ms::Sched::off), on = run(ms::Sched::interleave);
@@ -264,6 +268,67 @@ int main() {
         for (const auto& c : r.controls) if (c.command == 2) prompts.push_back(c.plen);
         check(prompts == std::vector<unsigned>({10, 10, 2000, 1}) && whole(r, 3),
               "pending reservation survives admin switch ahead of later short");
+    }
+    for (unsigned n : {1U, 2U, 4U}) {
+        const auto run = [&](ml::ds::Mode mode) {
+            Scenario s(ms::Sched::interleave); s.engine.dd = &s.engine; s.shared.policy.dspark_mode = mode;
+            for (unsigned i = 0; i < n; ++i) s.submit(0, i + 1, i == 0 ? 6551 : 100, 6 + i);
+            s.submit(12000, 20, 100, 3);  // drain, then slot reuse
+            return s.run();
+        };
+        const auto automatic = run(ml::ds::Mode::automatic), off = run(ml::ds::Mode::off);
+        check(sequence(automatic) == sequence(off), "auto unqualified trace equals OFF, including burst drain / slot reuse");
+        bool plain = true;
+        for (const auto& c : automatic.controls) {
+            if (c.command == static_cast<unsigned>(ms::Command::draft) || c.append != 0 ||
+                (c.command == static_cast<unsigned>(ms::Command::taps) && c.pflags != 0) ||
+                (c.command == static_cast<unsigned>(ms::Command::prefill) && c.pflags != 0)) plain = false;
+        }
+        check(plain, "auto PLAIN has no draft, append, tap enable or prefill sink");
+    }
+    {
+        Scenario s(ms::Sched::interleave); s.engine.dd = &s.engine; s.engine.taps = true;
+        s.shared.policy.dspark_mode = ml::ds::Mode::on;
+        s.submit(0, 1, 100, 20);
+        s.events.push_back({100, [&] {
+            std::lock_guard lock(s.shared.m); s.shared.policy.dspark_mode = ml::ds::Mode::off; ++s.shared.policy.epoch;
+        }});
+        const auto r = s.run();
+        bool disabled = false, clean = true;
+        for (const auto& c : r.controls) {
+            if (c.command == static_cast<unsigned>(ms::Command::taps) && c.pflags == 0) {
+                disabled = true; clean = clean && !c.active.open && !c.parked.open;
+            }
+            if (disabled && ((c.command == static_cast<unsigned>(ms::Command::step) && c.append != 0) || c.command == static_cast<unsigned>(ms::Command::draft))) clean = false;
+        }
+        check(disabled && clean && count(r, ms::Command::retire) == 1, "OFF during prefill retires context and disables taps only after task closure");
+    }
+    {
+        Scenario s(ms::Sched::interleave); s.engine.dd = &s.engine;
+        s.prompt_text = "```python\nprint(1)\n```";
+        s.submit(0, 1, 100, 100); s.submit(1800, 2, 100, 10);
+        const auto r = s.run();
+        check(count(r, ms::Command::draft) > 0, "structural C1 promotes into legacy controller");
+        bool retired = false, disabled = false, clean = true;
+        for (const auto& c : r.controls) {
+            if (c.command == static_cast<unsigned>(ms::Command::retire)) retired = true;
+            if (retired && c.command == static_cast<unsigned>(ms::Command::taps) && c.pflags == 0) disabled = true;
+            if (retired && ((c.command == static_cast<unsigned>(ms::Command::step) && c.append) || c.command == static_cast<unsigned>(ms::Command::draft))) clean = false;
+        }
+        check(retired && disabled && clean, "C1 to C2 retires auto with no drain reactivation");
+    }
+    {
+        Scenario s(ms::Sched::interleave); s.engine.dd = &s.engine; s.prompt_text = "```code```";
+        s.submit(0, 1, 100, 10); s.submit(0, 2, 100, 10);
+        const auto r = s.run();
+        check(count(r, ms::Command::draft) == 0 && count(r, ms::Command::taps) == 0, "structural burst stays plain from admission");
+    }
+    {
+        Scenario s(ms::Sched::interleave); s.engine.dd = &s.engine; s.prompt_text = "```code```";
+        s.shared.policy.dspark_prior = ml::ds::Prior::unqualified_v1;
+        s.submit(0, 1, 100, 10);
+        const auto r = s.run();
+        check(count(r, ms::Command::draft) == 0 && count(r, ms::Command::taps) == 0, "unqualified fallback ignores structural markers");
     }
     std::cout << "production Lead traces: " << failures << " failures\n";
     return failures == 0 ? 0 : 1;

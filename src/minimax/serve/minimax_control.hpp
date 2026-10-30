@@ -8,7 +8,7 @@
 namespace strix::minimax::serve {
 struct Control {
     std::uint32_t magic = 0x43534d4dU;  // "MMSC"
-    std::uint32_t version = 2;
+    std::uint32_t version = 3;
     std::uint32_t command = 0;
     std::uint64_t task_id = 0, parent_task_id = 0, slot_generation = 0;
     strix::minimax::engine::PfProgress active{}, parked{};

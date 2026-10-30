@@ -95,6 +95,9 @@ sv::Json reply_timings(const sv::GenerationStats& st, const RequestExtra& x) {
     timings.set("park_wall_ms", sv::Json(x.park_wall_ms));
     timings.set("short_first", sv::Json(x.short_first));
     timings.set("fallback_reason", sv::Json(x.fallback_reason));
+    timings.set("dspark_mode", sv::Json(x.dspark_mode));
+    timings.set("dspark_reason", sv::Json(x.dspark_reason));
+    timings.set("dspark_context", sv::Json(x.context));
     timings.set("sampling", sv::Json("greedy"));
     return timings;
 }

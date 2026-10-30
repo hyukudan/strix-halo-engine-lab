@@ -2,6 +2,7 @@
 // effective configuration (see mm_defaults.hpp).
 #include "minimax/engine/mm_defaults.hpp"
 #include "minimax/serve/minimax_sched.hpp"
+#include "minimax/dspark/minimax_auto.hpp"
 
 #include <cstdio>
 #include <charconv>
@@ -23,6 +24,7 @@ namespace {
 
 // Measurement evidence for the adopted production defaults.
 constexpr Item kItems[] = {
+    {"serve_dspark", "STRIX_MM_SERVE_DSPARK", "auto", "0", "Frozen structural-v1 admission; per-content node qualification pending"},
     {"serve_sched", "STRIX_MM_SERVE_SCHED", "interleave", "off", "Bounded serving policy; GPU qualification pending"},
     {"serve_service", "STRIX_MM_SERVE_SERVICE_MS", "250", "0", "Soft service opportunity target; GPU qualification pending"},
     {"serve_nest", "STRIX_MM_SERVE_NEST", "1", "0", "Nested short admission; extended resume-check GPU qualification pending"},
@@ -174,7 +176,13 @@ Cli parse_cli(const std::string& app, const std::vector<std::string>& args) {
     for (; i < args.size(); ++i) {
         const std::string& a = args[i];
         const bool has = i + 1 < args.size();
-        if (a == "--slots" && has) c.slots = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        if (a == "--dspark-prior") {
+            if (!has) throw std::invalid_argument("--dspark-prior requires a version");
+            c.dspark_prior = dspark::prior_name(dspark::parse_prior(args[++i].c_str()));
+        } else if (a == "--dspark-mode" && app == "serve") {
+            if (!has) throw std::invalid_argument("--dspark-mode requires off | auto | on");
+            c.dspark_mode = dspark::mode_name(dspark::parse_mode(args[++i]));
+        } else if (a == "--slots" && has) c.slots = static_cast<std::uint32_t>(std::stoul(args[++i]));
         else if (a == "--capacity" && has) c.capacity = std::stoull(args[++i]);
         else if (a == "--max-rows" && has) c.max_rows = static_cast<std::uint32_t>(std::stoul(args[++i]));
         else if (a == "--transport" && has && app == "serve") c.transport = args[++i];
@@ -225,8 +233,20 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
     o << "build.gu4_scalar=" << (STRIX_MM_GU4_SCALAR ? "on" : "off") << "\n";
     for (const Resolved& r : resolve(env)) o << r.item->env << "=" << r.value << "\n";
     o << "STRIX_MM_PF_ASYNC_MIN_ROWS=" << pf_async_min_rows(env("STRIX_MM_PF_ASYNC_MIN_ROWS")) << "\n";
+    const auto prior = dspark::parse_prior(cli.dspark_prior.empty() ? env("STRIX_MM_DSPARK_PRIOR") : cli.dspark_prior.c_str());
+    o << "dspark.prior=" << dspark::prior_name(prior) << "\n";
     if (cli.app == "serve") {
         const auto policy = serve_policy(env);
+        std::string mode = cli.dspark_mode;
+        if (mode.empty()) for (const auto& r : resolve(env))
+            if (std::strcmp(r.item->env, "STRIX_MM_SERVE_DSPARK") == 0) mode = r.value;
+        const auto requested = dspark::parse_mode(mode);
+        o << "serve.dspark_mode=" << dspark::mode_name(requested) << "\n"
+          << "serve.dspark_effective=" << (requested == dspark::Mode::on ? "on_if_assets" : requested == dspark::Mode::automatic && prior == dspark::Prior::structural_v1 ? "per_request_if_assets" : "plain") << "\n"
+          << "serve.dspark_reason=" << (requested == dspark::Mode::automatic ? (prior == dspark::Prior::unqualified_v1 ? "plain:prior_unqualified" : "auto:per_request") :
+                                        requested == dspark::Mode::off ? "plain:off" : "legacy") << "\n"
+          << "serve.dspark_inflight=" << dspark::parse_inflight(env("STRIX_MM_SERVE_DSPARK_INFLIGHT")) << "\n"
+          << "serve.dspark_prior=" << dspark::prior_name(prior) << "\n";
         o << std::setprecision(std::numeric_limits<double>::max_digits10)
           << "serve.sched=" << (policy.sched == serve::Sched::off ? "off" : "interleave") << "\n"
           << "serve.service_ms=" << policy.service << "\n"
@@ -246,7 +266,7 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
     }
     apply();
     (void)pf_async_min_rows(process_env("STRIX_MM_PF_ASYNC_MIN_ROWS"));
-    if (app == "serve") (void)serve_policy(process_env);
+    (void)effective_config(parse_cli(app, args), process_env);
     if (!print) return false;
     std::fputs(effective_config(parse_cli(app, args), process_env).c_str(), stdout);
     if (app == "serve") {

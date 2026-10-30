@@ -101,7 +101,7 @@ inline bool reorder_prompts(Sched sched, bool enabled, bool head_protected) {
     return sched == Sched::interleave && enabled && head_protected;
 }
 
-enum class Command : std::uint32_t { heartbeat = 1, prefill = 2, step = 3, shutdown = 4, unit = 5, cancel = 6, draft = 7, taps = 8, park = 9, nest = 10, resume_parked = 11, check = 12 };
+enum class Command : std::uint32_t { heartbeat = 1, prefill = 2, step = 3, shutdown = 4, unit = 5, cancel = 6, draft = 7, taps = 8, park = 9, nest = 10, resume_parked = 11, check = 12, retire = 13 };
 
 // A follower only replays the lead's payload. No policy, cancellation ticket or clock is consulted.
 template<class Control, class Engine, class Runner, class Receive>
@@ -139,7 +139,14 @@ bool replay_command(const Control& c, Engine& eng, Runner& run, Receive receive)
     case Command::park: eng.prefill_park(c.task_id); break;
     case Command::resume_parked: eng.prefill_resume_parked(c.task_id); break;
     case Command::check: run.prefill_check(c.task_id, c.plen); break;
-    case Command::taps: eng.set_taps((c.pflags & 1U) != 0); break;
+    case Command::taps:
+        if (eng.prefill_open() || c.pflags > 1) throw std::runtime_error("control channel: unsafe tap change");
+        eng.set_taps(c.pflags != 0);
+        break;
+    case Command::retire:
+        if ((c.append & ~255U) != 0) throw std::runtime_error("control channel: context mask");
+        run.retire_contexts(c.append);
+        break;
     case Command::draft:
         if (c.dslots > std::size(c.dslot)) throw std::runtime_error("control channel: draft count");
         if (run.dd == nullptr) throw std::runtime_error("control channel: draft without a drafter");

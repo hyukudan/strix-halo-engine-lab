@@ -54,6 +54,7 @@ struct RequestExtra {
     std::uint64_t units = 0, cycles = 0, drafted = 0, accepted = 0;
     std::uint64_t ids_fnv = 0, prompt_fnv = 0;
     bool context = false;
+    std::string dspark_mode = "auto", dspark_reason = "plain:prior_unqualified";
     std::string sched = "off", fallback_reason;
     double service_ms = 0;
     unsigned max_unit_layers = 0;
