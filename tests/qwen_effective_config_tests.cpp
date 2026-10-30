@@ -2482,6 +2482,7 @@ int main(int argc, char** arguments) {
             has(plain, "\"STRIX_QSA_DECODE_POOL\":{\"enabled\":true,\"suppression\":null}") &&
             has(plain, "\"STRIX_QSA_DECODE_SELECT\":{\"enabled\":true,\"suppression\":null}") &&
             has(plain, "\"STRIX_QSA_DECODE_POOL_BF16\":{\"enabled\":true,\"suppression\":null}") &&
+            has(plain, "\"STRIX_PREFILL_MOE_MERGE_VEC\":{\"enabled\":true,\"suppression\":null}") &&
             has(plain, "\"qsa_decode_pool_key_bytes\":2}"), "effective config resolves the long-context items as on");
         ::setenv("STRIX_QSA_DECODE_SELECT", "0", 1);
         ::setenv("STRIX_QSA_DECODE_POOL_BF16", "0", 1);

@@ -544,6 +544,17 @@
   },
   {
     "engine": "qwen",
+    "name": "Vector MoE merge+commit in tiled prefill",
+    "flag_or_env": "STRIX_PREFILL_MOE_MERGE_VEC",
+    "default": "1",
+    "exact": "Exact: merge+commit fixture (synthetic, crafted, real layers; NaN/Inf/large-dot, bad-route, weight-above-one and H-1 injections) 1712 comparisons byte-identical to the scalar merge incl. the accumulation view; plain default command 4K/32K: 32 generated tokens identical on/off.",
+    "gain": "-0.19 ms per T8192 admitted merge call (3.81 vs 3.99 ms, real layers); about -0.02 s at 32K",
+    "preconditions": "Tiled prefill with the certified merge+commit tail (STRIX_QPF2K_MOE_MC); hidden size divisible by 4 and 16-byte raw-dot/accumulation rows, 8-byte output rows; otherwise the scalar merge runs.",
+    "off_switch": "STRIX_PREFILL_MOE_MERGE_VEC=0",
+    "doc_anchor": "docs/optimizations.md#qwen-prefill-moe-merge-vec"
+  },
+  {
+    "engine": "qwen",
     "name": "QSA scorer R64 above 65,536 blocks",
     "flag_or_env": "STRIX_QSA_SCORE_ROWS64",
     "default": "1 (from 65,536 blocks; per-group 64-row scoring follows the policy)",

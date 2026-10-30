@@ -131,7 +131,7 @@ void prefix_dma_tests() {
         in.effective_execution=signature();
         const auto original=prefix_state_cache_identity(in);
         for(const char* name : {"STRIX_QSA_UNION_MERGE","STRIX_QSA_SCORE_ROWS64","STRIX_QSA_POOL_PACKED",
-                "STRIX_QSA_DECODE_POOL","STRIX_QSA_DECODE_SELECT","STRIX_QSA_DECODE_POOL_BF16","STRIX_QSA_DECODE_POOL_CHECK",
+                "STRIX_QSA_DECODE_POOL","STRIX_QSA_DECODE_SELECT","STRIX_QSA_DECODE_POOL_BF16","STRIX_QSA_DECODE_POOL_CHECK","STRIX_PREFILL_MOE_MERGE_VEC",
                 "STRIX_QPF2K_DEFAULTS","STRIX_BASELINE","STRIX_QPF2K_QSA_MASK"}) {
             const char* old=std::getenv(name);
             const std::optional<std::string> saved=old?std::optional<std::string>{old}:std::nullopt;
@@ -157,7 +157,7 @@ void prefix_dma_tests() {
             };
             const auto base=binding(signature());
             for(const char* name : {"STRIX_QSA_UNION_MERGE","STRIX_QSA_SCORE_ROWS64","STRIX_QSA_POOL_PACKED",
-                    "STRIX_QSA_DECODE_POOL","STRIX_QSA_DECODE_SELECT","STRIX_QSA_DECODE_POOL_BF16","STRIX_QSA_DECODE_POOL_CHECK",
+                    "STRIX_QSA_DECODE_POOL","STRIX_QSA_DECODE_SELECT","STRIX_QSA_DECODE_POOL_BF16","STRIX_QSA_DECODE_POOL_CHECK","STRIX_PREFILL_MOE_MERGE_VEC",
                     "STRIX_CTX_EXACT_MEMORY","STRIX_QSA_SCORE_RING","STRIX_QSA_SCORE_RING_ROWS","STRIX_TERMINAL_LOGITS_ARENA",
                     "STRIX_QPF2K_DEFAULTS","STRIX_BASELINE","STRIX_QPF2K_QSA_MASK",
                     "STRIX_PROMPT_BATCH_SHARED","STRIX_BATCH_SERVICE_MS","STRIX_BATCH_SERVICE_LOOKAHEAD",

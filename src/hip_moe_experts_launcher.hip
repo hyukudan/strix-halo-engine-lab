@@ -2749,6 +2749,20 @@ __global__ void known_moe_prefill_merge_commit_kernel(KnownMoePrefillDevice view
     moe_prefill_merge_z_body<true, Acc>(view, header, hidden_size, experts, top_k,
         [](auto v, unsigned r) { return known_moe_prefill_row(v, r); }, unsafe);
 }
+template <bool Acc>
+__global__ void known_moe_prefill_merge_commit_vec4_kernel(KnownMoePrefillDevice view, std::uint32_t* header,
+    std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k, const unsigned* unsafe) {
+    moe_prefill_merge_z_body_vec4<Acc>(view, header, hidden_size, experts, top_k,
+        [](auto v, unsigned r) { return known_moe_prefill_row(v, r); }, unsafe);
+}
+// STRIX_PREFILL_MOE_MERGE_VEC (default on; "0", the baseline, STRIX_QPF2K_DEFAULTS=0 or a GSQ model turn it off): the MC
+// merge with four outputs per thread when every row view is aligned for 16-byte FP32 / 8-byte BF16 vectors.
+bool prefill_merge_vec4(const KnownMoePrefillDevice& d, std::uint32_t hidden_size, bool gsq) {
+    static const bool enabled = qpf2k::long_context_item_enabled("STRIX_PREFILL_MOE_MERGE_VEC", false);
+    if (!enabled || gsq || hidden_size % 4U) return false;
+    const auto aligned = [](const auto& v, std::uint64_t a) { return reinterpret_cast<std::uintptr_t>(v.base) % a == 0U && v.stride % a == 0U; };
+    return aligned(d.rawdots, 16U) && aligned(d.accumulation, 16U) && aligned(d.output, 8U);
+}
 template <unsigned CTAs>
 __global__ void known_moe_prefill_finish_kernel(KnownMoePrefillDevice view, std::uint32_t* header,
     std::uint32_t row_count, std::uint32_t hidden, std::uint32_t* record, const unsigned* unsafe) {
@@ -3002,7 +3016,18 @@ void known_moe_prefill_enqueue(std::uint32_t count, const HipMoeExpertsLauncherC
         (void)witness;
         // The fallback choice is device-side and per call. No host fallback count/witness can observe it
         // without a readback; do not add synchronization or claim a host-observed fallback.
-        if (mc == 2U)
+        if (prefill_merge_vec4(p.device, config.hidden_size, gsq)) {
+            static const bool vec_witness = [] { std::fprintf(stderr, "qwen moe merge vec4 active\n"); return true; }();
+            (void)vec_witness;
+            const dim3 grid((config.hidden_size / 4U + 127U) / 128U, count);
+            if (mc == 2U)
+                hipLaunchKernelGGL(known_moe_prefill_merge_commit_vec4_kernel<true>, grid, dim3(128), 0,
+                    stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe);
+            else
+                hipLaunchKernelGGL(known_moe_prefill_merge_commit_vec4_kernel<false>, grid, dim3(128), 0,
+                    stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe);
+        }
+        else if (mc == 2U)
             hipLaunchKernelGGL(known_moe_prefill_merge_commit_kernel<true>, dim3((config.hidden_size + 255U) / 256U, count), dim3(256), 0,
                 stream, p.device, p.rows.csr.summary, config.hidden_size, config.expert_count, config.top_k, rows.unsafe);
         else

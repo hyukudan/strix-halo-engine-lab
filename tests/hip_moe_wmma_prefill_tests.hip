@@ -404,6 +404,21 @@ __global__ void candidate_merge_commit_kernel(kr::PrefillRows v, unsigned* heade
     moe_prefill_merge_z_body<true, Acc>(fixture_tail_view(v, out16), header, hidden, experts, top_k,
         [](auto v, unsigned r) { return fixture_row(v, r); }, v.unsafe);
 }
+template <bool Acc>
+__global__ void candidate_merge_commit_vec4_kernel(kr::PrefillRows v, unsigned* header, unsigned hidden, unsigned experts, unsigned top_k,
+    kr::StridedRows<std::uint16_t> out16) {
+    moe_prefill_merge_z_body_vec4<Acc>(fixture_tail_view(v, out16), header, hidden, experts, top_k,
+        [](auto v, unsigned r) { return fixture_row(v, r); }, v.unsafe);
+}
+dim3 vec4_grid(unsigned rows) { return dim3((Fixture::H / 4U + 127U) / 128U, rows); }
+// As the host: the vec4 body for widths divisible by four, the scalar MC body otherwise (the fixture's H-1 case).
+template <bool Acc>
+void candidate_merge_commit_vec4(hipStream_t stream, const kr::PrefillRows& v, unsigned* header, unsigned hidden, unsigned experts,
+    unsigned top_k, kr::StridedRows<std::uint16_t> out16, unsigned rows) {
+    if (hidden % 4U) hipLaunchKernelGGL(candidate_merge_commit_kernel<Acc>, dim3((Fixture::H + 255U) / 256U, rows), dim3(256), 0, stream,
+        v, header, hidden, experts, top_k, out16);
+    else hipLaunchKernelGGL(candidate_merge_commit_vec4_kernel<Acc>, vec4_grid(rows), dim3(128), 0, stream, v, header, hidden, experts, top_k, out16);
+}
 __global__ void candidate_finish_kernel(kr::PrefillRows v, unsigned* header, unsigned row_count, unsigned hidden,
     kr::StridedRows<std::uint16_t> out16, unsigned* record) {
     moe_prefill_finish_body<32>(fixture_tail_view(v, out16), header, row_count, hidden, record, v.unsafe,
@@ -1117,7 +1132,9 @@ int main(int argc, char** argv) {
                     hipLaunchKernelGGL(reference_merge_kernel_z, grid, dim3(256), 0, f.stream, f.view, f.view.csr.summary, hidden, f.c.experts, Fixture::K);
                     hipLaunchKernelGGL(reference_commit_kernel, grid, dim3(256), 0, f.stream, f.view, f.view.csr.summary, rows, hidden, o, rec);
                 } else {
-                    if (arm == 2) hipLaunchKernelGGL(candidate_merge_commit_kernel<true>, grid, dim3(256), 0, f.stream, f.view, f.view.csr.summary, hidden, f.c.experts, Fixture::K, o);
+                    if (arm == 4) candidate_merge_commit_vec4<true>(f.stream, f.view, f.view.csr.summary, hidden, f.c.experts, Fixture::K, o, rows);
+                    else if (arm == 3) candidate_merge_commit_vec4<false>(f.stream, f.view, f.view.csr.summary, hidden, f.c.experts, Fixture::K, o, rows);
+                    else if (arm == 2) hipLaunchKernelGGL(candidate_merge_commit_kernel<true>, grid, dim3(256), 0, f.stream, f.view, f.view.csr.summary, hidden, f.c.experts, Fixture::K, o);
                     else hipLaunchKernelGGL(candidate_merge_commit_kernel<false>, grid, dim3(256), 0, f.stream, f.view, f.view.csr.summary, hidden, f.c.experts, Fixture::K, o);
                     hipLaunchKernelGGL(candidate_finish_kernel, dim3(32), dim3(256), 0, f.stream, f.view, f.view.csr.summary, rows, hidden, o, rec);
                 }
@@ -1162,8 +1179,15 @@ int main(int argc, char** argv) {
                         }
                         if (!stored) throw std::runtime_error("mc: reference output not stored");
                     }
-                    for (const int arm : {1, 2}) {
+                    // Arms 3/4 (vec4 merge) must also equal arms 1/2 byte for byte, accumulation included.
+                    std::vector<std::vector<unsigned char>> scalar_bytes[2];
+                    for (const int arm : {1, 2, 3, 4}) {
                         const auto got = run(f, out16, record, rows, arm, inj, record_init);
+                        if (arm <= 2) scalar_bytes[arm - 1] = got.bytes;
+                        else if (got.bytes != scalar_bytes[arm - 3]) {
+                            std::printf("  DIFFER %s %s rows %u arm %d: vec4 bytes != scalar arm %d\n", cls, what.c_str(), rows, arm, arm - 2);
+                            ++failed;
+                        }
                         ++cases;
                         bool bad = got.pre != base.pre || got.post != base.post;
                         if (got.certificate) {
@@ -1179,7 +1203,7 @@ int main(int argc, char** argv) {
                             bad = true; std::printf("  DIFFER %s %s rows %u arm %d: upstream %s\n", cls, what.c_str(), rows, arm, names[k]);
                         }
                         for (std::size_t k = 0; k < got.bytes.size(); ++k) {
-                            if (k == 3U && arm == 1 && got.certificate && !got.unsafe && !got.pre) continue;  // mode 1 does not write the accumulation
+                            if (k == 3U && (arm == 1 || arm == 3) && got.certificate && !got.unsafe && !got.pre) continue;  // mode 1 does not write the accumulation
                             std::size_t first = 0;
                             const auto n = diff(got.bytes[k], base.bytes[k], first);
                             if (!n) continue;
@@ -1614,12 +1638,14 @@ int main(int argc, char** argv) {
             const dim3 grid((Fixture::H + 255U) / 256U, rows);
             const kr::StridedRows<std::uint16_t> o{static_cast<std::uint16_t*>(out16.base), out16.stride};
             auto* rec = static_cast<unsigned*>(record.base);
-            const auto tail = [&](bool cand) {
+            // cand: 0 base merge + commit, 1 MC merge, 2 MC merge vec4.
+            const auto tail = [&](int cand) {
                 if (!cand || !kr::prefill_certificate_produced()) {
                     hipLaunchKernelGGL(reference_merge_kernel_z, grid, dim3(256), 0, f.stream, f.view, f.view.csr.summary, Fixture::H, f.c.experts, Fixture::K);
                     hipLaunchKernelGGL(reference_commit_kernel, grid, dim3(256), 0, f.stream, f.view, f.view.csr.summary, rows, Fixture::H, o, rec);
                 } else {
-                    hipLaunchKernelGGL(candidate_merge_commit_kernel<false>, grid, dim3(256), 0, f.stream, f.view, f.view.csr.summary, Fixture::H, f.c.experts, Fixture::K, o);
+                    if (cand == 2) candidate_merge_commit_vec4<false>(f.stream, f.view, f.view.csr.summary, Fixture::H, f.c.experts, Fixture::K, o, rows);
+                    else hipLaunchKernelGGL(candidate_merge_commit_kernel<false>, grid, dim3(256), 0, f.stream, f.view, f.view.csr.summary, Fixture::H, f.c.experts, Fixture::K, o);
                     hipLaunchKernelGGL(candidate_finish_kernel, dim3(32), dim3(256), 0, f.stream, f.view, f.view.csr.summary, rows, Fixture::H, o, rec);
                 }
             };
@@ -1629,7 +1655,7 @@ int main(int argc, char** argv) {
                 f.view.unsafe=(!call||arm)?static_cast<unsigned*>(f.admission.base):nullptr;
                 check(hipEventRecord(e0, f.stream), "record");
                 if (call) f.enqueue(3, rows);
-                tail(arm==2U);
+                tail(arm==2U ? 1 : arm==3U ? 2 : 0);
                 check(hipEventRecord(e1, f.stream), "record");
                 check(hipEventSynchronize(e1), "sync");
                 float ms = 0.0F; check(hipEventElapsedTime(&ms, e0, e1), "elapsed");
@@ -1652,16 +1678,16 @@ int main(int argc, char** argv) {
                 unsigned summary = 0; check(hipMemcpy(&summary, f.view.csr.summary, 4U, hipMemcpyDeviceToHost), "summary");
                 if (summary) throw std::runtime_error("mcbench: the real-layer call failed (summary nonzero)");
                 for (const bool call : {false, true}) {
-                    std::vector<double> tb,tp,tc;
+                    std::vector<double> tb,tp,tc,tv;
                     for (int r=0;r<reps;++r) {
-                        // B/P/C/C/P/B balances first-order drift. Tail arms reuse the warm certificate.
-                        tb.push_back(timed(call,0U)); tp.push_back(timed(call,1U)); tc.push_back(timed(call,2U));
-                        tc.push_back(timed(call,2U)); tp.push_back(timed(call,1U)); tb.push_back(timed(call,0U));
+                        // B/P/C/V/V/C/P/B balances first-order drift. Tail arms reuse the warm certificate.
+                        tb.push_back(timed(call,0U)); tp.push_back(timed(call,1U)); tc.push_back(timed(call,2U)); tv.push_back(timed(call,3U));
+                        tv.push_back(timed(call,3U)); tc.push_back(timed(call,2U)); tp.push_back(timed(call,1U)); tb.push_back(timed(call,0U));
                     }
                     const auto med=[](std::vector<double> v){std::sort(v.begin(),v.end());return v[v.size()/2];};
-                    std::printf("mcbench %s rows %u reps %d: B %.4f ms, P %.4f ms, C %.4f ms, P-B %.4f ms, B-C %.4f ms\n",
-                        call?"call":"tail",rows,reps,med(tb),med(tp),med(tc),med(tp)-med(tb),med(tb)-med(tc));
-                    for (const auto* v : {&tb,&tp,&tc}) { for (double ms:*v) std::printf(" %.4f",ms); std::printf("\n"); }
+                    std::printf("mcbench %s rows %u reps %d: B %.4f ms, P %.4f ms, C %.4f ms, V %.4f ms, P-B %.4f ms, B-C %.4f ms, C-V %.4f ms\n",
+                        call?"call":"tail",rows,reps,med(tb),med(tp),med(tc),med(tv),med(tp)-med(tb),med(tb)-med(tc),med(tc)-med(tv));
+                    for (const auto* v : {&tb,&tp,&tc,&tv}) { for (double ms:*v) std::printf(" %.4f",ms); std::printf("\n"); }
                 }
             }
             check(hipEventDestroy(e0),"destroy event"); check(hipEventDestroy(e1),"destroy event");
