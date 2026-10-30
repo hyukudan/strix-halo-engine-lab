@@ -13,6 +13,7 @@
 #include "strix/prompt_terminal_diagnostics.hpp"
 #include "strix/session_state_cache.hpp"
 #include "strix/qpf2k_defaults.hpp"
+#include "strix/moe_route_bf16.hpp"
 #include "strix/rtx_state_import.hpp"
 #include "strix/serial_session.hpp"
 #include "strix/session_state_layout.hpp"
@@ -52,6 +53,10 @@ inline ModelContentIdentity prefix_effective_execution_signature(std::string_vie
     for(const char* name : {"STRIX_QSA_UNION_MERGE","STRIX_QSA_SCORE_ROWS64","STRIX_QSA_DECODE_POOL",
             "STRIX_QSA_DECODE_SELECT","STRIX_QSA_DECODE_POOL_BF16","STRIX_PREFILL_MOE_MERGE_VEC"})
         long_context+=std::string(";")+name+"="+(qpf2k::long_context_item_enabled(name,gsq)?"1":"0");
+    // This arithmetic candidate is opt-in; an absent variable must resolve to OFF.
+    const bool route_bf16 = !baseline && !qpf2k::baseline && !gsq && moe_route_bf16_environment_requested(
+        std::getenv("STRIX_QPF2K_MOE_ROUTE_BF16"), std::getenv("STRIX_BASELINE"), std::getenv("STRIX_QPF2K_DEFAULTS"));
+    long_context += std::string(";STRIX_QPF2K_MOE_ROUTE_BF16=") + (route_bf16 ? "1" : "0");
     const auto canonical=session_numerical_config(std::string(cli)+";prefix-execution-v4;baseline="+
         std::to_string(baseline || qpf2k::baseline)+";gsq="+std::to_string(gsq)+
         ";defaulted="+std::to_string(qpf2k::defaulted_items)+long_context,rotary);

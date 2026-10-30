@@ -2811,3 +2811,47 @@ by the IOMMU.
 - **Off switch:** `options amdgpu iommu_perfopt=0`, or boot the previous kernel
 - **Measured gain:** Qwen 32K prefill +2.9 % / +3.1 % (two repeats, one node, same power, equal or lower GPU clock); DeepSeek two-node decode within +/-1 % with one node on PerfOpt, both-node run pending
 - **Implementation / evidence:** [driver repo: PerfOpt](https://github.com/hyukudan/strix-halo-usb4-driver/blob/main/docs/PERFOPT.md)
+
+<a id="qwen-moe-route-bf16"></a>
+
+### MoE route output BF16 storage candidate
+
+**Engine:** `qwen`. **Control:** `STRIX_QPF2K_MOE_ROUTE_BF16=1` or
+`--prefill-moe-route-bf16 on`. **Config key:** `prefill_moe_route_bf16`.
+**Default:** OFF. **Status:** candidate; bit-changing; outside READY; needs qualification.
+
+Rounds each DA16 FP32 route dot to BF16 with round-to-nearest-even, preserving NaNs
+and infinities. The ordered merge widens each dot exactly to FP32 and retains the
+existing slot-order FMA chain, nonfinite status checks, commit and output format.
+Weights, activations and route weights retain their existing arithmetic.
+
+- **Covered route:** full-row known-prefix fast FP16 MoE prefill, Q4_K/Q5_K gate/up,
+  Q5_1/Q8_0 DA16 certificate down, effective tunes 80/82/88 (including XOR rows), ROUTE=14 and MC=1.
+  The default vector merge/commit and scalar route (`STRIX_PREFILL_MOE_MERGE_VEC=0`)
+  both widen BF16 in the admitted and device-side merge-zero/finish fallback branches.
+- **Declines:** other tunes, core/G3/P1, SMALL, non-DA16 F16X, GSQ, plain/decode and
+  known-rows organizations, MTP, nested/serving, cache/session routes and CUDA.
+  Unsupported geometry or weight formats are refused before execution. The ordinary
+  serial suffix and subsequent decode retain their decode profile and FP32 route scratch.
+- **Identity and inspection:** adds component bit 64 outside the default component set;
+  the profile-pair hash changes. The storage descriptor is `fp16-v1+moeroute16`;
+  OFF retains `fp16-v1` (`a0094634843e16ee`). `--print-effective-config` reports the
+  requested environment, effective boolean, storage descriptor/hash and decline or
+  suppression reason. HTTP capabilities explicitly report this candidate unsupported.
+- **Memory:** logical route-dot row size and slot pitch halve. The arena allocation
+  remains FP32-sized with its original per-row arena pitch; admission is unchanged.
+- **Off switch:** `STRIX_QPF2K_MOE_ROUTE_BF16=0` (any value beginning with `0`),
+  `--prefill-moe-route-bf16 off`, `--baseline`, `STRIX_BASELINE=1`, or
+  `STRIX_QPF2K_DEFAULTS=0`. CLI selection overrides the candidate environment value;
+  baseline and the master off switch suppress both.
+- **Measured gain:** same build, plain CLI on one node, OFF vs ON in three alternating pairs:
+  32K TTFT median **21.83 → 21.15 s** (per pair −0.78 / −0.68 / −0.66 s, mean **−3.2 %**),
+  16K **10.38 → 10.11 s** (−0.19 / −0.27 / −0.27 s, mean **−2.3 %**); every pair faster,
+  first generated token equal. The receipt reports the candidate active on the default route.
+- **Qualification:** CPU option/identity/suppression tests and the native HIP fixture
+  (scalar and vector merge, tunes 80/82/88, nonfinite status) pass. Model-fidelity
+  qualification against its own references is pending; until it passes the candidate stays
+  opt-in and outside every profile.
+- **Native fixture:** `ctest -R strix-hip-moe-route-bf16-tests --output-on-failure`
+  covers both down formats, all three tunes, scalar/vector tails, top-k ten, padded tails, RNE ties, subnormals,
+  infinities, NaNs, OFF byte equality and both merge/commit branches.

@@ -97,14 +97,15 @@
         const unsigned a=rbase+16U*mi+2U*e+h;
         if(a>=count)continue;
         const float unscale=ldexpf(1.0F,-exp_of(a));
-        float* out=at(view.rawdots,row_of(a))+slot_of(a)*hidden+tile*Columns+32U*cg+i;
+        float* out=at(view.rawdots,row_of(a));
+        const auto dot_index=slot_of(a)*hidden+tile*Columns+32U*cg+i;
 #ifdef STRIX_DA16_CERTIFICATE
-        const float d0=acc[mi][0][e]*unscale,d1=acc[mi][1][e]*unscale;
-        out[0]=d0;out[16]=d1;
+        const float d0=moe_route_store<RouteBF16>(out,dot_index,acc[mi][0][e]*unscale);
+        const float d1=moe_route_store<RouteBF16>(out,dot_index+16U,acc[mi][1][e]*unscale);
         unsafe|=(__float_as_uint(d0)&0x7fffffffU)>=0x7b800000U;
         unsafe|=(__float_as_uint(d1)&0x7fffffffU)>=0x7b800000U;
 #else
-        out[0]=acc[mi][0][e]*unscale;out[16]=acc[mi][1][e]*unscale;
+        out[dot_index]=acc[mi][0][e]*unscale;out[dot_index+16U]=acc[mi][1][e]*unscale;
 #endif
     }
 #ifdef STRIX_DA16_CERTIFICATE

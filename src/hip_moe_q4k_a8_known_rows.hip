@@ -1,3 +1,4 @@
+#include "strix/moe_route_bf16.hpp"
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
 #include "strix/moe_a8_down_contract.hpp"
 #include "strix/qpf2k_defaults.hpp"
@@ -1944,6 +1945,7 @@ __global__ __launch_bounds__(F16Tile<Tune>::Threads,prefill_core2_min_waves(Tune
 #include "hip_moe_prefill_route.inc"
 #include "hip_moe_prefill_g3.inc"
 #include "hip_moe_prefill_p1.inc"
+#include "hip_moe_route_bf16.inc"
 #include "hip_moe_prefill_da16.inc"
 #include "hip_moe_prefill_p1da16.inc"
 #include "hip_moe_prefill_small.inc"
@@ -2268,6 +2270,8 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
         prefill_da16()&&prefill_core2()==0U&&prefill_small()==0U&&clear_words==request.shape.hidden&&
         request.shape.hidden/64U>=5U&&request.shape.rows/64U>=5U&&
         reinterpret_cast<std::uintptr_t>(rows.input.base)%16U==0U&&rows.input.stride%16U==0U;
+    if(rows.route_bf16 && (!certificate || prefill_core2()!=0U || q20 || (down_type!=7U && down_type!=8U)))
+        throw std::invalid_argument("MoE route BF16 requires DA16 certificate writer and matching ordered merge");
     if(f16&&(request.shape.rows%128U||request.shape.hidden%256U))throw std::invalid_argument("A8 prefill FP16 WMMA geometry is invalid");
     const bool wmma=kernel_form!=PrefillKernelForm::dot4;
     const unsigned cap=f16?((tune&2U)?2U*f16_batch:f16_batch):wmma?wmma_batch:dot4_cap;
@@ -2547,10 +2551,17 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
                     check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (DA16)");
                     const dim3 down_grid(request.shape.hidden/Tile::Columns,batches);
                     if constexpr(Tune==82U||Tune==80U||Tune==88U) if(certificate) {  // 80 = 82 below 96 assignments per expert; 88 = 80 with XOR rows
-                        if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate<true,Tune>),down_grid,dim3(Threads),0,
-                            stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
-                        else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate<false,Tune>),down_grid,dim3(Threads),0,
-                            stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
+                        if(rows.route_bf16) {
+                            if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate_bf16<true,Tune>),down_grid,dim3(Threads),0,
+                                stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
+                            else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate_bf16<false,Tune>),down_grid,dim3(Threads),0,
+                                stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
+                        } else {
+                            if(down_type==7U)hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate<true,Tune>),down_grid,dim3(Threads),0,
+                                stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
+                            else hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_da16_certificate<false,Tune>),down_grid,dim3(Threads),0,
+                                stream,down_weights,rows,request.shape.hidden,request.shape.rows,image);
+                        }
                         check(hipGetLastError(),"FP16 prefill WMMA down (DA16 certificate)");
                         prefill_certificate_flag()=true; // publish only after the entire producer chain was enqueued
                         return;

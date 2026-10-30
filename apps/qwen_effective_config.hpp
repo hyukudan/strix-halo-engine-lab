@@ -2,6 +2,7 @@
 #include "qwen_yarn_memory.hpp"
 #include "hip_decode_options.hpp"
 #include "known_prefill_reservation.hpp"
+#include "qwen_moe_route_bf16.hpp"
 #include "http_slot_capacity.hpp"
 #include "qwen_prefill_external_memory.hpp"
 #include "strix/known_prefix_prefill.hpp"
@@ -127,7 +128,8 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_SESSION_CACHE", "STRIX_SESSION_DISK", "XDG_CACHE_HOME", "HOME",
             "STRIX_PREFIX_BATCH_CERT", "STRIX_QWEN_YARN_MTP", "STRIX_QWEN_YARN_HOST_RESERVE", "STRIX_PLE_ROLLING_CAP_BYTES", "STRIX_PLE_ROLLING", "STRIX_PLE_ROLLING_POSITIONS", "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION",
             "STRIX_PREFIX_CACHE_INFLIGHT", "STRIX_PREFIX_CACHE_DISK", "STRIX_PREFIX_CACHE_DURABLE",
-            "STRIX_SERVE_PREFILL", "STRIX_BATCH_PROMPT_SMALL"})
+            "STRIX_SERVE_PREFILL", "STRIX_BATCH_PROMPT_SMALL", "STRIX_QPF2K_MOE_ROUTE_BF16",
+            "STRIX_INTPREFILL_MOE_TUNE", "STRIX_QPF2K_MOE", "STRIX_QPF2K_MOE_SMALL"})
         if (!(qpf2k::pre_injected_moe_marker && std::string_view(name) == "STRIX_QPF2K_MOE_DEFAULTED"))
             if (const char* value = get(name)) env.emplace(name, value);
     for (const char* name : {"STRIX_BITCALC_LOGITS_OUT", "STRIX_BITCALC_FORCE_TOKENS"})
@@ -1152,6 +1154,25 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     resolve_session_defaults(result.options,model,request.environment,memory.available);
     resolve_prefix_defaults(result.options,model,request.environment,memory.available);
     auto& o = result.options;
+    resolve_moe_route_bf16(o, result.environment, result.gsq_owner, capabilities.fp16_operands, result.error);
+    if (o.prefill_moe_route_bf16) {
+        const bool geometry = model.hidden_size == 2560U && model.moe_intermediate_size % 128U == 0U &&
+            model.moe_intermediate_size >= 320U && model.moe_intermediate_size <= 640U &&
+            model.num_experts > 0U && model.num_experts <= 512U &&
+            model.num_experts_per_token > 0U && model.num_experts_per_token <= 10U;
+        bool formats = true;
+        for (const auto& t : manifest.tensors) {
+            if (t.name.ends_with(".ffn_gate_exps.weight") || t.name.ends_with(".ffn_up_exps.weight"))
+                formats = formats && (t.ggml_type == 12U || t.ggml_type == 13U);
+            if (t.name.ends_with(".ffn_down_exps.weight")) formats = formats && (t.ggml_type == 7U || t.ggml_type == 8U);
+        }
+        if (!geometry || !formats) {
+            o.prefill_moe_route_bf16 = false;
+            o.prefill_moe_route_bf16_reason = "unsupported DA16 geometry or writer format";
+            result.error = "MoE route BF16 candidate declined: " + o.prefill_moe_route_bf16_reason;
+        }
+    }
+    if (!result.error.empty()) result.admitted = false;
     if (o.http_serve && !o.baseline && o.prefix_cache && o.prefix_cache_host_bytes &&
         !o.prefix_cache_block_rows_explicit && o.known_prefix_prefill_rows >= 1024 &&
         o.known_prefix_prefill_rows % 1024 == 0) {
@@ -1527,6 +1548,13 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
             config.environment.at("STRIX_BATCH_PROMPT_SMALL").starts_with('1')) ? "true" : "false")
         << ",\"decode_profile\":\"" << numerical_profile_name(o.numerical_profile)
         << "\",\"prefill_profile\":\"" << numerical_profile_name(numerical_profile_pair(o).prefill) << "\",\"numerical_profile_pair_identity\":" << numerical_profile_pair_identity(numerical_profile_pair(o))
+        << ",\"prefill_moe_route_bf16\":" << (o.prefill_moe_route_bf16 ? "true" : "false")
+        << ",\"prefill_storage_identity\":" << ((numerical_profile_pair(o).fast_components & kFastPrefillMoe) ?
+            serve::Json(moe_prefill_storage_name(o.prefill_moe_route_bf16)).dump() : "null")
+        << ",\"prefill_storage_identity_hash\":" << ((numerical_profile_pair(o).fast_components & kFastPrefillMoe) ?
+            std::to_string(moe_prefill_storage_identity(o.prefill_moe_route_bf16)) : "null")
+        << ",\"prefill_moe_route_bf16_reason\":" << serve::Json(o.prefill_moe_route_bf16_reason).dump()
+        << ",\"prefill_fast_components\":" << numerical_profile_pair(o).fast_components
         << ",\"tails\":[";
     for (std::size_t i = 0; i < o.known_prefix_tail_rows.size(); ++i) out << (i ? "," : "") << o.known_prefix_tail_rows[i];
     out << "],\"budgets\":[" << o.known_prefill_workspace_budget << ',' << o.known_prefill_metadata_budget << ','

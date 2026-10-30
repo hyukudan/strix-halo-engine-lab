@@ -2073,6 +2073,11 @@ static int run_decode_entry(
         optimization_profile_receipt +=
             "  \"prefill_dense_a8_configured\": " + std::string(prefill_dense_a8 ? "true" : "false") + ",\n" +
             "  \"prefill_fast_components\": " + std::to_string(profile_pair.fast_components) + ",\n" +
+            "  \"prefill_moe_route_bf16\": " + std::string(options.prefill_moe_route_bf16 ? "true" : "false") + ",\n" +
+            "  \"prefill_storage_identity\": " + ((profile_pair.fast_components & strix::kFastPrefillMoe) ?
+                "\"" + std::string(strix::moe_prefill_storage_name(options.prefill_moe_route_bf16)) + "\"" : "null") + ",\n" +
+            "  \"prefill_storage_identity_hash\": " + ((profile_pair.fast_components & strix::kFastPrefillMoe) ?
+                std::to_string(strix::moe_prefill_storage_identity(options.prefill_moe_route_bf16)) : "null") + ",\n" +
             "  \"prefill_serial_execution_identity\": " + std::to_string(compiled_prefill->execution_identity) + ",\n" +
             "  \"prefill_serial_kernel_plan_identity\": " + std::to_string(compiled_prefill->kernel_plan_identity) + ",\n" +
             "  \"prefill_serial_scratch\": \"shared-sibling-view-of-decode-serial-arena\",\n";

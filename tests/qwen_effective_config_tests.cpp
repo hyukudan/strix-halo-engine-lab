@@ -19,6 +19,7 @@
 #include "qwen_cache_compatibility_cases.hpp"
 #include "../apps/http_slot_capacity.hpp"
 #include "../apps/qwen_tiled_prompt_plan.hpp"
+#include "strix/moe_route_bf16.hpp"
 #include <limits>
 #include <set>
 #include "strix/q8_projection_organization.hpp"
@@ -1658,6 +1659,93 @@ int main(int argc, char** arguments) {
     const auto resolve = [&](const RequestedOptions& value, const PrefillMemory& observation) {
         return resolve_effective_config(value,model,info,manifest,validated_model_content_identity,capabilities,observation);
     };
+    {
+        constexpr auto candidate_key = "STRIX_QPF2K_MOE_ROUTE_BF16";
+        const auto base = resolve(request,memory);
+        expect(!base.options.prefill_moe_route_bf16 && base.error.empty(),"route BF16 default off");
+        expect(moe_prefill_storage_identity(false) == 0xa0094634843e16eeULL &&
+            numerical_profile_pair_identity(numerical_profile_pair(base.options)) == 0xf51680d10954bfe0ULL,
+            "plain FP16 pair identity unchanged");
+        for (const unsigned length : {4096U,32768U}) for (const char* vec : {"0","1"}) {
+            auto on = request; on.options.tokens.resize(length); on.environment[candidate_key] = "1";
+            on.environment["STRIX_PREFILL_MOE_MERGE_VEC"] = vec;
+            const auto got = resolve(on,memory);
+            expect(got.error.empty() && got.options.prefill_moe_route_bf16,"4K/32K route BF16 admitted as candidate");
+            const auto pair = numerical_profile_pair(got.options);
+            expect((pair.fast_components & kFastPrefillMoeRouteBF16) && numerical_profile_pair_admitted(pair) &&
+                numerical_profile_pair_identity(pair) != numerical_profile_pair_identity(numerical_profile_pair(base.options)) &&
+                moe_prefill_storage_identity(true) != moe_prefill_storage_identity(false),"route BF16 distinct composed identity");
+            expect(effective_config_json(got).find("\"prefill_moe_route_bf16\":true") != std::string::npos &&
+                effective_config_json(got).find("needs qualification") != std::string::npos,"candidate inspection disclosure");
+        }
+        for (const char* off : {"0","0anything"}) {
+            auto r=request; r.environment[candidate_key]=off; const auto got=resolve(r,memory);
+            expect(!got.options.prefill_moe_route_bf16 && numerical_profile_pair(got.options)==numerical_profile_pair(base.options),
+                "zero-prefixed env values preserve arithmetic");
+        }
+        for (const char* suppress : {"STRIX_BASELINE","STRIX_QPF2K_DEFAULTS"}) {
+            auto r=request; r.environment[candidate_key]="1";
+            r.environment[suppress]=std::string_view(suppress)=="STRIX_BASELINE"?"1":"0suffix";
+            expect(!resolve(r,memory).options.prefill_moe_route_bf16,"master env suppresses candidate");
+        }
+        auto baseline=request; baseline.options.baseline=true; baseline.options.prefill_moe_route_bf16_requested=true;
+        expect(!resolve(baseline,memory).options.prefill_moe_route_bf16,"CLI baseline suppresses candidate CLI");
+        const auto parsed=parse({"decoder","MODEL","1","--prefill-moe-route-bf16","on"});
+        expect(parsed.prefill_moe_route_bf16_requested==true,"candidate CLI parses");
+        auto precedence=request; precedence.environment[candidate_key]="1";
+        precedence.options.prefill_moe_route_bf16_requested=false;
+        expect(!resolve(precedence,memory).options.prefill_moe_route_bf16,"CLI off overrides env on");
+        bool bad=false; try { (void)parse({"decoder","MODEL","1","--prefill-moe-route-bf16","perhaps"}); }
+        catch(const std::invalid_argument&) {bad=true;} expect(bad,"candidate invalid CLI rejected");
+        for (const char* vec : {"0","1"}) for (const auto& [key,value] : Environment{{"STRIX_QPF2K_MOE","513"},{"STRIX_QPF2K_MOE_SMALL","16"},
+            {"STRIX_QPF2K_MOE_MC","2"},{"STRIX_QPF2K_MOE_DA16","0"},{"STRIX_QPF2K_MOE_ROUTE","6"},
+            {"STRIX_INTPREFILL_MOE_TUNE","0"}}) {
+            auto o=base.options; Environment env=base.environment; env[candidate_key]="1";env[key]=value;env["STRIX_PREFILL_MOE_MERGE_VEC"]=vec;std::string error;
+            resolve_moe_route_bf16(o,env,false,true,error);
+            expect(!o.prefill_moe_route_bf16 && error.find("declined")!=std::string::npos,"unsupported MoE organization declines");
+        }
+        {
+            auto o=base.options; auto env=base.environment;env[candidate_key]="1";env["STRIX_QPF2K_MOE_DA16"]="";std::string error;
+            resolve_moe_route_bf16(o,env,false,true,error);
+            expect(!o.prefill_moe_route_bf16 && !error.empty(),"explicit empty organization declines");
+        }
+        for (unsigned route=0;route<8U;++route) {
+            auto o=base.options; Environment env=base.environment;env[candidate_key]="1";std::string error;
+            if(route==0U)o.mtp.enabled=true;
+            if(route==1U)o.http_serve=true;
+            if(route==2U)o.http_batch=true;
+            if(route==3U)o.known_prefix_prefill_rows=0;
+            if(route==4U)o.prefill_fast_components=kFastPrefillDense;
+            if(route==5U)o.serving_concurrency=2;
+            resolve_moe_route_bf16(o,env,route==6U,route!=7U,error);
+            expect(!o.prefill_moe_route_bf16 && !error.empty(),"excluded controller/writer/backend declines");
+        }
+        auto caps=serve::Json::object();moe_route_bf16_capabilities(caps);
+        expect(!caps.find("prefill_moe_route_bf16")->find("supported")->as_bool(),"HTTP capability refuses candidate");
+        {
+            const char* key = "STRIX_QPF2K_MOE_ROUTE_BF16";
+            const char* old = std::getenv(key);
+            const auto saved = old ? std::optional<std::string>{old} : std::nullopt;
+            ::setenv(key,"0",1);
+            const auto off = session_numerical_config("same execution");
+            ::setenv(key,"1",1);
+            expect(session_numerical_config("same execution") != off,"route BF16 changes session namespace");
+            if(saved) ::setenv(key,saved->c_str(),1); else ::unsetenv(key);
+        }
+        const auto captured=requested_prefill_environment([](const char* name)->const char* {
+            return std::string_view(name)=="STRIX_QPF2K_MOE_ROUTE_BF16"?"1":nullptr;
+        });
+        expect(captured.contains(candidate_key),"candidate env captured for inspection and execution");
+        expect(moe_route_bf16_environment_requested("1",nullptr,nullptr) &&
+            !moe_route_bf16_environment_requested("0suffix",nullptr,nullptr) &&
+            !moe_route_bf16_environment_requested("1","1",nullptr) &&
+            !moe_route_bf16_environment_requested("1",nullptr,"0suffix"),"CUDA environment suppression contract");
+        for (const auto& [bits,expected] : std::initializer_list<std::pair<std::uint32_t,std::uint16_t>>{
+            {0x3f808000U,0x3f80U},{0x3f818000U,0x3f82U},{0xbf808000U,0xbf80U},{0xbf818000U,0xbf82U},
+            {0x00008000U,0U},{0x00018000U,2U},{0x80000000U,0x8000U},{0x7f800000U,0x7f80U},
+            {0xff800000U,0xff80U},{0x7f800001U,0x7fc0U},{0x7fffffffU,0x7fffU},{0xffffffffU,0xffffU}})
+            expect(moe_route_bf16_bits(bits)==expected,"route BF16 RNE / nonfinite / denormal bits");
+    }
     {
         auto argv=mtp_fixture(); argv.insert(argv.begin()+5,13,"1");
         argv.insert(argv.end(),{"--http-serve","--http-batch","0"});

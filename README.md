@@ -396,6 +396,14 @@ or a new long-context model-fidelity qualification. See the [catalog](docs/optim
 
 Exact MTP draft attention and the router defaults are enabled in the public Qwen line.
 Batched MTP drafting remains opt-in. The HTTP server sizes its request slots from memory (`--http-batch N` caps, `0` = one at a time), serves decoding requests at layer boundaries inside long prompt blocks (`STRIX_BATCH_SERVICE_MS=250`), runs short prompts first and nests them into a paused long prompt (`STRIX_BATCH_NEST_ROWS=2048`), and cancels at those boundaries; every request keeps the token IDs and committed state it has alone. With a 32K prompt arriving among three decoding streams (default command) the p90 decode gap went from 14.3 s to 0.54 s and a short request's first token from 42-52 s to 2.3-3.8 s ([serving](docs/engine/serving/serving.md#batched-decoding)).
+
+**MoE route BF16 storage — opt-in candidate, pending qualification.** `STRIX_QPF2K_MOE_ROUTE_BF16=1`
+(or `--prefill-moe-route-bf16 on`) stores the per-route MoE dot products in BF16 and widens them exactly in the
+ordered merge. It is bit-changing (prefill storage identity `fp16-v1+moeroute16`), default OFF, and not part of
+any profile until it passes qualification. Same build, plain CLI, three paired runs each: 32K TTFT
+**21.83 → 21.15 s (−3.2 %)**, 16K **10.38 → 10.11 s (−2.3 %)**, every pair faster. See the
+[catalog](docs/optimizations.md#qwen-moe-route-bf16).
+
 GSQ below is a separate speed-over-quality profile.
 
 ### GSQ: opt-in speed-over-quality profile

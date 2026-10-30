@@ -172,3 +172,22 @@ tiled route.
 QSA indexer and selection, GDN recurrence, PLE and LM head keep the decode profile's arithmetic (and the
 QSA attention and router logits without `qsa` and `router`).
 Tokens differ from a dense-A8 run; exactness is defined from the handoff state as for every split pair.
+
+## MoE route storage candidate
+
+`STRIX_QPF2K_MOE_ROUTE_BF16=1` or `--prefill-moe-route-bf16 on` adds the
+`moeroute16` storage component (bit 64) outside the default fast component set.
+The effective config key is `prefill_moe_route_bf16`. This bit-changing candidate is
+OFF by default, outside READY and needs native compiler, execution, model fidelity
+and complete-workload qualification. It supports only the DA16 certificate down
+and ordered merge/commit route; exclusions fail closed. See the
+[full storage contract](../../optimizations.md#qwen-moe-route-bf16).
+
+`prefill_storage_identity` names `fp16-v1` when OFF (FNV-1a hash
+`a0094634843e16ee`), and `fp16-v1+moeroute16` when ON. This storage descriptor is
+separate from `numerical_profile_pair_identity`: the existing plain pair hash is
+unchanged, and enabling the candidate adds bit 64 to the pair composition.
+`--print-effective-config` and execution receipts disclose both identities and the
+component mask. Inspection also reports the effective boolean and reason;
+HTTP capabilities report the candidate unsupported. Baseline and
+`STRIX_QPF2K_DEFAULTS=0` suppress it, including explicit CLI requests.

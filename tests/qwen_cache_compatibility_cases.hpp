@@ -42,6 +42,24 @@ inline std::string without_prefix_reuse_policy(std::string text) {
     return text;
 }
 
+// The storage candidate adds scalar report fields. Exclude only those fields
+// from the frozen cache-policy comparison; candidate reporting has its own tests.
+inline std::string without_moe_route_report(std::string text) {
+    for(const char* key:{"prefill_moe_route_bf16","prefill_storage_identity","prefill_storage_identity_hash",
+            "prefill_moe_route_bf16_reason","prefill_fast_components"}) {
+        const auto needle=std::string("\"")+key+"\":";
+        auto start=text.find(needle);
+        if(start==std::string::npos) continue;
+        auto end=start+needle.size();
+        if(end<text.size() && text[end]=='\"') {for(++end;end<text.size() && text[end]!='\"';++end) if(text[end]=='\\') ++end;++end;}
+        else while(end<text.size() && text[end]!=',' && text[end]!='}') ++end;
+        if(end<text.size() && text[end]==',') ++end;
+        else if(start>0 && text[start-1]==',') --start;
+        text.erase(start,end-start);
+    }
+    return text;
+}
+
 // Public-main resolver output fingerprints. Generation uses the same fixture
 // against the preserved source; expected values are in the adjacent table.
 inline std::vector<std::pair<std::string,std::string>> cache_compatibility_records(const strix::ModelContract& model) {
@@ -56,7 +74,7 @@ inline std::vector<std::pair<std::string,std::string>> cache_compatibility_recor
         auto text=effective_config_json(config);
         // New report is additive; compare every incumbent field, including its
         // original representation/reason, rather than a handpicked subset.
-        text=without_prefix_reuse_policy(without_cache_policy(std::move(text)));
+        text=without_moe_route_report(without_prefix_reuse_policy(without_cache_policy(std::move(text))));
         text+=';'+std::to_string(o.prefix_batch_cert)+';'+std::to_string(o.session_management_requested);
         text+=';'+std::to_string(ordinary_http_batch_slots(o))+';'+std::to_string(o.prefix_cache_every);
         text+=';'+std::to_string(o.prefix_cache_disk_bytes)+';'+o.prefix_cache_dir;

@@ -2070,5 +2070,18 @@
     "preconditions": "Wait before the next producer overwrites its member partial; requires successful async start; compute scratch remains serialized. Per grouped call, EVERY member must have at least STRIX_MM_PF_ASYNC_MIN_ROWS rows (default 2048; 0 removes the row gate). Otherwise ordinary comm.start, byte-identical scheduling to STRIX_MM_PF_ASYNC_START=0. Deterministic member-row decision on both ranks; global off always wins.",
     "off_switch": "STRIX_MM_PF_LATE_SRC_FENCE=0 (also STRIX_MM_BASELINE=1 unless explicitly overridden)",
     "doc_anchor": "docs/minimax-grouped-prefill.md"
+  },
+  {
+    "engine": "qwen",
+    "category": "candidate",
+    "name": "MoE route output BF16 storage candidate",
+    "flag_or_env": "STRIX_QPF2K_MOE_ROUTE_BF16=1; --prefill-moe-route-bf16 on; config key prefill_moe_route_bf16",
+    "default": "OFF",
+    "status": "candidate; outside READY; pending qualification",
+    "exact": "Bit-changing: each FP32 DA16 route dot rounds to BF16 RNE, preserving NaN/Inf; exact FP32 widening precedes the unchanged slot-order FMA and status/commit logic. OFF preserves incumbent arithmetic and identity.",
+    "gain": "Same build, plain CLI, three alternating pairs: 32K TTFT 21.83 -> 21.15 s (-3.2 %), 16K 10.38 -> 10.11 s (-2.3 %); every pair faster. Native fixture passes; model-fidelity qualification pending.",
+    "preconditions": "Full-row known-prefix fast FP16 MoE, Q4_K/Q5_K gate/up, Q5_1/Q8_0 DA16 certificate down, effective tunes 80/82/88 including XOR rows, ROUTE=14, MC=1; default vector and MERGE_VEC=0 scalar merge/commit, including unsafe fallback. Other writers/readers, GSQ, core/G3/P1, SMALL, MTP, nested/serving, cache/session and CUDA decline. Logical dot row bytes halve; allocation and arena pitch remain FP32-sized.",
+    "off_switch": "Any environment value starting with 0; --prefill-moe-route-bf16 off; --baseline; STRIX_BASELINE=1; STRIX_QPF2K_DEFAULTS=0.",
+    "doc_anchor": "docs/optimizations.md#qwen-moe-route-bf16"
   }
 ]
