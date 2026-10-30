@@ -12,6 +12,8 @@
 #include "strix/dist/communicator.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/ds41_layer.hpp"
+#include "strix/ds41_touch_batch.hpp"
+#include "strix/ds41_exact_flags.hpp"
 #include "strix/hip_ds41_attention.hpp"
 
 #include <hip/hip_runtime.h>
@@ -83,7 +85,9 @@
 // --aba N [--aba-flags filter,direct,seghpw,fold,f16,live,engtp]: the prompt + generation and the --window-rows windows 2N times in this
 // process from the same start (--state-in or position 0), the listed attention flags (STRIX_DS41_IDX_CAND_FILTER,
 // STRIX_DS41_IDX_DIRECT, STRIX_DS41_ATTN_SEG_HPW, STRIX_DS41_ATTN_WINDOW_FOLD,
-// STRIX_DS41_ATTN_TILE_F16, STRIX_DS41_ATTN_LIVE_CHUNKS, STRIX_DS41_ENGRAM_TP) off in even arms and on in odd ones; per arm one "aba arm" line
+// STRIX_DS41_ATTN_TILE_F16, STRIX_DS41_ATTN_LIVE_CHUNKS, STRIX_DS41_ENGRAM_TP; touch = STRIX_DS41_TOUCH_BATCH, rowviews =
+// STRIX_DS41_TRELLIS_ROW_VIEWS, normilp = STRIX_DS41_NORM_ILP, routes = STRIX_DS41_R1FUSE_ROUTES, cfast = STRIX_DS41_COMPRESS_FAST,
+// swz = STRIX_DS41_ATTN_LDS_SWIZZLE) off in even arms and on in odd ones; per arm one "aba arm" line
 // (R1 ms/token, window ms, fingerprints of the R1 tokens + local logits slice, the window tokens and the attention state)
 // and at the end "aba exact IDENTICAL|DIFFER" (every arm's fingerprints == arm 0's).
 //   Route recording: --routes-seqs FILE --routes OUT [--max-positions N] teacher-forces every sequence of FILE from a
@@ -1825,7 +1829,10 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
     const bool aba_filter = a.aba_flags.find("filter") != std::string::npos, aba_direct = a.aba_flags.find("direct") != std::string::npos,
                aba_seghpw = a.aba_flags.find("seghpw") != std::string::npos, aba_fold = a.aba_flags.find("fold") != std::string::npos,
                aba_f16 = a.aba_flags.find("f16") != std::string::npos, aba_live = a.aba_flags.find("live") != std::string::npos,
-               aba_engtp = a.aba_flags.find("engtp") != std::string::npos;
+               aba_engtp = a.aba_flags.find("engtp") != std::string::npos, aba_touch = a.aba_flags.find("touch") != std::string::npos,
+               aba_rowviews = a.aba_flags.find("rowviews") != std::string::npos, aba_normilp = a.aba_flags.find("normilp") != std::string::npos,
+               aba_routes = a.aba_flags.find("routes") != std::string::npos, aba_cfast = a.aba_flags.find("cfast") != std::string::npos,
+               aba_swz = a.aba_flags.find("swz") != std::string::npos;
     const auto slice = strix::ds41::vocab_slice(129280U, single ? 1U : 2U, single ? 0U : rank);
     std::vector<float> slice_host(slice.count);
     for (std::uint32_t arm = 0; arm < arms; ++arm) {
@@ -1839,6 +1846,12 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
         ah::set_attention_tile_f16(aba_f16 ? on : -1);     // STRIX_DS41_ATTN_TILE_F16
         ah::set_attention_live_chunks(aba_live ? on : -1);   // STRIX_DS41_ATTN_LIVE_CHUNKS
         strix::ds41::set_engram_tp(aba_engtp ? on : -1);     // STRIX_DS41_ENGRAM_TP
+        strix::ds41::set_touch_batch(aba_touch ? on : -1);  // touch = STRIX_DS41_TOUCH_BATCH
+        strix::ds41::set_trellis_row_views(aba_rowviews ? on : -1);  // STRIX_DS41_TRELLIS_ROW_VIEWS
+        strix::ds41::set_norm_ilp(aba_normilp ? on : -1);            // STRIX_DS41_NORM_ILP
+        strix::ds41::set_r1fuse_routes(aba_routes ? on : -1);        // STRIX_DS41_R1FUSE_ROUTES
+        ah::set_compress_fast(aba_cfast ? on : -1);                  // STRIX_DS41_COMPRESS_FAST
+        ah::set_attention_lds_swizzle(aba_swz ? on : -1);            // STRIX_DS41_ATTN_LDS_SWIZZLE
         if (arm != 0U) {
             seq = prompt_seq;
             if (!a.state_in.empty()) fwd.import_state(start);

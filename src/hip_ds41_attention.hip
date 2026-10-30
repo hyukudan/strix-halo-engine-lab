@@ -104,7 +104,7 @@ __device__ __forceinline__ void window_write_body(const WindowView& v, const uin
 // weights ahead (the first ones before the latent barrier) instead of one step at a time;
 // the chain of each output (512 fmaf over d ascending) and everything else are unchanged.
 constexpr unsigned kAheadSteps = 3;
-// Fast (STRIX_DS41_COMPRESS_FAST=1, default off): the same values in fewer instructions. f16_to_float compiles to
+// Fast (STRIX_DS41_COMPRESS_FAST, default on, =0 off): the same values in fewer instructions. f16_to_float compiles to
 // per-element exec-mask branches in the 512-term chains; here a finite F16 converts in the fmaf itself (v_fma_mix:
 // exact, the same float for normals, subnormals with F16 denormals on and signed zeros) and a step of 64 weights with
 // an exponent of 31 in any of its lanes takes f16_to_float itself; the latent is read from LDS 4 floats at a time and
@@ -1444,7 +1444,7 @@ static void check_compress(const CompressView& v) {
 // 2 fast, 1 ahead, 0 the default kernel
 static int compress_form() {
     static const bool ahead_env = [] { const char* e = std::getenv("STRIX_DS41_COMPRESS_AHEAD"); return e && e[0] == '1'; }();
-    static const bool fast_env = [] { const char* e = std::getenv("STRIX_DS41_COMPRESS_FAST"); return e && e[0] == '1'; }();
+    static const bool fast_env = [] { const char* e = std::getenv("STRIX_DS41_COMPRESS_FAST"); return !(e && e[0] == '0'); }();  // default on
     if (compress_fast_mode < 0 ? fast_env : compress_fast_mode != 0) return 2;
     if (compress_ahead_mode < 0 ? ahead_env : compress_ahead_mode != 0) return 1;
     return 0;

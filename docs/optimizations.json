@@ -698,6 +698,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "Exact decode launch and staging options",
+    "flag_or_env": "STRIX_DS41_TOUCH_BATCH; STRIX_DS41_TRELLIS_ROW_VIEWS; STRIX_DS41_NORM_ILP; STRIX_DS41_R1FUSE_ROUTES; STRIX_DS41_COMPRESS_FAST",
+    "default": "on",
+    "exact": "In-process ABA on both ranks: R1 tokens + logits slice, verify-window tokens and the attention state of every arm equal arm 0's; batch N8 every row's fed/argmax/logits hash and final attention states equal.",
+    "gain": "GPU, two Strix Halo nodes over 2x USB4 Gen3, PerfOpt kernel, production packs; one binary, all five off vs all five on in the same process (rank app --aba 5, batch app --aba 3, first pair discarded): R1 26.94 -> 26.68 ms/token (-0.95 %, paired 95 % interval -0.28..-0.24 ms, 4/4 pairs faster); R6 verify window 51.43 -> 51.08 ms (-0.68 %, 4/4 pairs faster); batch N8 decode 71.19 -> 70.91 ms/step (-0.40 %), wall -1.16 % (2/2 pairs faster); Per option, alone vs off (in-process ABA x4, 3 warm pairs, every arm bitwise on both ranks): TOUCH_BATCH R1 -0.31 % (95 % interval -0.14..-0.03 ms), TRELLIS_ROW_VIEWS R1 -0.08 % (-0.034..-0.009 ms), NORM_ILP R1 -0.35 % (-0.18..-0.01 ms), COMPRESS_FAST R1 -0.34 % and R6 -0.59 % (both intervals below zero), R1FUSE_ROUTES R1 -0.11 % (3/3 pairs faster, interval -0.066..+0.005 ms); R6 not slower for any of them",
+    "preconditions": "Two-node decode (DeviceForward / BatchForward). TRELLIS_ROW_VIEWS needs the dense_r1 trellis API and applies to multi-row steps; the others apply at every row count.",
+    "off_switch": "=0 on each variable (STRIX_DS41_TOUCH_BATCH=0, STRIX_DS41_TRELLIS_ROW_VIEWS=0, STRIX_DS41_NORM_ILP=0, STRIX_DS41_R1FUSE_ROUTES=0, STRIX_DS41_COMPRESS_FAST=0), separately",
+    "doc_anchor": "docs/optimizations.md#ds-exact-decode-launches"
+  },
+  {
+    "engine": "deepseek",
     "name": "Grouped trellis o_a and q_a/KV pair",
     "flag_or_env": "STRIX_DS41_TRELLIS_OA_GROUP; STRIX_DS41_TRELLIS_QAKV_PAIR",
     "default": "auto",

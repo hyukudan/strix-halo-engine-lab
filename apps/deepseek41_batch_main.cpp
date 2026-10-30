@@ -6,6 +6,8 @@
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/ds41_dspark_files.hpp"
 #include "strix/ds41_engram_tp.hpp"
+#include "strix/ds41_touch_batch.hpp"
+#include "strix/ds41_exact_flags.hpp"
 #include "strix/hip_ds41_attention.hpp"
 #include "strix/hip_ds41_dspark.hpp"
 
@@ -87,7 +89,8 @@ struct Args {
     std::uint32_t draft_ranks = 2;  // 2 (default since P17.2): drafts on both ranks (a request's context on rank slot % 2); 1: rank 0
     // --aba K [--aba-flags filter,direct,seghpw,fold,f16,live,engtp] (--mode batch): each N run 2K times from the same start, the listed
     // attention flags (STRIX_DS41_IDX_CAND_FILTER, STRIX_DS41_IDX_DIRECT, STRIX_DS41_ATTN_SEG_HPW,
-    // STRIX_DS41_ATTN_WINDOW_FOLD, STRIX_DS41_ATTN_TILE_F16, STRIX_DS41_ATTN_LIVE_CHUNKS, STRIX_DS41_ENGRAM_TP) off in even arms, on in
+    // STRIX_DS41_ATTN_WINDOW_FOLD, STRIX_DS41_ATTN_TILE_F16, STRIX_DS41_ATTN_LIVE_CHUNKS, STRIX_DS41_ENGRAM_TP; touch =
+    // STRIX_DS41_TOUCH_BATCH, rowviews / normilp / routes / cfast / swz as in the rank app) off in even arms, on in
     // odd ones; one "aba arm" line each (decode ms/step, fingerprint of every row's fed / argmax / logits hash with
     // --check and the final attention states) and "aba exact IDENTICAL|DIFFER" (every arm == arm 0).
     std::uint32_t aba = 0;
@@ -1015,7 +1018,10 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
             const bool f = a.aba_flags.find("filter") != std::string::npos, d = a.aba_flags.find("direct") != std::string::npos,
                        h = a.aba_flags.find("seghpw") != std::string::npos, fo = a.aba_flags.find("fold") != std::string::npos,
                        bf = a.aba_flags.find("f16") != std::string::npos, lv = a.aba_flags.find("live") != std::string::npos,
-                       et = a.aba_flags.find("engtp") != std::string::npos;
+                       et = a.aba_flags.find("engtp") != std::string::npos, tb = a.aba_flags.find("touch") != std::string::npos,
+                       rv = a.aba_flags.find("rowviews") != std::string::npos, ni = a.aba_flags.find("normilp") != std::string::npos,
+                       ro = a.aba_flags.find("routes") != std::string::npos, cf = a.aba_flags.find("cfast") != std::string::npos,
+                       sz = a.aba_flags.find("swz") != std::string::npos;
             std::vector<std::uint64_t> prints;
             for (std::uint32_t arm = 0; arm < 2U * a.aba; ++arm) {
                 const int on = static_cast<int>(arm % 2U);
@@ -1026,6 +1032,12 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
                 ah::set_attention_tile_f16(bf ? on : -1);
                 ah::set_attention_live_chunks(lv ? on : -1);
                 strix::ds41::set_engram_tp(et ? on : -1);  // STRIX_DS41_ENGRAM_TP
+                strix::ds41::set_touch_batch(tb ? on : -1);
+                strix::ds41::set_trellis_row_views(rv ? on : -1);
+                strix::ds41::set_norm_ilp(ni ? on : -1);
+                strix::ds41::set_r1fuse_routes(ro ? on : -1);
+                ah::set_compress_fast(cf ? on : -1);
+                ah::set_attention_lds_swizzle(sz ? on : -1);
                 const auto rr = run(fwd, a, prompts, n, template_slot, a.fill != 0U, false);
                 std::uint64_t fp = 14695981039346656037ULL;
                 const auto mix = [&](std::uint64_t v) { fp = (fp ^ v) * 1099511628211ULL; };
@@ -1048,6 +1060,12 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
             ah::set_attention_tile_f16(-1);
             ah::set_attention_live_chunks(-1);
             strix::ds41::set_engram_tp(-1);
+            strix::ds41::set_touch_batch(-1);
+            strix::ds41::set_trellis_row_views(-1);
+            strix::ds41::set_norm_ilp(-1);
+            strix::ds41::set_r1fuse_routes(-1);
+            ah::set_compress_fast(-1);
+            ah::set_attention_lds_swizzle(-1);
             const bool same = std::all_of(prints.begin(), prints.end(), [&](std::uint64_t v) { return v == prints[0]; });
             if (print) std::printf("aba exact %s (N %u, %zu arms; %s, final attention states)\n", same ? "IDENTICAL" : "DIFFER", n, prints.size(),
                                    a.check ? "fed / argmax / logits hash per row" : "fed / argmax per row");

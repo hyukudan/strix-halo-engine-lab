@@ -1,5 +1,6 @@
 // Device side of ds41_trellis.hpp: the trellis library context, prepared sites, per-stream workspaces and the linear.
 #include "strix/ds41_trellis.hpp"
+#include "strix/ds41_exact_flags.hpp"
 
 #include "strix/ds41_moe.hpp"
 
@@ -100,8 +101,7 @@ bool trellis_qakv_pair_enabled() noexcept {
 }
 bool trellis_row_views_enabled() noexcept {
 #if defined(STRIX_DS41_TRELLIS_DENSE_R1)
-    static const bool on = [] { const auto* e = std::getenv("STRIX_DS41_TRELLIS_ROW_VIEWS"); return e && e[0] == '1'; }();
-    return on;
+    return trellis_row_views();  // default on, STRIX_DS41_TRELLIS_ROW_VIEWS=0 off (ds41_exact_flags.hpp)
 #else
     return false;
 #endif

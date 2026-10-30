@@ -14,6 +14,8 @@
 #include "strix/ds41_trellis.hpp"
 #include "strix/ds41_trellis_group.hpp"
 #include "strix/ds41_engram_tp.hpp"
+#include "strix/ds41_touch_batch.hpp"
+#include "strix/ds41_exact_flags.hpp"
 #include "strix/hip_ds41_attention.hpp"
 #include "strix/hip_ds41_expert_tp.hpp"
 #include "strix/hip_ds41_formats.hpp"
@@ -261,6 +263,24 @@ __global__ void touch_kernel(const uint4* __restrict__ p, std::uint64_t n, std::
         acc ^= v.x ^ v.y ^ v.z ^ v.w;
     }
     if (acc == 0x9e3779b9U && n == 0U) never[0] = acc;  // never true: keeps the loads
+}
+
+// Up to 16 spans read by one launch (ds41::touch_batch()): span k is the 16-byte words [end[k - 1], end[k]) of the
+// concatenation, each read once as by touch_kernel; a thread's index only grows, so its span index only moves forward.
+struct TouchSpans {
+    const uint4* p[16];
+    std::uint64_t end[16];
+    std::uint32_t count;
+};
+__global__ void touch_spans_kernel(TouchSpans s, std::uint32_t* __restrict__ never) {
+    std::uint32_t acc = 0, k = 0;
+    const std::uint64_t total = s.count ? s.end[s.count - 1U] : 0U;
+    for (std::uint64_t i = blockIdx.x * std::uint64_t{blockDim.x} + threadIdx.x; i < total; i += std::uint64_t{gridDim.x} * blockDim.x) {
+        while (i >= s.end[k]) ++k;
+        const uint4 v = s.p[k][i - (k ? s.end[k - 1U] : 0U)];
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (acc == 0x9e3779b9U && total == 0U) never[0] = acc;  // never true: keeps the loads
 }
 
 std::uint64_t row_bytes(ds41::WeightFormat f, std::uint32_t width) {
@@ -1935,9 +1955,9 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
         ds41::enqueue_hc_site(v, st);
         late_mix = nullptr;
     };
-    // Residual boundary fusions; each flag is independent and off by default.
+    // Residual boundary fusions; each flag is independent (QNORM_A8 off by default, ROUTES on by default).
     static const bool qnorm_a8 = [] { const char* v = std::getenv("STRIX_DS41_R1FUSE_QNORM_A8"); return v && v[0] == '1'; }();
-    static const bool router_routes = [] { const char* v = std::getenv("STRIX_DS41_R1FUSE_ROUTES"); return v && v[0] == '1'; }();
+    const bool router_routes = ds41::r1fuse_routes();  // STRIX_DS41_R1FUSE_ROUTES: default on, =0 off
     bool q_a8 = false, routes_ready = false;
     const auto route_view = [&] {
         ds41::BuildRoutesView bv;
@@ -2012,6 +2032,21 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
             check(hipStreamWaitEvent(m.prefetch_stream, m.prefetch_ready, 0), "prefetch wait");
             ps = m.prefetch_stream;
         }
+        TouchSpans spans{};
+        const bool batched = ds41::touch_batch();
+        const auto flush = [&] {
+            if (spans.count) touch_spans_kernel<<<320, 256, 0, ps>>>(spans, m.never.p);
+            spans.count = 0;
+        };
+        const auto touch = [&](const uint4* p, std::uint64_t n) {
+            if (!batched) {
+                touch_kernel<<<320, 256, 0, ps>>>(p, n, m.never.p);
+                return;
+            }
+            spans.p[spans.count] = p;
+            spans.end[spans.count] = (spans.count ? spans.end[spans.count - 1U] : 0U) + n;
+            if (++spans.count == 16U) flush();
+        };
         for (auto i = static_cast<std::size_t>(&from - m.plan.steps.data()) + 1U; i < m.plan.steps.size() && left; ++i)
             for (const auto& w : m.plan.steps[i].weights) {
                 if (!left) break;
@@ -2040,7 +2075,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                             std::uint64_t n = 0;
                             if (!left || !ds41::trellis_site_span(*t, &data, &n)) break;
                             const std::uint64_t size = std::min<std::uint64_t>(n, left);
-                            if (size / 16U) touch_kernel<<<320, 256, 0, ps>>>(static_cast<const uint4*>(data), size / 16U, m.never.p);
+                            if (size / 16U) touch(static_cast<const uint4*>(data), size / 16U);
                             left -= size;
                         }
                         continue;
@@ -2053,9 +2088,10 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 const bool half = tp && (w.ends_with("attn_q_b.weight") || w.ends_with("attn_output_a.weight"));
                 const std::uint8_t* base = d.p + (half ? d.n / 2U * m.options.rank : 0U);
                 const std::uint64_t size = std::min<std::uint64_t>(half ? d.n / 2U : d.n, left);
-                if (size / 16U) touch_kernel<<<320, 256, 0, ps>>>(reinterpret_cast<const uint4*>(base), size / 16U, m.never.p);
+                if (size / 16U) touch(reinterpret_cast<const uint4*>(base), size / 16U);
                 left -= size;
             }
+        flush();
         check(hipGetLastError(), "prefetch");
     };
 
