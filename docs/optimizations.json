@@ -636,9 +636,9 @@
     "flag_or_env": "--peer-timeout; --prefill-path; --slots; --prefill-rows",
     "default": "auto",
     "exact": "Both-rank reference gates compare prefill logits/state digests, greedy token IDs, verify rows and batch rows with fixed Q2 experts, dense overlay and trellis packs; pack identity changes require their separate quality reference.",
-    "gain": "No isolated measurement",
+    "gain": "Pair, context 49152, fresh prompts: 8,399 tokens 14.57 -> 10.34 s, 32,499 tokens 60.8 -> 39.1 s (16384 vs 2048 rows), same logits and tokens",
     "preconditions": "Serve app and capacity for the requested slots/rows.",
-    "off_switch": "Explicit values override each flag; STRIX_DS41_BASELINE=1 suppresses injection",
+    "off_switch": "Explicit values override each flag (--prefill-rows N); STRIX_DS41_BASELINE=1 suppresses injection",
     "doc_anchor": "docs/optimizations.md#ds-serve-shape"
   },
   {

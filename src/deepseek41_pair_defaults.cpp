@@ -267,7 +267,7 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& env,
         if (!has(user, "--engram-mapped")) def.emplace_back("--engram-direct");
     }
     if (app == App::serve) {
-        def.insert(def.end(), {"--peer-timeout", "120", "--prefill-path", "device", "--slots", "8", "--prefill-rows", "2048"});
+        def.insert(def.end(), {"--peer-timeout", "120", "--prefill-path", "device", "--slots", "8", "--prefill-rows", "auto"});
         const char* rows16 = env("STRIX_DS41_BATCH_ROWS16");
         if (has(user, "--no-dspark") || has(user, "--dspark") || model.empty()) {
         } else if (rows16 != nullptr && rows16[0] == '1') {

@@ -277,6 +277,9 @@ public:
     [[nodiscard]] AttentionState export_state_at(std::uint32_t position) const;
     [[nodiscard]] std::uint64_t weight_bytes() const noexcept;         // loaded (owned) by this prefill
     [[nodiscard]] std::uint64_t shared_weight_bytes() const noexcept;  // read in place from shared_weights
+    // The bytes of weights a prefill with these options would load itself (not found in options.shared_weights; streamed
+    // experts: both layer slots), from the model's tensor inventory, before constructing it (memory admission).
+    [[nodiscard]] static std::uint64_t owned_weight_bytes(const std::filesystem::path& gguf, const PrefillOptions& options);
     [[nodiscard]] double load_seconds() const noexcept;
 
     struct Impl;
