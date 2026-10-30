@@ -1038,15 +1038,16 @@ std::uint32_t prefix_cache_unit(const O& options) {
 #ifndef STRIX_DECODE_ENTRY
 #define STRIX_DECODE_ENTRY main
 #endif
-int STRIX_DECODE_ENTRY(
+static int run_decode_entry(
     int argc,
-    char** argv) try {
+    char** argv, strix::decode_cli::MtpBundleSetupRetry bundle_retry = {}) try {
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
         std::cout << "Usage: strix-hip-decode-token MODEL.gguf TOKEN_ID ... [options]\n"
             "  --context N --generate N --eos-token ID --residency register|copy\n"
             "  --optimization-profile auto|manual (default auto, qualified checkpoint only)\n"
             "  --baseline / STRIX_BASELINE=1 (historical resolution, controlled defaults off)\n"
             "  --print-effective-config (deterministic host JSON; exits before HIP setup)\n"
+            "  --mtp-bundle FILE (YaRN MTP pins/policy/budgets; otherwise discover MODEL.gguf.mtp-bundle.json)\n"
             "  --prefill-numerical-profile dense-a8|fast-prefill-f16wmma-v1 (automatic tiled default: FP16)\n"
             "  STRIX_PREFILL_F16=0 restores historical resolution of the same argv\n"
             "  --known-prefix-prefill-rows 16..8192; route/full-rows/union/router/prefill-rows accept =0\n"
@@ -1107,10 +1108,12 @@ int STRIX_DECODE_ENTRY(
         parse_options(
             argc,
             argv, true);
+    bundle_retry.selected=options.mtp.enabled && !options.mtp_bundle_path.empty();
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     options.mtp_cli_phase_retirement=false;
 #endif
-    const auto startup_preflight = strix::emit_qwen_startup_diagnostics(options.print_effective_config);
+    const auto startup_preflight = strix::emit_qwen_startup_diagnostics(
+        options.print_effective_config || strix::decode_cli::yarn_bundle_serial_retry);
     const auto release_assets = strix::decode_cli::verify_http_release_assets(options);
     // Bind supplied numerical settings; operational paths, switches and budgets are excluded.
     const std::set<std::string_view> session_io_options{"--session-save", "--session-load", "--session-then-prompt", "--session-logits",
@@ -3766,6 +3769,36 @@ int STRIX_DECODE_ENTRY(
         // session over the same loaded model; one receipt per request.
         const auto fresh_session = session;
         auto request_options = options;
+        if (!options.mtp_bundle_path.empty()) {
+            try {
+                const auto identity=strix::decode_cli::mtp_bundle_golden_identity(options,model);
+                const auto golden=strix::decode_cli::ensure_mtp_bundle_golden(options.mtp_bundle_path,identity,
+                    [&](const std::filesystem::path& temp) {
+                        auto dump_options=options;
+                        dump_options.mtp_bundle_path.clear();
+                        dump_options.mtp.golden.clear();dump_options.mtp.golden_sha256.clear();
+                        dump_options.mtp.golden_dump=temp.string();
+                        std::ostringstream ignored;
+                        strix::decode_cli::run_mtp_decode_bridge(dump_options,model,compiled,parents,session,direct_dispatcher,
+                            generations,catalog_config.deferred_moe_status,optimization_profile.selected,ignored,make_window);
+                        // Restore precisely the fresh target state before generation.
+                        if (parents->tiled.reset_state) parents->tiled.reset_state();
+                        else strix::initialize_hip_fresh_runtime_memory(memory.scratch(),memory.state());
+                        session=fresh_session;
+                        if (ple_turn) {
+                            ple_turn->finish();
+                            ple_turn=ple_reclaimer->begin_turn();
+                            mtp_mapped_ple_owner->bind_residency(ple_turn);
+                        }
+                    });
+                request_options.mtp.golden=golden.string();
+                request_options.mtp.golden_sha256=strix::model_content_identity_hex(
+                    strix::sha256_file_content(golden,strix::FileHashPolicy::cached));
+            } catch (const strix::decode_cli::YarnMemoryPressure&) { throw; }
+            catch (const std::exception& error) {
+                throw strix::decode_cli::YarnBundleCalibrationFailure(error.what());
+            }
+        }
         for (std::uint32_t repeat = 0; repeat < options.mtp.sample_repeats; ++repeat) {
             if (repeat) {
                 if (ple_reclaimer) {
@@ -3787,8 +3820,10 @@ int STRIX_DECODE_ENTRY(
                     ? strix::decode_cli::MtpDecodeComponentDiagnostic{strix::tests::run_mtp_component_diagnostic}
                     : strix::decode_cli::MtpDecodeComponentDiagnostic{}
                 , strix::tests::mtp_prefix_gate_requested()
+#else
+                , {}, {}, false
 #endif
-                );
+                , [&] { bundle_retry.target_mutated=true; });
             if (ple_turn) ple_turn->finish();
             std::cout.flush();
         }
@@ -5638,17 +5673,32 @@ int STRIX_DECODE_ENTRY(
                    !replay_assessment->passes_declared_policy
                ? 2
                : 0;
+} catch (const strix::decode_cli::YarnBundleCalibrationFailure& error) {
+    // All owners above have unwound. Retry from a fresh serial target session;
+    // no generated output has been published by the calibration-only pass.
+    bundle_retry.restore();
+    return strix::decode_cli::retry_mtp_bundle_serial(error,[&] {return run_decode_entry(argc,argv);});
 } catch (const strix::decode_cli::YarnMemoryPressure& error) {
+    if (const auto status=strix::decode_cli::retry_mtp_bundle_setup(bundle_retry,error,[&] {return run_decode_entry(argc,argv);}))
+        return *status;
     std::cerr << "strix-hip-decode-token: " << error.what() << '\n';
     std::cout << "{\"stop_reason\":\"yarn-memory-watchdog\"," << error.receipt() << "}\n";
     return 1;
 } catch (const strix::ple_reclaim::DirectError& error) {
+    if (const auto status=strix::decode_cli::retry_mtp_bundle_setup(bundle_retry,error,[&] {return run_decode_entry(argc,argv);}))
+        return *status;
     std::cerr << "strix-hip-decode-token: PLE runtime read failed after source admission; canonical state may be mutated; "
         "resident restart requires a fresh invocation: " << error.what() << '\n';
     return 1;
 } catch (const std::exception& error) {
+    if (const auto status=strix::decode_cli::retry_mtp_bundle_setup(bundle_retry,error,[&] {return run_decode_entry(argc,argv);}))
+        return *status;
     std::cerr
         << "strix-hip-decode-token: "
         << error.what() << '\n';
     return 1;
+}
+
+int STRIX_DECODE_ENTRY(int argc,char** argv) {
+    return run_decode_entry(argc,argv);
 }

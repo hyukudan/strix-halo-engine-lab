@@ -767,14 +767,15 @@ cannot overlap later compute, is a large one. Rows stay chronological; only bloc
 
 ### YaRN long-context MTP CLI
 
-**Engine:** `qwen`. **Control:** `--rope-yarn 2|4 --context C --mtp`, `STRIX_QWEN_YARN_MTP=0`, `STRIX_QSA_MTP_POOL`, `STRIX_PLE_ROLLING`. **Default:** table-backed QSA MTP pool and rolling PLE for factor 2 through 524,288 and factor 4 through 1,048,576 positions when admitted.
+**Engine:** `qwen`. **Control:** `--rope-yarn 2|4 --context C` with a verified MTP bundle (or `--mtp`), `--mtp-bundle FILE`, `STRIX_QWEN_YARN_MTP=0`, `STRIX_QSA_MTP_POOL`, `STRIX_PLE_ROLLING`. **Default:** table-backed QSA MTP pool and rolling PLE for factor 2 through 524,288 and factor 4 through 1,048,576 positions when admitted.
 
 Speculative MTP decode on the static YaRN CLI route, with the committed QSA MTP pool and rolling PLE reads so that a
 1,048,576-position context fits one node. YaRN itself stays opt-in because it changes outputs against native rotary.
 
 - **Preconditions:** CLI only (HTTP refuses YaRN); explicit `--context`; pinned sidecar and version-3 golden; memory admission with a 4 GiB physical margin. The [storage admission ladder](engine/speculative/mtp-native-cli.md#explicit-yarn-mtp-cli) tries defaults, H1024/cap268435456/ring256/PIPE-default, then H256/cap33554432/ring64/PIPE0. Only memory refusal advances it; explicit environment values pin each knob. `storage_ladder_step` and chosen sizes appear in inspection and run receipts.
 - **Exactness evidence:** Against serial YaRN at 1,048,576 positions (factor 4, real prose prompt): all 256 generated tokens, every committed step's full-vocabulary logits, prompt and final target state and predictor state are identical between MTP with the pool, plain serial YaRN and MTP with the pool off. 262K (full scope) and 524K (target scope) are identical as well.
-- **Off switch:** omit `--mtp` for serial YaRN; `STRIX_QSA_MTP_POOL=0` and `STRIX_PLE_ROLLING=0` restore the previous pool and PLE paths.
+- **Automatic selection:** a bare `--rope-yarn` command selects MTP when `<model>.mtp-bundle.json` (or `--mtp-bundle FILE`) verifies against its pins; the calibration golden is read from the bundle directory or generated once into the user cache (`$XDG_CACHE_HOME/strix-engine/goldens`); any bundle failure before mutation falls back to serial YaRN with one notice. At 131,072 positions the bare command with an empty golden cache matched serial YaRN on all 256 tokens, the full logit ledger and target state.
+- **Off switch:** `STRIX_QWEN_YARN_MTP=0` (or no bundle and no `--mtp`) keeps serial YaRN; `STRIX_QSA_MTP_POOL=0` and `STRIX_PLE_ROLLING=0` restore the previous pool and PLE paths.
 - **Measured gain:** MTP speculative decode on YaRN contexts through 1,048,576 positions on one node; serial YaRN is the comparator.
 - **Implementation / evidence:** [YaRN MTP CLI](engine/speculative/mtp-native-cli.md#explicit-yarn-mtp-cli)
 

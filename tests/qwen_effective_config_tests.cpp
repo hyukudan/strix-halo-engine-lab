@@ -1400,6 +1400,12 @@ void long_context_admission_tests(const RequestedOptions& original, const ModelC
         expect(admitted.ple_rolling_h == 1024U && admitted.ple_rolling_bound > 600000000U &&
             effective_config_json(admitted).find("\"ple_verified_credit_bytes\":0") != std::string::npos,
             "rolling inspection exposes H/bound and never claims setup verification");
+        {
+            const auto json = effective_config_json(admitted);
+            const auto first = json.find("\"ple_rolling_cap_bytes\":");
+            expect(first != std::string::npos && json.find("\"ple_rolling_cap_bytes\":", first + 1U) == std::string::npos,
+                "rolling inspection emits ple_rolling_cap_bytes once");
+        }
         auto off_request = request;
         off_request.environment["STRIX_PLE_ROLLING"] = "0";
         const auto off = resolve(off_request,observed);

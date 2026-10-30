@@ -251,6 +251,7 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
                 }
                 std::string failure;
                 try {
+                    select_mtp_bundle_golden(o,model);
                     const auto required = o.mtp.enabled && memory.estimate_with_score_ring
                         ? memory.estimate_with_score_ring(o, score_ring_rows) : memory.estimate(o);
                     auto owners = required.owners;

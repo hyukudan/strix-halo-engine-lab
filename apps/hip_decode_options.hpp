@@ -23,6 +23,7 @@
 #include <array>
 #include "strix/token_sampling.hpp"
 #include "strix/mtp_draft_profiles.hpp"
+#include "qwen_mtp_bundle.hpp"
 #include "strix/mtp_depth_window_controller.hpp"
 #include <cerrno>
 #include <fstream>
@@ -236,6 +237,8 @@ inline bool mtp_sha256_text(std::string_view value) noexcept {
     return nonzero;
 }
 struct Options {
+    std::string mtp_bundle_path;
+    std::string yarn_decode_source = "explicit";
     bool baseline = false;
     std::string suppressed_yarn_request;
     bool print_effective_config = false;
@@ -1380,7 +1383,7 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
         throw std::invalid_argument("MTP metadata diagnostic does not accept unused golden options");
     if(!m.golden_dump.empty() && (!m.golden.empty() || !m.golden_sha256.empty()))
         throw std::invalid_argument("MTP golden dump writes a golden and does not accept an input golden");
-    const bool needs_golden=!m.metadata_only && m.golden_dump.empty();
+    const bool needs_golden=!m.metadata_only && m.golden_dump.empty() && o.mtp_bundle_path.empty();
     if(m.sidecar.empty() || m.sidecar_logical_name.empty() || (needs_golden && m.golden.empty()) || m.repository.empty() || m.revision.empty() || m.source_path.empty() || m.converter_revision.empty() ||
        !mtp_sha256_text(m.sidecar_sha256) || !mtp_sha256_text(m.target_sha256) || !mtp_sha256_text(m.target_content) ||
        (needs_golden && !mtp_sha256_text(m.golden_sha256)) || !mtp_sha256_text(m.converter_sha256) || !mtp_sha256_text(m.norm_converter_sha256))
@@ -1595,13 +1598,69 @@ inline void apply_prefix_cache_environment(Options& o, Lookup lookup) {
 
 inline Options parse_options(
     int argc,
-    char** argv, bool defer_qpf2k_defaults = false) {
+    char** argv, bool defer_qpf2k_defaults = false, std::string bundle_path = {}) {
+    if (argc>=2 && bundle_path.empty()) {
+        std::string bundle;
+        const char* inherited_yarn=std::getenv("STRIX_QWEN_ROPE_YARN");
+        bool explicit_mtp=false, yarn=inherited_yarn && std::string_view(inherited_yarn)!="off";
+        const char* inherited_baseline=std::getenv("STRIX_BASELINE");
+        bool baseline=inherited_baseline && std::string_view(inherited_baseline)=="1";
+        std::vector<std::string> expanded;
+        for (int i=0;i<argc;++i) {
+            const std::string arg=argv[i];
+            if (arg=="--mtp-bundle" || arg.starts_with("--mtp-bundle=")) {
+                if (!bundle.empty()) throw std::invalid_argument("duplicate --mtp-bundle");
+                if (arg=="--mtp-bundle") {
+                    if (++i>=argc) throw std::invalid_argument("--mtp-bundle requires FILE");
+                    bundle=argv[i];
+                } else bundle=arg.substr(13);
+                if (bundle.empty()) throw std::invalid_argument("--mtp-bundle requires FILE");
+                continue;
+            }
+            explicit_mtp |= arg=="--mtp" || arg.starts_with("--mtp-");
+            if (arg=="--baseline") baseline=true;
+            if (arg=="--rope-yarn" && i+1<argc) yarn=std::string_view(argv[i+1])!="off";
+            if (arg.starts_with("--rope-yarn=")) yarn=arg.substr(12)!="off";
+            expanded.push_back(arg);
+        }
+        yarn &= !baseline;
+        if (!bundle.empty() && explicit_mtp) throw std::invalid_argument("explicit MTP flags and bundle are mutually exclusive");
+        const char* env=std::getenv("STRIX_QWEN_YARN_MTP");
+        const bool off=yarn_bundle_serial_retry || (env && std::string_view(env)=="0");
+        if (yarn && !explicit_mtp && bundle.empty() && !off) {
+            const std::string discovered=std::string(argv[1])+".mtp-bundle.json";
+            if (std::filesystem::exists(discovered)) bundle=discovered;
+        }
+        if (yarn && !explicit_mtp && !off && bundle.empty() && env && std::string_view(env)=="1")
+            throw std::invalid_argument("STRIX_QWEN_YARN_MTP=1 requires an MTP bundle");
+        if ((!bundle.empty() || yarn_bundle_serial_retry) && !explicit_mtp) {
+            try {
+                if (!off) {
+                    auto loaded=read_mtp_bundle(bundle);
+                    expanded.insert(expanded.end(),loaded.argv.begin(),loaded.argv.end());
+                }
+                std::vector<char*> pointers;
+                for (auto& arg:expanded) pointers.push_back(arg.data());
+                auto result=parse_options(static_cast<int>(pointers.size()),pointers.data(),defer_qpf2k_defaults,
+                    off?"serial-retry":bundle);
+                if (off) {result.mtp_bundle_path.clear();result.yarn_decode_source="env";}
+                else verify_mtp_bundle_sidecar(result.mtp.sidecar,result.mtp.sidecar_sha256,result.mtp.sidecar_bytes);
+                return result;
+            } catch(const std::exception& error) {
+                if(off) throw;
+                throw YarnBundleCalibrationFailure(error.what());
+            }
+        }
+        if (yarn && !explicit_mtp && !off && bundle.empty())
+            std::cerr << "YaRN: no MTP bundle found; using serial decode\n";
+    }
     validate_release_manifest_arguments(argc, argv);
     // The executable resolves injected schedule defaults after reading the manifest.
     const strix::qpf2k::ModelScope defaults_scope(defer_qpf2k_defaults || strix::qpf2k::gsq_model);
     if (argc < 2) {
         throw std::invalid_argument(
             "usage: strix-hip-decode-token MODEL.gguf [TOKEN_ID ...] "
+            "[--mtp-bundle FILE] "
             "[--mtp --mtp-sidecar FILE --mtp-sidecar-sha256 HEX (--mtp-golden FILE --mtp-golden-sha256 HEX | --mtp-golden-dump FILE) [--mtp-window-expert-union --mtp-window-expert-union-bytes N] [--mtp-window-hyper-mix] [--mtp-window-qsa-rows] [--mtp-window-prefix] [--mtp-draft-chain [--mtp-draft-vocab FILE[,FILE...]|auto:DIR] [--mtp-draft-context-vocab N] [--mtp-draft-exact] [--mtp-draft-q4] [--mtp-ngram-draft[=on|off|auto|ctx|copy|wide]]] [--mtp-draft-profile base|distill-d|distill-g] (explicit source/conversion/cast/budget options required)] "
             "[--optimization-profile auto|manual] [--baseline] [--print-effective-config] [--execution-inventory] [--host-dispatch-telemetry] [--execution-telemetry-trace] [--device-queue-trace] "
             "[--numerical-profile exact-v5|hc-splitk-f32-v1|q51-a8-down-v1|hc-splitk-f32+q51-a8-down-v1|q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-deferred-norm-f32+q51-q80-a8-down-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup-v1|hc-splitk-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1|hc-deferred-norm-f32+q51-q80-a8-down+q5k-a8-gateup+dense-a8-v1] [--prefill-numerical-profile NAME] "
@@ -1617,6 +1676,10 @@ inline Options parse_options(
     }
 
     Options options;
+    if (bundle_path!="serial-retry") options.mtp_bundle_path=std::move(bundle_path);
+    if (!options.mtp_bundle_path.empty()) options.yarn_decode_source=options.mtp_bundle_path;
+    else if (yarn_bundle_serial_retry || (std::getenv("STRIX_QWEN_YARN_MTP") &&
+        std::string_view(std::getenv("STRIX_QWEN_YARN_MTP"))=="0")) options.yarn_decode_source="env";
     std::optional<std::string> yarn_env, yarn_cli;
     if (const char* value = std::getenv("STRIX_QWEN_ROPE_YARN"))
         yarn_env = value;
@@ -2996,6 +3059,8 @@ inline Options parse_options(
     }
     options.rotary = strix::validate_qwen_rotary_request(yarn_factor,
         options.context_explicit, options.context_tokens, options.baseline);
+    if (!options.mtp_bundle_path.empty() && options.rotary.mode()!=strix::RotaryMode::yarn)
+        throw std::invalid_argument("MTP bundles require YaRN");
     if (options.rotary.mode() == strix::RotaryMode::yarn) {
         const auto reason = yarn_route_refusal(options);
         if (!reason.empty()) throw std::invalid_argument(reason);

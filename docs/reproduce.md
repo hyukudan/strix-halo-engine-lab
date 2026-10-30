@@ -120,6 +120,7 @@ and manifests. Unpinned sizes must be read from actual manifests/files; bpw is n
 |---|---|---|---|---|---|
 | Qwen | [Qwen3.8-Flash-Next-GGUF-mirror](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GGUF-mirror) | `unsloth/Qwen3.8-Flash-Next-GGUF@38bb39ee` | `UD-Q4_K_XL/*.gguf`, merged as `Qwen3.8-Flash-Next-UD-Q4_K_XL.gguf`; public base `MTP/*.gguf` | Target about 111.33 GB; default distilled sidecar 2,786,568,256 bytes | Qwen Community License; base MTP is not distill-g. |
 | Qwen GSQ | [Qwen3.8-Flash-Next-GSQ-hybrid-Q2](https://huggingface.co/hyukudan/Qwen3.8-Flash-Next-GSQ-hybrid-Q2) | `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF@ed59f920` plus project composition recipe | `hybrid-q2.gguf`; same distilled draft/vocabulary prerequisites | Unpinned | Qwen Community License; separate numerical/quality identity. |
+| Qwen YaRN MTP bundle | Project recipe in this repository | Expanded distill-g pins and explicit 1M budgets | [`recipes/qwen-distill-g-yarn.mtp-bundle.json`](../recipes/qwen-distill-g-yarn.mtp-bundle.json); copy beside the GGUF as `<model>.mtp-bundle.json` | JSON only; sidecar and the `draft-vocab/` directory supplied separately | Preserves draft provenance; calibration caches locally on first use. |
 | DeepSeek pair/RTX | [deepseek-v4.1-flash-gguf-mirror](https://huggingface.co/hyukudan/deepseek-v4.1-flash-gguf-mirror) | `kyuz0/deepseek-v4.1-flash-gguf@20408f69` | `DeepSeek-V4.1-Flash-1017-Q2.gguf`, `DeepSeek-V4.1-Flash-1017-DSpark-MXFP4.gguf` | 365,713,686,528 + 7,966,294,016 bytes | MIT; preserve notices. |
 | DeepSeek pair overlay | [DeepSeek-V4.1-Flash-1017-strix-dense-U6](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-dense-U6) | Project conversion in same repository; immutable revision not recorded by fetcher | `c-u6.gguf`, `c-u6.json` | Unpinned | DeepSeek MIT; retain conversion provenance. |
 | DeepSeek pair packs | [DeepSeek-V4.1-Flash-1017-strix-trellis-EXL3](https://huggingface.co/hyukudan/DeepSeek-V4.1-Flash-1017-strix-trellis-EXL3) | Project packs in same repository; immutable revision not recorded by fetcher | `ours-K4/*`, `ours-K5/*`, `mixB.txt`, `aux/vocab/*.bin`, `aux/draft-keep-stats.jsonl`; copy vocabulary to `vocab/` for pairs | Unpinned | DeepSeek MIT; preserve adopted pack/code notices separately. |
@@ -313,11 +314,11 @@ context (1024-row passes, auto budgeting, hashes).
 
 | Engine, default profile and decode/prefill/exactness | Quick loads | Full loads | Rough planning wall time quick / full |
 |---|---:|---:|---|
-| Qwen | 25 | 380 | 15ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“60 min / 3ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“12 h |
-| DeepSeek pair | 3 paired launches | 6 paired launches | 5ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“20 min / 1ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“4 h |
-| GLM r1b (r1 same count) | 2 paired launches | 2 paired launches | 5ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“30 min / 15ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“90 min |
-| MiniMax | 1 paired launch | 1 paired launch | 5ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“30 min / 1ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“4 h |
-| RTX | 2 | 4 | 5ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“20 min / 20ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“90 min |
+| Qwen | 25 | 380 | 15-60 min / 3-12 h |
+| DeepSeek pair | 3 paired launches | 6 paired launches | 5-20 min / 1-4 h |
+| GLM r1b (r1 same count) | 2 paired launches | 2 paired launches | 5-30 min / 15-90 min |
+| MiniMax | 1 paired launch | 1 paired launch | 5-30 min / 1-4 h |
+| RTX | 2 | 4 | 5-20 min / 20-90 min |
 
 DeepSeek quick uses exactly 3 paired model loads per rank: greedy decode, DSpark decode and
 1K prefill, plus 6 host-only config-print calls (3 on each node). Plan 5-20 minutes; config

@@ -137,7 +137,8 @@ inline PrefillRequirements compile_prompt_requirements(const Options& options,
         if(page<=0) throw std::invalid_argument("YaRN MTP page size unavailable");
         mtp_geometry.page_bytes=static_cast<std::uint64_t>(page);
 #endif
-        if(options.rotary.mode()==RotaryMode::yarn && !supplied_sidecar_info && options.mtp.golden_dump.empty())
+        if(options.rotary.mode()==RotaryMode::yarn && !supplied_sidecar_info && options.mtp.golden_dump.empty() &&
+            (options.mtp_bundle_path.empty() || !options.mtp.golden.empty()))
             require_mtp_forward_golden_geometry(options.mtp.golden,mtp_calibration_rows(options),
                 mul(model.hidden_size,model.hc_count),model.vocab_size,options.context_tokens);
         const auto mtp=yarn_mtp_owners(options,model,mtp_geometry);

@@ -2008,7 +2008,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     bool deferred_status,std::string_view resolved_profile,std::ostream& output,
     MtpDecodeWindowFactory make_window={},std::function<std::string()> completion_receipt={},
     MtpDecodeQualification qualify={},MtpDecodeComponentDiagnostic component_diagnostic={},
-    bool qualification_after_tiled_prompt=false) {
+    bool qualification_after_tiled_prompt=false,std::function<void()> before_target_mutation={}) {
 
     struct CaptureShutdown {
         ~CaptureShutdown() noexcept {
@@ -2204,6 +2204,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             check_yarn_memory();
             if(sampler && !tiled_prompt && i+1U==options.tokens.size())target->set_token_sampler(sampler);
             const auto input=session_calibration.empty()?options.tokens[i]:session_calibration[i];
+            if(before_target_mutation) before_target_mutation();
             auto current=serial_split ? target->execute_serial(session,parents->prompt.resources,*parents->prompt.dispatcher,input)
                                : target->execute_serial(session,r,dispatcher,input);
             check_yarn_memory();
