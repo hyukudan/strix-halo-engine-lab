@@ -953,6 +953,23 @@ halves, instead of both reading the whole ~160 MB weight.
 - **Measured gain:** R1 decode -0.61 ms/step (-2.1 %); verify windows (rank app, in-process ABA x4, every arm bitwise on both ranks, steps of up to 8 rows vs off): R1 -2.1 %, R2 -1.5 %, R4 -1.0 %, R6 -1.0 % (95 % intervals below zero), R8 -0.6 % (3/3 pairs faster)
 - **Implementation / evidence:** [production defaults](models/deepseek-v4.1/production-defaults.md)
 
+<a id="ds-engram-f16-pf"></a>
+
+### Engram prefill projection tile with prefetch
+
+**Engine:** `deepseek`. **Control:** `STRIX_DS41_ENGRAM_F16_PF`. **Default:** on.
+
+The prefill Engram projection runs a 48 x 64 LDS tile (6 x 16 accumulators per lane, 1024 threads) that loads the next
+128-element slab into registers while the current slab is computed, instead of the 64 x 64 tile that stages after a barrier.
+
+- **Preconditions:** F16 Engram KV, the full aligned view (width 6144, 25600 outputs, first 0, 16-byte aligned x and weights, valid strides), 32..8192 rows, row padding at most 9/8 of the 64-row tile (49..64 rows excluded). F8 / TP-split views and other F16 projections keep enqueue_f16_rows.
+- **Automatic selection:** Every prefill Engram piece (hip_deepseek41_prefill.hip) that meets the preconditions.
+- **Fallback notice:** Other views and row counts take enqueue_f16_rows silently (same bits).
+- **Exactness evidence:** Bitwise: every output byte equals enqueue_f16_rows (rows 1..8192 incl. tile edges 47/48/49/63/64/65/95/96/97, padded strides with guard values, 3 independent F16 weight matrices, BF16-rounded inputs with signed zeros); same per-lane chains (k = lane, lane + 32, ... ascending, separate multiply and add rounding, no contraction), same butterfly and storing lane. Compiler resources: 164 VGPR, no spill or scratch.
+- **Off switch:** STRIX_DS41_ENGRAM_F16_PF=0 (read on every call)
+- **Measured gain:** Isolated Engram projection (6144 -> 25600, event medians, interleaved arms, 3 weight copies) vs enqueue_f16_rows: rows 32 0.54x, 128 0.87x, 256 0.94x, 512 0.86x, 1024 0.86x (88.1 -> 75.8 ms), 2048 0.86x, 4096 0.86x, 8192 0.87x; 49..64 rows keep enqueue_f16_rows (64 rows: 1.16x). End-to-end TTFT not separately measured.
+- **Implementation / evidence:** [kernel](../src/hip_ds41_layer.hip), [gate and bench](../tests/hip_ds41_engram_f16_pf_tests.hip)
+
 <a id="ds-shared-grouped"></a>
 
 ### Grouped shared expert

@@ -1797,6 +1797,112 @@ void launch_f16_tiled(const F16RowsView& v, hipStream_t stream) {
                        row_tiles, output_tiles);
 }
 
+// Engram prefill tile with next-slab prefetch: f16_tiled_kernel's V = 2 slot layout and arithmetic body on RB x OB blocks of
+// WR x 16 per wave, but the next 128-element slab's raw x / F16 weight words are loaded into registers before the current
+// slab's arithmetic and published to LDS after its last barrier. WR = 6 (48 x 64, 1024 threads) keeps the prefetch spill-free
+// (164 VGPRs; the 64 x 64 / WR 8 form needs 192 and spills). Lane l still adds elements l, l + 32, ... in ascending order with
+// separate multiply and add rounding from 0.0F, then the same butterfly and storing lane: the bits of f16_rows_kernel.
+template <unsigned RB, unsigned OB, unsigned GROUP, unsigned WR>
+__global__ __launch_bounds__(RB / WR * (OB / 16U) * 32U) void f16_tiled_pf_kernel(F16RowsView v, unsigned row_tiles, unsigned output_tiles) {
+    constexpr unsigned S = f16t_slab, WO = 16U, T = RB / WR * (OB / WO) * 32U;
+    constexpr unsigned NX = (RB * S / 4U + T - 1U) / T, NW = (OB * S / 8U + T - 1U) / T;
+    static_assert(RB % WR == 0 && OB % WO == 0 && T <= 1024U && (RB + OB) * S * sizeof(float) <= 65536U);
+    __shared__ float xs[RB][S];
+    __shared__ float ws[OB][S];
+    const unsigned b = blockIdx.x, g = b / (GROUP * output_tiles);
+    const unsigned rem = b - g * GROUP * output_tiles;
+    const unsigned in_group = row_tiles - g * GROUP < GROUP ? row_tiles - g * GROUP : GROUP;
+    const unsigned r0 = (g * GROUP + rem % in_group) * RB, o0 = (rem / in_group) * OB;
+    const unsigned tid = threadIdx.x, l = tid % wave, w = tid / wave;
+    const unsigned wr = (w % (RB / WR)) * WR, wo = (w / (RB / WR)) * WO;
+    float acc[WR][WO];
+#pragma unroll
+    for (unsigned r = 0; r < WR; ++r)
+#pragma unroll
+        for (unsigned j = 0; j < WO; ++j) acc[r][j] = 0.0F;
+    float4 px[NX];
+    uint4 pw[NW];
+    const auto fetch = [&](unsigned k0) {  // raw words of slab k0 (clamped rows/outputs, as f16_tiled_kernel)
+#pragma unroll
+        for (unsigned n = 0; n < NX; ++n) {
+            const unsigned q = tid + n * T;
+            if (q < RB * S / 4U) {
+                const unsigned r = q / (S / 4U), c = q % (S / 4U);
+                const unsigned row = r0 + r < v.rows ? r0 + r : v.rows - 1U;
+                px[n] = *reinterpret_cast<const float4*>(v.x + static_cast<std::size_t>(row) * v.x_stride + k0 + c * 4U);
+            }
+        }
+#pragma unroll
+        for (unsigned n = 0; n < NW; ++n) {
+            const unsigned q = tid + n * T;
+            if (q < OB * S / 8U) {
+                const unsigned o = q / (S / 8U), c = q % (S / 8U);
+                const unsigned out = o0 + o < v.count ? o0 + o : v.count - 1U;
+                pw[n] = *reinterpret_cast<const uint4*>(v.weight + static_cast<std::size_t>(v.first + out) * v.width + k0 + c * 8U);
+            }
+        }
+    };
+    const auto publish = [&]() {  // the same values and LDS slots as f16_tiled_kernel<.., V = 2>
+#pragma unroll
+        for (unsigned n = 0; n < NX; ++n) {
+            const unsigned q = tid + n * T;
+            if (q < RB * S / 4U) {
+                const unsigned r = q / (S / 4U), c = q % (S / 4U);
+                xs[r][f16t_slot<2>(c * 4U)] = px[n].x;
+                xs[r][f16t_slot<2>(c * 4U + 1U)] = px[n].y;
+                xs[r][f16t_slot<2>(c * 4U + 2U)] = px[n].z;
+                xs[r][f16t_slot<2>(c * 4U + 3U)] = px[n].w;
+            }
+        }
+#pragma unroll
+        for (unsigned n = 0; n < NW; ++n) {
+            const unsigned q = tid + n * T;
+            if (q < OB * S / 8U) {
+                const unsigned o = q / (S / 8U), c = q % (S / 8U);
+                const unsigned words[4] = {pw[n].x, pw[n].y, pw[n].z, pw[n].w};
+#pragma unroll
+                for (unsigned k = 0; k < 4; ++k) {
+                    ws[o][f16t_slot<2>(c * 8U + 2U * k)] = f16_to_float(static_cast<std::uint16_t>(words[k] & 0xFFFFU));
+                    ws[o][f16t_slot<2>(c * 8U + 2U * k + 1U)] = f16_to_float(static_cast<std::uint16_t>(words[k] >> 16U));
+                }
+            }
+        }
+    };
+    fetch(0);
+    for (unsigned k0 = 0; k0 < v.width; k0 += S) {
+        publish();
+        __syncthreads();  // current slab visible
+        if (k0 + S < v.width) fetch(k0 + S);  // consumed only by the next publish
+#pragma unroll
+        for (unsigned sb = 0; sb < S / wave / 2U; ++sb) {  // steps s = 2 sb, 2 sb + 1, ascending
+            float xv[2][WR], wv[WO][2];
+#pragma unroll
+            for (unsigned r = 0; r < WR; ++r)
+#pragma unroll
+                for (unsigned t = 0; t < 2; ++t) xv[t][r] = xs[wr + r][sb * wave * 2U + l * 2U + t];
+#pragma unroll
+            for (unsigned j = 0; j < WO; ++j)
+#pragma unroll
+                for (unsigned t = 0; t < 2; ++t) wv[j][t] = ws[wo + j][sb * wave * 2U + l * 2U + t];
+#pragma unroll
+            for (unsigned t = 0; t < 2; ++t)
+#pragma unroll
+                for (unsigned r = 0; r < WR; ++r)
+#pragma unroll
+                    for (unsigned j = 0; j < WO; ++j) acc[r][j] = acc[r][j] + wv[j][t] * xv[t][r];
+        }
+        __syncthreads();  // all readers finish before the next publish
+    }
+#pragma unroll
+    for (unsigned r = 0; r < WR; ++r)
+#pragma unroll
+        for (unsigned j = 0; j < WO; ++j) {
+            const float t = butterfly(acc[r][j]);
+            const unsigned row = r0 + wr + r, o = o0 + wo + j;
+            if (l == j && row < v.rows && o < v.count) v.out[static_cast<std::size_t>(row) * v.out_stride + o] = t;
+        }
+}
+
 // ---- embedding and argmax ---------------------------------------------------------------------------
 __global__ __launch_bounds__(256) void embedding_kernel(const std::uint16_t* __restrict__ table, const std::uint32_t* __restrict__ tokens,
                                                         unsigned hidden, unsigned long long total, float* __restrict__ out) {
@@ -2348,6 +2454,33 @@ void enqueue_f16_rows(const F16RowsView& v, void* stream) {
         hipLaunchKernelGGL(f16_many_kernel, dim3((v.count + f16_block_outputs - 1U) / f16_block_outputs, (v.rows + f16_tile_rows - 1U) / f16_tile_rows),
                            dim3(256), 0, as_stream(stream), v);
     check(hipGetLastError(), "F16 rows launch");
+}
+
+bool engram_f16_pf_supported(const F16RowsView& v) noexcept {
+    return v.weight && !v.weight_f8 && v.x && v.out && v.width == 6144U && v.count == 25600U && v.first == 0U && v.rows >= 32U &&
+           v.rows <= 8192U && v.x_stride >= v.width && v.x_stride % 4U == 0U && v.out_stride >= v.count &&
+           (reinterpret_cast<std::uintptr_t>(v.x) & 15U) == 0U && (reinterpret_cast<std::uintptr_t>(v.weight) & 15U) == 0U;
+}
+
+void enqueue_engram_f16_pf(const F16RowsView& v, void* stream) {
+    require(engram_f16_pf_supported(v), "Engram F16 prefetch tile view");
+    const unsigned row_tiles = (v.rows + 47U) / 48U, output_tiles = (v.count + 63U) / 64U;
+    hipLaunchKernelGGL((f16_tiled_pf_kernel<48, 64, 8, 6>), dim3(row_tiles * output_tiles), dim3(48U / 6U * (64U / 16U) * 32U), 0,
+                       as_stream(stream), v, row_tiles, output_tiles);
+    check(hipGetLastError(), "Engram F16 prefetch tile launch");
+}
+
+bool engram_f16_pf_admitted(const F16RowsView& v) noexcept {
+    // The 48-row tile is ~14 % faster per padded row than the 64 x 64 default; admit it while its row padding is at most
+    // 9/8 of that tile's (measured: 64 rows, 96 vs 64, 1.16x slower; 128 and 256 at the bound 0.87x / 0.94x).
+    return engram_f16_pf_supported(v) && (v.rows + 47U) / 48U * 48U * 8U <= (v.rows + 63U) / 64U * 64U * 9U;
+}
+
+void enqueue_engram_f16_rows(const F16RowsView& v, void* stream) {
+    // Read on every call (in-process A/B); =0 restores enqueue_f16_rows with all its controls.
+    const char* e = std::getenv("STRIX_DS41_ENGRAM_F16_PF");
+    if (!(e && e[0] == '0') && engram_f16_pf_admitted(v)) enqueue_engram_f16_pf(v, stream);
+    else enqueue_f16_rows(v, stream);
 }
 
 void enqueue_f16_rows_pair(const F16RowsView& a, const F16RowsView& b, void* stream) {
