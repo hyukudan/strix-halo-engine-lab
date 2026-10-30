@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -38,7 +39,7 @@
 // they needed), never anything a live request holds (the cache holds copies on the host, apart from the KV pool).
 //
 // Disk tier (options.dir non-empty): every inserted block and snapshot is also written (write-through, by a writer
-// thread, never in the caller's path) to one file each in `dir`: a 128-byte header (magic, version, the model identity,
+// thread; serialization and enqueueing run on the caller) to one file each in `dir`: a 128-byte header (magic, version, the model identity,
 // the layer layout hash, block size, chain key, parent key, depth, insert sequence, payload size and checksum, header
 // checksum), then the payload (the layer layout table; a block: its tokens and per KV-source layer its KV and index-key
 // entries; a snapshot: next token, logits FNV and per layer the v1 ring bytes and carry floats). Files are written to
@@ -65,17 +66,26 @@ struct PrefixCacheOptions {
     std::array<std::uint8_t, 32> model_id{};  // identity of the model (and layer count) the states belong to
     bool promote = true;                  // a hit read from disk is inserted into the RAM tier
     bool drop_page_cache = true;          // written files leave the page cache; reads use O_DIRECT
+    std::filesystem::path quota_dir;      // explicit service root shared by its namespaces; empty: legacy per-tier quota
+    std::uint64_t aggregate_disk_budget_bytes = 4096ULL << 20U;
+    std::uint64_t queue_budget_bytes = 128ULL << 20U;  // includes the active writer's payload; 0: no limit
+    std::uint64_t min_free_bytes = 0;      // filesystem floor after predicted writes (serve: 16 GiB)
+    std::function<bool(bool)> disk_admission;  // optional both-rank agreement on local resource admission
     std::uint32_t io_threads = 4;         // parallel file reads (load, open)
 };
 
 struct PrefixCacheStats {
     std::uint64_t bytes = 0, blocks = 0, snapshots = 0;
     std::uint64_t lookups = 0, hits = 0, hit_tokens = 0, inserts = 0, evicted_snapshots = 0, evicted_blocks = 0, refused = 0;
+    std::uint64_t capture_checks = 0, capture_bypasses = 0, capture_predicted_peak = 0, host_ceiling_bytes = 0;
+    std::uint64_t export_bytes = 0, export_inrun = 0, export_run = 0, export_handoff = 0, export_session = 0;
+    std::uint64_t row_layers = 0, planned_splits = 0;
     // disk tier
     std::uint64_t disk_bytes = 0, disk_blocks = 0, disk_snapshots = 0;
     std::uint64_t disk_hits = 0, disk_evicted_snapshots = 0, disk_evicted_blocks = 0, disk_refused = 0, disk_dropped = 0;
     std::uint64_t scanned_files = 0, ignored_files = 0;  // at open: files read / ignored (corrupt, other model, orphan)
     std::uint64_t written_files = 0, written_bytes = 0, write_errors = 0;
+    std::uint64_t queued_bytes = 0, queue_peak_bytes = 0, disk_resource_refused = 0;
     std::uint64_t read_files = 0, read_bytes = 0, read_errors = 0;
     double write_seconds = 0.0, read_seconds = 0.0, scan_seconds = 0.0;
 };
@@ -159,7 +169,7 @@ public:
     [[nodiscard]] std::vector<PrefixDiskItem> inventory() const;
     std::uint64_t retain(std::span<const PrefixDiskItem> peer);
     // Bytes the cache would take for one snapshot at `position` of a prompt sharing nothing (the budget unit).
-    [[nodiscard]] static std::uint64_t snapshot_bytes(const AttentionState& s);
+    [[nodiscard]] static std::uint64_t snapshot_bytes(const AttentionState& s, std::uint32_t block = 256);
 
     // Complete generated conversations use the same attention-state adapter, in a separate versioned namespace.
     class Sessions;
@@ -218,6 +228,11 @@ struct PrefillRunPlan {
 [[nodiscard]] PrefillRunPlan plan_prefill_runs(std::uint32_t resume, std::uint32_t shared, std::uint32_t total, std::uint32_t block,
                                                std::uint32_t max_rows, std::uint32_t min_rows = 1, bool before_tail = false,
                                                std::uint32_t reach = 0, std::uint32_t extra = 0);
+
+// Admission is part of planning: a declined capture has exactly the baseline endpoints and no points.
+[[nodiscard]] PrefillRunPlan select_prefix_prefill_plan(std::uint32_t resume, std::uint32_t shared, std::uint32_t total, std::uint32_t block,
+                                                       std::uint32_t max_rows, std::uint32_t min_rows, bool capture, bool inrun,
+                                                       bool before_tail, std::uint32_t reach, std::uint32_t stable);
 
 // The bit-relevant configuration whose states a cache keeps: everything besides the model file and the layer count that
 // changes a state's bits. `text` is a canonical "key=value;" list (version, weights overlay + CB4, trellis pack, sites and

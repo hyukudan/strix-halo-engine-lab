@@ -33,7 +33,7 @@
 //   strix-deepseek41-prefix MODEL.gguf --prompt FILE (comma-separated ids) [--rows N] [--layers L]
 //       [--world 1 [--stream-experts] | --transport emulate | --rank R --transport usb4-auto]
 //       [--block 256] [--max-rows 4096] [--cache-mb 0] [--warm W1,W2,...] [--decode G] [--repeat-hit K] [--before-tail]
-//       [--inrun [--inrun-check]]
+//       [--inrun [--inrun-check]] [--byte-check]
 //       [--cache-dir DIR [--disk-mb 0] [--phase all|write|read|fresh] [--no-fresh] [--fork F] [--rewind R]
 //        [--corrupt block|snapshot] [--session G]]
 //
@@ -67,7 +67,7 @@ struct Args {
     std::string cache_dir, phase = "all", corrupt;
     std::uint64_t disk_mb = 0;
     std::uint32_t fork = 0, rewind = 0, session = 0;
-    bool before_tail = false, no_fresh = false, inrun = false, inrun_check = false;
+    bool before_tail = false, no_fresh = false, inrun = false, inrun_check = false, byte_check = false;
     std::uint32_t rank = 0, world = 1, layers = 40, rows = 0, block = 256, max_rows = 4096, decode = 0, repeat_hit = 1;
     std::uint64_t cache_mb = 0;
     unsigned connect_timeout = 60;
@@ -117,6 +117,9 @@ struct Outcome {
     std::uint64_t logits = 0, digest = 0;
     std::vector<std::pair<std::string, std::uint64_t>> hashes;
     ds::AttentionState state;
+    std::vector<std::uint8_t> canonical;
+    std::vector<float> full_logits;
+    bool logits_known = true;
     double seconds = 0.0, lookup_seconds = 0.0, import_seconds = 0.0, export_seconds = 0.0;
     std::vector<std::uint32_t> pieces;
     std::uint64_t disk_bytes = 0;
@@ -190,6 +193,7 @@ public:
         }
         o.next_token = r.next_token;
         o.logits = fnv(r.logits);
+        if (a_.byte_check) o.full_logits = r.logits;
         const auto t1 = Clock::now();
         o.state = prefill_->export_state();
         o.state.tokens = prompt;
@@ -225,6 +229,7 @@ public:
             o.state = std::move(loaded);
             o.next_token = hit.next_token;
             o.logits = hit.logits_fnv;
+            o.logits_known = hit.logits_fnv != 0U;
             o.lookup_seconds = since(t0);
             o.seconds = since(t0);
             finish(o);
@@ -279,6 +284,7 @@ public:
         }
         o.next_token = r.next_token;
         o.logits = fnv(r.logits);
+        if (a_.byte_check) o.full_logits = r.logits;
         if (o.state.layers.empty()) {
             const auto t1 = Clock::now();
             o.state = prefill_->export_state();
@@ -345,6 +351,7 @@ public:
 
 private:
     void finish(Outcome& o) const {
+        if (a_.byte_check) o.canonical = ds::canonical_attention_state_bytes(o.state);
         o.digest = o.state.digest(true);
         o.hashes = o.state.hashes();
     }
@@ -371,8 +378,12 @@ std::string list(const std::vector<std::uint32_t>& v) {
 int compare(std::uint32_t rank, const std::string& name, const Outcome& ref, const Outcome& o) {
     int bad = 0;
     if (o.next_token != ref.next_token) ++bad;
-    if (o.logits != ref.logits) ++bad;
+    if (o.logits_known && ref.logits_known && o.logits != ref.logits) ++bad;
     if (o.digest != ref.digest) ++bad;
+    if (!ref.canonical.empty() && !o.canonical.empty() && o.canonical != ref.canonical) ++bad;
+    const bool logits_bytes = !ref.full_logits.empty() && !o.full_logits.empty();
+    if (logits_bytes && (ref.full_logits.size() != o.full_logits.size() ||
+        std::memcmp(ref.full_logits.data(), o.full_logits.data(), ref.full_logits.size() * sizeof(float)) != 0)) ++bad;
     std::size_t diff = 0;
     for (std::size_t i = 0; i < ref.hashes.size() && i < o.hashes.size(); ++i)
         if (ref.hashes[i] != o.hashes[i] && ref.hashes[i].first.rfind("topk", 0) != 0) {
@@ -382,8 +393,11 @@ int compare(std::uint32_t rank, const std::string& name, const Outcome& ref, con
     std::printf("GATE rank %u %-14s resume %6u pieces %-24s token %6u logits %016llx digest %016llx  %s  ttft %.3f s (lookup+state %.3f, import %.3f, "
                 "export+insert %.3f)",
                 rank, name.c_str(), o.resume, list(o.pieces).c_str(), o.next_token, static_cast<unsigned long long>(o.logits),
-                static_cast<unsigned long long>(o.digest), bad == 0 ? "EQUAL" : "DIFFERENT", o.seconds, o.lookup_seconds, o.import_seconds,
+                static_cast<unsigned long long>(o.digest), bad != 0 ? "DIFFERENT" : !o.logits_known || !ref.logits_known ? "STATE-ONLY" : "EQUAL", o.seconds, o.lookup_seconds, o.import_seconds,
                 o.export_seconds);
+    if (!ref.canonical.empty() && !o.canonical.empty())
+        std::printf(" canonical-bytes %s, full-logits-bytes %s", o.canonical == ref.canonical ? "EQUAL" : "DIFFERENT",
+                    logits_bytes ? "CHECKED" : "UNAVAILABLE (require fresh suffix)");
     if (o.disk_bytes != 0U)
         std::printf(" disk %.1f MB in %.3f s = %.2f GB/s", static_cast<double>(o.disk_bytes) / 1e6, o.disk_seconds,
                     o.disk_seconds > 0.0 ? static_cast<double>(o.disk_bytes) / o.disk_seconds / 1e9 : 0.0);
@@ -441,9 +455,17 @@ int run(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint32_t r
         oy.digest = y.digest(true);
         oy.hashes = y.hashes();
         ox.next_token = oy.next_token;
-        ox.logits = oy.logits;
+        ox.logits_known = oy.logits_known = false;
+        if (a.byte_check) { ox.canonical = ds::canonical_attention_state_bytes(x); oy.canonical = ds::canonical_attention_state_bytes(y); }
         ox.resume = s.position;
         bad += compare(rank, "inrun" + std::to_string(s.position), oy, ox);
+    }
+    if (a.byte_check) {
+        auto suffix = prompt;
+        suffix.insert(suffix.end(), prompt.begin(), prompt.begin() + std::min<std::size_t>(16, prompt.size()));
+        const auto suffix_ref = g.fresh(suffix);
+        const auto suffix_hit = g.cached(suffix);
+        bad += compare(rank, "byte-suffix", suffix_ref, suffix_hit);
     }
     if (a.decode != 0U && g.has_batch()) {
         double import_seconds = 0.0;
@@ -559,7 +581,8 @@ int run_disk(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint3
     } else if (a.phase == "read") {  // a new process on the files of a write phase
         const auto ref = load_reference(rpath);
         if (ref.tokens != N) throw std::invalid_argument("the reference is of another prompt length");
-        const auto R = as_outcome(ref);
+        const auto R = a.byte_check ? g.fresh(prompt) : as_outcome(ref);
+        if (a.byte_check) bad += compare(rank, "restart-fresh", as_outcome(ref), R);
         report_cache("after the restart");
         const auto disk = g.cached(prompt);
         bad += compare(rank, "restart-disk", R, disk);
@@ -673,7 +696,7 @@ int run_disk(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint3
                 const auto ref_s = g.fresh(upto);
                 g.cache().clear_ram();
                 auto full = g.cached(upto);
-                full.logits = ref_s.logits;  // a session snapshot does not know its logits (the batch forward does not keep them)
+                full.logits_known = false;  // state-only; fresh session-turn suffix below must prove logits
                 bad += compare(rank, "session-full", ref_s, full);
                 std::vector<std::uint32_t> next_turn = upto;
                 next_turn.insert(next_turn.end(), prompt.begin(), prompt.begin() + 40);
@@ -681,11 +704,25 @@ int run_disk(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint3
                 g.cache().clear_ram();
                 const auto t = g.cached(next_turn);
                 bad += compare(rank, "session-turn", ref_t, t);
+                if (a.decode != 0U) {
+                    double import_seconds = 0.0;
+                    const auto [cold, restored] = g.decode(ref_t, t, import_seconds);
+                    bad += cold == restored ? 0 : 1;
+                    std::printf("GATE rank %u session suffix decode: %s; tokens %s\n", rank,
+                                cold == restored ? "EQUAL" : "DIFFERENT", list(restored).c_str());
+                }
             }
         }
         report_cache("at the end");
         g.cache().flush();
         if (a.phase == "write") save_reference(rpath, saved);
+    }
+    if (a.byte_check && a.phase != "fresh") {
+        auto suffix = prompt;
+        suffix.insert(suffix.end(), prompt.begin(), prompt.begin() + std::min<std::size_t>(16, prompt.size()));
+        const auto cold = g.fresh(suffix);
+        const auto restored = g.cached(suffix);
+        bad += compare(rank, "disk-byte-suffix", cold, restored);
     }
     const auto st = g.cache().stats();
     std::printf("GATE rank %u %s (%d differences); cache %llu lookups %llu hits %llu inserts %llu refused, disk hits %llu\n", rank, bad == 0 ? "PASS" : "FAIL", bad,
@@ -733,6 +770,7 @@ int main(int argc, char** argv) try {
         else if (s == "--no-shared-weights") a.shared = false;
         else if (s == "--before-tail") a.before_tail = true;
         else if (s == "--inrun") a.inrun = true;
+        else if (s == "--byte-check") a.byte_check = true;
         else if (s == "--inrun-check") a.inrun = a.inrun_check = true;
         else if (s == "--cache-dir") a.cache_dir = next();
         else if (s == "--disk-mb") a.disk_mb = std::stoull(next());

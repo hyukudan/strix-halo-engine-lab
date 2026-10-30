@@ -51,6 +51,9 @@ void save_attention_state(const std::filesystem::path& path, const AttentionStat
 [[nodiscard]] AttentionState load_attention_state(const std::filesystem::path& path);
 // The same bytes in memory (a state message of strix/ds41-pipeline-v1).
 [[nodiscard]] std::vector<std::uint8_t> serialize_attention_state(const AttentionState& state);
+// Diagnostic bytes of continuation state: zero inactive ring slots and invalid carries,
+// omit recomputed top-k. This does not change the persisted state format or production exports.
+[[nodiscard]] std::vector<std::uint8_t> canonical_attention_state_bytes(const AttentionState& state);
 [[nodiscard]] AttentionState deserialize_attention_state(std::span<const std::uint8_t> bytes);
 
 // The same bytes written in place (a producer that already holds the pieces elsewhere, e.g. a device capture into a

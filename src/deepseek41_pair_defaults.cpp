@@ -1,4 +1,5 @@
 #include "strix/deepseek41_pair_defaults.hpp"
+#include "strix/deepseek41_serve_cache_policy.hpp"
 
 #include <algorithm>
 #include <array>
@@ -271,7 +272,19 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& env,
         if (has(user, "--no-dspark") || has(user, "--dspark") || model.empty()) {
         } else if (rows16 != nullptr && rows16[0] == '1') {
             notice("serve DSpark off (not qualified with STRIX_DS41_BATCH_ROWS16=1)");
-        } else if (has(user, "--prefix-session-snapshots")) {
+        } else if ([&] {
+            ServeCachePolicy cache;
+            for (std::size_t i = 0; i < user.size(); ++i) {
+                const auto& key = user[i];
+                std::string_view value;
+                if (ServeCachePolicy::takes_value(key)) {
+                    if (++i >= user.size()) throw std::invalid_argument(key + " needs a value");
+                    value = user[i];
+                }
+                (void)cache.parse(key, value);
+            }
+            return cache.prefix_session && !cache.no_session && !cache.no_cache;
+        }()) {
             notice("serve DSpark off (--prefix-session-snapshots is not exact with --dspark)");
         } else {
             std::string draft;

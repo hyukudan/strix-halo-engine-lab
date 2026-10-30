@@ -10,6 +10,87 @@ It runs on the tiled known-prefix prefill
 (`--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T`), with serial
 greedy decode or with MTP decode (see [MTP](#mtp)). Every other route rejects the options.
 
+## DeepSeek pair agent prefix cache
+
+These are the DS-specific `strix-deepseek41-serve` controls; the generic options below belong to
+other serving routes. The executable now resolves omitted cache flags and `--cache-profile agent`
+to a bounded host candidate: 512 MiB **per rank**, 256-token blocks, an 8192 MiB reserve on each
+node after predicted capture allocations, in-run snapshots with reach 0, and session snapshots
+only for plain R=1 decode. Before-tail and disk persistence stay OFF. This policy is the default. Native qualification (two Strix Halo nodes over 2x USB4 Gen3, PerfOpt kernel, production packs): prefix tool exactness on both ranks at 6000 and 8192 rows (max rows 4096 / 2048): miss, same-prompt, warm, in-run and byte-suffix resumes equal a fresh prefill (logits and state digest), 16 decoded tokens equal, 0 differences. Serve timing, a fresh process per arm, `--cache-profile off` vs the default in ABBA order over two turns (n = 4 pairs per size), generated text and token IDs identical in all 8 processes: cold 2K miss -0.14 s mean (pairs +0.09 / -0.46 / -0.13 / -0.08 s; not slower), an 8K prompt that shares its 2K prefix with the previous request -3.63 s (-24 %, 15.0 -> 11.2 s mean; every pair faster).
+No historical session speedup is a measurement of this policy.
+
+Both ranks agree fresh capture admission before planning or copying. A refusal removes cache
+snapshot points and cache-specific run splits, including with an explicit legacy planner.
+In-run runs keep baseline endpoints, even when the configured row limit is not block aligned;
+far stable-prefix points are retained inside runs, never silently replaced by splits at reach 0.
+The final aligned snapshot retains the required slot-handoff export. Captures still allocate,
+copy and widen replay cones; admission and in-run capture are not free on misses.
+
+| Control | Meaning |
+|---|---|
+| `--cache-profile off` | Supply no profile settings; alone restores the prefix-cache baseline. Explicit cache options remain active. |
+| `--no-prefix-cache` or `--prefix-cache-mb 0` | Disable the entire prefix bundle. |
+| `--no-prefix-disk` | Disable disk even when a directory/limit was supplied. |
+| `--no-prefix-before-tail` | Disable the optional edited-tail checkpoint. |
+| `--no-prefix-session-snapshots` | Disable captures during decode. |
+| `--no-prefix-inrun-snapshots` | Disable in-run captures; with retention enabled the explicit legacy piece planner may add splits. |
+| `--prefix-cache-mb M`, `--prefix-reserve-mb M`, `--prefix-block B` | Explicit host ceiling, reserve and token block size. |
+| `--prefix-inrun-reach N` | Explicit distance limit; 0 never adds reach splits. Nonzero values keep legacy reach behavior. |
+| `--prefix-cache-dir DIR` | Explicit disk opt-in. No directory means no writer or startup scan. |
+| `--prefix-cache-disk-mb M` | Explicit per-tier ceiling; **0 means unlimited per tier**, never disk OFF. Without a directory, this explicit opt-in resolves `$STRIX_DS41_PREFIX_DIR`, then `$HOME/.cache/strix/ds41-prefix`. |
+
+Negative switches, including a numeric host zero, veto conflicting positive options independently
+of argv order. Other explicit values survive profile fills. Rows prefill and hetero-listen receive
+no implicit cache settings; explicit incompatible requests still fail before loading. Implicit
+sessions never disable auto-DSpark. An explicit, non-vetoed session request still prevents automatic
+DSpark selection; explicitly combining sessions and DSpark fails before model loading.
+
+Host ceilings use nonblocking kernel leases shared by service instances of the same OS user on a
+node, capped at 1024 MiB in total, with 64 MiB reservation granularity. No host memory is
+preallocated. Explicit larger host ceilings are accepted but effective retention is capped at
+1024 MiB; a failed lease disables new retention on both ranks. The host accounting includes
+per-layer vector descriptors and allocator allowances; it is not an allocator/RSS hard limit.
+The conservative transient prediction includes retained copies, whole-prefix exports, serialization
+and snapshot rings. Unsupported host locking fails closed.
+
+An explicit directory gets a 4096 MiB tier ceiling unless overridden. Its namespaces and service
+processes share a 4096 MiB directory quota, a 128 MiB outstanding-payload limit and a 16384 MiB
+filesystem free-space floor. Queue reservations precede serialization; payloads remain charged
+through the active write. Files pending deletion and temporary files count physically until gone.
+Quota/space/peer refusal keeps RAM when possible. Each namespace/rank directory has one exclusive
+service owner; a second writer is refused, and no sibling namespace is evicted. Inactive writer
+reservations are ignored after a crash. Disk reads retain all-or-nothing peer restore and do not
+promote into RAM without collective admission. The quota covers one configured service root;
+**separate roots and OS users are not an aggregate node-wide disk safeguard**. Keep all service
+namespaces under one root. Cross-root coordination and allocator-level resident-byte accounting
+remain future work. Disk stays explicit and unqualified.
+
+The old bundle can be requested with `--cache-profile off --prefix-cache-mb 8192
+--prefix-cache-dir DIR --prefix-cache-disk-mb 65536 --prefix-before-tail
+--no-prefix-inrun-snapshots`, plus `--prefix-session-snapshots` only without DSpark.
+Those requested ceilings are subject to the new host and directory safeguards; this does not
+restore the old 8 GiB resident capacity or claim non-regression. Host-only defaults lose restart
+hits, and before-tail OFF loses the special edited-tail checkpoint. Prompts below one block still
+cannot produce a checkpoint, so short-chat benefit cannot be assumed.
+
+Startup prints resolved policy and disk-zero interpretation. `GET /api/status` exposes the policy,
+effective host ceiling, admission/bypass counters and predicted transient peak, plus disk queue
+bytes/peak and resource refusals. `STRIX_DS41_PREFIX_DIAGNOSTICS=1` adds exported bytes, counts by
+snapshot source, executed prefill row-layers and planned cache splits; it adds no target kernels.
+Unset/0 disables these diagnostic counters. Compare diagnostic arms separately from production
+timing; reported bytes are host export bytes, not all device or allocator traffic.
+
+Exactness concerns continuation-relevant state, fresh suffix logits and complete generated IDs
+under the same numerical identity. Recomputed top-k, inactive ring slots and invalid carry contents
+are excluded from the existing state digest; this is not equality of every serialized byte.
+Unknown session logits do not count as an equality result. The prefix tool's optional
+`--byte-check` compares canonical continuation bytes and full freshly computed logits; whole hits
+receive a fresh-suffix diagnostic. Session and in-run state-only comparisons are labeled explicitly. Namespace/model/layout/checksum,
+token comparisons, unknown-next-token protection and both-rank disk intersection remain mandatory.
+See the [qualification protocol](ds41-prefix-cache-qualification.md) before making performance or
+current native exactness claims. Every exact gain that meets its not-slower rule is promoted
+without a minimum percentage threshold.
+
 ## Options
 
 | Option | Meaning |

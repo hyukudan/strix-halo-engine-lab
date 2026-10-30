@@ -4,6 +4,7 @@
 #include "strix/ds41_attention.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -195,6 +196,26 @@ std::uint64_t AttentionState::bytes() const {
     std::uint64_t n = 0;
     for (const auto& L : layers) n += L.ring.size() + L.kv.size() + L.idx_keys.size() + L.carry.size() * 4U + L.topk.size() * 4U;
     return n;
+}
+
+std::vector<std::uint8_t> canonical_attention_state_bytes(const AttentionState& state) {
+    namespace attn = ds41::attn;
+    auto out = state;
+    std::array<bool, AttentionHost::ring_capacity> live{};
+    const auto first = state.position > attn::kWindow ? state.position - attn::kWindow : 0U;
+    for (auto p = first; p < state.position; ++p) live[p % AttentionHost::ring_capacity] = true;
+    for (auto& layer : out.layers) {
+        if (!layer.ring.empty()) {
+            if (layer.ring.size() != live.size() * attn::kWindowEntryBytes)
+                throw std::invalid_argument("canonical attention state: invalid ring size");
+            for (std::size_t i = 0; i < live.size(); ++i)
+                if (!live[i]) std::fill_n(layer.ring.begin() + i * attn::kWindowEntryBytes, attn::kWindowEntryBytes, 0);
+        }
+        layer.topk.clear();
+        layer.topk_known = false;
+        if (!layer.carry_valid) std::fill(layer.carry.begin(), layer.carry.end(), 0.0F);
+    }
+    return serialize_attention_state(out);
 }
 
 namespace {

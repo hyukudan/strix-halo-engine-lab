@@ -23,6 +23,7 @@
 #if defined(__unix__)
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <unistd.h>
 #endif
 
@@ -309,13 +310,123 @@ struct PrefixCache::DiskEntry {
     std::uint32_t next_token = 0;
 };
 
+// The explicit service directory owns this quota across all its namespaces/processes.
+// Files awaiting deletion still count physically; reservations count payloads not yet written.
+class DiskQuota {
+public:
+    DiskQuota(const fs::path& root, std::uint64_t budget, std::uint64_t queue_budget, std::uint64_t min_free)
+        : root_(root), budget_(budget), queue_budget_(queue_budget), min_free_(min_free) {
+#if defined(__unix__)
+        fs::create_directories(root_);
+        lock_ = ::open((root_ / ".strix-prefix-quota").c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+        static std::atomic<unsigned> serial{0};
+        file_ = root_ / (".strix-prefix-reservation-" + std::to_string(::getpid()) + "-" +
+                        std::to_string(Clock::now().time_since_epoch().count()) + "-" + std::to_string(serial++));
+        reservation_ = ::open(file_.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (reservation_ >= 0) {
+            if (::flock(reservation_, LOCK_EX | LOCK_NB) != 0 || !publish()) {
+                ::close(reservation_); reservation_ = -1;
+            }
+        }
+#endif
+    }
+    ~DiskQuota() {
+#if defined(__unix__)
+        if (reservation_ >= 0) { ::close(reservation_); std::error_code ec; fs::remove(file_, ec); }
+        if (lock_ >= 0) ::close(lock_);
+#endif
+    }
+    bool reserve(std::uint64_t n) {
+#if defined(__unix__)
+        if (lock_ < 0 || reservation_ < 0 || ::flock(lock_, LOCK_EX | LOCK_NB) != 0) return false;
+        struct Unlock { int fd; ~Unlock() { ::flock(fd, LOCK_UN); } } unlock{lock_};
+        if (!publish()) return false;
+        std::uint64_t used = 0, queued = 0;
+        std::error_code ec;
+        fs::recursive_directory_iterator it(root_, ec), end;
+        for (; !ec && it != end; it.increment(ec)) {
+            const auto& p = it->path();
+            if (it->is_symlink(ec)) { it.disable_recursion_pending(); continue; }
+            if (!it->is_regular_file(ec)) continue;
+            std::uint64_t bytes = 0;
+            if (p.filename().string().starts_with(".strix-prefix-reservation-")) {
+                const int fd = ::open(p.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+                if (fd < 0) return false;
+                // An unlocked reservation belongs to a dead writer, hence has no queued payloads.
+                if (::flock(fd, LOCK_EX | LOCK_NB) == 0) ::flock(fd, LOCK_UN);
+                else if (::pread(fd, &bytes, sizeof(bytes), 0) != static_cast<ssize_t>(sizeof(bytes))) { ::close(fd); return false; }
+                ::close(fd);
+                if (bytes > UINT64_MAX - queued) return false;
+                queued += bytes;
+            } else if (p.extension() == ".blk" || p.extension() == ".snp" || p.extension() == ".tmp") {
+                bytes = it->file_size(ec);
+            }
+            if (ec || bytes > budget_ || used > budget_ - bytes) return false;
+            used += bytes;
+        }
+        if (ec || n > budget_ || used > budget_ - n) return false;
+        if (queue_budget_ != 0U && (n > queue_budget_ || queued > queue_budget_ - n)) return false;
+        const auto space = fs::space(root_, ec);
+        if (min_free_ != 0U && (ec || space.available < min_free_ || queued > space.available - min_free_ ||
+            n > space.available - min_free_ - queued)) return false;
+        pending_ += n;
+        if (publish()) return true;
+        pending_ -= n;
+#else
+        (void)n;
+#endif
+        return false;
+    }
+    void release(std::uint64_t n) {
+        pending_ -= n;
+#if defined(__unix__)
+        // A busy quota leaves an overestimate until our next publication, never an underestimate.
+        if (lock_ >= 0 && ::flock(lock_, LOCK_EX | LOCK_NB) == 0) { (void)publish(); ::flock(lock_, LOCK_UN); }
+#endif
+    }
+
+private:
+    bool publish() {
+#if defined(__unix__)
+        return ::pwrite(reservation_, &pending_, sizeof(pending_), 0) == static_cast<ssize_t>(sizeof(pending_));
+#else
+        return false;
+#endif
+    }
+    fs::path root_, file_;
+    std::uint64_t budget_, queue_budget_, min_free_, pending_ = 0;
+    int lock_ = -1, reservation_ = -1;
+};
+
+class DiskOwner {
+public:
+    explicit DiskOwner(const fs::path& dir) {
+#if defined(__unix__)
+        fd_ = ::open((dir / ".strix-prefix-owner").c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (fd_ >= 0 && ::flock(fd_, LOCK_EX | LOCK_NB) == 0) return;
+        if (fd_ >= 0) ::close(fd_);
+#else
+        (void)dir;
+#endif
+        throw std::runtime_error("prefix disk namespace already owned or locking unavailable");
+    }
+    ~DiskOwner() {
+#if defined(__unix__)
+        ::close(fd_);
+#endif
+    }
+private:
+    int fd_ = -1;
+};
+
 // The writer thread: file writes and deletions in call order (a deletion after a write of the same file wins).
 struct PrefixCache::Writer {
     struct Job {
         fs::path path;
         std::shared_ptr<const std::vector<std::uint8_t>> data;  // null: delete the file
     };
-    explicit Writer(bool drop) : drop_(drop), thread_([this] { run(); }) {}
+    explicit Writer(bool drop, std::uint64_t budget, std::unique_ptr<DiskQuota> quota, std::unique_ptr<DiskOwner> owner)
+        : drop_(drop), budget_(budget), quota_(std::move(quota)), owner_(std::move(owner)), thread_([this] { run(); }) {}
     ~Writer() {
         {
             const std::lock_guard lock(mutex_);
@@ -323,6 +434,20 @@ struct PrefixCache::Writer {
         }
         cv_.notify_all();
         thread_.join();
+    }
+    bool reserve(std::uint64_t n) {
+        const std::lock_guard lock(mutex_);
+        const auto current = queued.load();
+        if (n > UINT64_MAX - current || (budget_ != 0U && (n > budget_ || current > budget_ - n))) return false;
+        if (quota_ && !quota_->reserve(n)) return false;
+        queued.store(current + n);
+        peak.store(std::max(peak.load(), current + n));
+        return true;
+    }
+    void release(std::uint64_t n) {
+        const std::lock_guard lock(mutex_);
+        queued.fetch_sub(n);
+        if (quota_) quota_->release(n);
     }
     void push(Job job) {
         {
@@ -335,7 +460,7 @@ struct PrefixCache::Writer {
         std::unique_lock lock(mutex_);
         idle_.wait(lock, [&] { return queue_.empty() && !busy_; });
     }
-    std::atomic<std::uint64_t> files{0}, bytes{0}, errors{0}, nanos{0};
+    std::atomic<std::uint64_t> files{0}, bytes{0}, errors{0}, nanos{0}, queued{0}, peak{0};
 
 private:
     void run() {
@@ -364,12 +489,19 @@ private:
             }
             {
                 const std::lock_guard lock(mutex_);
+                if (job.data) {
+                    queued.fetch_sub(job.data->size());
+                    if (quota_) quota_->release(job.data->size());
+                }
                 busy_ = false;
                 if (queue_.empty()) idle_.notify_all();
             }
         }
     }
     bool drop_;
+    std::uint64_t budget_;
+    std::unique_ptr<DiskQuota> quota_;
+    std::unique_ptr<DiskOwner> owner_;
     std::mutex mutex_;
     std::condition_variable cv_, idle_;
     std::deque<Job> queue_;
@@ -536,7 +668,7 @@ PrefillRunPlan plan_prefill_runs(std::uint32_t resume, std::uint32_t shared, std
     PrefillRunPlan out;
     if (resume == total) return out;
     // the runs: max_rows steps from resume (plan_prefill_pieces' split), then total
-    const std::uint32_t step = max_rows >= block ? max_rows / block * block : max_rows / 8U * 8U;
+    const std::uint32_t step = max_rows / 8U * 8U;
     for (std::uint32_t at = resume; total - at > max_rows;) {
         at = total - (at + step) >= min_rows ? at + step : (total - min_rows) / 8U * 8U;
         out.ends.push_back(at);
@@ -562,6 +694,14 @@ PrefillRunPlan plan_prefill_runs(std::uint32_t resume, std::uint32_t shared, std
         std::erase_if(out.points, [&](std::uint32_t p) { return std::binary_search(out.ends.begin(), out.ends.end(), p); });
     }
     return out;
+}
+
+PrefillRunPlan select_prefix_prefill_plan(std::uint32_t resume, std::uint32_t shared, std::uint32_t total, std::uint32_t block,
+                                          std::uint32_t max_rows, std::uint32_t min_rows, bool capture, bool inrun,
+                                          bool before_tail, std::uint32_t reach, std::uint32_t stable) {
+    if (!capture) return {plan_prefill_pieces(resume, 0U, total, max_rows, max_rows, min_rows), {}};
+    if (inrun) return plan_prefill_runs(resume, shared, total, block, max_rows, min_rows, before_tail, reach, stable);
+    return {plan_prefill_pieces(resume, shared, total, block, max_rows, min_rows, before_tail), {}};
 }
 
 PrefixCache::PrefixCache(const PrefixCacheOptions& options) : options_(options) {
@@ -602,6 +742,8 @@ PrefixCacheStats PrefixCache::stats() const {
         s.written_files = writer_->files.load();
         s.written_bytes = writer_->bytes.load();
         s.write_errors = writer_->errors.load();
+        s.queued_bytes = writer_->queued.load();
+        s.queue_peak_bytes = writer_->peak.load();
         s.write_seconds = static_cast<double>(writer_->nanos.load()) * 1e-9;
     }
     return s;
@@ -910,8 +1052,11 @@ AttentionState PrefixCache::state(std::span<const std::uint32_t> tokens, std::ui
     return s;
 }
 
-std::uint64_t PrefixCache::snapshot_bytes(const AttentionState& s) {
-    std::uint64_t n = kNodeOverhead + s.tokens.size() * 4U;
+std::uint64_t PrefixCache::snapshot_bytes(const AttentionState& s, std::uint32_t block) {
+    if (block == 0U) throw std::invalid_argument("snapshot_bytes: block must be positive");
+    const auto blocks = (s.tokens.size() + block - 1U) / block;
+    std::uint64_t n = kNodeOverhead + s.tokens.size() * 4U + blocks * (kNodeOverhead + s.layers.size() * (2U * sizeof(std::vector<std::uint8_t>) + 64U));
+    n += s.layers.size() * (sizeof(std::vector<std::uint8_t>) + sizeof(std::vector<float>) + 65U);
     for (const auto& L : s.layers) n += L.ring.size() + L.kv.size() + L.idx_keys.size() + L.carry.size() * 4U;
     return n;
 }
@@ -968,12 +1113,12 @@ bool PrefixCache::insert_ram(const AttentionState& s, std::uint64_t logits_fnv, 
     }
     // bytes this insert adds
     const auto block_bytes = [&] {
-        std::uint64_t n = kNodeOverhead + std::uint64_t{B} * 4U;
+        std::uint64_t n = kNodeOverhead + std::uint64_t{B} * 4U + s.layers.size() * (2U * sizeof(std::vector<std::uint8_t>) + 64U);
         for (const auto& L : s.layers)
             if (L.owns_kv) n += std::uint64_t{B / L.ratio} * (attn::kKvEntryBytes + attn::kIdxEntryBytes);
         return n;
     };
-    std::uint64_t snap_bytes = kNodeOverhead;
+    std::uint64_t snap_bytes = kNodeOverhead + s.layers.size() * (sizeof(std::vector<std::uint8_t>) + sizeof(std::vector<float>) + 65U);
     for (const auto& L : s.layers) snap_bytes += L.ring.size() + L.carry.size() * 4U;
     std::uint64_t need = snap_bytes;
     for (std::uint32_t k = have; k < blocks; ++k) need += block_bytes();
@@ -1073,6 +1218,26 @@ bool PrefixCache::insert_disk(const AttentionState& s, std::uint64_t logits_fnv,
     std::uint64_t snap_file = kHeaderBytes + table.size() + 16U;
     for (const auto& L : s.layers) snap_file += 24U + L.ring.size() + L.carry.size() * 4U;
     const std::uint64_t need = snap_file + std::uint64_t{blocks - have} * block_file;
+    // Reserve before allocating/serializing payloads, and keep the active write charged.
+    const bool reserved = writer_->reserve(need);
+    std::error_code space_error;
+    const auto space = fs::space(options_.dir, space_error);
+    bool allowed = reserved && (options_.min_free_bytes == 0U ||
+        (!space_error && space.available >= options_.min_free_bytes && space.available - options_.min_free_bytes >= writer_->queued.load()));
+    const bool local = allowed;
+    if (options_.disk_admission) allowed = options_.disk_admission(local);
+    struct Reservation {
+        Writer& writer;
+        std::uint64_t remaining;
+        ~Reservation() { if (remaining != 0U) writer.release(remaining); }
+    } reservation{*writer_, reserved ? need : 0U};
+    if (!allowed || !reserved) {
+        ++stats_.disk_refused;
+        ++stats_.disk_resource_refused;
+        std::fprintf(stderr, "prefix persistence bypass: %s\n", !reserved ? "queue or service-directory quota unavailable" :
+                     !local ? "filesystem free-space floor" : "peer resource refusal");
+        return false;
+    }
     if (options_.disk_budget_bytes != 0U) {
         if (need > options_.disk_budget_bytes) {
             ++stats_.disk_refused;
@@ -1121,7 +1286,9 @@ bool PrefixCache::insert_disk(const AttentionState& s, std::uint64_t logits_fnv,
         ++stats_.disk_blocks;
         if (k > 0U) ++disk_.at(parent)->children;
         disk_.emplace(keys[k], std::move(e));
+        const auto queued = file->size();
         writer_->push({block_path(keys[k]), std::move(file)});
+        reservation.remaining -= queued;
     }
     DiskEntry& leaf = *disk_.at(keys[blocks - 1U]);
     auto file = std::make_shared<std::vector<std::uint8_t>>(kHeaderBytes, std::uint8_t{0});
@@ -1146,7 +1313,9 @@ bool PrefixCache::insert_disk(const AttentionState& s, std::uint64_t logits_fnv,
     leaf.last_use = seq;
     stats_.disk_bytes += leaf.snap_bytes;
     ++stats_.disk_snapshots;
+    const auto queued = file->size();
     writer_->push({snapshot_path(leaf.key), std::move(file)});
+    reservation.remaining -= queued;
     return true;
 }
 
@@ -1309,7 +1478,10 @@ void PrefixCache::open_disk() {
     std::error_code ec;
     fs::create_directories(options_.dir, ec);
     if (ec) throw std::runtime_error("deepseek41 prefix cache: cannot create " + options_.dir.string() + ": " + ec.message());
-    writer_ = std::make_unique<Writer>(options_.drop_page_cache);
+    writer_ = std::make_unique<Writer>(options_.drop_page_cache, options_.queue_budget_bytes,
+        options_.quota_dir.empty() ? nullptr : std::make_unique<DiskQuota>(options_.quota_dir, options_.aggregate_disk_budget_bytes,
+            options_.queue_budget_bytes, options_.min_free_bytes),
+        options_.quota_dir.empty() ? nullptr : std::make_unique<DiskOwner>(options_.dir));
     struct File {
         fs::path path;
         std::uint32_t kind = 0;
