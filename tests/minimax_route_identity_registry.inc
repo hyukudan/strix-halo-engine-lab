@@ -109,3 +109,7 @@
 {"prefill-async-min-rows", 'a', "all ordered member rows >= STRIX_MM_PF_ASYNC_MIN_ROWS (2048 default, 0 unconditional); global async off wins", "CPU minimax-defaults-tests covers boundaries, member order, zero and global off; measured TP2 token IDs identical; UNCOVERED full prompt-output/state/logit and complete-workload lifetime gates pending", ""},
 // src/minimax/dspark/minimax_auto.hpp; apps/minimax_rank_main.cpp; src/minimax/serve/minimax_lead.hpp
 {"draft-auto", 'a', "target identity+unchanged OFF prefill plan+greedy verify; frozen structural-v1 or unqualified-v1", "CPU features/admission and Lead traces: prose == OFF, structural C1 uses legacy controller, C2 retires; GPU tokens/logits/committed-state and paired json/code/long/story/prose-es receipts pending", ""},
+// src/minimax/session/runtime.cpp; src/minimax/serve/minimax_lead.hpp
+{"session-producer", 'b', "model+numerical environment+geometry+single-row suffix+fixed-width-one verification", "session_cache_gate.sh A/L/B IDs, every FP32 row and complete-state digest on both ranks; UNCOVERED native and complete-workload qualification", ""},
+// src/minimax/session/session_cache.cpp; include/strix/file_snapshot.hpp
+{"session-restore", 'b', "loader-fd asset identities+executable+runtime+schema+frontier+rank-group digest", "minimax_session_cache_tests.cpp envelope/transaction/retarget negatives; session_cache_gate.sh fresh restore and never-saved control; UNCOVERED GPU state equality", ""},

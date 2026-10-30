@@ -29,6 +29,11 @@ typedef struct ihipStream_t* hipStream_t;
 
 namespace strix::minimax::dspark {
 
+struct ContextSnapshot {
+    std::vector<std::uint16_t> k, v; // [5][4096][512], invalid slots canonical zero
+    std::vector<std::int64_t> positions;
+};
+
 class DeviceDrafter {
 public:
     struct Options {
@@ -62,6 +67,7 @@ public:
     void set_linear_group_hook(LinearGroupHook hook) { group_hook_ = std::move(hook); }
     // hipDeviceSynchronize for callers without HIP headers (draft-cycle attribution).
     static void device_synchronize();
+    static std::string runtime_identity();
     // Attribution: every linear() synchronised and timed per kind (0..7) and the number of calls; off by default.
     // linear_seconds = block passes only; append_linear_seconds = context appends (fc + k/v of every layer).
     void set_profile(bool on) { profile_ = on; }
@@ -104,6 +110,10 @@ public:
         opt_.prefetch_linears = prefetch_linears;
         opt_.multi_linears = multi_linears;
     }
+    void reset_context(std::uint32_t slot);
+    [[nodiscard]] ContextSnapshot export_context(std::uint32_t slot) const;
+    void import_context(std::uint32_t slot, const ContextSnapshot&, std::uint64_t frontier);
+
     // Device bytes of the weights and of the rings.
     [[nodiscard]] std::uint64_t weight_bytes() const noexcept { return weight_bytes_; }
     [[nodiscard]] std::uint64_t ring_bytes() const noexcept { return ring_bytes_; }

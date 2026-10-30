@@ -4,6 +4,7 @@
 // bit for bit; the safetensors reader replaces the gate's mmap Pack with O_DIRECT reads (the DS DirectLoader pattern):
 // no file page is ever handed to HIP, and resident weights do not compete with the page cache.
 #include <cstdint>
+#include "strix/file_snapshot.hpp"
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -50,9 +51,11 @@ public:
     void read(const TensorInfo& t, std::uint64_t offset, std::uint64_t n, void* dst);
     // Plain tensors (BF16 / F16 / F32) converted to FP32, as the gates' Pack::floats.
     std::vector<float> floats(const std::string& name);
+    const LoaderSnapshot& loader_snapshot() const { return snapshot_; }
     double gib_read() const { return static_cast<double>(bytes_read_) / 1073741824.0; }
 
 private:
+    LoaderSnapshot snapshot_;
     std::string dir_;
     std::vector<int> fds_;
     std::vector<int> direct_;  // 1 if opened with O_DIRECT

@@ -121,6 +121,10 @@ public:
         const std::lock_guard<std::mutex> l(m_);
         return finished_;
     }
+    std::string session() {
+        const std::lock_guard<std::mutex> l(m_);
+        return session_;
+    }
     // As the serve scheduler: per-request extras inserted before the ticket finishes, taken by the API (hook).
     void keep_extras(bool on) {
         const std::lock_guard<std::mutex> l(m_);
@@ -151,6 +155,7 @@ private:
             {
                 const std::lock_guard<std::mutex> l(m_);
                 s = script_;
+                session_ = t->job.session;
             }
             sv::GenerationStats st;
             st.prompt_tokens = t->job.prompt.size();
@@ -223,6 +228,7 @@ private:
     std::mutex m_;
     std::condition_variable cv_;
     Script script_;
+    std::string session_;
     bool released_ = false;
     bool keep_extras_ = false;
     std::map<const sv::GenerationTicket*, mo::RequestExtra> extras_;
@@ -320,8 +326,9 @@ const std::string kChat = R"({"messages":[{"role":"user","content":"hi"}],"max_t
 
 struct Rig {
     // hooks: the serve scheduler's side (extras from the fake engine, extra mm_* lines, /admin/sched)
-    explicit Rig(bool with_hooks = false) : hooks(with_hooks) { engine.keep_extras(with_hooks); }
+    explicit Rig(bool with_hooks = false, bool with_sessions = false) : hooks(with_hooks), sessions(with_sessions) { engine.keep_extras(with_hooks); }
     bool hooks;
+    bool sessions;
     sv::GenerationQueue queue{8};
     mo::Observer observer{[] {
         mo::ObserverInfo i;
@@ -333,6 +340,7 @@ struct Rig {
     }()};
     mo::MinimaxApi api{fake_tokenizer(), queue, [this] {
                            mo::MinimaxApiOptions o;
+                           o.session_enabled = sessions;
                            o.model_id = "test-model";
                            o.default_max_tokens = 16;
                            o.context_tokens = 8256;
@@ -747,6 +755,28 @@ void test_scheduler_side() {
     plain.api.handle(get("/admin/sched"), n);
     check(n.status == 404, "no /admin/sched without the scheduler's hook");
 }
+void test_sessions() {
+    for (bool enabled : {false, true}) {
+        Rig rig(false, enabled);
+        for (const auto& value : {std::string("123"), std::string("\"bad.id\""), std::string("\"\"")}) {
+            rig.engine.next({{5, kEos}});
+            Writer w;
+            rig.api.handle(post("/v1/chat/completions", kChat + ",\"session\":" + value + "}"), w);
+            check(w.status == (enabled ? 400 : 200), "session validation follows admission");
+            if (enabled) check(at(at(sv::parse_json(w.body), "error"), "code").as_string() == "invalid_request", "invalid session error code");
+            else check(rig.engine.session().empty(), "disabled session field never reaches scheduler");
+        }
+        rig.engine.next({{5, kEos}});
+        Writer named;
+        rig.api.handle(post("/v1/completions", R"({"prompt":"hi","session":"conversation","max_tokens":2})"), named);
+        check(named.status == 200 && rig.engine.session() == (enabled ? "conversation" : ""), "named completion admission");
+        rig.engine.next({{}, "session_budget: capture peak refused"});
+        Writer budget;
+        rig.api.handle(post("/v1/chat/completions", kChat + R"(,"session":"conversation"})"), budget);
+        check(budget.status == (enabled ? 507 : 400), "named session budget HTTP status");
+        if (enabled) check(at(at(sv::parse_json(budget.body), "error"), "code").as_string() == "session_budget", "named session budget error code");
+    }
+}
 }  // namespace
 
 int main() {
@@ -757,6 +787,7 @@ int main() {
     test_delivery_outcomes();
     test_options_and_utf8();
     test_scheduler_side();
+    test_sessions();
     std::cout << (failures ? "FAIL" : "PASS") << " strix-minimax-api-tests: " << checks - failures << "/" << checks << " checks\n";
     return failures ? 1 : 0;
 }

@@ -1082,4 +1082,70 @@ Draft DeviceDrafter::sample(std::uint32_t anchor, const float* base, hipStream_t
     return d;
 }
 
+std::string DeviceDrafter::runtime_identity() {
+  int device = 0, runtime = 0, driver = 0;
+  hipDeviceProp_t props{};
+  hip_ok(hipGetDevice(&device), "identity device");
+  hip_ok(hipGetDeviceProperties(&props, device), "identity properties");
+  hip_ok(hipRuntimeGetVersion(&runtime), "identity runtime");
+  hip_ok(hipDriverGetVersion(&driver), "identity driver");
+  return std::string(props.gcnArchName) + ":" + std::to_string(runtime) + ":" +
+         std::to_string(driver);
+}
+void DeviceDrafter::reset_context(std::uint32_t slot) {
+  if (slot >= opt_.slots)
+    throw std::invalid_argument("DSpark reset slot");
+  hip_ok(hipDeviceSynchronize(), "reset context quiesce");
+  drop_staged(slot);
+  std::fill(ring_pos_[slot].begin(), ring_pos_[slot].end(), -1);
+}
+ContextSnapshot DeviceDrafter::export_context(std::uint32_t slot) const {
+  if (slot >= opt_.slots)
+    throw std::invalid_argument("DSpark snapshot slot");
+  if (staged_n_[slot] != 0)
+    throw std::invalid_argument("DSpark snapshot requires committed context");
+  hip_ok(hipDeviceSynchronize(), "capture context quiesce");
+  ContextSnapshot s;
+  const auto n = static_cast<std::size_t>(layers) * window * kv_width;
+  s.k.resize(n);
+  s.v.resize(n);
+  s.positions = ring_pos_[slot];
+  hip_ok(hipMemcpy(s.k.data(), ring_k_[slot], n * 2, hipMemcpyDeviceToHost),
+         "capture draft K");
+  hip_ok(hipMemcpy(s.v.data(), ring_v_[slot], n * 2, hipMemcpyDeviceToHost),
+         "capture draft V");
+  for (unsigned l = 0; l < layers; ++l)
+    for (unsigned p = 0; p < window; ++p)
+      if (s.positions[p] < 0) {
+        auto off = (static_cast<std::size_t>(l) * window + p) * kv_width;
+        std::fill_n(s.k.begin() + static_cast<std::ptrdiff_t>(off), kv_width, 0);
+        std::fill_n(s.v.begin() + static_cast<std::ptrdiff_t>(off), kv_width, 0);
+      }
+  return s;
+}
+void DeviceDrafter::import_context(std::uint32_t slot, const ContextSnapshot &s,
+                                   std::uint64_t frontier) {
+  const auto n = static_cast<std::size_t>(layers) * window * kv_width;
+  if (slot >= opt_.slots || s.k.size() != n || s.v.size() != n ||
+      s.positions.size() != window || frontier > opt_.capacity)
+    throw std::invalid_argument("DSpark snapshot geometry");
+  for (unsigned p = 0; p < window; ++p) {
+    auto v = s.positions[p];
+    if (v < -1 || (v >= 0 && (static_cast<std::uint64_t>(v) >= frontier ||
+                              static_cast<std::uint64_t>(v) % window != p)))
+      throw std::invalid_argument("DSpark snapshot position");
+  }
+  for (auto p = frontier > context_keys ? frontier - context_keys : 0;
+       p < frontier; ++p)
+    if (s.positions[p % window] != static_cast<std::int64_t>(p))
+      throw std::invalid_argument("DSpark incomplete context");
+  hip_ok(hipDeviceSynchronize(), "restore context quiesce");
+  hip_ok(hipMemcpy(ring_k_[slot], s.k.data(), n * 2, hipMemcpyHostToDevice),
+         "restore draft K");
+  hip_ok(hipMemcpy(ring_v_[slot], s.v.data(), n * 2, hipMemcpyHostToDevice),
+         "restore draft V");
+  ring_pos_[slot] = s.positions;
+  drop_staged(slot);
+}
+
 } // namespace strix::minimax::dspark

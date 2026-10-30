@@ -68,6 +68,19 @@ struct Cli {
     std::uint64_t capacity = 8256;
     std::uint32_t max_rows = 4096;
 };
+struct SessionConfig {
+    bool enabled = true, disk = true;
+    std::uint64_t ram_bytes = 0, disk_bytes = 0, max_parked = 8;
+    std::string directory, reason, disk_reason, route;
+};
+// Resolve the startup vote without measuring resources or touching storage.
+SessionConfig session_policy(const Cli&, const Lookup&, bool explicit_cli = false);
+// Runtime admission measures memory/storage and may probe the cache directory.
+// Effective-config inspection uses pure policy resolution instead.
+// explicit_cli bypasses automatic qualification/switches, retaining resource checks
+// and validating explicit_directory rather than the automatic cache path.
+SessionConfig session_config(const Cli&, const Lookup&, std::uint64_t available = UINT64_MAX,
+                             bool explicit_cli = false, const std::string& explicit_directory = "");
 Cli parse_cli(const std::string& app, const std::vector<std::string>& args);  // args without argv[0]
 
 // Canonical text, one key=value per line: CLI shape, route/build switches, every item and resolved serve policy.

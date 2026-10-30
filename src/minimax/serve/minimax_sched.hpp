@@ -101,7 +101,7 @@ inline bool reorder_prompts(Sched sched, bool enabled, bool head_protected) {
     return sched == Sched::interleave && enabled && head_protected;
 }
 
-enum class Command : std::uint32_t { heartbeat = 1, prefill = 2, step = 3, shutdown = 4, unit = 5, cancel = 6, draft = 7, taps = 8, park = 9, nest = 10, resume_parked = 11, check = 12, retire = 13 };
+enum class Command : std::uint32_t { heartbeat = 1, prefill = 2, step = 3, shutdown = 4, unit = 5, cancel = 6, draft = 7, taps = 8, park = 9, nest = 10, resume_parked = 11, check = 12, retire = 13, session = 14 };
 
 // A follower only replays the lead's payload. No policy, cancellation ticket or clock is consulted.
 template<class Control, class Engine, class Runner, class Receive>

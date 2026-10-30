@@ -15,9 +15,11 @@ struct SessionApiError : std::runtime_error {
     SessionApiError(int s, std::string c, const std::string& message)
         : std::runtime_error(message), status(s), code(std::move(c)) {}
 };
-inline Json session_error(const std::string& code, const std::string& message) {
+inline Json session_error(const std::string& code, const std::string& message, int status = 0) {
     auto detail = Json::object(); detail.set("code", Json(code)); detail.set("message", Json(message));
-    auto out = Json::object(); out.set("error", std::move(detail)); return out;
+    auto out = Json::object(); out.set("error", std::move(detail));
+    if (status) out.set("_status", Json(std::int64_t(status)));
+    return out;
 }
 // Translate the public routes into engine-owned session operations.
 inline Json session_command(std::string_view method, std::string_view path, std::string_view body) {

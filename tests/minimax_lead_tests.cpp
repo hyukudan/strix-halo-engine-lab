@@ -20,6 +20,8 @@ struct FakeEngine {
     std::uint64_t control_round = 0;
     mm::PfProgress active{}, parked{};
     std::vector<ms::Control> controls;
+    std::array<std::byte, 512> last_wire{};
+    bool session_peer = false;
     unsigned syncs = 0;
     bool taps = false;
     double parent_speed = 1;  // cold estimate may exceed actual service, as on native warm runs
@@ -35,16 +37,20 @@ struct FakeEngine {
     std::uint64_t prefill_rows_left() const { return active.rows; }
     void abort(const char* why) { throw std::runtime_error(why); }
     void set_taps(bool value) { if (prefill_open()) throw std::runtime_error("open-task taps"); taps = value; }
+    unsigned rank() const { return 0; }
+    unsigned peer(unsigned value) const { return value; }
     void send_prompt(std::vector<unsigned>&) {}
     void synchronize() { ++syncs; }
     void retire_contexts(unsigned) {}
     void exchange_bytes(const void* out, void* in, std::size_t bytes) {
-        if (bytes != 512) throw std::runtime_error("control size");
+        if (bytes != 512) { std::memcpy(in, out, bytes); return; }
+        std::memcpy(last_wire.data(), out, bytes);
         ms::Control c;
         std::memcpy(&c, out, sizeof(c));
         controls.push_back(c);
         // Echo checkpoints through the real exchange validation; check replies carry the child's token.
         if (c.command == static_cast<unsigned>(ms::Command::check)) c.plen = active.next;
+        if (session_peer) c.pflags |= ms::kHelloSessionVote;
         std::memset(in, 0, bytes);
         std::memcpy(in, &c, sizeof(c));
     }
@@ -115,9 +121,10 @@ struct Scenario {
     }
     void set_clock() { FakeClock::value = FakeClock::time_point{} + std::chrono::hours(1) +
         std::chrono::duration_cast<FakeClock::time_point::duration>(std::chrono::duration<double, std::milli>(now)); }
-    void submit(double at, unsigned id, unsigned rows, unsigned tokens = 3) {
+    void submit(double at, unsigned id, unsigned rows, unsigned tokens = 3, const std::string& session = "") {
         events.push_back({at, [=, this] {
             sv::GenerationJob j; j.prompt.resize(rows, id); j.max_tokens = tokens;
+            j.session = session;
             tickets[id] = queue.submit(std::move(j));
         }});
     }
@@ -126,12 +133,12 @@ struct Scenario {
         // Same shared policy + epoch transition used by /admin/sched, without HTTP parsing.
         std::lock_guard lock(shared.m); shared.policy.sched = mode; ++shared.policy.epoch;
     }}); }
-    Result run(double end = 40000) {
+    Result run(double end = 40000, ms::SessionService* session = nullptr) {
         events.push_back({end, [&] { stop.store(true); }});
         std::stable_sort(events.begin(), events.end(), [](const auto& a, const auto& b) { return a.at < b.at; });
         advance(0);
         ml::Lead<FakeEngine, FakeEngine, FakeClock> lead(engine, engine, queue, shared, 4096, engine.taps, stop,
-            [&](const std::vector<std::uint32_t>&) { return prompt_text; });
+            [&](const std::vector<std::uint32_t>&) { return prompt_text; }, session);
         lead.loop();
         return {engine.controls, queue.work};
     }
@@ -169,6 +176,23 @@ int main() {
     const auto check = [&](bool ok, const char* name) {
         std::cout << (ok ? "PASS " : "FAIL ") << name << '\n'; failures += ok ? 0U : 1U;
     };
+    {
+        // Frozen version-3 hello encoding of public main (control version 3), including zero padding.
+        std::array<unsigned char, 512> legacy{};
+        legacy[0] = 0x4d; legacy[1] = 0x4d; legacy[2] = 0x53; legacy[3] = 0x43;
+        legacy[4] = 3;
+        std::fill_n(legacy.begin() + 216, 8, 0xff);
+        FakeEngine eng;
+        check(!ms::session_hello(eng, false), "both OFF skip session admission");
+        check(eng.controls.size() == 1 && std::memcmp(eng.last_wire.data(), legacy.data(), legacy.size()) == 0,
+              "session OFF hello equals public main bytes");
+        check(ms::session_hello(eng, true), "local ON requests session admission");
+        check(eng.controls.back().pflags == ms::kHelloSessionVote, "hello vote uses existing flags");
+        eng.session_peer = true;
+        check(ms::session_hello(eng, false), "peer ON requests admission even with local OFF");
+        check(std::memcmp(eng.last_wire.data(), legacy.data(), legacy.size()) == 0,
+              "local OFF hello stays unchanged with peer ON");
+    }
     const auto compare = [&](const char* name, const std::function<void(Scenario&)>& script, bool dspark = false) {
         const auto run = [&](ms::Sched mode) {
             Scenario s(mode); if (dspark) { s.engine.dd = &s.engine; s.engine.taps = true; s.shared.policy.dspark_mode = ml::ds::Mode::on; s.shared.policy.inflight = 8; }
@@ -329,6 +353,37 @@ int main() {
         s.submit(0, 1, 100, 10);
         const auto r = s.run();
         check(count(r, ms::Command::draft) == 0 && count(r, ms::Command::taps) == 0, "unqualified fallback ignores structural markers");
+    }
+    {
+        Scenario s(ms::Sched::interleave);
+        s.submit(0, 1, 10, 100);
+        s.submit(800, 2, 2000, 3);
+        s.submit(1000, 3, 10, 2, "conversation");
+        ms::SessionService service;
+        unsigned calls = 0;
+        service.execute = [&](const std::string& body, const ms::SessionService::Publish& publish) {
+            check(!s.engine.prefill_open(), "session runs without active or parked prefill");
+            check(s.tickets.at(1)->stats().generated_tokens == 100 && s.tickets.at(2)->stats().generated_tokens == 3,
+                  "named request waits for ordinary decoders");
+            const auto command = sv::parse_json(body);
+            check(command.find("id")->as_string() == "conversation" && command.find("count")->as_int() == 2,
+                  "named request command retains session and generation count");
+            const std::array<std::uint32_t, 2> ids{201, 202};
+            check(publish(ids), "session callback accepts complete tokens");
+            auto reply = sv::Json::object(), tokens = sv::Json::array();
+            for (auto id : ids) tokens.push(sv::Json(std::uint64_t(id)));
+            reply.set("token_ids", std::move(tokens)); reply.set("hit", sv::Json(true));
+            ++calls;
+            return reply;
+        };
+        const auto r = s.run(40000, &service);
+        check(calls == 1 && count(r, ms::Command::session) == 1 && count(r, ms::Command::nest) == 0,
+              "named request dispatches once at idle and cannot nest");
+        const auto stats = s.tickets.at(3)->stats();
+        check(stats.generated_tokens == 2 && stats.cached_tokens == 10 && stats.finish == "length",
+              "named request completion publishes cache hit and complete token count");
+        for (std::size_t i = 1; i < r.controls.size(); ++i)
+            check(r.controls[i].round == r.controls[i - 1].round + 1, "session preserves control round sequence");
     }
     std::cout << "production Lead traces: " << failures << " failures\n";
     return failures == 0 ? 0 : 1;

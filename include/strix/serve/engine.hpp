@@ -152,6 +152,7 @@ struct GenerationJob {
     bool observed = false;
     std::uint64_t observed_period = 0;  // set by submit: observe_period() then
     [[nodiscard]] bool observation_complete() const noexcept { return observed && observe_period() == observed_period; }
+    std::string session; // empty: ordinary scheduler, unchanged numerical route
 };
 
 struct GenerationStats {

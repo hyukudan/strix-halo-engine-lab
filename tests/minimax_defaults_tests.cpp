@@ -1,12 +1,17 @@
+#ifdef _MSC_VER
+#define _CRT_SECURE_NO_WARNINGS
+#endif
 // MiniMax M3.1 defaults-on resolver, CPU only: the plain invocation resolves to exactly the measured production
 // receipt (argv + env, tests/fixtures/minimax_production_receipt.txt), every off switch restores its item's former
 // value, STRIX_MM_BASELINE=1 restores all of them, and apply() exports what --print-effective-config prints.
 #include "minimax/engine/mm_defaults.hpp"
+#include "strix/minimax/session_startup.hpp"
 
 #include <cstdlib>
 #include <array>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <map>
 #include <set>
@@ -15,6 +20,10 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+int setenv(const char* key, const char* value, int overwrite) { if (!overwrite && std::getenv(key)) return 0; return ::_putenv_s(key, value); }
+int unsetenv(const char* key) { return ::_putenv_s(key, ""); }
+#endif
 namespace {
 
 namespace md = strix::minimax::defaults;
@@ -125,7 +134,12 @@ void test_receipts(const char* path) {
     for (const Receipt& r : receipts) {
         const std::string want = md::effective_config(md::parse_cli(r.app, r.argv), lookup(r.env));
         const std::string got = md::effective_config(md::parse_cli(r.app, r.plain), lookup(none));
-        check(got == want, r.app + ": plain invocation == receipt\n--- receipt\n" + want + "--- plain\n" + got);
+        auto numerical = [](const std::string& text) {
+            std::istringstream input(text); std::string result, line;
+            while (std::getline(input,line)) if (!line.starts_with("session_")) result += line + "\n";
+            return result;
+        };
+        check(numerical(got) == numerical(want), r.app + ": plain invocation == receipt\n--- receipt\n" + want + "--- plain\n" + got);
         // Every receipt env value is one of the resolved items (no receipt switch is left unmanaged).
         for (const auto& [k, v] : r.env) {
             bool found = false;
@@ -147,7 +161,7 @@ void test_off_switches() {
         }
         const auto off_lines = lines(md::effective_config(md::Cli{}, lookup(off)));
         std::size_t diff = 0;
-        for (const auto& l : off_lines) diff += on_lines.count(l) == 0 ? 1 : 0;
+        for (const auto& l : off_lines) if (!l.starts_with("session_")) diff += on_lines.count(l) == 0 ? 1 : 0;
         check(diff == 1 && off_lines.count(std::string(it.env) + "=" + it.off) == 1, std::string(it.env) + " off changes one line");
     }
 }
@@ -199,6 +213,129 @@ void test_async_group() {
           "inspection reports default threshold");
     check(lines(md::effective_config(md::Cli{}, lookup(custom))).count("STRIX_MM_PF_ASYNC_MIN_ROWS=0") == 1,
           "inspection reports custom threshold");
+}
+void test_session_inspection() {
+    const auto directory = std::filesystem::current_path() / "minimax-inspection-fixture";
+    check(!std::filesystem::exists(directory), "inspection fixture absent");
+    for (const char* app : {"rank", "serve"}) {
+        md::Cli cli; cli.app = app;
+        for (const char* mode : {"auto", "off", "0", "on", "1"}) {
+            EnvMap env{{"STRIX_SESSION_CACHE", mode}, {"STRIX_SESSION_DIR", directory.string()}};
+            const auto clean = md::effective_config(cli, lookup(env));
+            env["HOME"] = "alternate-home"; env["XDG_CACHE_HOME"] = "alternate-cache";
+            env["USERPROFILE"] = "alternate-profile";
+            const auto guarded = [&](const char* key) -> const char* {
+                check(std::string(key) != "HOME" && std::string(key) != "XDG_CACHE_HOME" &&
+                      std::string(key) != "USERPROFILE", "inspection never resolves a host home");
+                return lookup(env)(key);
+            };
+            check(md::effective_config(cli, guarded) == clean, "inspection independent of host paths");
+            check(!std::filesystem::exists(directory), "inspection creates no files or directories, including ON");
+            std::istringstream input(clean); std::string line; unsigned count = 0;
+            while (std::getline(input, line)) if (line.starts_with("session_")) {
+                check(line.starts_with("session_requested=") || line.starts_with("session_cache=") ||
+                      line.starts_with("session_reason="), "inspection contains only host-independent session policy");
+                ++count;
+            }
+            check(count == 3, "three documented session policy lines");
+            env[md::kBaselineEnv] = "1";
+            const auto base = md::effective_config(cli, guarded);
+            check(base.find("session_cache=off\nsession_reason=baseline\n") != std::string::npos,
+                  "baseline inspection is off");
+        }
+    }
+}
+void test_session_defaults() {
+    md::Cli cli; cli.app = "serve";
+    for (const EnvMap& off : {EnvMap{}, EnvMap{{"STRIX_SESSION_CACHE", "0"}},
+                             EnvMap{{"STRIX_SESSION_CACHE", "off"}}, EnvMap{{"STRIX_MM_BASELINE", "1"}},
+                             EnvMap{{"STRIX_BASELINE", "1"}, {"STRIX_SESSION_CACHE", "1"}}}) {
+        const auto policy = md::session_policy(cli, [&](const char* key) -> const char* {
+            const std::string name(key);
+            check(name != "HOME" && name != "USERPROFILE" && name != "XDG_CACHE_HOME" &&
+                  name != "STRIX_SESSION_DIR" && name != "STRIX_SESSION_RAM_BYTES" &&
+                  name != "STRIX_SESSION_DISK_BYTES", "OFF startup does not resolve resources");
+            return lookup(off)(key);
+        });
+        check(!policy.enabled && policy.ram_bytes == 0 && policy.directory.empty(), "OFF startup uses pure policy");
+    }
+    EnvMap env{{"STRIX_SESSION_DISK","0"},{"HOME","/test-home"}};
+    auto c = md::session_config(cli, lookup(env), 100ULL << 30);
+    check(!c.enabled && c.reason == "route not yet GPU-qualified: " + c.route &&
+          c.ram_bytes == (8ULL << 30) && c.max_parked == 8 && !c.disk, "unqualified default declines");
+    env["STRIX_SESSION_CACHE"] = "1";
+    check(md::session_config(cli,lookup(env),100ULL<<30).enabled, "explicit qualification gate opt-in");
+    env.erase("STRIX_SESSION_CACHE");
+    check(c.directory == "/test-home/.cache/strix-engine/sessions", "default disk path");
+    env["XDG_CACHE_HOME"] = "/test-xdg";
+    check(md::session_config(cli,lookup(env),100ULL<<30).directory == "/test-xdg/strix-engine/sessions", "XDG path");
+    for (const char* key : {"STRIX_SESSION_CACHE","STRIX_BASELINE", md::kBaselineEnv}) {
+        env[key] = std::string(key) == "STRIX_SESSION_CACHE" ? "0" : "1";
+        check(!md::session_config(cli,lookup(env),100ULL<<30).enabled, std::string("session off switch ") + key);
+        env.erase(key);
+    }
+    cli.capacity = 122880;
+    c = md::session_config(cli,lookup(env),100ULL<<30);
+    check(!c.enabled && !c.reason.empty(), "120K refuses default budget cleanly");
+    cli.capacity = 8256;
+    check(!md::session_config(cli,lookup(env),2ULL<<30).enabled, "MemAvailable guard");
+    env["STRIX_SESSION_RAM_BYTES"] = "7000000000"; env["STRIX_SESSION_MAX_PARKED"] = "3";
+    c = md::session_config(cli,lookup(env),100ULL<<30);
+    check(!c.enabled && c.ram_bytes == 7000000000 && c.max_parked == 3, "budget overrides");
+    const auto directory = std::filesystem::current_path() / "minimax-explicit-defaults-fixture";
+    check(!std::filesystem::exists(directory), "explicit test directory fresh");
+    env["STRIX_SESSION_CACHE"] = "0";
+    env[md::kBaselineEnv] = "1";
+    env["STRIX_SESSION_DIR"] = "invalid-default-cache";
+    c = md::session_config(cli,lookup(env),100ULL<<30,true,directory.string());
+    check(c.enabled && c.disk && c.directory == directory.string(), "explicit disk independent of automatic switches and path");
+    env["STRIX_SESSION_DISK_BYTES"] = "1";
+    check(!md::session_config(cli,lookup(env),100ULL<<30,true,directory.string()).disk, "explicit disk cap retained");
+    env.erase("STRIX_SESSION_DISK_BYTES");
+    check(!md::session_config(cli,lookup(env),2ULL<<30,true,directory.string()).enabled, "explicit memory guard retained");
+    std::filesystem::remove_all(directory);
+    cli.slots = 1;
+    check(!md::session_config(cli,lookup(env),100ULL<<30).enabled, "transaction slot precondition");
+}
+// Execute the same serving admission path with a CPU factory. A baseline must
+// reach ordinary serving without constructing a runtime; explicit ON failures
+// must reach the server-style nonzero exit handler.
+void test_session_startup() {
+    md::Cli cli; cli.app = "serve"; cli.capacity = 32;
+    for (const char* baseline : {"STRIX_MM_BASELINE", "STRIX_BASELINE"}) {
+        for (const char* on : {"1", "on"}) {
+            EnvMap env{{baseline, "1"}, {"STRIX_SESSION_CACHE", on}, {"STRIX_SESSION_DISK", "0"}};
+            const auto config = md::session_config(cli, lookup(env), 100ULL << 30);
+            bool attempted = false, served = false;
+            std::string log;
+            auto serve = [&] {
+                try {
+                    auto runtime = strix::minimax::session::admit_runtime(config.enabled, true, config.reason,
+                        [&]() -> std::unique_ptr<int> { attempted = true; throw std::runtime_error("injected failure"); },
+                        [&](const std::string& line) { log = line; });
+                    check(!runtime, "baseline runtime is absent");
+                    served = true;
+                    return 0;
+                } catch (const std::exception&) { return 2; }
+            };
+            check(!config.enabled && config.reason == "baseline", "baseline resolves sessions OFF over explicit ON");
+            check(serve() == 0 && served && !attempted, "baseline ordinary serving continues and exits zero");
+            check(log == "session cache: off (baseline)", "baseline diagnostic");
+        }
+    }
+    EnvMap env{{"STRIX_SESSION_CACHE", "1"}, {"STRIX_SESSION_DISK", "0"}};
+    auto config = md::session_config(cli, lookup(env), 100ULL << 30);
+    bool served = false;
+    std::string log;
+    int exit = 0;
+    try {
+        (void)strix::minimax::session::admit_runtime(config.enabled, true, config.reason,
+            []() -> std::unique_ptr<int> { throw std::runtime_error("injected failure"); },
+            [&](const std::string& line) { log = line; });
+        served = true;
+    } catch (const std::exception&) { exit = 2; }
+    check(config.enabled && exit == 2 && !served, "explicit ON initialization failure exits nonzero");
+    check(log == "session cache: initialization failed (injected failure)", "explicit ON failure diagnostic");
 }
 
 void test_cli() {
@@ -263,6 +400,7 @@ void test_serve_preflight() {
 
 // Last: changes the process environment.
 void test_apply() {
+    (void)::setenv("STRIX_SESSION_DISK", "0", 1); // CPU checks never create user cache directories.
     for (const md::Item& it : md::items()) (void)::unsetenv(it.env);
     (void)::unsetenv(md::kBaselineEnv);
     (void)::setenv("STRIX_MM_XB_PUBLISH", "0", 1);  // a user value
@@ -302,6 +440,21 @@ void test_apply() {
     }
     char* argv2[] = {app, m, r0, tr, out};
     check(!md::print_or_apply("rank", 5, argv2), "print_or_apply without the flag");
+    // Both argv orders resolve OFF. --session-cache is the CLI form of ON.
+    char baseline[] = "--baseline", cache[] = "--session-cache", on[] = "on";
+    char* baseline_first[] = {app, m, baseline, cache, on};
+    char* baseline_last[] = {app, m, cache, on, baseline};
+    for (auto args : {baseline_first, baseline_last}) {
+        (void)::unsetenv(md::kBaselineEnv);
+        check(!md::print_or_apply("serve", 5, args), "baseline ordinary startup");
+        auto config = md::session_config(md::Cli{}, [](const char* key) { return std::getenv(key); }, 100ULL << 30);
+        check(!config.enabled && config.reason == "baseline", "--baseline wins in either argv order");
+        std::string log;
+        auto runtime = strix::minimax::session::admit_runtime(config.enabled, true, config.reason,
+            []() -> std::unique_ptr<int> { throw std::runtime_error("must not initialize"); },
+            [&](const std::string& line) { log = line; });
+        check(!runtime && log == "session cache: off (baseline)", "--baseline continues ordinary serving");
+    }
 }
 
 }  // namespace
@@ -319,6 +472,9 @@ int main(int argc, char** argv) {
         test_cli();
         test_async_group();
         test_serve_preflight();
+        test_session_inspection();
+        test_session_defaults();
+        test_session_startup();
         test_apply();
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << "\n";

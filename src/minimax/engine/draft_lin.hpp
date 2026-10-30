@@ -35,6 +35,7 @@ public:
     DraftLinears(const DraftLinears&) = delete;
     DraftLinears& operator=(const DraftLinears&) = delete;
 
+    const LoaderSnapshot& loader_snapshot() const { return pack_.loader_snapshot(); }
     [[nodiscard]] bool has_fc() const noexcept { return has_fc_; }
     [[nodiscard]] Mode mode() const noexcept { return mode_; }
     [[nodiscard]] bool opt() const noexcept { return opt_on_; }

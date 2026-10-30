@@ -3,6 +3,7 @@
 #include "minimax_sched.hpp"
 #include "minimax_control.hpp"
 #include "minimax_api.hpp"
+#include "minimax_session.hpp"
 #include "minimax/dspark/minimax_dspark.hpp"
 #include "minimax/dspark/minimax_auto.hpp"
 #include <algorithm>
@@ -152,9 +153,9 @@ template<class Engine, class Runner, class Time = std::chrono::steady_clock>
 class Lead {
 public:
     Lead(Engine& eng, Runner& run, sv::GenerationQueue& queue, Shared& shared, std::uint64_t max_rows, bool taps, std::atomic<bool>& stop,
-         std::function<std::string(const std::vector<std::uint32_t>&)> prompt_bytes = {})
+         std::function<std::string(const std::vector<std::uint32_t>&)> prompt_bytes = {}, ms::SessionService* session = nullptr)
         : eng_(eng), run_(run), queue_(queue), sh_(shared), slots_(eng.slots()), capacity_(eng.capacity()), max_rows_(max_rows),
-          run_slots_(slots_), stop_(stop), taps_(taps) {
+          run_slots_(slots_), stop_(stop), session_(session), taps_(taps) {
         prompt_bytes_ = std::move(prompt_bytes);
         round_ = run.control_round;
         const char* v = std::getenv("STRIX_MM_SERVE_TIMELINE");
@@ -400,7 +401,7 @@ private:
     }
     bool waiting_child(const sv::GenerationJob& job, Clock::time_point submitted,
                        Clock::time_point parent_submitted, Clock::time_point started) const {
-        return job.prompt.size() <= std::min(512U, eng_.nested_rows()) && job.prompt.size() > 0 &&
+        return (!session_ || job.session.empty()) && job.prompt.size() <= std::min(512U, eng_.nested_rows()) && job.prompt.size() > 0 &&
             job.prompt.size() + 1 < capacity_ && ms::waiting_short(submitted, parent_submitted, started);
     }
     bool nested_candidate(const sv::GenerationJob& job, Clock::time_point submitted) {
@@ -469,6 +470,13 @@ private:
                 break;
             }
         if (free_slot >= slots_) return false;
+        if (session_ && !nested && inflight() == 0 && session_->tasks.pending.load(std::memory_order_relaxed)) {
+            if (auto task = session_->tasks.take()) {
+                try { task->result.set_value(dispatch_session(task->body)); }
+                catch (...) { task->result.set_value(sv::session_error("unavailable", "session execution stopped")); throw; }
+                return true;
+            }
+        }
         // Reserve one selected candidate without opening device state; it remains ahead of later arrivals.
         if (!pending_) {
             pending_short_first_ = false;
@@ -490,6 +498,36 @@ private:
         if (pending_->ticket->cancelled()) {
             queue_.finish(*pending_, {});
             pending_.reset();
+            return true;
+        }
+        if (session_ && !pending_->job.session.empty()) {
+            if (nested || inflight() != 0) return false;
+            auto t = std::move(pending_);
+            pending_.reset();
+            t->started = Time::now();
+            auto command = sv::Json::object(); command.set("op", sv::Json("generate")); command.set("id", sv::Json(t->job.session));
+            auto tokens = sv::Json::array(), stops = sv::Json::array();
+            for (auto id : t->job.prompt) tokens.push(sv::Json(std::uint64_t(id)));
+            for (auto id : t->job.stop_tokens) stops.push(sv::Json(std::uint64_t(id)));
+            command.set("tokens", std::move(tokens)); command.set("stops", std::move(stops));
+            command.set("count", sv::Json(std::uint64_t(t->job.max_tokens)));
+            const auto begin = Time::now();
+            sv::GenerationStats stats; stats.prompt_tokens = t->job.prompt.size();
+            auto publish = [&](std::span<const std::uint32_t> ids) {
+                if (stats.generated_tokens == 0 && t->job.observation_complete()) stats.first_token_ms = elapsed(t->submitted);
+                stats.generated_tokens += ids.size();
+                return !t->ticket->cancelled() && (!t->job.on_tokens || t->job.on_tokens(ids));
+            };
+            auto reply = dispatch_session(command.dump(), publish);
+            stats.decode_ms = elapsed(begin);
+            if (const auto* error = reply.find("error")) queue_.finish(*t, stats, error->find("code")->as_string() + ": " + error->find("message")->as_string());
+            else {
+                std::vector<std::uint32_t> ids;
+                for (const auto& id : reply.find("token_ids")->as_array()) ids.push_back(static_cast<std::uint32_t>(id.as_int()));
+                stats.generated_tokens = ids.size(); stats.cached_tokens = reply.find("hit")->as_bool() ? stats.prompt_tokens : 0;
+                stats.finish = t->ticket->cancelled() ? "cancelled" : ids.size() < t->job.max_tokens ? "stop" : "length";
+                queue_.finish(*t, stats);
+            }
             return true;
         }
         const auto& candidate = pending_->job.prompt;
@@ -988,6 +1026,17 @@ private:
         }
     }
 
+    sv::Json dispatch_session(const std::string& body, const ms::SessionService::Publish& publish = {}) {
+        Control c; c.command = static_cast<std::uint32_t>(Command::session); c.plen = static_cast<std::uint32_t>(body.size());
+        c.round = round_++;
+        (void)exchange(eng_, c);
+        const auto wire = ms::session_wire(eng_, body, body.size());
+        const auto available = eng_.peer(session_ && session_->execute ? 1U : 0U);
+        auto reply = available ? session_->execute(wire, publish) : sv::session_error("session_budget", "peer session precondition failed", 507);
+        eng_.set_taps(taps_);
+        return reply;
+    }
+
     std::function<std::string(const std::vector<std::uint32_t>&)> prompt_bytes_;
     Engine& eng_;
     Runner& run_;
@@ -1018,6 +1067,7 @@ private:
     std::array<double, kStepRows + 1> cycle_cost_{};
     ms::LayerModel layer_;
     std::atomic<bool>& stop_;
+    ms::SessionService* session_ = nullptr;
     bool taps_ = false;  // the engine's taps (set to the startup policy before READY, then sync_taps)
     std::vector<ds::DraftGate> gates_ = std::vector<ds::DraftGate>(kStepRows + 1);  // one per decoding count
     std::array<std::uint64_t, kStepRows + 1> explore_{};

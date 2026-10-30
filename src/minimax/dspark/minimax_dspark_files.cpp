@@ -1,9 +1,11 @@
 // MiniMax DSpark drafter: the draft checkpoint (safetensors) read into host memory and checked against the expected
 // manifest, and row reads of the target's BF16 embedding.
 #include "minimax_dspark.hpp"
+#include "strix/minimax/model_assets.hpp"
 
 #include <cstring>
 #include <fstream>
+#include "strix/minimax/asset_input.hpp"
 #include <map>
 #include <stdexcept>
 #include <variant>
@@ -99,19 +101,14 @@ Json parse(const std::string& text) {
     Parser ps{text.data(), text.data() + text.size()};
     return ps.value();
 }
-std::string read_text(const std::filesystem::path& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("dspark: cannot open " + path.string());
-    return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
-}
 
 struct TensorInfo {
     std::string dtype;
     std::vector<std::uint64_t> shape;
     std::uint64_t offset = 0, bytes = 0;  // absolute in the file
 };
-std::map<std::string, TensorInfo> read_header(const std::filesystem::path& file) {
-    std::ifstream f(file, std::ios::binary);
+std::map<std::string, TensorInfo> read_header(const std::filesystem::path& file, LoaderSnapshot* snapshot = nullptr) {
+    assets::Input f(file, snapshot);
     if (!f) throw std::runtime_error("dspark: cannot open " + file.string());
     std::uint64_t n = 0;
     f.read(reinterpret_cast<char*>(&n), 8);
@@ -180,10 +177,9 @@ std::unique_ptr<DraftFile> DraftFile::open(const std::filesystem::path& dir, boo
     const auto want = manifest();
     std::map<std::string, const Blob*> found;
     std::size_t skipped = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
-        if (entry.path().extension() != ".safetensors") continue;
-        const auto header = read_header(entry.path());
-        std::ifstream in(entry.path(), std::ios::binary);
+    for (const auto& path : assets::draft_files(dir)) {
+        const auto header = read_header(path, &f->snapshot_);
+        assets::Input in(path, &f->snapshot_);
         for (const auto& [name, t] : header) {
             if (name.rfind(checkpoint_prefix, 0) != 0) throw std::runtime_error("dspark: unexpected tensor " + name);
             const std::string key = name.substr(checkpoint_prefix.size());
@@ -251,8 +247,7 @@ std::span<const std::uint8_t> DraftFile::tensor(const std::string& name) const {
 }
 
 std::vector<float> read_bf16_rows(const std::filesystem::path& dir, const std::string& name, std::span<const std::uint32_t> rows) {
-    const Json index = parse(read_text(dir / "model.safetensors.index.json"));
-    const auto file = dir / index.object().at("weight_map").object().at(name).string();
+    const auto file = assets::pack_weight_map(dir).at(name);
     const auto header = read_header(file);
     const TensorInfo& t = header.at(name);
     if (t.dtype != "BF16" || t.shape.size() != 2) throw std::runtime_error("dspark: " + name + " is not a BF16 matrix");

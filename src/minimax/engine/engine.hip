@@ -8,6 +8,7 @@
 // expert id per token, batch invariant) -> exchange X2 + fused post-exchange (next input norm / final norm).
 // Linears: strix_gemm for prefill / gate calls, strix_gemv for decode steps (<= 8 rows).
 #include "strix/minimax/engine.hpp"
+#include "strix/dist/communicator.hpp"
 
 #include "mm_kernels.hpp"
 #include "strix/hip_minimax_moe.hpp"
@@ -2420,7 +2421,7 @@ struct Engine::Impl {
     void state_rows(std::uint32_t slot, std::uint64_t pos0, std::uint64_t n, std::uint8_t* host, bool to_host, unsigned l0 = 0,
                     unsigned l1 = kLayers) {
         no_task("state rows");
-        if (slot >= opt.slots || pos0 + n > opt.capacity || l1 > kLayers) throw std::invalid_argument("state rows: bad slot / range");
+        if (slot >= opt.slots || pos0 > opt.capacity || n > opt.capacity - pos0 || l1 > kLayers) throw std::invalid_argument("state rows: bad slot / range");
         const hipMemcpyKind kind = to_host ? hipMemcpyDeviceToHost : hipMemcpyHostToDevice;
         for (unsigned L = l0; L < l1; ++L) {
             std::uint8_t* b = host + static_cast<std::size_t>(L - l0) * n * 1280;
@@ -2715,6 +2716,10 @@ const char* Engine::prefill_unlimited_reason() const {
     return impl_->profiling ? "profiling" : impl_->fp32_prefill ? "fp32_prefill" : "";
 }
 bool Engine::prefill_open() const { return impl_->task.open || impl_->parked.open; }
+LoaderSnapshot Engine::loader_snapshot() const { return impl_->pack.loader_snapshot(); }
+LoaderSnapshot Engine::draft_loader_snapshot() const {
+    return impl_->dlin ? impl_->dlin->loader_snapshot() : LoaderSnapshot{};
+}
 unsigned Engine::prefill_layer() const { return impl_->task.layer; }
 std::uint64_t Engine::prefill_unit_rows() const { return impl_->task.open ? impl_->task.rows : 0; }
 std::uint64_t Engine::prefill_rows_left() const { return impl_->task.open ? impl_->task.toks.size() - impl_->task.c0 : 0; }
