@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <array>
 #include <bit>
@@ -289,10 +290,12 @@ void a8_down_runtime_admission() {
             expect(before == after && before_record == after_record,"A8 down admission preserves every arena and D1 byte");
         };
         const auto rejects = [&](auto&& operation,const char* fragment) {
-            bool rejected = false;
+            bool rejected = false; std::string actual = "no std::invalid_argument";
             try { operation(); } catch (const std::invalid_argument& e) {
-                rejected = std::string(e.what()).find(fragment) != std::string::npos;
+                actual = e.what();
+                rejected = actual.find(fragment) != std::string::npos;
             }
+            if (!rejected) std::fprintf(stderr,"  expected rejection containing '%s', got: %s\n",fragment,actual.c_str());
             expect(rejected,"A8 down runtime rejects at the specified admission boundary");
         };
         strix::HipLaunchContext scope;
@@ -367,7 +370,10 @@ void a8_down_runtime_admission() {
                 weights.model_content_identity.bytes[31] ^= 1U;
                 rejects([&] { launcher.function(context,launcher.user_data); },"buffers are undersized");
                 context.layer = step.layer;
-                rejects([&] { strix::moe_experts_known_window_rows_preflight({},config,{}); },"rejects known-window CSR");
+                // The known-window rows launcher admits the A8 down profile since the A8 routed expert
+                // union; an empty row set must still be rejected before any write, now at the row-count gate.
+                rejects([&] { strix::moe_experts_known_window_rows_preflight({},config,{}); },
+                    "known-window routed rows require R2/R4/R8");
             }
             unchanged();
             auto graph_fields = scope;
