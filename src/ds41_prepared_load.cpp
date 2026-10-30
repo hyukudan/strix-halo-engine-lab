@@ -187,6 +187,43 @@ std::string name_space(const std::filesystem::path& model, const std::filesystem
     }
     return ns.str();
 }
+std::filesystem::path default_root(const std::string& root, const std::string& xdg, const std::string& home) {
+    if (!root.empty()) return root;
+    if (!xdg.empty()) return std::filesystem::path(xdg) / "strix/ds41-prepared";
+    if (!home.empty()) return std::filesystem::path(home) / ".cache/strix/ds41-prepared";
+    return {};
+}
+std::filesystem::path default_root() {
+    return default_root(env("STRIX_DS41_PREPARED_ROOT"), env("XDG_CACHE_HOME"), env("HOME"));
+}
+std::string directory_name(const std::string& ns, unsigned rank, bool tp, bool packed) {
+    return "rank" + std::to_string(rank) + (tp ? "-tp-" : "-ep-") + (packed ? "packed-" : "dup-") +
+           digest(Bytes(reinterpret_cast<const std::uint8_t*>(ns.data()), ns.size())).substr(0, 16);
+}
+std::filesystem::path select_directory(const std::filesystem::path& root, const char* setting, const std::string& expected) {
+    return select_directory(root, setting, [&] { return expected; });
+}
+std::filesystem::path select_directory(const std::filesystem::path& root, const char* setting, const std::function<std::string()>& expected_namespace) {
+    if (setting && std::string_view(setting) == "0") return {};
+    if (setting && *setting) return setting;
+    if (root.empty()) return {};
+    std::error_code error;
+    std::vector<std::filesystem::path> candidates;
+    std::filesystem::directory_iterator it(root, error), end;
+    for (; !error && it != end; it.increment(error)) {
+        std::error_code status_error;
+        if (!it->path().filename().string().ends_with(".incomplete") && it->is_directory(status_error))
+            candidates.push_back(it->path());
+    }
+    if (error || candidates.empty()) return {};
+    const auto expected = expected_namespace();
+    std::sort(candidates.begin(), candidates.end());
+    for (const auto& candidate : candidates) {
+        try { Reader reader(candidate, expected); return candidate; }
+        catch (const std::runtime_error&) { /* An absent, incompatible or invalid pack is a miss. */ }
+    }
+    return {};
+}
 Writer::Writer(const std::filesystem::path& destination, std::string ns) : destination_(destination), ns_(std::move(ns)) {
     require(!std::filesystem::exists(destination_), "destination exists (use a new version directory)");
     temporary_ = destination_; temporary_ += ".incomplete";
@@ -355,7 +392,13 @@ void prepare(const std::filesystem::path& model, const std::filesystem::path& ov
     const auto ns = name_space(model, overlay_path, target, rank, world, tp, packed);
     std::unique_ptr<WeightOverlay> overlay;
     if (!overlay_path.empty()) overlay = std::make_unique<WeightOverlay>(overlay_path, target.manifest);
-    Writer writer(destination, ns);
+    auto dest_path = destination;
+    if (dest_path.empty() || dest_path == "-") {
+        const auto root = default_root();
+        require(!root.empty(), "no default prepared root (set STRIX_DS41_PREPARED_ROOT, XDG_CACHE_HOME or HOME)");
+        dest_path = root / directory_name(ns, rank, tp, packed);
+    }
+    Writer writer(dest_path, ns);
     for (const auto& t : target.manifest.tensors) {
         if (!t.name.ends_with("_exps.weight") || !t.layer || *t.layer >= layers) continue;
         const auto* over = overlay ? overlay->find(t.name) : nullptr;
@@ -406,5 +449,6 @@ void prepare(const std::filesystem::path& model, const std::filesystem::path& ov
     }
     require(ns == name_space(model, overlay_path, target, rank, world, tp, packed), "namespace changed during preparation");
     writer.commit();
+    std::fprintf(stderr, "prepared artifact %s\n", dest_path.string().c_str());
 }
 } // namespace strix::ds41::prepared

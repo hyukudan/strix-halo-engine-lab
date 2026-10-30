@@ -409,6 +409,16 @@ void full_hash(const std::filesystem::path &dir) {
         if (value) setenv(name, value, 1); else unsetenv(name);
 #endif
     };
+    // The prepared-loader OFF sentinel is not an asset named "0".
+    {
+        const char* prior = std::getenv("STRIX_DS41_PREPARED_LOAD");
+        const bool present = prior != nullptr;
+        const std::string saved = prior ? prior : "";
+        environment("STRIX_DS41_PREPARED_LOAD", "0");
+        const auto off = session_compat({}, {{"model", file}}, file);
+        require(!off.fields.contains("asset:env:STRIX_DS41_PREPARED_LOAD"), "prepared OFF is not a file asset");
+        environment("STRIX_DS41_PREPARED_LOAD", present ? saved.c_str() : nullptr);
+    }
     for (const auto* name : {"GPU_TURN_ID", "GPU_TURN_DEADLINE", "GPU_WINDOW", "STRIX_HASH_CACHE",
              "STRIX_SESSION_DIR", "STRIX_SESSION_CACHE", "STRIX_SESSION_DISK", "STRIX_SESSION_DISK_BYTES",
              "STRIX_SESSION_RAM_BYTES", "STRIX_SESSION_MAX_PARKED", "STRIX_SESSION_POOL_IDENTITY_TEST",

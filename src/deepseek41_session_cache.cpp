@@ -438,7 +438,7 @@ SessionCompat session_compat(std::map<std::string, std::string> effective, const
         // Only immutable numerical inputs are assets. Operational paths (hash,
         // prefix, output and log caches) must never be traversed.
         const bool numerical_asset = name == "STRIX_DS41_NATIVE_FP8" || name == "STRIX_DS41_OVERLAY" ||
-            name == "STRIX_DS41_PREPARED_LOAD" || name == "STRIX_DS41_EP_MAP" ||
+            (name == "STRIX_DS41_PREPARED_LOAD" && value != "0") || name == "STRIX_DS41_EP_MAP" ||
             (name == "STRIX_DS41_TRELLIS_MIX" && value.find('=') == std::string::npos) ||
             (name == "STRIX_DS41_FP16_CACHE" && std::getenv("STRIX_DS41_FP16_CACHE_READONLY") &&
              std::string_view(std::getenv("STRIX_DS41_FP16_CACHE_READONLY")) == "1");

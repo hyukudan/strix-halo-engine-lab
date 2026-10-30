@@ -8,6 +8,7 @@ deployment's environment (pack paths), listed below.
 
 | setting | default | off | effect (P17.1 campaign) |
 |---|---|---|---|
+| `STRIX_DS41_PREPARED_LOAD` | discover exact matching per-node pack ([layout and preparation](prepared-load.md)) | `=0`; explicit directory overrides discovery | R1 tokens identical; default discovery vs `=0` whole-run wall -22.1 s mean (66.0 -> 43.8 s; explicit directory -20.6 s), fresh-process ABBA x2, two Strix Halo nodes, production identity, TP packed accepted on both ranks (72 GiB/node) |
 | `STRIX_DS41_BATCH_SEGMENTS` | on (off by itself with `STRIX_DS41_BATCH_ROWS16=1`) | `=0` | batch N=8 +9 % |
 | `STRIX_DS41_TP_DOWN` | on (the expert-TP down, width 1152 only) | `=0` | R6 window -3 %, batch N=8 +1.6 % |
 | `STRIX_DS41_SERVE_SCHED` | `interleave` | `=off` | 8K prompt under load: decode stall <= 1 s instead of ~13 s (its own TTFT about doubles) |
@@ -20,7 +21,7 @@ deployment's environment (pack paths), listed below.
 | `STRIX_DIST_STAGING` | `fused` (P17.4): the TP o_b product writes the pinned send buffer, the add reads the pinned receive buffer (host-path routes) | `=copy` | R1 -0.2..-0.4 ms/token, batch N=1..2 -0.25 ms/step, R6 / N=8 equal; bitwise in layouts 1 and 2bq |
 | `STRIX_DS41_EXPERT_TP`, `EXPERT_SLOTS`, `ROUTES_FAST`, `F16_PAIR` | on (P16) | `=0` | |
 
-Unchanged (off unless set): `STRIX_DS41_PREPARED_LOAD`, the tpserve prefill
+Unchanged (off unless set): the tpserve prefill
 (`STRIX_DS41_PREFILL_EXPERT_TP`, slower than the EP prefill), `STRIX_DS41_BATCH_ROWS16`, `STRIX_DS41_EXPERT_ROWS`.
 
 ## Agent prefix policy (default)

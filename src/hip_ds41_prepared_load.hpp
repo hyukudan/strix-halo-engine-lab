@@ -9,7 +9,7 @@
 #include <memory>
 
 namespace strix::ds41::prepared {
-// Optional adapter; legacy loading remains the authority and overwrites the complete tensor
+// Default-discovered adapter; legacy loading remains the authority and overwrites the complete tensor
 // after ANY cache failure, even when some validated chunks were already uploaded.
 class HipLoader {
 public:
@@ -17,16 +17,30 @@ public:
               const deepseek41::TargetModel& target, unsigned rank, unsigned world, bool tp,
               const std::filesystem::path* trellis = nullptr, const std::string* sites = nullptr) : rank_(rank) {
         const char* directory = std::getenv("STRIX_DS41_PREPARED_LOAD");
-        if (!directory || !*directory || world != 2) return;
+        if ((directory && std::strcmp(directory, "0") == 0) || world != 2) return;
+        const bool automatic = !directory || !*directory;
         try {
+            const auto root = automatic ? default_root() : std::filesystem::path{};
             auto dense = dense_from_env();
             // a single pack directory replaces the environment's; a mix spec (class=dir,...,default=dir: the forward's
             // trellis_env_spec()) is already bound by STRIX_DS41_TRELLIS + STRIX_DS41_TRELLIS_MIX as the tool prepared it
             if (trellis && trellis->string().find('=') == std::string::npos) dense.trellis = trellis->string();
             if (sites) dense.sites = *sites;
-            reader_ = std::make_unique<Reader>(directory, name_space(model, overlay, target, rank, world, tp, expert_tp::packed_from_env(), dense));
+            std::string ns;
+            const auto expected = [&] {
+                if (ns.empty()) ns = name_space(model, overlay, target, rank, world, tp, expert_tp::packed_from_env(), dense);
+                return ns;
+            };
+            const auto selected = select_directory(root, directory, expected);
+            if (selected.empty()) {
+                std::fprintf(stderr, "prepared rank %u no matching pack; legacy fallback\n", rank_); return;
+            }
+            reader_ = std::make_unique<Reader>(selected, expected());
         }
-        catch (const std::exception& e) { std::fprintf(stderr, "prepared rank %u REJECT %s; legacy fallback\n", rank_, e.what()); }
+        catch (const std::exception& e) {
+            if (automatic) std::fprintf(stderr, "prepared rank %u no matching pack; legacy fallback\n", rank_);
+            else std::fprintf(stderr, "prepared rank %u REJECT %s; legacy fallback\n", rank_, e.what());
+        }
     }
     ~HipLoader() { if (pinned_) (void)hipHostFree(pinned_); }
     bool active() const noexcept { return bool(reader_); }

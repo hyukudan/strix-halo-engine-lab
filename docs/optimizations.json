@@ -544,6 +544,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "Prepared rank-local expert loading",
+    "flag_or_env": "STRIX_DS41_PREPARED_LOAD; STRIX_DS41_PREPARED_ROOT",
+    "default": "ON: discover matching local pack",
+    "exact": "R1 tokens (63 position records) identical in every arm on two Strix Halo nodes, production identity, fresh process per arm, ABBA x2, for both the explicit-directory and the default-discovery A/B; TP packed packs accepted on both ranks (72 GiB/node).",
+    "gain": "Default discovery vs STRIX_DS41_PREPARED_LOAD=0, fresh process per arm, ABBA x2: whole-run wall -22.1 s mean (66.0 -> 43.8 s; discovery 43.78-43.86 s, original loader 59.6-81.8 s, its first visit with a cold page cache). Explicit-directory A/B: -20.6 s (63.7 -> 43.0 s).",
+    "preconditions": "Offline local pack matching the full validated namespace: model/overlay, trellis/env, rank/world, EP/TP and down layout. Immediate children of STRIX_DS41_PREPARED_ROOT, else XDG_CACHE_HOME/strix/ds41-prepared, else HOME/.cache/strix/ds41-prepared; lexical first valid match. Manifest and payload size checks at discovery, chunk verification before upload; no runtime pack writes. Missing match uses original loader with one concise line. Serve with expert TP and device prefill needs TP dup.",
+    "off_switch": "STRIX_DS41_PREPARED_LOAD=0; an explicit directory bypasses discovery and retains rejection diagnostics and fallback.",
+    "doc_anchor": "docs/optimizations.md#ds-prepared-load"
+  },
+  {
+    "engine": "deepseek",
     "name": "Bounded agent prefix retention",
     "flag_or_env": "--cache-profile agent|off; --prefix-cache-mb; --prefix-inrun-snapshots; --prefix-inrun-reach; --prefix-session-snapshots; STRIX_DS41_PREFIX_DIAGNOSTICS",
     "default": "ON: 512 MiB/rank, block 256, reserve 8192 MiB, inrun reach 0, sessions only without DSpark; disk and before-tail OFF",

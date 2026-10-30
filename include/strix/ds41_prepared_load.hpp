@@ -32,6 +32,19 @@ std::string name_space(const std::filesystem::path& model, const std::filesystem
 // Snapshot detects source changes during preparation/loading, including restored mtime.
 std::string source_stamp(const std::filesystem::path& path);
 
+// Empty environment values are treated as unset. No home means no default root.
+std::filesystem::path default_root(const std::string& root, const std::string& xdg, const std::string& home);
+std::filesystem::path default_root();
+std::string directory_name(const std::string& ns, unsigned rank, bool tp, bool packed);
+// "0" disables, a nonempty explicit directory wins, otherwise scan immediate children.
+// Reuses Reader validation (manifest + payload sizes only); never reads payload contents.
+// Multiple valid copies are resolved in lexical path order; incomplete packs are ignored.
+std::filesystem::path select_directory(const std::filesystem::path& root, const char* setting,
+                                       const std::string& expected_namespace);
+// Lazy namespace construction avoids source identity work when the root has no candidates.
+std::filesystem::path select_directory(const std::filesystem::path& root, const char* setting,
+                                       const std::function<std::string()>& expected_namespace);
+
 class Writer {
 public:
     Writer(const std::filesystem::path& destination, std::string ns);
