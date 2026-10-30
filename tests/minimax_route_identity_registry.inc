@@ -12,6 +12,8 @@
 {"decode-moe-interleave", 'a', "EXL3 matrix+fixed split/k/reduction chain; v4 N8 grid", "hip_mmx_moe_bench.hip --diverse --test four-switch output/workspace/routes and rows==alone gate", ""},
 // src/minimax/moe/mmx_moe.hip: single_stream_for / singleton3_core
 {"decode-moe-singleton", 'a', "EXL3 matrix+fixed split/k/reduction chain; N/U/S+slot occupancy+K3+narrow W4+Depth4", "hip_mmx_moe_bench.hip --diverse --test reader counters+resources; --diverse-fallback --test wide/K5/W8/Depth8+12", ""},
+// src/minimax/moe/mmx_moe.hip: launch_experts4_grid / down4_combine_kernel
+{"decode-moe-down-split", 'a', "EXL3 matrix+fixed split/k/reduction chain; same partial scratch, ascending split sum, expert fmaf, shared add", "hip_mmx_moe_bench.hip --diverse --test DOWN_SPLIT=0/1/2 output/workspace/routes, repeated calls and rows==alone gate", ""},
 // src/minimax/moe/mmx_moe.hip:1195
 {"decode-moe-core", 'a', "EXL3 vector shape+bits+S; router row", "hip-mmx-moe-bench exact-form gates; mmx_moe.hpp arithmetic contract; hip_minimax_g4.hip bitwise gate", ""},
 // src/minimax/moe/mmx_moe.hip:1071
@@ -36,6 +38,8 @@
 {"prefill-table", 'a', "identical item table bytes", "prefill table ring event ownership; default OFF; A/B pftab gate in rank app", ""},
 // src/minimax/attn/msa_fused.hip:1714
 {"msa-attend", 'a', "MSA block128/chunk/FP32 combine contract", "msa_fused_tests.hip:run_case versions/head counts/graph replay", ""},
+// src/minimax/engine/engine.hip: route::attend_n2_sparse; src/minimax/attn/msa_fused.hip: launch_attend
+{"decode-attend-grid", 'a', "MSA block128/chunk/FP32 combine contract; seqs+rows_per_seq+dense+min position", "msa_fused_tests.hip:run_case v3 lds_diet and v4 heads_per_wave 1/2/4 bitwise (engine: v4 hpw1, else diet); bench_cell arms (STRIX_MMATTN_BENCH_DIET)", ""},
 // src/minimax/attn/msa_fused.hip:1693
 {"msa-grid", 'a', "MSA query+block identity", "msa_fused_tests.hip fused grid3; index tests; same_out score bytes", ""},
 // src/minimax/attn/msa_fused.hip:1934

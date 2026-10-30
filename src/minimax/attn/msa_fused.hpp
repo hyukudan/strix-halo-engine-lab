@@ -67,6 +67,10 @@ struct DecodeView {
     // Versions 3/4: full 16-key tiles take a predicate-free PV path (16 V-row LDS reads issued together); 0 = every
     // tile on the predicated path (diagnostic / disable flag). Same bits.
     std::uint32_t pv_full_tiles = 1;
+    // Versions 2/3 (sparse): launch with the actual dynamic LDS (the 32 KB tile when the selection scratch fits it)
+    // instead of the 43008-byte floor, four 16-wave blocks per WGP instead of three. Per call; the engine sets it only on
+    // the measured winning grids (route::attend_n2_sparse, STRIX_MM_ATTEND_DIET). Same bits.
+    bool lds_diet = false;
     // Dense: the caller guarantees every row's pos < kTopK * kBlock (2048): every block is attended, no scores are
     // needed, and enqueue_decode is ONE launch (the attend blocks write the new K/V/index-key rows themselves).
     // scores / idx / idx_count are not written in this mode.
@@ -117,6 +121,7 @@ unsigned attend_version(const DecodeView& v);  // attend kernel version the laun
 // Persistent index grid cap (default 160 blocks = 4 per WGP); STRIX_MMATTN_INDEX_GRID overrides it (bench only).
 unsigned index_grid_cap();
 void set_index_grid_cap(unsigned cap);  // tests and bench only (changes the grid: recapture graphs)
-void set_attend_lds_min(std::size_t bytes);  // bench only: minimum dynamic LDS of the v2/v3 attend (occupancy A/B)
+void set_attend_lds_min(std::size_t bytes);  // bench only: minimum dynamic LDS of the v2/v3 attend (occupancy A/B);
+                                             // a view with lds_diet whose selection fits the tile ignores it
 
 }  // namespace strix::minimax::msa::fused

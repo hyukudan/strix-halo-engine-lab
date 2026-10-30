@@ -104,6 +104,17 @@ void decode_moe_selectors() {
                                         }
                 }
             }
+    // Down partials + ordered finish: mode 1 only at the measured B4 wide W4 Depth4 regime, mode 2 everywhere.
+    for (unsigned mode : {0U, 1U, 2U})
+        for (unsigned n = 1; n <= 8; ++n)
+            for (bool wide : {false, true})
+                for (unsigned waves : {4U, 8U})
+                    for (unsigned depth : {4U, 8U, 12U}) {
+                        const bool got = route::moe_down_split(mode, n, wide, waves, depth);
+                        require(got == (mode == 2 || (mode == 1 && n == 4 && wide && waves == 4 && depth == 4)),
+                                "down split N/wide/W/depth admission");
+                        compare_tuple("decode-moe-down-split", {0,0,0,0}, {got ? 1U : 0U,0,0,0});
+                    }
     require(!route::moe_single_slot(8, 24, 16, false, 1) &&
             route::moe_single_slot(8, 25, 18, false, 1) &&
             !route::moe_single_slot(8, 25, 17, false, 1) &&
@@ -125,6 +136,14 @@ void decode_and_verify() {
         require(index.ring == (n == 1 ? 32U : 16U) && index.rows_per_wave == (n > 2 ? 2U : 0U) &&
                 !index.lds && !index.tiled, "index projection route");
         require(route::wide_for(n, 2) == (n >= 2 && n <= 4), "wide decode route");
+        for (bool dense : {false, true})
+            for (std::uint64_t pos : {std::uint64_t{2047}, std::uint64_t{8190}, std::uint64_t{8191}, std::uint64_t{131071}}) {
+                const bool attend = route::attend_n2_sparse(layout.seqs, layout.rows_per_seq, dense, pos);
+                require(attend == (!dense && n == 2 && pos >= 8191), "attend N2/W1 sparse >= 8K grid");
+                require(!route::attend_n2_sparse(verify.seqs, verify.rows_per_seq, dense, pos),
+                        "verify windows keep the default attend");
+                compare_tuple("decode-attend-grid", {0,0,0,0}, {attend ? 1U : 0U,0,0,0});
+            }
         compare_tuple("index-proj", {32,0,0,0}, {index.ring,index.rows_per_wave,0,0});
         compare_tuple("decode-wide", {0,0,0,0}, {route::wide_for(n, 2) ? 1U : 0U,0,0,0});
         for (const auto& shape : std::array<std::array<unsigned, 3>, 8>{{
