@@ -632,6 +632,22 @@ Select decode blocks from precomputed 4-block maxima; same selected blocks.
 - **Measured gain:** Not separately measured (no change at 131K: 50.69 vs 50.87 ms/step); an exact reorganisation for depth
 - **Implementation / evidence:** [QSA launcher](../src/hip_indexed_attention_launcher.hip)
 
+<a id="qwen-prefill-moe-merge-vec"></a>
+
+### Vector MoE merge+commit in tiled prefill
+
+**Engine:** `qwen`. **Control:** `STRIX_PREFILL_MOE_MERGE_VEC`. **Default:** 1.
+
+The certified routed-MoE merge+commit handles four adjacent outputs per thread (vector raw-dot loads, packed BF16 stores); each output keeps its own guards and its slot-ordered FP32 FMA chain.
+
+- **Preconditions:** Tiled prefill with the certified merge+commit tail (STRIX_QPF2K_MOE_MC); hidden size divisible by 4 and 16-byte raw-dot/accumulation rows, 8-byte output rows; otherwise the scalar merge runs.
+- **Automatic selection:** On when unset; explicit values win; `--baseline`, `STRIX_QPF2K_DEFAULTS=0` and the GSQ profile turn it off; `--print-effective-config` reports it under `long_context_items`.
+- **Fallback notice:** Unaligned views or widths run the scalar merge+commit.
+- **Exactness evidence:** Exact: merge+commit fixture (synthetic, crafted, real layers; NaN/Inf/large-dot, bad-route, weight-above-one and H-1 injections) 1712 comparisons byte-identical to the scalar merge incl. the accumulation view; plain default command 4K/32K: 32 generated tokens identical on/off.
+- **Off switch:** STRIX_PREFILL_MOE_MERGE_VEC=0
+- **Measured gain:** -0.19 ms per T8192 admitted merge call (3.81 vs 3.99 ms, real layers); about -0.02 s at 32K
+- **Implementation / evidence:** [MoE merge+commit](../src/hip_moe_prefill_commit.inc)
+
 <a id="qwen-qsa-score-rows64"></a>
 
 ### QSA scorer R64 above 65,536 blocks

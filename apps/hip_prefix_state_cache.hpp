@@ -49,7 +49,7 @@ inline ModelContentIdentity prefix_effective_execution_signature(std::string_vie
     // default (not only a changed variable) also changes the namespace.
     std::string long_context;
     for(const char* name : {"STRIX_QSA_UNION_MERGE","STRIX_QSA_SCORE_ROWS64","STRIX_QSA_DECODE_POOL",
-            "STRIX_QSA_DECODE_SELECT","STRIX_QSA_DECODE_POOL_BF16"})
+            "STRIX_QSA_DECODE_SELECT","STRIX_QSA_DECODE_POOL_BF16","STRIX_PREFILL_MOE_MERGE_VEC"})
         long_context+=std::string(";")+name+"="+(qpf2k::long_context_item_enabled(name,gsq)?"1":"0");
     const auto canonical=session_numerical_config(std::string(cli)+";prefix-execution-v4;baseline="+
         std::to_string(baseline || qpf2k::baseline)+";gsq="+std::to_string(gsq)+

@@ -79,6 +79,67 @@ __device__ __forceinline__ void moe_prefill_merge_z_body(View view, std::uint32_
     if ((__float_as_uint(current) & 0x7fffffffU) >= 0x7f7f8000U) { atomicOr(status, 8U); atomicOr(header, 8U); }
 }
 
+// Vector MC merge (STRIX_PREFILL_MOE_MERGE_VEC, default on): moe_prefill_merge_z_body<true, Acc> with four adjacent outputs per
+// thread; each output keeps its own guards and its slot 0..top_k-1 v_fmac chain, only loads/stores are widened. Admitted
+// calls (*unsafe == 0) cannot set merge bit 8 (MC certificate): header/status are fixed during the launch and every stored
+// word equals the scalar body's. Unproven calls: identical words while no sum is non-finite. When one is, bit 8 fails the
+// call; outputs whose guard already sees it keep a zero accumulation in both bodies (which ones is schedule-dependent in
+// the scalar body as well); every row the merge flags gets status exactly 8 (header and status were 0 before the merge),
+// so the finish record ({q4k_a8, 8}: the bits of the first flagged row, not its index) and the thrown completion error are
+// the same, and the failed call's accumulation is never read. Host requires hidden % 4 == 0, 16-byte rawdot/accumulation rows and 8-byte output rows.
+template <bool Acc, class View, class RowAt>
+__device__ __forceinline__ void moe_prefill_merge_z_body_vec4(View view, std::uint32_t* header,
+    std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k, const RowAt& row_at, const unsigned* unsafe) {
+    const auto row = blockIdx.y;
+    auto* status = row_at(view.status, row);
+    const auto out = (static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x) * 4U;
+    if (out >= hidden_size) return;
+    auto* accumulation = row_at(view.accumulation, row) + out;
+    auto* output = row_at(view.output, row) + out;
+    const auto store4 = [&](float a, float b, float c, float d) { *reinterpret_cast<float4*>(accumulation) = make_float4(a, b, c, d); };
+    if (header[0] || *status) { store4(0.0F, 0.0F, 0.0F, 0.0F); return; }
+    const bool admitted = *unsafe == 0U;
+    const auto* routes = row_at(view.routes, row);
+    for (std::uint32_t slot = 0; slot < top_k; ++slot) if (routes[slot] >= experts) {
+        if (!admitted || Acc) store4(0.0F, 0.0F, 0.0F, 0.0F);
+        if (admitted) *reinterpret_cast<uint2*>(output) = make_uint2(0U, 0U);
+        return;
+    }
+    const auto* rawdots = row_at(view.rawdots, row);
+    const auto* route_weights = row_at(view.route_weights, row);
+    float4 dots[10];
+#pragma unroll
+    for (std::uint32_t slot = 0; slot < 10U; ++slot) if (slot < top_k)
+        dots[slot] = *reinterpret_cast<const float4*>(rawdots + static_cast<std::uint64_t>(slot) * hidden_size + out);
+    float current[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+#pragma unroll
+    for (std::uint32_t slot = 0; slot < 10U; ++slot) if (slot < top_k) {
+        const float weight = route_weights[slot];
+        asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(current[0]) : "s"(weight), "v"(dots[slot].x));
+        asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(current[1]) : "s"(weight), "v"(dots[slot].y));
+        asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(current[2]) : "s"(weight), "v"(dots[slot].z));
+        asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(current[3]) : "s"(weight), "v"(dots[slot].w));
+    }
+    if (!admitted || Acc) store4(current[0], current[1], current[2], current[3]);
+    bool finite = true;
+    std::uint32_t words[4];
+#pragma unroll
+    for (std::uint32_t j = 0; j < 4U; ++j) {
+        const auto bits = __float_as_uint(current[j]);
+        finite &= (bits & 0x7fffffffU) < 0x7f7f8000U;
+        words[j] = (bits + 0x7fffU + ((bits >> 16U) & 1U)) >> 16U;
+    }
+    if (finite) {
+        if (admitted) *reinterpret_cast<uint2*>(output) = make_uint2(words[0] | words[1] << 16U, words[2] | words[3] << 16U);
+        return;
+    }
+#pragma unroll
+    for (std::uint32_t j = 0; j < 4U; ++j) {
+        if ((__float_as_uint(current[j]) & 0x7fffffffU) >= 0x7f7f8000U) { atomicOr(status, 8U); atomicOr(header, 8U); continue; }
+        if (admitted) output[j] = static_cast<std::uint16_t>(words[j]);
+    }
+}
+
 template <class View, class RowAt, class Store>
 __device__ __forceinline__ void moe_prefill_commit_body(View view, std::uint32_t* header,
     std::uint32_t row_count, std::uint32_t hidden_size, std::uint32_t* record, unsigned logical_x, unsigned logical_y, const RowAt& row_at, const Store& store) {

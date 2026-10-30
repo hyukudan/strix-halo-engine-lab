@@ -119,7 +119,7 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_RTX_EXPORT_STATE", "STRIX_QRTX_STEP_DUMP", "STRIX_PROMPT_BATCH_ROWS", "STRIX_PREFILL_LOGITS_DIGEST",
             "STRIX_MODEL_COPY_ALL", "STRIX_PLE_RECLAIM_DECODE_BYTES",
             "STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_QSA_POOL_PACKED", "STRIX_QSA_DECODE_POOL",
-            "STRIX_QSA_DECODE_SELECT", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_POOL_CHECK",
+            "STRIX_QSA_DECODE_SELECT", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_POOL_CHECK", "STRIX_PREFILL_MOE_MERGE_VEC",
             "STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA",
             "STRIX_SESSION_CACHE", "STRIX_SESSION_DISK", "XDG_CACHE_HOME", "HOME",
             "STRIX_PREFIX_BATCH_CERT", "STRIX_QWEN_YARN_MTP", "STRIX_QWEN_YARN_HOST_RESERVE", "STRIX_PLE_ROLLING_CAP_BYTES", "STRIX_PLE_ROLLING", "STRIX_PLE_ROLLING_POSITIONS", "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION",
@@ -1216,7 +1216,8 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     item("STRIX_QSA_SCORE_ROWS64", qpf2k::long_context_item_suppression("STRIX_QSA_SCORE_ROWS64", config.gsq_owner), true);
     item("STRIX_QSA_DECODE_POOL", pool_off, true);
     item("STRIX_QSA_DECODE_SELECT", select_off, true);
-    item("STRIX_QSA_DECODE_POOL_BF16", bf16_off, false);
+    item("STRIX_QSA_DECODE_POOL_BF16", bf16_off, true);
+    item("STRIX_PREFILL_MOE_MERGE_VEC", qpf2k::long_context_item_suppression("STRIX_PREFILL_MOE_MERGE_VEC", config.gsq_owner), false);
     out << "},\"qsa_decode_pool_key_bytes\":" << (pool_off ? 0U : qsa_decode_pool_key_bytes(o, config.gsq_owner)) << "}\n";
     return out.str();
 }
