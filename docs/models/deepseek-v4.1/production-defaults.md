@@ -21,8 +21,21 @@ deployment's environment (pack paths), listed below.
 | `STRIX_DS41_EXPERT_TP`, `EXPERT_SLOTS`, `ROUTES_FAST`, `F16_PAIR` | on (P16) | `=0` | |
 
 Unchanged (off unless set): `STRIX_DS41_PREPARED_LOAD`, the tpserve prefill
-(`STRIX_DS41_PREFILL_EXPERT_TP`, slower than the EP prefill), `STRIX_DS41_BATCH_ROWS16`, serve `--cache-profile`
-(opt-in for agent loops: prompts shorter than a 256-token block are never cached), `STRIX_DS41_EXPERT_ROWS`.
+(`STRIX_DS41_PREFILL_EXPERT_TP`, slower than the EP prefill), `STRIX_DS41_BATCH_ROWS16`, `STRIX_DS41_EXPERT_ROWS`.
+
+## Agent prefix policy (default)
+
+Serve now resolves no cache flags to `--cache-profile agent`: 512 MiB host per rank, block 256,
+8192 MiB post-allocation reserve on both nodes, in-run snapshots with reach 0, and session
+snapshots only without DSpark. Disk and before-tail stay OFF. Native qualification (two Strix Halo nodes over 2x USB4 Gen3, PerfOpt kernel, production packs): prefix tool exactness on both ranks at 6000 and 8192 rows (max rows 4096 / 2048): miss, same-prompt, warm, in-run and byte-suffix resumes equal a fresh prefill (logits and state digest), 16 decoded tokens equal, 0 differences. Serve timing, a fresh process per arm, `--cache-profile off` vs the default in ABBA order over two turns (n = 4 pairs per size), generated text and token IDs identical in all 8 processes: cold 2K miss -0.14 s mean (pairs +0.09 / -0.46 / -0.13 / -0.08 s; not slower), an 8K prompt that shares its 2K prefix with the previous request -3.63 s (-24 %, 15.0 -> 11.2 s mean; every pair faster). Short prompts below one block do not hit.
+
+Use `--cache-profile off` alone for the prefix baseline, or `--no-prefix-cache` to veto the bundle
+and all explicit prefix features. Component OFF controls, legacy settings, explicit disk-zero
+semantics, effective host/service-directory caps and pending work are listed in
+[the DS cache contract](../../engine/serving/prefix-state-cache.md#deepseek-pair-agent-prefix-cache).
+The launcher still selects DSpark automatically; implicit sessions never suppress it.
+Inspection by `--print-effective-config` reports launcher settings; the executable's startup
+`prefix policy` line and `/api/status` report the resolved cache policy after manifest fills.
 
 ## Additional qualified two-node code defaults (unset = on, `=0` = off)
 

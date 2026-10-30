@@ -14,10 +14,10 @@
 //       [--http-stream-receipts on|off] [--http-sse-keepalive 10] [--model-id deepseek-v4.1-flash] [--default-max-tokens 1024]
 //       [--connect-timeout 60] [--peer-timeout 60]
 //       [--prefill-path rows|device] [--prefill-rows 4096] [--prefill-min 0]
-//       [--prefix-cache-mb 0] [--prefix-block 256] [--prefix-reserve-mb 4096] [--import-parked 1]
+//       [--prefix-cache-mb 512] [--prefix-block 256] [--prefix-reserve-mb 8192] [--import-parked 1]
 //       [--prefix-cache-dir DIR [--prefix-cache-disk-mb 0]] [--prefix-before-tail] [--prefix-session-snapshots]
 //       [--cache-profile agent|off] [--no-prefix-cache] [--no-prefix-disk] [--no-prefix-before-tail]
-//       [--no-prefix-session-snapshots] [--prefix-inrun-snapshots [--prefix-inrun-reach 512]]   (off, the default: new behaviour stays opt-in; agent: see apply_cache_profile)
+//       [--no-prefix-session-snapshots] [--prefix-inrun-snapshots [--prefix-inrun-reach 0]] [--no-prefix-inrun-snapshots] (agent default)
 //       [--dspark DSPARK.gguf [--dspark-window controller|fixed:R] [--dspark-vocab SPEC] [--dspark-ranks 2|1]
 //        [--dspark-max-inflight 4]]   (drafts on both ranks by default; plain steps while > N requests are in flight)
 //       [--hetero-listen HOST:PORT --hetero-token-file FILE [--hetero-cut 22] [--hetero-groups 2|1]]   (split decode, see below)
@@ -53,8 +53,8 @@
 // prefill (no decode steps run).
 // --prefix-cache-mb M (device path): a prefix cache of attention states on the host, M MiB (deepseek41_prefix_cache.hpp):
 // a prompt whose beginning was prefilled before resumes from the longest cached block boundary; each rank keeps its own
-// copy (the state is replicated), rank 0 decides hits and inserts (an insert is skipped while the node's MemAvailable is
-// below --prefix-reserve-mb) and rank 1 checks it holds the same entry. The cache lives on the host, apart from the KV
+// copy (the state is replicated), rank 0 decides hits and both ranks agree capture admission from fresh MemAvailable
+// after predicted allocations and --prefix-reserve-mb. Rank 1 checks it holds the same entry. The cache lives on the host, apart from the KV
 // pool: it never takes room from live requests.
 // --prefix-cache-dir DIR (with --prefix-cache-mb): a disk tier of the cache in DIR/<namespace tag>/rank<R> on each rank's
 // own disk (the tag covers the weights overlay, trellis, decode identity: prefix_namespace_from_env; both ranks must agree), at
@@ -111,6 +111,8 @@
 #include "strix/hip_ds41_dspark.hpp"
 #include "strix/deepseek41_prefill.hpp"
 #include "strix/deepseek41_prefix_cache.hpp"
+#include "strix/deepseek41_serve_cache_policy.hpp"
+#include "strix/deepseek41_cache_lease.hpp"
 #include "strix/deepseek41_session_cache.hpp"
 #include "strix/serve/session_api.hpp"
 #include "strix/deepseek41_describe.hpp"
@@ -166,7 +168,7 @@ using strix::deepseek41::BatchSequence;
 namespace serve = strix::serve;
 using Clock = std::chrono::steady_clock;
 
-struct Args {
+struct Args : strix::deepseek41::ServeCachePolicy {
     std::string model, transport = "usb4auto", manifest, http_bind = "127.0.0.1", api_key_file, model_id = "deepseek-v4.1-flash";
     std::string group_id = "local";
     std::uint64_t epoch = 0;
@@ -182,21 +184,11 @@ struct Args {
     bool tp = true, engram_direct = true, describe = false, describe_parts = false;
     bool device_prefill = true;                      // --prefill-path device (default since P15; rows = the batch steps)
     std::uint32_t prefill_rows = 4096, prefill_min = 0;
-    std::uint64_t prefix_cache_mb = 0, prefix_reserve_mb = 4096;
-    std::uint32_t prefix_block = 256;
-    std::string prefix_dir;
     std::string session_dir;
     std::uint64_t session_ram_bytes = 0; // injected by pair_defaults after route/memory checks
     std::uint64_t session_max_parked = 8, session_disk_bytes = 0;
 
-    std::uint64_t prefix_disk_mb = 0;
-    bool prefix_before_tail = false, prefix_session = false;
     bool session_explicit = false;
-    bool prefix_inrun = false;  // --prefix-inrun-snapshots: the cache's snapshot points inside the prefill runs (no extra runs)
-    std::uint32_t prefix_inrun_reach = 512;  // --prefix-inrun-reach: farther points before a run's end split it (plan_prefill_runs)
-    // --cache-profile off (default) | agent: the prefix cache settings not given explicitly (apply_cache_profile)
-    std::string cache_profile = "off";
-    bool set_cache_mb = false, set_dir = false, set_disk_mb = false, no_disk = false, no_before_tail = false, no_session = false;
     // DSpark windows inside the batch steps (--dspark DSPARK.gguf): the drafter on rank 0, one drafting context per slot
     std::string dspark, dspark_window = "controller", dspark_vocab = "full";
     std::uint32_t dspark_ranks = 2;  // 2 (default since P17.2): a drafter on each rank, requests draft on rank slot % 2; 1: rank 0
@@ -206,27 +198,11 @@ struct Args {
     std::uint32_t hetero_cut = 22, hetero_groups = 2;
 };
 
-// The agent profile (--cache-profile agent; off is the default): with the device prefill, a prefix cache of 8 GiB on the host, a
-// disk tier of at most 64 GiB in $STRIX_DS41_PREFIX_DIR (default ~/.cache/strix/ds41-prefix; one subdirectory per
-// namespace, see prefix_namespace_from_env), a snapshot one block before each prompt's tail and session snapshots, so a
-// growing conversation (agent loop, chat) resumes after its previous turn, also after a restart. Explicit flags win;
-// --no-prefix-cache / --no-prefix-disk / --no-prefix-before-tail / --no-prefix-session-snapshots turn parts off;
-// --cache-profile off keeps only what the flags ask for. The rows prefill path has no cache.
+// Fill only compatible implicit settings, then apply order-independent OFF vetoes.
 void apply_cache_profile(Args& a) {
-    if (a.cache_profile != "agent" || !a.device_prefill) return;
-    if (!a.set_cache_mb) a.prefix_cache_mb = 8192;
-    if (a.prefix_cache_mb == 0U) return;
-    if (!a.no_disk && !a.set_dir) {
-        if (const char* d = std::getenv("STRIX_DS41_PREFIX_DIR"); d != nullptr && *d != 0) a.prefix_dir = d;
-        else if (const char* h = std::getenv("HOME"); h != nullptr && *h != 0) a.prefix_dir = std::string(h) + "/.cache/strix/ds41-prefix";
-    }
-    if (a.no_disk) a.prefix_dir.clear(), a.prefix_disk_mb = 0;
-    if (!a.prefix_dir.empty() && !a.set_disk_mb) a.prefix_disk_mb = 65536;
-    if (!a.no_before_tail) a.prefix_before_tail = true;
-    // Session snapshots export the slot's state as the decode left it; with DSpark the decode runs verify windows of R
-    // rows, whose attention state is not the prefill's bitwise (a request that resumed from a
-    // session snapshot diverged), so the profile keeps them off under --dspark.
-    if (!a.no_session && a.dspark.empty()) a.prefix_session = true;
+    const char* dir = std::getenv("STRIX_DS41_PREFIX_DIR");
+    const char* home = std::getenv("HOME");
+    a.resolve(a.device_prefill, !a.hetero_listen.empty(), !a.dspark.empty(), dir ? dir : "", home ? home : "");
 }
 
 void event(const serve::Json& e) {
@@ -560,13 +536,23 @@ public:
         if (a.prefix_cache_mb != 0U) {
             strix::deepseek41::PrefixCacheOptions co;
             co.block = a.prefix_block;
-            co.budget_bytes = a.prefix_cache_mb << 20U;
+            host_lease_ = std::make_unique<strix::deepseek41::PrefixHostLease>(a.prefix_cache_mb);
+            host_budget_mb_ = host_lease_->budget_mb();
+            co.budget_bytes = std::max<std::uint64_t>(1U, host_budget_mb_ << 20U);
             if (!a.prefix_dir.empty()) {
                 // one directory per namespace: states of another configuration (or of code without a namespace) are never read
                 const auto ns = strix::deepseek41::prefix_namespace_from_env(fwd.expert_tp());
                 const std::filesystem::path base = std::filesystem::path(a.prefix_dir) / ns.tag;
                 co.dir = base / ("rank" + std::to_string(rank));
                 co.disk_budget_bytes = a.prefix_disk_mb << 20U;
+                co.min_free_bytes = 16384ULL << 20U;
+                co.quota_dir = a.prefix_dir;
+                co.promote = false;  // retention admission is collective; disk reads never insert unilaterally
+                co.disk_admission = [&](bool local) {
+                    std::array<std::uint64_t, 1> mine{local ? 1U : 0U}, peer{};
+                    fwd_.exchange_host(std::as_bytes(std::span(mine)), std::as_writable_bytes(std::span(peer)));
+                    return local && peer[0] != 0U;
+                };
                 co.model_id = strix::deepseek41::prefix_model_id(a.model, a.layers, ns);
                 std::filesystem::create_directories(base);
                 std::ofstream(base / "NAMESPACE") << ns.text << '\n';  // each node's copy, for people
@@ -588,12 +574,48 @@ public:
                      o.max_rows, static_cast<double>(prefill_->shared_weight_bytes()) / 1073741824.0,
                      static_cast<double>(prefill_->weight_bytes()) / 1073741824.0, cache.c_str());
     }
+    void record_export(const strix::deepseek41::AttentionState& state, unsigned kind) {
+        if (!diagnostics_) return;
+        export_bytes_ += state.bytes() + state.tokens.size() * 4U;
+        ++exports_.at(kind);
+    }
+    // Fresh observations from both nodes, before either plans a capture or exports a slot.
+    bool admit(std::uint32_t tokens, bool requested = true, std::uint32_t slots = 1) {
+        const std::uint64_t rings = std::uint64_t{a_.layers} * (136U * 528U + 4096U + 4096U);
+        const std::uint64_t state = std::uint64_t{tokens} * (std::uint64_t{a_.layers} * 356U + 4U) + rings;
+        // Full export + retained copy + snapshot rings and disk serialization, conservatively
+        // treating every layer as a ratio-1 KV owner. Existing retention is already in MemAvailable.
+        const std::uint64_t predicted = (host_budget_mb_ << 20U) + slots * (state * 3U + rings * 8U);
+        std::array<std::uint64_t, 3> mine{mem_available_mb(), predicted, 0}, peer{};
+        mine[2] = requested && cache_ && host_budget_mb_ != 0U &&
+                  strix::deepseek41::prefix_memory_admitted(mine[0], a_.prefix_reserve_mb, predicted);
+        fwd_.exchange_host(std::as_bytes(std::span(mine)), std::as_writable_bytes(std::span(peer)));
+        ++capture_checks_;
+        capture_peak_ = std::max(capture_peak_, predicted);
+        const bool ok = mine[2] != 0U && peer[2] != 0U;
+        if (!ok) {
+            ++capture_bypasses_;
+            std::fprintf(stderr, "prefix capture bypass: local/peer available %llu/%llu MiB, predicted %llu/%llu bytes, reserve %llu MiB, host ceiling %llu MiB\n",
+                         static_cast<unsigned long long>(mine[0]), static_cast<unsigned long long>(peer[0]),
+                         static_cast<unsigned long long>(predicted), static_cast<unsigned long long>(peer[1]),
+                         static_cast<unsigned long long>(a_.prefix_reserve_mb), static_cast<unsigned long long>(host_budget_mb_));
+        }
+        return ok;
+    }
     [[nodiscard]] bool has_cache() const noexcept { return cache_ != nullptr; }
     void set_moe_chunk_rows(std::uint32_t r) noexcept { moe_chunk_rows_ = r; }
     strix::deepseek41::PrefixLookup lookup(std::span<const std::uint32_t> prompt) {
         return cache_ ? cache_->lookup(prompt, kMinRows) : strix::deepseek41::PrefixLookup{};
     }
-    [[nodiscard]] strix::deepseek41::PrefixCacheStats cache_stats() const { return cache_ ? cache_->stats() : strix::deepseek41::PrefixCacheStats{}; }
+    [[nodiscard]] strix::deepseek41::PrefixCacheStats cache_stats() const {
+        auto st = cache_ ? cache_->stats() : strix::deepseek41::PrefixCacheStats{};
+        st.capture_checks = capture_checks_; st.capture_bypasses = capture_bypasses_; st.capture_predicted_peak = capture_peak_;
+        st.host_ceiling_bytes = host_budget_mb_ << 20U;
+        st.export_bytes = export_bytes_; st.export_inrun = exports_[0]; st.export_run = exports_[1];
+        st.export_handoff = exports_[2]; st.export_session = exports_[3];
+        st.row_layers = row_layers_; st.planned_splits = planned_splits_;
+        return st;
+    }
     [[nodiscard]] bool has_disk() const noexcept { return cache_ && cache_->has_disk(); }
 
     // After a restart: both ranks keep the disk entries both hold (same bytes). Both ranks call it after the hello.
@@ -667,6 +689,10 @@ public:
     }
     // Inserts the state of every slot of `mask` (at a block boundary since the last step).
     void snapshot(std::uint32_t mask) {
+        std::uint32_t tokens = 0, slots = 0;
+        for (std::uint32_t slot = 0; slot < a_.slots; ++slot)
+            if (((mask >> slot) & 1U) != 0U) { tokens = std::max(tokens, fwd_.position(slot)); ++slots; }
+        if (!admit(tokens, true, slots)) return;
         for (std::uint32_t slot = 0; slot < a_.slots; ++slot) {
             if (((mask >> slot) & 1U) == 0U) continue;
             const auto t0 = Clock::now();
@@ -677,6 +703,7 @@ public:
             auto st = fwd_.export_state(slot, from);
             st.tokens = h;
             st.next_token = last_out_[slot];
+            record_export(st, 3);
             const bool ok = cache_->insert(st, 0U, from);
             std::fprintf(stderr, "session snapshot slot %u at %u (KV from %u): %s in %.3f s\n", slot, p, from, ok ? "inserted" : "refused",
                          std::chrono::duration<double>(Clock::now() - t0).count());
@@ -712,16 +739,15 @@ public:
                 sp_.loaded_ = {};
             }
             out_.state_seconds = std::chrono::duration<double>(Clock::now() - t0_).count();
-            if (sp_.cache_ && sp_.a_.prefix_inrun) {
-                // with the stable prefix's last block boundary (a chat's system prompt + tools) as one more snapshot, so
-                // the next conversation with the same system prompt resumes there
-                auto plan = ds::plan_prefill_runs(hit.resume, hit.shared, N, sp_.a_.prefix_block, rows, kMinRows, sp_.a_.prefix_before_tail,
-                                                  sp_.a_.prefix_inrun_reach, stable);
-                ends_ = std::move(plan.ends);
-                points_ = std::move(plan.points);
-            } else {
-                ends_ = sp_.cache_ ? ds::plan_prefill_pieces(hit.resume, hit.shared, N, sp_.a_.prefix_block, rows, kMinRows, sp_.a_.prefix_before_tail)
-                                   : ds::plan_prefill_pieces(0U, 0U, N, rows, rows, kMinRows);
+            auto plan = ds::select_prefix_prefill_plan(hit.resume, hit.shared, N, sp_.a_.prefix_block, rows, kMinRows,
+                                                       sp_.cache_ && insert_, sp_.a_.prefix_inrun, sp_.a_.prefix_before_tail,
+                                                       sp_.a_.prefix_inrun_reach, stable);
+            ends_ = std::move(plan.ends);
+            points_ = std::move(plan.points);
+            if (sp_.diagnostics_) {
+                const auto baseline = ds::plan_prefill_pieces(hit.resume, 0U, N, rows, rows, kMinRows);
+                for (const auto end : ends_)
+                    sp_.planned_splits_ += std::binary_search(baseline.begin(), baseline.end(), end) ? 0U : 1U;
             }
         }
         // budget 0: the piece [at, end) in one DevicePrefill run / extend. budget k > 0 (phase B): k units of the
@@ -734,7 +760,7 @@ public:
             const auto t1 = Clock::now();
             const std::uint32_t from = at_;
             // in-run snapshot points of this run (both ranks: they widen the cone, so the ranks must agree)
-            if (!ptask_ && !points_.empty()) {
+            if (!ptask_) {
                 std::vector<std::uint32_t> inside;
                 for (const auto p : points_)
                     if (p > at_ && p < end) inside.push_back(p);
@@ -764,13 +790,14 @@ public:
             }
             at_ = end;
             ++out_.pieces;
-            if (sp_.cache_ && insert_ && end % sp_.a_.prefix_block == 0U && std::binary_search(ends_.begin(), ends_.end(), end)) {
+            if (sp_.diagnostics_) sp_.row_layers_ += r_.row_layers;
+            if (end != N && sp_.cache_ && insert_ && end % sp_.a_.prefix_block == 0U && std::binary_search(ends_.begin(), ends_.end(), end)) {
                 const auto ti = Clock::now();
                 auto s = sp_.prefill_->export_state();
                 s.tokens.assign(prompt_.begin(), prompt_.begin() + end);
                 s.next_token = r_.next_token;
+                sp_.record_export(s, 1);
                 out_.inserted += sp_.cache_->insert(s, fnv_floats(r_.logits)) ? 1U : 0U;
-                if (end == N) state_ = std::move(s);
                 out_.insert_seconds += std::chrono::duration<double>(Clock::now() - ti).count();
             }
             if (sp_.cache_ && insert_)
@@ -780,6 +807,7 @@ public:
                     auto s = sp_.prefill_->export_state_at(p);
                     s.tokens.assign(prompt_.begin(), prompt_.begin() + p);
                     s.next_token = strix::deepseek41::kPrefixUnknownNextToken;
+                    sp_.record_export(s, 0);
                     out_.inserted += sp_.cache_->insert(s, 0U) ? 1U : 0U;
                     out_.insert_seconds += std::chrono::duration<double>(Clock::now() - ti).count();
                 }
@@ -814,14 +842,23 @@ public:
         // after the last unit: the state into the slot
         PrefillOutcome finish() {
             if (!done()) throw std::runtime_error("prefill task: finish before the last unit");
+            const auto t2 = Clock::now();
+            double final_insert = 0.0;
             if (state_.layers.empty()) {
                 state_ = sp_.prefill_->export_state();
                 state_.tokens = prompt_;
                 state_.next_token = r_.next_token;
+                sp_.record_export(state_, 2);
+                if (sp_.cache_ && insert_ && total() % sp_.a_.prefix_block == 0U) {
+                    const auto ti = Clock::now();
+                    out_.inserted += sp_.cache_->insert(state_, out_.logits) ? 1U : 0U;
+                    final_insert = std::chrono::duration<double>(Clock::now() - ti).count();
+                    out_.insert_seconds += final_insert;
+                    out_.prefill_seconds += final_insert;
+                }
             }
-            const auto t2 = Clock::now();
             sp_.fwd_.import_state(slot_, state_);
-            out_.handoff_seconds = std::chrono::duration<double>(Clock::now() - t2).count();
+            out_.handoff_seconds = std::chrono::duration<double>(Clock::now() - t2).count() - final_insert;
             out_.seconds = std::chrono::duration<double>(Clock::now() - t0_).count();
             return out_;
         }
@@ -864,6 +901,11 @@ public:
 private:
     const Args& a_;
     BatchForward& fwd_;
+    std::unique_ptr<strix::deepseek41::PrefixHostLease> host_lease_;
+    std::uint64_t host_budget_mb_ = 0, capture_checks_ = 0, capture_bypasses_ = 0, capture_peak_ = 0;
+    const bool diagnostics_ = std::getenv("STRIX_DS41_PREFIX_DIAGNOSTICS") && std::string_view(std::getenv("STRIX_DS41_PREFIX_DIAGNOSTICS")) == "1";
+    std::array<std::uint64_t, 4> exports_{};
+    std::uint64_t export_bytes_ = 0, row_layers_ = 0, planned_splits_ = 0;
     std::unique_ptr<strix::deepseek41::DevicePrefill> prefill_;
     std::unique_ptr<strix::deepseek41::PrefixCache> cache_;
     strix::deepseek41::AttentionState loaded_;  // prepare()'s state
@@ -1335,9 +1377,11 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, SlotPrefill* 
                     hit = strix::deepseek41::PrefixLookup{};
                 }
             }
+            const bool capture = prefill->has_cache() && hit.resume < c.plen && c.plen >= a.prefix_block;
+            const bool insert = capture && prefill->admit(c.plen, (c.pflags & 1U) != 0U);
             if ((c.pflags & kPrefillTask) != 0U) {  // interleave: units follow (prefill_unit)
                 if (task) throw std::runtime_error("control channel: a prefill task is already running");
-                task = prefill->begin(c.pslot, prompt, hit, (c.pflags & 1U) != 0U, (c.pflags >> kPrefillHintShift) * a.prefix_block);
+                task = prefill->begin(c.pslot, prompt, hit, insert, (c.pflags >> kPrefillHintShift) * a.prefix_block);
                 if (task->done()) {  // the whole prompt was cached: no unit (rank 0 does the same)
                     const auto o = task->finish();
                     prefill->on_prefill(c.pslot, prompt);
@@ -1348,7 +1392,7 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, SlotPrefill* 
                 dog.pause(false);
                 continue;
             }
-            const auto o = prefill->run(c.pslot, prompt, hit, (c.pflags & 1U) != 0U, (c.pflags >> kPrefillHintShift) * a.prefix_block);
+            const auto o = prefill->run(c.pslot, prompt, hit, insert, (c.pflags >> kPrefillHintShift) * a.prefix_block);
             prefill->on_prefill(c.pslot, prompt);
             if (spec) spec->imported(c.pslot, prompt, c.plen, o.next_token, o.seed.streams, o.seed.rows, fwd.stream());
             log_outcome(c.pslot, c.plen, o);
@@ -1811,6 +1855,11 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         if (a.prefix_cache_mb != 0U) {
             const auto& cs = st.cache;
             serve::Json pc = serve::Json::object();
+            pc.set("profile", serve::Json(a.cache_profile));
+            pc.set("inrun", serve::Json(a.prefix_inrun));
+            pc.set("inrun_reach", serve::Json(static_cast<std::uint64_t>(a.prefix_inrun_reach)));
+            pc.set("before_tail", serve::Json(a.prefix_before_tail));
+            pc.set("session", serve::Json(a.prefix_session));
             pc.set("budget_bytes", serve::Json(a.prefix_cache_mb << 20U));
             pc.set("bytes", serve::Json(cs.bytes));
             pc.set("blocks", serve::Json(cs.blocks));
@@ -1820,10 +1869,27 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
             pc.set("hit_tokens", serve::Json(cs.hit_tokens));
             pc.set("inserts", serve::Json(cs.inserts));
             pc.set("evicted_snapshots", serve::Json(cs.evicted_snapshots));
+            pc.set("diagnostics", serve::Json(std::getenv("STRIX_DS41_PREFIX_DIAGNOSTICS") && std::string_view(std::getenv("STRIX_DS41_PREFIX_DIAGNOSTICS")) == "1"));
+            pc.set("export_bytes", serve::Json(cs.export_bytes));
+            pc.set("export_inrun", serve::Json(cs.export_inrun));
+            pc.set("export_run", serve::Json(cs.export_run));
+            pc.set("export_handoff", serve::Json(cs.export_handoff));
+            pc.set("export_session", serve::Json(cs.export_session));
+            pc.set("row_layers", serve::Json(cs.row_layers));
+            pc.set("planned_cache_splits", serve::Json(cs.planned_splits));
+            pc.set("capture_checks", serve::Json(cs.capture_checks));
+            pc.set("capture_bypasses", serve::Json(cs.capture_bypasses));
+            pc.set("capture_predicted_peak_bytes", serve::Json(cs.capture_predicted_peak));
+            pc.set("host_ceiling_bytes", serve::Json(cs.host_ceiling_bytes));
             pc.set("refused", serve::Json(cs.refused));
             if (!a.prefix_dir.empty()) {
                 serve::Json d = serve::Json::object();
                 d.set("budget_bytes", serve::Json(a.prefix_disk_mb << 20U));
+                d.set("tier_unlimited", serve::Json(a.prefix_disk_mb == 0U));
+                d.set("service_directory_budget_bytes", serve::Json(std::uint64_t{4096} << 20U));
+                d.set("queue_budget_bytes", serve::Json(std::uint64_t{128} << 20U));
+                d.set("min_free_bytes", serve::Json(std::uint64_t{16384} << 20U));
+                d.set("promote", serve::Json(false));
                 d.set("bytes", serve::Json(cs.disk_bytes));
                 d.set("blocks", serve::Json(cs.disk_blocks));
                 d.set("snapshots", serve::Json(cs.disk_snapshots));
@@ -1831,6 +1897,9 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 d.set("written_bytes", serve::Json(cs.written_bytes));
                 d.set("write_seconds", serve::Json(cs.write_seconds));
                 d.set("write_errors", serve::Json(cs.write_errors));
+                d.set("queued_bytes", serve::Json(cs.queued_bytes));
+                d.set("queue_peak_bytes", serve::Json(cs.queue_peak_bytes));
+                d.set("resource_refused", serve::Json(cs.disk_resource_refused));
                 d.set("read_bytes", serve::Json(cs.read_bytes));
                 d.set("read_seconds", serve::Json(cs.read_seconds));
                 d.set("read_errors", serve::Json(cs.read_errors));
@@ -2309,7 +2378,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         const auto& prompt = r.seq.prompt;
         const auto t0 = Clock::now();
         auto hit = prefill->lookup(prompt);
-        const bool insert = prefill->has_cache() && mem_available_mb() >= a.prefix_reserve_mb;
+        bool insert = prefill->has_cache();
         Control c;
         c.command = static_cast<std::uint32_t>(Command::prefill);
         c.resets = pending_resets;
@@ -2352,6 +2421,8 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 disk_failed = true;
             }
         }
+        const bool capture = prefill->has_cache() && hit.resume < prompt.size() && prompt.size() >= a.prefix_block;
+        insert = capture && prefill->admit(static_cast<std::uint32_t>(prompt.size()), insert);
         if (as_task) {
             active.emplace();
             active->r = &r;
@@ -2560,9 +2631,14 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         }
         if (prefill) {  // session snapshots: slots now at a block boundary, taken before any of them finishes
             const auto cand = prefill->on_step(kept_rows, kept_tokens);
-            if (cand != 0U && mem_available_mb() >= a.prefix_reserve_mb) {
-                prefill->snapshot(cand);
-                pending_snaps = cand;
+            if (cand != 0U) {
+                Control snap;
+                snap.command = static_cast<std::uint32_t>(Command::heartbeat);
+                snap.snaps = cand;
+                take_commits(snap);
+                (void)exchange(fwd, snap);
+                prefill->snapshot(cand);  // both ranks admit before either exports
+                dog.progress();
             }
         }
         if (!spec) strix::deepseek41::apply_step(seqs, plan, tokens);
@@ -3338,23 +3414,7 @@ int main(int argc, char** argv) try {
         else if (s == "--session-ram-bytes") a.session_ram_bytes = std::stoull(next());
         else if (s == "--session-max-parked") a.session_max_parked = std::stoull(next());
         else if (s == "--session-disk-bytes") a.session_disk_bytes = std::stoull(next());
-        else if (s == "--prefix-cache-mb") a.prefix_cache_mb = std::stoull(next()), a.set_cache_mb = true;
-        else if (s == "--prefix-block") a.prefix_block = u32();
-        else if (s == "--prefix-reserve-mb") a.prefix_reserve_mb = std::stoull(next());
-        else if (s == "--prefix-cache-dir") a.prefix_dir = next(), a.set_dir = true;
-        else if (s == "--prefix-cache-disk-mb") a.prefix_disk_mb = std::stoull(next()), a.set_disk_mb = true;
-        else if (s == "--prefix-before-tail") a.prefix_before_tail = true;
-        else if (s == "--prefix-session-snapshots") a.prefix_session = true;
-        else if (s == "--prefix-inrun-snapshots") a.prefix_inrun = true;
-        else if (s == "--prefix-inrun-reach") a.prefix_inrun_reach = u32();
-        else if (s == "--cache-profile") {
-            a.cache_profile = next();
-            if (a.cache_profile != "agent" && a.cache_profile != "off") throw std::invalid_argument("--cache-profile is agent or off");
-        }
-        else if (s == "--no-prefix-cache") a.prefix_cache_mb = 0, a.set_cache_mb = true;
-        else if (s == "--no-prefix-disk") a.no_disk = true;
-        else if (s == "--no-prefix-before-tail") a.no_before_tail = true;
-        else if (s == "--no-prefix-session-snapshots") a.no_session = true;
+        else if (a.parse(s, strix::deepseek41::ServeCachePolicy::takes_value(s) ? next() : std::string{})) {}
         else if (a.model.empty()) a.model = s;
         else throw std::invalid_argument("unknown argument " + s);
     }
@@ -3368,6 +3428,12 @@ int main(int argc, char** argv) try {
     // The device prefill runs the expert-TP identity too (d647d6d4) and the cache namespace records the decode identity
     // (prefix_namespace_from_env), so the agent profile applies with STRIX_DS41_EXPERT_TP=1 as well.
     apply_cache_profile(a);
+    std::fprintf(stderr, "prefix policy: profile %s, host %llu MiB/rank, block %u, reserve %llu MiB after predicted allocations, inrun %u reach %u, before-tail %u, session %u, disk %s limit %s\n",
+                 a.cache_profile.c_str(), static_cast<unsigned long long>(a.prefix_cache_mb), a.prefix_block,
+                 static_cast<unsigned long long>(a.prefix_reserve_mb), a.prefix_inrun ? 1U : 0U, a.prefix_inrun_reach,
+                 a.prefix_before_tail ? 1U : 0U, a.prefix_session ? 1U : 0U, a.prefix_dir.empty() ? "off" : "explicit",
+                 a.prefix_dir.empty() ? "disabled" : a.prefix_disk_mb == 0U ? "unlimited per tier (numeric zero)" : (std::to_string(a.prefix_disk_mb) + " MiB").c_str());
+    if (!a.prefix_dir.empty()) std::fprintf(stderr, "prefix disk guard: service directory quota 4096 MiB, queued payloads 128 MiB, free-space floor 16384 MiB; disk promotion off\n");
     if (a.slots == 0U || a.slots > BatchForward::configured_row_limit()) throw std::invalid_argument("--slots exceeds STRIX_DS41_BATCH_ROWS16 step limit (8, or 16 when enabled)");
     if (a.slots > strix::deepseek41::serve_observe::kMaxStepOwners)  // the per-step draft accounting covers every slot
         throw std::invalid_argument("--slots exceeds the per-step draft accounting limit (64)");

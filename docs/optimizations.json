@@ -533,6 +533,17 @@
   },
   {
     "engine": "deepseek",
+    "name": "Bounded agent prefix retention",
+    "flag_or_env": "--cache-profile agent|off; --prefix-cache-mb; --prefix-inrun-snapshots; --prefix-inrun-reach; --prefix-session-snapshots; STRIX_DS41_PREFIX_DIAGNOSTICS",
+    "default": "ON: 512 MiB/rank, block 256, reserve 8192 MiB, inrun reach 0, sessions only without DSpark; disk and before-tail OFF",
+    "exact": "Existing target kernels and numerical identity retained. Prefix tool on both ranks at 6000 and 8192 rows: miss, same-prompt, warm, in-run and byte-suffix resumes equal a fresh prefill (logits and state digest), 16 decoded tokens equal; serve: generated text and token IDs identical with --cache-profile off and the default in all 8 fresh processes. CPU policy, planner, budget and persistence-refusal contracts tested.",
+    "gain": "Serve, fresh process per arm, --cache-profile off vs default, ABBA over two turns (n = 4 pairs per size): cold 2K miss -0.14 s mean (not slower); 8K prompt sharing a cached 2K prefix -3.63 s (-24 %, every pair faster). No percentage threshold.",
+    "preconditions": "Device prefill without hetero-listen; both-rank fresh memory admission and host leases. Host aggregate ceiling 1024 MiB per service user/node; explicit disk uses one shared root with 4096 MiB directory quota, 128 MiB queued payloads and 16384 MiB free-space floor. Separate roots/users are not covered by one disk quota. Sessions exclude DSpark; disk promotion disabled.",
+    "off_switch": "--cache-profile off supplies no settings and preserves explicit options. --no-prefix-cache / --prefix-cache-mb 0 veto all prefix features; --no-prefix-disk, --no-prefix-before-tail, --no-prefix-session-snapshots, --no-prefix-inrun-snapshots veto components independent of argv order. STRIX_DS41_PREFIX_DIAGNOSTICS=0 disables diagnostic counters.",
+    "doc_anchor": "docs/engine/serving/prefix-state-cache.md#deepseek-pair-agent-prefix-cache"
+  },
+  {
+    "engine": "deepseek",
     "name": "Production dense overlay",
     "flag_or_env": "STRIX_DS41_OVERLAY; STRIX_DS41_CB4",
     "default": "auto",

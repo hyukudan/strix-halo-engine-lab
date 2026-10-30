@@ -12,6 +12,29 @@ tokens against its target from the prefill handoff state; draft changes can affe
 that sequence. Gains from separate campaigns must not be added. Measurements below are prior device
 qualification; a host-only publication build cannot establish new device exactness or speed.
 
+## Bounded agent prefix retention
+
+**Engine:** `deepseek`. **Control:** `--cache-profile agent|off`. **Default:** ON,
+512 MiB per rank, block 256, reserve 8192 MiB, in-run reach 0, sessions only without DSpark;
+disk and before-tail OFF. Native qualification: prefix-tool resumes equal fresh prefills on both
+ranks (6000 / 8192 rows, logits + state digest, 16 decoded tokens); serve, fresh process per arm,
+off vs default ABBA x2 with identical text and token IDs: cold 2K miss -0.14 s mean (not slower),
+an 8K prompt sharing a cached 2K prefix -3.63 s (-24 %). CPU policy, planner and
+persistence-refusal contracts are tested.
+
+Both ranks admit capture before planning/copying. Host leases cap retention at 1024 MiB per
+service user/node. Explicit disk uses one shared service root: 4096 MiB aggregate directory
+quota, 128 MiB outstanding payloads, 16384 MiB free-space floor; separate roots/users are outside
+one disk quota. Target kernels and numerical identity are unchanged. Exactness means live
+continuation state, fresh logits and complete IDs, with the documented digest normalization.
+
+OFF: `--cache-profile off` supplies no fills; explicit options remain. Hard vetoes are
+`--no-prefix-cache` / `--prefix-cache-mb 0`, `--no-prefix-disk`, `--no-prefix-before-tail`,
+`--no-prefix-session-snapshots` and `--no-prefix-inrun-snapshots`, independent of argv order.
+`STRIX_DS41_PREFIX_DIAGNOSTICS=0` disables diagnostic counters. Every qualifying exact gain
+becomes default without a percentage threshold. See [controls](engine/serving/prefix-state-cache.md#deepseek-pair-agent-prefix-cache)
+and [qualification](engine/serving/ds41-prefix-cache-qualification.md).
+
 ## Baselines, inspection and exactness
 
 | Engine | Master baseline | Inspect before device work | Scope / precedence |

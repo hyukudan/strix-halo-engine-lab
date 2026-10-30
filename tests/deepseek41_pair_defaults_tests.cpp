@@ -268,6 +268,15 @@ void test_fallbacks() {
                       "route not yet GPU-qualified: tp2-http-target", "serve: ROWS16 notices");
         const auto p = World().run(pd::App::serve, {MODEL, "--rank", "0", "--transport", "usb4auto", "--prefix-session-snapshots"});
         check(!has_arg(p, "--dspark"), "serve: session snapshots: DSpark off");
+        const auto implicit = World().run(pd::App::serve, {MODEL, "--rank", "0", "--transport", "usb4auto", "--cache-profile", "agent"});
+        check(has_arg(implicit, "--dspark"), "serve: implicit agent sessions never suppress auto DSpark");
+        for (const auto veto : {"--no-prefix-session-snapshots", "--no-prefix-cache"}) {
+            const auto disabled = World().run(pd::App::serve, {MODEL, "--rank", "0", "--transport", "usb4auto", veto, "--prefix-session-snapshots"});
+            check(has_arg(disabled, "--dspark"), "serve: explicit session veto preserves auto DSpark");
+        }
+        const auto zero = World().run(pd::App::serve, {MODEL, "--rank", "0", "--transport", "usb4auto", "--prefix-cache-mb", "0", "--prefix-session-snapshots"});
+        check(has_arg(zero, "--dspark"), "serve: numeric cache zero veto preserves auto DSpark");
+
         check_notices(pd::App::serve, p, {"deepseek41 defaults: serve DSpark off (--prefix-session-snapshots is not exact with --dspark)"},
                       "route not yet GPU-qualified: tp2-http-target", "serve: snapshot notices");
     }

@@ -1171,6 +1171,12 @@ non-interleave modes have distinct fallback reasons. Direct short prompts and co
 row runs do not produce fine-unit timing. Cached, imported and computed prompt
 accounting remain disjoint.
 
+The DS prefix policy now defaults to bounded `agent` host retention with in-run snapshots
+(reach 0), plain-decode sessions, and disk/before-tail OFF. `--cache-profile off` alone selects
+the prefix baseline; `--no-prefix-cache` is a hard veto. See the
+[DS-specific controls and resource contract](prefix-state-cache.md#deepseek-pair-agent-prefix-cache)
+and [qualification protocol](ds41-prefix-cache-qualification.md). Native qualification (two Strix Halo nodes over 2x USB4 Gen3, PerfOpt kernel, production packs): prefix tool exactness on both ranks at 6000 and 8192 rows (max rows 4096 / 2048): miss, same-prompt, warm, in-run and byte-suffix resumes equal a fresh prefill (logits and state digest), 16 decoded tokens equal, 0 differences. Serve timing, a fresh process per arm, `--cache-profile off` vs the default in ABBA order over two turns (n = 4 pairs per size), generated text and token IDs identical in all 8 processes: cold 2K miss -0.14 s mean (pairs +0.09 / -0.46 / -0.13 / -0.08 s; not slower), an 8K prompt that shares its 2K prefix with the previous request -3.63 s (-24 %, 15.0 -> 11.2 s mean; every pair faster). The older qualification below predates the new policy.
+
 The new service, cancellation and ordering behavior has CPU contract coverage. On both ranks,
 with the scheduler on, prefill logits, decode windows, batch rows and greedy tokens equal the
 reference; resumable prefill task gates at unit budgets 1, 3, 32 and 250 equal whole prefills; served

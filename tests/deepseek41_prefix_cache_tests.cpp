@@ -3,6 +3,7 @@
 #include "strix/deepseek41_prefix_cache.hpp"
 #include "strix/ds41_attention.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -137,6 +138,25 @@ void test_roundtrip() {
     expect(threw, "state() refuses a prompt that does not match the key");
 }
 
+void test_canonical_bytes() {
+    std::mt19937 rng(37);
+    auto a = synthetic(random_tokens(512, rng), 512U), b = a;
+    const auto inactive = a.position % ds::AttentionHost::ring_capacity;
+    b.layers[0].ring[inactive * attn::kWindowEntryBytes] ^= 1U;
+    b.layers[0].topk = {1, 2, 3}; b.layers[0].topk_known = true;
+    for (auto& layer : b.layers)
+        if (!layer.carry_valid) std::fill(layer.carry.begin(), layer.carry.end(), 1.0F);
+    expect(ds::canonical_attention_state_bytes(a) == ds::canonical_attention_state_bytes(b), "canonical bytes ignore inactive ring, topk and invalid carry contents");
+    b = a;
+    const auto active = (a.position - 1U) % ds::AttentionHost::ring_capacity;
+    b.layers[0].ring[active * attn::kWindowEntryBytes] ^= 1U;
+    expect(ds::canonical_attention_state_bytes(a) != ds::canonical_attention_state_bytes(b), "canonical bytes detect live ring changes");
+    b = a; b.tokens[0] ^= 1U;
+    expect(ds::canonical_attention_state_bytes(a) != ds::canonical_attention_state_bytes(b), "canonical bytes retain tokens");
+    b = a; ++b.next_token;
+    expect(ds::canonical_attention_state_bytes(a) != ds::canonical_attention_state_bytes(b), "canonical bytes retain next token");
+}
+
 void test_budget() {
     std::mt19937 rng(11);
     const auto one = ds::PrefixCache::snapshot_bytes(synthetic(random_tokens(512, rng), 512U));
@@ -243,6 +263,18 @@ void test_runs() {
     expect(q.ends == (V{1280, 3000}) && q.points == V{2816}, "extra point beyond reach splits");
     q = ds::plan_prefill_runs(1536, 1536, 3000, 256, 4096, 9, false, 512, 1300);
     expect(q.ends == V{3000} && q.points == V{2816}, "extra point before the resume: none");
+    for (const auto rows : {2048U, 3000U, 4096U}) {
+        const auto baseline = ds::plan_prefill_pieces(0, 0, 8217, rows, rows, 9);
+        const auto admitted = ds::select_prefix_prefill_plan(0, 1280, 8217, 256, rows, 9, true, true, false, 0, 1300);
+        expect(admitted.ends == baseline, "default keeps OFF endpoints, including non-block-sized runs");
+        expect(std::find(admitted.points.begin(), admitted.points.end(), 1280U) != admitted.points.end(), "far stable point is retained without a split");
+        for (const bool inrun : {false, true}) {
+            const auto denied = ds::select_prefix_prefill_plan(0, 1280, 8217, 256, rows, 9, false, inrun, true, 512, 1300);
+            expect(denied.ends == baseline && denied.points.empty(), "pressure removes all cache points and legacy splits");
+        }
+    }
+    const auto legacy = ds::select_prefix_prefill_plan(0, 1280, 3000, 256, 4096, 9, true, false, true, 0, 0);
+    expect(legacy.ends == ds::plan_prefill_pieces(0, 1280, 3000, 256, 4096, 9, true), "explicit inrun OFF preserves legacy planner");
     // a point's snapshot does not know the next token: never a whole-prompt hit, a resume with rows left still is
     std::mt19937 rng(5);
     ds::PrefixCache cache(ram_options(0U));
@@ -393,7 +425,56 @@ void test_disk() {
         expect(c0.inventory() == c1.inventory(), "retain: same inventories after");
         expect(c0.lookup(t).resume == 512U && c1.lookup(t).resume == 512U, "retain: both resume at 512");
     }
-    for (const char* n : {"disk", "other", "late", "probe", "budget", "r0", "r1"}) fs::remove_all(fs::temp_directory_path() / (std::string("ds41-prefix-cache-test-") + n));
+    {  // Refused persistence does not serialize/enqueue anything and still retains RAM.
+        auto o = disk_options(fresh_dir("resources"));
+        o.queue_budget_bytes = 1;
+        ds::PrefixCache cache(o);
+        expect(cache.insert(synthetic(a, 512U), 1U), "queue refusal retains RAM");
+        const auto st = cache.stats();
+        expect(st.disk_resource_refused == 1 && st.disk_blocks == 0 && st.queued_bytes == 0 && st.queue_peak_bytes == 0,
+               "oversize payload rejected before queue reservation");
+        expect(cache.lookup(a).resume == 512U, "RAM hit after persistence refusal");
+    }
+    {
+        auto o = disk_options(fresh_dir("free-floor"));
+        o.min_free_bytes = UINT64_MAX;
+        ds::PrefixCache cache(o);
+        expect(cache.insert(synthetic(a, 512U), 1U), "free-space refusal retains RAM");
+        expect(cache.stats().disk_resource_refused == 1 && cache.stats().queued_bytes == 0, "free-space denial releases queue reservation");
+    }
+    {
+        auto o = disk_options(fresh_dir("peer-denial"));
+        unsigned calls = 0;
+        o.disk_admission = [&](bool local) { expect(local, "local admission succeeds"); ++calls; return false; };
+        ds::PrefixCache cache(o);
+        expect(cache.insert(synthetic(a, 512U), 1U), "peer denial retains RAM");
+        expect(calls == 1 && cache.inventory().empty() && cache.stats().queued_bytes == 0, "peer denial is all-or-nothing");
+    }
+#if defined(__unix__)
+    {
+        std::uint64_t one = 0;
+        {
+            ds::PrefixCache probe(disk_options(fresh_dir("aggregate-probe")));
+            expect(probe.insert(synthetic(a, 512U), 1U), "aggregate sizing probe");
+            one = probe.stats().disk_bytes;
+        }
+        const auto root = fresh_dir("aggregate");
+        auto x = disk_options(root / "ns0"), y = disk_options(root / "ns1");
+        x.quota_dir = y.quota_dir = root;
+        x.aggregate_disk_budget_bytes = y.aggregate_disk_budget_bytes = one + one / 2U;
+        ds::PrefixCache c0(x), c1(y);
+        expect(c0.insert(synthetic(a, 512U), 1U), "first namespace fits aggregate quota");
+        c0.flush();
+        expect(!c0.inventory().empty(), "first namespace really persisted");
+        expect(c1.insert(synthetic(a, 512U), 1U), "second namespace refusal retains RAM");
+        expect(c1.inventory().empty() && c1.stats().disk_resource_refused == 1, "existing sibling files consume aggregate quota");
+        bool owned = false;
+        try { ds::PrefixCache duplicate(x); }
+        catch (const std::runtime_error&) { owned = true; }
+        expect(owned, "a second owner cannot scan or delete a live namespace");
+    }
+#endif
+    for (const char* n : {"disk", "other", "late", "probe", "budget", "r0", "r1", "resources", "free-floor", "peer-denial", "aggregate", "aggregate-probe"}) fs::remove_all(fs::temp_directory_path() / (std::string("ds41-prefix-cache-test-") + n));
 }
 
 }  // namespace
@@ -480,6 +561,7 @@ void test_namespace() {
 int main() {
     test_roundtrip();
     test_budget();
+    test_canonical_bytes();
     test_pieces();
     test_runs();
     test_disk();
