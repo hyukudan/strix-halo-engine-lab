@@ -72,10 +72,11 @@ const std::vector<Receipt> receipts = {
     {pd::App::batch, CU6 + " " + TRB, "--layers 40 --tp-attention --engram-direct", "usb4auto"},
     // TTFT: run ... strix-deepseek41-prefill "$CU6 STRIX_DS41_EXPERT_TP=0 $E" $PR --layers 40 --timing
     {pd::App::prefill, CU6 + " STRIX_DS41_EXPERT_TP=0", "--layers 40", "usb4-auto"},
-    // serve: the node serve launcher
+    // serve: the node serve launcher; --prefill-rows auto replaces the receipt's 2048 (the prefill-rows A/B: larger
+    // pieces, same bits)
     {pd::App::serve, CU6 + " " + TRB,
      "--layers 40 --tp-attention --engram-direct --peer-timeout 120 --prefill-path device --slots 8 --context 4096 "
-     "--prefill-rows 2048 --dspark $DRAFT --dspark-vocab auto:$I/vocab",
+     "--prefill-rows auto --dspark $DRAFT --dspark-vocab auto:$I/vocab",
      "usb4auto"},
 };
 // Code defaults of the apps the receipt passed explicitly (unchanged by this resolver; serve's Args has tp = true,

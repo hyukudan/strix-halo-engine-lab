@@ -184,6 +184,7 @@ struct Args : strix::deepseek41::ServeCachePolicy {
     bool tp = true, engram_direct = true, describe = false, describe_parts = false;
     bool device_prefill = true;                      // --prefill-path device (default since P15; rows = the batch steps)
     std::uint32_t prefill_rows = 4096, prefill_min = 0;
+    bool prefill_rows_auto = false;  // --prefill-rows auto: resolved after the weights load (auto_prefill_rows)
     std::string session_dir;
     std::uint64_t session_ram_bytes = 0; // injected by pair_defaults after route/memory checks
     std::uint64_t session_max_parked = 8, session_disk_bytes = 0;
@@ -400,7 +401,7 @@ Control hello(const Args& a) {
     c.tp = (a.tp ? 1U : 0U) | (BatchForward::configured_row_limit() > BatchForward::max_rows ? 2U : 0U);
     c.pool = a.pool;
     c.prefill_mode = a.device_prefill ? 1U : 0U;
-    c.prefill_rows = a.prefill_rows;
+    c.prefill_rows = a.prefill_rows_auto ? 0U : a.prefill_rows;  // auto: resolved by both ranks after the load
     c.prefix_block = a.prefix_block;
     c.prefix_bytes = a.prefix_cache_mb << 20U;
     c.prefix_disk = a.prefix_dir.empty() ? 0U : (a.prefix_disk_mb << 20U) + 1U;
@@ -518,20 +519,26 @@ struct PrefillOutcome {
 // that each rank has a row. Shorter prompts take the rows path; pieces and resume points leave at least this many rows.
 constexpr std::uint32_t kMinRows = 9U;
 
+// The serve's device prefill options (both ranks; the weights read in place from the batch forward).
+strix::deepseek41::PrefillOptions slot_prefill_options(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, std::uint32_t rank) {
+    strix::deepseek41::PrefillOptions o;
+    o.layers = a.layers;
+    o.max_positions = a.context;
+    o.max_rows = std::min(a.prefill_rows, a.context);
+    o.rank = rank;
+    o.world = 2U;
+    o.communicator = &comm;
+    o.engram_direct_io = a.engram_direct;
+    o.shared_weights = fwd.file_form_weights();
+    o.expert_tp = strix::ds41::expert_tp::enabled_from_env();  // the batch forward's expert TP (dup layout)
+    if (!a.dspark.empty()) o.draft_rows = a.dspark_seed_rows;  // the drafter's seed (both ranks hold it)
+    return o;
+}
+
 class SlotPrefill {
 public:
     SlotPrefill(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, std::uint32_t rank) : a_(a), fwd_(fwd) {
-        strix::deepseek41::PrefillOptions o;
-        o.layers = a.layers;
-        o.max_positions = a.context;
-        o.max_rows = std::min(a.prefill_rows, a.context);
-        o.rank = rank;
-        o.world = 2U;
-        o.communicator = &comm;
-        o.engram_direct_io = a.engram_direct;
-        o.shared_weights = fwd.file_form_weights();
-        o.expert_tp = strix::ds41::expert_tp::enabled_from_env();  // the batch forward's expert TP (dup layout)
-        if (!a.dspark.empty()) o.draft_rows = a.dspark_seed_rows;  // the drafter's seed (both ranks hold it)
+        const auto o = slot_prefill_options(a, fwd, comm, rank);
         prefill_ = std::make_unique<strix::deepseek41::DevicePrefill>(a.model, o);
         if (a.prefix_cache_mb != 0U) {
             strix::deepseek41::PrefixCacheOptions co;
@@ -604,6 +611,7 @@ public:
     }
     [[nodiscard]] bool has_cache() const noexcept { return cache_ != nullptr; }
     void set_moe_chunk_rows(std::uint32_t r) noexcept { moe_chunk_rows_ = r; }
+    [[nodiscard]] std::uint64_t weight_bytes() const noexcept { return prefill_->weight_bytes(); }  // loaded (owned) by the prefill
     strix::deepseek41::PrefixLookup lookup(std::span<const std::uint32_t> prompt) {
         return cache_ ? cache_->lookup(prompt, kMinRows) : strix::deepseek41::PrefixLookup{};
     }
@@ -1091,6 +1099,7 @@ std::unique_ptr<Sessions> make_sessions(const Args &a, std::uint32_t rank) {
                                             {"engram-direct", std::to_string(a.engram_direct)},
                                             {"prefill-device", std::to_string(a.device_prefill)},
                                             {"prefill-rows", std::to_string(a.prefill_rows)},
+                                            {"prefill-rows-auto", std::to_string(a.prefill_rows_auto)},
                                             {"prefill-min", std::to_string(a.prefill_min)},
                                             {"prefix-block", std::to_string(a.prefix_block)},
                                             {"prefix-inrun", std::to_string(a.prefix_inrun)},
@@ -3205,7 +3214,37 @@ std::unique_ptr<strix::dist::Transport> open_transport(const std::string& spec, 
     throw std::invalid_argument("unknown or unavailable transport " + spec);
 }
 
-void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport) {
+// --prefill-rows auto (the pair default): the largest piece of 16384 / 8192 / 4096 rows (at most the context) that both
+// ranks admit after the batch forward's weights (sched::auto_prefill_rows: the piece's scratch, the prefill's own weights
+// from the tensor inventory, the drafter's peak on a drafting rank and a margin, against min(device free, MemAvailable)),
+// else 2048; both ranks take the smaller choice. Emulation (both ranks in one process, one device) keeps 2048. OFF: an
+// explicit --prefill-rows N. Pair, context 49152, fresh prompts: 16384 vs 2048 rows, 8,399 tokens 14.57 -> 10.34 s,
+// 32,499 tokens 60.8 -> 39.1 s, the same logits and tokens.
+std::uint32_t auto_prefill_rows(const Args& a, BatchForward& fwd, strix::dist::Communicator& comm, std::uint32_t rank) {
+    namespace sc = strix::deepseek41::sched;
+    std::uint32_t rows = std::max<std::uint32_t>(32U, std::min(sc::kAutoPrefillFallback, a.context / 8U * 8U));
+    sc::AutoPrefillRoom room;
+    if (a.transport != "emulate") {
+        room.device_free = fwd.device_memory().first;
+        room.mem_available = mem_available_mb() << 20U;
+        auto o = slot_prefill_options(a, fwd, comm, rank);
+        o.max_rows = std::min(sc::kAutoPrefillRows[0], a.context);
+        room.own_weights = strix::deepseek41::DevicePrefill::owned_weight_bytes(a.model, o);
+        if (!a.dspark.empty() && (rank == 0U || a.dspark_ranks == 2U)) room.drafter = sc::drafter_peak_bytes(std::filesystem::file_size(a.dspark));
+        rows = sc::auto_prefill_rows(a.context, room);
+    }
+    std::array<std::uint32_t, 1> mine{rows}, peer{};
+    fwd.exchange_host(std::as_bytes(std::span(mine)), std::as_writable_bytes(std::span(peer)));
+    const std::uint32_t agreed = std::min(rows, peer[0]);
+    const double g = 1073741824.0;
+    std::fprintf(stderr, "rank %u: --prefill-rows auto -> %u (this rank %u: device free %.1f, MemAvailable %.1f GiB; reserved own weights %.2f, "
+                 "drafter %.1f, margin %.1f GiB)%s\n", rank, agreed, rows, static_cast<double>(room.device_free) / g,
+                 static_cast<double>(room.mem_available) / g, static_cast<double>(room.own_weights) / g, static_cast<double>(room.drafter) / g,
+                 static_cast<double>(room.margin) / g, a.transport == "emulate" ? " [emulate: fixed]" : "");
+    return agreed;
+}
+
+void run_rank(Args a, std::uint32_t rank, std::unique_ptr<strix::dist::Transport> transport) {
     // the device prefill exchanges a chunk's MoE half sums (<= 21 MB) in one message
     strix::dist::Communicator comm(strix::dist::Group{rank, 2U, a.epoch, fnv(a.group_id)}, std::move(transport), std::move(gpu_direct),
                                    a.device_prefill ? std::size_t{22} << 20U : std::size_t{4} << 20U);
@@ -3220,7 +3259,15 @@ void run_rank(const Args& a, std::uint32_t rank, std::unique_ptr<strix::dist::Tr
         std::fprintf(stderr, "rank %u: trellis %s, %.1f MiB (+ %.1f MiB library workspaces)\n", rank, id.c_str(),
                      static_cast<double>(fwd.trellis_bytes()) / 1048576.0, static_cast<double>(fwd.trellis_library_bytes()) / 1048576.0);
     std::unique_ptr<SlotPrefill> prefill;
-    if (a.device_prefill) prefill = std::make_unique<SlotPrefill>(a, fwd, comm, rank);
+    if (a.device_prefill && a.prefill_rows_auto) a.prefill_rows = auto_prefill_rows(a, fwd, comm, rank);
+    if (a.device_prefill) {
+        const auto before = fwd.device_memory().first;
+        prefill = std::make_unique<SlotPrefill>(a, fwd, comm, rank);
+        std::fprintf(stderr, "rank %u: device prefill of %u-row pieces: device free %.2f GiB lower (scratch estimate %.2f GiB + own weights %.2f GiB)\n", rank, a.prefill_rows,
+                     (static_cast<double>(before) - static_cast<double>(fwd.device_memory().first)) / 1073741824.0,
+                     static_cast<double>(strix::deepseek41::sched::prefill_piece_bytes(a.prefill_rows, a.context)) / 1073741824.0,
+                     static_cast<double>(prefill->weight_bytes()) / 1073741824.0);
+    }
     if (prefill) prefill->set_moe_chunk_rows(strix::deepseek41::sched::options_from_env(true).moe_chunk_rows);  // phase B tasks (both ranks)
     dog.pause(false);
     std::unique_ptr<strix::ds41::hetero::Stage> stage;
@@ -3405,7 +3452,11 @@ int main(int argc, char** argv) try {
             if (v != "rows" && v != "device") throw std::invalid_argument("--prefill-path is rows or device");
             a.device_prefill = v == "device";
         }
-        else if (s == "--prefill-rows") a.prefill_rows = u32();
+        else if (s == "--prefill-rows") {
+            const auto v = next();
+            a.prefill_rows_auto = v == "auto";
+            if (!a.prefill_rows_auto) a.prefill_rows = static_cast<std::uint32_t>(std::stoul(v));
+        }
         else if (s == "--prefill-min") a.prefill_min = u32();
         else if (s == "--session-cache-dir")
             a.session_dir = next();

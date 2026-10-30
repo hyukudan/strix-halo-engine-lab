@@ -1025,6 +1025,31 @@ std::uint64_t DevicePrefill::shared_weight_bytes() const noexcept {
     return n;
 }
 double DevicePrefill::load_seconds() const noexcept { return impl_->load_seconds; }
+std::uint64_t DevicePrefill::owned_weight_bytes(const std::filesystem::path& gguf, const PrefillOptions& o) {
+    const auto model = validate_target(read_file(gguf));
+    const auto plan = build_decode_plan(model, 0, o.layers);
+    const auto& c = model.config;
+    std::map<std::string, std::uint64_t> sizes;
+    for (const auto& t : model.manifest.tensors) sizes.emplace(t.name, t.byte_size);
+    std::set<std::string> names;
+    for (const auto& st : plan.steps)
+        for (const auto& w : st.weights)
+            if (w.find("engram_embd") == std::string::npos) names.insert(w);
+    const std::uint32_t experts = o.expert_tp ? c.n_routed_experts : c.n_routed_experts / std::max(1U, o.world);
+    const auto head = o.world == 2U ? ds41::vocab_slice(c.vocab_size, 2U, o.rank).count : c.vocab_size;
+    std::uint64_t need = 0;
+    for (const auto& n : names) {  // the constructor's rules: the expert range (or TP part), the vocabulary slice, shared tensors
+        std::uint64_t bytes = sizes.at(n);
+        const bool exps = n.ends_with("_exps.weight");
+        if (exps && o.expert_tp) bytes = ds41::expert_tp::part_bytes(bytes, c.n_routed_experts, n.ends_with("ffn_down_exps.weight"), c.hidden_size);
+        else if (exps) bytes = bytes / c.n_routed_experts * experts * (o.stream_experts ? 2U : 1U);
+        else if (n == "output.weight") bytes = bytes / c.vocab_size * head;
+        const auto it = o.shared_weights.find(n);
+        if (o.stream_experts && exps) need += bytes;
+        else if (it == o.shared_weights.end() || it->second.second != bytes) need += bytes;
+    }
+    return need;
+}
 std::string DevicePrefill::overlay_description() const { return impl_->overlay ? impl_->overlay->describe() : std::string{}; }
 
 namespace {

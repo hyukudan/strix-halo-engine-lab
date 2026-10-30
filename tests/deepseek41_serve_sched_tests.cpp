@@ -221,8 +221,49 @@ void identities() {
     expect(sc::serve_identity_text(tp, 100, 2, "controller", "full") == sc::serve_identity_text(tp, 100, 2, "controller", "full"), "identity: same config equal");
 }
 
+// --prefill-rows auto: the measured pair point (context 49152, rank 0 drafting a 7.42 GiB file: device free 34.4 GiB,
+// MemAvailable 38.7, own weights 7.62) admits 16384; every reserve and the context bound it.
+void auto_rows() {
+    constexpr std::uint64_t GiB = std::uint64_t{1} << 30U;
+    const auto gib = [&](double v) { return static_cast<std::uint64_t>(v * static_cast<double>(GiB)); };
+    sc::AutoPrefillRoom r;
+    r.device_free = gib(34.4);
+    r.mem_available = gib(38.7);
+    r.own_weights = gib(7.62);
+    r.drafter = sc::drafter_peak_bytes(7966294016ULL);
+    expect(sc::auto_prefill_rows(49152, r) == 16384U, "auto rows: measured pair point -> 16384");
+    expect(sc::prefill_piece_bytes(16384, 49152) > gib(6.95), "auto rows: scratch estimate covers the measured 6.95 GiB");
+    expect(sc::drafter_peak_bytes(7966294016ULL) > gib(15.1), "auto rows: drafter peak covers the measured 15.1 GiB");
+    auto t = r;
+    t.mem_available = gib(31.0);  // the smaller of device free and MemAvailable limits
+    expect(sc::auto_prefill_rows(49152, t) == 8192U, "auto rows: MemAvailable limits");
+    t = r;
+    t.drafter = 0;  // rank 1 without a drafter: more room, same top candidate
+    expect(sc::auto_prefill_rows(49152, t) == 16384U, "auto rows: no drafter");
+    t = r;
+    t.device_free = gib(20.0);
+    expect(sc::auto_prefill_rows(49152, t) == 2048U, "auto rows: nothing fits -> 2048");
+    t.mem_available = 0;  // unknown MemAvailable: device free alone
+    t.device_free = gib(34.4);
+    expect(sc::auto_prefill_rows(49152, t) == 16384U, "auto rows: MemAvailable unknown");
+    t = r;
+    t.own_weights = gib(12.5);  // more weights to load (e.g. no trellis sharing) shrink the piece
+    expect(sc::auto_prefill_rows(49152, t) == 4096U, "auto rows: own weights reserved");
+    expect(sc::auto_prefill_rows(12000, r) == 8192U, "auto rows: at most the context");
+    expect(sc::auto_prefill_rows(1000, r) == 1000U, "auto rows: short context -> the context (fallback)");
+    expect(sc::auto_prefill_rows(20, r) == 32U, "auto rows: at least 32");
+    for (const std::uint32_t ctx : {32U, 1000U, 4096U, 49152U, 1048576U})
+        for (const double free : {0.0, 10.0, 40.0, 120.0}) {
+            t = r;
+            t.device_free = gib(free);
+            const auto rows = sc::auto_prefill_rows(ctx, t);
+            expect(rows >= 32U && rows % 8U == 0U && (rows <= ctx || rows == 32U), "auto rows: valid --prefill-rows value");
+        }
+}
+
 int main() {
     service_options();
+    auto_rows();
     short_first();
     control_trace();
     admission();

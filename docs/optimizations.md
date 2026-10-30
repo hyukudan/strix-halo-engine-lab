@@ -927,14 +927,14 @@ Use two-rank TP attention and direct Engram reads in rank/batch apps.
 
 **Engine:** `deepseek`. **Control:** `--peer-timeout; --prefill-path; --slots; --prefill-rows`. **Default:** auto.
 
-Resolve timeout 120, device prefill, 8 slots and 2048 prefill rows.
+Resolve timeout 120, device prefill, 8 slots and `--prefill-rows auto`: the largest prefill piece (16384, 8192 or 4096 rows, at most the context) whose scratch and the prefill's own weights both ranks admit after the weights load (else 2048). Each piece re-reads every routed expert and replays the decoder cone, so fewer, larger pieces are faster; pieces are bitwise-exact for any size.
 
 - **Preconditions:** Serve app and capacity for the requested slots/rows.
 - **Automatic selection:** Prepend defaults before caller arguments so explicit flags win.
 - **Fallback notice:** Missing resolver prerequisites print a `deepseek41 defaults:` notice; ordinary operator shape dispatch has no universal decline notice. Explicit incompatible configurations retain errors.
 - **Exactness evidence:** Both-rank reference gates compare prefill logits/state digests, greedy token IDs, verify rows and batch rows with fixed Q2 experts, dense overlay and trellis packs; pack identity changes require their separate quality reference.
-- **Off switch:** Explicit values override each flag; STRIX_DS41_BASELINE=1 suppresses injection
-- **Measured gain:** No isolated measurement
+- **Off switch:** Explicit values override each flag (`--prefill-rows N`); STRIX_DS41_BASELINE=1 suppresses injection
+- **Measured gain:** Pair, context 49152, fresh prompts: 8,399 tokens 14.57 -> 10.34 s, 32,499 tokens 60.8 -> 39.1 s (16384 vs 2048 rows), same logits and tokens.
 - **Implementation / evidence:** [Resolver](../src/deepseek41_pair_defaults.cpp), [contract](models/deepseek-v4.1/production-defaults.md)
 
 <a id="ds-draft"></a>

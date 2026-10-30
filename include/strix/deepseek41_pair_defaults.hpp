@@ -18,7 +18,7 @@
 //     STRIX_DS41_TRELLIS_DENSE_FULL=1 STRIX_DS41_TRELLIS_HEADOUT=1
 //   prefill: STRIX_DS41_OVERLAY + STRIX_DS41_CB4 as above and STRIX_DS41_EXPERT_TP=0 (the EP prefill, no trellis sites)
 //   rank / batch on two ranks: --tp-attention --engram-direct
-//   serve: --peer-timeout 120 --prefill-path device --slots 8 --prefill-rows 2048
+//   serve: --peer-timeout 120 --prefill-path device --slots 8 --prefill-rows auto (largest piece both ranks admit)
 //     --dspark <model dir>/*-DSpark-MXFP4.gguf --dspark-vocab auto:<packs>/vocab
 // <packs> is STRIX_DS41_PACKS when set, else <model dir>/packs, else the model's directory.
 //

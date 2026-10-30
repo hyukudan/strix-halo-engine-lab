@@ -126,6 +126,38 @@ inline Options options_from_env(bool device_prefill) {
     });
 }
 
+// --prefill-rows auto (serve): the device prefill's piece size. Each piece re-reads every routed expert and replays the
+// decoder cone, so fewer, larger pieces are faster (pieces are bitwise-exact for any size).
+// prefill_piece_bytes: the device prefill's row scratch for pieces of `rows` rows at `context` positions (DevicePrefill's
+// T-sized buffers, deepseek41 shapes, row split: ~0.4 MB per row + the context's candidate bits per row, rounded up;
+// measured 6.95 GiB at 16384 rows, context 49152).
+[[nodiscard]] constexpr std::uint64_t prefill_piece_bytes(std::uint32_t rows, std::uint32_t context) noexcept {
+    return (std::uint64_t{rows} + 32U) * ((std::uint64_t{448} << 10U) + (std::uint64_t{context} + 8U) / 8U);
+}
+struct AutoPrefillRoom {
+    std::uint64_t device_free = 0, mem_available = 0;  // after the batch forward's weights (mem_available 0: unknown)
+    std::uint64_t own_weights = 0;                     // DevicePrefill::owned_weight_bytes
+    std::uint64_t drafter = 0;                         // the drafter's peak still to come on this rank (device + host copy)
+    std::uint64_t margin = std::uint64_t{3} << 30U;
+};
+inline constexpr std::uint32_t kAutoPrefillRows[] = {16384U, 8192U, 4096U};
+inline constexpr std::uint32_t kAutoPrefillFallback = 2048U;
+// The largest candidate (at most the context) whose scratch fits in min(device free, MemAvailable) less the prefill's
+// own weights, the drafter's peak and the margin; else min(2048, the context) (at least 32 rows, a multiple of 8).
+[[nodiscard]] inline std::uint32_t auto_prefill_rows(std::uint32_t context, const AutoPrefillRoom& r) noexcept {
+    std::uint64_t room = r.mem_available != 0U ? std::min(r.device_free, r.mem_available) : r.device_free;
+    const std::uint64_t reserve = r.own_weights + r.drafter + r.margin;
+    room = room > reserve ? room - reserve : 0U;
+    for (const auto rows : kAutoPrefillRows)
+        if (rows <= context && prefill_piece_bytes(rows, context) <= room) return rows;
+    return std::max<std::uint32_t>(32U, std::min(kAutoPrefillFallback, context / 8U * 8U));
+}
+// The drafter's peak on a drafting rank, from its file: the device copy (weights + scratch + contexts + staging) while
+// the host copy of the loaded file is still alive (UMA: the same memory). Measured: a 7.42 GiB draft file took 15.1 GiB.
+[[nodiscard]] constexpr std::uint64_t drafter_peak_bytes(std::uint64_t draft_file_bytes) noexcept {
+    return 2U * draft_file_bytes + (std::uint64_t{1} << 30U);
+}
+
 // Disabled service without legacy units retains whole pieces while idle.
 [[nodiscard]] inline std::uint32_t row_budget(const Options& o, bool idle) noexcept {
     return o.resumable() || (idle && !o.legacy_units) ? UINT32_MAX : o.unit_rows;
